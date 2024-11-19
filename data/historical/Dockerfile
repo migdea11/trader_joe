@@ -7,12 +7,13 @@ FROM python:3.10-slim
 # Set the working directory in the container
 WORKDIR /code
 
-# Copy the current directory contents into the container at /code
-COPY ./app /code/app
-COPY ./requirements.txt /code/
-
 # Install any needed packages specified in requirements.txt
+COPY ./requirements.txt /code/
 RUN pip install --no-cache-dir --upgrade -r /code/requirements.txt
+
+# Copy the current directory contents into the container at /code
+COPY ./.env /code/.env
+COPY ./app /code/app
 
 # Make port 80 available to the world outside this container
 EXPOSE 80

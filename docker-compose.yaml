@@ -1,17 +1,21 @@
 version: '3.8'
 services:
-  data_historical:
+  data_hist:
     build:
       context: ./data/historical
       args:
         DATA_DIR: ${DATA_DIR:-./data}  # Default to ./data if not specified
     command: uvicorn app.main:app --host 0.0.0.0 --port 80 --reload
     volumes:
-      - ./app:/code/app
+      - ./data/historical/alembic.ini:/code/alembic.ini
+      - ./data/historical/migrations:/code/migrations
     ports:
       - "80:80"
+    env_file:
+      - .env
+      - ./data/historical/.env
     environment:
-      - DATABASE_URL=postgresql://postgres:password@db:5432/postgres
+      - DATABASE_URL=${DATABASE_URL:-postgresql://postgres:password@db:5432/postgres}
     depends_on:
       - db
   db:
@@ -24,6 +28,3 @@ services:
       - "5432:5432"
     volumes:
       - ${DATA_DIR:-./data}/postgres:/var/lib/postgresql/data
-
-volumes:
-  pgdata:
