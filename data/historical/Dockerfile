@@ -1,11 +1,12 @@
 # Use an official Python runtime as a parent image
-FROM python:3.10-slim
+FROM python:3.12-slim
 
 # Use an argument in Dockerfile if needed
 # ARG DATA_DIR
 
 # Set the working directory in the container
 WORKDIR /code
+ENV PYTHONPATH="/code"
 
 # Install any needed packages specified in requirements.txt
 COPY ./requirements.txt /code/
