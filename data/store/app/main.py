@@ -1,12 +1,13 @@
 import os
 import time
-import psycopg2
-from fastapi import FastAPI
-from alembic.config import Config
-from alembic import command
 from contextlib import asynccontextmanager
 
-from routers import items
+import psycopg2
+from alembic import command
+from alembic.config import Config
+from fastapi import FastAPI
+
+from routers import stock_price_volume
 
 # TODO move to config
 CONNECTION_ATTEMPTS = 5
@@ -49,4 +50,4 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-app.include_router(items.router)
+app.include_router(stock_price_volume.router)
