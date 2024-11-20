@@ -6,7 +6,7 @@ from alembic.config import Config
 from alembic import command
 from contextlib import asynccontextmanager
 
-from schemas import items
+from routers import items
 
 # TODO move to config
 CONNECTION_ATTEMPTS = 5

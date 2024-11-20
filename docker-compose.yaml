@@ -1,11 +1,10 @@
 version: '3.8'
 services:
-  data_hist:
+  data_historical:
     build:
-      context: ./data/historical
+      context: ./
       args:
         DATA_DIR: ${DATA_DIR:-./data}  # Default to ./data if not specified
-    command: uvicorn app.main:app --host 0.0.0.0 --port 80 --reload
     volumes:
       - ./data/historical/alembic.ini:/code/alembic.ini
       - ./data/historical/migrations:/code/migrations

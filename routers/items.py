@@ -4,6 +4,7 @@ from fastapi import Depends
 from sqlalchemy.orm import Session
 
 from schemas import items
+from data.historical.app.db import database, models
 
 router = APIRouter()
 
