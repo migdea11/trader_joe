@@ -2,7 +2,7 @@ from pydantic import BaseModel
 from datetime import datetime
 from typing import Optional
 
-from common.enums.stock_data import Granularity, DataSource
+from common.enums.data_stock import Granularity, DataSource
 
 class StockPriceVolumeBase(BaseModel):
     symbol: str
@@ -12,6 +12,8 @@ class StockPriceVolumeBase(BaseModel):
     low: float
     close: float
     volume: int
+    trade_count: int
+    vwap: float
     granularity: Granularity
     source: DataSource
 

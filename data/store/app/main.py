@@ -1,41 +1,22 @@
 import os
-import time
 from contextlib import asynccontextmanager
 
-import psycopg2
 from alembic import command
 from alembic.config import Config
 from fastapi import FastAPI
 
+from common.postgres.postgres_tools import wait_for_db
 from routers import stock_price_volume
 
-# TODO move to config
-CONNECTION_ATTEMPTS = 5
-CONNECTION_DELAY = 5
-
-def wait_for_db(url):
-    """Wait for the database to become available."""
-    attempt = 0
-    while attempt < CONNECTION_ATTEMPTS:
-        try:
-            conn = psycopg2.connect(url)
-            conn.close()
-            print("Database is ready!")
-            return True
-        except psycopg2.OperationalError:
-            print(f"Database not ready, waiting for {CONNECTION_DELAY} seconds...")
-            time.sleep(CONNECTION_DELAY)
-            attempt += 1
-    print("Database failed to start within the allocated time.")
-    return False
+DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_CONN_TIMEOUT = os.getenv("DATABASE_CONN_TIMEOUT")
 
 def run_migrations():
-    URL = os.getenv("DATABASE_URL")
-    print(f"connected to {URL}")
-    if wait_for_db(URL):
+    print(f"connected to {DATABASE_URL}")
+    if wait_for_db(DATABASE_URL, DATABASE_CONN_TIMEOUT):
         alembic_cfg = Config("/code/alembic.ini")
         alembic_cfg.set_main_option("script_location", "/code/migrations")
-        alembic_cfg.set_main_option("sqlalchemy.url", URL)
+        alembic_cfg.set_main_option("sqlalchemy.url", DATABASE_URL)
         print("Running migrations...")
         command.upgrade(alembic_cfg, "head")
     else:

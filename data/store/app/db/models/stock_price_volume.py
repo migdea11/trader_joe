@@ -1,7 +1,7 @@
 from sqlalchemy import Column, DateTime, Enum, Float, Integer, String
 from sqlalchemy.ext.declarative import declarative_base
 
-from common.enums.stock_data import DataSource, Granularity
+from common.enums.data_stock import DataSource, Granularity
 
 Base = declarative_base()
 

@@ -23,7 +23,7 @@ COPY ./routers /code/routers
 COPY ./schemas /code/schemas
 
 # Set the entrypoint script as the entrypoint
-# ENV APP_MODULE="data.store.app.main:app"
+ENV APP_MODULE="data.store.app.main:app"
 ENTRYPOINT ["/code/entrypoint.sh"]
 
 #
@@ -36,10 +36,10 @@ RUN pip install --no-cache-dir --upgrade -r /code/requirements.txt
 # Add Service
 COPY ./data/ingest/app /code/data/ingest/app
 # Add Internal Deps
-# COPY ./common /code/common
-# COPY ./routers /code/routers
-# COPY ./schemas /code/schemas
+COPY ./common /code/common
+COPY ./routers /code/routers
+COPY ./schemas /code/schemas
 
 # Set the entrypoint script as the entrypoint
-# ENV APP_MODULE="data.ingest.app.main:app"
+ENV APP_MODULE="data.ingest.app.main:app"
 ENTRYPOINT ["/code/entrypoint.sh"]
