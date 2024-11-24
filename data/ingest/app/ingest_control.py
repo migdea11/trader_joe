@@ -4,9 +4,12 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest, StockQuotesRequest, StockSnapshotRequest, StockTradesRequest
+from alpaca.data.requests import StockBarsRequest, StockLatestBarRequest
+from alpaca.data.requests import StockQuotesRequest, StockLatestQuoteRequest
+from alpaca.data.requests import StockTradesRequest, StockLatestTradeRequest
+from alpaca.data.requests import StockSnapshotRequest
 from alpaca.data.timeframe import TimeFrame
-from alpaca.data.models.bars import Bar
+from alpaca.data.models.bars import Bar, BarSet
 from kafka import KafkaProducer
 
 from common.enums.data_select import DataType
@@ -30,6 +33,7 @@ THREAD_WORKERS = int(os.getenv('THREAD_WORKERS'))
 executor = ThreadPoolExecutor(max_workers=THREAD_WORKERS)
 
 def create_stock_price_volume(data: Bar, symbol: str, granularity: Granularity, source: DataSource) -> StockPriceVolume:
+    print("Adding: ", data)
     return StockPriceVolume(
         symbol=symbol,
         granularity=granularity,
@@ -49,11 +53,11 @@ async def store_retrieve_stock(request: DataRequest):
         "symbol_or_symbols": request.symbol,
         "timeframe": TimeFrame.Day,
         "limit": 10,
-        "start": (datetime.now() - timedelta(days=2)).isoformat(),
-        # "end": (datetime.now() - timedelta(days=1)).isoformat()
+        "start": (datetime.now() - timedelta(days=10)).isoformat(),
+        "end": (datetime.now() - timedelta(days=1)).isoformat()
     }
 
-    print(request)
+    print("params", params)
 
     tasks = []
     loop = asyncio.get_running_loop()
@@ -61,8 +65,10 @@ async def store_retrieve_stock(request: DataRequest):
     response_map = {}
 
     if DataType.BAR in request.data:
-        stock_bar_request = StockBarsRequest(**params)
-        task = loop.run_in_executor(executor, client.get_stock_bars, stock_bar_request)
+        if "start" not in params and "end" not in params:
+            task = loop.run_in_executor(executor, client.get_stock_latest_bar, StockLatestBarRequest(**params))
+        else:
+            task = loop.run_in_executor(executor, client.get_stock_bars, StockBarsRequest(**params))
         tasks.append(task)
         response_map[DataType.BAR] = len(tasks) - 1
 
@@ -93,11 +99,13 @@ async def store_retrieve_stock(request: DataRequest):
     symbol = request.symbol.upper()
     producer: KafkaProducer = get_producer(BROKER_NAME, BROKER_PORT, BROKER_CONN_TIMEOUT)
     if DataType.BAR in response_map:
-        stock_bars = results[response_map[DataType.BAR]]
-        print(f" bar results: {len(stock_bars[symbol])}")
+        stock_bars: BarSet = results[response_map[DataType.BAR]]
 
-        data_json = [create_stock_price_volume(bar, symbol, request.granularity, request.source).model_dump_json() for bar in stock_bars[symbol]]
-        producer.send('stock_price_volume', value=data_json)
+        if symbol in stock_bars.data:
+            bars = stock_bars[symbol] if isinstance(stock_bars[symbol], list) else [stock_bars[symbol]]
+            data_json = [create_stock_price_volume(bar, symbol, request.granularity, request.source).model_dump_json() for bar in bars]
+            print("sending:", data_json)
+            await producer.send('stock_price_volume', value=data_json)
     if DataType.QUOTE in response_map:
         stock_quotes = results[response_map[DataType.QUOTE]]
         print(f" quote results: {len(stock_quotes[symbol])}")
