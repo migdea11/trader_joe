@@ -26,7 +26,7 @@ services:
     environment:
       CLUSTER_ID: ${KAFKA_ID}
       KAFKA_LISTENERS: BROKER://0.0.0.0:9092,CONTROLLER://${BROKER_NAME}:9093
-      KAFKA_ADVERTISED_LISTENERS: BROKER://localhost:9092
+      KAFKA_ADVERTISED_LISTENERS: BROKER://${BROKER_NAME}:9092
       # KAFKA_LISTENERS: BROKER://${BROKER_NAME}:${BROKER_PORT},EXTERNAL://${BROKER_NAME}:9092,CONTROLLER://${BROKER_NAME}:9093
       # KAFKA_ADVERTISED_LISTENERS: BROKER://${BROKER_NAME}:${BROKER_PORT},EXTERNAL://${BROKER_NAME}:9092
       KAFKA_INTER_BROKER_LISTENER_NAME: BROKER
@@ -36,8 +36,9 @@ services:
       KAFKA_NODE_ID: 1
       KAFKA_CONTROLLER_QUORUM_VOTERS: '1@${BROKER_NAME}:9093'  #,2@kafka2:9093,3@kafka3:9093
       KAFKA_LOG_DIRS: '/var/lib/kafka/data'
+      KAFKA_CREATE_TOPICS: "stock_price_volume:1:1"
     volumes:
-      - ${DATA_DIR:-./volume_data}/kafka:/var/lib/kafka/data
+      - ${DATA_DIR:-./volume_data}/kafka:/var/lib/kafka/
 
   data_store:
     build:
@@ -49,7 +50,7 @@ services:
       - ./data/store/alembic.ini:/code/alembic.ini
       - ./data/store/migrations:/code/migrations
     ports:
-      - "8080:80"
+      - "${DATA_STORE}:80"
     env_file:
       - .env
       - ./data/store/.env
@@ -63,7 +64,7 @@ services:
       context: ./
       target: data_ingest
     ports:
-      - "8081:80"
+      - "${DATA_INGEST}:80"
     env_file:
       - .env
       - ./data/ingest/.env

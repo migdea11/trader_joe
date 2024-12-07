@@ -15,6 +15,7 @@ config = context.config
 load_dotenv(".env")
 database_url = os.getenv("DATABASE_URL")
 # Set the SQLALCHEMY_DATABASE_URL dynamically
+print(f"Setting up postgres URL: {database_url}")
 config.set_main_option('sqlalchemy.url', database_url)
 
 # Interpret the config file for Python logging.

@@ -1,8 +1,8 @@
 """Initial migration
 
-Revision ID: a62667a6c4d8
+Revision ID: 8d6b5a79176f
 Revises: 
-Create Date: 2024-11-20 18:14:24.381264
+Create Date: 2024-12-07 00:00:48.329075
 
 """
 from typing import Sequence, Union
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision: str = 'a62667a6c4d8'
+revision: str = '8d6b5a79176f'
 down_revision: Union[str, None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -30,7 +30,7 @@ def upgrade() -> None:
     sa.Column('close', sa.Float(), nullable=False),
     sa.Column('volume', sa.Integer(), nullable=False),
     sa.Column('granularity', sa.Enum('ONE_MINUTE', 'FIVE_MINUTES', 'ONE_HOUR', 'ONE_DAY', name='granularity'), nullable=False),
-    sa.Column('source', sa.Enum('BROKER_API', 'MANUAL_ENTRY', 'AUTOMATED_SYSTEM', name='datasource'), nullable=False),
+    sa.Column('source', sa.Enum('IB_API', 'ALPACA_API', 'MANUAL_ENTRY', name='datasource'), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
     op.create_index(op.f('ix_stock_price_volume_datetime'), 'stock_price_volume', ['datetime'], unique=False)

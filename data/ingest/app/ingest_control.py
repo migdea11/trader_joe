@@ -105,7 +105,9 @@ async def store_retrieve_stock(request: DataRequest):
             bars = stock_bars[symbol] if isinstance(stock_bars[symbol], list) else [stock_bars[symbol]]
             data_json = [create_stock_price_volume(bar, symbol, request.granularity, request.source).model_dump_json() for bar in bars]
             print("sending:", data_json)
-            await producer.send('stock_price_volume', value=data_json)
+            future = producer.send('stock_price_volume', value=data_json)
+            result = future.get(timeout=30)
+            print(result)
     if DataType.QUOTE in response_map:
         stock_quotes = results[response_map[DataType.QUOTE]]
         print(f" quote results: {len(stock_quotes[symbol])}")
