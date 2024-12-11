@@ -6,3 +6,4 @@ python-dotenv
 pydantic
 psycopg2-binary
 alembic
+httpx

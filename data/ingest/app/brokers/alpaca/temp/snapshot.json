@@ -1,0 +1,62 @@
+{
+    "symbol": "SPY",
+    "latest_trade": {
+        "conditions": [
+            " "
+        ],
+        "exchange": "V",
+        "id": 52983747786869,
+        "price": 604.365,
+        "size": 245.0,
+        "symbol": "SPY",
+        "tape": "B",
+        "timestamp": "2024, 12, 9, 20, 29, 5, 456391, tzinfo=TzInfo(UTC)"
+    },
+    "latest_quote": {
+        "ask_exchange": "V",
+        "ask_price": 604.42,
+        "ask_size": 2.0,
+        "bid_exchange": "V",
+        "bid_price": 604.4,
+        "bid_size": 1.0,
+        "conditions": [
+            "R"
+        ],
+        "symbol": "SPY",
+        "tape": "B",
+        "timestamp": "2024, 12, 9, 20, 29, 11, 578835, tzinfo=TzInfo(UTC)"
+    },
+    "minute_bar": {
+        "close": 604.38,
+        "high": 604.4,
+        "low": 604.35,
+        "open": 604.38,
+        "symbol": "SPY",
+        "timestamp": "2024, 12, 9, 20, 28, tzinfo=TzInfo(UTC)",
+        "trade_count": 23.0,
+        "volume": 1866.0,
+        "vwap": 604.367427
+    },
+    "daily_bar": {
+        "close": 604.38,
+        "high": 607.84,
+        "low": 604.35,
+        "open": 607.59,
+        "symbol": "SPY",
+        "timestamp": "2024, 12, 9, 5, 0, tzinfo=TzInfo(UTC)",
+        "trade_count": 8578.0,
+        "volume": 695317.0,
+        "vwap": 605.856032
+    },
+    "previous_daily_bar": {
+        "close": 607.89,
+        "high": 609.05,
+        "low": 607.02,
+        "open": 607.47,
+        "symbol": "SPY",
+        "timestamp": "2024, 12, 6, 5, 0, tzinfo=TzInfo(UTC)",
+        "trade_count": 9259.0,
+        "volume": 734753.0,
+        "vwap": 607.827239
+    }
+}

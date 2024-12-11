@@ -1,0 +1,57 @@
+[
+    {
+        "close": 603.63,
+        "high": 604.32,
+        "low": 602.47,
+        "open": 602.97,
+        "symbol": "SPY",
+        "timestamp": "datetime.datetime(2024, 12, 2, 5, 0, tzinfo=TzInfo(UTC))",
+        "trade_count": 327962.0,
+        "volume": 31745989.0,
+        "vwap": 603.497049
+    },
+    {
+        "close": 603.91,
+        "high": 604.16,
+        "low": 602.341,
+        "open": 603.39,
+        "symbol": "SPY",
+        "timestamp": "datetime.datetime(2024, 12, 3, 5, 0, tzinfo=TzInfo(UTC))",
+        "trade_count": 279092.0,
+        "volume": 26906629.0,
+        "vwap": 603.476262
+    },
+    {
+        "close": 607.66,
+        "high": 607.91,
+        "low": 604.95,
+        "open": 605.63,
+        "symbol": "SPY",
+        "timestamp": "datetime.datetime(2024, 12, 4, 5, 0, tzinfo=TzInfo(UTC))",
+        "trade_count": 324666.0,
+        "volume": 42787561.0,
+        "vwap": 606.696218
+    },
+    {
+        "close": 606.66,
+        "high": 608.48,
+        "low": 606.305,
+        "open": 607.66,
+        "symbol": "SPY",
+        "timestamp": "datetime.datetime(2024, 12, 5, 5, 0, tzinfo=TzInfo(UTC))",
+        "trade_count": 303780.0,
+        "volume": 28762183.0,
+        "vwap": 607.290697
+    },
+    {
+        "close": 607.81,
+        "high": 609.07,
+        "low": 607.02,
+        "open": 607.44,
+        "symbol": "SPY",
+        "timestamp": "datetime.datetime(2024, 12, 6, 5, 0, tzinfo=TzInfo(UTC))",
+        "trade_count": 282829.0,
+        "volume": 31241549.0,
+        "vwap": 607.88419
+    }
+]

@@ -1,0 +1,136 @@
+{
+    "SPY": [
+        {
+            "conditions": [
+                " ",
+                "I"
+            ],
+            "exchange": "D",
+            "id": 71696834508357,
+            "price": 603.2099,
+            "size": 7.0,
+            "symbol": "SPY",
+            "tape": "B",
+            "timestamp": "2024, 11, 29, 17, 49, 54, 660052, tzinfo=TzInfo(UTC)"
+        },
+        {
+            "conditions": [
+                " ",
+                "I"
+            ],
+            "exchange": "D",
+            "id": 71696834511945,
+            "price": 603.205,
+            "size": 10.0,
+            "symbol": "SPY",
+            "tape": "B",
+            "timestamp": "2024, 11, 29, 17, 49, 54, 973892, tzinfo=TzInfo(UTC)"
+        },
+        {
+            "conditions": [
+                " ",
+                "I"
+            ],
+            "exchange": "Z",
+            "id": 52983525889347,
+            "price": 603.21,
+            "size": 80.0,
+            "symbol": "SPY",
+            "tape": "B",
+            "timestamp": "2024, 11, 29, 17, 49, 55, 201691, tzinfo=TzInfo(UTC)"
+        },
+        {
+            "conditions": [
+                " ",
+                "I"
+            ],
+            "exchange": "D",
+            "id": 71696834516051,
+            "price": 603.2035,
+            "size": 5.0,
+            "symbol": "SPY",
+            "tape": "B",
+            "timestamp": "2024, 11, 29, 17, 49, 55, 339846, tzinfo=TzInfo(UTC)"
+        },
+        {
+            "conditions": [
+                " "
+            ],
+            "exchange": "D",
+            "id": 71696848533584,
+            "price": 603.205,
+            "size": 500.0,
+            "symbol": "SPY",
+            "tape": "B",
+            "timestamp": "2024, 11, 29, 17, 49, 55, 721513, tzinfo=TzInfo(UTC)"
+        },
+        {
+            "conditions": [
+                " ",
+                "I"
+            ],
+            "exchange": "D",
+            "id": 71696848533589,
+            "price": 603.2,
+            "size": 52.0,
+            "symbol": "SPY",
+            "tape": "B",
+            "timestamp": "2024, 11, 29, 17, 49, 55, 723203, tzinfo=TzInfo(UTC)"
+        },
+        {
+            "conditions": [
+                " ",
+                "F",
+                "I"
+            ],
+            "exchange": "T",
+            "id": 62879650565474,
+            "price": 603.21,
+            "size": 20.0,
+            "symbol": "SPY",
+            "tape": "B",
+            "timestamp": "2024, 11, 29, 17, 49, 56, 245731, tzinfo=TzInfo(UTC)"
+        },
+        {
+            "conditions": [
+                " ",
+                "F",
+                "I"
+            ],
+            "exchange": "T",
+            "id": 62879650565475,
+            "price": 603.21,
+            "size": 80.0,
+            "symbol": "SPY",
+            "tape": "B",
+            "timestamp": "2024, 11, 29, 17, 49, 56, 245734, tzinfo=TzInfo(UTC)"
+        },
+        {
+            "conditions": [
+                " ",
+                "F"
+            ],
+            "exchange": "P",
+            "id": 52983543378768,
+            "price": 603.2,
+            "size": 100.0,
+            "symbol": "SPY",
+            "tape": "B",
+            "timestamp": "2024, 11, 29, 17, 49, 56, 308720, tzinfo=TzInfo(UTC)"
+        },
+        {
+            "conditions": [
+                " ",
+                "F",
+                "I"
+            ],
+            "exchange": "P",
+            "id": 52983543378769,
+            "price": 603.2,
+            "size": 30.0,
+            "symbol": "SPY",
+            "tape": "B",
+            "timestamp": "2024, 11, 29, 17, 49, 56, 308720, tzinfo=TzInfo(UTC)"
+        }
+    ]
+}

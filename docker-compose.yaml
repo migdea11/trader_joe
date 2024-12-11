@@ -27,16 +27,14 @@ services:
       CLUSTER_ID: ${KAFKA_ID}
       KAFKA_LISTENERS: BROKER://0.0.0.0:9092,CONTROLLER://${BROKER_NAME}:9093
       KAFKA_ADVERTISED_LISTENERS: BROKER://${BROKER_NAME}:9092
-      # KAFKA_LISTENERS: BROKER://${BROKER_NAME}:${BROKER_PORT},EXTERNAL://${BROKER_NAME}:9092,CONTROLLER://${BROKER_NAME}:9093
-      # KAFKA_ADVERTISED_LISTENERS: BROKER://${BROKER_NAME}:${BROKER_PORT},EXTERNAL://${BROKER_NAME}:9092
       KAFKA_INTER_BROKER_LISTENER_NAME: BROKER
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,BROKER:PLAINTEXT,EXTERNAL:PLAINTEXT
       KAFKA_PROCESS_ROLES: 'controller,broker'
       KAFKA_NODE_ID: 1
-      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@${BROKER_NAME}:9093'  #,2@kafka2:9093,3@kafka3:9093
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@${BROKER_NAME}:9093'
       KAFKA_LOG_DIRS: '/var/lib/kafka/data'
-      KAFKA_CREATE_TOPICS: "stock_price_volume:1:1"
+      KAFKA_CREATE_TOPICS: "stock_market_activity:1:1,stock_market_quote:1:1,stock_market_trade:1:1"
     volumes:
       - ${DATA_DIR:-./volume_data}/kafka:/var/lib/kafka/
 
@@ -44,18 +42,18 @@ services:
     build:
       context: ./
       target: data_store
-      # args:
-      #   DATA_DIR: ${DATA_DIR:-./data}
+    hostname: ${DATA_STORE_NAME:-data_store}
+    ports:
+      - "${DATA_STORE_PORT}:${APP_INTERNAL_PORT}"
     volumes:
       - ./data/store/alembic.ini:/code/alembic.ini
       - ./data/store/migrations:/code/migrations
-    ports:
-      - "${DATA_STORE}:80"
     env_file:
       - .env
       - ./data/store/.env
     environment:
       - DATABASE_URL=${DATABASE_URL:-postgresql://postgres:password@db:5432/postgres}
+      - LOG_LEVEL=debug
     depends_on:
       - postgres
 
@@ -63,10 +61,13 @@ services:
     build:
       context: ./
       target: data_ingest
+    hostname: ${DATA_INGEST_NAME:-data_ingest}
     ports:
-      - "${DATA_INGEST}:80"
+      - "${DATA_INGEST_PORT}:${APP_INTERNAL_PORT}"
     env_file:
       - .env
       - ./data/ingest/.env
+    environment:
+      - LOG_LEVEL=debug
     depends_on:
       - kafka

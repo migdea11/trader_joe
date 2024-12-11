@@ -5,6 +5,8 @@ class Granularity(str, Enum):
     FIVE_MINUTES = "5min"
     ONE_HOUR = "1hour"
     ONE_DAY = "1day"
+    ONE_WEEK = "1week"
+    ONE_MONTH = "1month"
 
 class DataSource(str, Enum):
     IB_API = "IB"

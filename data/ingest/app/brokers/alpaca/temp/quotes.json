@@ -1,0 +1,142 @@
+[
+    {
+        "ask_exchange": "T",
+        "ask_price": 603.2,
+        "ask_size": 11.0,
+        "bid_exchange": "P",
+        "bid_price": 603.19,
+        "bid_size": 2.0,
+        "conditions": [
+            "R"
+        ],
+        "symbol": "SPY",
+        "tape": "B",
+        "timestamp": "2024, 11, 29, 17, 47, 25, 979566, tzinfo=TzInfo(UTC)"
+    },
+    {
+        "ask_exchange": "T",
+        "ask_price": 603.2,
+        "ask_size": 11.0,
+        "bid_exchange": "P",
+        "bid_price": 603.19,
+        "bid_size": 1.0,
+        "conditions": [
+            "R"
+        ],
+        "symbol": "SPY",
+        "tape": "B",
+        "timestamp": "2024, 11, 29, 17, 47, 25, 995063, tzinfo=TzInfo(UTC)"
+    },
+    {
+        "ask_exchange": "T",
+        "ask_price": 603.2,
+        "ask_size": 11.0,
+        "bid_exchange": "P",
+        "bid_price": 603.19,
+        "bid_size": 2.0,
+        "conditions": [
+            "R"
+        ],
+        "symbol": "SPY",
+        "tape": "B",
+        "timestamp": "2024, 11, 29, 17, 47, 26, 8074, tzinfo=TzInfo(UTC)"
+    },
+    {
+        "ask_exchange": "T",
+        "ask_price": 603.2,
+        "ask_size": 11.0,
+        "bid_exchange": "P",
+        "bid_price": 603.19,
+        "bid_size": 1.0,
+        "conditions": [
+            "R"
+        ],
+        "symbol": "SPY",
+        "tape": "B",
+        "timestamp": "2024, 11, 29, 17, 47, 26, 8139, tzinfo=TzInfo(UTC)"
+    },
+    {
+        "ask_exchange": "T",
+        "ask_price": 603.2,
+        "ask_size": 12.0,
+        "bid_exchange": "P",
+        "bid_price": 603.19,
+        "bid_size": 1.0,
+        "conditions": [
+            "R"
+        ],
+        "symbol": "SPY",
+        "tape": "B",
+        "timestamp": "2024, 11, 29, 17, 47, 26, 315470, tzinfo=TzInfo(UTC)"
+    },
+    {
+        "ask_exchange": "T",
+        "ask_price": 603.2,
+        "ask_size": 11.0,
+        "bid_exchange": "P",
+        "bid_price": 603.19,
+        "bid_size": 1.0,
+        "conditions": [
+            "R"
+        ],
+        "symbol": "SPY",
+        "tape": "B",
+        "timestamp": "2024, 11, 29, 17, 47, 26, 315480, tzinfo=TzInfo(UTC)"
+    },
+    {
+        "ask_exchange": "T",
+        "ask_price": 603.2,
+        "ask_size": 12.0,
+        "bid_exchange": "P",
+        "bid_price": 603.19,
+        "bid_size": 1.0,
+        "conditions": [
+            "R"
+        ],
+        "symbol": "SPY",
+        "tape": "B",
+        "timestamp": "2024, 11, 29, 17, 47, 26, 335548, tzinfo=TzInfo(UTC)"
+    },
+    {
+        "ask_exchange": "T",
+        "ask_price": 603.2,
+        "ask_size": 12.0,
+        "bid_exchange": "T",
+        "bid_price": 603.19,
+        "bid_size": 1.0,
+        "conditions": [
+            "R"
+        ],
+        "symbol": "SPY",
+        "tape": "B",
+        "timestamp": "2024, 11, 29, 17, 47, 26, 368882, tzinfo=TzInfo(UTC)"
+    },
+    {
+        "ask_exchange": "T",
+        "ask_price": 603.2,
+        "ask_size": 11.0,
+        "bid_exchange": "P",
+        "bid_price": 603.19,
+        "bid_size": 1.0,
+        "conditions": [
+            "R"
+        ],
+        "symbol": "SPY",
+        "tape": "B",
+        "timestamp": "2024, 11, 29, 17, 47, 26, 689620, tzinfo=TzInfo(UTC)"
+    },
+    {
+        "ask_exchange": "T",
+        "ask_price": 603.2,
+        "ask_size": 11.0,
+        "bid_exchange": "T",
+        "bid_price": 603.19,
+        "bid_size": 1.0,
+        "conditions": [
+            "R"
+        ],
+        "symbol": "SPY",
+        "tape": "B",
+        "timestamp": "2024, 11, 29, 17, 47, 26, 725275, tzinfo=TzInfo(UTC)"
+    }
+]

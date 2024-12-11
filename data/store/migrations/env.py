@@ -5,7 +5,10 @@ from alembic import context
 from dotenv import load_dotenv
 from sqlalchemy import engine_from_config, pool
 
-from data.store.app.db.models.stock_price_volume import Base
+from common.logging import get_logger
+from data.store.app.db.models.stock_market_activity_data import Base
+
+log = get_logger(__name__)
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -15,10 +18,10 @@ config = context.config
 load_dotenv(".env")
 database_url = os.getenv("DATABASE_URL")
 # Set the SQLALCHEMY_DATABASE_URL dynamically
-print(f"Setting up postgres URL: {database_url}")
+log.debug(f"Setting up postgres URL: {database_url}")
 config.set_main_option('sqlalchemy.url', database_url)
 
-# Interpret the config file for Python logging.
+# Interpret the config file for Python log.
 # This line sets up loggers basically.
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

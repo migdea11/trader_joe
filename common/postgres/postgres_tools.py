@@ -1,34 +1,40 @@
 import time
-import os
+from typing import Dict, Tuple
 import psycopg2
 
-from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import Engine, create_engine
+from sqlalchemy.orm import sessionmaker, Session
 
-__POSTGRES_INSTANCE = {}
+from common.logging import get_logger
 
-def wait_for_db(url: str, timeout: int):
+log = get_logger(__name__)
+
+__POSTGRES_INSTANCE: Dict[str, Tuple[Engine, sessionmaker]] = {}
+
+
+def wait_for_db(url: str, timeout: int) -> bool:
     start_time = time.time()
     while True:
         try:
             conn = psycopg2.connect(url)
             conn.close()
-            print("Database is ready!")
+            log.info("Postgres is ready!")
             break
         except psycopg2.OperationalError:
             elapsed_time = time.time() - start_time
             if elapsed_time >= timeout:
-                print("Failed to connect to Kafka after {} seconds.".format(timeout))
+                log.error("Failed to connect to Postgres after {} seconds.".format(timeout))
                 return False
-            print("Waiting for Kafka to be ready...")
+            log.debug("Waiting for Postgres to be ready...")
             time.sleep(5)
     return True
 
-def get_instance(host: str, port: int, timeout: int):
+
+def get_instance(host: str, port: int, timeout: int) -> Session:
     url = f"{host}:{port}"
     if url not in __POSTGRES_INSTANCE and wait_for_db(url, port, timeout):
         engine = create_engine(url)
-        session = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-        __POSTGRES_INSTANCE[url] = (engine, session)
-    return __POSTGRES_INSTANCE[url][1]
+        session_maker = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        __POSTGRES_INSTANCE[url] = (engine, session_maker)
+    engine, session_maker = __POSTGRES_INSTANCE[url]
+    return session_maker(engine)
