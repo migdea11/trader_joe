@@ -7,7 +7,10 @@ from schemas import stock_market_activity_data
 log = get_logger(__name__)
 
 
-def create_stock_market_activity_data(stock_data: stock_market_activity_data.StockMarketActivityDataCreate, db: Session):
+def create_stock_market_activity_data(
+    stock_data: stock_market_activity_data.StockMarketActivityDataCreate,
+    db: Session
+):
     log.debug("Storing stock market activity data")
     db_stock_price_volume = StockMarketActivityData(**stock_data.model_dump())
     db.add(db_stock_price_volume)

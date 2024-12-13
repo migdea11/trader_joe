@@ -1,6 +1,6 @@
-fastapi
-uvicorn[standard]
-python-dotenv
-pydantic
 alpaca-py
+fastapi
 kafka-python-ng
+pydantic
+python-dotenv
+uvicorn[standard]

@@ -2,7 +2,7 @@ import time
 from typing import Dict, Tuple
 import psycopg2
 
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import URL, Engine, create_engine
 from sqlalchemy.orm import sessionmaker, Session
 
 from common.logging import get_logger
@@ -12,11 +12,12 @@ log = get_logger(__name__)
 __POSTGRES_INSTANCE: Dict[str, Tuple[Engine, sessionmaker]] = {}
 
 
-def wait_for_db(url: str, timeout: int) -> bool:
+def wait_for_db(uri: URL, timeout: int) -> bool:
+    uri_str = uri.render_as_string(hide_password=False)
     start_time = time.time()
     while True:
         try:
-            conn = psycopg2.connect(url)
+            conn = psycopg2.connect(uri_str)
             conn.close()
             log.info("Postgres is ready!")
             break
@@ -30,11 +31,11 @@ def wait_for_db(url: str, timeout: int) -> bool:
     return True
 
 
-def get_instance(host: str, port: int, timeout: int) -> Session:
-    url = f"{host}:{port}"
-    if url not in __POSTGRES_INSTANCE and wait_for_db(url, port, timeout):
-        engine = create_engine(url)
+def get_instance(uri: URL, timeout: int) -> Session:
+    uri_str = uri.render_as_string(hide_password=False)
+    if uri not in __POSTGRES_INSTANCE and wait_for_db(uri, timeout):
+        engine = create_engine(uri)
         session_maker = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-        __POSTGRES_INSTANCE[url] = (engine, session_maker)
-    engine, session_maker = __POSTGRES_INSTANCE[url]
-    return session_maker(engine)
+        __POSTGRES_INSTANCE[uri_str] = session_maker
+    session_maker = __POSTGRES_INSTANCE[uri_str]
+    return session_maker()

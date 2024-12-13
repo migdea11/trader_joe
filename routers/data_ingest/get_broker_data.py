@@ -30,6 +30,6 @@ async def store_data(
 
     request = {**body_dict, "asset_type": asset_type, "symbol": symbol}
     log.debug(request)
-    await asset_map[asset_type](DataRequest(**request))
+    asset_map[asset_type](DataRequest(**request))
 
     return {"message": "Data retrieval started."}

@@ -16,10 +16,10 @@ config = context.config
 
 # Assuming your .env file is in the same directory as your Alembic directory or specify the path
 load_dotenv(".env")
-database_url = os.getenv("DATABASE_URL")
-# Set the SQLALCHEMY_DATABASE_URL dynamically
-log.debug(f"Setting up postgres URL: {database_url}")
-config.set_main_option('sqlalchemy.url', database_url)
+database_uri = os.getenv("DATABASE_URI")
+# Set the SQLALCHEMY_DATABASE_URI dynamically
+log.debug(f"Setting up postgres URL: {database_uri}")
+config.set_main_option('sqlalchemy.url', database_uri)
 
 # Interpret the config file for Python log.
 # This line sets up loggers basically.

@@ -17,7 +17,7 @@ from alpaca.data.timeframe import TimeFrame
 
 from common.enums.data_select import DataType
 from common.enums.data_stock import DataSource, Granularity
-from common.kafka.topics import StaticTopic
+from common.kafka.topics import StaticTopic, TopicTyping
 from common.logging import get_logger
 from schemas.stock_market_activity_data import StockMarketActivityData
 from schemas.store_broker_data import DataRequest
@@ -34,8 +34,10 @@ __CLIENT = StockHistoricalDataClient(API_KEY, API_SECRET)
 def create_stock_market_activity_data(
     data: Bar, symbol: str, granularity: Granularity, source: DataSource
 ) -> StockMarketActivityData:
-    log.debug("Adding: ", data)
+    log.debug("Adding: %s", data)
+    now = datetime.now()
     return StockMarketActivityData(
+        timestamp=data.timestamp,
         symbol=symbol,
         granularity=granularity,
         source=source,
@@ -46,7 +48,10 @@ def create_stock_market_activity_data(
         close=data.close,
         volume=data.volume,
         trade_count=data.trade_count,
-        vwap=data.vwap,
+        split_factor=1,
+        dividends_factor=1,
+        created_at=now,
+        updated_at=now
     )
 
 
@@ -54,7 +59,7 @@ def create_stock_quote(data: Quote, symbol: str, granularity: Granularity, sourc
     return None
 
 
-async def get_market_data(executor: ThreadPoolExecutor, request: DataRequest) -> Dict[StaticTopic, List[str]]:
+async def get_market_data(executor: ThreadPoolExecutor, request: DataRequest) -> Dict[TopicTyping, List[str]]:
     params = {
             "symbol_or_symbols": request.symbol,
             "timeframe": TimeFrame.Day,

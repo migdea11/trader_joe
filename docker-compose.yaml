@@ -52,7 +52,7 @@ services:
       - .env
       - ./data/store/.env
     environment:
-      - DATABASE_URL=${DATABASE_URL:-postgresql://postgres:password@db:5432/postgres}
+      - DATABASE_URI=${DATABASE_URI:-postgresql://postgres:password@db:5432/postgres}
       - LOG_LEVEL=debug
     depends_on:
       - postgres

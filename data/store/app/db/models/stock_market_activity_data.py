@@ -6,19 +6,21 @@ from common.enums.data_stock import DataSource, Granularity
 Base = declarative_base()
 
 
+# TODO figure out actual primary keys
 class StockMarketActivityData(Base):
     __tablename__ = 'stock_market_activity_data'
 
     id = Column(Integer, primary_key=True)
+    timestamp = Column(DateTime, nullable=False)
     symbol = Column(String, nullable=False)
-    datetime = Column(DateTime, nullable=False, index=True)
+    granularity = Column(Enum(Granularity), nullable=False)  # e.g., '1min', '1hour', 'daily'
+    source = Column(Enum(DataSource), nullable=False)        # e.g., 'Broker API', 'Manual Entry'
     open = Column(Float, nullable=False)
     high = Column(Float, nullable=False)
     low = Column(Float, nullable=False)
     close = Column(Float, nullable=False)
     volume = Column(Integer, nullable=False)
-    granularity = Column(Enum(Granularity), nullable=False)  # e.g., '1min', '1hour', 'daily'
-    source = Column(Enum(DataSource), nullable=False)        # e.g., 'Broker API', 'Manual Entry'
+    trade_count = Column(Integer, nullable=False)
     split_factor = Column(Float, nullable=False, default=1.0)
     dividends_factor = Column(Float, nullable=False, default=1.0)
     # Dates used to manage split and dividends adjustments
