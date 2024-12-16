@@ -8,15 +8,18 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.models.bars import Bar, BarSet
 from alpaca.data.models.quotes import Quote, QuoteSet
 from alpaca.data.requests import (
-    StockBarsRequest, StockLatestBarRequest,
+    StockBarsRequest,
+    StockLatestBarRequest,
     StockLatestQuoteRequest,
-    StockLatestTradeRequest, StockQuotesRequest,
+    StockLatestTradeRequest,
+    StockQuotesRequest,
     StockTradesRequest
 )
 from alpaca.data.timeframe import TimeFrame
 
 from common.enums.data_select import DataType
 from common.enums.data_stock import DataSource, Granularity
+from common.environment import get_env_var
 from common.kafka.topics import StaticTopic, TopicTyping
 from common.logging import get_logger
 from schemas.stock_market_activity_data import StockMarketActivityData
@@ -25,8 +28,8 @@ from schemas.store_broker_data import DataRequest
 log = get_logger(__name__)
 
 # Configure Alpaca Client
-API_KEY = os.getenv('ALPACA_API_KEY')
-API_SECRET = os.getenv('ALPACA_API_SECRET')
+API_KEY = get_env_var('ALPACA_API_KEY')
+API_SECRET = get_env_var('ALPACA_API_SECRET')
 log.debug(f"API_KEY: {API_KEY}, API_SECRET: {API_SECRET}")
 __CLIENT = StockHistoricalDataClient(API_KEY, API_SECRET)
 

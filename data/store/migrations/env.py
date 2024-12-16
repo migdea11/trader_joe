@@ -1,10 +1,10 @@
-import os
 from logging.config import fileConfig
 
 from alembic import context
 from dotenv import load_dotenv
 from sqlalchemy import engine_from_config, pool
 
+from common.environment import get_env_var
 from common.logging import get_logger
 from data.store.app.db.models.stock_market_activity_data import Base
 
@@ -16,7 +16,7 @@ config = context.config
 
 # Assuming your .env file is in the same directory as your Alembic directory or specify the path
 load_dotenv(".env")
-database_uri = os.getenv("DATABASE_URI")
+database_uri = get_env_var("DATABASE_URI")
 # Set the SQLALCHEMY_DATABASE_URI dynamically
 log.debug(f"Setting up postgres URL: {database_uri}")
 config.set_main_option('sqlalchemy.url', database_uri)

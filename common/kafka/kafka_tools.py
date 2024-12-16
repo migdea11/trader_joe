@@ -1,16 +1,23 @@
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import json
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, List, Union
 
-from common.logging import get_logger
-from common.kafka.topics import TopicTyping, ConsumerGroup
-from kafka import KafkaAdminClient, KafkaConsumer, KafkaProducer, TopicPartition, OffsetAndMetadata
+from kafka import (
+    KafkaAdminClient,
+    KafkaConsumer,
+    KafkaProducer,
+    OffsetAndMetadata,
+    TopicPartition
+)
 from kafka.admin import NewTopic
 from kafka.consumer.fetcher import ConsumerRecord
 from kafka.errors import KafkaError
+
+from common.kafka.topics import ConsumerGroup, TopicTyping
+from common.logging import get_logger
 
 log = get_logger(__name__)
 
@@ -100,6 +107,15 @@ def wait_for_kafka(
     return True
 
 
+def close_kafka():
+    if __KAFKA_ADMIN_CLIENT is not None:
+        __KAFKA_ADMIN_CLIENT.close()
+    for producer in __KAFKA_PUB_INSTANCES.values():
+        producer.close()
+    for consumer in __KAFKA_SUB_INSTANCES.values():
+        consumer.close()
+
+
 def get_producer(host: str, port: int, timeout: int) -> KafkaProducer:
     clientParams = ProducerParams(host, port, timeout)
     if clientParams.get_key() not in __KAFKA_PUB_INSTANCES:
@@ -121,7 +137,6 @@ def flush_messages_async(executor: ThreadPoolExecutor, producer: KafkaProducer):
 def get_consumer(clientParams: ConsumerParams) -> KafkaConsumer:
     wait_for_kafka(clientParams)
     if clientParams.get_key() not in __KAFKA_SUB_INSTANCES:
-        log.debug("Waiting for Consumer")
         consumer_topics = [topic.value for topic in clientParams.topics]
         consumer = KafkaConsumer(
             *consumer_topics,
@@ -179,3 +194,4 @@ async def consume_messages_async(
     # Offload the Kafka consumer loop to a separate thread
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(executor, consume_messages)
+

@@ -1,9 +1,10 @@
-import os
 from enum import Enum
 
-APP_NAME = os.getenv("DATA_INGEST_NAME")
-APP_PORT = int(os.getenv("DATA_INGEST_PORT"))
-APP_PORT_INTERNAL = int(os.getenv("APP_INTERNAL_PORT"))
+from common.environment import get_env_var
+
+APP_NAME = get_env_var("DATA_INGEST_NAME")
+APP_PORT = get_env_var("DATA_INGEST_PORT", is_num=True)
+APP_PORT_INTERNAL = get_env_var("APP_INTERNAL_PORT", is_num=True)
 
 
 class Interface(str, Enum):

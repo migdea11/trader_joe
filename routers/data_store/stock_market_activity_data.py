@@ -5,10 +5,14 @@ from sqlalchemy.orm import Session
 
 from common.enums.data_select import AssetType
 from common.logging import get_logger
-from data.store.app.db.crud import stock_market_activity_data as crud_stock_price_volume
-from routers.data_store.app_endpoints import MarketDataInterface
-from schemas.stock_market_activity_data import StockMarketActivityData, StockMarketActivityDataCreate
+from data.store.app.db.crud import \
+    stock_market_activity_data as crud_stock_price_volume
 from data.store.app.db.database import get_instance
+from routers.data_store.app_endpoints import MarketDataInterface
+from schemas.stock_market_activity_data import (
+    StockMarketActivityData,
+    StockMarketActivityDataCreate
+)
 
 router = APIRouter()
 log = get_logger(__name__)
