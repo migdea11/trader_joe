@@ -28,7 +28,7 @@ def verify_code_mapping():
 async def send_on_receive(producer: KafkaProducer, data_request: Coroutine[Any, Any, Dict[TopicTyping, List[str]]]):
     topic_map = await data_request
     for topic, data in topic_map.items():
-        log.debug("sending: %s", data)
+        log.debug("sending to: %s", topic.value)
         send_message_async(EXECUTOR, producer, topic.value, data)
 
 

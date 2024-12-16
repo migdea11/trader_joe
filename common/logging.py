@@ -1,5 +1,8 @@
 import logging
 
+# Suppress Kafka logs
+logging.getLogger("kafka").setLevel(logging.WARNING)
+
 
 def get_logger(name: str) -> logging.Logger:
     logging.basicConfig(

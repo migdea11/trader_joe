@@ -8,6 +8,8 @@ APP_PORT_INTERNAL = int(os.getenv("APP_INTERNAL_PORT"))
 
 class MarketDataInterface(str, Enum):
     POST_MARKET_ACTIVITY = "/market-activity/{asset_type}"
+    DELETE_MARKET_ACTIVITY = "/market-activity/{stock_data_id}"
+    DELETE_ALL_MARKET_ACTIVITY = "/market-activity/"
     GET_MARKET_ACTIVITY = "/market-activity/{asset_type}"
 
 

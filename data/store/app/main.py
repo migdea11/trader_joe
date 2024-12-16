@@ -6,6 +6,8 @@ from alembic.config import Config
 from fastapi import FastAPI
 
 from common.app_lifecycle import startup_logs, teardown_logs
+from common.kafka.kafka_tools import ConsumerParams, wait_for_kafka
+from common.kafka.topics import ConsumerGroup, StaticTopic
 from common.logging import get_logger
 from data.store.app.retrieve.data_action_request import store_market_activity_worker
 from common.worker_pool import worker_shutdown, worker_startup
@@ -14,6 +16,7 @@ from routers.data_store import stock_market_activity_data, store_broker_data
 from .db.database import DATABASE_URI, get_instance, wait_for_db
 
 log = get_logger(__name__)
+
 
 BROKER_NAME = os.getenv("BROKER_NAME")
 BROKER_PORT = int(os.getenv("BROKER_PORT"))
@@ -40,18 +43,29 @@ def run_migrations():
 async def lifespan(app: FastAPI):
     startup_logs(app)
     worker_startup()
-    # TODO fix migrations
-    # run_migrations()
 
-    # Setup Consumers
+    # Setup Kafka for all topics
+    clientParams = ConsumerParams(
+        BROKER_NAME,
+        BROKER_PORT,
+        [StaticTopic.STOCK_MARKET_ACTIVITY],
+        ConsumerGroup.DATA_STORE_GROUP,
+        False,
+        BROKER_CONN_TIMEOUT
+    )
+    wait_for_kafka(clientParams)
+
+    # Setup Workers
     store_market_activity_worker(
-        host=BROKER_NAME,
-        port=BROKER_PORT,
-        timeout=BROKER_CONN_TIMEOUT,
+        host=clientParams.host,
+        port=clientParams.port,
+        timeout=clientParams.timeout,
         db=get_instance()
     )
     log.info("Data Store Ready!!!")
+
     yield
+
     teardown_logs(app)
     worker_shutdown()
     # cleanup tasks

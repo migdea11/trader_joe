@@ -31,7 +31,7 @@ log.debug(f"API_KEY: {API_KEY}, API_SECRET: {API_SECRET}")
 __CLIENT = StockHistoricalDataClient(API_KEY, API_SECRET)
 
 
-def create_stock_market_activity_data(
+def convert_bar_to_schema(
     data: Bar, symbol: str, granularity: Granularity, source: DataSource
 ) -> StockMarketActivityData:
     log.debug("Adding: %s", data)
@@ -117,7 +117,7 @@ async def get_market_data(executor: ThreadPoolExecutor, request: DataRequest) ->
             bars = stock_bars[symbol] if isinstance(stock_bars[symbol], list) else [stock_bars[symbol]]
             log.debug(bars)
             topic_map[StaticTopic.STOCK_MARKET_ACTIVITY] = [
-                create_stock_market_activity_data(
+                convert_bar_to_schema(
                     bar, symbol, request.granularity, request.source
                 ).model_dump_json() for bar in bars
             ]

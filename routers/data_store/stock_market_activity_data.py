@@ -26,6 +26,19 @@ def create_stock_market_activity_data(
     return {}  # TODO: Add other asset types
 
 
+@router.delete(MarketDataInterface.DELETE_MARKET_ACTIVITY, response_model=StockMarketActivityData)
+def delete_stock_market_activity_data(
+    stock_data_id: int = Path(..., description="The ID of the stock data"),
+    db: Session = Depends(get_instance)
+):
+    return crud_stock_price_volume.delete_stock_market_activity_data(db=db, stock_data_id=stock_data_id)
+
+
+@router.delete(MarketDataInterface.DELETE_ALL_MARKET_ACTIVITY, response_model=List[StockMarketActivityData])
+def delete_all_stock_market_activity_data(db: Session = Depends(get_instance)):
+    return crud_stock_price_volume.delete_all_stock_market_activity_data(db=db)
+
+
 @router.get(MarketDataInterface.GET_MARKET_ACTIVITY, response_model=List[StockMarketActivityData])
 def read_stock_market_activity_data(db: Session = Depends(get_instance)):
     return crud_stock_price_volume.read_stock_market_activity_data(db=db)

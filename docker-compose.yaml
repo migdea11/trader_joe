@@ -16,7 +16,7 @@ services:
       - ${DATA_DIR:-./volume_data}/postgres:/var/lib/postgresql/data
 
   kafka:
-    image: confluentinc/cp-kafka:latest  # Make sure the version supports KRaft
+    image: confluentinc/cp-kafka:latest
     container_name: ${BROKER_NAME}
     ports:
       - "${BROKER_PORT}:9092"
@@ -29,14 +29,24 @@ services:
       KAFKA_ADVERTISED_LISTENERS: BROKER://${BROKER_NAME}:9092
       KAFKA_INTER_BROKER_LISTENER_NAME: BROKER
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,BROKER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,BROKER:PLAINTEXT
       KAFKA_PROCESS_ROLES: 'controller,broker'
       KAFKA_NODE_ID: 1
       KAFKA_CONTROLLER_QUORUM_VOTERS: '1@${BROKER_NAME}:9093'
       KAFKA_LOG_DIRS: '/var/lib/kafka/data'
-      KAFKA_CREATE_TOPICS: "stock_market_activity:1:1,stock_market_quote:1:1,stock_market_trade:1:1"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"  # Optional: Enable dynamic topic creation
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
     volumes:
       - ${DATA_DIR:-./volume_data}/kafka:/var/lib/kafka/
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/console:latest
+    ports:
+      - "${BROKER_UI_PORT}:8080"
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+    depends_on:
+      - kafka
 
   data_store:
     build:
