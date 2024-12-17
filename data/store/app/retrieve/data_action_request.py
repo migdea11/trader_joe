@@ -6,7 +6,7 @@ from kafka.consumer.fetcher import ConsumerRecord
 from sqlalchemy.orm import Session
 
 from common.environment import get_env_var
-from common.kafka.kafka_tools import ConsumerParams, consume_messages_async
+from common.kafka.kafka_consumer import ConsumerParams, SharedKafkaConsumer
 from common.kafka.topics import ConsumerGroup, StaticTopic
 from common.logging import get_logger
 from common.worker_pool import SharedWorkerPool
@@ -44,7 +44,7 @@ def store_market_activity_worker(host: str, port: int, timeout: int, db: Session
         timeout
     )
 
-    asyncio.create_task(consume_messages_async(
+    asyncio.create_task(SharedKafkaConsumer.consume_messages_async(
         SharedWorkerPool.get_instance(),
         clientConfig,
         callback,

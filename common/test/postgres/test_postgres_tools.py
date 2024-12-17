@@ -59,7 +59,6 @@ def test_wait_for_db_timeout(mock_psycopg_connect, mock_uri, cleanup):
 
     # Assert that the method retried and eventually returned False
     assert result is False
-    print(mock_psycopg_connect.call_count)
     assert mock_psycopg_connect.call_count > 1
 
 

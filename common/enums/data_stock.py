@@ -1,5 +1,6 @@
 from enum import Enum
 
+
 class Granularity(str, Enum):
     ONE_MINUTE = "1min"
     FIVE_MINUTES = "5min"
@@ -7,6 +8,7 @@ class Granularity(str, Enum):
     ONE_DAY = "1day"
     ONE_WEEK = "1week"
     ONE_MONTH = "1month"
+
 
 class DataSource(str, Enum):
     IB_API = "IB"

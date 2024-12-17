@@ -6,11 +6,8 @@ from fastapi import FastAPI
 
 from common.app_lifecycle import startup_logs, teardown_logs
 from common.environment import get_env_var
-from common.kafka.kafka_tools import (
-    ConsumerParams,
-    close_kafka,
-    wait_for_kafka
-)
+from common.kafka.kafka_config import ConsumerParams
+from common.kafka.kafka_consumer import SharedKafkaConsumer
 from common.kafka.topics import ConsumerGroup, StaticTopic
 from common.logging import get_logger
 from common.worker_pool import SharedWorkerPool
@@ -59,7 +56,7 @@ async def lifespan(app: FastAPI):
         False,
         BROKER_CONN_TIMEOUT
     )
-    wait_for_kafka(clientParams)
+    SharedKafkaConsumer.wait_for_kafka(clientParams)
 
     # Setup Workers
     store_market_activity_worker(
@@ -75,7 +72,7 @@ async def lifespan(app: FastAPI):
     # cleanup tasks
     teardown_logs(app)
     SharedWorkerPool.worker_shutdown()
-    close_kafka()
+    SharedKafkaConsumer.shutdown()
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(ping.router)
