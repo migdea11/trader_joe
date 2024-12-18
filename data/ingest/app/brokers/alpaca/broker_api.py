@@ -1,5 +1,4 @@
 import asyncio
-import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Dict, List
@@ -22,10 +21,13 @@ from common.enums.data_stock import DataSource, Granularity
 from common.environment import get_env_var
 from common.kafka.topics import StaticTopic, TopicTyping
 from common.logging import get_logger
+from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
 from schemas.stock_market_activity_data import StockMarketActivityData
 from schemas.store_broker_data import DataRequest
 
 log = get_logger(__name__)
+
+ALPACA_SIP_ENABLED = get_env_var('ALPACA_SIP_ENABLED')
 
 # Configure Alpaca Client
 API_KEY = get_env_var('ALPACA_API_KEY')
@@ -63,14 +65,15 @@ def create_stock_quote(data: Quote, symbol: str, granularity: Granularity, sourc
 
 
 async def get_market_data(executor: ThreadPoolExecutor, request: DataRequest) -> Dict[TopicTyping, List[str]]:
+    granularity: TimeFrame = AlpacaGranularity.from_granularity(request.granularity).broker_code
     params = {
-            "symbol_or_symbols": request.symbol,
-            "timeframe": TimeFrame.Day,
-            "limit": 10,
-            "start": (datetime.now() - timedelta(days=10)).isoformat(),
-            "end": (datetime.now() - timedelta(days=1)).isoformat()
-        }
-    log.debug("params", params)
+        "symbol_or_symbols": request.symbol,
+        "timeframe": granularity,
+        "limit": 100,
+        "start": request.start.isoformat() if request.start is not None else None,
+        "end": request.end.isoformat() if request.end is not None else None,
+    }
+    log.debug(f"params: {params}")
 
     tasks = []
     loop = asyncio.get_running_loop()

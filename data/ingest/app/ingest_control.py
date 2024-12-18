@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime
 from typing import Any, Coroutine, Dict, List
 
 from kafka import KafkaProducer
