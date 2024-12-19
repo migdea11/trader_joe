@@ -1,5 +1,9 @@
 from enum import Enum
-from typing import Generic, Self, Type, TypeVar
+from typing import Self, TypeVar, Generic, Type
+
+
+# Define a TypeVar to represent the broker-specific type
+T = TypeVar("T")
 
 
 class Granularity(str, Enum):
@@ -10,9 +14,6 @@ class Granularity(str, Enum):
     ONE_DAY = "1day"
     ONE_WEEK = "1week"
     ONE_MONTH = "1month"
-
-
-T = TypeVar("T")
 
 
 class BrokerGranularityBase(Generic[T]):
@@ -45,7 +46,6 @@ class BrokerGranularityBase(Generic[T]):
         """
         Find and return the granularity mapping for a given broker code.
         """
-        granularity_map: Self
         for granularity_map in cls:
             if granularity_map.broker_code == broker_code:
                 return granularity_map
@@ -58,34 +58,40 @@ class BrokerGranularityBase(Generic[T]):
         """
         Find and return the broker-specific code for a given standardized granularity.
         """
-        granularity_map: Self
         for granularity_map in cls:
             if granularity_map.granularity == granularity:
                 return granularity_map
         raise ValueError(f"Granularity '{granularity}' not found in {cls.__name__}")
 
 
-class DataSource(str, Enum):
-    IB_API = "IB"
-    ALPACA_API = "ALPACA"
-    MANUAL_ENTRY = "MANUAL"
+class AlpacaGranularity(BrokerGranularityBase[str], Enum):
+    """
+    Specific implementation of BrokerGranularityBase for Alpaca's granularity mappings.
+    """
+
+    ONE_MINUTE = ("1Min", Granularity.ONE_MINUTE)
+    FIVE_MINUTES = ("5Min", Granularity.FIVE_MINUTES)
+    THIRTY_MINUTES = ("30Min", Granularity.THIRTY_MINUTES)
+    ONE_HOUR = ("1Hour", Granularity.ONE_HOUR)
+    ONE_DAY = ("1Day", Granularity.ONE_DAY)
+    ONE_WEEK = ("1Week", Granularity.ONE_WEEK)
+    ONE_MONTH = ("1Month", Granularity.ONE_MONTH)
+
+    # def __init__(self, broker_code: str, granularity: Granularity):
+    #     self._broker_code = broker_code
+    #     self._granularity = granularity
+
+    # @property
+    # def broker_code(self) -> str:
+    #     return self._broker_code
+
+    # @property
+    # def granularity(self) -> Granularity:
+    #     return self._granularity
 
 
-class ExpiryType(Enum):
-    # All items from request expire at the same time
-    BULK = "BULK"
-    # A max number of items are stored, when the limit is reached the oldest item is removed
-    BUFFER_1K = "BUFFER_1K"
-    BUFFER_10K = "BUFFER_10K"
-    BUFFER_100K = "BUFFER_100K"
-    # Each item from request expires at an offset from the first item (1day bars will expire 1 day after the previous)
-    ROLLING = "ROLLING"
-
-
-class UpdateType(Enum):
-    # Data is pulled once and never updated
-    STATIC = "STATIC"
-    # Data is pulled at the end of the day
-    DAILY = "DAILY"
-    # Data is streamed in real-time
-    STREAM = "STREAM"
+# Example usage
+print(AlpacaGranularity.ONE_MONTH.broker_code)  # Output: "1Month"
+print(AlpacaGranularity.ONE_MONTH.granularity)  # Output: Granularity.ONE_MONTH
+print(AlpacaGranularity.from_broker_code("1Month").granularity)  # Output: AlpacaGranularity.ONE_MONTH
+print(AlpacaGranularity.from_granularity(Granularity.ONE_MONTH).broker_code)  # Output: AlpacaGranularity.ONE_MONTH

@@ -8,4 +8,4 @@ APP_PORT_INTERNAL = get_env_var("APP_INTERNAL_PORT", is_num=True)
 
 
 class Interface(str, Enum):
-    POST_STORE_STOCK = "/broker/{asset_type}/{symbol}/"
+    POST_STORE_DATASET = "/broker/{asset_type}/{symbol}/{data_type}/"

@@ -1,6 +1,6 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, List
 
 from alpaca.data.historical import StockHistoricalDataClient
@@ -14,7 +14,6 @@ from alpaca.data.requests import (
     StockQuotesRequest,
     StockTradesRequest
 )
-from alpaca.data.timeframe import TimeFrame
 
 from common.enums.data_select import DataType
 from common.enums.data_stock import DataSource, Granularity
@@ -22,8 +21,8 @@ from common.environment import get_env_var
 from common.kafka.topics import StaticTopic, TopicTyping
 from common.logging import get_logger
 from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
-from schemas.stock_market_activity_data import StockMarketActivityData
-from schemas.store_broker_data import DataRequest
+from schemas.data_store.asset_market_activity_data import AssetMarketActivityData, AssetMarketActivityDataCreate
+from schemas.data_ingest.get_dataset_request import StockDatasetRequest
 
 log = get_logger(__name__)
 
@@ -38,23 +37,26 @@ __CLIENT = StockHistoricalDataClient(API_KEY, API_SECRET)
 
 def convert_bar_to_schema(
     data: Bar, symbol: str, granularity: Granularity, source: DataSource
-) -> StockMarketActivityData:
+) -> AssetMarketActivityDataCreate:
     log.debug("Adding: %s", data)
     now = datetime.now()
-    return StockMarketActivityData(
-        timestamp=data.timestamp,
-        symbol=symbol,
-        granularity=granularity,
+    return AssetMarketActivityDataCreate(
         source=source,
-        datetime=data.timestamp,
+        symbol=symbol,
+
+        timestamp=data.timestamp,
+        granularity=granularity,
+
         open=data.open,
         high=data.high,
         low=data.low,
         close=data.close,
         volume=data.volume,
         trade_count=data.trade_count,
+
         split_factor=1,
         dividends_factor=1,
+
         created_at=now,
         updated_at=now
     )
@@ -64,12 +66,13 @@ def create_stock_quote(data: Quote, symbol: str, granularity: Granularity, sourc
     return None
 
 
-async def get_market_data(executor: ThreadPoolExecutor, request: DataRequest) -> Dict[TopicTyping, List[str]]:
-    granularity: TimeFrame = AlpacaGranularity.from_granularity(request.granularity).broker_code
+async def get_market_data(
+    executor: ThreadPoolExecutor, request: StockDatasetRequest
+) -> Dict[TopicTyping, List[str]]:
+    granularity = AlpacaGranularity.from_granularity(request.granularity).broker_code
     params = {
         "symbol_or_symbols": request.symbol,
         "timeframe": granularity,
-        "limit": 100,
         "start": request.start.isoformat() if request.start is not None else None,
         "end": request.end.isoformat() if request.end is not None else None,
     }
@@ -83,7 +86,7 @@ async def get_market_data(executor: ThreadPoolExecutor, request: DataRequest) ->
     if "start" not in params and "end" not in params:
         latest = True
 
-    if DataType.BAR in request.data:
+    if DataType.BAR in request.data_type:
         if latest is True:
             task = loop.run_in_executor(executor, __CLIENT.get_stock_latest_bar, StockLatestBarRequest(**params))
         else:
@@ -91,7 +94,7 @@ async def get_market_data(executor: ThreadPoolExecutor, request: DataRequest) ->
         tasks.append(task)
         response_map[DataType.BAR] = len(tasks) - 1
 
-    if DataType.QUOTE in request.data:
+    if DataType.QUOTE in request.data_type:
         if latest is True:
             task = loop.run_in_executor(executor, __CLIENT.get_stock_latest_quote, StockLatestQuoteRequest(**params))
         else:
@@ -99,7 +102,7 @@ async def get_market_data(executor: ThreadPoolExecutor, request: DataRequest) ->
         tasks.append(task)
         response_map[DataType.QUOTE] = len(tasks) - 1
 
-    if DataType.TRADE in request.data:
+    if DataType.TRADE in request.data_type:
         if latest is True:
             task = loop.run_in_executor(executor, __CLIENT.get_stock_latest_trade, StockLatestTradeRequest(**params))
         else:
@@ -118,6 +121,7 @@ async def get_market_data(executor: ThreadPoolExecutor, request: DataRequest) ->
     topic_map = {}
     if DataType.BAR in response_map:
         stock_bars: BarSet = results[response_map[DataType.BAR]]
+        stock_bars
 
         if symbol in stock_bars.data:
             bars = stock_bars[symbol] if isinstance(stock_bars[symbol], list) else [stock_bars[symbol]]

@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import TypeVar, Self
+from typing import Generic, Type, TypeVar, Self
 
 T = TypeVar("T")
 
@@ -27,7 +27,7 @@ class ExchangeCode(str, Enum):
     PSX = "X"          # NASDAQ PSX (Philadelphia Stock Exchange)
 
 
-class BrokerExchangeBase(Enum):
+class BrokerExchangeBase(Generic[T]):
     """
     Base class for mapping broker-specific exchange codes to standardized exchange enums.
     """
@@ -50,20 +50,22 @@ class BrokerExchangeBase(Enum):
         return self._exchange
 
     @classmethod
-    def from_broker_code(cls, broker_code: T) -> Self:
+    def from_broker_code(cls: Type["BrokerExchangeBase"], broker_code: T) -> Self:
         """
         Returns the standardized exchange enum for the given broker code.
         """
+        exchange_map: Self
         for exchange_map in cls:
             if exchange_map.broker_code == broker_code:
                 return exchange_map
         raise ValueError(f"Broker code '{broker_code}' not found in {cls.__name__}")
 
     @classmethod
-    def get_broker_code(cls, exchange: ExchangeCode) -> Self:
+    def get_broker_code(cls: Type["BrokerExchangeBase"], exchange: ExchangeCode) -> Self:
         """
         Returns the broker-specific exchange code for the given standardized exchange.
         """
+        exchange_map: Self
         for exchange_map in cls:
             if exchange_map.exchange == exchange:
                 return exchange_map

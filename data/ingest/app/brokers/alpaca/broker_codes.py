@@ -6,7 +6,7 @@ from common.enums.exchange_code import BrokerExchangeBase, ExchangeCode
 from common.enums.data_stock import BrokerGranularityBase, Granularity
 
 
-class AlpacaGranularity(BrokerGranularityBase):
+class AlpacaGranularity(BrokerGranularityBase[TimeFrame], Enum):
     ONE_MINUTE = (TimeFrame(1, TimeFrameUnit.Minute), Granularity.ONE_MINUTE)
     FIVE_MINUTES = (TimeFrame(5, TimeFrameUnit.Minute), Granularity.FIVE_MINUTES)
     THIRTY_MINUTES = (TimeFrame(30, TimeFrameUnit.Minute), Granularity.THIRTY_MINUTES)
@@ -22,7 +22,7 @@ class ConditionCode(str, Enum):
     BUNCHED = "B"
 
 
-class AlpacaExchangeCode(BrokerExchangeBase):
+class AlpacaExchangeCode(BrokerExchangeBase[str], Enum):
     CBOE = ("W", ExchangeCode.CBOE)              # CBOE
     CBOE_BYX = ("Y", ExchangeCode.BYX)           # Cboe BYX
     CBOE_BZ = ("Z", ExchangeCode.OTHER)          # Cboe BZ

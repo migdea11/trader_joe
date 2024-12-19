@@ -1,4 +1,4 @@
-# TraderJoes
+# TraderJoe
 framework for testing trading algos
 
 ## Design

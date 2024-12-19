@@ -1,4 +1,4 @@
-from sqlalchemy import Column, DateTime, Enum, Float, Integer, String, func
+from sqlalchemy import UUID, Column, DateTime, Enum, Float, ForeignKey, Integer, String, func
 from sqlalchemy.ext.declarative import declarative_base
 
 from common.enums.data_stock import DataSource, Granularity
@@ -11,10 +11,11 @@ class StockMarketActivityData(Base):
     __tablename__ = 'stock_market_activity_data'
 
     id = Column(Integer, primary_key=True)
+    store_dataset_id = Column(UUID, ForeignKey("store_dataset_entry.id"), nullable=False)
     timestamp = Column(DateTime, nullable=False)
     symbol = Column(String, nullable=False)
-    granularity = Column(Enum(Granularity), nullable=False)  # e.g., '1min', '1hour', 'daily'
-    source = Column(Enum(DataSource), nullable=False)        # e.g., 'Broker API', 'Manual Entry'
+    granularity = Column(Enum(Granularity), nullable=False)
+    source = Column(Enum(DataSource), nullable=False)
     open = Column(Float, nullable=False)
     high = Column(Float, nullable=False)
     low = Column(Float, nullable=False)
@@ -29,7 +30,7 @@ class StockMarketActivityData(Base):
 
     def __repr__(self):
         return (
-            f"<StockPriceVolume(symbol='{self.symbol}', datetime='{self.datetime}', open={self.open}, "
-            f"high={self.high}, low={self.low}, close={self.close}, volume={self.volume}, "
-            f"granularity='{self.granularity}', source='{self.source}')>"
+            f"<StockPriceVolume(id='{self.id}', store_dataset_id='{self.store_dataset_id}', symbol='{self.symbol}', "
+            f"datetime='{self.datetime}', open='{self.open}', high='{self.high}', low='{self.low}', "
+            f"close='{self.close}', volume='{self.volume}', granularity='{self.granularity}', source='{self.source}')>"
         )

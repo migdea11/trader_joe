@@ -1,4 +1,5 @@
 alembic
+apscheduler
 asyncpg
 fastapi
 httpx

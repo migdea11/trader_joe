@@ -7,7 +7,7 @@ from common.kafka.kafka_config import ProducerParams
 from common.kafka.kafka_producer import SharedKafkaProducer
 from common.worker_pool import SharedWorkerPool
 from routers.common import ping
-from routers.data_ingest import get_broker_data
+from routers.data_ingest import get_dataset_request
 
 BROKER_NAME = get_env_var("BROKER_NAME")
 BROKER_PORT = get_env_var("BROKER_PORT", is_num=True)
@@ -26,4 +26,4 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(ping.router)
-app.include_router(get_broker_data.router)
+app.include_router(get_dataset_request.router)

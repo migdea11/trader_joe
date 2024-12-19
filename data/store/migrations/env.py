@@ -6,7 +6,7 @@ from sqlalchemy import engine_from_config, pool
 
 from common.environment import get_env_var
 from common.logging import get_logger
-from data.store.app.db.models.stock_market_activity_data import Base
+from data.store.app.db.models.stock_market_activity import Base
 
 log = get_logger(__name__)
 

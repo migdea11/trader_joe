@@ -14,7 +14,7 @@ from common.worker_pool import SharedWorkerPool
 from data.store.app.retrieve.data_action_request import \
     store_market_activity_worker
 from routers.common import ping
-from routers.data_store import stock_market_activity_data, store_broker_data
+from routers.data_store import asset_market_activity_data, store_dataset_request
 
 from .db.database import DATABASE_URI, get_instance, wait_for_db
 
@@ -76,5 +76,5 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(ping.router)
-app.include_router(stock_market_activity_data.router)
-app.include_router(store_broker_data.router)
+app.include_router(asset_market_activity_data.router)
+app.include_router(store_dataset_request.router)

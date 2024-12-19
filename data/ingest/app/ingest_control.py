@@ -10,7 +10,7 @@ from common.kafka.kafka_producer import SharedKafkaProducer
 from common.kafka.topics import TopicTyping
 from common.logging import get_logger
 from common.worker_pool import SharedWorkerPool
-from schemas.store_broker_data import DataRequest
+from schemas.data_ingest.get_dataset_request import GetDatasetRequest
 
 from .brokers.alpaca.broker_api import get_market_data as alpaca_market_data
 
@@ -34,7 +34,7 @@ async def send_on_receive(producer: KafkaProducer, data_request: Coroutine[Any, 
         SharedKafkaProducer.send_message_async(SharedWorkerPool.get_instance(), producer, topic.value, data)
 
 
-def store_retrieve_stock(request: DataRequest):
+def store_retrieve_stock(request: GetDatasetRequest):
     producer: KafkaProducer = SharedKafkaProducer.get_producer(BROKER_NAME, BROKER_PORT, BROKER_CONN_TIMEOUT)
     if request.source is DataSource.ALPACA_API:
         data_request = alpaca_market_data(SharedWorkerPool.get_instance(), request)
@@ -43,9 +43,9 @@ def store_retrieve_stock(request: DataRequest):
     SharedKafkaProducer.flush_messages_async(SharedWorkerPool.get_instance(), producer)
 
 
-def store_retrieve_crypto(request: DataRequest):
+def store_retrieve_crypto(request: GetDatasetRequest):
     pass
 
 
-def store_retrieve_option(request: DataRequest):
+def store_retrieve_option(request: GetDatasetRequest):
     pass
