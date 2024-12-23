@@ -104,7 +104,7 @@ class SharedKafkaConsumer:
                 message: ConsumerRecord
                 for message in consumer:
 
-                    log.debug(f"Received message: {message.value}")
+                    log.debug(f"Received message from: {message.topic}")
                     success = callback(message)
 
                     if success:

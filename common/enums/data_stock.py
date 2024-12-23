@@ -1,4 +1,4 @@
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import Generic, Self, Type, TypeVar
 
 
@@ -71,21 +71,21 @@ class DataSource(str, Enum):
     MANUAL_ENTRY = "MANUAL"
 
 
-class ExpiryType(Enum):
+class ExpiryType(IntEnum):
     # All items from request expire at the same time
-    BULK = "BULK"
+    BULK = 1
     # A max number of items are stored, when the limit is reached the oldest item is removed
-    BUFFER_1K = "BUFFER_1K"
-    BUFFER_10K = "BUFFER_10K"
-    BUFFER_100K = "BUFFER_100K"
+    BUFFER_1K = 2
+    BUFFER_10K = 3
+    BUFFER_100K = 4
     # Each item from request expires at an offset from the first item (1day bars will expire 1 day after the previous)
-    ROLLING = "ROLLING"
+    ROLLING = 5
 
 
-class UpdateType(Enum):
+class UpdateType(IntEnum):
     # Data is pulled once and never updated
-    STATIC = "STATIC"
+    STATIC = 1
     # Data is pulled at the end of the day
-    DAILY = "DAILY"
+    DAILY = 2
     # Data is streamed in real-time
-    STREAM = "STREAM"
+    STREAM = 3

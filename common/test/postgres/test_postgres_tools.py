@@ -3,7 +3,7 @@ from unittest.mock import MagicMock, patch
 from sqlalchemy.engine import Engine
 from psycopg2 import OperationalError
 from sqlalchemy.engine.url import URL
-from common.postgres.postgres_tools import SharedPostgresSession
+from common.database.postgres_tools import SharedPostgresSession
 
 
 @pytest.fixture
@@ -24,9 +24,9 @@ def cleanup():
     SharedPostgresSession.shutdown()
 
 
-@patch("common.postgres.postgres_tools.psycopg2.connect")
-@patch("common.postgres.postgres_tools.create_engine")
-@patch("common.postgres.postgres_tools.sessionmaker")
+@patch("common.database.postgres_tools.psycopg2.connect")
+@patch("common.database.postgres_tools.create_engine")
+@patch("common.database.postgres_tools.sessionmaker")
 def test_successful_get_instance(mock_sessionmaker, mock_create_engine, mock_psycopg_connect, mock_uri, cleanup):
     # Mock psycopg2.connect to simulate successful connection
     mock_psycopg_connect.return_value = MagicMock()
@@ -49,7 +49,7 @@ def test_successful_get_instance(mock_sessionmaker, mock_create_engine, mock_psy
     assert session is mock_session_maker_instance()
 
 
-@patch("common.postgres.postgres_tools.psycopg2.connect")
+@patch("common.database.postgres_tools.psycopg2.connect")
 def test_wait_for_db_timeout(mock_psycopg_connect, mock_uri, cleanup):
     # Simulate psycopg2.connect raising OperationalError
     mock_psycopg_connect.side_effect = OperationalError
@@ -62,9 +62,9 @@ def test_wait_for_db_timeout(mock_psycopg_connect, mock_uri, cleanup):
     assert mock_psycopg_connect.call_count > 1
 
 
-@patch("common.postgres.postgres_tools.psycopg2.connect")
-@patch("common.postgres.postgres_tools.create_engine")
-@patch("common.postgres.postgres_tools.sessionmaker")
+@patch("common.database.postgres_tools.psycopg2.connect")
+@patch("common.database.postgres_tools.create_engine")
+@patch("common.database.postgres_tools.sessionmaker")
 def test_reuse_existing_instance(mock_sessionmaker, mock_create_engine, mock_psycopg_connect, mock_uri, cleanup):
     # Mock psycopg2.connect and engine creation
     mock_psycopg_connect.return_value = MagicMock()
@@ -85,7 +85,7 @@ def test_reuse_existing_instance(mock_sessionmaker, mock_create_engine, mock_psy
     mock_sessionmaker.assert_called_once_with(autocommit=False, autoflush=False, bind=mock_engine)
 
 
-@patch("common.postgres.postgres_tools.psycopg2.connect")
+@patch("common.database.postgres_tools.psycopg2.connect")
 def test_get_instance_db_unavailable(mock_psycopg_connect, mock_uri, cleanup):
     # Simulate psycopg2.connect raising OperationalError
     mock_psycopg_connect.side_effect = OperationalError

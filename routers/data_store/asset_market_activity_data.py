@@ -12,7 +12,8 @@ from routers.data_store.app_endpoints import MarketDataInterface
 from schemas.data_store.asset_market_activity_data import (
     AssetMarketActivityData,
     AssetMarketActivityDataCreate,
-    AssetMarketActivityDataDelete
+    AssetMarketActivityDataDelete,
+    AssetMarketActivityDataGet
 )
 
 router = APIRouter()
@@ -28,32 +29,42 @@ class UnsupportedAssetType(ValueError):
     MarketDataInterface.POST_MARKET_ACTIVITY, response_model=AssetMarketActivityData
 )
 def create_stock_market_activity_data(
-    request: AssetMarketActivityDataCreate,
-    db: Session = Depends(get_instance)
+    db: Session = Depends(get_instance),
+    request: AssetMarketActivityDataCreate = Depends()
 ):
     log.debug("Storing data for", request.asset_type)
     if request.asset_type == AssetType.STOCK:
-        return crud_stock_market_activity.create_asset_market_activity_data_data(db, request)
+        crud_stock_market_activity.create_asset_market_activity_data(db, request)
+        return {"message": "Stock market activity data stored"}
 
     raise UnsupportedAssetType(request.asset_type)
 
 
 @router.delete(MarketDataInterface.DELETE_MARKET_ACTIVITY)
 def delete_stock_market_activity_data(
-    request: AssetMarketActivityDataDelete,
-    db: Session = Depends(get_instance)
+    db: Session = Depends(get_instance),
+    request: AssetMarketActivityDataDelete = Depends()
 ):
     if request.asset_type == AssetType.STOCK:
         if request.id is None:
-            crud_stock_market_activity.delete_all_stock_market_activity_data(db=db)
+            crud_stock_market_activity.delete_all_asset_market_activity_data(db=db)
             return {"message": "All stock market activity data deleted"}
         else:
-            crud_stock_market_activity.delete_stock_market_activity_data(db, request.id)
+            crud_stock_market_activity.delete_asset_market_activity_data(db, request.id)
             return {"message": "Stock market activity data deleted"}
 
     raise UnsupportedAssetType(request.asset_type)
 
 
 @router.get(MarketDataInterface.GET_MARKET_ACTIVITY, response_model=List[AssetMarketActivityData])
-def read_stock_market_activity_data(db: Session = Depends(get_instance)):
-    return crud_stock_market_activity.read_stock_market_activity_data(db)
+def read_stock_market_activity_data(
+    db: Session = Depends(get_instance),
+    request: AssetMarketActivityDataGet = Depends()
+):
+    if request.asset_type == AssetType.STOCK:
+        if request.symbol is None:
+            return crud_stock_market_activity.read_all_asset_market_activity_data(db)
+        else:
+            return crud_stock_market_activity.read_asset_market_activity_data(db, request.symbol)
+
+    raise UnsupportedAssetType(request.asset_type)

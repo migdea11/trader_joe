@@ -2,7 +2,7 @@ from enum import Enum
 
 
 class DataType(str, Enum):
-    BAR = "bar"
+    MARKET_ACTIVITY = "market-activity"
     QUOTE = "quote"
     TRADE = "trade"
 

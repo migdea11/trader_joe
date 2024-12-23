@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 
 from common.environment import get_env_var
 from common.logging import get_logger
-from common.postgres.postgres_tools import SharedPostgresSession
+from common.database.postgres_tools import SharedPostgresSession
 
 log = get_logger(__name__)
 

@@ -10,7 +10,7 @@ from common.kafka.kafka_consumer import ConsumerParams, SharedKafkaConsumer
 from common.kafka.topics import ConsumerGroup, StaticTopic
 from common.logging import get_logger
 from common.worker_pool import SharedWorkerPool
-from data.store.app.db.crud.stock_market_activity import create_asset_market_activity_data_data
+from data.store.app.db.crud.stock_market_activity import batch_insert_asset_market_activity_data
 from schemas.data_store.asset_market_activity_data import AssetMarketActivityDataCreate
 
 log = get_logger(__name__)
@@ -24,10 +24,13 @@ def store_market_activity_worker(host: str, port: int, timeout: int, db: Session
         try:
             message_json = message.value.decode('utf-8')
             message_dict = json.loads(message_json)
+            batch_data = {}
             for item in message_dict:
-                data = AssetMarketActivityDataCreate.model_validate_json(item)
-                # TODO implement batch insert
-                create_asset_market_activity_data_data(data, db)
+                data_item = AssetMarketActivityDataCreate.model_validate_json(item)
+                if data_item.asset_type not in batch_data:
+                    batch_data[data_item.asset_type] = []
+                batch_data[data_item.asset_type].append(data_item)
+            batch_insert_asset_market_activity_data(db, batch_data)
             return True
         except Exception as e:
             log.error(f"Failed to store data: {e}")

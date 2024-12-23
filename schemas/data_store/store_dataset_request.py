@@ -1,7 +1,7 @@
 from uuid import UUID
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
+from typing import Optional
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Granularity, ExpiryType, UpdateType
@@ -19,25 +19,20 @@ class StoreDatasetRequestBody(BaseModel):
     expiry_type: Optional[ExpiryType] = ExpiryType.BULK
     update_type: Optional[UpdateType] = UpdateType.STATIC
 
-    @model_validator(mode="before")
-    def validate_fields(cls, values: Dict[str, Any]):
-        start = values.get("start")
-        end = values.get("end")
-        expiry_type = values.get("expiry_type")
-        update_type = values.get("update_type")
-
-        if end is not None and start is None:
+    @model_validator(mode="after")
+    def validate_fields(cls, request: 'StoreDatasetRequestBody') -> 'StoreDatasetRequestBody':
+        if request.end is not None and request.start is None:
             raise ValueError("The 'start' field is required when 'end' is provided.")
 
-        if update_type is not UpdateType.STATIC and end is not None:
+        if request.update_type is not UpdateType.STATIC and request.end is not None:
             raise ValueError(f"The 'update_type' field must be '{ExpiryType.BULK.value}' when 'end' is provided.")
 
-        if update_type is not UpdateType.STATIC and expiry_type is ExpiryType.BULK:
+        if request.update_type is not UpdateType.STATIC and request.expiry_type is ExpiryType.BULK:
             raise ValueError(
                 f"The 'update_type' field must be '{UpdateType.STATIC.value}' "
                 f"when 'expiry_type' is '{ExpiryType.BULK.value}'."
             )
-        return values
+        return request
 
 
 class StoreDatasetRequestPath(BaseModel):
@@ -45,21 +40,25 @@ class StoreDatasetRequestPath(BaseModel):
     symbol: str = Field(..., description=SYMBOL_DESC)
     data_type: DataType = Field(..., description=DATA_TYPE_DESC)
 
+    @field_validator("symbol")
+    def uppercase_item_id(cls, value: str) -> str:
+        return value.upper()
 
-class StoreDatasetRequest(StoreDatasetRequestPath, StoreDatasetRequestBody):
-    def extract_path(self) -> Dict[str, Any]:
-        path_fields = StoreDatasetRequestPath.model_fields
-        return {key: value for key, value in self.model_dump().items() if key in path_fields}
 
-    def extract_path_obj(self) -> StoreDatasetRequestPath:
-        return StoreDatasetRequestPath(**self.extract_path())
+# class StoreDatasetRequest(StoreDatasetRequestPath, StoreDatasetRequestBody):
+#     def extract_path(self) -> Dict[str, Any]:
+#         path_fields = StoreDatasetRequestPath.model_fields
+#         return {key: value for key, value in self.model_dump().items() if key in path_fields}
 
-    def extract_body(self) -> Dict[str, Any]:
-        body_fields = StoreDatasetRequestBody.model_fields
-        return {key: value for key, value in self.model_dump().items() if key in body_fields}
+#     def extract_path_obj(self) -> StoreDatasetRequestPath:
+#         return StoreDatasetRequestPath(**self.extract_path())
 
-    def extract_body_obj(self) -> StoreDatasetRequestBody:
-        return StoreDatasetRequestBody(**self.extract_body())
+#     def extract_body(self) -> Dict[str, Any]:
+#         body_fields = StoreDatasetRequestBody.model_fields
+#         return {key: value for key, value in self.model_dump().items() if key in body_fields}
+
+#     def extract_body_obj(self) -> StoreDatasetRequestBody:
+#         return StoreDatasetRequestBody(**self.extract_body())
 
 
 class StoreDatasetIdentifiers:

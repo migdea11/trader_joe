@@ -1,6 +1,7 @@
-from pydantic import BaseModel, Field
+from uuid import UUID
+from pydantic import BaseModel, Field, field_validator
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Optional
 
 from common.enums.data_select import AssetType
 from common.enums.data_stock import Granularity, DataSource
@@ -8,6 +9,7 @@ from routers.data_store.app_endpoints import ASSET_DATA_ID_DESC, ASSET_TYPE_DESC
 
 
 class AssetMarketActivityRequestBody(BaseModel):
+    dataset_id: UUID
     source: DataSource
     symbol: str
 
@@ -29,21 +31,9 @@ class AssetMarketActivityRequestPath(BaseModel):
     asset_type: AssetType = Field(..., description=ASSET_TYPE_DESC)
     symbol: str = Field(..., description=SYMBOL_DESC)
 
-
-class AssetMarketActivityRequest(AssetMarketActivityRequestPath, AssetMarketActivityRequestBody):
-    def extract_path(self) -> Dict[str, Any]:
-        path_fields = AssetMarketActivityRequestPath.model_fields
-        return {key: value for key, value in self.model_dump().items() if key in path_fields}
-
-    def extract_path_obj(self) -> AssetMarketActivityRequestPath:
-        return AssetMarketActivityRequestPath(**self.extract_path())
-
-    def extract_body(self) -> Dict[str, Any]:
-        body_fields = AssetMarketActivityRequestBody.model_fields
-        return {key: value for key, value in self.model_dump().items() if key in body_fields}
-
-    def extract_body_obj(self) -> AssetMarketActivityRequestBody:
-        return AssetMarketActivityRequestBody(**self.extract_body())
+    @field_validator("symbol")
+    def uppercase_item_id(cls, value: str) -> str:
+        return value.upper()
 
 
 class AssetMarketActivityDataCreate(AssetMarketActivityRequestPath, AssetMarketActivityRequestBody):
@@ -57,6 +47,15 @@ class AssetMarketActivityDataUpdate(AssetMarketActivityDataCreate):
 class AssetMarketActivityDataDelete(BaseModel):
     asset_type: AssetType = Field(..., description=ASSET_TYPE_DESC)
     id: str = Field(None, description=ASSET_DATA_ID_DESC)
+
+
+class AssetMarketActivityDataGet(BaseModel):
+    asset_type: AssetType = Field(..., description=ASSET_TYPE_DESC)
+    symbol: Optional[str] = Field(None, description=SYMBOL_DESC)
+
+    @field_validator("symbol")
+    def uppercase_item_id(cls, value: str) -> str:
+        return value.upper()
 
 
 class AssetMarketActivityDataInDB(AssetMarketActivityDataUpdate):

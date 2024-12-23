@@ -26,22 +26,6 @@ BROKER_PORT = get_env_var("BROKER_PORT", is_num=True)
 BROKER_CONN_TIMEOUT = get_env_var("BROKER_CONN_TIMEOUT", is_num=True)
 
 
-def run_migrations():
-    log.debug(f"connected to {DATABASE_URI}")
-    if wait_for_db():
-        alembic_cfg = Config("/code/alembic.ini")
-        alembic_cfg.set_main_option("script_location", "/code/migrations")
-        alembic_cfg.set_main_option("sqlalchemy.url", DATABASE_URI.render_as_string(hide_password=False))
-        log.info("Running migrations...")
-        try:
-            command.upgrade(alembic_cfg, "head")
-        except Exception as e:
-            log.error(f"Error running migrations: {e}")
-            raise e
-    else:
-        raise Exception("Database is not ready.")
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     startup_logs(app)

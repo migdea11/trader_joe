@@ -11,28 +11,13 @@ from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateT
 from data.store.app.db.models.store_dataset_entry import StoreDatasetEntry
 from schemas.data_store import store_dataset_request
 
-# Enum ranking maps
-EXPIRY_TYPE_RANKING = {
-    ExpiryType.BULK: 1,
-    ExpiryType.BUFFER_1K: 2,
-    ExpiryType.BUFFER_10K: 3,
-    ExpiryType.BUFFER_100K: 4,
-    ExpiryType.ROLLING: 5,
-}
-
-UPDATE_TYPE_RANKING = {
-    UpdateType.STATIC: 1,
-    UpdateType.DAILY: 2,
-    UpdateType.STREAM: 3,
-}
-
 
 def upsert_entry(
     db: Session, entry: store_dataset_request.StoreDatasetEntryCreate
 ) -> store_dataset_request.StoreDatasetEntry:
     try:
         stmt = insert(StoreDatasetEntry).values(
-            **entry.model_dump(),
+            **entry.model_dump(exclude_none=True),
             created_at=func.now(),
             updated_at=func.now()
         ).on_conflict_do_update(
@@ -40,34 +25,24 @@ def upsert_entry(
             set_={
                 # Update expiry_type based on custom ranking
                 'expiry_type': case(
-                    [
-                        (
-                            EXPIRY_TYPE_RANKING[StoreDatasetEntry.expiry_type] > EXPIRY_TYPE_RANKING[entry.expiry_type],
-                            StoreDatasetEntry.expiry_type
-                        )
-                    ],
+                    (StoreDatasetEntry.expiry_type > entry.expiry_type, StoreDatasetEntry.expiry_type),
                     else_=entry.expiry_type
                 ),
 
                 # Update update_type based on custom ranking
                 'update_type': case(
-                    [
-                        (
-                            UPDATE_TYPE_RANKING[StoreDatasetEntry.update_type] > UPDATE_TYPE_RANKING[entry.update_type],
-                            StoreDatasetEntry.update_type
-                        )
-                    ],
+                    (StoreDatasetEntry.update_type > entry.update_type, StoreDatasetEntry.update_type),
                     else_=entry.update_type
                 ),
 
                 # Always update updated_at timestamp
                 'updated_at': func.now()
             }
-        ).returning(StoreDatasetEntry)
-        created = db.execute(stmt).fetchone()
+        ).returning(StoreDatasetEntry.id)
+        result_id: StoreDatasetEntry = db.execute(stmt).scalar_one()
         db.commit()
-        entry = db.get(StoreDatasetEntry, created.id) if created else None
-        return store_dataset_request.StoreDatasetEntry.model_validate(entry)
+
+        return result_id
     except SQLAlchemyError as e:
         db.rollback()
         raise RuntimeError(f"Error while creating or updating entry: {e}")
