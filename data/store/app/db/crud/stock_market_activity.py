@@ -1,4 +1,6 @@
-from typing import Dict, List
+from datetime import datetime
+from typing import Dict, List, Optional
+from uuid import UUID
 from sqlalchemy.orm import Session
 
 from common.enums.data_select import AssetType
@@ -43,18 +45,25 @@ def batch_insert_asset_market_activity_data(
 
 
 # TODO replace with a search function
-def read_asset_market_activity_data(
-    db: Session, stock_symbol: str
+def read_asset_market_activity_dataset(
+    db: Session, dataset_id: UUID, start_date: Optional[datetime], end_date: Optional[datetime]
 ) -> List[asset_market_activity_data.AssetMarketActivityData]:
-    log.debug("Reading stock market activity data")
-    db_asset_market_activities = db.query(StockMarketActivity).filter(
-        StockMarketActivity.symbol == stock_symbol
-    ).all()
+    log.debug("Reading stock market activity dataset")
+    conditions = [StockMarketActivity.dataset_id == dataset_id]
+
+    # If using subset of dataset
+    if start_date:
+        conditions.append(StockMarketActivity.timestamp >= start_date)
+    if end_date:
+        conditions.append(StockMarketActivity.timestamp <= end_date)
+
+    db_asset_market_activities = db.query(StockMarketActivity).filter(*conditions).all()
     return [
         asset_market_activity_data.AssetMarketActivityData.model_validate(obj) for obj in db_asset_market_activities
     ]
 
 
+# TODO replace with a search function
 def read_all_asset_market_activity_data(db: Session) -> List[asset_market_activity_data.AssetMarketActivityData]:
     log.debug("Reading stock market activity data")
     db_stock_market_activities = db.query(StockMarketActivity).all()
@@ -63,15 +72,6 @@ def read_all_asset_market_activity_data(db: Session) -> List[asset_market_activi
         asset_market_activity_data.AssetMarketActivityData.model_validate(obj) for obj in db_stock_market_activities
     ]
     return schema_objects
-
-
-def delete_asset_market_activity_data(db: Session, stock_data_id: int):
-    log.debug("Deleting stock market activity data")
-    db_asset_market_activity_data = db.query(StockMarketActivity).filter(
-        StockMarketActivity.id == stock_data_id
-    ).first()
-    db.delete(db_asset_market_activity_data)
-    db.commit()
 
 
 def delete_all_asset_market_activity_data(db: Session):

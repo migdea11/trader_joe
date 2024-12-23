@@ -26,7 +26,6 @@ class StoreDatasetEntry(Base):
     expiry = Column(DateTime, nullable=True)
     expiry_type = Column(SQLAlchemyIntEnum(ExpiryType), nullable=True)
     update_type = Column(SQLAlchemyIntEnum(UpdateType), nullable=True)
-    item_count = Column(Integer, default=0, nullable=False)
 
     # Dates used to manage split and dividends adjustments
     created_at = Column(DateTime, default=func.now(), nullable=False)
@@ -41,5 +40,5 @@ class StoreDatasetEntry(Base):
             f"<StoreDatasetEntry(id='{self.id}', symbol='{self.symbol}', source='{self.source}', "
             f"data_types='{self.data_type}', granularity='{self.granularity}', start='{self.start}', end='{self.end}', "
             f"expiry='{self.expiry}', expiry_type='{self.expiry_type}', update_type='{self.update_type}', "
-            f"item_count={self.item_count}, created_at='{self.created_at}', updated_at='{self.updated_at}')>"
+            f"created_at='{self.created_at}', updated_at='{self.updated_at}')>"
         )

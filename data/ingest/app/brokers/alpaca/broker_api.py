@@ -1,5 +1,6 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from typing import Dict, List
 from uuid import UUID
 
@@ -15,6 +16,7 @@ from alpaca.data.requests import (
     StockTradesRequest
 )
 
+from common.data_lifecyle import expiry_inc
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Granularity
 from common.environment import get_env_var
@@ -35,7 +37,8 @@ __CLIENT = StockHistoricalDataClient(API_KEY, API_SECRET)
 
 
 def convert_bar_to_schema(
-    data: Bar, dataset_id: UUID, symbol: str, source: DataSource, asset_type: AssetType, granularity: Granularity
+    data: Bar, dataset_id: UUID, symbol: str, source: DataSource, asset_type: AssetType,
+    granularity: Granularity, expiry: datetime = None
 ) -> AssetMarketActivityDataCreate:
     return AssetMarketActivityDataCreate(
         dataset_id=dataset_id,
@@ -46,6 +49,7 @@ def convert_bar_to_schema(
 
         timestamp=data.timestamp,
         granularity=granularity,
+        expiry=expiry,
 
         open=data.open,
         high=data.high,
@@ -118,20 +122,25 @@ async def get_market_stock_data(
     topic_map = {}
     if DataType.MARKET_ACTIVITY in response_map:
         stock_bars: BarSet = results[response_map[DataType.MARKET_ACTIVITY]]
-        stock_bars
+        latest_expiry = request.expiry
 
         if symbol in stock_bars.data:
             bars = stock_bars[symbol] if isinstance(stock_bars[symbol], list) else [stock_bars[symbol]]
-            topic_map[StaticTopic.STOCK_MARKET_ACTIVITY] = [
-                convert_bar_to_schema(
-                    bar,
-                    request.dataset_id,
-                    symbol,
-                    request.source,
-                    AssetType.STOCK,
-                    request.granularity
-                ).model_dump_json() for bar in bars
-            ]
+            dataset = []
+            for bar in bars:
+                dataset.append(
+                    convert_bar_to_schema(
+                        bar,
+                        request.dataset_id,
+                        symbol,
+                        request.source,
+                        AssetType.STOCK,
+                        request.granularity,
+                        latest_expiry
+                    ).model_dump_json()
+                )
+                latest_expiry = expiry_inc(latest_expiry, request.expiry_type, request.granularity)
+            topic_map[StaticTopic.STOCK_MARKET_ACTIVITY] = dataset
     if DataType.QUOTE in response_map:
         raise NotImplementedError("Quotes not implemented")
         # stock_quotes: QuoteSet = results[response_map[DataType.QUOTE]]

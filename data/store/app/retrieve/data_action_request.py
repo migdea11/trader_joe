@@ -1,10 +1,12 @@
 import asyncio
 import json
 import traceback
+from typing import Dict, List
 
 from kafka.consumer.fetcher import ConsumerRecord
 from sqlalchemy.orm import Session
 
+from common.enums.data_select import AssetType
 from common.environment import get_env_var
 from common.kafka.kafka_consumer import ConsumerParams, SharedKafkaConsumer
 from common.kafka.topics import ConsumerGroup, StaticTopic
@@ -24,7 +26,7 @@ def store_market_activity_worker(host: str, port: int, timeout: int, db: Session
         try:
             message_json = message.value.decode('utf-8')
             message_dict = json.loads(message_json)
-            batch_data = {}
+            batch_data: Dict[AssetType, List[AssetMarketActivityDataCreate]] = {}
             for item in message_dict:
                 data_item = AssetMarketActivityDataCreate.model_validate_json(item)
                 if data_item.asset_type not in batch_data:

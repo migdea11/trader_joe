@@ -63,15 +63,14 @@ def update_entry(db: Session, entry: store_dataset_request.StoreDatasetEntryUpda
         raise RuntimeError(f"Error while updating entry: {e}")
 
 
-def update_entry_lifecycle(db: Session, id: uuid.UUID, item_count: int):
+def update_entry_lifecycle(db: Session, id: uuid.UUID):
     """
-    Updates only the `updated_at` and `item_count` fields for an existing entry.
+    Updates only the `updated_at` for an existing entry.
     """
     try:
         db.query(StoreDatasetEntry).filter(StoreDatasetEntry.id == id).update(
             {
                 'updated_at': func.now(),
-                'item_count': item_count
             },
             synchronize_session=False
         )
@@ -100,7 +99,6 @@ def search_entries(
     expiry: Optional[datetime] = None,
     expiry_type: Optional[ExpiryType] = None,
     update_type: Optional[UpdateType] = None,
-    item_count: Optional[int] = None,
     created_at: Optional[datetime] = None,
     updated_at: Optional[datetime] = None
 ) -> List[store_dataset_request.StoreDatasetEntry]:
@@ -127,8 +125,6 @@ def search_entries(
         query = query.filter(StoreDatasetEntry.expiry_type == expiry_type)
     if update_type is not None:
         query = query.filter(StoreDatasetEntry.update_type == update_type)
-    if item_count is not None:
-        query = query.filter(StoreDatasetEntry.item_count == item_count)
     if created_at is not None:
         query = query.filter(StoreDatasetEntry.created_at == created_at)
     if updated_at is not None:

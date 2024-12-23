@@ -82,7 +82,7 @@ class StoreDatasetIdentifiers:
 
 
 class StoreDatasetEntryCreate(StoreDatasetRequestPath, StoreDatasetRequestBody):
-    item_count: int = 0
+    pass
 
 
 class StoreDatasetEntryUpdate(StoreDatasetEntryCreate):

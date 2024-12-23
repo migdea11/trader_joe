@@ -1,7 +1,6 @@
 import httpx
 
 from fastapi import APIRouter, Body, Depends
-from fastapi.encoders import jsonable_encoder
 
 from common.endpoints import get_endpoint_url
 from common.logging import get_logger

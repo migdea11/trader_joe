@@ -14,7 +14,7 @@ ASSET_DATA_ID_DESC = "ID of the asset data"
 
 class MarketDataInterface(str, Enum):
     POST_MARKET_ACTIVITY = "/market-activity/{asset_type}/{symbol}/"
-    DELETE_MARKET_ACTIVITY = "/market-activity/{asset_type}/{asset_data_id}"
+    DELETE_MARKET_ACTIVITY = "/market-activity/{asset_type}/"
     GET_MARKET_ACTIVITY = "/market-activity/{asset_type}/{symbol}"
 
 

@@ -1,15 +1,33 @@
+from datetime import timedelta
 from enum import Enum, IntEnum
 from typing import Generic, Self, Type, TypeVar
 
 
 class Granularity(str, Enum):
-    ONE_MINUTE = "1min"
-    FIVE_MINUTES = "5min"
-    THIRTY_MINUTES = "30min"
-    ONE_HOUR = "1hour"
-    ONE_DAY = "1day"
-    ONE_WEEK = "1week"
-    ONE_MONTH = "1month"
+    ONE_MINUTE = ("1min", timedelta(minutes=1))
+    FIVE_MINUTES = ("5min", timedelta(minutes=5))
+    THIRTY_MINUTES = ("30min", timedelta(minutes=30))
+    ONE_HOUR = ("1hour", timedelta(hours=1))
+    ONE_DAY = ("1day", timedelta(days=1))
+    ONE_WEEK = ("1week", timedelta(weeks=1))
+    ONE_MONTH = ("1month", timedelta(weeks=4))
+
+    def __new__(cls, value: str, offset: timedelta):
+        obj = str.__new__(cls, value)  # Ensure the Enum behaves like a str
+        obj._value_ = value
+        obj._offset = offset
+        return obj
+
+    # @property
+    # def value(self) -> str:
+    #     return self._value
+
+    @property
+    def offset(self) -> timedelta:
+        return self._offset
+
+    def __str__(self) -> str:
+        return self._value_
 
 
 T = TypeVar("T")

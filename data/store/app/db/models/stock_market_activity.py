@@ -1,4 +1,4 @@
-from sqlalchemy import UUID, Column, DateTime, Enum, Float, ForeignKey, Integer, String, func
+from sqlalchemy import UUID, Column, DateTime, Enum, Float, ForeignKey, Index, Integer, String, func
 
 from common.enums.data_stock import DataSource, Granularity
 from data.store.app.db.models.store_dataset_entry import StoreDatasetEntry
@@ -11,13 +11,16 @@ class StockMarketActivity(Base):
     __tablename__ = TABLE_NAME
 
     id = Column(Integer, primary_key=True)
-    dataset_id = Column(UUID, ForeignKey(f"{StoreDatasetEntry.TABLE_NAME}.id"), nullable=False)
+    dataset_id = Column(
+        UUID, ForeignKey(f"{StoreDatasetEntry.TABLE_NAME}.id", ondelete="CASCADE"), index=True, nullable=False
+    )
 
     source = Column(Enum(DataSource), nullable=False)
     symbol = Column(String, nullable=False)
 
     timestamp = Column(DateTime, nullable=False)
     granularity = Column(Enum(Granularity), nullable=False)
+    expiry = Column(DateTime, index=True, nullable=True)
 
     open = Column(Float, nullable=False)
     high = Column(Float, nullable=False)
@@ -32,6 +35,10 @@ class StockMarketActivity(Base):
     # Dates used to manage split and dividends adjustments
     created_at = Column(DateTime, nullable=False, default=func.now())
     updated_at = Column(DateTime, nullable=False, default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index('ix_dataset_id_timestamp', 'dataset_id', 'timestamp'),
+    )
 
     def __repr__(self):
         return (

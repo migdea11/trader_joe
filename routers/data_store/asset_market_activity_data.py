@@ -40,18 +40,15 @@ def create_stock_market_activity_data(
     raise UnsupportedAssetType(request.asset_type)
 
 
+# TODO this will be removed in the future
 @router.delete(MarketDataInterface.DELETE_MARKET_ACTIVITY)
 def delete_stock_market_activity_data(
     db: Session = Depends(get_instance),
     request: AssetMarketActivityDataDelete = Depends()
 ):
     if request.asset_type == AssetType.STOCK:
-        if request.id is None:
-            crud_stock_market_activity.delete_all_asset_market_activity_data(db=db)
-            return {"message": "All stock market activity data deleted"}
-        else:
-            crud_stock_market_activity.delete_asset_market_activity_data(db, request.id)
-            return {"message": "Stock market activity data deleted"}
+        crud_stock_market_activity.delete_all_asset_market_activity_data(db=db)
+        return {"message": "All stock market activity data deleted"}
 
     raise UnsupportedAssetType(request.asset_type)
 

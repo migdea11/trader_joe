@@ -5,7 +5,7 @@ from typing import Optional
 
 from common.enums.data_select import AssetType
 from common.enums.data_stock import Granularity, DataSource
-from routers.data_store.app_endpoints import ASSET_DATA_ID_DESC, ASSET_TYPE_DESC, SYMBOL_DESC
+from routers.data_store.app_endpoints import ASSET_TYPE_DESC, SYMBOL_DESC
 
 
 class AssetMarketActivityRequestBody(BaseModel):
@@ -15,6 +15,7 @@ class AssetMarketActivityRequestBody(BaseModel):
 
     timestamp: datetime
     granularity: Granularity
+    expiry: Optional[datetime]
 
     open: float
     high: float
@@ -46,7 +47,6 @@ class AssetMarketActivityDataUpdate(AssetMarketActivityDataCreate):
 
 class AssetMarketActivityDataDelete(BaseModel):
     asset_type: AssetType = Field(..., description=ASSET_TYPE_DESC)
-    id: str = Field(None, description=ASSET_DATA_ID_DESC)
 
 
 class AssetMarketActivityDataGet(BaseModel):
