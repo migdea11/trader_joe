@@ -10,8 +10,8 @@ from alembic.autogenerate.api import AutogenContext
 
 from common.environment import get_env_var
 from common.logging import get_logger
-from common.database.sql_alchemy_types import IntEnum
-from data.store.app.db.models import alembic_base
+from common.database.sql_alchemy_types import OrderedEnum, NullableDateTime
+from common.database.sql_alchemy_table import AppBase
 
 log = get_logger(__name__)
 
@@ -35,24 +35,27 @@ for filename in models_dir.iterdir():
         module_name = f"data.store.app.db.models.{filename.stem}"
         print(f"found: {module_name}")
         importlib.import_module(module_name)
-target_metadata = alembic_base.Base.metadata
-print(f"Registered tables: {alembic_base.Base.metadata.tables.keys()}")
+target_metadata = AppBase.DATA_STORE_BASE.metadata
+print(f"Registered tables: {AppBase.DATA_STORE_BASE.metadata.tables.keys()}")
 
 
 # Custom renderer for IntEnum
-def render_int_enum(type_: str, object_: Any, autogen_context: AutogenContext):
-    if type_ == 'type' and isinstance(object_, IntEnum):
-        # Ensure enum_class is present
-        enum_object: IntEnum = object_
-        if hasattr(enum_object, "enum_class"):
-            enum_class = enum_object.enum_class
-            autogen_context.imports.add(f"from common.enums.data_stock import {enum_class.__name__}")
-            autogen_context.imports.add("from common.database.sql_alchemy_types import IntEnum")
-            return f"IntEnum({enum_class.__name__})"
-        else:
-            raise ValueError(f"IntEnum type {type_} is missing the 'enum_class' attribute.")
+# def render_int_enum(type_: str, object_: Any, autogen_context: AutogenContext):
+#     if type_ == 'type':
+#         if isinstance(object_, OrderedEnum):
+#             enum_object: OrderedEnum = object_
+#             if hasattr(enum_object, "enum_class"):
+#                 enum_class = enum_object.enum_class
+#                 autogen_context.imports.add(f"from common.enums.data_stock import {enum_class.__name__}")
+#                 autogen_context.imports.add("from common.database.sql_alchemy_types import IntEnum")
+#                 return f"IntEnum({enum_class.__name__})"
+#             else:
+#                 raise ValueError(f"IntEnum type {type_} is missing the 'enum_class' attribute.")
+#         elif isinstance(object_, NullableDateTime):
+#             autogen_context.imports.add("from common.database.sql_alchemy_types import NullableDateTime")
+#             return "NullableDateTime"
 
-    return False
+#     return False
 
 # other values from the config, defined by the needs of env.py,
 # can be acquired:
@@ -78,7 +81,7 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
-        render_item=render_int_enum
+        # render_item=render_int_enum
     )
 
     with context.begin_transaction():
@@ -101,7 +104,7 @@ def run_migrations_online() -> None:
     with connectable.connect() as connection:
         context.configure(
             connection=connection, target_metadata=target_metadata,
-            render_item=render_int_enum
+            # render_item=render_int_enum
         )
 
         with context.begin_transaction():

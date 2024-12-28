@@ -61,7 +61,8 @@ def read_stock_market_activity_data(
     if request.asset_type == AssetType.STOCK:
         if request.symbol is None:
             return crud_stock_market_activity.read_all_asset_market_activity_data(db)
-        else:
-            return crud_stock_market_activity.read_asset_market_activity_data(db, request.symbol)
+        # TODO implement search functionality
+        # else:
+        #     return crud_stock_market_activity.read_asset_market_activity_dataset(db, request)
 
     raise UnsupportedAssetType(request.asset_type)

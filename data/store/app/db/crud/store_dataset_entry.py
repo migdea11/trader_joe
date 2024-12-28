@@ -1,23 +1,30 @@
 from datetime import datetime
+import traceback
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy import Select, and_, func, case, or_, select
-from typing import List, Optional
+from sqlalchemy import func, case, select
+from typing import List, Tuple
 import uuid
 
-from common.enums.data_select import DataType
-from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateType
+from common.logging import get_logger
+from data.store.app.db.models.stock_market_activity import StockMarketActivity
 from data.store.app.db.models.store_dataset_entry import StoreDatasetEntry
 from schemas.data_store import store_dataset_request
 
+log = get_logger(__name__)
 
-def upsert_entry(
+
+async def upsert_entry(
     db: Session, entry: store_dataset_request.StoreDatasetEntryCreate
 ) -> store_dataset_request.StoreDatasetEntry:
     try:
+        test = StoreDatasetEntry.get_fields(entry, exclude={"expiry"}, exclude_none=True)
+        log.debug("Inserting or updating entry with the following values:")
+        for name, column in test.items():
+            log.debug(f"  test - {name}: {column}")
         stmt = insert(StoreDatasetEntry).values(
-            **entry.model_dump(exclude_none=True),
+            **StoreDatasetEntry.get_fields(entry, exclude={"expiry"}, exclude_none=True),
             created_at=func.now(),
             updated_at=func.now()
         ).on_conflict_do_update(
@@ -45,10 +52,11 @@ def upsert_entry(
         return result_id
     except SQLAlchemyError as e:
         db.rollback()
+        traceback.print_exc()
         raise RuntimeError(f"Error while creating or updating entry: {e}")
 
 
-def update_entry(db: Session, entry: store_dataset_request.StoreDatasetEntryUpdate):
+async def update_entry(db: Session, entry: store_dataset_request.StoreDatasetEntryUpdate):
     """
     Update an existing entry.
     """
@@ -60,13 +68,15 @@ def update_entry(db: Session, entry: store_dataset_request.StoreDatasetEntryUpda
         db.commit()
     except SQLAlchemyError as e:
         db.rollback()
+        traceback.print_exc()
         raise RuntimeError(f"Error while updating entry: {e}")
 
 
-def update_entry_lifecycle(db: Session, id: uuid.UUID):
+async def update_entry_lifecycle(db: Session, id: uuid.UUID):
     """
     Updates only the `updated_at` for an existing entry.
     """
+    # TODO might not be necessary
     try:
         db.query(StoreDatasetEntry).filter(StoreDatasetEntry.id == id).update(
             {
@@ -77,10 +87,11 @@ def update_entry_lifecycle(db: Session, id: uuid.UUID):
         db.commit()
     except SQLAlchemyError as e:
         db.rollback()
+        traceback.print_exc()
         raise RuntimeError(f"Error while updating entry lifecycle: {e}")
 
 
-def get_entry_by_id(db: Session, id: uuid.UUID) -> store_dataset_request.StoreDatasetEntry:
+async def get_entry_by_id(db: Session, id: uuid.UUID) -> store_dataset_request.StoreDatasetEntry:
     """
     Retrieve an entry by its ID.
     """
@@ -88,77 +99,46 @@ def get_entry_by_id(db: Session, id: uuid.UUID) -> store_dataset_request.StoreDa
     return store_dataset_request.StoreDatasetEntry.model_validate(entry)
 
 
-def search_entries(
+async def search_entries(
     db: Session,
-    symbol: Optional[str] = None,
-    source: Optional[DataSource] = None,
-    data_type: Optional[DataType] = None,
-    granularity: Optional[Granularity] = None,
-    start: Optional[datetime] = None,
-    end: Optional[datetime] = None,
-    expiry: Optional[datetime] = None,
-    expiry_type: Optional[ExpiryType] = None,
-    update_type: Optional[UpdateType] = None,
-    created_at: Optional[datetime] = None,
-    updated_at: Optional[datetime] = None
+    request_path: store_dataset_request.StoreDatasetRequestPath,
+    request_query: store_dataset_request.StoreDatasetEntrySearch
 ) -> List[store_dataset_request.StoreDatasetEntry]:
     """
     Search for entries based on optional criteria.
     """
-    query = db.query(StoreDatasetEntry)
-
-    if symbol is not None:
-        query = query.filter(StoreDatasetEntry.symbol == symbol)
-    if source is not None:
-        query = query.filter(StoreDatasetEntry.source == source)
-    if data_type is not None:
-        query = query.filter(StoreDatasetEntry.data_type == data_type)
-    if granularity is not None:
-        query = query.filter(StoreDatasetEntry.granularity == granularity)
-    if start is not None:
-        query = query.filter(StoreDatasetEntry.start == start)
-    if end is not None:
-        query = query.filter(StoreDatasetEntry.end == end)
-    if expiry is not None:
-        query = query.filter(StoreDatasetEntry.expiry == expiry)
-    if expiry_type is not None:
-        query = query.filter(StoreDatasetEntry.expiry_type == expiry_type)
-    if update_type is not None:
-        query = query.filter(StoreDatasetEntry.update_type == update_type)
-    if created_at is not None:
-        query = query.filter(StoreDatasetEntry.created_at == created_at)
-    if updated_at is not None:
-        query = query.filter(StoreDatasetEntry.updated_at == updated_at)
-
-    entries = query.all()
-    return [store_dataset_request.StoreDatasetEntry.model_validate(entry) for entry in entries]
-
-
-def _query_overlap(select: Select, entryIdentifier: store_dataset_request.StoreDatasetIdentifiers) -> Select:
-    return select.where(
-        and_(
-            StoreDatasetEntry.symbol == entryIdentifier.symbol,
-            StoreDatasetEntry.source == entryIdentifier.source,
-            StoreDatasetEntry.granularity == entryIdentifier.granularity,
-            StoreDatasetEntry.data_type == entryIdentifier.data_type,
-            or_(
-                and_(StoreDatasetEntry.start <= entryIdentifier.start, StoreDatasetEntry.end >= entryIdentifier.start),
-                and_(StoreDatasetEntry.start <= entryIdentifier.end, StoreDatasetEntry.end >= entryIdentifier.end),
-                and_(StoreDatasetEntry.start >= entryIdentifier.start, StoreDatasetEntry.end <= entryIdentifier.end)
-            )
-        )
+    joined_table = StockMarketActivity
+    query = select(
+        StoreDatasetEntry,
+        func.min(joined_table.expiry).label("expiry"),
+        func.count(joined_table.id).label("item_count"),
+    ).outerjoin(
+        joined_table, StoreDatasetEntry.id == joined_table.dataset_id
+    ).where(
+        joined_table.symbol == request_path.symbol
     )
 
+    # Apply filters to the subquery
+    for column, value in request_query.__dict__.items():
+        log.debug(f"Filtering by {column}: {value}")
+        if value is not None:
+            query = query.where(getattr(StoreDatasetEntry, column) == value)
 
-def search_overlapping_datasets(
-    db: Session,
-    entryIdentifier: store_dataset_request.StoreDatasetIdentifiers
-) -> List[uuid.UUID]:
-    query = _query_overlap(select(StoreDatasetEntry.id), entryIdentifier)
-    return db.execute(query).scalars().all()
+    # Execute query (example, depending on your session setup)
+    query = query.group_by(StoreDatasetEntry.id)
+    log.debug(f"Query: {query}")
+    entries: List[Tuple[StoreDatasetEntry, datetime, int]] = db.execute(query).fetchall()
+
+    return [
+        entry.to_validated_schema(
+            store_dataset_request.StoreDatasetEntry,
+            additional={"expiry": expiry, "item_count": item_count}
+        )
+        for entry, expiry, item_count in entries
+    ]
 
 
-def delete_entry_by_id(db: Session, id: uuid.UUID):
+async def delete_entry_by_id(db: Session, id: uuid.UUID):
     """
     Delete an entry by its ID.
     """
@@ -169,4 +149,5 @@ def delete_entry_by_id(db: Session, id: uuid.UUID):
             raise ValueError(f"No entry found with ID {id}")
     except SQLAlchemyError as e:
         db.rollback()
+        traceback.print_exc()
         raise RuntimeError(f"Error while deleting entry with ID {id}: {e}")

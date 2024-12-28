@@ -15,6 +15,19 @@ services:
     volumes:
       - ${DATA_DIR:-./volume_data}/postgres:/var/lib/postgresql/data
 
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: pgadmin
+    ports:
+      - "${POSTGRES_UI_PORT}:80"  # Map the container's port 80 to localhost:5050
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    depends_on:
+      - postgres
+    volumes:
+      - ${DATA_DIR:-./volume_data}/pgadmin:/var/lib/postgresql/data
+
   kafka:
     image: confluentinc/cp-kafka:latest
     container_name: ${BROKER_NAME}

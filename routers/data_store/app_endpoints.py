@@ -9,7 +9,7 @@ APP_PORT_INTERNAL = get_env_var("APP_INTERNAL_PORT", is_num=True)
 ASSET_TYPE_DESC = "Type of financial asset"
 SYMBOL_DESC = "Symbol of the financial asset (aka ticker)"
 DATA_TYPE_DESC = "Type of financial data"
-ASSET_DATA_ID_DESC = "ID of the asset data"
+ASSET_DATA_ID_DESC = "Unique identifier of the dataset entry."
 
 
 class MarketDataInterface(str, Enum):
@@ -20,4 +20,5 @@ class MarketDataInterface(str, Enum):
 
 class StoreDataInterface(str, Enum):
     POST_STORE_STOCK = "/store/{asset_type}/{symbol}/{data_type}/"
-    DELETE_STORE_STOCK = "/store/{asset_type}/{symbol}/{data_type}/"
+    GET_STORE_STOCK = "/store/{asset_type}/{symbol}/{data_type}/"
+    DELETE_STORE_STOCK = "/store/{dataset_id}/"

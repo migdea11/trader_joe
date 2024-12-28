@@ -1,8 +1,7 @@
 from contextlib import asynccontextmanager
 
-from alembic import command
-from alembic.config import Config
 from fastapi import FastAPI
+from sqlalchemy import inspect
 
 from common.app_lifecycle import startup_logs, teardown_logs
 from common.environment import get_env_var
@@ -11,12 +10,14 @@ from common.kafka.kafka_consumer import SharedKafkaConsumer
 from common.kafka.topics import ConsumerGroup, StaticTopic
 from common.logging import get_logger
 from common.worker_pool import SharedWorkerPool
+from data.store.app.db.models.stock_market_activity import StockMarketActivity
+from data.store.app.db.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.retrieve.data_action_request import \
     store_market_activity_worker
 from routers.common import ping
 from routers.data_store import asset_market_activity_data, store_dataset_request
 
-from .db.database import DATABASE_URI, get_instance, wait_for_db
+from .db.database import get_instance
 
 log = get_logger(__name__)
 
@@ -50,6 +51,13 @@ async def lifespan(app: FastAPI):
         db=get_instance()
     )
     log.info("Data Store App Ready!!!")
+
+    mapper = inspect(StoreDatasetEntry)
+    for column in mapper.columns:
+        log.debug(f"Column {column.name} type: {column.type}")
+    mapper = inspect(StockMarketActivity)
+    for column in mapper.columns:
+        log.debug(f"Column {column.name} type: {column.type}")
 
     yield
 

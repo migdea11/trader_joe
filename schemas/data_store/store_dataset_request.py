@@ -5,7 +5,7 @@ from typing import Optional
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Granularity, ExpiryType, UpdateType
-from routers.data_store.app_endpoints import ASSET_TYPE_DESC, DATA_TYPE_DESC, SYMBOL_DESC
+from routers.data_store.app_endpoints import ASSET_DATA_ID_DESC, ASSET_TYPE_DESC, DATA_TYPE_DESC, SYMBOL_DESC
 
 
 class StoreDatasetRequestBody(BaseModel):
@@ -34,6 +34,20 @@ class StoreDatasetRequestBody(BaseModel):
             )
         return request
 
+    @field_validator("expiry_type", mode="before")
+    def validate_expiry_type(cls, value):
+        return ExpiryType.validate(value)
+
+    @field_validator("update_type", mode="before")
+    def validate_update_type(cls, value):
+        return UpdateType.validate(value)
+
+    class Config:
+        json_encoders = {
+            ExpiryType: ExpiryType.encoder,
+            UpdateType: UpdateType.encoder
+        }
+
 
 class StoreDatasetRequestPath(BaseModel):
     asset_type: AssetType = Field(..., description=ASSET_TYPE_DESC)
@@ -45,20 +59,8 @@ class StoreDatasetRequestPath(BaseModel):
         return value.upper()
 
 
-# class StoreDatasetRequest(StoreDatasetRequestPath, StoreDatasetRequestBody):
-#     def extract_path(self) -> Dict[str, Any]:
-#         path_fields = StoreDatasetRequestPath.model_fields
-#         return {key: value for key, value in self.model_dump().items() if key in path_fields}
-
-#     def extract_path_obj(self) -> StoreDatasetRequestPath:
-#         return StoreDatasetRequestPath(**self.extract_path())
-
-#     def extract_body(self) -> Dict[str, Any]:
-#         body_fields = StoreDatasetRequestBody.model_fields
-#         return {key: value for key, value in self.model_dump().items() if key in body_fields}
-
-#     def extract_body_obj(self) -> StoreDatasetRequestBody:
-#         return StoreDatasetRequestBody(**self.extract_body())
+class StoreDatasetRequestById(BaseModel):
+    id: UUID = Field(..., description=ASSET_DATA_ID_DESC)
 
 
 class StoreDatasetIdentifiers:
@@ -81,6 +83,17 @@ class StoreDatasetIdentifiers:
         self.end = end
 
 
+class StoreDatasetEntrySearch(BaseModel):
+    source: Optional[DataSource] = None
+    granularity: Optional[Granularity] = None
+    start: Optional[datetime] = None
+    end: Optional[datetime] = None
+    expiry_type: Optional[ExpiryType] = None
+    update_type: Optional[UpdateType] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
 class StoreDatasetEntryCreate(StoreDatasetRequestPath, StoreDatasetRequestBody):
     pass
 
@@ -98,4 +111,5 @@ class StoreDatasetEntryInDb(StoreDatasetEntryUpdate):
 
 
 class StoreDatasetEntry(StoreDatasetEntryInDb):
-    pass
+    item_count: int
+    expiry: datetime

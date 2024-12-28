@@ -1,6 +1,8 @@
 from datetime import timedelta
-from enum import Enum, IntEnum
+from enum import Enum
 from typing import Generic, Self, Type, TypeVar
+
+from common.enums.pydantic_enums import NamedIntEnum
 
 
 class Granularity(str, Enum):
@@ -17,10 +19,6 @@ class Granularity(str, Enum):
         obj._value_ = value
         obj._offset = offset
         return obj
-
-    # @property
-    # def value(self) -> str:
-    #     return self._value
 
     @property
     def offset(self) -> timedelta:
@@ -89,7 +87,7 @@ class DataSource(str, Enum):
     MANUAL_ENTRY = "MANUAL"
 
 
-class ExpiryType(IntEnum):
+class ExpiryType(NamedIntEnum):
     # All items from request expire at the same time
     BULK = 1
     # A max number of items are stored, when the limit is reached the oldest item is removed
@@ -100,7 +98,7 @@ class ExpiryType(IntEnum):
     ROLLING = 5
 
 
-class UpdateType(IntEnum):
+class UpdateType(NamedIntEnum):
     # Data is pulled once and never updated
     STATIC = 1
     # Data is pulled at the end of the day

@@ -1,20 +1,18 @@
 """Initial migration
 
-Revision ID: 95280b9ee61e
+Revision ID: ba3729d63ca3
 Revises: 
-Create Date: 2024-12-23 19:23:14.340484
+Create Date: 2024-12-26 21:49:31.003890
 
 """
 from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
-from common.database.sql_alchemy_types import IntEnum
-from common.enums.data_stock import ExpiryType
-from common.enums.data_stock import UpdateType
+
 
 # revision identifiers, used by Alembic.
-revision: str = '95280b9ee61e'
+revision: str = 'ba3729d63ca3'
 down_revision: Union[str, None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -29,25 +27,17 @@ def upgrade() -> None:
     sa.Column('asset_type', sa.Enum('STOCK', 'CRYPTO', 'OPTION', name='assettype'), nullable=False),
     sa.Column('data_type', sa.Enum('MARKET_ACTIVITY', 'QUOTE', 'TRADE', name='datatype'), nullable=False),
     sa.Column('granularity', sa.Enum('ONE_MINUTE', 'FIVE_MINUTES', 'THIRTY_MINUTES', 'ONE_HOUR', 'ONE_DAY', 'ONE_WEEK', 'ONE_MONTH', name='granularity'), nullable=False),
-    sa.Column('start', sa.DateTime(), nullable=False),
-    sa.Column('end', sa.DateTime(), nullable=True),
-    sa.Column('expiry', sa.DateTime(), nullable=True),
-    sa.Column('expiry_type', IntEnum(ExpiryType), nullable=True),
-    sa.Column('update_type', IntEnum(UpdateType), nullable=True),
-    sa.Column('created_at', sa.DateTime(), nullable=False),
-    sa.Column('updated_at', sa.DateTime(), nullable=False),
+    sa.Column('start', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('end', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('expiry_type', sa.Integer(), nullable=True),
+    sa.Column('update_type', sa.Integer(), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('id'),
     sa.UniqueConstraint('symbol', 'granularity', 'start', 'end', 'source', 'data_type')
     )
     op.create_table('stock_market_activity',
-    sa.Column('id', sa.Integer(), nullable=False),
-    sa.Column('dataset_id', sa.UUID(), nullable=False),
-    sa.Column('source', sa.Enum('IB_API', 'ALPACA_API', 'MANUAL_ENTRY', name='datasource'), nullable=False),
-    sa.Column('symbol', sa.String(), nullable=False),
-    sa.Column('timestamp', sa.DateTime(), nullable=False),
-    sa.Column('granularity', sa.Enum('ONE_MINUTE', 'FIVE_MINUTES', 'THIRTY_MINUTES', 'ONE_HOUR', 'ONE_DAY', 'ONE_WEEK', 'ONE_MONTH', name='granularity'), nullable=False),
-    sa.Column('expiry', sa.DateTime(), nullable=True),
     sa.Column('open', sa.Float(), nullable=False),
     sa.Column('high', sa.Float(), nullable=False),
     sa.Column('low', sa.Float(), nullable=False),
@@ -56,8 +46,15 @@ def upgrade() -> None:
     sa.Column('trade_count', sa.Integer(), nullable=False),
     sa.Column('split_factor', sa.Float(), nullable=False),
     sa.Column('dividends_factor', sa.Float(), nullable=False),
-    sa.Column('created_at', sa.DateTime(), nullable=False),
-    sa.Column('updated_at', sa.DateTime(), nullable=False),
+    sa.Column('id', sa.Integer(), nullable=False),
+    sa.Column('dataset_id', sa.UUID(), nullable=False),
+    sa.Column('source', sa.Enum('IB_API', 'ALPACA_API', 'MANUAL_ENTRY', name='datasource'), nullable=False),
+    sa.Column('symbol', sa.String(), nullable=False),
+    sa.Column('timestamp', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('granularity', sa.Enum('ONE_MINUTE', 'FIVE_MINUTES', 'THIRTY_MINUTES', 'ONE_HOUR', 'ONE_DAY', 'ONE_WEEK', 'ONE_MONTH', name='granularity'), nullable=False),
+    sa.Column('expiry', sa.DateTime(), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
     sa.ForeignKeyConstraint(['dataset_id'], ['store_dataset_entry.id'], ondelete='CASCADE'),
     sa.PrimaryKeyConstraint('id')
     )
