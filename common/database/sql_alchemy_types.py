@@ -39,8 +39,6 @@ class _CustomSqlType(Generic[S, M], ABC):
 
 class CustomColumn(Column):
     def __init__(self, custom_type: Optional[_CustomSqlType[S, M] | Type[_CustomSqlType[S, M]]] = None, **kwargs):
-        print("BUILDING!!!", kwargs)
-
         if custom_type is not None:
             self.custom_type = custom_type() if isinstance(custom_type, type) else custom_type
             self.custom_type.validate_column_params(**kwargs)

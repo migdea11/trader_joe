@@ -27,7 +27,7 @@ class NamedIntEnum(IntEnum):
         """
         Convert the integer to an enum.
         """
-        return cls[value]
+        return cls[value.upper()]
 
     @classmethod
     def encoder(cls, value: Self) -> int:

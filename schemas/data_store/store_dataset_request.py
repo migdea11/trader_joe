@@ -1,11 +1,15 @@
 from uuid import UUID
+from fastapi import Query
 from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import datetime, timedelta
 from typing import Optional
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Granularity, ExpiryType, UpdateType
+from common.logging import get_logger
 from routers.data_store.app_endpoints import ASSET_DATA_ID_DESC, ASSET_TYPE_DESC, DATA_TYPE_DESC, SYMBOL_DESC
+
+log = get_logger(__name__)
 
 
 class StoreDatasetRequestBody(BaseModel):
@@ -21,6 +25,7 @@ class StoreDatasetRequestBody(BaseModel):
 
     @model_validator(mode="after")
     def validate_fields(cls, request: 'StoreDatasetRequestBody') -> 'StoreDatasetRequestBody':
+        log.debug(f"Validating request: {request}")
         if request.end is not None and request.start is None:
             raise ValueError("The 'start' field is required when 'end' is provided.")
 
@@ -47,6 +52,7 @@ class StoreDatasetRequestBody(BaseModel):
             ExpiryType: ExpiryType.encoder,
             UpdateType: UpdateType.encoder
         }
+        # extra = "forbid"
 
 
 class StoreDatasetRequestPath(BaseModel):
@@ -60,7 +66,7 @@ class StoreDatasetRequestPath(BaseModel):
 
 
 class StoreDatasetRequestById(BaseModel):
-    id: UUID = Field(..., description=ASSET_DATA_ID_DESC)
+    dataset_id: UUID = Field(..., description=ASSET_DATA_ID_DESC)
 
 
 class StoreDatasetIdentifiers:
@@ -84,6 +90,7 @@ class StoreDatasetIdentifiers:
 
 
 class StoreDatasetEntrySearch(BaseModel):
+    # Same as body, but with optional fields
     source: Optional[DataSource] = None
     granularity: Optional[Granularity] = None
     start: Optional[datetime] = None
@@ -92,6 +99,25 @@ class StoreDatasetEntrySearch(BaseModel):
     update_type: Optional[UpdateType] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+    @field_validator("expiry_type", mode="before")
+    def validate_expiry_type(cls, value):
+        if value is None:
+            return value
+        return ExpiryType.validate(value)
+
+    @field_validator("update_type", mode="before")
+    def validate_update_type(cls, value):
+        if value is None:
+            return value
+        return UpdateType.validate(value)
+
+    class Config:
+        json_encoders = {
+            ExpiryType: ExpiryType.encoder,
+            UpdateType: UpdateType.encoder
+        }
+        # extra = "forbid"
 
 
 class StoreDatasetEntryCreate(StoreDatasetRequestPath, StoreDatasetRequestBody):

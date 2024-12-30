@@ -119,7 +119,7 @@ async def search_entries(
     )
 
     # Apply filters to the subquery
-    for column, value in request_query.__dict__.items():
+    for column, value in request_query.model_dump().items():
         log.debug(f"Filtering by {column}: {value}")
         if value is not None:
             query = query.where(getattr(StoreDatasetEntry, column) == value)
@@ -128,6 +128,7 @@ async def search_entries(
     query = query.group_by(StoreDatasetEntry.id)
     log.debug(f"Query: {query}")
     entries: List[Tuple[StoreDatasetEntry, datetime, int]] = db.execute(query).fetchall()
+    log.debug(f"Entries: {entries}")
 
     return [
         entry.to_validated_schema(

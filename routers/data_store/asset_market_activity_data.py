@@ -33,7 +33,7 @@ def create_stock_market_activity_data(
     request: AssetMarketActivityDataCreate = Depends()
 ):
     log.debug("Storing data for", request.asset_type)
-    if request.asset_type == AssetType.STOCK:
+    if request.asset_type is AssetType.STOCK:
         crud_stock_market_activity.create_asset_market_activity_data(db, request)
         return {"message": "Stock market activity data stored"}
 
@@ -46,7 +46,7 @@ def delete_stock_market_activity_data(
     db: Session = Depends(get_instance),
     request: AssetMarketActivityDataDelete = Depends()
 ):
-    if request.asset_type == AssetType.STOCK:
+    if request.asset_type is AssetType.STOCK:
         crud_stock_market_activity.delete_all_asset_market_activity_data(db=db)
         return {"message": "All stock market activity data deleted"}
 
@@ -58,11 +58,10 @@ def read_stock_market_activity_data(
     db: Session = Depends(get_instance),
     request: AssetMarketActivityDataGet = Depends()
 ):
-    if request.asset_type == AssetType.STOCK:
-        if request.symbol is None:
+    if request.asset_type is AssetType.STOCK:
+        if request.query() is False:
             return crud_stock_market_activity.read_all_asset_market_activity_data(db)
-        # TODO implement search functionality
-        # else:
-        #     return crud_stock_market_activity.read_asset_market_activity_dataset(db, request)
+        else:
+            return crud_stock_market_activity.read_asset_market_activity_dataset(db, request)
 
     raise UnsupportedAssetType(request.asset_type)

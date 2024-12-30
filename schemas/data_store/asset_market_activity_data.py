@@ -50,12 +50,24 @@ class AssetMarketActivityDataDelete(BaseModel):
 
 
 class AssetMarketActivityDataGet(BaseModel):
+    # Path
     asset_type: AssetType = Field(..., description=ASSET_TYPE_DESC)
-    symbol: Optional[str] = Field(None, description=SYMBOL_DESC)
+
+    # Query
+    dataset_id: Optional[UUID] = None
+    symbol: Optional[str] = None
+    granularity: Optional[Granularity] = None
+    start: Optional[datetime] = None
+    end: Optional[datetime] = None
 
     @field_validator("symbol")
-    def uppercase_item_id(cls, value: str) -> str:
+    def uppercase_item_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
         return value.upper()
+
+    def query(self) -> bool:
+        return any([self.dataset_id, self.symbol, self.granularity, self.start, self.end])
 
 
 class AssetMarketActivityDataInDB(AssetMarketActivityDataUpdate):

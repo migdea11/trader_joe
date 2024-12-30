@@ -13,12 +13,12 @@ ASSET_DATA_ID_DESC = "Unique identifier of the dataset entry."
 
 
 class MarketDataInterface(str, Enum):
-    POST_MARKET_ACTIVITY = "/market-activity/{asset_type}/{symbol}/"
-    DELETE_MARKET_ACTIVITY = "/market-activity/{asset_type}/"
-    GET_MARKET_ACTIVITY = "/market-activity/{asset_type}/{symbol}"
+    POST_MARKET_ACTIVITY = "/market-activity/{asset_type}/{symbol}"
+    DELETE_MARKET_ACTIVITY = "/market-activity/{asset_type}"
+    GET_MARKET_ACTIVITY = "/market-activity/{asset_type}"
 
 
 class StoreDataInterface(str, Enum):
-    POST_STORE_STOCK = "/store/{asset_type}/{symbol}/{data_type}/"
-    GET_STORE_STOCK = "/store/{asset_type}/{symbol}/{data_type}/"
-    DELETE_STORE_STOCK = "/store/{dataset_id}/"
+    POST_STORE_STOCK = "/store/{asset_type}/{symbol}/{data_type}"
+    GET_STORE_STOCK = "/store/{asset_type}/{symbol}/{data_type}"
+    DELETE_STORE_STOCK = "/store/{dataset_id}"

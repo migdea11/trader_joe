@@ -46,16 +46,22 @@ def batch_insert_asset_market_activity_data(
 
 # TODO replace with a search function
 def read_asset_market_activity_dataset(
-    db: Session, dataset_id: UUID, start_date: Optional[datetime], end_date: Optional[datetime]
+    db: Session, request: asset_market_activity_data.AssetMarketActivityDataGet
 ) -> List[asset_market_activity_data.AssetMarketActivityData]:
     log.debug("Reading stock market activity dataset")
-    conditions = [StockMarketActivity.dataset_id == dataset_id]
 
     # If using subset of dataset
-    if start_date:
-        conditions.append(StockMarketActivity.timestamp >= start_date)
-    if end_date:
-        conditions.append(StockMarketActivity.timestamp <= end_date)
+    conditions = []
+    if request.dataset_id:
+        conditions.append(StockMarketActivity.dataset_id == request.dataset_id)
+    if request.symbol:
+        conditions.append(StockMarketActivity.symbol == request.symbol)
+    if request.granularity:
+        conditions.append(StockMarketActivity.granularity == request.granularity)
+    if request.start:
+        conditions.append(StockMarketActivity.timestamp >= request.start)
+    if request.end:
+        conditions.append(StockMarketActivity.timestamp <= request.end)
 
     db_asset_market_activities = db.query(StockMarketActivity).filter(*conditions).all()
     return [
@@ -69,7 +75,9 @@ def read_all_asset_market_activity_data(db: Session) -> List[asset_market_activi
     db_stock_market_activities = db.query(StockMarketActivity).all()
 
     schema_objects = [
-        asset_market_activity_data.AssetMarketActivityData.model_validate(obj) for obj in db_stock_market_activities
+        asset_market_activity_data.AssetMarketActivityData.model_validate(
+            {**obj.__dict__, "asset_type": AssetType.STOCK}
+        ) for obj in db_stock_market_activities
     ]
     return schema_objects
 
