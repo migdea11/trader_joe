@@ -1,11 +1,12 @@
-from datetime import datetime
 import traceback
-from sqlalchemy.orm import Session
-from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy import func, case, select
-from typing import List, Tuple
 import uuid
+from datetime import datetime
+from typing import List, Tuple
+
+from sqlalchemy import case, delete, func, select, update
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.logging import get_logger
 from data.store.app.db.models.stock_market_activity import StockMarketActivity
@@ -16,14 +17,10 @@ log = get_logger(__name__)
 
 
 async def upsert_entry(
-    db: Session, entry: store_dataset_request.StoreDatasetEntryCreate
+    db: AsyncSession, entry: store_dataset_request.StoreDatasetEntryCreate
 ) -> store_dataset_request.StoreDatasetEntry:
     try:
-        test = StoreDatasetEntry.get_fields(entry, exclude={"expiry"}, exclude_none=True)
-        log.debug("Inserting or updating entry with the following values:")
-        for name, column in test.items():
-            log.debug(f"  test - {name}: {column}")
-        stmt = insert(StoreDatasetEntry).values(
+        stmt = postgresql.insert(StoreDatasetEntry).values(
             **StoreDatasetEntry.get_fields(entry, exclude={"expiry"}, exclude_none=True),
             created_at=func.now(),
             updated_at=func.now()
@@ -46,9 +43,9 @@ async def upsert_entry(
                 'updated_at': func.now()
             }
         ).returning(StoreDatasetEntry.id)
-        result_id: StoreDatasetEntry = db.execute(stmt).scalar_one()
-        db.commit()
-
+        result = await db.execute(stmt)
+        result_id = result.scalar_one()
+        await db.commit()
         return result_id
     except SQLAlchemyError as e:
         db.rollback()
@@ -56,51 +53,48 @@ async def upsert_entry(
         raise RuntimeError(f"Error while creating or updating entry: {e}")
 
 
-async def update_entry(db: Session, entry: store_dataset_request.StoreDatasetEntryUpdate):
+async def update_entry(db: AsyncSession, entry: store_dataset_request.StoreDatasetEntryUpdate):
     """
     Update an existing entry.
     """
     try:
-        db.query(StoreDatasetEntry).filter(StoreDatasetEntry.id == entry.id).update(
+        stmt = update(StoreDatasetEntry).where(StoreDatasetEntry.id == entry.id).values(
             entry.model_dump(),
-            synchronize_session=False
         )
-        db.commit()
+        await db.execute(stmt)
+        await db.commit()
     except SQLAlchemyError as e:
         db.rollback()
         traceback.print_exc()
         raise RuntimeError(f"Error while updating entry: {e}")
 
 
-async def update_entry_lifecycle(db: Session, id: uuid.UUID):
+async def update_entry_lifecycle(db: AsyncSession, id: uuid.UUID):
     """
     Updates only the `updated_at` for an existing entry.
     """
     # TODO might not be necessary
     try:
-        db.query(StoreDatasetEntry).filter(StoreDatasetEntry.id == id).update(
-            {
-                'updated_at': func.now(),
-            },
-            synchronize_session=False
-        )
-        db.commit()
+        stmt = update(StoreDatasetEntry).where(StoreDatasetEntry.id == id).values(updated_at=func.now())
+        await db.execute(stmt)
+        await db.commit()
     except SQLAlchemyError as e:
         db.rollback()
         traceback.print_exc()
         raise RuntimeError(f"Error while updating entry lifecycle: {e}")
 
 
-async def get_entry_by_id(db: Session, id: uuid.UUID) -> store_dataset_request.StoreDatasetEntry:
+async def get_entry_by_id(db: AsyncSession, id: uuid.UUID) -> store_dataset_request.StoreDatasetEntry:
     """
     Retrieve an entry by its ID.
     """
-    entry = db.query(StoreDatasetEntry).filter(StoreDatasetEntry.id == id).first()
-    return store_dataset_request.StoreDatasetEntry.model_validate(entry)
+    stmt = select(StoreDatasetEntry).where(StoreDatasetEntry.id == id)
+    result = await db.execute(stmt)
+    return store_dataset_request.StoreDatasetEntry.model_validate(result.first())
 
 
 async def search_entries(
-    db: Session,
+    db: AsyncSession,
     request_path: store_dataset_request.StoreDatasetRequestPath,
     request_query: store_dataset_request.StoreDatasetEntrySearch
 ) -> List[store_dataset_request.StoreDatasetEntry]:
@@ -108,27 +102,28 @@ async def search_entries(
     Search for entries based on optional criteria.
     """
     joined_table = StockMarketActivity
-    query = select(
+    stmt = select(
         StoreDatasetEntry,
         func.min(joined_table.expiry).label("expiry"),
         func.count(joined_table.id).label("item_count"),
     ).outerjoin(
         joined_table, StoreDatasetEntry.id == joined_table.dataset_id
     ).where(
-        joined_table.symbol == request_path.symbol
+        StoreDatasetEntry.symbol == request_path.symbol
     )
 
     # Apply filters to the subquery
     for column, value in request_query.model_dump().items():
         log.debug(f"Filtering by {column}: {value}")
         if value is not None:
-            query = query.where(getattr(StoreDatasetEntry, column) == value)
+            stmt = stmt.where(getattr(StoreDatasetEntry, column) == value)
 
     # Execute query (example, depending on your session setup)
-    query = query.group_by(StoreDatasetEntry.id)
-    log.debug(f"Query: {query}")
-    entries: List[Tuple[StoreDatasetEntry, datetime, int]] = db.execute(query).fetchall()
-    log.debug(f"Entries: {entries}")
+    stmt = stmt.group_by(StoreDatasetEntry.id)
+    # log.debug(f"Query: {stmt.compile(dialect=postgresql.dialect())}")
+    result = await db.execute(stmt)
+    entries: List[Tuple[StoreDatasetEntry, datetime, int]] = result.all()
+    # log.debug(f"Entries: {entries}")
 
     return [
         entry.to_validated_schema(
@@ -139,13 +134,14 @@ async def search_entries(
     ]
 
 
-async def delete_entry_by_id(db: Session, id: uuid.UUID):
+async def delete_entry_by_id(db: AsyncSession, id: uuid.UUID):
     """
     Delete an entry by its ID.
     """
     try:
-        result = db.query(StoreDatasetEntry).filter(StoreDatasetEntry.id == id).delete()
-        db.commit()
+        stmt = delete(StoreDatasetEntry).filter(StoreDatasetEntry.id == id)
+        result = await db.execute(stmt)
+        await db.commit()
         if result == 0:
             raise ValueError(f"No entry found with ID {id}")
     except SQLAlchemyError as e:

@@ -2,7 +2,7 @@ import asyncio
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable
+from typing import Any, Callable, Coroutine
 
 from kafka import (
     KafkaAdminClient,
@@ -89,7 +89,7 @@ class SharedKafkaConsumer:
         cls,
         executor: ThreadPoolExecutor,
         consumer_params: ConsumerParams,
-        callback: Callable[[ConsumerRecord], bool],
+        callback: Callable[[ConsumerRecord], Coroutine[Any, Any, bool]],
         commit_batch_size: int,
         commit_batch_interval: int
     ):
@@ -105,7 +105,7 @@ class SharedKafkaConsumer:
                 for message in consumer:
 
                     log.debug(f"Received message from: {message.topic}")
-                    success = callback(message)
+                    success = asyncio.run(callback(message))
 
                     if success:
                         # Track the latest offset for this partition
@@ -128,3 +128,4 @@ class SharedKafkaConsumer:
         # Offload the Kafka consumer loop to a separate thread
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(executor, consume_messages)
+        # asyncio.create_task(consume_messages)

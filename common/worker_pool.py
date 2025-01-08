@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from common.environment import get_env_var
 
 # Configure Worker Threads
-EXECUTOR_WORKERS = get_env_var('EXECUTOR_WORKERS', is_num=True)
+EXECUTOR_WORKERS = get_env_var('EXECUTOR_WORKERS', cast_type=int)
 
 
 class SharedWorkerPool:

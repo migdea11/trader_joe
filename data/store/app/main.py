@@ -1,7 +1,6 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from sqlalchemy import inspect
 
 from common.app_lifecycle import startup_logs, teardown_logs
 from common.environment import get_env_var
@@ -10,21 +9,19 @@ from common.kafka.kafka_consumer import SharedKafkaConsumer
 from common.kafka.topics import ConsumerGroup, StaticTopic
 from common.logging import get_logger
 from common.worker_pool import SharedWorkerPool
-from data.store.app.db.models.stock_market_activity import StockMarketActivity
-from data.store.app.db.models.store_dataset_entry import StoreDatasetEntry
+from data.store.app.db import database
 from data.store.app.retrieve.data_action_request import \
     store_market_activity_worker
 from routers.common import ping
-from routers.data_store import asset_market_activity_data, store_dataset_request
-
-from .db.database import get_instance
+from routers.data_store import (asset_market_activity_data,
+                                store_dataset_request)
 
 log = get_logger(__name__)
 
 
 BROKER_NAME = get_env_var("BROKER_NAME")
-BROKER_PORT = get_env_var("BROKER_PORT", is_num=True)
-BROKER_CONN_TIMEOUT = get_env_var("BROKER_CONN_TIMEOUT", is_num=True)
+BROKER_PORT = get_env_var("BROKER_PORT", cast_type=int)
+BROKER_CONN_TIMEOUT = get_env_var("BROKER_CONN_TIMEOUT", cast_type=int)
 
 
 @asynccontextmanager
@@ -43,21 +40,15 @@ async def lifespan(app: FastAPI):
     )
     SharedKafkaConsumer.wait_for_kafka(clientParams)
 
+    # Setup Database
+    await database.initialize()
     # Setup Workers
     store_market_activity_worker(
         host=clientParams.host,
         port=clientParams.port,
-        timeout=clientParams.timeout,
-        db=get_instance()
+        timeout=clientParams.timeout
     )
     log.info("Data Store App Ready!!!")
-
-    mapper = inspect(StoreDatasetEntry)
-    for column in mapper.columns:
-        log.debug(f"Column {column.name} type: {column.type}")
-    mapper = inspect(StockMarketActivity)
-    for column in mapper.columns:
-        log.debug(f"Column {column.name} type: {column.type}")
 
     yield
 
@@ -65,6 +56,8 @@ async def lifespan(app: FastAPI):
     teardown_logs(app)
     SharedWorkerPool.worker_shutdown()
     SharedKafkaConsumer.shutdown()
+
+    await database.shutdown()
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(ping.router)

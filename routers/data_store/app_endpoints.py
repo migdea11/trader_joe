@@ -3,8 +3,8 @@ from enum import Enum
 from common.environment import get_env_var
 
 APP_NAME = get_env_var("DATA_STORE_NAME")
-APP_PORT = get_env_var("DATA_STORE_PORT", is_num=True)
-APP_PORT_INTERNAL = get_env_var("APP_INTERNAL_PORT", is_num=True)
+APP_PORT = get_env_var("DATA_STORE_PORT", cast_type=int)
+APP_PORT_INTERNAL = get_env_var("APP_INTERNAL_PORT", cast_type=int)
 
 ASSET_TYPE_DESC = "Type of financial asset"
 SYMBOL_DESC = "Symbol of the financial asset (aka ticker)"

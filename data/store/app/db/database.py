@@ -1,32 +1,46 @@
-from sqlalchemy import URL
-from sqlalchemy.orm import Session
+from typing import AsyncGenerator
 
+from contextlib import asynccontextmanager
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from common.database.postgres_tools import PostgresSessionFactory
 from common.environment import get_env_var
 from common.logging import get_logger
-from common.database.postgres_tools import SharedPostgresSession
 
 log = get_logger(__name__)
 
 DATABASE_HOST = get_env_var("DATABASE_NAME")
-DATABASE_PORT = get_env_var("DATABASE_PORT", is_num=True)
+DATABASE_PORT = get_env_var("DATABASE_PORT", cast_type=int)
 DATABASE_DB_NAME = get_env_var("POSTGRES_DB_NAME")
 DATABASE_USER = get_env_var("POSTGRES_USER")
 DATABASE_PASS = get_env_var("POSTGRES_PASS")
-DATABASE_CONN_TIMEOUT = get_env_var("DATABASE_CONN_TIMEOUT", is_num=True)
+DATABASE_CONN_TIMEOUT = get_env_var("DATABASE_CONN_TIMEOUT", cast_type=int)
 
-DATABASE_URI = URL.create(
-    "postgresql",
-    username=DATABASE_USER,
-    password=DATABASE_PASS,
-    host=DATABASE_HOST,
-    port=DATABASE_PORT,
-    database=DATABASE_DB_NAME
+DATABASE_ASYNC_URI = PostgresSessionFactory.AsyncSession.create_uri(
+    DATABASE_HOST, DATABASE_PORT, DATABASE_DB_NAME, DATABASE_USER, DATABASE_PASS
 )
 
 
-def wait_for_db() -> bool:
-    return SharedPostgresSession.wait_for_db(DATABASE_URI, DATABASE_CONN_TIMEOUT)
+async def initialize():
+    await PostgresSessionFactory.AsyncSession.initialize(DATABASE_ASYNC_URI, DATABASE_CONN_TIMEOUT)
 
 
-def get_instance() -> Session:
-    return SharedPostgresSession.get_instance(DATABASE_URI, DATABASE_CONN_TIMEOUT)
+async def shutdown():
+    await PostgresSessionFactory.shutdown()
+
+
+# def get_db() -> Generator[Session, None, None]:
+#     yield PostgresSessionFactory.SyncSession.get_session(DATABASE_URI)
+
+
+async def async_db() -> AsyncGenerator[AsyncSession, None]:
+    yield PostgresSessionFactory.AsyncSession.get_session(DATABASE_ASYNC_URI)
+
+
+@asynccontextmanager
+async def get_async_db() -> AsyncGenerator[AsyncSession, None]:
+    session = PostgresSessionFactory.AsyncSession.get_session(DATABASE_ASYNC_URI)
+    try:
+        yield session
+    finally:
+        await session.close()

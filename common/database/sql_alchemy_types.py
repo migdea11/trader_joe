@@ -9,8 +9,6 @@ from sqlalchemy import Column, DateTime, Integer
 from common.logging import get_logger
 
 log = get_logger(__name__)
-
-
 S = TypeVar("S")
 M = TypeVar("M")
 

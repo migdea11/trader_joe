@@ -10,8 +10,8 @@ from routers.common import ping
 from routers.data_ingest import get_dataset_request
 
 BROKER_NAME = get_env_var("BROKER_NAME")
-BROKER_PORT = get_env_var("BROKER_PORT", is_num=True)
-BROKER_CONN_TIMEOUT = get_env_var("BROKER_CONN_TIMEOUT", is_num=True)
+BROKER_PORT = get_env_var("BROKER_PORT", cast_type=int)
+BROKER_CONN_TIMEOUT = get_env_var("BROKER_CONN_TIMEOUT", cast_type=int)
 
 
 @asynccontextmanager

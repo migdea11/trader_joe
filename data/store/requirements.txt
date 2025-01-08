@@ -4,7 +4,6 @@ asyncpg
 fastapi
 httpx
 kafka-python-ng
-psycopg2-binary
 pydantic
 python-dotenv
 sqlalchemy

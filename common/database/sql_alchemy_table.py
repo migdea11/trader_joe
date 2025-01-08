@@ -39,8 +39,6 @@ class CustomTypeTable:
                     and (exclude_none is False or column.default is None):
                 other_columns[column.name] = column
 
-        # log.debug(f"Other columns: {other_columns}")
-        # log.debug(f"Custom type columns: {custom_type_columns}")
         return other_columns, custom_type_columns
 
     def __to_fields(
@@ -77,7 +75,6 @@ class CustomTypeTable:
         other_columns, custom_type_columns = cls._get_columns(exclude, exclude_none)
         columns = {}
         for name, value in schema.__dict__.items():
-            # log.debug(f"  {name}: {value}(type: {type(value)})")
             if name in other_columns:
                 columns[name] = value
             elif name in custom_type_columns:

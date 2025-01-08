@@ -138,4 +138,4 @@ class StoreDatasetEntryInDb(StoreDatasetEntryUpdate):
 
 class StoreDatasetEntry(StoreDatasetEntryInDb):
     item_count: int
-    expiry: datetime
+    expiry: Optional[datetime] = None
