@@ -17,10 +17,14 @@ log = get_logger(__name__)
 _POSTGRES_ASYNC_ENABLED = get_env_var("POSTGRES_ASYNC", default=False, cast_type=bool)
 _POSTGRES_SYNC_ENABLED = get_env_var("POSTGRES_SYNC", default=False, cast_type=bool)
 if _POSTGRES_ASYNC_ENABLED is True:
+    log.info("Postgres async is enabled.")
+    print("Postgres async is enabled.")
     import asyncio
 
     import asyncpg
 if _POSTGRES_SYNC_ENABLED is True:
+    log.info("Postgres sync is enabled.")
+    print("Postgres sync is enabled.")
     import psycopg2
 
 
@@ -64,11 +68,12 @@ class PostgresSessionFactory:
                 raise RuntimeError("Postgres async is not enabled.")
 
             start_time = time.time()
-            uri_copy = uri.set(drivername="postgresql")
-            uri_str = PostgresSessionFactory._get_display_uri(uri_copy)
+            # asyncpg doesn't support the SQLAlchemy's 'postgresql+asyncpg' drivername
+            internal_uri = uri.set(drivername="postgresql")
+            uri_str = PostgresSessionFactory._get_display_uri(internal_uri)
             while True:
                 try:
-                    conn = await asyncpg.connect(uri_copy.render_as_string(hide_password=False))
+                    conn = await asyncpg.connect(internal_uri.render_as_string(hide_password=False))
                     await conn.close()
                     log.info(f"Postgres is ready for {uri_str}!")
                     return True
