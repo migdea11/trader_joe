@@ -8,7 +8,7 @@ from kafka.consumer.fetcher import ConsumerRecord
 
 from common.enums.data_select import AssetType
 from common.environment import get_env_var
-from common.kafka.kafka_consumer import ConsumerParams, SharedKafkaConsumer
+from common.kafka.kafka_consumer import ConsumerParams, KafkaConsumerFactory
 from common.kafka.topics import ConsumerGroup, StaticTopic
 from common.logging import get_logger
 from common.worker_pool import SharedWorkerPool
@@ -50,7 +50,7 @@ def store_market_activity_worker(host: str, port: int, timeout: int):
         timeout
     )
 
-    asyncio.create_task(SharedKafkaConsumer.consume_messages_async(
+    asyncio.create_task(KafkaConsumerFactory.consume_messages_async(
         SharedWorkerPool.get_instance(),
         clientConfig,
         callback,

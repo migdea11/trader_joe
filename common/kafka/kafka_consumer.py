@@ -20,9 +20,9 @@ from common.logging import get_logger
 log = get_logger(__name__)
 
 
-class SharedKafkaConsumer:
+class KafkaConsumerFactory:
     __KAFKA_ADMIN_CLIENT: KafkaAdminClient = None
-    __KAFKA_SUB_INSTANCES = {}
+    _KAFKA_SUB_INSTANCES = []
 
     @classmethod
     def shutdown(cls):
@@ -30,10 +30,15 @@ class SharedKafkaConsumer:
             cls.__KAFKA_ADMIN_CLIENT.close()
             cls.__KAFKA_ADMIN_CLIENT = None
         consumer: KafkaConsumer
-        for consumer in cls.__KAFKA_SUB_INSTANCES.values():
+        for consumer in cls._KAFKA_SUB_INSTANCES:
             consumer.close()
-        cls.__KAFKA_SUB_INSTANCES.clear()
+        cls._KAFKA_SUB_INSTANCES.clear()
         log.info("Kafka consumer shutdown.")
+
+    @classmethod
+    def release(cls, consumer: KafkaConsumer):
+        consumer.close()
+        cls._KAFKA_SUB_INSTANCES.remove(consumer)
 
     @classmethod
     def wait_for_kafka(
@@ -72,17 +77,16 @@ class SharedKafkaConsumer:
     @classmethod
     def get_consumer(cls, clientParams: ConsumerParams) -> KafkaConsumer:
         cls.wait_for_kafka(clientParams)
-        if clientParams.get_key() not in cls.__KAFKA_SUB_INSTANCES:
-            consumer_topics = [topic.value for topic in clientParams.topics]
-            consumer = KafkaConsumer(
-                *consumer_topics,
-                bootstrap_servers=clientParams.get_url(),
-                group_id=clientParams.group_id.value,
-                auto_offset_reset="earliest",
-                enable_auto_commit=clientParams.enable_auto_commit
-            )
-            cls.__KAFKA_SUB_INSTANCES[clientParams.get_key()] = consumer
-        return cls.__KAFKA_SUB_INSTANCES[clientParams.get_key()]
+        consumer_topics = [topic.value for topic in clientParams.topics]
+        consumer = KafkaConsumer(
+            *consumer_topics,
+            bootstrap_servers=clientParams.get_url(),
+            group_id=clientParams.group_id.value,
+            auto_offset_reset="earliest",
+            enable_auto_commit=clientParams.enable_auto_commit
+        )
+        cls._KAFKA_SUB_INSTANCES.append(consumer)
+        return consumer
 
     @classmethod
     async def consume_messages_async(
@@ -128,4 +132,3 @@ class SharedKafkaConsumer:
         # Offload the Kafka consumer loop to a separate thread
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(executor, consume_messages)
-        # asyncio.create_task(consume_messages)

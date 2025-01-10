@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from common.app_lifecycle import startup_logs, teardown_logs
 from common.environment import get_env_var
 from common.kafka.kafka_config import ConsumerParams
-from common.kafka.kafka_consumer import SharedKafkaConsumer
+from common.kafka.kafka_consumer import KafkaConsumerFactory
 from common.kafka.topics import ConsumerGroup, StaticTopic
 from common.logging import get_logger
 from common.worker_pool import SharedWorkerPool
@@ -38,7 +38,7 @@ async def lifespan(app: FastAPI):
         False,
         BROKER_CONN_TIMEOUT
     )
-    SharedKafkaConsumer.wait_for_kafka(clientParams)
+    KafkaConsumerFactory.wait_for_kafka(clientParams)
 
     # Setup Database
     await database.initialize()
@@ -55,7 +55,7 @@ async def lifespan(app: FastAPI):
     # cleanup tasks
     teardown_logs(app)
     SharedWorkerPool.worker_shutdown()
-    SharedKafkaConsumer.shutdown()
+    KafkaConsumerFactory.shutdown()
 
     await database.shutdown()
 

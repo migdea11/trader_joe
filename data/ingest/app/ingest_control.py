@@ -5,7 +5,8 @@ from kafka import KafkaProducer
 
 from common.enums.data_stock import DataSource
 from common.environment import get_env_var
-from common.kafka.kafka_producer import SharedKafkaProducer
+from common.kafka.kafka_config import ProducerParams
+from common.kafka.kafka_producer import KafkaProducerFactory
 from common.kafka.topics import TopicTyping
 from common.logging import get_logger
 from common.worker_pool import SharedWorkerPool
@@ -30,16 +31,18 @@ async def send_on_receive(producer: KafkaProducer, data_request: Coroutine[Any, 
     topic_map = await data_request
     for topic, data in topic_map.items():
         log.debug("sending to: %s", topic.value)
-        SharedKafkaProducer.send_message_async(SharedWorkerPool.get_instance(), producer, topic.value, data)
+        KafkaProducerFactory.send_message_async(SharedWorkerPool.get_instance(), producer, topic.value, data)
 
 
 def store_retrieve_stock(request: StockDatasetRequest):
-    producer: KafkaProducer = SharedKafkaProducer.get_producer(BROKER_NAME, BROKER_PORT, BROKER_CONN_TIMEOUT)
+    producer: KafkaProducer = KafkaProducerFactory.get_producer(
+        BROKER_NAME, BROKER_PORT, BROKER_CONN_TIMEOUT, producer_type=ProducerParams.ProducerType.DEDICATED
+    )
     if request.source is DataSource.ALPACA_API:
         data_request = alpaca_market_data(SharedWorkerPool.get_instance(), request)
         asyncio.create_task(send_on_receive(producer, data_request))
     # TODO Other Brokers
-    SharedKafkaProducer.flush_messages_async(SharedWorkerPool.get_instance(), producer)
+    KafkaProducerFactory.flush_messages_async(SharedWorkerPool.get_instance(), producer)
 
 
 def store_retrieve_crypto(request: StockDatasetRequest):
