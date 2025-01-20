@@ -1,7 +1,7 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import Dict, List
+from typing import List
 from uuid import UUID
 
 from alpaca.data.historical import StockHistoricalDataClient
@@ -20,11 +20,11 @@ from common.data_lifecyle import expiry_inc
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Granularity
 from common.environment import get_env_var
-from common.kafka.topics import StaticTopic, TopicTyping
 from common.logging import get_logger
 from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
-from schemas.data_store.asset_market_activity_data import AssetMarketActivityDataCreate
 from schemas.data_ingest.get_dataset_request import StockDatasetRequest
+from schemas.data_store.asset_market_activity_data import (
+    AssetMarketActivityDataCreate, BatchStockDataCreate)
 
 log = get_logger(__name__)
 
@@ -69,7 +69,7 @@ def create_stock_quote(data: Quote, symbol: str, granularity: Granularity, sourc
 
 async def get_market_stock_data(
     executor: ThreadPoolExecutor, request: StockDatasetRequest
-) -> Dict[TopicTyping, List[str]]:
+) -> BatchStockDataCreate:
     granularity = AlpacaGranularity.from_granularity(request.granularity).broker_code
     params = {
         "symbol_or_symbols": request.symbol,
@@ -87,7 +87,7 @@ async def get_market_stock_data(
     if "start" not in params and "end" not in params:
         latest = True
 
-    if DataType.MARKET_ACTIVITY in request.data_type:
+    if DataType.MARKET_ACTIVITY in request.data_types:
         if latest is True:
             task = loop.run_in_executor(executor, __CLIENT.get_stock_latest_bar, StockLatestBarRequest(**params))
         else:
@@ -95,7 +95,7 @@ async def get_market_stock_data(
         tasks.append(task)
         response_map[DataType.MARKET_ACTIVITY] = len(tasks) - 1
 
-    if DataType.QUOTE in request.data_type:
+    if DataType.QUOTE in request.data_types:
         if latest is True:
             task = loop.run_in_executor(executor, __CLIENT.get_stock_latest_quote, StockLatestQuoteRequest(**params))
         else:
@@ -103,7 +103,7 @@ async def get_market_stock_data(
         tasks.append(task)
         response_map[DataType.QUOTE] = len(tasks) - 1
 
-    if DataType.TRADE in request.data_type:
+    if DataType.TRADE in request.data_types:
         if latest is True:
             task = loop.run_in_executor(executor, __CLIENT.get_stock_latest_trade, StockLatestTradeRequest(**params))
         else:
@@ -119,14 +119,15 @@ async def get_market_stock_data(
         return {}
 
     symbol = request.symbol.upper()
-    topic_map = {}
+    batch_data = BatchStockDataCreate(data={})
     if DataType.MARKET_ACTIVITY in response_map:
         stock_bars: BarSet = results[response_map[DataType.MARKET_ACTIVITY]]
         latest_expiry = request.expiry
+        dataset: List[AssetMarketActivityDataCreate] = []
 
         if symbol in stock_bars.data:
             bars = stock_bars[symbol] if isinstance(stock_bars[symbol], list) else [stock_bars[symbol]]
-            dataset = []
+            dataset: List[AssetMarketActivityDataCreate] = []
             for bar in bars:
                 dataset.append(
                     convert_bar_to_schema(
@@ -140,7 +141,7 @@ async def get_market_stock_data(
                     ).model_dump_json()
                 )
                 latest_expiry = expiry_inc(latest_expiry, request.expiry_type, request.granularity)
-            topic_map[StaticTopic.STOCK_MARKET_ACTIVITY] = dataset
+            batch_data.data[DataType.MARKET_ACTIVITY] = dataset
     if DataType.QUOTE in response_map:
         raise NotImplementedError("Quotes not implemented")
         # stock_quotes: QuoteSet = results[response_map[DataType.QUOTE]]
@@ -159,4 +160,4 @@ async def get_market_stock_data(
         # log.debug(f" trade results: {len(stock_trades[symbol])}")
         # log.debug(f"    last: {stock_trades}")
 
-    return topic_map
+    return batch_data

@@ -1,21 +1,20 @@
-from typing import Annotated
-import httpx
+from typing import Annotated, List
 
 from fastapi import APIRouter, Body, Depends, Query
 
-from common.endpoints import get_endpoint_url
+from common.kafka.kafka_rpc_factory import KafkaRpcFactory
 from common.logging import get_logger
-from data.store.app.db.crud.store_dataset_entry import upsert_entry, search_entries, delete_entry_by_id
+from data.store.app.app_depends import get_rpc_clients
+from data.store.app.db.crud.store_dataset_entry import search_entries, delete_entry_by_id
 from data.store.app.db.database import async_db
-from schemas.data_ingest.get_dataset_request import GetDatasetRequestBody
+from data.store.app.ingest.data_action_request import store_market_activity_worker
 from schemas.data_store.store_dataset_request import (
-    StoreDatasetEntryCreate,
+    StoreDatasetEntry,
     StoreDatasetEntrySearch,
     StoreDatasetRequestBody,
     StoreDatasetRequestById,
     StoreDatasetRequestPath
 )
-from routers.data_ingest import app_endpoints as data_ingest_endpoints
 from routers.data_store.app_endpoints import StoreDataInterface
 
 router = APIRouter()
@@ -24,38 +23,25 @@ log = get_logger(__name__)
 
 @router.post(StoreDataInterface.POST_STORE_STOCK)
 async def store_data(
-    db=Depends(async_db),
     request_path: StoreDatasetRequestPath = Depends(),
     request_body: StoreDatasetRequestBody = Body(...),
+    db=Depends(async_db),
+    rpc_clients: KafkaRpcFactory.RpcClients = Depends(get_rpc_clients)
 ):
     log.debug(f"Storing data for {request_path.asset_type.value}, {request_path.symbol}")
-    dataset_id = await upsert_entry(
-        db, StoreDatasetEntryCreate(**request_path.model_dump(), **request_body.model_dump())
-    )
-    data_ingest_request = GetDatasetRequestBody(
-        **request_body.model_dump(), dataset_id=dataset_id
-    )
-
-    # TODO add functionality to avoid redundant data storage
-    url = get_endpoint_url(
-        data_ingest_endpoints.APP_NAME,
-        data_ingest_endpoints.APP_PORT_INTERNAL,
-        data_ingest_endpoints.Interface.POST_STORE_DATASET,
-        request_path.model_dump(mode='json')
-    )
-    log.debug(f"URL: {url}")
-    async with httpx.AsyncClient() as client:
-        response = await client.post(url, json=data_ingest_request.model_dump(mode='json'))
-        response.raise_for_status()
-        return response.json()
+    data_points = await store_market_activity_worker(request_path, request_body, db, rpc_clients)
+    return {
+        "message": "Data stored",
+        "data_points": data_points
+    }
 
 
 @router.get(StoreDataInterface.GET_STORE_STOCK)
 async def get_data(
     request_query: Annotated[StoreDatasetEntrySearch, Query()],
-    db=Depends(async_db),
     request_path: StoreDatasetRequestPath = Depends(),
-):
+    db=Depends(async_db)
+) -> List[StoreDatasetEntry]:
     log.debug(f"Getting data for {request_path.asset_type.value}, {request_path.symbol}")
     log.debug(f"Query: {request_query}")
     return await search_entries(

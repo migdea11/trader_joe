@@ -57,7 +57,7 @@ class KafkaProducerFactory:
             try:
                 producer = KafkaProducer(
                     bootstrap_servers=clientParams.get_url(),
-                    value_serializer=lambda v: json.dumps(v).encode('utf-8')
+                    value_serializer=lambda v: v.encode('utf-8')
                 )
                 cls._KAFKA_PUB_INSTANCES[clientParams.get_key()] = producer
                 break
@@ -71,29 +71,16 @@ class KafkaProducerFactory:
         return True
 
     @classmethod
-    def get_producer(
-        cls,
-        host: str,
-        port: int,
-        timeout: int,
-        producer_type: ProducerParams.ProducerType = ProducerParams.ProducerType.DEDICATED
-    ) -> KafkaProducer:
-        clientParams = ProducerParams(host, port, timeout, producer_type=producer_type)
-        if clientParams.get_key() not in cls._KAFKA_PUB_INSTANCES:
+    def get_producer(cls, producer_params: ProducerParams) -> KafkaProducer:
+        if producer_params.get_key() not in cls._KAFKA_PUB_INSTANCES:
             log.debug("waiting for Producer")
-            cls.wait_for_kafka(clientParams)
-        return cls._KAFKA_PUB_INSTANCES[clientParams.get_key()]
+            cls.wait_for_kafka(producer_params)
+        return cls._KAFKA_PUB_INSTANCES[producer_params.get_key()]
 
     @classmethod
     @contextmanager
-    def scoped_producer(
-        cls,
-        host: str,
-        port: int,
-        timeout: int,
-        producer_type: ProducerParams.ProducerType = ProducerParams.ProducerType.DEDICATED
-    ) -> Generator[KafkaProducer, None, None]:
-        producer: KafkaProducer = cls.get_producer(host, port, timeout, producer_type, producer_type)
+    def scoped_producer(cls, producer_params: ProducerParams) -> Generator[KafkaProducer, None, None]:
+        producer: KafkaProducer = cls.get_producer(producer_params)
         try:
             yield producer
         finally:
@@ -101,6 +88,7 @@ class KafkaProducerFactory:
 
     @classmethod
     def send_message_async(cls, executor: ThreadPoolExecutor, producer: KafkaProducer, topic: str, message):
+        log.debug(f"Sending message to topic: {topic}\n{message}")
         loop = asyncio.get_running_loop()
         loop.run_in_executor(executor, producer.send, topic, message)
 

@@ -1,11 +1,15 @@
+import json
 from uuid import UUID
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import datetime
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
-from common.enums.data_select import AssetType
+from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import Granularity, DataSource
+from common.logging import get_logger
 from routers.data_store.app_endpoints import ASSET_TYPE_DESC, SYMBOL_DESC
+
+log = get_logger(__name__)
 
 
 class AssetMarketActivityRequestBody(BaseModel):
@@ -38,7 +42,17 @@ class AssetMarketActivityRequestPath(BaseModel):
 
 
 class AssetMarketActivityDataCreate(AssetMarketActivityRequestPath, AssetMarketActivityRequestBody):
-    pass
+    @model_validator(mode='before')
+    @classmethod
+    def validate(cls, data: Any):
+        # When this data is nested in another model, it is passed as a string
+        if isinstance(data, str):
+            return json.loads(data)
+        return data
+
+
+class BatchStockDataCreate(BaseModel):
+    data: Dict[DataType, List[AssetMarketActivityDataCreate]]
 
 
 class AssetMarketActivityDataUpdate(AssetMarketActivityDataCreate):

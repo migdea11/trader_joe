@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from common.kafka.topics import StaticTopic, ConsumerGroup
 from common.kafka.kafka_config import ConsumerParams
-from common.kafka.kafka_consumer import KafkaConsumerFactory
+from common.kafka.messaging.kafka_consumer import KafkaConsumerFactory
 
 
 @pytest.fixture
@@ -18,7 +18,7 @@ def consumer_params():
         host="localhost",
         port=9092,
         topics=[StaticTopic.STOCK_MARKET_ACTIVITY],
-        group_id=ConsumerGroup.DATA_STORE_GROUP,
+        consumer_group=ConsumerGroup.DATA_STORE_GROUP,
         timeout=0.1,
         auto_commit=False
     )
@@ -38,7 +38,7 @@ def test_release():
     assert mock_consumer not in KafkaConsumerFactory._KAFKA_SUB_INSTANCES
 
 
-@patch("common.kafka.kafka_consumer.KafkaConsumer")
+@patch("common.kafka.messaging.kafka_consumer.KafkaConsumer")
 def test_consume_messages_async(mock_kafka_consumer, consumer_params):
     """Test the consume_messages_async method to ensure it processes messages correctly."""
     # Mock the consumer
@@ -62,7 +62,8 @@ def test_consume_messages_async(mock_kafka_consumer, consumer_params):
     # Run the function with a ThreadPoolExecutor
     async def test_async_consume():
         with ThreadPoolExecutor() as executor:
-            await KafkaConsumerFactory.consume_messages_async(
+            factory = KafkaConsumerFactory()
+            await factory.add_async_consumer(
                 executor=executor,
                 consumer_params=consumer_params,
                 callback=mock_callback,
@@ -77,7 +78,7 @@ def test_consume_messages_async(mock_kafka_consumer, consumer_params):
     mock_consumer_instance.commit.assert_called_once_with(offsets={})
 
 
-@patch("common.kafka.kafka_consumer.KafkaConsumer")
+@patch("common.kafka.messaging.kafka_consumer.KafkaConsumer")
 def test_consume_messages_async_failed_callback(mock_kafka_consumer, consumer_params):
     """Test consume_messages_async with a callback that fails to process a message."""
     # Mock the consumer
@@ -100,7 +101,8 @@ def test_consume_messages_async_failed_callback(mock_kafka_consumer, consumer_pa
     # Run the function with a ThreadPoolExecutor
     async def test_async_consume():
         with ThreadPoolExecutor() as executor:
-            await KafkaConsumerFactory.consume_messages_async(
+            factory = KafkaConsumerFactory()
+            await factory.add_async_consumer(
                 executor=executor,
                 consumer_params=consumer_params,
                 callback=mock_callback_failure,
@@ -115,8 +117,8 @@ def test_consume_messages_async_failed_callback(mock_kafka_consumer, consumer_pa
     mock_consumer_instance.commit.assert_not_called()
 
 
-@patch("common.kafka.kafka_consumer.NewTopic")
-@patch("common.kafka.kafka_consumer.KafkaAdminClient")
+@patch("common.kafka.messaging.kafka_consumer.NewTopic")
+@patch("common.kafka.messaging.kafka_consumer.KafkaAdminClient")
 def test_wait_for_kafka(mock_admin_client, mock_new_topic, consumer_params: ConsumerParams):
     """Test the wait_for_kafka method to ensure topics are created if missing."""
     # Mock the admin client

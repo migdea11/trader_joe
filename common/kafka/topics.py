@@ -1,18 +1,30 @@
 from enum import Enum
+from aenum import Enum as AEnum, extend_enum
 
 
-class StaticTopic(str, Enum):
+class StaticTopic(AEnum):
     STOCK_MARKET_ACTIVITY = "stock_market_activity"
     STOCK_MARKET_QUOTE = "stock_market_quote"
     STOCK_MARKET_TRADE = "stock_market_trade"
 
 
-class DynamicTopic(str, Enum):
-    LATER = "none"
+class RpcEndpointTopic(str, Enum):
+    STOCK_MARKET_ACTIVITY = "stock_market_activity_rpc"
 
+    @property
+    def request(self) -> StaticTopic:
+        return StaticTopic(f"{self.value}_request")
 
-TopicTyping = StaticTopic | DynamicTopic
+    @property
+    def response(self) -> StaticTopic:
+        return StaticTopic(f"{self.value}_response")
 
 
 class ConsumerGroup(str, Enum):
     DATA_STORE_GROUP = "data_store_group"
+    DATA_INGEST_GROUP = "data_ingest_group"
+
+
+for rpc_endpoint in RpcEndpointTopic:
+    extend_enum(StaticTopic, f'{rpc_endpoint.name}_REQUEST', f'{rpc_endpoint.value}_request')
+    extend_enum(StaticTopic, f'{rpc_endpoint.name}_RESPONSE', f'{rpc_endpoint.value}_response')

@@ -2,7 +2,7 @@ import asyncio
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Coroutine
+from typing import Any, Callable, Coroutine, Dict
 
 from kafka import (
     KafkaAdminClient,
@@ -15,7 +15,8 @@ from kafka.consumer.fetcher import ConsumerRecord
 from kafka.errors import KafkaError
 
 from common.kafka.kafka_config import ConsumerParams
-from common.logging import get_logger
+from common.kafka.topics import StaticTopic
+from common.logging import get_logger, limit
 
 log = get_logger(__name__)
 
@@ -23,6 +24,9 @@ log = get_logger(__name__)
 class KafkaConsumerFactory:
     __KAFKA_ADMIN_CLIENT: KafkaAdminClient = None
     _KAFKA_SUB_INSTANCES = []
+
+    def __init__(self):
+        self.__async_instances: Dict[str, 'KafkaConsumerFactory.ConsumerControl'] = {}
 
     @classmethod
     def shutdown(cls):
@@ -60,9 +64,12 @@ class KafkaConsumerFactory:
                 for topic in clientParams.topics:
                     if topic.value not in topics:
                         log.debug(f"Creating topic: {topic.value}")
-                        cls.__KAFKA_ADMIN_CLIENT.create_topics(
-                            new_topics=[NewTopic(topic.value, partitions, replicas)]
-                        )
+                        if isinstance(topic, StaticTopic):
+                            cls.__KAFKA_ADMIN_CLIENT.create_topics(
+                                new_topics=[NewTopic(topic.value, partitions, replicas)]
+                            )
+                        else:
+                            raise ValueError(f"Unknown topic type: {topic}")
                     consumer_topics.append(topic.value)
                 break
             except KafkaError:
@@ -81,47 +88,59 @@ class KafkaConsumerFactory:
         consumer = KafkaConsumer(
             *consumer_topics,
             bootstrap_servers=clientParams.get_url(),
-            group_id=clientParams.group_id.value,
+            group_id=clientParams.consumer_group.value,
             auto_offset_reset="earliest",
             enable_auto_commit=clientParams.enable_auto_commit
         )
         cls._KAFKA_SUB_INSTANCES.append(consumer)
         return consumer
 
-    @classmethod
-    async def consume_messages_async(
-        cls,
-        executor: ThreadPoolExecutor,
-        consumer_params: ConsumerParams,
-        callback: Callable[[ConsumerRecord], Coroutine[Any, Any, bool]],
-        commit_batch_size: int,
-        commit_batch_interval: int
-    ):
-        def consume_messages():
+    class ConsumerControl:
+        def __init__(
+            self,
+            executor: ThreadPoolExecutor,
+            consumer_params: ConsumerParams,
+            callback: Callable[[ConsumerRecord], Coroutine[Any, Any, bool]],
+            commit_batch_size: int,
+            commit_batch_interval: int
+        ):
+            self.consumer = KafkaConsumerFactory.get_consumer(consumer_params)
+            self.executor = executor
+            self.callback = callback
+            self.commit_batch_size = commit_batch_size
+            self.commit_batch_interval = commit_batch_interval
+
+        def start(self):
+            loop = asyncio.get_event_loop()
+            loop.run_in_executor(self.executor, self.__consume_messages)
+
+        def stop(self):
+            self.consumer.close()
+
+        def __consume_messages(self):
             """
             Run the KafkaConsumer in a blocking loop within a dedicated thread.
             """
-            consumer = cls.get_consumer(consumer_params)
             batch_offsets = {}  # Store offsets for each partition
             batch_start_time = time.time()
             try:
                 message: ConsumerRecord
-                for message in consumer:
+                for message in self.consumer:
 
                     log.debug(f"Received message from: {message.topic}")
-                    success = asyncio.run(callback(message))
+                    success = asyncio.run(self.callback(message))
 
                     if success:
                         # Track the latest offset for this partition
                         partition = TopicPartition(message.topic, message.partition)
                         batch_offsets[partition] = OffsetAndMetadata(message.offset + 1, "")
                     else:
-                        log.warning(f"Failed to process message: {message.value}")
+                        log.warning(limit(f"Failed to process message: {message.value}"))
 
                     # Commit offsets if the batch size is reached for any partition
-                    time_limit_reached = time.time() - batch_start_time >= commit_batch_interval
-                    if len(batch_offsets) >= commit_batch_size or (time_limit_reached and batch_offsets):
-                        consumer.commit(offsets=batch_offsets)
+                    time_limit_reached = time.time() - batch_start_time >= self.commit_batch_interval
+                    if len(batch_offsets) >= self.commit_batch_size or (time_limit_reached and batch_offsets):
+                        self.consumer.commit(offsets=batch_offsets)
                         batch_start_time = time.time()
                         batch_offsets.clear()
 
@@ -129,6 +148,16 @@ class KafkaConsumerFactory:
                 log.error(f"Error consuming messages: {e}")
                 traceback.print_exc()
 
-        # Offload the Kafka consumer loop to a separate thread
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(executor, consume_messages)
+    def add_async_consumer(
+        self,
+        executor: ThreadPoolExecutor,
+        consumer_params: ConsumerParams,
+        callback: Callable[[ConsumerRecord], Coroutine[Any, Any, bool]],
+        commit_batch_size: int,
+        commit_batch_interval: int,
+    ) -> None:
+        if consumer_params.topics is None or len(consumer_params.topics) == 0:
+            raise ValueError("No topics specified for consumer")
+        control = self.ConsumerControl(executor, consumer_params, callback, commit_batch_size, commit_batch_interval)
+        self.__async_instances[consumer_params.get_key()] = control
+        control.start()

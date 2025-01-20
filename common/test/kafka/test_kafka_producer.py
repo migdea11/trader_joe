@@ -3,14 +3,14 @@ import asyncio
 from unittest.mock import patch, MagicMock
 from kafka.errors import KafkaError
 
-from common.kafka.kafka_producer import KafkaProducerFactory
 from common.kafka.kafka_config import ProducerParams
+from common.kafka.messaging.kafka_producer import KafkaProducerFactory
 
 
 @pytest.fixture
 def mock_kafka_producer():
     """Fixture to mock KafkaProducer."""
-    with patch('common.kafka.kafka_producer.KafkaProducer') as mock_producer:
+    with patch('common.kafka.messaging.kafka_producer.KafkaProducer') as mock_producer:
         mock_instance = MagicMock()
         mock_producer.return_value = mock_instance
         yield mock_producer, mock_instance
@@ -65,7 +65,7 @@ def test_release(mock_kafka_producer, producer_params):
     assert dummy_producer_mock.close.call_count == 0
 
 
-@patch("common.kafka.kafka_producer.KafkaProducer")
+@patch("common.kafka.messaging.kafka_producer.KafkaProducer")
 def test_scoped_producer(mock_producer, mock_kafka_producer, producer_params: ProducerParams):
     """Test the scoped_producer context manager to ensure proper resource cleanup."""
     # Mock the factory's get_producer method to return the mock producer
@@ -73,9 +73,7 @@ def test_scoped_producer(mock_producer, mock_kafka_producer, producer_params: Pr
         with patch.object(KafkaProducerFactory, "release") as mock_release:
             # Use the scoped_producer context manager
             with KafkaProducerFactory.scoped_producer(
-                host=producer_params.host,
-                port=producer_params.port,
-                timeout=producer_params.timeout
+                producer_params
             ) as producer:
                 # Assert that the producer was obtained
                 assert producer is mock_producer
@@ -113,8 +111,8 @@ def test_get_producer_reuse(mock_kafka_producer):
     mock_producer_class, _ = mock_kafka_producer
 
     params = ProducerParams(host='localhost', port=9092, timeout=5, producer_type=ProducerParams.ProducerType.SHARED)
-    producer_1 = KafkaProducerFactory.get_producer(params.host, params.port, params.timeout, params.producer_type)
-    producer_2 = KafkaProducerFactory.get_producer(params.host, params.port, params.timeout, params.producer_type)
+    producer_1 = KafkaProducerFactory.get_producer(params)
+    producer_2 = KafkaProducerFactory.get_producer(params)
 
     assert producer_1 is producer_2
     mock_producer_class.assert_called_once()

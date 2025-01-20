@@ -11,4 +11,4 @@ if [ ! -d "$MIGRATION_DIR" ]; then
 fi
 
 # Apply migrations up to head
-docker-compose run --rm --entrypoint /bin/bash data_store -c "alembic upgrade head"
+docker-compose run --rm --entrypoint /bin/bash data_store -c "pip install psycopg2-binary && alembic upgrade head"

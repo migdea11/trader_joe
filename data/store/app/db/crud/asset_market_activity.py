@@ -1,4 +1,4 @@
-from typing import Dict, List
+from typing import List
 from sqlalchemy import delete, select, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,20 +35,16 @@ async def create_asset_market_activity_data(
 
 
 async def batch_insert_asset_market_activity_data(
-    db: AsyncSession, batch_asset_data: Dict[AssetType, List[asset_market_activity_data.AssetMarketActivityDataCreate]]
+    db: AsyncSession, batch_asset_data: List[asset_market_activity_data.AssetMarketActivityDataCreate]
 ):
     try:
-        # Insert in batches for each asset type
-        for asset_type, data_list in batch_asset_data.items():
-            log.debug(f"Batch storing market activity: {asset_type.value}[{len(data_list)}]")
-            if asset_type not in _ASSET_TABLE_MAP:
-                raise UnsupportedAssetType(asset_type)
+        log.debug(f"Batch storing market activity[{len(batch_asset_data)}]")
 
-            asset_table = _ASSET_TABLE_MAP[asset_type]
-            stmt = insert(asset_table).values(
-                [data.model_dump(exclude={"asset_type"}) for data in data_list]
-            )
-            await db.execute(stmt)
+        asset_table = StockMarketActivity
+        stmt = insert(asset_table).values(
+            [data.model_dump(exclude={"asset_type"}) for data in batch_asset_data]
+        )
+        await db.execute(stmt)
 
         await db.commit()
         log.debug("Batch insert completed successfully")

@@ -1,6 +1,5 @@
 from typing import AsyncGenerator
 
-from contextlib import asynccontextmanager
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.database.postgres_tools import PostgresSessionFactory
@@ -35,12 +34,3 @@ async def shutdown():
 
 async def async_db() -> AsyncGenerator[AsyncSession, None]:
     yield PostgresSessionFactory.AsyncSession.get_session(DATABASE_ASYNC_URI)
-
-
-@asynccontextmanager
-async def get_async_db() -> AsyncGenerator[AsyncSession, None]:
-    session = PostgresSessionFactory.AsyncSession.get_session(DATABASE_ASYNC_URI)
-    try:
-        yield session
-    finally:
-        await session.close()

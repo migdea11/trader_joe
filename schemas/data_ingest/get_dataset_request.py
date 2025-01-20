@@ -1,14 +1,13 @@
-from typing import Optional
+from typing import List, Optional
 from uuid import UUID
 from pydantic import BaseModel
 from datetime import datetime
 
-from common.enums.data_select import DataType
+from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Granularity, ExpiryType, UpdateType
-from schemas.data_store.store_dataset_request import StoreDatasetRequestPath
 
 
-class GetDatasetRequestBody(BaseModel):
+class BaseGetDatasetRequest(BaseModel):
     dataset_id: UUID
     source: DataSource
 
@@ -21,14 +20,16 @@ class GetDatasetRequestBody(BaseModel):
     update_type: UpdateType
 
 
-class GetDatasetRequestPath(StoreDatasetRequestPath):
-    pass
+class GetDatasetRequest(BaseGetDatasetRequest):
+    asset_type: AssetType
+    symbol: str
+    data_types: List[DataType]
 
 
-class StockDatasetRequest(GetDatasetRequestBody):
+class StockDatasetRequest(GetDatasetRequest):
     # Adding path params except asset_type
     symbol: str
-    data_type: DataType
+    data_types: List[DataType]
 
     class Config:
         # ignore asset_type

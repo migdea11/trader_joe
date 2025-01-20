@@ -1,5 +1,4 @@
 from uuid import UUID
-from fastapi import Query
 from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import datetime, timedelta
 from typing import Optional
