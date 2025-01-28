@@ -1,0 +1,27 @@
+version: '3.8'
+services:
+  data_store:
+    build:
+      target: dev_image
+      args:
+        SERVICE: store
+    volumes:
+      - ./data/store/app:/code/data/store/app
+      - ./common:/code/common
+      - ./routers:/code/routers
+      - ./schemas:/code/schemas
+    environment:
+      - LOG_LEVEL=debug
+
+  data_ingest:
+    build:
+      target: dev_image
+      args:
+        SERVICE: ingest
+    volumes:
+      - ./data/ingest/app:/code/data/ingest/app
+      - ./common:/code/common
+      - ./routers:/code/routers
+      - ./schemas:/code/schemas
+    environment:
+      - LOG_LEVEL=debug

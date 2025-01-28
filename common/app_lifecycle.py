@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from typing import TYPE_CHECKING
 
+from common.environment import get_run_mode
 from common.logging import get_logger
 
 if TYPE_CHECKING:
@@ -11,6 +12,7 @@ log = get_logger(__name__)
 
 def startup_logs(app: FastAPI):
     log.info("Starting up app...")
+    log.info(f"App run mode: {get_run_mode()}")
     log.info("Routes:")
     route: 'Route'
     for route in app.routes:

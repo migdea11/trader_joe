@@ -1,4 +1,5 @@
 import asyncio
+import traceback
 from typing import Dict, Generic, Type
 
 from kafka.consumer.fetcher import ConsumerRecord
@@ -23,15 +24,23 @@ class KafkaRpcClient(Generic[Req, Res], KafkaRpcBase[Req, Res]):
         self._pending_requests: Dict[str, asyncio.Future] = {}
         self._timeout = timeout
 
-    async def _callback(self, message: ConsumerRecord) -> None:
-        response_type: Type[Res] = self.endpoint.response_model
-        message_value: bytes = message.value
-        response = RpcResponse[response_type].model_validate_json(message_value.decode('utf-8'))
+    async def _callback(self, message: ConsumerRecord) -> bool:
+        success = False
+        try:
+            response_type: Type[Res] = self.endpoint.response_model
+            message_value: bytes = message.value
+            response = RpcResponse[response_type].model_validate_json(message_value.decode('utf-8'))
 
-        if response.correlation_id in self._pending_requests:
-            self._pending_requests[response.correlation_id].set_result(response)
-        else:
-            log.warning(limit(f"Received unexpected response: {response.model_dump_json()}"))
+            if response.correlation_id in self._pending_requests:
+                self._pending_requests[response.correlation_id].set_result(response)
+            else:
+                log.warning(limit(f"Received unexpected response: {response.model_dump_json()}"))
+            success = True
+        except Exception as e:
+            log.error(limit(f"Error processing response: {e}"))
+            traceback.print_exc()
+        finally:
+            return success
 
     async def send_request(self, request_payload: Req) -> Res:
         request = RpcRequest.create_request(request_payload)

@@ -19,10 +19,6 @@ class KafkaRpcFactory:
     def add_client(self, endpoint: RpcEndpoint, timeout: int = 5):
         self._rpc_clients.append(KafkaRpcClient(self.rpc_params, endpoint, timeout))
 
-    # def add_server(
-    #     self, endpoint: RpcEndpoint, rpc_function: Callable[[RpcRequest], Coroutine[Any, Any, Res]], timeout: int = 5
-    # ):
-    #     self._rpc_servers.append(KafkaRpcServer(self.rpc_params, endpoint, rpc_function, timeout))
     def add_server(
         self,
         endpoint: RpcEndpoint,

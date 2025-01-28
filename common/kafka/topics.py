@@ -9,6 +9,7 @@ class StaticTopic(AEnum):
 
 
 class RpcEndpointTopic(str, Enum):
+    LATENCY_TEST = "latency_test_rpc"
     STOCK_MARKET_ACTIVITY = "stock_market_activity_rpc"
 
     @property
@@ -23,6 +24,7 @@ class RpcEndpointTopic(str, Enum):
 class ConsumerGroup(str, Enum):
     DATA_STORE_GROUP = "data_store_group"
     DATA_INGEST_GROUP = "data_ingest_group"
+    COMMON_GROUP = "common_group"
 
 
 for rpc_endpoint in RpcEndpointTopic:

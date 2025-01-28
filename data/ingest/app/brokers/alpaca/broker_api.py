@@ -123,7 +123,6 @@ async def get_market_stock_data(
     if DataType.MARKET_ACTIVITY in response_map:
         stock_bars: BarSet = results[response_map[DataType.MARKET_ACTIVITY]]
         latest_expiry = request.expiry
-        dataset: List[AssetMarketActivityDataCreate] = []
 
         if symbol in stock_bars.data:
             bars = stock_bars[symbol] if isinstance(stock_bars[symbol], list) else [stock_bars[symbol]]
@@ -138,7 +137,7 @@ async def get_market_stock_data(
                         AssetType.STOCK,
                         request.granularity,
                         latest_expiry
-                    ).model_dump_json()
+                    )
                 )
                 latest_expiry = expiry_inc(latest_expiry, request.expiry_type, request.granularity)
             batch_data.data[DataType.MARKET_ACTIVITY] = dataset

@@ -156,6 +156,10 @@ class KafkaConsumerFactory:
         commit_batch_size: int,
         commit_batch_interval: int,
     ) -> None:
+        log.info(
+            f"Adding consumer {consumer_params.consumer_group.value} for topics: "
+            f"{[topic.value for topic in consumer_params.topics]}"
+        )
         if consumer_params.topics is None or len(consumer_params.topics) == 0:
             raise ValueError("No topics specified for consumer")
         control = self.ConsumerControl(executor, consumer_params, callback, commit_batch_size, commit_batch_interval)

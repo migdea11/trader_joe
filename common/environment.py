@@ -12,3 +12,7 @@ def get_env_var(var_name: str, default: Type[T] = None, cast_type: Type[T] = str
         else:
             var = cast_type(var)
     return var
+
+
+def get_run_mode() -> str:
+    return get_env_var("RUN_MODE", default="not found")

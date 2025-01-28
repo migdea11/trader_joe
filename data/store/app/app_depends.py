@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
-from fastapi import Depends, FastAPI
+from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.app_lifecycle import startup_logs, teardown_logs
@@ -13,7 +13,12 @@ from common.kafka.topics import ConsumerGroup, RpcEndpointTopic
 from common.logging import get_logger
 from common.worker_pool import SharedWorkerPool
 from data.store.app.db import database
-from routers.data_ingest.app_endpoints import InterfaceRpc
+from routers.common.latency import get_latency_topics, initialize_latency_client
+from routers.data_ingest.app_endpoints import (
+    InterfaceRpc,
+    APP_NAME as INGEST_APP_NAME,
+    APP_PORT_INTERNAL as INGEST_APP_PORT
+)
 
 log = get_logger(__name__)
 
@@ -22,6 +27,10 @@ __RPC_CLIENTS = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Init Common Endpoints
+    # Using different app for REST latency, ensuring test isn't affected by client and server are on the same thread.
+    initialize_latency_client(app, INGEST_APP_NAME, INGEST_APP_PORT, ConsumerGroup.COMMON_GROUP)
+
     startup_logs(app)
     SharedWorkerPool.worker_startup()
 
@@ -31,7 +40,8 @@ async def lifespan(app: FastAPI):
     # Init Kafka
     consumer_params = get_consumer_params(
         [
-            RpcEndpointTopic.STOCK_MARKET_ACTIVITY.request
+            RpcEndpointTopic.STOCK_MARKET_ACTIVITY.request,
+            *get_latency_topics()
         ],
         ConsumerGroup.DATA_STORE_GROUP
     )

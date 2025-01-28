@@ -1,45 +1,43 @@
-# Creating Base Image
+# Base Image
 FROM python:3.12-slim AS base_image
-
-EXPOSE 80
 WORKDIR /code
 ENV PYTHONPATH="/code"
 
-COPY ./.env /code/.env
+# Install common dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libpq-dev \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
 COPY ./entrypoint.sh /code/entrypoint.sh
 
-#
-# Creating Data Store Service
-#
-FROM base_image AS data_store
-COPY ./data/store/requirements.txt /code/
+# Install dependencies for specific services
+ARG SERVICE_PATH=none
+ARG SERVICE_NAME=none
+COPY ./${SERVICE_PATH}/${SERVICE_NAME}/requirements.txt /code/requirements.txt
 RUN pip install --no-cache-dir --upgrade -r /code/requirements.txt
 
-# Add Service
-COPY ./data/store/app /code/data/store/app
-# Add Internal Deps
+# Add common files
 COPY ./common /code/common
 COPY ./routers /code/routers
 COPY ./schemas /code/schemas
 
-# Set the entrypoint script as the entrypoint
-ENV APP_MODULE="data.store.app.main:app"
+# Add service-specific files
+COPY ./${SERVICE_PATH}/${SERVICE_NAME}/app /code/data/${SERVICE_NAME}/app
+
+# Set entrypoint and environment variable
+COPY ./.env /code/.env
+ENV APP_MODULE="data.${SERVICE_NAME}.app.main:app"
 ENTRYPOINT ["/code/entrypoint.sh"]
 
-#
-# Creating Data Ingest Service
-#
-FROM base_image AS data_ingest
-COPY ./data/ingest/requirements.txt /code/
-RUN pip install --no-cache-dir --upgrade -r /code/requirements.txt
+# Dev-specific stage
+FROM base_image AS dev_image
+ARG SERVICE_PATH
+ARG SERVICE_NAME
+RUN pip install --no-cache-dir --upgrade debugpy
+ENV RUN_MODE="dev"
+ENV ADDITIONAL_ARGS="--reload"
 
-# Add Service
-COPY ./data/ingest/app /code/data/ingest/app
-# Add Internal Deps
-COPY ./common /code/common
-COPY ./routers /code/routers
-COPY ./schemas /code/schemas
-
-# Set the entrypoint script as the entrypoint
-ENV APP_MODULE="data.ingest.app.main:app"
-ENTRYPOINT ["/code/entrypoint.sh"]
+# Prod-specific stage
+FROM base_image AS prod_image
+ARG SERVICE_PATH
+ARG SERVICE_NAME
+ENV RUN_MODE="prod"

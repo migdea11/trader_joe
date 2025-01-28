@@ -2,14 +2,13 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-import json
 import time
 from typing import Dict, Generator
 from kafka import KafkaProducer
 from kafka.errors import KafkaError
 
 from common.kafka.kafka_config import ProducerParams
-from common.logging import get_logger
+from common.logging import get_logger, limit
 
 log = get_logger(__name__)
 
@@ -88,7 +87,7 @@ class KafkaProducerFactory:
 
     @classmethod
     def send_message_async(cls, executor: ThreadPoolExecutor, producer: KafkaProducer, topic: str, message):
-        log.debug(f"Sending message to topic: {topic}\n{message}")
+        log.debug(limit(f"Sending message to topic: {topic}\n{message}"))
         loop = asyncio.get_running_loop()
         loop.run_in_executor(executor, producer.send, topic, message)
 

@@ -2,6 +2,7 @@ aenum
 alpaca-py
 apscheduler
 fastapi
+httpx
 kafka-python-ng
 pydantic
 python-dotenv

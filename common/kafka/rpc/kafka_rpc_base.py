@@ -93,7 +93,7 @@ class KafkaRpcBase(Generic[Req, Res], ABC):
         self._executor = SharedWorkerPool.get_instance()
 
     @abstractmethod
-    async def _callback(self, message: ConsumerRecord) -> None:
+    async def _callback(self, message: ConsumerRecord) -> bool:
         ...
 
     def initialize(self, factory: KafkaConsumerFactory) -> 'KafkaConsumerFactory.ConsumerControl':

@@ -63,8 +63,11 @@ services:
 
   data_store:
     build:
-      context: ./
-      target: data_store
+      context: .
+      target: prod_image
+      args:
+        SERVICE_PATH: data
+        SERVICE_NAME: store
     hostname: ${DATA_STORE_NAME:-data_store}
     ports:
       - "${DATA_STORE_PORT}:${APP_INTERNAL_PORT}"
@@ -76,14 +79,17 @@ services:
       - ./data/store/.env
     environment:
       - DATABASE_URI=${DATABASE_URI:-postgresql://postgres:password@db:5432/postgres}
-      - LOG_LEVEL=debug
+      - LOG_LEVEL=info
     depends_on:
       - postgres
 
   data_ingest:
     build:
-      context: ./
-      target: data_ingest
+      context: .
+      target: prod_image
+      args:
+        SERVICE_PATH: data
+        SERVICE_NAME: ingest
     hostname: ${DATA_INGEST_NAME:-data_ingest}
     ports:
       - "${DATA_INGEST_PORT}:${APP_INTERNAL_PORT}"
@@ -91,6 +97,6 @@ services:
       - .env
       - ./data/ingest/.env
     environment:
-      - LOG_LEVEL=debug
+      - LOG_LEVEL=info
     depends_on:
       - kafka

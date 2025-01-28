@@ -1,5 +1,4 @@
 import time
-from copy import copy
 from typing import Dict
 
 from sqlalchemy import Engine, create_engine
