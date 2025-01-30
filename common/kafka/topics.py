@@ -27,6 +27,7 @@ class ConsumerGroup(str, Enum):
     COMMON_GROUP = "common_group"
 
 
+# Extend StaticTopic with RPC endpoints
 for rpc_endpoint in RpcEndpointTopic:
     extend_enum(StaticTopic, f'{rpc_endpoint.name}_REQUEST', f'{rpc_endpoint.value}_request')
     extend_enum(StaticTopic, f'{rpc_endpoint.name}_RESPONSE', f'{rpc_endpoint.value}_response')

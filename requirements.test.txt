@@ -1,0 +1,13 @@
+aenum
+alembic
+alpaca-py
+asyncpg
+fastapi
+httpx
+kafka-python-ng
+pydantic
+python-dotenv
+sqlalchemy
+pytest
+pytest-asyncio
+pytest-cov

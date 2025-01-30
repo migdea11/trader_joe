@@ -11,6 +11,11 @@ log = get_logger(__name__)
 
 
 def startup_logs(app: FastAPI):
+    """Startup logs for the app
+
+    Args:
+        app (FastAPI): The FastAPI app
+    """
     log.info("Starting up app...")
     log.info(f"App run mode: {get_run_mode()}")
     log.info("Routes:")
@@ -20,4 +25,9 @@ def startup_logs(app: FastAPI):
 
 
 def teardown_logs(app: FastAPI):
+    """Teardown logs for the app
+
+    Args:
+        app (FastAPI): The FastAPI app
+    """
     log.info("Shutting down app...")
