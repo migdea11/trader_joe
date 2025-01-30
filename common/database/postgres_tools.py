@@ -28,20 +28,35 @@ if _POSTGRES_SYNC_ENABLED is True:
 
 
 class PostgresSessionFactory:
+    """Creates handle to create and manage Postgres database async sessions."""
     _active_db_uris = set()
 
     @staticmethod
     def _get_display_uri(uri: URL) -> str:
+        """Get a display URI for logging purposes.
+
+        Args:
+            uri (URL): URI to be formatted.
+
+        Returns:
+            str: formatted URI.
+        """
         return uri.render_as_string(hide_password=True)
 
     @classmethod
-    def _get_db_hash(cls, uri: URL) -> str:
-        """
-        Get a hash of the database URI.
+    def _get_db_hash(cls, uri: URL) -> int:
+        """Hashes the database URI for internal use.
+
+        Args:
+            uri (URL): URI to be hashed.
+
+        Returns:
+            int: hashed URI.
         """
         return hash(cls._get_display_uri(uri))
 
-    class AsyncSession:
+    class AsyncSessionHandle:
+        """Postgres session handle."""
         _async_engines: Dict[str, AsyncEngine] = {}
         _async_sessions: Dict[str, async_scoped_session] = {}
 
@@ -49,6 +64,18 @@ class PostgresSessionFactory:
         def create_uri(
             host: str, port: int, database: str, user: str, password: str
         ) -> URL:
+            """Creates Postgres URI.
+
+            Args:
+                host (str): Postgres host.
+                port (int): Postgres port.
+                database (str): Postgres database name.
+                user (str): database user.
+                password (str): database password.
+
+            Returns:
+                URL: Postgres URI.
+            """
             return URL.create(
                 "postgresql+asyncpg",
                 username=user,
@@ -60,8 +87,18 @@ class PostgresSessionFactory:
 
         @classmethod
         async def wait_for_db(cls, uri: URL, timeout: int, retry: int = 1) -> bool:
-            """
-            Wait for the database to be ready (asynchronous) using asyncpg.
+            """Wait for the database to be ready (asynchronous) using asyncpg.
+
+            Args:
+                uri (URL): Postgres URI.
+                timeout (int): Connection timeout.
+                retry (int, optional): Attempts to connect. Defaults to 1.
+
+            Raises:
+                RuntimeError: Attempting to connect when async is not enabled.
+
+            Returns:
+                bool: Flag indicating if the database is ready.
             """
             if _POSTGRES_ASYNC_ENABLED is False:
                 raise RuntimeError("Postgres async is not enabled.")
@@ -86,8 +123,15 @@ class PostgresSessionFactory:
 
         @classmethod
         async def initialize(cls, uri: URL, timeout: int):
-            """
-            Initialize async and sync engines and session factories (asynchronous).
+            """Initialize async session handle.
+
+            Args:
+                uri (URL): Postgres URI.
+                timeout (int): Connection timeout.
+
+            Raises:
+                RuntimeError: Connection already initialized.
+                ConnectionError: Failed to connect to the database.
             """
             uri_str = PostgresSessionFactory._get_display_uri(uri)
             if uri_str in cls._async_engines:
@@ -109,13 +153,21 @@ class PostgresSessionFactory:
 
         @classmethod
         def get_session(cls, uri: URL) -> AsyncSession:
-            """
-            Get an async session for the given database URI.
+            """Get an async session for the given database URI.
+
+            Args:
+                uri (URL): Postgres URI.
+
+            Raises:
+                RuntimeError: Session Handle not initialized.
+
+            Returns:
+                AsyncSession: Postgres async session.
             """
             db_hash = PostgresSessionFactory._get_db_hash(uri)
             if db_hash not in cls._async_sessions:
                 raise RuntimeError(
-                    f"Session factory not initialized for {PostgresSessionFactory._get_display_uri(uri)}."
+                    f"Session handle not initialized for {PostgresSessionFactory._get_display_uri(uri)}."
                 )
 
             temp = cls._async_sessions[db_hash]()
@@ -123,6 +175,7 @@ class PostgresSessionFactory:
             return temp
 
     class SyncSession:
+        """Creates handle to create and manage Postgres database async sessions."""
         _sync_engines: Dict[str, Engine] = {}
         _sync_sessions: Dict[str, scoped_session] = {}
 
@@ -130,6 +183,18 @@ class PostgresSessionFactory:
         def create_uri(
             host: str, port: int, database: str, user: str, password: str
         ) -> URL:
+            """Create Postgres URI.
+
+            Args:
+                host (str): Postgres host.
+                port (int): Postgres port.
+                database (str): Postgres database name.
+                user (str): database user.
+                password (str): database password.
+
+            Returns:
+                URL: Postgres URI.
+            """
             return URL.create(
                 "postgresql+psycopg2",
                 username=user,
@@ -141,8 +206,18 @@ class PostgresSessionFactory:
 
         @classmethod
         def wait_for_db(cls, uri: URL, timeout: int, retry: int = 1) -> bool:
-            """
-            Wait for the database to be ready (synchronous) using psycopg2.
+            """Wait for the database to be ready (synchronous) using psycopg2.
+
+            Args:
+                uri (URL): Postgres URI.
+                timeout (int): Connection timeout.
+                retry (int, optional): Attempts to connect. Defaults to 1.
+
+            Raises:
+                RuntimeError: Attempting to connect when sync is not enabled.
+
+            Returns:
+                bool: Flag indicating if the database is ready.
             """
             if _POSTGRES_SYNC_ENABLED is False:
                 raise RuntimeError("Postgres sync is not enabled.")
@@ -186,29 +261,35 @@ class PostgresSessionFactory:
 
         @classmethod
         def get_session(cls, uri: URL) -> Session:
-            """
-            Get a sync session for the given database URI.
+            """Get a sync session for the given database URI.
+
+            Args:
+                uri (URL): Postgres URI.
+
+            Raises:
+                RuntimeError: Session Handle not initialized.
+
+            Returns:
+                Session: Postgres sync session.
             """
             db_hash = PostgresSessionFactory._get_db_hash(uri)
             if db_hash not in cls._sync_sessions:
                 raise RuntimeError(
-                    f"Session factory not initialized for {PostgresSessionFactory._get_display_uri(uri)}."
+                    f"Session handle not initialized for {PostgresSessionFactory._get_display_uri(uri)}."
                 )
 
             return cls._sync_sessions[db_hash]()
 
     @classmethod
     async def shutdown(cls):
-        """
-        Clean up engines and sessions.
-        """
-        for async_engine in cls.AsyncSession._async_engines.values():
+        """Clean up engines and sessions."""
+        for async_engine in cls.AsyncSessionHandle._async_engines.values():
             await async_engine.dispose()
         for sync_engine in cls.SyncSession._sync_engines.values():
             sync_engine.dispose()
 
-        cls.AsyncSession._async_engines.clear()
-        cls.AsyncSession._async_sessions.clear()
+        cls.AsyncSessionHandle._async_engines.clear()
+        cls.AsyncSessionHandle._async_sessions.clear()
         cls.SyncSession._sync_engines.clear()
         cls.SyncSession._sync_sessions.clear()
         log.info("Postgres session factory shut down.")

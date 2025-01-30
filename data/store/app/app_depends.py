@@ -12,7 +12,7 @@ from common.kafka.messaging.kafka_consumer import KafkaConsumerFactory
 from common.kafka.topics import ConsumerGroup, RpcEndpointTopic
 from common.logging import get_logger
 from common.worker_pool import SharedWorkerPool
-from data.store.app.db import database
+from data.store.app.database import database
 from routers.common.latency import get_latency_topics, initialize_latency_client
 from routers.data_ingest.app_endpoints import (
     InterfaceRpc,
@@ -67,7 +67,7 @@ async def lifespan(app: FastAPI):
 
 @asynccontextmanager
 async def get_async_db() -> AsyncGenerator[AsyncSession, None]:
-    session = PostgresSessionFactory.AsyncSession.get_session(database.DATABASE_ASYNC_URI)
+    session = PostgresSessionFactory.AsyncSessionHandle.get_session(database.DATABASE_ASYNC_URI)
     try:
         yield session
     finally:

@@ -3,13 +3,20 @@ from typing import Self
 
 
 class NamedIntEnum(IntEnum):
-    """
-    Base class for creating named integer enums.
-    """
+    """Base class for creating named integer enums."""
     @classmethod
     def validate(cls, value: int) -> Self:
-        """
-        Validate that the value is a valid enum member.
+        """Validate and parse the enum value.
+
+        Args:
+            value (int): Value to validate.
+
+        Raises:
+            ValueError: Invalid enum value.
+            ValueError: Invalid type for enum_field.
+
+        Returns:
+            Self: Enum instance.
         """
         if isinstance(value, str):  # Parse from lowercase string
             try:
@@ -24,15 +31,25 @@ class NamedIntEnum(IntEnum):
 
     @classmethod
     def _decode(cls, value: str) -> Self:
-        """
-        Convert the integer to an enum.
+        """Decode the enum value from a string
+
+        Args:
+            value (str): Value to decode.
+
+        Returns:
+            Self: Enum instance.
         """
         return cls[value.upper()]
 
     @classmethod
     def encoder(cls, value: Self) -> int:
-        """
-        Convert the enum to an integer.
+        """Encode the enum value to an integer.
+
+        Args:
+            value (Self): Enum instance.
+
+        Returns:
+            int: Encoded value.
         """
         return value.name
 

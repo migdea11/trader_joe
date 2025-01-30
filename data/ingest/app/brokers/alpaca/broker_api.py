@@ -23,8 +23,8 @@ from common.environment import get_env_var
 from common.logging import get_logger
 from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
 from schemas.data_ingest.get_dataset_request import StockDatasetRequest
-from schemas.data_store.asset_market_activity_data import (
-    AssetMarketActivityDataCreate, BatchStockDataCreate)
+from schemas.data_store.stock.market_activity_data import (
+    StockDataMarketActivityCreate, BatchStockDataMarketActivityCreate)
 
 log = get_logger(__name__)
 
@@ -39,8 +39,8 @@ __CLIENT = StockHistoricalDataClient(API_KEY, API_SECRET)
 def convert_bar_to_schema(
     data: Bar, dataset_id: UUID, symbol: str, source: DataSource, asset_type: AssetType,
     granularity: Granularity, expiry: datetime = None
-) -> AssetMarketActivityDataCreate:
-    return AssetMarketActivityDataCreate(
+) -> StockDataMarketActivityCreate:
+    return StockDataMarketActivityCreate(
         dataset_id=dataset_id,
 
         asset_type=asset_type,
@@ -69,7 +69,7 @@ def create_stock_quote(data: Quote, symbol: str, granularity: Granularity, sourc
 
 async def get_market_stock_data(
     executor: ThreadPoolExecutor, request: StockDatasetRequest
-) -> BatchStockDataCreate:
+) -> BatchStockDataMarketActivityCreate:
     granularity = AlpacaGranularity.from_granularity(request.granularity).broker_code
     params = {
         "symbol_or_symbols": request.symbol,
@@ -119,14 +119,14 @@ async def get_market_stock_data(
         return {}
 
     symbol = request.symbol.upper()
-    batch_data = BatchStockDataCreate(data={})
+    batch_data = BatchStockDataMarketActivityCreate(data={})
     if DataType.MARKET_ACTIVITY in response_map:
         stock_bars: BarSet = results[response_map[DataType.MARKET_ACTIVITY]]
         latest_expiry = request.expiry
 
         if symbol in stock_bars.data:
             bars = stock_bars[symbol] if isinstance(stock_bars[symbol], list) else [stock_bars[symbol]]
-            dataset: List[AssetMarketActivityDataCreate] = []
+            dataset: List[StockDataMarketActivityCreate] = []
             for bar in bars:
                 dataset.append(
                     convert_bar_to_schema(

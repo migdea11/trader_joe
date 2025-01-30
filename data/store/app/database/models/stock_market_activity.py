@@ -1,6 +1,6 @@
 from sqlalchemy import Column, Float, Integer
 
-from data.store.app.db.models.base_market_activity import BaseMarketActivity
+from data.store.app.database.models.base_market_activity import BaseMarketActivity
 
 
 # TODO figure out actual primary keys

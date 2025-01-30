@@ -63,7 +63,7 @@ def test_consume_messages_async(mock_kafka_consumer, consumer_params):
     async def test_async_consume():
         with ThreadPoolExecutor() as executor:
             factory = KafkaConsumerFactory()
-            await factory.add_async_consumer(
+            factory.add_async_consumer(
                 executor=executor,
                 consumer_params=consumer_params,
                 callback=mock_callback,
@@ -102,7 +102,7 @@ def test_consume_messages_async_failed_callback(mock_kafka_consumer, consumer_pa
     async def test_async_consume():
         with ThreadPoolExecutor() as executor:
             factory = KafkaConsumerFactory()
-            await factory.add_async_consumer(
+            factory.add_async_consumer(
                 executor=executor,
                 consumer_params=consumer_params,
                 callback=mock_callback_failure,

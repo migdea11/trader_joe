@@ -23,7 +23,7 @@ def mock_sync_uri() -> URL:
 
 @pytest.fixture
 def mock_async_uri() -> URL:
-    return PostgresSessionFactory.AsyncSession.create_uri(
+    return PostgresSessionFactory.AsyncSessionHandle.create_uri(
         host="localhost",
         port=5432,
         database="test_db",
@@ -93,7 +93,7 @@ async def test_async_initialize(
     mock_engine = MagicMock(spec=AsyncEngine)
     mock_create_async_engine.return_value = mock_engine
 
-    await PostgresSessionFactory.AsyncSession.initialize(mock_async_uri, timeout=0)
+    await PostgresSessionFactory.AsyncSessionHandle.initialize(mock_async_uri, timeout=0)
     internal_uri = mock_async_uri.set(drivername="postgresql")
 
     # Assert that connection and engine creation occurred
@@ -111,14 +111,14 @@ async def test_async_disabled(mock_async_uri: URL):
     # Ensure async methods raise an error when async is disabled
     with patch("common.database.postgres_tools._POSTGRES_ASYNC_ENABLED", False):
         with pytest.raises(RuntimeError, match="Postgres async is not enabled."):
-            await PostgresSessionFactory.AsyncSession.initialize(mock_async_uri, timeout=1)
+            await PostgresSessionFactory.AsyncSessionHandle.initialize(mock_async_uri, timeout=1)
 
 
 @pytest.mark.asyncio
 @patch("common.database.postgres_tools.asyncpg.connect", new_callable=AsyncMock)
 async def test_async_wait_for_db_timeout(mock_asyncpg_connect, mock_async_uri: URL, cleanup):
     mock_asyncpg_connect.side_effect = CannotConnectNowError("test")
-    result = await PostgresSessionFactory.AsyncSession.wait_for_db(mock_async_uri, timeout=1)
+    result = await PostgresSessionFactory.AsyncSessionHandle.wait_for_db(mock_async_uri, timeout=1)
 
     # Assert that the method retried and eventually returned False
     assert result is False

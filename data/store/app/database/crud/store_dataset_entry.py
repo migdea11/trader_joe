@@ -9,8 +9,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.logging import get_logger
-from data.store.app.db.models.stock_market_activity import StockMarketActivity
-from data.store.app.db.models.store_dataset_entry import StoreDatasetEntry
+from data.store.app.database.models.stock_market_activity import StockMarketActivity
+from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from schemas.data_store import store_dataset_request
 
 log = get_logger(__name__)

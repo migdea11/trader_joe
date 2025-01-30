@@ -32,9 +32,7 @@ T = TypeVar("T")
 
 
 class BrokerGranularityBase(Generic[T]):
-    """
-    Base class for mapping broker-specific granularities to standardized ones.
-    """
+    """Base class for mapping broker-specific granularities to standardized ones."""
 
     def __init__(self, broker_code: T, granularity: Granularity):
         self._broker_code = broker_code
@@ -42,15 +40,19 @@ class BrokerGranularityBase(Generic[T]):
 
     @property
     def broker_code(self) -> T:
-        """
-        Returns the broker-specific granularity code.
+        """Get the broker-specific granularity code.
+
+        Returns:
+            T: Broker-specific granularity code.
         """
         return self._broker_code
 
     @property
     def granularity(self) -> Granularity:
-        """
-        Returns the standardized granularity enum.
+        """Get the standardized granularity.
+
+        Returns:
+            Granularity: Standardized granularity.
         """
         return self._granularity
 
@@ -58,8 +60,17 @@ class BrokerGranularityBase(Generic[T]):
     def from_broker_code(
         cls: Type["BrokerGranularityBase"], broker_code: T
     ) -> Self:
-        """
-        Find and return the granularity mapping for a given broker code.
+        """Find and return the granularity mapping for a given broker-specific
+
+        Args:
+            cls (Type[BrokerGranularityBase&quot])
+            broker_code (T): Broker-specific granularity code.
+
+        Raises:
+            ValueError: If the broker code is not found.
+
+        Returns:
+            Self: Granularity mapping.
         """
         granularity_map: Self
         for granularity_map in cls:
@@ -71,8 +82,17 @@ class BrokerGranularityBase(Generic[T]):
     def from_granularity(
         cls: Type["BrokerGranularityBase"], granularity: Granularity
     ) -> Self:
-        """
-        Find and return the broker-specific code for a given standardized granularity.
+        """Find and return the granularity mapping for a given standardized granularity.
+
+        Args:
+            cls (Type[BrokerGranularityBase])
+            granularity (Granularity): Standardized granularity.
+
+        Raises:
+            ValueError: If the standardized granularity is not found.
+
+        Returns:
+            Self: Granularity mapping.
         """
         granularity_map: Self
         for granularity_map in cls:

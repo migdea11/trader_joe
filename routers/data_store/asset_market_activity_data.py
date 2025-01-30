@@ -5,13 +5,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.enums.data_select import AssetType
 from common.logging import get_logger
-from data.store.app.db.crud import \
+from data.store.app.database.crud import \
     asset_market_activity as crud_stock_market_activity
-from data.store.app.db.database import async_db
+from data.store.app.database.database import async_db
 from routers.data_store.app_endpoints import MarketDataInterface
-from schemas.data_store.asset_market_activity_data import (
+from schemas.data_store.stock.market_activity_data import (
     AssetMarketActivityData,
-    AssetMarketActivityDataCreate,
+    StockDataMarketActivityCreate,
     AssetMarketActivityDataDelete,
     AssetMarketActivityDataGet
 )
@@ -30,7 +30,7 @@ class UnsupportedAssetType(ValueError):
 )
 async def create_stock_market_activity_data(
     db: AsyncSession = Depends(async_db),
-    request: AssetMarketActivityDataCreate = Depends()
+    request: StockDataMarketActivityCreate = Depends()
 ):
     log.debug("Storing data for", request.asset_type)
     if request.asset_type is AssetType.STOCK:

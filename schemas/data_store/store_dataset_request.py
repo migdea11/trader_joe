@@ -68,26 +68,6 @@ class StoreDatasetRequestById(BaseModel):
     dataset_id: UUID = Field(..., description=ASSET_DATA_ID_DESC)
 
 
-class StoreDatasetIdentifiers:
-    def __init__(
-        self,
-        asset_type: AssetType,
-        symbol: str,
-        granularity: Granularity,
-        source: DataSource,
-        data_type: DataType,
-        start: Optional[datetime],
-        end: Optional[datetime]
-    ):
-        self.asset_type = asset_type
-        self.symbol = symbol
-        self.granularity = granularity
-        self.source = source
-        self.data_type = data_type
-        self.start = start
-        self.end = end
-
-
 class StoreDatasetEntrySearch(BaseModel):
     # Same as body, but with optional fields
     source: Optional[DataSource] = None

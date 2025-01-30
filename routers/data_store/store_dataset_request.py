@@ -5,8 +5,8 @@ from fastapi import APIRouter, Body, Depends, Query
 from common.kafka.kafka_rpc_factory import KafkaRpcFactory
 from common.logging import get_logger
 from data.store.app.app_depends import get_rpc_clients
-from data.store.app.db.crud.store_dataset_entry import search_entries, delete_entry_by_id
-from data.store.app.db.database import async_db
+from data.store.app.database.crud.store_dataset_entry import search_entries, delete_entry_by_id
+from data.store.app.database.database import async_db
 from data.store.app.ingest.data_action_request import store_market_activity_worker
 from schemas.data_store.store_dataset_request import (
     StoreDatasetEntry,

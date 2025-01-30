@@ -15,13 +15,13 @@ DATABASE_USER = get_env_var("POSTGRES_USER")
 DATABASE_PASS = get_env_var("POSTGRES_PASS")
 DATABASE_CONN_TIMEOUT = get_env_var("DATABASE_CONN_TIMEOUT", cast_type=int)
 
-DATABASE_ASYNC_URI = PostgresSessionFactory.AsyncSession.create_uri(
+DATABASE_ASYNC_URI = PostgresSessionFactory.AsyncSessionHandle.create_uri(
     DATABASE_HOST, DATABASE_PORT, DATABASE_DB_NAME, DATABASE_USER, DATABASE_PASS
 )
 
 
 async def initialize():
-    await PostgresSessionFactory.AsyncSession.initialize(DATABASE_ASYNC_URI, DATABASE_CONN_TIMEOUT)
+    await PostgresSessionFactory.AsyncSessionHandle.initialize(DATABASE_ASYNC_URI, DATABASE_CONN_TIMEOUT)
 
 
 async def shutdown():
@@ -33,4 +33,4 @@ async def shutdown():
 
 
 async def async_db() -> AsyncGenerator[AsyncSession, None]:
-    yield PostgresSessionFactory.AsyncSession.get_session(DATABASE_ASYNC_URI)
+    yield PostgresSessionFactory.AsyncSessionHandle.get_session(DATABASE_ASYNC_URI)

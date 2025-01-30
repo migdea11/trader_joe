@@ -14,10 +14,12 @@ log = get_logger(__name__)
 
 
 class KafkaProducerFactory:
+    """Factory that manages the creation and lifecycle of Kafka producers."""
     _KAFKA_PUB_INSTANCES: Dict[str, KafkaProducer] = {}
 
     @classmethod
     def shutdown(cls):
+        """Shutdown all Kafka producers."""
         producer: KafkaProducer
         for producer in cls._KAFKA_PUB_INSTANCES.values():
             producer.close()
@@ -26,6 +28,11 @@ class KafkaProducerFactory:
 
     @classmethod
     def release(cls, producer: KafkaProducer | ProducerParams):
+        """Close and remove a Kafka producer instance.
+
+        Args:
+            producer (KafkaProducer | ProducerParams): The producer instance or parameters of instance to release.
+        """
         producer_key = None
         if isinstance(producer, ProducerParams):
             producer_key = producer.get_key()
@@ -48,6 +55,14 @@ class KafkaProducerFactory:
         cls,
         clientParams: ProducerParams
     ) -> bool:
+        """Wait for Kafka to be ready before creating a producer.
+
+        Args:
+            clientParams (ProducerParams): The parameters to create the producer.
+
+        Returns:
+            bool: True if the producer was created successfully, False otherwise.
+        """
         start_time = time.time()
         if clientParams.get_key() in cls._KAFKA_PUB_INSTANCES:
             return True
@@ -71,6 +86,14 @@ class KafkaProducerFactory:
 
     @classmethod
     def get_producer(cls, producer_params: ProducerParams) -> KafkaProducer:
+        """Get a Kafka producer instance.
+
+        Args:
+            producer_params (ProducerParams): The parameters to create the producer.
+
+        Returns:
+            KafkaProducer: The Kafka producer instance.
+        """
         if producer_params.get_key() not in cls._KAFKA_PUB_INSTANCES:
             log.debug("waiting for Producer")
             cls.wait_for_kafka(producer_params)
@@ -79,6 +102,14 @@ class KafkaProducerFactory:
     @classmethod
     @contextmanager
     def scoped_producer(cls, producer_params: ProducerParams) -> Generator[KafkaProducer, None, None]:
+        """Context manager to get a Kafka producer instance.
+
+        Args:
+            producer_params (ProducerParams): The parameters to create the producer.
+
+        Yields:
+            Generator[KafkaProducer, None, None]: The Kafka producer instance generator.
+        """
         producer: KafkaProducer = cls.get_producer(producer_params)
         try:
             yield producer
@@ -87,11 +118,25 @@ class KafkaProducerFactory:
 
     @classmethod
     def send_message_async(cls, executor: ThreadPoolExecutor, producer: KafkaProducer, topic: str, message):
+        """Send a message to a Kafka topic asynchronously.
+
+        Args:
+            executor (ThreadPoolExecutor): Producer thread pool executor.
+            producer (KafkaProducer): The Kafka producer instance.
+            topic (str): The Kafka topic to send the message to.
+            message (_type_): The message to send.
+        """
         log.debug(limit(f"Sending message to topic: {topic}\n{message}"))
         loop = asyncio.get_running_loop()
         loop.run_in_executor(executor, producer.send, topic, message)
 
     @classmethod
     def flush_messages_async(cls, executor: ThreadPoolExecutor, producer: KafkaProducer):
+        """Flush messages in the producer asynchronously.
+
+        Args:
+            executor (ThreadPoolExecutor): _description_
+            producer (KafkaProducer): _description_
+        """
         loop = asyncio.get_running_loop()
         loop.run_in_executor(executor, producer.flush)

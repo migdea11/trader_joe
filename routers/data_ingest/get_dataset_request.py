@@ -13,7 +13,7 @@ from data.ingest.app.ingest_control import (
 from schemas.data_ingest.get_dataset_request import (
     CryptoDatasetRequest, GetDatasetRequest, OptionDatasetRequest, StockDatasetRequest
 )
-from schemas.data_store.asset_market_activity_data import BatchStockDataCreate
+from schemas.data_store.stock.market_activity_data import BatchStockDataMarketActivityCreate
 from .app_endpoints import InterfaceRpc
 
 log = get_logger(__name__)
@@ -25,7 +25,7 @@ rpc = KafkaRpcFactory(get_rpc_params(ConsumerGroup.DATA_INGEST_GROUP))
 @rpc.add_server(InterfaceRpc.INGEST_DATASET)
 async def store_data(
     request: GetDatasetRequest
-) -> BatchStockDataCreate:
+) -> BatchStockDataMarketActivityCreate:
     asset_map: Dict[AssetType, Tuple[Type[BaseModel], Any]] = {
         AssetType.STOCK: (StockDatasetRequest, store_retrieve_stock),
         AssetType.CRYPTO: (CryptoDatasetRequest, store_retrieve_crypto),

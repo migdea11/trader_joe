@@ -4,8 +4,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.enums.data_select import AssetType
 from common.logging import get_logger
-from data.store.app.db.models.stock_market_activity import StockMarketActivity
-from schemas.data_store import asset_market_activity_data
+from data.store.app.database.models.stock_market_activity import StockMarketActivity
+from schemas.data_store.stock import market_activity_data
 
 log = get_logger(__name__)
 
@@ -22,7 +22,7 @@ class UnsupportedAssetType(ValueError):
 
 async def create_asset_market_activity_data(
     db: AsyncSession,
-    asset_data: asset_market_activity_data.AssetMarketActivityDataCreate,
+    asset_data: market_activity_data.StockDataMarketActivityCreate,
 ):
     log.debug("Storing asset market activity data")
     if asset_data.asset_type not in _ASSET_TABLE_MAP:
@@ -35,7 +35,7 @@ async def create_asset_market_activity_data(
 
 
 async def batch_insert_asset_market_activity_data(
-    db: AsyncSession, batch_asset_data: List[asset_market_activity_data.AssetMarketActivityDataCreate]
+    db: AsyncSession, batch_asset_data: List[market_activity_data.StockDataMarketActivityCreate]
 ):
     try:
         log.debug(f"Batch storing market activity[{len(batch_asset_data)}]")
@@ -56,8 +56,8 @@ async def batch_insert_asset_market_activity_data(
 
 # TODO replace with a search function
 async def read_asset_market_activity_dataset(
-    db: AsyncSession, request: asset_market_activity_data.AssetMarketActivityDataGet
-) -> List[asset_market_activity_data.AssetMarketActivityData]:
+    db: AsyncSession, request: market_activity_data.AssetMarketActivityDataGet
+) -> List[market_activity_data.AssetMarketActivityData]:
     log.debug("Reading stock market activity dataset")
 
     if request.asset_type not in _ASSET_TABLE_MAP:
@@ -82,7 +82,7 @@ async def read_asset_market_activity_dataset(
     results = await db.execute(stmt)
     db_asset_market_activities = results.scalars().all()
     return [
-        asset_market_activity_data.AssetMarketActivityData.model_validate(obj) for obj in db_asset_market_activities
+        market_activity_data.AssetMarketActivityData.model_validate(obj) for obj in db_asset_market_activities
     ]
 
 
@@ -90,7 +90,7 @@ async def read_asset_market_activity_dataset(
 async def read_all_asset_market_activity_data(
     db: AsyncSession,
     asset_type: AssetType
-) -> List[asset_market_activity_data.AssetMarketActivityData]:
+) -> List[market_activity_data.AssetMarketActivityData]:
     if asset_type not in _ASSET_TABLE_MAP:
         raise UnsupportedAssetType(asset_type)
 
@@ -101,7 +101,7 @@ async def read_all_asset_market_activity_data(
     db_stock_market_activities = result.scalars().all()
 
     schema_objects = [
-        asset_market_activity_data.AssetMarketActivityData.model_validate(
+        market_activity_data.AssetMarketActivityData.model_validate(
             {**obj.__dict__, "asset_type": AssetType.STOCK}
         ) for obj in db_stock_market_activities
     ]

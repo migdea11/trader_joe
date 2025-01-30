@@ -13,6 +13,12 @@ log = get_logger(__name__)
 
 
 class KafkaRpcServer(Generic[Req, Res], KafkaRpcBase[Req, Res]):
+    """RPC server that listens for requests and sends responses.
+
+    Args:
+        Generic (Req, Res): Request and response types.
+        KafkaRpcBase (Req, Res): Base class for RPC servers.
+    """
     def __init__(
         self,
         kafka_config: RpcParams,
@@ -20,6 +26,14 @@ class KafkaRpcServer(Generic[Req, Res], KafkaRpcBase[Req, Res]):
         rpc_function: Callable[[RpcRequest], Coroutine[Any, Any, Res]],
         timeout: int = 5
     ):
+        """Create a new RPC server.
+
+        Args:
+            kafka_config (RpcParams): Kafka configuration parameters.
+            endpoint (RpcEndpoint[Req, Res]): RPC endpoint definition.
+            rpc_function (Callable[[RpcRequest], Coroutine[Any, Any, Res]]): The function to process incoming requests.
+            timeout (int, optional): Timeout period to consume request. Defaults to 5.
+        """
         super().__init__(kafka_config, endpoint, timeout)
 
         # Update consumer params to listen for requests
@@ -29,6 +43,14 @@ class KafkaRpcServer(Generic[Req, Res], KafkaRpcBase[Req, Res]):
         self._rpc_function = rpc_function
 
     async def _callback(self, message: ConsumerRecord) -> bool:
+        """Process an incoming request message.
+
+        Args:
+            message (ConsumerRecord): The raw incoming message.
+
+        Returns:
+            bool: True if the message was processed successfully.
+        """
         success = False
         try:
             request_type: Type[Req] = self.endpoint.request_model

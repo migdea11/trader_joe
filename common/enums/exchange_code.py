@@ -28,31 +28,42 @@ class ExchangeCode(str, Enum):
 
 
 class BrokerExchangeBase(Generic[T]):
-    """
-    Base class for mapping broker-specific exchange codes to standardized exchange enums.
-    """
+    """Base class for mapping broker-specific exchange codes to standardized exchange enums."""
     def __init__(self, broker_code: T, exchange: ExchangeCode):
         self._broker_code = broker_code
         self._exchange = exchange
 
     @property
     def broker_code(self) -> T:
-        """
-        Returns the broker-specific exchange code.
+        """Returns the broker-specific exchange code.
+
+        Returns:
+            T: Broker-specific exchange code.
         """
         return self._broker_code
 
     @property
     def exchange(self) -> ExchangeCode:
-        """
-        Returns the standardized exchange enum.
+        """Returns the standardized exchange enum.
+
+        Returns:
+            ExchangeCode: Standardized exchange enum.
         """
         return self._exchange
 
     @classmethod
     def from_broker_code(cls: Type["BrokerExchangeBase"], broker_code: T) -> Self:
-        """
-        Returns the standardized exchange enum for the given broker code.
+        """Find and return the exchange code mapping for a given broker-specific exchange code.
+
+        Args:
+            cls (Type[BrokerExchangeBase])
+            broker_code (T): Broker-specific exchange code.
+
+        Raises:
+            ValueError: If the broker code is not found.
+
+        Returns:
+            Self: Broker code mapping.
         """
         exchange_map: Self
         for exchange_map in cls:
@@ -62,8 +73,17 @@ class BrokerExchangeBase(Generic[T]):
 
     @classmethod
     def get_broker_code(cls: Type["BrokerExchangeBase"], exchange: ExchangeCode) -> Self:
-        """
-        Returns the broker-specific exchange code for the given standardized exchange.
+        """Find and return the exchange code mapping for a given standardized exchange
+
+        Args:
+            cls (Type[BrokerExchangeBase])
+            exchange (ExchangeCode): Standardized exchange.
+
+        Raises:
+            ValueError: If the exchange is not found.
+
+        Returns:
+            Self: Broker code mapping.
         """
         exchange_map: Self
         for exchange_map in cls:

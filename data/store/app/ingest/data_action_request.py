@@ -4,8 +4,8 @@ from common.enums.data_select import DataType
 from common.environment import get_env_var
 from common.kafka.kafka_rpc_factory import KafkaRpcFactory
 from common.logging import get_logger
-from data.store.app.db.crud.asset_market_activity import batch_insert_asset_market_activity_data
-from data.store.app.db.crud.store_dataset_entry import upsert_entry
+from data.store.app.database.crud.asset_market_activity import batch_insert_asset_market_activity_data
+from data.store.app.database.crud.store_dataset_entry import upsert_entry
 from routers.data_ingest.app_endpoints import InterfaceRpc
 from schemas.data_ingest.get_dataset_request import GetDatasetRequest
 from schemas.data_store.store_dataset_request import (

@@ -14,7 +14,20 @@ log = get_logger(__name__)
 
 
 class KafkaRpcClient(Generic[Req, Res], KafkaRpcBase[Req, Res]):
+    """RPC client that sends requests and listens for responses.
+
+    Args:
+        Generic (Req, Res): Request and response types.
+        KafkaRpcBase (Req, Res): Base class for RPC clients.
+    """
     def __init__(self, kafka_config: RpcParams, endpoint: RpcEndpoint[Req, Res], timeout: int = 5):
+        """Create a new RPC client.
+
+        Args:
+            kafka_config (RpcParams): Kafka configuration parameters.
+            endpoint (RpcEndpoint[Req, Res]): RPC endpoint definition.
+            timeout (int, optional): Timeout period for request and to consume response. Defaults to 5.
+        """
         super().__init__(kafka_config, endpoint, timeout)
 
         # Update consumer params to listen for responses
@@ -25,6 +38,14 @@ class KafkaRpcClient(Generic[Req, Res], KafkaRpcBase[Req, Res]):
         self._timeout = timeout
 
     async def _callback(self, message: ConsumerRecord) -> bool:
+        """Process a response message.
+
+        Args:
+            message (ConsumerRecord): The raw incoming message.
+
+        Returns:
+            bool: True if the message was processed successfully.
+        """
         success = False
         try:
             response_type: Type[Res] = self.endpoint.response_model
@@ -43,6 +64,17 @@ class KafkaRpcClient(Generic[Req, Res], KafkaRpcBase[Req, Res]):
             return success
 
     async def send_request(self, request_payload: Req) -> Res:
+        """Send an RPC request and wait for a response.
+
+        Args:
+            request_payload (Req): The request payload.
+
+        Raises:
+            TimeoutError: If the request times out.
+
+        Returns:
+            Res: The response payload.
+        """
         request = RpcRequest.create_request(request_payload)
         future = asyncio.get_event_loop().create_future()
         self._pending_requests[request.correlation_id] = future
