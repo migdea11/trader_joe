@@ -10,10 +10,10 @@ from data.store.app.database.crud import \
 from data.store.app.database.database import async_db
 from routers.data_store.app_endpoints import MarketDataInterface
 from schemas.data_store.stock.market_activity_data import (
-    AssetMarketActivityData,
     StockDataMarketActivityCreate,
-    AssetMarketActivityDataDelete,
-    AssetMarketActivityDataGet
+    StockDataMarketActivity,
+    StockDataMarketActivityDelete,
+    StockDataMarketActivityQuery
 )
 
 router = APIRouter()
@@ -26,7 +26,7 @@ class UnsupportedAssetType(ValueError):
 
 
 @router.post(
-    MarketDataInterface.POST_MARKET_ACTIVITY, response_model=AssetMarketActivityData
+    MarketDataInterface.POST_MARKET_ACTIVITY, response_model=StockDataMarketActivity
 )
 async def create_stock_market_activity_data(
     db: AsyncSession = Depends(async_db),
@@ -44,7 +44,7 @@ async def create_stock_market_activity_data(
 @router.delete(MarketDataInterface.DELETE_MARKET_ACTIVITY)
 async def delete_stock_market_activity_data(
     db: AsyncSession = Depends(async_db),
-    request: AssetMarketActivityDataDelete = Depends()
+    request: StockDataMarketActivityDelete = Depends()
 ):
     if request.asset_type is AssetType.STOCK:
         await crud_stock_market_activity.delete_all_asset_market_activity_data(db=db)
@@ -53,10 +53,10 @@ async def delete_stock_market_activity_data(
     raise UnsupportedAssetType(request.asset_type)
 
 
-@router.get(MarketDataInterface.GET_MARKET_ACTIVITY, response_model=List[AssetMarketActivityData])
+@router.get(MarketDataInterface.GET_MARKET_ACTIVITY, response_model=List[StockDataMarketActivity])
 async def read_stock_market_activity_data(
     db: AsyncSession = Depends(async_db),
-    request: AssetMarketActivityDataGet = Depends()
+    request: StockDataMarketActivityQuery = Depends()
 ):
     if request.query() is False:
         return await crud_stock_market_activity.read_all_asset_market_activity_data(db, request.asset_type)

@@ -1,10 +1,15 @@
+from datetime import datetime
 from typing import List, Optional
 from uuid import UUID
+
 from pydantic import BaseModel
-from datetime import datetime
 
 from common.enums.data_select import AssetType, DataType
-from common.enums.data_stock import DataSource, Granularity, ExpiryType, UpdateType
+from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateType
+
+
+class Test:
+  pass
 
 
 class BaseGetDatasetRequest(BaseModel):

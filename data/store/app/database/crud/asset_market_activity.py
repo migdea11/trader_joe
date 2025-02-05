@@ -56,8 +56,8 @@ async def batch_insert_asset_market_activity_data(
 
 # TODO replace with a search function
 async def read_asset_market_activity_dataset(
-    db: AsyncSession, request: market_activity_data.AssetMarketActivityDataGet
-) -> List[market_activity_data.AssetMarketActivityData]:
+    db: AsyncSession, request: market_activity_data.StockDataMarketActivityQuery
+) -> List[market_activity_data.StockDataMarketActivity]:
     log.debug("Reading stock market activity dataset")
 
     if request.asset_type not in _ASSET_TABLE_MAP:
@@ -69,7 +69,7 @@ async def read_asset_market_activity_dataset(
     conditions = []
     if request.dataset_id:
         conditions.append(asset_table.dataset_id == request.dataset_id)
-    if request.symbol:
+    if request.asset_symbol:
         conditions.append(asset_table.symbol == request.symbol)
     if request.granularity:
         conditions.append(asset_table.granularity == request.granularity)
@@ -82,7 +82,7 @@ async def read_asset_market_activity_dataset(
     results = await db.execute(stmt)
     db_asset_market_activities = results.scalars().all()
     return [
-        market_activity_data.AssetMarketActivityData.model_validate(obj) for obj in db_asset_market_activities
+        market_activity_data.StockDataMarketActivity.model_validate(obj) for obj in db_asset_market_activities
     ]
 
 
@@ -90,7 +90,7 @@ async def read_asset_market_activity_dataset(
 async def read_all_asset_market_activity_data(
     db: AsyncSession,
     asset_type: AssetType
-) -> List[market_activity_data.AssetMarketActivityData]:
+) -> List[market_activity_data.StockDataMarketActivity]:
     if asset_type not in _ASSET_TABLE_MAP:
         raise UnsupportedAssetType(asset_type)
 
@@ -101,7 +101,7 @@ async def read_all_asset_market_activity_data(
     db_stock_market_activities = result.scalars().all()
 
     schema_objects = [
-        market_activity_data.AssetMarketActivityData.model_validate(
+        market_activity_data.StockDataMarketActivity.model_validate(
             {**obj.__dict__, "asset_type": AssetType.STOCK}
         ) for obj in db_stock_market_activities
     ]

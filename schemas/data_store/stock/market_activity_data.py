@@ -1,7 +1,7 @@
 from uuid import UUID
 from pydantic import BaseModel, Field, field_validator
 from datetime import datetime
-from typing import Optional
+from typing import Optional, TypeVar
 
 from common.enums.data_select import AssetType, DataType
 from common.logging import get_logger
@@ -11,6 +11,9 @@ from schemas.data_store.asset_data_interface import (
 )
 
 log = get_logger(__name__)
+
+DT = TypeVar('DT')  # Data Type
+QT = TypeVar('QT')  # Query Type
 
 
 class _StockDataMarketActivityData(BaseModel):

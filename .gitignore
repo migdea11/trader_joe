@@ -4,7 +4,10 @@
 
 # Environments
 .env
-venv/
+.venv/
+
+# Make
+.venv_init
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -12,8 +15,9 @@ __pycache__/
 *$py.class
 
 # Testing
-./pytest_cache
 .coverage
+.ruff_cache/
+.pytest_cache/
 
 # Default Volume locations
 ./data/postgres

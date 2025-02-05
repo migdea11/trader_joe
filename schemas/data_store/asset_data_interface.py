@@ -36,7 +36,7 @@ class _AssetIdentifier(BaseModel, _AssetProperties, ABC):
     source: DataSource
     granularity: Granularity
 
-    @field_validator("symbol")
+    @field_validator("asset_symbol")
     def uppercase_item_id(cls, value: str) -> str:
         return value.upper()
 
@@ -48,7 +48,7 @@ class _AssetIdentifierQuery(BaseModel, _AssetProperties, ABC):
     granularity: Optional[Granularity]
     dataset_id: Optional[UUID]
 
-    @field_validator("symbol")
+    @field_validator("asset_symbol")
     def uppercase_item_id(cls, value: str | None) -> str:
         return value.upper()
 
@@ -65,7 +65,7 @@ class AssetDataPath(BaseModel):
     data_type: DataType = Field(..., description=DATA_TYPE_DESC)
 
 
-class AssetDataCreate(_AssetIdentifier, _AssetProperties, _AssetDataType[DT], ABC):
+class AssetDataCreate(_AssetIdentifier, _AssetDataType[DT], _AssetProperties, Generic[DT], ABC):
     dataset_id: UUID
 
 
@@ -74,7 +74,7 @@ class BatchAssetDataCreate(_AssetIdentifier, Generic[DT], ABC):
     dataset: List[_AssetDataType[DT]]
 
 
-class AssetDataUpdate(_AssetIdentifier, _AssetDataType[DT], ABC):
+class AssetDataUpdate(_AssetIdentifier, _AssetDataType[DT], Generic[DT], ABC):
     id: int  # Isn't this uuid...
     dataset_id: UUID
 
@@ -83,11 +83,11 @@ class AssetDataDelete(_AssetIdentifier, ABC):
     dataset_id: UUID
 
 
-class AssetDataQuery(_AssetIdentifierQuery, _AssetDataQuery[QT], ABC):
+class AssetDataQuery(_AssetIdentifierQuery, _AssetDataQuery[QT], Generic[QT], ABC):
     dataset_id: Optional[UUID]
 
 
-class AssetData(_AssetIdentifier, _AssetDataType[DT], ABC):
+class AssetData(_AssetIdentifier, _AssetDataType[DT], Generic[DT], ABC):
     id: int  # Isn't this uuid...
     dataset_id: UUID
 
