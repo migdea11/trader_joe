@@ -92,7 +92,7 @@ class KafkaRpcFactory:
             """Shutdown all RPC clients."""
             self._consumer_factory.shutdown()
 
-    def init_clients(self) -> Self:
+    def init_clients(self) -> RpcClients:
         """Initialize all RPC clients.
 
         Raises:

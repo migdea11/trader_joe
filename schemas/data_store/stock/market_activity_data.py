@@ -1,13 +1,14 @@
-from uuid import UUID
-from pydantic import BaseModel, Field, field_validator
-from datetime import datetime
-from typing import Optional, TypeVar
+from pydantic import BaseModel
+from typing import TypeVar
 
-from common.enums.data_select import AssetType, DataType
 from common.logging import get_logger
-from routers.data_store.app_endpoints import ASSET_TYPE_DESC, SYMBOL_DESC
 from schemas.data_store.asset_data_interface import (
-    AssetData, AssetDataCreate, AssetDataDelete, AssetDataQuery, AssetDataUpdate, BatchAssetDataCreate
+    AssetData,
+    AssetDataCreate,
+    AssetDataDeleteById,
+    AssetDataQuery,
+    AssetDataUpdate,
+    BatchAssetDataCreate
 )
 
 log = get_logger(__name__)
@@ -16,7 +17,8 @@ DT = TypeVar('DT')  # Data Type
 QT = TypeVar('QT')  # Query Type
 
 
-class _StockDataMarketActivityData(BaseModel):
+class StockDataMarketActivityData(BaseModel):
+    """Basic Data for a stock's market activity."""
     open: float
     high: float
     low: float
@@ -28,17 +30,18 @@ class _StockDataMarketActivityData(BaseModel):
     dividends_factor: float
 
 
-class _StockMarketActivityDataQuery(BaseModel):
+class StockMarketActivityDataQuery(BaseModel):
+    """Basic Query for a stock's market activity."""
     pass
 
 
-class AssetMarketActivityRequestPath(BaseModel):
-    asset_type: AssetType = Field(..., description=ASSET_TYPE_DESC)
-    symbol: str = Field(..., description=SYMBOL_DESC)
+# class AssetMarketActivityRequestPath(BaseModel):
+#     asset_type: AssetType = Field(..., description=ASSET_TYPE_DESC)
+#     symbol: str = Field(..., description=SYMBOL_DESC)
 
-    @field_validator("symbol")
-    def uppercase_item_id(cls, value: str) -> str:
-        return value.upper()
+#     @field_validator("symbol")
+#     def uppercase_item_id(cls, value: str) -> str:
+#         return value.upper()
 
 
 # class StockDataMarketActivityCreate(AssetMarketActivityRequestPath, AssetMarketActivityRequestBody):
@@ -96,41 +99,25 @@ class AssetMarketActivityRequestPath(BaseModel):
 #     pass
 
 
-class _StockDataMarketActivityProperties:
-    @property
-    def asset_type(self) -> AssetType:
-        return AssetType.STOCK
-
-    @property
-    def data_type(self) -> DataType:
-        return DataType.MARKET_ACTIVITY
-
-
-class StockDataMarketActivityCreate(AssetDataCreate[_StockDataMarketActivityData], _StockDataMarketActivityProperties):
+class StockDataMarketActivityCreate(AssetDataCreate[StockDataMarketActivityData]):
     pass
 
 
-class BatchStockDataMarketActivityCreate(
-    BatchAssetDataCreate[_StockDataMarketActivityData], _StockDataMarketActivityProperties
-):
+class BatchStockDataMarketActivityCreate(BatchAssetDataCreate[StockDataMarketActivityData]):
     pass
 
 
-class StockDataMarketActivityUpdate(AssetDataUpdate[_StockDataMarketActivityData], _StockDataMarketActivityProperties):
+class StockDataMarketActivityUpdate(AssetDataUpdate[StockDataMarketActivityData]):
     pass
 
 
-class StockDataMarketActivityDelete(AssetDataDelete, _StockDataMarketActivityProperties):
+class StockDataMarketActivityDeleteById(AssetDataDeleteById):
     pass
 
 
-class StockDataMarketActivityQuery(AssetDataQuery[_StockMarketActivityDataQuery], _StockDataMarketActivityProperties):
-    dataset_id: Optional[UUID]
+class StockDataMarketActivityQuery(AssetDataQuery[StockMarketActivityDataQuery]):
+    pass
 
 
-class StockDataMarketActivity(AssetData[_StockDataMarketActivityData], _StockDataMarketActivityProperties):
-    id: int  # Isn't this uuid...
-    dataset_id: UUID
-
-    created_at: datetime
-    updated_at: datetime
+class StockDataMarketActivity(AssetData[StockDataMarketActivityData]):
+    pass

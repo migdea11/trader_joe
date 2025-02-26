@@ -1,13 +1,15 @@
-from typing import Any, Dict, List, Optional, Self, Tuple, Type, TypeVar
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Self, Tuple, Type, TypeVar
 
 from pydantic import BaseModel
-
 from sqlalchemy import Column
 from sqlalchemy.orm import declarative_base
-from sqlalchemy.sql.base import ReadOnlyColumnCollection
 
 from common.database.sql_alchemy_types import CustomColumn
 from common.logging import get_logger
+
+if TYPE_CHECKING:
+    from sqlalchemy.sql.base import ReadOnlyColumnCollection
+
 
 log = get_logger(__name__)
 
@@ -59,11 +61,14 @@ class CustomTypeTable:
 
         Args:
             schema_type (Type[S]): Output schema type.
-            additional (Optional[Dict[str, Any]], optional): Additional Fields to add to Model to complete the Schema. Defaults to None.
-            exclude (Optional[List[str]], optional): Fields to be removed from Model to complete  Schema. Defaults to None.
+            additional (Optional[Dict[str, Any]], optional): Additional Fields to add to Model to complete the Schema.
+                Defaults to None.
+            exclude (Optional[List[str]], optional): Fields to be removed from Model to complete  Schema. Defaults to
+                None.
 
         Returns:
-            Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]: Unflattened fields, custom type fields, additional fields.
+            Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]: Unflattened fields, custom type fields, additional
+                fields.
         """
         log.debug(f"Converting {self.__class__.__name__} to schema")
         other_columns, custom_type_columns = self.__class__._get_columns(exclude)
@@ -84,8 +89,10 @@ class CustomTypeTable:
 
         Args:
             schema_type (Type[S]): Output schema type.
-            additional (Optional[Dict[str, Any]], optional): Additional Fields to add to Model to complete the Schema. Defaults to None.
-            exclude (Optional[List[str]], optional): Fields to be removed from Model to complete Schema. Defaults to None.
+            additional (Optional[Dict[str, Any]], optional): Additional Fields to add to Model to complete the Schema.
+                Defaults to None.
+            exclude (Optional[List[str]], optional): Fields to be removed from Model to complete Schema. Defaults to
+                None.
 
         Returns:
             Dict[str, Any]: output as Schema fields.
@@ -100,8 +107,10 @@ class CustomTypeTable:
 
         Args:
             schema_type (Type[S]): Output schema type.
-            additional (Optional[Dict[str, Any]], optional): Additional Fields to add to Model to complete the Schema. Defaults to None.
-            exclude (Optional[List[str]], optional): Fields to be removed from Model to complete Schema. Defaults to None.
+            additional (Optional[Dict[str, Any]], optional): Additional Fields to add to Model to complete the Schema.
+                Defaults to None.
+            exclude (Optional[List[str]], optional): Fields to be removed from Model to complete Schema. Defaults to
+                None.
 
         Returns:
             S: output as validated Schema.

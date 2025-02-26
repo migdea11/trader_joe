@@ -1,6 +1,5 @@
-from typing import Any, Dict, Tuple, Type
+from typing import Any, Dict, Tuple, Type, TYPE_CHECKING
 from fastapi import APIRouter
-from pydantic import BaseModel
 
 from common.enums.data_select import AssetType
 from common.kafka.kafka_config import get_rpc_params
@@ -15,6 +14,9 @@ from schemas.data_ingest.get_dataset_request import (
 )
 from schemas.data_store.stock.market_activity_data import BatchStockDataMarketActivityCreate
 from .app_endpoints import InterfaceRpc
+
+if TYPE_CHECKING:
+    from pydantic import BaseModel
 
 log = get_logger(__name__)
 

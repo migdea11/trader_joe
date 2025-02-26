@@ -35,7 +35,7 @@ ENTRYPOINT ["/code/entrypoint.sh"]
 FROM base_image AS dev_image
 ARG SERVICE_PATH
 ARG SERVICE_NAME
-RUN uv sync --group base --group ${SERVICE_PATH}-${SERVICE_NAME} --group dev --frozen --no-cache
+RUN uv sync --group base --group ${SERVICE_PATH}-${SERVICE_NAME} --group dev --no-cache
 ENV RUN_MODE="dev"
 ENV ADDITIONAL_ARGS="--reload"
 

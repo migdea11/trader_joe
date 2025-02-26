@@ -16,6 +16,7 @@ __pycache__/
 
 # Testing
 .coverage
+coverage.xml
 .ruff_cache/
 .pytest_cache/
 

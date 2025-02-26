@@ -17,7 +17,7 @@ class BaseMarketActivity(AppBase.DATA_STORE_BASE):
     )
 
     source = Column(Enum(DataSource), nullable=False)
-    symbol = Column(String, nullable=False)
+    asset_symbol = Column(String, nullable=False)
 
     timestamp = Column(DateTime(timezone=True), nullable=False)
     granularity = Column(Enum(Granularity), nullable=False)
@@ -34,7 +34,7 @@ class BaseMarketActivity(AppBase.DATA_STORE_BASE):
     def _repr(self, table_name: str, additional_fields: str) -> str:
         return (
             f"<{table_name}(id='{self.id}', dataset_id='{self.dataset_id}', source='{self.source}, "
-            f"symbol='{self.symbol}', timestamp='{self.timestamp}', granularity='{self.granularity}', "
+            f"symbol='{self.asset_symbol}', timestamp='{self.timestamp}', granularity='{self.granularity}', "
             f"{additional_fields}"
             f"created_at='{self.created_at}', updated_at='{self.updated_at}')>"
         )

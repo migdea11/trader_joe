@@ -1,16 +1,13 @@
 import importlib
 from logging.config import fileConfig
 from pathlib import Path
-from typing import Any
 
 from alembic import context
 from dotenv import load_dotenv
 from sqlalchemy import engine_from_config, pool
-from alembic.autogenerate.api import AutogenContext
 
 from common.environment import get_env_var
 from common.logging import get_logger
-from common.database.sql_alchemy_types import OrderedEnum, NullableDateTime
 from common.database.sql_alchemy_table import AppBase
 
 log = get_logger(__name__)
@@ -28,11 +25,11 @@ config.set_main_option('sqlalchemy.url', database_uri)
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-models_dir = Path('/code/data/store/app/db/models')
+models_dir = Path('/code/data/store/app/database/models')
 print(f"Scanning models directory: {models_dir}")
 for filename in models_dir.iterdir():
     if filename.suffix == ".py" and filename.stem not in ("__init__", "alembic_base"):
-        module_name = f"data.store.app.db.models.{filename.stem}"
+        module_name = f"data.store.app.database.models.{filename.stem}"
         print(f"found: {module_name}")
         importlib.import_module(module_name)
 target_metadata = AppBase.DATA_STORE_BASE.metadata

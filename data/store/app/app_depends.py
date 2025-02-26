@@ -4,7 +4,7 @@ from typing import AsyncGenerator
 from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from common.app_lifecycle import startup_logs, teardown_logs
+from common.app_lifecycle import init_debugger, startup_logs, teardown_logs
 from common.database.postgres_tools import PostgresSessionFactory
 from common.kafka.kafka_config import get_consumer_params, get_rpc_params
 from common.kafka.kafka_rpc_factory import KafkaRpcFactory
@@ -30,6 +30,7 @@ async def lifespan(app: FastAPI):
     # Init Common Endpoints
     # Using different app for REST latency, ensuring test isn't affected by client and server are on the same thread.
     initialize_latency_client(app, INGEST_APP_NAME, INGEST_APP_PORT, ConsumerGroup.COMMON_GROUP)
+    init_debugger()
 
     startup_logs(app)
     SharedWorkerPool.worker_startup()

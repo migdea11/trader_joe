@@ -1,11 +1,11 @@
 from datetime import timedelta
-from enum import Enum
+from enum import StrEnum
 from typing import Generic, Self, Type, TypeVar
 
 from common.enums.pydantic_enums import NamedIntEnum
 
 
-class Granularity(str, Enum):
+class Granularity(StrEnum):
     ONE_MINUTE = ("1min", timedelta(minutes=1))
     FIVE_MINUTES = ("5min", timedelta(minutes=5))
     THIRTY_MINUTES = ("30min", timedelta(minutes=30))
@@ -101,7 +101,7 @@ class BrokerGranularityBase(Generic[T]):
         raise ValueError(f"Granularity '{granularity}' not found in {cls.__name__}")
 
 
-class DataSource(str, Enum):
+class DataSource(StrEnum):
     IB_API = "IB"
     ALPACA_API = "ALPACA"
     MANUAL_ENTRY = "MANUAL"

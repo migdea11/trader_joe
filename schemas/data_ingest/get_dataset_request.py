@@ -8,10 +8,6 @@ from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateType
 
 
-class Test:
-  pass
-
-
 class BaseGetDatasetRequest(BaseModel):
     dataset_id: UUID
     source: DataSource
@@ -26,14 +22,14 @@ class BaseGetDatasetRequest(BaseModel):
 
 
 class GetDatasetRequest(BaseGetDatasetRequest):
+    asset_symbol: str
     asset_type: AssetType
-    symbol: str
     data_types: List[DataType]
 
 
 class StockDatasetRequest(GetDatasetRequest):
     # Adding path params except asset_type
-    symbol: str
+    asset_symbol: str
     data_types: List[DataType]
 
     class Config:

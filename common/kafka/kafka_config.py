@@ -85,7 +85,8 @@ class ProducerParams:
         self.producer_type = producer_type
 
         self.__url = f"{self.host}:{self.port}"
-        # Unique key for producer based on config, including dedicated producers which could have same config as another.
+        # Unique key for producer based on config, including dedicated producers which could have same config as
+        # another.
         self.__key_str = f"{self.__url}" \
             if producer_type is ProducerParams.ProducerType.SHARED \
             else f"{self.__url}+{UUID()}"

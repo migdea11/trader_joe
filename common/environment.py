@@ -1,6 +1,10 @@
 import os
 from typing import Type, TypeVar
 
+from common.enums.config_enum import RunMode
+from common.logging import get_logger
+
+log = get_logger(__name__)
 T = TypeVar('T')
 
 
@@ -20,7 +24,15 @@ def get_env_var(var_name: str, default: Type[T] = None, cast_type: Type[T] = str
         if cast_type is bool and isinstance(var, str):
             var = var.lower() in ['true', '1']
         else:
-            var = cast_type(var)
+            try:
+                var = cast_type(var)
+            except ValueError as e:
+                log.error(f"Failed to cast {var_name} to {cast_type}: {e}")
+                if default is not None:
+                    log.info(f"Using default value: {default}")
+                    var = default
+                else:
+                    raise
     return var
 
 
@@ -30,4 +42,4 @@ def get_run_mode() -> str:
     Returns:
         str: Run mode.
     """
-    return get_env_var("RUN_MODE", default="not found")
+    return get_env_var("RUN_MODE", default=RunMode.DEV, cast_type=RunMode)

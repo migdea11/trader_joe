@@ -1,5 +1,3 @@
-
-
 from datetime import datetime
 
 from common.enums.data_stock import ExpiryType, Granularity
@@ -18,6 +16,6 @@ def expiry_inc(expiry: datetime, expiry_type: ExpiryType, granularity: Granulari
     """
     if expiry is None:
         return None
-    if expiry_type == ExpiryType.ROLLING:
+    if expiry_type is ExpiryType.ROLLING:
         return expiry + granularity.offset
     return expiry

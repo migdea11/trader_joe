@@ -1,7 +1,6 @@
 import traceback
 import uuid
-from datetime import datetime
-from typing import List, Tuple
+from typing import List, Tuple, TYPE_CHECKING
 
 from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.dialects import postgresql
@@ -11,21 +10,27 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from common.logging import get_logger
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
-from schemas.data_store import store_dataset_request
+from schemas.data_store import asset_dataset_store
+
+if TYPE_CHECKING:
+    from datetime import datetime
 
 log = get_logger(__name__)
 
 
 async def upsert_entry(
-    db: AsyncSession, entry: store_dataset_request.StoreDatasetEntryCreate
-) -> store_dataset_request.StoreDatasetEntry:
+    db: AsyncSession, entry: asset_dataset_store.AssetDatasetStoreCreate
+) -> asset_dataset_store.AssetDatasetStore:
+    log.debug(f"Upserting entry: {entry}")
     try:
+        test = StoreDatasetEntry.get_fields(entry, exclude={"expiry"}, exclude_none=True)
+        log.debug(f"Test: {test}")
         stmt = postgresql.insert(StoreDatasetEntry).values(
             **StoreDatasetEntry.get_fields(entry, exclude={"expiry"}, exclude_none=True),
             created_at=func.now(),
             updated_at=func.now()
         ).on_conflict_do_update(
-            index_elements=['symbol', 'granularity', 'start', 'end', 'source', 'data_type'],
+            index_elements=['asset_symbol', 'granularity', 'start', 'end', 'source', 'data_type'],
             set_={
                 # Update expiry_type based on custom ranking
                 'expiry_type': case(
@@ -48,12 +53,12 @@ async def upsert_entry(
         await db.commit()
         return result_id
     except SQLAlchemyError as e:
-        db.rollback()
+        await db.rollback()
         traceback.print_exc()
         raise RuntimeError(f"Error while creating or updating entry: {e}")
 
 
-async def update_entry(db: AsyncSession, entry: store_dataset_request.StoreDatasetEntryUpdate):
+async def update_entry(db: AsyncSession, entry: asset_dataset_store.AssetDatasetStoreUpdate):
     """
     Update an existing entry.
     """
@@ -64,7 +69,7 @@ async def update_entry(db: AsyncSession, entry: store_dataset_request.StoreDatas
         await db.execute(stmt)
         await db.commit()
     except SQLAlchemyError as e:
-        db.rollback()
+        await db.rollback()
         traceback.print_exc()
         raise RuntimeError(f"Error while updating entry: {e}")
 
@@ -79,25 +84,25 @@ async def update_entry_lifecycle(db: AsyncSession, id: uuid.UUID):
         await db.execute(stmt)
         await db.commit()
     except SQLAlchemyError as e:
-        db.rollback()
+        await db.rollback()
         traceback.print_exc()
         raise RuntimeError(f"Error while updating entry lifecycle: {e}")
 
 
-async def get_entry_by_id(db: AsyncSession, id: uuid.UUID) -> store_dataset_request.StoreDatasetEntry:
+async def get_entry_by_id(db: AsyncSession, id: uuid.UUID) -> asset_dataset_store.AssetDatasetStore:
     """
     Retrieve an entry by its ID.
     """
     stmt = select(StoreDatasetEntry).where(StoreDatasetEntry.id == id)
     result = await db.execute(stmt)
-    return store_dataset_request.StoreDatasetEntry.model_validate(result.first())
+    return asset_dataset_store.AssetDatasetStore.model_validate(result.first())
 
 
 async def search_entries(
     db: AsyncSession,
-    request_path: store_dataset_request.StoreDatasetRequestPath,
-    request_query: store_dataset_request.StoreDatasetEntrySearch
-) -> List[store_dataset_request.StoreDatasetEntry]:
+    request_path: asset_dataset_store.StoreAssetDatasetPath,
+    request_query: asset_dataset_store.StoreAssetDatasetQuery
+) -> List[asset_dataset_store.AssetDatasetStore]:
     """
     Search for entries based on optional criteria.
     """
@@ -109,7 +114,7 @@ async def search_entries(
     ).outerjoin(
         joined_table, StoreDatasetEntry.id == joined_table.dataset_id
     ).where(
-        StoreDatasetEntry.symbol == request_path.symbol
+        StoreDatasetEntry.asset_symbol == request_path.asset_symbol
     )
 
     # Apply filters to the subquery
@@ -127,7 +132,7 @@ async def search_entries(
 
     return [
         entry.to_validated_schema(
-            store_dataset_request.StoreDatasetEntry,
+            asset_dataset_store.AssetDatasetStore,
             additional={"expiry": expiry, "item_count": item_count}
         )
         for entry, expiry, item_count in entries
@@ -145,6 +150,6 @@ async def delete_entry_by_id(db: AsyncSession, id: uuid.UUID):
         if result == 0:
             raise ValueError(f"No entry found with ID {id}")
     except SQLAlchemyError as e:
-        db.rollback()
+        await db.rollback()
         traceback.print_exc()
         raise RuntimeError(f"Error while deleting entry with ID {id}: {e}")

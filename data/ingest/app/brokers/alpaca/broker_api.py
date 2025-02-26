@@ -1,8 +1,6 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
-from typing import List
-from uuid import UUID
+from typing import Callable, List, Tuple, Type
 
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.models.bars import Bar, BarSet
@@ -24,7 +22,8 @@ from common.logging import get_logger
 from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
 from schemas.data_ingest.get_dataset_request import StockDatasetRequest
 from schemas.data_store.stock.market_activity_data import (
-    StockDataMarketActivityCreate, BatchStockDataMarketActivityCreate)
+    StockDataMarketActivityCreate, BatchStockDataMarketActivityCreate, StockDataMarketActivityData
+)
 
 log = get_logger(__name__)
 
@@ -33,24 +32,12 @@ ALPACA_SIP_ENABLED = get_env_var('ALPACA_SIP_ENABLED')
 # Configure Alpaca Client
 API_KEY = get_env_var('ALPACA_API_KEY')
 API_SECRET = get_env_var('ALPACA_API_SECRET')
+# TODO this should probably be wrapped to utilize dependency injection base on source selection
 __CLIENT = StockHistoricalDataClient(API_KEY, API_SECRET)
 
 
-def convert_bar_to_schema(
-    data: Bar, dataset_id: UUID, symbol: str, source: DataSource, asset_type: AssetType,
-    granularity: Granularity, expiry: datetime = None
-) -> StockDataMarketActivityCreate:
-    return StockDataMarketActivityCreate(
-        dataset_id=dataset_id,
-
-        asset_type=asset_type,
-        source=source,
-        symbol=symbol,
-
-        timestamp=data.timestamp,
-        granularity=granularity,
-        expiry=expiry,
-
+def convert_bar_to_schema(data: Bar) -> StockDataMarketActivityCreate:
+    return StockDataMarketActivityData(
         open=data.open,
         high=data.high,
         low=data.low,
@@ -63,8 +50,55 @@ def convert_bar_to_schema(
     )
 
 
+def convert_bars_to_batch_schema(
+    batch_response: BatchStockDataMarketActivityCreate, request: StockDatasetRequest, stock_bars: BarSet
+) -> List[StockDataMarketActivityCreate]:
+    stock_symbol = request.asset_symbol
+    if stock_symbol not in stock_bars.data:
+        log.warning(f"Symbol {stock_symbol} not found in bar set")
+        return []
+
+    latest_expiry = request.expiry
+    bars: List[Bar] = \
+        stock_bars[stock_symbol] if isinstance(stock_bars[stock_symbol], list) else [stock_bars[stock_symbol]]
+
+    log.debug(f"bars: {len(bars)}")
+    for bar in bars:
+        batch_response.append_data(
+            DataType.MARKET_ACTIVITY,
+            convert_bar_to_schema(bar),
+            bar.timestamp,
+            latest_expiry
+        )
+        latest_expiry = expiry_inc(latest_expiry, request.expiry_type, request.granularity)
+
+
 def create_stock_quote(data: Quote, symbol: str, granularity: Granularity, source: DataSource) -> None:
     return None
+
+
+def match_client_request(asset_type: AssetType, data_type: DataType, request_latest: bool) -> Tuple[Callable, Type]:
+    match (asset_type, data_type, request_latest):
+        ### STOCK ###
+        ## MARKET ACTIVITY ##
+        case (AssetType.STOCK, DataType.MARKET_ACTIVITY, False):
+            return __CLIENT.get_stock_bars, StockBarsRequest
+        case (AssetType.STOCK, DataType.MARKET_ACTIVITY, True):
+            return __CLIENT.get_stock_latest_bar, StockLatestBarRequest
+        ## QUOTE ##
+        case (AssetType.STOCK, DataType.QUOTE, False):
+            return __CLIENT.get_stock_quotes, StockQuotesRequest
+        case (AssetType.STOCK, DataType.QUOTE, True):
+            return __CLIENT.get_stock_latest_quote, StockLatestQuoteRequest
+        ## TRADE ##
+        case (AssetType.STOCK, DataType.TRADE, False):
+            return __CLIENT.get_stock_trades, StockTradesRequest
+        case (AssetType.STOCK, DataType.TRADE, True):
+            return __CLIENT.get_stock_latest_trade, StockLatestTradeRequest
+        ### CRYPTO ###
+        ### OPTION ###
+        case (_, _):
+            raise NotImplementedError(f"{asset_type} - {data_type} not implemented")
 
 
 async def get_market_stock_data(
@@ -72,7 +106,7 @@ async def get_market_stock_data(
 ) -> BatchStockDataMarketActivityCreate:
     granularity = AlpacaGranularity.from_granularity(request.granularity).broker_code
     params = {
-        "symbol_or_symbols": request.symbol,
+        "symbol_or_symbols": request.asset_symbol,
         "timeframe": granularity,
         "start": request.start.isoformat(),
         "end": request.end.isoformat() if request.end is not None else None,
@@ -87,29 +121,15 @@ async def get_market_stock_data(
     if "start" not in params and "end" not in params:
         latest = True
 
-    if DataType.MARKET_ACTIVITY in request.data_types:
-        if latest is True:
-            task = loop.run_in_executor(executor, __CLIENT.get_stock_latest_bar, StockLatestBarRequest(**params))
-        else:
-            task = loop.run_in_executor(executor, __CLIENT.get_stock_bars, StockBarsRequest(**params))
-        tasks.append(task)
-        response_map[DataType.MARKET_ACTIVITY] = len(tasks) - 1
+    for data_type in request.data_types:
+        if data_type in response_map:
+            log.warning(f"Duplicate data type found: {data_type}")
+            continue
 
-    if DataType.QUOTE in request.data_types:
-        if latest is True:
-            task = loop.run_in_executor(executor, __CLIENT.get_stock_latest_quote, StockLatestQuoteRequest(**params))
-        else:
-            task = loop.run_in_executor(executor, __CLIENT.get_stock_quotes, StockQuotesRequest(**params))
+        client_request, client_request_type = match_client_request(AssetType.STOCK, data_type, latest)
+        task = loop.run_in_executor(executor, client_request, client_request_type(**params))
         tasks.append(task)
-        response_map[DataType.QUOTE] = len(tasks) - 1
-
-    if DataType.TRADE in request.data_types:
-        if latest is True:
-            task = loop.run_in_executor(executor, __CLIENT.get_stock_latest_trade, StockLatestTradeRequest(**params))
-        else:
-            task = loop.run_in_executor(executor, __CLIENT.get_stock_trades, StockTradesRequest(**params))
-        tasks.append(task)
-        response_map[DataType.TRADE] = len(tasks) - 1
+        response_map[data_type] = len(tasks) - 1
 
     try:
         results = await asyncio.gather(*tasks)
@@ -118,29 +138,18 @@ async def get_market_stock_data(
         # TODO better error handling
         return {}
 
-    symbol = request.symbol.upper()
-    batch_data = BatchStockDataMarketActivityCreate(data={})
+    batch_response = BatchStockDataMarketActivityCreate(
+        dataset_id=request.dataset_id,
+        asset_symbol=request.asset_symbol,
+        source=request.source,
+        granularity=request.granularity,
+        dataset={}
+    )
     if DataType.MARKET_ACTIVITY in response_map:
-        stock_bars: BarSet = results[response_map[DataType.MARKET_ACTIVITY]]
-        latest_expiry = request.expiry
-
-        if symbol in stock_bars.data:
-            bars = stock_bars[symbol] if isinstance(stock_bars[symbol], list) else [stock_bars[symbol]]
-            dataset: List[StockDataMarketActivityCreate] = []
-            for bar in bars:
-                dataset.append(
-                    convert_bar_to_schema(
-                        bar,
-                        request.dataset_id,
-                        symbol,
-                        request.source,
-                        AssetType.STOCK,
-                        request.granularity,
-                        latest_expiry
-                    )
-                )
-                latest_expiry = expiry_inc(latest_expiry, request.expiry_type, request.granularity)
-            batch_data.data[DataType.MARKET_ACTIVITY] = dataset
+        convert_bars_to_batch_schema(
+            batch_response, request, results[response_map[DataType.MARKET_ACTIVITY]]
+        )
+        log.debug(f"dataset bars: {len(batch_response.dataset[DataType.MARKET_ACTIVITY])}")
     if DataType.QUOTE in response_map:
         raise NotImplementedError("Quotes not implemented")
         # stock_quotes: QuoteSet = results[response_map[DataType.QUOTE]]
@@ -159,4 +168,4 @@ async def get_market_stock_data(
         # log.debug(f" trade results: {len(stock_trades[symbol])}")
         # log.debug(f"    last: {stock_trades}")
 
-    return batch_data
+    return batch_response

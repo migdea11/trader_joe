@@ -1,10 +1,10 @@
-from enum import Enum
+from enum import StrEnum
 from typing import Generic, Type, TypeVar, Self
 
 T = TypeVar("T")
 
 
-class ExchangeCode(str, Enum):
+class ExchangeCode(StrEnum):
     AMEX = "A"         # NYSE American (formerly AMEX)
     ARCA = "P"         # NYSE Arca
     BATS = "B"         # BATS Exchange

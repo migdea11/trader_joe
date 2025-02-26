@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.concurrency import asynccontextmanager
 
-from common.app_lifecycle import startup_logs, teardown_logs
+from common.app_lifecycle import init_debugger, startup_logs, teardown_logs
 from common.kafka.kafka_config import get_consumer_params
 from common.kafka.messaging.kafka_consumer import KafkaConsumerFactory
 from common.kafka.messaging.kafka_producer import KafkaProducerFactory
@@ -20,6 +20,7 @@ async def lifespan(app: FastAPI):
     # Init Common Endpoints
     # Using different app for REST latency, ensuring test isn't affected by client and server are on the same thread.
     initialize_latency_server(app, STORE_APP_NAME, STORE_APP_PORT, ConsumerGroup.COMMON_GROUP)
+    init_debugger()
 
     startup_logs(app)
     SharedWorkerPool.worker_startup()

@@ -1,7 +1,8 @@
 from fastapi import FastAPI
 from typing import TYPE_CHECKING
 
-from common.environment import get_run_mode
+from common.enums.config_enum import RunMode
+from common.environment import get_env_var, get_run_mode
 from common.logging import get_logger
 
 if TYPE_CHECKING:
@@ -22,6 +23,15 @@ def startup_logs(app: FastAPI):
     route: 'Route'
     for route in app.routes:
         log.info(f"  Path: {route.path}, Method(s): {route.methods}, Name: {route.name}")
+
+
+def init_debugger():
+    """Initialize debug mode"""
+    if get_run_mode() is RunMode.DEV:
+        debug_internal_port = get_env_var("APP_INTERNAL_DEBUG_PORT", cast_type=int)
+        log.info(f"Initializing debugger to port {debug_internal_port}...")
+        import debugpy
+        debugpy.listen(("0.0.0.0", debug_internal_port))
 
 
 def teardown_logs(app: FastAPI):

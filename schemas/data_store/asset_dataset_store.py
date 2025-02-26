@@ -6,12 +6,12 @@ from typing import Optional
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Granularity, ExpiryType, UpdateType
 from common.logging import get_logger
-from routers.data_store.app_endpoints import ASSET_DATA_ID_DESC, ASSET_TYPE_DESC, DATA_TYPE_DESC, SYMBOL_DESC
+from routers.data_store.app_endpoints import ASSET_DATASET_ID_DESC, ASSET_TYPE_DESC, DATA_TYPE_DESC, SYMBOL_DESC
 
 log = get_logger(__name__)
 
 
-class StoreDatasetRequestBody(BaseModel):
+class StoreAssetDatasetBody(BaseModel):
     source: DataSource
 
     granularity: Granularity
@@ -23,7 +23,7 @@ class StoreDatasetRequestBody(BaseModel):
     update_type: Optional[UpdateType] = UpdateType.STATIC
 
     @model_validator(mode="after")
-    def validate_fields(cls, request: 'StoreDatasetRequestBody') -> 'StoreDatasetRequestBody':
+    def validate_fields(cls, request: 'StoreAssetDatasetBody') -> 'StoreAssetDatasetBody':
         log.debug(f"Validating request: {request}")
         if request.end is not None and request.start is None:
             raise ValueError("The 'start' field is required when 'end' is provided.")
@@ -54,21 +54,17 @@ class StoreDatasetRequestBody(BaseModel):
         # extra = "forbid"
 
 
-class StoreDatasetRequestPath(BaseModel):
+class StoreAssetDatasetPath(BaseModel):
     asset_type: AssetType = Field(..., description=ASSET_TYPE_DESC)
-    symbol: str = Field(..., description=SYMBOL_DESC)
     data_type: DataType = Field(..., description=DATA_TYPE_DESC)
+    asset_symbol: str = Field(..., description=SYMBOL_DESC)
 
-    @field_validator("symbol")
+    @field_validator("asset_symbol")
     def uppercase_item_id(cls, value: str) -> str:
         return value.upper()
 
 
-class StoreDatasetRequestById(BaseModel):
-    dataset_id: UUID = Field(..., description=ASSET_DATA_ID_DESC)
-
-
-class StoreDatasetEntrySearch(BaseModel):
+class StoreAssetDatasetQuery(BaseModel):
     # Same as body, but with optional fields
     source: Optional[DataSource] = None
     granularity: Optional[Granularity] = None
@@ -99,22 +95,30 @@ class StoreDatasetEntrySearch(BaseModel):
         # extra = "forbid"
 
 
-class StoreDatasetEntryCreate(StoreDatasetRequestPath, StoreDatasetRequestBody):
+class AssetDatasetStoreCreate(StoreAssetDatasetPath, StoreAssetDatasetBody):
     pass
 
 
-class StoreDatasetEntryUpdate(StoreDatasetEntryCreate):
+class AssetDatasetStoreUpdate(AssetDatasetStoreCreate):
+    id: UUID = Field(..., description=ASSET_DATASET_ID_DESC)
+
+
+class AssetDatasetStoreGetById(BaseModel):
+    id: UUID = Field(..., description=ASSET_DATASET_ID_DESC)
+
+
+class AssetDatasetStoreDelete(BaseModel):
+    id: UUID = Field(..., description=ASSET_DATASET_ID_DESC)
+
+
+class AssetDatasetStore(AssetDatasetStoreUpdate):
     id: UUID
 
+    item_count: int
+    expiry: Optional[datetime] = None
 
-class StoreDatasetEntryInDb(StoreDatasetEntryUpdate):
     created_at: datetime
     updated_at: datetime
 
     class Config:
         from_attributes = True
-
-
-class StoreDatasetEntry(StoreDatasetEntryInDb):
-    item_count: int
-    expiry: Optional[datetime] = None

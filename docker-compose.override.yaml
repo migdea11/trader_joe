@@ -5,6 +5,8 @@ services:
       target: dev_image
       args:
         SERVICE: store
+    ports:
+      - "${DATA_STORE_DEBUG_PORT}:${APP_INTERNAL_DEBUG_PORT}"
     volumes:
       - ./data/store/app:/code/data/store/app
       - ./common:/code/common
@@ -18,6 +20,8 @@ services:
       target: dev_image
       args:
         SERVICE: ingest
+    ports:
+      - "${DATA_INGEST_DEBUG_PORT}:${APP_INTERNAL_DEBUG_PORT}"
     volumes:
       - ./data/ingest/app:/code/data/ingest/app
       - ./common:/code/common

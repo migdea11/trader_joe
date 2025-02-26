@@ -1,13 +1,13 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class DataType(str, Enum):
+class DataType(StrEnum):
     MARKET_ACTIVITY = "market-activity"
     QUOTE = "quote"
     TRADE = "trade"
 
 
-class AssetType(str, Enum):
+class AssetType(StrEnum):
     STOCK = "stock"
     CRYPTO = "crypto"
     OPTION = "option"

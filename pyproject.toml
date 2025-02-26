@@ -34,6 +34,7 @@ data-ingest = [
 data-store = [
     "alembic>=1.14.1",
     "asyncpg>=0.30.0",
+    "psycopg2-binary>=2.9.10",
     "sqlalchemy>=2.0.37",
 ]
 
@@ -45,6 +46,7 @@ exclude = [
     ".venv",
     ".vscode",
     "__pypackages__",
+    "data/store/migrations/versions/*",
 ]
 
 line-length = 120
@@ -52,6 +54,7 @@ indent-width = 4
 
 [tool.ruff.lint]
 # select = ["E4", "E7", "E9", "F", "B", "C", "Q"]
+extend-select = ["TC", "E501"]
 ignore = []
 
 # Allow fix for all enabled rules (when `--fix`) is provided.
@@ -60,12 +63,9 @@ unfixable = []
 
 # Allow unused variables when underscore-prefixed.
 dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
-extend-select = ["E501"]
 
 [tool.ruff.format]
-quote-style = "double"
 indent-style = "space"
 skip-magic-trailing-comma = false
-line-ending = "auto"
 docstring-code-format = false
 # docstring-code-line-length = "dynamic"
