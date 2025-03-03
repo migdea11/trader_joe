@@ -6,7 +6,6 @@ from routers.data_store import (
     internal_asset_data
 )
 
-
 app = FastAPI(lifespan=lifespan)
 app.include_router(ping.router)
 app.include_router(internal_asset_data.router)

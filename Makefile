@@ -17,7 +17,7 @@ $(VENV_MARKER):  ## Internal option to create virtual environment
 	touch $(VENV_MARKER)
 
 build: $(VENV_MARKER)  ## Build the Docker images
-	docker-compose build
+	docker-compose  -f docker-compose.yaml build
 
 launch-deps: $(VENV_MARKER)  ## Launch dependency containers
 	docker-compose up -d postgres kafka pgadmin redpanda
@@ -27,6 +27,9 @@ launch: launch-deps  ## Launch production services
 
 launch-down:  ## Stop all services
 	docker-compose down
+
+dev-build: $(VENV_MARKER)  ## Build the Docker images for development
+	docker-compose -f docker-compose.yaml -f docker-compose.override.yaml build
 
 dev-launch: launch-deps  ## Launch development services
 	docker-compose -f docker-compose.yaml -f docker-compose.override.yaml up data_store data_ingest

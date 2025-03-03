@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from common.environment import get_env_var
 
 # Configure Worker Threads
-EXECUTOR_WORKERS = get_env_var('EXECUTOR_WORKERS', cast_type=int)
+EXECUTOR_THREADS = get_env_var('EXECUTOR_THREADS', cast_type=int)
 
 
 class SharedWorkerPool:
@@ -14,7 +14,7 @@ class SharedWorkerPool:
     def worker_startup(cls):
         """Initialize the worker pool."""
         if cls.__executor is None:
-            cls.__executor = ThreadPoolExecutor(max_workers=EXECUTOR_WORKERS)
+            cls.__executor = ThreadPoolExecutor(max_workers=EXECUTOR_THREADS)
 
     @classmethod
     def worker_shutdown(cls):

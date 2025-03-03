@@ -1,4 +1,4 @@
-from typing import Any, Callable, Coroutine, Dict, List, Self
+from typing import Any, Callable, Coroutine, Dict, List
 from common.kafka.kafka_config import RpcParams
 from common.kafka.messaging.kafka_consumer import KafkaConsumerFactory
 from common.kafka.rpc.kafka_rpc_base import RpcEndpoint, RpcRequest
@@ -120,7 +120,7 @@ class KafkaRpcFactory:
         def shutdown(self):
             self._consumer_factory.shutdown()
 
-    def init_servers(self) -> Self:
+    def init_servers(self) -> RpcServers:
         """Initialize all RPC servers.
 
         Raises:

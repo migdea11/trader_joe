@@ -79,9 +79,10 @@ services:
       - ./data/store/.env
     environment:
       - DATABASE_URI=${DATABASE_URI:-postgresql://postgres:password@db:5432/postgres}
-      - LOG_LEVEL=info
+    image: trader_joe_data_store:prod
     depends_on:
       - postgres
+      - kafka
 
   data_ingest:
     build:
@@ -96,7 +97,6 @@ services:
     env_file:
       - .env
       - ./data/ingest/.env
-    environment:
-      - LOG_LEVEL=info
+    image: trader_joe_data_ingest:prod
     depends_on:
       - kafka
