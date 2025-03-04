@@ -10,8 +10,16 @@ help:  ## Show this help message
 		/^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
 
-$(VENV_MARKER):  ## Internal option to create virtual environment
-	uv venv  # Create virtual environment
+$(VENV_MARKER):  ## Internal option to install uv and create a virtual environment
+	UV_VERSION=0.6.4
+	if  [[ ! $(which uv) ]]; then
+		curl -LsSf https://astral.sh/uv/install.sh | sh -s -- --version $UV_VERSION
+	else
+		[[ $(uv --version) == $UV_VERSION ]] || uv self update $UV_VERSION
+	fi
+	[[ -d .venv ]] || uv venv
+
+init $(VENV_MARKER):  ## Initialize the project
 	source .venv/bin/activate
 	uv sync --all-groups
 	touch $(VENV_MARKER)
@@ -50,7 +58,7 @@ lint-fix:  ## Lint the project and fix
 	uv run ruff check --fix .
 
 test: lint  ## Run tests
-	uv run pytest  # Run Pytest for tests
+	uv run pytest
 
 test-cov: lint  ## Run tests with coverage
 	uv run coverage run -m pytest

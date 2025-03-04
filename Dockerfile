@@ -5,7 +5,7 @@ ARG SERVICE_NAME=none
 WORKDIR /code
 
 # Install common dependencies
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.6.4. /uv /bin/uv
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
 ENV PYTHONPATH="/code"
 ENV PATH="/code/.venv/bin:${PATH}"

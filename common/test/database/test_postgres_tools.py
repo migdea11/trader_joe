@@ -7,6 +7,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from psycopg2 import OperationalError
 from asyncpg import CannotConnectNowError
 from sqlalchemy.engine.url import URL
+
+# Set environment variables
+import os
+os.environ["POSTGRES_ASYNC"] = "True"
+os.environ["POSTGRES_SYNC"] = "True"
+
 from common.database.postgres_tools import PostgresSessionFactory
 
 

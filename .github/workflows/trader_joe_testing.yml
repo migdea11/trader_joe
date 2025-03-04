@@ -1,0 +1,39 @@
+name: Trader Joe Testing
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  testing:
+    name: Testing
+    runs-on: ubuntu-latest
+    container: debian:bookworm-slim
+    env:
+      UV_LINK_MODE: copy
+      POSTGRES_ASYNC: true
+      POSTGRES_SYNC: true
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install UV
+      uses: astral-sh/setup-uv@v5
+      with:
+        # Install a specific version of uv.
+        version: "0.6.4"
+
+    - name: Install dependencies
+      run: |
+        uv sync --all-groups --locked
+    - name: Run Ruff Linting
+      run: |
+        uv run ruff check .
+    - name: Run Unit Tests
+      run: |
+        uv run pytest -s
