@@ -1,6 +1,5 @@
 import importlib
 from logging.config import fileConfig
-from pathlib import Path
 
 from alembic import context
 from dotenv import load_dotenv
@@ -25,13 +24,18 @@ config.set_main_option('sqlalchemy.url', database_uri)
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-models_dir = Path('/code/data/store/app/database/models')
-print(f"Scanning models directory: {models_dir}")
-for filename in models_dir.iterdir():
-    if filename.suffix == ".py" and filename.stem not in ("__init__", "alembic_base"):
-        module_name = f"data.store.app.database.models.{filename.stem}"
-        print(f"found: {module_name}")
-        importlib.import_module(module_name)
+ALLOWED_MODELS = {
+    "base_market_activity",
+    "stock_market_activity",
+    "store_dataset_entry"
+}
+for model_name in ALLOWED_MODELS:
+    try:
+        importlib.import_module(f"data.store.app.database.models.{model_name}")  # nosem
+        print(f"Successfully imported {model_name}")
+    except ImportError as e:
+        print(f"Failed to import {model_name}: {e}")
+
 target_metadata = AppBase.DATA_STORE_BASE.metadata
 print(f"Registered tables: {AppBase.DATA_STORE_BASE.metadata.tables.keys()}")
 

@@ -2,7 +2,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from common.test.fixtures.environment import mock_get_env_var
+from common.tests.fixtures.environment import mock_get_env_var
 
 
 @pytest.fixture(autouse=True)

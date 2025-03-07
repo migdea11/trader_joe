@@ -28,10 +28,11 @@ def startup_logs(app: FastAPI):
 def init_debugger():
     """Initialize debug mode"""
     if get_run_mode() is RunMode.DEV:
+        debug_internal_host = get_env_var("APP_INTERNAL_DEBUG_HOST", cast_type=str)
         debug_internal_port = get_env_var("APP_INTERNAL_DEBUG_PORT", cast_type=int)
         log.info(f"Initializing debugger to port {debug_internal_port}...")
         import debugpy
-        debugpy.listen(("0.0.0.0", debug_internal_port))
+        debugpy.listen((debug_internal_host, debug_internal_port))
 
 
 def teardown_logs(app: FastAPI):

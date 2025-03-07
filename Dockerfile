@@ -45,6 +45,10 @@ FROM debian:bookworm-slim AS base_deploy_image
 ARG SERVICE_PATH=none
 ARG SERVICE_NAME=none
 
+# User setup
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+USER appuser
+
 # Setup environment
 WORKDIR /code
 ENV PYTHONPATH="/code"

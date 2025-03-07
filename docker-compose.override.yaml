@@ -3,6 +3,7 @@ services:
   data_store:
     build:
       target: dev_image
+    read_only: true
     volumes:
       - ./data/store/app:/code/data/store/app
       - ./common:/code/common

@@ -37,6 +37,12 @@ data-store = [
     "psycopg2-binary>=2.9.10",
     "sqlalchemy>=2.0.37",
 ]
+security = [
+    "bandit>=1.8.3",
+    "pip-audit>=2.8.0",
+    "safety>=3.2.9",
+    "semgrep>=1.111.0",
+]
 
 [tool.ruff]
 exclude = [

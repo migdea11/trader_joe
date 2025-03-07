@@ -54,8 +54,17 @@ clean: launch-down  ## Clean up the project
 lint: $(VENV_MARKER)  ## Lint the project
 	uv run ruff check .
 
+SOURCE_DIRS :=./common ./router ./schemas ./data
 lint-fix:  ## Lint the project and fix
 	uv run ruff check --fix .
+
+security: $(VENV_MARKER)  ## Check security vulnerabilities
+	uv run bandit -r $(SOURCE_DIRS) --exclude tests/
+	uv run semgrep --config=auto --exclude=tests/ --exclude=.venv --exclude=docker-compose.override.yaml .
+	uv export --all-groups --no-group dev --no-group testing --no-group security --locked --format requirements-txt > requirements.txt
+	# uv run safety scan --file requirements.txt
+	uv run pip-audit -r requirements.txt --disable-pip
+	rm requirements.txt
 
 test: lint  ## Run tests
 	uv run pytest

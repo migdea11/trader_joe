@@ -14,6 +14,9 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASS}
     volumes:
       - ${DATA_DIR:-./volume_data}/postgres:/var/lib/postgresql/data
+    security_opt:
+      - "no-new-privileges:true"
+    read_only: true
 
   pgadmin:
     image: dpage/pgadmin4:latest
@@ -27,6 +30,9 @@ services:
       - postgres
     volumes:
       - ${DATA_DIR:-./volume_data}/pgadmin:/var/lib/postgresql/data
+    security_opt:
+      - "no-new-privileges:true"
+    read_only: true
 
   kafka:
     image: confluentinc/cp-kafka:latest
@@ -51,6 +57,9 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
     volumes:
       - ${DATA_DIR:-./volume_data}/kafka:/var/lib/kafka/
+    security_opt:
+      - "no-new-privileges:true"
+    read_only: true
 
   redpanda:
     image: docker.redpanda.com/redpandadata/console:latest
@@ -60,6 +69,9 @@ services:
       - KAFKA_BROKERS=kafka:9092
     depends_on:
       - kafka
+    security_opt:
+      - "no-new-privileges:true"
+    read_only: true
 
   data_store:
     build:
@@ -80,6 +92,9 @@ services:
     environment:
       - DATABASE_URI=${DATABASE_URI:-postgresql://postgres:password@db:5432/postgres}
     image: trader_joe_data_store:prod
+    security_opt:
+      - "no-new-privileges:true"
+    read_only: true
     depends_on:
       - postgres
       - kafka
@@ -98,5 +113,8 @@ services:
       - .env
       - ./data/ingest/.env
     image: trader_joe_data_ingest:prod
+    security_opt:
+      - "no-new-privileges:true"
+    read_only: true
     depends_on:
       - kafka
