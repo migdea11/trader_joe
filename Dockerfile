@@ -5,7 +5,7 @@ ARG SERVICE_NAME=none
 WORKDIR /code
 
 # Install common dependencies
-COPY --from=ghcr.io/astral-sh/uv:0.6.4. /uv /bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.6.4 /uv /uvx /bin/
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
 ENV PYTHONPATH="/code"
 ENV PATH="/code/.venv/bin:${PATH}"
@@ -46,7 +46,7 @@ ARG SERVICE_PATH=none
 ARG SERVICE_NAME=none
 
 # User setup
-RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
 USER appuser
 
 # Setup environment

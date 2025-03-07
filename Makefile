@@ -37,10 +37,10 @@ launch-down:  ## Stop all services
 	docker-compose down
 
 dev-build: $(VENV_MARKER)  ## Build the Docker images for development
-	docker-compose -f docker-compose.yaml -f docker-compose.override.yaml build
+	docker compose -f docker-compose.yaml -f docker-compose.override.yaml build
 
 dev-launch: launch-deps  ## Launch development services
-	docker-compose -f docker-compose.yaml -f docker-compose.override.yaml up data_store data_ingest
+	docker compose -f docker-compose.yaml -f docker-compose.override.yaml up data_store data_ingest
 
 dev-prune: ## Prune development services
 	docker container prune -f && docker volume prune -f && docker image prune -f
