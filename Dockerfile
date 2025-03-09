@@ -2,6 +2,10 @@
 FROM debian:bookworm-slim AS base_build_image
 ARG SERVICE_PATH=none
 ARG SERVICE_NAME=none
+
+# User setup
+RUN addgroup --system appgroup && adduser --ingroup appgroup appuser
+USER appuser
 WORKDIR /code
 
 # Install common dependencies
@@ -46,7 +50,7 @@ ARG SERVICE_PATH=none
 ARG SERVICE_NAME=none
 
 # User setup
-RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
+RUN addgroup --system appgroup && adduser --ingroup appgroup appuser
 USER appuser
 
 # Setup environment
@@ -55,7 +59,7 @@ ENV PYTHONPATH="/code"
 ENV PATH="/code/.venv/bin/:${PATH}"
 
 # Setup service execution
-COPY --from=service_build_image /root/.local/share/uv/python /root/.local/share/uv/python
+COPY --from=service_build_image /home/appuser/.local/share/uv/python /home/appuser/.local/share/uv/python
 ENV APP_MODULE="${SERVICE_PATH}.${SERVICE_NAME}.app.main:app"
 CMD ["/code/entrypoint.sh"]
 

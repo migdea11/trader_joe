@@ -14,7 +14,7 @@ env:
 
 jobs:
   testing:
-    name: Testing
+    name: Linting and Unit Testing
     runs-on: ubuntu-latest
     container: debian:bookworm-slim
     env:
@@ -103,17 +103,55 @@ jobs:
     - name: Build Images
       run: |
         docker compose -f docker-compose.yaml build
+        docker images  # List built images
 
-    - name: Push Data Store Image
+    - name: Save Images as Artifacts
       run: |
-        docker tag trader_joe_data_store ghcr.io/${{ github.repository_owner }}/trader_joe_data_store:${{ env.SHORT_SHA }}
-        docker tag trader_joe_data_store ghcr.io/${{ github.repository_owner }}/trader_joe_data_store:latest
-        docker push ghcr.io/${{ github.repository_owner }}/trader_joe_data_store:${{ env.SHORT_SHA }}
-        docker push ghcr.io/${{ github.repository_owner }}/trader_joe_data_store:latest
+        docker save -o trader_joe_data_store.tar trader_joe_data_store
+        docker save -o trader_joe_data_ingest.tar trader_joe_data_ingest
 
-    - name: Push Data Ingest Image
-      run: |
-        docker tag trader_joe_data_ingest ghcr.io/${{ github.repository_owner }}/trader_joe_data_ingest:${{ env.SHORT_SHA }}
-        docker tag trader_joe_data_ingest ghcr.io/${{ github.repository_owner }}/trader_joe_data_ingest:latest
-        docker push ghcr.io/${{ github.repository_owner }}/trader_joe_data_ingest:${{ env.SHORT_SHA }}
-        docker push ghcr.io/${{ github.repository_owner }}/trader_joe_data_ingest:latest
+    - name: Upload Images as Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: docker-images
+        path: |
+          docker-compose.yaml
+          trader_joe_data_store.tar
+          trader_joe_data_ingest.tar
+
+  system:
+    name: System Testing
+    runs-on: ubuntu-latest
+    needs:
+      - build
+
+    steps:
+      - name: Download Docker Images
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images
+
+      - name: Load Docker Images
+        run: |
+          docker load -i trader_joe_data_store.tar
+          docker load -i trader_joe_data_ingest.tar
+          docker images  # Verify images are loaded
+
+      - name: Start Docker Compose
+        run: |
+          docker compose -f docker-compose.yaml up -d
+          docker ps  # Verify containers are running
+
+    # - name: Push Data Store Image
+    #   run: |
+    #     docker tag trader_joe_data_store ghcr.io/${{ github.repository_owner }}/trader_joe_data_store:${{ env.SHORT_SHA }}
+    #     docker tag trader_joe_data_store ghcr.io/${{ github.repository_owner }}/trader_joe_data_store:latest
+    #     docker push ghcr.io/${{ github.repository_owner }}/trader_joe_data_store:${{ env.SHORT_SHA }}
+    #     docker push ghcr.io/${{ github.repository_owner }}/trader_joe_data_store:latest
+
+    # - name: Push Data Ingest Image
+    #   run: |
+    #     docker tag trader_joe_data_ingest ghcr.io/${{ github.repository_owner }}/trader_joe_data_ingest:${{ env.SHORT_SHA }}
+    #     docker tag trader_joe_data_ingest ghcr.io/${{ github.repository_owner }}/trader_joe_data_ingest:latest
+    #     docker push ghcr.io/${{ github.repository_owner }}/trader_joe_data_ingest:${{ env.SHORT_SHA }}
+    #     docker push ghcr.io/${{ github.repository_owner }}/trader_joe_data_ingest:latest

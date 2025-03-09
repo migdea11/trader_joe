@@ -5,6 +5,7 @@
 # Environments
 .env
 .venv/
+.python-version
 
 # Make
 .venv_init
