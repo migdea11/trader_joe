@@ -65,7 +65,7 @@ services:
       - ./data/store/.env
     environment:
       - DATABASE_URI=${DATABASE_URI:-postgresql://postgres:password@db:5432/postgres}
-    image: trader_joe_data_store:prod
+    image: trader_joe_data_store:latest
     security_opt:
       - "no-new-privileges:true"
     read_only: true
@@ -86,7 +86,7 @@ services:
     env_file:
       - .env
       - ./data/ingest/.env
-    image: trader_joe_data_ingest:prod
+    image: trader_joe_data_ingest:latest
     security_opt:
       - "no-new-privileges:true"
     read_only: true

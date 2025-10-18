@@ -8,8 +8,10 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 env:
+  UV_VERSION: "0.9.3"
   SOURCE_PATHS: "./common ./router ./schemas ./data"
 
 jobs:
@@ -26,10 +28,9 @@ jobs:
     - uses: actions/checkout@v4
 
     - name: Install UV
-      uses: astral-sh/setup-uv@v5
+      uses: astral-sh/setup-uv@v6
       with:
-        # Install a specific version of uv.
-        version: "0.6.4"
+        version: "${{ env.UV_VERSION }}"
 
     - name: Install dependencies
       run: |
@@ -44,15 +45,13 @@ jobs:
   security:
     name: Security Checks
     runs-on: ubuntu-latest
-    container: debian:bookworm-slim
     steps:
     - uses: actions/checkout@v4
 
     - name: Install UV
-      uses: astral-sh/setup-uv@v5
+      uses: astral-sh/setup-uv@v6
       with:
-        # Install a specific version of uv.
-        version: "0.6.4"
+        version: "${{ env.UV_VERSION }}"
 
     - name: Install Security Group
       run: |
@@ -85,19 +84,25 @@ jobs:
     needs:
       - testing
       - security
+    outputs:
+      BRANCH_NAME: ${{ steps.branch_name.outputs.BRANCH_NAME }}
+      IMAGE_STORE: ${{ steps.push_store.outputs.IMAGE }}
+      IMAGE_INGEST: ${{ steps.push_ingest.outputs.IMAGE }}
 
     steps:
     - uses: actions/checkout@v4
 
     - name: Get Branch Name
       id: branch_name
-      run: echo "BRANCH_NAME=${GITHUB_REF##*/}" >> $GITHUB_ENV
+      run: |
+        # set as a step output so other jobs can consume it
+        echo "BRANCH_NAME=${GITHUB_REF##*/}" >> $GITHUB_OUTPUT
 
     - name: Get Commit Hash
       id: commit_hash
       run: echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
 
-    - name: Log in to GitHub Container Registry (GHCR)
+    - name: Registry Login
       uses: docker/login-action@v3
       with:
         registry: ghcr.io
@@ -106,22 +111,46 @@ jobs:
 
     - name: Build Images
       run: |
+        cp .env.default .env
+        cp data/ingest/.env.default data/ingest/.env
+        cp data/store/.env.default data/store/.env
         docker compose -f docker-compose.yaml build
         docker images  # List built images
 
-    - name: Save Images as Artifacts
+    - name: Push Image - Data Store
+      id: push_store
       run: |
-        docker save -o trader_joe_data_store.tar trader_joe_data_store
-        docker save -o trader_joe_data_ingest.tar trader_joe_data_ingest
+        # tag with short sha and push to GHCR
+        IMAGE_STORE=ghcr.io/${{ github.repository_owner }}/trader_joe_data_store:${SHORT_SHA}
+        docker tag trader_joe_data_store $IMAGE_STORE
+        docker push $IMAGE_STORE
+        echo "IMAGE=$IMAGE_STORE" >> $GITHUB_OUTPUT
 
-    - name: Upload Images as Artifacts
+    - name: Push Image - Data Ingest
+      id: push_ingest
+      run: |
+        IMAGE_INGEST=ghcr.io/${{ github.repository_owner }}/trader_joe_data_ingest:${SHORT_SHA}
+        docker tag trader_joe_data_ingest $IMAGE_INGEST
+        docker push $IMAGE_INGEST
+        echo "IMAGE=$IMAGE_INGEST" >> $GITHUB_OUTPUT
+
+    - name: Setup Pipeline Configs
+      run: |
+        mkdir -p artifact
+        cp docker-compose.yaml artifact/
+        cp .env.default artifact/.env.default
+
+        mkdir -p artifact/data/ingest artifact/data/store
+        cp data/ingest/.env.default artifact/data/ingest/.env.default
+        cp data/store/.env.default artifact/data/store/.env.default
+        ls -lahR artifact/
+
+    - name: Push Pipeline Configs
       uses: actions/upload-artifact@v4
       with:
-        name: docker-images-${{ env.BRANCH_NAME }}
-        path: |
-          docker-compose.yaml
-          trader_joe_data_store.tar
-          trader_joe_data_ingest.tar
+        name: pipeline-configs-${{ steps.branch_name.outputs.BRANCH_NAME }}
+        path: artifact/
+        include-hidden-files: true
 
   system:
     name: System Testing
@@ -130,21 +159,63 @@ jobs:
       - build
 
     steps:
-      - name: Download Docker Images
-        uses: actions/download-artifact@v4
+      - name: Registry Login
+        uses: docker/login-action@v3
         with:
-          name: docker-images-${{ env.BRANCH_NAME }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Load Docker Images
+      - name: Pull Pipeline Configs
+        uses: actions/download-artifact@v5
+        with:
+          name: pipeline-configs-${{ needs.build.outputs.BRANCH_NAME }}
+          path: artifact
+
+      - name: Stage Pipeline Configs
         run: |
-          docker load -i trader_joe_data_store.tar
-          docker load -i trader_joe_data_ingest.tar
+          ls -lahR artifact/
+          cp artifact/docker-compose.yaml ./docker-compose.yaml
+          cp artifact/.env.default ./.env
+
+          mkdir -p data/ingest
+          cp artifact/data/ingest/.env.default data/ingest/.env
+          mkdir -p data/store
+          cp artifact/data/store/.env.default data/store/.env
+
+
+      - name: Pull Docker Images
+        run: |
+          echo "Pulling ${{ needs.build.outputs.IMAGE_STORE }}"
+          docker pull ${{ needs.build.outputs.IMAGE_STORE }}
+          echo "Pulling ${{ needs.build.outputs.IMAGE_INGEST }}"
+          docker pull ${{ needs.build.outputs.IMAGE_INGEST }}
+
+          docker tag ${{ needs.build.outputs.IMAGE_STORE }} trader_joe_data_store
+          docker tag ${{ needs.build.outputs.IMAGE_INGEST }} trader_joe_data_ingest
           docker images  # Verify images are loaded
 
-      - name: Start Docker Compose
+      - name: Add Runtime Configs
         run: |
+          cat >> data/ingest/.env <<EOF
+          ALPACA_API_KEY=${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET=${{ secrets.ALPACA_API_SECRET }}
+          EOF
+          chmod 600 data/ingest/.env
+          cat data/ingest/.env
+
+      - name: Start System
+        run: |
+          ls -lah
           docker compose -f docker-compose.yaml up -d
           docker ps  # Verify containers are running
+
+      - name: Clean Runtime Configs
+        if: always()
+        run: |
+          shred -u .env || rm -f .env
+          shred -u data/ingest/.env || rm -f data/ingest/.env
+          shred -u data/store/.env || rm -f data/store/.env
 
     # - name: Push Data Store Image
     #   run: |

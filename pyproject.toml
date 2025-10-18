@@ -11,37 +11,39 @@ default-groups = ["base", "dev", "testing"]
 
 [dependency-groups]
 base = [
-    "aenum>=3.1.15",
-    "fastapi[standard]>=0.115.8",
+    "aenum>=3.1.16",
+    # pin a safe minimum for starlette. Remove once fastapi update is available.
+    "starlette>=0.47.2",
+    "fastapi>=0.119.0", # revert to standard once semgrep issue resolved
     "httpx>=0.28.1",
     "kafka-python-ng>=2.2.3",
-    "pydantic>=2.10.6",
-    "python-dotenv>=1.0.1",
-    "uvicorn[standard]>=0.34.0",
+    "pydantic>=2.12.3",
+    "python-dotenv>=1.1.1",
+    "uvicorn[standard]>=0.37.0",
 ]
 dev = [
-    "debugpy>=1.8.12",
+    "debugpy>=1.8.17",
 ]
 testing = [
-    "ruff>=0.9.4",
-    "pytest>=8.3.4",
-    "pytest-asyncio>=0.25.3",
-    "pytest-cov>=6.0.0",
+    "ruff>=0.14.1",
+    "pytest>=8.4.2",
+    "pytest-asyncio>=1.2.0",
+    "pytest-cov>=7.0.0",
 ]
 data-ingest = [
-    "alpaca-py>=0.38.0",
+    "alpaca-py>=0.42.2",
 ]
 data-store = [
-    "alembic>=1.14.1",
+    "alembic>=1.17.0",
     "asyncpg>=0.30.0",
-    "psycopg2-binary>=2.9.10",
-    "sqlalchemy>=2.0.37",
+    "psycopg2-binary>=2.9.11",
+    "sqlalchemy>=2.0.44",
 ]
 security = [
-    "bandit>=1.8.3",
-    "pip-audit>=2.8.0",
-    "safety>=3.2.9",
-    "semgrep>=1.111.0",
+    "bandit>=1.8.6",
+    "pip-audit>=2.9.0",
+    "safety>=3.6.2",
+    "semgrep>=1.140.0",
 ]
 
 [tool.ruff]
