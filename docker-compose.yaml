@@ -15,23 +15,6 @@ services:
       - ${DATA_DIR:-./volume_data}/postgres:/var/lib/postgresql/data
     security_opt:
       - "no-new-privileges:true"
-    read_only: true
-
-  pgadmin:
-    image: dpage/pgadmin4:latest
-    container_name: pgadmin
-    ports:
-      - "${POSTGRES_UI_PORT}:80"  # Map the container's port 80 to localhost:5050
-    environment:
-      PGADMIN_DEFAULT_EMAIL: admin@admin.com
-      PGADMIN_DEFAULT_PASSWORD: admin
-    depends_on:
-      - postgres
-    volumes:
-      - ${DATA_DIR:-./volume_data}/pgadmin:/var/lib/postgresql/data
-    security_opt:
-      - "no-new-privileges:true"
-    read_only: true
 
   kafka:
     image: confluentinc/cp-kafka:latest
@@ -58,19 +41,11 @@ services:
       - ${DATA_DIR:-./volume_data}/kafka:/var/lib/kafka/
     security_opt:
       - "no-new-privileges:true"
-    read_only: true
+    # kafka needs to write config/state during startup (e.g. /etc/kafka),
+    # keep the service writable. Setting the whole container read_only prevents
+    # startup scripts from creating files and causes checks like
+    # "/usr/local/bin/dub path /etc/kafka/ writable" to fail.
 
-  redpanda:
-    image: docker.redpanda.com/redpandadata/console:latest
-    ports:
-      - "${BROKER_UI_PORT}:8080"
-    environment:
-      - KAFKA_BROKERS=kafka:9092
-    depends_on:
-      - kafka
-    security_opt:
-      - "no-new-privileges:true"
-    read_only: true
 
   data_store:
     build:

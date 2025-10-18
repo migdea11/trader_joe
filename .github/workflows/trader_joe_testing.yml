@@ -89,6 +89,10 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Get Branch Name
+      id: branch_name
+      run: echo "BRANCH_NAME=${GITHUB_REF##*/}" >> $GITHUB_ENV
+
     - name: Get Commit Hash
       id: commit_hash
       run: echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
@@ -113,7 +117,7 @@ jobs:
     - name: Upload Images as Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: docker-images
+        name: docker-images-${{ env.BRANCH_NAME }}
         path: |
           docker-compose.yaml
           trader_joe_data_store.tar
@@ -129,7 +133,7 @@ jobs:
       - name: Download Docker Images
         uses: actions/download-artifact@v4
         with:
-          name: docker-images
+          name: docker-images-${{ env.BRANCH_NAME }}
 
       - name: Load Docker Images
         run: |
