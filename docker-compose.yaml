@@ -1,6 +1,9 @@
 services:
   postgres:
-    image: postgres:13
+    # Pinned to an exact patch AND base OS: PGDATA is a bind mount, so a silent base-OS
+    # bump would change glibc and with it the collation version of every text index.
+    # 13 went EOL 2025-11-13; bump deliberately (tj-owduw0).
+    image: postgres:17.11-trixie
     container_name: ${DATABASE_NAME}
     ports:
       - "${DATABASE_PORT}:5432"
@@ -17,7 +20,10 @@ services:
       - "no-new-privileges:true"
 
   kafka:
-    image: confluentinc/cp-kafka:latest
+    # Confluent Platform 7.9.x == Apache Kafka 3.9.x. Held on the 3.x line on purpose:
+    # Kafka 4.0 removed the old protocol api versions (KIP-896) that kafka-python-ng
+    # still sends, so moving to cp-kafka 8.x needs the client swap first (tj-q65ux6).
+    image: confluentinc/cp-kafka:7.9.10
     container_name: ${BROKER_NAME}
     ports:
       - "${BROKER_PORT}:9092"
