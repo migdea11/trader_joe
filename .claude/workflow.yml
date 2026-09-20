@@ -81,7 +81,7 @@ agents:
 
   - name: builder-shared
     role: builder
-    scope: [common, schemas, routers/common, pyproject.toml, uv.lock, Dockerfile, entrypoint.sh, docker-compose.yaml, docker-compose.override.yaml, Makefile, .github]
+    scope: [common, schemas, routers/common, pyproject.toml, uv.lock, Dockerfile, entrypoint.sh, docker-compose.yaml, docker-compose.override.yaml, Makefile, .github, .gitignore, pytest.ini, .dockerignore, .env.default]
     model: opus
     slots:
       do_not: "Do not refactor inside another builder's scope without filing the follow-up task for that builder. Do not add a dependency without proposing it first. Do not weaken a security control to make a build pass."
