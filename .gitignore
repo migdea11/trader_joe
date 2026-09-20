@@ -33,3 +33,6 @@ coverage.xml
 .beads-credential-key
 .beads/proxieddb/
 *.gate.lock*
+
+# Scratch output from the prepare-pr skill
+.claude/publish/
