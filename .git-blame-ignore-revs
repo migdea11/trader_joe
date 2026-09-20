@@ -1,0 +1,11 @@
+# Revisions to skip when running `git blame`.
+#
+# Enable locally with:
+#     git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# Only whole-tree, formatting-only commits belong here.
+
+# [builder-shared] style(build-infra): apply ruff format across the repo
+# Repo-wide reformat when the project ruff config was adopted (tj-isypb9):
+# single quotes and no magic trailing comma. No behaviour change.
+f965b1ca48c95bbcf89e0b290180f7afb09ab6e6
