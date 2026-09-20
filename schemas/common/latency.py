@@ -6,19 +6,19 @@ from pydantic import BaseModel
 from common.kafka.rpc.kafka_rpc_base import BaseRpcAck
 
 
-LATENCY_TYPE_DESC = "Type of latency to measure"
-LOOP_DESC = "Number of times to measure latency"
-PAYLOAD_SIZE_DESC = "Size of payload to send"
+LATENCY_TYPE_DESC = 'Type of latency to measure'
+LOOP_DESC = 'Number of times to measure latency'
+PAYLOAD_SIZE_DESC = 'Size of payload to send'
 
 
 class LatencyRequest(BaseModel):
     class LatencyType(str, Enum):
-        REST = "rest"
-        RPC_KAFKA = "rpc_kafka"
+        REST = 'rest'
+        RPC_KAFKA = 'rpc_kafka'
 
-    latency_type: LatencyType = Path(..., title="Latency type", description=LATENCY_TYPE_DESC)
-    iterations: int | None = Query(..., title="Iterations", description=LOOP_DESC)
-    payload_size: int | None = Query(..., title="Payload size", description=PAYLOAD_SIZE_DESC)
+    latency_type: LatencyType = Path(..., title='Latency type', description=LATENCY_TYPE_DESC)
+    iterations: int | None = Query(..., title='Iterations', description=LOOP_DESC)
+    payload_size: int | None = Query(..., title='Payload size', description=PAYLOAD_SIZE_DESC)
 
 
 class LatencyResponse(BaseRpcAck):

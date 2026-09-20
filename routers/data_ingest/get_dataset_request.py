@@ -29,9 +29,7 @@ rpc = KafkaRpcFactory(get_rpc_params(ConsumerGroup.DATA_INGEST_GROUP))
 
 
 @rpc.add_server(InterfaceRpc.INGEST_DATASET)
-async def store_data(
-    request: GetDatasetRequest
-) -> BatchStockDataMarketActivityCreate:
+async def store_data(request: GetDatasetRequest) -> BatchStockDataMarketActivityCreate:
     asset_map: dict[AssetType, tuple[type[BaseModel], Any]] = {
         AssetType.STOCK: (StockDatasetRequest, store_retrieve_stock),
         AssetType.CRYPTO: (CryptoDatasetRequest, store_retrieve_crypto),

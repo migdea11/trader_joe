@@ -19,6 +19,7 @@ def test_worker_startup(mock_executor):
     mock_executor.return_value = mock_executor_instance
 
     from common.worker_pool import SharedWorkerPool
+
     SharedWorkerPool.worker_startup()
     mock_executor.assert_called_once_with(max_workers=5)
 

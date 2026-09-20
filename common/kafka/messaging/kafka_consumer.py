@@ -20,6 +20,7 @@ log = get_logger(__name__)
 
 class KafkaConsumerFactory:
     """Factory that manages the creation and lifecycle of Kafka consumers."""
+
     __KAFKA_ADMIN_CLIENT: KafkaAdminClient = None
     _KAFKA_SUB_INSTANCES: ClassVar[list] = []
 
@@ -36,7 +37,7 @@ class KafkaConsumerFactory:
         for consumer in cls._KAFKA_SUB_INSTANCES:
             consumer.close()
         cls._KAFKA_SUB_INSTANCES.clear()
-        log.info("Kafka consumer shutdown.")
+        log.info('Kafka consumer shutdown.')
 
     @classmethod
     def release(cls, consumer: KafkaConsumer):
@@ -49,12 +50,7 @@ class KafkaConsumerFactory:
         cls._KAFKA_SUB_INSTANCES.remove(consumer)
 
     @classmethod
-    def wait_for_kafka(
-        cls,
-        clientParams: ConsumerParams,
-        partitions: int = 1,
-        replicas: int = 1
-    ) -> bool:
+    def wait_for_kafka(cls, clientParams: ConsumerParams, partitions: int = 1, replicas: int = 1) -> bool:
         """Wait for Kafka to be ready before creating a consumer.
 
         Args:
@@ -72,29 +68,27 @@ class KafkaConsumerFactory:
         while True:
             try:
                 if cls.__KAFKA_ADMIN_CLIENT is None:
-                    cls.__KAFKA_ADMIN_CLIENT = KafkaAdminClient(
-                        bootstrap_servers=clientParams.get_url()
-                    )
+                    cls.__KAFKA_ADMIN_CLIENT = KafkaAdminClient(bootstrap_servers=clientParams.get_url())
 
                 topics = cls.__KAFKA_ADMIN_CLIENT.list_topics()
                 consumer_topics = []
                 for topic in clientParams.topics:
                     if topic.value not in topics:
-                        log.debug(f"Creating topic: {topic.value}")
+                        log.debug(f'Creating topic: {topic.value}')
                         if isinstance(topic, StaticTopic):
                             cls.__KAFKA_ADMIN_CLIENT.create_topics(
                                 new_topics=[NewTopic(topic.value, partitions, replicas)]
                             )
                         else:
-                            raise ValueError(f"Unknown topic type: {topic}")
+                            raise ValueError(f'Unknown topic type: {topic}')
                     consumer_topics.append(topic.value)
                 break
             except KafkaError:
                 elapsed_time = time.time() - start_time
                 if elapsed_time >= clientParams.timeout:
-                    log.error(f"Failed to connect to Kafka after {clientParams.timeout} seconds.")
+                    log.error(f'Failed to connect to Kafka after {clientParams.timeout} seconds.')
                     return False
-                log.debug("Waiting for Kafka to be ready...")
+                log.debug('Waiting for Kafka to be ready...')
                 time.sleep(5)
         return True
 
@@ -114,21 +108,22 @@ class KafkaConsumerFactory:
             *consumer_topics,
             bootstrap_servers=clientParams.get_url(),
             group_id=clientParams.consumer_group.value,
-            auto_offset_reset="earliest",
-            enable_auto_commit=clientParams.enable_auto_commit
+            auto_offset_reset='earliest',
+            enable_auto_commit=clientParams.enable_auto_commit,
         )
         cls._KAFKA_SUB_INSTANCES.append(consumer)
         return consumer
 
     class ConsumerControl:
         """Wrapper class used to manage consumer lifecycle and message processing."""
+
         def __init__(
             self,
             executor: ThreadPoolExecutor,
             consumer_params: ConsumerParams,
             callback: Callable[[ConsumerRecord], Coroutine[Any, Any, bool]],
             commit_batch_size: int,
-            commit_batch_interval: int
+            commit_batch_interval: int,
         ):
             """Initialize the ConsumerControl instance.
 
@@ -161,16 +156,15 @@ class KafkaConsumerFactory:
             try:
                 message: ConsumerRecord
                 for message in self.consumer:
-
-                    log.debug(f"Received message from: {message.topic}")
+                    log.debug(f'Received message from: {message.topic}')
                     success = asyncio.run(self.callback(message))
 
                     if success:
                         # Track the latest offset for this partition
                         partition = TopicPartition(message.topic, message.partition)
-                        batch_offsets[partition] = OffsetAndMetadata(message.offset + 1, "")
+                        batch_offsets[partition] = OffsetAndMetadata(message.offset + 1, '')
                     else:
-                        log.warning(limit(f"Failed to process message: {message.value}"))
+                        log.warning(limit(f'Failed to process message: {message.value}'))
 
                     # Commit offsets if the batch size is reached for any partition
                     time_limit_reached = time.time() - batch_start_time >= self.commit_batch_interval
@@ -180,7 +174,7 @@ class KafkaConsumerFactory:
                         batch_offsets.clear()
 
             except Exception as e:
-                log.error(f"Error consuming messages, exiting consumer: {e}")
+                log.error(f'Error consuming messages, exiting consumer: {e}')
                 traceback.print_exc()
 
     def add_async_consumer(
@@ -204,11 +198,11 @@ class KafkaConsumerFactory:
             ValueError: No topics specified for consumer.
         """
         log.info(
-            f"Adding consumer {consumer_params.consumer_group.value} for topics: "
-            f"{[topic.value for topic in consumer_params.topics]}"
+            f'Adding consumer {consumer_params.consumer_group.value} for topics: '
+            f'{[topic.value for topic in consumer_params.topics]}'
         )
         if consumer_params.topics is None or len(consumer_params.topics) == 0:
-            raise ValueError("No topics specified for consumer")
+            raise ValueError('No topics specified for consumer')
         control = self.ConsumerControl(executor, consumer_params, callback, commit_batch_size, commit_batch_interval)
         self.__async_instances[consumer_params.get_key()] = control
         control.start()

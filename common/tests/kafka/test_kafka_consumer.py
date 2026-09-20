@@ -16,12 +16,12 @@ from common.kafka.topics import ConsumerGroup, StaticTopic
 def consumer_params():
     """Fixture to create mock ConsumerParams."""
     return ConsumerParams(
-        host="localhost",
+        host='localhost',
         port=9092,
         topics=[StaticTopic.STOCK_MARKET_ACTIVITY],
         consumer_group=ConsumerGroup.DATA_STORE_GROUP,
         timeout=0.1,
-        auto_commit=False
+        auto_commit=False,
     )
 
 
@@ -39,7 +39,7 @@ def test_release():
     assert mock_consumer not in KafkaConsumerFactory._KAFKA_SUB_INSTANCES
 
 
-@patch("common.kafka.messaging.kafka_consumer.KafkaConsumer")
+@patch('common.kafka.messaging.kafka_consumer.KafkaConsumer')
 def test_consume_messages_async(mock_kafka_consumer, consumer_params):
     """Test the consume_messages_async method to ensure it processes messages correctly."""
     # Mock the consumer
@@ -48,7 +48,7 @@ def test_consume_messages_async(mock_kafka_consumer, consumer_params):
 
     # Mock a ConsumerRecord
     mock_message = MagicMock(spec=ConsumerRecord)
-    mock_message.topic = "test-topic"
+    mock_message.topic = 'test-topic'
     mock_message.partition = 0
     mock_message.offset = 10
 
@@ -69,7 +69,7 @@ def test_consume_messages_async(mock_kafka_consumer, consumer_params):
                 consumer_params=consumer_params,
                 callback=mock_callback,
                 commit_batch_size=1,
-                commit_batch_interval=5
+                commit_batch_interval=5,
             )
 
     # Run the async test
@@ -79,7 +79,7 @@ def test_consume_messages_async(mock_kafka_consumer, consumer_params):
     mock_consumer_instance.commit.assert_called_once_with(offsets={})
 
 
-@patch("common.kafka.messaging.kafka_consumer.KafkaConsumer")
+@patch('common.kafka.messaging.kafka_consumer.KafkaConsumer')
 def test_consume_messages_async_failed_callback(mock_kafka_consumer, consumer_params):
     """Test consume_messages_async with a callback that fails to process a message."""
     # Mock the consumer
@@ -88,7 +88,7 @@ def test_consume_messages_async_failed_callback(mock_kafka_consumer, consumer_pa
 
     # Mock a ConsumerRecord
     mock_message = MagicMock(spec=ConsumerRecord)
-    mock_message.topic = "test-topic"
+    mock_message.topic = 'test-topic'
     mock_message.partition = 0
     mock_message.offset = 10
 
@@ -108,7 +108,7 @@ def test_consume_messages_async_failed_callback(mock_kafka_consumer, consumer_pa
                 consumer_params=consumer_params,
                 callback=mock_callback_failure,
                 commit_batch_size=1,
-                commit_batch_interval=5
+                commit_batch_interval=5,
             )
 
     # Run the async test
@@ -118,8 +118,8 @@ def test_consume_messages_async_failed_callback(mock_kafka_consumer, consumer_pa
     mock_consumer_instance.commit.assert_not_called()
 
 
-@patch("common.kafka.messaging.kafka_consumer.NewTopic")
-@patch("common.kafka.messaging.kafka_consumer.KafkaAdminClient")
+@patch('common.kafka.messaging.kafka_consumer.NewTopic')
+@patch('common.kafka.messaging.kafka_consumer.KafkaAdminClient')
 def test_wait_for_kafka(mock_admin_client, mock_new_topic, consumer_params: ConsumerParams):
     """Test the wait_for_kafka method to ensure topics are created if missing."""
     # Mock the admin client

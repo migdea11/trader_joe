@@ -47,9 +47,8 @@ def convert_bar_to_schema(data: Bar) -> StockDataMarketActivityCreate:
         close=data.close,
         volume=data.volume,
         trade_count=data.trade_count,
-
         split_factor=1,
-        dividends_factor=1
+        dividends_factor=1,
     )
 
 
@@ -58,21 +57,17 @@ def convert_bars_to_batch_schema(
 ) -> list[StockDataMarketActivityCreate]:
     stock_symbol = request.asset_symbol
     if stock_symbol not in stock_bars.data:
-        log.warning(f"Symbol {stock_symbol} not found in bar set")
+        log.warning(f'Symbol {stock_symbol} not found in bar set')
         return []
 
     latest_expiry = request.expiry
-    bars: list[Bar] = \
+    bars: list[Bar] = (
         stock_bars[stock_symbol] if isinstance(stock_bars[stock_symbol], list) else [stock_bars[stock_symbol]]
+    )
 
-    log.debug(f"bars: {len(bars)}")
+    log.debug(f'bars: {len(bars)}')
     for bar in bars:
-        batch_response.append_data(
-            DataType.MARKET_ACTIVITY,
-            convert_bar_to_schema(bar),
-            bar.timestamp,
-            latest_expiry
-        )
+        batch_response.append_data(DataType.MARKET_ACTIVITY, convert_bar_to_schema(bar), bar.timestamp, latest_expiry)
         latest_expiry = expiry_inc(latest_expiry, request.expiry_type, request.granularity)
 
 
@@ -101,7 +96,7 @@ def match_client_request(asset_type: AssetType, data_type: DataType, request_lat
         ### CRYPTO ###
         ### OPTION ###
         case (_, _):
-            raise NotImplementedError(f"{asset_type} - {data_type} not implemented")
+            raise NotImplementedError(f'{asset_type} - {data_type} not implemented')
 
 
 async def get_market_stock_data(
@@ -109,24 +104,24 @@ async def get_market_stock_data(
 ) -> BatchStockDataMarketActivityCreate:
     granularity = AlpacaGranularity.from_granularity(request.granularity).broker_code
     params = {
-        "symbol_or_symbols": request.asset_symbol,
-        "timeframe": granularity,
-        "start": request.start.isoformat(),
-        "end": request.end.isoformat() if request.end is not None else None,
+        'symbol_or_symbols': request.asset_symbol,
+        'timeframe': granularity,
+        'start': request.start.isoformat(),
+        'end': request.end.isoformat() if request.end is not None else None,
     }
-    log.debug(f"params: {params}")
+    log.debug(f'params: {params}')
 
     tasks = []
     loop = asyncio.get_running_loop()
     results = None
     response_map = {}
     latest = False
-    if "start" not in params and "end" not in params:
+    if 'start' not in params and 'end' not in params:
         latest = True
 
     for data_type in request.data_types:
         if data_type in response_map:
-            log.warning(f"Duplicate data type found: {data_type}")
+            log.warning(f'Duplicate data type found: {data_type}')
             continue
 
         client_request, client_request_type = match_client_request(AssetType.STOCK, data_type, latest)
@@ -146,15 +141,13 @@ async def get_market_stock_data(
         asset_symbol=request.asset_symbol,
         source=request.source,
         granularity=request.granularity,
-        dataset={}
+        dataset={},
     )
     if DataType.MARKET_ACTIVITY in response_map:
-        convert_bars_to_batch_schema(
-            batch_response, request, results[response_map[DataType.MARKET_ACTIVITY]]
-        )
-        log.debug(f"dataset bars: {len(batch_response.dataset[DataType.MARKET_ACTIVITY])}")
+        convert_bars_to_batch_schema(batch_response, request, results[response_map[DataType.MARKET_ACTIVITY]])
+        log.debug(f'dataset bars: {len(batch_response.dataset[DataType.MARKET_ACTIVITY])}')
     if DataType.QUOTE in response_map:
-        raise NotImplementedError("Quotes not implemented")
+        raise NotImplementedError('Quotes not implemented')
         # stock_quotes: QuoteSet = results[response_map[DataType.QUOTE]]
 
         # if symbol in stock_quotes.data:
@@ -166,7 +159,7 @@ async def get_market_stock_data(
         #         ).model_dump_json() for quote in quotes
         #     ]
     if DataType.TRADE in response_map:
-        raise NotImplementedError("Trades not implemented")
+        raise NotImplementedError('Trades not implemented')
         # stock_trades = results[response_map[DataType.TRADE]]
         # log.debug(f" trade results: {len(stock_trades[symbol])}")
         # log.debug(f"    last: {stock_trades}")

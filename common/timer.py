@@ -4,6 +4,7 @@ from uuid import UUID, uuid4
 
 class Timer:
     """Timer util to help measure time taken for a block of code to execute."""
+
     def __init__(self):
         self.start: dict[UUID, float] = {}
         self._latest_key = None
@@ -58,6 +59,7 @@ def timeit(timer: Timer):
     Args:
         timer (Timer): Timer instance to use.
     """
+
     def decorator(func):
         def wrapper(*args, **kwargs):
             # Use the provided Timer instance
@@ -65,5 +67,7 @@ def timeit(timer: Timer):
             result = func(*args, **kwargs)
             timer.tock(key)
             return result
+
         return wrapper
+
     return decorator

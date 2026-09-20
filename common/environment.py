@@ -28,9 +28,9 @@ def get_env_var(var_name: str, default: type[T] | None = None, cast_type: type[T
             try:
                 var = cast_type(var)
             except ValueError as e:
-                log.error(f"Failed to cast {var_name} to {cast_type}: {e}")
+                log.error(f'Failed to cast {var_name} to {cast_type}: {e}')
                 if default is not None:
-                    log.info(f"Using default value: {default}")
+                    log.info(f'Using default value: {default}')
                     var = default
                 else:
                     raise
@@ -43,4 +43,4 @@ def get_run_mode() -> str:
     Returns:
         str: Run mode.
     """
-    return get_env_var("RUN_MODE", default=RunMode.DEV, cast_type=RunMode)
+    return get_env_var('RUN_MODE', default=RunMode.DEV, cast_type=RunMode)

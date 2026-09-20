@@ -13,12 +13,14 @@ from routers.data_store.app_endpoints import ASSET_DATA_ID_DESC, ASSET_DATASET_I
 DT = TypeVar('DT')  # Data Type
 QT = TypeVar('QT')  # Query Type
 
+
 class _AssetDataType(BaseModel, Generic[DT], ABC):
     """Basic Data for a financial asset.
 
     Args:
         Generic (DT): The data type for the asset.
     """
+
     timestamp: datetime
     expiry: datetime | None
     data: DT
@@ -31,24 +33,26 @@ class _AssetDataType(BaseModel, Generic[DT], ABC):
 
 class _AssetIdentifier(BaseModel, ABC):
     """Basic Identifiers for a financial asset's data."""
+
     asset_symbol: str
     source: DataSource
     granularity: Granularity
 
-    @field_validator("asset_symbol")
+    @field_validator('asset_symbol')
     def uppercase_item_id(cls, value: str) -> str:
         return value.upper()
 
 
 class _AssetIdentifierQuery(BaseModel, ABC):
     """Similar to _AssetIdentifier but with optional fields for querying data."""
+
     asset_symbol: str
 
     source: DataSource | None
     granularity: Granularity | None
     dataset_id: UUID | None
 
-    @field_validator("asset_symbol")
+    @field_validator('asset_symbol')
     def uppercase_item_id(cls, value: str | None) -> str:
         return value.upper()
 
@@ -59,6 +63,7 @@ class _AssetDataQuery(BaseModel, Generic[QT], ABC):
     Args:
         Generic (QT): The query type for the asset.
     """
+
     start: datetime | None
     end: datetime | None
     expiry: datetime | None
@@ -67,6 +72,7 @@ class _AssetDataQuery(BaseModel, Generic[QT], ABC):
 
 class AssetDataPath(BaseModel):
     """Asset Properties, as path to identify the endpoint for the desired data and asset type."""
+
     asset_type: AssetType = Field(..., description=ASSET_TYPE_DESC)
     data_type: DataType = Field(..., description=DATA_TYPE_DESC)
 
@@ -78,6 +84,7 @@ class AssetDataCreate(_AssetIdentifier, _AssetDataType[DT], Generic[DT], ABC):
         _AssetIdentifier: Identifies the asset, data source and granularity.
         _AssetDataType (DT): Data for the asset including asset type specific data
     """
+
     dataset_id: UUID
 
 
@@ -88,6 +95,7 @@ class BatchAssetDataCreate(_AssetIdentifier, Generic[DT], ABC):
         _AssetIdentifier: Identifies the asset, data source and granularity.
         Generic (DT): Data for the asset including asset type specific data
     """
+
     dataset_id: UUID
     dataset: dict[DataType, list[_AssetDataType[DT]]]
 
@@ -104,6 +112,7 @@ class AssetDataUpdate(_AssetIdentifier, _AssetDataType[DT], Generic[DT], ABC):
         _AssetIdentifier: Identifies the asset, data source and granularity.
         _AssetDataType (DT): Data for the asset including asset type specific data
     """
+
     id: int = Field(..., description=ASSET_DATA_ID_DESC)
     dataset_id: UUID
 
@@ -114,6 +123,7 @@ class AssetDataDeleteById(ABC):  # noqa: B024  # marker base for the delete cont
     Args:
         _AssetIdentifier: Identifies the asset, data source and granularity.
     """
+
     dataset_id: UUID = Field(..., description=ASSET_DATASET_ID_DESC)
 
 
@@ -124,6 +134,7 @@ class AssetDataQuery(_AssetIdentifierQuery, _AssetDataQuery[QT], Generic[QT], AB
         _AssetIdentifierQuery: Queries the asset, data source and granularity.
         _AssetDataQuery (QT): Queries for the asset data, including asset type specific data.
     """
+
     dataset_id: UUID | None
 
 
@@ -134,6 +145,7 @@ class AssetData(_AssetIdentifier, _AssetDataType[DT], Generic[DT], ABC):
         _AssetIdentifier: Identifies the asset, data source and granularity.
         _AssetDataType (DT): Data for the asset including asset type specific data
     """
+
     id: int
     dataset_id: UUID
 

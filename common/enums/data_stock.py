@@ -6,13 +6,13 @@ from common.enums.pydantic_enums import NamedIntEnum
 
 
 class Granularity(StrEnum):
-    ONE_MINUTE = ("1min", timedelta(minutes=1))
-    FIVE_MINUTES = ("5min", timedelta(minutes=5))
-    THIRTY_MINUTES = ("30min", timedelta(minutes=30))
-    ONE_HOUR = ("1hour", timedelta(hours=1))
-    ONE_DAY = ("1day", timedelta(days=1))
-    ONE_WEEK = ("1week", timedelta(weeks=1))
-    ONE_MONTH = ("1month", timedelta(weeks=4))
+    ONE_MINUTE = ('1min', timedelta(minutes=1))
+    FIVE_MINUTES = ('5min', timedelta(minutes=5))
+    THIRTY_MINUTES = ('30min', timedelta(minutes=30))
+    ONE_HOUR = ('1hour', timedelta(hours=1))
+    ONE_DAY = ('1day', timedelta(days=1))
+    ONE_WEEK = ('1week', timedelta(weeks=1))
+    ONE_MONTH = ('1month', timedelta(weeks=4))
 
     def __new__(cls, value: str, offset: timedelta):
         obj = str.__new__(cls, value)  # Ensure the Enum behaves like a str
@@ -28,7 +28,7 @@ class Granularity(StrEnum):
         return self._value_
 
 
-T = TypeVar("T")
+T = TypeVar('T')
 
 
 class BrokerGranularityBase(Generic[T]):
@@ -57,9 +57,7 @@ class BrokerGranularityBase(Generic[T]):
         return self._granularity
 
     @classmethod
-    def from_broker_code(
-        cls: type["BrokerGranularityBase"], broker_code: T
-    ) -> Self:
+    def from_broker_code(cls: type['BrokerGranularityBase'], broker_code: T) -> Self:
         """Find and return the granularity mapping for a given broker-specific.
 
         Args:
@@ -79,9 +77,7 @@ class BrokerGranularityBase(Generic[T]):
         raise ValueError(f"Broker code '{broker_code}' not found in {cls.__name__}")
 
     @classmethod
-    def from_granularity(
-        cls: type["BrokerGranularityBase"], granularity: Granularity
-    ) -> Self:
+    def from_granularity(cls: type['BrokerGranularityBase'], granularity: Granularity) -> Self:
         """Find and return the granularity mapping for a given standardized granularity.
 
         Args:
@@ -102,9 +98,9 @@ class BrokerGranularityBase(Generic[T]):
 
 
 class DataSource(StrEnum):
-    IB_API = "IB"
-    ALPACA_API = "ALPACA"
-    MANUAL_ENTRY = "MANUAL"
+    IB_API = 'IB'
+    ALPACA_API = 'ALPACA'
+    MANUAL_ENTRY = 'MANUAL'
 
 
 class ExpiryType(NamedIntEnum):

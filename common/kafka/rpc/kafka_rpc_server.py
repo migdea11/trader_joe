@@ -21,12 +21,13 @@ class KafkaRpcServer(Generic[Req, Res], KafkaRpcBase[Req, Res]):
         Generic (Req, Res): Request and response types.
         KafkaRpcBase (Req, Res): Base class for RPC servers.
     """
+
     def __init__(
         self,
         kafka_config: RpcParams,
         endpoint: RpcEndpoint[Req, Res],
         rpc_function: Callable[[RpcRequest], Coroutine[Any, Any, Res]],
-        timeout: int = 5
+        timeout: int = 5,
     ):
         """Create a new RPC server.
 
@@ -69,6 +70,6 @@ class KafkaRpcServer(Generic[Req, Res], KafkaRpcBase[Req, Res]):
             KafkaProducerFactory.flush_messages_async(self._executor, self.producer)
             success = True
         except Exception as e:
-            log.error(limit(f"Error processing response: {e}"))
+            log.error(limit(f'Error processing response: {e}'))
             traceback.print_exc()
         return success

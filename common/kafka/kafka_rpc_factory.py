@@ -10,6 +10,7 @@ from common.kafka.rpc.kafka_rpc_server import KafkaRpcServer, Req, Res
 
 class KafkaRpcFactory:
     """Factory that manages the creation and lifecycle of Kafka RPC clients and servers."""
+
     def __init__(self, rpc_params: RpcParams):
         """Create a new KafkaRpcFactory.
 
@@ -34,9 +35,7 @@ class KafkaRpcFactory:
         self._rpc_clients.append(KafkaRpcClient(self.rpc_params, endpoint, timeout))
 
     def add_server(
-        self,
-        endpoint: RpcEndpoint,
-        timeout: int = 5,
+        self, endpoint: RpcEndpoint, timeout: int = 5
     ) -> Callable[[Callable[[RpcRequest], Coroutine[Any, Any, Res]]], Callable[[RpcRequest], Coroutine[Any, Any, Res]]]:
         """Add an RPC server to the provided endpoint definition.
 
@@ -47,8 +46,9 @@ class KafkaRpcFactory:
         Returns:
             Callable[[Callable[[RpcRequest], Coroutine[Any, Any, Res]]], Callable[[RpcRequest], Coroutine[Any, Any, Res]]]: Decorator function.
         """
+
         def decorator(
-            rpc_function: Callable[[RpcRequest], Coroutine[Any, Any, Res]]
+            rpc_function: Callable[[RpcRequest], Coroutine[Any, Any, Res]],
         ) -> Callable[[RpcRequest], Coroutine[Any, Any, Res]]:
             self._rpc_servers.append(KafkaRpcServer(self.rpc_params, endpoint, rpc_function, timeout))
             return rpc_function  # Return the original function unchanged
@@ -57,6 +57,7 @@ class KafkaRpcFactory:
 
     class RpcClients:
         """Handle for Kafka RPC clients."""
+
         def __init__(self):
             self._consumer_factory = KafkaConsumerFactory()
             self._rpc_clients: dict[int, KafkaRpcClient] = {}
@@ -87,7 +88,7 @@ class KafkaRpcFactory:
             """
             client_key = self._client_key(endpoint)
             if client_key not in self._rpc_clients:
-                raise ValueError(f"Client for {endpoint} not found")
+                raise ValueError(f'Client for {endpoint} not found')
             return self._rpc_clients[client_key]
 
         def shutdown(self):
@@ -104,7 +105,7 @@ class KafkaRpcFactory:
             Self: RPC clients Handle.
         """
         if self._clients_running is True:
-            raise RuntimeError("Already initialized")
+            raise RuntimeError('Already initialized')
 
         clients = self.RpcClients()
         for rpc_client in self._rpc_clients:
@@ -132,7 +133,7 @@ class KafkaRpcFactory:
             Self: RPC servers Handle.
         """
         if self._servers_running is True:
-            raise RuntimeError("Already initialized")
+            raise RuntimeError('Already initialized')
 
         rpc_servers = self.RpcServers()
         rpc_servers._rpc_servers = self._rpc_servers
@@ -141,4 +142,3 @@ class KafkaRpcFactory:
 
         self._servers_running = True
         return rpc_servers
-

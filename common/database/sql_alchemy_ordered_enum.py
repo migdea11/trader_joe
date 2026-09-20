@@ -8,13 +8,15 @@ from common.logging import get_logger
 
 
 log = get_logger(__name__)
-S = TypeVar("S")
+S = TypeVar('S')
+
 
 class OrderedEnum(BaseCustomSqlType[S, int]):
     """Enum that maintains an order so its values can be compared.
 
     The order is preserved by having the SQL representation be an integer.
     """
+
     def __init__(self, schema_type: type[S] | None, **kwargs):
         BaseCustomSqlType.__init__(self, schema_type, int)
 
@@ -25,13 +27,13 @@ class OrderedEnum(BaseCustomSqlType[S, int]):
         return True
 
     def to_model_type(self, value: S) -> int:
-        log.debug(f"  Converting {value} to model type")
+        log.debug(f'  Converting {value} to model type')
         if isinstance(value, Enum):
             return value.value
-        raise ValueError(f"Invalid value for IntEnum: {value}")
+        raise ValueError(f'Invalid value for IntEnum: {value}')
 
     def to_schema_type(self, value: int) -> S:
-        log.debug(f"  Converting {value} to schema type")
+        log.debug(f'  Converting {value} to schema type')
         if value is not None:
             return self._model_type(value)
-        raise ValueError(f"Invalid value for IntEnum: {value}")
+        raise ValueError(f'Invalid value for IntEnum: {value}')

@@ -1,4 +1,3 @@
-
 from fastapi import APIRouter, Depends, FastAPI
 
 from common.endpoints import get_endpoint_url
@@ -15,8 +14,8 @@ from schemas.common.latency import InternalLatencyRequest, LatencyRequest
 
 log = get_logger(__name__)
 
-LATENCY_TEST_ENABLED = get_env_var("LATENCY_TEST_ENABLED", default=False, cast_type=bool)
-LATENCY_TEST_TIMEOUT = get_env_var("LATENCY_TEST_TIMEOUT", default=30, cast_type=int)
+LATENCY_TEST_ENABLED = get_env_var('LATENCY_TEST_ENABLED', default=False, cast_type=bool)
+LATENCY_TEST_TIMEOUT = get_env_var('LATENCY_TEST_TIMEOUT', default=30, cast_type=int)
 __PRC_CLIENTS = None
 __RPC_SERVERS = None
 __APP_NAME = None
@@ -27,20 +26,17 @@ def get_latency_topics():
     if not LATENCY_TEST_ENABLED:
         return ()
 
-    return (
-        RpcEndpointTopic.LATENCY_TEST.request,
-        RpcEndpointTopic.LATENCY_TEST.response
-    )
+    return (RpcEndpointTopic.LATENCY_TEST.request, RpcEndpointTopic.LATENCY_TEST.response)
 
 
 def initialize_latency_client(app: FastAPI, app_name: str, app_port: int, client_group: ConsumerGroup):
     if not LATENCY_TEST_ENABLED:
         return
 
-    log.debug("Initializing latency client...")
+    log.debug('Initializing latency client...')
     global __APP_NAME, __APP_PORT
     if __APP_NAME is not None:
-        log.error("Latency test already initialized.")
+        log.error('Latency test already initialized.')
         return
 
     __APP_NAME = app_name
@@ -63,7 +59,7 @@ def initialize_latency_client(app: FastAPI, app_name: str, app_port: int, client
 
         import httpx
 
-        log.debug("Measuring latency...")
+        log.debug('Measuring latency...')
         inner_timer = Timer()
         payload = ''.join(os.urandom(request.payload_size * 1024).hex())
 
@@ -88,10 +84,10 @@ def initialize_latency_client(app: FastAPI, app_name: str, app_port: int, client
         if request.latency_type is LatencyRequest.LatencyType.RPC_KAFKA:
             send_type = send_rpc_kafka
         elif request.latency_type is LatencyRequest.LatencyType.REST:
-            log.debug(f"Sending REST request to {url}")
+            log.debug(f'Sending REST request to {url}')
             send_type = send_rest
         else:
-            return {"success": False, "error": "Invalid latency type"}
+            return {'success': False, 'error': 'Invalid latency type'}
 
         tasks = []
         outer_timer = Timer()
@@ -103,15 +99,15 @@ def initialize_latency_client(app: FastAPI, app_name: str, app_port: int, client
         outer_timer.tock()
         for result in results:
             if result is False:
-                return {"success": False, "error": "Failed to send request"}
+                return {'success': False, 'error': 'Failed to send request'}
         total_time = inner_timer.total_time()
         latency = total_time / (request.iterations or 1)
         return {
-            "success": True,
-            "latency": latency,
-            "mean_latency": total_time,
-            "total_time": outer_timer.total_time(),
-            "iterations": request.iterations or 1
+            'success': True,
+            'latency': latency,
+            'mean_latency': total_time,
+            'total_time': outer_timer.total_time(),
+            'iterations': request.iterations or 1,
         }
 
     app.include_router(router)
@@ -121,10 +117,10 @@ def initialize_latency_server(app: FastAPI, app_name: str, app_port: int, server
     if not LATENCY_TEST_ENABLED:
         return
 
-    log.debug("Initializing latency server...")
+    log.debug('Initializing latency server...')
     global __APP_NAME, __APP_PORT
     if __APP_NAME is not None:
-        log.error("Latency test already initialized.")
+        log.error('Latency test already initialized.')
         return
 
     __APP_NAME = app_name
@@ -145,6 +141,6 @@ def initialize_latency_server(app: FastAPI, app_name: str, app_port: int, server
 
     @router.post(InterfaceRest.INTERNAL_LATENCY)
     async def latency_test(request: InternalLatencyRequest):
-        return {"test": True}
+        return {'test': True}
 
     app.include_router(router)

@@ -33,7 +33,7 @@ class StockDatasetRequest(GetDatasetRequest):
 
     class Config:
         # ignore asset_type
-        extra = "ignore"
+        extra = 'ignore'
 
 
 class CryptoDatasetRequest(StockDatasetRequest):

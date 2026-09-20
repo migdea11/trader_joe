@@ -19,7 +19,7 @@ async def store_retrieve_stock(request: StockDatasetRequest) -> BatchStockDataMa
     if request.source is DataSource.ALPACA_API:
         return await alpaca_market_data(SharedWorkerPool.get_instance(), request)
     else:
-        raise NotImplementedError("Data source not implemented")
+        raise NotImplementedError('Data source not implemented')
 
 
 def store_retrieve_crypto(request: StockDatasetRequest):

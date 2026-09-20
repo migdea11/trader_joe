@@ -29,11 +29,7 @@ async def lifespan(app: FastAPI):
 
     # Init Kafka
     consumer_params = get_consumer_params(
-        [
-            RpcEndpointTopic.STOCK_MARKET_ACTIVITY.request,
-            *get_latency_topics()
-        ],
-        ConsumerGroup.DATA_INGEST_GROUP
+        [RpcEndpointTopic.STOCK_MARKET_ACTIVITY.request, *get_latency_topics()], ConsumerGroup.DATA_INGEST_GROUP
     )
     KafkaConsumerFactory.wait_for_kafka(consumer_params)
 
@@ -41,7 +37,7 @@ async def lifespan(app: FastAPI):
     rpc = get_dataset_request.rpc
     rpc_servers = rpc.init_servers()
 
-    log.info("Data Ingest App Ready!!!")
+    log.info('Data Ingest App Ready!!!')
     yield
 
     teardown_logs(app)

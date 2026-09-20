@@ -21,6 +21,7 @@ class KafkaRpcClient(Generic[Req, Res], KafkaRpcBase[Req, Res]):
         Generic (Req, Res): Request and response types.
         KafkaRpcBase (Req, Res): Base class for RPC clients.
     """
+
     def __init__(self, kafka_config: RpcParams, endpoint: RpcEndpoint[Req, Res], timeout: int = 5):
         """Create a new RPC client.
 
@@ -56,10 +57,10 @@ class KafkaRpcClient(Generic[Req, Res], KafkaRpcBase[Req, Res]):
             if response.correlation_id in self._pending_requests:
                 self._pending_requests[response.correlation_id].set_result(response)
             else:
-                log.warning(limit(f"Received unexpected response: {response.model_dump_json()}"))
+                log.warning(limit(f'Received unexpected response: {response.model_dump_json()}'))
             success = True
         except Exception as e:
-            log.error(limit(f"Error processing response: {e}"))
+            log.error(limit(f'Error processing response: {e}'))
             traceback.print_exc()
         return success
 
@@ -79,13 +80,11 @@ class KafkaRpcClient(Generic[Req, Res], KafkaRpcBase[Req, Res]):
         future = asyncio.get_event_loop().create_future()
         self._pending_requests[request.correlation_id] = future
         topic: StaticTopic = self.endpoint.topic.request
-        KafkaProducerFactory.send_message_async(
-            self._executor, self.producer, topic.value, request.model_dump_json()
-        )
+        KafkaProducerFactory.send_message_async(self._executor, self.producer, topic.value, request.model_dump_json())
         try:
             response: RpcResponse[Res] = await asyncio.wait_for(future, timeout=self._timeout)
             return response.payload
         except TimeoutError as e:
-            raise TimeoutError(f"RPC request timed out after {self._timeout} seconds") from e
+            raise TimeoutError(f'RPC request timed out after {self._timeout} seconds') from e
         finally:
             self._pending_requests.pop(request.correlation_id)

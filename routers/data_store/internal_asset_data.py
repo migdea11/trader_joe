@@ -23,17 +23,16 @@ log = get_logger(__name__)
 
 class UnsupportedAssetType(ValueError):
     def __init__(self, asset_type: AssetType):
-        super().__init__(f"Asset type not supported: {asset_type}")
+        super().__init__(f'Asset type not supported: {asset_type}')
 
-@router.post(
-    AssetDataInterface.POST_ASSET_DATA, response_model=StockDataMarketActivity
-)
+
+@router.post(AssetDataInterface.POST_ASSET_DATA, response_model=StockDataMarketActivity)
 async def create_stock_market_activity_data(
     db: Annotated[AsyncSession, Depends(async_db)],
     asset_path: Annotated[AssetDataPath, Depends()],
-    asset_data: Annotated[dict, Body(...)]
+    asset_data: Annotated[dict, Body(...)],
 ):
-    log.debug(f"Storing data: /{asset_path.asset_type}/{asset_path.data_type}/{asset_path.asset_symbol}")
+    log.debug(f'Storing data: /{asset_path.asset_type}/{asset_path.data_type}/{asset_path.asset_symbol}')
     match (asset_path.asset_type, asset_path.data_type):
         case (AssetType.STOCK, DataType.MARKET_ACTIVITY):
             stock_market_activity = StockDataMarketActivityCreate(**asset_data)
@@ -47,16 +46,16 @@ async def create_stock_market_activity_data(
 async def delete_stock_market_activity_data(
     db: Annotated[AsyncSession, Depends(async_db)],
     asset_path: Annotated[AssetDataPath, Depends()],
-    asset_request: Annotated[list[str], Depends()]
+    asset_request: Annotated[list[str], Depends()],
 ):
     asset_query = asset_request  # dict(asset_request.query_params)
-    log.debug(f"Deleting data: /{asset_path.asset_type}/{asset_path.data_type}")
-    log.debug(f"Query: {asset_query}")
+    log.debug(f'Deleting data: /{asset_path.asset_type}/{asset_path.data_type}')
+    log.debug(f'Query: {asset_query}')
     match (asset_path.asset_type, asset_path.data_type):
         case (AssetType.STOCK, DataType.MARKET_ACTIVITY):
             stock_market_activity = StockDataMarketActivityDeleteById(**asset_query)
             await crud_stock_market_activity.delete_all_market_activity_data(db, stock_market_activity)
-            return {"message": "Data deleted successfully"}
+            return {'message': 'Data deleted successfully'}
         case _:
             raise UnsupportedAssetType(asset_path.asset_type)
 
@@ -68,8 +67,8 @@ async def read_stock_market_activity_data(
     # asset_request: Annotated[Dict[str, Any], Depends()]
 ):
     asset_query = None  # dict(asset_request.query_params)
-    log.debug(f"Reading data: /{asset_path.asset_type}/{asset_path.data_type}")
-    log.debug(f"Query: {asset_query}")
+    log.debug(f'Reading data: /{asset_path.asset_type}/{asset_path.data_type}')
+    log.debug(f'Query: {asset_query}')
     match (asset_path.asset_type, asset_path.data_type):
         case (AssetType.STOCK, DataType.MARKET_ACTIVITY):
             if asset_query is None:

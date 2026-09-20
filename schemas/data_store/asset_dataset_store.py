@@ -24,9 +24,9 @@ class StoreAssetDatasetBody(BaseModel):
     expiry_type: ExpiryType | None = ExpiryType.BULK
     update_type: UpdateType | None = UpdateType.STATIC
 
-    @model_validator(mode="after")
+    @model_validator(mode='after')
     def validate_fields(cls, request: 'StoreAssetDatasetBody') -> 'StoreAssetDatasetBody':
-        log.debug(f"Validating request: {request}")
+        log.debug(f'Validating request: {request}')
         if request.end is not None and request.start is None:
             raise ValueError("The 'start' field is required when 'end' is provided.")
 
@@ -40,19 +40,16 @@ class StoreAssetDatasetBody(BaseModel):
             )
         return request
 
-    @field_validator("expiry_type", mode="before")
+    @field_validator('expiry_type', mode='before')
     def validate_expiry_type(cls, value):
         return ExpiryType.validate(value)
 
-    @field_validator("update_type", mode="before")
+    @field_validator('update_type', mode='before')
     def validate_update_type(cls, value):
         return UpdateType.validate(value)
 
     class Config:
-        json_encoders: ClassVar[dict] = {
-            ExpiryType: ExpiryType.encoder,
-            UpdateType: UpdateType.encoder
-        }
+        json_encoders: ClassVar[dict] = {ExpiryType: ExpiryType.encoder, UpdateType: UpdateType.encoder}
         # extra = "forbid"
 
 
@@ -61,7 +58,7 @@ class StoreAssetDatasetPath(BaseModel):
     data_type: DataType = Field(..., description=DATA_TYPE_DESC)
     asset_symbol: str = Field(..., description=SYMBOL_DESC)
 
-    @field_validator("asset_symbol")
+    @field_validator('asset_symbol')
     def uppercase_item_id(cls, value: str) -> str:
         return value.upper()
 
@@ -77,23 +74,20 @@ class StoreAssetDatasetQuery(BaseModel):
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
-    @field_validator("expiry_type", mode="before")
+    @field_validator('expiry_type', mode='before')
     def validate_expiry_type(cls, value):
         if value is None:
             return value
         return ExpiryType.validate(value)
 
-    @field_validator("update_type", mode="before")
+    @field_validator('update_type', mode='before')
     def validate_update_type(cls, value):
         if value is None:
             return value
         return UpdateType.validate(value)
 
     class Config:
-        json_encoders: ClassVar[dict] = {
-            ExpiryType: ExpiryType.encoder,
-            UpdateType: UpdateType.encoder
-        }
+        json_encoders: ClassVar[dict] = {ExpiryType: ExpiryType.encoder, UpdateType: UpdateType.encoder}
         # extra = "forbid"
 
 

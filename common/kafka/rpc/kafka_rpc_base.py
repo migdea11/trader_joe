@@ -16,8 +16,8 @@ from common.worker_pool import SharedWorkerPool
 
 log = get_logger(__name__)
 
-Req = TypeVar("Req", bound=BaseModel)
-Res = TypeVar("Res", bound=BaseModel)
+Req = TypeVar('Req', bound=BaseModel)
+Res = TypeVar('Res', bound=BaseModel)
 
 
 class RpcRequest(BaseModel, Generic[Req]):
@@ -27,18 +27,17 @@ class RpcRequest(BaseModel, Generic[Req]):
         BaseModel: Pydantic BaseModel.
         Generic (Req): Request type.
     """
+
     correlation_id: int
     payload: Req
 
     class Config:
         # Required for Pydantic to validate generic models
         arbitrary_types_allowed = True
-        json_encoders: ClassVar[dict] = {
-            Req: lambda x: x.dict()
-        }
+        json_encoders: ClassVar[dict] = {Req: lambda x: x.dict()}
 
     @staticmethod
-    def create_request(payload: Req) -> "RpcRequest[Req]":
+    def create_request(payload: Req) -> 'RpcRequest[Req]':
         """Create a new RPC request.
 
         Args:
@@ -57,18 +56,17 @@ class RpcResponse(BaseModel, Generic[Res]):
         BaseModel: Pydantic BaseModel.
         Generic (Req): Response type.
     """
+
     correlation_id: int
     payload: Res
 
     class Config:
         # Required for Pydantic to validate generic models
         arbitrary_types_allowed = True
-        json_encoders: ClassVar[dict] = {
-            Req: lambda x: x.dict()
-        }
+        json_encoders: ClassVar[dict] = {Req: lambda x: x.dict()}
 
     @staticmethod
-    def create_response(request: RpcRequest, payload: Res) -> "RpcResponse[Res]":
+    def create_response(request: RpcRequest, payload: Res) -> 'RpcResponse[Res]':
         """Create a new RPC response.
 
         Args:
@@ -83,15 +81,18 @@ class RpcResponse(BaseModel, Generic[Res]):
 
 class BaseRpcAck(BaseModel):
     """Basic RPC Response."""
+
     class Success(str, Enum):
-        SUCCESS = "success"
-        FAILED = "failed"
+        SUCCESS = 'success'
+        FAILED = 'failed'
+
     success: 'BaseRpcAck.Success' = Success.SUCCESS
     error: str | None = None
 
 
 class BaseRpcPageAck(BaseRpcAck):
     """Basic RPC Response with pagination."""
+
     page: int
     total_pages: int
 
@@ -102,9 +103,8 @@ class RpcEndpoint(Generic[Req, Res]):
     Args:
         Generic (Req, Res): Request and Response types.
     """
-    def __init__(
-        self, topic: RpcEndpointTopic, request_model: type[Req], response_model: type[Res] = BaseRpcAck
-    ):
+
+    def __init__(self, topic: RpcEndpointTopic, request_model: type[Req], response_model: type[Res] = BaseRpcAck):
         """Create a new RPC Endpoint Definition.
 
         Args:
@@ -123,17 +123,13 @@ class KafkaRpcBase(Generic[Req, Res], ABC):
     Args:
         Generic (Req, Res): Request and Response types.
     """
+
     def __init__(self, kafka_config: RpcParams, endpoint: RpcEndpoint[Req, Res], timeout: int):
         self.endpoint = endpoint
         producer_params = ProducerParams(kafka_config.host, kafka_config.port, timeout)
         self.producer = KafkaProducerFactory.get_producer(producer_params)
         self._consumer_params = ConsumerParams(
-            kafka_config.host,
-            kafka_config.port,
-            [],
-            kafka_config.consumer_group,
-            False,
-            timeout
+            kafka_config.host, kafka_config.port, [], kafka_config.consumer_group, False, timeout
         )
         self._commit_batch_size = 10
         self._commit_batch_interval = 10
@@ -162,9 +158,5 @@ class KafkaRpcBase(Generic[Req, Res], ABC):
             KafkaConsumerFactory.ConsumerControl: Consumer control instance.
         """
         return factory.add_async_consumer(
-            self._executor,
-            self._consumer_params,
-            self._callback,
-            self._commit_batch_size,
-            self._commit_batch_interval
+            self._executor, self._consumer_params, self._callback, self._commit_batch_size, self._commit_batch_interval
         )

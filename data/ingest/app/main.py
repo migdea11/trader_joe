@@ -1,4 +1,3 @@
-
 from fastapi import FastAPI
 
 from data.ingest.app.app_depends import lifespan

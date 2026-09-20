@@ -17,15 +17,17 @@ log = get_logger(__name__)
 
 class AppBase:
     """Stored all independent declarative_base() objects for each app."""
+
     DATA_STORE_BASE = declarative_base()
     # Add other Apps with their own declarative_base() here
 
 
-S = TypeVar("S", bound=BaseModel)
+S = TypeVar('S', bound=BaseModel)
 
 
 class CustomTypeTable:
     """Base class for all tables that use custom types."""
+
     @classmethod
     def _get_columns(
         cls, exclude: list[str] | None = None, exclude_none: bool = False
@@ -43,14 +45,18 @@ class CustomTypeTable:
         custom_type_columns = {}
         other_columns = {}
         for column in columns:
-            if isinstance(column, CustomColumn) \
-                    and (exclude is None or column.name not in exclude) \
-                    and (exclude_none is False or column.default is None):
+            if (
+                isinstance(column, CustomColumn)
+                and (exclude is None or column.name not in exclude)
+                and (exclude_none is False or column.default is None)
+            ):
                 custom_type_columns[column.name] = column
-            elif isinstance(column, Column) \
-                    and column.name not in custom_type_columns \
-                    and (exclude is None or column.name not in exclude) \
-                    and (exclude_none is False or column.default is None):
+            elif (
+                isinstance(column, Column)
+                and column.name not in custom_type_columns
+                and (exclude is None or column.name not in exclude)
+                and (exclude_none is False or column.default is None)
+            ):
                 other_columns[column.name] = column
 
         return other_columns, custom_type_columns
@@ -71,17 +77,21 @@ class CustomTypeTable:
             Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]: Unflattened fields, custom type fields, additional
                 fields.
         """
-        log.debug(f"Converting {self.__class__.__name__} to schema")
+        log.debug(f'Converting {self.__class__.__name__} to schema')
         other_columns, custom_type_columns = self.__class__._get_columns(exclude)
-        return {
+        return (
+            {
                 col.name: getattr(self, col.name)
-                for col in other_columns.values() if col.name in schema_type.model_fields
-            }, \
+                for col in other_columns.values()
+                if col.name in schema_type.model_fields
+            },
             {
                 col.name: col.custom_type.to_schema_type(getattr(self, col.name))
-                for col in custom_type_columns.values() if col.name in schema_type.model_fields
-            }, \
-            (additional or {})
+                for col in custom_type_columns.values()
+                if col.name in schema_type.model_fields
+            },
+            (additional or {}),
+        )
 
     def to_schema(
         self, schema_type: type[S], additional: dict[str, Any] | None = None, exclude: list[str] | None = None
@@ -117,7 +127,7 @@ class CustomTypeTable:
             S: output as validated Schema.
         """
         other_fields, custom_fields, additional = self.__to_fields(schema_type, additional, exclude)
-        log.debug(f"Validating {schema_type.__name__} with fields: {other_fields}, {custom_fields}, {additional}")
+        log.debug(f'Validating {schema_type.__name__} with fields: {other_fields}, {custom_fields}, {additional}')
         return schema_type.model_validate({**other_fields, **custom_fields, **additional})
 
     @classmethod
@@ -132,7 +142,7 @@ class CustomTypeTable:
         Returns:
             Dict[str, Any]: Columns that match Schema.
         """
-        log.debug(f"Converting {cls.__name__} from schema")
+        log.debug(f'Converting {cls.__name__} from schema')
         other_columns, custom_type_columns = cls._get_columns(exclude, exclude_none)
         columns = {}
         for name, value in schema.__dict__.items():

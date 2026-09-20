@@ -19,21 +19,22 @@ def startup_logs(app: FastAPI):
     Args:
         app (FastAPI): The FastAPI app
     """
-    log.info("Starting up app...")
-    log.info(f"App run mode: {get_run_mode()}")
-    log.info("Routes:")
+    log.info('Starting up app...')
+    log.info(f'App run mode: {get_run_mode()}')
+    log.info('Routes:')
     route: Route
     for route in app.routes:
-        log.info(f"  Path: {route.path}, Method(s): {route.methods}, Name: {route.name}")
+        log.info(f'  Path: {route.path}, Method(s): {route.methods}, Name: {route.name}')
 
 
 def init_debugger():
     """Initialize debug mode."""
     if get_run_mode() is RunMode.DEV:
-        debug_internal_host = get_env_var("APP_INTERNAL_DEBUG_HOST", cast_type=str)
-        debug_internal_port = get_env_var("APP_INTERNAL_DEBUG_PORT", cast_type=int)
-        log.info(f"Initializing debugger to port {debug_internal_port}...")
+        debug_internal_host = get_env_var('APP_INTERNAL_DEBUG_HOST', cast_type=str)
+        debug_internal_port = get_env_var('APP_INTERNAL_DEBUG_PORT', cast_type=int)
+        log.info(f'Initializing debugger to port {debug_internal_port}...')
         import debugpy
+
         debugpy.listen((debug_internal_host, debug_internal_port))
 
 
@@ -43,4 +44,4 @@ def teardown_logs(app: FastAPI):
     Args:
         app (FastAPI): The FastAPI app
     """
-    log.info("Shutting down app...")
+    log.info('Shutting down app...')

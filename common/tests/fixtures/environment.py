@@ -10,9 +10,6 @@ def mock_get_env_var(env_values: dict[str, Any]):
         else:
             return env_value
 
-    patcher = patch(
-        'common.environment.get_env_var',
-        side_effect=side_effect
-    )
+    patcher = patch('common.environment.get_env_var', side_effect=side_effect)
     mock = patcher.start()
     return mock, patcher

@@ -17,28 +17,24 @@ log = get_logger(__name__)
 config = context.config
 
 # Assuming your .env file is in the same directory as your Alembic directory or specify the path
-load_dotenv(".env")
-database_uri = get_env_var("DATABASE_URI")
-log.debug(f"Setting up postgres URL: {database_uri}")
+load_dotenv('.env')
+database_uri = get_env_var('DATABASE_URI')
+log.debug(f'Setting up postgres URL: {database_uri}')
 config.set_main_option('sqlalchemy.url', database_uri)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-ALLOWED_MODELS = {
-    "base_market_activity",
-    "stock_market_activity",
-    "store_dataset_entry"
-}
+ALLOWED_MODELS = {'base_market_activity', 'stock_market_activity', 'store_dataset_entry'}
 for model_name in ALLOWED_MODELS:
     try:
-        importlib.import_module(f"data.store.app.database.models.{model_name}")  # nosem
-        print(f"Successfully imported {model_name}")
+        importlib.import_module(f'data.store.app.database.models.{model_name}')  # nosem
+        print(f'Successfully imported {model_name}')
     except ImportError as e:
-        print(f"Failed to import {model_name}: {e}")
+        print(f'Failed to import {model_name}: {e}')
 
 target_metadata = AppBase.DATA_STORE_BASE.metadata
-print(f"Registered tables: {AppBase.DATA_STORE_BASE.metadata.tables.keys()}")
+print(f'Registered tables: {AppBase.DATA_STORE_BASE.metadata.tables.keys()}')
 
 
 # Custom renderer for IntEnum
@@ -77,12 +73,12 @@ def run_migrations_offline() -> None:
     script output.
 
     """
-    url = config.get_main_option("sqlalchemy.url")
+    url = config.get_main_option('sqlalchemy.url')
     context.configure(
         url=url,
         target_metadata=target_metadata,
         literal_binds=True,
-        dialect_opts={"paramstyle": "named"},
+        dialect_opts={'paramstyle': 'named'},
         # render_item=render_int_enum
     )
 
@@ -98,14 +94,13 @@ def run_migrations_online() -> None:
 
     """
     connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
+        config.get_section(config.config_ini_section, {}), prefix='sqlalchemy.', poolclass=pool.NullPool
     )
 
     with connectable.connect() as connection:
         context.configure(
-            connection=connection, target_metadata=target_metadata,
+            connection=connection,
+            target_metadata=target_metadata,
             # render_item=render_int_enum
         )
 

@@ -21,6 +21,7 @@ QT = TypeVar('QT')  # Query Type
 
 class StockDataMarketActivityData(BaseModel):
     """Basic Data for a stock's market activity."""
+
     open: float
     high: float
     low: float
@@ -34,6 +35,7 @@ class StockDataMarketActivityData(BaseModel):
 
 class StockMarketActivityDataQuery(BaseModel):
     """Basic Query for a stock's market activity."""
+
     pass
 
 

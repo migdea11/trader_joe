@@ -13,24 +13,24 @@ from schemas.data_store.asset_dataset_store import AssetDatasetStoreCreate, Stor
 
 log = get_logger(__name__)
 
-MARKET_ACTIVITY_BATCH_SIZE = get_env_var("MARKET_ACTIVITY_BATCH_SIZE", cast_type=int)
-MARKET_ACTIVITY_BATCH_INTERVAL = get_env_var("MARKET_ACTIVITY_BATCH_INTERVAL", cast_type=int)
+MARKET_ACTIVITY_BATCH_SIZE = get_env_var('MARKET_ACTIVITY_BATCH_SIZE', cast_type=int)
+MARKET_ACTIVITY_BATCH_INTERVAL = get_env_var('MARKET_ACTIVITY_BATCH_INTERVAL', cast_type=int)
 
 
 async def store_market_activity_worker(
     request_path: StoreAssetDatasetPath,
     request_body: StoreAssetDatasetBody,
     db: AsyncSession,
-    rpc_clients: KafkaRpcFactory.RpcClients
+    rpc_clients: KafkaRpcFactory.RpcClients,
 ) -> int:
     dataset_id = await upsert_entry(
         db, AssetDatasetStoreCreate(**request_path.model_dump(), **request_body.model_dump())
     )
     data_ingest_request = GetDatasetRequest(
-        **request_path.model_dump(exclude={"data_type"}),
+        **request_path.model_dump(exclude={'data_type'}),
         **request_body.model_dump(),
         dataset_id=dataset_id,
-        data_types=[request_path.data_type]
+        data_types=[request_path.data_type],
     )
 
     rpc_client = rpc_clients.get_client(InterfaceRpc.INGEST_DATASET)

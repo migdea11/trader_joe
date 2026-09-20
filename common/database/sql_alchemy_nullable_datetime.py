@@ -9,11 +9,12 @@ from common.logging import get_logger
 
 
 log = get_logger(__name__)
-S = TypeVar("S")
+S = TypeVar('S')
 
 
 class NullableDateTime(BaseCustomSqlType[datetime, datetime]):
     """DateTime column that allows for None values (None in Schema == EPOCH in Model)."""
+
     EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
     def __init__(self, *args, **kwargs):
@@ -23,18 +24,18 @@ class NullableDateTime(BaseCustomSqlType[datetime, datetime]):
         return DateTime(timezone=True)
 
     def validate_column_params(self, *args, **kwargs) -> bool:
-        if "nullable" in kwargs and kwargs["nullable"] is True:
-            raise ValueError("NullableDateTime does not support nullable parameter")
+        if 'nullable' in kwargs and kwargs['nullable'] is True:
+            raise ValueError('NullableDateTime does not support nullable parameter')
         return True
 
     def to_model_type(self, value: datetime | None) -> datetime:
-        log.debug(f"  Converting {value} to model type")
+        log.debug(f'  Converting {value} to model type')
         if value is None:
             return copy(self.EPOCH)
         return value
 
     def to_schema_type(self, value: datetime) -> datetime | None:
-        log.debug(f"  Converting {value} to schema type")
+        log.debug(f'  Converting {value} to schema type')
         if value == self.EPOCH:
             return None
         return value

@@ -1,5 +1,3 @@
-
-
 def get_endpoint_url(app_name: str, app_port: int, interface: str, param: dict[str, str] | None = None) -> str:
     """Format the endpoint URL.
 
@@ -12,4 +10,4 @@ def get_endpoint_url(app_name: str, app_port: int, interface: str, param: dict[s
     Returns:
         str: _description_
     """
-    return f"http://{app_name}:{app_port}{interface.format(**(param or {}))}"
+    return f'http://{app_name}:{app_port}{interface.format(**(param or {}))}'

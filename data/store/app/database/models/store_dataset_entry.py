@@ -34,9 +34,7 @@ class StoreDatasetEntry(AppBase.DATA_STORE_BASE, CustomTypeTable):
     created_at = Column(DateTime(timezone=True), default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), default=func.now(), onupdate=func.now(), nullable=False)
 
-    __table_args__ = (
-        UniqueConstraint("asset_symbol", "granularity", "start", "end", "source", "data_type"),
-    )
+    __table_args__ = (UniqueConstraint('asset_symbol', 'granularity', 'start', 'end', 'source', 'data_type'),)
 
     def __repr__(self):
         return (
