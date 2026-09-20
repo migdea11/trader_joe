@@ -59,11 +59,45 @@ RUN set -eux; \
 RUN npm install -g @anthropic-ai/claude-code@2.1.274 \
     && npm cache clean --force
 
+# --- tailored for trader_joe from here down -------------------------------------------------
+# The project's own toolchain, so an agent can actually run `make test` / `make lint` instead of
+# reporting them NOT RUN. Pinned and checksum-verified, on the same rule as bd and dolt above.
+#
+# uv is pinned to the version CI uses (.github/workflows/trader_joe_testing.yml UV_VERSION), not
+# the older one in the project Makefile and Dockerfile — CI is what a green run has to reproduce.
+# The disagreement between those three is a known defect, tracked in the store.
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) target='x86_64-unknown-linux-gnu'; sum='4d6f84490da4b21bb6075ffc1c6b22e0cf37bc98d7cca8aff9fbb759093cdc23' ;; \
+      arm64) target='aarch64-unknown-linux-gnu'; sum='2094a3ead5a026a2f6894c4d3f71026129c8878939a57f17f0c8246a737bed1d' ;; \
+      *) echo "no uv checksum pinned for ${arch}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/uv.tar.gz \
+      "https://github.com/astral-sh/uv/releases/download/0.9.3/uv-${target}.tar.gz"; \
+    echo "${sum}  /tmp/uv.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/uv.tar.gz -C /tmp; \
+    install -m 0755 "/tmp/uv-${target}/uv" /usr/local/bin/uv; \
+    install -m 0755 "/tmp/uv-${target}/uvx" /usr/local/bin/uvx; \
+    rm -rf /tmp/uv.tar.gz "/tmp/uv-${target}"; \
+    uv --version
+
+# make drives every command binding in the manifest; bookworm ships Python 3.11, so uv supplies
+# the 3.12 the project requires. UV_PYTHON_INSTALL_DIR is outside $HOME so it survives the
+# config volume being replaced, and is readable by the agent user.
+RUN apt-get update && apt-get install -y --no-install-recommends make \
+    && rm -rf /var/lib/apt/lists/*
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
+RUN install -d -o 1000 -g 1000 /opt/uv/python \
+    && uv python install 3.12 \
+    && chmod -R a+rX /opt/uv/python
+
 # Non-root. The agent must not be able to remove its own controls.
 #
-# The config directory is created here, owned by the user, because compose mounts a named volume
-# on it. Docker creates a missing mount point root-owned; one that exists in the image is copied
-# into a new volume with its ownership intact.
+# The config directory is created here, owned by the user, so the image is coherent on its own.
+# Compose bind-mounts a host directory over it, and a bind mount takes the host directory's
+# ownership rather than the image's — which is why devcontainer.json creates that host directory
+# before the container starts.
 RUN groupadd -g "${GID}" "${USERNAME}" \
     && useradd -u "${UID}" -g "${GID}" -m -s /bin/bash "${USERNAME}" \
     && install -d -o "${UID}" -g "${GID}" "/home/${USERNAME}/.claude"

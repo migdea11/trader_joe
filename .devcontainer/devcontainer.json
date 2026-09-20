@@ -6,7 +6,11 @@
   "remoteUser": "agent",
 
   // `mounts` has no default-value syntax, so the kit mount lives in compose.yml where it does.
-  // This preflight runs on the host before the container starts: an unset or wrong
-  // AGENT_KIT_PATH otherwise produces an empty mount source and a confusing failure inside.
-  "initializeCommand": "sh -c 'd=\"${AGENT_KIT_PATH:-$HOME/repos/agent-workflow}\"; test -d \"$d/skills\" || { echo \"AGENT_KIT_PATH does not resolve to a kit clone: $d\" >&2; exit 1; }'"
+  // This preflight runs on the host before the container starts. It does two things:
+  //   - an unset or wrong AGENT_KIT_PATH otherwise produces an empty mount source and a
+  //     confusing failure inside the container;
+  //   - the agent config directory holds the session transcripts and must exist on the host
+  //     first. Docker creates a missing bind source root-owned, and the entrypoint then cannot
+  //     write its skill symlinks. mkdir here makes it, owned by the invoking user.
+  "initializeCommand": "sh -c 'd=\"${AGENT_KIT_PATH:-$HOME/repos/agent-workflow}\"; test -d \"$d/skills\" || { echo \"AGENT_KIT_PATH does not resolve to a kit clone: $d\" >&2; exit 1; }; mkdir -p \"${AGENT_HOME_PATH:-$HOME/.claude-agent-homes/trader_joe}\"'"
 }

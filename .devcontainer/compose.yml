@@ -1,4 +1,14 @@
-# Generic bootstrap container for trader_joe — phase A0.
+# Agent container for trader_joe — tailored in phase E from the phase A0 bootstrap image.
+#
+# The project name is explicit. Compose otherwise names a project after the directory holding its
+# first compose file — `.devcontainer`, in every project — so every project would share one
+# container name, and each project's `up` would replace the previous project's container.
+#
+# Snake case, matching project.name in .claude/workflow.yml and the repo directory. The project is
+# spelled trader_joe everywhere else in this repo; a second spelling here bought nothing and made
+# the generated container and volume names hard to search for.
+name: trader_joe_agent
+
 services:
   agent:
     build:
@@ -19,11 +29,31 @@ services:
       # skill symlinks pointing at /kit, which does not exist on the host.
       - ${HOME}/.claude.json:/home/agent/.claude.json
 
-      # Agent config and session state, container-local but surviving rebuilds.
-      - agent-config:/home/agent/.claude
+      # Agent config and session state — the chat transcripts live here. A host directory and
+      # deliberately not a named volume: a volume is deleted by `docker volume prune`, and is
+      # orphaned outright if the compose project name changes, which is how every session before
+      # 2026-09-20 was stranded. Outside the repo, because this directory holds .credentials.json
+      # and this repo is public — and because `git clean -xdf` would take it. The host path is
+      # created by initializeCommand in devcontainer.json: Docker creates a missing bind source
+      # as a root-owned directory, and the entrypoint then cannot write its skill symlinks.
+      - ${AGENT_HOME_PATH:-$HOME/.claude-agent-homes/trader_joe}:/home/agent/.claude
     environment:
       - CLAUDE_CONFIG_DIR=/home/agent/.claude
-    command: ["sleep", "infinity"]
 
-volumes:
-  agent-config:
+      # bd reports usage telemetry unless told not to, and its own config file lives outside the
+      # persistent config directory — so this variable is the only opt-out that survives a rebuild.
+      - BD_DISABLE_METRICS=1
+
+      # Git identity. The container has no ~/.gitconfig, so without this every agent commit fails
+      # with "unable to auto-detect email address" and each one works around it separately. These
+      # are the identity already on this repo's commits, and are public in its history.
+      - GIT_AUTHOR_NAME=Miguel
+      - GIT_AUTHOR_EMAIL=migdea11@gmail.com
+      - GIT_COMMITTER_NAME=Miguel
+      - GIT_COMMITTER_EMAIL=migdea11@gmail.com
+
+      # Tests import psycopg2/asyncpg only when these are set; CI sets them and the Makefile does
+      # not, which is why a bare `make test` fails. Set here so an agent's run matches CI.
+      - POSTGRES_ASYNC=true
+      - POSTGRES_SYNC=true
+    command: ["sleep", "infinity"]

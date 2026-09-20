@@ -113,6 +113,8 @@ components:
   - path: data/ingest
     slots:
       component_name: "Market data ingest"
+      component_summary: "Broker-facing ingest service. Fetches market data from Alpaca and answers data-store's Kafka RPC request; a request may also be a feed subscription that this service streams to Kafka. Stock only today — crypto and option paths are stubs."
+      arch_refs: "`bd list -t arch_index --all` — child of `trader_joe system` (tj-mtwvnu). Design diagram: `docs/img/design.jpg`."
       tech_stack: "Python 3.12, FastAPI, alpaca-py, Kafka RPC server"
       key_invariants: "Broker-facing layer only; data-store owns the data. Blocking SDK calls go through the shared worker pool, never inline in an async handler."
       env_vars: "| ALPACA_API_KEY / ALPACA_API_SECRET | broker credentials | unset |"
@@ -120,6 +122,8 @@ components:
   - path: data/store
     slots:
       component_name: "Market data store"
+      component_summary: "Owner of all persisted market data. Requests data from data-ingest over Kafka RPC, writes it to Postgres, and serves it over `/store/...` and `/internal/asset-data/...`. Tables: `store_dataset_entry`, `stock_market_activity`."
+      arch_refs: "`bd list -t arch_index --all` — child of `trader_joe system` (tj-mtwvnu). Design diagram: `docs/img/design.jpg`."
       tech_stack: "Python 3.12, FastAPI, SQLAlchemy 2.0 async, asyncpg, Alembic, Postgres"
       key_invariants: "Sole owner of persisted market data. Every write goes through a repository; no raw SQL in routers. Migrations are additive."
       env_vars: "| DATABASE_URI | primary DSN | fails closed |"
@@ -127,6 +131,8 @@ components:
   - path: common
     slots:
       component_name: "Shared library"
+      component_summary: "Shared library imported by both services: Kafka producer/consumer and the hand-written RPC layer, the topic registry, the Postgres session factory, custom SQLAlchemy types, and env/logging/worker-pool helpers."
+      arch_refs: "`bd list -t arch_index --all` — child of `trader_joe system` (tj-mtwvnu). Design diagram: `docs/img/design.jpg`."
       tech_stack: "Kafka producer/consumer and hand-written Kafka RPC, Postgres session factory, custom SQLAlchemy types, env/logging/worker pool"
       key_invariants: "Changing anything here affects both services. The Kafka topic registry is the inter-service contract."
       env_vars: "| RUN_MODE | dev enables the debugger | defaults to DEV (bug tj-g1qqf1) |"
@@ -134,6 +140,8 @@ components:
   - path: schemas
     slots:
       component_name: "Shared schemas"
+      component_summary: "Pydantic v2 models shared across services — the cross-service data contract, separate from the transport contracts in `routers/*/app_endpoints.py`."
+      arch_refs: "`bd list -t arch_index --all` — child of `trader_joe system` (tj-mtwvnu). Design diagram: `docs/img/design.jpg`."
       tech_stack: "Pydantic v2"
       key_invariants: "Models are the cross-service contract. Annotations are evaluated at runtime, so imports used in them must not move into TYPE_CHECKING blocks."
       env_vars: "| — | — | — |"

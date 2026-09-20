@@ -53,13 +53,22 @@ dev-prune: ## Prune development services
 	docker container prune -f && docker volume prune -f && docker image prune -f
 
 AGENT_COMPOSE := docker compose -f .devcontainer/compose.yml
+
+# The agent config directory holds the session transcripts, bind-mounted from the host.
+# devcontainer.json's initializeCommand creates it when an IDE starts the container, but that
+# hook does not run for a plain `compose up` — so agent-up creates it too. Docker would otherwise
+# create the missing bind source as a root-owned directory the agent user cannot write to.
+# Exported so compose.yml resolves the same path this file does.
+export AGENT_HOME_PATH ?= $(HOME)/.claude-agent-homes/trader_joe
+
 agent-build:  ## Build the agent devcontainer image
 	$(AGENT_COMPOSE) build
 
 agent-up:  ## Start the agent devcontainer
+	mkdir -p "$(AGENT_HOME_PATH)"
 	$(AGENT_COMPOSE) up -d
 
-agent-down:  ## Stop the agent devcontainer (config volume is kept)
+agent-down:  ## Stop the agent devcontainer (host config dir is kept)
 	$(AGENT_COMPOSE) down
 
 agent-attach:  ## Open a shell inside the agent devcontainer
