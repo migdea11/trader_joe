@@ -1,0 +1,153 @@
+# Project manifest for the agent workflow. Written by workflow-init (phase A0), completed in A1,
+# filled out by Phase C decisions. Edit it and run `update` to regenerate; never hand-edit a
+# generated agent file. Every value below has an ADR bead — `bd list -t decision --all`.
+
+kit:
+  sha: ee0119b                                   # kit commit this project was generated from
+  version: 1
+
+project:
+  name: trader_joe
+  bead_prefix: tj                                # ids are tj-xxxxxx; min_hash_length=6 in bd config
+  overview: |
+    A trading platform for its owner. The goal is a prod deployment that actively trades — first
+    automated rebalancing of an ETF portfolio across Canadian registered accounts, later more
+    complex strategies. This repo is the PUBLIC, generic framework: broker adapters, account and
+    portfolio model, order/fill event log, market-data pipeline. Strategies, targets and private
+    config live in a separate private repo that consumes it through an API and typed client SDK.
+    Profile: bead tj-luy0uh.
+
+publish:
+  # No git-host CLI is installed: a token in the agent container would undercut human-gated push
+  # (ADR tj-yh1m6o). The agent writes the PR title and body and emits a prefilled compare link.
+  command: "https://github.com/migdea11/trader_joe/compare/{base}...{head}?expand=1&title={title}&body={body}"
+  requires: ""                                   # nothing for `check` to assert
+
+commands:
+  # Bound to make targets so the user, CI and agents run identical strings (ADR tj-x6rgd1).
+  # PATHS defaults to "."; agents pass their own scope. Requires make + uv in the container.
+  test: "make test PATHS={path}"
+  lint: "make lint PATHS={path}"
+  format: "make lint-fix PATHS={path}"
+
+beads:
+  # Embedded on the laptop for now. The Dolt server on the home server, the Meshnet overlay and the
+  # split client/server containers land together before data collection (ADRs tj-l7kxo5, tj-q193d3).
+  mode: embedded
+  telemetry: false
+
+toolchain:
+  # Seeded from the kit's defaults; authoritative for this project from here on.
+  # Checksums are keyed by architecture: the artifact differs per platform.
+  bd:
+    version: 1.3.0
+    sha256:
+      amd64: 2f92b904ecf35b607e44dc5c39229173af69c54f1183e8d709f1773540cdcf3b
+      arm64: 4ce9446a68edc13202b76c84a47d66fb3dad2787b6464c9522a108faf9c1c608
+  dolt:
+    version: 2.3.5
+    sha256:
+      amd64: c49d4c3e004cf1581ba0d4a00c5023a26f84eb2ec15d5fe876eed36d5343f463
+      arm64: 9ce70fc81e50139e97758ef7f4dc57e9583e4e5ef05ad75d7535c30caa161387
+  claude_code:
+    version: 2.1.274
+    sha256: unpublished
+
+agents:
+  # Standard weight plus a broker researcher (ADR tj-uels7f). Scopes are disjoint by construction:
+  # two agents may run concurrently only if their scope lists do not overlap.
+  # NOTE: the Phase 1 restructure to src/trader_joe/ redraws every scope below; re-run update after.
+  - name: architect
+    role: architect
+    model: opus
+    slots:
+      role_description: "Design authority for trader_joe."
+      tech_stack: "Python 3.12, FastAPI, SQLAlchemy 2.0 async, Pydantic v2, Kafka, Postgres; uv workspace."
+      key_invariants: "Turnover limits and broker capability are account-type-aware. The order/fill event log is append-only. Nothing that touches money ships without a decision record."
+
+  - name: builder-ingest
+    role: builder
+    scope: [data/ingest, routers/data_ingest]
+    model: sonnet
+    slots:
+      do_not: "Do not edit common/, schemas/ or routers/common — propose the change to builder-shared. Do not change the Kafka topic registry or RPC contracts unilaterally. Do not commit broker credentials or scratch data files."
+
+  - name: builder-store
+    role: builder
+    scope: [data/store, routers/data_store]
+    model: sonnet
+    slots:
+      do_not: "Do not edit common/ or schemas/ — propose the change to builder-shared. Migrations are additive only; never edit an applied revision, and never run reset_migrations.sh against data that matters."
+
+  - name: builder-shared
+    role: builder
+    scope: [common, schemas, routers/common, pyproject.toml, uv.lock, Dockerfile, entrypoint.sh, docker-compose.yaml, docker-compose.override.yaml, Makefile, .github, .gitignore, pytest.ini, .dockerignore, .env.default]
+    model: opus
+    slots:
+      do_not: "Do not refactor inside another builder's scope without filing the follow-up task for that builder. Do not add a dependency without proposing it first. Do not weaken a security control to make a build pass."
+
+  - name: validator
+    role: validator
+    model: opus
+    slots:
+      role_description: "Quality gate for trader_joe."
+      test_paths: "common/tests (the only suite today; service-level tests are being built up)"
+
+  - name: scribe
+    role: scribe
+    model: sonnet
+    slots:
+      role_description: "Keeps README, CLAUDE.md, DETAILS.md and component files matching the merged tree."
+
+  - name: researcher-broker
+    role: researcher
+    model: sonnet
+    slots:
+      role_description: "Read-only research on broker and market-data APIs."
+      capabilities: "Fetches vendor documentation and changelogs; reports with sources; never edits."
+      doc_sources: "alpaca-py SDK and market-data docs; IBKR Client Portal Web API and TWS API; Questrade REST and Agentic Finance MCP; CRA guidance where it constrains trading behaviour."
+
+components:
+  # Rendered into each directory, loaded on demand when an agent reads files there. Context only —
+  # prohibitions live in the agent definitions above (ADR tj-q72317).
+  - path: data/ingest
+    slots:
+      component_name: "Market data ingest"
+      component_summary: "Broker-facing ingest service. Fetches market data from Alpaca and answers data-store's Kafka RPC request; a request may also be a feed subscription that this service streams to Kafka. Stock only today — crypto and option paths are stubs."
+      arch_refs: "`bd list -t arch_index --all` — child of `trader_joe system` (tj-mtwvnu). Design diagram: `docs/img/design.jpg`."
+      tech_stack: "Python 3.12, FastAPI, alpaca-py, Kafka RPC server"
+      key_invariants: "Broker-facing layer only; data-store owns the data. Blocking SDK calls go through the shared worker pool, never inline in an async handler."
+      env_vars: "| ALPACA_API_KEY / ALPACA_API_SECRET | broker credentials | unset |"
+      pitfalls: "| 1 | The Alpaca client is built at import time, which breaks tests and secret rotation | Build it lazily |"
+  - path: data/store
+    slots:
+      component_name: "Market data store"
+      component_summary: "Owner of all persisted market data. Requests data from data-ingest over Kafka RPC, writes it to Postgres, and serves it over `/store/...` and `/internal/asset-data/...`. Tables: `store_dataset_entry`, `stock_market_activity`."
+      arch_refs: "`bd list -t arch_index --all` — child of `trader_joe system` (tj-mtwvnu). Design diagram: `docs/img/design.jpg`."
+      tech_stack: "Python 3.12, FastAPI, SQLAlchemy 2.0 async, asyncpg, Alembic, Postgres"
+      key_invariants: "Sole owner of persisted market data. Every write goes through a repository; no raw SQL in routers. Migrations are additive."
+      env_vars: "| DATABASE_URI | primary DSN | fails closed |"
+      pitfalls: "| 1 | Compose falls back to a hard-coded password and host 'db' | Fail on missing variables (bug tj-70ovb3) |"
+  - path: common
+    slots:
+      component_name: "Shared library"
+      component_summary: "Shared library imported by both services: Kafka producer/consumer and the hand-written RPC layer, the topic registry, the Postgres session factory, custom SQLAlchemy types, and env/logging/worker-pool helpers."
+      arch_refs: "`bd list -t arch_index --all` — child of `trader_joe system` (tj-mtwvnu). Design diagram: `docs/img/design.jpg`."
+      tech_stack: "Kafka producer/consumer and hand-written Kafka RPC, Postgres session factory, custom SQLAlchemy types, env/logging/worker pool"
+      key_invariants: "Changing anything here affects both services. The Kafka topic registry is the inter-service contract."
+      env_vars: "| RUN_MODE | dev enables the debugger | defaults to DEV (bug tj-g1qqf1) |"
+      pitfalls: "| 1 | Env vars are read at import time, so importing a module requires them set | Keep reads lazy in new code |"
+  - path: schemas
+    slots:
+      component_name: "Shared schemas"
+      component_summary: "Pydantic v2 models shared across services — the cross-service data contract, separate from the transport contracts in `routers/*/app_endpoints.py`."
+      arch_refs: "`bd list -t arch_index --all` — child of `trader_joe system` (tj-mtwvnu). Design diagram: `docs/img/design.jpg`."
+      tech_stack: "Pydantic v2"
+      key_invariants: "Models are the cross-service contract. Annotations are evaluated at runtime, so imports used in them must not move into TYPE_CHECKING blocks."
+      env_vars: "| — | — | — |"
+      pitfalls: "| 1 | schemas imports routers constants, which read env at import time — wrong direction | Do not deepen it |"
+
+docs:
+  claude_md_budget: 250                          # lines, counting what @ imports expand to
+
+protected_branches: [main]

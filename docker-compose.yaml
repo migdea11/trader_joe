@@ -1,26 +1,45 @@
 services:
   postgres:
-    image: postgres:13
+    # Pinned to an exact patch AND base OS: PGDATA is a bind mount, so a silent base-OS
+    # bump would change glibc and with it the collation version of every text index.
+    # 13 went EOL 2025-11-13; bump deliberately (tj-owduw0).
+    image: postgres:17.11-trixie
     container_name: ${DATABASE_NAME}
     ports:
-      - "${DATABASE_PORT}:5432"
+      # Loopback only. A published port bypasses the host firewall entirely -- docker
+      # writes its own DOCKER chain ahead of anything ufw/firewalld holds -- so the bare
+      # "5432:5432" put this database on every interface the machine has. Nothing in the
+      # stack needs it: data_store reaches Postgres over the compose network. This
+      # mapping exists solely for psql or a GUI client on this machine.
+      - "127.0.0.1:${DATABASE_PORT}:5432"
     env_file:
       - .env
       - ./data/store/.env
     environment:
       POSTGRES_DB: ${POSTGRES_DB_NAME}
       POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASS}
+      # No default, by design: a fallback here is a password an attacker already knows.
+      # ":?" makes compose refuse to start -- unset and empty both count -- rather than
+      # silently standing up a database anyone on the network can log into.
+      POSTGRES_PASSWORD: ${POSTGRES_PASS:?set POSTGRES_PASS in .env; there is no default}
     volumes:
       - ${DATA_DIR:-./volume_data}/postgres:/var/lib/postgresql/data
     security_opt:
       - "no-new-privileges:true"
 
   kafka:
-    image: confluentinc/cp-kafka:latest
+    # Confluent Platform 7.9.x == Apache Kafka 3.9.x. Held on the 3.x line on purpose:
+    # Kafka 4.0 removed the old protocol api versions (KIP-896) that kafka-python-ng
+    # still sends, so moving to cp-kafka 8.x needs the client swap first (tj-q65ux6).
+    image: confluentinc/cp-kafka:7.9.10
     container_name: ${BROKER_NAME}
-    ports:
-      - "${BROKER_PORT}:9092"
+    # No published port, and nothing is lost by that. KAFKA_ADVERTISED_LISTENERS below
+    # hands every client back BROKER://${BROKER_NAME}:9092, a name that resolves only on
+    # the compose network, so a host client reaching in through a published port was
+    # redirected to an address it could not connect to. The mapping bought nothing and
+    # put an unauthenticated, plaintext broker on the LAN. Inspect the broker through the
+    # redpanda console (dev override) or `docker compose exec kafka`. BROKER_PORT is
+    # still the port the services connect to inside the network.
     env_file:
       - .env
       - ./data/ingest/.env
@@ -56,7 +75,11 @@ services:
         SERVICE_NAME: store
     hostname: ${DATA_STORE_NAME:-data_store}
     ports:
-      - "${DATA_STORE_PORT}:${APP_INTERNAL_PORT}"
+      # Loopback only. The API has no authentication of any kind yet, and data_ingest
+      # calls it over the compose network on APP_INTERNAL_PORT, not through this
+      # mapping. Kept published so /docs and curl still work from this machine; drop the
+      # mapping outright once nothing on the host talks to it.
+      - "127.0.0.1:${DATA_STORE_PORT}:${APP_INTERNAL_PORT}"
     volumes:
       - ./data/store/alembic.ini:/code/alembic.ini
       - ./data/store/migrations:/code/migrations
@@ -64,7 +87,16 @@ services:
       - .env
       - ./data/store/.env
     environment:
-      - DATABASE_URI=${DATABASE_URI:-postgresql://postgres:password@db:5432/postgres}
+      # Built from the same variables Postgres itself is given, so there is one password
+      # in one place and the app cannot drift from the server. The previous fallback,
+      # postgresql://postgres:password@db:5432/postgres, was a working credential pair in
+      # a committed file; folded in here because removing the guessable POSTGRES_PASS
+      # default without this would leave alembic authenticating with 'password' against a
+      # server that no longer accepts it. The rest of tj-70ovb3 (data/store/.env.default
+      # referencing undefined DATABASE_USER/DATABASE_PASS) is still open.
+      # The port is the container's 5432, not DATABASE_PORT -- that one is the host side
+      # of the mapping above and is not what this URI dials.
+      - DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASS}@${DATABASE_NAME}:5432/${POSTGRES_DB_NAME}
     image: trader_joe_data_store:latest
     security_opt:
       - "no-new-privileges:true"
@@ -82,7 +114,9 @@ services:
         SERVICE_NAME: ingest
     hostname: ${DATA_INGEST_NAME:-data_ingest}
     ports:
-      - "${DATA_INGEST_PORT}:${APP_INTERNAL_PORT}"
+      # Loopback only, same reasoning as data_store: unauthenticated API, and data_store
+      # reaches it over the compose network rather than through this mapping.
+      - "127.0.0.1:${DATA_INGEST_PORT}:${APP_INTERNAL_PORT}"
     env_file:
       - .env
       - ./data/ingest/.env

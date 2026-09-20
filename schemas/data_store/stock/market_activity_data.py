@@ -1,5 +1,6 @@
-from pydantic import BaseModel
 from typing import TypeVar
+
+from pydantic import BaseModel
 
 from common.logging import get_logger
 from schemas.data_store.asset_data_interface import (
@@ -8,8 +9,9 @@ from schemas.data_store.asset_data_interface import (
     AssetDataDeleteById,
     AssetDataQuery,
     AssetDataUpdate,
-    BatchAssetDataCreate
+    BatchAssetDataCreate,
 )
+
 
 log = get_logger(__name__)
 
@@ -19,6 +21,7 @@ QT = TypeVar('QT')  # Query Type
 
 class StockDataMarketActivityData(BaseModel):
     """Basic Data for a stock's market activity."""
+
     open: float
     high: float
     low: float
@@ -32,6 +35,7 @@ class StockDataMarketActivityData(BaseModel):
 
 class StockMarketActivityDataQuery(BaseModel):
     """Basic Query for a stock's market activity."""
+
     pass
 
 

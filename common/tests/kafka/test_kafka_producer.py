@@ -1,6 +1,7 @@
-import pytest
 import asyncio
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
 from kafka.errors import KafkaError
 
 from common.kafka.kafka_config import ProducerParams
@@ -21,12 +22,7 @@ def mock_kafka_producer():
 @pytest.fixture
 def producer_params():
     """Fixture to create mock ProducerParams."""
-    return ProducerParams(
-        host="localhost",
-        port=9092,
-        timeout=0.1,
-        producer_type=ProducerParams.ProducerType.DEDICATED
-    )
+    return ProducerParams(host='localhost', port=9092, timeout=0.1, producer_type=ProducerParams.ProducerType.DEDICATED)
 
 
 def test_shutdown(mock_kafka_producer):
@@ -35,10 +31,7 @@ def test_shutdown(mock_kafka_producer):
     _, producer_mock = mock_kafka_producer
 
     # Add fake producers to the internal dictionary
-    KafkaProducerFactory._KAFKA_PUB_INSTANCES = {
-        "key1": producer_mock,
-        "key2": producer_mock
-    }
+    KafkaProducerFactory._KAFKA_PUB_INSTANCES = {'key1': producer_mock, 'key2': producer_mock}
 
     KafkaProducerFactory.shutdown()
 
@@ -53,10 +46,7 @@ def test_release(mock_kafka_producer, producer_params):
     dummy_producer_mock = MagicMock()
 
     # Add fake producers to the internal dictionary
-    KafkaProducerFactory._KAFKA_PUB_INSTANCES = {
-        "key1": producer_mock,
-        "key2": dummy_producer_mock
-    }
+    KafkaProducerFactory._KAFKA_PUB_INSTANCES = {'key1': producer_mock, 'key2': dummy_producer_mock}
 
     KafkaProducerFactory.release(producer_mock)
 
@@ -65,21 +55,22 @@ def test_release(mock_kafka_producer, producer_params):
     assert dummy_producer_mock.close.call_count == 0
 
 
-@patch("common.kafka.messaging.kafka_producer.KafkaProducer")
+@patch('common.kafka.messaging.kafka_producer.KafkaProducer')
 def test_scoped_producer(mock_producer, mock_kafka_producer, producer_params: ProducerParams):
     """Test the scoped_producer context manager to ensure proper resource cleanup."""
     # Mock the factory's get_producer method to return the mock producer
-    with patch.object(KafkaProducerFactory, "get_producer", return_value=mock_producer):
-        with patch.object(KafkaProducerFactory, "release") as mock_release:
-            # Use the scoped_producer context manager
-            with KafkaProducerFactory.scoped_producer(
-                producer_params
-            ) as producer:
-                # Assert that the producer was obtained
-                assert producer is mock_producer
+    # nesting is deliberate: the release assert runs after scoped_producer exits
+    with (
+        patch.object(KafkaProducerFactory, 'get_producer', return_value=mock_producer),
+        patch.object(KafkaProducerFactory, 'release') as mock_release,
+    ):
+        # Use the scoped_producer context manager
+        with KafkaProducerFactory.scoped_producer(producer_params) as producer:
+            # Assert that the producer was obtained
+            assert producer is mock_producer
 
-            # Assert the release method was called
-            mock_release.assert_called_once_with(mock_producer)
+        # Assert the release method was called
+        mock_release.assert_called_once_with(mock_producer)
 
 
 def test_wait_for_kafka_success(mock_kafka_producer, producer_params: ProducerParams):
@@ -124,9 +115,9 @@ def test_send_message_async(mock_kafka_producer):
     executor = MagicMock()
 
     with patch.object(asyncio, 'get_running_loop', return_value=MagicMock()) as mock_loop:
-        KafkaProducerFactory.send_message_async(executor, producer_mock, "test_topic", {"key": "value"})
+        KafkaProducerFactory.send_message_async(executor, producer_mock, 'test_topic', {'key': 'value'})
         mock_loop.return_value.run_in_executor.assert_called_once_with(
-            executor, producer_mock.send, "test_topic", {"key": "value"}
+            executor, producer_mock.send, 'test_topic', {'key': 'value'}
         )
 
 
@@ -137,6 +128,4 @@ def test_flush_messages_async(mock_kafka_producer):
 
     with patch.object(asyncio, 'get_running_loop', return_value=MagicMock()) as mock_loop:
         KafkaProducerFactory.flush_messages_async(executor, producer_mock)
-        mock_loop.return_value.run_in_executor.assert_called_once_with(
-            executor, producer_mock.flush
-        )
+        mock_loop.return_value.run_in_executor.assert_called_once_with(executor, producer_mock.flush)

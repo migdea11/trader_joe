@@ -6,12 +6,10 @@ from schemas.common.latency import InternalLatencyRequest
 
 
 class InterfaceRest(str, Enum):
-    PING = "/ping"
-    LATENCY = "/latency/{latency_type}"
-    INTERNAL_LATENCY = "/latency_internal"
+    PING = '/ping'
+    LATENCY = '/latency/{latency_type}'
+    INTERNAL_LATENCY = '/latency_internal'
 
 
 class InterfaceRpc:
-    LATENCY = RpcEndpoint(
-        RpcEndpointTopic.LATENCY_TEST, InternalLatencyRequest, BaseRpcAck
-    )
+    LATENCY = RpcEndpoint(RpcEndpointTopic.LATENCY_TEST, InternalLatencyRequest, BaseRpcAck)

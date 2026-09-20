@@ -1,12 +1,18 @@
 services:
   pgadmin:
-    image: dpage/pgadmin4:latest
+    image: dpage/pgadmin4:9.17.0
     container_name: pgadmin
     ports:
-      - "${POSTGRES_UI_PORT}:80"  # Map the container's port 80 to localhost:5050
+      # Loopback only: this is a browser UI with a login that holds the database
+      # credentials, so it is reachable from this machine and nowhere else.
+      - "127.0.0.1:${POSTGRES_UI_PORT}:80"
     environment:
-      PGADMIN_DEFAULT_EMAIL: admin@admin.com
-      PGADMIN_DEFAULT_PASSWORD: admin
+      # Was admin@admin.com / admin, hard-coded and published on every interface. No
+      # defaults now -- ":?" stops compose before the container exists. Note pgAdmin only
+      # reads these on first initialisation, so changing them does not rotate an account
+      # an earlier run already created in the mounted volume.
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:?set PGADMIN_EMAIL in .env}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASS:?set PGADMIN_PASS in .env (6+ characters)}
     depends_on:
       - postgres
     volumes:
@@ -16,9 +22,11 @@ services:
     read_only: true
 
   redpanda:
-    image: docker.redpanda.com/redpandadata/console:latest
+    image: docker.redpanda.com/redpandadata/console:v3.12.0
     ports:
-      - "${BROKER_UI_PORT}:8080"
+      # Loopback only: the console ships with no authentication and offers full read and
+      # write access to every topic, so LAN reachability here is broker access.
+      - "127.0.0.1:${BROKER_UI_PORT}:8080"
     environment:
       - KAFKA_BROKERS=kafka:9092
     depends_on:

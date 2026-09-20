@@ -1,30 +1,32 @@
 from enum import Enum
-from aenum import Enum as AEnum, extend_enum
+
+from aenum import Enum as AEnum
+from aenum import extend_enum
 
 
 class StaticTopic(AEnum):
-    STOCK_MARKET_ACTIVITY = "stock_market_activity"
-    STOCK_MARKET_QUOTE = "stock_market_quote"
-    STOCK_MARKET_TRADE = "stock_market_trade"
+    STOCK_MARKET_ACTIVITY = 'stock_market_activity'
+    STOCK_MARKET_QUOTE = 'stock_market_quote'
+    STOCK_MARKET_TRADE = 'stock_market_trade'
 
 
 class RpcEndpointTopic(str, Enum):
-    LATENCY_TEST = "latency_test_rpc"
-    STOCK_MARKET_ACTIVITY = "stock_market_activity_rpc"
+    LATENCY_TEST = 'latency_test_rpc'
+    STOCK_MARKET_ACTIVITY = 'stock_market_activity_rpc'
 
     @property
     def request(self) -> StaticTopic:
-        return StaticTopic(f"{self.value}_request")
+        return StaticTopic(f'{self.value}_request')
 
     @property
     def response(self) -> StaticTopic:
-        return StaticTopic(f"{self.value}_response")
+        return StaticTopic(f'{self.value}_response')
 
 
 class ConsumerGroup(str, Enum):
-    DATA_STORE_GROUP = "data_store_group"
-    DATA_INGEST_GROUP = "data_ingest_group"
-    COMMON_GROUP = "common_group"
+    DATA_STORE_GROUP = 'data_store_group'
+    DATA_INGEST_GROUP = 'data_ingest_group'
+    COMMON_GROUP = 'common_group'
 
 
 # Extend StaticTopic with RPC endpoints

@@ -1,0 +1,29 @@
+{
+  "env": {
+    "BD_DISABLE_METRICS": "1"
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "BD_DISABLE_METRICS=1 bd prime --hook-json"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "BD_DISABLE_METRICS=1 bd prime"
+          }
+        ]
+      }
+    ]
+  }
+}

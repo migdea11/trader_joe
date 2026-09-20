@@ -1,12 +1,14 @@
-from uuid import UUID
-from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import ClassVar
+from uuid import UUID
+
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from common.enums.data_select import AssetType, DataType
-from common.enums.data_stock import DataSource, Granularity, ExpiryType, UpdateType
+from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateType
 from common.logging import get_logger
 from routers.data_store.app_endpoints import ASSET_DATASET_ID_DESC, ASSET_TYPE_DESC, DATA_TYPE_DESC, SYMBOL_DESC
+
 
 log = get_logger(__name__)
 
@@ -15,16 +17,16 @@ class StoreAssetDatasetBody(BaseModel):
     source: DataSource
 
     granularity: Granularity
-    start: Optional[datetime] = None
-    end: Optional[datetime] = None
+    start: datetime | None = None
+    end: datetime | None = None
 
-    expiry: Optional[datetime] = datetime.now() + timedelta(days=1)
-    expiry_type: Optional[ExpiryType] = ExpiryType.BULK
-    update_type: Optional[UpdateType] = UpdateType.STATIC
+    expiry: datetime | None = datetime.now() + timedelta(days=1)
+    expiry_type: ExpiryType | None = ExpiryType.BULK
+    update_type: UpdateType | None = UpdateType.STATIC
 
-    @model_validator(mode="after")
+    @model_validator(mode='after')
     def validate_fields(cls, request: 'StoreAssetDatasetBody') -> 'StoreAssetDatasetBody':
-        log.debug(f"Validating request: {request}")
+        log.debug(f'Validating request: {request}')
         if request.end is not None and request.start is None:
             raise ValueError("The 'start' field is required when 'end' is provided.")
 
@@ -38,19 +40,16 @@ class StoreAssetDatasetBody(BaseModel):
             )
         return request
 
-    @field_validator("expiry_type", mode="before")
+    @field_validator('expiry_type', mode='before')
     def validate_expiry_type(cls, value):
         return ExpiryType.validate(value)
 
-    @field_validator("update_type", mode="before")
+    @field_validator('update_type', mode='before')
     def validate_update_type(cls, value):
         return UpdateType.validate(value)
 
     class Config:
-        json_encoders = {
-            ExpiryType: ExpiryType.encoder,
-            UpdateType: UpdateType.encoder
-        }
+        json_encoders: ClassVar[dict] = {ExpiryType: ExpiryType.encoder, UpdateType: UpdateType.encoder}
         # extra = "forbid"
 
 
@@ -59,39 +58,36 @@ class StoreAssetDatasetPath(BaseModel):
     data_type: DataType = Field(..., description=DATA_TYPE_DESC)
     asset_symbol: str = Field(..., description=SYMBOL_DESC)
 
-    @field_validator("asset_symbol")
+    @field_validator('asset_symbol')
     def uppercase_item_id(cls, value: str) -> str:
         return value.upper()
 
 
 class StoreAssetDatasetQuery(BaseModel):
     # Same as body, but with optional fields
-    source: Optional[DataSource] = None
-    granularity: Optional[Granularity] = None
-    start: Optional[datetime] = None
-    end: Optional[datetime] = None
-    expiry_type: Optional[ExpiryType] = None
-    update_type: Optional[UpdateType] = None
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
+    source: DataSource | None = None
+    granularity: Granularity | None = None
+    start: datetime | None = None
+    end: datetime | None = None
+    expiry_type: ExpiryType | None = None
+    update_type: UpdateType | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
-    @field_validator("expiry_type", mode="before")
+    @field_validator('expiry_type', mode='before')
     def validate_expiry_type(cls, value):
         if value is None:
             return value
         return ExpiryType.validate(value)
 
-    @field_validator("update_type", mode="before")
+    @field_validator('update_type', mode='before')
     def validate_update_type(cls, value):
         if value is None:
             return value
         return UpdateType.validate(value)
 
     class Config:
-        json_encoders = {
-            ExpiryType: ExpiryType.encoder,
-            UpdateType: UpdateType.encoder
-        }
+        json_encoders: ClassVar[dict] = {ExpiryType: ExpiryType.encoder, UpdateType: UpdateType.encoder}
         # extra = "forbid"
 
 
@@ -115,7 +111,7 @@ class AssetDatasetStore(AssetDatasetStoreUpdate):
     id: UUID
 
     item_count: int
-    expiry: Optional[datetime] = None
+    expiry: datetime | None = None
 
     created_at: datetime
     updated_at: datetime

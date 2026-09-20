@@ -1,4 +1,3 @@
-
 from fastapi import APIRouter
 
 from common.logging import get_logger
@@ -11,5 +10,5 @@ log = get_logger(__name__)
 
 @router.get(InterfaceRest.PING)
 async def ping():
-    log.debug("Pinging...")
-    return {"message": "pong"}
+    log.debug('Pinging...')
+    return {'message': 'pong'}

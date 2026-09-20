@@ -1,5 +1,4 @@
 from datetime import datetime
-from typing import List, Optional
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -14,7 +13,7 @@ class BaseGetDatasetRequest(BaseModel):
 
     granularity: Granularity
     start: datetime
-    end: Optional[datetime]
+    end: datetime | None
 
     expiry: datetime
     expiry_type: ExpiryType
@@ -24,17 +23,17 @@ class BaseGetDatasetRequest(BaseModel):
 class GetDatasetRequest(BaseGetDatasetRequest):
     asset_symbol: str
     asset_type: AssetType
-    data_types: List[DataType]
+    data_types: list[DataType]
 
 
 class StockDatasetRequest(GetDatasetRequest):
     # Adding path params except asset_type
     asset_symbol: str
-    data_types: List[DataType]
+    data_types: list[DataType]
 
     class Config:
         # ignore asset_type
-        extra = "ignore"
+        extra = 'ignore'
 
 
 class CryptoDatasetRequest(StockDatasetRequest):

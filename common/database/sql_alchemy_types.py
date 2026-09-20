@@ -1,13 +1,14 @@
 from abc import ABC, abstractmethod
-from typing import Generic, Optional, Type, TypeVar
+from typing import Generic, TypeVar
 
 from sqlalchemy import Column
 
 from common.logging import get_logger
 
+
 log = get_logger(__name__)
-S = TypeVar("S")
-M = TypeVar("M")
+S = TypeVar('S')
+M = TypeVar('M')
 
 
 class BaseCustomSqlType(Generic[S, M], ABC):
@@ -17,12 +18,13 @@ class BaseCustomSqlType(Generic[S, M], ABC):
         Generic (S, M): Schema Field and Model Column types used to be converted to/from each other.
         ABC: _description_
     """
-    def __init__(self, schema_type: Type[S], model_type: Type[M]):
-        self._schema_type: Type[S] = schema_type
-        self._model_type: Type[M] = model_type
+
+    def __init__(self, schema_type: type[S], model_type: type[M]):
+        self._schema_type: type[S] = schema_type
+        self._model_type: type[M] = model_type
 
     @abstractmethod
-    def get_type(self) -> Type[M]:
+    def get_type(self) -> type[M]:
         """Get the SQLAlchemy type for the column.
 
         Returns:
@@ -66,12 +68,14 @@ class BaseCustomSqlType(Generic[S, M], ABC):
 
 class CustomColumn(Column):
     """Custom Column for SQLAlchemy. Allowing to intercept the conversion between schema and model types."""
-    def __init__(self, custom_type: Optional[BaseCustomSqlType[S, M] | Type[BaseCustomSqlType[S, M]]] = None, **kwargs):
+
+    def __init__(self, custom_type: BaseCustomSqlType[S, M] | type[BaseCustomSqlType[S, M]] | None = None, **kwargs):
         """Create a custom column.
 
         Args:
             custom_type (Optional[BaseCustomSqlType[S, M]  |  Type[BaseCustomSqlType[S, M]]], optional): Type or
                 Instance of custom column. Defaults to None.
+            **kwargs: Column arguments forwarded to SQLAlchemy's Column.
         """
         if custom_type is not None:
             self.custom_type = custom_type() if isinstance(custom_type, type) else custom_type

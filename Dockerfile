@@ -9,7 +9,7 @@ USER appuser
 WORKDIR /code
 
 # Install common dependencies
-COPY --from=ghcr.io/astral-sh/uv:0.6.4 /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.9.3 /uv /uvx /bin/
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
 ENV PYTHONPATH="/code"
 ENV PATH="/code/.venv/bin:${PATH}"
@@ -28,8 +28,11 @@ ARG SERVICE_NAME=none
 # Install service-specific dependencies
 RUN uv sync --only-group base --only-group ${SERVICE_PATH}-${SERVICE_NAME} --frozen
 
-# Set entrypoint and environment variable
-COPY ./.env /code/.env
+# NOTE: the build deliberately copies no .env. Configuration arrives at runtime through
+# compose's env_file:, and a baked .env would put whatever the build host happened to
+# have -- Alpaca keys, database password -- into an image layer that is then pushed to
+# GHCR. data/store/migrations/env.py calls load_dotenv('.env'), which is a no-op when the
+# file is absent; it reads DATABASE_URI from the process environment either way.
 
 # Add common files
 COPY ./entrypoint.sh /code/entrypoint.sh

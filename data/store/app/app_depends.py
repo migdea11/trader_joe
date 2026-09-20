@@ -1,5 +1,5 @@
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
 
 from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,11 +14,10 @@ from common.logging import get_logger
 from common.worker_pool import SharedWorkerPool
 from data.store.app.database import database
 from routers.common.latency import get_latency_topics, initialize_latency_client
-from routers.data_ingest.app_endpoints import (
-    InterfaceRpc,
-    APP_NAME as INGEST_APP_NAME,
-    APP_PORT_INTERNAL as INGEST_APP_PORT
-)
+from routers.data_ingest.app_endpoints import APP_NAME as INGEST_APP_NAME
+from routers.data_ingest.app_endpoints import APP_PORT_INTERNAL as INGEST_APP_PORT
+from routers.data_ingest.app_endpoints import InterfaceRpc
+
 
 log = get_logger(__name__)
 
@@ -40,11 +39,7 @@ async def lifespan(app: FastAPI):
 
     # Init Kafka
     consumer_params = get_consumer_params(
-        [
-            RpcEndpointTopic.STOCK_MARKET_ACTIVITY.request,
-            *get_latency_topics()
-        ],
-        ConsumerGroup.DATA_STORE_GROUP
+        [RpcEndpointTopic.STOCK_MARKET_ACTIVITY.request, *get_latency_topics()], ConsumerGroup.DATA_STORE_GROUP
     )
     KafkaConsumerFactory.wait_for_kafka(consumer_params)
 
@@ -54,7 +49,7 @@ async def lifespan(app: FastAPI):
     global __RPC_CLIENTS
     __RPC_CLIENTS = rpc.init_clients()
 
-    log.info("Data Store App Ready!!!")
+    log.info('Data Store App Ready!!!')
     yield
 
     # cleanup tasks

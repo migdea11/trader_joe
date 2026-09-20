@@ -10,7 +10,9 @@ from common.logging import get_logger
 from common.worker_pool import SharedWorkerPool
 from routers.common.latency import get_latency_topics, initialize_latency_server
 from routers.data_ingest import get_dataset_request
-from routers.data_store.app_endpoints import APP_NAME as STORE_APP_NAME, APP_PORT_INTERNAL as STORE_APP_PORT
+from routers.data_store.app_endpoints import APP_NAME as STORE_APP_NAME
+from routers.data_store.app_endpoints import APP_PORT_INTERNAL as STORE_APP_PORT
+
 
 log = get_logger(__name__)
 
@@ -27,11 +29,7 @@ async def lifespan(app: FastAPI):
 
     # Init Kafka
     consumer_params = get_consumer_params(
-        [
-            RpcEndpointTopic.STOCK_MARKET_ACTIVITY.request,
-            *get_latency_topics()
-        ],
-        ConsumerGroup.DATA_INGEST_GROUP
+        [RpcEndpointTopic.STOCK_MARKET_ACTIVITY.request, *get_latency_topics()], ConsumerGroup.DATA_INGEST_GROUP
     )
     KafkaConsumerFactory.wait_for_kafka(consumer_params)
 
@@ -39,7 +37,7 @@ async def lifespan(app: FastAPI):
     rpc = get_dataset_request.rpc
     rpc_servers = rpc.init_servers()
 
-    log.info("Data Ingest App Ready!!!")
+    log.info('Data Ingest App Ready!!!')
     yield
 
     teardown_logs(app)

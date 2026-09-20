@@ -21,5 +21,18 @@ coverage.xml
 .ruff_cache/
 .pytest_cache/
 
-# Default Volume locations
-./data/postgres
+# Container volume mounts (DATA_DIR in .env, and the compose fallback).
+# Root-owned by the container; must never be committable, and ruff/pytest
+# cannot traverse it either.
+/volumes/
+/volume_data/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+*.gate.lock*
+
+# Scratch output from the prepare-pr skill
+.claude/publish/

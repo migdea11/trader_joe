@@ -4,6 +4,7 @@ from typing import Self
 
 class NamedIntEnum(IntEnum):
     """Base class for creating named integer enums."""
+
     @classmethod
     def validate(cls, value: int) -> Self:
         """Validate and parse the enum value.
@@ -21,17 +22,19 @@ class NamedIntEnum(IntEnum):
         if isinstance(value, str):  # Parse from lowercase string
             try:
                 return cls._decode(value)
-            except KeyError:
-                raise ValueError(f"Invalid enum value: {value}. Must be one of {[cls.encoder(e) for e in cls]}")
+            except KeyError as err:
+                raise ValueError(
+                    f'Invalid enum value: {value}. Must be one of {[cls.encoder(e) for e in cls]}'
+                ) from err
         elif isinstance(value, int):  # Parse from integer
             return cls(value)
         elif isinstance(value, cls):  # Already a valid enum instance
             return value
-        raise ValueError(f"Invalid type for enum_field: {type(value)}")
+        raise ValueError(f'Invalid type for enum_field: {type(value)}')
 
     @classmethod
     def _decode(cls, value: str) -> Self:
-        """Decode the enum value from a string
+        """Decode the enum value from a string.
 
         Args:
             value (str): Value to decode.
@@ -54,7 +57,7 @@ class NamedIntEnum(IntEnum):
         return value.name
 
     def __str__(self) -> str:
-        return f"{type(self).__name__}.{self.name}[{self.value}]"
+        return f'{type(self).__name__}.{self.name}[{self.value}]'
 
     def __repr__(self) -> str:
         return str(self)
