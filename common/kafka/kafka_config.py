@@ -1,5 +1,4 @@
 from enum import Enum
-from typing import List
 from uuid import uuid4 as UUID
 
 from common.environment import get_env_var
@@ -17,7 +16,7 @@ class ConsumerParams:
         self,
         host: str,
         port: int,
-        topics: List[StaticTopic],
+        topics: list[StaticTopic],
         consumer_group: ConsumerGroup,
         auto_commit: bool,
         timeout: int
@@ -77,7 +76,7 @@ class ProducerParams:
             timeout (int): Timeout period for Kafka producer.
             retry (int, optional): Attempts to send message. Defaults to 1.
             producer_type (ProducerType, optional): Select dedicated producer or shared instance. Defaults to ProducerType.DEDICATED.
-        """  # noqa: E501
+        """
         self.host = host
         self.port = port
         self.timeout = timeout
@@ -136,7 +135,7 @@ class RpcParams:
         return self.__url
 
     def get_key(self) -> int:
-        """Unique identifier for RPC based on config
+        """Unique identifier for RPC based on config.
 
         Returns:
             int: Hash key.
@@ -144,7 +143,7 @@ class RpcParams:
         return self.__key
 
 
-def get_consumer_params(topics: List[StaticTopic], consumer_group: ConsumerGroup) -> ConsumerParams:
+def get_consumer_params(topics: list[StaticTopic], consumer_group: ConsumerGroup) -> ConsumerParams:
     """Get the consumer parameters for default Kafka broker.
 
     Args:

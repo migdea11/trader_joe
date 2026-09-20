@@ -21,8 +21,10 @@ class NamedIntEnum(IntEnum):
         if isinstance(value, str):  # Parse from lowercase string
             try:
                 return cls._decode(value)
-            except KeyError:
-                raise ValueError(f"Invalid enum value: {value}. Must be one of {[cls.encoder(e) for e in cls]}")
+            except KeyError as err:
+                raise ValueError(
+                    f"Invalid enum value: {value}. Must be one of {[cls.encoder(e) for e in cls]}"
+                ) from err
         elif isinstance(value, int):  # Parse from integer
             return cls(value)
         elif isinstance(value, cls):  # Already a valid enum instance
@@ -31,7 +33,7 @@ class NamedIntEnum(IntEnum):
 
     @classmethod
     def _decode(cls, value: str) -> Self:
-        """Decode the enum value from a string
+        """Decode the enum value from a string.
 
         Args:
             value (str): Value to decode.

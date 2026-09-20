@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Self, Tuple, Type, TypeVar
+from typing import TYPE_CHECKING, Any, Self, TypeVar
 
 from pydantic import BaseModel
 from sqlalchemy import Column
@@ -6,6 +6,7 @@ from sqlalchemy.orm import declarative_base
 
 from common.database.sql_alchemy_types import CustomColumn
 from common.logging import get_logger
+
 
 if TYPE_CHECKING:
     from sqlalchemy.sql.base import ReadOnlyColumnCollection
@@ -27,8 +28,8 @@ class CustomTypeTable:
     """Base class for all tables that use custom types."""
     @classmethod
     def _get_columns(
-        cls, exclude: Optional[List[str]] = None, exclude_none: bool = False
-    ) -> Tuple[Dict[str, Column], Dict[str, CustomColumn]]:
+        cls, exclude: list[str] | None = None, exclude_none: bool = False
+    ) -> tuple[dict[str, Column], dict[str, CustomColumn]]:
         """Grabs all columns from the table, and separates them into custom type columns and other columns.
 
         Args:
@@ -55,8 +56,8 @@ class CustomTypeTable:
         return other_columns, custom_type_columns
 
     def __to_fields(
-        self, schema_type: Type[S], additional: Optional[Dict[str, Any]] = None, exclude: Optional[List[str]] = None
-    ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+        self, schema_type: type[S], additional: dict[str, Any] | None = None, exclude: list[str] | None = None
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         """Converting columns to fields for schema.
 
         Args:
@@ -83,8 +84,8 @@ class CustomTypeTable:
             (additional or {})
 
     def to_schema(
-        self, schema_type: Type[S], additional: Optional[Dict[str, Any]] = None, exclude: Optional[List[str]] = None
-    ) -> Dict[str, Any]:
+        self, schema_type: type[S], additional: dict[str, Any] | None = None, exclude: list[str] | None = None
+    ) -> dict[str, Any]:
         """Converts the table Model to fields from Schema.
 
         Args:
@@ -101,7 +102,7 @@ class CustomTypeTable:
         return {**other_fields, **custom_fields, **additional}
 
     def to_validated_schema(
-        self, schema_type: Type[S], additional: Optional[Dict[str, Any]] = None, exclude: Optional[List[str]] = None
+        self, schema_type: type[S], additional: dict[str, Any] | None = None, exclude: list[str] | None = None
     ) -> S:
         """Converts the table Model to a validated Schema.
 
@@ -120,8 +121,8 @@ class CustomTypeTable:
         return schema_type.model_validate({**other_fields, **custom_fields, **additional})
 
     @classmethod
-    def get_fields(cls, schema: S, exclude: Optional[List[str]] = None, exclude_none: bool = False) -> Dict[str, Any]:
-        """Gets columns from table that matches content of Schema
+    def get_fields(cls, schema: S, exclude: list[str] | None = None, exclude_none: bool = False) -> dict[str, Any]:
+        """Gets columns from table that matches content of Schema.
 
         Args:
             schema (S): Schema to match columns with.
@@ -144,7 +145,7 @@ class CustomTypeTable:
         return columns
 
     @classmethod
-    def get_model(cls, schema: S, exclude: Optional[List[str]] = None, exclude_none: bool = False) -> Self:
+    def get_model(cls, schema: S, exclude: list[str] | None = None, exclude_none: bool = False) -> Self:
         """Converts Schema to Model.
 
         Args:

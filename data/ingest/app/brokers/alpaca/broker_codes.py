@@ -2,8 +2,8 @@ from enum import Enum
 
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
-from common.enums.exchange_code import BrokerExchangeBase, ExchangeCode
 from common.enums.data_stock import BrokerGranularityBase, Granularity
+from common.enums.exchange_code import BrokerExchangeBase, ExchangeCode
 
 
 class AlpacaGranularity(BrokerGranularityBase[TimeFrame], Enum):

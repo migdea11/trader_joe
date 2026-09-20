@@ -1,5 +1,7 @@
 from enum import Enum
-from aenum import Enum as AEnum, extend_enum
+
+from aenum import Enum as AEnum
+from aenum import extend_enum
 
 
 class StaticTopic(AEnum):

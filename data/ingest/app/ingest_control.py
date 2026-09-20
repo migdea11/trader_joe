@@ -6,6 +6,7 @@ from schemas.data_store.stock.market_activity_data import BatchStockDataMarketAc
 
 from .brokers.alpaca.broker_api import get_market_stock_data as alpaca_market_data
 
+
 log = get_logger(__name__)
 
 

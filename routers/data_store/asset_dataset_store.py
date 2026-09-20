@@ -1,4 +1,4 @@
-from typing import Annotated, List
+from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,6 +17,7 @@ from schemas.data_store.asset_dataset_store import (
     StoreAssetDatasetPath,
     StoreAssetDatasetQuery,
 )
+
 
 router = APIRouter()
 log = get_logger(__name__)
@@ -42,7 +43,7 @@ async def get_data(
     db: Annotated[AsyncSession, Depends(async_db)],
     request_path: Annotated[StoreAssetDatasetPath, Depends()],
     request_query: Annotated[StoreAssetDatasetQuery, Query()]
-) -> List[AssetDatasetStore]:
+) -> list[AssetDatasetStore]:
     log.debug(f"Getting data for {request_path.asset_type.value}, {request_path.asset_symbol}")
     log.debug(f"Query: {request_query}")
     return await search_entries(

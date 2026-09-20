@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from common.environment import get_env_var
 
+
 # Configure Worker Threads
 EXECUTOR_THREADS = get_env_var('EXECUTOR_THREADS', cast_type=int)
 

@@ -25,7 +25,7 @@ __APP_PORT = None
 
 def get_latency_topics():
     if not LATENCY_TEST_ENABLED:
-        return tuple()
+        return ()
 
     return (
         RpcEndpointTopic.LATENCY_TEST.request,
@@ -58,11 +58,10 @@ def initialize_latency_client(app: FastAPI, app_name: str, app_port: int, client
 
     @router.get(InterfaceRest.LATENCY)
     async def latency(request: LatencyRequest = Depends()):
-        import httpx
-        import os
         import asyncio
+        import os
 
-        from typing import List
+        import httpx
 
         log.debug("Measuring latency...")
         inner_timer = Timer()
@@ -100,7 +99,7 @@ def initialize_latency_client(app: FastAPI, app_name: str, app_port: int, client
         for _ in range(request.iterations or 1):
             tasks.append(send_type())
 
-        results: List[BaseRpcAck] = await asyncio.gather(*tasks)
+        results: list[BaseRpcAck] = await asyncio.gather(*tasks)
         outer_timer.tock()
         for result in results:
             if result is False:

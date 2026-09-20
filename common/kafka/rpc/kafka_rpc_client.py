@@ -1,14 +1,15 @@
 import asyncio
 import traceback
-from typing import Dict, Generic, Type
+from typing import Generic
 
 from kafka.consumer.fetcher import ConsumerRecord
 
 from common.kafka.kafka_config import RpcParams
 from common.kafka.messaging.kafka_producer import KafkaProducerFactory
-from common.kafka.rpc.kafka_rpc_base import KafkaRpcBase, RpcEndpoint, RpcRequest, Req, Res, RpcResponse
+from common.kafka.rpc.kafka_rpc_base import KafkaRpcBase, Req, Res, RpcEndpoint, RpcRequest, RpcResponse
 from common.kafka.topics import StaticTopic
 from common.logging import get_logger, limit
+
 
 log = get_logger(__name__)
 
@@ -34,7 +35,7 @@ class KafkaRpcClient(Generic[Req, Res], KafkaRpcBase[Req, Res]):
         consumer_topic = StaticTopic(self.endpoint.topic.response)
         self._consumer_params.topics = [consumer_topic]
 
-        self._pending_requests: Dict[str, asyncio.Future] = {}
+        self._pending_requests: dict[str, asyncio.Future] = {}
         self._timeout = timeout
 
     async def _callback(self, message: ConsumerRecord) -> bool:
@@ -48,7 +49,7 @@ class KafkaRpcClient(Generic[Req, Res], KafkaRpcBase[Req, Res]):
         """
         success = False
         try:
-            response_type: Type[Res] = self.endpoint.response_model
+            response_type: type[Res] = self.endpoint.response_model
             message_value: bytes = message.value
             response = RpcResponse[response_type].model_validate_json(message_value.decode('utf-8'))
 
@@ -60,8 +61,7 @@ class KafkaRpcClient(Generic[Req, Res], KafkaRpcBase[Req, Res]):
         except Exception as e:
             log.error(limit(f"Error processing response: {e}"))
             traceback.print_exc()
-        finally:
-            return success
+        return success
 
     async def send_request(self, request_payload: Req) -> Res:
         """Send an RPC request and wait for a response.
@@ -85,7 +85,7 @@ class KafkaRpcClient(Generic[Req, Res], KafkaRpcBase[Req, Res]):
         try:
             response: RpcResponse[Res] = await asyncio.wait_for(future, timeout=self._timeout)
             return response.payload
-        except asyncio.TimeoutError:
-            raise TimeoutError(f"RPC request timed out after {self._timeout} seconds")
+        except TimeoutError as e:
+            raise TimeoutError(f"RPC request timed out after {self._timeout} seconds") from e
         finally:
             self._pending_requests.pop(request.correlation_id)

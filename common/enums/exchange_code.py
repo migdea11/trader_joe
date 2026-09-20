@@ -1,5 +1,6 @@
 from enum import StrEnum
-from typing import Generic, Type, TypeVar, Self
+from typing import Generic, Self, TypeVar
+
 
 T = TypeVar("T")
 
@@ -52,7 +53,7 @@ class BrokerExchangeBase(Generic[T]):
         return self._exchange
 
     @classmethod
-    def from_broker_code(cls: Type["BrokerExchangeBase"], broker_code: T) -> Self:
+    def from_broker_code(cls: type["BrokerExchangeBase"], broker_code: T) -> Self:
         """Find and return the exchange code mapping for a given broker-specific exchange code.
 
         Args:
@@ -72,8 +73,8 @@ class BrokerExchangeBase(Generic[T]):
         raise ValueError(f"Broker code '{broker_code}' not found in {cls.__name__}")
 
     @classmethod
-    def get_broker_code(cls: Type["BrokerExchangeBase"], exchange: ExchangeCode) -> Self:
-        """Find and return the exchange code mapping for a given standardized exchange
+    def get_broker_code(cls: type["BrokerExchangeBase"], exchange: ExchangeCode) -> Self:
+        """Find and return the exchange code mapping for a given standardized exchange.
 
         Args:
             cls (Type[BrokerExchangeBase])

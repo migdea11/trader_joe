@@ -1,6 +1,6 @@
 import asyncio
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable, List, Tuple, Type
 
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.models.bars import Bar, BarSet
@@ -11,7 +11,7 @@ from alpaca.data.requests import (
     StockLatestQuoteRequest,
     StockLatestTradeRequest,
     StockQuotesRequest,
-    StockTradesRequest
+    StockTradesRequest,
 )
 
 from common.data_lifecyle import expiry_inc
@@ -22,8 +22,11 @@ from common.logging import get_logger
 from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
 from schemas.data_ingest.get_dataset_request import StockDatasetRequest
 from schemas.data_store.stock.market_activity_data import (
-    StockDataMarketActivityCreate, BatchStockDataMarketActivityCreate, StockDataMarketActivityData
+    BatchStockDataMarketActivityCreate,
+    StockDataMarketActivityCreate,
+    StockDataMarketActivityData,
 )
+
 
 log = get_logger(__name__)
 
@@ -52,14 +55,14 @@ def convert_bar_to_schema(data: Bar) -> StockDataMarketActivityCreate:
 
 def convert_bars_to_batch_schema(
     batch_response: BatchStockDataMarketActivityCreate, request: StockDatasetRequest, stock_bars: BarSet
-) -> List[StockDataMarketActivityCreate]:
+) -> list[StockDataMarketActivityCreate]:
     stock_symbol = request.asset_symbol
     if stock_symbol not in stock_bars.data:
         log.warning(f"Symbol {stock_symbol} not found in bar set")
         return []
 
     latest_expiry = request.expiry
-    bars: List[Bar] = \
+    bars: list[Bar] = \
         stock_bars[stock_symbol] if isinstance(stock_bars[stock_symbol], list) else [stock_bars[stock_symbol]]
 
     log.debug(f"bars: {len(bars)}")
@@ -77,7 +80,7 @@ def create_stock_quote(data: Quote, symbol: str, granularity: Granularity, sourc
     return None
 
 
-def match_client_request(asset_type: AssetType, data_type: DataType, request_latest: bool) -> Tuple[Callable, Type]:
+def match_client_request(asset_type: AssetType, data_type: DataType, request_latest: bool) -> tuple[Callable, type]:
     match (asset_type, data_type, request_latest):
         ### STOCK ###
         ## MARKET ACTIVITY ##

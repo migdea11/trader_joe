@@ -1,15 +1,11 @@
 import asyncio
 import time
 import traceback
+from collections.abc import Callable, Coroutine
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Coroutine, Dict
+from typing import Any, ClassVar
 
-from kafka import (
-    KafkaAdminClient,
-    KafkaConsumer,
-    OffsetAndMetadata,
-    TopicPartition
-)
+from kafka import KafkaAdminClient, KafkaConsumer, OffsetAndMetadata, TopicPartition
 from kafka.admin import NewTopic
 from kafka.consumer.fetcher import ConsumerRecord
 from kafka.errors import KafkaError
@@ -18,16 +14,17 @@ from common.kafka.kafka_config import ConsumerParams
 from common.kafka.topics import StaticTopic
 from common.logging import get_logger, limit
 
+
 log = get_logger(__name__)
 
 
 class KafkaConsumerFactory:
     """Factory that manages the creation and lifecycle of Kafka consumers."""
     __KAFKA_ADMIN_CLIENT: KafkaAdminClient = None
-    _KAFKA_SUB_INSTANCES = []
+    _KAFKA_SUB_INSTANCES: ClassVar[list] = []
 
     def __init__(self):
-        self.__async_instances: Dict[str, 'KafkaConsumerFactory.ConsumerControl'] = {}
+        self.__async_instances: dict[str, KafkaConsumerFactory.ConsumerControl] = {}
 
     @classmethod
     def shutdown(cls):
@@ -95,7 +92,7 @@ class KafkaConsumerFactory:
             except KafkaError:
                 elapsed_time = time.time() - start_time
                 if elapsed_time >= clientParams.timeout:
-                    log.error("Failed to connect to Kafka after {} seconds.".format(clientParams.timeout))
+                    log.error(f"Failed to connect to Kafka after {clientParams.timeout} seconds.")
                     return False
                 log.debug("Waiting for Kafka to be ready...")
                 time.sleep(5)
@@ -124,8 +121,7 @@ class KafkaConsumerFactory:
         return consumer
 
     class ConsumerControl:
-        """Wrapper class used to manage consumer lifecycle and message processing.
-        """
+        """Wrapper class used to manage consumer lifecycle and message processing."""
         def __init__(
             self,
             executor: ThreadPoolExecutor,

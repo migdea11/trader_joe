@@ -1,7 +1,6 @@
-from typing import Dict, Optional
 
 
-def get_endpoint_url(app_name: str, app_port: int, interface: str, param: Optional[Dict[str, str]] = None) -> str:
+def get_endpoint_url(app_name: str, app_port: int, interface: str, param: dict[str, str] | None = None) -> str:
     """Format the endpoint URL.
 
     Args:

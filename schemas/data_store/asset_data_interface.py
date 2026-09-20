@@ -1,6 +1,6 @@
 from abc import ABC
 from datetime import datetime
-from typing import Dict, Generic, List, Optional, TypeVar
+from typing import Generic, TypeVar
 from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, field_validator
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Granularity
 from routers.data_store.app_endpoints import ASSET_DATA_ID_DESC, ASSET_DATASET_ID_DESC, ASSET_TYPE_DESC, DATA_TYPE_DESC
+
 
 DT = TypeVar('DT')  # Data Type
 QT = TypeVar('QT')  # Query Type
@@ -19,17 +20,17 @@ class _AssetDataType(BaseModel, Generic[DT], ABC):
         Generic (DT): The data type for the asset.
     """
     timestamp: datetime
-    expiry: Optional[datetime]
+    expiry: datetime | None
     data: DT
 
-    def add_data(self, data: DT, timestamp: datetime, expiry: Optional[datetime]):
+    def add_data(self, data: DT, timestamp: datetime, expiry: datetime | None):
         self.timestamp = timestamp
         self.expiry = expiry
         self.data = data
 
 
 class _AssetIdentifier(BaseModel, ABC):
-    """Basic Identifiers for a financial asset's data"""
+    """Basic Identifiers for a financial asset's data."""
     asset_symbol: str
     source: DataSource
     granularity: Granularity
@@ -43,9 +44,9 @@ class _AssetIdentifierQuery(BaseModel, ABC):
     """Similar to _AssetIdentifier but with optional fields for querying data."""
     asset_symbol: str
 
-    source: Optional[DataSource]
-    granularity: Optional[Granularity]
-    dataset_id: Optional[UUID]
+    source: DataSource | None
+    granularity: Granularity | None
+    dataset_id: UUID | None
 
     @field_validator("asset_symbol")
     def uppercase_item_id(cls, value: str | None) -> str:
@@ -58,9 +59,9 @@ class _AssetDataQuery(BaseModel, Generic[QT], ABC):
     Args:
         Generic (QT): The query type for the asset.
     """
-    start: Optional[datetime]
-    end: Optional[datetime]
-    expiry: Optional[datetime]
+    start: datetime | None
+    end: datetime | None
+    expiry: datetime | None
     query: QT
 
 
@@ -88,9 +89,9 @@ class BatchAssetDataCreate(_AssetIdentifier, Generic[DT], ABC):
         Generic (DT): Data for the asset including asset type specific data
     """
     dataset_id: UUID
-    dataset: Dict[DataType, List[_AssetDataType[DT]]]
+    dataset: dict[DataType, list[_AssetDataType[DT]]]
 
-    def append_data(self, data_type: DataType, data: DT, timestamp: datetime, expiry: Optional[datetime]):
+    def append_data(self, data_type: DataType, data: DT, timestamp: datetime, expiry: datetime | None):
         if data_type not in self.dataset:
             self.dataset[data_type] = []
         self.dataset[data_type].append(_AssetDataType(timestamp=timestamp, expiry=expiry, data=data))
@@ -107,7 +108,7 @@ class AssetDataUpdate(_AssetIdentifier, _AssetDataType[DT], Generic[DT], ABC):
     dataset_id: UUID
 
 
-class AssetDataDeleteById(ABC):
+class AssetDataDeleteById(ABC):  # noqa: B024  # marker base for the delete contract; see tj-9dqfjo
     """Delete an existing asset data entry linked to the dataset provided.
 
     Args:
@@ -123,7 +124,7 @@ class AssetDataQuery(_AssetIdentifierQuery, _AssetDataQuery[QT], Generic[QT], AB
         _AssetIdentifierQuery: Queries the asset, data source and granularity.
         _AssetDataQuery (QT): Queries for the asset data, including asset type specific data.
     """
-    dataset_id: Optional[UUID]
+    dataset_id: UUID | None
 
 
 class AssetData(_AssetIdentifier, _AssetDataType[DT], Generic[DT], ABC):

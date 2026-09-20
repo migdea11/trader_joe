@@ -1,14 +1,15 @@
 import asyncio
-import pytest
-from unittest.mock import MagicMock, patch
-from kafka.admin import NewTopic
-from kafka import KafkaConsumer, KafkaAdminClient
-from kafka.consumer.fetcher import ConsumerRecord
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import MagicMock, patch
 
-from common.kafka.topics import StaticTopic, ConsumerGroup
+import pytest
+from kafka import KafkaAdminClient, KafkaConsumer
+from kafka.admin import NewTopic
+from kafka.consumer.fetcher import ConsumerRecord
+
 from common.kafka.kafka_config import ConsumerParams
 from common.kafka.messaging.kafka_consumer import KafkaConsumerFactory
+from common.kafka.topics import ConsumerGroup, StaticTopic
 
 
 @pytest.fixture

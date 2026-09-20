@@ -2,6 +2,7 @@ from enum import StrEnum
 
 from common.environment import get_env_var
 
+
 APP_NAME = get_env_var("DATA_STORE_NAME")
 APP_PORT = get_env_var("DATA_STORE_PORT", cast_type=int)
 APP_PORT_INTERNAL = get_env_var("APP_INTERNAL_PORT", cast_type=int)

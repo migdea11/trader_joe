@@ -1,14 +1,15 @@
 import os
-from typing import Type, TypeVar
+from typing import TypeVar
 
 from common.enums.config_enum import RunMode
 from common.logging import get_logger
+
 
 log = get_logger(__name__)
 T = TypeVar('T')
 
 
-def get_env_var(var_name: str, default: Type[T] = None, cast_type: Type[T] = str) -> T:
+def get_env_var(var_name: str, default: type[T] | None = None, cast_type: type[T] = str) -> T:
     """Get the environment variable.
 
     Args:

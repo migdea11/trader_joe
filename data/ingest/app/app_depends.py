@@ -10,7 +10,9 @@ from common.logging import get_logger
 from common.worker_pool import SharedWorkerPool
 from routers.common.latency import get_latency_topics, initialize_latency_server
 from routers.data_ingest import get_dataset_request
-from routers.data_store.app_endpoints import APP_NAME as STORE_APP_NAME, APP_PORT_INTERNAL as STORE_APP_PORT
+from routers.data_store.app_endpoints import APP_NAME as STORE_APP_NAME
+from routers.data_store.app_endpoints import APP_PORT_INTERNAL as STORE_APP_PORT
+
 
 log = get_logger(__name__)
 

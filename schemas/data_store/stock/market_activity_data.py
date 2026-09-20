@@ -1,5 +1,6 @@
-from pydantic import BaseModel
 from typing import TypeVar
+
+from pydantic import BaseModel
 
 from common.logging import get_logger
 from schemas.data_store.asset_data_interface import (
@@ -8,8 +9,9 @@ from schemas.data_store.asset_data_interface import (
     AssetDataDeleteById,
     AssetDataQuery,
     AssetDataUpdate,
-    BatchAssetDataCreate
+    BatchAssetDataCreate,
 )
+
 
 log = get_logger(__name__)
 

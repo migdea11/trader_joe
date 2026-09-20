@@ -1,21 +1,24 @@
 
 import asyncio
+import time
+from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-import time
-from typing import Dict, Generator
+from typing import ClassVar
+
 from kafka import KafkaProducer
 from kafka.errors import KafkaError
 
 from common.kafka.kafka_config import ProducerParams
 from common.logging import get_logger, limit
 
+
 log = get_logger(__name__)
 
 
 class KafkaProducerFactory:
     """Factory that manages the creation and lifecycle of Kafka producers."""
-    _KAFKA_PUB_INSTANCES: Dict[str, KafkaProducer] = {}
+    _KAFKA_PUB_INSTANCES: ClassVar[dict[str, KafkaProducer]] = {}
 
     @classmethod
     def shutdown(cls):

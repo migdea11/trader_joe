@@ -1,10 +1,11 @@
-from typing import AsyncGenerator
+from collections.abc import AsyncGenerator
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.database.postgres_tools import PostgresSessionFactory
 from common.environment import get_env_var
 from common.logging import get_logger
+
 
 log = get_logger(__name__)
 

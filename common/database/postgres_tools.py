@@ -1,15 +1,14 @@
 import time
-from typing import Dict
+from typing import ClassVar
 
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.engine.url import URL
-from sqlalchemy.ext.asyncio import (
-    AsyncEngine, AsyncSession, async_scoped_session, create_async_engine
-)
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_scoped_session, create_async_engine
 from sqlalchemy.orm import Session, scoped_session, sessionmaker
 
 from common.environment import get_env_var
 from common.logging import get_logger
+
 
 log = get_logger(__name__)
 
@@ -19,6 +18,7 @@ if _POSTGRES_ASYNC_ENABLED is True:
     log.info("Postgres async is enabled.")
     print("Postgres async is enabled.")
     import asyncio
+
     import asyncpg
 if _POSTGRES_SYNC_ENABLED is True:
     log.info("Postgres sync is enabled.")
@@ -28,7 +28,7 @@ if _POSTGRES_SYNC_ENABLED is True:
 
 class PostgresSessionFactory:
     """Creates handle to create and manage Postgres database async sessions."""
-    _active_db_uris = set()
+    _active_db_uris: ClassVar[set[str]] = set()
 
     @staticmethod
     def _get_display_uri(uri: URL) -> str:
@@ -56,8 +56,8 @@ class PostgresSessionFactory:
 
     class AsyncSessionHandle:
         """Postgres session handle."""
-        _async_engines: Dict[str, AsyncEngine] = {}
-        _async_sessions: Dict[str, async_scoped_session] = {}
+        _async_engines: ClassVar[dict[str, AsyncEngine]] = {}
+        _async_sessions: ClassVar[dict[str, async_scoped_session]] = {}
 
         @staticmethod
         def create_uri(
@@ -175,8 +175,8 @@ class PostgresSessionFactory:
 
     class SyncSession:
         """Creates handle to create and manage Postgres database async sessions."""
-        _sync_engines: Dict[str, Engine] = {}
-        _sync_sessions: Dict[str, scoped_session] = {}
+        _sync_engines: ClassVar[dict[str, Engine]] = {}
+        _sync_sessions: ClassVar[dict[str, scoped_session]] = {}
 
         @staticmethod
         def create_uri(
@@ -239,9 +239,7 @@ class PostgresSessionFactory:
 
         @classmethod
         def initialize(cls, uri: URL, timeout: int, retry: int = 1):
-            """
-            Initialize sync engines and session factories (synchronous).
-            """
+            """Initialize sync engines and session factories (synchronous)."""
             uri_str = PostgresSessionFactory._get_display_uri(uri)
             if uri_str in cls._sync_engines:
                 raise RuntimeError(f"Session factory already initialized for {uri_str}.")

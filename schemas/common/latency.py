@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Optional
+
 from fastapi import Path, Query
 from pydantic import BaseModel
 
@@ -17,8 +17,8 @@ class LatencyRequest(BaseModel):
         RPC_KAFKA = "rpc_kafka"
 
     latency_type: LatencyType = Path(..., title="Latency type", description=LATENCY_TYPE_DESC)
-    iterations: Optional[int] = Query(..., title="Iterations", description=LOOP_DESC)
-    payload_size: Optional[int] = Query(..., title="Payload size", description=PAYLOAD_SIZE_DESC)
+    iterations: int | None = Query(..., title="Iterations", description=LOOP_DESC)
+    payload_size: int | None = Query(..., title="Payload size", description=PAYLOAD_SIZE_DESC)
 
 
 class LatencyResponse(BaseRpcAck):

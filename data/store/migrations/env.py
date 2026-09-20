@@ -5,9 +5,10 @@ from alembic import context
 from dotenv import load_dotenv
 from sqlalchemy import engine_from_config, pool
 
+from common.database.sql_alchemy_table import AppBase
 from common.environment import get_env_var
 from common.logging import get_logger
-from common.database.sql_alchemy_table import AppBase
+
 
 log = get_logger(__name__)
 

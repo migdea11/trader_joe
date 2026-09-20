@@ -1,6 +1,7 @@
 import os
-import pytest
 from unittest.mock import patch
+
+import pytest
 
 from common.environment import get_env_var
 
@@ -38,6 +39,5 @@ def test_get_env_var_with_cast_type_and_default_value():
 
 
 def test_get_env_var_with_invalid_cast_type():
-    with patch.dict(os.environ, {"TEST_VAR": "not_an_int"}):
-        with pytest.raises(ValueError):
-            get_env_var("TEST_VAR", cast_type=int)
+    with patch.dict(os.environ, {"TEST_VAR": "not_an_int"}), pytest.raises(ValueError):
+        get_env_var("TEST_VAR", cast_type=int)

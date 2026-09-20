@@ -1,12 +1,11 @@
 import time
-from typing import Dict
 from uuid import UUID, uuid4
 
 
 class Timer:
     """Timer util to help measure time taken for a block of code to execute."""
     def __init__(self):
-        self.start: Dict[UUID, float] = {}
+        self.start: dict[UUID, float] = {}
         self._latest_key = None
         self._duration = 0
 
@@ -20,7 +19,7 @@ class Timer:
         self.start[self._latest_key] = time.perf_counter()
         return self._latest_key
 
-    def tock(self, key: UUID = None) -> float:
+    def tock(self, key: UUID | None = None) -> float:
         """End the timer and return the duration.
 
         Args:
@@ -54,7 +53,7 @@ class Timer:
 
 
 def timeit(timer: Timer):
-    """Decorator to measure the time taken for a function to execute
+    """Decorator to measure the time taken for a function to execute.
 
     Args:
         timer (Timer): Timer instance to use.

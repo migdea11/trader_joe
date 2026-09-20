@@ -1,4 +1,5 @@
-from typing import Any, Dict, List
+from typing import Any
+
 from sqlalchemy import Column, Float, Integer
 
 from common.enums.data_select import AssetType, DataType
@@ -7,7 +8,7 @@ from schemas.data_store.stock.market_activity_data import (
     BatchStockDataMarketActivityCreate,
     StockDataMarketActivity,
     StockDataMarketActivityCreate,
-    StockDataMarketActivityData
+    StockDataMarketActivityData,
 )
 
 
@@ -27,7 +28,7 @@ class StockMarketActivity(BaseMarketActivity):
     dividends_factor = Column(Float, nullable=False, default=1.0)
 
     @classmethod
-    def from_batch_create(cls, batch_create: BatchStockDataMarketActivityCreate) -> List[Dict[str, Any]]:
+    def from_batch_create(cls, batch_create: BatchStockDataMarketActivityCreate) -> list[dict[str, Any]]:
         return [{
             # Base Market Activity fields
             "dataset_id" : batch_create.dataset_id,
@@ -49,7 +50,7 @@ class StockMarketActivity(BaseMarketActivity):
         } for create in batch_create.dataset[DataType.MARKET_ACTIVITY]]
 
     @classmethod
-    def from_create(cls, create: StockDataMarketActivityCreate) -> Dict[str, Any]:
+    def from_create(cls, create: StockDataMarketActivityCreate) -> dict[str, Any]:
         return {
             # Base Market Activity fields
             "dataset_id" : create.dataset_id,

@@ -8,11 +8,8 @@ from data.store.app.database.crud.stock.asset_market_activity import batch_creat
 from data.store.app.database.crud.stock.store_dataset_entry import upsert_entry
 from routers.data_ingest.app_endpoints import InterfaceRpc
 from schemas.data_ingest.get_dataset_request import GetDatasetRequest
-from schemas.data_store.asset_dataset_store import (
-    AssetDatasetStoreCreate,
-    StoreAssetDatasetBody,
-    StoreAssetDatasetPath
-)
+from schemas.data_store.asset_dataset_store import AssetDatasetStoreCreate, StoreAssetDatasetBody, StoreAssetDatasetPath
+
 
 log = get_logger(__name__)
 

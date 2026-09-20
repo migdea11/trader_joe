@@ -1,9 +1,10 @@
 from abc import abstractmethod
+
 from sqlalchemy import UUID, Column, DateTime, Enum, ForeignKey, Index, Integer, String, func
 
+from common.database.sql_alchemy_table import AppBase
 from common.enums.data_select import AssetType
 from common.enums.data_stock import DataSource, Granularity
-from common.database.sql_alchemy_table import AppBase
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 
 

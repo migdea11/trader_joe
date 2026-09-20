@@ -1,6 +1,6 @@
 import traceback
 import uuid
-from typing import List, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.dialects import postgresql
@@ -11,6 +11,7 @@ from common.logging import get_logger
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from schemas.data_store import asset_dataset_store
+
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -55,13 +56,11 @@ async def upsert_entry(
     except SQLAlchemyError as e:
         await db.rollback()
         traceback.print_exc()
-        raise RuntimeError(f"Error while creating or updating entry: {e}")
+        raise RuntimeError(f"Error while creating or updating entry: {e}")  # noqa: B904  # see tj-76u8ip
 
 
 async def update_entry(db: AsyncSession, entry: asset_dataset_store.AssetDatasetStoreUpdate):
-    """
-    Update an existing entry.
-    """
+    """Update an existing entry."""
     try:
         stmt = update(StoreDatasetEntry).where(StoreDatasetEntry.id == entry.id).values(
             entry.model_dump(),
@@ -71,13 +70,11 @@ async def update_entry(db: AsyncSession, entry: asset_dataset_store.AssetDataset
     except SQLAlchemyError as e:
         await db.rollback()
         traceback.print_exc()
-        raise RuntimeError(f"Error while updating entry: {e}")
+        raise RuntimeError(f"Error while updating entry: {e}")  # noqa: B904  # see tj-76u8ip
 
 
 async def update_entry_lifecycle(db: AsyncSession, id: uuid.UUID):
-    """
-    Updates only the `updated_at` for an existing entry.
-    """
+    """Updates only the `updated_at` for an existing entry."""
     # TODO might not be necessary
     try:
         stmt = update(StoreDatasetEntry).where(StoreDatasetEntry.id == id).values(updated_at=func.now())
@@ -86,13 +83,11 @@ async def update_entry_lifecycle(db: AsyncSession, id: uuid.UUID):
     except SQLAlchemyError as e:
         await db.rollback()
         traceback.print_exc()
-        raise RuntimeError(f"Error while updating entry lifecycle: {e}")
+        raise RuntimeError(f"Error while updating entry lifecycle: {e}")  # noqa: B904  # see tj-76u8ip
 
 
 async def get_entry_by_id(db: AsyncSession, id: uuid.UUID) -> asset_dataset_store.AssetDatasetStore:
-    """
-    Retrieve an entry by its ID.
-    """
+    """Retrieve an entry by its ID."""
     stmt = select(StoreDatasetEntry).where(StoreDatasetEntry.id == id)
     result = await db.execute(stmt)
     return asset_dataset_store.AssetDatasetStore.model_validate(result.first())
@@ -102,10 +97,8 @@ async def search_entries(
     db: AsyncSession,
     request_path: asset_dataset_store.StoreAssetDatasetPath,
     request_query: asset_dataset_store.StoreAssetDatasetQuery
-) -> List[asset_dataset_store.AssetDatasetStore]:
-    """
-    Search for entries based on optional criteria.
-    """
+) -> list[asset_dataset_store.AssetDatasetStore]:
+    """Search for entries based on optional criteria."""
     joined_table = StockMarketActivity
     stmt = select(
         StoreDatasetEntry,
@@ -127,7 +120,7 @@ async def search_entries(
     stmt = stmt.group_by(StoreDatasetEntry.id)
     # log.debug(f"Query: {stmt.compile(dialect=postgresql.dialect())}")
     result = await db.execute(stmt)
-    entries: List[Tuple[StoreDatasetEntry, datetime, int]] = result.all()
+    entries: list[tuple[StoreDatasetEntry, datetime, int]] = result.all()
     # log.debug(f"Entries: {entries}")
 
     return [
@@ -140,9 +133,7 @@ async def search_entries(
 
 
 async def delete_entry_by_id(db: AsyncSession, id: uuid.UUID):
-    """
-    Delete an entry by its ID.
-    """
+    """Delete an entry by its ID."""
     try:
         stmt = delete(StoreDatasetEntry).filter(StoreDatasetEntry.id == id)
         result = await db.execute(stmt)
@@ -152,4 +143,4 @@ async def delete_entry_by_id(db: AsyncSession, id: uuid.UUID):
     except SQLAlchemyError as e:
         await db.rollback()
         traceback.print_exc()
-        raise RuntimeError(f"Error while deleting entry with ID {id}: {e}")
+        raise RuntimeError(f"Error while deleting entry with ID {id}: {e}")  # noqa: B904  # see tj-76u8ip

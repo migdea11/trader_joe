@@ -1,9 +1,11 @@
-from typing import Any, Callable, Coroutine, Dict, List
+from collections.abc import Callable, Coroutine
+from typing import Any
+
 from common.kafka.kafka_config import RpcParams
 from common.kafka.messaging.kafka_consumer import KafkaConsumerFactory
 from common.kafka.rpc.kafka_rpc_base import RpcEndpoint, RpcRequest
 from common.kafka.rpc.kafka_rpc_client import KafkaRpcClient
-from common.kafka.rpc.kafka_rpc_server import KafkaRpcServer, Res, Req
+from common.kafka.rpc.kafka_rpc_server import KafkaRpcServer, Req, Res
 
 
 class KafkaRpcFactory:
@@ -16,8 +18,8 @@ class KafkaRpcFactory:
         """
         self.rpc_params = rpc_params
 
-        self._rpc_clients: List[KafkaRpcClient] = []
-        self._rpc_servers: List[KafkaRpcServer] = []
+        self._rpc_clients: list[KafkaRpcClient] = []
+        self._rpc_servers: list[KafkaRpcServer] = []
 
         self._clients_running = False
         self._servers_running = False
@@ -44,7 +46,7 @@ class KafkaRpcFactory:
 
         Returns:
             Callable[[Callable[[RpcRequest], Coroutine[Any, Any, Res]]], Callable[[RpcRequest], Coroutine[Any, Any, Res]]]: Decorator function.
-        """  # noqa: E501
+        """
         def decorator(
             rpc_function: Callable[[RpcRequest], Coroutine[Any, Any, Res]]
         ) -> Callable[[RpcRequest], Coroutine[Any, Any, Res]]:
@@ -57,7 +59,7 @@ class KafkaRpcFactory:
         """Handle for Kafka RPC clients."""
         def __init__(self):
             self._consumer_factory = KafkaConsumerFactory()
-            self._rpc_clients: Dict[int, KafkaRpcClient] = {}
+            self._rpc_clients: dict[int, KafkaRpcClient] = {}
 
         @staticmethod
         def _client_key(endpoint: RpcEndpoint) -> int:
@@ -115,7 +117,7 @@ class KafkaRpcFactory:
     class RpcServers:
         def __init__(self):
             self._consumer_factory = KafkaConsumerFactory()
-            self._rpc_servers: List[KafkaRpcServer] = []
+            self._rpc_servers: list[KafkaRpcServer] = []
 
         def shutdown(self):
             self._consumer_factory.shutdown()

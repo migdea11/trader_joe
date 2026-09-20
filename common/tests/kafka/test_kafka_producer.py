@@ -1,6 +1,7 @@
-import pytest
 import asyncio
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
+
+import pytest
 from kafka.errors import KafkaError
 
 from common.kafka.kafka_config import ProducerParams
@@ -69,17 +70,20 @@ def test_release(mock_kafka_producer, producer_params):
 def test_scoped_producer(mock_producer, mock_kafka_producer, producer_params: ProducerParams):
     """Test the scoped_producer context manager to ensure proper resource cleanup."""
     # Mock the factory's get_producer method to return the mock producer
-    with patch.object(KafkaProducerFactory, "get_producer", return_value=mock_producer):
-        with patch.object(KafkaProducerFactory, "release") as mock_release:
-            # Use the scoped_producer context manager
-            with KafkaProducerFactory.scoped_producer(
-                producer_params
-            ) as producer:
-                # Assert that the producer was obtained
-                assert producer is mock_producer
+    # nesting is deliberate: the release assert runs after scoped_producer exits
+    with (
+        patch.object(KafkaProducerFactory, "get_producer", return_value=mock_producer),
+        patch.object(KafkaProducerFactory, "release") as mock_release,
+    ):
+        # Use the scoped_producer context manager
+        with KafkaProducerFactory.scoped_producer(
+            producer_params
+        ) as producer:
+            # Assert that the producer was obtained
+            assert producer is mock_producer
 
-            # Assert the release method was called
-            mock_release.assert_called_once_with(mock_producer)
+        # Assert the release method was called
+        mock_release.assert_called_once_with(mock_producer)
 
 
 def test_wait_for_kafka_success(mock_kafka_producer, producer_params: ProducerParams):

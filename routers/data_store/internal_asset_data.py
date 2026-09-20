@@ -1,4 +1,4 @@
-from typing import Annotated, List
+from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,6 +15,7 @@ from schemas.data_store.stock.market_activity_data import (
     StockDataMarketActivityDeleteById,
     StockDataMarketActivityQuery,
 )
+
 
 router = APIRouter()
 log = get_logger(__name__)
@@ -46,7 +47,7 @@ async def create_stock_market_activity_data(
 async def delete_stock_market_activity_data(
     db: Annotated[AsyncSession, Depends(async_db)],
     asset_path: Annotated[AssetDataPath, Depends()],
-    asset_request: Annotated[List[str], Depends()]
+    asset_request: Annotated[list[str], Depends()]
 ):
     asset_query = asset_request  # dict(asset_request.query_params)
     log.debug(f"Deleting data: /{asset_path.asset_type}/{asset_path.data_type}")
@@ -60,7 +61,7 @@ async def delete_stock_market_activity_data(
             raise UnsupportedAssetType(asset_path.asset_type)
 
 
-@router.get(AssetDataInterface.GET_ASSET_DATA, response_model=List[StockDataMarketActivity])
+@router.get(AssetDataInterface.GET_ASSET_DATA, response_model=list[StockDataMarketActivity])
 async def read_stock_market_activity_data(
     db: Annotated[AsyncSession, Depends(async_db)],
     asset_path: Annotated[AssetDataPath, Depends()],

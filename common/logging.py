@@ -1,6 +1,7 @@
 import logging
 from typing import Any
 
+
 # Suppress Kafka logs
 logging.getLogger("kafka").setLevel(logging.WARNING)
 

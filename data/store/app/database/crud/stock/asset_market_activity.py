@@ -1,4 +1,3 @@
-from typing import List
 
 from sqlalchemy import delete, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,6 +6,7 @@ from common.enums.data_select import AssetType, DataType
 from common.logging import get_logger
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from schemas.data_store.stock import market_activity_data
+
 
 log = get_logger(__name__)
 
@@ -57,7 +57,7 @@ async def batch_create_market_activity_data(
 # TODO replace with a search function
 async def read_market_activity_data(
     db: AsyncSession, request: market_activity_data.StockDataMarketActivityQuery
-) -> List[market_activity_data.StockDataMarketActivity]:
+) -> list[market_activity_data.StockDataMarketActivity]:
     log.debug("Reading stock market activity dataset")
     asset_table = StockMarketActivity
 
@@ -85,7 +85,7 @@ async def read_market_activity_data(
 # TODO replace with a search function
 async def read_all_asset_market_activity_data(
     db: AsyncSession
-) -> List[market_activity_data.StockDataMarketActivity]:
+) -> list[market_activity_data.StockDataMarketActivity]:
     log.debug("Reading all stock market activity dataset")
     asset_table = StockMarketActivity
 

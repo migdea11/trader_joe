@@ -6,6 +6,7 @@ from sqlalchemy.orm import declarative_base
 from common.database.sql_alchemy_table import CustomTypeTable
 from common.database.sql_alchemy_types import BaseCustomSqlType, CustomColumn
 
+
 Base = declarative_base()
 
 

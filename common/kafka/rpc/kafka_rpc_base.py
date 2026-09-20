@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Generic, Optional, Type, TypeVar
+from typing import ClassVar, Generic, TypeVar
 from uuid import uuid4 as UUID
 
 from kafka.consumer.fetcher import ConsumerRecord
@@ -12,6 +12,7 @@ from common.kafka.messaging.kafka_producer import KafkaProducerFactory
 from common.kafka.topics import RpcEndpointTopic
 from common.logging import get_logger
 from common.worker_pool import SharedWorkerPool
+
 
 log = get_logger(__name__)
 
@@ -32,7 +33,7 @@ class RpcRequest(BaseModel, Generic[Req]):
     class Config:
         # Required for Pydantic to validate generic models
         arbitrary_types_allowed = True
-        json_encoders = {
+        json_encoders: ClassVar[dict] = {
             Req: lambda x: x.dict()
         }
 
@@ -62,7 +63,7 @@ class RpcResponse(BaseModel, Generic[Res]):
     class Config:
         # Required for Pydantic to validate generic models
         arbitrary_types_allowed = True
-        json_encoders = {
+        json_encoders: ClassVar[dict] = {
             Req: lambda x: x.dict()
         }
 
@@ -81,28 +82,28 @@ class RpcResponse(BaseModel, Generic[Res]):
 
 
 class BaseRpcAck(BaseModel):
-    """Basic RPC Response"""
+    """Basic RPC Response."""
     class Success(str, Enum):
         SUCCESS = "success"
         FAILED = "failed"
     success: 'BaseRpcAck.Success' = Success.SUCCESS
-    error: Optional[str] = None
+    error: str | None = None
 
 
 class BaseRpcPageAck(BaseRpcAck):
-    """Basic RPC Response with pagination"""
+    """Basic RPC Response with pagination."""
     page: int
     total_pages: int
 
 
 class RpcEndpoint(Generic[Req, Res]):
-    """RPC Endpoint Definition
+    """RPC Endpoint Definition.
 
     Args:
         Generic (Req, Res): Request and Response types.
     """
     def __init__(
-        self, topic: RpcEndpointTopic, request_model: Type[Req], response_model: Type[Res] = BaseRpcAck
+        self, topic: RpcEndpointTopic, request_model: type[Req], response_model: type[Res] = BaseRpcAck
     ):
         """Create a new RPC Endpoint Definition.
 

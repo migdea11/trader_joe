@@ -1,8 +1,8 @@
+from typing import Any
 from unittest.mock import patch
-from typing import Any, Dict
 
 
-def mock_get_env_var(env_values: Dict[str, Any]):
+def mock_get_env_var(env_values: dict[str, Any]):
     def side_effect(key, default=None, cast_type=str):
         env_value = env_values.get(key)
         if isinstance(env_value, tuple):

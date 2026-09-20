@@ -1,6 +1,6 @@
 from datetime import timedelta
 from enum import StrEnum
-from typing import Generic, Self, Type, TypeVar
+from typing import Generic, Self, TypeVar
 
 from common.enums.pydantic_enums import NamedIntEnum
 
@@ -58,9 +58,9 @@ class BrokerGranularityBase(Generic[T]):
 
     @classmethod
     def from_broker_code(
-        cls: Type["BrokerGranularityBase"], broker_code: T
+        cls: type["BrokerGranularityBase"], broker_code: T
     ) -> Self:
-        """Find and return the granularity mapping for a given broker-specific
+        """Find and return the granularity mapping for a given broker-specific.
 
         Args:
             cls (Type[BrokerGranularityBase&quot])
@@ -80,7 +80,7 @@ class BrokerGranularityBase(Generic[T]):
 
     @classmethod
     def from_granularity(
-        cls: Type["BrokerGranularityBase"], granularity: Granularity
+        cls: type["BrokerGranularityBase"], granularity: Granularity
     ) -> Self:
         """Find and return the granularity mapping for a given standardized granularity.
 

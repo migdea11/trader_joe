@@ -1,15 +1,16 @@
-import pytest
-from unittest.mock import MagicMock, patch, AsyncMock
-import pytest_asyncio
-from sqlalchemy.engine import Engine
-from sqlalchemy.ext.asyncio import AsyncEngine
-from sqlalchemy.ext.asyncio import AsyncSession
-from psycopg2 import OperationalError
-from asyncpg import CannotConnectNowError
-from sqlalchemy.engine.url import URL
-
 # Set environment variables
 import os
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+import pytest_asyncio
+from asyncpg import CannotConnectNowError
+from psycopg2 import OperationalError
+from sqlalchemy.engine import Engine
+from sqlalchemy.engine.url import URL
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+
+
 os.environ["POSTGRES_ASYNC"] = "True"
 os.environ["POSTGRES_SYNC"] = "True"
 
@@ -67,9 +68,11 @@ def test_sync_initialize(
 
 @patch("common.environment.get_env_var", return_value=False)  # Mock sync disabled
 def test_sync_disabled(mock_get_env_var, mock_sync_uri: URL, cleanup):
-    with patch("common.database.postgres_tools._POSTGRES_SYNC_ENABLED", False):
-        with pytest.raises(RuntimeError, match="Postgres sync is not enabled."):
-            PostgresSessionFactory.SyncSession.wait_for_db(mock_sync_uri, timeout=0)
+    with (
+        patch("common.database.postgres_tools._POSTGRES_SYNC_ENABLED", False),
+        pytest.raises(RuntimeError, match=r"Postgres sync is not enabled\."),
+    ):
+        PostgresSessionFactory.SyncSession.wait_for_db(mock_sync_uri, timeout=0)
 
 
 @patch("common.database.postgres_tools.psycopg2.connect")
@@ -115,9 +118,11 @@ async def test_async_initialize(
 @pytest.mark.asyncio
 async def test_async_disabled(mock_async_uri: URL):
     # Ensure async methods raise an error when async is disabled
-    with patch("common.database.postgres_tools._POSTGRES_ASYNC_ENABLED", False):
-        with pytest.raises(RuntimeError, match="Postgres async is not enabled."):
-            await PostgresSessionFactory.AsyncSessionHandle.initialize(mock_async_uri, timeout=1)
+    with (
+        patch("common.database.postgres_tools._POSTGRES_ASYNC_ENABLED", False),
+        pytest.raises(RuntimeError, match=r"Postgres async is not enabled\."),
+    ):
+        await PostgresSessionFactory.AsyncSessionHandle.initialize(mock_async_uri, timeout=1)
 
 
 @pytest.mark.asyncio

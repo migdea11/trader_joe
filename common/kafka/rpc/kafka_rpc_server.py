@@ -1,13 +1,15 @@
 import traceback
-from typing import Any, Callable, Coroutine, Generic, Type
+from collections.abc import Callable, Coroutine
+from typing import Any, Generic
 
 from kafka.consumer.fetcher import ConsumerRecord
 
 from common.kafka.kafka_config import RpcParams
 from common.kafka.messaging.kafka_producer import KafkaProducerFactory
-from common.kafka.rpc.kafka_rpc_base import KafkaRpcBase, RpcEndpoint, RpcRequest, Req, Res, RpcResponse
+from common.kafka.rpc.kafka_rpc_base import KafkaRpcBase, Req, Res, RpcEndpoint, RpcRequest, RpcResponse
 from common.kafka.topics import StaticTopic
 from common.logging import get_logger, limit
+
 
 log = get_logger(__name__)
 
@@ -53,7 +55,7 @@ class KafkaRpcServer(Generic[Req, Res], KafkaRpcBase[Req, Res]):
         """
         success = False
         try:
-            request_type: Type[Req] = self.endpoint.request_model
+            request_type: type[Req] = self.endpoint.request_model
             message_value: bytes = message.value
             request = RpcRequest[request_type].model_validate_json(message_value.decode('utf-8'))
 
@@ -69,5 +71,4 @@ class KafkaRpcServer(Generic[Req, Res], KafkaRpcBase[Req, Res]):
         except Exception as e:
             log.error(limit(f"Error processing response: {e}"))
             traceback.print_exc()
-        finally:
-            return success
+        return success
