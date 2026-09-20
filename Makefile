@@ -6,26 +6,46 @@ help:  ## Show this help message
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make <target>\n\nTargets:\n"} \
 		/^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
-UV_VERSION := 0.6.4
+# Matches the uv pinned by CI (.github/workflows) and the Dockerfile.
+UV_VERSION := 0.9.3
+
+# Scopes lint/format/test to one component, e.g. `make test PATHS=common`.
+PATHS ?= .
+
 VENV_MARKER := .venv_init
-$(VENV_MARKER):  ## Internal option to install uv and create a virtual environment
+# Bootstraps uv only when the host has none. An existing uv is used as-is: `uv self update`
+# fails outright for a system- or package-managed install, and would downgrade one that is
+# already newer than the pin.
+#
+# The marker depends on the dependency declarations so the sync re-runs when they change,
+# instead of going stale behind a marker file that already exists.
+$(VENV_MARKER): pyproject.toml uv.lock  ## Internal option to install uv and sync the virtual environment
 	@if ! command -v uv > /dev/null; then \
 		echo "Installing uv $(UV_VERSION)"; \
 		curl -LsSf https://astral.sh/uv/install.sh | sh -s -- --version $(UV_VERSION); \
 	else \
-		if [ "$$(uv --version)" != "$(UV_VERSION)" ]; then \
-			echo "Updating uv to $(UV_VERSION)"; \
-			uv self update $(UV_VERSION); \
+		found=$$(uv --version | awk '{print $$2}'); \
+		oldest=$$(printf '%s\n%s\n' "$$found" "$(UV_VERSION)" | sort -V | head -n1); \
+		if [ "$$oldest" = "$(UV_VERSION)" ]; then \
+			echo "Using uv $$found already on PATH"; \
+		else \
+			echo "Warning: uv $$found is older than the pinned $(UV_VERSION); upgrade it if a command fails"; \
 		fi; \
 	fi
 	@if [ ! -d .venv ]; then \
 		echo "Creating uv venv"; \
 		uv venv; \
 	fi
+# Sync here, not only in `init`, so every target below gets a usable environment on a bare
+# checkout: the test suite imports asyncpg and sqlalchemy, which live in the data-store group
+# and so are not covered by `default-groups`. The group set matches CI, less `security` —
+# that tooling is heavy and only `make security` needs it. Unlike CI this omits `--locked`:
+# CI must fail when the lock is stale, but locally that would block anyone mid-edit of
+# pyproject.toml.
+	uv sync --all-groups --no-group security
 	touch $(VENV_MARKER)
 
-init: $(VENV_MARKER)  ## Initialize the project
-	@source .venv/bin/activate
+init: $(VENV_MARKER)  ## Initialize the project, including the security tooling
 	uv sync --all-groups
 
 build: $(VENV_MARKER)  ## Build the Docker images
@@ -80,12 +100,14 @@ clean: launch-down  ## Clean up the project
 	[[ -d .coverage ]] && rm -rf .coverage || true
 	[[ -d coverage.xml ]] && rm -rf coverage.xml || true
 
-lint: $(VENV_MARKER)  ## Lint the project
-	uv run ruff check .
+lint: $(VENV_MARKER)  ## Lint and format-check the project (scope with PATHS=)
+	uv run ruff check $(PATHS)
+	uv run ruff format --check $(PATHS)
 
 SOURCE_DIRS := ./common ./router ./schemas ./data
-lint-fix:  ## Lint the project and fix
-	uv run ruff check --fix .
+lint-fix: $(VENV_MARKER)  ## Apply lint fixes and formatting (scope with PATHS=)
+	uv run ruff check --fix $(PATHS)
+	uv run ruff format $(PATHS)
 
 security: $(VENV_MARKER)  ## Check security vulnerabilities
 	uv run bandit -r $(SOURCE_DIRS) --exclude tests/
@@ -95,9 +117,11 @@ security: $(VENV_MARKER)  ## Check security vulnerabilities
 	uv run pip-audit -r requirements.txt --disable-pip
 	rm requirements.txt
 
-test: lint  ## Run tests
-	uv run pytest
+# Deliberately independent of `lint`: a test run must report a test result, not a lint failure.
+# CI runs both, as separate steps.
+test: $(VENV_MARKER)  ## Run tests (scope with PATHS=)
+	POSTGRES_ASYNC=true POSTGRES_SYNC=true uv run pytest $(PATHS)
 
-test-cov: lint  ## Run tests with coverage
-	uv run coverage run -m pytest
+test-cov: $(VENV_MARKER)  ## Run tests with coverage (scope with PATHS=)
+	POSTGRES_ASYNC=true POSTGRES_SYNC=true uv run coverage run -m pytest $(PATHS)
 	uv run coverage xml

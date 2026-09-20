@@ -9,7 +9,7 @@ USER appuser
 WORKDIR /code
 
 # Install common dependencies
-COPY --from=ghcr.io/astral-sh/uv:0.6.4 /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.9.3 /uv /uvx /bin/
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
 ENV PYTHONPATH="/code"
 ENV PATH="/code/.venv/bin:${PATH}"

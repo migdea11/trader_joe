@@ -9,5 +9,5 @@ Take a look at the `Makefile` for all the major commands.
 ```
 # Example of launching dev container
 make build
-make launch-dev
+make dev-launch
 ```
