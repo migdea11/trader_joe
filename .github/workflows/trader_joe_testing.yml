@@ -202,7 +202,6 @@ jobs:
           ALPACA_API_SECRET=${{ secrets.ALPACA_API_SECRET }}
           EOF
           chmod 600 data/ingest/.env
-          cat data/ingest/.env
 
       - name: Start System
         run: |
