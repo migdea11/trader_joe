@@ -83,6 +83,10 @@ Then also check:
 - Every subject ≤ 72 characters, house format, `Bead:` the only trailer.
   Agents re-add `Co-Authored-By` and session links against convention — grep for
   them and strip them.
+- **Drop the `[agent-name]` tag from regrouped subjects.** A working commit
+  carries the name of the agent that wrote it; a regrouped commit absorbs
+  several, so any single tag is false. Keep the `Bead:` trailer — list more than
+  one where a group spans beads.
 - `make lint` and `make test` on the final tree.
 - Each commit self-consistent, if the branch is long enough to warrant it.
 

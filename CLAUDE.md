@@ -90,7 +90,7 @@ Bead: <bead-id>
 
 | Part | Rule |
 |---|---|
-| Tag | The committing agent's name, exactly as in `.claude/workflow.yml`. The main session uses `[orchestrator]`. Optional on commits a human writes by hand. |
+| Tag | The committing agent's name, exactly as in `.claude/workflow.yml`; `[orchestrator]` for the main session. Optional for a human. **Dropped when commits are regrouped for review** — a squashed commit merges several agents' work, so one name would be a lie. If the tag pushes the subject past 72, shorten the summary; never drop the tag on a working commit. |
 | Type | `feat`, `fix`, `refactor`, `perf`, `test`, `docs`, `build`, `ci`, `chore` |
 | Scope | Optional. The component or area touched, kebab-case — matches the `area:` label. |
 | Summary | Imperative, lower-case, no trailing period, whole subject ≤ 72 characters. |
