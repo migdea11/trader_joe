@@ -28,8 +28,11 @@ ARG SERVICE_NAME=none
 # Install service-specific dependencies
 RUN uv sync --only-group base --only-group ${SERVICE_PATH}-${SERVICE_NAME} --frozen
 
-# Set entrypoint and environment variable
-COPY ./.env /code/.env
+# NOTE: the build deliberately copies no .env. Configuration arrives at runtime through
+# compose's env_file:, and a baked .env would put whatever the build host happened to
+# have -- Alpaca keys, database password -- into an image layer that is then pushed to
+# GHCR. data/store/migrations/env.py calls load_dotenv('.env'), which is a no-op when the
+# file is absent; it reads DATABASE_URI from the process environment either way.
 
 # Add common files
 COPY ./entrypoint.sh /code/entrypoint.sh

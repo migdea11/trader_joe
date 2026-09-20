@@ -8,6 +8,13 @@ from common.logging import get_logger
 
 log = get_logger(__name__)
 
+# debugpy.listen() opens a socket that runs arbitrary code inside this process, so the
+# fallback binds loopback. Reaching the debugger from outside the container takes two
+# deliberate steps -- setting APP_INTERNAL_DEBUG_HOST to a wider address *and* publishing
+# the port in compose -- and neither is a default.
+DEFAULT_DEBUG_HOST = '127.0.0.1'
+DEFAULT_DEBUG_PORT = 5678
+
 
 def startup_logs(app: FastAPI):
     """Startup logs for the app.
@@ -40,9 +47,9 @@ def startup_logs(app: FastAPI):
 def init_debugger():
     """Initialize debug mode."""
     if get_run_mode() is RunMode.DEV:
-        debug_internal_host = get_env_var('APP_INTERNAL_DEBUG_HOST', cast_type=str)
-        debug_internal_port = get_env_var('APP_INTERNAL_DEBUG_PORT', cast_type=int)
-        log.info(f'Initializing debugger to port {debug_internal_port}...')
+        debug_internal_host = get_env_var('APP_INTERNAL_DEBUG_HOST', default=DEFAULT_DEBUG_HOST, cast_type=str)
+        debug_internal_port = get_env_var('APP_INTERNAL_DEBUG_PORT', default=DEFAULT_DEBUG_PORT, cast_type=int)
+        log.info(f'Initializing debugger on {debug_internal_host}:{debug_internal_port}...')
         import debugpy
 
         debugpy.listen((debug_internal_host, debug_internal_port))

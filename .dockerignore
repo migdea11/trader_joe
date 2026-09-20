@@ -3,6 +3,13 @@ docker-compose.yml
 Dockerfile
 .dockerignore
 
+# Environments. These hold live credentials -- data/ingest/.env carries the Alpaca API
+# key -- and nothing in the image reads them: compose supplies configuration at runtime
+# via env_file:. Keeping them out of the build context means a stray COPY cannot pick
+# one up either. .env.default is committed and harmless, so it is not excluded.
+.env
+**/.env
+
 # Virtual environment
 .venv/
 .venv_init

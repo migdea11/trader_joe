@@ -40,7 +40,14 @@ def get_env_var(var_name: str, default: type[T] | None = None, cast_type: type[T
 def get_run_mode() -> str:
     """Get the run mode (dev or prod).
 
+    Defaults to PROD. DEV is the mode that opens a debugpy socket (see
+    common.app_lifecycle.init_debugger), so an unset RUN_MODE must not select it --
+    anything running outside the dev image (tests, scripts, a bare uvicorn) inherits
+    no RUN_MODE at all. The dev image sets RUN_MODE=dev explicitly (Dockerfile), which
+    is the only thing that should. An unrecognised value falls back here too, because
+    get_env_var() returns the default when the cast fails.
+
     Returns:
         str: Run mode.
     """
-    return get_env_var('RUN_MODE', default=RunMode.DEV, cast_type=RunMode)
+    return get_env_var('RUN_MODE', default=RunMode.PROD, cast_type=RunMode)

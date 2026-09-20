@@ -117,6 +117,11 @@ jobs:
         cp .env.default .env
         cp data/ingest/.env.default data/ingest/.env
         cp data/store/.env.default data/store/.env
+        # .env.default ships no database password on purpose (tj-glqs4r) and compose
+        # refuses to interpolate without one -- it fails the whole file, build included.
+        # This runner's Postgres is thrown away with the job, so a throwaway password is
+        # the right answer; a shared secret would only be one more thing to leak.
+        echo "POSTGRES_PASS=$(openssl rand -hex 24)" >> .env
         docker compose -f docker-compose.yaml build
         docker images  # List built images
 
@@ -180,6 +185,10 @@ jobs:
           ls -lahR artifact/
           cp artifact/docker-compose.yaml ./docker-compose.yaml
           cp artifact/.env.default ./.env
+          # Same throwaway credential as the build job, regenerated here: the two jobs
+          # run on different runners and this one is the one that actually starts
+          # Postgres, so the value only has to be consistent within this job.
+          echo "POSTGRES_PASS=$(openssl rand -hex 24)" >> .env
 
           mkdir -p data/ingest
           cp artifact/data/ingest/.env.default data/ingest/.env

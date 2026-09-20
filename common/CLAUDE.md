@@ -18,7 +18,9 @@ Changing anything here affects both services. The Kafka topic registry is the in
 
 | Variable | Purpose | Default |
 |---|---|---|
-| RUN_MODE | dev enables the debugger | defaults to DEV (bug tj-g1qqf1) |
+| RUN_MODE | `dev` enables the debugger; only the dev image sets it | PROD |
+| APP_INTERNAL_DEBUG_HOST | address debugpy binds when RUN_MODE=dev | 127.0.0.1 |
+| APP_INTERNAL_DEBUG_PORT | port debugpy binds when RUN_MODE=dev | 5678 |
 
 ## Common pitfalls
 
