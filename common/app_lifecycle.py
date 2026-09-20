@@ -1,14 +1,10 @@
-from typing import TYPE_CHECKING
-
 from fastapi import FastAPI
+from fastapi.routing import iter_route_contexts
 
 from common.enums.config_enum import RunMode
 from common.environment import get_env_var, get_run_mode
 from common.logging import get_logger
 
-
-if TYPE_CHECKING:
-    from starlette.routing import Route
 
 log = get_logger(__name__)
 
@@ -22,9 +18,23 @@ def startup_logs(app: FastAPI):
     log.info('Starting up app...')
     log.info(f'App run mode: {get_run_mode()}')
     log.info('Routes:')
-    route: Route
-    for route in app.routes:
-        log.info(f'  Path: {route.path}, Method(s): {route.methods}, Name: {route.name}')
+    # fastapi 0.141 no longer puts the included routes in app.routes: each
+    # include_router() call leaves a single _IncludedRouter placeholder, which is a
+    # BaseRoute with no .path/.methods/.name. iter_route_contexts flattens those back
+    # into the real endpoints with their prefixes applied -- it is what fastapi's own
+    # OpenAPI generation uses (fastapi/openapi/utils.py), so it stays in step with how
+    # the app actually routes. Skipping the placeholders instead would silently reduce
+    # this log to /docs, /redoc and /openapi.json.
+    for route in iter_route_contexts(app.routes):
+        # Version-fragile, pinned to fastapi 0.141.1: a websocket route reached through
+        # include_router() comes back with path/name blank (an HTTP one resolves fine).
+        # original_route only carries the innermost router's prefix, so the fallback can
+        # be a partial path -- flagged rather than printed as if it were the real one.
+        # Recheck on the next fastapi bump; there are no websocket routes today.
+        path = route.path or f'{getattr(route.original_route, "path", "?")} (unresolved)'
+        methods = ', '.join(sorted(route.methods)) if route.methods else '-'
+        name = route.name or getattr(route.original_route, 'name', '') or '-'
+        log.info(f'  Path: {path}, Method(s): {methods}, Name: {name}')
 
 
 def init_debugger():
