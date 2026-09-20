@@ -52,6 +52,19 @@ dev-launch: launch-deps  ## Launch development services
 dev-prune: ## Prune development services
 	docker container prune -f && docker volume prune -f && docker image prune -f
 
+AGENT_COMPOSE := docker compose -f .devcontainer/compose.yml
+agent-build:  ## Build the agent devcontainer image
+	$(AGENT_COMPOSE) build
+
+agent-up:  ## Start the agent devcontainer
+	$(AGENT_COMPOSE) up -d
+
+agent-down:  ## Stop the agent devcontainer (config volume is kept)
+	$(AGENT_COMPOSE) down
+
+agent-attach:  ## Open a shell inside the agent devcontainer
+	$(AGENT_COMPOSE) exec agent bash
+
 clean: launch-down  ## Clean up the project
 	rm -rf .venv $(VENV_MARKER)
 	[[ -d .pytest_cache ]] && rm -rf .pytest_cache || true

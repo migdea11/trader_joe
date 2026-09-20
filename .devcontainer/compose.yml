@@ -1,0 +1,29 @@
+# Generic bootstrap container for trader_joe — phase A0.
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /workspace
+    volumes:
+      # The project itself.
+      - ..:/workspace:cached
+
+      # The kit, read-only: a project session must never write to it. The default keeps an unset
+      # variable from expanding to an empty source and producing a silently broken mount.
+      - ${AGENT_KIT_PATH:-$HOME/repos/agent-workflow}:/kit:ro
+
+      # Host credentials, as a single file — rendered by workflow-init only when that file exists,
+      # because a bind mount whose source is missing makes Docker create it on the host as a
+      # root-owned directory. Never mount the whole host config directory: the entrypoint writes
+      # skill symlinks pointing at /kit, which does not exist on the host.
+      - ${HOME}/.claude.json:/home/agent/.claude.json
+
+      # Agent config and session state, container-local but surviving rebuilds.
+      - agent-config:/home/agent/.claude
+    environment:
+      - CLAUDE_CONFIG_DIR=/home/agent/.claude
+    command: ["sleep", "infinity"]
+
+volumes:
+  agent-config:

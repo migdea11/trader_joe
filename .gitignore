@@ -23,3 +23,10 @@ coverage.xml
 
 # Default Volume locations
 ./data/postgres
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+*.gate.lock*
