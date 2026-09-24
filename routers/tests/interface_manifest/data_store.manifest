@@ -6,7 +6,6 @@
 # it gets one; POST /store/... also reaches Kafka. That is what the touches field is for.
 #
 # kind | address | file | symbol | request | response | touches
-http | DELETE /internal/asset-data/{asset_type}/{data_type} | routers/data_store/internal_asset_data.py | delete_stock_market_activity_data | schemas.data_store.asset_data_interface.AssetDataPath | - | list[str], sqlalchemy.ext.asyncio.session.AsyncSession
 http | DELETE /store/{id} | routers/data_store/asset_dataset_store.py | delete_data | schemas.data_store.asset_dataset_store.AssetDatasetStoreDelete | - | sqlalchemy.ext.asyncio.session.AsyncSession
 http | GET /internal/asset-data/{asset_type}/{data_type} | routers/data_store/internal_asset_data.py | read_stock_market_activity_data | schemas.data_store.asset_data_interface.AssetDataPath | list[schemas.data_store.stock.market_activity_data.StockDataMarketActivity] | sqlalchemy.ext.asyncio.session.AsyncSession
 http | GET /store/{asset_type}/{data_type}/{asset_symbol} | routers/data_store/asset_dataset_store.py | get_data | schemas.data_store.asset_dataset_store.StoreAssetDatasetPath, schemas.data_store.asset_dataset_store.StoreAssetDatasetQuery | list[schemas.data_store.asset_dataset_store.AssetDatasetStore] | sqlalchemy.ext.asyncio.session.AsyncSession

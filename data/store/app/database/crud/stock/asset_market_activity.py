@@ -1,6 +1,6 @@
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import Insert, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,12 +18,16 @@ class UnsupportedAssetType(ValueError):
         super().__init__(f'Asset type not supported: {asset_type}')
 
 
-async def create_market_activity_data(db: AsyncSession, asset_data: market_activity_data.StockDataMarketActivityCreate):
+async def create_market_activity_data(
+    db: AsyncSession, asset_data: market_activity_data.StockDataMarketActivityCreate
+) -> market_activity_data.StockDataMarketActivity:
     log.debug('Storing asset market activity data')
     asset_table = StockMarketActivity
-    db_asset_market_activity_data = asset_table(**asset_data.model_dump(exclude={'asset_type'}))
-    await db.add(db_asset_market_activity_data)
+    db_asset_market_activity_data = asset_table(**asset_table.from_create(asset_data))
+    db.add(db_asset_market_activity_data)
     await db.commit()
+    await db.refresh(db_asset_market_activity_data)
+    return db_asset_market_activity_data.to_schema()
 
 
 def build_market_activity_upsert(values: list[dict[str, Any]]) -> Insert:
@@ -103,10 +107,3 @@ async def read_all_asset_market_activity_data(db: AsyncSession) -> list[market_a
 
     schema_objects = [model_data.to_schema() for model_data in db_stock_market_activities]
     return schema_objects
-
-
-async def delete_all_market_activity_data(db: AsyncSession):
-    log.debug('Deleting all stock market activity data')
-    stmt = delete(StockMarketActivity)
-    await db.execute(stmt)
-    db.commit()

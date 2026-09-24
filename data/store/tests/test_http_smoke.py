@@ -55,24 +55,32 @@ UNBOUND_PATH = 'unbound-path'
 # manifest says it is; 500 means it is mounted and broken.
 UNREACHABLE_STATUSES = (404, 405)
 
-# Two routes that CANNOT answer a well-formed request today, for reasons that have nothing to do
-# with the database being absent. Both were found by this file and are filed against builder-store,
-# whose scope routers/data_store is -- a validator that patches the code under test has destroyed
-# the review. strict=True: when the route is fixed the test goes RED (XPASS), which is the signal
-# to delete the entry here in the same diff. This is not a skip -- the request is really made and
-# its failure is really observed -- and it is not an assertion that 500 is correct, which is what
+# A route that CANNOT answer a well-formed request today, for reasons that have nothing to do
+# with the database being absent. Found by this file and filed against builder-store, whose scope
+# routers/data_store is -- a validator that patches the code under test has destroyed the review.
+# strict=True: when the route is fixed the test goes RED (XPASS), which is the signal to delete
+# the entry here in the same diff. This is not a skip -- the request is really made and its
+# failure is really observed -- and it is not an assertion that 500 is correct, which is what
 # writing `assert status == 500` would have meant.
+#
+# DELETE /internal/asset-data/{asset_type}/{data_type} (tj-h7ikz2) is no longer here: builder-store
+# removed the route rather than repair it. Its schema, StockDataMarketActivityDeleteById, inherits
+# a plain ABC (AssetDataDeleteById, tj-9dqfjo) that cannot be constructed with **kwargs, so keeping
+# the route working would have needed a schemas/ fix outside builder-store's scope; the route also
+# carried a stale '# TODO this will be removed in the future' comment and its crud function deleted
+# every row in the table regardless of any argument. See tj-h7ikz2 for the full reasoning.
 KNOWN_BROKEN = {
+    # tj-v7340n's original three defects (the bad log field, the awaited sync `db.add()`, and the
+    # missing return) are fixed. What remains, still filed against tj-v7340n:
+    # create_market_activity_data now does `db.add(...); await db.commit(); await db.refresh(...)`
+    # to populate the response's DB-generated id/created_at/updated_at -- the standard async
+    # SQLAlchemy pattern -- but FakeSession below has no `refresh`, so the well-formed request
+    # still raises AttributeError. Adding `refresh` to FakeSession is this file's call, not
+    # builder-store's, which is why it is left unadded rather than the fixture being extended here.
     'POST /internal/asset-data/{asset_type}/{data_type}': (
-        'tj-v7340n: the handler logs asset_path.asset_symbol, which AssetDataPath does not have; '
-        'behind that, crud writes `await db.add(...)` and returns None against a declared '
-        'response_model'
-    ),
-    'DELETE /internal/asset-data/{asset_type}/{data_type}': (
-        'tj-h7ikz2: `Annotated[list[str], Depends()]` makes FastAPI call list(args=, kwargs=); '
-        'behind that, a plain-ABC schema is constructed with ** and a 1-arg crud function is '
-        'called with 2'
-    ),
+        "tj-v7340n: create_market_activity_data awaits db.refresh(...) to populate the response's "
+        'DB-generated id/created_at/updated_at, and FakeSession has no refresh method'
+    )
 }
 
 
@@ -143,22 +151,6 @@ CASES: dict[str, Case] = {
         request={'json': DATA_POINT},
         malformed_path_params={**ASSET_PATH, 'asset_type': 'not-an-asset-type'},
         malformed_request={'json': DATA_POINT},
-        malformed_field='asset_type',
-    ),
-    'DELETE /internal/asset-data/{asset_type}/{data_type}': Case(
-        path_params=ASSET_PATH,
-        # args and kwargs are not a contract anybody designed: they are what FastAPI synthesises
-        # from `Annotated[list[str], Depends()]`. Sent so that the well-formed call fails on the
-        # route's defect (tj-h7ikz2) rather than on a missing parameter.
-        request={'params': {'args': 'x', 'kwargs': 'y'}},
-        malformed_path_params={**ASSET_PATH, 'asset_type': 'not-an-asset-type'},
-        # The malformed half deliberately does NOT send args and kwargs, unlike the well-formed
-        # half above. FastAPI solves that dependency before it reports the path-parameter failure,
-        # so sending them calls list(args=, kwargs=) and the request raises instead of returning
-        # 422. Omitting them leaves the 422 to fire on asset_type, which is what this half is
-        # about. When tj-h7ikz2 is fixed, both halves should use whatever the real contract turns
-        # out to be.
-        malformed_request={},
         malformed_field='asset_type',
     ),
     'GET /store/{asset_type}/{data_type}/{asset_symbol}': Case(
