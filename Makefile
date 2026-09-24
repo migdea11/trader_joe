@@ -60,7 +60,12 @@ init: $(VENV_MARKER)  ## Initialize the project, including the security tooling
 #
 # The two stacks differ only in the override: dev_image (RUN_MODE=dev, --reload, the dev
 # dependency group, and the debugger of tj-g1qqf1), source bind mounts so reload sees host
-# edits, and LOG_LEVEL=debug. Nothing structural. PROD_COMPOSE must never grow the override.
+# edits, LOG_LEVEL=debug, and LATENCY_TEST_ENABLED=true on data_store and data_ingest. The
+# first three change how the services are built and how loudly they log; the last changes what
+# they DO at startup -- both create the latency Kafka topics and their RPC client/server
+# consumers, and data_store serves GET /latency (tj-8mt207). That is the whole reason
+# PROD_COMPOSE must never grow the override: loading it here would put the harness back into
+# prod, which is the environment this repo exists to keep it out of.
 #
 # TOOLS_COMPOSE is the dev pair plus docker-compose.tools.yaml, which holds pgAdmin and nothing
 # else. Only dev-tools and dev-down use it (tj-ae3n49). pgAdmin's PGADMIN_EMAIL/PGADMIN_PASS use

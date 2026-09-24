@@ -17,10 +17,27 @@ from pathlib import Path, PurePosixPath
 import pytest
 import yaml
 
+from common.environment import get_env_var
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_DIR = REPO_ROOT / '.github' / 'workflows'
 COMPOSE_FILE = REPO_ROOT / 'docker-compose.yaml'
+OVERRIDE_FILE = REPO_ROOT / 'docker-compose.override.yaml'
+ENV_DEFAULT_FILE = REPO_ROOT / '.env.default'
+MAKEFILE = REPO_ROOT / 'Makefile'
+
+# tj-8mt207. The harness is a load generator, not a feature: when it is on, data_store and
+# data_ingest each create the latency Kafka topics and an RPC consumer at startup, called or
+# not. It must be on in dev -- tj-3mk3u5.8 needs the REST vs Kafka vs gRPC comparison before
+# the Kafka arm can be deleted -- and off everywhere else.
+LATENCY_FLAG = 'LATENCY_TEST_ENABLED'
+
+# Both halves, always. routers/common/latency.py guards the client (initialize_latency_client,
+# served by data_store) and the server (initialize_latency_server, answered by data_ingest) on
+# the same flag, read once at import. Enabling one alone is the failure worth a test: the stack
+# still boots, every healthcheck stays green, and GET /latency hangs until LATENCY_TEST_TIMEOUT.
+LATENCY_SERVICES = ('data_store', 'data_ingest')
 
 # Prefixes that identify a secret authenticating to a broker or brokerage account.
 # tj-59cce6 states the rule in full; this is its machine-checkable form. Extend this
@@ -290,6 +307,69 @@ def _stage_ancestry(target: str) -> list[str]:
     return chain
 
 
+def _env_file_values(path: Path) -> dict[str, str]:
+    """Return the `NAME=value` pairs of an env file, in file order.
+
+    Deliberately not a shell parser. An env file read by `env_file:` is not sourced: compose
+    takes the whole of the rest of the line as the value, so there is no quote removal and no
+    inline-comment stripping to do here either. A line with no `=` is not an assignment.
+    """
+    values = {}
+    for line in path.read_text(encoding='utf-8').splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#') or '=' not in stripped:
+            continue
+        name, _, value = stripped.partition('=')
+        values[name.strip()] = value
+    return values
+
+
+def _compose_service_environment(path: Path, service: str) -> dict[str, str | None]:
+    """Return a compose service's `environment:` block as a mapping, whichever form it is written in.
+
+    Compose accepts both, and this repository uses both -- postgres is written as a mapping
+    (`POSTGRES_DB: ${...}`) and data_store as a list (`- DATABASE_URI=...`) in the same file --
+    so a check that understood only one would silently pass the other by finding nothing.
+
+    None is the value of a list entry with no `=`, which is not an assignment at all: it passes
+    the variable through from the host environment. Mapping to None rather than '' keeps that
+    distinguishable from an explicit assignment to the empty string.
+    """
+    spec = (_load_yaml(path).get('services') or {}).get(service) or {}
+    environment = spec.get('environment')
+    if environment is None:
+        return {}
+    if isinstance(environment, dict):
+        return {str(name): None if value is None else str(value) for name, value in environment.items()}
+    values: dict[str, str | None] = {}
+    for entry in environment:
+        name, separator, value = str(entry).partition('=')
+        values[name.strip()] = value if separator else None
+    return values
+
+
+def _reads_as_enabled(value: str | None, monkeypatch: pytest.MonkeyPatch) -> bool:
+    """Return what the application would make of `value`, using the application's own caster.
+
+    The question is never "is the committed string 'false'" -- it is "does the app read this as
+    on". Those differ: `1` is on and `False` is off, and a string comparison gets at least one of
+    them wrong. common.environment.get_env_var is the only thing that decides, and
+    routers/common/latency.py:17 calls it with exactly these arguments, so this asks it.
+    """
+    if value is None:
+        monkeypatch.delenv(LATENCY_FLAG, raising=False)
+    else:
+        monkeypatch.setenv(LATENCY_FLAG, value)
+    return get_env_var(LATENCY_FLAG, default=False, cast_type=bool)
+
+
+def _make_variable(name: str) -> str:
+    """Return the right-hand side of a `NAME := value` assignment in the Makefile."""
+    match = re.search(rf'^{re.escape(name)}\s*:?=\s*(.*)$', MAKEFILE.read_text(encoding='utf-8'), re.MULTILINE)
+    assert match is not None, f'{MAKEFILE.name} defines no {name}'
+    return match.group(1).strip()
+
+
 def test_workflow_directory_is_not_empty():
     """Guard the guard: every other test here passes vacuously on an empty directory."""
     assert _workflow_files(), f'no workflow files found under {WORKFLOW_DIR}'
@@ -547,3 +627,94 @@ def test_compose_app_probes_use_an_interpreter_the_image_actually_has():
         assert '/code/.venv/bin/python' in joined, (
             f'service {name!r} does not probe with the venv interpreter: {joined}'
         )
+
+
+def test_latency_harness_is_off_in_the_env_default(monkeypatch: pytest.MonkeyPatch):
+    """tj-8mt207: .env.default is copied into every environment, so the harness must be off in it.
+
+    This is the file CI copies to .env (trader_joe_testing.yml, "Stage Pipeline Configs") and the
+    file a prod deployment is seeded from. Shipping it on is how a load generator ended up running
+    in production: nothing fails, no probe goes red, both services just permanently hold a Kafka
+    RPC consumer and a set of topics nobody asked for. A regression here is silent, which is the
+    whole reason it is worth a test rather than a comment.
+    """
+    values = _env_file_values(ENV_DEFAULT_FILE)
+    assert LATENCY_FLAG in values, (
+        f'{ENV_DEFAULT_FILE.name} no longer assigns {LATENCY_FLAG}. Leaving it unset happens to be '
+        f'off today, because routers/common/latency.py defaults it False -- but the point of naming '
+        f'it here is that the value is a decision on the record. Set it to false explicitly.'
+    )
+    assert not _reads_as_enabled(values[LATENCY_FLAG], monkeypatch), (
+        f'{ENV_DEFAULT_FILE.name} sets {LATENCY_FLAG}={values[LATENCY_FLAG]!r}, which the app reads '
+        f'as ON. Every environment is copied from this file, prod and CI included. Turn the harness '
+        f'on in {OVERRIDE_FILE.name}, which only the dev stack loads.'
+    )
+
+
+@pytest.mark.parametrize('service', LATENCY_SERVICES)
+def test_latency_harness_is_on_for_both_services_in_the_dev_override(service: str, monkeypatch: pytest.MonkeyPatch):
+    """tj-8mt207: the dev override turns the harness on, and must do it for the client and the server.
+
+    Parametrized per service on purpose: the failure this exists to catch is someone removing or
+    missing ONE of the two entries. data_store is the client -- it serves GET /latency -- and
+    data_ingest is the server that answers it over REST and Kafka RPC. Half a pair is worse than
+    neither half, because it looks configured: the stack comes up healthy and the endpoint hangs
+    until LATENCY_TEST_TIMEOUT with nothing in the logs to say why.
+
+    The harness has to survive in dev because tj-3mk3u5.8 needs the REST vs Kafka vs gRPC
+    measurement before any deletion task in that epic can run, and that measurement is only
+    possible while all three transports exist.
+    """
+    environment = _compose_service_environment(OVERRIDE_FILE, service)
+    assert LATENCY_FLAG in environment, (
+        f'{OVERRIDE_FILE.name} does not set {LATENCY_FLAG} for {service!r}. Both {LATENCY_SERVICES} '
+        f'need it: this is the only file that turns the harness on, and enabling one service alone '
+        f'leaves a client with no server.'
+    )
+    assert _reads_as_enabled(environment[LATENCY_FLAG], monkeypatch), (
+        f'{OVERRIDE_FILE.name} sets {LATENCY_FLAG}={environment[LATENCY_FLAG]!r} for {service!r}, '
+        f'which the app reads as OFF. `make dev-launch` then cannot run the transport comparison '
+        f'tj-3mk3u5.8 is blocked on.'
+    )
+
+
+def test_prod_compose_does_not_enable_the_latency_harness(monkeypatch: pytest.MonkeyPatch):
+    """tj-8mt207: the harness is turned on in the dev override and nowhere else.
+
+    Flipping .env.default buys nothing if the next person re-enables the harness in the base
+    compose file instead, and that is the easy mistake to make -- it is the file everything
+    loads, which is exactly why it is the wrong place. Any assignment here reaches prod.
+    """
+    offenders = []
+    for service in _load_yaml(COMPOSE_FILE)['services']:
+        value = _compose_service_environment(COMPOSE_FILE, service).get(LATENCY_FLAG, _ABSENT)
+        if value is not _ABSENT and _reads_as_enabled(value, monkeypatch):
+            offenders.append(f'{service}={value!r}')
+    assert not offenders, (
+        f'{COMPOSE_FILE.name} enables {LATENCY_FLAG} for {offenders}. This file is loaded by every '
+        f'stack including prod. The harness belongs in {OVERRIDE_FILE.name}, which PROD_COMPOSE '
+        f'never loads.'
+    )
+
+
+def test_prod_compose_command_does_not_load_the_dev_override():
+    """tj-8mt207: the premise every other latency check rests on -- PROD_COMPOSE excludes the override.
+
+    "Turned back on for dev only" is only true while the prod command does not load the file it is
+    turned on in. Makefile already states that as a comment ("PROD_COMPOSE must never grow the
+    override"); a comment does not fail a build, and adding one more `-f` is a plausible edit that
+    would quietly hand prod the dev image, the source bind mounts and the harness at once.
+    """
+    prod_compose = _make_variable('PROD_COMPOSE')
+    assert OVERRIDE_FILE.name not in prod_compose, (
+        f'PROD_COMPOSE is `{prod_compose}`, which loads {OVERRIDE_FILE.name}. That override exists '
+        f'to hold dev-only settings -- the dev image, source bind mounts, debug logging and the '
+        f'latency harness -- and none of them belong in a production stack.'
+    )
+    # The converse: dev must load it, or the harness cannot be reached at all and the entries
+    # asserted above are dead config.
+    dev_compose = _make_variable('DEV_COMPOSE')
+    assert OVERRIDE_FILE.name in dev_compose, (
+        f'DEV_COMPOSE is `{dev_compose}`, which does not load {OVERRIDE_FILE.name}, so nothing '
+        f'turns the latency harness on and tj-3mk3u5.8 has no way to run its comparison.'
+    )

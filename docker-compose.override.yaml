@@ -1,5 +1,13 @@
 # pgAdmin is not here: it lives in docker-compose.tools.yaml, which only `make dev-tools` and
 # `make dev-down` load, so the dev stack needs no PGADMIN_* values (tj-ae3n49).
+#
+# This file is also the one place the latency harness is switched on. .env.default ships
+# LATENCY_TEST_ENABLED=false because every environment is copied from it and the harness costs
+# startup work in both services even when nobody calls GET /latency -- each creates the latency
+# Kafka topics and its RPC consumer. Only the dev stack loads this override (PROD_COMPOSE never
+# does), so enabling it here keeps `make dev-launch` able to run the REST vs Kafka RPC comparison
+# that tj-3mk3u5.8 needs. Both services must carry it: data_store is the client and data_ingest
+# the server, and a client with no server just times out.
 services:
   data_store:
     build:
@@ -12,6 +20,8 @@ services:
       - ./schemas:/code/schemas
     environment:
       - LOG_LEVEL=debug
+      # Latency harness client: serves GET /latency (see the header comment).
+      - LATENCY_TEST_ENABLED=true
     image: trader_joe_data_store:dev
 
   data_ingest:
@@ -24,4 +34,7 @@ services:
       - ./schemas:/code/schemas
     environment:
       - LOG_LEVEL=debug
+      # Latency harness server: answers data_store over REST and Kafka RPC. Must match the
+      # data_store setting above -- enabling one alone leaves a client with no server.
+      - LATENCY_TEST_ENABLED=true
     image: trader_joe_data_ingest:dev
