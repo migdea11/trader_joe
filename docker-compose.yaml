@@ -48,9 +48,9 @@ services:
     # hands every client back BROKER://${BROKER_NAME}:9092, a name that resolves only on
     # the compose network, so a host client reaching in through a published port was
     # redirected to an address it could not connect to. The mapping bought nothing and
-    # put an unauthenticated, plaintext broker on the LAN. Inspect the broker through the
-    # redpanda console (dev override) or `docker compose exec kafka`. BROKER_PORT is
-    # still the port the services connect to inside the network.
+    # put an unauthenticated, plaintext broker on the LAN. Inspect the broker with
+    # `docker compose exec kafka`. BROKER_PORT is still the port the services connect to
+    # inside the network.
     env_file:
       - .env
       - ./data/ingest/.env
@@ -118,10 +118,12 @@ services:
       # Built from the same variables Postgres itself is given, so there is one password
       # in one place and the app cannot drift from the server. The previous fallback,
       # postgresql://postgres:password@db:5432/postgres, was a working credential pair in
-      # a committed file; folded in here because removing the guessable POSTGRES_PASS
-      # default without this would leave alembic authenticating with 'password' against a
-      # server that no longer accepts it. The rest of tj-70ovb3 (data/store/.env.default
-      # referencing undefined DATABASE_USER/DATABASE_PASS) is still open.
+      # a committed file.
+      # This is the only definition of DATABASE_URI under compose: data/store/.env.default
+      # deliberately leaves it unset (tj-70ovb3), and `environment:` would take precedence
+      # over `env_file:` regardless. Its one consumer is data/store/migrations/env.py, which
+      # hands it to alembic; the app builds its own DSN from the discrete POSTGRES_* and
+      # DATABASE_* variables.
       # The port is the container's 5432, not DATABASE_PORT -- that one is the host side
       # of the mapping above and is not what this URI dials.
       - DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASS}@${DATABASE_NAME}:5432/${POSTGRES_DB_NAME}

@@ -1,46 +1,6 @@
+# pgAdmin is not here: it lives in docker-compose.tools.yaml, which only `make dev-tools` and
+# `make dev-down` load, so the dev stack needs no PGADMIN_* values (tj-ae3n49).
 services:
-  pgadmin:
-    image: dpage/pgadmin4:9.17.0
-    container_name: pgadmin
-    ports:
-      # Loopback only: this is a browser UI with a login that holds the database
-      # credentials, so it is reachable from this machine and nowhere else.
-      - "127.0.0.1:${POSTGRES_UI_PORT}:80"
-    environment:
-      # Was admin@admin.com / admin, hard-coded and published on every interface. No
-      # defaults now -- ":?" stops compose before the container exists. Note pgAdmin only
-      # reads these on first initialisation, so changing them does not rotate an account
-      # an earlier run already created in the mounted volume.
-      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:?set PGADMIN_EMAIL in .env}
-      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASS:?set PGADMIN_PASS in .env (6+ characters)}
-    depends_on:
-      # Long form so the UI is not started against a database that is still running initdb;
-      # pgAdmin caches a failed server connection and the first page load looks broken.
-      postgres:
-        condition: service_healthy
-    volumes:
-      - ${DATA_DIR:-./volume_data}/pgadmin:/var/lib/postgresql/data
-    security_opt:
-      - "no-new-privileges:true"
-    read_only: true
-
-  redpanda:
-    image: docker.redpanda.com/redpandadata/console:v3.12.0
-    ports:
-      # Loopback only: the console ships with no authentication and offers full read and
-      # write access to every topic, so LAN reachability here is broker access.
-      - "127.0.0.1:${BROKER_UI_PORT}:8080"
-    environment:
-      - KAFKA_BROKERS=kafka:9092
-    depends_on:
-      # The console polls on a fixed schedule and logs a wall of connection errors when it
-      # starts before the broker answers; waiting on health keeps dev logs readable.
-      kafka:
-        condition: service_healthy
-    security_opt:
-      - "no-new-privileges:true"
-    read_only: true
-
   data_store:
     build:
       target: dev_image
