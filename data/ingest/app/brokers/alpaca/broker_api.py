@@ -20,6 +20,7 @@ from common.enums.data_stock import DataSource, Granularity
 from common.environment import get_env_var
 from common.logging import get_logger
 from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
+from data.ingest.app.brokers.broker_errors import MissingCredentialsError
 from data.ingest.app.brokers.rate_budget import RateBudget, priority_for_update_type
 from data.ingest.app.brokers.request_key import VendorRequestKey
 from data.ingest.app.brokers.single_flight import SingleFlight
@@ -33,21 +34,67 @@ from schemas.data_store.stock.market_activity_data import (
 
 log = get_logger(__name__)
 
-# Cast, because an unset variable and the string 'false' are both truthy without it, and
-# the feed is part of the request key below rather than a log line.
-ALPACA_SIP_ENABLED = get_env_var('ALPACA_SIP_ENABLED', default=False, cast_type=bool)
 # The bars request never sets an adjustment, so every bar we hold is the vendor's raw one.
 # Named here because it is part of the request key: a raw bar is not a split-adjusted one.
 ALPACA_ADJUSTMENT = 'raw'
 
-# Configure Alpaca Client
-API_KEY = get_env_var('ALPACA_API_KEY')
-API_SECRET = get_env_var('ALPACA_API_SECRET')
-# TODO this should probably be wrapped to utilize dependency injection base on source selection
-__CLIENT = StockHistoricalDataClient(API_KEY, API_SECRET)
+ALPACA_CREDENTIAL_VARS = ('ALPACA_API_KEY', 'ALPACA_API_SECRET')
 
+__CLIENT: StockHistoricalDataClient | None = None
 __SINGLE_FLIGHT = SingleFlight()
 __RATE_BUDGET: RateBudget | None = None
+
+
+def sip_enabled() -> bool:
+    """Report whether this process is configured for the SIP feed rather than IEX.
+
+    Read on each call rather than at import, for the same reason the client is built
+    lazily. Cast, because an unset variable and the string 'false' are both truthy
+    without it, and the feed is part of the request key rather than a log line.
+
+    Returns:
+        bool: True when ALPACA_SIP_ENABLED is set to a true value.
+    """
+    return get_env_var('ALPACA_SIP_ENABLED', default=False, cast_type=bool)
+
+
+def get_client() -> StockHistoricalDataClient:
+    """Get this process's Alpaca client, building it on first use.
+
+    BUILT LAZILY, NOT AT IMPORT (tj-84jfb9). get_env_var() returns None for an unset
+    variable, so building the client at module scope made alpaca-py raise at import time
+    and left the whole ingest package unimportable without credentials -- no tests, no
+    app start, and a secret rotation that needed a process restart rather than a fresh
+    client. Callers that want to supply their own client inject it instead; see
+    set_client() and the client argument on get_market_stock_data().
+
+    Returns:
+        StockHistoricalDataClient: Shared client for every Alpaca call this process makes.
+
+    Raises:
+        MissingCredentialsError: If either credential variable is unset or empty.
+    """
+    global __CLIENT
+    if __CLIENT is None:
+        missing = [name for name in ALPACA_CREDENTIAL_VARS if not get_env_var(name)]
+        if missing:
+            raise MissingCredentialsError(f'Alpaca credentials are not configured: {", ".join(missing)} unset')
+        __CLIENT = StockHistoricalDataClient(*(get_env_var(name) for name in ALPACA_CREDENTIAL_VARS))
+    return __CLIENT
+
+
+def set_client(client: StockHistoricalDataClient | None) -> None:
+    """Install a client for this process, or clear the one already built.
+
+    The injection seam: tests pass a stub, and passing None drops the cached client so
+    the next call rebuilds it -- which is what makes a rotated secret take effect without
+    a restart.
+
+    Args:
+        client (StockHistoricalDataClient | None): Client to use, or None to clear.
+    """
+    global __CLIENT
+    __CLIENT = client
 
 
 def get_rate_budget() -> RateBudget:
@@ -100,24 +147,26 @@ def create_stock_quote(data: Quote, symbol: str, granularity: Granularity, sourc
     return None
 
 
-def match_client_request(asset_type: AssetType, data_type: DataType, request_latest: bool) -> tuple[Callable, type]:
+def match_client_request(
+    client: StockHistoricalDataClient, asset_type: AssetType, data_type: DataType, request_latest: bool
+) -> tuple[Callable, type]:
     match (asset_type, data_type, request_latest):
         ### STOCK ###
         ## MARKET ACTIVITY ##
         case (AssetType.STOCK, DataType.MARKET_ACTIVITY, False):
-            return __CLIENT.get_stock_bars, StockBarsRequest
+            return client.get_stock_bars, StockBarsRequest
         case (AssetType.STOCK, DataType.MARKET_ACTIVITY, True):
-            return __CLIENT.get_stock_latest_bar, StockLatestBarRequest
+            return client.get_stock_latest_bar, StockLatestBarRequest
         ## QUOTE ##
         case (AssetType.STOCK, DataType.QUOTE, False):
-            return __CLIENT.get_stock_quotes, StockQuotesRequest
+            return client.get_stock_quotes, StockQuotesRequest
         case (AssetType.STOCK, DataType.QUOTE, True):
-            return __CLIENT.get_stock_latest_quote, StockLatestQuoteRequest
+            return client.get_stock_latest_quote, StockLatestQuoteRequest
         ## TRADE ##
         case (AssetType.STOCK, DataType.TRADE, False):
-            return __CLIENT.get_stock_trades, StockTradesRequest
+            return client.get_stock_trades, StockTradesRequest
         case (AssetType.STOCK, DataType.TRADE, True):
-            return __CLIENT.get_stock_latest_trade, StockLatestTradeRequest
+            return client.get_stock_latest_trade, StockLatestTradeRequest
         ### CRYPTO ###
         ### OPTION ###
         case (_, _):
@@ -125,7 +174,12 @@ def match_client_request(asset_type: AssetType, data_type: DataType, request_lat
 
 
 async def fetch_data_type(
-    executor: ThreadPoolExecutor, request: StockDatasetRequest, data_type: DataType, latest: bool, params: dict
+    executor: ThreadPoolExecutor,
+    request: StockDatasetRequest,
+    data_type: DataType,
+    latest: bool,
+    params: dict,
+    client: StockHistoricalDataClient | None = None,
 ):
     """Fetch one data type from the vendor, collapsed and rate-limited.
 
@@ -140,14 +194,18 @@ async def fetch_data_type(
         data_type (DataType): Data type to fetch.
         latest (bool): Whether the latest-value endpoint is being used.
         params (dict): Vendor request parameters.
+        client (StockHistoricalDataClient | None): Client to call, or None for this
+            process's own (see get_client()).
 
     Returns:
         The vendor's response, shared read-only with any caller that attached to this call.
     """
-    client_request, client_request_type = match_client_request(AssetType.STOCK, data_type, latest)
+    client_request, client_request_type = match_client_request(
+        client if client is not None else get_client(), AssetType.STOCK, data_type, latest
+    )
     key = VendorRequestKey(
         broker=DataSource.ALPACA_API,
-        feed='sip' if ALPACA_SIP_ENABLED else 'iex',
+        feed='sip' if sip_enabled() else 'iex',
         asset_type=AssetType.STOCK,
         asset_symbol=request.asset_symbol,
         data_type=data_type,
@@ -169,8 +227,26 @@ async def fetch_data_type(
 
 
 async def get_market_stock_data(
-    executor: ThreadPoolExecutor, request: StockDatasetRequest
+    executor: ThreadPoolExecutor, request: StockDatasetRequest, client: StockHistoricalDataClient | None = None
 ) -> BatchStockDataMarketActivityCreate:
+    """Fetch a stock dataset from Alpaca and convert it into the store's batch schema.
+
+    Args:
+        executor (ThreadPoolExecutor): Pool the blocking SDK calls run on.
+        request (StockDatasetRequest): Request being served.
+        client (StockHistoricalDataClient | None): Client to call, or None for this
+            process's own. Injected by tests, and by a caller that selects its own
+            adapter instance.
+
+    Returns:
+        BatchStockDataMarketActivityCreate: Converted dataset for the store.
+
+    Raises:
+        MissingCredentialsError: If no client is injected and none can be built.
+    """
+    # Resolved once, before any task is spawned, so a missing credential fails here with a
+    # named variable rather than inside a gathered task whose errors are swallowed below.
+    client = client if client is not None else get_client()
     granularity = AlpacaGranularity.from_granularity(request.granularity).broker_code
     params = {
         'symbol_or_symbols': request.asset_symbol,
@@ -192,7 +268,7 @@ async def get_market_stock_data(
             log.warning(f'Duplicate data type found: {data_type}')
             continue
 
-        tasks.append(fetch_data_type(executor, request, data_type, latest, params))
+        tasks.append(fetch_data_type(executor, request, data_type, latest, params, client))
         response_map[data_type] = len(tasks) - 1
 
     try:
