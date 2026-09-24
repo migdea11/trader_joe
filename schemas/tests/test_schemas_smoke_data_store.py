@@ -24,6 +24,7 @@ import importlib
 import inspect
 import pkgutil
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
@@ -346,3 +347,28 @@ def test_delete_contract_is_not_a_validating_model():
         assert not issubclass(model, BaseModel), f'{model.__name__} is now a model -- tj-9dqfjo fixed?'
         assert isinstance(model.dataset_id, FieldInfo)
         assert model() is not None
+
+
+def test_expiry_default_is_computed_per_instance(monkeypatch: pytest.MonkeyPatch):
+    """Pin tj-swean0: two bodies built at different times get different expiry defaults.
+
+    A plain ``datetime.now() + timedelta(days=1)`` default is evaluated ONCE, at import, so every
+    instance in a long-lived process would share an expiry frozen at process start. A wall-clock
+    delta between two consecutive constructions cannot assert that -- the microseconds differ under
+    either implementation -- so the model module's own ``datetime`` is replaced by a clock handing
+    out two known, far-apart instants. The default factory's lambda resolves ``datetime`` from
+    those module globals, which is what makes the substitution deterministic.
+
+    Args:
+        monkeypatch: Replaces ``datetime`` in ``schemas.data_store.asset_dataset_store``.
+    """
+    instants = iter((datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 6, 1, tzinfo=UTC)))
+    monkeypatch.setattr('schemas.data_store.asset_dataset_store.datetime', SimpleNamespace(now=lambda: next(instants)))
+
+    first = StoreAssetDatasetBody(**_DATASET_BODY)
+    second = StoreAssetDatasetBody(**_DATASET_BODY)
+
+    assert first.expiry == datetime(2026, 1, 2, tzinfo=UTC)
+    assert second.expiry == datetime(2026, 6, 2, tzinfo=UTC)
+    # Cheap second line pinning the mechanism; it is not a substitute for the behaviour above.
+    assert StoreAssetDatasetBody.model_fields['expiry'].default_factory is not None

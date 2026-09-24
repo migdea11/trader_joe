@@ -1,8 +1,10 @@
 import uuid
+from datetime import UTC, datetime
 from typing import Any, NamedTuple
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import InvalidRequestError
 from starlette.routing import NoMatchFound
 
 from common.database.postgres_tools import PostgresSessionFactory
@@ -55,33 +57,33 @@ UNBOUND_PATH = 'unbound-path'
 # manifest says it is; 500 means it is mounted and broken.
 UNREACHABLE_STATUSES = (404, 405)
 
-# A route that CANNOT answer a well-formed request today, for reasons that have nothing to do
-# with the database being absent. Found by this file and filed against builder-store, whose scope
+# Routes that CANNOT answer a well-formed request today, for reasons that have nothing to do with
+# the database being absent. Found by this file and filed against builder-store, whose scope
 # routers/data_store is -- a validator that patches the code under test has destroyed the review.
 # strict=True: when the route is fixed the test goes RED (XPASS), which is the signal to delete
 # the entry here in the same diff. This is not a skip -- the request is really made and its
 # failure is really observed -- and it is not an assertion that 500 is correct, which is what
 # writing `assert status == 500` would have meant.
 #
-# DELETE /internal/asset-data/{asset_type}/{data_type} (tj-h7ikz2) is no longer here: builder-store
-# removed the route rather than repair it. Its schema, StockDataMarketActivityDeleteById, inherits
-# a plain ABC (AssetDataDeleteById, tj-9dqfjo) that cannot be constructed with **kwargs, so keeping
-# the route working would have needed a schemas/ fix outside builder-store's scope; the route also
-# carried a stale '# TODO this will be removed in the future' comment and its crud function deleted
-# every row in the table regardless of any argument. See tj-h7ikz2 for the full reasoning.
-KNOWN_BROKEN = {
-    # tj-v7340n's original three defects (the bad log field, the awaited sync `db.add()`, and the
-    # missing return) are fixed. What remains, still filed against tj-v7340n:
-    # create_market_activity_data now does `db.add(...); await db.commit(); await db.refresh(...)`
-    # to populate the response's DB-generated id/created_at/updated_at -- the standard async
-    # SQLAlchemy pattern -- but FakeSession below has no `refresh`, so the well-formed request
-    # still raises AttributeError. Adding `refresh` to FakeSession is this file's call, not
-    # builder-store's, which is why it is left unadded rather than the fixture being extended here.
-    'POST /internal/asset-data/{asset_type}/{data_type}': (
-        "tj-v7340n: create_market_activity_data awaits db.refresh(...) to populate the response's "
-        'DB-generated id/created_at/updated_at, and FakeSession has no refresh method'
-    )
-}
+# EMPTY TODAY, and that is a real state rather than an oversight: every route the manifest
+# declares now answers a well-formed request. The mapping stays because it is the mechanism for
+# recording a broken route without a validator patching the code under review, and the next such
+# finding should land here rather than reinvent it. Unlike the manifest categories below, an
+# empty mapping asserts nothing vacuously: it is a lookup, not a parametrize source, and both
+# readers (`KNOWN_BROKEN.get(address)` and the `not in KNOWN_BROKEN` scan) behave when it is
+# empty -- the addresses still come from the manifest, so every route is still driven.
+#
+# The last two entries, and why neither is here:
+#   * POST /internal/asset-data/{asset_type}/{data_type} (tj-v7340n) -- all four defects fixed,
+#     and FakeSession.refresh() below now simulates the DB-generated columns, so the route is
+#     driven end to end and the strict xfail would XPASS. Removed in that same diff, as above.
+#   * DELETE /internal/asset-data/{asset_type}/{data_type} (tj-h7ikz2) -- the route was removed
+#     rather than repaired. Its schema, StockDataMarketActivityDeleteById, inherits a plain ABC
+#     (AssetDataDeleteById, tj-9dqfjo) that cannot be constructed with **kwargs, so repairing it
+#     needed a schemas/ fix outside builder-store's scope; it also carried a stale
+#     '# TODO this will be removed in the future' comment and its crud function deleted every row
+#     in the table regardless of any argument. See tj-h7ikz2 for the full reasoning.
+KNOWN_BROKEN: dict[str, str] = {}
 
 
 class Case(NamedTuple):
@@ -200,6 +202,14 @@ class FakeSession:
     AsyncSession does. Every method here is one a data_store handler actually reaches.
     """
 
+    def __init__(self) -> None:
+        # What add() was handed, so refresh() can refuse an instance the session never saw. Without
+        # this the fake was permissive in exactly the way the class docstring forbids: refresh()
+        # populated unconditionally, so deleting `db.add(...)` from a crud function outright stayed
+        # green here while a real AsyncSession raises InvalidRequestError. Found by the tj-1bv25s
+        # architect gate reviewing this file, not by a failure.
+        self._added: list[int] = []
+
     async def execute(self, statement: Any) -> FakeResult:
         return FakeResult()
 
@@ -213,7 +223,31 @@ class FakeSession:
         return None
 
     def add(self, instance: Any) -> None:
-        return None
+        self._added.append(id(instance))
+
+    async def refresh(self, instance: Any) -> None:
+        # REFUSES AN INSTANCE THE SESSION NEVER SAW, as a real AsyncSession does: refreshing an
+        # object that was never added raises InvalidRequestError rather than quietly populating it.
+        if id(instance) not in self._added:
+            raise InvalidRequestError(f'Instance {type(instance).__name__} is not persisted in this Session')
+
+        # POPULATING, NOT A NO-OP, and that is the faithful choice rather than the permissive one.
+        # A real AsyncSession.refresh() re-reads the row, so the server-generated columns ARE set
+        # when it returns. A no-op refresh would leave id/created_at/updated_at as None and the
+        # response_model would then raise a ValidationError against AssetData's required
+        # `id: int`, `created_at` and `updated_at` -- a failure no real deployment can produce,
+        # which is the fake inventing a defect rather than reproducing one. tj-v7340n's reason
+        # text predicted a no-op would be enough; it would not have been.
+        #
+        # The VALUES are placeholders and nothing asserts them: this file proves reachability and
+        # shape, never content (tj-19qp1q owns content against a real database). What the values
+        # buy is that the POST route is driven all the way through the real handler, the real
+        # crud function and StockMarketActivity.from_create() -- so a regression that reintroduces
+        # any of tj-v7340n's four defects, the nested `data` splat above all, turns this red.
+        now = datetime.now(UTC)
+        for column, value in (('id', 1), ('created_at', now), ('updated_at', now)):
+            if getattr(instance, column, None) is None:
+                setattr(instance, column, value)
 
 
 class FakeRpcClient:
@@ -271,10 +305,13 @@ def unbound_path_addresses() -> list[Any]:
 
     Unlike http_addresses(), zero is a real state here, not the vacuous-parametrize accident
     manifest_entries() otherwise guards against: tj-wc4pe8 deleted the last two unimplemented
-    declarations, and tj-2h1q3k may add a new one back. An empty argvalues list would still
-    collect zero tests silently, so an empty manifest returns one explicitly skipped case instead
-    of nothing -- the run says out loud that the category is empty today, rather than the category
-    just vanishing from the report.
+    declarations, and tj-2h1q3k may add a new one back.
+
+    The placeholder buys a NAMED reason, not visibility as such. Measured, not assumed: pytest's
+    default empty_parameter_set_mark is `skip`, so an empty argvalues list already reports
+    'got empty parameter set for (address)' rather than collecting nothing silently. What it does
+    not say is WHICH category is empty, or why that is expected -- so the placeholder names the
+    manifest and the bead instead, and a reader of the summary line learns something.
 
     Returns:
         list[Any]: Addresses, e.g. '/store/{id}', or a single skip placeholder when there are none.

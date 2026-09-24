@@ -31,6 +31,7 @@ that the path 404s, so implementing it turns this test red and the manifest line
 
 import importlib
 import re
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from types import ModuleType, SimpleNamespace
@@ -180,21 +181,23 @@ def stub_broker_client() -> Mock:
 
 
 @pytest.fixture
-def worker_pool() -> ThreadPoolExecutor:
+def worker_pool() -> Iterator[ThreadPoolExecutor]:
     """Start the shared worker pool the handler's blocking vendor call runs on.
 
     The app's lifespan calls worker_startup(); this is the same call, because the handler reaches
     SharedWorkerPool.get_instance() through ingest_control and an unstarted pool hands it None.
-    NOT shut down afterwards: worker_shutdown() shuts the executor down without clearing the
-    class attribute, so a later test in the same session would be handed a dead pool.
+    Shut down in teardown: since tj-1bv25s, worker_shutdown() clears the class attribute as well as
+    stopping the executor, so a later test that starts the pool again is handed a live one instead
+    of this one's corpse. The workaround that left it running is gone with the defect.
 
-    Returns:
+    Yields:
         ThreadPoolExecutor: The running pool.
     """
     SharedWorkerPool.worker_startup()
     pool = SharedWorkerPool.get_instance()
     assert pool is not None, 'worker_startup() left no executor, so the handler would run on the default one'
-    return pool
+    yield pool
+    SharedWorkerPool.worker_shutdown()
 
 
 def import_module_of(entry: Entry) -> ModuleType:
@@ -391,12 +394,23 @@ def test_each_route_the_app_mounts_answers_over_http(http_client: TestClient):
 
 def test_a_path_the_manifest_records_as_unbound_is_not_served(http_client: TestClient):
     # tj-427x50: data_ingest used to declare a REST path in an interface enum with no route bound
-    # to it. That declaration is deleted now, so UNBOUND_ENTRIES may be empty -- the loop below
-    # would then run zero times and this test would pass without asserting anything, the same
-    # trap as an empty parametrize collapsing to a skip. Assert first that the manifest actually
-    # parsed entries (proving this reads real data, not silently nothing), then check whatever
-    # unbound entries exist, of however many, are genuinely unserved. If a future change adds a
-    # new unbound-path line, this still pins it as 404 the same diff that adds it.
+    # to it. That declaration is deleted, so UNBOUND_ENTRIES is empty today and the loop below
+    # runs zero times.
+    #
+    # THAT IS NOT THE VACUOUS-PASS BUG, and the distinction is the whole point of this comment.
+    # Zero unbound paths is the DESIRED end state of this category -- every declaration either
+    # implemented or deleted -- not a surface that silently disappeared. Contrast
+    # test_each_route_the_app_mounts_answers_over_http above, where empty means the app serves
+    # nothing and MUST fail. The guard below is therefore deliberately weak: it proves the
+    # manifest parsed real data, so a parsing regression that empties every category still fails
+    # here, while a legitimately empty category does not.
+    #
+    # WHY THIS FILE LOOPS AND data/store/tests/test_http_smoke.py PARAMETRIZES for the same
+    # category: no deep reason, and neither is wrong. Note for whoever unifies them that pytest's
+    # default empty_parameter_set_mark is `skip`, so an empty parametrize reports
+    # 'got empty parameter set for (...)' -- a visible skip, NOT silent collection of nothing.
+    # Both files' comments claimed otherwise before this was measured; do not re-derive it from
+    # the old wording.
     assert ENTRIES['data_ingest'], 'data_ingest.manifest parsed to no entries at all'
 
     for entry in UNBOUND_ENTRIES:
