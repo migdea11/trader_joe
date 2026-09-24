@@ -10,7 +10,9 @@ returns non-zero on a broken service. That requires a daemon and is tracked in t
 A green run here means the configuration still says the right thing, nothing more.
 """
 
+import configparser
 import re
+import shlex
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 
@@ -26,6 +28,7 @@ COMPOSE_FILE = REPO_ROOT / 'docker-compose.yaml'
 OVERRIDE_FILE = REPO_ROOT / 'docker-compose.override.yaml'
 ENV_DEFAULT_FILE = REPO_ROOT / '.env.default'
 MAKEFILE = REPO_ROOT / 'Makefile'
+PYTEST_INI = REPO_ROOT / 'pytest.ini'
 
 # tj-8mt207. The harness is a load generator, not a feature: when it is on, data_store and
 # data_ingest each create the latency Kafka topics and an RPC consumer at startup, called or
@@ -717,4 +720,182 @@ def test_prod_compose_command_does_not_load_the_dev_override():
     assert OVERRIDE_FILE.name in dev_compose, (
         f'DEV_COMPOSE is `{dev_compose}`, which does not load {OVERRIDE_FILE.name}, so nothing '
         f'turns the latency harness on and tj-3mk3u5.8 has no way to run its comparison.'
+    )
+
+
+# tj-95ip1q. pytest.ini is the PR gate's own configuration, and its failure mode is the one this
+# project keeps re-learning: a green run that asserted less than it appears to. The marker set is
+# asserted by EQUALITY rather than containment so that adding a marker is a deliberate act which
+# updates this test in the same diff -- the same friction tj-ru24i2's interface manifest uses.
+DECLARED_MARKERS = frozenset({'common', 'data_store', 'data_ingest', 'build_infra', 'external'})
+REQUIRED_ADDOPTS_FLAGS = ('--strict-markers', '--strict-config', '--continue-on-collection-errors')
+GATE_EXPRESSION = 'not external'
+
+
+def _pytest_ini() -> configparser.SectionProxy:
+    parser = configparser.ConfigParser()
+    read = parser.read(PYTEST_INI, encoding='utf-8')
+    assert read, f'{PYTEST_INI} is missing or unreadable'
+    assert parser.has_section('pytest'), f'{PYTEST_INI.name} declares no [pytest] section'
+    return parser['pytest']
+
+
+def _marker_names() -> set[str]:
+    """The marker NAMES declared in pytest.ini, without their descriptions."""
+    raw = _pytest_ini().get('markers', '')
+    return {line.split(':', 1)[0].strip() for line in raw.splitlines() if line.strip()}
+
+
+def _addopts_tokens() -> list[str]:
+    """Split addopts as pytest itself does -- shlex, so a quoted expression stays one token."""
+    return shlex.split(_pytest_ini().get('addopts', ''))
+
+
+def _marker_expressions() -> list[str]:
+    """Every -m expression in addopts, in order. A list, because the COUNT is the assertion."""
+    expressions: list[str] = []
+    tokens = _addopts_tokens()
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == '-m':
+            # `-m "not external"`: the expression is the following token, and its absence is a
+            # malformed addopts rather than a missing gate -- report it as the empty expression
+            # so the value assertion below names it instead of an IndexError hiding it.
+            expressions.append(tokens[index + 1] if index + 1 < len(tokens) else '')
+            index += 2
+            continue
+        # `-m"not external"` survives shlex as the single token `-mnot external`, and
+        # `--deselect` etc. must not be swept up with it.
+        if token.startswith('-m') and not token.startswith('--'):
+            expressions.append(token[2:])
+        index += 1
+    return expressions
+
+
+def test_pytest_ini_declares_exactly_the_component_markers():
+    """tj-95ip1q: set equality, so a new marker cannot appear without a deliberate edit here.
+
+    A DROPPED declaration is loud on its own -- under --strict-markers the first test carrying
+    the marker is a collection error -- so that half needs no help. An ADDED one is silent, and
+    a marker nobody declared a rule for is how a component selection starts drifting away from
+    what the four markers in pytest.ini's prose say they mean.
+    """
+    assert _marker_names() == set(DECLARED_MARKERS), (
+        f'{PYTEST_INI.name} declares markers {sorted(_marker_names())}, expected '
+        f'{sorted(DECLARED_MARKERS)}. Adding or renaming a marker is a deliberate act: update '
+        f'this test and pytest.ini`s MARKERS prose in the same diff, and say which component '
+        f'the new marker names.'
+    )
+
+
+@pytest.mark.parametrize('flag', REQUIRED_ADDOPTS_FLAGS)
+def test_pytest_ini_addopts_keeps_the_strict_flags(flag: str):
+    """tj-95ip1q: every flag in this tuple is SILENT TO LOSE -- that is what earns it a guard.
+
+    Without --strict-markers, `@pytest.mark.data_stor` is a no-op: the test still passes, and it
+    is simply invisible to every component selection for as long as nobody notices. That is the
+    misspelled-marker hole the flag exists to close, and nothing else in this repo closes it.
+
+    tj-cx5wzy: --continue-on-collection-errors is here for the same reason and a sharper one.
+    Delete it and this suite goes back to CANCELLING EVERY TEST on one collection error -- at
+    fc377e4 that cost zero of 231 tests over a data_store manifest guard unrelated to any of
+    them -- and the run stays green while it happens, because a suite that never ran reports no
+    failures. It also carries a standing condition (pytest.ini: gates key on the EXIT CODE, never
+    on the summary line) that is only coherent while the flag is present, so losing it silently
+    invalidates a documented rule in another file.
+    """
+    assert flag in _addopts_tokens(), (
+        f'{PYTEST_INI.name} addopts no longer carries {flag}. It reads: `{_pytest_ini().get("addopts", "")}`'
+    )
+
+
+def test_pytest_ini_gate_is_exactly_one_marker_expression():
+    """tj-95ip1q: EXACTLY ONE -m in addopts, and its value is exactly "not external".
+
+    This is the load-bearing one. addopts is prepended to the command line and the LAST -m wins,
+    so appending a second, narrower expression -- `-m "not data_ingest"` -- drops a whole
+    component out of the PR gate. Nothing errors. Nothing skips. The run is green, and the only
+    evidence is the "N deselected" count that pytest.ini's own comment says nobody reads. A
+    substring check for "not external" passes that very edit, which is why the count is asserted
+    and not the presence.
+
+    Widening the single expression in place -- `-m "not external and not data_ingest"` -- is the
+    same false green through a different edit, and the exact-value assertion is what catches it.
+    Both are tj-06uflo and tj-0qxnzw again: a result that asserted less than it appeared to.
+    """
+    expressions = _marker_expressions()
+    assert len(expressions) == 1, (
+        f'{PYTEST_INI.name} addopts carries {len(expressions)} -m expressions {expressions}, '
+        f'expected exactly one. addopts is prepended to the command line and the last -m wins, '
+        f'so a second expression silently deselects whatever it names -- a green PR gate that '
+        f'never ran that component. Put a narrower selection in a make target, not in addopts.'
+    )
+    assert expressions[0] == GATE_EXPRESSION, (
+        f'{PYTEST_INI.name} addopts gates on `-m "{expressions[0]}"`, expected exactly '
+        f'`-m "{GATE_EXPRESSION}"`. Every term added to this expression deselects tests from '
+        f'the PR gate without failing, skipping or erroring anything.'
+    )
+
+
+# tj-nedzts. Both the Makefile and the workflow named `./router` for months; the directory is
+# `routers`. bandit is invoked as `bandit -r $(SOURCE_DIRS)` / `-r $SOURCE_PATHS`, and a root
+# that does not exist is not an error to it -- it reports "Files skipped (1)", scans what is
+# left and exits 0. So the externally reachable FastAPI handler layer went unscanned by a
+# security tool that reported success every time. A Makefile-vs-CI PARITY test would not have
+# caught it: both lists carried the same typo and agreed with each other perfectly.
+#
+# Existence is therefore the check, not agreement. The roots are relative to the repository
+# root because that is where both invocations run.
+SCANNER_ROOT_SOURCES = ('Makefile SOURCE_DIRS', 'workflow SOURCE_PATHS')
+
+
+def _workflow_source_paths() -> dict[str, str]:
+    """Map each workflow declaring a top-level `env.SOURCE_PATHS` to that value."""
+    declared = {}
+    for path in _workflow_files():
+        value = ((_load_yaml(path) or {}).get('env') or {}).get('SOURCE_PATHS')
+        if value is not None:
+            declared[path.name] = str(value)
+    return declared
+
+
+def _scanner_roots(source: str) -> list[tuple[str, str]]:
+    """Return (origin, root) for every scanner root named by `source`.
+
+    Both halves fail closed. If the variable is renamed or deleted the helper raises rather
+    than returning nothing, because a scanner-root test that silently checks an empty list is
+    the same vacuous green this bead exists to close.
+    """
+    if source == 'Makefile SOURCE_DIRS':
+        return [(MAKEFILE.name, root) for root in _make_variable('SOURCE_DIRS').split()]
+    declared = _workflow_source_paths()
+    assert declared, (
+        'no workflow under .github/workflows declares a top-level env.SOURCE_PATHS. If the '
+        'variable was renamed, rename it here too; if the bandit step was removed, remove this '
+        'test with it rather than leaving it passing over an empty list.'
+    )
+    return [(name, root) for name, value in declared.items() for root in value.split()]
+
+
+@pytest.mark.parametrize('source', SCANNER_ROOT_SOURCES)
+def test_every_scanner_root_exists_as_a_directory(source: str):
+    """tj-nedzts: every root handed to bandit must be a directory that is actually there.
+
+    This is the check that catches the bug class. bandit exits 0 over a path that does not
+    exist, so the typo bought nothing but a smaller scan and a green check mark -- the
+    tj-06uflo shape, a tool reporting success having examined nothing. The spelling fix itself
+    landed in ba498ad (./router -> ./routers in both files, confirmed by the scanned-LOC count
+    going 3354 -> 3621 with "Files skipped" dropping from 1 to 0); this is the guard that keeps
+    it fixed, and that catches the next root added with a typo or removed without being
+    dropped from the list.
+    """
+    roots = _scanner_roots(source)
+    assert roots, f'{source} is empty, so every assertion below passes over nothing'
+    missing = [(origin, root) for origin, root in roots if not (REPO_ROOT / root).is_dir()]
+    assert not missing, (
+        f'{source} names {len(missing)} root(s) that are not directories in the repository: '
+        f'{[f"{origin}: {root}" for origin, root in missing]}. bandit does not fail on a path '
+        f'that does not exist -- it skips it, scans the rest and exits 0 -- so a misspelled '
+        f'root silently removes that whole layer from the security scan.'
     )
