@@ -1,0 +1,10 @@
+# The interface surface of routers/data_ingest. Asserted by routers/tests/test_interface_surface.py.
+# Format, field meanings and why this file is committed rather than generated: see README.md.
+# Keep sorted. Adding an interface is meant to cost a line here, in the same diff.
+#
+# The rpc line is the one interface data_ingest answers on today, and enumerating it is proof that
+# the decorator in get_dataset_request.py really ran while the module body executed.
+#
+# kind | address | file | symbol | request | response | touches
+rpc | stock_market_activity_rpc | routers/data_ingest/get_dataset_request.py | store_data | schemas.data_ingest.get_dataset_request.GetDatasetRequest | schemas.data_store.stock.market_activity_data.BatchStockDataMarketActivityCreate | -
+unbound-path | /broker/{asset_type}/{symbol}/{data_type} | routers/data_ingest/app_endpoints.py | InterfaceRest.POST_STORE_DATASET | - | - | -

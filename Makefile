@@ -233,11 +233,59 @@ security: $(VENV_MARKER)  ## Check security vulnerabilities
 
 # Deliberately independent of `lint`: a test run must report a test result, not a lint failure.
 # CI runs both, as separate steps.
-.PHONY: test
-test: $(VENV_MARKER)  ## Run tests (scope with PATHS=)
-	POSTGRES_ASYNC=true POSTGRES_SYNC=true uv run pytest $(PATHS)
+#
+# THE PR GATE -- -m "not external" -- IS IN pytest.ini's addopts, NOT in these targets, because
+# CI does not go through make: .github/workflows/trader_joe_testing.yml runs `uv run pytest`
+# directly. Every target here therefore inherits the gate for free, and the ones that want a
+# different set pass their own -m, which wins: addopts is prepended, so the last -m on the
+# command line is the one that takes effect. Putting an -m in each target instead would mean
+# two places that must agree, and the CI one is the one that drifts.
+#
+# POSTGRES_ASYNC / POSTGRES_SYNC are import-time feature flags in
+# common/database/postgres_tools.py choosing which driver is imported. They are NOT a claim
+# that a database is reachable, and they are not markers. CI and .devcontainer/compose.yml set
+# them too; spelled once here so the targets below cannot drift apart.
+PYTEST_ENV := POSTGRES_ASYNC=true POSTGRES_SYNC=true
+PYTEST := $(PYTEST_ENV) uv run pytest
 
+.PHONY: test
+test: $(VENV_MARKER)  ## Run the PR gate: every test except `external` (scope with PATHS=)
+	$(PYTEST) $(PATHS)
+
+# coverage has to own the invocation -- `coverage run -m pytest` -- so this takes the env
+# prefix rather than $(PYTEST). pytest.ini still applies, so the selected set is identical.
 .PHONY: test-cov
-test-cov: $(VENV_MARKER)  ## Run tests with coverage (scope with PATHS=)
-	POSTGRES_ASYNC=true POSTGRES_SYNC=true uv run coverage run -m pytest $(PATHS)
+test-cov: $(VENV_MARKER)  ## Run the PR gate with coverage (scope with PATHS=)
+	$(PYTEST_ENV) uv run coverage run -m pytest $(PATHS)
 	uv run coverage xml
+
+# One parameterised target rather than one per component, so the set of components can change
+# without touching this file. `make test PATHS=data/store/tests` does the same job today, but
+# only until the Phase 1 restructure (tj-55cczk) moves every path -- markers survive that,
+# PATHS= does not. Component names are the `markers` list in pytest.ini.
+#
+# A COMPONENT that matches nothing is not silently green: pytest collects nothing and exits 5.
+# The guard is for the EMPTY case only, which would otherwise hand pytest the unparseable
+# expression " and not external" and report a usage error instead of the missing variable.
+.PHONY: test-component
+test-component: $(VENV_MARKER)  ## Run one component, e.g. COMPONENT=data_store (scope with PATHS=)
+	@[ -n "$(COMPONENT)" ] || { echo "make test-component needs COMPONENT=<name>; the names are the 'markers' list in pytest.ini." >&2; exit 1; }
+	$(PYTEST) -m "$(COMPONENT) and not external" $(PATHS)
+
+# The only target that runs the `external` set, and the only one CI must never call: an
+# external test needs a live third-party credential, and tj-59cce6 forbids a credential in a
+# branch-triggered workflow. This is a target the USER runs on their own machine; an agent
+# reports it NOT RUN rather than passed. It fails rather than skips when the account is not
+# answering -- see the fail-never-skip comment in pytest.ini.
+#
+# Named `broker` while the marker is named `external` on purpose, not by oversight: pytest.ini
+# records why.
+.PHONY: test-broker
+test-broker: $(VENV_MARKER)  ## Run the external broker tests: needs live credentials, never CI
+	$(PYTEST) -m external $(PATHS)
+
+# -m "" REPLACES the addopts filter rather than adding to it, leaving no selection at all, so
+# this is the gate plus the external set. Same caveat as test-broker: it needs live credentials.
+.PHONY: test-all
+test-all: $(VENV_MARKER)  ## Run every test, external included: needs live credentials
+	$(PYTEST) -m "" $(PATHS)
