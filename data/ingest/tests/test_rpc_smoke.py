@@ -390,15 +390,14 @@ def test_each_route_the_app_mounts_answers_over_http(http_client: TestClient):
 
 
 def test_a_path_the_manifest_records_as_unbound_is_not_served(http_client: TestClient):
-    # tj-427x50: data_ingest DECLARES this REST path in an interface enum and binds no route to
-    # it. Pinned rather than implemented -- implementing it is not this task's job, and when
-    # someone does, this assertion goes red and names the manifest line that has to become an
-    # `http` one in the same diff. The test above is what stops this one passing vacuously: if
-    # the app were broken badly enough to 404 everything, that one fails.
-    assert UNBOUND_ENTRIES, (
-        'data_ingest.manifest declares no unbound path. If its REST path is now served, this test has become the '
-        'wrong assertion: drive it through the served-routes test above instead of asserting it 404s.'
-    )
+    # tj-427x50: data_ingest used to declare a REST path in an interface enum with no route bound
+    # to it. That declaration is deleted now, so UNBOUND_ENTRIES may be empty -- the loop below
+    # would then run zero times and this test would pass without asserting anything, the same
+    # trap as an empty parametrize collapsing to a skip. Assert first that the manifest actually
+    # parsed entries (proving this reads real data, not silently nothing), then check whatever
+    # unbound entries exist, of however many, are genuinely unserved. If a future change adds a
+    # new unbound-path line, this still pins it as 404 the same diff that adds it.
+    assert ENTRIES['data_ingest'], 'data_ingest.manifest parsed to no entries at all'
 
     for entry in UNBOUND_ENTRIES:
         # Any value serves: nothing is routed to, so no path parameter is ever parsed.

@@ -7,4 +7,3 @@
 #
 # kind | address | file | symbol | request | response | touches
 rpc | stock_market_activity_rpc | routers/data_ingest/get_dataset_request.py | store_data | schemas.data_ingest.get_dataset_request.GetDatasetRequest | schemas.data_store.stock.market_activity_data.BatchStockDataMarketActivityCreate | -
-unbound-path | /broker/{asset_type}/{symbol}/{data_type} | routers/data_ingest/app_endpoints.py | InterfaceRest.POST_STORE_DATASET | - | - | -

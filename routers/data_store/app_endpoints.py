@@ -15,13 +15,11 @@ ASSET_DATA_ID_DESC = 'Unique identifier of the data entry.'
 
 
 class AssetDataInterface(StrEnum):
-    PUT_ASSET_DATA = '/internal/asset-data/{asset_type}/{data_type}/{id}'
     POST_ASSET_DATA = '/internal/asset-data/{asset_type}/{data_type}'
     GET_ASSET_DATA = '/internal/asset-data/{asset_type}/{data_type}'
 
 
 class AssetDatasetStoreInterface(StrEnum):
-    PUT_STORE_ASSET_DATASET = '/store/{asset_type}/{data_type}/{asset_symbol}/{id}'
     POST_STORE_ASSET_DATASET = '/store/{asset_type}/{data_type}/{asset_symbol}'
     GET_STORE_ASSET_DATASET = '/store/{asset_type}/{data_type}/{asset_symbol}'
 

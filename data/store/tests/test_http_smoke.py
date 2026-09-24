@@ -234,18 +234,23 @@ class FakeRpcClients:
         return FakeRpcClient()
 
 
-def manifest_entries(kind: str) -> list[list[str]]:
+def manifest_entries(kind: str, *, allow_empty: bool = False) -> list[list[str]]:
     """Read one kind of entry out of the data_store manifest.
 
     Args:
         kind (str): Manifest kind, e.g. 'http'.
+        allow_empty (bool): True lets zero matches through instead of raising. A kind whose count
+            reflects a real decision -- unbound-path went to zero when tj-wc4pe8 deleted the last
+            two unimplemented declarations -- is a legitimate empty, not a vacuous-parametrize
+            accident. `http` never passes this: a manifest with no bound routes at all is exactly
+            the accident the guard exists to catch.
 
     Returns:
         list[list[str]]: The matching entries, each split into its fields.
     """
     entries = [line.split(SEPARATOR) for line in load_manifest(COMPONENT)]
     matching = [fields for fields in entries if fields[0] == kind]
-    if not matching:
+    if not matching and not allow_empty:
         # Guards the vacuous pass: an empty parametrization collects zero tests and reports
         # success. tj-ru24i2 makes the same guard for the same reason.
         raise AssertionError(f'{COMPONENT}.manifest declares no {kind} entries, so this file asserts nothing')
@@ -259,6 +264,32 @@ def http_addresses() -> list[str]:
         list[str]: Addresses, e.g. 'GET /store/{id}'.
     """
     return [fields[1] for fields in manifest_entries(HTTP)]
+
+
+def unbound_path_addresses() -> list[Any]:
+    """Return the address field of every unbound-path entry in the manifest, for parametrize.
+
+    Unlike http_addresses(), zero is a real state here, not the vacuous-parametrize accident
+    manifest_entries() otherwise guards against: tj-wc4pe8 deleted the last two unimplemented
+    declarations, and tj-2h1q3k may add a new one back. An empty argvalues list would still
+    collect zero tests silently, so an empty manifest returns one explicitly skipped case instead
+    of nothing -- the run says out loud that the category is empty today, rather than the category
+    just vanishing from the report.
+
+    Returns:
+        list[Any]: Addresses, e.g. '/store/{id}', or a single skip placeholder when there are none.
+    """
+    entries = manifest_entries(UNBOUND_PATH, allow_empty=True)
+    if not entries:
+        return [
+            pytest.param(
+                None,
+                marks=pytest.mark.skip(
+                    reason=f'{COMPONENT}.manifest currently declares no {UNBOUND_PATH} entries (tj-wc4pe8)'
+                ),
+            )
+        ]
+    return [fields[1] for fields in entries]
 
 
 def substitute(path: str, path_params: dict[str, str]) -> str:
@@ -451,12 +482,15 @@ def test_a_malformed_request_is_rejected_with_422(address: str, client: TestClie
     )
 
 
-@pytest.mark.parametrize('address', [fields[1] for fields in manifest_entries(UNBOUND_PATH)])
+@pytest.mark.parametrize('address', unbound_path_addresses())
 def test_nothing_serves_an_unbound_path(address: str):
-    # The manifest records these as declared-but-not-implemented (two PUTs on
-    # routers/data_store/app_endpoints.py that no route binds). tj-ru24i2 proves no ROUTER binds
-    # them; this proves no APP serves them, which is the stronger statement and the one a caller
-    # experiences. Implementing one turns both red, in the same diff.
+    # The manifest records these as declared-but-not-implemented: a path some interface enum in
+    # routers/data_store/app_endpoints.py names, that no route binds. tj-ru24i2 proves no ROUTER
+    # binds them; this proves no APP serves them, which is the stronger statement and the one a
+    # caller experiences. Implementing one turns both red, in the same diff.
+    #
+    # tj-wc4pe8 deleted the last two (both PUTs); this is a skipped no-op until tj-2h1q3k or
+    # another declaration adds one back, per unbound_path_addresses().
     #
     # Every method is tried because an unbound-path entry carries none: the manifest is recording
     # a path nobody serves, not a method nobody serves.
