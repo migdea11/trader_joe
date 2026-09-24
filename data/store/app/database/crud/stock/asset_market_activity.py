@@ -1,4 +1,7 @@
-from sqlalchemy import delete, insert, select
+from typing import Any
+
+from sqlalchemy import delete, func, select
+from sqlalchemy.dialects.postgresql import Insert, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.enums.data_select import AssetType, DataType
@@ -23,20 +26,35 @@ async def create_market_activity_data(db: AsyncSession, asset_data: market_activ
     await db.commit()
 
 
+def build_market_activity_upsert(values: list[dict[str, Any]]) -> Insert:
+    """Build the idempotent bar insert.
+
+    A repeat of an already-stored bar collides on the natural key and refreshes the existing
+    row instead of adding a second one, so re-fetching an overlapping window leaves the row
+    count unchanged. DO UPDATE rather than DO NOTHING, so a vendor correction to a stored bar
+    is applied rather than discarded.
+    """
+    stmt = insert(StockMarketActivity).values(values)
+    updates = {column: getattr(stmt.excluded, column) for column in StockMarketActivity.MUTABLE_COLUMNS}
+    # ON CONFLICT DO UPDATE does not exercise the column's Python-side onupdate, so updated_at
+    # has to be set here explicitly. created_at is left alone: it records first storage.
+    updates['updated_at'] = func.now()
+    return stmt.on_conflict_do_update(constraint=StockMarketActivity.NATURAL_KEY_CONSTRAINT, set_=updates)
+
+
 async def batch_create_market_activity_data(
     db: AsyncSession, batch_asset_data: market_activity_data.BatchStockDataMarketActivityCreate
 ) -> int:
     try:
-        if DataType.MARKET_ACTIVITY not in batch_asset_data.dataset:
+        batch_market_activity = batch_asset_data.dataset.get(DataType.MARKET_ACTIVITY)
+        if not batch_market_activity:
             log.warning('No market activity data in batch')
             return 0
 
-        batch_market_activity = batch_asset_data.dataset[DataType.MARKET_ACTIVITY]
         log.debug(f'Batch storing market activity[{len(batch_market_activity)}]')
         log.debug(f'Batch storing market activity: {next(iter(batch_market_activity))}')
 
-        asset_table = StockMarketActivity
-        stmt = insert(asset_table).values(StockMarketActivity.from_batch_create(batch_asset_data))
+        stmt = build_market_activity_upsert(StockMarketActivity.from_batch_create(batch_asset_data))
         await db.execute(stmt)
 
         await db.commit()

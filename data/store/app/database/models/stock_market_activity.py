@@ -1,6 +1,6 @@
 from typing import Any
 
-from sqlalchemy import Column, Float, Integer
+from sqlalchemy import Column, Float, Integer, UniqueConstraint
 
 from common.enums.data_select import AssetType, DataType
 from data.store.app.database.models.base_market_activity import BaseMarketActivity
@@ -12,10 +12,28 @@ from schemas.data_store.stock.market_activity_data import (
 )
 
 
-# TODO figure out actual primary keys
 class StockMarketActivity(BaseMarketActivity):
     TABLE_NAME = 'stock_market_activity'
     __tablename__ = TABLE_NAME
+
+    # Named so the ON CONFLICT clause in the repository can target it by name rather than by
+    # column list; the name is the contract between this model and migration 8f41c2d7a3b9.
+    NATURAL_KEY_CONSTRAINT = 'uq_stock_market_activity_natural_key'
+
+    # Columns the upsert refreshes when a bar already exists. OHLCV plus the adjustment
+    # factors, so a vendor correction to a stored bar is applied rather than discarded.
+    MUTABLE_COLUMNS = (
+        'open',
+        'high',
+        'low',
+        'close',
+        'volume',
+        'trade_count',
+        'split_factor',
+        'dividends_factor',
+        'expiry',
+        'dataset_id',
+    )
 
     open = Column(Float, nullable=False)
     high = Column(Float, nullable=False)
@@ -26,6 +44,11 @@ class StockMarketActivity(BaseMarketActivity):
 
     split_factor = Column(Float, nullable=False, default=1.0)
     dividends_factor = Column(Float, nullable=False, default=1.0)
+
+    __table_args__ = (
+        *BaseMarketActivity.__table_args__,
+        UniqueConstraint(*BaseMarketActivity.NATURAL_KEY, name=NATURAL_KEY_CONSTRAINT),
+    )
 
     @classmethod
     def from_batch_create(cls, batch_create: BatchStockDataMarketActivityCreate) -> list[dict[str, Any]]:
