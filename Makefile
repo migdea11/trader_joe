@@ -63,6 +63,17 @@ launch: launch-deps  ## Launch production services
 launch-down:  ## Stop all services
 	docker compose down
 
+# The single spelling of "apply the migrations" — run it after every deploy, once the stack is
+# up. Nothing else creates the schema, so a healthy stack has an empty database until this runs.
+# The deploy script of tj-jm51fw will call this target rather than repeat the compose line.
+#
+# No $(VENV_MARKER) prerequisite, unlike every other compose target here: the script runs alembic
+# inside the data_store container, never from the host venv. A host sync would be wasted work,
+# and it would make the production migration path depend on uv being usable on the server.
+# The script resolves the repo root itself, so this works from any directory.
+migrate:  ## Apply database migrations to the running stack
+	./data/store/run_migrations.sh
+
 dev-build: $(VENV_MARKER)  ## Build the Docker images for development
 	docker compose -f docker-compose.yaml -f docker-compose.override.yaml build
 
