@@ -20,6 +20,9 @@ from common.enums.data_stock import DataSource, Granularity
 from common.environment import get_env_var
 from common.logging import get_logger
 from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
+from data.ingest.app.brokers.rate_budget import RateBudget, priority_for_update_type
+from data.ingest.app.brokers.request_key import VendorRequestKey
+from data.ingest.app.brokers.single_flight import SingleFlight
 from schemas.data_ingest.get_dataset_request import StockDatasetRequest
 from schemas.data_store.stock.market_activity_data import (
     BatchStockDataMarketActivityCreate,
@@ -30,13 +33,35 @@ from schemas.data_store.stock.market_activity_data import (
 
 log = get_logger(__name__)
 
-ALPACA_SIP_ENABLED = get_env_var('ALPACA_SIP_ENABLED')
+# Cast, because an unset variable and the string 'false' are both truthy without it, and
+# the feed is part of the request key below rather than a log line.
+ALPACA_SIP_ENABLED = get_env_var('ALPACA_SIP_ENABLED', default=False, cast_type=bool)
+# The bars request never sets an adjustment, so every bar we hold is the vendor's raw one.
+# Named here because it is part of the request key: a raw bar is not a split-adjusted one.
+ALPACA_ADJUSTMENT = 'raw'
 
 # Configure Alpaca Client
 API_KEY = get_env_var('ALPACA_API_KEY')
 API_SECRET = get_env_var('ALPACA_API_SECRET')
 # TODO this should probably be wrapped to utilize dependency injection base on source selection
 __CLIENT = StockHistoricalDataClient(API_KEY, API_SECRET)
+
+__SINGLE_FLIGHT = SingleFlight()
+__RATE_BUDGET: RateBudget | None = None
+
+
+def get_rate_budget() -> RateBudget:
+    """Get this vendor's rate budget, building it on first use.
+
+    Built lazily so that importing the module does not read the environment.
+
+    Returns:
+        RateBudget: Shared budget for every Alpaca call this process makes.
+    """
+    global __RATE_BUDGET
+    if __RATE_BUDGET is None:
+        __RATE_BUDGET = RateBudget.from_env(DataSource.ALPACA_API)
+    return __RATE_BUDGET
 
 
 def convert_bar_to_schema(data: Bar) -> StockDataMarketActivityCreate:
@@ -99,6 +124,50 @@ def match_client_request(asset_type: AssetType, data_type: DataType, request_lat
             raise NotImplementedError(f'{asset_type} - {data_type} not implemented')
 
 
+async def fetch_data_type(
+    executor: ThreadPoolExecutor, request: StockDatasetRequest, data_type: DataType, latest: bool, params: dict
+):
+    """Fetch one data type from the vendor, collapsed and rate-limited.
+
+    Concurrent callers asking for the same content share one vendor call; the extra ones
+    attach to it and nothing is retained afterwards (tj-84ty47 section 6). The shared value
+    is the vendor's own response, which every caller then converts with ITS OWN dataset_id
+    and expiry -- collapsing the conversion too would hand one caller another's dataset_id.
+
+    Args:
+        executor (ThreadPoolExecutor): Pool the blocking SDK call runs on.
+        request (StockDatasetRequest): Request being served.
+        data_type (DataType): Data type to fetch.
+        latest (bool): Whether the latest-value endpoint is being used.
+        params (dict): Vendor request parameters.
+
+    Returns:
+        The vendor's response, shared read-only with any caller that attached to this call.
+    """
+    client_request, client_request_type = match_client_request(AssetType.STOCK, data_type, latest)
+    key = VendorRequestKey(
+        broker=DataSource.ALPACA_API,
+        feed='sip' if ALPACA_SIP_ENABLED else 'iex',
+        asset_type=AssetType.STOCK,
+        asset_symbol=request.asset_symbol,
+        data_type=data_type,
+        granularity=request.granularity,
+        range_start=request.start,
+        range_end=request.end,
+        adjustment=ALPACA_ADJUSTMENT,
+    )
+    priority = priority_for_update_type(request.update_type)
+
+    async def call_vendor():
+        # One token per call that actually reaches the vendor. Calls collapsed by the guard
+        # cost nothing, which is the point of doing this inside it rather than outside.
+        await get_rate_budget().acquire(priority)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(executor, client_request, client_request_type(**params))
+
+    return await __SINGLE_FLIGHT.run(key, call_vendor)
+
+
 async def get_market_stock_data(
     executor: ThreadPoolExecutor, request: StockDatasetRequest
 ) -> BatchStockDataMarketActivityCreate:
@@ -112,7 +181,6 @@ async def get_market_stock_data(
     log.debug(f'params: {params}')
 
     tasks = []
-    loop = asyncio.get_running_loop()
     results = None
     response_map = {}
     latest = False
@@ -124,9 +192,7 @@ async def get_market_stock_data(
             log.warning(f'Duplicate data type found: {data_type}')
             continue
 
-        client_request, client_request_type = match_client_request(AssetType.STOCK, data_type, latest)
-        task = loop.run_in_executor(executor, client_request, client_request_type(**params))
-        tasks.append(task)
+        tasks.append(fetch_data_type(executor, request, data_type, latest, params))
         response_map[data_type] = len(tasks) - 1
 
     try:
