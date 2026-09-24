@@ -43,7 +43,7 @@ permissions: {}
 
 env:
   UV_VERSION: "0.9.3"
-  SOURCE_PATHS: "./common ./router ./schemas ./data"
+  SOURCE_PATHS: "./common ./routers ./schemas ./data"
 
 jobs:
   testing:

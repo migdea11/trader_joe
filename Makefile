@@ -216,7 +216,7 @@ lint: $(VENV_MARKER)  ## Lint and format-check the project (scope with PATHS=)
 	uv run ruff check $(PATHS)
 	uv run ruff format --check $(PATHS)
 
-SOURCE_DIRS := ./common ./router ./schemas ./data
+SOURCE_DIRS := ./common ./routers ./schemas ./data
 .PHONY: lint-fix
 lint-fix: $(VENV_MARKER)  ## Apply lint fixes and formatting (scope with PATHS=)
 	uv run ruff check --fix $(PATHS)
