@@ -14,7 +14,7 @@ _REDACTED = '***'
 # libpq itself only recognises the lowercase key, but an operator can still type 'Password' or
 # 'PASSWORD' and get a DSN that fails to connect while still carrying a real value -- masked on
 # a case-folded match so a typo doesn't turn into a leak.
-_PASSWORD_QUERY_KEY = 'password'
+_QUERY_KEY_TO_REDACT = 'password'
 
 
 def is_ambiguous_database_uri(uri: str) -> bool:
@@ -43,7 +43,7 @@ def is_ambiguous_database_uri(uri: str) -> bool:
 def _redact_query_password(url: URL) -> URL:
     """Return `url` with any query key that case-folds to 'password' masked."""
     return url.set(
-        query={key: (_REDACTED if key.lower() == _PASSWORD_QUERY_KEY else value) for key, value in url.query.items()}
+        query={key: (_REDACTED if key.lower() == _QUERY_KEY_TO_REDACT else value) for key, value in url.query.items()}
     )
 
 
