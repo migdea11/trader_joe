@@ -1,14 +1,45 @@
 name: Trader Joe Testing
 
+# ---------------------------------------------------------------------------
+# RULE -- no live broker credential in a branch-triggered workflow (tj-59cce6)
+#
+# Nothing triggered by `push` or `pull_request` may reference a secret that
+# authenticates to a broker or to a brokerage account. That includes anything
+# named ALPACA_*, IBKR_*, QUESTRADE_* or the equivalent for a future adapter,
+# and it holds whether the account is paper or live.
+#
+# Why: every job that holds such a secret exposes it to code on an unreviewed
+# branch and to every third-party action in that job. Pinning actions by SHA
+# lowers the probability of compromise; it does not lower the blast radius,
+# and blast radius is what matters when the asset is a trading credential.
+# Today the key is an Alpaca paper key, so the loss is bounded. The same job
+# shape at Phase 2 holds a credential that can place real orders in a
+# registered account -- hence the rule now, while it is cheap and boring.
+#
+# System and smoke tests therefore run without a real vendor. They assert the
+# stack comes up and answers; they do not exercise a broker account.
+#
+# If a credentialed run is ever genuinely needed, it does NOT come back here.
+# It goes in a SEPARATE workflow whose only trigger is `workflow_dispatch`,
+# with `environment:` set to a GitHub Environment configured with required
+# reviewers. That workflow is deliberately not built yet -- build it when a
+# use case actually appears, not speculatively.
+#
+# `secrets.GITHUB_TOKEN` and `secrets.SAFETY_API_KEY` are not broker
+# credentials and are unaffected by this rule.
+# ---------------------------------------------------------------------------
+
 on:
   push:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
 
-permissions:
-  contents: read
-  packages: write
+# Deny by default at workflow level; every job declares the scopes it needs and
+# nothing else. `packages: write` in particular belongs only to Image Build --
+# declared here it would also hand a registry-push token to the lint job and to
+# the security job, which runs a third-party action with an API key.
+permissions: {}
 
 env:
   UV_VERSION: "0.9.3"
@@ -19,6 +50,8 @@ jobs:
     name: Linting and Unit Testing
     runs-on: ubuntu-latest
     container: debian:bookworm-slim
+    permissions:
+      contents: read  # checkout only
     env:
       UV_LINK_MODE: copy
       POSTGRES_ASYNC: true
@@ -48,6 +81,8 @@ jobs:
   security:
     name: Security Checks
     runs-on: ubuntu-latest
+    permissions:
+      contents: read  # checkout only; pyupio/safety-action runs here, so no more
     steps:
     - uses: actions/checkout@v4
 
@@ -84,6 +119,9 @@ jobs:
   build:
     name: Image Build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read   # checkout
+      packages: write  # the only job that pushes to ghcr.io
     needs:
       - testing
       - security
@@ -163,6 +201,8 @@ jobs:
   system:
     name: System Testing
     runs-on: ubuntu-latest
+    permissions:
+      packages: read  # pulls the images Image Build pushed; no checkout, so no contents
     needs:
       - build
 
@@ -207,13 +247,14 @@ jobs:
           docker tag ${{ needs.build.outputs.IMAGE_INGEST }} trader_joe_data_ingest
           docker images  # Verify images are loaded
 
-      - name: Add Runtime Configs
-        run: |
-          cat >> data/ingest/.env <<EOF
-          ALPACA_API_KEY=${{ secrets.ALPACA_API_KEY }}
-          ALPACA_API_SECRET=${{ secrets.ALPACA_API_SECRET }}
-          EOF
-          chmod 600 data/ingest/.env
+      # No "Add Runtime Configs" step: this job writes no ALPACA_* value at all, not
+      # even a placeholder one. The placeholders were only ever needed because
+      # data/ingest/app/brokers/alpaca/broker_api.py built its Alpaca client at import
+      # time. It now builds lazily, per request, so data_ingest imports and starts with
+      # both variables unset -- and data/ingest/.env.default ships them commented out.
+      # The smoke test below asserts /ping on both services and one data_store read
+      # through to Postgres; none of those reaches the broker, so nothing here needs a
+      # credential, real or fake. Do not reintroduce a step that writes one.
 
       - name: Start System
         run: |
