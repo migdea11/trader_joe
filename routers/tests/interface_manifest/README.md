@@ -53,14 +53,20 @@ answer: there is no schema to name.
 - **`unbound-path`** — a path declared in an interface enum that no import-time route serves.
 
 `unbound-path` exists because the import-time surface is not the whole declared surface, and the gap
-was invisible before this manifest. Three sit here today and each is a real finding:
+was invisible before this manifest. Two sit here today, and they are the latency pair:
 `routers/common/latency.py` builds its `APIRouter` *inside*
-`initialize_latency_client()`/`initialize_latency_server()`, so `/latency` and `/latency_internal`
-appear only when `LATENCY_TEST_ENABLED` is set and a live Kafka factory is available — which a test
-that touches nothing external may not do; and `routers/data_ingest` declares
-`/broker/{asset_type}/{symbol}/{data_type}` while `get_dataset_request.router` registers no route at
-all. Implement one of them and its `unbound-path` line has to become an `http` line in the same
-diff, so the gap cannot close quietly either.
+`initialize_latency_client()`/`initialize_latency_server()`, so `/latency/{latency_type}` and
+`/latency_internal` appear only when `LATENCY_TEST_ENABLED` is set and a live Kafka factory is
+available — which a test that touches nothing external may not do. Both paths are real and served by
+committed code; they are simply not enumerable at import. That is the kind doing the job it was
+invented for.
+
+A line leaves this kind in one of two ways, and neither is quiet: implement the path and its
+`unbound-path` line has to become an `http` line in the same diff, or delete the declaration and the
+line goes with it in the same diff. Three entries left by that second route on 2026-09-23 — one in
+`routers/data_ingest`, two in `routers/data_store` — and each was a declaration no code ever served,
+not a route anyone could call. See "Declarations deleted by ruling" in `docs/API.md` for what each
+was and what would bring it back; it is not restated here.
 
 Matching is by path, not by method, because an enum member carries no method: `DELETE /store/{id}`
 is therefore enough to count `GET_STORE_ASSET_DATASET_BY_ID` as bound. That coarseness is the
