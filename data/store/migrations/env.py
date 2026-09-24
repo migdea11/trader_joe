@@ -8,6 +8,7 @@ from sqlalchemy import engine_from_config, pool
 from common.database.sql_alchemy_table import AppBase
 from common.environment import get_env_var
 from common.logging import get_logger
+from data.store.app.database.uri_display import is_ambiguous_database_uri, mask_database_uri
 
 
 log = get_logger(__name__)
@@ -19,8 +20,27 @@ config = context.config
 # Assuming your .env file is in the same directory as your Alembic directory or specify the path
 load_dotenv('.env')
 database_uri = get_env_var('DATABASE_URI')
-log.debug(f'Setting up postgres URL: {database_uri}')
-config.set_main_option('sqlalchemy.url', database_uri)
+# tj-zb1di4: a raw, unescaped '@' in the password (docker-compose.yaml interpolates
+# POSTGRES_PASS unencoded, so this is reachable) makes the DSN's userinfo/host split
+# ambiguous. Masking the log line below isn't enough on its own -- the SAME ambiguous DSN
+# still goes to psycopg2 in run_migrations_online(), and psycopg2's own connection-failure
+# message names whatever it mis-parsed as the host (e.g. `could not translate host name
+# "TAILpart@db-nx.invalid"`), which reaches make migrate/CI output exactly like the log line
+# used to. So refuse before anything downstream gets a chance to leak part of the password,
+# with a message that names the problem but never echoes the URI.
+if database_uri and is_ambiguous_database_uri(database_uri):
+    raise RuntimeError('DATABASE_URI is ambiguous (unescaped @ in the password?); percent-encode reserved characters.')
+# DATABASE_URI carries the postgres password. Never log it verbatim -- this line used to, and
+# the password showed up in plain text in `make migrate` output and in this public repo's CI
+# logs. mask_database_uri() is the only thing allowed to sit inside this f-string.
+log.debug(f'Setting up postgres URL: {mask_database_uri(database_uri)}')
+# config.set_main_option() writes through configparser, which treats '%' as its own
+# interpolation escape. A percent-encoded password (the correct way to put a reserved
+# character like '@' in a URL, e.g. '%40') then raises ValueError with the FULL RAW URI --
+# password included -- in the traceback, which reaches make migrate and CI output same as the
+# log line above did. '%' -> '%%' is alembic's documented escape and round-trips losslessly:
+# configparser un-doubles it back to a single '%' when the value is read back out.
+config.set_main_option('sqlalchemy.url', database_uri.replace('%', '%%') if database_uri else database_uri)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
