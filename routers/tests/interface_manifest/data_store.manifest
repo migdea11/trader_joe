@@ -1,0 +1,13 @@
+# The interface surface of routers/data_store. Asserted by routers/tests/test_interface_surface.py.
+# Format, field meanings and why this file is committed rather than generated: see README.md.
+# Keep sorted. Adding an interface is meant to cost a line here, in the same diff.
+#
+# Every route here touches an AsyncSession, so every one of them is an integration-tier test when
+# it gets one; POST /store/... also reaches Kafka. That is what the touches field is for.
+#
+# kind | address | file | symbol | request | response | touches
+http | DELETE /store/{id} | routers/data_store/asset_dataset_store.py | delete_data | schemas.data_store.asset_dataset_store.AssetDatasetStoreDelete | - | sqlalchemy.ext.asyncio.session.AsyncSession
+http | GET /internal/asset-data/{asset_type}/{data_type} | routers/data_store/internal_asset_data.py | read_stock_market_activity_data | schemas.data_store.asset_data_interface.AssetDataPath | list[schemas.data_store.stock.market_activity_data.StockDataMarketActivity] | sqlalchemy.ext.asyncio.session.AsyncSession
+http | GET /store/{asset_type}/{data_type}/{asset_symbol} | routers/data_store/asset_dataset_store.py | get_data | schemas.data_store.asset_dataset_store.StoreAssetDatasetPath, schemas.data_store.asset_dataset_store.StoreAssetDatasetQuery | list[schemas.data_store.asset_dataset_store.AssetDatasetStore] | sqlalchemy.ext.asyncio.session.AsyncSession
+http | POST /internal/asset-data/{asset_type}/{data_type} | routers/data_store/internal_asset_data.py | create_stock_market_activity_data | schemas.data_store.asset_data_interface.AssetDataPath | schemas.data_store.stock.market_activity_data.StockDataMarketActivity | dict, sqlalchemy.ext.asyncio.session.AsyncSession
+http | POST /store/{asset_type}/{data_type}/{asset_symbol} | routers/data_store/asset_dataset_store.py | store_data | schemas.data_store.asset_dataset_store.StoreAssetDatasetBody, schemas.data_store.asset_dataset_store.StoreAssetDatasetPath | - | common.kafka.kafka_rpc_factory.KafkaRpcFactory.RpcClients, sqlalchemy.ext.asyncio.session.AsyncSession

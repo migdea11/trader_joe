@@ -1,0 +1,8 @@
+# The interface surface of routers/common. Asserted by routers/tests/test_interface_surface.py.
+# Format, field meanings and why this file is committed rather than generated: see README.md.
+# Keep sorted. Adding an interface is meant to cost a line here, in the same diff.
+#
+# kind | address | file | symbol | request | response | touches
+http | GET /ping | routers/common/ping.py | ping | - | - | -
+unbound-path | /latency/{latency_type} | routers/common/app_endpoints.py | InterfaceRest.LATENCY | - | - | -
+unbound-path | /latency_internal | routers/common/app_endpoints.py | InterfaceRest.INTERNAL_LATENCY | - | - | -

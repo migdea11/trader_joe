@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import ClassVar, Generic, TypeVar
+from typing import TYPE_CHECKING, ClassVar, Generic, TypeVar
 from uuid import uuid4 as UUID
 
 from kafka.consumer.fetcher import ConsumerRecord
@@ -12,6 +12,10 @@ from common.kafka.messaging.kafka_producer import KafkaProducerFactory
 from common.kafka.topics import RpcEndpointTopic
 from common.logging import get_logger
 from common.worker_pool import SharedWorkerPool
+
+
+if TYPE_CHECKING:
+    from kafka import KafkaProducer
 
 
 log = get_logger(__name__)
@@ -126,8 +130,12 @@ class KafkaRpcBase(Generic[Req, Res], ABC):
 
     def __init__(self, kafka_config: RpcParams, endpoint: RpcEndpoint[Req, Res], timeout: int):
         self.endpoint = endpoint
-        producer_params = ProducerParams(kafka_config.host, kafka_config.port, timeout)
-        self.producer = KafkaProducerFactory.get_producer(producer_params)
+        # Only the parameters are resolved here. The producer itself is built in initialize(),
+        # because get_producer() calls wait_for_kafka() and add_server() is applied at module
+        # scope -- building it here makes importing a module that registers an RPC server
+        # require a reachable broker and a populated KAFKA_* environment.
+        self._producer_params = ProducerParams(kafka_config.host, kafka_config.port, timeout)
+        self.producer: KafkaProducer | None = None
         self._consumer_params = ConsumerParams(
             kafka_config.host, kafka_config.port, [], kafka_config.consumer_group, False, timeout
         )
@@ -157,6 +165,7 @@ class KafkaRpcBase(Generic[Req, Res], ABC):
         Returns:
             KafkaConsumerFactory.ConsumerControl: Consumer control instance.
         """
+        self.producer = KafkaProducerFactory.get_producer(self._producer_params)
         return factory.add_async_consumer(
             self._executor, self._consumer_params, self._callback, self._commit_batch_size, self._commit_batch_interval
         )

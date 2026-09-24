@@ -8,10 +8,19 @@ from common.enums.data_stock import DataSource, Granularity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 
 
-# TODO figure out actual primary keys
 class BaseMarketActivity(AppBase.DATA_STORE_BASE):
     __abstract__ = True
 
+    # The natural key of a bar. A bar is identified by what it describes — a symbol, from a
+    # vendor, at a granularity, at an instant — so re-fetching an overlapping window is a
+    # no-op rather than a duplicate row. dataset_id is deliberately NOT part of the key:
+    # two fetches of the same minute through different dataset entries are the same bar, and
+    # including dataset_id would defeat the point. See tj-3mk3u5.3. Concrete tables declare
+    # the constraint itself so each gets its own name.
+    NATURAL_KEY = ('asset_symbol', 'source', 'granularity', 'timestamp')
+
+    # Surrogate key, kept deliberately: it is exposed as StockDataMarketActivity.id and is a
+    # cheaper join and delete target than the four-column natural key above.
     id = Column(Integer, primary_key=True)
     dataset_id = Column(
         UUID, ForeignKey(f'{StoreDatasetEntry.TABLE_NAME}.id', ondelete='CASCADE'), index=True, nullable=False

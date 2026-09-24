@@ -1,6 +1,11 @@
 # Define default shell
 SHELL := /bin/bash
 
+# Every target except $(VENV_MARKER) is a command, not a file, and is declared .PHONY next to
+# its own recipe so a new target is hard to add without one. Undeclared, a file or directory of
+# the same name -- a test/ or build/ at the repo root -- makes the target "up to date": make
+# runs nothing and exits 0, so `make test` would report success having run no test (tj-06uflo).
+.PHONY: help
 help:  ## Show this help message
 	@echo "Available make commands:"
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make <target>\n\nTargets:\n"} \
@@ -45,32 +50,130 @@ $(VENV_MARKER): pyproject.toml uv.lock  ## Internal option to install uv and syn
 	uv sync --all-groups --no-group security
 	touch $(VENV_MARKER)
 
+.PHONY: init
 init: $(VENV_MARKER)  ## Initialize the project, including the security tooling
 	uv sync --all-groups
 
-build: $(VENV_MARKER)  ## Build the Docker images
-	docker compose  -f docker-compose.yaml build
+# Every compose target goes through one of these, and none omits -f. A bare
+# `docker compose` auto-loads docker-compose.override.yaml, which is what made `launch`
+# start the dev images while its help text claimed production (tj-6ap2vw).
+#
+# The two stacks differ only in the override: dev_image (RUN_MODE=dev, --reload, the dev
+# dependency group, and the debugger of tj-g1qqf1), source bind mounts so reload sees host
+# edits, LOG_LEVEL=debug, and LATENCY_TEST_ENABLED=true on data_store and data_ingest. The
+# first three change how the services are built and how loudly they log; the last changes what
+# they DO at startup -- both create the latency Kafka topics and their RPC client/server
+# consumers, and data_store serves GET /latency (tj-8mt207). That is the whole reason
+# PROD_COMPOSE must never grow the override: loading it here would put the harness back into
+# prod, which is the environment this repo exists to keep it out of.
+#
+# TOOLS_COMPOSE is the dev pair plus docker-compose.tools.yaml, which holds pgAdmin and nothing
+# else. Only dev-tools and dev-down use it (tj-ae3n49). pgAdmin's PGADMIN_EMAIL/PGADMIN_PASS use
+# ":?" guards, and compose evaluates every file it is handed, so a file any other target loaded
+# would make those credentials a requirement of the whole dev stack. A profile does not avoid
+# that; a separate file does. PROD_COMPOSE never loads it.
+PROD_COMPOSE := docker compose -f docker-compose.yaml
+DEV_COMPOSE := docker compose -f docker-compose.yaml -f docker-compose.override.yaml
+TOOLS_COMPOSE := $(DEV_COMPOSE) -f docker-compose.tools.yaml
 
-build-clean: $(VENV_MARKER)  ## Build the Docker images
-	docker compose  -f docker-compose.yaml build --no-cache
+# --wait, matching the CI deploy step: it blocks until every started service reports
+# healthy and exits non-zero if one does not, so a broken deploy fails the command instead
+# of printing a cheerful "Started". 300s because kafka alone declares a 90s start_period
+# and data_store a 60s one. Detached is the consequence -- `prod-logs` is how you watch it.
+PROD_UP := $(PROD_COMPOSE) up -d --wait --wait-timeout 300
 
-launch-deps: $(VENV_MARKER)  ## Launch dependency containers
-	docker compose up -d postgres kafka pgadmin redpanda
+.PHONY: prod-build
+prod-build: $(VENV_MARKER)  ## Build the production images (:latest)
+	$(PROD_COMPOSE) build
 
-launch: launch-deps  ## Launch production services
-	docker compose up data_store data_ingest
+.PHONY: prod-build-clean
+prod-build-clean: $(VENV_MARKER)  ## Build the production images from scratch, no cache
+	$(PROD_COMPOSE) build --no-cache
 
-launch-down:  ## Stop all services
-	docker compose down
+.PHONY: prod-deps
+prod-deps: $(VENV_MARKER)  ## Start the production dependencies (postgres, kafka)
+	$(PROD_UP) postgres kafka
 
-dev-build: $(VENV_MARKER)  ## Build the Docker images for development
-	docker compose -f docker-compose.yaml -f docker-compose.override.yaml build
+.PHONY: prod-launch
+prod-launch: prod-deps  ## Start the production services, waiting for healthy
+	$(PROD_UP) data_store data_ingest
 
-dev-launch: launch-deps  ## Launch development services
-	docker compose -f docker-compose.yaml -f docker-compose.override.yaml up data_store data_ingest
+.PHONY: prod-logs
+prod-logs:  ## Follow the production service logs
+	$(PROD_COMPOSE) logs -f data_store data_ingest
 
+.PHONY: prod-down
+prod-down:  ## Stop the production stack
+	$(PROD_COMPOSE) down
+
+# The single spelling of "apply the migrations" — run it after every deploy, once the stack is
+# up. Nothing else creates the schema, so a healthy stack has an empty database until this runs.
+# The deploy script of tj-jm51fw will call this target rather than repeat the compose line.
+#
+# No $(VENV_MARKER) prerequisite, unlike every other compose target here: the script runs alembic
+# inside the data_store container, never from the host venv. A host sync would be wasted work,
+# and it would make the production migration path depend on uv being usable on the server.
+# The script resolves the repo root itself, so this works from any directory.
+#
+# Production-shaped, and deliberately not a prerequisite of any launch target: the accepted
+# direction (tj-x3ig38) is that migrations are a deploy-script step, never a compose
+# dependency and never the entrypoint, because a rollback re-runs `compose up` and would
+# re-apply the migration from the wrong revision directory. The script passes
+# -f docker-compose.yaml itself, so this runs against the production data_store definition
+# even when the dev stack is what is up -- postgres is the same container either way.
+.PHONY: migrate
+migrate:  ## Apply database migrations to the running production stack
+	./data/store/run_migrations.sh
+
+.PHONY: dev-build
+dev-build: $(VENV_MARKER)  ## Build the development images (:dev)
+	$(DEV_COMPOSE) build
+
+.PHONY: dev-deps
+dev-deps: $(VENV_MARKER)  ## Start the development dependencies (postgres, kafka)
+	$(DEV_COMPOSE) up -d postgres kafka
+
+# pgAdmin is a tool, not a dependency: it lives in docker-compose.tools.yaml, which dev-deps and
+# dev-launch never load (tj-ae3n49). This is the on-demand spelling, and the one target that
+# needs PGADMIN_EMAIL/PGADMIN_PASS set. compose brings postgres up first, because pgadmin
+# depends on it being healthy. Stop it with dev-down.
+.PHONY: dev-tools
+dev-tools: $(VENV_MARKER)  ## Start pgAdmin against the development database (needs PGADMIN_*)
+	$(TOOLS_COMPOSE) up -d pgadmin
+
+# Foreground on purpose, unlike prod-launch: --reload prints what it reloaded and why, and
+# that output is the reason to run the dev stack at all. Ctrl-C stops it.
+.PHONY: dev-launch
+dev-launch: dev-deps  ## Start the development services in the foreground, with reload
+	$(DEV_COMPOSE) up data_store data_ingest
+
+# Through TOOLS_COMPOSE, so a pgAdmin started by dev-tools goes down with the rest instead of
+# being left running as an orphan on the project network. Costs nothing when it is not running.
+#
+# The placeholder PGADMIN_* values exist only to get past the ":?" guards, so that stopping the
+# stack never requires pgAdmin credentials. They are safe here and ONLY here: `down` creates no
+# container, so no pgAdmin account can ever be initialised from them. Shell variables outrank
+# .env in compose interpolation, which is why they must never be copied onto an `up`.
+.PHONY: dev-down
+dev-down:  ## Stop the development stack, pgAdmin included
+	PGADMIN_EMAIL=unused PGADMIN_PASS=unused $(TOOLS_COMPOSE) down
+
+.PHONY: dev-prune
 dev-prune: ## Prune development services
 	docker container prune -f && docker volume prune -f && docker image prune -f
+
+# Removed spellings. Each one used to resolve a stack its name did not state: `launch` and
+# `launch-deps` ran dev while the help text said production, and `build` produced prod
+# images no target ever started (tj-6ap2vw). Failing here rather than deleting the names
+# outright means muscle memory gets a pointer instead of picking a stack silently -- and
+# data/store/run_migrations.sh still names `make launch-deps` in its error path, so that
+# hint degrades into this message rather than into nothing. No `##`: `make help` lists the
+# real targets only.
+.PHONY: build build-clean launch launch-deps launch-down
+build build-clean launch launch-deps launch-down:
+	@echo "'make $@' is gone: it did not state which stack it meant (tj-6ap2vw)." >&2
+	@echo "Use the prod-* or dev-* target for the stack you want -- see 'make help'." >&2
+	@exit 1
 
 AGENT_COMPOSE := docker compose -f .devcontainer/compose.yml
 
@@ -81,34 +184,45 @@ AGENT_COMPOSE := docker compose -f .devcontainer/compose.yml
 # Exported so compose.yml resolves the same path this file does.
 export AGENT_HOME_PATH ?= $(HOME)/.claude-agent-homes/trader_joe
 
+.PHONY: agent-build
 agent-build:  ## Build the agent devcontainer image
 	$(AGENT_COMPOSE) build
 
+.PHONY: agent-up
 agent-up:  ## Start the agent devcontainer
 	mkdir -p "$(AGENT_HOME_PATH)"
 	$(AGENT_COMPOSE) up -d
 
+.PHONY: agent-down
 agent-down:  ## Stop the agent devcontainer (host config dir is kept)
 	$(AGENT_COMPOSE) down
 
+.PHONY: agent-attach
 agent-attach:  ## Open a shell inside the agent devcontainer
 	$(AGENT_COMPOSE) exec agent bash
 
-clean: launch-down  ## Clean up the project
+# dev-down, not prod-down: this is a workstation target -- it deletes .venv -- and dev-down is
+# the one teardown that loads docker-compose.tools.yaml, so going through it leaves no pgAdmin
+# behind.
+.PHONY: clean
+clean: dev-down  ## Clean up the project
 	rm -rf .venv $(VENV_MARKER)
 	[[ -d .pytest_cache ]] && rm -rf .pytest_cache || true
 	[[ -d .coverage ]] && rm -rf .coverage || true
 	[[ -d coverage.xml ]] && rm -rf coverage.xml || true
 
+.PHONY: lint
 lint: $(VENV_MARKER)  ## Lint and format-check the project (scope with PATHS=)
 	uv run ruff check $(PATHS)
 	uv run ruff format --check $(PATHS)
 
-SOURCE_DIRS := ./common ./router ./schemas ./data
+SOURCE_DIRS := ./common ./routers ./schemas ./data
+.PHONY: lint-fix
 lint-fix: $(VENV_MARKER)  ## Apply lint fixes and formatting (scope with PATHS=)
 	uv run ruff check --fix $(PATHS)
 	uv run ruff format $(PATHS)
 
+.PHONY: security
 security: $(VENV_MARKER)  ## Check security vulnerabilities
 	uv run bandit -r $(SOURCE_DIRS) --exclude tests/
 	uv run semgrep --config=auto --exclude=tests/ --exclude=.venv --exclude=docker-compose.override.yaml .
@@ -119,9 +233,59 @@ security: $(VENV_MARKER)  ## Check security vulnerabilities
 
 # Deliberately independent of `lint`: a test run must report a test result, not a lint failure.
 # CI runs both, as separate steps.
-test: $(VENV_MARKER)  ## Run tests (scope with PATHS=)
-	POSTGRES_ASYNC=true POSTGRES_SYNC=true uv run pytest $(PATHS)
+#
+# THE PR GATE -- -m "not external" -- IS IN pytest.ini's addopts, NOT in these targets, because
+# CI does not go through make: .github/workflows/trader_joe_testing.yml runs `uv run pytest`
+# directly. Every target here therefore inherits the gate for free, and the ones that want a
+# different set pass their own -m, which wins: addopts is prepended, so the last -m on the
+# command line is the one that takes effect. Putting an -m in each target instead would mean
+# two places that must agree, and the CI one is the one that drifts.
+#
+# POSTGRES_ASYNC / POSTGRES_SYNC are import-time feature flags in
+# common/database/postgres_tools.py choosing which driver is imported. They are NOT a claim
+# that a database is reachable, and they are not markers. CI and .devcontainer/compose.yml set
+# them too; spelled once here so the targets below cannot drift apart.
+PYTEST_ENV := POSTGRES_ASYNC=true POSTGRES_SYNC=true
+PYTEST := $(PYTEST_ENV) uv run pytest
 
-test-cov: $(VENV_MARKER)  ## Run tests with coverage (scope with PATHS=)
-	POSTGRES_ASYNC=true POSTGRES_SYNC=true uv run coverage run -m pytest $(PATHS)
+.PHONY: test
+test: $(VENV_MARKER)  ## Run the PR gate: every test except `external` (scope with PATHS=)
+	$(PYTEST) $(PATHS)
+
+# coverage has to own the invocation -- `coverage run -m pytest` -- so this takes the env
+# prefix rather than $(PYTEST). pytest.ini still applies, so the selected set is identical.
+.PHONY: test-cov
+test-cov: $(VENV_MARKER)  ## Run the PR gate with coverage (scope with PATHS=)
+	$(PYTEST_ENV) uv run coverage run -m pytest $(PATHS)
 	uv run coverage xml
+
+# One parameterised target rather than one per component, so the set of components can change
+# without touching this file. `make test PATHS=data/store/tests` does the same job today, but
+# only until the Phase 1 restructure (tj-55cczk) moves every path -- markers survive that,
+# PATHS= does not. Component names are the `markers` list in pytest.ini.
+#
+# A COMPONENT that matches nothing is not silently green: pytest collects nothing and exits 5.
+# The guard is for the EMPTY case only, which would otherwise hand pytest the unparseable
+# expression " and not external" and report a usage error instead of the missing variable.
+.PHONY: test-component
+test-component: $(VENV_MARKER)  ## Run one component, e.g. COMPONENT=data_store (scope with PATHS=)
+	@[ -n "$(COMPONENT)" ] || { echo "make test-component needs COMPONENT=<name>; the names are the 'markers' list in pytest.ini." >&2; exit 1; }
+	$(PYTEST) -m "$(COMPONENT) and not external" $(PATHS)
+
+# The only target that runs the `external` set, and the only one CI must never call: an
+# external test needs a live third-party credential, and tj-59cce6 forbids a credential in a
+# branch-triggered workflow. This is a target the USER runs on their own machine; an agent
+# reports it NOT RUN rather than passed. It fails rather than skips when the account is not
+# answering -- see the fail-never-skip comment in pytest.ini.
+#
+# Named `broker` while the marker is named `external` on purpose, not by oversight: pytest.ini
+# records why.
+.PHONY: test-broker
+test-broker: $(VENV_MARKER)  ## Run the external broker tests: needs live credentials, never CI
+	$(PYTEST) -m external $(PATHS)
+
+# -m "" REPLACES the addopts filter rather than adding to it, leaving no selection at all, so
+# this is the gate plus the external set. Same caveat as test-broker: it needs live credentials.
+.PHONY: test-all
+test-all: $(VENV_MARKER)  ## Run every test, external included: needs live credentials
+	$(PYTEST) -m "" $(PATHS)

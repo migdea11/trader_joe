@@ -1,0 +1,37 @@
+# Developer tools, loaded on demand only: `make dev-tools` starts them and `make dev-down`
+# stops them. No other target passes this file -- not dev-deps, dev-launch or dev-build, and
+# never PROD_COMPOSE -- so nothing here can be required by, or started with, the stack itself.
+#
+# A separate file rather than a compose profile on purpose (tj-ae3n49). compose interpolates
+# every file it is given before it drops inactive-profile services, so a ":?" guard in a
+# profiled service still aborts every command that loads the file. Keeping pgAdmin out of the
+# files the stack loads is what lets its guards stay strict without taxing every dev command.
+#
+# Layered on the dev pair (docker-compose.yaml + docker-compose.override.yaml): pgadmin's
+# depends_on names the postgres service defined in the base file.
+services:
+  pgadmin:
+    image: dpage/pgadmin4:9.17.0
+    container_name: pgadmin
+    ports:
+      # Loopback only: this is a browser UI with a login that holds the database
+      # credentials, so it is reachable from this machine and nowhere else.
+      - "127.0.0.1:${POSTGRES_UI_PORT}:80"
+    environment:
+      # Was admin@admin.com / admin, hard-coded and published on every interface. No
+      # defaults now -- ":?" stops compose before the container exists, and because only
+      # the dev-tools and dev-down targets load this file, only they need these set. Note
+      # pgAdmin only reads them on first initialisation, so changing them does not rotate an
+      # account an earlier run already created in the mounted volume.
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:?set PGADMIN_EMAIL in .env}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASS:?set PGADMIN_PASS in .env (6+ characters)}
+    depends_on:
+      # Long form so the UI is not started against a database that is still running initdb;
+      # pgAdmin caches a failed server connection and the first page load looks broken.
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ${DATA_DIR:-./volume_data}/pgadmin:/var/lib/postgresql/data
+    security_opt:
+      - "no-new-privileges:true"
+    read_only: true

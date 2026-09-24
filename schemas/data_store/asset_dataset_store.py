@@ -20,7 +20,9 @@ class StoreAssetDatasetBody(BaseModel):
     start: datetime | None = None
     end: datetime | None = None
 
-    expiry: datetime | None = datetime.now() + timedelta(days=1)
+    # default_factory, not a computed default: a plain default is evaluated once at import, so
+    # every instance in a long-lived process would share an expiry frozen at process start.
+    expiry: datetime | None = Field(default_factory=lambda: datetime.now() + timedelta(days=1))
     expiry_type: ExpiryType | None = ExpiryType.BULK
     update_type: UpdateType | None = UpdateType.STATIC
 

@@ -36,3 +36,6 @@ coverage.xml
 
 # Scratch output from the prepare-pr skill
 .claude/publish/
+
+# Per-machine Claude Code settings: local permission overrides, never shared
+/.claude/settings.local.json
