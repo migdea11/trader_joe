@@ -189,6 +189,19 @@ jobs:
         mkdir -p artifact/data/ingest artifact/data/store
         cp data/ingest/.env.default artifact/data/ingest/.env.default
         cp data/store/.env.default artifact/data/store/.env.default
+
+        # The migration scripts travel with the configs because System Testing has no
+        # checkout and the schema has to exist before anything can query it. The prod
+        # image ships alembic and psycopg2 (the data-store dependency group) but not
+        # these files -- the Dockerfile copies data/store/app only -- so compose
+        # bind-mounts them over /code/alembic.ini and /code/migrations. Without them
+        # staged, those two mounts point at paths that do not exist on that runner and
+        # docker silently materialises empty directories.
+        cp data/store/alembic.ini artifact/data/store/alembic.ini
+        cp -r data/store/migrations artifact/data/store/migrations
+        # Bytecode from this runner's interpreter is not useful to the container and
+        # only makes the artifact bigger.
+        find artifact/data/store/migrations -name __pycache__ -type d -prune -exec rm -rf {} +
         ls -lahR artifact/
 
     - name: Push Pipeline Configs
@@ -234,6 +247,12 @@ jobs:
           cp artifact/data/ingest/.env.default data/ingest/.env
           mkdir -p data/store
           cp artifact/data/store/.env.default data/store/.env
+          # Restored to the exact paths docker-compose.yaml bind-mounts into data_store:
+          # ./data/store/alembic.ini -> /code/alembic.ini and ./data/store/migrations ->
+          # /code/migrations. alembic resolves script_location=migrations against the
+          # container's WORKDIR (/code), so both have to land here, not anywhere else.
+          cp artifact/data/store/alembic.ini data/store/alembic.ini
+          cp -r artifact/data/store/migrations data/store/migrations
 
 
       - name: Pull Docker Images
@@ -259,8 +278,108 @@ jobs:
       - name: Start System
         run: |
           ls -lah
-          docker compose -f docker-compose.yaml up -d
-          docker ps  # Verify containers are running
+          # --wait, not a bare up -d. `up -d` returns once the containers are CREATED, so
+          # a service that boots and dies two seconds later still left this step green;
+          # `docker ps` then exits 0 on an empty list and confirmed nothing. With every
+          # service in docker-compose.yaml declaring a healthcheck, --wait blocks until
+          # each one reports healthy and exits non-zero if any goes unhealthy or dies.
+          # --wait-timeout bounds it: kafka's start_period is 90s and the two apps wait on
+          # kafka, so the ceiling has to sit well above the sum, and a hung stack should
+          # fail the job rather than burn the runner's six hours.
+          docker compose -f docker-compose.yaml up -d --wait --wait-timeout 300
+          docker compose -f docker-compose.yaml ps  # health column, not just liveness
+
+      - name: Migrate Database
+        run: |
+          # Nothing else ever creates the schema. entrypoint.sh runs uvicorn and nothing
+          # else; data_store's lifespan calls database.initialize(), which opens the engine
+          # and does not create a single table; there is no migration service in
+          # docker-compose.yaml. A healthy stack therefore has an EMPTY database, and every
+          # /store request answers 500 with an UndefinedTable error -- so the assertion in
+          # the next step would be red forever without this.
+          #
+          # --no-deps because the stack is already up and healthy; without it compose
+          # re-resolves postgres and kafka for a container that only needs the former.
+          # `run` publishes no ports, so this cannot collide with the running data_store.
+          # The command is an explicit argv: the image sets CMD, not ENTRYPOINT, so passing
+          # one replaces entrypoint.sh rather than appending to it.
+          docker compose -f docker-compose.yaml run --rm --no-deps data_store \
+            /code/.venv/bin/alembic upgrade head
+
+      - name: Smoke Test
+        run: |
+          set -euo pipefail
+
+          # Read the published ports out of the staged .env rather than sourcing it --
+          # sourcing would also pull POSTGRES_PASS into this shell's environment, and the
+          # only thing that buys is one more place a stray `set -x` could print it.
+          DATA_STORE_PORT="$(grep -E '^DATA_STORE_PORT=' .env | cut -d= -f2)"
+          DATA_INGEST_PORT="$(grep -E '^DATA_INGEST_PORT=' .env | cut -d= -f2)"
+
+          # Both services publish on 127.0.0.1 only (see the ports: comments in
+          # docker-compose.yaml). The runner is the host here, so loopback is reachable.
+          assert_http() {
+            name="$1"; url="$2"; want_body="$3"
+            # No -f: --fail suppresses the response body on a 4xx/5xx, and the body is
+            # exactly what makes a failure here diagnosable instead of an opaque number.
+            if ! response="$(curl -sS --max-time 20 -w '\n%{http_code}' "$url")"; then
+              echo "::error::${name}: curl could not complete a request to ${url}"
+              return 1
+            fi
+            status="${response##*$'\n'}"
+            body="${response%$'\n'*}"
+            echo "${name}: GET ${url} -> HTTP ${status}"
+            echo "${name}: body: ${body}"
+            if [ "${status}" != "200" ]; then
+              echo "::error::${name}: expected HTTP 200 from ${url}, got ${status}; body: ${body}"
+              return 1
+            fi
+            # Status alone is not enough. A 200 carrying an error payload is the next false
+            # green after the `docker ps` one this job is replacing, so the body is checked
+            # against the exact document the handler is supposed to return.
+            if [ "${body}" != "${want_body}" ]; then
+              echo "::error::${name}: expected body ${want_body} from ${url}, got: ${body}"
+              return 1
+            fi
+          }
+
+          assert_http "data_store ping" \
+            "http://127.0.0.1:${DATA_STORE_PORT}/ping" '{"message":"pong"}'
+          assert_http "data_ingest ping" \
+            "http://127.0.0.1:${DATA_INGEST_PORT}/ping" '{"message":"pong"}'
+
+          # The one request that actually proves something new. /ping is what the container
+          # healthchecks already probe, so re-asserting it adds nothing; this route runs
+          # data_store's own path into Postgres end to end -- Depends(async_db) hands the
+          # handler a session and search_entries() executes a real SELECT with an outer join
+          # and a GROUP BY against store_dataset_entry. It needs no broker and no Kafka RPC,
+          # which is what makes it the cheapest read that covers app -> database -> app.
+          #
+          # [] is the correct answer, not an empty-ish one: the query ran, matched no rows
+          # for this deliberately synthetic symbol, and came back. A missing schema, a
+          # refused connection or a bad credential all produce a 500 instead, and a failure
+          # here prints the body and then the `if: failure()` step below dumps the logs.
+          assert_http "data_store dataset search" \
+            "http://127.0.0.1:${DATA_STORE_PORT}/store/stock/market-activity/SMOKETEST" '[]'
+
+          echo "Smoke test passed: both services answered /ping and data_store served a query from Postgres."
+
+      - name: Dump Container Logs
+        if: failure()
+        run: |
+          # Without this a --wait timeout is an opaque red X, and the cheapest way to make
+          # an opaque red X go away is to delete --wait. Logs only: never `compose config`
+          # here, which would interpolate POSTGRES_PASS straight into the build log.
+          docker compose -f docker-compose.yaml ps --all
+          docker compose -f docker-compose.yaml logs --tail 200 --no-color
+
+      - name: Stop System
+        if: always()
+        # After the log dump on purpose -- `down -v` destroys the containers whose logs the
+        # step above reads. This buys nothing on a runner that is discarded either way; it
+        # is here so the invocation a human copies out of this job is one that does not
+        # leave a stack and a Postgres volume behind on their machine.
+        run: docker compose -f docker-compose.yaml down -v
 
       - name: Clean Runtime Configs
         if: always()

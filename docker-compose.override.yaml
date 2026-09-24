@@ -14,7 +14,10 @@ services:
       PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:?set PGADMIN_EMAIL in .env}
       PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASS:?set PGADMIN_PASS in .env (6+ characters)}
     depends_on:
-      - postgres
+      # Long form so the UI is not started against a database that is still running initdb;
+      # pgAdmin caches a failed server connection and the first page load looks broken.
+      postgres:
+        condition: service_healthy
     volumes:
       - ${DATA_DIR:-./volume_data}/pgadmin:/var/lib/postgresql/data
     security_opt:
@@ -30,7 +33,10 @@ services:
     environment:
       - KAFKA_BROKERS=kafka:9092
     depends_on:
-      - kafka
+      # The console polls on a fixed schedule and logs a wall of connection errors when it
+      # starts before the broker answers; waiting on health keeps dev logs readable.
+      kafka:
+        condition: service_healthy
     security_opt:
       - "no-new-privileges:true"
     read_only: true

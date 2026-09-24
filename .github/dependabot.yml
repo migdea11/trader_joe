@@ -1,0 +1,165 @@
+# Dependabot version updates.
+#
+# WHY THIS FILE EXISTS. Dependabot ALERTS and SECURITY UPDATES are configured in the
+# repository settings UI and need no config file; that is what "Dependabot is enabled"
+# meant up to now (tj-mcg1cs). Neither covers GitHub Actions VERSION updates, so the
+# `uses:` references in .github/workflows/ are currently updated by nobody. That is
+# survivable while they point at moving tags -- @v4 silently follows upstream -- and
+# becomes a defect the moment they are pinned to commit SHAs (tj-wkdnrv): a pinned SHA
+# never moves, so a pin with no update mechanism keeps a known-vulnerable action
+# forever AND looks deliberate. Pinning is the right call; it is only safe once this
+# file is in place. The reach worth caring about is astral-sh/setup-uv, which installs
+# the binary that resolves and executes the whole dependency tree, and
+# pyupio/safety-action, which runs in a job holding an API key (tj-xzx6my section 3).
+#
+# SCHEDULE. Weekly, not daily. One person reviews these. A bot that opens pull
+# requests faster than they are read gets muted, and a muted bot is worse than no bot
+# because it produces the appearance of maintenance. Weekly, grouped, with a low
+# ceiling keeps the queue at a size one person actually drains. Nothing here delays a
+# security fix: Dependabot security updates open their own pull requests when an
+# advisory lands, on their own schedule, and are explicitly NOT subject to
+# open-pull-requests-limit.
+#
+# GROUPING. Minor and patch updates are collapsed into one pull request per ecosystem.
+# Majors are deliberately left ungrouped -- a major is the one that breaks the build,
+# and it deserves its own diff and its own revert. `applies-to` is omitted throughout,
+# which means every group below applies to VERSION updates only; security updates stay
+# ungrouped and arrive on their own, which is the behaviour you want when the question
+# is "what exactly is this fixing".
+#
+# WHAT IS DELIBERATELY ABSENT: a Python entry. `uv` is a valid package-ecosystem value,
+# but GitHub documents neither which files it reads nor whether it understands PEP 735
+# `[dependency-groups]` -- and this project declares an EMPTY `[project].dependencies`
+# and puts every dependency in those groups. An entry whose behaviour on this exact
+# layout is unknown is either dead or a fight with uv.lock, and a config entry that
+# never fires is the same class of defect as bandit pointed at a directory that does
+# not exist (tj-nedzts). That is not in tension with keeping the `docker` entry below,
+# which admits it may open nothing for a while: that entry is idle for an UNDERSTOOD
+# reason and we know exactly what makes it fire (digest pinning), whereas a `uv` entry's
+# behaviour on this layout is UNKNOWN. A rule idle for a reason you can state is not the
+# same defect as a rule whose behaviour nobody here can predict.
+# Python dependencies stay covered by Dependabot alerts and
+# security updates plus pip-audit/safety in CI until someone confirms uv support
+# against this layout empirically. Do NOT substitute a `pip` entry: it would resolve
+# from pyproject.toml/requirements and fight the lockfile uv actually installs from.
+version: 2
+
+updates:
+  # ---------------------------------------------------------------------------
+  # GitHub Actions. The entry that did not exist, and the reason for the file.
+  #
+  # `directory: /` is how this ecosystem is addressed -- it means the repository root,
+  # from which Dependabot searches .github/workflows/. `/.github/workflows` is wrong
+  # here.
+  #
+  # Tracks, today: actions/checkout, astral-sh/setup-uv, pyupio/safety-action,
+  # docker/login-action, actions/upload-artifact, actions/download-artifact.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: America/Toronto
+    open-pull-requests-limit: 5
+    commit-message:
+      # Matches the repo's conventional-commit types. Dependabot writes its own
+      # subjects and cannot know about the [agent] tag or the Bead: trailer, so this
+      # is as close to the convention as a bot gets.
+      prefix: ci
+    groups:
+      actions-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  # ---------------------------------------------------------------------------
+  # Dockerfile. `directory: /` is the root Dockerfile, which is the one that builds
+  # both service images.
+  #
+  # HONEST LIMIT: this may open nothing for a while. Both `FROM` lines are
+  # debian:bookworm-slim -- a suite tag with no version component to compare -- and the
+  # uv binary arrives via `COPY --from=ghcr.io/astral-sh/uv:0.9.3`, which GitHub does
+  # not document as being tracked at all. The entry earns its place on what comes
+  # next: the moment the bases are pinned by digest for reproducibility, this is the
+  # mechanism that refreshes those digests instead of freezing them, which is the same
+  # argument as the actions pins above. It is here BEFORE the digest pins for that
+  # reason. If the uv version in the Dockerfile needs to move, that is still a manual
+  # edit -- it is pinned in three places (Dockerfile, Makefile, workflow env).
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: America/Toronto
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: build
+    groups:
+      docker-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  # ---------------------------------------------------------------------------
+  # Docker Compose. A SEPARATE ecosystem from `docker` -- the docker entry above does
+  # not cover compose files. This is the entry that actually has version-comparable
+  # pins to move today: postgres:17.11-trixie and confluentinc/cp-kafka:7.9.10.
+  #
+  # Majors are ignored for both images, and that is a deliberate trade, not tidiness:
+  #
+  # * confluentinc/cp-kafka 8.x is Kafka 4.0, which removed the protocol api versions
+  #   kafka-python-ng still sends. The client swap is tracked in tj-q65ux6. Until it
+  #   lands, a major bump is a pull request that cannot be merged, only reclosed.
+  # * postgres majors change the on-disk format. PGDATA is a bind mount, so a tag bump
+  #   alone does not migrate anything -- it starts a server that refuses the data
+  #   directory. That bump is a planned operation (tj-owduw0), not a pull request.
+  #
+  # WHAT THIS COSTS IS AN OPEN QUESTION, and this file will not pretend otherwise.
+  # `ignore` naming a dependency outright, or with a `versions:` range, is documented to
+  # suppress SECURITY updates in the ignored range as well. Whether `ignore` with
+  # `update-types: [version-update:semver-major]` -- the form used here, with no
+  # `versions:` key -- does the same is NOT stated plainly by GitHub anywhere findable.
+  # The available evidence points the other way, that `update-types` scopes the rule to
+  # VERSION updates only and leaves security updates alone, but that has not been
+  # verified empirically against this repository. tj-nzytct settles it once Dependabot
+  # has actually run. Read that bead before acting on this comment, and do NOT delete
+  # this block to "restore" security coverage that may never have been lost: doing so
+  # lets through a major that cannot be merged here anyway.
+  #
+  # The block is safe under EITHER reading. Both projects ship security fixes as patch
+  # releases on supported majors, patch and minor remain fully covered, and a cp-kafka
+  # 8.x or postgres major bump is unmergeable here regardless, for the two reasons
+  # above.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: America/Toronto
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: build
+    ignore:
+      - dependency-name: confluentinc/cp-kafka
+        update-types:
+          - version-update:semver-major
+      - dependency-name: postgres
+        update-types:
+          - version-update:semver-major
+    groups:
+      compose-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch

@@ -26,6 +26,17 @@ services:
       - ${DATA_DIR:-./volume_data}/postgres:/var/lib/postgresql/data
     security_opt:
       - "no-new-privileges:true"
+    healthcheck:
+      # -h 127.0.0.1 on purpose. The postgres entrypoint runs a temporary server during
+      # initdb that listens on the unix socket ONLY, so a socket-based pg_isready reports
+      # ready while the database is still initialising and every TCP client is refused --
+      # exactly the false green this task exists to remove. $$ is compose's escape for a
+      # literal $, so the shell inside the container expands these, not the compose file.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   kafka:
     # Confluent Platform 7.9.x == Apache Kafka 3.9.x. Held on the 3.x line on purpose:
@@ -60,6 +71,23 @@ services:
       - ${DATA_DIR:-./volume_data}/kafka:/var/lib/kafka/
     security_opt:
       - "no-new-privileges:true"
+    healthcheck:
+      # The broker's own admin client against the BROKER listener: this succeeds only once
+      # the KRaft broker has finished startup and is answering the protocol, which a TCP
+      # connect test does not distinguish from a socket that is merely bound. localhost is
+      # deliberate -- KAFKA_LISTENERS binds 0.0.0.0:9092, and bootstrapping over the loopback
+      # keeps the probe independent of how ${BROKER_NAME} resolves.
+      #
+      # Each probe starts a JVM, hence the 20s timeout: a 5s timeout would report a healthy
+      # broker as unhealthy roughly as often as it reported anything. start_period is 90s
+      # because KRaft format-and-start takes tens of seconds on a cold volume, and a
+      # start_period shorter than the real startup is how `up --wait` acquires a reputation
+      # for spurious failure and gets deleted.
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 15s
+      timeout: 20s
+      retries: 10
+      start_period: 90s
     # kafka needs to write config/state during startup (e.g. /etc/kafka),
     # keep the service writable. Setting the whole container read_only prevents
     # startup scripts from creating files and causes checks like
@@ -101,9 +129,32 @@ services:
     security_opt:
       - "no-new-privileges:true"
     read_only: true
+    healthcheck:
+      # There is no curl and no wget in this image. The deploy stage is debian:bookworm-slim
+      # plus the venv and nothing apt-installs into it, and uv/uvx are copied into the BUILD
+      # stage only -- so a curl-based probe would fail permanently on a healthy service.
+      # /code/.venv/bin/python is the interpreter uvicorn itself runs under, so this adds
+      # nothing to the image. urlopen raises on a refused connection and on any non-2xx
+      # status, so a service that boots and then answers 500 reads as unhealthy. The probe
+      # writes nothing, which is what read_only: true above requires.
+      #
+      # 127.0.0.1 and APP_INTERNAL_PORT: the port inside the container, not the host side of
+      # the ports: mapping above. start_period is 60s because lifespan blocks on
+      # database.initialize() and wait_for_kafka() before uvicorn serves a single request.
+      test: ["CMD", "/code/.venv/bin/python", "-c", "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ['APP_INTERNAL_PORT'] + '/ping', timeout=5).read()"]
+      interval: 10s
+      timeout: 10s
+      retries: 6
+      start_period: 60s
     depends_on:
-      - postgres
-      - kafka
+      # Long form, not the list. The short form waits for "started", which for Postgres means
+      # the container exists, not that it accepts connections -- data_store survived that
+      # only because nothing in its boot path talked to the database immediately, and that
+      # stopped being true the moment lifespan called database.initialize().
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
 
   data_ingest:
     build:
@@ -124,5 +175,14 @@ services:
     security_opt:
       - "no-new-privileges:true"
     read_only: true
+    healthcheck:
+      # Same probe and the same reasoning as data_store: no curl in the image, the venv
+      # interpreter is already there, and the check writes nothing under read_only: true.
+      test: ["CMD", "/code/.venv/bin/python", "-c", "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ['APP_INTERNAL_PORT'] + '/ping', timeout=5).read()"]
+      interval: 10s
+      timeout: 10s
+      retries: 6
+      start_period: 60s
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
