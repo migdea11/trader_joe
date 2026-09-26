@@ -83,9 +83,28 @@ def test_a_composed_str_member_stringifies_to_its_value_in_both_forms():
     tj-09rtle demonstrates that on the live defect in common/kafka/topics.py. A value that
     stringifies as 'Feed.IEX' reaches a vendor query string or a log line intact and is only
     noticed downstream, well away from the change that caused it.
+
+    THE REAL-ENUM HALF IS WEAKER THAN IT LOOKS, AND THAT IS WHY THE THROWAWAY IS HERE
+    (tj-1njw7c). Every Feed member's name equals its value today -- IEX, SIP, NOT_APPLICABLE --
+    so `str(Feed.IEX) == 'IEX'` cannot tell the VALUE from the NAME. It catches __str__ being
+    dropped, which is the observed bug, but a __str__ returning `self.name` passes it. The
+    throwaway below is composed from a member whose name and value differ, which is the only
+    shape that distinguishes them. Feed is still asserted on too: the throwaway proves the
+    machinery and Feed proves the class that actually crosses the wire.
     """
     assert str(Feed.IEX) == 'IEX'
     assert f'{Feed.IEX}' == 'IEX'
+
+    class _NameDiffersFromValue(SubsetStrEnum):
+        CONSOLIDATED = 'SIP'
+
+    class _Superset(StrSupersetEnum):
+        pass
+
+    _Superset.compose(_NameDiffersFromValue)
+
+    assert str(_Superset.CONSOLIDATED) == 'SIP'
+    assert f'{_Superset.CONSOLIDATED}' == 'SIP'
 
 
 def test_narrowing_upward_to_the_superset_is_total():

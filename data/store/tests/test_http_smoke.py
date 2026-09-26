@@ -109,29 +109,31 @@ SYMBOL_PATH = {**ASSET_PATH, 'asset_symbol': 'AAPL'}
 
 # A complete StockDataMarketActivityCreate. Written out rather than minimised: the point of the
 # well-formed half is that nothing about the PAYLOAD can be blamed when a route misbehaves.
+#
+# SHAPE AS OF eec8f88a7443, and both halves of that change are visible here (tj-1njw7c). feed is a
+# TOP-LEVEL key, a sibling of source, because it is declared on AssetDataCreate rather than on the
+# per-bar data model -- putting it inside `data` gets an extra_forbidden on the way in and a
+# missing-field error at the same time, which reads like two problems and is one. And expiry,
+# split_factor and dividends_factor are GONE rather than set to None: StockDataMarketActivityData
+# is an InboundContract, so an unknown key is a 422 and not a silently ignored extra.
 DATA_POINT = {
     'dataset_id': '8f41c2d7-a3b9-4d1e-9c2f-0a1b2c3d4e5f',
     'asset_symbol': 'AAPL',
     'source': 'ALPACA',
+    'feed': 'IEX',
     'granularity': '1day',
     'timestamp': '2026-01-02T00:00:00Z',
-    'expiry': None,
-    'data': {
-        'open': 1.0,
-        'high': 2.0,
-        'low': 0.5,
-        'close': 1.5,
-        'volume': 100,
-        'trade_count': 10,
-        'split_factor': 1.0,
-        'dividends_factor': 1.0,
-    },
+    'data': {'open': 1.0, 'high': 2.0, 'low': 0.5, 'close': 1.5, 'volume': 100, 'trade_count': 10},
 }
 
 # start is present although StoreAssetDatasetBody makes it optional: the handler forwards the body
 # into GetDatasetRequest, where start is REQUIRED, so a body without it is not in fact well-formed.
 # That asymmetry between the two schemas is a real trap and the reason this constant is commented.
-DATASET_REQUEST = {'source': 'ALPACA', 'granularity': '1day', 'start': '2026-01-01T00:00:00Z'}
+#
+# owner is required with no default (schemas/data_store/asset_dataset_store.py) and has been since
+# 7e0b2ee, which predates the migration that stalled the rest of this file -- so this line and the
+# ones above went stale for unrelated reasons and only looked like one failure (tj-1njw7c).
+DATASET_REQUEST = {'owner': 'test-owner', 'source': 'ALPACA', 'granularity': '1day', 'start': '2026-01-01T00:00:00Z'}
 
 # One entry per `http` line in data_store.manifest. The key is the manifest's address verbatim, so
 # an address that changes shape turns this file red rather than silently matching nothing.
@@ -256,8 +258,13 @@ class FakeRpcClient:
     async def send_request(self, request: Any) -> BatchStockDataMarketActivityCreate:
         # An empty `dataset` means the handler stores nothing and reports 0 data points. A
         # populated one would be tj-19qp1q's job, and would need a database to store into.
+        #
+        # feed is the ingest adapter's resolved tape, and this fake stands in for the adapter, so
+        # it supplies one (tj-1njw7c). It went stale at eec8f88a7443 like the two payload
+        # constants above, but failed LATER than they did -- only once the body validated -- so
+        # the POST /store case reported the missing owner and hid this behind it.
         return BatchStockDataMarketActivityCreate(
-            asset_symbol='AAPL', source='ALPACA', granularity='1day', dataset_id=uuid.uuid4(), dataset={}
+            asset_symbol='AAPL', source='ALPACA', feed='IEX', granularity='1day', dataset_id=uuid.uuid4(), dataset={}
         )
 
 

@@ -49,15 +49,6 @@ class StockMarketActivity(BaseMarketActivity):
         Index(SYMBOL_GRANULARITY_TIMESTAMP_INDEX, 'asset_symbol', 'granularity', 'timestamp'),
     )
 
-    # feed IS NOT SET HERE, AND THIS IS A KNOWN GAP, NOT AN OVERSIGHT. The bar column is NOT
-    # NULL (see base_market_activity.py), but neither StockDataMarketActivityCreate nor
-    # BatchStockDataMarketActivityCreate carries a feed field -- _AssetIdentifier in
-    # schemas/data_store/asset_data_interface.py (builder-shared scope) declares only
-    # asset_symbol, source and granularity. Guessing a value here (defaulting to the caller's
-    # source, or to a market's NOT_APPLICABLE) would be exactly the silent default the "no
-    # sentinel for we do not know" ruling exists to prevent. Until that schema carries feed, an
-    # insert built from these dicts fails on the NOT NULL constraint rather than writing a wrong
-    # tape -- reported as a finding for T4 (tj-vhboky.5), not patched around here.
     @classmethod
     def from_batch_create(cls, batch_create: BatchStockDataMarketActivityCreate) -> list[dict[str, Any]]:
         return [
@@ -66,6 +57,9 @@ class StockMarketActivity(BaseMarketActivity):
                 'dataset_id': batch_create.dataset_id,
                 'source': batch_create.source,
                 'asset_symbol': batch_create.asset_symbol,
+                # One feed for the whole batch (BatchStockDataMarketActivityCreate.feed), not
+                # per-bar: a batch is the product of one fetch, and a fetch is served by one tape.
+                'feed': batch_create.feed,
                 'granularity': batch_create.granularity,
                 'timestamp': create.timestamp,
                 # Stock Market Activity fields
@@ -86,6 +80,7 @@ class StockMarketActivity(BaseMarketActivity):
             'dataset_id': create.dataset_id,
             'source': create.source,
             'asset_symbol': create.asset_symbol,
+            'feed': create.feed,
             'granularity': create.granularity,
             'timestamp': create.timestamp,
             # Stock Market Activity fields
@@ -103,6 +98,10 @@ class StockMarketActivity(BaseMarketActivity):
             dataset_id=self.dataset_id,
             source=self.source,
             asset_symbol=self.asset_symbol,
+            # Which tape served this row (schemas/data_store/asset_data_interface.py ::
+            # AssetData.feed, required, tj-5dvgaa). The column is NOT NULL, so self.feed always
+            # has a value by the time a row exists to be read back.
+            feed=self.feed,
             granularity=self.granularity,
             created_at=self.created_at,
             updated_at=self.updated_at,

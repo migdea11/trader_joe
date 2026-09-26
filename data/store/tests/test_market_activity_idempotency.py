@@ -32,7 +32,20 @@ from data.store.app.database.models.stock_market_activity import StockMarketActi
 
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / 'migrations'
+
+# TWO REVISIONS, TWO NAMES, and the distinction is the whole reason this file went red at
+# eec8f88a7443 (tj-1njw7c). NATURAL_KEY_REVISION is the revision most of this file INSPECTS --
+# the archive/row-move machinery below exists only there. HEAD_REVISION is the current head, and
+# the only revision whose constants may be compared against the model. Swapping the one constant
+# would have re-pointed all seven of the archive tests at a revision that has no archive.
 NATURAL_KEY_REVISION = '8f41c2d7a3b9'
+HEAD_REVISION = 'eec8f88a7443'
+
+# The natural key as 8f41c2d7a3b9 itself declares it, written out as a HISTORIC LITERAL rather
+# than read off BaseMarketActivity. A past revision's job is to describe the schema as it was;
+# comparing it against today's model asserts that history does not change, which is the opposite
+# of what is wanted. The model is compared against HEAD_REVISION instead, below.
+HISTORIC_BAR_NATURAL_KEY = ('asset_symbol', 'source', 'granularity', 'timestamp')
 
 # Columns the upsert is allowed to leave alone: the surrogate key, the natural key itself,
 # and the two timestamps the write path manages directly.
@@ -41,22 +54,27 @@ NOT_REFRESHED = {'id', 'created_at', 'updated_at', *BaseMarketActivity.NATURAL_K
 
 @pytest.fixture
 def bar_values() -> list[dict[str, Any]]:
+    """One row's worth of insert values, in the post-eec8f88a7443 column shape.
+
+    Only the column NAMES matter here -- the values are bound parameters and never reach a
+    server -- so the natural-key columns are left None. feed is present and split_factor,
+    dividends_factor and expiry are absent because SQLAlchemy raises CompileError on a key the
+    table does not have, which is what this fixture did until tj-1njw7c.
+    """
     return [
         {
             'dataset_id': None,
             'source': None,
             'asset_symbol': 'AAPL',
+            'feed': None,
             'granularity': None,
             'timestamp': None,
-            'expiry': None,
             'open': 1.0,
             'high': 2.0,
             'low': 0.5,
             'close': 1.5,
             'volume': 100,
             'trade_count': 10,
-            'split_factor': 1.0,
-            'dividends_factor': 1.0,
         }
     ]
 
@@ -66,25 +84,37 @@ def compiled_upsert(bar_values: list[dict[str, Any]]) -> str:
     return str(build_market_activity_upsert(bar_values).compile(dialect=postgresql.dialect()))
 
 
-@pytest.fixture
-def natural_key_migration():
-    path = MIGRATIONS_DIR / 'versions' / f'{NATURAL_KEY_REVISION}_bar_natural_key_and_upsert.py'
-    spec = importlib.util.spec_from_file_location(NATURAL_KEY_REVISION, path)
+def _load_revision(revision: str, filename: str) -> Any:
+    path = MIGRATIONS_DIR / 'versions' / filename
+    spec = importlib.util.spec_from_file_location(revision, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-def _run_migration(migration: Any, direction: str, row_counts: list[int]) -> MagicMock:
+@pytest.fixture
+def natural_key_migration():
+    return _load_revision(NATURAL_KEY_REVISION, f'{NATURAL_KEY_REVISION}_bar_natural_key_and_upsert.py')
+
+
+@pytest.fixture
+def head_migration():
+    return _load_revision(HEAD_REVISION, f'{HEAD_REVISION}_per_dataset_identity_and_feed.py')
+
+
+def _run_migration(migration: Any, direction: str, scalar_results: list[Any]) -> MagicMock:
     """Run a migration function against a recording stand-in for the alembic.op proxy.
 
-    row_counts feeds the SELECT count(*) probes the migration makes through op.get_bind(), in
-    the order it makes them: upgrade() asks for rows-before, rows-archived, rows-after;
-    downgrade() asks for the rows in the archive before the restore, then the rows still left
-    in it afterwards - which are exactly the ones that could not go back.
+    scalar_results feeds, in order, every probe the migration makes through
+    op.get_bind().execute(...).scalar_one(). What those probes ARE differs per revision:
+      * 8f41c2d7a3b9 counts rows -- upgrade() asks for rows-before, rows-archived, rows-after;
+        downgrade() asks for the rows in the archive before the restore, then the rows still
+        left in it afterwards, which are exactly the ones that could not go back.
+      * eec8f88a7443 looks up ONE thing, the Postgres-generated name of the unnamed unique
+        constraint it replaces on store_dataset_entry, so it takes a single string.
     """
     bind = MagicMock(name='bind')
-    bind.execute.return_value.scalar_one.side_effect = list(row_counts)
+    bind.execute.return_value.scalar_one.side_effect = list(scalar_results)
     recorder = MagicMock(name='op')
     recorder.get_bind.return_value = bind
     with patch.object(migration, 'op', recorder):
@@ -145,11 +175,32 @@ def downgraded(natural_key_migration) -> MagicMock:
     return _run_migration(natural_key_migration, 'downgrade', [2, 0])
 
 
-def test_natural_key_is_unique_and_excludes_dataset_id():
+@pytest.fixture
+def upgraded_head(head_migration) -> MagicMock:
+    """eec8f88a7443's upgrade(), whose single scalar probe is a constraint-name lookup.
+
+    The name handed back is deliberately NOT the one the revision would guess: the lookup exists
+    because Postgres generated and truncated that name at CREATE TABLE time, so a stand-in that
+    returned the obvious name would let a revision that ignored the lookup still pass.
+    """
+    return _run_migration(head_migration, 'upgrade', ['store_dataset_entry_asset_symbol_granularity_start_end_so_key'])
+
+
+def test_natural_key_is_unique_and_leads_with_dataset_id():
     """The decision this whole task turns on, pinned so a later change is a deliberate one.
 
-    Two fetches of the same minute through different dataset entries are the same bar, so
-    dataset_id is not part of the key - including it would defeat the point.
+    INVERTED AT eec8f88a7443, name and all (tj-vhboky.1; the repair is tj-1njw7c). This test
+    used to assert dataset_id was EXCLUDED, on the reasoning that two fetches of the same minute
+    through different dataset entries are the same bar. Coverage is per-dataset now, so they are
+    deliberately two rows, and the old assertion is not a stale detail of this test -- it is the
+    previous design stated in a name. Renamed rather than edited in place for that reason: a test
+    still called ..._excludes_dataset_id while asserting the opposite is worse than either.
+
+    LEADS, not merely contains. Column ORDER inside a unique constraint decides what the backing
+    index can serve: dataset_id first gives a dataset-scoped range read its equality prefix and an
+    ordered timestamp, which is why base_market_activity.py drops the standalone dataset_id index.
+    A key holding the same six columns in another order satisfies `sorted(...)` below and quietly
+    costs that read.
     """
     unique = [
         c for c in StockMarketActivity.__table__.constraints if c.name == StockMarketActivity.NATURAL_KEY_CONSTRAINT
@@ -157,7 +208,8 @@ def test_natural_key_is_unique_and_excludes_dataset_id():
     assert len(unique) == 1, 'the natural-key unique constraint is missing from the model'
     columns = tuple(column.name for column in unique[0].columns)
     assert sorted(columns) == sorted(BaseMarketActivity.NATURAL_KEY)
-    assert 'dataset_id' not in columns
+    assert columns[0] == 'dataset_id', f'dataset_id no longer leads the natural key: {columns}'
+    assert 'feed' in columns, 'feed has left the natural key'
 
 
 def test_upsert_targets_the_named_constraint(compiled_upsert: str):
@@ -188,20 +240,81 @@ def test_upsert_stamps_updated_at_but_not_created_at(compiled_upsert: str):
     assert 'created_at' not in conflict_clause
 
 
-def test_migration_declares_the_names_the_model_declares(natural_key_migration):
+def test_the_superseded_revision_still_declares_the_key_it_shipped(natural_key_migration):
+    """8f41c2d7a3b9's constants against a HISTORIC LITERAL, not against the model.
+
+    The name and the table survived eec8f88a7443 unchanged -- deliberately, so the write path's
+    ON CONFLICT ON CONSTRAINT does not change shape across the upgrade -- so those two are still
+    worth comparing against the model. The COLUMN LIST did not survive it, and re-pointing this
+    assertion at today's NATURAL_KEY would demand that a shipped revision rewrite its own
+    history. That is what this test was doing when it went red (tj-1njw7c).
+    """
     assert natural_key_migration.CONSTRAINT_NAME == StockMarketActivity.NATURAL_KEY_CONSTRAINT
-    assert tuple(natural_key_migration.NATURAL_KEY) == BaseMarketActivity.NATURAL_KEY
     assert natural_key_migration.TABLE == StockMarketActivity.TABLE_NAME
+    assert tuple(natural_key_migration.NATURAL_KEY) == HISTORIC_BAR_NATURAL_KEY
+
+
+def test_head_migration_declares_the_names_the_model_declares(head_migration):
+    """The model-vs-migration agreement check, re-pointed at the revision that is actually live.
+
+    This is the assertion that stops the three artifacts drifting, and it only means anything
+    against the HEAD revision: the model describes the schema a migrated database has, and that
+    is the last revision's output, not an earlier one's.
+    """
+    assert head_migration.BAR_CONSTRAINT_NAME == StockMarketActivity.NATURAL_KEY_CONSTRAINT
+    assert head_migration.BAR_TABLE == StockMarketActivity.TABLE_NAME
+    assert tuple(head_migration.NEW_BAR_NATURAL_KEY) == BaseMarketActivity.NATURAL_KEY
+    # And the revision's own record of what it replaced agrees with this file's historic literal,
+    # so the two do not drift into disagreeing about what the old key was.
+    assert tuple(head_migration.OLD_BAR_NATURAL_KEY) == HISTORIC_BAR_NATURAL_KEY
+
+
+def test_head_migration_feed_type_suppresses_implicit_create_by_the_flag(head_migration):
+    """create_type=False is honoured BY THE FLAG, not by add_column's incidental output.
+
+    The revision creates and drops the feed enum type explicitly, once, and passes
+    create_type=False so that add_column does not also try. create_type is a postgresql.ENUM
+    keyword: generic sa.Enum accepts it and silently discards it into **kw, so under sa.Enum the
+    suppression held only by accident of what add_column happens to compile to today (tj-uxl817
+    item 2). This assertion is what makes it a guarantee -- a tidy-up back to the generic type
+    costs a red test instead of quietly restoring the accident.
+
+    WHY THE ATTRIBUTE AND NOT SOMETHING MORE OBVIOUS. The two alternatives are both vacuous.
+    isinstance(FEED_TYPE, sa.Enum) can never fail, because postgresql.ENUM is a subclass of it.
+    And a compiled-SQL assertion cannot tell the two apart either: both render the identical bare
+    'feed' column type on the pinned SQLAlchemy, which is exactly why the defect was invisible.
+    The attribute is the only observable difference -- on sa.Enum the keyword is swallowed and
+    hasattr is False, so getattr returns None and this goes red.
+    """
+    assert getattr(head_migration.FEED_TYPE, 'create_type', None) is False, (
+        'FEED_TYPE does not carry create_type=False as a real attribute, so the revision is asking '
+        'a generic sa.Enum to suppress an implicit CREATE TYPE and the keyword is being discarded'
+    )
 
 
 def test_migration_upgrade_actually_adds_the_constraint(upgraded: MagicMock):
-    """Asserted against the MODEL's names, not the revision's constants.
+    """The revision BODY, not its constants.
 
-    The constants agreeing proves only that two strings match; a revision that declared them
-    and then never called create_unique_constraint would leave the write path's ON CONFLICT
-    ON CONSTRAINT targeting a constraint that does not exist on the server.
+    A revision that declared them and never called create_unique_constraint would leave the
+    write path's ON CONFLICT ON CONSTRAINT targeting a constraint that does not exist on the
+    server.
+
+    Asserted against the historic literal for the column list and against the model for the name
+    and table, for the reason in test_the_superseded_revision_still_declares_the_key_it_shipped.
     """
     upgraded.create_unique_constraint.assert_called_once_with(
+        StockMarketActivity.NATURAL_KEY_CONSTRAINT, StockMarketActivity.TABLE_NAME, list(HISTORIC_BAR_NATURAL_KEY)
+    )
+
+
+def test_head_migration_upgrade_actually_adds_the_widened_constraint(upgraded_head: MagicMock):
+    """The same body-level check on the head revision, against the MODEL's names.
+
+    The bar constraint is dropped and recreated here, so create_unique_constraint is called twice
+    in this upgrade -- once for the entry's new identity and once for the bar. Only the bar call
+    is this file's business.
+    """
+    upgraded_head.create_unique_constraint.assert_any_call(
         StockMarketActivity.NATURAL_KEY_CONSTRAINT, StockMarketActivity.TABLE_NAME, list(BaseMarketActivity.NATURAL_KEY)
     )
 
@@ -228,13 +341,18 @@ def test_migration_upgrade_moves_superseded_rows_instead_of_deleting_them(natura
     )
     assert 'row_number() OVER' in move and 'rn > 1' in move, 'the move no longer selects the superseded rows'
 
-    # EXACTLY the natural key, not merely a superset of it. Adding dataset_id here would
-    # de-duplicate per dataset entry - the one thing this task exists to prevent, since two
-    # fetches of the same minute through different entries are the same bar. It would also
-    # leave real duplicates behind, so create_unique_constraint would then fail on a live
-    # database, having already moved rows into the archive.
+    # EXACTLY the key THIS REVISION adds, not merely a superset of it. Grouping by more columns
+    # than the constraint covers leaves real duplicates behind, so create_unique_constraint then
+    # fails on a live database having already moved rows into the archive; grouping by fewer
+    # archives rows that were never duplicates.
+    #
+    # THE HISTORIC LITERAL, NOT THE MODEL (tj-1njw7c). eec8f88a7443 later widened the key to
+    # include dataset_id and feed, and this revision's window must NOT follow it there: this
+    # upgrade runs against a database that still has the four-column constraint, and its job is
+    # to clear the duplicates that constraint will reject. It cannot be re-pointed at the head
+    # revision either -- that one has no archive and no row-move at all.
     partition, _ordering = _window_spec(move)
-    assert sorted(partition) == sorted(BaseMarketActivity.NATURAL_KEY), (
+    assert sorted(partition) == sorted(HISTORIC_BAR_NATURAL_KEY), (
         f'duplicates are not grouped by exactly the natural key: partitioned by {partition}'
     )
 
@@ -361,6 +479,77 @@ def test_migration_history_has_a_single_head():
 
     Nothing in this stack runs a migration automatically (tj-rhcllr), so a branched history
     would not surface until someone ran it by hand against a real database.
+
+    THE COUNT IS THE PROPERTY THIS TEST IS NAMED FOR, and it is asserted first and on its own.
+    This test used to assert only `heads == [NATURAL_KEY_REVISION]`, so landing eec8f88a7443 --
+    an ordinary, correct, single-head revision -- turned it red for a non-reason and said
+    'branched history' while pointing at a history that was not branched (tj-1njw7c).
     """
     heads = ScriptDirectory(str(MIGRATIONS_DIR)).get_heads()
-    assert list(heads) == [NATURAL_KEY_REVISION]
+    assert len(heads) == 1, f'the migration history has branched: {sorted(heads)}'
+
+
+def test_the_named_head_is_the_current_revision():
+    """Separate from the count above, and separate on purpose.
+
+    Worth pinning because every other constant in this file is chosen relative to which revision
+    is live -- but a new revision makes this one line go red and nothing else, which is a
+    one-line edit rather than a hunt through seven archive tests.
+    """
+    assert list(ScriptDirectory(str(MIGRATIONS_DIR)).get_heads()) == [HEAD_REVISION]
+
+
+@pytest.mark.parametrize('column', ['expiry_type', 'update_type'])
+def test_head_migration_backfills_a_policy_column_before_making_it_not_null(upgraded_head: MagicMock, column: str):
+    """A migration-safety property that IS provable without a database, so it is proved here.
+
+    expiry_type and update_type join eec8f88a7443's ten-column entry identity, and NOT NULL is
+    load-bearing there: Postgres treats NULL as distinct from NULL inside a unique index, so a
+    nullable column in that constraint makes every null-bearing row unique and silently stops
+    ON CONFLICT from ever matching a repeat.
+
+    WHY ORDER IS THE WHOLE PROPERTY. Both columns were already nullable in 2b88043cd13c, so a
+    pre-existing NULL is possible. ALTER COLUMN ... SET DEFAULT does not backfill an existing
+    row the way ADD COLUMN ... DEFAULT does, and alembic compiles
+    alter_column(nullable=False, server_default=...) as SET NOT NULL followed by SET DEFAULT --
+    the constraint lands before the value that would satisfy it exists. An explicit UPDATE
+    AFTER the alter is therefore no fix at all, and an UPDATE before it is a complete one.
+
+    AND WHY IT IS A TEST RATHER THAN A COMMENT. The builder made this true today instead of
+    rewording the docstring that claimed it (tj-uxl817). Nothing else notices if the two
+    statements swap: both still run, the migration still succeeds on the empty database this
+    project's deploy note promises, and it fails only on an operator's populated one.
+    """
+    calls = list(upgraded_head.method_calls)
+
+    backfills = [
+        (index, ' '.join(str(args[0]).split()))
+        for index, (name, args, _) in enumerate(calls)
+        if name == 'execute' and args and f'SET {column} =' in ' '.join(str(args[0]).split())
+    ]
+    assert len(backfills) == 1, f'{column} is not backfilled exactly once before it is made NOT NULL: {backfills}'
+    backfill_index, backfill = backfills[0]
+    assert f'WHERE {column} IS NULL' in backfill, (
+        f'the {column} backfill is not restricted to the rows that need it: {backfill}'
+    )
+
+    alters = [
+        (index, kwargs)
+        for index, (name, args, kwargs) in enumerate(calls)
+        if name == 'alter_column' and args[1:2] == (column,) and kwargs.get('nullable') is False
+    ]
+    assert len(alters) == 1, f'{column} is not made NOT NULL exactly once: {alters}'
+    alter_index, alter_kwargs = alters[0]
+
+    assert backfill_index < alter_index, (
+        f'{column} is made NOT NULL at call {alter_index} before it is backfilled at call '
+        f'{backfill_index}, so an existing NULL row fails the alter'
+    )
+
+    # The backfill must write the SAME value the column is about to default to. A backfill to
+    # some other value satisfies NOT NULL just as well and leaves the pre-existing rows saying
+    # something different from every row written afterwards.
+    written = backfill.split(f'SET {column} =')[1].split('WHERE')[0].strip()
+    assert written == str(alter_kwargs.get('server_default')).strip("'"), (
+        f'{column} is backfilled to {written} but defaults to {alter_kwargs.get("server_default")}'
+    )

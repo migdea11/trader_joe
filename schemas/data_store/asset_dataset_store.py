@@ -4,7 +4,7 @@ from uuid import UUID
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from common.enums.data_select import AssetType, DataType
-from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
+from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateType
 from common.logging import get_logger
 from routers.data_store.app_endpoints import ASSET_DATASET_ID_DESC, ASSET_TYPE_DESC, DATA_TYPE_DESC, SYMBOL_DESC
 from schemas.inbound_contract import InboundContract
@@ -17,17 +17,31 @@ class StoreAssetDatasetBody(InboundContract):
     """The fields a caller supplies to ask for a dataset.
 
     EVERY FIELD HERE IS IDENTITY (tj-vhboky.1 section 2). Two requests name the same dataset only
-    if they agree on all of owner, asset_symbol, asset_type, data_type, source, feed, granularity,
+    if they agree on all of owner, asset_symbol, asset_type, data_type, source, granularity,
     expiry_type, update_type, start and end -- the range included. They back a UNIQUE constraint,
     which is why the policy fields below are NOT optional: Postgres treats NULL as distinct from
     NULL in a unique index, so a request that explicitly sent null would write a NULL into a key
     column, the ON CONFLICT would never fire against it, and "an exact repeat returns the existing
     id" would silently become "an exact repeat creates a second row".
 
-    FEED IS THE ONE EXCEPTION AND IT IS NOT A LOOSENING. It is identity like the rest and its
-    column is NOT NULL like the rest; what is optional is only the CALLER's obligation to choose
-    a tape. The ingest adapter resolves it before anything is written, so no NULL ever reaches
-    the key -- the optionality stops at the edge rather than travelling into the table.
+    THERE IS DELIBERATELY NO feed FIELD HERE, though an earlier version of this model carried one
+    as `Feed | None = None`. tj-rh4b7f (2026-09-25) DEFERRED both the entry's feed column and feed
+    as an accepted create-request field to the gRPC transport work. The reason is write order, not
+    taste: data/store/app/ingest/data_action_request.py upserts the entry FROM THIS BODY and only
+    then calls ingest, so at the moment the entry row is written nothing has resolved a feed yet --
+    and feed is identity, so a placeholder written now and corrected later would MUTATE identity
+    and silently merge two datasets that asked for different tapes. Deferring costs nothing today:
+    no caller can select a feed, because there is exactly one feed per deployment and the ingest
+    adapter alone decides it.
+
+    THE FIELD ALSO HAD TO GO FOR A MORE IMMEDIATE REASON, AND IT IS THE QUIET KIND. StoreDatasetEntry
+    has no feed column, and upsert_entry builds its values through AppBase.get_fields, which
+    enumerates __table__.columns and keeps only schema attributes that match one
+    (common/database/sql_alchemy_table.py, _get_columns). A field the table does not have matches
+    neither branch and falls out with no else, no warning and no log -- so a caller that named a
+    tape got a 200 and an entry that silently did not record it. Not a crash: a wrong answer,
+    which is why leaving the field in place until the transport work would have been worse than
+    removing it. See tj-rh4b7f for the full reasoning and for where feed comes back.
     """
 
     # The caller's declared principal. NO DEFAULT, because it is identity: a default principal
@@ -38,15 +52,6 @@ class StoreAssetDatasetBody(InboundContract):
     owner: str
 
     source: DataSource
-    # OPTIONAL HERE, NOT NULL IN THE DATABASE, AND THE ADAPTER CLOSES THE GAP (tj-vhboky.1, user
-    # ruling of 2026-09-25: "the API should be optional, but the ingest should specify it in the
-    # data"). None means "I have no preference about the tape", which is a reasonable thing for a
-    # caller to say and NOT the same as "nobody knows" -- by the time a row is written the ingest
-    # adapter has resolved a concrete Feed, using the caller's selection if there is one and
-    # otherwise the constant for a vendor with a single tape. That is why there is no UNKNOWN
-    # member to default to any more: a value that should never reach a row is an error, not a
-    # member of the vocabulary.
-    feed: Feed | None = None
 
     granularity: Granularity
     # REQUIRED, and no sentinel (tj-vhboky.1, ruling closing open question 2). An open start would
@@ -105,7 +110,12 @@ class StoreAssetDatasetQuery(InboundContract):
     # value written into an identity column.
     owner: str | None = None
     source: DataSource | None = None
-    feed: Feed | None = None
+    # No feed filter, for the same reason the body has no feed field: there is no feed column on
+    # store_dataset_entry to filter (tj-rh4b7f). Here it was not merely inert, it was a live
+    # AttributeError -- search_entries loops this model's model_dump() and calls
+    # getattr(StoreDatasetEntry, column) for every value that is not None
+    # (data/store/app/database/crud/stock/store_dataset_entry.py), so any search that actually
+    # named a tape raised rather than filtered.
     granularity: Granularity | None = None
     start: datetime | None = None
     end: datetime | None = None

@@ -43,6 +43,7 @@ from schemas.data_store.asset_data_interface import (
     AssetDataUpdate,
     BatchAssetDataCreate,
     _AssetDataType,
+    _AssetIdentifier,
 )
 from schemas.data_store.asset_dataset_store import (
     AssetDatasetStore,
@@ -96,18 +97,29 @@ _BAR: dict[str, Any] = {'open': 1.0, 'high': 2.0, 'low': 0.5, 'close': 1.5, 'vol
 
 _IDENTIFIER: dict[str, Any] = {'asset_symbol': 'VFV', 'source': 'ALPACA', 'granularity': '1day'}
 
-# WHAT ONLY THE CREATE PATHS CARRY. `dataset_id` says which dataset the bar belongs to; `feed`
-# says which tape served it. Both are identity on the bar and BOTH ARE REQUIRED WITH NO DEFAULT
-# (77f3a6c, implementing tj-rh4b7f), which is why they sit here and not in _IDENTIFIER --
-# _IDENTIFIER also feeds AssetDataUpdate, AssetDataQuery and the AssetData read model, none of
-# which declares a feed, and those models are `extra='forbid'` so handing them one would RAISE
-# rather than be ignored.
+# THE BAR'S IDENTITY PAIR, CARRIED BY THE CREATE PATHS AND THE READ MODEL AND BY NOTHING ELSE.
+# `dataset_id` says which dataset the bar belongs to; `feed` says which tape served it. Both are
+# identity on the bar and BOTH ARE REQUIRED WITH NO DEFAULT (77f3a6c implementing tj-rh4b7f for the
+# create paths, 8240133 implementing tj-5dvgaa for the read model).
+#
+# THIS USED TO BE `_CREATE_IDENTITY`, AND THE RENAME IS THE tj-5dvgaa CHANGE rather than a tidy-up.
+# The comment here used to say the pair was what "only the CREATE paths carry", and listed the
+# AssetData read model among the models that declare no feed. That stopped being true: the read
+# model could not report which tape served a bar the store had already recorded one for, which is
+# the gap tj-5dvgaa closed. The pair is now create-and-read.
+#
+# IT STILL SITS HERE AND NOT IN _IDENTIFIER, and the reason narrowed rather than went away.
+# _IDENTIFIER is also the base of AssetDataUpdate and AssetDataQuery, which still declare no feed --
+# an update addresses a row by id and a query filters rather than reports -- and those models are
+# `extra='forbid'`, so handing either one a feed would RAISE rather than be ignored.
 #
 # feed has NO DEFAULT on purpose: the enum no longer has an UNKNOWN member to default to (32438a9,
 # tj-vhboky.1 ruling of 2026-09-25). An adapter that cannot resolve a tape has failed, and a
 # missing feed must fail at the call site rather than be written as a sentinel into an identity
-# column that a later correction could not rewrite.
-_CREATE_IDENTITY: dict[str, Any] = {'dataset_id': DATASET_ID, 'feed': Feed.IEX}
+# column that a later correction could not rewrite. On the READ side the same absence of a default
+# means a reader that cannot supply one fails loudly instead of reporting None for a value the
+# NOT NULL column actually holds.
+_BAR_IDENTITY: dict[str, Any] = {'dataset_id': DATASET_ID, 'feed': Feed.IEX}
 
 # THE LIFETIME BELONGS TO THE DATASET, NOT THE BAR (tj-vhboky.1 section 9). `expiry` is gone from
 # this level entirely: it was a per-FETCH attribute stored on a per-BAR row, which is how it
@@ -135,14 +147,15 @@ _DATASET_PATH: dict[str, Any] = {'asset_type': 'stock', 'data_type': 'market-act
 # every required field and nothing else.
 CONSTRUCT_CASES: list[tuple[type[BaseModel], dict[str, Any]]] = [
     (AssetDataPath, {'asset_type': 'stock', 'data_type': 'market-activity'}),
-    (AssetDataCreate, _IDENTIFIER | _DATA_FIELDS | _CREATE_IDENTITY | {'data': _OPAQUE_DATA}),
-    (BatchAssetDataCreate, _IDENTIFIER | _CREATE_IDENTITY | {'dataset': {}}),
+    (AssetDataCreate, _IDENTIFIER | _DATA_FIELDS | _BAR_IDENTITY | {'data': _OPAQUE_DATA}),
+    (BatchAssetDataCreate, _IDENTIFIER | _BAR_IDENTITY | {'dataset': {}}),
     (AssetDataUpdate, _IDENTIFIER | _DATA_FIELDS | {'data': _OPAQUE_DATA, 'dataset_id': DATASET_ID, 'id': 1}),
     (
         AssetData,
         _IDENTIFIER
         | _DATA_FIELDS
-        | {'data': _OPAQUE_DATA, 'dataset_id': DATASET_ID, 'id': 1, 'created_at': WHEN, 'updated_at': WHEN},
+        | _BAR_IDENTITY
+        | {'data': _OPAQUE_DATA, 'id': 1, 'created_at': WHEN, 'updated_at': WHEN},
     ),
     (StoreAssetDatasetBody, _DATASET_BODY),
     (StoreAssetDatasetPath, _DATASET_PATH),
@@ -155,14 +168,12 @@ CONSTRUCT_CASES: list[tuple[type[BaseModel], dict[str, Any]]] = [
         _DATASET_BODY | _DATASET_PATH | {'id': DATASET_ID, 'item_count': 0, 'created_at': WHEN, 'updated_at': WHEN},
     ),
     (StockDataMarketActivityData, _BAR),
-    (StockDataMarketActivityCreate, _IDENTIFIER | _DATA_FIELDS | _CREATE_IDENTITY | {'data': _BAR}),
-    (BatchStockDataMarketActivityCreate, _IDENTIFIER | _CREATE_IDENTITY | {'dataset': {}}),
+    (StockDataMarketActivityCreate, _IDENTIFIER | _DATA_FIELDS | _BAR_IDENTITY | {'data': _BAR}),
+    (BatchStockDataMarketActivityCreate, _IDENTIFIER | _BAR_IDENTITY | {'dataset': {}}),
     (StockDataMarketActivityUpdate, _IDENTIFIER | _DATA_FIELDS | {'data': _BAR, 'dataset_id': DATASET_ID, 'id': 1}),
     (
         StockDataMarketActivity,
-        _IDENTIFIER
-        | _DATA_FIELDS
-        | {'data': _BAR, 'dataset_id': DATASET_ID, 'id': 1, 'created_at': WHEN, 'updated_at': WHEN},
+        _IDENTIFIER | _DATA_FIELDS | _BAR_IDENTITY | {'data': _BAR, 'id': 1, 'created_at': WHEN, 'updated_at': WHEN},
     ),
 ]
 
@@ -580,30 +591,73 @@ def test_the_entry_carries_no_feed_and_the_bar_requires_one():
     only the presence would pass on a tree that declared it in both places. Both are asserted
     here, in one test, for that reason.
 
-    REQUIRED WITH NO DEFAULT on the create path is the other half of the removed ``UNKNOWN``: with
-    no sentinel to fall back to, a missing feed has to fail at the call site.
+    REQUIRED WITH NO DEFAULT is the other half of the removed ``UNKNOWN``: with no sentinel to fall
+    back to, a missing feed has to fail loudly at the boundary.
+
+    THE READ MODEL MOVED FROM THE ABSENCE LIST TO THE PRESENCE LIST, and the move is tj-5dvgaa
+    (8240133) rather than a repair of this test. This test previously asserted that ``AssetData``
+    declared NO feed, citing its own docstring's "known gap"; the whole point of that bead is that
+    the gap was a gap. The stored bar has a NOT NULL feed column, so a read model without the field
+    could not report which tape served a row the database had already recorded one for -- an answer
+    withheld, not an answer that did not exist. The bead's own reasoning is why the field had to be
+    REQUIRED rather than optional on arrival: optional would report ``None`` for a column that is
+    NOT NULL, a wrong answer rather than a missing one, and the removed ``UNKNOWN`` under a new
+    name.
+
+    WHAT IS STILL ABSENT, AND WHY THAT IS NOT AN OVERSIGHT: ``AssetDataUpdate`` and
+    ``AssetDataQuery``. An update addresses an existing row by id, so obliging a caller to restate
+    identity it is not changing would invite a mismatch between the feed sent and the feed stored.
+    A query FILTERS rather than reports, and every query field is optional by the tj-vhboky.1
+    section 8 ruling, so a required feed there would make an unfiltered read impossible. The field
+    therefore sits on the concrete create and read models and NOT on the shared ``_AssetIdentifier``
+    mixin, which is the structural fact this test's three lists together pin.
     """
     for model in (StoreAssetDatasetBody, StoreAssetDatasetQuery, AssetDatasetStoreCreate, AssetDatasetStore):
         assert 'feed' not in model.model_fields, f'{model.__name__} declares a feed again'
 
+    # The create paths, which supply the tape, and the READ models, which report it. Same three
+    # assertions for both, because "required, no default, typed as the shared enum" is one contract
+    # whichever direction the value is travelling.
     for model in (
         AssetDataCreate,
         BatchAssetDataCreate,
         StockDataMarketActivityCreate,
         BatchStockDataMarketActivityCreate,
+        AssetData,
+        StockDataMarketActivity,
     ):
         field = model.model_fields['feed']
         assert field.is_required(), f'{model.__name__}.feed acquired a default'
+        assert field.default_factory is None, f'{model.__name__}.feed acquired a default factory'
         assert field.annotation is Feed
 
-    # The identifier mixin the READ and UPDATE models share still carries none, which is what keeps
-    # a required feed off every read: see AssetData's own docstring for that known gap.
-    for model in (AssetDataUpdate, AssetDataQuery, AssetData):
+    # NOT on the shared mixin, which is what keeps a required feed off the update and query paths.
+    assert 'feed' not in _AssetIdentifier.model_fields
+    for model in (AssetDataUpdate, AssetDataQuery, StockDataMarketActivityUpdate, StockDataMarketActivityQuery):
         assert 'feed' not in model.model_fields, f'{model.__name__} declares a feed again'
 
+    # The behavioural half, on a create path and on a read model: omitting feed is reported against
+    # `feed` and nothing else. A field-set assertion alone would pass on a model that declared the
+    # field and then never enforced it.
     with pytest.raises(ValidationError) as excinfo:
         StockDataMarketActivityCreate(**_IDENTIFIER | _DATA_FIELDS | {'data': _BAR, 'dataset_id': DATASET_ID})
     assert [error['loc'] for error in excinfo.value.errors()] == [('feed',)]
+
+    with pytest.raises(ValidationError) as excinfo:
+        StockDataMarketActivity(
+            **_IDENTIFIER
+            | _DATA_FIELDS
+            | {'data': _BAR, 'dataset_id': DATASET_ID, 'id': 1, 'created_at': WHEN, 'updated_at': WHEN}
+        )
+    assert [error['loc'] for error in excinfo.value.errors()] == [('feed',)]
+
+    # And the value survives the round trip rather than merely being accepted: a read model that
+    # declared the field but dropped it on validation would satisfy every assertion above.
+    built = StockDataMarketActivity(
+        **_IDENTIFIER | _DATA_FIELDS | _BAR_IDENTITY | {'data': _BAR, 'id': 1, 'created_at': WHEN, 'updated_at': WHEN}
+    )
+    assert built.feed is Feed.IEX
+    assert built.model_dump()['feed'] is Feed.IEX
 
 
 def test_expiry_default_is_computed_per_instance(monkeypatch: pytest.MonkeyPatch):
@@ -745,10 +799,15 @@ def test_no_level_of_the_data_interface_carries_a_per_item_expiry():
     for model in (_AssetDataType, AssetDataCreate, AssetDataUpdate, AssetData, StockDataMarketActivity):
         assert 'expiry' not in model.model_fields, f'{model.__name__} carries a per-item expiry again'
 
+    # `_BAR_IDENTITY` rather than a bare `dataset_id`: the read model requires a feed as of
+    # tj-5dvgaa, so this construction has to supply one. What the test asserts is unchanged -- a
+    # payload that omits expiry constructs either way, and the field set is still the thing under
+    # test.
     built = AssetData(
         **_IDENTIFIER
         | _DATA_FIELDS
-        | {'data': _OPAQUE_DATA, 'dataset_id': DATASET_ID, 'id': 1}
+        | _BAR_IDENTITY
+        | {'data': _OPAQUE_DATA, 'id': 1}
         | {'created_at': WHEN, 'updated_at': WHEN}
     )
     assert 'expiry' not in built.model_dump()
@@ -769,9 +828,14 @@ def test_asset_data_requires_its_dataset_id():
     dataset it was not fetched for.
     """
     assert AssetData.model_fields['dataset_id'].is_required()
+    # The payload carries `feed` -- required on the read model as of tj-5dvgaa -- so that the sole
+    # reported error is the one this test is about. Widening the assertion to accept a second
+    # missing field instead would have stopped pinning "dataset_id, and dataset_id alone".
     with pytest.raises(ValidationError) as excinfo:
         AssetData(
-            **_IDENTIFIER | _DATA_FIELDS | {'data': _OPAQUE_DATA, 'id': 1, 'created_at': WHEN, 'updated_at': WHEN}
+            **_IDENTIFIER
+            | _DATA_FIELDS
+            | {'data': _OPAQUE_DATA, 'feed': Feed.IEX, 'id': 1, 'created_at': WHEN, 'updated_at': WHEN}
         )
     assert [error['loc'] for error in excinfo.value.errors()] == [('dataset_id',)]
 
@@ -785,11 +849,29 @@ def test_a_flat_row_cannot_validate_into_the_bar_read_schema():
     returned a row, and it has no caller: the GET route calls the unfiltered variant, which uses
     ``to_schema()``.
 
+    THAT PARTICULAR CALL SITE IS NOW FIXED -- ``read_market_activity_data`` returns
+    ``[obj.to_schema() for obj in ...]`` as of e907bc6 -- and this test is deliberately NOT retired
+    with it. The LIVE instance of the same defect shape is ``get_entry_by_id``
+    (``data/store/app/database/crud/stock/store_dataset_entry.py``), filed as tj-b2uqfl, which
+    passes a ``Row`` to ``model_validate``. This test pins the schema-side property that makes every
+    such call fail, so it keeps standing guard over the shape rather than over one function.
+
     TWO things stop it, and only one of them is the obvious one. Missing ``from_attributes`` is
     the first. The second survives fixing the first: ``data`` is a NESTED submodel and a flat row
     has no ``data`` attribute at all, so enabling ``from_attributes`` moves the failure rather
     than removing it. This test constructs a flat, ORM-shaped object with every bar column on it
     and shows that ``data`` is still reported missing WITH ``from_attributes`` in force.
+
+    THE FLAT ROW GAINED A ``feed`` ATTRIBUTE, RATHER THAN THE ASSERTION GAINING A SECOND EXPECTED
+    ERROR (tj-5dvgaa). ``feed`` is a real NOT NULL column on ``BaseMarketActivity``, so a faithful
+    ORM-shaped stand-in has to carry one now that the read model declares it -- this row is meant to
+    be "every bar column on it". Relaxing the assertion to ``[('data',), ('feed',)]`` instead would
+    have been the wrong repair twice over: it would pin an omission from this fixture as though it
+    were part of the contract, and it would blunt what this test exists to say. The SINGLE expected
+    error is load-bearing -- it is what makes ``data`` the surviving blocker rather than one
+    complaint among several. If someone later adds ``from_attributes`` and a ``data`` property and
+    declares the read fixed, a two-error assertion would still be red, for a feed on a row that
+    never had one, and the real signal would be lost inside it.
 
     WHY THIS ASSERTION DOES NOT NEED INVERTING WHEN THE BUG IS FIXED, unlike the delete-contract
     test it sits beside: it pins a property of the SCHEMA -- a nested submodel is not a flat row
@@ -804,6 +886,7 @@ def test_a_flat_row_cannot_validate_into_the_bar_read_schema():
         asset_symbol='VFV',
         source='ALPACA',
         granularity='1day',
+        feed=Feed.IEX,
         timestamp=WHEN,
         created_at=WHEN,
         updated_at=WHEN,
