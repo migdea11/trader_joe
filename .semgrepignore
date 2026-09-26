@@ -1,0 +1,15 @@
+# Paths semgrep does not scan. Kept deliberately short: an entry here is a place we have
+# decided not to look, so each one needs a reason that survives someone reading it later.
+
+# Alembic revisions. These are the only files in the repo whose job is to emit SQL as text,
+# and the two rules that fire on them -- sqlalchemy-execute-raw-query and
+# avoid-sqlalchemy-text -- exist to catch caller input reaching a query. A migration takes
+# no caller input: its SQL is fixed at the moment the revision is written and runs once, from
+# a file, under an operator. The same directory is already excluded from ruff for the related
+# reason that these files are mechanically generated.
+#
+# THE RESIDUAL RISK, stated rather than hidden: a future revision that interpolates a
+# variable into its SQL would not be flagged here either. If migrations ever start taking
+# parameters from anywhere but the revision file itself, this entry should go and the
+# findings should be dispositioned one by one instead.
+data/store/migrations/versions/

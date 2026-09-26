@@ -6,7 +6,25 @@ readme = "README.md"
 requires-python = "==3.12.*"
 dependencies = []
 
+# Dependency cooldown: never resolve a release younger than 7 days, so a compromised or
+# yanked upload has a window to be caught before it can reach a build here. This closes
+# the last semgrep finding from tj-cg2i9p, rule
+# package_managers.uv.uv-missing-dependency-cooldown.
+#
+# THE UV PIN AND THIS KEY MOVE TOGETHER. The relative form needs uv >= 0.9.17. Older uv
+# does not reject it -- 0.9.3 prints 'failed to parse year in date "7 days"' during
+# settings discovery and then resolves AS IF THE KEY WERE ABSENT, exit 0. Lowering the
+# pin below 0.9.17 therefore does not disable this control, it makes it silently inert,
+# which is worse. The pin lives in Makefile UV_VERSION, Dockerfile and
+# .github/workflows/trader_joe_testing.yml env.UV_VERSION; all three must agree.
+#
+# Layout is load-bearing for the scanner, not for uv: exclude-newer sits on the line
+# directly below the table header and these notes stay above it. The rule keys off the
+# literal table header, so a header spelled out inside a comment reads to it as a second,
+# empty uv table and it reports the cooldown missing while it is in fact set. Hence the
+# header is named nowhere above. Same setting either way -- only the placement differs.
 [tool.uv]
+exclude-newer = "7 days"
 default-groups = ["base", "dev", "testing"]
 
 [dependency-groups]
@@ -46,7 +64,13 @@ data-store = [
     "alembic>=1.20.0",
     "asyncpg>=0.31.0",
     "psycopg2-binary>=2.9.13",
-    "sqlalchemy>=2.0.54",
+    # The [asyncio] extra, not the plain distribution: the async store imports
+    # sqlalchemy.ext.asyncio, which runs on greenlet. Plain sqlalchemy declares greenlet
+    # only behind a platform_machine marker, so it lands in the lock incidentally and any
+    # re-resolution is free to drop it — measured, it did: a forced re-lock refreshed 61
+    # packages, removed greenlet and took the suite to 1 failed, 1 error, 250 passed. The
+    # extra names what the code actually requires instead of relying on that marker.
+    "sqlalchemy[asyncio]>=2.0.54",
 ]
 security = [
     "bandit>=1.8.6",
@@ -56,16 +80,33 @@ security = [
 ]
 
 [tool.ruff]
+# Ruff only ever reads .py, so most of the list below is not about the files that are
+# there now -- it is about the ones a directory could acquire. A helper script dropped
+# into .github/ or .claude/ is tooling, not this project's source, and should not start
+# failing the lint gate the day someone adds it. Each entry held no Python when it was
+# added, so nothing linted today stops being linted.
 exclude = [
-    # Other agents' live worktrees (tj-aov3ip): half-edited copies of this repo, not this tree
-    ".claude/worktrees",
+    ".beads",
+    # Agent configuration, and the live worktrees beneath it (tj-aov3ip): half-edited
+    # copies of this whole repo. Without this, a root-level run lints every other
+    # agent's tree as if it were ours -- 687 files instead of 118, with findings
+    # against code that does not exist on this branch.
+    ".claude",
+    ".devcontainer",
     ".git",
+    ".github",
+    "docs",
     ".pytest_cache",
     ".ruff_cache",
     ".venv",
     ".vscode",
     "__pypackages__",
     "data/store/migrations/versions/*",
+    # Bind-mounted container state, not source. The Postgres data directory inside is
+    # root-owned and unreadable from this container, so a scan that walks it ERRORS
+    # rather than skipping -- the reason this one is not merely tidiness.
+    "volumes",
+    "volume_data",
 ]
 
 line-length = 120
@@ -81,6 +122,17 @@ ignore = [
     # PEP 695 generics: no autofix, and the 17 sites are Pydantic generic models on the
     # cross-service contract plus the Kafka RPC layer. Migrating them is its own task.
     "UP046",
+    # UP047 is the function-level half of the same PEP 695 migration (get_env_var in
+    # common/environment.py), ignored on UP046's reasoning rather than a new one. It
+    # surfaced only because the uv cooldown's re-lock carried ruff 0.14.1 -> 0.16.8.
+    "UP047",
+    # Same re-lock, and NOT cosmetic: UP042 wants `class X(str, Enum)` to become
+    # enum.StrEnum, which changes what str(X.MEMBER) returns -- 'X.MEMBER' for a str-Enum,
+    # the bare value for a StrEnum. These 7 enums are serialised across the Kafka RPC
+    # contract and Pydantic schemas, so the migration needs its own task and its own
+    # tests, not a line in a dependency bump. The sites also straddle three agents'
+    # scopes (common, schemas, routers/common, data/ingest), so no one owner can do it.
+    "UP042",
     # docstring style, not presence
     "D100",
     "D101",

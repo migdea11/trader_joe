@@ -29,6 +29,31 @@ name: Trader Joe Testing
 # credentials and are unaffected by this rule.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# RULE -- every `uses:` is pinned to a full 40-character commit SHA (tj-cg2i9p)
+#
+# A tag is a mutable pointer. `@v4` is a name the action's owner can repoint at
+# any commit at any time, so a workflow pinned to one executes whatever that
+# name means at the moment the job starts -- with this repository's contents and
+# this job's token. That is not hypothetical: it is how the tj-actions/changed-
+# files, trivy-action and kics-github-action compromises reached their
+# downstream consumers, in each case without any version appearing to move.
+#
+# The SHA is the only immutable reference GitHub offers. The trailing `# vX.Y.Z`
+# comment is not decoration: Dependabot reads it to know which release a pin
+# corresponds to, and rewrites BOTH the SHA and the comment when it opens an
+# update. Drop the comment and the pin still works but stops being updatable by
+# anything except a human reading changelogs -- see .github/dependabot.yml,
+# which exists for precisely this reason.
+#
+# WHEN ADDING A STEP: look the SHA up, do not copy one from memory or from
+# another repository. `gh api repos/<owner>/<repo>/git/ref/tags/<tag>` gives the
+# ref; if it returns `"type": "tag"` it is an annotated tag and must be
+# dereferenced through `git/tags/<sha>` to reach the commit. A pin nobody
+# verified is worse than the mutable tag it replaced, because it looks
+# deliberate.
+# ---------------------------------------------------------------------------
+
 on:
   push:
     branches: [ "main" ]
@@ -42,7 +67,9 @@ on:
 permissions: {}
 
 env:
-  UV_VERSION: "0.9.3"
+  # Floor, not a preference: below 0.9.17 uv silently ignores the `exclude-newer`
+  # install cooldown in pyproject.toml. Matches Makefile UV_VERSION and the Dockerfile.
+  UV_VERSION: "0.12.19"
   SOURCE_PATHS: "./common ./routers ./schemas ./data"
 
 jobs:
@@ -58,10 +85,10 @@ jobs:
       POSTGRES_SYNC: true
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
     - name: Install UV
-      uses: astral-sh/setup-uv@v6
+      uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
       with:
         version: "${{ env.UV_VERSION }}"
 
@@ -84,10 +111,10 @@ jobs:
     permissions:
       contents: read  # checkout only; pyupio/safety-action runs here, so no more
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
     - name: Install UV
-      uses: astral-sh/setup-uv@v6
+      uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
       with:
         version: "${{ env.UV_VERSION }}"
 
@@ -110,7 +137,10 @@ jobs:
         uv export --all-groups --no-group dev --no-group testing --no-group security --locked --format requirements-txt > requirements.txt
 
     - name: Run Safety CLI
-      uses: pyupio/safety-action@v1
+      # No semver tag exists on this commit -- pyupio publishes the moving `v1` only, so the
+      # comment names the tag rather than a release. The pin is still immutable; Dependabot
+      # just has a coarser signal to bump it from than the other five.
+      uses: pyupio/safety-action@7baf6605473beffc874c1313ddf2db085c0cacf2  # v1
       with:
         api-key: ${{ secrets.SAFETY_API_KEY }}
 
@@ -133,7 +163,7 @@ jobs:
       IMAGE_INGEST: ${{ steps.push_ingest.outputs.IMAGE }}
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
     - name: Get Branch Name
       id: branch_name
@@ -146,7 +176,7 @@ jobs:
       run: echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
 
     - name: Registry Login
-      uses: docker/login-action@v3
+      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
       with:
         registry: ghcr.io
         username: ${{ github.actor }}
@@ -207,7 +237,7 @@ jobs:
         ls -lahR artifact/
 
     - name: Push Pipeline Configs
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
       with:
         name: pipeline-configs-${{ steps.branch_name.outputs.BRANCH_NAME }}
         path: artifact/
@@ -223,14 +253,14 @@ jobs:
 
     steps:
       - name: Registry Login
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Pull Pipeline Configs
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0  # v5.0.0
         with:
           name: pipeline-configs-${{ needs.build.outputs.BRANCH_NAME }}
           path: artifact

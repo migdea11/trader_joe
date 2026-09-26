@@ -50,3 +50,40 @@ one postgres container, but expect it to want the production image built (`make 
 The revisions applied are the ones in **this checkout**, not the ones baked into the deployed
 image — `alembic.ini` and `data/store/migrations/` reach the container as bind mounts. Run it from
 a checkout that matches the image you deployed.
+
+### Checking what is applied
+
+```
+make migrate-status
+```
+
+Read-only: it runs `alembic current`, which reads the version table to report the revision the
+database is actually at, and `alembic history`, which lists the revisions this checkout would
+apply. Nothing in it writes. It goes through the same script as `make migrate`, so it needs
+postgres running and fails the same way on an empty revisions directory.
+
+Read the two answers together. Because the applied revisions come from the checkout while the
+running code comes from the deployed image, the two can disagree with nothing saying so — a
+database at a revision this checkout has never heard of means you are in the wrong checkout, and
+a history that runs past `current` means the deploy is missing `make migrate`.
+
+## Database shell
+
+There is no make target for this, deliberately: it is a thin `psql` wrapper and a debugging step,
+not part of the standard workflow, and a target would suggest otherwise.
+
+```
+docker compose -f docker-compose.yaml exec postgres \
+    sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+```
+
+The variables are expanded **inside the container**, which is why they are in single quotes: the
+credentials come from `.env` via compose, and compose does not export them into your own shell.
+`-f docker-compose.yaml` for the same reason `make migrate` pins it — a bare `docker compose` also
+loads the dev override. The one postgres container is shared by both stacks, so this reaches the
+same database either way.
+
+`make dev-tools` starts pgAdmin as a GUI alternative, but it is reachable only through the
+**development** stack: it lives in `docker-compose.tools.yaml`, which only `dev-tools` and
+`dev-down` load and no `prod-*` target ever does, and it needs `PGADMIN_EMAIL`/`PGADMIN_PASS` set.
+Running a production stack, the command above is your documented way in.

@@ -13,6 +13,7 @@ A green run here means the configuration still says the right thing, nothing mor
 import configparser
 import re
 import shlex
+import tomllib
 from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 
@@ -898,4 +899,118 @@ def test_every_scanner_root_exists_as_a_directory(source: str):
         f'{[f"{origin}: {root}" for origin, root in missing]}. bandit does not fail on a path '
         f'that does not exist -- it skips it, scans the rest and exits 0 -- so a misspelled '
         f'root silently removes that whole layer from the security scan.'
+    )
+
+
+# ---------------------------------------------------------------------------------------
+# THE UV PIN AND THE INSTALL COOLDOWN (tj-jon3d1, tj-vhboky.17)
+#
+# `exclude-newer = "7 days"` is a SILENTLY INERT control below uv 0.9.17. That uv does not
+# reject the relative form: it prints a parse warning during settings discovery and then
+# resolves AS IF THE KEY WERE ABSENT, exit 0. So the key and the version are one control
+# spread over two files, and the version is the half that can be lowered with nothing
+# anywhere going red.
+#
+# The pin lives in FOUR places -- Makefile UV_VERSION, the project Dockerfile, the CI
+# workflow and .devcontainer/Dockerfile -- and a bump that misses one leaves CI, the image
+# and local resolving under different uv versions. Every one of those files carries a
+# comment asserting the four agree; nothing until now checked it. A comment does not fail
+# a build, which is the reason given at the top of this module for all of its other rules.
+PROJECT_DOCKERFILE = REPO_ROOT / 'Dockerfile'
+DEVCONTAINER_DOCKERFILE = REPO_ROOT / '.devcontainer' / 'Dockerfile'
+PYPROJECT = REPO_ROOT / 'pyproject.toml'
+TESTING_WORKFLOW = WORKFLOW_DIR / 'trader_joe_testing.yml'
+
+# Below this, `exclude-newer = "7 days"` parses as nothing and the cooldown is off.
+UV_COOLDOWN_FLOOR = (0, 9, 17)
+
+# Each pin is read with the pattern its own file actually uses, not one loose pattern over all
+# four. A pin that moves to a different spelling then reads as MISSING here and fails loudly,
+# instead of matching some other version-shaped string on a nearby line and passing while the
+# real pin drifts.
+UV_PIN_SOURCES = {
+    'Makefile': (MAKEFILE, r'^UV_VERSION\s*:?=\s*([0-9]+\.[0-9]+\.[0-9]+)'),
+    'Dockerfile': (PROJECT_DOCKERFILE, r'^COPY --from=ghcr\.io/astral-sh/uv:([0-9]+\.[0-9]+\.[0-9]+)'),
+    '.github/workflows/trader_joe_testing.yml': (TESTING_WORKFLOW, r'^\s*UV_VERSION:\s*"?([0-9]+\.[0-9]+\.[0-9]+)"?'),
+    '.devcontainer/Dockerfile': (DEVCONTAINER_DOCKERFILE, r'astral-sh/uv/releases/download/([0-9]+\.[0-9]+\.[0-9]+)/'),
+}
+
+
+def _uv_pins() -> dict[str, str]:
+    """Every uv version pin in the repository, keyed by the file that carries it.
+
+    A pin that could not be found comes back as the empty string rather than raising, so the
+    assertion below names the file instead of an AttributeError hiding which one moved.
+    """
+    return {
+        name: (match.group(1) if (match := re.search(pattern, path.read_text(), re.MULTILINE)) else '')
+        for name, (path, pattern) in UV_PIN_SOURCES.items()
+    }
+
+
+def test_every_uv_pin_in_the_repository_agrees():
+    """One control, four files. A bump that misses one is invisible until something diverges.
+
+    The failure this prevents is not a broken build -- each file stays individually valid -- it
+    is CI resolving under a different uv than local, which is how a lock file starts being
+    rewritten by whichever machine happened to run last.
+    """
+    pins = _uv_pins()
+    assert len(set(pins.values())) == 1, (
+        f'the uv pins disagree: {pins}. An empty value means the pin was not found at all, which '
+        f'is a spelling change in that file rather than a missing pin -- fix that entry in '
+        f'UV_PIN_SOURCES in the same diff. All four move together.'
+    )
+
+
+def test_the_uv_pin_is_new_enough_for_the_cooldown_to_be_active():
+    """The half that fails OPEN, which is what earns it a test the other pins would not.
+
+    Lowering the pin below 0.9.17 does not disable the cooldown, it makes it silently inert: uv
+    warns during settings discovery, resolves as if `exclude-newer` were absent, and exits 0.
+    Nothing downstream goes red. Resolving a package uploaded minutes ago is exactly what the
+    key exists to prevent, and there would be no signal that it had stopped preventing it.
+    """
+    pinned = _uv_pins()['Makefile']
+    assert pinned, f'no UV_VERSION found in {MAKEFILE.name}'
+    floor = '.'.join(str(part) for part in UV_COOLDOWN_FLOOR)
+    assert tuple(int(part) for part in pinned.split('.')) >= UV_COOLDOWN_FLOOR, (
+        f'uv is pinned at {pinned}, below the {floor} floor at which `exclude-newer` became a '
+        f'parsed setting. Below the floor the cooldown in pyproject.toml is not rejected -- it '
+        f'is ignored, and every build resolves without it.'
+    )
+
+
+def test_the_install_cooldown_is_declared():
+    """The other half of the same control, read from the parsed TOML rather than from the text.
+
+    pyproject.toml's own comment explains that the key's PLACEMENT is load-bearing for semgrep,
+    which keys off the literal table header. Parsing means this test keeps holding if that
+    placement has to move again for the scanner's sake.
+    """
+    with PYPROJECT.open('rb') as handle:
+        config = tomllib.load(handle)
+    assert config.get('tool', {}).get('uv', {}).get('exclude-newer'), (
+        'pyproject.toml declares no [tool.uv] exclude-newer. That is the dependency cooldown '
+        'from tj-jon3d1: without it a release uploaded minutes ago -- compromised, or yanked '
+        'an hour later -- reaches a build here with no window for anyone to catch it.'
+    )
+
+
+def test_sqlalchemy_is_declared_with_the_asyncio_extra():
+    """tj-9848p1: the async store runs on greenlet, and nothing else declares it.
+
+    Plain `sqlalchemy` pulls greenlet in only behind a platform_machine marker, so it lands in
+    the lock incidentally and any re-resolution is free to drop it. Measured, not feared: a
+    forced re-lock refreshed 61 packages, removed greenlet and took the suite to 1 failed,
+    1 error, 250 passed. The extra is what names the requirement, and dropping it back to plain
+    `sqlalchemy` would pass every other check in this repo.
+    """
+    with PYPROJECT.open('rb') as handle:
+        config = tomllib.load(handle)
+    declarations = config.get('dependency-groups', {}).get('data-store', [])
+    assert any(declaration.startswith('sqlalchemy[asyncio]') for declaration in declarations), (
+        f'the data-store group declares {declarations}, with no sqlalchemy[asyncio]. The async '
+        f'layer imports sqlalchemy.ext.asyncio, which needs greenlet; without the extra nothing '
+        f'in this repo requires greenlet and a re-lock may silently drop it.'
     )

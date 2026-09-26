@@ -9,7 +9,9 @@ USER appuser
 WORKDIR /code
 
 # Install common dependencies
-COPY --from=ghcr.io/astral-sh/uv:0.9.3 /uv /uvx /bin/
+# 0.9.17 is a floor, not a preference: older uv silently ignores the `exclude-newer`
+# cooldown in pyproject.toml. Matches Makefile UV_VERSION and the CI workflow.
+COPY --from=ghcr.io/astral-sh/uv:0.12.19 /uv /uvx /bin/
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
 ENV PYTHONPATH="/code"
 ENV PATH="/code/.venv/bin:${PATH}"
