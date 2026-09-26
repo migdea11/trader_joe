@@ -7,9 +7,10 @@ from unittest.mock import Mock, patch
 from uuid import uuid4
 
 import pytest
+from alpaca.data.enums import DataFeed
 
 from common.enums.data_select import AssetType, DataType
-from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateType
+from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from data.ingest.app.brokers.alpaca import broker_api
 from data.ingest.app.brokers.broker_errors import MissingCredentialsError
 from schemas.data_ingest.get_dataset_request import StockDatasetRequest
@@ -41,7 +42,18 @@ def reimport_broker_api():
 def build_request(**overrides) -> StockDatasetRequest:
     fields = {
         'dataset_id': uuid4(),
+        # owner is carried through from the store request and is required with no default
+        # (tj-vhboky.1 section 2): it is identity on the dataset entry, so a fetch may not invent
+        # a principal.
+        #
+        # feed is passed here even though it is OPTIONAL on the request (`Feed | None = None`
+        # since 77f3a6c) and even though the adapter does not read it. It is set deliberately so
+        # that the tests below which override it to SIP are overriding a populated field rather
+        # than filling an empty one -- "the adapter ignores the request's tape" is only worth
+        # asserting against a request that actually names one.
+        'owner': 'rebalancer',
         'source': DataSource.ALPACA_API,
+        'feed': Feed.IEX,
         'granularity': Granularity.ONE_DAY,
         'start': START,
         'end': None,
@@ -157,6 +169,68 @@ async def test_an_injected_client_is_used_without_any_credentials():
         batch = await broker_api.get_market_stock_data(executor, request, client=client)
 
     assert len(batch.dataset[DataType.MARKET_ACTIVITY]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('sip_enabled', 'expected'), [('false', Feed.IEX), ('true', Feed.SIP)], ids=['iex', 'sip'])
+async def test_the_resolved_feed_reaches_the_vendor_call_and_is_stamped_on_the_batch(sip_enabled: str, expected: Feed):
+    """The scope amendment on tj-vhboky.13, both halves, against a real adapter call.
+
+    THE TWO HALVES FAIL SEPARATELY, which is why one test asserts both. Before tj-vhboky.9,
+    ``resolve_feed()`` fed the local single-flight key and nothing else: the vendor call carried no
+    ``feed`` parameter at all, so Alpaca served whatever it defaults to, and the batch went out
+    unstamped. Either half alone is a silent wrong-tape bug --
+
+      VENDOR CALL  without it, a SIP-entitled deployment quietly receives IEX bars.
+      BATCH STAMP  without it, bars from whichever tape did serve them are stored carrying no tape
+                   at all, and ``feed`` is inside the bar's identity.
+
+    The vendor value is LOWERCASE and the stamped value is the uppercase ``Feed`` member: the
+    first is alpaca-py's ``DataFeed`` wire vocabulary and the second is the stored contract. That
+    difference is asserted rather than normalised away -- collapsing them is how a vendor string
+    ends up in a column typed by the shared enum.
+
+    Args:
+        sip_enabled: The value of ALPACA_SIP_ENABLED for this case.
+        expected: The Feed the adapter must resolve from it.
+    """
+    request = build_request()
+    client = Mock()
+    client.get_stock_bars.return_value = StubBarSet(request.asset_symbol, [build_bar(10.0)])
+
+    with patch.dict(os.environ, {'ALPACA_SIP_ENABLED': sip_enabled}), ThreadPoolExecutor(max_workers=1) as executor:
+        batch = await broker_api.get_market_stock_data(executor, request, client=client)
+
+    assert batch.feed is expected
+    sent = client.get_stock_bars.call_args.args[0]
+    assert sent.feed == DataFeed(expected.value.lower())
+
+
+@pytest.mark.asyncio
+async def test_a_tape_named_by_the_request_does_not_override_the_deployment():
+    """``GetDatasetRequest.feed`` is DECLARED BUT INERT, pinned where it can actually be observed.
+
+    tj-rh4b7f deferred caller-selected feed: the store has no feed to forward, so the field stays
+    on the request as the landing site for the transport work rather than as a working selection.
+    Its comment says nothing in data/ingest reads it. A comment is not a test, and the failure it
+    describes is silent -- a request naming SIP against an IEX deployment would simply be served
+    IEX with nobody told.
+
+    So this drives the adapter with a request that explicitly names SIP, in a deployment
+    configured for IEX, and asserts IEX wins at both sites. WHEN THE DEFERRED TRANSPORT WORK
+    LANDS, THIS IS THE TEST THAT MUST FAIL, and inverting it is the deliberate act that records
+    the field becoming live. It is not a test to repair around.
+    """
+    request = build_request(feed=Feed.SIP)
+    assert request.feed is Feed.SIP, 'the request really does name the other tape'
+    client = Mock()
+    client.get_stock_bars.return_value = StubBarSet(request.asset_symbol, [build_bar(10.0)])
+
+    with patch.dict(os.environ, {'ALPACA_SIP_ENABLED': 'false'}), ThreadPoolExecutor(max_workers=1) as executor:
+        batch = await broker_api.get_market_stock_data(executor, request, client=client)
+
+    assert batch.feed is Feed.IEX
+    assert client.get_stock_bars.call_args.args[0].feed == DataFeed('iex')
 
 
 @pytest.mark.asyncio

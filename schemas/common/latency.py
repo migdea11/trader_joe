@@ -1,9 +1,9 @@
 from enum import Enum
 
 from fastapi import Path, Query
-from pydantic import BaseModel
 
 from common.kafka.rpc.kafka_rpc_base import BaseRpcAck
+from schemas.inbound_contract import InboundContract
 
 
 LATENCY_TYPE_DESC = 'Type of latency to measure'
@@ -11,7 +11,7 @@ LOOP_DESC = 'Number of times to measure latency'
 PAYLOAD_SIZE_DESC = 'Size of payload to send'
 
 
-class LatencyRequest(BaseModel):
+class LatencyRequest(InboundContract):
     class LatencyType(str, Enum):
         REST = 'rest'
         RPC_KAFKA = 'rpc_kafka'
@@ -25,5 +25,5 @@ class LatencyResponse(BaseRpcAck):
     latency: float
 
 
-class InternalLatencyRequest(BaseModel):
+class InternalLatencyRequest(InboundContract):
     payload: str

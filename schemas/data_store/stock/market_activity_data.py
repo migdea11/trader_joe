@@ -1,16 +1,14 @@
 from typing import TypeVar
 
-from pydantic import BaseModel
-
 from common.logging import get_logger
 from schemas.data_store.asset_data_interface import (
     AssetData,
     AssetDataCreate,
-    AssetDataDeleteById,
     AssetDataQuery,
     AssetDataUpdate,
     BatchAssetDataCreate,
 )
+from schemas.inbound_contract import InboundContract
 
 
 log = get_logger(__name__)
@@ -19,8 +17,21 @@ DT = TypeVar('DT')  # Data Type
 QT = TypeVar('QT')  # Query Type
 
 
-class StockDataMarketActivityData(BaseModel):
-    """Basic Data for a stock's market activity."""
+class StockDataMarketActivityData(InboundContract):
+    """Basic Data for a stock's market activity.
+
+    BARS ARE RAW AND NEVER CORRECTED (tj-vhboky.1 section 6). There is deliberately no
+    split_factor or dividends_factor here: corporate actions live in their own events table and
+    are applied SERVER-SIDE AT READ TIME against a basis the caller names, so an adjusted value
+    is derived and disposable and a bug in the adjustment is fixed by invalidating a cache rather
+    than by rewriting history. The columns that used to sit here were hard-coded to 1.0 by the
+    Alpaca adapter and nothing ever wrote a real factor.
+
+    THIS IS THE MODEL THE STRICT-CONTRACT RULING WAS ABOUT. Dropping those two fields did not
+    stop the Alpaca adapter sending them, and under the old permissive default every such call
+    kept succeeding. As an InboundContract it now fails loudly instead, which is the whole point:
+    see schemas/inbound_contract.py, including the deploy-ordering constraint it creates.
+    """
 
     open: float
     high: float
@@ -29,11 +40,8 @@ class StockDataMarketActivityData(BaseModel):
     volume: int
     trade_count: int
 
-    split_factor: float
-    dividends_factor: float
 
-
-class StockMarketActivityDataQuery(BaseModel):
+class StockMarketActivityDataQuery(InboundContract):
     """Basic Query for a stock's market activity."""
 
     pass
@@ -112,10 +120,6 @@ class BatchStockDataMarketActivityCreate(BatchAssetDataCreate[StockDataMarketAct
 
 
 class StockDataMarketActivityUpdate(AssetDataUpdate[StockDataMarketActivityData]):
-    pass
-
-
-class StockDataMarketActivityDeleteById(AssetDataDeleteById):
     pass
 
 
