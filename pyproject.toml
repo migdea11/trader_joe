@@ -57,6 +57,8 @@ security = [
 
 [tool.ruff]
 exclude = [
+    # Other agents' live worktrees (tj-aov3ip): half-edited copies of this repo, not this tree
+    ".claude/worktrees",
     ".git",
     ".pytest_cache",
     ".ruff_cache",

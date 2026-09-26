@@ -99,9 +99,11 @@ jobs:
       run: |
         uv run bandit -r ${{ env.SOURCE_PATHS }} --exclude tests/
 
+    # A fresh checkout has no .claude/worktrees; the exclude keeps this line identical to
+    # `make security`, where agent worktrees do exist (tj-aov3ip).
     - name: Run SemGrep
       run: |
-        uv run semgrep --config=auto --exclude=tests/ --exclude=.venv --exclude=docker-compose.override.yaml .
+        uv run semgrep --config=auto --exclude=tests/ --exclude=.venv --exclude=docker-compose.override.yaml --exclude=.claude/worktrees .
 
     - name: Generate Requirements
       run: |

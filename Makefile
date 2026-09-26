@@ -222,10 +222,13 @@ lint-fix: $(VENV_MARKER)  ## Apply lint fixes and formatting (scope with PATHS=)
 	uv run ruff check --fix $(PATHS)
 	uv run ruff format $(PATHS)
 
+# semgrep scans '.', so it would also scan other agents' live worktrees under .claude/worktrees
+# (tj-aov3ip) -- half-edited copies of this repo. bandit needs no exclude: SOURCE_DIRS names
+# its roots explicitly and none of them contains .claude.
 .PHONY: security
 security: $(VENV_MARKER)  ## Check security vulnerabilities
 	uv run bandit -r $(SOURCE_DIRS) --exclude tests/
-	uv run semgrep --config=auto --exclude=tests/ --exclude=.venv --exclude=docker-compose.override.yaml .
+	uv run semgrep --config=auto --exclude=tests/ --exclude=.venv --exclude=docker-compose.override.yaml --exclude=.claude/worktrees .
 	uv export --all-groups --no-group dev --no-group testing --no-group security --locked --format requirements-txt > requirements.txt
 	# uv run safety scan --file requirements.txt
 	uv run pip-audit -r requirements.txt --disable-pip
