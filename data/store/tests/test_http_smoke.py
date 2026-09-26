@@ -1,3 +1,4 @@
+import importlib
 import uuid
 from datetime import UTC, datetime
 from typing import Any, NamedTuple
@@ -10,7 +11,14 @@ from starlette.routing import NoMatchFound
 from common.database.postgres_tools import PostgresSessionFactory
 from data.store.app.app_depends import get_rpc_clients
 from data.store.app.database.database import async_db
+from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.main import app
+from routers.common.instance_secret import (
+    INSTANCE_SECRET_ENV_VAR,
+    INSTANCE_SECRET_HEADER,
+    INSTANCE_SECRET_REJECTION_DETAIL,
+    require_instance_secret,
+)
 from routers.tests.test_interface_surface import SEPARATOR, load_manifest
 from schemas.data_store.stock.market_activity_data import BatchStockDataMarketActivityCreate
 
@@ -56,6 +64,46 @@ UNBOUND_PATH = 'unbound-path'
 # Statuses a well-formed request must not produce. 404/405 mean the route is not mounted where the
 # manifest says it is; 500 means it is mounted and broken.
 UNREACHABLE_STATUSES = (404, 405)
+
+# ---------------------------------------------------------------------------------------------
+# THE INSTANCE SECRET, AND WHY EVERY REQUEST BELOW CARRIES ONE ON A WRITE ROUTE (tj-vhboky.8)
+#
+# The three write routes now take require_instance_secret as a DECORATOR-level dependency. FastAPI
+# inserts those AHEAD of the endpoint's own parameter dependencies, so the 401 is answered before
+# any body or path value is validated. That is designed behaviour, not a defect: an auth gate that
+# ran after body parsing would do work for an unauthenticated caller.
+#
+# It made three malformed-request cases fail, because they were written when no route had a guard.
+# THE FIX IS TO AUTHENTICATE THEM, NOT TO WIDEN WHAT THEY ACCEPT. A malformed-request test that
+# accepted "401 or 422" would no longer pin either status, and this branch has twice shipped an
+# assertion that passed in both worlds. So a guarded route is given a configured secret and a valid
+# header for the SHAPE halves of this file, and the fail-closed behaviour gets its own two cases
+# below -- test_a_guarded_route_rejects_a_request_carrying_no_secret and
+# test_a_guarded_route_answers_401_before_it_validates_anything. Two properties, separately named.
+#
+# THE WELL-FORMED HALF IS ALSO AFFECTED, which is the less obvious half and the more important one.
+# 401 is not in UNREACHABLE_STATUSES, is not 422 and is below 500, so a guarded route satisfied
+# every assertion in test_a_well_formed_request_reaches_the_handler WITHOUT REACHING THE HANDLER --
+# the test's own name became false for three of the five routes the moment the guard landed. Giving
+# the well-formed half a real secret is what makes that test mean again what it says.
+# ---------------------------------------------------------------------------------------------
+
+# Any non-empty value works. The comparison itself -- compare_digest, the absent-header case, the
+# unset-variable case, the non-ASCII header -- belongs to common/tests/test_instance_secret.py and
+# is not re-tested here; this file only proves WHICH ROUTES the dependency sits on.
+CONFIGURED_SECRET = 'smoke-test-instance-secret'
+
+# The write routes that must carry the guard, and the only routes that may. Written out rather than
+# derived from the routers, because the derived set is the thing under test: a guard that appears on
+# a READ route -- which routers/common/instance_secret.py forbids by design, reads being open --
+# would otherwise be adopted silently by any test that asked the routers what they guard.
+GUARDED_ADDRESSES = frozenset(
+    {
+        'POST /internal/asset-data/{asset_type}/{data_type}',
+        'POST /store/{asset_type}/{data_type}/{asset_symbol}',
+        'DELETE /store/{id}',
+    }
+)
 
 # Routes that CANNOT answer a well-formed request today, for reasons that have nothing to do with
 # the database being absent. Found by this file and filed against builder-store, whose scope
@@ -135,6 +183,16 @@ DATA_POINT = {
 # ones above went stale for unrelated reasons and only looked like one failure (tj-1njw7c).
 DATASET_REQUEST = {'owner': 'test-owner', 'source': 'ALPACA', 'granularity': '1day', 'start': '2026-01-01T00:00:00Z'}
 
+# The well-formed DELETE. `owner` is a QUERY parameter on /store/{id} (AssetDatasetStoreDelete), and
+# it is an authorisation assertion rather than a data field -- so a well-formed delete declares one
+# that MATCHES the stored entry FakeResult.scalar_one_or_none() hands back. Without a matching owner
+# the handler answers 403, which is below 500 and not in UNREACHABLE_STATUSES and would therefore
+# have let the well-formed half pass on a refusal. What a refusal looks like, and that an absent
+# owner is refused too, is data/store/tests/test_delete_dataset_entry_route.py's subject, not this
+# file's: here the point is only that the route is reachable and answers.
+DELETE_OWNER = 'test-owner'
+DELETE_ID = uuid.uuid4()
+
 # One entry per `http` line in data_store.manifest. The key is the manifest's address verbatim, so
 # an address that changes shape turns this file red rather than silently matching nothing.
 #
@@ -172,8 +230,8 @@ CASES: dict[str, Case] = {
         malformed_field='source',
     ),
     'DELETE /store/{id}': Case(
-        path_params={'id': str(uuid.uuid4())},
-        request={},
+        path_params={'id': str(DELETE_ID)},
+        request={'params': {'owner': DELETE_OWNER}},
         malformed_path_params={'id': 'not-a-uuid'},
         malformed_request={},
         malformed_field='id',
@@ -182,7 +240,22 @@ CASES: dict[str, Case] = {
 
 
 class FakeResult:
-    """Stands in for a SQLAlchemy Result over an empty table."""
+    """Stands in for a SQLAlchemy Result over an empty table -- with one row the DELETE must find.
+
+    scalar_one_or_none() is the exception to "empty table", and it is deliberate. Its ONLY reader in
+    the driven paths is _get_entry_or_raise() (store_dataset_entry.py:180), reached by
+    delete_entry_by_id and by the two id-addressed updates, neither of which has a route. Returning
+    None there would make every well-formed DELETE answer 404 -- a status this file reads as "the
+    route is not mounted where the manifest says it is", so the well-formed half would report a
+    mounting failure for a route that is mounted and working.
+
+    rowcount is a real int for the same reason the recording fake in test_dataset_entry_identity.py
+    gives it one: delete_entry_by_id compares result.rowcount to 0, and an attribute that does not
+    exist raises AttributeError inside the handler -- which raise_server_exceptions=True surfaces as
+    a traceback, not as the 500 a reader would expect.
+    """
+
+    rowcount = 1
 
     def all(self) -> list:
         return []
@@ -195,6 +268,12 @@ class FakeResult:
 
     def first(self) -> None:
         return None
+
+    def scalar_one_or_none(self) -> StoreDatasetEntry:
+        # Only id and owner are set: those are the two attributes _check_owner and the DELETE
+        # statement read, and inventing values for the other eight identity columns would suggest
+        # this file asserts something about them. It does not -- content is tj-19qp1q's tier.
+        return StoreDatasetEntry(id=DELETE_ID, owner=DELETE_OWNER)
 
 
 class FakeSession:
@@ -470,6 +549,77 @@ def client():
         app.dependency_overrides.clear()
 
 
+@pytest.fixture(autouse=True)
+def configured_instance_secret(monkeypatch: pytest.MonkeyPatch):
+    """Put a real instance secret in the environment for every test in this module.
+
+    AUTOUSE, because the alternative is remembering it per test: a guarded route with no secret
+    configured answers 401 no matter what header the request carries (fail closed), and a 401 passes
+    every assertion in the well-formed half except the explicit one added there. The dependency reads
+    the variable per request, so a function-scoped fixture works against the module-scoped client.
+
+    The two fail-closed cases below deliberately do NOT rely on this: they leave the secret
+    configured and omit the HEADER, which is the cause an ordinary caller produces.
+
+    Args:
+        monkeypatch: Sets INSTANCE_WRITE_SECRET for the duration of one test.
+    """
+    monkeypatch.setenv(INSTANCE_SECRET_ENV_VAR, CONFIGURED_SECRET)
+
+
+def module_for(file_path: str):
+    """Import the router module the manifest names for one route.
+
+    Args:
+        file_path (str): Repository-relative module path, e.g. 'routers/data_store/x.py'.
+
+    Returns:
+        ModuleType: The imported module.
+    """
+    return importlib.import_module(file_path.removesuffix('.py').replace('/', '.'))
+
+
+def guarded_addresses() -> set[str]:
+    """The manifest addresses whose route carries require_instance_secret, read off the routers.
+
+    ASKED OF THE ROUTE OBJECT, not of the wire. A request with no header answers 401 whether the
+    route is guarded or the guard is gone and something else rejected it, so deriving the set by
+    sending requests would classify a route that LOST its guard as unguarded and go green. The
+    decorator-level dependency list is the declaration itself, which is what a reviewer would read.
+
+    Returns:
+        set[str]: Guarded addresses.
+    """
+    guarded = set()
+    for fields in manifest_entries(HTTP):
+        address, file_path, symbol = fields[1], fields[2], fields[3]
+        matching = [route for route in module_for(file_path).router.routes if route.name == symbol]
+        assert len(matching) == 1, (
+            f'{file_path} registers {len(matching)} routes named {symbol}, so {address} cannot be '
+            f'resolved to one route object'
+        )
+        if any(dependency.dependency is require_instance_secret for dependency in matching[0].dependencies):
+            guarded.add(address)
+    return guarded
+
+
+def secret_headers(address: str) -> dict[str, str]:
+    """The headers a request to one address must carry to get past the instance-secret guard.
+
+    Keyed on the hand-written GUARDED_ADDRESSES rather than on guarded_addresses(): if the derived
+    set were used here, a guard newly added to a read route would be silently accommodated by every
+    request this file sends, and only one test would notice. Keyed on the literal, the shape halves
+    break too.
+
+    Args:
+        address (str): Manifest address.
+
+    Returns:
+        dict[str, str]: The secret header, or nothing for an open route.
+    """
+    return {INSTANCE_SECRET_HEADER: CONFIGURED_SECRET} if address in GUARDED_ADDRESSES else {}
+
+
 def symbol_for(address: str) -> str:
     """Return the implementing symbol the manifest records for one address.
 
@@ -497,7 +647,7 @@ def test_a_well_formed_request_reaches_the_handler(address: str, client: TestCli
     method = address.split(' ', 1)[0]
     url = app_url_for(address, symbol_for(address), case.path_params)
 
-    response = client.request(method, url, **case.request)
+    response = client.request(method, url, headers=secret_headers(address), **case.request)
 
     assert response.status_code not in UNREACHABLE_STATUSES, (
         f'{method} {url} returned {response.status_code}: the manifest declares this route but the '
@@ -506,6 +656,15 @@ def test_a_well_formed_request_reaches_the_handler(address: str, client: TestCli
     assert response.status_code != 422, (
         f'{method} {url} returned 422 ({response.text}). The request this test calls well-formed '
         f'is not; fix the CASES entry, or the malformed half below proves nothing.'
+    )
+    # THE ASSERTION THAT KEEPS THIS TEST'S NAME TRUE. 401 is not in UNREACHABLE_STATUSES, is not 422
+    # and is under 500, so between the guard landing (tj-vhboky.8) and this line the three write
+    # routes passed every other assertion here WITHOUT THE HANDLER EVER RUNNING. A broken secret
+    # constant, a renamed header or a dropped autouse fixture puts them straight back there, and
+    # nothing else in this file would say so.
+    assert response.status_code != 401, (
+        f'{method} {url} returned 401, so the request never reached the handler and the rest of '
+        f'this test asserts nothing about it. The secret header or the configured secret is wrong.'
     )
     assert response.status_code < 500, f'{method} {url} returned {response.status_code}: {response.text}'
 
@@ -516,7 +675,9 @@ def test_a_malformed_request_is_rejected_with_422(address: str, client: TestClie
     method = address.split(' ', 1)[0]
     url = app_url_for(address, symbol_for(address), case.malformed_path_params)
 
-    response = client.request(method, url, **case.malformed_request)
+    # AUTHENTICATED, so validation is actually reached on the guarded routes. Widening this
+    # assertion to "401 or 422" instead would have made it pin neither.
+    response = client.request(method, url, headers=secret_headers(address), **case.malformed_request)
 
     assert response.status_code == 422, f'{method} {url} returned {response.status_code}: {response.text}'
     complained_about = [error['loc'][-1] for error in response.json()['detail']]
@@ -524,6 +685,85 @@ def test_a_malformed_request_is_rejected_with_422(address: str, client: TestClie
         f'{method} {url} returned 422, but about {complained_about} rather than about '
         f'{case.malformed_field!r}, which is the only field this request corrupts.'
     )
+
+
+def test_exactly_the_write_routes_carry_the_instance_secret_guard():
+    """The guard is on the three writes and on nothing else -- both halves of that, in one equality.
+
+    READS ARE OPEN BY DESIGN (routers/common/instance_secret.py: "Apply this to write routes one at a
+    time, as a per-route dependency. Never put it in a router-wide dependencies=[...] list, where a
+    GET added later would silently inherit it"). A router-wide list is the plausible tidy-up, and it
+    would break the open-read design without editing that file or any handler -- so the direction
+    that must fail here is a guard APPEARING, not only one going missing. An equality against a
+    written-out set catches both; a subset check catches one.
+    """
+    assert guarded_addresses() == set(GUARDED_ADDRESSES), (
+        'the set of routes carrying require_instance_secret is not the set this file expects. A '
+        'route that LOST the guard is a write path open to an unauthenticated caller; a route that '
+        'GAINED one is a read path that is no longer open, which tj-vhboky.8 decided against.'
+    )
+
+
+@pytest.mark.parametrize('address', sorted(GUARDED_ADDRESSES))
+def test_a_guarded_route_rejects_a_request_carrying_no_secret(address: str, client: TestClient):
+    """The other property of the same three routes: the guard is live, not merely declared.
+
+    test_exactly_the_write_routes_carry_the_instance_secret_guard reads the declaration off the route
+    object; this drives the wire. A dependency that is listed but no longer raises -- an early
+    return, a swallowed exception, a refactor that drops the raise -- satisfies the declaration and
+    fails here, which is why both exist rather than one standing in for the other.
+
+    The secret IS configured (the autouse fixture) and the HEADER is absent, because that is the
+    cause an ordinary misconfigured caller produces. The unset-variable and wrong-value causes, and
+    the fact that all three answer identically, belong to common/tests/test_instance_secret.py.
+
+    Args:
+        address: A manifest address the design says must be guarded.
+        client: The store app with its database and RPC clients replaced.
+    """
+    case = case_for(address)
+    method = address.split(' ', 1)[0]
+    url = app_url_for(address, symbol_for(address), case.path_params)
+
+    response = client.request(method, url, **case.request)
+
+    assert response.status_code == 401, (
+        f'{method} {url} answered {response.status_code} to a well-formed request carrying no '
+        f'instance secret ({response.text}). This is a dataset write path.'
+    )
+    assert response.json()['detail'] == INSTANCE_SECRET_REJECTION_DETAIL
+
+
+@pytest.mark.parametrize('address', sorted(GUARDED_ADDRESSES))
+def test_a_guarded_route_answers_401_before_it_validates_anything(address: str, client: TestClient):
+    """THE ORDERING, pinned as the intended behaviour rather than worked around.
+
+    A decorator-level dependency is inserted AHEAD of the endpoint's own parameter dependencies, so
+    the 401 is decided before any path or body value is parsed. That ordering is the reason the three
+    malformed cases above had to be authenticated, and it is worth pinning in its own right: an auth
+    gate that ran after body validation would parse an unauthenticated caller's payload, and would
+    also tell them which of their fields was malformed -- a free validation oracle in front of a
+    credential check.
+
+    The request here is BOTH unauthenticated and malformed, which is the only request that can tell
+    the two orderings apart. The detail is asserted as well as the status: a 401 raised for some
+    unrelated reason would satisfy the status alone.
+
+    Args:
+        address: A manifest address the design says must be guarded.
+        client: The store app with its database and RPC clients replaced.
+    """
+    case = case_for(address)
+    method = address.split(' ', 1)[0]
+    url = app_url_for(address, symbol_for(address), case.malformed_path_params)
+
+    response = client.request(method, url, **case.malformed_request)
+
+    assert response.status_code == 401, (
+        f'{method} {url} answered {response.status_code} to a request that is both unauthenticated '
+        f'and malformed ({response.text}); validation now runs in front of the credential check.'
+    )
+    assert response.json()['detail'] == INSTANCE_SECRET_REJECTION_DETAIL
 
 
 @pytest.mark.parametrize('address', unbound_path_addresses())
@@ -566,7 +806,9 @@ def test_the_routes_are_driven_without_a_lifespan(client: TestClient):
     address = next(fields[1] for fields in manifest_entries(HTTP) if fields[1] not in KNOWN_BROKEN)
     case = case_for(address)
     url = app_url_for(address, symbol_for(address), case.path_params)
-    client.request(address.split(' ', 1)[0], url, **case.request)
+    # Authenticated like the halves above: a 401 short-circuit would never reach the database
+    # dependency at all, so this test would pass against an app whose override was not taking effect.
+    client.request(address.split(' ', 1)[0], url, headers=secret_headers(address), **case.request)
 
     assert set(PostgresSessionFactory.AsyncSessionHandle._async_engines) == engines_before, (
         'driving a route opened a Postgres engine, so the database dependency override is not '

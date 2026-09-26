@@ -66,7 +66,18 @@ class StoreAssetDatasetBody(InboundContract):
     # every instance in a long-lived process would share an expiry frozen at process start.
     # UTC, not naive local: this is stored as timestamptz, and datetime.now() with no tzinfo makes
     # "when does this data die" an environment-dependent answer.
-    expiry: datetime | None = Field(default_factory=lambda: datetime.now(UTC) + timedelta(days=1))
+    #
+    # NOT `datetime | None`, and the default_factory is deliberately the ONLY source of a value.
+    # Optional here was the same seam defect as `start` above, one field over: BaseGetDatasetRequest
+    # .expiry (schemas/data_ingest/get_dataset_request.py) is a REQUIRED, non-optional datetime, and
+    # data/store/app/ingest/data_action_request.py builds that request by splatting this model's
+    # model_dump(). So an explicit "expiry": null passed body validation, carried None through the
+    # splat, and blew up as a ValidationError on GetDatasetRequest -- a 500 on caller-shaped input,
+    # which is the one class of failure a declared request schema must never produce. Omitting the
+    # field is still fine and still means "a day from now"; only an explicit null now 422s, naming
+    # the field, at the edge. Fixed the same way `start` was under tj-6yk4qs: make the declared
+    # contract honest, rather than patch the handler into tolerating a body it should have refused.
+    expiry: datetime = Field(default_factory=lambda: datetime.now(UTC) + timedelta(days=1))
     expiry_type: ExpiryType = ExpiryType.BULK
     update_type: UpdateType = UpdateType.STATIC
 
@@ -153,6 +164,40 @@ class AssetDatasetStoreGetById(InboundContract):
 
 class AssetDatasetStoreDelete(InboundContract):
     id: UUID = Field(..., description=ASSET_DATASET_ID_DESC)
+
+    # THE CALLER'S DECLARED PRINCIPAL ON AN ID-ADDRESSED DELETE. It is a FIELD ON THIS EXISTING
+    # CLASS, and that is the whole reason this is a one-line change rather than a coordinated one:
+    # routers/tests/interface_manifest/data_store.manifest records this type's QUALIFIED NAME, not
+    # its fields, so adding one leaves the manifest -- the validator's file -- untouched, while
+    # adding a parameter to delete_data would not. FastAPI derives it as a QUERY parameter, since
+    # `owner` does not match the /store/{id} path template.
+    #
+    # Without it the route was broken outright: delete_entry_by_id(db, id, owner) grew a required
+    # third parameter under tj-vhboky.6, and routers/data_store/asset_dataset_store.py had no way
+    # to supply one, so every authenticated DELETE raised TypeError.
+    #
+    # OPTIONAL, AND THE REASON IS NOT THE ONE THAT APPLIES TO `start` AND `expiry` ABOVE -- read
+    # this before "making it honest" like those two, because the conclusion here is the opposite
+    # and it is opposite on purpose. Those are DATA fields feeding required downstream fields, so a
+    # value they cannot supply is a malformed body and belongs in a 422. `owner` is an
+    # AUTHORISATION ASSERTION: a DELETE naming a well-formed id is fully processable and is being
+    # REFUSED, not found malformed. An absent owner is just the degenerate case of a WRONG owner,
+    # which is uncontroversially a 403 -- so declaring this required would report an authorisation
+    # failure as a validation error, and would differ in status code depending on whether the
+    # caller got the principal wrong or omitted it. Optional keeps both answers the same.
+    #
+    # WHAT MAKES OPTIONAL SAFE IS A COLUMN CONSTRAINT, SO IT IS NAMED HERE RATHER THAN TRUSTED.
+    # None must never AUTHORISE, and it cannot: _check_owner compares `existing.owner != declared`,
+    # and StoreDatasetEntry.owner is Column(String, nullable=False), so existing.owner is never
+    # None and the comparison is always true -- verified against both a normal owner and the
+    # migration's 'unassigned' server_default. If that column ever became nullable, a None here
+    # would start matching legacy rows and this field would turn into an authorisation bypass.
+    #
+    # NOT YET A 403, and do not read this field as delivering one: nothing maps OwnerMismatch to
+    # 403 or EntryNotFound to 404 yet, so today an owner-less delete is still a 500 -- just a
+    # different one. Those mappings are builder-store's remaining tj-vhboky.8 work in
+    # routers/data_store/asset_dataset_store.py. This field is what unblocks them, not a substitute.
+    owner: str | None = None
 
 
 class AssetDatasetStore(AssetDatasetStoreUpdate):

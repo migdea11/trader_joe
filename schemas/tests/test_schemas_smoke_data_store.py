@@ -728,19 +728,60 @@ def test_owner_is_required_with_no_default():
     assert [error['loc'] for error in excinfo.value.errors()] == [('owner',)]
 
 
-@pytest.mark.parametrize('field', ['expiry_type', 'update_type'])
+@pytest.mark.parametrize('field', ['expiry', 'expiry_type', 'update_type'])
 def test_a_policy_field_rejects_an_explicit_null_rather_than_defaulting_it(field: str):
-    """THE CONTRACT HALF OF THE NULL-IN-A-UNIQUE-KEY HAZARD. tj-vhboky.1 section 2 pins the other.
+    """One assertion, TWO DIFFERENT HAZARDS, and the docstring has to say which field carries which.
 
-    These fields have defaults, so OMITTING them is fine and the minimal payload leaves them out.
-    Sending ``null`` explicitly is a different request and must be rejected, because the value
-    lands in a UNIQUE constraint and Postgres treats NULL as distinct from NULL in a unique index.
-    A NULL written into a key column means the ON CONFLICT never fires against that row, and "an
-    exact repeat returns the existing id" silently becomes "an exact repeat creates a second row"
-    -- the duplication the whole identity model exists to make impossible.
+    All three fields have defaults, so OMITTING them is fine and the minimal payload leaves them
+    out. Sending ``null`` explicitly is a different request and must be rejected in every case.
+    What a null would COST differs by field, and naming only one reason for three parameters would
+    be a test whose stated purpose no longer matches what it checks:
 
-    Making the annotation non-Optional is what produces the rejection. A ``| None`` annotation
-    with a non-None default would accept the null and store it.
+    ``expiry_type`` and ``update_type`` -- THE CONTRACT HALF OF THE NULL-IN-A-UNIQUE-KEY HAZARD
+    (tj-vhboky.1 section 2 pins the other). Both land in a UNIQUE constraint, and Postgres treats
+    NULL as distinct from NULL in a unique index. A NULL written into a key column means the ON
+    CONFLICT never fires against that row, and "an exact repeat returns the existing id" silently
+    becomes "an exact repeat creates a second row" -- the duplication the whole identity model
+    exists to make impossible.
+
+    ``expiry`` -- A DIFFERENT HAZARD AT A DIFFERENT SEAM, and deliberately not the one above:
+    expiry is NOT part of the identity key (expiry_TYPE is; the value itself is a policy the
+    request asks for, not a thing that makes one dataset different from another), so nothing about
+    the unique index applies to it. The cost is downstream. ``BaseGetDatasetRequest.expiry``
+    (schemas/data_ingest/get_dataset_request.py) is a REQUIRED, non-optional datetime, and
+    data/store/app/ingest/data_action_request.py builds that request by splatting this model's
+    ``model_dump()``. So an explicit ``"expiry": null`` passed body validation, carried None
+    through the splat, and blew up as a ValidationError on GetDatasetRequest -- a 500 on
+    caller-shaped input, which is the one class of failure a declared request schema must never
+    produce. It now 422s at the edge, naming the field.
+
+    THE REGRESSION TO CATCH ON expiry is a widening BACK to ``datetime | None``, and it looks
+    reasonable from two directions: StoreDatasetEntry.expiry is nullable=True and
+    AssetDatasetStore.expiry is ``datetime | None``. Both of those are correct and must STAY -- the
+    column is nullable for rows predating the default, and the READ model must be able to represent
+    them. It is the WRITE body that must not accept null. The other plausible wrong fix is making
+    the field required, which would break every caller that legitimately omits it; the positives
+    are pinned separately by test_expiry_default_is_computed_per_instance and
+    test_expiry_default_is_an_aware_utc_instant so that this test cannot invite it.
+
+    WHAT ACTUALLY PRODUCES THE REJECTION DIFFERS BY FIELD, and this paragraph used to say the
+    annotation did it in all three cases. It does not, and the difference decides what this test can
+    be read as pinning -- measured by mutating each guard alone, not inferred from the annotations.
+
+    ``expiry``: the non-Optional annotation IS the only mechanism. Nothing coerces this field before
+    the annotation is consulted, so re-widening it to ``datetime | None`` reds this case -- and reds
+    only this case, with the rest of the suite green. That is the regression described above.
+
+    ``expiry_type`` and ``update_type``: DOUBLY GUARDED, so this case pins neither guard on its own
+    and must not be read as pinning the annotation for them. Each has a ``mode='before'`` field
+    validator (``ExpiryType.validate`` / ``UpdateType.validate``) that raises on a null before the
+    annotation is ever reached -- ``NamedIntEnum.validate`` falls through its str/int/enum branches to
+    ``raise ValueError(f'Invalid type for enum_field: {type(value)}')`` (common/enums/
+    pydantic_enums.py). Measured: widening either annotation to ``| None`` is green across the whole
+    suite, and making the before-validator tolerate a null with the annotations untouched is green
+    too; the case reds only when BOTH are relaxed for the same field. A ``| None`` annotation with a
+    non-None default and no before-validator would accept the null and carry it, which is what
+    ``expiry`` shows and what these two are protected from twice over.
 
     Args:
         field: The policy field being sent as null.
