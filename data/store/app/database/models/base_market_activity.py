@@ -67,6 +67,26 @@ class BaseMarketActivity(AppBase.DATA_STORE_BASE):
             f"created_at='{self.created_at}', updated_at='{self.updated_at}')>"
         )
 
+    @classmethod
+    def bind_params_per_row(cls) -> int:
+        """Bind parameters one VALUES row consumes in a multi-row INSERT against this table.
+
+        Derived from the table's own column list rather than hard-coded, so it tracks the schema
+        instead of silently going stale the way MARKET_ACTIVITY_BATCH_SIZE did while this column
+        set changed twice in two days (tj-rpyv5u): split_factor/dividends_factor dropped, feed
+        added NOT NULL. Excludes the surrogate primary key, which Postgres generates rather than
+        a caller binding it, and any column whose default is applied by SQLAlchemy at compile
+        time as an inline SQL expression (created_at/updated_at's func.now()) rather than bound
+        per row -- the same derivation shape as test_bar_write_path.py's _required_columns().
+        """
+        return len(
+            [
+                column
+                for column in cls.__table__.columns
+                if not column.primary_key and column.default is None and column.server_default is None
+            ]
+        )
+
     @abstractmethod
     def get_asset_type(self) -> AssetType: ...
 

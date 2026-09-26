@@ -13,6 +13,10 @@ from schemas.data_store.stock import market_activity_data
 
 log = get_logger(__name__)
 
+# The Postgres wire protocol's hard cap on bind parameters in a single statement (tj-rpyv5u). A
+# statement built from more rows than this fits refuses outright rather than degrading.
+POSTGRES_MAX_BIND_PARAMETERS = 65_535
+
 
 class UnsupportedAssetType(ValueError):
     def __init__(self, asset_type: AssetType):
@@ -57,6 +61,34 @@ async def create_market_activity_data(
     return db_asset_market_activity_data.to_schema()
 
 
+def _resolve_chunk_size(requested_chunk_size: int | None) -> int:
+    """The rows per upsert statement, bounded by the wire-protocol limit.
+
+    protocol_max_rows is derived from StockMarketActivity.bind_params_per_row() rather than a
+    hard-coded twelve, so it re-derives itself the next time the column list changes instead of
+    quietly going stale. requested_chunk_size is MARKET_ACTIVITY_BATCH_SIZE, read by the caller
+    (data/store/app/ingest/data_action_request.py) -- the setting this bug exists to make the
+    write path actually obey. Unset, non-positive, or larger than the protocol allows are all
+    treated the same way: clamp to the derived safe ceiling and log that it happened, rather than
+    building a statement Postgres would reject.
+    """
+    protocol_max_rows = POSTGRES_MAX_BIND_PARAMETERS // StockMarketActivity.bind_params_per_row()
+    if not requested_chunk_size or requested_chunk_size <= 0:
+        log.warning(
+            f'MARKET_ACTIVITY_BATCH_SIZE is unset or non-positive ({requested_chunk_size!r}); '
+            f'using the wire-protocol-derived chunk size of {protocol_max_rows} rows'
+        )
+        return protocol_max_rows
+    if requested_chunk_size > protocol_max_rows:
+        log.warning(
+            f'MARKET_ACTIVITY_BATCH_SIZE={requested_chunk_size} would exceed the '
+            f'{POSTGRES_MAX_BIND_PARAMETERS}-bind-parameter limit at '
+            f'{StockMarketActivity.bind_params_per_row()} params/row; clamping to {protocol_max_rows} rows'
+        )
+        return protocol_max_rows
+    return requested_chunk_size
+
+
 def build_market_activity_upsert(values: list[dict[str, Any]]) -> Insert:
     """Build the idempotent bar insert.
 
@@ -74,8 +106,22 @@ def build_market_activity_upsert(values: list[dict[str, Any]]) -> Insert:
 
 
 async def batch_create_market_activity_data(
-    db: AsyncSession, batch_asset_data: market_activity_data.BatchStockDataMarketActivityCreate
+    db: AsyncSession,
+    batch_asset_data: market_activity_data.BatchStockDataMarketActivityCreate,
+    requested_chunk_size: int | None = None,
 ) -> int:
+    """Upsert a batch of bars, chunked to stay under the wire-protocol bind-parameter limit.
+
+    ALL CHUNKS SHARE ONE TRANSACTION (tj-rpyv5u): every db.execute below runs before the single
+    db.commit() at the end, so an oversized batch either lands whole or (on any exception,
+    including one raised mid-chunk) rolls back whole. Committing per chunk was rejected
+    deliberately -- it would turn one failed request into a dataset entry claiming coverage for
+    bars that were never written, which is worse than today's all-or-nothing failure.
+
+    The duplicate-timestamp guard runs across the WHOLE batch before any chunk is built, not
+    per chunk: two bars at the same timestamp landing in different chunks would each pass a
+    per-chunk guard and still collide on the natural key.
+    """
     try:
         batch_market_activity = batch_asset_data.dataset.get(DataType.MARKET_ACTIVITY)
         if not batch_market_activity:
@@ -92,8 +138,11 @@ async def batch_create_market_activity_data(
                 raise DuplicateBatchTimestamp(bar.timestamp)
             seen_timestamps.add(normalized_timestamp)
 
-        stmt = build_market_activity_upsert(StockMarketActivity.from_batch_create(batch_asset_data))
-        await db.execute(stmt)
+        values = StockMarketActivity.from_batch_create(batch_asset_data)
+        chunk_size = _resolve_chunk_size(requested_chunk_size)
+        for chunk_start in range(0, len(values), chunk_size):
+            chunk = values[chunk_start : chunk_start + chunk_size]
+            await db.execute(build_market_activity_upsert(chunk))
 
         await db.commit()
         log.debug('Batch insert completed successfully')

@@ -39,5 +39,7 @@ async def store_market_activity_worker(
     # TODO function for each data type
     item_count = 0
     if DataType.MARKET_ACTIVITY in batch_data.dataset:
-        item_count += await batch_create_market_activity_data(db, batch_data)
+        item_count += await batch_create_market_activity_data(
+            db, batch_data, requested_chunk_size=MARKET_ACTIVITY_BATCH_SIZE
+        )
     return item_count
