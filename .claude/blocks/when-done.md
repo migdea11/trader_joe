@@ -7,9 +7,20 @@ Before reporting complete:
 
 1. Tests pass — `make test PATHS=<path>`.
 2. Lint is clean — `make lint PATHS=<path>`.
-3. Your changes are committed in a self-consistent state.
-4. The task record carries a final checkpoint note.
-5. The record is set to your role's terminal status.
+3. **The security scanners pass — `make security` — whenever your diff changes production source
+   under the scanned paths.** Not required for a tests-only or docs-only diff; the scanners exclude
+   test directories anyway. It needs `make init` first, because the security tooling sits in a uv
+   group the default sync omits.
+4. Your changes are committed in a self-consistent state.
+5. The task record carries a final checkpoint note.
+6. The record is set to your role's terminal status.
+
+**`make lint` does not run the scanners, and nothing else substitutes for step 3.** This list
+previously stopped at tests and lint, so sixty-two commits — including a new credential-handling
+module, exactly the kind of file bandit exists for — were reported complete, correctly, by agents
+that had satisfied every check they were given. The gap surfaced only when CI failed on a branch
+that had already been pushed for review. `make security` runs the identical invocation to CI, and
+ran the whole time. A green `make lint` is not evidence about a scanner that lint never invokes.
 
 Then report in this shape:
 
