@@ -57,16 +57,25 @@ log = get_logger(__name__)
 # cannot disagree about the spelling. The ``X-`` prefix is deprecated by RFC 6648, and is kept
 # anyway: it is the prevailing spelling for a bespoke credential header, and it makes clear at a
 # glance that this is not Authorization and not any standard scheme.
-INSTANCE_SECRET_HEADER = 'X-Instance-Secret'
+# The value is the header's NAME -- public, and sent on every request. bandit's B105 fires only
+# because the constant's name contains SECRET and the value is a literal; nothing is compared
+# against it. The suppression names B105 rather than being bare, so a real finding on this line
+# later -- say someone assigns an actual default here -- still fails the scan.
+INSTANCE_SECRET_HEADER = 'X-Instance-Secret'  # nosec B105
 
 # Reserved, empty, in .env.default. Read LAZILY inside the dependency (see below), never at import.
-INSTANCE_SECRET_ENV_VAR = 'INSTANCE_WRITE_SECRET'
+# The value is the VARIABLE's name, not the secret it holds; the secret itself is read from the
+# environment inside require_instance_secret and appears as a literal nowhere in this tree. B105
+# as above.
+INSTANCE_SECRET_ENV_VAR = 'INSTANCE_WRITE_SECRET'  # nosec B105
 
 # ONE message for every cause of rejection -- secret not configured, header absent, header wrong.
 # Distinguishing them in the response would turn the endpoint into an oracle that tells a caller
 # whether the deployment has a secret at all, and how close a guess was. The operator gets the
 # distinction in the logs instead, where the cause is useful and the caller cannot see it.
-INSTANCE_SECRET_REJECTION_DETAIL = 'Invalid or missing instance write secret'
+# The value is the text sent to a rejected caller -- deliberately public, and deliberately the
+# same for every cause. B105 as above.
+INSTANCE_SECRET_REJECTION_DETAIL = 'Invalid or missing instance write secret'  # nosec B105
 
 
 async def require_instance_secret(
