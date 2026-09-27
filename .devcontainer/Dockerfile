@@ -56,25 +56,34 @@ RUN set -eux; \
     rm -rf /tmp/dolt.tar.gz "/tmp/dolt-linux-${arch}"; \
     dolt version
 
-RUN npm install -g @anthropic-ai/claude-code@2.1.274 \
-    && npm cache clean --force
+# Claude Code is installed further down, AS THE AGENT USER, with the native installer.
+#
+# It was a root `npm install -g` here. That put the package in a root-owned global node_modules
+# which the agent user cannot write, so Claude's own updater could not run and updating it meant
+# rebuilding this image. npm global is also the legacy install path and does not auto-update.
+#
+# Not the dev container feature either: this image is built by `make agent-build`, a plain
+# `docker compose build`, and devcontainer.json's features are applied only by the Dev Containers
+# CLI or IDE extension. Declaring the feature installs nothing here — it leaves no Claude at all.
 
 # --- tailored for trader_joe from here down -------------------------------------------------
 # The project's own toolchain, so an agent can actually run `make test` / `make lint` instead of
 # reporting them NOT RUN. Pinned and checksum-verified, on the same rule as bd and dolt above.
 #
-# uv is pinned to the version CI uses (.github/workflows/trader_joe_testing.yml UV_VERSION), not
-# the older one in the project Makefile and Dockerfile — CI is what a green run has to reproduce.
-# The disagreement between those three is a known defect, tracked in the store.
+# uv is pinned here to the same version as the other three pins: Makefile UV_VERSION, the project
+# Dockerfile, and .github/workflows/trader_joe_testing.yml UV_VERSION. All four move together.
+# They have to: this is the uv on PATH for every agent in this image, the Makefile refuses to run
+# when the uv it finds is older than its pin, and an older uv silently rewrites uv.lock rather
+# than failing. Changing one pin without the other three breaks `make` here or diverges the lock.
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
     case "$arch" in \
-      amd64) target='x86_64-unknown-linux-gnu'; sum='4d6f84490da4b21bb6075ffc1c6b22e0cf37bc98d7cca8aff9fbb759093cdc23' ;; \
-      arm64) target='aarch64-unknown-linux-gnu'; sum='2094a3ead5a026a2f6894c4d3f71026129c8878939a57f17f0c8246a737bed1d' ;; \
+      amd64) target='x86_64-unknown-linux-gnu'; sum='23bf5552d220e0842b65c862097b2ebaeba0064b74eda5e565e77fd25969d8c8' ;; \
+      arm64) target='aarch64-unknown-linux-gnu'; sum='0804e9b164c64b6914182d5920c08551958a095986f10a3731056df701126436' ;; \
       *) echo "no uv checksum pinned for ${arch}" >&2; exit 1 ;; \
     esac; \
     curl -fsSL -o /tmp/uv.tar.gz \
-      "https://github.com/astral-sh/uv/releases/download/0.9.3/uv-${target}.tar.gz"; \
+      "https://github.com/astral-sh/uv/releases/download/0.12.19/uv-${target}.tar.gz"; \
     echo "${sum}  /tmp/uv.tar.gz" | sha256sum -c -; \
     tar -xzf /tmp/uv.tar.gz -C /tmp; \
     install -m 0755 "/tmp/uv-${target}/uv" /usr/local/bin/uv; \
@@ -106,6 +115,26 @@ COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 USER ${USERNAME}
+
+# Claude Code, installed by its native installer as the agent user rather than as root.
+#
+# This is what makes `claude` able to update itself inside a running container: the launcher at
+# ~/.local/bin/claude is a symlink into ~/.local/share/claude/versions/<version>/, and both are
+# owned by the user running Claude, so the updater swaps versions without sudo and without a
+# rebuild. PATH is set explicitly because the entrypoint execs its command — no login shell runs,
+# so the line the installer appends to ~/.bashrc is never sourced.
+#
+# The version argument is the STARTING point, not a ceiling: Claude updates past it in place. A
+# rebuild returns to this version, and .claude/workflow.yml's claude_code pin is what to bump.
+# To hold a version instead, set DISABLE_AUTOUPDATER=1 in compose.yml.
+#
+# Deliberately not a named volume over ~/.local/share/claude: Docker seeds an empty volume from
+# the image, but never re-seeds a populated one, so after a version bump the volume would still
+# hold the old payload while the image's launcher symlink pointed at a version that is not there.
+ENV PATH="/home/${USERNAME}/.local/bin:${PATH}"
+RUN curl -fsSL https://claude.ai/install.sh | bash -s 2.1.274 \
+    && claude --version
+
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["sleep", "infinity"]

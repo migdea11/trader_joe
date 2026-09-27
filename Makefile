@@ -12,7 +12,9 @@ help:  ## Show this help message
 		/^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
 
 # Matches the uv pinned by CI (.github/workflows) and the Dockerfile.
-UV_VERSION := 0.9.3
+# Floor is 0.9.17: below that, `exclude-newer = "7 days"` in pyproject.toml is not rejected,
+# it is silently ignored, and the install cooldown stops protecting anything.
+UV_VERSION := 0.12.19
 
 # Scopes lint/format/test to one component, e.g. `make test PATHS=common`.
 PATHS ?= .
@@ -34,7 +36,15 @@ $(VENV_MARKER): pyproject.toml uv.lock  ## Internal option to install uv and syn
 		if [ "$$oldest" = "$(UV_VERSION)" ]; then \
 			echo "Using uv $$found already on PATH"; \
 		else \
-			echo "Warning: uv $$found is older than the pinned $(UV_VERSION); upgrade it if a command fails"; \
+			echo "Error: uv $$found is older than the pinned $(UV_VERSION)."; \
+			echo "  An older uv does not merely fail to apply settings it does not know about --"; \
+			echo "  it RE-RESOLVES AND OVERWRITES uv.lock, reverting pinned versions and the"; \
+			echo "  install cooldown, while every command still exits 0. This was a warning until"; \
+			echo "  an agent's test run silently reverted a correct lock (tj-jon3d1)."; \
+			echo "  Install the pin:  curl -LsSf https://astral.sh/uv/$(UV_VERSION)/install.sh | sh"; \
+			echo "  Or, if uv is already installed:  uv self update $(UV_VERSION)"; \
+			echo "  (Agents cannot run the piped installer -- the isolation guard refuses '| sh'.)"; \
+			exit 1; \
 		fi; \
 	fi
 	@if [ ! -d .venv ]; then \
@@ -124,6 +134,27 @@ prod-down:  ## Stop the production stack
 .PHONY: migrate
 migrate:  ## Apply database migrations to the running production stack
 	./data/store/run_migrations.sh
+
+# READ-ONLY, and the approval for this target was conditional on staying that way: `current`
+# reads the alembic_version table, `history` reads the revision files, and neither writes
+# anything. Nothing may be added here that mutates -- a mutating step belongs behind its own
+# named target, the way `migrate` is.
+#
+# It exists because the hazard run_migrations.sh's header documents had no diagnostic: the code
+# that runs comes from the deployed image, the revisions that get applied come from whatever is
+# checked out, and the two can disagree silently. `current` says what the database actually has;
+# `history` says what this checkout would apply. Read together they answer "are these the same
+# thing", which no other command here could ask.
+#
+# Two runs of the same script rather than a second compose invocation, for every reason `migrate`
+# goes through it: the repo root, the pinned -f docker-compose.yaml (so the dev override cannot
+# swap in the dev image), the postgres check, and the empty-versions guard -- which matters most
+# here, since an empty versions/ is the wrong-checkout symptom this target is used to diagnose.
+# alembic has no one command for both, and each container is --rm, so the cost is one extra start.
+.PHONY: migrate-status
+migrate-status:  ## Report the applied revision and the revision history (read-only)
+	./data/store/run_migrations.sh current
+	./data/store/run_migrations.sh history
 
 .PHONY: dev-build
 dev-build: $(VENV_MARKER)  ## Build the development images (:dev)
@@ -222,10 +253,13 @@ lint-fix: $(VENV_MARKER)  ## Apply lint fixes and formatting (scope with PATHS=)
 	uv run ruff check --fix $(PATHS)
 	uv run ruff format $(PATHS)
 
+# semgrep scans '.', so it would also scan other agents' live worktrees under .claude/worktrees
+# (tj-aov3ip) -- half-edited copies of this repo. bandit needs no exclude: SOURCE_DIRS names
+# its roots explicitly and none of them contains .claude.
 .PHONY: security
 security: $(VENV_MARKER)  ## Check security vulnerabilities
 	uv run bandit -r $(SOURCE_DIRS) --exclude tests/
-	uv run semgrep --config=auto --exclude=tests/ --exclude=.venv --exclude=docker-compose.override.yaml .
+	uv run semgrep --config=auto --exclude=tests/ --exclude=.venv --exclude=docker-compose.override.yaml --exclude=.claude/worktrees .
 	uv export --all-groups --no-group dev --no-group testing --no-group security --locked --format requirements-txt > requirements.txt
 	# uv run safety scan --file requirements.txt
 	uv run pip-audit -r requirements.txt --disable-pip

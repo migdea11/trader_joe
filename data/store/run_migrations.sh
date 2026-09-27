@@ -1,7 +1,9 @@
 #! /bin/bash
 set -euo pipefail
 
-# Apply the data-store migrations to the running stack.
+# Run an alembic command against the data-store schema on the running stack.
+#
+# Usage: run_migrations.sh [alembic-command...]   (default: upgrade head)
 #
 # This is the single spelling of "apply the migrations": the make target and, later, the
 # deploy step call this script rather than repeating the compose invocation (tj-oiv075 —
@@ -18,9 +20,26 @@ set -euo pipefail
 # the revisions that get applied are whatever is checked out here, and the two can
 # disagree silently. Run this from a checkout that matches the running image. Shipping the
 # revisions inside the image is a build-infra change, not this script's job — tj-y3sj8x.
+#
+# THE ALEMBIC COMMAND IS AN ARGUMENT because that silent disagreement needs a diagnostic, and
+# the diagnostic wants every check below unchanged: the repo root, the pinned compose file, the
+# postgres check, and above all the empty-versions guard, since `alembic history` reads the same
+# bind-mounted revision files whose absence is the symptom being looked for. `make migrate-status`
+# passes the read-only commands (`current`, `history`); a second compose invocation elsewhere is
+# exactly what this script's existence is meant to prevent (tj-4yvsb2). The default is
+# `upgrade head`, so callers that pass nothing — `make migrate`, the deploy step — are unchanged.
+# Nothing here validates the command: this is the plumbing, and it is the CALLER that promises
+# read-only. Anything mutating still belongs behind a named, reviewed target.
 
 REPO_ROOT="$(realpath "$(dirname "$0")/../..")"
 MIGRATION_DIR="$REPO_ROOT/data/store/migrations/versions"
+
+# "$@" is exempt from `set -u` when empty, so this is safe with no arguments; the array is
+# never empty afterwards, which keeps the expansions below safe too.
+ALEMBIC_ARGS=("$@")
+if [ ${#ALEMBIC_ARGS[@]} -eq 0 ]; then
+    ALEMBIC_ARGS=(upgrade head)
+fi
 
 # Compose resolves the compose file, .env and every bind-mount source against the project
 # directory, and derives the default project name from it. Run from anywhere else, this
@@ -33,7 +52,7 @@ cd "$REPO_ROOT"
 # the dev image; migrations belong against the production service definition.
 COMPOSE=(docker compose -f docker-compose.yaml)
 
-echo "Applying migrations from $MIGRATION_DIR"
+echo "Running 'alembic ${ALEMBIC_ARGS[*]}' against the revisions in $MIGRATION_DIR"
 
 if [ ! -d "$MIGRATION_DIR" ]; then
     echo "Migration directory does not exist: $MIGRATION_DIR" >&2
@@ -67,4 +86,4 @@ fi
 # path because the image sets CMD and not ENTRYPOINT: an argv here replaces entrypoint.sh
 # rather than appending to it. `run` publishes no ports, so this cannot collide with the
 # data_store container already serving traffic.
-"${COMPOSE[@]}" run --rm --no-deps data_store /code/.venv/bin/alembic upgrade head
+"${COMPOSE[@]}" run --rm --no-deps data_store /code/.venv/bin/alembic "${ALEMBIC_ARGS[@]}"

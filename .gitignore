@@ -39,3 +39,6 @@ coverage.xml
 
 # Per-machine Claude Code settings: local permission overrides, never shared
 /.claude/settings.local.json
+
+# Agent git worktrees (tj-aov3ip): each is a separate checkout, never content of this one
+/.claude/worktrees/

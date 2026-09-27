@@ -10,6 +10,9 @@ Dockerfile
 .env
 **/.env
 
+# Agent git worktrees (tj-aov3ip): whole extra copies of the repo, and half-edited ones
+.claude/worktrees/
+
 # Virtual environment
 .venv/
 .venv_init

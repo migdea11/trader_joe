@@ -1,3 +1,4 @@
+<!-- LOCALLY AMENDED 2026-09-22: architect gate step (tj-rk0w5i), test ownership (tj-8fxxfb), worktrees (tj-aov3ip). `update` flags this file rather than overwriting it; promote upstream later. -->
 # trader_joe — Agent Context
 
 > Do not guess. If you need more information, ask for it.
@@ -8,26 +9,34 @@
 ## Pipeline
 
 ```
-architect plans → (user approves) → builder → [validator ∥ next builder] → … → validator signs off
+architect plans → (user approves) → builder → validator → architect (tests vs design) → validator closes
 ```
 
 1. Work request → orchestrator launches the **architect** to plan.
 2. The architect emits a task graph in the store. State lives there, not in chat.
 3. On approval, the orchestrator queries `bd ready --label assignee:<role>` and spawns the owner.
 4. Builder finishes → sets in-review → orchestrator launches its **validator** and the next
-   builder in parallel, when their file scopes don't overlap.
-5. CHANGES NEEDED → back to in-progress with an `RE:` comment. ESCALATE → stop, ask the user.
-6. The **scribe** runs at feature completion, not per task.
+   builder in parallel, when their file scopes don't overlap. Every agent that writes code runs
+   in its own worktree (ADR tj-aov3ip), so parallel work never shares a tree.
+5. Validator PASS → it leaves the bead in-review with `pending-from:architect` and a verdict note
+   naming the commit SHA and the design it checked against. The orchestrator then launches the
+   **architect** gate step: do the tests match the design, and where no test was written, was that
+   right? Architect PASS → `pending-from:validator`, and the validator closes. Skip the architect
+   step only for comment-only and other non-functional changes — docs, comments, formatting,
+   whitespace; any diff that touches a test is functional (ADR tj-rk0w5i).
+6. CHANGES NEEDED → back to in-progress with an `RE:` comment, routed to the validator when a test
+   is wrong and to the builder when the code departs from the design. ESCALATE → stop, ask the user.
+7. The **scribe** runs at feature completion, not per task.
 
 ## Agents
 
 | Agent | Role | Scope |
 |---|---|---|
-| architect | plans, never edits | reads everything |
+| architect | plans, never edits; gates tests against the design | reads everything |
 | builder-ingest | builder | `data/ingest`, `routers/data_ingest` |
 | builder-store | builder | `data/store`, `routers/data_store` |
 | builder-shared | builder | `common`, `schemas`, `routers/common`, build + CI files |
-| validator | quality gate, only role that closes work | `common/tests` |
+| validator | quality gate, default test author, only role that closes work | all `tests/` directories |
 | scribe | docs, at feature completion | all doc tiers |
 | researcher-broker | read-only research | broker and market-data APIs |
 

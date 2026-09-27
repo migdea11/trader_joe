@@ -27,7 +27,7 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 import schemas.data_ingest
-from common.enums.data_stock import ExpiryType, UpdateType
+from common.enums.data_stock import ExpiryType, Feed, UpdateType
 from schemas.data_ingest.get_dataset_request import (
     BaseGetDatasetRequest,
     CryptoDatasetRequest,
@@ -50,8 +50,21 @@ WHEN = datetime(2026, 1, 1, tzinfo=UTC)
 
 # Every field on BaseGetDatasetRequest is required, `end` included -- it is `datetime | None` with
 # no default, so the key must be present even when the value is null.
+#
+# `owner` is CARRIED THROUGH from the store request rather than originating here, and it is
+# required because it is identity on the dataset entry (tj-vhboky.1 section 2): the fetch may not
+# invent a principal.
+#
+# NO `feed` KEY, and this list changed to remove one. An earlier revision carried `'feed': 'IEX'`
+# and a comment claiming feed had no default here because "by the time a fetch is dispatched the
+# tape has been decided". That was wrong in both halves by 77f3a6c. The field is now
+# `Feed | None = None`, so it is not required and including it here would put a key in the
+# minimal payload that test_model_rejects_empty_payload then expects in the missing-set. What it
+# actually is -- declared, optional and INERT -- is pinned by its own test below rather than by a
+# fixture key that reads as "required".
 _BASE_PAYLOAD: dict[str, Any] = {
     'dataset_id': DATASET_ID,
+    'owner': 'rebalancer',
     'source': 'ALPACA',
     'granularity': '1day',
     'start': WHEN,
@@ -62,8 +75,10 @@ _BASE_PAYLOAD: dict[str, Any] = {
 }
 
 # The asset fields the three concrete request shapes add. StockDatasetRequest re-declares
-# asset_symbol and data_types and sets `extra = 'ignore'` with a comment about ignoring
-# asset_type, but asset_type is inherited and still REQUIRED -- the payload proves it.
+# asset_symbol and data_types; asset_type is inherited and still REQUIRED -- the payload proves
+# it. It also USED to set `extra = 'ignore'` with a comment about ignoring asset_type, which never
+# did that: asset_type was already a declared field, so the override only ever relaxed the model
+# against genuinely unknown keys. 32438a9 removed it rather than repairing it.
 _ASSET_PAYLOAD: dict[str, Any] = {'asset_symbol': 'VFV', 'asset_type': 'stock', 'data_types': ['market-activity']}
 
 # Every public model in the package, with a minimal valid payload. Minimal means: every required
@@ -163,3 +178,65 @@ def test_model_rejects_empty_payload(model: type[BaseModel], payload: dict[str, 
         model()
     missing = {str(error['loc'][0]) for error in excinfo.value.errors() if error['type'] == 'missing'}
     assert missing == set(payload)
+
+
+@pytest.mark.parametrize(('model', 'payload'), CONSTRUCT_CASES, ids=_case_id)
+def test_model_rejects_an_unknown_field(model: type[BaseModel], payload: dict[str, Any]):
+    """Every request shape here is RECEIVED, so every one rejects a field it does not declare.
+
+    These models are the far end of the store->ingest Kafka RPC, which makes them the exact case
+    ``schemas/inbound_contract.py`` was written for (32438a9, tj-vhboky.1 ruling of 2026-09-25):
+    an internal sender still putting a field on the wire after the contract dropped it used to
+    succeed silently. ``StockDatasetRequest`` was the worst of them -- it carried an explicit
+    ``extra = 'ignore'`` override, so it relaxed the guarantee for the three concrete shapes that
+    inherit from it.
+
+    Args:
+        model: The model class.
+        payload: Its minimal valid payload, which this adds one unknown key to.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        model(**payload | {'a_field_no_contract_declares': 1})
+    errors = excinfo.value.errors()
+    assert [error['loc'] for error in errors] == [('a_field_no_contract_declares',)]
+    assert [error['type'] for error in errors] == ['extra_forbidden']
+
+
+def test_the_request_feed_is_declared_optional_and_is_read_by_nothing():
+    """Pin feed here as DECLARED BUT INERT, which is neither "required" nor "gone".
+
+    It is a landing site, not a working field, and both halves need pinning because each alone
+    reads as the opposite of the truth:
+
+      OPTIONAL     ``Feed | None = None``. tj-rh4b7f (2026-09-25) deferred caller-selected feed,
+                   so ``StoreAssetDatasetBody`` has no feed to forward and the store's
+                   ``model_dump()`` splat leaves this at its default. A required field here would
+                   make every dispatch fail today.
+      READ BY
+      NOTHING      The one resolution site in data/ingest consults a deployment env var and never
+                   the request. A request naming a tape is accepted and ignored -- which is
+                   precisely the failure the strict base above exists to prevent, arriving through
+                   a declared field rather than past one.
+
+    THE SECOND HALF IS PINNED IN data/ingest/tests/test_broker_api.py, not here, by driving the
+    adapter with a request that names SIP against a deployment configured for IEX and watching the
+    vendor call get IEX anyway. A schemas test can only assert the declaration; asserting "nothing
+    reads it" from this layer would mean grepping the adapter's source, which passes on a rename
+    and would import data/ingest into a schemas test to do it.
+
+    The field survives anyway because it is the designated landing site for the deferred transport
+    work: it is the store->ingest channel a feed would be resolved over.
+    """
+    field = BaseGetDatasetRequest.model_fields['feed']
+    assert not field.is_required()
+    assert field.default is None
+    assert BaseGetDatasetRequest(**_BASE_PAYLOAD).feed is None
+
+    # Declared, so a caller naming a tape is ACCEPTED rather than rejected as an unknown field.
+    # This is the one thing that distinguishes "inert" from "gone", and it is what makes the
+    # deferred transport work an ingest-side change rather than a contract change.
+    assert BaseGetDatasetRequest(**_BASE_PAYLOAD | {'feed': 'SIP'}).feed is Feed.SIP
+
+    # And it is a value the SHARED enum can express -- a second Feed enum declared anywhere would
+    # compare unequal to this one and fail only at runtime.
+    assert Feed.SIP in set(Feed)

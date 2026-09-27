@@ -1,15 +1,36 @@
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel
-
 from common.enums.data_select import AssetType, DataType
-from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateType
+from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
+from schemas.inbound_contract import InboundContract
 
 
-class BaseGetDatasetRequest(BaseModel):
+class BaseGetDatasetRequest(InboundContract):
     dataset_id: UUID
+    # Carried through from the store request so the fetch knows which principal it is acting for
+    # and which tape to ask the vendor for. owner is identity on the entry (tj-vhboky.1 section 2)
+    # and may not be invented here.
+    owner: str
     source: DataSource
+    # KEPT, BUT INERT TODAY, AND THE COMMENT THAT USED TO SIT HERE OVERSTATED IT. It claimed this
+    # was "the only model where that optionality is meant to end" -- that the adapter would take
+    # the caller's selection when there is one. NOTHING IN data/ingest READS THIS FIELD. The one
+    # resolution site (alpaca/broker_api.py, `'sip' if sip_enabled() else 'iex'`) consults a
+    # deployment env var and never the request, so a request naming a tape is accepted and
+    # ignored -- exactly the failure schemas/inbound_contract.py exists to prevent, arriving
+    # through a field rather than past one.
+    #
+    # WHY IT SURVIVES ANYWAY, while StoreAssetDatasetBody.feed did not: nothing can populate it
+    # now. tj-rh4b7f (2026-09-25) deferred caller-selected feed, so the store body has no feed to
+    # forward and data_action_request.py's model_dump() splat leaves this at its default. This is
+    # the store->ingest channel the deferred transport work resolves a feed OVER, so it is the
+    # designated landing site rather than dead weight. It stays declared and honestly described;
+    # it does not stay described as working.
+    #
+    # It cannot be resolved from the vendor's answer either: Alpaca's bars response has no feed
+    # field at any level, so the ruling's middle branch does not exist for the one vendor there is.
+    feed: Feed | None = None
 
     granularity: Granularity
     start: datetime
@@ -31,9 +52,11 @@ class StockDatasetRequest(GetDatasetRequest):
     asset_symbol: str
     data_types: list[DataType]
 
-    class Config:
-        # ignore asset_type
-        extra = 'ignore'
+    # This carried `extra = 'ignore'` with the comment "ignore asset_type", which never did that:
+    # asset_type is a DECLARED field inherited from GetDatasetRequest, so it was already accepted
+    # and the override only ever relaxed the model against genuinely unknown keys. It is removed
+    # rather than repaired -- the router builds this from GetDatasetRequest.model_dump(), whose
+    # keys are exactly this model's fields, so there is nothing for it to have been ignoring.
 
 
 class CryptoDatasetRequest(StockDatasetRequest):

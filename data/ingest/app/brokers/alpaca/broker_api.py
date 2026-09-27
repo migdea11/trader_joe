@@ -2,6 +2,7 @@ import asyncio
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
+from alpaca.data.enums import DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.models.bars import Bar, BarSet
 from alpaca.data.models.quotes import Quote
@@ -14,9 +15,8 @@ from alpaca.data.requests import (
     StockTradesRequest,
 )
 
-from common.data_lifecyle import expiry_inc
 from common.enums.data_select import AssetType, DataType
-from common.enums.data_stock import DataSource, Granularity
+from common.enums.data_stock import DataSource, Feed, Granularity
 from common.environment import get_env_var
 from common.logging import get_logger
 from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
@@ -27,7 +27,6 @@ from data.ingest.app.brokers.single_flight import SingleFlight
 from schemas.data_ingest.get_dataset_request import StockDatasetRequest
 from schemas.data_store.stock.market_activity_data import (
     BatchStockDataMarketActivityCreate,
-    StockDataMarketActivityCreate,
     StockDataMarketActivityData,
 )
 
@@ -36,6 +35,9 @@ log = get_logger(__name__)
 
 # The bars request never sets an adjustment, so every bar we hold is the vendor's raw one.
 # Named here because it is part of the request key: a raw bar is not a split-adjusted one.
+# This is the design, not an accident of how the request happens to be built: ADR tj-vhboky.1
+# section 6 rules that bars are stored raw and immutable, with adjustment applied on read
+# against an events table that is not built yet. Do not "fix" this by passing an adjustment.
 ALPACA_ADJUSTMENT = 'raw'
 
 ALPACA_CREDENTIAL_VARS = ('ALPACA_API_KEY', 'ALPACA_API_SECRET')
@@ -56,6 +58,34 @@ def sip_enabled() -> bool:
         bool: True when ALPACA_SIP_ENABLED is set to a true value.
     """
     return get_env_var('ALPACA_SIP_ENABLED', default=False, cast_type=bool)
+
+
+def resolve_feed() -> Feed:
+    """Resolve the tape this deployment is entitled to, once, for a whole fetch.
+
+    THE SINGLE RESOLUTION SITE (tj-rh4b7f, 2026-09-25 ruling; tj-vhboky.9 part B). Both the
+    single-flight request key and the batch stamped onto every bar must agree, so this is the
+    only place ALPACA_SIP_ENABLED is read for that purpose -- callers take the return value
+    rather than re-deriving it, which is what stops the key and the batch silently drifting
+    apart.
+
+    WHAT THIS RECORDS, SAID PLAINLY RATHER THAN PAPERED OVER: this is an assertion about the
+    ACCOUNT ("which tape is this deployment entitled to"), not an observation of the response
+    ("which tape actually served this call"). NO CALLER CAN SELECT A FEED today (the ruling
+    above defers that to the gRPC transport work), and Alpaca's bars response carries no feed
+    field at any level to read the served tape back off of (researcher-broker, confirmed on two
+    independent reads) -- so there is no vendor confirmation to fall back to even if there were
+    a caller selection to try first. The value below is passed to the vendor call as its own
+    `feed` parameter (get_market_stock_data), which is the best available assurance that the
+    entitled tape and the requested tape are the same one; it is still not proof that the tape
+    which answered matches, since a lapsed or misconfigured entitlement would make this value
+    wrong in a way nothing here can detect.
+
+    Returns:
+        Feed: Feed.SIP when this deployment is entitled to the consolidated tape,
+            else Feed.IEX.
+    """
+    return Feed.SIP if sip_enabled() else Feed.IEX
 
 
 def get_client() -> StockHistoricalDataClient:
@@ -111,36 +141,33 @@ def get_rate_budget() -> RateBudget:
     return __RATE_BUDGET
 
 
-def convert_bar_to_schema(data: Bar) -> StockDataMarketActivityCreate:
+def convert_bar_to_schema(data: Bar) -> StockDataMarketActivityData:
+    # split_factor and dividends_factor are gone (tj-vhboky.1 section 6): bars are stored RAW,
+    # never corrected, and adjustment is applied on read against the events table. Sending them
+    # is not merely redundant, it is the case the strict InboundContract was adopted to catch --
+    # see StockDataMarketActivityData's docstring.
     return StockDataMarketActivityData(
-        open=data.open,
-        high=data.high,
-        low=data.low,
-        close=data.close,
-        volume=data.volume,
-        trade_count=data.trade_count,
-        split_factor=1,
-        dividends_factor=1,
+        open=data.open, high=data.high, low=data.low, close=data.close, volume=data.volume, trade_count=data.trade_count
     )
 
 
 def convert_bars_to_batch_schema(
     batch_response: BatchStockDataMarketActivityCreate, request: StockDatasetRequest, stock_bars: BarSet
-) -> list[StockDataMarketActivityCreate]:
+) -> None:
     stock_symbol = request.asset_symbol
     if stock_symbol not in stock_bars.data:
         log.warning(f'Symbol {stock_symbol} not found in bar set')
-        return []
+        return
 
-    latest_expiry = request.expiry
     bars: list[Bar] = (
         stock_bars[stock_symbol] if isinstance(stock_bars[stock_symbol], list) else [stock_bars[stock_symbol]]
     )
 
     log.debug(f'bars: {len(bars)}')
     for bar in bars:
-        batch_response.append_data(DataType.MARKET_ACTIVITY, convert_bar_to_schema(bar), bar.timestamp, latest_expiry)
-        latest_expiry = expiry_inc(latest_expiry, request.expiry_type, request.granularity)
+        # No per-bar expiry: the lifetime moved to the dataset entry (tj-vhboky.1 section 6),
+        # which is upserted before ingest is ever called, so nothing at this level carries one.
+        batch_response.append_data(DataType.MARKET_ACTIVITY, convert_bar_to_schema(bar), bar.timestamp)
 
 
 def create_stock_quote(data: Quote, symbol: str, granularity: Granularity, source: DataSource) -> None:
@@ -179,21 +206,27 @@ async def fetch_data_type(
     data_type: DataType,
     latest: bool,
     params: dict,
+    feed: Feed,
     client: StockHistoricalDataClient | None = None,
 ):
     """Fetch one data type from the vendor, collapsed and rate-limited.
 
     Concurrent callers asking for the same content share one vendor call; the extra ones
     attach to it and nothing is retained afterwards (tj-84ty47 section 6). The shared value
-    is the vendor's own response, which every caller then converts with ITS OWN dataset_id
-    and expiry -- collapsing the conversion too would hand one caller another's dataset_id.
+    is the vendor's own response, which every caller then converts with ITS OWN dataset_id --
+    collapsing the conversion too would hand one caller another's dataset_id.
 
     Args:
         executor (ThreadPoolExecutor): Pool the blocking SDK call runs on.
         request (StockDatasetRequest): Request being served.
         data_type (DataType): Data type to fetch.
         latest (bool): Whether the latest-value endpoint is being used.
-        params (dict): Vendor request parameters.
+        params (dict): Vendor request parameters. Already carries this call's resolved
+            `feed`, put there by get_market_stock_data so every vendor call in the batch
+            asks for the same tape the key and the batch record.
+        feed (Feed): This call's resolved tape (resolve_feed()), taken as a parameter
+            rather than re-read here so the key can never disagree with the batch that
+            get_market_stock_data stamps from the same value.
         client (StockHistoricalDataClient | None): Client to call, or None for this
             process's own (see get_client()).
 
@@ -205,7 +238,11 @@ async def fetch_data_type(
     )
     key = VendorRequestKey(
         broker=DataSource.ALPACA_API,
-        feed='sip' if sip_enabled() else 'iex',
+        # Lowercase, matching the vendor's own wire values ('iex'/'sip', see DataFeed) rather
+        # than the contract's uppercase Feed members -- this key is never stored or compared
+        # against the schema, only against itself, and the vendor call above the key was
+        # already stamped from this same lowercase form.
+        feed=feed.value.lower(),
         asset_type=AssetType.STOCK,
         asset_symbol=request.asset_symbol,
         data_type=data_type,
@@ -247,12 +284,22 @@ async def get_market_stock_data(
     # Resolved once, before any task is spawned, so a missing credential fails here with a
     # named variable rather than inside a gathered task whose errors are swallowed below.
     client = client if client is not None else get_client()
+    # Resolved once for the whole fetch and threaded through explicitly (fetch_data_type's
+    # key, the vendor params below, and the batch stamped at the end of this function) rather
+    # than re-read from sip_enabled() at each site -- that duplication is what let the batch go
+    # unstamped before (tj-vhboky.9). A single deployment has exactly one active tape at a time
+    # (tj-rh4b7f), so one resolution per call is correct, not merely convenient.
+    feed = resolve_feed()
     granularity = AlpacaGranularity.from_granularity(request.granularity).broker_code
     params = {
         'symbol_or_symbols': request.asset_symbol,
         'timeframe': granularity,
         'start': request.start.isoformat(),
         'end': request.end.isoformat() if request.end is not None else None,
+        # Sent to the vendor so the entitled tape is the one actually requested, rather than
+        # whatever Alpaca defaults to in feed's absence -- without this, resolve_feed() only
+        # ever affected the local key and the label stamped on the bar, never the vendor call.
+        'feed': DataFeed(feed.value.lower()),
     }
     log.debug(f'params: {params}')
 
@@ -268,7 +315,7 @@ async def get_market_stock_data(
             log.warning(f'Duplicate data type found: {data_type}')
             continue
 
-        tasks.append(fetch_data_type(executor, request, data_type, latest, params, client))
+        tasks.append(fetch_data_type(executor, request, data_type, latest, params, feed, client))
         response_map[data_type] = len(tasks) - 1
 
     try:
@@ -283,6 +330,12 @@ async def get_market_stock_data(
         asset_symbol=request.asset_symbol,
         source=request.source,
         granularity=request.granularity,
+        # THE FEED RECORDED HERE IS THE REQUESTED ONE, NOT A CONFIRMED SERVED ONE (tj-vhboky.9
+        # part B, tj-rh4b7f). Alpaca's bars response has no feed field at any level to read an
+        # answered tape back off of, so the ruling's "else what the vendor response reports"
+        # branch does not exist for this vendor -- resolve_feed()'s value is recorded because it
+        # is the only value there is, not because it has been confirmed against the response.
+        feed=feed,
         dataset={},
     )
     if DataType.MARKET_ACTIVITY in response_map:

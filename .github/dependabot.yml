@@ -42,6 +42,24 @@
 # security updates plus pip-audit/safety in CI until someone confirms uv support
 # against this layout empirically. Do NOT substitute a `pip` entry: it would resolve
 # from pyproject.toml/requirements and fight the lockfile uv actually installs from.
+#
+# COOLDOWN (tj-cg2i9p). Every entry below sets one, and the reason is the same one that
+# put the SHA pins in the workflow: the dangerous window for a supply-chain compromise is
+# the hours immediately after a malicious version is published, before anyone has noticed
+# and yanked it. A bot that proposes a version the moment it appears is a machine for
+# walking straight into that window -- and because these pull requests are grouped and
+# routine, the proposal is the thing most likely to be merged without a close read.
+# Waiting lets the ecosystem find the bad release first.
+#
+# `default-days: 7` matches the `exclude-newer` cooldown that governs uv's own resolution,
+# so the bot cannot propose something the package manager would itself refuse to resolve.
+# Majors wait longer: they are the updates that need a human to read a changelog anyway,
+# so there is no cost to letting them settle.
+#
+# WHAT THIS DOES NOT DELAY: Dependabot SECURITY updates. Those come from an advisory
+# rather than from a version appearing, they open their own ungrouped pull requests, and
+# the cooldown does not apply to them. The whole point is to slow down ROUTINE version
+# churn without slowing down the response to a known vulnerability.
 version: 2
 
 updates:
@@ -54,6 +72,16 @@ updates:
   #
   # Tracks, today: actions/checkout, astral-sh/setup-uv, pyupio/safety-action,
   # docker/login-action, actions/upload-artifact, actions/download-artifact.
+  #
+  # THIS ENTRY IS WHAT KEEPS THE SHA PINS ALIVE (tj-cg2i9p). Every `uses:` in
+  # .github/workflows/ is now pinned to a 40-character commit SHA with a trailing
+  # `# vX.Y.Z` comment. Dependabot handles that form natively: it reads the comment to
+  # learn which release the SHA represents, and when a newer release exists it rewrites
+  # the SHA and the comment together. Without this entry the pins would never move --
+  # a frozen action is the failure mode pinning trades into, and the one the file header
+  # above was written to pre-empt. The two halves only work as a pair: do not remove
+  # this entry while the workflow is pinned, and do not un-pin the workflow because the
+  # pins "never change".
   # ---------------------------------------------------------------------------
   - package-ecosystem: github-actions
     directory: /
@@ -62,6 +90,9 @@ updates:
       day: monday
       time: "09:00"
       timezone: America/Toronto
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
     open-pull-requests-limit: 5
     commit-message:
       # Matches the repo's conventional-commit types. Dependabot writes its own
@@ -97,6 +128,9 @@ updates:
       day: monday
       time: "09:00"
       timezone: America/Toronto
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
     open-pull-requests-limit: 3
     commit-message:
       prefix: build
@@ -146,6 +180,9 @@ updates:
       day: monday
       time: "09:00"
       timezone: America/Toronto
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
     open-pull-requests-limit: 3
     commit-message:
       prefix: build

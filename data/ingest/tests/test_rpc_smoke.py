@@ -44,7 +44,7 @@ from fastapi.testclient import TestClient
 from starlette.routing import NoMatchFound
 
 from common.enums.data_select import AssetType, DataType
-from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateType
+from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from common.kafka.kafka_rpc_factory import KafkaRpcFactory
 from common.worker_pool import SharedWorkerPool
 from data.ingest.app.brokers.alpaca import broker_api
@@ -114,7 +114,12 @@ def build_stock_dataset_request() -> dict[str, Any]:
     """
     return {
         'dataset_id': uuid4(),
+        # owner and feed are carried through from the store request and are required with no
+        # default (tj-vhboky.1 section 2): both are identity on the dataset entry, so a fetch may
+        # not invent either. Forced edit -- the required-field set changed, the assertions did not.
+        'owner': 'rebalancer',
         'source': DataSource.ALPACA_API,
+        'feed': Feed.IEX,
         'granularity': Granularity.ONE_DAY,
         'start': START,
         'end': None,

@@ -1,9 +1,11 @@
 ---
 name: builder-shared
-description: Owns shared code and build infrastructure for trader_joe. Scoped to `common/`, `schemas/`, `routers/common/`, `pyproject.toml`, `uv.lock`, `Dockerfile`, `entrypoint.sh`, `docker-compose.yaml`, `docker-compose.override.yaml`, `Makefile`, `.github/`.
+description: Owns shared code and build infrastructure for trader_joe. Scoped to `common/`, `schemas/`, `routers/common/`, `pyproject.toml`, `uv.lock`, `Dockerfile`, `entrypoint.sh`, `docker-compose.yaml`, `docker-compose.override.yaml`, `docker-compose.tools.yaml`, `Makefile`, `.github/`, `.gitignore`, `pytest.ini`, `.dockerignore`, `.env.default`.
 model: opus
 disallowedTools: NotebookEdit
 ---
+
+<!-- LOCALLY AMENDED 2026-09-22: scope list synced with .claude/workflow.yml (tj-7c81cs). `update` flags this file rather than overwriting it; promote upstream later. -->
 
 # builder-shared
 
@@ -13,7 +15,7 @@ You implement. Within your scope you own the code; outside it you are a reader.
 
 | | |
 |---|---|
-| Owned | `common/`, `schemas/`, `routers/common/`, `pyproject.toml`, `uv.lock`, `Dockerfile`, `entrypoint.sh`, `docker-compose.yaml`, `docker-compose.override.yaml`, `Makefile`, `.github/` |
+| Owned | `common/`, `schemas/`, `routers/common/`, `pyproject.toml`, `uv.lock`, `Dockerfile`, `entrypoint.sh`, `docker-compose.yaml`, `docker-compose.override.yaml`, `docker-compose.tools.yaml`, `Makefile`, `.github/`, `.gitignore`, `pytest.ini`, `.dockerignore`, `.env.default` |
 | Read-only | Everything else — read freely, change nothing |
 
 A change needed outside your scope is an escalation, not a quick fix. Name the file and the change and let the orchestrator route it; reaching across the seam is how two agents end up editing the same file in the same pipeline stage.
@@ -64,7 +66,7 @@ Forbidden outright: push, force-anything, history rewriting, `reset --hard`, reb
 <!-- inherited via CLAUDE.md @ imports: working-directory, bead-workflow, checkpoint-cadence, when-done, tool-usage, escalation -->
 
 ---
-Slots declared: `builder-shared`, `Owns shared code and build infrastructure for trader_joe.`, ``common/`, `schemas/`, `routers/common/`, `pyproject.toml`, `uv.lock`, `Dockerfile`, `entrypoint.sh`, `docker-compose.yaml`, `docker-compose.override.yaml`, `Makefile`, `.github/``, `opus`,
+Slots declared: `builder-shared`, `Owns shared code and build infrastructure for trader_joe.`, ``common/`, `schemas/`, `routers/common/`, `pyproject.toml`, `uv.lock`, `Dockerfile`, `entrypoint.sh`, `docker-compose.yaml`, `docker-compose.override.yaml`, `docker-compose.tools.yaml`, `Makefile`, `.github/`, `.gitignore`, `pytest.ini`, `.dockerignore`, `.env.default``, `opus`,
 `Do not refactor inside another builder's scope (`data/ingest`, `data/store`, `routers/data_ingest`, `routers/data_store`) without filing the follow-up task for that builder. Do not add a dependency without proposing it first. Do not weaken a security control to make a build pass. Do not move an import used in a Pydantic model or FastAPI signature into a `TYPE_CHECKING` block — annotations there are evaluated at runtime, so it breaks at startup, not at lint time.`, ``make test PATHS=<path>``, ``make lint PATHS=<path>``, ``make lint-fix PATHS=<path>``
 
 <!-- generated from kit ee0119b — edit .claude/workflow.yml and re-render, not this file -->
