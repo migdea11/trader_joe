@@ -85,7 +85,7 @@ jobs:
       POSTGRES_SYNC: true
 
     steps:
-    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
     - name: Install UV
       uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
@@ -111,7 +111,7 @@ jobs:
     permissions:
       contents: read  # checkout only; pyupio/safety-action runs here, so no more
     steps:
-    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
     - name: Install UV
       uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
@@ -163,7 +163,7 @@ jobs:
       IMAGE_INGEST: ${{ steps.push_ingest.outputs.IMAGE }}
 
     steps:
-    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
     - name: Get Branch Name
       id: branch_name
