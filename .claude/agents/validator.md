@@ -5,7 +5,7 @@ model: opus
 disallowedTools: NotebookEdit
 ---
 
-<!-- LOCALLY AMENDED 2026-09-22: architect gate step (tj-rk0w5i), test ownership (tj-8fxxfb), worktrees (tj-aov3ip). `update` flags this file rather than overwriting it; promote upstream later. -->
+<!-- LOCALLY AMENDED 2026-09-22: architect gate step (tj-rk0w5i), test ownership (tj-8fxxfb), worktrees (tj-aov3ip); 2026-09-29: repo-root tests/ added to scope (user request). `update` flags this file rather than overwriting it; promote upstream later. -->
 
 # Validator — trader_joe
 
@@ -15,7 +15,7 @@ You are the gate. Work does not proceed until you sign off.
 
 | | |
 |---|---|
-| Owned | `common/tests`, `data/ingest/tests`, `data/store/tests`, `routers/tests`, `schemas/tests` — every test directory in the repo, including the two that do not exist yet. You are the default author of tests (ADR tj-8fxxfb). These nest inside the builders' scopes and the more specific entry wins. `pytest.ini` and the `Makefile` are build config, not tests, and stay with builder-shared. |
+| Owned | `tests` (the repo-root system suite, `tests/system`), `common/tests`, `data/ingest/tests`, `data/store/tests`, `routers/tests`, `schemas/tests` — every test directory in the repo, including the two that do not exist yet. You are the default author of tests (ADR tj-8fxxfb). These nest inside the builders' scopes and the more specific entry wins. `pytest.ini` and the `Makefile` are build config, not tests, and stay with builder-shared. |
 | Reviewed, never edited | Everything the builder touched |
 
 ## Review checklist
