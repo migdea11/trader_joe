@@ -16,6 +16,7 @@ from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateType
 from common.enums.pydantic_enums import NamedIntEnum
 from common.logging import get_logger
+from common.sensitive import OptionalSensitiveStr, SensitiveStr
 from routers.data_store.app_endpoints import ASSET_DATASET_ID_DESC, ASSET_TYPE_DESC, DATA_TYPE_DESC, SYMBOL_DESC
 from schemas.inbound_contract import InboundContract
 
@@ -82,7 +83,11 @@ class StoreAssetDatasetBody(InboundContract):
     # problem owner-scoped writes exist to prevent. Note what this does and does not buy -- the
     # single instance secret authenticates THE DEPLOYMENT, not the caller, so "only the owner may
     # edit" is enforced against MISTAKES, not against anyone holding the key.
-    owner: str
+    #
+    # Sensitive (tj-vhboky.45): left out of the repr and str of this model and every model that
+    # inherits it, so validate_fields' debug line below does not log it. model_dump and JSON are
+    # unchanged -- see common/sensitive.py for what is and is not guarded.
+    owner: SensitiveStr
 
     source: DataSource
 
@@ -171,8 +176,9 @@ class StoreAssetDatasetPath(InboundContract):
 class StoreAssetDatasetQuery(InboundContract):
     # Same as body, but with optional fields. Optional is correct HERE and wrong on the body:
     # this is a search filter, where an absent field means "no constraint on that column", not a
-    # value written into an identity column.
-    owner: str | None = None
+    # value written into an identity column. Sensitive: OptionalSensitiveStr, never
+    # `SensitiveStr | None`, which silently keeps the value in the repr (common/sensitive.py).
+    owner: OptionalSensitiveStr = None
     source: DataSource | None = None
     # No feed filter, for the same reason the body has no feed field: there is no feed column on
     # store_dataset_entry to filter (tj-rh4b7f). Here it was not merely inert, it was a live
@@ -256,7 +262,9 @@ class AssetDatasetStoreDelete(InboundContract):
     #
     # The status codes are not set here: delete_data in routers/data_store/asset_dataset_store.py
     # maps OwnerMismatch to 403 and EntryNotFound to 404, so an owner-less delete is a 403.
-    owner: str | None = None
+    #
+    # Sensitive (tj-vhboky.45): out of the repr and str, unchanged in model_dump (common/sensitive.py).
+    owner: OptionalSensitiveStr = None
 
 
 class AssetDatasetStore(AssetDatasetStoreUpdate):
