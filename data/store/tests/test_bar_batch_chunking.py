@@ -23,6 +23,19 @@ compiler is what makes bind_params_per_row()'s derivation a tested claim rather 
 re-running its own column comprehension inside a test would only prove the comprehension agrees
 with itself.
 
+THE CEILING CHANGED, AND WHY THE OLD ONE WAS WRONG (tj-vhboky.69). This file first pinned the
+ceiling as 65,535 // 12 = 5461 rows: POSTGRES_MAX_BIND_PARAMETERS, the server's int16 cap on bind
+parameters, which tj-rpyv5u called "the wire protocol" limit. That is still true of the server, but
+it is not the limit that binds. asyncpg 0.31.0, the driver data_store writes through, refuses more
+than 32,767 query arguments CLIENT-SIDE (asyncpg/protocol/prepared_stmt.pyx line 130), before the
+server sees anything -- so every 5461-row chunk (65,532 arguments) failed, and the original
+65,535 tests passed only because the compiler and a mocked session accept statements asyncpg
+refuses. The design is now a min() of two cited limits, MAX_BIND_PARAMETERS, which is 2730 rows at
+twelve params per row. The two tests that pinned 65,535 went red when the clamp moved; they were
+updated because the DESIGN changed (tj-8fxxfb iii), not to make them pass, and the superseded
+reasoning is kept here and in their docstrings. What keeps the driver's literal honest is pinned
+below against the installed driver itself: its version, and its own source.
+
 NOT PROVEN HERE, and it is the operationally important half. That an oversized batch genuinely
 SUCCEEDS against Postgres, and that Postgres actually rejects the pre-fix single statement, need a
 live database: a mocked session accepts any statement the wire protocol would refuse. That belongs
@@ -30,8 +43,11 @@ to the host-verified tier (tj-vhboky.14). This file proves we never hand the wir
 know it would reject, and that a partial failure cannot leave data behind.
 """
 
+import importlib.metadata
+import importlib.util
 import logging
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
@@ -43,6 +59,8 @@ from sqlalchemy.exc import OperationalError
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Feed, Granularity
 from data.store.app.database.crud.stock.asset_market_activity import (
+    ASYNCPG_LIMIT_VERIFIED_VERSION,
+    ASYNCPG_MAX_QUERY_ARGUMENTS,
     POSTGRES_MAX_BIND_PARAMETERS,
     DuplicateBatchTimestamp,
     _resolve_chunk_size,
@@ -64,11 +82,17 @@ pytestmark = pytest.mark.data_store
 FIRST_TIMESTAMP = datetime(2026, 1, 2, tzinfo=UTC)
 
 # The chunk ceiling production actually uses, taken from the resolver rather than recomputed here.
-# A test that recomputed `65535 // 12` would agree with a broken resolver, and the module constant
+# A test that recomputed `32767 // 12` would agree with a broken resolver, and the module constant
 # is what the write path consults. It is safe to anchor the rest of the file on this because
-# test_the_derived_ceiling_is_the_largest_chunk_the_protocol_accepts pins this exact value against
-# the compiler and the protocol cap, independently of the resolver that produced it.
+# test_the_derived_ceiling_is_the_largest_chunk_both_limits_accept pins this exact value against
+# the compiler and both caps, independently of the resolver that produced it.
 DERIVED_CEILING = _resolve_chunk_size(None)
+
+# The ceiling a statement must meet: the tighter of the server's bind cap and the driver's argument
+# cap. Taken as the min of the two NAMED limits, not from the module's MAX_BIND_PARAMETERS, on
+# purpose: a MAX_BIND_PARAMETERS edited back to the server's figure alone is one of the mutations
+# these tests exist to catch, and a test that read it would move with it.
+BINDING_LIMIT = min(POSTGRES_MAX_BIND_PARAMETERS, ASYNCPG_MAX_QUERY_ARGUMENTS)
 
 
 def _batch_of(bar_count: int) -> BatchStockDataMarketActivityCreate:
@@ -129,7 +153,8 @@ def _upsert_for(bar_count: int) -> Insert:
 def _bind_params(statement: Insert) -> dict[str, object]:
     """Every bind parameter the statement will send, as Postgres would receive them.
 
-    This is the quantity the 65,535 cap applies to, so it is the quantity asserted on.
+    This is the quantity both caps apply to -- the server's 65,535 and asyncpg's 32,767 -- so it is
+    the quantity asserted on.
     """
     return statement.compile(dialect=postgresql.dialect()).params
 
@@ -230,8 +255,15 @@ def test_the_derivation_excludes_the_surrogate_key_and_the_server_stamped_column
     assert len(bound_columns) == StockMarketActivity.bind_params_per_row()
 
 
-def test_the_derived_ceiling_is_the_largest_chunk_the_protocol_accepts():
-    """The boundary, against the compiler and the protocol cap rather than against the arithmetic.
+def test_the_derived_ceiling_is_the_largest_chunk_both_limits_accept():
+    """The boundary, against the compiler and both caps rather than against the arithmetic.
+
+    Formerly test_the_derived_ceiling_is_the_largest_chunk_the_protocol_accepts, which asserted
+    against POSTGRES_MAX_BIND_PARAMETERS alone and so pinned 5461 rows as maximal. SUPERSEDED
+    (tj-vhboky.69): that reasoning took the server's 65,535 as the only cap, and it was satisfied by
+    chunks asyncpg refuses at bind time -- a mocked session and the compiler both accept them. The
+    ceiling is now the min of the two cited limits, and the chunk must fit EACH of them, which is
+    why both are asserted by name below rather than only their min.
 
     BOTH HALVES ARE LOAD-BEARING. That a chunk at the ceiling fits is satisfied by any ceiling at
     all, including an absurdly small one -- so on its own it proves nothing about the division. That
@@ -239,11 +271,52 @@ def test_the_derived_ceiling_is_the_largest_chunk_the_protocol_accepts():
     breaks: `math.ceil` in place of `//`, or an off-by-one, reds here and nowhere else in this file.
 
     This is also the test that lets the rest of the file trust DERIVED_CEILING, which is read off
-    the resolver: whatever the resolver returned, this proves that value is exactly the protocol's
-    largest safe chunk.
+    the resolver: whatever the resolver returned, this proves that value is exactly the largest
+    chunk both the driver and the server accept.
     """
-    assert len(_bind_params(_upsert_for(DERIVED_CEILING))) <= POSTGRES_MAX_BIND_PARAMETERS
-    assert len(_bind_params(_upsert_for(DERIVED_CEILING + 1))) > POSTGRES_MAX_BIND_PARAMETERS
+    at_ceiling = len(_bind_params(_upsert_for(DERIVED_CEILING)))
+    assert at_ceiling <= ASYNCPG_MAX_QUERY_ARGUMENTS, (
+        f'a ceiling-sized chunk binds {at_ceiling} arguments; asyncpg refuses more than {ASYNCPG_MAX_QUERY_ARGUMENTS}'
+    )
+    assert at_ceiling <= POSTGRES_MAX_BIND_PARAMETERS
+    assert len(_bind_params(_upsert_for(DERIVED_CEILING + 1))) > BINDING_LIMIT, 'the ceiling is not maximal'
+
+
+def test_the_installed_asyncpg_is_the_version_its_argument_limit_was_verified_against():
+    """An asyncpg upgrade fails HERE, loudly, instead of silently invalidating the ceiling.
+
+    ASYNCPG_MAX_QUERY_ARGUMENTS is a literal copied out of the driver's compiled source, because
+    asyncpg does not export it (tj-vhboky.69 design: a named constant with a cited source, not a
+    runtime derivation). A literal cannot notice the driver changing underneath it. This pin is the
+    mechanism the design chose to make it notice: when uv.lock moves asyncpg, this goes red, and the
+    fix is to re-verify the limit in the new driver and then move ASYNCPG_LIMIT_VERIFIED_VERSION --
+    never to move the version alone.
+    """
+    installed = importlib.metadata.version('asyncpg')
+    assert installed == ASYNCPG_LIMIT_VERIFIED_VERSION, (
+        f'asyncpg is {installed}, but ASYNCPG_MAX_QUERY_ARGUMENTS={ASYNCPG_MAX_QUERY_ARGUMENTS} was verified '
+        f'against {ASYNCPG_LIMIT_VERIFIED_VERSION}: re-verify the argument limit in the installed driver '
+        '(asyncpg/protocol/prepared_stmt.pyx) before updating ASYNCPG_LIMIT_VERIFIED_VERSION'
+    )
+
+
+def test_the_argument_limit_is_the_one_in_the_installed_drivers_own_source():
+    """The literal, checked against the file it was copied from rather than restated here.
+
+    The version pin above catches the driver moving; it cannot catch the constant being edited while
+    the driver stays put. Restating 32767 in this file would only agree with itself. The wheel ships
+    the Cython source beside the compiled module, so the bind check is read from there: the same
+    guard the design comment cites, compared against the constant production clamps with. This is a
+    test reading the driver, which the design rejected for PRODUCTION (fragile at runtime, and a
+    wrong answer there is an outage); here a wrong answer is a red gate, which is the point.
+    """
+    protocol_dir = Path(importlib.util.find_spec('asyncpg.protocol').origin).parent
+    source = (protocol_dir / 'prepared_stmt.pyx').read_text()
+
+    assert f'if len(args) > {ASYNCPG_MAX_QUERY_ARGUMENTS}:' in source, (
+        f'the installed asyncpg no longer guards binds at {ASYNCPG_MAX_QUERY_ARGUMENTS} arguments'
+    )
+    assert f'the number of query arguments cannot exceed {ASYNCPG_MAX_QUERY_ARGUMENTS}' in source
 
 
 # ---------------------------------------------------------------------------------------
@@ -263,9 +336,15 @@ def test_an_unset_setting_falls_back_to_the_derived_ceiling():
     The arithmetic is restated here deliberately, and this is the only place it is: it pins the
     FLOOR division specifically, which is a claim about the operator rather than about the value.
     The value itself is anchored independently, against the compiler, by
-    test_the_derived_ceiling_is_the_largest_chunk_the_protocol_accepts.
+    test_the_derived_ceiling_is_the_largest_chunk_both_limits_accept.
+
+    SUPERSEDED (tj-vhboky.69): this used to divide POSTGRES_MAX_BIND_PARAMETERS, 65,535 // 12 =
+    5461 rows, on the reasoning that the server's bind cap was the only one. asyncpg refuses above
+    32,767 before the server is reached, so the fallback now divides the min of the two limits,
+    2730 rows. BINDING_LIMIT is used rather than the module's MAX_BIND_PARAMETERS so that a
+    MAX_BIND_PARAMETERS set back to the server's figure reds here too.
     """
-    assert _resolve_chunk_size(None) == POSTGRES_MAX_BIND_PARAMETERS // StockMarketActivity.bind_params_per_row()
+    assert _resolve_chunk_size(None) == BINDING_LIMIT // StockMarketActivity.bind_params_per_row()
 
 
 @pytest.mark.parametrize('requested', [0, -1, -5461])
@@ -477,8 +556,8 @@ async def test_a_batch_over_the_protocol_limit_is_chunked_within_one_transaction
     statements = _statements_sent(session)
     assert [len(_timestamps_sent(statement)) for statement in statements] == [DERIVED_CEILING, 1]
     for statement in statements:
-        assert len(_bind_params(statement)) <= POSTGRES_MAX_BIND_PARAMETERS, (
-            'a chunk still exceeds the wire-protocol bind-parameter limit'
+        assert len(_bind_params(statement)) <= BINDING_LIMIT, (
+            "a chunk still exceeds the binding limit (asyncpg's argument cap, tighter than the server's)"
         )
     assert call_order == ['execute', 'execute', 'commit'], 'the oversized batch did not land in one transaction'
 

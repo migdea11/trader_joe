@@ -15,8 +15,25 @@ from schemas.data_store.stock import market_activity_data
 log = get_logger(__name__)
 
 # The Postgres wire protocol's hard cap on bind parameters in a single statement (tj-rpyv5u). A
-# statement built from more rows than this fits refuses outright rather than degrading.
+# statement built from more rows than this fits refuses outright rather than degrading. Still true
+# of the server; kept even though the driver below binds tighter, since a future driver without
+# the int16 limit makes this one binding again.
 POSTGRES_MAX_BIND_PARAMETERS = 65_535
+
+# asyncpg's own client-side cap, enforced before the server ever sees the statement: asyncpg
+# 0.31.0, asyncpg/protocol/prepared_stmt.pyx line 130, "the number of query arguments cannot
+# exceed 32767". asyncpg does not export this limit, so it is a literal here rather than a runtime
+# derivation (tj-vhboky.69).
+ASYNCPG_MAX_QUERY_ARGUMENTS = 32_767
+
+# The asyncpg version the limit above was verified against. Pinned so an asyncpg upgrade is loud:
+# the validator checks this against the installed version in the PR gate, and a mismatch means
+# re-verify the argument limit rather than drift silently.
+ASYNCPG_LIMIT_VERIFIED_VERSION = '0.31.0'
+
+# The binding ceiling is whichever of the two real limits above is smaller -- today the driver's,
+# not the server's.
+MAX_BIND_PARAMETERS = min(POSTGRES_MAX_BIND_PARAMETERS, ASYNCPG_MAX_QUERY_ARGUMENTS)
 
 
 class UnsupportedAssetType(ValueError):
@@ -63,30 +80,34 @@ async def create_market_activity_data(
 
 
 def _resolve_chunk_size(requested_chunk_size: int | None) -> int:
-    """The rows per upsert statement, bounded by the wire-protocol limit.
+    """The rows per upsert statement, bounded by the driver's argument-count limit.
 
-    protocol_max_rows is derived from StockMarketActivity.bind_params_per_row() rather than a
-    hard-coded twelve, so it re-derives itself the next time the column list changes instead of
-    quietly going stale. requested_chunk_size is MARKET_ACTIVITY_BATCH_SIZE, read by the caller
-    (data/store/app/ingest/data_action_request.py) -- the setting this bug exists to make the
-    write path actually obey. Unset, non-positive, or larger than the protocol allows are all
-    treated the same way: clamp to the derived safe ceiling and log that it happened, rather than
-    building a statement Postgres would reject.
+    max_rows is derived from StockMarketActivity.bind_params_per_row() rather than a hard-coded
+    twelve, so it re-derives itself the next time the column list changes instead of quietly going
+    stale. The ceiling it divides is MAX_BIND_PARAMETERS, the smaller of two real limits: the
+    Postgres wire protocol's bind-parameter cap (POSTGRES_MAX_BIND_PARAMETERS) and asyncpg's own
+    client-side argument cap (ASYNCPG_MAX_QUERY_ARGUMENTS), enforced before the server ever sees
+    the statement. Today the driver's limit binds. requested_chunk_size is
+    MARKET_ACTIVITY_BATCH_SIZE, read by the caller (data/store/app/ingest/data_action_request.py)
+    -- the setting this bug exists to make the write path actually obey. Unset, non-positive, or
+    larger than the driver allows are all treated the same way: clamp to the derived safe ceiling
+    and log that it happened, rather than building a statement asyncpg would refuse client-side.
     """
-    protocol_max_rows = POSTGRES_MAX_BIND_PARAMETERS // StockMarketActivity.bind_params_per_row()
+    max_rows = MAX_BIND_PARAMETERS // StockMarketActivity.bind_params_per_row()
     if not requested_chunk_size or requested_chunk_size <= 0:
         log.warning(
             f'MARKET_ACTIVITY_BATCH_SIZE is unset or non-positive ({requested_chunk_size!r}); '
-            f'using the wire-protocol-derived chunk size of {protocol_max_rows} rows'
+            f'using the asyncpg-argument-limit-derived chunk size of {max_rows} rows'
         )
-        return protocol_max_rows
-    if requested_chunk_size > protocol_max_rows:
+        return max_rows
+    if requested_chunk_size > max_rows:
         log.warning(
-            f'MARKET_ACTIVITY_BATCH_SIZE={requested_chunk_size} would exceed the '
-            f'{POSTGRES_MAX_BIND_PARAMETERS}-bind-parameter limit at '
-            f'{StockMarketActivity.bind_params_per_row()} params/row; clamping to {protocol_max_rows} rows'
+            f"MARKET_ACTIVITY_BATCH_SIZE={requested_chunk_size} would exceed asyncpg's "
+            f'{ASYNCPG_MAX_QUERY_ARGUMENTS}-argument client-side limit (Postgres itself allows '
+            f'{POSTGRES_MAX_BIND_PARAMETERS}) at {StockMarketActivity.bind_params_per_row()} '
+            f'params/row; clamping to {max_rows} rows'
         )
-        return protocol_max_rows
+        return max_rows
     return requested_chunk_size
 
 
