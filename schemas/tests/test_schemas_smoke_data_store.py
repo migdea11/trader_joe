@@ -35,7 +35,7 @@ from pydantic.fields import FieldInfo
 
 import common.enums.data_stock
 import schemas.data_store
-from common.enums.data_stock import Feed, NoTapeFeed, UsEquityFeed
+from common.enums.data_stock import ExpiryType, Feed, NoTapeFeed, UpdateType, UsEquityFeed
 from schemas.data_store.asset_data_interface import (
     AssetData,
     AssetDataCreate,
@@ -1452,6 +1452,12 @@ def test_a_blank_symbol_is_refused_with_the_empty_query_error(
     present that would be false (architect item 3, 00:24 UTC). The no-selector message itself is
     pinned by test_an_empty_bar_query_is_refused and is unchanged.
 
+    Tightened in M1 (tj-vhboky.32, orchestrator note 00:31 UTC 2026-09-28): the message must not
+    mention ``dataset_id`` either. The F1c wording ('a bars query must name dataset_id or
+    asset_symbol; ...') told a caller who HAD sent a dataset_id to name one, which is the same false
+    hint in a milder form; c535d98 reworded it to name only the blank symbol. The F1c assertions
+    are unchanged; this one is added after them.
+
     Args:
         model: The shared bars query, or its stock binding.
         blank: An empty or whitespace-only symbol.
@@ -1464,6 +1470,7 @@ def test_a_blank_symbol_is_refused_with_the_empty_query_error(
     assert 'asset_symbol' in errors[0]['msg']
     assert 'blank' in errors[0]['msg']
     assert 'unbounded' not in errors[0]['msg']
+    assert 'dataset_id' not in errors[0]['msg'], errors[0]['msg']
 
 
 @pytest.mark.parametrize('scope', _WITH_AND_WITHOUT_DATASET.values(), ids=_WITH_AND_WITHOUT_DATASET.keys())
@@ -1597,3 +1604,432 @@ def test_a_dataset_search_bound_stays_optional_and_none_means_no_constraint(fiel
     assert field_info.default is None
     assert getattr(StoreAssetDatasetQuery(), field) is None
     assert getattr(StoreAssetDatasetQuery(**{field: None}), field) is None
+
+
+# ---------------------------------------------------------------------------------------------
+# M0 (tj-vhboky.31): the enum-NAME wire form and validate_fields, pinned BEFORE M1 migrates them
+# ---------------------------------------------------------------------------------------------
+#
+# CHARACTERISATION, GREEN AT 23f953f, AND REQUIRED TO STAY GREEN THROUGH M1 (tj-vhboky.32). M1
+# replaces the deprecated ``json_encoders`` on these models (asset_dataset_store.py, the two
+# ``model_config`` lines) with a v2 serializer and rewrites the classmethod-shaped
+# ``validate_fields`` model validator. Decision tj-vhboky.30, approved by the user as option A on
+# 2026-09-28: KEEP ENUM NAMES ON THE WIRE, byte-identical. Measured: without the encoders
+# expiry_type and update_type dump as 1 and 1; with them, 'BULK' and 'STATIC'. GET /store's JSON is
+# what the private SDK reads, so the pin at the HTTP layer lives in
+# data/store/tests/test_store_dataset_entry_route.py beside these.
+#
+# The five models that carry the encoders, directly or by inheritance.
+_ENUM_WIRE_MODELS = [
+    StoreAssetDatasetBody,
+    StoreAssetDatasetQuery,
+    AssetDatasetStoreCreate,
+    AssetDatasetStoreUpdate,
+    AssetDatasetStore,
+]
+
+# EVERY MEMBER OF BOTH ENUMS, in pairs validate_fields accepts: each expiry type under STATIC (which
+# accepts any expiry and an end), and each update type under ROLLING (a non-BULK expiry, so rule (b)
+# does not fire for DAILY/STREAM). Enumerated from the enums rather than written out, so a member
+# added later is covered without anyone editing this list.
+_ENUM_WIRE_PAIRS: list[tuple[ExpiryType, UpdateType]] = [(member, UpdateType.STATIC) for member in ExpiryType] + [
+    (ExpiryType.ROLLING, member) for member in UpdateType if member is not UpdateType.STATIC
+]
+
+
+def _enum_wire_payload(model: type[BaseModel], expiry_type: ExpiryType, update_type: UpdateType) -> dict[str, Any]:
+    """A valid payload for one of the five models, carrying the two enum fields as MEMBERS.
+
+    Members rather than names go in, so the name that comes out cannot be an echo of the input form.
+
+    Args:
+        model: One of ``_ENUM_WIRE_MODELS``.
+        expiry_type: The expiry policy to carry.
+        update_type: The update policy to carry.
+
+    Returns:
+        dict[str, Any]: The payload.
+    """
+    policy = {'expiry_type': expiry_type, 'update_type': update_type}
+    if model is StoreAssetDatasetQuery:
+        return policy
+    payload = _DATASET_BODY | {'expiry': WHEN} | policy
+    if model is not StoreAssetDatasetBody:
+        payload |= _DATASET_PATH
+    if model in (AssetDatasetStoreUpdate, AssetDatasetStore):
+        payload |= {'id': DATASET_ID}
+    if model is AssetDatasetStore:
+        payload |= {'item_count': 0, 'created_at': WHEN, 'updated_at': WHEN}
+    return payload
+
+
+@pytest.mark.parametrize(
+    ('expiry_type', 'update_type'), _ENUM_WIRE_PAIRS, ids=[f'{e.name}-{u.name}' for e, u in _ENUM_WIRE_PAIRS]
+)
+@pytest.mark.parametrize('model', _ENUM_WIRE_MODELS, ids=lambda model: model.__name__)
+def test_a_dataset_store_model_puts_enum_names_on_the_wire(
+    model: type[BaseModel], expiry_type: ExpiryType, update_type: UpdateType
+):
+    """expiry_type and update_type serialise as NAMES in both JSON forms, per member, per model.
+
+    Both ``model_dump_json()`` and ``model_dump(mode='json')`` are asserted because a replacement
+    serializer can be wired to one and not the other (a ``when_used='json'`` plain serializer covers
+    both; a custom ``model_dump_json`` override would cover only the first). The value is compared
+    with ``is str`` as well as by equality, so an IntEnum that happened to compare equal cannot pass.
+
+    Args:
+        model: The dataset-store model under test.
+        expiry_type: The expiry member carried.
+        update_type: The update member carried.
+    """
+    built = model(**_enum_wire_payload(model, expiry_type, update_type))
+
+    for form, dumped in [
+        ('model_dump_json', json.loads(built.model_dump_json())),
+        ('model_dump(mode=json)', built.model_dump(mode='json')),
+    ]:
+        assert (dumped['expiry_type'], dumped['update_type']) == (expiry_type.name, update_type.name), (
+            f'{model.__name__}.{form} emitted {dumped["expiry_type"]!r}/{dumped["update_type"]!r}, not the '
+            f'enum names {expiry_type.name!r}/{update_type.name!r} the private SDK reads (tj-vhboky.30)'
+        )
+        assert type(dumped['expiry_type']) is str
+        assert type(dumped['update_type']) is str
+
+
+@pytest.mark.parametrize(
+    ('expiry_type', 'update_type'), _ENUM_WIRE_PAIRS, ids=[f'{e.name}-{u.name}' for e, u in _ENUM_WIRE_PAIRS]
+)
+@pytest.mark.parametrize('model', _ENUM_WIRE_MODELS, ids=lambda model: model.__name__)
+def test_a_dumped_dataset_store_model_validates_back_to_the_same_members(
+    model: type[BaseModel], expiry_type: ExpiryType, update_type: UpdateType
+):
+    """The JSON round trip: a dumped model validates back to the SAME members, not to neighbours.
+
+    The name form is only safe on the wire if the receiving side reads it back, which it does through
+    the ``mode='before'`` validators calling ``NamedIntEnum.validate`` -> ``cls[value.upper()]``. A
+    serializer that emitted something those validators cannot parse (the value as a string, say)
+    would red this while the name assertion above could still be satisfied by accident of spelling.
+
+    Args:
+        model: The dataset-store model under test.
+        expiry_type: The expiry member carried.
+        update_type: The update member carried.
+    """
+    built = model(**_enum_wire_payload(model, expiry_type, update_type))
+
+    again = model.model_validate_json(built.model_dump_json())
+
+    assert again.expiry_type is expiry_type
+    assert again.update_type is update_type
+    assert again == built
+
+
+# THE EXACT BYTES, one representative per model. The per-member tests above pin the two fields;
+# these pin the whole document, and with it that nulls are PRESERVED rather than dropped (an
+# ``exclude_none`` slipped into a replacement serializer would drop ``end``, the read model's
+# ``expiry`` and every unset search filter) and that no other field changed its encoding. Decision
+# tj-vhboky.30 says byte-identical, so the comparison is on the string, not a parsed dict.
+_EXACT_WIRE_CASES: list[tuple[type[BaseModel], dict[str, Any], str]] = [
+    (
+        StoreAssetDatasetBody,
+        _enum_wire_payload(StoreAssetDatasetBody, ExpiryType.BUFFER_10K, UpdateType.STATIC),
+        '{"owner":"rebalancer","source":"ALPACA","granularity":"1day","start":"2026-01-01T00:00:00Z",'
+        '"end":null,"expiry":"2026-01-01T00:00:00Z","expiry_type":"BUFFER_10K","update_type":"STATIC"}',
+    ),
+    (
+        AssetDatasetStoreCreate,
+        _enum_wire_payload(AssetDatasetStoreCreate, ExpiryType.BUFFER_10K, UpdateType.STATIC),
+        '{"owner":"rebalancer","source":"ALPACA","granularity":"1day","start":"2026-01-01T00:00:00Z",'
+        '"end":null,"expiry":"2026-01-01T00:00:00Z","expiry_type":"BUFFER_10K","update_type":"STATIC",'
+        '"asset_type":"stock","data_type":"market-activity","asset_symbol":"VFV"}',
+    ),
+    (
+        AssetDatasetStoreUpdate,
+        _enum_wire_payload(AssetDatasetStoreUpdate, ExpiryType.BUFFER_10K, UpdateType.STATIC),
+        '{"owner":"rebalancer","source":"ALPACA","granularity":"1day","start":"2026-01-01T00:00:00Z",'
+        '"end":null,"expiry":"2026-01-01T00:00:00Z","expiry_type":"BUFFER_10K","update_type":"STATIC",'
+        '"asset_type":"stock","data_type":"market-activity","asset_symbol":"VFV",'
+        '"id":"00000000-0000-0000-0000-000000000001"}',
+    ),
+    (
+        AssetDatasetStore,
+        _enum_wire_payload(AssetDatasetStore, ExpiryType.BUFFER_10K, UpdateType.STATIC) | {'expiry': None},
+        '{"owner":"rebalancer","source":"ALPACA","granularity":"1day","start":"2026-01-01T00:00:00Z",'
+        '"end":null,"expiry":null,"expiry_type":"BUFFER_10K","update_type":"STATIC",'
+        '"asset_type":"stock","data_type":"market-activity","asset_symbol":"VFV",'
+        '"id":"00000000-0000-0000-0000-000000000001","item_count":0,'
+        '"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}',
+    ),
+    (
+        StoreAssetDatasetQuery,
+        {'expiry_type': ExpiryType.ROLLING, 'update_type': UpdateType.STREAM},
+        '{"owner":null,"source":null,"granularity":null,"start":null,"end":null,'
+        '"expiry_type":"ROLLING","update_type":"STREAM","created_at":null,"updated_at":null}',
+    ),
+    (
+        StoreAssetDatasetQuery,
+        {},
+        '{"owner":null,"source":null,"granularity":null,"start":null,"end":null,'
+        '"expiry_type":null,"update_type":null,"created_at":null,"updated_at":null}',
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ('model', 'payload', 'wire'),
+    _EXACT_WIRE_CASES,
+    ids=[
+        'StoreAssetDatasetBody',
+        'AssetDatasetStoreCreate',
+        'AssetDatasetStoreUpdate',
+        'AssetDatasetStore-null-expiry',
+        'StoreAssetDatasetQuery-enums-set',
+        'StoreAssetDatasetQuery-all-null',
+    ],
+)
+def test_a_dataset_store_model_serialises_to_exactly_these_bytes(
+    model: type[BaseModel], payload: dict[str, Any], wire: str
+):
+    """The whole JSON document, byte for byte, with names for the enums and nulls kept.
+
+    The all-null query case is the one where a null enum must stay ``null``: a serializer that
+    assumed a member and called ``.name`` on None would raise here, and one that dropped None would
+    shorten the document.
+
+    Args:
+        model: The dataset-store model under test.
+        payload: A valid payload for it.
+        wire: The exact ``model_dump_json()`` output at 23f953f.
+    """
+    built = model(**payload)
+
+    assert built.model_dump_json() == wire
+    assert built.model_dump(mode='json') == json.loads(wire)
+
+
+# validate_fields' TWO RULES (asset_dataset_store.py, StoreAssetDatasetBody.validate_fields), and
+# the error each raises, exactly. Both are model-level (loc ``()``) value errors.
+#
+# THE MESSAGE TEXTS CHANGED BY USER RULING, not to make this test pass. M0 (tj-vhboky.31) pinned
+# them as they stood, and they were wrong in two ways: each formatted an IntEnum's ``.value``, so
+# the text said '1' where 'STATIC' or 'BULK' was meant; and rule (a)'s text was built from
+# ExpiryType.BULK where UpdateType.STATIC was meant, reading the same only because both members
+# are 1. The user ruled (A) on tj-vhboky.36 (2026-09-28): member names and the right enum; the only
+# callers are tests. M4 (tj-vhboky.37) made the change. The SUPERSEDED texts, kept for the record:
+#   rule (a): "Value error, The 'update_type' field must be '1' when 'end' is provided."
+#   rule (b): "Value error, The 'update_type' field must be '1' when 'expiry_type' is '1'."
+# The assertion stays exact; only the pinned text moved. ``_BARE_VALUES`` below names the specific
+# regression: a message that goes back to formatting ``.value`` prints the digit '1' (the value of
+# both UpdateType.STATIC and ExpiryType.BULK).
+_RULE_A_MESSAGE = "Value error, The 'update_type' field must be 'STATIC' when 'end' is provided."
+_RULE_B_MESSAGE = "Value error, The 'update_type' field must be 'STATIC' when 'expiry_type' is 'BULK'."
+_BARE_VALUES = {str(UpdateType.STATIC.value), str(ExpiryType.BULK.value)}
+_NON_STATIC_UPDATES = [member for member in UpdateType if member is not UpdateType.STATIC]
+_NON_BULK_EXPIRIES = [member for member in ExpiryType if member is not ExpiryType.BULK]
+_END = datetime(2026, 3, 1, tzinfo=UTC)
+
+
+def _only_error(excinfo: pytest.ExceptionInfo[ValidationError]) -> tuple[Any, str, str]:
+    """The single error a refusal carries, as (loc, type, msg).
+
+    Args:
+        excinfo: The captured ValidationError.
+
+    Returns:
+        tuple[Any, str, str]: loc, type and msg of the one error; the list is asserted to hold exactly one.
+    """
+    errors = excinfo.value.errors()
+    assert len(errors) == 1, errors
+    return errors[0]['loc'], errors[0]['type'], errors[0]['msg']
+
+
+@pytest.mark.parametrize('update_type', _NON_STATIC_UPDATES, ids=lambda member: member.name)
+@pytest.mark.parametrize('model', _WRITE_MODELS, ids=lambda model: model.__name__)
+def test_rule_a_a_non_static_update_with_an_end_is_refused(model: type[BaseModel], update_type: UpdateType):
+    """Rule (a): update_type not STATIC and ``end`` given -> refused, with exactly this error.
+
+    expiry_type is ROLLING, not the BULK default, so rule (b) cannot be what refuses it: dropping
+    rule (a) alone makes this construct.
+
+    Args:
+        model: The body, or one of the two write models that inherit its validator.
+        update_type: A non-STATIC update policy.
+    """
+    payload = _write_payload(model) | {'update_type': update_type, 'expiry_type': ExpiryType.ROLLING, 'end': _END}
+
+    with pytest.raises(ValidationError) as excinfo:
+        model(**payload)
+
+    loc, error_type, message = _only_error(excinfo)
+    assert (loc, error_type, message) == ((), 'value_error', _RULE_A_MESSAGE)
+    assert not [value for value in _BARE_VALUES if value in message], f'bare enum value in {message!r}'
+
+
+@pytest.mark.parametrize('expiry_type', list(ExpiryType), ids=lambda member: member.name)
+@pytest.mark.parametrize('model', _WRITE_MODELS, ids=lambda model: model.__name__)
+def test_rule_a_a_static_update_with_an_end_is_accepted(model: type[BaseModel], expiry_type: ExpiryType):
+    """Rule (a)'s positive: STATIC with ``end`` constructs, under every expiry policy, and keeps the end.
+
+    Without this, a rule that refused every ``end`` would satisfy the refusal above.
+
+    Args:
+        model: The body, or one of the two write models that inherit its validator.
+        expiry_type: The expiry policy, every member.
+    """
+    built = model(**_write_payload(model) | {'update_type': UpdateType.STATIC, 'expiry_type': expiry_type, 'end': _END})
+
+    assert built.end == _END
+    assert built.update_type is UpdateType.STATIC
+    assert built.expiry_type is expiry_type
+
+
+@pytest.mark.parametrize('update_type', _NON_STATIC_UPDATES, ids=lambda member: member.name)
+@pytest.mark.parametrize('model', _WRITE_MODELS, ids=lambda model: model.__name__)
+def test_rule_b_a_non_static_update_with_a_bulk_expiry_is_refused(model: type[BaseModel], update_type: UpdateType):
+    """Rule (b): update_type not STATIC and expiry_type BULK -> refused, with exactly this error.
+
+    No ``end`` is sent, so rule (a) cannot be what refuses it. BULK is passed explicitly rather than
+    left to the default, so a change of default cannot quietly turn this into a positive.
+
+    Args:
+        model: The body, or one of the two write models that inherit its validator.
+        update_type: A non-STATIC update policy.
+    """
+    payload = _write_payload(model) | {'update_type': update_type, 'expiry_type': ExpiryType.BULK}
+
+    with pytest.raises(ValidationError) as excinfo:
+        model(**payload)
+
+    loc, error_type, message = _only_error(excinfo)
+    assert (loc, error_type, message) == ((), 'value_error', _RULE_B_MESSAGE)
+    assert not [value for value in _BARE_VALUES if value in message], f'bare enum value in {message!r}'
+
+
+@pytest.mark.parametrize('expiry_type', _NON_BULK_EXPIRIES, ids=lambda member: member.name)
+@pytest.mark.parametrize('update_type', _NON_STATIC_UPDATES, ids=lambda member: member.name)
+@pytest.mark.parametrize('model', _WRITE_MODELS, ids=lambda model: model.__name__)
+def test_rule_b_a_non_static_update_with_a_non_bulk_expiry_and_no_end_is_accepted(
+    model: type[BaseModel], update_type: UpdateType, expiry_type: ExpiryType
+):
+    """Rule (b)'s positive: a non-STATIC update with a non-BULK expiry and no ``end`` constructs.
+
+    Without this, a rule that refused every non-STATIC update would satisfy both refusals above.
+
+    Args:
+        model: The body, or one of the two write models that inherit its validator.
+        update_type: A non-STATIC update policy.
+        expiry_type: A non-BULK expiry policy.
+    """
+    built = model(**_write_payload(model) | {'update_type': update_type, 'expiry_type': expiry_type})
+
+    assert built.end is None
+    assert built.update_type is update_type
+    assert built.expiry_type is expiry_type
+
+
+# ---------------------------------------------------------------------------------------------
+# M1 (tj-vhboky.32): what the v2 serializer that replaced json_encoders must also keep
+# ---------------------------------------------------------------------------------------------
+#
+# c535d98 replaced the deprecated ``json_encoders`` with ``field_serializer('expiry_type',
+# 'update_type', when_used='json-unless-none')``. M0's pins above cover the dumped JSON. Two things
+# the serializer can change that M0 does not reach:
+#
+# THE DOCUMENTED DEFAULT. Pydantic encodes a JSON-schema default through the config's
+# ``json_encoders`` and never through a field serializer, so the serializer alone turned the default
+# of both fields from 'BULK'/'STATIC' into 1 (the builder's finding). c535d98 restores the names with
+# ``json_schema_extra={'default': <member>.name}`` on StoreAssetDatasetBody's two fields. Before these
+# tests, removing that line left the suite green while the OpenAPI the private SDK is generated from
+# advertised a default the wire never carries. The OpenAPI half is in
+# data/store/tests/test_store_dataset_entry_route.py.
+#
+# THE PYTHON-MODE DUMP. ``json_encoders`` applied only in JSON mode, so ``model_dump()`` returned the
+# enum MEMBERS, and production relies on that: search_entries turns ``request_query.model_dump()`` into
+# column filters, and data_action_request builds the create model and the ingest request from
+# ``model_dump()``. A serializer widened past JSON would hand those callers the name strings instead.
+# Measured at c535d98 with ``when_used='unless-none'``: on the WRITE path five route-level tests
+# already go red, indirectly, because GetDatasetRequest refuses 'BULK' as an int enum; on the SEARCH
+# path nothing did, since the fake session never evaluates the filters search_entries builds. The
+# test below is the direct pin, per model and per member, and the only one reaching the query.
+_BODY_DEFAULT_MODELS = [StoreAssetDatasetBody, AssetDatasetStoreCreate, AssetDatasetStoreUpdate, AssetDatasetStore]
+
+
+@pytest.mark.parametrize('mode', ['validation', 'serialization'])
+@pytest.mark.parametrize('model', _BODY_DEFAULT_MODELS, ids=lambda model: model.__name__)
+def test_a_dataset_store_model_documents_the_enum_defaults_as_names(model: type[BaseModel], mode: str):
+    """The JSON schema's default for expiry_type and update_type is the NAME, 'BULK' and 'STATIC'.
+
+    That is the form the wire carries (tj-vhboky.30), so a client generated from the schema sends and
+    expects what the server does. Both schema modes are asserted, because FastAPI draws request bodies
+    from the validation schema and responses from the serialization schema, and a fix reaching one
+    could miss the other. ``type(...) is str`` is asserted too, so a str-subclass enum member standing
+    in for the name cannot pass the equality alone. The three subclasses inherit the
+    fields from StoreAssetDatasetBody and are listed so that redeclaring the fields on one of them
+    without the fix is seen.
+
+    Args:
+        model: StoreAssetDatasetBody or a model that inherits its two enum fields.
+        mode: The JSON-schema mode.
+    """
+    properties = model.model_json_schema(mode=mode)['properties']
+
+    defaults = (properties['expiry_type'].get('default'), properties['update_type'].get('default'))
+
+    assert defaults == ('BULK', 'STATIC'), (
+        f'{model.__name__} {mode} schema documents defaults {defaults!r}, not the names the wire carries (tj-vhboky.30)'
+    )
+    assert all(type(default) is str for default in defaults)
+
+
+@pytest.mark.parametrize('mode', ['validation', 'serialization'])
+def test_the_dataset_search_documents_no_enum_default(mode: str):
+    """StoreAssetDatasetQuery's two enum filters default to null in the schema: absent means no filter.
+
+    The name default above belongs to the body only. Carrying it onto the search would document that
+    an omitted filter means BULK/STATIC, which search_entries does not do.
+
+    Args:
+        mode: The JSON-schema mode.
+    """
+    properties = StoreAssetDatasetQuery.model_json_schema(mode=mode)['properties']
+
+    assert properties['expiry_type']['default'] is None
+    assert properties['update_type']['default'] is None
+
+
+@pytest.mark.parametrize(
+    ('expiry_type', 'update_type'), _ENUM_WIRE_PAIRS, ids=[f'{e.name}-{u.name}' for e, u in _ENUM_WIRE_PAIRS]
+)
+@pytest.mark.parametrize('model', _ENUM_WIRE_MODELS, ids=lambda model: model.__name__)
+def test_a_python_mode_dump_keeps_the_enum_members(
+    model: type[BaseModel], expiry_type: ExpiryType, update_type: UpdateType
+):
+    """``model_dump()`` and ``model_dump(mode='python')`` carry the enum MEMBERS, never their names.
+
+    The name serializer is JSON-only (``when_used='json-unless-none'``), as ``json_encoders`` was.
+    Asserted with ``is``, because a name string is not the member and an int equal to its value would
+    compare equal to an IntEnum. Both spellings are asserted, since the default mode is what the
+    production callers use and the explicit one is what the serializer's ``when_used`` is defined
+    against.
+
+    Args:
+        model: The dataset-store model under test.
+        expiry_type: The expiry member carried.
+        update_type: The update member carried.
+    """
+    built = model(**_enum_wire_payload(model, expiry_type, update_type))
+
+    for form, dumped in [
+        ('model_dump()', built.model_dump()),
+        ("model_dump(mode='python')", built.model_dump(mode='python')),
+    ]:
+        assert dumped['expiry_type'] is expiry_type, f'{model.__name__}.{form} gave {dumped["expiry_type"]!r}'
+        assert dumped['update_type'] is update_type, f'{model.__name__}.{form} gave {dumped["update_type"]!r}'
+
+
+def test_a_python_mode_dump_of_an_unfiltered_search_keeps_none():
+    """An absent enum filter dumps as None in Python mode, which search_entries skips as no constraint."""
+    dumped = StoreAssetDatasetQuery().model_dump()
+
+    assert dumped['expiry_type'] is None
+    assert dumped['update_type'] is None

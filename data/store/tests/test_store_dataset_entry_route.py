@@ -46,6 +46,8 @@ declared is the principal both collaborators are handed.
 """
 
 import uuid
+from collections import defaultdict
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -54,8 +56,10 @@ from sqlalchemy import Select
 from sqlalchemy.dialects.postgresql import Insert as PostgresInsert
 
 from common.enums.data_select import AssetType, DataType
+from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateType
 from data.store.app.app_depends import get_rpc_clients
 from data.store.app.database.database import async_db
+from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.ingest import data_action_request
 from data.store.app.main import app
 from routers.common.instance_secret import INSTANCE_SECRET_ENV_VAR, INSTANCE_SECRET_HEADER
@@ -587,4 +591,156 @@ async def test_the_entry_and_the_fetch_agree_on_every_identity_field_the_caller_
         'beyond the reach of this case and is not claimed here: the fixture drives one data_type, so the '
         'literal and the forwarded value are the same string in the only request that runs -- see the '
         'docstring for why widening the fixture is the wrong repair'
+    )
+
+
+# ---------------------------------------------------------------------------------------------
+# What the private SDK reads: GET /store's JSON carries enum NAMES (M0, tj-vhboky.31)
+# ---------------------------------------------------------------------------------------------
+
+# Every member of both enums, in the pairs validate_fields accepts (the read model inherits it): each
+# expiry type under STATIC, and each non-STATIC update type under ROLLING.
+_WIRE_PAIRS: list[tuple[ExpiryType, UpdateType]] = [(member, UpdateType.STATIC) for member in ExpiryType] + [
+    (ExpiryType.ROLLING, member) for member in UpdateType if member is not UpdateType.STATIC
+]
+_WHEN = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ('expiry_type', 'update_type'), _WIRE_PAIRS, ids=[f'{e.name}-{u.name}' for e, u in _WIRE_PAIRS]
+)
+def test_the_dataset_search_answers_enum_names_and_nulls_on_the_wire(expiry_type: ExpiryType, update_type: UpdateType):
+    """GET /store/{asset_type}/{data_type}/{asset_symbol} answers expiry_type and update_type as NAMES.
+
+    Decision tj-vhboky.30 (user approved option A, 2026-09-28): the names are the contract the
+    private SDK consumes, and M1 (tj-vhboky.32) must keep them byte-identical while it replaces the
+    deprecated ``json_encoders``. The schema-level pins are in
+    schemas/tests/test_schemas_smoke_data_store.py; what only this layer shows is that FastAPI's
+    response serialisation of ``list[AssetDatasetStore]`` -- which goes through its own TypeAdapter,
+    not through ``model_dump_json`` -- honours the same encoding. A serializer that one path used and
+    the other did not would pass there and fail here.
+
+    The REAL search_entries runs, against the recording fake session: it is handed one transient
+    StoreDatasetEntry row and its bar count, which is the shape ``result.all()`` yields, so the ORM ->
+    AssetDatasetStore -> JSON path is the production one end to end. ``end`` and ``expiry`` are None on
+    the row, and the answer must carry them as JSON null rather than drop them. No Postgres is
+    reached: what a real row round-trips as is the host-verified tier's (tj-vhboky.14), not this one.
+
+    Args:
+        expiry_type: The expiry member stored on the row.
+        update_type: The update member stored on the row.
+    """
+    entry_id = uuid.UUID('00000000-0000-0000-0000-00000000000a')
+    row = StoreDatasetEntry(
+        id=entry_id,
+        owner=DECLARED_PRINCIPAL,
+        source=DataSource.ALPACA_API,
+        asset_symbol='AAPL',
+        asset_type=AssetType.STOCK,
+        data_type=DataType.MARKET_ACTIVITY,
+        granularity=Granularity.ONE_DAY,
+        start=_WHEN,
+        end=None,
+        expiry=None,
+        expiry_type=expiry_type,
+        update_type=update_type,
+        created_at=_WHEN,
+        updated_at=_WHEN,
+    )
+    session = FakeSession(FakeResult(rows=[(row, 3)]))
+    app.dependency_overrides[async_db] = lambda: session
+    try:
+        response = TestClient(app).get(app.url_path_for(SEARCH_ROUTE_NAME, **PATH_PARAMS))
+    finally:
+        # `app` is a module-level singleton other test modules import.
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200, response.text
+    assert response.json() == [
+        {
+            'owner': DECLARED_PRINCIPAL,
+            'source': 'ALPACA',
+            'granularity': '1day',
+            'start': '2026-01-01T00:00:00Z',
+            'end': None,
+            'expiry': None,
+            'expiry_type': expiry_type.name,
+            'update_type': update_type.name,
+            'asset_type': 'stock',
+            'data_type': 'market-activity',
+            'asset_symbol': 'AAPL',
+            'id': str(entry_id),
+            'item_count': 3,
+            'created_at': '2026-01-01T00:00:00Z',
+            'updated_at': '2026-01-01T00:00:00Z',
+        }
+    ], (
+        f'GET /store no longer answers the enum names {expiry_type.name!r}/{update_type.name!r} (or dropped a '
+        f'null) -- the wire form the private SDK reads (tj-vhboky.30): {response.text}'
+    )
+
+
+# ---------------------------------------------------------------------------------------------
+# M1 (tj-vhboky.32): the OpenAPI documents the enum defaults as names
+# ---------------------------------------------------------------------------------------------
+
+
+def _openapi_schema_of(spec: dict, route_name: str, method: str, *, response: bool) -> dict:
+    """The component schema one store route's request body or 200 response resolves to.
+
+    Reached from the route, not by component name, so the assertion is about what that route actually
+    documents rather than about a component that might no longer be the one it references.
+
+    Args:
+        spec: ``app.openapi()``.
+        route_name: The FastAPI route name, as ``app.url_path_for`` takes it.
+        method: The HTTP method, lower-case.
+        response: True for the 200 response's schema (the list item, for a list), False for the body.
+
+    Returns:
+        dict: The resolved component schema.
+    """
+    # The OpenAPI keys paths by template. Fill each with this file's path parameters (a placeholder
+    # it does not know, such as {id}, fills empty and so cannot match) and keep the one that equals
+    # the URL the app resolves for the route.
+    url = app.url_path_for(route_name, **PATH_PARAMS)
+    fill = defaultdict(str, PATH_PARAMS)
+    (path,) = [template for template in spec['paths'] if template.format_map(fill) == url]
+    operation = spec['paths'][path][method]
+    if response:
+        schema = operation['responses']['200']['content']['application/json']['schema']
+        schema = schema.get('items', schema)
+    else:
+        schema = operation['requestBody']['content']['application/json']['schema']
+    ref = schema['$ref']
+    assert ref.startswith('#/components/schemas/'), ref
+    return spec['components']['schemas'][ref.rsplit('/', 1)[1]]
+
+
+@pytest.mark.parametrize(
+    ('route_name', 'method', 'response'),
+    [(ROUTE_NAME, 'post', False), (SEARCH_ROUTE_NAME, 'get', True)],
+    ids=['POST-store-body', 'GET-store-response'],
+)
+def test_the_store_openapi_documents_the_enum_defaults_as_names(route_name: str, method: str, response: bool):
+    """The store's OpenAPI gives expiry_type and update_type the defaults 'BULK' and 'STATIC'.
+
+    The OpenAPI is what the private SDK's typed client is generated from, and the wire carries names
+    (tj-vhboky.30), so the documented default must be the name too. c535d98's field serializer does not
+    reach the schema default -- Pydantic encodes it through config ``json_encoders`` only -- and without
+    the ``json_schema_extra`` default on StoreAssetDatasetBody this document says 1 for both, with every
+    wire pin still green. The schema-level half is in schemas/tests/test_schemas_smoke_data_store.py;
+    this is the document FastAPI actually serves, for the POST body and for the search's response items.
+
+    Args:
+        route_name: The store route whose schema is read.
+        method: Its HTTP method.
+        response: Read the 200 response's item schema rather than the request body.
+    """
+    properties = _openapi_schema_of(app.openapi(), route_name, method, response=response)['properties']
+
+    defaults = (properties['expiry_type'].get('default'), properties['update_type'].get('default'))
+
+    assert defaults == ('BULK', 'STATIC'), (
+        f'{method.upper()} {route_name} documents defaults {defaults!r}, not the enum names the wire carries'
     )

@@ -1,7 +1,8 @@
 from datetime import UTC, datetime, timedelta
+from typing import Self
 from uuid import UUID
 
-from pydantic import AwareDatetime, ConfigDict, Field, field_validator, model_validator
+from pydantic import AwareDatetime, ConfigDict, Field, field_serializer, field_validator, model_validator
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateType
@@ -87,21 +88,24 @@ class StoreAssetDatasetBody(InboundContract):
     # the field, at the edge. Fixed the same way `start` was under tj-6yk4qs: make the declared
     # contract honest, rather than patch the handler into tolerating a body it should have refused.
     expiry: AwareDatetime = Field(default_factory=lambda: datetime.now(UTC) + timedelta(days=1))
-    expiry_type: ExpiryType = ExpiryType.BULK
-    update_type: UpdateType = UpdateType.STATIC
+    # json_schema_extra keeps the documented default the NAME the wire carries. The JSON schema's
+    # default is encoded from the config, never from a field serializer, so without it the OpenAPI
+    # default would silently turn from 'BULK' into 1 when json_encoders was replaced below.
+    expiry_type: ExpiryType = Field(default=ExpiryType.BULK, json_schema_extra={'default': ExpiryType.BULK.name})
+    update_type: UpdateType = Field(default=UpdateType.STATIC, json_schema_extra={'default': UpdateType.STATIC.name})
 
     @model_validator(mode='after')
-    def validate_fields(cls, request: 'StoreAssetDatasetBody') -> 'StoreAssetDatasetBody':
-        log.debug(f'Validating request: {request}')
-        if request.update_type is not UpdateType.STATIC and request.end is not None:
-            raise ValueError(f"The 'update_type' field must be '{ExpiryType.BULK.value}' when 'end' is provided.")
+    def validate_fields(self) -> Self:
+        log.debug(f'Validating request: {self}')
+        if self.update_type is not UpdateType.STATIC and self.end is not None:
+            raise ValueError(f"The 'update_type' field must be '{UpdateType.STATIC.name}' when 'end' is provided.")
 
-        if request.update_type is not UpdateType.STATIC and request.expiry_type is ExpiryType.BULK:
+        if self.update_type is not UpdateType.STATIC and self.expiry_type is ExpiryType.BULK:
             raise ValueError(
-                f"The 'update_type' field must be '{UpdateType.STATIC.value}' "
-                f"when 'expiry_type' is '{ExpiryType.BULK.value}'."
+                f"The 'update_type' field must be '{UpdateType.STATIC.name}' "
+                f"when 'expiry_type' is '{ExpiryType.BULK.name}'."
             )
-        return request
+        return self
 
     @field_validator('expiry_type', mode='before')
     def validate_expiry_type(cls, value):
@@ -111,7 +115,13 @@ class StoreAssetDatasetBody(InboundContract):
     def validate_update_type(cls, value):
         return UpdateType.validate(value)
 
-    model_config = ConfigDict(json_encoders={ExpiryType: ExpiryType.encoder, UpdateType: UpdateType.encoder})
+    # Enum NAMES on the wire, not the integer values (decision tj-vhboky.30): GET /store's JSON
+    # carries 'BULK'/'STATIC' and the private SDK reads them. JSON only, so model_dump() still
+    # yields the enum members. Replaces the deprecated json_encoders; no return annotation, so
+    # the JSON schema is left exactly as it was. Subclasses inherit it.
+    @field_serializer('expiry_type', 'update_type', when_used='json-unless-none')
+    def serialize_enum_name(self, value: ExpiryType | UpdateType):
+        return value.name
 
 
 class StoreAssetDatasetPath(InboundContract):
@@ -161,7 +171,10 @@ class StoreAssetDatasetQuery(InboundContract):
             return value
         return UpdateType.validate(value)
 
-    model_config = ConfigDict(json_encoders={ExpiryType: ExpiryType.encoder, UpdateType: UpdateType.encoder})
+    # Same wire form as StoreAssetDatasetBody's serializer; 'unless-none' keeps an absent filter null.
+    @field_serializer('expiry_type', 'update_type', when_used='json-unless-none')
+    def serialize_enum_name(self, value: ExpiryType | UpdateType):
+        return value.name
 
 
 class AssetDatasetStoreCreate(StoreAssetDatasetPath, StoreAssetDatasetBody):

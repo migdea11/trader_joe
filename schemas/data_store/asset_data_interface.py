@@ -203,7 +203,7 @@ class AssetDataQuery(_AssetIdentifierQuery, _AssetDataQuery, ABC):
     @model_validator(mode='after')
     def require_dataset_or_symbol(self) -> Self:
         if self.asset_symbol is not None and not self.asset_symbol.strip():
-            raise ValueError('a bars query must name dataset_id or asset_symbol; a blank asset_symbol names no symbol')
+            raise ValueError('asset_symbol must not be blank; omit it or give a symbol')
         if self.dataset_id is None and self.asset_symbol is None:
             raise ValueError('a bars query must name dataset_id or asset_symbol; an unbounded read is refused')
         return self
