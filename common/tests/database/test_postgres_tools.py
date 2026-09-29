@@ -8,7 +8,7 @@ from asyncpg import CannotConnectNowError
 from psycopg2 import OperationalError
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.url import URL
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 
 os.environ['POSTGRES_ASYNC'] = 'True'
@@ -82,8 +82,14 @@ def test_sync_wait_for_db_timeout(mock_psycopg_connect, mock_sync_uri: URL, clea
 @patch('common.database.postgres_tools.asyncpg.connect', new_callable=AsyncMock)
 @patch('common.database.postgres_tools.create_async_engine')
 @patch('common.database.postgres_tools.sessionmaker')
+@patch('common.database.postgres_tools.async_sessionmaker')
 async def test_async_initialize(
-    mock_sessionmaker, mock_create_async_engine, mock_asyncpg_connect, mock_async_uri: URL, cleanup
+    mock_async_sessionmaker,
+    mock_sessionmaker,
+    mock_create_async_engine,
+    mock_asyncpg_connect,
+    mock_async_uri: URL,
+    cleanup,
 ):
     # Mock asyncpg.connect to simulate successful connection
     mock_asyncpg_connect.return_value = AsyncMock()
@@ -100,7 +106,13 @@ async def test_async_initialize(
     mock_create_async_engine.assert_called_once_with(
         mock_async_uri.render_as_string(hide_password=False), pool_pre_ping=True
     )
-    mock_sessionmaker.assert_called_once_with(mock_engine, class_=AsyncSession, autocommit=False, autoflush=False)
+    # ADR tj-8z213c: a plain async_sessionmaker, bound to the engine, with the same session
+    # options the registry's factory had (no autocommit, no autoflush, expire_on_commit left at
+    # its default). The exact kwargs also pin that no class_ override replaces async_sessionmaker's
+    # default AsyncSession, which class_=AsyncSession used to pin; test_postgres_session.py checks
+    # the session type for real. The sessionmaker that fed the Task-scoped registry is gone.
+    mock_async_sessionmaker.assert_called_once_with(mock_engine, autocommit=False, autoflush=False)
+    mock_sessionmaker.assert_not_called()
 
 
 @pytest.mark.asyncio

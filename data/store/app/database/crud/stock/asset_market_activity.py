@@ -8,14 +8,32 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from common.enums.data_select import AssetType, DataType
 from common.logging import get_logger
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
+from data.store.app.database.transaction import write_transaction
 from schemas.data_store.stock import market_activity_data
 
 
 log = get_logger(__name__)
 
 # The Postgres wire protocol's hard cap on bind parameters in a single statement (tj-rpyv5u). A
-# statement built from more rows than this fits refuses outright rather than degrading.
+# statement built from more rows than this fits refuses outright rather than degrading. Still true
+# of the server; kept even though the driver below binds tighter, since a future driver without
+# the int16 limit makes this one binding again.
 POSTGRES_MAX_BIND_PARAMETERS = 65_535
+
+# asyncpg's own client-side cap, enforced before the server ever sees the statement: asyncpg
+# 0.31.0, asyncpg/protocol/prepared_stmt.pyx line 130, "the number of query arguments cannot
+# exceed 32767". asyncpg does not export this limit, so it is a literal here rather than a runtime
+# derivation (tj-vhboky.69).
+ASYNCPG_MAX_QUERY_ARGUMENTS = 32_767
+
+# The asyncpg version the limit above was verified against. Pinned so an asyncpg upgrade is loud:
+# the validator checks this against the installed version in the PR gate, and a mismatch means
+# re-verify the argument limit rather than drift silently.
+ASYNCPG_LIMIT_VERIFIED_VERSION = '0.31.0'
+
+# The binding ceiling is whichever of the two real limits above is smaller -- today the driver's,
+# not the server's.
+MAX_BIND_PARAMETERS = min(POSTGRES_MAX_BIND_PARAMETERS, ASYNCPG_MAX_QUERY_ARGUMENTS)
 
 
 class UnsupportedAssetType(ValueError):
@@ -55,37 +73,41 @@ async def create_market_activity_data(
     log.debug('Storing asset market activity data')
     asset_table = StockMarketActivity
     db_asset_market_activity_data = asset_table(**asset_table.from_create(asset_data))
-    db.add(db_asset_market_activity_data)
-    await db.commit()
+    async with write_transaction(db, 'store market activity'):
+        db.add(db_asset_market_activity_data)
     await db.refresh(db_asset_market_activity_data)
     return db_asset_market_activity_data.to_schema()
 
 
 def _resolve_chunk_size(requested_chunk_size: int | None) -> int:
-    """The rows per upsert statement, bounded by the wire-protocol limit.
+    """The rows per upsert statement, bounded by the driver's argument-count limit.
 
-    protocol_max_rows is derived from StockMarketActivity.bind_params_per_row() rather than a
-    hard-coded twelve, so it re-derives itself the next time the column list changes instead of
-    quietly going stale. requested_chunk_size is MARKET_ACTIVITY_BATCH_SIZE, read by the caller
-    (data/store/app/ingest/data_action_request.py) -- the setting this bug exists to make the
-    write path actually obey. Unset, non-positive, or larger than the protocol allows are all
-    treated the same way: clamp to the derived safe ceiling and log that it happened, rather than
-    building a statement Postgres would reject.
+    max_rows is derived from StockMarketActivity.bind_params_per_row() rather than a hard-coded
+    twelve, so it re-derives itself the next time the column list changes instead of quietly going
+    stale. The ceiling it divides is MAX_BIND_PARAMETERS, the smaller of two real limits: the
+    Postgres wire protocol's bind-parameter cap (POSTGRES_MAX_BIND_PARAMETERS) and asyncpg's own
+    client-side argument cap (ASYNCPG_MAX_QUERY_ARGUMENTS), enforced before the server ever sees
+    the statement. Today the driver's limit binds. requested_chunk_size is
+    MARKET_ACTIVITY_BATCH_SIZE, read by the caller (data/store/app/ingest/data_action_request.py)
+    -- the setting this bug exists to make the write path actually obey. Unset, non-positive, or
+    larger than the driver allows are all treated the same way: clamp to the derived safe ceiling
+    and log that it happened, rather than building a statement asyncpg would refuse client-side.
     """
-    protocol_max_rows = POSTGRES_MAX_BIND_PARAMETERS // StockMarketActivity.bind_params_per_row()
+    max_rows = MAX_BIND_PARAMETERS // StockMarketActivity.bind_params_per_row()
     if not requested_chunk_size or requested_chunk_size <= 0:
         log.warning(
             f'MARKET_ACTIVITY_BATCH_SIZE is unset or non-positive ({requested_chunk_size!r}); '
-            f'using the wire-protocol-derived chunk size of {protocol_max_rows} rows'
+            f'using the asyncpg-argument-limit-derived chunk size of {max_rows} rows'
         )
-        return protocol_max_rows
-    if requested_chunk_size > protocol_max_rows:
+        return max_rows
+    if requested_chunk_size > max_rows:
         log.warning(
-            f'MARKET_ACTIVITY_BATCH_SIZE={requested_chunk_size} would exceed the '
-            f'{POSTGRES_MAX_BIND_PARAMETERS}-bind-parameter limit at '
-            f'{StockMarketActivity.bind_params_per_row()} params/row; clamping to {protocol_max_rows} rows'
+            f"MARKET_ACTIVITY_BATCH_SIZE={requested_chunk_size} would exceed asyncpg's "
+            f'{ASYNCPG_MAX_QUERY_ARGUMENTS}-argument client-side limit (Postgres itself allows '
+            f'{POSTGRES_MAX_BIND_PARAMETERS}) at {StockMarketActivity.bind_params_per_row()} '
+            f'params/row; clamping to {max_rows} rows'
         )
-        return protocol_max_rows
+        return max_rows
     return requested_chunk_size
 
 
@@ -112,22 +134,24 @@ async def batch_create_market_activity_data(
 ) -> int:
     """Upsert a batch of bars, chunked to stay under the wire-protocol bind-parameter limit.
 
-    ALL CHUNKS SHARE ONE TRANSACTION (tj-rpyv5u): every db.execute below runs before the single
-    db.commit() at the end, so an oversized batch either lands whole or (on any exception,
-    including one raised mid-chunk) rolls back whole. Committing per chunk was rejected
-    deliberately -- it would turn one failed request into a dataset entry claiming coverage for
-    bars that were never written, which is worse than today's all-or-nothing failure.
+    ALL CHUNKS SHARE ONE TRANSACTION (tj-rpyv5u): every db.execute below runs inside one
+    write_transaction block, so an oversized batch either lands whole (the block's single commit
+    on normal exit) or (on any exception, including one raised mid-chunk) rolls back whole.
+    Committing per chunk was rejected deliberately -- it would turn one failed request into a
+    dataset entry claiming coverage for bars that were never written, which is worse than today's
+    all-or-nothing failure.
 
-    The duplicate-timestamp guard runs across the WHOLE batch before any chunk is built, not
-    per chunk: two bars at the same timestamp landing in different chunks would each pass a
-    per-chunk guard and still collide on the natural key.
+    The empty-batch return is ABOVE the block: it neither commits nor rolls back anything, since
+    there is nothing to write. The duplicate-timestamp guard runs INSIDE the block, across the
+    WHOLE batch before any chunk is built, not per chunk: two bars at the same timestamp landing
+    in different chunks would each pass a per-chunk guard and still collide on the natural key.
     """
-    try:
-        batch_market_activity = batch_asset_data.dataset.get(DataType.MARKET_ACTIVITY)
-        if not batch_market_activity:
-            log.warning('No market activity data in batch')
-            return 0
+    batch_market_activity = batch_asset_data.dataset.get(DataType.MARKET_ACTIVITY)
+    if not batch_market_activity:
+        log.warning('No market activity data in batch')
+        return 0
 
+    async with write_transaction(db, 'batch store market activity'):
         log.debug(f'Batch storing market activity[{len(batch_market_activity)}]')
         log.debug(f'Batch storing market activity: {next(iter(batch_market_activity))}')
 
@@ -144,41 +168,46 @@ async def batch_create_market_activity_data(
             chunk = values[chunk_start : chunk_start + chunk_size]
             await db.execute(build_market_activity_upsert(chunk))
 
-        await db.commit()
         log.debug('Batch insert completed successfully')
-        return len(batch_market_activity)
-    except Exception as e:
-        await db.rollback()
-        log.error(f'Failed to batch insert asset market activity data: {e}')
-        raise
+
+    return len(batch_market_activity)
 
 
-# TODO replace with a search function
 async def read_market_activity_data(
     db: AsyncSession, request: market_activity_data.StockDataMarketActivityQuery
 ) -> list[market_activity_data.StockDataMarketActivity]:
     log.debug('Reading stock market activity dataset')
     asset_table = StockMarketActivity
 
-    # If using subset of dataset
+    # Each predicate tests "is not None", not truthiness: a falsy-but-set value (an enum member
+    # whose value is falsy, a UUID, etc.) must still filter. An absent field means "no constraint
+    # on that column" (tj-vhboky.1 section 8).
     conditions = []
-    if request.dataset_id:
+    if request.dataset_id is not None:
         # This filter is trustworthy again. dataset_id is part of the bar's natural key
         # (BaseMarketActivity.NATURAL_KEY) and is NOT in StockMarketActivity.MUTABLE_COLUMNS, so
         # an overlapping re-fetch through a different dataset entry writes a DIFFERENT ROW rather
         # than re-owning this one. The last-write-wins ownership that made this filter lie
         # (tj-k207b7) is gone by construction, not by discipline.
         conditions.append(asset_table.dataset_id == request.dataset_id)
-    if request.asset_symbol:
+    if request.asset_symbol is not None:
         conditions.append(asset_table.asset_symbol == request.asset_symbol)
-    if request.granularity:
+    if request.source is not None:
+        conditions.append(asset_table.source == request.source)
+    if request.feed is not None:
+        conditions.append(asset_table.feed == request.feed)
+    if request.granularity is not None:
         conditions.append(asset_table.granularity == request.granularity)
-    if request.start:
+    if request.start is not None:
         conditions.append(asset_table.timestamp >= request.start)
-    if request.end:
+    if request.end is not None:
         conditions.append(asset_table.timestamp <= request.end)
 
-    stmt = select(asset_table).filter(*conditions)
+    # ORDER BY timestamp, dataset_id -- NOTHING ELSE (user ruling, tj-vhboky.25 addendum, 21:41
+    # UTC 2026-09-27). No row id: this is deterministic today because one feed serves one
+    # deployment, and by construction once feed joins the dataset entry's identity (tj-rh4b7f),
+    # since a dataset then has exactly one feed.
+    stmt = select(asset_table).filter(*conditions).order_by(asset_table.timestamp, asset_table.dataset_id)
     results = await db.execute(stmt)
     db_asset_market_activities = results.scalars().all()
     return [obj.to_schema() for obj in db_asset_market_activities]

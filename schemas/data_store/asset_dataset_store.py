@@ -1,16 +1,50 @@
 from datetime import UTC, datetime, timedelta
+from typing import Annotated, Self
 from uuid import UUID
 
-from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    AwareDatetime,
+    ConfigDict,
+    Field,
+    WithJsonSchema,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateType
+from common.enums.pydantic_enums import NamedIntEnum
 from common.logging import get_logger
+from common.sensitive import OptionalSensitiveStr, SensitiveStr
 from routers.data_store.app_endpoints import ASSET_DATASET_ID_DESC, ASSET_TYPE_DESC, DATA_TYPE_DESC, SYMBOL_DESC
 from schemas.inbound_contract import InboundContract
 
 
 log = get_logger(__name__)
+
+
+def _member_names_schema(enum: type[NamedIntEnum]) -> WithJsonSchema:
+    """Document an enum field as the string enum of member names that the wire carries.
+
+    Args:
+        enum: The enum whose member names are the documented values.
+
+    Returns:
+        WithJsonSchema: The replacement schema, used in validation and serialization mode alike.
+    """
+    return WithJsonSchema({'type': 'string', 'enum': [member.name for member in enum]})
+
+
+# The documented type of expiry_type/update_type on the dataset-store models (user ruling A on
+# tj-vhboky.38). Left alone, pydantic documents an IntEnum as {type: integer, enum: [1..5]}, which
+# contradicts both the wire (serialize_enum_name below sends names) and the documented default
+# ('BULK' is not in [1..5]). Schema only: validation and serialization are untouched, so the wire
+# bytes do not change and NamedIntEnum.validate still accepts an integer, undocumented.
+# FIELD-LOCAL, NOT A HOOK ON NamedIntEnum: GetDatasetRequest (schemas/data_ingest) carries these
+# same enums as integers on the Kafka wire, so a class-level schema would make that model lie.
+ExpiryTypeByName = Annotated[ExpiryType, _member_names_schema(ExpiryType)]
+UpdateTypeByName = Annotated[UpdateType, _member_names_schema(UpdateType)]
 
 
 class StoreAssetDatasetBody(InboundContract):
@@ -49,7 +83,11 @@ class StoreAssetDatasetBody(InboundContract):
     # problem owner-scoped writes exist to prevent. Note what this does and does not buy -- the
     # single instance secret authenticates THE DEPLOYMENT, not the caller, so "only the owner may
     # edit" is enforced against MISTAKES, not against anyone holding the key.
-    owner: str
+    #
+    # Sensitive (tj-vhboky.45): left out of the repr and str of this model and every model that
+    # inherits it, so validate_fields' debug line below does not log it. model_dump and JSON are
+    # unchanged -- see common/sensitive.py for what is and is not guarded.
+    owner: SensitiveStr
 
     source: DataSource
 
@@ -59,8 +97,17 @@ class StoreAssetDatasetBody(InboundContract):
     # beginning cannot be checked for growth-only extension. The column is NOT NULL and the entry
     # upsert drops None values, so an absent start used to fail on a constraint deep in the write
     # rather than on validation at the edge. Fixed by making the body honest, not the column loose.
-    start: datetime
-    end: datetime | None = None
+    #
+    # AwareDatetime on start, end AND expiry, and the choice is REFUSE, not convert (user ruling on
+    # tj-1bl90i, 2026-09-27). All three land in timestamptz columns, where a naive value is read in
+    # the SESSION timezone -- an environment-dependent instant, silently. Assuming UTC for the
+    # caller was offered and declined: it is the same guess, just moved into our code. So a value
+    # with no offset is a 422 naming the field, in line with InboundContract's reject-don't-guess
+    # stance. These annotations are inherited by AssetDatasetStoreCreate, AssetDatasetStoreUpdate
+    # and the read model AssetDatasetStore (start/end); that is safe because every one of them is
+    # either built from this body or read off timestamptz columns, which always come back aware.
+    start: AwareDatetime
+    end: AwareDatetime | None = None
 
     # default_factory, not a computed default: a plain default is evaluated once at import, so
     # every instance in a long-lived process would share an expiry frozen at process start.
@@ -77,22 +124,27 @@ class StoreAssetDatasetBody(InboundContract):
     # field is still fine and still means "a day from now"; only an explicit null now 422s, naming
     # the field, at the edge. Fixed the same way `start` was under tj-6yk4qs: make the declared
     # contract honest, rather than patch the handler into tolerating a body it should have refused.
-    expiry: datetime = Field(default_factory=lambda: datetime.now(UTC) + timedelta(days=1))
-    expiry_type: ExpiryType = ExpiryType.BULK
-    update_type: UpdateType = UpdateType.STATIC
+    expiry: AwareDatetime = Field(default_factory=lambda: datetime.now(UTC) + timedelta(days=1))
+    # json_schema_extra keeps the documented default the NAME the wire carries. The JSON schema's
+    # default is encoded from the config, never from a field serializer, so without it the OpenAPI
+    # default would silently turn from 'BULK' into 1 when json_encoders was replaced below.
+    expiry_type: ExpiryTypeByName = Field(default=ExpiryType.BULK, json_schema_extra={'default': ExpiryType.BULK.name})
+    update_type: UpdateTypeByName = Field(
+        default=UpdateType.STATIC, json_schema_extra={'default': UpdateType.STATIC.name}
+    )
 
     @model_validator(mode='after')
-    def validate_fields(cls, request: 'StoreAssetDatasetBody') -> 'StoreAssetDatasetBody':
-        log.debug(f'Validating request: {request}')
-        if request.update_type is not UpdateType.STATIC and request.end is not None:
-            raise ValueError(f"The 'update_type' field must be '{ExpiryType.BULK.value}' when 'end' is provided.")
+    def validate_fields(self) -> Self:
+        log.debug(f'Validating request: {self}')
+        if self.update_type is not UpdateType.STATIC and self.end is not None:
+            raise ValueError(f"The 'update_type' field must be '{UpdateType.STATIC.name}' when 'end' is provided.")
 
-        if request.update_type is not UpdateType.STATIC and request.expiry_type is ExpiryType.BULK:
+        if self.update_type is not UpdateType.STATIC and self.expiry_type is ExpiryType.BULK:
             raise ValueError(
-                f"The 'update_type' field must be '{UpdateType.STATIC.value}' "
-                f"when 'expiry_type' is '{ExpiryType.BULK.value}'."
+                f"The 'update_type' field must be '{UpdateType.STATIC.name}' "
+                f"when 'expiry_type' is '{ExpiryType.BULK.name}'."
             )
-        return request
+        return self
 
     @field_validator('expiry_type', mode='before')
     def validate_expiry_type(cls, value):
@@ -102,7 +154,13 @@ class StoreAssetDatasetBody(InboundContract):
     def validate_update_type(cls, value):
         return UpdateType.validate(value)
 
-    model_config = ConfigDict(json_encoders={ExpiryType: ExpiryType.encoder, UpdateType: UpdateType.encoder})
+    # Enum NAMES on the wire, not the integer values (decision tj-vhboky.30): GET /store's JSON
+    # carries 'BULK'/'STATIC' and the private SDK reads them. JSON only, so model_dump() still
+    # yields the enum members. Replaces the deprecated json_encoders; no return annotation, so
+    # the JSON schema is left exactly as it was. Subclasses inherit it.
+    @field_serializer('expiry_type', 'update_type', when_used='json-unless-none')
+    def serialize_enum_name(self, value: ExpiryType | UpdateType):
+        return value.name
 
 
 class StoreAssetDatasetPath(InboundContract):
@@ -118,8 +176,9 @@ class StoreAssetDatasetPath(InboundContract):
 class StoreAssetDatasetQuery(InboundContract):
     # Same as body, but with optional fields. Optional is correct HERE and wrong on the body:
     # this is a search filter, where an absent field means "no constraint on that column", not a
-    # value written into an identity column.
-    owner: str | None = None
+    # value written into an identity column. Sensitive: OptionalSensitiveStr, never
+    # `SensitiveStr | None`, which silently keeps the value in the repr (common/sensitive.py).
+    owner: OptionalSensitiveStr = None
     source: DataSource | None = None
     # No feed filter, for the same reason the body has no feed field: there is no feed column on
     # store_dataset_entry to filter (tj-rh4b7f). Here it was not merely inert, it was a live
@@ -128,12 +187,17 @@ class StoreAssetDatasetQuery(InboundContract):
     # (data/store/app/database/crud/stock/store_dataset_entry.py), so any search that actually
     # named a tape raised rather than filtered.
     granularity: Granularity | None = None
-    start: datetime | None = None
-    end: datetime | None = None
-    expiry_type: ExpiryType | None = None
-    update_type: UpdateType | None = None
-    created_at: datetime | None = None
-    updated_at: datetime | None = None
+    # AwareDatetime on every time bound, and REFUSE, not convert (user ruling D2 = A on
+    # tj-vhboky.20, the tj-1bl90i rule applied to the read side). These are compared against
+    # timestamptz columns, where a naive bound is read in the SESSION timezone, so the same search
+    # would return different rows on differently configured hosts. A value with no offset is a 422
+    # naming the field; a caller typing ?start=2026-01-01 must add an offset or Z.
+    start: AwareDatetime | None = None
+    end: AwareDatetime | None = None
+    expiry_type: ExpiryTypeByName | None = None
+    update_type: UpdateTypeByName | None = None
+    created_at: AwareDatetime | None = None
+    updated_at: AwareDatetime | None = None
 
     @field_validator('expiry_type', mode='before')
     def validate_expiry_type(cls, value):
@@ -147,7 +211,10 @@ class StoreAssetDatasetQuery(InboundContract):
             return value
         return UpdateType.validate(value)
 
-    model_config = ConfigDict(json_encoders={ExpiryType: ExpiryType.encoder, UpdateType: UpdateType.encoder})
+    # Same wire form as StoreAssetDatasetBody's serializer; 'unless-none' keeps an absent filter null.
+    @field_serializer('expiry_type', 'update_type', when_used='json-unless-none')
+    def serialize_enum_name(self, value: ExpiryType | UpdateType):
+        return value.name
 
 
 class AssetDatasetStoreCreate(StoreAssetDatasetPath, StoreAssetDatasetBody):
@@ -188,16 +255,17 @@ class AssetDatasetStoreDelete(InboundContract):
     #
     # WHAT MAKES OPTIONAL SAFE IS A COLUMN CONSTRAINT, SO IT IS NAMED HERE RATHER THAN TRUSTED.
     # None must never AUTHORISE, and it cannot: _check_owner compares `existing.owner != declared`,
-    # and StoreDatasetEntry.owner is Column(String, nullable=False), so existing.owner is never
-    # None and the comparison is always true -- verified against both a normal owner and the
-    # migration's 'unassigned' server_default. If that column ever became nullable, a None here
-    # would start matching legacy rows and this field would turn into an authorisation bypass.
+    # and StoreDatasetEntry.owner is Column(SensitiveString, nullable=False,
+    # server_default='unassigned'), so existing.owner is never None and the comparison is always
+    # true -- verified against both a normal owner and the migration's 'unassigned' server_default.
+    # If that column ever became nullable, a None here would start matching legacy rows and this
+    # field would turn into an authorisation bypass.
     #
-    # NOT YET A 403, and do not read this field as delivering one: nothing maps OwnerMismatch to
-    # 403 or EntryNotFound to 404 yet, so today an owner-less delete is still a 500 -- just a
-    # different one. Those mappings are builder-store's remaining tj-vhboky.8 work in
-    # routers/data_store/asset_dataset_store.py. This field is what unblocks them, not a substitute.
-    owner: str | None = None
+    # The status codes are not set here: delete_data in routers/data_store/asset_dataset_store.py
+    # maps OwnerMismatch to 403 and EntryNotFound to 404, so an owner-less delete is a 403.
+    #
+    # Sensitive (tj-vhboky.45): out of the repr and str, unchanged in model_dump (common/sensitive.py).
+    owner: OptionalSensitiveStr = None
 
 
 class AssetDatasetStore(AssetDatasetStoreUpdate):

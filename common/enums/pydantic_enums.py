@@ -45,14 +45,14 @@ class NamedIntEnum(IntEnum):
         return cls[value.upper()]
 
     @classmethod
-    def encoder(cls, value: Self) -> int:
-        """Encode the enum value to an integer.
+    def encoder(cls, value: Self) -> str:
+        """Encode the enum value to its member name.
 
         Args:
             value (Self): Enum instance.
 
         Returns:
-            int: Encoded value.
+            str: The member name, e.g. 'BULK'.
         """
         return value.name
 

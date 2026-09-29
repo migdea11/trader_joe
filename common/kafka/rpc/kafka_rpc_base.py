@@ -1,10 +1,10 @@
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import TYPE_CHECKING, ClassVar, Generic, TypeVar
+from typing import TYPE_CHECKING, Generic, TypeVar
 from uuid import uuid4 as UUID
 
 from kafka.consumer.fetcher import ConsumerRecord
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from common.kafka.kafka_config import ConsumerParams, ProducerParams, RpcParams
 from common.kafka.messaging.kafka_consumer import KafkaConsumerFactory
@@ -35,10 +35,8 @@ class RpcRequest(BaseModel, Generic[Req]):
     correlation_id: int
     payload: Req
 
-    class Config:
-        # Required for Pydantic to validate generic models
-        arbitrary_types_allowed = True
-        json_encoders: ClassVar[dict] = {Req: lambda x: x.dict()}
+    # Required for Pydantic to validate generic models
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     @staticmethod
     def create_request(payload: Req) -> 'RpcRequest[Req]':
@@ -64,10 +62,8 @@ class RpcResponse(BaseModel, Generic[Res]):
     correlation_id: int
     payload: Res
 
-    class Config:
-        # Required for Pydantic to validate generic models
-        arbitrary_types_allowed = True
-        json_encoders: ClassVar[dict] = {Req: lambda x: x.dict()}
+    # Required for Pydantic to validate generic models
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     @staticmethod
     def create_response(request: RpcRequest, payload: Res) -> 'RpcResponse[Res]':

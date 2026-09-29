@@ -18,8 +18,9 @@ No external resource. Nothing here is marked ``external`` and nothing skips.
 
 import importlib
 import inspect
+import json
 import pkgutil
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
@@ -240,3 +241,150 @@ def test_the_request_feed_is_declared_optional_and_is_read_by_nothing():
     # And it is a value the SHARED enum can express -- a second Feed enum declared anywhere would
     # compare unequal to this one and fail only at runtime.
     assert Feed.SIP in set(Feed)
+
+
+# ---------------------------------------------------------------------------------------------
+# The RPC contract refuses naive times (F4, tj-vhboky.24)
+# ---------------------------------------------------------------------------------------------
+
+# BaseGetDatasetRequest's three time fields, each with an OFFSET-LESS instant that is otherwise
+# valid beside the rest of the payload. User ruling D2 = (A) on tj-vhboky.20 (2026-09-27, 21:21
+# UTC) says REFUSE, not convert -- the tj-1bl90i rule, applied to the store->ingest Kafka RPC
+# contract. fa1d7ee made them AwareDatetime.
+_NAIVE_RPC_TIMES: dict[str, datetime] = {
+    'start': datetime(2026, 1, 1),
+    'end': datetime(2026, 3, 1),
+    'expiry': datetime(2026, 2, 1),
+}
+
+_REQUEST_MODELS = [model for model, _ in CONSTRUCT_CASES]
+_PAYLOADS = dict(CONSTRUCT_CASES)
+
+_MINUS_FIVE = timezone(timedelta(hours=-5))
+
+
+def _wire(model: type[BaseModel], overrides: dict[str, Any]) -> str:
+    """The JSON the RPC would carry for ``model``'s minimal payload, with some keys replaced.
+
+    Built from the model's own ``model_dump(mode='json')`` rather than by hand, so the enum and UUID
+    keys are exactly what the sender puts on the wire; only the overridden keys are ours.
+
+    Args:
+        model: The request model.
+        overrides: Keys to replace in the dumped payload, already in their wire (JSON) form.
+
+    Returns:
+        str: The JSON text.
+    """
+    return json.dumps(model(**_PAYLOADS[model]).model_dump(mode='json') | overrides)
+
+
+@pytest.mark.parametrize('form', ['object', 'wire-text'])
+@pytest.mark.parametrize('field', sorted(_NAIVE_RPC_TIMES))
+@pytest.mark.parametrize('model', _REQUEST_MODELS, ids=_case_id)
+def test_a_naive_rpc_time_is_refused_at_its_own_field(model: type[BaseModel], field: str, form: str):
+    """REFUSE, per field, per request shape: user ruling D2 = (A), tj-vhboky.20, 2026-09-27.
+
+    Before fa1d7ee all three were plain ``datetime``, so a sender that put an offset-less time on the
+    Kafka topic had it accepted and handed to the vendor fetch as an instant in whatever zone the
+    ingest host assumed.
+
+    The error list is asserted EXACTLY -- one error, at this field, of type ``timezone_aware`` -- so a
+    refusal for another reason cannot satisfy it, and a CONVERT implementation (an after-validator
+    attaching UTC) reds it. ``wire-text`` is how the value actually arrives: the RPC server validates
+    the message with ``model_validate_json`` (common/kafka/rpc/kafka_rpc_server.py), so the naive
+    value is offset-less ISO text inside JSON. Every request shape is included because the ingest
+    router rebuilds the concrete ones from the base (routers/data_ingest/get_dataset_request.py); a
+    subclass that re-declared a field as ``datetime`` would reopen the hole below the base.
+
+    Args:
+        model: The request shape under test.
+        field: The time field sent without an offset.
+        form: A Python datetime passed to the constructor, or offset-less ISO text in JSON.
+    """
+    naive = _NAIVE_RPC_TIMES[field]
+    with pytest.raises(ValidationError) as excinfo:
+        if form == 'object':
+            model(**_PAYLOADS[model] | {field: naive})
+        else:
+            text = naive.isoformat()
+            assert text == naive.strftime('%Y-%m-%dT%H:%M:%S'), 'the fixture must carry no offset'
+            model.model_validate_json(_wire(model, {field: text}))
+    assert [(error['loc'], error['type']) for error in excinfo.value.errors()] == [((field,), 'timezone_aware')]
+
+
+@pytest.mark.parametrize(('suffix', 'zone'), [('Z', UTC), ('-05:00', _MINUS_FIVE)], ids=['zulu', 'nonzero-offset'])
+@pytest.mark.parametrize('field', sorted(_NAIVE_RPC_TIMES))
+def test_an_offset_bearing_rpc_time_is_accepted_as_the_instant_it_names(field: str, suffix: str, zone: timezone):
+    """The success half: the refusal above is also satisfied by a field that refuses EVERYTHING.
+
+    'Z' is what the store's own create body carries, so a guard that refused it would break the only
+    in-tree sender. The non-zero offset is compared as the INSTANT it names -- read as UTC, ``-05:00``
+    would fetch five hours early -- and the offset itself is asserted, so normalising on the way in
+    would be seen.
+
+    Args:
+        field: The time field sent with an offset.
+        suffix: The offset designator appended to the ISO text.
+        zone: The zone that designator names.
+    """
+    text = _NAIVE_RPC_TIMES[field].isoformat() + suffix
+
+    request = BaseGetDatasetRequest.model_validate_json(_wire(BaseGetDatasetRequest, {field: text}))
+
+    value = getattr(request, field)
+    assert value.tzinfo is not None
+    assert value == _NAIVE_RPC_TIMES[field].replace(tzinfo=zone)
+    assert value.utcoffset() == zone.utcoffset(None)
+
+
+def test_the_rpc_end_stays_required_but_nullable():
+    """Tightening ``end`` to AwareDatetime must keep ``| None`` AND keep it without a default.
+
+    Null is the open-ended dataset, and it is what data_action_request.py forwards whenever the
+    create body left ``end`` out -- so a refusal of None would break every open-ended fetch. Absent,
+    on the other hand, stays a ``missing`` error at ``end``: the sender must say "open-ended"
+    explicitly rather than by forgetting the key.
+    """
+    assert BaseGetDatasetRequest(**_BASE_PAYLOAD | {'end': None}).end is None
+    assert BaseGetDatasetRequest.model_validate_json(_wire(BaseGetDatasetRequest, {'end': None})).end is None
+
+    field = BaseGetDatasetRequest.model_fields['end']
+    assert field.is_required()
+
+    without_end = {key: value for key, value in _BASE_PAYLOAD.items() if key != 'end'}
+    with pytest.raises(ValidationError) as excinfo:
+        BaseGetDatasetRequest(**without_end)
+    assert [(error['loc'], error['type']) for error in excinfo.value.errors()] == [(('end',), 'missing')]
+
+
+@pytest.mark.parametrize('model', _REQUEST_MODELS, ids=_case_id)
+@pytest.mark.parametrize('end', [datetime(2026, 3, 1, tzinfo=timezone(timedelta(hours=9, minutes=30))), None])
+def test_a_json_round_trip_keeps_every_offset(model: type[BaseModel], end: datetime | None):
+    """The RPC's own serialisation must deliver an aware request the receiver still accepts.
+
+    The store sends ``request.model_dump_json()`` and the ingest server re-validates it with
+    ``model_validate_json`` (common/kafka/rpc/kafka_rpc_client.py and kafka_rpc_server.py). If the
+    dump dropped an offset, tightening the receiver would 422 -- more exactly, raise inside the RPC
+    server -- on every request the store itself builds. Three different offsets, one per field, so a
+    serialiser that kept only the first, or normalised all of them to one zone, is caught by the
+    per-field offset assertion rather than hidden by instant equality.
+
+    This drives the model's round trip, not the ``RpcRequest`` envelope around it; the envelope is
+    common/kafka's, and nothing here claims it.
+
+    Args:
+        model: The request shape under test.
+        end: A non-UTC aware end, or the open-ended null.
+    """
+    times = {'start': datetime(2026, 1, 1, tzinfo=_MINUS_FIVE), 'end': end, 'expiry': datetime(2026, 2, 1, tzinfo=UTC)}
+    sent = model(**_PAYLOADS[model] | times)
+
+    received = model.model_validate_json(sent.model_dump_json())
+
+    assert received == sent
+    for field, value in times.items():
+        if value is None:
+            assert getattr(received, field) is None
+        else:
+            assert getattr(received, field).utcoffset() == value.utcoffset(), f'{field} lost its offset'

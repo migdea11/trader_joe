@@ -56,6 +56,10 @@ testing = [
     "pytest>=8.4.2",
     "pytest-asyncio>=1.2.0",
     "pytest-cov>=7.0.0",
+    # Test-only: a real async pool without Postgres for the Docker-free component tests.
+    # Never add it to base, a service group or dev -- dev is baked into the service dev
+    # image (ADR tj-8z213c, Addendum 1).
+    "aiosqlite>=0.22.1",
 ]
 data-ingest = [
     "alpaca-py>=0.42.2",
@@ -70,12 +74,19 @@ data-store = [
     # re-resolution is free to drop it — measured, it did: a forced re-lock refreshed 61
     # packages, removed greenlet and took the suite to 1 failed, 1 error, 250 passed. The
     # extra names what the code actually requires instead of relying on that marker.
-    "sqlalchemy[asyncio]>=2.0.54",
+    #
+    # The <2.1 cap is deliberate (tj-bzcbb8). uv's default prerelease mode takes a pre-release
+    # whenever no stable release satisfies a requirement, and the install cooldown can create
+    # exactly that: with the >=2.0.54 floor younger than the window, a re-lock picked
+    # 2.1.0rc2 and three data/store tests failed, so 2.1 is not a drop-in. A global
+    # `prerelease = "explicit"` would cover every package, but measured, it makes the security
+    # group unresolvable: semgrep needs the opentelemetry 0.58b0 betas, which are published only
+    # as betas. Lift the cap as a decision when Dependabot proposes 2.1 final, not by re-lock.
+    "sqlalchemy[asyncio]>=2.0.54,<2.1",
 ]
 security = [
     "bandit>=1.8.6",
     "pip-audit>=2.9.0",
-    "safety>=3.6.2",
     "semgrep>=1.140.0",
 ]
 
@@ -99,6 +110,7 @@ exclude = [
     ".pytest_cache",
     ".ruff_cache",
     ".venv",
+    ".venv-devcontainer",
     ".vscode",
     "__pypackages__",
     "data/store/migrations/versions/*",
@@ -115,7 +127,8 @@ target-version = "py312"
 force-exclude = true
 
 [tool.ruff.lint]
-select = ["E", "W", "F", "I", "B", "UP", "C4", "SIM", "RUF", "TID252", "TC", "D"]
+# DTZ and ASYNC are permanent (tj-vhboky.30 item 3); PERF, RET, PIE and PTH are not, on purpose.
+select = ["E", "W", "F", "I", "B", "UP", "C4", "SIM", "RUF", "TID252", "TC", "D", "DTZ", "ASYNC"]
 ignore = [
     "E501", # line length — the formatter owns it
     "E402", # module-level import not at top: FastAPI pattern (routers imported after app)
@@ -151,6 +164,11 @@ runtime-evaluated-base-classes = ["pydantic.BaseModel"]
 [tool.ruff.lint.per-file-ignores]
 # FastAPI evaluates handler annotations at runtime; B008 is the Depends() idiom
 "routers/**" = ["TC001", "TC002", "TC003", "B008"]
+# the tests build naive datetimes on purpose, to prove they are refused
+"**/tests/**" = ["DTZ001"]
+# `timeout` here is a retry deadline that returns False, not an operation timeout, so
+# asyncio.timeout would change behaviour; kept as-is by user ruling (tj-mvqbaf, 2026-09-28)
+"common/database/postgres_tools.py" = ["ASYNC109"]
 
 [tool.ruff.lint.isort]
 lines-after-imports = 2

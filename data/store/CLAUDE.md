@@ -24,7 +24,7 @@ Sole owner of persisted market data. Every write goes through a repository; no r
 
 | # | Pitfall | Do instead |
 |---|---|---|
-| 1 | Compose falls back to a hard-coded password and host 'db' | Fail on missing variables (bug tj-70ovb3) |
+| 1 | A request session opened outside `async_db` / `session()` is never returned to the pool | Take the session from `async_db`; commit only through `write_transaction` (bug tj-vhboky.76, ADR tj-8z213c) |
 
 A pitfall lands here when it is true of this component and nowhere else. If it generalises past
 this project, it belongs in the kit's `lessons/` instead — and if it is a prohibition rather than

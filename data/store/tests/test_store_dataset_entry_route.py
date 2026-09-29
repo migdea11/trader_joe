@@ -46,6 +46,8 @@ declared is the principal both collaborators are handed.
 """
 
 import uuid
+from collections import defaultdict
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -54,8 +56,10 @@ from sqlalchemy import Select
 from sqlalchemy.dialects.postgresql import Insert as PostgresInsert
 
 from common.enums.data_select import AssetType, DataType
+from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateType
 from data.store.app.app_depends import get_rpc_clients
 from data.store.app.database.database import async_db
+from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.ingest import data_action_request
 from data.store.app.main import app
 from routers.common.instance_secret import INSTANCE_SECRET_ENV_VAR, INSTANCE_SECRET_HEADER
@@ -348,6 +352,93 @@ def test_a_request_overlapping_nothing_is_written_and_answers_200(post_dataset):
 
 
 # ---------------------------------------------------------------------------------------------
+# A naive datetime is refused at the edge (tj-1bl90i)
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ('field', 'offset_less'),
+    [('start', '2026-01-01T00:00:00'), ('end', '2026-03-01T00:00:00'), ('expiry', '2026-02-01T00:00:00')],
+)
+def test_an_offset_less_datetime_answers_422_naming_its_field_and_writes_nothing(
+    post_dataset, field: str, offset_less: str
+):
+    """THE CALLER'S VIEW OF THE USER RULING ON tj-1bl90i (2026-09-27): REFUSE, for start, end and expiry.
+
+    All three land in timestamptz columns, where an offset-less value is read in the Postgres SESSION
+    timezone. The schema-level refusal is pinned in schemas/tests/test_schemas_smoke_data_store.py;
+    what only this layer shows is that the refusal reaches the caller as a 422 naming the field --
+    not a 500 from a ValidationError raised deeper in the worker, where AssetDatasetStoreCreate is
+    rebuilt from the body -- and that it happens BEFORE anything is sent to the database or to ingest.
+    The session is given no canned results at all, so a single statement would fail the test on its
+    own assertion.
+
+    Args:
+        post_dataset: Drives the real POST route against a fake session.
+        field: The datetime field sent without an offset.
+        offset_less: Its ISO-8601 text, with no 'Z' and no offset.
+    """
+    session = FakeSession()
+    rpc_clients = RecordingRpcClients()
+
+    response = post_dataset(session, rpc_clients, REQUEST_BODY | {field: offset_less})
+
+    assert response.status_code == 422, f'an offset-less {field} answered {response.status_code}: {response.text}'
+    assert [(error['loc'], error['type']) for error in response.json()['detail']] == [
+        (['body', field], 'timezone_aware')
+    ], f'the 422 does not name {field} as timezone_aware: {response.text}'
+    assert session.statements == [], 'a request refused at the edge still reached the database'
+    assert rpc_clients.client.requests == [], 'ingest was asked to fetch data for a request that was refused'
+
+
+# The GET on the same address: the dataset SEARCH, bound to StoreAssetDatasetQuery with Query().
+SEARCH_ROUTE_NAME = 'get_data'
+
+
+@pytest.mark.parametrize(
+    ('field', 'offset_less'),
+    [
+        ('start', '2026-01-01T00:00:00'),
+        ('end', '2026-03-01T00:00:00'),
+        ('created_at', '2026-02-01T09:30:00'),
+        ('updated_at', '2026-02-02T16:45:00'),
+    ],
+)
+def test_an_offset_less_search_bound_answers_422_naming_its_field_and_reads_nothing(field: str, offset_less: str):
+    """THE CALLER'S VIEW OF USER RULING D2 = (A) ON tj-vhboky.20 (2026-09-27): REFUSE, on the search too.
+
+    GET /store/{asset_type}/{data_type}/{asset_symbol} filters store_dataset_entry by these four
+    bounds, compared against timestamptz columns, where an offset-less value is read in the Postgres
+    SESSION timezone. fa1d7ee made them AwareDatetime; the schema-level refusal is pinned in
+    schemas/tests/test_schemas_smoke_data_store.py. What only this layer shows is that the refusal
+    reaches the caller as a 422 at ``['query', field]`` -- the route binds the model with Query(), so
+    a Depends() or body binding would name a different location -- and that it happens before
+    search_entries runs. The session is given no canned results, so a single statement would fail on
+    the session's own assertion as well as on the empty-statements check.
+
+    The GET carries no instance-secret guard (only the write routes do; test_http_smoke.py pins
+    which), so no header is sent and the 422 cannot be a 401 in disguise.
+
+    Args:
+        field: The time filter sent without an offset.
+        offset_less: Its ISO-8601 text, with no 'Z' and no offset.
+    """
+    session = FakeSession()
+    app.dependency_overrides[async_db] = lambda: session
+    try:
+        response = TestClient(app).get(app.url_path_for(SEARCH_ROUTE_NAME, **PATH_PARAMS), params={field: offset_less})
+    finally:
+        # `app` is a module-level singleton other test modules import.
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 422, f'an offset-less {field} answered {response.status_code}: {response.text}'
+    assert [(error['loc'], error['type']) for error in response.json()['detail']] == [
+        (['query', field], 'timezone_aware')
+    ], f'the 422 does not name {field} as timezone_aware: {response.text}'
+    assert session.statements == [], 'a search refused at the edge still reached the database'
+
+
+# ---------------------------------------------------------------------------------------------
 # Whose principal the write lands under
 # ---------------------------------------------------------------------------------------------
 
@@ -500,4 +591,236 @@ async def test_the_entry_and_the_fetch_agree_on_every_identity_field_the_caller_
         'beyond the reach of this case and is not claimed here: the fixture drives one data_type, so the '
         'literal and the forwarded value are the same string in the only request that runs -- see the '
         'docstring for why widening the fixture is the wrong repair'
+    )
+
+
+# ---------------------------------------------------------------------------------------------
+# What the private SDK reads: GET /store's JSON carries enum NAMES (M0, tj-vhboky.31)
+# ---------------------------------------------------------------------------------------------
+
+# Every member of both enums, in the pairs validate_fields accepts (the read model inherits it): each
+# expiry type under STATIC, and each non-STATIC update type under ROLLING.
+_WIRE_PAIRS: list[tuple[ExpiryType, UpdateType]] = [(member, UpdateType.STATIC) for member in ExpiryType] + [
+    (ExpiryType.ROLLING, member) for member in UpdateType if member is not UpdateType.STATIC
+]
+_WHEN = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ('expiry_type', 'update_type'), _WIRE_PAIRS, ids=[f'{e.name}-{u.name}' for e, u in _WIRE_PAIRS]
+)
+def test_the_dataset_search_answers_enum_names_and_nulls_on_the_wire(expiry_type: ExpiryType, update_type: UpdateType):
+    """GET /store/{asset_type}/{data_type}/{asset_symbol} answers expiry_type and update_type as NAMES.
+
+    Decision tj-vhboky.30 (user approved option A, 2026-09-28): the names are the contract the
+    private SDK consumes, and M1 (tj-vhboky.32) must keep them byte-identical while it replaces the
+    deprecated ``json_encoders``. The schema-level pins are in
+    schemas/tests/test_schemas_smoke_data_store.py; what only this layer shows is that FastAPI's
+    response serialisation of ``list[AssetDatasetStore]`` -- which goes through its own TypeAdapter,
+    not through ``model_dump_json`` -- honours the same encoding. A serializer that one path used and
+    the other did not would pass there and fail here.
+
+    The REAL search_entries runs, against the recording fake session: it is handed one transient
+    StoreDatasetEntry row and its bar count, which is the shape ``result.all()`` yields, so the ORM ->
+    AssetDatasetStore -> JSON path is the production one end to end. ``end`` and ``expiry`` are None on
+    the row, and the answer must carry them as JSON null rather than drop them. No Postgres is
+    reached: what a real row round-trips as is the host-verified tier's (tj-vhboky.14), not this one.
+
+    Args:
+        expiry_type: The expiry member stored on the row.
+        update_type: The update member stored on the row.
+    """
+    entry_id = uuid.UUID('00000000-0000-0000-0000-00000000000a')
+    row = StoreDatasetEntry(
+        id=entry_id,
+        owner=DECLARED_PRINCIPAL,
+        source=DataSource.ALPACA_API,
+        asset_symbol='AAPL',
+        asset_type=AssetType.STOCK,
+        data_type=DataType.MARKET_ACTIVITY,
+        granularity=Granularity.ONE_DAY,
+        start=_WHEN,
+        end=None,
+        expiry=None,
+        expiry_type=expiry_type,
+        update_type=update_type,
+        created_at=_WHEN,
+        updated_at=_WHEN,
+    )
+    session = FakeSession(FakeResult(rows=[(row, 3)]))
+    app.dependency_overrides[async_db] = lambda: session
+    try:
+        response = TestClient(app).get(app.url_path_for(SEARCH_ROUTE_NAME, **PATH_PARAMS))
+    finally:
+        # `app` is a module-level singleton other test modules import.
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200, response.text
+    assert response.json() == [
+        {
+            'owner': DECLARED_PRINCIPAL,
+            'source': 'ALPACA',
+            'granularity': '1day',
+            'start': '2026-01-01T00:00:00Z',
+            'end': None,
+            'expiry': None,
+            'expiry_type': expiry_type.name,
+            'update_type': update_type.name,
+            'asset_type': 'stock',
+            'data_type': 'market-activity',
+            'asset_symbol': 'AAPL',
+            'id': str(entry_id),
+            'item_count': 3,
+            'created_at': '2026-01-01T00:00:00Z',
+            'updated_at': '2026-01-01T00:00:00Z',
+        }
+    ], (
+        f'GET /store no longer answers the enum names {expiry_type.name!r}/{update_type.name!r} (or dropped a '
+        f'null) -- the wire form the private SDK reads (tj-vhboky.30): {response.text}'
+    )
+
+
+# ---------------------------------------------------------------------------------------------
+# M1 (tj-vhboky.32): the OpenAPI documents the enum defaults as names
+# ---------------------------------------------------------------------------------------------
+
+
+def _openapi_schema_of(spec: dict, route_name: str, method: str, *, response: bool) -> dict:
+    """The component schema one store route's request body or 200 response resolves to.
+
+    Reached from the route, not by component name, so the assertion is about what that route actually
+    documents rather than about a component that might no longer be the one it references.
+
+    Args:
+        spec: ``app.openapi()``.
+        route_name: The FastAPI route name, as ``app.url_path_for`` takes it.
+        method: The HTTP method, lower-case.
+        response: True for the 200 response's schema (the list item, for a list), False for the body.
+
+    Returns:
+        dict: The resolved component schema.
+    """
+    # The OpenAPI keys paths by template. Fill each with this file's path parameters (a placeholder
+    # it does not know, such as {id}, fills empty and so cannot match) and keep the one that equals
+    # the URL the app resolves for the route.
+    url = app.url_path_for(route_name, **PATH_PARAMS)
+    fill = defaultdict(str, PATH_PARAMS)
+    (path,) = [template for template in spec['paths'] if template.format_map(fill) == url]
+    operation = spec['paths'][path][method]
+    if response:
+        schema = operation['responses']['200']['content']['application/json']['schema']
+        schema = schema.get('items', schema)
+    else:
+        schema = operation['requestBody']['content']['application/json']['schema']
+    ref = schema['$ref']
+    assert ref.startswith('#/components/schemas/'), ref
+    return spec['components']['schemas'][ref.rsplit('/', 1)[1]]
+
+
+@pytest.mark.parametrize(
+    ('route_name', 'method', 'response'),
+    [(ROUTE_NAME, 'post', False), (SEARCH_ROUTE_NAME, 'get', True)],
+    ids=['POST-store-body', 'GET-store-response'],
+)
+def test_the_store_openapi_documents_the_enum_defaults_as_names(route_name: str, method: str, response: bool):
+    """The store's OpenAPI gives expiry_type and update_type the defaults 'BULK' and 'STATIC'.
+
+    The OpenAPI is what the private SDK's typed client is generated from, and the wire carries names
+    (tj-vhboky.30), so the documented default must be the name too. c535d98's field serializer does not
+    reach the schema default -- Pydantic encodes it through config ``json_encoders`` only -- and without
+    the ``json_schema_extra`` default on StoreAssetDatasetBody this document says 1 for both, with every
+    wire pin still green. The schema-level half is in schemas/tests/test_schemas_smoke_data_store.py;
+    this is the document FastAPI actually serves, for the POST body and for the search's response items.
+
+    Args:
+        route_name: The store route whose schema is read.
+        method: Its HTTP method.
+        response: Read the 200 response's item schema rather than the request body.
+    """
+    properties = _openapi_schema_of(app.openapi(), route_name, method, response=response)['properties']
+
+    defaults = (properties['expiry_type'].get('default'), properties['update_type'].get('default'))
+
+    assert defaults == ('BULK', 'STATIC'), (
+        f'{method.upper()} {route_name} documents defaults {defaults!r}, not the enum names the wire carries'
+    )
+
+
+# ---------------------------------------------------------------------------------------------
+# M5 (tj-vhboky.40): the OpenAPI documents the enum TYPE as a string enum of names
+# ---------------------------------------------------------------------------------------------
+#
+# User ruling A on tj-vhboky.38. The schema-level half is in schemas/tests/test_schemas_smoke_data_store.py.
+# The unreferenced integer ExpiryType/UpdateType components that app.openapi() once listed (the
+# builder's finding on tj-vhboky.40) are pruned since tj-1b3aer; their absence is pinned in
+# data/store/tests/test_openapi_pruning.py, not here. These tests still read only what each route
+# REFERENCES, so they neither rely on nor forbid those components.
+_ENUM_FIELDS = [('expiry_type', ExpiryType), ('update_type', UpdateType)]
+
+
+def _search_query_parameter(spec: dict, name: str) -> dict:
+    """The schema of one query parameter of GET /store, reached from the route.
+
+    Args:
+        spec: ``app.openapi()``.
+        name: The query parameter's name.
+
+    Returns:
+        dict: That parameter's ``schema``; exactly one parameter of that name must be in the query.
+    """
+    url = app.url_path_for(SEARCH_ROUTE_NAME, **PATH_PARAMS)
+    fill = defaultdict(str, PATH_PARAMS)
+    (path,) = [template for template in spec['paths'] if template.format_map(fill) == url]
+    (parameter,) = [
+        parameter
+        for parameter in spec['paths'][path]['get'].get('parameters', [])
+        if parameter['name'] == name and parameter['in'] == 'query'
+    ]
+    return parameter['schema']
+
+
+@pytest.mark.parametrize(('field', 'enum'), _ENUM_FIELDS, ids=[field for field, _ in _ENUM_FIELDS])
+@pytest.mark.parametrize(
+    ('route_name', 'method', 'response'),
+    [(ROUTE_NAME, 'post', False), (SEARCH_ROUTE_NAME, 'get', True)],
+    ids=['POST-store-body', 'GET-store-response'],
+)
+def test_the_store_openapi_documents_the_enum_body_fields_as_names(
+    route_name: str, method: str, response: bool, field: str, enum: type
+):
+    """The POST body and the GET response items document the field as {type: string, enum: names}.
+
+    Args:
+        route_name: The store route whose schema is read.
+        method: Its HTTP method.
+        response: Read the 200 response's item schema rather than the request body.
+        field: The enum field.
+        enum: The enum class the field holds.
+    """
+    documented = _openapi_schema_of(app.openapi(), route_name, method, response=response)['properties'][field]
+
+    assert '$ref' not in documented, f'{method.upper()} {route_name} {field} points at a component: {documented!r}'
+    assert documented.get('type') == 'string', f'{method.upper()} {route_name} {field} documents {documented!r}'
+    assert documented.get('enum') == [member.name for member in enum], (
+        f'{method.upper()} {route_name} {field} documents enum {documented.get("enum")!r}, not the member names'
+    )
+
+
+@pytest.mark.parametrize(('field', 'enum'), _ENUM_FIELDS, ids=[field for field, _ in _ENUM_FIELDS])
+def test_the_store_openapi_documents_the_search_filters_as_nullable_names(field: str, enum: type):
+    """GET /store's enum query parameters are anyOf [{type: string, enum: names}, {type: null}].
+
+    The filters are optional, so the null branch is expected; the one other branch must be the
+    string enum of names, not an integer enum or a component reference.
+
+    Args:
+        field: The enum query parameter.
+        enum: The enum class the parameter holds.
+    """
+    schema = _search_query_parameter(app.openapi(), field)
+
+    assert {'type': 'null'} in schema.get('anyOf', []), f'GET /store ?{field} is not nullable: {schema!r}'
+    branches = [branch for branch in schema['anyOf'] if branch != {'type': 'null'}]
+    assert branches == [{'type': 'string', 'enum': [member.name for member in enum]}], (
+        f'GET /store ?{field} documents {branches!r}, not a string enum of member names'
     )

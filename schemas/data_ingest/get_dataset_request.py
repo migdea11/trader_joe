@@ -1,8 +1,10 @@
-from datetime import datetime
 from uuid import UUID
+
+from pydantic import AwareDatetime
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
+from common.sensitive import SensitiveStr
 from schemas.inbound_contract import InboundContract
 
 
@@ -10,8 +12,9 @@ class BaseGetDatasetRequest(InboundContract):
     dataset_id: UUID
     # Carried through from the store request so the fetch knows which principal it is acting for
     # and which tape to ask the vendor for. owner is identity on the entry (tj-vhboky.1 section 2)
-    # and may not be invented here.
-    owner: str
+    # and may not be invented here. Sensitive (tj-vhboky.45): left out of this model's repr and
+    # str, still carried by model_dump/model_dump_json -- see common/sensitive.py.
+    owner: SensitiveStr
     source: DataSource
     # KEPT, BUT INERT TODAY, AND THE COMMENT THAT USED TO SIT HERE OVERSTATED IT. It claimed this
     # was "the only model where that optionality is meant to end" -- that the adapter would take
@@ -33,10 +36,14 @@ class BaseGetDatasetRequest(InboundContract):
     feed: Feed | None = None
 
     granularity: Granularity
-    start: datetime
-    end: datetime | None
+    # AwareDatetime, REFUSE not convert (user ruling D2 = A on tj-vhboky.20, the tj-1bl90i rule).
+    # The one in-tree sender, data/store/app/ingest/data_action_request.py, builds this from
+    # StoreAssetDatasetBody, whose start/end/expiry are already aware, and the RPC carries it as
+    # model_dump_json(), which keeps the offset -- so tightening this receiver breaks no sender.
+    start: AwareDatetime
+    end: AwareDatetime | None
 
-    expiry: datetime
+    expiry: AwareDatetime
     expiry_type: ExpiryType
     update_type: UpdateType
 

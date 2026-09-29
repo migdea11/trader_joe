@@ -1,10 +1,12 @@
 import time
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from typing import ClassVar
 
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.engine.url import URL
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_scoped_session, create_async_engine
-from sqlalchemy.orm import Session, scoped_session, sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import Session, sessionmaker
 
 from common.environment import get_env_var
 from common.logging import get_logger
@@ -16,13 +18,11 @@ _POSTGRES_ASYNC_ENABLED = get_env_var('POSTGRES_ASYNC', default=False, cast_type
 _POSTGRES_SYNC_ENABLED = get_env_var('POSTGRES_SYNC', default=False, cast_type=bool)
 if _POSTGRES_ASYNC_ENABLED is True:
     log.info('Postgres async is enabled.')
-    print('Postgres async is enabled.')
     import asyncio
 
     import asyncpg
 if _POSTGRES_SYNC_ENABLED is True:
     log.info('Postgres sync is enabled.')
-    print('Postgres sync is enabled.')
     import psycopg2
 
 
@@ -58,8 +58,8 @@ class PostgresSessionFactory:
     class AsyncSessionHandle:
         """Postgres session handle."""
 
-        _async_engines: ClassVar[dict[str, AsyncEngine]] = {}
-        _async_sessions: ClassVar[dict[str, async_scoped_session]] = {}
+        _async_engines: ClassVar[dict[int, AsyncEngine]] = {}
+        _async_session_makers: ClassVar[dict[int, async_sessionmaker[AsyncSession]]] = {}
 
         @staticmethod
         def create_uri(host: str, port: int, database: str, user: str, password: str) -> URL:
@@ -128,7 +128,9 @@ class PostgresSessionFactory:
                 ConnectionError: Failed to connect to the database.
             """
             uri_str = PostgresSessionFactory._get_display_uri(uri)
-            if uri_str in cls._async_engines:
+            # The dicts are keyed by the db hash, so the guard must test the hash.
+            db_hash = PostgresSessionFactory._get_db_hash(uri)
+            if db_hash in cls._async_engines:
                 raise RuntimeError(f'Session factory already initialized for {uri_str}.')
 
             if not await cls.wait_for_db(uri, timeout):
@@ -136,16 +138,28 @@ class PostgresSessionFactory:
 
             # Initialize async engine and session
             async_engine = create_async_engine(uri.render_as_string(hide_password=False), pool_pre_ping=True)
-            db_hash = PostgresSessionFactory._get_db_hash(uri)
             cls._async_engines[db_hash] = async_engine
-            cls._async_sessions[db_hash] = async_scoped_session(
-                sessionmaker(async_engine, class_=AsyncSession, autocommit=False, autoflush=False),
-                scopefunc=asyncio.current_task,
-            )
+            cls._async_session_makers[db_hash] = async_sessionmaker(async_engine, autocommit=False, autoflush=False)
 
         @classmethod
-        def get_session(cls, uri: URL) -> AsyncSession:
-            """Get an async session for the given database URI.
+        @asynccontextmanager
+        async def session(cls, uri: URL) -> AsyncIterator[AsyncSession]:
+            """Open an async session for the given database URI, closed when the block exits.
+
+            The session comes from a plain async_sessionmaker, not a registry. Nothing here
+            commits and nothing here rolls back: transaction boundaries belong to the caller
+            (data_store's write_transaction). On exit, AsyncSession.__aexit__ closes the
+            session, which rolls back any transaction still open -- that is how a read ends --
+            and returns the connection to the pool.
+
+            There is deliberately no scoped registry behind this. A Task-keyed registry keeps
+            every session and its Task alive until someone calls remove(), and a caller that
+            forgets leaks a pooled connection per request (ADR tj-8z213c). The context manager
+            makes the owner of the session explicit instead.
+
+            expire_on_commit is left at its default (True) deliberately (ADR tj-8z213c,
+            Addendum 1 (i)): no code reads ORM attributes after a commit, and the one caller
+            that returns an ORM object after committing refreshes it explicitly.
 
             Args:
                 uri (URL): Postgres URI.
@@ -153,24 +167,26 @@ class PostgresSessionFactory:
             Raises:
                 RuntimeError: Session Handle not initialized.
 
-            Returns:
-                AsyncSession: Postgres async session.
+            Yields:
+                AsyncSession: Postgres async session, closed when the block exits.
             """
             db_hash = PostgresSessionFactory._get_db_hash(uri)
-            if db_hash not in cls._async_sessions:
+            if db_hash not in cls._async_session_makers:
                 raise RuntimeError(
                     f'Session handle not initialized for {PostgresSessionFactory._get_display_uri(uri)}.'
                 )
 
-            temp = cls._async_sessions[db_hash]()
-            log.debug(f'Session[{type(temp)}]: {temp}')
-            return temp
+            async with cls._async_session_makers[db_hash]() as session:
+                yield session
 
     class SyncSession:
-        """Creates handle to create and manage Postgres database async sessions."""
+        """Creates and manages a sync Postgres engine and a plain sessionmaker.
 
-        _sync_engines: ClassVar[dict[str, Engine]] = {}
-        _sync_sessions: ClassVar[dict[str, scoped_session]] = {}
+        Exposed only through session() (ADR tj-8z213c).
+        """
+
+        _sync_engines: ClassVar[dict[int, Engine]] = {}
+        _sync_session_makers: ClassVar[dict[int, sessionmaker[Session]]] = {}
 
         @staticmethod
         def create_uri(host: str, port: int, database: str, user: str, password: str) -> URL:
@@ -228,22 +244,38 @@ class PostgresSessionFactory:
         def initialize(cls, uri: URL, timeout: int, retry: int = 1):
             """Initialize sync engines and session factories (synchronous)."""
             uri_str = PostgresSessionFactory._get_display_uri(uri)
-            if uri_str in cls._sync_engines:
+            # The dicts are keyed by the db hash, so the guard must test the hash.
+            db_hash = PostgresSessionFactory._get_db_hash(uri)
+            if db_hash in cls._sync_engines:
                 raise RuntimeError(f'Session factory already initialized for {uri_str}.')
 
             if not cls.wait_for_db(uri, timeout, retry):
                 raise ConnectionError(f'Database startup timed out for {uri_str}.')
 
-            # Initialize sync engine and session
+            # Initialize sync engine and session factory. session() is the only accessor.
             sync_engine = create_engine(uri.render_as_string(hide_password=False), pool_pre_ping=True)
-            db_hash = PostgresSessionFactory._get_db_hash(uri)
+            session_maker = sessionmaker(sync_engine, autocommit=False, autoflush=False)
             cls._sync_engines[db_hash] = sync_engine
-            cls._sync_sessions[db_hash] = scoped_session(sessionmaker(sync_engine, autocommit=False, autoflush=False))
+            cls._sync_session_makers[db_hash] = session_maker
             log.info(f'Postgres sync session factory initialized for {uri_str}.')
 
         @classmethod
-        def get_session(cls, uri: URL) -> Session:
-            """Get a sync session for the given database URI.
+        @contextmanager
+        def session(cls, uri: URL) -> Iterator[Session]:
+            """Open a sync session for the given database URI, closed when the block exits.
+
+            The session comes from a plain sessionmaker, not a registry. Nothing here commits
+            and nothing here rolls back: transaction boundaries belong to the caller. On exit,
+            Session.__exit__ closes the session, which rolls back any transaction still open
+            and returns the connection to the pool.
+
+            There is deliberately no scoped registry behind this: a registry keeps every
+            session alive until someone calls remove(), and a caller that forgets leaks a
+            pooled connection (ADR tj-8z213c). The context manager makes the owner explicit.
+
+            expire_on_commit is left at its default (True) deliberately (ADR tj-8z213c,
+            Addendum 1 (i)): no code reads ORM attributes after a commit, and the one caller
+            that returns an ORM object after committing refreshes it explicitly.
 
             Args:
                 uri (URL): Postgres URI.
@@ -251,16 +283,17 @@ class PostgresSessionFactory:
             Raises:
                 RuntimeError: Session Handle not initialized.
 
-            Returns:
-                Session: Postgres sync session.
+            Yields:
+                Session: Postgres sync session, closed when the block exits.
             """
             db_hash = PostgresSessionFactory._get_db_hash(uri)
-            if db_hash not in cls._sync_sessions:
+            if db_hash not in cls._sync_session_makers:
                 raise RuntimeError(
                     f'Session handle not initialized for {PostgresSessionFactory._get_display_uri(uri)}.'
                 )
 
-            return cls._sync_sessions[db_hash]()
+            with cls._sync_session_makers[db_hash]() as session:
+                yield session
 
     @classmethod
     async def shutdown(cls):
@@ -271,7 +304,7 @@ class PostgresSessionFactory:
             sync_engine.dispose()
 
         cls.AsyncSessionHandle._async_engines.clear()
-        cls.AsyncSessionHandle._async_sessions.clear()
+        cls.AsyncSessionHandle._async_session_makers.clear()
         cls.SyncSession._sync_engines.clear()
-        cls.SyncSession._sync_sessions.clear()
+        cls.SyncSession._sync_session_makers.clear()
         log.info('Postgres session factory shut down.')

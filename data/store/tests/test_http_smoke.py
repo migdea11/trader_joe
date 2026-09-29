@@ -183,6 +183,20 @@ DATA_POINT = {
 # ones above went stale for unrelated reasons and only looked like one failure (tj-1njw7c).
 DATASET_REQUEST = {'owner': 'test-owner', 'source': 'ALPACA', 'granularity': '1day', 'start': '2026-01-01T00:00:00Z'}
 
+# The well-formed GET /internal/asset-data names a dataset_id, and the malformed one does too. Until
+# F1b (tj-vhboky.26, ebb2439) both sent NO query at all, which was well-formed while every bars-query
+# field was optional. The user ruled on 2026-09-27 (tj-vhboky.20, ruling 5) that a bars query naming
+# neither dataset_id nor asset_symbol must be impossible to construct, so `{}` now answers 422 at loc
+# ['query'] and is no longer a well-formed request.
+#
+# THE EMPTY QUERY DID NOT MOVE TO THE MALFORMED SIDE, because it does not fit this file's design:
+# each malformed request corrupts exactly ONE named field, and the refusal names no field -- it is a
+# model-level error. It is also why the malformed request carries the selector: without it that
+# request would corrupt the path AND omit the selector, two faults where the design allows one. The
+# empty-query refusal over HTTP is the behaviour-test bead's subject (F3, tj-vhboky.23); the model
+# level is pinned in schemas/tests/test_schemas_smoke_data_store.py.
+BARS_QUERY = {'params': {'dataset_id': '8f41c2d7-a3b9-4d1e-9c2f-0a1b2c3d4e5f'}}
+
 # The well-formed DELETE. `owner` is a QUERY parameter on /store/{id} (AssetDatasetStoreDelete), and
 # it is an authorisation assertion rather than a data field -- so a well-formed delete declares one
 # that MATCHES the stored entry FakeResult.scalar_one_or_none() hands back. Without a matching owner
@@ -203,9 +217,9 @@ DELETE_ID = uuid.uuid4()
 CASES: dict[str, Case] = {
     'GET /internal/asset-data/{asset_type}/{data_type}': Case(
         path_params=ASSET_PATH,
-        request={},
+        request=BARS_QUERY,
         malformed_path_params={**ASSET_PATH, 'asset_type': 'not-an-asset-type'},
-        malformed_request={},
+        malformed_request=BARS_QUERY,
         malformed_field='asset_type',
     ),
     'POST /internal/asset-data/{asset_type}/{data_type}': Case(

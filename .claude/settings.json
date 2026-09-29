@@ -3,14 +3,15 @@
     "BD_DISABLE_METRICS": "1"
   },
   "permissions": {
+    "defaultMode": "bypassPermissions",
     "allow": [
       "Bash(bd show *)",
       "WebSearch"
     ],
     "deny": [
-      "Read(.env)",
-      "Read(./.env)",
-      "Read(**/.env)"
+      "Read(**/.env)",
+      "Bash(git push)",
+      "Bash(git push *)"
     ]
   },
   "hooks": {
@@ -21,6 +22,10 @@
           {
             "type": "command",
             "command": "jq -r '.tool_input.command // \"\"' | grep -qP '(^|[|;&(]|\\s)(cat|head|tail|less|more|sed|awk|nl|tac|od|xxd|strings|base64|cp|mv|rsync|scp|tar|dd|source|grep|rg|ugrep|egrep|fgrep|jq|python|python3|perl|ruby|node|bat|vi|vim|nano|emacs|cut|sort|uniq|split|cmp|diff|md5sum|sha256sum)\\s+[^|;&]*?(?<![A-Za-z0-9_-])\\.env(?!\\.(default|example|sample|template))(?![A-Za-z0-9_-])' && echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Project rule: agents never read a live .env - it holds real credentials. Read .env.default instead (placeholders). Deferred rotation context: bd tj-10jczr.\"}}' || true"
+          },
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input.command // \"\"' | grep -qP '(^|[|;&(]|\\s)git(\\s+-[Cc]\\s+\\S+|\\s+--?[A-Za-z][\\w-]*(=\\S+)?)*\\s+push(\\s|$)' && echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Project rule: no agent pushes, in any spelling. The user pushes by hand.\"}}' || true"
           }
         ]
       }

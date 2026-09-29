@@ -5,13 +5,13 @@ services:
     # 13 went EOL 2025-11-13; bump deliberately (tj-owduw0).
     image: postgres:17.11-trixie
     container_name: ${DATABASE_NAME}
-    ports:
-      # Loopback only. A published port bypasses the host firewall entirely -- docker
-      # writes its own DOCKER chain ahead of anything ufw/firewalld holds -- so the bare
-      # "5432:5432" put this database on every interface the machine has. Nothing in the
-      # stack needs it: data_store reaches Postgres over the compose network. This
-      # mapping exists solely for psql or a GUI client on this machine.
-      - "127.0.0.1:${DATABASE_PORT}:5432"
+    networks:
+      # store_db only: data_store is the one service that talks to the database, and an
+      # internal network gives Postgres no gateway, so no egress and nothing to publish
+      # through. No host port in prod -- a published port bypasses the host firewall
+      # entirely (docker writes its own DOCKER chain ahead of ufw/firewalld). The dev-only
+      # loopback publish for psql lives in docker-compose.override.yaml, with devnet.
+      - store_db
     env_file:
       - .env
       - ./data/store/.env
@@ -51,6 +51,11 @@ services:
     # put an unauthenticated, plaintext broker on the LAN. Inspect the broker with
     # `docker compose exec kafka`. BROKER_PORT is still the port the services connect to
     # inside the network.
+    networks:
+      # ingest_store only: its clients are data_store and data_ingest. Internal, so the
+      # unauthenticated plaintext broker has no egress and no host port, in prod or dev.
+      # When gRPC replaces Kafka this entry goes and ingest_store stays (see networks:).
+      - ingest_store
     env_file:
       - .env
       - ./data/ingest/.env
@@ -102,12 +107,18 @@ services:
         SERVICE_PATH: data
         SERVICE_NAME: store
     hostname: ${DATA_STORE_NAME:-data_store}
-    ports:
-      # Loopback only. The API has no authentication of any kind yet, and data_ingest
-      # calls it over the compose network on APP_INTERNAL_PORT, not through this
-      # mapping. Kept published so /docs and curl still work from this machine; drop the
-      # mapping outright once nothing on the host talks to it.
-      - "127.0.0.1:${DATA_STORE_PORT}:${APP_INTERNAL_PORT}"
+    networks:
+      # Three internal networks and nothing else, so data_store has no gateway: no egress,
+      # and it cannot be published, which is what keeps it off the internet for good.
+      #   store_db      reaches Postgres.
+      #   ingest_store  reaches data_ingest and Kafka, and is reached by data_ingest.
+      #   store_api     serves its API to client containers (strategies, SDK, test client).
+      # No host port in prod: host-side inspection is `compose exec` or a client container
+      # on store_api. The dev-only loopback publish for /docs and curl lives in
+      # docker-compose.override.yaml, with devnet.
+      - store_db
+      - ingest_store
+      - store_api
     volumes:
       - ./data/store/alembic.ini:/code/alembic.ini
       - ./data/store/migrations:/code/migrations
@@ -124,8 +135,9 @@ services:
       # over `env_file:` regardless. Its one consumer is data/store/migrations/env.py, which
       # hands it to alembic; the app builds its own DSN from the discrete POSTGRES_* and
       # DATABASE_* variables.
-      # The port is the container's 5432, not DATABASE_PORT -- that one is the host side
-      # of the mapping above and is not what this URI dials.
+      # The port is the container's 5432, not DATABASE_PORT -- that one is the host-side
+      # port of the dev-only loopback publish in docker-compose.override.yaml, and is not
+      # what this URI dials.
       - DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASS}@${DATABASE_NAME}:5432/${POSTGRES_DB_NAME}
     image: trader_joe_data_store:latest
     security_opt:
@@ -140,9 +152,10 @@ services:
       # status, so a service that boots and then answers 500 reads as unhealthy. The probe
       # writes nothing, which is what read_only: true above requires.
       #
-      # 127.0.0.1 and APP_INTERNAL_PORT: the port inside the container, not the host side of
-      # the ports: mapping above. start_period is 60s because lifespan blocks on
-      # database.initialize() and wait_for_kafka() before uvicorn serves a single request.
+      # 127.0.0.1 and APP_INTERNAL_PORT: the port inside the container. Prod publishes no
+      # port at all; the dev-only loopback publish lives in docker-compose.override.yaml.
+      # start_period is 60s because lifespan blocks on database.initialize() and
+      # wait_for_kafka() before uvicorn serves a single request.
       test: ["CMD", "/code/.venv/bin/python", "-c", "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ['APP_INTERNAL_PORT'] + '/ping', timeout=5).read()"]
       interval: 10s
       timeout: 10s
@@ -166,10 +179,16 @@ services:
         SERVICE_PATH: data
         SERVICE_NAME: ingest
     hostname: ${DATA_INGEST_NAME:-data_ingest}
-    ports:
-      # Loopback only, same reasoning as data_store: unauthenticated API, and data_store
-      # reaches it over the compose network rather than through this mapping.
-      - "127.0.0.1:${DATA_INGEST_PORT}:${APP_INTERNAL_PORT}"
+    networks:
+      #   ingest_store   reaches data_store and Kafka, and is reached by data_store.
+      #   ingest_egress  the ordinary bridge that gives it internet access to the broker
+      #                  API. data_ingest is the only service on it, and so the only
+      #                  component of the stack with egress.
+      # No host port in prod: nothing consumes one (data_store reaches it over
+      # ingest_store, the healthcheck probes in-container) and its API is unauthenticated.
+      # The dev-only loopback publish lives in docker-compose.override.yaml, with devnet.
+      - ingest_store
+      - ingest_egress
     env_file:
       - .env
       - ./data/ingest/.env
@@ -188,3 +207,31 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+
+# THE PROD NETWORK MODEL (decision record tj-q9ae5u, addendum 1). Four named networks, and no
+# service on the implicit default network. Three are internal -- no gateway, so nothing on them
+# alone has egress or can publish a port -- and one is an ordinary bridge:
+#   store_db       internal  postgres, data_store.
+#   ingest_store   internal  data_store, data_ingest, and kafka while it exists.
+#   store_api      internal  data_store and client containers only (strategies, the SDK, the
+#                            system-test client). A client sees data_store and nothing else.
+#   ingest_egress  bridge    data_ingest only: the one component with internet access.
+# So prod publishes NOTHING on the host, and data_store is never internet-reachable.
+#
+# Kafka rides ingest_store until gRPC replaces it; removing it then removes no network, because
+# ingest_store goes on carrying the data_store <-> data_ingest traffic.
+#
+# store_api has a fixed name so another compose project (a strategy stack, the private repo's
+# clients) can declare it external and join it. The other three keep compose's project prefix.
+#
+# Dev adds one more, devnet, in docker-compose.override.yaml only. PROD_COMPOSE never loads that
+# file, so a prod launch never attaches devnet.
+networks:
+  store_db:
+    internal: true
+  ingest_store:
+    internal: true
+  store_api:
+    internal: true
+    name: trader_joe_store_api
+  ingest_egress: {}

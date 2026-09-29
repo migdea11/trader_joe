@@ -13,6 +13,12 @@ services:
   pgadmin:
     image: dpage/pgadmin4:9.17.0
     container_name: pgadmin
+    networks:
+      # devnet (tj-q9ae5u addendum 1): postgres is on the internal store_db and devnet, never
+      # on default, so this is how pgAdmin reaches it. The network itself is declared in
+      # docker-compose.override.yaml, which every load of this file includes, so its fixed
+      # name is not restated here.
+      - devnet
     ports:
       # Loopback only: this is a browser UI with a login that holds the database
       # credentials, so it is reachable from this machine and nowhere else.

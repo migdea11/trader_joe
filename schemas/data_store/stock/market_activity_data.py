@@ -14,7 +14,6 @@ from schemas.inbound_contract import InboundContract
 log = get_logger(__name__)
 
 DT = TypeVar('DT')  # Data Type
-QT = TypeVar('QT')  # Query Type
 
 
 class StockDataMarketActivityData(InboundContract):
@@ -39,12 +38,6 @@ class StockDataMarketActivityData(InboundContract):
     close: float
     volume: int
     trade_count: int
-
-
-class StockMarketActivityDataQuery(InboundContract):
-    """Basic Query for a stock's market activity."""
-
-    pass
 
 
 # class AssetMarketActivityRequestPath(BaseModel):
@@ -123,7 +116,7 @@ class StockDataMarketActivityUpdate(AssetDataUpdate[StockDataMarketActivityData]
     pass
 
 
-class StockDataMarketActivityQuery(AssetDataQuery[StockMarketActivityDataQuery]):
+class StockDataMarketActivityQuery(AssetDataQuery):
     pass
 
 

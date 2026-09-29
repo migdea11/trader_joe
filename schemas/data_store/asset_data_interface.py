@@ -1,9 +1,9 @@
 from abc import ABC
 from datetime import datetime
-from typing import Generic, TypeVar
+from typing import Generic, Self, TypeVar
 from uuid import UUID
 
-from pydantic import Field, field_validator
+from pydantic import AwareDatetime, Field, field_validator, model_validator
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Feed, Granularity
@@ -12,7 +12,6 @@ from schemas.inbound_contract import InboundContract
 
 
 DT = TypeVar('DT')  # Data Type
-QT = TypeVar('QT')  # Query Type
 
 
 class _AssetDataType(InboundContract, Generic[DT], ABC):
@@ -28,21 +27,25 @@ class _AssetDataType(InboundContract, Generic[DT], ABC):
         Generic (DT): The data type for the asset.
     """
 
-    timestamp: datetime
+    # AwareDatetime: a naive timestamp is REFUSED, not converted (tj-1bl90i; D2 = A on
+    # tj-vhboky.20). Bound to a timestamptz column, a naive value is read in the SESSION timezone,
+    # and since the timestamp is part of the bar's natural key a shifted instant is a different bar.
+    # Typed on this base on purpose, so every bar shape refuses it: the single-bar create (a 422 on
+    # the POST), the update, the batch items built by append_data, and the read model. The read
+    # model loses nothing, since values read back from timestamptz are aware; nor does the ingest
+    # batch, since Alpaca's bar timestamps are aware UTC (tj-vhboky.57, item 1).
+    timestamp: AwareDatetime
     data: DT
-
-    def add_data(self, data: DT, timestamp: datetime):
-        self.timestamp = timestamp
-        self.data = data
 
 
 class _AssetIdentifier(InboundContract, ABC):
     """Basic Identifiers for a financial asset's data.
 
     feed is NOT here even though it is part of the bar's natural key, and neither is dataset_id.
-    Both are declared on the concrete CREATE models instead: this base is shared with AssetData
-    and AssetDataUpdate, where a required feed would oblige every read and every update to carry
-    one. See AssetDataCreate.feed.
+    Both are declared on the concrete models that need them instead: this base is shared with
+    AssetDataUpdate, which addresses an existing row by id, and a required feed here would oblige
+    every update to restate one. AssetData (the read model) and the create models each declare
+    their own required feed (tj-5dvgaa). See AssetDataCreate.feed and AssetData.feed.
     """
 
     asset_symbol: str
@@ -57,16 +60,22 @@ class _AssetIdentifier(InboundContract, ABC):
 class _AssetIdentifierQuery(InboundContract, ABC):
     """Similar to _AssetIdentifier but with optional fields for querying data.
 
-    EVERY FIELD HAS AN UNSET DEFAULT, and that is the point of the model (tj-vhboky.1 section 8).
-    These were annotated "| None" with NO default, which in Pydantic v2 means required-but-
-    nullable: a caller had to pass every one explicitly, so the object could not represent an
-    unfiltered request and could not serve as an optional FastAPI query dependency. An absent
-    parameter means NO CONSTRAINT on that column.
+    EACH FIELD IS INDIVIDUALLY OPTIONAL (tj-vhboky.1 section 8): an absent parameter means NO
+    CONSTRAINT on that column. They carry a None default rather than a bare "| None", which in
+    Pydantic v2 would be required-but-nullable and oblige a caller to pass every one explicitly.
+    Optional one at a time is not optional all at once: AssetDataQuery requires that a query names
+    dataset_id or asset_symbol, so an unbounded read cannot be constructed (tj-vhboky.26, user
+    ruling (5) on tj-vhboky.20). The rule sits there, not here, because dataset_id is declared
+    there.
+
+    feed is HERE, unlike on _AssetIdentifier: a filter on it is optional, so it costs no caller
+    anything, and without it a read could not select one tape (tj-p78ng6).
     """
 
     asset_symbol: str | None = None
 
     source: DataSource | None = None
+    feed: Feed | None = None
     granularity: Granularity | None = None
     dataset_id: UUID | None = None
 
@@ -79,24 +88,57 @@ class _AssetIdentifierQuery(InboundContract, ABC):
         return value.upper()
 
 
-class _AssetDataQuery(InboundContract, Generic[QT], ABC):
+class _AssetDataQuery(InboundContract, ABC):
     """Remaining base query parameters that aren't direct identifiers.
 
-    Args:
-        Generic (QT): The query type for the asset.
+    start and end are AwareDatetime and a naive value is REFUSED, not converted (tj-vhboky.20
+    D2, extending tj-1bl90i): compared against a timestamptz column, a naive bound is read in the
+    session timezone, so the same query would return different bars on differently configured
+    hosts.
+
+    expiry is gone: a bar carries no expiry (tj-vhboky Ruling 1), so nothing could read it
+    (tj-wdjpmq). query is gone: a nested model cannot be an HTTP query parameter, nothing read
+    it, and an extra='forbid' contract that accepts a field and ignores it only looks validating
+    (tj-vhboky.25).
     """
 
-    start: datetime | None = None
-    end: datetime | None = None
-    expiry: datetime | None = None
-    query: QT | None = None
+    start: AwareDatetime | None = None
+    end: AwareDatetime | None = None
+
+
+# The (asset_type, data_type) pairs the internal asset-data routes serve
+# (routers/data_store/internal_asset_data.py, the match statements). Enabling a new pair means
+# editing this set as well as those routes (tj-vhboky.68).
+SUPPORTED_ASSET_DATA_PAIRS: frozenset[tuple[AssetType, DataType]] = frozenset(
+    {(AssetType.STOCK, DataType.MARKET_ACTIVITY)}
+)
 
 
 class AssetDataPath(InboundContract):
-    """Asset Properties, as path to identify the endpoint for the desired data and asset type."""
+    """Asset Properties, as path to identify the endpoint for the desired data and asset type.
+
+    THE PAIR IS VALIDATED, NOT JUST EACH FIELD (tj-vhboky.68). Each enum on its own admits pairs
+    no route serves, such as crypto/quote, and those used to build successfully and then fail in
+    the route as an unhandled 500. A pair outside SUPPORTED_ASSET_DATA_PAIRS is refused here, as a
+    property of the request contract. OpenAPI still lists every enum value for each field, because
+    a cross-field rule is invisible there.
+
+    The refusal is a 422 over HTTP only when the model is bound with Path(). Under Depends() the
+    ValidationError is raised inside the dependency call and is not a request validation error;
+    the route binding is tj-vhboky.72 (builder-store).
+    """
 
     asset_type: AssetType = Field(..., description=ASSET_TYPE_DESC)
     data_type: DataType = Field(..., description=DATA_TYPE_DESC)
+
+    @model_validator(mode='after')
+    def require_supported_pair(self) -> Self:
+        if (self.asset_type, self.data_type) not in SUPPORTED_ASSET_DATA_PAIRS:
+            supported = ', '.join(f'{asset}/{data}' for asset, data in sorted(SUPPORTED_ASSET_DATA_PAIRS))
+            raise ValueError(
+                f'unsupported asset_type/data_type pair {self.asset_type}/{self.data_type}; supported: {supported}'
+            )
+        return self
 
 
 class AssetDataCreate(_AssetIdentifier, _AssetDataType[DT], Generic[DT], ABC):
@@ -110,8 +152,9 @@ class AssetDataCreate(_AssetIdentifier, _AssetDataType[DT], Generic[DT], ABC):
     dataset_id: UUID
     # Part of the bar's natural key, alongside dataset_id above: (dataset_id, asset_symbol,
     # source, feed, granularity, timestamp). Declared HERE rather than on _AssetIdentifier for
-    # the same reason dataset_id is -- _AssetIdentifier is also the base of AssetData and
-    # AssetDataUpdate, and only the CREATE paths are obliged to supply a feed today.
+    # the same reason dataset_id is -- _AssetIdentifier is also the base of AssetDataUpdate, which
+    # addresses an existing row by id, and a required feed there would oblige every update to
+    # restate one. AssetData declares its own required feed (tj-5dvgaa); see _AssetIdentifier.
     #
     # REQUIRED, AND WITH NO DEFAULT ON PURPOSE. The column is NOT NULL with no server default
     # (data/store/app/database/models/base_market_activity.py), because the "no sentinel for we
@@ -143,7 +186,7 @@ class BatchAssetDataCreate(_AssetIdentifier, Generic[DT], ABC):
     feed: Feed
     dataset: dict[DataType, list[_AssetDataType[DT]]]
 
-    def append_data(self, data_type: DataType, data: DT, timestamp: datetime):
+    def append_data(self, data_type: DataType, data: DT, timestamp: AwareDatetime):
         if data_type not in self.dataset:
             self.dataset[data_type] = []
         self.dataset[data_type].append(_AssetDataType(timestamp=timestamp, data=data))
@@ -161,15 +204,40 @@ class AssetDataUpdate(_AssetIdentifier, _AssetDataType[DT], Generic[DT], ABC):
     dataset_id: UUID
 
 
-class AssetDataQuery(_AssetIdentifierQuery, _AssetDataQuery[QT], Generic[QT], ABC):
+class AssetDataQuery(_AssetIdentifierQuery, _AssetDataQuery, ABC):
     """Query for asset data entries linked to the dataset provided.
 
+    Fields are individually optional (absent = no constraint on that column), but a query MUST
+    name dataset_id or asset_symbol; one that names neither is refused with a ValidationError,
+    which FastAPI reports as a 422 (tj-vhboky.26). User ruling (5) on tj-vhboky.20: an unbounded
+    read (every symbol, all time) must be impossible to construct anywhere, so the refusal lives
+    on this shared model, not in a route and not on a route-only subclass. It supersedes the
+    empty-query half of tj-vhboky.1 section 8; the per-field half stands.
+
+    mode='after' so a field-level error (a bad enum, a naive datetime) is still reported against
+    its own field rather than masked by this rule.
+
+    A BLANK asset_symbol ('' or whitespace only) NAMES NO SYMBOL, and a query carrying one is
+    refused by this same rule with the same error shape (loc ['query'], type value_error) as a
+    query naming nothing (user ruling on tj-vhboky.28). That holds even when dataset_id is given:
+    a blank symbol filter matches no rows, so accepting it returns a silent empty 200 for a
+    malformed request, and dropping it would hide the caller's bug. A padded but non-blank symbol
+    is not trimmed here or in the field validator; it is uppercased and filtered as sent.
+
     Args:
-        _AssetIdentifierQuery: Queries the asset, data source and granularity.
-        _AssetDataQuery (QT): Queries for the asset data, including asset type specific data.
+        _AssetIdentifierQuery: Queries the asset, data source, feed and granularity.
+        _AssetDataQuery: Queries the time range of the asset data.
     """
 
     dataset_id: UUID | None = None
+
+    @model_validator(mode='after')
+    def require_dataset_or_symbol(self) -> Self:
+        if self.asset_symbol is not None and not self.asset_symbol.strip():
+            raise ValueError('asset_symbol must not be blank; omit it or give a symbol')
+        if self.dataset_id is None and self.asset_symbol is None:
+            raise ValueError('a bars query must name dataset_id or asset_symbol; an unbounded read is refused')
+        return self
 
 
 class AssetData(_AssetIdentifier, _AssetDataType[DT], Generic[DT], ABC):

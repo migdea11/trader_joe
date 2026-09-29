@@ -70,6 +70,12 @@ env:
   # Floor, not a preference: below 0.9.17 uv silently ignores the `exclude-newer`
   # install cooldown in pyproject.toml. Matches Makefile UV_VERSION and the Dockerfile.
   UV_VERSION: "0.12.19"
+  # No uv command in this workflow may re-lock (tj-3zh7ss). Every `uv run` below installs the
+  # committed uv.lock as-is instead of re-resolving it, so CI is covered by this setting and not
+  # by the order of its steps. The explicit `--locked` on sync and export still wins over it:
+  # uv warns, then asserts the lock is current, so a stale lock still fails the job. Matches the
+  # Makefile's exported UV_FROZEN.
+  UV_FROZEN: "1"
   SOURCE_PATHS: "./common ./routers ./schemas ./data"
 
 jobs:
@@ -85,6 +91,23 @@ jobs:
       POSTGRES_SYNC: true
 
     steps:
+    # debian:bookworm-slim ships neither git nor make, and the suite needs both: the Makefile tests
+    # run make, and the tracked-file and ignore-rule tests run git from the checkout root. Before
+    # checkout on purpose: with no git on PATH, actions/checkout falls back to a REST API tarball
+    # that has no .git, and every git test then fails even with git installed. ca-certificates
+    # because --no-install-recommends leaves it out, and git fetches over https (tj-ijpys9.16).
+    #
+    # safe.directory: the runner creates the workspace as its own user and this container runs as
+    # root, so git refuses the checkout for dubious ownership. actions/checkout marks the workspace
+    # safe only in a temporary global config that it deletes when its own step ends, so later steps
+    # do not inherit it. --system, in /etc/gitconfig, where checkout's HOME override cannot hide it.
+    - name: Install Git and Make
+      run: |
+        apt-get update
+        apt-get install -y --no-install-recommends git make ca-certificates
+        rm -rf /var/lib/apt/lists/*
+        git config --system --add safe.directory "${GITHUB_WORKSPACE}"
+
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
     - name: Install UV
@@ -122,15 +145,20 @@ jobs:
       run: |
         uv sync --only-group security --locked
 
+    # '*/tests/*', not 'tests/': bandit turns an exclude naming an existing directory into
+    # '<dir>/*', so the repository-root tests/ made 'tests/' stop matching every nested tests
+    # directory (tj-vhboky.67). Identical to the Makefile's security target; change both.
     - name: Run Bandit
       run: |
-        uv run bandit -r ${{ env.SOURCE_PATHS }} --exclude tests/
+        uv run bandit -r ${{ env.SOURCE_PATHS }} --exclude '*/tests/*'
 
-    # A fresh checkout has no .claude/worktrees; the exclude keeps this line identical to
-    # `make security`, where agent worktrees do exist (tj-aov3ip).
+    # --error makes semgrep exit non-zero on any finding, so this step fails on findings rather
+    # than only proving semgrep ran (tj-cg2i9p). A fresh checkout has no .claude/worktrees; the
+    # exclude keeps this line identical to `make security`, where agent worktrees do exist
+    # (tj-aov3ip). Change both or neither.
     - name: Run SemGrep
       run: |
-        uv run semgrep --config=auto --exclude=tests/ --exclude=.venv --exclude=docker-compose.override.yaml --exclude=.claude/worktrees .
+        uv run semgrep --config=auto --error --exclude=tests/ --exclude=.venv --exclude=docker-compose.override.yaml --exclude=.claude/worktrees .
 
     - name: Generate Requirements
       run: |
@@ -195,6 +223,29 @@ jobs:
         docker compose -f docker-compose.yaml build
         docker images  # List built images
 
+    - name: Check Compose Renders
+      run: |
+        set -euo pipefail
+        # Every compose set the Makefile and CI load must still interpolate and merge, including
+        # the ones no job in this workflow starts: a broken override or tools file would
+        # otherwise surface only on a developer's machine. The env files Build Images staged
+        # are what the files interpolate from, so this step follows it.
+        #
+        # --quiet ALWAYS. Without it `config` prints the fully interpolated model, and that
+        # model carries POSTGRES_PASS in data_store's DATABASE_URI -- straight into the log.
+        #
+        # The prod set, the dev set (base plus override), the tools set and the client set, in
+        # the same file order the Makefile uses for each. The tools set gets the same throwaway
+        # PGADMIN_* placeholders dev-down uses, only to get past its ":?" guards; they are safe
+        # here for the same reason, because `config` creates no container and so no pgAdmin
+        # account can ever be initialised from them.
+        docker compose -f docker-compose.yaml config --quiet
+        docker compose -f docker-compose.yaml -f docker-compose.override.yaml config --quiet
+        PGADMIN_EMAIL=unused PGADMIN_PASS=unused docker compose -f docker-compose.yaml \
+          -f docker-compose.override.yaml -f docker-compose.tools.yaml config --quiet
+        docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml config --quiet
+        echo "Compose renders: prod, dev, tools and client sets all interpolate and merge."
+
     - name: Push Image - Data Store
       id: push_store
       run: |
@@ -247,11 +298,35 @@ jobs:
     name: System Testing
     runs-on: ubuntu-latest
     permissions:
-      packages: read  # pulls the images Image Build pushed; no checkout, so no contents
+      contents: read  # checkout: the system suite (tests/system) runs from the source tree
+      packages: read  # pulls the images Image Build pushed
     needs:
       - build
 
     steps:
+      # The stack still runs from the images Image Build pushed and the configs it staged; the
+      # checkout exists only to build test_client and hand it the system suite (tests/system),
+      # which it runs against that stack. Into the workspace root, not a subdirectory: make
+      # test-system only needs the project env file to exist in its own working directory, and
+      # compose interpolates from it; the Stage step below writes that file here. No credential is
+      # persisted into the checkout's config -- nothing in this job fetches or pushes.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install UV
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
+        with:
+          version: "${{ env.UV_VERSION }}"
+
+      # No step in this job uses the host venv these two steps build. make test-system has no
+      # venv prerequisite and runs no uv sync: the suite runs inside test_client, whose image
+      # installs its own groups, and every other step works through docker compose. The steps
+      # are left in place for now; dropping them is a separate change.
+      - name: Install dependencies
+        run: |
+          uv sync --all-groups --no-group security --locked
+
       - name: Registry Login
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
         with:
@@ -267,13 +342,32 @@ jobs:
 
       - name: Stage Pipeline Configs
         run: |
+          set -euo pipefail
           ls -lahR artifact/
           cp artifact/docker-compose.yaml ./docker-compose.yaml
           cp artifact/.env.default ./.env
           # Same throwaway credential as the build job, regenerated here: the two jobs
           # run on different runners and this one is the one that actually starts
-          # Postgres, so the value only has to be consistent within this job.
-          printf '\nPOSTGRES_PASS=%s\n' "$(openssl rand -hex 24)" >> .env
+          # Postgres, so the value only has to be consistent within this job. Masked before
+          # it is written anywhere: the system suite now holds it too, and a failing test's
+          # output is one more place it could otherwise surface.
+          db_pass="$(openssl rand -hex 24)"
+          echo "::add-mask::${db_pass}"
+          printf '\nPOSTGRES_PASS=%s\n' "${db_pass}" >> .env
+
+          # A throwaway INSTANCE_WRITE_SECRET, generated the same way and for the same reason:
+          # the template ships it empty, the write routes fail closed without it, and the
+          # system suite (make test-system) refuses to start without one. Registered with the
+          # runner's log masking BEFORE anything can print it, and never echoed. It is not a
+          # broker credential -- it authenticates this job's own data_store to its own test
+          # client and nothing else -- so the tj-59cce6 rule at the top of this file is
+          # unaffected. The template's empty line is deleted rather than overridden, so the
+          # staged file holds exactly one value for every reader: compose, the make recipe and
+          # the secret-lifecycle step below.
+          write_secret="$(openssl rand -hex 32)"
+          echo "::add-mask::${write_secret}"
+          sed -i '/^INSTANCE_WRITE_SECRET=/d' .env
+          printf 'INSTANCE_WRITE_SECRET=%s\n' "${write_secret}" >> .env
 
           mkdir -p data/ingest
           cp artifact/data/ingest/.env.default data/ingest/.env
@@ -283,9 +377,31 @@ jobs:
           # ./data/store/alembic.ini -> /code/alembic.ini and ./data/store/migrations ->
           # /code/migrations. alembic resolves script_location=migrations against the
           # container's WORKDIR (/code), so both have to land here, not anywhere else.
+          # The checkout already holds a migrations directory at that path, and cp -r into an
+          # existing directory nests the copy one level down (migrations/migrations), which
+          # would leave the mounted tree as the checkout's rather than the artifact's. Remove
+          # it first, so what is mounted is exactly what Image Build staged beside the images.
           cp artifact/data/store/alembic.ini data/store/alembic.ini
+          rm -rf data/store/migrations
           cp -r artifact/data/store/migrations data/store/migrations
 
+      # THE CLIENT (decision record tj-q9ae5u, addendum 1). Prod publishes no host port, so
+      # nothing on this runner can reach data_store from outside the stack: every HTTP request
+      # this job makes to it goes from test_client, a container on store_api, by service name.
+      # Two compose spellings, and only two, in this job:
+      #   the stack   docker compose -f docker-compose.yaml ...  -- up, migrate, exec, the
+      #               recreate, logs, down. It never loads the client file, so starting,
+      #               blanking and recreating data_store cannot depend on it.
+      #   the client  docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml
+      #               -- and only ever to build or run test_client (run: --rm --no-deps -T, plus
+      #               --pull never wherever stdout is captured).
+      # Built here from this job's checkout, before Start System and after Stage, because the
+      # base file cannot interpolate without the staged POSTGRES_PASS. make test-system rebuilds
+      # it with --build, which then finds every layer cached.
+      - name: Build Test Client
+        run: |
+          set -euo pipefail
+          docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml build test_client
 
       - name: Pull Docker Images
         run: |
@@ -335,27 +451,89 @@ jobs:
           # `run` publishes no ports, so this cannot collide with the running data_store.
           # The command is an explicit argv: the image sets CMD, not ENTRYPOINT, so passing
           # one replaces entrypoint.sh rather than appending to it.
+          #
+          # upgrade head, never create_all (tj-6bvoic): the schema the system suite runs
+          # against is the one the migrations build, which is the only one prod ever has. See
+          # data/store/tests/test_market_activity_idempotency.py, whose docstring concedes the
+          # Postgres-only property that tests/system now checks against this database.
+          set -euo pipefail
           docker compose -f docker-compose.yaml run --rm --no-deps data_store \
             /code/.venv/bin/alembic upgrade head
+
+          # Then prove it landed where it was aimed: the revision the database records must be
+          # the single head the migration scripts report. alembic logs to stderr (alembic.ini's
+          # console handler), but anything imported on the way may still print to stdout, so a
+          # revision is only ever a line LED by a 12-hex-digit id: grep extracts those ids and
+          # nothing else, and the head count is a count of ids, not of lines. grep exiting 1
+          # means no id at all, which the checks below report; 2 is an error and fails the step.
+          # -T: no TTY, so no carriage returns in what is compared. --pull never: a missing image
+          # fails loudly instead of mixing pull progress into the captured output.
+          #
+          # NOTHING ELSE runs on this database -- no downgrade, no re-upgrade. A downgrade over
+          # the empty database this job has just migrated proves nothing (user ruling,
+          # tj-vhboky.47): the round trip only means something against rows. It needs seeded
+          # data, so it moved with the seed work to the fake-broker PR (epic tj-irhy0a,
+          # tj-vhboky.62).
+          revisions() {
+            docker compose -f docker-compose.yaml run --rm --no-deps -T --pull never data_store \
+              /code/.venv/bin/alembic "$1" | { grep -Eo '^[0-9a-f]{12}\b' || [ $? -eq 1 ]; }
+          }
+          heads="$(revisions heads)"
+          current="$(revisions current)"
+          head_count="$(printf '%s\n' "${heads}" | { grep -cE '^[0-9a-f]{12}$' || [ $? -eq 1 ]; })"
+          echo "alembic heads: ${heads:-<none>}; current: ${current:-<none>}"
+          if [ "${head_count}" -ne 1 ]; then
+            echo "::error::expected exactly one migration head, got: ${heads:-<none>}"
+            exit 1
+          fi
+          if [ "${current}" != "${heads}" ]; then
+            echo "::error::database is at revision ${current:-<none>}, not the head ${heads}"
+            exit 1
+          fi
 
       - name: Smoke Test
         run: |
           set -euo pipefail
 
-          # Read the published ports out of the staged .env rather than sourcing it --
-          # sourcing would also pull POSTGRES_PASS into this shell's environment, and the
-          # only thing that buys is one more place a stray `set -x` could print it.
-          DATA_STORE_PORT="$(grep -E '^DATA_STORE_PORT=' .env | cut -d= -f2)"
-          DATA_INGEST_PORT="$(grep -E '^DATA_INGEST_PORT=' .env | cut -d= -f2)"
+          # Read the container port out of the staged .env rather than sourcing it -- sourcing
+          # would also pull POSTGRES_PASS into this shell's environment, and the only thing
+          # that buys is one more place a stray `set -x` could print it. APP_INTERNAL_PORT is
+          # not a secret: it is the port both apps listen on inside their containers. The same
+          # env_value as the Instance Secret Lifecycle step: the last line for a key wins, as it
+          # does for compose, and the value is everything after the first `=`.
+          env_value() { grep -E "^$1=" .env | tail -n 1 | cut -d= -f2-; }
+          APP_INTERNAL_PORT="$(env_value APP_INTERNAL_PORT)"
 
-          # Both services publish on 127.0.0.1 only (see the ports: comments in
-          # docker-compose.yaml). The runner is the host here, so loopback is reachable.
+          # WHY NO HOST PORT. Prod publishes nothing (tj-q9ae5u addendum 1): data_store sits on
+          # three internal networks and data_ingest on ingest_store plus its egress bridge, so
+          # there is no 127.0.0.1 mapping for the runner to curl, and adding one here would test
+          # a topology prod does not have. So each request goes from inside the stack, by
+          # compose service name, exactly as a real client would reach it:
+          #   data_store   from test_client, which joins store_api -- the strategy clients' path.
+          #   data_ingest  from inside data_store, which proves ingest_store carries HTTP
+          #                between the two apps; test_client cannot reach data_ingest at all,
+          #                and Check Network Lockdown below proves that it cannot.
+          # Each fetcher prints the body, a newline and the HTTP status, like curl -w below.
+          from_client() {
+            docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml \
+              run --rm --no-deps -T --pull never --entrypoint curl test_client \
+              -sS --max-time 20 -w '\n%{http_code}' "$1"
+          }
+          # data_store has no curl (see its healthcheck), so its own interpreter fetches.
+          # http.client, not urlopen: it does not raise on a 4xx/5xx, so the status and the body
+          # of a failure are printed like any other, where urlopen would bury them in a trace.
+          from_data_store() {
+            docker compose -f docker-compose.yaml exec -T data_store /code/.venv/bin/python -c \
+              'import http.client, sys, urllib.parse; u = urllib.parse.urlsplit(sys.argv[1]); c = http.client.HTTPConnection(u.hostname, u.port, timeout=20); c.request("GET", u.path); r = c.getresponse(); sys.stdout.write(r.read().decode() + "\n" + str(r.status))' \
+              "$1"
+          }
+
           assert_http() {
-            name="$1"; url="$2"; want_body="$3"
-            # No -f: --fail suppresses the response body on a 4xx/5xx, and the body is
-            # exactly what makes a failure here diagnosable instead of an opaque number.
-            if ! response="$(curl -sS --max-time 20 -w '\n%{http_code}' "$url")"; then
-              echo "::error::${name}: curl could not complete a request to ${url}"
+            fetch="$1"; name="$2"; url="$3"; want_body="$4"
+            # No -f on curl: --fail suppresses the response body on a 4xx/5xx, and the body
+            # is exactly what makes a failure here diagnosable instead of an opaque number.
+            if ! response="$("${fetch}" "$url")"; then
+              echo "::error::${name}: ${fetch} could not complete a request to ${url}"
               return 1
             fi
             status="${response##*$'\n'}"
@@ -375,10 +553,10 @@ jobs:
             fi
           }
 
-          assert_http "data_store ping" \
-            "http://127.0.0.1:${DATA_STORE_PORT}/ping" '{"message":"pong"}'
-          assert_http "data_ingest ping" \
-            "http://127.0.0.1:${DATA_INGEST_PORT}/ping" '{"message":"pong"}'
+          assert_http from_client "data_store ping (from test_client)" \
+            "http://data_store:${APP_INTERNAL_PORT}/ping" '{"message":"pong"}'
+          assert_http from_data_store "data_ingest ping (from data_store)" \
+            "http://data_ingest:${APP_INTERNAL_PORT}/ping" '{"message":"pong"}'
 
           # The one request that actually proves something new. /ping is what the container
           # healthchecks already probe, so re-asserting it adds nothing; this route runs
@@ -391,10 +569,232 @@ jobs:
           # for this deliberately synthetic symbol, and came back. A missing schema, a
           # refused connection or a bad credential all produce a 500 instead, and a failure
           # here prints the body and then the `if: failure()` step below dumps the logs.
-          assert_http "data_store dataset search" \
-            "http://127.0.0.1:${DATA_STORE_PORT}/store/stock/market-activity/SMOKETEST" '[]'
+          assert_http from_client "data_store dataset search (from test_client)" \
+            "http://data_store:${APP_INTERNAL_PORT}/store/stock/market-activity/SMOKETEST" '[]'
 
-          echo "Smoke test passed: both services answered /ping and data_store served a query from Postgres."
+          echo "Smoke test passed: both services answered /ping by service name and data_store served a query from Postgres."
+
+      - name: Check Network Lockdown
+        run: |
+          set -euo pipefail
+          # The prod network model (tj-q9ae5u addendum 1) as the running stack enforces it, not
+          # as the compose file declares it: a network that lost `internal: true`, or a service
+          # that gained one, still starts green and still passes every other step here.
+          #   test_client  sees data_store and Postgres only: neither the kafka container name,
+          #                its service name, nor data_ingest resolves from it.
+          #   postgres, data_store  have no egress: a TCP connect to a public address fails. A
+          #                literal IP, so the check is about routing and no DNS is involved.
+          # Every negative check needs a distinct exit status for "refused as expected", so that
+          # a container that failed to start, or a missing binary, can never pass as blocked.
+          # BROKER_NAME is read with the Instance Secret Lifecycle step's env_value: last one wins.
+          env_value() { grep -E "^$1=" .env | tail -n 1 | cut -d= -f2-; }
+          BROKER_NAME="$(env_value BROKER_NAME)"
+          PUBLIC_ADDRESS="1.1.1.1"
+          PUBLIC_PORT="443"
+          failed=0
+
+          # getent exits 0 on a hit and 2 when the name does not resolve; anything else is the
+          # client failing to run at all. data_store must resolve first, or a client with no
+          # working DNS would make both negatives below pass for the wrong reason.
+          lookup() {
+            docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml \
+              run --rm --no-deps -T --pull never --entrypoint getent test_client hosts "$1"
+          }
+          if found="$(lookup data_store)"; then
+            echo "test_client -> data_store: resolves (${found}), as it must"
+          else
+            echo "::error::test_client could not resolve data_store (exit $?), so its lookups prove nothing"
+            exit 1
+          fi
+          # kafka's container_name is ${BROKER_NAME} today, so this loop's first two words
+          # coincide -- a duplicate lookup when they do is harmless, and the service name kafka
+          # stays probed even if BROKER_NAME ever diverges from it.
+          for name in "${BROKER_NAME}" kafka data_ingest; do
+            if found="$(lookup "${name}")"; then
+              echo "::error::test_client resolved ${name} to ${found}; it must see data_store and Postgres only"
+              failed=1
+            else
+              status=$?
+              if [ "${status}" -eq 2 ]; then
+                echo "test_client -> ${name}: does not resolve, as it must"
+              else
+                echo "::error::test_client lookup of ${name} failed with exit ${status}, not getent's not-found (2)"
+                failed=1
+              fi
+            fi
+          done
+
+          # Exit 3 means the connect did not complete, 0 that it reached the address. data_store
+          # through its own interpreter (no curl in the image): connect_ex returns the errno
+          # instead of raising, and it is printed. postgres through bash's /dev/tcp, bounded by
+          # timeout.
+          if out="$(docker compose -f docker-compose.yaml exec -T data_store /code/.venv/bin/python -c \
+              'import socket, sys; s = socket.socket(); s.settimeout(10); rc = s.connect_ex((sys.argv[1], int(sys.argv[2]))); print(f"connect errno {rc}"); sys.exit(0 if rc == 0 else 3)' \
+              "${PUBLIC_ADDRESS}" "${PUBLIC_PORT}")"; then
+            echo "::error::data_store connected to ${PUBLIC_ADDRESS}:${PUBLIC_PORT}; it must have no egress"
+            failed=1
+          else
+            status=$?
+            if [ "${status}" -eq 3 ]; then
+              echo "data_store -> ${PUBLIC_ADDRESS}:${PUBLIC_PORT}: blocked, as it must be (${out})"
+            else
+              echo "::error::data_store egress probe failed with exit ${status}, not a refused connect (3): ${out}"
+              failed=1
+            fi
+          fi
+          if out="$(docker compose -f docker-compose.yaml exec -T postgres bash -c \
+              'if timeout 10 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; then echo connected; exit 0; fi; echo "no connection"; exit 3' \
+              probe "${PUBLIC_ADDRESS}" "${PUBLIC_PORT}")"; then
+            echo "::error::postgres connected to ${PUBLIC_ADDRESS}:${PUBLIC_PORT}; it must have no egress"
+            failed=1
+          else
+            status=$?
+            if [ "${status}" -eq 3 ]; then
+              echo "postgres -> ${PUBLIC_ADDRESS}:${PUBLIC_PORT}: blocked, as it must be (${out})"
+            else
+              echo "::error::postgres egress probe failed with exit ${status}, not a refused connect (3): ${out}"
+              failed=1
+            fi
+          fi
+
+          if [ "${failed}" -ne 0 ]; then
+            exit 1
+          fi
+          echo "Network lockdown holds: test_client sees neither kafka nor data_ingest; postgres and data_store have no egress."
+
+      - name: Check Container Env
+        run: |
+          set -euo pipefail
+          # A container-level fact no test can see: the system suite talks to data_store over
+          # HTTP and never reads the container's environment. MARKET_ACTIVITY_BATCH_SIZE comes
+          # from the data_store env template through compose's env_file; unset or non-positive,
+          # the bar write path refuses every batch (asset_market_activity.py). Read with the
+          # image's own interpreter -- there is no printenv-is-missing ambiguity and the value is
+          # not a secret, so it is printed.
+          value="$(docker compose -f docker-compose.yaml exec -T data_store /code/.venv/bin/python -c \
+            'import os; print(os.environ.get("MARKET_ACTIVITY_BATCH_SIZE", ""))')"
+          echo "data_store MARKET_ACTIVITY_BATCH_SIZE=${value:-<unset or empty>}"
+          if ! [[ "${value}" =~ ^[0-9]+$ ]] || (( 10#${value} <= 0 )); then
+            echo "::error::MARKET_ACTIVITY_BATCH_SIZE in data_store must be a positive integer, got '${value}'"
+            exit 1
+          fi
+
+      - name: System Tests
+        # This runner's database is thrown away with the job, which is the one condition under
+        # which the suite may run: it WRITES to the database it is pointed at, and the make
+        # target refuses without this. Set on this step only, so nothing else in the job
+        # inherits the permission.
+        env:
+          SYSTEM_TEST_DISPOSABLE_DB: "1"
+        run: |
+          set -euo pipefail
+          # The same invocation a developer runs (tj-vhboky.48): the target, not a copy of its
+          # pytest line, so the env contract has one definition. Ports, credentials, a non-UTC TZ
+          # and PYTHONPATH live in docker-compose.test-client.yaml, which compose interpolates
+          # from the staged project env file; the recipe only checks that the file exists. The
+          # recipe ends on pytest, so its exit status is this step's: any failure is red, and so
+          # is exit 5, an empty collection -- a suite that ran nothing has proved nothing.
+          # tests/system is the counterpart of data/store/tests/test_market_activity_idempotency.py:
+          # what that file's docstring concedes a unit test cannot show, these check on Postgres.
+          make test-system
+
+      - name: Instance Secret Lifecycle
+        run: |
+          set -euo pipefail
+          # Two properties of INSTANCE_WRITE_SECRET that need container control, so they are
+          # steps here rather than tests in tests/system (test_http_write_secret.py covers the
+          # rest of the matrix over HTTP). After System Tests on purpose: the log scan should see
+          # every request the suite made. The value is read back from the staged project env
+          # file, like the ports in Smoke Test, never sourced; it was masked when generated.
+          env_value() { grep -E "^$1=" .env | tail -n 1 | cut -d= -f2-; }
+          APP_INTERNAL_PORT="$(env_value APP_INTERNAL_PORT)"
+          former_secret="$(env_value INSTANCE_WRITE_SECRET)"
+          if [ -z "${former_secret}" ]; then
+            echo "::error::no INSTANCE_WRITE_SECRET in the staged project env file; the Stage step should have written one"
+            exit 1
+          fi
+
+          # (f) FIRST: no container log carries the secret. Before (e), because recreating
+          # data_store discards its current container, and with it the logs of the whole suite.
+          # A hit prints the container and a count, never the matching line. grep exiting 1
+          # means no match and is the pass; 2 is an error and fails the step.
+          leaked=0
+          for container in $(docker compose -f docker-compose.yaml ps --all --format '{{.Name}}'); do
+            if ! hits="$(docker logs "${container}" 2>&1 | { grep -cF -e "${former_secret}" || [ $? -eq 1 ]; })"; then
+              echo "::error::could not read the logs of ${container}, so they could not be checked"
+              exit 1
+            fi
+            hits="${hits:-0}"
+            echo "${container}: ${hits} log line(s) carry the instance secret"
+            if [ "${hits}" -ne 0 ]; then
+              echo "::error::${container} logged the instance secret on ${hits} line(s); lines withheld"
+              leaked=1
+            fi
+          done
+          if [ "${leaked}" -ne 0 ]; then
+            exit 1
+          fi
+
+          # (e) An unset secret must never mean allow-everything. Blank it -- the template's own
+          # shipped state -- and recreate data_store alone; --no-deps leaves Postgres, kafka and
+          # data_ingest as they are, and --wait holds until the new container is healthy.
+          sed -i 's/^INSTANCE_WRITE_SECRET=.*/INSTANCE_WRITE_SECRET=/' .env
+          docker compose -f docker-compose.yaml up -d --no-deps --force-recreate --wait --wait-timeout 180 data_store
+          # Check the blanking reached the process, or every 401 below would prove nothing new.
+          docker compose -f docker-compose.yaml exec -T data_store /code/.venv/bin/python -c \
+            'import os, sys; sys.exit(1 if os.environ.get("INSTANCE_WRITE_SECRET") else 0)' \
+            || { echo "::error::data_store still has a non-empty INSTANCE_WRITE_SECRET after recreation"; exit 1; }
+
+          # Every write route, with every kind of header -- none, empty, arbitrary, and the
+          # secret that was valid a minute ago -- must answer 401 with the fixed detail
+          # (routers/common/instance_secret.py). The bodies are {} on purpose: the guard is a
+          # route dependency and runs before body validation, so a route that lost it answers
+          # 422 here and fails the check, and a probe can never write anything.
+          want_body='{"detail":"Invalid or missing instance write secret"}'
+          # Sent from test_client by service name, like the Smoke Test: prod publishes no host
+          # port. The client file is loaded for this request only; the blank and the recreate
+          # above ran on docker-compose.yaml alone and never depended on it. The client's own
+          # INSTANCE_WRITE_SECRET is interpolated blank now too, and it never sends it: the only
+          # secret a probe carries is the header argument below, as before.
+          base="http://data_store:${APP_INTERNAL_PORT}"
+          failed=0
+          probe() {
+            method="$1"; path="$2"; label="$3"; shift 3
+            response="$(docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml \
+              run --rm --no-deps -T --pull never --entrypoint curl test_client \
+              -sS --max-time 20 -w '\n%{http_code}' -X "${method}" \
+              -H 'Content-Type: application/json' "$@" "${base}${path}")" || {
+              echo "::error::${method} ${path} (${label}): curl could not complete the request"
+              failed=1; return 0; }
+            status="${response##*$'\n'}"
+            body="${response%$'\n'*}"
+            if [[ "${body}" == *"${former_secret}"* ]]; then
+              echo "::error::${method} ${path} (${label}): HTTP ${status}, and the body carries the former secret (withheld)"
+              failed=1
+            elif [ "${status}" != "401" ] || [ "${body}" != "${want_body}" ]; then
+              echo "::error::${method} ${path} (${label}): expected 401 ${want_body}, got ${status} ${body}"
+              failed=1
+            else
+              echo "${method} ${path} (${label}): 401"
+            fi
+          }
+          arbitrary="$(openssl rand -hex 32)"
+          for route in \
+              "POST /store/stock/market-activity/LIFECYCLE" \
+              "DELETE /store/00000000-0000-0000-0000-000000000000?owner=ci-secret-lifecycle" \
+              "POST /internal/asset-data/stock/market-activity"; do
+            method="${route%% *}"; path="${route#* }"
+            data=()
+            if [ "${method}" = "POST" ]; then data=(--data '{}'); fi
+            probe "${method}" "${path}" "no header" "${data[@]}"
+            probe "${method}" "${path}" "empty header" -H 'X-Instance-Secret;' "${data[@]}"
+            probe "${method}" "${path}" "arbitrary header" -H "X-Instance-Secret: ${arbitrary}" "${data[@]}"
+            probe "${method}" "${path}" "former secret" -H "X-Instance-Secret: ${former_secret}" "${data[@]}"
+          done
+          if [ "${failed}" -ne 0 ]; then
+            exit 1
+          fi
+          echo "Instance secret lifecycle passed: no log carries it, and with it unset every write is 401."
 
       - name: Dump Container Logs
         if: failure()

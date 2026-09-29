@@ -1,5 +1,7 @@
-# Docker
-docker-compose.yml
+# Docker. The root compose file, every docker-compose.*.yaml beside it, and the devcontainer.
+docker-compose.yaml
+docker-compose.*.yaml
+.devcontainer/
 Dockerfile
 .dockerignore
 
@@ -10,11 +12,21 @@ Dockerfile
 .env
 **/.env
 
+# Host bind-mount data (tj-ijpys9.17). Every host data directory compose declares sits under
+# ${DATA_DIR:-./volume_data}: postgres and kafka in docker-compose.yaml, pgadmin in
+# docker-compose.tools.yaml. .env.default sets DATA_DIR=./volumes/trader_joe/, and the fallback
+# is ./volume_data. The Postgres directory is mode 0700 and owned by the container's uid, so a
+# build started while a stack is up -- make test-system's --build, in CI after Start System --
+# fails sending the context with "permission denied". Nothing in the image reads them anyway.
+volumes/
+volume_data/
+
 # Agent git worktrees (tj-aov3ip): whole extra copies of the repo, and half-edited ones
 .claude/worktrees/
 
 # Virtual environment
 .venv/
+.venv-devcontainer/
 .venv_init
 
 # Byte-compiled / optimized / DLL files

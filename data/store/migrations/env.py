@@ -45,16 +45,17 @@ config.set_main_option('sqlalchemy.url', database_uri.replace('%', '%%') if data
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
+# stdout belongs to alembic: CI's Migrate Database step parses `alembic current` stdout for the
+# revision id, and anything printed here is read as a revision (tj-ijpys9.19). Log, never print.
+# An ImportError propagates: a model that fails to import leaves target_metadata incomplete, so
+# carrying on would migrate/autogenerate against a partial schema.
 ALLOWED_MODELS = {'base_market_activity', 'stock_market_activity', 'store_dataset_entry'}
 for model_name in ALLOWED_MODELS:
-    try:
-        importlib.import_module(f'data.store.app.database.models.{model_name}')  # nosem
-        print(f'Successfully imported {model_name}')
-    except ImportError as e:
-        print(f'Failed to import {model_name}: {e}')
+    importlib.import_module(f'data.store.app.database.models.{model_name}')  # nosem
+    log.debug(f'Imported model {model_name}')
 
 target_metadata = AppBase.DATA_STORE_BASE.metadata
-print(f'Registered tables: {AppBase.DATA_STORE_BASE.metadata.tables.keys()}')
+log.debug(f'Registered tables: {list(target_metadata.tables.keys())}')
 
 
 # Custom renderer for IntEnum

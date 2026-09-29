@@ -59,8 +59,9 @@ log = get_logger(__name__)
 # glance that this is not Authorization and not any standard scheme.
 # The value is the header's NAME -- public, and sent on every request. bandit's B105 fires only
 # because the constant's name contains SECRET and the value is a literal; nothing is compared
-# against it. The suppression names B105 rather than being bare, so a real finding on this line
-# later -- say someone assigns an actual default here -- still fails the scan.
+# against it. The suppression names B105 rather than being bare, so any other bandit check on
+# this line still fires. A literal secret assigned here would NOT be caught -- that is exactly
+# B105 -- which is why the value must stay a header name.
 INSTANCE_SECRET_HEADER = 'X-Instance-Secret'  # nosec B105
 
 # Reserved, empty, in .env.default. Read LAZILY inside the dependency (see below), never at import.

@@ -93,18 +93,18 @@ agents:
 
   - name: builder-shared
     role: builder
-    scope: [common, schemas, routers/common, pyproject.toml, uv.lock, Dockerfile, entrypoint.sh, docker-compose.yaml, docker-compose.override.yaml, docker-compose.tools.yaml, Makefile, .github, .gitignore, pytest.ini, .dockerignore, .env.default, .devcontainer]
+    scope: [common, schemas, routers/common, pyproject.toml, uv.lock, Dockerfile, entrypoint.sh, docker-compose*.yaml, Makefile, .github, .gitignore, pytest.ini, .dockerignore, .env.default, .devcontainer]
     model: opus
     slots:
       do_not: "Do not refactor inside another builder's scope without filing the follow-up task for that builder. common/tests, routers/tests and schemas/tests are the validator's; pytest.ini and the Makefile are yours. Do not add a dependency without proposing it first. Do not weaken a security control to make a build pass."
 
   - name: validator
     role: validator
-    scope: [common/tests, data/ingest/tests, data/store/tests, routers/tests, schemas/tests]
+    scope: [tests, common/tests, data/ingest/tests, data/store/tests, routers/tests, schemas/tests]
     model: opus
     slots:
       role_description: "Quality gate for trader_joe."
-      test_paths: "common/tests, data/ingest/tests, data/store/tests, routers/tests, schemas/tests — every test directory in the repo, including the two that do not exist yet. You are the default author of tests (ADR tj-8fxxfb). pytest.ini and the Makefile are build config, not tests, and stay with builder-shared."
+      test_paths: "tests (the repo-root system suite), common/tests, data/ingest/tests, data/store/tests, routers/tests, schemas/tests — every test directory in the repo, including the two that do not exist yet. You are the default author of tests (ADR tj-8fxxfb). pytest.ini and the Makefile are build config, not tests, and stay with builder-shared."
 
   - name: scribe
     role: scribe
@@ -140,7 +140,7 @@ components:
       tech_stack: "Python 3.12, FastAPI, SQLAlchemy 2.0 async, asyncpg, Alembic, Postgres"
       key_invariants: "Sole owner of persisted market data. Every write goes through a repository; no raw SQL in routers. Migrations are additive."
       env_vars: "| DATABASE_URI | primary DSN | fails closed |"
-      pitfalls: "| 1 | Compose falls back to a hard-coded password and host 'db' | Fail on missing variables (bug tj-70ovb3) |"
+      pitfalls: "| 1 | A request session opened outside `async_db` / `session()` is never returned to the pool | Take the session from `async_db`; commit only through `write_transaction` (bug tj-vhboky.76, ADR tj-8z213c) |"
   - path: common
     slots:
       component_name: "Shared library"

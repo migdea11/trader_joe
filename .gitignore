@@ -5,9 +5,13 @@
 # Environments
 .env
 .venv/
+# The devcontainer's own environment (UV_PROJECT_ENVIRONMENT, tj-3t2axg), kept apart from the
+# host's .venv because /workspace is the host checkout bind-mounted in.
+.venv-devcontainer/
 .python-version
 
-# Make
+# Make. The sync marker now lives inside the environment; .venv_init is the pre-tj-3t2axg
+# spelling, still ignored because old checkouts carry one.
 .venv_init
 
 # Byte-compiled / optimized / DLL files

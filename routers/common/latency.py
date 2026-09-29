@@ -89,11 +89,9 @@ def initialize_latency_client(app: FastAPI, app_name: str, app_port: int, client
         else:
             return {'success': False, 'error': 'Invalid latency type'}
 
-        tasks = []
         outer_timer = Timer()
         outer_timer.tick()
-        for _ in range(request.iterations or 1):
-            tasks.append(send_type())
+        tasks = [send_type() for _ in range(request.iterations or 1)]
 
         results: list[BaseRpcAck] = await asyncio.gather(*tasks)
         outer_timer.tock()

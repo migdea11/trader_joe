@@ -56,4 +56,32 @@ services:
       # not, which is why a bare `make test` fails. Set here so an agent's run matches CI.
       - POSTGRES_ASYNC=true
       - POSTGRES_SYNC=true
+
+      # The container's own uv environment, never the host's .venv (tj-3t2axg). /workspace is the
+      # host checkout bind-mounted in, so one shared .venv had each side's uv point bin/python at an
+      # interpreter only it has (/opt/uv/python here); the other side's next `uv run` then rebuilt
+      # the venv with default-groups only. Relative on purpose: uv resolves it against the project
+      # root, so each agent worktree keeps its own. The Makefile's VENV_DIR reads this same
+      # variable, so its sync marker follows it. Ignored in .gitignore, .dockerignore and ruff.
+      - UV_PROJECT_ENVIRONMENT=.venv-devcontainer
     command: ["sleep", "infinity"]
+    networks:
+      # default keeps this project's own network, and with it the agent's own egress.
+      # devnet is dev reach (decision record tj-q9ae5u, addendum 1): the dev stack joins it through
+      # docker-compose.override.yaml, so from here postgres (or its container name,
+      # DATABASE_NAME), kafka, data_store and data_ingest resolve by name. A prod launch never
+      # attaches devnet, so this reaches no prod stack on the same machine. The agent has no
+      # Docker -- no socket, no CLI -- so this is for reaching services by name, not for running
+      # the system suite.
+      - default
+      - devnet
+
+# External with a fixed name: owned by neither this project nor the stack's, and created
+# idempotently by the initializeCommand in devcontainer.json and by `make dev-network`
+# (a prerequisite of agent-up), so either side can start first and neither side's down removes
+# it. trader_joe_devnet appears in exactly four places, which must agree: this file,
+# docker-compose.override.yaml, the Makefile's DEV_NETWORK and the initializeCommand.
+networks:
+  devnet:
+    external: true
+    name: trader_joe_devnet

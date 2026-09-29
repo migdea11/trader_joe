@@ -23,6 +23,19 @@ compiler is what makes bind_params_per_row()'s derivation a tested claim rather 
 re-running its own column comprehension inside a test would only prove the comprehension agrees
 with itself.
 
+THE CEILING CHANGED, AND WHY THE OLD ONE WAS WRONG (tj-vhboky.69). This file first pinned the
+ceiling as 65,535 // 12 = 5461 rows: POSTGRES_MAX_BIND_PARAMETERS, the server's int16 cap on bind
+parameters, which tj-rpyv5u called "the wire protocol" limit. That is still true of the server, but
+it is not the limit that binds. asyncpg 0.31.0, the driver data_store writes through, refuses more
+than 32,767 query arguments CLIENT-SIDE (asyncpg/protocol/prepared_stmt.pyx line 130), before the
+server sees anything -- so every 5461-row chunk (65,532 arguments) failed, and the original
+65,535 tests passed only because the compiler and a mocked session accept statements asyncpg
+refuses. The design is now a min() of two cited limits, MAX_BIND_PARAMETERS, which is 2730 rows at
+twelve params per row. The two tests that pinned 65,535 went red when the clamp moved; they were
+updated because the DESIGN changed (tj-8fxxfb iii), not to make them pass, and the superseded
+reasoning is kept here and in their docstrings. What keeps the driver's literal honest is pinned
+below against the installed driver itself: its version, and its own source.
+
 NOT PROVEN HERE, and it is the operationally important half. That an oversized batch genuinely
 SUCCEEDS against Postgres, and that Postgres actually rejects the pre-fix single statement, need a
 live database: a mocked session accepts any statement the wire protocol would refuse. That belongs
@@ -30,18 +43,24 @@ to the host-verified tier (tj-vhboky.14). This file proves we never hand the wir
 know it would reject, and that a partial failure cannot leave data behind.
 """
 
+import importlib.metadata
+import importlib.util
 import logging
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import Insert
+from sqlalchemy.exc import OperationalError
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Feed, Granularity
 from data.store.app.database.crud.stock.asset_market_activity import (
+    ASYNCPG_LIMIT_VERIFIED_VERSION,
+    ASYNCPG_MAX_QUERY_ARGUMENTS,
     POSTGRES_MAX_BIND_PARAMETERS,
     DuplicateBatchTimestamp,
     _resolve_chunk_size,
@@ -49,6 +68,7 @@ from data.store.app.database.crud.stock.asset_market_activity import (
     build_market_activity_upsert,
 )
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
+from data.store.app.database.transaction import write_transaction
 from data.store.app.ingest import data_action_request
 from schemas.data_store.asset_dataset_store import StoreAssetDatasetBody, StoreAssetDatasetPath
 from schemas.data_store.stock.market_activity_data import (
@@ -62,11 +82,17 @@ pytestmark = pytest.mark.data_store
 FIRST_TIMESTAMP = datetime(2026, 1, 2, tzinfo=UTC)
 
 # The chunk ceiling production actually uses, taken from the resolver rather than recomputed here.
-# A test that recomputed `65535 // 12` would agree with a broken resolver, and the module constant
+# A test that recomputed `32767 // 12` would agree with a broken resolver, and the module constant
 # is what the write path consults. It is safe to anchor the rest of the file on this because
-# test_the_derived_ceiling_is_the_largest_chunk_the_protocol_accepts pins this exact value against
-# the compiler and the protocol cap, independently of the resolver that produced it.
+# test_the_derived_ceiling_is_the_largest_chunk_both_limits_accept pins this exact value against
+# the compiler and both caps, independently of the resolver that produced it.
 DERIVED_CEILING = _resolve_chunk_size(None)
+
+# The ceiling a statement must meet: the tighter of the server's bind cap and the driver's argument
+# cap. Taken as the min of the two NAMED limits, not from the module's MAX_BIND_PARAMETERS, on
+# purpose: a MAX_BIND_PARAMETERS edited back to the server's figure alone is one of the mutations
+# these tests exist to catch, and a test that read it would move with it.
+BINDING_LIMIT = min(POSTGRES_MAX_BIND_PARAMETERS, ASYNCPG_MAX_QUERY_ARGUMENTS)
 
 
 def _batch_of(bar_count: int) -> BatchStockDataMarketActivityCreate:
@@ -127,7 +153,8 @@ def _upsert_for(bar_count: int) -> Insert:
 def _bind_params(statement: Insert) -> dict[str, object]:
     """Every bind parameter the statement will send, as Postgres would receive them.
 
-    This is the quantity the 65,535 cap applies to, so it is the quantity asserted on.
+    This is the quantity both caps apply to -- the server's 65,535 and asyncpg's 32,767 -- so it is
+    the quantity asserted on.
     """
     return statement.compile(dialect=postgresql.dialect()).params
 
@@ -228,8 +255,15 @@ def test_the_derivation_excludes_the_surrogate_key_and_the_server_stamped_column
     assert len(bound_columns) == StockMarketActivity.bind_params_per_row()
 
 
-def test_the_derived_ceiling_is_the_largest_chunk_the_protocol_accepts():
-    """The boundary, against the compiler and the protocol cap rather than against the arithmetic.
+def test_the_derived_ceiling_is_the_largest_chunk_both_limits_accept():
+    """The boundary, against the compiler and both caps rather than against the arithmetic.
+
+    Formerly test_the_derived_ceiling_is_the_largest_chunk_the_protocol_accepts, which asserted
+    against POSTGRES_MAX_BIND_PARAMETERS alone and so pinned 5461 rows as maximal. SUPERSEDED
+    (tj-vhboky.69): that reasoning took the server's 65,535 as the only cap, and it was satisfied by
+    chunks asyncpg refuses at bind time -- a mocked session and the compiler both accept them. The
+    ceiling is now the min of the two cited limits, and the chunk must fit EACH of them, which is
+    why both are asserted by name below rather than only their min.
 
     BOTH HALVES ARE LOAD-BEARING. That a chunk at the ceiling fits is satisfied by any ceiling at
     all, including an absurdly small one -- so on its own it proves nothing about the division. That
@@ -237,11 +271,52 @@ def test_the_derived_ceiling_is_the_largest_chunk_the_protocol_accepts():
     breaks: `math.ceil` in place of `//`, or an off-by-one, reds here and nowhere else in this file.
 
     This is also the test that lets the rest of the file trust DERIVED_CEILING, which is read off
-    the resolver: whatever the resolver returned, this proves that value is exactly the protocol's
-    largest safe chunk.
+    the resolver: whatever the resolver returned, this proves that value is exactly the largest
+    chunk both the driver and the server accept.
     """
-    assert len(_bind_params(_upsert_for(DERIVED_CEILING))) <= POSTGRES_MAX_BIND_PARAMETERS
-    assert len(_bind_params(_upsert_for(DERIVED_CEILING + 1))) > POSTGRES_MAX_BIND_PARAMETERS
+    at_ceiling = len(_bind_params(_upsert_for(DERIVED_CEILING)))
+    assert at_ceiling <= ASYNCPG_MAX_QUERY_ARGUMENTS, (
+        f'a ceiling-sized chunk binds {at_ceiling} arguments; asyncpg refuses more than {ASYNCPG_MAX_QUERY_ARGUMENTS}'
+    )
+    assert at_ceiling <= POSTGRES_MAX_BIND_PARAMETERS
+    assert len(_bind_params(_upsert_for(DERIVED_CEILING + 1))) > BINDING_LIMIT, 'the ceiling is not maximal'
+
+
+def test_the_installed_asyncpg_is_the_version_its_argument_limit_was_verified_against():
+    """An asyncpg upgrade fails HERE, loudly, instead of silently invalidating the ceiling.
+
+    ASYNCPG_MAX_QUERY_ARGUMENTS is a literal copied out of the driver's compiled source, because
+    asyncpg does not export it (tj-vhboky.69 design: a named constant with a cited source, not a
+    runtime derivation). A literal cannot notice the driver changing underneath it. This pin is the
+    mechanism the design chose to make it notice: when uv.lock moves asyncpg, this goes red, and the
+    fix is to re-verify the limit in the new driver and then move ASYNCPG_LIMIT_VERIFIED_VERSION --
+    never to move the version alone.
+    """
+    installed = importlib.metadata.version('asyncpg')
+    assert installed == ASYNCPG_LIMIT_VERIFIED_VERSION, (
+        f'asyncpg is {installed}, but ASYNCPG_MAX_QUERY_ARGUMENTS={ASYNCPG_MAX_QUERY_ARGUMENTS} was verified '
+        f'against {ASYNCPG_LIMIT_VERIFIED_VERSION}: re-verify the argument limit in the installed driver '
+        '(asyncpg/protocol/prepared_stmt.pyx) before updating ASYNCPG_LIMIT_VERIFIED_VERSION'
+    )
+
+
+def test_the_argument_limit_is_the_one_in_the_installed_drivers_own_source():
+    """The literal, checked against the file it was copied from rather than restated here.
+
+    The version pin above catches the driver moving; it cannot catch the constant being edited while
+    the driver stays put. Restating 32767 in this file would only agree with itself. The wheel ships
+    the Cython source beside the compiled module, so the bind check is read from there: the same
+    guard the design comment cites, compared against the constant production clamps with. This is a
+    test reading the driver, which the design rejected for PRODUCTION (fragile at runtime, and a
+    wrong answer there is an outage); here a wrong answer is a red gate, which is the point.
+    """
+    protocol_dir = Path(importlib.util.find_spec('asyncpg.protocol').origin).parent
+    source = (protocol_dir / 'prepared_stmt.pyx').read_text()
+
+    assert f'if len(args) > {ASYNCPG_MAX_QUERY_ARGUMENTS}:' in source, (
+        f'the installed asyncpg no longer guards binds at {ASYNCPG_MAX_QUERY_ARGUMENTS} arguments'
+    )
+    assert f'the number of query arguments cannot exceed {ASYNCPG_MAX_QUERY_ARGUMENTS}' in source
 
 
 # ---------------------------------------------------------------------------------------
@@ -255,15 +330,21 @@ def test_an_unset_setting_falls_back_to_the_derived_ceiling():
     get_env_var('MARKET_ACTIVITY_BATCH_SIZE', cast_type=int) returns None when the variable is
     unset -- it casts only when the value is not None (common/environment.py) -- so the module
     constant is None and that None is what the write path receives. A resolver that assumed an int
-    would raise a TypeError inside the write path's try block and turn a missing setting into a
-    lost batch.
+    would raise a TypeError inside the write path's transaction block and turn a missing setting
+    into a lost batch.
 
     The arithmetic is restated here deliberately, and this is the only place it is: it pins the
     FLOOR division specifically, which is a claim about the operator rather than about the value.
     The value itself is anchored independently, against the compiler, by
-    test_the_derived_ceiling_is_the_largest_chunk_the_protocol_accepts.
+    test_the_derived_ceiling_is_the_largest_chunk_both_limits_accept.
+
+    SUPERSEDED (tj-vhboky.69): this used to divide POSTGRES_MAX_BIND_PARAMETERS, 65,535 // 12 =
+    5461 rows, on the reasoning that the server's bind cap was the only one. asyncpg refuses above
+    32,767 before the server is reached, so the fallback now divides the min of the two limits,
+    2730 rows. BINDING_LIMIT is used rather than the module's MAX_BIND_PARAMETERS so that a
+    MAX_BIND_PARAMETERS set back to the server's figure reds here too.
     """
-    assert _resolve_chunk_size(None) == POSTGRES_MAX_BIND_PARAMETERS // StockMarketActivity.bind_params_per_row()
+    assert _resolve_chunk_size(None) == BINDING_LIMIT // StockMarketActivity.bind_params_per_row()
 
 
 @pytest.mark.parametrize('requested', [0, -1, -5461])
@@ -475,8 +556,8 @@ async def test_a_batch_over_the_protocol_limit_is_chunked_within_one_transaction
     statements = _statements_sent(session)
     assert [len(_timestamps_sent(statement)) for statement in statements] == [DERIVED_CEILING, 1]
     for statement in statements:
-        assert len(_bind_params(statement)) <= POSTGRES_MAX_BIND_PARAMETERS, (
-            'a chunk still exceeds the wire-protocol bind-parameter limit'
+        assert len(_bind_params(statement)) <= BINDING_LIMIT, (
+            "a chunk still exceeds the binding limit (asyncpg's argument cap, tighter than the server's)"
         )
     assert call_order == ['execute', 'execute', 'commit'], 'the oversized batch did not land in one transaction'
 
@@ -547,6 +628,149 @@ async def test_a_duplicate_beyond_the_first_chunk_is_rejected_before_anything_is
     assert session.execute.await_count == 0, 'a chunk was sent before the whole batch had been checked for duplicates'
     assert session.commit.await_count == 0, 'a chunk was committed before the whole batch had been checked'
     assert call_order == ['rollback'], 'the rejected batch did not roll back cleanly without touching the database'
+
+
+# ---------------------------------------------------------------------------------------
+# DATABASE ERRORS THROUGH THE TRANSACTION HELPER (tj-vhboky.43; design tj-vhboky.41 S1, Addendum 1
+# and its 03:42 correction). The write path no longer has a try/except of its own: write_transaction
+# rolls back once, logs once at ERROR through ITS module logger, and re-raises the original error
+# unchanged. test_a_failure_on_any_chunk_persists_nothing above raises a plain RuntimeError, which
+# takes the helper's NON-database branch -- rolled back, never logged. The branch a real database
+# failure takes was reached by no test on this path, so it is pinned here with a SQLAlchemyError.
+
+# Distinctive enough that finding it in a log message can only mean the error's text was rendered
+# there. A real DBAPIError's str() carries the statement and the bound parameters; this one does too.
+LEAKED_SQL = 'INSERT INTO stock_market_activity -- validator-marker-7f3a'
+HELPER_LOGGER = write_transaction.__module__
+
+
+def _database_error() -> OperationalError:
+    return OperationalError(LEAKED_SQL, {'owner': 'validator-marker-owner'}, Exception('connection reset'))
+
+
+def _error_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [record for record in caplog.records if record.levelno >= logging.ERROR]
+
+
+def _assert_logged_once_without_its_text(caplog: pytest.LogCaptureFixture, error: OperationalError) -> None:
+    """Pin 5: one ERROR record, from the helper, and the error's text in no log message at all.
+
+    ONE, not at least one. The deleted `log.error(f'...{e}')` fired in ADDITION to anything the
+    helper logs, so restoring it would show up as a second record here -- and, because it formatted
+    the error into the message, as the marker in getMessage() below. Every level is scanned, not
+    just ERROR, so the raw text cannot come back as a warning either.
+
+    The traceback is meant to travel as exc_info (Addendum 1, S3 revised: the user wants SQL and
+    parameters kept, redacted where rendered by the D3 mechanism), so exc_info carrying this very
+    object is asserted too; only the MESSAGE must be free of it.
+    """
+    (record,) = _error_records(caplog)
+    assert record.name == HELPER_LOGGER, 'the database error was logged by someone other than the helper'
+    assert record.exc_info is not None and record.exc_info[1] is error, (
+        'the traceback no longer travels with the record'
+    )
+    for any_record in caplog.records:
+        assert LEAKED_SQL not in any_record.getMessage(), (
+            f'the error text was formatted into a log message: {any_record.name} {any_record.getMessage()!r}'
+        )
+        assert str(error) not in any_record.getMessage()
+
+
+@pytest.mark.parametrize('failing_chunk', [1, 2, 3])
+@pytest.mark.asyncio
+async def test_a_database_error_on_any_chunk_rolls_back_once_and_leaves_as_itself(
+    session, call_order: list[str], failing_chunk: int, caplog: pytest.LogCaptureFixture
+):
+    """Pins 1 and 5: k executes, one rollback, no commit, the same object raised, one ERROR record.
+
+    Identity, not type: the design's interim is RE-RAISE THE ORIGINAL UNCHANGED (Addendum 1, D1
+    interim, confirmed by the 03:42 correction -- conversion belongs in the store app's HTTP
+    exception handler, not in the helper). A wrapper of the same class, or a translation to any
+    other type, fails `is`.
+
+    Args:
+        session: The recording session, made to fail on one chunk.
+        call_order: The sequence of session calls.
+        failing_chunk: Which of three statements raises.
+        caplog: The log records the failure produced.
+    """
+    caplog.set_level(logging.DEBUG)
+    error = _database_error()
+    attempts = 0
+
+    def fail_on_the_nominated_chunk(statement):
+        nonlocal attempts
+        attempts += 1
+        call_order.append('execute')
+        if attempts == failing_chunk:
+            raise error
+
+    session.execute.side_effect = fail_on_the_nominated_chunk
+
+    with pytest.raises(OperationalError) as raised:
+        await batch_create_market_activity_data(session, _batch_of(5), requested_chunk_size=2)
+
+    assert raised.value is error, 'the database error was replaced on its way out'
+    assert call_order == ['execute'] * failing_chunk + ['rollback']
+    _assert_logged_once_without_its_text(caplog, error)
+
+
+@pytest.mark.asyncio
+async def test_a_database_error_from_the_commit_rolls_back_once_and_leaves_as_itself(
+    session, call_order: list[str], caplog: pytest.LogCaptureFixture
+):
+    """Pins 2 and 5: the commit is inside the helper's catch, so its failure rolls back too.
+
+    Every chunk has been sent when the commit fails, so this is the case where a missing rollback
+    would leave the most behind on the session. It is also the case the old code covered only
+    because its commit sat inside its own try; the helper has to reproduce that, not assume it.
+    """
+    caplog.set_level(logging.DEBUG)
+    error = _database_error()
+
+    def fail_the_commit():
+        call_order.append('commit')
+        raise error
+
+    session.commit.side_effect = fail_the_commit
+
+    with pytest.raises(OperationalError) as raised:
+        await batch_create_market_activity_data(session, _batch_of(5), requested_chunk_size=2)
+
+    assert raised.value is error, 'the commit error was replaced on its way out'
+    assert call_order == ['execute', 'execute', 'execute', 'commit', 'rollback']
+    _assert_logged_once_without_its_text(caplog, error)
+
+
+@pytest.mark.parametrize(
+    'dataset',
+    [
+        pytest.param({}, id='no-market-activity-key'),
+        pytest.param({DataType.MARKET_ACTIVITY: []}, id='an-empty-market-activity-list'),
+    ],
+)
+@pytest.mark.asyncio
+async def test_an_empty_batch_touches_nothing(session, call_order: list[str], dataset: dict):
+    """Pin 3: nothing to write means no execute, no commit, and no rollback.
+
+    The early return sits ABOVE the transaction block by design (tj-vhboky.43 build item 1). Moved
+    inside it, a return is a normal exit and the helper COMMITS -- an empty transaction reported as
+    a write. Both spellings of empty reach the same `not batch_market_activity` branch, and both are
+    shapes a batch can arrive in: a fetch that returned no bars never calls append_data, and a
+    caller that pre-seeded the key does.
+
+    Args:
+        session: The recording session; it must record nothing.
+        call_order: Expected to stay empty.
+        dataset: The batch's dataset mapping, empty either way.
+    """
+    batch = _batch_of(0)
+    batch.dataset = dataset
+
+    written = await batch_create_market_activity_data(session, batch, requested_chunk_size=2)
+
+    assert written == 0
+    assert call_order == [], 'an empty batch opened, committed or rolled back a transaction'
 
 
 # ---------------------------------------------------------------------------------------

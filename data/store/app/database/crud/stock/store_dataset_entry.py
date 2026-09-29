@@ -1,16 +1,17 @@
-import traceback
 import uuid
 from typing import TYPE_CHECKING
 
 from sqlalchemy import and_, delete, func, not_, or_, select, update
 from sqlalchemy.dialects import postgresql
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.database.sql_alchemy_nullable_datetime import NullableDateTime
+from common.database.sql_alchemy_sensitive_string import SensitiveString
 from common.logging import get_logger
+from common.sensitive import REDACTED
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
+from data.store.app.database.transaction import write_transaction
 from schemas.data_store import asset_dataset_store
 
 
@@ -213,11 +214,11 @@ async def upsert_entry(db: AsyncSession, entry: asset_dataset_store.AssetDataset
     log.debug(f'Upserting entry: {entry}')
     field_values = StoreDatasetEntry.get_fields(entry, exclude_none=True)
 
-    colliding_ids = await _find_own_overlap(db, field_values)
-    if colliding_ids:
-        raise OwnOverlapConflict(colliding_ids)
+    async with write_transaction(db, 'create or update entry'):
+        colliding_ids = await _find_own_overlap(db, field_values)
+        if colliding_ids:
+            raise OwnOverlapConflict(colliding_ids)
 
-    try:
         stmt = postgresql.insert(StoreDatasetEntry).values(**field_values, created_at=func.now(), updated_at=func.now())
         stmt = stmt.on_conflict_do_update(
             constraint=StoreDatasetEntry.NATURAL_KEY_CONSTRAINT,
@@ -239,12 +240,7 @@ async def upsert_entry(db: AsyncSession, entry: asset_dataset_store.AssetDataset
         stmt = stmt.returning(StoreDatasetEntry.id)
         result = await db.execute(stmt)
         result_id = result.scalar_one()
-        await db.commit()
         return result_id
-    except SQLAlchemyError as e:
-        await db.rollback()
-        traceback.print_exc()
-        raise RuntimeError(f'Error while creating or updating entry: {e}')  # noqa: B904  # see tj-76u8ip
 
 
 async def update_entry(db: AsyncSession, entry: asset_dataset_store.AssetDatasetStoreUpdate) -> None:
@@ -256,47 +252,37 @@ async def update_entry(db: AsyncSession, entry: asset_dataset_store.AssetDataset
     same owner's entries for a reason the caller cannot see. Growth only: shrinking strands
     already-stored bars outside the entry's declared coverage, and shrinking is a delete's job.
     """
-    existing = await _get_entry_or_raise(db, entry.id)
-    _check_owner(existing, entry.owner)
+    async with write_transaction(db, 'update entry'):
+        existing = await _get_entry_or_raise(db, entry.id)
+        _check_owner(existing, entry.owner)
 
-    field_values = StoreDatasetEntry.get_fields(entry, exclude_none=True)
-    new_start = field_values['start']
-    new_end = field_values['end']
+        field_values = StoreDatasetEntry.get_fields(entry, exclude_none=True)
+        new_start = field_values['start']
+        new_end = field_values['end']
 
-    if not _is_growth(existing.start, existing.end, new_start, new_end):
-        raise RangeShrink(entry.id)
+        if not _is_growth(existing.start, existing.end, new_start, new_end):
+            raise RangeShrink(entry.id)
 
-    colliding_id = await _find_exact_collision(db, existing, new_start, new_end)
-    if colliding_id is not None:
-        raise RangeCollision(colliding_id)
+        colliding_id = await _find_exact_collision(db, existing, new_start, new_end)
+        if colliding_id is not None:
+            raise RangeCollision(colliding_id)
 
-    try:
         stmt = (
             update(StoreDatasetEntry)
             .where(StoreDatasetEntry.id == entry.id)
             .values(start=new_start, end=new_end, updated_at=func.now())
         )
         await db.execute(stmt)
-        await db.commit()
-    except SQLAlchemyError as e:
-        await db.rollback()
-        traceback.print_exc()
-        raise RuntimeError(f'Error while updating entry: {e}')  # noqa: B904  # see tj-76u8ip
 
 
 async def update_entry_lifecycle(db: AsyncSession, id: uuid.UUID, owner: str) -> None:
     """Updates only the `updated_at` for an existing entry."""
     # TODO might not be necessary
-    existing = await _get_entry_or_raise(db, id)
-    _check_owner(existing, owner)
-    try:
+    async with write_transaction(db, 'update entry lifecycle'):
+        existing = await _get_entry_or_raise(db, id)
+        _check_owner(existing, owner)
         stmt = update(StoreDatasetEntry).where(StoreDatasetEntry.id == id).values(updated_at=func.now())
         await db.execute(stmt)
-        await db.commit()
-    except SQLAlchemyError as e:
-        await db.rollback()
-        traceback.print_exc()
-        raise RuntimeError(f'Error while updating entry lifecycle: {e}')  # noqa: B904  # see tj-76u8ip
 
 
 async def get_entry_by_id(db: AsyncSession, id: uuid.UUID) -> asset_dataset_store.AssetDatasetStore:
@@ -332,8 +318,14 @@ async def search_entries(
     # StoreDatasetEntry column, so this loop already picks it up with no change -- verified,
     # not assumed). feed is NOT: there is no feed column on the entry to filter (tj-rh4b7f), and
     # StoreAssetDatasetQuery deliberately does not expose one.
+    #
+    # The log line renders the value directly, which neither the bind type (M1) nor the schema
+    # alias (M2) reaches, so a SensitiveString column logs the marker (tj-vhboky.41 Addendum 1,
+    # D3). The type is read off the table so the column declaration stays the one list.
     for column, value in request_query.model_dump().items():
-        log.debug(f'Filtering by {column}: {value}')
+        table_column = StoreDatasetEntry.__table__.c.get(column)
+        is_sensitive = table_column is not None and isinstance(table_column.type, SensitiveString)
+        log.debug(f'Filtering by {column}: {REDACTED if is_sensitive else value}')
         if value is not None:
             stmt = stmt.where(getattr(StoreDatasetEntry, column) == value)
 
@@ -358,17 +350,13 @@ async def delete_entry_by_id(db: AsyncSession, id: uuid.UUID, owner: str) -> Non
     nothing else. There is no membership sweep, no RETURNING capture and no IN-list here anymore
     -- that removes the ~65,000-bar IN-list ceiling (D1) structurally rather than by code.
     """
-    existing = await _get_entry_or_raise(db, id)
-    _check_owner(existing, owner)
-    try:
+    async with write_transaction(db, f'delete entry {id}'):
+        existing = await _get_entry_or_raise(db, id)
+        _check_owner(existing, owner)
         stmt = delete(StoreDatasetEntry).where(StoreDatasetEntry.id == id)
         result = await db.execute(stmt)
         if result.rowcount == 0:
-            # Raced with a concurrent delete between the SELECT above and this statement.
-            await db.rollback()
+            # Raced with a concurrent delete between the SELECT above and this statement. The
+            # rollback for this path comes from write_transaction, the same as every other error
+            # path here (tj-ck5spw).
             raise EntryNotFound(id)
-        await db.commit()
-    except SQLAlchemyError as e:
-        await db.rollback()
-        traceback.print_exc()
-        raise RuntimeError(f'Error while deleting entry with ID {id}: {e}')  # noqa: B904  # see tj-76u8ip
