@@ -393,7 +393,8 @@ jobs:
       #               recreate, logs, down. It never loads the client file, so starting,
       #               blanking and recreating data_store cannot depend on it.
       #   the client  docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml
-      #               -- and only ever to build or run test_client (run: --rm --no-deps -T).
+      #               -- and only ever to build or run test_client (run: --rm --no-deps -T, plus
+      #               --pull never wherever stdout is captured).
       # Built here from this job's checkout, before Start System and after Stage, because the
       # base file cannot interpolate without the staged POSTGRES_PASS. make test-system rebuilds
       # it with --build, which then finds every layer cached.
@@ -461,8 +462,12 @@ jobs:
 
           # Then prove it landed where it was aimed: the revision the database records must be
           # the single head the migration scripts report. alembic logs to stderr (alembic.ini's
-          # console handler), so stdout carries only the revision lines, each led by its id.
-          # -T: no TTY, so no carriage returns in what is compared.
+          # console handler), but anything imported on the way may still print to stdout, so a
+          # revision is only ever a line LED by a 12-hex-digit id: grep extracts those ids and
+          # nothing else, and the head count is a count of ids, not of lines. grep exiting 1
+          # means no id at all, which the checks below report; 2 is an error and fails the step.
+          # -T: no TTY, so no carriage returns in what is compared. --pull never: a missing image
+          # fails loudly instead of mixing pull progress into the captured output.
           #
           # NOTHING ELSE runs on this database -- no downgrade, no re-upgrade. A downgrade over
           # the empty database this job has just migrated proves nothing (user ruling,
@@ -470,13 +475,14 @@ jobs:
           # data, so it moved with the seed work to the fake-broker PR (epic tj-irhy0a,
           # tj-vhboky.62).
           revisions() {
-            docker compose -f docker-compose.yaml run --rm --no-deps -T data_store \
-              /code/.venv/bin/alembic "$1" | awk 'NF { print $1 }'
+            docker compose -f docker-compose.yaml run --rm --no-deps -T --pull never data_store \
+              /code/.venv/bin/alembic "$1" | { grep -Eo '^[0-9a-f]{12}\b' || [ $? -eq 1 ]; }
           }
           heads="$(revisions heads)"
           current="$(revisions current)"
+          head_count="$(printf '%s\n' "${heads}" | { grep -cE '^[0-9a-f]{12}$' || [ $? -eq 1 ]; })"
           echo "alembic heads: ${heads:-<none>}; current: ${current:-<none>}"
-          if [ -z "${heads}" ] || [ "$(printf '%s\n' "${heads}" | wc -l)" -ne 1 ]; then
+          if [ "${head_count}" -ne 1 ]; then
             echo "::error::expected exactly one migration head, got: ${heads:-<none>}"
             exit 1
           fi
@@ -492,8 +498,11 @@ jobs:
           # Read the container port out of the staged .env rather than sourcing it -- sourcing
           # would also pull POSTGRES_PASS into this shell's environment, and the only thing
           # that buys is one more place a stray `set -x` could print it. APP_INTERNAL_PORT is
-          # not a secret: it is the port both apps listen on inside their containers.
-          APP_INTERNAL_PORT="$(grep -E '^APP_INTERNAL_PORT=' .env | cut -d= -f2)"
+          # not a secret: it is the port both apps listen on inside their containers. The same
+          # env_value as the Instance Secret Lifecycle step: the last line for a key wins, as it
+          # does for compose, and the value is everything after the first `=`.
+          env_value() { grep -E "^$1=" .env | tail -n 1 | cut -d= -f2-; }
+          APP_INTERNAL_PORT="$(env_value APP_INTERNAL_PORT)"
 
           # WHY NO HOST PORT. Prod publishes nothing (tj-q9ae5u addendum 1): data_store sits on
           # three internal networks and data_ingest on ingest_store plus its egress bridge, so
@@ -507,7 +516,7 @@ jobs:
           # Each fetcher prints the body, a newline and the HTTP status, like curl -w below.
           from_client() {
             docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml \
-              run --rm --no-deps -T --entrypoint curl test_client \
+              run --rm --no-deps -T --pull never --entrypoint curl test_client \
               -sS --max-time 20 -w '\n%{http_code}' "$1"
           }
           # data_store has no curl (see its healthcheck), so its own interpreter fetches.
@@ -577,7 +586,9 @@ jobs:
           #                literal IP, so the check is about routing and no DNS is involved.
           # Every negative check needs a distinct exit status for "refused as expected", so that
           # a container that failed to start, or a missing binary, can never pass as blocked.
-          BROKER_NAME="$(grep -E '^BROKER_NAME=' .env | cut -d= -f2)"
+          # BROKER_NAME is read with the Instance Secret Lifecycle step's env_value: last one wins.
+          env_value() { grep -E "^$1=" .env | tail -n 1 | cut -d= -f2-; }
+          BROKER_NAME="$(env_value BROKER_NAME)"
           PUBLIC_ADDRESS="1.1.1.1"
           PUBLIC_PORT="443"
           failed=0
@@ -587,7 +598,7 @@ jobs:
           # working DNS would make both negatives below pass for the wrong reason.
           lookup() {
             docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml \
-              run --rm --no-deps -T --entrypoint getent test_client hosts "$1"
+              run --rm --no-deps -T --pull never --entrypoint getent test_client hosts "$1"
           }
           if found="$(lookup data_store)"; then
             echo "test_client -> data_store: resolves (${found}), as it must"
@@ -750,7 +761,7 @@ jobs:
           probe() {
             method="$1"; path="$2"; label="$3"; shift 3
             response="$(docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml \
-              run --rm --no-deps -T --entrypoint curl test_client \
+              run --rm --no-deps -T --pull never --entrypoint curl test_client \
               -sS --max-time 20 -w '\n%{http_code}' -X "${method}" \
               -H 'Content-Type: application/json' "$@" "${base}${path}")" || {
               echo "::error::${method} ${path} (${label}): curl could not complete the request"

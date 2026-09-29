@@ -18,13 +18,11 @@ _POSTGRES_ASYNC_ENABLED = get_env_var('POSTGRES_ASYNC', default=False, cast_type
 _POSTGRES_SYNC_ENABLED = get_env_var('POSTGRES_SYNC', default=False, cast_type=bool)
 if _POSTGRES_ASYNC_ENABLED is True:
     log.info('Postgres async is enabled.')
-    print('Postgres async is enabled.')
     import asyncio
 
     import asyncpg
 if _POSTGRES_SYNC_ENABLED is True:
     log.info('Postgres sync is enabled.')
-    print('Postgres sync is enabled.')
     import psycopg2
 
 
