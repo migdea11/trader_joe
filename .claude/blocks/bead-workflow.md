@@ -1,3 +1,4 @@
+<!-- LOCALLY AMENDED 2026-09-27: last gate to run closes (tj-rk0w5i ruling, tj-iv8npq). `update` flags this file rather than overwriting it; promote upstream later. -->
 <!-- generated from kit ee0119b — edit .claude/workflow.yml and re-render, not this file -->
 <!-- delivery: import — universal, pulled into CLAUDE.md via @ -->
 
@@ -15,7 +16,7 @@ Rules:
 
 | Rule | Why |
 |---|---|
-| Only the validator closes work as done | One gate, one owner |
+| The last gate to run closes work as done: the architect after its PASS on functional work, the validator on work that skips the architect gate. The main session closes only as a fallback, when the closing gate cannot, or for trivial changes that needed no review | One close per bead, by whichever gate ran last — user ruling 2026-09-27, recorded on ADR tj-rk0w5i |
 | Finish with `bd close`, never a status | Only the built-in `closed` releases a blocking edge; a custom "done" stalls every dependent, silently |
 | Never invent a status | A status with no queue is one nothing watches, and the work disappears |
 | Never rewrite a decision record | Append an addendum; the superseded reasoning is the point of having a record |

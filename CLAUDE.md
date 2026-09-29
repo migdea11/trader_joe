@@ -9,7 +9,7 @@
 ## Pipeline
 
 ```
-architect plans → (user approves) → builder → validator → architect (tests vs design) → validator closes
+architect plans → (user approves) → builder → validator → architect (tests vs design) → architect closes
 ```
 
 1. Work request → orchestrator launches the **architect** to plan.
@@ -21,22 +21,25 @@ architect plans → (user approves) → builder → validator → architect (tes
 5. Validator PASS → it leaves the bead in-review with `pending-from:architect` and a verdict note
    naming the commit SHA and the design it checked against. The orchestrator then launches the
    **architect** gate step: do the tests match the design, and where no test was written, was that
-   right? Architect PASS → `pending-from:validator`, and the validator closes. Skip the architect
-   step only for comment-only and other non-functional changes — docs, comments, formatting,
-   whitespace; any diff that touches a test is functional (ADR tj-rk0w5i).
-6. CHANGES NEEDED → back to in-progress with an `RE:` comment, routed to the validator when a test
-   is wrong and to the builder when the code departs from the design. ESCALATE → stop, ask the user.
+   right? Architect PASS → the architect closes. Skip the architect step only for comment-only and
+   other non-functional changes — docs, comments, formatting, whitespace; any diff that touches a
+   test is functional — and there the validator closes on its own PASS (ADR tj-rk0w5i).
+6. The last gate to run closes: the architect for functional work, the validator for work that
+   skipped the architect. The main session closes only as a fallback, when the closing gate cannot,
+   or for trivial changes that needed no review. CHANGES NEEDED → back to in-progress with
+   an `RE:` comment, routed to the validator when a test is wrong and to the builder when the code
+   departs from the design. ESCALATE → stop, ask the user.
 7. The **scribe** runs at feature completion, not per task.
 
 ## Agents
 
 | Agent | Role | Scope |
 |---|---|---|
-| architect | plans, never edits; gates tests against the design | reads everything |
+| architect | plans, never edits; gates tests against the design, closes functional work | reads everything |
 | builder-ingest | builder | `data/ingest`, `routers/data_ingest` |
 | builder-store | builder | `data/store`, `routers/data_store` |
 | builder-shared | builder | `common`, `schemas`, `routers/common`, build + CI files |
-| validator | quality gate, default test author, only role that closes work | all `tests/` directories |
+| validator | quality gate, default test author, closes work that skips the architect gate | all `tests/` directories |
 | scribe | docs, at feature completion | all doc tiers |
 | researcher-broker | read-only research | broker and market-data APIs |
 

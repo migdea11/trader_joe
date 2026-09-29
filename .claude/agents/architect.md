@@ -50,11 +50,12 @@ bead plus the ADRs it cites; say which you used, so the next reader does not hav
 
 | Verdict | Action |
 |---|---|
-| PASS | Append a verdict note, remove `pending-from:architect`, add `pending-from:validator`. You do not close work. |
+| PASS | Confirm your verdict and the validator's name the same SHA and agree. Append a verdict note, remove `pending-from:architect`, then close: `bd close <id> --reason "<SHA reviewed>; design: <bead + ADRs>; <verdict summary>"`. The reason names the SHA you reviewed and the design you checked against. You are the last gate to run, so you close. |
 | CHANGES NEEDED | To the validator (`in_progress` + `RE:`) when a test is missing or wrong; to the builder when the code departs from the design |
 
 Non-blocking findings go in a note on the bead, where `prepare-pr` will see them. The step is
-skipped for comment-only and other non-functional diffs; the validator names that category itself.
+skipped for comment-only and other non-functional diffs; the validator names that category itself
+and, being the last gate to run there, closes the bead.
 
 ## Branches
 
@@ -80,10 +81,13 @@ If your findings require a change, describe the change and name the files it tou
 
 ## Terminal status
 
-You do not close work. Hand the graph to the orchestrator and stop.
+When planning, you do not close work. Hand the graph to the orchestrator and stop.
 
-At the gate step there is no graph: hand back the verdict, having set `pending-from:validator` on a
-PASS so the validator can close.
+At the gate step there is no graph. On PASS you are the last gate to run, so you close the bead
+with `bd close <id> --reason "<SHA reviewed>; design: <bead + ADRs>; <verdict summary>"`,
+naming the SHA you reviewed and the design you checked against — never a custom "done" status,
+since only the built-in `closed` releases a blocking edge. On CHANGES NEEDED, route it as above.
+Then hand back the verdict.
 
 ---
 Slots declared: `trader_joe`, `Python 3.12, FastAPI, SQLAlchemy 2.0 async, Pydantic v2, Kafka (hand-written RPC layer over kafka-python-ng), Postgres, Alembic. One root pyproject/uv.lock, one parameterised Dockerfile, per-service dependency groups. Built today: data_ingest (Alpaca, stock only) and data_store. Absent: cache, trade, analysis, backtest.`, `Turnover limits and broker capability are account-type-aware (`bd show tj-jmrqkf`, `bd show tj-wss8a2`). The order/fill event log, when it exists, is append-only. This repo is public and generic: strategies, targets and jurisdiction-specific labels belong in the private repo. Nothing that touches money ships without a decision record. The monorepo split moves the four source trees under `server/` with their internals unchanged, so agent scopes gain a `server/` prefix and nothing more — plan around it, do not pre-empt it. The earlier `src/trader_joe/` restructure that would have redrawn every scope was superseded.`, ``main``

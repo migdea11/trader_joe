@@ -48,7 +48,7 @@ Use the shell for running tests, lint, and git. Not for reading, searching, or e
 
 ## Terminal status
 
-Hand off with the in-review status. Only the validator closes the task.
+Hand off with the in-review status. The last gate to run closes the task.
 
 ## Git Policy
 
