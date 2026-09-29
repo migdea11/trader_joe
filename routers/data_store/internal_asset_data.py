@@ -1,6 +1,8 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, Query
+from fastapi.exceptions import RequestValidationError
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.enums.data_select import AssetType, DataType
@@ -45,7 +47,19 @@ async def create_stock_market_activity_data(
     log.debug(f'Storing data: /{asset_path.asset_type}/{asset_path.data_type}')
     match (asset_path.asset_type, asset_path.data_type):
         case (AssetType.STOCK, DataType.MARKET_ACTIVITY):
-            stock_market_activity = StockDataMarketActivityCreate(**asset_data)
+            # asset_data is Body(dict), not the model itself (see the module docstring note above
+            # the route), so FastAPI never validates it and a malformed body raises pydantic's
+            # ValidationError here rather than FastAPI's RequestValidationError -- which escapes
+            # as an unhandled 500 instead of the usual 422 (tj-vhboky.66). Re-raising as FastAPI's
+            # own exception, with each loc prefixed by 'body', gives the caller the same 422 shape
+            # every other route answers with, without retyping the parameter (that would change
+            # this route's line in routers/tests/interface_manifest/data_store.manifest).
+            try:
+                stock_market_activity = StockDataMarketActivityCreate(**asset_data)
+            except ValidationError as e:
+                raise RequestValidationError(
+                    errors=[{**error, 'loc': ('body', *error['loc'])} for error in e.errors(include_url=False)]
+                ) from e
             return await crud_stock_market_activity.create_market_activity_data(db, stock_market_activity)
         case _:
             raise UnsupportedAssetType(asset_path.asset_type)
