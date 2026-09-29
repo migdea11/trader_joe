@@ -3931,3 +3931,221 @@ def test_a_route_dropped_from_the_system_suite_is_named(tmp_path: Path, position
     (lost,) = full - reduced
     gaps = _secret_probe_gaps(full, reduced, 'the copy')
     assert gaps == [f"guarded by require_instance_secret but not covered by the copy: ['{lost[0]} {lost[1]}']"], gaps
+
+
+# ---------------------------------------------------------------------------------------
+# A CONTAINER TEST JOB BRINGS ITS OWN GIT AND MAKE (tj-ijpys9.16)
+#
+# A job that runs in `container:` gets the image's toolchain, not the runner's. The unit-test job
+# runs in debian:bookworm-slim, which has neither git nor make, and 26 tests failed closed in CI:
+# 22 drive the Makefile, 4 run git from the checkout root. git has to be there BEFORE
+# actions/checkout, not merely before pytest: with no git on PATH checkout falls back to a REST
+# API tarball with no .git, and installing git afterwards cannot bring the repository back.
+#
+# Derived from the YAML, not from a job name: every job in every workflow that runs in a container
+# and has a step running pytest or `make test` is judged, so a second container job is held to the
+# same rule the day it is added.
+#
+# safe.directory is pinned with it. The runner creates the workspace as its own user and the
+# container runs as root, so git refuses the checkout for dubious ownership; the builder's reading
+# of actions/checkout (tj-ijpys9.16 notes) is that checkout's own safe.directory entry lives in a
+# temporary global config deleted when its step ends. Without the entry the same four git tests
+# fail closed, which is the failure this bead exists to remove, so it is part of the contract, not
+# an extra. Accepted at --system or --global scope (a later step's HOME is the real one either
+# way), for the workspace or for '*', in any step before the suite runs.
+CONTAINER_TEST_TOOLS = frozenset({'git', 'make'})
+CHECKOUT_ACTION = 'actions/checkout'
+# (package manager, subcommand) pairs that install packages. A manager missing from here makes a
+# correct job read as installing nothing, which fails loudly rather than passing.
+_PACKAGE_INSTALLS = frozenset(
+    {('apt-get', 'install'), ('apt', 'install'), ('apk', 'add'), ('dnf', 'install'), ('yum', 'install')}
+)
+SAFE_DIRECTORY_SCOPES = frozenset({'--system', '--global'})
+_WORKSPACE_VALUE = re.compile(r'^(?:\$GITHUB_WORKSPACE|\$\{GITHUB_WORKSPACE\}|\$\{\{\s*github\.workspace\s*\}\}|\*)$')
+
+
+def _step_commands(step: dict) -> list[list[str]]:
+    """Every simple command in a step's `run:` script, as argv."""
+    return [command for line in _step_lines(step) for command in _commands(line)]
+
+
+def _is_checkout(step: dict) -> bool:
+    uses = str(step.get('uses') or '')
+    return uses == CHECKOUT_ACTION or uses.startswith(f'{CHECKOUT_ACTION}@')
+
+
+def _runs_the_suite(step: dict) -> bool:
+    """True when a step runs pytest (directly, through uv or python -m) or `make test`."""
+    for command in _step_commands(step):
+        if any(PurePosixPath(word).name == 'pytest' for word in command):
+            return True
+        for index, word in enumerate(command):
+            if PurePosixPath(word).name == 'make' and 'test' in command[index + 1 :]:
+                return True
+    return False
+
+
+def _installed_packages(step: dict) -> set[str]:
+    """The package names a step's run script installs, version pins stripped."""
+    packages: set[str] = set()
+    for command in _step_commands(step):
+        for index in range(len(command) - 1):
+            if (PurePosixPath(command[index]).name, command[index + 1]) in _PACKAGE_INSTALLS:
+                arguments = command[index + 2 :]
+                packages |= {re.split(r'[=<>]', word)[0] for word in arguments if not word.startswith('-')}
+                break
+    return packages
+
+
+def _marks_workspace_safe(step: dict) -> bool:
+    """True when a step adds the workspace (or '*') to safe.directory at system or global scope."""
+    for command in _step_commands(step):
+        if not command or PurePosixPath(command[0]).name != 'git' or 'config' not in command:
+            continue
+        if 'safe.directory' not in command or not SAFE_DIRECTORY_SCOPES & set(command):
+            continue
+        value = ' '.join(command[command.index('safe.directory') + 1 :])
+        if _WORKSPACE_VALUE.match(value):
+            return True
+    return False
+
+
+def _container_test_jobs() -> list[tuple[str, dict]]:
+    """(label, job) for every workflow job that runs in a container and runs the unit suite."""
+    found = []
+    for workflow in _workflow_files():
+        for job_id, job in ((_load_yaml(workflow) or {}).get('jobs') or {}).items():
+            spec = job or {}
+            if spec.get('container') and any(_runs_the_suite(step) for step in spec.get('steps') or []):
+                found.append((f'{workflow.name}:{job_id}', spec))
+    return found
+
+
+def _container_toolchain_gaps(job: dict) -> list[str]:
+    """What a container test job lacks: git and make installed before checkout, and a safe workspace."""
+    steps = job.get('steps') or []
+    checkouts = [index for index, step in enumerate(steps) if _is_checkout(step)]
+    if not checkouts:
+        return [f'no {CHECKOUT_ACTION} step, so there is nothing to install {sorted(CONTAINER_TEST_TOOLS)} before']
+    checkout = checkouts[0]
+    gaps = []
+    before = set().union(*(_installed_packages(step) for step in steps[:checkout]))
+    after = set().union(*(_installed_packages(step) for step in steps[checkout:]))
+    missing = sorted(CONTAINER_TEST_TOOLS - before)
+    if missing:
+        late = sorted(set(missing) & after)
+        gaps.append(
+            f'{missing} not installed before {CHECKOUT_ACTION} (step {checkout})'
+            + (f'; {late} installed only after it, too late for checkout to clone a .git' if late else '')
+        )
+    suite = next(index for index, step in enumerate(steps) if _runs_the_suite(step))
+    if not any(_marks_workspace_safe(step) for step in steps[:suite]):
+        gaps.append(
+            f'no step before the suite (step {suite}) runs `git config --system|--global --add '
+            f'safe.directory "${{GITHUB_WORKSPACE}}"`, so git refuses the root-run container checkout'
+        )
+    return gaps
+
+
+_CONTAINER_TEST_JOBS = _container_test_jobs()
+
+
+@pytest.mark.build_infra
+def test_some_workflow_job_runs_the_suite_in_a_container():
+    """Guard the guard: the derivation must find the container unit-test job.
+
+    If _runs_the_suite or the container detection stopped matching, the per-job test below would
+    parametrize over nothing. No job name is named: any container job running the suite satisfies it.
+    """
+    assert _CONTAINER_TEST_JOBS, (
+        'no workflow job both runs in `container:` and runs pytest or `make test`: either the unit '
+        'job left its container (then retire this section in the same diff) or the detection is blind'
+    )
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    'job', [job for _, job in _CONTAINER_TEST_JOBS], ids=[label for label, _ in _CONTAINER_TEST_JOBS]
+)
+def test_container_test_job_installs_git_and_make_before_checkout(job: dict):
+    """tj-ijpys9.16: a container job running the suite installs git and make before checkout and trusts the workspace."""
+    gaps = _container_toolchain_gaps(job)
+    assert gaps == [], '; '.join(gaps)
+
+
+_CHECKOUT = {'uses': 'actions/checkout@0123456789abcdef'}
+_INSTALL = {'run': 'apt-get update\napt-get install -y --no-install-recommends git make ca-certificates'}
+_SAFE = {'run': 'git config --system --add safe.directory "${GITHUB_WORKSPACE}"'}
+_SUITE = {'run': 'uv run pytest -s'}
+_TOOLCHAIN_ACCEPTED = {
+    'install-then-checkout': [_INSTALL, _SAFE, _CHECKOUT, _SUITE],
+    'one-step-with-safe-directory': [{'run': _INSTALL['run'] + '\n' + _SAFE['run']}, _CHECKOUT, _SUITE],
+    'global-scope-expression-make-test': [
+        _INSTALL,
+        _CHECKOUT,
+        {'run': 'git config --global --add safe.directory "${{ github.workspace }}"'},
+        {'run': 'make test PATHS=common'},
+    ],
+    'pinned-version-and-env-prefix': [
+        {'run': 'DEBIAN_FRONTEND=noninteractive apt-get install -y git=1:2.39.5-0 make'},
+        _SAFE,
+        _CHECKOUT,
+        _SUITE,
+    ],
+}
+_TOOLCHAIN_REJECTED = {
+    'install-after-checkout': [_CHECKOUT, _INSTALL, _SAFE, _SUITE],
+    'make-dropped': [{'run': 'apt-get install -y git ca-certificates'}, _SAFE, _CHECKOUT, _SUITE],
+    'git-dropped': [{'run': 'apt-get install -y make ca-certificates'}, _SAFE, _CHECKOUT, _SUITE],
+    'no-install-step': [_SAFE, _CHECKOUT, _SUITE],
+    'no-safe-directory': [_INSTALL, _CHECKOUT, _SUITE],
+    'safe-directory-after-suite': [_INSTALL, _CHECKOUT, _SUITE, _SAFE],
+    'safe-directory-local-scope': [
+        _INSTALL,
+        _CHECKOUT,
+        {'run': 'git config --local --add safe.directory "$GITHUB_WORKSPACE"'},
+        _SUITE,
+    ],
+    'safe-directory-other-path': [
+        {'run': _INSTALL['run'] + '\ngit config --system --add safe.directory /tmp'},
+        _CHECKOUT,
+        _SUITE,
+    ],
+    'no-checkout': [_INSTALL, _SAFE, _SUITE],
+}
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize('steps', list(_TOOLCHAIN_ACCEPTED.values()), ids=list(_TOOLCHAIN_ACCEPTED))
+def test_container_toolchain_rule_accepts_a_correct_job(steps: list[dict]):
+    """A correct container job passes, including shapes the real workflow does not use today."""
+    assert _container_toolchain_gaps({'container': 'debian:bookworm-slim', 'steps': steps}) == []
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize('steps', list(_TOOLCHAIN_REJECTED.values()), ids=list(_TOOLCHAIN_REJECTED))
+def test_container_toolchain_rule_rejects_a_broken_job(steps: list[dict]):
+    """Each of these leaves the suite without git, make or a trusted checkout, and must be named."""
+    assert _container_toolchain_gaps({'container': 'debian:bookworm-slim', 'steps': steps}) != []
+
+
+@pytest.mark.build_infra
+def test_only_container_jobs_that_run_the_suite_are_judged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A host job has the runner's git and make; a container job that runs no tests needs neither."""
+    workflow = {
+        'jobs': {
+            'host-tests': {'steps': [_CHECKOUT, _SUITE]},
+            'container-lint': {
+                'container': 'debian:bookworm-slim',
+                'steps': [_CHECKOUT, {'run': 'uv run ruff check .'}],
+            },
+            'container-system': {
+                'container': 'debian:bookworm-slim',
+                'steps': [_CHECKOUT, {'run': 'make test-system'}],
+            },
+            'container-tests': {'container': {'image': 'debian:bookworm-slim'}, 'steps': [_CHECKOUT, _SUITE]},
+        }
+    }
+    (tmp_path / 'ci.yml').write_text(yaml.safe_dump(workflow), encoding='utf-8')
+    monkeypatch.setattr(sys.modules[__name__], 'WORKFLOW_DIR', tmp_path)
+    assert [label for label, _ in _container_test_jobs()] == ['ci.yml:container-tests']
