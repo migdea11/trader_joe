@@ -256,11 +256,34 @@ jobs:
     name: System Testing
     runs-on: ubuntu-latest
     permissions:
-      packages: read  # pulls the images Image Build pushed; no checkout, so no contents
+      contents: read  # checkout: the system suite (tests/system) runs from the source tree
+      packages: read  # pulls the images Image Build pushed
     needs:
       - build
 
     steps:
+      # The stack still runs from the images Image Build pushed and the configs it staged; the
+      # checkout exists only so the runner can execute the system suite (tests/system) against
+      # that stack. Into the workspace root, not a subdirectory: make test-system reads the
+      # stack's ports and credentials from the project env file in its own working directory,
+      # and the Stage step below writes that file here. No credential is persisted into the
+      # checkout's config -- nothing in this job fetches or pushes.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install UV
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
+        with:
+          version: "${{ env.UV_VERSION }}"
+
+      # The same group set, locked, as Linting and Unit Testing and the Makefile's venv
+      # recipe: the suite needs httpx (base), asyncpg and sqlalchemy (data-store) and pytest
+      # (testing), and make test-system's own sync then finds nothing left to install.
+      - name: Install dependencies
+        run: |
+          uv sync --all-groups --no-group security --locked
+
       - name: Registry Login
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
         with:
@@ -276,13 +299,32 @@ jobs:
 
       - name: Stage Pipeline Configs
         run: |
+          set -euo pipefail
           ls -lahR artifact/
           cp artifact/docker-compose.yaml ./docker-compose.yaml
           cp artifact/.env.default ./.env
           # Same throwaway credential as the build job, regenerated here: the two jobs
           # run on different runners and this one is the one that actually starts
-          # Postgres, so the value only has to be consistent within this job.
-          printf '\nPOSTGRES_PASS=%s\n' "$(openssl rand -hex 24)" >> .env
+          # Postgres, so the value only has to be consistent within this job. Masked before
+          # it is written anywhere: the system suite now holds it too, and a failing test's
+          # output is one more place it could otherwise surface.
+          db_pass="$(openssl rand -hex 24)"
+          echo "::add-mask::${db_pass}"
+          printf '\nPOSTGRES_PASS=%s\n' "${db_pass}" >> .env
+
+          # A throwaway INSTANCE_WRITE_SECRET, generated the same way and for the same reason:
+          # the template ships it empty, the write routes fail closed without it, and the
+          # system suite (make test-system) refuses to start without one. Registered with the
+          # runner's log masking BEFORE anything can print it, and never echoed. It is not a
+          # broker credential -- it authenticates this job's own data_store to its own test
+          # client and nothing else -- so the tj-59cce6 rule at the top of this file is
+          # unaffected. The template's empty line is deleted rather than overridden, so the
+          # staged file holds exactly one value for every reader: compose, the make recipe and
+          # the secret-lifecycle step below.
+          write_secret="$(openssl rand -hex 32)"
+          echo "::add-mask::${write_secret}"
+          sed -i '/^INSTANCE_WRITE_SECRET=/d' .env
+          printf 'INSTANCE_WRITE_SECRET=%s\n' "${write_secret}" >> .env
 
           mkdir -p data/ingest
           cp artifact/data/ingest/.env.default data/ingest/.env
@@ -292,7 +334,12 @@ jobs:
           # ./data/store/alembic.ini -> /code/alembic.ini and ./data/store/migrations ->
           # /code/migrations. alembic resolves script_location=migrations against the
           # container's WORKDIR (/code), so both have to land here, not anywhere else.
+          # The checkout already holds a migrations directory at that path, and cp -r into an
+          # existing directory nests the copy one level down (migrations/migrations), which
+          # would leave the mounted tree as the checkout's rather than the artifact's. Remove
+          # it first, so what is mounted is exactly what Image Build staged beside the images.
           cp artifact/data/store/alembic.ini data/store/alembic.ini
+          rm -rf data/store/migrations
           cp -r artifact/data/store/migrations data/store/migrations
 
 
@@ -344,8 +391,40 @@ jobs:
           # `run` publishes no ports, so this cannot collide with the running data_store.
           # The command is an explicit argv: the image sets CMD, not ENTRYPOINT, so passing
           # one replaces entrypoint.sh rather than appending to it.
+          #
+          # upgrade head, never create_all (tj-6bvoic): the schema the system suite runs
+          # against is the one the migrations build, which is the only one prod ever has. See
+          # data/store/tests/test_market_activity_idempotency.py, whose docstring concedes the
+          # Postgres-only property that tests/system now checks against this database.
+          set -euo pipefail
           docker compose -f docker-compose.yaml run --rm --no-deps data_store \
             /code/.venv/bin/alembic upgrade head
+
+          # Then prove it landed where it was aimed: the revision the database records must be
+          # the single head the migration scripts report. alembic logs to stderr (alembic.ini's
+          # console handler), so stdout carries only the revision lines, each led by its id.
+          # -T: no TTY, so no carriage returns in what is compared.
+          #
+          # NOTHING ELSE runs on this database -- no downgrade, no re-upgrade. A downgrade over
+          # the empty database this job has just migrated proves nothing (user ruling,
+          # tj-vhboky.47): the round trip only means something against rows. It needs seeded
+          # data, so it moved with the seed work to the fake-broker PR (epic tj-irhy0a,
+          # tj-vhboky.62).
+          revisions() {
+            docker compose -f docker-compose.yaml run --rm --no-deps -T data_store \
+              /code/.venv/bin/alembic "$1" | awk 'NF { print $1 }'
+          }
+          heads="$(revisions heads)"
+          current="$(revisions current)"
+          echo "alembic heads: ${heads:-<none>}; current: ${current:-<none>}"
+          if [ -z "${heads}" ] || [ "$(printf '%s\n' "${heads}" | wc -l)" -ne 1 ]; then
+            echo "::error::expected exactly one migration head, got: ${heads:-<none>}"
+            exit 1
+          fi
+          if [ "${current}" != "${heads}" ]; then
+            echo "::error::database is at revision ${current:-<none>}, not the head ${heads}"
+            exit 1
+          fi
 
       - name: Smoke Test
         run: |
@@ -404,6 +483,132 @@ jobs:
             "http://127.0.0.1:${DATA_STORE_PORT}/store/stock/market-activity/SMOKETEST" '[]'
 
           echo "Smoke test passed: both services answered /ping and data_store served a query from Postgres."
+
+      - name: Check Container Env
+        run: |
+          set -euo pipefail
+          # A container-level fact no test can see: the system suite talks to data_store over
+          # HTTP and never reads the container's environment. MARKET_ACTIVITY_BATCH_SIZE comes
+          # from the data_store env template through compose's env_file; unset or non-positive,
+          # the bar write path refuses every batch (asset_market_activity.py). Read with the
+          # image's own interpreter -- there is no printenv-is-missing ambiguity and the value is
+          # not a secret, so it is printed.
+          value="$(docker compose -f docker-compose.yaml exec -T data_store /code/.venv/bin/python -c \
+            'import os; print(os.environ.get("MARKET_ACTIVITY_BATCH_SIZE", ""))')"
+          echo "data_store MARKET_ACTIVITY_BATCH_SIZE=${value:-<unset or empty>}"
+          if ! [[ "${value}" =~ ^[0-9]+$ ]] || (( 10#${value} <= 0 )); then
+            echo "::error::MARKET_ACTIVITY_BATCH_SIZE in data_store must be a positive integer, got '${value}'"
+            exit 1
+          fi
+
+      - name: System Tests
+        # This runner's database is thrown away with the job, which is the one condition under
+        # which the suite may run: it WRITES to the database it is pointed at, and the make
+        # target refuses without this. Set on this step only, so nothing else in the job
+        # inherits the permission.
+        env:
+          SYSTEM_TEST_DISPOSABLE_DB: "1"
+        run: |
+          set -euo pipefail
+          # The same invocation a developer runs (tj-vhboky.48): the target, not a copy of its
+          # pytest line, so the env contract -- ports and credentials read from the staged project
+          # env file without sourcing it, a non-UTC TZ, PYTHONPATH -- has one definition. The
+          # recipe ends on pytest, so its exit status is this step's: any failure is red, and so
+          # is exit 5, an empty collection -- a suite that ran nothing has proved nothing.
+          # tests/system is the counterpart of data/store/tests/test_market_activity_idempotency.py:
+          # what that file's docstring concedes a unit test cannot show, these check on Postgres.
+          make test-system
+
+      - name: Instance Secret Lifecycle
+        run: |
+          set -euo pipefail
+          # Two properties of INSTANCE_WRITE_SECRET that need container control, so they are
+          # steps here rather than tests in tests/system (test_http_write_secret.py covers the
+          # rest of the matrix over HTTP). After System Tests on purpose: the log scan should see
+          # every request the suite made. The value is read back from the staged project env
+          # file, like the ports in Smoke Test, never sourced; it was masked when generated.
+          env_value() { grep -E "^$1=" .env | tail -n 1 | cut -d= -f2-; }
+          DATA_STORE_PORT="$(env_value DATA_STORE_PORT)"
+          former_secret="$(env_value INSTANCE_WRITE_SECRET)"
+          if [ -z "${former_secret}" ]; then
+            echo "::error::no INSTANCE_WRITE_SECRET in the staged project env file; the Stage step should have written one"
+            exit 1
+          fi
+
+          # (f) FIRST: no container log carries the secret. Before (e), because recreating
+          # data_store discards its current container, and with it the logs of the whole suite.
+          # A hit prints the container and a count, never the matching line. grep exiting 1
+          # means no match and is the pass; 2 is an error and fails the step.
+          leaked=0
+          for container in $(docker compose -f docker-compose.yaml ps --all --format '{{.Name}}'); do
+            if ! hits="$(docker logs "${container}" 2>&1 | { grep -cF -e "${former_secret}" || [ $? -eq 1 ]; })"; then
+              echo "::error::could not read the logs of ${container}, so they could not be checked"
+              exit 1
+            fi
+            hits="${hits:-0}"
+            echo "${container}: ${hits} log line(s) carry the instance secret"
+            if [ "${hits}" -ne 0 ]; then
+              echo "::error::${container} logged the instance secret on ${hits} line(s); lines withheld"
+              leaked=1
+            fi
+          done
+          if [ "${leaked}" -ne 0 ]; then
+            exit 1
+          fi
+
+          # (e) An unset secret must never mean allow-everything. Blank it -- the template's own
+          # shipped state -- and recreate data_store alone; --no-deps leaves Postgres, kafka and
+          # data_ingest as they are, and --wait holds until the new container is healthy.
+          sed -i 's/^INSTANCE_WRITE_SECRET=.*/INSTANCE_WRITE_SECRET=/' .env
+          docker compose -f docker-compose.yaml up -d --no-deps --force-recreate --wait --wait-timeout 180 data_store
+          # Check the blanking reached the process, or every 401 below would prove nothing new.
+          docker compose -f docker-compose.yaml exec -T data_store /code/.venv/bin/python -c \
+            'import os, sys; sys.exit(1 if os.environ.get("INSTANCE_WRITE_SECRET") else 0)' \
+            || { echo "::error::data_store still has a non-empty INSTANCE_WRITE_SECRET after recreation"; exit 1; }
+
+          # Every write route, with every kind of header -- none, empty, arbitrary, and the
+          # secret that was valid a minute ago -- must answer 401 with the fixed detail
+          # (routers/common/instance_secret.py). The bodies are {} on purpose: the guard is a
+          # route dependency and runs before body validation, so a route that lost it answers
+          # 422 here and fails the check, and a probe can never write anything.
+          want_body='{"detail":"Invalid or missing instance write secret"}'
+          base="http://127.0.0.1:${DATA_STORE_PORT}"
+          failed=0
+          probe() {
+            method="$1"; path="$2"; label="$3"; shift 3
+            response="$(curl -sS --max-time 20 -w '\n%{http_code}' -X "${method}" \
+              -H 'Content-Type: application/json' "$@" "${base}${path}")" || {
+              echo "::error::${method} ${path} (${label}): curl could not complete the request"
+              failed=1; return 0; }
+            status="${response##*$'\n'}"
+            body="${response%$'\n'*}"
+            if [[ "${body}" == *"${former_secret}"* ]]; then
+              echo "::error::${method} ${path} (${label}): HTTP ${status}, and the body carries the former secret (withheld)"
+              failed=1
+            elif [ "${status}" != "401" ] || [ "${body}" != "${want_body}" ]; then
+              echo "::error::${method} ${path} (${label}): expected 401 ${want_body}, got ${status} ${body}"
+              failed=1
+            else
+              echo "${method} ${path} (${label}): 401"
+            fi
+          }
+          arbitrary="$(openssl rand -hex 32)"
+          for route in \
+              "POST /store/stock/market-activity/LIFECYCLE" \
+              "DELETE /store/00000000-0000-0000-0000-000000000000?owner=ci-secret-lifecycle" \
+              "POST /internal/asset-data/stock/market-activity"; do
+            method="${route%% *}"; path="${route#* }"
+            data=()
+            if [ "${method}" = "POST" ]; then data=(--data '{}'); fi
+            probe "${method}" "${path}" "no header" "${data[@]}"
+            probe "${method}" "${path}" "empty header" -H 'X-Instance-Secret;' "${data[@]}"
+            probe "${method}" "${path}" "arbitrary header" -H "X-Instance-Secret: ${arbitrary}" "${data[@]}"
+            probe "${method}" "${path}" "former secret" -H "X-Instance-Secret: ${former_secret}" "${data[@]}"
+          done
+          if [ "${failed}" -ne 0 ]; then
+            exit 1
+          fi
+          echo "Instance secret lifecycle passed: no log carries it, and with it unset every write is 401."
 
       - name: Dump Container Logs
         if: failure()

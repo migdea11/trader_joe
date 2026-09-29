@@ -10,9 +10,11 @@ returns non-zero on a broken service. That requires a daemon and is tracked in t
 A green run here means the configuration still says the right thing, nothing more.
 """
 
+import ast
 import configparser
 import copy
 import fnmatch
+import importlib
 import os
 import re
 import shlex
@@ -24,6 +26,7 @@ from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 from pathlib import Path, PurePosixPath
+from typing import Annotated
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -2449,3 +2452,841 @@ def test_the_bandit_model_reproduces_the_directory_rewrite(
     scanned = _bandit_scanned_files(['bandit', '-r', './pkg', '--exclude', exclude], tmp_path)
     assert os.path.join('pkg', 'module.py') in scanned
     assert (os.path.join('pkg', 'tests', 'test_module.py') in scanned) is nested_test_scanned, scanned
+
+
+# ---------------------------------------------------------------------------------------
+# THE SYSTEM TESTING JOB (Sys-5 tj-vhboky.52, pinned by Sys-6 tj-vhboky.53)
+#
+# The job brings the stack up from docker-compose.yaml alone, migrates it to head and proves the
+# recorded revision is the single head, checks one container-level env value, runs the system
+# suite through `make test-system`, then checks the instance write secret's lifecycle. Every
+# property below fails silently when lost: a job that swallows the suite's exit status, loads an
+# overlay, downgrades a database or prints a secret before masking it still shows a green tick.
+#
+# Read from the parsed YAML. Inside a `run:` script the shell text is judged line by line, with
+# comment lines dropped, because a comment is the one place a forbidden word may legitimately
+# appear -- the Migrate step's comment explains why it runs no downgrade.
+#
+# Already pinned elsewhere and not repeated here: `make test-system` refuses without the
+# disposable-database attestation (test_test_system_refuses_without_the_disposable_database_attestation,
+# a real make run) and the PR gate never collects tests/system (test_the_gate_does_not_collect_a_test_
+# under_tests_system, a real pytest --collect-only).
+SYSTEM_JOB_NAME = 'System Testing'
+STAGE_STEP = 'Stage Pipeline Configs'
+MIGRATE_STEP = 'Migrate Database'
+SYSTEM_TESTS_STEP = 'System Tests'
+LIFECYCLE_STEP = 'Instance Secret Lifecycle'
+DUMP_STEP = 'Dump Container Logs'
+STOP_STEP = 'Stop System'
+SYSTEM_JOB_STEP_ORDER = (
+    STAGE_STEP,
+    'Start System',
+    MIGRATE_STEP,
+    'Smoke Test',
+    'Check Container Env',
+    SYSTEM_TESTS_STEP,
+    LIFECYCLE_STEP,
+    DUMP_STEP,
+    STOP_STEP,
+)
+# Steps that must reach the stack, so an empty compose-invocation list cannot pass the file check.
+SYSTEM_JOB_COMPOSE_STEPS = ('Start System', MIGRATE_STEP, 'Check Container Env', LIFECYCLE_STEP, DUMP_STEP, STOP_STEP)
+TEARDOWN_CONDITIONS = frozenset({'failure()', 'always()'})
+# The staged project env file the job writes and reads back. Named through the template's stem so
+# this module never spells a path that holds real credentials.
+STAGED_ENV_FILE = ENV_DEFAULT_FILE.stem
+# The write routes the lifecycle step must refuse with the secret blank, and how it probes each.
+LIFECYCLE_ROUTE_COUNT = 3
+LIFECYCLE_HEADER_VARIANTS = 4
+# docker compose global options that take a value, so the subcommand can be told from a value.
+_COMPOSE_VALUE_OPTIONS = frozenset(
+    {'-f', '--file', '-p', '--project-name', '--env-file', '--profile', '--project-directory', '--ansi', '--progress'}
+)
+_COMPOSE_INVOCATION = re.compile(r'\bdocker(?:\s+compose|-compose)(?=\s|$)')
+_SWALLOWED_STATUS = re.compile(r'\|\|\s*(?:true|:)\s*(?:$|[;)}])|\|\|\s*exit\s+0\b|\bset\s+\+e\b')
+_BROKER_NAME = re.compile(r'\b(?:' + '|'.join(re.escape(prefix) for prefix in BROKER_SECRET_PREFIXES) + r')\w+')
+_GENERATED_VALUE = re.compile(r'^(\w+)="?\$\(openssl rand\b')
+_FUNCTION_HEAD = re.compile(r'^(\w+)\(\)\s*\{$')
+_CAPTURED_CALL = re.compile(r'^(\w+)="\$\((\w+) (\w+)\)"$')
+
+
+def _system_job() -> dict:
+    jobs = (_load_yaml(TESTING_WORKFLOW) or {}).get('jobs') or {}
+    matches = [job for job in jobs.values() if (job or {}).get('name') == SYSTEM_JOB_NAME]
+    assert len(matches) == 1, (
+        f'expected one job named {SYSTEM_JOB_NAME!r} in {TESTING_WORKFLOW.name}, found {len(matches)}'
+    )
+    return matches[0]
+
+
+def _system_steps() -> list[dict]:
+    steps = _system_job().get('steps') or []
+    assert steps, f'the {SYSTEM_JOB_NAME} job has no steps'
+    return steps
+
+
+def _system_step(name: str) -> dict:
+    matches = [step for step in _system_steps() if step.get('name') == name]
+    assert len(matches) == 1, f'expected one {name!r} step in {SYSTEM_JOB_NAME}, found {len(matches)}'
+    return matches[0]
+
+
+def _step_lines(step: dict) -> list[str]:
+    return _run_lines(step.get('run') or '')
+
+
+def _compose_files(line: str) -> list[list[str]]:
+    """For each docker compose invocation on a line, the compose files it names with -f/--file."""
+    invocations = []
+    for match in _COMPOSE_INVOCATION.finditer(line):
+        words = line[match.end() :].split()
+        files, position = [], 0
+        while position < len(words) and words[position].startswith('-'):
+            option, equals, value = words[position].partition('=')
+            if option in ('-f', '--file'):
+                if not equals:
+                    position += 1
+                    value = words[position] if position < len(words) else ''
+                files.append(value.strip('\'"'))
+            elif option in _COMPOSE_VALUE_OPTIONS and not equals:
+                position += 1
+            position += 1
+        invocations.append(files)
+    return invocations
+
+
+@pytest.mark.build_infra
+def test_system_job_steps_run_in_order_with_teardown_last():
+    """tj-vhboky.52 items 6 and 7: the suite before the lifecycle, the log dump before the stop.
+
+    The lifecycle step must follow the suite so its log scan sees every request the suite made;
+    Dump Container Logs (on failure) must precede Stop System (always), whose `down -v` destroys
+    the containers the dump reads. Everything after the lifecycle step is teardown, and nothing
+    before it is conditional, so no check on the way can be skipped.
+    """
+    steps = _system_steps()
+    names = [step.get('name') for step in steps]
+    for name in SYSTEM_JOB_STEP_ORDER:
+        assert names.count(name) == 1, f'{SYSTEM_JOB_NAME} has {names.count(name)} {name!r} step(s): {names}'
+    positions = [names.index(name) for name in SYSTEM_JOB_STEP_ORDER]
+    assert positions == sorted(positions), (
+        f'{SYSTEM_JOB_NAME} steps are out of order: expected {list(SYSTEM_JOB_STEP_ORDER)} as a subsequence of {names}'
+    )
+    lifecycle = names.index(LIFECYCLE_STEP)
+    assert names[lifecycle + 1 : lifecycle + 3] == [DUMP_STEP, STOP_STEP], (
+        f'{DUMP_STEP} then {STOP_STEP} must directly follow {LIFECYCLE_STEP}: {names}'
+    )
+    assert _system_step(DUMP_STEP).get('if') == 'failure()', f'{DUMP_STEP} must run on failure only'
+    assert _system_step(STOP_STEP).get('if') == 'always()', f'{STOP_STEP} must always run'
+    conditional = [step.get('name') for step in steps[: lifecycle + 1] if 'if' in step]
+    assert not conditional, f'steps up to {LIFECYCLE_STEP} must be unconditional: {conditional}'
+    not_teardown = [step.get('name') for step in steps[lifecycle + 1 :] if step.get('if') not in TEARDOWN_CONDITIONS]
+    assert not not_teardown, f'steps after {LIFECYCLE_STEP} must be failure() or always() teardown: {not_teardown}'
+    stop = names.index(STOP_STEP)
+    late_docker = [
+        step.get('name')
+        for step in steps[stop + 1 :]
+        if any('docker' in shlex.split(line, comments=True) for line in _step_lines(step))
+    ]
+    assert not late_docker, f'steps after {STOP_STEP} still drive docker: {late_docker}'
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize('workflow', _workflow_files(), ids=lambda p: p.name)
+def test_no_workflow_runs_a_downgrade(workflow: Path):
+    """tj-vhboky.53 (5), user ruling tj-vhboky.47: no workflow downgrades a database.
+
+    A downgrade over the empty database the job has just migrated proves nothing; the round trip
+    with data moved to the fake-broker PR (epic tj-irhy0a). Every run line of every step is
+    judged, comments excepted, so a downgrade through alembic, run_migrations.sh or make is caught.
+    """
+    document = _load_yaml(workflow) or {}
+    offenders = [
+        f'{job_id} / {step.get("name")}: {line}'
+        for job_id, job in (document.get('jobs') or {}).items()
+        for step in (job or {}).get('steps') or []
+        for line in _step_lines(step)
+        if 'downgrade' in line.lower()
+    ]
+    assert not offenders, f'{workflow.name} runs a downgrade: {offenders}'
+
+
+@pytest.mark.build_infra
+def test_no_makefile_recipe_runs_a_downgrade():
+    """tj-vhboky.53: the host must never downgrade a real database, so no make target can."""
+    offenders = [
+        line.strip()
+        for line in MAKEFILE.read_text(encoding='utf-8').replace('\\\n', ' ').splitlines()
+        if line.startswith('\t') and not line.strip().startswith('#') and 'downgrade' in line.lower()
+    ]
+    assert not offenders, f'{MAKEFILE.name} has recipe lines that downgrade: {offenders}'
+
+
+@pytest.mark.build_infra
+def test_system_job_migrates_only_up_to_head_and_asserts_current_is_head():
+    """tj-vhboky.52 item 3: upgrade head, then the recorded revision equals the single head.
+
+    alembic runs only in the Migrate step. Its one mutating command is `upgrade head`; the rest
+    read (`heads`, `current`), through the step's wrapper function, and the step compares them.
+    """
+    offenders = [
+        f'{step.get("name")}: {line}'
+        for step in _system_steps()
+        if step.get('name') != MIGRATE_STEP
+        for line in _step_lines(step)
+        for command in _commands(line)
+        if _alembic_subcommand(command) is not None
+    ]
+    assert not offenders, f'alembic runs outside {MIGRATE_STEP}: {offenders}'
+
+    lines = _step_lines(_system_step(MIGRATE_STEP))
+    wrappers, upgrades, others = set(), [], []
+    current_function = None
+    for line in lines:
+        if head := _FUNCTION_HEAD.match(line):
+            current_function = head.group(1)
+            continue
+        if line == '}':
+            current_function = None
+            continue
+        for command in _commands(line):
+            subcommand = _alembic_subcommand(command)
+            if subcommand is None:
+                continue
+            if subcommand == '$1' and current_function:
+                wrappers.add(current_function)
+            elif subcommand == 'upgrade':
+                upgrades.append(command[command.index('upgrade') + 1 :])
+            else:
+                others.append(' '.join(command))
+    assert upgrades == [['head']], f'{MIGRATE_STEP} must run exactly one `upgrade head`, found {upgrades}'
+    assert not others, f'{MIGRATE_STEP} runs alembic subcommands other than upgrade head: {others}'
+    assert wrappers, f'{MIGRATE_STEP} has no function wrapping `alembic "$1"`, so it reads neither heads nor current'
+
+    captured = {
+        match.group(1): match.group(3)
+        for line in lines
+        if (match := _CAPTURED_CALL.match(line)) and match.group(2) in wrappers
+    }
+    assert sorted(captured.values()) == ['current', 'heads'], (
+        f'{MIGRATE_STEP} must read alembic heads and current through its wrapper, and nothing else: {captured}'
+    )
+    by_role = {role: variable for variable, role in captured.items()}
+    heads, current = by_role['heads'], by_role['current']
+    comparison = re.compile(rf'\[\s*"\$\{{(?:{current}|{heads})\}}"\s*!=\s*"\$\{{(?:{current}|{heads})\}}"\s*\]')
+    compared = [line for line in lines if comparison.search(line) and current in line and heads in line]
+    assert compared, f'{MIGRATE_STEP} never compares ${{{current}}} with ${{{heads}}}'
+    single_head = [line for line in lines if f'${{{heads}}}' in line and 'wc -l' in line and '-ne 1' in line]
+    assert single_head, f'{MIGRATE_STEP} does not assert exactly one migration head'
+
+
+@pytest.mark.build_infra
+def test_system_job_loads_docker_compose_yaml_alone():
+    """tj-vhboky.53 re-scope: like the Smoke Test, the job runs on docker-compose.yaml and nothing else.
+
+    Every compose invocation names it with -f and names no other file: a bare `docker compose`
+    would also load docker-compose.override.yaml, and a second -f is an overlay the job must not
+    have until the fake-broker PR (tj-irhy0a). COMPOSE_FILE would do the same behind the flags.
+    """
+    seen, offenders = set(), []
+    for step in _system_steps():
+        for line in _step_lines(step):
+            for files in _compose_files(line):
+                seen.add(step.get('name'))
+                if files != [COMPOSE_FILE.name]:
+                    offenders.append(f'{step.get("name")}: -f {files} in {line}')
+    missing = sorted(set(SYSTEM_JOB_COMPOSE_STEPS) - seen)
+    assert not missing, f'no docker compose invocation found in {missing}, so this check saw less than the job runs'
+    assert not offenders, (
+        f'{SYSTEM_JOB_NAME} runs compose on something other than {COMPOSE_FILE.name} alone: {offenders}'
+    )
+
+    document = _load_yaml(TESTING_WORKFLOW) or {}
+    scopes = [document.get('env') or {}, _system_job().get('env') or {}]
+    scopes += [step.get('env') or {} for step in _system_steps()]
+    assert not any('COMPOSE_FILE' in scope for scope in scopes), 'COMPOSE_FILE is set for the System Testing job'
+    assert not any('COMPOSE_FILE' in line for step in _system_steps() for line in _step_lines(step)), (
+        'a System Testing step sets or reads COMPOSE_FILE'
+    )
+
+
+@pytest.mark.build_infra
+def test_system_job_never_swallows_a_failure():
+    """tj-vhboky.52 item 7: no continue-on-error, no `|| true`, and the suite's status is the step's.
+
+    The suite step is `make test-system` under errexit and ends there, so pytest's exit status --
+    exit 5 on an empty collection included -- is the step's. No step in the job runs pytest
+    itself: the target is the one definition of the invocation, and a copy would drift from it.
+    """
+    job = _system_job()
+    assert 'continue-on-error' not in job, f'{SYSTEM_JOB_NAME} sets continue-on-error at job level'
+    lenient = [step.get('name') for step in _system_steps() if 'continue-on-error' in step]
+    assert not lenient, f'steps set continue-on-error: {lenient}'
+    swallowed = [
+        f'{step.get("name")}: {line}'
+        for step in _system_steps()
+        for line in _step_lines(step)
+        if _SWALLOWED_STATUS.search(line)
+    ]
+    assert not swallowed, f'{SYSTEM_JOB_NAME} discards an exit status: {swallowed}'
+
+    lines = _step_lines(_system_step(SYSTEM_TESTS_STEP))
+    assert lines, f'{SYSTEM_TESTS_STEP} runs nothing'
+    assert shlex.split(lines[-1]) == ['make', SYSTEM_TARGET], (
+        f'{SYSTEM_TESTS_STEP} must end on `make {SYSTEM_TARGET}` alone, so its status is the step status: {lines[-1]!r}'
+    )
+    errexit = [line for line in lines[:-1] if re.match(r'^set\s+-\w*e', line)]
+    assert errexit, f'{SYSTEM_TESTS_STEP} does not set errexit before running the suite'
+    direct = [
+        f'{step.get("name")}: {line}' for step in _system_steps() for line in _step_lines(step) if 'pytest' in line
+    ]
+    assert not direct, f'{SYSTEM_JOB_NAME} runs pytest directly instead of make {SYSTEM_TARGET}: {direct}'
+
+
+@pytest.mark.build_infra
+def test_only_the_system_tests_step_attests_a_disposable_database():
+    """tj-vhboky.52 item 2: SYSTEM_TEST_DISPOSABLE_DB=1 on the suite step and nowhere else.
+
+    The attestation is what lets the suite write to a database. Set on the step, nothing else in
+    the job inherits it; set at job or workflow level, or exported by a script, it would.
+    """
+    step = _system_step(SYSTEM_TESTS_STEP)
+    assert str((step.get('env') or {}).get(SYSTEM_GUARD)) == '1', (
+        f'{SYSTEM_TESTS_STEP} does not set {SYSTEM_GUARD}=1 in its env: {step.get("env")}'
+    )
+    elsewhere = []
+    for path in _workflow_files():
+        document = _load_yaml(path) or {}
+        if SYSTEM_GUARD in (document.get('env') or {}):
+            elsewhere.append(f'{path.name} workflow env')
+        for job_id, job in (document.get('jobs') or {}).items():
+            if SYSTEM_GUARD in ((job or {}).get('env') or {}):
+                elsewhere.append(f'{path.name} {job_id} env')
+            for other in (job or {}).get('steps') or []:
+                where = f'{path.name} {job_id} / {other.get("name")}'
+                is_suite_step = (
+                    path == TESTING_WORKFLOW
+                    and (job or {}).get('name') == SYSTEM_JOB_NAME
+                    and other.get('name') == SYSTEM_TESTS_STEP
+                )
+                if not is_suite_step and SYSTEM_GUARD in (other.get('env') or {}):
+                    elsewhere.append(f'{where} env')
+                if any(SYSTEM_GUARD in line for line in _step_lines(other)):
+                    elsewhere.append(f'{where} run')
+                if any(SYSTEM_GUARD in scalar for scalar in _walk_scalars(other.get('with') or {})):
+                    elsewhere.append(f'{where} with')
+    assert not elsewhere, f'{SYSTEM_GUARD} is set outside {SYSTEM_TESTS_STEP}: {elsewhere}'
+
+
+@pytest.mark.build_infra
+def test_generated_secrets_are_masked_before_any_use():
+    """tj-vhboky.52 item 2: each throwaway secret is masked on the line after it is generated.
+
+    POSTGRES_PASS and INSTANCE_WRITE_SECRET are generated with openssl in the Stage step and
+    written to the staged project env file. `::add-mask::` must be the very next line, before the
+    value is written, printed or handed to anything; nothing else may print it, and no step may
+    switch on shell tracing, which would print it expanded. The Stage step precedes every other
+    step that mentions either name.
+    """
+    stage = _system_step(STAGE_STEP)
+    lines = _step_lines(stage)
+    generated = {match.group(1): index for index, line in enumerate(lines) if (match := _GENERATED_VALUE.match(line))}
+    written = {}
+    for line in lines:
+        words = shlex.split(line)
+        if words[:1] == ['printf'] and words[-2:] == ['>>', STAGED_ENV_FILE]:
+            key = re.search(r'([A-Z][A-Z0-9_]*)=%s', words[1])
+            value = re.fullmatch(r'\$\{?(\w+)\}?', words[2]) if len(words) > 3 else None
+            if key and value:
+                written[key.group(1)] = value.group(1)
+    for key in SYSTEM_SECRET_KEYS:
+        variable = written.get(key)
+        assert variable, f'{STAGE_STEP} writes no generated {key} to the staged env file: {written}'
+        assert variable in generated, f'{key} is written from ${variable}, which is not generated in {STAGE_STEP}'
+        mask = lines[generated[variable] + 1] if generated[variable] + 1 < len(lines) else ''
+        assert mask == f'echo "::add-mask::${{{variable}}}"', (
+            f'the line after generating {key} (${variable}) must mask it, found {mask!r}'
+        )
+        printed = [
+            line
+            for line in lines
+            if line != mask
+            and re.match(r'^(?:echo|printf|cat|tee)\b', line)
+            and _mentions_variable(line, variable)
+            and not line.endswith(f'>> {STAGED_ENV_FILE}')
+        ]
+        assert not printed, f'{STAGE_STEP} prints ${variable} ({key}): {printed}'
+
+    tracing = [
+        f'{step.get("name")}: {line}'
+        for step in _system_steps()
+        for line in _step_lines(step)
+        if re.match(r'^set\s+(?:-\w*[xv]|-o\s+(?:xtrace|verbose))', line)
+    ]
+    assert not tracing, f'{SYSTEM_JOB_NAME} switches on shell tracing: {tracing}'
+
+    names = [step.get('name') for step in _system_steps()]
+    first_use = next(
+        (
+            index
+            for index, step in enumerate(_system_steps())
+            if step.get('name') != STAGE_STEP
+            and any(key in line for line in _step_lines(step) for key in SYSTEM_SECRET_KEYS)
+        ),
+        len(names),
+    )
+    assert names.index(STAGE_STEP) < first_use, (
+        f'{names[first_use]} uses a secret before {STAGE_STEP} generates and masks it'
+    )
+
+
+@pytest.mark.build_infra
+def test_the_testing_workflow_stays_under_the_broker_credential_rule():
+    """tj-59cce6 still covers the job: the workflow is branch-triggered, and the job names no broker value.
+
+    test_branch_triggered_workflow_holds_no_broker_credential skips a workflow outside the branch
+    reach, so this first pins that the testing workflow is inside it. Then the System Testing job
+    -- every key and value, run scripts included -- names no ALPACA_/IBKR_/QUESTRADE_ variable at
+    all, credential or not: it runs without a broker, and the fake-broker overlay is a later PR.
+    """
+    assert TESTING_WORKFLOW.name in _branch_reach(), (
+        f'{TESTING_WORKFLOW.name} is no longer branch-triggered, so the tj-59cce6 test skips it'
+    )
+    named = sorted(
+        {match.group(0) for scalar in _walk_scalars(_system_job()) for match in _BROKER_NAME.finditer(scalar)}
+    )
+    assert not named, f'{SYSTEM_JOB_NAME} names broker variables {named}; it must run without any (tj-59cce6)'
+    references = sorted(set(_secret_references(_system_job())))
+    assert references == ['GITHUB_TOKEN'], f'{SYSTEM_JOB_NAME} references secrets {references}; only GITHUB_TOKEN'
+
+
+@pytest.mark.build_infra
+def test_instance_secret_lifecycle_scans_logs_then_proves_a_blank_secret_refuses_writes():
+    """tj-vhboky.52 item 6: (f) the log scan, then (e) blank, recreate data_store alone, probe.
+
+    The scan comes first because recreating data_store discards the logs of the whole suite, and it
+    counts matches rather than printing them. Then every write route is probed with each header
+    variant -- none, empty, arbitrary, the former secret -- and each must answer 401.
+    """
+    lines = _step_lines(_system_step(LIFECYCLE_STEP))
+
+    def first(predicate) -> int:
+        index = next((i for i, line in enumerate(lines) if predicate(line)), None)
+        assert index is not None, f'{LIFECYCLE_STEP} lacks an expected line'
+        return index
+
+    scan = first(lambda line: 'docker logs' in line)
+    blank = first(
+        lambda line: line.startswith('sed ') and 'INSTANCE_WRITE_SECRET=/' in line and STAGED_ENV_FILE in line
+    )
+    recreate = first(lambda line: '--force-recreate' in line)
+    assert scan < blank < recreate, (
+        f'{LIFECYCLE_STEP} must scan logs ({scan}), blank ({blank}), then recreate ({recreate})'
+    )
+
+    grep = re.search(r'\bgrep\s+-(\w+)', lines[scan])
+    assert grep and ({'c', 'q'} & set(grep.group(1))), (
+        f'the log scan must count or test matches, never print them: {lines[scan]}'
+    )
+
+    recreated = shlex.split(lines[recreate])
+    assert '--no-deps' in recreated and '--wait' in recreated and recreated[-1] == 'data_store', (
+        f'the recreate must be data_store alone, waited on healthy: {lines[recreate]}'
+    )
+
+    loops = [command for line in lines for command in _commands(line) if command[:3] == ['for', 'route', 'in']]
+    assert len(loops) == 1, f'{LIFECYCLE_STEP} must probe from one route loop, found {loops}'
+    routes = loops[0][3:]
+    assert len(routes) == LIFECYCLE_ROUTE_COUNT, f'expected {LIFECYCLE_ROUTE_COUNT} write routes, probed {routes}'
+    assert {route.split()[0] for route in routes} == {'POST', 'DELETE'}, routes
+    probes = [line for line in lines if line.startswith('probe ')]
+    assert len(probes) == LIFECYCLE_HEADER_VARIANTS, f'expected one probe per header variant, found {probes}'
+    assert any('!= "401"' in line for line in lines), f'{LIFECYCLE_STEP} never requires HTTP 401'
+
+
+# ---------------------------------------------------------------------------------------
+# THE SECRET-GUARDED WRITE ROUTES (tj-vhboky.75)
+#
+# The instance secret is a security control, so which routes prove they refuse without it must
+# be derived, not remembered. The Instance Secret Lifecycle step probes a hand-listed set of
+# write routes with the secret blank, and tests/system/test_http_write_secret.py covers a
+# hand-listed set over real HTTP. A fourth route carrying require_instance_secret would be guarded
+# and proven by neither. So the guarded set is read from data_store's app itself -- every
+# (method, path) whose dependency tree reaches require_instance_secret -- and each hand list must
+# equal it, both ways round.
+#
+# The app is imported (routes only; no lifespan runs). The workflow's probes are parsed from the
+# YAML and resolved to route templates by the app's own router matching, so a probe that hits a
+# different route than intended is caught too. The system module is read with ast and NEVER
+# imported: it lives under tests/system, outside the gate, and importing it would drag in its
+# fixtures. Only the production interface enums its paths are built from are imported.
+SECRET_PROBE_MODULE = REPO_ROOT / 'tests' / 'system' / 'test_http_write_secret.py'
+SECRET_PROBE_ENUM = 'WriteRoute'
+SECRET_PROBE_PARAMETER = 'route'
+SECRET_PROBE_CLIENT = 'data_store'
+_HTTP_CLIENT_METHODS = frozenset({'get', 'post', 'put', 'patch', 'delete'})
+_INTERFACE_PACKAGE = 'routers.'
+SECRET_PROBE_SOURCES = ('workflow', 'system-suite')
+
+
+def _data_store_app():
+    """data_store's FastAPI app, imported lazily so a broken import reds these tests, not the module."""
+    from data.store.app.main import app
+
+    return app
+
+
+def _reaches(dependant, call) -> bool:
+    return any(child.call is call or _reaches(child, call) for child in dependant.dependencies)
+
+
+def _api_routes(app) -> list:
+    """Every API route on `app` as FastAPI serves it: included routers flattened, prefixes applied.
+
+    Since FastAPI 0.141 include_router no longer copies routes onto the app; app.routes holds one
+    wrapper per included router. iter_route_contexts is FastAPI's public flattening, and each
+    context carries the EFFECTIVE path and dependant -- router-level include dependencies merged
+    in -- so a guard added with include_router(dependencies=[...]) is seen too.
+    """
+    from fastapi.routing import APIRoute, iter_route_contexts
+
+    return [context for context in iter_route_contexts(app.routes) if isinstance(context.original_route, APIRoute)]
+
+
+def _guarded_routes(app) -> set[tuple[str, str]]:
+    """Every (METHOD, path template) on `app` whose dependency tree includes require_instance_secret."""
+    from routers.common.instance_secret import require_instance_secret
+
+    return {
+        (method, route.path)
+        for route in _api_routes(app)
+        if _reaches(route.dependant, require_instance_secret)
+        for method in route.methods
+    }
+
+
+def _route_templates(app, method: str, url: str) -> list[str]:
+    """The path template of every route on `app` that fully matches `method url`, by the app's own matching."""
+    from starlette.routing import Match
+
+    scope = {'type': 'http', 'method': method, 'path': url.partition('?')[0], 'root_path': ''}
+    return [route.path for route in _api_routes(app) if route.matches(scope)[0] == Match.FULL]
+
+
+def _lifecycle_probe_loop(document: dict) -> tuple[dict, list[str]]:
+    """The Instance Secret Lifecycle step of a parsed workflow, and the words of its one route loop."""
+    jobs = [job for job in (document.get('jobs') or {}).values() if (job or {}).get('name') == SYSTEM_JOB_NAME]
+    assert len(jobs) == 1, f'expected one {SYSTEM_JOB_NAME!r} job, found {len(jobs)}'
+    steps = [step for step in jobs[0].get('steps') or [] if step.get('name') == LIFECYCLE_STEP]
+    assert len(steps) == 1, f'expected one {LIFECYCLE_STEP!r} step in {SYSTEM_JOB_NAME}, found {len(steps)}'
+    loops = [
+        command
+        for line in _step_lines(steps[0])
+        for command in _commands(line)
+        if command[:3] == ['for', SECRET_PROBE_PARAMETER, 'in']
+    ]
+    assert len(loops) == 1, f'{LIFECYCLE_STEP} must probe from one route loop, found {loops}'
+    return steps[0], loops[0]
+
+
+def _lifecycle_probed_routes(workflow: Path, app) -> set[tuple[str, str]]:
+    """The (METHOD, path template) of every route the Instance Secret Lifecycle step's loop probes."""
+    _, loop = _lifecycle_probe_loop(_load_yaml(workflow) or {})
+    probed = set()
+    for entry in loop[3:]:
+        method, _, url = entry.partition(' ')
+        templates = _route_templates(app, method, url)
+        assert len(templates) == 1, (
+            f'{LIFECYCLE_STEP} probes {entry!r}, which data_store routes to {templates}; expected exactly one route'
+        )
+        probed.add((method, templates[0]))
+    return probed
+
+
+def _interface_template(expression: ast.expr, local: dict[str, ast.expr], helpers: dict, imports: dict) -> str:
+    """Resolve a request's path expression to the interface enum value it is formatted from.
+
+    Follows a local name to its assignment, a module helper to its return value and `.format(...)`
+    to its receiver, until it reaches `<Interface>.<MEMBER>`. The interface is imported from the
+    module the probe module imports it from, which must be production code under routers/.
+    """
+    if isinstance(expression, ast.Name) and expression.id in local:
+        return _interface_template(local[expression.id], local, helpers, imports)
+    if isinstance(expression, ast.Call) and isinstance(expression.func, ast.Name) and expression.func.id in helpers:
+        returns = [node.value for node in ast.walk(helpers[expression.func.id]) if isinstance(node, ast.Return)]
+        assert len(returns) == 1 and returns[0] is not None, f'{expression.func.id} must return one path expression'
+        return _interface_template(returns[0], {}, helpers, imports)
+    if (
+        isinstance(expression, ast.Call)
+        and isinstance(expression.func, ast.Attribute)
+        and expression.func.attr == 'format'
+    ):
+        return _interface_template(expression.func.value, local, helpers, imports)
+    if (
+        isinstance(expression, ast.Attribute)
+        and isinstance(expression.value, ast.Name)
+        and expression.value.id in imports
+    ):
+        module = imports[expression.value.id]
+        assert module.startswith(_INTERFACE_PACKAGE), (
+            f'{expression.value.id} comes from {module}; a probe path must be built from a routers/ interface enum'
+        )
+        return str(getattr(getattr(importlib.import_module(module), expression.value.id), expression.attr))
+    raise AssertionError(f'cannot resolve the request path {ast.unparse(expression)!r} to an interface route')
+
+
+def _is_route_parametrize(decorator: ast.expr) -> bool:
+    return (
+        isinstance(decorator, ast.Call)
+        and ast.unparse(decorator.func) == 'pytest.mark.parametrize'
+        and bool(decorator.args)
+        and isinstance(decorator.args[0], ast.Constant)
+        and decorator.args[0].value == SECRET_PROBE_PARAMETER
+    )
+
+
+def _client_sends(body: list[ast.stmt]) -> list[ast.Call]:
+    """Every `data_store.<http method>(...)` call anywhere in `body`."""
+    return [
+        node
+        for statement in body
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == SECRET_PROBE_CLIENT
+        and node.func.attr in _HTTP_CLIENT_METHODS
+    ]
+
+
+def _system_suite_covered_routes(module: Path) -> set[tuple[str, str]]:
+    """The (METHOD, path template) each WriteRoute member sends, read from `module` by ast, never imported.
+
+    Every test that parametrises `route` must do so over list(WriteRoute), and the one match on
+    `route` that sends requests must have exactly one case per member, each sending exactly one
+    request through the data_store client.
+    """
+    tree = ast.parse(module.read_text(encoding='utf-8'))
+    imports = {
+        alias.asname or alias.name: node.module
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module
+        for alias in node.names
+    }
+    helpers = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    classes = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == SECRET_PROBE_ENUM]
+    assert len(classes) == 1, f'{module.name} defines {len(classes)} {SECRET_PROBE_ENUM} classes, expected 1'
+    members = [
+        target.id
+        for node in classes[0].body
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    ]
+    assert members, f'{SECRET_PROBE_ENUM} in {module.name} has no members'
+
+    everything = f'list({SECRET_PROBE_ENUM})'
+    parametrised = [
+        (node.name, ast.unparse(decorator.args[1]) if len(decorator.args) > 1 else None)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name.startswith('test_')
+        for decorator in node.decorator_list
+        if _is_route_parametrize(decorator)
+    ]
+    assert parametrised, f'no test in {module.name} parametrises {SECRET_PROBE_PARAMETER!r}'
+    partial = [(name, values) for name, values in parametrised if values != everything]
+    assert not partial, (
+        f'tests in {module.name} parametrise {SECRET_PROBE_PARAMETER!r} over less than {everything}: {partial}'
+    )
+
+    senders = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Match)
+        and ast.unparse(node.subject) == SECRET_PROBE_PARAMETER
+        and any(_client_sends(case.body) for case in node.cases)
+    ]
+    assert len(senders) == 1, (
+        f'expected one match on {SECRET_PROBE_PARAMETER!r} that sends requests in {module.name}, found {len(senders)}'
+    )
+
+    covered, handled = set(), []
+    for case in senders[0].cases:
+        pattern = ast.unparse(case.pattern)
+        assert isinstance(case.pattern, ast.MatchValue) and pattern.startswith(f'{SECRET_PROBE_ENUM}.'), (
+            f'unexpected case pattern {pattern!r} in the sending match'
+        )
+        member = pattern.removeprefix(f'{SECRET_PROBE_ENUM}.')
+        handled.append(member)
+        calls = _client_sends(case.body)
+        assert len(calls) == 1, f'case {member} must send exactly one request, sends {len(calls)}'
+        local = {
+            target.id: node.value
+            for node in case.body
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+        covered.add((calls[0].func.attr.upper(), _interface_template(calls[0].args[0], local, helpers, imports)))
+    assert sorted(handled) == sorted(members), (
+        f'the sending match handles {sorted(handled)}, but {SECRET_PROBE_ENUM} has {sorted(members)}'
+    )
+    return covered
+
+
+def _secret_probe_gaps(guarded: set[tuple[str, str]], covered: set[tuple[str, str]], where: str) -> list[str]:
+    """Both directions of disagreement between the guarded routes and one source's covered routes."""
+    unproven = [f'{method} {path}' for method, path in sorted(guarded - covered)]
+    unguarded = [f'{method} {path}' for method, path in sorted(covered - guarded)]
+    gaps = []
+    if unproven:
+        gaps.append(f'guarded by require_instance_secret but not covered by {where}: {unproven}')
+    if unguarded:
+        gaps.append(f'covered by {where} but not guarded by require_instance_secret: {unguarded}')
+    return gaps
+
+
+def _secret_probe_coverage(source: str, app) -> tuple[set[tuple[str, str]], str]:
+    if source == 'workflow':
+        return _lifecycle_probed_routes(TESTING_WORKFLOW, app), f'the {LIFECYCLE_STEP} step in {TESTING_WORKFLOW.name}'
+    return _system_suite_covered_routes(SECRET_PROBE_MODULE), SECRET_PROBE_MODULE.relative_to(REPO_ROOT).as_posix()
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize('source', SECRET_PROBE_SOURCES)
+def test_every_secret_guarded_route_is_proven_to_refuse(source: str):
+    """tj-vhboky.75: the routes proven to refuse without the secret are exactly the guarded ones.
+
+    Derived from data_store's app, so a new route carrying require_instance_secret reds the gate
+    until both the CI lifecycle probe and the system suite cover it -- and a probe or case left on
+    a route that lost the guard reds it too.
+    """
+    app = _data_store_app()
+    guarded = _guarded_routes(app)
+    assert guarded, 'data_store has no route guarded by require_instance_secret, so this comparison is vacuous'
+    covered, where = _secret_probe_coverage(source, app)
+    gaps = _secret_probe_gaps(guarded, covered, where)
+    assert not gaps, '; '.join(gaps)
+
+
+@pytest.mark.build_infra
+def test_the_guarded_route_derivation_follows_every_dependency_form():
+    """Guard the guard: guarded through a decorator list, a parameter, a sub-dependency or an include.
+
+    The included router is the shape data_store actually has, so this also pins that routes behind
+    include_router are seen at all, under their prefixed path.
+    """
+    from fastapi import APIRouter, Depends, FastAPI
+
+    from routers.common.instance_secret import require_instance_secret
+
+    async def wraps_the_guard(_: Annotated[None, Depends(require_instance_secret)]) -> None:
+        return None
+
+    scratch = FastAPI()
+
+    @scratch.post('/listed', dependencies=[Depends(require_instance_secret)])
+    async def by_list() -> None:
+        return None
+
+    @scratch.patch('/parameter')
+    async def by_parameter(_: Annotated[None, Depends(require_instance_secret)]) -> None:
+        return None
+
+    @scratch.delete('/nested')
+    async def by_sub_dependency(_: Annotated[None, Depends(wraps_the_guard)]) -> None:
+        return None
+
+    @scratch.get('/open')
+    async def open_read() -> None:
+        return None
+
+    included = APIRouter()
+
+    @included.put('/by-include')
+    async def by_include() -> None:
+        return None
+
+    @included.get('/also-open')
+    async def included_read() -> None:
+        return None
+
+    scratch.include_router(included, prefix='/wide', dependencies=[Depends(require_instance_secret)])
+    scratch.include_router(included, prefix='/open-include')
+
+    assert _guarded_routes(scratch) == {
+        ('POST', '/listed'),
+        ('PATCH', '/parameter'),
+        ('DELETE', '/nested'),
+        ('PUT', '/wide/by-include'),
+        ('GET', '/wide/also-open'),
+    }
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize('source', SECRET_PROBE_SOURCES)
+def test_a_new_guarded_route_without_a_probe_is_named(source: str):
+    """Guard the guard: data_store's routes plus one more guarded write, and each source names it."""
+    from fastapi import Depends, FastAPI
+
+    from routers.common.instance_secret import require_instance_secret
+
+    app = _data_store_app()
+    scratch = FastAPI()
+    scratch.router.routes.extend(app.routes)
+
+    @scratch.post('/store/unprobed-write', dependencies=[Depends(require_instance_secret)])
+    async def unprobed_write() -> None:
+        return None
+
+    guarded = _guarded_routes(scratch)
+    assert guarded - _guarded_routes(app) == {('POST', '/store/unprobed-write')}, guarded
+    covered, where = _secret_probe_coverage(source, scratch)
+    gaps = _secret_probe_gaps(guarded, covered, where)
+    unproven = f'guarded by require_instance_secret but not covered by {where}: '
+    assert any(gap.startswith(unproven) and "'POST /store/unprobed-write'" in gap for gap in gaps), gaps
+
+
+@pytest.mark.build_infra
+def test_a_dropped_lifecycle_probe_is_named(tmp_path: Path):
+    """Guard the guard: a copy of the workflow with the loop's first probe removed names that route."""
+    app = _data_store_app()
+    document = _load_yaml(TESTING_WORKFLOW)
+    step, loop = _lifecycle_probe_loop(document)
+    dropped = loop[3]
+    assert step['run'].count(f'"{dropped}"') == 1, f'the probe {dropped!r} is not quoted exactly once in the step'
+    step['run'] = step['run'].replace(f'"{dropped}"', '')
+    copy_path = tmp_path / TESTING_WORKFLOW.name
+    copy_path.write_text(yaml.safe_dump(document, sort_keys=False), encoding='utf-8')
+
+    method, _, url = dropped.partition(' ')
+    (template,) = _route_templates(app, method, url)
+    probed = _lifecycle_probed_routes(TESTING_WORKFLOW, app)
+    gaps = _secret_probe_gaps(probed, _lifecycle_probed_routes(copy_path, app), 'the copy')
+    assert gaps == [f"guarded by require_instance_secret but not covered by the copy: ['{method} {template}']"], gaps
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize('position', [0, -1], ids=['first-member', 'last-member'])
+def test_a_route_dropped_from_the_system_suite_is_named(tmp_path: Path, position: int):
+    """Guard the guard: a copy of the system module without one WriteRoute member and its case names that route."""
+    tree = ast.parse(SECRET_PROBE_MODULE.read_text(encoding='utf-8'))
+    enum = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == SECRET_PROBE_ENUM)
+    assignment = [node for node in enum.body if isinstance(node, ast.Assign)][position]
+    member = assignment.targets[0].id
+    enum.body.remove(assignment)
+    removed_cases = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Match):
+            kept = [case for case in node.cases if ast.unparse(case.pattern) != f'{SECRET_PROBE_ENUM}.{member}']
+            removed_cases += len(node.cases) - len(kept)
+            node.cases = kept
+    assert removed_cases, f'no match case handles {SECRET_PROBE_ENUM}.{member}, so this copy drops nothing'
+    copy_path = tmp_path / SECRET_PROBE_MODULE.name
+    copy_path.write_text(ast.unparse(tree), encoding='utf-8')
+
+    full = _system_suite_covered_routes(SECRET_PROBE_MODULE)
+    reduced = _system_suite_covered_routes(copy_path)
+    (lost,) = full - reduced
+    gaps = _secret_probe_gaps(full, reduced, 'the copy')
+    assert gaps == [f"guarded by require_instance_secret but not covered by the copy: ['{lost[0]} {lost[1]}']"], gaps
