@@ -12,15 +12,18 @@ A green run here means the configuration still says the right thing, nothing mor
 
 import configparser
 import copy
+import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tomllib
 from collections.abc import Iterator
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 from pathlib import Path, PurePosixPath
+from zoneinfo import ZoneInfo
 
 import pytest
 import yaml
@@ -1810,3 +1813,444 @@ def test_the_prerelease_check_exempts_packages_only_the_tool_groups_reach():
     tool_only = sorted(set(_locked_closure(lock, set(NON_RUNTIME_GROUPS))) - runtime)
     assert tool_only, 'no package is reached only through a tool group, so this exempts nothing'
     assert _runtime_prereleases(_synthetic_lock(lock, dict.fromkeys(tool_only, '0.58b0'))) == []
+
+
+# ---------------------------------------------------------------------------------------
+# THE SYSTEM SUITE HARNESS (tj-vhboky.48, ADR tj-fdb9gz sections 2, 3 and 7, ruling tj-vhboky.47 D1)
+#
+# tests/system/ writes to whatever database it is pointed at, and the machine that runs it also
+# runs production. Two things keep that suite from running by accident, and both fail silently:
+#
+# 1. pytest.ini keeps tests/system out of the PR gate BY DIRECTORY (norecursedirs), not by a
+#    marker. Drop the entry and the next `make test` or CI `uv run pytest` collects the suite; the
+#    marker set is pinned by equality above, so a `system` marker cannot stand in for it.
+# 2. `make test-system` refuses unless SYSTEM_TEST_DISPOSABLE_DB=1, reads .env with grep and never
+#    sources it, never prints POSTGRES_PASS or INSTANCE_WRITE_SECRET, and ends on pytest so an
+#    empty selection (exit 5) or a missing database fails the target.
+#
+# The recipe is read AS MAKE EXPANDS IT: `make -n` prints the shell text a run would execute
+# without executing it. Reading the Makefile source instead would mean re-implementing make's
+# variable expansion here, and `$(PYTEST_ENV)` splits into shell operators under shlex.
+#
+# Every make run here starts in an EMPTY temporary directory. That is what makes the behavioural
+# guard test safe under a mutation that weakens the guard: with no .env beside it, the recipe
+# stops at the .env check and cannot reach a database, whatever the developer's own .env says.
+# .env itself is never read or written by this module.
+SYSTEM_SUITE_DIR = 'tests/system'
+SYSTEM_TARGET = 'test-system'
+SYSTEM_GUARD = 'SYSTEM_TEST_DISPOSABLE_DB'
+
+# The values the recipe reads out of .env, and the name the suite receives each one under. The
+# names are data_store's own, so both sides of the mapping are the same key.
+SYSTEM_ENV_FILE_KEYS = (
+    'DATA_STORE_PORT',
+    'DATABASE_PORT',
+    'POSTGRES_USER',
+    'POSTGRES_PASS',
+    'POSTGRES_DB_NAME',
+    'INSTANCE_WRITE_SECRET',
+)
+SYSTEM_SECRET_KEYS = ('POSTGRES_PASS', 'INSTANCE_WRITE_SECRET')
+
+# The env contract the suite reads, by EQUALITY: a new variable in the contract is a deliberate
+# edit to this set, in the same diff as the Makefile comment that documents it.
+SYSTEM_ENV_CONTRACT = frozenset(
+    {
+        'POSTGRES_ASYNC',
+        'POSTGRES_SYNC',
+        'TZ',
+        'PYTHONPATH',
+        'SYSTEM_TEST_DATA_STORE_URL',
+        'DATABASE_NAME',
+        'DATABASE_PORT',
+        'DATABASE_CONN_TIMEOUT',
+        'POSTGRES_USER',
+        'POSTGRES_PASS',
+        'POSTGRES_DB_NAME',
+        'INSTANCE_WRITE_SECRET',
+    }
+)
+
+# Words that open a compound command rather than name the command run.
+_SHELL_KEYWORDS = frozenset({'if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', '{', '}', '!'})
+
+# `name=$(helper KEY)`: a shell variable captured from the recipe's .env reader.
+_ENV_CAPTURE = re.compile(r'^(\w+)=\$\((\w+) (\w+)\)$')
+
+# `name() { body };` at the start of a logical line: a shell function definition.
+_SHELL_FUNCTION = re.compile(r'^(\w+)\(\)\s*\{(.*?)\};')
+
+
+def _subprocess_env(**overrides: str | None) -> dict[str, str]:
+    """This process's environment with the named variables replaced, or removed when None."""
+    env = dict(os.environ)
+    env.pop('PYTEST_ADDOPTS', None)
+    for name, value in overrides.items():
+        if value is None:
+            env.pop(name, None)
+        else:
+            env[name] = value
+    return env
+
+
+def _run_make(cwd: Path, *arguments: str, env: dict[str, str]) -> subprocess.CompletedProcess:
+    """Run the repository Makefile from `cwd`, never remaking the venv marker.
+
+    `-o` treats the marker as up to date, so no `uv sync` runs from a directory that has no
+    pyproject.toml, and the recipe under test is the only thing make executes.
+    """
+    assert shutil.which('make'), 'make is not on PATH, so the Makefile target cannot be exercised'
+    command = ['make', '--no-print-directory', '-C', str(cwd), '-f', str(MAKEFILE), '-o', _make_variable('VENV_MARKER')]
+    return subprocess.run([*command, *arguments], capture_output=True, text=True, env=env, check=False)
+
+
+def _system_recipe_lines(cwd: Path) -> list[str]:
+    """The test-system recipe as make expands it, one logical shell line per entry, not executed."""
+    result = _run_make(cwd, '-n', SYSTEM_TARGET, env=_subprocess_env(**{SYSTEM_GUARD: None}))
+    assert result.returncode == 0, f'`make -n {SYSTEM_TARGET}` failed: {result.stderr}'
+    folded = re.sub(r'\\\n\t?', ' ', result.stdout)
+    lines = [line.strip() for line in folded.splitlines() if line.strip()]
+    assert lines, f'`make -n {SYSTEM_TARGET}` printed no recipe'
+    return lines
+
+
+def _command_name(command: list[str]) -> str:
+    """The command a simple command runs, past any compound-command keyword in front of it."""
+    words = [word for word in command if word not in _SHELL_KEYWORDS]
+    return PurePosixPath(words[0]).name if words else ''
+
+
+def _assignments(command: list[str]) -> dict[str, str]:
+    """The `NAME=value` prefix of a simple command, i.e. the environment it hands the command."""
+    assigned = {}
+    for word in command:
+        name, separator, value = word.partition('=')
+        if not separator or not re.fullmatch(r'[A-Za-z_]\w*', name):
+            break
+        assigned[name] = value
+    return assigned
+
+
+def _env_reader(lines: list[str]) -> tuple[str, str]:
+    """The (name, body) of the shell function the recipe reads .env through. Exactly one."""
+    readers = [
+        (m.group(1), m.group(2)) for line in lines if (m := _SHELL_FUNCTION.match(line)) and '.env' in m.group(2)
+    ]
+    assert len(readers) == 1, f'expected one shell function reading .env in the {SYSTEM_TARGET} recipe, found {readers}'
+    return readers[0]
+
+
+def _env_captures(lines: list[str]) -> dict[str, str]:
+    """Map each .env key the recipe reads to the shell variable it is captured in."""
+    reader, _ = _env_reader(lines)
+    captures = {}
+    for line in lines:
+        for command in _commands(line):
+            for word in command:
+                if (match := _ENV_CAPTURE.match(word)) and match.group(2) == reader:
+                    captures[match.group(3)] = match.group(1)
+    return captures
+
+
+def _pytest_command(lines: list[str]) -> list[str]:
+    commands = _commands(lines[-1])
+    assert commands, f'the last line of the {SYSTEM_TARGET} recipe holds no command: {lines[-1]}'
+    return commands[-1]
+
+
+def _mentions_variable(word: str, variable: str) -> bool:
+    return re.search(rf'\$(?:{re.escape(variable)}\b|\{{{re.escape(variable)}\}})', word) is not None
+
+
+@pytest.mark.build_infra
+def test_pytest_ini_keeps_the_system_suite_out_by_directory():
+    """tj-vhboky.48 item 1: the exclusion is a norecursedirs entry, not a marker and not --ignore.
+
+    The pytest.ini comment records why the alternatives were rejected: --ignore resolves against
+    the invocation directory and stopped excluding from a subdirectory, and testpaths does not
+    apply when a path is given, which `make test` always does.
+    """
+    entries = _pytest_ini().get('norecursedirs', '').split()
+    assert SYSTEM_SUITE_DIR in entries, (
+        f'{PYTEST_INI.name} norecursedirs is {entries}, without {SYSTEM_SUITE_DIR!r}. The PR gate then '
+        f'collects the system suite, which writes to whatever database the environment points at.'
+    )
+    assert not any(token.startswith('--ignore') for token in _addopts_tokens()), (
+        f'{PYTEST_INI.name} addopts carries an --ignore, which pytest resolves against the invocation '
+        f'directory. The system suite is excluded by norecursedirs instead.'
+    )
+
+
+# (arguments, directory to start pytest in relative to the copy, collected?). The first three are
+# the PR gate as make, CI and a run from a subdirectory start it; the last two are how
+# `make test-system` names the suite, which must still collect.
+_SYSTEM_COLLECTION_CASES = {
+    'gate-whole-tree': (['.'], '.', False),
+    'gate-no-arguments-as-ci': ([], '.', False),
+    'gate-from-a-subdirectory': (['..'], 'gate', False),
+    'named-directory': ([SYSTEM_SUITE_DIR], '.', True),
+    'named-file': ([f'{SYSTEM_SUITE_DIR}/test_system_probe.py'], '.', True),
+}
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    ('arguments', 'start', 'collected'), list(_SYSTEM_COLLECTION_CASES.values()), ids=list(_SYSTEM_COLLECTION_CASES)
+)
+def test_the_gate_does_not_collect_a_test_under_tests_system(
+    tmp_path: Path, arguments: list[str], start: str, collected: bool
+):
+    """tj-vhboky.48 DONE WHEN: the gate collects nothing from tests/system; naming it collects it.
+
+    Measured, not inferred from the ini text: the real pytest.ini is copied beside a probe under
+    tests/system and a control test outside it, and pytest itself is asked what it collects. The
+    control proves the run collected something, so a probe that is absent is absent because of
+    the exclusion and not because collection broke.
+    """
+    shutil.copy(PYTEST_INI, tmp_path / PYTEST_INI.name)
+    (tmp_path / SYSTEM_SUITE_DIR).mkdir(parents=True)
+    (tmp_path / SYSTEM_SUITE_DIR / 'test_system_probe.py').write_text('def test_system_probe():\n    pass\n')
+    (tmp_path / 'gate').mkdir()
+    (tmp_path / 'gate' / 'test_gate_control.py').write_text('def test_gate_control():\n    pass\n')
+
+    result = subprocess.run(
+        [sys.executable, '-m', 'pytest', '--collect-only', '-q', '-p', 'no:cacheprovider', *arguments],
+        cwd=tmp_path / start,
+        capture_output=True,
+        text=True,
+        env=_subprocess_env(),
+        check=False,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, f'collection in the copy failed (exit {result.returncode}):\n{output}'
+    assert ('test_system_probe' in result.stdout) is collected, (
+        f'pytest {" ".join(arguments) or "(no arguments)"} from {start!r} '
+        f'{"did not collect" if collected else "COLLECTED"} the probe under {SYSTEM_SUITE_DIR}:\n{output}'
+    )
+    if not collected:
+        assert 'test_gate_control' in result.stdout, (
+            f'the control test outside {SYSTEM_SUITE_DIR} was not collected:\n{output}'
+        )
+
+
+@pytest.mark.build_infra
+def test_test_system_is_phony():
+    """tj-06uflo: undeclared, a file named test-system at the root makes the target a no-op exit 0."""
+    assert re.search(
+        rf'^\.PHONY:.*(?<![\w-]){re.escape(SYSTEM_TARGET)}(?![\w-])', MAKEFILE.read_text(), re.MULTILINE
+    ), f'{MAKEFILE.name} does not declare {SYSTEM_TARGET} .PHONY'
+
+
+# (how the guard is given, as make arguments, as environment). Everything but exactly "1" refuses.
+_REFUSED_GUARDS = {
+    'unset': ([], None),
+    'zero-argument': ([f'{SYSTEM_GUARD}=0'], None),
+    'yes-argument': ([f'{SYSTEM_GUARD}=yes'], None),
+    'true-argument': ([f'{SYSTEM_GUARD}=true'], None),
+    'empty-argument': ([f'{SYSTEM_GUARD}='], None),
+    'zero-environment': ([], '0'),
+}
+_ACCEPTED_GUARDS = {'one-argument': ([f'{SYSTEM_GUARD}=1'], None), 'one-environment': ([], '1')}
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(('arguments', 'environment'), list(_REFUSED_GUARDS.values()), ids=list(_REFUSED_GUARDS))
+def test_test_system_refuses_without_the_disposable_database_attestation(
+    tmp_path: Path, arguments: list[str], environment: str | None
+):
+    """tj-vhboky.48 item 2a: the target refuses, says why, and refuses before it reads anything.
+
+    The reason is part of the contract: someone who hits the refusal has to learn that the suite
+    WRITES to the database and that production shares the machine, or the guard trains them to
+    type =1 without thinking. "no .env" absent from the output shows the guard fired first.
+    """
+    result = _run_make(tmp_path, SYSTEM_TARGET, *arguments, env=_subprocess_env(**{SYSTEM_GUARD: environment}))
+    assert result.returncode != 0, (
+        f'make {SYSTEM_TARGET} {arguments} ran with the guard {environment!r}:\n{result.stdout}'
+    )
+    for phrase in ('REFUSED', 'WRITES to the database it is pointed at', 'production deployment', f'{SYSTEM_GUARD}=1'):
+        assert phrase in result.stderr, f'the refusal does not say {phrase!r}:\n{result.stderr}'
+    assert 'no .env' not in result.stderr, f'the recipe got past the guard before refusing:\n{result.stderr}'
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(('arguments', 'environment'), list(_ACCEPTED_GUARDS.values()), ids=list(_ACCEPTED_GUARDS))
+def test_test_system_passes_the_guard_on_exactly_one(tmp_path: Path, arguments: list[str], environment: str | None):
+    """The converse, so the refusal above is shown to be conditional rather than unconditional.
+
+    Run from an empty directory, the recipe then stops at the missing .env and still fails --
+    which also pins that a missing .env is a failure and never a skip.
+    """
+    result = _run_make(tmp_path, SYSTEM_TARGET, *arguments, env=_subprocess_env(**{SYSTEM_GUARD: environment}))
+    assert 'REFUSED' not in result.stderr, f'the guard refused {arguments or environment!r}:\n{result.stderr}'
+    assert result.returncode != 0 and 'no .env' in result.stderr, (
+        f'with no .env beside it the target should fail naming the missing .env; exit {result.returncode}:\n'
+        f'{result.stdout}{result.stderr}'
+    )
+
+
+@pytest.mark.build_infra
+def test_test_system_reads_env_with_grep_and_never_sources_it(tmp_path: Path):
+    """tj-vhboky.48 item 2c: .env is read one key at a time, never loaded into the shell.
+
+    Sourcing it -- `. .env`, `source .env`, `set -a`, `eval` -- puts POSTGRES_PASS and the write
+    secret into the shell where one stray `set -x` or echo prints them (the CI Smoke Test step's
+    reasoning). So .env may appear in exactly two places: the existence check, and a grep inside
+    the one reader function whose output is only ever captured into a variable.
+    """
+    lines = _system_recipe_lines(tmp_path)
+    reader, body = _env_reader(lines)
+    assert re.match(r'^\s*grep\b', body), f'the .env reader {reader}() does not start with grep: {body!r}'
+
+    offenders = []
+    for line in lines:
+        # The reader's own definition is judged above; drop it so its grep is not judged twice.
+        judged = _SHELL_FUNCTION.sub('', line, count=1) if line.startswith(f'{reader}()') else line
+        for command in _commands(judged):
+            name = _command_name(command)
+            words = [word for word in command if word not in _SHELL_KEYWORDS]
+            allexport = name == 'set' and any(
+                (word.startswith(('-', '+')) and not word.startswith('--') and 'a' in word) or word == 'allexport'
+                for word in words[1:]
+            )
+            loads = name in ('.', 'source', 'eval', 'export') or allexport
+            reads_elsewhere = '.env' in words and words[:3] != ['[', '-f', '.env']
+            if loads or reads_elsewhere:
+                offenders.append(' '.join(command))
+            elif name == reader:
+                offenders.append(f'{" ".join(command)} (prints the value it reads)')
+            elif any(f'$({reader} ' in word and not _ENV_CAPTURE.match(word) for word in words):
+                offenders.append(f'{" ".join(command)} (reader output not captured into a variable)')
+    assert not offenders, (
+        f'the {SYSTEM_TARGET} recipe loads or reads .env outside the grep reader, or calls the reader '
+        f'outside a $(...) capture: {offenders}'
+    )
+    assert set(_env_captures(lines)) == set(SYSTEM_ENV_FILE_KEYS), (
+        f'the recipe reads {sorted(_env_captures(lines))} from .env, expected {sorted(SYSTEM_ENV_FILE_KEYS)}'
+    )
+
+
+@pytest.mark.build_infra
+def test_test_system_never_prints_a_secret(tmp_path: Path):
+    """tj-vhboky.48 item 2c: POSTGRES_PASS and INSTANCE_WRITE_SECRET never reach the output.
+
+    The banner may NAME them; no echo or printf may expand the variables holding them, and no
+    shell tracing may be switched on, since `set -x` prints the pytest line with values expanded.
+    """
+    lines = _system_recipe_lines(tmp_path)
+    captures = _env_captures(lines)
+    secrets = {key: captures.get(key) for key in SYSTEM_SECRET_KEYS}
+    assert all(secrets.values()), f'the recipe captures no variable for {secrets}, so this check would see nothing'
+
+    offenders = []
+    for line in lines:
+        for command in _commands(line):
+            name = _command_name(command)
+            words = [word for word in command if word not in _SHELL_KEYWORDS]
+            tracing = name == 'set' and any(
+                (word.startswith('-') and not word.startswith('--') and ('x' in word or 'v' in word))
+                or word in ('xtrace', 'verbose')
+                for word in words[1:]
+            )
+            if tracing:
+                offenders.append(' '.join(command))
+            if name in ('echo', 'printf', 'tee', 'cat'):
+                leaked = [
+                    key for key, variable in secrets.items() if any(_mentions_variable(w, variable) for w in words)
+                ]
+                if leaked:
+                    offenders.append(f'{" ".join(command)} (prints {leaked})')
+    assert not offenders, f'the {SYSTEM_TARGET} recipe prints a secret or traces the shell: {offenders}'
+
+
+@pytest.mark.build_infra
+def test_test_system_fails_on_every_missing_env_value(tmp_path: Path):
+    """tj-vhboky.48 item 2b: each value read from .env is checked non-empty before pytest starts.
+
+    One missing check means the suite starts with an empty password or port and fails somewhere
+    downstream with a message that names neither.
+    """
+    lines = _system_recipe_lines(tmp_path)
+    checked = {
+        word.lstrip('$')
+        for line in lines
+        for command in _commands(line)
+        if (words := [w for w in command if w not in _SHELL_KEYWORDS])[:2] == ['[', '-n']
+        for word in words[2:3]
+    }
+    unchecked = sorted(key for key, variable in _env_captures(lines).items() if variable not in checked)
+    assert not unchecked, f'the {SYSTEM_TARGET} recipe reads {unchecked} from .env without failing when empty'
+
+
+@pytest.mark.build_infra
+def test_test_system_ends_on_pytest_over_the_system_suite(tmp_path: Path):
+    """tj-vhboky.48 item 2d: the recipe's last command IS pytest, so its exit status is make's.
+
+    Anything after it -- `|| true`, `; exit 0`, a `| tee` -- turns pytest's exit 5 on an empty
+    selection, and every red, into a green make. The default path must be the suite itself, and
+    the PYTEST_ENV driver flags every test target sets must be there too.
+    """
+    lines = _system_recipe_lines(tmp_path)
+    command = _pytest_command(lines)
+    assigned = _assignments(command)
+    invoked = command[len(assigned) :]
+    assert invoked[:3] == ['uv', 'run', 'pytest'], (
+        f'the {SYSTEM_TARGET} recipe does not end on `uv run pytest`: {command}'
+    )
+    assert invoked[3:] == [SYSTEM_SUITE_DIR], (
+        f'the recipe runs pytest over {invoked[3:]}, expected [{SYSTEM_SUITE_DIR!r}]'
+    )
+    for word in _make_variable('PYTEST_ENV').split():
+        name, _, value = word.partition('=')
+        assert assigned.get(name) == value, f'the pytest command lost $(PYTEST_ENV)`s {word}: {assigned}'
+
+
+@pytest.mark.build_infra
+def test_test_system_hands_the_suite_the_env_contract(tmp_path: Path):
+    """tj-vhboky.48 item 2b: the contract, in one place, with the values the bead requires.
+
+    - Postgres and data_store are reached on loopback from the runner.
+    - Each .env-backed name carries the value read for that same key, so a swap is caught.
+    - The repository root is on PYTHONPATH: tests/system has no package chain to provide it.
+    - TZ is off UTC in both January and July, so a naive-to-timestamptz shift can go red on a
+      UTC runner in either season.
+    """
+    lines = _system_recipe_lines(tmp_path)
+    assigned = _assignments(_pytest_command(lines))
+    assert set(assigned) == set(SYSTEM_ENV_CONTRACT), (
+        f'the pytest command receives {sorted(assigned)}, expected exactly {sorted(SYSTEM_ENV_CONTRACT)}. '
+        f'Change the contract here and in the Makefile comment above {SYSTEM_TARGET} together.'
+    )
+    assert assigned['DATABASE_NAME'] == '127.0.0.1', (
+        f'DATABASE_NAME (the Postgres host) is {assigned["DATABASE_NAME"]!r}'
+    )
+    assert assigned['SYSTEM_TEST_DATA_STORE_URL'].startswith('http://127.0.0.1:'), assigned[
+        'SYSTEM_TEST_DATA_STORE_URL'
+    ]
+    assert Path(assigned['PYTHONPATH']).resolve() == tmp_path.resolve(), (
+        f'PYTHONPATH is {assigned["PYTHONPATH"]!r}, not the directory make runs in ({tmp_path})'
+    )
+
+    captures = _env_captures(lines)
+    for key in set(SYSTEM_ENV_FILE_KEYS) & set(SYSTEM_ENV_CONTRACT):
+        assert assigned[key] == f'${captures[key]}', f'{key} is handed {assigned[key]!r}, not the value read from .env'
+    assert _mentions_variable(assigned['SYSTEM_TEST_DATA_STORE_URL'], captures['DATA_STORE_PORT'])
+
+    zone = ZoneInfo(assigned['TZ'])
+    for month in (1, 7):
+        offset = datetime(2026, month, 15, 12, tzinfo=UTC).astimezone(zone).utcoffset()
+        assert offset, f'TZ={assigned["TZ"]} is UTC in month {month}, where a naive shift is invisible'
+
+
+@pytest.mark.build_infra
+def test_test_system_neither_starts_nor_migrates_the_stack(tmp_path: Path):
+    """tj-vhboky.48 item 2: which database gets touched stays the decision of whoever runs it."""
+    lines = _system_recipe_lines(tmp_path)
+    forbidden = {'docker', 'docker-compose', 'alembic', MIGRATIONS_SCRIPT.name, 'make'}
+    offenders = [
+        ' '.join(command)
+        for line in lines
+        for command in _commands(line)
+        if forbidden & {PurePosixPath(word).name for word in command}
+    ]
+    assert not offenders, f'the {SYSTEM_TARGET} recipe starts, stops or migrates something: {offenders}'

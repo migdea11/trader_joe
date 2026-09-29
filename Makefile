@@ -345,3 +345,96 @@ test-broker: $(VENV_MARKER)  ## Run the external broker tests: needs live creden
 .PHONY: test-all
 test-all: $(VENV_MARKER)  ## Run every test, external included: needs live credentials
 	$(PYTEST) -m "" $(PATHS)
+
+# THE SYSTEM SUITE (tj-vhboky.48, ADR tj-fdb9gz). tests/system/ drives a stack that is ALREADY UP
+# AND MIGRATED -- `make dev-launch` (or prod-launch) and then `make migrate`. This target does
+# neither: bringing a stack up or migrating it is a decision about which database is touched, and
+# that decision stays with whoever runs it. pytest.ini keeps tests/system out of every other target
+# by directory (norecursedirs), so this is the one target that names it. SYSTEM_PATHS scopes it to
+# one file inside the suite; pointing it outside tests/system collects the gate, not the suite.
+#
+# THE DISPOSABLE-DATABASE GUARD. The suite WRITES to whatever database it is pointed at, and this
+# machine also runs the production deployment. So the target refuses unless
+# SYSTEM_TEST_DISPOSABLE_DB=1 is set -- as a make argument or in the environment. It is an
+# attestation by the person running it, not a detection: nothing here can tell a disposable
+# Postgres from the production one, which is exactly why it has to be said out loud each time.
+#
+# THE ENV CONTRACT the suite reads, defined here and nowhere else:
+#   SYSTEM_TEST_DATA_STORE_URL  http://127.0.0.1:<DATA_STORE_PORT from .env>. Loopback, because
+#                               docker-compose.yaml publishes data_store on 127.0.0.1 only.
+#   DATABASE_NAME               127.0.0.1 -- the Postgres HOST. The name is data_store's own:
+#                               data/store/app/database/database.py reads DATABASE_NAME as the
+#                               host, so its modules connect runner-side unchanged, and a raw
+#                               asyncpg connection is built from the same five names.
+#   DATABASE_PORT, POSTGRES_USER, POSTGRES_PASS, POSTGRES_DB_NAME
+#                               from .env. DATABASE_PORT is the host side of the loopback mapping.
+#   DATABASE_CONN_TIMEOUT       10 (seconds). database.py reads it. Unset, a Postgres that ANSWERS
+#                               but refuses (still starting, bad password) sends wait_for_db into
+#                               comparing elapsed time against None: a TypeError, not a message
+#                               naming the database. A refused TCP connect raises straight away.
+#   INSTANCE_WRITE_SECRET       from .env -- the write path fails closed without it.
+#   TZ                          $(SYSTEM_TEST_TZ). NON-UTC ON PURPOSE: CI runners are UTC, and a
+#                               naive-to-timestamptz shift is invisible at offset zero, so a test
+#                               of it could never go red there. Checked before pytest starts: a
+#                               host without that zone's tzdata silently falls back to UTC.
+#   POSTGRES_ASYNC, POSTGRES_SYNC
+#                               the usual $(PYTEST_ENV) driver flags, as every test target.
+#   PYTHONPATH                  the repository root, so `from data.store.app... import` resolves.
+#                               The gate's test directories get the root from their __init__.py
+#                               chain (data/store/tests -> data/store -> data); tests/system has
+#                               no package above it, so pytest would insert tests/system instead.
+#
+# .env IS READ, NEVER SOURCED -- the reasoning of CI's Smoke Test step: sourcing would pull
+# POSTGRES_PASS and the write secret into the shell, where any stray `set -x` or echo prints them.
+# Each value is grepped out on its own, the recipe is not echoed, and the banner names the two
+# secrets without their values. A required value that is missing or empty fails here, naming
+# only the variable.
+#
+# A MISSING DATABASE FAILS, NEVER SKIPS (pytest.ini, FAIL, NEVER SKIP). And an empty selection is
+# a failure too: pytest exits 5 when it collects nothing, and the recipe ends on pytest so make
+# returns that status untouched.
+SYSTEM_TEST_TZ := America/Toronto
+SYSTEM_PATHS ?= tests/system
+
+.PHONY: test-system
+test-system: $(VENV_MARKER)  ## Run tests/system against an up, migrated stack (SYSTEM_TEST_DISPOSABLE_DB=1)
+	@if [ "$(SYSTEM_TEST_DISPOSABLE_DB)" != "1" ]; then \
+		echo "make test-system REFUSED: the system suite WRITES to the database it is pointed at," >&2; \
+		echo "  and this machine also runs the production deployment." >&2; \
+		echo "  Point .env at a disposable Postgres, bring the stack up and migrate it" >&2; \
+		echo "  (make dev-launch, make migrate), then run:" >&2; \
+		echo "    make test-system SYSTEM_TEST_DISPOSABLE_DB=1" >&2; \
+		exit 1; \
+	fi
+	@[ -f .env ] || { echo "make test-system: no .env in $(CURDIR); the suite reads the stack's ports and credentials from it." >&2; exit 1; }
+	@if [ "$$(TZ=$(SYSTEM_TEST_TZ) date +%z)" = "+0000" ]; then \
+		echo "make test-system: TZ=$(SYSTEM_TEST_TZ) resolves to UTC here (no tzdata for it?)," >&2; \
+		echo "  so a naive-to-timestamptz shift could not go red. Install tzdata and retry." >&2; \
+		exit 1; \
+	fi
+	@env_value() { grep -E "^$$1=" .env | tail -n 1 | cut -d= -f2-; }; \
+	data_store_port="$$(env_value DATA_STORE_PORT)"; \
+	db_port="$$(env_value DATABASE_PORT)"; \
+	db_user="$$(env_value POSTGRES_USER)"; \
+	db_pass="$$(env_value POSTGRES_PASS)"; \
+	db_name="$$(env_value POSTGRES_DB_NAME)"; \
+	write_secret="$$(env_value INSTANCE_WRITE_SECRET)"; \
+	missing=""; \
+	[ -n "$$data_store_port" ] || missing="$$missing DATA_STORE_PORT"; \
+	[ -n "$$db_port" ] || missing="$$missing DATABASE_PORT"; \
+	[ -n "$$db_user" ] || missing="$$missing POSTGRES_USER"; \
+	[ -n "$$db_pass" ] || missing="$$missing POSTGRES_PASS"; \
+	[ -n "$$db_name" ] || missing="$$missing POSTGRES_DB_NAME"; \
+	[ -n "$$write_secret" ] || missing="$$missing INSTANCE_WRITE_SECRET"; \
+	if [ -n "$$missing" ]; then \
+		echo "make test-system: missing or empty in .env:$$missing" >&2; \
+		exit 1; \
+	fi; \
+	echo "System suite against data_store http://127.0.0.1:$$data_store_port and Postgres $$db_user@127.0.0.1:$$db_port/$$db_name, TZ=$(SYSTEM_TEST_TZ)"; \
+	echo "POSTGRES_PASS and INSTANCE_WRITE_SECRET are set (values not shown)."; \
+	$(PYTEST_ENV) TZ=$(SYSTEM_TEST_TZ) PYTHONPATH="$(CURDIR)" \
+		SYSTEM_TEST_DATA_STORE_URL="http://127.0.0.1:$$data_store_port" \
+		DATABASE_NAME=127.0.0.1 DATABASE_PORT="$$db_port" DATABASE_CONN_TIMEOUT=10 \
+		POSTGRES_USER="$$db_user" POSTGRES_PASS="$$db_pass" POSTGRES_DB_NAME="$$db_name" \
+		INSTANCE_WRITE_SECRET="$$write_secret" \
+		uv run pytest $(SYSTEM_PATHS)
