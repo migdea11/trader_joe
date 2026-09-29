@@ -2283,6 +2283,11 @@ BANDIT_TEST_SEGMENT = 'tests'
 _BANDIT_MODELLED_FLAGS = frozenset({'-r', '--recursive'})
 _BANDIT_EXCLUDE_OPTIONS = frozenset({'-x', '--exclude'})
 _BANDIT_DEFAULT_INCLUDE = '*.py'  # bandit's `include` default; no bandit config file sets another
+# The bandit release _bandit_scanned_files was cross-checked against (tj-vhboky.74). A bandit bump
+# in uv.lock reds test_the_locked_bandit_is_the_modelled_one on the same diff, which is the only
+# signal that the model may have gone stale: bandit is not installed where this runs.
+MODELLED_BANDIT_VERSION = '1.9.4'
+BANDIT_DISTRIBUTION = 'bandit'
 _MAKE_REFERENCE = re.compile(r'\$\((\w+)\)')
 _WORKFLOW_ENV_REFERENCE = re.compile(r'\$\{\{\s*env\.(\w+)\s*\}\}')
 
@@ -2452,6 +2457,53 @@ def test_the_bandit_model_reproduces_the_directory_rewrite(
     scanned = _bandit_scanned_files(['bandit', '-r', './pkg', '--exclude', exclude], tmp_path)
     assert os.path.join('pkg', 'module.py') in scanned
     assert (os.path.join('pkg', 'tests', 'test_module.py') in scanned) is nested_test_scanned, scanned
+
+
+def _locked_versions(lockfile: Path, distribution: str) -> list[str | None]:
+    """Every version `lockfile` locks for `distribution`, read as TOML; bandit itself is never run."""
+    with lockfile.open('rb') as handle:
+        lock = tomllib.load(handle)
+    name = canonicalize_name(distribution)
+    return [package.get('version') for package in lock.get('package', []) if canonicalize_name(package['name']) == name]
+
+
+def _bandit_model_drift(lockfile: Path) -> str | None:
+    """Why the bandit locked in `lockfile` is not the one the discovery model follows, or None if it is."""
+    versions = _locked_versions(lockfile, BANDIT_DISTRIBUTION)
+    if versions == [MODELLED_BANDIT_VERSION]:
+        return None
+    return (
+        f'{lockfile.name} locks {BANDIT_DISTRIBUTION} {versions}, but _bandit_scanned_files models bandit '
+        f'{MODELLED_BANDIT_VERSION} (MODELLED_BANDIT_VERSION). Before changing the constant, re-run the '
+        f'cross-check under the new bandit: its own BanditManager.discover_files against _bandit_scanned_files, '
+        f"from the repository root, on both exclude forms ('*/tests/*' and 'tests/'), and get the same file set. "
+        f'Update the model if discovery changed, then the constant, and put the evidence in the commit body.'
+    )
+
+
+@pytest.mark.build_infra
+def test_the_locked_bandit_is_the_modelled_one():
+    """tj-vhboky.74: a bandit bump in uv.lock reds the gate until the discovery model is re-checked.
+
+    The scanned-file-set tests above trust a model of bandit 1.9.4, because bandit is not in the
+    gate's venv and a skip is forbidden. The model's one blind spot is a bandit release that changes
+    discovery; this turns that release into a red on the same diff that locks it.
+    """
+    drift = _bandit_model_drift(LOCKFILE)
+    assert drift is None, drift
+
+
+@pytest.mark.build_infra
+def test_the_bandit_tripwire_fires_on_a_different_locked_version(tmp_path: Path):
+    """Guard the guard: a copy of uv.lock with bandit at another version is reported, naming it."""
+    lock = LOCKFILE.read_text(encoding='utf-8')
+    entry = re.compile(rf'(^name = "{BANDIT_DISTRIBUTION}"\nversion = ")([^"]+)(")', re.MULTILINE)
+    assert len(entry.findall(lock)) == 1, f'{LOCKFILE.name} does not hold exactly one {BANDIT_DISTRIBUTION} entry'
+    bumped = tmp_path / LOCKFILE.name
+    bumped.write_text(entry.sub(r'\g<1>999.0.0\g<3>', lock), encoding='utf-8')
+    drift = _bandit_model_drift(bumped)
+    assert drift is not None, 'a lock with bandit 999.0.0 passed the tripwire'
+    assert '999.0.0' in drift and MODELLED_BANDIT_VERSION in drift, drift
 
 
 # ---------------------------------------------------------------------------------------
