@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Body, Depends, Query
+from fastapi import APIRouter, Body, Depends, Path, Query
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -41,7 +41,7 @@ class UnsupportedAssetType(ValueError):
 )
 async def create_stock_market_activity_data(
     db: Annotated[AsyncSession, Depends(async_db)],
-    asset_path: Annotated[AssetDataPath, Depends()],
+    asset_path: Annotated[AssetDataPath, Path()],
     asset_data: Annotated[dict, Body(...)],
 ):
     log.debug(f'Storing data: /{asset_path.asset_type}/{asset_path.data_type}')
@@ -68,7 +68,7 @@ async def create_stock_market_activity_data(
 @router.get(AssetDataInterface.GET_ASSET_DATA, response_model=list[StockDataMarketActivity])
 async def read_stock_market_activity_data(
     db: Annotated[AsyncSession, Depends(async_db)],
-    asset_path: Annotated[AssetDataPath, Depends()],
+    asset_path: Annotated[AssetDataPath, Path()],
     asset_query: Annotated[StockDataMarketActivityQuery, Query()],
 ):
     """Read stock market activity data.

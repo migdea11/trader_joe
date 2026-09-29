@@ -106,11 +106,39 @@ class _AssetDataQuery(InboundContract, ABC):
     end: AwareDatetime | None = None
 
 
+# The (asset_type, data_type) pairs the internal asset-data routes serve
+# (routers/data_store/internal_asset_data.py, the match statements). Enabling a new pair means
+# editing this set as well as those routes (tj-vhboky.68).
+SUPPORTED_ASSET_DATA_PAIRS: frozenset[tuple[AssetType, DataType]] = frozenset(
+    {(AssetType.STOCK, DataType.MARKET_ACTIVITY)}
+)
+
+
 class AssetDataPath(InboundContract):
-    """Asset Properties, as path to identify the endpoint for the desired data and asset type."""
+    """Asset Properties, as path to identify the endpoint for the desired data and asset type.
+
+    THE PAIR IS VALIDATED, NOT JUST EACH FIELD (tj-vhboky.68). Each enum on its own admits pairs
+    no route serves, such as crypto/quote, and those used to build successfully and then fail in
+    the route as an unhandled 500. A pair outside SUPPORTED_ASSET_DATA_PAIRS is refused here, as a
+    property of the request contract. OpenAPI still lists every enum value for each field, because
+    a cross-field rule is invisible there.
+
+    The refusal is a 422 over HTTP only when the model is bound with Path(). Under Depends() the
+    ValidationError is raised inside the dependency call and is not a request validation error;
+    the route binding is tj-vhboky.72 (builder-store).
+    """
 
     asset_type: AssetType = Field(..., description=ASSET_TYPE_DESC)
     data_type: DataType = Field(..., description=DATA_TYPE_DESC)
+
+    @model_validator(mode='after')
+    def require_supported_pair(self) -> Self:
+        if (self.asset_type, self.data_type) not in SUPPORTED_ASSET_DATA_PAIRS:
+            supported = ', '.join(f'{asset}/{data}' for asset, data in sorted(SUPPORTED_ASSET_DATA_PAIRS))
+            raise ValueError(
+                f'unsupported asset_type/data_type pair {self.asset_type}/{self.data_type}; supported: {supported}'
+            )
+        return self
 
 
 class AssetDataCreate(_AssetIdentifier, _AssetDataType[DT], Generic[DT], ABC):
