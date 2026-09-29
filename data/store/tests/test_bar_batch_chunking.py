@@ -38,6 +38,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import Insert
+from sqlalchemy.exc import OperationalError
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Feed, Granularity
@@ -49,6 +50,7 @@ from data.store.app.database.crud.stock.asset_market_activity import (
     build_market_activity_upsert,
 )
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
+from data.store.app.database.transaction import write_transaction
 from data.store.app.ingest import data_action_request
 from schemas.data_store.asset_dataset_store import StoreAssetDatasetBody, StoreAssetDatasetPath
 from schemas.data_store.stock.market_activity_data import (
@@ -255,8 +257,8 @@ def test_an_unset_setting_falls_back_to_the_derived_ceiling():
     get_env_var('MARKET_ACTIVITY_BATCH_SIZE', cast_type=int) returns None when the variable is
     unset -- it casts only when the value is not None (common/environment.py) -- so the module
     constant is None and that None is what the write path receives. A resolver that assumed an int
-    would raise a TypeError inside the write path's try block and turn a missing setting into a
-    lost batch.
+    would raise a TypeError inside the write path's transaction block and turn a missing setting
+    into a lost batch.
 
     The arithmetic is restated here deliberately, and this is the only place it is: it pins the
     FLOOR division specifically, which is a claim about the operator rather than about the value.
@@ -547,6 +549,149 @@ async def test_a_duplicate_beyond_the_first_chunk_is_rejected_before_anything_is
     assert session.execute.await_count == 0, 'a chunk was sent before the whole batch had been checked for duplicates'
     assert session.commit.await_count == 0, 'a chunk was committed before the whole batch had been checked'
     assert call_order == ['rollback'], 'the rejected batch did not roll back cleanly without touching the database'
+
+
+# ---------------------------------------------------------------------------------------
+# DATABASE ERRORS THROUGH THE TRANSACTION HELPER (tj-vhboky.43; design tj-vhboky.41 S1, Addendum 1
+# and its 03:42 correction). The write path no longer has a try/except of its own: write_transaction
+# rolls back once, logs once at ERROR through ITS module logger, and re-raises the original error
+# unchanged. test_a_failure_on_any_chunk_persists_nothing above raises a plain RuntimeError, which
+# takes the helper's NON-database branch -- rolled back, never logged. The branch a real database
+# failure takes was reached by no test on this path, so it is pinned here with a SQLAlchemyError.
+
+# Distinctive enough that finding it in a log message can only mean the error's text was rendered
+# there. A real DBAPIError's str() carries the statement and the bound parameters; this one does too.
+LEAKED_SQL = 'INSERT INTO stock_market_activity -- validator-marker-7f3a'
+HELPER_LOGGER = write_transaction.__module__
+
+
+def _database_error() -> OperationalError:
+    return OperationalError(LEAKED_SQL, {'owner': 'validator-marker-owner'}, Exception('connection reset'))
+
+
+def _error_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [record for record in caplog.records if record.levelno >= logging.ERROR]
+
+
+def _assert_logged_once_without_its_text(caplog: pytest.LogCaptureFixture, error: OperationalError) -> None:
+    """Pin 5: one ERROR record, from the helper, and the error's text in no log message at all.
+
+    ONE, not at least one. The deleted `log.error(f'...{e}')` fired in ADDITION to anything the
+    helper logs, so restoring it would show up as a second record here -- and, because it formatted
+    the error into the message, as the marker in getMessage() below. Every level is scanned, not
+    just ERROR, so the raw text cannot come back as a warning either.
+
+    The traceback is meant to travel as exc_info (Addendum 1, S3 revised: the user wants SQL and
+    parameters kept, redacted where rendered by the D3 mechanism), so exc_info carrying this very
+    object is asserted too; only the MESSAGE must be free of it.
+    """
+    (record,) = _error_records(caplog)
+    assert record.name == HELPER_LOGGER, 'the database error was logged by someone other than the helper'
+    assert record.exc_info is not None and record.exc_info[1] is error, (
+        'the traceback no longer travels with the record'
+    )
+    for any_record in caplog.records:
+        assert LEAKED_SQL not in any_record.getMessage(), (
+            f'the error text was formatted into a log message: {any_record.name} {any_record.getMessage()!r}'
+        )
+        assert str(error) not in any_record.getMessage()
+
+
+@pytest.mark.parametrize('failing_chunk', [1, 2, 3])
+@pytest.mark.asyncio
+async def test_a_database_error_on_any_chunk_rolls_back_once_and_leaves_as_itself(
+    session, call_order: list[str], failing_chunk: int, caplog: pytest.LogCaptureFixture
+):
+    """Pins 1 and 5: k executes, one rollback, no commit, the same object raised, one ERROR record.
+
+    Identity, not type: the design's interim is RE-RAISE THE ORIGINAL UNCHANGED (Addendum 1, D1
+    interim, confirmed by the 03:42 correction -- conversion belongs in the store app's HTTP
+    exception handler, not in the helper). A wrapper of the same class, or a translation to any
+    other type, fails `is`.
+
+    Args:
+        session: The recording session, made to fail on one chunk.
+        call_order: The sequence of session calls.
+        failing_chunk: Which of three statements raises.
+        caplog: The log records the failure produced.
+    """
+    caplog.set_level(logging.DEBUG)
+    error = _database_error()
+    attempts = 0
+
+    def fail_on_the_nominated_chunk(statement):
+        nonlocal attempts
+        attempts += 1
+        call_order.append('execute')
+        if attempts == failing_chunk:
+            raise error
+
+    session.execute.side_effect = fail_on_the_nominated_chunk
+
+    with pytest.raises(OperationalError) as raised:
+        await batch_create_market_activity_data(session, _batch_of(5), requested_chunk_size=2)
+
+    assert raised.value is error, 'the database error was replaced on its way out'
+    assert call_order == ['execute'] * failing_chunk + ['rollback']
+    _assert_logged_once_without_its_text(caplog, error)
+
+
+@pytest.mark.asyncio
+async def test_a_database_error_from_the_commit_rolls_back_once_and_leaves_as_itself(
+    session, call_order: list[str], caplog: pytest.LogCaptureFixture
+):
+    """Pins 2 and 5: the commit is inside the helper's catch, so its failure rolls back too.
+
+    Every chunk has been sent when the commit fails, so this is the case where a missing rollback
+    would leave the most behind on the session. It is also the case the old code covered only
+    because its commit sat inside its own try; the helper has to reproduce that, not assume it.
+    """
+    caplog.set_level(logging.DEBUG)
+    error = _database_error()
+
+    def fail_the_commit():
+        call_order.append('commit')
+        raise error
+
+    session.commit.side_effect = fail_the_commit
+
+    with pytest.raises(OperationalError) as raised:
+        await batch_create_market_activity_data(session, _batch_of(5), requested_chunk_size=2)
+
+    assert raised.value is error, 'the commit error was replaced on its way out'
+    assert call_order == ['execute', 'execute', 'execute', 'commit', 'rollback']
+    _assert_logged_once_without_its_text(caplog, error)
+
+
+@pytest.mark.parametrize(
+    'dataset',
+    [
+        pytest.param({}, id='no-market-activity-key'),
+        pytest.param({DataType.MARKET_ACTIVITY: []}, id='an-empty-market-activity-list'),
+    ],
+)
+@pytest.mark.asyncio
+async def test_an_empty_batch_touches_nothing(session, call_order: list[str], dataset: dict):
+    """Pin 3: nothing to write means no execute, no commit, and no rollback.
+
+    The early return sits ABOVE the transaction block by design (tj-vhboky.43 build item 1). Moved
+    inside it, a return is a normal exit and the helper COMMITS -- an empty transaction reported as
+    a write. Both spellings of empty reach the same `not batch_market_activity` branch, and both are
+    shapes a batch can arrive in: a fetch that returned no bars never calls append_data, and a
+    caller that pre-seeded the key does.
+
+    Args:
+        session: The recording session; it must record nothing.
+        call_order: Expected to stay empty.
+        dataset: The batch's dataset mapping, empty either way.
+    """
+    batch = _batch_of(0)
+    batch.dataset = dataset
+
+    written = await batch_create_market_activity_data(session, batch, requested_chunk_size=2)
+
+    assert written == 0
+    assert call_order == [], 'an empty batch opened, committed or rolled back a transaction'
 
 
 # ---------------------------------------------------------------------------------------

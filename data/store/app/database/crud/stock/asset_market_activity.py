@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from common.enums.data_select import AssetType, DataType
 from common.logging import get_logger
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
+from data.store.app.database.transaction import write_transaction
 from schemas.data_store.stock import market_activity_data
 
 
@@ -55,8 +56,8 @@ async def create_market_activity_data(
     log.debug('Storing asset market activity data')
     asset_table = StockMarketActivity
     db_asset_market_activity_data = asset_table(**asset_table.from_create(asset_data))
-    db.add(db_asset_market_activity_data)
-    await db.commit()
+    async with write_transaction(db, 'store market activity'):
+        db.add(db_asset_market_activity_data)
     await db.refresh(db_asset_market_activity_data)
     return db_asset_market_activity_data.to_schema()
 
@@ -112,22 +113,24 @@ async def batch_create_market_activity_data(
 ) -> int:
     """Upsert a batch of bars, chunked to stay under the wire-protocol bind-parameter limit.
 
-    ALL CHUNKS SHARE ONE TRANSACTION (tj-rpyv5u): every db.execute below runs before the single
-    db.commit() at the end, so an oversized batch either lands whole or (on any exception,
-    including one raised mid-chunk) rolls back whole. Committing per chunk was rejected
-    deliberately -- it would turn one failed request into a dataset entry claiming coverage for
-    bars that were never written, which is worse than today's all-or-nothing failure.
+    ALL CHUNKS SHARE ONE TRANSACTION (tj-rpyv5u): every db.execute below runs inside one
+    write_transaction block, so an oversized batch either lands whole (the block's single commit
+    on normal exit) or (on any exception, including one raised mid-chunk) rolls back whole.
+    Committing per chunk was rejected deliberately -- it would turn one failed request into a
+    dataset entry claiming coverage for bars that were never written, which is worse than today's
+    all-or-nothing failure.
 
-    The duplicate-timestamp guard runs across the WHOLE batch before any chunk is built, not
-    per chunk: two bars at the same timestamp landing in different chunks would each pass a
-    per-chunk guard and still collide on the natural key.
+    The empty-batch return is ABOVE the block: it neither commits nor rolls back anything, since
+    there is nothing to write. The duplicate-timestamp guard runs INSIDE the block, across the
+    WHOLE batch before any chunk is built, not per chunk: two bars at the same timestamp landing
+    in different chunks would each pass a per-chunk guard and still collide on the natural key.
     """
-    try:
-        batch_market_activity = batch_asset_data.dataset.get(DataType.MARKET_ACTIVITY)
-        if not batch_market_activity:
-            log.warning('No market activity data in batch')
-            return 0
+    batch_market_activity = batch_asset_data.dataset.get(DataType.MARKET_ACTIVITY)
+    if not batch_market_activity:
+        log.warning('No market activity data in batch')
+        return 0
 
+    async with write_transaction(db, 'batch store market activity'):
         log.debug(f'Batch storing market activity[{len(batch_market_activity)}]')
         log.debug(f'Batch storing market activity: {next(iter(batch_market_activity))}')
 
@@ -144,13 +147,9 @@ async def batch_create_market_activity_data(
             chunk = values[chunk_start : chunk_start + chunk_size]
             await db.execute(build_market_activity_upsert(chunk))
 
-        await db.commit()
         log.debug('Batch insert completed successfully')
-        return len(batch_market_activity)
-    except Exception as e:
-        await db.rollback()
-        log.error(f'Failed to batch insert asset market activity data: {e}')
-        raise
+
+    return len(batch_market_activity)
 
 
 async def read_market_activity_data(

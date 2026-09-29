@@ -35,6 +35,7 @@ THE RULINGS PINNED, each traceable to tj-vhboky.1 and its amendments:
 * An update changes the range and only by growth, and never touches an identity column or the id.
 """
 
+import logging
 import re
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
@@ -42,7 +43,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.dialects import postgresql, sqlite
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from common.database.sql_alchemy_nullable_datetime import NullableDateTime
 from common.enums.data_select import AssetType, DataType
@@ -643,6 +644,421 @@ async def test_a_delete_that_races_another_reports_not_found_before_committing()
 
     assert db.commits == 0, 'the transaction was committed before the no-such-entry check ran'
     assert db.rollbacks == 1, 'the failed delete left its transaction open'
+
+
+# ---------------------------------------------------------------------------------------------
+# Every rejected write rolls back before the domain error reaches the caller (tj-ck5spw)
+# ---------------------------------------------------------------------------------------------
+#
+# The file's convention is an explicit rollback on every error path. Before 39b9d19 the domain
+# rejections were raised from OUTSIDE each function's try, so they skipped it. Nothing noticed,
+# because a request-scoped session rolls back when FastAPI closes it. That property belongs to a
+# caller this module does not control, and update_entry has no HTTP caller at all. Until these
+# tests, the delete-race case above was the only one that observed a rollback. The existing tests
+# for each path keep the exception type, message and statement assertions; these add only
+# rollbacks == 1 and commits == 0, one test per path, so a red names the path it lost.
+
+_ID_ADDRESSED_WRITES = {
+    'delete_entry_by_id': lambda db, entry_id: crud.delete_entry_by_id(db, entry_id, OWNER),
+    'update_entry': lambda db, entry_id: crud.update_entry(db, update_request(entry_id)),
+    'update_entry_lifecycle': lambda db, entry_id: crud.update_entry_lifecycle(db, entry_id, OWNER),
+}
+
+
+@pytest.mark.asyncio
+async def test_a_create_rejected_as_an_own_overlap_rolls_back():
+    """OwnOverlapConflict out of upsert_entry. The overlap select has run, so the session was touched."""
+    db = FakeSession(FakeResult([(uuid4(),)]))
+
+    with pytest.raises(crud.OwnOverlapConflict):
+        await crud.upsert_entry(db, create_request())
+
+    assert (db.commits, db.rollbacks) == (0, 1), 'a create rejected for own overlap did not roll back'
+
+
+@pytest.mark.asyncio
+async def test_an_update_rejected_as_a_range_shrink_rolls_back():
+    """RangeShrink out of update_entry, raised after the entry lookup has run."""
+    entry_id = uuid4()
+    db = FakeSession(FakeResult([(stored_entry(entry_id, start=JANUARY, end=MARCH),)]))
+
+    with pytest.raises(crud.RangeShrink):
+        await crud.update_entry(db, update_request(entry_id, start=FEBRUARY, end=MARCH))
+
+    assert (db.commits, db.rollbacks) == (0, 1), 'an update rejected as a shrink did not roll back'
+
+
+@pytest.mark.asyncio
+async def test_an_update_rejected_as_a_range_collision_rolls_back():
+    """RangeCollision out of update_entry, raised after the lookup and the collision select have run."""
+    entry_id = uuid4()
+    db = FakeSession(FakeResult([(stored_entry(entry_id, end=MARCH),)]), FakeResult([(uuid4(),)]))
+
+    with pytest.raises(crud.RangeCollision):
+        await crud.update_entry(db, update_request(entry_id, end=APRIL))
+
+    assert (db.commits, db.rollbacks) == (0, 1), 'an update rejected as a range collision did not roll back'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('write', list(_ID_ADDRESSED_WRITES), ids=list(_ID_ADDRESSED_WRITES))
+async def test_an_id_addressed_write_against_an_unknown_id_rolls_back(write: str):
+    """EntryNotFound from the lookup, not the delete race above: no entry was found by the SELECT.
+
+    Args:
+        write: Which id-addressed write is called, and the case id a red is reported under.
+    """
+    db = FakeSession(FakeResult([]))
+
+    with pytest.raises(crud.EntryNotFound):
+        await _ID_ADDRESSED_WRITES[write](db, uuid4())
+
+    assert (db.commits, db.rollbacks) == (0, 1), f'{write} against an unknown id did not roll back'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('write', list(_ID_ADDRESSED_WRITES), ids=list(_ID_ADDRESSED_WRITES))
+async def test_an_id_addressed_write_by_a_non_owner_rolls_back(write: str):
+    """OwnerMismatch from _check_owner, after the lookup has read the entry.
+
+    Args:
+        write: Which id-addressed write is called, and the case id a red is reported under.
+    """
+    entry_id = uuid4()
+    db = FakeSession(FakeResult([(stored_entry(entry_id, owner='someone-else'),)]))
+
+    with pytest.raises(crud.OwnerMismatch):
+        await _ID_ADDRESSED_WRITES[write](db, entry_id)
+
+    assert (db.commits, db.rollbacks) == (0, 1), f'{write} by a non-owner did not roll back'
+
+
+# ---------------------------------------------------------------------------------------------
+# A database error rolls back and leaves unchanged; a success never rolls back (tj-vhboky.39,
+# tj-76u8ip)
+# ---------------------------------------------------------------------------------------------
+#
+# Error handling for all four writes is write_transaction's, per tj-vhboky.41 Addendum 1.
+
+
+class ErroringSession(FakeSession):
+    """A FakeSession whose execute raises a SQLAlchemyError on the statement at index `fail_at`.
+
+    The statements before it are answered from `results` exactly as FakeSession answers them, so
+    the path reaches the failing statement honestly rather than by skipping the checks before it.
+    """
+
+    def __init__(self, fail_at: int, *results: FakeResult):
+        super().__init__(*results)
+        self._fail_at = fail_at
+        self.error = SQLAlchemyError(f'simulated database failure on statement {fail_at}')
+
+    async def execute(self, statement):
+        if len(self.statements) == self._fail_at:
+            self.statements.append(statement)
+            raise self.error
+        return await super().execute(statement)
+
+
+_WRITES = {
+    'upsert_entry': lambda db, entry_id: crud.upsert_entry(db, create_request()),
+    'update_entry': lambda db, entry_id: crud.update_entry(db, update_request(entry_id, end=APRIL)),
+    'update_entry_lifecycle': lambda db, entry_id: crud.update_entry_lifecycle(db, entry_id, OWNER),
+    'delete_entry_by_id': lambda db, entry_id: crud.delete_entry_by_id(db, entry_id, OWNER),
+}
+
+# The operation each write names to write_transaction, which its ERROR record leads with
+# (tj-76u8ip build step 2).
+_OPERATIONS = {
+    'upsert_entry': 'create or update entry',
+    'update_entry': 'update entry',
+    'update_entry_lifecycle': 'update entry lifecycle',
+    'delete_entry_by_id': 'delete entry {entry_id}',
+}
+
+_TRANSACTION_LOGGER = 'data.store.app.database.transaction'
+
+
+def _owned(entry_id: UUID) -> FakeResult:
+    """The lookup's answer: the entry exists, is owned by OWNER, and ends in March so April is growth."""
+    return FakeResult([(stored_entry(entry_id, end=MARCH),)])
+
+
+# (write, the statement that fails) -> the answers to every statement BEFORE it. The failing
+# statement's index is the length of that list, so the table cannot disagree with itself.
+_DATABASE_ERROR_CASES = {
+    ('upsert_entry', 'overlap select'): lambda entry_id: [],
+    ('upsert_entry', 'insert'): lambda entry_id: [FakeResult([])],
+    ('update_entry', 'lookup'): lambda entry_id: [],
+    ('update_entry', 'collision select'): lambda entry_id: [_owned(entry_id)],
+    ('update_entry', 'update'): lambda entry_id: [_owned(entry_id), FakeResult([])],
+    ('update_entry_lifecycle', 'lookup'): lambda entry_id: [],
+    ('update_entry_lifecycle', 'update'): lambda entry_id: [_owned(entry_id)],
+    ('delete_entry_by_id', 'lookup'): lambda entry_id: [],
+    ('delete_entry_by_id', 'delete'): lambda entry_id: [_owned(entry_id)],
+}
+
+
+# write -> the answers to every statement its successful path issues. Used by the success case AND
+# the failing-commit case: a commit only fails after every statement has succeeded.
+_SUCCESS_ANSWERS = {
+    'upsert_entry': lambda entry_id: [FakeResult([]), FakeResult([(entry_id,)])],
+    'update_entry': lambda entry_id: [_owned(entry_id), FakeResult([]), FakeResult([])],
+    'update_entry_lifecycle': lambda entry_id: [_owned(entry_id), FakeResult([])],
+    'delete_entry_by_id': lambda entry_id: [_owned(entry_id), FakeResult([], rowcount=1)],
+}
+
+
+class CommitFailingSession(FakeSession):
+    """A FakeSession whose every statement succeeds and whose commit raises a SQLAlchemyError.
+
+    commits stays 0, because no commit succeeded; commit_attempts is what shows the commit was
+    reached, so a case cannot pass by failing earlier than the commit it targets.
+    """
+
+    def __init__(self, *results: FakeResult):
+        super().__init__(*results)
+        self.commit_attempts = 0
+        self.error = SQLAlchemyError('simulated database failure on commit')
+
+    async def commit(self) -> None:
+        self.commit_attempts += 1
+        raise self.error
+
+
+def _error_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [record for record in caplog.records if record.levelno >= logging.ERROR]
+
+
+def test_every_write_has_a_database_error_case_and_every_id_addressed_one_a_lookup_case():
+    """The tables above are the coverage claim, so they are checked rather than trusted.
+
+    Every write appears in the statement-error table, every id-addressed write has a `lookup` case
+    -- the path 39b9d19 moved inside the try -- and every write has a success/failing-commit case
+    (tj-76u8ip MUST PIN 1). A fifth write added to _WRITES without cases fails here.
+    """
+    covered = {write for write, _ in _DATABASE_ERROR_CASES}
+    assert covered == set(_WRITES)
+    for write in set(_WRITES) - {'upsert_entry'}:
+        assert (write, 'lookup') in _DATABASE_ERROR_CASES, f'{write} has no lookup-error case'
+    assert set(_SUCCESS_ANSWERS) == set(_WRITES), 'a write has no success / failing-commit case'
+    assert set(_OPERATIONS) == set(_WRITES), 'a write has no expected operation name'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('case', list(_DATABASE_ERROR_CASES), ids=[f'{w}: {s}' for w, s in _DATABASE_ERROR_CASES])
+async def test_a_database_error_rolls_back_once_and_leaves_as_the_original_error(case: tuple[str, str]):
+    """One rollback, no commit, and the raised object IS the session's SQLAlchemyError.
+
+    SUPERSEDED DESIGN, kept so the change of assertion is traceable (tj-8fxxfb (iii)): until
+    d43582f this test was test_a_database_error_rolls_back_once_and_leaves_as_runtime_error. Each
+    write then caught SQLAlchemyError itself and raised RuntimeError with a per-function message
+    prefix, and the test asserted that type, the prefix, the original's text in the message and
+    the original on __context__ -- pytest.raises(RuntimeError) was the "not raw" assertion. The
+    user rejected that catch/rethrow forwarding (tj-76u8ip ruling, 2026-09-28), and tj-vhboky.41
+    Addendum 1 (D1 interim) now requires the opposite: write_transaction rolls back, logs, and
+    re-raises the ORIGINAL error unchanged, with no wrapper type until tj-fa1rpu is ruled. So the
+    assertion is identity, not type: a wrapper of any type, or a copy, fails here. The (0, 1)
+    commit/rollback check is unchanged by that ruling.
+
+    Args:
+        case: (the write, the statement whose execute raises), and the case id a red is reported under.
+    """
+    write, _ = case
+    entry_id = uuid4()
+    answers = _DATABASE_ERROR_CASES[case](entry_id)
+    db = ErroringSession(len(answers), *answers)
+
+    with pytest.raises(SQLAlchemyError) as raised:
+        await _WRITES[write](db, entry_id)
+
+    assert len(db.statements) == len(answers) + 1, 'the error was not raised by the statement this case targets'
+    assert (db.commits, db.rollbacks) == (0, 1), f'{case} did not roll back exactly once without committing'
+    assert raised.value is db.error, f'{case} did not leave as the original error: {raised.value!r}'
+    assert raised.value.__cause__ is None, f'{case} gained a chained cause: {raised.value.__cause__!r}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('write', list(_SUCCESS_ANSWERS), ids=list(_SUCCESS_ANSWERS))
+async def test_a_successful_write_commits_once_and_never_rolls_back(write: str):
+    """F2 of the tj-ck5spw gate: an unconditional rollback would pass every error-path assertion.
+
+    Every error path above asserts rollbacks == 1, which a write that ALWAYS rolled back satisfies
+    too, and the happy-path tests elsewhere in this file assert commits alone. On a real session a
+    rollback before the commit discards the write, so (1, 0) is the only correct success.
+
+    Args:
+        write: Which write is called, and the case id a red is reported under.
+    """
+    entry_id = uuid4()
+    db = FakeSession(*_SUCCESS_ANSWERS[write](entry_id))
+
+    await _WRITES[write](db, entry_id)
+
+    assert (db.commits, db.rollbacks) == (1, 0), f'{write} succeeded with commits/rollbacks {db.commits}/{db.rollbacks}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('write', list(_SUCCESS_ANSWERS), ids=list(_SUCCESS_ANSWERS))
+async def test_a_failing_commit_rolls_back_once_and_leaves_as_the_original_error(write: str):
+    """tj-76u8ip MUST PIN 1. Every statement succeeds; the commit itself raises.
+
+    A commit failure has to take the same branch as a statement failure (tj-vhboky.41 S1). A
+    helper that commits outside its try would let this error out with the transaction still open,
+    and no statement-error case above can see that, because none of them reaches the commit.
+
+    Args:
+        write: Which write is called, and the case id a red is reported under.
+    """
+    entry_id = uuid4()
+    db = CommitFailingSession(*_SUCCESS_ANSWERS[write](entry_id))
+
+    with pytest.raises(SQLAlchemyError) as raised:
+        await _WRITES[write](db, entry_id)
+
+    assert db.commit_attempts == 1, f'{write} did not reach its commit exactly once'
+    assert db.rollbacks == 1, f'{write} left a failed commit without rolling back'
+    assert raised.value is db.error, f'{write} did not leave as the original commit error: {raised.value!r}'
+    assert raised.value.__cause__ is None
+
+
+def _database_error_session(case: tuple, entry_id: UUID) -> ErroringSession | CommitFailingSession:
+    if case[1] == 'commit':
+        return CommitFailingSession(*_SUCCESS_ANSWERS[case[0]](entry_id))
+    answers = _DATABASE_ERROR_CASES[case](entry_id)
+    return ErroringSession(len(answers), *answers)
+
+
+_LOGGED_CASES = [*_DATABASE_ERROR_CASES, *((write, 'commit') for write in _SUCCESS_ANSWERS)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('case', _LOGGED_CASES, ids=[f'{w}: {s}' for w, s in _LOGGED_CASES])
+async def test_a_database_error_is_logged_once_through_the_module_logger_and_never_to_stderr(
+    case: tuple[str, str], caplog: pytest.LogCaptureFixture, capfd: pytest.CaptureFixture
+):
+    """tj-76u8ip MUST PIN 2, tj-vhboky.41 S3 revised: logger, not stderr.
+
+    The code this replaced called traceback.print_exc(), which writes straight to stderr and
+    bypasses the logging config. Exactly one ERROR record, from write_transaction's module logger,
+    naming the operation and carrying the original error as its exc_info, so the traceback travels
+    through logging. "Exactly one" also catches a caller that logs the same failure a second time.
+
+    Args:
+        case: (the write, the statement or commit that raises), and the case id a red is reported under.
+        caplog: Captures the log records.
+        capfd: Captures what reaches file descriptor 2.
+    """
+    write, _ = case
+    entry_id = uuid4()
+    db = _database_error_session(case, entry_id)
+    caplog.set_level(logging.DEBUG)
+    capfd.readouterr()
+
+    with pytest.raises(SQLAlchemyError):
+        await _WRITES[write](db, entry_id)
+
+    errors = _error_records(caplog)
+    assert len(errors) == 1, f'{case} logged {len(errors)} ERROR records: {[r.getMessage() for r in errors]}'
+    (record,) = errors
+    assert record.name == _TRANSACTION_LOGGER, f'{case} logged through {record.name}'
+    assert record.exc_info is not None and record.exc_info[1] is db.error, f'{case} logged without the original error'
+    assert record.getMessage().startswith(_OPERATIONS[write].format(entry_id=entry_id)), record.getMessage()
+    assert capfd.readouterr().err == '', f'{case} wrote to stderr'
+
+
+def _rejected_by_own_overlap():
+    return FakeSession(FakeResult([(uuid4(),)])), lambda db, entry_id: crud.upsert_entry(db, create_request())
+
+
+# case id -> (the domain exception, a factory for (session, call) given the entry id)
+_DOMAIN_REJECTIONS = {
+    'upsert_entry: OwnOverlapConflict': (crud.OwnOverlapConflict, lambda entry_id: _rejected_by_own_overlap()),
+    'update_entry: RangeShrink': (
+        crud.RangeShrink,
+        lambda entry_id: (
+            FakeSession(FakeResult([(stored_entry(entry_id, start=JANUARY, end=MARCH),)])),
+            lambda db, entry_id: crud.update_entry(db, update_request(entry_id, start=FEBRUARY, end=MARCH)),
+        ),
+    ),
+    'update_entry: RangeCollision': (
+        crud.RangeCollision,
+        lambda entry_id: (
+            FakeSession(FakeResult([(stored_entry(entry_id, end=MARCH),)]), FakeResult([(uuid4(),)])),
+            lambda db, entry_id: crud.update_entry(db, update_request(entry_id, end=APRIL)),
+        ),
+    ),
+    'delete_entry_by_id: EntryNotFound (race)': (
+        crud.EntryNotFound,
+        lambda entry_id: (
+            FakeSession(FakeResult([(stored_entry(entry_id),)]), FakeResult([], rowcount=0)),
+            _ID_ADDRESSED_WRITES['delete_entry_by_id'],
+        ),
+    ),
+    **{
+        f'{write}: EntryNotFound': (
+            crud.EntryNotFound,
+            lambda entry_id, write=write: (FakeSession(FakeResult([])), _ID_ADDRESSED_WRITES[write]),
+        )
+        for write in _ID_ADDRESSED_WRITES
+    },
+    **{
+        f'{write}: OwnerMismatch': (
+            crud.OwnerMismatch,
+            lambda entry_id, write=write: (
+                FakeSession(FakeResult([(stored_entry(entry_id, owner='someone-else'),)])),
+                _ID_ADDRESSED_WRITES[write],
+            ),
+        )
+        for write in _ID_ADDRESSED_WRITES
+    },
+}
+
+
+def test_every_domain_exception_has_a_rejection_case():
+    """The five domain exceptions tj-vhboky.41 S4 names, each reached by at least one case above."""
+    raised = {exception for exception, _ in _DOMAIN_REJECTIONS.values()}
+    assert raised == {
+        crud.EntryNotFound,
+        crud.OwnerMismatch,
+        crud.OwnOverlapConflict,
+        crud.RangeShrink,
+        crud.RangeCollision,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('case', list(_DOMAIN_REJECTIONS), ids=list(_DOMAIN_REJECTIONS))
+async def test_a_domain_rejection_passes_through_unwrapped_and_is_not_logged_at_error(
+    case: str, caplog: pytest.LogCaptureFixture, capfd: pytest.CaptureFixture
+):
+    """tj-76u8ip MUST PIN 2 (domain half) and 3; tj-vhboky.41 S3 and S4.
+
+    A domain rejection is an expected outcome, not a database failure, so it produces no ERROR
+    record and nothing on stderr. It reaches the caller as exactly its own type with no chained
+    cause -- the routers map these to 409/403/404 by type, so a wrapper would turn every one of
+    them into a 500. The rollback for each is pinned by the tj-ck5spw tests above; it is repeated
+    here only so a case that silently stopped reaching its rejection shows up as a red.
+
+    Args:
+        case: Which write and which rejection, and the case id a red is reported under.
+        caplog: Captures the log records.
+        capfd: Captures what reaches file descriptor 2.
+    """
+    exception, build = _DOMAIN_REJECTIONS[case]
+    entry_id = uuid4()
+    db, call = build(entry_id)
+    caplog.set_level(logging.DEBUG)
+    capfd.readouterr()
+
+    with pytest.raises(exception) as raised:
+        await call(db, entry_id)
+
+    assert type(raised.value) is exception, f'{case} left as {type(raised.value).__name__}'
+    assert raised.value.__cause__ is None, f'{case} gained a chained cause: {raised.value.__cause__!r}'
+    assert (db.commits, db.rollbacks) == (0, 1), f'{case} did not roll back exactly once without committing'
+    assert _error_records(caplog) == [], f'{case} was logged at ERROR: {[r.getMessage() for r in caplog.records]}'
+    assert capfd.readouterr().err == '', f'{case} wrote to stderr'
 
 
 # ---------------------------------------------------------------------------------------------

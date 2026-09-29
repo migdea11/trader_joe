@@ -20,11 +20,13 @@ NOT PROVEN HERE, and it is the half that matters most operationally: that Postgr
 never hand it one.
 """
 
+import logging
 from datetime import UTC, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 from common.enums.data_select import DataType
 from common.enums.data_stock import DataSource, Feed, Granularity
@@ -32,11 +34,14 @@ from data.store.app.database.crud.stock.asset_market_activity import (
     DuplicateBatchTimestamp,
     _as_utc,
     batch_create_market_activity_data,
+    create_market_activity_data,
 )
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
+from data.store.app.database.transaction import write_transaction
 from schemas.data_store.stock.market_activity_data import (
     BatchStockDataMarketActivityCreate,
     StockDataMarketActivity,
+    StockDataMarketActivityCreate,
     StockDataMarketActivityData,
 )
 
@@ -107,15 +112,36 @@ async def test_a_duplicate_timestamp_raises_before_any_sql_is_built(session: Mag
 
 @pytest.mark.asyncio
 async def test_the_rejected_batch_is_rolled_back(session: MagicMock):
-    """The write path's own error handling has to cover the guard, not just database errors.
+    """The write path's error handling has to cover the guard, not just database errors.
 
-    The guard raises inside the try block, so the rollback is reached. Asserted because a future
-    refactor that hoists the guard above the try would silently leave the session dirty.
+    The guard raises inside the write_transaction block (tj-vhboky.43 build item 1), so the
+    helper's rollback is reached. Asserted because a future refactor that hoists the guard above
+    the block -- next to the empty-batch return, which does belong there -- would silently leave
+    the session dirty.
     """
     with pytest.raises(DuplicateBatchTimestamp):
         await batch_create_market_activity_data(session, _batch(TIMESTAMP, TIMESTAMP))
 
     assert session.rollback.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_the_rejected_batch_is_not_logged_as_a_database_failure(
+    session: MagicMock, caplog: pytest.LogCaptureFixture
+):
+    """A domain rejection is an expected outcome, not an ERROR (tj-vhboky.41 S3 revised).
+
+    The deleted `except Exception: log.error(...)` logged this rejection at ERROR alongside every
+    real database failure, so an operator could not tell a malformed batch from a sick database by
+    level. The helper logs only SQLAlchemyError; this pins that the guard's exception stays on the
+    unlogged branch.
+    """
+    caplog.set_level(logging.DEBUG)
+
+    with pytest.raises(DuplicateBatchTimestamp):
+        await batch_create_market_activity_data(session, _batch(TIMESTAMP, TIMESTAMP))
+
+    assert [record for record in caplog.records if record.levelno >= logging.ERROR] == []
 
 
 @pytest.mark.asyncio
@@ -250,6 +276,96 @@ def test_to_schema_reports_the_tape_that_served_the_row(stored_feed: Feed):
     )
 
     assert row.to_schema().feed is stored_feed
+
+
+# ---------------------------------------------------------------------------------------
+# THE SINGLE-BAR WRITE (tj-vhboky.43 build item 2). create_market_activity_data had no rollback at
+# all before cf3ec69, and no test anywhere in the suite called it. It now wraps the add and the
+# commit in write_transaction; the refresh and to_schema run after the block.
+
+LEAKED_SQL = 'INSERT INTO stock_market_activity -- validator-marker-c41e'
+
+
+def _single_bar() -> StockDataMarketActivityCreate:
+    return StockDataMarketActivityCreate(
+        dataset_id=uuid4(),
+        asset_symbol='AAPL',
+        source=DataSource.ALPACA_API,
+        feed=Feed.SIP,
+        granularity=Granularity.ONE_DAY,
+        timestamp=TIMESTAMP,
+        data=_bar(),
+    )
+
+
+@pytest.fixture
+def single_write_session() -> tuple[MagicMock, list[str]]:
+    """A session for the single-bar write: add is synchronous, commit/rollback/refresh are awaited.
+
+    refresh stands in for the database populating the server-side columns, since to_schema needs
+    id and the timestamps and a detached ORM object does not have them until then.
+    """
+    call_order: list[str] = []
+
+    def refresh(row: StockMarketActivity) -> None:
+        call_order.append('refresh')
+        row.id, row.created_at, row.updated_at = 1, TIMESTAMP, TIMESTAMP
+
+    db = MagicMock()
+    db.add = MagicMock(side_effect=lambda row: call_order.append('add'))
+    db.commit = AsyncMock(side_effect=lambda: call_order.append('commit'))
+    db.rollback = AsyncMock(side_effect=lambda: call_order.append('rollback'))
+    db.refresh = AsyncMock(side_effect=refresh)
+    return db, call_order
+
+
+@pytest.mark.asyncio
+async def test_a_single_bar_is_added_committed_then_refreshed(single_write_session: tuple[MagicMock, list[str]]):
+    """The green path's order: the refresh reads back AFTER the commit, outside the block.
+
+    A refresh moved inside the block would run before the commit and read back an uncommitted row;
+    a missing commit would return a schema for a row that never landed. The order says both.
+    """
+    db, call_order = single_write_session
+
+    stored = await create_market_activity_data(db, _single_bar())
+
+    assert call_order == ['add', 'commit', 'refresh']
+    assert isinstance(stored, StockDataMarketActivity)
+    assert stored.timestamp == TIMESTAMP
+
+
+@pytest.mark.asyncio
+async def test_a_failing_commit_on_a_single_bar_rolls_back_once(
+    single_write_session: tuple[MagicMock, list[str]], caplog: pytest.LogCaptureFixture
+):
+    """Pins 4 and 5: the rollback this function never had, and one clean ERROR record.
+
+    Before cf3ec69 a failing commit left the session in a failed transaction and raised; nothing
+    rolled it back. Through the helper: one rollback, no refresh of a row that did not land, the
+    same error object out, and exactly one ERROR record from the helper's logger whose message
+    does not carry the error's text.
+    """
+    caplog.set_level(logging.DEBUG)
+    db, call_order = single_write_session
+    error = OperationalError(LEAKED_SQL, {'owner': 'validator-marker-owner'}, Exception('connection reset'))
+
+    def fail_the_commit():
+        call_order.append('commit')
+        raise error
+
+    db.commit.side_effect = fail_the_commit
+
+    with pytest.raises(OperationalError) as raised:
+        await create_market_activity_data(db, _single_bar())
+
+    assert raised.value is error, 'the commit error was replaced on its way out'
+    assert call_order == ['add', 'commit', 'rollback'], 'the failed single-bar write was not rolled back exactly once'
+    (record,) = [record for record in caplog.records if record.levelno >= logging.ERROR]
+    assert record.name == write_transaction.__module__
+    assert record.exc_info is not None and record.exc_info[1] is error
+    for any_record in caplog.records:
+        assert LEAKED_SQL not in any_record.getMessage()
 
 
 def test_model_validate_on_a_stored_row_still_raises():
