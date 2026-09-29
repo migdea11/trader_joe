@@ -2615,19 +2615,23 @@ def _run_lines(run: str) -> list[str]:
     return [line.strip() for line in folded.splitlines() if line.strip() and not line.strip().startswith('#')]
 
 
-def _runs_bandit(words: list[str]) -> bool:
-    return any(PurePosixPath(word).name == 'bandit' for word in words)
+def _runs(scanner: str, words: list[str]) -> bool:
+    return any(PurePosixPath(word).name == scanner for word in words)
 
 
-def _makefile_bandit_invocation() -> list[str]:
-    """The security target's bandit command as argv, with every $(VAR) expanded from the Makefile."""
-    lines = [line for line in _make_recipe('security') if _runs_bandit(shlex.split(line))]
-    assert len(lines) == 1, f'expected one bandit line in the security target, found {lines}'
+def _makefile_scanner_invocation(scanner: str) -> list[str]:
+    """The security target's `scanner` command as argv, with every $(VAR) expanded from the Makefile.
+
+    Fails closed: a renamed or emptied target raises in _make_recipe, and a recipe with no line (or
+    more than one line) running `scanner` raises here, so parity is never judged on an empty argv.
+    """
+    lines = [line for line in _make_recipe('security') if _runs(scanner, shlex.split(line))]
+    assert len(lines) == 1, f'expected one {scanner} line in the security target, found {lines}'
     return shlex.split(_MAKE_REFERENCE.sub(lambda match: _make_variable(match.group(1)), lines[0]))
 
 
-def _workflow_bandit_invocations() -> dict[str, list[str]]:
-    """Every bandit command in every workflow, as argv with ${{ env.X }} expanded, keyed by where it is."""
+def _workflow_scanner_invocations(scanner: str) -> dict[str, list[str]]:
+    """Every `scanner` command in every workflow, as argv with ${{ env.X }} expanded, keyed by where it is."""
     found = {}
     for path in _workflow_files():
         document = _load_yaml(path) or {}
@@ -2637,9 +2641,17 @@ def _workflow_bandit_invocations() -> dict[str, list[str]]:
                 for line in _run_lines(step.get('run') or ''):
                     expanded = _WORKFLOW_ENV_REFERENCE.sub(lambda match, env=env: str(env[match.group(1)]), line)
                     words = shlex.split(expanded)
-                    if _runs_bandit(words):
+                    if _runs(scanner, words):
                         found[f'{path.name} {job_id} step {index} ({step.get("name")})'] = words
     return found
+
+
+def _makefile_bandit_invocation() -> list[str]:
+    return _makefile_scanner_invocation('bandit')
+
+
+def _workflow_bandit_invocations() -> dict[str, list[str]]:
+    return _workflow_scanner_invocations('bandit')
 
 
 def _bandit_arguments(invocation: list[str]) -> tuple[list[str], list[str]]:
@@ -2821,6 +2833,79 @@ def test_the_bandit_tripwire_fires_on_a_different_locked_version(tmp_path: Path)
     drift = _bandit_model_drift(bumped)
     assert drift is not None, 'a lock with bandit 999.0.0 passed the tripwire'
     assert '999.0.0' in drift and MODELLED_BANDIT_VERSION in drift, drift
+
+
+# ---------------------------------------------------------------------------------------
+# SEMGREP'S GATE (tj-vhboky.18, tj-1mtrlh.2, tj-cg2i9p)
+#
+# Without --error semgrep exits 0 whatever it finds, so the CI step and `make security` only proved
+# that semgrep ran; 23 blocking findings sat under a green tick (tj-cg2i9p). Two properties keep the
+# gate real, and each catches what the other cannot:
+#   - parity: CI runs exactly the Makefile's semgrep argv, so neither side can narrow its scan (an
+#     extra --exclude) or drop the gate flag alone. Parity passes when BOTH sides drop --error.
+#   - the gate flag: the Makefile's (and so, with parity, CI's) invocation carries --error. It
+#     passes when one side adds an --exclude the other lacks.
+# The flag list is not pinned as a literal (tj-1mtrlh.2 item 4): the sources must agree, and the
+# one flag whose absence makes the gate vacuous must be present.
+SEMGREP = 'semgrep'
+SEMGREP_GATE_FLAG = '--error'
+
+
+def _makefile_semgrep_invocation() -> list[str]:
+    return _makefile_scanner_invocation(SEMGREP)
+
+
+def _workflow_semgrep_invocations() -> dict[str, list[str]]:
+    """Every workflow semgrep command; fails closed when no workflow step runs semgrep at all."""
+    found = _workflow_scanner_invocations(SEMGREP)
+    assert found, 'no workflow step runs semgrep, so CI scans nothing and a Makefile parity check would be vacuous'
+    return found
+
+
+def _semgrep_arguments(invocation: list[str]) -> list[str]:
+    return invocation[next(i for i, word in enumerate(invocation) if PurePosixPath(word).name == SEMGREP) + 1 :]
+
+
+def _carries_gate_flag(invocation: list[str]) -> bool:
+    return any(
+        word == SEMGREP_GATE_FLAG or word.startswith(f'{SEMGREP_GATE_FLAG}=') for word in _semgrep_arguments(invocation)
+    )
+
+
+@pytest.mark.build_infra
+def test_the_ci_semgrep_invocation_is_the_makefiles():
+    """tj-1mtrlh.2 item 2: CI's semgrep command equals `make security`'s, flags and target both.
+
+    Compared as argv, mirroring the bandit parity test, so a quoting-only difference is not a
+    failure and a flag, exclude or target changed on one side is.
+    """
+    expected = _makefile_semgrep_invocation()
+    invocations = _workflow_semgrep_invocations()
+    drifted = {where: words for where, words in invocations.items() if words != expected}
+    assert not drifted, (
+        f'the workflow runs semgrep differently from the Makefile security target ({shlex.join(expected)}): '
+        f'{ {where: shlex.join(words) for where, words in drifted.items()} }. Change both or neither.'
+    )
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize('source', ['Makefile', 'workflow'])
+def test_semgrep_fails_on_findings(source: str):
+    """tj-vhboky.18: every semgrep invocation carries --error, so a finding exits non-zero.
+
+    Without it semgrep exits 0 on any number of findings and the gate is green by construction
+    (tj-cg2i9p). The parity test cannot see this when both sides drop the flag together.
+    """
+    invocations = (
+        {'Makefile security target': _makefile_semgrep_invocation()}
+        if source == 'Makefile'
+        else _workflow_semgrep_invocations()
+    )
+    ungated = {where: shlex.join(words) for where, words in invocations.items() if not _carries_gate_flag(words)}
+    assert not ungated, (
+        f'semgrep runs without {SEMGREP_GATE_FLAG}, so it exits 0 whatever it finds: {ungated}. '
+        f'Put {SEMGREP_GATE_FLAG} back on both the Makefile and the workflow line.'
+    )
 
 
 # ---------------------------------------------------------------------------------------
