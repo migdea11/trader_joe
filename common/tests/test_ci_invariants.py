@@ -17,6 +17,7 @@ import fnmatch
 import importlib
 import ipaddress
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -4149,3 +4150,346 @@ def test_only_container_jobs_that_run_the_suite_are_judged(tmp_path: Path, monke
     (tmp_path / 'ci.yml').write_text(yaml.safe_dump(workflow), encoding='utf-8')
     monkeypatch.setattr(sys.modules[__name__], 'WORKFLOW_DIR', tmp_path)
     assert [label for label, _ in _container_test_jobs()] == ['ci.yml:container-tests']
+
+
+# ---------------------------------------------------------------------------------------
+# THE BUILD CONTEXT (tj-ijpys9.17)
+#
+# Every host bind-mount data directory compose declares must stay out of the Docker build context.
+# The Postgres directory is mode 0700 and owned by the container's uid, so a build started while a
+# stack is up -- make test-system's --build in CI, after Start System -- fails sending the context
+# with "permission denied". The other half: nothing the Dockerfile COPYs may be excluded, or the
+# image builds without its source and fails only at runtime.
+#
+# The data directories are derived from the compose YAML, not listed: a mount is data when its host
+# side starts with ${DATA_DIR...}, or with the literal fallback such an interpolation names. Each
+# one is resolved against BOTH the DATA_DIR in .env.default and the compose fallback, because either
+# can be in force: .env.default is what every environment copies, and the fallback is what compose
+# uses when DATA_DIR is unset.
+#
+# .dockerignore is matched with a faithful subset of Docker's own semantics (moby patternmatcher):
+# patterns are path-cleaned and anchored at the context root, so `volumes/` and `/volumes` both mean
+# the top-level volumes; `*` and `?` stay within one path segment; `**` spans any number of them; a
+# pattern that matches a parent directory excludes everything under it; `!` re-includes; the last
+# matching pattern wins. Not implemented, because no line here uses them: escape sequences and
+# Windows separators. A green run means the files agree; it does not start a daemon.
+DOCKERIGNORE_FILE = REPO_ROOT / '.dockerignore'
+DOCKERFILE = REPO_ROOT / 'Dockerfile'
+DATA_DIR_VARIABLE = 'DATA_DIR'
+# A representative file inside a data directory, for the "is its content sent?" half of the check.
+DATA_DIR_SAMPLE_FILE = 'PG_VERSION'
+# What the Dockerfile COPYs today. A floor for the parse below, so a parser regression that finds
+# nothing cannot pass the "no COPY source is excluded" check vacuously.
+KNOWN_COPY_SOURCES = frozenset({'common', 'routers', 'schemas', 'data/store/app', 'data/ingest/app'})
+
+# ${DATA_DIR}, ${DATA_DIR:-default}, ${DATA_DIR-default} or $DATA_DIR, then the rest of the path.
+_DATA_DIR_INTERPOLATION = re.compile(
+    rf'^(?:\$\{{{DATA_DIR_VARIABLE}(?::?-(?P<default>[^}}]*))?\}}|\${DATA_DIR_VARIABLE}(?!\w))(?P<rest>.*)$'
+)
+
+_IgnoreRules = list[tuple[bool, re.Pattern]]
+
+
+def _dockerignore_pattern_regex(pattern: str) -> re.Pattern:
+    """Compile one cleaned .dockerignore pattern the way moby's patternmatcher does."""
+    out = ''
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if pattern.startswith('**/', index):
+            # `**/` matches zero or more whole directories.
+            out += '(?:.*/)?'
+            index += 3
+            continue
+        if pattern.startswith('**', index):
+            out += '.*'
+            index += 2
+            continue
+        if char == '*':
+            out += '[^/]*'
+        elif char == '?':
+            out += '[^/]'
+        elif char == '[' and pattern.find(']', index + 1) != -1:
+            close = pattern.find(']', index + 1)
+            body = pattern[index + 1 : close]
+            out += '[' + ('^' + body[1:] if body.startswith(('!', '^')) else body) + ']'
+            index = close
+        else:
+            out += re.escape(char)
+        index += 1
+    return re.compile(f'^{out}$')
+
+
+def _dockerignore_rules(text: str) -> _IgnoreRules:
+    """Return (is_exception, compiled pattern) for each rule of a .dockerignore, in file order."""
+    rules = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        exception = stripped.startswith('!')
+        if exception:
+            stripped = stripped[1:].strip()
+        cleaned = posixpath.normpath(stripped).lstrip('/')
+        if cleaned in ('', '.'):
+            continue
+        rules.append((exception, _dockerignore_pattern_regex(cleaned)))
+    return rules
+
+
+def _committed_dockerignore_rules() -> _IgnoreRules:
+    return _dockerignore_rules(DOCKERIGNORE_FILE.read_text(encoding='utf-8'))
+
+
+def _is_excluded_from_context(path: str, rules: _IgnoreRules) -> bool:
+    """Is `path`, relative to the context root, left out of the build context?
+
+    moby's MatchesOrParentMatches: a rule matches a path when it matches the path itself or any of
+    its parent directories, and the last matching rule decides.
+    """
+    parts = PurePosixPath(path).parts
+    candidates = ['/'.join(parts[: depth + 1]) for depth in range(len(parts))]
+    excluded = False
+    for exception, compiled in rules:
+        if any(compiled.match(candidate) for candidate in candidates):
+            excluded = not exception
+    return excluded
+
+
+def _context_relative(host_path: str, base: Path) -> str | None:
+    """Return `host_path` relative to the build context (the repo root), or None when outside it."""
+    resolved = Path(os.path.normpath(base / host_path))
+    try:
+        relative = resolved.relative_to(REPO_ROOT).as_posix()
+    except ValueError:
+        return None
+    return None if relative in ('', '.') else relative
+
+
+def _every_compose_file() -> list[Path]:
+    """Every compose file in the repository, globbed so a new one is covered without an edit here."""
+    files = sorted(REPO_ROOT.glob('docker-compose*.yaml')) + sorted(REPO_ROOT.glob('docker-compose*.yml'))
+    return files + sorted((REPO_ROOT / '.devcontainer').glob('compose*.y*ml'))
+
+
+def _compose_services() -> Iterator[tuple[Path, str, dict]]:
+    for path in _every_compose_file():
+        for name, service in (_load_yaml(path).get('services') or {}).items():
+            yield path, name, service or {}
+
+
+def _short_volume_source(entry: str) -> str:
+    """The host side of a short-form volume, `source:target[:mode]`.
+
+    Split on the first colon outside a ${...} interpolation: in `${DATA_DIR:-./volume_data}/x:/y`
+    the first colon belongs to the fallback, and a plain split(':') reads the source as `${DATA_DIR`.
+    """
+    depth = 0
+    for index, char in enumerate(entry):
+        if entry.startswith('${', index):
+            depth += 1
+        elif char == '}' and depth:
+            depth -= 1
+        elif char == ':' and not depth:
+            return entry[:index]
+    return entry
+
+
+def _bind_sources(service: dict) -> list[str]:
+    """The host side of each of a service's volume entries, short or long form."""
+    sources = []
+    for entry in service.get('volumes') or []:
+        if isinstance(entry, str):
+            sources.append(_short_volume_source(entry))
+        elif isinstance(entry, dict) and entry.get('type', 'bind') == 'bind' and entry.get('source'):
+            sources.append(str(entry['source']))
+    return sources
+
+
+def _compose_data_dir_defaults() -> set[str]:
+    """Every literal fallback a compose file gives DATA_DIR, e.g. ./volume_data."""
+    defaults = set()
+    for _, _, service in _compose_services():
+        for source in _bind_sources(service):
+            match = _DATA_DIR_INTERPOLATION.match(source)
+            if match and match.group('default'):
+                defaults.add(match.group('default'))
+    return defaults
+
+
+def _under_literal_default(source: str, defaults: set[str]) -> bool:
+    normalized = posixpath.normpath(source)
+    return any(
+        normalized == posixpath.normpath(default) or normalized.startswith(posixpath.normpath(default) + '/')
+        for default in defaults
+    )
+
+
+def _compose_data_mounts() -> list[tuple[str, str, list[str]]]:
+    """Return (label, host source, [context-relative resolutions]) for every data mount.
+
+    A resolution outside the repository is dropped: it is not in the build context, so it cannot be
+    sent. An empty list therefore means "never in the context", which is a pass.
+    """
+    env_data_dir = _env_file_values(ENV_DEFAULT_FILE).get(DATA_DIR_VARIABLE)
+    assert env_data_dir, f'{ENV_DEFAULT_FILE.name} sets no {DATA_DIR_VARIABLE}; nothing to resolve against'
+    compose_defaults = _compose_data_dir_defaults()
+
+    mounts = []
+    for path, name, service in _compose_services():
+        for source in _bind_sources(service):
+            match = _DATA_DIR_INTERPOLATION.match(source)
+            if match:
+                own_default = match.group('default')
+                bases = {env_data_dir} | ({own_default} if own_default else compose_defaults)
+                host_paths = {f'{base}/{match.group("rest")}' for base in bases}
+            elif _under_literal_default(source, compose_defaults):
+                host_paths = {source}
+            else:
+                continue
+            resolutions = {_context_relative(host, path.parent) for host in host_paths} - {None}
+            mounts.append((f'{path.relative_to(REPO_ROOT)}:{name}', source, sorted(resolutions)))
+    return mounts
+
+
+def _data_mounts_in_context(rules: _IgnoreRules) -> list[str]:
+    """Name every data-mount resolution whose directory, or a file inside it, would be sent."""
+    offenders = []
+    for label, source, resolutions in _compose_data_mounts():
+        for relative in resolutions:
+            for probe in (relative, f'{relative}/{DATA_DIR_SAMPLE_FILE}'):
+                if not _is_excluded_from_context(probe, rules):
+                    offenders.append(f'{label} mounts {source}; {probe} is in the build context')
+    return offenders
+
+
+def _compose_build_args() -> list[dict[str, str]]:
+    """The build args of every compose service that declares any."""
+    return [
+        {str(key): str(value) for key, value in service['build']['args'].items()}
+        for _, _, service in _compose_services()
+        if isinstance(service.get('build'), dict) and isinstance(service['build'].get('args'), dict)
+    ]
+
+
+def _dockerfile_copy_sources() -> set[str]:
+    """Every context path a COPY or ADD in the Dockerfile reads, build args expanded from compose.
+
+    A COPY --from reads another stage or image, not the context, and is skipped. A source naming a
+    build arg is expanded once per compose service's args, and dropped when no service's args
+    expand it -- the KNOWN_COPY_SOURCES floor is what notices a source lost that way.
+    """
+    text = DOCKERFILE.read_text(encoding='utf-8').replace('\\\n', ' ')
+    raw = []
+    for line in text.splitlines():
+        if line.strip().split(maxsplit=1)[:1] not in (['COPY'], ['ADD']):
+            continue
+        words = shlex.split(line, comments=True)
+        if any(word.startswith('--from') for word in words[1:]):
+            continue
+        operands = [word for word in words[1:] if not word.startswith('--')]
+        raw.extend(operands[:-1])
+
+    sources = set()
+    for source in raw:
+        if '$' not in source:
+            sources.add(posixpath.normpath(source))
+            continue
+        for args in _compose_build_args():
+            expanded = re.sub(r'\$\{(\w+)\}|\$(\w+)', lambda m, a=args: a.get(m[1] or m[2], m[0]), source)
+            if '$' not in expanded:
+                sources.add(posixpath.normpath(expanded))
+    return sources
+
+
+def _copy_sources_excluded(rules: _IgnoreRules) -> list[str]:
+    """Name every COPY source, or git-tracked file under one, that the build context would leave out."""
+    offenders = []
+    for source in sorted(_dockerfile_copy_sources()):
+        if _is_excluded_from_context(source, rules):
+            offenders.append(f'COPY source {source} itself')
+        offenders.extend(
+            f'{tracked} (under COPY source {source})'
+            for tracked in _run('git', 'ls-files', '--', source)
+            if _is_excluded_from_context(tracked, rules)
+        )
+    return offenders
+
+
+# Docker's own semantics, pinned so the matcher the checks below rely on cannot drift into something
+# laxer. Each row: (.dockerignore text, path relative to the context, excluded?).
+_DOCKERIGNORE_CASES = {
+    'dir-rule-excludes-the-dir': ('volumes/', 'volumes', True),
+    'dir-rule-excludes-a-descendant': ('volumes/', 'volumes/trader_joe/postgres/PG_VERSION', True),
+    'anchored-at-the-root': ('volumes/', 'data/volumes/x', False),
+    'leading-slash-is-the-root': ('/volumes', 'volumes/x', True),
+    'star-stays-in-one-segment': ('*/postgres', 'volumes/trader_joe/postgres', False),
+    'star-matches-one-segment': ('volumes/*/postgres', 'volumes/trader_joe/postgres', True),
+    'double-star-any-depth': ('**/postgres', 'volumes/trader_joe/postgres/base', True),
+    'double-star-zero-depth': ('**/postgres', 'postgres', True),
+    'a-prefix-is-not-a-match': ('volume', 'volume_data/x', False),
+    'question-mark-is-one-char': ('volume?data', 'volume_data', True),
+    'character-class': ('**/*.py[cod]', 'common/x.pyc', True),
+    'negation-re-includes': ('volumes/\n!volumes/keep', 'volumes/keep', False),
+    'last-match-wins': ('!volumes/keep\nvolumes/', 'volumes/keep', True),
+    'comment-is-not-a-rule': ('# volumes/', 'volumes', False),
+}
+
+# The short-volume split, including the fallback colon that a plain split(':') gets wrong.
+_SHORT_VOLUME_CASES = {
+    'fallback-colon-kept': (
+        '${DATA_DIR:-./volume_data}/postgres:/var/lib/postgresql/data',
+        '${DATA_DIR:-./volume_data}/postgres',
+    ),
+    'plain-with-mode': ('./common:/code/common:ro', './common'),
+    'bare-variable': ('${DATA_DIR}/kafka:/var/lib/kafka/', '${DATA_DIR}/kafka'),
+    'named-volume-only': ('pgdata', 'pgdata'),
+}
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(('entry', 'source'), list(_SHORT_VOLUME_CASES.values()), ids=list(_SHORT_VOLUME_CASES))
+def test_short_volume_source_splits_outside_interpolation(entry: str, source: str):
+    assert _short_volume_source(entry) == source
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    ('text', 'path', 'excluded'), list(_DOCKERIGNORE_CASES.values()), ids=list(_DOCKERIGNORE_CASES)
+)
+def test_dockerignore_matcher_follows_docker_semantics(text: str, path: str, excluded: bool):
+    """The emulation the build-context checks rely on agrees with Docker on each rule shape."""
+    assert _is_excluded_from_context(path, _dockerignore_rules(text)) is excluded
+
+
+@pytest.mark.build_infra
+def test_compose_declares_data_mounts_under_data_dir():
+    """Non-vacuity: the derivation finds data mounts, the database's among them, and a fallback."""
+    labels = {label for label, _, _ in _compose_data_mounts()}
+    assert 'docker-compose.yaml:postgres' in labels, (
+        f'no DATA_DIR bind mount found for postgres in docker-compose.yaml (found {sorted(labels)}), '
+        f'so the build-context check would judge nothing'
+    )
+    assert _compose_data_dir_defaults(), 'no compose file gives DATA_DIR a fallback; nothing to resolve against'
+
+
+@pytest.mark.build_infra
+def test_dockerignore_excludes_every_compose_data_mount():
+    """Every host data directory, under either DATA_DIR resolution, stays out of the build context."""
+    offenders = _data_mounts_in_context(_committed_dockerignore_rules())
+    assert not offenders, (
+        f'{DOCKERIGNORE_FILE.name} lets host data into the build context, and a build started while a '
+        f'stack is up fails with "permission denied" on the 0700 database directory: {offenders}. '
+        f'Add the directory to {DOCKERIGNORE_FILE.name}.'
+    )
+
+
+@pytest.mark.build_infra
+def test_dockerignore_excludes_no_dockerfile_copy_source():
+    """What the Dockerfile COPYs from the context is sent, all of it."""
+    sources = _dockerfile_copy_sources()
+    assert sources >= KNOWN_COPY_SOURCES, f'the COPY parse found {sorted(sources)}; it lost a source it used to find'
+    missing = sorted(source for source in sources if not (REPO_ROOT / source).exists())
+    assert not missing, f'COPY sources that do not exist in the checkout: {missing}'
+    offenders = _copy_sources_excluded(_committed_dockerignore_rules())
+    assert not offenders, f'{DOCKERIGNORE_FILE.name} keeps what the image COPYs out of the build context: {offenders}'
