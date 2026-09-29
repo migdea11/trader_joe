@@ -35,11 +35,20 @@ bar together with its enum type, split_factor and dividends_factor are re-added 
 nothing to put in them), the bar's old four-column constraint and its three dropped indexes come
 back; on the entry, owner and expiry are dropped, expiry_type and update_type return to NULLABLE
 with no default, and the old six-column constraint is recreated -- and NOTHING ELSE. It does not,
-and cannot, restore any VALUE: feed, owner and expiry come back NULL (or absent) for every row
-written under this revision, and any bar written under the new natural key is gone the moment the
-old four-column constraint would collide with it. This is a one-way door in substance even though
-the SQL runs in both directions: which tape a bar came from and which principal a dataset belongs
-to were never durable anywhere else once this revision has run.
+and cannot, restore any VALUE: feed, owner and expiry come back NULL (or absent), but every bar
+and entry row this revision ever wrote stays, with its id unchanged -- downgrade() issues no
+DELETE anywhere. If two dataset_ids' bars collide on the old four-column key, or two owners'
+entries collide on the old six-column key -- both ROUTINE under the per-dataset model -- the
+corresponding op.create_unique_constraint call below FAILS on the duplicate instead of silently
+dropping the loser: "the constraint will be checked immediately, so the table data must satisfy
+the constraint before it can be added" (PostgreSQL, "Adding a Constraint",
+https://www.postgresql.org/docs/current/ddl-alter.html). Nothing is deleted -- the downgrade
+refuses and the whole invocation rolls back to the schema and rows it started from, because
+env.py wraps the entire run in a single context.begin_transaction() (see its
+run_migrations_online/run_migrations_offline), not one transaction per migration. This is a
+one-way door in substance even though the SQL runs in both directions, collisions aside: which
+tape a bar came from and which principal a dataset belongs to were never durable anywhere else
+once this revision has run.
 
 ONE MORE DOWNGRADE HAZARD, NOT COVERED ABOVE (tj-uxl817): if 8f41c2d7a3b9's archive table
 (stock_market_activity_superseded_8f41c2d7a3b9) still holds rows, downgrading this revision and

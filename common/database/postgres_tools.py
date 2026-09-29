@@ -182,7 +182,10 @@ class PostgresSessionFactory:
                 yield session
 
     class SyncSession:
-        """Creates handle to create and manage Postgres database async sessions."""
+        """Creates and manages a sync Postgres engine and a plain sessionmaker.
+
+        Exposed only through session() (ADR tj-8z213c).
+        """
 
         _sync_engines: ClassVar[dict[int, Engine]] = {}
         _sync_session_makers: ClassVar[dict[int, sessionmaker[Session]]] = {}
