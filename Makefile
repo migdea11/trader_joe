@@ -1,10 +1,11 @@
 # Define default shell
 SHELL := /bin/bash
 
-# Every target except $(VENV_MARKER) is a command, not a file, and is declared .PHONY next to
-# its own recipe so a new target is hard to add without one. Undeclared, a file or directory of
-# the same name -- a test/ or build/ at the repo root -- makes the target "up to date": make
-# runs nothing and exits 0, so `make test` would report success having run no test (tj-06uflo).
+# Every target except $(VENV_MARKER) and $(VENV_PYTHON) is a command, not a file, and is declared
+# .PHONY next to its own recipe so a new target is hard to add without one. Undeclared, a file or
+# directory of the same name -- a test/ or build/ at the repo root -- makes the target "up to
+# date": make runs nothing and exits 0, so `make test` would report success having run no test
+# (tj-06uflo).
 .PHONY: help
 help:  ## Show this help message
 	@echo "Available make commands:"
@@ -55,14 +56,35 @@ else \
 fi
 endef
 
-VENV_MARKER := .venv_init
-# The marker depends on the dependency declarations so the sync re-runs when they change,
+# THE ENVIRONMENT AND ITS MARKER (tj-3t2axg). VENV_DIR is the environment uv itself uses:
+# UV_PROJECT_ENVIRONMENT when set, else uv's own default, .venv. The devcontainer sets it to a
+# container-only directory, because /workspace is the host's checkout bind-mounted in: sharing one
+# .venv, each side's uv rewrote bin/python to an interpreter only it has, and the other side's
+# next `uv run` silently recreated the venv with default-groups only (no sqlalchemy, no asyncpg)
+# while the marker still said "synced". Relative, uv resolves it against the project root, so
+# every worktree still gets its own.
+VENV_DIR := $(or $(UV_PROJECT_ENVIRONMENT),.venv)
+VENV_PYTHON := $(VENV_DIR)/bin/python
+# The marker lives INSIDE the environment it vouches for, so whenever uv deletes and recreates that
+# environment -- which is what it does to one whose interpreter is gone -- the marker goes with it
+# and the next target re-syncs in full, instead of trusting a marker left beside a different venv.
+VENV_MARKER := $(VENV_DIR)/.trader_joe_synced
+
+# A missing or dangling interpreter forces the full sync below. make stats through the symlink, so
+# a bin/python pointing at an interpreter that does not exist here counts as missing, runs this
+# rule, and leaves the marker out of date. Checked before any uv command runs, which is the point:
+# the first `uv run` would otherwise rebuild the venv itself, with default-groups only.
+$(VENV_PYTHON):
+	@echo "No working interpreter at $@: syncing $(VENV_DIR) in full."
+	@rm -f $(VENV_MARKER)
+
+# The marker also depends on the dependency declarations so the sync re-runs when they change,
 # instead of going stale behind a marker file that already exists.
-$(VENV_MARKER): pyproject.toml uv.lock  ## Internal option to install uv and sync the virtual environment
+$(VENV_MARKER): pyproject.toml uv.lock $(VENV_PYTHON)  ## Internal option to install uv and sync the virtual environment
 	$(UV_PIN_CHECK)
-	@if [ ! -d .venv ]; then \
+	@if [ ! -d $(VENV_DIR) ]; then \
 		echo "Creating uv venv"; \
-		uv venv; \
+		uv venv $(VENV_DIR); \
 	fi
 # Sync here, not only in `init`, so every target below gets a usable environment on a bare
 # checkout: the test suite imports asyncpg and sqlalchemy, which live in the data-store group
@@ -280,12 +302,12 @@ agent-down:  ## Stop the agent devcontainer (host config dir is kept)
 agent-attach:  ## Open a shell inside the agent devcontainer
 	$(AGENT_COMPOSE) exec agent bash
 
-# dev-down, not prod-down: this is a workstation target -- it deletes .venv -- and dev-down is
+# dev-down, not prod-down: this is a workstation target -- it deletes the venv -- and dev-down is
 # the one teardown that loads docker-compose.tools.yaml, so going through it leaves no pgAdmin
 # behind.
 .PHONY: clean
 clean: dev-down  ## Clean up the project
-	rm -rf .venv $(VENV_MARKER)
+	rm -rf $(VENV_DIR)
 	[[ -d .pytest_cache ]] && rm -rf .pytest_cache || true
 	[[ -d .coverage ]] && rm -rf .coverage || true
 	[[ -d coverage.xml ]] && rm -rf coverage.xml || true

@@ -17,6 +17,7 @@ Dockerfile
 
 # Virtual environment
 .venv/
+.venv-devcontainer/
 .venv_init
 
 # Byte-compiled / optimized / DLL files

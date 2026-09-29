@@ -106,6 +106,7 @@ exclude = [
     ".pytest_cache",
     ".ruff_cache",
     ".venv",
+    ".venv-devcontainer",
     ".vscode",
     "__pypackages__",
     "data/store/migrations/versions/*",
