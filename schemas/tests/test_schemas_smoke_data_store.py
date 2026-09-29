@@ -22,8 +22,9 @@ No external resource. Nothing here is marked ``external`` and nothing skips.
 
 import importlib
 import inspect
+import json
 import pkgutil
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
@@ -44,6 +45,7 @@ from schemas.data_store.asset_data_interface import (
     BatchAssetDataCreate,
     _AssetDataType,
     _AssetIdentifier,
+    _AssetIdentifierQuery,
 )
 from schemas.data_store.asset_dataset_store import (
     AssetDatasetStore,
@@ -62,7 +64,6 @@ from schemas.data_store.stock.market_activity_data import (
     StockDataMarketActivityData,
     StockDataMarketActivityQuery,
     StockDataMarketActivityUpdate,
-    StockMarketActivityDataQuery,
 )
 
 
@@ -84,9 +85,14 @@ EXPECTED_MODULES = frozenset(
 DATASET_ID = UUID('00000000-0000-0000-0000-000000000001')
 WHEN = datetime(2026, 1, 1, tzinfo=UTC)
 
-# The generic models in asset_data_interface are used here UNPARAMETRISED, which binds DT and QT to
-# Any, so `data` and `query` accept anything. The parametrised bindings are what the stock models
-# test below, and that difference is the point of test_generic_parameter_actually_binds.
+# The generic models in asset_data_interface are used here UNPARAMETRISED, which binds DT to Any,
+# so `data` accepts anything. The parametrised bindings are what the stock models test below, and
+# that difference is the point of test_generic_parameter_actually_binds.
+#
+# THERE IS NO QT ANY MORE. This comment used to name a second type parameter, QT, binding the
+# nested `query` field of the bars query. a8218d5 (tj-vhboky.21, under the user ruling of
+# 2026-09-27 on tj-vhboky.20) removed that field and with it the parameter, so the query models
+# are no longer generic at all -- test_the_bar_query_is_no_longer_generic pins that.
 _OPAQUE_DATA: dict[str, Any] = {'anything': 1}
 
 # BARS ARE RAW (tj-vhboky.1 section 6): no split_factor, no dividends_factor. Corporate actions
@@ -109,9 +115,11 @@ _IDENTIFIER: dict[str, Any] = {'asset_symbol': 'VFV', 'source': 'ALPACA', 'granu
 # the gap tj-5dvgaa closed. The pair is now create-and-read.
 #
 # IT STILL SITS HERE AND NOT IN _IDENTIFIER, and the reason narrowed rather than went away.
-# _IDENTIFIER is also the base of AssetDataUpdate and AssetDataQuery, which still declare no feed --
-# an update addresses a row by id and a query filters rather than reports -- and those models are
-# `extra='forbid'`, so handing either one a feed would RAISE rather than be ignored.
+# _IDENTIFIER is also the base of AssetDataUpdate, which declares no feed -- an update addresses a
+# row by id -- and it is `extra='forbid'`, so handing it a feed would RAISE rather than be ignored.
+# The bars QUERY used to be named here alongside the update as a second model with no feed. It now
+# carries an OPTIONAL one (a8218d5, tj-vhboky.21): a filter, not the required identity pair, so it
+# still does not belong in this dict.
 #
 # feed has NO DEFAULT on purpose: the enum no longer has an UNKNOWN member to default to (32438a9,
 # tj-vhboky.1 ruling of 2026-09-25). An adapter that cannot resolve a tape has failed, and a
@@ -181,12 +189,21 @@ CONSTRUCT_CASES: list[tuple[type[BaseModel], dict[str, Any]]] = [
 # the bead's fallback applies: reject a payload that violates a declared constraint, and name the
 # constraint here rather than leaving a reader to infer it.
 #
-# THE TWO QUERY MODELS MOVED HERE FROM THE CONSTRUCT LIST, and the move is the contract change
-# rather than a tidy-up (tj-vhboky.1 section 8, tj-6z03hd's escalation). Their fields were
-# annotated `| None` with NO default, which in Pydantic v2 means required-but-nullable: a caller
-# had to pass every one explicitly, so the object could not represent an unfiltered request and
-# could not serve as an optional FastAPI query dependency. Being constructible from `{}` is now
-# the point of them, so an empty-payload REJECTION would pin the opposite of the ruling.
+# THE QUERY MODELS MOVED HERE FROM THE CONSTRUCT LIST, and the move was the contract change rather
+# than a tidy-up (tj-vhboky.1 section 8, tj-6z03hd's escalation). Their fields were annotated
+# `| None` with NO default, which in Pydantic v2 means required-but-nullable: a caller had to pass
+# every one explicitly, so the object could not represent an unfiltered request and could not serve
+# as an optional FastAPI query dependency. For the dataset search that is still the point of it,
+# so an empty-payload REJECTION here would pin the opposite of the ruling.
+#
+# THE BARS QUERY HAS LEFT THIS LIST (F1b, tj-vhboky.26, ebb2439). It sat here with the same
+# `{'source': 'NOT_A_BROKER'}` case until the user ruled on 2026-09-27 (tj-vhboky.20, 21:41 UTC,
+# ruling 5) that an EMPTY bars query must be impossible to construct, and ebb2439 put a
+# model_validator on the shared AssetDataQuery refusing one that names neither dataset_id nor
+# asset_symbol. `{}` is no longer valid for it, so it cannot be an all-optional model. It moved to
+# SELECTOR_CASES below, and the assertion these entries made -- a bad `source` on an otherwise empty
+# query is reported at `source` and nowhere else -- moved with it, strengthened, into
+# test_a_field_error_on_an_empty_bar_query_is_not_masked_by_the_refusal.
 CONSTRAINT_CASES: list[tuple[type[BaseModel], dict[str, Any], str, str]] = [
     (
         StoreAssetDatasetQuery,
@@ -194,38 +211,30 @@ CONSTRAINT_CASES: list[tuple[type[BaseModel], dict[str, Any], str, str]] = [
         'source',
         '`source` is `DataSource | None`, so a value outside the DataSource enum is rejected even '
         'though omitting the field entirely is fine.',
-    ),
-    (
-        AssetDataQuery,
-        {'source': 'NOT_A_BROKER'},
-        'source',
-        '`source` is `DataSource | None`. Every field defaults to unset so `{}` is valid, but a '
-        'value outside the DataSource enum is still rejected -- "no filter" and "any filter" are '
-        'not the same thing.',
-    ),
-    (
-        StockDataMarketActivityQuery,
-        {'source': 'NOT_A_BROKER'},
-        'source',
-        'The parametrised stock binding inherits the same all-optional shape, including the '
-        'nested `query` submodel, which is what lets the ONE filtering read path take it as an '
-        'optional dependency.',
-    ),
+    )
 ]
 
-# Models with NO declared constraint to violate, so neither an empty-payload rejection nor a
-# constraint case can be written honestly. Listing one here is a finding, not a gap in the tests.
-#
-# StockMarketActivityDataQuery declares zero fields, so there is no DECLARED constraint to
-# violate and no field a rejection could be reported against. The only assertion worth making is
-# that it constructs and is empty, which is what test_no_constraint_model_constructs does.
-#
-# THE REASON RECORDED HERE USED TO BE THE WRONG ONE. It said no payload at all could be invalid,
-# because Pydantic v2 ignores extras by default. That stopped being true in 32438a9: the class is
-# an InboundContract, so `extra='forbid'` applies and an unknown key IS rejected even with no
-# fields declared. It stays on this list because zero fields still means zero constraints to
-# violate, but the strict half is now pinned -- by test_no_constraint_model_constructs below.
-NO_CONSTRAINT_CASES: list[type[BaseModel]] = [StockMarketActivityDataQuery]
+# Models whose fields are each optional but which REFUSE the empty payload with a MODEL-LEVEL error,
+# not a missing-field one, so they fit neither list above: test_model_rejects_empty_payload counts
+# `missing` errors and would find none, and test_all_optional_model_accepts_empty_... would find `{}`
+# refused. The payload is the smallest valid one -- a single selector. What the refusal looks like
+# is pinned by test_an_empty_bar_query_is_refused; this list keeps both classes in the package-wide
+# coverage and strict-receiver sweeps.
+SELECTOR_CASES: list[tuple[type[BaseModel], dict[str, Any]]] = [
+    (AssetDataQuery, {'dataset_id': DATASET_ID}),
+    (StockDataMarketActivityQuery, {'dataset_id': DATASET_ID}),
+]
+
+# THE NO_CONSTRAINT_CASES LIST AND ITS TEST ARE GONE, because their only member is. The list held
+# models with no declared constraint to violate, and its one entry was StockMarketActivityDataQuery,
+# the zero-field type argument of the bars query's nested `query` field. a8218d5 (tj-vhboky.21)
+# deleted both under the user ruling of 2026-09-27 ("sounds dangerous"; tj-vhboky.25 item 2). An
+# empty list would have left test_no_constraint_model_constructs parametrised over nothing, which
+# pytest reports as a skip -- a test that can never run. The deletion is audited by absence instead,
+# in test_the_nested_query_submodel_is_gone, the way DELETED_PSEUDO_MODELS audits tj-9dqfjo. A future
+# zero-field model still cannot slip through: test_every_public_model_is_covered fails on it until
+# someone decides where it belongs.
+DELETED_QUERY_MODELS = frozenset({'StockMarketActivityDataQuery'})
 
 # Public classes in the package that are NOT Pydantic models. EMPTY, AND IT MUST STAY EMPTY.
 #
@@ -308,7 +317,7 @@ def test_every_public_model_is_covered():
     covered = (
         {model.__name__ for model, _ in CONSTRUCT_CASES}
         | {model.__name__ for model, _, _, _ in CONSTRAINT_CASES}
-        | {model.__name__ for model in NO_CONSTRAINT_CASES}
+        | {model.__name__ for model, _ in SELECTOR_CASES}
         | KNOWN_NON_MODELS
     )
     declared = set()
@@ -346,7 +355,10 @@ def test_model_rejects_empty_payload(model: type[BaseModel], payload: dict[str, 
     # The constraint cases contribute `{}`, not their listed payload: that payload is the one that
     # VIOLATES their constraint, so adding an unknown key to it would raise two errors and the
     # assertion below would be measuring the violation as much as the unknown field.
-    CONSTRUCT_CASES + [(model, {}) for model, _, _, _ in CONSTRAINT_CASES],
+    #
+    # The SELECTOR_CASES contribute their one-selector payload, not `{}`: an empty bars query is
+    # refused by its model_validator, and that refusal would be a second error beside the unknown key.
+    CONSTRUCT_CASES + [(model, {}) for model, _, _, _ in CONSTRAINT_CASES] + SELECTOR_CASES,
     ids=_case_id,
 )
 def test_every_model_in_the_package_rejects_an_unknown_field(model: type[BaseModel], payload: dict[str, Any]):
@@ -397,26 +409,50 @@ def test_all_optional_model_accepts_empty_and_rejects_a_constraint_violation(
     assert {str(error['loc'][0]) for error in excinfo.value.errors()} == {field}, constraint
 
 
-@pytest.mark.parametrize('model', NO_CONSTRAINT_CASES, ids=_case_id)
-def test_no_constraint_model_constructs(model: type[BaseModel]):
-    """Construct a model that declares no field, and assert exactly that and nothing more.
+@pytest.mark.parametrize('name', sorted(DELETED_QUERY_MODELS))
+def test_the_nested_query_submodel_is_gone(name: str):
+    """Audit the removal of the bars query's nested submodel by absence from every module.
 
-    There is no CONSTRAINT case to write: with no fields declared there is nothing whose declared
-    constraint could be violated. Asserting the field set is empty is the honest assertion -- it
-    fails the day the model gains a field, which is the day a constraint case becomes writable.
+    REPLACES test_no_constraint_model_constructs, which is RETIRED rather than edited, because the
+    one model it was parametrised over no longer exists. That test asserted that
+    StockMarketActivityDataQuery constructed from nothing, declared no field and refused an unknown
+    key: the right assertions about a zero-field type argument whose existence nobody questioned.
+    The user ruling of 2026-09-27 (tj-vhboky.20, 21:21 and 21:41 UTC) questioned it and removed the
+    nested ``query`` field it typed -- "sounds dangerous" -- and tj-vhboky.25 item 2 records why: a
+    nested model cannot be an HTTP query parameter, nothing read it, and an ``extra='forbid'``
+    contract that accepts a field and ignores it only looks validating.
 
-    An unknown key is still rejected, and that is asserted here rather than left implicit: a model
-    with no fields is the one place a reader would assume anything goes, and under
-    ``schemas/inbound_contract.py`` it is instead the strictest thing in the package.
+    STRONGER THAN WHAT IT REPLACES, not weaker: the old test passed on any tree where the class
+    existed and was empty; this one fails on any tree where the class exists at all, in any module
+    of the package. A deleted class is invisible to every other test here, and coming back in a
+    merge is exactly how it would reappear.
 
     Args:
-        model: The model class.
+        name: One deleted class name, checked against every module in the package.
     """
-    assert model.model_fields == {}
-    assert model().model_dump() == {}
-    with pytest.raises(ValidationError) as excinfo:
-        model(a_field_no_contract_declares=1)
-    assert [error['type'] for error in excinfo.value.errors()] == ['extra_forbidden']
+    for module_name in sorted(EXPECTED_MODULES):
+        module = importlib.import_module(module_name)
+        assert not hasattr(module, name), (
+            f'{module_name}.{name} is back. It was deleted by tj-vhboky.21 with the nested `query` '
+            f'field it typed. Asset-type-specific filters are designed with a reader, as flat fields.'
+        )
+
+
+@pytest.mark.parametrize('model', [AssetDataQuery, StockDataMarketActivityQuery], ids=_case_id)
+def test_the_bar_query_is_no_longer_generic(model: type[BaseModel]):
+    """The QT type parameter went with the nested field, so the query cannot be re-parametrised.
+
+    Pinned separately from the field set because the two can come back independently: a QT with no
+    ``query`` field would be dead generic machinery that invites the field back, and it would pass
+    every field-set assertion in this file.
+
+    Args:
+        model: The shared bars query, or its stock binding.
+    """
+    assert 'query' not in model.model_fields
+    assert model.__pydantic_generic_metadata__['parameters'] == ()
+    with pytest.raises(TypeError):
+        _ = model[int]
 
 
 @pytest.mark.parametrize(
@@ -604,13 +640,21 @@ def test_the_entry_carries_no_feed_and_the_bar_requires_one():
     NOT NULL, a wrong answer rather than a missing one, and the removed ``UNKNOWN`` under a new
     name.
 
-    WHAT IS STILL ABSENT, AND WHY THAT IS NOT AN OVERSIGHT: ``AssetDataUpdate`` and
-    ``AssetDataQuery``. An update addresses an existing row by id, so obliging a caller to restate
-    identity it is not changing would invite a mismatch between the feed sent and the feed stored.
-    A query FILTERS rather than reports, and every query field is optional by the tj-vhboky.1
-    section 8 ruling, so a required feed there would make an unfiltered read impossible. The field
-    therefore sits on the concrete create and read models and NOT on the shared ``_AssetIdentifier``
-    mixin, which is the structural fact this test's three lists together pin.
+    WHAT IS STILL ABSENT, AND WHY THAT IS NOT AN OVERSIGHT: ``AssetDataUpdate``. An update
+    addresses an existing row by id, so obliging a caller to restate identity it is not changing
+    would invite a mismatch between the feed sent and the feed stored. The field therefore sits on
+    the concrete create and read models and NOT on the shared ``_AssetIdentifier`` mixin, which is
+    the structural fact this test's three lists together pin.
+
+    THE QUERY HALF OF THE ABSENCE LIST MOVED OUT, INVERTED, to
+    test_the_bar_query_carries_an_optional_feed_filter. This test used to assert that
+    ``AssetDataQuery`` and ``StockDataMarketActivityQuery`` declared NO feed, reasoning that a
+    required feed would make an unfiltered read impossible. That reasoning was about a REQUIRED
+    feed and was sound; the conclusion it was used for -- no feed at all -- left the read unable
+    to select one tape (tj-p78ng6). The user ruled on 2026-09-27 (tj-vhboky.20, 21:41 UTC, ruling
+    3) to add feed as an optional FILTER, and a8218d5 (tj-vhboky.21) put it on
+    ``_AssetIdentifierQuery``. The half that survives here is the one the ruling kept: feed is
+    still not on ``_AssetIdentifier`` and not on the update.
     """
     for model in (StoreAssetDatasetBody, StoreAssetDatasetQuery, AssetDatasetStoreCreate, AssetDatasetStore):
         assert 'feed' not in model.model_fields, f'{model.__name__} declares a feed again'
@@ -631,9 +675,10 @@ def test_the_entry_carries_no_feed_and_the_bar_requires_one():
         assert field.default_factory is None, f'{model.__name__}.feed acquired a default factory'
         assert field.annotation is Feed
 
-    # NOT on the shared mixin, which is what keeps a required feed off the update and query paths.
+    # NOT on the shared mixin, which is what keeps a required feed off the update path. The query
+    # models used to be in this loop; see the docstring for where they went and why.
     assert 'feed' not in _AssetIdentifier.model_fields
-    for model in (AssetDataUpdate, AssetDataQuery, StockDataMarketActivityUpdate, StockDataMarketActivityQuery):
+    for model in (AssetDataUpdate, StockDataMarketActivityUpdate):
         assert 'feed' not in model.model_fields, f'{model.__name__} declares a feed again'
 
     # The behavioural half, on a create path and on a read model: omitting feed is reported against
@@ -709,6 +754,145 @@ def test_expiry_default_is_an_aware_utc_instant():
     assert expiry is not None
     assert expiry.tzinfo is not None
     assert expiry.utcoffset() == datetime.now(UTC).utcoffset()
+
+
+# The three create-body fields bound for timestamptz columns, each with an OFFSET-LESS instant that
+# is otherwise valid beside the rest of the payload (end after start, expiry between them). Naive on
+# purpose: these are the values the user ruling on tj-1bl90i (2026-09-27) says must be REFUSED --
+# not converted -- because Postgres would read them in the session timezone.
+_NAIVE_INSTANTS: dict[str, datetime] = {
+    'start': datetime(2026, 1, 1),
+    'end': datetime(2026, 3, 1),
+    'expiry': datetime(2026, 2, 1),
+}
+
+_WRITE_MODELS = [StoreAssetDatasetBody, AssetDatasetStoreCreate, AssetDatasetStoreUpdate]
+
+
+def _write_payload(model: type[BaseModel]) -> dict[str, Any]:
+    """A minimal valid payload for one of the write models, whose only datetime is an aware start.
+
+    Args:
+        model: The body, or one of the two models that inherit its datetime fields.
+
+    Returns:
+        dict[str, Any]: The payload, ready to have one field replaced.
+    """
+    payload = dict(_DATASET_BODY)
+    if model is not StoreAssetDatasetBody:
+        payload |= _DATASET_PATH
+    if model is AssetDatasetStoreUpdate:
+        payload |= {'id': str(DATASET_ID)}
+    return payload
+
+
+def _as_json(payload: dict[str, Any]) -> str:
+    """Serialise a payload the way a caller would send it, datetimes as ISO-8601 text.
+
+    Args:
+        payload: A payload whose datetime values are rendered with ``isoformat()``.
+
+    Returns:
+        str: The JSON body.
+    """
+    return json.dumps(
+        {key: value.isoformat() if isinstance(value, datetime) else value for key, value in payload.items()}
+    )
+
+
+@pytest.mark.parametrize('model', _WRITE_MODELS)
+@pytest.mark.parametrize('field', sorted(_NAIVE_INSTANTS))
+def test_a_naive_datetime_is_refused_at_its_own_field(field: str, model: type[BaseModel]):
+    """REFUSE, per field, per write model: the user ruling on tj-1bl90i, 2026-09-27.
+
+    Before a29e690 all three fields were plain ``datetime``, so a value with no tzinfo validated and
+    upsert_entry bound it unchanged into a timestamptz column, where Postgres reads it in the SESSION
+    timezone -- an environment-dependent instant, silently. Converting to UTC was offered and
+    declined, so the only passing answer is a ValidationError.
+
+    The error list is asserted EXACTLY -- one error, at this field, of type ``timezone_aware`` -- so
+    that it cannot pass on a refusal raised for some other reason (a missing field, the model
+    validator's end/update_type rule), and so that a CONVERT implementation (an after-validator
+    attaching UTC) reds it rather than slipping through as "no error at start, but one somewhere".
+
+    The two models that inherit these fields are included because they are what the store actually
+    hands to upsert_entry (data/store/app/ingest/data_action_request.py builds
+    AssetDatasetStoreCreate); a subclass that re-declared one of the fields as ``datetime`` would
+    reopen the hole below the route while the body still refused.
+
+    Args:
+        field: The datetime field sent naive.
+        model: The write model under test.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        model(**_write_payload(model) | {field: _NAIVE_INSTANTS[field]})
+    assert [(error['loc'], error['type']) for error in excinfo.value.errors()] == [((field,), 'timezone_aware')]
+
+
+@pytest.mark.parametrize('field', sorted(_NAIVE_INSTANTS))
+def test_an_offset_less_json_string_is_refused_at_its_own_field(field: str):
+    """The wire form of the case above, which is how a real caller sends it.
+
+    A caller never sends a Python datetime; it sends text. ``'2026-01-01T00:00:00'`` parsed from
+    JSON is the naive value that actually arrives, and a string-side coercion (a before-validator
+    that parsed text and attached a zone) could refuse the object form while accepting this one.
+
+    Args:
+        field: The datetime field sent as offset-less text.
+    """
+    text = _NAIVE_INSTANTS[field].isoformat()
+    assert text == _NAIVE_INSTANTS[field].strftime('%Y-%m-%dT%H:%M:%S'), 'the fixture must carry no offset'
+
+    with pytest.raises(ValidationError) as excinfo:
+        StoreAssetDatasetBody.model_validate_json(_as_json(_write_payload(StoreAssetDatasetBody) | {field: text}))
+    assert [(error['loc'], error['type']) for error in excinfo.value.errors()] == [((field,), 'timezone_aware')]
+
+
+@pytest.mark.parametrize(
+    ('suffix', 'zone'),
+    [('Z', UTC), ('+00:00', UTC), ('-05:00', timezone(timedelta(hours=-5)))],
+    ids=['zulu', 'utc-offset', 'nonzero-offset'],
+)
+@pytest.mark.parametrize('field', sorted(_NAIVE_INSTANTS))
+def test_an_offset_bearing_json_string_is_accepted_as_the_instant_it_names(field: str, suffix: str, zone: timezone):
+    """The success half: a refusal test alone is satisfied by a field that refuses EVERYTHING.
+
+    'Z' is what our own ingest path and test_store_dataset_entry_route.py's REQUEST_BODY send, so a
+    guard that refused it would break the only caller. The non-zero offset is asserted as the INSTANT
+    it names, which is what separates honouring the offset from dropping it: were ``-05:00`` read as
+    UTC, the value would compare five hours early.
+
+    Args:
+        field: The datetime field sent with an offset.
+        suffix: The offset designator appended to the ISO text.
+        zone: The zone that designator names.
+    """
+    text = _NAIVE_INSTANTS[field].isoformat() + suffix
+
+    body = StoreAssetDatasetBody.model_validate_json(_as_json(_write_payload(StoreAssetDatasetBody) | {field: text}))
+
+    value = getattr(body, field)
+    assert value.tzinfo is not None
+    assert value == _NAIVE_INSTANTS[field].replace(tzinfo=zone)
+
+
+def test_the_default_expiry_survives_a_round_trip_through_its_own_annotation():
+    """The default expiry is still aware, measured the way the new annotation measures it.
+
+    A default_factory's output is NOT validated (pydantic's validate_default is off), so the
+    AwareDatetime annotation never inspects the default: a factory that went back to naive
+    ``datetime.now()`` would construct without complaint. test_expiry_default_is_an_aware_utc_instant
+    checks tzinfo directly; this checks the consequence that matters under the ruling -- a body the
+    store itself builds with the default, sent on as JSON (as data_action_request.py's downstream
+    requests are), must be one the same contract accepts rather than 422s.
+    """
+    body = StoreAssetDatasetBody(**_DATASET_BODY)
+    assert 'expiry' not in body.model_fields_set, 'the default was not the one exercised'
+
+    again = StoreAssetDatasetBody.model_validate_json(body.model_dump_json())
+
+    assert again.expiry.tzinfo is not None
+    assert again.expiry == body.expiry
 
 
 def test_owner_is_required_with_no_default():
@@ -971,3 +1155,445 @@ def test_a_flat_row_cannot_validate_into_the_bar_read_schema():
     with pytest.raises(ValidationError) as excinfo:
         StockDataMarketActivity.model_validate(flat_row, from_attributes=True)
     assert [error['loc'] for error in excinfo.value.errors()] == [('data',)]
+
+
+# THE BARS QUERY CONTRACT, PART 1 (tj-vhboky.21, a8218d5), under the user rulings of 2026-09-27 on
+# tj-vhboky.20 and decision tj-vhboky.25 with its addenda. Both query classes are checked: the shared
+# AssetDataQuery that F1b's model_validator sits on (ebb2439), and the stock binding the route and
+# read_market_activity_data actually take. A subclass that re-declared a field would reopen a hole
+# below the shared model while the shared model still looked right.
+_BAR_QUERIES = [AssetDataQuery, StockDataMarketActivityQuery]
+
+# Every query below names a dataset_id so that it stays NON-EMPTY: F1b (tj-vhboky.26) refuses an
+# empty query, and a query without a selector would report that refusal beside the field under test.
+_SCOPED_QUERY: dict[str, Any] = {'dataset_id': DATASET_ID}
+
+_NAIVE_BOUNDS: dict[str, datetime] = {'start': datetime(2026, 1, 1), 'end': datetime(2026, 3, 1)}
+
+
+@pytest.mark.parametrize('model', _BAR_QUERIES, ids=_case_id)
+def test_the_bar_query_carries_an_optional_feed_filter(model: type[BaseModel]):
+    """INVERTS the query half of test_the_entry_carries_no_feed_and_the_bar_requires_one.
+
+    SUPERSEDED DESIGN, kept here so the file carries the history: that test asserted
+    ``'feed' not in model.model_fields`` for both query classes, because every query field is
+    optional (tj-vhboky.1 section 8) and a REQUIRED feed would have made an unfiltered read
+    impossible. The premise holds; the conclusion drawn from it -- no feed at all -- left the
+    filtering read unable to select one tape (tj-p78ng6). The user ruled on 2026-09-27
+    (tj-vhboky.20, 21:41 UTC, ruling 3: "FILTERS: add source and feed"), and a8218d5
+    (tj-vhboky.21) added ``feed: Feed | None = None`` to ``_AssetIdentifierQuery``. The design
+    change is recorded in the ruling and the task, not only in the commit that rewrites this.
+
+    STRENGTHENED, not merely flipped. The old assertion was one absence. This one pins: WHERE the
+    field lives (the query mixin, and still not ``_AssetIdentifier``, whose required feed would
+    burden the update path); that it is OPTIONAL with a None default, which is the half of the old
+    reasoning that survives; that it is the SHARED enum, not a local copy that would compare
+    unequal; that a value is carried through, in both enum and wire (string) form, since the route
+    will bind it with Query(); that omitting it leaves it unset rather than defaulting a tape; and
+    that a value outside the enum is refused AT ``feed`` rather than read as "no filter".
+
+    Args:
+        model: The shared bars query, or its stock binding.
+    """
+    assert 'feed' in _AssetIdentifierQuery.model_fields
+    assert 'feed' not in _AssetIdentifier.model_fields
+
+    field = model.model_fields['feed']
+    assert not field.is_required(), (
+        f'{model.__name__}.feed became required; an unfiltered-by-tape read needs it optional'
+    )
+    assert field.default is None
+    assert field.annotation == Feed | None
+
+    omitted = model(**_SCOPED_QUERY)
+    assert omitted.feed is None
+    assert 'feed' not in omitted.model_fields_set
+
+    assert model(**_SCOPED_QUERY | {'feed': Feed.SIP}).feed is Feed.SIP
+    assert model(**_SCOPED_QUERY | {'feed': 'SIP'}).feed is Feed.SIP
+
+    with pytest.raises(ValidationError) as excinfo:
+        model(**_SCOPED_QUERY | {'feed': 'NOT_A_TAPE'})
+    assert [error['loc'] for error in excinfo.value.errors()] == [('feed',)]
+
+
+@pytest.mark.parametrize('form', ['object', 'text'])
+@pytest.mark.parametrize('field', sorted(_NAIVE_BOUNDS))
+@pytest.mark.parametrize('model', _BAR_QUERIES, ids=_case_id)
+def test_a_naive_query_bound_is_refused_at_its_own_field(model: type[BaseModel], field: str, form: str):
+    """REFUSE, per bound, on the read side too: the user ruling D2 = (A), tj-vhboky.20, 2026-09-27.
+
+    Before a8218d5 ``start`` and ``end`` were plain ``datetime``, so a value with no offset
+    validated and was compared against the timestamptz ``timestamp`` column in the SESSION
+    timezone -- the same query returning different bars on differently configured hosts. The
+    create body got the same refusal in a29e690 (tj-1bl90i); this extends it to the filtering
+    read. Converting to UTC was offered and declined on tj-1bl90i, so only a ValidationError passes.
+
+    The error list is asserted EXACTLY -- one error, at this field, of type ``timezone_aware`` -- so
+    a refusal for some other reason cannot satisfy it, and a CONVERT implementation (an
+    after-validator attaching UTC) reds it rather than slipping through. The ``text`` form is what
+    a query string actually delivers once the route binds the model with Query(); a before-validator
+    that parsed text and attached a zone could refuse the object and accept the string.
+
+    Args:
+        model: The shared bars query, or its stock binding.
+        field: The bound sent without an offset.
+        form: A Python datetime, or its offset-less ISO text.
+    """
+    naive = _NAIVE_BOUNDS[field]
+    value = naive if form == 'object' else naive.isoformat()
+    if form == 'text':
+        assert value == naive.strftime('%Y-%m-%dT%H:%M:%S'), 'the fixture must carry no offset'
+
+    with pytest.raises(ValidationError) as excinfo:
+        model(**_SCOPED_QUERY | {field: value})
+    assert [(error['loc'], error['type']) for error in excinfo.value.errors()] == [((field,), 'timezone_aware')]
+
+
+@pytest.mark.parametrize(
+    ('suffix', 'zone'), [('Z', UTC), ('-05:00', timezone(timedelta(hours=-5)))], ids=['zulu', 'nonzero-offset']
+)
+@pytest.mark.parametrize('field', sorted(_NAIVE_BOUNDS))
+@pytest.mark.parametrize('model', _BAR_QUERIES, ids=_case_id)
+def test_an_offset_bearing_query_bound_is_accepted_as_the_instant_it_names(
+    model: type[BaseModel], field: str, suffix: str, zone: timezone
+):
+    """The success half: the refusal above is also satisfied by a bound that refuses EVERYTHING.
+
+    The non-zero offset is compared as the INSTANT it names, which separates honouring the offset
+    from dropping it: read as UTC, ``-05:00`` would filter five hours early.
+
+    Args:
+        model: The shared bars query, or its stock binding.
+        field: The bound sent with an offset.
+        suffix: The offset designator appended to the ISO text.
+        zone: The zone that designator names.
+    """
+    built = model(**_SCOPED_QUERY | {field: _NAIVE_BOUNDS[field].isoformat() + suffix})
+
+    value = getattr(built, field)
+    assert value.tzinfo is not None
+    assert value == _NAIVE_BOUNDS[field].replace(tzinfo=zone)
+
+
+@pytest.mark.parametrize(('dead_field', 'value'), [('expiry', WHEN), ('query', {})], ids=['expiry', 'query'])
+@pytest.mark.parametrize('model', _BAR_QUERIES, ids=_case_id)
+def test_a_removed_query_field_is_refused_rather_than_ignored(model: type[BaseModel], dead_field: str, value: Any):
+    """``expiry`` and ``query`` left the bars query in a8218d5, and a sender of either gets a 422.
+
+    Why each went (user rulings of 2026-09-27 on tj-vhboky.20, 21:41 UTC; tj-vhboky.25 item 2):
+    ``expiry`` because a bar carries no expiry (tj-vhboky Ruling 1), so a bar-expiry filter means
+    nothing and nothing read it (tj-wdjpmq); ``query`` because a nested model cannot be an HTTP
+    query parameter, nothing read it, and the user judged it "dangerous". A contract that accepted
+    either and ignored it would be the "looks validating, is not" shape.
+
+    Absence from the field set alone is not the contract: a model with ``extra='ignore'`` would lack
+    the field and swallow it silently. So the error is asserted exactly, at the dead field, of type
+    ``extra_forbidden`` -- the interface change the builder named in its handback.
+
+    Args:
+        model: The shared bars query, or its stock binding.
+        dead_field: A field the query no longer declares.
+        value: An otherwise-plausible value for it.
+    """
+    assert dead_field not in model.model_fields
+
+    with pytest.raises(ValidationError) as excinfo:
+        model(**_SCOPED_QUERY | {dead_field: value})
+    errors = excinfo.value.errors()
+    assert [error['loc'] for error in errors] == [(dead_field,)]
+    assert [error['type'] for error in errors] == ['extra_forbidden']
+
+
+# Queries that name NEITHER selector. The last one filters on every other column there is and is
+# still refused: narrowed by source, tape, granularity and a time range, it is every symbol in that
+# window, which is the unbounded read the ruling forbids -- the rule is about the two selectors, not
+# about the query being literally empty.
+_SELECTORLESS_QUERIES: dict[str, dict[str, Any]] = {
+    'empty': {},
+    'explicit-none': {'dataset_id': None, 'asset_symbol': None},
+    'every-other-filter': {
+        'source': 'ALPACA',
+        'feed': 'SIP',
+        'granularity': '1day',
+        'start': '2026-01-01T00:00:00Z',
+        'end': '2026-03-01T00:00:00Z',
+    },
+}
+
+_SELECTORS: dict[str, dict[str, Any]] = {
+    'dataset_id': {'dataset_id': DATASET_ID},
+    'asset_symbol': {'asset_symbol': 'AAPL'},
+    'both': {'dataset_id': DATASET_ID, 'asset_symbol': 'AAPL'},
+}
+
+
+@pytest.mark.parametrize('payload', _SELECTORLESS_QUERIES.values(), ids=_SELECTORLESS_QUERIES.keys())
+@pytest.mark.parametrize('model', _BAR_QUERIES, ids=_case_id)
+def test_an_empty_bar_query_is_refused(model: type[BaseModel], payload: dict[str, Any]):
+    """A bars query naming neither dataset_id nor asset_symbol cannot be constructed (F1b, ebb2439).
+
+    RENAMED FROM test_an_empty_bar_query_still_constructs_until_f1b, and INVERTED, as that test's
+    docstring directed (tj-8fxxfb iii).
+
+    SUPERSEDED DESIGN, kept so the file carries the history. At a8218d5 every field of the bars query
+    was individually optional with a None default and an empty query constructed. That was pinned
+    deliberately, as all fields None and none set: the route's placeholder
+    (routers/data_store/internal_asset_data.py, a bare ``StockDataMarketActivityQuery()``) built
+    exactly that object on every GET, and a refusal landing before F2 removed the line would have
+    turned every GET into a 500 rather than a 422 (tj-vhboky.25, architect addendum at dccd2c5).
+    Behind it stood tj-vhboky.1 section 8: the query model must be able to represent "no filter".
+
+    THE DESIGN NOW: the user ruled on 2026-09-27 (tj-vhboky.20, 21:21 UTC D1 = (A); 21:41 UTC ruling
+    5) that an unbounded read -- every symbol, all time -- must be IMPOSSIBLE TO CONSTRUCT anywhere,
+    and rejected section 8 as a reason to permit one. The refusal sits on the shared AssetDataQuery
+    as a model_validator, "not in the route and not a route-only subclass", which is why both
+    classes are checked: the stock binding must inherit it, not shadow it. The per-field half of
+    section 8 stands and is pinned by test_a_bar_query_naming_one_selector_constructs.
+
+    STRENGTHENED, not merely flipped. The old test had one payload; this one has three, and the third
+    carries every OTHER filter, so a rule keyed on "the query is empty" rather than on the two
+    selectors reds it. The refusal is asserted EXACTLY -- one error, model-level (loc ``()``), type
+    ``value_error`` -- so a refusal for any other reason cannot satisfy it, and its message must
+    name both selectors, which the task required so a caller learns how to fix the request. Over
+    HTTP the same refusal is a 422 at loc ['query']; that is F3's subject (tj-vhboky.23), not this
+    file's.
+
+    Args:
+        model: The shared bars query, or its stock binding.
+        payload: A query naming no selector.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        model(**payload)
+    errors = excinfo.value.errors()
+    assert [(error['loc'], error['type']) for error in errors] == [((), 'value_error')]
+    assert 'dataset_id' in errors[0]['msg']
+    assert 'asset_symbol' in errors[0]['msg']
+
+
+@pytest.mark.parametrize('selector', _SELECTORS.values(), ids=_SELECTORS.keys())
+@pytest.mark.parametrize('model', _BAR_QUERIES, ids=_case_id)
+def test_a_bar_query_naming_one_selector_constructs(model: type[BaseModel], selector: dict[str, Any]):
+    """The positive half of the refusal above: EITHER selector alone is enough, and so are both.
+
+    A rule that demanded dataset_id (or demanded both) would pass every refusal case and break the
+    symbol-scoped read the ruling left open. The rest of the query is asserted as ALL None and NOT
+    SET, carrying forward the strengthening the superseded empty-query test made: a default quietly
+    narrowing the read (a default granularity, say) is caught here too.
+
+    Args:
+        model: The shared bars query, or its stock binding.
+        selector: dataset_id alone, asset_symbol alone, or both.
+    """
+    built = model(**selector)
+    assert built.model_fields_set == set(selector)
+    assert built.model_dump() == dict.fromkeys(model.model_fields) | selector
+
+
+@pytest.mark.parametrize(
+    ('payload', 'field', 'error_type'),
+    [({'source': 'NOT_A_BROKER'}, 'source', 'enum'), ({'start': '2026-01-01T00:00:00'}, 'start', 'timezone_aware')],
+    ids=['bad-enum', 'naive-bound'],
+)
+@pytest.mark.parametrize('model', _BAR_QUERIES, ids=_case_id)
+def test_a_field_error_on_an_empty_bar_query_is_not_masked_by_the_refusal(
+    model: type[BaseModel], payload: dict[str, Any], field: str, error_type: str
+):
+    """A bad field on a selector-less query is reported at that field, and ONLY there.
+
+    CARRIES THE ASSERTION the bars query's two CONSTRAINT_CASES entries made before F1b moved them
+    out: a ``source`` outside the enum, on a query with nothing else set, was reported at ``source``
+    and nowhere else. It still is, because the refusal is ``mode='after'`` and Pydantic runs an
+    after-validator only once every field has validated. A ``mode='before'`` or ``'wrap'`` refusal
+    would run first and report the empty query instead, hiding the field the caller got wrong --
+    the task names this as the reason for ``mode='after'``.
+
+    Strengthened with a naive bound beside the bad enum: two kinds of field error, since a refusal
+    that happened to defer to enum errors alone would pass the first.
+
+    Args:
+        model: The shared bars query, or its stock binding.
+        payload: One invalid field and no selector.
+        field: The field the error must be reported against.
+        error_type: The Pydantic error type for that field.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        model(**payload)
+    assert [(error['loc'], error['type']) for error in excinfo.value.errors()] == [((field,), error_type)]
+
+
+# A BLANK asset_symbol NAMES NO SYMBOL (F1c, tj-vhboky.28, 1331ef5). The user ruled on 2026-09-28
+# (00:23 UTC): a blank symbol gets "the same error as the empty search", and the architect confirmed
+# at 00:24 UTC that this means the same MODEL-LEVEL error (loc (), type value_error) and that it
+# holds EVEN WHEN dataset_id IS GIVEN. The bead body's field-level loc ('asset_symbol',) is
+# superseded. Each blank is a str that is not None, so the pre-F1c "is None" selector rule let it
+# through as a symbol filter that matches no rows: a silent empty 200 for a malformed request.
+_BLANK_SYMBOLS: dict[str, str] = {'empty': '', 'spaces': '  ', 'tab': '\t'}
+
+_WITH_AND_WITHOUT_DATASET: dict[str, dict[str, Any]] = {'symbol-only': {}, 'with-dataset_id': _SCOPED_QUERY}
+
+
+@pytest.mark.parametrize('scope', _WITH_AND_WITHOUT_DATASET.values(), ids=_WITH_AND_WITHOUT_DATASET.keys())
+@pytest.mark.parametrize('blank', _BLANK_SYMBOLS.values(), ids=_BLANK_SYMBOLS.keys())
+@pytest.mark.parametrize('model', _BAR_QUERIES, ids=_case_id)
+def test_a_blank_symbol_is_refused_with_the_empty_query_error(
+    model: type[BaseModel], blank: str, scope: dict[str, Any]
+):
+    """A blank asset_symbol is refused at the MODEL, like a query naming nothing, with or without dataset_id.
+
+    The error list is asserted EXACTLY -- one error, loc ``()``, type ``value_error`` -- because the
+    loc is the ruling: a field-level check (a raise in the ``asset_symbol`` field validator, or
+    ``Field(min_length=1)``) would report ``('asset_symbol',)``, the superseded design. The
+    with-dataset_id half is the case the architect named: treating a blank as absent would drop the
+    symbol filter and return the whole dataset, and keeping it would return the silent empty read.
+
+    The message must name ``asset_symbol`` and say it is blank, so the caller learns which value is
+    wrong. It must NOT be the no-selector message ("an unbounded read is refused"): with dataset_id
+    present that would be false (architect item 3, 00:24 UTC). The no-selector message itself is
+    pinned by test_an_empty_bar_query_is_refused and is unchanged.
+
+    Args:
+        model: The shared bars query, or its stock binding.
+        blank: An empty or whitespace-only symbol.
+        scope: No other selector, or a dataset_id.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        model(**scope | {'asset_symbol': blank})
+    errors = excinfo.value.errors()
+    assert [(error['loc'], error['type']) for error in errors] == [((), 'value_error')]
+    assert 'asset_symbol' in errors[0]['msg']
+    assert 'blank' in errors[0]['msg']
+    assert 'unbounded' not in errors[0]['msg']
+
+
+@pytest.mark.parametrize('scope', _WITH_AND_WITHOUT_DATASET.values(), ids=_WITH_AND_WITHOUT_DATASET.keys())
+@pytest.mark.parametrize('model', _BAR_QUERIES, ids=_case_id)
+def test_a_padded_symbol_is_upper_cased_and_not_trimmed(model: type[BaseModel], scope: dict[str, Any]):
+    """A padded but NON-blank symbol constructs and normalises exactly as before 1331ef5.
+
+    The blank refusal tests ``strip()`` but must not trim: the ruling changed what a BLANK symbol
+    does and nothing else, and trimming would silently rewrite what a caller sent (the bead body
+    already named ' AAPL ' normalisation as a contract choice to ask about, not to make). So the
+    value is upper-cased, with its padding intact, whether or not dataset_id is given.
+
+    Args:
+        model: The shared bars query, or its stock binding.
+        scope: No other selector, or a dataset_id.
+    """
+    built = model(**scope | {'asset_symbol': ' aapl '})
+    assert built.asset_symbol == ' AAPL '
+
+
+@pytest.mark.parametrize(
+    'payload',
+    [{'dataset_id': DATASET_ID}, {'dataset_id': DATASET_ID, 'asset_symbol': None}],
+    ids=['symbol-omitted', 'symbol-explicit-none'],
+)
+@pytest.mark.parametrize('model', _BAR_QUERIES, ids=_case_id)
+def test_a_dataset_id_query_without_a_symbol_is_unaffected_by_the_blank_rule(
+    model: type[BaseModel], payload: dict[str, Any]
+):
+    """None is "not given", not blank: a dataset_id-only query still constructs, symbol None.
+
+    The explicit-None case separates the blank check from one written as ``not (symbol or '').strip()``,
+    which would treat None as blank and refuse a valid dataset read.
+
+    Args:
+        model: The shared bars query, or its stock binding.
+        payload: dataset_id with the symbol omitted or explicitly None.
+    """
+    built = model(**payload)
+    assert built.asset_symbol is None
+    assert built.dataset_id == DATASET_ID
+
+
+# ---------------------------------------------------------------------------------------------
+# The dataset search refuses naive bounds too (F4, tj-vhboky.24)
+# ---------------------------------------------------------------------------------------------
+
+# StoreAssetDatasetQuery's four time filters, each with an OFFSET-LESS instant. The search filters
+# GET /store/{asset_type}/{data_type}/{asset_symbol} against timestamptz columns, where a naive
+# bound is read in the SESSION timezone -- the tj-1bl90i defect on the read side. User ruling
+# D2 = (A) on tj-vhboky.20 (2026-09-27, 21:21 UTC) says REFUSE, not convert; fa1d7ee applied it.
+# The model is all-optional, so no selector is needed beside the field under test: {} is valid.
+_NAIVE_SEARCH_BOUNDS: dict[str, datetime] = {
+    'start': datetime(2026, 1, 1),
+    'end': datetime(2026, 3, 1),
+    'created_at': datetime(2026, 2, 1, 9, 30),
+    'updated_at': datetime(2026, 2, 2, 16, 45),
+}
+
+
+@pytest.mark.parametrize('form', ['object', 'text'])
+@pytest.mark.parametrize('field', sorted(_NAIVE_SEARCH_BOUNDS))
+def test_a_naive_dataset_search_bound_is_refused_at_its_own_field(field: str, form: str):
+    """REFUSE, per field, on the dataset search: user ruling D2 = (A), tj-vhboky.20, 2026-09-27.
+
+    Before fa1d7ee all four were plain ``datetime | None``, so an offset-less value validated and
+    search_entries compared it against a timestamptz column in the Postgres SESSION timezone -- the
+    same search returning different datasets on differently configured hosts.
+
+    The error list is asserted EXACTLY -- one error, at this field, of type ``timezone_aware`` -- so a
+    refusal for another reason cannot satisfy it, and a CONVERT implementation (an after-validator
+    attaching UTC) reds it. The ``text`` form is what the route actually receives: FastAPI binds this
+    model with Query(), so every value arrives as a string, and a before-validator that parsed text
+    and attached a zone could refuse the object while accepting the string.
+
+    Args:
+        field: The time filter sent without an offset.
+        form: A Python datetime, or its offset-less ISO text.
+    """
+    naive = _NAIVE_SEARCH_BOUNDS[field]
+    value = naive if form == 'object' else naive.isoformat()
+    if form == 'text':
+        assert value == naive.strftime('%Y-%m-%dT%H:%M:%S'), 'the fixture must carry no offset'
+
+    with pytest.raises(ValidationError) as excinfo:
+        StoreAssetDatasetQuery(**{field: value})
+    assert [(error['loc'], error['type']) for error in excinfo.value.errors()] == [((field,), 'timezone_aware')]
+
+
+@pytest.mark.parametrize(
+    ('suffix', 'zone'), [('Z', UTC), ('-05:00', timezone(timedelta(hours=-5)))], ids=['zulu', 'nonzero-offset']
+)
+@pytest.mark.parametrize('field', sorted(_NAIVE_SEARCH_BOUNDS))
+def test_an_offset_bearing_dataset_search_bound_is_accepted_as_the_instant_it_names(
+    field: str, suffix: str, zone: timezone
+):
+    """The success half: the refusal above is also satisfied by a field that refuses EVERYTHING.
+
+    The non-zero offset is compared as the INSTANT it names, which separates honouring the offset
+    from dropping it: read as UTC, ``-05:00`` would filter five hours early. The offset itself is
+    asserted too, so a guard that normalised to UTC on the way in would be seen rather than
+    tolerated by the instant comparison alone.
+
+    Args:
+        field: The time filter sent with an offset.
+        suffix: The offset designator appended to the ISO text.
+        zone: The zone that designator names.
+    """
+    built = StoreAssetDatasetQuery(**{field: _NAIVE_SEARCH_BOUNDS[field].isoformat() + suffix})
+
+    value = getattr(built, field)
+    assert value.tzinfo is not None
+    assert value == _NAIVE_SEARCH_BOUNDS[field].replace(tzinfo=zone)
+    assert value.utcoffset() == zone.utcoffset(None)
+    assert built.model_fields_set == {field}
+
+
+@pytest.mark.parametrize('field', sorted(_NAIVE_SEARCH_BOUNDS))
+def test_a_dataset_search_bound_stays_optional_and_none_means_no_constraint(field: str):
+    """Tightening to AwareDatetime must not have tightened away the None default.
+
+    An absent time filter is "no constraint on that column" (tj-vhboky.1 section 8), and
+    search_entries skips every None value. An explicit null must be accepted as the same thing, not
+    refused as a value that is not aware.
+
+    Args:
+        field: The time filter.
+    """
+    field_info = StoreAssetDatasetQuery.model_fields[field]
+    assert not field_info.is_required()
+    assert field_info.default is None
+    assert getattr(StoreAssetDatasetQuery(), field) is None
+    assert getattr(StoreAssetDatasetQuery(**{field: None}), field) is None

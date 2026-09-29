@@ -348,6 +348,93 @@ def test_a_request_overlapping_nothing_is_written_and_answers_200(post_dataset):
 
 
 # ---------------------------------------------------------------------------------------------
+# A naive datetime is refused at the edge (tj-1bl90i)
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ('field', 'offset_less'),
+    [('start', '2026-01-01T00:00:00'), ('end', '2026-03-01T00:00:00'), ('expiry', '2026-02-01T00:00:00')],
+)
+def test_an_offset_less_datetime_answers_422_naming_its_field_and_writes_nothing(
+    post_dataset, field: str, offset_less: str
+):
+    """THE CALLER'S VIEW OF THE USER RULING ON tj-1bl90i (2026-09-27): REFUSE, for start, end and expiry.
+
+    All three land in timestamptz columns, where an offset-less value is read in the Postgres SESSION
+    timezone. The schema-level refusal is pinned in schemas/tests/test_schemas_smoke_data_store.py;
+    what only this layer shows is that the refusal reaches the caller as a 422 naming the field --
+    not a 500 from a ValidationError raised deeper in the worker, where AssetDatasetStoreCreate is
+    rebuilt from the body -- and that it happens BEFORE anything is sent to the database or to ingest.
+    The session is given no canned results at all, so a single statement would fail the test on its
+    own assertion.
+
+    Args:
+        post_dataset: Drives the real POST route against a fake session.
+        field: The datetime field sent without an offset.
+        offset_less: Its ISO-8601 text, with no 'Z' and no offset.
+    """
+    session = FakeSession()
+    rpc_clients = RecordingRpcClients()
+
+    response = post_dataset(session, rpc_clients, REQUEST_BODY | {field: offset_less})
+
+    assert response.status_code == 422, f'an offset-less {field} answered {response.status_code}: {response.text}'
+    assert [(error['loc'], error['type']) for error in response.json()['detail']] == [
+        (['body', field], 'timezone_aware')
+    ], f'the 422 does not name {field} as timezone_aware: {response.text}'
+    assert session.statements == [], 'a request refused at the edge still reached the database'
+    assert rpc_clients.client.requests == [], 'ingest was asked to fetch data for a request that was refused'
+
+
+# The GET on the same address: the dataset SEARCH, bound to StoreAssetDatasetQuery with Query().
+SEARCH_ROUTE_NAME = 'get_data'
+
+
+@pytest.mark.parametrize(
+    ('field', 'offset_less'),
+    [
+        ('start', '2026-01-01T00:00:00'),
+        ('end', '2026-03-01T00:00:00'),
+        ('created_at', '2026-02-01T09:30:00'),
+        ('updated_at', '2026-02-02T16:45:00'),
+    ],
+)
+def test_an_offset_less_search_bound_answers_422_naming_its_field_and_reads_nothing(field: str, offset_less: str):
+    """THE CALLER'S VIEW OF USER RULING D2 = (A) ON tj-vhboky.20 (2026-09-27): REFUSE, on the search too.
+
+    GET /store/{asset_type}/{data_type}/{asset_symbol} filters store_dataset_entry by these four
+    bounds, compared against timestamptz columns, where an offset-less value is read in the Postgres
+    SESSION timezone. fa1d7ee made them AwareDatetime; the schema-level refusal is pinned in
+    schemas/tests/test_schemas_smoke_data_store.py. What only this layer shows is that the refusal
+    reaches the caller as a 422 at ``['query', field]`` -- the route binds the model with Query(), so
+    a Depends() or body binding would name a different location -- and that it happens before
+    search_entries runs. The session is given no canned results, so a single statement would fail on
+    the session's own assertion as well as on the empty-statements check.
+
+    The GET carries no instance-secret guard (only the write routes do; test_http_smoke.py pins
+    which), so no header is sent and the 422 cannot be a 401 in disguise.
+
+    Args:
+        field: The time filter sent without an offset.
+        offset_less: Its ISO-8601 text, with no 'Z' and no offset.
+    """
+    session = FakeSession()
+    app.dependency_overrides[async_db] = lambda: session
+    try:
+        response = TestClient(app).get(app.url_path_for(SEARCH_ROUTE_NAME, **PATH_PARAMS), params={field: offset_less})
+    finally:
+        # `app` is a module-level singleton other test modules import.
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 422, f'an offset-less {field} answered {response.status_code}: {response.text}'
+    assert [(error['loc'], error['type']) for error in response.json()['detail']] == [
+        (['query', field], 'timezone_aware')
+    ], f'the 422 does not name {field} as timezone_aware: {response.text}'
+    assert session.statements == [], 'a search refused at the edge still reached the database'
+
+
+# ---------------------------------------------------------------------------------------------
 # Whose principal the write lands under
 # ---------------------------------------------------------------------------------------------
 

@@ -1,7 +1,7 @@
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic import AwareDatetime, ConfigDict, Field, field_validator, model_validator
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateType
@@ -59,8 +59,17 @@ class StoreAssetDatasetBody(InboundContract):
     # beginning cannot be checked for growth-only extension. The column is NOT NULL and the entry
     # upsert drops None values, so an absent start used to fail on a constraint deep in the write
     # rather than on validation at the edge. Fixed by making the body honest, not the column loose.
-    start: datetime
-    end: datetime | None = None
+    #
+    # AwareDatetime on start, end AND expiry, and the choice is REFUSE, not convert (user ruling on
+    # tj-1bl90i, 2026-09-27). All three land in timestamptz columns, where a naive value is read in
+    # the SESSION timezone -- an environment-dependent instant, silently. Assuming UTC for the
+    # caller was offered and declined: it is the same guess, just moved into our code. So a value
+    # with no offset is a 422 naming the field, in line with InboundContract's reject-don't-guess
+    # stance. These annotations are inherited by AssetDatasetStoreCreate, AssetDatasetStoreUpdate
+    # and the read model AssetDatasetStore (start/end); that is safe because every one of them is
+    # either built from this body or read off timestamptz columns, which always come back aware.
+    start: AwareDatetime
+    end: AwareDatetime | None = None
 
     # default_factory, not a computed default: a plain default is evaluated once at import, so
     # every instance in a long-lived process would share an expiry frozen at process start.
@@ -77,7 +86,7 @@ class StoreAssetDatasetBody(InboundContract):
     # field is still fine and still means "a day from now"; only an explicit null now 422s, naming
     # the field, at the edge. Fixed the same way `start` was under tj-6yk4qs: make the declared
     # contract honest, rather than patch the handler into tolerating a body it should have refused.
-    expiry: datetime = Field(default_factory=lambda: datetime.now(UTC) + timedelta(days=1))
+    expiry: AwareDatetime = Field(default_factory=lambda: datetime.now(UTC) + timedelta(days=1))
     expiry_type: ExpiryType = ExpiryType.BULK
     update_type: UpdateType = UpdateType.STATIC
 
@@ -128,12 +137,17 @@ class StoreAssetDatasetQuery(InboundContract):
     # (data/store/app/database/crud/stock/store_dataset_entry.py), so any search that actually
     # named a tape raised rather than filtered.
     granularity: Granularity | None = None
-    start: datetime | None = None
-    end: datetime | None = None
+    # AwareDatetime on every time bound, and REFUSE, not convert (user ruling D2 = A on
+    # tj-vhboky.20, the tj-1bl90i rule applied to the read side). These are compared against
+    # timestamptz columns, where a naive bound is read in the SESSION timezone, so the same search
+    # would return different rows on differently configured hosts. A value with no offset is a 422
+    # naming the field; a caller typing ?start=2026-01-01 must add an offset or Z.
+    start: AwareDatetime | None = None
+    end: AwareDatetime | None = None
     expiry_type: ExpiryType | None = None
     update_type: UpdateType | None = None
-    created_at: datetime | None = None
-    updated_at: datetime | None = None
+    created_at: AwareDatetime | None = None
+    updated_at: AwareDatetime | None = None
 
     @field_validator('expiry_type', mode='before')
     def validate_expiry_type(cls, value):

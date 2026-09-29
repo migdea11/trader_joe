@@ -1,5 +1,6 @@
-from datetime import datetime
 from uuid import UUID
+
+from pydantic import AwareDatetime
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
@@ -33,10 +34,14 @@ class BaseGetDatasetRequest(InboundContract):
     feed: Feed | None = None
 
     granularity: Granularity
-    start: datetime
-    end: datetime | None
+    # AwareDatetime, REFUSE not convert (user ruling D2 = A on tj-vhboky.20, the tj-1bl90i rule).
+    # The one in-tree sender, data/store/app/ingest/data_action_request.py, builds this from
+    # StoreAssetDatasetBody, whose start/end/expiry are already aware, and the RPC carries it as
+    # model_dump_json(), which keeps the offset -- so tightening this receiver breaks no sender.
+    start: AwareDatetime
+    end: AwareDatetime | None
 
-    expiry: datetime
+    expiry: AwareDatetime
     expiry_type: ExpiryType
     update_type: UpdateType
 

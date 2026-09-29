@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Body, Depends
+from fastapi import APIRouter, Body, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.enums.data_select import AssetType, DataType
@@ -53,7 +53,9 @@ async def create_stock_market_activity_data(
 
 @router.get(AssetDataInterface.GET_ASSET_DATA, response_model=list[StockDataMarketActivity])
 async def read_stock_market_activity_data(
-    db: Annotated[AsyncSession, Depends(async_db)], asset_path: Annotated[AssetDataPath, Depends()]
+    db: Annotated[AsyncSession, Depends(async_db)],
+    asset_path: Annotated[AssetDataPath, Depends()],
+    asset_query: Annotated[StockDataMarketActivityQuery, Query()],
 ):
     """Read stock market activity data.
 
@@ -61,24 +63,30 @@ async def read_stock_market_activity_data(
     to call, read_all_asset_market_activity_data, no longer exists -- tj-vhboky.5 deleted it, and
     this route was left pointing at the deleted name, a 500 on every call.
 
-    NO QUERY DEPENDENCY IS BOUND HERE, DELIBERATELY, THOUGH read_market_activity_data ACCEPTS ONE.
-    The architect's plan (tj-vhboky.8 Amendment 2, item S) asks for a real optional query
-    (asset_symbol, granularity, start, end, dataset_id) bound to this route. That is parked: the
-    user has an open question about whether the filtering read should be wired end to end, and a
-    separate task owns it. Binding StockDataMarketActivityQuery as a route parameter here would
-    also change this route's request signature and therefore its line in
-    routers/tests/interface_manifest/data_store.manifest -- the validator's file, out of scope for
-    a builder-store change. See the handback for the full reasoning.
+    THE QUERY IS BOUND WITH Query(), NOT Depends() (tj-vhboky.25 item 1, measured on FastAPI
+    0.141.1): Query() honours the model's extra='forbid', so an unknown query parameter is a 422
+    rather than being silently dropped, which is the same defect class as tj-6z03hd.
 
-    THE CONSEQUENCE: an empty StockDataMarketActivityQuery() is built here with every field unset,
-    which read_market_activity_data treats as "no constraint on that column" -- so this route
-    still reads every row of stock_market_activity, unfiltered and unbounded, exactly as it did
-    before this fix. Only the function it reaches is now one that exists. Do not read the absence
-    of a 500 as the full-table-scan defect (tj-xoz4ll) being closed; it is not.
+    dataset_id, asset_symbol, source, feed and granularity each filter on an exact match when
+    given; an absent parameter puts no constraint on that column (tj-vhboky.1 section 8). start
+    and end bound the timestamp range and are INCLUSIVE (timestamp >= start, timestamp <= end);
+    both are AwareDatetime, so a naive start or end is refused with a 422 (loc ['query',
+    '<field>'], type timezone_aware), and an unknown parameter is refused with a 422 (loc ['query',
+    '<name>'], type extra_forbidden), both before the handler runs. Results are ordered by
+    timestamp, then dataset_id, and no other column (user ruling, tj-vhboky.25 addendum) --
+    deterministic today because one feed serves one deployment, and by construction once feed
+    joins the dataset entry's identity (tj-rh4b7f), since a dataset then has exactly one feed.
+
+    A QUERY NAMING NEITHER dataset_id NOR asset_symbol IS REFUSED: a model_validator on the shared
+    AssetDataQuery (tj-vhboky.26) raises before the handler runs, reported as a 422 (loc ['query'],
+    type value_error), so an unbounded read of the whole table cannot be expressed. THE SAME RULE
+    ALSO REFUSES A BLANK asset_symbol ('' or whitespace only), reported with the same 422 (loc
+    ['query'], type value_error), even when dataset_id is given (tj-vhboky.28): a blank symbol
+    names no symbol, so it is treated as if neither selector had been named.
     """
     log.debug(f'Reading data: /{asset_path.asset_type}/{asset_path.data_type}')
     match (asset_path.asset_type, asset_path.data_type):
         case (AssetType.STOCK, DataType.MARKET_ACTIVITY):
-            return await crud_stock_market_activity.read_market_activity_data(db, StockDataMarketActivityQuery())
+            return await crud_stock_market_activity.read_market_activity_data(db, asset_query)
         case _:
             raise UnsupportedAssetType(asset_path.asset_type)

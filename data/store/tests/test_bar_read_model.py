@@ -88,18 +88,19 @@ def test_the_bar_model_carries_no_dead_column(dead_column: str):
     assert dead_column not in emitted and dead_column not in emitted['data'], f'to_schema emits {dead_column}'
 
 
+# Plain dicts, and the query is built INSIDE the test (tj-vhboky.26 architect gate). Built here, at
+# collection, a future tightening of the query model would crash the whole module with a collection
+# error instead of redding the one case it breaks.
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    'query',
+    'query_fields',
     [
-        StockDataMarketActivityQuery(dataset_id=DATASET_ID),
-        StockDataMarketActivityQuery(
-            asset_symbol='aapl', granularity=Granularity.ONE_DAY, start=TIMESTAMP, end=TIMESTAMP
-        ),
+        {'dataset_id': DATASET_ID},
+        {'asset_symbol': 'aapl', 'granularity': Granularity.ONE_DAY, 'start': TIMESTAMP, 'end': TIMESTAMP},
     ],
     ids=['dataset-scoped', 'symbol-granularity-range'],
 )
-async def test_the_read_path_converts_rows_with_to_schema(query: StockDataMarketActivityQuery):
+async def test_the_read_path_converts_rows_with_to_schema(query_fields: dict):
     """tj-vhboky.11 item 15: to_schema(), not model_validate(), on the rows the read returns.
 
     model_validate on a flat ORM row raises -- the read schema nests OHLCV under `data`
@@ -111,8 +112,10 @@ async def test_the_read_path_converts_rows_with_to_schema(query: StockDataMarket
     "BOTH BRANCHES" (the bead's wording) no longer exists: the read was an if/else on dataset_id
     and is now one statement built from optional conditions. Both query shapes that used to pick a
     branch are driven, so a branch coming back with the old call in it is still caught. The empty
-    query is deliberately NOT driven: what it should do is tj-vhboky.11 item 23, held on tj-xoz4ll.
+    query is deliberately NOT driven: it can no longer be constructed (tj-vhboky.26), which is
+    pinned in schemas/tests/test_schemas_smoke_data_store.py and, over HTTP, test_filtering_read.py.
     """
+    query = StockDataMarketActivityQuery(**query_fields)
     rows = [_row(1, close=1.5), _row(2, close=2.5)]
     db = _ReadSession(rows)
 

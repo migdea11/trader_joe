@@ -153,32 +153,41 @@ async def batch_create_market_activity_data(
         raise
 
 
-# TODO replace with a search function
 async def read_market_activity_data(
     db: AsyncSession, request: market_activity_data.StockDataMarketActivityQuery
 ) -> list[market_activity_data.StockDataMarketActivity]:
     log.debug('Reading stock market activity dataset')
     asset_table = StockMarketActivity
 
-    # If using subset of dataset
+    # Each predicate tests "is not None", not truthiness: a falsy-but-set value (an enum member
+    # whose value is falsy, a UUID, etc.) must still filter. An absent field means "no constraint
+    # on that column" (tj-vhboky.1 section 8).
     conditions = []
-    if request.dataset_id:
+    if request.dataset_id is not None:
         # This filter is trustworthy again. dataset_id is part of the bar's natural key
         # (BaseMarketActivity.NATURAL_KEY) and is NOT in StockMarketActivity.MUTABLE_COLUMNS, so
         # an overlapping re-fetch through a different dataset entry writes a DIFFERENT ROW rather
         # than re-owning this one. The last-write-wins ownership that made this filter lie
         # (tj-k207b7) is gone by construction, not by discipline.
         conditions.append(asset_table.dataset_id == request.dataset_id)
-    if request.asset_symbol:
+    if request.asset_symbol is not None:
         conditions.append(asset_table.asset_symbol == request.asset_symbol)
-    if request.granularity:
+    if request.source is not None:
+        conditions.append(asset_table.source == request.source)
+    if request.feed is not None:
+        conditions.append(asset_table.feed == request.feed)
+    if request.granularity is not None:
         conditions.append(asset_table.granularity == request.granularity)
-    if request.start:
+    if request.start is not None:
         conditions.append(asset_table.timestamp >= request.start)
-    if request.end:
+    if request.end is not None:
         conditions.append(asset_table.timestamp <= request.end)
 
-    stmt = select(asset_table).filter(*conditions)
+    # ORDER BY timestamp, dataset_id -- NOTHING ELSE (user ruling, tj-vhboky.25 addendum, 21:41
+    # UTC 2026-09-27). No row id: this is deterministic today because one feed serves one
+    # deployment, and by construction once feed joins the dataset entry's identity (tj-rh4b7f),
+    # since a dataset then has exactly one feed.
+    stmt = select(asset_table).filter(*conditions).order_by(asset_table.timestamp, asset_table.dataset_id)
     results = await db.execute(stmt)
     db_asset_market_activities = results.scalars().all()
     return [obj.to_schema() for obj in db_asset_market_activities]
