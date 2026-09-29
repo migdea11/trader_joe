@@ -15,6 +15,7 @@ import configparser
 import copy
 import fnmatch
 import importlib
+import ipaddress
 import os
 import re
 import shlex
@@ -1844,17 +1845,33 @@ SYSTEM_SUITE_DIR = 'tests/system'
 SYSTEM_TARGET = 'test-system'
 SYSTEM_GUARD = 'SYSTEM_TEST_DISPOSABLE_DB'
 
-# The values the recipe reads out of .env, and the name the suite receives each one under. The
-# names are data_store's own, so both sides of the mapping are the same key.
-SYSTEM_ENV_FILE_KEYS = (
-    'DATA_STORE_PORT',
-    'DATABASE_PORT',
-    'POSTGRES_USER',
-    'POSTGRES_PASS',
-    'POSTGRES_DB_NAME',
-    'INSTANCE_WRITE_SECRET',
-)
 SYSTEM_SECRET_KEYS = ('POSTGRES_PASS', 'INSTANCE_WRITE_SECRET')
+
+# THE SYSTEM-TEST CLIENT (decision record tj-q9ae5u addendum 1 items 4' and 6'; N3 tj-ijpys9.10).
+# make test-system no longer runs pytest on the host: it runs test_client, a container on the
+# stack's own networks, and the env contract is set in that service's environment block.
+TEST_CLIENT_FILE = REPO_ROOT / 'docker-compose.test-client.yaml'
+TEST_CLIENT_SERVICE = 'test_client'
+# store_api for data_store's API, store_db because the suite seeds and checks through Postgres (the
+# documented harness-only exception; a strategy client joins store_api alone).
+TEST_CLIENT_NETWORKS = frozenset({'store_api', 'store_db'})
+TEST_CLIENT_GROUPS = frozenset({'base', 'data-store', 'testing'})
+# Allowed in the client's environment beside the contract, and nothing else.
+TEST_CLIENT_EXTRA_ENV = frozenset({'PYTHONDONTWRITEBYTECODE'})
+# The contract values the suite cannot default: compose interpolates each from the project env
+# file, with no default and no :? guard, and conftest's _contract fails naming a missing one.
+SYSTEM_INTERPOLATED_KEYS = frozenset({'POSTGRES_USER', 'POSTGRES_DB_NAME', 'POSTGRES_PASS', 'INSTANCE_WRITE_SECRET'})
+SYSTEM_CONFTEST = REPO_ROOT / 'tests' / 'system' / 'conftest.py'
+# Makefile variables naming the other compose sets. None may load the client file.
+OTHER_COMPOSE_VARIABLES = ('PROD_COMPOSE', 'DEV_COMPOSE', 'TOOLS_COMPOSE', 'AGENT_COMPOSE')
+TEST_CLIENT_COMPOSE_VARIABLE = 'TEST_CLIENT_COMPOSE'
+# A loopback address in any spelling a URL or a curl would use.
+_LOOPBACK = re.compile(r'127\.0\.0\.1|\blocalhost\b|\[::1\]|0\.0\.0\.0')
+# `docker compose run` options that take a value, so the service can be told from a value.
+_COMPOSE_RUN_VALUE_OPTIONS = frozenset(
+    {'--entrypoint', '-e', '--env', '-w', '--workdir', '-u', '--user', '-v', '--volume', '-p', '--publish'}
+    | {'-l', '--label', '--name', '--env-from-file', '--pull', '--cap-add', '--cap-drop'}
+)
 
 # The env contract the suite reads, by EQUALITY: a new variable in the contract is a deliberate
 # edit to this set, in the same diff as the Makefile comment that documents it.
@@ -1878,12 +1895,6 @@ SYSTEM_ENV_CONTRACT = frozenset(
 # Words that open a compound command rather than name the command run.
 _SHELL_KEYWORDS = frozenset({'if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', '{', '}', '!'})
 
-# `name=$(helper KEY)`: a shell variable captured from the recipe's .env reader.
-_ENV_CAPTURE = re.compile(r'^(\w+)=\$\((\w+) (\w+)\)$')
-
-# `name() { body };` at the start of a logical line: a shell function definition.
-_SHELL_FUNCTION = re.compile(r'^(\w+)\(\)\s*\{(.*?)\};')
-
 
 def _subprocess_env(**overrides: str | None) -> dict[str, str]:
     """This process's environment with the named variables replaced, or removed when None."""
@@ -1897,20 +1908,38 @@ def _subprocess_env(**overrides: str | None) -> dict[str, str]:
     return env
 
 
+def _expanded_make_variable(name: str, cwd: Path, env: dict[str, str]) -> str:
+    """The value make gives a variable once the whole Makefile is parsed, under `env`, from `cwd`.
+
+    Unlike _make_variable, which returns the assignment's source text, this is what make itself
+    sees: `$(VENV_DIR)/...` resolved through UV_PROJECT_ENVIRONMENT, `$(DEV_COMPOSE) -f ...` spelled
+    out. Nothing runs but the one print rule.
+    """
+    assert shutil.which('make'), 'make is not on PATH, so the Makefile cannot be exercised'
+    command = ['make', '-s', '--no-print-directory', '-C', str(cwd), '-f', str(MAKEFILE)]
+    command += ['--eval', 'print-value-%: ; @: $(info $($*))', f'print-value-{name}']
+    result = subprocess.run(command, capture_output=True, text=True, env=env, check=False)
+    assert result.returncode == 0, f'make could not evaluate {name}: {result.stderr}'
+    return result.stdout.rstrip('\n')
+
+
 def _run_make(cwd: Path, *arguments: str, env: dict[str, str]) -> subprocess.CompletedProcess:
     """Run the repository Makefile from `cwd`, never remaking the venv marker.
 
     `-o` treats the marker as up to date, so no `uv sync` runs from a directory that has no
-    pyproject.toml, and the recipe under test is the only thing make executes.
+    pyproject.toml, and the recipe under test is the only thing make executes. The marker is
+    passed as make EXPANDS it: since tj-3t2axg it is `$(VENV_DIR)/...`, and that source text,
+    passed to -o, names no target at all and protects nothing.
     """
     assert shutil.which('make'), 'make is not on PATH, so the Makefile target cannot be exercised'
-    command = ['make', '--no-print-directory', '-C', str(cwd), '-f', str(MAKEFILE), '-o', _make_variable('VENV_MARKER')]
+    marker = _expanded_make_variable('VENV_MARKER', cwd, env)
+    command = ['make', '--no-print-directory', '-C', str(cwd), '-f', str(MAKEFILE), '-o', marker]
     return subprocess.run([*command, *arguments], capture_output=True, text=True, env=env, check=False)
 
 
-def _system_recipe_lines(cwd: Path) -> list[str]:
+def _system_recipe_lines(cwd: Path, *arguments: str) -> list[str]:
     """The test-system recipe as make expands it, one logical shell line per entry, not executed."""
-    result = _run_make(cwd, '-n', SYSTEM_TARGET, env=_subprocess_env(**{SYSTEM_GUARD: None}))
+    result = _run_make(cwd, '-n', SYSTEM_TARGET, *arguments, env=_subprocess_env(**{SYSTEM_GUARD: None}))
     assert result.returncode == 0, f'`make -n {SYSTEM_TARGET}` failed: {result.stderr}'
     folded = re.sub(r'\\\n\t?', ' ', result.stdout)
     lines = [line.strip() for line in folded.splitlines() if line.strip()]
@@ -1924,42 +1953,58 @@ def _command_name(command: list[str]) -> str:
     return PurePosixPath(words[0]).name if words else ''
 
 
-def _assignments(command: list[str]) -> dict[str, str]:
-    """The `NAME=value` prefix of a simple command, i.e. the environment it hands the command."""
-    assigned = {}
-    for word in command:
-        name, separator, value = word.partition('=')
-        if not separator or not re.fullmatch(r'[A-Za-z_]\w*', name):
-            break
-        assigned[name] = value
-    return assigned
+def _compose_calls(line: str) -> list[tuple[list[str], list[str]]]:
+    """Each docker compose invocation on a line, as (its -f files, the words after its options).
+
+    The second item starts with the subcommand.
+    """
+    calls = []
+    for match in _COMPOSE_INVOCATION.finditer(line):
+        words = line[match.end() :].split()
+        files, position = [], 0
+        while position < len(words) and words[position].startswith('-'):
+            option, equals, value = words[position].partition('=')
+            if option in ('-f', '--file'):
+                if not equals:
+                    position += 1
+                    value = words[position] if position < len(words) else ''
+                files.append(value.strip('\'"'))
+            elif option in _COMPOSE_VALUE_OPTIONS and not equals:
+                position += 1
+            position += 1
+        calls.append((files, words[position:]))
+    return calls
 
 
-def _env_reader(lines: list[str]) -> tuple[str, str]:
-    """The (name, body) of the shell function the recipe reads .env through. Exactly one."""
-    readers = [
-        (m.group(1), m.group(2)) for line in lines if (m := _SHELL_FUNCTION.match(line)) and '.env' in m.group(2)
-    ]
-    assert len(readers) == 1, f'expected one shell function reading .env in the {SYSTEM_TARGET} recipe, found {readers}'
-    return readers[0]
+def _compose_service(rest: list[str]) -> tuple[str, list[str], list[str]]:
+    """Split a compose subcommand's words into (service, its options, the words after the service)."""
+    options, position = [], 1
+    while position < len(rest) and rest[position].startswith('-'):
+        options.append(rest[position])
+        if rest[position] in _COMPOSE_RUN_VALUE_OPTIONS:
+            position += 1
+            options.append(rest[position] if position < len(rest) else '')
+        position += 1
+    service = rest[position] if position < len(rest) else ''
+    return service, options, rest[position + 1 :]
 
 
-def _env_captures(lines: list[str]) -> dict[str, str]:
-    """Map each .env key the recipe reads to the shell variable it is captured in."""
-    reader, _ = _env_reader(lines)
-    captures = {}
-    for line in lines:
-        for command in _commands(line):
-            for word in command:
-                if (match := _ENV_CAPTURE.match(word)) and match.group(2) == reader:
-                    captures[match.group(3)] = match.group(1)
-    return captures
+def _test_client() -> dict:
+    services = _load_yaml(TEST_CLIENT_FILE).get('services') or {}
+    assert list(services) == [TEST_CLIENT_SERVICE], (
+        f'{TEST_CLIENT_FILE.name} must define {TEST_CLIENT_SERVICE} and nothing else, found {list(services)}'
+    )
+    return services[TEST_CLIENT_SERVICE]
 
 
-def _pytest_command(lines: list[str]) -> list[str]:
-    commands = _commands(lines[-1])
-    assert commands, f'the last line of the {SYSTEM_TARGET} recipe holds no command: {lines[-1]}'
-    return commands[-1]
+def _service_networks(document: dict, service: str) -> set[str]:
+    """The network keys a compose service joins, list or mapping form."""
+    networks = ((document.get('services') or {}).get(service) or {}).get('networks') or []
+    return {str(name) for name in networks}
+
+
+def _client_file_pair() -> list[str]:
+    return [COMPOSE_FILE.name, TEST_CLIENT_FILE.name]
 
 
 def _mentions_variable(word: str, variable: str) -> bool:
@@ -2094,170 +2139,442 @@ def test_test_system_passes_the_guard_on_exactly_one(tmp_path: Path, arguments: 
 
 
 @pytest.mark.build_infra
-def test_test_system_reads_env_with_grep_and_never_sources_it(tmp_path: Path):
-    """tj-vhboky.48 item 2c: .env is read one key at a time, never loaded into the shell.
+def test_run_make_never_remakes_the_venv(tmp_path: Path):
+    """The -o in _run_make must name the marker make actually builds, or it protects nothing.
 
-    Sourcing it -- `. .env`, `source .env`, `set -a`, `eval` -- puts POSTGRES_PASS and the write
-    secret into the shell where one stray `set -x` or echo prints them (the CI Smoke Test step's
-    reasoning). So .env may appear in exactly two places: the existence check, and a grep inside
-    the one reader function whose output is only ever captured into a variable.
+    Every behavioural make test here runs from an empty directory. Were the marker remade there,
+    a test that runs a target for real would `uv venv` and `uv sync` into that directory. `make -n
+    test` (which depends on the marker) is the probe: with the guard working it prints pytest and
+    no sync at all.
     """
-    lines = _system_recipe_lines(tmp_path)
-    reader, body = _env_reader(lines)
-    assert re.match(r'^\s*grep\b', body), f'the .env reader {reader}() does not start with grep: {body!r}'
-
-    offenders = []
-    for line in lines:
-        # The reader's own definition is judged above; drop it so its grep is not judged twice.
-        judged = _SHELL_FUNCTION.sub('', line, count=1) if line.startswith(f'{reader}()') else line
-        for command in _commands(judged):
-            name = _command_name(command)
-            words = [word for word in command if word not in _SHELL_KEYWORDS]
-            allexport = name == 'set' and any(
-                (word.startswith(('-', '+')) and not word.startswith('--') and 'a' in word) or word == 'allexport'
-                for word in words[1:]
-            )
-            loads = name in ('.', 'source', 'eval', 'export') or allexport
-            reads_elsewhere = '.env' in words and words[:3] != ['[', '-f', '.env']
-            if loads or reads_elsewhere:
-                offenders.append(' '.join(command))
-            elif name == reader:
-                offenders.append(f'{" ".join(command)} (prints the value it reads)')
-            elif any(f'$({reader} ' in word and not _ENV_CAPTURE.match(word) for word in words):
-                offenders.append(f'{" ".join(command)} (reader output not captured into a variable)')
-    assert not offenders, (
-        f'the {SYSTEM_TARGET} recipe loads or reads .env outside the grep reader, or calls the reader '
-        f'outside a $(...) capture: {offenders}'
+    result = _run_make(tmp_path, '-n', 'test', env=_subprocess_env())
+    assert result.returncode == 0, f'`make -n test` failed: {result.stderr}'
+    assert 'uv sync' not in result.stdout and 'uv venv' not in result.stdout, (
+        f'_run_make let make remake the venv marker from an empty directory:\n{result.stdout}'
     )
-    assert set(_env_captures(lines)) == set(SYSTEM_ENV_FILE_KEYS), (
-        f'the recipe reads {sorted(_env_captures(lines))} from .env, expected {sorted(SYSTEM_ENV_FILE_KEYS)}'
-    )
+    assert 'pytest' in result.stdout, f'`make -n test` printed no pytest, so this probe saw nothing:\n{result.stdout}'
 
 
 @pytest.mark.build_infra
-def test_test_system_never_prints_a_secret(tmp_path: Path):
-    """tj-vhboky.48 item 2c: POSTGRES_PASS and INSTANCE_WRITE_SECRET never reach the output.
+def test_test_system_reads_nothing_from_env_and_never_loads_it(tmp_path: Path):
+    """N5 re-pin of tj-vhboky.48 item 2c, after N3: .env only has to EXIST.
 
-    The banner may NAME them; no echo or printf may expand the variables holding them, and no
-    shell tracing may be switched on, since `set -x` prints the pytest line with values expanded.
+    Compose interpolates the credentials into test_client itself, so the recipe has no reason to
+    open .env at all. It may test for the file -- one `[ -f .env ]` -- and nothing else: no grep, no
+    redirect, no --env-file, and never `.`, `source`, `eval`, `export` or `set -a`, which would pull
+    POSTGRES_PASS and the write secret into make's shell where a stray trace prints them.
     """
     lines = _system_recipe_lines(tmp_path)
-    captures = _env_captures(lines)
-    secrets = {key: captures.get(key) for key in SYSTEM_SECRET_KEYS}
-    assert all(secrets.values()), f'the recipe captures no variable for {secrets}, so this check would see nothing'
-
-    offenders = []
+    offenders, existence_checks = [], 0
     for line in lines:
         for command in _commands(line):
             name = _command_name(command)
             words = [word for word in command if word not in _SHELL_KEYWORDS]
-            tracing = name == 'set' and any(
-                (word.startswith('-') and not word.startswith('--') and ('x' in word or 'v' in word))
-                or word in ('xtrace', 'verbose')
+            if words[:4] == ['[', '-f', '.env', ']']:
+                existence_checks += 1
+                continue
+            allexport = name == 'set' and any(
+                (word.startswith(('-', '+')) and not word.startswith('--') and 'a' in word) or word == 'allexport'
                 for word in words[1:]
             )
-            if tracing:
+            touches = [
+                word for word in words if word == '.env' or word.endswith('/.env') or word.startswith('--env-file')
+            ]
+            if name in ('.', 'source', 'eval', 'export') or allexport or touches:
                 offenders.append(' '.join(command))
-            if name in ('echo', 'printf', 'tee', 'cat'):
-                leaked = [
-                    key for key, variable in secrets.items() if any(_mentions_variable(w, variable) for w in words)
-                ]
-                if leaked:
-                    offenders.append(f'{" ".join(command)} (prints {leaked})')
-    assert not offenders, f'the {SYSTEM_TARGET} recipe prints a secret or traces the shell: {offenders}'
+    assert not offenders, f'the {SYSTEM_TARGET} recipe reads or loads .env beyond its existence check: {offenders}'
+    assert existence_checks == 1, (
+        f'the {SYSTEM_TARGET} recipe must check once that .env exists (compose interpolates from it), '
+        f'found {existence_checks} checks'
+    )
 
 
 @pytest.mark.build_infra
-def test_test_system_fails_on_every_missing_env_value(tmp_path: Path):
-    """tj-vhboky.48 item 2b: each value read from .env is checked non-empty before pytest starts.
+def test_test_system_never_names_or_prints_a_secret(tmp_path: Path):
+    """N5 re-pin of tj-vhboky.48 item 2c: no recipe line names POSTGRES_PASS or INSTANCE_WRITE_SECRET.
 
-    One missing check means the suite starts with an empty password or port and fails somewhere
-    downstream with a message that names neither.
+    The secrets reach test_client from .env through compose and never pass through make's shell,
+    so the recipe has no business naming either -- not as an assignment, not as `-e NAME` on the
+    compose command line, not in the banner. And no shell tracing, which would print whatever the
+    shell expands.
     """
     lines = _system_recipe_lines(tmp_path)
-    checked = {
-        word.lstrip('$')
+    named = [line for line in lines if any(key in line for key in SYSTEM_SECRET_KEYS)]
+    assert not named, f'the {SYSTEM_TARGET} recipe names a secret variable: {named}'
+    tracing = [
+        ' '.join(command)
         for line in lines
         for command in _commands(line)
-        if (words := [w for w in command if w not in _SHELL_KEYWORDS])[:2] == ['[', '-n']
-        for word in words[2:3]
+        if _command_name(command) in ('set', 'bash', 'sh')
+        and any(
+            (word.startswith('-') and not word.startswith('--') and ('x' in word or 'v' in word))
+            or word in ('xtrace', 'verbose')
+            for word in command[1:]
+        )
+    ]
+    assert not tracing, f'the {SYSTEM_TARGET} recipe traces the shell: {tracing}'
+
+
+def _conftest_contract_names() -> set[str]:
+    """The CONTRACT_* names tests/system/conftest.py reads through _contract, by ast -- never imported."""
+    tree = ast.parse(SYSTEM_CONFTEST.read_text(encoding='utf-8'))
+    names = {
+        node.value.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id.startswith('CONTRACT_')
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
     }
-    unchecked = sorted(key for key, variable in _env_captures(lines).items() if variable not in checked)
-    assert not unchecked, f'the {SYSTEM_TARGET} recipe reads {unchecked} from .env without failing when empty'
+    assert names, f'{SYSTEM_CONFTEST.name} defines no CONTRACT_* names'
+    return names
+
+
+def _conftest_contract_function():
+    """Conftest's _contract, compiled on its own from the ast.
+
+    The module is NEVER imported: it lives outside the gate, and importing it would drag in its
+    fixtures and their imports.
+    """
+    tree = ast.parse(SYSTEM_CONFTEST.read_text(encoding='utf-8'))
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == '_contract']
+    assert len(functions) == 1, f'{SYSTEM_CONFTEST.name} must define one _contract, found {len(functions)}'
+    module = ast.Module(body=functions, type_ignores=[])
+    namespace = {'os': os, 'pytest': pytest}
+    exec(compile(module, str(SYSTEM_CONFTEST), 'exec'), namespace)
+    return namespace['_contract']
 
 
 @pytest.mark.build_infra
-def test_test_system_ends_on_pytest_over_the_system_suite(tmp_path: Path):
-    """tj-vhboky.48 item 2d: the recipe's last command IS pytest, so its exit status is make's.
+def test_every_interpolated_contract_value_is_plain_and_read_through_contract():
+    """N5 re-pin of tj-vhboky.48 item 2b, static half: the values the suite cannot default.
 
-    Anything after it -- `|| true`, `; exit 0`, a `| tee` -- turns pytest's exit 5 on an empty
-    selection, and every red, into a green make. The default path must be the suite itself, and
-    the PYTEST_ENV driver flags every test target sets must be there too.
+    test_client interpolates exactly these from .env, each as plain ${NAME}: a `:-default` would
+    hand the suite a made-up credential, and a `:?` guard is ruled out on purpose -- CI blanks
+    INSTANCE_WRITE_SECRET mid-job and still needs the client. Every ${...} anywhere in the block is
+    plain. And each interpolated name is one conftest reads through _contract, which is what fails.
     """
-    lines = _system_recipe_lines(tmp_path)
-    command = _pytest_command(lines)
-    assigned = _assignments(command)
-    invoked = command[len(assigned) :]
-    assert invoked[:3] == ['uv', 'run', 'pytest'], (
-        f'the {SYSTEM_TARGET} recipe does not end on `uv run pytest`: {command}'
+    environment = _compose_service_environment(TEST_CLIENT_FILE, TEST_CLIENT_SERVICE)
+    guarded = [
+        f'{key}={value}'
+        for key, value in environment.items()
+        for inner in re.findall(r'\$\{([^}]*)\}', value or '')
+        if not re.fullmatch(r'\w+', inner)
+    ]
+    assert not guarded, f'{TEST_CLIENT_SERVICE} interpolates with a default or a guard: {guarded}'
+    interpolated = {key for key, value in environment.items() if value == f'${{{key}}}'}
+    assert interpolated == SYSTEM_INTERPOLATED_KEYS, (
+        f'{TEST_CLIENT_SERVICE} interpolates {sorted(interpolated)} as ${{NAME}}, expected {sorted(SYSTEM_INTERPOLATED_KEYS)}'
     )
-    assert invoked[3:] == [SYSTEM_SUITE_DIR], (
-        f'the recipe runs pytest over {invoked[3:]}, expected [{SYSTEM_SUITE_DIR!r}]'
+    contract_names = _conftest_contract_names()
+    assert contract_names <= SYSTEM_ENV_CONTRACT, (
+        f'{SYSTEM_CONFTEST.name} reads {sorted(contract_names - SYSTEM_ENV_CONTRACT)} outside the contract'
+    )
+    unread = sorted(SYSTEM_INTERPOLATED_KEYS - contract_names)
+    assert not unread, (
+        f'{sorted(unread)} are interpolated but not read through _contract, so a missing one fails nowhere'
+    )
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize('key', sorted(SYSTEM_INTERPOLATED_KEYS))
+@pytest.mark.parametrize('state', ['missing', 'empty'])
+def test_a_missing_contract_value_fails_naming_it(monkeypatch: pytest.MonkeyPatch, key: str, state: str):
+    """N5 re-pin of tj-vhboky.48 item 2b, behavioural half: missing or empty FAILS, naming the variable.
+
+    The recipe used to check each value non-empty before pytest; that check now lives in conftest's
+    _contract, run here as written. A skip would be the silent green pytest.ini forbids, and a
+    message that did not name the variable would send the reader to the wrong place.
+    """
+    contract = _conftest_contract_function()
+    if state == 'missing':
+        monkeypatch.delenv(key, raising=False)
+    else:
+        monkeypatch.setenv(key, '')
+    with pytest.raises(pytest.fail.Exception) as failure:
+        contract(key)
+    assert key in str(failure.value), f'_contract failed on a {state} {key} without naming it: {failure.value}'
+
+    monkeypatch.setenv(key, 'present')
+    assert contract(key) == 'present', f'_contract did not return a set {key}'
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    ('arguments', 'suite'),
+    [
+        ([], SYSTEM_SUITE_DIR),
+        ([f'SYSTEM_PATHS={SYSTEM_SUITE_DIR}/test_http_bars.py'], f'{SYSTEM_SUITE_DIR}/test_http_bars.py'),
+    ],
+    ids=['default', 'scoped'],
+)
+def test_test_system_ends_on_the_client_run_over_the_system_suite(tmp_path: Path, arguments: list[str], suite: str):
+    """N5 re-pin of tj-vhboky.48 item 2d: the recipe ends on ONE compose run of test_client.
+
+    Over exactly docker-compose.yaml and docker-compose.test-client.yaml -- not the dev override,
+    so the client behaves the same against a dev stack and in CI -- removed on exit, no deps, the
+    suite (or SYSTEM_PATHS) last, and nothing after it: a `|| true`, a `; exit 0` or a `| tee` would
+    turn pytest's exit 5 on an empty selection, and every red, into a green make.
+    """
+    lines = _system_recipe_lines(tmp_path, *arguments)
+    last = lines[-1]
+    assert len(_commands(last)) == 1, f'the last line of {SYSTEM_TARGET} is more than one command: {last}'
+    calls = _compose_calls(last)
+    assert len(calls) == 1, f'{SYSTEM_TARGET} does not end on one docker compose invocation: {last}'
+    files, rest = calls[0]
+    assert files == _client_file_pair(), f'{SYSTEM_TARGET} runs compose over {files}, expected {_client_file_pair()}'
+    assert rest[:1] == ['run'], f'{SYSTEM_TARGET} ends on compose {rest[:1]}, not run: {last}'
+    service, options, trailing = _compose_service(rest)
+    assert service == TEST_CLIENT_SERVICE, f'{SYSTEM_TARGET} runs {service!r}, not {TEST_CLIENT_SERVICE}: {last}'
+    missing = {'--rm', '--no-deps'} - set(options)
+    assert not missing, f'the client run lacks {sorted(missing)}: {last}'
+    assert trailing == [suite], f'the client run is handed {trailing}, expected [{suite!r}]'
+
+
+@pytest.mark.build_infra
+def test_the_client_entrypoint_checks_tz_then_execs_pytest_with_its_arguments():
+    """The container half of item 2d: pytest is the container's main process, handed "$@".
+
+    The compose run's exit status is the container's, so the entrypoint must END by exec'ing pytest
+    -- anything after, or a pytest that is not exec'd, puts a shell's status in between. And the TZ
+    check that left the recipe (N3) runs here first. Run for real under sh, with the exec pointed
+    at nothing: a UTC zone must stop before it, naming TZ; a real non-UTC zone must reach it.
+    """
+    client = _test_client()
+    entrypoint = client.get('entrypoint')
+    assert isinstance(entrypoint, list) and entrypoint[1:2] == ['-c'] and len(entrypoint) == 4, (
+        f'{TEST_CLIENT_SERVICE} entrypoint must be [shell, -c, script, $0]: {entrypoint}'
+    )
+    shell, _, script, zero = entrypoint
+    script_lines = [line.strip() for line in script.strip().splitlines() if line.strip()]
+    final = shlex.split(script_lines[-1])
+    assert (
+        final[:1] == ['exec'] and PurePosixPath(final[1]).name == 'python' and final[2:] == ['-m', 'pytest', '$$@']
+    ), f'the {TEST_CLIENT_SERVICE} entrypoint must end on `exec <venv python> -m pytest "$$@"`: {script_lines[-1]!r}'
+    assert client.get('command') == [SYSTEM_SUITE_DIR], f'{TEST_CLIENT_SERVICE} command is {client.get("command")}'
+
+    # Compose unescapes $$ to $; the exec is pointed at a marker so a zone that passes is visible.
+    runnable = script.replace('$$', '$').replace(final[1], 'echo REACHED-EXEC')
+    for zone, reaches in (('UTC', False), ('America/Toronto', True)):
+        result = subprocess.run(
+            [shell, '-c', runnable, zero, SYSTEM_SUITE_DIR],
+            capture_output=True,
+            text=True,
+            env={**_subprocess_env(), 'TZ': zone},
+            check=False,
+        )
+        if reaches:
+            assert result.returncode == 0 and 'REACHED-EXEC -m pytest tests/system' in result.stdout, (
+                f'TZ={zone} did not reach pytest with its arguments (exit {result.returncode}; is tzdata '
+                f'installed here?): {result.stdout}{result.stderr}'
+            )
+        else:
+            assert result.returncode != 0 and 'REACHED-EXEC' not in result.stdout and 'TZ' in result.stderr, (
+                f'TZ={zone} was not refused before pytest, naming TZ (exit {result.returncode}): '
+                f'{result.stdout}{result.stderr}'
+            )
+
+
+@pytest.mark.build_infra
+def test_the_client_hands_the_suite_the_env_contract():
+    """N5 re-pin of tj-vhboky.48 item 2b: the contract, set in test_client's environment block.
+
+    - Exactly the contract's names, plus PYTHONDONTWRITEBYTECODE at most.
+    - Postgres and data_store are reached by compose SERVICE name, each a service of
+      docker-compose.yaml that shares a network with test_client; never loopback, which reaches
+      nothing from inside a container and nothing at all in prod, which publishes no port.
+    - DATABASE_PORT is the container port, 5432: the client is on the network.
+    - The secrets are ${NAME} interpolation, never literals.
+    - TZ is off UTC in both January and July, so a naive-to-timestamptz shift can go red.
+    - PYTHONPATH is the working directory: tests/system has no package chain to provide the root.
+    - The driver flags match $(PYTEST_ENV), as for every host test target.
+    """
+    client = _test_client()
+    environment = _compose_service_environment(TEST_CLIENT_FILE, TEST_CLIENT_SERVICE)
+    assert set(environment) - TEST_CLIENT_EXTRA_ENV == SYSTEM_ENV_CONTRACT, (
+        f'{TEST_CLIENT_SERVICE} sets {sorted(environment)}, expected exactly {sorted(SYSTEM_ENV_CONTRACT)} '
+        f'plus at most {sorted(TEST_CLIENT_EXTRA_ENV)}. Change the contract here and in the Makefile comment together.'
+    )
+
+    base = _load_yaml(COMPOSE_FILE)
+    client_networks = {str(name) for name in client.get('networks') or []}
+    url = re.fullmatch(r'http://([\w.-]+):\$\{APP_INTERNAL_PORT\}/?', environment['SYSTEM_TEST_DATA_STORE_URL'] or '')
+    assert url, (
+        f'SYSTEM_TEST_DATA_STORE_URL is {environment["SYSTEM_TEST_DATA_STORE_URL"]!r}, not http://<service>:${{APP_INTERNAL_PORT}}'
+    )
+    for key, host in (('DATABASE_NAME', environment['DATABASE_NAME']), ('SYSTEM_TEST_DATA_STORE_URL', url.group(1))):
+        assert host in (base.get('services') or {}), (
+            f'{key} points at {host!r}, which is not a service of {COMPOSE_FILE.name}: a client reaches the stack by service name'
+        )
+        shared = _service_networks(base, host) & client_networks
+        assert shared, (
+            f'{key} points at {host!r}, which shares no network with {TEST_CLIENT_SERVICE} ({sorted(client_networks)})'
+        )
+    assert environment['DATABASE_PORT'] == '5432', (
+        f'DATABASE_PORT is {environment["DATABASE_PORT"]!r}, not the container port'
+    )
+    assert int(environment['DATABASE_CONN_TIMEOUT'] or 0) > 0, (
+        'DATABASE_CONN_TIMEOUT must be a positive number of seconds'
+    )
+    for key in SYSTEM_SECRET_KEYS:
+        assert environment[key] == f'${{{key}}}', (
+            f'{key} is {environment[key]!r}: a secret is interpolated, never literal'
+        )
+    assert environment['PYTHONPATH'] == client.get('working_dir'), (
+        f'PYTHONPATH {environment["PYTHONPATH"]!r} is not the working_dir {client.get("working_dir")!r}'
     )
     for word in _make_variable('PYTEST_ENV').split():
         name, _, value = word.partition('=')
-        assert assigned.get(name) == value, f'the pytest command lost $(PYTEST_ENV)`s {word}: {assigned}'
+        assert environment.get(name) == value, f'{TEST_CLIENT_SERVICE} lost $(PYTEST_ENV)`s {word}'
 
-
-@pytest.mark.build_infra
-def test_test_system_hands_the_suite_the_env_contract(tmp_path: Path):
-    """tj-vhboky.48 item 2b: the contract, in one place, with the values the bead requires.
-
-    - Postgres and data_store are reached on loopback from the runner.
-    - Each .env-backed name carries the value read for that same key, so a swap is caught.
-    - The repository root is on PYTHONPATH: tests/system has no package chain to provide it.
-    - TZ is off UTC in both January and July, so a naive-to-timestamptz shift can go red on a
-      UTC runner in either season.
-    """
-    lines = _system_recipe_lines(tmp_path)
-    assigned = _assignments(_pytest_command(lines))
-    assert set(assigned) == set(SYSTEM_ENV_CONTRACT), (
-        f'the pytest command receives {sorted(assigned)}, expected exactly {sorted(SYSTEM_ENV_CONTRACT)}. '
-        f'Change the contract here and in the Makefile comment above {SYSTEM_TARGET} together.'
-    )
-    assert assigned['DATABASE_NAME'] == '127.0.0.1', (
-        f'DATABASE_NAME (the Postgres host) is {assigned["DATABASE_NAME"]!r}'
-    )
-    assert assigned['SYSTEM_TEST_DATA_STORE_URL'].startswith('http://127.0.0.1:'), assigned[
-        'SYSTEM_TEST_DATA_STORE_URL'
-    ]
-    assert Path(assigned['PYTHONPATH']).resolve() == tmp_path.resolve(), (
-        f'PYTHONPATH is {assigned["PYTHONPATH"]!r}, not the directory make runs in ({tmp_path})'
-    )
-
-    captures = _env_captures(lines)
-    for key in set(SYSTEM_ENV_FILE_KEYS) & set(SYSTEM_ENV_CONTRACT):
-        assert assigned[key] == f'${captures[key]}', f'{key} is handed {assigned[key]!r}, not the value read from .env'
-    assert _mentions_variable(assigned['SYSTEM_TEST_DATA_STORE_URL'], captures['DATA_STORE_PORT'])
-
-    zone = ZoneInfo(assigned['TZ'])
+    zone = ZoneInfo(environment['TZ'])
     for month in (1, 7):
         offset = datetime(2026, month, 15, 12, tzinfo=UTC).astimezone(zone).utcoffset()
-        assert offset, f'TZ={assigned["TZ"]} is UTC in month {month}, where a naive shift is invisible'
+        assert offset, f'TZ={environment["TZ"]} is UTC in month {month}, where a naive shift is invisible'
 
 
 @pytest.mark.build_infra
-def test_test_system_neither_starts_nor_migrates_the_stack(tmp_path: Path):
-    """tj-vhboky.48 item 2: which database gets touched stays the decision of whoever runs it."""
+def test_test_system_runs_only_the_client(tmp_path: Path):
+    """N5 re-pin of tj-vhboky.48 item 2: which database gets touched stays the runner's decision.
+
+    The only docker invocation in the recipe is that one run of test_client: no up, down, start or
+    exec, no alembic, no migration script, no nested make.
+    """
     lines = _system_recipe_lines(tmp_path)
-    forbidden = {'docker', 'docker-compose', 'alembic', MIGRATIONS_SCRIPT.name, 'make'}
+    docker = [
+        ' '.join(command)
+        for line in lines
+        for command in _commands(line)
+        if {'docker', 'docker-compose'} & {PurePosixPath(word).name for word in command}
+    ]
+    assert len(docker) == 1 and docker[0] == lines[-1], (
+        f'the {SYSTEM_TARGET} recipe must invoke docker exactly once, as its last line: {docker}'
+    )
+    forbidden = {'alembic', MIGRATIONS_SCRIPT.name, 'make'}
     offenders = [
         ' '.join(command)
         for line in lines
         for command in _commands(line)
         if forbidden & {PurePosixPath(word).name for word in command}
     ]
-    assert not offenders, f'the {SYSTEM_TARGET} recipe starts, stops or migrates something: {offenders}'
+    assert not offenders, f'the {SYSTEM_TARGET} recipe migrates or runs make: {offenders}'
+
+
+def _env_file_directories() -> set[PurePosixPath]:
+    """The directories that hold an env file any service of docker-compose.yaml loads."""
+    directories = set()
+    for spec in (_load_yaml(COMPOSE_FILE).get('services') or {}).values():
+        env_files = (spec or {}).get('env_file') or []
+        for entry in [env_files] if isinstance(env_files, str) else env_files:
+            path = entry.get('path') if isinstance(entry, dict) else entry
+            directories.add(PurePosixPath(os.path.normpath(str(path))).parent)
+    assert directories, f'no service in {COMPOSE_FILE.name} loads an env file, so this check would guard nothing'
+    return directories
+
+
+@pytest.mark.build_infra
+def test_the_test_client_service_is_shaped_as_the_design_says():
+    """tj-q9ae5u addendum 1 item 4', N3 item 2: networks, no ports, no env_file, read-only source.
+
+    - Networks exactly store_api and store_db, keys the base file declares: never devnet, never
+      ingest_store (unauthenticated data_ingest and the plaintext broker live there).
+    - No ports: nothing reaches into the client. No env_file: the secrets arrive by interpolation,
+      and an env_file would hand it pgAdmin's credentials or the ingest broker keys too.
+    - Every mount read-only, and none is the repository root, an env file, a directory holding one
+      (an env directory) or a virtual environment.
+    - no-new-privileges, like every service.
+    - The build target exists, copies no source (it is mounted) and syncs exactly the base,
+      data-store and testing groups, frozen, with curl for CI's probes and tzdata for TZ.
+    """
+    client = _test_client()
+    declared = set(_load_yaml(COMPOSE_FILE).get('networks') or {})
+    networks = {str(name) for name in client.get('networks') or []}
+    assert networks == TEST_CLIENT_NETWORKS, (
+        f'{TEST_CLIENT_SERVICE} joins {sorted(networks)}, expected {sorted(TEST_CLIENT_NETWORKS)}'
+    )
+    assert networks <= declared, (
+        f'{TEST_CLIENT_SERVICE} joins {sorted(networks - declared)}, undeclared in {COMPOSE_FILE.name}'
+    )
+    assert 'ports' not in client, f'{TEST_CLIENT_SERVICE} publishes ports: {client.get("ports")}'
+    assert 'env_file' not in client, f'{TEST_CLIENT_SERVICE} loads env files: {client.get("env_file")}'
+    assert 'no-new-privileges:true' in (client.get('security_opt') or []), (
+        f'{TEST_CLIENT_SERVICE} lacks no-new-privileges'
+    )
+
+    volumes = client.get('volumes') or []
+    assert volumes, f'{TEST_CLIENT_SERVICE} mounts nothing, so it has no suite to run'
+    env_directories = _env_file_directories()
+    offenders = []
+    for volume in volumes:
+        if isinstance(volume, dict):
+            source, read_only = str(volume.get('source', '')), volume.get('read_only') is True
+        else:
+            parts = str(volume).split(':')
+            source, read_only = parts[0], len(parts) == 3 and 'ro' in parts[2].split(',')
+        normal = PurePosixPath(os.path.normpath(source))
+        if not read_only:
+            offenders.append(f'{volume} (writable)')
+        if normal == PurePosixPath('.') or normal.name.startswith(('.env', '.venv')):
+            offenders.append(f'{volume} (the repository root, an env file or a virtual environment)')
+        if any(normal == directory or normal in directory.parents for directory in env_directories):
+            offenders.append(f'{volume} (contains an env file)')
+    assert not offenders, f'{TEST_CLIENT_SERVICE} mounts: {offenders}'
+
+    target = (client.get('build') or {}).get('target')
+    stages = _dockerfile_stages()
+    assert target in stages, f'{TEST_CLIENT_SERVICE} builds target {target!r}, which the Dockerfile does not define'
+    body = stages[target][1]
+    copies = [line.strip() for line in body.splitlines() if line.strip().upper().startswith(('COPY', 'ADD'))]
+    assert not copies, (
+        f'{target} copies files in; the source is bind-mounted, so a stale image could run old tests: {copies}'
+    )
+    syncs = [line for line in body.splitlines() if 'uv sync' in line]
+    assert len(syncs) == 1, f'{target} must run one uv sync, found {syncs}'
+    groups = set(re.findall(r'--only-group\s+(\S+)', syncs[0]))
+    assert groups == TEST_CLIENT_GROUPS and '--frozen' in syncs[0], (
+        f'{target} syncs {sorted(groups)} ({syncs[0].strip()}), expected {sorted(TEST_CLIENT_GROUPS)}, frozen'
+    )
+    for package in ('curl', 'tzdata'):
+        assert re.search(rf'apt-get install[^\n]*\b{package}\b', body), f'{target} does not install {package}'
+
+
+@pytest.mark.build_infra
+def test_no_other_compose_set_loads_the_client_file():
+    """tj-q9ae5u addendum 1 item 4': the client file is loaded ONLY by make test-system and CI's client steps.
+
+    Never by PROD_COMPOSE, DEV_COMPOSE, TOOLS_COMPOSE, the agent's set or run_migrations.sh: a prod
+    or dev launch that picked it up would start a container on store_db beside the real stack.
+    TEST_CLIENT_COMPOSE is exactly the base file plus the client file, and only test-system uses it.
+    """
+    env = _subprocess_env()
+    loading = [
+        name
+        for name in OTHER_COMPOSE_VARIABLES
+        if TEST_CLIENT_FILE.name in _expanded_make_variable(name, REPO_ROOT, env)
+    ]
+    assert not loading, f'{loading} load {TEST_CLIENT_FILE.name}'
+    assert TEST_CLIENT_FILE.name not in MIGRATIONS_SCRIPT.read_text(encoding='utf-8'), (
+        f'{MIGRATIONS_SCRIPT.name} loads {TEST_CLIENT_FILE.name}'
+    )
+    expanded = _expanded_make_variable(TEST_CLIENT_COMPOSE_VARIABLE, REPO_ROOT, env)
+    calls = _compose_calls(expanded)
+    assert len(calls) == 1 and calls[0][0] == _client_file_pair() and not calls[0][1], (
+        f'{TEST_CLIENT_COMPOSE_VARIABLE} is {expanded!r}, expected docker compose over exactly {_client_file_pair()}'
+    )
+    recipe_lines = [
+        line.strip()
+        for line in MAKEFILE.read_text(encoding='utf-8').replace('\\\n', ' ').splitlines()
+        if line.startswith('\t')
+        and not line.strip().startswith('#')
+        and (TEST_CLIENT_FILE.name in line or f'$({TEST_CLIENT_COMPOSE_VARIABLE})' in line)
+    ]
+    system_recipe = _make_recipe(SYSTEM_TARGET)
+    elsewhere = [line for line in recipe_lines if line.lstrip('@-+').strip() not in system_recipe]
+    assert recipe_lines and not elsewhere, (
+        f'the client set is used outside {SYSTEM_TARGET}: {elsewhere or "(nowhere at all)"}'
+    )
 
 
 # ---------------------------------------------------------------------------------------
@@ -2530,11 +2847,16 @@ SYSTEM_TESTS_STEP = 'System Tests'
 LIFECYCLE_STEP = 'Instance Secret Lifecycle'
 DUMP_STEP = 'Dump Container Logs'
 STOP_STEP = 'Stop System'
+BUILD_CLIENT_STEP = 'Build Test Client'
+SMOKE_STEP = 'Smoke Test'
+LOCKDOWN_STEP = 'Check Network Lockdown'
 SYSTEM_JOB_STEP_ORDER = (
     STAGE_STEP,
+    BUILD_CLIENT_STEP,
     'Start System',
     MIGRATE_STEP,
-    'Smoke Test',
+    SMOKE_STEP,
+    LOCKDOWN_STEP,
     'Check Container Env',
     SYSTEM_TESTS_STEP,
     LIFECYCLE_STEP,
@@ -2543,6 +2865,18 @@ SYSTEM_JOB_STEP_ORDER = (
 )
 # Steps that must reach the stack, so an empty compose-invocation list cannot pass the file check.
 SYSTEM_JOB_COMPOSE_STEPS = ('Start System', MIGRATE_STEP, 'Check Container Env', LIFECYCLE_STEP, DUMP_STEP, STOP_STEP)
+# Steps that drive the stack and nothing else: they must never load the client file, so starting,
+# migrating, inspecting and stopping the stack cannot depend on it.
+SYSTEM_JOB_STACK_ONLY_STEPS = ('Start System', MIGRATE_STEP, 'Check Container Env', DUMP_STEP, STOP_STEP)
+# Steps that must send at least one request from test_client (tj-q9ae5u addendum 1 item 5').
+SYSTEM_JOB_CLIENT_STEPS = (BUILD_CLIENT_STEP, SMOKE_STEP, LOCKDOWN_STEP, LIFECYCLE_STEP)
+# The one compose subcommands a client invocation may run.
+CLIENT_SUBCOMMANDS = frozenset({'build', 'run'})
+CLIENT_RUN_OPTIONS = frozenset({'--rm', '--no-deps', '-T'})
+IMAGE_BUILD_JOB_NAME = 'Image Build'
+RENDER_STEP = 'Check Compose Renders'
+# The Makefile's compose sets the render check must cover, each in the Makefile's own file order.
+RENDERED_COMPOSE_VARIABLES = ('PROD_COMPOSE', 'DEV_COMPOSE', 'TOOLS_COMPOSE', TEST_CLIENT_COMPOSE_VARIABLE)
 TEARDOWN_CONDITIONS = frozenset({'failure()', 'always()'})
 # The staged project env file the job writes and reads back. Named through the template's stem so
 # this module never spells a path that holds real credentials.
@@ -2589,22 +2923,7 @@ def _step_lines(step: dict) -> list[str]:
 
 def _compose_files(line: str) -> list[list[str]]:
     """For each docker compose invocation on a line, the compose files it names with -f/--file."""
-    invocations = []
-    for match in _COMPOSE_INVOCATION.finditer(line):
-        words = line[match.end() :].split()
-        files, position = [], 0
-        while position < len(words) and words[position].startswith('-'):
-            option, equals, value = words[position].partition('=')
-            if option in ('-f', '--file'):
-                if not equals:
-                    position += 1
-                    value = words[position] if position < len(words) else ''
-                files.append(value.strip('\'"'))
-            elif option in _COMPOSE_VALUE_OPTIONS and not equals:
-                position += 1
-            position += 1
-        invocations.append(files)
-    return invocations
+    return [files for files, _ in _compose_calls(line)]
 
 
 @pytest.mark.build_infra
@@ -2733,25 +3052,42 @@ def test_system_job_migrates_only_up_to_head_and_asserts_current_is_head():
 
 
 @pytest.mark.build_infra
-def test_system_job_loads_docker_compose_yaml_alone():
-    """tj-vhboky.53 re-scope: like the Smoke Test, the job runs on docker-compose.yaml and nothing else.
+def test_system_job_loads_the_stack_alone_and_the_client_only_as_a_pair():
+    """N5 re-pin of the tj-vhboky.53 re-scope, after N4 (tj-q9ae5u addendum 1 item 5').
 
-    Every compose invocation names it with -f and names no other file: a bare `docker compose`
-    would also load docker-compose.override.yaml, and a second -f is an overlay the job must not
-    have until the fake-broker PR (tj-irhy0a). COMPOSE_FILE would do the same behind the flags.
+    Two spellings and only two. The STACK: docker-compose.yaml alone -- a bare `docker compose`
+    would also load the dev override, and any other overlay is one the job must not have. The
+    CLIENT: docker-compose.yaml then docker-compose.test-client.yaml, and only ever to build or run
+    test_client, a run always removed on exit, with no deps and no TTY. So anything that starts,
+    blanks, recreates, inspects or stops the stack names the base file alone, and the stack-only
+    steps never load the client file at all. COMPOSE_FILE would do all this behind the flags.
     """
-    seen, offenders = set(), []
+    seen, client_steps, offenders = set(), set(), []
     for step in _system_steps():
+        name = step.get('name')
         for line in _step_lines(step):
-            for files in _compose_files(line):
-                seen.add(step.get('name'))
-                if files != [COMPOSE_FILE.name]:
-                    offenders.append(f'{step.get("name")}: -f {files} in {line}')
+            for files, rest in _compose_calls(line):
+                seen.add(name)
+                if files == [COMPOSE_FILE.name]:
+                    continue
+                if files != _client_file_pair():
+                    offenders.append(f'{name}: -f {files} in {line}')
+                    continue
+                client_steps.add(name)
+                service, options, _ = _compose_service(rest)
+                if name in SYSTEM_JOB_STACK_ONLY_STEPS:
+                    offenders.append(f'{name}: a stack-only step loads the client file: {line}')
+                if (rest[:1] and rest[0] not in CLIENT_SUBCOMMANDS) or service != TEST_CLIENT_SERVICE:
+                    offenders.append(
+                        f'{name}: the client set runs {rest[:1]} on {service!r}, not build/run {TEST_CLIENT_SERVICE}: {line}'
+                    )
+                if rest[:1] == ['run'] and not set(options) >= CLIENT_RUN_OPTIONS:
+                    offenders.append(f'{name}: a client run lacks {sorted(CLIENT_RUN_OPTIONS - set(options))}: {line}')
     missing = sorted(set(SYSTEM_JOB_COMPOSE_STEPS) - seen)
     assert not missing, f'no docker compose invocation found in {missing}, so this check saw less than the job runs'
-    assert not offenders, (
-        f'{SYSTEM_JOB_NAME} runs compose on something other than {COMPOSE_FILE.name} alone: {offenders}'
-    )
+    assert not offenders, f'{SYSTEM_JOB_NAME} loads compose files outside the two spellings: {offenders}'
+    without_client = sorted(set(SYSTEM_JOB_CLIENT_STEPS) - client_steps)
+    assert not without_client, f'{without_client} send nothing from {TEST_CLIENT_SERVICE}'
 
     document = _load_yaml(TESTING_WORKFLOW) or {}
     scopes = [document.get('env') or {}, _system_job().get('env') or {}]
@@ -2759,6 +3095,174 @@ def test_system_job_loads_docker_compose_yaml_alone():
     assert not any('COMPOSE_FILE' in scope for scope in scopes), 'COMPOSE_FILE is set for the System Testing job'
     assert not any('COMPOSE_FILE' in line for step in _system_steps() for line in _step_lines(step)), (
         'a System Testing step sets or reads COMPOSE_FILE'
+    )
+
+
+@pytest.mark.build_infra
+def test_build_test_client_builds_only_the_client():
+    """N4 item 3: one build of test_client from the job's checkout, over the client pair.
+
+    Its place -- after Stage (the base file cannot interpolate without the staged POSTGRES_PASS),
+    before Start System -- is pinned by SYSTEM_JOB_STEP_ORDER.
+    """
+    calls = [call for line in _step_lines(_system_step(BUILD_CLIENT_STEP)) for call in _compose_calls(line)]
+    assert len(calls) == 1, f'{BUILD_CLIENT_STEP} must run one compose invocation, found {calls}'
+    files, rest = calls[0]
+    service, _, trailing = _compose_service(rest)
+    assert files == _client_file_pair() and rest[:1] == ['build'] and service == TEST_CLIENT_SERVICE and not trailing, (
+        f'{BUILD_CLIENT_STEP} must build {TEST_CLIENT_SERVICE} over {_client_file_pair()}: -f {files} {rest}'
+    )
+
+
+@pytest.mark.build_infra
+def test_smoke_test_reaches_each_service_by_name_and_never_by_loopback():
+    """N4 item 4: prod publishes no host port, so the Smoke Test uses none.
+
+    data_store is asked from test_client (store_api, the strategy clients' path) and data_ingest
+    from inside data_store (proving ingest_store carries HTTP), each at http://<service>:
+    ${APP_INTERNAL_PORT}. A loopback URL here would test a topology prod does not have -- and
+    would only pass at all if some overlay put the publishes back.
+    """
+    lines = _step_lines(_system_step(SMOKE_STEP))
+    loopback = [line for line in lines if _LOOPBACK.search(line)]
+    assert not loopback, f'{SMOKE_STEP} still uses a loopback address: {loopback}'
+    hosts = {host for line in lines for host in re.findall(r'http://([\w.-]+):\$\{APP_INTERNAL_PORT\}', line)}
+    assert hosts == {'data_store', 'data_ingest'}, (
+        f'{SMOKE_STEP} requests {sorted(hosts)} by name, expected data_store and data_ingest'
+    )
+
+    calls = [call for line in lines for call in _compose_calls(line)]
+    client_curl = [
+        rest
+        for files, rest in calls
+        if files == _client_file_pair()
+        and rest[:1] == ['run']
+        and _compose_service(rest)[0] == TEST_CLIENT_SERVICE
+        and 'curl' in _compose_service(rest)[1]
+    ]
+    assert client_curl, f'{SMOKE_STEP} sends no curl from {TEST_CLIENT_SERVICE}'
+    from_data_store = [
+        rest for files, rest in calls if files == [COMPOSE_FILE.name] and rest[:1] == ['exec'] and 'data_store' in rest
+    ]
+    assert from_data_store, f'{SMOKE_STEP} sends nothing from inside data_store, so ingest_store HTTP is unproven'
+    assert any('\'{"message":"pong"}\'' in line for line in lines) and any("'[]'" in line for line in lines), (
+        f'{SMOKE_STEP} lost its exact-body assertions'
+    )
+
+
+@pytest.mark.build_infra
+def test_network_lockdown_checks_non_resolution_and_no_egress():
+    """N4 item 5: the network model as the RUNNING stack enforces it, not as the file declares it.
+
+    - From test_client, a positive lookup of data_store comes first -- a client with no working DNS
+      would otherwise make every negative pass -- then the kafka container name and data_ingest
+      must NOT resolve, told apart from a failed run by getent's own not-found status, 2.
+    - From postgres and from data_store, a TCP connect to a public LITERAL address (no DNS
+      involved) must fail, told apart from a failed probe by a distinct status, 3.
+    The name probed as kafka is the one kafka's container_name interpolates.
+    """
+    lines = _step_lines(_system_step(LOCKDOWN_STEP))
+    calls = [call for line in lines for call in _compose_calls(line)]
+    getent = [
+        rest
+        for files, rest in calls
+        if files == _client_file_pair()
+        and rest[:1] == ['run']
+        and _compose_service(rest)[0] == TEST_CLIENT_SERVICE
+        and 'getent' in _compose_service(rest)[1]
+    ]
+    assert getent, f'{LOCKDOWN_STEP} resolves nothing from {TEST_CLIENT_SERVICE}'
+
+    looked_up = [match.group(1) for line in lines for match in re.finditer(r'\blookup\s+"?([^")\s]+)"?\)', line)]
+    loops = [match for line in lines if (match := re.match(r'^for (\w+) in (.+); do$', line))]
+    assert looked_up[:1] == ['data_store'], f'{LOCKDOWN_STEP} must look up data_store first, looked up {looked_up}'
+    negatives = {
+        word
+        for match in loops
+        if f'lookup "${{{match.group(1)}}}"' in ' '.join(lines)
+        for word in shlex.split(match.group(2))
+    }
+    kafka_name = (_load_yaml(COMPOSE_FILE)['services']['kafka'] or {}).get('container_name')
+    kafka_service = 'kafka'
+    assert kafka_name and kafka_name in negatives and 'data_ingest' in negatives, (
+        f'{LOCKDOWN_STEP} must show {kafka_name} (kafka) and data_ingest do not resolve; it loops over {sorted(negatives)}'
+    )
+    assert kafka_service in negatives, (
+        f'{LOCKDOWN_STEP} must also show the service name {kafka_service!r} does not resolve, not only the '
+        f'container name {kafka_name!r}; it loops over {sorted(negatives)}'
+    )
+    assert any(re.search(r'-eq 2\b', line) for line in lines), f'{LOCKDOWN_STEP} never requires getent not-found (2)'
+
+    execs = {
+        _compose_service(rest)[0] for files, rest in calls if files == [COMPOSE_FILE.name] and rest[:1] == ['exec']
+    }
+    assert {'postgres', 'data_store'} <= execs, (
+        f'{LOCKDOWN_STEP} probes egress from {sorted(execs)}, expected postgres and data_store'
+    )
+    addresses = [match.group(1) for line in lines if (match := re.match(r'^PUBLIC_ADDRESS="?([^"\s]+)"?$', line))]
+    assert len(addresses) == 1, f'{LOCKDOWN_STEP} must set one PUBLIC_ADDRESS literal, found {addresses}'
+    assert ipaddress.ip_address(addresses[0]).is_global, f'{addresses[0]} is not a public literal address'
+    assert any(re.search(r'-eq 3\b', line) for line in lines), f'{LOCKDOWN_STEP} never requires a refused connect (3)'
+
+
+@pytest.mark.build_infra
+def test_lifecycle_probes_go_from_the_client_by_service_name():
+    """N4 item 7: only probe() changed -- each request is curl inside test_client to data_store by name.
+
+    The scan, blank, recreate and route loop stay pinned by the lifecycle tests above; this pins
+    where the request comes from, so a probe cannot drift back to a loopback port prod lacks.
+    """
+    lines = _step_lines(_system_step(LIFECYCLE_STEP))
+    loopback = [line for line in lines if _LOOPBACK.search(line)]
+    assert not loopback, f'{LIFECYCLE_STEP} still uses a loopback address: {loopback}'
+    bases = [match.group(1) for line in lines if (match := re.match(r'^base="([^"]+)"$', line))]
+    assert bases == ['http://data_store:${APP_INTERNAL_PORT}'], f'{LIFECYCLE_STEP} probes base {bases}'
+    sends = [
+        line
+        for line in lines
+        for files, rest in _compose_calls(line)
+        if files == _client_file_pair()
+        and _compose_service(rest)[0] == TEST_CLIENT_SERVICE
+        and 'curl' in _compose_service(rest)[1]
+        and '${base}${path}' in line
+    ]
+    assert len(sends) == 1, f'probe() must send "${{base}}${{path}}" by curl from {TEST_CLIENT_SERVICE}, found {sends}'
+
+
+def _image_build_job() -> dict:
+    jobs = (_load_yaml(TESTING_WORKFLOW) or {}).get('jobs') or {}
+    matches = [job for job in jobs.values() if (job or {}).get('name') == IMAGE_BUILD_JOB_NAME]
+    assert len(matches) == 1, f'expected one {IMAGE_BUILD_JOB_NAME!r} job, found {len(matches)}'
+    return matches[0]
+
+
+@pytest.mark.build_infra
+def test_image_build_renders_every_compose_set_quietly():
+    """N4 item 8: `config --quiet` over the prod, dev, tools and client sets, after Build Images.
+
+    Each set exactly as the Makefile spells it, so the check cannot drift from what make loads. A
+    broken override or tools file otherwise surfaces only on a developer's machine. ALWAYS quiet:
+    without it `config` prints the interpolated model, POSTGRES_PASS inside DATABASE_URI included.
+    """
+    steps = _image_build_job().get('steps') or []
+    names = [step.get('name') for step in steps]
+    assert names.count(RENDER_STEP) == 1 and 'Build Images' in names, f'{IMAGE_BUILD_JOB_NAME} steps: {names}'
+    assert names.index('Build Images') < names.index(RENDER_STEP), (
+        f'{RENDER_STEP} must follow Build Images (env files staged)'
+    )
+    step = steps[names.index(RENDER_STEP)]
+    assert 'if' not in step and 'continue-on-error' not in step, f'{RENDER_STEP} must be unconditional and blocking'
+
+    calls = [call for line in _step_lines(step) for call in _compose_calls(line)]
+    loud = [rest for _, rest in calls if rest[:1] != ['config'] or not {'--quiet', '-q'} & set(rest)]
+    assert not loud, f'{RENDER_STEP} runs compose other than `config --quiet`: {loud}'
+    env = _subprocess_env()
+    expected = [
+        _compose_calls(_expanded_make_variable(name, REPO_ROOT, env))[0][0] for name in RENDERED_COMPOSE_VARIABLES
+    ]
+    rendered = [files for files, _ in calls]
+    assert sorted(rendered) == sorted(expected), (
+        f'{RENDER_STEP} renders {rendered}, expected the Makefile sets {dict(zip(RENDERED_COMPOSE_VARIABLES, expected, strict=True))}'
     )
 
 

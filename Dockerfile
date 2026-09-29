@@ -49,6 +49,29 @@ COPY ./${SERVICE_PATH}/${SERVICE_NAME}/app /code/${SERVICE_PATH}/${SERVICE_NAME}
 FROM service_build_image AS service_build_image_dev
 RUN uv sync --only-group base --only-group ${SERVICE_PATH}-${SERVICE_NAME} --only-group dev --frozen
 
+# System-test client image (tj-q9ae5u addendum 1 item 4', ruling Q2-B on tj-ijpys9.9). The
+# test_client service in docker-compose.test-client.yaml runs tests/system from it; only
+# `make test-system` and CI's client steps build it. Shaped like the future SDK base image --
+# Python plus the client-side dependencies -- with the testing group layered on top. When the
+# SDK image exists (tj-d2mhru) this becomes FROM that image instead.
+#
+# NO SOURCE IS COPIED: compose bind-mounts common, routers, schemas, data/store/app,
+# data/store/migrations, tests/system and pytest.ini read-only from the checkout, so a test edit
+# needs no rebuild and a stale image cannot run old tests. Placed before the deploy stages so
+# prod_image stays the last stage, the one a target-less `docker build` produces.
+FROM base_build_image AS system_test_image
+
+# Root for the package step only. curl for CI's probes from the client; tzdata because the
+# suite runs under a non-UTC TZ, and without the zone's data the container silently runs at UTC,
+# where a naive-to-timestamptz shift cannot go red.
+USER root
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl tzdata \
+    && rm -rf /var/lib/apt/lists/*
+USER appuser
+
+RUN uv sync --only-group base --only-group data-store --only-group testing --frozen
+
 # Base Deploy Image
 FROM debian:bookworm-slim AS base_deploy_image
 ARG SERVICE_PATH=none

@@ -1,0 +1,88 @@
+# THE SYSTEM-TEST CLIENT (decision record tj-q9ae5u, addendum 1 item 4'; image ruling Q2-B on
+# tj-ijpys9.9). One service, test_client, that runs tests/system against a stack that is already
+# up and migrated. It is the ONE place the suite's env contract is set -- the Makefile comment
+# above test-system documents it and points here.
+#
+# Loaded ONLY after docker-compose.yaml -- `make test-system` and CI's client steps, as
+#   docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml run ...
+# -- which is why the networks below are referenced by the keys the base file declares. Never
+# loaded by PROD_COMPOSE, DEV_COMPOSE or data/store/run_migrations.sh, and never with the dev
+# override: the client joins no devnet, so it behaves the same against a dev stack and in CI.
+#
+# NOT A PURE STRATEGY CLIENT. A strategy or SDK client joins store_api and nothing else, and sees
+# data_store's API only. This one also joins store_db, a documented harness-only exception: the
+# suite's schema, db-layer and asyncpg tests talk to Postgres directly, and the HTTP tests seed
+# and check rows through it. No strategy container is ever given store_db.
+#
+# SECRETS. POSTGRES_PASS and INSTANCE_WRITE_SECRET are interpolated by compose from the project
+# .env, so they never pass through make's shell, a command line or the recipe's output. No
+# env_file: nothing else in the env files (pgAdmin credentials, the ingest broker keys) reaches
+# the client. Plain ${NAME}, with NO :? guard, on purpose: CI blanks INSTANCE_WRITE_SECRET mid-job
+# and still needs the client for its probes. The missing-value check is conftest's _contract(),
+# which fails naming the variable (fail, never skip).
+services:
+  test_client:
+    build:
+      context: .
+      target: system_test_image
+    image: trader_joe_test_client
+    # No ports: nothing reaches into the client. It dials out to data_store and postgres by
+    # compose service name.
+    networks:
+      - store_api
+      - store_db
+    security_opt:
+      - "no-new-privileges:true"
+    # The source, read-only, each onto its own path under /code. NEVER the repository root, an env
+    # directory or an env file: the root would hand the container every .env in the checkout.
+    # data/store/migrations is there because test_schema_constraints reads the head revision
+    # from it with alembic's ScriptDirectory.
+    volumes:
+      - ./common:/code/common:ro
+      - ./routers:/code/routers:ro
+      - ./schemas:/code/schemas:ro
+      - ./data/store/app:/code/data/store/app:ro
+      - ./data/store/migrations:/code/data/store/migrations:ro
+      - ./tests/system:/code/tests/system:ro
+      - ./pytest.ini:/code/pytest.ini:ro
+    # THE ENV CONTRACT: exactly the twelve names tests/system/conftest.py reads, and one extra.
+    environment:
+      # Compose SERVICE names, literal: they resolve on store_db and store_api respectively.
+      # DATABASE_NAME is the Postgres HOST -- data_store's own name for it.
+      DATABASE_NAME: postgres
+      SYSTEM_TEST_DATA_STORE_URL: http://data_store:${APP_INTERNAL_PORT}
+      # The container port, not the host side of any mapping: the client is on the network.
+      DATABASE_PORT: "5432"
+      # Unset, a Postgres that answers but refuses sends wait_for_db into comparing elapsed time
+      # against None -- a TypeError, not a message naming the database.
+      DATABASE_CONN_TIMEOUT: "10"
+      # NON-UTC ON PURPOSE: a naive-to-timestamptz shift is invisible at offset zero. The
+      # entrypoint below refuses to start pytest if this zone resolves to +0000.
+      TZ: America/Toronto
+      # tests/system has no package chain above it, so the root has to be on the path.
+      PYTHONPATH: /code
+      # Import-time driver flags read by common/database/postgres_tools.py.
+      POSTGRES_ASYNC: "true"
+      POSTGRES_SYNC: "true"
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_DB_NAME: ${POSTGRES_DB_NAME}
+      POSTGRES_PASS: ${POSTGRES_PASS}
+      INSTANCE_WRITE_SECRET: ${INSTANCE_WRITE_SECRET}
+      # Not part of the contract: the source mounts are read-only, so no bytecode is written.
+      PYTHONDONTWRITEBYTECODE: "1"
+    working_dir: /code
+    # The TZ check, then pytest as the container's main process, so the exit status compose run
+    # returns is pytest's, unmodified. $$ is compose's escape for a literal $; "test_client" is
+    # $0, and the command (or the arguments given to `compose run`) are "$@".
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        if [ "$$(date +%z)" = "+0000" ]; then
+          echo "test_client: TZ=$$TZ resolves to UTC in this image (no tzdata for it?)," >&2
+          echo "  so a naive-to-timestamptz shift could not go red. Refusing to run the suite." >&2
+          exit 1
+        fi
+        exec /code/.venv/bin/python -m pytest "$$@"
+      - test_client
+    command: [tests/system]

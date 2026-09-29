@@ -1,5 +1,7 @@
-# Docker
-docker-compose.yml
+# Docker. The root compose file, every docker-compose.*.yaml beside it, and the devcontainer.
+docker-compose.yaml
+docker-compose.*.yaml
+.devcontainer/
 Dockerfile
 .dockerignore
 

@@ -8,8 +8,39 @@
 # does), so enabling it here keeps `make dev-launch` able to run the REST vs Kafka RPC comparison
 # that tj-3mk3u5.8 needs. Both services must carry it: data_store is the client and data_ingest
 # the server, and a client with no server just times out.
+#
+# DEV REACH (decision record tj-q9ae5u, addendum 1, item 3'). This file also puts every stack
+# service on devnet, one external network that the devcontainer and pgAdmin join too, so a dev
+# session reaches the whole stack by service name. Each service below lists devnet ONLY: compose
+# merges a service's networks from this file and the base file by key, so each keeps its prod
+# networks and gains devnet. Restating the prod networks here would only invite drift. There are
+# no override tags (!reset, !override) on purpose: the CI invariant tests parse this file as plain
+# YAML, and nothing here needs removing -- it only adds.
+#
+# The loopback publishes (psql, /docs, curl from this machine) live here, not in the base file,
+# because prod publishes nothing. They work in dev only because devnet is an ordinary network:
+# a container on internal networks alone has no gateway to publish through.
 services:
+  postgres:
+    networks:
+      - devnet
+    ports:
+      # Loopback only: a published port bypasses the host firewall entirely, so the bare
+      # "5432:5432" would put this database on every interface the machine has. Solely for
+      # psql or a GUI client on this machine.
+      - "127.0.0.1:${DATABASE_PORT}:5432"
+
+  kafka:
+    # devnet only, and still no published port (see the base file's kafka comment).
+    networks:
+      - devnet
+
   data_store:
+    networks:
+      - devnet
+    ports:
+      # Loopback only: /docs and curl from this machine, and from nowhere else.
+      - "127.0.0.1:${DATA_STORE_PORT}:${APP_INTERNAL_PORT}"
     build:
       target: dev_image
     read_only: true
@@ -25,6 +56,11 @@ services:
     image: trader_joe_data_store:dev
 
   data_ingest:
+    networks:
+      - devnet
+    ports:
+      # Loopback only, same reasoning as data_store: unauthenticated API.
+      - "127.0.0.1:${DATA_INGEST_PORT}:${APP_INTERNAL_PORT}"
     build:
       target: dev_image
     volumes:
@@ -38,3 +74,15 @@ services:
       # data_store setting above -- enabling one alone leaves a client with no server.
       - LATENCY_TEST_ENABLED=true
     image: trader_joe_data_ingest:dev
+
+# devnet: an ordinary bridge (NOT internal), owned by neither compose project and so declared
+# external here. `make dev-network` creates it idempotently as a prerequisite of dev-deps,
+# dev-tools and agent-up, and the devcontainer's initializeCommand creates it too, so whichever
+# starts first works; no down, prune or clean ever removes it. Its fixed name
+# trader_joe_devnet appears in exactly four places, which must agree: this file, the Makefile's
+# DEV_NETWORK variable, .devcontainer/compose.yml and the initializeCommand in
+# .devcontainer/devcontainer.json.
+networks:
+  devnet:
+    external: true
+    name: trader_joe_devnet

@@ -106,8 +106,18 @@ init: $(VENV_MARKER)  ## Initialize the project, including the security tooling
 # would make those credentials a requirement of the whole dev stack. A profile does not avoid
 # that; a separate file does. PROD_COMPOSE never loads it.
 PROD_COMPOSE := docker compose -f docker-compose.yaml
+# Dev gains devnet through the override, which attaches every stack service to it (tj-q9ae5u
+# addendum 1). PROD_COMPOSE never loads the override, so a prod launch never attaches devnet --
+# which is also what keeps a dev session off a prod stack on the same machine.
 DEV_COMPOSE := docker compose -f docker-compose.yaml -f docker-compose.override.yaml
 TOOLS_COMPOSE := $(DEV_COMPOSE) -f docker-compose.tools.yaml
+
+# The dev network: an ordinary bridge (NOT internal) owned by neither compose project, which the
+# dev stack, pgAdmin and the agent devcontainer all join, so either side can start first. Its
+# fixed name appears in exactly four places, which must agree: this variable,
+# docker-compose.override.yaml, .devcontainer/compose.yml and the initializeCommand in
+# .devcontainer/devcontainer.json.
+DEV_NETWORK := trader_joe_devnet
 
 # --wait, matching the CI deploy step: it blocks until every started service reports
 # healthy and exits non-zero if one does not, so a broken deploy fails the command instead
@@ -153,7 +163,9 @@ prod-down:  ## Stop the production stack
 # dependency and never the entrypoint, because a rollback re-runs `compose up` and would
 # re-apply the migration from the wrong revision directory. The script passes
 # -f docker-compose.yaml itself, so this runs against the production data_store definition
-# even when the dev stack is what is up -- postgres is the same container either way.
+# even when the dev stack is what is up -- postgres is the same container either way, and the
+# one-off data_store container joins data_store's prod networks, store_db included, which is how
+# it reaches the database. It needs no egress and no devnet.
 .PHONY: migrate
 migrate:  ## Apply database migrations to the running production stack
 	./data/store/run_migrations.sh
@@ -183,8 +195,21 @@ migrate-status:  ## Report the applied revision and the revision history (read-o
 dev-build: $(VENV_MARKER)  ## Build the development images (:dev)
 	$(DEV_COMPOSE) build
 
+# Idempotent, and safe against a concurrent create by the devcontainer's initializeCommand: look,
+# else create, else look again -- a create that lost the race fails, and the second look is what
+# decides. The create's error is left visible: in a lost race it is one harmless line, and in a
+# real failure (daemon down, no permission) it is the only line that says why. Ordinary bridge on
+# purpose: devnet is the network the dev loopback publishes go out through, and an internal one
+# has no gateway to publish through. Nothing here ever removes it: no down, prune or clean recipe
+# names it, and compose never removes an external network.
+.PHONY: dev-network
+dev-network:  ## Create the shared dev network if it is missing (never removed)
+	@docker network inspect $(DEV_NETWORK) > /dev/null 2>&1 \
+		|| docker network create --driver bridge $(DEV_NETWORK) > /dev/null \
+		|| docker network inspect $(DEV_NETWORK) > /dev/null
+
 .PHONY: dev-deps
-dev-deps: $(VENV_MARKER)  ## Start the development dependencies (postgres, kafka)
+dev-deps: $(VENV_MARKER) dev-network  ## Start the development dependencies (postgres, kafka)
 	$(DEV_COMPOSE) up -d postgres kafka
 
 # pgAdmin is a tool, not a dependency: it lives in docker-compose.tools.yaml, which dev-deps and
@@ -192,7 +217,7 @@ dev-deps: $(VENV_MARKER)  ## Start the development dependencies (postgres, kafka
 # needs PGADMIN_EMAIL/PGADMIN_PASS set. compose brings postgres up first, because pgadmin
 # depends on it being healthy. Stop it with dev-down.
 .PHONY: dev-tools
-dev-tools: $(VENV_MARKER)  ## Start pgAdmin against the development database (needs PGADMIN_*)
+dev-tools: $(VENV_MARKER) dev-network  ## Start pgAdmin against the development database (needs PGADMIN_*)
 	$(TOOLS_COMPOSE) up -d pgadmin
 
 # Foreground on purpose, unlike prod-launch: --reload prints what it reloaded and why, and
@@ -243,7 +268,7 @@ agent-build:  ## Build the agent devcontainer image
 	$(AGENT_COMPOSE) build
 
 .PHONY: agent-up
-agent-up:  ## Start the agent devcontainer
+agent-up: dev-network  ## Start the agent devcontainer
 	mkdir -p "$(AGENT_HOME_PATH)"
 	$(AGENT_COMPOSE) up -d
 
@@ -352,95 +377,83 @@ test-broker: $(VENV_MARKER)  ## Run the external broker tests: needs live creden
 test-all: $(VENV_MARKER)  ## Run every test, external included: needs live credentials
 	$(PYTEST) -m "" $(PATHS)
 
-# THE SYSTEM SUITE (tj-vhboky.48, ADR tj-fdb9gz). tests/system/ drives a stack that is ALREADY UP
-# AND MIGRATED -- `make dev-launch` (or prod-launch) and then `make migrate`. This target does
-# neither: bringing a stack up or migrating it is a decision about which database is touched, and
-# that decision stays with whoever runs it. pytest.ini keeps tests/system out of every other target
-# by directory (norecursedirs), so this is the one target that names it. SYSTEM_PATHS scopes it to
-# one file inside the suite; pointing it outside tests/system collects the gate, not the suite.
+# THE SYSTEM SUITE (tj-vhboky.48, ADR tj-fdb9gz; tj-q9ae5u addendum 1 items 4' and 6').
+# tests/system/ drives a stack that is ALREADY UP AND MIGRATED -- `make dev-launch` (or prod-launch)
+# and then `make migrate`. This target does neither: bringing a stack up or migrating it is a
+# decision about which database is touched, and that decision stays with whoever runs it.
+# pytest.ini keeps tests/system out of every other target by directory (norecursedirs), so this is
+# the one target that names it.
 #
-# THE DISPOSABLE-DATABASE GUARD. The suite WRITES to whatever database it is pointed at, and this
-# machine also runs the production deployment. So the target refuses unless
-# SYSTEM_TEST_DISPOSABLE_DB=1 is set -- as a make argument or in the environment. It is an
-# attestation by the person running it, not a detection: nothing here can tell a disposable
-# Postgres from the production one, which is exactly why it has to be said out loud each time.
+# THE SUITE RUNS FROM A CLIENT CONTAINER, test_client in docker-compose.test-client.yaml, on the
+# stack's own networks -- store_api for data_store's API, store_db for Postgres -- never from the
+# host, which in prod reaches neither: prod publishes nothing. store_db (like every other unfixed
+# network) resolves as <compose project>_store_db, and the project name defaults to the checkout's
+# directory name, so this target joins the running stack only when run from a checkout whose
+# directory name matches the one that launched it; store_api is fixed-name and unaffected.
+# SYSTEM_PATHS scopes it, relative to /code in the container, where only tests/system is mounted;
+# a path outside it fails the target with a non-zero pytest status -- 4 when the path does not
+# exist in the container, 5 when it exists but collects nothing.
 #
-# THE ENV CONTRACT the suite reads, defined here and nowhere else:
-#   SYSTEM_TEST_DATA_STORE_URL  http://127.0.0.1:<DATA_STORE_PORT from .env>. Loopback, because
-#                               docker-compose.yaml publishes data_store on 127.0.0.1 only.
-#   DATABASE_NAME               127.0.0.1 -- the Postgres HOST. The name is data_store's own:
-#                               data/store/app/database/database.py reads DATABASE_NAME as the
-#                               host, so its modules connect runner-side unchanged, and a raw
-#                               asyncpg connection is built from the same five names.
-#   DATABASE_PORT, POSTGRES_USER, POSTGRES_PASS, POSTGRES_DB_NAME
-#                               from .env. DATABASE_PORT is the host side of the loopback mapping.
+# THE DISPOSABLE-DATABASE GUARD. The suite WRITES to whatever database it is pointed at. This target
+# is run on the HOST by its owner -- never by an agent, whose container has no Docker. prod-launch
+# lives in this same Makefile and this same compose project, so that host may be the one running
+# the production deployment, and the client would join that stack's networks and write to its
+# database. So the target refuses unless SYSTEM_TEST_DISPOSABLE_DB=1 is set -- as a make argument or
+# in the environment. It is an attestation by the person running it, not a detection: nothing here
+# can tell a stack you can wipe from the production one, which is why it has to be said out loud
+# each time.
+#
+# THE ENV CONTRACT the suite reads -- the twelve names tests/system/conftest.py checks through its
+# _contract() -- is SET in docker-compose.test-client.yaml, in test_client's environment block, and
+# documented here:
+#   DATABASE_NAME               postgres: the compose SERVICE name, the Postgres HOST on store_db.
+#                               The name is data_store's own: data/store/app/database/database.py
+#                               reads DATABASE_NAME as the host, so its modules connect unchanged,
+#                               and a raw asyncpg connection is built from the same five names.
+#   DATABASE_PORT               5432, the container port: the client is on the network.
+#   SYSTEM_TEST_DATA_STORE_URL  http://data_store:<APP_INTERNAL_PORT>, the SERVICE name on store_api.
+#   POSTGRES_USER, POSTGRES_PASS, POSTGRES_DB_NAME, INSTANCE_WRITE_SECRET
+#                               interpolated by compose from .env, with no :? guard -- CI blanks the
+#                               write secret mid-job and still needs the client. conftest's
+#                               _contract() fails naming a missing one (fail, never skip).
 #   DATABASE_CONN_TIMEOUT       10 (seconds). database.py reads it. Unset, a Postgres that ANSWERS
 #                               but refuses (still starting, bad password) sends wait_for_db into
 #                               comparing elapsed time against None: a TypeError, not a message
 #                               naming the database. A refused TCP connect raises straight away.
-#   INSTANCE_WRITE_SECRET       from .env -- the write path fails closed without it.
-#   TZ                          $(SYSTEM_TEST_TZ). NON-UTC ON PURPOSE: CI runners are UTC, and a
+#   TZ                          America/Toronto. NON-UTC ON PURPOSE: CI runners are UTC, and a
 #                               naive-to-timestamptz shift is invisible at offset zero, so a test
-#                               of it could never go red there. Checked before pytest starts: a
-#                               host without that zone's tzdata silently falls back to UTC.
+#                               of it could never go red there. The image carries tzdata, and the
+#                               container's entrypoint refuses to start pytest at offset +0000.
 #   POSTGRES_ASYNC, POSTGRES_SYNC
-#                               the usual $(PYTEST_ENV) driver flags, as every test target.
-#   PYTHONPATH                  the repository root, so `from data.store.app... import` resolves.
-#                               The gate's test directories get the root from their __init__.py
-#                               chain (data/store/tests -> data/store -> data); tests/system has
-#                               no package above it, so pytest would insert tests/system instead.
+#                               the driver flags, as $(PYTEST_ENV) sets them for every host target.
+#   PYTHONPATH                  /code, the mount root, so `from data.store.app... import` resolves:
+#                               tests/system has no package chain above it.
 #
-# .env IS READ, NEVER SOURCED -- the reasoning of CI's Smoke Test step: sourcing would pull
-# POSTGRES_PASS and the write secret into the shell, where any stray `set -x` or echo prints them.
-# Each value is grepped out on its own, the recipe is not echoed, and the banner names the two
-# secrets without their values. A required value that is missing or empty fails here, naming
-# only the variable.
+# THE RECIPE READS NO .env VALUE; .env only has to exist. Compose interpolates the credentials into
+# the container itself, so no secret passes through make's shell, a command line or this recipe's
+# output. No $(VENV_MARKER) prerequisite, for the reason `migrate` has none: nothing here runs in
+# the host venv, and the host may be a server with no usable uv.
 #
-# A MISSING DATABASE FAILS, NEVER SKIPS (pytest.ini, FAIL, NEVER SKIP). And an empty selection is
-# a failure too: pytest exits 5 when it collects nothing, and the recipe ends on pytest so make
-# returns that status untouched.
-SYSTEM_TEST_TZ := America/Toronto
+# A MISSING DATABASE FAILS, NEVER SKIPS (pytest.ini, FAIL, NEVER SKIP). And an empty selection is a
+# failure too: pytest exits 5 when it collects nothing, and the recipe ends on the compose run,
+# whose exit status is pytest's, so make returns it untouched.
+#
+# The client invocation: the base file for the networks, the client file, and nothing else -- not
+# the dev override, so the client needs no devnet and behaves the same against a dev stack and in CI.
+TEST_CLIENT_COMPOSE := docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml
 SYSTEM_PATHS ?= tests/system
 
 .PHONY: test-system
-test-system: $(VENV_MARKER)  ## Run tests/system against an up, migrated stack (SYSTEM_TEST_DISPOSABLE_DB=1)
+test-system:  ## Run tests/system from the test_client container against an up, migrated stack (SYSTEM_TEST_DISPOSABLE_DB=1)
 	@if [ "$(SYSTEM_TEST_DISPOSABLE_DB)" != "1" ]; then \
 		echo "make test-system REFUSED: the system suite WRITES to the database it is pointed at," >&2; \
-		echo "  and this machine also runs the production deployment." >&2; \
-		echo "  Point .env at a disposable Postgres, bring the stack up and migrate it" >&2; \
+		echo "  and this host may also run the production deployment, whose networks the client would join." >&2; \
+		echo "  Run it only against a stack you can wipe: bring one up and migrate it" >&2; \
 		echo "  (make dev-launch, make migrate), then run:" >&2; \
 		echo "    make test-system SYSTEM_TEST_DISPOSABLE_DB=1" >&2; \
 		exit 1; \
 	fi
-	@[ -f .env ] || { echo "make test-system: no .env in $(CURDIR); the suite reads the stack's ports and credentials from it." >&2; exit 1; }
-	@if [ "$$(TZ=$(SYSTEM_TEST_TZ) date +%z)" = "+0000" ]; then \
-		echo "make test-system: TZ=$(SYSTEM_TEST_TZ) resolves to UTC here (no tzdata for it?)," >&2; \
-		echo "  so a naive-to-timestamptz shift could not go red. Install tzdata and retry." >&2; \
-		exit 1; \
-	fi
-	@env_value() { grep -E "^$$1=" .env | tail -n 1 | cut -d= -f2-; }; \
-	data_store_port="$$(env_value DATA_STORE_PORT)"; \
-	db_port="$$(env_value DATABASE_PORT)"; \
-	db_user="$$(env_value POSTGRES_USER)"; \
-	db_pass="$$(env_value POSTGRES_PASS)"; \
-	db_name="$$(env_value POSTGRES_DB_NAME)"; \
-	write_secret="$$(env_value INSTANCE_WRITE_SECRET)"; \
-	missing=""; \
-	[ -n "$$data_store_port" ] || missing="$$missing DATA_STORE_PORT"; \
-	[ -n "$$db_port" ] || missing="$$missing DATABASE_PORT"; \
-	[ -n "$$db_user" ] || missing="$$missing POSTGRES_USER"; \
-	[ -n "$$db_pass" ] || missing="$$missing POSTGRES_PASS"; \
-	[ -n "$$db_name" ] || missing="$$missing POSTGRES_DB_NAME"; \
-	[ -n "$$write_secret" ] || missing="$$missing INSTANCE_WRITE_SECRET"; \
-	if [ -n "$$missing" ]; then \
-		echo "make test-system: missing or empty in .env:$$missing" >&2; \
-		exit 1; \
-	fi; \
-	echo "System suite against data_store http://127.0.0.1:$$data_store_port and Postgres $$db_user@127.0.0.1:$$db_port/$$db_name, TZ=$(SYSTEM_TEST_TZ)"; \
-	echo "POSTGRES_PASS and INSTANCE_WRITE_SECRET are set (values not shown)."; \
-	$(PYTEST_ENV) TZ=$(SYSTEM_TEST_TZ) PYTHONPATH="$(CURDIR)" \
-		SYSTEM_TEST_DATA_STORE_URL="http://127.0.0.1:$$data_store_port" \
-		DATABASE_NAME=127.0.0.1 DATABASE_PORT="$$db_port" DATABASE_CONN_TIMEOUT=10 \
-		POSTGRES_USER="$$db_user" POSTGRES_PASS="$$db_pass" POSTGRES_DB_NAME="$$db_name" \
-		INSTANCE_WRITE_SECRET="$$write_secret" \
-		uv run pytest $(SYSTEM_PATHS)
+	@[ -f .env ] || { echo "make test-system: no .env in $(CURDIR); compose interpolates the stack's credentials from it." >&2; exit 1; }
+	@echo "System suite from test_client against data_store (service data_store, on store_api) and Postgres (service postgres, on store_db); TZ set in docker-compose.test-client.yaml and checked by the client's entrypoint."
+	@echo "The database password and the instance write secret reach the container from .env through compose (values not shown)."
+	$(TEST_CLIENT_COMPOSE) run --rm --no-deps --build test_client $(SYSTEM_PATHS)
