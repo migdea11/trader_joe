@@ -1,32 +1,43 @@
 # API reference — the declared interface surface
 
-**This document describes commit `5ed8eb1`** (2026-09-28, `release/dataset-model`), the tree after
-the per-dataset bar model, owner-scoped writes and the filtering bar read landed. The previous pin,
-`a96ede9`, is not an ancestor of this line; everything below was re-checked against `5ed8eb1`.
-Check the commit pin before trusting anything below.
+**This document describes `release/dataset-model` as of its docs pass for the dataset-model PR
+(2026-09-29)**: the tree after the per-dataset bar model, owner-scoped writes, the filtering bar
+read, per-request database sessions and owner redaction landed. **It pins no commit SHA.** This
+branch is regrouped before review, and a regroup rewrites every SHA on it — both earlier pins
+(`a96ede9`, then `5ed8eb1`) stopped resolving that way. What each entry cites instead is a file and
+a symbol. Check those before trusting an entry: if the file or symbol an entry names no longer
+exists, the entry is stale.
 
-<!-- TODO: verify — if release/dataset-model is regrouped again before merge, 5ed8eb1 stops
-resolving on the merged line. Re-pin to the commit this document is true at after the regroup;
-no source file changed between 5ed8eb1 and the docs commit that set this pin. -->
+**Checked on real Postgres, with named gaps.** Every status code and behaviour below was checked in
+process, against the code and its tests. On 2026-09-29 the owner ran the system suite
+(`tests/system`, through `make test-system SYSTEM_TEST_DISPOSABLE_DB=1`) on the host against a
+wiped, freshly migrated stack, twice, and it passed both times. The host verification record is
+`tj-vhboky.14`. That suite covers, on real Postgres:
 
-**Only partly verified against a live database.** Every status code and behaviour below was checked
-in process, against the code and its tests. On real Postgres, one thing has been shown: on
-2026-09-25 an **earlier form** of revision `eec8f88a7443` upgraded cleanly on the host, a second
-`make migrate` was a no-op, and `make migrate-status` reported it as head. **Not yet run on real
-Postgres:**
+- revision `eec8f88a7443` as it stands, applied by `make migrate`, with the recorded revision equal
+  to the single head;
+- both unique constraints rejecting exact duplicates, and `owner` refusing an explicit NULL;
+- the bar upsert keeping one row on a repeat and refreshing it;
+- the delete cascade removing one entry's bars and leaving another entry's whole;
+- an oversized batch landing whole in one transaction, and a failure on a later chunk leaving
+  nothing;
+- the instance secret rejecting a write over real HTTP, with nothing changed;
+- the 409 on an overlap with the caller's own dataset;
+- sequential reads beyond the connection pool's size all answering.
 
-- the revision **as pinned** — the backfill of NULL `expiry_type`/`update_type` landed after that run;
-- its downgrade;
-- its intended failure on a non-empty bar table;
-- both unique constraints actually rejecting duplicates;
-- the upsert's `ON CONFLICT` finding its constraint by name;
-- the delete cascade removing exactly one entry's bars;
-- a batch above the 65,535 bind-parameter limit;
-- the instance secret rejecting a write over real HTTP.
+That run came **before** the owner-redaction change landed (`SensitiveString` on the `owner`
+column, `RedactedStr` in its bound parameters). The suite has not been run against a stack built
+with it.
 
-Read those behaviours as designed and unit-tested, not as proven. The host verification record is
-`tj-vhboky.14`; on 2026-09-28 it was trimmed to its manual items, with the original checklist kept in
-its notes.
+**Not yet run on real Postgres:**
+
+- the revision's downgrade, and its intended failure on a non-empty bar table (the downgrade waits
+  on seeded data, `tj-vhboky.62`; CI does not run it either);
+- the suite shown red against a deliberately broken schema;
+- one real ingest from the vendor end to end, and query plans on real volume;
+- the System Testing job in CI, whose first real run is this PR's.
+
+Read those as designed and unit-tested, not as proven.
 
 ## Read this first
 
@@ -39,10 +50,12 @@ check **fails closed**: an unset or empty secret rejects every write. Every read
 principal, so "only the owner may edit a dataset" is **not** enforced against anyone holding the key:
 whoever has it may declare any `owner` they like. What the owner check buys is protection against
 *mistakes* — an honest caller cannot accidentally overwrite or delete another principal's dataset. It
-is not access control. It also does not close `tj-glqs4r`: both services still publish on every
-interface they bind with default or no auth, and every surface other than the three write routes is
-exactly as exposed as before. `GET /latency/{latency_type}` is still an unauthenticated request
-amplifier when switched on. See gap **G4**.
+is not access control. It also does not close `tj-glqs4r`: every surface other than the three write
+routes answers without credentials. What narrows who can reach them is the network model (decision
+record `tj-q9ae5u`, addendum 1): prod publishes no host port, and data_store is reachable only from
+containers on its internal networks, including any client on `store_api`; dev publishes on loopback
+only. That is a perimeter, not an identity. `GET /latency/{latency_type}` is still an
+unauthenticated request amplifier when switched on. See gap **G4**.
 
 **This is the market-data surface, and only that.** Nothing here touches accounts, portfolios,
 orders or fills. A reader arriving from the project description — a trading platform with an
@@ -65,7 +78,7 @@ against this document.
 code under a `server/` prefix with its internal layout unchanged — it superseded the earlier
 `src/trader_joe/` restructure, which was closed without being done — so every file path in this
 document goes stale in one diff while the addresses survive. File and symbol are still given — they are what makes an
-entry checkable — but they are marked *as of `5ed8eb1`* and are deliberately never woven into prose,
+entry checkable — but they are marked *as of the dataset-model PR* and are deliberately never woven into prose,
 so updating them is a field edit rather than a rewrite.
 
 There is one place that rule breaks, and it is flagged inline at the entry: **R1's address is a Kafka
@@ -108,7 +121,7 @@ repeated per entry.
 
 ## The surface at a glance
 
-**Nine** interfaces are visible to the manifest at `5ed8eb1`, plus one declaration the manifest
+**Nine** interfaces are visible to the manifest as of the dataset-model PR, plus one declaration the manifest
 cannot see (`GET /store/{id}`, per the method-blind matching limit above). Four of the nine are
 stable. The count is taken from `routers/tests/interface_manifest/*.manifest` — three lines in
 `common.manifest`, five in `data_store.manifest`, one in `data_ingest.manifest` — not from the prose
@@ -138,12 +151,12 @@ kind was invented to describe: written code that mounts only under an environmen
 data_store or data_ingest declaration sits unserved any more.
 
 **Four entries have left this surface since the inventory behind this document was taken.** One was a
-real route: `DELETE /internal/asset-data/{asset_type}/{data_type}`, removed at `3cb5bea` — handler,
+real route: `DELETE /internal/asset-data/{asset_type}/{data_type}`, removed under `tj-h7ikz2` — handler,
 enum member and manifest line in one diff, which is what the manifest's rule demands. The other three
-were *declarations* that no code ever served, deleted at `fc377e4` and `ab42ec4` by user ruling; see
+were *declarations* that no code ever served, deleted under `tj-wc4pe8` and `tj-427x50` by user ruling; see
 [Declarations deleted by ruling](#declarations-deleted-by-ruling-2026-09-23). If you are reading an
-analysis or task note that says thirteen interfaces, it predates `3cb5bea`; one that says twelve
-predates `fc377e4`.
+analysis or task note that says thirteen interfaces, it predates that route's removal; one that
+says twelve predates the first deletion by ruling.
 
 ### The three kinds
 
@@ -226,12 +239,19 @@ returned by S2 and is a filter there, not a restriction.
 Read the warning at the top of this document again before building on this. The owner check guards
 against a caller's mistakes, not against anyone holding the instance secret.
 
-`owner` is kept out of the `repr()`/`str()` of every request model that declares it, so a model
-formatted into a log line does not print it; `model_dump()` and JSON are unchanged, since the open read
-returns it. **Two renderings still carry it:** the store's ORM row `repr`, and the bound parameters of
-a failing SQL statement in a database error's traceback. Redacting SQL parameters waits on a host-side
-check that asyncpg stores a `str` subclass as its plain value (`tj-w6bpjm`); the ORM `repr` is
-`tj-vhboky.46`. Because the open GET returns `owner` anyway, this is log hygiene, not secrecy.
+`owner` is kept out of the text the store renders, in three layers (`common/sensitive.py`):
+
+| Where | How |
+|---|---|
+| A request model's `repr()`/`str()` | the field is declared with `SensitiveStr`/`OptionalSensitiveStr`, which leaves it out |
+| The bound parameters of a SQL statement, as SQLAlchemy's error text, engine echo and uvicorn's traceback render them | the column is `SensitiveString` (`common/database/sql_alchemy_sensitive_string.py`), which binds each value as a `RedactedStr` whose `repr()` is `<redacted>`; the driver still sends and stores the real value |
+| The entry row's `repr()` and the search filter's log line | both print `<redacted>` in place of the value |
+
+`model_dump()` and JSON are unchanged, since the open read returns `owner`. **Two renderings still
+carry it:** Postgres's own `DETAIL` text on a constraint violation, which the server writes before
+SQLAlchemy sees it, and any `str()`, `format()` or f-string of the value itself — `RedactedStr`
+overrides `repr()` only. A pydantic `ValidationError` also renders the rejected input. Because the
+open GET returns `owner` anyway, this is log hygiene, not secrecy.
 
 ## Bars are raw; adjustment is not built
 
@@ -256,11 +276,12 @@ These hold on every route unless the entry says otherwise.
 
 | Convention | Behaviour |
 |---|---|
-| **Timezone-aware datetimes only** | Every datetime a caller sends — the create body's `start`, `end` and `expiry`; S2's `start`, `end`, `created_at`, `updated_at`; S5's `start`, `end`; and the RPC request R1 — must carry an offset or `Z`. A naive value is a **422** naming the field (type `timezone_aware`). It is refused, never assumed to be UTC. |
+| **Timezone-aware datetimes only** | Every datetime a caller sends — the create body's `start`, `end` and `expiry`; S2's `start`, `end`, `created_at`, `updated_at`; S4's bar `timestamp`; S5's `start`, `end`; and the RPC request R1 — must carry an offset or `Z`. A naive value is a **422** naming the field (type `timezone_aware`). It is refused, never assumed to be UTC. |
 | **Unknown fields and parameters are refused** | Request models reject what they do not declare (`extra='forbid'`), so a misspelt field or query parameter is a **422** (type `extra_forbidden`) rather than silently ignored. On S2 and S5 this holds for query parameters because the query model is bound with `Query()`. A strict receiver means that when a field is **added** to a contract, the receiving side must deploy first. |
 | **Enum names on the wire** | `expiry_type` and `update_type` travel as member **names** — `BULK`, `BUFFER_1K`, `BUFFER_10K`, `BUFFER_100K`, `ROLLING`; `STATIC`, `DAILY`, `STREAM` — and the OpenAPI document declares them as string enums of those names, with defaults `BULK` and `STATIC`. An integer is still accepted on input but is undocumented. The Kafka RPC request (R1) still carries these two as integers. |
 | **No orphan OpenAPI components** | The store app prunes any `components.schemas` entry no `$ref` reaches, so the leftover integer-enum components `ExpiryType` and `UpdateType` are no longer in the document. A client generated from it gets one type per component actually used. |
 | **Instance secret before schema validation** | On a guarded route the 401 is answered before path, query and body values are validated against their models, so an unauthenticated request with, say, a bad path value or a body that fails the schema is a 401, not a 422. **Except for a body that is not valid JSON:** FastAPI parses the JSON body before it runs the secret dependency, so an unparseable body is a 422 whether or not the secret is present. |
+| **One database session per request** | Every store route gets its session from the `async_db` dependency (`data/store/app/database/database.py`), which opens it through `PostgresSessionFactory.AsyncSessionHandle.session()` and closes it when the request ends, including when the request raises. Closing rolls back any transaction still open and returns the connection to the pool. There is no `get_session` and no task-scoped registry behind it; the registry it replaced leaked one pooled connection per read request (decision record `tj-8z213c`). |
 | **Database errors** | A write rolls back once, is logged once at ERROR with its traceback, and **re-raises the original SQLAlchemy error**. No exception handler is registered, so over HTTP it is a bare **500**, as before. A typed conversion (a 503-class status with a structured body) is planned at the store app's HTTP boundary under an error-handling standard that is proposed and **not yet accepted** (`tj-fa1rpu`). |
 
 **Status codes the store routes can answer by design:**
@@ -271,8 +292,8 @@ These hold on every route unless the entry says otherwise.
 | 403 | The declared `owner` does not own the entry (a missing owner is treated as a wrong one) | S3 |
 | 404 | No entry with that id | S3 |
 | 409 | The create overlaps the same owner's existing dataset; `detail.colliding_ids` lists them | S1 |
-| 422 | Validation: a naive datetime, an unknown field or parameter, a missing required field, a bars query naming no selector or a blank symbol, or a `validate_fields` rule on the create body | all |
-| 500 | Anything unmapped: a database error, a non-stock `asset_type` (gap **G8**), a duplicate timestamp inside one ingested batch | all |
+| 422 | Validation: a naive datetime, an unknown field or parameter, a missing required field, a bars query naming no selector or a blank symbol, a `validate_fields` rule on the create body, an `asset_type`/`data_type` pair other than `stock`/`market_activity` on the internal asset-data path, or a malformed single-bar body | all |
+| 500 | Anything unmapped: a database error, a non-stock `asset_type` on S1 (gap **G8**), a duplicate timestamp inside one ingested batch | all |
 
 ---
 
@@ -284,7 +305,7 @@ These hold on every route unless the entry says otherwise.
 |---|---|
 | **Stability** | **Stable.** Not Kafka-borne, and the gRPC work (`tj-8konfu`) keeps REST for admin, debug and health rather than re-hosting it. |
 | **Auth** | none |
-| **Implementation** | `routers/common/ping.py :: ping` *(as of `5ed8eb1`)* |
+| **Implementation** | `routers/common/ping.py :: ping` *(as of the dataset-model PR)* |
 | **Request** | none |
 | **Response** | undeclared — no `response_model`; the handler returns an ad-hoc dict |
 | **Touches** | nothing — no Postgres, no Kafka, no broker |
@@ -297,8 +318,8 @@ It is served by both applications but declared once, here, because the manifest 
 and nothing enumerates applications. One interface, one implementation, one entry.
 
 Because the handler touches nothing, a 2xx from it says only that the web server is up. See gap
-**G3** — this is the entire health story today, and the dependency ordering between the two services
-is built on it.
+**G3** — this is the entire health story today: it is what `make prod-launch` and CI's `up --wait`
+block on for both services.
 
 ## C2 · `/latency/{latency_type}`
 
@@ -306,7 +327,7 @@ is built on it.
 |---|---|
 | **Stability** | **Dies with Kafka** — after one last job. See below; this is *not* dead code to delete today. |
 | **Auth** | none |
-| **Declared at** | `routers/common/app_endpoints.py :: InterfaceRest.LATENCY` *(as of `5ed8eb1`)* |
+| **Declared at** | `routers/common/app_endpoints.py :: InterfaceRest.LATENCY` *(as of the dataset-model PR)* |
 | **Implemented in** | `routers/common/latency.py`, inside `initialize_latency_client()` |
 | **Request** | `schemas.common.latency.LatencyRequest` |
 | **Response** | undeclared — one of three ad-hoc dicts |
@@ -335,7 +356,7 @@ built to compare against.
 |---|---|
 | **Stability** | **Dies with Kafka**, with C2 — it exists only as C2's echo target. |
 | **Auth** | none |
-| **Declared at** | `routers/common/app_endpoints.py :: InterfaceRest.INTERNAL_LATENCY` *(as of `5ed8eb1`)* |
+| **Declared at** | `routers/common/app_endpoints.py :: InterfaceRest.INTERNAL_LATENCY` *(as of the dataset-model PR)* |
 | **Implemented in** | `routers/common/latency.py`, inside `initialize_latency_server()` |
 | **Request** | `schemas.common.latency.InternalLatencyRequest` |
 | **Response** | undeclared — ad-hoc dict |
@@ -357,7 +378,7 @@ interface in the component that crosses two external boundaries.
 |---|---|
 | **Stability** | **Route survives, outbound hop changes.** The address stays; its Kafka forward to data_ingest becomes a gRPC call. |
 | **Auth** | **instance secret** (`X-Instance-Secret`), fail-closed; 401 otherwise |
-| **Implementation** | `routers/data_store/asset_dataset_store.py :: store_data` *(as of `5ed8eb1`)* |
+| **Implementation** | `routers/data_store/asset_dataset_store.py :: store_data` *(as of the dataset-model PR)* |
 | **Request** | `schemas.data_store.asset_dataset_store.StoreAssetDatasetPath` + `...StoreAssetDatasetBody` |
 | **Response** | **undeclared** — ad-hoc dict: `message` and `data_points` (bars written) |
 | **Touches** | Postgres (`AsyncSession`) **and** Kafka (`KafkaRpcFactory.RpcClients`) |
@@ -382,8 +403,9 @@ be 'STATIC' when 'end' is provided."*
 **Two things a retry does not avoid.** An exact repeat reuses the entry and the bar upsert is
 idempotent on the bar's natural key, so the stored data does not duplicate — but the vendor fetch is
 repeated on every call, and a batch carrying two bars at the same timestamp fails the whole write with
-a 500. A batch is written in chunks sized under Postgres's 65,535 bind-parameter limit, all inside one
-transaction: it lands whole or not at all.
+a 500. A batch is written in chunks sized under the tighter of two argument limits — asyncpg's
+32,767 per statement, below Postgres's own 65,535 — all inside one transaction: it lands whole or not
+at all.
 
 The `start` 500 recorded against this route at the previous pin (`tj-6yk4qs`) is fixed: `start` is
 required on the body, so a missing one is a 422 at the edge.
@@ -399,7 +421,7 @@ event log will eventually sit behind. See gaps **G6** (undeclared response) and 
 |---|---|
 | **Stability** | **Stable.** The Kafka removal (`tj-3mk3u5`) explicitly keeps REST for read and debug. |
 | **Auth** | none |
-| **Implementation** | `routers/data_store/asset_dataset_store.py :: get_data` *(as of `5ed8eb1`)* |
+| **Implementation** | `routers/data_store/asset_dataset_store.py :: get_data` *(as of the dataset-model PR)* |
 | **Request** | `...StoreAssetDatasetPath` + `...StoreAssetDatasetQuery`, bound with `Query()` |
 | **Response** | `list[schemas.data_store.asset_dataset_store.AssetDatasetStore]` |
 | **Touches** | Postgres |
@@ -425,7 +447,7 @@ identically, so do not read the difference as significant — it is noted only s
 |---|---|
 | **Stability** | **Stable** as REST. Its *address* is contested — see the note below. |
 | **Auth** | **instance secret** (`X-Instance-Secret`), fail-closed; then the owner check |
-| **Implementation** | `routers/data_store/asset_dataset_store.py :: delete_data` *(as of `5ed8eb1`)* |
+| **Implementation** | `routers/data_store/asset_dataset_store.py :: delete_data` *(as of the dataset-model PR)* |
 | **Request** | `schemas.data_store.asset_dataset_store.AssetDatasetStoreDelete` — path `id`, query `owner` |
 | **Response** | **undeclared** — ad-hoc dict |
 | **Touches** | Postgres |
@@ -450,7 +472,7 @@ request model*. **That was wrong.** This route's request model is
 `AssetDataDeleteById` lives in `schemas/data_store/asset_data_interface.py` and belongs to the
 internal asset-data family. The defect is real and `tj-9dqfjo` is still live, but it is a **schema**
 defect with no bound route behind it: its only consumer was `DELETE /internal/asset-data/...`, removed
-at `3cb5bea`. Nothing on the served surface reaches it today.
+under `tj-h7ikz2`. Nothing on the served surface reaches it today.
 
 Deletion is also the one operation the append-only event-log rule (`tj-qqdo3j`) will forbid outright
 on the order path. When that lands, the question worth asking of this route is whether it can reach
@@ -462,7 +484,7 @@ event-log rows at all.
 |---|---|
 | **Stability** | **Fate undecided — do not guess.** See below. |
 | **Auth** | **instance secret** (`X-Instance-Secret`), fail-closed; 401 otherwise |
-| **Implementation** | `routers/data_store/internal_asset_data.py :: create_stock_market_activity_data` *(as of `5ed8eb1`)* |
+| **Implementation** | `routers/data_store/internal_asset_data.py :: create_stock_market_activity_data` *(as of the dataset-model PR)* |
 | **Request** | `schemas.data_store.asset_data_interface.AssetDataPath` + **an untyped `dict` body** |
 | **Response** | `schemas.data_store.stock.market_activity_data.StockDataMarketActivity` |
 | **Touches** | Postgres, plus that untyped body |
@@ -473,21 +495,21 @@ returns it, including its `feed`.
 **The body is an untyped `dict`** at the route signature, passed as
 `StockDataMarketActivityCreate(**asset_data)` inside the handler. That is why the manifest's
 `touches` field for this route reads `dict` — there is no schema to name. The model it is splatted
-into is now strict: it requires `dataset_id` and `feed`, and rejects unknown fields, so a renamed
-producer field is an error rather than a missing column. But because the model is built inside the
-handler rather than by FastAPI, that error is not reported as a request validation error. See gap
-**G7**.
+into is strict: it requires `dataset_id` and `feed`, requires a timezone-aware `timestamp`, and
+rejects unknown fields, so a renamed producer field is an error rather than a missing column. A body
+that fails it is a **422** in FastAPI's usual shape, each `loc` prefixed with `body`: the handler
+re-raises pydantic's error as a request validation error. As on every guarded route, the secret is
+checked first, so without it the answer is a 401. See gap **G7**.
 
-<!-- TODO: verify — the status a malformed body gets here (expected 500, since a pydantic
-ValidationError raised inside a handler is not FastAPI's RequestValidationError); no test pins it. -->
+**The path is validated as a pair.** `AssetDataPath` is bound with `Path()` and refuses any
+`asset_type`/`data_type` pair outside `SUPPORTED_ASSET_DATA_PAIRS` — today only `stock` with
+`market_activity` — with a **422** naming the supported pairs. OpenAPI still lists every enum value
+for each field, since a cross-field rule is invisible there.
 
 **Why the fate is undecided and nobody should guess it:** nothing in the repository calls this route
 and no accepted decision record names it. `tj-3mk3u5` keeps REST for admin and debug, which this
 plausibly is — but it is also exactly the data_store↔data_ingest write path that `tj-8konfu` moves to
 gRPC. Confirm before building on it.
-
-A non-stock `asset_type` raises `UnsupportedAssetType` (a `ValueError`) rather than returning a 4xx —
-the same contract defect described in gap **G8**.
 
 ## S5 · `GET /internal/asset-data/{asset_type}/{data_type}`
 
@@ -495,7 +517,7 @@ the same contract defect described in gap **G8**.
 |---|---|
 | **Stability** | **Stable.** It is the one bar read, by ruling: the unfiltered read it used to call was deleted rather than kept beside it, and the Kafka removal keeps REST for read. |
 | **Auth** | none |
-| **Implementation** | `routers/data_store/internal_asset_data.py :: read_stock_market_activity_data` *(as of `5ed8eb1`)* |
+| **Implementation** | `routers/data_store/internal_asset_data.py :: read_stock_market_activity_data` *(as of the dataset-model PR)* |
 | **Request** | `schemas.data_store.asset_data_interface.AssetDataPath` + `schemas.data_store.stock.market_activity_data.StockDataMarketActivityQuery`, bound with `Query()` |
 | **Response** | `list[schemas.data_store.stock.market_activity_data.StockDataMarketActivity]` |
 | **Touches** | Postgres |
@@ -529,7 +551,8 @@ rows stay distinguishable.
 It still has no `limit` or `offset`: a selector bounds the read to one symbol or one dataset, not to
 a page. See gap **G5**.
 
-A non-stock `asset_type` raises `UnsupportedAssetType` here too — gap **G8**.
+An unsupported `asset_type`/`data_type` pair is a **422** here too, from the same `Path()`-bound
+`AssetDataPath` as S4.
 
 ## `GET /store/{id}` — declared, unserved, and invisible to the manifest
 
@@ -537,7 +560,7 @@ A non-stock `asset_type` raises `UnsupportedAssetType` here too — gap **G8**.
 |---|---|
 | **Stability** | **Filed for implementation** — `tj-2h1q3k`, user ruling 2026-09-23. Not built yet. |
 | **Auth** | n/a — nothing is served **yet** |
-| **Declared at** | `routers/data_store/app_endpoints.py :: AssetDatasetStoreInterface.GET_STORE_ASSET_DATASET_BY_ID` *(as of `5ed8eb1`)* |
+| **Declared at** | `routers/data_store/app_endpoints.py :: AssetDatasetStoreInterface.GET_STORE_ASSET_DATASET_BY_ID` *(as of the dataset-model PR)* |
 | **Request / Response / Touches** | none — nothing is bound |
 
 **This is the only entry in this document that is not implemented, and it is the only one left.** The
@@ -583,7 +606,7 @@ data_ingest declares **no HTTP interface at all** today. It answers on one Kafka
 |---|---|
 | **Stability** | **Address is re-keyed.** See the caveat below — this is the one entry whose key changes. |
 | **Auth** | none |
-| **Implementation** | `routers/data_ingest/get_dataset_request.py :: store_data` *(as of `5ed8eb1`)*, registered by the `add_server` decorator while the module body runs |
+| **Implementation** | `routers/data_ingest/get_dataset_request.py :: store_data` *(as of the dataset-model PR)*, registered by the `add_server` decorator while the module body runs |
 | **Request** | `schemas.data_ingest.get_dataset_request.GetDatasetRequest` |
 | **Response** | `schemas.data_store.stock.market_activity_data.BatchStockDataMarketActivityCreate` |
 | **Touches** | Kafka (the transport itself) and the broker, reached through a module-level import rather than injection |
@@ -631,7 +654,7 @@ empty interval. Two narrowings worth knowing, neither of which retracts the defe
 
 See gaps **G1** and **G2**, which compound here.
 
-data_ingest declares **no REST interface at all** now — not merely none that is bound. `ab42ec4`
+data_ingest declares **no REST interface at all** now — not merely none that is bound. `tj-427x50`
 deleted the last member of its `InterfaceRest` enum, and with it the empty enum class and its `Enum`
 import. The component's entire declared surface is the one RPC topic above. See
 [Declarations deleted by ruling](#declarations-deleted-by-ruling-2026-09-23).
@@ -668,11 +691,11 @@ returned PASS on `tj-wc4pe8` and `tj-427x50`, and both beads are closed. Each de
 member and its manifest line in one diff, which is what the manifest's equality test requires — so a
 silent reintroduction turns that test red.
 
-| Was | Declared at | Deleted by | Bead |
-|---|---|---|---|
-| `/internal/asset-data/{asset_type}/{data_type}/{id}` | `AssetDataInterface.PUT_ASSET_DATA` | `fc377e4` | `tj-wc4pe8` |
-| `/store/{asset_type}/{data_type}/{asset_symbol}/{id}` | `AssetDatasetStoreInterface.PUT_STORE_ASSET_DATASET` | `fc377e4` | `tj-wc4pe8` |
-| `/broker/{asset_type}/{symbol}/{data_type}` | `routers/data_ingest` `InterfaceRest.POST_STORE_DATASET` | `ab42ec4` | `tj-427x50` |
+| Was | Declared at | Bead |
+|---|---|---|
+| `/internal/asset-data/{asset_type}/{data_type}/{id}` | `AssetDataInterface.PUT_ASSET_DATA` | `tj-wc4pe8` |
+| `/store/{asset_type}/{data_type}/{asset_symbol}/{id}` | `AssetDatasetStoreInterface.PUT_STORE_ASSET_DATASET` | `tj-wc4pe8` |
+| `/broker/{asset_type}/{symbol}/{data_type}` | `routers/data_ingest` `InterfaceRest.POST_STORE_DATASET` | `tj-427x50` |
 
 ## What each was for, and what would bring it back
 
@@ -707,8 +730,8 @@ authoritative about what is missing. Writable from outside, it is not authoritat
 > route must exist, because the 409 on an overlapping create hands the caller an id with nowhere to
 > send it. That update is narrower than the row update deleted here: it changes only `start` and/or
 > `end`, only by growth, keeps the id, and is owner-checked — it is not a caller-writable ledger. The
-> crud function exists (`update_entry`), but **no route, endpoint constant or manifest line exists at
-> `5ed8eb1`**. See [What a create does](#what-a-create-does).
+> crud function exists (`update_entry`), but **no route, endpoint constant or manifest line exists as of
+> the dataset-model PR**. See [What a create does](#what-a-create-does).
 
 **`POST /broker/{asset_type}/{symbol}/{data_type}` — a REST door into the fetch path.** The same job
 as R1, but reachable by a human or a script instead of by data_store. *Deleted as a defer, not a no —
@@ -760,9 +783,10 @@ will record as fetched.
 ## G3 · No health/readiness distinction beyond `/ping` — **REAL GAP**, with a dated trigger
 
 `GET /ping` is answered by a handler that touches nothing — no Postgres, no Kafka, no broker — and it
-is the container healthcheck for *both* services, with data_store's startup gated on data_ingest
-reporting healthy. So a container with a dead Postgres pool, unreachable peer or exhausted broker
-credentials reports healthy, and the dependency gate opens.
+is the container healthcheck for *both* services, which `make prod-launch` and CI's `up --wait`
+block on. So a container with a dead Postgres pool, unreachable peer or exhausted broker credentials
+reports healthy, and the launch reports success. (data_store's own start waits on postgres and kafka
+being healthy, through their own probes, not on data_ingest.)
 
 The gRPC work (`tj-8konfu`) already names the sharper version of this: both healthchecks probe HTTP
 `/ping`, so a container whose gRPC listener is dead still reports healthy.
@@ -775,8 +799,9 @@ The gRPC work (`tj-8konfu`) already names the sharper version of this: both heal
 The three write routes now require the deployment's instance secret, and nothing else on the surface
 requires anything. **The secret is not caller authentication**: it authenticates the deployment, so
 with one key there is one effective principal, and the per-dataset owner check stops mistakes rather
-than anyone holding the key. Services still publish on all interfaces with default or no auth
-(`tj-glqs4r`, open). `tj-a0s7vl` owns real authentication at P1 and is explicit that loopback binding
+than anyone holding the key. Every other surface answers without credentials (`tj-glqs4r`, open);
+prod publishing no host port narrows who can reach them to containers on the stack's networks, which
+is not the same thing. `tj-a0s7vl` owns real authentication at P1 and is explicit that loopback binding
 is a perimeter, not an identity. The platform design wants scoped keys (`read:accounts`,
 `read:events`, `read:market`, `trade`) from day one, because the private strategy repo consumes this
 surface from outside the container; per-principal keys would reuse the same owner comparison with
@@ -803,10 +828,10 @@ large answer, returned 200 in one response.
 
 ## G6 · Routes that declare no response model — **REAL GAP**, cheap, and it compounds
 
-At `5ed8eb1` three HTTP routes return undeclared dicts: `POST /store/...` (S1),
+As of the dataset-model PR, three HTTP routes return undeclared dicts: `POST /store/...` (S1),
 `DELETE /store/{id}` (S3) and `GET /ping` (C1). The latency pair (C2, C3) returns ad-hoc dicts too.
 *(The analysis behind this document counted four HTTP routes; the fourth was
-`DELETE /internal/asset-data/...`, removed at `3cb5bea`.)*
+`DELETE /internal/asset-data/...`, removed under `tj-h7ikz2`.)*
 
 The generated OpenAPI therefore documents nothing for them — and a **versioned typed client SDK** is
 planned for the private repo (`tj-d2mhru`), which has nothing to generate from where the response
@@ -821,25 +846,26 @@ model is absent.
 `StockDataMarketActivityCreate` inside the handler. It is the reason the manifest's `touches` field
 for that route reads `dict` — there is no schema to name, so the OpenAPI document describes no body.
 
-The target model is now strict (unknown fields rejected, `dataset_id` and `feed` required), so a
-renamed producer field is an error rather than a missing column. What remains is the typing gap
-itself: the error is raised by the handler rather than by request validation, and nothing documents
-the body to a generated client.
+The target model is strict (unknown fields rejected, `dataset_id` and `feed` required), and a body
+that fails it is now a 422 in the usual shape, re-raised by the handler. What remains is the typing
+gap itself: nothing documents the body to a generated client.
 
 ## G8 · The surface promises three asset classes and serves one — **REAL GAP in the contract**
 
 The RPC handler re-validates into a stock, crypto or option request on a caller-supplied `asset_type`,
 and the crypto and option callbacks are empty synchronous stubs that return `None`, which the handler
-then awaits — so the caller gets a `TypeError`, not a clean rejection (R1). The data_store internal
-family raises `UnsupportedAssetType` — a plain `ValueError`, not an `HTTPException` — on the same
-input (S4, S5). No exception handler is registered anywhere in `routers/` or `data/store/app/`, so
-each of these reaches the caller as a 500.
+then awaits — so the caller gets a `TypeError`, not a clean rejection (R1). No exception handler is
+registered anywhere in `routers/` or `data/store/app/`, so that reaches an S1 caller as a 500.
+
+The data_store internal family is **fixed**: S4 and S5 refuse an unsupported pair at the path model
+with a 422, before the handler runs. Their `UnsupportedAssetType` branch is still in the handler but
+is no longer reachable over HTTP.
 
 Stock-only is the correct **scope** today. But an interface that accepts an argument it will 500 on is
 a contract defect regardless of scope.
 
-*Recommendation:* state stock-only in terms — done, here — and reject an unsupported `asset_type` with
-a 4xx instead of raising. Cheap.
+*Recommendation:* state stock-only in terms — done, here — and reject an unsupported `asset_type` on
+S1 and R1 with a 4xx instead of raising, the way S4 and S5 now do. Cheap.
 
 ## G9 · Nothing here touches accounts, portfolios, orders or fills — **NOT-YET**, unambiguously
 
@@ -899,12 +925,11 @@ rewrite it, and knowing which is more useful than any individual entry above:
 
 Pending at the time of writing, beyond those four:
 
-- `tj-vhboky.14` — the remaining host checks listed at the top. Until they run, every
-  database-dependent behaviour in
-  [The data model behind the store surface](#the-data-model-behind-the-store-surface) is designed
-  and unit-tested, not proven against Postgres.
-- `tj-w6bpjm` and `tj-vhboky.46` — redacting `owner` from SQL parameters in error text and from the
-  ORM row `repr`. The SQL-parameter layer waits on the host check above.
+- `tj-vhboky.14` — the host checks the top of this document lists as not yet run. Until they run,
+  those behaviours are designed and unit-tested, not proven against Postgres.
+- The asyncpg bind check against the shipped `RedactedStr` and `SensitiveString`. The host run above
+  proved a stand-in subclass; `tests/system/test_asyncpg_bind_spike.py` was re-pointed at the real
+  classes afterwards and has not been run on a host since (`tj-vhboky.14`).
 - `tj-fa1rpu` — the error-handling standard, **proposed, not accepted**. When accepted, database
   errors on the store's routes get a typed response at the HTTP boundary instead of a bare 500.
 - `tj-rh4b7f` — `feed` on the dataset entry and in its identity, with the gRPC transport work.
@@ -923,9 +948,9 @@ Pending at the time of writing, beyond those four:
 When this document and the manifest disagree, **the manifest is right**. File a bug against this
 document.
 
-This document has drifted once already, and the way it happened is worth recording. It was written
-pinned to `315a043`; the next two commits deleted three of the declarations it described. Both of
-those commits were correctly gated and the manifest test was green throughout, because the manifest
+This document has drifted before, and the way it happened is worth recording. It was written
+pinned to a commit on the `tj-6z03hd` work; the next two commits deleted three of the declarations
+it described. Both of those commits were correctly gated and the manifest test was green throughout, because the manifest
 moved with the code exactly as designed. Nothing was broken — the document simply was not in anyone's
 path. **The manifest test makes the surface impossible to change silently; it does nothing to make
 this document move when the surface does.** That gap is routing, not detection, and a proposal for
@@ -933,8 +958,10 @@ closing it is recorded on `tj-d6e128`.
 
 It drifted a second way on the per-dataset release: the branch was regrouped for review, and the
 commit the document was pinned to stopped being an ancestor of the line it described — so the one
-instruction a reader was given, "check the commit pin", became impossible to follow. **Re-pin after
-a regroup, not before it**, in the same diff as the content pass.
+instruction a reader was given, "check the commit pin", became impossible to follow. It happened
+twice, to `a96ede9` and then `5ed8eb1`. **So this document pins no SHA.** It names the release it
+describes and cites a file and symbol per entry, both of which survive a regroup. The SHAs a
+regroup does not touch are the ones already on `main`.
 
 Until something mechanical exists, the working rule is: **a diff that touches `routers/`, `schemas/`,
 an interface enum, or `routers/tests/interface_manifest/` obliges a pass over this file before the
