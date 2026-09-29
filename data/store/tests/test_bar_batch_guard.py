@@ -206,7 +206,7 @@ def test_to_schema_converts_a_stored_row_to_the_read_schema():
     assert schema.data.trade_count == 10
 
 
-@pytest.mark.parametrize('stored_feed', [Feed.IEX, Feed.SIP, Feed.NOT_APPLICABLE])
+@pytest.mark.parametrize('stored_feed', list(Feed))
 def test_to_schema_reports_the_tape_that_served_the_row(stored_feed: Feed):
     """tj-5dvgaa's acceptance criterion, pinned against a CONSTANT and not just against absence.
 
@@ -218,10 +218,15 @@ def test_to_schema_reports_the_tape_that_served_the_row(stored_feed: Feed):
     wrong-answer-rather-than-missing-answer failure the bead's reasoning rejects an optional field to
     avoid.
 
-    Parametrising over every member is what closes that: no single constant satisfies three cases.
-    ``NOT_APPLICABLE`` is included because it is a real stored value -- the final, correct answer for
-    a source with no tape distinction -- and not a sentinel standing in for one that was never
-    resolved (tj-vhboky.1, 2026-09-25).
+    Parametrising over every member is what closes that: no single constant satisfies more than one
+    case. ``NOT_APPLICABLE`` is included because it is a real stored value -- the final, correct
+    answer for a source with no tape distinction -- and not a sentinel standing in for one that was
+    never resolved (tj-vhboky.1, 2026-09-25).
+
+    The members are read off ``Feed`` itself, never listed here (tj-ibf2vo). Feed is composed at
+    import time precisely so that no list is hand-maintained. A literal list here would be that list:
+    adding a market would leave it collecting the old cases, and a to_schema that mis-reported the
+    new tape would fail nothing. Derived, the new market adds its own case with no edit.
 
     Args:
         stored_feed: The feed on the stored row, which the converted schema must report back.

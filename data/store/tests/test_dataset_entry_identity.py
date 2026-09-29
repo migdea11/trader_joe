@@ -40,7 +40,9 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy.dialects import postgresql
+from sqlalchemy import create_engine, func, select
+from sqlalchemy.dialects import postgresql, sqlite
+from sqlalchemy.exc import IntegrityError
 
 from common.database.sql_alchemy_nullable_datetime import NullableDateTime
 from common.enums.data_select import AssetType, DataType
@@ -892,3 +894,312 @@ async def test_an_open_ended_entry_lists_with_no_end_rather_than_1970():
 
     assert listed[0].end is None, 'the EPOCH sentinel is being served to callers as a real date'
     assert listed[0].item_count == 3
+
+
+# ---------------------------------------------------------------------------------------------
+# The entry key: what makes two requests two entries (tj-vhboky.11 items 1, 4, 6, 20)
+# ---------------------------------------------------------------------------------------------
+#
+# WHAT "THE ENTRY KEY" MEANS HERE, because every test below turns on it. The only thing that
+# decides whether a create lands on an existing row or makes a new one is the constraint the
+# upsert's ON CONFLICT names. So the key is read off the statement upsert_entry actually builds:
+# the constraint name is parsed out of the compiled ON CONFLICT clause, that constraint is looked
+# up on the TABLE (not on NATURAL_KEY, which is only the list the constraint happens to be built
+# from), and the key is the INSERT's bound values for that constraint's columns. A field dropped
+# from the constraint, dropped from the insert, or bound to the wrong value changes this tuple.
+#
+# WHAT THIS DOES NOT PROVE: that Postgres enforces the constraint or matches it on conflict. That
+# is tj-vhboky.14's. What it proves is that the statement we send asks for the right thing.
+
+# The one-field variants depart from this base. Chosen so every variant is a body the schema
+# accepts: update_type=DAILY needs a non-BULK expiry_type and no end (StoreAssetDatasetBody.
+# validate_fields), so the base is open-ended with a ROLLING expiry, and the `end` variant closes
+# it. expiry is fixed rather than defaulted so no clock is involved.
+_KEY_BASE: dict = {
+    'owner': OWNER,
+    'asset_symbol': 'AAPL',
+    'asset_type': AssetType.STOCK,
+    'data_type': DataType.MARKET_ACTIVITY,
+    'source': DataSource.ALPACA_API,
+    'granularity': Granularity.ONE_DAY,
+    'expiry_type': ExpiryType.ROLLING,
+    'update_type': UpdateType.STATIC,
+    'start': JANUARY,
+    'end': None,
+    'expiry': FEBRUARY,
+}
+
+# One entry per identity field of tj-vhboky.1 section 2, as amended by tj-rh4b7f: feed is NOT an
+# entry field any more, so there are ten, not the eleven tj-ilo73k was written against. This is
+# the DESIGN's list, written out on purpose -- test_every_entry_key_column_has_a_one_field_case
+# compares it against the model so that neither can move without the other.
+_ONE_FIELD_CHANGES: dict = {
+    'owner': 'strategy-b',
+    'asset_symbol': 'MSFT',
+    'asset_type': AssetType.CRYPTO,
+    'data_type': DataType.QUOTE,
+    'source': DataSource.IB_API,
+    'granularity': Granularity.ONE_HOUR,
+    'expiry_type': ExpiryType.BUFFER_1K,
+    'update_type': UpdateType.DAILY,
+    'start': FEBRUARY,
+    'end': MARCH,
+}
+
+
+async def _upsert(request: AssetDatasetStoreCreate, returned_id: UUID | None = None) -> tuple[UUID, FakeSession]:
+    """Run the real upsert with no overlap found, returning what it returned and what it sent."""
+    db = FakeSession(FakeResult([]), FakeResult([(returned_id or uuid4(),)]))
+    returned = await crud.upsert_entry(db, request)
+    return returned, db
+
+
+def _key_constraint_columns(sql: str) -> list[str]:
+    """The columns of the constraint the compiled ON CONFLICT clause actually targets, looked up on the table."""
+    target = re.search(r'ON CONFLICT ON CONSTRAINT (\w+) DO UPDATE', sql)
+    assert target, f'the upsert does not target a named constraint, so it has no entry key to read: {sql}'
+    constraints = [c for c in StoreDatasetEntry.__table__.constraints if c.name == target.group(1)]
+    assert len(constraints) == 1, f'ON CONFLICT names {target.group(1)!r}, which the table does not declare'
+    return [column.name for column in constraints[0].columns]
+
+
+def _entry_key(db: FakeSession) -> dict:
+    """The entry key the recorded upsert sends: the targeted constraint's columns, mapped to their bound values."""
+    insert = _only(db.statements, 'INSERT')
+    params = _params(insert)
+    columns = _key_constraint_columns(_sql(insert))
+    unbound = [column for column in columns if column not in params]
+    assert unbound == [], f'key columns are not bound by the insert, so the key cannot dedup on them: {unbound}'
+    return {column: params[column] for column in columns}
+
+
+@pytest.mark.asyncio
+async def test_an_identical_request_resolves_to_the_same_entry_key():
+    """The negative control for the one-field cases below.
+
+    Without it, a key that differed on EVERY call -- a fresh uuid or a now() slipping into the
+    constraint -- would pass all ten of them while breaking the exact-repeat guarantee outright.
+    """
+    _, first = await _upsert(AssetDatasetStoreCreate(**_KEY_BASE))
+    _, second = await _upsert(AssetDatasetStoreCreate(**_KEY_BASE))
+
+    assert _entry_key(first) == _entry_key(second)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('field', list(_ONE_FIELD_CHANGES))
+async def test_a_request_differing_in_one_identity_field_is_a_different_entry(field: str):
+    """tj-ilo73k's acceptance criterion, one case per identity field (tj-vhboky.11 item 1).
+
+    THE REGRESSION THIS EXISTS FOR IS SILENT. Drop a field from the entry's unique constraint and
+    the write keeps succeeding: two requests that differ only in that field collide on ON CONFLICT
+    and the second quietly resolves to the FIRST one's id -- a different owner's dataset, a
+    different granularity's bars, a weaker lifetime. The existing tests in this file derive their
+    column sets FROM NATURAL_KEY, so they follow a shrunken key down and stay green; this test
+    names the fields from the design instead.
+
+    For `start` and `end` the second create would, for the SAME owner, be refused as an own-overlap
+    before it inserted anything (test_an_overlapping_but_not_identical_request_fails_naming_the_
+    colliding_ids). That is still a different entry, which is the claim: what matters here is that
+    the key cannot merge the two, so a range change can never be answered with the other range's id.
+    """
+    _, base = await _upsert(AssetDatasetStoreCreate(**_KEY_BASE))
+    _, variant = await _upsert(AssetDatasetStoreCreate(**_KEY_BASE | {field: _ONE_FIELD_CHANGES[field]}))
+
+    base_key, variant_key = _entry_key(base), _entry_key(variant)
+    assert field in base_key, f'{field} is not part of the entry key, so two requests differing in it are one entry'
+    differing = sorted(column for column in base_key if base_key[column] != variant_key[column])
+    assert differing == [field], f'changing only {field} changed the entry key in {differing}'
+
+
+def test_every_entry_key_column_has_a_one_field_case():
+    """The model's key and the design's field list, compared both ways.
+
+    A column added to the constraint without a case here would be an identity field nothing pins;
+    one removed from it reddens its case above and this. feed coming back onto the entry
+    (tj-rh4b7f defers it to the gRPC transport work) lands here first, which is the prompt to add
+    its case deliberately rather than by accident.
+    """
+    constraints = [
+        c for c in StoreDatasetEntry.__table__.constraints if c.name == StoreDatasetEntry.NATURAL_KEY_CONSTRAINT
+    ]
+    assert len(constraints) == 1
+    assert sorted(column.name for column in constraints[0].columns) == sorted(_ONE_FIELD_CHANGES)
+
+
+def test_no_column_of_the_entry_key_is_nullable():
+    """The model half of "a key column can never reach the database as NULL" (tj-vhboky.11 item 4).
+
+    Postgres treats NULL as distinct from NULL in a unique index, so ONE nullable key column is
+    enough to make every null-bearing row unique and to turn an exact repeat into a second row.
+    The schema half -- an explicit null is refused at the edge -- is in
+    schemas/tests/test_schemas_smoke_data_store.py. Derived from the constraint, so a column that
+    joins the key later is covered here without an edit.
+    """
+    constraints = [
+        c for c in StoreDatasetEntry.__table__.constraints if c.name == StoreDatasetEntry.NATURAL_KEY_CONSTRAINT
+    ]
+    assert len(constraints) == 1
+    nullable = sorted(column.name for column in constraints[0].columns if column.nullable)
+    assert nullable == [], f'entry key columns accept NULL, so the unique key cannot dedup on them: {nullable}'
+
+
+@pytest.mark.asyncio
+async def test_two_owners_asking_for_the_same_spec_get_two_entries_and_neither_fails():
+    """tj-vhboky.11 item 6: owner is identity, so the same spec twice is two datasets, not a conflict.
+
+    test_the_overlap_check_is_scoped_to_the_requesting_owner pins that the second owner's overlap
+    check binds ITS owner. This pins the rest of the claim: that it does not ALSO see the first
+    owner (so it cannot fail against them), that both creates commit and return their own ids,
+    and that the two inserts carry keys differing in owner and nothing else -- so the constraint
+    cannot fold the second owner onto the first owner's row.
+    """
+    first_id, second_id = uuid4(), uuid4()
+
+    first_returned, first = await _upsert(create_request(owner='strategy-a', end=MARCH), first_id)
+    second_returned, second = await _upsert(create_request(owner='strategy-b', end=MARCH), second_id)
+
+    assert (first_returned, second_returned) == (first_id, second_id)
+    assert (first.commits, second.commits) == (1, 1)
+    assert 'strategy-a' not in _params(second.statements[0]).values(), (
+        "the second owner's overlap check can match the first owner's entry, so it can fail against it"
+    )
+    first_key, second_key = _entry_key(first), _entry_key(second)
+    assert sorted(column for column in first_key if first_key[column] != second_key[column]) == ['owner']
+
+
+def test_the_entry_expiry_column_is_timezone_aware():
+    """tj-vhboky.11 item 20, the column half. A plain TIMESTAMP is the defect being fixed.
+
+    The bar's old expiry was a naive DateTime while every other timestamp here is timestamptz, and
+    a naive column makes "when does this data die" depend on the session timezone. Nothing else
+    reads this attribute, so without an explicit assertion a revert to DateTime() is invisible.
+    The compiled-DDL half is in test_head_revision_shape.py.
+
+    NOT COVERED, AND NOT COVERABLE WITHOUT A PRODUCTION CHANGE: a NAIVE expiry sent in the request
+    body is accepted and bound unchanged into the insert today -- neither refused nor converted.
+    Filed as tj-1bl90i rather than pinned here.
+    """
+    expiry = StoreDatasetEntry.__table__.columns['expiry']
+    assert expiry.type.timezone is True, 'store_dataset_entry.expiry is a naive TIMESTAMP again'
+
+
+# ---------------------------------------------------------------------------------------------
+# The owner column stays NOT NULL, in its own right (tj-ap3he4)
+# ---------------------------------------------------------------------------------------------
+#
+# test_no_column_of_the_entry_key_is_nullable already reds on a nullable owner, but only because
+# owner happens to be in the constraint it derives from, and it names neither of the two things
+# that depend on owner being NOT NULL. The delete-route test asserts the same property as a side
+# effect of an authorisation argument. Neither reaches the consequence: that a NULL in an identity
+# column turns an exact repeat into a second row. The two tests below pin the column by name and
+# then show that consequence against the model's own table.
+
+
+def test_the_entry_owner_column_is_not_null_for_authorisation_and_for_identity():
+    """StoreDatasetEntry.owner is NOT NULL, and two separate properties rest on it.
+
+    AUTHORISATION. _check_owner refuses an id-addressed write when ``existing.owner !=
+    declared_owner``. An owner-less DELETE declares None, and it is refused only because the stored
+    owner is never None, so the comparison always holds. A NULL stored owner would make None equal
+    None, and an owner-less caller could delete or grow that entry.
+
+    IDENTITY. owner is a column of uq_store_dataset_entry_identity, and a unique index treats NULL
+    as distinct from NULL. A nullable owner would stop the exact-repeat-returns-the-existing-id
+    path from matching, which is shown against a real table by
+    test_a_null_owner_turns_an_exact_repeat_into_a_second_row_unless_the_column_refuses_it.
+
+    Named rather than derived from the constraint, so dropping owner from the key does not also
+    drop this check. The authorisation reason holds whether or not owner is identity.
+    """
+    owner = StoreDatasetEntry.__table__.columns['owner']
+    key_columns = [
+        column.name
+        for constraint in StoreDatasetEntry.__table__.constraints
+        if constraint.name == StoreDatasetEntry.NATURAL_KEY_CONSTRAINT
+        for column in constraint.columns
+    ]
+
+    assert owner.nullable is False, (
+        'store_dataset_entry.owner accepts NULL. Authorisation: _check_owner would let an owner-less '
+        'request (declared None) pass against a NULL-owned entry. Identity: owner is in '
+        f'{StoreDatasetEntry.NATURAL_KEY_CONSTRAINT}, where NULL is distinct from NULL, so an exact '
+        'repeat would insert a second row instead of returning the existing id.'
+    )
+    assert 'owner' in key_columns, (
+        f'owner is no longer in {StoreDatasetEntry.NATURAL_KEY_CONSTRAINT}. The identity reason above '
+        'has changed, so revisit this test and tj-vhboky.1 section 5 together.'
+    )
+
+
+def _replay_on_sqlite(engine, row: dict, key_columns: list[str]) -> UUID:
+    """Send one upsert of `row` to the model's own table, with an ON CONFLICT on the identity key.
+
+    The SQLite spelling of what upsert_entry sends Postgres. SQLite cannot target a constraint by
+    name, so it names the constraint's own columns, which resolve to the same unique index. The SET
+    clause matches production: expiry and updated_at only.
+    """
+    stmt = sqlite.insert(StoreDatasetEntry.__table__).values(id=uuid4(), created_at=JANUARY, updated_at=JANUARY, **row)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=key_columns, set_={'expiry': row['expiry'], 'updated_at': FEBRUARY}
+    ).returning(StoreDatasetEntry.__table__.c.id)
+    with engine.begin() as connection:
+        return connection.execute(stmt).scalar_one()
+
+
+def _row_count(engine) -> int:
+    with engine.connect() as connection:
+        return connection.execute(select(func.count()).select_from(StoreDatasetEntry.__table__)).scalar_one()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('owner', [OWNER, None], ids=['control-a-declared-owner', 'a-null-owner'])
+async def test_a_null_owner_turns_an_exact_repeat_into_a_second_row_unless_the_column_refuses_it(owner):
+    """A NULL in an identity column defeats the exact-repeat path. The NOT NULL on owner is what stops it.
+
+    THE CONSEQUENCE, SHOWN RATHER THAN DESCRIBED. The row is the INSERT the real upsert_entry
+    builds, with its key columns read off the constraint the ON CONFLICT names. That row is then
+    sent twice to StoreDatasetEntry's own table on an in-memory SQLite, the second time as an exact
+    repeat.
+
+    * CONTROL, a declared owner. The repeat hits the unique key and returns the first id. There is
+      one row. This shows the harness's ON CONFLICT really matches, so a second row in the other
+      case is caused by the NULL and not by the harness.
+    * A NULL owner. Both SQLite and Postgres (without NULLS NOT DISTINCT) treat NULL as distinct in
+      a unique index, so the ON CONFLICT never fires. Today the column refuses the NULL outright,
+      and both attempts raise IntegrityError. Make owner nullable and both attempts succeed. The
+      table then holds two rows for one dataset under two different ids, with no error anywhere.
+
+    WHAT THIS DOES NOT PROVE: that Postgres behaves the same. SQLite stands in for its unique-index
+    NULL semantics, which the two share by default. The Postgres-verified tier is tj-vhboky.14.
+    The schema already refuses an owner-less create (owner is required), so this row cannot reach
+    the table through the API today. The column is the backstop this test pins.
+    """
+    _, db = await _upsert(AssetDatasetStoreCreate(**_KEY_BASE))
+    key = _entry_key(db)
+    insert_params = _params(_only(db.statements, 'INSERT'))
+    table_columns = set(StoreDatasetEntry.__table__.columns.keys())
+    row = {column: value for column, value in insert_params.items() if column in table_columns} | {'owner': owner}
+
+    engine = create_engine('sqlite://')
+    StoreDatasetEntry.__table__.create(engine)
+
+    outcomes = []
+    for _attempt in range(2):
+        try:
+            outcomes.append(_replay_on_sqlite(engine, row, list(key)))
+        except IntegrityError as error:
+            outcomes.append(f'refused: {error.orig}')
+    rows = _row_count(engine)
+
+    if owner is not None:
+        assert rows == 1, f'the control repeat made {rows} rows, so the harness ON CONFLICT does not match'
+        assert outcomes[0] == outcomes[1], f'the control repeat returned a different id: {outcomes}'
+        return
+
+    assert all(str(outcome).startswith('refused: NOT NULL') for outcome in outcomes), (
+        f'a NULL owner was accepted. The exact repeat produced {rows} rows, outcomes {outcomes}: the '
+        f'NULL is distinct in {StoreDatasetEntry.NATURAL_KEY_CONSTRAINT}, so ON CONFLICT never matched '
+        'and a second row was written instead of the existing id being returned.'
+    )
+    assert rows == 0

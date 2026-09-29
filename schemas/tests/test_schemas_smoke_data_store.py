@@ -653,6 +653,12 @@ def test_the_entry_carries_no_feed_and_the_bar_requires_one():
 
     # And the value survives the round trip rather than merely being accepted: a read model that
     # declared the field but dropped it on validation would satisfy every assertion above.
+    #
+    # ONE MEMBER ONLY, ON PURPOSE. The value-level property across EVERY Feed member -- that the
+    # stored row's own tape is what the read model reports -- is pinned in
+    # data/store/tests/test_bar_batch_guard.py::test_to_schema_reports_the_tape_that_served_the_row,
+    # parametrised over list(Feed). A schema-side coercion of one tape into another would be caught
+    # there and NOT by a schemas-only test run (tj-ibf2vo).
     built = StockDataMarketActivity(
         **_IDENTIFIER | _DATA_FIELDS | _BAR_IDENTITY | {'data': _BAR, 'id': 1, 'created_at': WHEN, 'updated_at': WHEN}
     )
@@ -725,6 +731,31 @@ def test_owner_is_required_with_no_default():
     assert field.default_factory is None
     with pytest.raises(ValidationError) as excinfo:
         StoreAssetDatasetBody(**{key: value for key, value in _DATASET_BODY.items() if key != 'owner'})
+    assert [error['loc'] for error in excinfo.value.errors()] == [('owner',)]
+
+
+@pytest.mark.parametrize('model', [StoreAssetDatasetBody, AssetDatasetStoreCreate, AssetDatasetStoreUpdate])
+def test_owner_rejects_an_explicit_null(model: type[BaseModel]):
+    """The explicit-null half of "owner never reaches the database as NULL" (tj-vhboky.11 item 4).
+
+    test_owner_is_required_with_no_default pins that OMITTING owner fails. It does not pin this:
+    ``owner: str | None`` with no default is still required, so a missing owner still fails -- but
+    an explicit ``"owner": null`` is then accepted, and upsert_entry's ``exclude_none=True`` drops
+    the None from the insert. The column's server_default then writes 'unassigned', and every
+    caller that sent null lands on ONE shared dataset -- the exact problem owner-scoped writes
+    exist to prevent. Each write model is checked, since the crud layer receives the Create and
+    Update models rather than the body.
+
+    Args:
+        model: A write model carrying the owner field.
+    """
+    payload = _DATASET_BODY | {'owner': None}
+    if model is not StoreAssetDatasetBody:
+        payload |= {'asset_type': 'stock', 'data_type': 'market-activity', 'asset_symbol': 'AAPL'}
+    if model is AssetDatasetStoreUpdate:
+        payload |= {'id': DATASET_ID}
+    with pytest.raises(ValidationError) as excinfo:
+        model(**payload)
     assert [error['loc'] for error in excinfo.value.errors()] == [('owner',)]
 
 
