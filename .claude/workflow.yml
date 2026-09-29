@@ -140,7 +140,7 @@ components:
       tech_stack: "Python 3.12, FastAPI, SQLAlchemy 2.0 async, asyncpg, Alembic, Postgres"
       key_invariants: "Sole owner of persisted market data. Every write goes through a repository; no raw SQL in routers. Migrations are additive."
       env_vars: "| DATABASE_URI | primary DSN | fails closed |"
-      pitfalls: "| 1 | Compose falls back to a hard-coded password and host 'db' | Fail on missing variables (bug tj-70ovb3) |"
+      pitfalls: "| 1 | A request session opened outside `async_db` / `session()` is never returned to the pool | Take the session from `async_db`; commit only through `write_transaction` (bug tj-vhboky.76, ADR tj-8z213c) |"
   - path: common
     slots:
       component_name: "Shared library"

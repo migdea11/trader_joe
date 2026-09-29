@@ -56,6 +56,10 @@ testing = [
     "pytest>=8.4.2",
     "pytest-asyncio>=1.2.0",
     "pytest-cov>=7.0.0",
+    # Test-only: a real async pool without Postgres for the Docker-free component tests.
+    # Never add it to base, a service group or dev -- dev is baked into the service dev
+    # image (ADR tj-8z213c, Addendum 1).
+    "aiosqlite>=0.22.1",
 ]
 data-ingest = [
     "alpaca-py>=0.42.2",

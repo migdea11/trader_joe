@@ -29,9 +29,15 @@ async def shutdown():
     await PostgresSessionFactory.shutdown()
 
 
-# def get_db() -> Generator[Session, None, None]:
-#     yield PostgresSessionFactory.SyncSession.get_session(DATABASE_URI)
-
-
 async def async_db() -> AsyncGenerator[AsyncSession, None]:
-    yield PostgresSessionFactory.AsyncSessionHandle.get_session(DATABASE_ASYNC_URI)
+    """FastAPI dependency: the one place data_store opens a request's database session.
+
+    One session per request, closed when the request ends -- including when the request
+    raises -- which rolls back any transaction still open and returns the connection to the
+    pool (tj-vhboky.76). Transaction boundaries stay with write_transaction.
+
+    Yields:
+        AsyncSession: The request's session.
+    """
+    async with PostgresSessionFactory.AsyncSessionHandle.session(DATABASE_ASYNC_URI) as session:
+        yield session

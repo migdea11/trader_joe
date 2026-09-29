@@ -1,11 +1,8 @@
-from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.app_lifecycle import init_debugger, startup_logs, teardown_logs
-from common.database.postgres_tools import PostgresSessionFactory
 from common.kafka.kafka_config import get_consumer_params, get_rpc_params
 from common.kafka.kafka_rpc_factory import KafkaRpcFactory
 from common.kafka.messaging.kafka_consumer import KafkaConsumerFactory
@@ -55,19 +52,9 @@ async def lifespan(app: FastAPI):
     # cleanup tasks
     teardown_logs(app)
     __RPC_CLIENTS.shutdown()
-    await database.shutdown()
     SharedWorkerPool.worker_shutdown()
 
     await database.shutdown()
-
-
-@asynccontextmanager
-async def get_async_db() -> AsyncGenerator[AsyncSession, None]:
-    session = PostgresSessionFactory.AsyncSessionHandle.get_session(database.DATABASE_ASYNC_URI)
-    try:
-        yield session
-    finally:
-        await session.close()
 
 
 def get_rpc_clients() -> KafkaRpcFactory.RpcClients:
