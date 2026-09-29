@@ -12,6 +12,7 @@ A green run here means the configuration still says the right thing, nothing mor
 
 import configparser
 import copy
+import fnmatch
 import os
 import re
 import shlex
@@ -2254,3 +2255,197 @@ def test_test_system_neither_starts_nor_migrates_the_stack(tmp_path: Path):
         if forbidden & {PurePosixPath(word).name for word in command}
     ]
     assert not offenders, f'the {SYSTEM_TARGET} recipe starts, stops or migrates something: {offenders}'
+
+
+# ---------------------------------------------------------------------------------------
+# BANDIT'S EXCLUDE (tj-vhboky.67)
+#
+# `--exclude tests/` passed for a year and then silently stopped excluding anything: bandit
+# rewrites an exclude that names an EXISTING directory, relative to its cwd, into `<dir>/*`, and
+# matches each discovered path by fnmatch OR by substring. The repository-root tests/ (the
+# system suite) made `tests/` exist, so it became `tests/*`, which no `./common/tests/...` path
+# matches either way, and bandit reported a thousand asserts in test files. Nothing about the
+# exclude TEXT changed, which is why a string check cannot guard it: the file set bandit scans is
+# the thing pinned here.
+#
+# bandit sits in the `security` group, which neither the PR gate's venv nor the CI unit-test job
+# installs, and a test that skips without it would be the silent green pytest.ini forbids. So
+# _bandit_scanned_files follows bandit 1.9.4's discover_files, _get_files_from_dir and
+# _is_file_included (bandit/core/manager.py) step for step, over the invocation's own targets and
+# excludes, read from the Makefile and the workflow rather than restated. It was cross-checked
+# against bandit's own BanditManager.discover_files when it was written (tj-vhboky.67 notes): the
+# same file set for '*/tests/*' and for 'tests/'. Only the flags the invocation uses are modelled;
+# any other flag fails the test rather than being ignored.
+BANDIT_TEST_SEGMENT = 'tests'
+_BANDIT_MODELLED_FLAGS = frozenset({'-r', '--recursive'})
+_BANDIT_EXCLUDE_OPTIONS = frozenset({'-x', '--exclude'})
+_BANDIT_DEFAULT_INCLUDE = '*.py'  # bandit's `include` default; no bandit config file sets another
+_MAKE_REFERENCE = re.compile(r'\$\((\w+)\)')
+_WORKFLOW_ENV_REFERENCE = re.compile(r'\$\{\{\s*env\.(\w+)\s*\}\}')
+
+
+def _run_lines(run: str) -> list[str]:
+    """The logical lines of a `run:` script: continuations folded, blanks and comment lines dropped."""
+    folded = run.replace('\\\n', ' ')
+    return [line.strip() for line in folded.splitlines() if line.strip() and not line.strip().startswith('#')]
+
+
+def _runs_bandit(words: list[str]) -> bool:
+    return any(PurePosixPath(word).name == 'bandit' for word in words)
+
+
+def _makefile_bandit_invocation() -> list[str]:
+    """The security target's bandit command as argv, with every $(VAR) expanded from the Makefile."""
+    lines = [line for line in _make_recipe('security') if _runs_bandit(shlex.split(line))]
+    assert len(lines) == 1, f'expected one bandit line in the security target, found {lines}'
+    return shlex.split(_MAKE_REFERENCE.sub(lambda match: _make_variable(match.group(1)), lines[0]))
+
+
+def _workflow_bandit_invocations() -> dict[str, list[str]]:
+    """Every bandit command in every workflow, as argv with ${{ env.X }} expanded, keyed by where it is."""
+    found = {}
+    for path in _workflow_files():
+        document = _load_yaml(path) or {}
+        for job_id, job in (document.get('jobs') or {}).items():
+            for index, step in enumerate((job or {}).get('steps') or []):
+                env = {**(document.get('env') or {}), **(job.get('env') or {}), **(step.get('env') or {})}
+                for line in _run_lines(step.get('run') or ''):
+                    expanded = _WORKFLOW_ENV_REFERENCE.sub(lambda match, env=env: str(env[match.group(1)]), line)
+                    words = shlex.split(expanded)
+                    if _runs_bandit(words):
+                        found[f'{path.name} {job_id} step {index} ({step.get("name")})'] = words
+    return found
+
+
+def _bandit_arguments(invocation: list[str]) -> tuple[list[str], list[str]]:
+    """Split a bandit argv into (targets, raw exclude entries), refusing any flag not modelled."""
+    arguments = invocation[next(i for i, word in enumerate(invocation) if PurePosixPath(word).name == 'bandit') + 1 :]
+    assert set(arguments) & _BANDIT_MODELLED_FLAGS, (
+        f'bandit is not run recursively, so it scans no directory: {arguments}'
+    )
+    targets, excludes = [], []
+    position = 0
+    while position < len(arguments):
+        word = arguments[position]
+        option, equals, value = word.partition('=')
+        if option in _BANDIT_EXCLUDE_OPTIONS:
+            if not equals:
+                position += 1
+                value = arguments[position]
+            excludes.extend(value.split(','))
+        elif word in _BANDIT_MODELLED_FLAGS:
+            pass
+        else:
+            assert not word.startswith('-'), (
+                f'bandit is invoked with {word!r}, which _bandit_scanned_files does not model. Teach it the '
+                f'flag (bandit/core/manager.py and cli/main.py) rather than dropping it from this list.'
+            )
+            targets.append(word)
+        position += 1
+    assert targets, f'bandit is given no target: {invocation}'
+    return targets, excludes
+
+
+def _bandit_scanned_files(invocation: list[str], cwd: Path) -> set[str]:
+    """The .py files bandit would scan for this argv run from `cwd`, normalised relative to it.
+
+    Mirrors bandit 1.9.4: an exclude naming an existing directory (relative to the cwd) becomes
+    `<dir>/*`; then every file os.walk finds under a target is kept when it fnmatches the include
+    glob and neither fnmatches nor contains any exclude.
+    """
+    targets, raw_excludes = _bandit_arguments(invocation)
+    excludes = [os.path.join(entry, '*') if (cwd / entry).is_dir() else entry for entry in raw_excludes]
+    previous = Path.cwd()
+    os.chdir(cwd)
+    try:
+        scanned = set()
+        for target in targets:
+            assert os.path.isdir(target), f'bandit target {target!r} is not a directory under {cwd}'
+            for root, _, names in os.walk(target):
+                for name in names:
+                    path = os.path.join(root, name)
+                    if not fnmatch.fnmatch(path, _BANDIT_DEFAULT_INCLUDE):
+                        continue
+                    if any(fnmatch.fnmatch(path, glob) for glob in excludes) or any(x in path for x in excludes):
+                        continue
+                    scanned.add(os.path.normpath(path))
+    finally:
+        os.chdir(previous)
+    return scanned
+
+
+def _is_test_path(path: str) -> bool:
+    return BANDIT_TEST_SEGMENT in PurePosixPath(path).parts[:-1]
+
+
+@pytest.mark.build_infra
+def test_the_ci_bandit_invocation_is_the_makefiles():
+    """tj-vhboky.67, tj-1mtrlh.2: CI's bandit command equals `make security`'s, variables expanded.
+
+    Compared as argv after each side expands its own variables ($(SOURCE_DIRS), ${{ env.SOURCE_PATHS }}),
+    so a quoting-only difference is not a failure and a changed root, flag or exclude on one side is.
+    """
+    expected = _makefile_bandit_invocation()
+    invocations = _workflow_bandit_invocations()
+    assert invocations, 'no workflow step runs bandit, so the CI security job scans nothing'
+    drifted = {where: words for where, words in invocations.items() if words != expected}
+    assert not drifted, (
+        f'the workflow runs bandit differently from the Makefile security target ({shlex.join(expected)}): '
+        f'{ {where: shlex.join(words) for where, words in drifted.items()} }. Change both or neither.'
+    )
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize('source', ['Makefile', 'workflow'])
+def test_bandit_scans_every_production_file_and_no_test_file(source: str):
+    """tj-vhboky.67 acceptance: the exclude matches every nested tests dir and no production path.
+
+    Judged on the file set bandit discovers from the repository root, not on the exclude text.
+    Production is every tracked .py under SOURCE_DIRS outside a `tests` directory.
+    """
+    invocations = (
+        [_makefile_bandit_invocation()] if source == 'Makefile' else list(_workflow_bandit_invocations().values())
+    )
+    assert invocations, f'no {source} bandit invocation found'
+    tracked = _tracked_source_python()
+    production = {path for path in tracked if not _is_test_path(path)}
+    tests = tracked - production
+    assert tests, 'git tracks no test file under SOURCE_DIRS, so the exclude side of this check is vacuous'
+    for invocation in invocations:
+        scanned = _bandit_scanned_files(invocation, REPO_ROOT)
+        unscanned = sorted(production - scanned)
+        assert not unscanned, (
+            f'{shlex.join(invocation)} does not scan {len(unscanned)} production file(s): {unscanned[:10]}. '
+            f'The exclude now matches source, which is the silent direction: bandit reports fewer lines and exits 0.'
+        )
+        scanned_tests = sorted(path for path in scanned if _is_test_path(path))
+        assert not scanned_tests, (
+            f'{shlex.join(invocation)} scans {len(scanned_tests)} file(s) in tests directories, e.g. '
+            f'{scanned_tests[:5]}: B101 fires on every assert and make security goes red. bandit rewrites an '
+            f'exclude naming an existing directory to `<dir>/*`; exclude `*/tests/*`, never a bare `tests/`.'
+        )
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    ('exclude', 'root_tests_dir', 'nested_test_scanned'),
+    [
+        ('tests/', False, False),
+        ('tests/', True, True),  # the tj-vhboky.67 regression
+        ('*/tests/*', False, False),
+        ('*/tests/*', True, False),
+    ],
+    ids=['bare-without-root-dir', 'bare-with-root-dir', 'glob-without-root-dir', 'glob-with-root-dir'],
+)
+def test_the_bandit_model_reproduces_the_directory_rewrite(
+    tmp_path: Path, exclude: str, root_tests_dir: bool, nested_test_scanned: bool
+):
+    """Guard the guard: the model above goes red on exactly the shape that broke, and only then."""
+    (tmp_path / 'pkg' / 'tests').mkdir(parents=True)
+    (tmp_path / 'pkg' / 'module.py').write_text('')
+    (tmp_path / 'pkg' / 'tests' / 'test_module.py').write_text('')
+    if root_tests_dir:
+        (tmp_path / 'tests').mkdir()
+    scanned = _bandit_scanned_files(['bandit', '-r', './pkg', '--exclude', exclude], tmp_path)
+    assert os.path.join('pkg', 'module.py') in scanned
+    assert (os.path.join('pkg', 'tests', 'test_module.py') in scanned) is nested_test_scanned, scanned

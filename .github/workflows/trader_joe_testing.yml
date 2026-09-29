@@ -128,9 +128,12 @@ jobs:
       run: |
         uv sync --only-group security --locked
 
+    # '*/tests/*', not 'tests/': bandit turns an exclude naming an existing directory into
+    # '<dir>/*', so the repository-root tests/ made 'tests/' stop matching every nested tests
+    # directory (tj-vhboky.67). Identical to the Makefile's security target; change both.
     - name: Run Bandit
       run: |
-        uv run bandit -r ${{ env.SOURCE_PATHS }} --exclude tests/
+        uv run bandit -r ${{ env.SOURCE_PATHS }} --exclude '*/tests/*'
 
     # A fresh checkout has no .claude/worktrees; the exclude keeps this line identical to
     # `make security`, where agent worktrees do exist (tj-aov3ip).
