@@ -2982,6 +2982,85 @@ _FUNCTION_HEAD = re.compile(r'^(\w+)\(\)\s*\{$')
 _CAPTURED_CALL = re.compile(r'^(\w+)="\$\((\w+) (\w+)\)"$')
 
 
+MIGRATION_VERSIONS_DIR = REPO_ROOT / 'data' / 'store' / 'migrations' / 'versions'
+# What common/database/postgres_tools.py printed at import before tj-ijpys9.20: stray stdout of
+# the kind awk's first field would have read as revisions, had anything in alembic's chain imported it.
+_IMPORT_TIME_STDOUT = 'Postgres async is enabled.\nPostgres sync is enabled.\n'
+
+
+def _migration_revision_ids() -> list[str]:
+    """Every `revision` a migration script declares -- the ids alembic heads/current print."""
+    ids = []
+    for path in sorted(MIGRATION_VERSIONS_DIR.glob('*.py')):
+        for node in ast.parse(path.read_text(encoding='utf-8')).body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                target = node.targets[0]
+            elif isinstance(node, ast.AnnAssign):
+                target = node.target
+            else:
+                continue
+            if isinstance(target, ast.Name) and target.id == 'revision' and isinstance(node.value, ast.Constant):
+                ids.append(node.value.value)
+    assert len(ids) >= 2, f'found {ids} in {MIGRATION_VERSIONS_DIR}; the id checks below need at least two'
+    return ids
+
+
+def _grep_invocation(command: list[str]) -> tuple[list[str], str] | None:
+    """A grep simple command as (its option words, its pattern), or None if it is not grep."""
+    words = [word for word in command if word not in _SHELL_KEYWORDS]
+    if not words or PurePosixPath(words[0]).name != 'grep':
+        return None
+    flags, position = [], 1
+    while position < len(words) and words[position].startswith('-') and words[position] != '--':
+        if words[position] in ('-e', '--regexp'):
+            return flags, words[position + 1] if position + 1 < len(words) else ''
+        flags.append(words[position])
+        position += 1
+    if position < len(words) and words[position] == '--':
+        position += 1
+    return (flags, words[position]) if position < len(words) else None
+
+
+def _grep_letters(flags: list[str]) -> str:
+    """The short-option letters among grep option words: ['-Eo'] -> 'Eo'."""
+    return ''.join(flag[1:] for flag in flags if flag.startswith('-') and not flag.startswith('--'))
+
+
+def _grep(flags: list[str], pattern: str, text: str) -> str:
+    """Run the real grep with a workflow's own options and pattern; exit 1 (no match) is an answer."""
+    assert shutil.which('grep'), 'grep is not on PATH, so the workflow regex cannot be exercised'
+    result = subprocess.run(['grep', *flags, '--', pattern], input=text, capture_output=True, text=True, check=False)
+    assert result.returncode in (0, 1), f'grep {flags} {pattern!r} failed: {result.stderr}'
+    return result.stdout
+
+
+def _assert_extracts_revision_ids(flags: list[str], pattern: str, ids: list[str]) -> None:
+    """The extractor yields exactly the id of every line an id LEADS, as a whole word, and nothing else."""
+    last = ids[-1]
+    cases = {f'`{revision} (head)`': (f'{revision} (head)\n', f'{revision}\n') for revision in ids}
+    cases |= {
+        'import-time prints ahead of the head line': (f'{_IMPORT_TIME_STDOUT}{last} (head)\n', f'{last}\n'),
+        'an id that does not lead its line': (f'Rev: {last} (head)\n', ''),
+        'a longer hex word': (f'{last}0 (head)\n', ''),
+        'no revision at all': ('\n', ''),
+    }
+    wrong = {name: got for name, (text, want) in cases.items() if (got := _grep(flags, pattern, text)) != want}
+    assert not wrong, f'grep {" ".join(flags)} {pattern!r} is not a revision-id extractor; it yields {wrong}'
+
+
+def _assert_counts_revision_ids(flags: list[str], pattern: str, ids: list[str]) -> None:
+    """The counter counts revision ids, one per line, and never a line that is not one."""
+    cases = {
+        'one id': (f'{ids[0]}\n', '1'),
+        'every id': (''.join(f'{revision}\n' for revision in ids), str(len(ids))),
+        'nothing (printf of an empty heads)': ('\n', '0'),
+        'stray stdout beside one id': (f'{_IMPORT_TIME_STDOUT}{ids[0]}\n', '1'),
+        'stray stdout alone': (_IMPORT_TIME_STDOUT, '0'),
+    }
+    wrong = {name: got for name, (text, want) in cases.items() if (got := _grep(flags, pattern, text).strip()) != want}
+    assert not wrong, f'grep {" ".join(flags)} {pattern!r} does not count revision ids; it counts {wrong}'
+
+
 def _system_job() -> dict:
     jobs = (_load_yaml(TESTING_WORKFLOW) or {}).get('jobs') or {}
     matches = [job for job in jobs.values() if (job or {}).get('name') == SYSTEM_JOB_NAME]
@@ -3085,6 +3164,11 @@ def test_system_job_migrates_only_up_to_head_and_asserts_current_is_head():
 
     alembic runs only in the Migrate step. Its one mutating command is `upgrade head`; the rest
     read (`heads`, `current`), through the step's wrapper function, and the step compares them.
+
+    tj-ijpys9.20 re-pin: "exactly one head" is a count of revision IDS, not of lines. The wrapper
+    extracts ids with a grep -o over a revision-id regex (never awk's first field, which took any
+    stray stdout line for a revision), and the head count is a grep -c of ids in ${heads}, then
+    `-ne 1`. Both regexes are run through grep itself against the real migration ids.
     """
     offenders = [
         f'{step.get("name")}: {line}'
@@ -3098,6 +3182,7 @@ def test_system_job_migrates_only_up_to_head_and_asserts_current_is_head():
 
     lines = _step_lines(_system_step(MIGRATE_STEP))
     wrappers, upgrades, others = set(), [], []
+    bodies: dict[str, list[list[str]]] = {}
     current_function = None
     for line in lines:
         if head := _FUNCTION_HEAD.match(line):
@@ -3106,6 +3191,8 @@ def test_system_job_migrates_only_up_to_head_and_asserts_current_is_head():
         if line == '}':
             current_function = None
             continue
+        if current_function:
+            bodies.setdefault(current_function, []).extend(_commands(line))
         for command in _commands(line):
             subcommand = _alembic_subcommand(command)
             if subcommand is None:
@@ -3133,8 +3220,34 @@ def test_system_job_migrates_only_up_to_head_and_asserts_current_is_head():
     comparison = re.compile(rf'\[\s*"\$\{{(?:{current}|{heads})\}}"\s*!=\s*"\$\{{(?:{current}|{heads})\}}"\s*\]')
     compared = [line for line in lines if comparison.search(line) and current in line and heads in line]
     assert compared, f'{MIGRATE_STEP} never compares ${{{current}}} with ${{{heads}}}'
-    single_head = [line for line in lines if f'${{{heads}}}' in line and 'wc -l' in line and '-ne 1' in line]
-    assert single_head, f'{MIGRATE_STEP} does not assert exactly one migration head'
+
+    revision_ids = _migration_revision_ids()
+    for wrapper in sorted(wrappers):
+        body = bodies.get(wrapper, [])
+        awk = [' '.join(command) for command in body if _command_name(command) == 'awk']
+        assert not awk, f'{wrapper}() still reads revisions with awk, so any stray stdout line is one: {awk}'
+        extractors = [grep for command in body if (grep := _grep_invocation(command)) and 'o' in _grep_letters(grep[0])]
+        assert len(extractors) == 1, (
+            f'{wrapper}() must extract revision ids with one `grep -o` over a revision-id regex, found {extractors}'
+        )
+        _assert_extracts_revision_ids(*extractors[0], revision_ids)
+
+    counters = {
+        match.group(1): grep
+        for line in lines
+        if (match := re.match(r'^(\w+)="\$\((.*)\)"$', line)) and f'${{{heads}}}' in match.group(2)
+        for command in _commands(match.group(2))
+        if (grep := _grep_invocation(command)) and 'c' in _grep_letters(grep[0])
+    }
+    assert len(counters) == 1, (
+        f'{MIGRATE_STEP} must count the ids in ${{{heads}}} with one `grep -c` over a revision-id regex, found {counters}'
+    )
+    ((count, (flags, pattern)),) = counters.items()
+    _assert_counts_revision_ids(flags, pattern, revision_ids)
+    single_head = [line for line in lines if re.search(rf'\[\s*"\$\{{{count}\}}"\s+-ne\s+1\s*\]', line)]
+    assert single_head, f'{MIGRATE_STEP} does not assert exactly one migration head (`[ "${{{count}}}" -ne 1 ]`)'
+    by_lines = [line for line in lines if heads in line and re.search(r'\bwc\b', line)]
+    assert not by_lines, f'{MIGRATE_STEP} still counts ${{{heads}}} by lines, not ids: {by_lines}'
 
 
 @pytest.mark.build_infra
@@ -4493,3 +4606,455 @@ def test_dockerignore_excludes_no_dockerfile_copy_source():
     assert not missing, f'COPY sources that do not exist in the checkout: {missing}'
     offenders = _copy_sources_excluded(_committed_dockerignore_rules())
     assert not offenders, f'{DOCKERIGNORE_FILE.name} keeps what the image COPYs out of the build context: {offenders}'
+
+
+# ---------------------------------------------------------------------------------------
+# CAPTURED OUTPUT (tj-ijpys9.20). Wherever a workflow reads text back -- a value from the staged
+# env file, the stdout of a compose run -- the text must be exactly what it is taken for: the
+# last value for a key, all of it; a container's output with no pull progress mixed in. And
+# nothing in common/ may print at import, since whatever imports it inside such a run writes
+# into the capture (the Migrate Database failure, tj-ijpys9.19).
+# ---------------------------------------------------------------------------------------
+
+# The staged env file as a whole shell word: `.env` or `./.env`, never `.env.default` or
+# `data/store/.env`.
+_STAGED_ENV_WORD = re.compile(rf'(?<![\w./-])(?:\./)?{re.escape(STAGED_ENV_FILE)}(?![\w.-])')
+# Commands that name the staged file only to create, replace or remove it.
+_STAGED_ENV_WRITERS = frozenset({'cp', 'mv', 'rm', 'shred', 'touch', 'chmod', 'install'})
+# Where one simple command ends and the next begins, for the text around a word.
+_COMMAND_BOUNDARY = re.compile(r'\|\||&&|\||;|\$\(|(?<![$\w])\{\s|\(')
+_PIPELINE_END = re.compile(r'\|\||&&|;|\)')
+_ONE_LINE_FUNCTION = re.compile(r'^(\w+)\(\)\s*\{\s.*;\s*\}$')
+_CUT_OPTIONS = re.compile(r'(?<![\w-])cut\s+([^|;)]*)')
+
+
+def _without_single_quoted(text: str) -> str:
+    """Text with every closed single-quoted string emptied. Double quotes are kept: `"$(...)"` runs."""
+    return re.sub(r"'[^']*'", "''", text)
+
+
+def _unquoted(text: str) -> str:
+    """Text with every closed quoted string emptied, so an operator inside quotes is not one."""
+    return re.sub(r'"[^"]*"', '""', _without_single_quoted(text))
+
+
+def _cut_fields(options: str) -> tuple[str | None, str | None]:
+    """(delimiter, field list) of a cut command's option text: `-d= -f2-` -> ('=', '2-').
+
+    The text may end inside a quote it did not open -- `"$(... | cut -d= -f2)"` -- so words are
+    split by whitespace and stripped of quotes when shlex cannot balance them.
+    """
+    try:
+        words = shlex.split(options)
+    except ValueError:
+        words = [word.strip('\'"') for word in options.split()]
+    delimiter = fields = None
+    for position, word in enumerate(words):
+        following = words[position + 1] if position + 1 < len(words) else None
+        for short, long in (('-d', '--delimiter'), ('-f', '--fields')):
+            value = None
+            if word in (short, long):
+                value = following
+            elif word.startswith(f'{long}='):
+                value = word[len(long) + 1 :]
+            elif word.startswith(short):
+                value = word[len(short) :]
+            if value is not None:
+                if short == '-d':
+                    delimiter = value
+                else:
+                    fields = value
+    return delimiter, fields
+
+
+def _staged_env_reads(lines: list[str]) -> list[tuple[str, str]]:
+    """Each read of the staged env file, as (its line, the pipeline its output flows through)."""
+    reads = []
+    for line in lines:
+        for match in _STAGED_ENV_WORD.finditer(line):
+            before = line[: match.start()]
+            if before.rstrip().endswith('>'):
+                continue
+            command = shlex.split(_COMMAND_BOUNDARY.split(_unquoted(before))[-1] or ':')
+            name = _command_name(command)
+            if name in _STAGED_ENV_WRITERS or (name == 'sed' and any(word.startswith('-i') for word in command)):
+                continue
+            after = _unquoted(line[match.end() :])
+            reads.append((line, _PIPELINE_END.split(after, maxsplit=1)[0]))
+    return reads
+
+
+def _takes_last_line_and_full_value(pipeline: str) -> bool:
+    """Whether a read's downstream pipeline keeps only the last line and cuts everything after `=`."""
+    stages = [stage.strip() for stage in pipeline.split('|')[1:]]
+    last_line = any(re.fullmatch(r'tail\s+(?:-n\s*1|-1|--lines[= ]1)', stage) for stage in stages)
+    full_value = any(
+        _cut_fields(match.group(1)) == ('=', '2-') for stage in stages if (match := _CUT_OPTIONS.match(stage))
+    )
+    return last_line and full_value
+
+
+def _every_workflow_step() -> Iterator[tuple[str, dict]]:
+    for workflow in _workflow_files():
+        for job_id, job in ((_load_yaml(workflow) or {}).get('jobs') or {}).items():
+            for step in (job or {}).get('steps') or []:
+                yield f'{workflow.name} {job_id} / {step.get("name")}', step
+
+
+_ENV_VALUE_CASES = {
+    'the last line for a key wins': ('KEY=first\nKEY=second\n', 'second'),
+    'the value is everything after the first =': ('KEY=a=b=c\n', 'a=b=c'),
+    'a longer key sharing the prefix is not the key': ('KEY=right\nKEY_OTHER=wrong\n', 'right'),
+}
+
+
+@pytest.mark.build_infra
+def test_every_staged_env_read_takes_the_last_line_and_the_full_value(tmp_path: Path):
+    """tj-ijpys9.20 item 3: every read of the staged env file is last-wins and full-value.
+
+    Compose takes the LAST line for a key, and a value may itself hold `=` (a base64 secret
+    does). A step reading the file must agree with compose, or it tests a different value from
+    the one the stack runs with: `tail -n 1` then `cut -d= -f2-`. Reads are found by the file's
+    name as a word in any step of any workflow, writes (redirection, cp, sed -i, shred, rm)
+    excepted. A one-line helper that does the read is also RUN, by bash, against a synthetic
+    file in a scratch directory, so the property is shown, not only spelled.
+    """
+    reads, offenders, helpers = [], [], {}
+    for where, step in _every_workflow_step():
+        for line, pipeline in _staged_env_reads(_step_lines(step)):
+            reads.append(where)
+            if not _takes_last_line_and_full_value(pipeline):
+                offenders.append(f'{where}: {line}')
+            elif match := _ONE_LINE_FUNCTION.match(line):
+                helpers.setdefault(line, (where, match.group(1)))
+    assert reads, f'no step reads the staged {STAGED_ENV_FILE}, so this check judged nothing'
+    assert not offenders, (
+        f'these read the staged {STAGED_ENV_FILE} without `tail -n 1 | cut -d= -f2-`, so a repeated key or '
+        f'a value holding `=` reads differently from compose: {offenders}'
+    )
+    assert helpers, f'no step reads the staged {STAGED_ENV_FILE} through a one-line helper to exercise'
+
+    assert shutil.which('bash'), 'bash is not on PATH, so the env helper cannot be exercised'
+    wrong = []
+    for definition, (where, function) in helpers.items():
+        for case, (content, want) in _ENV_VALUE_CASES.items():
+            (tmp_path / STAGED_ENV_FILE).write_text(content, encoding='utf-8')
+            result = subprocess.run(
+                ['bash', '-c', f'set -euo pipefail\n{definition}\n{function} KEY'],
+                cwd=tmp_path,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0 or result.stdout.rstrip('\n') != want:
+                wrong.append(f'{where} {function}(), {case}: got {result.stdout!r} (exit {result.returncode})')
+    assert not wrong, f'the staged-env helper does not read as compose does: {wrong}'
+
+
+@pytest.mark.build_infra
+def test_no_step_reads_an_env_value_with_the_second_field_alone():
+    """tj-ijpys9.20 item 3: `cut -d= -f2` truncates a value at its second `=`; nothing may use it."""
+    offenders = [
+        f'{where}: {line}'
+        for where, step in _every_workflow_step()
+        for line in _step_lines(step)
+        if _cuts_second_field(line)
+    ]
+    assert not offenders, f'these cut an env value at its second `=`; use `cut -d= -f2-`: {offenders}'
+
+
+def _cuts_second_field(line: str) -> bool:
+    """Whether a line runs `cut -d= -f2` (the second field alone), inside a substitution or not."""
+    return any(_cut_fields(match.group(1)) == ('=', '2') for match in _CUT_OPTIONS.finditer(line))
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    ('line', 'truncates'),
+    [
+        ('X="$(grep -E \'^X=\' env | cut -d= -f2)"', True),
+        ('f() { grep -E "^$1=" env | tail -n 1 | cut -d= -f2; }', True),
+        ("cut -d '=' -f 2 < env", True),
+        ('f() { grep -E "^$1=" env | tail -n 1 | cut -d= -f2-; }', False),
+        ('cut -d: -f2 /etc/passwd', False),
+    ],
+    ids=['substituted', 'in-a-helper', 'spaced', 'full-value', 'other-delimiter'],
+)
+def test_the_second_field_rule_finds_every_spelling(line: str, truncates: bool):
+    """The rule above, on synthetic lines: a `-f2` inside `"$(...)"` is found, however it is spaced."""
+    assert _cuts_second_field(line) is truncates
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    ('pipeline', 'accepted'),
+    [
+        (' | tail -n 1 | cut -d= -f2-', True),
+        (' | tail -n 1 | cut -d = -f 2-', True),
+        (' | cut -d= -f2', False),
+        (' | tail -n 1 | cut -d= -f2', False),
+        (' | cut -d= -f2-', False),
+        (' | head -n 1 | cut -d= -f2-', False),
+        ('', False),
+    ],
+    ids=['canonical', 'spaced-options', 'old-first-match', 'last-but-truncated', 'full-but-first', 'head', 'bare'],
+)
+def test_the_last_wins_rule_judges_the_pipeline(pipeline: str, accepted: bool):
+    """The rule above, on synthetic pipelines, so a weakened parser cannot pass the workflow vacuously."""
+    assert _takes_last_line_and_full_value(pipeline) is accepted
+
+
+@pytest.mark.build_infra
+def test_writes_to_the_staged_env_file_are_not_taken_for_reads():
+    """The reader finder skips what only creates, edits or removes the file, and finds a real read."""
+    lines = [
+        f'cp artifact/.env.default ./{STAGED_ENV_FILE}',
+        f'printf \'KEY=%s\\n\' "${{value}}" >> {STAGED_ENV_FILE}',
+        f"sed -i 's/^KEY=.*/KEY=/' {STAGED_ENV_FILE}",
+        f'shred -u {STAGED_ENV_FILE} || rm -f {STAGED_ENV_FILE}',
+        f'cp artifact/data/store/.env.default data/store/{STAGED_ENV_FILE}',
+        f'X="$(grep -E \'^X=\' {STAGED_ENV_FILE} | cut -d= -f2)"',
+    ]
+    reads = _staged_env_reads(lines)
+    assert [line for line, _ in reads] == [lines[-1]], f'reads found: {reads}'
+    assert not _takes_last_line_and_full_value(reads[0][1])
+
+
+# A command substitution whose command is a plain word, and one whose command is a variable.
+_SUBSTITUTED_CALL = re.compile(r'\$\(\s*(\w+)\b')
+_DYNAMIC_SUBSTITUTED_CALL = re.compile(r'\$\(\s*"?\$\{?\w+')
+# Where a command's stdout goes next: a pipe, or the end of the command.
+_COMMAND_END = re.compile(r'(?<!\|)\|(?!\|)|\|\||&&|;|\)')
+# Minimum count of captured compose runs the testing workflow holds: the bead's four (the alembic
+# wrapper, from_client, lookup, probe). A derivation that finds fewer has gone blind, not clean.
+CAPTURED_COMPOSE_RUN_FLOOR = 4
+
+
+def _brace_delta(line: str) -> int:
+    """How many brace groups a logical line opens, net of those it closes."""
+    opens = len(re.findall(r'(?:^|(?<=\s))\{(?=\s|$)', line))
+    closes = len(re.findall(r'(?:^|(?<=[\s;]))\}(?=\s|$|[;)"])', line))
+    return opens - closes
+
+
+def _function_spans(lines: list[str]) -> dict[str, range]:
+    """Each multi-line shell function, as the indices of its lines, head and closing brace included."""
+    spans = {}
+    for start, line in enumerate(lines):
+        if head := _FUNCTION_HEAD.match(line):
+            depth, end = 1, start + 1
+            while end < len(lines) and depth > 0:
+                depth += _brace_delta(lines[end])
+                end += 1
+            spans[head.group(1)] = range(start, end)
+    return spans
+
+
+def _piped(after: str) -> bool:
+    """Whether the command whose remaining text is `after` sends its stdout into a pipe."""
+    end = _COMMAND_END.search(_unquoted(after))
+    return bool(end) and end.group(0) == '|'
+
+
+def _output_is_captured(name: str, span: range, lines: list[str]) -> bool:
+    """Whether a function's stdout is read back: substituted, piped, or handed to a caller that substitutes it."""
+    outside = [line for index, line in enumerate(lines) if index not in span]
+    if any(name in _SUBSTITUTED_CALL.findall(line) for line in outside):
+        return True
+    called = re.compile(rf'(?:^|[;&|{{(]\s*)(?:if\s+|!\s+)?{name}\b')
+    if any((match := called.search(line)) and _piped(line[match.end() :]) for line in outside):
+        return True
+    dynamic = any(_DYNAMIC_SUBSTITUTED_CALL.search(line) for line in lines)
+    return dynamic and any(re.search(rf'\s{name}(?=\s|$)', line) for line in outside)
+
+
+def _compose_runs(run: str) -> list[tuple[str, list[str], bool]]:
+    """Each `docker compose run` in a script, as (its line, its words from `run`, whether its stdout is captured).
+
+    Captured means read back by the script: the run sits inside a `$(...)`, its stdout is piped,
+    or it is the body of a function whose own stdout is captured in one of those ways.
+    """
+    lines = _run_lines(run)
+    spans = _function_spans(lines)
+    runs = []
+    for index, line in enumerate(lines):
+        for match, (_, rest) in zip(_COMPOSE_INVOCATION.finditer(line), _compose_calls(line), strict=True):
+            if rest[:1] != ['run']:
+                continue
+            before = re.sub(r"'[^']*'", "''", line[: match.start()])
+            substituted = before.count('$(') > before.count(')')
+            in_captured_function = any(
+                index in span and _output_is_captured(name, span, lines) for name, span in spans.items()
+            )
+            runs.append((line, rest, substituted or _piped(line[match.end() :]) or in_captured_function))
+    return runs
+
+
+def _refuses_to_pull(rest: list[str]) -> bool:
+    _, options, _ = _compose_service(rest)
+    return any(
+        option == '--pull=never' or (option == '--pull' and following == 'never')
+        for option, following in zip(options, [*options[1:], ''], strict=True)
+    )
+
+
+@pytest.mark.build_infra
+def test_every_captured_compose_run_refuses_to_pull():
+    """tj-ijpys9.20 item 4: a compose run whose stdout the script reads back carries --pull never.
+
+    Otherwise a missing image is pulled on the spot, and the pull's progress lines land in the
+    very text the step then parses -- a revision list, a status line, a response body. With
+    `--pull never` a missing image fails the run loudly instead. The set is derived from every
+    step of every workflow, not listed by name: a run inside `$(...)`, piped, or inside a function
+    whose own output is captured. A run whose stdout only goes to the log (upgrade head) is free.
+    """
+    captured, offenders = [], []
+    for where, step in _every_workflow_step():
+        for line, rest, is_captured in _compose_runs(step.get('run') or ''):
+            if is_captured:
+                captured.append(where)
+                if not _refuses_to_pull(rest):
+                    offenders.append(f'{where}: {line}')
+    assert len(captured) >= CAPTURED_COMPOSE_RUN_FLOOR, (
+        f'found {len(captured)} captured compose runs ({captured}), fewer than the {CAPTURED_COMPOSE_RUN_FLOOR} '
+        f'tj-ijpys9.20 hardened, so the derivation has lost some'
+    )
+    assert not offenders, f'these compose runs are captured but may pull, mixing progress into the capture: {offenders}'
+
+
+_COMPOSE_RUN_CAPTURE_CASES = {
+    'substituted': ('x="$(docker compose -f a.yaml run --rm svc echo hi)"', [True]),
+    'piped': ('docker compose -f a.yaml run --rm svc cat | grep -c x', [True]),
+    'or-list, pipe only inside quotes': ('docker compose run --rm svc true || echo "a | b"', [False]),
+    'bare, output to the log': ('docker compose -f a.yaml run --rm svc alembic upgrade head', [False]),
+    'function substituted': ('f() {\ndocker compose run --rm svc cat\n}\nx="$(f arg)"', [True]),
+    'function piped': ('f() {\ndocker compose run --rm svc cat\n}\nf arg | tail -n 1', [True]),
+    'function handed to a substituting caller': (
+        'f() {\ndocker compose run --rm svc cat\n}\ng() {\nout="$("$1")"\n}\ng f',
+        [True],
+    ),
+    'function called bare': ('f() {\ndocker compose run --rm svc true\n}\nf', [False]),
+    'exec is not run': ('x="$(docker compose exec -T svc cat)"', []),
+    'continued lines': ('x="$(docker compose -f a.yaml \\\n  run --rm svc cat)"', [True]),
+}
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    ('run', 'expected'), _COMPOSE_RUN_CAPTURE_CASES.values(), ids=_COMPOSE_RUN_CAPTURE_CASES.keys()
+)
+def test_the_capture_derivation_tells_captured_runs_from_logged_ones(run: str, expected: list[bool]):
+    """The derivation above, on synthetic scripts, so it cannot pass the workflow by seeing nothing."""
+    assert [captured for _, _, captured in _compose_runs(run)] == expected
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    ('options', 'refuses'),
+    [
+        (['--rm', '--pull', 'never'], True),
+        (['--rm', '--pull=never'], True),
+        (['--rm', '--pull', 'missing'], False),
+        (['--rm', '-T'], False),
+    ],
+    ids=['spaced', 'equals', 'missing-policy', 'absent'],
+)
+def test_the_pull_rule_reads_the_run_options(options: list[str], refuses: bool):
+    """`--pull never` in either spelling is a refusal to pull; any other policy, or none, is not."""
+    assert _refuses_to_pull(['run', *options, 'svc', 'cmd']) is refuses
+
+
+def _import_time_prints(source: str) -> list[int]:
+    """The line of every print() call that runs when a module is imported.
+
+    That is everything outside a function or lambda body: module statements, the bodies of
+    module-level if/try/with/for, class bodies, decorators and default values. A block under
+    `if __name__ == '__main__':` does not run at import and is left out.
+    """
+    found: list[int] = []
+
+    class Visitor(ast.NodeVisitor):
+        def _visit_defaults(self, arguments: ast.arguments) -> None:
+            for child in [*arguments.defaults, *arguments.kw_defaults]:
+                if child is not None:
+                    self.visit(child)
+
+        def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            for decorator in node.decorator_list:
+                self.visit(decorator)
+            self._visit_defaults(node.args)
+
+        visit_FunctionDef = visit_AsyncFunctionDef = _visit_function
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            self._visit_defaults(node.args)
+
+        def visit_If(self, node: ast.If) -> None:
+            test = node.test
+            is_main_guard = (
+                isinstance(test, ast.Compare)
+                and isinstance(test.left, ast.Name)
+                and test.left.id == '__name__'
+                and len(test.comparators) == 1
+                and isinstance(test.comparators[0], ast.Constant)
+                and test.comparators[0].value == '__main__'
+            )
+            for child in node.orelse if is_main_guard else [node.test, *node.body, *node.orelse]:
+                self.visit(child)
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if isinstance(node.func, ast.Name) and node.func.id == 'print':
+                found.append(node.lineno)
+            self.generic_visit(node)
+
+    Visitor().visit(ast.parse(source))
+    return sorted(found)
+
+
+COMMON_PACKAGE = 'common'
+
+
+@pytest.mark.common
+def test_no_common_module_prints_at_import():
+    """tj-ijpys9.20 item 2: importing anything in common/ writes nothing to stdout.
+
+    SCOPE: every git-tracked production module under common/ (tests excluded), not only the
+    database modules. common/ is imported by both services, by alembic's env.py through the
+    store's models, and by the client's suite; which modules any one import chain reaches is
+    not something to pin by name, and the two prints tj-ijpys9.20 removed sat in
+    common/database/postgres_tools.py only by accident of history. Output inside a function
+    runs only when called and is the caller's business; this pins import time, where a stray
+    line lands in `alembic heads` or any other captured run. data/, schemas/ and routers/ are
+    outside the bead and not judged here.
+    """
+    modules = [path for path in _run('git', 'ls-files', '--', f'{COMMON_PACKAGE}/*.py') if not _is_test_path(path)]
+    assert modules, f'git tracks no production module under {COMMON_PACKAGE}/, so this check judged nothing'
+    offenders = [
+        f'{path}:{line}'
+        for path in modules
+        for line in _import_time_prints((REPO_ROOT / path).read_text(encoding='utf-8'))
+    ]
+    assert not offenders, f'these print() at import, into any captured stdout that imports them: {offenders}'
+
+
+_IMPORT_TIME_PRINT_CASES = {
+    'module level': ("print('x')\n", [1]),
+    'inside a module-level if': ("import os\nif os.environ.get('X'):\n    print('x')\n", [3]),
+    'inside a module-level try': ("try:\n    print('x')\nexcept Exception:\n    pass\n", [2]),
+    'a class body': ("class C:\n    print('x')\n", [2]),
+    'a decorator argument': ("def d(x):\n    return x\n@d(print('x'))\ndef f():\n    pass\n", [3]),
+    'a default value': ("def f(x=print('x')):\n    pass\n", [1]),
+    'a function body': ("def f():\n    print('x')\n", []),
+    'a method body': ("class C:\n    def m(self):\n        print('x')\n", []),
+    'a lambda': ("f = lambda: print('x')\n", []),
+    'the main guard': ("if __name__ == '__main__':\n    print('x')\n", []),
+    'the else of the main guard': ("if __name__ == '__main__':\n    pass\nelse:\n    print('x')\n", [4]),
+    'a logger call': ("import logging\nlogging.getLogger().info('x')\n", []),
+}
+
+
+@pytest.mark.common
+@pytest.mark.parametrize(('source', 'lines'), _IMPORT_TIME_PRINT_CASES.values(), ids=_IMPORT_TIME_PRINT_CASES.keys())
+def test_the_import_time_print_finder_follows_what_runs_at_import(source: str, lines: list[int]):
+    """The finder above, on synthetic modules, so it cannot pass common/ by looking nowhere."""
+    assert _import_time_prints(source) == lines
