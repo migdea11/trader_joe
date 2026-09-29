@@ -27,12 +27,15 @@ class _AssetDataType(InboundContract, Generic[DT], ABC):
         Generic (DT): The data type for the asset.
     """
 
-    timestamp: datetime
+    # AwareDatetime: a naive timestamp is REFUSED, not converted (tj-1bl90i; D2 = A on
+    # tj-vhboky.20). Bound to a timestamptz column, a naive value is read in the SESSION timezone,
+    # and since the timestamp is part of the bar's natural key a shifted instant is a different bar.
+    # Typed on this base on purpose, so every bar shape refuses it: the single-bar create (a 422 on
+    # the POST), the update, the batch items built by append_data, and the read model. The read
+    # model loses nothing, since values read back from timestamptz are aware; nor does the ingest
+    # batch, since Alpaca's bar timestamps are aware UTC (tj-vhboky.57, item 1).
+    timestamp: AwareDatetime
     data: DT
-
-    def add_data(self, data: DT, timestamp: datetime):
-        self.timestamp = timestamp
-        self.data = data
 
 
 class _AssetIdentifier(InboundContract, ABC):
@@ -155,7 +158,7 @@ class BatchAssetDataCreate(_AssetIdentifier, Generic[DT], ABC):
     feed: Feed
     dataset: dict[DataType, list[_AssetDataType[DT]]]
 
-    def append_data(self, data_type: DataType, data: DT, timestamp: datetime):
+    def append_data(self, data_type: DataType, data: DT, timestamp: AwareDatetime):
         if data_type not in self.dataset:
             self.dataset[data_type] = []
         self.dataset[data_type].append(_AssetDataType(timestamp=timestamp, data=data))

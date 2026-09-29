@@ -79,9 +79,9 @@ def _without(key: str) -> dict[str, Any]:
     return {field: value for field, value in VALID_BAR.items() if field != key}
 
 
-# Each body corrupts exactly ONE field, so the loc the 422 names can only be that field. The three differ
+# Each body corrupts exactly ONE field, so the loc the 422 names can only be that field. The first three differ
 # in kind: a missing top-level field, a wrong type nested inside `data`, and a wrong type at the top
-# level. The nested one matters most for the 'body' prefix: its loc has three parts, so a prefix that
+# level. The fourth is a well-typed value the contract refuses: a timestamp with no offset. The nested one matters most for the 'body' prefix: its loc has three parts, so a prefix that
 # replaced the first element instead of prepending to it fails here and would pass on the others.
 MALFORMED = [
     pytest.param(_without('asset_symbol'), ['body', 'asset_symbol'], 'missing', id='missing-field'),
@@ -92,6 +92,14 @@ MALFORMED = [
         id='wrong-type-nested',
     ),
     pytest.param({**VALID_BAR, 'dataset_id': 'not-a-uuid'}, ['body', 'dataset_id'], 'uuid_parsing', id='wrong-type'),
+    # tj-vhboky.70 (ad7aefe): a timestamp with no offset is REFUSED, not converted (tj-1bl90i; D2 = A on
+    # tj-vhboky.20). Before that commit this body was a 200, and the bar was stored at whatever instant
+    # the database session's timezone made of it. Being a row here, it gets the same three pins as the
+    # others: 422 at ['body', 'timestamp'], no secret echoed, nothing written. The schema-level pins,
+    # per bar shape, are schemas/tests/test_bar_timestamp_aware.py.
+    pytest.param(
+        {**VALID_BAR, 'timestamp': '2026-01-02T00:00:00'}, ['body', 'timestamp'], 'timezone_aware', id='naive-timestamp'
+    ),
 ]
 
 
