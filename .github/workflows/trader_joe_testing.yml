@@ -91,6 +91,23 @@ jobs:
       POSTGRES_SYNC: true
 
     steps:
+    # debian:bookworm-slim ships neither git nor make, and the suite needs both: the Makefile tests
+    # run make, and the tracked-file and ignore-rule tests run git from the checkout root. Before
+    # checkout on purpose: with no git on PATH, actions/checkout falls back to a REST API tarball
+    # that has no .git, and every git test then fails even with git installed. ca-certificates
+    # because --no-install-recommends leaves it out, and git fetches over https (tj-ijpys9.16).
+    #
+    # safe.directory: the runner creates the workspace as its own user and this container runs as
+    # root, so git refuses the checkout for dubious ownership. actions/checkout marks the workspace
+    # safe only in a temporary global config that it deletes when its own step ends, so later steps
+    # do not inherit it. --system, in /etc/gitconfig, where checkout's HOME override cannot hide it.
+    - name: Install Git and Make
+      run: |
+        apt-get update
+        apt-get install -y --no-install-recommends git make ca-certificates
+        rm -rf /var/lib/apt/lists/*
+        git config --system --add safe.directory "${GITHUB_WORKSPACE}"
+
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
     - name: Install UV
