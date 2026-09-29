@@ -1,37 +1,37 @@
-"""SPIKE (tj-vhboky.51): does asyncpg bind a str subclass with an overridden __repr__ as its plain value?
+"""SPIKE, now a regression pin (tj-vhboky.51, tj-w6bpjm): asyncpg binds RedactedStr as its plain value.
 
 tj-w6bpjm step 0, moved to the system suite (tj-vhboky.14 item H3). Design: tj-vhboky.41
-Addendum 1, D3, layer M1 -- a SensitiveString TypeDecorator whose process_bind_param wraps the
-value in a str subclass that overrides __repr__ ONLY, so every repr()-based rendering (exception
-text, engine echo, uvicorn's traceback) shows a marker while the driver sends and stores the
-real value. The architect verified the rendering half offline (03:23 UTC note on tj-vhboky.41);
-the whole layer rests on the other half, which needs a real Postgres: that asyncpg encodes such a
-subclass exactly as it encodes a plain str.
+Addendum 1, D3, layer M1 -- SensitiveString (common/database/sql_alchemy_sensitive_string.py), a
+TypeDecorator whose process_bind_param wraps the value in RedactedStr (common/sensitive.py), a
+str subclass that overrides __repr__ ONLY, so every repr()-based rendering (exception text,
+engine echo, uvicorn's traceback) shows the marker while the driver sends and stores the real
+value. The rendering half is pinned offline in common/tests/database/
+test_sql_alchemy_sensitive_string.py; the whole layer rests on the other half, which needs a real
+Postgres: that asyncpg encodes such a subclass exactly as it encodes a plain str.
 
-THE RESULT DECIDES WHETHER M1 IS BUILT. If the first test fails for the stand-in while its plain
-control passes, M1 falls back to M1' (tj-vhboky.41) and needs a re-plan, not a build. The host run
-copies both tests' printed SPIKE blocks onto tj-w6bpjm (tj-vhboky.14, H3). The blocks are printed
-straight to the terminal, past pytest's capture, so they appear in a passing run's output too.
-
-M1 IS NOT BUILT. RedactedStr and SensitiveString do not exist yet, so _StandInRedactedStr and
-_StandInSensitiveString below are LOCAL STAND-INS written to the design's wording: the subclass
-overrides __repr__ and nothing else; the TypeDecorator (impl String, cache_ok) wraps the value on
-bind and returns a plain str on read. When M1 lands, its validator points this module at the real
-classes and deletes the stand-ins.
+HISTORY. This module first ran (host, 2026-09-29) against local stand-ins written to the design's
+wording, before M1 existed; both halves passed, the output is on tj-w6bpjm, and the architect ruled
+M1 proceeds as designed. M1 is now built, so the stand-ins are gone and the module drives the real
+RedactedStr and SensitiveString (tj-w6bpjm validator stage). A red here now means the shipped type
+does not store, match or upsert as a plain str would -- the owner column (tj-vhboky.46) must not
+adopt it until that is understood. The host run copies both tests' printed SPIKE blocks onto the
+bead that asked for the run. The blocks are printed straight to the terminal, past pytest's
+capture, so they appear in a passing run's output too.
 
 WHAT IS COMPARED. One scenario -- insert, select back, filter by equality, ON CONFLICT on the
-wrapped column -- runs twice: through a plain String column (the control) and through the
-stand-in type. Both runs must produce identical observations, and each run must show which type
-actually reached the driver in every statement binding the value; without that, the stand-in run
+wrapped column -- runs twice: through a plain String column (the control) and through
+SensitiveString. Both runs must produce identical observations, and each run must show which type
+actually reached the driver in every statement binding the value; without that, the SensitiveString run
 could pass because something upstream had already turned the subclass back into a plain str. ON
 CONFLICT is the discriminating step: had the driver sent anything but the value, the second insert
 would find no conflict and add a second row.
 
-THE SECOND HALF IS AN OBSERVATION. A statement carrying the value is forced to fail (division by
-zero in a sibling column, a server error whose text echoes no parameter), and the rendered
-"[parameters: ...]" is printed. Per the bead, the only assertion on the stand-in run is that the
-plain value is absent; that parameters were rendered at all is a precondition, and the plain
-control must show the value, which is what keeps the stand-in's absence from being vacuous.
+THE SECOND HALF. A statement carrying the value is forced to fail (division by zero in a sibling
+column, a server error whose text echoes no parameter), and the rendered "[parameters: ...]" is
+printed. On the SensitiveString run the plain value must be absent and the marker present -- the
+stand-in run only observed the marker; the real type is held to it. That parameters were rendered
+at all is a precondition, and the plain control must show the value, which is what keeps
+SensitiveString's absence from being vacuous.
 
 TEMP TABLES ONLY. Each test opens one connection and one transaction, creates a TEMPORARY table in
 it, and rolls the transaction back at the end, which drops the table. Nothing is written to the
@@ -45,41 +45,21 @@ from typing import Any
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.engine import Dialect
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
-from sqlalchemy.types import TypeDecorator
+
+from common.database.sql_alchemy_sensitive_string import SensitiveString
+from common.sensitive import REDACTED, RedactedStr
 
 
 pytestmark = pytest.mark.data_store
 
-STAND_IN_MARKER = '<redacted-by-spike-stand-in>'
 TEMP_TABLE = 'zzsys_asyncpg_bind_spike'
-
-
-class _StandInRedactedStr(str):
-    """LOCAL STAND-IN for tj-w6bpjm M1's RedactedStr, which is not built: overrides __repr__ only."""
-
-    def __repr__(self) -> str:
-        return STAND_IN_MARKER
-
-
-class _StandInSensitiveString(TypeDecorator):
-    """LOCAL STAND-IN for tj-w6bpjm M1's SensitiveString: wraps on bind, plain str on read."""
-
-    impl = sa.String
-    cache_ok = True
-
-    def process_bind_param(self, value: Any, dialect: Dialect) -> Any:
-        return None if value is None else _StandInRedactedStr(value)
-
-    def process_result_value(self, value: Any, dialect: Dialect) -> Any:
-        return None if value is None else str(value)
 
 
 # The two ways the value is bound: the control first, so a broken scenario shows up there.
 BINDINGS = [
     pytest.param(sa.String(), str, id='plain-str-control'),
-    pytest.param(_StandInSensitiveString(), _StandInRedactedStr, id='repr-override-stand-in'),
+    pytest.param(SensitiveString(), RedactedStr, id='sensitive-string'),
 ]
 
 
@@ -87,7 +67,7 @@ BINDINGS = [
 def spike_value(run_identity) -> str:
     """The value bound: synthetic, this run's, and unmistakable for the marker."""
     value = f'{run_identity.owner}-spike-owner'
-    assert STAND_IN_MARKER not in value and value not in STAND_IN_MARKER
+    assert REDACTED not in value and value not in REDACTED
     return value
 
 
@@ -149,9 +129,7 @@ async def _scenario(conn: AsyncConnection, table: sa.Table, value: str) -> Obser
     await conn.execute(upsert)
     after_upsert = (await conn.execute(sa.text(f'SELECT owner, note FROM {TEMP_TABLE} ORDER BY id'))).all()
     rows_holding_marker = (
-        await conn.execute(
-            sa.text(f'SELECT count(*) FROM {TEMP_TABLE} WHERE owner = :marker'), {'marker': STAND_IN_MARKER}
-        )
+        await conn.execute(sa.text(f'SELECT count(*) FROM {TEMP_TABLE} WHERE owner = :marker'), {'marker': REDACTED})
     ).scalar_one()
     typed_read = (await conn.execute(sa.select(table.c.owner))).scalar_one()
     return Observed(
@@ -231,10 +209,10 @@ async def test_a_failed_statement_renders_what_the_binding_shows(
     driver_parameters: DriverParameters,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """OBSERVATION: a DBAPIError on a statement carrying the value, and what its rendered parameters show.
+    """A DBAPIError on a statement carrying the value, and what its rendered parameters show.
 
     The control must render the plain value -- that is what proves parameters are rendered at
-    all. The stand-in must not; whether it shows the marker instead is printed for H3.
+    all. SensitiveString must render the marker in its place.
     """
     table = _temp_table(column_type)
     # Division by zero in a sibling column: the server's message echoes no parameter, so anything
@@ -260,13 +238,14 @@ async def test_a_failed_statement_renders_what_the_binding_shows(
             f'error class: {type(raised.value).__module__}.{type(raised.value).__name__}',
             f'driver received: {[(kw, t.__name__) for kw, t in driver_parameters.seen]}',
             f'rendered parameters: {parameters_line}',
-            f'plain value present: {spike_value in rendered}; marker present: {STAND_IN_MARKER in rendered}',
+            f'plain value present: {spike_value in rendered}; marker present: {REDACTED in rendered}',
         ],
     )
 
     assert driver_parameters.seen == [('INSERT', expected_driver_type)]
     assert '[parameters:' in rendered, 'the error must render its parameters, or nothing below is evidence'
     if expected_driver_type is str:
-        assert spike_value in rendered, 'the control must render the plain value, or the stand-in check is vacuous'
+        assert spike_value in rendered, 'the control must render the plain value, or the redaction check is vacuous'
     else:
         assert spike_value not in rendered, 'the plain value must not appear where the error is rendered'
+        assert REDACTED in rendered, 'the marker must stand where the value was'
