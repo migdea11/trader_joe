@@ -41,6 +41,14 @@ old four-column constraint would collide with it. This is a one-way door in subs
 the SQL runs in both directions: which tape a bar came from and which principal a dataset belongs
 to were never durable anywhere else once this revision has run.
 
+ONE MORE DOWNGRADE HAZARD, NOT COVERED ABOVE (tj-uxl817): if 8f41c2d7a3b9's archive table
+(stock_market_activity_superseded_8f41c2d7a3b9) still holds rows, downgrading this revision and
+then downgrading past 8f41c2d7a3b9 too can fail loudly instead of restoring correctly -- see the
+paragraph in upgrade() step 4 below for the mechanism. Only reachable on a database that went
+through 8f41c2d7a3b9 with duplicates present, i.e. the archive is non-empty; an operator not in
+that situation can stop reading. Remediate by emptying or dropping that archive table before
+downgrading past this revision. tj-lf7tuf is the permanent fix.
+
 DEPLOYMENT ORDER: the migration and the code that depends on it land in the SAME release. The bar
 upsert's ON CONFLICT clause targets uq_stock_market_activity_natural_key by name
 (StockMarketActivity.NATURAL_KEY_CONSTRAINT) -- unchanged by this revision, but the column list
@@ -261,6 +269,14 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     bind = op.get_bind()
+
+    # ARCHIVE HAZARD, READ BEFORE DOWNGRADING PAST THIS REVISION (tj-uxl817): if 8f41c2d7a3b9's
+    # archive table (stock_market_activity_superseded_8f41c2d7a3b9) still holds rows, downgrading
+    # this revision and then that one restores them against a mismatched column order -- see the
+    # paragraph in upgrade() step 4 above for the mechanism. Only reachable if that archive is
+    # non-empty, i.e. a database that went through 8f41c2d7a3b9 with duplicates present.
+    # Remediate by emptying or dropping the archive table before downgrading past this revision.
+    # tj-lf7tuf is the permanent fix.
 
     # Inverse of step 3.
     op.drop_index(BAR_SYMBOL_GRANULARITY_TIMESTAMP_INDEX, table_name=BAR_TABLE)

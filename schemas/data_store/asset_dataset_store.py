@@ -193,10 +193,8 @@ class AssetDatasetStoreDelete(InboundContract):
     # migration's 'unassigned' server_default. If that column ever became nullable, a None here
     # would start matching legacy rows and this field would turn into an authorisation bypass.
     #
-    # NOT YET A 403, and do not read this field as delivering one: nothing maps OwnerMismatch to
-    # 403 or EntryNotFound to 404 yet, so today an owner-less delete is still a 500 -- just a
-    # different one. Those mappings are builder-store's remaining tj-vhboky.8 work in
-    # routers/data_store/asset_dataset_store.py. This field is what unblocks them, not a substitute.
+    # The status codes are not set here: delete_data in routers/data_store/asset_dataset_store.py
+    # maps OwnerMismatch to 403 and EntryNotFound to 404, so an owner-less delete is a 403.
     owner: str | None = None
 
 
