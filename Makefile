@@ -16,37 +16,50 @@ help:  ## Show this help message
 # it is silently ignored, and the install cooldown stops protecting anything.
 UV_VERSION := 0.12.19
 
+# THE LOCK IS FROZEN BY DEFAULT (tj-3zh7ss). Exported, so every uv below -- and every uv those
+# recipes start -- installs from uv.lock exactly as committed and never re-resolves it. Without
+# this, any `uv run` or `uv sync` re-locked whenever pyproject.toml had moved: a plain
+# `make test` once silently moved ten packages, sqlalchemy to a pre-release among them.
+# The ONE deliberate way to change the lock is `make lock`. An explicit `--locked` still wins
+# over this variable (uv warns and asserts instead), so the stale-lock checks in `security`
+# and CI keep asserting. CI sets the same variable in its workflow env.
+export UV_FROZEN := 1
+
 # Scopes lint/format/test to one component, e.g. `make test PATHS=common`.
 PATHS ?= .
 
-VENV_MARKER := .venv_init
 # Bootstraps uv only when the host has none. An existing uv is used as-is: `uv self update`
 # fails outright for a system- or package-managed install, and would downgrade one that is
-# already newer than the pin.
-#
+# already newer than the pin. One definition, used by every recipe that runs uv in a way that
+# can write uv.lock, so the guard cannot differ between them.
+define UV_PIN_CHECK
+@if ! command -v uv > /dev/null; then \
+	echo "Installing uv $(UV_VERSION)"; \
+	curl -LsSf https://astral.sh/uv/install.sh | sh -s -- --version $(UV_VERSION); \
+else \
+	found=$$(uv --version | awk '{print $$2}'); \
+	oldest=$$(printf '%s\n%s\n' "$$found" "$(UV_VERSION)" | sort -V | head -n1); \
+	if [ "$$oldest" = "$(UV_VERSION)" ]; then \
+		echo "Using uv $$found already on PATH"; \
+	else \
+		echo "Error: uv $$found is older than the pinned $(UV_VERSION)."; \
+		echo "  An older uv does not merely fail to apply settings it does not know about --"; \
+		echo "  it RE-RESOLVES AND OVERWRITES uv.lock, reverting pinned versions and the"; \
+		echo "  install cooldown, while every command still exits 0. This was a warning until"; \
+		echo "  an agent's test run silently reverted a correct lock (tj-jon3d1)."; \
+		echo "  Install the pin:  curl -LsSf https://astral.sh/uv/$(UV_VERSION)/install.sh | sh"; \
+		echo "  Or, if uv is already installed:  uv self update $(UV_VERSION)"; \
+		echo "  (Agents cannot run the piped installer -- the isolation guard refuses '| sh'.)"; \
+		exit 1; \
+	fi; \
+fi
+endef
+
+VENV_MARKER := .venv_init
 # The marker depends on the dependency declarations so the sync re-runs when they change,
 # instead of going stale behind a marker file that already exists.
 $(VENV_MARKER): pyproject.toml uv.lock  ## Internal option to install uv and sync the virtual environment
-	@if ! command -v uv > /dev/null; then \
-		echo "Installing uv $(UV_VERSION)"; \
-		curl -LsSf https://astral.sh/uv/install.sh | sh -s -- --version $(UV_VERSION); \
-	else \
-		found=$$(uv --version | awk '{print $$2}'); \
-		oldest=$$(printf '%s\n%s\n' "$$found" "$(UV_VERSION)" | sort -V | head -n1); \
-		if [ "$$oldest" = "$(UV_VERSION)" ]; then \
-			echo "Using uv $$found already on PATH"; \
-		else \
-			echo "Error: uv $$found is older than the pinned $(UV_VERSION)."; \
-			echo "  An older uv does not merely fail to apply settings it does not know about --"; \
-			echo "  it RE-RESOLVES AND OVERWRITES uv.lock, reverting pinned versions and the"; \
-			echo "  install cooldown, while every command still exits 0. This was a warning until"; \
-			echo "  an agent's test run silently reverted a correct lock (tj-jon3d1)."; \
-			echo "  Install the pin:  curl -LsSf https://astral.sh/uv/$(UV_VERSION)/install.sh | sh"; \
-			echo "  Or, if uv is already installed:  uv self update $(UV_VERSION)"; \
-			echo "  (Agents cannot run the piped installer -- the isolation guard refuses '| sh'.)"; \
-			exit 1; \
-		fi; \
-	fi
+	$(UV_PIN_CHECK)
 	@if [ ! -d .venv ]; then \
 		echo "Creating uv venv"; \
 		uv venv; \
@@ -54,11 +67,21 @@ $(VENV_MARKER): pyproject.toml uv.lock  ## Internal option to install uv and syn
 # Sync here, not only in `init`, so every target below gets a usable environment on a bare
 # checkout: the test suite imports asyncpg and sqlalchemy, which live in the data-store group
 # and so are not covered by `default-groups`. The group set matches CI, less `security` —
-# that tooling is heavy and only `make security` needs it. Unlike CI this omits `--locked`:
-# CI must fail when the lock is stale, but locally that would block anyone mid-edit of
-# pyproject.toml.
+# that tooling is heavy and only `make security` needs it. UV_FROZEN makes this install the
+# committed lock as-is: a pyproject.toml edit mid-work does not block the sync, and it does not
+# re-lock either -- a new dependency reaches the venv only after `make lock`.
 	uv sync --all-groups --no-group security
 	touch $(VENV_MARKER)
+
+# The one deliberate re-lock. Everything else runs frozen, so this is the only target that can
+# change uv.lock: after a dependency edit in pyproject.toml, run it and commit the lock with the
+# edit. Same uv pin guard as the venv recipe, because a re-lock is exactly the operation an old
+# uv gets silently wrong. UV_FROZEN is removed for this one command only -- `uv lock` reads it
+# as --check-exists and would otherwise check instead of lock.
+.PHONY: lock
+lock:  ## Re-resolve uv.lock from pyproject.toml (the only target that changes the lock)
+	$(UV_PIN_CHECK)
+	env -u UV_FROZEN uv lock
 
 .PHONY: init
 init: $(VENV_MARKER)  ## Initialize the project, including the security tooling
@@ -261,7 +284,6 @@ security: $(VENV_MARKER)  ## Check security vulnerabilities
 	uv run bandit -r $(SOURCE_DIRS) --exclude tests/
 	uv run semgrep --config=auto --exclude=tests/ --exclude=.venv --exclude=docker-compose.override.yaml --exclude=.claude/worktrees .
 	uv export --all-groups --no-group dev --no-group testing --no-group security --locked --format requirements-txt > requirements.txt
-	# uv run safety scan --file requirements.txt
 	uv run pip-audit -r requirements.txt --disable-pip
 	rm requirements.txt
 

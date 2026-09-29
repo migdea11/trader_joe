@@ -70,6 +70,12 @@ env:
   # Floor, not a preference: below 0.9.17 uv silently ignores the `exclude-newer`
   # install cooldown in pyproject.toml. Matches Makefile UV_VERSION and the Dockerfile.
   UV_VERSION: "0.12.19"
+  # No uv command in this workflow may re-lock (tj-3zh7ss). Every `uv run` below installs the
+  # committed uv.lock as-is instead of re-resolving it, so CI is covered by this setting and not
+  # by the order of its steps. The explicit `--locked` on sync and export still wins over it:
+  # uv warns, then asserts the lock is current, so a stale lock still fails the job. Matches the
+  # Makefile's exported UV_FROZEN.
+  UV_FROZEN: "1"
   SOURCE_PATHS: "./common ./routers ./schemas ./data"
 
 jobs:
