@@ -319,9 +319,10 @@ jobs:
         with:
           version: "${{ env.UV_VERSION }}"
 
-      # The same group set, locked, as Linting and Unit Testing and the Makefile's venv
-      # recipe: the suite needs httpx (base), asyncpg and sqlalchemy (data-store) and pytest
-      # (testing), and make test-system's own sync then finds nothing left to install.
+      # No step in this job uses the host venv these two steps build. make test-system has no
+      # venv prerequisite and runs no uv sync: the suite runs inside test_client, whose image
+      # installs its own groups, and every other step works through docker compose. The steps
+      # are left in place for now; dropping them is a separate change.
       - name: Install dependencies
         run: |
           uv sync --all-groups --no-group security --locked
