@@ -142,7 +142,8 @@ class KafkaConsumerFactory:
 
         def start(self):
             """Start the consumer in a dedicated thread."""
-            loop = asyncio.get_event_loop()
+            # Must run inside a running loop (the services' async lifespan); a sync caller raises RuntimeError.
+            loop = asyncio.get_running_loop()
             loop.run_in_executor(self.executor, self.__consume_messages)
 
         def stop(self):

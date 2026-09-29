@@ -77,7 +77,7 @@ class KafkaRpcClient(Generic[Req, Res], KafkaRpcBase[Req, Res]):
             Res: The response payload.
         """
         request = RpcRequest.create_request(request_payload)
-        future = asyncio.get_event_loop().create_future()
+        future = asyncio.get_running_loop().create_future()
         self._pending_requests[request.correlation_id] = future
         topic: StaticTopic = self.endpoint.topic.request
         KafkaProducerFactory.send_message_async(self._executor, self.producer, topic.value, request.model_dump_json())
