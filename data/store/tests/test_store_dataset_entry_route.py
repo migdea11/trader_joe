@@ -744,3 +744,83 @@ def test_the_store_openapi_documents_the_enum_defaults_as_names(route_name: str,
     assert defaults == ('BULK', 'STATIC'), (
         f'{method.upper()} {route_name} documents defaults {defaults!r}, not the enum names the wire carries'
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# M5 (tj-vhboky.40): the OpenAPI documents the enum TYPE as a string enum of names
+# ---------------------------------------------------------------------------------------------
+#
+# User ruling A on tj-vhboky.38. The schema-level half is in schemas/tests/test_schemas_smoke_data_store.py.
+# The unreferenced integer ExpiryType/UpdateType components that app.openapi() once listed (the
+# builder's finding on tj-vhboky.40) are pruned since tj-1b3aer; their absence is pinned in
+# data/store/tests/test_openapi_pruning.py, not here. These tests still read only what each route
+# REFERENCES, so they neither rely on nor forbid those components.
+_ENUM_FIELDS = [('expiry_type', ExpiryType), ('update_type', UpdateType)]
+
+
+def _search_query_parameter(spec: dict, name: str) -> dict:
+    """The schema of one query parameter of GET /store, reached from the route.
+
+    Args:
+        spec: ``app.openapi()``.
+        name: The query parameter's name.
+
+    Returns:
+        dict: That parameter's ``schema``; exactly one parameter of that name must be in the query.
+    """
+    url = app.url_path_for(SEARCH_ROUTE_NAME, **PATH_PARAMS)
+    fill = defaultdict(str, PATH_PARAMS)
+    (path,) = [template for template in spec['paths'] if template.format_map(fill) == url]
+    (parameter,) = [
+        parameter
+        for parameter in spec['paths'][path]['get'].get('parameters', [])
+        if parameter['name'] == name and parameter['in'] == 'query'
+    ]
+    return parameter['schema']
+
+
+@pytest.mark.parametrize(('field', 'enum'), _ENUM_FIELDS, ids=[field for field, _ in _ENUM_FIELDS])
+@pytest.mark.parametrize(
+    ('route_name', 'method', 'response'),
+    [(ROUTE_NAME, 'post', False), (SEARCH_ROUTE_NAME, 'get', True)],
+    ids=['POST-store-body', 'GET-store-response'],
+)
+def test_the_store_openapi_documents_the_enum_body_fields_as_names(
+    route_name: str, method: str, response: bool, field: str, enum: type
+):
+    """The POST body and the GET response items document the field as {type: string, enum: names}.
+
+    Args:
+        route_name: The store route whose schema is read.
+        method: Its HTTP method.
+        response: Read the 200 response's item schema rather than the request body.
+        field: The enum field.
+        enum: The enum class the field holds.
+    """
+    documented = _openapi_schema_of(app.openapi(), route_name, method, response=response)['properties'][field]
+
+    assert '$ref' not in documented, f'{method.upper()} {route_name} {field} points at a component: {documented!r}'
+    assert documented.get('type') == 'string', f'{method.upper()} {route_name} {field} documents {documented!r}'
+    assert documented.get('enum') == [member.name for member in enum], (
+        f'{method.upper()} {route_name} {field} documents enum {documented.get("enum")!r}, not the member names'
+    )
+
+
+@pytest.mark.parametrize(('field', 'enum'), _ENUM_FIELDS, ids=[field for field, _ in _ENUM_FIELDS])
+def test_the_store_openapi_documents_the_search_filters_as_nullable_names(field: str, enum: type):
+    """GET /store's enum query parameters are anyOf [{type: string, enum: names}, {type: null}].
+
+    The filters are optional, so the null branch is expected; the one other branch must be the
+    string enum of names, not an integer enum or a component reference.
+
+    Args:
+        field: The enum query parameter.
+        enum: The enum class the parameter holds.
+    """
+    schema = _search_query_parameter(app.openapi(), field)
+
+    assert {'type': 'null'} in schema.get('anyOf', []), f'GET /store ?{field} is not nullable: {schema!r}'
+    branches = [branch for branch in schema['anyOf'] if branch != {'type': 'null'}]
+    assert branches == [{'type': 'string', 'enum': [member.name for member in enum]}], (
+        f'GET /store ?{field} documents {branches!r}, not a string enum of member names'
+    )

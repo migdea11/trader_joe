@@ -1,17 +1,49 @@
 from datetime import UTC, datetime, timedelta
-from typing import Self
+from typing import Annotated, Self
 from uuid import UUID
 
-from pydantic import AwareDatetime, ConfigDict, Field, field_serializer, field_validator, model_validator
+from pydantic import (
+    AwareDatetime,
+    ConfigDict,
+    Field,
+    WithJsonSchema,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateType
+from common.enums.pydantic_enums import NamedIntEnum
 from common.logging import get_logger
 from routers.data_store.app_endpoints import ASSET_DATASET_ID_DESC, ASSET_TYPE_DESC, DATA_TYPE_DESC, SYMBOL_DESC
 from schemas.inbound_contract import InboundContract
 
 
 log = get_logger(__name__)
+
+
+def _member_names_schema(enum: type[NamedIntEnum]) -> WithJsonSchema:
+    """Document an enum field as the string enum of member names that the wire carries.
+
+    Args:
+        enum: The enum whose member names are the documented values.
+
+    Returns:
+        WithJsonSchema: The replacement schema, used in validation and serialization mode alike.
+    """
+    return WithJsonSchema({'type': 'string', 'enum': [member.name for member in enum]})
+
+
+# The documented type of expiry_type/update_type on the dataset-store models (user ruling A on
+# tj-vhboky.38). Left alone, pydantic documents an IntEnum as {type: integer, enum: [1..5]}, which
+# contradicts both the wire (serialize_enum_name below sends names) and the documented default
+# ('BULK' is not in [1..5]). Schema only: validation and serialization are untouched, so the wire
+# bytes do not change and NamedIntEnum.validate still accepts an integer, undocumented.
+# FIELD-LOCAL, NOT A HOOK ON NamedIntEnum: GetDatasetRequest (schemas/data_ingest) carries these
+# same enums as integers on the Kafka wire, so a class-level schema would make that model lie.
+ExpiryTypeByName = Annotated[ExpiryType, _member_names_schema(ExpiryType)]
+UpdateTypeByName = Annotated[UpdateType, _member_names_schema(UpdateType)]
 
 
 class StoreAssetDatasetBody(InboundContract):
@@ -91,8 +123,10 @@ class StoreAssetDatasetBody(InboundContract):
     # json_schema_extra keeps the documented default the NAME the wire carries. The JSON schema's
     # default is encoded from the config, never from a field serializer, so without it the OpenAPI
     # default would silently turn from 'BULK' into 1 when json_encoders was replaced below.
-    expiry_type: ExpiryType = Field(default=ExpiryType.BULK, json_schema_extra={'default': ExpiryType.BULK.name})
-    update_type: UpdateType = Field(default=UpdateType.STATIC, json_schema_extra={'default': UpdateType.STATIC.name})
+    expiry_type: ExpiryTypeByName = Field(default=ExpiryType.BULK, json_schema_extra={'default': ExpiryType.BULK.name})
+    update_type: UpdateTypeByName = Field(
+        default=UpdateType.STATIC, json_schema_extra={'default': UpdateType.STATIC.name}
+    )
 
     @model_validator(mode='after')
     def validate_fields(self) -> Self:
@@ -154,8 +188,8 @@ class StoreAssetDatasetQuery(InboundContract):
     # naming the field; a caller typing ?start=2026-01-01 must add an offset or Z.
     start: AwareDatetime | None = None
     end: AwareDatetime | None = None
-    expiry_type: ExpiryType | None = None
-    update_type: UpdateType | None = None
+    expiry_type: ExpiryTypeByName | None = None
+    update_type: UpdateTypeByName | None = None
     created_at: AwareDatetime | None = None
     updated_at: AwareDatetime | None = None
 

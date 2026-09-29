@@ -2033,3 +2033,63 @@ def test_a_python_mode_dump_of_an_unfiltered_search_keeps_none():
 
     assert dumped['expiry_type'] is None
     assert dumped['update_type'] is None
+
+
+# ---------------------------------------------------------------------------------------------
+# M5 (tj-vhboky.40): the documented TYPE of the two enum fields is a string enum of names
+# ---------------------------------------------------------------------------------------------
+#
+# User ruling A on tj-vhboky.38 (2026-09-28): the schema must document what the wire carries. Left
+# alone, pydantic documents an IntEnum as {type: integer, enum: [1..5]}, next to a 'BULK' default
+# that is not in that enum. 999fc4c annotates the fields with WithJsonSchema (ExpiryTypeByName /
+# UpdateTypeByName). The M0 wire pins and the M1 default pins above cannot see this: removing the
+# annotation changes no byte on the wire and no default. The OpenAPI half is in
+# data/store/tests/test_store_dataset_entry_route.py.
+_NAMES_SCHEMA_FIELDS = [('expiry_type', ExpiryType), ('update_type', UpdateType)]
+
+
+def _documented_member_schema(field_schema: dict) -> dict:
+    """The schema a field documents for its member, with a nullable query filter's null branch removed.
+
+    Args:
+        field_schema: One entry of a model's JSON-schema ``properties``.
+
+    Returns:
+        dict: The single non-null schema. A nullable field must have exactly one non-null branch.
+    """
+    if 'anyOf' not in field_schema:
+        return field_schema
+    branches = [branch for branch in field_schema['anyOf'] if branch != {'type': 'null'}]
+    assert len(branches) == 1, field_schema
+    assert {'type': 'null'} in field_schema['anyOf'], field_schema
+    return branches[0]
+
+
+@pytest.mark.parametrize(('field', 'enum'), _NAMES_SCHEMA_FIELDS, ids=[field for field, _ in _NAMES_SCHEMA_FIELDS])
+@pytest.mark.parametrize('mode', ['validation', 'serialization'])
+@pytest.mark.parametrize('model', [*_BODY_DEFAULT_MODELS, StoreAssetDatasetQuery], ids=lambda model: model.__name__)
+def test_a_dataset_store_model_documents_the_enum_as_a_string_enum_of_names(
+    model: type[BaseModel], mode: str, field: str, enum: type
+):
+    """expiry_type and update_type are documented as {type: string, enum: <member names>}.
+
+    Every dataset-store model that carries the fields, in both schema modes (FastAPI draws request
+    bodies from the validation schema and responses from the serialization schema). The query's
+    filters are nullable, so there the member schema is the one non-null branch of an anyOf. The enum
+    is asserted equal to the member names in declaration order, so an integer enum, a partial list
+    or a list of values cannot pass.
+
+    Args:
+        model: A dataset-store model carrying both enum fields.
+        mode: The JSON-schema mode.
+        field: The enum field.
+        enum: The enum class the field holds.
+    """
+    schema = model.model_json_schema(mode=mode)
+    documented = _documented_member_schema(schema['properties'][field])
+
+    assert '$ref' not in documented, f'{model.__name__}.{field} ({mode}) points at a component: {documented!r}'
+    assert documented.get('type') == 'string', f'{model.__name__}.{field} ({mode}) documents {documented!r}'
+    assert documented.get('enum') == [member.name for member in enum], (
+        f'{model.__name__}.{field} ({mode}) documents enum {documented.get("enum")!r}, not the member names'
+    )
