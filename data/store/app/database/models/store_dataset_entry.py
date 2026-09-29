@@ -2,10 +2,12 @@ from sqlalchemy import UUID, Column, DateTime, Enum, String, UniqueConstraint, f
 
 from common.database.sql_alchemy_nullable_datetime import NullableDateTime as SqlNullableDateTime
 from common.database.sql_alchemy_ordered_enum import OrderedEnum as SqlIntEnum
+from common.database.sql_alchemy_sensitive_string import SensitiveString
 from common.database.sql_alchemy_table import AppBase, CustomTypeTable
 from common.database.sql_alchemy_types import CustomColumn
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateType
+from common.sensitive import REDACTED
 
 
 class StoreDatasetEntry(AppBase.DATA_STORE_BASE, CustomTypeTable):
@@ -57,7 +59,10 @@ class StoreDatasetEntry(AppBase.DATA_STORE_BASE, CustomTypeTable):
     # firing for any request that omitted it. The server default exists only so this column can
     # be added NOT NULL in one step; the API-side schema (StoreAssetDatasetBody.owner) has no
     # default of its own; a caller must always name itself.
-    owner = Column(String, nullable=False, server_default='unassigned')
+    # SensitiveString (tj-vhboky.41 Addendum 1, D3, M1): every statement binding owner renders
+    # it as the redaction marker in exception text and engine echo; the stored value and the DDL
+    # (VARCHAR) are String's, so no migration.
+    owner = Column(SensitiveString, nullable=False, server_default='unassigned')
 
     # Data request details
     source = Column(Enum(DataSource), nullable=False)
@@ -98,8 +103,9 @@ class StoreDatasetEntry(AppBase.DATA_STORE_BASE, CustomTypeTable):
     __table_args__ = (UniqueConstraint(*NATURAL_KEY, name=NATURAL_KEY_CONSTRAINT),)
 
     def __repr__(self):
+        # owner is sensitive (tj-vhboky.41 Addendum 1, D3, M3): the marker, never the value.
         return (
-            f"<StoreDatasetEntry(id='{self.id}', owner='{self.owner}', symbol='{self.asset_symbol}', "
+            f"<StoreDatasetEntry(id='{self.id}', owner='{REDACTED}', symbol='{self.asset_symbol}', "
             f"source='{self.source}', data_types='{self.data_type}', granularity='{self.granularity}', "
             f"start='{self.start}', end='{self.end}', expiry='{self.expiry}', expiry_type='{self.expiry_type}', "
             f"update_type='{self.update_type}', created_at='{self.created_at}', updated_at='{self.updated_at}')>"

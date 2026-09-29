@@ -255,10 +255,11 @@ class AssetDatasetStoreDelete(InboundContract):
     #
     # WHAT MAKES OPTIONAL SAFE IS A COLUMN CONSTRAINT, SO IT IS NAMED HERE RATHER THAN TRUSTED.
     # None must never AUTHORISE, and it cannot: _check_owner compares `existing.owner != declared`,
-    # and StoreDatasetEntry.owner is Column(String, nullable=False), so existing.owner is never
-    # None and the comparison is always true -- verified against both a normal owner and the
-    # migration's 'unassigned' server_default. If that column ever became nullable, a None here
-    # would start matching legacy rows and this field would turn into an authorisation bypass.
+    # and StoreDatasetEntry.owner is Column(SensitiveString, nullable=False,
+    # server_default='unassigned'), so existing.owner is never None and the comparison is always
+    # true -- verified against both a normal owner and the migration's 'unassigned' server_default.
+    # If that column ever became nullable, a None here would start matching legacy rows and this
+    # field would turn into an authorisation bypass.
     #
     # The status codes are not set here: delete_data in routers/data_store/asset_dataset_store.py
     # maps OwnerMismatch to 403 and EntryNotFound to 404, so an owner-less delete is a 403.

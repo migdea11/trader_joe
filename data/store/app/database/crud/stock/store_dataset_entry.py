@@ -6,7 +6,9 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.database.sql_alchemy_nullable_datetime import NullableDateTime
+from common.database.sql_alchemy_sensitive_string import SensitiveString
 from common.logging import get_logger
+from common.sensitive import REDACTED
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.database.transaction import write_transaction
@@ -316,8 +318,14 @@ async def search_entries(
     # StoreDatasetEntry column, so this loop already picks it up with no change -- verified,
     # not assumed). feed is NOT: there is no feed column on the entry to filter (tj-rh4b7f), and
     # StoreAssetDatasetQuery deliberately does not expose one.
+    #
+    # The log line renders the value directly, which neither the bind type (M1) nor the schema
+    # alias (M2) reaches, so a SensitiveString column logs the marker (tj-vhboky.41 Addendum 1,
+    # D3). The type is read off the table so the column declaration stays the one list.
     for column, value in request_query.model_dump().items():
-        log.debug(f'Filtering by {column}: {value}')
+        table_column = StoreDatasetEntry.__table__.c.get(column)
+        is_sensitive = table_column is not None and isinstance(table_column.type, SensitiveString)
+        log.debug(f'Filtering by {column}: {REDACTED if is_sensitive else value}')
         if value is not None:
             stmt = stmt.where(getattr(StoreDatasetEntry, column) == value)
 
