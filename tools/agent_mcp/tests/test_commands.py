@@ -113,7 +113,7 @@ def test_every_verb_runs_only_the_fixed_compose_prefix_over_the_snapshot(
     """
     rig, result = _run_verb(tmp_path, monkeypatch, verb, _bases_absent)
     layout = rig.layout
-    assert result['status'] in {'ok', 'not_available'}, result
+    assert result['status'] == 'ok', result
     if verb in DOCKERLESS_VERBS:
         assert rig.docker.steps == [], f'{verb} ran docker: {rig.docker.steps}'
         return
@@ -171,6 +171,13 @@ _EXPECTED_TAILS = {
         *_INSPECTS,
         ['run', '--rm', '--no-deps', '--build', 'test_client', 'tests/system/test_one.py'],
     ],
+    # tj-irhy0a.22 V1: the bases, the build, then the ONE producer invocation make seed-dump also
+    # spells (ADR tj-4rr0la addendum 10 (1)), spelled out here; --date only when given (below).
+    'seed_dump': [
+        *_INSPECTS,
+        ['build', 'test_client'],
+        ['run', '--rm', '-T', '--entrypoint', '/code/.venv/bin/python', 'test_client', '-m', 'data.store.seeds'],
+    ],
     'logs': [['logs', '--no-color', '--tail', '50', 'postgres']],
     'ps': [['ps', '--all']],
 }
@@ -195,6 +202,14 @@ def test_every_verb_runs_exactly_its_fixed_tails(tmp_path: Path, monkeypatch: py
     assert len(tails) == len(expected), f'{verb} ran {tails}'
     for tail, want in zip(tails, expected, strict=True):
         assert tail[: len(want)] == want, f'{verb} ran {tail}, expected it to start {want}'
+    if verb == 'seed_dump':
+        # Exactly, not a prefix: with no date given, nothing follows the module name.
+        assert tails[-2:] == expected[-2:], tails
+
+
+def test_every_verb_with_fixed_tails_is_covered():
+    """A verb that runs docker and has no _EXPECTED_TAILS entry would escape the tail pin."""
+    assert set(_EXPECTED_TAILS) == set(VERB_SAMPLES) - DOCKERLESS_VERBS
 
 
 def test_stack_wipe_clears_only_the_data_mounts_as_root_in_one_off_containers(
@@ -568,14 +583,21 @@ def _server_error_statuses() -> set[str]:
     raise AssertionError('server.py defines no ERROR_STATUSES')
 
 
-def test_seed_dump_answers_not_available_which_is_not_an_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """(13): until tj-irhy0a.22 lands, seed_dump validates its worktree and answers not_available."""
+def test_seed_dump_runs_and_answers_ok_and_the_error_statuses_are_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """(13), re-pinned by tj-irhy0a.22 item 4 ('Remove the not_available answer').
+
+    seed_dump now runs docker and answers 'ok' on a valid bundle; the server's error statuses are
+    still the five, so 'refused' (the producer's exit 3) and 'failed' (a refused bundle) read as
+    errors and 'ok' does not.
+    """
     rig = make_rig(tmp_path, monkeypatch)
     result = rig.call('seed_dump', {'worktree': WORKTREE_NAME})
-    assert result['status'] == 'not_available' and rig.docker.steps == []
+    assert result['status'] == 'ok' and rig.docker.steps, result
     statuses = _server_error_statuses()
     assert statuses == {'refused', 'busy', 'failed', 'timeout', 'error'}
-    assert 'not_available' not in statuses
+    assert 'ok' not in statuses and 'not_available' not in statuses
 
 
 # --- the one reviewed suppression --------------------------------------------------------------

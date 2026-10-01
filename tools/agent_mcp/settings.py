@@ -1,9 +1,14 @@
 """The server's own settings, read once from its container environment (tj-c4mosr.4 sets them).
 
-Every path here is a HOST absolute path that the MCP container mounts at the same path (ADR tj-4rr0la
-addendum 1 (d)), because the Docker daemon resolves bind-mount sources on the host. A default computed
-from $HOME inside the container would name a directory the daemon has never seen, so the paths have
-none: an unset one stops the server at start.
+Only AGENT_MCP_STACK_DIR is a HOST absolute path mounted at the same path (ADR tj-4rr0la addendum 1
+(d)), because the Docker daemon resolves the snapshot's and the data directory's bind sources on the
+host. The other two are CONTAINER paths since addendum 11: AGENT_MCP_REPO_ROOT is /workspace, where
+the repository is mounted read-only (R1), and AGENT_HOME_PATH is the share directory, /agent_mcp_share
+(R2) -- the token file and seed output, never the user's Claude config. None has a default: a default
+computed from $HOME inside the container would name a directory the daemon has never seen, so an unset
+one stops the server at start. The containment checks below compare container paths, so for the two
+container-path settings they no longer describe the real host layout; the Makefile's host-side path
+check (agent-mcp-paths) covers that.
 """
 
 import os
@@ -40,6 +45,11 @@ class Settings:
     port: int
     hostname: str
 
+    @property
+    def agent_home(self) -> Path:
+        """The AGENT_HOME_PATH setting, the share directory: the token file's directory, and seed_dump's output root."""
+        return self.token_file.parent
+
 
 def _absolute_dir(environ: Mapping[str, str], name: str) -> Path:
     raw = environ.get(name, '')
@@ -60,13 +70,20 @@ def _is_within(path: Path, base: Path) -> bool:
 def load_settings(environ: Mapping[str, str]) -> Settings:
     """Read and check the settings.
 
-    AGENT_MCP_REPO_ROOT  the repository's main checkout (mounted read-only).
-    AGENT_MCP_STACK_DIR  the agent stack's own directory (env files, data, snapshot, audit log),
-                         outside the repository and AGENT_HOME_PATH; default on the host
+    AGENT_MCP_REPO_ROOT  the repository's main checkout, mounted read-only; /workspace, a container
+                         path (addendum 11 R1).
+    AGENT_MCP_STACK_DIR  the agent stack's own directory (env files, data, snapshot, audit log), a
+                         HOST path mounted at the same path, outside the repository and
+                         AGENT_HOME_PATH; default on the host
                          ${XDG_DATA_HOME:-$HOME/.local/share}/trader_joe_agent_stack, computed by the
                          host make target, not here.
-    AGENT_HOME_PATH      the agent home directory; the token file is AGENT_HOME_PATH/agent_mcp_token.
+    AGENT_HOME_PATH      the share directory, /agent_mcp_share, a container path (addendum 11 R2):
+                         the token file is AGENT_HOME_PATH/agent_mcp_token, and seed_dump writes under
+                         AGENT_HOME_PATH/agent_mcp_seeds. The name is kept from before R2.
     AGENT_MCP_PORT, AGENT_MCP_BIND, AGENT_MCP_HOSTNAME  optional.
+
+    The containment checks run on these container paths; the host-side check in the Makefile
+    (agent-mcp-paths) is what covers the real host layout.
     """
     repo_root = _absolute_dir(environ, 'AGENT_MCP_REPO_ROOT')
     stack_dir = _absolute_dir(environ, 'AGENT_MCP_STACK_DIR')

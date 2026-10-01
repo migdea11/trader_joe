@@ -227,11 +227,29 @@ def test_only_system_compose_and_the_agent_stack_name_the_overlay_in_the_makefil
     assert naming == FAKE_LOADING_VARIABLES, f'Makefile lines naming {FAKE_FILE.name}: {naming}'
 
 
-def test_only_system_launch_starts_system_compose():
-    """No other recipe (prod-launch, dev-launch, test-system...) reaches the fake stack's file list."""
-    users = [line.strip().lstrip('@-+') for line in _makefile_code_lines() if '$(SYSTEM_COMPOSE)' in line]
+SEED_DUMP = 'seed-dump'
+SEED_DUMP_COMPOSE = 'SEED_DUMP_COMPOSE'
+
+
+def test_only_system_launch_and_seed_dump_reach_system_compose():
+    """No other recipe (prod-launch, dev-launch, test-system...) reaches the fake stack's file list.
+
+    Re-pinned by tj-irhy0a.22 item 3: make seed-dump runs the producer 'against the stack
+    system-launch started (base + fake overlay + test-client file)', so SYSTEM_COMPOSE has exactly
+    two users -- system-launch's recipe and the one SEED_DUMP_COMPOSE assignment -- and
+    SEED_DUMP_COMPOSE has exactly one, seed-dump's recipe. Both recipes open with the shared guard.
+    """
+    lines = [line.strip().lstrip('@-+') for line in _makefile_code_lines()]
+    users = [line for line in lines if '$(SYSTEM_COMPOSE)' in line]
     launch = [line for line in _make_recipe(SYSTEM_LAUNCH) if '$(SYSTEM_COMPOSE)' in line]
-    assert len(users) == 1 and users == launch, f'recipe lines using $(SYSTEM_COMPOSE): {users}'
+    seed_assignment = [line for line in users if line.split(':=')[0].strip() == SEED_DUMP_COMPOSE]
+    assert len(launch) == 1 and len(seed_assignment) == 1, f'lines using $(SYSTEM_COMPOSE): {users}'
+    assert sorted(users) == sorted(launch + seed_assignment), f'lines using $(SYSTEM_COMPOSE): {users}'
+    seed_users = [line for line in lines if f'$({SEED_DUMP_COMPOSE})' in line]
+    seed_recipe = [line for line in _make_recipe(SEED_DUMP) if f'$({SEED_DUMP_COMPOSE})' in line]
+    assert len(seed_users) == 1 and seed_users == seed_recipe, f'lines using $({SEED_DUMP_COMPOSE}): {seed_users}'
+    for target in (SYSTEM_LAUNCH, SEED_DUMP):
+        assert _make_recipe(target)[0] == '$(SYSTEM_TEST_DISPOSABLE_GUARD)', (target, _make_recipe(target))
 
 
 # --- make system-launch, run for real with docker stubbed ------------------------------------------

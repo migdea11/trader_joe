@@ -56,7 +56,7 @@ TRUSTED_COMPOSE_FILES = (
 # Addendum 15: the services a compose `run` can build, and the image-only ones stack_wipe clears.
 LITERAL_BUILT_SERVICES = {'data_store', 'data_ingest', 'test_client'}
 # The verbs that can build today, and the ones that must stay base-free (FINAL DESIGN note).
-BUILDING_VERBS = {'stack_up', 'run_system_tests', 'migrate', 'migrate_status'}
+BUILDING_VERBS = {'stack_up', 'run_system_tests', 'migrate', 'migrate_status', 'seed_dump'}
 BASE_FREE_VERBS = {'stack_down', 'stack_wipe', 'logs', 'ps'}
 
 
@@ -184,6 +184,7 @@ _BUILDER_SAMPLES = {
     'postgres_running_steps': (),
     'alembic_steps': (['upgrade', 'head'], ['current']),
     'system_tests_steps': (['tests/system'],),
+    'seed_dump_steps': ('2026-01-02',),
     'logs_steps': ('data_store', 50),
     'ps_steps': (),
 }

@@ -64,6 +64,17 @@ def test_a_sane_layout_loads_with_the_documented_defaults(tmp_path: Path):
     assert (DEFAULT_PORT, DEFAULT_HOSTNAME) == (8765, 'agent_mcp')
 
 
+def test_agent_home_is_the_agent_home_path_setting_the_seed_output_root(tmp_path: Path):
+    """tj-irhy0a.22: seed_dump writes under Settings.agent_home, which is AGENT_HOME_PATH itself.
+
+    Not the token file and not its grandparent: a property that drifted from the setting would put
+    the seeds somewhere the devcontainer does not mount at /agent_mcp_share.
+    """
+    paths = _dirs(tmp_path)
+    settings = load_settings(_environ(paths))
+    assert settings.agent_home == paths['AGENT_HOME_PATH']
+
+
 @pytest.mark.parametrize('variable', VARIABLES)
 @pytest.mark.parametrize('spelling', ['unset', 'empty', 'relative', 'missing', 'a file'])
 def test_each_path_must_be_set_absolute_and_a_directory(tmp_path: Path, variable: str, spelling: str):

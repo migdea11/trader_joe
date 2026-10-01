@@ -10,6 +10,7 @@ first await, so it still admits one verb at a time.
 """
 
 import asyncio
+import errno
 import json
 import os
 import shlex
@@ -21,7 +22,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from tools.agent_mcp import stack
+from tools.agent_mcp import seeds, stack
 from tools.agent_mcp.settings import Settings
 
 
@@ -39,7 +40,10 @@ VERB_TIMEOUT_SECONDS = {
     'migrate': 600,
     'migrate_status': 300,
     'run_system_tests': 1800,
-    'seed_dump': 30,
+    # run_system_tests' budget, for the same work: a snapshot, a test_client build that on a cold
+    # cache re-syncs the image's dependencies, then the producer's scenario POSTs, the fake ingest
+    # behind them and the dump. 30 s was the not_available answer's.
+    'seed_dump': 1800,
     'logs': 60,
     'ps': 60,
 }
@@ -79,7 +83,16 @@ VERB_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         'required': ['worktree', 'paths'],
     },
-    'seed_dump': {'properties': {'worktree': _worktree_schema}, 'required': ['worktree']},
+    'seed_dump': {
+        'properties': {
+            'worktree': _worktree_schema,
+            'date': {
+                'type': 'string',
+                'description': "the manifest's UTC date, YYYY-MM-DD (a real calendar date); default today",
+            },
+        },
+        'required': ['worktree'],
+    },
     'logs': {
         'properties': {
             'service': {'type': 'string', 'enum': list(stack.SERVICES)},
@@ -97,6 +110,10 @@ for _schema in VERB_SCHEMAS.values():
 
 _OPTIONAL_DEFAULTS: dict[str, dict[str, Any]] = {'logs': {'tail': stack.TAIL_DEFAULT}}
 
+# The seed producer's exit status for a refusal (python -m data.store.seeds: 0 printed, 3 refused, 1
+# failed); seed_dump answers 'refused' for it.
+SEED_EXIT_REFUSED = 3
+
 # An unknown verb's name is recorded in the audit line cut to this many characters (json.dumps
 # escapes it), with known: false.
 AUDIT_VERB_NAME_MAX = 64
@@ -111,11 +128,25 @@ class ProcessResult:
     stderr: bytes
 
 
+_READ_CHUNK = 64 * 1024
+
+
+async def _read_capped(stream: asyncio.StreamReader, cap: int) -> bytes:
+    """Read a stream to its end, keeping at most cap + 1 bytes: one over says 'over the cap' without the rest."""
+    kept = bytearray()
+    while chunk := await stream.read(_READ_CHUNK):
+        if len(kept) <= cap:
+            kept += chunk[: cap + 1 - len(kept)]
+    return bytes(kept)
+
+
 async def run_process(step: stack.Step) -> ProcessResult:
     """Run one argument list -- never a shell -- in DOCKER_ENV, capturing both streams.
 
-    Cancelled (the verb's timeout), it kills the process before letting the cancellation through, so
-    no docker client outlives the verb that started it.
+    A step with stdout_cap has its stdout read to the end but kept only up to the cap plus one byte,
+    so a runaway producer cannot fill the server's memory. Cancelled (the verb's timeout), it kills
+    the process before letting the cancellation through, so no docker client outlives the verb that
+    started it.
     """
     process = await asyncio.create_subprocess_exec(
         *step.argv,
@@ -126,7 +157,11 @@ async def run_process(step: stack.Step) -> ProcessResult:
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        stdout, stderr = await process.communicate()
+        if step.stdout_cap is None or process.stdout is None or process.stderr is None:
+            stdout, stderr = await process.communicate()
+        else:
+            stdout, stderr = await asyncio.gather(_read_capped(process.stdout, step.stdout_cap), process.stderr.read())
+            await process.wait()
     except asyncio.CancelledError:
         process.kill()
         await process.wait()
@@ -143,6 +178,11 @@ def truncate(data: bytes) -> dict[str, Any]:
         'truncated': True,
         'note': f'truncated: showing the last {OUTPUT_CAP_BYTES} of {len(data)} bytes',
     }
+
+
+def withhold(data: bytes) -> dict[str, Any]:
+    """A data stream's place in the response: its size only, never its content (seed_dump's bundle)."""
+    return {'text': '', 'truncated': False, 'note': f'withheld: {len(data)} bytes of data, not output'}
 
 
 class BasePullFailed(Exception):
@@ -162,6 +202,8 @@ class _Call:
     validated: dict[str, Any] | None = None
     last_exit: int | None = None
     bases_present: bool = False
+    # A verb's structured result beyond its status and message (seed_dump's files); never content.
+    details: dict[str, Any] | None = None
 
     async def ensure_bases(self, cwd: Path) -> None:
         """Per stack.BASE_IMAGES ref: `docker image inspect`, and `docker pull` only when that fails.
@@ -185,7 +227,8 @@ class _Call:
         record: dict[str, Any] = {'command': shlex.join(step.argv), 'exit_status': None}
         self.steps.append(record)
         result = await self.run(step)
-        record.update(exit_status=result.exit_status, stdout=truncate(result.stdout), stderr=truncate(result.stderr))
+        stdout = truncate(result.stdout) if step.stdout_cap is None else withhold(result.stdout)
+        record.update(exit_status=result.exit_status, stdout=stdout, stderr=truncate(result.stderr))
         self.last_exit = result.exit_status
         return result
 
@@ -277,6 +320,8 @@ class AgentStack:
             'duration_s': round(self._clock() - started, 3),
             'output_cap_bytes': OUTPUT_CAP_BYTES,
         }
+        if call.details is not None:
+            result['details'] = call.details
         audit_error = self._audit(result, verb if known else str(verb)[:AUDIT_VERB_NAME_MAX], known, call.validated)
         if audit_error:
             result['audit'] = audit_error
@@ -442,23 +487,47 @@ class AgentStack:
             return 'failed', f'the system suite failed (pytest exit status {call.last_exit})'
         return 'ok', 'the system suite passed'
 
-    async def _seed_dump(self, call: _Call, worktree: object) -> tuple[str, str]:
-        """NOT AVAILABLE YET: answers 'not_available' (not an error) until the seed-dump target exists.
+    async def _seed_dump(self, call: _Call, worktree: object, date: object = None) -> tuple[str, str]:
+        """Snapshot WORKTREE, rebuild test_client from it and run the seed producer there against the agent stack (up, migrated, fake mode); write <revision>.sql and <revision>.json under agent_mcp_seeds/<worktree>/ in the share directory.
 
-        It is wired once tj-vhboky.61 lands make seed-dump. Then its container writes ONLY into an
-        MCP-owned directory under the stack directory, NEVER through a bind mount into a worktree:
-        the daemon writes as root, so a worktree bind would reopen the hole the snapshot closes (ADR
-        tj-4rr0la addendum 5). How the output reaches the worktree is designed with tj-vhboky.61
-        under that rule -- returned in the verb's response, or copied by the MCP process with
-        no-follow writes -- and never into tests/.
+        DATE (YYYY-MM-DD, a real calendar date) is the manifest's; default today. The response names
+        the two files RELATIVE to the share directory -- /agent_mcp_share, the same path in the
+        devcontainer -- with their sizes and the manifest's row counts, never their content. Exit 3
+        from the producer is 'refused'; a bundle the contract refuses, or stdout over its cap, is
+        'failed' with nothing written. The producer runs per call in test_client, which has no Docker
+        access and no writable mount; this process reads its stdout and writes the files itself, with
+        no-follow writes (ADR tj-4rr0la addendum 10, relocated by addendum 11 R2).
         """
         name = stack.check_worktree_name(worktree)
-        stack.resolve_worktree(name, await self._worktrees())
-        call.validated = {'worktree': name}
-        return (
-            'not_available',
-            'seed_dump is not available yet: it is wired when the seed-dump target lands (tj-vhboky.61)',
-        )
+        checked_date = stack.check_seed_date(date)
+        path = stack.resolve_worktree(name, await self._worktrees())
+        call.validated = {'worktree': name} if checked_date is None else {'worktree': name, 'date': checked_date}
+        snapshot = await self._refresh_snapshot(path)
+        stack.check_mount_sources(snapshot)
+        env_file = await self._guarded_env()
+        build, produce = stack.seed_dump_steps(self.settings.stack_dir, env_file, checked_date)
+        if (await call.step(build)).exit_status != 0:
+            return 'failed', 'seed_dump stopped: test_client did not build; see the steps'
+        produced = await call.step(produce)
+        if produced.exit_status == SEED_EXIT_REFUSED:
+            return 'refused', 'the seed producer refused (exit 3); its stderr is in the steps'
+        if produced.exit_status != 0:
+            return 'failed', f'the seed producer failed (exit {produced.exit_status}); its stderr is in the steps'
+        try:
+            bundle = seeds.parse_bundle(produced.stdout)
+            files = await asyncio.to_thread(seeds.write_seed, self.settings.agent_home, name, bundle)
+        except seeds.BundleRefused as refusal:
+            return 'failed', f'the seed bundle was refused and nothing was written: {refusal}'
+        except OSError as failure:
+            code = errno.errorcode.get(failure.errno or 0, 'unknown')
+            return 'failed', f'the seed files could not be written: {type(failure).__name__} ({code})'
+        call.details = {
+            'relative_to': str(self.settings.agent_home),
+            'sql': {'path': files.sql, 'bytes': files.sql_bytes},
+            'manifest': {'path': files.manifest, 'bytes': files.manifest_bytes},
+            'row_counts': files.row_counts,
+        }
+        return 'ok', f'seed for revision {bundle.revision} written under {seeds.SEEDS_DIR_NAME}/{name}/'
 
     async def _logs(self, call: _Call, service: object, tail: object) -> tuple[str, str]:
         """The last TAIL lines (clamped) of one agent-stack service's log."""

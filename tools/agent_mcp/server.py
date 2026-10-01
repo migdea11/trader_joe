@@ -29,7 +29,7 @@ from tools.agent_mcp.settings import Settings, SettingsError, load_settings
 
 
 MCP_PATH = '/mcp'
-# Statuses that are not the verb doing its job. 'not_available' (seed_dump, for now) is not one.
+# Statuses that are not the verb doing its job.
 ERROR_STATUSES = frozenset({'refused', 'busy', 'failed', 'timeout', 'error'})
 
 log = logging.getLogger('agent_mcp')

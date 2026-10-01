@@ -142,13 +142,13 @@ TOOLS_COMPOSE := $(DEV_COMPOSE) -f docker-compose.tools.yaml
 # project, the checkout's directory name). The base file, the test client, then
 # docker-compose.agent-stack.yaml so its names and image tags win over both, then the fake-mode
 # overlay docker-compose.fake.yaml AFTER it (tj-vhboky.61; ADR tj-4rr0la addendum 3 (3)), so the
-# agent stack's data_ingest always runs on FakeRead -- it has no egress and no broker key anyway, and
-# the fake overlay touches nothing the agent-stack overlay sets. The server passes its generated env file as well,
-# never the user's .env, and that env also points the services' env files outside the repository
-# (ROOT_ENV_FILE, STORE_ENV_FILE, INGEST_ENV_FILE; addendum 2). No target here uses these: the MCP
-# server is their only reader. And the mirror of the rule above: PROD_COMPOSE, DEV_COMPOSE and
-# TOOLS_COMPOSE never load the agent-stack overlay, and this set never loads the dev override or
-# the tools file -- no devnet, no publish.
+# agent stack's data_ingest always runs on FakeRead -- it has no egress and no broker key anyway,
+# and the fake overlay touches nothing the agent-stack overlay sets. The server passes its
+# generated env file as well, never the user's .env, and that env also points the services' env
+# files outside the repository (ROOT_ENV_FILE, STORE_ENV_FILE, INGEST_ENV_FILE; addendum 2). No
+# target here uses these: the MCP server is their only reader. And the mirror of the rule above:
+# PROD_COMPOSE, DEV_COMPOSE and TOOLS_COMPOSE never load the agent-stack overlay, and this set
+# never loads the dev override or the tools file -- no devnet, no publish.
 AGENT_STACK_PROJECT := trader_joe_agent_stack
 AGENT_STACK_COMPOSE := docker compose -p $(AGENT_STACK_PROJECT) -f docker-compose.yaml -f docker-compose.test-client.yaml -f docker-compose.agent-stack.yaml -f docker-compose.fake.yaml
 
@@ -704,13 +704,17 @@ test-all: $(VENV_MARKER)  ## Run every test, external included: needs live crede
 TEST_CLIENT_COMPOSE := docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml
 SYSTEM_PATHS ?= tests/system
 
-# The disposable-database guard itself, ONE definition shared by test-system and system-launch, so
-# the two cannot drift apart. $@ names whichever target refused.
+# The disposable-database guard itself, ONE definition shared by test-system, system-launch and
+# seed-dump, so the three cannot drift apart. $@ names whichever target refused; the text is generic,
+# with one line per user saying how that target reaches the database.
 define SYSTEM_TEST_DISPOSABLE_GUARD
 @if [ "$(SYSTEM_TEST_DISPOSABLE_DB)" != "1" ]; then \
-	echo "make $@ REFUSED: the system suite WRITES to the database it is pointed at," >&2; \
-	echo "  and this host may also run the production deployment, in the same compose project: test-system's" >&2; \
-	echo "  client would join its networks, and system-launch would replace its data_ingest with the fake." >&2; \
+	echo "make $@ REFUSED: this target WRITES to the database it is pointed at -- the one the default" >&2; \
+	echo "  compose project's stack holds -- and this host may also run the production deployment, in that" >&2; \
+	echo "  same compose project:" >&2; \
+	echo "    test-system:   the suite's client joins its networks and writes to its database;" >&2; \
+	echo "    system-launch: replaces its data_ingest with the fake, which writes fake bars;" >&2; \
+	echo "    seed-dump:     the producer POSTs its scenario into it." >&2; \
 	echo "  Run it only against a stack you can wipe: bring one up and migrate it" >&2; \
 	echo "  (make system-launch or make dev-launch, then make migrate), then run:" >&2; \
 	echo "    make $@ SYSTEM_TEST_DISPOSABLE_DB=1" >&2; \
@@ -748,3 +752,45 @@ SYSTEM_COMPOSE := docker compose -f docker-compose.yaml -f docker-compose.fake.y
 system-launch:  ## Start the stack from the prod images with data_ingest on the fake broker, waiting for healthy (SYSTEM_TEST_DISPOSABLE_DB=1)
 	$(SYSTEM_TEST_DISPOSABLE_GUARD)
 	$(SYSTEM_COMPOSE) up -d --wait --wait-timeout 300
+
+# THE SEED DUMP (ADR tj-4rr0la addendum 10 (4); decision tj-vhboky.55 S9-S11). Against the stack
+# system-launch started -- up, migrated (make migrate) and in fake mode -- with the test-client file
+# added, it runs the producer in test_client by the ONE invocation the agent-stack MCP's seed_dump
+# verb also uses: `compose run --rm -T --entrypoint /code/.venv/bin/python test_client -m
+# data.store.seeds [--date D]`. The producer POSTs its own scenario to data_store (tj-vhboky.55) and
+# reads Postgres, over the stack's networks from the client container -- never `docker exec` into a
+# service. It writes nothing: its stdout is the one-line bundle, its stderr the messages.
+#
+# THE HOST WRITER is data.store.seeds.bundle in the host venv, the ONE host-side no-follow writer
+# (S11): stdout is piped to `python -m data.store.seeds.bundle --out $(SEED_OUT)`, which writes
+# <revision>.sql and <revision>.json there. SEED_OUT defaults to output/seeds, git-ignored, inside
+# the repository and never under tests/ (the writer refuses tests/ itself); a person copies a
+# reviewed seed into tests/system/seeds/ (tj-vhboky.56). A SEED_OUT OUTSIDE the repository reached
+# through a symlinked parent (macOS /tmp, a symlinked checkout path) is refused, exit 3, by design:
+# the writer's no-follow walk starts at / for such a path (S11.2). DATE, when given, is forwarded as
+# --date; the producer refuses one that is not a real YYYY-MM-DD date.
+#
+# THE STATUS is the producer's whenever it is non-zero (0, 3 refused, 1 failed), else the writer's.
+# Not `set -o pipefail`, which reports the RIGHTMOST failure -- the writer's 'no bundle line' after a
+# failed producer. bash's PIPESTATUS (SHELL is /bin/bash) is read straight after the pipeline.
+# Behind the SAME disposable-database guard as test-system: the producer writes its scenario into
+# whatever database the default compose project's stack holds. $(VENV_MARKER), unlike test-system,
+# because the writer runs in the host venv.
+SEED_OUT ?= output/seeds
+SEED_DUMP_COMPOSE := $(SYSTEM_COMPOSE) -f docker-compose.test-client.yaml
+
+.PHONY: seed-dump
+seed-dump: $(VENV_MARKER)  ## Dump a seed from the fake-mode stack into SEED_OUT (default output/seeds; DATE=YYYY-MM-DD; SYSTEM_TEST_DISPOSABLE_DB=1). A SEED_OUT outside the repo via a symlinked parent is refused, exit 3
+	$(SYSTEM_TEST_DISPOSABLE_GUARD)
+	@[ -f .env ] || { echo "make seed-dump: no .env in $(CURDIR); compose interpolates the stack's credentials from it." >&2; exit 1; }
+	$(SEED_DUMP_COMPOSE) run --rm -T --entrypoint /code/.venv/bin/python test_client -m data.store.seeds $(if $(DATE),--date "$$SEED_DUMP_DATE") \
+		| $(VENV_PYTHON) -m data.store.seeds.bundle --out "$$SEED_DUMP_OUT"; \
+		status=("$${PIPESTATUS[@]}"); \
+		if [ "$${status[0]}" -ne 0 ]; then exit "$${status[0]}"; fi; \
+		exit "$${status[1]}"
+
+# DATE and SEED_OUT reach the recipe through the environment, never spliced into its text: a quote in
+# either would otherwise break the shell quoting around it (tj-irhy0a.25). Declared after the recipe
+# so the rule with the recipe stays the first `seed-dump:` line, the one readers of this file look for.
+seed-dump: export SEED_DUMP_DATE := $(DATE)
+seed-dump: export SEED_DUMP_OUT := $(SEED_OUT)

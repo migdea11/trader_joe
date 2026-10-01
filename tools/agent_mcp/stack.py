@@ -27,6 +27,7 @@ A check on an agent-writable tree is always a race, so neither is ever pointed a
 """
 
 import contextlib
+import datetime
 import os
 import re
 import secrets
@@ -35,9 +36,10 @@ import stat
 import subprocess  # nosec B404 -- argument lists only, never a shell; see run_git
 import threading
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
+from tools.agent_mcp.seeds import MAX_BUNDLE_BYTES
 from tools.agent_mcp.settings import Settings
 
 
@@ -103,11 +105,13 @@ WAIT_TIMEOUT_SECONDS = 300
 # Dockerfile's COPY sources from the build context (pyproject.toml, uv.lock, entrypoint.sh, common,
 # routers, schemas and ${SERVICE_PATH}/${SERVICE_NAME}/app for data_store and data_ingest) plus the
 # trusted compose files' relative bind sources (common, routers, schemas, data/store/app,
-# data/store/alembic.ini, data/store/migrations, tests/system, pytest.ini, and tests/fakes, the
-# fake-mode overlay's read-only mount, tj-vhboky.61). A validator test pins the equality by parsing
-# those files (tj-c4mosr.5 S2), so a new COPY or mount without an entry goes red. An allow-list,
-# never the whole tree: the root checkout's live env files, .venv, data directories and .git are
-# never copied, whatever the (agent-writable) .dockerignore says. The build context '.' is the snapshot root itself.
+# data/store/alembic.ini, data/store/migrations, tests/system, pytest.ini; tests/fakes, the
+# fake-mode overlay's read-only mount, tj-vhboky.61; and test_client's read-only mounts of the seed
+# producer's import closure, data/store/seeds, data/ingest/app and tests/fakes, ADR tj-4rr0la
+# addendum 10 (2)). A validator test pins the equality by parsing those files (tj-c4mosr.5 S2), so a
+# new COPY or mount without an entry goes red. An allow-list, never the whole tree: the root
+# checkout's live env files, .venv, data directories and .git are never copied, whatever the
+# (agent-writable) .dockerignore says. The build context '.' is the snapshot root itself.
 SOURCE_DIR_NAME = 'source'
 SNAPSHOT_SOURCES = (
     'pyproject.toml',
@@ -120,6 +124,7 @@ SNAPSHOT_SOURCES = (
     'data/ingest/app',
     'data/store/alembic.ini',
     'data/store/migrations',
+    'data/store/seeds',
     'tests/system',
     'tests/fakes',
     'pytest.ini',
@@ -177,6 +182,8 @@ STEERING_PREFIXES = ('COMPOSE_', 'DOCKER_')
 
 _ENV_LINE = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)=(.*)$')
 _WORKTREE_NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$')
+# seed_dump's --date: ASCII digits only (\d would take any Unicode digit), then a real calendar date.
+_SEED_DATE = re.compile(r'^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
 
 
 # ---------------------------------------------------------------------------------------------
@@ -337,6 +344,22 @@ def resolve_test_paths(snapshot: Path, paths: object) -> list[str]:
             raise Refused(f'{spelled!r} does not resolve to an existing path under {SYSTEM_TESTS_DIR}')
         resolved_paths.append(resolved.relative_to(snapshot).as_posix())
     return resolved_paths
+
+
+def check_seed_date(value: object) -> str | None:
+    """seed_dump's optional date: None, or YYYY-MM-DD in ASCII digits that is a real calendar date.
+
+    Checked before any git, copy or docker call, and the refusal never echoes the value.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _SEED_DATE.fullmatch(value):
+        raise Refused('date must be YYYY-MM-DD')
+    try:
+        datetime.date.fromisoformat(value)
+    except ValueError:
+        raise Refused('date must be a real calendar date, YYYY-MM-DD') from None
+    return value
 
 
 def validate_service(service: object) -> str:
@@ -893,11 +916,16 @@ class Step:
     missing image on up/run without --build (ADR tj-4rr0la addendum 15). _steps() sets it from the
     compose command (builds()), so no builder can add a build without it; the runner makes BASE_IMAGES
     present before the first such step of a verb and never runs it when a base could not be pulled.
+
+    stdout_cap, when set, marks the step's stdout as DATA rather than output (seed_dump's bundle):
+    the runner reads it in full up to stdout_cap bytes plus one -- not under the OUTPUT_CAP_BYTES
+    tail rule -- and withholds it from the response and the audit line.
     """
 
     argv: tuple[str, ...]
     cwd: Path
     builds: bool = False
+    stdout_cap: int | None = None
 
 
 def compose_prefix(stack_dir: Path, root_env_file: Path) -> list[str]:
@@ -1022,6 +1050,32 @@ def alembic_steps(stack_dir: Path, root_env_file: Path, *commands: Sequence[str]
 def system_tests_steps(stack_dir: Path, root_env_file: Path, paths: Sequence[str]) -> list[Step]:
     """The test client, rebuilt from the snapshot, run against the agent stack."""
     return _steps(stack_dir, root_env_file, ['run', '--rm', '--no-deps', '--build', 'test_client', *paths])
+
+
+# THE SEED PRODUCER'S ONE INVOCATION (ADR tj-4rr0la addendum 10 (1)), spelled exactly as make
+# seed-dump spells it: test_client's entrypoint overridden to the image's own interpreter, the
+# producer module, and --date only when one was given.
+SEED_PRODUCER_RUN = (
+    'run',
+    '--rm',
+    '-T',
+    '--entrypoint',
+    '/code/.venv/bin/python',
+    'test_client',
+    '-m',
+    'data.store.seeds',
+)
+
+
+def seed_dump_steps(stack_dir: Path, root_env_file: Path, date: str | None) -> list[Step]:
+    """Build test_client from the snapshot, then run the producer in it; its stdout is the bundle.
+
+    The build is a step of its own so the run is the one invocation make seed-dump also uses; both
+    steps can build, so the runner makes BASE_IMAGES present before the first (addenda 14-15).
+    """
+    date_args = ['--date', date] if date is not None else []
+    build, run = _steps(stack_dir, root_env_file, ['build', 'test_client'], [*SEED_PRODUCER_RUN, *date_args])
+    return [build, replace(run, stdout_cap=MAX_BUNDLE_BYTES)]
 
 
 def logs_steps(stack_dir: Path, root_env_file: Path, service: str, tail: int) -> list[Step]:

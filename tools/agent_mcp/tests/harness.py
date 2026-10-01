@@ -17,6 +17,7 @@ the host sitting's (tj-c4mosr.6 H1-H3), not this suite's.
 
 import asyncio
 import hashlib
+import json
 import os
 import stat
 import subprocess
@@ -51,6 +52,9 @@ WORKTREE_FILES = {
     'data/store/alembic.ini': '[alembic]\n',
     'data/store/migrations/env.py': 'ENV = 1\n',
     'data/store/migrations/versions/0001_initial.py': 'revision = "0001"\n',
+    # The seed producer, test_client's read-only mount (ADR tj-4rr0la addendum 10 (2); tj-irhy0a.22).
+    'data/store/seeds/__init__.py': '',
+    'data/store/seeds/__main__.py': 'MAIN = 1\n',
     'tests/system/test_one.py': 'def test_one():\n    pass\n',
     'tests/system/sub/test_two.py': 'def test_two():\n    pass\n',
     # The fake-mode overlay's read-only mount source (docker-compose.fake.yaml; tj-vhboky.61).
@@ -170,10 +174,31 @@ class FakeGit:
         return self.calls.count(('worktree', 'list', '--porcelain'))
 
 
+# What the seed producer prints on success: one bundle line (decision tj-vhboky.55 S9), spelled here
+# from literals rather than by either reader's code, so a sample seed_dump call ends 'ok'.
+SEED_REVISION = '0a1b2c3d4e5f'
+SEED_SQL = "INSERT INTO public.store_dataset_entry (id) VALUES ('harness');\n"
+SEED_MANIFEST = json.dumps({'revision': SEED_REVISION, 'row_counts': {'store_dataset_entry': 1}}) + '\n'
+SEED_STDOUT = (
+    json.dumps({'bundle': 'trader_joe-seed/1', 'revision': SEED_REVISION, 'sql': SEED_SQL, 'manifest': SEED_MANIFEST})
+    + '\n'
+).encode('utf-8')
+
+
+def is_seed_producer(step: stack.Step) -> bool:
+    """The step that runs the seed producer in test_client (its stdout is the bundle)."""
+    return 'data.store.seeds' in step.argv
+
+
 def default_response(step: stack.Step) -> runner.ProcessResult:
-    """Every docker step succeeds; `ps -q postgres` answers with one container id (postgres is running)."""
+    """Every docker step succeeds; `ps -q postgres` answers with one container id (postgres is running).
+
+    The seed producer's run answers with SEED_STDOUT, a valid bundle.
+    """
     if list(step.argv[-3:]) == ['ps', '-q', 'postgres']:
         return runner.ProcessResult(0, b'0123456789ab\n', b'')
+    if is_seed_producer(step):
+        return runner.ProcessResult(0, SEED_STDOUT, b'')
     return runner.ProcessResult(0, b'', b'')
 
 
@@ -288,8 +313,9 @@ VERB_SAMPLES: Mapping[str, dict[str, Any]] = {
     'logs': {'service': 'postgres', 'tail': 50},
     'ps': {},
 }
-# Verbs that run no docker at all (seed_dump answers not_available until tj-irhy0a.22).
-DOCKERLESS_VERBS = frozenset({'seed_dump'})
+# Verbs that run no docker at all. None since tj-irhy0a.22 wired seed_dump; kept so a future verb
+# that runs no docker is classified here rather than tripping the docker sweeps.
+DOCKERLESS_VERBS: frozenset[str] = frozenset()
 
 
 def tree_digest(path: Path) -> dict[str, str]:
