@@ -76,7 +76,7 @@ env:
   # uv warns, then asserts the lock is current, so a stale lock still fails the job. Matches the
   # Makefile's exported UV_FROZEN.
   UV_FROZEN: "1"
-  SOURCE_PATHS: "./common ./routers ./schemas ./data"
+  SOURCE_PATHS: "./common ./routers ./schemas ./data ./tools"
 
 jobs:
   testing:
@@ -117,7 +117,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        uv sync --all-groups --no-group security --locked
+        uv sync --all-groups --no-group security --no-group agent-mcp --locked
     - name: Run Ruff Linting
       run: |
         uv run ruff check .
@@ -239,12 +239,43 @@ jobs:
         # PGADMIN_* placeholders dev-down uses, only to get past its ":?" guards; they are safe
         # here for the same reason, because `config` creates no container and so no pgAdmin
         # account can ever be initialised from them.
+        #
+        # The agent-stack set, spelled exactly as the Makefile's AGENT_STACK_COMPOSE: project
+        # trader_joe_agent_stack, then base, test-client and the agent-stack overlay LAST (ADR
+        # tj-4rr0la addendum 3). The overlay reads seven variables through ":?" guards with no
+        # default -- DATABASE_NAME, BROKER_NAME, STORE_API_NETWORK, DATA_DIR and the three
+        # *_ENV_FILE paths -- which the MCP server's generated env file supplies at run time, so
+        # this line sets throwaway placeholders for all seven, safe for the same reason as
+        # PGADMIN_*: `config` creates no container, network, volume or directory. The names
+        # differ from the user's defaults (db, kafka, trader_joe_store_api) so the render shows
+        # the overlay's names are the ones that win. The three *_ENV_FILE placeholders are NOT
+        # arbitrary: `config` refuses an env_file that does not exist, so they name the root,
+        # data/store and data/ingest env files Build Images already staged above, as absolute
+        # paths the way the generated env file spells them (the step runs at the checkout
+        # root, so ${PWD} is it). Naming a path is not reading the file. Whoever
+        # changes AGENT_STACK_COMPOSE (the fake-mode overlay, tj-vhboky.61) updates this line.
+        #
+        # The agent-stack MCP's own project (docker-compose.agent-mcp.yaml; ADR tj-4rr0la addendum
+        # 11 R5), spelled as the Makefile's AGENT_MCP_COMPOSE: project trader_joe_agent_mcp and an
+        # empty --env-file, so no env file is read. Its five ":?" variables -- three host paths and
+        # the build's UID/GID -- get throwaway placeholders, safe for the same reason: `config`
+        # creates nothing, and it does not check that a bind source exists. Nothing else in CI
+        # reads this file before the host sitting (tj-c4mosr.6).
+        AGENT_MCP_REPO_HOST_PATH=/tmp/agent_mcp_render_repo AGENT_MCP_STACK_DIR=/tmp/agent_mcp_render_stack \
+          AGENT_MCP_SHARE_PATH=/tmp/agent_mcp_render_share AGENT_MCP_UID=1000 AGENT_MCP_GID=1000 \
+          docker compose -p trader_joe_agent_mcp --env-file /dev/null -f docker-compose.agent-mcp.yaml config --quiet
         docker compose -f docker-compose.yaml config --quiet
         docker compose -f docker-compose.yaml -f docker-compose.override.yaml config --quiet
         PGADMIN_EMAIL=unused PGADMIN_PASS=unused docker compose -f docker-compose.yaml \
           -f docker-compose.override.yaml -f docker-compose.tools.yaml config --quiet
         docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml config --quiet
-        echo "Compose renders: prod, dev, tools and client sets all interpolate and merge."
+        DATABASE_NAME=agent_stack_render_db BROKER_NAME=agent_stack_render_kafka \
+          STORE_API_NETWORK=agent_stack_render_store_api DATA_DIR=/tmp/agent_stack_render_data \
+          ROOT_ENV_FILE="${PWD}/.env" STORE_ENV_FILE="${PWD}/data/store/.env" \
+          INGEST_ENV_FILE="${PWD}/data/ingest/.env" \
+          docker compose -p trader_joe_agent_stack -f docker-compose.yaml \
+          -f docker-compose.test-client.yaml -f docker-compose.agent-stack.yaml config --quiet
+        echo "Compose renders: prod, dev, tools, client, agent-stack and agent-mcp sets all interpolate and merge."
 
     - name: Push Image - Data Store
       id: push_store
@@ -325,7 +356,7 @@ jobs:
       # are left in place for now; dropping them is a separate change.
       - name: Install dependencies
         run: |
-          uv sync --all-groups --no-group security --locked
+          uv sync --all-groups --no-group security --no-group agent-mcp --locked
 
       - name: Registry Login
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0

@@ -26,6 +26,11 @@ dependencies = []
 [tool.uv]
 exclude-newer = "7 days"
 default-groups = ["base", "dev", "testing"]
+# agent-mcp and security resolve SEPARATELY. semgrep (security) caps pyjwt below 2.14, the release
+# that fixes the advisories pip-audit reports against 2.13.0, which the MCP SDK pulls in; one shared
+# resolution cannot satisfy both. Nothing installs the two together: the venv sync and `init` leave
+# agent-mcp out, the MCP image takes agent-mcp only, and CI's security job takes security only.
+conflicts = [[{ group = "agent-mcp" }, { group = "security" }]]
 
 [dependency-groups]
 base = [
@@ -83,6 +88,20 @@ data-store = [
     # group unresolvable: semgrep needs the opentelemetry 0.58b0 betas, which are published only
     # as betas. Lift the cap as a decision when Dependabot proposes 2.1 final, not by re-lock.
     "sqlalchemy[asyncio]>=2.0.54,<2.1",
+]
+# The agent-stack MCP server (tools/agent_mcp, ADR tj-4rr0la addendum 1). Installed by
+# tools/agent_mcp/Dockerfile ONLY: in no stage of the service Dockerfile, not in
+# default-groups, not in the Makefile's venv sync and not in CI's test installs. The pip-audit
+# export in `make security` still covers it, because that export takes every group but the
+# dev, testing and security ones. It resolves apart from security (the conflicts entry under
+# the uv table explains why), so semgrep's own mcp and pyjwt pins do not hold this group back.
+agent-mcp = [
+    "mcp>=1.29.0",
+    # Not imported here: a floor on mcp's own dependency, the starlette pattern in base. mcp
+    # declares pyjwt with no bound that excludes 2.13.0, and pip-audit reports ten advisories
+    # against 2.13.0, all fixed in 2.14.0 (CVE-2026-101917, CVE-2026-102265 to -102269, -102271
+    # to -102274). Without the floor a re-lock is free to pick it straight back.
+    "pyjwt>=2.14.0",
 ]
 security = [
     "bandit>=1.8.6",

@@ -6,16 +6,46 @@
   "remoteUser": "agent",
 
   // `mounts` has no default-value syntax, so the kit mount lives in compose.yml where it does.
-  // This preflight runs on the host before the container starts. It does three things:
+  // This preflight runs on the host before the container starts. It does six things:
   //   - an unset or wrong AGENT_KIT_PATH otherwise produces an empty mount source and a
   //     confusing failure inside the container;
   //   - the agent config directory holds the session transcripts and must exist on the host
   //     first. Docker creates a missing bind source root-owned, and the entrypoint then cannot
   //     write its skill symlinks. mkdir here makes it, owned by the invoking user;
+  //   - the agent-stack MCP's share directory, which compose.yml binds at /agent_mcp_share (the
+  //     MCP's token file and seed output; ADR tj-4rr0la addendum 11 R2). Transient by design:
+  //     AGENT_MCP_SHARE_PATH, else $XDG_RUNTIME_DIR/trader_joe_agent_mcp (tmpfs, wiped at logout
+  //     or reboot). It is created 0700 and REFUSED -- the start fails naming the path -- when it
+  //     is a symlink (checked, never followed), not owned by the invoking user, or not mode 700,
+  //     the same check as `make agent-mcp-share`. With neither variable set, the start fails too:
+  //     compose.yml interpolates the same default from the IDE's environment and has no uid for the
+  //     Makefile's /tmp/trader_joe_agent_mcp-<uid> fallback, so set AGENT_MCP_SHARE_PATH to that
+  //     path in the environment the IDE is launched from. The default is spelled the same in three
+  //     places, which must agree: here, compose.yml and the Makefile's AGENT_MCP_SHARE_PATH;
   //   - compose.yml joins the external dev network, which must exist before the container
   //     starts. Created the same idempotent way as `make dev-network` (look, else create, else
   //     look again, so a concurrent create by the dev stack is harmless), ordinary bridge, never
   //     removed. Its fixed name trader_joe_devnet appears in exactly four places, which must
-  //     agree: here, compose.yml, docker-compose.override.yaml and the Makefile's DEV_NETWORK.
-  "initializeCommand": "sh -c 'd=\"${AGENT_KIT_PATH:-$HOME/repos/agent-workflow}\"; test -d \"$d/skills\" || { echo \"AGENT_KIT_PATH does not resolve to a kit clone: $d\" >&2; exit 1; }; mkdir -p \"${AGENT_HOME_PATH:-$HOME/.claude-agent-homes/trader_joe}\"; n=trader_joe_devnet; docker network inspect \"$n\" >/dev/null 2>&1 || docker network create --driver bridge \"$n\" >/dev/null || docker network inspect \"$n\" >/dev/null'"
+  //     agree: here, compose.yml, docker-compose.override.yaml and the Makefile's DEV_NETWORK;
+  //   - compose.yml also joins trader_joe_agent_mcp, the devcontainer's one route to the
+  //     agent-stack MCP (ADR tj-4rr0la addendum 1 (c)). Created the same idempotent way as
+  //     `make agent-mcp-network`, but INTERNAL, never removed; the name must agree with
+  //     compose.yml, docker-compose.agent-mcp.yaml and the Makefile's AGENT_MCP_NETWORK. A failure
+  //     to create either network stops the start: compose.yml could not join it anyway;
+  //   - then it STARTS THE AGENT-STACK MCP: `make agent-mcp-up` in the checkout this file belongs
+  //     to, ${localWorkspaceFolder} (containers.dev json_reference: "Path of the local folder that
+  //     was opened ... (that contains .devcontainer/devcontainer.json)"), so it never depends on
+  //     the IDE's cwd. These are the user's rulings, ADR tj-4rr0la addendum 7, not defaults open to
+  //     change: on by default; AGENT_MCP=off in the environment the IDE is launched from skips it;
+  //     a failed start prints one warning on stderr and the devcontainer still starts (this
+  //     command exits 0 when only the MCP step failed; the AGENT_KIT_PATH check still fails hard);
+  //     the MCP outlives the devcontainer (make agent-mcp-down stops it). It runs HERE, on the
+  //     host, because it needs Docker: postCreateCommand and postStartCommand run inside the
+  //     devcontainer, which has no Docker by standing rule. agent-mcp-up starts the EXISTING MCP
+  //     containers and never rebuilds or re-applies its compose file (tj-h8yf91; ADR tj-4rr0la
+  //     addendum 9); `make agent-mcp-rebuild` does both. This hook cannot tell Rebuild Container
+  //     from a start (it runs before the old container is removed), so after an IDE rebuild run
+  //     `make agent-mcp-rebuild` by hand; `make agent-build` runs it for you (the user's ruling on
+  //     tj-c4mosr.4, F-B option A).
+  "initializeCommand": "sh -c 'd=\"${AGENT_KIT_PATH:-$HOME/repos/agent-workflow}\"; test -d \"$d/skills\" || { echo \"AGENT_KIT_PATH does not resolve to a kit clone: $d\" >&2; exit 1; }; mkdir -p \"${AGENT_HOME_PATH:-$HOME/.claude-agent-homes/trader_joe}\"; s=\"${AGENT_MCP_SHARE_PATH:-}\"; if [ -z \"$s\" ]; then [ -n \"${XDG_RUNTIME_DIR:-}\" ] || { echo \"Neither AGENT_MCP_SHARE_PATH nor XDG_RUNTIME_DIR is set in the IDE environment; set AGENT_MCP_SHARE_PATH=/tmp/trader_joe_agent_mcp-$(id -u) there (compose.yml cannot compute that fallback).\" >&2; exit 1; }; s=\"$XDG_RUNTIME_DIR/trader_joe_agent_mcp\"; fi; case \"$s\" in /*) ;; *) echo \"AGENT_MCP_SHARE_PATH must be absolute: $s\" >&2; exit 1;; esac; [ -e \"$s\" ] || [ -L \"$s\" ] || { mkdir -p \"$(dirname \"$s\")\" && mkdir -m 0700 \"$s\"; } 2>/dev/null; [ -e \"$s\" ] || [ -L \"$s\" ] || { echo \"could not create $s\" >&2; exit 1; }; if [ -L \"$s\" ] || [ ! -d \"$s\" ] || [ \"$(stat -c %u:%a \"$s\")\" != \"$(id -u):700\" ]; then echo \"refusing $s: it must be a directory (not a symlink) owned by uid $(id -u) with mode 700; found type:uid:mode $(stat -c %F:%u:%a \"$s\")\" >&2; exit 1; fi; n=trader_joe_devnet; docker network inspect \"$n\" >/dev/null 2>&1 || docker network create --driver bridge \"$n\" >/dev/null || docker network inspect \"$n\" >/dev/null || exit 1; m=trader_joe_agent_mcp; docker network inspect \"$m\" >/dev/null 2>&1 || docker network create --driver bridge --internal \"$m\" >/dev/null || docker network inspect \"$m\" >/dev/null || exit 1; if [ \"${AGENT_MCP:-}\" != off ]; then make -C \"${localWorkspaceFolder}\" --no-print-directory agent-mcp-up || echo \"WARNING: the agent-stack MCP did not start; the devcontainer starts without it. Retry with make agent-mcp-up, or skip it with AGENT_MCP=off.\" >&2; fi'"
 }

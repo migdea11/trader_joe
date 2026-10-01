@@ -257,3 +257,24 @@ host's `.venv`. The checkout is bind-mounted in, and a shared `.venv` had each s
 at an interpreter only it has, so the other side silently rebuilt it without the database groups.
 The Makefile's sync marker lives inside whichever environment is active and is invalidated when that
 environment's interpreter is missing, so a rebuilt environment always gets a full sync.
+
+Agents reach Docker only through the agent-stack MCP (`docker-compose.agent-mcp.yaml`), a server in its
+own container that starts with the devcontainer by default: `make agent-up`, or the IDE's host-side
+`initializeCommand`, runs `make agent-mcp-up` on the host. Set `AGENT_MCP=off` to skip it; a failed
+start only warns. It offers fixed verbs over one isolated, credential-free compose project,
+`trader_joe_agent_stack`: bring the stack up from a named worktree, stop it, wipe it, migrate it, run
+`tests/system` against it, read its logs and status. It cannot touch the dev or prod stacks, run an
+arbitrary command, image or compose file, or read your env files. Only its socket proxy mounts the Docker
+socket. The devcontainer reaches it as `http://agent_mcp:8765/mcp` over an internal network, with a
+bearer token read from `agent_mcp_token` in the MCP's share directory (`AGENT_MCP_SHARE_PATH`, mounted
+at `/agent_mcp_share` in both containers; `.mcp.json`; Claude Code asks you to approve the server on
+first use). The share directory lives under `/run/user/<uid>` (`$XDG_RUNTIME_DIR`) and is wiped at
+logout or reboot; the MCP writes a new token on its next start, and a devcontainer left running across
+that must be restarted too (`make agent-down && make agent-up`, or close and reopen it in the IDE). The
+MCP never sees your Claude
+config directory, and `make agent-mcp-up` refuses host paths that overlap. It keeps running after the devcontainer stops; stop it with
+`make agent-mcp-down`, which stops its containers but keeps them. A start reuses the existing
+containers and never re-reads the compose file. The image is built from the root checkout's working
+tree, and only `make agent-mcp-rebuild` rebuilds it and applies compose-file changes. `make agent-build`
+runs it for you. After the IDE's Rebuild Container, or after changing the MCP's files (`tools/agent_mcp`,
+the compose files, the `Dockerfile`), run `make agent-mcp-rebuild` yourself.

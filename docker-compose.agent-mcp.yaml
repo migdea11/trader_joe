@@ -1,0 +1,183 @@
+# THE AGENT-STACK MCP AND ITS SOCKET PROXY (ADR tj-4rr0la addendum 1, as amended by addenda 4-7;
+# build task tj-c4mosr.4). The server of tools/agent_mcp in ITS OWN container -- separate from the
+# devcontainer and from test_client -- reaching Docker only through a socket proxy.
+#
+# Started and stopped by `make agent-mcp-up` / `make agent-mcp-down` on the HOST (the devcontainer
+# has no Docker, by standing rule), and started by default with the devcontainer (make agent-up and
+# devcontainer.json's initializeCommand; AGENT_MCP=off opts out, addendum 7). THIS FILE IS APPLIED
+# ONLY WHEN THE CONTAINERS ARE CREATED: at the first start, or by `make agent-mcp-rebuild`. A plain
+# start `docker start`s the existing containers and a stop keeps them (addendum 9 (a)), so an edit
+# here does nothing until a rebuild the user runs. PROD_COMPOSE,
+# DEV_COMPOSE, TOOLS_COMPOSE and AGENT_STACK_COMPOSE never load this file, and it loads none of
+# theirs: it is its own compose project, and the agent STACK it drives is started only by the
+# server's stack_up verb.
+#
+# THE DOCKER SOCKET IS MOUNTED HERE ONCE, in socket_proxy -- the only place in the repository that
+# mounts it. Its ':ro' protects only the socket FILE (no chmod, no replacing it); it narrows no API
+# call, since a connection through a read-only mount still reaches the whole daemon. What narrows
+# the API is the proxy's section list below. agent_mcp reaches the daemon at
+# tcp://socket_proxy:2375, over agent_mcp_docker, which only these two services join. The section
+# list is not a sandbox (compose build/up/run need container, image, network and volume writes).
+# The fixed verbs remain the real control (addendum 1 (b)).
+#
+# REACH: agent_mcp listens on 8765 at /mcp inside its container and publishes NO port. The
+# devcontainer reaches it by service name over trader_joe_agent_mcp, an internal network shared by
+# the two of them and nothing else -- not devnet, not any stack network (addendum 1 (c)). A bearer
+# token stands in front of every call (tools/agent_mcp/auth.py).
+#
+# Every variable below is set by the Makefile's agent-mcp-up/-down recipes, which also pass an empty
+# --env-file, so compose never interpolates from the user's live env file. The ':?' guards make a
+# bare `docker compose -f docker-compose.agent-mcp.yaml up` refuse instead of mounting '' paths.
+name: trader_joe_agent_mcp
+
+services:
+  socket_proxy:
+    # tecnativa/docker-socket-proxy 0.3.0 (HAProxy), pinned by digest. Each variable is one API
+    # path prefix: 1 allows it, 0 refuses it, and anything unnamed is refused by the final deny.
+    # POST=1 lets the allowed sections write; the rest stay GET-refused too.
+    image: tecnativa/docker-socket-proxy:0.3.0@sha256:9e4b9e7517a6b660f2cc903a19b257b1852d5b3344794e3ea334ff00ae677ac2
+    volumes:
+      # ':ro' guards the socket file only; the section list below is what narrows the API.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    # No capabilities at all (ADR tj-4rr0la addendum 12, F4), and none added back: the image
+    # (haproxy:2.2-alpine base, no USER) runs as root, and at 0.3.0 its haproxy.cfg has no
+    # user/group/chroot directive and binds :2375 (above 1024); the entrypoint writes haproxy.cfg
+    # and haproxy its pidfile, both in root-owned directories; root owns docker.sock, so owner
+    # bits suffice. tj-c4mosr.6 confirms the proxy starts and serves under this.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      # EXACTLY the list in tools/agent_mcp/__init__.py's docstring ("DOCKER API SECTIONS THE VERBS
+      # NEED"). A verb failing with 403 names the missing section; the host sitting (tj-c4mosr.6)
+      # confirms the list against real compose calls.
+      PING: 1
+      VERSION: 1
+      INFO: 1
+      CONTAINERS: 1
+      IMAGES: 1
+      NETWORKS: 1
+      VOLUMES: 1
+      BUILD: 1
+      SESSION: 1
+      GRPC: 1
+      EVENTS: 1
+      POST: 1
+      # Off, stated rather than left to the image's defaults. EXEC off also stops `exec`: creating
+      # one is POST /containers/{id}/exec (under CONTAINERS), but starting it is /exec/{id}/start.
+      EXEC: 0
+      AUTH: 0
+      SECRETS: 0
+      CONFIGS: 0
+      PLUGINS: 0
+      SYSTEM: 0
+      SWARM: 0
+      NODES: 0
+      SERVICES: 0
+      TASKS: 0
+      DISTRIBUTION: 0
+      COMMIT: 0
+      # The ALLOW_* switches only matter with CONTAINERS=0; kept off so nothing reads as extra.
+      ALLOW_START: 0
+      ALLOW_STOP: 0
+      ALLOW_RESTARTS: 0
+      # Bind 0.0.0.0:2375 only: an internal network may have no IPv6, and the image's default
+      # '[::]:2375 v4v6' bind would then fail.
+      DISABLE_IPV6: 1
+    networks:
+      - agent_mcp_docker
+
+  agent_mcp:
+    # Built from the repository root's WORKING TREE with the MCP's own Dockerfile (and its
+    # Dockerfile.dockerignore allow-list), which bakes in the trusted compose files and the trusted
+    # service Dockerfile (addendum 5 ruling 2; the source ruled on tj-h8yf91). The Makefile passes
+    # --project-directory <root checkout>, so the context is the root even when make runs in a
+    # worktree. UID/GID are the host user's, so the 0600 token file the server writes in the share
+    # directory is readable by the devcontainer user.
+    build:
+      context: .
+      dockerfile: tools/agent_mcp/Dockerfile
+      args:
+        UID: ${AGENT_MCP_UID:?set by make agent-mcp-up}
+        GID: ${AGENT_MCP_GID:?set by make agent-mcp-up}
+    image: trader_joe_agent_mcp:latest
+    depends_on:
+      - socket_proxy
+    environment:
+      # The server's own settings (tools/agent_mcp/settings.py).
+      # /workspace, the DEVCONTAINER's path to the checkout (addendum 11 R1): the harness creates
+      # agent worktrees inside the devcontainer, so git records them as
+      # /workspace/.claude/worktrees/<name>, and only a repository seen at /workspace resolves
+      # them. The daemon never sees a repository path (addendum 5: the project directory, every
+      # bind source and the build context are the snapshot in the stack directory), so the host
+      # path has no consumer here. Must agree with .devcontainer/compose.yml ('..:/workspace',
+      # working_dir) and devcontainer.json's workspaceFolder.
+      AGENT_MCP_REPO_ROOT: /workspace
+      # A HOST path mounted at the SAME path (addendum 1 (d)): the daemon resolves the snapshot's
+      # and the data directories' bind sources on the host.
+      AGENT_MCP_STACK_DIR: ${AGENT_MCP_STACK_DIR:?set by make agent-mcp-up}
+      # In THIS container the server's AGENT_HOME_PATH names the SHARE directory -- token file and
+      # seed output only -- never the user's Claude config, which the MCP must not see (addendum 11
+      # R2). The name is the server's; the directory is AGENT_MCP_SHARE_PATH on the host.
+      AGENT_HOME_PATH: /agent_mcp_share
+      # The server sets DOCKER_HOST per subprocess itself (runner.DOCKER_ENV); stated here too so
+      # anything else in the container can only ever reach the proxy.
+      DOCKER_HOST: tcp://socket_proxy:2375
+    # NO docker.sock, NO ports:, NO env_file. Three mounts, nothing else.
+    volumes:
+      # The repository, READ-ONLY, at /workspace (see AGENT_MCP_REPO_ROOT above): git plumbing and
+      # the snapshot's copy source (addendum 5 1(d); addendum 11 R1).
+      - type: bind
+        source: ${AGENT_MCP_REPO_HOST_PATH:?set by make agent-mcp-up}
+        target: /workspace
+        read_only: true
+      # The agent stack's own directory, read-write: generated env files, data, snapshot, audit log.
+      - type: bind
+        source: ${AGENT_MCP_STACK_DIR:?set by make agent-mcp-up}
+        target: ${AGENT_MCP_STACK_DIR:?set by make agent-mcp-up}
+      # The share directory, read-write: the token file the server writes and the devcontainer reads,
+      # and seed output. Its own host directory, bound at the same fixed path in the devcontainer, so
+      # a path the MCP reports opens as-is there -- and never AGENT_HOME_PATH or anything under it
+      # (addendum 11 R2): that is the user's Claude config, credential and hooks included.
+      - type: bind
+        source: ${AGENT_MCP_SHARE_PATH:?set by make agent-mcp-up}
+        target: /agent_mcp_share
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Healthy once the server answers AND refuses: an unauthenticated request must get 401 from the
+    # token gate. `up --wait` in make agent-mcp-up blocks on this.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import urllib.error, urllib.request
+          try:
+              urllib.request.urlopen('http://127.0.0.1:8765/mcp', timeout=3)
+          except urllib.error.HTTPError as refused:
+              raise SystemExit(refused.code != 401)
+          raise SystemExit(1)
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - agent_mcp_docker
+      - trader_joe_agent_mcp
+
+networks:
+  # The proxy's network: internal (no gateway, no egress) and owned by this project, so only
+  # socket_proxy and agent_mcp are ever on it. The devcontainer never joins it.
+  agent_mcp_docker:
+    internal: true
+  # The devcontainer's route to the MCP. External with a fixed name, created INTERNAL by
+  # `make agent-mcp-network` and by devcontainer.json's initializeCommand, so either side can start
+  # first and neither side's down removes it. 'internal' cannot be restated on an external network:
+  # it is a property of the network's creation, and agent-mcp-up refuses one that is not internal.
+  trader_joe_agent_mcp:
+    external: true
+    name: trader_joe_agent_mcp
