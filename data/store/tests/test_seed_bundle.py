@@ -626,16 +626,38 @@ def test_an_os_failure_exits_1_naming_the_class_and_errno_only(tmp_path, capsys,
     assert captured.err == 'seed bundle write failed: PermissionError (EACCES)\n'
 
 
-def test_an_unwritable_directory_exits_1_and_leaves_nothing(tmp_path, capsys):
+_EXCLUSIVE_CREATE = os.O_CREAT | os.O_EXCL
+
+
+@pytest.mark.parametrize('denied', [1, 2], ids=['first-create', 'second-create'])
+def test_an_unwritable_directory_exits_1_and_leaves_nothing(tmp_path, capsys, monkeypatch, denied):
+    """The kernel's EACCES at the writer's own exclusive create, injected so it holds for every uid.
+
+    Mode bits cannot make this test: CI runs as root, and root ignores a directory's 0555 (the
+    create succeeds and main returns 0). So the refusal is injected at os.open, the call the writer
+    makes for each O_CREAT|O_EXCL temporary, raising what a non-root create in a 0555 directory
+    raises. 'first-create' is the unwritable directory itself; 'second-create' is a denial arriving
+    after the .sql temporary exists, so 'leaves nothing' also covers the cleanup of a temporary.
+    """
     out = tmp_path / 'out'
     out.mkdir()
-    out.chmod(0o555)
-    try:
-        assert bundle_module.main(['--out', str(out)], stdin=bundle_line()) == 1
-        assert capsys.readouterr().err == 'seed bundle write failed: PermissionError (EACCES)\n'
-        assert list(out.iterdir()) == []
-    finally:
-        out.chmod(0o755)
+    real_open = os.open
+    creates: list[str] = []
+
+    def refusing_open(path, flags, mode=0o777, *, dir_fd=None):
+        if flags & _EXCLUSIVE_CREATE == _EXCLUSIVE_CREATE:
+            creates.append(path)
+            if len(creates) == denied:
+                raise PermissionError(errno.EACCES, 'Permission denied')
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(bundle_module.os, 'open', refusing_open)
+    exit_code = bundle_module.main(['--out', str(out)], stdin=bundle_line())
+    monkeypatch.undo()
+    assert len(creates) == denied, f'the writer made {len(creates)} exclusive creates; the denial was not reached'
+    assert exit_code == 1
+    assert capsys.readouterr().err == 'seed bundle write failed: PermissionError (EACCES)\n'
+    assert list(out.iterdir()) == []
 
 
 def test_a_symlinked_component_exits_3_through_the_command(tmp_path, victim, capsys):
