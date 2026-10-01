@@ -1,9 +1,9 @@
 ---
-name: status
+name: status-update
 description: Report progress on the work dispatched in this conversation as one grouped table the user can read at a glance. Use when the user asks for status, progress, where things stand, what is done, or what is waiting on them. Read-only — it changes nothing in the store or the repository.
 ---
 
-# status
+# status-update
 
 Tells the user where this conversation's work stands, in one screen. The work is grouping and
 compression. The value is that the user can see what is done, what is moving and what is waiting on

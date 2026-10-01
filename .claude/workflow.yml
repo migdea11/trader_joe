@@ -75,7 +75,7 @@ agents:
     slots:
       role_description: "Design authority for trader_joe."
       tech_stack: "Python 3.12, FastAPI, SQLAlchemy 2.0 async, Pydantic v2, Kafka, Postgres; uv workspace."
-      key_invariants: "Turnover limits and broker capability are account-type-aware. The order/fill event log is append-only. Nothing that touches money ships without a decision record."
+      key_invariants: "Turnover caps are per account and account-type-agnostic, and broker handles declare no capability flags (decision tj-j4wknb addendum 4). The order/fill event log is append-only. Nothing that touches money ships without a decision record."
 
   - name: builder-ingest
     role: builder
@@ -93,7 +93,7 @@ agents:
 
   - name: builder-shared
     role: builder
-    scope: [common, schemas, routers/common, pyproject.toml, uv.lock, Dockerfile, entrypoint.sh, docker-compose*.yaml, Makefile, .github, .gitignore, pytest.ini, .dockerignore, .env.default, .devcontainer]
+    scope: [common, schemas, routers/common, tools, pyproject.toml, uv.lock, Dockerfile, entrypoint.sh, docker-compose*.yaml, Makefile, .github, .gitignore, pytest.ini, .dockerignore, .env.default, .devcontainer]
     model: opus
     slots:
       do_not: "Do not refactor inside another builder's scope without filing the follow-up task for that builder. common/tests, routers/tests and schemas/tests are the validator's; pytest.ini and the Makefile are yours. Do not add a dependency without proposing it first. Do not weaken a security control to make a build pass."

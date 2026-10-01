@@ -129,14 +129,7 @@ generic framework** — broker adapters, account and portfolio model, order/fill
 market-data pipeline. Strategies, targets and private config live in a separate private repo that
 consumes it through an API and typed client SDK.
 
-Two constraints that shape design decisions here:
-
-- **Turnover is account-type-aware.** Frequent trading inside a TFSA or FHSA can be taxed as
-  business income; RRSP and RRIF are carved out. Caps, minimum holding windows and a per-trade
-  rationale trail are requirements, not niceties. See `bd show tj-jmrqkf`.
-- **Broker capability differs per adapter.** Alpaca is paper and data only for a Canadian, Questrade
-  REST is read-only, IBKR can execute but needs a co-located session daemon. The rebalancer degrades
-  to advisory mode where `place_order` is unavailable. See `bd show tj-wss8a2`.
+Design constraints and their reasoning live in decision records: `bd list -t decision --all`.
 
 Full profile: `bd show tj-luy0uh`. Roadmap: `bd show tj-jsrxdp`.
 

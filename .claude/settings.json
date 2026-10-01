@@ -3,7 +3,6 @@
     "BD_DISABLE_METRICS": "1"
   },
   "permissions": {
-    "defaultMode": "bypassPermissions",
     "allow": [
       "Bash(bd show *)",
       "WebSearch"
