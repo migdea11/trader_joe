@@ -47,7 +47,12 @@ ROOT_DOCKERFILE = REPO_ROOT / 'Dockerfile'
 EXPECTED_DOCKER = '/usr/local/bin/docker'
 # The trusted compose files, spelled out (ADR tj-4rr0la; stack.COMPOSE_FILES is pinned to the Makefile
 # in test_commands.py).
-TRUSTED_COMPOSE_FILES = ('docker-compose.yaml', 'docker-compose.test-client.yaml', 'docker-compose.agent-stack.yaml')
+TRUSTED_COMPOSE_FILES = (
+    'docker-compose.yaml',
+    'docker-compose.test-client.yaml',
+    'docker-compose.agent-stack.yaml',
+    'docker-compose.fake.yaml',
+)
 # Addendum 15: the services a compose `run` can build, and the image-only ones stack_wipe clears.
 LITERAL_BUILT_SERVICES = {'data_store', 'data_ingest', 'test_client'}
 # The verbs that can build today, and the ones that must stay base-free (FINAL DESIGN note).

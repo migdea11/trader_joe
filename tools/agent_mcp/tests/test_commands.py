@@ -47,11 +47,20 @@ MCP_DIR = REPO_ROOT / 'tools' / 'agent_mcp'
 MCP_DOCKERFILE = MCP_DIR / 'Dockerfile'
 MCP_DOCKERIGNORE = MCP_DIR / 'Dockerfile.dockerignore'
 OVERLAY = REPO_ROOT / 'docker-compose.agent-stack.yaml'
+FAKE_OVERLAY = REPO_ROOT / 'docker-compose.fake.yaml'
 # Spelled out, not read from stack.py: a test that took the expected prefix from the module under
 # test would agree with any change to it.
 EXPECTED_PROJECT = 'trader_joe_agent_stack'
 EXPECTED_TRUSTED_DIR = '/opt/agent_mcp/compose'
 EXPECTED_DOCKER = '/usr/local/bin/docker'
+# The agent stack's file list, in order (ADR tj-4rr0la addendum 3 (3); tj-vhboky.61): base, test
+# client, the agent-stack overlay, then the fake-mode overlay LAST, so data_ingest always runs FakeRead.
+EXPECTED_COMPOSE_FILES = (
+    'docker-compose.yaml',
+    'docker-compose.test-client.yaml',
+    'docker-compose.agent-stack.yaml',
+    'docker-compose.fake.yaml',
+)
 
 
 def _base_inspect_argv(ref: str) -> list[str]:
@@ -119,7 +128,7 @@ def test_every_verb_runs_only_the_fixed_compose_prefix_over_the_snapshot(
         '--env-file',
         str(layout.stack_dir / 'agent_stack.env'),
     ]
-    for name in ('docker-compose.yaml', 'docker-compose.test-client.yaml', 'docker-compose.agent-stack.yaml'):
+    for name in EXPECTED_COMPOSE_FILES:
         expected += ['-f', f'{EXPECTED_TRUSTED_DIR}/{name}']
     base_argvs = [_base_inspect_argv(ref) for ref in stack.BASE_IMAGES] + [
         _base_pull_argv(ref) for ref in stack.BASE_IMAGES
@@ -228,7 +237,10 @@ def test_the_module_constants_and_the_makefile_agree():
     assert _make_variable('AGENT_STACK_PROJECT') == stack.PROJECT == EXPECTED_PROJECT
     files = [value for flag, value in pairwise(words) if flag in ('-f', '--file')]
     assert tuple(files) == stack.COMPOSE_FILES, f'AGENT_STACK_COMPOSE loads {files}, the server {stack.COMPOSE_FILES}'
-    assert files[-1] == OVERLAY.name, 'the agent-stack overlay must be LAST (ADR tj-4rr0la addendum 3)'
+    assert tuple(files) == EXPECTED_COMPOSE_FILES, f'AGENT_STACK_COMPOSE loads {files}'
+    assert files[-2:] == [OVERLAY.name, FAKE_OVERLAY.name], (
+        'the agent-stack overlay, then the fake-mode overlay LAST (ADR tj-4rr0la addendum 3 (3), tj-vhboky.61)'
+    )
 
 
 def test_the_prefix_names_only_the_trusted_copies():
@@ -265,6 +277,25 @@ def test_the_mcp_image_bakes_in_exactly_the_trusted_compose_files_and_dockerfile
                 into_trusted[source] = destination
     assert set(into_trusted) == {*stack.COMPOSE_FILES, 'Dockerfile'}, into_trusted
     assert into_trusted['Dockerfile'] == str(stack.TRUSTED_DOCKERFILE)
+
+
+def test_the_mcp_image_bakes_in_the_fake_overlay_and_admits_it_but_never_the_fakes():
+    """tj-vhboky.61, D1: the MCP image carries its own copy of docker-compose.fake.yaml, never tests/.
+
+    The verbs pass -f for every COMPOSE_FILES entry under TRUSTED_COMPOSE_DIR, so
+    docker-compose.fake.yaml must be COPYd there and re-included by Dockerfile.dockerignore -- named
+    literally, not through COMPOSE_FILES, so dropping it from the module and the image together still
+    goes red. The fakes themselves reach the agent stack only through the snapshot's :ro mount: the
+    MCP image never COPYs anything under tests/, and its build context leaves tests/fakes out.
+    """
+    copied = {source: destination for sources, destination in _mcp_dockerfile_copies() for source in sources}
+    assert copied.get(FAKE_OVERLAY.name, '').rstrip('/') == EXPECTED_TRUSTED_DIR, copied
+    rules = _dockerignore_rules(MCP_DOCKERIGNORE.read_text(encoding='utf-8'))
+    assert not _is_excluded_from_context(FAKE_OVERLAY.name, rules), 'the MCP build context leaves out the fake overlay'
+    assert [source for source in copied if source == 'tests' or source.startswith(('tests/', './tests'))] == []
+    fakes = sorted(str(path.relative_to(REPO_ROOT)) for path in (REPO_ROOT / 'tests' / 'fakes').glob('*.py'))
+    assert 'tests/fakes/ingest_launcher.py' in fakes, fakes
+    assert [path for path in fakes if not _is_excluded_from_context(path, rules)] == []
 
 
 def test_the_mcp_build_context_admits_the_trusted_files_and_nothing_live():
@@ -449,7 +480,9 @@ def test_snapshot_sources_are_exactly_what_the_trusted_files_read_from_the_proje
     expected = set(_dockerfile_copy_sources())
     for name in stack.COMPOSE_FILES:
         expected |= _relative_bind_sources(REPO_ROOT / name)
-    assert {'data/store/migrations', 'tests/system', 'data/ingest/app', 'pytest.ini'} <= expected, expected
+    assert {'data/store/migrations', 'tests/system', 'tests/fakes', 'data/ingest/app', 'pytest.ini'} <= expected, (
+        expected
+    )
     assert set(stack.SNAPSHOT_SOURCES) == expected, (
         f'SNAPSHOT_SOURCES {sorted(stack.SNAPSHOT_SOURCES)} vs what the trusted files read {sorted(expected)}'
     )

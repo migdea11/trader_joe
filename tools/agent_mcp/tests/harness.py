@@ -53,10 +53,15 @@ WORKTREE_FILES = {
     'data/store/migrations/versions/0001_initial.py': 'revision = "0001"\n',
     'tests/system/test_one.py': 'def test_one():\n    pass\n',
     'tests/system/sub/test_two.py': 'def test_two():\n    pass\n',
+    # The fake-mode overlay's read-only mount source (docker-compose.fake.yaml; tj-vhboky.61).
+    'tests/fakes/__init__.py': '',
+    'tests/fakes/ingest_launcher.py': 'app = None\n',
     'pytest.ini': '[pytest]\n',
-    # Outside every SNAPSHOT_SOURCES entry: never copied.
+    # Outside every SNAPSHOT_SOURCES entry: never copied. tests/ is allow-listed per subdirectory,
+    # never whole, so a sibling of tests/system and tests/fakes stays out.
     'Dockerfile': 'FROM scratch\n',
     'README.md': 'not a source\n',
+    'tests/README.md': 'not a source\n',
 }
 EXECUTABLE_FILES = ('entrypoint.sh',)
 # A live env file's content: it must never reach a snapshot, a generated file or any output.

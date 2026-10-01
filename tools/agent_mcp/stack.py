@@ -48,10 +48,15 @@ class Refused(Exception):
 # ---------------------------------------------------------------------------------------------
 # THE STACK. These two mirror the Makefile's AGENT_STACK_PROJECT and AGENT_STACK_COMPOSE exactly --
 # the project name and the -f file names in the same order (base, test client, the agent-stack
-# overlay LAST; ADR tj-4rr0la addendum 3). A validator test pins that they agree (tj-c4mosr.5). The
-# fake-mode overlay (tj-vhboky.61) is appended to both, after the overlay.
+# overlay, then the fake-mode overlay AFTER it; ADR tj-4rr0la addendum 3 (3), tj-vhboky.61). A
+# validator test pins that they agree (tj-c4mosr.5).
 PROJECT = 'trader_joe_agent_stack'
-COMPOSE_FILES = ('docker-compose.yaml', 'docker-compose.test-client.yaml', 'docker-compose.agent-stack.yaml')
+COMPOSE_FILES = (
+    'docker-compose.yaml',
+    'docker-compose.test-client.yaml',
+    'docker-compose.agent-stack.yaml',
+    'docker-compose.fake.yaml',
+)
 
 # Where the MCP image carries its OWN copies of COMPOSE_FILES (tools/agent_mcp/Dockerfile). Never the
 # worktree's: a worktree is agent-writable, and compose content from it could mount any host path,
@@ -98,11 +103,11 @@ WAIT_TIMEOUT_SECONDS = 300
 # Dockerfile's COPY sources from the build context (pyproject.toml, uv.lock, entrypoint.sh, common,
 # routers, schemas and ${SERVICE_PATH}/${SERVICE_NAME}/app for data_store and data_ingest) plus the
 # trusted compose files' relative bind sources (common, routers, schemas, data/store/app,
-# data/store/alembic.ini, data/store/migrations, tests/system, pytest.ini). A validator test pins the
-# equality by parsing those files (tj-c4mosr.5 S2), so a new COPY or mount without an entry goes red.
-# The fake-mode overlay's tests/fakes joins it with tj-vhboky.61. An allow-list, never the whole tree:
-# the root checkout's live env files, .venv, data directories and .git are never copied, whatever the
-# (agent-writable) .dockerignore says. The build context '.' is the snapshot root itself.
+# data/store/alembic.ini, data/store/migrations, tests/system, pytest.ini, and tests/fakes, the
+# fake-mode overlay's read-only mount, tj-vhboky.61). A validator test pins the equality by parsing
+# those files (tj-c4mosr.5 S2), so a new COPY or mount without an entry goes red. An allow-list,
+# never the whole tree: the root checkout's live env files, .venv, data directories and .git are
+# never copied, whatever the (agent-writable) .dockerignore says. The build context '.' is the snapshot root itself.
 SOURCE_DIR_NAME = 'source'
 SNAPSHOT_SOURCES = (
     'pyproject.toml',
@@ -116,6 +121,7 @@ SNAPSHOT_SOURCES = (
     'data/store/alembic.ini',
     'data/store/migrations',
     'tests/system',
+    'tests/fakes',
     'pytest.ini',
 )
 # The copy's caps: generous (the sources are a few MB today), there to stop a worktree that grew a

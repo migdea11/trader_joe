@@ -5,9 +5,9 @@ tj-c4mosr.5: the body's build_infra bullets 1-4, the validator's 00:55 gaps (1) 
 section 1 and 5(b), addenda 1-3 and 5 (O1, O2).
 
 A separate module from test_ci_invariants.py and test_network_model.py so the agent stack's pins read
-as one design. The merged model is common/tests/compose_model.py's: base, test client, then the overlay
-LAST, as AGENT_STACK_COMPOSE loads them -- a property of the merged model cannot be dodged by an edit
-to one file the others override.
+as one design. The merged model is common/tests/compose_model.py's: base, test client, the overlay,
+then the fake-mode overlay LAST (tj-vhboky.61), as AGENT_STACK_COMPOSE loads them -- a property of the
+merged model cannot be dodged by an edit to one file the others override.
 """
 
 import re
@@ -20,6 +20,7 @@ from common.tests.compose_model import (
     AGENT_MCP_FILE,
     AGENT_STACK_FILE,
     BASE_FILE,
+    FAKE_FILE,
     TEST_CLIENT_FILE,
     InterpolationRefused,
     NotModelled,
@@ -105,12 +106,16 @@ def test_run_migrations_never_names_the_agent_files():
     assert AGENT_STACK_FILE.name not in text and AGENT_MCP_FILE.name not in text
 
 
-def test_the_agent_stack_set_is_its_project_then_base_client_overlay_last():
-    """00:55 (3) and addendum 3 (3): -p trader_joe_agent_stack; base, test client, overlay LAST."""
+def test_the_agent_stack_set_is_its_project_then_base_client_overlay_then_fake_last():
+    """00:55 (3), addendum 3 (3), tj-vhboky.61: -p trader_joe_agent_stack; base, client, overlay, fake LAST.
+
+    The fake-mode overlay goes after the agent-stack overlay, so the agent stack's data_ingest always
+    runs FakeRead and nothing the agent-stack overlay sets is overridden by an earlier file.
+    """
     expanded = _expanded_make_variable('AGENT_STACK_COMPOSE', REPO_ROOT, _subprocess_env())
     calls = _compose_calls(expanded)
     assert len(calls) == 1 and calls[0][1] == [], expanded
-    assert calls[0][0] == [BASE_FILE.name, TEST_CLIENT_FILE.name, AGENT_STACK_FILE.name], expanded
+    assert calls[0][0] == [BASE_FILE.name, TEST_CLIENT_FILE.name, AGENT_STACK_FILE.name, FAKE_FILE.name], expanded
     words = shlex.split(expanded)
     assert words[words.index('-p') + 1] == AGENT_STACK_PROJECT and words.count('-p') == 1
     assert 'docker-compose.override.yaml' not in expanded and 'docker-compose.tools.yaml' not in expanded

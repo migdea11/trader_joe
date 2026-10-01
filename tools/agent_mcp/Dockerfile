@@ -92,7 +92,8 @@ COPY tools/agent_mcp/*.py /opt/agent_mcp/tools/agent_mcp/
 # THE TRUSTED COMPOSE FILES (stack.TRUSTED_COMPOSE_DIR): the -f list the verbs pass, taken from the
 # checkout the image is built from, never from an agent's worktree at run time. A compose change
 # reaches the MCP when this image is rebuilt (make agent-mcp-up).
-COPY docker-compose.yaml docker-compose.test-client.yaml docker-compose.agent-stack.yaml /opt/agent_mcp/compose/
+COPY docker-compose.yaml docker-compose.test-client.yaml docker-compose.agent-stack.yaml docker-compose.fake.yaml \
+    /opt/agent_mcp/compose/
 # THE TRUSTED DOCKERFILE (stack.TRUSTED_DOCKERFILE; ADR tj-4rr0la addendum 5, ruling 2): the service
 # Dockerfile, which docker-compose.agent-stack.yaml names as build.dockerfile for every service it
 # builds, so the worktree's own Dockerfile is never read and FROM / COPY --from cannot reach other

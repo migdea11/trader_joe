@@ -1,0 +1,46 @@
+# THE FAKE-MODE OVERLAY (decision tj-j4wknb R4; tj-vhboky.61). It runs data_ingest on FakeRead instead
+# of the real broker, for the system suite and the seed producer, with no vendor and no credential.
+# There is no mode flag: production code instantiates the real broker and knows nothing of fakes. The
+# fake is chosen HERE and only here, by mounting the test tree and pointing uvicorn at the test-only
+# launcher, tests/fakes/ingest_launcher.py, whose app is production's own create_app with FakeRead in
+# the ALPACA_API slot. It logs one WARNING starting 'FAKE BROKER:' at import, so its logs say which
+# mode a service is in.
+#
+# Loaded by `make system-launch` (base file, then this one) and by the agent-stack MCP, appended LAST
+# to the Makefile's AGENT_STACK_COMPOSE, after docker-compose.agent-stack.yaml (ADR tj-4rr0la addendum
+# 3 (3)). PROD_COMPOSE never loads it, and neither do DEV_COMPOSE, TOOLS_COMPOSE or TEST_CLIENT_COMPOSE.
+#
+# THE PROD IMAGE HOLDS NO FAKES. The Dockerfile copies only common, routers, schemas and
+# <service>/app, never anything under tests/; this file only MOUNTS tests/fakes, read-only, into a
+# prod_image container. data/ingest/tests/test_no_production_test_imports.py pins that production
+# never imports the test tree.
+#
+# WHY tests.fakes RESOLVES IN THE CONTAINER: the image sets PYTHONPATH=/code and has no /code/tests;
+# the bind below creates /code/tests as a bare mount point, with no __init__.py, so `tests` is a
+# namespace package there and tests.fakes (which has its own __init__.py) a regular package under it.
+# The repository commits no tests/__init__.py either, so the host import path and the container's agree.
+#
+# data_ingest ONLY. Nothing else changes: same image, networks, env files and healthcheck (it probes
+# /ping on APP_INTERNAL_PORT, which the launcher's app serves like production's).
+services:
+  data_ingest:
+    volumes:
+      # Read-only: the container runs agent-changeable code and must not write into the tree it runs
+      # from (in the agent stack, the MCP's snapshot; ADR tj-4rr0la addendum 5).
+      - ./tests/fakes:/code/tests/fakes:ro
+    # The prod image's CMD is entrypoint.sh (`uvicorn $APP_MODULE --host 0.0.0.0 --port
+    # $APP_INTERNAL_PORT --workers $SERVICE_WORKERS $ADDITIONAL_ARGS`); this replaces it with the same
+    # host and the same port variable, read from the CONTAINER environment as entrypoint.sh reads it
+    # ($$ is compose's escape for a literal $). ONE WORKER, LITERAL, never $SERVICE_WORKERS from an env
+    # file: FakeRead remembers FAILONCE_ per instance, in process, so every extra worker would fail
+    # once more (architect ruling on tj-irhy0a.8). No ADDITIONAL_ARGS: the prod image sets none.
+    command:
+      - /bin/sh
+      - -c
+      - exec uvicorn tests.fakes.ingest_launcher:app --host 0.0.0.0 --port "$$APP_INTERNAL_PORT" --workers 1
+    environment:
+      # Empty, so broker keys in a host .env (or data/ingest/.env) never reach a fake-mode container:
+      # environment: outranks env_file:. Ops hygiene (decision tj-0rpt9t), not a guard -- the ALPACA_API
+      # slot holds FakeRead, which calls no vendor.
+      ALPACA_API_KEY: ""
+      ALPACA_API_SECRET: ""

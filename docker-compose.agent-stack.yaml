@@ -8,7 +8,9 @@
 # Loaded ONLY by the agent-stack MCP, as the Makefile's AGENT_STACK_COMPOSE spells it -- under the
 # compose project trader_joe_agent_stack, never the default project that prod-launch and the dev
 # targets use -- and ONLY with the file list there: docker-compose.yaml, then
-# docker-compose.test-client.yaml, then this file LAST, so what it sets wins over both. PROD_COMPOSE,
+# docker-compose.test-client.yaml, then this file, so what it sets wins over both, and only the
+# fake-mode overlay docker-compose.fake.yaml after it (tj-vhboky.61), which touches nothing this file
+# sets. PROD_COMPOSE,
 # DEV_COMPOSE, TOOLS_COMPOSE and TEST_CLIENT_COMPOSE never load it, and it is never loaded beside
 # docker-compose.override.yaml or docker-compose.tools.yaml: so NO devnet and NO published port.
 # The base file publishes nothing and this file adds nothing.

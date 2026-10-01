@@ -39,4 +39,5 @@ tools/agent_mcp/__pycache__
 !docker-compose.yaml
 !docker-compose.test-client.yaml
 !docker-compose.agent-stack.yaml
+!docker-compose.fake.yaml
 !Dockerfile

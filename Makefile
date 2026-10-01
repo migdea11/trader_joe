@@ -140,15 +140,17 @@ TOOLS_COMPOSE := $(DEV_COMPOSE) -f docker-compose.tools.yaml
 # drives from an agent's worktree, under its own compose project so it never shares a container,
 # network or volume with the stack prod-launch or the dev targets start (both use the default
 # project, the checkout's directory name). The base file, the test client, then
-# docker-compose.agent-stack.yaml LAST so its names and image tags win over both; the fake-mode
-# overlay is appended after it (tj-vhboky.61). The server passes its generated env file as well,
+# docker-compose.agent-stack.yaml so its names and image tags win over both, then the fake-mode
+# overlay docker-compose.fake.yaml AFTER it (tj-vhboky.61; ADR tj-4rr0la addendum 3 (3)), so the
+# agent stack's data_ingest always runs on FakeRead -- it has no egress and no broker key anyway, and
+# the fake overlay touches nothing the agent-stack overlay sets. The server passes its generated env file as well,
 # never the user's .env, and that env also points the services' env files outside the repository
 # (ROOT_ENV_FILE, STORE_ENV_FILE, INGEST_ENV_FILE; addendum 2). No target here uses these: the MCP
 # server is their only reader. And the mirror of the rule above: PROD_COMPOSE, DEV_COMPOSE and
 # TOOLS_COMPOSE never load the agent-stack overlay, and this set never loads the dev override or
 # the tools file -- no devnet, no publish.
 AGENT_STACK_PROJECT := trader_joe_agent_stack
-AGENT_STACK_COMPOSE := docker compose -p $(AGENT_STACK_PROJECT) -f docker-compose.yaml -f docker-compose.test-client.yaml -f docker-compose.agent-stack.yaml
+AGENT_STACK_COMPOSE := docker compose -p $(AGENT_STACK_PROJECT) -f docker-compose.yaml -f docker-compose.test-client.yaml -f docker-compose.agent-stack.yaml -f docker-compose.fake.yaml
 
 # The dev network: an ordinary bridge (NOT internal) owned by neither compose project, which the
 # dev stack, pgAdmin and the agent devcontainer all join, so either side can start first. Its
@@ -702,17 +704,47 @@ test-all: $(VENV_MARKER)  ## Run every test, external included: needs live crede
 TEST_CLIENT_COMPOSE := docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml
 SYSTEM_PATHS ?= tests/system
 
+# The disposable-database guard itself, ONE definition shared by test-system and system-launch, so
+# the two cannot drift apart. $@ names whichever target refused.
+define SYSTEM_TEST_DISPOSABLE_GUARD
+@if [ "$(SYSTEM_TEST_DISPOSABLE_DB)" != "1" ]; then \
+	echo "make $@ REFUSED: the system suite WRITES to the database it is pointed at," >&2; \
+	echo "  and this host may also run the production deployment, in the same compose project: test-system's" >&2; \
+	echo "  client would join its networks, and system-launch would replace its data_ingest with the fake." >&2; \
+	echo "  Run it only against a stack you can wipe: bring one up and migrate it" >&2; \
+	echo "  (make system-launch or make dev-launch, then make migrate), then run:" >&2; \
+	echo "    make $@ SYSTEM_TEST_DISPOSABLE_DB=1" >&2; \
+	exit 1; \
+fi
+endef
+
 .PHONY: test-system
 test-system:  ## Run tests/system from the test_client container against an up, migrated stack (SYSTEM_TEST_DISPOSABLE_DB=1)
-	@if [ "$(SYSTEM_TEST_DISPOSABLE_DB)" != "1" ]; then \
-		echo "make test-system REFUSED: the system suite WRITES to the database it is pointed at," >&2; \
-		echo "  and this host may also run the production deployment, whose networks the client would join." >&2; \
-		echo "  Run it only against a stack you can wipe: bring one up and migrate it" >&2; \
-		echo "  (make dev-launch, make migrate), then run:" >&2; \
-		echo "    make test-system SYSTEM_TEST_DISPOSABLE_DB=1" >&2; \
-		exit 1; \
-	fi
+	$(SYSTEM_TEST_DISPOSABLE_GUARD)
 	@[ -f .env ] || { echo "make test-system: no .env in $(CURDIR); compose interpolates the stack's credentials from it." >&2; exit 1; }
 	@echo "System suite from test_client against data_store (service data_store, on store_api) and Postgres (service postgres, on store_db); TZ set in docker-compose.test-client.yaml and checked by the client's entrypoint."
 	@echo "The database password and the instance write secret reach the container from .env through compose (values not shown)."
 	$(TEST_CLIENT_COMPOSE) run --rm --no-deps --build test_client $(SYSTEM_PATHS)
+
+# THE FAKE-MODE STACK (decision tj-j4wknb R4; tj-vhboky.61): the stack docker-compose.yaml defines,
+# from the PROD images, with docker-compose.fake.yaml on top -- data_ingest runs the test-only launcher
+# on FakeRead from a read-only mount of tests/fakes, one worker, broker keys blanked. Nothing else
+# differs from prod-launch. The system suite runs against it: make system-launch, make migrate, then
+# make test-system.
+#
+# PROD_COMPOSE never loads the fake-mode overlay, just as it never loads the dev override: the prod
+# image holds no fakes, and the only way a fake reaches a running service is this file list (or the
+# agent stack's, AGENT_STACK_COMPOSE).
+SYSTEM_COMPOSE := docker compose -f docker-compose.yaml -f docker-compose.fake.yaml
+
+# Behind the SAME disposable-database guard as test-system: this runs in the default compose project,
+# the one prod-launch uses, so on a host that runs the production deployment it would recreate that
+# stack's data_ingest as the fake, and fake bars would reach its database. The same --wait as PROD_UP
+# (spelled out rather than shared, so PROD_UP stays as it is). No build: like prod-launch it starts the
+# images prod-build made, so build first after a change. No $(VENV_MARKER), for the reason test-system
+# has none. No stop target of its own: every service here is in docker-compose.yaml, so `make
+# prod-down` (or dev-down) stops and removes this stack cleanly.
+.PHONY: system-launch
+system-launch:  ## Start the stack from the prod images with data_ingest on the fake broker, waiting for healthy (SYSTEM_TEST_DISPOSABLE_DB=1)
+	$(SYSTEM_TEST_DISPOSABLE_GUARD)
+	$(SYSTEM_COMPOSE) up -d --wait --wait-timeout 300

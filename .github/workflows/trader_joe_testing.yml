@@ -241,19 +241,26 @@ jobs:
         # account can ever be initialised from them.
         #
         # The agent-stack set, spelled exactly as the Makefile's AGENT_STACK_COMPOSE: project
-        # trader_joe_agent_stack, then base, test-client and the agent-stack overlay LAST (ADR
-        # tj-4rr0la addendum 3). The overlay reads seven variables through ":?" guards with no
-        # default -- DATABASE_NAME, BROKER_NAME, STORE_API_NETWORK, DATA_DIR and the three
-        # *_ENV_FILE paths -- which the MCP server's generated env file supplies at run time, so
-        # this line sets throwaway placeholders for all seven, safe for the same reason as
-        # PGADMIN_*: `config` creates no container, network, volume or directory. The names
-        # differ from the user's defaults (db, kafka, trader_joe_store_api) so the render shows
-        # the overlay's names are the ones that win. The three *_ENV_FILE placeholders are NOT
-        # arbitrary: `config` refuses an env_file that does not exist, so they name the root,
-        # data/store and data/ingest env files Build Images already staged above, as absolute
-        # paths the way the generated env file spells them (the step runs at the checkout
-        # root, so ${PWD} is it). Naming a path is not reading the file. Whoever
-        # changes AGENT_STACK_COMPOSE (the fake-mode overlay, tj-vhboky.61) updates this line.
+        # trader_joe_agent_stack, then base, test-client, the agent-stack overlay and the
+        # fake-mode overlay LAST (ADR tj-4rr0la addendum 3 (3); decision tj-j4wknb R4). The
+        # agent-stack overlay reads seven variables through ":?" guards with no default --
+        # DATABASE_NAME, BROKER_NAME, STORE_API_NETWORK, DATA_DIR and the three *_ENV_FILE
+        # paths -- which the MCP server's generated env file supplies at run time, so this line
+        # sets throwaway placeholders for all seven, safe for the same reason as PGADMIN_*:
+        # `config` creates no container, network, volume or directory. The names differ from the
+        # user's defaults (db, kafka, trader_joe_store_api) only so a placeholder can never be
+        # taken for a real resource. With --quiet this line proves that the set interpolates and
+        # merges, and nothing more; which names the merged agent-stack model carries is pinned
+        # in-process by the build_infra tests (tj-c4mosr.5). The three *_ENV_FILE placeholders
+        # are NOT arbitrary: `config` refuses an env_file that does not exist, so they name the
+        # root, data/store and data/ingest env files Build Images already staged above, as
+        # absolute paths the way the generated env file spells them (the step runs at the
+        # checkout root, so ${PWD} is it). Naming a path is not reading the file. Whoever
+        # changes AGENT_STACK_COMPOSE updates this line.
+        #
+        # The fake-mode system set, spelled as the Makefile's SYSTEM_COMPOSE (what make
+        # system-launch starts; tj-vhboky.61): the default project, base then the fake-mode
+        # overlay. The overlay adds no variable, so it needs no env beyond the base file's.
         #
         # The agent-stack MCP's own project (docker-compose.agent-mcp.yaml; ADR tj-4rr0la addendum
         # 11 R5), spelled as the Makefile's AGENT_MCP_COMPOSE: project trader_joe_agent_mcp and an
@@ -274,8 +281,10 @@ jobs:
           ROOT_ENV_FILE="${PWD}/.env" STORE_ENV_FILE="${PWD}/data/store/.env" \
           INGEST_ENV_FILE="${PWD}/data/ingest/.env" \
           docker compose -p trader_joe_agent_stack -f docker-compose.yaml \
-          -f docker-compose.test-client.yaml -f docker-compose.agent-stack.yaml config --quiet
-        echo "Compose renders: prod, dev, tools, client, agent-stack and agent-mcp sets all interpolate and merge."
+          -f docker-compose.test-client.yaml -f docker-compose.agent-stack.yaml \
+          -f docker-compose.fake.yaml config --quiet
+        docker compose -f docker-compose.yaml -f docker-compose.fake.yaml config --quiet
+        echo "Compose renders: prod, dev, tools, client, agent-stack, agent-mcp and fake-mode system sets all interpolate and merge."
 
     - name: Push Image - Data Store
       id: push_store

@@ -3003,6 +3003,9 @@ RENDERED_COMPOSE_VARIABLES = (
     TEST_CLIENT_COMPOSE_VARIABLE,
     'AGENT_STACK_COMPOSE',
     'AGENT_MCP_COMPOSE',
+    # The fake-mode stack make system-launch starts (tj-vhboky.61), default project. Its render line,
+    # and the fake overlay as the agent-stack line's fourth file, landed with tj-irhy0a.24.
+    'SYSTEM_COMPOSE',
 )
 TEARDOWN_CONDITIONS = frozenset({'failure()', 'always()'})
 # The staged project env file the job writes and reads back. Named through the template's stem so
@@ -3516,6 +3519,22 @@ def test_image_build_renders_every_compose_set_quietly():
     assert sorted(rendered, key=str) == sorted(expected, key=str), (
         f'{RENDER_STEP} renders {rendered}, expected the Makefile sets {dict(zip(RENDERED_COMPOSE_VARIABLES, expected, strict=True))}'
     )
+
+
+@pytest.mark.build_infra
+def test_every_compose_render_failure_fails_the_step():
+    """tj-irhy0a.24: a render that fails, fails Check Compose Renders, whichever line it is.
+
+    The pin above keeps the step unconditional and without continue-on-error, which says nothing
+    about the lines inside it: one `|| true` or `set +e` lets a broken compose set through as a
+    green step, and without errexit only the closing echo's status would be the step's.
+    """
+    lines = _step_lines(next(step for step in _image_build_job().get('steps') or [] if step.get('name') == RENDER_STEP))
+    first_render = next(index for index, line in enumerate(lines) if _compose_calls(line))
+    errexit = [line for line in lines[:first_render] if re.match(r'^set\s+-\w*e', line)]
+    assert errexit, f'{RENDER_STEP} does not set errexit before its first render'
+    swallowed = [line for line in lines if _SWALLOWED_STATUS.search(line)]
+    assert not swallowed, f'{RENDER_STEP} swallows a failure: {swallowed}'
 
 
 @pytest.mark.build_infra

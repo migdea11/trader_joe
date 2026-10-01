@@ -33,6 +33,7 @@ BASE_FILE = REPO_ROOT / 'docker-compose.yaml'
 TEST_CLIENT_FILE = REPO_ROOT / 'docker-compose.test-client.yaml'
 AGENT_STACK_FILE = REPO_ROOT / 'docker-compose.agent-stack.yaml'
 AGENT_MCP_FILE = REPO_ROOT / 'docker-compose.agent-mcp.yaml'
+FAKE_FILE = REPO_ROOT / 'docker-compose.fake.yaml'
 DEVCONTAINER_COMPOSE = REPO_ROOT / '.devcontainer' / 'compose.yml'
 DEVCONTAINER_JSON = REPO_ROOT / '.devcontainer' / 'devcontainer.json'
 
@@ -279,8 +280,18 @@ def client_model() -> dict:
 
 
 def agent_stack_model() -> dict:
-    """The merged agent-stack model, in AGENT_STACK_COMPOSE's order: base, test client, overlay LAST."""
-    return merge([load(BASE_FILE), load(TEST_CLIENT_FILE), load(AGENT_STACK_FILE)])
+    """The merged agent-stack model, in AGENT_STACK_COMPOSE's order.
+
+    Base, test client, the agent-stack overlay, then the fake-mode overlay LAST (ADR tj-4rr0la
+    addendum 3 (3); tj-vhboky.61) -- so every property pinned on this model holds for the stack the
+    MCP really starts, fake data_ingest included.
+    """
+    return merge([load(BASE_FILE), load(TEST_CLIENT_FILE), load(AGENT_STACK_FILE), load(FAKE_FILE)])
+
+
+def system_model() -> dict:
+    """The merged fake-mode stack make system-launch starts: SYSTEM_COMPOSE, base then the fake overlay."""
+    return merge([load(BASE_FILE), load(FAKE_FILE)])
 
 
 def service_networks(service: dict) -> list[str]:
