@@ -100,8 +100,9 @@ agent-mcp = [
     # Not imported here: a floor on mcp's own dependency, the starlette pattern in base. mcp
     # declares pyjwt with no bound that excludes 2.13.0, and pip-audit reports ten advisories
     # against 2.13.0, all fixed in 2.14.0 (CVE-2026-101917, CVE-2026-102265 to -102269, -102271
-    # to -102274). Without the floor a re-lock is free to pick it straight back.
-    "pyjwt>=2.14.0",
+    # to -102274), and one more against 2.14.0, fixed in 2.15.0 (CVE-2026-101918). Without the
+    # floor a re-lock is free to pick either straight back.
+    "pyjwt>=2.15.0",
 ]
 security = [
     "bandit>=1.8.6",

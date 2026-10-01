@@ -116,7 +116,7 @@ def test_the_venv_ci_test_installs_are_one_group_set_without_security_or_agent_m
 
 
 def test_the_audit_export_keeps_agent_mcp_and_drops_security_in_ci_and_make():
-    """01:37 / ADR s6: pip-audit in make security covers the agent-mcp group (mcp, pyjwt>=2.14)."""
+    """01:37 / ADR s6: pip-audit in make security covers the agent-mcp group (mcp, pyjwt>=2.15, CVE-2026-101918)."""
     ci = _one_uv(_step('Security Checks', 'Generate Requirements'))
     make = _one_uv([line for line in _make_recipe('security') if line.startswith('uv export')])
     assert ci == make, (ci, make)
@@ -139,7 +139,12 @@ def test_init_and_default_groups_leave_agent_mcp_out():
 
 
 def test_agent_mcp_and_security_resolve_apart_and_pyjwt_has_its_floor():
-    """(12), D7: the [tool.uv] conflict, and pyjwt>=2.14.0 in agent-mcp."""
+    """(12), D7: the [tool.uv] conflict, and pyjwt>=2.15.0 in agent-mcp.
+
+    The floor excludes every 2.14.x (CVE-2026-101918, fixed in 2.15.0; tj-0pobey.5) and with it
+    every 2.13.x (the ten advisories fixed in 2.14.0). The agent-mcp group's locked pyjwt must
+    meet that floor; the security group's fork, resolved apart, is semgrep's to cap.
+    """
     conflicts = _pyproject()['tool']['uv']['conflicts']
     assert [{'group': GROUP}, {'group': 'security'}] in conflicts or [
         {'group': 'security'},
@@ -148,7 +153,16 @@ def test_agent_mcp_and_security_resolve_apart_and_pyjwt_has_its_floor():
     requirements = [Requirement(item) for item in _pyproject()['dependency-groups'][GROUP] if isinstance(item, str)]
     pyjwt = [requirement for requirement in requirements if requirement.name.lower() == 'pyjwt']
     assert len(pyjwt) == 1, requirements
-    assert not pyjwt[0].specifier.contains(Version('2.13.9')) and pyjwt[0].specifier.contains(Version('2.14.0')), pyjwt
+    specifier = pyjwt[0].specifier
+    vulnerable = [
+        version for version in ('2.13.0', '2.13.9', '2.14.0', '2.14.9') if specifier.contains(Version(version))
+    ]
+    assert not vulnerable, f'{pyjwt[0]} admits vulnerable pyjwt {vulnerable}'
+    assert specifier.contains(Version('2.15.0')), pyjwt
+    lock = tomllib.loads((REPO_ROOT / 'uv.lock').read_text(encoding='utf-8'))
+    project = next(package for package in lock['package'] if package['name'] == 'trader-joe')
+    locked = [dep['version'] for dep in project['dev-dependencies'][GROUP] if dep['name'] == 'pyjwt']
+    assert len(locked) == 1 and specifier.contains(Version(locked[0])), (locked, str(specifier))
 
 
 def test_no_stage_of_the_service_dockerfile_installs_agent_mcp():
