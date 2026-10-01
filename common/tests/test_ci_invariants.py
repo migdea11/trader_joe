@@ -4271,8 +4271,29 @@ def test_only_container_jobs_that_run_the_suite_are_judged(tmp_path: Path, monke
 # Every host bind-mount data directory compose declares must stay out of the Docker build context.
 # The Postgres directory is mode 0700 and owned by the container's uid, so a build started while a
 # stack is up -- make test-system's --build in CI, after Start System -- fails sending the context
-# with "permission denied". The other half: nothing the Dockerfile COPYs may be excluded, or the
-# image builds without its source and fails only at runtime.
+# with "permission denied". The other half: what the images run must be sent, or an image builds
+# without its source and fails only at runtime.
+#
+# That half is checked twice. (1) Nothing under a Dockerfile COPY source may be excluded, with one
+# named exception: a file whose path RELATIVE TO THAT SOURCE has a directory segment exactly `tests`
+# (common/tests/..., routers/tests/interface_manifest/...). No image reads a tests/ directory --
+# tests run on the host venv, and the dev image and test_client bind-mount the source -- so keeping
+# them out of the prod image (tj-v82dvm) is allowed. The COPY source itself, a non-test file,
+# `tests_util/`, `testsuite/` and `tests.py` stay offenders. tj-ijpys9.17 first pinned "every
+# tracked file under a COPY source is sent", which was a proxy for the purpose and stricter than it.
+# (2) The purpose, directly: every module each service app imports, transitively (TYPE_CHECKING and
+# function-level imports included), and each package __init__.py on its path, is sent. The apps are
+# the COPY sources the Dockerfile builds from build args, so a new service is covered by the parse.
+# (2) is what catches a production import of a tests/ module that (1) now lets be excluded.
+# (3) The reverse of (1), so the exception is used and stays used: every `tests` directory under a
+# COPY source that holds a git-tracked file IS excluded, file by file (tj-v82dvm). The directories
+# are derived from the COPY parse and git, so a new suite under a copied package is covered.
+# (4) Sent is not copied: every file of each app's closure lies under a static COPY source (one no
+# build arg names) or the app's own source -- never another service's app or an uncopied package
+# (tj-bhzf6b). An ancestor package __init__.py of those sources (data/__init__.py) is not copied
+# and imports as a namespace package in the image; it is allowed only while it has no statement
+# beyond a module docstring (tj-zcd9ar), since the host runs its code and the image does not. It is
+# walked like every package __init__.py on a reached file's path, so what it imports must be copied too.
 #
 # The data directories are derived from the compose YAML, not listed: a mount is data when its host
 # side starts with ${DATA_DIR...}, or with the literal fallback such an interpolation names. Each
@@ -4294,6 +4315,14 @@ DATA_DIR_SAMPLE_FILE = 'PG_VERSION'
 # What the Dockerfile COPYs today. A floor for the parse below, so a parser regression that finds
 # nothing cannot pass the "no COPY source is excluded" check vacuously.
 KNOWN_COPY_SOURCES = frozenset({'common', 'routers', 'schemas', 'data/store/app', 'data/ingest/app'})
+# The one directory name under a COPY source that .dockerignore may exclude (tj-v82dvm).
+EXCLUDABLE_TEST_DIR = 'tests'
+# Non-vacuity for the reverse pin: the test directories under a COPY source when it was written.
+KNOWN_COPY_SOURCE_TEST_DIRS = frozenset({'common/tests', 'routers/tests', 'schemas/tests'})
+# Non-vacuity for the import closure: a module each service app is known to import, and a floor on
+# how many module files its closure reaches (61 for ingest and 74 for store when this was written).
+KNOWN_APP_IMPORTS = {'data/ingest/app': 'routers/common/ping.py', 'data/store/app': 'routers/common/ping.py'}
+APP_CLOSURE_FLOOR = 40
 
 # ${DATA_DIR}, ${DATA_DIR:-default}, ${DATA_DIR-default} or $DATA_DIR, then the rest of the path.
 _DATA_DIR_INTERPOLATION = re.compile(
@@ -4485,8 +4514,8 @@ def _compose_build_args() -> list[dict[str, str]]:
     ]
 
 
-def _dockerfile_copy_sources() -> set[str]:
-    """Every context path a COPY or ADD in the Dockerfile reads, build args expanded from compose.
+def _dockerfile_copy_sources_by_origin() -> set[tuple[str, bool]]:
+    """(context path, named a build arg?) for every source a COPY or ADD in the Dockerfile reads.
 
     A COPY --from reads another stage or image, not the context, and is skipped. A source naming a
     build arg is expanded once per compose service's args, and dropped when no service's args
@@ -4506,17 +4535,41 @@ def _dockerfile_copy_sources() -> set[str]:
     sources = set()
     for source in raw:
         if '$' not in source:
-            sources.add(posixpath.normpath(source))
+            sources.add((posixpath.normpath(source), False))
             continue
         for args in _compose_build_args():
             expanded = re.sub(r'\$\{(\w+)\}|\$(\w+)', lambda m, a=args: a.get(m[1] or m[2], m[0]), source)
             if '$' not in expanded:
-                sources.add(posixpath.normpath(expanded))
+                sources.add((posixpath.normpath(expanded), True))
     return sources
 
 
+def _dockerfile_copy_sources() -> set[str]:
+    """Every context path a COPY or ADD in the Dockerfile reads, build args expanded from compose."""
+    return {source for source, _ in _dockerfile_copy_sources_by_origin()}
+
+
+def _dockerfile_service_apps() -> set[str]:
+    """The service apps: the COPY sources the Dockerfile names through build args, one per service."""
+    return {source for source, from_args in _dockerfile_copy_sources_by_origin() if from_args}
+
+
+def _under_excludable_test_dir(path: str, source: str) -> bool:
+    """Does `path`, relative to COPY source `source`, have a directory segment exactly `tests`?
+
+    Only the directories between the source and the file count: the file name is not a directory
+    (so `tests.py` is not one), and a `tests` segment inside the source itself is not relative to it.
+    """
+    relative = PurePosixPath(path).relative_to(source)
+    return EXCLUDABLE_TEST_DIR in relative.parts[:-1]
+
+
 def _copy_sources_excluded(rules: _IgnoreRules) -> list[str]:
-    """Name every COPY source, or git-tracked file under one, that the build context would leave out."""
+    """Name every COPY source, or git-tracked file under one, that the build context would leave out.
+
+    A tracked file under a `tests` directory of its COPY source may be left out (tj-v82dvm); whether
+    anything the apps import is left out is the import closure's question, not this one's.
+    """
     offenders = []
     for source in sorted(_dockerfile_copy_sources()):
         if _is_excluded_from_context(source, rules):
@@ -4524,9 +4577,163 @@ def _copy_sources_excluded(rules: _IgnoreRules) -> list[str]:
         offenders.extend(
             f'{tracked} (under COPY source {source})'
             for tracked in _run('git', 'ls-files', '--', source)
-            if _is_excluded_from_context(tracked, rules)
+            if _is_excluded_from_context(tracked, rules) and not _under_excludable_test_dir(tracked, source)
         )
     return offenders
+
+
+def _copy_source_test_dirs() -> dict[str, list[str]]:
+    """Every `tests` directory under a COPY source that holds a git-tracked file, with those files.
+
+    The same rule _under_excludable_test_dir applies: only directories between the source and the
+    file count. A nested tests/.../tests/ yields both directories.
+    """
+    test_dirs: dict[str, list[str]] = {}
+    for source in sorted(_dockerfile_copy_sources()):
+        for tracked in _run('git', 'ls-files', '--', source):
+            parts = PurePosixPath(tracked).relative_to(source).parts[:-1]
+            for depth, part in enumerate(parts):
+                if part == EXCLUDABLE_TEST_DIR:
+                    directory = PurePosixPath(source, *parts[: depth + 1]).as_posix()
+                    test_dirs.setdefault(directory, []).append(tracked)
+    return test_dirs
+
+
+def _copy_source_test_dirs_sent(rules: _IgnoreRules, test_dirs: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Per `tests` directory, the tracked files under it the build context would still send."""
+    sent = {
+        directory: sorted(tracked for tracked in files if not _is_excluded_from_context(tracked, rules))
+        for directory, files in test_dirs.items()
+    }
+    return {directory: files for directory, files in sorted(sent.items()) if files}
+
+
+def _first_party_module_file(module: str) -> Path | None:
+    """The repo source file a dotted module name resolves to, or None when it is not first-party."""
+    base = REPO_ROOT.joinpath(*module.split('.'))
+    for candidate in (base.with_suffix('.py'), base / '__init__.py'):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _imported_module_names(path: Path) -> list[str]:
+    """Every module a source file imports, anywhere in it, relative imports resolved to absolute names.
+
+    ast.walk reaches every node, so an import under `if TYPE_CHECKING:`, inside a function or behind
+    a flag is found like a top-level one. `from x import y` yields both x and x.y, because y may be a
+    submodule rather than a name defined in x.
+    """
+    tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+    package = list(path.relative_to(REPO_ROOT).parent.parts)
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                base = package[: len(package) - (node.level - 1)]
+                module = '.'.join([*base, *([node.module] if node.module else [])])
+            else:
+                module = node.module or ''
+            found.append(module)
+            found.extend(f'{module}.{alias.name}' for alias in node.names)
+    return found
+
+
+def _package_inits(path: Path) -> set[Path]:
+    """Each package __init__.py between the repo root and `path`, where one exists."""
+    relative = path.relative_to(REPO_ROOT)
+    return {
+        init
+        for depth in range(1, len(relative.parts))
+        if (init := REPO_ROOT.joinpath(*relative.parts[:depth], '__init__.py')).is_file()
+    }
+
+
+def _app_import_closure(app: str) -> set[Path]:
+    """Every first-party file a service app loads: its own modules, what they import, transitively.
+
+    Test packages are followed like any other: the point is to find a production import of one.
+    Each package __init__.py on a reached file's path runs when that file is imported, so it is
+    walked like any other reached file, not merely added: what it imports is loaded too.
+    """
+    pending = sorted((REPO_ROOT / app).rglob('*.py'))
+    reached: set[Path] = set()
+    while pending:
+        path = pending.pop()
+        if path in reached:
+            continue
+        reached.add(path)
+        pending.extend(_package_inits(path))
+        for module in _imported_module_names(path):
+            target = _first_party_module_file(module)
+            if target is not None:
+                pending.append(target)
+    return reached
+
+
+def _is_under(path: str, source: str) -> bool:
+    """Is context path `path` the COPY source `source` itself, or inside it?"""
+    return path == source or path.startswith(f'{source}/')
+
+
+def _dockerfile_static_copy_sources() -> set[str]:
+    """The COPY sources every service image shares: those the Dockerfile names without a build arg."""
+    return {source for source, from_args in _dockerfile_copy_sources_by_origin() if not from_args}
+
+
+_UNCOPIED_INIT_WITH_CODE = (
+    'an uncopied ancestor package __init__.py with statements: the host runs them, the image never '
+    'does. COPY it, or move its code into a copied module'
+)
+
+
+def _has_statements(path: Path) -> bool:
+    """Does the module do anything on import? A lone module docstring, comments and blank lines do not."""
+    body = ast.parse(path.read_text(encoding='utf-8'), filename=str(path)).body
+    first = body[0] if body else None
+    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
+        body = body[1:]
+    return bool(body)
+
+
+def _app_imports_outside_image(app: str, static_sources: set[str]) -> list[str]:
+    """Every file of `app`'s import closure that its own image does not COPY.
+
+    The image holds the shared static sources and this app's own source -- never another service's
+    app. One carve-out: a package __init__.py whose directory is a strict ancestor of one of those
+    sources (data/__init__.py above data/store/app) is not copied, and Python imports that package
+    as a namespace package inside the image. That is equivalent to the host only while the file does
+    nothing, so the carve-out holds only for one that is empty or a lone docstring; one with any
+    statement is named, annotated with why. The closure walks such an __init__.py either way, so
+    anything it imports must itself be copied.
+    """
+    own = static_sources | {app}
+    ancestors = {parent.as_posix() for source in own for parent in PurePosixPath(source).parents} - {'.'}
+    offenders = []
+    for path in _app_import_closure(app):
+        relative = path.relative_to(REPO_ROOT).as_posix()
+        if any(_is_under(relative, source) for source in own):
+            continue
+        if path.name == '__init__.py' and PurePosixPath(relative).parent.as_posix() in ancestors:
+            if _has_statements(path):
+                offenders.append(f'{relative} ({_UNCOPIED_INIT_WITH_CODE})')
+            continue
+        offenders.append(relative)
+    return sorted(offenders)
+
+
+def _app_imports_excluded(rules: _IgnoreRules) -> dict[str, list[str]]:
+    """Per service app, every file of its import closure the build context would leave out."""
+    return {
+        app: sorted(
+            relative
+            for path in _app_import_closure(app)
+            if _is_excluded_from_context(relative := path.relative_to(REPO_ROOT).as_posix(), rules)
+        )
+        for app in sorted(_dockerfile_service_apps())
+    }
 
 
 # Docker's own semantics, pinned so the matcher the checks below rely on cannot drift into something
@@ -4605,7 +4812,237 @@ def test_dockerignore_excludes_no_dockerfile_copy_source():
     missing = sorted(source for source in sources if not (REPO_ROOT / source).exists())
     assert not missing, f'COPY sources that do not exist in the checkout: {missing}'
     offenders = _copy_sources_excluded(_committed_dockerignore_rules())
-    assert not offenders, f'{DOCKERIGNORE_FILE.name} keeps what the image COPYs out of the build context: {offenders}'
+    assert not offenders, (
+        f'{DOCKERIGNORE_FILE.name} keeps what the image COPYs out of the build context: {offenders}. '
+        f'Only files under a {EXCLUDABLE_TEST_DIR}/ directory of a COPY source may be excluded.'
+    )
+
+
+# The one exception the COPY-source check allows, pinned at its edges. Each row: (COPY source,
+# tracked path, may be excluded?). A near-miss name is the failure worth pinning: a pattern that
+# excludes `tests_util/` or `testsuite/` would take production code with it.
+_EXCLUDABLE_TEST_DIR_CASES = {
+    'tests-dir-under-source': ('common', 'common/tests/x.py', True),
+    'nested-tests-dir-deep-file': ('routers', 'routers/tests/interface_manifest/data_store.manifest', True),
+    'tests-dir-in-a-subpackage': ('common', 'common/kafka/tests/x.py', True),
+    'tests-prefix-dir-is-not-tests': ('common', 'common/tests_util/x.py', False),
+    'tests-suffix-dir-is-not-tests': ('common', 'common/testsuite/x.py', False),
+    'tests-module-is-not-a-dir': ('common', 'common/tests.py', False),
+    'production-file': ('common', 'common/database/sql_alchemy_table.py', False),
+    'file-source-itself': ('pyproject.toml', 'pyproject.toml', False),
+    'tests-segment-inside-the-source-does-not-count': ('common/tests', 'common/tests/x.py', False),
+}
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    ('source', 'path', 'excludable'), list(_EXCLUDABLE_TEST_DIR_CASES.values()), ids=list(_EXCLUDABLE_TEST_DIR_CASES)
+)
+def test_only_a_tests_dir_under_a_copy_source_may_be_excluded(source: str, path: str, excludable: bool):
+    assert _under_excludable_test_dir(path, source) is excludable
+
+
+@pytest.mark.build_infra
+def test_the_copy_source_check_allows_a_tests_dir_and_nothing_else():
+    """The exception, through the check itself: a tests/ rule passes, a production directory does not.
+
+    Judged against these rules alone, not the committed file, so this pins the check, not the file.
+    """
+    assert not _copy_sources_excluded(_dockerignore_rules('common/tests/'))
+    offenders = _copy_sources_excluded(_dockerignore_rules('common/database/'))
+    assert offenders, 'excluding common/database/ went unnoticed'
+    assert all(offender.startswith('common/database/') for offender in offenders), offenders
+
+
+@pytest.mark.build_infra
+def test_the_service_apps_are_derived_from_the_dockerfile_and_their_closures_are_real():
+    """Non-vacuity for the import-closure check: it finds both apps, and each closure leaves its app."""
+    apps = _dockerfile_service_apps()
+    assert apps >= set(KNOWN_APP_IMPORTS), f'the COPY parse found service apps {sorted(apps)}'
+    for app, known in KNOWN_APP_IMPORTS.items():
+        closure = {path.relative_to(REPO_ROOT).as_posix() for path in _app_import_closure(app)}
+        assert known in closure, f'the import closure of {app} does not reach {known}'
+        assert len(closure) >= APP_CLOSURE_FLOOR, f'the import closure of {app} reached only {len(closure)} files'
+
+
+@pytest.mark.build_infra
+def test_the_import_closure_follows_guarded_and_deferred_imports(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The walk reads imports a runtime check would miss, wherever they sit.
+
+    Under TYPE_CHECKING, inside a function, and in a package __init__.py that runs only because a
+    module under it is imported.
+    """
+    (tmp_path / 'app').mkdir()
+    (tmp_path / 'lib').mkdir()
+    (tmp_path / 'pkg').mkdir()
+    (tmp_path / 'lib' / '__init__.py').write_text('', encoding='utf-8')
+    for name in ('guarded', 'lazy', 'relative'):
+        (tmp_path / 'lib' / f'{name}.py').write_text('', encoding='utf-8')
+    (tmp_path / 'lib' / 'entry.py').write_text('from . import relative\n', encoding='utf-8')
+    # Nothing imports pkg.hidden but pkg/__init__.py, which the app never names.
+    (tmp_path / 'pkg' / '__init__.py').write_text('from . import hidden\n', encoding='utf-8')
+    (tmp_path / 'pkg' / 'hidden.py').write_text('', encoding='utf-8')
+    (tmp_path / 'pkg' / 'used.py').write_text('', encoding='utf-8')
+    (tmp_path / 'app' / 'main.py').write_text(
+        'from typing import TYPE_CHECKING\n'
+        'import lib.entry\n'
+        'import pkg.used\n'
+        'if TYPE_CHECKING:\n'
+        '    from lib import guarded\n'
+        'def later():\n'
+        '    import lib.lazy\n',
+        encoding='utf-8',
+    )
+    monkeypatch.setattr(sys.modules[__name__], 'REPO_ROOT', tmp_path)
+    closure = {path.relative_to(tmp_path).as_posix() for path in _app_import_closure('app')}
+    assert closure == {
+        'app/main.py',
+        'lib/__init__.py',
+        'lib/entry.py',
+        'lib/guarded.py',
+        'lib/lazy.py',
+        'lib/relative.py',
+        'pkg/__init__.py',
+        'pkg/hidden.py',
+        'pkg/used.py',
+    }
+
+
+@pytest.mark.build_infra
+def test_the_copy_coverage_check_names_what_the_image_does_not_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Only the shared sources and the app's own source are in its image, never another service's app.
+
+    Synthetic tree: two service apps under svc/, one shared source. An ancestor package __init__.py
+    of the app's own source is allowed (a namespace package in the image) while it is empty or a
+    lone docstring (svc/__init__.py); one with a statement (svc/a/__init__.py) is named, and still
+    walked, so the stray it imports is named too. A copied __init__.py may do anything.
+    """
+    files = {
+        'shared/__init__.py': 'X = 1\n',
+        'shared/util.py': '',
+        'svc/__init__.py': '"""Services."""\n# a comment is not a statement\n',
+        'svc/a/__init__.py': 'import stray_from_init\n',
+        'svc/a/app/__init__.py': '',
+        'svc/a/app/main.py': 'import shared.util\nimport stray\nfrom svc.b.app import api\n',
+        'svc/b/__init__.py': '',
+        'svc/b/app/__init__.py': '',
+        'svc/b/app/api.py': 'from shared import util\n',
+        'stray.py': '',
+        'stray_from_init.py': '',
+    }
+    for relative, text in files.items():
+        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / relative).write_text(text, encoding='utf-8')
+    monkeypatch.setattr(sys.modules[__name__], 'REPO_ROOT', tmp_path)
+    assert _app_imports_outside_image('svc/a/app', {'shared'}) == [
+        'stray.py',
+        'stray_from_init.py',
+        f'svc/a/__init__.py ({_UNCOPIED_INIT_WITH_CODE})',
+        'svc/b/__init__.py',
+        'svc/b/app/__init__.py',
+        'svc/b/app/api.py',
+    ]
+    assert _app_imports_outside_image('svc/b/app', {'shared'}) == []
+
+
+# An uncopied ancestor package __init__.py, by content. Each row: (its text, allowed?). Allowed
+# means the image, importing the package as a namespace package, behaves as the host does.
+_ANCESTOR_INIT_CASES = {
+    'empty': ('', True),
+    'comments-and-blank-lines': ('# nothing here\n\n', True),
+    'docstring-only': ('"""The package."""\n', True),
+    'docstring-and-comment': ('"""The package."""\n# trailing comment\n', True),
+    'assignment': ('X = 1\n', False),
+    'docstring-then-assignment': ('"""The package."""\nX = 1\n', False),
+    'third-party-import': ('import os\n', False),
+    'a-second-string-is-a-statement': ('"""The package."""\n"""Not a docstring."""\n', False),
+    'a-leading-non-string-constant': ('1\n', False),
+}
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(('text', 'allowed'), list(_ANCESTOR_INIT_CASES.values()), ids=list(_ANCESTOR_INIT_CASES))
+def test_an_uncopied_ancestor_init_is_allowed_only_without_statements(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, text: str, allowed: bool
+):
+    """The carve-out, through the check itself: a namespace package in the image runs none of this."""
+    files = {
+        'shared/__init__.py': '',
+        'svc/__init__.py': text,
+        'svc/a/app/__init__.py': '',
+        'svc/a/app/main.py': 'import shared\n',
+    }
+    for relative, content in files.items():
+        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / relative).write_text(content, encoding='utf-8')
+    monkeypatch.setattr(sys.modules[__name__], 'REPO_ROOT', tmp_path)
+    expected = [] if allowed else [f'svc/__init__.py ({_UNCOPIED_INIT_WITH_CODE})']
+    assert _app_imports_outside_image('svc/a/app', {'shared'}) == expected
+
+
+@pytest.mark.build_infra
+def test_each_service_app_imports_only_what_its_image_copies():
+    """The other half of the build-context purpose: what each app loads is COPYed into its image.
+
+    Sent (the .dockerignore check) is not enough: a file the Dockerfile never COPYs -- another
+    service's app, a new top-level package -- is in the context and still missing at import.
+    """
+    static_sources = _dockerfile_static_copy_sources()
+    apps = _dockerfile_service_apps()
+    assert static_sources >= KNOWN_COPY_SOURCES - apps, f'the COPY parse found static sources {sorted(static_sources)}'
+    assert apps >= set(KNOWN_APP_IMPORTS), f'the COPY parse found service apps {sorted(apps)}'
+    assert not static_sources & apps, f'a service app is also a static COPY source: {sorted(static_sources & apps)}'
+    outside = {app: files for app in sorted(apps) if (files := _app_imports_outside_image(app, static_sources))}
+    assert not outside, (
+        f'service apps import files their image does not COPY (only {sorted(static_sources)} and the '
+        f"app's own source are copied), so the image builds and fails at import: {outside}"
+    )
+
+
+@pytest.mark.build_infra
+def test_dockerignore_sends_every_module_the_service_apps_import():
+    """The purpose behind the COPY-source check: what each app loads is in the build context."""
+    excluded = {app: files for app, files in _app_imports_excluded(_committed_dockerignore_rules()).items() if files}
+    assert not excluded, (
+        f'{DOCKERIGNORE_FILE.name} keeps modules the service apps import out of the build context, so the '
+        f'image builds and fails at import: {excluded}'
+    )
+
+
+@pytest.mark.build_infra
+def test_the_test_dirs_under_the_copy_sources_are_derived_and_real():
+    """Non-vacuity for the reverse pin: the derivation finds at least the known test directories."""
+    found = set(_copy_source_test_dirs())
+    assert found >= KNOWN_COPY_SOURCE_TEST_DIRS, (
+        f'the COPY parse and git ls-files found test directories {sorted(found)}; '
+        f'expected at least {sorted(KNOWN_COPY_SOURCE_TEST_DIRS)}'
+    )
+
+
+@pytest.mark.build_infra
+def test_dockerignore_excludes_every_tests_dir_under_a_copy_source():
+    """The reverse of the COPY-source check: no test suite under a copied package ships in an image."""
+    sent = _copy_source_test_dirs_sent(_committed_dockerignore_rules(), _copy_source_test_dirs())
+    assert not sent, (
+        f'{DOCKERIGNORE_FILE.name} sends test directories under a Dockerfile COPY source into every '
+        f'service image: {sorted(sent)} ({sent}). Add each as `<dir>/` to {DOCKERIGNORE_FILE.name} (tj-v82dvm).'
+    )
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize('dropped', sorted(KNOWN_COPY_SOURCE_TEST_DIRS))
+def test_the_test_dir_check_names_the_one_dir_left_in(dropped: str):
+    """The check against rules built here: leave one directory in, or re-include a file, and it is named.
+
+    Every found directory excluded is clean; dropping one names exactly that directory; re-including
+    one tracked file under it names exactly that file.
+    """
+    test_dirs = _copy_source_test_dirs()
+    assert not _copy_source_test_dirs_sent(_dockerignore_rules('\n'.join(f'{d}/' for d in test_dirs)), test_dirs)
+    left_in = _dockerignore_rules('\n'.join(f'{d}/' for d in test_dirs if d != dropped))
+    assert set(_copy_source_test_dirs_sent(left_in, test_dirs)) == {dropped}
+    re_included = _dockerignore_rules('\n'.join([*(f'{d}/' for d in test_dirs), f'!{test_dirs[dropped][0]}']))
+    assert _copy_source_test_dirs_sent(re_included, test_dirs) == {dropped: [test_dirs[dropped][0]]}
 
 
 # ---------------------------------------------------------------------------------------
