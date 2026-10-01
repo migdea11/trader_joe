@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from common.tests import compose_model
 from common.tests.test_ci_invariants import (
     _dockerfile_copy_sources,
     _dockerignore_pattern_regex,
@@ -152,7 +153,10 @@ _EXPECTED_TAILS = {
     'stack_up': [
         *_INSPECTS,
         ['build', 'data_store', 'data_ingest', 'test_client'],
-        ['up', '-d', '--wait', '--wait-timeout', '300'],
+        # tj-zgq5v2: the infrastructure plain, then the snapshot-bound services force-recreated. Exact,
+        # not a prefix (below), so a flag or a service moved between the two is red.
+        ['up', '-d', '--wait', '--wait-timeout', '300', 'postgres', 'kafka'],
+        ['up', '-d', '--wait', '--wait-timeout', '300', '--force-recreate', '--no-deps', 'data_store', 'data_ingest'],
     ],
     'stack_down': [['down', '--remove-orphans']],
     'stack_wipe': [['down', '--remove-orphans'], ['run'], ['run']],
@@ -205,6 +209,9 @@ def test_every_verb_runs_exactly_its_fixed_tails(tmp_path: Path, monkeypatch: py
     if verb == 'seed_dump':
         # Exactly, not a prefix: with no date given, nothing follows the module name.
         assert tails[-2:] == expected[-2:], tails
+    if verb == 'stack_up':
+        # Exactly, not a prefix: the build names every built service and each up its whole service list.
+        assert tails[-3:] == expected[-3:], tails
 
 
 def test_every_verb_with_fixed_tails_is_covered():
@@ -502,6 +509,115 @@ def test_snapshot_sources_are_exactly_what_the_trusted_files_read_from_the_proje
         f'SNAPSHOT_SOURCES {sorted(stack.SNAPSHOT_SOURCES)} vs what the trusted files read {sorted(expected)}'
     )
     assert len(stack.SNAPSHOT_SOURCES) == len(set(stack.SNAPSHOT_SOURCES))
+
+
+# --- stack_up recreates what binds the snapshot (tj-zgq5v2) -------------------------------------
+#
+# refresh_snapshot swaps the snapshot by rename and removes the old generation, so a running
+# container's relative binds point at a removed directory; only a re-CREATION re-resolves them.
+# Design: the architect's ruling on tj-zgq5v2; ADR tj-4rr0la addendum 5 ruling 1 (the validator
+# mutates in place) and addenda 14-15 (the bases before the first building step).
+
+# The run-per-call service: it binds the snapshot too, but run_system_tests and seed_dump create it
+# fresh with `run --rm` after the refresh, so it is outside SERVICES and needs no recreate.
+_RUN_PER_CALL_SERVICES = {'test_client'}
+
+
+def _services_with_a_snapshot_bind() -> set[str]:
+    """The services of the MERGED agent-stack model (stack.COMPOSE_FILES, in order) with a relative bind.
+
+    Merged, not per file: volumes merge by container target, so a later file that replaces a relative
+    bind with a DATA_DIR one removes it, and one that adds it (the fake overlay's tests/fakes) adds it.
+    """
+    model = compose_model.merge([compose_model.load(REPO_ROOT / name) for name in stack.COMPOSE_FILES])
+    bound = set()
+    for service, spec in model['services'].items():
+        for entry in spec.get('volumes') or []:
+            mount = compose_model.volume(entry)
+            if mount['type'] == 'bind' and mount['source'].startswith('.'):
+                bound.add(service)
+    return bound
+
+
+def test_snapshot_bound_services_are_the_long_running_services_with_a_relative_bind():
+    """Ruling (1) and re-pin (b): SNAPSHOT_BOUND_SERVICES == the SERVICES binding the snapshot, parsed.
+
+    So a new relative bind into a long-running service without an entry goes red, and an entry that
+    binds nothing goes red too. Every other service with such a bind must be a run-per-call one.
+    """
+    bound = _services_with_a_snapshot_bind()
+    assert {'data_store', 'data_ingest'} <= bound, bound
+    assert len(stack.SNAPSHOT_BOUND_SERVICES) == len(set(stack.SNAPSHOT_BOUND_SERVICES))
+    assert set(stack.SNAPSHOT_BOUND_SERVICES) == bound & set(stack.SERVICES), (
+        f'SNAPSHOT_BOUND_SERVICES {sorted(stack.SNAPSHOT_BOUND_SERVICES)} vs the SERVICES with a relative '
+        f'bind in the merged agent-stack model {sorted(bound & set(stack.SERVICES))}: stack_up would leave '
+        f'the difference on a removed snapshot generation'
+    )
+    assert bound - set(stack.SERVICES) == _RUN_PER_CALL_SERVICES, (
+        f'{sorted(bound - set(stack.SERVICES) - _RUN_PER_CALL_SERVICES)} bind the snapshot but are neither '
+        f'started by stack_up nor created per call: decide which, and pin it'
+    )
+
+
+def _compose_tails(rig) -> list[tuple[stack.Step, list[str]]]:
+    return [(step, _tail(step)) for step in rig.docker.steps if list(step.argv[:2]) == [EXPECTED_DOCKER, 'compose']]
+
+
+def _up_services(tail: list[str]) -> list[str]:
+    """The service operands of an `up` tail: the words after its options (`--wait-timeout` takes one)."""
+    words, services = iter(tail[1:]), []
+    for word in words:
+        if word == '--wait-timeout':
+            next(words)
+        elif not word.startswith('-'):
+            services.append(word)
+    return services
+
+
+def test_stack_up_force_recreates_exactly_the_snapshot_bound_services_after_the_infrastructure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Ruling (2) and re-pin (c), run through AgentStack.
+
+    The last step is an `up --force-recreate --no-deps` of exactly SNAPSHOT_BOUND_SERVICES; the `up`
+    before it names exactly the rest of SERVICES, with neither flag, so postgres and kafka keep their
+    containers and each app container is created once; together they cover SERVICES. Both up steps
+    wait, both are flagged as builds, and the base inspects run once, before the build.
+    """
+    rig, result = _run_verb(tmp_path, monkeypatch, 'stack_up')
+    assert result['status'] == 'ok', result
+    steps = _compose_tails(rig)
+    assert [tail[0] for _, tail in steps] == ['build', 'up', 'up'], [tail for _, tail in steps]
+    (_, build), (plain_step, plain), (recreate_step, recreate) = steps
+    assert rig.docker.steps[-1] is recreate_step, 'the force-recreate must be the last step stack_up runs'
+    assert '--force-recreate' in recreate and '--no-deps' in recreate, recreate
+    assert '--force-recreate' not in plain and '--no-deps' not in plain, plain
+    assert _up_services(recreate) == list(stack.SNAPSHOT_BOUND_SERVICES), recreate
+    assert set(_up_services(plain)) == set(stack.SERVICES) - set(stack.SNAPSHOT_BOUND_SERVICES), plain
+    assert sorted(_up_services(plain) + _up_services(recreate)) == sorted(stack.SERVICES)
+    for tail in (plain, recreate):
+        assert tail[1:5] == ['-d', '--wait', '--wait-timeout', '300'], tail
+    assert plain_step.builds is True and recreate_step.builds is True
+    inspects = [index for index, step in enumerate(rig.docker.steps) if list(step.argv) in _INSPECTS]
+    assert len(inspects) == len(stack.BASE_IMAGES), 'the bases are ensured once per stack_up, not per up step'
+    assert max(inspects) < rig.docker.steps.index(steps[0][0]), 'the inspects run before the build'
+    assert build == ['build', *stack.BUILT_SERVICES]
+
+
+@pytest.mark.parametrize('verb', sorted(set(VERB_SAMPLES) - DOCKERLESS_VERBS - {'stack_up'}))
+def test_no_other_verb_recreates_or_restarts_a_running_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str
+):
+    """Ruling, rejected option: only stack_up recreates a running service.
+
+    run_system_tests in particular must not restart the stack between a validator's focused runs --
+    it recreates test_client alone, by `run`.
+    """
+    rig, result = _run_verb(tmp_path, monkeypatch, verb)
+    assert result['status'] == 'ok', result
+    for _, tail in _compose_tails(rig):
+        assert tail[0] not in ('up', 'restart', 'create', 'start'), f'{verb} runs {tail}'
+        assert '--force-recreate' not in tail and '--always-recreate-deps' not in tail, f'{verb} runs {tail}'
 
 
 # --- git: plumbing only, hardened ---------------------------------------------------------------

@@ -301,7 +301,11 @@ def test_the_bases_are_ensured_once_per_verb(tmp_path: Path, monkeypatch: pytest
 
 
 def test_a_base_is_pulled_only_when_its_inspect_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Addendum 14 (3): inspect each ref; pull exactly the absent one; then build and up."""
+    """Addendum 14 (3): inspect each ref; pull exactly the absent one; then build and both up steps.
+
+    Re-pinned by tj-zgq5v2: stack_up's plain `up` became two (the infrastructure, then the
+    force-recreate of SNAPSHOT_BOUND_SERVICES), and the base steps still all come before the build.
+    """
     absent = stack.BASE_IMAGES[0]
 
     def respond(step: stack.Step) -> runner.ProcessResult:
@@ -311,7 +315,13 @@ def test_a_base_is_pulled_only_when_its_inspect_fails(tmp_path: Path, monkeypatc
     assert result['status'] == 'ok', result
     base_steps = [step.argv for step in rig.docker.steps if _is_base(step.argv)]
     assert base_steps == [_inspect(absent), _pull(absent), *(_inspect(ref) for ref in stack.BASE_IMAGES[1:])]
-    assert [step.argv[step_prefix_length()] for step in rig.docker.steps if not _is_base(step.argv)] == ['build', 'up']
+    assert [step.argv[step_prefix_length()] for step in rig.docker.steps if not _is_base(step.argv)] == [
+        'build',
+        'up',
+        'up',
+    ]
+    last_base = max(index for index, step in enumerate(rig.docker.steps) if _is_base(step.argv))
+    assert last_base < min(index for index, step in enumerate(rig.docker.steps) if not _is_base(step.argv))
 
 
 @pytest.mark.parametrize('failing', range(len(stack.BASE_IMAGES)))

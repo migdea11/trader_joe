@@ -400,7 +400,11 @@ class AgentStack:
     # that build or create a container from source refresh the snapshot first and check it, never
     # the worktree; the rest read no worktree at all.
     async def _stack_up(self, call: _Call, worktree: object) -> tuple[str, str]:
-        """Snapshot WORKTREE, build the service and test-client images from it and start the agent stack, waiting for healthy."""
+        """Snapshot WORKTREE, build the service and test-client images from it and start the agent stack, waiting for healthy.
+
+        Every call force-recreates data_store and data_ingest, so the long-running services run the
+        code of the LAST stack_up -- tests/fakes included; postgres and kafka are kept.
+        """
         name = stack.check_worktree_name(worktree)
         path = stack.resolve_worktree(name, await self._worktrees())
         call.validated = {'worktree': name}
@@ -472,6 +476,8 @@ class AgentStack:
     async def _run_system_tests(self, call: _Call, worktree: object, paths: object) -> tuple[str, str]:
         """Snapshot WORKTREE and run tests/system (or PATHS under it) from test_client, rebuilt from the snapshot, against the agent stack.
 
+        Only test_client is rebuilt and recreated: the running services keep the code of the last
+        stack_up, so after editing anything they load -- tests/fakes included -- call stack_up first.
         The disposable-database attestation of make test-system is satisfied by construction: this
         verb reaches the agent stack and nothing else.
         """

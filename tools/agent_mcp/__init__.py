@@ -41,6 +41,10 @@ capped in bytes and files, built beside the old copy, verified, swapped in by re
 is the project directory: the build context and every relative bind source. stack.check_mount_sources,
 stack.resolve_test_paths and the migrations guard run on it. stack_down, stack_wipe, logs and ps read
 no worktree. The premise, checked by settings: nothing but the MCP writes under the stack directory.
+The swap orphans a running container's snapshot binds, so stack_up force-recreates
+stack.SNAPSHOT_BOUND_SERVICES on every call: the long-running services run the code of the LAST
+stack_up, and run_system_tests rebuilds and recreates only test_client -- after editing anything a
+running service loads, tests/fakes included, call stack_up first (tj-zgq5v2).
 
 THE GENERATED ENV FILES (stack.ensure_env_files; ADR addendum 2). Three files in the agent stack's own
 directory, outside the repository, 0600, generated once from the committed .env.default files read at

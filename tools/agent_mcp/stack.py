@@ -94,6 +94,15 @@ SERVICES = ('postgres', 'kafka', 'data_store', 'data_ingest')
 # the services with a build: key in COMPOSE_FILES, so builds() also reads it: a `run` of one of them
 # builds its image when it is missing.
 BUILT_SERVICES = ('data_store', 'data_ingest', 'test_client')
+# The long-running SERVICES with a snapshot bind: exactly those whose merged model under
+# COMPOSE_FILES has a bind mount with a relative source, resolved in the SNAPSHOT (data_store's
+# alembic.ini and migrations, data_ingest's tests/fakes in fake mode). refresh_snapshot() swaps the
+# snapshot by rename and removes the old generation, so a running container's binds point at a
+# removed directory after any refresh, and a plain `up` recreates only on an image or config
+# change. stack_up therefore force-recreates these on every call, so the long-running services run
+# the code of the LAST stack_up (tj-zgq5v2). A validator test pins the equality by parsing those
+# files, so a new bind into a long-running service without an entry goes red.
+SNAPSHOT_BOUND_SERVICES = ('data_store', 'data_ingest')
 TAIL_DEFAULT = 200
 TAIL_MAX = 2000
 MAX_TEST_PATHS = 50
@@ -984,12 +993,23 @@ def base_pull_step(ref: str, cwd: Path) -> Step:
 
 
 def stack_up_steps(stack_dir: Path, root_env_file: Path) -> list[Step]:
-    """Build the service and test-client images from the snapshot, then start the stack and wait."""
+    """Build the images from the snapshot, start the infrastructure, then force-recreate the app services.
+
+    Three steps. The plain `up` of the services with no snapshot bind (postgres, kafka) recreates
+    them only on a config change, so their data and Kafka's start_period are not paid on every call.
+    The last `up` force-recreates SNAPSHOT_BOUND_SERVICES so their binds resolve in the snapshot just
+    refreshed, and creates each once per stack_up; --no-deps is safe because the step before already
+    waited for the infrastructure healthy. Both `up` steps can build (builds()), so the runner's
+    BASE_IMAGES check still runs before the first building step (ADR tj-4rr0la addenda 14-15).
+    """
+    wait = ['-d', '--wait', '--wait-timeout', str(WAIT_TIMEOUT_SECONDS)]
+    infrastructure = [service for service in SERVICES if service not in SNAPSHOT_BOUND_SERVICES]
     return _steps(
         stack_dir,
         root_env_file,
         ['build', *BUILT_SERVICES],
-        ['up', '-d', '--wait', '--wait-timeout', str(WAIT_TIMEOUT_SECONDS), *SERVICES],
+        ['up', *wait, *infrastructure],
+        ['up', *wait, '--force-recreate', '--no-deps', *SNAPSHOT_BOUND_SERVICES],
     )
 
 
