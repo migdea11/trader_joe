@@ -1,5 +1,23 @@
+"""The Alpaca adapter's client, feed and single-flight properties, and where each one now lives.
+
+HANDLES-1 (tj-irhy0a.6) replaced broker_api.get_market_stock_data with AlpacaRead.get_bars (the
+broker speaks market data) plus ingest_control.store_retrieve_stock (the platform conversion to
+the store's batch schema, decision tj-j4wknb addendum 2 B). The tests below that drove the old
+function were RE-POINTED to where each property now lives, with every assertion kept (HANDLES-2,
+tj-irhy0a.7):
+
+  the injected client, the vendor feed parameter, the single-flight key  -> AlpacaRead.get_bars
+  the feed stamped on the batch, a request-named tape not overriding      -> store_retrieve_stock
+  no credentials and no client failing before any call                    -> store_retrieve_stock,
+                                                                             production AlpacaRead()
+
+Where one test asserts both a vendor-side and a batch-side property, it drives store_retrieve_stock
+with a real AlpacaRead underneath, so the two halves are still asserted by one test.
+"""
+
 import importlib
 import os
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -11,8 +29,12 @@ from alpaca.data.enums import DataFeed
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
+from data.ingest.app import ingest_control
 from data.ingest.app.brokers.alpaca import broker_api
+from data.ingest.app.brokers.alpaca.read import AlpacaRead
 from data.ingest.app.brokers.broker_errors import MissingCredentialsError
+from data.ingest.app.brokers.interface import BarsQuery, Instrument
+from data.ingest.app.brokers.rate_budget import RequestPriority
 from schemas.data_ingest.get_dataset_request import StockDatasetRequest
 
 
@@ -22,10 +44,42 @@ START = datetime(2026, 1, 2, 14, 30, tzinfo=UTC)
 
 @pytest.fixture(autouse=True)
 def no_client_leaks_between_tests():
-    """Drop any cached client, so one test's stub is never another test's vendor."""
+    """Drop any cached client and installed reader, so one test's stub is never another's vendor."""
     broker_api.set_client(None)
+    ingest_control.clear_readers()
     yield
     broker_api.set_client(None)
+    ingest_control.clear_readers()
+
+
+@pytest.fixture
+def executor() -> Iterator[ThreadPoolExecutor]:
+    """A pool for the blocking SDK call, handed to AlpacaRead through its executor_provider seam."""
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        yield pool
+
+
+def install_alpaca(executor: ThreadPoolExecutor, client: Mock | None = None) -> None:
+    """Install a real AlpacaRead in the ALPACA_API slot, as the app's lifespan would.
+
+    Args:
+        executor (ThreadPoolExecutor): Pool the vendor call runs on.
+        client (Mock | None): Client to inject, or None for production's own (broker_api.get_client()).
+    """
+    ingest_control.install_readers(
+        {DataSource.ALPACA_API: AlpacaRead(client=client, executor_provider=lambda: executor)}
+    )
+
+
+def build_query(request: StockDatasetRequest) -> BarsQuery:
+    """The BarsQuery store_retrieve_stock builds for a request, written out for direct get_bars calls."""
+    return BarsQuery(
+        instrument=Instrument(symbol=request.asset_symbol, asset_type=AssetType.STOCK),
+        granularity=request.granularity,
+        start=request.start,
+        end=request.end,
+        priority=RequestPriority.INTERACTIVE,
+    )
 
 
 @pytest.fixture
@@ -68,11 +122,15 @@ def build_request(**overrides) -> StockDatasetRequest:
 
 
 def build_bar(close: float) -> SimpleNamespace:
-    return SimpleNamespace(open=1.0, high=2.0, low=0.5, close=close, volume=10, trade_count=3, timestamp=START)
+    # vwap is carried because a real alpaca-py Bar always has it and AlpacaRead reads it: without
+    # it the conversion raises AttributeError, which store_retrieve_stock swallows into {}.
+    return SimpleNamespace(
+        open=1.0, high=2.0, low=0.5, close=close, volume=10, trade_count=3, vwap=1.5, timestamp=START
+    )
 
 
 class StubBarSet:
-    """The slice of alpaca-py's BarSet that convert_bars_to_batch_schema actually touches."""
+    """The slice of alpaca-py's BarSet that AlpacaRead's conversion actually touches."""
 
     def __init__(self, symbol: str, bars: list[SimpleNamespace]):
         self.data = {symbol: bars}
@@ -143,15 +201,17 @@ def test_sip_feed_is_read_at_call_time_not_at_import():
 
 
 @pytest.mark.asyncio
-async def test_market_data_is_fetched_through_an_injected_client():
-    # The path that was unreachable before this fix: a whole request served end to end,
-    # single flight and rate budget included, against a client that is not the vendor.
+async def test_market_data_is_fetched_through_an_injected_client(executor: ThreadPoolExecutor):
+    # The path that was unreachable before tj-84jfb9: a whole request served end to end, single
+    # flight and rate budget included, against a client that is not the vendor. Re-pointed from
+    # get_market_stock_data to store_retrieve_stock over a real AlpacaRead, so it stays END TO END:
+    # dataset_id is ingest_control's to stamp now, the bars are AlpacaRead's to fetch.
     request = build_request()
     client = Mock()
     client.get_stock_bars.return_value = StubBarSet(request.asset_symbol, [build_bar(10.0), build_bar(11.0)])
+    install_alpaca(executor, client)
 
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        batch = await broker_api.get_market_stock_data(executor, request, client=client)
+    batch = await ingest_control.store_retrieve_stock(request)
 
     client.get_stock_bars.assert_called_once()
     assert [entry.data.close for entry in batch.dataset[DataType.MARKET_ACTIVITY]] == [10.0, 11.0]
@@ -159,22 +219,32 @@ async def test_market_data_is_fetched_through_an_injected_client():
 
 
 @pytest.mark.asyncio
-async def test_an_injected_client_is_used_without_any_credentials():
+async def test_an_injected_client_is_used_without_any_credentials(executor: ThreadPoolExecutor):
     # The injected client is the credential. Nothing reads the environment on this path.
     request = build_request()
     client = Mock()
     client.get_stock_bars.return_value = StubBarSet(request.asset_symbol, [build_bar(10.0)])
+    reader = AlpacaRead(client=client, executor_provider=lambda: executor)
 
-    with patch.dict(os.environ, {}, clear=True), ThreadPoolExecutor(max_workers=1) as executor:
-        batch = await broker_api.get_market_stock_data(executor, request, client=client)
+    with patch.dict(os.environ, {}, clear=True):
+        response = await reader.get_bars(build_query(request))
+        bars = [bar async for bar in response.bars]
 
-    assert len(batch.dataset[DataType.MARKET_ACTIVITY]) == 1
+    assert len(bars) == 1
+    client.get_stock_bars.assert_called_once()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(('sip_enabled', 'expected'), [('false', Feed.IEX), ('true', Feed.SIP)], ids=['iex', 'sip'])
-async def test_the_resolved_feed_reaches_the_vendor_call_and_is_stamped_on_the_batch(sip_enabled: str, expected: Feed):
+async def test_the_resolved_feed_reaches_the_vendor_call_and_is_stamped_on_the_batch(
+    sip_enabled: str, expected: Feed, executor: ThreadPoolExecutor
+):
     """The scope amendment on tj-vhboky.13, both halves, against a real adapter call.
+
+    RE-POINTED (tj-irhy0a.7): the vendor call is now made by AlpacaRead.get_bars and the batch is
+    now stamped by ingest_control.store_retrieve_stock from BarsResponse.feed. Driving
+    store_retrieve_stock over a real AlpacaRead reaches both sites in one call, so the two halves
+    are still asserted by one test.
 
     THE TWO HALVES FAIL SEPARATELY, which is why one test asserts both. Before tj-vhboky.9,
     ``resolve_feed()`` fed the local single-flight key and nothing else: the vendor call carried no
@@ -193,13 +263,15 @@ async def test_the_resolved_feed_reaches_the_vendor_call_and_is_stamped_on_the_b
     Args:
         sip_enabled: The value of ALPACA_SIP_ENABLED for this case.
         expected: The Feed the adapter must resolve from it.
+        executor: Pool the vendor call runs on.
     """
     request = build_request()
     client = Mock()
     client.get_stock_bars.return_value = StubBarSet(request.asset_symbol, [build_bar(10.0)])
+    install_alpaca(executor, client)
 
-    with patch.dict(os.environ, {'ALPACA_SIP_ENABLED': sip_enabled}), ThreadPoolExecutor(max_workers=1) as executor:
-        batch = await broker_api.get_market_stock_data(executor, request, client=client)
+    with patch.dict(os.environ, {'ALPACA_SIP_ENABLED': sip_enabled}):
+        batch = await ingest_control.store_retrieve_stock(request)
 
     assert batch.feed is expected
     sent = client.get_stock_bars.call_args.args[0]
@@ -207,7 +279,7 @@ async def test_the_resolved_feed_reaches_the_vendor_call_and_is_stamped_on_the_b
 
 
 @pytest.mark.asyncio
-async def test_a_tape_named_by_the_request_does_not_override_the_deployment():
+async def test_a_tape_named_by_the_request_does_not_override_the_deployment(executor: ThreadPoolExecutor):
     """``GetDatasetRequest.feed`` is DECLARED BUT INERT, pinned where it can actually be observed.
 
     tj-rh4b7f deferred caller-selected feed: the store has no feed to forward, so the field stays
@@ -216,18 +288,20 @@ async def test_a_tape_named_by_the_request_does_not_override_the_deployment():
     describes is silent -- a request naming SIP against an IEX deployment would simply be served
     IEX with nobody told.
 
-    So this drives the adapter with a request that explicitly names SIP, in a deployment
-    configured for IEX, and asserts IEX wins at both sites. WHEN THE DEFERRED TRANSPORT WORK
-    LANDS, THIS IS THE TEST THAT MUST FAIL, and inverting it is the deliberate act that records
-    the field becoming live. It is not a test to repair around.
+    So this drives the request path -- store_retrieve_stock over a real AlpacaRead since
+    tj-irhy0a.6 -- with a request that explicitly names SIP, in a deployment configured for IEX,
+    and asserts IEX wins at both sites. WHEN THE DEFERRED TRANSPORT WORK LANDS, THIS IS THE TEST
+    THAT MUST FAIL, and inverting it is the deliberate act that records the field becoming live.
+    It is not a test to repair around.
     """
     request = build_request(feed=Feed.SIP)
     assert request.feed is Feed.SIP, 'the request really does name the other tape'
     client = Mock()
     client.get_stock_bars.return_value = StubBarSet(request.asset_symbol, [build_bar(10.0)])
+    install_alpaca(executor, client)
 
-    with patch.dict(os.environ, {'ALPACA_SIP_ENABLED': 'false'}), ThreadPoolExecutor(max_workers=1) as executor:
-        batch = await broker_api.get_market_stock_data(executor, request, client=client)
+    with patch.dict(os.environ, {'ALPACA_SIP_ENABLED': 'false'}):
+        batch = await ingest_control.store_retrieve_stock(request)
 
     assert batch.feed is Feed.IEX
     assert client.get_stock_bars.call_args.args[0].feed == DataFeed('iex')
@@ -251,8 +325,12 @@ class KeyRecordingSingleFlight:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(('sip_enabled', 'expected'), [('false', 'iex'), ('true', 'sip')], ids=['iex', 'sip'])
-async def test_the_resolved_feed_is_written_into_the_single_flight_key(sip_enabled: str, expected: str):
-    """broker_api.py:245, the third leg of resolve_feed() and the one that was untested.
+async def test_the_resolved_feed_is_written_into_the_single_flight_key(
+    sip_enabled: str, expected: str, executor: ThreadPoolExecutor
+):
+    """broker_api.fetch_data_type's key, the third leg of resolve_feed() and the one that was untested.
+
+    Re-pointed to AlpacaRead.get_bars, which resolves the feed once and hands it to fetch_data_type.
 
     The other two legs -- the vendor call and the batch stamp -- are asserted above. This one is
     the single-flight key, and it fails DIFFERENTLY from both: the tape reaching the vendor and the
@@ -263,26 +341,26 @@ async def test_the_resolved_feed_is_written_into_the_single_flight_key(sip_enabl
 
     Lowercase is asserted deliberately. The key is built from ``feed.value.lower()`` to match the
     vendor's wire vocabulary, while the batch carries the uppercase ``Feed`` member; that split is
-    a documented choice at :241-244 and normalising it here would stop testing it.
+    a documented choice in fetch_data_type and normalising it here would stop testing it.
     """
     request = build_request()
     client = Mock()
     client.get_stock_bars.return_value = StubBarSet(request.asset_symbol, [build_bar(10.0)])
     recorder = KeyRecordingSingleFlight(getattr(broker_api, '__SINGLE_FLIGHT'))
+    reader = AlpacaRead(client=client, executor_provider=lambda: executor)
 
     with (
         patch.object(broker_api, '__SINGLE_FLIGHT', recorder),
         patch.dict(os.environ, {'ALPACA_SIP_ENABLED': sip_enabled}),
-        ThreadPoolExecutor(max_workers=1) as executor,
     ):
-        await broker_api.get_market_stock_data(executor, request, client=client)
+        await reader.get_bars(build_query(request))
 
     assert len(recorder.keys) == 1, 'the adapter did not go through the single flight at all'
     assert recorder.keys[0].feed == expected
 
 
 @pytest.mark.asyncio
-async def test_two_tapes_do_not_share_one_single_flight_key():
+async def test_two_tapes_do_not_share_one_single_flight_key(executor: ThreadPoolExecutor):
     """Two deployments' tapes produce UNEQUAL keys, stated as the property that matters.
 
     The parametrized test above pins each key's feed field; this pins the consequence, and it is
@@ -298,11 +376,12 @@ async def test_two_tapes_do_not_share_one_single_flight_key():
     client = Mock()
     client.get_stock_bars.return_value = StubBarSet(request.asset_symbol, [build_bar(10.0)])
     recorder = KeyRecordingSingleFlight(getattr(broker_api, '__SINGLE_FLIGHT'))
+    reader = AlpacaRead(client=client, executor_provider=lambda: executor)
 
-    with patch.object(broker_api, '__SINGLE_FLIGHT', recorder), ThreadPoolExecutor(max_workers=1) as executor:
+    with patch.object(broker_api, '__SINGLE_FLIGHT', recorder):
         for sip_enabled in ('false', 'true'):
             with patch.dict(os.environ, {'ALPACA_SIP_ENABLED': sip_enabled}):
-                await broker_api.get_market_stock_data(executor, request, client=client)
+                await reader.get_bars(build_query(request))
 
     iex_key, sip_key = recorder.keys
     assert iex_key != sip_key, 'an IEX request and a SIP request collapse onto one vendor call'
@@ -311,12 +390,21 @@ async def test_two_tapes_do_not_share_one_single_flight_key():
 
 
 @pytest.mark.asyncio
-async def test_a_request_without_credentials_or_a_client_fails_before_any_call():
+async def test_a_request_without_credentials_or_a_client_fails_before_any_call(executor: ThreadPoolExecutor):
+    # Re-pointed to the request path with the PRODUCTION AlpacaRead (no client injected), so the
+    # credential is resolved by broker_api.get_client() exactly as in a deployment. The error must
+    # reach the caller by name -- store_retrieve_stock swallows every other exception into {} --
+    # and 'before any call' is observed: the single flight, the only way to the vendor, is never
+    # entered.
     request = build_request()
+    install_alpaca(executor, client=None)
+    recorder = KeyRecordingSingleFlight(getattr(broker_api, '__SINGLE_FLIGHT'))
 
     with (
+        patch.object(broker_api, '__SINGLE_FLIGHT', recorder),
         patch.dict(os.environ, {}, clear=True),
-        ThreadPoolExecutor(max_workers=1) as executor,
         pytest.raises(MissingCredentialsError),
     ):
-        await broker_api.get_market_stock_data(executor, request)
+        await ingest_control.store_retrieve_stock(request)
+
+    assert recorder.keys == [], 'a vendor call was attempted before the missing credential surfaced'

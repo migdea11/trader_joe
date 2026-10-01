@@ -1,0 +1,13 @@
+{
+  "provenance": {
+    "kind": "documented",
+    "note": "Documented, not recorded: 504, the second status alpaca-py retries (DEFAULT_RETRY_EXCEPTION_CODES = [429, 504]). No example body is published; {code, message} is the shape ruled on tj-vhboky.57 (16:44 UTC). Not recordable: a gateway timeout cannot be provoked.",
+    "source": "https://docs.alpaca.markets/us/reference/stockbars",
+    "wire_contract": "tj-vhboky.57"
+  },
+  "status": 504,
+  "body": {
+    "code": 50400000,
+    "message": "gateway timeout"
+  }
+}

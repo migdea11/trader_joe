@@ -1,0 +1,19 @@
+{
+  "provenance": {
+    "kind": "documented",
+    "note": "Documented, not recorded: bars_1Day with the second bar's trade count null. Alpaca sends n on every stock bar, so this cannot be provoked; it pins that a missing count stays None. Stays documented after the host sitting (tj-irhy0a.3).",
+    "source": "https://docs.alpaca.markets/us/reference/stockbars",
+    "wire_contract": "tj-vhboky.57"
+  },
+  "status": 200,
+  "body": {
+    "bars": {
+      "AAPL": [
+        {"t": "2022-01-03T05:00:00Z", "o": 177.83, "h": 182.88, "l": 177.71, "c": 182.01, "v": 104487900, "n": 772630, "vw": 181.103},
+        {"t": "2022-01-04T05:00:00Z", "o": 182.63, "h": 182.94, "l": 179.12, "c": 179.7, "v": 99310438, "n": null, "vw": 180.721},
+        {"t": "2022-01-05T05:00:00Z", "o": 179.61, "h": 180.17, "l": 174.64, "c": 174.92, "v": 94537602, "n": 846121, "vw": 177.172}
+      ]
+    },
+    "next_page_token": null
+  }
+}
