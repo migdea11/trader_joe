@@ -571,13 +571,16 @@ lint-fix: $(VENV_MARKER)  ## Apply lint fixes and formatting (scope with PATHS=)
 # common/tests, data/store/tests and the rest: a thousand findings in test files. The glob exists
 # nowhere as a directory, so it is matched as written, against every nested tests directory and
 # no production path. The CI security job runs the identical line; change both or neither.
+# requirements.txt is removed whatever the export or pip-audit returns (tj-0pobey.6): a bare
+# `rm` line after pip-audit never ran when pip-audit found something, leaving the file behind in
+# the working tree. The cleanup sits AFTER each command, so the export and pip-audit invocations
+# stay CI's; each one's status is captured and re-raised, so a finding still fails this target.
 .PHONY: security
 security: $(VENV_MARKER)  ## Check security vulnerabilities
 	uv run bandit -r $(SOURCE_DIRS) --exclude '*/tests/*'
 	uv run semgrep --config=auto --error --exclude=tests/ --exclude=.venv --exclude=docker-compose.override.yaml --exclude=.claude/worktrees .
-	uv export --all-groups --no-group dev --no-group testing --no-group security --locked --format requirements-txt > requirements.txt
-	uv run pip-audit -r requirements.txt --disable-pip
-	rm requirements.txt
+	uv export --all-groups --no-group dev --no-group testing --no-group security --locked --format requirements-txt > requirements.txt || { status=$$?; rm -f requirements.txt; exit $$status; }
+	uv run pip-audit -r requirements.txt --disable-pip; status=$$?; rm -f requirements.txt; exit $$status
 
 # Deliberately independent of `lint`: a test run must report a test result, not a lint failure.
 # CI runs both, as separate steps.
