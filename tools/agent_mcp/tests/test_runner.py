@@ -146,7 +146,14 @@ def test_valid_test_paths_are_normalised_and_an_empty_list_runs_the_suite(
         {'worktree': WORKTREE_NAME, 'paths': ['tests/system/./sub/../test_one.py', 'tests/system/sub']},
     )
     rig.call('run_system_tests', {'worktree': WORKTREE_NAME, 'paths': []})
-    tails = [list(step.argv[step_prefix_length() :]) for step in rig.docker.steps]
+    # Each call first inspects every BASE_IMAGES ref (ADR tj-4rr0la addendum 14 (3); re-pinned,
+    # tj-c4mosr.14). The path normalisation below is unchanged.
+    inspects = [('/usr/local/bin/docker', 'image', 'inspect', '--format', '{{.Id}}', ref) for ref in stack.BASE_IMAGES]
+    assert [step.argv for step in rig.docker.steps if step.argv[1] != 'compose'] == inspects * 2
+    steps = rig.docker.steps
+    assert [step.argv for step in steps[: len(inspects)]] == inspects
+    assert [step.argv for step in steps[len(inspects) + 1 : 2 * len(inspects) + 1]] == inspects
+    tails = [list(step.argv[step_prefix_length() :]) for step in steps if step.argv[1] == 'compose']
     assert tails == [
         ['run', '--rm', '--no-deps', '--build', 'test_client', 'tests/system/test_one.py', 'tests/system/sub'],
         ['run', '--rm', '--no-deps', '--build', 'test_client', 'tests/system'],
@@ -302,7 +309,14 @@ def test_a_failing_step_stops_the_verb_as_failed(tmp_path: Path, monkeypatch: py
     rig = make_rig(tmp_path, monkeypatch, FakeDocker(respond=fail_build))
     result = rig.call('stack_up', {'worktree': WORKTREE_NAME})
     assert result['status'] == 'failed' and result['exit_status'] == 1
-    assert [step['exit_status'] for step in result['steps']] == [1], 'a step ran after a failed one'
+    # The base inspects run (and succeed) before the build (re-pinned, tj-c4mosr.14). The property:
+    # nothing runs after the failed step -- the failed build is LAST and `up` never ran.
+    exits = [step['exit_status'] for step in result['steps']]
+    assert exits == [0] * len(stack.BASE_IMAGES) + [1], result['steps']
+    commands = [step['command'].split() for step in result['steps']]
+    assert 'build' in commands[-1], f'the last step is not the failed build: {commands[-1]}'
+    assert not any('up' in command for command in commands), 'a step ran after a failed one: up'
+    assert [step.argv for step in rig.docker.steps if 'up' in step.argv] == []
 
 
 def test_output_keeps_its_tail_and_says_it_was_cut(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

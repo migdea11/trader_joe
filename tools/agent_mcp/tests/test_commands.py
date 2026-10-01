@@ -33,6 +33,7 @@ from tools.agent_mcp.tests.harness import (
     VERB_SAMPLES,
     WORKTREE_NAME,
     clearing_hook,
+    default_response,
     make_rig,
     populate_data,
     record_state,
@@ -50,10 +51,29 @@ OVERLAY = REPO_ROOT / 'docker-compose.agent-stack.yaml'
 # test would agree with any change to it.
 EXPECTED_PROJECT = 'trader_joe_agent_stack'
 EXPECTED_TRUSTED_DIR = '/opt/agent_mcp/compose'
+EXPECTED_DOCKER = '/usr/local/bin/docker'
 
 
-def _run_verb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str):
+def _base_inspect_argv(ref: str) -> list[str]:
+    """The one plain-docker inspect argv the ensure-bases step may run (ADR tj-4rr0la addendum 14 (3))."""
+    return [EXPECTED_DOCKER, 'image', 'inspect', '--format', '{{.Id}}', ref]
+
+
+def _base_pull_argv(ref: str) -> list[str]:
+    """The one plain-docker pull argv, run only after its inspect failed."""
+    return [EXPECTED_DOCKER, 'pull', ref]
+
+
+def _bases_absent(step: stack.Step) -> runner.ProcessResult:
+    """Every base inspect fails (the daemon lacks it), so ensure-bases pulls each ref; the rest as default."""
+    if list(step.argv[1:3]) == ['image', 'inspect']:
+        return runner.ProcessResult(1, b'', b'Error: No such image')
+    return default_response(step)
+
+
+def _run_verb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str, respond=default_response):
     rig = make_rig(tmp_path, monkeypatch)
+    rig.docker.respond = respond
     record_state(rig.layout)
     populate_data(rig.layout)
     rig.docker.hook = clearing_hook(rig.layout)
@@ -74,12 +94,15 @@ def test_every_verb_runs_only_the_fixed_compose_prefix_over_the_snapshot(
 ):
     """Body bullet 1, S1 and G1: -p trader_joe_agent_stack, the snapshot, the generated env, the trusted -f list.
 
-    Every step of every verb starts `/usr/local/bin/docker compose -p trader_joe_agent_stack
+    Every compose step of every verb starts `/usr/local/bin/docker compose -p trader_joe_agent_stack
     --project-directory <stack>/source --env-file <stack>/agent_stack.env` and then -f for each
-    trusted compose file, in the Makefile's order; runs with cwd <stack>/source; and no argv word
-    names a path under the repository or any worktree.
+    trusted compose file, in the Makefile's order. The ONLY other argv a verb may run is the
+    ensure-bases pair of ADR tj-4rr0la addendum 14 (3), exactly `docker image inspect --format {{.Id}}
+    <ref>` or `docker pull <ref>` of a BASE_IMAGES ref (re-pinned, tj-c4mosr.14); any other plain
+    docker argv is red. Run with every base absent, so both forms appear. Every step, either kind,
+    runs with cwd <stack>/source, and no argv word names a path under the repository or any worktree.
     """
-    rig, result = _run_verb(tmp_path, monkeypatch, verb)
+    rig, result = _run_verb(tmp_path, monkeypatch, verb, _bases_absent)
     layout = rig.layout
     assert result['status'] in {'ok', 'not_available'}, result
     if verb in DOCKERLESS_VERBS:
@@ -98,17 +121,27 @@ def test_every_verb_runs_only_the_fixed_compose_prefix_over_the_snapshot(
     ]
     for name in ('docker-compose.yaml', 'docker-compose.test-client.yaml', 'docker-compose.agent-stack.yaml'):
         expected += ['-f', f'{EXPECTED_TRUSTED_DIR}/{name}']
+    base_argvs = [_base_inspect_argv(ref) for ref in stack.BASE_IMAGES] + [
+        _base_pull_argv(ref) for ref in stack.BASE_IMAGES
+    ]
     for step in rig.docker.steps:
         argv = list(step.argv)
-        assert argv[: len(expected)] == expected, f'{verb}: {shlex.join(argv)}'
         assert step.cwd == layout.stack_dir / 'source', f'{verb} runs a step with cwd {step.cwd}, not the snapshot'
         repository_paths = [word for word in argv if str(layout.repo) in word or str(layout.worktree) in word]
         assert not repository_paths, f'{verb} hands the daemon a repository or worktree path: {repository_paths}'
+        if argv in base_argvs:
+            continue
+        assert argv[: len(expected)] == expected, f'{verb}: {shlex.join(argv)}'
         assert argv.count('-p') == 1 and argv.count('--project-directory') == 1 and argv.count('--env-file') == 1
 
 
+# The ensure-bases inspects, once per verb before its first step that can build (ADR tj-4rr0la
+# addenda 14 (3) and 15). Bases present here (FakeDocker's default exit 0), so nothing is pulled.
+_INSPECTS = [_base_inspect_argv(ref) for ref in stack.BASE_IMAGES]
+
 _EXPECTED_TAILS = {
     'stack_up': [
+        *_INSPECTS,
         ['build', 'data_store', 'data_ingest', 'test_client'],
         ['up', '-d', '--wait', '--wait-timeout', '300'],
     ],
@@ -116,24 +149,39 @@ _EXPECTED_TAILS = {
     'stack_wipe': [['down', '--remove-orphans'], ['run'], ['run']],
     'migrate': [
         ['ps', '-q', 'postgres'],
+        *_INSPECTS,
         ['run', '--rm', '--no-deps', 'data_store', '/code/.venv/bin/alembic', 'upgrade', 'head'],
     ],
     'migrate_status': [
         ['ps', '-q', 'postgres'],
+        *_INSPECTS,
         ['run', '--rm', '--no-deps', 'data_store', '/code/.venv/bin/alembic', 'current'],
         ['run', '--rm', '--no-deps', 'data_store', '/code/.venv/bin/alembic', 'history'],
     ],
-    'run_system_tests': [['run', '--rm', '--no-deps', '--build', 'test_client', 'tests/system/test_one.py']],
+    'run_system_tests': [
+        *_INSPECTS,
+        ['run', '--rm', '--no-deps', '--build', 'test_client', 'tests/system/test_one.py'],
+    ],
     'logs': [['logs', '--no-color', '--tail', '50', 'postgres']],
     'ps': [['ps', '--all']],
 }
 
 
+def _tail(step: stack.Step) -> list[str]:
+    """A compose step's words after the fixed prefix; a plain docker step (the bases) whole."""
+    if list(step.argv[:2]) == [EXPECTED_DOCKER, 'compose']:
+        return list(step.argv[step_prefix_length() :])
+    return list(step.argv)
+
+
 @pytest.mark.parametrize('verb', sorted(_EXPECTED_TAILS))
 def test_every_verb_runs_exactly_its_fixed_tails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str):
-    """After the prefix, each step is a fixed tail from constants plus the verb's validated arguments."""
+    """After the prefix, each step is a fixed tail from constants plus the verb's validated arguments.
+
+    The ensure-bases inspects sit whole at their place in the list (re-pinned, tj-c4mosr.14).
+    """
     rig, _ = _run_verb(tmp_path, monkeypatch, verb)
-    tails = [list(step.argv[step_prefix_length() :]) for step in rig.docker.steps]
+    tails = [_tail(step) for step in rig.docker.steps]
     expected = _EXPECTED_TAILS[verb]
     assert len(tails) == len(expected), f'{verb} ran {tails}'
     for tail, want in zip(tails, expected, strict=True):

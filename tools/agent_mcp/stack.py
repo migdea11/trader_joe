@@ -15,7 +15,10 @@ A check on an agent-writable tree is always a race, so neither is ever pointed a
     THE TRUSTED DOCKERFILE. The agent-stack overlay sets build.dockerfile to TRUSTED_DOCKERFILE, the
         MCP image's own copy of the repository's Dockerfile. The worktree's Dockerfile is never read,
         so FROM, COPY --from, RUN --mount from= and a syntax= frontend are fixed: a build cannot read
-        prod images, the private repository's images or any other image on the host daemon.
+        prod images, the private repository's images or any other image on the host daemon. Its
+        external refs are digest-pinned (BASE_IMAGES) and pulled by the daemon before every build,
+        because buildx would otherwise fetch the registry token from inside agent_mcp, which has no
+        egress (ADR tj-4rr0la addendum 13).
     ACCEPTED, RECORDED: RUN keeps bridge egress (uv sync downloads from PyPI) and runs agent-chosen
         code -- the packages the snapshot's pyproject.toml and uv.lock name, and their build hooks.
         What that code can read is the build container: the public base images and the snapshot,
@@ -59,6 +62,19 @@ TRUSTED_COMPOSE_DIR = Path('/opt/agent_mcp/compose')
 # as build.dockerfile for every service it builds (ADR tj-4rr0la addendum 5, ruling 2). A Dockerfile
 # change reaches the agent stack when the MCP image is rebuilt, as a compose change does.
 TRUSTED_DOCKERFILE = TRUSTED_COMPOSE_DIR / 'Dockerfile'
+# Every external image TRUSTED_DOCKERFILE names (FROM and COPY --from; stage names are not external),
+# exactly as it spells them: tag@sha256:<multi-arch index digest>. Before any build the MCP has the
+# DAEMON make each one present -- `docker image inspect`, then `docker pull` only if absent -- so the
+# build never resolves a registry from inside agent_mcp, which has no egress (ADR tj-4rr0la addenda
+# 13-14). This module reaches the MCP image by the same build, from the same checkout, as the trusted
+# Dockerfile (tools/agent_mcp/Dockerfile copies tools/agent_mcp/*.py and the root Dockerfile), so the
+# two always agree within one image. This constant is the ONLY place the list lives: nothing parses it
+# from the snapshot or a worktree. A digest bump in the root Dockerfile updates it in the same change;
+# a validator test pins the two equal (tj-c4mosr.14).
+BASE_IMAGES = (
+    'debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251',
+    'ghcr.io/astral-sh/uv:0.12.19@sha256:04d046b13e60d6bcec73cbc5e1cad25d680dea90c8573340950a0ac2d1aef424',
+)
 
 DOCKER = '/usr/local/bin/docker'
 GIT = '/usr/bin/git'
@@ -67,7 +83,9 @@ GIT = '/usr/bin/git'
 DOCKER_HOST = 'tcp://socket_proxy:2375'
 
 SERVICES = ('postgres', 'kafka', 'data_store', 'data_ingest')
-# Built by stack_up; test_client is rebuilt by run_system_tests' own `run --build` as well.
+# Built by stack_up; test_client is rebuilt by run_system_tests' own `run --build` as well. Exactly
+# the services with a build: key in COMPOSE_FILES, so builds() also reads it: a `run` of one of them
+# builds its image when it is missing.
 BUILT_SERVICES = ('data_store', 'data_ingest', 'test_client')
 TAIL_DEFAULT = 200
 TAIL_MAX = 2000
@@ -863,10 +881,17 @@ def ensure_snapshot(stack_dir: Path) -> Path:
 # builders take the stack directory, never a worktree: no compose argv carries a repository path.
 @dataclass(frozen=True)
 class Step:
-    """One subprocess: its argument list and the directory it runs in (the snapshot)."""
+    """One subprocess: its argument list and the directory it runs in (the snapshot).
+
+    builds is True for a step that CAN build an image from TRUSTED_DOCKERFILE -- compose builds a
+    missing image on up/run without --build (ADR tj-4rr0la addendum 15). _steps() sets it from the
+    compose command (builds()), so no builder can add a build without it; the runner makes BASE_IMAGES
+    present before the first such step of a verb and never runs it when a base could not be pulled.
+    """
 
     argv: tuple[str, ...]
     cwd: Path
+    builds: bool = False
 
 
 def compose_prefix(stack_dir: Path, root_env_file: Path) -> list[str]:
@@ -887,9 +912,41 @@ def compose_prefix(stack_dir: Path, root_env_file: Path) -> list[str]:
     return prefix
 
 
+def builds(tail: Sequence[str]) -> bool:
+    """Whether a compose command (the words after compose_prefix) CAN build.
+
+    compose builds a missing image on up/run without --build, so this is: `build`; any `--build`;
+    `up`, always (an `up` naming no service builds every one); or a `run` naming a BUILT_SERVICES
+    service (postgres and kafka are image-only, so stack_wipe's clear runs stay base-free). A word
+    that matches by coincidence costs an extra inspect, the safe direction.
+    """
+    if not tail:
+        return False
+    first = tail[0]
+    return (
+        first in ('build', 'up')
+        or '--build' in tail
+        or (first == 'run' and any(word in BUILT_SERVICES for word in tail))
+    )
+
+
 def _steps(stack_dir: Path, root_env_file: Path, *tails: Sequence[str]) -> list[Step]:
     prefix = compose_prefix(stack_dir, root_env_file)
-    return [Step(tuple(prefix + list(tail)), snapshot_dir(stack_dir)) for tail in tails]
+    return [Step(tuple(prefix + list(tail)), snapshot_dir(stack_dir), builds(tail)) for tail in tails]
+
+
+# THE BASES. Plain docker commands, not compose: through the same socket proxy (DOCKER_HOST in the
+# runner's fixed environment), where IMAGES and POST already allow both. `docker pull` is POST
+# /images/create, so the daemon fetches the token and the layers with the host's network; nothing
+# here adds a network to agent_mcp, and no build passes --pull.
+def base_inspect_step(ref: str, cwd: Path) -> Step:
+    """`docker image inspect` of one BASE_IMAGES ref: exit status 0 when the daemon already has it."""
+    return Step((DOCKER, 'image', 'inspect', '--format', '{{.Id}}', ref), cwd)
+
+
+def base_pull_step(ref: str, cwd: Path) -> Step:
+    """`docker pull` of one BASE_IMAGES ref, run only after its inspect found it absent."""
+    return Step((DOCKER, 'pull', ref), cwd)
 
 
 def stack_up_steps(stack_dir: Path, root_env_file: Path) -> list[Step]:

@@ -20,7 +20,7 @@ MODULES
 Everything but server.py imports the standard library only, so the dev venv -- which does not install
 the agent-mcp group -- can import and test it.
 
-COMMANDS. Every docker command is stack.compose_prefix() plus a fixed tail:
+COMMANDS. Every docker command but the base-image pair below is stack.compose_prefix() plus a fixed tail:
     /usr/local/bin/docker compose -p trader_joe_agent_stack --project-directory <stack dir>/source
         --env-file <stack dir>/agent_stack.env -f <each of stack.COMPOSE_FILES>
 stack.PROJECT and stack.COMPOSE_FILES mirror the Makefile's AGENT_STACK_PROJECT and
@@ -28,6 +28,11 @@ AGENT_STACK_COMPOSE. The -f files are the MCP IMAGE's own copies (stack.TRUSTED_
 the worktree's, which is agent-writable, and the overlay builds every service with the image's own
 Dockerfile (stack.TRUSTED_DOCKERFILE). No argv ever carries a repository path.
 Subprocesses take argument lists, never a shell, with a fixed environment (runner.DOCKER_ENV).
+Before the first step of a verb that can build (stack.builds: `build`, any `--build`, `up`, or a `run`
+of a stack.BUILT_SERVICES service, since compose builds a missing image), the runner has the DAEMON
+make each stack.BASE_IMAGES ref present -- `docker image inspect <ref>`, then `docker pull <ref>` only
+if absent -- and a failed pull stops the verb, naming the ref, before any build (ADR addenda 14-15).
+The trusted Dockerfile pins those refs by digest; no build passes --pull.
 
 THE SNAPSHOT (ADR addendum 5). The Docker daemon never resolves a path an agent can change. Before
 stack_up, migrate, migrate_status and run_system_tests, stack.refresh_snapshot() copies the named (or
@@ -79,7 +84,7 @@ DOCKER API SECTIONS THE VERBS NEED -- the socket proxy (tj-c4mosr.4) enables exa
 docker-socket-proxy's variables, everything else off:
     PING, VERSION, INFO    the CLI's and compose's handshake.
     CONTAINERS             create/start/stop/remove/inspect/logs/wait/attach: up, down, run, logs, ps.
-    IMAGES                 pull postgres and kafka, tag and inspect built images.
+    IMAGES                 pull postgres, kafka and the BASE_IMAGES, tag and inspect images.
     NETWORKS, VOLUMES      the project's networks; compose inspects volumes on up and down.
     BUILD, SESSION, GRPC   image builds through BuildKit (compose build, run --build).
     EVENTS                 compose up --wait and run follow container events.

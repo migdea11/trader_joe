@@ -145,6 +145,14 @@ def truncate(data: bytes) -> dict[str, Any]:
     }
 
 
+class BasePullFailed(Exception):
+    """A BASE_IMAGES ref is absent from the daemon and its pull failed: the verb stops before any build."""
+
+    def __init__(self, ref: str):
+        super().__init__(f'base image {ref} is not on the daemon and could not be pulled; nothing was built')
+        self.ref = ref
+
+
 @dataclass
 class _Call:
     """One verb call in progress: the steps it ran, and its arguments once validated."""
@@ -153,8 +161,27 @@ class _Call:
     steps: list[dict[str, Any]] = field(default_factory=list)
     validated: dict[str, Any] | None = None
     last_exit: int | None = None
+    bases_present: bool = False
+
+    async def ensure_bases(self, cwd: Path) -> None:
+        """Per stack.BASE_IMAGES ref: `docker image inspect`, and `docker pull` only when that fails.
+
+        The DAEMON pulls (ADR tj-4rr0la addendum 14): agent_mcp has no egress, and a build that had
+        to resolve a base itself would fetch the registry token from in here. A failed pull raises
+        BasePullFailed naming the ref, so the build step after it never runs.
+        """
+        for ref in stack.BASE_IMAGES:
+            if (await self.step(stack.base_inspect_step(ref, cwd))).exit_status == 0:
+                continue
+            if (await self.step(stack.base_pull_step(ref, cwd))).exit_status != 0:
+                raise BasePullFailed(ref)
+        self.bases_present = True
 
     async def step(self, step: stack.Step) -> ProcessResult:
+        # Every subprocess passes here, so every build does too: the bases are made present before the
+        # first step that builds, once per verb, whichever verb and whichever builder produced it.
+        if step.builds and not self.bases_present:
+            await self.ensure_bases(step.cwd)
         record: dict[str, Any] = {'command': shlex.join(step.argv), 'exit_status': None}
         self.steps.append(record)
         result = await self.run(step)
@@ -230,6 +257,8 @@ class AgentStack:
                     status, message = await self._handlers[verb](call, **checked)
             except stack.Refused as refusal:
                 status, message = 'refused', str(refusal)
+            except BasePullFailed as failure:
+                status, message = 'failed', f'{verb} stopped: {failure}'
             except TimeoutError:
                 status, message = (
                     'timeout',

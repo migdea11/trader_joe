@@ -49,7 +49,10 @@
 #                     never the snapshot's: FROM and COPY --from are then fixed, so a build cannot
 #                     read other images on the host daemon. compose merges build keys, so context,
 #                     target and args stay from the base and test-client files. The path exists only
-#                     inside the MCP image.
+#                     inside the MCP image. Its external refs are digest-pinned and pulled by the
+#                     daemon before every build (stack.BASE_IMAGES), because buildx would otherwise
+#                     fetch the registry token from inside agent_mcp, which has no egress (ADR
+#                     tj-4rr0la addendum 13).
 #   read-only binds   no service built from agent source gets a writable bind mount (data_store's
 #                     are restated :ro below); the only writable binds are postgres's and kafka's
 #                     DATA_DIR ones.
