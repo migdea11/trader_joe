@@ -72,6 +72,9 @@ PRODUCER_CLOSURE_MOUNTS = {
     ('./tests/fakes', '/code/tests/fakes'),
     ('./data/ingest/app', '/code/data/ingest/app'),
 }
+# tj-7294qb: the repository's alembic ini, a FILE, beside the migrations mount as data_store lays them
+# out, so tests/system/test_migration_with_data.py runs the alembic CLI from cwd data/store with it.
+ALEMBIC_INI_MOUNTS = {('./data/store/alembic.ini', '/code/data/store/alembic.ini')}
 
 DOCKER_STUB = """#!/bin/sh
 printf '%s\\n' "$*" >> "$STUB_LOG"
@@ -107,14 +110,16 @@ def _client_mounts() -> list[dict]:
 
 
 def test_test_client_mounts_are_exactly_the_old_set_plus_the_producers_closure_all_read_only():
-    """V6 / item 1: the three new mounts and nothing else; every mount :ro; never the root or an env path."""
+    """V6 / item 1, plus tj-7294qb's ini: the new mounts, nothing else; all :ro; never the root or an env path."""
     mounts = _client_mounts()
     assert all(mount['type'] == 'bind' and mount['read_only'] for mount in mounts), mounts
     pairs = [(mount['source'], mount['target']) for mount in mounts]
     assert len(pairs) == len(set(pairs)), pairs
-    assert set(pairs) == CLIENT_MOUNTS_BEFORE | PRODUCER_CLOSURE_MOUNTS, sorted(pairs)
+    assert set(pairs) == CLIENT_MOUNTS_BEFORE | PRODUCER_CLOSURE_MOUNTS | ALEMBIC_INI_MOUNTS, sorted(pairs)
     for source, _ in PRODUCER_CLOSURE_MOUNTS:
         assert (REPO_ROOT / source).is_dir(), f'the mount source {source} does not exist'
+    for source, _ in ALEMBIC_INI_MOUNTS:
+        assert (REPO_ROOT / source).is_file(), f'the mount source {source} is not a file'
 
 
 def _writable_binds(model: dict) -> set[tuple[str, str]]:
