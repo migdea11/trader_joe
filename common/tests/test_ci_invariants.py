@@ -2968,24 +2968,50 @@ STOP_STEP = 'Stop System'
 BUILD_CLIENT_STEP = 'Build Test Client'
 SMOKE_STEP = 'Smoke Test'
 LOCKDOWN_STEP = 'Check Network Lockdown'
+START_STEP = 'Start System'
+# tj-irhy0a.1 / tj-irhy0a.2: the fake-mode banner check, and the head seed's dump and upload.
+FAKE_CHECK_STEP = 'Check Fake Broker'
+SEED_DUMP_STEP = 'Seed Dump'
+UPLOAD_SEED_STEP = 'Upload Head Seed'
 SYSTEM_JOB_STEP_ORDER = (
     STAGE_STEP,
     BUILD_CLIENT_STEP,
-    'Start System',
+    START_STEP,
+    FAKE_CHECK_STEP,
     MIGRATE_STEP,
     SMOKE_STEP,
     LOCKDOWN_STEP,
     'Check Container Env',
     SYSTEM_TESTS_STEP,
+    # After the suite (decision tj-vhboky.55) and BEFORE the lifecycle step, which blanks the write
+    # secret the producer authenticates with (architect note of 04:45 UTC 2026-09-30 on tj-irhy0a.1).
+    SEED_DUMP_STEP,
+    UPLOAD_SEED_STEP,
     LIFECYCLE_STEP,
     DUMP_STEP,
     STOP_STEP,
 )
+# The fake-mode overlay (decision tj-j4wknb R4; tj-vhboky.61). In System Testing it is loaded with the
+# base file, in that order, by every `up` -- a container created without it runs data_ingest on the
+# production entrypoint (tj-irhy0a.1 item 1).
+FAKE_OVERLAY_FILE = REPO_ROOT / 'docker-compose.fake.yaml'
+CONTAINER_CREATING_SUBCOMMANDS = frozenset({'up', 'create'})
+# The steps that may, and must, carry SYSTEM_TEST_DISPOSABLE_DB=1: each runs a make target behind the
+# disposable-database guard (test-system, system-launch, seed-dump), and nothing else may inherit it.
+ATTESTING_STEPS = frozenset({SYSTEM_TESTS_STEP, START_STEP, SEED_DUMP_STEP})
 # Steps that must reach the stack, so an empty compose-invocation list cannot pass the file check.
-SYSTEM_JOB_COMPOSE_STEPS = ('Start System', MIGRATE_STEP, 'Check Container Env', LIFECYCLE_STEP, DUMP_STEP, STOP_STEP)
+SYSTEM_JOB_COMPOSE_STEPS = (
+    START_STEP,
+    FAKE_CHECK_STEP,
+    MIGRATE_STEP,
+    'Check Container Env',
+    LIFECYCLE_STEP,
+    DUMP_STEP,
+    STOP_STEP,
+)
 # Steps that drive the stack and nothing else: they must never load the client file, so starting,
 # migrating, inspecting and stopping the stack cannot depend on it.
-SYSTEM_JOB_STACK_ONLY_STEPS = ('Start System', MIGRATE_STEP, 'Check Container Env', DUMP_STEP, STOP_STEP)
+SYSTEM_JOB_STACK_ONLY_STEPS = (START_STEP, FAKE_CHECK_STEP, MIGRATE_STEP, 'Check Container Env', DUMP_STEP, STOP_STEP)
 # Steps that must send at least one request from test_client (tj-q9ae5u addendum 1 item 5').
 SYSTEM_JOB_CLIENT_STEPS = (BUILD_CLIENT_STEP, SMOKE_STEP, LOCKDOWN_STEP, LIFECYCLE_STEP)
 # The one compose subcommands a client invocation may run.
@@ -3143,6 +3169,11 @@ def test_system_job_steps_run_in_order_with_teardown_last():
     Dump Container Logs (on failure) must precede Stop System (always), whose `down -v` destroys
     the containers the dump reads. Everything after the lifecycle step is teardown, and nothing
     before it is conditional, so no check on the way can be skipped.
+
+    tj-irhy0a.2 re-pin (tj-irhy0a.1): Check Fake Broker DIRECTLY follows Start System, so nothing talks
+    to a stack whose data_ingest has not been shown to be the fake; Seed Dump then Upload Head Seed
+    sit after System Tests and before the lifecycle step, whose blanked secret the producer would
+    fail on (exit 1).
     """
     steps = _system_steps()
     names = [step.get('name') for step in steps]
@@ -3151,6 +3182,9 @@ def test_system_job_steps_run_in_order_with_teardown_last():
     positions = [names.index(name) for name in SYSTEM_JOB_STEP_ORDER]
     assert positions == sorted(positions), (
         f'{SYSTEM_JOB_NAME} steps are out of order: expected {list(SYSTEM_JOB_STEP_ORDER)} as a subsequence of {names}'
+    )
+    assert names[names.index(START_STEP) + 1] == FAKE_CHECK_STEP, (
+        f'{FAKE_CHECK_STEP} must directly follow {START_STEP}: {names}'
     )
     lifecycle = names.index(LIFECYCLE_STEP)
     assert names[lifecycle + 1 : lifecycle + 3] == [DUMP_STEP, STOP_STEP], (
@@ -3304,14 +3338,31 @@ def test_system_job_loads_the_stack_alone_and_the_client_only_as_a_pair():
     test_client, a run always removed on exit, with no deps and no TTY. So anything that starts,
     blanks, recreates, inspects or stops the stack names the base file alone, and the stack-only
     steps never load the client file at all. COMPOSE_FILE would do all this behind the flags.
+
+    tj-irhy0a.2 RE-PIN (tj-irhy0a.1 item 1, decision tj-j4wknb R4): a THIRD spelling, the FAKE-MODE
+    STACK -- docker-compose.yaml then docker-compose.fake.yaml, SYSTEM_COMPOSE's set -- and it is the
+    only one an `up` (or `create`) may use. The job starts the stack through make system-launch, so a
+    container created or recreated on the base file alone would bring data_ingest back on the
+    production entrypoint; the lifecycle step's data_store recreate is the one `up` written out in
+    the job, and it must carry the overlay. The base file alone stays the spelling for everything
+    that creates no service container (run --no-deps of a one-off, exec, logs, ps, down); the overlay
+    is loaded for nothing but `up`; the client pair is unchanged.
     """
-    seen, client_steps, offenders = set(), set(), []
+    fake_stack = [COMPOSE_FILE.name, FAKE_OVERLAY_FILE.name]
+    seen, client_steps, fake_ups, offenders = set(), set(), set(), []
     for step in _system_steps():
         name = step.get('name')
         for line in _step_lines(step):
             for files, rest in _compose_calls(line):
                 seen.add(name)
+                if files == fake_stack:
+                    if rest[:1] != ['up']:
+                        offenders.append(f'{name}: the fake-mode set runs {rest[:1]}, not up: {line}')
+                    fake_ups.add(name)
+                    continue
                 if files == [COMPOSE_FILE.name]:
+                    if rest[:1] and rest[0] in CONTAINER_CREATING_SUBCOMMANDS:
+                        offenders.append(f'{name}: `{rest[0]}` on the base file alone drops the fake overlay: {line}')
                     continue
                 if files != _client_file_pair():
                     offenders.append(f'{name}: -f {files} in {line}')
@@ -3328,7 +3379,8 @@ def test_system_job_loads_the_stack_alone_and_the_client_only_as_a_pair():
                     offenders.append(f'{name}: a client run lacks {sorted(CLIENT_RUN_OPTIONS - set(options))}: {line}')
     missing = sorted(set(SYSTEM_JOB_COMPOSE_STEPS) - seen)
     assert not missing, f'no docker compose invocation found in {missing}, so this check saw less than the job runs'
-    assert not offenders, f'{SYSTEM_JOB_NAME} loads compose files outside the two spellings: {offenders}'
+    assert not offenders, f'{SYSTEM_JOB_NAME} loads compose files outside the three spellings: {offenders}'
+    assert LIFECYCLE_STEP in fake_ups, f'{LIFECYCLE_STEP} recreates data_store without the fake-mode overlay'
     without_client = sorted(set(SYSTEM_JOB_CLIENT_STEPS) - client_steps)
     assert not without_client, f'{without_client} send nothing from {TEST_CLIENT_SERVICE}'
 
@@ -3594,16 +3646,23 @@ def test_system_job_never_swallows_a_failure():
 
 
 @pytest.mark.build_infra
-def test_only_the_system_tests_step_attests_a_disposable_database():
-    """tj-vhboky.52 item 2: SYSTEM_TEST_DISPOSABLE_DB=1 on the suite step and nowhere else.
+def test_only_the_guarded_target_steps_attest_a_disposable_database():
+    """tj-vhboky.52 item 2: SYSTEM_TEST_DISPOSABLE_DB=1 on the guarded-target steps and nowhere else.
 
     The attestation is what lets the suite write to a database. Set on the step, nothing else in
     the job inherits it; set at job or workflow level, or exported by a script, it would.
+
+    tj-irhy0a.2 RE-PIN (tj-irhy0a.1 item 1 and its 08:35 UTC note; item 3): make system-launch and
+    make seed-dump sit behind the same guard as make test-system (test_fake_overlay.py,
+    test_seed_dump_make.py), so Start System and Seed Dump carry it too. The property is unchanged:
+    STEP-level only, on exactly the steps that run a guarded target -- ATTESTING_STEPS -- and never
+    on the job, the workflow, another step, a run line or a `with:`.
     """
-    step = _system_step(SYSTEM_TESTS_STEP)
-    assert str((step.get('env') or {}).get(SYSTEM_GUARD)) == '1', (
-        f'{SYSTEM_TESTS_STEP} does not set {SYSTEM_GUARD}=1 in its env: {step.get("env")}'
-    )
+    for name in sorted(ATTESTING_STEPS):
+        step = _system_step(name)
+        assert str((step.get('env') or {}).get(SYSTEM_GUARD)) == '1', (
+            f'{name} does not set {SYSTEM_GUARD}=1 in its env: {step.get("env")}'
+        )
     elsewhere = []
     for path in _workflow_files():
         document = _load_yaml(path) or {}
@@ -3614,18 +3673,18 @@ def test_only_the_system_tests_step_attests_a_disposable_database():
                 elsewhere.append(f'{path.name} {job_id} env')
             for other in (job or {}).get('steps') or []:
                 where = f'{path.name} {job_id} / {other.get("name")}'
-                is_suite_step = (
+                is_attesting_step = (
                     path == TESTING_WORKFLOW
                     and (job or {}).get('name') == SYSTEM_JOB_NAME
-                    and other.get('name') == SYSTEM_TESTS_STEP
+                    and other.get('name') in ATTESTING_STEPS
                 )
-                if not is_suite_step and SYSTEM_GUARD in (other.get('env') or {}):
+                if not is_attesting_step and SYSTEM_GUARD in (other.get('env') or {}):
                     elsewhere.append(f'{where} env')
                 if any(SYSTEM_GUARD in line for line in _step_lines(other)):
                     elsewhere.append(f'{where} run')
                 if any(SYSTEM_GUARD in scalar for scalar in _walk_scalars(other.get('with') or {})):
                     elsewhere.append(f'{where} with')
-    assert not elsewhere, f'{SYSTEM_GUARD} is set outside {SYSTEM_TESTS_STEP}: {elsewhere}'
+    assert not elsewhere, f'{SYSTEM_GUARD} is set outside {sorted(ATTESTING_STEPS)}: {elsewhere}'
 
 
 @pytest.mark.build_infra
@@ -3697,7 +3756,9 @@ def test_the_testing_workflow_stays_under_the_broker_credential_rule():
     test_branch_triggered_workflow_holds_no_broker_credential skips a workflow outside the branch
     reach, so this first pins that the testing workflow is inside it. Then the System Testing job
     -- every key and value, run scripts included -- names no ALPACA_/IBKR_/QUESTRADE_ variable at
-    all, credential or not: it runs without a broker, and the fake-broker overlay is a later PR.
+    all, credential or not: it runs without a broker. Since tj-irhy0a.1 the job runs data_ingest on
+    the fake-mode overlay, which blanks the broker keys itself (docker-compose.fake.yaml, pinned in
+    test_fake_overlay.py); the workflow still names none.
     """
     assert TESTING_WORKFLOW.name in _branch_reach(), (
         f'{TESTING_WORKFLOW.name} is no longer branch-triggered, so the tj-59cce6 test skips it'

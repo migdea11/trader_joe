@@ -17,7 +17,7 @@ compose_model, and make runs for real with `docker` stubbed first on PATH. What 
 import ast
 import os
 import shlex
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -40,6 +40,7 @@ from common.tests.test_ci_invariants import (
     _compose_calls,
     _compose_projects,
     _dockerfile_copy_sources,
+    _dockerfile_stages,
     _expanded_make_variable,
     _make_recipe,
     _run_make,
@@ -338,9 +339,32 @@ def test_no_dockerfile_copy_reads_the_test_tree():
     """R4: the fakes reach a container only through the overlay's mount, never an image layer.
 
     Every context path the root Dockerfile COPYs or ADDs (build args expanded from compose) lies
-    outside the repository-root tests/ -- neither tests/ itself nor anything under it.
+    outside the repository-root tests/ -- neither tests/ itself, nor anything under it, nor (tj-irhy0a.2,
+    the architect's 08:35 UTC 2026-09-30 gap) an ANCESTOR of it: `COPY . /code` normalises to '.', which
+    would carry tests/fakes into the image while naming no path under tests/. .dockerignore does not
+    exclude the top-level tests/ (only the in-package test directories), so this pin, not the ignore
+    file, is what keeps the fakes out of every image.
     """
     sources = _dockerfile_copy_sources()
     assert {'common', 'routers', 'schemas', 'data/ingest/app'} <= sources, sources
-    offending = sorted(source for source in sources if source == 'tests' or source.startswith('tests/'))
-    assert offending == [], f'the Dockerfile copies the test tree: {offending}'
+    test_tree = PurePosixPath('tests')
+    offending = sorted(
+        source
+        for source in sources
+        if PurePosixPath(source).is_relative_to(test_tree) or test_tree.is_relative_to(PurePosixPath(source))
+    )
+    assert offending == [], f'the Dockerfile copies the test tree, or a directory holding it: {offending}'
+
+
+def test_the_system_test_image_copies_no_source():
+    """tj-irhy0a.2 item 4: system_test_image adds no COPY or ADD of its own.
+
+    compose bind-mounts its sources read-only (the Dockerfile's comment above the stage), so a test
+    edit needs no rebuild and a stale image cannot run old tests. What it inherits from
+    base_build_image (pyproject.toml and uv.lock) is that stage's, not this one's.
+    """
+    stages = _dockerfile_stages()
+    assert 'system_test_image' in stages, sorted(stages)
+    _, body = stages['system_test_image']
+    copies = [line.strip() for line in body.splitlines() if line.strip().split(maxsplit=1)[:1] in (['COPY'], ['ADD'])]
+    assert copies == [], f'system_test_image copies files into itself: {copies}'
