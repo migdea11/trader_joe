@@ -91,8 +91,10 @@ $(VENV_MARKER): pyproject.toml uv.lock $(VENV_PYTHON)  ## Internal option to ins
 # and so are not covered by `default-groups`. The group set matches CI, less `security` —
 # that tooling is heavy and only `make security` needs it. UV_FROZEN makes this install the
 # committed lock as-is: a pyproject.toml edit mid-work does not block the sync, and it does not
-# re-lock either -- a new dependency reaches the venv only after `make lock`.
-	uv sync --all-groups --no-group security
+# re-lock either -- a new dependency reaches the venv only after `make lock`. agent-mcp is left out
+# as well: it belongs to the agent-stack MCP's own image (tools/agent_mcp/Dockerfile) and nothing
+# that runs in this venv imports it.
+	uv sync --all-groups --no-group security --no-group agent-mcp
 	touch $(VENV_MARKER)
 
 # The one deliberate re-lock. Everything else runs frozen, so this is the only target that can
@@ -105,9 +107,10 @@ lock:  ## Re-resolve uv.lock from pyproject.toml (the only target that changes t
 	$(UV_PIN_CHECK)
 	env -u UV_FROZEN uv lock
 
+# Every group but agent-mcp, which only tools/agent_mcp/Dockerfile installs (see the venv sync).
 .PHONY: init
 init: $(VENV_MARKER)  ## Initialize the project, including the security tooling
-	uv sync --all-groups
+	uv sync --all-groups --no-group agent-mcp
 
 # Every compose target goes through one of these, and none omits -f. A bare
 # `docker compose` auto-loads docker-compose.override.yaml, which is what made `launch`
@@ -133,6 +136,21 @@ PROD_COMPOSE := docker compose -f docker-compose.yaml
 # which is also what keeps a dev session off a prod stack on the same machine.
 DEV_COMPOSE := docker compose -f docker-compose.yaml -f docker-compose.override.yaml
 TOOLS_COMPOSE := $(DEV_COMPOSE) -f docker-compose.tools.yaml
+# THE AGENT STACK (ADR tj-4rr0la section 1 and addendum 1). The isolated stack the agent-stack MCP
+# drives from an agent's worktree, under its own compose project so it never shares a container,
+# network or volume with the stack prod-launch or the dev targets start (both use the default
+# project, the checkout's directory name). The base file, the test client, then
+# docker-compose.agent-stack.yaml so its names and image tags win over both, then the fake-mode
+# overlay docker-compose.fake.yaml AFTER it (tj-vhboky.61; ADR tj-4rr0la addendum 3 (3)), so the
+# agent stack's data_ingest always runs on FakeRead -- it has no egress and no broker key anyway,
+# and the fake overlay touches nothing the agent-stack overlay sets. The server passes its
+# generated env file as well, never the user's .env, and that env also points the services' env
+# files outside the repository (ROOT_ENV_FILE, STORE_ENV_FILE, INGEST_ENV_FILE; addendum 2). No
+# target here uses these: the MCP server is their only reader. And the mirror of the rule above:
+# PROD_COMPOSE, DEV_COMPOSE and TOOLS_COMPOSE never load the agent-stack overlay, and this set
+# never loads the dev override or the tools file -- no devnet, no publish.
+AGENT_STACK_PROJECT := trader_joe_agent_stack
+AGENT_STACK_COMPOSE := docker compose -p $(AGENT_STACK_PROJECT) -f docker-compose.yaml -f docker-compose.test-client.yaml -f docker-compose.agent-stack.yaml -f docker-compose.fake.yaml
 
 # The dev network: an ordinary bridge (NOT internal) owned by neither compose project, which the
 # dev stack, pgAdmin and the agent devcontainer all join, so either side can start first. Its
@@ -284,23 +302,240 @@ AGENT_COMPOSE := docker compose -f .devcontainer/compose.yml
 # create the missing bind source as a root-owned directory the agent user cannot write to.
 # Exported so compose.yml resolves the same path this file does.
 export AGENT_HOME_PATH ?= $(HOME)/.claude-agent-homes/trader_joe
+# The agent-stack MCP's SHARE directory (ADR tj-4rr0la addendum 11 R2): the token file and seed
+# output, and nothing else -- never inside AGENT_HOME_PATH, the user's Claude config, which the MCP
+# must not see. Bound at /agent_mcp_share in both the devcontainer and agent_mcp.
+# TRANSIENT BY DESIGN (the user's ruling on tj-c4mosr.4): $XDG_RUNTIME_DIR (/run/user/<uid>: per-user
+# tmpfs, wiped at logout or reboot), or /tmp/trader_joe_agent_mcp-<uid> only when XDG_RUNTIME_DIR is
+# unset or empty. The server regenerates the token when it is missing. agent-mcp-share creates it 0700
+# and refuses one that is a symlink, not ours or not 0700. One overridable variable; the default is
+# spelled the same in three places, which must agree: here, .devcontainer/compose.yml and the
+# initializeCommand in .devcontainer/devcontainer.json. Computed once (:=), so `id` runs once.
+ifeq ($(strip $(AGENT_MCP_SHARE_PATH)),)
+AGENT_MCP_SHARE_PATH := $(if $(XDG_RUNTIME_DIR),$(XDG_RUNTIME_DIR)/trader_joe_agent_mcp,/tmp/trader_joe_agent_mcp-$(shell id -u))
+endif
+export AGENT_MCP_SHARE_PATH
 
+# Creates the share directory 0700 if it is missing, then REFUSES -- naming the path and what it found
+# -- unless it is a real directory (lstat: a symlink is refused, never followed), owned by the invoking
+# user, mode exactly 0700. /tmp is shared by every user, so an existing path there is someone's claim
+# until proven ours. The same check is inlined in the initializeCommand. Docker-free; GNU stat.
+.PHONY: agent-mcp-share
+agent-mcp-share:  ## Create the agent-stack MCP's share directory 0700, refusing one not owned by you or not 0700 (no Docker)
+	@s="$(AGENT_MCP_SHARE_PATH)"; \
+	case "$$s" in /*) ;; *) echo "make agent-mcp-share: AGENT_MCP_SHARE_PATH must be absolute: '$$s'" >&2; exit 1;; esac; \
+	[ -e "$$s" ] || [ -L "$$s" ] || { mkdir -p "$$(dirname "$$s")" && mkdir -m 0700 "$$s"; } 2> /dev/null; \
+	[ -e "$$s" ] || [ -L "$$s" ] || { echo "make agent-mcp-share: could not create $$s" >&2; exit 1; }; \
+	if [ -L "$$s" ] || [ ! -d "$$s" ] || [ "$$(stat -c %u:%a "$$s")" != "$$(id -u):700" ]; then \
+		echo "make agent-mcp-share: refusing $$s: it must be a directory (not a symlink) owned by uid $$(id -u) with mode 700; found $$(stat -c '%F, uid %u, mode %a' "$$s")" >&2; \
+		exit 1; \
+	fi
+
+# Rebuilding the devcontainer also rebuilds the agent-stack MCP (the user's ruling on tj-c4mosr.4,
+# F-B option A; ADR tj-4rr0la addendum 9 (2)): its image takes its trusted files from root's working
+# tree, and this is the make path's "devcontainer rebuild". The IDE's Rebuild Container cannot be told
+# apart from a start on the host (initializeCommand runs before the old container is removed), so after
+# one the user runs `make agent-mcp-rebuild` by hand -- no watcher, no next-start check.
+# A RECIPE LINE after the devcontainer build, like agent-up's MCP start: a failed devcontainer build
+# still stops make, a failed MCP rebuild warns and does not. AGENT_MCP=off skips it, as it does there.
 .PHONY: agent-build
-agent-build:  ## Build the agent devcontainer image
+agent-build:  ## Build the agent devcontainer image, then rebuild the agent-stack MCP (AGENT_MCP=off skips it)
 	$(AGENT_COMPOSE) build
+	@if [ "$(AGENT_MCP)" != off ]; then \
+		$(MAKE) --no-print-directory agent-mcp-rebuild \
+			|| echo "WARNING: the agent-stack MCP was not rebuilt and keeps its previous image. Retry with 'make agent-mcp-rebuild', or skip it with AGENT_MCP=off." >&2; \
+	fi
 
+# The agent-stack MCP starts with the devcontainer unless AGENT_MCP=off (make agent-up AGENT_MCP=off,
+# or AGENT_MCP=off in the environment) -- the user's rulings, ADR tj-4rr0la addendum 7, not defaults
+# open to change. A RECIPE LINE, not a prerequisite: a failed prerequisite stops make, and a failed
+# MCP start must warn and let the devcontainer start anyway. agent-mcp-network IS a prerequisite:
+# compose.yml joins trader_joe_agent_mcp, so it has to exist even with the MCP off -- and so must the
+# share directory it binds.
 .PHONY: agent-up
-agent-up: dev-network  ## Start the agent devcontainer
+agent-up: dev-network agent-mcp-network agent-mcp-share  ## Start the agent devcontainer and the agent-stack MCP (AGENT_MCP=off skips the MCP; ruled, tj-4rr0la add. 7)
 	mkdir -p "$(AGENT_HOME_PATH)"
+	@if [ "$(AGENT_MCP)" != off ]; then \
+		$(MAKE) --no-print-directory agent-mcp-up \
+			|| echo "WARNING: the agent-stack MCP did not start; the devcontainer starts without it. Retry with 'make agent-mcp-up', or skip it with AGENT_MCP=off." >&2; \
+	fi
 	$(AGENT_COMPOSE) up -d
 
+# Leaves the agent-stack MCP running (ruled, tj-4rr0la addendum 7): the IDE path has no host-side stop
+# hook, so the make path does not stop it either. make agent-mcp-down does.
 .PHONY: agent-down
-agent-down:  ## Stop the agent devcontainer (host config dir is kept)
+agent-down:  ## Stop the agent devcontainer (host config dir is kept; the agent-stack MCP keeps running)
 	$(AGENT_COMPOSE) down
 
 .PHONY: agent-attach
 agent-attach:  ## Open a shell inside the agent devcontainer
 	$(AGENT_COMPOSE) exec agent bash
+
+# THE AGENT-STACK MCP (ADR tj-4rr0la addenda 1, 4, 5, 7, 9 and 11; tj-c4mosr.4):
+# docker-compose.agent-mcp.yaml, the server in its own container plus the socket proxy. HOST ONLY: the
+# devcontainer has no Docker, by standing rule, so these targets cannot run inside it. No
+# $(VENV_MARKER) or uv prerequisite -- they must run on a bare host, because the IDE's
+# initializeCommand calls agent-mcp-up on every start.
+#
+# The compose invocation is pinned to the ROOT checkout, wherever make runs: --project-directory and
+# -f name the main worktree (git's common directory, less /.git), so the image is always built from
+# root's working tree (the source ruled on tj-h8yf91). --env-file /dev/null: compose would otherwise
+# read the project directory's live env file for interpolation; this file needs none of it, and every
+# variable it interpolates is set on this line. -p restates the file's own name: for the reader.
+AGENT_MCP_PROJECT := trader_joe_agent_mcp
+# The devcontainer's route to the MCP. INTERNAL (no gateway), unlike devnet. Its fixed name appears in
+# four places, which must agree: this variable, docker-compose.agent-mcp.yaml, .devcontainer/compose.yml
+# and the initializeCommand in .devcontainer/devcontainer.json.
+AGENT_MCP_NETWORK := trader_joe_agent_mcp
+# The root checkout's HOST path: the source of agent_mcp's read-only /workspace bind (addendum 11 R1)
+# and the MCP project's own --project-directory. Recursive (=), so git runs only when an MCP recipe
+# expands it, never on `make test`.
+AGENT_MCP_REPO_HOST_PATH = $(patsubst %/.git,%,$(shell git rev-parse --path-format=absolute --git-common-dir))
+# The agent stack's own directory, outside the repository, AGENT_HOME_PATH and the share directory
+# (agent-mcp-paths refuses otherwise): generated env files, data, snapshot, audit log.
+# tools/agent_mcp/settings.py documents it.
+AGENT_MCP_STACK_DIR ?= $(or $(XDG_DATA_HOME),$(HOME)/.local/share)/trader_joe_agent_stack
+AGENT_MCP_COMPOSE = AGENT_MCP_REPO_HOST_PATH="$(AGENT_MCP_REPO_HOST_PATH)" \
+	AGENT_MCP_STACK_DIR="$(AGENT_MCP_STACK_DIR)" AGENT_MCP_SHARE_PATH="$(AGENT_MCP_SHARE_PATH)" \
+	AGENT_MCP_UID="$$(id -u)" AGENT_MCP_GID="$$(id -g)" \
+	docker compose -p $(AGENT_MCP_PROJECT) --project-directory "$(AGENT_MCP_REPO_HOST_PATH)" --env-file /dev/null \
+	-f "$(AGENT_MCP_REPO_HOST_PATH)/docker-compose.agent-mcp.yaml"
+
+# Idempotent and race-safe the dev-network way (look, else create, else look again), but INTERNAL:
+# only the devcontainer and agent_mcp join it, and neither needs a gateway through it. Never removed.
+# Whether an existing network really is internal is checked by agent-mcp-up, not here: agent-up needs
+# the network to exist even with AGENT_MCP=off, and must not fail on the MCP's account.
+.PHONY: agent-mcp-network
+agent-mcp-network:  ## Create the internal agent-stack MCP network if it is missing (never removed)
+	@docker network inspect $(AGENT_MCP_NETWORK) > /dev/null 2>&1 \
+		|| docker network create --driver bridge --internal $(AGENT_MCP_NETWORK) > /dev/null \
+		|| docker network inspect $(AGENT_MCP_NETWORK) > /dev/null
+
+# THE HOST PATH CHECK (addendum 11 R2). DOCKER-FREE, so it can be run for real anywhere. With
+# the repository seen at /workspace inside agent_mcp, settings.py's own 'stack dir outside the
+# repository' checks compare a host path with a container path and prove nothing; this replaces them,
+# on the host, before every start and rebuild. The share directory comes from its prerequisite
+# agent-mcp-share. It creates the other directories (0700, except the agent home
+# directory, which agent-up owns), resolves every path, and refuses -- exit 1, naming both paths --
+# unless:
+#   AGENT_MCP_STACK_DIR   lies outside, and does not contain, the repository, AGENT_HOME_PATH and
+#                         AGENT_MCP_SHARE_PATH (the snapshot's premise: only the MCP writes there);
+#   AGENT_MCP_SHARE_PATH  lies outside, and does not contain, the repository and AGENT_HOME_PATH (its
+#                         own mount, so the agent cannot swap it for a symlink the daemon follows);
+#   AGENT_HOME_PATH       lies outside the repository.
+# (The rebuild trigger the user chose, agent-build and agent-mcp-rebuild, keeps no host state, so
+# addendum 11 R4's marker directory and its rules are not needed.)
+.PHONY: agent-mcp-paths
+agent-mcp-paths: agent-mcp-share  ## Check the agent-stack MCP's host paths do not overlap (no Docker; run by agent-mcp-up/-rebuild)
+	@mkdir -p "$(AGENT_HOME_PATH)" \
+		&& mkdir -p -m 0700 "$(AGENT_MCP_STACK_DIR)" || exit 1; \
+	repo=$$(realpath "$(AGENT_MCP_REPO_HOST_PATH)") && home=$$(realpath "$(AGENT_HOME_PATH)") \
+		&& share=$$(realpath "$(AGENT_MCP_SHARE_PATH)") && stack=$$(realpath "$(AGENT_MCP_STACK_DIR)") || exit 1; \
+	within() { case "$$1/" in "$${2%/}"/*) return 0;; esac; return 1; }; \
+	refuse() { echo "make agent-mcp-paths: $$1 ($$2) must lie outside $$3 ($$4)$$5" >&2; bad=1; }; \
+	apart() { within "$$2" "$$4" && refuse "$$1" "$$2" "$$3" "$$4"; within "$$4" "$$2" && refuse "$$1" "$$2" "$$3" "$$4" ", and not contain it"; :; }; \
+	outside() { within "$$2" "$$4" && refuse "$$1" "$$2" "$$3" "$$4"; :; }; \
+	bad=0; \
+	apart AGENT_MCP_STACK_DIR "$$stack" "the repository" "$$repo"; \
+	apart AGENT_MCP_STACK_DIR "$$stack" AGENT_HOME_PATH "$$home"; \
+	apart AGENT_MCP_STACK_DIR "$$stack" AGENT_MCP_SHARE_PATH "$$share"; \
+	apart AGENT_MCP_SHARE_PATH "$$share" "the repository" "$$repo"; \
+	apart AGENT_MCP_SHARE_PATH "$$share" AGENT_HOME_PATH "$$home"; \
+	outside AGENT_HOME_PATH "$$home" "the repository" "$$repo"; \
+	exit $$bad
+
+# The MCP project's containers, found by the labels compose puts on them -- no compose file read.
+# oneoff=False leaves out any `compose run` container of the project.
+AGENT_MCP_CONTAINER = docker ps -aq --filter label=com.docker.compose.project=$(AGENT_MCP_PROJECT) \
+	--filter label=com.docker.compose.service=$(1) --filter label=com.docker.compose.oneoff=False
+
+# Shared by agent-mcp-up and agent-mcp-rebuild: the network must really be internal. (The mount
+# sources are created by agent-mcp-paths, a prerequisite of both.)
+define AGENT_MCP_PREFLIGHT
+@[ "$$(docker network inspect -f '{{.Internal}}' $(AGENT_MCP_NETWORK))" = true ] || { \
+	echo "make $@: network $(AGENT_MCP_NETWORK) exists but is not internal; remove that network by hand and re-run." >&2; \
+	exit 1; }
+endef
+
+define AGENT_MCP_ANNOUNCE
+@echo "agent-stack MCP: http://agent_mcp:8765/mcp, from the devcontainer over $(AGENT_MCP_NETWORK)"
+@echo "bearer token file: $(AGENT_MCP_SHARE_PATH)/agent_mcp_token on the host, /agent_mcp_share/agent_mcp_token in the devcontainer (not printed)"
+endef
+
+# THE PLAIN START -- what agent-up and the IDE's initializeCommand run on every start. IDEMPOTENT.
+# It NEVER APPLIES docker-compose.agent-mcp.yaml to an existing container (ADR tj-4rr0la addendum 9 (a);
+# addendum 11 R3): `compose up` recreates a container whose configuration changed, so an up at every
+# start would put an unreviewed edit to that file -- a new mount, the socket on agent_mcp -- live with no
+# rebuild. The label lookup must find EXACTLY ONE container per service:
+#   one each    `docker start` on both, which reads no compose file at all (stronger than
+#               `compose start`, which still parses it), then a bounded wait on agent_mcp's healthcheck
+#               (the token gate answering 401). The share directory is transient: if logout wiped it
+#               while agent_mcp kept running, its bind still points at the old, unreachable directory
+#               and the host's new one has no token. Then agent_mcp is `docker restart`ed: a restart
+#               re-resolves the bind source (same config, no compose file read) and the server writes
+#               a new token at start (auth.load_or_create_token). A devcontainer already running keeps
+#               its own bind to the OLD directory and gets 401 until it is restarted too, so this
+#               branch also tells the user so on stderr. It never restarts the devcontainer itself:
+#               that would kill live agent sessions (ADR tj-4rr0la addendum 12, F2);
+#   any zero    the CREATE branch: `compose up --no-recreate`, from the existing image, building only if
+#               that is missing. The first-ever create is inside addendum 9 (3), and only a user action
+#               removes these containers (agent-mcp-down keeps them; no verb reaches this project), so it
+#               is user-caused. --no-recreate is why a partial state -- one container left -- creates only
+#               the missing one and never re-applies the file to the survivor;
+#   any two+    refuse and start nothing; agent-mcp-rebuild recreates the project cleanly.
+#
+# NO REBUILD HERE, and no rebuild detection: a plain start stays start-only (the user's ruling on
+# tj-c4mosr.4, F-B option A). The image, with the trusted compose files and Dockerfile baked in, is
+# rebuilt only by agent-mcp-rebuild -- run by `make agent-build`, or by hand after the IDE's Rebuild
+# Container (tj-h8yf91; addendum 9).
+#
+# Prints the URL and the token FILE, never the token.
+.PHONY: agent-mcp-up
+agent-mcp-up: agent-mcp-network agent-mcp-paths  ## Start the agent-stack MCP's existing containers (host only; never rebuilds -- see agent-mcp-rebuild)
+	$(AGENT_MCP_PREFLIGHT)
+	@proxy=$$($(call AGENT_MCP_CONTAINER,socket_proxy)) && mcp=$$($(call AGENT_MCP_CONTAINER,agent_mcp)) || exit 1; \
+	np=$$(echo $$proxy | wc -w); nm=$$(echo $$mcp | wc -w); \
+	if [ "$$np" -gt 1 ] || [ "$$nm" -gt 1 ]; then \
+		echo "make agent-mcp-up: project $(AGENT_MCP_PROJECT) has $$np socket_proxy and $$nm agent_mcp containers, expected one each; started nothing. Run 'make agent-mcp-rebuild'." >&2; \
+		exit 1; \
+	elif [ "$$np" -eq 1 ] && [ "$$nm" -eq 1 ]; then \
+		healthy() { for i in $$(seq 60); do \
+			health=$$(docker inspect -f '{{.State.Health.Status}}' $$mcp); \
+			[ "$$health" = healthy ] && return 0; \
+			[ "$$i" = 60 ] && { echo "make agent-mcp-up: agent_mcp is still '$$health' after 120s" >&2; return 1; }; \
+			sleep 2; \
+		done; }; \
+		docker start $$proxy $$mcp > /dev/null && healthy || exit 1; \
+		if [ ! -e "$(AGENT_MCP_SHARE_PATH)/agent_mcp_token" ]; then \
+			echo "make agent-mcp-up: no token in $(AGENT_MCP_SHARE_PATH) (the share directory was wiped under a running MCP); restarting agent_mcp to bind the new directory and generate one." >&2; \
+			docker restart $$mcp > /dev/null && healthy || exit 1; \
+			echo "make agent-mcp-up: a devcontainer that is already running keeps the old share directory and gets 401 from the MCP until it is restarted: 'make agent-down && make agent-up', or close and reopen it in the IDE." >&2; \
+		fi; \
+	else \
+		$(AGENT_MCP_COMPOSE) up -d --wait --wait-timeout 120 --no-recreate; \
+	fi
+	$(AGENT_MCP_ANNOUNCE)
+
+# THE FORCED REBUILD (addendum 9 (c)): rebuilds the image from root's WORKING TREE -- the trusted compose
+# files, the trusted Dockerfile and tools/agent_mcp as they stand there, trusted without review (the
+# residual the user accepted, addendum 9 (3)) -- and recreates both containers from the current compose
+# file. The one target that applies docker-compose.agent-mcp.yaml to existing containers.
+# --remove-orphans (addendum 11 R3): a service renamed or dropped in the file must not leave its old
+# container -- possibly one holding docker.sock -- running beside the new one.
+.PHONY: agent-mcp-rebuild
+agent-mcp-rebuild: agent-mcp-network agent-mcp-paths  ## Rebuild and recreate the agent-stack MCP from root's working tree: after the IDE's Rebuild Container, or after changing MCP files (host only; agent-build runs it)
+	$(AGENT_MCP_PREFLIGHT)
+	$(AGENT_MCP_COMPOSE) up -d --wait --wait-timeout 120 --build --force-recreate --remove-orphans
+	$(AGENT_MCP_ANNOUNCE)
+
+# STOPS the MCP and its proxy and KEEPS the containers (addendum 9 (a)), so the next plain start
+# re-reads no compose file. `docker stop` by label, like the start: no compose file read here either.
+# The agent STACK the MCP drives is a separate project: stop it first with the stack_down verb (or
+# leave it; it keeps its data). The external network stays.
+.PHONY: agent-mcp-down
+agent-mcp-down:  ## Stop (not remove) the agent-stack MCP and its socket proxy (the agent stack itself: stack_down verb)
+	@ids="$$($(call AGENT_MCP_CONTAINER,agent_mcp)) $$($(call AGENT_MCP_CONTAINER,socket_proxy))"; \
+	[ -z "$$(echo $$ids)" ] || docker stop $$ids > /dev/null
 
 # dev-down, not prod-down: this is a workstation target -- it deletes the venv -- and dev-down is
 # the one teardown that loads docker-compose.tools.yaml, so going through it leaves no pgAdmin
@@ -317,7 +552,9 @@ lint: $(VENV_MARKER)  ## Lint and format-check the project (scope with PATHS=)
 	uv run ruff check $(PATHS)
 	uv run ruff format --check $(PATHS)
 
-SOURCE_DIRS := ./common ./routers ./schemas ./data
+# ./tools holds the agent-stack MCP server (tools/agent_mcp, ADR tj-4rr0la section 6): build
+# tooling, but it holds Docker access, so bandit reads it like production source.
+SOURCE_DIRS := ./common ./routers ./schemas ./data ./tools
 .PHONY: lint-fix
 lint-fix: $(VENV_MARKER)  ## Apply lint fixes and formatting (scope with PATHS=)
 	uv run ruff check --fix $(PATHS)
@@ -334,13 +571,16 @@ lint-fix: $(VENV_MARKER)  ## Apply lint fixes and formatting (scope with PATHS=)
 # common/tests, data/store/tests and the rest: a thousand findings in test files. The glob exists
 # nowhere as a directory, so it is matched as written, against every nested tests directory and
 # no production path. The CI security job runs the identical line; change both or neither.
+# requirements.txt is removed whatever the export or pip-audit returns (tj-0pobey.6): a bare
+# `rm` line after pip-audit never ran when pip-audit found something, leaving the file behind in
+# the working tree. The cleanup sits AFTER each command, so the export and pip-audit invocations
+# stay CI's; each one's status is captured and re-raised, so a finding still fails this target.
 .PHONY: security
 security: $(VENV_MARKER)  ## Check security vulnerabilities
 	uv run bandit -r $(SOURCE_DIRS) --exclude '*/tests/*'
 	uv run semgrep --config=auto --error --exclude=tests/ --exclude=.venv --exclude=docker-compose.override.yaml --exclude=.claude/worktrees .
-	uv export --all-groups --no-group dev --no-group testing --no-group security --locked --format requirements-txt > requirements.txt
-	uv run pip-audit -r requirements.txt --disable-pip
-	rm requirements.txt
+	uv export --all-groups --no-group dev --no-group testing --no-group security --locked --format requirements-txt > requirements.txt || { status=$$?; rm -f requirements.txt; exit $$status; }
+	uv run pip-audit -r requirements.txt --disable-pip; status=$$?; rm -f requirements.txt; exit $$status
 
 # Deliberately independent of `lint`: a test run must report a test result, not a lint failure.
 # CI runs both, as separate steps.
@@ -467,17 +707,93 @@ test-all: $(VENV_MARKER)  ## Run every test, external included: needs live crede
 TEST_CLIENT_COMPOSE := docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml
 SYSTEM_PATHS ?= tests/system
 
+# The disposable-database guard itself, ONE definition shared by test-system, system-launch and
+# seed-dump, so the three cannot drift apart. $@ names whichever target refused; the text is generic,
+# with one line per user saying how that target reaches the database.
+define SYSTEM_TEST_DISPOSABLE_GUARD
+@if [ "$(SYSTEM_TEST_DISPOSABLE_DB)" != "1" ]; then \
+	echo "make $@ REFUSED: this target WRITES to the database it is pointed at -- the one the default" >&2; \
+	echo "  compose project's stack holds -- and this host may also run the production deployment, in that" >&2; \
+	echo "  same compose project:" >&2; \
+	echo "    test-system:   the suite's client joins its networks and writes to its database;" >&2; \
+	echo "    system-launch: replaces its data_ingest with the fake, which writes fake bars;" >&2; \
+	echo "    seed-dump:     the producer POSTs its scenario into it." >&2; \
+	echo "  Run it only against a stack you can wipe: bring one up and migrate it" >&2; \
+	echo "  (make system-launch or make dev-launch, then make migrate), then run:" >&2; \
+	echo "    make $@ SYSTEM_TEST_DISPOSABLE_DB=1" >&2; \
+	exit 1; \
+fi
+endef
+
 .PHONY: test-system
 test-system:  ## Run tests/system from the test_client container against an up, migrated stack (SYSTEM_TEST_DISPOSABLE_DB=1)
-	@if [ "$(SYSTEM_TEST_DISPOSABLE_DB)" != "1" ]; then \
-		echo "make test-system REFUSED: the system suite WRITES to the database it is pointed at," >&2; \
-		echo "  and this host may also run the production deployment, whose networks the client would join." >&2; \
-		echo "  Run it only against a stack you can wipe: bring one up and migrate it" >&2; \
-		echo "  (make dev-launch, make migrate), then run:" >&2; \
-		echo "    make test-system SYSTEM_TEST_DISPOSABLE_DB=1" >&2; \
-		exit 1; \
-	fi
+	$(SYSTEM_TEST_DISPOSABLE_GUARD)
 	@[ -f .env ] || { echo "make test-system: no .env in $(CURDIR); compose interpolates the stack's credentials from it." >&2; exit 1; }
 	@echo "System suite from test_client against data_store (service data_store, on store_api) and Postgres (service postgres, on store_db); TZ set in docker-compose.test-client.yaml and checked by the client's entrypoint."
 	@echo "The database password and the instance write secret reach the container from .env through compose (values not shown)."
 	$(TEST_CLIENT_COMPOSE) run --rm --no-deps --build test_client $(SYSTEM_PATHS)
+
+# THE FAKE-MODE STACK (decision tj-j4wknb R4; tj-vhboky.61): the stack docker-compose.yaml defines,
+# from the PROD images, with docker-compose.fake.yaml on top -- data_ingest runs the test-only launcher
+# on FakeRead from a read-only mount of tests/fakes, one worker, broker keys blanked. Nothing else
+# differs from prod-launch. The system suite runs against it: make system-launch, make migrate, then
+# make test-system.
+#
+# PROD_COMPOSE never loads the fake-mode overlay, just as it never loads the dev override: the prod
+# image holds no fakes, and the only way a fake reaches a running service is this file list (or the
+# agent stack's, AGENT_STACK_COMPOSE).
+SYSTEM_COMPOSE := docker compose -f docker-compose.yaml -f docker-compose.fake.yaml
+
+# Behind the SAME disposable-database guard as test-system: this runs in the default compose project,
+# the one prod-launch uses, so on a host that runs the production deployment it would recreate that
+# stack's data_ingest as the fake, and fake bars would reach its database. The same --wait as PROD_UP
+# (spelled out rather than shared, so PROD_UP stays as it is). No build: like prod-launch it starts the
+# images prod-build made, so build first after a change. No $(VENV_MARKER), for the reason test-system
+# has none. No stop target of its own: every service here is in docker-compose.yaml, so `make
+# prod-down` (or dev-down) stops and removes this stack cleanly.
+.PHONY: system-launch
+system-launch:  ## Start the stack from the prod images with data_ingest on the fake broker, waiting for healthy (SYSTEM_TEST_DISPOSABLE_DB=1)
+	$(SYSTEM_TEST_DISPOSABLE_GUARD)
+	$(SYSTEM_COMPOSE) up -d --wait --wait-timeout 300
+
+# THE SEED DUMP (ADR tj-4rr0la addendum 10 (4); decision tj-vhboky.55 S9-S11). Against the stack
+# system-launch started -- up, migrated (make migrate) and in fake mode -- with the test-client file
+# added, it runs the producer in test_client by the ONE invocation the agent-stack MCP's seed_dump
+# verb also uses: `compose run --rm -T --entrypoint /code/.venv/bin/python test_client -m
+# data.store.seeds [--date D]`. The producer POSTs its own scenario to data_store (tj-vhboky.55) and
+# reads Postgres, over the stack's networks from the client container -- never `docker exec` into a
+# service. It writes nothing: its stdout is the one-line bundle, its stderr the messages.
+#
+# THE HOST WRITER is data.store.seeds.bundle in the host venv, the ONE host-side no-follow writer
+# (S11): stdout is piped to `python -m data.store.seeds.bundle --out $(SEED_OUT)`, which writes
+# <revision>.sql and <revision>.json there. SEED_OUT defaults to output/seeds, git-ignored, inside
+# the repository and never under tests/ (the writer refuses tests/ itself); a person copies a
+# reviewed seed into tests/system/seeds/ (tj-vhboky.56). A SEED_OUT OUTSIDE the repository reached
+# through a symlinked parent (macOS /tmp, a symlinked checkout path) is refused, exit 3, by design:
+# the writer's no-follow walk starts at / for such a path (S11.2). DATE, when given, is forwarded as
+# --date; the producer refuses one that is not a real YYYY-MM-DD date.
+#
+# THE STATUS is the producer's whenever it is non-zero (0, 3 refused, 1 failed), else the writer's.
+# Not `set -o pipefail`, which reports the RIGHTMOST failure -- the writer's 'no bundle line' after a
+# failed producer. bash's PIPESTATUS (SHELL is /bin/bash) is read straight after the pipeline.
+# Behind the SAME disposable-database guard as test-system: the producer writes its scenario into
+# whatever database the default compose project's stack holds. $(VENV_MARKER), unlike test-system,
+# because the writer runs in the host venv.
+SEED_OUT ?= output/seeds
+SEED_DUMP_COMPOSE := $(SYSTEM_COMPOSE) -f docker-compose.test-client.yaml
+
+.PHONY: seed-dump
+seed-dump: $(VENV_MARKER)  ## Dump a seed from the fake-mode stack into SEED_OUT (default output/seeds; DATE=YYYY-MM-DD; SYSTEM_TEST_DISPOSABLE_DB=1). A SEED_OUT outside the repo via a symlinked parent is refused, exit 3
+	$(SYSTEM_TEST_DISPOSABLE_GUARD)
+	@[ -f .env ] || { echo "make seed-dump: no .env in $(CURDIR); compose interpolates the stack's credentials from it." >&2; exit 1; }
+	$(SEED_DUMP_COMPOSE) run --rm -T --entrypoint /code/.venv/bin/python test_client -m data.store.seeds $(if $(DATE),--date "$$SEED_DUMP_DATE") \
+		| $(VENV_PYTHON) -m data.store.seeds.bundle --out "$$SEED_DUMP_OUT"; \
+		status=("$${PIPESTATUS[@]}"); \
+		if [ "$${status[0]}" -ne 0 ]; then exit "$${status[0]}"; fi; \
+		exit "$${status[1]}"
+
+# DATE and SEED_OUT reach the recipe through the environment, never spliced into its text: a quote in
+# either would otherwise break the shell quoting around it (tj-irhy0a.25). Declared after the recipe
+# so the rule with the recipe stays the first `seed-dump:` line, the one readers of this file look for.
+seed-dump: export SEED_DUMP_DATE := $(DATE)
+seed-dump: export SEED_DUMP_OUT := $(SEED_OUT)

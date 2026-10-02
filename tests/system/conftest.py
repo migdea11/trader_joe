@@ -60,6 +60,7 @@ from data.store.app.database.models.stock_market_activity import StockMarketActi
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from routers.common.app_endpoints import InterfaceRest
 from routers.common.instance_secret import INSTANCE_SECRET_HEADER
+from tests.fakes.market_data import SCENARIO_PREFIXES
 
 
 # ---------------------------------------------------------------------------------------------
@@ -557,6 +558,59 @@ def adopt_entries(
         return ids
 
     return _adopt
+
+
+@pytest.fixture(scope='session')
+def scenario_entries(pg_engine: Engine, run_identity: RunIdentity) -> Iterator[Callable[[str], list[uuid.UUID]]]:
+    """adopt_entries for a symbol that carries a FakeRead scenario prefix (tj-vhboky.63, Sys-7).
+
+    FakeRead picks its scenario from the symbol's PREFIX (tests/fakes/market_data.py), so a
+    scenario symbol is <PREFIX><one of this run's symbols> -- which the run's symbol% pattern that
+    adopt_entries and entry_registry's survivor check use cannot match. This fixture is their
+    counterpart for those symbols: it returns the ids carrying `symbol`, oldest first, remembers
+    them, and at session end deletes exactly those ids (the cascade takes their bars) and fails if
+    any entry or bar with a scenario-prefixed run symbol survives. Nothing is truncated, and
+    nothing is deleted that this run did not create.
+    """
+    patterns = [f'{prefix}{run_identity.symbol}%' for prefix in SCENARIO_PREFIXES]
+    ids: list[uuid.UUID] = []
+
+    def _adopt(symbol: str) -> list[uuid.UUID]:
+        assert any(symbol.startswith(f'{prefix}{run_identity.symbol}') for prefix in SCENARIO_PREFIXES), (
+            f'{symbol} is not a scenario symbol of this run'
+        )
+        with pg_engine.connect() as conn:
+            found = list(
+                conn.execute(
+                    sa.select(ENTRY_TABLE.c.id)
+                    .where(ENTRY_TABLE.c.asset_symbol == symbol)
+                    .order_by(ENTRY_TABLE.c.created_at, ENTRY_TABLE.c.id)
+                ).scalars()
+            )
+        ids.extend(entry_id for entry_id in found if entry_id not in ids)
+        return found
+
+    yield _adopt
+    with pg_engine.begin() as conn:
+        if ids:
+            conn.execute(sa.delete(ENTRY_TABLE).where(ENTRY_TABLE.c.id.in_(ids)))
+    with pg_engine.connect() as conn:
+        entries_left = conn.execute(
+            sa.select(sa.func.count())
+            .select_from(ENTRY_TABLE)
+            .where(sa.or_(*(ENTRY_TABLE.c.asset_symbol.like(pattern) for pattern in patterns)))
+        ).scalar_one()
+        bars_left = conn.execute(
+            sa.select(sa.func.count())
+            .select_from(BAR_TABLE)
+            .where(sa.or_(*(BAR_TABLE.c.asset_symbol.like(pattern) for pattern in patterns)))
+        ).scalar_one()
+    if entries_left or bars_left:
+        pytest.fail(
+            f'system suite cleanup: {entries_left} entries and {bars_left} bars with a scenario-prefixed '
+            f"{run_identity.symbol}* symbol survived the delete of this run's {len(ids)} scenario entries",
+            pytrace=False,
+        )
 
 
 @pytest.fixture(scope='session')

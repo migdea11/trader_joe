@@ -35,7 +35,7 @@ The two stacks are wired differently on purpose (decision record `tj-q9ae5u`, ad
 |---|---|---|
 | `store_db` | internal | postgres, data_store |
 | `ingest_store` | internal | data_store, data_ingest, and kafka while it exists |
-| `store_api` | internal, fixed name `trader_joe_store_api` | data_store and client containers |
+| `store_api` | internal, fixed name `trader_joe_store_api` (`STORE_API_NETWORK`) | data_store and client containers |
 | `ingest_egress` | ordinary bridge | data_ingest only |
 
 An internal network has no gateway, so postgres, kafka and data_store have no egress and cannot be
@@ -44,6 +44,12 @@ the broker API. A client — a strategy container, the SDK, the system-test clie
 `store_api`, which has a fixed name so another compose project can declare it external, and sees
 data_store and nothing else. To look inside a prod stack, use `docker compose exec` or a client
 container on `store_api`.
+
+The fixed name is read from `STORE_API_NETWORK`, defaulting to `trader_joe_store_api`; only the agent
+stack's generated env sets it (see [The agent-stack MCP](#the-agent-stack-mcp)), so it gets a
+network of its own. In the same way, every service's env files are read from `ROOT_ENV_FILE`,
+`STORE_ENV_FILE` and `INGEST_ENV_FILE`, defaulting to `.env`, `data/store/.env` and
+`data/ingest/.env`; a normal launch never sets them.
 
 **Dev** adds one external network, `trader_joe_devnet`, created by `make dev-network`. The dev
 override attaches every stack service to it and publishes postgres, data_store and data_ingest on
@@ -69,6 +75,14 @@ so a resolve never picks a release younger than a week. And every target that ca
 refuses to run under a `uv` older than the version pinned in the `Makefile`, because an older `uv`
 can re-resolve and overwrite the lock — reverting pinned versions and the cooldown — while every
 command still exits 0.
+
+Base images are pinned the same way. Every external image the `Dockerfile`,
+`tools/agent_mcp/Dockerfile` and the agent-stack MCP's socket proxy build from is pinned as
+`tag@sha256:<digest>`, so a tag that moves upstream never changes what builds. Bumping one means
+changing the digest on purpose. The agent-stack MCP keeps its own list of the root `Dockerfile`'s
+references (`BASE_IMAGES` in `tools/agent_mcp/stack.py`) and makes sure they are present before
+every build, so the two must name the same references; a test checks that they do. The postgres
+and kafka images in `docker-compose.yaml` are pinned by tag only.
 
 ## Writing data: the instance secret
 
@@ -167,9 +181,35 @@ else — feed, owner and expiry values written under it are not recoverable.
 
 **What has been checked on real Postgres.** On 2026-09-29 the revision as it stands was applied by
 `make migrate` to a wiped database on the owner's host, and the system suite then passed against
-it twice (the host verification record is `tj-vhboky.14`). Its downgrade and its failure on a
-non-empty bar table have **not** been run: CI does not run the downgrade either, because a round
-trip over an empty database proves nothing, and it waits on seeded data (`tj-vhboky.62`).
+it twice (the host verification record is `tj-vhboky.14`). Its downgrade and its refusal on a
+non-empty bar table are now checked by the system suite, `tests/system/test_migration_with_data.py`:
+each test creates a scratch database on the same server, loads a committed seed at that seed's
+revision, then upgrades or downgrades it and compares the rows with the seed's manifest. It has
+passed through the agent-stack MCP; the stack's own database is never migrated by it.
+
+### Seeds: every revision ships one
+
+`tests/system/seeds/` holds a seed for each database revision: `<revision>.sql` (the data) and
+`<revision>.json` (its manifest: revision, row counts, digests). A file named
+`<revision>.<variant>.sql` is an extra, hand-written seed for a specific case and never stands in
+for the canonical one. **A revision without its canonical seed fails the PR gate**
+(`data/store/tests/test_seed_guard.py`, which runs in `make test`); only the initial revision,
+`2b88043cd13c`, is exempt.
+
+So a PR that adds a revision also needs a seed produced at the new head, by either route:
+
+```
+# Host: a fake-mode stack you can wipe (see the system suite below)
+make system-launch SYSTEM_TEST_DISPOSABLE_DB=1
+make migrate
+make seed-dump SYSTEM_TEST_DISPOSABLE_DB=1     # DATE=YYYY-MM-DD optional; writes to output/seeds/
+```
+
+or, from an agent, the agent-stack MCP's `seed_dump` verb, which writes the pair under
+`agent_mcp_seeds/<worktree>/` in the MCP's share directory. CI's System Testing job also uploads one
+for every branch (below). Whichever route, the output is reviewed, then copied into
+`tests/system/seeds/` and committed. `make seed-dump` writes only to `SEED_OUT`
+(default `output/seeds`, git-ignored) and refuses to write under `tests/`.
 
 ### Checking what is applied
 
@@ -222,16 +262,36 @@ documented way in.
 ### The system suite
 
 `tests/system` checks the behaviours a unit test cannot: the migrated schema's constraints, the
-store over real HTTP, the batch write under the driver's argument limit, and the connection pool.
+store over real HTTP, the batch write under the driver's argument limit, the connection pool, a
+dataset request through the real ingest service end to end, and each migration against seeded data.
 It runs **from a client container**, `test_client` in `docker-compose.test-client.yaml`, which joins
 `store_api` and `store_db` and dials data_store and postgres by service name. It never runs from the
 host, which reaches neither in prod.
 
+The stack must be in **fake mode**: data_ingest serves bars from `FakeRead` (`tests/fakes`) instead of
+a broker, and the end-to-end tests fail against a real one.
+
 ```
-make dev-launch     # or prod-launch; any stack you can wipe
+make prod-build     # system-launch starts the prod images; it does not build them
+make system-launch SYSTEM_TEST_DISPOSABLE_DB=1
 make migrate
 make test-system SYSTEM_TEST_DISPOSABLE_DB=1
+make prod-down      # stops it; system-launch has no stop target of its own
 ```
+
+`make system-launch` is the prod stack with `docker-compose.fake.yaml` on top. The overlay changes
+data_ingest only: it mounts `tests/fakes` read-only, runs the test-only launcher with one worker, and
+blanks the broker keys. The prod image holds no fakes, and no `prod-*` or `dev-*` target loads the
+overlay. data_ingest logs a `FAKE BROKER:` warning at startup, so its logs say which mode it is in.
+
+> **Hazard: fake mode runs in the live stack's place.** `system-launch` uses the default compose
+> project and container names — the same ones `prod-launch` uses — and its postgres data lives in
+> `DATA_DIR`, which `.env.default` sets to the live `./volumes/trader_joe/`. On a host
+> that runs the production deployment it would recreate the live data_ingest as the fake and write
+> fake bars into the live database, and `make prod-down` afterwards stops the live stack. Run it only
+> where the stack and its database are disposable; `SYSTEM_TEST_DISPOSABLE_DB=1` is your claim of
+> that, and nothing checks it. `make seed-dump` carries the same risk: it writes its scenario into
+> whatever database the default project holds. Agents use the isolated agent stack instead.
 
 The target does not start or migrate a stack; that choice stays with you. It **writes to the
 database it reaches**, and on a host that also runs the production deployment it would join that
@@ -243,17 +303,70 @@ the client runs in a non-UTC timezone on purpose, so a naive-to-`timestamptz` sh
 Run it from a checkout whose directory name matches the one that launched the stack: compose
 prefixes `store_db` with the project name, which defaults to that directory.
 
-CI's System Testing job runs the same target against a throwaway stack, after checks that the
-compose sets still render and that the running stack enforces the network model (the test client
-cannot resolve kafka or data_ingest; postgres and data_store have no egress).
+CI's System Testing job runs the same target against a throwaway stack, always in fake mode, after
+checks that the compose sets still render, that data_ingest is on the fake broker, and that the
+running stack enforces the network model (the test client cannot resolve kafka or data_ingest;
+postgres and data_store have no egress). It then dumps a seed at the head revision and uploads it as
+the `head-seed-<branch>` artifact, kept seven days, for a person to review and commit.
 
 ## Agent devcontainer
 
 `.devcontainer/` defines the container agents work in. It joins devnet, so it reaches a running dev
-stack by service name, and it has no Docker, so it cannot run the system suite.
+stack by service name. It has no Docker: it runs the system suite only through the agent-stack MCP,
+below.
 
 It keeps its own uv environment, `.venv-devcontainer` (`UV_PROJECT_ENVIRONMENT`), separate from the
 host's `.venv`. The checkout is bind-mounted in, and a shared `.venv` had each side point its Python
 at an interpreter only it has, so the other side silently rebuilt it without the database groups.
 The Makefile's sync marker lives inside whichever environment is active and is invalidated when that
 environment's interpreter is missing, so a rebuilt environment always gets a full sync.
+
+### The agent-stack MCP
+
+Agents reach Docker only through the agent-stack MCP (`docker-compose.agent-mcp.yaml`), a server in
+its own container that starts with the devcontainer by default: `make agent-up`, or the IDE's
+host-side `initializeCommand`, runs `make agent-mcp-up` on the host. Set `AGENT_MCP=off` to skip it;
+a failed start only warns. It offers fixed verbs over one isolated, credential-free compose project,
+`trader_joe_agent_stack`. It cannot touch the dev or prod stacks, run an arbitrary command, image or
+compose file, or read your env files. Only its socket proxy mounts the Docker socket.
+
+| Verb | What it does |
+|---|---|
+| `stack_up(worktree)` | Snapshots the worktree (`root` or a worktree's name), builds the images from the snapshot and starts the stack, waiting for healthy. Every call force-recreates data_store and data_ingest, so they run the last snapshot's code — `tests/fakes` included; postgres and kafka are kept. |
+| `stack_down` | Stops the stack and removes its containers and networks; its data is kept. |
+| `stack_wipe` | Stops the stack and deletes its data directory, and nothing else. |
+| `migrate` / `migrate_status` | `alembic upgrade head`, or the read-only `current` and `history`, from a fresh snapshot of the worktree the stack was brought up from. |
+| `run_system_tests(worktree, paths)` | Runs `tests/system` (or `paths` under it) from a test client rebuilt from the snapshot. The services keep the last `stack_up`'s code, so call `stack_up` after editing anything they load. |
+| `seed_dump(worktree, date?)` | Runs the seed producer against the up, migrated stack and writes `<revision>.sql` and `.json` under `agent_mcp_seeds/<worktree>/` in the share directory. |
+| `logs(service, tail?)` / `ps` | One service's recent log lines; the stack's containers and their health. |
+
+The agent stack is the base compose file plus `docker-compose.test-client.yaml`,
+`docker-compose.agent-stack.yaml` and the fake-mode overlay (the Makefile's `AGENT_STACK_COMPOSE`;
+only the MCP uses it), so its data_ingest always runs on the fake broker. The MCP generates the
+stack's env itself: its own container names, `STORE_API_NETWORK`, a `DATA_DIR` under the stack's own
+directory, and env files outside the repository. It never reads your `.env` or touches your
+`DATA_DIR`.
+
+**Known limitation:** `stack_wipe` reports `failed` because clearing kafka's data hits `Device or
+resource busy`. The postgres clear runs first and succeeds, so the database is empty, but the data
+directory itself is kept. The defect is waived, not fixed, because Kafka is being removed.
+
+The devcontainer reaches the MCP as `http://agent_mcp:8765/mcp` over an internal network, with a
+bearer token read from `agent_mcp_token` in the MCP's share directory (`AGENT_MCP_SHARE_PATH`,
+mounted at `/agent_mcp_share` in both containers; `.mcp.json`; Claude Code asks you to approve the
+server on first use). The share directory lives under `/run/user/<uid>` (`$XDG_RUNTIME_DIR`) and is
+wiped at logout or reboot; the MCP writes a new token on its next start, and a devcontainer left
+running across that must be restarted too (`make agent-down && make agent-up`, or close and reopen it
+in the IDE). The MCP never sees your Claude config directory, and `make agent-mcp-up` refuses host
+paths that overlap.
+
+| Command (host) | Effect |
+|---|---|
+| `make agent-mcp-up` | Starts the existing MCP containers, never re-reading the compose file; creates them only if there are none. |
+| `make agent-mcp-down` | Stops the MCP and its socket proxy and keeps the containers. The agent stack is separate: stop it with `stack_down`. |
+| `make agent-mcp-rebuild` | Rebuilds the image from the root checkout's working tree and recreates both containers from the current compose file. `make agent-build` runs it for you. |
+
+The MCP keeps running after the devcontainer stops. **Rebuild** after the IDE's Rebuild Container,
+or after changing what the image bakes in from the root checkout: the MCP's own code
+(`tools/agent_mcp`), the compose files or the `Dockerfile`. A change to service code, tests or
+`tests/fakes` in a worktree needs no rebuild — `stack_up` picks it up from its snapshot.

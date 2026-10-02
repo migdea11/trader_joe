@@ -22,11 +22,14 @@ from pathlib import Path
 
 import pytest
 
+from common.tests.compose_model import AGENT_MCP_FILE, interpolate
 from common.tests.test_ci_invariants import (
     COMPOSE_FILE,
+    ENV_DEFAULT_FILE,
     MAKEFILE,
     OVERRIDE_FILE,
     REPO_ROOT,
+    _env_file_values,
     _load_yaml,
     _make_recipe,
     _make_variable,
@@ -52,6 +55,11 @@ PROD_MEMBERSHIP = {
 }
 # Item 1': ingest is the only component with internet access.
 EGRESS_SERVICES = {'data_ingest'}
+
+# The agent-stack MCP's route (ADR tj-4rr0la addendum 1 (c)): the devcontainer joins it; it never
+# joins the proxy's network, which only agent_mcp and socket_proxy share.
+MCP_NETWORK = 'trader_joe_agent_mcp'
+PROXY_NETWORK = 'agent_mcp_docker'
 
 # Item 3'. The dev network's key in the compose files, and the loopback publishes moved into the
 # override verbatim from the base file.
@@ -109,16 +117,29 @@ def _devcontainer_json() -> dict:
     return json.loads('\n'.join(line for line in lines if not line.lstrip().startswith('//')))
 
 
-def _initialize_command_network() -> str:
-    """Return the network name the devcontainer's initializeCommand ensures exists."""
+def _initialize_command_create(variable: str) -> tuple[str, str]:
+    """(network name, the options of its `docker network create`) for one of the initializeCommand's networks.
+
+    The command ensures two networks, devnet as `n` and the MCP's as `m`, each with its own create; the
+    options are judged per network, so one network's --internal never reads as the other's (tj-c4mosr.5
+    re-pin: the MCP network's create is --internal, devnet's must not be).
+    """
     command = _devcontainer_json()['initializeCommand']
-    match = re.search(r'\bn=([\w.-]+);', command)
-    assert match is not None, f'initializeCommand sets no network name (n=...): {command}'
-    assert 'docker network create --driver bridge "$n"' in command, (
-        f'initializeCommand does not create the network it names as an ordinary bridge: {command}'
+    match = re.search(rf'\b{variable}=([\w.-]+);', command)
+    assert match is not None, f'initializeCommand sets no network name ({variable}=...): {command}'
+    creates = re.findall(rf'docker network create((?:\s+--?[\w-]+(?:\s+\w+)?)*)\s+"\${variable}"', command)
+    assert len(creates) == 1, f'initializeCommand creates "${variable}" {len(creates)} times: {command}'
+    return match.group(1), creates[0]
+
+
+def _initialize_command_network() -> str:
+    """Return the dev network's name in the initializeCommand, created as an ordinary bridge."""
+    name, options = _initialize_command_create('n')
+    assert options.split() == ['--driver', 'bridge'], (
+        f'the initializeCommand creates devnet with {options!r}; devnet must be an ordinary bridge: the dev '
+        f'publishes go out through it'
     )
-    assert '--internal' not in command, 'devnet must be an ordinary bridge: the dev publishes go out through it'
-    return match.group(1)
+    return name
 
 
 def _make_prerequisites(target: str) -> list[str]:
@@ -157,9 +178,17 @@ def test_the_base_file_declares_exactly_the_four_prod_networks():
         config = networks[name] or {}
         assert not config.get('internal'), f'{name} is the egress network and must not be internal'
         assert not config.get('external'), f'{name} belongs to the stack and must not be external'
-    assert (networks['store_api'] or {}).get('name') == STORE_API_NAME, (
-        f'store_api must carry the fixed name {STORE_API_NAME}, so another compose project can '
-        f'declare it external and join it.'
+    # tj-c4mosr.5 re-pin (ADR tj-4rr0la section 1): the name now reads STORE_API_NETWORK so the agent
+    # stack can take its own, with today's name as the default. What prod renders is pinned: with the
+    # variable unset, and under every value the committed .env.default sets, it is still the fixed name.
+    spelled = str((networks['store_api'] or {}).get('name'))
+    for environment in ({}, _env_file_values(ENV_DEFAULT_FILE)):
+        assert interpolate(spelled, environment) == STORE_API_NAME, (
+            f'store_api renders as {interpolate(spelled, environment)!r} ({spelled!r}); it must carry the fixed '
+            f'name {STORE_API_NAME}, so another compose project can declare it external and join it.'
+        )
+    assert spelled in (STORE_API_NAME, f'${{STORE_API_NETWORK:-{STORE_API_NAME}}}'), (
+        f'store_api is named {spelled!r}: the literal, or STORE_API_NETWORK defaulting to it, and nothing else'
     )
 
 
@@ -303,12 +332,41 @@ def test_the_four_places_naming_devnet_agree():
     )
 
 
-def test_the_agent_devcontainer_joins_default_and_devnet():
+def test_the_agent_devcontainer_joins_default_devnet_and_the_mcp_network_only():
+    """Re-pinned (tj-c4mosr.5; ADR tj-4rr0la addendum 1 (c)/(f)): exactly default, devnet, trader_joe_agent_mcp.
+
+    Was test_the_agent_devcontainer_joins_default_and_devnet. The MCP network is the devcontainer's one
+    route to Docker; agent_mcp_docker, the socket proxy's network, it never joins.
+    """
     agent = _load_yaml(DEVCONTAINER_COMPOSE)['services']['agent']
-    assert set(_service_networks(agent)) == {'default', DEVNET_KEY}, (
-        f'the agent service is on {_service_networks(agent)}: default keeps its own egress and '
-        f'devnet is its reach into the dev stack; anything else is reach nobody designed.'
+    joined = set(_service_networks(agent))
+    assert PROXY_NETWORK not in joined, f"the devcontainer joins {PROXY_NETWORK}, the socket proxy's network"
+    assert joined == {'default', DEVNET_KEY, MCP_NETWORK}, (
+        f'the agent service is on {sorted(joined)}: default keeps its own egress, devnet is its reach into the '
+        f'dev stack and {MCP_NETWORK} its route to the agent-stack MCP; anything else is reach nobody designed.'
     )
+
+
+def test_the_four_places_naming_the_mcp_network_agree_and_it_is_internal():
+    """The Makefile, docker-compose.agent-mcp.yaml, the devcontainer compose and the initializeCommand.
+
+    Both creators make it --internal: only the devcontainer and agent_mcp join it, and neither needs
+    a gateway through it (ADR tj-4rr0la addendum 1 (c)).
+    """
+    devcontainer = (_load_yaml(DEVCONTAINER_COMPOSE).get('networks') or {}).get(MCP_NETWORK) or {}
+    mcp_file = (_load_yaml(AGENT_MCP_FILE).get('networks') or {}).get(MCP_NETWORK) or {}
+    assert devcontainer.get('external') is True and mcp_file.get('external') is True
+    name, options = _initialize_command_create('m')
+    names = {
+        'Makefile AGENT_MCP_NETWORK': _make_variable('AGENT_MCP_NETWORK'),
+        AGENT_MCP_FILE.name: mcp_file.get('name'),
+        '.devcontainer/compose.yml': devcontainer.get('name'),
+        'devcontainer.json initializeCommand': name,
+    }
+    assert set(names.values()) == {MCP_NETWORK}, f'the MCP network is named differently in different places: {names}'
+    assert options.split() == ['--driver', 'bridge', '--internal'], f'the initializeCommand creates it with {options!r}'
+    recipe = ' '.join(_make_recipe('agent-mcp-network'))
+    assert 'docker network create --driver bridge --internal $(AGENT_MCP_NETWORK)' in recipe, recipe
 
 
 # --- item 4. prod never loads what attaches devnet -------------------------------------------

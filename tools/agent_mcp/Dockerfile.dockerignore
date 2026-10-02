@@ -1,0 +1,43 @@
+# The agent-stack MCP image's build context (BuildKit reads this in place of the root .dockerignore
+# when tools/agent_mcp/Dockerfile is the Dockerfile). An ALLOW-LIST: everything at every depth is
+# excluded, then exactly what the Dockerfile copies is let back in -- so no env file, data directory,
+# worktree or test can reach the context, whatever the checkout holds.
+#
+# TWO RULES OF BuildKit's CONTEXT WALKER SHAPE THIS FILE (tonistiigi/fsutil filter.go, matching by
+# moby/patternmatcher). Only the second was ever broken here, and it cost the host sitting a build
+# (tj-c4mosr.11):
+#
+# 1. '**' ON THE FIRST LINE CHANGES NOTHING; IT ONLY STATES THE INTENT HONESTLY. A single '*' never
+#    crosses '/', but the matcher excludes a path when a pattern matches any ANCESTOR of it
+#    (MatchesOrParentMatches), so a single '*' DOES exclude a whole subtree: '*' matching top-level
+#    data, .claude, .venv and .git already excluded data/*/.env, .claude/worktrees/**, .venv/** and
+#    .git/**. Measured against the checkout at 32abf36, nested paths were NOT reaching the context:
+#    it was already exactly the 14 files the Dockerfile COPYs, before and after. So '**' here is a
+#    MEASURED NO-OP, kept only so line 1 means what this comment claims -- it fixes nothing, and
+#    neither would explicit volumes/ or .git/ lines. Rule 2 is the whole behavioural change.
+#
+# 2. NO WILDCARD IN ANY '!' LINE. The walker prunes an excluded directory -- never opens it -- only
+#    while onlyPrefixExcludeExceptions holds, and that is false as soon as one '!' pattern still
+#    contains a character of "*[]?^\" after a trailing '/*' or '/**' is stripped. One such pattern
+#    disables pruning for the WHOLE file, the sender then descends into every directory, and
+#    ${DATA_DIR}'s postgres directory (mode 0700, owned by the container's uid) answers EACCES:
+#    "failed to solve: error from sender: open .../volumes/trader_joe/postgres: permission denied".
+#    So the re-include below is the DIRECTORY tools/agent_mcp, with the entries the Dockerfile does
+#    not COPY excluded after it -- never '!tools/agent_mcp/*.py'. For the same reason volumes/ and
+#    .git/ need no line of their own: '**' already excludes them and pruning now stops the walk at
+#    them, because no '!' pattern is a prefix of them.
+**
+!pyproject.toml
+!uv.lock
+!tools/__init__.py
+!tools/agent_mcp
+# ... minus what the Dockerfile does not COPY: it takes tools/agent_mcp/*.py only. A wildcard is fine
+# on these lines -- only '!' lines govern pruning.
+tools/agent_mcp/Dockerfile*
+tools/agent_mcp/tests
+tools/agent_mcp/__pycache__
+!docker-compose.yaml
+!docker-compose.test-client.yaml
+!docker-compose.agent-stack.yaml
+!docker-compose.fake.yaml
+!Dockerfile

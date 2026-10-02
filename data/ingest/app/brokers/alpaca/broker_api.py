@@ -2,9 +2,7 @@ import asyncio
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
-from alpaca.data.enums import DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.models.bars import Bar, BarSet
 from alpaca.data.models.quotes import Quote
 from alpaca.data.requests import (
     StockBarsRequest,
@@ -19,16 +17,11 @@ from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Feed, Granularity
 from common.environment import get_env_var
 from common.logging import get_logger
-from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
 from data.ingest.app.brokers.broker_errors import MissingCredentialsError
-from data.ingest.app.brokers.rate_budget import RateBudget, priority_for_update_type
+from data.ingest.app.brokers.interface import BarsQuery
+from data.ingest.app.brokers.rate_budget import RateBudget
 from data.ingest.app.brokers.request_key import VendorRequestKey
 from data.ingest.app.brokers.single_flight import SingleFlight
-from schemas.data_ingest.get_dataset_request import StockDatasetRequest
-from schemas.data_store.stock.market_activity_data import (
-    BatchStockDataMarketActivityCreate,
-    StockDataMarketActivityData,
-)
 
 
 log = get_logger(__name__)
@@ -76,7 +69,7 @@ def resolve_feed() -> Feed:
     field at any level to read the served tape back off of (researcher-broker, confirmed on two
     independent reads) -- so there is no vendor confirmation to fall back to even if there were
     a caller selection to try first. The value below is passed to the vendor call as its own
-    `feed` parameter (get_market_stock_data), which is the best available assurance that the
+    `feed` parameter (AlpacaRead.get_bars), which is the best available assurance that the
     entitled tape and the requested tape are the same one; it is still not proof that the tape
     which answered matches, since a lapsed or misconfigured entitlement would make this value
     wrong in a way nothing here can detect.
@@ -96,7 +89,7 @@ def get_client() -> StockHistoricalDataClient:
     and left the whole ingest package unimportable without credentials -- no tests, no
     app start, and a secret rotation that needed a process restart rather than a fresh
     client. Callers that want to supply their own client inject it instead; see
-    set_client() and the client argument on get_market_stock_data().
+    set_client() and the client argument on AlpacaRead.
 
     Returns:
         StockHistoricalDataClient: Shared client for every Alpaca call this process makes.
@@ -141,35 +134,6 @@ def get_rate_budget() -> RateBudget:
     return __RATE_BUDGET
 
 
-def convert_bar_to_schema(data: Bar) -> StockDataMarketActivityData:
-    # split_factor and dividends_factor are gone (tj-vhboky.1 section 6): bars are stored RAW,
-    # never corrected, and adjustment is applied on read against the events table. Sending them
-    # is not merely redundant, it is the case the strict InboundContract was adopted to catch --
-    # see StockDataMarketActivityData's docstring.
-    return StockDataMarketActivityData(
-        open=data.open, high=data.high, low=data.low, close=data.close, volume=data.volume, trade_count=data.trade_count
-    )
-
-
-def convert_bars_to_batch_schema(
-    batch_response: BatchStockDataMarketActivityCreate, request: StockDatasetRequest, stock_bars: BarSet
-) -> None:
-    stock_symbol = request.asset_symbol
-    if stock_symbol not in stock_bars.data:
-        log.warning(f'Symbol {stock_symbol} not found in bar set')
-        return
-
-    bars: list[Bar] = (
-        stock_bars[stock_symbol] if isinstance(stock_bars[stock_symbol], list) else [stock_bars[stock_symbol]]
-    )
-
-    log.debug(f'bars: {len(bars)}')
-    for bar in bars:
-        # No per-bar expiry: the lifetime moved to the dataset entry (tj-vhboky.1 section 6),
-        # which is upserted before ingest is ever called, so nothing at this level carries one.
-        batch_response.append_data(DataType.MARKET_ACTIVITY, convert_bar_to_schema(bar), bar.timestamp)
-
-
 def create_stock_quote(data: Quote, symbol: str, granularity: Granularity, source: DataSource) -> None:
     return None
 
@@ -202,7 +166,7 @@ def match_client_request(
 
 async def fetch_data_type(
     executor: ThreadPoolExecutor,
-    request: StockDatasetRequest,
+    query: BarsQuery,
     data_type: DataType,
     latest: bool,
     params: dict,
@@ -213,20 +177,21 @@ async def fetch_data_type(
 
     Concurrent callers asking for the same content share one vendor call; the extra ones
     attach to it and nothing is retained afterwards (tj-84ty47 section 6). The shared value
-    is the vendor's own response, which every caller then converts with ITS OWN dataset_id --
-    collapsing the conversion too would hand one caller another's dataset_id.
+    is the vendor's own response, which every caller then converts on its own -- the platform
+    conversion (dataset_id and the store's batch schema) happens above the broker, in
+    ingest_control, so nothing caller-specific is ever shared.
 
     Args:
         executor (ThreadPoolExecutor): Pool the blocking SDK call runs on.
-        request (StockDatasetRequest): Request being served.
+        query (BarsQuery): Query being served.
         data_type (DataType): Data type to fetch.
         latest (bool): Whether the latest-value endpoint is being used.
         params (dict): Vendor request parameters. Already carries this call's resolved
-            `feed`, put there by get_market_stock_data so every vendor call in the batch
-            asks for the same tape the key and the batch record.
+            `feed`, put there by AlpacaRead.get_bars so every vendor call asks for the same
+            tape the key and the response record.
         feed (Feed): This call's resolved tape (resolve_feed()), taken as a parameter
-            rather than re-read here so the key can never disagree with the batch that
-            get_market_stock_data stamps from the same value.
+            rather than re-read here so the key can never disagree with the response that
+            AlpacaRead stamps from the same value.
         client (StockHistoricalDataClient | None): Client to call, or None for this
             process's own (see get_client()).
 
@@ -244,14 +209,14 @@ async def fetch_data_type(
         # already stamped from this same lowercase form.
         feed=feed.value.lower(),
         asset_type=AssetType.STOCK,
-        asset_symbol=request.asset_symbol,
+        asset_symbol=query.instrument.symbol,
         data_type=data_type,
-        granularity=request.granularity,
-        range_start=request.start,
-        range_end=request.end,
+        granularity=query.granularity,
+        range_start=query.start,
+        range_end=query.end,
         adjustment=ALPACA_ADJUSTMENT,
     )
-    priority = priority_for_update_type(request.update_type)
+    priority = query.priority
 
     async def call_vendor():
         # One token per call that actually reaches the vendor. Calls collapsed by the guard
@@ -261,102 +226,3 @@ async def fetch_data_type(
         return await loop.run_in_executor(executor, client_request, client_request_type(**params))
 
     return await __SINGLE_FLIGHT.run(key, call_vendor)
-
-
-async def get_market_stock_data(
-    executor: ThreadPoolExecutor, request: StockDatasetRequest, client: StockHistoricalDataClient | None = None
-) -> BatchStockDataMarketActivityCreate:
-    """Fetch a stock dataset from Alpaca and convert it into the store's batch schema.
-
-    Args:
-        executor (ThreadPoolExecutor): Pool the blocking SDK calls run on.
-        request (StockDatasetRequest): Request being served.
-        client (StockHistoricalDataClient | None): Client to call, or None for this
-            process's own. Injected by tests, and by a caller that selects its own
-            adapter instance.
-
-    Returns:
-        BatchStockDataMarketActivityCreate: Converted dataset for the store.
-
-    Raises:
-        MissingCredentialsError: If no client is injected and none can be built.
-    """
-    # Resolved once, before any task is spawned, so a missing credential fails here with a
-    # named variable rather than inside a gathered task whose errors are swallowed below.
-    client = client if client is not None else get_client()
-    # Resolved once for the whole fetch and threaded through explicitly (fetch_data_type's
-    # key, the vendor params below, and the batch stamped at the end of this function) rather
-    # than re-read from sip_enabled() at each site -- that duplication is what let the batch go
-    # unstamped before (tj-vhboky.9). A single deployment has exactly one active tape at a time
-    # (tj-rh4b7f), so one resolution per call is correct, not merely convenient.
-    feed = resolve_feed()
-    granularity = AlpacaGranularity.from_granularity(request.granularity).broker_code
-    params = {
-        'symbol_or_symbols': request.asset_symbol,
-        'timeframe': granularity,
-        'start': request.start.isoformat(),
-        'end': request.end.isoformat() if request.end is not None else None,
-        # Sent to the vendor so the entitled tape is the one actually requested, rather than
-        # whatever Alpaca defaults to in feed's absence -- without this, resolve_feed() only
-        # ever affected the local key and the label stamped on the bar, never the vendor call.
-        'feed': DataFeed(feed.value.lower()),
-    }
-    log.debug(f'params: {params}')
-
-    tasks = []
-    results = None
-    response_map = {}
-    latest = False
-    if 'start' not in params and 'end' not in params:
-        latest = True
-
-    for data_type in request.data_types:
-        if data_type in response_map:
-            log.warning(f'Duplicate data type found: {data_type}')
-            continue
-
-        tasks.append(fetch_data_type(executor, request, data_type, latest, params, feed, client))
-        response_map[data_type] = len(tasks) - 1
-
-    try:
-        results = await asyncio.gather(*tasks)
-    except Exception as e:
-        log.error(e)
-        # TODO better error handling
-        return {}
-
-    batch_response = BatchStockDataMarketActivityCreate(
-        dataset_id=request.dataset_id,
-        asset_symbol=request.asset_symbol,
-        source=request.source,
-        granularity=request.granularity,
-        # THE FEED RECORDED HERE IS THE REQUESTED ONE, NOT A CONFIRMED SERVED ONE (tj-vhboky.9
-        # part B, tj-rh4b7f). Alpaca's bars response has no feed field at any level to read an
-        # answered tape back off of, so the ruling's "else what the vendor response reports"
-        # branch does not exist for this vendor -- resolve_feed()'s value is recorded because it
-        # is the only value there is, not because it has been confirmed against the response.
-        feed=feed,
-        dataset={},
-    )
-    if DataType.MARKET_ACTIVITY in response_map:
-        convert_bars_to_batch_schema(batch_response, request, results[response_map[DataType.MARKET_ACTIVITY]])
-        log.debug(f'dataset bars: {len(batch_response.dataset[DataType.MARKET_ACTIVITY])}')
-    if DataType.QUOTE in response_map:
-        raise NotImplementedError('Quotes not implemented')
-        # stock_quotes: QuoteSet = results[response_map[DataType.QUOTE]]
-
-        # if symbol in stock_quotes.data:
-        #     quotes = stock_quotes[symbol] if isinstance(stock_quotes[symbol], list) else [stock_quotes[symbol]]
-        #     log.debug(quotes)
-        #     topic_map[StaticTopic.STOCK_MARKET_QUOTE] = [
-        #         create_stock_quote(
-        #             quote, symbol, request.granularity, request.source
-        #         ).model_dump_json() for quote in quotes
-        #     ]
-    if DataType.TRADE in response_map:
-        raise NotImplementedError('Trades not implemented')
-        # stock_trades = results[response_map[DataType.TRADE]]
-        # log.debug(f" trade results: {len(stock_trades[symbol])}")
-        # log.debug(f"    last: {stock_trades}")
-
-    return batch_response

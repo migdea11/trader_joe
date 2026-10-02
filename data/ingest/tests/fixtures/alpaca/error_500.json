@@ -1,0 +1,13 @@
+{
+  "provenance": {
+    "kind": "documented",
+    "note": "Documented, not recorded: 500 'Internal server error. We recommend retrying these later.' No example body is published; {code, message} is the shape ruled on tj-vhboky.57 (16:44 UTC). Not recordable: a server error cannot be provoked.",
+    "source": "https://docs.alpaca.markets/us/reference/stockbars",
+    "wire_contract": "tj-vhboky.57"
+  },
+  "status": 500,
+  "body": {
+    "code": 50010000,
+    "message": "internal server error occurred"
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "provenance": {
+    "kind": "recorded",
+    "recorded_at": "2026-10-01T22:00:06+00:00",
+    "source": "GET https://data.alpaca.markets/v2/stocks/bars (paper keys, read-only)",
+    "note": "Recorded by tests/fakes/record_alpaca.py: one body per timeframe."
+  },
+  "status": 200,
+  "body": {
+    "bars": {
+      "AAPL": [
+        {
+          "c": 180.97,
+          "h": 181.39,
+          "l": 180.4,
+          "n": 1657,
+          "o": 180.47,
+          "t": "2022-01-03T15:00:00Z",
+          "v": 183786,
+          "vw": 181.00859
+        },
+        {
+          "c": 181.45,
+          "h": 181.75,
+          "l": 180.445,
+          "n": 1015,
+          "o": 180.96,
+          "t": "2022-01-03T16:00:00Z",
+          "v": 110475,
+          "vw": 181.225003
+        },
+        {
+          "c": 181.67,
+          "h": 182.15,
+          "l": 181.08,
+          "n": 917,
+          "o": 181.37,
+          "t": "2022-01-03T17:00:00Z",
+          "v": 109346,
+          "vw": 181.66618
+        }
+      ]
+    },
+    "next_page_token": null
+  }
+}

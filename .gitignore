@@ -31,6 +31,10 @@ coverage.xml
 /volumes/
 /volume_data/
 
+# Seed output (make seed-dump's SEED_OUT default, output/seeds; tj-irhy0a.22). Never committed from
+# here: a person copies a reviewed seed into tests/system/seeds/ (tj-vhboky.56).
+/output/
+
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db

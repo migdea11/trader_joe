@@ -1,0 +1,13 @@
+{
+  "provenance": {
+    "kind": "recorded",
+    "recorded_at": "2026-10-01T22:00:07+00:00",
+    "source": "GET https://data.alpaca.markets/v2/stocks/bars (paper keys, read-only)",
+    "note": "Recorded by tests/fakes/record_alpaca.py: the real empty-range body shape."
+  },
+  "status": 200,
+  "body": {
+    "bars": {},
+    "next_page_token": null
+  }
+}

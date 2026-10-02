@@ -20,6 +20,13 @@
 # the client. Plain ${NAME}, with NO :? guard, on purpose: CI blanks INSTANCE_WRITE_SECRET mid-job
 # and still needs the client for its probes. The missing-value check is conftest's _contract(),
 # which fails naming the variable (fail, never skip).
+#
+# THE CLIENT ALSO RUNS THE SEED PRODUCER (ADR tj-4rr0la addendum 10; decision tj-vhboky.55 S9), per
+# call, as a one-off: `compose run --rm -T --entrypoint /code/.venv/bin/python test_client -m
+# data.store.seeds [--date D]` -- from `make seed-dump` and the agent-stack MCP's seed_dump verb
+# alike. No standing service: nothing stays running after the call. The producer prints the bundle
+# on stdout and writes nothing, so the client still has no writable mount; it uses only the
+# environment below (the POSTGRES_* names and INSTANCE_WRITE_SECRET), nothing new.
 services:
   test_client:
     build:
@@ -36,14 +43,24 @@ services:
     # The source, read-only, each onto its own path under /code. NEVER the repository root, an env
     # directory or an env file: the root would hand the container every .env in the checkout.
     # data/store/migrations is there because test_schema_constraints reads the head revision
-    # from it with alembic's ScriptDirectory.
+    # from it with alembic's ScriptDirectory. data/store/alembic.ini sits beside it, as the
+    # repository lays them out, so the migration check with data (tests/system, tj-vhboky.62) runs
+    # the alembic CLI from cwd data/store with the repo's own ini -- its relative script_location
+    # resolves to the mounted migrations (tj-7294qb). data/store/seeds, tests/fakes and
+    # data/ingest/app are the seed producer's import closure beyond those (tj-irhy0a.21's
+    # hand-off): the producer, the fake's synthetic prefixes it checks rows against, and the
+    # ingest code the fake imports.
     volumes:
       - ./common:/code/common:ro
       - ./routers:/code/routers:ro
       - ./schemas:/code/schemas:ro
       - ./data/store/app:/code/data/store/app:ro
+      - ./data/store/alembic.ini:/code/data/store/alembic.ini:ro
       - ./data/store/migrations:/code/data/store/migrations:ro
+      - ./data/store/seeds:/code/data/store/seeds:ro
+      - ./data/ingest/app:/code/data/ingest/app:ro
       - ./tests/system:/code/tests/system:ro
+      - ./tests/fakes:/code/tests/fakes:ro
       - ./pytest.ini:/code/pytest.ini:ro
     # THE ENV CONTRACT: exactly the twelve names tests/system/conftest.py reads, and one extra.
     environment:

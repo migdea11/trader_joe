@@ -36,6 +36,13 @@ volume_data/
 # C extensions
 *.so
 
+# Test directories under the Dockerfile's COPY roots (tj-v82dvm). The image copies common/,
+# routers/ and schemas/ whole, so without these their suites ship in every service image. No
+# production module imports them (decision tj-j4wknb R4). The top-level tests/ is never copied.
+common/tests/
+routers/tests/
+schemas/tests/
+
 # Unit test / coverage reports
 .pytest_cache/
 .ruff_cache/

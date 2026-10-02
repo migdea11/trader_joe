@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "agent-stack": {
+      "type": "http",
+      "url": "http://agent_mcp:8765/mcp",
+      "headersHelper": "t=$(cat /agent_mcp_share/agent_mcp_token) || exit 1; printf '{\"Authorization\": \"Bearer %s\"}' \"$t\""
+    }
+  }
+}

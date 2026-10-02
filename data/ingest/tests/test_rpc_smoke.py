@@ -47,7 +47,9 @@ from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from common.kafka.kafka_rpc_factory import KafkaRpcFactory
 from common.worker_pool import SharedWorkerPool
+from data.ingest.app import ingest_control
 from data.ingest.app.brokers.alpaca import broker_api
+from data.ingest.app.brokers.alpaca.read import AlpacaRead
 
 # The manifest parser, not a second copy of it: load_manifest() also enforces the manifest's
 # structure (field count, sorting, duplicates), so a malformed manifest fails here too instead
@@ -139,7 +141,7 @@ REQUEST_PAYLOADS = {'schemas.data_ingest.get_dataset_request.GetDatasetRequest':
 
 
 class StubBarSet:
-    """The slice of alpaca-py's BarSet that convert_bars_to_batch_schema actually touches.
+    """The slice of alpaca-py's BarSet that AlpacaRead's conversion actually touches.
 
     The same shape data/ingest/tests/test_broker_api.py uses. A heavier double buys nothing:
     the vendor response is read through exactly two operations, and a stub that supports only
@@ -160,20 +162,29 @@ def build_bar(close: float) -> SimpleNamespace:
         close (float): Closing price, the one field the assertions read back.
 
     Returns:
-        SimpleNamespace: A bar with every attribute the converter touches.
+        SimpleNamespace: A bar with every attribute the converter touches. vwap included: a real
+            alpaca-py Bar always carries it and AlpacaRead reads it, so a stub without it raises
+            AttributeError inside the fetch, which store_retrieve_stock swallows into a bare {}.
     """
-    return SimpleNamespace(open=1.0, high=2.0, low=0.5, close=close, volume=10, trade_count=3, timestamp=START)
+    return SimpleNamespace(
+        open=1.0, high=2.0, low=0.5, close=close, volume=10, trade_count=3, vwap=1.5, timestamp=START
+    )
 
 
 @pytest.fixture
-def stub_broker_client() -> Mock:
-    """Install a stub Alpaca client for the duration of one test.
+def stub_broker_client() -> Iterator[Mock]:
+    """Install a stub Alpaca client, and the production reader that uses it, for one test.
 
-    set_client() is production's own injection seam (tj-84jfb9), so nothing is patched and no
-    credential is read: the injected client IS the credential. Cleared afterwards so one test's
-    stub is never another test's vendor.
+    set_client() is production's own injection seam (tj-84jfb9), so no credential is read: the
+    injected client IS the credential. The reader is installed through install_readers(), the
+    same call the app's lifespan makes before the RPC servers start (decision tj-j4wknb,
+    INJECTION): the handler is called directly here, without the lifespan, so without this the
+    handler finds no reader for ALPACA_API and raises NotImplementedError. A production
+    AlpacaRead() with no client of its own, so the vendor is reached through broker_api.get_client()
+    exactly as in a deployment. Both are cleared afterwards so one test's stub is never another's
+    vendor.
 
-    Returns:
+    Yields:
         Mock: The installed client.
     """
     client = Mock()
@@ -181,7 +192,9 @@ def stub_broker_client() -> Mock:
         build_stock_dataset_request()['asset_symbol'], [build_bar(close) for close in CLOSES]
     )
     broker_api.set_client(client)
+    ingest_control.install_readers({DataSource.ALPACA_API: AlpacaRead()})
     yield client
+    ingest_control.clear_readers()
     broker_api.set_client(None)
 
 
@@ -283,9 +296,10 @@ async def test_the_registered_rpc_handler_answers_in_its_declared_response_schem
 
     response = await handler(request)
 
-    # isinstance, not truthiness: get_market_stock_data() catches every exception on the fetch
-    # path and returns a bare {} (broker_api.py, "TODO better error handling"). A failed request
-    # therefore comes back as an empty dict that a weaker assertion would read as success.
+    # isinstance, not truthiness: store_retrieve_stock() catches every exception on the fetch
+    # path and returns a bare {} (ingest_control.py, "TODO better error handling", tj-fe19tu). A
+    # failed request therefore comes back as an empty dict that a weaker assertion would read as
+    # success.
     assert isinstance(response, import_symbol(entry.response)), (
         f'{entry.symbol} returned {type(response).__name__}, not the declared {entry.response}'
     )

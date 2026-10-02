@@ -111,15 +111,26 @@ updates:
   # Dockerfile. `directory: /` is the root Dockerfile, which is the one that builds
   # both service images.
   #
-  # HONEST LIMIT: this may open nothing for a while. Both `FROM` lines are
-  # debian:bookworm-slim -- a suite tag with no version component to compare -- and the
-  # uv binary arrives via `COPY --from=ghcr.io/astral-sh/uv:0.9.3`, which GitHub does
-  # not document as being tracked at all. The entry earns its place on what comes
-  # next: the moment the bases are pinned by digest for reproducibility, this is the
-  # mechanism that refreshes those digests instead of freezing them, which is the same
-  # argument as the actions pins above. It is here BEFORE the digest pins for that
-  # reason. If the uv version in the Dockerfile needs to move, that is still a manual
-  # edit -- it is pinned in three places (Dockerfile, Makefile, workflow env).
+  # LIVE SINCE THE DIGEST PINS (ADR tj-4rr0la addendum 14). Every external FROM and
+  # COPY --from in the root Dockerfile is now tag@sha256:<multi-arch index digest>
+  # (debian:bookworm-slim, both stages; ghcr.io/astral-sh/uv), so this entry has digests
+  # to refresh, which is what it was put here for: a pin with no update mechanism freezes,
+  # the same argument as the actions pins above.
+  #
+  # A DIGEST BUMP IS TWO EDITS. The agent-stack MCP pulls exactly the refs listed in
+  # tools/agent_mcp/stack.py BASE_IMAGES before it builds, so a Dependabot pull request
+  # that moves a digest here must update BASE_IMAGES in the same pull request; the
+  # validator's equality pin fails until it does. It reaches the agent stack only on
+  # `make agent-mcp-rebuild`.
+  #
+  # NOT VERIFIED: whether Dependabot tracks the `COPY --from=ghcr.io/astral-sh/uv` ref at
+  # all. GitHub documents FROM lines; it does not document COPY --from, and nobody here has
+  # watched it open a pull request for one.
+  #
+  # The uv VERSION is still moved by hand, in every place it is pinned: the four
+  # UV_PIN_SOURCES in common/tests/test_ci_invariants.py (Makefile, root Dockerfile,
+  # workflow env, .devcontainer/Dockerfile), plus stack.py BASE_IMAGES and
+  # tools/agent_mcp/Dockerfile's uv digest.
   # ---------------------------------------------------------------------------
   - package-ecosystem: docker
     directory: /

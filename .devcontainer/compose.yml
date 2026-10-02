@@ -37,6 +37,23 @@ services:
       # created by initializeCommand in devcontainer.json: Docker creates a missing bind source
       # as a root-owned directory, and the entrypoint then cannot write its skill symlinks.
       - ${AGENT_HOME_PATH:-$HOME/.claude-agent-homes/trader_joe}:/home/agent/.claude
+
+      # The agent-stack MCP's share directory: its bearer token file (read by .mcp.json's
+      # headersHelper) and its seed output, nothing else. Its OWN mount, never a subdirectory of
+      # AGENT_HOME_PATH: from here the agent could replace such a subdirectory with a symlink, and
+      # the daemon would follow it when it binds the source into agent_mcp. A mount point cannot be
+      # renamed or removed from inside the container. agent_mcp binds the same directory at the same
+      # path and never sees AGENT_HOME_PATH (ADR tj-4rr0la addendum 11 R2). Transient by design:
+      # $XDG_RUNTIME_DIR/trader_joe_agent_mcp (tmpfs, wiped at logout or reboot); the MCP regenerates
+      # its token. The default is spelled the same in three places, which must agree: here, the
+      # Makefile's AGENT_MCP_SHARE_PATH and the initializeCommand, which creates it 0700.
+      # HOW THIS VALUE REACHES COMPOSE: interpolated from the environment of whoever runs compose.
+      # make agent-up exports AGENT_MCP_SHARE_PATH (with its /tmp/...-<uid> fallback) to it. The IDE
+      # runs compose in its own environment, which initializeCommand cannot change, so here only
+      # XDG_RUNTIME_DIR can supply the default: compose has no uid for the /tmp fallback. The
+      # initializeCommand therefore refuses to start when neither variable is set in the IDE's
+      # environment, rather than let this resolve to /trader_joe_agent_mcp.
+      - ${AGENT_MCP_SHARE_PATH:-${XDG_RUNTIME_DIR}/trader_joe_agent_mcp}:/agent_mcp_share
     environment:
       - CLAUDE_CONFIG_DIR=/home/agent/.claude
 
@@ -73,15 +90,29 @@ services:
       # attaches devnet, so this reaches no prod stack on the same machine. The agent has no
       # Docker -- no socket, no CLI -- so this is for reaching services by name, not for running
       # the system suite.
+      # trader_joe_agent_mcp is the ONE route to Docker (ADR tj-4rr0la addendum 1 (c)): the
+      # agent-stack MCP container (docker-compose.agent-mcp.yaml) answers here as agent_mcp:8765,
+      # with fixed verbs behind a bearer token, and it alone reaches the daemon, through its socket
+      # proxy on a network this container never joins. Nothing here adds a socket, a docker CLI
+      # or a docker group.
       - default
       - devnet
+      - trader_joe_agent_mcp
 
 # External with a fixed name: owned by neither this project nor the stack's, and created
 # idempotently by the initializeCommand in devcontainer.json and by `make dev-network`
 # (a prerequisite of agent-up), so either side can start first and neither side's down removes
 # it. trader_joe_devnet appears in exactly four places, which must agree: this file,
 # docker-compose.override.yaml, the Makefile's DEV_NETWORK and the initializeCommand.
+#
+# trader_joe_agent_mcp likewise, but INTERNAL (no gateway): created by the initializeCommand and
+# by `make agent-mcp-network` (a prerequisite of agent-up), joined only by this container and
+# agent_mcp. Its name appears in four places, which must agree: this file,
+# docker-compose.agent-mcp.yaml, the Makefile's AGENT_MCP_NETWORK and the initializeCommand.
 networks:
   devnet:
     external: true
     name: trader_joe_devnet
+  trader_joe_agent_mcp:
+    external: true
+    name: trader_joe_agent_mcp

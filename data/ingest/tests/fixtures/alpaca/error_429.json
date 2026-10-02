@@ -1,0 +1,13 @@
+{
+  "provenance": {
+    "kind": "documented",
+    "note": "Documented, not recorded: 429 'Too Many Requests. You hit the rate limit.' The page shows no example body; {code, message} is the shape ruled on tj-vhboky.57 (16:44 UTC), inferred from alpaca-py's APIError. Not recordable on purpose: provoking a rate limit on a real account is not a test step.",
+    "source": "https://docs.alpaca.markets/us/reference/stockbars",
+    "wire_contract": "tj-vhboky.57"
+  },
+  "status": 429,
+  "body": {
+    "code": 42910000,
+    "message": "rate limit exceeded"
+  }
+}

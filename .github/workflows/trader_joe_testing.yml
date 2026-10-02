@@ -76,7 +76,7 @@ env:
   # uv warns, then asserts the lock is current, so a stale lock still fails the job. Matches the
   # Makefile's exported UV_FROZEN.
   UV_FROZEN: "1"
-  SOURCE_PATHS: "./common ./routers ./schemas ./data"
+  SOURCE_PATHS: "./common ./routers ./schemas ./data ./tools"
 
 jobs:
   testing:
@@ -117,7 +117,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        uv sync --all-groups --no-group security --locked
+        uv sync --all-groups --no-group security --no-group agent-mcp --locked
     - name: Run Ruff Linting
       run: |
         uv run ruff check .
@@ -239,12 +239,52 @@ jobs:
         # PGADMIN_* placeholders dev-down uses, only to get past its ":?" guards; they are safe
         # here for the same reason, because `config` creates no container and so no pgAdmin
         # account can ever be initialised from them.
+        #
+        # The agent-stack set, spelled exactly as the Makefile's AGENT_STACK_COMPOSE: project
+        # trader_joe_agent_stack, then base, test-client, the agent-stack overlay and the
+        # fake-mode overlay LAST (ADR tj-4rr0la addendum 3 (3); decision tj-j4wknb R4). The
+        # agent-stack overlay reads seven variables through ":?" guards with no default --
+        # DATABASE_NAME, BROKER_NAME, STORE_API_NETWORK, DATA_DIR and the three *_ENV_FILE
+        # paths -- which the MCP server's generated env file supplies at run time, so this line
+        # sets throwaway placeholders for all seven, safe for the same reason as PGADMIN_*:
+        # `config` creates no container, network, volume or directory. The names differ from the
+        # user's defaults (db, kafka, trader_joe_store_api) only so a placeholder can never be
+        # taken for a real resource. With --quiet this line proves that the set interpolates and
+        # merges, and nothing more; which names the merged agent-stack model carries is pinned
+        # in-process by the build_infra tests (tj-c4mosr.5). The three *_ENV_FILE placeholders
+        # are NOT arbitrary: `config` refuses an env_file that does not exist, so they name the
+        # root, data/store and data/ingest env files Build Images already staged above, as
+        # absolute paths the way the generated env file spells them (the step runs at the
+        # checkout root, so ${PWD} is it). Naming a path is not reading the file. Whoever
+        # changes AGENT_STACK_COMPOSE updates this line.
+        #
+        # The fake-mode system set, spelled as the Makefile's SYSTEM_COMPOSE (what make
+        # system-launch starts; tj-vhboky.61): the default project, base then the fake-mode
+        # overlay. The overlay adds no variable, so it needs no env beyond the base file's.
+        #
+        # The agent-stack MCP's own project (docker-compose.agent-mcp.yaml; ADR tj-4rr0la addendum
+        # 11 R5), spelled as the Makefile's AGENT_MCP_COMPOSE: project trader_joe_agent_mcp and an
+        # empty --env-file, so no env file is read. Its five ":?" variables -- three host paths and
+        # the build's UID/GID -- get throwaway placeholders, safe for the same reason: `config`
+        # creates nothing, and it does not check that a bind source exists. Nothing else in CI
+        # reads this file before the host sitting (tj-c4mosr.6).
+        AGENT_MCP_REPO_HOST_PATH=/tmp/agent_mcp_render_repo AGENT_MCP_STACK_DIR=/tmp/agent_mcp_render_stack \
+          AGENT_MCP_SHARE_PATH=/tmp/agent_mcp_render_share AGENT_MCP_UID=1000 AGENT_MCP_GID=1000 \
+          docker compose -p trader_joe_agent_mcp --env-file /dev/null -f docker-compose.agent-mcp.yaml config --quiet
         docker compose -f docker-compose.yaml config --quiet
         docker compose -f docker-compose.yaml -f docker-compose.override.yaml config --quiet
         PGADMIN_EMAIL=unused PGADMIN_PASS=unused docker compose -f docker-compose.yaml \
           -f docker-compose.override.yaml -f docker-compose.tools.yaml config --quiet
         docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml config --quiet
-        echo "Compose renders: prod, dev, tools and client sets all interpolate and merge."
+        DATABASE_NAME=agent_stack_render_db BROKER_NAME=agent_stack_render_kafka \
+          STORE_API_NETWORK=agent_stack_render_store_api DATA_DIR=/tmp/agent_stack_render_data \
+          ROOT_ENV_FILE="${PWD}/.env" STORE_ENV_FILE="${PWD}/data/store/.env" \
+          INGEST_ENV_FILE="${PWD}/data/ingest/.env" \
+          docker compose -p trader_joe_agent_stack -f docker-compose.yaml \
+          -f docker-compose.test-client.yaml -f docker-compose.agent-stack.yaml \
+          -f docker-compose.fake.yaml config --quiet
+        docker compose -f docker-compose.yaml -f docker-compose.fake.yaml config --quiet
+        echo "Compose renders: prod, dev, tools, client, agent-stack, agent-mcp and fake-mode system sets all interpolate and merge."
 
     - name: Push Image - Data Store
       id: push_store
@@ -293,6 +333,7 @@ jobs:
         name: pipeline-configs-${{ steps.branch_name.outputs.BRANCH_NAME }}
         path: artifact/
         include-hidden-files: true
+        overwrite: true
 
   system:
     name: System Testing
@@ -319,13 +360,13 @@ jobs:
         with:
           version: "${{ env.UV_VERSION }}"
 
-      # No step in this job uses the host venv these two steps build. make test-system has no
-      # venv prerequisite and runs no uv sync: the suite runs inside test_client, whose image
-      # installs its own groups, and every other step works through docker compose. The steps
-      # are left in place for now; dropping them is a separate change.
+      # One step in this job uses the host venv these two steps build: Seed Dump, whose host-side
+      # writer (python -m data.store.seeds.bundle) runs in it. make test-system has no venv
+      # prerequisite and runs no uv sync: the suite runs inside test_client, whose image installs
+      # its own groups, and every other step works through docker compose.
       - name: Install dependencies
         run: |
-          uv sync --all-groups --no-group security --locked
+          uv sync --all-groups --no-group security --no-group agent-mcp --locked
 
       - name: Registry Login
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
@@ -388,13 +429,23 @@ jobs:
       # THE CLIENT (decision record tj-q9ae5u, addendum 1). Prod publishes no host port, so
       # nothing on this runner can reach data_store from outside the stack: every HTTP request
       # this job makes to it goes from test_client, a container on store_api, by service name.
-      # Two compose spellings, and only two, in this job:
-      #   the stack   docker compose -f docker-compose.yaml ...  -- up, migrate, exec, the
-      #               recreate, logs, down. It never loads the client file, so starting,
-      #               blanking and recreating data_store cannot depend on it.
+      # Three compose spellings, and only three, in this job:
+      #   the stack   docker compose -f docker-compose.yaml ...  -- run --no-deps, exec, logs,
+      #               ps, down. It never loads the client file, so migrating, blanking and
+      #               inspecting data_store cannot depend on it. None of these creates a service
+      #               container, so they keep the base file alone.
+      #   the fake stack
+      #               docker compose -f docker-compose.yaml -f docker-compose.fake.yaml -- for
+      #               `up` and nothing else (FAKE MODE, decision tj-j4wknb R4): make
+      #               system-launch starts the stack with it, so data_ingest runs the test-only
+      #               launcher on FakeRead, and the lifecycle step's data_store recreate repeats
+      #               it, so no container is ever created without the overlay -- or data_ingest
+      #               would silently come back on the production entrypoint.
       #   the client  docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml
       #               -- and only ever to build or run test_client (run: --rm --no-deps -T, plus
       #               --pull never wherever stdout is captured).
+      # make seed-dump runs inside its own recipe with base + fake + client (pinned in
+      # test_seed_dump_make.py), a spelling this job never writes out.
       # Built here from this job's checkout, before Start System and after Stage, because the
       # base file cannot interpolate without the staged POSTGRES_PASS. make test-system rebuilds
       # it with --build, which then finds every layer cached.
@@ -424,18 +475,46 @@ jobs:
       # credential, real or fake. Do not reintroduce a step that writes one.
 
       - name: Start System
+        # make system-launch refuses without this attestation. It holds by construction here: the
+        # runner's database is thrown away with the job. Set on this step only, like System Tests.
+        env:
+          SYSTEM_TEST_DISPOSABLE_DB: "1"
         run: |
+          set -euo pipefail
           ls -lah
-          # --wait, not a bare up -d. `up -d` returns once the containers are CREATED, so
-          # a service that boots and dies two seconds later still left this step green;
-          # `docker ps` then exits 0 on an empty list and confirmed nothing. With every
-          # service in docker-compose.yaml declaring a healthcheck, --wait blocks until
-          # each one reports healthy and exits non-zero if any goes unhealthy or dies.
-          # --wait-timeout bounds it: kafka's start_period is 90s and the two apps wait on
-          # kafka, so the ceiling has to sit well above the sum, and a hung stack should
-          # fail the job rather than burn the runner's six hours.
-          docker compose -f docker-compose.yaml up -d --wait --wait-timeout 300
+          # IN FAKE MODE (decision tj-j4wknb R4, tj-vhboky.61), through the same target a developer
+          # runs: the prod images and the prod compose file (decision tj-0rpt9t), plus
+          # docker-compose.fake.yaml, which mounts tests/fakes read-only into data_ingest and swaps
+          # its command for the test-only launcher -- FakeRead in the broker slot, no vendor, no
+          # credential. The Smoke Test asserts nothing that depends on the mode; the overlay is
+          # what lets the system suite and the seed producer fetch bars at all.
+          #
+          # --wait, not a bare up -d (the recipe's own flags). `up -d` returns once the
+          # containers are CREATED, so a service that boots and dies two seconds later still left
+          # this step green. With every service declaring a healthcheck, --wait blocks until
+          # each one reports healthy and exits non-zero if any goes unhealthy or dies; its
+          # --wait-timeout 300 sits well above kafka's 90s start_period plus the apps' own, so a
+          # hung stack fails the job rather than burn the runner's six hours.
+          make system-launch
           docker compose -f docker-compose.yaml ps  # health column, not just liveness
+
+      - name: Check Fake Broker
+        run: |
+          set -euo pipefail
+          # FAKES-1: the launcher logs ONE WARNING starting 'FAKE BROKER:' at import, and the
+          # production entrypoint never does. Checked BEFORE anything talks to the stack, so a
+          # data_ingest that came up on the production entrypoint (an overlay dropped from Start
+          # System) fails here, by name, rather than as a confusing failure deep in the suite or
+          # the seed producer. The logs are captured first and grepped after, so grep stopping
+          # early can never break the pipe under pipefail. The banner holds no secret: it is
+          # printed. grep exiting 1 means no banner, which the check below reports.
+          logs="$(docker compose -f docker-compose.yaml logs --no-color --no-log-prefix data_ingest)"
+          banner="$(printf '%s\n' "${logs}" | { grep -E 'WARNING.*FAKE BROKER:' || [ $? -eq 1 ]; })"
+          if [ -z "${banner}" ]; then
+            echo "::error::data_ingest's logs carry no 'FAKE BROKER:' WARNING; it is not running the fake-mode launcher"
+            exit 1
+          fi
+          echo "data_ingest is in fake mode: ${banner}"
 
       - name: Migrate Database
         run: |
@@ -698,6 +777,54 @@ jobs:
           # what that file's docstring concedes a unit test cannot show, these check on Postgres.
           make test-system
 
+      - name: Seed Dump
+        # The producer writes its scenario into the database it reaches, so make seed-dump has
+        # the same disposable-database attestation as the suite. Set on this step only.
+        env:
+          SYSTEM_TEST_DISPOSABLE_DB: "1"
+        run: |
+          set -euo pipefail
+          # THE HEAD SEED (decision tj-vhboky.55; ADR tj-4rr0la addendum 10). The same target a
+          # developer runs: the producer runs in test_client (compose run --rm, entrypoint
+          # overridden), POSTs its synthetic scenario to data_store -- answered with fake bars by the
+          # fake-mode data_ingest -- normalises and renders the two market tables, and prints one
+          # bundle line; the repo venv's python -m data.store.seeds.bundle unpacks it into SEED_OUT
+          # as <revision>.sql and <revision>.json. The recipe's status is the producer's when it
+          # fails, else the writer's, so a refusal (3) or a failure (1) is red here.
+          #
+          # ORDER, chosen on purpose: AFTER System Tests and BEFORE Instance Secret Lifecycle.
+          #   Before the lifecycle step, because the producer authenticates its writes with
+          #   test_client's INSTANCE_WRITE_SECRET, and that step blanks the secret in the staged
+          #   env file and recreates data_store to refuse every write. After it, the producer would
+          #   fail with its missing-secret error (exit 1).
+          #   After System Tests, because that is where the bead puts it and because the suite
+          #   removes every row it writes (tests/system/conftest.py fails its own teardown
+          #   otherwise): the producer refuses a database holding any row outside its synthetic
+          #   patterns, so a suite that left litter turns this step red rather than producing a seed
+          #   from it. A side effect: the lifecycle step's log scan covers the producer's requests.
+          #
+          # SEED_OUT is job-local: inside this checkout, under the git-ignored output/, and never
+          # under tests/ (the writer refuses tests/).
+          make seed-dump SEED_OUT=output/ci-seed
+          ls -la output/ci-seed
+
+      # This only moves the seed off the runner, so a person can download, review and commit it.
+      # It is NOT where seeds are kept: storage is the committed files under tests/system/seeds
+      # (ruling on tj-vhboky.56). Hence the short retention. Before the lifecycle step like the
+      # dump, and unconditional: every step up to that one is (no `if:`), so no check can be
+      # skipped on the way. overwrite: a re-run attempt replaces the earlier attempt's artifact,
+      # which is the newer head; without it the fixed name conflicts and the re-run fails here
+      # instead of reaching the step that failed. The same key on Push Pipeline Configs, for the
+      # same reason -- and no run_attempt suffix, because Pull Pipeline Configs names it exactly.
+      - name: Upload Head Seed
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: head-seed-${{ needs.build.outputs.BRANCH_NAME }}
+          path: output/ci-seed/
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
       - name: Instance Secret Lifecycle
         run: |
           set -euo pipefail
@@ -737,9 +864,12 @@ jobs:
 
           # (e) An unset secret must never mean allow-everything. Blank it -- the template's own
           # shipped state -- and recreate data_store alone; --no-deps leaves Postgres, kafka and
-          # data_ingest as they are, and --wait holds until the new container is healthy.
+          # data_ingest as they are, and --wait holds until the new container is healthy. The
+          # fake-mode overlay stays loaded (the set make system-launch started), so this `up` sees
+          # the same model the stack runs and data_ingest can never come back on the production
+          # entrypoint, even if --no-deps were ever lost.
           sed -i 's/^INSTANCE_WRITE_SECRET=.*/INSTANCE_WRITE_SECRET=/' .env
-          docker compose -f docker-compose.yaml up -d --no-deps --force-recreate --wait --wait-timeout 180 data_store
+          docker compose -f docker-compose.yaml -f docker-compose.fake.yaml up -d --no-deps --force-recreate --wait --wait-timeout 180 data_store
           # Check the blanking reached the process, or every 401 below would prove nothing new.
           docker compose -f docker-compose.yaml exec -T data_store /code/.venv/bin/python -c \
             'import os, sys; sys.exit(1 if os.environ.get("INSTANCE_WRITE_SECRET") else 0)' \

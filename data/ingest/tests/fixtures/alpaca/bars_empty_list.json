@@ -1,0 +1,15 @@
+{
+  "provenance": {
+    "kind": "documented",
+    "note": "Documented, not recorded: EMPTY range, symbol present with an empty list -- the second shape tj-vhboky.57 (16:44 UTC) requires the tests to accept. Alpaca does not document its empty-range body; the host sitting records which shape it really sends (tj-irhy0a.3; FAKES-4 tj-irhy0a.13).",
+    "source": "https://docs.alpaca.markets/us/reference/stockbars",
+    "wire_contract": "tj-vhboky.57"
+  },
+  "status": 200,
+  "body": {
+    "bars": {
+      "AAPL": []
+    },
+    "next_page_token": null
+  }
+}

@@ -12,9 +12,15 @@ services:
       # entirely (docker writes its own DOCKER chain ahead of ufw/firewalld). The dev-only
       # loopback publish for psql lives in docker-compose.override.yaml, with devnet.
       - store_db
+    # Every service's env files read ROOT_ENV_FILE, STORE_ENV_FILE and INGEST_ENV_FILE, defaulting
+    # to the paths they always had, so the isolated agent stack (docker-compose.agent-stack.yaml,
+    # ADR tj-4rr0la addendum 2) can point its services at its own generated, credential-free files
+    # outside the repository instead of the user's. Nothing but the agent stack's generated env sets
+    # them: unset, as in every .env, this renders exactly as before. Short form on purpose -- a
+    # missing env file still stops compose.
     env_file:
-      - .env
-      - ./data/store/.env
+      - ${ROOT_ENV_FILE:-.env}
+      - ${STORE_ENV_FILE:-./data/store/.env}
     environment:
       POSTGRES_DB: ${POSTGRES_DB_NAME}
       POSTGRES_USER: ${POSTGRES_USER}
@@ -57,8 +63,8 @@ services:
       # When gRPC replaces Kafka this entry goes and ingest_store stays (see networks:).
       - ingest_store
     env_file:
-      - .env
-      - ./data/ingest/.env
+      - ${ROOT_ENV_FILE:-.env}
+      - ${INGEST_ENV_FILE:-./data/ingest/.env}
     environment:
       CLUSTER_ID: ${KAFKA_ID}
       KAFKA_LISTENERS: BROKER://0.0.0.0:9092,CONTROLLER://${BROKER_NAME}:9093
@@ -123,8 +129,8 @@ services:
       - ./data/store/alembic.ini:/code/alembic.ini
       - ./data/store/migrations:/code/migrations
     env_file:
-      - .env
-      - ./data/store/.env
+      - ${ROOT_ENV_FILE:-.env}
+      - ${STORE_ENV_FILE:-./data/store/.env}
     environment:
       # Built from the same variables Postgres itself is given, so there is one password
       # in one place and the app cannot drift from the server. The previous fallback,
@@ -190,8 +196,8 @@ services:
       - ingest_store
       - ingest_egress
     env_file:
-      - .env
-      - ./data/ingest/.env
+      - ${ROOT_ENV_FILE:-.env}
+      - ${INGEST_ENV_FILE:-./data/ingest/.env}
     image: trader_joe_data_ingest:latest
     security_opt:
       - "no-new-privileges:true"
@@ -223,6 +229,9 @@ services:
 #
 # store_api has a fixed name so another compose project (a strategy stack, the private repo's
 # clients) can declare it external and join it. The other three keep compose's project prefix.
+# The name reads STORE_API_NETWORK, defaulting to trader_joe_store_api, so the isolated agent stack
+# (docker-compose.agent-stack.yaml, ADR tj-4rr0la) can run beside this one without joining its
+# store_api. Nothing else sets it: unset, as in every .env, this renders exactly as before.
 #
 # Dev adds one more, devnet, in docker-compose.override.yaml only. PROD_COMPOSE never loads that
 # file, so a prod launch never attaches devnet.
@@ -233,5 +242,5 @@ networks:
     internal: true
   store_api:
     internal: true
-    name: trader_joe_store_api
+    name: ${STORE_API_NETWORK:-trader_joe_store_api}
   ingest_egress: {}

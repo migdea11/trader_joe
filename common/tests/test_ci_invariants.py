@@ -37,6 +37,7 @@ from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
 from common.environment import get_env_var
+from common.tests.compose_model import InterpolationRefused, interpolate
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -1977,6 +1978,25 @@ def _compose_calls(line: str) -> list[tuple[list[str], list[str]]]:
     return calls
 
 
+def _compose_projects(line: str) -> list[str | None]:
+    """The -p / --project-name of each docker compose invocation on a line, None where it sets none."""
+    projects = []
+    for match in _COMPOSE_INVOCATION.finditer(line):
+        words, project, position = line[match.end() :].split(), None, 0
+        while position < len(words) and words[position].startswith('-'):
+            option, equals, value = words[position].partition('=')
+            if option in ('-p', '--project-name'):
+                if not equals:
+                    position += 1
+                    value = words[position] if position < len(words) else ''
+                project = value.strip('\'"')
+            elif option in _COMPOSE_VALUE_OPTIONS and not equals:
+                position += 1
+            position += 1
+        projects.append(project)
+    return projects
+
+
 def _compose_service(rest: list[str]) -> tuple[str, list[str], list[str]]:
     """Split a compose subcommand's words into (service, its options, the words after the service)."""
     options, position = [], 1
@@ -2464,13 +2484,25 @@ def test_test_system_runs_only_the_client(tmp_path: Path):
 
 
 def _env_file_directories() -> set[PurePosixPath]:
-    """The directories that hold an env file any service of docker-compose.yaml loads."""
+    """The directories that hold an env file any service of docker-compose.yaml loads.
+
+    Each entry is RESOLVED before it is normalised (tj-c4mosr.5, addendum-2 pin (4)): since
+    tj-c4mosr.7 the entries read ${ROOT_ENV_FILE:-.env} and the like, and normalising the raw string
+    derived '${STORE_ENV_FILE:-./data/store' -- a directory nothing is ever under -- so the check that
+    uses this guarded nothing and stayed green. An entry that still holds a '$' once its default is
+    taken fails here, loudly, rather than being judged as a path.
+    """
     directories = set()
-    for spec in (_load_yaml(COMPOSE_FILE).get('services') or {}).values():
+    for name, spec in (_load_yaml(COMPOSE_FILE).get('services') or {}).items():
         env_files = (spec or {}).get('env_file') or []
         for entry in [env_files] if isinstance(env_files, str) else env_files:
-            path = entry.get('path') if isinstance(entry, dict) else entry
-            directories.add(PurePosixPath(os.path.normpath(str(path))).parent)
+            path = str(entry.get('path') if isinstance(entry, dict) else entry)
+            try:
+                resolved = interpolate(path, {})
+            except InterpolationRefused as refused:
+                raise AssertionError(f'{name} loads env file {path!r}, which has no default to judge') from refused
+            assert resolved and '$' not in resolved, f'{name} loads env file {path!r}, which does not resolve to a path'
+            directories.add(PurePosixPath(os.path.normpath(resolved)).parent)
     assert directories, f'no service in {COMPOSE_FILE.name} loads an env file, so this check would guard nothing'
     return directories
 
@@ -2936,24 +2968,50 @@ STOP_STEP = 'Stop System'
 BUILD_CLIENT_STEP = 'Build Test Client'
 SMOKE_STEP = 'Smoke Test'
 LOCKDOWN_STEP = 'Check Network Lockdown'
+START_STEP = 'Start System'
+# tj-irhy0a.1 / tj-irhy0a.2: the fake-mode banner check, and the head seed's dump and upload.
+FAKE_CHECK_STEP = 'Check Fake Broker'
+SEED_DUMP_STEP = 'Seed Dump'
+UPLOAD_SEED_STEP = 'Upload Head Seed'
 SYSTEM_JOB_STEP_ORDER = (
     STAGE_STEP,
     BUILD_CLIENT_STEP,
-    'Start System',
+    START_STEP,
+    FAKE_CHECK_STEP,
     MIGRATE_STEP,
     SMOKE_STEP,
     LOCKDOWN_STEP,
     'Check Container Env',
     SYSTEM_TESTS_STEP,
+    # After the suite (decision tj-vhboky.55) and BEFORE the lifecycle step, which blanks the write
+    # secret the producer authenticates with (architect note of 04:45 UTC 2026-09-30 on tj-irhy0a.1).
+    SEED_DUMP_STEP,
+    UPLOAD_SEED_STEP,
     LIFECYCLE_STEP,
     DUMP_STEP,
     STOP_STEP,
 )
+# The fake-mode overlay (decision tj-j4wknb R4; tj-vhboky.61). In System Testing it is loaded with the
+# base file, in that order, by every `up` -- a container created without it runs data_ingest on the
+# production entrypoint (tj-irhy0a.1 item 1).
+FAKE_OVERLAY_FILE = REPO_ROOT / 'docker-compose.fake.yaml'
+CONTAINER_CREATING_SUBCOMMANDS = frozenset({'up', 'create'})
+# The steps that may, and must, carry SYSTEM_TEST_DISPOSABLE_DB=1: each runs a make target behind the
+# disposable-database guard (test-system, system-launch, seed-dump), and nothing else may inherit it.
+ATTESTING_STEPS = frozenset({SYSTEM_TESTS_STEP, START_STEP, SEED_DUMP_STEP})
 # Steps that must reach the stack, so an empty compose-invocation list cannot pass the file check.
-SYSTEM_JOB_COMPOSE_STEPS = ('Start System', MIGRATE_STEP, 'Check Container Env', LIFECYCLE_STEP, DUMP_STEP, STOP_STEP)
+SYSTEM_JOB_COMPOSE_STEPS = (
+    START_STEP,
+    FAKE_CHECK_STEP,
+    MIGRATE_STEP,
+    'Check Container Env',
+    LIFECYCLE_STEP,
+    DUMP_STEP,
+    STOP_STEP,
+)
 # Steps that drive the stack and nothing else: they must never load the client file, so starting,
 # migrating, inspecting and stopping the stack cannot depend on it.
-SYSTEM_JOB_STACK_ONLY_STEPS = ('Start System', MIGRATE_STEP, 'Check Container Env', DUMP_STEP, STOP_STEP)
+SYSTEM_JOB_STACK_ONLY_STEPS = (START_STEP, FAKE_CHECK_STEP, MIGRATE_STEP, 'Check Container Env', DUMP_STEP, STOP_STEP)
 # Steps that must send at least one request from test_client (tj-q9ae5u addendum 1 item 5').
 SYSTEM_JOB_CLIENT_STEPS = (BUILD_CLIENT_STEP, SMOKE_STEP, LOCKDOWN_STEP, LIFECYCLE_STEP)
 # The one compose subcommands a client invocation may run.
@@ -2962,7 +3020,19 @@ CLIENT_RUN_OPTIONS = frozenset({'--rm', '--no-deps', '-T'})
 IMAGE_BUILD_JOB_NAME = 'Image Build'
 RENDER_STEP = 'Check Compose Renders'
 # The Makefile's compose sets the render check must cover, each in the Makefile's own file order.
-RENDERED_COMPOSE_VARIABLES = ('PROD_COMPOSE', 'DEV_COMPOSE', 'TOOLS_COMPOSE', TEST_CLIENT_COMPOSE_VARIABLE)
+# Re-pinned for tj-c4mosr.5: the agent-stack set (tj-c4mosr.8) and the MCP's own project (tj-c4mosr.4,
+# ADR tj-4rr0la addendum 11 R5 (c)) are rendered too, each under the project the Makefile gives it.
+RENDERED_COMPOSE_VARIABLES = (
+    'PROD_COMPOSE',
+    'DEV_COMPOSE',
+    'TOOLS_COMPOSE',
+    TEST_CLIENT_COMPOSE_VARIABLE,
+    'AGENT_STACK_COMPOSE',
+    'AGENT_MCP_COMPOSE',
+    # The fake-mode stack make system-launch starts (tj-vhboky.61), default project. Its render line,
+    # and the fake overlay as the agent-stack line's fourth file, landed with tj-irhy0a.24.
+    'SYSTEM_COMPOSE',
+)
 TEARDOWN_CONDITIONS = frozenset({'failure()', 'always()'})
 # The staged project env file the job writes and reads back. Named through the template's stem so
 # this module never spells a path that holds real credentials.
@@ -3099,6 +3169,11 @@ def test_system_job_steps_run_in_order_with_teardown_last():
     Dump Container Logs (on failure) must precede Stop System (always), whose `down -v` destroys
     the containers the dump reads. Everything after the lifecycle step is teardown, and nothing
     before it is conditional, so no check on the way can be skipped.
+
+    tj-irhy0a.2 re-pin (tj-irhy0a.1): Check Fake Broker DIRECTLY follows Start System, so nothing talks
+    to a stack whose data_ingest has not been shown to be the fake; Seed Dump then Upload Head Seed
+    sit after System Tests and before the lifecycle step, whose blanked secret the producer would
+    fail on (exit 1).
     """
     steps = _system_steps()
     names = [step.get('name') for step in steps]
@@ -3107,6 +3182,9 @@ def test_system_job_steps_run_in_order_with_teardown_last():
     positions = [names.index(name) for name in SYSTEM_JOB_STEP_ORDER]
     assert positions == sorted(positions), (
         f'{SYSTEM_JOB_NAME} steps are out of order: expected {list(SYSTEM_JOB_STEP_ORDER)} as a subsequence of {names}'
+    )
+    assert names[names.index(START_STEP) + 1] == FAKE_CHECK_STEP, (
+        f'{FAKE_CHECK_STEP} must directly follow {START_STEP}: {names}'
     )
     lifecycle = names.index(LIFECYCLE_STEP)
     assert names[lifecycle + 1 : lifecycle + 3] == [DUMP_STEP, STOP_STEP], (
@@ -3260,14 +3338,31 @@ def test_system_job_loads_the_stack_alone_and_the_client_only_as_a_pair():
     test_client, a run always removed on exit, with no deps and no TTY. So anything that starts,
     blanks, recreates, inspects or stops the stack names the base file alone, and the stack-only
     steps never load the client file at all. COMPOSE_FILE would do all this behind the flags.
+
+    tj-irhy0a.2 RE-PIN (tj-irhy0a.1 item 1, decision tj-j4wknb R4): a THIRD spelling, the FAKE-MODE
+    STACK -- docker-compose.yaml then docker-compose.fake.yaml, SYSTEM_COMPOSE's set -- and it is the
+    only one an `up` (or `create`) may use. The job starts the stack through make system-launch, so a
+    container created or recreated on the base file alone would bring data_ingest back on the
+    production entrypoint; the lifecycle step's data_store recreate is the one `up` written out in
+    the job, and it must carry the overlay. The base file alone stays the spelling for everything
+    that creates no service container (run --no-deps of a one-off, exec, logs, ps, down); the overlay
+    is loaded for nothing but `up`; the client pair is unchanged.
     """
-    seen, client_steps, offenders = set(), set(), []
+    fake_stack = [COMPOSE_FILE.name, FAKE_OVERLAY_FILE.name]
+    seen, client_steps, fake_ups, offenders = set(), set(), set(), []
     for step in _system_steps():
         name = step.get('name')
         for line in _step_lines(step):
             for files, rest in _compose_calls(line):
                 seen.add(name)
+                if files == fake_stack:
+                    if rest[:1] != ['up']:
+                        offenders.append(f'{name}: the fake-mode set runs {rest[:1]}, not up: {line}')
+                    fake_ups.add(name)
+                    continue
                 if files == [COMPOSE_FILE.name]:
+                    if rest[:1] and rest[0] in CONTAINER_CREATING_SUBCOMMANDS:
+                        offenders.append(f'{name}: `{rest[0]}` on the base file alone drops the fake overlay: {line}')
                     continue
                 if files != _client_file_pair():
                     offenders.append(f'{name}: -f {files} in {line}')
@@ -3284,7 +3379,8 @@ def test_system_job_loads_the_stack_alone_and_the_client_only_as_a_pair():
                     offenders.append(f'{name}: a client run lacks {sorted(CLIENT_RUN_OPTIONS - set(options))}: {line}')
     missing = sorted(set(SYSTEM_JOB_COMPOSE_STEPS) - seen)
     assert not missing, f'no docker compose invocation found in {missing}, so this check saw less than the job runs'
-    assert not offenders, f'{SYSTEM_JOB_NAME} loads compose files outside the two spellings: {offenders}'
+    assert not offenders, f'{SYSTEM_JOB_NAME} loads compose files outside the three spellings: {offenders}'
+    assert LIFECYCLE_STEP in fake_ups, f'{LIFECYCLE_STEP} recreates data_store without the fake-mode overlay'
     without_client = sorted(set(SYSTEM_JOB_CLIENT_STEPS) - client_steps)
     assert not without_client, f'{without_client} send nothing from {TEST_CLIENT_SERVICE}'
 
@@ -3437,11 +3533,14 @@ def _image_build_job() -> dict:
 
 @pytest.mark.build_infra
 def test_image_build_renders_every_compose_set_quietly():
-    """N4 item 8: `config --quiet` over the prod, dev, tools and client sets, after Build Images.
+    """N4 item 8: `config --quiet` over every compose set the Makefile names, after Build Images.
 
-    Each set exactly as the Makefile spells it, so the check cannot drift from what make loads. A
-    broken override or tools file otherwise surfaces only on a developer's machine. ALWAYS quiet:
-    without it `config` prints the interpolated model, POSTGRES_PASS inside DATABASE_URI included.
+    Each set exactly as the Makefile spells it -- the files in order AND the project -- so the check
+    cannot drift from what make loads. A broken override or tools file otherwise surfaces only on a
+    developer's machine. ALWAYS quiet: without it `config` prints the interpolated model, POSTGRES_PASS
+    inside DATABASE_URI included. Re-pinned for tj-c4mosr.5: the agent-stack set under
+    trader_joe_agent_stack and the MCP's file under trader_joe_agent_mcp are rendered too; a
+    workflow line that drops its -p renders a different project and goes red.
     """
     steps = _image_build_job().get('steps') or []
     names = [step.get('name') for step in steps]
@@ -3456,12 +3555,60 @@ def test_image_build_renders_every_compose_set_quietly():
     loud = [rest for _, rest in calls if rest[:1] != ['config'] or not {'--quiet', '-q'} & set(rest)]
     assert not loud, f'{RENDER_STEP} runs compose other than `config --quiet`: {loud}'
     env = _subprocess_env()
-    expected = [
-        _compose_calls(_expanded_make_variable(name, REPO_ROOT, env))[0][0] for name in RENDERED_COMPOSE_VARIABLES
+    expected = []
+    for name in RENDERED_COMPOSE_VARIABLES:
+        expanded = _expanded_make_variable(name, REPO_ROOT, env)
+        (files, rest), project = _compose_calls(expanded)[0], _compose_projects(expanded)[0]
+        assert not rest, f'{name} is {expanded!r}; a compose set names files, not a subcommand'
+        # AGENT_MCP_COMPOSE names its file under the root checkout's absolute path; CI renders from
+        # the checkout root, so the file's name is what the two must agree on.
+        expected.append((tuple(PurePosixPath(file).name if file.startswith('/') else file for file in files), project))
+    rendered = [
+        (tuple(files), project)
+        for line in _step_lines(step)
+        for (files, _), project in zip(_compose_calls(line), _compose_projects(line), strict=True)
     ]
-    rendered = [files for files, _ in calls]
-    assert sorted(rendered) == sorted(expected), (
+    assert sorted(rendered, key=str) == sorted(expected, key=str), (
         f'{RENDER_STEP} renders {rendered}, expected the Makefile sets {dict(zip(RENDERED_COMPOSE_VARIABLES, expected, strict=True))}'
+    )
+
+
+@pytest.mark.build_infra
+def test_every_compose_render_failure_fails_the_step():
+    """tj-irhy0a.24: a render that fails, fails Check Compose Renders, whichever line it is.
+
+    The pin above keeps the step unconditional and without continue-on-error, which says nothing
+    about the lines inside it: one `|| true` or `set +e` lets a broken compose set through as a
+    green step, and without errexit only the closing echo's status would be the step's.
+    """
+    lines = _step_lines(next(step for step in _image_build_job().get('steps') or [] if step.get('name') == RENDER_STEP))
+    first_render = next(index for index, line in enumerate(lines) if _compose_calls(line))
+    errexit = [line for line in lines[:first_render] if re.match(r'^set\s+-\w*e', line)]
+    assert errexit, f'{RENDER_STEP} does not set errexit before its first render'
+    swallowed = [line for line in lines if _SWALLOWED_STATUS.search(line)]
+    assert not swallowed, f'{RENDER_STEP} swallows a failure: {swallowed}'
+
+
+@pytest.mark.build_infra
+def test_the_agent_stack_render_names_the_env_files_build_images_staged():
+    """Each *_ENV_FILE placeholder on the agent-stack render line names a staged file.
+
+    tj-c4mosr.5 (01:50 item 2, optional, taken): the placeholder names a file Build Images copies from its .env.default before the render step. A rename on
+    either side otherwise surfaces only when CI's `config` refuses a missing env_file.
+    """
+    steps = {step.get('name'): step for step in _image_build_job().get('steps') or []}
+    staged = set()
+    for line in _step_lines(steps['Build Images']):
+        words = shlex.split(line)
+        if words[:1] == ['cp'] and len(words) == 3 and words[1] == f'{words[2]}.default':
+            staged.add(posixpath.normpath(words[2]))
+    placeholders = {}
+    for line in _step_lines(steps[RENDER_STEP]):
+        for variable, value in re.findall(r'\b(ROOT_ENV_FILE|STORE_ENV_FILE|INGEST_ENV_FILE)="([^"]*)"', line):
+            placeholders[variable] = posixpath.normpath(value.removeprefix('${PWD}/'))
+    assert set(placeholders) == {'ROOT_ENV_FILE', 'STORE_ENV_FILE', 'INGEST_ENV_FILE'}, placeholders
+    assert set(placeholders.values()) <= staged, (
+        f'{RENDER_STEP} names {placeholders}; Build Images stages {sorted(staged)}'
     )
 
 
@@ -3499,16 +3646,23 @@ def test_system_job_never_swallows_a_failure():
 
 
 @pytest.mark.build_infra
-def test_only_the_system_tests_step_attests_a_disposable_database():
-    """tj-vhboky.52 item 2: SYSTEM_TEST_DISPOSABLE_DB=1 on the suite step and nowhere else.
+def test_only_the_guarded_target_steps_attest_a_disposable_database():
+    """tj-vhboky.52 item 2: SYSTEM_TEST_DISPOSABLE_DB=1 on the guarded-target steps and nowhere else.
 
     The attestation is what lets the suite write to a database. Set on the step, nothing else in
     the job inherits it; set at job or workflow level, or exported by a script, it would.
+
+    tj-irhy0a.2 RE-PIN (tj-irhy0a.1 item 1 and its 08:35 UTC note; item 3): make system-launch and
+    make seed-dump sit behind the same guard as make test-system (test_fake_overlay.py,
+    test_seed_dump_make.py), so Start System and Seed Dump carry it too. The property is unchanged:
+    STEP-level only, on exactly the steps that run a guarded target -- ATTESTING_STEPS -- and never
+    on the job, the workflow, another step, a run line or a `with:`.
     """
-    step = _system_step(SYSTEM_TESTS_STEP)
-    assert str((step.get('env') or {}).get(SYSTEM_GUARD)) == '1', (
-        f'{SYSTEM_TESTS_STEP} does not set {SYSTEM_GUARD}=1 in its env: {step.get("env")}'
-    )
+    for name in sorted(ATTESTING_STEPS):
+        step = _system_step(name)
+        assert str((step.get('env') or {}).get(SYSTEM_GUARD)) == '1', (
+            f'{name} does not set {SYSTEM_GUARD}=1 in its env: {step.get("env")}'
+        )
     elsewhere = []
     for path in _workflow_files():
         document = _load_yaml(path) or {}
@@ -3519,18 +3673,18 @@ def test_only_the_system_tests_step_attests_a_disposable_database():
                 elsewhere.append(f'{path.name} {job_id} env')
             for other in (job or {}).get('steps') or []:
                 where = f'{path.name} {job_id} / {other.get("name")}'
-                is_suite_step = (
+                is_attesting_step = (
                     path == TESTING_WORKFLOW
                     and (job or {}).get('name') == SYSTEM_JOB_NAME
-                    and other.get('name') == SYSTEM_TESTS_STEP
+                    and other.get('name') in ATTESTING_STEPS
                 )
-                if not is_suite_step and SYSTEM_GUARD in (other.get('env') or {}):
+                if not is_attesting_step and SYSTEM_GUARD in (other.get('env') or {}):
                     elsewhere.append(f'{where} env')
                 if any(SYSTEM_GUARD in line for line in _step_lines(other)):
                     elsewhere.append(f'{where} run')
                 if any(SYSTEM_GUARD in scalar for scalar in _walk_scalars(other.get('with') or {})):
                     elsewhere.append(f'{where} with')
-    assert not elsewhere, f'{SYSTEM_GUARD} is set outside {SYSTEM_TESTS_STEP}: {elsewhere}'
+    assert not elsewhere, f'{SYSTEM_GUARD} is set outside {sorted(ATTESTING_STEPS)}: {elsewhere}'
 
 
 @pytest.mark.build_infra
@@ -3602,7 +3756,9 @@ def test_the_testing_workflow_stays_under_the_broker_credential_rule():
     test_branch_triggered_workflow_holds_no_broker_credential skips a workflow outside the branch
     reach, so this first pins that the testing workflow is inside it. Then the System Testing job
     -- every key and value, run scripts included -- names no ALPACA_/IBKR_/QUESTRADE_ variable at
-    all, credential or not: it runs without a broker, and the fake-broker overlay is a later PR.
+    all, credential or not: it runs without a broker. Since tj-irhy0a.1 the job runs data_ingest on
+    the fake-mode overlay, which blanks the broker keys itself (docker-compose.fake.yaml, pinned in
+    test_fake_overlay.py); the workflow still names none.
     """
     assert TESTING_WORKFLOW.name in _branch_reach(), (
         f'{TESTING_WORKFLOW.name} is no longer branch-triggered, so the tj-59cce6 test skips it'
@@ -4271,8 +4427,29 @@ def test_only_container_jobs_that_run_the_suite_are_judged(tmp_path: Path, monke
 # Every host bind-mount data directory compose declares must stay out of the Docker build context.
 # The Postgres directory is mode 0700 and owned by the container's uid, so a build started while a
 # stack is up -- make test-system's --build in CI, after Start System -- fails sending the context
-# with "permission denied". The other half: nothing the Dockerfile COPYs may be excluded, or the
-# image builds without its source and fails only at runtime.
+# with "permission denied". The other half: what the images run must be sent, or an image builds
+# without its source and fails only at runtime.
+#
+# That half is checked twice. (1) Nothing under a Dockerfile COPY source may be excluded, with one
+# named exception: a file whose path RELATIVE TO THAT SOURCE has a directory segment exactly `tests`
+# (common/tests/..., routers/tests/interface_manifest/...). No image reads a tests/ directory --
+# tests run on the host venv, and the dev image and test_client bind-mount the source -- so keeping
+# them out of the prod image (tj-v82dvm) is allowed. The COPY source itself, a non-test file,
+# `tests_util/`, `testsuite/` and `tests.py` stay offenders. tj-ijpys9.17 first pinned "every
+# tracked file under a COPY source is sent", which was a proxy for the purpose and stricter than it.
+# (2) The purpose, directly: every module each service app imports, transitively (TYPE_CHECKING and
+# function-level imports included), and each package __init__.py on its path, is sent. The apps are
+# the COPY sources the Dockerfile builds from build args, so a new service is covered by the parse.
+# (2) is what catches a production import of a tests/ module that (1) now lets be excluded.
+# (3) The reverse of (1), so the exception is used and stays used: every `tests` directory under a
+# COPY source that holds a git-tracked file IS excluded, file by file (tj-v82dvm). The directories
+# are derived from the COPY parse and git, so a new suite under a copied package is covered.
+# (4) Sent is not copied: every file of each app's closure lies under a static COPY source (one no
+# build arg names) or the app's own source -- never another service's app or an uncopied package
+# (tj-bhzf6b). An ancestor package __init__.py of those sources (data/__init__.py) is not copied
+# and imports as a namespace package in the image; it is allowed only while it has no statement
+# beyond a module docstring (tj-zcd9ar), since the host runs its code and the image does not. It is
+# walked like every package __init__.py on a reached file's path, so what it imports must be copied too.
 #
 # The data directories are derived from the compose YAML, not listed: a mount is data when its host
 # side starts with ${DATA_DIR...}, or with the literal fallback such an interpolation names. Each
@@ -4294,10 +4471,21 @@ DATA_DIR_SAMPLE_FILE = 'PG_VERSION'
 # What the Dockerfile COPYs today. A floor for the parse below, so a parser regression that finds
 # nothing cannot pass the "no COPY source is excluded" check vacuously.
 KNOWN_COPY_SOURCES = frozenset({'common', 'routers', 'schemas', 'data/store/app', 'data/ingest/app'})
+# The one directory name under a COPY source that .dockerignore may exclude (tj-v82dvm).
+EXCLUDABLE_TEST_DIR = 'tests'
+# Non-vacuity for the reverse pin: the test directories under a COPY source when it was written.
+KNOWN_COPY_SOURCE_TEST_DIRS = frozenset({'common/tests', 'routers/tests', 'schemas/tests'})
+# Non-vacuity for the import closure: a module each service app is known to import, and a floor on
+# how many module files its closure reaches (61 for ingest and 74 for store when this was written).
+KNOWN_APP_IMPORTS = {'data/ingest/app': 'routers/common/ping.py', 'data/store/app': 'routers/common/ping.py'}
+APP_CLOSURE_FLOOR = 40
 
-# ${DATA_DIR}, ${DATA_DIR:-default}, ${DATA_DIR-default} or $DATA_DIR, then the rest of the path.
+# ${DATA_DIR}, ${DATA_DIR:-default}, ${DATA_DIR-default}, ${DATA_DIR:?message}, ${DATA_DIR?message} or
+# $DATA_DIR, then the rest of the path. The guarded forms carry no default and resolve like a bare
+# ${DATA_DIR}; before tj-c4mosr.5 they were not parsed at all, and the agent-stack overlay's two data
+# mounts were skipped in silence. test_every_data_dir_mount_is_parsed now fails on any it cannot read.
 _DATA_DIR_INTERPOLATION = re.compile(
-    rf'^(?:\$\{{{DATA_DIR_VARIABLE}(?::?-(?P<default>[^}}]*))?\}}|\${DATA_DIR_VARIABLE}(?!\w))(?P<rest>.*)$'
+    rf'^(?:\$\{{{DATA_DIR_VARIABLE}(?::?-(?P<default>[^}}]*)|:?\?[^}}]*)?\}}|\${DATA_DIR_VARIABLE}(?!\w))(?P<rest>.*)$'
 )
 
 _IgnoreRules = list[tuple[bool, re.Pattern]]
@@ -4485,8 +4673,8 @@ def _compose_build_args() -> list[dict[str, str]]:
     ]
 
 
-def _dockerfile_copy_sources() -> set[str]:
-    """Every context path a COPY or ADD in the Dockerfile reads, build args expanded from compose.
+def _dockerfile_copy_sources_by_origin() -> set[tuple[str, bool]]:
+    """(context path, named a build arg?) for every source a COPY or ADD in the Dockerfile reads.
 
     A COPY --from reads another stage or image, not the context, and is skipped. A source naming a
     build arg is expanded once per compose service's args, and dropped when no service's args
@@ -4506,17 +4694,41 @@ def _dockerfile_copy_sources() -> set[str]:
     sources = set()
     for source in raw:
         if '$' not in source:
-            sources.add(posixpath.normpath(source))
+            sources.add((posixpath.normpath(source), False))
             continue
         for args in _compose_build_args():
             expanded = re.sub(r'\$\{(\w+)\}|\$(\w+)', lambda m, a=args: a.get(m[1] or m[2], m[0]), source)
             if '$' not in expanded:
-                sources.add(posixpath.normpath(expanded))
+                sources.add((posixpath.normpath(expanded), True))
     return sources
 
 
+def _dockerfile_copy_sources() -> set[str]:
+    """Every context path a COPY or ADD in the Dockerfile reads, build args expanded from compose."""
+    return {source for source, _ in _dockerfile_copy_sources_by_origin()}
+
+
+def _dockerfile_service_apps() -> set[str]:
+    """The service apps: the COPY sources the Dockerfile names through build args, one per service."""
+    return {source for source, from_args in _dockerfile_copy_sources_by_origin() if from_args}
+
+
+def _under_excludable_test_dir(path: str, source: str) -> bool:
+    """Does `path`, relative to COPY source `source`, have a directory segment exactly `tests`?
+
+    Only the directories between the source and the file count: the file name is not a directory
+    (so `tests.py` is not one), and a `tests` segment inside the source itself is not relative to it.
+    """
+    relative = PurePosixPath(path).relative_to(source)
+    return EXCLUDABLE_TEST_DIR in relative.parts[:-1]
+
+
 def _copy_sources_excluded(rules: _IgnoreRules) -> list[str]:
-    """Name every COPY source, or git-tracked file under one, that the build context would leave out."""
+    """Name every COPY source, or git-tracked file under one, that the build context would leave out.
+
+    A tracked file under a `tests` directory of its COPY source may be left out (tj-v82dvm); whether
+    anything the apps import is left out is the import closure's question, not this one's.
+    """
     offenders = []
     for source in sorted(_dockerfile_copy_sources()):
         if _is_excluded_from_context(source, rules):
@@ -4524,9 +4736,163 @@ def _copy_sources_excluded(rules: _IgnoreRules) -> list[str]:
         offenders.extend(
             f'{tracked} (under COPY source {source})'
             for tracked in _run('git', 'ls-files', '--', source)
-            if _is_excluded_from_context(tracked, rules)
+            if _is_excluded_from_context(tracked, rules) and not _under_excludable_test_dir(tracked, source)
         )
     return offenders
+
+
+def _copy_source_test_dirs() -> dict[str, list[str]]:
+    """Every `tests` directory under a COPY source that holds a git-tracked file, with those files.
+
+    The same rule _under_excludable_test_dir applies: only directories between the source and the
+    file count. A nested tests/.../tests/ yields both directories.
+    """
+    test_dirs: dict[str, list[str]] = {}
+    for source in sorted(_dockerfile_copy_sources()):
+        for tracked in _run('git', 'ls-files', '--', source):
+            parts = PurePosixPath(tracked).relative_to(source).parts[:-1]
+            for depth, part in enumerate(parts):
+                if part == EXCLUDABLE_TEST_DIR:
+                    directory = PurePosixPath(source, *parts[: depth + 1]).as_posix()
+                    test_dirs.setdefault(directory, []).append(tracked)
+    return test_dirs
+
+
+def _copy_source_test_dirs_sent(rules: _IgnoreRules, test_dirs: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Per `tests` directory, the tracked files under it the build context would still send."""
+    sent = {
+        directory: sorted(tracked for tracked in files if not _is_excluded_from_context(tracked, rules))
+        for directory, files in test_dirs.items()
+    }
+    return {directory: files for directory, files in sorted(sent.items()) if files}
+
+
+def _first_party_module_file(module: str) -> Path | None:
+    """The repo source file a dotted module name resolves to, or None when it is not first-party."""
+    base = REPO_ROOT.joinpath(*module.split('.'))
+    for candidate in (base.with_suffix('.py'), base / '__init__.py'):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _imported_module_names(path: Path) -> list[str]:
+    """Every module a source file imports, anywhere in it, relative imports resolved to absolute names.
+
+    ast.walk reaches every node, so an import under `if TYPE_CHECKING:`, inside a function or behind
+    a flag is found like a top-level one. `from x import y` yields both x and x.y, because y may be a
+    submodule rather than a name defined in x.
+    """
+    tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+    package = list(path.relative_to(REPO_ROOT).parent.parts)
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                base = package[: len(package) - (node.level - 1)]
+                module = '.'.join([*base, *([node.module] if node.module else [])])
+            else:
+                module = node.module or ''
+            found.append(module)
+            found.extend(f'{module}.{alias.name}' for alias in node.names)
+    return found
+
+
+def _package_inits(path: Path) -> set[Path]:
+    """Each package __init__.py between the repo root and `path`, where one exists."""
+    relative = path.relative_to(REPO_ROOT)
+    return {
+        init
+        for depth in range(1, len(relative.parts))
+        if (init := REPO_ROOT.joinpath(*relative.parts[:depth], '__init__.py')).is_file()
+    }
+
+
+def _app_import_closure(app: str) -> set[Path]:
+    """Every first-party file a service app loads: its own modules, what they import, transitively.
+
+    Test packages are followed like any other: the point is to find a production import of one.
+    Each package __init__.py on a reached file's path runs when that file is imported, so it is
+    walked like any other reached file, not merely added: what it imports is loaded too.
+    """
+    pending = sorted((REPO_ROOT / app).rglob('*.py'))
+    reached: set[Path] = set()
+    while pending:
+        path = pending.pop()
+        if path in reached:
+            continue
+        reached.add(path)
+        pending.extend(_package_inits(path))
+        for module in _imported_module_names(path):
+            target = _first_party_module_file(module)
+            if target is not None:
+                pending.append(target)
+    return reached
+
+
+def _is_under(path: str, source: str) -> bool:
+    """Is context path `path` the COPY source `source` itself, or inside it?"""
+    return path == source or path.startswith(f'{source}/')
+
+
+def _dockerfile_static_copy_sources() -> set[str]:
+    """The COPY sources every service image shares: those the Dockerfile names without a build arg."""
+    return {source for source, from_args in _dockerfile_copy_sources_by_origin() if not from_args}
+
+
+_UNCOPIED_INIT_WITH_CODE = (
+    'an uncopied ancestor package __init__.py with statements: the host runs them, the image never '
+    'does. COPY it, or move its code into a copied module'
+)
+
+
+def _has_statements(path: Path) -> bool:
+    """Does the module do anything on import? A lone module docstring, comments and blank lines do not."""
+    body = ast.parse(path.read_text(encoding='utf-8'), filename=str(path)).body
+    first = body[0] if body else None
+    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
+        body = body[1:]
+    return bool(body)
+
+
+def _app_imports_outside_image(app: str, static_sources: set[str]) -> list[str]:
+    """Every file of `app`'s import closure that its own image does not COPY.
+
+    The image holds the shared static sources and this app's own source -- never another service's
+    app. One carve-out: a package __init__.py whose directory is a strict ancestor of one of those
+    sources (data/__init__.py above data/store/app) is not copied, and Python imports that package
+    as a namespace package inside the image. That is equivalent to the host only while the file does
+    nothing, so the carve-out holds only for one that is empty or a lone docstring; one with any
+    statement is named, annotated with why. The closure walks such an __init__.py either way, so
+    anything it imports must itself be copied.
+    """
+    own = static_sources | {app}
+    ancestors = {parent.as_posix() for source in own for parent in PurePosixPath(source).parents} - {'.'}
+    offenders = []
+    for path in _app_import_closure(app):
+        relative = path.relative_to(REPO_ROOT).as_posix()
+        if any(_is_under(relative, source) for source in own):
+            continue
+        if path.name == '__init__.py' and PurePosixPath(relative).parent.as_posix() in ancestors:
+            if _has_statements(path):
+                offenders.append(f'{relative} ({_UNCOPIED_INIT_WITH_CODE})')
+            continue
+        offenders.append(relative)
+    return sorted(offenders)
+
+
+def _app_imports_excluded(rules: _IgnoreRules) -> dict[str, list[str]]:
+    """Per service app, every file of its import closure the build context would leave out."""
+    return {
+        app: sorted(
+            relative
+            for path in _app_import_closure(app)
+            if _is_excluded_from_context(relative := path.relative_to(REPO_ROOT).as_posix(), rules)
+        )
+        for app in sorted(_dockerfile_service_apps())
+    }
 
 
 # Docker's own semantics, pinned so the matcher the checks below rely on cannot drift into something
@@ -4587,6 +4953,26 @@ def test_compose_declares_data_mounts_under_data_dir():
 
 
 @pytest.mark.build_infra
+def test_every_data_dir_mount_is_parsed():
+    """tj-c4mosr.5 (00:55 gap (2)): a DATA_DIR-sourced mount the parser cannot read fails, never skips.
+
+    The agent-stack overlay mounts ${DATA_DIR:?...}/postgres and /kafka; the build-context check below
+    judges only the mounts _compose_data_mounts yields, so an unparsed spelling was a silent pass.
+    """
+    unparsed = [
+        f'{path.relative_to(REPO_ROOT)}:{name} {source}'
+        for path, name, service in _compose_services()
+        for source in _bind_sources(service)
+        if re.match(rf'^\$\{{?{DATA_DIR_VARIABLE}(?!\w)', source) and not _DATA_DIR_INTERPOLATION.match(source)
+    ]
+    assert not unparsed, f'DATA_DIR mounts the build-context check cannot read, so it would skip them: {unparsed}'
+    labels = {label for label, _, _ in _compose_data_mounts()}
+    assert {'docker-compose.agent-stack.yaml:postgres', 'docker-compose.agent-stack.yaml:kafka'} <= labels, sorted(
+        labels
+    )
+
+
+@pytest.mark.build_infra
 def test_dockerignore_excludes_every_compose_data_mount():
     """Every host data directory, under either DATA_DIR resolution, stays out of the build context."""
     offenders = _data_mounts_in_context(_committed_dockerignore_rules())
@@ -4605,7 +4991,237 @@ def test_dockerignore_excludes_no_dockerfile_copy_source():
     missing = sorted(source for source in sources if not (REPO_ROOT / source).exists())
     assert not missing, f'COPY sources that do not exist in the checkout: {missing}'
     offenders = _copy_sources_excluded(_committed_dockerignore_rules())
-    assert not offenders, f'{DOCKERIGNORE_FILE.name} keeps what the image COPYs out of the build context: {offenders}'
+    assert not offenders, (
+        f'{DOCKERIGNORE_FILE.name} keeps what the image COPYs out of the build context: {offenders}. '
+        f'Only files under a {EXCLUDABLE_TEST_DIR}/ directory of a COPY source may be excluded.'
+    )
+
+
+# The one exception the COPY-source check allows, pinned at its edges. Each row: (COPY source,
+# tracked path, may be excluded?). A near-miss name is the failure worth pinning: a pattern that
+# excludes `tests_util/` or `testsuite/` would take production code with it.
+_EXCLUDABLE_TEST_DIR_CASES = {
+    'tests-dir-under-source': ('common', 'common/tests/x.py', True),
+    'nested-tests-dir-deep-file': ('routers', 'routers/tests/interface_manifest/data_store.manifest', True),
+    'tests-dir-in-a-subpackage': ('common', 'common/kafka/tests/x.py', True),
+    'tests-prefix-dir-is-not-tests': ('common', 'common/tests_util/x.py', False),
+    'tests-suffix-dir-is-not-tests': ('common', 'common/testsuite/x.py', False),
+    'tests-module-is-not-a-dir': ('common', 'common/tests.py', False),
+    'production-file': ('common', 'common/database/sql_alchemy_table.py', False),
+    'file-source-itself': ('pyproject.toml', 'pyproject.toml', False),
+    'tests-segment-inside-the-source-does-not-count': ('common/tests', 'common/tests/x.py', False),
+}
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    ('source', 'path', 'excludable'), list(_EXCLUDABLE_TEST_DIR_CASES.values()), ids=list(_EXCLUDABLE_TEST_DIR_CASES)
+)
+def test_only_a_tests_dir_under_a_copy_source_may_be_excluded(source: str, path: str, excludable: bool):
+    assert _under_excludable_test_dir(path, source) is excludable
+
+
+@pytest.mark.build_infra
+def test_the_copy_source_check_allows_a_tests_dir_and_nothing_else():
+    """The exception, through the check itself: a tests/ rule passes, a production directory does not.
+
+    Judged against these rules alone, not the committed file, so this pins the check, not the file.
+    """
+    assert not _copy_sources_excluded(_dockerignore_rules('common/tests/'))
+    offenders = _copy_sources_excluded(_dockerignore_rules('common/database/'))
+    assert offenders, 'excluding common/database/ went unnoticed'
+    assert all(offender.startswith('common/database/') for offender in offenders), offenders
+
+
+@pytest.mark.build_infra
+def test_the_service_apps_are_derived_from_the_dockerfile_and_their_closures_are_real():
+    """Non-vacuity for the import-closure check: it finds both apps, and each closure leaves its app."""
+    apps = _dockerfile_service_apps()
+    assert apps >= set(KNOWN_APP_IMPORTS), f'the COPY parse found service apps {sorted(apps)}'
+    for app, known in KNOWN_APP_IMPORTS.items():
+        closure = {path.relative_to(REPO_ROOT).as_posix() for path in _app_import_closure(app)}
+        assert known in closure, f'the import closure of {app} does not reach {known}'
+        assert len(closure) >= APP_CLOSURE_FLOOR, f'the import closure of {app} reached only {len(closure)} files'
+
+
+@pytest.mark.build_infra
+def test_the_import_closure_follows_guarded_and_deferred_imports(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The walk reads imports a runtime check would miss, wherever they sit.
+
+    Under TYPE_CHECKING, inside a function, and in a package __init__.py that runs only because a
+    module under it is imported.
+    """
+    (tmp_path / 'app').mkdir()
+    (tmp_path / 'lib').mkdir()
+    (tmp_path / 'pkg').mkdir()
+    (tmp_path / 'lib' / '__init__.py').write_text('', encoding='utf-8')
+    for name in ('guarded', 'lazy', 'relative'):
+        (tmp_path / 'lib' / f'{name}.py').write_text('', encoding='utf-8')
+    (tmp_path / 'lib' / 'entry.py').write_text('from . import relative\n', encoding='utf-8')
+    # Nothing imports pkg.hidden but pkg/__init__.py, which the app never names.
+    (tmp_path / 'pkg' / '__init__.py').write_text('from . import hidden\n', encoding='utf-8')
+    (tmp_path / 'pkg' / 'hidden.py').write_text('', encoding='utf-8')
+    (tmp_path / 'pkg' / 'used.py').write_text('', encoding='utf-8')
+    (tmp_path / 'app' / 'main.py').write_text(
+        'from typing import TYPE_CHECKING\n'
+        'import lib.entry\n'
+        'import pkg.used\n'
+        'if TYPE_CHECKING:\n'
+        '    from lib import guarded\n'
+        'def later():\n'
+        '    import lib.lazy\n',
+        encoding='utf-8',
+    )
+    monkeypatch.setattr(sys.modules[__name__], 'REPO_ROOT', tmp_path)
+    closure = {path.relative_to(tmp_path).as_posix() for path in _app_import_closure('app')}
+    assert closure == {
+        'app/main.py',
+        'lib/__init__.py',
+        'lib/entry.py',
+        'lib/guarded.py',
+        'lib/lazy.py',
+        'lib/relative.py',
+        'pkg/__init__.py',
+        'pkg/hidden.py',
+        'pkg/used.py',
+    }
+
+
+@pytest.mark.build_infra
+def test_the_copy_coverage_check_names_what_the_image_does_not_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Only the shared sources and the app's own source are in its image, never another service's app.
+
+    Synthetic tree: two service apps under svc/, one shared source. An ancestor package __init__.py
+    of the app's own source is allowed (a namespace package in the image) while it is empty or a
+    lone docstring (svc/__init__.py); one with a statement (svc/a/__init__.py) is named, and still
+    walked, so the stray it imports is named too. A copied __init__.py may do anything.
+    """
+    files = {
+        'shared/__init__.py': 'X = 1\n',
+        'shared/util.py': '',
+        'svc/__init__.py': '"""Services."""\n# a comment is not a statement\n',
+        'svc/a/__init__.py': 'import stray_from_init\n',
+        'svc/a/app/__init__.py': '',
+        'svc/a/app/main.py': 'import shared.util\nimport stray\nfrom svc.b.app import api\n',
+        'svc/b/__init__.py': '',
+        'svc/b/app/__init__.py': '',
+        'svc/b/app/api.py': 'from shared import util\n',
+        'stray.py': '',
+        'stray_from_init.py': '',
+    }
+    for relative, text in files.items():
+        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / relative).write_text(text, encoding='utf-8')
+    monkeypatch.setattr(sys.modules[__name__], 'REPO_ROOT', tmp_path)
+    assert _app_imports_outside_image('svc/a/app', {'shared'}) == [
+        'stray.py',
+        'stray_from_init.py',
+        f'svc/a/__init__.py ({_UNCOPIED_INIT_WITH_CODE})',
+        'svc/b/__init__.py',
+        'svc/b/app/__init__.py',
+        'svc/b/app/api.py',
+    ]
+    assert _app_imports_outside_image('svc/b/app', {'shared'}) == []
+
+
+# An uncopied ancestor package __init__.py, by content. Each row: (its text, allowed?). Allowed
+# means the image, importing the package as a namespace package, behaves as the host does.
+_ANCESTOR_INIT_CASES = {
+    'empty': ('', True),
+    'comments-and-blank-lines': ('# nothing here\n\n', True),
+    'docstring-only': ('"""The package."""\n', True),
+    'docstring-and-comment': ('"""The package."""\n# trailing comment\n', True),
+    'assignment': ('X = 1\n', False),
+    'docstring-then-assignment': ('"""The package."""\nX = 1\n', False),
+    'third-party-import': ('import os\n', False),
+    'a-second-string-is-a-statement': ('"""The package."""\n"""Not a docstring."""\n', False),
+    'a-leading-non-string-constant': ('1\n', False),
+}
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(('text', 'allowed'), list(_ANCESTOR_INIT_CASES.values()), ids=list(_ANCESTOR_INIT_CASES))
+def test_an_uncopied_ancestor_init_is_allowed_only_without_statements(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, text: str, allowed: bool
+):
+    """The carve-out, through the check itself: a namespace package in the image runs none of this."""
+    files = {
+        'shared/__init__.py': '',
+        'svc/__init__.py': text,
+        'svc/a/app/__init__.py': '',
+        'svc/a/app/main.py': 'import shared\n',
+    }
+    for relative, content in files.items():
+        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / relative).write_text(content, encoding='utf-8')
+    monkeypatch.setattr(sys.modules[__name__], 'REPO_ROOT', tmp_path)
+    expected = [] if allowed else [f'svc/__init__.py ({_UNCOPIED_INIT_WITH_CODE})']
+    assert _app_imports_outside_image('svc/a/app', {'shared'}) == expected
+
+
+@pytest.mark.build_infra
+def test_each_service_app_imports_only_what_its_image_copies():
+    """The other half of the build-context purpose: what each app loads is COPYed into its image.
+
+    Sent (the .dockerignore check) is not enough: a file the Dockerfile never COPYs -- another
+    service's app, a new top-level package -- is in the context and still missing at import.
+    """
+    static_sources = _dockerfile_static_copy_sources()
+    apps = _dockerfile_service_apps()
+    assert static_sources >= KNOWN_COPY_SOURCES - apps, f'the COPY parse found static sources {sorted(static_sources)}'
+    assert apps >= set(KNOWN_APP_IMPORTS), f'the COPY parse found service apps {sorted(apps)}'
+    assert not static_sources & apps, f'a service app is also a static COPY source: {sorted(static_sources & apps)}'
+    outside = {app: files for app in sorted(apps) if (files := _app_imports_outside_image(app, static_sources))}
+    assert not outside, (
+        f'service apps import files their image does not COPY (only {sorted(static_sources)} and the '
+        f"app's own source are copied), so the image builds and fails at import: {outside}"
+    )
+
+
+@pytest.mark.build_infra
+def test_dockerignore_sends_every_module_the_service_apps_import():
+    """The purpose behind the COPY-source check: what each app loads is in the build context."""
+    excluded = {app: files for app, files in _app_imports_excluded(_committed_dockerignore_rules()).items() if files}
+    assert not excluded, (
+        f'{DOCKERIGNORE_FILE.name} keeps modules the service apps import out of the build context, so the '
+        f'image builds and fails at import: {excluded}'
+    )
+
+
+@pytest.mark.build_infra
+def test_the_test_dirs_under_the_copy_sources_are_derived_and_real():
+    """Non-vacuity for the reverse pin: the derivation finds at least the known test directories."""
+    found = set(_copy_source_test_dirs())
+    assert found >= KNOWN_COPY_SOURCE_TEST_DIRS, (
+        f'the COPY parse and git ls-files found test directories {sorted(found)}; '
+        f'expected at least {sorted(KNOWN_COPY_SOURCE_TEST_DIRS)}'
+    )
+
+
+@pytest.mark.build_infra
+def test_dockerignore_excludes_every_tests_dir_under_a_copy_source():
+    """The reverse of the COPY-source check: no test suite under a copied package ships in an image."""
+    sent = _copy_source_test_dirs_sent(_committed_dockerignore_rules(), _copy_source_test_dirs())
+    assert not sent, (
+        f'{DOCKERIGNORE_FILE.name} sends test directories under a Dockerfile COPY source into every '
+        f'service image: {sorted(sent)} ({sent}). Add each as `<dir>/` to {DOCKERIGNORE_FILE.name} (tj-v82dvm).'
+    )
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize('dropped', sorted(KNOWN_COPY_SOURCE_TEST_DIRS))
+def test_the_test_dir_check_names_the_one_dir_left_in(dropped: str):
+    """The check against rules built here: leave one directory in, or re-include a file, and it is named.
+
+    Every found directory excluded is clean; dropping one names exactly that directory; re-including
+    one tracked file under it names exactly that file.
+    """
+    test_dirs = _copy_source_test_dirs()
+    assert not _copy_source_test_dirs_sent(_dockerignore_rules('\n'.join(f'{d}/' for d in test_dirs)), test_dirs)
+    left_in = _dockerignore_rules('\n'.join(f'{d}/' for d in test_dirs if d != dropped))
+    assert set(_copy_source_test_dirs_sent(left_in, test_dirs)) == {dropped}
+    re_included = _dockerignore_rules('\n'.join([*(f'{d}/' for d in test_dirs), f'!{test_dirs[dropped][0]}']))
+    assert _copy_source_test_dirs_sent(re_included, test_dirs) == {dropped: [test_dirs[dropped][0]]}
 
 
 # ---------------------------------------------------------------------------------------
@@ -4616,9 +5232,22 @@ def test_dockerignore_excludes_no_dockerfile_copy_source():
 # into the capture (the Migrate Database failure, tj-ijpys9.19).
 # ---------------------------------------------------------------------------------------
 
-# The staged env file as a whole shell word: `.env` or `./.env`, never `.env.default` or
-# `data/store/.env`.
-_STAGED_ENV_WORD = re.compile(rf'(?<![\w./-])(?:\./)?{re.escape(STAGED_ENV_FILE)}(?![\w.-])')
+# Every spelling of the checkout root a step can put in front of an env file: none, `./`, $PWD and
+# $GITHUB_WORKSPACE (braced or not), and the `${{ github.workspace }}` expression (tj-0pobey.4).
+_CHECKOUT_ROOT = (
+    r'(?:\./|\$\{PWD\}/|\$PWD/|\$\{GITHUB_WORKSPACE\}/|\$GITHUB_WORKSPACE/|\$\{\{\s*github\.workspace\s*\}\}/)?'
+)
+# An env file the finder can place, as a whole shell word: the staged root file, or a service's
+# own (`data/store/`, `data/ingest/`), under any root spelling. The `service` group is set for the
+# latter. Never `.env.default`; never a path under some other directory.
+_KNOWN_ENV_PATH = re.compile(
+    rf'(?<![^\s"\'=(<>|;&]){_CHECKOUT_ROOT}(?P<service>data/(?:store|ingest)/)?'
+    rf'{re.escape(STAGED_ENV_FILE)}(?![\w.-])'
+)
+# The env file's name as a path component, however it is prefixed: what _KNOWN_ENV_PATH must account for.
+_ANY_ENV_PATH = re.compile(rf'(?<![\w.-]){re.escape(STAGED_ENV_FILE)}(?![\w.-])')
+# The text before a word that makes the word the value of a shell assignment, `NAME=` or `NAME="`.
+_ASSIGNED_VALUE = re.compile(r'(?:^|[\s;&|(])[A-Za-z_]\w*=$')
 # Commands that name the staged file only to create, replace or remove it.
 _STAGED_ENV_WRITERS = frozenset({'cp', 'mv', 'rm', 'shred', 'touch', 'chmod', 'install'})
 # Where one simple command ends and the next begins, for the text around a word.
@@ -4667,20 +5296,47 @@ def _cut_fields(options: str) -> tuple[str | None, str | None]:
     return delimiter, fields
 
 
+def _unplaced_env_paths(line: str) -> list[str]:
+    """Each word on a line naming an env file under a directory _KNOWN_ENV_PATH does not recognise."""
+    placed = {match.end() for match in _KNOWN_ENV_PATH.finditer(line)}
+    return [
+        re.split(r'[\s=(<>|;&]', line[: match.end()])[-1].strip('\'"')
+        for match in _ANY_ENV_PATH.finditer(line)
+        if match.end() not in placed
+    ]
+
+
 def _staged_env_reads(lines: list[str]) -> list[tuple[str, str]]:
-    """Each read of the staged env file, as (its line, the pipeline its output flows through)."""
+    """Each read of the staged env file, as (its line, the pipeline its output flows through).
+
+    The file is found under every spelling of the checkout root. A word that is only the value of
+    a `NAME=` assignment is not a read (a `$(...)` on the right of `=` still is), and neither is a
+    redirection target or the operand of a writer. An env file under any directory the finder
+    cannot place fails here, naming the line and the word, rather than passing as a non-read
+    (tj-0pobey.4: that silence is how directory-prefixed reads went unseen).
+    """
     reads = []
     for line in lines:
-        for match in _STAGED_ENV_WORD.finditer(line):
-            before = line[: match.start()]
-            if before.rstrip().endswith('>'):
+        unplaced = _unplaced_env_paths(line)
+        assert not unplaced, (
+            f'{unplaced} name an env file under a directory the staged-{STAGED_ENV_FILE} finder does not '
+            f'recognise, so it cannot tell whether this reads the staged file: {line!r}. Spell the checkout '
+            f'root as the finder does, or teach _KNOWN_ENV_PATH the new spelling.'
+        )
+        for match in _KNOWN_ENV_PATH.finditer(line):
+            if match.group('service'):
+                continue
+            before, after = line[: match.start()], line[match.end() :]
+            if before[-1:] in ('"', "'"):
+                quote, before = before[-1], before[:-1]
+                after = after.removeprefix(quote)
+            if _ASSIGNED_VALUE.search(before) or before.rstrip().endswith('>'):
                 continue
             command = shlex.split(_COMMAND_BOUNDARY.split(_unquoted(before))[-1] or ':')
             name = _command_name(command)
             if name in _STAGED_ENV_WRITERS or (name == 'sed' and any(word.startswith('-i') for word in command)):
                 continue
-            after = _unquoted(line[match.end() :])
-            reads.append((line, _PIPELINE_END.split(after, maxsplit=1)[0]))
+            reads.append((line, _PIPELINE_END.split(_unquoted(after), maxsplit=1)[0]))
     return reads
 
 
@@ -4818,6 +5474,115 @@ def test_writes_to_the_staged_env_file_are_not_taken_for_reads():
     reads = _staged_env_reads(lines)
     assert [line for line, _ in reads] == [lines[-1]], f'reads found: {reads}'
     assert not _takes_last_line_and_full_value(reads[0][1])
+
+
+# Every spelling of the checkout root a workflow step can put in front of the staged file (the
+# steps run at the root, with no working-directory default). Spelled out here, not taken from the
+# finder, so a finder that forgets one cannot also forget to test it (tj-0pobey.4).
+_ROOT_SPELLINGS = {
+    'bare': '',
+    'dot': './',
+    'braced-pwd': '${PWD}/',
+    'pwd': '$PWD/',
+    'braced-workspace': '${GITHUB_WORKSPACE}/',
+    'workspace': '$GITHUB_WORKSPACE/',
+    'workspace-expression': '${{ github.workspace }}/',
+}
+_QUOTINGS = {'unquoted': '', 'double-quoted': '"', 'single-quoted': "'"}
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize('quote', _QUOTINGS.values(), ids=_QUOTINGS.keys())
+@pytest.mark.parametrize('prefix', _ROOT_SPELLINGS.values(), ids=_ROOT_SPELLINGS.keys())
+def test_every_spelling_of_the_checkout_root_is_a_read(prefix: str, quote: str):
+    """tj-0pobey.4 item 1: a directory prefix does not hide a read, and the pipeline is still judged.
+
+    The finder used to see only `.env` and `./.env`, so `grep K "${PWD}/.env" | cut -d= -f2` --
+    first match, truncated value -- passed the last-wins check unseen.
+    """
+    path = f'{quote}{prefix}{STAGED_ENV_FILE}{quote}'
+    truncating = f'grep -E "^KEY=" {path} | cut -d= -f2'
+    canonical = f'grep -E "^KEY=" {path} | tail -n 1 | cut -d= -f2-'
+    reads = _staged_env_reads([truncating, canonical])
+    assert [line for line, _ in reads] == [truncating, canonical], f'reads found: {reads}'
+    assert [_takes_last_line_and_full_value(pipeline) for _, pipeline in reads] == [False, True]
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    'line',
+    [
+        f'ROOT_ENV_FILE=./{STAGED_ENV_FILE} docker compose -f docker-compose.yaml config --quiet',
+        f'ROOT_ENV_FILE="${{PWD}}/{STAGED_ENV_FILE}" docker compose -f docker-compose.yaml config --quiet',
+        f"ROOT_ENV_FILE='${{{{ github.workspace }}}}/{STAGED_ENV_FILE}' docker compose config --quiet",
+        f'export ROOT_ENV_FILE={STAGED_ENV_FILE}',
+        f'ROOT_ENV_FILE="$GITHUB_WORKSPACE/{STAGED_ENV_FILE}"',
+        f'DATA_DIR=/tmp/x ROOT_ENV_FILE="${{PWD}}/{STAGED_ENV_FILE}" STORE_ENV_FILE="${{PWD}}/data/store/'
+        f'{STAGED_ENV_FILE}" INGEST_ENV_FILE="${{PWD}}/data/ingest/{STAGED_ENV_FILE}" docker compose config',
+    ],
+    ids=['dot-prefix', 'pwd-quoted', 'workspace-single-quoted', 'export', 'standalone', 'agent-stack-render'],
+)
+def test_an_assignment_names_the_staged_env_file_without_reading_it(line: str):
+    """tj-0pobey.4 item 2: `NAME=path` hands a path on; nothing reads the file, so nothing is judged."""
+    assert _staged_env_reads([line]) == []
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    ('line', 'accepted'),
+    [
+        (f'VAR="$(grep K ${{PWD}}/{STAGED_ENV_FILE} | tail -1 | cut -d= -f2-)"', True),
+        (f'VAR="$(grep K "${{PWD}}/{STAGED_ENV_FILE}" | tail -n 1 | cut -d= -f2-)"', True),
+        (f'VAR="$(grep K ./{STAGED_ENV_FILE} | cut -d= -f2-)"', False),
+    ],
+    ids=['pwd-unquoted', 'pwd-quoted-inside', 'first-match'],
+)
+def test_a_substitution_on_the_right_of_an_assignment_is_still_a_read(line: str, accepted: bool):
+    """tj-0pobey.4 item 2: only the assigned word itself is exempt; a `$(...)` that reads is judged."""
+    reads = _staged_env_reads([line])
+    assert [read for read, _ in reads] == [line], f'reads found: {reads}'
+    assert _takes_last_line_and_full_value(reads[0][1]) is accepted
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    'line',
+    [
+        f'printf \'KEY=%s\\n\' "${{value}}" >> "${{PWD}}/{STAGED_ENV_FILE}"',
+        f'rm -f "$GITHUB_WORKSPACE/{STAGED_ENV_FILE}"',
+        f"sed -i 's/^KEY=.*/KEY=/' ${{PWD}}/{STAGED_ENV_FILE}",
+        f'cp .env.default "${{{{ github.workspace }}}}/{STAGED_ENV_FILE}"',
+        f'grep K data/store/{STAGED_ENV_FILE} | cut -d= -f2-',
+        f'grep K "${{PWD}}/data/ingest/{STAGED_ENV_FILE}" | cut -d= -f2-',
+    ],
+    ids=['append-quoted', 'rm-workspace', 'sed-in-place', 'cp-expression', 'store-service', 'ingest-service'],
+)
+def test_prefixed_writes_and_service_env_files_are_not_staged_reads(line: str):
+    """The writer and redirect exclusions hold under a directory prefix; a service's own env file is not the root one."""
+    assert _staged_env_reads([line]) == []
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    'word',
+    [
+        f'/opt/x/{STAGED_ENV_FILE}',
+        f'$HOME/{STAGED_ENV_FILE}',
+        f'"${{RUNNER_TEMP}}/{STAGED_ENV_FILE}"',
+        f'artifact/{STAGED_ENV_FILE}',
+        f'../{STAGED_ENV_FILE}',
+    ],
+    ids=['absolute', 'home', 'runner-temp', 'relative-dir', 'parent'],
+)
+def test_an_unrecognised_spelling_of_the_env_file_fails_loudly(word: str):
+    """tj-0pobey.4 item 3: a path the finder cannot place is an error naming it, never a silent non-read.
+
+    Silence is how the directory-prefixed read went unseen: the finder did not know the spelling,
+    so it judged nothing and the check passed.
+    """
+    line = f'grep -E "^KEY=" {word} | cut -d= -f2'
+    with pytest.raises(AssertionError, match=re.escape(word.strip('"'))):
+        _staged_env_reads([line])
 
 
 # A command substitution whose command is a plain word, and one whose command is a variable.
