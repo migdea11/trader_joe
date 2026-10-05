@@ -79,6 +79,7 @@ EXPECTED_MODULES = frozenset(
     {
         'schemas.data_store.asset_data_interface',
         'schemas.data_store.asset_dataset_store',
+        'schemas.data_store.field_descriptions',
         'schemas.data_store.stock',
         'schemas.data_store.stock.market_activity_data',
     }

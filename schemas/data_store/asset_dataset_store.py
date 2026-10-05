@@ -18,7 +18,7 @@ from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, U
 from common.enums.pydantic_enums import NamedIntEnum
 from common.logging import get_logger
 from common.sensitive import OptionalSensitiveStr, SensitiveStr
-from routers.data_store.app_endpoints import ASSET_DATASET_ID_DESC, ASSET_TYPE_DESC, DATA_TYPE_DESC, SYMBOL_DESC
+from schemas.data_store.field_descriptions import ASSET_DATASET_ID_DESC, ASSET_TYPE_DESC, DATA_TYPE_DESC, SYMBOL_DESC
 from schemas.inbound_contract import InboundContract
 
 

@@ -7,7 +7,7 @@ from pydantic import AwareDatetime, Field, field_validator, model_validator
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Feed, Granularity
-from routers.data_store.app_endpoints import ASSET_DATA_ID_DESC, ASSET_TYPE_DESC, DATA_TYPE_DESC
+from schemas.data_store.field_descriptions import ASSET_DATA_ID_DESC, ASSET_TYPE_DESC, DATA_TYPE_DESC
 from schemas.inbound_contract import InboundContract
 
 
