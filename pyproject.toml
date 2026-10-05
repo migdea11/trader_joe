@@ -188,6 +188,11 @@ exclude = [
     # regenerated, never hand-edited or reformatted. Every language's tree whole, the hand-committed
     # trader_joe/proto/__init__.py included.
     "gen/proto",
+    # The UI's home (tj-iontkq.1). Not Python and not generated: TypeScript, its build config and
+    # node_modules. Listed for the reason at the top of this list -- a tooling script dropped in
+    # here, or a vendored vendor directory, should not start failing the Python lint gate. The
+    # UI's generated TypeScript is not here either; it is gen/proto/ts, under the entry above.
+    "web/**",
     # Bind-mounted container state, not source. The Postgres data directory inside is
     # root-owned and unreadable from this container, so a scan that walks it ERRORS
     # rather than skipping -- the reason this one is not merely tidiness.

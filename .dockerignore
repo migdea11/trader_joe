@@ -43,6 +43,17 @@ common/tests/
 routers/tests/
 schemas/tests/
 
+# The three root siblings that are not server code (tj-iontkq.1). Every service build sets
+# context: . -- docker-compose.yaml for both services, plus docker-compose.test-client.yaml and
+# docker-compose.agent-mcp.yaml -- so anything here is uploaded to the daemon on every build, and
+# that is the whole cost: web/ grows node_modules and client/ grows build artefacts and a .venv.
+# Nothing in a service image reads any of the three. proto/ is the hand-written contract source;
+# what the image needs is protoc's OUTPUT, and it gets exactly that from one COPY of
+# ./gen/proto/python (Dockerfile), which is deliberately NOT excluded here.
+web/
+client/
+proto/
+
 # Unit test / coverage reports
 .pytest_cache/
 .ruff_cache/
