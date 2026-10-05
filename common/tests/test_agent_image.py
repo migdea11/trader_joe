@@ -23,14 +23,21 @@ Five properties, each one a silent failure if lost:
 * NO NODE (tj-3mk3u5.52). nodejs and npm left the apt line with the npm install: nothing in the
   image runs them, and an unused package manager is supply-chain surface. Nothing would notice
   them slipping back in, so the pin makes adding them a decision instead.
+* THE BUF PIN (tj-3mk3u5.54). The image's buf RUN mirrors the Makefile's BUF_VERSION and both
+  SHA-256s, which nothing else compares: the build context cannot read the Makefile. A drift is a
+  checksum failure at the user's next rebuild, or an image whose buf `make lint` refuses.
 """
 
+import os
 import re
 import shlex
+import subprocess
 from pathlib import Path
 
 import pytest
 import yaml
+
+from common.tests.test_ci_invariants import _expanded_make_variable
 
 
 pytestmark = pytest.mark.build_infra
@@ -259,3 +266,116 @@ def test_no_apt_install_brings_back_nodejs_or_npm() -> None:
 def test_the_apt_reader_finds_what_each_install_names(run: str, packages: list[str]) -> None:
     """The reader behind the apt pins. One that found nothing would pass every no-X pin vacuously."""
     assert _apt_install_packages(run) == packages
+
+
+# ---------------------------------------------------------------------------------------------------
+# THE BUF PIN'S ONE MIRROR (tj-3mk3u5.54). The Makefile is the one authority for BUF_VERSION and both
+# SHA-256s. This build's context is .devcontainer/, so its RUN cannot read the Makefile and carries a
+# copy, which nothing but this compares. The RUN is EXECUTED, under /bin/sh as docker runs it, with
+# dpkg, curl, sha256sum, install, rm and buf stubbed first on PATH: what is pinned is what the shell
+# does for each architecture -- the asset it fetches, the checksum it checks that file against, where
+# it installs it -- not how the text is spelled. Nothing is downloaded, and nothing outside the test's
+# directory is written. The arm64 branch is shown here only: no image is built for it anywhere.
+
+MAKEFILE = REPO_ROOT / 'Makefile'
+BUF_RELEASES = 'https://github.com/bufbuild/buf/releases/download'
+BUF_DESTINATION = '/usr/local/bin/buf'
+# One stand-in under six names. Each call is a log line: its name, then its arguments, US-separated.
+RUN_STUB = r"""#!/bin/sh
+name="${0##*/}"
+{ printf '%s' "$name"; for word in "$@"; do printf '\037%s' "$word"; done; printf '\n'; } >> "$STUB_LOG"
+case "$name" in
+  dpkg) printf '%s\n' "$DPKG_ARCH" ;;
+  sha256sum) cat >> "$SHA256SUM_STDIN"; exit "${SHA256SUM_EXIT:-0}" ;;
+  buf) printf '%s\n' "$BUF_REPORTS" ;;
+esac
+exit 0
+"""
+RUN_STUBBED = ('dpkg', 'curl', 'sha256sum', 'install', 'rm', 'buf')
+
+
+def _buf_run_index(instructions: list[tuple[str, str]]) -> int:
+    found = [
+        i for i, (keyword, arguments) in enumerate(instructions) if keyword == 'RUN' and 'bufbuild/buf' in arguments
+    ]
+    assert len(found) == 1, f'expected exactly one RUN that installs buf in {DOCKERFILE.name}, found {len(found)}'
+    return found[0]
+
+
+def _make_pin(name: str) -> str:
+    """The Makefile's value, as make expands it; an outer make's command-line variables kept out."""
+    env = {key: value for key, value in os.environ.items() if key not in ('MAKEFLAGS', 'MFLAGS', 'MAKELEVEL')}
+    return _expanded_make_variable(name, REPO_ROOT, env)
+
+
+def _run_buf_install(
+    tmp_path: Path, arch: str, **variables: str
+) -> tuple[subprocess.CompletedProcess, list[list[str]], str]:
+    """The image's buf RUN, executed with every command it calls stubbed: (result, calls, sha256sum's stdin)."""
+    instructions = _instructions()
+    run = instructions[_buf_run_index(instructions)][1]
+    stubs = tmp_path / 'bin'
+    stubs.mkdir()
+    for name in RUN_STUBBED:
+        (stubs / name).write_text(RUN_STUB, encoding='utf-8')
+        (stubs / name).chmod(0o755)
+    log, stdin = tmp_path / 'calls', tmp_path / 'sha256sum.stdin'
+    env = {
+        'PATH': f'{stubs}{os.pathsep}{os.environ.get("PATH", "")}',
+        'STUB_LOG': str(log),
+        'SHA256SUM_STDIN': str(stdin),
+        'DPKG_ARCH': arch,
+        'BUF_REPORTS': _make_pin('BUF_VERSION'),
+        **variables,
+    }
+    result = subprocess.run(['/bin/sh', '-c', run], cwd=tmp_path, env=env, capture_output=True, text=True, check=False)
+    calls = [line.split('\x1f') for line in log.read_text(encoding='utf-8').splitlines()] if log.exists() else []
+    return result, calls, stdin.read_text(encoding='utf-8') if stdin.exists() else ''
+
+
+def test_buf_installs_as_root_into_usr_local_bin() -> None:
+    """Before the USER switch: /usr/local/bin is root's to write, and the image build fails there otherwise."""
+    instructions = _instructions()
+    user = _user_at(instructions, _buf_run_index(instructions))
+    assert user.split(':')[0] in ROOT_USERS, f'the buf RUN runs as {user!r}, who cannot install into /usr/local/bin'
+
+
+@pytest.mark.parametrize(
+    ('arch', 'asset', 'checksum'),
+    [('amd64', 'buf-Linux-x86_64', 'BUF_SHA256_X86_64'), ('arm64', 'buf-Linux-aarch64', 'BUF_SHA256_AARCH64')],
+)
+def test_the_image_installs_the_makefiles_buf_pin_for_each_arch(
+    tmp_path: Path, arch: str, asset: str, checksum: str
+) -> None:
+    """Gate 8: the Makefile's version and this arch's checksum are the ones the image fetches and checks.
+
+    The asset is named by the Makefile's BUF_VERSION, the downloaded file is checked against the
+    Makefile's checksum for this arch, and the file checked is the file installed, at 0755, then run.
+    """
+    result, calls, stdin = _run_buf_install(tmp_path, arch)
+    assert result.returncode == 0, f'{result.stdout}\n{result.stderr}'
+    assert [call[0] for call in calls] == ['dpkg', 'curl', 'sha256sum', 'install', 'rm', 'buf', 'buf'], calls
+    curl, sha256sum, install = calls[1][1:], calls[2][1:], calls[3][1:]
+    assert curl[-1] == f'{BUF_RELEASES}/v{_make_pin("BUF_VERSION")}/{asset}', curl
+    downloaded = curl[curl.index('-o') + 1]
+    assert '-c' in sha256sum and stdin == f'{_make_pin(checksum)}  {downloaded}\n', (sha256sum, stdin)
+    assert install[-2:] == [downloaded, BUF_DESTINATION] and install[install.index('-m') + 1] == '0755', install
+
+
+@pytest.mark.parametrize(
+    ('arch', 'variables', 'reached', 'says'),
+    [
+        ('riscv64', {}, ['dpkg'], 'no buf checksum pinned for riscv64'),
+        ('amd64', {'SHA256SUM_EXIT': '1'}, ['dpkg', 'curl', 'sha256sum'], ''),
+        ('amd64', {'BUF_REPORTS': '1.0.0'}, ['dpkg', 'curl', 'sha256sum', 'install', 'rm', 'buf', 'buf'], ''),
+    ],
+    ids=['an-unpinned-arch', 'a-checksum-mismatch', 'another-version'],
+)
+def test_the_image_build_fails_on_an_unpinned_arch_a_mismatch_or_another_version(
+    tmp_path: Path, arch: str, variables: dict[str, str], reached: list[str], says: str
+) -> None:
+    """Each refusal stops the build: nothing is fetched for an unpinned arch, nothing installed on a mismatch."""
+    result, calls, _ = _run_buf_install(tmp_path, arch, **variables)
+    assert result.returncode != 0, f'{result.stdout}\n{result.stderr}'
+    assert [call[0] for call in calls] == reached, calls
+    assert says in result.stderr

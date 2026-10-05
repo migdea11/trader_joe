@@ -6090,8 +6090,23 @@ def _runs_make_target(command: list[str], target: str) -> bool:
     return bool(command) and PurePosixPath(command[0]).name == 'make' and target in command[1:]
 
 
-def _runs_ruff(step: dict) -> bool:
-    return any(PurePosixPath(word).name == 'ruff' for command in _step_commands(step) for word in command)
+# What lints, for the ordering test below: `make lint` or one of its legs, which is how CI lints since
+# tj-3mk3u5.54, and ruff or a buf check called directly. Matching ruff alone went silent at that change:
+# no step ran ruff any more, so a `make lint` step moved ahead of the staleness step stayed green.
+_LINT_TARGETS = ('lint', 'lint-python', 'lint-proto')
+_BUF_CHECKS = frozenset({'lint', 'format', 'breaking'})
+
+
+def _lints_directly(command: list[str]) -> bool:
+    names = [PurePosixPath(word).name for word in command]
+    return 'ruff' in names or ('buf' in names and bool(_BUF_CHECKS & set(names[names.index('buf') + 1 :])))
+
+
+def _runs_a_linter(step: dict) -> bool:
+    return any(
+        _lints_directly(command) or any(_runs_make_target(command, target) for target in _LINT_TARGETS)
+        for command in _step_commands(step)
+    )
 
 
 def _proto_regeneration_steps() -> list[tuple[str, int, dict]]:
@@ -6115,7 +6130,7 @@ def _staleness_step() -> dict:
 
 @pytest.mark.build_infra
 def test_ci_checks_the_generated_grpc_tree_before_it_lints_or_tests():
-    """D3: the staleness step exists, in the job that runs the suite, ahead of ruff and pytest.
+    """D3: the staleness step exists, in the job that runs the suite, ahead of the linters and pytest.
 
     Ahead, so a stale tree is reported as stale rather than as whatever lint or import error it
     happens to cause first.
@@ -6123,12 +6138,15 @@ def test_ci_checks_the_generated_grpc_tree_before_it_lints_or_tests():
     _staleness_step()
     ((job_id, index, _),) = _proto_regeneration_steps()
     steps = _load_yaml(TESTING_WORKFLOW)['jobs'][job_id]['steps']
-    gated = [later for later, step in enumerate(steps) if _runs_the_suite(step) or _runs_ruff(step)]
+    gated = [later for later, step in enumerate(steps) if _runs_the_suite(step) or _runs_a_linter(step)]
     assert any(_runs_the_suite(step) for step in steps), (
         f'the `make proto` step is in {job_id}, which does not run the unit suite'
     )
+    assert any(_runs_a_linter(step) for step in steps), (
+        f'no step in {job_id} lints, so the ordering below would judge pytest alone'
+    )
     assert gated and min(gated) > index, (
-        f'in {job_id}, the `make proto` step is step {index}, but ruff or pytest runs at steps {gated}; '
+        f'in {job_id}, the `make proto` step is step {index}, but a linter or pytest runs at steps {gated}; '
         f'it has to come first'
     )
 
@@ -6207,6 +6225,153 @@ def test_the_staleness_step_fails_on_any_drift_in_the_generated_tree(tmp_path: P
         f'the staleness step exited {result.returncode}, expected {status}.\n'
         f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}'
     )
+
+
+# ---------------------------------------------------------------------------------------
+# THE ONE LINT STEP AND ITS BUF (tj-3mk3u5.54; the user's ruling on tj-3mk3u5.55)
+#
+# CI lints through `make lint`, the target every agent and developer runs, so the linters have one
+# definition, as protoc has through the staleness step's `make proto`. Before that step the job needs
+# curl (debian:bookworm-slim has none), the pinned buf through `make buf-install` (the Makefile's pin;
+# CI holds no copy), and main fetched as buf breaking's baseline. The suite runs the real buf too
+# (common/tests/test_make_lint.py), so buf comes before the suite as well. What the Makefile does with
+# all of it is pinned by running it, in test_make_lint.py; this pins that CI asks for it.
+#
+# Not folded into CONTAINER_SUITE_TOOLS (tj-3mk3u5.40; the bead left it to the validator): that rule
+# reads apt installs, and buf is not an apt package. Its install step is pinned by what it runs.
+BUF_BASELINE_SOURCE = 'refs/heads/main'
+
+
+def _lint_job_steps() -> tuple[str, list[dict]]:
+    """(job id, steps) of the one job in the testing workflow that runs `make lint`."""
+    jobs = (_load_yaml(TESTING_WORKFLOW) or {}).get('jobs') or {}
+    found = [
+        (job_id, (job or {}).get('steps') or [])
+        for job_id, job in jobs.items()
+        if any(
+            _runs_make_target(command, 'lint')
+            for step in (job or {}).get('steps') or []
+            for command in _step_commands(step)
+        )
+    ]
+    assert len(found) == 1, (
+        f'expected one job in {TESTING_WORKFLOW.name} that runs `make lint`, found {[j for j, _ in found]}'
+    )
+    return found[0]
+
+
+def _only_step(steps: list[dict], matches, what: str) -> int:
+    indexes = [index for index, step in enumerate(steps) if matches(step)]
+    assert len(indexes) == 1, f'expected exactly one step that {what}, found steps {indexes}'
+    return indexes[0]
+
+
+def _make_lint_command(steps: list[dict]) -> list[str]:
+    commands = [command for step in steps for command in _step_commands(step) if _runs_make_target(command, 'lint')]
+    assert len(commands) == 1, f'expected one `make lint` command, found {commands}'
+    return commands[0]
+
+
+def _make_assignments(command: list[str]) -> dict[str, str]:
+    return dict(word.split('=', 1) for word in command[1:] if '=' in word)
+
+
+def _fetched_refs(step: dict) -> list[tuple[str, str]]:
+    """(source, destination) for each refspec a `git fetch` in the step names."""
+    refs = []
+    for command in _step_commands(step):
+        if command[:2] != ['git', 'fetch']:
+            continue
+        for word in command[2:]:
+            if ':' in word and not word.startswith('-'):
+                source, destination = word.lstrip('+').split(':', 1)
+                refs.append((source, destination))
+    return refs
+
+
+@pytest.mark.build_infra
+def test_ci_lints_through_one_make_lint_step_and_calls_no_linter_directly():
+    """Gate 7: exactly one step runs `make lint`, and no step in any workflow runs ruff or a buf check itself."""
+    _, steps = _lint_job_steps()
+    _only_step(steps, lambda step: any(_runs_make_target(c, 'lint') for c in _step_commands(step)), 'runs `make lint`')
+    direct = [
+        f'{workflow.name}:{name}:{step.get("name")}'
+        for workflow in _workflow_files()
+        for name, job in ((_load_yaml(workflow) or {}).get('jobs') or {}).items()
+        for step in (job or {}).get('steps') or []
+        if any(_lints_directly(command) for command in _step_commands(step))
+    ]
+    assert not direct, f'these steps lint outside `make lint`, a second definition of the linters: {direct}'
+
+
+@pytest.mark.build_infra
+def test_ci_lint_step_covers_proto_against_the_main_it_fetched_and_annotates():
+    """Gate 7 / item 7: the lint step runs the proto leg, against the main it fetched, as annotations.
+
+    PATHS is left at '.', so buf runs; the baseline is the ref the fetch step writes, from main; and the
+    report-only switch stays the Makefile's alone, so its flip at the first SDK release reaches CI.
+    """
+    _, steps = _lint_job_steps()
+    lint = _make_lint_command(steps)
+    assignments = _make_assignments(lint)
+    assert assignments.get('PATHS', '.') == '.', f'CI scopes make lint to {assignments["PATHS"]!r}, so buf never runs'
+    assert 'BUF_BREAKING_BLOCKING' not in assignments, (
+        'CI sets BUF_BREAKING_BLOCKING itself, so flipping the Makefile at the first SDK release (tj-d2mhru) would not reach CI'
+    )
+    assert assignments.get('BUF_ERROR_FORMAT') == 'github-actions', lint
+    fetched = [ref for step in steps for ref in _fetched_refs(step)]
+    assert len(fetched) == 1, f'expected one fetched refspec for the baseline, found {fetched}'
+    ((source, destination),) = fetched
+    assert source == BUF_BASELINE_SOURCE, f'the baseline is fetched from {source}, not main'
+    against = assignments.get('BUF_AGAINST_REF')
+    assert against in {destination, destination.removeprefix('refs/remotes/')}, (
+        f'make lint compares against {against!r}, but the fetch step writes {destination}'
+    )
+
+
+@pytest.mark.build_infra
+def test_ci_installs_curl_buf_and_main_before_it_lints_and_buf_before_the_suite():
+    """Gate 7: curl, then make buf-install, and the fetch of main, all before make lint; buf before the suite."""
+    job_id, steps = _lint_job_steps()
+    lint = _only_step(
+        steps, lambda step: any(_runs_make_target(c, 'lint') for c in _step_commands(step)), 'runs make lint'
+    )
+    install = _only_step(
+        steps,
+        lambda step: any(_runs_make_target(c, 'buf-install') for c in _step_commands(step)),
+        'runs make buf-install',
+    )
+    fetch = _only_step(steps, lambda step: bool(_fetched_refs(step)), 'fetches the baseline')
+    suite = _only_step(steps, _runs_the_suite, 'runs the unit suite')
+    curl = [index for index, step in enumerate(steps) if 'curl' in _installed_packages(step)]
+    assert curl and curl[0] < install, (
+        f'in {job_id}, curl is installed at steps {curl}, not before buf-install (step {install})'
+    )
+    assert install < lint and fetch < lint, f'in {job_id}: buf-install {install}, fetch {fetch}, make lint {lint}'
+    assert install < suite, (
+        f'in {job_id}, buf is installed at step {install}, after the suite (step {suite}), which runs it'
+    )
+
+
+_LINTER_STEPS = {
+    'make-lint': ({'run': 'make lint BUF_AGAINST_REF=origin/main BUF_ERROR_FORMAT=github-actions'}, True),
+    'make-lint-proto': ({'run': 'make lint-proto PATHS=proto'}, True),
+    'make-lint-python': ({'run': 'make lint-python'}, True),
+    'ruff-directly': ({'run': 'uv run ruff check .'}, True),
+    'buf-lint-directly': ({'run': 'buf lint --error-format=github-actions'}, True),
+    'buf-breaking-by-path': ({'run': '/usr/local/bin/buf breaking --against x'}, True),
+    'make-proto': ({'run': 'make proto'}, False),
+    'make-buf-install': ({'run': 'make buf-install BUF_INSTALL_DIR=/usr/local/bin'}, False),
+    'buf-version': ({'run': 'buf --version'}, False),
+    'make-lint-fix': ({'run': 'make lint-fix'}, False),
+}
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(('step', 'lints'), _LINTER_STEPS.values(), ids=_LINTER_STEPS)
+def test_the_linter_detector_sees_make_lint_and_its_legs(step: dict, lints: bool):
+    """Guard the guard: the ordering test above is only as good as what this recognises as linting."""
+    assert _runs_a_linter(step) is lints
 
 
 SEAM_VIOLATIONS = (

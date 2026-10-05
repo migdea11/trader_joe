@@ -39,9 +39,11 @@ coroutines -- builds its own async engine from the same `pg_settings`.
 """
 
 import hashlib
+import logging
 import os
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -414,16 +416,190 @@ def write_secret() -> str:
 
 
 # ---------------------------------------------------------------------------------------------
+# No log record carries the write secret (tj-3mk3u5.47; tj-3mk3u5.41 finding F5).
+#
+# common/logging.py's basicConfig puts the root logger at DEBUG with a stderr handler, so
+# httpcore's trace reaches both pytest's 'Captured log' and 'Captured stderr' sections. Its
+# 'receive_response_headers.complete return_value=(...)' line prints every RAW response header
+# value as a bytes literal, so a response that echoed the secret in a header printed it in full,
+# in the report of the very test that caught the leak.
+#
+# So every record is redacted WHERE IT IS CREATED. A session-wide record factory, chained over
+# the one it replaces and restored at teardown, rewrites each new record before any filter or
+# handler sees it. It does not care which logger emits. httpcore creates its trace on five child
+# loggers (httpcore.connection, .http11, .http2, .proxy, .socks), and a Filter on 'httpcore'
+# would never run for them: a logger's filters see only the records created on that logger, and
+# its children's records reach only its handlers. The trace keeps printing; only the value
+# changes.
+
+REDACTED = '<redacted>'
+
+
+class SecretRedaction:
+    """Replaces every spelling of one secret with '<redacted>': THE redaction (tj-3mk3u5.47 R3).
+
+    DataStoreHttp.redact and the log-record factory both call this class, so the two cannot drift.
+    The spellings are the secret as text, and as the inside of a bytes literal. httpcore prints
+    header values with repr, which escapes a quote, a backslash and any non-ASCII character. A hex
+    secret reads the same both ways. The longest spelling is replaced first, so no occurrence is
+    left half-replaced.
+
+    The secret lives only in here, behind a repr that masks it: pytest prints the arguments of
+    every frame in a failure's traceback, and this object is the form the secret travels in.
+    """
+
+    def __init__(self, secret: str) -> None:
+        # surrogateescape: a value read from os.environ always encodes back, so this cannot raise,
+        # and a traceback from this frame would print `secret`.
+        as_bytes_literal = repr(secret.encode(errors='surrogateescape'))[2:-1]
+        self.__spellings = tuple(sorted({secret, as_bytes_literal} - {''}, key=len, reverse=True))
+
+    def __repr__(self) -> str:
+        return f'{type(self).__name__}(<redacted>)'
+
+    def __call__(self, text: str) -> str:
+        for spelling in self.__spellings:
+            text = text.replace(spelling, REDACTED)
+        return text
+
+
+# Renders a record's traceback at creation, so it is redacted before any handler could render it
+# from the live exception.
+_TRACEBACK_FORMATTER = logging.Formatter()
+
+
+def redact_log_record(record: logging.LogRecord, redaction: SecretRedaction) -> None:
+    """Rewrite a new record in place so that nothing a handler reads from it carries the secret.
+
+    The message is rendered here, once, and kept redacted, with no args left to render it again
+    from. A record's exception is rendered too, into exc_text, which logging.Formatter prints in
+    place of formatting exc_info, and exc_info is dropped (R5). A call whose args do not fit its
+    message keeps both, rendered side by side and redacted. Otherwise the record would reach
+    Handler.handleError, which prints msg and args raw.
+    """
+    try:
+        message = record.getMessage()
+    except Exception:  # a malformed logging call must not raise in the code that made it
+        message = f'{record.msg} (logging args that did not fit: {record.args!r})'
+    record.msg, record.args = redaction(message), ()
+    if record.exc_info:
+        record.exc_text = redaction(_TRACEBACK_FORMATTER.formatException(record.exc_info))
+        record.exc_info = None
+
+
+def redacting_record_factory(
+    previous: Callable[..., logging.LogRecord], redaction: SecretRedaction
+) -> Callable[..., logging.LogRecord]:
+    """A log-record factory that builds each record with `previous`, then redacts it."""
+
+    def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = previous(*args, **kwargs)
+        redact_log_record(record, redaction)
+        return record
+
+    return factory
+
+
+@contextmanager
+def log_records_redacted(redaction: SecretRedaction) -> Iterator[None]:
+    """Install the redacting factory over whichever factory is current, and put that one back on exit."""
+    previous = logging.getLogRecordFactory()
+    logging.setLogRecordFactory(redacting_record_factory(previous, redaction))
+    try:
+        yield
+    finally:
+        logging.setLogRecordFactory(previous)
+
+
+@pytest.fixture(scope='session', autouse=True)
+def redacted_log_records() -> Iterator[None]:
+    """Every log record this session creates reaches its handlers with the write secret redacted.
+
+    Autouse and session-scoped, so it is set up ahead of this suite's other fixtures for the first
+    test and torn down after them at the end. The secret is read here, in the body, never taken
+    as an argument (R4). The suite already requires it: make test-system refuses to start
+    without it. So no test fails for a reason it did not have, and nothing here needs a running
+    data_store.
+    """
+    with log_records_redacted(SecretRedaction(_contract(CONTRACT_WRITE_SECRET))):
+        yield
+
+
+class SecretLogProbe:
+    """Puts the deployment's write secret into log records, and says whether text carries it (R7).
+
+    For tests/system/test_log_redaction.py, which proves that the INSTALLED factory redacts the
+    REAL secret. The secret stays in here, behind a repr that masks it, so no test function holds
+    it (R4). carries_secret looks for both spellings by itself, not through SecretRedaction, so a
+    fault in the redaction cannot also blind the check meant to catch it.
+    """
+
+    def __init__(self, secret: str) -> None:
+        self.__secret = secret
+
+    def __repr__(self) -> str:
+        return f'{type(self).__name__}(secret=<redacted>)'
+
+    def emit_header_trace(self, logger_name: str, level: int = logging.DEBUG) -> None:
+        """Log one record shaped like httpcore's trace of a 401 that echoed the secret in a header."""
+        return_value = (
+            b'HTTP/1.1',
+            401,
+            b'Unauthorized',
+            [(b'content-length', b'53'), (b'www-authenticate', self.__secret.encode())],
+        )
+        logging.getLogger(logger_name).log(level, f'receive_response_headers.complete return_value={return_value!r}')
+
+    def emit_failure_with_traceback(self, logger_name: str) -> None:
+        """Log one record whose exc_info is an exception with the secret in its message."""
+        try:
+            raise ConnectionError(f'the peer sent back {self.__secret}')
+        except ConnectionError:
+            logging.getLogger(logger_name).exception('receive_response_headers.failed')
+
+    def carries_secret(self, text: str) -> bool:
+        """Whether `text` holds the secret, as text or as a bytes literal's inside. Assert on the bool."""
+        return self.__secret in text or repr(self.__secret.encode())[2:-1] in text
+
+
+@pytest.fixture(scope='session')
+def secret_log_probe() -> SecretLogProbe:
+    """The probe, holding the deployment's secret, read in the body (R4). It needs no data_store."""
+    return SecretLogProbe(_contract(CONTRACT_WRITE_SECRET))
+
+
+@dataclass(frozen=True)
+class RedactionKit:
+    """The redaction's parts, for test_log_redaction.py to build with SYNTHETIC secrets.
+
+    tests/system is not a package, so a test module cannot import this conftest by name; this
+    fixture hands the parts over instead. Nothing in it holds the deployment's secret.
+    """
+
+    redaction: type[SecretRedaction]
+    data_store_http: type['DataStoreHttp']
+    records_redacted: Callable[[SecretRedaction], AbstractContextManager[None]]
+
+
+@pytest.fixture(scope='session')
+def redaction_kit() -> RedactionKit:
+    return RedactionKit(SecretRedaction, DataStoreHttp, log_records_redacted)
+
+
+# ---------------------------------------------------------------------------------------------
 # One HTTP client for data_store that holds the write secret and never shows it (tj-vhboky.50).
 #
 # THE SECRET STAYS INSIDE DataStoreHttp. A test names what a write carries -- WriteAuth.ABSENT,
-# EMPTY, WRONG or RIGHT -- and never the value. What a failure can print is kept clean in four
+# EMPTY, WRONG or RIGHT -- and never the value. What a failure can print is kept clean in five
 # places: the client's repr masks the secret (pytest prints fixture arguments in a traceback);
-# describe() and every transport-failure message pass through redact(); a transport failure is a
-# pytest.fail with pytrace=False, so no httpx frame -- whose arguments include the headers -- is
-# printed; and leaks_secret() and response_leaks_secret() return a bool, so a test asserts on a
-# plain name rather than on an expression pytest would expand, response body included, into the
-# failure message.
+# describe() and every transport-failure message pass through redact(), which is the shared
+# SecretRedaction above; a transport failure is a pytest.fail with pytrace=False, so no httpx
+# frame -- whose arguments include the headers -- is printed; leaks_secret() and
+# response_leaks_secret() return a bool, so a test asserts on a plain name rather than on an
+# expression pytest would expand, response body included, into the failure message; and the
+# captured log, where every record is created already redacted by the session-wide factory above
+# (tj-3mk3u5.47), so httpcore's trace of a header that echoed the secret prints '<redacted>' in
+# both 'Captured log' and 'Captured stderr'.
 
 HTTP_TIMEOUT_SECONDS = 30.0
 
@@ -443,6 +619,7 @@ class DataStoreHttp:
     def __init__(self, base_url: str, secret: str) -> None:
         self.base_url = base_url
         self.__secret = secret
+        self.__redaction = SecretRedaction(secret)
         wrong = f'wrong-{uuid.uuid4().hex}'
         while wrong == secret:  # astronomically unlikely; cheap to rule out
             wrong = f'wrong-{uuid.uuid4().hex}'
@@ -513,7 +690,8 @@ class DataStoreHttp:
         return any(self.leaks_secret(value) for _, value in response.headers.multi_items())
 
     def redact(self, text: str) -> str:
-        return text.replace(self.__secret, '<redacted>')
+        """`text` with the secret, as text or as a bytes literal's inside, replaced: SecretRedaction (R3)."""
+        return self.__redaction(text)
 
     def describe(self, response: httpx.Response) -> str:
         """The request and its answer, for an assertion message, with the secret redacted."""

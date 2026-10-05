@@ -104,14 +104,17 @@ jobs:
     # would go red (tj-3mk3u5.40). grep -P, the hooks' other tool, needs nothing here: bookworm's
     # grep is Essential, so the slim image has it, and it pre-depends on libpcre2-8-0.
     #
+    # curl because `make buf-install` (Install Buf, below) downloads the pinned buf release with it,
+    # and the slim image has none (tj-3mk3u5.54). ca-certificates serves it too: the download is https.
+    #
     # safe.directory: the runner creates the workspace as its own user and this container runs as
     # root, so git refuses the checkout for dubious ownership. actions/checkout marks the workspace
     # safe only in a temporary global config that it deletes when its own step ends, so later steps
     # do not inherit it. --system, in /etc/gitconfig, where checkout's HOME override cannot hide it.
-    - name: Install Git, Make and jq
+    - name: Install Git, Make, jq and curl
       run: |
         apt-get update
-        apt-get install -y --no-install-recommends git make jq ca-certificates
+        apt-get install -y --no-install-recommends git make jq curl ca-certificates
         rm -rf /var/lib/apt/lists/*
         git config --system --add safe.directory "${GITHUB_WORKSPACE}"
 
@@ -125,6 +128,22 @@ jobs:
     - name: Install dependencies
       run: |
         uv sync --all-groups --no-group security --no-group agent-mcp --locked
+
+    # THE PINNED BUF, through the target a developer runs (tj-3mk3u5.54), so the version and both
+    # checksums have one definition, the Makefile's: the bare release binary, sha256-verified against
+    # the pin, refused on a mismatch. Before Run Linters, whose proto leg needs it, and before Run Unit
+    # Tests, because tests in the suite run the real buf. No cache: one small download per run.
+    - name: Install Buf
+      run: |
+        make buf-install BUF_INSTALL_DIR=/usr/local/bin
+
+    # buf breaking's baseline (tj-3mk3u5.54). actions/checkout fetches one commit and no branch, so
+    # main is fetched here as a remote-tracking ref, and make lint is pointed at it. Depth 1: make
+    # lint extracts one tree from it with git archive and needs no history. On a push to main this
+    # writes refs/remotes/origin/main, never the checked-out branch.
+    - name: Fetch main for buf breaking
+      run: |
+        git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
 
     # THE STALENESS CHECK (ADR tj-8konfu D3; decision tj-3mk3u5.42 F1). gen/proto/ is committed protoc
     # output, one tree per language, and a committed copy can disagree with its source; this step is
@@ -147,12 +166,17 @@ jobs:
         fi
         echo "gen/proto/ matches what make proto writes from proto/."
 
-    - name: Run Ruff Linting
+    # THE ONE LINT ENTRY POINT, the same target every agent and developer runs (tj-3mk3u5.54), so the
+    # linters have one definition, as the staleness step's protoc does through make proto. PATHS
+    # defaults to '.', so this is ruff check and ruff format --check on the whole tree, then the
+    # proto leg: buf lint, buf format --diff --exit-code and buf breaking against main. Breaking is
+    # REPORT-ONLY until the first SDK release (tj-d2mhru): a break prints as annotations on the pull
+    # request and does not fail the step; a broken check still does. After the staleness step, so a
+    # stale tree is reported as stale.
+    - name: Run Linters
       run: |
-        uv run ruff check .
-    - name: Run Ruff Format Check
-      run: |
-        uv run ruff format --check .
+        make lint BUF_AGAINST_REF=origin/main BUF_ERROR_FORMAT=github-actions
+
     - name: Run Unit Tests
       run: |
         uv run pytest -s
@@ -947,6 +971,43 @@ jobs:
             echo "::error::MARKET_ACTIVITY_BATCH_SIZE in data_store must be a positive integer, got '${value}'"
             exit 1
           fi
+
+      - name: Check Generated Code Import
+        run: |
+          set -euo pipefail
+          # THE IMPORT-PATH CHECK (decision tj-3mk3u5.42 addendum F1-A; tj-3mk3u5.56). Inside each running
+          # service built from the Dockerfile's service stages, import common.rpc.ping, which imports the
+          # generated trader_joe.proto.ping.v1 and so needs /code/gen/proto/python on the container's
+          # PYTHONPATH. The image's ENV puts it there, but compose ranks env_file: above an image's ENV, and
+          # the staged root env file is a copy of .env.default, whose legacy PYTHONPATH=./ replaces it.
+          # docker-compose.yaml's environment: restates the value and outranks both. Every static pin reads
+          # the files; this is the one check that sees compose's precedence at runtime, with the very env
+          # file that drops the path. Nothing else here notices a lost path while no servicer imports
+          # generated code: the stack starts healthy and passes every other step.
+          #
+          # The image's own interpreter imports, as the services do. stdout carries only the generated
+          # module's file, so a pass shows where it loaded from; a failed import's traceback reaches the log
+          # on stderr, and the error names the service and the PYTHONPATH it saw (not a secret).
+          failed=0
+          for service in data_store data_ingest; do
+            if ! path="$(docker compose -f docker-compose.yaml exec -T "${service}" /code/.venv/bin/python -c \
+                'import os; print(os.environ.get("PYTHONPATH", ""))')"; then
+              echo "::error::could not read PYTHONPATH inside ${service}, so its import path is unproven"
+              failed=1
+              continue
+            fi
+            if out="$(docker compose -f docker-compose.yaml exec -T "${service}" /code/.venv/bin/python -c \
+                'import common.rpc.ping as ping; print(ping.ping_pb2.__file__)')"; then
+              echo "${service}: common.rpc.ping imports; generated code from ${out} (PYTHONPATH=${path})"
+            else
+              echo "::error::${service} cannot import common.rpc.ping (the generated code under /code/gen/proto/python) with PYTHONPATH=${path:-<unset or empty>}; the traceback is above"
+              failed=1
+            fi
+          done
+          if [ "${failed}" -ne 0 ]; then
+            exit 1
+          fi
+          echo "The generated code imports in every service container: compose's environment: PYTHONPATH holds over the root env file."
 
       - name: System Tests
         # This runner's database is thrown away with the job, which is the one condition under

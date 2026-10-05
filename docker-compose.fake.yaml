@@ -15,7 +15,9 @@
 # prod_image container. data/ingest/tests/test_no_production_test_imports.py pins that production
 # never imports the test tree.
 #
-# WHY tests.fakes RESOLVES IN THE CONTAINER: the image sets PYTHONPATH=/code and has no /code/tests;
+# WHY tests.fakes RESOLVES IN THE CONTAINER: PYTHONPATH starts with /code (the image's ENV, which
+# docker-compose.yaml's environment: restates so the root env file cannot replace it; decision
+# tj-3mk3u5.42 addendum F1-A), and the image has no /code/tests;
 # the bind below creates /code/tests as a bare mount point, with no __init__.py, so `tests` is a
 # namespace package there and tests.fakes (which has its own __init__.py) a regular package under it.
 # The repository commits no tests/__init__.py either, so the host import path and the container's agree.

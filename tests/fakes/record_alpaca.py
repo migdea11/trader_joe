@@ -28,8 +28,11 @@ for both credential values; either check failing aborts the whole run with nothi
 
 WHAT A REFUSAL PRINTS (tj-3mk3u5.37.18): the spec, the reason and -- once a response has arrived --
 its HTTP status, so a refused body still leaves its status as evidence even though nothing is
-written. It may name top-level key names. It never prints a value from the body or a header, and
-the credential refusal names neither the credential nor where it appeared.
+written. It may name top-level key names, but only after that body has passed the credential scan
+(tj-3mk3u5.37.19): every decoded body is searched for both credential values before any check that
+can print its key names, so a credential sent back as a key is refused as a credential. It never
+prints a value from the body or a header, and the credential refusal names neither the credential
+nor where it appeared.
 
 RATE-LIMIT HEADERS ARE PRINTED, NEVER WRITTEN (tj-3mk3u5.37.11, the architect's optional suggestion
 from the TE-4 gate). Four response headers are read and no other: X-RateLimit-Limit,
@@ -399,6 +402,16 @@ def fetch(url: str, key_id: str, secret: str) -> tuple[int, object, dict[str, st
         raise RecordingRefused(f'HTTP {status} with a body that is not JSON') from undecodable
 
 
+def carries_credential(body: object, secrets: tuple[str, str]) -> bool:
+    """Whether a decoded body, an object or not, holds either credential value anywhere -- a key included.
+
+    The serialisation keeps non-ASCII characters as they are, so a credential is found in the same
+    characters a refusal's key-name repr would print, not hidden behind an ASCII escape.
+    """
+    text = json.dumps(body, ensure_ascii=False)
+    return any(value and value in text for value in secrets)
+
+
 def fixture_text(spec: Spec, status: int, body: object, secrets: tuple[str, str]) -> str:
     """Serialise one fixture, refusing anything that is not plainly market or reference data.
 
@@ -433,8 +446,9 @@ def empty_name(body: dict, status: int) -> str:
     never filed as the absent-symbol shape it is not (null was community-reported on the old
     single-symbol endpoint, forum thread 8954; alpaca-py 0.44.0 raises on it, common/rest.py:395).
 
-    This runs before fixture_text's credential scan, so a refusal here names the response's HTTP
-    status and the body's shape -- key names, a type, a count -- and never a value from it.
+    This runs after record() has scanned the body for the credentials but before fixture_text's
+    scan of the written text, so a refusal here names the response's HTTP status and the body's
+    shape -- key names, a type, a count -- and never a value from it.
     """
     if 'bars' not in body:
         raise RecordingRefused(f'bars_empty: the response has no bars key, only {sorted(body)} (HTTP {status})')
@@ -490,6 +504,9 @@ def record(specs: tuple[Spec, ...], out: Path, dry_run: bool) -> int:
             raise RecordingRefused(f'{spec.name}: {refused}') from refused
         if status not in spec.accepted:
             raise RecordingRefused(f'{spec.name}: expected HTTP {spec.accepted_text}, got {status}')
+        # Before empty_name or fixture_text can print a key name from it (tj-3mk3u5.37.19).
+        if carries_credential(body, (key_id, secret)):
+            raise RecordingRefused(f'{spec.name}: a credential value appears in the output (HTTP {status})')
         if isinstance(body, dict):
             bodies[spec.name] = body
             statuses[spec.name] = status

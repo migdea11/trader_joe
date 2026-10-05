@@ -95,6 +95,28 @@ RUN set -eux; \
     rm -rf /tmp/uv.tar.gz "/tmp/uv-${target}"; \
     uv --version
 
+# buf, which `make lint` runs on proto/ when PATHS covers it (tj-3mk3u5.54): the bare release binary,
+# pinned and checksum-verified on the same rule as bd, dolt and uv. It lints only; protoc generates.
+# These values MIRROR the Makefile's BUF_VERSION, BUF_SHA256_X86_64 and BUF_SHA256_AARCH64, which are
+# the one authority: this build's context is .devcontainer/, so it cannot read the Makefile.
+# common/tests/test_agent_image.py pins them equal, and all of them move together, in one commit.
+# Until this image is rebuilt, `make buf-install` puts the same pin in ~/.local/bin.
+RUN set -eux; \
+    version='1.73.0'; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) asset='buf-Linux-x86_64'; sum='8f2986298ad08f0cc1bf999b9797b7c383adf32d7edf0f73d6f1e1a701baeac1' ;; \
+      arm64) asset='buf-Linux-aarch64'; sum='902b75267db7f4391e99b7fa0756050e5354234cc0437ef50eee9c788950c7a3' ;; \
+      *) echo "no buf checksum pinned for ${arch}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/buf \
+      "https://github.com/bufbuild/buf/releases/download/v${version}/${asset}"; \
+    echo "${sum}  /tmp/buf" | sha256sum -c -; \
+    install -m 0755 /tmp/buf /usr/local/bin/buf; \
+    rm /tmp/buf; \
+    buf --version; \
+    [ "$(buf --version)" = "${version}" ]
+
 # make drives every command binding in the manifest; bookworm ships Python 3.11, so uv supplies
 # the 3.12 the project requires. UV_PYTHON_INSTALL_DIR is outside $HOME so it survives the
 # config volume being replaced, and is readable by the agent user.

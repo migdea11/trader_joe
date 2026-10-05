@@ -793,7 +793,9 @@ def test_an_empty_range_refusal_names_its_http_status_and_the_shape_alone(monkey
 
 @pytest.mark.parametrize('credential', [KEY_ID, SECRET], ids=['key-id', 'secret'])
 def test_a_populated_empty_range_body_is_refused_without_echoing_it(monkeypatch, keys, out, capsys, credential):
-    # empty_name runs before the credential scan, so its refusal is the only guard here.
+    # record() scans a body for the credentials before empty_name sees it (tj-3mk3u5.37.19), so the
+    # scan refuses this one; empty_name's populated refusal prints a count, never the entry, either
+    # way (the 'populated' row above pins its whole line).
     weekend = {'bars': {'AAPL': [{**AAPL_BARS['bars']['AAPL'][0], 't': credential}]}, 'next_page_token': None}
     vendor = Vendor({'bars_empty': Answer(200, weekend)})
 
@@ -815,6 +817,97 @@ def test_a_page_one_with_no_token_is_refused_with_page_ones_status(monkeypatch, 
     assert capsys.readouterr().err == (
         f'{REFUSED}bars_1Day_page1 returned no next_page_token (HTTP 200), so bars_1Day_page2 cannot be asked for\n'
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# The credential scan comes before any refusal that prints a key name (tj-3mk3u5.37.19)
+#
+# The unexpected-keys refusal and empty_name's no-bars-key refusal print a body's top-level key
+# names. A credential the vendor sent back AS a key would ride out on either one, so every decoded
+# body -- an object or not -- is scanned first, and such a body is refused as a credential: the
+# whole stderr line is the credential refusal, naming neither the credential nor the key.
+# ---------------------------------------------------------------------------------------------
+
+
+# name -> (status, the body with the credential planted as a top-level key)
+KEY_PLANTS: dict[str, tuple[int, Callable[[str], dict]]] = {
+    'asset_known_symbol': (200, lambda credential: {**AAPL_ASSET, credential: True}),
+    'asset_unknown_symbol': (404, lambda credential: {**ASSET_NOT_FOUND, credential: None}),
+    'bars_unknown_symbol': (200, lambda credential: {**EMPTY_BARS, credential: {}}),
+}
+
+
+def credential_line(name: str, status: int) -> str:
+    return f'{REFUSED}{name}: a credential value appears in the output (HTTP {status})\n'
+
+
+@pytest.mark.parametrize('credential', [KEY_ID, SECRET], ids=['key-id', 'secret'])
+@pytest.mark.parametrize(
+    'name', list(KEY_PLANTS), ids=['paper-host-asset-body-200', 'paper-host-error-body-404', 'data-host-bars-body-200']
+)
+def test_a_credential_sent_back_as_a_top_level_key_is_refused_as_a_credential_not_as_a_key(
+    monkeypatch, keys, out, capsys, name, credential
+):
+    status, plant = KEY_PLANTS[name]
+    vendor = Vendor(SITTING | {name: Answer(status, plant(credential))})
+
+    assert run(monkeypatch, vendor, '--only', *Q_EMPTY, out=out) == 1
+
+    captured = capsys.readouterr()
+    assert not out.exists()
+    assert captured.err == credential_line(name, status)
+    assert credential not in captured.out + captured.err
+
+
+@pytest.mark.parametrize('credential', [KEY_ID, SECRET], ids=['key-id', 'secret'])
+def test_a_credential_as_a_key_of_an_empty_range_body_with_no_bars_key_is_refused_as_a_credential(
+    monkeypatch, keys, out, capsys, credential
+):
+    vendor = Vendor({'bars_empty': Answer(200, {'next_page_token': None, credential: []})})
+
+    assert run(monkeypatch, vendor, '--only', 'bars_empty', out=out) == 1
+
+    captured = capsys.readouterr()
+    assert not out.exists()
+    assert captured.err == credential_line('bars_empty', 200)
+    assert credential not in captured.out + captured.err
+
+
+@pytest.mark.parametrize('credential', [KEY_ID, SECRET], ids=['key-id', 'secret'])
+@pytest.mark.parametrize(
+    ('name', 'status', 'plant'),
+    [
+        pytest.param('bars_mixed_known_unknown', 200, lambda credential: [credential], id='data-host-list-200'),
+        pytest.param('asset_unknown_symbol', 404, lambda credential: credential, id='paper-host-string-404'),
+    ],
+)
+def test_a_body_that_is_not_an_object_is_scanned_too(monkeypatch, keys, out, capsys, name, status, plant, credential):
+    vendor = Vendor(SITTING | {name: Answer(status, plant(credential))})
+
+    assert run(monkeypatch, vendor, '--only', *Q_EMPTY, out=out) == 1
+
+    captured = capsys.readouterr()
+    assert not out.exists()
+    assert captured.err == credential_line(name, status)
+    assert credential not in captured.out + captured.err
+
+
+def test_a_non_ascii_credential_sent_back_as_a_key_is_found_in_the_characters_a_refusal_prints(
+    monkeypatch, out, capsys
+):
+    # The unexpected-keys refusal prints a key's repr, which keeps 'é' as it is; a scan of the
+    # ASCII-escaped serialisation would look for it and miss it.
+    secret = 'stub-sécret-not-a-credential'
+    monkeypatch.setenv('ALPACA_API_KEY', KEY_ID)
+    monkeypatch.setenv('ALPACA_API_SECRET', secret)
+    vendor = Vendor(SITTING | {'asset_known_symbol': Answer(200, {**AAPL_ASSET, secret: True})})
+
+    assert run(monkeypatch, vendor, '--only', *Q_EMPTY, out=out) == 1
+
+    captured = capsys.readouterr()
+    assert not out.exists()
+    assert captured.err == credential_line('asset_known_symbol', 200)
+    assert secret not in captured.out + captured.err
 
 
 # ---------------------------------------------------------------------------------------------

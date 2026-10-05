@@ -17,6 +17,17 @@ help:  ## Show this help message
 # it is silently ignored, and the install cooldown stops protecting anything.
 UV_VERSION := 0.12.19
 
+# THE BUF PIN (tj-3mk3u5.54). This file is its one authority. buf lints, format-checks and
+# breaking-checks proto/ inside `make lint` (the BUF section, above `lint`); it generates nothing.
+# The checksums are the release's own sha256.txt lines for the bare buf-Linux-<arch> binaries.
+# THE ONE MIRROR is .devcontainer/Dockerfile's buf RUN: its build context is .devcontainer/, so it
+# cannot read this file, and common/tests/test_agent_image.py pins the two equal. CI reaches the pin
+# through `make buf-install` and holds no copy. A bump is these three values and the Dockerfile's
+# three, in one commit, then the agent-image rebuild.
+BUF_VERSION := 1.73.0
+BUF_SHA256_X86_64 := 8f2986298ad08f0cc1bf999b9797b7c383adf32d7edf0f73d6f1e1a701baeac1
+BUF_SHA256_AARCH64 := 902b75267db7f4391e99b7fa0756050e5354234cc0437ef50eee9c788950c7a3
+
 # THE LOCK IS FROZEN BY DEFAULT (tj-3zh7ss). Exported, so every uv below -- and every uv those
 # recipes start -- installs from uv.lock exactly as committed and never re-resolves it. Without
 # this, any `uv run` or `uv sync` re-locked whenever pyproject.toml had moved: a plain
@@ -128,9 +139,13 @@ init: $(VENV_MARKER)  ## Initialize the project, including the security tooling
 # `from trader_joe.proto.ping.v1 import ping_pb2`. So imports resolve as protoc writes them, one .proto
 # can import another by its canonical path, and every descriptor records its canonical file name -- the
 # name every other consumer generating from proto/ records too. gen/proto/python reaches Python by
-# CONFIGURATION, never by code, in three places: pytest.ini's pythonpath, the image's PYTHONPATH plus
-# its COPY of ./gen/proto/python (Dockerfile), and a bind mount beside every ./common mount (the
-# compose files). NOTHING EDITS THE OUTPUT: no rewrite, no post-processing, no check of import lines.
+# CONFIGURATION, never by code, in four places: pytest.ini's pythonpath, the image's PYTHONPATH plus
+# its COPY of ./gen/proto/python (Dockerfile), a bind mount beside every ./common mount (the compose
+# files), and docker-compose.yaml's environment: PYTHONPATH on every service built from the service
+# stages -- literal, and what makes the image's value hold under compose, because the root env file's
+# legacy PYTHONPATH=./ arrives through env_file:, which outranks an image's ENV (decision
+# tj-3mk3u5.42 addendum F1-A). NOTHING EDITS THE OUTPUT: no rewrite, no post-processing, no check of
+# import lines.
 # What is committed is protoc's, byte for byte.
 #
 # TWO GUARDS, before anything is deleted. $(PROTO_PKG)/__init__.py, hand-committed and the one file
@@ -598,20 +613,206 @@ clean: dev-down  ## Clean up the project
 	[[ -d .coverage ]] && rm -rf .coverage || true
 	[[ -d coverage.xml ]] && rm -rf coverage.xml || true
 
+# THE ONE LINT ENTRY POINT (tj-3mk3u5.54; the user's ruling on tj-3mk3u5.55). `make lint` lints every
+# language PATHS covers, one leg per language, and `make lint-fix` fixes what each leg can fix:
+#   lint-python   ruff check and ruff format --check on PATHS: the two lines `lint` always ran.
+#   lint-proto    buf lint, buf format --diff --exit-code and buf breaking, on the WHOLE proto module,
+#                 when PATHS covers proto/ (the selector below). PATHS decides WHETHER buf runs, never
+#                 what it reads: module-level rules (package against directory, import cycles) need
+#                 every file in the module.
+#   lint-ts       NOT YET. PR 4 adds the third leg with the UI and its tooling: lint-ts and lint-fix-ts,
+#                 selected by web/, as a third prerequisite of lint and of lint-fix. Nothing stands in
+#                 for it before then: a leg that lints nothing is a green result with nothing behind it.
+# buf lint and buf breaking have no autofix, so lint-fix-proto is buf format -w alone.
+#
+# THE PROTO SELECTOR. PATHS is space-separated and relative to the repository root. Each word is
+# normalised -- one leading ./ stripped, then every trailing / -- and the proto leg is SELECTED when
+# any word is then '.' or empty (PATHS=. or ./), 'proto', or under proto/. An empty PATHS selects it
+# too, because ruff given no path lints the whole tree. NOT SELECTED, the leg prints one 'not run'
+# line and passes WITHOUT looking for buf, so a component-scoped run (PATHS=common, data/ingest, ...)
+# behaves as it did before buf, installed or not. SELECTED, an absent buf or a buf at any other version
+# than BUF_VERSION FAILS, naming both remedies. Never a skip, and no variable switches the leg off
+# (tj-qenrpk's fail-not-skip rule; pytest.ini). A change to buf.yaml itself is checked with PATHS=.
+_lint_strip_slashes = $(if $(filter %/,$(1)),$(call _lint_strip_slashes,$(patsubst %/,%,$(1))),$(1))
+_lint_word = $(call _lint_strip_slashes,$(patsubst ./%,%,$(1)))
+_lint_selects_proto = $(if $(filter . proto proto/%,$(or $(call _lint_word,$(1)),.)),yes)
+LINT_PROTO_SELECTED := $(if $(strip $(PATHS)),$(strip $(foreach word,$(PATHS),$(call _lint_selects_proto,$(word)))),yes)
+LINT_PROTO_NOT_RUN = $@: not run: PATHS=$(PATHS) does not cover proto/ (buf runs for PATHS=. or proto/...)
+
+# BUF is looked up on PATH; overridable, e.g. with a stub. BUF_ERROR_FORMAT goes to buf lint and buf
+# breaking; CI passes github-actions, so findings become annotations on the pull request.
+BUF ?= buf
+BUF_ERROR_FORMAT ?= text
+
+# The selected leg needs the pinned buf: another version may lint, format or compare differently.
+define BUF_PIN_CHECK
+@if ! where="$$(command -v $(BUF))"; then \
+	found='none: $(BUF) is not on PATH'; \
+elif ! version="$$($(BUF) --version 2>&1)"; then \
+	found="$$where, whose --version fails: $$version"; \
+elif [ "$$version" != '$(BUF_VERSION)' ]; then \
+	found="buf $$version at $$where"; \
+else \
+	found=''; \
+fi; \
+if [ -n "$$found" ]; then \
+	echo "make $@: PATHS=$(PATHS) covers proto/, which needs buf $(BUF_VERSION) (BUF=$(BUF)); found $$found." >&2; \
+	echo "  Install the pin: make buf-install (checksum-verified, into $(BUF_INSTALL_DIR); BUF_INSTALL_DIR= to change it)," >&2; \
+	echo "  or rebuild the agent image, which installs it at /usr/local/bin/buf." >&2; \
+	exit 1; \
+fi
+endef
+
+# BREAKING, the last step of lint-proto. The baseline is BUF_AGAINST_REF, by default the LOCAL main
+# branch: refs are shared across linked worktrees, so it resolves inside an agent's worktree too. A
+# local main can lag origin's, which is acceptable while the check is report-only. CI fetches main into
+# origin/main at depth 1 and passes BUF_AGAINST_REF=origin/main.
+#
+# THE BASELINE IS MATERIALISED WITH git archive: <ref>'s buf.yaml and proto/ are extracted into a
+# temporary directory, removed on exit, and buf compares against that directory. Not buf's own
+# '.git#branch=main' input: in a linked worktree .git is a file, not the directory buf reads, and CI's
+# checkout is shallow with no local main. git archive works the same in the shared checkout, a
+# worktree and CI.
+#   <ref> does not resolve   FAIL, naming the ref and the fix. A missing baseline is a broken check.
+#   <ref> has no proto/      PASS, saying 'nothing to compare': the first-adoption case, since main has
+#                            no proto/ until PR 2 merges. Said out loud, never silent.
+#   proto/ but no buf.yaml   FAIL: there is no module to compare against.
+# BOTH SIDES ARE BUILT FIRST, and either failing to build FAILS. That is what makes the report-only
+# downgrade safe: buf exits 100 for a compile error as well as for breaking-change findings, in the
+# input and in the baseline alike (seen on buf 1.73.0), so without the builds a baseline that does not
+# compile would read as a finding and pass.
+#
+# REPORT-ONLY (tj-3mk3u5.55, W2) while ADR tj-8konfu D1's compatibility window is open. buf breaking
+# exiting 0 prints 'no breaking changes'. Exiting 100, its findings code, prints the findings and a
+# banner, then passes while BUF_BREAKING_BLOCKING is 0 and fails when it is 1. ANY OTHER non-zero fails
+# in both modes: report-only covers findings, never a broken check, which is why this is not `|| true`.
+BUF_AGAINST_REF ?= main
+# Flip to 1 at the first SDK release (tj-d2mhru). Until then a break is printed, not failed (tj-3mk3u5.55 W2).
+BUF_BREAKING_BLOCKING := 0
+
+define BUF_BREAKING
+@set -euo pipefail; \
+ref='$(BUF_AGAINST_REF)'; \
+if ! git rev-parse --verify --quiet "$$ref^{commit}" > /dev/null; then \
+	echo "make $@: breaking: the baseline ref '$$ref' does not resolve to a commit here; failing. Fetch it, or pass BUF_AGAINST_REF=<ref> (CI fetches main as origin/main)." >&2; \
+	exit 1; \
+fi; \
+if ! git cat-file -e "$$ref:proto" 2> /dev/null; then \
+	echo "$@: breaking: no proto/ on $$ref: nothing to compare"; \
+	exit 0; \
+fi; \
+if ! git cat-file -e "$$ref:buf.yaml" 2> /dev/null; then \
+	echo "make $@: breaking: $$ref has proto/ but no buf.yaml, so there is no module to compare against; failing." >&2; \
+	exit 1; \
+fi; \
+base="$$(mktemp -d)"; \
+trap 'rm -rf "$$base"' EXIT; \
+git archive "$$ref" -- buf.yaml proto | tar -x -C "$$base"; \
+echo "$@: breaking: against $$ref ($$(git rev-parse --short "$$ref^{commit}")), its buf.yaml and proto/ extracted by git archive"; \
+$(BUF) build; \
+$(BUF) build "$$base" || { status=$$?; echo "make $@: breaking: the baseline on $$ref does not build (exit $$status); failing, because a broken baseline is not a finding." >&2; exit 1; }; \
+status=0; \
+$(BUF) breaking --error-format=$(BUF_ERROR_FORMAT) --against "$$base" || status=$$?; \
+case "$$status" in \
+	0) echo "$@: breaking: no breaking changes against $$ref" ;; \
+	100) \
+		if [ '$(BUF_BREAKING_BLOCKING)' = 0 ]; then \
+			echo "$@: breaking: REPORT-ONLY until the first SDK release (tj-d2mhru): the breaking change(s) above are against $$ref; not failing."; \
+		else \
+			echo "make $@: breaking: BLOCKING (BUF_BREAKING_BLOCKING=$(BUF_BREAKING_BLOCKING)): the breaking change(s) above are against $$ref; failing." >&2; \
+			exit 1; \
+		fi ;; \
+	*) echo "make $@: breaking: buf breaking exited $$status, which is a broken check, not a finding; failing in either mode." >&2; exit "$$status" ;; \
+esac
+endef
+
 .PHONY: lint
-lint: $(VENV_MARKER)  ## Lint and format-check the project (scope with PATHS=)
+lint: lint-python lint-proto  ## Lint every language PATHS covers (Python: ruff; proto: buf, when PATHS is . or under proto/)
+
+.PHONY: lint-python
+lint-python: $(VENV_MARKER)  ## Lint and format-check Python with ruff (scope with PATHS=)
 	uv run ruff check $(PATHS)
 	uv run ruff format --check $(PATHS)
+
+.PHONY: lint-proto
+lint-proto:  ## buf lint, format check and breaking vs BUF_AGAINST_REF (report-only), when PATHS covers proto/
+ifeq ($(LINT_PROTO_SELECTED),)
+	@echo "$(LINT_PROTO_NOT_RUN)"
+else
+	$(BUF_PIN_CHECK)
+	$(BUF) lint --error-format=$(BUF_ERROR_FORMAT)
+	@echo '$(BUF) format --diff --exit-code'; $(BUF) format --diff --exit-code \
+		|| { status=$$?; echo "make $@: the diff above is buf format's; apply it with 'make lint-fix PATHS=proto'." >&2; exit $$status; }
+	$(BUF_BREAKING)
+endif
+
+.PHONY: lint-fix
+lint-fix: lint-fix-python lint-fix-proto  ## Apply lint fixes and formatting for every language PATHS covers (scope with PATHS=)
+
+.PHONY: lint-fix-python
+lint-fix-python: $(VENV_MARKER)  ## Apply ruff's fixes and formatting (scope with PATHS=)
+	uv run ruff check --fix $(PATHS)
+	uv run ruff format $(PATHS)
+
+.PHONY: lint-fix-proto
+lint-fix-proto:  ## Apply buf format to proto/, when PATHS covers proto/
+ifeq ($(LINT_PROTO_SELECTED),)
+	@echo "$(LINT_PROTO_NOT_RUN)"
+else
+	$(BUF_PIN_CHECK)
+	$(BUF) format -w
+endif
+
+# THE ONE TARGET THAT DOWNLOADS BUF. `make lint` never touches the network. Linux x86_64 and aarch64
+# only: any other platform fails naming itself, never as a checksum mismatch, which would read like a
+# corrupted download. The BARE release binary is fetched from BUF_RELEASE_URL (overridable, so a test
+# can serve a fake over file://) into a temporary file INSIDE BUF_INSTALL_DIR, checked by sha256sum
+# against the pin, and run to check that it reports BUF_VERSION. Either mismatch deletes the download
+# and fails, leaving any existing buf untouched. Only then is it renamed over BUF_INSTALL_DIR/buf: a
+# rename within one directory is atomic, so agents sharing a container never run a half-written file.
+# The default, ~/.local/bin, is first on the agent image's PATH; it is per container, not per worktree,
+# and not a mount, so one run serves every agent in the container until it is recreated, and the
+# rebuilt image then carries /usr/local/bin/buf itself. CI installs into /usr/local/bin.
+BUF_RELEASE_URL ?= https://github.com/bufbuild/buf/releases/download
+BUF_INSTALL_DIR ?= $(HOME)/.local/bin
+
+.PHONY: buf-install
+buf-install:  ## Install the pinned buf, checksum-verified, into BUF_INSTALL_DIR (default ~/.local/bin; the only target that downloads it)
+	@set -euo pipefail; \
+	platform="$$(uname -s) $$(uname -m)"; \
+	case "$$platform" in \
+		'Linux x86_64') asset=buf-Linux-x86_64; sum='$(BUF_SHA256_X86_64)' ;; \
+		'Linux aarch64') asset=buf-Linux-aarch64; sum='$(BUF_SHA256_AARCH64)' ;; \
+		*) echo "make buf-install: no buf checksum pinned for $$platform; buf is pinned for Linux x86_64 and Linux aarch64 only (BUF_SHA256_* in the Makefile)." >&2; exit 1 ;; \
+	esac; \
+	url='$(BUF_RELEASE_URL)/v$(BUF_VERSION)/'"$$asset"; \
+	dir='$(BUF_INSTALL_DIR)'; \
+	mkdir -p "$$dir"; \
+	tmp="$$(mktemp "$$dir/.buf-install.XXXXXX")"; \
+	trap 'rm -f "$$tmp"' EXIT; \
+	echo "make buf-install: fetching $$url"; \
+	curl -fsSL -o "$$tmp" "$$url"; \
+	if ! printf '%s  %s\n' "$$sum" "$$tmp" | sha256sum -c --status -; then \
+		echo "make buf-install: checksum mismatch for $$url: expected $$sum, got $$(sha256sum "$$tmp" | cut -d ' ' -f 1). Deleted the download; $$dir/buf is untouched." >&2; \
+		exit 1; \
+	fi; \
+	chmod 0755 "$$tmp"; \
+	found="$$("$$tmp" --version 2>&1)" || found="a failing --version ($$found)"; \
+	if [ "$$found" != '$(BUF_VERSION)' ]; then \
+		echo "make buf-install: $$url matches its pinned checksum but reports version $$found, not $(BUF_VERSION): BUF_VERSION and BUF_SHA256_* disagree. Deleted the download; $$dir/buf is untouched." >&2; \
+		exit 1; \
+	fi; \
+	mv -f "$$tmp" "$$dir/buf"; \
+	trap - EXIT; \
+	echo "make buf-install: installed buf $$("$$dir/buf" --version) at $$dir/buf (sha256 $$sum)"; \
+	resolved="$$(command -v buf || true)"; \
+	[ "$$resolved" = "$$dir/buf" ] || echo "make buf-install: note: 'buf' on PATH is $${resolved:-not found}, not $$dir/buf; make lint runs the first buf on PATH (or BUF=<path>)." >&2
 
 # ./tools holds the agent-stack MCP server (tools/agent_mcp, ADR tj-4rr0la section 6): build
 # tooling, but it holds Docker access, so bandit reads it like production source.
 # ./gen/proto/python is generated, but the image copies it and runs it, so bandit reads it too
 # (decision tj-3mk3u5.42 F1). CI's SOURCE_PATHS must name the same roots.
 SOURCE_DIRS := ./common ./routers ./schemas ./data ./tools ./gen/proto/python
-.PHONY: lint-fix
-lint-fix: $(VENV_MARKER)  ## Apply lint fixes and formatting (scope with PATHS=)
-	uv run ruff check --fix $(PATHS)
-	uv run ruff format $(PATHS)
 
 # semgrep runs with --error, so a finding fails this target (and the CI step) instead of printing
 # and exiting 0 (tj-cg2i9p).

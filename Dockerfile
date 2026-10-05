@@ -24,6 +24,10 @@ COPY --from=ghcr.io/astral-sh/uv:0.12.19@sha256:04d046b13e60d6bcec73cbc5e1cad25d
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
 # /code/gen/proto/python is the generated gRPC code's import root (trader_joe.proto; decision
 # tj-3mk3u5.42 F1), reached by configuration, never by code. pytest.ini's pythonpath mirrors it.
+# Under compose this ENV does not hold on its own: the root env file's legacy PYTHONPATH=./ arrives
+# through env_file:, which outranks an image's ENV. So docker-compose.yaml sets this same value,
+# literally, in the environment: of every service built from the service stages (addendum F1-A),
+# and environment: outranks both. Change the copies together.
 ENV PYTHONPATH="/code:/code/gen/proto/python"
 ENV PATH="/code/.venv/bin:${PATH}"
 

@@ -594,14 +594,14 @@ REASONS: Final[Mapping[Reason, ReasonSpec]] = MappingProxyType(
             summary='The market-data vendor rate-limited the request even after retrying it; retry once reset_at has passed.',
             requires_reset_at=True,
         ),
-        # A vendor 5xx or 504, a connection error, or a vendor timeout (TE-4).
+        # A vendor 5xx or 504, a connection error, a vendor timeout, or a connection cut while the body is read (TE-4).
         Reason.VENDOR_UNAVAILABLE: ReasonSpec(
             branch=ExogenousError,
             outcome=Outcome.NOT_READY,
             disposition=Disposition.RECORD,
             grpc_code='FAILED_PRECONDITION',
             http_status=503,
-            summary='The market-data vendor could not be reached, timed out or failed on its side; retry later.',
+            summary='The market-data vendor could not be reached, timed out, failed on its side, or its answer was cut off; retry later.',
         ),
         # MissingCredentialsError, or a vendor 401 or 403 (TE-4).
         Reason.VENDOR_AUTH: ReasonSpec(

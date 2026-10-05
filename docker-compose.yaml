@@ -145,6 +145,9 @@ services:
       # port of the dev-only loopback publish in docker-compose.override.yaml, and is not
       # what this URI dials.
       - DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASS}@${DATABASE_NAME}:5432/${POSTGRES_DB_NAME}
+      # The import path, literal: the same entry and the same reasoning as data_ingest's PYTHONPATH
+      # below (decision tj-3mk3u5.42 addendum F1-A).
+      - PYTHONPATH=/code:/code/gen/proto/python
     image: trader_joe_data_store:latest
     security_opt:
       - "no-new-privileges:true"
@@ -222,6 +225,17 @@ services:
       # reach it. The host is literal: the alias above, never an env-file value.
       APP_INTERNAL_GRPC_HOST: data-ingest-grpc
       APP_INTERNAL_GRPC_PORT: ${DATA_INGEST_GRPC_PORT:-50051}
+      # The import path (decision tj-3mk3u5.42 F1 rule 3, addendum F1-A), here for the same reason as
+      # the gRPC host above. environment: outranks env_file:, which outranks the image's ENV. The root
+      # env file ships a legacy PYTHONPATH=./ (.env.default, host-side only), so without this entry it
+      # replaces the Dockerfile's ENV PYTHONPATH in every container. That drops /code/gen/proto/python, the
+      # generated code's import root, and common.rpc's first import of trader_joe.proto fails. The value
+      # equals the Dockerfile's ENV PYTHONPATH, and a test pins that. LITERAL, never ${...}: compose
+      # interpolates from the project directory's env file, which carries that same PYTHONPATH=./, so an
+      # interpolated value brings the bug back. Every service built from the Dockerfile's service stages
+      # carries this entry (data_store above), and a new one needs it too. CI's System Testing imports
+      # common.rpc.ping inside both running services, the one check that sees this precedence at runtime.
+      PYTHONPATH: /code:/code/gen/proto/python
     image: trader_joe_data_ingest:latest
     security_opt:
       - "no-new-privileges:true"
