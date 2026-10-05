@@ -22,7 +22,13 @@ WORKDIR /code
 # cooldown in pyproject.toml. Matches Makefile UV_VERSION and the CI workflow.
 COPY --from=ghcr.io/astral-sh/uv:0.12.19@sha256:04d046b13e60d6bcec73cbc5e1cad25d680dea90c8573340950a0ac2d1aef424 /uv /uvx /bin/
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
-ENV PYTHONPATH="/code"
+# /code/gen/proto/python is the generated gRPC code's import root (trader_joe.proto; decision
+# tj-3mk3u5.42 F1), reached by configuration, never by code. pytest.ini's pythonpath mirrors it.
+# Under compose this ENV does not hold on its own: the root env file's legacy PYTHONPATH=./ arrives
+# through env_file:, which outranks an image's ENV. So docker-compose.yaml sets this same value,
+# literally, in the environment: of every service built from the service stages (addendum F1-A),
+# and environment: outranks both. Change the copies together.
+ENV PYTHONPATH="/code:/code/gen/proto/python"
 ENV PATH="/code/.venv/bin:${PATH}"
 
 COPY ./pyproject.toml /code/pyproject.toml
@@ -45,11 +51,13 @@ RUN uv sync --only-group base --only-group ${SERVICE_PATH}-${SERVICE_NAME} --fro
 # GHCR. data/store/migrations/env.py calls load_dotenv('.env'), which is a no-op when the
 # file is absent; it reads DATABASE_URI from the process environment either way.
 
-# Add common files
+# Add common files. gen/proto/python is the committed protoc output common/rpc imports; without it
+# the image starts until the first servicer that imports generated code is registered, then fails.
 COPY ./entrypoint.sh /code/entrypoint.sh
 COPY ./common /code/common
 COPY ./routers /code/routers
 COPY ./schemas /code/schemas
+COPY ./gen/proto/python /code/gen/proto/python
 
 # Add service-specific files
 COPY ./${SERVICE_PATH}/${SERVICE_NAME}/app /code/${SERVICE_PATH}/${SERVICE_NAME}/app
@@ -64,7 +72,7 @@ RUN uv sync --only-group base --only-group ${SERVICE_PATH}-${SERVICE_NAME} --onl
 # Python plus the client-side dependencies -- with the testing group layered on top. When the
 # SDK image exists (tj-d2mhru) this becomes FROM that image instead.
 #
-# NO SOURCE IS COPIED: compose bind-mounts common, routers, schemas, data/store/app,
+# NO SOURCE IS COPIED: compose bind-mounts common, routers, schemas, gen/proto/python, data/store/app,
 # data/store/migrations, tests/system and pytest.ini read-only from the checkout, so a test edit
 # needs no rebuild and a stale image cannot run old tests. Placed before the deploy stages so
 # prod_image stays the last stage, the one a target-less `docker build` produces.
@@ -90,15 +98,48 @@ ARG SERVICE_NAME=none
 RUN addgroup --system appgroup && adduser --ingroup appgroup appuser
 USER appuser
 
-# Setup environment
+# Setup environment. PYTHONPATH as in base_build_image: the root, then the generated code's root.
 WORKDIR /code
-ENV PYTHONPATH="/code"
+ENV PYTHONPATH="/code:/code/gen/proto/python"
 ENV PATH="/code/.venv/bin/:${PATH}"
 
 # Setup service execution
 COPY --from=service_build_image /home/appuser/.local/share/uv/python /home/appuser/.local/share/uv/python
 ENV APP_MODULE="${SERVICE_PATH}.${SERVICE_NAME}.app.main:app"
 CMD ["/code/entrypoint.sh"]
+
+# THE SOURCE STAMP (decision tj-yb1bxj clauses 1 and 6), applied to both deploy stages below.
+#
+# WHAT IT IS FOR. data/store/migrations/env.py imports the models from /code -- IN THE IMAGE --
+# while only alembic.ini and migrations/ are bind-mounted, so `alembic check` always compares the
+# IMAGE'S models against the live schema and never the checkout's. On 2026-10-04 that reported
+# three drift items against a stale prod image that were all phantoms. This label is what lets
+# migrate-check (tj-ymsobh) tell a stale image from a fresh one instead of warning about it.
+#
+# THE VALUE is tools/source_digest.sh's output for this service: a sha256 over exactly the build
+# context the COPYs above deliver. That script PARSES ITS PATH LIST OUT OF THIS FILE, so adding a
+# COPY here grows what the digest covers in the same commit -- a hand-maintained list would let
+# coverage shrink silently and the guard go hollow a second time.
+#
+# PLACED LAST IN EACH STAGE, ON PURPOSE. An ARG invalidates every layer below it whenever its
+# value changes, and this value changes on every source edit. Declared any earlier, each build
+# would be a cold build. It feeds nothing but the LABEL, so it is declared and consumed at the
+# very bottom and only that one layer is rebuilt.
+#
+# WHEN IT IS EMPTY, AND WHAT EMPTY MEANS. docker-compose.yaml interpolates the value from the
+# environment of whoever runs the build, which the Makefile's prod-build and dev-build set. A
+# build started any other way -- the agent stack, CI, a bare `docker compose build` -- leaves it
+# unset, and compose then passes an empty string. Compose cannot omit a mapping-form build arg, so
+# the label is always present and the EMPTY VALUE is what says "unstamped"; an image built before
+# this change has no such label key at all. THE CONTRACT WITH tj-ymsobh IS THEREFORE: the stamp is
+# trustworthy only when the label exists AND matches ^[0-9a-f]{64}$. A missing key and an empty
+# value both mean "cannot verify", which is NOT "matches" -- conflating them is how this goes
+# hollow again. Nothing but a real digest can ever satisfy that pattern, so neither case can be
+# mistaken for a match.
+#
+# WHAT IT DOES NOT COVER: this file's own instructions. A new ENV or a different `uv sync` group
+# changes the image without moving the digest. Dependency changes ARE covered, because
+# pyproject.toml and uv.lock are COPY sources themselves. Stated limit, not an oversight.
 
 # Dev-specific stage
 FROM base_deploy_image AS dev_image
@@ -108,9 +149,15 @@ COPY --from=service_build_image_dev /code /code
 ENV RUN_MODE="dev"
 ENV ADDITIONAL_ARGS="--reload"
 
+ARG SOURCE_DIGEST
+LABEL trader_joe.source.digest="${SOURCE_DIGEST}"
+
 # Prod-specific stage
 FROM base_deploy_image AS prod_image
 # Copy service source and deps from build
 COPY --from=service_build_image /code /code
 
 ENV RUN_MODE="prod"
+
+ARG SOURCE_DIGEST
+LABEL trader_joe.source.digest="${SOURCE_DIGEST}"

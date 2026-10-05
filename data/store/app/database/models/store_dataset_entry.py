@@ -6,7 +6,7 @@ from common.database.sql_alchemy_sensitive_string import SensitiveString
 from common.database.sql_alchemy_table import AppBase, CustomTypeTable
 from common.database.sql_alchemy_types import CustomColumn
 from common.enums.data_select import AssetType, DataType
-from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateType
+from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from common.sensitive import REDACTED
 
 
@@ -28,15 +28,28 @@ class StoreDatasetEntry(AppBase.DATA_STORE_BASE, CustomTypeTable):
     # and end go LAST so the own-overlap check (same owner, same everything else, ranges that
     # overlap) gets a long equality prefix before the range comparison.
     #
-    # feed IS DELIBERATELY NOT HERE, though an earlier version of this record's section 7 listed
-    # it as NEW. tj-rh4b7f (2026-09-25) deferred it: the entry is upserted before the ingest
-    # adapter has resolved a feed (data/store/app/ingest/data_action_request.py upserts the entry
-    # from the request body, then calls ingest), so a feed column on the entry would have to be
-    # written before anything can supply a trustworthy value. The user ruled to defer both feed
-    # on the entry and feed as an accepted create-request field to the gRPC transport work, where
-    # an acknowledgement can carry the resolved value early enough to write it. No caller can
-    # select a feed today -- there is exactly one feed per deployment -- so deferring costs
-    # nothing yet. See tj-rh4b7f for the full reasoning.
+    # feed IS HERE NOW, and the deferral this comment used to record is RETIRED (tj-3mk3u5.31,
+    # closing tj-f2qz44). tj-rh4b7f (2026-09-25) deferred it because of WRITE ORDER, not taste:
+    # the entry was upserted from the request body BEFORE ingest was called, so nothing had
+    # resolved a tape at the moment the row was written, and feed is identity -- a placeholder
+    # written then and corrected later would MUTATE identity and silently merge two datasets that
+    # asked for different tapes. The FetchDataset cutover (tj-3mk3u5.10) reversed that order: the
+    # acknowledgement arrives FIRST and carries the resolved feed, so
+    # data/store/app/ingest/data_action_request.py now upserts the entry ON THE ACK with a tape
+    # that is already decided. An IEX request and a SIP request over the same window are two
+    # entries again, which is what tj-f2qz44 asked for.
+    #
+    # feed IS IDENTITY AND IS NOT AN OVERLAP TERM (tj-xn3qa6 D1), and the distinction lives one
+    # layer up: the own-overlap REFUSAL in the crud keys on this tuple MINUS feed, because "is
+    # this the same dataset" and "does this owner already hold data covering this window" are
+    # different questions. Only the first one gets feed.
+    #
+    # SO feed GOES LAST AMONG THE EQUALITY COLUMNS, immediately before the range: that is the
+    # ordering rule above applied to a column the own-overlap check does NOT filter on. The check
+    # keys on the other eight, so any position earlier in this tuple would truncate its usable
+    # index prefix at feed; here the eight it does filter on stay contiguous and leading, and feed
+    # costs that check nothing. Identity itself does not care where feed sits -- a unique
+    # constraint is order-blind -- so the index is the only thing deciding the position.
     NATURAL_KEY = (
         'asset_symbol',
         'source',
@@ -46,13 +59,16 @@ class StoreDatasetEntry(AppBase.DATA_STORE_BASE, CustomTypeTable):
         'owner',
         'expiry_type',
         'update_type',
+        'feed',
         'start',
         'end',
     )
 
-    id = Column(
-        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid(), unique=True, nullable=False
-    )
+    # NO unique=True HERE (tj-o3af47). primary_key=True already provides uniqueness; adding
+    # unique=True on top makes SQLAlchemy emit a SECOND, anonymous UNIQUE (id) that no revision
+    # ever created and no database has, so `alembic check` reports drift forever -- found by the
+    # first real run of that check, and the reason it is worth running at all.
+    id = Column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid(), nullable=False)
     # The caller's declared principal (tj-vhboky.1 section 5). NOT NULL because it is identity
     # and joins the unique constraint below -- Postgres treats NULL as distinct from NULL there,
     # so a nullable owner would silently stop the exact-repeat-returns-the-id guarantee from
@@ -66,6 +82,29 @@ class StoreDatasetEntry(AppBase.DATA_STORE_BASE, CustomTypeTable):
 
     # Data request details
     source = Column(Enum(DataSource), nullable=False)
+
+    # THE RESOLVED TAPE, never the caller's preference (tj-3mk3u5.31, closing tj-f2qz44). It is
+    # written from FetchAccepted, the one place the tape is decided (tj-3mk3u5.22 Q5);
+    # StoreAssetDatasetBody.feed is a different value with the same name and is optional, which is
+    # why AssetDatasetStoreCreate.feed overrides it as required -- read that model's docstring
+    # before touching either.
+    #
+    # NOT NULL AND NO SERVER DEFAULT, which is the "no sentinel" ruling (tj-vhboky.1 / tj-vhboky.1
+    # as restated on tj-3mk3u5.22): Feed carries no UNKNOWN member for a default to point at,
+    # because a value that should never be written is better expressed as an error than as a
+    # vocabulary member. An unresolved feed is therefore a loud failure at the boundary, not a
+    # placeholder sitting on an identity column that no later correction could rewrite. The
+    # migration that adds it DELETES every existing entry and bar rather than backfilling (user
+    # ruling, tj-3mk3u5.22 Q6).
+    #
+    # Same enum type and values_callable as the bar's column (base_market_activity.py), so both
+    # columns share one Postgres type named 'feed' and both persist the member VALUE rather than
+    # its name -- identical today, and the day a member's name stops equalling its value the two
+    # tables do not drift apart.
+    feed = Column(
+        Enum(Feed, name='feed', values_callable=lambda enum_cls: [member.value for member in enum_cls]), nullable=False
+    )
+
     asset_symbol = Column(String, nullable=False)
     asset_type = Column(Enum(AssetType), nullable=False)
     data_type = Column(Enum(DataType), nullable=False)
@@ -106,7 +145,8 @@ class StoreDatasetEntry(AppBase.DATA_STORE_BASE, CustomTypeTable):
         # owner is sensitive (tj-vhboky.41 Addendum 1, D3, M3): the marker, never the value.
         return (
             f"<StoreDatasetEntry(id='{self.id}', owner='{REDACTED}', symbol='{self.asset_symbol}', "
-            f"source='{self.source}', data_types='{self.data_type}', granularity='{self.granularity}', "
+            f"source='{self.source}', feed='{self.feed}', data_types='{self.data_type}', "
+            f"granularity='{self.granularity}', "
             f"start='{self.start}', end='{self.end}', expiry='{self.expiry}', expiry_type='{self.expiry_type}', "
             f"update_type='{self.update_type}', created_at='{self.created_at}', updated_at='{self.updated_at}')>"
         )

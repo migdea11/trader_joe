@@ -35,6 +35,8 @@ import alembic
 import pytest
 from alembic.config import Config
 
+from common.tests.image_path import image_pythonpath
+
 
 pytestmark = pytest.mark.data_store
 
@@ -55,13 +57,17 @@ def alembic_current_env() -> dict[str, str]:
 
     A wholesale replacement, not os.environ with entries removed, so a DATABASE_URI or logging
     setting in the developer's shell cannot change the result. POSTGRES_ASYNC=true mirrors the
-    data_store container CI runs the command in. PYTHONPATH puts the repo on the path, as /code
-    is in the image.
+    data_store container CI runs the command in. PYTHONPATH is the image's, the repo for /code and
+    then the generated gRPC code's root (common/tests/image_path.py, decision tj-3mk3u5.42 F1).
 
     Returns:
         dict[str, str]: Every variable the child process will see.
     """
-    return {'PYTHONPATH': str(REPO_ROOT), 'DATABASE_URI': UNREACHABLE_DATABASE_URI, 'POSTGRES_ASYNC': 'true'}
+    return {
+        'PYTHONPATH': image_pythonpath(REPO_ROOT),
+        'DATABASE_URI': UNREACHABLE_DATABASE_URI,
+        'POSTGRES_ASYNC': 'true',
+    }
 
 
 @pytest.fixture(scope='module')

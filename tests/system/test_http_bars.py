@@ -11,7 +11,7 @@ server-assigned id, created_at and updated_at populated. The unit tier only fake
 after write_transaction's commit; here the returned row is compared with the row Postgres holds.
 
 THE FILTERING READ. One module-scoped seed under a symbol of this run, bars written over HTTP:
-  * A: the run's owner, 1min, IEX bars at minutes 0-4;
+  * A: the run's owner, 1min, IEX bars at minutes 0-6;
   * B: a second owner, otherwise A's spec, SIP bars at minutes 1-3 -- so minutes 1-3 each hold
     two rows, one per dataset;
   * C: the run's owner, 5min, IEX bars at minutes 0 and 5.
@@ -39,8 +39,10 @@ from sqlalchemy.engine import Engine
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import Feed, Granularity
+from common.errors.vocabulary import Reason
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from routers.data_store.app_endpoints import AssetDataInterface
+from tests.system.problem_json import assert_problem
 
 
 pytestmark = pytest.mark.data_store
@@ -130,9 +132,17 @@ def test_single_bar_post_returns_the_stored_row_with_server_fields(
 # ---------------------------------------------------------------------------------------------
 # The filtering read (items 9 and 11).
 
-A_MINUTES = (0, 1, 2, 3, 4)
+A_MINUTES = (0, 1, 2, 3, 4, 5, 6)
 B_MINUTES = (1, 2, 3)
-C_MINUTES = (0, 5)
+C_MINUTES = (0, 5)  # 5-minute bars stay on 5-minute boundaries
+
+# The item-11 read: granularity plus an inclusive window, in minutes from the seed's start. Chosen
+# WITH the seed above so that each of the three filters removes a seeded bar the other two admit:
+# granularity removes C's minute 5, start removes A's minute 0, end removes A's minute 6. The test
+# asserts that as a precondition (tj-3mk3u5.41; tj-vhboky.14 F1 is the window that did not).
+FILTER_GRANULARITY = Granularity.ONE_MINUTE
+FILTER_FIRST_MINUTE = 1
+FILTER_LAST_MINUTE = 5
 
 
 @dataclass(frozen=True)
@@ -185,23 +195,43 @@ def _table_rows(pg_engine: Engine) -> int:
 def test_filtered_read_returns_only_the_seeded_matches_and_fewer_than_symbol_only(
     read_seed: ReadSeed, data_store, pg_engine: Engine
 ) -> None:
-    """Item 11: symbol + granularity + range returns exactly the matches, fewer than symbol-only."""
+    """Item 11: symbol + granularity + range returns exactly the matches, fewer than symbol-only.
+
+    PRECONDITION, checked before any request: each of the three filters removes at least one
+    seeded bar that the other two admit. Without that, deleting one filter from the query leaves
+    this test green -- tj-vhboky.14 F1, where the window alone already excluded every 5-minute bar
+    and the granularity predicate went unpinned. It is computed from the seed's own keys, so a
+    later edit to the seed or the window cannot vacate a filter silently.
+    """
+    start, end = read_seed.instant(FILTER_FIRST_MINUTE), read_seed.instant(FILTER_LAST_MINUTE)
+    admitted_by: dict[str, Callable[[BarKey], bool]] = {
+        'granularity': lambda key: key[3] == FILTER_GRANULARITY.value,
+        'start': lambda key: key[1] >= start,
+        'end': lambda key: key[1] <= end,
+    }
+    for name, admits in admitted_by.items():
+        others = [other for other_name, other in admitted_by.items() if other_name != name]
+        removed_by_it_alone = {
+            key for key in read_seed.every_key if all(other(key) for other in others) and not admits(key)
+        }
+        assert removed_by_it_alone, (
+            f'precondition: the {name} filter removes no seeded bar that the other two admit, so this test '
+            f'cannot see that filter dropped; re-cut read_seed or the FILTER_* window'
+        )
+
     table_rows = _table_rows(pg_engine)
     _, symbol_only = _read(data_store, {'asset_symbol': read_seed.symbol})
     _, filtered = _read(
         data_store,
         {
             'asset_symbol': read_seed.symbol,
-            'granularity': Granularity.ONE_MINUTE.value,
-            'start': read_seed.instant(1).isoformat(),
-            'end': read_seed.instant(3).isoformat(),
+            'granularity': FILTER_GRANULARITY.value,
+            'start': start.isoformat(),
+            'end': end.isoformat(),
         },
     )
-    expected = {
-        key
-        for key in read_seed.keys['a'] | read_seed.keys['b']
-        if read_seed.instant(1) <= key[1] <= read_seed.instant(3)
-    }
+    # From what the seed POSTs returned, never from the read.
+    expected = {key for key in read_seed.every_key if all(admits(key) for admits in admitted_by.values())}
     counts = (
         f'table {table_rows} rows; symbol-only {len(symbol_only)}; filtered {len(filtered)}; expected {len(expected)}'
     )
@@ -291,6 +321,20 @@ def test_malformed_read_is_422_naming_the_cause(
 ) -> None:
     response = data_store.get(READ_PATH, params=params)
 
-    assert response.status_code == 422, data_store.describe(response)
-    errors = [(error['loc'], error['type']) for error in response.json()['detail']]
+    # THE PER-FIELD ISSUES MOVED, THE PIN DID NOT (tj-3mk3u5.37.9). Before TE-6 these were
+    # FastAPI's default body, a bare LIST under `detail`; they are now the `errors` member of a
+    # problem+json envelope, with loc/msg/type unchanged. So the (loc, type) assertion below is
+    # the SAME assertion reading a new address -- it still says which field was rejected and
+    # which validator rejected it, which is the whole content of "naming the cause".
+    #
+    # The envelope is asserted too, and that is new: reason INVALID_REQUEST is what a caller
+    # branches on, and a 422 that lost its reason would still have passed the old assertion.
+    body = assert_problem(
+        response,
+        status=422,
+        reason=Reason.INVALID_REQUEST.value,
+        title='Unprocessable Entity',
+        describe=data_store.describe,
+    )
+    errors = [(error['loc'], error['type']) for error in body['errors']]
     assert errors == [(loc, error_type)], data_store.describe(response)

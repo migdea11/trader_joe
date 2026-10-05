@@ -27,7 +27,8 @@ from common.tests.compose_model import (
     service_networks,
     volume,
 )
-from common.tests.test_ci_invariants import _every_compose_file
+from common.tests.test_ci_invariants import SYSTEM_SECRET_KEYS, _every_compose_file
+from tools.agent_mcp import stack
 
 
 pytestmark = pytest.mark.build_infra
@@ -298,6 +299,38 @@ HOST_SIDE_KEY = 'initializeCommand'
 # userns_mode, security_opt, volumes_from and the like would each hand the agent the host or its daemon.
 DEVCONTAINER_AGENT_KEYS = ['build', 'working_dir', 'volumes', 'environment', 'command', 'networks']
 
+# THE AGENT SERVICE'S environment: BLOCK, EXACTLY -- every name it is allowed to carry (bead
+# tj-ix1hbl, R1; decision record tj-izzqub clause 3). DEVCONTAINER_AGENT_KEYS above stops one layer
+# ABOVE this, at the service's own keys, which is why adding a NAMED key here was green until this
+# set existed. Compared as a set, not a list: reordering the file changes nothing about what the
+# container holds, while an added or removed name is the whole point.
+DEVCONTAINER_AGENT_ENVIRONMENT_KEYS = frozenset(
+    {
+        'CLAUDE_CONFIG_DIR',
+        'BD_DISABLE_METRICS',
+        'GIT_AUTHOR_NAME',
+        'GIT_AUTHOR_EMAIL',
+        'GIT_COMMITTER_NAME',
+        'GIT_COMMITTER_EMAIL',
+        'POSTGRES_ASYNC',
+        'POSTGRES_SYNC',
+        'UV_PROJECT_ENVIRONMENT',
+        'UV_FROZEN',
+        *SYSTEM_SECRET_KEYS,
+    }
+)
+# The sentinel both credentials fall back to. Pinned as a literal because it is the string that
+# turns up in whatever authentication error a missing credential goes on to cause: it must stay
+# non-empty, and must stay unmistakable for a credential.
+AGENT_CREDENTIAL_SENTINEL = 'UNSET-start-with-make-agent-up-from-the-repo-root'
+# The broker family, from the one definition the repository already has (tools/agent_mcp/stack.py:231),
+# never respelled here -- so a third broker key added THERE is refused HERE automatically. The vendor
+# prefixes are derived from those same names, so ALPACA_ANYTHING is refused without naming 'ALPACA'.
+BROKER_FAMILY = frozenset(stack.BROKER_CREDENTIALS)
+BROKER_PREFIXES = tuple(sorted({f'{name.partition("_")[0]}_' for name in stack.BROKER_CREDENTIALS}))
+# A value that is nothing but an interpolation of ONE named variable with a literal default.
+_PURE_INTERPOLATION = re.compile(r'\$\{(\w+):-([^${}]+)\}')
+
 
 def test_the_devcontainer_holds_no_socket_no_docker_cli_and_no_docker_group():
     """Body bullet 5 and 01:43 (e): nothing under .devcontainer/ mounts the socket or installs docker.
@@ -351,6 +384,169 @@ def test_the_devcontainer_compose_service_has_exactly_todays_keys():
     )
     environment = {str(item).partition('=')[0] for item in agent['environment']}
     assert not {name for name in environment if name.startswith('DOCKER_')}, environment
+
+
+# --- tj-ix1hbl: the agent container's environment, as an exact allowed key set -------------------
+#
+# WHY THESE TESTS EXIST, since no single assertion below says it: they are what makes the credential
+# grant of tj-ywpuxx a PRECAUTION RATHER THAN A SHRUG. The user's ruling of 2026-10-04 (decision
+# record tj-izzqub addendum 1 (a)) lets this container hold exactly POSTGRES_PASS and
+# INSTANCE_WRITE_SECRET, and clause 3 of that record names the test below as the condition on which
+# the grant is bounded at all -- until it existed, clause 3 described a guard that was not there
+# (addendum 2).
+#
+# THE RISK MANAGED HERE IS NOT POSTGRES. A throwaway local database password and a dev write token
+# are what the ruling judged affordable. The risk is THIS LIST GROWING LATER, one reasonable-looking
+# line at a time, in a file whose comment blocks are long enough that an added entry reads as
+# unremarkable. So the shape is two assertions and not one:
+#   R1, the exact set, makes EVERY addition a deliberate act with a diff someone has to approve. It
+#       is widenable, on purpose -- a legitimate new key edits the set in the same commit.
+#   R2, the broker family, is the part that is NOT widenable by adding a name to a list. To defeat
+#       it someone must delete an assertion whose message says the user ruled broker keys out, which
+#       is a different act from appending a line.
+# A superset check in place of R1 would be satisfied by a file that ALSO hands over the broker keys,
+# and a prefix-family denial in place of R1 would not notice the set growing by anything else.
+
+
+def _agent_service() -> dict:
+    return load(DEVCONTAINER_COMPOSE)['services']['agent']
+
+
+def _agent_environment() -> dict[str, str]:
+    """The agent service's environment: block as {name: value-as-written}, interpolation unresolved."""
+    entries = [str(item).partition('=') for item in _agent_service()['environment']]
+    return {name: value for name, _, value in entries}
+
+
+def test_the_agent_environment_block_is_exactly_the_allowed_key_set():
+    """R1 and decision tj-izzqub clause 3: the names in agent.environment, as an EXACT set.
+
+    test_the_devcontainer_compose_service_has_exactly_todays_keys pins the service's TOP-LEVEL keys,
+    which is why an added `env_file:` reds there already. This is the layer BELOW it, which did not:
+    adding ALPACA_API_KEY to the environment block passed the whole build_infra suite before this.
+
+    Adding a key here reddens this test ON PURPOSE. Widen the set in the same diff, deliberately, or
+    do not add the key -- and read the broker assertion below before widening it.
+    """
+    entries = [str(item) for item in _agent_service()['environment']]
+    names = [entry.partition('=')[0] for entry in entries]
+    assert set(names) == DEVCONTAINER_AGENT_ENVIRONMENT_KEYS, (
+        f'.devcontainer/compose.yml agent environment keys are {sorted(names)}, not '
+        f'{sorted(DEVCONTAINER_AGENT_ENVIRONMENT_KEYS)}: this container holds exactly the key set the '
+        'user ruled on (tj-izzqub addendum 1 (a)), so an added key needs that set widened in the same, '
+        'deliberate diff'
+    )
+    assert len(names) == len(set(names)), f'a name appears twice, so a later entry overrides an earlier: {names}'
+    assert set(SYSTEM_SECRET_KEYS) == {'POSTGRES_PASS', 'INSTANCE_WRITE_SECRET'}, (
+        f'the allowed set builds its credential pair by reusing SYSTEM_SECRET_KEYS, which is now '
+        f'{sorted(SYSTEM_SECRET_KEYS)}. Reuse is right -- it is the same pair -- but it must not become a '
+        'way for this container to hold a third credential through an edit to another file. The user ruled '
+        'on exactly two (tj-izzqub addendum 1 (a))'
+    )
+    assert all('=' in entry for entry in entries), (
+        f'an environment entry with no value takes its value from the HOST environment, wholesale and '
+        f'unnamed, which is what ruling (a) refuses: {[entry for entry in entries if "=" not in entry]}'
+    )
+
+
+def test_no_broker_family_key_reaches_the_agent_container():
+    """R2: the broker exclusion as its OWN assertion, not as a consequence of the exact set above.
+
+    Ruling (d) of tj-izzqub addendum 1: "Why should the agent have keys? They should use the
+    framework API to have ingest run queries." An agent reaches a real vendor fetch by driving
+    data_ingest over devnet, never by holding a vendor key.
+
+    Keyed on the family, not on two spellings: the names come from tools/agent_mcp/stack.py's
+    BROKER_CREDENTIALS, and the vendor prefixes are derived from them, so a third broker key added
+    there is refused here with no edit. Scanned over the WHOLE service and not just the environment
+    block -- a key smuggled in through command:, build.args or a volume is the same credential.
+    """
+    assert BROKER_FAMILY and BROKER_PREFIXES, (BROKER_FAMILY, BROKER_PREFIXES)
+    widened = sorted(
+        name
+        for name in DEVCONTAINER_AGENT_ENVIRONMENT_KEYS
+        if name in BROKER_FAMILY or name.startswith(BROKER_PREFIXES)
+    )
+    assert not widened, (
+        f'the allowed key set itself was widened with broker credentials {widened}. Widening that set is '
+        'the intended way to add a legitimate key, which is exactly why this assertion reads the set too: '
+        'the broker family is the half that no widening reaches'
+    )
+    names = set(_agent_environment())
+    offenders = sorted(names & BROKER_FAMILY) + sorted(name for name in names if name.startswith(BROKER_PREFIXES))
+    assert not offenders, (
+        f'the agent container is handed broker credentials {sorted(set(offenders))}: the user ruled the '
+        'broker family out of this container entirely (tj-izzqub addendum 1 (d)). This is not an '
+        'assertion to widen -- an agent drives data_ingest over devnet instead of holding a vendor key'
+    )
+    spelled_out = json.dumps(_agent_service())
+    smuggled = sorted(name for name in BROKER_FAMILY if name in spelled_out)
+    assert not smuggled, f'the agent service names broker credentials outside its environment block: {smuggled}'
+
+
+def test_the_agent_service_loads_no_env_file_at_all():
+    """Ruling (a), by name: `env_file:` is the single edit that would silently defeat the set above.
+
+    It injects EVERY key the named file holds without naming one, which would hand this container
+    ALPACA_API_KEY and ALPACA_API_SECRET in the same stroke while the environment block still read
+    as the ruled twelve. The service's top-level key list already reds on it; this says so, so a
+    reader looking for the assertion the ruling describes finds it rather than inferring it.
+    """
+    assert 'env_file' not in _agent_service(), (
+        'the agent service loads an env_file: wholesale, which ruling (a) of tj-izzqub addendum 1 '
+        'refuses by name. The two allowed credentials are interpolated one by one, on the host'
+    )
+    code = [
+        line
+        for line in DEVCONTAINER_COMPOSE.read_text(encoding='utf-8').splitlines()
+        if line.strip() and not line.lstrip().startswith('#')
+    ]
+    offenders = [line for line in code if 'env_file' in line]
+    assert not offenders, f'.devcontainer/compose.yml names an env file outside its comments: {offenders}'
+
+
+@pytest.mark.parametrize('key', SYSTEM_SECRET_KEYS)
+def test_each_agent_credential_falls_back_to_the_sentinel_when_unset_or_empty(key: str):
+    """R4, both halves, resolved through compose_model.interpolate so the BEHAVIOUR is pinned, not the spelling.
+
+    An unset or empty value must never pass through as a set one: an empty password is a config that
+    looks like it nearly works, and compose only warns. `${VAR:-X}` fires on empty as well as unset;
+    `${VAR-X}` does not, and a bare `${VAR}` resolves to nothing at all. Both of those were green
+    before this test, and neither is visible in a diff that only widens a key set.
+
+    Not `${VAR:?}`, deliberately: that would make the devcontainer REFUSE TO START on the IDE path
+    for anyone who has not exported both secrets into the environment their IDE was launched from
+    (.devcontainer/compose.yml:140-148). The sentinel starts the container and names itself in
+    whatever authentication error it goes on to cause.
+    """
+    expression = _agent_environment()[key]
+    assert interpolate(expression, {}) == AGENT_CREDENTIAL_SENTINEL, f'{key} unset resolves to {expression!r}'
+    assert interpolate(expression, {key: ''}) == AGENT_CREDENTIAL_SENTINEL, (
+        f'{key} set to EMPTY passes through as a real value: {expression!r} needs ${{{key}:-...}}, not ${{{key}-...}}'
+    )
+    assert interpolate(expression, {key: 'a-real-dev-value'}) == 'a-real-dev-value', expression
+    assert AGENT_CREDENTIAL_SENTINEL.startswith('UNSET'), (
+        f'the fallback {AGENT_CREDENTIAL_SENTINEL!r} must stay non-empty and unmistakable for a credential'
+    )
+
+
+def test_neither_agent_credential_carries_a_literal_value():
+    """R5: both entries are pure interpolations of their own name -- no secret VALUE in this file.
+
+    Cheap, and the assertion a reader of that file will look for. `${OTHER_NAME:-...}` under one
+    key's name is refused too: the value of POSTGRES_PASS comes from POSTGRES_PASS or from the
+    sentinel, and from nowhere else.
+    """
+    environment = _agent_environment()
+    for key in SYSTEM_SECRET_KEYS:
+        value = environment[key]
+        match = _PURE_INTERPOLATION.fullmatch(value)
+        assert match, (
+            f'{key}={value!r} is not a bare ${{{key}:-<sentinel>}} interpolation: a literal secret value '
+            'must never appear in .devcontainer/compose.yml, which is committed to a public repository'
+        )
+        assert match.group(1) == key, f'{key} takes its value from {match.group(1)}, not from its own name'
+        assert match.group(2) == AGENT_CREDENTIAL_SENTINEL, f'{key} defaults to {match.group(2)!r}'
 
 
 def test_the_devcontainer_compose_defines_the_agent_alone():

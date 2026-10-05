@@ -1,0 +1,13 @@
+{
+  "provenance": {
+    "kind": "documented",
+    "note": "Documented, not recorded: a 200 whose 'bars' is JSON null. Never recorded on the multi-symbol endpoint, whose recorded empty body is {} (bars_empty_absent_symbol.json). Kept to pin that such a body is NEVER served as a window, whatever get_bars does with it (ADR tj-fa1rpu, 2026-10-02 Q-EMPTY addendum item 4; TE-5 tj-3mk3u5.37.6). INFERRED from the SDK source: alpaca-py 0.44.0 common/rest.py:395 runs 'for k, v in _get_marketdata_entries(response, no_sub_key).items()', which raises AttributeError on a null. Community corroboration only: forum thread 8954 shows bars None on the OLD single-symbol endpoint, and thread 12212 reports \"'NoneType' object has no attribute 'items'\" from get_stock_bars without a root cause.",
+    "source": "alpaca-py 0.44.0 common/rest.py:395 (inferred); https://forum.alpaca.markets/t/historical-bar-data-returns-none/8954; https://forum.alpaca.markets/t/stockhistoricaldataclient-get-stock-bars-method-returning-no-data/12212",
+    "wire_contract": "tj-3mk3u5.37.1"
+  },
+  "status": 200,
+  "body": {
+    "bars": null,
+    "next_page_token": null
+  }
+}

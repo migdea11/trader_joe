@@ -42,7 +42,8 @@ from sqlalchemy.dialects.postgresql import asyncpg as asyncpg_dialect
 from sqlalchemy.schema import CreateColumn
 
 from common.enums.data_select import AssetType, DataType
-from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateType
+from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
+from common.errors.vocabulary import ExogenousError, Reason
 from common.sensitive import REDACTED, RedactedStr
 from data.store.app.database.crud.stock import store_dataset_entry as crud
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
@@ -97,11 +98,20 @@ class _Session:
     build for it -- from the statement's asyncpg-processed parameters, which is what
     _handle_dbapi_exception hands the error -- so the error text is the real rendering, not a string
     this test wrote.
+
+    `classifiable` CHOOSES WHICH BRANCH OF write_transaction THE CASE EXERCISES (validator, gating
+    tj-3mk3u5.37.8), and the choice used to be implicit. The default builds a plain DBAPIError with
+    no SQLSTATE, which `_reason_for` cannot classify, so the helper re-raises it unchanged -- the
+    BUG branch, which is what every case in this file reached before TE-6 and still reaches. True
+    builds an OperationalError over the same real rendering, which the helper converts into a typed
+    ExogenousError -- a branch that emits a DIFFERENT ERROR line and, for the first time, puts a
+    message on the WIRE. This file's subject is that the owner reaches neither, so it needs both.
     """
 
-    def __init__(self, *results: _Result, fail_at: int | None = None):
+    def __init__(self, *results: _Result, fail_at: int | None = None, classifiable: bool = False):
         self._results = list(results)
         self._fail_at = fail_at
+        self._classifiable = classifiable
         self.statements: list = []
         self.error: sa.exc.DBAPIError | None = None
 
@@ -110,7 +120,10 @@ class _Session:
         self.statements.append(statement)
         if index == self._fail_at:
             sql, parameters = _processed(statement)
-            self.error = sa.exc.DBAPIError.instance(sql, parameters, Exception('driver failure'), Exception)
+            if self._classifiable:
+                self.error = sa.exc.OperationalError(sql, parameters, Exception('server closed the connection'))
+            else:
+                self.error = sa.exc.DBAPIError.instance(sql, parameters, Exception('driver failure'), Exception)
             raise self.error
         assert self._results, 'the crud path issued more statements than the fixture planned for'
         return self._results.pop(0)
@@ -146,6 +159,10 @@ def _create() -> AssetDatasetStoreCreate:
         data_type=DataType.MARKET_ACTIVITY,
         source=DataSource.ALPACA_API,
         granularity=Granularity.ONE_DAY,
+        # The RESOLVED tape (tj-3mk3u5.31). Required on this model, so there is nothing to omit;
+        # which member it is does not matter to anything in this file, since feed is not sensitive
+        # and binds as an ordinary enum.
+        feed=Feed.IEX,
         start=JANUARY,
         end=None,
         expiry=FEBRUARY,
@@ -167,6 +184,7 @@ def _stored(entry_id: UUID, owner: str = OWNER) -> StoreDatasetEntry:
         data_type=DataType.MARKET_ACTIVITY,
         source=DataSource.ALPACA_API,
         granularity=Granularity.ONE_DAY,
+        feed=Feed.IEX,
         start=JANUARY,
         end=MARCH,
         expiry=FEBRUARY,
@@ -314,6 +332,62 @@ async def test_the_write_error_record_formats_the_marker_and_a_neighbour_never_t
     assert REDACTED in text
     assert OWNER not in text
     assert repr(SYMBOL) in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('case', _WRITE_CASES, ids=lambda c: f'{c[0]}-{c[1]}')
+async def test_a_classified_database_failure_redacts_the_owner_in_the_log_and_omits_it_from_the_answer(
+    case: tuple[str, str], caplog: pytest.LogCaptureFixture
+):
+    """Pin 3's other branch, and the first time this file's subject reaches the WIRE.
+
+    WHY IT IS NEW (validator, gating tj-3mk3u5.37.8). Every case in this file builds a DBAPIError
+    with no SQLSTATE, which write_transaction cannot classify, so all of them take its BUG branch:
+    re-raised unchanged, logged under ``{operation} failed: {class}, SQLSTATE {code}``. TE-6 added a
+    second branch that none of them reaches -- a classifiable error is converted, logged under a
+    DIFFERENT message that also names the reason and an error_id, and, unlike a bug, is RENDERED TO
+    THE CALLER as a problem+json body. This file's whole subject is where the owner may appear, and
+    a branch that produces a new log line and a new wire message is exactly where it would next
+    appear. Nothing was asserting it.
+
+    BOTH DIRECTIONS, as Pin 3 does. The log must still carry the redaction marker and the
+    non-sensitive neighbour -- which is what keeps "OWNER not in text" from passing because nothing
+    rendered at all -- and the ANSWER must carry neither the owner nor the symbol, because the
+    detail on the converted error is a fixed sentence per reason and quotes no parameter of any
+    kind. The symbol is the sharper half of that second check: it is not secret, so its absence can
+    only mean the detail is not derived from the statement.
+
+    Args:
+        case: (the write, the statement whose execute raises).
+        caplog: Captures the single ERROR record.
+    """
+    call, before = _OWNER_BINDING_STATEMENTS[case]
+    entry_id = uuid4()
+    answers = before(entry_id)
+    db = _Session(*answers, fail_at=len(answers), classifiable=True)
+    caplog.set_level(logging.DEBUG)
+
+    with pytest.raises(ExogenousError) as raised:
+        await call(db, entry_id)
+
+    assert raised.value.reason is Reason.DATABASE_UNAVAILABLE, (
+        f'the fixture must reach the CONVERSION branch for this case to mean anything; it reported '
+        f'{raised.value.reason}'
+    )
+    (record,) = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    text = logging.Formatter('%(levelname)s %(name)s %(message)s').format(record)
+    assert '[parameters:' in text, 'the formatted traceback must include the parameters, or this is vacuous'
+    assert REDACTED in text, 'the owner is no longer redacted on the classified branch'
+    assert OWNER not in text, 'the raw owner reached the ERROR record for a classified failure'
+    assert repr(SYMBOL) in text, 'the non-sensitive neighbour is absent, so the check above may be vacuous'
+
+    # THE WIRE. The detail is what a problem+json body prints, and it is the surface no case in this
+    # file could see before TE-6.
+    assert OWNER not in raised.value.detail, 'the owner reached the detail the caller is answered with'
+    assert SYMBOL not in raised.value.detail, (
+        'the asset symbol reached the detail, so the detail is being derived from the failing '
+        'statement rather than being the fixed sentence per reason that D8 requires'
+    )
 
 
 # ---------------------------------------------------------------------------------------------

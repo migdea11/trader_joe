@@ -3,16 +3,19 @@
 HANDLES-1 (tj-irhy0a.6) replaced broker_api.get_market_stock_data with AlpacaRead.get_bars (the
 broker speaks market data) plus ingest_control.store_retrieve_stock (the platform conversion to
 the store's batch schema, decision tj-j4wknb addendum 2 B). The tests below that drove the old
-function were RE-POINTED to where each property now lives, with every assertion kept (HANDLES-2,
-tj-irhy0a.7):
+function were RE-POINTED to where each property now lives (HANDLES-2, tj-irhy0a.7), and on
+tj-3mk3u5.32 they were re-pointed a second time, off the half that is being deleted:
 
   the injected client, the vendor feed parameter, the single-flight key  -> AlpacaRead.get_bars
-  the feed stamped on the batch, a request-named tape not overriding      -> store_retrieve_stock
-  no credentials and no client failing before any call                    -> store_retrieve_stock,
-                                                                             production AlpacaRead()
+  no credentials and no client failing before any call                   -> AlpacaRead.get_bars,
+                                                                            production AlpacaRead()
 
-Where one test asserts both a vendor-side and a batch-side property, it drives store_retrieve_stock
-with a real AlpacaRead underneath, so the two halves are still asserted by one test.
+EVERY TEST HERE NOW DRIVES THE ADAPTER DIRECTLY. Four of them went through
+ingest_control.store_retrieve_stock, because that was the only caller that built a BarsQuery from a
+request; tj-3mk3u5.11 deletes it with the rest of the Kafka edge. The vendor-side property each one
+asserted survives unchanged on get_bars, which is where it always lived -- what went with the edge
+is the BATCH, and the batch's successor is the gRPC ack. Each retirement below names where its
+batch half is now pinned, so the diff can be read without the bead.
 """
 
 import importlib
@@ -29,11 +32,11 @@ from alpaca.data.enums import DataFeed
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
-from data.ingest.app import ingest_control
+from common.errors.vocabulary import Reason
 from data.ingest.app.brokers.alpaca import broker_api
 from data.ingest.app.brokers.alpaca.read import AlpacaRead
 from data.ingest.app.brokers.broker_errors import MissingCredentialsError
-from data.ingest.app.brokers.interface import BarsQuery, Instrument
+from data.ingest.app.brokers.interface import BarsFailure, BarsQuery, Instrument
 from data.ingest.app.brokers.rate_budget import RequestPriority
 from schemas.data_ingest.get_dataset_request import StockDatasetRequest
 
@@ -44,12 +47,10 @@ START = datetime(2026, 1, 2, 14, 30, tzinfo=UTC)
 
 @pytest.fixture(autouse=True)
 def no_client_leaks_between_tests():
-    """Drop any cached client and installed reader, so one test's stub is never another's vendor."""
+    """Drop any cached client, so one test's stub is never another's vendor."""
     broker_api.set_client(None)
-    ingest_control.clear_readers()
     yield
     broker_api.set_client(None)
-    ingest_control.clear_readers()
 
 
 @pytest.fixture
@@ -59,16 +60,22 @@ def executor() -> Iterator[ThreadPoolExecutor]:
         yield pool
 
 
-def install_alpaca(executor: ThreadPoolExecutor, client: Mock | None = None) -> None:
-    """Install a real AlpacaRead in the ALPACA_API slot, as the app's lifespan would.
+def alpaca_reader(executor: ThreadPoolExecutor, client: Mock | None = None) -> AlpacaRead:
+    """A real AlpacaRead over the given pool.
+
+    Replaced install_alpaca() on tj-3mk3u5.32: the reader used to be installed in the ALPACA_API
+    slot because the test then called ingest_control, which dispatched through that slot. These
+    tests call the reader directly, so the slot -- and the ingest_control machinery behind it,
+    which tj-3mk3u5.11 deletes -- is no longer in the path.
 
     Args:
         executor (ThreadPoolExecutor): Pool the vendor call runs on.
         client (Mock | None): Client to inject, or None for production's own (broker_api.get_client()).
+
+    Returns:
+        AlpacaRead: The reader.
     """
-    ingest_control.install_readers(
-        {DataSource.ALPACA_API: AlpacaRead(client=client, executor_provider=lambda: executor)}
-    )
+    return AlpacaRead(client=client, executor_provider=lambda: executor)
 
 
 def build_query(request: StockDatasetRequest) -> BarsQuery:
@@ -200,22 +207,14 @@ def test_sip_feed_is_read_at_call_time_not_at_import():
         assert broker_api.sip_enabled() is False
 
 
-@pytest.mark.asyncio
-async def test_market_data_is_fetched_through_an_injected_client(executor: ThreadPoolExecutor):
-    # The path that was unreachable before tj-84jfb9: a whole request served end to end, single
-    # flight and rate budget included, against a client that is not the vendor. Re-pointed from
-    # get_market_stock_data to store_retrieve_stock over a real AlpacaRead, so it stays END TO END:
-    # dataset_id is ingest_control's to stamp now, the bars are AlpacaRead's to fetch.
-    request = build_request()
-    client = Mock()
-    client.get_stock_bars.return_value = StubBarSet(request.asset_symbol, [build_bar(10.0), build_bar(11.0)])
-    install_alpaca(executor, client)
-
-    batch = await ingest_control.store_retrieve_stock(request)
-
-    client.get_stock_bars.assert_called_once()
-    assert [entry.data.close for entry in batch.dataset[DataType.MARKET_ACTIVITY]] == [10.0, 11.0]
-    assert batch.dataset_id == request.dataset_id
+# RETIRED ON tj-3mk3u5.32: test_market_data_is_fetched_through_an_injected_client.
+#
+# It drove store_retrieve_stock over a real AlpacaRead and asserted three things. That the injected
+# client really serves the bars is the test immediately below, which asserts it against the adapter
+# without the edge in the way. The other two were the BATCH's: that the vendor's bars arrive in it
+# in order, and that it carries the request's dataset_id for the store to correlate on. Both belong
+# to a schema tj-3mk3u5.11 deletes; their successors are the gRPC bar pages and the ack, pinned in
+# test_fetch_dataset_handler.py and common/tests/rpc/test_rpc_fetch_mapping.py.
 
 
 @pytest.mark.asyncio
@@ -236,29 +235,31 @@ async def test_an_injected_client_is_used_without_any_credentials(executor: Thre
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(('sip_enabled', 'expected'), [('false', Feed.IEX), ('true', Feed.SIP)], ids=['iex', 'sip'])
-async def test_the_resolved_feed_reaches_the_vendor_call_and_is_stamped_on_the_batch(
+async def test_the_feed_the_deployment_resolves_reaches_the_vendor_call(
     sip_enabled: str, expected: Feed, executor: ThreadPoolExecutor
 ):
-    """The scope amendment on tj-vhboky.13, both halves, against a real adapter call.
+    """The scope amendment on tj-vhboky.13: ALPACA_SIP_ENABLED decides the tape Alpaca is asked for.
 
-    RE-POINTED (tj-irhy0a.7): the vendor call is now made by AlpacaRead.get_bars and the batch is
-    now stamped by ingest_control.store_retrieve_stock from BarsResponse.feed. Driving
-    store_retrieve_stock over a real AlpacaRead reaches both sites in one call, so the two halves
-    are still asserted by one test.
+    RE-POINTED TWICE. tj-irhy0a.7 moved it onto store_retrieve_stock over a real AlpacaRead, because
+    that reached the vendor call and the batch stamp in one go. tj-3mk3u5.32 moved it onto get_bars,
+    because tj-3mk3u5.11 deletes the edge -- and the vendor call was always the adapter's.
 
-    THE TWO HALVES FAIL SEPARATELY, which is why one test asserts both. Before tj-vhboky.9,
+    THE HALF THAT WENT, and where it is now: the batch stamp. ingest_control stamped
+    BarsResponse.feed onto the batch, and without it bars from whichever tape served them were
+    stored carrying no tape at all, with ``feed`` inside the bar's identity. The gRPC ack carries
+    the resolved feed instead -- test_fetch_dataset_handler.py's
+    test_the_ack_comes_first_carrying_the_feed_the_adapter_resolved_not_the_one_the_request_named --
+    and tj-3mk3u5.31 writes it to the entry. Nothing here was its last pin.
+
+    THE HALF THAT STAYS is the one this file is for, and it fails on its own. Before tj-vhboky.9
     ``resolve_feed()`` fed the local single-flight key and nothing else: the vendor call carried no
-    ``feed`` parameter at all, so Alpaca served whatever it defaults to, and the batch went out
-    unstamped. Either half alone is a silent wrong-tape bug --
+    ``feed`` parameter, so a SIP-entitled deployment quietly received IEX bars. Both branches are
+    driven because only the pair shows the environment is read at all, rather than a constant
+    returned.
 
-      VENDOR CALL  without it, a SIP-entitled deployment quietly receives IEX bars.
-      BATCH STAMP  without it, bars from whichever tape did serve them are stored carrying no tape
-                   at all, and ``feed`` is inside the bar's identity.
-
-    The vendor value is LOWERCASE and the stamped value is the uppercase ``Feed`` member: the
-    first is alpaca-py's ``DataFeed`` wire vocabulary and the second is the stored contract. That
-    difference is asserted rather than normalised away -- collapsing them is how a vendor string
-    ends up in a column typed by the shared enum.
+    The vendor value is LOWERCASE -- alpaca-py's ``DataFeed`` wire vocabulary -- and is compared
+    against the uppercase ``Feed`` member lowered, rather than normalised away: collapsing the two
+    is how a vendor string ends up in a column typed by the shared enum.
 
     Args:
         sip_enabled: The value of ALPACA_SIP_ENABLED for this case.
@@ -268,43 +269,31 @@ async def test_the_resolved_feed_reaches_the_vendor_call_and_is_stamped_on_the_b
     request = build_request()
     client = Mock()
     client.get_stock_bars.return_value = StubBarSet(request.asset_symbol, [build_bar(10.0)])
-    install_alpaca(executor, client)
+    reader = alpaca_reader(executor, client)
 
     with patch.dict(os.environ, {'ALPACA_SIP_ENABLED': sip_enabled}):
-        batch = await ingest_control.store_retrieve_stock(request)
+        response = await reader.get_bars(build_query(request))
+        assert [bar async for bar in response.bars], 'the vendor served nothing, so no call was made to inspect'
 
-    assert batch.feed is expected
+    assert response.feed is expected, 'the adapter resolved a tape the deployment did not configure'
     sent = client.get_stock_bars.call_args.args[0]
     assert sent.feed == DataFeed(expected.value.lower())
 
 
-@pytest.mark.asyncio
-async def test_a_tape_named_by_the_request_does_not_override_the_deployment(executor: ThreadPoolExecutor):
-    """``GetDatasetRequest.feed`` is DECLARED BUT INERT, pinned where it can actually be observed.
-
-    tj-rh4b7f deferred caller-selected feed: the store has no feed to forward, so the field stays
-    on the request as the landing site for the transport work rather than as a working selection.
-    Its comment says nothing in data/ingest reads it. A comment is not a test, and the failure it
-    describes is silent -- a request naming SIP against an IEX deployment would simply be served
-    IEX with nobody told.
-
-    So this drives the request path -- store_retrieve_stock over a real AlpacaRead since
-    tj-irhy0a.6 -- with a request that explicitly names SIP, in a deployment configured for IEX,
-    and asserts IEX wins at both sites. WHEN THE DEFERRED TRANSPORT WORK LANDS, THIS IS THE TEST
-    THAT MUST FAIL, and inverting it is the deliberate act that records the field becoming live.
-    It is not a test to repair around.
-    """
-    request = build_request(feed=Feed.SIP)
-    assert request.feed is Feed.SIP, 'the request really does name the other tape'
-    client = Mock()
-    client.get_stock_bars.return_value = StubBarSet(request.asset_symbol, [build_bar(10.0)])
-    install_alpaca(executor, client)
-
-    with patch.dict(os.environ, {'ALPACA_SIP_ENABLED': 'false'}):
-        batch = await ingest_control.store_retrieve_stock(request)
-
-    assert batch.feed is Feed.IEX
-    assert client.get_stock_bars.call_args.args[0].feed == DataFeed('iex')
+# RETIRED ON tj-3mk3u5.32, and this one is not a move -- the behaviour it pinned is GONE, replaced
+# by its opposite: test_a_tape_named_by_the_request_does_not_override_the_deployment.
+#
+# It asserted that GetDatasetRequest.feed was INERT. That was never a property anyone wanted; it was
+# a consequence of ingest_control building its BarsQuery with feed=None, so a request naming SIP
+# against an IEX deployment was served IEX. tj-rh4b7f had deferred caller-selected feed, and the
+# test existed to pin the deferral where it could actually be observed. Its own docstring named
+# tj-3mk3u5.32 and tj-3mk3u5.11 as the point it retires.
+#
+# On the gRPC path the named feed DOES reach the adapter, which serves it or refuses it with
+# FEED_NOT_AVAILABLE before any vendor call (TE-4, tj-3mk3u5.37.5). Re-pointing the assertion would
+# have meant inverting it, and the inverted form already exists: test_fetch_dataset_handler.py's
+# test_the_ack_comes_first_carrying_the_feed_the_adapter_resolved_not_the_one_the_request_named,
+# with the refusal in test_typed_outcomes.py. So this is deleted rather than moved.
 
 
 class KeyRecordingSingleFlight:
@@ -391,20 +380,29 @@ async def test_two_tapes_do_not_share_one_single_flight_key(executor: ThreadPool
 
 @pytest.mark.asyncio
 async def test_a_request_without_credentials_or_a_client_fails_before_any_call(executor: ThreadPoolExecutor):
-    # Re-pointed to the request path with the PRODUCTION AlpacaRead (no client injected), so the
-    # credential is resolved by broker_api.get_client() exactly as in a deployment. The error must
-    # reach the caller by name -- store_retrieve_stock swallows every other exception into {} --
-    # and 'before any call' is observed: the single flight, the only way to the vendor, is never
-    # entered.
+    """The PRODUCTION AlpacaRead, no client injected, no credentials: it refuses before the vendor.
+
+    The reader is production's own, so the credential is resolved by broker_api.get_client() exactly
+    as in a deployment. 'Before any call' is the half that needs observing and it is observed rather
+    than inferred: the single flight is the only way to the vendor, and it is never entered.
+
+    RE-POINTED ON tj-3mk3u5.32 from store_retrieve_stock to get_bars. What changed with it is the
+    SHAPE of the refusal, not the fact of it. Since TE-4 the adapter RETURNS a BarsFailure carrying
+    a VENDOR_AUTH MissingCredentialsError; it was the Kafka edge that re-raised it by name, so that
+    an operator got the variable's name instead of an empty batch -- builder-ingest's flagged
+    deviation from 'a bare {} for ANY BarsFailure', ruled at the TE-4 gate. The edge goes on
+    tj-3mk3u5.11 and the re-raise goes with it: on the gRPC path the typed error is the reply, and
+    nothing has to be re-raised to survive the hop. So the returned form is what is asserted here.
+    """
     request = build_request()
-    install_alpaca(executor, client=None)
+    reader = alpaca_reader(executor, client=None)
     recorder = KeyRecordingSingleFlight(getattr(broker_api, '__SINGLE_FLIGHT'))
 
-    with (
-        patch.object(broker_api, '__SINGLE_FLIGHT', recorder),
-        patch.dict(os.environ, {}, clear=True),
-        pytest.raises(MissingCredentialsError),
-    ):
-        await ingest_control.store_retrieve_stock(request)
+    with patch.object(broker_api, '__SINGLE_FLIGHT', recorder), patch.dict(os.environ, {}, clear=True):
+        outcome = await reader.get_bars(build_query(request))
 
+    assert isinstance(outcome, BarsFailure), f'a missing credential produced {type(outcome).__name__}, not a refusal'
+    assert isinstance(outcome.error, MissingCredentialsError)
+    assert outcome.error.reason is Reason.VENDOR_AUTH
+    assert 'ALPACA_API_KEY' in outcome.error.detail, 'the refusal does not name the variable an operator must set'
     assert recorder.keys == [], 'a vendor call was attempted before the missing credential surfaced'

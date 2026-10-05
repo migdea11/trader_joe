@@ -303,6 +303,44 @@ def test_entry_omitted_owner_takes_the_server_default(insert_entry: Callable[...
     assert entry.owner == server_default
 
 
+def test_entry_requires_a_feed(
+    attempt: Callable[[sa.Executable], sa.exc.DBAPIError | None],
+    entry_values: Callable[..., dict[str, Any]],
+    own_symbol: str,
+    pg_engine: Engine,
+) -> None:
+    """THE OPPOSITE OF THE OWNER CASE ABOVE, and the contrast is the ruling (tj-vhboky.1 item 1).
+
+    owner is NOT NULL WITH a server default, so omitting it is legal and the default applies. feed
+    is NOT NULL with NO server default, because Feed carries no UNKNOWN member for one to point at
+    -- a value that should never be written is better expressed as an error than as a vocabulary
+    member, and feed is an identity column where no later correction could rewrite a placeholder.
+    So omitting feed must be REFUSED, and the two tests together say that the difference between
+    these columns is deliberate rather than an oversight in one of them.
+
+    ONLY POSTGRES CAN ANSWER THIS. The unit tier asserts the model declares nullable=False and the
+    revision's add_column carries no server_default; neither is evidence that the database refuses
+    the insert. This is the tier that is (tj-vhboky.14).
+
+    It is also what makes this bug's fix non-vacuous: entry_values now supplies feed, and without a
+    case that deliberately omits it, nothing would notice if the column quietly became nullable
+    again -- every other test would simply keep passing.
+    """
+    statement = sa.insert(ENTRY_TABLE).values(entry_values(asset_symbol=own_symbol, omit=('feed',)))
+    compiled = statement.compile(dialect=pg_engine.dialect)
+    assert 'feed' not in compiled.params, 'the statement still binds a feed, so nothing about NOT NULL is tested'
+
+    error = attempt(statement)
+    if error is None:
+        # The row should not exist; remove it so the session cleanup check is not what reports it.
+        with pg_engine.begin() as conn:
+            conn.execute(sa.delete(ENTRY_TABLE).where(ENTRY_TABLE.c.asset_symbol == own_symbol))
+        pytest.fail('an entry with no feed COMMITTED: feed is nullable or has a server default on this database')
+
+    diag = _assert_refused(error, SQLSTATE_NOT_NULL_VIOLATION)
+    assert diag.column_name == 'feed'
+
+
 # ---------------------------------------------------------------------------------------------
 # The entry identity constraint.
 
@@ -332,6 +370,12 @@ ENTRY_KEY_VARIANTS: dict[str, Callable[[dict[str, Any]], Any]] = {
     'owner': lambda base: f'{base["owner"]}-variant',
     'expiry_type': lambda base: _other_int_member(ExpiryType, base['expiry_type']),
     'update_type': lambda base: _other_int_member(UpdateType, base['update_type']),
+    # feed joined the entry's identity in c4a1f7b2e905 (tj-3mk3u5.31, closing tj-f2qz44), and this
+    # case is the live-database half of that bug's criterion: an IEX request and a SIP request over
+    # the same window are two entries. The unit tier asserts the STATEMENT names eleven columns
+    # (data/store/tests/test_dataset_entry_identity.py); only here does Postgres actually accept
+    # the second row rather than folding it onto the first.
+    'feed': lambda base: _other_member(base['feed']),
     'start': lambda base: base['start'] - timedelta(days=1),
     'end': lambda base: base['end'] + timedelta(days=1),
 }

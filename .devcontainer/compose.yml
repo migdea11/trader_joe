@@ -81,12 +81,79 @@ services:
       # root, so each agent worktree keeps its own. The Makefile's VENV_DIR reads this same
       # variable, so its sync marker follows it. Ignored in .gitignore, .dockerignore and ruff.
       - UV_PROJECT_ENVIRONMENT=.venv-devcontainer
+
+      # THE THIRD PATH TO AN ACCIDENTAL RE-LOCK, and the last one open. tj-3zh7ss closed the other
+      # two: the Makefile exports UV_FROZEN=1 (line 38) and CI sets it at workflow level. Neither
+      # reaches a bare `uv run` or `uv sync` TYPED IN THIS SHELL, which would re-resolve and rewrite
+      # uv.lock -- and the damage surfaces far from its cause, as a sync that quietly drops a
+      # dependency group (a stale lock is what made `make security` fail with bandit missing, and
+      # what reddened four test_security_make cases whose output named neither uv nor the lock).
+      #
+      # HERE RATHER THAN IN devcontainer.json: containerEnv/remoteEnv are applied only by the Dev
+      # Containers CLI or an IDE, while this file is what `make agent-build` reads, so a value set
+      # there would be absent from exactly the shells the agents use. NOT the Dockerfile: ENV would
+      # bake it into the image, and tj-qenrpk is reviewing that file in this same PR.
+      #
+      # `make lock` is unaffected and must stay so: it is the one deliberate re-lock and runs
+      # `env -u UV_FROZEN uv lock` (Makefile:119), which strips this for that command only.
+      - UV_FROZEN=1
+
+      # THE TWO DEV CREDENTIALS THIS CONTAINER IS ALLOWED TO HOLD, AND NOTHING ELSE. The user's
+      # ruling of 2026-10-04, decision record tj-izzqub addendum 1 (a): exactly POSTGRES_PASS and
+      # INSTANCE_WRITE_SECRET, each named on its own line below. NEVER an `env_file:` entry on
+      # this service pointing at the repo root's file -- env_file injects every key the file holds
+      # without naming one, which would hand this container ALPACA_API_KEY and ALPACA_API_SECRET
+      # in the same stroke. Ruling (d) of the same addendum keeps those out: "Why should the agent
+      # have keys? They should use the framework API to have ingest run queries." An agent reaches
+      # a real vendor fetch by driving data_ingest over devnet, never by holding a vendor key.
+      #
+      # WHAT THEY REACH, and what they are worth. The DEV stack, over devnet, by service name: a
+      # disposable local Postgres and a dev instance write token. A prod deployment never builds
+      # this container -- nothing in docker-compose.yaml or the prod-* targets reads this file --
+      # so no prod value can arrive here. These exist for ad-hoc troubleshooting against the
+      # user's own running dev stack; anything reproducible belongs in the system suite instead,
+      # which the agent-stack MCP already runs credential-free (tj-izzqub clause 1).
+      # THE COST, STATED RATHER THAN IMPLIED: an agent holding these can print them and echo them
+      # into a note, a commit message or a transcript, and this repository is public. The bet is
+      # that a throwaway local database password and a dev write token are worth that. The log
+      # redaction elsewhere in this repo covers log records, not agent output, and does not help.
+      #
+      # THE ALLOWED KEY SET IS PINNED BY A TEST (bead tj-ix1hbl, with the other build_infra guards
+      # that already read this file). The risk it manages is not Postgres; it is this list growing
+      # later, one reasonable-looking line at a time, in a file whose comment blocks are long
+      # enough that an added entry reads as unremarkable. Adding a key here reddens that test ON
+      # PURPOSE: widen it in the same diff, deliberately, or do not add the key.
+      #
+      # HOW THE VALUES REACH COMPOSE -- the part that breaks silently. Compose takes its project
+      # directory from the FIRST compose file's directory, which is `.devcontainer` on every path
+      # into this file, including `make agent-up`, which runs from the repo root. So the env file
+      # compose reads by default is `.devcontainer/.env` and NOT the repo root's `.env`, where
+      # these two values live.
+      #   make path: the Makefile's AGENT_COMPOSE names the root file explicitly with --env-file,
+      #     as an absolute path, falling back to /dev/null on a checkout that has no root .env.
+      #   IDE path: the IDE runs compose in its own environment and devcontainer.json cannot add a
+      #     flag to that invocation -- the same asymmetry the AGENT_MCP_SHARE_PATH block above
+      #     records. There each value comes from the IDE's own environment or from nowhere.
+      # INTERPOLATION HAPPENS ON THE HOST. Nothing inside this container reads the root .env, and
+      # nothing here is a way to get at the rest of it: only these two names are substituted.
+      #
+      # WHY A SENTINEL DEFAULT AND NOT `${...:?}`. An unset or empty value must never pass as a
+      # set one -- an empty password is a config that looks like it nearly works, and compose only
+      # warns. A `:?` guard is louder, and it is this repo's idiom elsewhere, but here it would
+      # make the devcontainer REFUSE TO START on the IDE path for anyone who has not exported both
+      # secrets into the environment their IDE was launched from, which is a worse place to keep a
+      # secret than .env, and unstartable for a contributor with no dev stack at all. Nothing else
+      # in this container depends on these two, so a hard stop is out of proportion to what is
+      # missing. The sentinel starts the container, cannot be mistaken for a credential, and names
+      # itself in whatever authentication error it goes on to cause.
+      - POSTGRES_PASS=${POSTGRES_PASS:-UNSET-start-with-make-agent-up-from-the-repo-root}
+      - INSTANCE_WRITE_SECRET=${INSTANCE_WRITE_SECRET:-UNSET-start-with-make-agent-up-from-the-repo-root}
     command: ["sleep", "infinity"]
     networks:
       # default keeps this project's own network, and with it the agent's own egress.
       # devnet is dev reach (decision record tj-q9ae5u, addendum 1): the dev stack joins it through
       # docker-compose.override.yaml, so from here postgres (or its container name,
-      # DATABASE_NAME), kafka, data_store and data_ingest resolve by name. A prod launch never
+      # DATABASE_NAME), data_store and data_ingest resolve by name. A prod launch never
       # attaches devnet, so this reaches no prod stack on the same machine. The agent has no
       # Docker -- no socket, no CLI -- so this is for reaching services by name, not for running
       # the system suite.

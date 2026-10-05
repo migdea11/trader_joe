@@ -14,12 +14,17 @@ Fixture files live in fixtures/alpaca/ as JSON: {"provenance": {...}, "status": 
 Most were RECORDED from Alpaca at the host sitting (tj-irhy0a.3; FAKES-4 tj-irhy0a.13); the few
 that cannot be provoked stay DOCUMENTED from research tj-vhboky.57. fixtures/alpaca/README.md says
 which is which.
+
+RESPONSE HEADERS (TE-5 tj-3mk3u5.37.6). A response can carry headers beside its Content-Type, so a
+429 can be answered with or without X-RateLimit-Reset or Retry-After. No fixture records any: the
+recorder writes no header (README, Re-recording), and which ones a real 429 sends is unknown. A
+test that needs one attaches it with with_headers(), and says so.
 """
 
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from http import HTTPStatus
 from itertools import pairwise
@@ -63,12 +68,15 @@ class RecordedResponse:
         status (int): HTTP status code.
         body (Any): Decoded JSON body.
         provenance (Mapping[str, Any]): Where the body came from ('documented' or 'recorded').
+        headers (Mapping[str, str]): Response headers beside Content-Type, such as a 429's
+            X-RateLimit-Reset or Retry-After. None recorded; see with_headers().
     """
 
     name: str
     status: int
     body: Any
     provenance: Mapping[str, Any] = field(default_factory=dict)
+    headers: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def bars(self) -> list[dict]:
@@ -142,7 +150,20 @@ def load(name: str) -> RecordedResponse:
         RecordedResponse: The fixture.
     """
     raw = json.loads((FIXTURES_DIR / f'{name}.json').read_text())
-    return RecordedResponse(name=name, status=raw['status'], body=raw['body'], provenance=raw.get('provenance', {}))
+    return RecordedResponse(
+        name=name,
+        status=raw['status'],
+        body=raw['body'],
+        provenance=raw.get('provenance', {}),
+        headers=raw.get('headers', {}),
+    )
+
+
+def with_headers(response: RecordedResponse, headers: Mapping[str, str]) -> RecordedResponse:
+    """The same response, answering with these headers too: constructed, never recorded."""
+    return replace(
+        response, name=f'{response.name}[headers={sorted(headers)}]', headers={**response.headers, **headers}
+    )
 
 
 def always(response: RecordedResponse) -> Responder:
@@ -215,7 +236,7 @@ class RecordedTransport(BaseAdapter):
         response.status_code = recorded.status
         response.reason = HTTPStatus(recorded.status).phrase
         response._content = json.dumps(recorded.body).encode()
-        response.headers = CaseInsensitiveDict({'Content-Type': 'application/json'})
+        response.headers = CaseInsensitiveDict({'Content-Type': 'application/json', **recorded.headers})
         response.encoding = 'utf-8'
         response.url = request.url
         response.request = request

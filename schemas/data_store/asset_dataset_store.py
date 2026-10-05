@@ -4,6 +4,7 @@ from uuid import UUID
 
 from pydantic import (
     AwareDatetime,
+    BaseModel,
     ConfigDict,
     Field,
     WithJsonSchema,
@@ -13,7 +14,7 @@ from pydantic import (
 )
 
 from common.enums.data_select import AssetType, DataType
-from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateType
+from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from common.enums.pydantic_enums import NamedIntEnum
 from common.logging import get_logger
 from common.sensitive import OptionalSensitiveStr, SensitiveStr
@@ -41,8 +42,10 @@ def _member_names_schema(enum: type[NamedIntEnum]) -> WithJsonSchema:
 # contradicts both the wire (serialize_enum_name below sends names) and the documented default
 # ('BULK' is not in [1..5]). Schema only: validation and serialization are untouched, so the wire
 # bytes do not change and NamedIntEnum.validate still accepts an integer, undocumented.
-# FIELD-LOCAL, NOT A HOOK ON NamedIntEnum: GetDatasetRequest (schemas/data_ingest) carries these
-# same enums as integers on the Kafka wire, so a class-level schema would make that model lie.
+# FIELD-LOCAL, NOT A HOOK ON NamedIntEnum: GetDatasetRequest (schemas/data_ingest) still declares
+# these same enums as plain integers, so a class-level schema would make that model lie. Its Kafka
+# transport went on tj-3mk3u5.14 and it has no non-test importer left, but the model is still in
+# the tree and so is the reason this annotation is per field rather than on the enum class.
 ExpiryTypeByName = Annotated[ExpiryType, _member_names_schema(ExpiryType)]
 UpdateTypeByName = Annotated[UpdateType, _member_names_schema(UpdateType)]
 
@@ -50,7 +53,9 @@ UpdateTypeByName = Annotated[UpdateType, _member_names_schema(UpdateType)]
 class StoreAssetDatasetBody(InboundContract):
     """The fields a caller supplies to ask for a dataset.
 
-    EVERY FIELD HERE IS IDENTITY (tj-vhboky.1 section 2). Two requests name the same dataset only
+    EVERY FIELD HERE IS IDENTITY (tj-vhboky.1 section 2) WITH ONE NAMED EXCEPTION, feed, which is
+    a preference rather than a value written -- see its own paragraph below. Two requests name the
+    same dataset only
     if they agree on all of owner, asset_symbol, asset_type, data_type, source, granularity,
     expiry_type, update_type, start and end -- the range included. They back a UNIQUE constraint,
     which is why the policy fields below are NOT optional: Postgres treats NULL as distinct from
@@ -58,24 +63,25 @@ class StoreAssetDatasetBody(InboundContract):
     column, the ON CONFLICT would never fire against it, and "an exact repeat returns the existing
     id" would silently become "an exact repeat creates a second row".
 
-    THERE IS DELIBERATELY NO feed FIELD HERE, though an earlier version of this model carried one
-    as `Feed | None = None`. tj-rh4b7f (2026-09-25) DEFERRED both the entry's feed column and feed
-    as an accepted create-request field to the gRPC transport work. The reason is write order, not
-    taste: data/store/app/ingest/data_action_request.py upserts the entry FROM THIS BODY and only
-    then calls ingest, so at the moment the entry row is written nothing has resolved a feed yet --
-    and feed is identity, so a placeholder written now and corrected later would MUTATE identity
-    and silently merge two datasets that asked for different tapes. Deferring costs nothing today:
-    no caller can select a feed, because there is exactly one feed per deployment and the ingest
-    adapter alone decides it.
+    feed IS THE ONE FIELD HERE THAT IS NOT IDENTITY, which is why it is the one optional field
+    among them. It is the CALLER'S PREFERENCE, never the value stored: absent means "the deployment
+    decides", and a named tape means "this tape, or a refused ack" -- ingest resolves the tape it is
+    entitled to and can only CHECK a named feed against it, never be steered by one (tj-3mk3u5.22
+    Q5). The value that IS stored is a DIFFERENT VALUE WITH THE SAME NAME: the RESOLVED feed, which
+    arrives on FetchAccepted and is declared, required, on AssetDatasetStoreCreate below. Read that
+    model's docstring before touching either field; conflating the two is the defect this pair of
+    declarations exists to keep apart.
 
-    THE FIELD ALSO HAD TO GO FOR A MORE IMMEDIATE REASON, AND IT IS THE QUIET KIND. StoreDatasetEntry
-    has no feed column, and upsert_entry builds its values through AppBase.get_fields, which
-    enumerates __table__.columns and keeps only schema attributes that match one
-    (common/database/sql_alchemy_table.py, _get_columns). A field the table does not have matches
-    neither branch and falls out with no else, no warning and no log -- so a caller that named a
-    tape got a 200 and an entry that silently did not record it. Not a crash: a wrong answer,
-    which is why leaving the field in place until the transport work would have been worse than
-    removing it. See tj-rh4b7f for the full reasoning and for where feed comes back.
+    THE FIELD IS ACCEPTED NOW BECAUSE THE WRITE ORDER FINALLY ALLOWS IT. tj-rh4b7f (2026-09-25)
+    deferred both the entry's feed column and feed as an accepted create-request field to the gRPC
+    transport work, and the reason was write order rather than taste: data/store upserted the entry
+    FROM THIS BODY and only then called ingest, so at the moment the row was written nothing had
+    resolved a feed -- and feed is identity, so a placeholder written then and corrected later would
+    MUTATE identity and silently merge two datasets that asked for different tapes. The FetchDataset
+    cutover (tj-3mk3u5.10) reversed that order: the acknowledgement arrives FIRST and carries the
+    resolved feed, early enough to write it, so the entry is written with a tape that is already
+    decided and never with a placeholder. The entry's own column, its migration and the crud that
+    writes it from the ack are tj-3mk3u5.31, which is blocked on this task so the two land in order.
     """
 
     # The caller's declared principal. NO DEFAULT, because it is identity: a default principal
@@ -90,6 +96,22 @@ class StoreAssetDatasetBody(InboundContract):
     owner: SensitiveStr
 
     source: DataSource
+
+    # The caller's OPTIONAL tape preference, directly below source because the two answer adjacent
+    # questions: source names the VENDOR we ask, feed names the TAPE the answer comes from, and one
+    # vendor can resell several (common/enums/data_stock.py). None is not "unknown" and not a
+    # sentinel -- it is a real, ordinary request meaning "the deployment decides", and it is the
+    # value almost every caller sends, because there is normally one feed per deployment.
+    #
+    # NOT the value written to the entry. AssetDatasetStoreCreate.feed is, and it is required; this
+    # one is a preference the ack either honours or refuses. See both docstrings.
+    #
+    # ENUM NAMES ON THE WIRE COST NOTHING HERE, unlike expiry_type and update_type below. Feed is a
+    # str enum whose value IS its member name, so pydantic already documents it as a string enum of
+    # those names and already serialises the name; ExpiryType and UpdateType are NamedIntEnum, which
+    # is the whole reason ExpiryTypeByName and serialize_enum_name exist. Adding feed to that
+    # serializer would be a no-op that implied the opposite about this field's wire form.
+    feed: Feed | None = None
 
     granularity: Granularity
     # REQUIRED, and no sentinel (tj-vhboky.1, ruling closing open question 2). An open start would
@@ -180,12 +202,18 @@ class StoreAssetDatasetQuery(InboundContract):
     # `SensitiveStr | None`, which silently keeps the value in the repr (common/sensitive.py).
     owner: OptionalSensitiveStr = None
     source: DataSource | None = None
-    # No feed filter, for the same reason the body has no feed field: there is no feed column on
-    # store_dataset_entry to filter (tj-rh4b7f). Here it was not merely inert, it was a live
-    # AttributeError -- search_entries loops this model's model_dump() and calls
-    # getattr(StoreDatasetEntry, column) for every value that is not None
-    # (data/store/app/database/crud/stock/store_dataset_entry.py), so any search that actually
-    # named a tape raised rather than filtered.
+    # An optional feed FILTER, which is what "feed on the entry" means on the read side: having
+    # recorded which tape served a dataset, a caller must be able to ask for one. Optional for the
+    # same reason every filter here is -- absent means "no constraint on that column" -- and the
+    # body's reasoning about identity does not apply, because nothing here is written.
+    #
+    # IT NEEDS THE COLUMN TO EXIST, AND THE COLUMN IS tj-3mk3u5.31's. search_entries loops this
+    # model's model_dump() and calls getattr(StoreDatasetEntry, column) for every value that is not
+    # None (data/store/app/database/crud/stock/store_dataset_entry.py), so a filter with no column
+    # behind it is not inert, it is a live AttributeError on any search that names a tape -- which
+    # is why this field was removed under tj-rh4b7f rather than left declared. .31 is blocked on
+    # this task precisely so the column lands immediately after the filter it answers.
+    feed: Feed | None = None
     granularity: Granularity | None = None
     # AwareDatetime on every time bound, and REFUSE, not convert (user ruling D2 = A on
     # tj-vhboky.20, the tj-1bl90i rule applied to the read side). These are compared against
@@ -218,7 +246,27 @@ class StoreAssetDatasetQuery(InboundContract):
 
 
 class AssetDatasetStoreCreate(StoreAssetDatasetPath, StoreAssetDatasetBody):
-    pass
+    """The entry as it is WRITTEN: the caller's body, the path, and the tape that was resolved.
+
+    THIS MODEL'S feed AND THE BODY'S ARE TWO DIFFERENT VALUES THAT SHARE A NAME, and keeping them
+    apart is the point of declaring it twice. StoreAssetDatasetBody.feed is what the CALLER asked
+    for and may be absent. This one is the RESOLVED feed, read off FetchAccepted -- the single value
+    only ingest may decide (tj-3mk3u5.22 Q5) -- and it is what the entry row records. Building this
+    model by passing the body's feed straight through would write a preference where a resolution
+    belongs, and on an identity column, so the two would be indistinguishable afterwards.
+
+    THE OVERRIDE IS DELIBERATE: the inherited field is `Feed | None = None` and this one is
+    required, so a value that was never resolved cannot reach the write by being forgotten. There
+    is no sentinel to fall back on either -- Feed carries no UNKNOWN member (tj-vhboky.1, ruling of
+    2026-09-25) -- so an unresolved feed is a loud failure at the boundary rather than a placeholder
+    on an identity column that no later correction could rewrite.
+
+    feed JOINS THE ENTRY'S IDENTITY once the column exists (tj-3mk3u5.31): two datasets that asked
+    for the same window on different tapes are different datasets, which is the same reasoning that
+    put feed on the bar's natural key (tj-u12tjo.11).
+    """
+
+    feed: Feed
 
 
 class AssetDatasetStoreUpdate(AssetDatasetStoreCreate):
@@ -269,6 +317,12 @@ class AssetDatasetStoreDelete(InboundContract):
 
 
 class AssetDatasetStore(AssetDatasetStoreUpdate):
+    # feed IS HERE, REQUIRED, BY INHERITANCE FROM AssetDatasetStoreCreate, and that is a reported
+    # value rather than a requested one: this model reads the entry's NOT NULL feed column back, so
+    # the required declaration is what makes it report the tape the row actually holds. Not
+    # redeclared, because there is nothing to change -- an optional one here would answer None for
+    # a column that always has a value, which is the removed UNKNOWN sentinel under a new name
+    # (the same reasoning AssetData.feed carries for the bar, tj-5dvgaa).
     id: UUID
 
     item_count: int
@@ -281,3 +335,60 @@ class AssetDatasetStore(AssetDatasetStoreUpdate):
     # harmless here: with from_attributes the validator only ever looks up declared field names
     # on the ORM row, so there is no extra for it to reject.
     model_config = ConfigDict(from_attributes=True)
+
+
+class ServedRange(BaseModel):
+    """The window the vendor ACTUALLY ANSWERED FOR, which is not the window that was asked for.
+
+    ADR tj-fa1rpu D2: a SERVED outcome carries its own provenance. A vendor that holds only part of
+    the requested range answers for that part, so these bounds can be NARROWER than the request's
+    start and end, and comparing the two field by field is how a caller learns what it did not get.
+    The range is never widened and never recomputed here: data_store copies it unchanged from the
+    fetch's FetchDone (schemas/data_ingest/fetch_dataset.py, tj-3mk3u5.27).
+
+    THE BOUNDS MEAN WHAT THE REQUEST'S OWN BOUNDS MEAN -- start inclusive, end exclusive -- so the
+    two are comparable without a convention lookup (data/ingest/app/brokers/interface.py documents
+    the same for the requested range).
+
+    end IS NEVER NULL, though StoreAssetDatasetBody.end may be. An open request end means "up to
+    whatever is current", and the fetch clamps it: end = min(requested end, as_of), with an open end
+    served as as_of. So "open" is a property of the REQUEST only; the answer always names an instant.
+
+    VALUES ARRIVE IN UTC AND ARE AWARE, ALWAYS. The model itself carries whatever offset it is
+    handed, but in production these bounds have crossed the internal gRPC hop as a
+    google.protobuf.Timestamp, which has no offset to carry (tj-3mk3u5.22 Q4), so what a client
+    receives is the right instant expressed in UTC rather than the offset it happened to send:
+    a start sent as '2026-01-01T00:00:00-05:00' comes back as '2026-01-01T05:00:00Z'. COMPARE THESE
+    AS INSTANTS, NEVER AS STRINGS. AwareDatetime REFUSES a naive value rather than guessing a zone
+    for it, the tj-1bl90i rule, which is what makes "an instant" true of every value here.
+    """
+
+    start: AwareDatetime
+    end: AwareDatetime
+
+
+class StoreAssetDatasetResponse(BaseModel):
+    """What POST /store/{asset_type}/{data_type}/{asset_symbol} answers with on success.
+
+    THIS EXISTS SO served_range IS VISIBLE TO A GENERATED CLIENT. The route used to return an
+    undeclared dict, and the interface manifest recorded its response as '-'; a member added to an
+    undeclared dict is absent from OpenAPI and therefore from every client generated out of it. The
+    user ruled on 2026-10-02 that served_range is exposed in PR 2 precisely so a SERVED-BUT-EMPTY
+    answer -- a misspelled symbol among them (tj-lldllr) -- reaches the caller rather than only an
+    INFO line in our logs. Declaring the model is what makes that exposure real.
+
+    message and data_points keep today's keys and today's meaning, so the only wire change is one
+    added member: D2 applied at the edge, additive. Every 200 from the route carries served_range,
+    including the empty window where data_points is 0; a failure is problem+json and carries none.
+
+    A MODEL OF ITS OWN, NOT A RE-EXPORT of the internal FetchDone (tj-3mk3u5.27). This response is
+    public and the gRPC hop it draws from is internal, so a re-export would let an internal change
+    move the public contract silently. The semantics are kept in step by hand, deliberately.
+
+    NO as_of, by user ruling of 2026-10-02 04:54 UTC: the ruling names served_range only, and a
+    client that wants the vendor's answer time can query the data for it.
+    """
+
+    message: str
+    data_points: int
+    served_range: ServedRange

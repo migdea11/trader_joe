@@ -33,18 +33,30 @@ from data.store.app.database.models.stock_market_activity import StockMarketActi
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / 'migrations'
 
-# TWO REVISIONS, TWO NAMES, and the distinction is the whole reason this file went red at
-# eec8f88a7443 (tj-1njw7c). NATURAL_KEY_REVISION is the revision most of this file INSPECTS --
-# the archive/row-move machinery below exists only there. HEAD_REVISION is the current head, and
-# the only revision whose constants may be compared against the model. Swapping the one constant
-# would have re-pointed all seven of the archive tests at a revision that has no archive.
+# THREE REVISIONS, THREE NAMES, and the distinction is the whole reason this file went red at
+# eec8f88a7443 (tj-1njw7c) and again at c4a1f7b2e905 (tj-3mk3u5.31).
+#
+# NATURAL_KEY_REVISION is the revision most of this file INSPECTS -- the archive/row-move
+# machinery below exists only there. Swapping that one constant would re-point all seven archive
+# tests at a revision that has no archive.
+#
+# BAR_IDENTITY_REVISION is the last revision to touch the BAR, which is this file's subject, so it
+# is the one whose constants may be compared against BaseMarketActivity and StockMarketActivity.
+# It was ALSO the head until tj-3mk3u5.31, which is why it used to be called HEAD_REVISION; the
+# rename is the point. c4a1f7b2e905 touches the ENTRY only, so nothing about the bar moved under
+# it and every comparison below still belongs to this revision.
+#
+# CURRENT_HEAD is the head and is used by exactly one test, the single-head pin at the bottom.
+# data/store/tests/test_head_revision_shape.py owns the entry half of the head's agreement with
+# its model.
 NATURAL_KEY_REVISION = '8f41c2d7a3b9'
-HEAD_REVISION = 'eec8f88a7443'
+BAR_IDENTITY_REVISION = 'eec8f88a7443'
+CURRENT_HEAD = 'c4a1f7b2e905'
 
 # The natural key as 8f41c2d7a3b9 itself declares it, written out as a HISTORIC LITERAL rather
 # than read off BaseMarketActivity. A past revision's job is to describe the schema as it was;
 # comparing it against today's model asserts that history does not change, which is the opposite
-# of what is wanted. The model is compared against HEAD_REVISION instead, below.
+# of what is wanted. The model is compared against BAR_IDENTITY_REVISION instead, below.
 HISTORIC_BAR_NATURAL_KEY = ('asset_symbol', 'source', 'granularity', 'timestamp')
 
 # Columns the upsert is allowed to leave alone: the surrogate key, the natural key itself,
@@ -99,7 +111,7 @@ def natural_key_migration():
 
 @pytest.fixture
 def head_migration():
-    return _load_revision(HEAD_REVISION, f'{HEAD_REVISION}_per_dataset_identity_and_feed.py')
+    return _load_revision(BAR_IDENTITY_REVISION, f'{BAR_IDENTITY_REVISION}_per_dataset_identity_and_feed.py')
 
 
 def _run_migration(migration: Any, direction: str, scalar_results: list[Any]) -> MagicMock:
@@ -493,10 +505,12 @@ def test_the_named_head_is_the_current_revision():
     """Separate from the count above, and separate on purpose.
 
     Worth pinning because every other constant in this file is chosen relative to which revision
-    is live -- but a new revision makes this one line go red and nothing else, which is a
-    one-line edit rather than a hunt through seven archive tests.
+    is live -- but a new revision makes this one line go red and nothing else, which is a one-line
+    edit rather than a hunt through seven archive tests. It did exactly that when tj-3mk3u5.31
+    landed c4a1f7b2e905, which is the evidence the design worked: the one line, and no other test
+    in this file, had to change.
     """
-    assert list(ScriptDirectory(str(MIGRATIONS_DIR)).get_heads()) == [HEAD_REVISION]
+    assert list(ScriptDirectory(str(MIGRATIONS_DIR)).get_heads()) == [CURRENT_HEAD]
 
 
 @pytest.mark.parametrize('column', ['expiry_type', 'update_type'])

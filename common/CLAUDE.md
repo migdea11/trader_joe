@@ -1,6 +1,6 @@
 # Shared library
 
-Shared library imported by both services: Kafka producer/consumer and the hand-written RPC layer, the topic registry, the Postgres session factory, custom SQLAlchemy types, and env/logging/worker-pool helpers.
+Shared library imported by both services: the gRPC channel, server and client layer (`common/rpc`), the shared error vocabulary (`common/errors`), the Postgres session factory, custom SQLAlchemy types, and env/logging/worker-pool helpers.
 
 ## Architecture reference
 
@@ -8,11 +8,14 @@ Shared library imported by both services: Kafka producer/consumer and the hand-w
 
 ## Tech stack
 
-Kafka producer/consumer and hand-written Kafka RPC, Postgres session factory, custom SQLAlchemy types, env/logging/worker pool
+`grpc.aio` and protobuf (contracts in `proto/`, generated code committed under `gen/`), Postgres session factory, custom SQLAlchemy types, shared error vocabulary, env/logging/worker pool
 
 ## Key invariants
 
-Changing anything here affects both services. The Kafka topic registry is the inter-service contract.
+Changing anything here affects both services. The `.proto` files under `proto/` are the inter-service
+contract: they are the source of truth, the Python stubs under `gen/` are generated from them and
+committed, and a staleness check fails the build when the two disagree. Change the `.proto` and
+regenerate — never hand-edit anything under `gen/`.
 
 ## Environment variables
 

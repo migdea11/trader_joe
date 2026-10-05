@@ -51,23 +51,3 @@ class Timer:
         """Reset all timers, and running total."""
         self.start = {}
         self._duration = 0
-
-
-def timeit(timer: Timer):
-    """Decorator to measure the time taken for a function to execute.
-
-    Args:
-        timer (Timer): Timer instance to use.
-    """
-
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            # Use the provided Timer instance
-            key = timer.tick()
-            result = func(*args, **kwargs)
-            timer.tock(key)
-            return result
-
-        return wrapper
-
-    return decorator

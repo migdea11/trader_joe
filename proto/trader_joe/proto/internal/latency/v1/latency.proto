@@ -1,0 +1,21 @@
+// MEASUREMENT TOOLING, NOT A DATA CONTRACT (tj-3mk3u5.8). The latency harness's gRPC arm
+// (routers/common/latency.py): data_store sends a payload, data_ingest acknowledges it, and the
+// harness times each round trip beside its REST and Kafka-RPC arms. Internal: both ends deploy
+// together and nothing outside this repository calls it, so it may break freely. Only
+// common/rpc/latency.py touches the generated code.
+syntax = "proto3";
+
+package trader_joe.proto.internal.latency.v1;
+
+// Acknowledges a probe without reading its payload.
+service LatencyService {
+  rpc Probe(ProbeRequest) returns (ProbeResponse);
+}
+
+// The same payload the REST and Kafka-RPC arms send: payload_size KB of random bytes, hex-encoded.
+message ProbeRequest {
+  string payload = 1;
+}
+
+// Empty: a probe that returns at all was acknowledged; a failure is the call's gRPC status.
+message ProbeResponse {}

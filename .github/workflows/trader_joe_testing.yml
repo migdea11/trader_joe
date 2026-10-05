@@ -76,7 +76,7 @@ env:
   # uv warns, then asserts the lock is current, so a stale lock still fails the job. Matches the
   # Makefile's exported UV_FROZEN.
   UV_FROZEN: "1"
-  SOURCE_PATHS: "./common ./routers ./schemas ./data ./tools"
+  SOURCE_PATHS: "./common ./routers ./schemas ./data ./tools ./gen/proto/python"
 
 jobs:
   testing:
@@ -97,14 +97,28 @@ jobs:
     # that has no .git, and every git test then fails even with git installed. ca-certificates
     # because --no-install-recommends leaves it out, and git fetches over https (tj-ijpys9.16).
     #
+    # jq because the harness-hook tests (common/tests/test_harness_hooks.py, tj-qenrpk) run the
+    # PreToolUse hook commands in .claude/settings.json verbatim, and each one starts with jq.
+    # Without jq a hook falls through its `|| true` and allows every command, so those tests check
+    # for it first and fail, never skip (pytest.ini). The agent image installs it, so only this job
+    # would go red (tj-3mk3u5.40). grep -P, the hooks' other tool, needs nothing here: bookworm's
+    # grep is Essential, so the slim image has it, and it pre-depends on libpcre2-8-0.
+    #
+    # curl because `make buf-install` (Install Buf, below) and `make shellcheck-install` (Install
+    # ShellCheck, below) download their pinned releases with it, and the slim image has none
+    # (tj-3mk3u5.54, tj-xc6nfv). ca-certificates serves them too: both downloads are https.
+    # tar and gzip need no entry: both are Essential in Debian, so the slim image has them, which is
+    # why the shellcheck pin takes the release's .tar.gz and not its smaller .tar.xz (xz-utils is not
+    # Essential, and the agent image has no xz binary at all).
+    #
     # safe.directory: the runner creates the workspace as its own user and this container runs as
     # root, so git refuses the checkout for dubious ownership. actions/checkout marks the workspace
     # safe only in a temporary global config that it deletes when its own step ends, so later steps
     # do not inherit it. --system, in /etc/gitconfig, where checkout's HOME override cannot hide it.
-    - name: Install Git and Make
+    - name: Install Git, Make, jq and curl
       run: |
         apt-get update
-        apt-get install -y --no-install-recommends git make ca-certificates
+        apt-get install -y --no-install-recommends git make jq curl ca-certificates
         rm -rf /var/lib/apt/lists/*
         git config --system --add safe.directory "${GITHUB_WORKSPACE}"
 
@@ -118,12 +132,87 @@ jobs:
     - name: Install dependencies
       run: |
         uv sync --all-groups --no-group security --no-group agent-mcp --locked
-    - name: Run Ruff Linting
+
+    # THE PINNED BUF, through the target a developer runs (tj-3mk3u5.54), so the version and both
+    # checksums have one definition, the Makefile's: the bare release binary, sha256-verified against
+    # the pin, refused on a mismatch. Before Run Linters, whose proto leg needs it, and before Run Unit
+    # Tests, because tests in the suite run the real buf. No cache: one small download per run.
+    - name: Install Buf
       run: |
-        uv run ruff check .
-    - name: Run Ruff Format Check
+        make buf-install BUF_INSTALL_DIR=/usr/local/bin
+
+    # THE PINNED SHELLCHECK (tj-xc6nfv), through the target a developer runs, for the same reason buf
+    # goes through make buf-install: the version and both checksums have one definition, the
+    # Makefile's. NOT the Debian package -- bookworm ships shellcheck 0.9.0, and a linter at a
+    # different version than the one agents run locally reports a different set of findings, which
+    # makes a green local `make lint` mean nothing about CI. Before Run Linters, whose shell leg needs
+    # it, and also before Run Unit Tests, for the reason buf is: the suite runs the real pinned binary
+    # (test_make_lint.py's real_buf fixture, which FAILS rather than skips when it is absent). No test
+    # reaches shellcheck yet -- that is tj-s2tf38 -- and the step is ordered now so adding one later
+    # is a test change and not a CI change. No cache: one 4 MB download per run.
+    - name: Install ShellCheck
       run: |
-        uv run ruff format --check .
+        make shellcheck-install SHELLCHECK_INSTALL_DIR=/usr/local/bin
+
+    # buf breaking's baseline (tj-3mk3u5.54). actions/checkout fetches one commit and no branch, so
+    # main is fetched here as a remote-tracking ref, and make lint is pointed at it. Depth 1: make
+    # lint extracts one tree from it with git archive and needs no history. On a push to main this
+    # writes refs/remotes/origin/main, never the checked-out branch.
+    - name: Fetch main for buf breaking
+      run: |
+        git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
+
+    # THE STALENESS CHECK (ADR tj-8konfu D3; decision tj-3mk3u5.42 F1). gen/proto/ is committed protoc
+    # output, one tree per language, and a committed copy can disagree with its source; this step is
+    # the control that makes committing it safe, not an extra. It regenerates through `make proto`, the
+    # target a developer runs, so the protoc invocation has one definition, and fails if the tree then
+    # differs from the commit in any way: a changed file, a deleted one (a .proto removed without its
+    # module) or an untracked one (a .proto added without its generated code). That is why it reads
+    # `git status` and not `git diff`, which ignores untracked files. It runs before the linters so a
+    # stale tree is reported as stale.
+    - name: Check Generated gRPC Code
+      run: |
+        set -eu
+        make proto
+        stale="$(git status --porcelain --untracked-files=all -- gen/proto)"
+        if [ -n "${stale}" ]; then
+          echo "::error::gen/proto/ does not match what make proto writes from proto/; run 'make proto' and commit the result"
+          printf '%s\n' "${stale}"
+          git --no-pager diff -- gen/proto
+          exit 1
+        fi
+        echo "gen/proto/ matches what make proto writes from proto/."
+
+    # THE SAME CONTROL FOR docs/errors.md (ADR tj-fa1rpu, Q-URI addendum; tj-3mk3u5.37.10). The catalogue
+    # is generated from the one Reason table in common/errors and committed, so it can go stale exactly as
+    # gen/proto/ can. It regenerates through `make errors-doc`, the target a developer runs, and reads
+    # `git status` rather than `git diff` for the same reason the step above does: a file that is missing
+    # or untracked is stale too. The generator's own `--check` mode is the in-suite twin of this step.
+    - name: Check Generated Error Catalogue
+      run: |
+        set -eu
+        make errors-doc
+        stale="$(git status --porcelain --untracked-files=all -- docs/errors.md)"
+        if [ -n "${stale}" ]; then
+          echo "::error::docs/errors.md does not match what make errors-doc writes from common/errors; run 'make errors-doc' and commit the result"
+          printf '%s\n' "${stale}"
+          git --no-pager diff -- docs/errors.md
+          exit 1
+        fi
+        echo "docs/errors.md matches what make errors-doc writes from common/errors."
+
+    # THE ONE LINT ENTRY POINT, the same target every agent and developer runs (tj-3mk3u5.54), so the
+    # linters have one definition, as the staleness step's protoc does through make proto. PATHS
+    # defaults to '.', so this is ruff check and ruff format --check on the whole tree, then the shell
+    # leg (shellcheck over every *.sh git lists, tj-xc6nfv), then the proto leg: buf lint, buf format
+    # --diff --exit-code and buf breaking against main. Breaking is
+    # REPORT-ONLY until the first SDK release (tj-d2mhru): a break prints as annotations on the pull
+    # request and does not fail the step; a broken check still does. After the staleness step, so a
+    # stale tree is reported as stale.
+    - name: Run Linters
+      run: |
+        make lint BUF_AGAINST_REF=origin/main BUF_ERROR_FORMAT=github-actions
+
     - name: Run Unit Tests
       run: |
         uv run pytest -s
@@ -160,9 +249,12 @@ jobs:
       run: |
         uv run semgrep --config=auto --error --exclude=tests/ --exclude=.venv --exclude=docker-compose.override.yaml --exclude=.claude/worktrees .
 
+    # --color never, the same command as the Makefile's security target (tj-3mk3u5.43): uv colours
+    # its output when the environment forces colour, even into this redirect, and pip-audit cannot
+    # parse the escape codes. This job forces none, so here the flag changes no package line.
     - name: Generate Requirements
       run: |
-        uv export --all-groups --no-group dev --no-group testing --no-group security --locked --format requirements-txt > requirements.txt
+        uv export --all-groups --no-group dev --no-group testing --no-group security --locked --format requirements-txt --color never > requirements.txt
 
     - name: Run Safety CLI
       # No semver tag exists on this commit -- pyupio publishes the moving `v1` only, so the
@@ -243,12 +335,12 @@ jobs:
         # The agent-stack set, spelled exactly as the Makefile's AGENT_STACK_COMPOSE: project
         # trader_joe_agent_stack, then base, test-client, the agent-stack overlay and the
         # fake-mode overlay LAST (ADR tj-4rr0la addendum 3 (3); decision tj-j4wknb R4). The
-        # agent-stack overlay reads seven variables through ":?" guards with no default --
-        # DATABASE_NAME, BROKER_NAME, STORE_API_NETWORK, DATA_DIR and the three *_ENV_FILE
+        # agent-stack overlay reads six variables through ":?" guards with no default --
+        # DATABASE_NAME, STORE_API_NETWORK, DATA_DIR and the three *_ENV_FILE
         # paths -- which the MCP server's generated env file supplies at run time, so this line
-        # sets throwaway placeholders for all seven, safe for the same reason as PGADMIN_*:
+        # sets throwaway placeholders for all six, safe for the same reason as PGADMIN_*:
         # `config` creates no container, network, volume or directory. The names differ from the
-        # user's defaults (db, kafka, trader_joe_store_api) only so a placeholder can never be
+        # user's defaults (db, trader_joe_store_api) only so a placeholder can never be
         # taken for a real resource. With --quiet this line proves that the set interpolates and
         # merges, and nothing more; which names the merged agent-stack model carries is pinned
         # in-process by the build_infra tests (tj-c4mosr.5). The three *_ENV_FILE placeholders
@@ -276,7 +368,7 @@ jobs:
         PGADMIN_EMAIL=unused PGADMIN_PASS=unused docker compose -f docker-compose.yaml \
           -f docker-compose.override.yaml -f docker-compose.tools.yaml config --quiet
         docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml config --quiet
-        DATABASE_NAME=agent_stack_render_db BROKER_NAME=agent_stack_render_kafka \
+        DATABASE_NAME=agent_stack_render_db \
           STORE_API_NETWORK=agent_stack_render_store_api DATA_DIR=/tmp/agent_stack_render_data \
           ROOT_ENV_FILE="${PWD}/.env" STORE_ENV_FILE="${PWD}/data/store/.env" \
           INGEST_ENV_FILE="${PWD}/data/ingest/.env" \
@@ -493,7 +585,7 @@ jobs:
           # containers are CREATED, so a service that boots and dies two seconds later still left
           # this step green. With every service declaring a healthcheck, --wait blocks until
           # each one reports healthy and exits non-zero if any goes unhealthy or dies; its
-          # --wait-timeout 300 sits well above kafka's 90s start_period plus the apps' own, so a
+          # --wait-timeout 300 sits well above the apps' own start periods, so a
           # hung stack fails the job rather than burn the runner's six hours.
           make system-launch
           docker compose -f docker-compose.yaml ps  # health column, not just liveness
@@ -526,7 +618,7 @@ jobs:
           # the next step would be red forever without this.
           #
           # --no-deps because the stack is already up and healthy; without it compose
-          # re-resolves postgres and kafka for a container that only needs the former.
+          # re-resolves postgres for a container that needs nothing started on its behalf.
           # `run` publishes no ports, so this cannot collide with the running data_store.
           # The command is an explicit argv: the image sets CMD, not ENTRYPOINT, so passing
           # one replaces entrypoint.sh rather than appending to it.
@@ -641,8 +733,8 @@ jobs:
           # healthchecks already probe, so re-asserting it adds nothing; this route runs
           # data_store's own path into Postgres end to end -- Depends(async_db) hands the
           # handler a session and search_entries() executes a real SELECT with an outer join
-          # and a GROUP BY against store_dataset_entry. It needs no broker and no Kafka RPC,
-          # which is what makes it the cheapest read that covers app -> database -> app.
+          # and a GROUP BY against store_dataset_entry. It reaches no peer service, which is
+          # what makes it the cheapest read that covers app -> database -> app.
           #
           # [] is the correct answer, not an empty-ish one: the query ran, matched no rows
           # for this deliberately synthetic symbol, and came back. A missing schema, a
@@ -653,21 +745,155 @@ jobs:
 
           echo "Smoke test passed: both services answered /ping by service name and data_store served a query from Postgres."
 
+      - name: Check gRPC Bind Network
+        run: |
+          set -euo pipefail
+          # THE BIND-NETWORK CHECK, first half (ADR tj-q9ae5u addendum 3; tj-3mk3u5.49). data_ingest's
+          # gRPC server binds APP_INTERNAL_GRPC_HOST, the data-ingest-grpc alias docker-compose.yaml
+          # declares on its ingest_store attachment only, and never a wildcard. This proves the NAME
+          # before anything binds it: inside data_ingest, the host resolves to data_ingest's address
+          # on ingest_store and to nothing else. A name answering with its ingest_egress address
+          # would still let the server start cleanly, bound where data_store cannot reach it, so no
+          # other step here would notice. Nothing here dials the port: the reachability half, data_store
+          # calling gRPC health on the name, is Check gRPC Peer Reach, the next step (tj-3mk3u5.25).
+          #
+          # IF THIS FAILS ON A MISMATCH, the alias design itself is wrong: report it to the
+          # architect. Never "fix" it with 0.0.0.0, the service name or the hostname.
+          #
+          # Both variables must be in the CONTAINER's environment: the base file's environment:
+          # block has to reach this fake-overlay launch, as it must every launch. Read with the
+          # image's own interpreter (no printenv-is-missing ambiguity); neither value is a secret.
+          container_env() {
+            docker compose -f docker-compose.yaml exec -T data_ingest /code/.venv/bin/python -c \
+              'import os, sys; print(os.environ.get(sys.argv[1], "").strip())' "$1"
+          }
+          grpc_host="$(container_env APP_INTERNAL_GRPC_HOST)"
+          grpc_port="$(container_env APP_INTERNAL_GRPC_PORT)"
+          echo "data_ingest APP_INTERNAL_GRPC_HOST=${grpc_host:-<unset or empty>} APP_INTERNAL_GRPC_PORT=${grpc_port:-<unset or empty>}"
+          if [ -z "${grpc_host}" ] || [ -z "${grpc_port}" ]; then
+            echo "::error::data_ingest's container environment lacks APP_INTERNAL_GRPC_HOST or APP_INTERNAL_GRPC_PORT; docker-compose.yaml's environment: block did not reach this launch"
+            exit 1
+          fi
+
+          # The resolution, by the same call common.rpc's refuse_wildcard makes before the server
+          # binds: getaddrinfo(host, None, SOCK_STREAM). One address per line, any IPv6 %zone cut.
+          if ! resolved_raw="$(docker compose -f docker-compose.yaml exec -T data_ingest /code/.venv/bin/python -c \
+              'import socket, sys; print("\n".join(sorted({info[4][0].split("%")[0] for info in socket.getaddrinfo(sys.argv[1], None, type=socket.SOCK_STREAM)})))' \
+              "${grpc_host}")"; then
+            echo "::error::${grpc_host} does not resolve inside data_ingest"
+            exit 1
+          fi
+
+          # data_ingest's own addresses on every network, from the engine rather than from inside the
+          # container, so the expectation does not share the resolver it is checking. The network
+          # whose name ends _ingest_store (the project prefixes it) must be exactly one.
+          container="$(docker compose -f docker-compose.yaml ps -q data_ingest)"
+          if [ -z "${container}" ]; then
+            echo "::error::no data_ingest container to inspect"
+            exit 1
+          fi
+          networks="$(docker inspect --format '{{range $name, $net := .NetworkSettings.Networks}}{{$name}} {{$net.IPAddress}} {{$net.GlobalIPv6Address}}{{println}}{{end}}' "${container}")"
+          echo "data_ingest networks (name, IPv4, IPv6):"
+          printf '%s\n' "${networks}"
+          ingest_store="$(printf '%s\n' "${networks}" | awk '$1 ~ /_ingest_store$/')"
+          matches="$(printf '%s\n' "${ingest_store}" | awk 'NF { n++ } END { print n + 0 }')"
+          if [ "${matches}" -ne 1 ]; then
+            echo "::error::expected data_ingest on exactly one network named *_ingest_store, found ${matches}"
+            exit 1
+          fi
+
+          resolved="$(printf '%s\n' "${resolved_raw}" | awk 'NF' | LC_ALL=C sort -u)"
+          expected="$(printf '%s\n' "${ingest_store}" | awk '{ for (i = 2; i <= NF; i++) print $i }' | LC_ALL=C sort -u)"
+          echo "${grpc_host} resolves inside data_ingest to: $(printf '%s' "${resolved}" | tr '\n' ' ')"
+          echo "data_ingest's ingest_store address(es): $(printf '%s' "${expected}" | tr '\n' ' ')"
+          if [ -z "${expected}" ]; then
+            echo "::error::docker inspect reports no address for data_ingest on ingest_store"
+            exit 1
+          fi
+          if [ "${resolved}" != "${expected}" ]; then
+            echo "::error::${grpc_host} resolves inside data_ingest to [$(printf '%s' "${resolved}" | tr '\n' ' ')], not to its ingest_store address(es) [$(printf '%s' "${expected}" | tr '\n' ' ')] alone; report to the architect (ADR tj-q9ae5u addendum 3), never fall back to a wildcard"
+            exit 1
+          fi
+          echo "gRPC bind name holds: ${grpc_host} resolves inside data_ingest to its ingest_store address only (port ${grpc_port})."
+
+      - name: Check gRPC Peer Reach
+        run: |
+          set -euo pipefail
+          # THE PEER-REACH CHECK, the bind-network check's second half (ADR tj-q9ae5u addendum 3;
+          # tj-3mk3u5.25), and -- since addendum 5 item 7 -- the CLIENT-CONFIGURATION check too. From
+          # inside data_store -- the peer data_ingest's gRPC exists to serve -- call the standard
+          # grpc.health.v1 Health.Check for service '' and require SERVING. data_ingest's own healthcheck
+          # already reads SERVING, but it dials from inside data_ingest, where it succeeds on whichever
+          # interface the server is bound to. Only a call from data_store proves the listener sits on the
+          # network the two share, ingest_store. The step before proved the name resolves to that
+          # network's address alone.
+          #
+          # WHAT IS DIALLED IS data_store's OWN DATA_INGEST_GRPC_TARGET (addendum 5): the one entry every
+          # data_store -> data_ingest client reads through common.rpc.channel's target_from_env, which has
+          # no default and fails loudly. Composing the address here from data_ingest's two variables
+          # instead would prove the network path while a missing or wrong target passed unnoticed -- and
+          # from tj-3mk3u5.10 the dataset path dials that target on every launch. CI System Testing is the
+          # one runtime check that sees compose precedence (environment: over env_file:), so it is the only
+          # place a target that drifted from the bind can be caught before a DEADLINE_EXCEEDED in prod.
+          #
+          # The equality check comes first and is not a fallback: on a mismatch the step fails with BOTH
+          # values and dials nothing. Reconstructing the address from the server's side would be exactly
+          # the hole this closes. data_ingest's host and port are read back from its CONTAINER environment
+          # the same way as the step before; none of these values is a secret. Never a loopback address.
+          container_env() {
+            docker compose -f docker-compose.yaml exec -T data_ingest /code/.venv/bin/python -c \
+              'import os, sys; print(os.environ.get(sys.argv[1], "").strip())' "$1"
+          }
+          store_env() {
+            docker compose -f docker-compose.yaml exec -T data_store /code/.venv/bin/python -c \
+              'import os, sys; print(os.environ.get(sys.argv[1], "").strip())' "$1"
+          }
+          grpc_host="$(container_env APP_INTERNAL_GRPC_HOST)"
+          grpc_port="$(container_env APP_INTERNAL_GRPC_PORT)"
+          if [ -z "${grpc_host}" ] || [ -z "${grpc_port}" ]; then
+            echo "::error::data_ingest's container environment lacks APP_INTERNAL_GRPC_HOST or APP_INTERNAL_GRPC_PORT, so there is nothing to check data_store's target against"
+            exit 1
+          fi
+          target="$(store_env DATA_INGEST_GRPC_TARGET)"
+          echo "data_store DATA_INGEST_GRPC_TARGET=${target:-<unset or empty>}; data_ingest binds ${grpc_host}:${grpc_port}"
+          if [ -z "${target}" ]; then
+            echo "::error::data_store's container environment lacks DATA_INGEST_GRPC_TARGET; docker-compose.yaml's environment: block did not reach this launch, and every gRPC client in data_store would fail at startup (ADR tj-q9ae5u addendum 5)"
+            exit 1
+          fi
+          if [ "${target}" != "${grpc_host}:${grpc_port}" ]; then
+            echo "::error::data_store dials DATA_INGEST_GRPC_TARGET='${target}' but data_ingest binds '${grpc_host}:${grpc_port}'; the two must agree (ADR tj-q9ae5u addendum 5). Fix the compose entry or the env file that moved one end; never reconstruct the address here"
+            exit 1
+          fi
+
+          # data_store's own interpreter dials, and dials the target verbatim: grpcio and
+          # grpcio-health-checking are in the base group both images install. The sync API, one call with
+          # a 10 s deadline and no wait_for_ready: the stack is up and healthy, so the listener must answer
+          # now, and a refused or unreachable address fails at once with UNAVAILABLE rather than waiting.
+          # The future's exception() hands back a failed call's code and details without raising, so they
+          # are printed on stdout and captured here. Exit 0 on SERVING only: NOT_SERVING, SERVICE_UNKNOWN
+          # and every RPC error are red.
+          if ! out="$(docker compose -f docker-compose.yaml exec -T data_store /code/.venv/bin/python -c \
+              'import sys, grpc; from grpc_health.v1 import health_pb2 as h, health_pb2_grpc as g; t = sys.argv[1]; c = grpc.insecure_channel(t); f = g.HealthStub(c).Check.future(h.HealthCheckRequest(service=""), timeout=10); e = f.exception(); s = None if e else h.HealthCheckResponse.ServingStatus.Name(f.result().status); c.close(); print(f"{t}: {e.code().name}: {e.details()}" if e else f"{t}: {s}"); sys.exit(0 if s == "SERVING" else 1)' \
+              "${target}")"; then
+            echo "::error::data_store did not get SERVING from data_ingest's gRPC health over ingest_store at its own DATA_INGEST_GRPC_TARGET: ${out:-<no output>}"
+            exit 1
+          fi
+          echo "data_store -> ${out}"
+          echo "gRPC peer reach holds: data_store's own DATA_INGEST_GRPC_TARGET is data_ingest's bind ${grpc_host}:${grpc_port} and gets SERVING from its gRPC health."
+
       - name: Check Network Lockdown
         run: |
           set -euo pipefail
           # The prod network model (tj-q9ae5u addendum 1) as the running stack enforces it, not
           # as the compose file declares it: a network that lost `internal: true`, or a service
           # that gained one, still starts green and still passes every other step here.
-          #   test_client  sees data_store and Postgres only: neither the kafka container name,
-          #                its service name, nor data_ingest resolves from it.
+          #   test_client  sees data_store and Postgres only: neither data_ingest nor data_ingest's
+          #                gRPC bind alias data-ingest-grpc resolves from it, and it cannot connect
+          #                to data_ingest's gRPC port even by address (tj-3mk3u5.25).
           #   postgres, data_store  have no egress: a TCP connect to a public address fails. A
           #                literal IP, so the check is about routing and no DNS is involved.
           # Every negative check needs a distinct exit status for "refused as expected", so that
           # a container that failed to start, or a missing binary, can never pass as blocked.
-          # BROKER_NAME is read with the Instance Secret Lifecycle step's env_value: last one wins.
-          env_value() { grep -E "^$1=" .env | tail -n 1 | cut -d= -f2-; }
-          BROKER_NAME="$(env_value BROKER_NAME)"
           PUBLIC_ADDRESS="1.1.1.1"
           PUBLIC_PORT="443"
           failed=0
@@ -685,10 +911,9 @@ jobs:
             echo "::error::test_client could not resolve data_store (exit $?), so its lookups prove nothing"
             exit 1
           fi
-          # kafka's container_name is ${BROKER_NAME} today, so this loop's first two words
-          # coincide -- a duplicate lookup when they do is harmless, and the service name kafka
-          # stays probed even if BROKER_NAME ever diverges from it.
-          for name in "${BROKER_NAME}" kafka data_ingest; do
+          # data-ingest-grpc is the alias data_ingest's gRPC server binds, scoped to ingest_store,
+          # which test_client never joins.
+          for name in data_ingest data-ingest-grpc; do
             if found="$(lookup "${name}")"; then
               echo "::error::test_client resolved ${name} to ${found}; it must see data_store and Postgres only"
               failed=1
@@ -736,10 +961,55 @@ jobs:
             fi
           fi
 
+          # data_ingest's gRPC port is out of test_client's reach (tj-3mk3u5.25). BY ADDRESS, because
+          # the names do not resolve from test_client (the loop above): data_ingest's ingest_store
+          # address(es), where its gRPC server listens (Check gRPC Bind Network), from the engine, and
+          # the port from its container environment. The same connect and the same exit-3 convention as
+          # the egress probes, so a client that failed to run never passes as blocked -- and first a
+          # positive control from data_store, which shares ingest_store: each address and port must
+          # accept a connection from there, or test_client's refusal would prove nothing about the
+          # network. The family follows the address, so an IPv6 address is dialled as one.
+          connect_code='import socket, sys; host, port = sys.argv[1], int(sys.argv[2]); s = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET); s.settimeout(10); rc = s.connect_ex((host, port)); print(f"connect errno {rc}"); sys.exit(0 if rc == 0 else 3)'
+          grpc_port="$(docker compose -f docker-compose.yaml exec -T data_ingest /code/.venv/bin/python -c \
+            'import os; print(os.environ.get("APP_INTERNAL_GRPC_PORT", "").strip())')"
+          ingest_container="$(docker compose -f docker-compose.yaml ps -q data_ingest)"
+          if [ -z "${grpc_port}" ] || [ -z "${ingest_container}" ]; then
+            echo "::error::no data_ingest container or no APP_INTERNAL_GRPC_PORT in it (port '${grpc_port}'), so its gRPC port cannot be probed"
+            exit 1
+          fi
+          grpc_addresses="$(docker inspect --format '{{range $name, $net := .NetworkSettings.Networks}}{{$name}} {{$net.IPAddress}} {{$net.GlobalIPv6Address}}{{println}}{{end}}' "${ingest_container}" \
+            | awk '$1 ~ /_ingest_store$/ { for (i = 2; i <= NF; i++) print $i }')"
+          if [ -z "${grpc_addresses}" ]; then
+            echo "::error::docker inspect reports no ingest_store address for data_ingest, so its gRPC port cannot be probed"
+            exit 1
+          fi
+          for address in ${grpc_addresses}; do
+            if ! out="$(docker compose -f docker-compose.yaml exec -T data_store /code/.venv/bin/python -c \
+                "${connect_code}" "${address}" "${grpc_port}")"; then
+              echo "::error::data_store could not connect to data_ingest's gRPC port at ${address}:${grpc_port} (${out:-no output}), so a refusal from test_client would prove nothing"
+              failed=1
+              continue
+            fi
+            if out="$(docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml \
+                run --rm --no-deps -T --pull never --entrypoint /code/.venv/bin/python test_client \
+                -c "${connect_code}" "${address}" "${grpc_port}")"; then
+              echo "::error::test_client connected to data_ingest's gRPC port at ${address}:${grpc_port}; it must reach data_store only"
+              failed=1
+            else
+              status=$?
+              if [ "${status}" -eq 3 ]; then
+                echo "test_client -> data_ingest gRPC ${address}:${grpc_port}: blocked, as it must be (${out}); data_store connects"
+              else
+                echo "::error::test_client gRPC reach probe failed with exit ${status}, not a refused connect (3): ${out}"
+                failed=1
+              fi
+            fi
+          done
+
           if [ "${failed}" -ne 0 ]; then
             exit 1
           fi
-          echo "Network lockdown holds: test_client sees neither kafka nor data_ingest; postgres and data_store have no egress."
+          echo "Network lockdown holds: test_client does not see data_ingest and cannot reach data_ingest's gRPC port; postgres and data_store have no egress."
 
       - name: Check Container Env
         run: |
@@ -757,6 +1027,43 @@ jobs:
             echo "::error::MARKET_ACTIVITY_BATCH_SIZE in data_store must be a positive integer, got '${value}'"
             exit 1
           fi
+
+      - name: Check Generated Code Import
+        run: |
+          set -euo pipefail
+          # THE IMPORT-PATH CHECK (decision tj-3mk3u5.42 addendum F1-A; tj-3mk3u5.56). Inside each running
+          # service built from the Dockerfile's service stages, import common.rpc.ping, which imports the
+          # generated trader_joe.proto.ping.v1 and so needs /code/gen/proto/python on the container's
+          # PYTHONPATH. The image's ENV puts it there, but compose ranks env_file: above an image's ENV, and
+          # the staged root env file is a copy of .env.default, whose legacy PYTHONPATH=./ replaces it.
+          # docker-compose.yaml's environment: restates the value and outranks both. Every static pin reads
+          # the files; this is the one check that sees compose's precedence at runtime, with the very env
+          # file that drops the path. Nothing else here notices a lost path while no servicer imports
+          # generated code: the stack starts healthy and passes every other step.
+          #
+          # The image's own interpreter imports, as the services do. stdout carries only the generated
+          # module's file, so a pass shows where it loaded from; a failed import's traceback reaches the log
+          # on stderr, and the error names the service and the PYTHONPATH it saw (not a secret).
+          failed=0
+          for service in data_store data_ingest; do
+            if ! path="$(docker compose -f docker-compose.yaml exec -T "${service}" /code/.venv/bin/python -c \
+                'import os; print(os.environ.get("PYTHONPATH", ""))')"; then
+              echo "::error::could not read PYTHONPATH inside ${service}, so its import path is unproven"
+              failed=1
+              continue
+            fi
+            if out="$(docker compose -f docker-compose.yaml exec -T "${service}" /code/.venv/bin/python -c \
+                'import common.rpc.ping as ping; print(ping.ping_pb2.__file__)')"; then
+              echo "${service}: common.rpc.ping imports; generated code from ${out} (PYTHONPATH=${path})"
+            else
+              echo "::error::${service} cannot import common.rpc.ping (the generated code under /code/gen/proto/python) with PYTHONPATH=${path:-<unset or empty>}; the traceback is above"
+              failed=1
+            fi
+          done
+          if [ "${failed}" -ne 0 ]; then
+            exit 1
+          fi
+          echo "The generated code imports in every service container: compose's environment: PYTHONPATH holds over the root env file."
 
       - name: System Tests
         # This runner's database is thrown away with the job, which is the one condition under
@@ -863,7 +1170,7 @@ jobs:
           fi
 
           # (e) An unset secret must never mean allow-everything. Blank it -- the template's own
-          # shipped state -- and recreate data_store alone; --no-deps leaves Postgres, kafka and
+          # shipped state -- and recreate data_store alone; --no-deps leaves Postgres and
           # data_ingest as they are, and --wait holds until the new container is healthy. The
           # fake-mode overlay stays loaded (the set make system-launch started), so this `up` sees
           # the same model the stack runs and data_ingest can never come back on the production
@@ -880,7 +1187,15 @@ jobs:
           # (routers/common/instance_secret.py). The bodies are {} on purpose: the guard is a
           # route dependency and runs before body validation, so a route that lost it answers
           # 422 here and fails the check, and a probe can never write anything.
-          want_body='{"detail":"Invalid or missing instance write secret"}'
+          #
+          # THE DETAIL, NOT THE WHOLE BODY. This asserted the entire body until the typed-error
+          # work wrapped every error in problem+json, which added type, title and status beside
+          # detail and failed all twelve probes against a guard that was answering correctly.
+          # The two properties this step owns are that the status is 401 -- not the 422 a route
+          # that lost the dependency would give -- and that the message is the fixed one rather
+          # than some other refusal. The envelope's own shape is pinned by the test suite, which
+          # runs on every push; re-pinning it here only buys a second place to forget to update.
+          want_detail='"detail":"Invalid or missing instance write secret"'
           # Sent from test_client by service name, like the Smoke Test: prod publishes no host
           # port. The client file is loaded for this request only; the blank and the recreate
           # above ran on docker-compose.yaml alone and never depended on it. The client's own
@@ -901,8 +1216,8 @@ jobs:
             if [[ "${body}" == *"${former_secret}"* ]]; then
               echo "::error::${method} ${path} (${label}): HTTP ${status}, and the body carries the former secret (withheld)"
               failed=1
-            elif [ "${status}" != "401" ] || [ "${body}" != "${want_body}" ]; then
-              echo "::error::${method} ${path} (${label}): expected 401 ${want_body}, got ${status} ${body}"
+            elif [ "${status}" != "401" ] || [[ "${body}" != *"${want_detail}"* ]]; then
+              echo "::error::${method} ${path} (${label}): expected 401 carrying ${want_detail}, got ${status} ${body}"
               failed=1
             else
               echo "${method} ${path} (${label}): 401"

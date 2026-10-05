@@ -24,7 +24,7 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 import schemas.common
-from schemas.common.latency import InternalLatencyRequest, LatencyRequest, LatencyResponse
+from schemas.common.latency import InternalLatencyRequest, LatencyRequest
 
 
 pytestmark = pytest.mark.common
@@ -39,7 +39,6 @@ EXPECTED_MODULES = frozenset({'schemas.common.latency'})
 # field and nothing else. Values are the cheapest thing that satisfies the declared type.
 CONSTRUCT_CASES: list[tuple[type[BaseModel], dict[str, Any]]] = [
     (LatencyRequest, {'latency_type': 'rest', 'iterations': 1, 'payload_size': 16}),
-    (LatencyResponse, {'latency': 0.5}),
     (InternalLatencyRequest, {'payload': 'ping'}),
 ]
 

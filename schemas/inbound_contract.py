@@ -26,7 +26,7 @@ from pydantic import BaseModel, ConfigDict
 
 
 class InboundContract(BaseModel):
-    """A model a service accepts from somewhere else, over HTTP or over Kafka RPC.
+    """A model a service accepts from somewhere else, over HTTP or over gRPC.
 
     Inheriting this is the statement "this shape arrives from another process". Response and
     read models do not need it -- they are what we send, and we are already the authority on

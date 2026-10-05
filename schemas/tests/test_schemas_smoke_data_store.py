@@ -53,9 +53,11 @@ from schemas.data_store.asset_dataset_store import (
     AssetDatasetStoreDelete,
     AssetDatasetStoreGetById,
     AssetDatasetStoreUpdate,
+    ServedRange,
     StoreAssetDatasetBody,
     StoreAssetDatasetPath,
     StoreAssetDatasetQuery,
+    StoreAssetDatasetResponse,
 )
 from schemas.data_store.stock.market_activity_data import (
     BatchStockDataMarketActivityCreate,
@@ -151,6 +153,37 @@ _DATA_FIELDS: dict[str, Any] = {'timestamp': WHEN}
 _DATASET_BODY: dict[str, Any] = {'owner': 'rebalancer', 'source': 'ALPACA', 'granularity': '1day', 'start': WHEN}
 _DATASET_PATH: dict[str, Any] = {'asset_type': 'stock', 'data_type': 'market-activity', 'asset_symbol': 'VFV'}
 
+# THE TWO FEEDS ARE DIFFERENT VALUES THAT SHARE A NAME, and these two constants are deliberately
+# DIFFERENT MEMBERS so that nothing in this file can conflate them and still pass (tj-3mk3u5.30).
+#
+#   _REQUESTED_FEED  what the CALLER asked for, on StoreAssetDatasetBody.feed. Optional: absent
+#                    means "the deployment decides", which is what almost every caller sends.
+#   _RESOLVED_FEED   what the ACK resolved, on AssetDatasetStoreCreate.feed. Required, and the
+#                    value the entry row records -- the single value only ingest may decide.
+#
+# Were both the same member, a model that wrote the caller's preference onto the entry would be
+# indistinguishable here from one that wrote the resolved value, which is the precise defect this
+# task can produce. They are also NOT equal to the bar fixtures' feed for the same reason.
+_REQUESTED_FEED = Feed.IEX
+_RESOLVED_FEED = Feed.SIP
+
+# The entry-level addition, as a payload fragment. The models that take it are listed EXPLICITLY at
+# each site rather than derived from ``model_fields['feed'].is_required()``: a fixture that asked
+# the model whether the field is required would follow the model when someone makes it optional
+# again, and the suite would stay green through exactly the regression this task's whole point is
+# to prevent. Measured -- see the mutation log on tj-3mk3u5.30.
+_RESOLVED: dict[str, Any] = {'feed': _RESOLVED_FEED}
+
+# feed IS DELIBERATELY ABSENT FROM _DATASET_BODY BELOW. The minimal payload means "every required
+# field and nothing else", and on the body feed is optional -- so adding it would break
+# test_model_rejects_empty_payload, which asserts the missing set EQUALS the payload's keys. The
+# body's optional feed is exercised where it is the subject, not smuggled into the shared fixture.
+
+# The nested member of the declared dataset-create response. A dict rather than a ServedRange
+# instance, because test_model_rejects_empty_payload and the strictness sweep both re-validate the
+# payload and a pre-built submodel would skip the nested validation those sweeps are there to drive.
+_SERVED_RANGE: dict[str, Any] = {'start': WHEN, 'end': WHEN}
+
 # Every public model whose empty payload is REJECTED, with a minimal valid payload. Minimal means:
 # every required field and nothing else.
 CONSTRUCT_CASES: list[tuple[type[BaseModel], dict[str, Any]]] = [
@@ -167,13 +200,16 @@ CONSTRUCT_CASES: list[tuple[type[BaseModel], dict[str, Any]]] = [
     ),
     (StoreAssetDatasetBody, _DATASET_BODY),
     (StoreAssetDatasetPath, _DATASET_PATH),
-    (AssetDatasetStoreCreate, _DATASET_BODY | _DATASET_PATH),
-    (AssetDatasetStoreUpdate, _DATASET_BODY | _DATASET_PATH | {'id': DATASET_ID}),
+    (AssetDatasetStoreCreate, _DATASET_BODY | _DATASET_PATH | _RESOLVED),
+    (AssetDatasetStoreUpdate, _DATASET_BODY | _DATASET_PATH | _RESOLVED | {'id': DATASET_ID}),
     (AssetDatasetStoreGetById, {'id': DATASET_ID}),
     (AssetDatasetStoreDelete, {'id': DATASET_ID}),
     (
         AssetDatasetStore,
-        _DATASET_BODY | _DATASET_PATH | {'id': DATASET_ID, 'item_count': 0, 'created_at': WHEN, 'updated_at': WHEN},
+        _DATASET_BODY
+        | _DATASET_PATH
+        | _RESOLVED
+        | {'id': DATASET_ID, 'item_count': 0, 'created_at': WHEN, 'updated_at': WHEN},
     ),
     (StockDataMarketActivityData, _BAR),
     (StockDataMarketActivityCreate, _IDENTIFIER | _DATA_FIELDS | _BAR_IDENTITY | {'data': _BAR}),
@@ -183,6 +219,13 @@ CONSTRUCT_CASES: list[tuple[type[BaseModel], dict[str, Any]]] = [
         StockDataMarketActivity,
         _IDENTIFIER | _DATA_FIELDS | _BAR_IDENTITY | {'data': _BAR, 'id': 1, 'created_at': WHEN, 'updated_at': WHEN},
     ),
+    # The declared dataset-create response (tj-3mk3u5.37.12). These are OUTBOUND -- see
+    # OUTBOUND_MODELS_THAT_DO_NOT_FORBID_EXTRAS below, which is the one thing about them that
+    # differs from every other model in this package. What they are FOR, and the served_range
+    # ruling behind them, is schemas/tests/test_dataset_create_response.py's subject; they are
+    # listed here so the package-wide sweeps reach them like anything else.
+    (ServedRange, {'start': WHEN, 'end': WHEN}),
+    (StoreAssetDatasetResponse, {'message': 'Data stored', 'data_points': 0, 'served_range': _SERVED_RANGE}),
 ]
 
 # Models whose empty payload is LEGITIMATELY VALID -- every field is optional with a default -- so
@@ -251,6 +294,45 @@ DELETED_QUERY_MODELS = frozenset({'StockMarketActivityDataQuery'})
 # test_no_public_class_declares_fields_without_being_a_model below guards the SHAPE rather than
 # the two names, and this set is kept empty on purpose.
 KNOWN_NON_MODELS: frozenset[str] = frozenset()
+
+# THE ONLY PUBLIC MODELS IN THIS PACKAGE THAT DO NOT FORBID UNKNOWN FIELDS, and an open question
+# rather than a settled convention (validator, gating tj-3mk3u5.37.12).
+#
+# Until 849ef39 every public model here forbade extras, read and response models included --
+# AssetData, AssetDatasetStore and StockDataMarketActivity all inherit InboundContract through the
+# write model they extend, and asset_dataset_store.py's own comment records that `from_attributes`
+# beside `extra='forbid'` is harmless. The sweep below asserted that universally, and its docstring
+# says why: "It fails on a NEW model that forgot the base, which a per-model test never would."
+#
+# tj-3mk3u5.37.12 adds the first two exceptions. The builder chose a plain BaseModel deliberately
+# and said so, reasoning from schemas/inbound_contract.py's own words -- "Response and read models
+# do not need it -- they are what we send, and we are already the authority on their shape" -- and
+# the bead explicitly delegated the choice ("Whether they inherit InboundContract ... or a plain
+# BaseModel is your call"). That is a defensible reading, and it had a precedent in
+# schemas.common.latency.LatencyResponse, which was the same shape -- a response model on a plain
+# BaseModel. THE PRECEDENT IS GONE RATHER THAN REVERSED: tj-3mk3u5.13 deleted LatencyResponse as
+# dead code, it having had no production caller, so the citation is kept as history and must not be
+# followed. The reasoning above stands on inbound_contract.py's own words, not on that class.
+#
+# WHAT IT COSTS, measured rather than asserted: StoreAssetDatasetResponse(**payload,
+# a_field_no_contract_declares=1) constructs and drops the key silently. TE-6 (tj-3mk3u5.37.8)
+# builds this model in routers/data_store from values copied off FetchDone, so a typo'd keyword
+# there is caught today only because all three members are required -- the moment the response
+# gains an optional member, which is the extensibility this whole bead exists to create, a typo
+# becomes a silently absent field. That is the exact failure inbound_contract.py's header calls
+# "a bug shipped to ourselves".
+#
+# THIS IS THE ARCHITECT'S CALL, NOT THE VALIDATOR'S, and it is left to the gate rather than decided
+# here: the bead delegated the choice, so the builder complied, and the fact that the delegation
+# collided with a convention this package already enforced is a design question. If the ruling is
+# "make them strict", the fix is one base class in schemas/data_store/asset_dataset_store.py and
+# this set empties to frozenset() -- the sweep below then covers both models with no other edit.
+#
+# IT IS NOT AN ESCAPE HATCH, which is the thing KNOWN_NON_MODELS above is deliberately kept empty
+# to avoid. Nothing is skipped: test_the_package_forbids_extras_everywhere_except_these_two DERIVES
+# the non-strict set from the package and asserts it equals this one, so a new lax model reds
+# immediately instead of being waved through by adding a string here.
+OUTBOUND_MODELS_THAT_DO_NOT_FORBID_EXTRAS: frozenset[str] = frozenset({'ServedRange', 'StoreAssetDatasetResponse'})
 
 # The full list tj-vhboky.2 item I enumerated before deleting, recorded here so the deletion is
 # auditable from the tests rather than only from a commit message. The task required enumerating
@@ -358,7 +440,16 @@ def test_model_rejects_empty_payload(model: type[BaseModel], payload: dict[str, 
     #
     # The SELECTOR_CASES contribute their one-selector payload, not `{}`: an empty bars query is
     # refused by its model_validator, and that refusal would be a second error beside the unknown key.
-    CONSTRUCT_CASES + [(model, {}) for model, _, _, _ in CONSTRAINT_CASES] + SELECTOR_CASES,
+    # The two outbound response models are held out, and NOT because they are uninteresting: they
+    # are the only models here that accept an unknown field, which is asserted directly, as a
+    # derived set, by test_the_package_forbids_extras_everywhere_except_these_two below. Holding
+    # them out of this parametrization rather than weakening its assertion is what keeps this
+    # test's claim exact for the models it does cover.
+    [
+        case
+        for case in CONSTRUCT_CASES + [(model, {}) for model, _, _, _ in CONSTRAINT_CASES] + SELECTOR_CASES
+        if case[0].__name__ not in OUTBOUND_MODELS_THAT_DO_NOT_FORBID_EXTRAS
+    ],
     ids=_case_id,
 )
 def test_every_model_in_the_package_rejects_an_unknown_field(model: type[BaseModel], payload: dict[str, Any]):
@@ -389,6 +480,41 @@ def test_every_model_in_the_package_rejects_an_unknown_field(model: type[BaseMod
     errors = excinfo.value.errors()
     assert [error['loc'] for error in errors] == [('a_field_no_contract_declares',)]
     assert [error['type'] for error in errors] == ['extra_forbidden']
+
+
+def test_the_package_forbids_extras_everywhere_except_these_two():
+    """The strictness claim as a PARTITION OF THE WHOLE PACKAGE, derived rather than listed.
+
+    The sweep above can only assert strictness for models someone remembered to put in a case list,
+    and now it skips two of them. This is what stops that from being a hole: the non-strict set is
+    computed from the package's own classes and asserted to equal
+    OUTBOUND_MODELS_THAT_DO_NOT_FORBID_EXTRAS exactly, so the two halves together still cover every
+    public model and neither a new lax model nor a newly-lax existing one can slip between them.
+
+    IT FAILS IN BOTH DIRECTIONS, which is the point of an equality:
+      * a THIRD model declared without the strict base reds here immediately, naming itself, even
+        before anyone writes it a construct case;
+      * and if the architect rules that the two outbound responses should be strict after all, this
+        reds until the set is emptied -- so the decision cannot be made in production and left
+        unrecorded here, which is how the convention drifted into being implicit in the first place.
+
+    Read against the comment on that set for why the two exceptions exist and whose call it is.
+    """
+    lax = {}
+    for module_name in sorted(EXPECTED_MODULES):
+        module = importlib.import_module(module_name)
+        for name in sorted(_public_classes(module)):
+            model = getattr(module, name)
+            if issubclass(model, BaseModel) and model.model_config.get('extra') != 'forbid':
+                lax[name] = model.model_config.get('extra')
+
+    assert set(lax) == OUTBOUND_MODELS_THAT_DO_NOT_FORBID_EXTRAS, (
+        f'the set of public models in this package that do NOT forbid unknown fields has changed: '
+        f'found {lax}, expected exactly {sorted(OUTBOUND_MODELS_THAT_DO_NOT_FORBID_EXTRAS)}. A model '
+        f'that accepts an unknown field makes a removed field indistinguishable from one that was '
+        f'never sent (schemas/inbound_contract.py). Either give it the strict base or record here '
+        f'why it is an exception -- do not widen this set without a ruling.'
+    )
 
 
 @pytest.mark.parametrize(('model', 'payload', 'field', 'constraint'), CONSTRAINT_CASES, ids=_case_id)
@@ -556,21 +682,29 @@ def test_feed_has_one_home_and_data_store_does_not_redeclare_it():
     assert Feed is common.enums.data_stock.Feed
     assert Feed.__module__ == 'common.enums.data_stock'
 
-    # THE WITNESS MOVED, and the move is the tj-rh4b7f deferral rather than a test repair. This
-    # used to witness on `asset_dataset_store`, because the ENTRY body declared a feed. It no
-    # longer does, so that module legitimately no longer imports Feed and witnessing there would
-    # assert the opposite of the ruling. The bar create schemas are where feed lives now, so that
-    # is where the shared-enum identity has to hold.
-    imported = importlib.import_module('schemas.data_store.asset_data_interface')
-    assert imported.Feed is Feed
-    # The enum is imported into the schema module, never defined there.
-    assert 'Feed' not in _public_classes(imported)
-
-    # And the module it left declares none of its own on the way out -- a local re-declaration is
-    # exactly the duplicate-enum failure above, and removing the import is what must have happened
-    # rather than replacing it with a private copy.
-    vacated = importlib.import_module('schemas.data_store.asset_dataset_store')
-    assert not hasattr(vacated, 'Feed')
+    # THE WITNESS LIST, which has now moved TWICE and should stop moving. It first witnessed on
+    # `asset_dataset_store`, because the entry body declared a feed. tj-rh4b7f removed that field,
+    # so the witness moved to the bar schemas and a final line asserted `asset_dataset_store` had
+    # no `Feed` attribute AT ALL -- a reasonable reading of "the field left", but it pinned the
+    # IMPORT rather than the identity, and tj-3mk3u5.30 brought the field back. That line is
+    # therefore OBSOLETE rather than failing: it witnessed an absence that was only ever a
+    # consequence of the deferral, and asserting it now would pin the opposite of this task.
+    #
+    # WHAT REPLACES IT IS THE PROPERTY THE LINE WAS REACHING FOR, applied to BOTH modules: the
+    # enum each schema module uses is the shared one, and neither defines its own. That survives a
+    # field moving in or out, which is what the last two beads proved the previous spelling did
+    # not. Both modules are swept together so a third one is a one-line addition.
+    for module_name in ('schemas.data_store.asset_data_interface', 'schemas.data_store.asset_dataset_store'):
+        imported = importlib.import_module(module_name)
+        assert imported.Feed is Feed, (
+            f'{module_name} binds a Feed that is not common.enums.data_stock.Feed. Two enums with '
+            f'identical members are different types, so a value validated against one is rejected '
+            f'by the other and nothing about the failure says there are two.'
+        )
+        # Imported into the schema module, never defined there: a local re-declaration is exactly
+        # the duplicate-enum failure above, and `is` alone would not catch a copy that happened to
+        # be aliased to the shared one at import time.
+        assert 'Feed' not in _public_classes(imported), f'{module_name} defines its own Feed rather than importing it'
 
 
 def test_feed_has_no_sentinel_for_a_tape_nobody_resolved():
@@ -615,17 +749,36 @@ def test_feed_has_no_sentinel_for_a_tape_nobody_resolved():
         UsEquityFeed.from_superset(Feed.NOT_APPLICABLE)
 
 
-def test_the_entry_carries_no_feed_and_the_bar_requires_one():
-    """Pin BOTH halves of the tj-rh4b7f move, because either half alone is the bug it prevents.
+def test_the_entry_records_the_resolved_feed_and_the_bar_requires_one():
+    """INVERTED, DELIBERATELY, BY tj-3mk3u5.30 -- and the old reasoning is kept because it is why.
 
-    The store writes the dataset entry row and only then calls ingest, so at the moment the entry
-    is written nothing has resolved a tape. feed is identity, so a placeholder written there and
-    corrected afterwards would MUTATE identity in place -- the defect the whole per-dataset model
-    exists to remove. So feed left the entry and landed on the bar, where the adapter knows it.
+    This test was ``test_the_entry_carries_no_feed_and_the_bar_requires_one``, and its entry half
+    asserted that the four dataset models declared NO feed. That was tj-rh4b7f's deferral, and the
+    reason was WRITE ORDER rather than taste: the store wrote the entry row and only then called
+    ingest, so at the moment the row was written nothing had resolved a tape. feed is identity, so
+    a placeholder written there and corrected afterwards would MUTATE identity in place -- the
+    defect the per-dataset model exists to remove.
 
-    Asserting only the absence would pass on a tree that dropped feed everywhere, and asserting
-    only the presence would pass on a tree that declared it in both places. Both are asserted
-    here, in one test, for that reason.
+    THE CUTOVER REVERSED THE ORDER AND SO REVERSES THIS TEST. tj-3mk3u5.10 made the acknowledgement
+    arrive FIRST, carrying the resolved feed, early enough to write it, so the entry is written
+    with a tape that is already decided and never with a placeholder. The condition the deferral
+    was waiting on is met, and the deferral ends. This is an inversion the bead NAMED in advance,
+    not a repair of a test that broke.
+
+    THE TWO feed FIELDS ARE TWO DIFFERENT VALUES SHARING A NAME, which is what the three lists
+    below keep apart and the single most likely defect of this change:
+      the body's    OPTIONAL   -- the caller's PREFERENCE. Absent means "the deployment decides".
+      the entry's   REQUIRED   -- the RESOLVED tape, off FetchAccepted, the one value only ingest
+                                 may decide. It is what the row records.
+    A model that passed the body's feed straight through to the entry would write a preference onto
+    an identity column, and the two would be indistinguishable afterwards.
+
+    feed IS IDENTITY, AND IT IS NOT AN OVERLAP TERM (decision tj-xn3qa6 D1, 2026-10-03). Those are
+    two different keys and only identity gets feed: the own-overlap refusal asks whether this owner
+    already holds data covering this window, and a feed-blind 409 carrying colliding_ids tells that
+    caller something true and useful. Nothing in this test keys on the overlap, and nothing added
+    here should start to -- an earlier draft of tj-3mk3u5.31 said the overlap check "regains its
+    feed term" and that bullet is WITHDRAWN.
 
     REQUIRED WITH NO DEFAULT is the other half of the removed ``UNKNOWN``: with no sentinel to fall
     back to, a missing feed has to fail loudly at the boundary.
@@ -656,8 +809,26 @@ def test_the_entry_carries_no_feed_and_the_bar_requires_one():
     ``_AssetIdentifierQuery``. The half that survives here is the one the ruling kept: feed is
     still not on ``_AssetIdentifier`` and not on the update.
     """
-    for model in (StoreAssetDatasetBody, StoreAssetDatasetQuery, AssetDatasetStoreCreate, AssetDatasetStore):
-        assert 'feed' not in model.model_fields, f'{model.__name__} declares a feed again'
+    # THE PREFERENCE SIDE: optional, defaulting to None, on the two models a CALLER fills in. The
+    # default is asserted as None rather than merely "not required", because a default of any Feed
+    # member would mean the deployment's choice had been made in a schema.
+    for model in (StoreAssetDatasetBody, StoreAssetDatasetQuery):
+        field = model.model_fields['feed']
+        assert not field.is_required(), f'{model.__name__}.feed became required; a caller cannot resolve a tape'
+        assert field.default is None, f'{model.__name__}.feed defaults to {field.default!r} rather than to None'
+        assert field.annotation == Feed | None
+
+    # THE RESOLVED SIDE: required, no default, on the models that RECORD the tape. Update and the
+    # read model inherit it from Create and are listed anyway -- inheritance is what is being
+    # relied on, so a redeclaration that loosened either is the thing worth catching.
+    for model in (AssetDatasetStoreCreate, AssetDatasetStoreUpdate, AssetDatasetStore):
+        field = model.model_fields['feed']
+        assert field.is_required(), (
+            f'{model.__name__}.feed acquired a default. There is no sentinel to default TO -- Feed '
+            f'has no UNKNOWN member -- so a default here is a placeholder on an identity column.'
+        )
+        assert field.default_factory is None, f'{model.__name__}.feed acquired a default factory'
+        assert field.annotation is Feed, f'{model.__name__}.feed is {field.annotation}, not the bare shared enum'
 
     # The create paths, which supply the tape, and the READ models, which report it. Same three
     # assertions for both, because "required, no default, typed as the shared enum" is one contract
@@ -680,6 +851,32 @@ def test_the_entry_carries_no_feed_and_the_bar_requires_one():
     assert 'feed' not in _AssetIdentifier.model_fields
     for model in (AssetDataUpdate, StockDataMarketActivityUpdate):
         assert 'feed' not in model.model_fields, f'{model.__name__} declares a feed again'
+
+    # THE BEHAVIOURAL HALF ON THE ENTRY, and it is the one that constrains the store's own code.
+    # A body that named no tape -- which is what almost every caller sends -- cannot be splatted
+    # into the entry model: the resolved feed has to be supplied separately, from the ack. So the
+    # plausible wrong implementation, AssetDatasetStoreCreate(**body.model_dump(), **path), RAISES
+    # for the common case rather than writing something wrong.
+    #
+    # WHAT THIS CANNOT REACH, named rather than left to be assumed: a caller that DID name a tape.
+    # Then the same splat validates and writes the PREFERENCE onto an identity column, and no
+    # schema-level test can see the difference, because the two fields have the same name and the
+    # same type. Catching that needs the write path -- the entry must be built from the ack's feed,
+    # not the body's -- and it belongs to tj-3mk3u5.31 and to
+    # data/store/app/ingest/data_action_request.py, where the two values exist side by side.
+    with pytest.raises(ValidationError) as excinfo:
+        AssetDatasetStoreCreate(**_DATASET_BODY | _DATASET_PATH)
+    assert [error['loc'] for error in excinfo.value.errors()] == [('feed',)], (
+        'an entry was constructible from a body that named no tape, so an unresolved feed can '
+        'reach the write by being forgotten'
+    )
+
+    # And the two really are independent fields rather than one inherited field read twice: the
+    # body accepts a preference the entry does not take as its resolution.
+    assert StoreAssetDatasetBody(**_DATASET_BODY).feed is None, 'the body invented a tape the caller did not ask for'
+    assert StoreAssetDatasetBody(**_DATASET_BODY | {'feed': _REQUESTED_FEED}).feed is _REQUESTED_FEED
+    assert AssetDatasetStoreCreate(**_DATASET_BODY | _DATASET_PATH | _RESOLVED).feed is _RESOLVED_FEED
+    assert _REQUESTED_FEED is not _RESOLVED_FEED, 'the fixtures stopped distinguishing the two feeds'
 
     # The behavioural half, on a create path and on a read model: omitting feed is reported against
     # `feed` and nothing else. A field-set assertion alone would pass on a model that declared the
@@ -780,7 +977,9 @@ def _write_payload(model: type[BaseModel]) -> dict[str, Any]:
     """
     payload = dict(_DATASET_BODY)
     if model is not StoreAssetDatasetBody:
-        payload |= _DATASET_PATH
+        # The entry models require the RESOLVED feed; the body's own feed is optional and stays
+        # out, so these payloads also keep the two values apart (tj-3mk3u5.30).
+        payload |= _DATASET_PATH | _RESOLVED
     if model is AssetDatasetStoreUpdate:
         payload |= {'id': str(DATASET_ID)}
     return payload
@@ -935,7 +1134,7 @@ def test_owner_rejects_an_explicit_null(model: type[BaseModel]):
     """
     payload = _DATASET_BODY | {'owner': None}
     if model is not StoreAssetDatasetBody:
-        payload |= {'asset_type': 'stock', 'data_type': 'market-activity', 'asset_symbol': 'AAPL'}
+        payload |= {'asset_type': 'stock', 'data_type': 'market-activity', 'asset_symbol': 'AAPL'} | _RESOLVED
     if model is AssetDatasetStoreUpdate:
         payload |= {'id': DATASET_ID}
     with pytest.raises(ValidationError) as excinfo:
@@ -1655,7 +1854,7 @@ def _enum_wire_payload(model: type[BaseModel], expiry_type: ExpiryType, update_t
         return policy
     payload = _DATASET_BODY | {'expiry': WHEN} | policy
     if model is not StoreAssetDatasetBody:
-        payload |= _DATASET_PATH
+        payload |= _DATASET_PATH | _RESOLVED
     if model in (AssetDatasetStoreUpdate, AssetDatasetStore):
         payload |= {'id': DATASET_ID}
     if model is AssetDatasetStore:
@@ -1696,6 +1895,53 @@ def test_a_dataset_store_model_puts_enum_names_on_the_wire(
         assert type(dumped['update_type']) is str
 
 
+@pytest.mark.parametrize('member', list(Feed), ids=lambda member: member.name)
+def test_feed_reaches_the_wire_as_its_member_name_with_no_serializer(member: Feed):
+    """The feed field satisfies tj-vhboky.30 FOR A DIFFERENT REASON than the two above, so it is pinned apart.
+
+    expiry_type and update_type are NamedIntEnum and would dump as 1 and 1; names reach the wire
+    only because ExpiryTypeByName and serialize_enum_name put them there. feed needs none of that
+    machinery: Feed is a str enum whose VALUE IS ITS MEMBER NAME, so pydantic already emits the
+    name. tj-3mk3u5.30 therefore added no serializer for it, correctly.
+
+    AND THAT IS EXACTLY WHY IT NEEDS ITS OWN PIN. A property satisfied by accident of a base class
+    is one nobody is defending. Change Feed to ``IEX = 'iex'``, or move it off ``str``, and the
+    wire form changes silently -- the two assertions above would not notice, because they read
+    only the two NamedIntEnum fields, and the "enum names on the wire" contract the private SDK
+    reads would be broken for one field out of three with a full green suite over it.
+
+    THREE INDEPENDENT CLAIMS, because each fails differently:
+      * the dumped value equals the member NAME, in both JSON forms. Catches a value that drifts
+        from its name, which is the likely edit.
+      * ``type(...) is str``. Catches a base-class change that keeps the text but stops it being a
+        plain string on the wire.
+      * the JSON SCHEMA documents the enum as those names with ``type: string``. That is what a
+        generated client is built from, and a model can serialise correctly while documenting
+        something else -- which is the half a serialisation test alone never sees.
+
+    Args:
+        member: One Feed member, so a member added later is covered without editing a list.
+    """
+    built = AssetDatasetStoreCreate(**_DATASET_BODY | _DATASET_PATH | {'feed': member})
+
+    for form, dumped in [
+        ('model_dump_json', json.loads(built.model_dump_json())),
+        ('model_dump(mode=json)', built.model_dump(mode='json')),
+    ]:
+        assert dumped['feed'] == member.name, (
+            f'AssetDatasetStoreCreate.{form} emitted {dumped["feed"]!r} rather than the member name '
+            f'{member.name!r}. Feed reaching the wire as a name is not free -- it holds only while '
+            f'Feed is a str enum whose value is its name (tj-vhboky.30).'
+        )
+        assert type(dumped['feed']) is str, f'{form} emitted a {type(dumped["feed"]).__name__}, not a plain string'
+
+    feed_schema = AssetDatasetStoreCreate.model_json_schema()['$defs']['Feed']
+    assert feed_schema['type'] == 'string', f'Feed is documented as {feed_schema} rather than as a string enum'
+    assert sorted(feed_schema['enum']) == sorted(m.name for m in Feed), (
+        f'the generated client would be built with {feed_schema["enum"]} rather than the member names'
+    )
+
+
 @pytest.mark.parametrize(
     ('expiry_type', 'update_type'), _ENUM_WIRE_PAIRS, ids=[f'{e.name}-{u.name}' for e, u in _ENUM_WIRE_PAIRS]
 )
@@ -1733,20 +1979,20 @@ _EXACT_WIRE_CASES: list[tuple[type[BaseModel], dict[str, Any], str]] = [
     (
         StoreAssetDatasetBody,
         _enum_wire_payload(StoreAssetDatasetBody, ExpiryType.BUFFER_10K, UpdateType.STATIC),
-        '{"owner":"rebalancer","source":"ALPACA","granularity":"1day","start":"2026-01-01T00:00:00Z",'
+        '{"owner":"rebalancer","source":"ALPACA","feed":null,"granularity":"1day","start":"2026-01-01T00:00:00Z",'
         '"end":null,"expiry":"2026-01-01T00:00:00Z","expiry_type":"BUFFER_10K","update_type":"STATIC"}',
     ),
     (
         AssetDatasetStoreCreate,
         _enum_wire_payload(AssetDatasetStoreCreate, ExpiryType.BUFFER_10K, UpdateType.STATIC),
-        '{"owner":"rebalancer","source":"ALPACA","granularity":"1day","start":"2026-01-01T00:00:00Z",'
+        '{"owner":"rebalancer","source":"ALPACA","feed":"SIP","granularity":"1day","start":"2026-01-01T00:00:00Z",'
         '"end":null,"expiry":"2026-01-01T00:00:00Z","expiry_type":"BUFFER_10K","update_type":"STATIC",'
         '"asset_type":"stock","data_type":"market-activity","asset_symbol":"VFV"}',
     ),
     (
         AssetDatasetStoreUpdate,
         _enum_wire_payload(AssetDatasetStoreUpdate, ExpiryType.BUFFER_10K, UpdateType.STATIC),
-        '{"owner":"rebalancer","source":"ALPACA","granularity":"1day","start":"2026-01-01T00:00:00Z",'
+        '{"owner":"rebalancer","source":"ALPACA","feed":"SIP","granularity":"1day","start":"2026-01-01T00:00:00Z",'
         '"end":null,"expiry":"2026-01-01T00:00:00Z","expiry_type":"BUFFER_10K","update_type":"STATIC",'
         '"asset_type":"stock","data_type":"market-activity","asset_symbol":"VFV",'
         '"id":"00000000-0000-0000-0000-000000000001"}',
@@ -1754,7 +2000,7 @@ _EXACT_WIRE_CASES: list[tuple[type[BaseModel], dict[str, Any], str]] = [
     (
         AssetDatasetStore,
         _enum_wire_payload(AssetDatasetStore, ExpiryType.BUFFER_10K, UpdateType.STATIC) | {'expiry': None},
-        '{"owner":"rebalancer","source":"ALPACA","granularity":"1day","start":"2026-01-01T00:00:00Z",'
+        '{"owner":"rebalancer","source":"ALPACA","feed":"SIP","granularity":"1day","start":"2026-01-01T00:00:00Z",'
         '"end":null,"expiry":null,"expiry_type":"BUFFER_10K","update_type":"STATIC",'
         '"asset_type":"stock","data_type":"market-activity","asset_symbol":"VFV",'
         '"id":"00000000-0000-0000-0000-000000000001","item_count":0,'
@@ -1763,13 +2009,13 @@ _EXACT_WIRE_CASES: list[tuple[type[BaseModel], dict[str, Any], str]] = [
     (
         StoreAssetDatasetQuery,
         {'expiry_type': ExpiryType.ROLLING, 'update_type': UpdateType.STREAM},
-        '{"owner":null,"source":null,"granularity":null,"start":null,"end":null,'
+        '{"owner":null,"source":null,"feed":null,"granularity":null,"start":null,"end":null,'
         '"expiry_type":"ROLLING","update_type":"STREAM","created_at":null,"updated_at":null}',
     ),
     (
         StoreAssetDatasetQuery,
         {},
-        '{"owner":null,"source":null,"granularity":null,"start":null,"end":null,'
+        '{"owner":null,"source":null,"feed":null,"granularity":null,"start":null,"end":null,'
         '"expiry_type":null,"update_type":null,"created_at":null,"updated_at":null}',
     ),
 ]
@@ -1795,6 +2041,14 @@ def test_a_dataset_store_model_serialises_to_exactly_these_bytes(
     The all-null query case is the one where a null enum must stay ``null``: a serializer that
     assumed a member and called ``.name`` on None would raise here, and one that dropped None would
     shorten the document.
+
+    THE SIX LITERALS NOW CARRY feed, AND THEY ARE THE SHARPEST STATEMENT IN THE FILE THAT THE TWO
+    feed FIELDS ARE DIFFERENT VALUES (tj-3mk3u5.30). The body serialises ``"feed":null`` -- the
+    caller named no tape, and the absence reaches the wire as an explicit null rather than being
+    dropped -- while the three entry models serialise ``"feed":"SIP"``, the resolved value. Two
+    documents, same key, different meanings, both pinned to the byte. A change that collapsed the
+    two fields into one inherited field would have to make these literals agree, which cannot be
+    done without noticing.
 
     Args:
         model: The dataset-store model under test.

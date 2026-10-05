@@ -47,6 +47,10 @@ WORKTREE_FILES = {
     'common/.env.default': 'COMMITTED_TEMPLATE=1\n',
     'routers/__init__.py': '',
     'schemas/__init__.py': '',
+    # The committed generated gRPC tree the Dockerfile COPYs and compose mounts (decision tj-3mk3u5.42
+    # F1). trader_joe/ itself has no __init__.py, as in the real tree: it is a PEP 420 namespace.
+    'gen/proto/python/trader_joe/proto/__init__.py': '# guard\n',
+    'gen/proto/python/trader_joe/proto/ping/v1/ping_pb2.py': 'DESCRIPTOR = None\n',
     'data/store/app/main.py': 'APP = "store"\n',
     'data/ingest/app/main.py': 'APP = "ingest"\n',
     'data/store/alembic.ini': '[alembic]\n',
@@ -228,6 +232,11 @@ def step_prefix_length() -> int:
     return len(stack.compose_prefix(Path('/stack'), Path('/stack/agent_stack.env')))
 
 
+def dev_step_prefix_length() -> int:
+    """How many argv words dev_compose_prefix() spells before the subcommand (four: no -f, no env file)."""
+    return len(stack.dev_compose_prefix())
+
+
 def forbid_real_subprocesses(monkeypatch: pytest.MonkeyPatch) -> None:
     """Any real subprocess from the server under test fails the test: the fakes must see everything."""
 
@@ -308,14 +317,22 @@ VERB_SAMPLES: Mapping[str, dict[str, Any]] = {
     'stack_wipe': {},
     'migrate': {},
     'migrate_status': {},
+    'migrate_check': {},
     'run_system_tests': {'worktree': WORKTREE_NAME, 'paths': ['tests/system/test_one.py']},
     'seed_dump': {'worktree': WORKTREE_NAME},
     'logs': {'service': 'postgres', 'tail': 50},
     'ps': {},
+    'dev_logs': {'service': 'postgres', 'tail': 50},
+    'dev_ps': {},
 }
 # Verbs that run no docker at all. None since tj-irhy0a.22 wired seed_dump; kept so a future verb
 # that runs no docker is classified here rather than tripping the docker sweeps.
 DOCKERLESS_VERBS: frozenset[str] = frozenset()
+# The verbs that reach the USER'S OWN dev compose project read-only (tj-kzy7w2; ADR tj-4rr0la
+# addendum 18). They run docker, but NOT through stack.compose_prefix(): no -f, no
+# --project-directory, no --env-file, so the agent-stack sweeps must exclude them rather than
+# mis-slice their four-word prefix. tj-tq2hn6 (B2) owns the containment tests that take their place.
+DEV_PROJECT_VERBS = frozenset({'dev_ps', 'dev_logs'})
 
 
 def tree_digest(path: Path) -> dict[str, str]:

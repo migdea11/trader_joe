@@ -11,8 +11,9 @@ single-bar POST:
   * 7b a wrong secret -> 401, and nothing written or removed;
   * 7c the right secret -> the handler runs (below);
   * 7d a GET with no secret, or with a wrong one, succeeds: reads are deliberately open.
-Every 401 body is checked for the secret before anything else is asserted about it, and carries
-exactly the fixed rejection detail, imported rather than retyped.
+Every 401 response, and every 7c response, is checked for the secret -- in the body and in every
+raw header value -- before anything else is asserted about it. Every 401 body carries exactly the
+fixed rejection detail, imported rather than retyped.
 
 7c ON THE DATASET POST IS A 409, NOT A 2xx, AND ON PURPOSE. A 2xx there means data_store called
 data_ingest and the broker, and this part never drives the broker (fake-broker plan, decision
@@ -51,6 +52,7 @@ from data.store.app.database.models.stock_market_activity import StockMarketActi
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from routers.common.instance_secret import INSTANCE_SECRET_REJECTION_DETAIL
 from routers.data_store.app_endpoints import AssetDataInterface, AssetDatasetStoreInterface
+from tests.system.problem_json import PROBLEM_JSON
 
 
 pytestmark = pytest.mark.data_store
@@ -152,10 +154,25 @@ def test_write_without_the_right_secret_is_401_and_changes_nothing(
     response = send_write(route, seeded_entry, auth)
 
     # FIRST, and as a bool: if the body leaked the secret, no later assertion may print the body.
-    leaked = data_store.leaks_secret(response.text) or data_store.leaks_secret(str(response.headers))
+    # Body and raw header values both: response_leaks_secret explains why not str(response.headers).
+    leaked = data_store.response_leaks_secret(response)
     assert not leaked, f'{route} {auth}: the 401 response carries the instance secret (value withheld)'
     assert response.status_code == 401, data_store.describe(response)
-    assert response.json() == {'detail': INSTANCE_SECRET_REJECTION_DETAIL}, data_store.describe(response)
+    assert response.headers['content-type'] == PROBLEM_JSON, data_store.describe(response)
+    # WHOLE-BODY EQUALITY IS KEPT, and keeping it is the point (tj-3mk3u5.37.9). The old assertion
+    # compared the body to exactly {'detail': ...}, which is what proved the 401 carries NOTHING
+    # ELSE -- no secret, no echo of the request, no stray member. TE-6 (caf68f5) re-rendered it as
+    # problem+json, so the literal moved; if it had been relaxed to a membership check at the same
+    # time, this test would have kept its name and quietly stopped guarding the thing it exists
+    # for. The 401 goes through the HTTPException handler, which is deliberately NOT one of ours:
+    # no reason, no domain and no error_id, which is why those three are absent here and asserting
+    # the whole body is what pins their absence.
+    assert response.json() == {
+        'type': 'about:blank',
+        'title': 'Unauthorized',
+        'status': 401,
+        'detail': INSTANCE_SECRET_REJECTION_DETAIL,
+    }, data_store.describe(response)
 
     # Nothing written, nothing removed.
     assert _entry_exists(pg_engine, seeded_entry.id), f'{route} {auth}: the seeded entry is gone after a 401'
@@ -183,7 +200,10 @@ def test_write_with_the_right_secret_reaches_the_handler(
     """
     response = send_write(route, seeded_entry, 'right')
 
-    leaked = data_store.leaks_secret(response.text)
+    # FIRST, as in the 401 test. This is the one path where the RECEIVED header value IS the
+    # secret, so a response that echoed a request header would leak here and nowhere else --
+    # hence the headers, not only the body.
+    leaked = data_store.response_leaks_secret(response)
     assert not leaked, f'{route}: the response carries the instance secret (value withheld)'
     match route:
         case WriteRoute.DATASET_POST:

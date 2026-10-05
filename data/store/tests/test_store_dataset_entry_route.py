@@ -43,12 +43,32 @@ What IS proved is the half a unit-tier test owns: which status and which BODY SH
 when their request overlaps their own dataset, that no INSERT and no ingest fetch happen on that
 refusal, that a request overlapping nothing still gets through, and that the principal the caller
 declared is the principal both collaborators are handed.
+
+REPOINTED AT THE FetchDataset SEAM (validator, gating tj-3mk3u5.10). Everything above still holds;
+what changed underneath it is the collaborator. The route now takes an ``IngestFetchClient`` through
+``get_ingest_fetch_client`` instead of ``KafkaRpcFactory.RpcClients`` through ``get_rpc_clients``,
+and the worker builds a ``FetchDatasetRequest`` instead of a ``GetDatasetRequest``. The "no ingest
+fetch on a refusal" assertions are unchanged in substance -- they read the double's recorded
+requests, which is the same evidence under a different method name. ONE PIN IS GENUINELY DEAD AND IS
+NOT REPLACED BY A VAGUER ONE: ``expiry`` can no longer be compared across the two models, because
+``FetchDatasetRequest`` does not declare it -- retention is the store's business and the fetch never
+needed it. ``update_type``, which the new contract DOES carry and which selects ingest's rate-budget
+priority, takes its place in the agreement list, and the fetch's ``feed`` gets an assertion of its
+own. See the second worker case's docstring for what each of those costs.
+
+THE RETIRED PIN IS BACK (validator, gating tj-hywf7w). 12e1251 hoists the own-overlap check ahead of
+the FetchDataset stream, so ``fetch_client.requests == []`` on the 409 path is true again and is
+asserted again -- see the first case below for why it died and why its return is the evidence that
+the hoist is the right repair rather than a workaround. The two worker cases at the bottom also stop
+handing the worker a bare ``AsyncMock()`` session: the worker now issues one real statement of its
+own before the stream, which a bare AsyncMock cannot answer, so they take this file's ``FakeSession``
+like every other case here. That is a fixture correction and changes nothing either case asserts.
 """
 
 import uuid
 from collections import defaultdict
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -56,16 +76,23 @@ from sqlalchemy import Select
 from sqlalchemy.dialects.postgresql import Insert as PostgresInsert
 
 from common.enums.data_select import AssetType, DataType
-from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateType
-from data.store.app.app_depends import get_rpc_clients
+from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
+from data.store.app.app_depends import get_ingest_fetch_client
 from data.store.app.database.database import async_db
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.ingest import data_action_request
 from data.store.app.main import app
+from data.store.tests.fetch_double import (
+    FetchScript,
+    RecordingFetchClient,
+    accepted_stream,
+    assert_body_served_range,
+    served_range_of,
+)
+from data.store.tests.problem_body import problem, validation_errors
 from routers.common.instance_secret import INSTANCE_SECRET_ENV_VAR, INSTANCE_SECRET_HEADER
-from schemas.data_ingest.get_dataset_request import GetDatasetRequest
+from schemas.data_ingest.fetch_dataset import FetchDatasetRequest
 from schemas.data_store.asset_dataset_store import AssetDatasetStoreCreate, StoreAssetDatasetBody, StoreAssetDatasetPath
-from schemas.data_store.stock.market_activity_data import BatchStockDataMarketActivityCreate
 
 
 pytestmark = pytest.mark.data_store
@@ -146,34 +173,6 @@ class FakeSession:
         return None
 
 
-class RecordingRpcClient:
-    """Answers the ingest RPC with an empty dataset, and records what it was asked for.
-
-    An empty ``dataset`` means the handler stores no bars and reports 0 data points: the bar write
-    path has its own files (test_bar_write_path.py, test_bar_batch_chunking.py) and re-driving it here
-    would make this file depend on things it asserts nothing about.
-    """
-
-    def __init__(self) -> None:
-        self.requests: list = []
-
-    async def send_request(self, request) -> BatchStockDataMarketActivityCreate:
-        self.requests.append(request)
-        return BatchStockDataMarketActivityCreate(
-            asset_symbol='AAPL', source='ALPACA', feed='IEX', granularity='1day', dataset_id=uuid.uuid4(), dataset={}
-        )
-
-
-class RecordingRpcClients:
-    """Stands in for KafkaRpcFactory.RpcClients, handing out one shared client so its record is readable."""
-
-    def __init__(self) -> None:
-        self.client = RecordingRpcClient()
-
-    def get_client(self, endpoint) -> RecordingRpcClient:
-        return self.client
-
-
 def _sent_inserts(session: FakeSession) -> list:
     """Every INSERT the session was handed.
 
@@ -195,7 +194,7 @@ def _sent_selects(session: FakeSession) -> list:
 
 @pytest.fixture
 def post_dataset(monkeypatch: pytest.MonkeyPatch):
-    """A callable that drives the real POST route against a given fake session and RPC clients.
+    """A callable that drives the real POST route against a given fake session and fetch client.
 
     The instance secret is configured and sent, because the guard is a decorator-level dependency and
     is answered BEFORE any of this route's own parameters are read -- an unauthenticated request never
@@ -213,13 +212,13 @@ def post_dataset(monkeypatch: pytest.MonkeyPatch):
         monkeypatch: Sets INSTANCE_WRITE_SECRET for the duration of one test.
 
     Yields:
-        Callable: (session, rpc_clients, body) -> httpx.Response.
+        Callable: (session, fetch_client, body) -> httpx.Response.
     """
     monkeypatch.setenv(INSTANCE_SECRET_ENV_VAR, CONFIGURED_SECRET)
 
-    def send(session: FakeSession, rpc_clients: RecordingRpcClients, body: dict | None = None):
+    def send(session: FakeSession, fetch_client: RecordingFetchClient, body: dict | None = None):
         app.dependency_overrides[async_db] = lambda: session
-        app.dependency_overrides[get_rpc_clients] = lambda: rpc_clients
+        app.dependency_overrides[get_ingest_fetch_client] = lambda: fetch_client
         try:
             client = TestClient(app)
             return client.post(
@@ -268,16 +267,34 @@ def test_an_own_overlap_answers_409_carrying_the_ids_a_caller_can_extend(post_da
     So the one-id case pins the SHAPE and the two-id case pins the CARDINALITY, and the second is the
     half a single case would have lost.
 
-    NO INSERT AND NO INGEST FETCH, which is the ordering half of the requirement. The check runs before
-    the insert is attempted (``upsert_entry``: "checked BEFORE the insert is attempted"), and the route
-    calls ingest only after the entry exists. A conflict detected one step late would answer the same
-    409 having already written the row and asked the vendor for data, and the status assertion alone
-    cannot tell those apart. THE FIRST HALF OF THAT IS ALREADY PINNED ONE LAYER DOWN, and this file does
+    NO INSERT, which is the ordering half of the requirement. The check runs before the insert is
+    attempted (``check_own_overlap``, which the worker calls before it opens the stream). A conflict
+    detected one step late would answer the same 409 having already written the row, and the status
+    assertion alone cannot tell those apart. THAT IS ALREADY PINNED ONE LAYER DOWN, and this file does
     not claim it: test_dataset_entry_identity.py's test_the_overlap_check_runs_before_any_insert_is_sent
-    asserts exactly the no-INSERT property against ``upsert_entry`` directly. What is only observable
-    here is the INGEST leg -- the route asks the vendor for data through the worker, and no crud-level
-    test drives that -- so the insert assertion is a second layer over a covered property and the
-    ``rpc_clients.client.requests == []`` assertion is a new one.
+    asserts exactly the no-INSERT property against the crud function directly, so the insert assertion
+    here is a second layer over a covered property.
+
+    "AND NO INGEST FETCH" IS ALIVE AGAIN, AND IT IS THE HEADLINE EVIDENCE FOR tj-hywf7w. The history
+    is kept because the pin's value is in what it survived. Under the Kafka path the entry was written
+    first and ingest was asked second, so a refused request could be shown never to have reached
+    ingest. tj-3mk3u5.10's cutover INVERTED that -- "1. open the stream... 2. on the ACK: upsert the
+    entry" -- and this validator retired ``requests == []`` at that gate, correctly, because under that
+    order it would have been asserting against the design. What the gate on tj-3mk3u5.10 did NOT see,
+    and what the architect priced afterwards, is that the inversion made an own-overlap 409 cost a live
+    vendor call and a single-flight slot: ``IngestFetchHandler`` awaits ``reader.get_bars`` BEFORE it
+    yields the ack. 12e1251 hoists the check ahead of the stream, and because ``fetch`` is an async
+    generator that does no work until its first pull, raising there means INGEST IS NEVER ASKED AT ALL.
+    So the original guarantee is restored rather than replaced by a weaker one, and the two assertions
+    below say it at both the levels it is observable:
+      * ``requests == []`` -- the double records its request before it yields anything, so a non-empty
+        list means ``fetch`` was entered, which in production is the vendor call. This is the retired
+        assertion, back verbatim.
+      * ``journal == []`` -- strictly more than a count, and the half that bounds the WIRE waste. The
+        script carries two pages and a done, so a worker that opened the stream and then discovered the
+        conflict would leave ``yield FetchAccepted`` here even though it pulled nothing further. That is
+        exactly the state this bead exists to remove, and it is what the journal held before the hoist.
+    Un-hoisting the check reds both, and reds them with messages naming the cost rather than the order.
 
     Args:
         post_dataset: Drives the real POST route against a fake session.
@@ -285,29 +302,53 @@ def test_an_own_overlap_answers_409_carrying_the_ids_a_caller_can_extend(post_da
     """
     colliding_ids = [uuid.uuid4() for _ in range(collision_count)]
     session = FakeSession(FakeResult(rows=[(entry_id,) for entry_id in colliding_ids]))
-    rpc_clients = RecordingRpcClients()
+    fetch_client = RecordingFetchClient(FetchScript(events=accepted_stream([[0, 1], [2, 3]])))
 
-    response = post_dataset(session, rpc_clients)
+    response = post_dataset(session, fetch_client)
 
-    assert response.status_code == 409, (
-        f"a request overlapping the same owner's existing dataset(s) answered {response.status_code} "
-        f'rather than 409: {response.text}'
-    )
+    body = problem(response, status=409, reason='OWN_OVERLAP_CONFLICT')
 
-    detail = response.json()['detail']
-    assert isinstance(detail, dict), (
-        f'the 409 detail is {type(detail).__name__} rather than a structured object: {detail!r}. A '
-        f'caller builds auto-extend by READING the colliding id out of this body; an unstructured '
-        f'message makes that unbuildable (tj-vhboky.8).'
+    # THE IDS MOVED UP A LEVEL, AND THE CONTRACT DID NOT (validator, gating tj-3mk3u5.37.8). The
+    # hand-written HTTPException used to nest them in a dict under `detail`; the reason table now
+    # renders them as a top-level extension member, which is what RFC 9457 extension members are
+    # for and is the shape routers/common/errors.py's ProblemDetails declares. tj-vhboky.8's caller
+    # contract -- "read the ids, then extend" -- is satisfied by either, so this is a move and not a
+    # loss, and the assertion is on the member rather than on where it used to sit.
+    assert body['colliding_ids'] == [str(entry_id) for entry_id in colliding_ids], (
+        f'the 409 body does not carry the colliding dataset ids under colliding_ids: {body!r}'
     )
-    assert detail['colliding_ids'] == [str(entry_id) for entry_id in colliding_ids], (
-        f'the 409 body does not carry the colliding dataset ids under colliding_ids: {detail!r}'
-    )
+    # The three mutations this case was built on still apply to the member in its new place: the
+    # whole list stringified into one element reds both parameters, and reporting only the first id
+    # reds two-colliding-datasets. See this docstring's cardinality paragraph.
+
+    # `detail` is now the human sentence, not a structure. ITS EXACT RENDERING IS DELIBERATELY NOT
+    # PINNED: today it embeds a Python repr of the id list, which the orchestrator has taken to the
+    # architect as an open question, and a test asserting that text would bless an accident as the
+    # contract and turn the eventual repair into a regression. What IS asserted is the part that
+    # holds whichever way that question is answered -- the sentence names every colliding id, so a
+    # human reading the message alone can act on it.
+    detail = body['detail']
+    assert isinstance(detail, str) and detail, f'the 409 carries no human detail: {body!r}'
+    unnamed = [str(entry_id) for entry_id in colliding_ids if str(entry_id) not in detail]
+    assert unnamed == [], f'the 409 detail does not name the colliding ids {unnamed}: {detail!r}'
 
     assert _sent_selects(session), 'the overlap probe never ran, so the 409 came from somewhere else'
     assert _sent_inserts(session) == [], 'the entry was inserted despite the overlap being reported as a conflict'
     assert session.commits == 0, 'the conflicting request committed something'
-    assert rpc_clients.client.requests == [], 'ingest was asked to fetch data for a request that was refused'
+    assert session.rollbacks == 1, 'the conflicting request left its transaction open instead of rolling it back'
+    assert fetch_client.requests == [], (
+        f'ingest was asked to fetch {len(fetch_client.requests)} dataset(s) for a request the store '
+        f'already knew it would refuse. The own-overlap check is one local SELECT and depends on '
+        f'nothing the fetch returns, so it must run BEFORE the stream is opened (tj-hywf7w): ingest '
+        f'performs the vendor call and takes a rate-budget slot before it yields the ack, so a fetch '
+        f'issued here is a live vendor call -- and a held single-flight slot blocking a concurrent '
+        f'legitimate fetch for the same key -- spent entirely on a 409'
+    )
+    assert fetch_client.journal == [], (
+        f'the conflicting request pulled {fetch_client.journal} off the stream. NOTHING should have '
+        f'been consumed: the script carries two pages and a done behind the ack, so any entry here '
+        f'means the stream was opened for a request that was already refusable'
+    )
 
 
 def test_a_request_overlapping_nothing_is_written_and_answers_200(post_dataset):
@@ -331,24 +372,45 @@ def test_a_request_overlapping_nothing_is_written_and_answers_200(post_dataset):
     interned constant, so identity comparison refuses the LEGITIMATE owner. A file made only of refusal
     cases cannot see a guard that refuses too much.
 
-    The 200 body is asserted too. ``data_points`` is 0 because the fake ingest reply carries an empty
-    dataset -- what a populated one stores belongs to test_bar_batch_chunking.py -- but the key must be
-    there: the route's contract is a count, and the worker returning None would still be a 200.
+    The 200 body is asserted too. ``data_points`` is 0 because the scripted stream serves no bars --
+    what a populated one stores belongs to test_bar_batch_chunking.py and
+    test_dataset_fetch_transaction.py -- but the key must be there: the route's contract is a count,
+    and the worker returning None would still be a 200. A served-but-empty window is a success
+    carrying provenance, not a failure (ADR tj-fa1rpu D2), so this is also the case that pins an empty
+    fetch answering 200 rather than an error.
+
+    THE BODY GAINED served_range (TE-6 item 7, user ruling 2026-10-02). It is asserted as the WHOLE
+    member set, not just the new member: a route that answered the two old keys and dropped the new
+    one, and a route that added a fourth nobody declared, both have to red. The value is read off the
+    script's own FetchDone rather than written out, because the claim is that it was COPIED. That it
+    is not merely an echo of the REQUEST is this file's weakest angle on the property -- the fixture's
+    window happens to differ from the request's, but only incidentally -- so the deliberate
+    narrower-than-requested case lives in test_dataset_fetch_transaction.py, where it is the subject.
     """
     new_entry_id = uuid.uuid4()
     session = FakeSession(FakeResult(rows=[]), FakeResult(scalar=new_entry_id))
-    rpc_clients = RecordingRpcClients()
+    fetch_client = RecordingFetchClient()
 
-    response = post_dataset(session, rpc_clients)
+    response = post_dataset(session, fetch_client)
 
     assert response.status_code == 200, (
         f'a request that overlaps nothing answered {response.status_code}: {response.text}. The own-'
         f'overlap guard is refusing a legitimate create.'
     )
-    assert response.json() == {'message': 'Data stored', 'data_points': 0}
+    body = response.json()
+    assert set(body) == {'message', 'data_points', 'served_range'}, (
+        f'the 200 body members are {sorted(body)}; the declared StoreAssetDatasetResponse is message, '
+        f'data_points and served_range'
+    )
+    assert (body['message'], body['data_points']) == ('Data stored', 0)
+    assert_body_served_range(body, served_range_of(fetch_client.script))
     assert len(_sent_inserts(session)) == 1, 'the accepted request did not insert exactly one entry'
     assert session.commits == 1, 'the accepted request was never committed'
-    assert len(rpc_clients.client.requests) == 1, 'the accepted request never asked ingest for its data'
+    assert len(fetch_client.requests) == 1, 'the accepted request never asked ingest for its data'
+    assert fetch_client.journal == ['yield FetchAccepted', 'yield FetchDone'], (
+        f'the accepted request consumed {fetch_client.journal}: an empty stream is the ack and the '
+        f'done, and a worker that stopped at the ack would commit an entry it never finished fetching'
+    )
 
 
 # ---------------------------------------------------------------------------------------------
@@ -379,16 +441,19 @@ def test_an_offset_less_datetime_answers_422_naming_its_field_and_writes_nothing
         offset_less: Its ISO-8601 text, with no 'Z' and no offset.
     """
     session = FakeSession()
-    rpc_clients = RecordingRpcClients()
+    fetch_client = RecordingFetchClient()
 
-    response = post_dataset(session, rpc_clients, REQUEST_BODY | {field: offset_less})
+    response = post_dataset(session, fetch_client, REQUEST_BODY | {field: offset_less})
 
-    assert response.status_code == 422, f'an offset-less {field} answered {response.status_code}: {response.text}'
-    assert [(error['loc'], error['type']) for error in response.json()['detail']] == [
+    assert [(error['loc'], error['type']) for error in validation_errors(response)] == [
         (['body', field], 'timezone_aware')
     ], f'the 422 does not name {field} as timezone_aware: {response.text}'
     assert session.statements == [], 'a request refused at the edge still reached the database'
-    assert rpc_clients.client.requests == [], 'ingest was asked to fetch data for a request that was refused'
+    # STILL A LIVE PIN AFTER tj-3mk3u5.10, unlike the same assertion on the 409 above. The fetch now
+    # precedes the entry upsert, so an own-overlap DOES reach ingest -- but a body refused by
+    # validation never reaches the handler at all, so nothing may be fetched for it. That distinction
+    # is the whole reason the two assertions diverged.
+    assert fetch_client.requests == [], 'ingest was asked to fetch data for a request refused at the edge'
 
 
 # The GET on the same address: the dataset SEARCH, bound to StoreAssetDatasetQuery with Query().
@@ -431,8 +496,7 @@ def test_an_offset_less_search_bound_answers_422_naming_its_field_and_reads_noth
         # `app` is a module-level singleton other test modules import.
         app.dependency_overrides.clear()
 
-    assert response.status_code == 422, f'an offset-less {field} answered {response.status_code}: {response.text}'
-    assert [(error['loc'], error['type']) for error in response.json()['detail']] == [
+    assert [(error['loc'], error['type']) for error in validation_errors(response)] == [
         (['query', field], 'timezone_aware')
     ], f'the 422 does not name {field} as timezone_aware: {response.text}'
     assert session.statements == [], 'a search refused at the edge still reached the database'
@@ -446,9 +510,9 @@ def test_an_offset_less_search_bound_answers_422_naming_its_field_and_reads_noth
 def _only_instance(mock_call, model_type):
     """The single argument of ``mock_call`` that is an instance of ``model_type``, positional or keyword.
 
-    Searched rather than indexed so that a later builder switching ``upsert_entry(db, entry)`` to a
-    keyword argument -- a legitimate refactor -- does not red this test for a reason that has nothing
-    to do with the principal it asserts.
+    Searched rather than indexed so that a later builder switching
+    ``upsert_entry_in_transaction(db, entry)`` to a keyword argument -- a legitimate refactor -- does
+    not red this test for a reason that has nothing to do with the principal it asserts.
 
     Args:
         mock_call: A ``unittest.mock`` call object, i.e. ``some_mock.await_args``.
@@ -489,25 +553,31 @@ async def test_the_worker_writes_and_fetches_under_the_principal_the_caller_decl
     Those tests prove the KEY is present. Neither looks at the VALUE, and a wrong value validates
     perfectly.
 
-    ``upsert_entry`` and ``batch_create_market_activity_data`` are replaced at the module level, not the
-    session: this test asserts what the worker HANDS its collaborators, so the collaborators are the
-    seam. The reply carries an empty dataset, so the bar write path is not reached at all.
+    ``upsert_entry_in_transaction`` is replaced at the module level, not the session: this test asserts
+    what the worker HANDS its collaborators, so the collaborators are the seam. The scripted stream
+    serves no bars, so the bar write path is not reached at all.
+
+    REPOINTED (validator, tj-3mk3u5.10): the second leg is now a ``FetchDatasetRequest`` instead of a
+    ``GetDatasetRequest``, and ``owner`` is a declared required field on it too (SensitiveStr, "carried
+    so the fetch knows which principal it acts for and may not invent one downstream"), so both the
+    property and the mutation it guards survive the contract change unchanged.
 
     Args:
-        monkeypatch: Replaces the worker's two collaborators for the duration of the test.
+        monkeypatch: Replaces the worker's upsert collaborator for the duration of the test.
     """
     upsert = AsyncMock(return_value=uuid.uuid4())
-    monkeypatch.setattr(data_action_request, 'upsert_entry', upsert)
+    monkeypatch.setattr(data_action_request, 'upsert_entry_in_transaction', upsert)
 
-    rpc_client = RecordingRpcClient()
-    rpc_clients = MagicMock()
-    rpc_clients.get_client = MagicMock(return_value=rpc_client)
+    fetch_client = RecordingFetchClient()
 
+    # A FakeSession rather than a bare AsyncMock: the worker runs the hoisted own-overlap SELECT
+    # itself (tj-hywf7w), ahead of the collaborator this case replaces, and an AsyncMock answers it
+    # with a coroutine that `_find_own_overlap` cannot iterate. The empty row set is "no overlap".
     await data_action_request.store_market_activity_worker(
         StoreAssetDatasetPath(asset_type=AssetType.STOCK, data_type=DataType.MARKET_ACTIVITY, asset_symbol='AAPL'),
         StoreAssetDatasetBody(**REQUEST_BODY),
-        MagicMock(),
-        rpc_clients,
+        FakeSession(FakeResult(rows=[])),
+        fetch_client,
     )
 
     created = _only_instance(upsert.await_args, AssetDatasetStoreCreate)
@@ -516,9 +586,9 @@ async def test_the_worker_writes_and_fetches_under_the_principal_the_caller_decl
         f'declared ({DECLARED_PRINCIPAL!r}). owner is identity, so this is a different dataset.'
     )
 
-    assert len(rpc_client.requests) == 1, 'the worker did not ask ingest for the dataset exactly once'
-    fetched = rpc_client.requests[0]
-    assert isinstance(fetched, GetDatasetRequest), f'ingest was asked with a {type(fetched).__name__}'
+    assert len(fetch_client.requests) == 1, 'the worker did not ask ingest for the dataset exactly once'
+    fetched = fetch_client.requests[0]
+    assert isinstance(fetched, FetchDatasetRequest), f'ingest was asked with a {type(fetched).__name__}'
     assert fetched.owner == DECLARED_PRINCIPAL, (
         f'ingest is being asked to fetch on behalf of {fetched.owner!r} rather than the principal the '
         f'caller declared ({DECLARED_PRINCIPAL!r})'
@@ -536,7 +606,7 @@ async def test_the_entry_and_the_fetch_agree_on_every_identity_field_the_caller_
     not the other is a real shape, and it is the shape that makes the entry claim coverage of a range
     the fetch was never asked for -- this epic's stated failure class.
 
-    IT EARNS ITS PLACE ON TWO MUTATIONS NOTHING ELSE CATCHES, measured against the whole suite:
+    IT EARNED ITS PLACE ON TWO MUTATIONS NOTHING ELSE CAUGHT, measured against the suite as it stood:
       * recomputing ``expiry`` on the fetch leg instead of forwarding the body's --
         ``model_dump() | {'expiry': datetime.now(UTC) + timedelta(days=2)}`` -- which is exactly the
         plausible repair, since the body computes that default itself. 1 red: this case. The entry then
@@ -544,6 +614,23 @@ async def test_the_entry_and_the_fetch_agree_on_every_identity_field_the_caller_
       * ``data_types=[request_path.data_type]`` -> ``data_types=[]``. 1 red: this case. The entry is
         written and ingest is asked for nothing, so the dataset exists and stays empty.
     The owner substitutions red this case too, but the case above is what names those.
+
+    ONE OF THOSE TWO IS NOW DEAD, AND IT IS NOT REPLACED BY A SOFTER VERSION OF ITSELF (validator,
+    tj-3mk3u5.10). ``FetchDatasetRequest`` does not declare ``expiry`` -- "exactly the fields a reader
+    consumes, and nothing more"; retention is the store's business and no reader ever touched it -- so
+    the expiry mutation cannot be written any more and the two models cannot disagree about a field one
+    of them does not have. Comparing it would be comparing a value against ``AttributeError``.
+
+    WHAT TAKES ITS PLACE IS A FIELD THAT IS LOAD-BEARING ON THE NEW CONTRACT AND WAS NOT ON THE OLD
+    ONE. ``update_type`` travels the same splat and selects ingest's RATE BUDGET PRIORITY (STREAM ->
+    LIVE, STATIC -> BACKFILL, anything else -> INTERACTIVE), so a substituted value makes a backfill
+    compete with live traffic, or the reverse, while the entry records the update type the caller
+    actually asked for. The second new assertion is that the fetch names NO feed: an absent feed means
+    "the deployment decides", and a worker that started naming one would be steering a tape it is not
+    entitled to choose (tj-3mk3u5.22 Q5 -- ingest can only CHECK a named feed, never be steered by it,
+    so a wrong guess turns an ordinary fetch into a refusal).
+
+    The ``data_types`` mutation is unchanged: the new contract carries the same list field.
 
     WHAT THIS CASE DOES NOT REACH, measured rather than assumed:
     ``data_types=[request_path.data_type]`` -> ``data_types=[DataType.MARKET_ACTIVITY]``, i.e. hard-coding
@@ -555,36 +642,38 @@ async def test_the_entry_and_the_fetch_agree_on_every_identity_field_the_caller_
     market activity regardless. Pinning that would freeze an accident and make the eventual narrowing look
     like a regression, so the assertion message below claims only the emptied half.
 
-    ``data_type`` is deliberately not compared: the entry carries it and ``GetDatasetRequest`` takes a
-    ``data_types`` LIST instead, which the worker builds from the path. ``expiry`` is compared because
-    it is the field whose null-through-the-splat was a 500 on caller-shaped input (tj-uupb4q), so the
-    two models agreeing on it is worth having recorded here as well.
+    ``data_type`` is deliberately not compared: the entry carries it and ``FetchDatasetRequest`` takes
+    a ``data_types`` LIST instead, which the worker builds from the path.
 
     Args:
         monkeypatch: Replaces the worker's upsert collaborator for the duration of the test.
     """
     upsert = AsyncMock(return_value=uuid.uuid4())
-    monkeypatch.setattr(data_action_request, 'upsert_entry', upsert)
+    monkeypatch.setattr(data_action_request, 'upsert_entry_in_transaction', upsert)
 
-    rpc_client = RecordingRpcClient()
-    rpc_clients = MagicMock()
-    rpc_clients.get_client = MagicMock(return_value=rpc_client)
+    fetch_client = RecordingFetchClient()
 
     request_path = StoreAssetDatasetPath(
         asset_type=AssetType.STOCK, data_type=DataType.MARKET_ACTIVITY, asset_symbol='AAPL'
     )
+    # See the case above for why this is a FakeSession and not a bare AsyncMock (tj-hywf7w).
     await data_action_request.store_market_activity_worker(
-        request_path, StoreAssetDatasetBody(**REQUEST_BODY), MagicMock(), rpc_clients
+        request_path, StoreAssetDatasetBody(**REQUEST_BODY), FakeSession(FakeResult(rows=[])), fetch_client
     )
 
     created = _only_instance(upsert.await_args, AssetDatasetStoreCreate)
-    fetched = rpc_client.requests[0]
+    fetched = fetch_client.requests[0]
 
-    for field in ('owner', 'asset_symbol', 'asset_type', 'source', 'granularity', 'start', 'end', 'expiry'):
+    for field in ('owner', 'asset_symbol', 'asset_type', 'source', 'granularity', 'start', 'end', 'update_type'):
         assert getattr(created, field) == getattr(fetched, field), (
             f'the entry being written and the fetch being requested disagree on {field}: '
             f'{getattr(created, field)!r} vs {getattr(fetched, field)!r}'
         )
+    assert fetched.feed is None, (
+        f'the fetch names feed={fetched.feed!r}. No caller can ask for a tape today, and an absent '
+        f'feed is what means "the deployment decides" -- naming one turns a fetch ingest would have '
+        f'served into one it can only check and refuse'
+    )
     assert fetched.data_types == [request_path.data_type], (
         'the fetch asks for a data type the request path did not name -- an emptied data_types list '
         'would leave the entry claiming coverage of bars nobody asked ingest for. A HARD-CODED list is '
@@ -639,6 +728,12 @@ def test_the_dataset_search_answers_enum_names_and_nulls_on_the_wire(expiry_type
         asset_type=AssetType.STOCK,
         data_type=DataType.MARKET_ACTIVITY,
         granularity=Granularity.ONE_DAY,
+        # The RESOLVED tape the row records (tj-3mk3u5.31). Not parameterised with the two enums
+        # above: Feed is a plain StrEnum with no name/value split and no serializer of its own, so
+        # it has nothing of the encoding question this test is about. What matters here is that it
+        # reaches the wire AT ALL -- an AssetDatasetStore that dropped it would answer a dataset
+        # without saying which tape covered it, which is the coverage lie tj-f2qz44 is about.
+        feed=Feed.SIP,
         start=_WHEN,
         end=None,
         expiry=None,
@@ -661,6 +756,7 @@ def test_the_dataset_search_answers_enum_names_and_nulls_on_the_wire(expiry_type
             'owner': DECLARED_PRINCIPAL,
             'source': 'ALPACA',
             'granularity': '1day',
+            'feed': 'SIP',
             'start': '2026-01-01T00:00:00Z',
             'end': None,
             'expiry': None,

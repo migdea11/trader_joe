@@ -14,7 +14,7 @@ ARG GID=1000
 # has to install Python on the host to use it. Distribution packages rather than pip, because a
 # bookworm base refuses pip installs into the system environment.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl git jq less openssh-client ripgrep tar nodejs npm \
+        ca-certificates curl git jq less openssh-client ripgrep tar \
         python3 python3-yaml \
     && rm -rf /var/lib/apt/lists/*
 
@@ -65,6 +65,10 @@ RUN set -eux; \
 # Not the dev container feature either: this image is built by `make agent-build`, a plain
 # `docker compose build`, and devcontainer.json's features are applied only by the Dev Containers
 # CLI or IDE extension. Declaring the feature installs nothing here — it leaves no Claude at all.
+#
+# nodejs and npm left the first apt line with the npm install (tj-3mk3u5.52): nothing else in this
+# image runs them, and VS Code brings its own node for its server. Something that does need them,
+# such as an MCP server started through npx, is the reason to add them back; name it here if so.
 
 # --- tailored for trader_joe from here down -------------------------------------------------
 # The project's own toolchain, so an agent can actually run `make test` / `make lint` instead of
@@ -90,6 +94,58 @@ RUN set -eux; \
     install -m 0755 "/tmp/uv-${target}/uvx" /usr/local/bin/uvx; \
     rm -rf /tmp/uv.tar.gz "/tmp/uv-${target}"; \
     uv --version
+
+# buf, which `make lint` runs on proto/ when PATHS covers it (tj-3mk3u5.54): the bare release binary,
+# pinned and checksum-verified on the same rule as bd, dolt and uv. It lints only; protoc generates.
+# These values MIRROR the Makefile's BUF_VERSION, BUF_SHA256_X86_64 and BUF_SHA256_AARCH64, which are
+# the one authority: this build's context is .devcontainer/, so it cannot read the Makefile.
+# common/tests/test_agent_image.py pins them equal, and all of them move together, in one commit.
+# Until this image is rebuilt, `make buf-install` puts the same pin in ~/.local/bin.
+RUN set -eux; \
+    version='1.73.0'; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) asset='buf-Linux-x86_64'; sum='8f2986298ad08f0cc1bf999b9797b7c383adf32d7edf0f73d6f1e1a701baeac1' ;; \
+      arm64) asset='buf-Linux-aarch64'; sum='902b75267db7f4391e99b7fa0756050e5354234cc0437ef50eee9c788950c7a3' ;; \
+      *) echo "no buf checksum pinned for ${arch}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/buf \
+      "https://github.com/bufbuild/buf/releases/download/v${version}/${asset}"; \
+    echo "${sum}  /tmp/buf" | sha256sum -c -; \
+    install -m 0755 /tmp/buf /usr/local/bin/buf; \
+    rm /tmp/buf; \
+    buf --version; \
+    [ "$(buf --version)" = "${version}" ]
+
+# shellcheck, which `make lint` runs on every *.sh under PATHS (tj-xc6nfv): pinned and
+# checksum-verified on the same rule as bd, dolt, uv and buf. It lints only; nothing formats shell.
+# These values MIRROR the Makefile's SHELLCHECK_VERSION, SHELLCHECK_SHA256_X86_64 and
+# SHELLCHECK_SHA256_AARCH64, which are the one authority: this build's context is .devcontainer/, so
+# it cannot read the Makefile. All of them move together, in one commit.
+# A SEPARATE RUN from buf's, not folded into it: common/tests/test_agent_image.py executes the buf RUN
+# with dpkg, curl, sha256sum, install, rm and buf stubbed and asserts its exact call sequence, so an
+# extra command inside it breaks a test that is checking something else entirely.
+# NOT `apt-get install shellcheck`: bookworm ships 0.9.0, and a linter at a version other than the one
+# `make lint` pins reports a different set of findings.
+# .tar.gz, not the smaller .tar.xz, because the release's .xz needs an xz binary this image does not
+# have; tar and gzip are Essential in Debian. The archive holds shellcheck-v${version}/shellcheck.
+# Until this image is rebuilt, `make shellcheck-install` puts the same pin in ~/.local/bin.
+RUN set -eux; \
+    version='0.11.0'; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) asset="shellcheck-v${version}.linux.x86_64.tar.gz"; sum='b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6' ;; \
+      arm64) asset="shellcheck-v${version}.linux.aarch64.tar.gz"; sum='68a8133197a50beb8803f8d42f9908d1af1c5540d4bb05fdfca8c1fa47decefc' ;; \
+      *) echo "no shellcheck checksum pinned for ${arch}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/shellcheck.tar.gz \
+      "https://github.com/koalaman/shellcheck/releases/download/v${version}/${asset}"; \
+    echo "${sum}  /tmp/shellcheck.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/shellcheck.tar.gz -C /tmp; \
+    install -m 0755 "/tmp/shellcheck-v${version}/shellcheck" /usr/local/bin/shellcheck; \
+    rm -rf /tmp/shellcheck.tar.gz "/tmp/shellcheck-v${version}"; \
+    shellcheck --version; \
+    [ "$(shellcheck --version | awk '/^version:/ {print $2}')" = "${version}" ]
 
 # make drives every command binding in the manifest; bookworm ships Python 3.11, so uv supplies
 # the 3.12 the project requires. UV_PYTHON_INSTALL_DIR is outside $HOME so it survives the
@@ -132,6 +188,10 @@ USER ${USERNAME}
 # the image, but never re-seeds a populated one, so after a version bump the volume would still
 # hold the old payload while the image's launcher symlink pointed at a version that is not there.
 ENV PATH="/home/${USERNAME}/.local/bin:${PATH}"
+# No checksum is pinned on this script, unlike bd, dolt and uv above, and on purpose: accepted risk
+# tj-y9imnu. The trust root is the vendor origin, which the in-place updater pulls every later
+# version from anyway, so a pin here would protect one build and nothing after it; upstream
+# publishes no checksum to pin.
 RUN curl -fsSL https://claude.ai/install.sh | bash -s 2.1.274 \
     && claude --version
 

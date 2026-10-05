@@ -1,0 +1,77 @@
+// THE SHARED MARKET-DATA VOCABULARY (decision tj-3mk3u5.42 F1, rule 8). Every contract may import
+// this package; it imports nothing but google/protobuf, and it never imports a contract. These enums
+// MIRROR the Python ones in common/enums, which stay canonical: the wire carries member NAMES
+// (tj-vhboky.30), so a hand-written mapper in common/rpc strips the prefix below and looks the rest
+// up by name. They are in their own file so a consumer that wants the vocabulary without a bar --
+// the UI uses UpdateType (tj-grna9p.4 section 5) -- imports this and not bar.proto.
+//
+// WHY EVERY VALUE CARRIES ITS ENUM'S NAME AS A PREFIX (F1, rule 9). protoc scopes an enum's values as
+// siblings of the enum within the package, not inside the enum, so two enums here could not both
+// declare UNSPECIFIED. Buf's STANDARD lint requires the prefix for the same reason.
+//
+// THE ZERO VALUE IS NOT A SENTINEL, AND NOTHING MAY TREAT IT AS ONE. proto3 requires a zero value and
+// buf requires it to end _UNSPECIFIED, but common/enums deliberately has no "we do not know" member:
+// Feed.UNKNOWN was removed by the user's ruling on tj-vhboky.1, because "a value that should never be
+// written is better expressed as an ERROR than as an enum member". So each _UNSPECIFIED below exists
+// only to satisfy proto3, it has no Python counterpart, and the mapper REFUSES it on decode wherever
+// the field is required. It never reaches a domain model.
+syntax = "proto3";
+
+package trader_joe.proto.market.v1;
+
+// Which vendor or process the data came from. Mirrors common.enums.data_stock.DataSource, by member
+// NAME: the Python values are the shorter 'IB', 'ALPACA' and 'MANUAL', and the names are what cross.
+enum DataSource {
+  DATA_SOURCE_UNSPECIFIED = 0;
+  DATA_SOURCE_IB_API = 1;
+  DATA_SOURCE_ALPACA_API = 2;
+  DATA_SOURCE_MANUAL_ENTRY = 3;
+}
+
+// What kind of instrument. Mirrors common.enums.data_select.AssetType.
+enum AssetType {
+  ASSET_TYPE_UNSPECIFIED = 0;
+  ASSET_TYPE_STOCK = 1;
+  ASSET_TYPE_CRYPTO = 2;
+  ASSET_TYPE_OPTION = 3;
+}
+
+// Which series is being asked for. Mirrors common.enums.data_select.DataType.
+enum DataType {
+  DATA_TYPE_UNSPECIFIED = 0;
+  DATA_TYPE_MARKET_ACTIVITY = 1;
+  DATA_TYPE_QUOTE = 2;
+  DATA_TYPE_TRADE = 3;
+}
+
+// The width of one bar. Mirrors common.enums.data_stock.Granularity by member NAME; the Python values
+// ('1min', '5min', ...) and the timedelta offset beside each member do not cross the wire.
+enum Granularity {
+  GRANULARITY_UNSPECIFIED = 0;
+  GRANULARITY_ONE_MINUTE = 1;
+  GRANULARITY_FIVE_MINUTES = 2;
+  GRANULARITY_THIRTY_MINUTES = 3;
+  GRANULARITY_ONE_HOUR = 4;
+  GRANULARITY_ONE_DAY = 5;
+  GRANULARITY_ONE_WEEK = 6;
+  GRANULARITY_ONE_MONTH = 7;
+}
+
+// Which tape served the data. Mirrors common.enums.data_stock.Feed, the superset composed from
+// UsEquityFeed and NoTapeFeed. NOT_APPLICABLE is a real value for an instrument with no tape, never a
+// stand-in for a feed nobody resolved -- that case is an error, not a member.
+enum Feed {
+  FEED_UNSPECIFIED = 0;
+  FEED_IEX = 1;
+  FEED_SIP = 2;
+  FEED_NOT_APPLICABLE = 3;
+}
+
+// How the dataset is kept current. Mirrors common.enums.data_stock.UpdateType, a NamedIntEnum whose
+// encoder already puts the member NAME on the wire, so the spelling here matches what Kafka carries.
+enum UpdateType {
+  UPDATE_TYPE_UNSPECIFIED = 0;
+  UPDATE_TYPE_STATIC = 1;
+  UPDATE_TYPE_DAILY = 2;
+  UPDATE_TYPE_STREAM = 3;
+}

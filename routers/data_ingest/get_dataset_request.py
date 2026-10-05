@@ -1,39 +1,17 @@
-from typing import TYPE_CHECKING, Any
+"""data_ingest's HTTP router, now empty: the dataset request is served over gRPC, not here.
+
+Until tj-3mk3u5.11 this module also built a KafkaRpcFactory at import and decorated store_data with
+@rpc.add_server(InterfaceRpc.INGEST_DATASET), which dispatched into data/ingest/app/ingest_control.py.
+Both are gone with the Kafka transport. The dataset request is answered by the gRPC IngestService,
+whose domain handler is routers/data_ingest/fetch_dataset_handler.py::IngestFetchHandler and whose
+registration is data/ingest/app/grpc_host.py::registered_services.
+
+The router itself stays because main.create_app mounts it, and because an HTTP route added to
+routers/data_ingest later belongs here -- which is also what the `none` declaration in
+routers/tests/interface_manifest/data_ingest.manifest keeps guarded (decision tj-3wgh03).
+"""
 
 from fastapi import APIRouter
 
-from common.enums.data_select import AssetType
-from common.kafka.kafka_config import get_rpc_params
-from common.kafka.kafka_rpc_factory import KafkaRpcFactory
-from common.kafka.topics import ConsumerGroup
-from common.logging import get_logger
-from data.ingest.app.ingest_control import store_retrieve_crypto, store_retrieve_option, store_retrieve_stock
-from schemas.data_ingest.get_dataset_request import (
-    CryptoDatasetRequest,
-    GetDatasetRequest,
-    OptionDatasetRequest,
-    StockDatasetRequest,
-)
-from schemas.data_store.stock.market_activity_data import BatchStockDataMarketActivityCreate
-
-from .app_endpoints import InterfaceRpc
-
-
-if TYPE_CHECKING:
-    from pydantic import BaseModel
-
-log = get_logger(__name__)
 
 router = APIRouter()
-rpc = KafkaRpcFactory(get_rpc_params(ConsumerGroup.DATA_INGEST_GROUP))
-
-
-@rpc.add_server(InterfaceRpc.INGEST_DATASET)
-async def store_data(request: GetDatasetRequest) -> BatchStockDataMarketActivityCreate:
-    asset_map: dict[AssetType, tuple[type[BaseModel], Any]] = {
-        AssetType.STOCK: (StockDatasetRequest, store_retrieve_stock),
-        AssetType.CRYPTO: (CryptoDatasetRequest, store_retrieve_crypto),
-        AssetType.OPTION: (OptionDatasetRequest, store_retrieve_option),
-    }
-    input_type, callback = asset_map[request.asset_type]
-    return await callback(input_type(**request.model_dump()))

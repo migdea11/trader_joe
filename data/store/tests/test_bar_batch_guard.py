@@ -30,6 +30,7 @@ from sqlalchemy.exc import OperationalError
 
 from common.enums.data_select import DataType
 from common.enums.data_stock import DataSource, Feed, Granularity
+from common.errors.vocabulary import ExogenousError, Reason
 from data.store.app.database.crud.stock.asset_market_activity import (
     DuplicateBatchTimestamp,
     _as_utc,
@@ -284,6 +285,8 @@ def test_to_schema_reports_the_tape_that_served_the_row(stored_feed: Feed):
 # commit in write_transaction; the refresh and to_schema run after the block.
 
 LEAKED_SQL = 'INSERT INTO stock_market_activity -- validator-marker-c41e'
+# The bound-parameter half of the canary, standing in for an owner (D8).
+LEAKED_OWNER = 'validator-marker-owner'
 
 
 def _single_bar() -> StockDataMarketActivityCreate:
@@ -342,13 +345,20 @@ async def test_a_failing_commit_on_a_single_bar_rolls_back_once(
     """Pins 4 and 5: the rollback this function never had, and one clean ERROR record.
 
     Before cf3ec69 a failing commit left the session in a failed transaction and raised; nothing
-    rolled it back. Through the helper: one rollback, no refresh of a row that did not land, the
-    same error object out, and exactly one ERROR record from the helper's logger whose message
-    does not carry the error's text.
+    rolled it back. Through the helper: one rollback, no refresh of a row that did not land, a
+    typed error out, and exactly one ERROR record from the helper's logger whose message does not
+    carry the error's text.
+
+    REPOINTED (validator, gating tj-3mk3u5.37.8): "the same error object out" became "the typed
+    error out, with the original chained". TE-6's write_transaction classifies an OperationalError
+    as DATABASE_UNAVAILABLE and raises an ExogenousError from it (ADR tj-fa1rpu D5), so identity is
+    no longer available and `__cause__` carries exactly the object this case used to assert on.
+    The rollback pin -- which is what this case is NAMED for and what cf3ec69 was about -- is
+    untouched, and the canary now covers the caller's detail as well as the log.
     """
     caplog.set_level(logging.DEBUG)
     db, call_order = single_write_session
-    error = OperationalError(LEAKED_SQL, {'owner': 'validator-marker-owner'}, Exception('connection reset'))
+    error = OperationalError(LEAKED_SQL, {'owner': LEAKED_OWNER}, Exception('connection reset'))
 
     def fail_the_commit():
         call_order.append('commit')
@@ -356,16 +366,22 @@ async def test_a_failing_commit_on_a_single_bar_rolls_back_once(
 
     db.commit.side_effect = fail_the_commit
 
-    with pytest.raises(OperationalError) as raised:
+    with pytest.raises(ExogenousError) as raised:
         await create_market_activity_data(db, _single_bar())
 
-    assert raised.value is error, 'the commit error was replaced on its way out'
+    assert raised.value.reason is Reason.DATABASE_UNAVAILABLE, f'a failing commit was reported as {raised.value.reason}'
+    assert raised.value.__cause__ is error, 'the commit error is no longer chained to what the caller gets'
     assert call_order == ['add', 'commit', 'rollback'], 'the failed single-bar write was not rolled back exactly once'
     (record,) = [record for record in caplog.records if record.levelno >= logging.ERROR]
     assert record.name == write_transaction.__module__
     assert record.exc_info is not None and record.exc_info[1] is error
     for any_record in caplog.records:
         assert LEAKED_SQL not in any_record.getMessage()
+    # The canary on the caller's own surfaces, not only the log: this is what gets rendered into
+    # the problem+json body (D8).
+    assert LEAKED_SQL not in raised.value.detail and LEAKED_OWNER not in raised.value.detail, (
+        "the statement or a bound parameter reached the caller's detail, so it reaches the body"
+    )
 
 
 def test_model_validate_on_a_stored_row_still_raises():

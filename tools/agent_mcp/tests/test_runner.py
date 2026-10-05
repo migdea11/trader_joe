@@ -20,6 +20,7 @@ import pytest
 
 from tools.agent_mcp import runner, stack
 from tools.agent_mcp.tests.harness import (
+    DEV_PROJECT_VERBS,
     LIVE_ENV_SENTINEL,
     VERB_SAMPLES,
     WORKTREE_NAME,
@@ -50,8 +51,12 @@ _SHAPE_REFUSALS = {
         for index, name in enumerate(_BAD_NAMES)
     },
     **{f'seed_dump-name-{index}': ('seed_dump', {'worktree': name}) for index, name in enumerate(_BAD_NAMES)},
-    'unknown keyword on ps': ('ps', {'bogus': 1}),
-    'unknown keyword on stack_up': ('stack_up', {'worktree': WORKTREE_NAME, 'extra': 'x'}),
+    # THE CLOSED SCHEMA, SWEPT OVER EVERY VERB (tj-tq2hn6 R4). This was two hand-written cases, ps
+    # and stack_up, so neither dev verb had ever been shown to refuse an unknown keyword -- a verb
+    # was covered only if someone remembered to add it. Generated from VERB_SAMPLES instead, which
+    # test_commands.test_every_verb_has_a_sample pins equal to AgentStack's verb table, so the next
+    # verb added is covered by construction rather than by memory.
+    **{f'unknown keyword on {verb}': (verb, {**sample, 'bogus': 1}) for verb, sample in VERB_SAMPLES.items()},
     'a compose argument smuggled as a keyword': ('stack_down', {'volumes': True}),
     'missing required': ('stack_up', {}),
     'positional (a list)': ('stack_up', [WORKTREE_NAME]),
@@ -93,6 +98,12 @@ def test_a_malformed_call_is_refused_with_no_git_no_copy_and_no_docker(
     _no_subprocess(rig)
     assert copies == [], 'the snapshot was refreshed for a refused call'
     assert json.loads(rig.audit_lines()[-1])['arguments'] is None, 'a refused argument reached the audit log'
+
+
+def test_every_verb_is_swept_for_an_unknown_keyword():
+    """tj-tq2hn6 R4: the generated sweep above must cover every verb, not the two it used to name."""
+    swept = {verb for name, (verb, _) in _SHAPE_REFUSALS.items() if name.startswith('unknown keyword on ')}
+    assert swept == set(VERB_SAMPLES), f'not swept: {sorted(set(VERB_SAMPLES) - swept)}'
 
 
 @pytest.mark.parametrize('verb', ['stack_up', 'run_system_tests', 'seed_dump'])
@@ -446,11 +457,22 @@ def test_a_worktree_swapped_for_a_symlink_mid_verb_never_reaches_the_daemon(
     assert rig.docker.steps == []
 
 
-@pytest.mark.parametrize('verb', ['stack_down', 'stack_wipe', 'logs', 'ps'])
+# The dev pair belongs here too (tj-v4e9ke, from tj-tq2hn6's residual): _dev_steps's docstring claims
+# 'the snapshot is not used -- these verbs read no worktree at all', and until they were listed that
+# claim was unpinned. migrate_check, added after this list was written, does NOT belong: it BUILDS
+# data_store before it compares (stack.alembic_check_steps), so it is a BUILDING_VERB in test_bases
+# and reads the snapshot like every other alembic verb. Everything here is in BASE_FREE_VERBS.
+@pytest.mark.parametrize('verb', ['stack_down', 'stack_wipe', 'logs', 'ps', 'dev_ps', 'dev_logs'])
 def test_verbs_that_build_nothing_read_no_worktree_and_need_no_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str
 ):
-    """S6: never a copy from any worktree; an empty snapshot is made when there is none."""
+    """S6: never a copy from any worktree; an empty snapshot is made when there is none.
+
+    The dev pair is held to the STRONGER half of that, and it is the half _dev_steps claims in so
+    many words: the snapshot is not used at all. An agent-stack verb still needs the directory to
+    exist because compose is handed it as --project-directory; a dev verb names no project
+    directory, so the snapshot must still be absent after it has run.
+    """
     rig = make_rig(tmp_path, monkeypatch)
 
     def no_copy(*args: Any, **kwargs: Any) -> None:
@@ -461,7 +483,10 @@ def test_verbs_that_build_nothing_read_no_worktree_and_need_no_snapshot(
     assert not rig.layout.snapshot.exists()
     result = rig.call(verb, dict(VERB_SAMPLES[verb]))
     assert result['status'] == 'ok', result
-    assert rig.layout.snapshot.is_dir() and list(rig.layout.snapshot.iterdir()) == []
+    if verb in DEV_PROJECT_VERBS:
+        assert not rig.layout.snapshot.exists(), 'a dev verb reached the snapshot'
+    else:
+        assert rig.layout.snapshot.is_dir() and list(rig.layout.snapshot.iterdir()) == []
     assert all(call == ('worktree', 'list', '--porcelain') or call[0] == 'cat-file' for call in rig.git.calls)
 
 

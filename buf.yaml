@@ -1,0 +1,28 @@
+# Buf's configuration for proto/: lint, format and breaking checks only (decision tj-3mk3u5.42 addendum
+# R4-RULED; ADR tj-8konfu D1/C3 addendum). Buf does NOT generate code here: `make proto` does, with the
+# pinned grpcio-tools protoc. `make lint` runs every check below when PATHS is '.' or under proto/, and
+# `make lint-fix` applies buf format. proto/README.md, 'Lint and breaking checks', is the reader's guide.
+version: v2
+modules:
+  # THE MODULE ROOT IS proto/, the include root `make proto` passes to protoc (-Iproto). Rooted at the
+  # repository instead, PACKAGE_DIRECTORY_MATCH would expect every package to start 'proto.' and every
+  # file would fail.
+  - path: proto
+lint:
+  # STANDARD and nothing else: no except and no ignore. Comment ignores are off, so a
+  # `// buf:lint:ignore` in a .proto suppresses nothing. The only way to exempt anything is a reviewed
+  # change to this file, and that needs a Q:@architect first.
+  use:
+    - STANDARD
+  disallow_comment_ignores: true
+breaking:
+  # FILE, Buf's default and strictest set: wire, JSON and generated-source compatibility. The SDK and
+  # the web consume generated source, and canonical JSON (tj-grna9p.4) consumes names.
+  use:
+    - FILE
+  # Internal contracts deploy both ends together and may break freely (tj-3mk3u5.42 R3, F1). The path
+  # is relative to THIS FILE, as Buf's v2 docs require, not to the module root. Spelled relative to
+  # the module root (trader_joe/proto/internal) it matches nothing, and buf says nothing about it: an
+  # internal break is then reported like any other. Proven both ways on buf 1.73.0 (tj-3mk3u5.54).
+  ignore:
+    - proto/trader_joe/proto/internal

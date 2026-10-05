@@ -35,9 +35,11 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from common.enums.data_select import AssetType, DataType
+from common.errors.vocabulary import Reason
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from routers.data_store.app_endpoints import AssetDataInterface, AssetDatasetStoreInterface
+from tests.system.problem_json import assert_problem
 
 
 pytestmark = pytest.mark.data_store
@@ -122,10 +124,24 @@ def test_own_overlap_is_409_naming_the_seeded_entry_and_creates_nothing(
     finally:
         entries_after = adopt_entries(own_symbol)
 
-    assert response.status_code == 409, data_store.describe(response)
-    detail = response.json()['detail']
-    assert detail['colliding_ids'] == [str(seeded.id)], data_store.describe(response)
-    assert isinstance(detail['message'], str) and detail['message'], data_store.describe(response)
+    # BOTH OLD ASSERTIONS SURVIVE, ONE OF THEM STRENGTHENED (tj-3mk3u5.37.9). TE-6 replaced the
+    # ad-hoc {'detail': {'colliding_ids': ..., 'message': ...}} with problem+json, so
+    # colliding_ids is a TOP-LEVEL member now -- it is an allowlisted metadata key precisely so a
+    # caller can read it off the body -- and the human sentence is the envelope's `detail`.
+    problem = assert_problem(
+        response, status=409, reason=Reason.OWN_OVERLAP_CONFLICT.value, title='Conflict', describe=data_store.describe
+    )
+    assert problem['colliding_ids'] == [str(seeded.id)], data_store.describe(response)
+
+    # The old pin on the sentence was "a non-empty str", which any sentence satisfies. It is
+    # replaced by the guard tj-8feral settled on: the sentence NAMES every colliding id, which is
+    # the part an operator reading a log actually needs, while its wording stays free to change.
+    # Asserting the wording instead would red on a harmless reword and teach people to edit the
+    # test rather than read it.
+    assert str(seeded.id) in problem['detail'], data_store.describe(response)
+    assert 'UUID(' not in problem['detail'], (
+        f'the 409 detail carries a Python repr, which tj-8feral took out of it: {problem["detail"]!r}'
+    )
     assert entries_after == [seeded.id], (
         f'the refused POST left {len(entries_after)} entries for the symbol, expected only the seeded one'
     )

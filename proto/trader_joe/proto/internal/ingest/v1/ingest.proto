@@ -1,0 +1,193 @@
+// THE data_store -> data_ingest FETCH CONTRACT (tj-3mk3u5.27; ADR tj-8konfu addendum A1 item 2).
+// One server-streaming call: an ACKNOWLEDGEMENT first, carrying the resolved feed, then bounded bar
+// pages, then a done. Correlation belongs to the transport, so nothing here carries a dataset_id.
+//
+// INTERNAL means both ends always deploy together: data_store and data_ingest ship from this
+// repository in one release. Nothing outside it calls this, buf's breaking checks ignore
+// trader_joe.proto.internal (tj-3mk3u5.42 R3), and the shape may change freely. The external,
+// strategy-facing contract is a different package and is NOT this (tj-3mk3u5.21, tj-3mk3u5.22 Q3).
+//
+// THE ORDER OF EVENTS IS PART OF THE CONTRACT:
+//   accepted : FetchAck(accepted) -> BarPage* -> FetchDone, then the call ends OK.
+//   refused  : FetchAck(refused), and nothing else. No page, no done; the call still ends OK.
+// An ack is ALWAYS the first message. A stream that ends without a FetchDone is distinguishable from
+// one that completed, which is the whole reason FetchDone exists.
+//
+// WHY A REFUSED FEED IS ANSWERED IN THE ACK AND NEVER BY A STATUS (user ruling, tj-3mk3u5.22 Q5).
+// Ingest alone decides which tape it can serve, and the store writes its dataset entry -- feed
+// included -- only once it has the ack. So the one thing the ack must settle is the feed, and the one
+// refusal carried in-band is an unservable feed. Every OTHER failure on this hop is a gRPC status
+// with a google.rpc.Status + ErrorInfo, rendered by common/rpc (tj-3mk3u5.37.7), and the server never
+// deliberately returns UNAVAILABLE (ADR tj-8konfu D6.4).
+//
+// A FINITE DEADLINE, AND wait_for_ready WITH IT (architect ruling, tj-3mk3u5.28, 01:25 UTC
+// 2026-10-02, restated 05:58 UTC 2026-10-03). What ADR tj-8konfu D6.1 forbids is an UNBOUNDED
+// wait -- a deadline on an indefinitely-open SUBSCRIBE stream is a scheduled failure -- and this
+// stream is bounded work, one backfill, which ends. So the call carries a configurable finite
+// deadline together with wait_for_ready: D6.5 = O1's "wait_for_ready bounded by the call's own
+// deadline", and that bound is what makes the wait legal. STILL DO NOT ISSUE IT WITH
+// common.rpc.channel.unary_call_options(): the helper's options are the unary ones and not this
+// call's, so a client spells its own out. THE PYTHON SIDE IS AUTHORITATIVE --
+// common/rpc/clients/ingest_fetch.py's module docstring and DEFAULT_FETCH_DEADLINE_S (300 s,
+// derived from the vendor call and the size of a one-transaction backfill, NOT from the transport
+// and NOT from the Kafka RPC's 5 s). UNAVAILABLE reaches that seam's caller as PEER_UNAVAILABLE,
+// and retrying is the caller's decision.
+syntax = "proto3";
+
+package trader_joe.proto.internal.ingest.v1;
+
+import "google/protobuf/timestamp.proto";
+import "trader_joe/proto/market/v1/bar.proto";
+import "trader_joe/proto/market/v1/enums.proto";
+
+// Asks data_ingest for one dataset. A contract may import market/v1; it never imports another
+// contract, so the vocabulary below is the shared one and nothing here restates it.
+service IngestService {
+  // Server-streaming. The wire path is
+  // /trader_joe.proto.internal.ingest.v1.IngestService/FetchDataset.
+  rpc FetchDataset(FetchDatasetRequest) returns (stream FetchDatasetResponse);
+}
+
+// WHAT INGEST ACTUALLY READS, and deliberately nothing more. Established by reading data/ingest
+// rather than by copying GetDatasetRequest: expiry and expiry_type are retention policy that no
+// reader touches, and dataset_id is a data_store row id that must not cross the wire (tj-8konfu
+// D7.2, tj-rh4b7f).
+message FetchDatasetRequest {
+  // The principal the fetch acts for. Carried, not yet read: nothing under data/ingest/app reads it
+  // today (the Kafka schema says the same of its own owner field), but it is identity on the store's
+  // entry and may not be invented downstream, so the hop that will need it carries it from the start.
+  string owner = 1;
+
+  // Which reader serves this: data/ingest/app/ingest_control.py dispatches on it.
+  trader_joe.proto.market.v1.DataSource source = 2;
+
+  // The instrument. The reader uppercases nothing here; the store's schema already normalised it.
+  string asset_symbol = 3;
+
+  // Dispatch only -- the stock path hard-codes AssetType.STOCK onto the instrument it builds -- but
+  // it is what selects that path, so an unsupported type is refused rather than silently read as one.
+  trader_joe.proto.market.v1.AssetType asset_type = 4;
+
+  // At least one. An empty list is a refusal, not an empty fetch.
+  repeated trader_joe.proto.market.v1.DataType data_types = 5;
+
+  trader_joe.proto.market.v1.Granularity granularity = 6;
+
+  // The window asked for. start is required and inclusive.
+  google.protobuf.Timestamp start = 7;
+
+  // UNSET MEANS AN OPEN END, "up to whatever is current", which the reader serves as its as_of. A
+  // message field has explicit presence in proto3, so unset and "the epoch" are distinguishable here
+  // without an extra flag.
+  google.protobuf.Timestamp end = 8;
+
+  // Becomes the rate budget's priority: STREAM -> LIVE, STATIC -> BACKFILL, anything else ->
+  // INTERACTIVE (data/ingest/app/brokers/rate_budget.py).
+  trader_joe.proto.market.v1.UpdateType update_type = 9;
+
+  // OPTIONAL, and the only field whose zero value is meaningful. FEED_UNSPECIFIED means "the
+  // deployment decides"; any other value means "this tape, or refuse the fetch in the ack". It is
+  // never a selection -- ingest resolves the tape it is entitled to and can only check a named feed
+  // against it (tj-3mk3u5.22 Q5). There is deliberately no `optional` keyword: with one, "unset" and
+  // "set to FEED_UNSPECIFIED" would be two spellings of the same request.
+  trader_joe.proto.market.v1.Feed feed = 10;
+}
+
+// One message of the stream. The oneof is declared from day one, as ADR tj-8konfu D7.1 requires:
+// adding an arm later is additive, but moving published fields INTO a oneof breaks generated source.
+message FetchDatasetResponse {
+  oneof event {
+    FetchAck ack = 1;
+    BarPage page = 2;
+    FetchDone done = 3;
+  }
+}
+
+// ALWAYS THE FIRST EVENT. Either the fetch is viable and the resolved feed is settled, or it is
+// refused for its feed. Nothing else is answered here: a request that is not viable for any other
+// reason ends with a gRPC status BEFORE any ack.
+message FetchAck {
+  oneof outcome {
+    FetchAccepted accepted = 1;
+    FetchRefused refused = 2;
+  }
+}
+
+// The fetch is viable. The store writes its dataset entry, feed included, on this.
+message FetchAccepted {
+  // THE RESOLVED FEED: the tape this deployment is entitled to, decided once per fetch and the one
+  // value only ingest may decide. Never FEED_UNSPECIFIED -- a feed nobody resolved is an error, not a
+  // value (tj-vhboky.1), so the mapper refuses the zero here.
+  trader_joe.proto.market.v1.Feed feed = 1;
+}
+
+// The fetch is refused, and this is the stream's only event. In ADR tj-fa1rpu's terms it is a REFUSED
+// outcome: permanent for the request as asked, so it carries no reset_at and no retry hint -- no wait
+// cures it. The fields MIRROR google.rpc.ErrorInfo so that the client seam (tj-3mk3u5.28) builds the
+// same domain error a REFUSED status would have produced, and data_store's HTTP edge then renders it
+// as problem+json like any other. Mirroring rather than importing is deliberate: google/rpc/*.proto
+// would need its own include root and the googleapis-common-protos package, and this is the only
+// in-band refusal on the hop.
+message FetchRefused {
+  // A value of the closed Reason vocabulary in common/errors, which is canonical in PYTHON and not
+  // here (ADR tj-fa1rpu U1; the one named exception to tj-8konfu D1). Today it is only
+  // FEED_NOT_AVAILABLE. A STRING and not an enum on purpose: a client must survive a reason it has
+  // never heard of, and the seam turns an unrecognised one into PEER_PROTOCOL_ERROR rather than
+  // failing to decode the message.
+  string reason = 1;
+
+  // The vocabulary the reason belongs to: ERROR_DOMAIN, "trader-joe". (domain, reason) is the
+  // error's identity.
+  string domain = 2;
+
+  // For a human, and never parsed. It carries no secret, no vendor body and no stack trace.
+  string detail = 3;
+
+  // Allowlisted context, keys from common/errors METADATA_KEYS -- for this reason, the feed asked
+  // for. map<string, string> exactly as ErrorInfo declares it; the mapper formats a value that is a
+  // sequence on the Python side, so both transports write the same text.
+  map<string, string> metadata = 4;
+}
+
+// A BOUNDED PAGE OF BARS. No dataset_id: correlation is the transport's, and the store stamps its own
+// rows (tj-rh4b7f).
+//
+// THE PAGE SIZE IS 5000 BARS, and it is the server's to honour -- the wire cannot express it. The
+// figures are MEASURED on this contract, not estimated: a full page is 345000 bytes (337 KiB, 69.0
+// bytes a bar), and 385000 bytes (376 KiB, 77.0 a bar) with every optional field populated, the
+// nanosecond field non-zero and the varints at their widest. That is about a third of the ~1 MiB ADR
+// tj-8konfu D6.3 targets for a bulk chunk, and 9.2 % of the 4 MiB ceiling in common/rpc/config.py --
+// which is a bug guard rather than a working limit, so a message that approaches it is a defect to
+// surface. In the other direction 5000 bars is about 12.8 trading days of one-minute bars (390 to a
+// regular session) or some twenty years of daily ones, so an ordinary fetch is one or two pages and
+// the per-page overhead stays irrelevant.
+message BarPage {
+  repeated trader_joe.proto.market.v1.Bar bars = 1;
+}
+
+// TERMINATES AN ACCEPTED STREAM, so a stream that simply stops is distinguishable from one that
+// finished. It also carries the SERVED provenance of ADR tj-fa1rpu D2: what was actually served, as
+// opposed to what was asked for. "No data" is a success carrying provenance, not an error, so an
+// empty but genuinely served window ends here with bar_count 0 and never with a failure.
+message FetchDone {
+  // How many bars crossed, summed over every page.
+  uint64 bar_count = 1;
+
+  // The window actually served, which an open-ended request resolves against as_of.
+  ServedRange served_range = 2;
+
+  // When the vendor answered. UTC.
+  google.protobuf.Timestamp as_of = 3;
+}
+
+// The served window. Mirrors the ServedRange named tuple in data/ingest's broker interface, and the
+// served_range data_store exposes on its HTTP response (tj-3mk3u5.37.12), so one shape is described
+// the same way at every hop.
+message ServedRange {
+  // Inclusive.
+  google.protobuf.Timestamp start = 1;
+
+  // EXCLUSIVE, and never open: a request with no end is served up to as_of, and that instant is what
+  // lands here.
+  google.protobuf.Timestamp end = 2;
+}

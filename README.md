@@ -34,11 +34,11 @@ The two stacks are wired differently on purpose (decision record `tj-q9ae5u`, ad
 | Network | Kind | Members |
 |---|---|---|
 | `store_db` | internal | postgres, data_store |
-| `ingest_store` | internal | data_store, data_ingest, and kafka while it exists |
+| `ingest_store` | internal | data_store and data_ingest |
 | `store_api` | internal, fixed name `trader_joe_store_api` (`STORE_API_NETWORK`) | data_store and client containers |
 | `ingest_egress` | ordinary bridge | data_ingest only |
 
-An internal network has no gateway, so postgres, kafka and data_store have no egress and cannot be
+An internal network has no gateway, so postgres and data_store have no egress and cannot be
 reached from the host or the internet. data_ingest is the one component with internet access, for
 the broker API. A client — a strategy container, the SDK, the system-test client — joins
 `store_api`, which has a fixed name so another compose project can declare it external, and sees
@@ -82,7 +82,7 @@ Base images are pinned the same way. Every external image the `Dockerfile`,
 changing the digest on purpose. The agent-stack MCP keeps its own list of the root `Dockerfile`'s
 references (`BASE_IMAGES` in `tools/agent_mcp/stack.py`) and makes sure they are present before
 every build, so the two must name the same references; a test checks that they do. The postgres
-and kafka images in `docker-compose.yaml` are pinned by tag only.
+image in `docker-compose.yaml` is pinned by tag only.
 
 ## Writing data: the instance secret
 
@@ -227,6 +227,21 @@ running code comes from the deployed image, the two can disagree with nothing sa
 database at a revision this checkout has never heard of means you are in the wrong checkout, and
 a history that runs past `current` means the deploy is missing `make migrate`.
 
+Neither answer can see *drift* — a schema changed outside Alembic. `current` reads the version
+table, and a manual `DROP` leaves that table untouched, so the database reports head and is right
+while the schema is wrong. For that there is a separate target:
+
+```
+make migrate-check
+```
+
+It runs `alembic check`, comparing the models against the live catalogue; a non-zero exit means
+drift, or "Target database is not up to date." when the database is simply behind head. **It is not
+read-only**, which is why it is not folded into `make migrate-status`: `check` does not pass
+`dont_mutate=True`, so against a database that has never been migrated it creates `alembic_version`.
+Against an already-migrated database it writes nothing. Two blind spots: autogenerate compares
+neither enum labels nor server defaults, so a clean run is no evidence about either.
+
 ## Database shell
 
 There is no make target for this, deliberately: it is a thin `psql` wrapper and a debugging step,
@@ -305,7 +320,7 @@ prefixes `store_db` with the project name, which defaults to that directory.
 
 CI's System Testing job runs the same target against a throwaway stack, always in fake mode, after
 checks that the compose sets still render, that data_ingest is on the fake broker, and that the
-running stack enforces the network model (the test client cannot resolve kafka or data_ingest;
+running stack enforces the network model (the test client cannot resolve data_ingest;
 postgres and data_store have no egress). It then dumps a seed at the head revision and uploads it as
 the `head-seed-<branch>` artifact, kept seven days, for a person to review and commit.
 
@@ -332,7 +347,7 @@ compose file, or read your env files. Only its socket proxy mounts the Docker so
 
 | Verb | What it does |
 |---|---|
-| `stack_up(worktree)` | Snapshots the worktree (`root` or a worktree's name), builds the images from the snapshot and starts the stack, waiting for healthy. Every call force-recreates data_store and data_ingest, so they run the last snapshot's code — `tests/fakes` included; postgres and kafka are kept. |
+| `stack_up(worktree)` | Snapshots the worktree (`root` or a worktree's name), builds the images from the snapshot and starts the stack, waiting for healthy. Every call force-recreates data_store and data_ingest, so they run the last snapshot's code — `tests/fakes` included; postgres is kept. |
 | `stack_down` | Stops the stack and removes its containers and networks; its data is kept. |
 | `stack_wipe` | Stops the stack and deletes its data directory, and nothing else. |
 | `migrate` / `migrate_status` | `alembic upgrade head`, or the read-only `current` and `history`, from a fresh snapshot of the worktree the stack was brought up from. |
@@ -347,9 +362,18 @@ stack's env itself: its own container names, `STORE_API_NETWORK`, a `DATA_DIR` u
 directory, and env files outside the repository. It never reads your `.env` or touches your
 `DATA_DIR`.
 
-**Known limitation:** `stack_wipe` reports `failed` because clearing kafka's data hits `Device or
-resource busy`. The postgres clear runs first and succeeds, so the database is empty, but the data
-directory itself is kept. The defect is waived, not fixed, because Kafka is being removed.
+**Kafka is gone from this repository, but not yet from the stack you will see running.**
+`docker-compose.yaml` declares no broker and nothing in the source tree imports one. The MCP,
+however, composes from the compose files **baked into the agent image** (`/opt/agent_mcp/compose/`),
+and the pinned copy there still brings up `postgres kafka`. So `stack_up` starts four containers and
+`ps` lists a `kafka` one that this checkout cannot account for. It is inert — no service connects to
+it, and no test depends on it. It goes away when the agent image is rebuilt and the pinned compose
+files come with it (`make agent-mcp-rebuild` on the host). Until then, expect it, and do not read it
+as evidence that the repository still uses a broker.
+
+The `stack_wipe` defect that used to be documented here — a `failed` report because clearing kafka's
+data directory hit `Device or resource busy` — is **resolved**, not waived: the wipe now clears only
+postgres (`DATA_MOUNTS` in `tools/agent_mcp/stack.py`).
 
 The devcontainer reaches the MCP as `http://agent_mcp:8765/mcp` over an internal network, with a
 bearer token read from `agent_mcp_token` in the MCP's share directory (`AGENT_MCP_SHARE_PATH`,

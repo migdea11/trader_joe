@@ -1,14 +1,20 @@
 import asyncio
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from enum import IntEnum
 
 from common.enums.data_stock import DataSource, UpdateType
 from common.environment import get_env_var
+from common.errors.vocabulary import ExogenousError, Reason
 from common.logging import get_logger
 
 
 log = get_logger(__name__)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 class RequestPriority(IntEnum):
@@ -63,6 +69,7 @@ class RateBudget:
         burst: float | None = None,
         backfill_reserve: float | None = None,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         self.__vendor = vendor
         self.__rate_per_sec = rate_per_sec
@@ -76,6 +83,9 @@ class RateBudget:
         reserve = backfill_reserve if backfill_reserve is not None else self.__burst / 2
         self.__reserve = min(max(reserve, 0.0), self.__burst - 1.0)
         self.__clock = clock
+        # Wall time, for the one comparison a monotonic clock cannot make: a caller's deadline is an
+        # instant, and so is the reset_at an error reports.
+        self.__wall_clock = wall_clock
         self.__tokens = self.__burst
         self.__updated = clock()
 
@@ -116,6 +126,24 @@ class RateBudget:
         self.__refill()
         return self.__tokens
 
+    @property
+    def full_refill_seconds(self) -> float:
+        """Report how long an empty bucket takes to fill completely: this budget's own model of the window.
+
+        What a vendor's rate-limit answer is turned into when it names no reset of its own (the
+        fallback for a 429 with neither a reset nor a Retry-After header). Measured from empty, not
+        from the tokens held now: a vendor that rate-limited a call has told us its window is
+        spent, whatever this bucket believes.
+
+        Returns:
+            float: Burst divided by the refill rate, in seconds. 0.0 when no rate is configured:
+                an unthrottled budget models no window, and a number nobody has verified is not
+                invented for it (see from_env).
+        """
+        if self.__rate_per_sec is None:
+            return 0.0
+        return self.__burst / self.__rate_per_sec
+
     def try_acquire(self, priority: RequestPriority = RequestPriority.INTERACTIVE) -> bool:
         """Take one token if this priority class is allowed to; never waits.
 
@@ -136,14 +164,40 @@ class RateBudget:
             return True
         return False
 
-    async def acquire(self, priority: RequestPriority = RequestPriority.INTERACTIVE) -> None:
+    async def acquire(
+        self, priority: RequestPriority = RequestPriority.INTERACTIVE, deadline: datetime | None = None
+    ) -> None:
         """Wait until this priority class may spend a token, then spend it.
+
+        Without a deadline this waits as long as it takes. With one it FAILS FAST (ADR tj-fa1rpu U4 = A):
+        when the wait __wait_for() computes would end after the deadline it raises at once rather than
+        sleep past it, handing the caller the number the budget already knew. The check runs on every
+        pass, against the time then, so a token taken by another caller cannot stretch the wait past
+        the deadline.
 
         Args:
             priority (RequestPriority): Priority class of the call.
+            deadline (datetime | None): When the caller stops waiting, timezone aware, or None for
+                no bound. A token available at once is spent whatever the deadline says.
+
+        Raises:
+            ExogenousError: With the reason RATE_BUDGET and a reset_at of now plus the wait, if the
+                wait would pass the deadline.
         """
         while not self.try_acquire(priority):
             wait = self.__wait_for(priority)
+            if deadline is not None:
+                now = self.__wall_clock()
+                reset_at = now + timedelta(seconds=wait)
+                if reset_at > deadline:
+                    raise ExogenousError(
+                        Reason.RATE_BUDGET,
+                        f'The {self.__vendor} rate budget has no token for {priority.name} before the request '
+                        f'deadline; the next is due in {wait:.1f}s.',
+                        metadata={'vendor': self.__vendor},
+                        reset_at=reset_at,
+                        clock=self.__wall_clock,
+                    )
             log.debug(f'{self.__vendor} rate budget exhausted for {priority.name}, waiting {wait:.3f}s')
             await asyncio.sleep(wait)
 

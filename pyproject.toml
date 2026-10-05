@@ -47,14 +47,50 @@ base = [
     # 1.177.0 takes `rich>=13.5.2` unbounded, so rich-toolkit pulling rich 15.x resolves fine
     # now. Adopting `[standard]` is an open decision about what it drags in — tj-abme9y.
     "fastapi>=0.141.1",
+    # gRPC, both sides on grpc.aio (ADR tj-8konfu D2). In base because both services install it.
+    # EXACT PINS, and these two move together with grpcio-tools in dev: every generated
+    # *_pb2_grpc.py records the grpcio-tools version and refuses to import under an older grpcio,
+    # and every *_pb2.py checks the protobuf runtime against the protoc that wrote it.
+    # 1.81.1 rather than the newer 1.84.0 the cooldown admits: grpc 1.82 and later require
+    # protobuf>=7.35.1, while semgrep 1.177.0 (security group) pins opentelemetry ~=1.37.0, whose
+    # opentelemetry-proto caps protobuf below 7. One resolution holds both groups, so 1.81.1 is the
+    # newest line that resolves. Lift all three when semgrep's opentelemetry admits protobuf 7, then
+    # run `make proto` and commit the regenerated tree.
+    "grpcio==1.81.1",
+    "grpcio-health-checking==1.81.1",
+    # The rich status on the wire: google.rpc.Status in the grpc-status-details-bin trailer, which
+    # carries ErrorInfo and RetryInfo beside the code (ADR tj-fa1rpu's 2026-09-30 addendum; tj-8konfu
+    # D6.4; AIP-193). common/rpc/errors.py renders and parses it. Pinned exactly and moving with the
+    # two pins above for the same reason grpcio-health-checking does: all three are published from one
+    # grpc release and grpcio-status declares `grpcio>=1.81.1`, so a lone bump would drag grpcio past
+    # the version the generated code was written against.
+    "grpcio-status==1.81.1",
+    # grpcio-status already requires it, but common/rpc/errors.py imports google.rpc.status_pb2 and
+    # google.rpc.error_details_pb2 by name, and this repo declares what its code imports rather than
+    # leaning on a transitive pin (common/tests/test_declared_imports.py, and the sqlalchemy[asyncio]
+    # comment in data-store). Until now it reached the lock only through the security group's
+    # opentelemetry, so no image installed it. A floor and no cap: it ships nothing but generated
+    # protobuf modules, and 1.75.3 is what the resolution already held.
+    "googleapis-common-protos>=1.75.3",
+    # Imported by the generated *_pb2.py, which common/rpc loads in both prod images; it moves with the
+    # grpc pins above. A floor and no <7 cap: the generated code's runtime check
+    # (google/protobuf/runtime_version.py, 6.33.6) refuses a runtime OLDER than the gencode, not a newer
+    # major, and grpcio-health-checking 1.81.1 already holds protobuf below 7 until those pins lift.
+    "protobuf>=6.33.6",
     "httpx>=0.28.1",
-    "kafka-python-ng>=2.2.3",
     "pydantic>=2.13.5",
     "python-dotenv>=1.2.3",
     "uvicorn[standard]>=0.37.0",
 ]
 dev = [
     "debugpy>=1.8.17",
+    # The protoc `make proto` runs (it bundles libprotoc 33.5). Not a runtime dependency: services
+    # import the committed generated code and never generate, so prod never installs it (the dev
+    # image does, as it does everything in this group). Pinned exactly because its version is
+    # written into every generated file, so an unpinned generator would make CI's staleness check
+    # fail on a version bump rather than on a contract change (ADR tj-8konfu D1). Moves with the
+    # grpcio pins in base.
+    "grpcio-tools==1.81.1",
 ]
 testing = [
     "ruff>=0.14.1",
@@ -65,9 +101,17 @@ testing = [
     # Never add it to base, a service group or dev -- dev is baked into the service dev
     # image (ADR tj-8z213c, Addendum 1).
     "aiosqlite>=0.22.1",
+    # Imported directly by data/ingest/tests/test_alpaca_cut_connection.py (ProtocolError).
+    "urllib3>=2.8.0",
+    # Imported directly by common/tests/test_ci_invariants.py and test_agent_mcp_groups.py (Requirement, Version).
+    "packaging>=26.3",
+    # Imported directly by common/tests (compose_model.py, test_ci_invariants.py, ...) and tools/agent_mcp/tests.
+    "pyyaml>=6.0.3",
 ]
 data-ingest = [
     "alpaca-py>=0.42.2",
+    # Imported directly by data/ingest/app/brokers/alpaca/classify.py (typed-error classification).
+    "requests>=2.34.2",
 ]
 data-store = [
     "alembic>=1.20.0",
@@ -97,6 +141,11 @@ data-store = [
 # the uv table explains why), so semgrep's own mcp and pyjwt pins do not hold this group back.
 agent-mcp = [
     "mcp>=1.29.0",
+    # Imported directly by tools/agent_mcp/server.py, which builds the Starlette app and runs uvicorn
+    # itself. Base declares both too, but the MCP image installs this group alone. Plain uvicorn, not
+    # [standard]: the server needs no extra, and the extra would add packages to the MCP image.
+    "starlette>=1.6.0",
+    "uvicorn>=0.53.0",
     # Not imported here: a floor on mcp's own dependency, the starlette pattern in base. mcp
     # declares pyjwt with no bound that excludes 2.13.0, and pip-audit reports ten advisories
     # against 2.13.0, all fixed in 2.14.0 (CVE-2026-101917, CVE-2026-102265 to -102269, -102271
@@ -134,6 +183,11 @@ exclude = [
     ".vscode",
     "__pypackages__",
     "data/store/migrations/versions/*",
+    # Committed protoc output (ADR tj-8konfu D3; decision tj-3mk3u5.42 F1), generated code like the
+    # revisions above: `make proto` writes gen/proto/python and CI fails when it is stale, so it is
+    # regenerated, never hand-edited or reformatted. Every language's tree whole, the hand-committed
+    # trader_joe/proto/__init__.py included.
+    "gen/proto",
     # Bind-mounted container state, not source. The Postgres data directory inside is
     # root-owned and unreadable from this container, so a scan that walks it ERRORS
     # rather than skipping -- the reason this one is not merely tidiness.
@@ -148,12 +202,15 @@ force-exclude = true
 
 [tool.ruff.lint]
 # DTZ and ASYNC are permanent (tj-vhboky.30 item 3); PERF, RET, PIE and PTH are not, on purpose.
-select = ["E", "W", "F", "I", "B", "UP", "C4", "SIM", "RUF", "TID252", "TC", "D", "DTZ", "ASYNC"]
+# TID251 is banned-api: it does nothing without the flake8-tidy-imports.banned-api table below, and
+# that table does nothing without it (ADR tj-8konfu D3).
+select = ["E", "W", "F", "I", "B", "UP", "C4", "SIM", "RUF", "TID251", "TID252", "TC", "D", "DTZ", "ASYNC"]
 ignore = [
     "E501", # line length — the formatter owns it
     "E402", # module-level import not at top: FastAPI pattern (routers imported after app)
-    # PEP 695 generics: no autofix, and the 17 sites are Pydantic generic models on the
-    # cross-service contract plus the Kafka RPC layer. Migrating them is its own task.
+    # PEP 695 generics: no autofix, and the 9 sites are Pydantic generic models on the
+    # cross-service contract. Migrating them is its own task. (Count re-derived on
+    # tj-mzaub8 after the Kafka RPC layer went: it was 17 while that layer existed.)
     "UP046",
     # UP047 is the function-level half of the same PEP 695 migration (get_env_var in
     # common/environment.py), ignored on UP046's reasoning rather than a new one. It
@@ -161,10 +218,11 @@ ignore = [
     "UP047",
     # Same re-lock, and NOT cosmetic: UP042 wants `class X(str, Enum)` to become
     # enum.StrEnum, which changes what str(X.MEMBER) returns -- 'X.MEMBER' for a str-Enum,
-    # the bare value for a StrEnum. These 7 enums are serialised across the Kafka RPC
-    # contract and Pydantic schemas, so the migration needs its own task and its own
-    # tests, not a line in a dependency bump. The sites also straddle three agents'
-    # scopes (common, schemas, routers/common, data/ingest), so no one owner can do it.
+    # the bare value for a StrEnum. These 4 enums are serialised across the gRPC
+    # cross-service contract and Pydantic schemas, so the migration needs its own task and
+    # its own tests, not a line in a dependency bump. The sites also straddle two agents'
+    # scopes (schemas, routers/common, data/ingest), so no one owner can do it. (Count and
+    # transport re-derived on tj-mzaub8; it was 7 across the Kafka RPC contract.)
     "UP042",
     # docstring style, not presence
     "D100",
@@ -181,7 +239,19 @@ ignore = [
 # Pydantic reads annotations at runtime
 runtime-evaluated-base-classes = ["pydantic.BaseModel"]
 
+# THE gRPC SEAM (ADR tj-8konfu D3, re-homed by addendum A1; decision tj-3mk3u5.42 F1): no module
+# outside common/rpc/ imports a generated symbol. The generated package is trader_joe.proto, from
+# gen/proto/python, which configuration puts on the import path; its stubs are an implementation
+# detail of common/rpc, and everything else goes through the hand-written code there. One entry covers
+# every contract beneath trader_joe.proto: ruff matches an import against the banned name and each of
+# its parents, which is proven by a lint shown failing on a deliberate violation in tj-3mk3u5.23's
+# notes. common/rpc itself is exempted below.
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"trader_joe.proto".msg = "generated gRPC code (trader_joe.proto) is private to common/rpc; use the hand-written API there (ADR tj-8konfu D3)"
+
 [tool.ruff.lint.per-file-ignores]
+# The one package allowed to import generated gRPC code: the seam above.
+"common/rpc/**" = ["TID251"]
 # FastAPI evaluates handler annotations at runtime; B008 is the Depends() idiom
 "routers/**" = ["TC001", "TC002", "TC003", "B008"]
 # the tests build naive datetimes on purpose, to prove they are refused
@@ -194,8 +264,9 @@ runtime-evaluated-base-classes = ["pydantic.BaseModel"]
 lines-after-imports = 2
 # matches format.skip-magic-trailing-comma
 split-on-trailing-comma = false
-# becomes ["trader_joe"] after Phase 1
-known-first-party = ["common", "data", "routers", "schemas"]
+# becomes ["trader_joe"] after Phase 1. trader_joe is first-party already: the generated
+# trader_joe.proto (gen/proto/python) is this repository's own code.
+known-first-party = ["common", "data", "routers", "schemas", "trader_joe"]
 section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
 
 [tool.ruff.lint.pydocstyle]

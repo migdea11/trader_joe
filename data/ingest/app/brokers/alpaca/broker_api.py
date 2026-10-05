@@ -16,6 +16,7 @@ from alpaca.data.requests import (
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Feed, Granularity
 from common.environment import get_env_var
+from common.errors.vocabulary import InvalidRequestError, Reason
 from common.logging import get_logger
 from data.ingest.app.brokers.broker_errors import MissingCredentialsError
 from data.ingest.app.brokers.interface import BarsQuery
@@ -64,8 +65,10 @@ def resolve_feed() -> Feed:
 
     WHAT THIS RECORDS, SAID PLAINLY RATHER THAN PAPERED OVER: this is an assertion about the
     ACCOUNT ("which tape is this deployment entitled to"), not an observation of the response
-    ("which tape actually served this call"). NO CALLER CAN SELECT A FEED today (the ruling
-    above defers that to the gRPC transport work), and Alpaca's bars response carries no feed
+    ("which tape actually served this call"). A CALLER MAY NAME A FEED (BarsQuery.feed, live at
+    the adapter since PR 2's typed errors), but AlpacaRead serves a named feed only if it IS
+    the tape this returns, and otherwise answers FEED_NOT_AVAILABLE before any vendor call. So
+    the deployment, never the caller, decides the tape. Alpaca's bars response carries no feed
     field at any level to read the served tape back off of (researcher-broker, confirmed on two
     independent reads) -- so there is no vendor confirmation to fall back to even if there were
     a caller selection to try first. The value below is passed to the vendor call as its own
@@ -160,8 +163,11 @@ def match_client_request(
             return client.get_stock_latest_trade, StockLatestTradeRequest
         ### CRYPTO ###
         ### OPTION ###
-        case (_, _):
-            raise NotImplementedError(f'{asset_type} - {data_type} not implemented')
+        case _:
+            raise InvalidRequestError(
+                Reason.UNSUPPORTED_ASSET_TYPE,
+                f'Alpaca does not serve this yet: asset_type={asset_type.value}, data_type={data_type.value}',
+            )
 
 
 async def fetch_data_type(
@@ -197,6 +203,19 @@ async def fetch_data_type(
 
     Returns:
         The vendor's response, shared read-only with any caller that attached to this call.
+
+    Raises:
+        ExogenousError: With the reason RATE_BUDGET, if query.deadline is set and the rate budget
+            cannot admit the call before it. The call that reaches the vendor is the leader's, so
+            the leader's deadline is the one the budget holds it to, and an attached caller shares
+            that outcome whatever its own deadline.
+        InvalidRequestError: With the reason UNSUPPORTED_ASSET_TYPE, if the vendor has no
+            endpoint for the data type.
+        alpaca.common.exceptions.APIError: If the vendor answers an error status once alpaca-py's
+            own retries of 429 and 504 are spent.
+        requests.exceptions.ConnectionError: If the vendor cannot be reached.
+        requests.exceptions.Timeout: If the vendor does not answer in time.
+        requests.exceptions.ChunkedEncodingError: If the connection is cut while the body is read.
     """
     client_request, client_request_type = match_client_request(
         client if client is not None else get_client(), AssetType.STOCK, data_type, latest
@@ -217,11 +236,13 @@ async def fetch_data_type(
         adjustment=ALPACA_ADJUSTMENT,
     )
     priority = query.priority
+    deadline = query.deadline
 
     async def call_vendor():
         # One token per call that actually reaches the vendor. Calls collapsed by the guard
-        # cost nothing, which is the point of doing this inside it rather than outside.
-        await get_rate_budget().acquire(priority)
+        # cost nothing, which is the point of doing this inside it rather than outside. The
+        # deadline makes a wait the caller cannot afford a refusal at once (ADR tj-fa1rpu U4).
+        await get_rate_budget().acquire(priority, deadline=deadline)
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(executor, client_request, client_request_type(**params))
 

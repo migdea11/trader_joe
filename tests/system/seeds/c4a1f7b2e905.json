@@ -1,0 +1,45 @@
+{
+  "date": "2026-10-03",
+  "digests": {
+    "stock_market_activity": {
+      "asset_symbol": "296cf58199f05b94a62ee39333505f082a8b1a3f0b2184a2085d3e6da63acd1b",
+      "close": "b7116576bfd07295591121df875700bc71e9f04d3b048cbbafcf912bd0899e42",
+      "created_at": "3c1909cd7bee2bd7a3212f5b6aff751cd1d13f5b4e4c67ba13029564ea4385c7",
+      "dataset_id": "89ab1bea6c84b82091023ff980cae7273849525c51c44983ae90c0e8e6f0790d",
+      "feed": "4a21b211025a2668ab347e92daa516776d6da44be9b0ec4824cbbe570506d326",
+      "granularity": "94ada8c7ca22b257535da014cb2fce2327f3ed3f13421e249872e8ed91302dff",
+      "high": "40ea8823514b7e31e81a747a002189658d99439427bb27d4e60d4ce6b11fe212",
+      "id": "09ff027065a629c6ba1747a9a3987796f24e2f709e98e85fb73ed84ef617f03b",
+      "low": "797d59bfa21cb7b9a376f5a8c2d7d8ea41015a12f29ae59ea454c5e14f07e13a",
+      "open": "447d62e60fd3d153341718bb0b7ac923e65d3c9d8da702528487e6df9ab344e2",
+      "source": "e8c7fb4fb4e4e95e79d3dc7c2a6429197a2636b59ca65d4bb203614b5d5df0d5",
+      "timestamp": "540d57b9db5136c3d061e7189ed374069ed195b494ed999395f3759b16b417f3",
+      "trade_count": "3a34f6382b1d1c2820678710d3a74839104aace06c63b1242f8bf693bd47f53f",
+      "updated_at": "3c1909cd7bee2bd7a3212f5b6aff751cd1d13f5b4e4c67ba13029564ea4385c7",
+      "volume": "32419e424b00d2eeee04a61825b52476b779abb0b6ba13d5f4fd7aadecc9da8d"
+    },
+    "store_dataset_entry": {
+      "asset_symbol": "8d71a03eeecebcc4ab0f5db0b43740137fd490e97093eb731663eec25d9b1c49",
+      "asset_type": "f385f36a74bc18625672f5d4d0855857292998719370d266b5153eeee63425f9",
+      "created_at": "c18f1badcba1535b12b5e61bbf330c33c6c1202a68f0aac4e51c44c3afca576c",
+      "data_type": "4f3e1ecd0c7822ee52362110d11d60862d96689051df63d430ec87d74799e0fb",
+      "end": "6b1850794ca1cc53dc39ebd6e7c046aaf883564c0f42d08c9cb013cbce3f8d98",
+      "expiry": "75befcd9cabaca2e298eaa69476c34b92c131ba075ae29f04bfb060200518d18",
+      "expiry_type": "b2668c53e2b0e5a91aca20ada2022b4d22e1071865cae77cd2a1c26bd2cb5359",
+      "feed": "edf52bf1b3f530ceef622d690bbd6fcb4e9adf7308b44fe8bfbe9ee2e7e1d730",
+      "granularity": "52ed9c50d74e5fd97b2642c9ae7fd8aeb29c0616dbc7d136a2fed3ae72732ca0",
+      "id": "eaf5ebc5a30e8060768149d47f10aae8b53b410f2f9ef30c374d20ba218940c6",
+      "owner": "a4f84495c8cc4b55c97ae0616bec5c323322ed319b7760d4aa1e7fb977c77d01",
+      "source": "6ae7ffc48a3269417f374caaa99af94fc087c1dc1d2db30cc566ec15638269ad",
+      "start": "9ebcd0596a8c020f3ce30dd16636a7f28bae472f7ffe3fec34a7d59a0ddc91d6",
+      "update_type": "9a4ff094d387e42422c103c7a7687d9c2667df0fa7c896e344473854f05d99bf",
+      "updated_at": "c18f1badcba1535b12b5e61bbf330c33c6c1202a68f0aac4e51c44c3afca576c"
+    }
+  },
+  "producer": "data.store.seeds",
+  "revision": "c4a1f7b2e905",
+  "row_counts": {
+    "stock_market_activity": 330,
+    "store_dataset_entry": 10
+  }
+}

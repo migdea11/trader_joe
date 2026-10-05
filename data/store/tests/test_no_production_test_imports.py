@@ -12,7 +12,8 @@ under TYPE_CHECKING, inside a function or behind a flag is exactly what a runtim
 
 SCOPE: every module under PRODUCTION_ROOTS, which mirror the source COPY lines of the Dockerfile's
 service_build_image stage resolved with the data_store build args (docker-compose.yaml passes
-SERVICE_PATH=data, SERVICE_NAME=store): common, routers, schemas and data/store/app. The roots are
+SERVICE_PATH=data, SERVICE_NAME=store): common, routers, schemas, gen/proto/python (the committed
+generated gRPC code, decision tj-3mk3u5.42 F1) and data/store/app. The roots are
 hard-coded, not parsed from the Dockerfile, so the scan and its oracle are not the same code;
 test_the_roots_are_the_dockerfile_copy_sources asserts the mirror both ways. As a second backstop,
 the scan checks that it reaches every first-party module data/store/app imports, transitively. Test
@@ -61,6 +62,7 @@ from pathlib import Path, PurePosixPath
 import pytest
 
 from data.ingest.tests.test_no_production_test_imports import (
+    GENERATED_ROOT,
     REPO_ROOT,
     SOURCE_STAGE,
     TEST_PACKAGE,
@@ -77,7 +79,7 @@ from data.ingest.tests.test_no_production_test_imports import (
 pytestmark = pytest.mark.data_store
 
 APP_ROOT = 'data/store/app'
-PRODUCTION_ROOTS = (APP_ROOT, 'routers', 'common', 'schemas')
+PRODUCTION_ROOTS = (APP_ROOT, 'routers', 'common', 'schemas', GENERATED_ROOT)
 SEED_PACKAGE = 'data.store.seeds'
 DOCKERFILE = REPO_ROOT / 'Dockerfile'
 # The build args docker-compose.yaml passes for the data_store service.

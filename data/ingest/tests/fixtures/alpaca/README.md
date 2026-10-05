@@ -36,8 +36,9 @@ tj-vhboky.57. Prices and volumes are illustrative. Each file's `provenance.kind`
 
 | File | Why it is not recorded |
 |---|---|
-| `error_429.json`, `error_504.json`, `error_500.json` | You cannot provoke a rate limit, a gateway timeout or a server error on purpose. They keep the documented `{code, message}` body. The recorded 400 suggests that real error bodies may carry only `message`, but no test reads `code`. |
-| `bars_empty_list.json` | This is the other empty-range shape (`{"bars": {"AAPL": []}}`). Alpaca sent the absent-key shape when recorded, but the reader must still handle both, so the tests keep both. |
+| `error_429.json`, `error_504.json`, `error_500.json` | You cannot provoke a rate limit, a gateway timeout or a server error on purpose. They keep the documented `{code, message}` body. The recorded 400 suggests that real error bodies may carry only `message`. Nothing reads `code`: the reader classifies on the HTTP status alone, and a test fails if anything on the path reads it. |
+| `bars_empty_list.json` | This is the other empty-range shape (`{"bars": {"AAPL": []}}`). Alpaca sent the absent-key shape when recorded, but the reader must still handle both, so the tests keep both. Both are served as an empty window. |
+| `bars_null.json` | A 200 whose `bars` is JSON `null`. It has never been recorded on this endpoint. It is inferred from alpaca-py 0.44.0 `common/rest.py:395` and two forum threads, which its `provenance` names. It pins one property: such a body is never served as a window. |
 | `bars_1Day_fractional_trade_count.json`, `bars_1Day_null_trade_count.json` | Alpaca cannot be made to send either. Each one is FAKES-2's documented daily body with the second bar's `n` changed, as the table below shows. They do not follow the recorded `bars_1Day.json`, and the null-trade-count test pins their own values. |
 
 | File | Second bar's `n` | What it pins |
@@ -45,14 +46,30 @@ tj-vhboky.57. Prices and volumes are illustrative. Each file's `provenance.kind`
 | `bars_1Day_fractional_trade_count.json` | `831423.5` | A trade count that is not a whole number fails the fetch with ValueError. It is never truncated. |
 | `bars_1Day_null_trade_count.json` | `null` | A missing trade count reaches `Bar.trade_count` as None. |
 
+## Headers
+
+No fixture records a response header, because the recorder writes none. Which headers a real 429
+carries (`X-RateLimit-Reset`, `Retry-After`, or neither) is unknown. A test that needs one attaches
+it with `with_headers()` from the harness, and its file says the headers are constructed.
+
 ## Re-recording
 
-Run `tests/fakes/record_alpaca.py` by hand on the host, never in CI, with `--out` pointing at a
-directory outside the repo. Read the output before copying it in. The recorder reads
-`ALPACA_API_KEY` and `ALPACA_API_SECRET` from the environment and calls only
-`GET /v2/stocks/bars`. It writes only the response status and body, with a provenance block. It
-never writes a header, a credential or a query string. The tests derive every query bound from the
-bodies, so a re-recorded file drops in without a test edit. Recording on 2026-10-01 confirmed this:
-no test changed.
+Run `tests/fakes/record_alpaca.py` by hand on the host, never in CI, with paper keys. The recorder
+reads `ALPACA_API_KEY` and `ALPACA_API_SECRET` from the environment and sends read-only GETs to two
+endpoints and no other: `GET /v2/stocks/bars` on the market-data host,
+`https://data.alpaca.markets`, and `GET /v2/assets/{symbol}` on the paper trading host,
+`https://paper-api.alpaca.markets`. It refuses a request to any other host, the live trading host
+included, before sending it, and it never follows a redirect. `--dry-run` prints every request it
+would send and reads no credential. `--only` records the named fixtures alone, so a sitting rewrites
+nothing it did not name; naming page 2 brings page 1 along.
+
+Point `--out` at a directory outside the repo, or leave it at its default, this directory, with the
+new files uncommitted. Either way, read the files before they are committed. Each body is checked
+against its own endpoint's list of top-level keys, and the output is searched for both credential
+values; either check failing aborts the run with nothing written. The recorder writes only the
+response status and body, with a provenance block. It prints four rate-limit headers in its summary
+and writes none, so it never writes a header, a credential or a query string. The tests derive every
+query bound from the bodies, so a re-recorded file drops in without a test edit. Recording on
+2026-10-01 confirmed this: no test changed.
 
 Never put a credential in a file here.

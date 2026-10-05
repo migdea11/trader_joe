@@ -12,10 +12,12 @@ A green run here means the configuration still says the right thing, nothing mor
 
 import ast
 import configparser
+import contextlib
 import copy
 import fnmatch
 import importlib
 import ipaddress
+import json
 import os
 import posixpath
 import re
@@ -33,11 +35,14 @@ from zoneinfo import ZoneInfo
 
 import pytest
 import yaml
+from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
 from common.environment import get_env_var
+from common.tests import compose_model
 from common.tests.compose_model import InterpolationRefused, interpolate
+from common.tests.image_path import IMAGE_CODE_ROOT, IMAGE_PYTHONPATH_ENTRIES, image_import_roots
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -49,9 +54,11 @@ MAKEFILE = REPO_ROOT / 'Makefile'
 PYTEST_INI = REPO_ROOT / 'pytest.ini'
 
 # tj-8mt207. The harness is a load generator, not a feature: when it is on, data_store and
-# data_ingest each create the latency Kafka topics and an RPC consumer at startup, called or
-# not. It must be on in dev -- tj-3mk3u5.8 needs the REST vs Kafka vs gRPC comparison before
-# the Kafka arm can be deleted -- and off everywhere else.
+# data_ingest each stand up a latency arm at startup, called or not -- a gRPC servicer and a
+# client channel today, Kafka topics and an RPC consumer before tj-3mk3u5.13. It must be on in
+# dev, where it serves a live REST-against-gRPC comparison, and off everywhere else. It used to
+# say the comparison was needed "before the Kafka arm can be deleted"; that arm went on
+# tj-3mk3u5.35 once tj-3mk3u5.26 had banked the numbers, so nothing is gated on it now.
 LATENCY_FLAG = 'LATENCY_TEST_ENABLED'
 
 # Both halves, always. routers/common/latency.py guards the client (initialize_latency_client,
@@ -572,9 +579,9 @@ def test_every_compose_service_declares_a_healthcheck():
 def test_every_compose_healthcheck_declares_its_timings():
     """A healthcheck without a start_period fails `--wait` spuriously on a cold start.
 
-    Kafka in KRaft mode takes tens of seconds to format and start; the apps block in
-    lifespan on database.initialize() and wait_for_kafka(). A start_period shorter than
-    real startup is how `--wait` earns a reputation for flakiness and gets deleted.
+    The apps block in lifespan on database.initialize() before serving. A start_period
+    shorter than real startup is how `--wait` earns a reputation for flakiness and gets
+    deleted.
     """
     services = _load_yaml(COMPOSE_FILE)['services']
     required = {'test', 'interval', 'timeout', 'retries', 'start_period'}
@@ -654,10 +661,12 @@ def test_latency_harness_is_off_in_the_env_default(monkeypatch: pytest.MonkeyPat
     """tj-8mt207: .env.default is copied into every environment, so the harness must be off in it.
 
     This is the file CI copies to .env (trader_joe_testing.yml, "Stage Pipeline Configs") and the
-    file a prod deployment is seeded from. Shipping it on is how a load generator ended up running
-    in production: nothing fails, no probe goes red, both services just permanently hold a Kafka
-    RPC consumer and a set of topics nobody asked for. A regression here is silent, which is the
-    whole reason it is worth a test rather than a comment.
+    file a prod deployment is seeded from. Shipping it on is how a load generator ends up running
+    in production: nothing fails and no probe goes red, both services just permanently stand up a
+    latency arm nobody asked for. The cost used to be a Kafka RPC consumer and a set of topics,
+    which tj-3mk3u5.13 and .14 deleted; it is now a gRPC servicer and a client channel on each
+    side. A regression here is silent either way, which is the whole reason it is worth a test
+    rather than a comment.
     """
     values = _env_file_values(ENV_DEFAULT_FILE)
     assert LATENCY_FLAG in values, (
@@ -678,13 +687,17 @@ def test_latency_harness_is_on_for_both_services_in_the_dev_override(service: st
 
     Parametrized per service on purpose: the failure this exists to catch is someone removing or
     missing ONE of the two entries. data_store is the client -- it serves GET /latency -- and
-    data_ingest is the server that answers it over REST and Kafka RPC. Half a pair is worse than
+    data_ingest is the server that answers it over REST and gRPC. Half a pair is worse than
     neither half, because it looks configured: the stack comes up healthy and the endpoint hangs
     until LATENCY_TEST_TIMEOUT with nothing in the logs to say why.
 
-    The harness has to survive in dev because tj-3mk3u5.8 needs the REST vs Kafka vs gRPC
-    measurement before any deletion task in that epic can run, and that measurement is only
-    possible while all three transports exist.
+    WHY THE HARNESS SURVIVES IN DEV, restated because its original reason has expired. It used to
+    say tj-3mk3u5.8 needed the REST vs Kafka vs gRPC measurement "before any deletion task in that
+    epic can run, and that measurement is only possible while all three transports exist" -- a
+    BLOCKING PRECONDITION on deletions that have all since happened. The measurement was taken on
+    tj-3mk3u5.26, its p50/p99 banked on tj-q3zugf and the epic, and the Kafka arm removed on
+    tj-3mk3u5.35. What survives is a live REST-against-gRPC comparison, and the pairing above is
+    what keeps it working; nothing here gates anything any more.
     """
     environment = _compose_service_environment(OVERRIDE_FILE, service)
     assert LATENCY_FLAG in environment, (
@@ -916,6 +929,27 @@ def test_every_scanner_root_exists_as_a_directory(source: str):
         f'{[f"{origin}: {root}" for origin, root in missing]}. bandit does not fail on a path '
         f'that does not exist -- it skips it, scans the rest and exits 0 -- so a misspelled '
         f'root silently removes that whole layer from the security scan.'
+    )
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize('source', SCANNER_ROOT_SOURCES)
+def test_every_directory_the_image_copies_is_under_a_scanner_root(source: str):
+    """What the image ships, bandit reads (decision tj-3mk3u5.42 F1 rule 6).
+
+    The other direction of the check above, and as silent: a root dropped from BOTH lists keeps
+    them equal and every root existing, so nothing went red when gen/proto/python, generated but
+    copied into the image and run there, was taken out of SOURCE_DIRS and SOURCE_PATHS together
+    (tj-3mk3u5.44 gate, mutation 8). Every directory a Dockerfile COPY reads from the build context
+    has to lie under one of the roots.
+    """
+    roots = [PurePosixPath(posixpath.normpath(root)) for _, root in _scanner_roots(source)]
+    copied = sorted(path for path in _dockerfile_copy_sources() if (REPO_ROOT / path).is_dir())
+    assert set(copied) >= KNOWN_COPY_SOURCES, f'the COPY parse found directories {copied}'
+    unscanned = [path for path in copied if not any(PurePosixPath(path).is_relative_to(root) for root in roots)]
+    assert not unscanned, (
+        f'the image copies {unscanned}, which no {source} root covers, so bandit never reads code the '
+        f'image runs. Add the directory to SOURCE_DIRS and SOURCE_PATHS together.'
     )
 
 
@@ -1208,11 +1242,27 @@ def test_permanent_rule_families_are_suppressed_only_where_ruled():
 # rather than restated, so the two cannot drift apart.
 MIGRATIONS_SCRIPT = REPO_ROOT / 'data' / 'store' / 'run_migrations.sh'
 
-# An allow list, so that it fails closed: a subcommand nobody has classified is refused.
-# `current` reads alembic_version; `history`, `heads`, `branches` and `show` read the revision
-# files. stamp, upgrade, downgrade, merge, revision, edit and ensure_version all write to the
-# database or to the revision tree, and none of them is here.
-READ_ONLY_ALEMBIC_COMMANDS = frozenset({'current', 'history', 'heads', 'branches', 'show'})
+# An allow list of WHOLE INVOCATIONS, so that it fails closed AND cannot be fooled by an
+# argument (tj-k7xu0n). It used to key on the subcommand name alone, and that was unsound:
+# alembic.command.history has two branches, and the one `--indicate-current` or `-r current:head`
+# takes runs EnvironmentContext(...) -> script.run_env() with NO dont_mutate=True -- the same
+# shape that makes `check` write alembic_version on a never-migrated database. So `history` was
+# read-only on some argument lists and not others, while the classifier held the arguments and
+# threw them away.
+#
+# WHY WHOLE INVOCATIONS RATHER THAN A PREDICATE PER COMMAND. `check`'s conditionality is on THE
+# WORLD -- is this database already migrated -- which no command line reveals, so it cannot live
+# in a list at all and has its own target instead. `history`'s is on THE INVOCATION, which the
+# parser already has. Keying on it kills the --indicate-current hole by construction and keeps
+# this a plain readable set. A denylist of dangerous flags was rejected for failing OPEN: the
+# next alembic flag of the same shape would slip through it.
+#
+# MEASURED, not assumed, before narrowing: the only alembic invocations in the Makefile are the
+# bare script call (which is `upgrade head` by its own default), `current`, `history` and
+# `check`. `heads`, `branches` and `show` appeared in no recipe, so their entries were
+# speculative permissions in a fail-closed list and are gone. An invocation that needs adding is
+# a one-line change here, which is where that decision should be visible.
+READ_ONLY_ALEMBIC_INVOCATIONS = frozenset({('current',), ('history',)})
 
 # alembic's global options that take a value. Skipping their values finds the subcommand in
 # `alembic -c alembic.ini stamp head`, which would otherwise read `alembic.ini` as the command.
@@ -1268,33 +1318,67 @@ def _commands(recipe_line: str) -> list[list[str]]:
     return [command for command in commands if command]
 
 
-def _alembic_subcommand(command: list[str]) -> str | None:
-    """Return the alembic subcommand a simple command runs, or None if it does not run alembic.
+def _alembic_arguments(command: list[str]) -> list[str] | None:
+    """The arguments a simple command passes to alembic, or None if it does not run alembic.
 
     Two routes reach alembic: run_migrations.sh, whose arguments are alembic's and whose empty
-    argument list means the script's default, and alembic itself. A command that runs the
-    script or alembic with no subcommand to find returns the empty string, not None, so the
-    caller refuses it rather than mistaking it for something unrelated.
+    argument list means the script's default, and alembic itself.
+
+    Split out of _alembic_subcommand so the two classifiers below read the SAME argument list
+    (tj-k7xu0n). One wants the subcommand's name and the other the whole invocation; sharing the
+    route-finding means they cannot disagree about which commands reach alembic at all.
     """
     for index, word in enumerate(command):
         name = PurePosixPath(word).name
         if name == MIGRATIONS_SCRIPT.name:
-            arguments = command[index + 1 :] or _script_default_arguments()
-        elif name == 'alembic':
-            arguments = command[index + 1 :]
-        else:
-            continue
-        position = 0
-        while position < len(arguments):
-            argument = arguments[position]
-            if argument in _ALEMBIC_VALUE_OPTIONS:
-                position += 2
-            elif argument.startswith('-'):
-                position += 1
-            else:
-                return argument
-        return ''
+            return command[index + 1 :] or _script_default_arguments()
+        if name == 'alembic':
+            return command[index + 1 :]
     return None
+
+
+def _alembic_invocation(command: list[str]) -> tuple[str, ...] | None:
+    """The alembic invocation as the allow list keys on it: the subcommand and ITS arguments.
+
+    alembic's own global options are dropped, so `alembic -c alembic.ini current` and `alembic
+    current` are one invocation -- the config file does not change what the command does.
+    Everything from the subcommand onward is KEPT, which is the whole point: `history` and
+    `history --indicate-current` are different invocations because they take different branches
+    inside alembic, and only one of them is read-only.
+
+    Returns:
+        tuple: The normalised invocation, or the EMPTY tuple when alembic is reached with no
+        subcommand at all -- which is not in the allow list, so the caller refuses it. None only
+        when the command does not run alembic, which the caller distinguishes.
+    """
+    arguments = _alembic_arguments(command)
+    if arguments is None:
+        return None
+    position = 0
+    while position < len(arguments):
+        argument = arguments[position]
+        if argument in _ALEMBIC_VALUE_OPTIONS:
+            position += 2
+        elif argument.startswith('-'):
+            position += 1
+        else:
+            return tuple(arguments[position:])
+    return ()
+
+
+def _alembic_subcommand(command: list[str]) -> str | None:
+    """Return the alembic subcommand a simple command runs, or None if it does not run alembic.
+
+    The NAME only. The read-only allow list no longer uses this -- it keys on the whole
+    invocation (tj-k7xu0n) -- but the CI workflow check below genuinely wants the name, because
+    it asks which alembic verbs a step reaches and treats `upgrade` and the wrapper's `$1`
+    differently. A command that reaches alembic with no subcommand returns the empty string, not
+    None, so that caller refuses it rather than mistaking it for something unrelated.
+    """
+    invocation = _alembic_invocation(command)
+    if invocation is None:
+        return None
+    return invocation[0] if invocation else ''
 
 
 @pytest.mark.build_infra
@@ -1302,25 +1386,152 @@ def test_migrate_status_runs_only_read_only_alembic_commands():
     """tj-08dlh8: the approval of `make migrate-status` was conditional on it being read-only.
 
     Every simple command in the recipe must run alembic, directly or through
-    run_migrations.sh, with a subcommand in READ_ONLY_ALEMBIC_COMMANDS. A command that does
-    not run alembic at all is refused too: `$(SOMETHING)` or a second script could reach a
+    run_migrations.sh, with a WHOLE INVOCATION in READ_ONLY_ALEMBIC_INVOCATIONS. A command that
+    does not run alembic at all is refused too: `$(SOMETHING)` or a second script could reach a
     mutating command this test cannot see, and the target's whole job is to call alembic. If a
     new line is legitimate, the change to this test is where that gets decided.
+
+    IT KEYS ON THE INVOCATION, NOT THE SUBCOMMAND (tj-k7xu0n). `history` is read-only bare and
+    not read-only under `--indicate-current`, so a name-keyed allow list permitted a command
+    that writes. See the allow list for why a per-command predicate and a flag denylist were
+    both rejected.
     """
     offenders = []
     for line in _make_recipe('migrate-status'):
         for command in _commands(line):
-            subcommand = _alembic_subcommand(command)
-            if subcommand is None:
+            invocation = _alembic_invocation(command)
+            if invocation is None:
                 offenders.append(f'`{" ".join(command)}` does not run alembic')
-            elif subcommand not in READ_ONLY_ALEMBIC_COMMANDS:
-                offenders.append(f'`{" ".join(command)}` runs `alembic {subcommand or "<none>"}`')
+            elif invocation not in READ_ONLY_ALEMBIC_INVOCATIONS:
+                offenders.append(f'`{" ".join(command)}` runs `alembic {" ".join(invocation) or "<none>"}`')
     assert not offenders, (
         f'the migrate-status recipe in {MAKEFILE.name} is no longer read-only: {offenders}. The '
-        f'user approved it only on that condition (tj-4yvsb2). Read-only alembic commands are '
-        f'{sorted(READ_ONLY_ALEMBIC_COMMANDS)}; a bare run_migrations.sh call is '
+        f'user approved it only on that condition (tj-4yvsb2). Read-only alembic invocations are '
+        f'{sorted(READ_ONLY_ALEMBIC_INVOCATIONS)} -- WHOLE invocations, so an argument that '
+        f'changes what the command does is a different entry; a bare run_migrations.sh call is '
         f'`alembic {" ".join(_script_default_arguments())}`. A mutating step belongs behind its '
         f'own named target, the way `migrate` is.'
+    )
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    ('spelling', 'allowed'),
+    [
+        ('./data/store/run_migrations.sh current', True),
+        ('./data/store/run_migrations.sh history', True),
+        ('alembic -c alembic.ini current', True),
+        ('./data/store/run_migrations.sh history --indicate-current', False),
+        ('./data/store/run_migrations.sh history -r current:head', False),
+        ('./data/store/run_migrations.sh stamp head', False),
+        ('./data/store/run_migrations.sh', False),
+        ('alembic', False),
+    ],
+    ids=[
+        'bare-current',
+        'bare-history',
+        'current-with-a-config-file',
+        'history-indicate-current',
+        'history-with-a-range',
+        'stamp-head',
+        'bare-script-is-upgrade-head',
+        'alembic-with-no-subcommand',
+    ],
+)
+def test_the_read_only_allow_list_judges_whole_invocations(spelling: str, allowed: bool):
+    """The classifier itself, on the spellings that matter -- including the one that broke it.
+
+    THE GUARD ABOVE READS THE REAL MAKEFILE, so it can only ever judge the invocations that
+    happen to be in it today. That makes it silent about the dangerous spelling: nothing in the
+    repository runs `history --indicate-current`, so a name-keyed allow list stayed green for as
+    long as it existed while permitting a command that writes (tj-k7xu0n). This case produces
+    that forbidden state directly instead of waiting for someone to add it to a recipe.
+
+    THE TRUE CASES ARE AS LOAD-BEARING AS THE FALSE ONES. A classifier that refused everything
+    would satisfy the refusals alone, and `migrate-status` would then be red for the wrong
+    reason -- so bare `current` and bare `history` are pinned as ACCEPTED here, and the config
+    file case pins that a global option does not make an invocation unrecognisable.
+
+    Args:
+        spelling: One recipe-line spelling, as it would appear in the Makefile.
+        allowed: Whether the read-only allow list should accept it.
+    """
+    (command,) = _commands(spelling)
+    invocation = _alembic_invocation(command)
+    assert invocation is not None, f'{spelling!r} was not recognised as running alembic at all'
+    assert (invocation in READ_ONLY_ALEMBIC_INVOCATIONS) is allowed, (
+        f'{spelling!r} normalises to {invocation} and the allow list '
+        f'{"refuses" if allowed else "permits"} it. Read-only invocations are '
+        f'{sorted(READ_ONLY_ALEMBIC_INVOCATIONS)}.'
+    )
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize('target', ['dev-down', 'prod-down'])
+def test_the_teardown_targets_remove_orphans(target: str):
+    """tj-citjd6: both targets claim a clean teardown, and only --remove-orphans makes that true.
+
+    AN ORPHAN IS A CONTAINER THIS PROJECT OWNS WHOSE SERVICE IS NO LONGER IN THE COMPOSE FILE.
+    A plain `down` leaves it running with a warning, so a target advertised as stopping the
+    stack silently does not. That is not hypothetical: a kafka container outlived its service's
+    deletion and failed tj-3mk3u5.16's A0 after surviving every teardown for 38 hours.
+
+    WHY IT IS PINNED RATHER THAN LEFT TO THE COMMENT ABOVE IT. The flag was ABSENT here while
+    the same project had already chosen it twice -- the agent-MCP up at Makefile:638 and
+    stack_down_steps -- and both of those ARE pinned, by test_agent_mcp_make.py and by
+    test_commands.py's exact compose tails. So two of four equivalent commands were guarded and
+    two were not, and the two that were not are the two that drifted. This closes that asymmetry
+    rather than restating a literal for its own sake: what it defends is the agreement between
+    four commands, which is the thing nobody notices breaking.
+
+    Deliberately NOT asserted here: that the flag is safe. It DELETES, on a production path, and
+    that argument lives in the Makefile comment where someone running the command will read it.
+
+    Args:
+        target: The teardown target whose recipe must carry the flag.
+    """
+    recipe = _make_recipe(target)
+    downs = [line for line in recipe if ' down' in f' {line}']
+    assert downs, f'{target} runs no `down` at all, so {MAKEFILE.name} no longer tears anything down'
+    missing = [line for line in downs if '--remove-orphans' not in line]
+    assert not missing, (
+        f'{target} runs `down` without --remove-orphans: {missing}. A container whose service has '
+        f'left the compose file then survives the teardown, which is what cost tj-3mk3u5.16 its A0 '
+        f'run. The agent-MCP up and stack_down_steps already carry the flag; all four agree or none '
+        f'of the claims about a clean teardown are true.'
+    )
+
+
+@pytest.mark.build_infra
+def test_migrate_check_actually_runs_alembic_check():
+    """The positive half: `check` lives on its own target, and that target really runs it.
+
+    THE PAIR IS THE POINT (tj-9fxc46). The test above pins that `check` is NOT in
+    migrate-status, which is the dangerous direction and the one the user's read-only approval
+    turns on. On its own it is satisfied by a `check` that exists nowhere at all -- delete
+    migrate-check entirely and that test still passes. So the drift-detection the project
+    adopted could vanish silently while every guard stayed green. This is the other half.
+
+    WHY `check` IS NOT IN THE READ-ONLY ALLOW LIST, since the two tests sit together and the
+    asymmetry looks like an oversight: `check` writes alembic_version on a never-migrated
+    database -- command.check() passes no dont_mutate=True and the guard in
+    runtime/migration.py is `not self.as_sql and not heads and not dont_mutate` -- so it is
+    read-only only where heads already exist. That conditionality is on the WORLD rather than
+    on the command line, which is why it gets a target labelled as writing rather than a seat
+    in a list that keys on invocations (ADR tj-x3ig38, 2026-10-03 addendum superseding item 8).
+
+    Asserted as "some command in the recipe runs exactly `alembic check`", not as the whole
+    recipe text: the target may legitimately gain a guard or an echo, and a parity assertion
+    over the literal would make this test a copy of the Makefile rather than a claim about it.
+    """
+    invocations = [
+        _alembic_invocation(command) for line in _make_recipe('migrate-check') for command in _commands(line)
+    ]
+    assert ('check',) in invocations, (
+        f'the migrate-check recipe in {MAKEFILE.name} does not run `alembic check`; it runs '
+        f'{[i for i in invocations if i is not None]}. That target is the only place the '
+        f'model-versus-catalogue drift check runs (tj-o82yyu), and migrate-status must not take '
+        f'it back -- it keeps a read-only promise the user approved it on.'
     )
 
 
@@ -1366,7 +1577,15 @@ def test_migrate_still_defaults_to_upgrade_head():
 #
 # Alembic writes the revision files, and they were excluded before tj-2ngid0 widened the list.
 # Adding a prefix here takes a source path out of the lint gate, so it is a decision.
-RUFF_UNLINTED_SOURCE_PREFIXES = ('data/store/migrations/versions/',)
+#
+# gen/proto/ is protoc's committed output, one tree per language, excluded by ADR tj-8konfu D3 and
+# decision tj-3mk3u5.42 F1 as generated code, the same way the revisions are. `make proto` writes it
+# and nothing else does, so it is never hand-edited or reformatted. CI's staleness step regenerates it
+# and fails on any difference, so a hand-written file slipped in there shows up as one `make proto`
+# deletes. Its Python tree is a SOURCE_DIRS root (bandit reads it, because the image ships it), so
+# this prefix is what keeps the root out of ruff's list without a swallowed-source failure. It names
+# gen/proto/ only: common/rpc/, which imports the tree, is hand-written and stays linted.
+RUFF_UNLINTED_SOURCE_PREFIXES = ('data/store/migrations/versions/', 'gen/proto/')
 
 
 def _run(*command: str) -> list[str]:
@@ -2409,7 +2628,10 @@ def test_the_client_hands_the_suite_the_env_contract():
     - DATABASE_PORT is the container port, 5432: the client is on the network.
     - The secrets are ${NAME} interpolation, never literals.
     - TZ is off UTC in both January and July, so a naive-to-timestamptz shift can go red.
-    - PYTHONPATH is the working directory: tests/system has no package chain to provide the root.
+    - PYTHONPATH is the service image's, read under the working directory: the working directory
+      itself (tests/system has no package chain to provide the root), then the generated gRPC code's
+      root, gen/proto/python (decision tj-3mk3u5.42 F1). pytest.ini covers the suite, but the seed
+      producer test_client also runs is not pytest.
     - The driver flags match $(PYTEST_ENV), as for every host test target.
     """
     client = _test_client()
@@ -2443,8 +2665,11 @@ def test_the_client_hands_the_suite_the_env_contract():
         assert environment[key] == f'${{{key}}}', (
             f'{key} is {environment[key]!r}: a secret is interpolated, never literal'
         )
-    assert environment['PYTHONPATH'] == client.get('working_dir'), (
-        f'PYTHONPATH {environment["PYTHONPATH"]!r} is not the working_dir {client.get("working_dir")!r}'
+    working_dir = PurePosixPath(client.get('working_dir') or '')
+    image_model = ':'.join(str(working_dir / entry) for entry in IMAGE_PYTHONPATH_ENTRIES)
+    assert environment['PYTHONPATH'] == image_model, (
+        f'PYTHONPATH {environment["PYTHONPATH"]!r} is not the image model under the working_dir {working_dir}: '
+        f'{image_model!r}'
     )
     for word in _make_variable('PYTEST_ENV').split():
         name, _, value = word.partition('=')
@@ -2968,6 +3193,18 @@ STOP_STEP = 'Stop System'
 BUILD_CLIENT_STEP = 'Build Test Client'
 SMOKE_STEP = 'Smoke Test'
 LOCKDOWN_STEP = 'Check Network Lockdown'
+# tj-3mk3u5.49 (T3a): data_ingest's gRPC bind name resolves to its ingest_store address alone. After
+# the stack is up; its script's pass/fail logic is exercised in test_grpc_bind_network.py.
+GRPC_BIND_STEP = 'Check gRPC Bind Network'
+# tj-3mk3u5.25 (T3b): data_store calls data_ingest's gRPC health over ingest_store and needs SERVING.
+# After the bind check and before the lockdown; stack-only. Its script, and the lockdown step's gRPC
+# half, are run under bash with docker stubbed in test_grpc_peer_reach.py.
+PEER_STEP = 'Check gRPC Peer Reach'
+# tj-3mk3u5.56 (decision tj-3mk3u5.42 addendum F1-A): inside every running service built from the
+# Dockerfile, common.rpc.ping imports the generated code, so compose's environment: PYTHONPATH held over
+# the root env file at runtime. After the stack is up and before the suite; stack-only. Its script is run
+# under bash with docker stubbed in test_service_pythonpath.py.
+IMPORT_CHECK_STEP = 'Check Generated Code Import'
 START_STEP = 'Start System'
 # tj-irhy0a.1 / tj-irhy0a.2: the fake-mode banner check, and the head seed's dump and upload.
 FAKE_CHECK_STEP = 'Check Fake Broker'
@@ -2980,8 +3217,11 @@ SYSTEM_JOB_STEP_ORDER = (
     FAKE_CHECK_STEP,
     MIGRATE_STEP,
     SMOKE_STEP,
+    GRPC_BIND_STEP,
+    PEER_STEP,
     LOCKDOWN_STEP,
     'Check Container Env',
+    IMPORT_CHECK_STEP,
     SYSTEM_TESTS_STEP,
     # After the suite (decision tj-vhboky.55) and BEFORE the lifecycle step, which blanks the write
     # secret the producer authenticates with (architect note of 04:45 UTC 2026-09-30 on tj-irhy0a.1).
@@ -3004,14 +3244,27 @@ SYSTEM_JOB_COMPOSE_STEPS = (
     START_STEP,
     FAKE_CHECK_STEP,
     MIGRATE_STEP,
+    GRPC_BIND_STEP,
+    PEER_STEP,
     'Check Container Env',
+    IMPORT_CHECK_STEP,
     LIFECYCLE_STEP,
     DUMP_STEP,
     STOP_STEP,
 )
 # Steps that drive the stack and nothing else: they must never load the client file, so starting,
 # migrating, inspecting and stopping the stack cannot depend on it.
-SYSTEM_JOB_STACK_ONLY_STEPS = (START_STEP, FAKE_CHECK_STEP, MIGRATE_STEP, 'Check Container Env', DUMP_STEP, STOP_STEP)
+SYSTEM_JOB_STACK_ONLY_STEPS = (
+    START_STEP,
+    FAKE_CHECK_STEP,
+    MIGRATE_STEP,
+    GRPC_BIND_STEP,
+    PEER_STEP,
+    'Check Container Env',
+    IMPORT_CHECK_STEP,
+    DUMP_STEP,
+    STOP_STEP,
+)
 # Steps that must send at least one request from test_client (tj-q9ae5u addendum 1 item 5').
 SYSTEM_JOB_CLIENT_STEPS = (BUILD_CLIENT_STEP, SMOKE_STEP, LOCKDOWN_STEP, LIFECYCLE_STEP)
 # The one compose subcommands a client invocation may run.
@@ -3450,11 +3703,17 @@ def test_network_lockdown_checks_non_resolution_and_no_egress():
     """N4 item 5: the network model as the RUNNING stack enforces it, not as the file declares it.
 
     - From test_client, a positive lookup of data_store comes first -- a client with no working DNS
-      would otherwise make every negative pass -- then the kafka container name and data_ingest
-      must NOT resolve, told apart from a failed run by getent's own not-found status, 2.
+      would otherwise make every negative pass -- then data_ingest must NOT resolve, told apart
+      from a failed run by getent's own not-found status, 2.
     - From postgres and from data_store, a TCP connect to a public LITERAL address (no DNS
       involved) must fail, told apart from a failed probe by a distinct status, 3.
-    The name probed as kafka is the one kafka's container_name interpolates.
+
+    tj-3mk3u5.25 extension (the T3a gate's N1): data_ingest's gRPC bind alias -- the host its
+    environment names, read from the compose file -- is among the names test_client must not
+    resolve, and the step also probes the gRPC port BY ADDRESS from test_client through the image
+    interpreter, since the name will not resolve there. That half's pass and fail behaviour, its
+    data_store positive control and its exit-3 convention are exercised by running the step itself in
+    test_grpc_peer_reach.py.
     """
     lines = _step_lines(_system_step(LOCKDOWN_STEP))
     calls = [call for line in lines for call in _compose_calls(line)]
@@ -3477,15 +3736,24 @@ def test_network_lockdown_checks_non_resolution_and_no_egress():
         if f'lookup "${{{match.group(1)}}}"' in ' '.join(lines)
         for word in shlex.split(match.group(2))
     }
-    kafka_name = (_load_yaml(COMPOSE_FILE)['services']['kafka'] or {}).get('container_name')
-    kafka_service = 'kafka'
-    assert kafka_name and kafka_name in negatives and 'data_ingest' in negatives, (
-        f'{LOCKDOWN_STEP} must show {kafka_name} (kafka) and data_ingest do not resolve; it loops over {sorted(negatives)}'
+    assert 'data_ingest' in negatives, (
+        f'{LOCKDOWN_STEP} must show data_ingest does not resolve; it loops over {sorted(negatives)}'
     )
-    assert kafka_service in negatives, (
-        f'{LOCKDOWN_STEP} must also show the service name {kafka_service!r} does not resolve, not only the '
-        f'container name {kafka_name!r}; it loops over {sorted(negatives)}'
+    grpc_alias = _compose_service_environment(COMPOSE_FILE, 'data_ingest').get('APP_INTERNAL_GRPC_HOST')
+    assert grpc_alias, f'{COMPOSE_FILE.name} no longer names data_ingest APP_INTERNAL_GRPC_HOST'
+    assert grpc_alias in negatives, (
+        f'{LOCKDOWN_STEP} must show data_ingest gRPC bind alias {grpc_alias!r} does not resolve from '
+        f'{TEST_CLIENT_SERVICE}; it loops over {sorted(negatives)}'
     )
+    by_address = [
+        rest
+        for files, rest in calls
+        if files == _client_file_pair()
+        and rest[:1] == ['run']
+        and _compose_service(rest)[0] == TEST_CLIENT_SERVICE
+        and '/code/.venv/bin/python' in _compose_service(rest)[1]
+    ]
+    assert by_address, f'{LOCKDOWN_STEP} never probes data_ingest gRPC port by address from {TEST_CLIENT_SERVICE}'
     assert any(re.search(r'-eq 2\b', line) for line in lines), f'{LOCKDOWN_STEP} never requires getent not-found (2)'
 
     execs = {
@@ -4422,6 +4690,110 @@ def test_only_container_jobs_that_run_the_suite_are_judged(tmp_path: Path, monke
 
 
 # ---------------------------------------------------------------------------------------
+# ... AND THE TOOL THE SUITE ITSELF RUNS: JQ (tj-3mk3u5.40)
+#
+# common/tests/test_harness_hooks.py (tj-qenrpk) runs the PreToolUse Bash hooks in
+# .claude/settings.json verbatim, and each hook pipeline starts with jq, which debian:bookworm-slim
+# does not ship. Without jq a hook falls through its `|| true` and allows every command, so those
+# tests check for jq at run time and fail (pytest.ini: never skip). That check fires only where the
+# suite runs, and the agent image installs jq (.devcontainer/Dockerfile), so a job that lost jq would
+# go red in CI alone, on a push no agent makes. This pins it where an agent's own run sees it.
+#
+# BEFORE THE SUITE, NOT BEFORE CHECKOUT, which is why jq is not in CONTAINER_TEST_TOOLS. git has to
+# precede checkout for checkout to clone a repository; nothing earlier than pytest runs jq, so a job
+# that installs it in any step before the suite is correct and must not be named. Adding jq to that
+# set would also have turned every accepted fixture above red, and made the fixtures that drop git or
+# make fail for jq as well, so they would stop proving their own detection. Judged per step, like the
+# safe.directory check above: jq is installed in a step before the first one that runs the suite.
+# Same derivation as above, so a second container job running the suite is held to it too.
+#
+# grep -P, the hooks' other tool, is deliberately not pinned. It comes from the image, not from this
+# repository: bookworm's grep is Essential and pre-depends on libpcre2-8-0, so no line here installs
+# it and no edit here can lose it. The one lever is `container:` itself, and a new image is checked
+# on its first run by the hook tests' own grep -P probe, which runs the binary a static pin could
+# only guess about.
+CONTAINER_SUITE_TOOLS = frozenset({'jq'})
+
+
+def _container_suite_tool_gaps(job: dict) -> list[str]:
+    """What a container test job lacks: each of CONTAINER_SUITE_TOOLS installed in a step before the suite."""
+    steps = job.get('steps') or []
+    suite = next(index for index, step in enumerate(steps) if _runs_the_suite(step))
+    before = set().union(*(_installed_packages(step) for step in steps[:suite]))
+    missing = sorted(CONTAINER_SUITE_TOOLS - before)
+    if not missing:
+        return []
+    late = sorted(set(missing) & set().union(*(_installed_packages(step) for step in steps[suite:])))
+    return [
+        f'{missing} not installed in a step before the suite (step {suite}), and the harness-hook tests run it'
+        + (f'; {late} installed only in or after that step' if late else '')
+    ]
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    'job', [job for _, job in _CONTAINER_TEST_JOBS], ids=[label for label, _ in _CONTAINER_TEST_JOBS]
+)
+def test_container_test_job_installs_jq_before_the_suite(job: dict):
+    """tj-3mk3u5.40: a container job running the suite installs jq, which the harness-hook tests run, first."""
+    gaps = _container_suite_tool_gaps(job)
+    assert gaps == [], '; '.join(gaps)
+
+
+_INSTALL_WITH_JQ = {'run': 'apt-get update\napt-get install -y --no-install-recommends git make jq ca-certificates'}
+_INSTALL_JQ_ALONE = {'run': 'apt-get install -y --no-install-recommends jq'}
+_SUITE_TOOLS_ACCEPTED = {
+    'one-install-line': [_INSTALL_WITH_JQ, _SAFE, _CHECKOUT, _SUITE],
+    'own-step-after-checkout': [_INSTALL, _SAFE, _CHECKOUT, _INSTALL_JQ_ALONE, _SUITE],
+    'pinned-version-and-make-test': [
+        _INSTALL,
+        _CHECKOUT,
+        {'run': 'DEBIAN_FRONTEND=noninteractive apt-get install -y jq=1.6-2.1+deb12u2'},
+        _SAFE,
+        {'run': 'make test PATHS=common'},
+    ],
+}
+# Each of these is correct by the git-and-make rule above (the test asserts it), so jq is the only
+# thing any of them can be named for.
+_SUITE_TOOLS_REJECTED = {
+    'jq-dropped': [_INSTALL, _SAFE, _CHECKOUT, _SUITE],
+    'jq-after-the-suite': [_INSTALL, _SAFE, _CHECKOUT, _SUITE, _INSTALL_JQ_ALONE],
+    'jq-commented-out': [{'run': _INSTALL['run'] + '\n# apt-get install -y jq'}, _SAFE, _CHECKOUT, _SUITE],
+    'jq-run-never-installed': [_INSTALL, _SAFE, _CHECKOUT, {'run': 'jq --version'}, _SUITE],
+    'jq-removed-not-installed': [{'run': _INSTALL['run'] + '\napt-get purge -y jq'}, _SAFE, _CHECKOUT, _SUITE],
+}
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize('steps', list(_SUITE_TOOLS_ACCEPTED.values()), ids=list(_SUITE_TOOLS_ACCEPTED))
+def test_container_suite_tool_rule_accepts_a_correct_job(steps: list[dict]):
+    """A correct container job passes both rules, including jq in its own step after checkout."""
+    job = {'container': 'debian:bookworm-slim', 'steps': steps}
+    assert _container_suite_tool_gaps(job) == []
+    assert _container_toolchain_gaps(job) == []
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize('steps', list(_SUITE_TOOLS_REJECTED.values()), ids=list(_SUITE_TOOLS_REJECTED))
+def test_container_suite_tool_rule_rejects_a_broken_job(steps: list[dict]):
+    """Each of these reaches the suite without jq installed, and must be named for it."""
+    job = {'container': 'debian:bookworm-slim', 'steps': steps}
+    assert _container_toolchain_gaps(job) == [], 'the fixture is broken for a reason other than jq'
+    gaps = _container_suite_tool_gaps(job)
+    assert len(gaps) == 1 and gaps[0].startswith("['jq'] not installed in a step before the suite"), gaps
+
+
+@pytest.mark.build_infra
+def test_jq_installed_after_the_suite_is_named_as_late():
+    """The diagnosis says where jq went, so a reordered job reads as reordered, not as jq dropped."""
+    job = {'container': 'debian:bookworm-slim', 'steps': _SUITE_TOOLS_REJECTED['jq-after-the-suite']}
+    assert _container_suite_tool_gaps(job) == [
+        "['jq'] not installed in a step before the suite (step 3), and the harness-hook tests run it; "
+        "['jq'] installed only in or after that step"
+    ]
+
+
+# ---------------------------------------------------------------------------------------
 # THE BUILD CONTEXT (tj-ijpys9.17)
 #
 # Every host bind-mount data directory compose declares must stay out of the Docker build context.
@@ -4469,8 +4841,12 @@ DATA_DIR_VARIABLE = 'DATA_DIR'
 # A representative file inside a data directory, for the "is its content sent?" half of the check.
 DATA_DIR_SAMPLE_FILE = 'PG_VERSION'
 # What the Dockerfile COPYs today. A floor for the parse below, so a parser regression that finds
-# nothing cannot pass the "no COPY source is excluded" check vacuously.
-KNOWN_COPY_SOURCES = frozenset({'common', 'routers', 'schemas', 'data/store/app', 'data/ingest/app'})
+# nothing cannot pass the "no COPY source is excluded" check vacuously. gen/proto/python is the
+# committed generated gRPC code (decision tj-3mk3u5.42 F1): no app imports it yet, so the closure
+# check below cannot miss it, and this floor is what notices its COPY going.
+KNOWN_COPY_SOURCES = frozenset(
+    {'common', 'routers', 'schemas', 'gen/proto/python', 'data/store/app', 'data/ingest/app'}
+)
 # The one directory name under a COPY source that .dockerignore may exclude (tj-v82dvm).
 EXCLUDABLE_TEST_DIR = 'tests'
 # Non-vacuity for the reverse pin: the test directories under a COPY source when it was written.
@@ -4768,11 +5144,18 @@ def _copy_source_test_dirs_sent(rules: _IgnoreRules, test_dirs: dict[str, list[s
 
 
 def _first_party_module_file(module: str) -> Path | None:
-    """The repo source file a dotted module name resolves to, or None when it is not first-party."""
-    base = REPO_ROOT.joinpath(*module.split('.'))
-    for candidate in (base.with_suffix('.py'), base / '__init__.py'):
-        if candidate.is_file():
-            return candidate
+    """The repo source file a dotted module name resolves to, or None when it is not first-party.
+
+    Searched as the image's interpreter searches: each of its PYTHONPATH entries in order, the root
+    first, then gen/proto/python (common/tests/image_path.py). From the root alone, trader_joe.proto
+    is not first-party, and an app reaching it through common.rpc would pass the COPY check below
+    with the generated tree uncopied (decision tj-3mk3u5.42 F1).
+    """
+    for root in image_import_roots(REPO_ROOT):
+        base = root.joinpath(*module.split('.'))
+        for candidate in (base.with_suffix('.py'), base / '__init__.py'):
+            if candidate.is_file():
+                return candidate
     return None
 
 
@@ -4956,7 +5339,7 @@ def test_compose_declares_data_mounts_under_data_dir():
 def test_every_data_dir_mount_is_parsed():
     """tj-c4mosr.5 (00:55 gap (2)): a DATA_DIR-sourced mount the parser cannot read fails, never skips.
 
-    The agent-stack overlay mounts ${DATA_DIR:?...}/postgres and /kafka; the build-context check below
+    The agent-stack overlay mounts ${DATA_DIR:?...}/postgres; the build-context check below
     judges only the mounts _compose_data_mounts yields, so an unparsed spelling was a silent pass.
     """
     unparsed = [
@@ -4967,9 +5350,7 @@ def test_every_data_dir_mount_is_parsed():
     ]
     assert not unparsed, f'DATA_DIR mounts the build-context check cannot read, so it would skip them: {unparsed}'
     labels = {label for label, _, _ in _compose_data_mounts()}
-    assert {'docker-compose.agent-stack.yaml:postgres', 'docker-compose.agent-stack.yaml:kafka'} <= labels, sorted(
-        labels
-    )
+    assert {'docker-compose.agent-stack.yaml:postgres'} <= labels, sorted(labels)
 
 
 @pytest.mark.build_infra
@@ -5122,6 +5503,38 @@ def test_the_copy_coverage_check_names_what_the_image_does_not_copy(tmp_path: Pa
         'svc/b/app/api.py',
     ]
     assert _app_imports_outside_image('svc/b/app', {'shared'}) == []
+
+
+@pytest.mark.build_infra
+def test_the_copy_coverage_check_follows_generated_code_onto_the_images_second_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Decision tj-3mk3u5.42 F1: an app that reaches trader_joe.proto needs gen/proto/python in its image.
+
+    Synthetic tree in the repository's shape: the app imports a hand-written shared module, which
+    imports a generated one that resolves only on the image's second PYTHONPATH entry. No real app
+    does this until a servicer that imports generated code is registered (tj-3mk3u5.9/.10), so the
+    walk is pinned here. With the tree copied, nothing is named; without it, the generated module and
+    the guard __init__.py above it are.
+    """
+    files = {
+        'shared/__init__.py': '',
+        'shared/rpc.py': 'from trader_joe.proto.x.v1 import x_pb2\n',
+        'svc/app/main.py': 'import shared.rpc\n',
+        'gen/proto/python/trader_joe/proto/__init__.py': '# guard\n',
+        'gen/proto/python/trader_joe/proto/x/v1/x_pb2.py': 'from google.protobuf import descriptor\n',
+    }
+    for relative, text in files.items():
+        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / relative).write_text(text, encoding='utf-8')
+    monkeypatch.setattr(sys.modules[__name__], 'REPO_ROOT', tmp_path)
+    closure = {path.relative_to(tmp_path).as_posix() for path in _app_import_closure('svc/app')}
+    assert 'gen/proto/python/trader_joe/proto/x/v1/x_pb2.py' in closure, sorted(closure)
+    assert _app_imports_outside_image('svc/app', {'shared', 'gen/proto/python'}) == []
+    assert _app_imports_outside_image('svc/app', {'shared'}) == [
+        'gen/proto/python/trader_joe/proto/__init__.py',
+        'gen/proto/python/trader_joe/proto/x/v1/x_pb2.py',
+    ]
 
 
 # An uncopied ancestor package __init__.py, by content. Each row: (its text, allowed?). Allowed
@@ -5823,3 +6236,1164 @@ _IMPORT_TIME_PRINT_CASES = {
 def test_the_import_time_print_finder_follows_what_runs_at_import(source: str, lines: list[int]):
     """The finder above, on synthetic modules, so it cannot pass common/ by looking nowhere."""
     assert _import_time_prints(source) == lines
+
+
+# ---------------------------------------------------------------------------------------
+# THE gRPC TOOLCHAIN (ADR tj-8konfu D1 and D3, re-homed by addendum A1; tj-3mk3u5.23; the layout of
+# decision tj-3mk3u5.42 F1, tj-3mk3u5.44)
+#
+# Committing protoc's output is safe only with the controls around it. Each one fails silently
+# when it goes, because nothing reports a check that no longer runs.
+#
+# * THE STALENESS STEP. CI's unit job regenerates gen/proto/ through `make proto` and fails on ANY
+#   difference from the commit: a changed, staged, deleted or untracked file, in any language's
+#   tree. D3 says that without it committing is strictly worse than generating at build time. It has
+#   to run before the linters and the suite. Its script is pinned by RUNNING it against a scratch
+#   repository with a stand-in `make`, because the property is what it detects. A `git diff` in
+#   place of the `git status` reads the same at a glance and misses every untracked and staged file.
+# * THE SEAM. Nothing outside common/rpc/ imports trader_joe.proto (ruff TID251). Pinned by asking
+#   ruff itself, over stdin, with the project's own configuration. That exercises the select entry,
+#   the banned-api table and the per-file-ignore together: remove any one of them, narrow the ban to
+#   one contract, or widen the ignore, and a case here changes.
+# * THE IMPORT ROOT, BY CONFIGURATION ONLY (F1 rule 3). gen/proto/python reaches Python through
+#   pytest.ini's pythonpath, the image's ENV PYTHONPATH plus its COPY, and a bind mount beside every
+#   ./common mount. A missing piece is silent until a servicer that imports generated code is
+#   registered (data_ingest's registered_services() returns [] today), so each is pinned statically.
+# * THE PINS. The generator writes its version into every file it emits, so an unpinned
+#   grpcio-tools would fail the staleness step on a new release rather than on a contract change.
+#
+# What `make proto` itself does -- the plain include root, no post-processing, the clearing, the
+# reserved-root guard, the PEP 420 namespace -- is pinned by running the real target on scratch trees,
+# in common/tests/test_make_proto.py. Deliberately NOT pinned anywhere in the suite: that `make proto`
+# reproduces the COMMITTED tree. That IS the staleness step, which D3 makes the control.
+GENERATED_GRPC_TREE = PurePosixPath('gen/proto')
+GENERATED_GRPC_PACKAGE = GENERATED_GRPC_TREE / 'python' / 'trader_joe' / 'proto'
+GENERATED_GRPC_MODULE = GENERATED_GRPC_PACKAGE / 'ping' / 'v1' / 'ping_pb2.py'
+
+
+def _runs_make_target(command: list[str], target: str) -> bool:
+    return bool(command) and PurePosixPath(command[0]).name == 'make' and target in command[1:]
+
+
+# What lints, for the ordering test below: `make lint` or one of its legs, which is how CI lints since
+# tj-3mk3u5.54, and ruff or a buf check called directly. Matching ruff alone went silent at that change:
+# no step ran ruff any more, so a `make lint` step moved ahead of the staleness step stayed green.
+_LINT_TARGETS = ('lint', 'lint-python', 'lint-proto')
+_BUF_CHECKS = frozenset({'lint', 'format', 'breaking'})
+
+
+def _lints_directly(command: list[str]) -> bool:
+    names = [PurePosixPath(word).name for word in command]
+    return 'ruff' in names or ('buf' in names and bool(_BUF_CHECKS & set(names[names.index('buf') + 1 :])))
+
+
+def _runs_a_linter(step: dict) -> bool:
+    return any(
+        _lints_directly(command) or any(_runs_make_target(command, target) for target in _LINT_TARGETS)
+        for command in _step_commands(step)
+    )
+
+
+def _proto_regeneration_steps() -> list[tuple[str, int, dict]]:
+    """(job id, step index, step) for every step of the testing workflow that runs `make proto`."""
+    found = []
+    for job_id, job in ((_load_yaml(TESTING_WORKFLOW) or {}).get('jobs') or {}).items():
+        for index, step in enumerate((job or {}).get('steps') or []):
+            if any(_runs_make_target(command, 'proto') for command in _step_commands(step)):
+                found.append((job_id, index, step))
+    return found
+
+
+def _staleness_step() -> dict:
+    steps = _proto_regeneration_steps()
+    assert len(steps) == 1, (
+        f'expected exactly one step in {TESTING_WORKFLOW.name} that runs `make proto`, found '
+        f'{[(job_id, step.get("name")) for job_id, _, step in steps]}'
+    )
+    return steps[0][2]
+
+
+@pytest.mark.build_infra
+def test_ci_checks_the_generated_grpc_tree_before_it_lints_or_tests():
+    """D3: the staleness step exists, in the job that runs the suite, ahead of the linters and pytest.
+
+    Ahead, so a stale tree is reported as stale rather than as whatever lint or import error it
+    happens to cause first.
+    """
+    _staleness_step()
+    ((job_id, index, _),) = _proto_regeneration_steps()
+    steps = _load_yaml(TESTING_WORKFLOW)['jobs'][job_id]['steps']
+    gated = [later for later, step in enumerate(steps) if _runs_the_suite(step) or _runs_a_linter(step)]
+    assert any(_runs_the_suite(step) for step in steps), (
+        f'the `make proto` step is in {job_id}, which does not run the unit suite'
+    )
+    assert any(_runs_a_linter(step) for step in steps), (
+        f'no step in {job_id} lints, so the ordering below would judge pytest alone'
+    )
+    assert gated and min(gated) > index, (
+        f'in {job_id}, the `make proto` step is step {index}, but a linter or pytest runs at steps {gated}; '
+        f'it has to come first'
+    )
+
+
+_STALENESS_CASES = {
+    'regeneration is a no-op': ('', 0),
+    'a generated module changed': (f"printf '# drift\\n' >> {GENERATED_GRPC_MODULE}", 1),
+    # A hand edit that reached the index: `git diff` alone (unstaged changes only) would pass it.
+    'a generated module changed and staged': (
+        f"printf '# hand edit\\n' >> {GENERATED_GRPC_MODULE} && git add {GENERATED_GRPC_MODULE}",
+        1,
+    ),
+    'a generated module deleted': (f'rm {GENERATED_GRPC_MODULE}', 1),
+    'a generated module untracked': (
+        f'mkdir -p {GENERATED_GRPC_PACKAGE}/probe/v1 && '
+        f"printf 'x = 1\\n' > {GENERATED_GRPC_PACKAGE}/probe/v1/probe_pb2.py",
+        1,
+    ),
+    # The step judges gen/proto/, every language's tree (F1 rule 1), not only the Python one.
+    "another language's tree drifted": (
+        f"mkdir -p {GENERATED_GRPC_TREE}/ts && printf 'export {{}};\\n' > {GENERATED_GRPC_TREE}/ts/probe_pb.ts",
+        1,
+    ),
+    'a change outside the generated tree': ("printf 'drift\\n' >> README.md", 0),
+}
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(('regeneration', 'status'), _STALENESS_CASES.values(), ids=_STALENESS_CASES.keys())
+def test_the_staleness_step_fails_on_any_drift_in_the_generated_tree(tmp_path: Path, regeneration: str, status: int):
+    """D3: the step's own script, run where `make proto` leaves the generated tree in each possible state.
+
+    The stand-in `make` records its arguments and applies the case's change, so the step is shown to
+    regenerate through `make proto` and to judge what that leaves. Run under the shell GitHub uses for
+    a `run:` with no `shell:`. git is configured from nothing, so the runner's config cannot leak in.
+    """
+    script = _staleness_step().get('run') or ''
+    assert '${{' not in script, 'the step now uses a workflow expression, which this test cannot evaluate'
+
+    repo = tmp_path / 'repo'
+    (repo / GENERATED_GRPC_MODULE).parent.mkdir(parents=True)
+    (repo / GENERATED_GRPC_PACKAGE / '__init__.py').write_text('# guard\n', encoding='utf-8')
+    (repo / GENERATED_GRPC_MODULE).write_text('DESCRIPTOR = None\n', encoding='utf-8')
+    (repo / 'README.md').write_text('readme\n', encoding='utf-8')
+    env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    env |= {
+        'GIT_CONFIG_NOSYSTEM': '1',
+        'GIT_CONFIG_GLOBAL': os.devnull,
+        'GIT_AUTHOR_NAME': 'validator',
+        'GIT_AUTHOR_EMAIL': 'validator@example.invalid',
+        'GIT_COMMITTER_NAME': 'validator',
+        'GIT_COMMITTER_EMAIL': 'validator@example.invalid',
+    }
+    for command in (['git', 'init', '-q'], ['git', 'add', '-A'], ['git', 'commit', '-q', '-m', 'generated tree']):
+        subprocess.run(command, cwd=repo, env=env, check=True, capture_output=True)
+
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    make_log = tmp_path / 'make.args'
+    fake_make = bin_dir / 'make'
+    fake_make.write_text(
+        f'#!/usr/bin/env bash\nset -eu\nprintf "%s\\n" "$*" >> {shlex.quote(str(make_log))}\n{regeneration}\n',
+        encoding='utf-8',
+    )
+    fake_make.chmod(0o755)
+    step_script = tmp_path / 'step.sh'
+    step_script.write_text(script, encoding='utf-8')
+    env['PATH'] = f'{bin_dir}{os.pathsep}{env.get("PATH", "")}'
+
+    result = subprocess.run(
+        ['bash', '--noprofile', '--norc', '-e', str(step_script)], cwd=repo, env=env, capture_output=True, text=True
+    )
+
+    assert make_log.read_text(encoding='utf-8').splitlines() == ['proto'], 'the step must regenerate via `make proto`'
+    assert result.returncode == status, (
+        f'the staleness step exited {result.returncode}, expected {status}.\n'
+        f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}'
+    )
+
+
+# ---------------------------------------------------------------------------------------
+# THE ONE LINT STEP AND ITS BUF (tj-3mk3u5.54; the user's ruling on tj-3mk3u5.55)
+#
+# CI lints through `make lint`, the target every agent and developer runs, so the linters have one
+# definition, as protoc has through the staleness step's `make proto`. Before that step the job needs
+# curl (debian:bookworm-slim has none), the pinned buf through `make buf-install` (the Makefile's pin;
+# CI holds no copy), and main fetched as buf breaking's baseline. The suite runs the real buf too
+# (common/tests/test_make_lint.py), so buf comes before the suite as well. What the Makefile does with
+# all of it is pinned by running it, in test_make_lint.py; this pins that CI asks for it.
+#
+# Not folded into CONTAINER_SUITE_TOOLS (tj-3mk3u5.40; the bead left it to the validator): that rule
+# reads apt installs, and buf is not an apt package. Its install step is pinned by what it runs.
+BUF_BASELINE_SOURCE = 'refs/heads/main'
+
+
+def _lint_job_steps() -> tuple[str, list[dict]]:
+    """(job id, steps) of the one job in the testing workflow that runs `make lint`."""
+    jobs = (_load_yaml(TESTING_WORKFLOW) or {}).get('jobs') or {}
+    found = [
+        (job_id, (job or {}).get('steps') or [])
+        for job_id, job in jobs.items()
+        if any(
+            _runs_make_target(command, 'lint')
+            for step in (job or {}).get('steps') or []
+            for command in _step_commands(step)
+        )
+    ]
+    assert len(found) == 1, (
+        f'expected one job in {TESTING_WORKFLOW.name} that runs `make lint`, found {[j for j, _ in found]}'
+    )
+    return found[0]
+
+
+def _only_step(steps: list[dict], matches, what: str) -> int:
+    indexes = [index for index, step in enumerate(steps) if matches(step)]
+    assert len(indexes) == 1, f'expected exactly one step that {what}, found steps {indexes}'
+    return indexes[0]
+
+
+def _make_lint_command(steps: list[dict]) -> list[str]:
+    commands = [command for step in steps for command in _step_commands(step) if _runs_make_target(command, 'lint')]
+    assert len(commands) == 1, f'expected one `make lint` command, found {commands}'
+    return commands[0]
+
+
+def _make_assignments(command: list[str]) -> dict[str, str]:
+    return dict(word.split('=', 1) for word in command[1:] if '=' in word)
+
+
+def _fetched_refs(step: dict) -> list[tuple[str, str]]:
+    """(source, destination) for each refspec a `git fetch` in the step names."""
+    refs = []
+    for command in _step_commands(step):
+        if command[:2] != ['git', 'fetch']:
+            continue
+        for word in command[2:]:
+            if ':' in word and not word.startswith('-'):
+                source, destination = word.lstrip('+').split(':', 1)
+                refs.append((source, destination))
+    return refs
+
+
+@pytest.mark.build_infra
+def test_ci_lints_through_one_make_lint_step_and_calls_no_linter_directly():
+    """Gate 7: exactly one step runs `make lint`, and no step in any workflow runs ruff or a buf check itself."""
+    _, steps = _lint_job_steps()
+    _only_step(steps, lambda step: any(_runs_make_target(c, 'lint') for c in _step_commands(step)), 'runs `make lint`')
+    direct = [
+        f'{workflow.name}:{name}:{step.get("name")}'
+        for workflow in _workflow_files()
+        for name, job in ((_load_yaml(workflow) or {}).get('jobs') or {}).items()
+        for step in (job or {}).get('steps') or []
+        if any(_lints_directly(command) for command in _step_commands(step))
+    ]
+    assert not direct, f'these steps lint outside `make lint`, a second definition of the linters: {direct}'
+
+
+@pytest.mark.build_infra
+def test_ci_lint_step_covers_proto_against_the_main_it_fetched_and_annotates():
+    """Gate 7 / item 7: the lint step runs the proto leg, against the main it fetched, as annotations.
+
+    PATHS is left at '.', so buf runs; the baseline is the ref the fetch step writes, from main; and the
+    report-only switch stays the Makefile's alone, so its flip at the first SDK release reaches CI.
+    """
+    _, steps = _lint_job_steps()
+    lint = _make_lint_command(steps)
+    assignments = _make_assignments(lint)
+    assert assignments.get('PATHS', '.') == '.', f'CI scopes make lint to {assignments["PATHS"]!r}, so buf never runs'
+    assert 'BUF_BREAKING_BLOCKING' not in assignments, (
+        'CI sets BUF_BREAKING_BLOCKING itself, so flipping the Makefile at the first SDK release (tj-d2mhru) would not reach CI'
+    )
+    assert assignments.get('BUF_ERROR_FORMAT') == 'github-actions', lint
+    fetched = [ref for step in steps for ref in _fetched_refs(step)]
+    assert len(fetched) == 1, f'expected one fetched refspec for the baseline, found {fetched}'
+    ((source, destination),) = fetched
+    assert source == BUF_BASELINE_SOURCE, f'the baseline is fetched from {source}, not main'
+    against = assignments.get('BUF_AGAINST_REF')
+    assert against in {destination, destination.removeprefix('refs/remotes/')}, (
+        f'make lint compares against {against!r}, but the fetch step writes {destination}'
+    )
+
+
+@pytest.mark.build_infra
+def test_ci_installs_curl_buf_and_main_before_it_lints_and_buf_before_the_suite():
+    """Gate 7: curl, then make buf-install, and the fetch of main, all before make lint; buf before the suite."""
+    job_id, steps = _lint_job_steps()
+    lint = _only_step(
+        steps, lambda step: any(_runs_make_target(c, 'lint') for c in _step_commands(step)), 'runs make lint'
+    )
+    install = _only_step(
+        steps,
+        lambda step: any(_runs_make_target(c, 'buf-install') for c in _step_commands(step)),
+        'runs make buf-install',
+    )
+    fetch = _only_step(steps, lambda step: bool(_fetched_refs(step)), 'fetches the baseline')
+    suite = _only_step(steps, _runs_the_suite, 'runs the unit suite')
+    curl = [index for index, step in enumerate(steps) if 'curl' in _installed_packages(step)]
+    assert curl and curl[0] < install, (
+        f'in {job_id}, curl is installed at steps {curl}, not before buf-install (step {install})'
+    )
+    assert install < lint and fetch < lint, f'in {job_id}: buf-install {install}, fetch {fetch}, make lint {lint}'
+    assert install < suite, (
+        f'in {job_id}, buf is installed at step {install}, after the suite (step {suite}), which runs it'
+    )
+
+
+_LINTER_STEPS = {
+    'make-lint': ({'run': 'make lint BUF_AGAINST_REF=origin/main BUF_ERROR_FORMAT=github-actions'}, True),
+    'make-lint-proto': ({'run': 'make lint-proto PATHS=proto'}, True),
+    'make-lint-python': ({'run': 'make lint-python'}, True),
+    'ruff-directly': ({'run': 'uv run ruff check .'}, True),
+    'buf-lint-directly': ({'run': 'buf lint --error-format=github-actions'}, True),
+    'buf-breaking-by-path': ({'run': '/usr/local/bin/buf breaking --against x'}, True),
+    'make-proto': ({'run': 'make proto'}, False),
+    'make-buf-install': ({'run': 'make buf-install BUF_INSTALL_DIR=/usr/local/bin'}, False),
+    'buf-version': ({'run': 'buf --version'}, False),
+    'make-lint-fix': ({'run': 'make lint-fix'}, False),
+}
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(('step', 'lints'), _LINTER_STEPS.values(), ids=_LINTER_STEPS)
+def test_the_linter_detector_sees_make_lint_and_its_legs(step: dict, lints: bool):
+    """Guard the guard: the ordering test above is only as good as what this recognises as linting."""
+    assert _runs_a_linter(step) is lints
+
+
+SEAM_VIOLATIONS = (
+    'import trader_joe.proto.ping.v1.ping_pb2_grpc',
+    'from trader_joe.proto.ping.v1 import ping_pb2',
+    'from trader_joe.proto.ping.v1.ping_pb2 import PingRequest',
+    'from trader_joe import proto',
+    'import trader_joe.proto',
+    # A contract other than Ping, so a ban narrowed to one contract goes red. Ruff matches names; the
+    # module need not exist.
+    'from trader_joe.proto.market.v1 import bar_pb2',
+)
+OUTSIDE_THE_SEAM = (
+    'common/probe.py',
+    'common/tests/test_probe.py',
+    'common/tests/rpc/test_probe.py',
+    'routers/common/probe.py',
+    'schemas/common/probe.py',
+    'data/store/app/probe.py',
+    'data/ingest/app/probe.py',
+    'tests/system/test_probe.py',
+    'tools/agent_mcp/probe.py',
+)
+INSIDE_THE_SEAM = ('common/rpc/probe.py', 'common/rpc/nested/probe.py')
+
+
+def _ruff_codes_by_line(filename: str, source: str) -> dict[int, set[str]]:
+    """Lint `source` as though it lived at `filename`, under the project's ruff configuration."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            '-m',
+            'ruff',
+            'check',
+            '--no-cache',
+            '--output-format',
+            'json',
+            '--stdin-filename',
+            filename,
+            '-',
+        ],
+        cwd=REPO_ROOT,
+        input=source,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode in (0, 1), f'ruff did not run: exit {result.returncode}\n{result.stderr}'
+    found: dict[int, set[str]] = {}
+    for diagnostic in json.loads(result.stdout or '[]'):
+        found.setdefault(diagnostic['location']['row'], set()).add(diagnostic['code'])
+    return found
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize('filename', OUTSIDE_THE_SEAM)
+def test_generated_grpc_code_cannot_be_imported_outside_common_rpc(filename: str):
+    """D3's seam: every form of importing the generated package is TID251 outside common/rpc, tests included."""
+    flagged = _ruff_codes_by_line(filename, '\n'.join(SEAM_VIOLATIONS) + '\n')
+    missed = [line for row, line in enumerate(SEAM_VIOLATIONS, start=1) if 'TID251' not in flagged.get(row, set())]
+    assert not missed, f'in {filename}, ruff lets these through: {missed}. Reach generated code through common/rpc.'
+
+
+@pytest.mark.build_infra
+def test_no_hand_written_module_shares_the_generated_namespace_yet():
+    """The relative form of the seam: unreachable today, and this goes red the day it becomes reachable.
+
+    Before F1 the generated tree sat inside common/, and `from .rpc.generated... import` was a real
+    route around the ban, pinned as TID251. trader_joe.proto now heads its own top-level namespace, so
+    only a module INSIDE the trader_joe namespace could name it relatively, and ruff cannot resolve a
+    relative import there: no trader_joe/__init__.py exists to anchor it (F1 rule 5). Measured at
+    tj-3mk3u5.44's gate: in a trader_joe/common/x.py, `from ..proto.ping.v1 import ping_pb2` is not
+    TID251 (TID252, the parent-relative ban, does flag it), and in a trader_joe/x.py,
+    `from .proto.ping.v1 import ping_pb2` is flagged by neither.
+
+    No hand-written module lives in that namespace, so neither form can be written today, and no probe
+    is pinned against a file that does not exist. This pins the precondition instead: when PR 3 adds
+    the hand-written trader_joe.common (tj-yw8cok) or trader_joe.client, this fails, and the relative
+    form needs a control of its own before that lands.
+    """
+    tracked = _run('git', 'ls-files', '--', '*.py', '*.pyi')
+    in_namespace = sorted(
+        path
+        for path in tracked
+        if 'trader_joe' in PurePosixPath(path).parts and not path.startswith(f'{GENERATED_GRPC_TREE}/')
+    )
+    assert any(path.startswith(f'{GENERATED_GRPC_PACKAGE}/') for path in tracked), (
+        f'git tracks nothing under {GENERATED_GRPC_PACKAGE}, so this check reads the wrong tree'
+    )
+    assert not in_namespace, (
+        f'hand-written modules now share the trader_joe namespace with the generated trader_joe.proto: '
+        f'{in_namespace}. A relative import from them can reach generated code past TID251 (see this '
+        f"test's docstring); give the relative form a control, then update this test."
+    )
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize('filename', INSIDE_THE_SEAM)
+def test_common_rpc_may_import_its_generated_code(filename: str):
+    """Guard the guard: TID251 above comes from the ban, not from a rule that flags every import."""
+    flagged = _ruff_codes_by_line(filename, '\n'.join(SEAM_VIOLATIONS) + '\n')
+    assert not any('TID251' in codes for codes in flagged.values()), f'{filename}: {flagged}'
+
+
+# ---------------------------------------------------------------------------------------
+# THE GENERATED CODE'S IMPORT ROOT, BY CONFIGURATION ONLY (decision tj-3mk3u5.42 F1 rule 3;
+# tj-3mk3u5.44 gate item 7)
+#
+# gen/proto/python reaches Python in four places, and no code changes sys.path:
+#   * pytest.ini's pythonpath, for every pytest run (make test, CI's plain `uv run pytest`, test_client);
+#   * the image: ENV PYTHONPATH=/code:/code/gen/proto/python, and COPY ./gen/proto/python beside common;
+#   * a bind mount of ./gen/proto/python beside every ./common bind mount, so a host `make proto`
+#     reaches a dev container, plus test_client's PYTHONPATH, because the seed producer it runs is
+#     not pytest;
+#   * docker-compose.yaml's environment: PYTHONPATH on every service built from the service stages,
+#     because env_file: (the root env file's legacy PYTHONPATH=./) outranks the image's ENV (addendum
+#     F1-A, tj-3mk3u5.56; pinned in test_service_pythonpath.py).
+# A missing piece is silent: the image builds, the stack starts, and nothing fails until a servicer
+# that imports generated code is registered. data_ingest's registered_services() returns [] today,
+# so these static pins are the only control before tj-3mk3u5.9/.10. common/tests/image_path.py spells
+# the image's PYTHONPATH for the subprocesses the suite starts, and the first pin holds it equal to
+# the Dockerfile, so the mirror cannot drift from the image.
+GENERATED_PYTHON_ROOT = IMAGE_PYTHONPATH_ENTRIES[-1]
+# The images compose builds (data_store/data_ingest: prod_image, dev_image; test_client:
+# system_test_image) and the stage both service images copy /code from.
+IMAGE_TARGETS = ('prod_image', 'dev_image', 'system_test_image', 'service_build_image')
+# The stage that copies the hand-written shared code, as a floor for the COPY pin below.
+SHARED_COPY_STAGE = 'service_build_image'
+# Every compose service that mounts ./common today, as a floor for the mount pin below.
+KNOWN_COMMON_MOUNTS = frozenset(
+    {
+        'docker-compose.override.yaml:data_store',
+        'docker-compose.override.yaml:data_ingest',
+        'docker-compose.test-client.yaml:test_client',
+    }
+)
+
+
+def _stage_env(body: str, name: str) -> list[str]:
+    """Every value an ENV instruction in a stage body gives NAME, in order, `NAME=value` and legacy `NAME value` alike."""
+    values = []
+    for line in body.splitlines():
+        if line.strip().split(maxsplit=1)[:1] != ['ENV']:
+            continue
+        words = shlex.split(line, comments=True)[1:]
+        if len(words) == 2 and '=' not in words[0]:
+            values.extend([words[1]] if words[0] == name else [])
+            continue
+        for word in words:
+            key, separator, value = word.partition('=')
+            if separator and key == name:
+                values.append(value)
+    return values
+
+
+def _image_env(target: str, name: str) -> str | None:
+    """NAME in TARGET's image: the last ENV for it in the nearest stage of the FROM ancestry that sets it."""
+    stages = _dockerfile_stages()
+    for stage in _stage_ancestry(target):
+        values = _stage_env(stages[stage][1], name)
+        if values:
+            return values[-1]
+    return None
+
+
+def _stage_copies(body: str) -> list[tuple[str, str]]:
+    """(context source, destination) of each COPY in a stage body that reads the build context."""
+    copies = []
+    for line in body.splitlines():
+        if line.strip().split(maxsplit=1)[:1] != ['COPY']:
+            continue
+        words = shlex.split(line, comments=True)
+        if any(word.startswith('--from') for word in words[1:]):
+            continue
+        operands = [word for word in words[1:] if not word.startswith('--')]
+        copies.extend((posixpath.normpath(source), operands[-1]) for source in operands[:-1])
+    return copies
+
+
+def _image_pythonpath_model() -> str:
+    return ':'.join(str(IMAGE_CODE_ROOT / entry) for entry in IMAGE_PYTHONPATH_ENTRIES)
+
+
+@pytest.mark.build_infra
+def test_every_image_runs_with_the_pythonpath_the_suite_mirrors():
+    """Every ENV PYTHONPATH is the code root, then the generated code's root, and every image inherits one.
+
+    The model is common/tests/image_path.py's, which the suite's subprocess tests hand their children.
+    So a Dockerfile that drops gen/proto/python, or a mirror that drifts from it, goes red here.
+    """
+    stages = _dockerfile_stages()
+    setters = {stage for stage, (_, body) in stages.items() if _stage_env(body, 'PYTHONPATH')}
+    assert setters >= {'base_build_image', 'base_deploy_image'}, f'stages that set PYTHONPATH: {sorted(setters)}'
+    model = _image_pythonpath_model()
+    wrong = sorted(
+        f'{stage}: {value!r}'
+        for stage in setters
+        for value in _stage_env(stages[stage][1], 'PYTHONPATH')
+        if value != model
+    )
+    assert not wrong, f'ENV PYTHONPATH must be {model!r} (common/tests/image_path.py) everywhere: {wrong}'
+    for target in IMAGE_TARGETS:
+        assert target in stages, f'the Dockerfile has no stage {target}'
+        assert _image_env(target, 'PYTHONPATH') == model, f'{target} does not run with PYTHONPATH {model!r}'
+
+
+@pytest.mark.build_infra
+def test_the_image_copies_the_generated_tree_where_its_pythonpath_looks():
+    """The COPY of ./gen/proto/python sits in the stage that copies ./common, onto the PYTHONPATH entry."""
+    stages = _dockerfile_stages()
+    with_common = sorted(
+        stage for stage, (_, body) in stages.items() if any(source == 'common' for source, _ in _stage_copies(body))
+    )
+    assert SHARED_COPY_STAGE in with_common, f'no stage copies ./common where expected: {with_common}'
+    destination = str(IMAGE_CODE_ROOT / GENERATED_PYTHON_ROOT)
+    for stage in with_common:
+        copies = _stage_copies(stages[stage][1])
+        assert (str(GENERATED_PYTHON_ROOT), destination) in copies, (
+            f'{stage} copies ./common but not ./{GENERATED_PYTHON_ROOT} to {destination}: {copies}. The image '
+            f'builds and starts without it, and fails at the first import of generated code.'
+        )
+
+
+@pytest.mark.build_infra
+def test_every_compose_mount_of_common_has_the_generated_tree_beside_it():
+    """Beside every ./common bind mount, ./gen/proto/python at the sibling target, read-only exactly when common is."""
+    found, missing = [], []
+    for path, name, service in _compose_services():
+        by_source: dict[str | None, list[dict]] = {}
+        for mount in map(compose_model.volume, service.get('volumes') or []):
+            if mount['type'] == 'bind':
+                by_source.setdefault(_context_relative(mount['source'], path.parent), []).append(mount)
+        for common in by_source.get('common', []):
+            label = f'{path.relative_to(REPO_ROOT)}:{name}'
+            found.append(label)
+            target = str(PurePosixPath(common['target']).parent / GENERATED_PYTHON_ROOT)
+            beside = [(mount['target'], mount['read_only']) for mount in by_source.get(str(GENERATED_PYTHON_ROOT), [])]
+            if (target, common['read_only']) not in beside:
+                missing.append(
+                    f'{label} mounts ./common at {common["target"]} but not ./{GENERATED_PYTHON_ROOT} at {target} '
+                    f'(read_only={common["read_only"]}); it has {beside}'
+                )
+    assert set(found) >= KNOWN_COMMON_MOUNTS, f'./common mounts found: {sorted(found)}'
+    assert not missing, '\n'.join(missing)
+
+
+@pytest.mark.build_infra
+def test_pytest_puts_the_generated_root_on_the_suites_path():
+    """pytest.ini's pythonpath names every image entry but the root, which rootdir already provides, and took effect."""
+    config = configparser.ConfigParser(interpolation=None)
+    config.read(PYTEST_INI, encoding='utf-8')
+    entries = config.get('pytest', 'pythonpath', fallback='').split()
+    expected = {str(entry) for entry in IMAGE_PYTHONPATH_ENTRIES[1:]}
+    assert expected <= set(entries), (
+        f'{PYTEST_INI.name} pythonpath is {entries}, missing {sorted(expected - set(entries))}'
+    )
+    on_path = {Path(entry).resolve() for entry in sys.path if entry}
+    assert (REPO_ROOT / GENERATED_PYTHON_ROOT).resolve() in on_path, 'the pythonpath option did not reach sys.path'
+    assert REPO_ROOT.resolve() in on_path, 'the repository root is no longer on the suite path'
+
+
+# THE RUNTIME PATH IN THE CONTAINERS, as compose builds each container's environment: the image's ENV,
+# overridden by each env_file in order, overridden by environment: (compose's documented precedence).
+# Every service env_file is a live file the checkout does not hold (.env, data/store/.env, ...); each
+# is read here through its committed template (<file>.default), which is what every launch starts
+# from: CI's System Testing copies .env.default to .env, the agent stack copies every committed root
+# variable into its generated root env file, and a developer's .env begins as a copy.
+SERVICE_CONTAINERS = ('data_store', 'data_ingest')
+_LAUNCH_SETS = {
+    'prod': compose_model.prod_model,
+    'dev': lambda: compose_model.merge([compose_model.load(COMPOSE_FILE), compose_model.load(OVERRIDE_FILE)]),
+    'system': compose_model.system_model,
+    'agent-stack': compose_model.agent_stack_model,
+}
+
+
+def _env_file_template(entry: object, base: Path) -> Path | None:
+    """The committed template behind one env_file entry, with ${...} defaults applied; None when it has none."""
+    raw = entry.get('path') if isinstance(entry, dict) else entry
+    path = base / interpolate(str(raw), {})
+    template = path.with_name(f'{path.name}.default')
+    return template if template.is_file() else None
+
+
+def _container_env(service: dict, image_env: dict[str, str], base: Path) -> dict[str, str]:
+    """A container's environment as compose builds it: image ENV < env_file (in order) < environment:."""
+    env = dict(image_env)
+    for entry in service.get('env_file') or []:
+        template = _env_file_template(entry, base)
+        if template is not None:
+            env |= _env_file_values(template)
+    environment = service.get('environment') or {}
+    if isinstance(environment, dict):
+        env |= {str(key): str(value) for key, value in environment.items() if value is not None}
+    else:
+        env |= dict(str(item).partition('=')[::2] for item in environment if '=' in str(item))
+    return env
+
+
+def _runtime_path_entries(pythonpath: str) -> list[str]:
+    """PYTHONPATH's entries as absolute container paths, a relative one read against WORKDIR, the code root."""
+    return [posixpath.normpath(posixpath.join(str(IMAGE_CODE_ROOT), entry)) for entry in pythonpath.split(':') if entry]
+
+
+@pytest.mark.build_infra
+def test_the_container_env_model_ranks_environment_over_env_file_over_the_image(tmp_path: Path):
+    """Non-vacuity for the runtime pin below: the model ranks the three sources as compose does."""
+    (tmp_path / '.env.default').write_text('PYTHONPATH=./\nOTHER=1\n', encoding='utf-8')
+    image = {'PYTHONPATH': '/code:/code/gen/proto/python'}
+    env_file = ['${ROOT_ENV_FILE:-.env}']
+    assert _container_env({}, image, tmp_path)['PYTHONPATH'] == image['PYTHONPATH']
+    assert _container_env({'env_file': env_file}, image, tmp_path)['PYTHONPATH'] == './'
+    for environment in ({'PYTHONPATH': '/x'}, ['PYTHONPATH=/x']):
+        service = {'env_file': env_file, 'environment': environment}
+        assert _container_env(service, image, tmp_path)['PYTHONPATH'] == '/x'
+    assert _runtime_path_entries('./:/code/gen/proto/python') == ['/code', '/code/gen/proto/python']
+    assert _env_file_template('${ROOT_ENV_FILE:-.env}', REPO_ROOT) == ENV_DEFAULT_FILE
+
+
+@pytest.mark.build_infra
+def test_every_service_container_finds_the_generated_code_at_runtime():
+    """The image's PYTHONPATH is what the service process gets, in every launch set, or the static pins mean nothing.
+
+    Recorded as a strict xfail by tj-3mk3u5.44's gate (the FINDING: root .env.default's PYTHONPATH=./, read
+    through env_file, outranked the image ENV); a plain pin since the fix, tj-3mk3u5.56 (decision tj-3mk3u5.42
+    addendum F1-A). test_service_pythonpath.py holds the stricter form: every set read from its source, every
+    service derived from the Dockerfile builds, and the value EQUAL to the image's.
+    """
+    generated = str(IMAGE_CODE_ROOT / GENERATED_PYTHON_ROOT)
+    offenders = []
+    for label, model in _LAUNCH_SETS.items():
+        services = model()['services']
+        for name in SERVICE_CONTAINERS:
+            service = services[name]
+            target = (service.get('build') or {}).get('target') or 'prod_image'
+            env = _container_env(service, {'PYTHONPATH': _image_env(target, 'PYTHONPATH') or ''}, REPO_ROOT)
+            if generated not in _runtime_path_entries(env.get('PYTHONPATH', '')):
+                offenders.append(f'{label}: {name} runs with PYTHONPATH={env.get("PYTHONPATH")!r}')
+    assert not offenders, f'service containers that cannot import trader_joe.proto at runtime: {offenders}'
+
+
+# Where each half of the toolchain belongs: the runtime in base, which both services install, and
+# the generator in dev only, so the prod images never carry it.
+GRPC_PIN_GROUPS = {'grpcio': 'base', 'grpcio-health-checking': 'base', 'grpcio-tools': 'dev'}
+
+
+def _dependency_group_requirements() -> dict[str, dict[str, Requirement]]:
+    with PYPROJECT.open('rb') as handle:
+        groups = tomllib.load(handle).get('dependency-groups', {})
+    parsed: dict[str, dict[str, Requirement]] = {}
+    for group, entries in groups.items():
+        requirements = [Requirement(entry) for entry in entries if isinstance(entry, str)]
+        parsed[group] = {canonicalize_name(requirement.name): requirement for requirement in requirements}
+    return parsed
+
+
+def _exact_version(requirement: Requirement) -> str | None:
+    specifiers = list(requirement.specifier)
+    if len(specifiers) == 1 and specifiers[0].operator == '==' and '*' not in specifiers[0].version:
+        return specifiers[0].version
+    return None
+
+
+@pytest.mark.build_infra
+def test_the_grpc_toolchain_is_pinned_exactly_and_moves_together():
+    """D1/D3: the grpc toolchain is pinned with ==, at one version, each package in its own group.
+
+    grpcio-tools writes its version into every file it generates, and grpcio and
+    grpcio-health-checking move with it.
+    """
+    groups = _dependency_group_requirements()
+    versions: dict[str, str] = {}
+    for name, group in GRPC_PIN_GROUPS.items():
+        requirement = groups.get(group, {}).get(name)
+        assert requirement is not None, f'{name} is not declared in the {group!r} dependency group'
+        version = _exact_version(requirement)
+        assert version is not None, f'{name} is declared as {str(requirement)!r}; it must be pinned with =='
+        versions[name] = version
+    assert len(set(versions.values())) == 1, f'the grpc pins have to move together, but read {versions}'
+    elsewhere = sorted(
+        group for group, requirements in groups.items() if group != 'dev' and 'grpcio-tools' in requirements
+    )
+    assert not elsewhere, f'grpcio-tools is also declared in {elsewhere}; the generator belongs in dev only'
+
+
+# =================================================================================================
+# THE SOURCE STAMP: tools/source_digest.sh (decision tj-yb1bxj clauses 1, 5 and 6; task tj-9frycj)
+#
+# WHAT THE SCRIPT IS. The one definition of "a digest of exactly the source the Dockerfile COPYs
+# into a service image". The build stamps it on the image as trader_joe.source.digest and
+# migrate-check recomputes it from the checkout and refuses on a mismatch, so a stale image can no
+# longer be compared against a live schema and have the difference read as drift.
+#
+# WHAT THESE TESTS DO *NOT* ASSERT, so nobody reads a false reason out of them. They do NOT assert
+# that adding a COPY silently shrinks what the digest covers. It does not: copy_sources() parses
+# the path list out of the Dockerfile on every run, so a new COPY GROWS the coverage in the same
+# commit -- measured twice while C1 (tj-vj1d4h) was gated. Derivation prevents that drift; a test
+# would only notice it. The risk did not vanish, it MOVED INTO THE PARSER: coverage can shrink now
+# only if the Dockerfile or .dockerignore parser half-understands a form and quietly skips it. That
+# is what the two groups below are for -- cross-implementation equality, and the refusal vocabulary.
+#
+# >>> THE DRIFT SURFACE THESE TESTS EXIST TO HOLD TOGETHER, and it is the reason to keep them. <<<
+# .dockerignore IS INTERPRETED TWICE IN THIS REPOSITORY:
+#   * NARROWLY, in production bash -- tools/source_digest.sh's ignore_rules()/is_excluded(), which
+#     understands four deliberately small pattern kinds and hard-errors on anything else; and
+#   * GENERALLY, in this module's test helpers -- _dockerignore_pattern_regex, _dockerignore_rules
+#     and _is_excluded_from_context, a faithful subset of moby's patternmatcher, general over
+#     negations, `**`, multi-segment globs and last-rule-wins.
+# NOTHING ELSE HOLDS THE TWO IMPLEMENTATIONS TOGETHER. Decision tj-yb1bxj clause 5 asks for one
+# definition of the digest and did not anticipate this second spelling, precisely because the
+# second one is a test helper rather than part of the build. If you are reading this because you
+# changed one of them: THE OTHER ONE EXISTS, and the equality test below is what tells you so.
+#
+# THE TWO DIRECTIONS ARE NOT EQUALLY BAD, which is why they are asserted separately and never as
+# one symmetric difference:
+#   * script-minus-oracle is OVER-coverage. The stamp covers a file the context leaves out, so it
+#     moves while the image does not: a FALSE REFUSAL. Loud, and recoverable.
+#   * oracle-minus-script is UNDER-coverage. A file is in the image that the stamp does not cover,
+#     so the image can change while the stamp holds still: a FALSE MATCH -- the guard going hollow,
+#     which is the failure this whole epic exists to stop.
+# A single symmetric-difference assertion would report the fatal direction in the same breath as
+# the harmless one.
+#
+# WHAT NOBODY HAS MEASURED, declared rather than papered over: there is no docker CLI in the
+# devcontainer, so no image is built and no label is read back here. The Dockerfile's
+# ARG SOURCE_DIGEST / LABEL trader_joe.source.digest pair, and compose passing the build arg
+# through, stay unexercised by any test in this repository.
+SOURCE_DIGEST_SCRIPT = REPO_ROOT / 'tools' / 'source_digest.sh'
+SOURCE_DIGEST_HEX = re.compile(r'^[0-9a-f]{64}$')
+# Non-vacuity floors for the equality test: two sets that are both empty are equal. At 84f9775 the
+# real counts were 104 (data/store) and 105 (data/ingest); the floor is low enough not to need an
+# edit per file, high enough that a parser that found almost nothing cannot pass.
+SOURCE_DIGEST_FILE_FLOOR = 50
+
+
+def _digest_services() -> list[tuple[str, str]]:
+    """Every (SERVICE_PATH, SERVICE_NAME) pair a compose service declares as build args.
+
+    Derived, not listed: a third service gets covered by the tests below without an edit here.
+    """
+    pairs = sorted(
+        (args['SERVICE_PATH'], args['SERVICE_NAME'])
+        for args in _compose_build_args()
+        if 'SERVICE_PATH' in args and 'SERVICE_NAME' in args
+    )
+    assert pairs, 'no compose service declares SERVICE_PATH and SERVICE_NAME build args'
+    return pairs
+
+
+def _run_source_digest(script: Path, *arguments: str) -> subprocess.CompletedProcess:
+    """Run a source_digest.sh without checking its status; the status is what most tests assert."""
+    return subprocess.run([str(script), *arguments], capture_output=True, text=True, check=False)
+
+
+def _source_digest(*arguments: str) -> list[str]:
+    """Run the committed script, require success, and return its stdout lines."""
+    result = _run_source_digest(SOURCE_DIGEST_SCRIPT, *arguments)
+    assert result.returncode == 0, f'source_digest.sh {arguments} exited {result.returncode}: {result.stderr}'
+    return result.stdout.splitlines()
+
+
+def _oracle_copy_sources(service_path: str, service_name: str) -> set[str]:
+    """The COPY sources for one service, from this module's independent Dockerfile parser.
+
+    _dockerfile_copy_sources_by_origin expands a build-arg source once per compose service, so it
+    yields every service's app directory at once; this keeps the one belonging to this service.
+    """
+    by_origin = _dockerfile_copy_sources_by_origin()
+    app = posixpath.join(service_path, service_name, 'app')
+    from_args = {source for source, named_an_arg in by_origin if named_an_arg}
+    assert app in from_args, f'the Dockerfile COPY parse found no {app} among the build-arg sources {from_args}'
+    return {source for source, named_an_arg in by_origin if not named_an_arg} | {app}
+
+
+def _oracle_context_files(service_path: str, service_name: str) -> set[str]:
+    """Every file the build context delivers under one service's COPY sources, by the Python oracle.
+
+    The filesystem is walked, not `git ls-files`: docker sends untracked files too, and so does the
+    script. A symlink counts as a file and is never followed, matching the script's `find` type test.
+    """
+    rules = _committed_dockerignore_rules()
+    files = set()
+    for source in _oracle_copy_sources(service_path, service_name):
+        base = REPO_ROOT / source
+        candidates = [base] if base.is_file() or base.is_symlink() else base.rglob('*')
+        for path in candidates:
+            if path.is_dir() and not path.is_symlink():
+                continue
+            relative = path.relative_to(REPO_ROOT).as_posix()
+            if not _is_excluded_from_context(relative, rules):
+                files.add(relative)
+    return files
+
+
+@contextlib.contextmanager
+def _temporary_repo_file(relative: str) -> Iterator[None]:
+    """Create `relative` under the repository root for the body, then remove it and any directory made.
+
+    The probes below have to touch the real tree, because what is being measured is the COMMITTED
+    .dockerignore's effect on the COMMITTED Dockerfile's COPY sources; a sandbox would measure a
+    .dockerignore nobody ships.
+    """
+    path = REPO_ROOT / relative
+    assert not path.exists(), f'{relative} already exists; refusing to overwrite it with a probe'
+    made = []
+    parent = path.parent
+    while not parent.exists():
+        made.append(parent)
+        parent = parent.parent
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('source digest probe\n', encoding='utf-8')
+        yield
+    finally:
+        path.unlink(missing_ok=True)
+        for directory in made:
+            with contextlib.suppress(OSError):
+                directory.rmdir()
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(('service_path', 'service_name'), _digest_services())
+def test_the_digest_covers_exactly_the_files_the_python_oracle_finds(service_path: str, service_name: str):
+    """The script's file set equals the independent Python oracle's, in both directions, named apart.
+
+    THIS IS THE TEST THAT HOLDS THE TWO .dockerignore IMPLEMENTATIONS TOGETHER -- the narrow bash
+    one in tools/source_digest.sh and the general Python one in this module. See the section
+    comment above: nothing else does, and clause 5 of tj-yb1bxj did not anticipate the second one
+    because it is a test helper.
+    """
+    script_files = set(_source_digest('--list-files', service_path, service_name))
+    oracle_files = _oracle_context_files(service_path, service_name)
+
+    assert len(oracle_files) >= SOURCE_DIGEST_FILE_FLOOR, (
+        f'the oracle found only {len(oracle_files)} files under the COPY sources for '
+        f'{service_path}/{service_name}; equality against an almost-empty set proves nothing'
+    )
+    assert len(script_files) >= SOURCE_DIGEST_FILE_FLOOR, (
+        f'source_digest.sh listed only {len(script_files)} files for {service_path}/{service_name}'
+    )
+
+    over_coverage = sorted(script_files - oracle_files)
+    assert not over_coverage, (
+        f'OVER-coverage (script minus oracle) for {service_path}/{service_name}: {over_coverage}. '
+        'The stamp hashes files the build context leaves out, so it moves while the image does not: '
+        'a false refusal. Loud and recoverable, but the two .dockerignore readers now disagree.'
+    )
+    under_coverage = sorted(oracle_files - script_files)
+    assert not under_coverage, (
+        f'UNDER-coverage (oracle minus script) for {service_path}/{service_name}: {under_coverage}. '
+        'These files reach the image and the stamp does not cover them, so the image can change '
+        'while the stamp holds still -- a FALSE MATCH, which is the guard going hollow.'
+    )
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(('service_path', 'service_name'), _digest_services())
+def test_the_digest_claims_exactly_the_copy_sources_the_python_oracle_finds(service_path: str, service_name: str):
+    """--list-paths agrees with the independent COPY parser, so the two never drift apart silently."""
+    script_paths = set(_source_digest('--list-paths', service_path, service_name))
+    oracle_paths = _oracle_copy_sources(service_path, service_name)
+    assert script_paths == oracle_paths, (
+        f'source_digest.sh claims {sorted(script_paths)} for {service_path}/{service_name} but this '
+        f"module's Dockerfile parser finds {sorted(oracle_paths)}"
+    )
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(('service_path', 'service_name'), _digest_services())
+def test_list_files_prints_bare_paths_and_not_the_internal_manifest_format(service_path: str, service_name: str):
+    """--list-files emits one bare path per line.
+
+    Pinned because a review note once recorded the opposite -- that it emits `f <mode> <hash> <path>`
+    and `l <hash> <path>`. That is build_manifest()'s INTERNAL format, which --list-files never
+    prints. A consumer written against the note would parse every line's first word as a type tag.
+    """
+    lines = _source_digest('--list-files', service_path, service_name)
+    assert lines, f'--list-files printed nothing for {service_path}/{service_name}'
+    for line in lines:
+        assert ' ' not in line, f'--list-files printed {line!r}, which is not a bare path'
+        assert not re.match(r'^[fl] ', line), f'--list-files printed the internal manifest line {line!r}'
+        assert (REPO_ROOT / line).is_file() or (REPO_ROOT / line).is_symlink(), (
+            f'--list-files printed {line!r}, which is not a file relative to the repository root'
+        )
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(('service_path', 'service_name'), _digest_services())
+def test_the_digest_itself_is_one_line_of_64_hex(service_path: str, service_name: str):
+    """The output contract the Dockerfile label and migrate-check both key on."""
+    result = _run_source_digest(SOURCE_DIGEST_SCRIPT, service_path, service_name)
+    assert result.returncode == 0, f'source_digest.sh {service_path} {service_name} exited {result.returncode}'
+    lines = result.stdout.splitlines()
+    assert len(lines) == 1, f'expected exactly one line of stdout, read {lines}'
+    assert SOURCE_DIGEST_HEX.match(lines[0]), f'{lines[0]!r} is not a 64-hex digest'
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(('service_path', 'service_name'), _digest_services())
+def test_the_digest_is_deterministic_across_runs(service_path: str, service_name: str):
+    """Two runs on the same tree agree. Without this nothing else about the stamp means anything."""
+    first = _source_digest(service_path, service_name)
+    second = _source_digest(service_path, service_name)
+    assert first == second, f'two runs disagreed for {service_path}/{service_name}: {first} vs {second}'
+
+
+@pytest.mark.build_infra
+def test_each_service_gets_its_own_digest_covering_only_its_own_app():
+    """A per-service stamp: the digests differ, and no service's file list names another's app."""
+    services = _digest_services()
+    assert len(services) > 1, 'with one service there is nothing to tell apart'
+    digests = {service: _source_digest(*service)[0] for service in services}
+    assert len(set(digests.values())) == len(digests), f'two services share a digest: {digests}'
+    for service, files in ((service, _source_digest('--list-files', *service)) for service in services):
+        others = [f'{path}/{name}/app' for path, name in services if (path, name) != service]
+        intruders = sorted(line for line in files if any(line.startswith(f'{other}/') for other in others))
+        assert not intruders, f'{service} digest covers another service: {intruders}'
+
+
+# The committed .dockerignore excludes these from UNDER a COPY source, and over-exclusion is the
+# direction that makes a stale image read as FRESH -- so the pairing matters more than either half:
+# a file the context drops must not move the digest, and a file beside it that the context DOES
+# send must. The last entry is the control; without it every assertion here passes on a digest that
+# never moves at all.
+_DIGEST_PROBES = [
+    ('common/tests/_source_digest_probe.txt', False),
+    ('common/__pycache__/_source_digest_probe.pyc', False),
+    ('common/_source_digest_probe.pyc', False),
+    ('common/_source_digest_probe_control.py', True),
+]
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(('relative', 'moves'), _DIGEST_PROBES, ids=[probe for probe, _ in _DIGEST_PROBES])
+def test_only_a_file_the_build_context_sends_moves_the_digest(relative: str, moves: bool):
+    """A new file under a COPY source moves the stamp exactly when .dockerignore lets it through.
+
+    The excluded cases are the ones that matter in daily use: were a test edit or a .pyc to move the
+    stamp, migrate-check would refuse against a perfectly fresh image every day until somebody set
+    the escape hatch and stopped reading the output -- the outcome tj-yb1bxj names explicitly.
+    """
+    service_path, service_name = _digest_services()[0]
+    before = _source_digest(service_path, service_name)[0]
+    with _temporary_repo_file(relative):
+        after = _source_digest(service_path, service_name)[0]
+        listed = relative in _source_digest('--list-files', service_path, service_name)
+    if moves:
+        assert after != before, f'{relative} reaches the image, but the digest did not move'
+        assert listed, f'{relative} reaches the image, but --list-files does not name it'
+    else:
+        assert after == before, f'{relative} is kept out of the build context, but the digest moved'
+        assert not listed, f'{relative} is kept out of the build context, but --list-files names it'
+
+
+# -------------------------------------------------------------------------------------------------
+# THE REFUSAL VOCABULARY. Every form the parser does not fully understand exits NON-ZERO with ZERO
+# BYTES ON STDOUT. The empty stdout is the half that carries the weight: the Makefile assigns
+# SOURCE_DIGEST_DATA_STORE from a command substitution, so a failing script that printed a
+# plausible 64-hex line anyway would stamp an image with a digest covering less than it claims --
+# and an earlier draft of the script did exactly that, because each stage ran in a subshell where
+# `exit` killed only the subshell.
+#
+# These are driven against a THROWAWAY repository holding a copy of the real script, so a malformed
+# Dockerfile never touches the checkout. The sandbox exercises the parser, not the project's own
+# Dockerfile, which the equality tests above cover.
+_SANDBOX_DOCKERFILE = """\
+FROM scratch AS build
+ARG SERVICE_PATH=none
+ARG SERVICE_NAME=none
+COPY --from=somewhere/else:1 /from-another-image /elsewhere
+COPY ./pkg \\
+    /code/pkg
+COPY ./entry.sh /code/entry.sh
+COPY ./${SERVICE_PATH}/${SERVICE_NAME}/app /code/${SERVICE_PATH}/${SERVICE_NAME}/app
+"""
+_SANDBOX_DOCKERIGNORE = 'pkg/tests/\n**/__pycache__/\n**/*.py[cod]\n'
+_SANDBOX_SERVICE = ('svc', 'demo')
+
+
+@pytest.fixture
+def digest_sandbox(tmp_path: Path) -> Path:
+    """A throwaway repository root: a copy of the real script, a tiny Dockerfile and a tiny tree.
+
+    The script resolves its repository root from its own location, so copying it into <root>/tools
+    is all it takes to point it at a different tree.
+    """
+    (tmp_path / 'tools').mkdir()
+    shutil.copy2(SOURCE_DIGEST_SCRIPT, tmp_path / 'tools' / SOURCE_DIGEST_SCRIPT.name)
+    (tmp_path / 'pkg' / 'tests').mkdir(parents=True)
+    (tmp_path / 'pkg' / '__init__.py').write_text('', encoding='utf-8')
+    (tmp_path / 'pkg' / 'mod.py').write_text('VALUE = 1\n', encoding='utf-8')
+    (tmp_path / 'pkg' / 'tests' / 'test_mod.py').write_text('assert True\n', encoding='utf-8')
+    (tmp_path / 'svc' / 'demo' / 'app').mkdir(parents=True)
+    (tmp_path / 'svc' / 'demo' / 'app' / 'main.py').write_text('print(1)\n', encoding='utf-8')
+    entry = tmp_path / 'entry.sh'
+    entry.write_text('#! /bin/sh\n', encoding='utf-8')
+    entry.chmod(0o755)
+    (tmp_path / 'Dockerfile').write_text(_SANDBOX_DOCKERFILE, encoding='utf-8')
+    (tmp_path / '.dockerignore').write_text(_SANDBOX_DOCKERIGNORE, encoding='utf-8')
+    return tmp_path
+
+
+def _sandbox_run(root: Path, *arguments: str) -> subprocess.CompletedProcess:
+    return _run_source_digest(root / 'tools' / SOURCE_DIGEST_SCRIPT.name, *arguments)
+
+
+# (id, Dockerfile text or None to keep the sandbox's, .dockerignore text or None, expected exit).
+# Exit 3 is a parse refusal, exit 4 a source that exists in the Dockerfile but delivers no file.
+# Every one of these was reproduced by hand twice while C1 was gated; nothing re-measured them
+# until this table.
+_REFUSALS = [
+    ('dockerignore-negation', None, 'pkg/tests/\n!pkg/tests/test_mod.py\n', 3),
+    ('dockerignore-multi-segment-tail-after-globstar', None, '**/build/output\n', 3),
+    ('dockerignore-wildcard-inside-a-multi-segment-path', None, 'pkg/*.py\n', 3),
+    ('dockerignore-rule-erases-a-whole-copy-source', None, 'pkg\n', 4),
+    ('copy-source-names-an-unexpandable-build-arg', f'{_SANDBOX_DOCKERFILE}COPY ./${{OTHER}}/x /code/x\n', None, 3),
+    ('copy-source-does-not-exist', f'{_SANDBOX_DOCKERFILE}COPY ./absent /code/absent\n', None, 4),
+    ('json-array-copy', f'{_SANDBOX_DOCKERFILE}COPY ["pkg", "/code/pkg2"]\n', None, 3),
+    ('wildcard-copy-source', f'{_SANDBOX_DOCKERFILE}COPY ./pkg/*.py /code/pkg2/\n', None, 3),
+    ('copy-of-the-whole-context', f'{_SANDBOX_DOCKERFILE}COPY . /code/all\n', None, 3),
+    ('quoted-copy-operand', f'{_SANDBOX_DOCKERFILE}COPY "pkg" /code/pkg2\n', None, 3),
+    ('one-operand-copy', f'{_SANDBOX_DOCKERFILE}COPY ./pkg\n', None, 3),
+    ('no-copy-source-at-all', 'FROM scratch\nRUN true\n', None, 3),
+]
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    ('dockerfile', 'dockerignore', 'status'), [case[1:] for case in _REFUSALS], ids=[case[0] for case in _REFUSALS]
+)
+def test_a_form_the_parser_cannot_read_refuses_with_no_digest(
+    digest_sandbox: Path, dockerfile: str | None, dockerignore: str | None, status: int
+):
+    """Each unsupported form is a hard error with an empty stdout, never a quietly skipped line.
+
+    A skipped line is how coverage shrinks without anyone noticing, and a plausible-looking digest
+    printed alongside a failure is how a caller that forgets to check the status stamps an image
+    with a stamp that is wrong rather than absent.
+    """
+    if dockerfile is not None:
+        (digest_sandbox / 'Dockerfile').write_text(dockerfile, encoding='utf-8')
+    if dockerignore is not None:
+        (digest_sandbox / '.dockerignore').write_text(dockerignore, encoding='utf-8')
+    result = _sandbox_run(digest_sandbox, *_SANDBOX_SERVICE)
+    assert result.returncode == status, (
+        f'expected exit {status}, read {result.returncode}; stdout={result.stdout!r} stderr={result.stderr!r}'
+    )
+    assert result.stdout == '', f'a refusal printed {result.stdout!r} on stdout; it must print nothing at all'
+    assert result.stderr.strip(), 'a refusal must say why, on stderr'
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    'arguments',
+    [(), ('svc',), ('svc', 'demo', 'extra'), ('--bogus', 'svc', 'demo'), ('--list-files',), ('--list-paths', 'svc')],
+    ids=['none', 'one-operand', 'three-operands', 'unknown-option', 'mode-without-operands', 'mode-with-one-operand'],
+)
+def test_bad_arguments_refuse_with_no_digest(digest_sandbox: Path, arguments: tuple[str, ...]):
+    """Usage errors exit 2 and print nothing on stdout, same contract as a parse refusal."""
+    result = _sandbox_run(digest_sandbox, *arguments)
+    assert result.returncode == 2, f'expected exit 2 for {arguments}, read {result.returncode}'
+    assert result.stdout == '', f'a usage error printed {result.stdout!r} on stdout'
+
+
+@pytest.mark.build_infra
+def test_the_sandbox_itself_produces_a_digest(digest_sandbox: Path):
+    """Non-vacuity for every refusal above: unmutated, the same sandbox succeeds.
+
+    Without this, a sandbox broken in some unrelated way would make all twelve refusals pass by
+    failing for the wrong reason.
+    """
+    result = _sandbox_run(digest_sandbox, *_SANDBOX_SERVICE)
+    assert result.returncode == 0, f'the unmutated sandbox exited {result.returncode}: {result.stderr}'
+    assert SOURCE_DIGEST_HEX.match(result.stdout.strip()), f'{result.stdout!r} is not a 64-hex digest'
+    assert set(_sandbox_run(digest_sandbox, '--list-files', *_SANDBOX_SERVICE).stdout.split()) == {
+        'entry.sh',
+        'pkg/__init__.py',
+        'pkg/mod.py',
+        'svc/demo/app/main.py',
+    }, 'the sandbox must cover its COPY sources, skip --from=, join the continuation and drop pkg/tests'
+
+
+def _sandbox_touch(root: Path) -> None:
+    (root / 'pkg' / 'mod.py').touch()
+
+
+def _sandbox_edit_an_excluded_file(root: Path) -> None:
+    (root / 'pkg' / 'tests' / 'test_mod.py').write_text('assert True  # edited\n', encoding='utf-8')
+
+
+def _sandbox_add_bytecode(root: Path) -> None:
+    (root / 'pkg' / '__pycache__').mkdir()
+    (root / 'pkg' / '__pycache__' / 'mod.cpython-313.pyc').write_bytes(b'bytecode')
+    (root / 'pkg' / 'stray.pyc').write_bytes(b'bytecode')
+
+
+def _sandbox_edit_a_source_file(root: Path) -> None:
+    (root / 'pkg' / 'mod.py').write_text('VALUE = 2\n', encoding='utf-8')
+
+
+def _sandbox_rename_a_source_file(root: Path) -> None:
+    (root / 'pkg' / 'mod.py').rename(root / 'pkg' / 'renamed.py')
+
+
+def _sandbox_set_the_exec_bit(root: Path) -> None:
+    (root / 'pkg' / 'mod.py').chmod(0o755)
+
+
+def _sandbox_add_a_source_file(root: Path) -> None:
+    (root / 'pkg' / 'extra.py').write_text('EXTRA = 1\n', encoding='utf-8')
+
+
+# (id, mutation, does the digest move?). The first three are what the image does not see; the last
+# four are what it does. COPY preserves the executable bit and a rename changes the path the image
+# holds, so both have to move a digest that claims to cover "exactly the source it COPYs".
+_SANDBOX_MUTATIONS = [
+    ('touch-without-editing', _sandbox_touch, False),
+    ('edit-a-file-dockerignore-excludes', _sandbox_edit_an_excluded_file, False),
+    ('add-pycache-and-pyc-files', _sandbox_add_bytecode, False),
+    ('edit-a-source-file', _sandbox_edit_a_source_file, True),
+    ('rename-a-source-file', _sandbox_rename_a_source_file, True),
+    ('set-the-executable-bit', _sandbox_set_the_exec_bit, True),
+    ('add-a-source-file', _sandbox_add_a_source_file, True),
+]
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    ('mutate', 'moves'), [case[1:] for case in _SANDBOX_MUTATIONS], ids=[case[0] for case in _SANDBOX_MUTATIONS]
+)
+def test_the_digest_moves_for_what_the_image_sees_and_only_for_that(digest_sandbox: Path, mutate, moves: bool):
+    """mtime, an excluded file and bytecode leave the stamp alone; content, path and mode move it."""
+    before = _sandbox_run(digest_sandbox, *_SANDBOX_SERVICE)
+    assert before.returncode == 0, f'the sandbox would not digest before the mutation: {before.stderr}'
+    mutate(digest_sandbox)
+    after = _sandbox_run(digest_sandbox, *_SANDBOX_SERVICE)
+    assert after.returncode == 0, f'the sandbox would not digest after the mutation: {after.stderr}'
+    if moves:
+        assert after.stdout != before.stdout, 'the image would change, but the digest held still'
+    else:
+        assert after.stdout == before.stdout, 'the image would not change, but the digest moved'

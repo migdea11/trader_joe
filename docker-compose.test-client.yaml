@@ -49,9 +49,11 @@ services:
     # resolves to the mounted migrations (tj-7294qb). data/store/seeds, tests/fakes and
     # data/ingest/app are the seed producer's import closure beyond those (tj-irhy0a.21's
     # hand-off): the producer, the fake's synthetic prefixes it checks rows against, and the
-    # ingest code the fake imports.
+    # ingest code the fake imports. gen/proto/python sits beside common because common/rpc imports
+    # the generated code from it (decision tj-3mk3u5.42 F1); PYTHONPATH below names it.
     volumes:
       - ./common:/code/common:ro
+      - ./gen/proto/python:/code/gen/proto/python:ro
       - ./routers:/code/routers:ro
       - ./schemas:/code/schemas:ro
       - ./data/store/app:/code/data/store/app:ro
@@ -76,8 +78,12 @@ services:
       # NON-UTC ON PURPOSE: a naive-to-timestamptz shift is invisible at offset zero. The
       # entrypoint below refuses to start pytest if this zone resolves to +0000.
       TZ: America/Toronto
-      # tests/system has no package chain above it, so the root has to be on the path.
-      PYTHONPATH: /code
+      # tests/system has no package chain above it, so the root has to be on the path. Then the
+      # generated code's root, as the service image's PYTHONPATH has it: pytest.ini's pythonpath
+      # covers the suite, but the seed producer (`python -m data.store.seeds`) is not pytest, and
+      # its import closure includes data/ingest/app, which reaches the generated code once a
+      # servicer that imports it is registered there.
+      PYTHONPATH: /code:/code/gen/proto/python
       # Import-time driver flags read by common/database/postgres_tools.py.
       POSTGRES_ASYNC: "true"
       POSTGRES_SYNC: "true"

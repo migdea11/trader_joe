@@ -54,6 +54,7 @@ from data.store.app.database.database import async_db
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.main import app
+from data.store.tests.problem_body import problem
 from routers.common.instance_secret import INSTANCE_SECRET_ENV_VAR, INSTANCE_SECRET_HEADER
 
 
@@ -236,7 +237,12 @@ def test_a_wrong_owner_is_refused_with_403_and_nothing_is_deleted(delete_entry):
 
     response = delete_entry(session, entry_id, 'someone-else')
 
-    assert response.status_code == 403, response.text
+    # THE REASON, NOT ONLY THE STATUS (validator, gating tj-3mk3u5.37.8). The hand-written
+    # `except OwnerMismatch -> HTTPException(403)` is gone; the 403 now comes from the reason
+    # table, so what this case must pin is that OwnerMismatch still carries OWNER_MISMATCH. A
+    # re-parenting onto some other reason whose row also happens to be 403 would keep the status
+    # and silently change what a client branches on, and the status assertion alone cannot see it.
+    problem(response, status=403, reason='OWNER_MISMATCH')
     assert _sent_delete(session) == [], 'the entry was deleted despite the owner mismatch'
     assert session.commits == 0
 
@@ -284,7 +290,9 @@ def test_an_unknown_id_is_404(delete_entry):
 
     response = delete_entry(session, entry_id, OWNER)
 
-    assert response.status_code == 404, response.text
+    # The reason as well as the status: see the 403 case above for why the status alone stopped
+    # being sufficient once the mapping moved into the reason table.
+    problem(response, status=404, reason='NOT_FOUND')
     assert _sent_delete(session) == [], 'a DELETE was sent for an id that does not exist'
     assert session.commits == 0
 
@@ -322,17 +330,30 @@ def test_an_unknown_id_is_404_even_when_the_owner_is_also_unacceptable(delete_en
 def test_the_403_body_never_names_the_real_owner(delete_entry):
     """Reads are open, but an error body is not a read endpoint (tj-vhboky.1 section 5).
 
-    The route builds its detail from ``str(e)`` and OwnerMismatch refuses to format the owner, so the
-    property holds at both layers. It is asserted HERE, on the wire, because the exception-level half
-    is already pinned in test_dataset_entry_identity.py and the thing a caller sees is the response:
-    a later 'helpful' detail string would leave that test green.
+    SUPERSEDED REASONING, kept so the change is traceable: "The route builds its detail from
+    ``str(e)`` and OwnerMismatch refuses to format the owner, so the property holds at both layers.
+    It is asserted HERE, on the wire, because the exception-level half is already pinned in
+    test_dataset_entry_identity.py and the thing a caller sees is the response: a later 'helpful'
+    detail string would leave that test green."
+
+    THE ROUTE BUILDS NOTHING NOW (validator, gating tj-3mk3u5.37.8). TE-6 deleted the hand-written
+    ``except OwnerMismatch`` and the route catches nothing (D6), so the wire detail IS the error's
+    own ``detail`` -- the same string test_the_mismatch_never_names_the_real_owner already checks.
+    The two therefore red together instead of covering each other's gap, which is a real reduction
+    in what this case adds and is stated rather than glossed.
+
+    IT IS STILL WORTH ITS PLACE, for a reason that did not exist before: the body is now assembled
+    by a RENDERER that copies metadata into extension members. The owner is not in METADATA_KEYS, so
+    it cannot get there today -- and this is the only assertion in the repository that would notice
+    if a future key, or a renderer that echoed a bound value, put it there. The check is on the whole
+    response text for exactly that reason: it covers members nobody has thought of yet.
     """
     entry_id = uuid.uuid4()
     session = FakeSession(FakeResult(stored_entry(entry_id, owner='confidential-principal')))
 
     response = delete_entry(session, entry_id, 'someone-else')
 
-    assert response.status_code == 403
+    problem(response, status=403, reason='OWNER_MISMATCH')
     assert 'confidential-principal' not in response.text, f'the 403 body names the real owner: {response.text}'
 
 
