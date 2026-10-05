@@ -97,14 +97,21 @@ jobs:
     # that has no .git, and every git test then fails even with git installed. ca-certificates
     # because --no-install-recommends leaves it out, and git fetches over https (tj-ijpys9.16).
     #
+    # jq because the harness-hook tests (common/tests/test_harness_hooks.py, tj-qenrpk) run the
+    # PreToolUse hook commands in .claude/settings.json verbatim, and each one starts with jq.
+    # Without jq a hook falls through its `|| true` and allows every command, so those tests check
+    # for it first and fail, never skip (pytest.ini). The agent image installs it, so only this job
+    # would go red (tj-3mk3u5.40). grep -P, the hooks' other tool, needs nothing here: bookworm's
+    # grep is Essential, so the slim image has it, and it pre-depends on libpcre2-8-0.
+    #
     # safe.directory: the runner creates the workspace as its own user and this container runs as
     # root, so git refuses the checkout for dubious ownership. actions/checkout marks the workspace
     # safe only in a temporary global config that it deletes when its own step ends, so later steps
     # do not inherit it. --system, in /etc/gitconfig, where checkout's HOME override cannot hide it.
-    - name: Install Git and Make
+    - name: Install Git, Make and jq
       run: |
         apt-get update
-        apt-get install -y --no-install-recommends git make ca-certificates
+        apt-get install -y --no-install-recommends git make jq ca-certificates
         rm -rf /var/lib/apt/lists/*
         git config --system --add safe.directory "${GITHUB_WORKSPACE}"
 
@@ -181,9 +188,12 @@ jobs:
       run: |
         uv run semgrep --config=auto --error --exclude=tests/ --exclude=.venv --exclude=docker-compose.override.yaml --exclude=.claude/worktrees .
 
+    # --color never, the same command as the Makefile's security target (tj-3mk3u5.43): uv colours
+    # its output when the environment forces colour, even into this redirect, and pip-audit cannot
+    # parse the escape codes. This job forces none, so here the flag changes no package line.
     - name: Generate Requirements
       run: |
-        uv export --all-groups --no-group dev --no-group testing --no-group security --locked --format requirements-txt > requirements.txt
+        uv export --all-groups --no-group dev --no-group testing --no-group security --locked --format requirements-txt --color never > requirements.txt
 
     - name: Run Safety CLI
       # No semver tag exists on this commit -- pyupio publishes the moving `v1` only, so the
@@ -673,6 +683,77 @@ jobs:
             "http://data_store:${APP_INTERNAL_PORT}/store/stock/market-activity/SMOKETEST" '[]'
 
           echo "Smoke test passed: both services answered /ping by service name and data_store served a query from Postgres."
+
+      - name: Check gRPC Bind Network
+        run: |
+          set -euo pipefail
+          # THE BIND-NETWORK CHECK, first half (ADR tj-q9ae5u addendum 3; tj-3mk3u5.49). data_ingest's
+          # gRPC server binds APP_INTERNAL_GRPC_HOST, the data-ingest-grpc alias docker-compose.yaml
+          # declares on its ingest_store attachment only, and never a wildcard. This proves the NAME
+          # before anything binds it: inside data_ingest, the host resolves to data_ingest's address
+          # on ingest_store and to nothing else. A name answering with its ingest_egress address
+          # would still let the server start cleanly, bound where data_store cannot reach it, so no
+          # other step here would notice. Nothing listens on the port yet, so nothing dials it; the
+          # reachability half (data_store dials the name) lands with the listener.
+          #
+          # IF THIS FAILS ON A MISMATCH, the alias design itself is wrong: report it to the
+          # architect. Never "fix" it with 0.0.0.0, the service name or the hostname.
+          #
+          # Both variables must be in the CONTAINER's environment: the base file's environment:
+          # block has to reach this fake-overlay launch, as it must every launch. Read with the
+          # image's own interpreter (no printenv-is-missing ambiguity); neither value is a secret.
+          container_env() {
+            docker compose -f docker-compose.yaml exec -T data_ingest /code/.venv/bin/python -c \
+              'import os, sys; print(os.environ.get(sys.argv[1], "").strip())' "$1"
+          }
+          grpc_host="$(container_env APP_INTERNAL_GRPC_HOST)"
+          grpc_port="$(container_env APP_INTERNAL_GRPC_PORT)"
+          echo "data_ingest APP_INTERNAL_GRPC_HOST=${grpc_host:-<unset or empty>} APP_INTERNAL_GRPC_PORT=${grpc_port:-<unset or empty>}"
+          if [ -z "${grpc_host}" ] || [ -z "${grpc_port}" ]; then
+            echo "::error::data_ingest's container environment lacks APP_INTERNAL_GRPC_HOST or APP_INTERNAL_GRPC_PORT; docker-compose.yaml's environment: block did not reach this launch"
+            exit 1
+          fi
+
+          # The resolution, by the same call common.rpc's refuse_wildcard makes before the server
+          # binds: getaddrinfo(host, None, SOCK_STREAM). One address per line, any IPv6 %zone cut.
+          if ! resolved_raw="$(docker compose -f docker-compose.yaml exec -T data_ingest /code/.venv/bin/python -c \
+              'import socket, sys; print("\n".join(sorted({info[4][0].split("%")[0] for info in socket.getaddrinfo(sys.argv[1], None, type=socket.SOCK_STREAM)})))' \
+              "${grpc_host}")"; then
+            echo "::error::${grpc_host} does not resolve inside data_ingest"
+            exit 1
+          fi
+
+          # data_ingest's own addresses on every network, from the engine rather than from inside the
+          # container, so the expectation does not share the resolver it is checking. The network
+          # whose name ends _ingest_store (the project prefixes it) must be exactly one.
+          container="$(docker compose -f docker-compose.yaml ps -q data_ingest)"
+          if [ -z "${container}" ]; then
+            echo "::error::no data_ingest container to inspect"
+            exit 1
+          fi
+          networks="$(docker inspect --format '{{range $name, $net := .NetworkSettings.Networks}}{{$name}} {{$net.IPAddress}} {{$net.GlobalIPv6Address}}{{println}}{{end}}' "${container}")"
+          echo "data_ingest networks (name, IPv4, IPv6):"
+          printf '%s\n' "${networks}"
+          ingest_store="$(printf '%s\n' "${networks}" | awk '$1 ~ /_ingest_store$/')"
+          matches="$(printf '%s\n' "${ingest_store}" | awk 'NF { n++ } END { print n + 0 }')"
+          if [ "${matches}" -ne 1 ]; then
+            echo "::error::expected data_ingest on exactly one network named *_ingest_store, found ${matches}"
+            exit 1
+          fi
+
+          resolved="$(printf '%s\n' "${resolved_raw}" | awk 'NF' | LC_ALL=C sort -u)"
+          expected="$(printf '%s\n' "${ingest_store}" | awk '{ for (i = 2; i <= NF; i++) print $i }' | LC_ALL=C sort -u)"
+          echo "${grpc_host} resolves inside data_ingest to: $(printf '%s' "${resolved}" | tr '\n' ' ')"
+          echo "data_ingest's ingest_store address(es): $(printf '%s' "${expected}" | tr '\n' ' ')"
+          if [ -z "${expected}" ]; then
+            echo "::error::docker inspect reports no address for data_ingest on ingest_store"
+            exit 1
+          fi
+          if [ "${resolved}" != "${expected}" ]; then
+            echo "::error::${grpc_host} resolves inside data_ingest to [$(printf '%s' "${resolved}" | tr '\n' ' ')], not to its ingest_store address(es) [$(printf '%s' "${expected}" | tr '\n' ' ')] alone; report to the architect (ADR tj-q9ae5u addendum 3), never fall back to a wildcard"
+            exit 1
+          fi
+          echo "gRPC bind name holds: ${grpc_host} resolves inside data_ingest to its ingest_store address only (port ${grpc_port})."
 
       - name: Check Network Lockdown
         run: |

@@ -4,6 +4,8 @@ from typing import Any
 
 # Suppress Kafka logs
 logging.getLogger('kafka').setLevel(logging.WARNING)
+# Suppress grpc logs: grpc.aio logs DEBUG on every call, which would also bias the latency harness's gRPC timings
+logging.getLogger('grpc').setLevel(logging.WARNING)
 
 
 def get_logger(name: str) -> logging.Logger:

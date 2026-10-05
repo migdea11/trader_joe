@@ -607,11 +607,15 @@ lint-fix: $(VENV_MARKER)  ## Apply lint fixes and formatting (scope with PATHS=)
 # `rm` line after pip-audit never ran when pip-audit found something, leaving the file behind in
 # the working tree. The cleanup sits AFTER each command, so the export and pip-audit invocations
 # stay CI's; each one's status is captured and re-raised, so a finding still fails this target.
+# The export, here and in CI, passes --color never (tj-3mk3u5.43). uv colours its output when the
+# CALLER's environment asks for it (FORCE_COLOR, CLICOLOR_FORCE), even into a redirect, and
+# pip-audit then reads the escape code as line 1 and fails. The flag outranks every such variable,
+# so the file is plain text whoever runs this.
 .PHONY: security
 security: $(VENV_MARKER)  ## Check security vulnerabilities
 	uv run bandit -r $(SOURCE_DIRS) --exclude '*/tests/*'
 	uv run semgrep --config=auto --error --exclude=tests/ --exclude=.venv --exclude=docker-compose.override.yaml --exclude=.claude/worktrees .
-	uv export --all-groups --no-group dev --no-group testing --no-group security --locked --format requirements-txt > requirements.txt || { status=$$?; rm -f requirements.txt; exit $$status; }
+	uv export --all-groups --no-group dev --no-group testing --no-group security --locked --format requirements-txt --color never > requirements.txt || { status=$$?; rm -f requirements.txt; exit $$status; }
 	uv run pip-audit -r requirements.txt --disable-pip; status=$$?; rm -f requirements.txt; exit $$status
 
 # Deliberately independent of `lint`: a test run must report a test result, not a lint failure.

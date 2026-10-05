@@ -2976,6 +2976,9 @@ STOP_STEP = 'Stop System'
 BUILD_CLIENT_STEP = 'Build Test Client'
 SMOKE_STEP = 'Smoke Test'
 LOCKDOWN_STEP = 'Check Network Lockdown'
+# tj-3mk3u5.49 (T3a): data_ingest's gRPC bind name resolves to its ingest_store address alone. After
+# the stack is up; its script's pass/fail logic is exercised in test_grpc_bind_network.py.
+GRPC_BIND_STEP = 'Check gRPC Bind Network'
 START_STEP = 'Start System'
 # tj-irhy0a.1 / tj-irhy0a.2: the fake-mode banner check, and the head seed's dump and upload.
 FAKE_CHECK_STEP = 'Check Fake Broker'
@@ -2988,6 +2991,7 @@ SYSTEM_JOB_STEP_ORDER = (
     FAKE_CHECK_STEP,
     MIGRATE_STEP,
     SMOKE_STEP,
+    GRPC_BIND_STEP,
     LOCKDOWN_STEP,
     'Check Container Env',
     SYSTEM_TESTS_STEP,
@@ -3012,6 +3016,7 @@ SYSTEM_JOB_COMPOSE_STEPS = (
     START_STEP,
     FAKE_CHECK_STEP,
     MIGRATE_STEP,
+    GRPC_BIND_STEP,
     'Check Container Env',
     LIFECYCLE_STEP,
     DUMP_STEP,
@@ -3019,7 +3024,15 @@ SYSTEM_JOB_COMPOSE_STEPS = (
 )
 # Steps that drive the stack and nothing else: they must never load the client file, so starting,
 # migrating, inspecting and stopping the stack cannot depend on it.
-SYSTEM_JOB_STACK_ONLY_STEPS = (START_STEP, FAKE_CHECK_STEP, MIGRATE_STEP, 'Check Container Env', DUMP_STEP, STOP_STEP)
+SYSTEM_JOB_STACK_ONLY_STEPS = (
+    START_STEP,
+    FAKE_CHECK_STEP,
+    MIGRATE_STEP,
+    GRPC_BIND_STEP,
+    'Check Container Env',
+    DUMP_STEP,
+    STOP_STEP,
+)
 # Steps that must send at least one request from test_client (tj-q9ae5u addendum 1 item 5').
 SYSTEM_JOB_CLIENT_STEPS = (BUILD_CLIENT_STEP, SMOKE_STEP, LOCKDOWN_STEP, LIFECYCLE_STEP)
 # The one compose subcommands a client invocation may run.
@@ -4427,6 +4440,110 @@ def test_only_container_jobs_that_run_the_suite_are_judged(tmp_path: Path, monke
     (tmp_path / 'ci.yml').write_text(yaml.safe_dump(workflow), encoding='utf-8')
     monkeypatch.setattr(sys.modules[__name__], 'WORKFLOW_DIR', tmp_path)
     assert [label for label, _ in _container_test_jobs()] == ['ci.yml:container-tests']
+
+
+# ---------------------------------------------------------------------------------------
+# ... AND THE TOOL THE SUITE ITSELF RUNS: JQ (tj-3mk3u5.40)
+#
+# common/tests/test_harness_hooks.py (tj-qenrpk) runs the PreToolUse Bash hooks in
+# .claude/settings.json verbatim, and each hook pipeline starts with jq, which debian:bookworm-slim
+# does not ship. Without jq a hook falls through its `|| true` and allows every command, so those
+# tests check for jq at run time and fail (pytest.ini: never skip). That check fires only where the
+# suite runs, and the agent image installs jq (.devcontainer/Dockerfile), so a job that lost jq would
+# go red in CI alone, on a push no agent makes. This pins it where an agent's own run sees it.
+#
+# BEFORE THE SUITE, NOT BEFORE CHECKOUT, which is why jq is not in CONTAINER_TEST_TOOLS. git has to
+# precede checkout for checkout to clone a repository; nothing earlier than pytest runs jq, so a job
+# that installs it in any step before the suite is correct and must not be named. Adding jq to that
+# set would also have turned every accepted fixture above red, and made the fixtures that drop git or
+# make fail for jq as well, so they would stop proving their own detection. Judged per step, like the
+# safe.directory check above: jq is installed in a step before the first one that runs the suite.
+# Same derivation as above, so a second container job running the suite is held to it too.
+#
+# grep -P, the hooks' other tool, is deliberately not pinned. It comes from the image, not from this
+# repository: bookworm's grep is Essential and pre-depends on libpcre2-8-0, so no line here installs
+# it and no edit here can lose it. The one lever is `container:` itself, and a new image is checked
+# on its first run by the hook tests' own grep -P probe, which runs the binary a static pin could
+# only guess about.
+CONTAINER_SUITE_TOOLS = frozenset({'jq'})
+
+
+def _container_suite_tool_gaps(job: dict) -> list[str]:
+    """What a container test job lacks: each of CONTAINER_SUITE_TOOLS installed in a step before the suite."""
+    steps = job.get('steps') or []
+    suite = next(index for index, step in enumerate(steps) if _runs_the_suite(step))
+    before = set().union(*(_installed_packages(step) for step in steps[:suite]))
+    missing = sorted(CONTAINER_SUITE_TOOLS - before)
+    if not missing:
+        return []
+    late = sorted(set(missing) & set().union(*(_installed_packages(step) for step in steps[suite:])))
+    return [
+        f'{missing} not installed in a step before the suite (step {suite}), and the harness-hook tests run it'
+        + (f'; {late} installed only in or after that step' if late else '')
+    ]
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    'job', [job for _, job in _CONTAINER_TEST_JOBS], ids=[label for label, _ in _CONTAINER_TEST_JOBS]
+)
+def test_container_test_job_installs_jq_before_the_suite(job: dict):
+    """tj-3mk3u5.40: a container job running the suite installs jq, which the harness-hook tests run, first."""
+    gaps = _container_suite_tool_gaps(job)
+    assert gaps == [], '; '.join(gaps)
+
+
+_INSTALL_WITH_JQ = {'run': 'apt-get update\napt-get install -y --no-install-recommends git make jq ca-certificates'}
+_INSTALL_JQ_ALONE = {'run': 'apt-get install -y --no-install-recommends jq'}
+_SUITE_TOOLS_ACCEPTED = {
+    'one-install-line': [_INSTALL_WITH_JQ, _SAFE, _CHECKOUT, _SUITE],
+    'own-step-after-checkout': [_INSTALL, _SAFE, _CHECKOUT, _INSTALL_JQ_ALONE, _SUITE],
+    'pinned-version-and-make-test': [
+        _INSTALL,
+        _CHECKOUT,
+        {'run': 'DEBIAN_FRONTEND=noninteractive apt-get install -y jq=1.6-2.1+deb12u2'},
+        _SAFE,
+        {'run': 'make test PATHS=common'},
+    ],
+}
+# Each of these is correct by the git-and-make rule above (the test asserts it), so jq is the only
+# thing any of them can be named for.
+_SUITE_TOOLS_REJECTED = {
+    'jq-dropped': [_INSTALL, _SAFE, _CHECKOUT, _SUITE],
+    'jq-after-the-suite': [_INSTALL, _SAFE, _CHECKOUT, _SUITE, _INSTALL_JQ_ALONE],
+    'jq-commented-out': [{'run': _INSTALL['run'] + '\n# apt-get install -y jq'}, _SAFE, _CHECKOUT, _SUITE],
+    'jq-run-never-installed': [_INSTALL, _SAFE, _CHECKOUT, {'run': 'jq --version'}, _SUITE],
+    'jq-removed-not-installed': [{'run': _INSTALL['run'] + '\napt-get purge -y jq'}, _SAFE, _CHECKOUT, _SUITE],
+}
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize('steps', list(_SUITE_TOOLS_ACCEPTED.values()), ids=list(_SUITE_TOOLS_ACCEPTED))
+def test_container_suite_tool_rule_accepts_a_correct_job(steps: list[dict]):
+    """A correct container job passes both rules, including jq in its own step after checkout."""
+    job = {'container': 'debian:bookworm-slim', 'steps': steps}
+    assert _container_suite_tool_gaps(job) == []
+    assert _container_toolchain_gaps(job) == []
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize('steps', list(_SUITE_TOOLS_REJECTED.values()), ids=list(_SUITE_TOOLS_REJECTED))
+def test_container_suite_tool_rule_rejects_a_broken_job(steps: list[dict]):
+    """Each of these reaches the suite without jq installed, and must be named for it."""
+    job = {'container': 'debian:bookworm-slim', 'steps': steps}
+    assert _container_toolchain_gaps(job) == [], 'the fixture is broken for a reason other than jq'
+    gaps = _container_suite_tool_gaps(job)
+    assert len(gaps) == 1 and gaps[0].startswith("['jq'] not installed in a step before the suite"), gaps
+
+
+@pytest.mark.build_infra
+def test_jq_installed_after_the_suite_is_named_as_late():
+    """The diagnosis says where jq went, so a reordered job reads as reordered, not as jq dropped."""
+    job = {'container': 'debian:bookworm-slim', 'steps': _SUITE_TOOLS_REJECTED['jq-after-the-suite']}
+    assert _container_suite_tool_gaps(job) == [
+        "['jq'] not installed in a step before the suite (step 3), and the harness-hook tests run it; "
+        "['jq'] installed only in or after that step"
+    ]
 
 
 # ---------------------------------------------------------------------------------------

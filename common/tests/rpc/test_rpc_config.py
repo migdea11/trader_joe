@@ -14,6 +14,10 @@ production; here it is a missing key and fails.
 
 The message ceiling is pinned by behaviour in test_rpc_limits.py. It appears here only because an
 explicit 4 MiB receive limit and an inherited one behave identically, and D6.3 asks for explicit.
+
+One pin is a value rather than a relation: addendum A2 fixes the server's grpc.so_reuseport at 0,
+and any other value reverses A2. Its behaviour, a second server failing to bind the port, is pinned
+in test_rpc_server.py.
 """
 
 import pytest
@@ -33,6 +37,7 @@ MIN_PING_INTERVAL_WITHOUT_DATA = 'grpc.http2.min_ping_interval_without_data_ms'
 MAX_PING_STRIKES = 'grpc.http2.max_ping_strikes'
 MAX_SEND = 'grpc.max_send_message_length'
 MAX_RECEIVE = 'grpc.max_receive_message_length'
+REUSEPORT = 'grpc.so_reuseport'
 
 SIDES = {'channel': channel_options, 'server': server_options}
 
@@ -96,3 +101,16 @@ def test_a_client_that_pings_while_idle_keeps_pinging():
             f'the client permits idle pings but {MAX_PINGS_WITHOUT_DATA}={client.get(MAX_PINGS_WITHOUT_DATA)!r} '
             f'(unset means 2) stops them after that many, so a dead peer goes undetected on an idle channel'
         )
+
+
+def test_the_server_turns_so_reuseport_off():
+    """A2: a second bind on a server's port must fail, not share it, so SO_REUSEPORT is explicitly 0.
+
+    gRPC's default is 1, so a missing key shares the port exactly as a 1 does. Only the server side
+    is asserted: SO_REUSEPORT is an option on a listening socket, and a channel listens on nothing.
+    """
+    server = _options('server')
+    assert server.get(REUSEPORT) == 0, (
+        f'the server sets {REUSEPORT}={server.get(REUSEPORT)!r} (unset means 1): a second process binds '
+        f'the same port and the kernel splits connections between the two'
+    )

@@ -159,6 +159,43 @@ async def test_a_port_that_cannot_be_bound_fails_start():
 
 
 # ---------------------------------------------------------------------------------------------------
+# PORT EXCLUSIVITY (ADR tj-8konfu addendum A2)
+#
+# grpcio sets SO_REUSEPORT on a listening socket by default, and Linux lets a second socket bind a port
+# when both sockets set it: the bind succeeds and the kernel splits connections between the two. The
+# test above cannot see that. Its holder is a plain socket without SO_REUSEPORT, which refuses the
+# second bind whatever gRPC sets. Only two gRPC servers on one port show whether the option is off.
+
+
+@pytest.mark.asyncio
+async def test_a_second_host_on_a_bound_port_fails_start_instead_of_sharing_it():
+    """A2: an extra worker's lifespan fails at the bind, loudly, instead of taking half the connections.
+
+    The first host still answers afterwards: the failed start released only what it had built itself.
+    """
+    first = _loopback_host()
+    await first.start()
+    try:
+        second = GrpcServerHost(BindAddress(LOOPBACK, first.port), [ping_service()])
+        try:
+            with pytest.raises(RuntimeError, match='bind'):
+                await second.start()
+            with pytest.raises(RuntimeError, match='not been started'):
+                _ = second.port
+        finally:
+            # A no-op when the bind failed. When the port was shared instead, the second server is
+            # running, and a grpc.aio server left running past its event loop hangs the pytest run.
+            await second.stop()
+        channel = create_channel(f'{LOOPBACK}:{first.port}')
+        try:
+            assert await asyncio.wait_for(ping(channel, 'still here', timeout_s=5), GUARD_S) == 'still here'
+        finally:
+            await channel.close()
+    finally:
+        await first.stop()
+
+
+# ---------------------------------------------------------------------------------------------------
 # NEVER A WILDCARD (tj-r6vcgv addendum 1 A5; tj-glqs4r)
 #
 # What is refused is what the host RESOLVES to, not how it is spelled: '0' and '0.0' are inet_aton

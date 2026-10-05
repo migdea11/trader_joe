@@ -1,9 +1,9 @@
 """The shared gRPC transport policy: keepalive and message limits, for both sides, in one place.
 
-ADR tj-8konfu D6.2 and D6.3, plus the client's reconnect backoff, which D6.5 = O1 depends on. The
-server host (common.rpc.server) and the channel factory (common.rpc.channel) take their options from
-here and from nowhere else, so the client and server halves of each setting are one decision rather
-than two defaults that happen to meet.
+ADR tj-8konfu D6.2 and D6.3, plus the client's reconnect backoff, which D6.5 = O1 depends on, and the
+server's exclusive bind, addendum A2. The server host (common.rpc.server) and the channel factory
+(common.rpc.channel) take their options from here and from nowhere else, so the client and server
+halves of each setting are one decision rather than two defaults that happen to meet.
 
 What does NOT live here: no error reason, no domain and no status table. The error vocabulary is
 canonical in common/errors (ADR tj-fa1rpu U1), and rendering it as a gRPC status is its own module.
@@ -13,7 +13,8 @@ pinned grpcio: doc/keepalive.md, doc/connection-backoff.md and include/grpc/impl
 Client keepalive is disabled by default (INT_MAX). The server pings every 2 hours, accepts a client
 ping no more often than every 5 minutes and sends GOAWAY after 2 bad pings. Neither side pings
 without a call in flight, and neither sends more than 2 pings without data. The receive limit
-defaults to 4 MiB and the send limit to unlimited. Reconnect backoff grows to 120 s.
+defaults to 4 MiB and the send limit to unlimited. Reconnect backoff grows to 120 s. A server's
+listening socket allows SO_REUSEPORT (grpc.so_reuseport defaults to 1).
 """
 
 from typing import Final
@@ -76,6 +77,19 @@ MAX_PING_STRIKES: Final = 2
 # compose network.
 MAX_RECONNECT_BACKOFF_MS: Final = 2_000
 
+# ---------------------------------------------------------------------------------------------------
+# PORT EXCLUSIVITY -- SERVER ONLY (ADR tj-8konfu addendum A2). A second bind on a gRPC port fails.
+#
+# grpcio allows SO_REUSEPORT on a server's listening socket by default ('grpc.so_reuseport', default
+# 1, in include/grpc/impl/channel_arg_names.h at v1.81.1), so a second process that binds a port
+# already in use succeeds silently and the kernel splits incoming connections between the two.
+# Sharing a port is never intended here. entrypoint.sh starts uvicorn --workers $SERVICE_WORKERS and
+# every worker runs the lifespan that binds, while data_ingest is one process by design: its
+# RateBudget and SingleFlight are per-process state that an extra worker would duplicate, defeating
+# both. With the option off, the extra bind fails and GrpcServerHost.start() raises. Serving one port
+# from several processes would be a new decision reversing A2, not a change to this value.
+ALLOW_REUSEPORT: Final = False
+
 
 def _shared_options() -> ChannelOptions:
     return (
@@ -102,7 +116,8 @@ def channel_options() -> ChannelOptions:
 def server_options() -> ChannelOptions:
     """Options for every grpc.aio server this repository hosts.
 
-    The shared options plus the server's ping policy, which the client's keepalive must satisfy.
+    The shared options plus the server's ping policy, which the client's keepalive must satisfy, and
+    SO_REUSEPORT off, so a second bind on the same port fails instead of sharing it.
 
     Returns:
         ChannelOptions: The (key, value) channel arguments.
@@ -111,4 +126,5 @@ def server_options() -> ChannelOptions:
         *_shared_options(),
         ('grpc.http2.min_ping_interval_without_data_ms', MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS),
         ('grpc.http2.max_ping_strikes', MAX_PING_STRIKES),
+        ('grpc.so_reuseport', int(ALLOW_REUSEPORT)),
     )

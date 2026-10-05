@@ -193,11 +193,35 @@ services:
       # No host port in prod: nothing consumes one (data_store reaches it over
       # ingest_store, the healthcheck probes in-container) and its API is unauthenticated.
       # The dev-only loopback publish lives in docker-compose.override.yaml, with devnet.
-      - ingest_store
-      - ingest_egress
+      #
+      # data-ingest-grpc is the name the gRPC server binds (APP_INTERNAL_GRPC_HOST below), an
+      # alias on the ingest_store attachment ONLY (ADR tj-q9ae5u addendum 3). Docker's DNS answers
+      # a network-scoped alias with this container's address on THAT network, so the listener
+      # lands on ingest_store, where data_store reaches it, whatever order the networks attach in.
+      # Not the service name or hostname: the container's /etc/hosts maps its hostname to ONE of
+      # its addresses, picked by attach order, which nothing here pins -- the server could bind
+      # ingest_egress (or devnet in dev) and still start cleanly. Never 0.0.0.0 (tj-r6vcgv
+      # addendum 1 A5; tj-glqs4r): common.rpc refuses a wildcard at start. Hyphens, not
+      # underscores, so no resolver's tolerance of '_' matters to data_store's client either.
+      # CI's System Testing proves the name resolves to the ingest_store address and nothing else.
+      ingest_store:
+        aliases:
+          - data-ingest-grpc
+      ingest_egress: {}
     env_file:
       - ${ROOT_ENV_FILE:-.env}
       - ${INGEST_ENV_FILE:-./data/ingest/.env}
+    environment:
+      # Where the gRPC server listens (common.rpc BindAddress.from_env, which has no default and
+      # fails at startup when either is unset). Set here, in the base file, not only in
+      # .env.default: every launch loads this file, and environment: outranks env_file:, so no
+      # env file can move the listener. The agent stack's env files are generated once and never
+      # regenerated, and a user's .env predates these variables, so a value in .env.default
+      # alone would reach neither. The :-50051 fallback serves those same older env files; it is
+      # the real in-network port, so falling back never puts the listener where the peer cannot
+      # reach it. The host is literal: the alias above, never an env-file value.
+      APP_INTERNAL_GRPC_HOST: data-ingest-grpc
+      APP_INTERNAL_GRPC_PORT: ${DATA_INGEST_GRPC_PORT:-50051}
     image: trader_joe_data_ingest:latest
     security_opt:
       - "no-new-privileges:true"
