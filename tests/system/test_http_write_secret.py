@@ -11,8 +11,9 @@ single-bar POST:
   * 7b a wrong secret -> 401, and nothing written or removed;
   * 7c the right secret -> the handler runs (below);
   * 7d a GET with no secret, or with a wrong one, succeeds: reads are deliberately open.
-Every 401 body is checked for the secret before anything else is asserted about it, and carries
-exactly the fixed rejection detail, imported rather than retyped.
+Every 401 response, and every 7c response, is checked for the secret -- in the body and in every
+raw header value -- before anything else is asserted about it. Every 401 body carries exactly the
+fixed rejection detail, imported rather than retyped.
 
 7c ON THE DATASET POST IS A 409, NOT A 2xx, AND ON PURPOSE. A 2xx there means data_store called
 data_ingest and the broker, and this part never drives the broker (fake-broker plan, decision
@@ -152,7 +153,8 @@ def test_write_without_the_right_secret_is_401_and_changes_nothing(
     response = send_write(route, seeded_entry, auth)
 
     # FIRST, and as a bool: if the body leaked the secret, no later assertion may print the body.
-    leaked = data_store.leaks_secret(response.text) or data_store.leaks_secret(str(response.headers))
+    # Body and raw header values both: response_leaks_secret explains why not str(response.headers).
+    leaked = data_store.response_leaks_secret(response)
     assert not leaked, f'{route} {auth}: the 401 response carries the instance secret (value withheld)'
     assert response.status_code == 401, data_store.describe(response)
     assert response.json() == {'detail': INSTANCE_SECRET_REJECTION_DETAIL}, data_store.describe(response)
@@ -183,7 +185,10 @@ def test_write_with_the_right_secret_reaches_the_handler(
     """
     response = send_write(route, seeded_entry, 'right')
 
-    leaked = data_store.leaks_secret(response.text)
+    # FIRST, as in the 401 test. This is the one path where the RECEIVED header value IS the
+    # secret, so a response that echoed a request header would leak here and nowhere else --
+    # hence the headers, not only the body.
+    leaked = data_store.response_leaks_secret(response)
     assert not leaked, f'{route}: the response carries the instance secret (value withheld)'
     match route:
         case WriteRoute.DATASET_POST:

@@ -1,0 +1,21 @@
+// PIPELINE PROOF, NOT A CONTRACT (tj-3mk3u5.23). This service exists so the codegen pipeline runs
+// end to end before any real contract does: this file, `make proto`, the committed tree under
+// common/rpc/generated/, CI's staleness check, and a grpc.aio server and channel built from
+// common/rpc. No client depends on its shape. Change it or delete it freely; the first real
+// contract does not extend it.
+syntax = "proto3";
+
+package trader_joe.ping.v1;
+
+// Echoes the request's message back.
+service PingService {
+  rpc Ping(PingRequest) returns (PingResponse);
+}
+
+message PingRequest {
+  string message = 1;
+}
+
+message PingResponse {
+  string message = 1;
+}

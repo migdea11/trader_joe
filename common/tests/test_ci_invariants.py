@@ -16,6 +16,7 @@ import copy
 import fnmatch
 import importlib
 import ipaddress
+import json
 import os
 import posixpath
 import re
@@ -33,6 +34,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 import yaml
+from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
@@ -1366,7 +1368,13 @@ def test_migrate_still_defaults_to_upgrade_head():
 #
 # Alembic writes the revision files, and they were excluded before tj-2ngid0 widened the list.
 # Adding a prefix here takes a source path out of the lint gate, so it is a decision.
-RUFF_UNLINTED_SOURCE_PREFIXES = ('data/store/migrations/versions/',)
+#
+# common/rpc/generated/ is protoc's committed output, excluded by ADR tj-8konfu D3 (re-homed by
+# addendum A1) as generated code, the same way the revisions are. `make proto` writes it and nothing
+# else does, so it is never hand-edited or reformatted. CI's staleness step regenerates it and fails
+# on any difference, so a hand-written file slipped in there shows up as one `make proto` deletes.
+# The prefix stops at generated/. The hand-written modules beside it in common/rpc/ stay linted.
+RUFF_UNLINTED_SOURCE_PREFIXES = ('data/store/migrations/versions/', 'common/rpc/generated/')
 
 
 def _run(*command: str) -> list[str]:
@@ -5823,3 +5831,253 @@ _IMPORT_TIME_PRINT_CASES = {
 def test_the_import_time_print_finder_follows_what_runs_at_import(source: str, lines: list[int]):
     """The finder above, on synthetic modules, so it cannot pass common/ by looking nowhere."""
     assert _import_time_prints(source) == lines
+
+
+# ---------------------------------------------------------------------------------------
+# THE gRPC TOOLCHAIN (ADR tj-8konfu D1 and D3, re-homed by addendum A1; tj-3mk3u5.23)
+#
+# Committing protoc's output is safe only with three controls around it. Each one fails silently
+# when it goes, because nothing reports a check that no longer runs.
+#
+# * THE STALENESS STEP. CI's unit job regenerates common/rpc/generated/ through `make proto` and
+#   fails on ANY difference from the commit: a changed, deleted or untracked file. D3 says that
+#   without it committing is strictly worse than generating at build time. It has to run before
+#   the linters and the suite. Its script is pinned by RUNNING it against a scratch repository
+#   with a stand-in `make`, because the property is what it detects. A `git diff` in place of the
+#   `git status` reads the same at a glance and misses every untracked file.
+# * THE SEAM. Nothing outside common/rpc/ imports common.rpc.generated (ruff TID251). Pinned by
+#   asking ruff itself, over stdin, with the project's own configuration. That exercises the
+#   select entry, the banned-api table and the per-file-ignore together: remove any one of them,
+#   or widen the ignore, and a case here changes.
+# * THE PINS. The generator writes its version into every file it emits, so an unpinned
+#   grpcio-tools would fail the staleness step on a new release rather than on a contract change.
+#
+# Deliberately NOT pinned here: that `make proto` reproduces the committed tree. That IS the
+# staleness step, which D3 makes the control. A copy in the suite would be a second definition of
+# the protoc invocation to keep in step with the Makefile, which is what the step avoids.
+GENERATED_GRPC_TREE = PurePosixPath('common/rpc/generated')
+GENERATED_GRPC_MODULE = GENERATED_GRPC_TREE / 'trader_joe' / 'ping' / 'v1' / 'ping_pb2.py'
+
+
+def _runs_make_target(command: list[str], target: str) -> bool:
+    return bool(command) and PurePosixPath(command[0]).name == 'make' and target in command[1:]
+
+
+def _runs_ruff(step: dict) -> bool:
+    return any(PurePosixPath(word).name == 'ruff' for command in _step_commands(step) for word in command)
+
+
+def _proto_regeneration_steps() -> list[tuple[str, int, dict]]:
+    """(job id, step index, step) for every step of the testing workflow that runs `make proto`."""
+    found = []
+    for job_id, job in ((_load_yaml(TESTING_WORKFLOW) or {}).get('jobs') or {}).items():
+        for index, step in enumerate((job or {}).get('steps') or []):
+            if any(_runs_make_target(command, 'proto') for command in _step_commands(step)):
+                found.append((job_id, index, step))
+    return found
+
+
+def _staleness_step() -> dict:
+    steps = _proto_regeneration_steps()
+    assert len(steps) == 1, (
+        f'expected exactly one step in {TESTING_WORKFLOW.name} that runs `make proto`, found '
+        f'{[(job_id, step.get("name")) for job_id, _, step in steps]}'
+    )
+    return steps[0][2]
+
+
+@pytest.mark.build_infra
+def test_ci_checks_the_generated_grpc_tree_before_it_lints_or_tests():
+    """D3: the staleness step exists, in the job that runs the suite, ahead of ruff and pytest.
+
+    Ahead, so a stale tree is reported as stale rather than as whatever lint or import error it
+    happens to cause first.
+    """
+    _staleness_step()
+    ((job_id, index, _),) = _proto_regeneration_steps()
+    steps = _load_yaml(TESTING_WORKFLOW)['jobs'][job_id]['steps']
+    gated = [later for later, step in enumerate(steps) if _runs_the_suite(step) or _runs_ruff(step)]
+    assert any(_runs_the_suite(step) for step in steps), (
+        f'the `make proto` step is in {job_id}, which does not run the unit suite'
+    )
+    assert gated and min(gated) > index, (
+        f'in {job_id}, the `make proto` step is step {index}, but ruff or pytest runs at steps {gated}; '
+        f'it has to come first'
+    )
+
+
+_STALENESS_CASES = {
+    'regeneration is a no-op': ('', 0),
+    'a generated module changed': (f"printf '# drift\\n' >> {GENERATED_GRPC_MODULE}", 1),
+    'a generated module deleted': (f'rm {GENERATED_GRPC_MODULE}', 1),
+    'a generated module untracked': (
+        f'mkdir -p {GENERATED_GRPC_TREE}/trader_joe/probe/v1 && '
+        f"printf 'x = 1\\n' > {GENERATED_GRPC_TREE}/trader_joe/probe/v1/probe_pb2.py",
+        1,
+    ),
+    'a change outside the generated tree': ("printf 'drift\\n' >> README.md", 0),
+}
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(('regeneration', 'status'), _STALENESS_CASES.values(), ids=_STALENESS_CASES.keys())
+def test_the_staleness_step_fails_on_any_drift_in_the_generated_tree(tmp_path: Path, regeneration: str, status: int):
+    """D3: the step's own script, run where `make proto` leaves the generated tree in each possible state.
+
+    The stand-in `make` records its arguments and applies the case's change, so the step is shown to
+    regenerate through `make proto` and to judge what that leaves. Run under the shell GitHub uses for
+    a `run:` with no `shell:`. git is configured from nothing, so the runner's config cannot leak in.
+    """
+    script = _staleness_step().get('run') or ''
+    assert '${{' not in script, 'the step now uses a workflow expression, which this test cannot evaluate'
+
+    repo = tmp_path / 'repo'
+    (repo / GENERATED_GRPC_MODULE).parent.mkdir(parents=True)
+    (repo / GENERATED_GRPC_TREE / '__init__.py').write_text('', encoding='utf-8')
+    (repo / GENERATED_GRPC_MODULE).write_text('DESCRIPTOR = None\n', encoding='utf-8')
+    (repo / 'README.md').write_text('readme\n', encoding='utf-8')
+    env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    env |= {
+        'GIT_CONFIG_NOSYSTEM': '1',
+        'GIT_CONFIG_GLOBAL': os.devnull,
+        'GIT_AUTHOR_NAME': 'validator',
+        'GIT_AUTHOR_EMAIL': 'validator@example.invalid',
+        'GIT_COMMITTER_NAME': 'validator',
+        'GIT_COMMITTER_EMAIL': 'validator@example.invalid',
+    }
+    for command in (['git', 'init', '-q'], ['git', 'add', '-A'], ['git', 'commit', '-q', '-m', 'generated tree']):
+        subprocess.run(command, cwd=repo, env=env, check=True, capture_output=True)
+
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    make_log = tmp_path / 'make.args'
+    fake_make = bin_dir / 'make'
+    fake_make.write_text(
+        f'#!/usr/bin/env bash\nset -eu\nprintf "%s\\n" "$*" >> {shlex.quote(str(make_log))}\n{regeneration}\n',
+        encoding='utf-8',
+    )
+    fake_make.chmod(0o755)
+    step_script = tmp_path / 'step.sh'
+    step_script.write_text(script, encoding='utf-8')
+    env['PATH'] = f'{bin_dir}{os.pathsep}{env.get("PATH", "")}'
+
+    result = subprocess.run(
+        ['bash', '--noprofile', '--norc', '-e', str(step_script)], cwd=repo, env=env, capture_output=True, text=True
+    )
+
+    assert make_log.read_text(encoding='utf-8').splitlines() == ['proto'], 'the step must regenerate via `make proto`'
+    assert result.returncode == status, (
+        f'the staleness step exited {result.returncode}, expected {status}.\n'
+        f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}'
+    )
+
+
+SEAM_VIOLATIONS = (
+    'import common.rpc.generated.trader_joe.ping.v1.ping_pb2_grpc',
+    'from common.rpc.generated.trader_joe.ping.v1 import ping_pb2',
+    'from common.rpc.generated.trader_joe.ping.v1.ping_pb2 import PingRequest',
+    'from common.rpc import generated',
+)
+OUTSIDE_THE_SEAM = (
+    'common/probe.py',
+    'common/tests/test_probe.py',
+    'routers/common/probe.py',
+    'schemas/common/probe.py',
+    'data/store/app/probe.py',
+    'data/ingest/app/probe.py',
+)
+INSIDE_THE_SEAM = ('common/rpc/probe.py', 'common/rpc/nested/probe.py')
+
+
+def _ruff_codes_by_line(filename: str, source: str) -> dict[int, set[str]]:
+    """Lint `source` as though it lived at `filename`, under the project's ruff configuration."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            '-m',
+            'ruff',
+            'check',
+            '--no-cache',
+            '--output-format',
+            'json',
+            '--stdin-filename',
+            filename,
+            '-',
+        ],
+        cwd=REPO_ROOT,
+        input=source,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode in (0, 1), f'ruff did not run: exit {result.returncode}\n{result.stderr}'
+    found: dict[int, set[str]] = {}
+    for diagnostic in json.loads(result.stdout or '[]'):
+        found.setdefault(diagnostic['location']['row'], set()).add(diagnostic['code'])
+    return found
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize('filename', OUTSIDE_THE_SEAM)
+def test_generated_grpc_code_cannot_be_imported_outside_common_rpc(filename: str):
+    """D3's seam: every form of importing the generated package is TID251 outside common/rpc, tests included."""
+    flagged = _ruff_codes_by_line(filename, '\n'.join(SEAM_VIOLATIONS) + '\n')
+    missed = [line for row, line in enumerate(SEAM_VIOLATIONS, start=1) if 'TID251' not in flagged.get(row, set())]
+    assert not missed, f'in {filename}, ruff lets these through: {missed}. Reach generated code through common/rpc.'
+
+
+@pytest.mark.build_infra
+def test_a_relative_import_of_generated_grpc_code_is_caught_too():
+    flagged = _ruff_codes_by_line('common/probe.py', 'from .rpc.generated.trader_joe.ping.v1 import ping_pb2\n')
+    assert 'TID251' in flagged.get(1, set()), f'a relative import of the generated package is not TID251: {flagged}'
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize('filename', INSIDE_THE_SEAM)
+def test_common_rpc_may_import_its_generated_code(filename: str):
+    """Guard the guard: TID251 above comes from the ban, not from a rule that flags every import."""
+    flagged = _ruff_codes_by_line(filename, '\n'.join(SEAM_VIOLATIONS) + '\n')
+    assert not any('TID251' in codes for codes in flagged.values()), f'{filename}: {flagged}'
+
+
+# Where each half of the toolchain belongs: the runtime in base, which both services install, and
+# the generator in dev only, so the prod images never carry it.
+GRPC_PIN_GROUPS = {'grpcio': 'base', 'grpcio-health-checking': 'base', 'grpcio-tools': 'dev'}
+
+
+def _dependency_group_requirements() -> dict[str, dict[str, Requirement]]:
+    with PYPROJECT.open('rb') as handle:
+        groups = tomllib.load(handle).get('dependency-groups', {})
+    parsed: dict[str, dict[str, Requirement]] = {}
+    for group, entries in groups.items():
+        requirements = [Requirement(entry) for entry in entries if isinstance(entry, str)]
+        parsed[group] = {canonicalize_name(requirement.name): requirement for requirement in requirements}
+    return parsed
+
+
+def _exact_version(requirement: Requirement) -> str | None:
+    specifiers = list(requirement.specifier)
+    if len(specifiers) == 1 and specifiers[0].operator == '==' and '*' not in specifiers[0].version:
+        return specifiers[0].version
+    return None
+
+
+@pytest.mark.build_infra
+def test_the_grpc_toolchain_is_pinned_exactly_and_moves_together():
+    """D1/D3: the grpc toolchain is pinned with ==, at one version, each package in its own group.
+
+    grpcio-tools writes its version into every file it generates, and grpcio and
+    grpcio-health-checking move with it.
+    """
+    groups = _dependency_group_requirements()
+    versions: dict[str, str] = {}
+    for name, group in GRPC_PIN_GROUPS.items():
+        requirement = groups.get(group, {}).get(name)
+        assert requirement is not None, f'{name} is not declared in the {group!r} dependency group'
+        version = _exact_version(requirement)
+        assert version is not None, f'{name} is declared as {str(requirement)!r}; it must be pinned with =='
+        versions[name] = version
+    assert len(set(versions.values())) == 1, f'the grpc pins have to move together, but read {versions}'
+    elsewhere = sorted(
+        group for group, requirements in groups.items() if group != 'dev' and 'grpcio-tools' in requirements
+    )
+    assert not elsewhere, f'grpcio-tools is also declared in {elsewhere}; the generator belongs in dev only'

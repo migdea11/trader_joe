@@ -112,6 +112,38 @@ lock:  ## Re-resolve uv.lock from pyproject.toml (the only target that changes t
 init: $(VENV_MARKER)  ## Initialize the project, including the security tooling
 	uv sync --all-groups --no-group agent-mcp
 
+# THE gRPC CODEGEN (ADR tj-8konfu D1 and D3, re-homed by addendum A1; tj-3mk3u5.23). proto/ at the
+# repository root is the source of truth for what crosses the wire, and common/rpc/generated/ is the
+# server's COMMITTED copy of protoc's output. This target is the one way that copy is written: run it
+# after any .proto change and commit both together. CI's lint-and-test job runs it and fails on any
+# difference, because committed generated code without that check is worse than generating at build
+# time -- a committed copy can go stale, and a build-time one cannot.
+#
+# THE IMPORT TRAP, AND WHY -I CARRIES A MAPPING. protoc writes a generated module's imports from the
+# .proto's path under its include root, never from where the output lands. With a plain -Iproto,
+# trader_joe/ping/v1/ping.proto yields `from trader_joe.ping.v1 import ping_pb2`: a package that is
+# nowhere on the path, under pytest (the repository root) or in the image (PYTHONPATH=/code). The
+# virtual include root -I$(PROTO_OUT)=$(PROTO_SRC) makes protoc see that file as
+# common/rpc/generated/trader_joe/ping/v1/ping.proto, so the import becomes
+# `from common.rpc.generated.trader_joe.ping.v1 import ping_pb2`, which resolves in both with no
+# sys.path change; --python_out=. then lands the tree under common/rpc/generated/. What that costs is
+# in proto/README.md: one .proto cannot import ANOTHER of this repo's .proto files by its canonical
+# path. Well-known types (google/protobuf/*.proto) are unaffected.
+#
+# Everything in the output directory but its package __init__.py is deleted first, so a removed
+# .proto leaves no stale module behind; the guard refuses to clear a directory that is not that
+# package. Inputs are sorted for a stable command line. grpcio-tools is pinned exactly in
+# pyproject.toml, because its version is written into every file it emits.
+PROTO_SRC := proto
+PROTO_OUT := common/rpc/generated
+
+.PHONY: proto
+proto: $(VENV_MARKER)  ## Regenerate common/rpc/generated/ from proto/ (commit both; CI fails on a stale tree)
+	@[ -f "$(PROTO_OUT)/__init__.py" ] || { echo "make proto: $(PROTO_OUT)/__init__.py is missing; refusing to clear a directory that is not the generated package." >&2; exit 1; }
+	find "$(PROTO_OUT)" -mindepth 1 -maxdepth 1 ! -name __init__.py -exec rm -rf {} +
+	uv run python -m grpc_tools.protoc -I$(PROTO_OUT)=$(PROTO_SRC) --python_out=. --grpc_python_out=. --pyi_out=. \
+		$$(find $(PROTO_SRC) -name '*.proto' | LC_ALL=C sort)
+
 # Every compose target goes through one of these, and none omits -f. A bare
 # `docker compose` auto-loads docker-compose.override.yaml, which is what made `launch`
 # start the dev images while its help text claimed production (tj-6ap2vw).

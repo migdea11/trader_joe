@@ -421,8 +421,9 @@ def write_secret() -> str:
 # places: the client's repr masks the secret (pytest prints fixture arguments in a traceback);
 # describe() and every transport-failure message pass through redact(); a transport failure is a
 # pytest.fail with pytrace=False, so no httpx frame -- whose arguments include the headers -- is
-# printed; and leaks_secret() returns a bool, so a test asserts on a plain name rather than on an
-# expression pytest would expand, response body included, into the failure message.
+# printed; and leaks_secret() and response_leaks_secret() return a bool, so a test asserts on a
+# plain name rather than on an expression pytest would expand, response body included, into the
+# failure message.
 
 HTTP_TIMEOUT_SECONDS = 30.0
 
@@ -495,6 +496,21 @@ class DataStoreHttp:
     def leaks_secret(self, text: str) -> bool:
         """Whether `text` contains the deployment's secret. Assert on the returned bool, never on this call."""
         return self.__secret in text
+
+    def response_leaks_secret(self, response: httpx.Response) -> bool:
+        """Whether the response's body, or the value of any header it carries, contains the secret.
+
+        Header values are read RAW, from multi_items(), and never through str(response.headers):
+        that string is httpx's Headers repr, which prints the values of Authorization and
+        Proxy-Authorization as '[secure]' (httpx SENSITIVE_HEADERS) and so cannot see a secret
+        sent back under exactly the two names a credential is most likely to travel in
+        (tj-3mk3u5.41). multi_items() also keeps a repeated header's values apart rather than
+        joining them. Assert on the returned bool, never on this call: a bool keeps pytest from
+        expanding the body into the failure message.
+        """
+        if self.leaks_secret(response.text):
+            return True
+        return any(self.leaks_secret(value) for _, value in response.headers.multi_items())
 
     def redact(self, text: str) -> str:
         return text.replace(self.__secret, '<redacted>')

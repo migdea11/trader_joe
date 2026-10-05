@@ -1,0 +1,4 @@
+# Committed protoc output, written by `make proto` (ADR tj-8konfu D3). linguist-generated makes GitHub
+# collapse it in a diff by default. That only changes how the diff is shown. It does NOT exempt the
+# code from review: it is committed so that a wire change shows up in review, so expand it there.
+common/rpc/generated/** linguist-generated=true

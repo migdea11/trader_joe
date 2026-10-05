@@ -47,6 +47,17 @@ base = [
     # 1.177.0 takes `rich>=13.5.2` unbounded, so rich-toolkit pulling rich 15.x resolves fine
     # now. Adopting `[standard]` is an open decision about what it drags in — tj-abme9y.
     "fastapi>=0.141.1",
+    # gRPC, both sides on grpc.aio (ADR tj-8konfu D2). In base because both services install it.
+    # EXACT PINS, and these two move together with grpcio-tools in dev: every generated
+    # *_pb2_grpc.py records the grpcio-tools version and refuses to import under an older grpcio,
+    # and every *_pb2.py checks the protobuf runtime against the protoc that wrote it.
+    # 1.81.1 rather than the newer 1.84.0 the cooldown admits: grpc 1.82 and later require
+    # protobuf>=7.35.1, while semgrep 1.177.0 (security group) pins opentelemetry ~=1.37.0, whose
+    # opentelemetry-proto caps protobuf below 7. One resolution holds both groups, so 1.81.1 is the
+    # newest line that resolves. Lift all three when semgrep's opentelemetry admits protobuf 7, then
+    # run `make proto` and commit the regenerated tree.
+    "grpcio==1.81.1",
+    "grpcio-health-checking==1.81.1",
     "httpx>=0.28.1",
     "kafka-python-ng>=2.2.3",
     "pydantic>=2.13.5",
@@ -55,6 +66,13 @@ base = [
 ]
 dev = [
     "debugpy>=1.8.17",
+    # The protoc `make proto` runs (it bundles libprotoc 33.5). Not a runtime dependency: services
+    # import the committed generated code and never generate, so prod never installs it (the dev
+    # image does, as it does everything in this group). Pinned exactly because its version is
+    # written into every generated file, so an unpinned generator would make CI's staleness check
+    # fail on a version bump rather than on a contract change (ADR tj-8konfu D1). Moves with the
+    # grpcio pins in base.
+    "grpcio-tools==1.81.1",
 ]
 testing = [
     "ruff>=0.14.1",
@@ -134,6 +152,10 @@ exclude = [
     ".vscode",
     "__pypackages__",
     "data/store/migrations/versions/*",
+    # Committed protoc output (ADR tj-8konfu D3), generated code like the revisions above:
+    # `make proto` writes it and CI fails when it is stale, so it is regenerated, never hand-edited
+    # or reformatted. The directory whole, its package __init__.py included.
+    "common/rpc/generated",
     # Bind-mounted container state, not source. The Postgres data directory inside is
     # root-owned and unreadable from this container, so a scan that walks it ERRORS
     # rather than skipping -- the reason this one is not merely tidiness.
@@ -148,7 +170,9 @@ force-exclude = true
 
 [tool.ruff.lint]
 # DTZ and ASYNC are permanent (tj-vhboky.30 item 3); PERF, RET, PIE and PTH are not, on purpose.
-select = ["E", "W", "F", "I", "B", "UP", "C4", "SIM", "RUF", "TID252", "TC", "D", "DTZ", "ASYNC"]
+# TID251 is banned-api: it does nothing without the flake8-tidy-imports.banned-api table below, and
+# that table does nothing without it (ADR tj-8konfu D3).
+select = ["E", "W", "F", "I", "B", "UP", "C4", "SIM", "RUF", "TID251", "TID252", "TC", "D", "DTZ", "ASYNC"]
 ignore = [
     "E501", # line length — the formatter owns it
     "E402", # module-level import not at top: FastAPI pattern (routers imported after app)
@@ -181,7 +205,17 @@ ignore = [
 # Pydantic reads annotations at runtime
 runtime-evaluated-base-classes = ["pydantic.BaseModel"]
 
+# THE gRPC SEAM (ADR tj-8konfu D3, re-homed by addendum A1): no module outside common/rpc/ imports a
+# generated symbol. Generated stubs are an implementation detail of common/rpc, and everything else
+# goes through the hand-written code there. One entry covers every module beneath the package: ruff
+# matches an import against the banned name and each of its parents, which is proven by a lint shown
+# failing on a deliberate violation in tj-3mk3u5.23's notes. common/rpc itself is exempted below.
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"common.rpc.generated".msg = "generated gRPC code is private to common/rpc; use the hand-written API there (ADR tj-8konfu D3)"
+
 [tool.ruff.lint.per-file-ignores]
+# The one package allowed to import generated gRPC code: the seam above.
+"common/rpc/**" = ["TID251"]
 # FastAPI evaluates handler annotations at runtime; B008 is the Depends() idiom
 "routers/**" = ["TC001", "TC002", "TC003", "B008"]
 # the tests build naive datetimes on purpose, to prove they are refused

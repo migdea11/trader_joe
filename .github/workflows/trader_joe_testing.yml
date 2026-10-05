@@ -118,6 +118,27 @@ jobs:
     - name: Install dependencies
       run: |
         uv sync --all-groups --no-group security --no-group agent-mcp --locked
+
+    # THE STALENESS CHECK (ADR tj-8konfu D3). common/rpc/generated/ is committed protoc output, and a
+    # committed copy can disagree with its source; this step is the control that makes committing it
+    # safe, not an extra. It regenerates through `make proto`, the target a developer runs, so the
+    # protoc invocation has one definition, and fails if the tree then differs from the commit in any
+    # way: a changed file, a deleted one (a .proto removed without its module) or an untracked one (a
+    # .proto added without its generated code). That is why it reads `git status` and not `git diff`,
+    # which ignores untracked files. It runs before the linters so a stale tree is reported as stale.
+    - name: Check Generated gRPC Code
+      run: |
+        set -eu
+        make proto
+        stale="$(git status --porcelain --untracked-files=all -- common/rpc/generated)"
+        if [ -n "${stale}" ]; then
+          echo "::error::common/rpc/generated/ does not match what make proto writes from proto/; run 'make proto' and commit the result"
+          printf '%s\n' "${stale}"
+          git --no-pager diff -- common/rpc/generated
+          exit 1
+        fi
+        echo "common/rpc/generated/ matches what make proto writes from proto/."
+
     - name: Run Ruff Linting
       run: |
         uv run ruff check .
