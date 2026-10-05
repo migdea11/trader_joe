@@ -8,14 +8,15 @@ Shared library imported by both services: the gRPC channel, server and client la
 
 ## Tech stack
 
-`grpc.aio` and protobuf (contracts in `proto/`, generated code committed under `gen/`), Postgres session factory, custom SQLAlchemy types, shared error vocabulary, env/logging/worker pool
+`grpc.aio` and protobuf (contracts in `proto/`, generated code built into `gen/` and never committed), Postgres session factory, custom SQLAlchemy types, shared error vocabulary, env/logging/worker pool
 
 ## Key invariants
 
 Changing anything here affects both services. The `.proto` files under `proto/` are the inter-service
-contract: they are the source of truth, the Python stubs under `gen/` are generated from them and
-committed, and a staleness check fails the build when the two disagree. Change the `.proto` and
-regenerate — never hand-edit anything under `gen/`.
+contract: they are the source of truth, and the Python stubs under `gen/` are generated from them
+by `make proto` and never committed — every target that needs them runs it first, so a fresh clone
+has no `gen/` until it builds. Change the `.proto`; never hand-edit anything under `gen/`, because
+the next `make test` overwrites it.
 
 ## Environment variables
 

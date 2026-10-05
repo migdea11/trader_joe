@@ -14,6 +14,15 @@
 # spelling, still ignored because old checkouts carry one.
 .venv_init
 
+# Generated code, one tree per language (user ruling 2026-10-05, reversing ADR tj-8konfu D3 and
+# decision tj-3mk3u5.42 F1; the addendum on tj-8konfu records the reversal). `make proto` writes
+# gen/proto/python/ from proto/, and every target that needs it -- the pytest targets, security and
+# the image builds -- runs that first, so a fresh clone never sees this directory until it builds.
+# BLANKET, with no un-ignore for the package marker: protoc does not emit
+# trader_joe/proto/__init__.py, so `make proto` writes it, which is the only reason a single
+# hand-committed file used to live under here.
+/gen/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

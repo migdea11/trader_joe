@@ -6326,15 +6326,23 @@ def test_the_import_time_print_finder_follows_what_runs_at_import(source: str, l
 # THE gRPC TOOLCHAIN (ADR tj-8konfu D1 and D3, re-homed by addendum A1; tj-3mk3u5.23; the layout of
 # decision tj-3mk3u5.42 F1, tj-3mk3u5.44)
 #
-# Committing protoc's output is safe only with the controls around it. Each one fails silently
-# when it goes, because nothing reports a check that no longer runs.
+# NOTHING UNDER gen/ IS COMMITTED (user ruling 2026-10-05, reversing D3 and F1's committed tree).
+# The controls that made committing it safe are therefore gone, and what replaces them is that the
+# tree is BUILT before anything reads it. Each control fails silently when it goes, because nothing
+# reports a check that no longer runs.
 #
-# * THE STALENESS STEP. CI's unit job regenerates gen/proto/ through `make proto` and fails on ANY
-#   difference from the commit: a changed, staged, deleted or untracked file, in any language's
-#   tree. D3 says that without it committing is strictly worse than generating at build time. It has
-#   to run before the linters and the suite. Its script is pinned by RUNNING it against a scratch
-#   repository with a stand-in `make`, because the property is what it detects. A `git diff` in
-#   place of the `git status` reads the same at a glance and misses every untracked and staged file.
+# * NOTHING UNDER gen/ IS TRACKED. The ruling itself, read from the index. A single file creeping
+#   back -- the package marker was the obvious candidate, since protoc does not emit it -- is how
+#   this quietly becomes "mostly generated".
+# * THE CODEGEN STEPS. What used to be one staleness step is now one `make proto` per job that
+#   needs the tree, each ahead of the step that needs it: the unit job before its linters and
+#   pytest, Image Build before `docker compose build` (the Dockerfile COPYs the tree out of the
+#   build context), System Testing before `make test-system` (the client bind-mounts it). A job
+#   that needs it and does not generate fails on a missing import or a missing COPY source, which
+#   is loud; a job that generates too late is the quiet one, so the ORDER is what is pinned.
+# * NO STEP REGENERATES AND COMPARES. The staleness check is gone, not weakened into something that
+#   looks like it still runs. With nothing committed there is nothing to compare against, so a step
+#   that read `git status` over gen/ could only ever be vacuously green.
 # * THE SEAM. Nothing outside common/rpc/ imports trader_joe.proto (ruff TID251). Pinned by asking
 #   ruff itself, over stdin, with the project's own configuration. That exercises the select entry,
 #   the banned-api table and the per-file-ignore together: remove any one of them, narrow the ban to
@@ -6343,13 +6351,14 @@ def test_the_import_time_print_finder_follows_what_runs_at_import(source: str, l
 #   pytest.ini's pythonpath, the image's ENV PYTHONPATH plus its COPY, and a bind mount beside every
 #   ./common mount. A missing piece is silent until a servicer that imports generated code is
 #   registered (data_ingest's registered_services() returns [] today), so each is pinned statically.
-# * THE PINS. The generator writes its version into every file it emits, so an unpinned
-#   grpcio-tools would fail the staleness step on a new release rather than on a contract change.
+# * THE PINS. The generator writes its version into every file it emits. That used to matter
+#   because an unpinned grpcio-tools would fail the staleness step on a new release rather than on
+#   a contract change; it survives the step for a better reason -- byte-reproducible output is what
+#   keeps the Docker layer cache from thrashing and a future client wheel deterministic.
 #
 # What `make proto` itself does -- the plain include root, no post-processing, the clearing, the
-# reserved-root guard, the PEP 420 namespace -- is pinned by running the real target on scratch trees,
-# in common/tests/test_make_proto.py. Deliberately NOT pinned anywhere in the suite: that `make proto`
-# reproduces the COMMITTED tree. That IS the staleness step, which D3 makes the control.
+# reserved-root guard, the package marker it writes, the PEP 420 namespace -- is pinned by running the
+# real target on scratch trees, in common/tests/test_make_proto.py.
 GENERATED_GRPC_TREE = PurePosixPath('gen/proto')
 GENERATED_GRPC_PACKAGE = GENERATED_GRPC_TREE / 'python' / 'trader_joe' / 'proto'
 GENERATED_GRPC_MODULE = GENERATED_GRPC_PACKAGE / 'ping' / 'v1' / 'ping_pb2.py'
@@ -6388,112 +6397,96 @@ def _proto_regeneration_steps() -> list[tuple[str, int, dict]]:
     return found
 
 
-def _staleness_step() -> dict:
-    steps = _proto_regeneration_steps()
-    assert len(steps) == 1, (
-        f'expected exactly one step in {TESTING_WORKFLOW.name} that runs `make proto`, found '
-        f'{[(job_id, step.get("name")) for job_id, _, step in steps]}'
-    )
-    return steps[0][2]
+def _builds_service_images(step: dict) -> bool:
+    """True when a step builds images from the compose files, which COPY the generated tree."""
+    return any(subcommand[:1] == ['build'] for line in _step_lines(step) for _, subcommand in _compose_calls(line))
+
+
+def _runs_the_system_suite(step: dict) -> bool:
+    return any(_runs_make_target(command, 'test-system') for command in _step_commands(step))
+
+
+def _generated_tree_consumers(steps: list[dict]) -> list[int]:
+    """Indices of the steps in one job that cannot run before gen/proto/python has been written.
+
+    Derived, never listed: a new job that lints, tests, builds an image or runs the system suite is
+    caught by this without anyone remembering to add it here.
+    """
+    return [
+        index
+        for index, step in enumerate(steps)
+        if _runs_the_suite(step) or _runs_a_linter(step) or _builds_service_images(step) or _runs_the_system_suite(step)
+    ]
 
 
 @pytest.mark.build_infra
-def test_ci_checks_the_generated_grpc_tree_before_it_lints_or_tests():
-    """D3: the staleness step exists, in the job that runs the suite, ahead of the linters and pytest.
+def test_nothing_under_the_generated_tree_is_committed():
+    """The 2026-10-05 ruling, read from the index -- "I don't want generated files on main".
 
-    Ahead, so a stale tree is reported as stale rather than as whatever lint or import error it
-    happens to cause first.
+    The package marker is the file to watch. protoc does not emit it, so before the ruling it was
+    the one hand-committed file under gen/; `make proto` writes it now, and a commit putting it back
+    would leave a generated-code path on main while every other file stayed ignored.
     """
-    _staleness_step()
-    ((job_id, index, _),) = _proto_regeneration_steps()
-    steps = _load_yaml(TESTING_WORKFLOW)['jobs'][job_id]['steps']
-    gated = [later for later, step in enumerate(steps) if _runs_the_suite(step) or _runs_a_linter(step)]
-    assert any(_runs_the_suite(step) for step in steps), (
-        f'the `make proto` step is in {job_id}, which does not run the unit suite'
+    tracked = _run('git', 'ls-files', '--', f'{GENERATED_GRPC_TREE}')
+    assert not tracked, f'{GENERATED_GRPC_TREE}/ is generated and must not be committed; git tracks {tracked}'
+    assert (REPO_ROOT / GENERATED_GRPC_PACKAGE).is_dir(), (
+        f'{GENERATED_GRPC_PACKAGE} does not exist on disk either, so this test cannot tell "generated, '
+        f'not committed" from "nobody generates it"; `make proto` writes it'
     )
-    assert any(_runs_a_linter(step) for step in steps), (
-        f'no step in {job_id} lints, so the ordering below would judge pytest alone'
-    )
-    assert gated and min(gated) > index, (
-        f'in {job_id}, the `make proto` step is step {index}, but a linter or pytest runs at steps {gated}; '
-        f'it has to come first'
-    )
-
-
-_STALENESS_CASES = {
-    'regeneration is a no-op': ('', 0),
-    'a generated module changed': (f"printf '# drift\\n' >> {GENERATED_GRPC_MODULE}", 1),
-    # A hand edit that reached the index: `git diff` alone (unstaged changes only) would pass it.
-    'a generated module changed and staged': (
-        f"printf '# hand edit\\n' >> {GENERATED_GRPC_MODULE} && git add {GENERATED_GRPC_MODULE}",
-        1,
-    ),
-    'a generated module deleted': (f'rm {GENERATED_GRPC_MODULE}', 1),
-    'a generated module untracked': (
-        f'mkdir -p {GENERATED_GRPC_PACKAGE}/probe/v1 && '
-        f"printf 'x = 1\\n' > {GENERATED_GRPC_PACKAGE}/probe/v1/probe_pb2.py",
-        1,
-    ),
-    # The step judges gen/proto/, every language's tree (F1 rule 1), not only the Python one.
-    "another language's tree drifted": (
-        f"mkdir -p {GENERATED_GRPC_TREE}/ts && printf 'export {{}};\\n' > {GENERATED_GRPC_TREE}/ts/probe_pb.ts",
-        1,
-    ),
-    'a change outside the generated tree': ("printf 'drift\\n' >> README.md", 0),
-}
 
 
 @pytest.mark.build_infra
-@pytest.mark.parametrize(('regeneration', 'status'), _STALENESS_CASES.values(), ids=_STALENESS_CASES.keys())
-def test_the_staleness_step_fails_on_any_drift_in_the_generated_tree(tmp_path: Path, regeneration: str, status: int):
-    """D3: the step's own script, run where `make proto` leaves the generated tree in each possible state.
+def test_every_ci_job_that_needs_the_generated_tree_generates_it_first():
+    """Nothing under gen/ is committed, so each job that reads it has to write it, before it reads it.
 
-    The stand-in `make` records its arguments and applies the case's change, so the step is shown to
-    regenerate through `make proto` and to judge what that leaves. Run under the shell GitHub uses for
-    a `run:` with no `shell:`. git is configured from nothing, so the runner's config cannot leak in.
+    Both halves matter and neither is a step name: the set of generating jobs must EQUAL the set of
+    jobs with a consumer (a job that needs the tree and never generates, or generates without
+    needing to, is a finding either way), and within each job the `make proto` has to come first.
+    A job that generates too late is the quiet failure -- it fails on a missing import or a missing
+    COPY source, which reads like a broken repository rather than a misordered workflow.
     """
-    script = _staleness_step().get('run') or ''
-    assert '${{' not in script, 'the step now uses a workflow expression, which this test cannot evaluate'
-
-    repo = tmp_path / 'repo'
-    (repo / GENERATED_GRPC_MODULE).parent.mkdir(parents=True)
-    (repo / GENERATED_GRPC_PACKAGE / '__init__.py').write_text('# guard\n', encoding='utf-8')
-    (repo / GENERATED_GRPC_MODULE).write_text('DESCRIPTOR = None\n', encoding='utf-8')
-    (repo / 'README.md').write_text('readme\n', encoding='utf-8')
-    env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
-    env |= {
-        'GIT_CONFIG_NOSYSTEM': '1',
-        'GIT_CONFIG_GLOBAL': os.devnull,
-        'GIT_AUTHOR_NAME': 'validator',
-        'GIT_AUTHOR_EMAIL': 'validator@example.invalid',
-        'GIT_COMMITTER_NAME': 'validator',
-        'GIT_COMMITTER_EMAIL': 'validator@example.invalid',
+    jobs = (_load_yaml(TESTING_WORKFLOW) or {}).get('jobs') or {}
+    generating: dict[str, list[int]] = {}
+    for job_id, index, _ in _proto_regeneration_steps():
+        generating.setdefault(job_id, []).append(index)
+    needing = {
+        job_id: ((job or {}).get('steps') or [], _generated_tree_consumers((job or {}).get('steps') or []))
+        for job_id, job in jobs.items()
+        if _generated_tree_consumers((job or {}).get('steps') or [])
     }
-    for command in (['git', 'init', '-q'], ['git', 'add', '-A'], ['git', 'commit', '-q', '-m', 'generated tree']):
-        subprocess.run(command, cwd=repo, env=env, check=True, capture_output=True)
-
-    bin_dir = tmp_path / 'bin'
-    bin_dir.mkdir()
-    make_log = tmp_path / 'make.args'
-    fake_make = bin_dir / 'make'
-    fake_make.write_text(
-        f'#!/usr/bin/env bash\nset -eu\nprintf "%s\\n" "$*" >> {shlex.quote(str(make_log))}\n{regeneration}\n',
-        encoding='utf-8',
+    assert needing, f'no job in {TESTING_WORKFLOW.name} reads the generated tree, so this test judges nothing'
+    assert set(needing) == set(generating), (
+        f'jobs that need the generated tree: {sorted(needing)}; jobs that run `make proto`: {sorted(generating)}'
     )
-    fake_make.chmod(0o755)
-    step_script = tmp_path / 'step.sh'
-    step_script.write_text(script, encoding='utf-8')
-    env['PATH'] = f'{bin_dir}{os.pathsep}{env.get("PATH", "")}'
+    for job_id, (steps, consumers) in needing.items():
+        indices = generating[job_id]
+        assert len(indices) == 1, f'{job_id} runs `make proto` at steps {indices}; one step, once'
+        assert indices[0] < min(consumers), (
+            f'in {job_id}, `make proto` is step {indices[0]} but step {min(consumers)} '
+            f'({steps[min(consumers)].get("name")}) already needs the tree'
+        )
 
-    result = subprocess.run(
-        ['bash', '--noprofile', '--norc', '-e', str(step_script)], cwd=repo, env=env, capture_output=True, text=True
-    )
 
-    assert make_log.read_text(encoding='utf-8').splitlines() == ['proto'], 'the step must regenerate via `make proto`'
-    assert result.returncode == status, (
-        f'the staleness step exited {result.returncode}, expected {status}.\n'
-        f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}'
-    )
+@pytest.mark.build_infra
+def test_no_ci_step_regenerates_the_tree_and_compares_it_against_the_commit():
+    """The staleness check is GONE, not weakened into a step that still looks like a control.
+
+    It regenerated through `make proto` and failed on any difference from the commit, and the
+    workflow called it the control that made committing the output safe. With nothing committed
+    there is nothing to go stale, so such a step could only ever be vacuously green -- which is the
+    exact shape of hollow guard this file exists to catch. A codegen step runs `make proto` and
+    nothing else.
+    """
+    for job_id, index, step in _proto_regeneration_steps():
+        script = step.get('run') or ''
+        where = f'{job_id} step {index} ({step.get("name")})'
+        assert GENERATED_GRPC_TREE.as_posix() not in script, (
+            f'{where} names {GENERATED_GRPC_TREE} in its script; a codegen step runs `make proto` and '
+            f'reads nothing back -- there is no committed tree to compare it against'
+        )
+        assert _step_commands(step) == [['make', 'proto']], (
+            f'{where} does more than `make proto`: {_step_commands(step)}'
+        )
 
 
 # ---------------------------------------------------------------------------------------
@@ -6728,8 +6721,10 @@ def test_no_hand_written_module_shares_the_generated_namespace_yet():
         for path in tracked
         if 'trader_joe' in PurePosixPath(path).parts and not path.startswith(f'{GENERATED_GRPC_TREE}/')
     )
-    assert any(path.startswith(f'{GENERATED_GRPC_PACKAGE}/') for path in tracked), (
-        f'git tracks nothing under {GENERATED_GRPC_PACKAGE}, so this check reads the wrong tree'
+    # The generated tree is not in the index any more (the 2026-10-05 ruling), so the guard that
+    # proves this check is looking at the right namespace reads the disk, where `make proto` wrote it.
+    assert list((REPO_ROOT / GENERATED_GRPC_PACKAGE).rglob('*_pb2.py')), (
+        f'nothing generated exists under {GENERATED_GRPC_PACKAGE}, so this check reads the wrong tree'
     )
     assert not in_namespace, (
         f'hand-written modules now share the trader_joe namespace with the generated trader_joe.proto: '

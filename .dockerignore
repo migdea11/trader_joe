@@ -53,7 +53,10 @@ server/schemas/tests/
 # that is the whole cost: web/ grows node_modules and client/ grows build artefacts and a .venv.
 # Nothing in a service image reads any of the three. proto/ is the hand-written contract source;
 # what the image needs is protoc's OUTPUT, and it gets exactly that from one COPY of
-# ./gen/proto/python (Dockerfile), which is deliberately NOT excluded here.
+# ./gen/proto/python (Dockerfile), which is deliberately NOT excluded here. That tree is generated
+# and never committed, so the build targets run `make proto` on the host first -- the Dockerfile is
+# unchanged by that, and generating in-image would put grpcio-tools in the prod image (the Makefile's
+# proto block has the measurement).
 web/
 client/
 proto/
