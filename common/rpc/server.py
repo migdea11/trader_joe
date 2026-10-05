@@ -53,7 +53,7 @@ class ServiceRegistration:
     Everything outside it receives a ready-made registration.
 
     Attributes:
-        name: The fully qualified service name, e.g. 'trader_joe.ping.v1.PingService'. The health
+        name: The fully qualified service name, e.g. 'trader_joe.proto.ping.v1.PingService'. The health
             service reports this service under that name.
         add_to_server: Attaches the servicer: the generated add_*_to_server function with the servicer
             already bound to it.

@@ -47,6 +47,10 @@ WORKTREE_FILES = {
     'common/.env.default': 'COMMITTED_TEMPLATE=1\n',
     'routers/__init__.py': '',
     'schemas/__init__.py': '',
+    # The committed generated gRPC tree the Dockerfile COPYs and compose mounts (decision tj-3mk3u5.42
+    # F1). trader_joe/ itself has no __init__.py, as in the real tree: it is a PEP 420 namespace.
+    'gen/proto/python/trader_joe/proto/__init__.py': '# guard\n',
+    'gen/proto/python/trader_joe/proto/ping/v1/ping_pb2.py': 'DESCRIPTOR = None\n',
     'data/store/app/main.py': 'APP = "store"\n',
     'data/ingest/app/main.py': 'APP = "ingest"\n',
     'data/store/alembic.ini': '[alembic]\n',

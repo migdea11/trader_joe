@@ -26,6 +26,7 @@ import pytest
 from common.rpc.channel import create_channel
 from common.rpc.ping import ping, ping_service
 from common.rpc.server import BindAddress, GrpcServerHost
+from common.tests.image_path import image_pythonpath
 
 
 pytestmark = pytest.mark.common
@@ -126,6 +127,9 @@ def test_the_service_logging_setup_drops_grpc_debug_and_keeps_its_own_debug_and_
     """
     own_debug, grpc_warning = 'service debug still logs', 'GOAWAY received: too_many_pings'
     env = {name: value for name, value in os.environ.items() if name != 'PYTEST_ADDOPTS'}
+    # The image's path model: common.rpc.ping imports trader_joe.proto, which a fresh interpreter
+    # finds only on the image's second PYTHONPATH entry (decision tj-3mk3u5.42 F1).
+    env['PYTHONPATH'] = image_pythonpath(REPO_ROOT)
     result = subprocess.run(
         [sys.executable, '-c', _SERVICE_PROBE, own_debug, grpc_warning, CYGRPC],
         cwd=REPO_ROOT,

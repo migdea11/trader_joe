@@ -12,7 +12,7 @@ migrated, read or written: the only statements sent to it are CREATE DATABASE an
 which act on the server, not on that database.
 
 HOW ALEMBIC RUNS. As a subprocess, the way an operator runs it: `python -m alembic`, cwd
-data/store, PYTHONPATH the repository root, DATABASE_URI pointed at the scratch database. env.py
+data/store, PYTHONPATH the image's (the repository root, then gen/proto/python), DATABASE_URI pointed at the scratch database. env.py
 calls load_dotenv('.env'); python-dotenv's load_dotenv defaults to override=False, so it never
 replaces a variable that is already set -- the DATABASE_URI given here wins over any data/store/.env
 (checked: dotenv.main.load_dotenv(..., override: bool = False, ...), python-dotenv >= 1.2.3 as
@@ -82,6 +82,7 @@ import sqlalchemy as sa
 from alembic.script import ScriptDirectory
 from sqlalchemy.engine import URL, Engine
 
+from common.tests.image_path import image_pythonpath
 from data.store.seeds.scenario import is_synthetic
 
 
@@ -227,7 +228,8 @@ class ScratchDb:
         """Run `python -m alembic -c <ini> <args>` against this database; return its exit and output."""
         env = dict(os.environ)
         env['DATABASE_URI'] = self.url.render_as_string(hide_password=False)
-        env['PYTHONPATH'] = str(REPO_ROOT)
+        # The image's path model (decision tj-3mk3u5.42 F1): the root, then the generated gRPC code's.
+        env['PYTHONPATH'] = image_pythonpath(REPO_ROOT)
         argv = [sys.executable, '-m', 'alembic', '-c', str(self._ini_path), *args]
         done = subprocess.run(  # nosec B603 -- fixed argv, no shell
             argv, cwd=STORE_DIR, env=env, capture_output=True, text=True, timeout=ALEMBIC_TIMEOUT_SECONDS, check=False

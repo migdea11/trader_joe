@@ -112,8 +112,9 @@ WAIT_TIMEOUT_SECONDS = 300
 # THE SNAPSHOT (ADR tj-4rr0la addendum 5, ruling 1): what refresh_snapshot() copies from a worktree
 # into <stack dir>/SOURCE_DIR_NAME, the compose project directory of every verb. EXACTLY the trusted
 # Dockerfile's COPY sources from the build context (pyproject.toml, uv.lock, entrypoint.sh, common,
-# routers, schemas and ${SERVICE_PATH}/${SERVICE_NAME}/app for data_store and data_ingest) plus the
-# trusted compose files' relative bind sources (common, routers, schemas, data/store/app,
+# routers, schemas, gen/proto/python -- the committed generated gRPC code, decision tj-3mk3u5.42 F1 --
+# and ${SERVICE_PATH}/${SERVICE_NAME}/app for data_store and data_ingest) plus the trusted compose
+# files' relative bind sources (common, gen/proto/python, routers, schemas, data/store/app,
 # data/store/alembic.ini, data/store/migrations, tests/system, pytest.ini; tests/fakes, the
 # fake-mode overlay's read-only mount, tj-vhboky.61; and test_client's read-only mounts of the seed
 # producer's import closure, data/store/seeds, data/ingest/app and tests/fakes, ADR tj-4rr0la
@@ -129,6 +130,7 @@ SNAPSHOT_SOURCES = (
     'common',
     'routers',
     'schemas',
+    'gen/proto/python',
     'data/store/app',
     'data/ingest/app',
     'data/store/alembic.ini',

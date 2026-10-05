@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from common.tests.image_path import image_pythonpath
+
 
 # The guard this file exists for (tj-8yix3i): twice now a module-scope dependency -- first the
 # Alpaca client, then the Kafka producer -- made `import data.ingest.app.main` raise, and the
@@ -63,12 +65,13 @@ def probe_env() -> dict[str, str]:
 
     Not os.environ with entries removed: a wholesale replacement cannot be made vacuous later
     by a variable nobody thought to name here. PYTHONPATH is what puts the repo on the path,
-    since the child inherits nothing.
+    since the child inherits nothing: the image's two entries, the root and the generated gRPC
+    code's root (common/tests/image_path.py, decision tj-3mk3u5.42 F1), as uvicorn gets them.
 
     Returns:
         dict[str, str]: Every variable the probe process will see.
     """
-    return {'PYTHONPATH': str(REPO_ROOT)}
+    return {'PYTHONPATH': image_pythonpath(REPO_ROOT)}
 
 
 @pytest.fixture(scope='module')

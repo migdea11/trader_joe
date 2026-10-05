@@ -84,8 +84,9 @@ class AlpacaRead:
                 Alpaca cannot serve, FEED_NOT_AVAILABLE for a feed this deployment cannot,
                 RANGE_IN_FUTURE for a start at or after the clock, VENDOR_AUTH for a missing
                 credential or a 401 or 403, VENDOR_INVALID_REQUEST for a 400, VENDOR_REJECTED for
-                another 4xx, VENDOR_RATE_LIMITED for a 429, VENDOR_UNAVAILABLE for a 5xx or a
-                connection error or timeout, and RATE_BUDGET for the rate budget's own refusal.
+                another 4xx, VENDOR_RATE_LIMITED for a 429, VENDOR_UNAVAILABLE for a 5xx, a
+                connection error or timeout, or a connection cut while the body was read, and
+                RATE_BUDGET for the rate budget's own refusal.
 
         Raises:
             ValueError: If a bar within [start, end) carries a non-whole trade_count (a fraction,

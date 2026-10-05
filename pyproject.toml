@@ -152,10 +152,11 @@ exclude = [
     ".vscode",
     "__pypackages__",
     "data/store/migrations/versions/*",
-    # Committed protoc output (ADR tj-8konfu D3), generated code like the revisions above:
-    # `make proto` writes it and CI fails when it is stale, so it is regenerated, never hand-edited
-    # or reformatted. The directory whole, its package __init__.py included.
-    "common/rpc/generated",
+    # Committed protoc output (ADR tj-8konfu D3; decision tj-3mk3u5.42 F1), generated code like the
+    # revisions above: `make proto` writes gen/proto/python and CI fails when it is stale, so it is
+    # regenerated, never hand-edited or reformatted. Every language's tree whole, the hand-committed
+    # trader_joe/proto/__init__.py included.
+    "gen/proto",
     # Bind-mounted container state, not source. The Postgres data directory inside is
     # root-owned and unreadable from this container, so a scan that walks it ERRORS
     # rather than skipping -- the reason this one is not merely tidiness.
@@ -205,13 +206,15 @@ ignore = [
 # Pydantic reads annotations at runtime
 runtime-evaluated-base-classes = ["pydantic.BaseModel"]
 
-# THE gRPC SEAM (ADR tj-8konfu D3, re-homed by addendum A1): no module outside common/rpc/ imports a
-# generated symbol. Generated stubs are an implementation detail of common/rpc, and everything else
-# goes through the hand-written code there. One entry covers every module beneath the package: ruff
-# matches an import against the banned name and each of its parents, which is proven by a lint shown
-# failing on a deliberate violation in tj-3mk3u5.23's notes. common/rpc itself is exempted below.
+# THE gRPC SEAM (ADR tj-8konfu D3, re-homed by addendum A1; decision tj-3mk3u5.42 F1): no module
+# outside common/rpc/ imports a generated symbol. The generated package is trader_joe.proto, from
+# gen/proto/python, which configuration puts on the import path; its stubs are an implementation
+# detail of common/rpc, and everything else goes through the hand-written code there. One entry covers
+# every contract beneath trader_joe.proto: ruff matches an import against the banned name and each of
+# its parents, which is proven by a lint shown failing on a deliberate violation in tj-3mk3u5.23's
+# notes. common/rpc itself is exempted below.
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
-"common.rpc.generated".msg = "generated gRPC code is private to common/rpc; use the hand-written API there (ADR tj-8konfu D3)"
+"trader_joe.proto".msg = "generated gRPC code (trader_joe.proto) is private to common/rpc; use the hand-written API there (ADR tj-8konfu D3)"
 
 [tool.ruff.lint.per-file-ignores]
 # The one package allowed to import generated gRPC code: the seam above.
@@ -228,8 +231,9 @@ runtime-evaluated-base-classes = ["pydantic.BaseModel"]
 lines-after-imports = 2
 # matches format.skip-magic-trailing-comma
 split-on-trailing-comma = false
-# becomes ["trader_joe"] after Phase 1
-known-first-party = ["common", "data", "routers", "schemas"]
+# becomes ["trader_joe"] after Phase 1. trader_joe is first-party already: the generated
+# trader_joe.proto (gen/proto/python) is this repository's own code.
+known-first-party = ["common", "data", "routers", "schemas", "trader_joe"]
 section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
 
 [tool.ruff.lint.pydocstyle]

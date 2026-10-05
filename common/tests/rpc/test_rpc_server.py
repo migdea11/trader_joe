@@ -2,8 +2,9 @@
 
 ADR tj-8konfu D2 (grpc.aio), D6.5 (the standard grpc.health.v1 service) and the bind discipline
 from tj-r6vcgv addendum 1 A5 and tj-glqs4r: never a wildcard address, host and port from the
-environment. Nothing here imports common.rpc.generated, which TID251 bans outside common/rpc (D3):
-Ping is reached through common.rpc.ping, and health through grpcio-health-checking's own stubs.
+environment. Nothing here imports the generated package trader_joe.proto, which TID251 bans outside
+common/rpc (D3; decision tj-3mk3u5.42 F1): Ping is reached through common.rpc.ping, and health through
+grpcio-health-checking's own stubs.
 
 Every server binds 127.0.0.1 on an ephemeral port, and every network await is bounded by GUARD_S, so
 a regression fails a test instead of hanging the suite.
@@ -61,9 +62,10 @@ async def test_health_reports_the_server_and_each_attached_service_serving():
     """D6.5: the standard health service answers for the server ('') and by fully qualified service name.
 
     The name is the versioned proto package's (proto/README.md), which is what a probe will ask for.
+    Every package sits under the reserved trader_joe.proto root (decision tj-3mk3u5.42 F1 rule 4).
     An unregistered name is NOT_FOUND, so a SERVING answer is not just the default for any question.
     """
-    assert SERVICE_NAME == 'trader_joe.ping.v1.PingService'
+    assert SERVICE_NAME == 'trader_joe.proto.ping.v1.PingService'
     async with _loopback_host() as host:
         channel = create_channel(f'{LOOPBACK}:{host.port}')
         try:
@@ -71,7 +73,7 @@ async def test_health_reports_the_server_and_each_attached_service_serving():
             assert await _status(stub, '') == SERVING
             assert await _status(stub, SERVICE_NAME) == SERVING
             with pytest.raises(grpc.aio.AioRpcError) as raised:
-                await _status(stub, 'trader_joe.absent.v1.AbsentService')
+                await _status(stub, 'trader_joe.proto.absent.v1.AbsentService')
             assert raised.value.code() == grpc.StatusCode.NOT_FOUND
         finally:
             await channel.close()

@@ -17,6 +17,13 @@ such.
 
 The reader's path through the real SDK (retries, the transport, a BarsFailure out of get_bars) is
 the recorded-Alpaca suite's (TE-5); this file pins the classifier's own table.
+
+THE TRANSPORT FAILURES (TE-4 follow-up tj-3mk3u5.37.14). A connection cut while the body is read
+(requests' ChunkedEncodingError) is VENDOR_UNAVAILABLE, built exactly as a connection error is. Every
+other RequestException that requests defines stays unclassified, a bug (D5). The table below names
+every one of them, and a guard fails when requests adds a class nobody has ruled on. The reader
+catches exactly what this classifier converts, class by class, so the two cannot drift apart. The cut
+on a real socket, through alpaca-py's own session, is in test_alpaca_cut_connection.py.
 """
 
 import json
@@ -410,9 +417,10 @@ def test_the_rate_limit_error_derives_retry_after_from_the_readers_clock():
         pytest.param(requests.exceptions.ConnectTimeout(f'connect {RAW_BODY_MARKER}'), id='connect-timeout'),
         pytest.param(requests.exceptions.ReadTimeout(f'read {RAW_BODY_MARKER}'), id='read-timeout'),
         pytest.param(requests.exceptions.SSLError(f'tls {RAW_BODY_MARKER}'), id='ssl-error'),
+        pytest.param(requests.exceptions.ChunkedEncodingError(f'cut {RAW_BODY_MARKER}'), id='cut-mid-body'),
     ],
 )
-def test_a_connection_error_or_timeout_is_vendor_unavailable_with_its_cause(failure):
+def test_a_connection_error_timeout_or_cut_body_is_vendor_unavailable_with_its_cause(failure):
     classified = classify(failure)
 
     assert type(classified) is ExogenousError
@@ -420,6 +428,123 @@ def test_a_connection_error_or_timeout_is_vendor_unavailable_with_its_cause(fail
     assert classified.__cause__ is failure
     assert RAW_BODY_MARKER not in classified.detail
     assert classified.reset_at is None
+
+
+def test_a_cut_body_is_classified_exactly_as_a_connection_error_is():
+    """tj-3mk3u5.37.14: the same branch, sentence, metadata and outcome; only the cause is its own."""
+    connection = requests.exceptions.ConnectionError('refused')
+    cut = requests.exceptions.ChunkedEncodingError(
+        "('Connection broken: IncompleteRead(10 bytes read, 990 more expected)', ...)"
+    )
+
+    as_connection, as_cut = classify(connection), classify(cut)
+
+    assert type(as_cut) is type(as_connection) is ExogenousError
+    assert as_cut.reason is as_connection.reason is Reason.VENDOR_UNAVAILABLE
+    assert as_cut.detail == as_connection.detail
+    assert dict(as_cut.metadata) == dict(as_connection.metadata) == {'vendor': 'ALPACA'}
+    assert (as_cut.reset_at, as_cut.retry_after) == (as_connection.reset_at, as_connection.retry_after) == (None, None)
+    assert as_cut.__cause__ is cut
+    assert as_connection.__cause__ is connection
+    assert 'IncompleteRead' not in as_cut.detail
+
+
+# ---------------------------------------------------------------------------------------------
+# Every RequestException requests defines: transport, or a bug (tj-3mk3u5.37.14; D5, D6)
+# ---------------------------------------------------------------------------------------------
+
+# The HTTP session raising one of these means the vendor could not be reached, did not answer in time,
+# or cut the connection while its body was read: VENDOR_UNAVAILABLE (TE-4 item 4).
+TRANSPORT = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.ProxyError,
+    requests.exceptions.SSLError,
+    requests.exceptions.Timeout,
+    requests.exceptions.ConnectTimeout,
+    requests.exceptions.ReadTimeout,
+    requests.exceptions.ChunkedEncodingError,
+)
+
+# Everything else is a bug and is never classified (D5): a malformed URL, schema or header, a redirect
+# loop (alpaca-py sends allow_redirects=False), an undecodable or non-JSON body, a consumed stream, a
+# retry policy nobody configured, and an HTTPError, which alpaca-py always wraps in APIError.
+NOT_TRANSPORT = (
+    requests.exceptions.RequestException,
+    requests.exceptions.HTTPError,
+    requests.exceptions.InvalidJSONError,
+    requests.exceptions.JSONDecodeError,
+    requests.exceptions.URLRequired,
+    requests.exceptions.TooManyRedirects,
+    requests.exceptions.MissingSchema,
+    requests.exceptions.InvalidSchema,
+    requests.exceptions.InvalidURL,
+    requests.exceptions.InvalidProxyURL,
+    requests.exceptions.InvalidHeader,
+    requests.exceptions.ContentDecodingError,
+    requests.exceptions.StreamConsumedError,
+    requests.exceptions.RetryError,
+    requests.exceptions.UnrewindableBodyError,
+)
+
+
+def requests_failure(cls: type[requests.exceptions.RequestException]) -> requests.exceptions.RequestException:
+    """An instance of one of requests' exceptions, carrying the raw-body marker in its text."""
+    if issubclass(cls, requests.exceptions.JSONDecodeError):
+        # json.JSONDecodeError's constructor: (msg, doc, pos).
+        return cls(f'Expecting value {RAW_BODY_MARKER}', RAW_BODY_MARKER, 0)
+    return cls(f'{cls.__name__} {RAW_BODY_MARKER}')
+
+
+def test_the_table_names_every_request_exception_requests_defines_once():
+    """A requests upgrade that adds a class fails here until someone rules which side it is on."""
+    defined = {
+        value
+        for value in vars(requests.exceptions).values()
+        if isinstance(value, type) and issubclass(value, requests.exceptions.RequestException)
+    }
+
+    assert not set(TRANSPORT) & set(NOT_TRANSPORT)
+    assert len(set(TRANSPORT)) == len(TRANSPORT) and len(set(NOT_TRANSPORT)) == len(NOT_TRANSPORT)
+    assert set(TRANSPORT) | set(NOT_TRANSPORT) == defined
+
+
+@pytest.mark.parametrize('cls', [pytest.param(cls, id=cls.__name__) for cls in TRANSPORT])
+def test_every_transport_failure_is_vendor_unavailable(cls):
+    failure = requests_failure(cls)
+
+    classified = classify(failure)
+
+    assert type(classified) is ExogenousError
+    assert classified.reason is Reason.VENDOR_UNAVAILABLE
+    assert classified.__cause__ is failure
+    assert RAW_BODY_MARKER not in classified.detail
+
+
+@pytest.mark.parametrize('cls', [pytest.param(cls, id=cls.__name__) for cls in NOT_TRANSPORT])
+def test_no_other_request_exception_is_classified(cls):
+    """'Never catch RequestException wholesale' (D6): these stay bugs, re-raised by the reader (D5)."""
+    failure = requests_failure(cls)
+
+    assert classify(failure) is None
+    assert failure.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    'failure',
+    [pytest.param(requests_failure(cls), id=cls.__name__) for cls in (*TRANSPORT, *NOT_TRANSPORT)]
+    + [
+        pytest.param(api_error(503, {'message': 'down'}), id='APIError-with-status'),
+        pytest.param(ValueError('a bug'), id='ValueError'),
+    ],
+)
+def test_the_reader_catches_exactly_what_the_classifier_converts(failure):
+    """VENDOR_FAILURES and the classifier share one list (tj-3mk3u5.37.14), so they cannot drift.
+
+    Caught but unclassified would re-raise from inside the reader's except. Classified but never caught
+    would escape the reader as a bug. Either way the pair would disagree, so they are checked class by
+    class.
+    """
+    assert isinstance(failure, VENDOR_FAILURES) == (classify(failure) is not None)
 
 
 @pytest.mark.parametrize(
@@ -447,5 +572,11 @@ def test_an_api_error_with_no_http_status_is_not_classified():
 
 
 def test_vendor_failures_names_exactly_what_the_reader_converts():
-    # The reader catches exactly this tuple around the vendor call (never a broad except, D6).
-    assert (APIError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) == VENDOR_FAILURES
+    # The reader catches exactly this tuple around the vendor call (never a broad except, D6): the SDK's
+    # error status, then the transport failures, the cut body included (tj-3mk3u5.37.14).
+    assert (
+        APIError,
+        requests.exceptions.ConnectionError,
+        requests.exceptions.Timeout,
+        requests.exceptions.ChunkedEncodingError,
+    ) == VENDOR_FAILURES

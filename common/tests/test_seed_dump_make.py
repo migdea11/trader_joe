@@ -75,6 +75,10 @@ PRODUCER_CLOSURE_MOUNTS = {
 # tj-7294qb: the repository's alembic ini, a FILE, beside the migrations mount as data_store lays them
 # out, so tests/system/test_migration_with_data.py runs the alembic CLI from cwd data/store with it.
 ALEMBIC_INI_MOUNTS = {('./data/store/alembic.ini', '/code/data/store/alembic.ini')}
+# Decision tj-3mk3u5.42 F1: the committed generated gRPC code, beside ./common because common/rpc imports
+# it, and test_client's PYTHONPATH names it. The producer's closure includes data/ingest/app, which
+# reaches it once a servicer that imports generated code is registered there.
+GENERATED_CODE_MOUNTS = {('./gen/proto/python', '/code/gen/proto/python')}
 
 DOCKER_STUB = """#!/bin/sh
 printf '%s\\n' "$*" >> "$STUB_LOG"
@@ -110,13 +114,14 @@ def _client_mounts() -> list[dict]:
 
 
 def test_test_client_mounts_are_exactly_the_old_set_plus_the_producers_closure_all_read_only():
-    """V6 / item 1, plus tj-7294qb's ini: the new mounts, nothing else; all :ro; never the root or an env path."""
+    """V6 / item 1, plus tj-7294qb's ini and tj-3mk3u5.44's generated tree: nothing else; all :ro; never the root."""
     mounts = _client_mounts()
     assert all(mount['type'] == 'bind' and mount['read_only'] for mount in mounts), mounts
     pairs = [(mount['source'], mount['target']) for mount in mounts]
     assert len(pairs) == len(set(pairs)), pairs
-    assert set(pairs) == CLIENT_MOUNTS_BEFORE | PRODUCER_CLOSURE_MOUNTS | ALEMBIC_INI_MOUNTS, sorted(pairs)
-    for source, _ in PRODUCER_CLOSURE_MOUNTS:
+    expected = CLIENT_MOUNTS_BEFORE | PRODUCER_CLOSURE_MOUNTS | ALEMBIC_INI_MOUNTS | GENERATED_CODE_MOUNTS
+    assert set(pairs) == expected, sorted(pairs)
+    for source, _ in PRODUCER_CLOSURE_MOUNTS | GENERATED_CODE_MOUNTS:
         assert (REPO_ROOT / source).is_dir(), f'the mount source {source} does not exist'
     for source, _ in ALEMBIC_INI_MOUNTS:
         assert (REPO_ROOT / source).is_file(), f'the mount source {source} is not a file'

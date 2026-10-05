@@ -47,6 +47,7 @@ from fastapi import FastAPI
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from common.errors.vocabulary import REASONS, ExogenousError, InvalidRequestError, Outcome, Reason, TraderJoeError
+from common.tests.image_path import image_pythonpath
 from data.ingest.app import app_depends, ingest_control
 from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
 from data.ingest.app.brokers.interface import (
@@ -323,7 +324,7 @@ def test_the_generator_serves_well_formed_bars_the_same_in_a_fresh_interpreter()
     result = subprocess.run(
         [sys.executable, '-c', probe],
         cwd=REPO_ROOT,
-        env={'PYTHONPATH': str(REPO_ROOT), 'PYTHONHASHSEED': '12345'},
+        env={'PYTHONPATH': image_pythonpath(REPO_ROOT), 'PYTHONHASHSEED': '12345'},
         capture_output=True,
         text=True,
         timeout=60,
@@ -785,6 +786,9 @@ print('test-modules=' + ','.join(sorted(n for n in sys.modules if n.split('.')[0
 def run_launcher_probe(**environ: str) -> subprocess.CompletedProcess:
     """Import the launcher in a fresh interpreter, as uvicorn does, with a controlled environment.
 
+    PYTHONPATH is the image's (common/tests/image_path.py): the root, then the generated gRPC code's
+    root, which the launcher's app reaches once a servicer is registered (decision tj-3mk3u5.42 F1).
+
     Args:
         **environ (str): Variables to set beside PYTHONPATH.
 
@@ -794,7 +798,7 @@ def run_launcher_probe(**environ: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, '-c', LAUNCHER_PROBE],
         cwd=REPO_ROOT,
-        env={'PYTHONPATH': str(REPO_ROOT), **environ},
+        env={'PYTHONPATH': image_pythonpath(REPO_ROOT), **environ},
         capture_output=True,
         text=True,
         timeout=60,

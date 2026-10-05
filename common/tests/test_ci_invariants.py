@@ -39,7 +39,9 @@ from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
 from common.environment import get_env_var
+from common.tests import compose_model
 from common.tests.compose_model import InterpolationRefused, interpolate
+from common.tests.image_path import IMAGE_CODE_ROOT, IMAGE_PYTHONPATH_ENTRIES, image_import_roots
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -921,6 +923,27 @@ def test_every_scanner_root_exists_as_a_directory(source: str):
     )
 
 
+@pytest.mark.build_infra
+@pytest.mark.parametrize('source', SCANNER_ROOT_SOURCES)
+def test_every_directory_the_image_copies_is_under_a_scanner_root(source: str):
+    """What the image ships, bandit reads (decision tj-3mk3u5.42 F1 rule 6).
+
+    The other direction of the check above, and as silent: a root dropped from BOTH lists keeps
+    them equal and every root existing, so nothing went red when gen/proto/python, generated but
+    copied into the image and run there, was taken out of SOURCE_DIRS and SOURCE_PATHS together
+    (tj-3mk3u5.44 gate, mutation 8). Every directory a Dockerfile COPY reads from the build context
+    has to lie under one of the roots.
+    """
+    roots = [PurePosixPath(posixpath.normpath(root)) for _, root in _scanner_roots(source)]
+    copied = sorted(path for path in _dockerfile_copy_sources() if (REPO_ROOT / path).is_dir())
+    assert set(copied) >= KNOWN_COPY_SOURCES, f'the COPY parse found directories {copied}'
+    unscanned = [path for path in copied if not any(PurePosixPath(path).is_relative_to(root) for root in roots)]
+    assert not unscanned, (
+        f'the image copies {unscanned}, which no {source} root covers, so bandit never reads code the '
+        f'image runs. Add the directory to SOURCE_DIRS and SOURCE_PATHS together.'
+    )
+
+
 # ---------------------------------------------------------------------------------------
 # THE UV PIN AND THE INSTALL COOLDOWN (tj-jon3d1, tj-vhboky.17)
 #
@@ -1369,12 +1392,14 @@ def test_migrate_still_defaults_to_upgrade_head():
 # Alembic writes the revision files, and they were excluded before tj-2ngid0 widened the list.
 # Adding a prefix here takes a source path out of the lint gate, so it is a decision.
 #
-# common/rpc/generated/ is protoc's committed output, excluded by ADR tj-8konfu D3 (re-homed by
-# addendum A1) as generated code, the same way the revisions are. `make proto` writes it and nothing
-# else does, so it is never hand-edited or reformatted. CI's staleness step regenerates it and fails
-# on any difference, so a hand-written file slipped in there shows up as one `make proto` deletes.
-# The prefix stops at generated/. The hand-written modules beside it in common/rpc/ stay linted.
-RUFF_UNLINTED_SOURCE_PREFIXES = ('data/store/migrations/versions/', 'common/rpc/generated/')
+# gen/proto/ is protoc's committed output, one tree per language, excluded by ADR tj-8konfu D3 and
+# decision tj-3mk3u5.42 F1 as generated code, the same way the revisions are. `make proto` writes it
+# and nothing else does, so it is never hand-edited or reformatted. CI's staleness step regenerates it
+# and fails on any difference, so a hand-written file slipped in there shows up as one `make proto`
+# deletes. Its Python tree is a SOURCE_DIRS root (bandit reads it, because the image ships it), so
+# this prefix is what keeps the root out of ruff's list without a swallowed-source failure. It names
+# gen/proto/ only: common/rpc/, which imports the tree, is hand-written and stays linted.
+RUFF_UNLINTED_SOURCE_PREFIXES = ('data/store/migrations/versions/', 'gen/proto/')
 
 
 def _run(*command: str) -> list[str]:
@@ -2417,7 +2442,10 @@ def test_the_client_hands_the_suite_the_env_contract():
     - DATABASE_PORT is the container port, 5432: the client is on the network.
     - The secrets are ${NAME} interpolation, never literals.
     - TZ is off UTC in both January and July, so a naive-to-timestamptz shift can go red.
-    - PYTHONPATH is the working directory: tests/system has no package chain to provide the root.
+    - PYTHONPATH is the service image's, read under the working directory: the working directory
+      itself (tests/system has no package chain to provide the root), then the generated gRPC code's
+      root, gen/proto/python (decision tj-3mk3u5.42 F1). pytest.ini covers the suite, but the seed
+      producer test_client also runs is not pytest.
     - The driver flags match $(PYTEST_ENV), as for every host test target.
     """
     client = _test_client()
@@ -2451,8 +2479,11 @@ def test_the_client_hands_the_suite_the_env_contract():
         assert environment[key] == f'${{{key}}}', (
             f'{key} is {environment[key]!r}: a secret is interpolated, never literal'
         )
-    assert environment['PYTHONPATH'] == client.get('working_dir'), (
-        f'PYTHONPATH {environment["PYTHONPATH"]!r} is not the working_dir {client.get("working_dir")!r}'
+    working_dir = PurePosixPath(client.get('working_dir') or '')
+    image_model = ':'.join(str(working_dir / entry) for entry in IMAGE_PYTHONPATH_ENTRIES)
+    assert environment['PYTHONPATH'] == image_model, (
+        f'PYTHONPATH {environment["PYTHONPATH"]!r} is not the image model under the working_dir {working_dir}: '
+        f'{image_model!r}'
     )
     for word in _make_variable('PYTEST_ENV').split():
         name, _, value = word.partition('=')
@@ -4623,8 +4654,12 @@ DATA_DIR_VARIABLE = 'DATA_DIR'
 # A representative file inside a data directory, for the "is its content sent?" half of the check.
 DATA_DIR_SAMPLE_FILE = 'PG_VERSION'
 # What the Dockerfile COPYs today. A floor for the parse below, so a parser regression that finds
-# nothing cannot pass the "no COPY source is excluded" check vacuously.
-KNOWN_COPY_SOURCES = frozenset({'common', 'routers', 'schemas', 'data/store/app', 'data/ingest/app'})
+# nothing cannot pass the "no COPY source is excluded" check vacuously. gen/proto/python is the
+# committed generated gRPC code (decision tj-3mk3u5.42 F1): no app imports it yet, so the closure
+# check below cannot miss it, and this floor is what notices its COPY going.
+KNOWN_COPY_SOURCES = frozenset(
+    {'common', 'routers', 'schemas', 'gen/proto/python', 'data/store/app', 'data/ingest/app'}
+)
 # The one directory name under a COPY source that .dockerignore may exclude (tj-v82dvm).
 EXCLUDABLE_TEST_DIR = 'tests'
 # Non-vacuity for the reverse pin: the test directories under a COPY source when it was written.
@@ -4922,11 +4957,18 @@ def _copy_source_test_dirs_sent(rules: _IgnoreRules, test_dirs: dict[str, list[s
 
 
 def _first_party_module_file(module: str) -> Path | None:
-    """The repo source file a dotted module name resolves to, or None when it is not first-party."""
-    base = REPO_ROOT.joinpath(*module.split('.'))
-    for candidate in (base.with_suffix('.py'), base / '__init__.py'):
-        if candidate.is_file():
-            return candidate
+    """The repo source file a dotted module name resolves to, or None when it is not first-party.
+
+    Searched as the image's interpreter searches: each of its PYTHONPATH entries in order, the root
+    first, then gen/proto/python (common/tests/image_path.py). From the root alone, trader_joe.proto
+    is not first-party, and an app reaching it through common.rpc would pass the COPY check below
+    with the generated tree uncopied (decision tj-3mk3u5.42 F1).
+    """
+    for root in image_import_roots(REPO_ROOT):
+        base = root.joinpath(*module.split('.'))
+        for candidate in (base.with_suffix('.py'), base / '__init__.py'):
+            if candidate.is_file():
+                return candidate
     return None
 
 
@@ -5276,6 +5318,38 @@ def test_the_copy_coverage_check_names_what_the_image_does_not_copy(tmp_path: Pa
         'svc/b/app/api.py',
     ]
     assert _app_imports_outside_image('svc/b/app', {'shared'}) == []
+
+
+@pytest.mark.build_infra
+def test_the_copy_coverage_check_follows_generated_code_onto_the_images_second_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Decision tj-3mk3u5.42 F1: an app that reaches trader_joe.proto needs gen/proto/python in its image.
+
+    Synthetic tree in the repository's shape: the app imports a hand-written shared module, which
+    imports a generated one that resolves only on the image's second PYTHONPATH entry. No real app
+    does this until a servicer that imports generated code is registered (tj-3mk3u5.9/.10), so the
+    walk is pinned here. With the tree copied, nothing is named; without it, the generated module and
+    the guard __init__.py above it are.
+    """
+    files = {
+        'shared/__init__.py': '',
+        'shared/rpc.py': 'from trader_joe.proto.x.v1 import x_pb2\n',
+        'svc/app/main.py': 'import shared.rpc\n',
+        'gen/proto/python/trader_joe/proto/__init__.py': '# guard\n',
+        'gen/proto/python/trader_joe/proto/x/v1/x_pb2.py': 'from google.protobuf import descriptor\n',
+    }
+    for relative, text in files.items():
+        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / relative).write_text(text, encoding='utf-8')
+    monkeypatch.setattr(sys.modules[__name__], 'REPO_ROOT', tmp_path)
+    closure = {path.relative_to(tmp_path).as_posix() for path in _app_import_closure('svc/app')}
+    assert 'gen/proto/python/trader_joe/proto/x/v1/x_pb2.py' in closure, sorted(closure)
+    assert _app_imports_outside_image('svc/app', {'shared', 'gen/proto/python'}) == []
+    assert _app_imports_outside_image('svc/app', {'shared'}) == [
+        'gen/proto/python/trader_joe/proto/__init__.py',
+        'gen/proto/python/trader_joe/proto/x/v1/x_pb2.py',
+    ]
 
 
 # An uncopied ancestor package __init__.py, by content. Each row: (its text, allowed?). Allowed
@@ -5980,29 +6054,36 @@ def test_the_import_time_print_finder_follows_what_runs_at_import(source: str, l
 
 
 # ---------------------------------------------------------------------------------------
-# THE gRPC TOOLCHAIN (ADR tj-8konfu D1 and D3, re-homed by addendum A1; tj-3mk3u5.23)
+# THE gRPC TOOLCHAIN (ADR tj-8konfu D1 and D3, re-homed by addendum A1; tj-3mk3u5.23; the layout of
+# decision tj-3mk3u5.42 F1, tj-3mk3u5.44)
 #
-# Committing protoc's output is safe only with three controls around it. Each one fails silently
+# Committing protoc's output is safe only with the controls around it. Each one fails silently
 # when it goes, because nothing reports a check that no longer runs.
 #
-# * THE STALENESS STEP. CI's unit job regenerates common/rpc/generated/ through `make proto` and
-#   fails on ANY difference from the commit: a changed, deleted or untracked file. D3 says that
-#   without it committing is strictly worse than generating at build time. It has to run before
-#   the linters and the suite. Its script is pinned by RUNNING it against a scratch repository
-#   with a stand-in `make`, because the property is what it detects. A `git diff` in place of the
-#   `git status` reads the same at a glance and misses every untracked file.
-# * THE SEAM. Nothing outside common/rpc/ imports common.rpc.generated (ruff TID251). Pinned by
-#   asking ruff itself, over stdin, with the project's own configuration. That exercises the
-#   select entry, the banned-api table and the per-file-ignore together: remove any one of them,
-#   or widen the ignore, and a case here changes.
+# * THE STALENESS STEP. CI's unit job regenerates gen/proto/ through `make proto` and fails on ANY
+#   difference from the commit: a changed, staged, deleted or untracked file, in any language's
+#   tree. D3 says that without it committing is strictly worse than generating at build time. It has
+#   to run before the linters and the suite. Its script is pinned by RUNNING it against a scratch
+#   repository with a stand-in `make`, because the property is what it detects. A `git diff` in
+#   place of the `git status` reads the same at a glance and misses every untracked and staged file.
+# * THE SEAM. Nothing outside common/rpc/ imports trader_joe.proto (ruff TID251). Pinned by asking
+#   ruff itself, over stdin, with the project's own configuration. That exercises the select entry,
+#   the banned-api table and the per-file-ignore together: remove any one of them, narrow the ban to
+#   one contract, or widen the ignore, and a case here changes.
+# * THE IMPORT ROOT, BY CONFIGURATION ONLY (F1 rule 3). gen/proto/python reaches Python through
+#   pytest.ini's pythonpath, the image's ENV PYTHONPATH plus its COPY, and a bind mount beside every
+#   ./common mount. A missing piece is silent until a servicer that imports generated code is
+#   registered (data_ingest's registered_services() returns [] today), so each is pinned statically.
 # * THE PINS. The generator writes its version into every file it emits, so an unpinned
 #   grpcio-tools would fail the staleness step on a new release rather than on a contract change.
 #
-# Deliberately NOT pinned here: that `make proto` reproduces the committed tree. That IS the
-# staleness step, which D3 makes the control. A copy in the suite would be a second definition of
-# the protoc invocation to keep in step with the Makefile, which is what the step avoids.
-GENERATED_GRPC_TREE = PurePosixPath('common/rpc/generated')
-GENERATED_GRPC_MODULE = GENERATED_GRPC_TREE / 'trader_joe' / 'ping' / 'v1' / 'ping_pb2.py'
+# What `make proto` itself does -- the plain include root, no post-processing, the clearing, the
+# reserved-root guard, the PEP 420 namespace -- is pinned by running the real target on scratch trees,
+# in common/tests/test_make_proto.py. Deliberately NOT pinned anywhere in the suite: that `make proto`
+# reproduces the COMMITTED tree. That IS the staleness step, which D3 makes the control.
+GENERATED_GRPC_TREE = PurePosixPath('gen/proto')
+GENERATED_GRPC_PACKAGE = GENERATED_GRPC_TREE / 'python' / 'trader_joe' / 'proto'
+GENERATED_GRPC_MODULE = GENERATED_GRPC_PACKAGE / 'ping' / 'v1' / 'ping_pb2.py'
 
 
 def _runs_make_target(command: list[str], target: str) -> bool:
@@ -6055,10 +6136,20 @@ def test_ci_checks_the_generated_grpc_tree_before_it_lints_or_tests():
 _STALENESS_CASES = {
     'regeneration is a no-op': ('', 0),
     'a generated module changed': (f"printf '# drift\\n' >> {GENERATED_GRPC_MODULE}", 1),
+    # A hand edit that reached the index: `git diff` alone (unstaged changes only) would pass it.
+    'a generated module changed and staged': (
+        f"printf '# hand edit\\n' >> {GENERATED_GRPC_MODULE} && git add {GENERATED_GRPC_MODULE}",
+        1,
+    ),
     'a generated module deleted': (f'rm {GENERATED_GRPC_MODULE}', 1),
     'a generated module untracked': (
-        f'mkdir -p {GENERATED_GRPC_TREE}/trader_joe/probe/v1 && '
-        f"printf 'x = 1\\n' > {GENERATED_GRPC_TREE}/trader_joe/probe/v1/probe_pb2.py",
+        f'mkdir -p {GENERATED_GRPC_PACKAGE}/probe/v1 && '
+        f"printf 'x = 1\\n' > {GENERATED_GRPC_PACKAGE}/probe/v1/probe_pb2.py",
+        1,
+    ),
+    # The step judges gen/proto/, every language's tree (F1 rule 1), not only the Python one.
+    "another language's tree drifted": (
+        f"mkdir -p {GENERATED_GRPC_TREE}/ts && printf 'export {{}};\\n' > {GENERATED_GRPC_TREE}/ts/probe_pb.ts",
         1,
     ),
     'a change outside the generated tree': ("printf 'drift\\n' >> README.md", 0),
@@ -6079,7 +6170,7 @@ def test_the_staleness_step_fails_on_any_drift_in_the_generated_tree(tmp_path: P
 
     repo = tmp_path / 'repo'
     (repo / GENERATED_GRPC_MODULE).parent.mkdir(parents=True)
-    (repo / GENERATED_GRPC_TREE / '__init__.py').write_text('', encoding='utf-8')
+    (repo / GENERATED_GRPC_PACKAGE / '__init__.py').write_text('# guard\n', encoding='utf-8')
     (repo / GENERATED_GRPC_MODULE).write_text('DESCRIPTOR = None\n', encoding='utf-8')
     (repo / 'README.md').write_text('readme\n', encoding='utf-8')
     env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
@@ -6119,18 +6210,25 @@ def test_the_staleness_step_fails_on_any_drift_in_the_generated_tree(tmp_path: P
 
 
 SEAM_VIOLATIONS = (
-    'import common.rpc.generated.trader_joe.ping.v1.ping_pb2_grpc',
-    'from common.rpc.generated.trader_joe.ping.v1 import ping_pb2',
-    'from common.rpc.generated.trader_joe.ping.v1.ping_pb2 import PingRequest',
-    'from common.rpc import generated',
+    'import trader_joe.proto.ping.v1.ping_pb2_grpc',
+    'from trader_joe.proto.ping.v1 import ping_pb2',
+    'from trader_joe.proto.ping.v1.ping_pb2 import PingRequest',
+    'from trader_joe import proto',
+    'import trader_joe.proto',
+    # A contract other than Ping, so a ban narrowed to one contract goes red. Ruff matches names; the
+    # module need not exist.
+    'from trader_joe.proto.market.v1 import bar_pb2',
 )
 OUTSIDE_THE_SEAM = (
     'common/probe.py',
     'common/tests/test_probe.py',
+    'common/tests/rpc/test_probe.py',
     'routers/common/probe.py',
     'schemas/common/probe.py',
     'data/store/app/probe.py',
     'data/ingest/app/probe.py',
+    'tests/system/test_probe.py',
+    'tools/agent_mcp/probe.py',
 )
 INSIDE_THE_SEAM = ('common/rpc/probe.py', 'common/rpc/nested/probe.py')
 
@@ -6172,9 +6270,36 @@ def test_generated_grpc_code_cannot_be_imported_outside_common_rpc(filename: str
 
 
 @pytest.mark.build_infra
-def test_a_relative_import_of_generated_grpc_code_is_caught_too():
-    flagged = _ruff_codes_by_line('common/probe.py', 'from .rpc.generated.trader_joe.ping.v1 import ping_pb2\n')
-    assert 'TID251' in flagged.get(1, set()), f'a relative import of the generated package is not TID251: {flagged}'
+def test_no_hand_written_module_shares_the_generated_namespace_yet():
+    """The relative form of the seam: unreachable today, and this goes red the day it becomes reachable.
+
+    Before F1 the generated tree sat inside common/, and `from .rpc.generated... import` was a real
+    route around the ban, pinned as TID251. trader_joe.proto now heads its own top-level namespace, so
+    only a module INSIDE the trader_joe namespace could name it relatively, and ruff cannot resolve a
+    relative import there: no trader_joe/__init__.py exists to anchor it (F1 rule 5). Measured at
+    tj-3mk3u5.44's gate: in a trader_joe/common/x.py, `from ..proto.ping.v1 import ping_pb2` is not
+    TID251 (TID252, the parent-relative ban, does flag it), and in a trader_joe/x.py,
+    `from .proto.ping.v1 import ping_pb2` is flagged by neither.
+
+    No hand-written module lives in that namespace, so neither form can be written today, and no probe
+    is pinned against a file that does not exist. This pins the precondition instead: when PR 3 adds
+    the hand-written trader_joe.common (tj-yw8cok) or trader_joe.client, this fails, and the relative
+    form needs a control of its own before that lands.
+    """
+    tracked = _run('git', 'ls-files', '--', '*.py', '*.pyi')
+    in_namespace = sorted(
+        path
+        for path in tracked
+        if 'trader_joe' in PurePosixPath(path).parts and not path.startswith(f'{GENERATED_GRPC_TREE}/')
+    )
+    assert any(path.startswith(f'{GENERATED_GRPC_PACKAGE}/') for path in tracked), (
+        f'git tracks nothing under {GENERATED_GRPC_PACKAGE}, so this check reads the wrong tree'
+    )
+    assert not in_namespace, (
+        f'hand-written modules now share the trader_joe namespace with the generated trader_joe.proto: '
+        f'{in_namespace}. A relative import from them can reach generated code past TID251 (see this '
+        f"test's docstring); give the relative form a control, then update this test."
+    )
 
 
 @pytest.mark.build_infra
@@ -6183,6 +6308,244 @@ def test_common_rpc_may_import_its_generated_code(filename: str):
     """Guard the guard: TID251 above comes from the ban, not from a rule that flags every import."""
     flagged = _ruff_codes_by_line(filename, '\n'.join(SEAM_VIOLATIONS) + '\n')
     assert not any('TID251' in codes for codes in flagged.values()), f'{filename}: {flagged}'
+
+
+# ---------------------------------------------------------------------------------------
+# THE GENERATED CODE'S IMPORT ROOT, BY CONFIGURATION ONLY (decision tj-3mk3u5.42 F1 rule 3;
+# tj-3mk3u5.44 gate item 7)
+#
+# gen/proto/python reaches Python in three places, and no code changes sys.path:
+#   * pytest.ini's pythonpath, for every pytest run (make test, CI's plain `uv run pytest`, test_client);
+#   * the image: ENV PYTHONPATH=/code:/code/gen/proto/python, and COPY ./gen/proto/python beside common;
+#   * a bind mount of ./gen/proto/python beside every ./common bind mount, so a host `make proto`
+#     reaches a dev container, plus test_client's PYTHONPATH, because the seed producer it runs is
+#     not pytest.
+# A missing piece is silent: the image builds, the stack starts, and nothing fails until a servicer
+# that imports generated code is registered. data_ingest's registered_services() returns [] today,
+# so these static pins are the only control before tj-3mk3u5.9/.10. common/tests/image_path.py spells
+# the image's PYTHONPATH for the subprocesses the suite starts, and the first pin holds it equal to
+# the Dockerfile, so the mirror cannot drift from the image.
+GENERATED_PYTHON_ROOT = IMAGE_PYTHONPATH_ENTRIES[-1]
+# The images compose builds (data_store/data_ingest: prod_image, dev_image; test_client:
+# system_test_image) and the stage both service images copy /code from.
+IMAGE_TARGETS = ('prod_image', 'dev_image', 'system_test_image', 'service_build_image')
+# The stage that copies the hand-written shared code, as a floor for the COPY pin below.
+SHARED_COPY_STAGE = 'service_build_image'
+# Every compose service that mounts ./common today, as a floor for the mount pin below.
+KNOWN_COMMON_MOUNTS = frozenset(
+    {
+        'docker-compose.override.yaml:data_store',
+        'docker-compose.override.yaml:data_ingest',
+        'docker-compose.test-client.yaml:test_client',
+    }
+)
+
+
+def _stage_env(body: str, name: str) -> list[str]:
+    """Every value an ENV instruction in a stage body gives NAME, in order, `NAME=value` and legacy `NAME value` alike."""
+    values = []
+    for line in body.splitlines():
+        if line.strip().split(maxsplit=1)[:1] != ['ENV']:
+            continue
+        words = shlex.split(line, comments=True)[1:]
+        if len(words) == 2 and '=' not in words[0]:
+            values.extend([words[1]] if words[0] == name else [])
+            continue
+        for word in words:
+            key, separator, value = word.partition('=')
+            if separator and key == name:
+                values.append(value)
+    return values
+
+
+def _image_env(target: str, name: str) -> str | None:
+    """NAME in TARGET's image: the last ENV for it in the nearest stage of the FROM ancestry that sets it."""
+    stages = _dockerfile_stages()
+    for stage in _stage_ancestry(target):
+        values = _stage_env(stages[stage][1], name)
+        if values:
+            return values[-1]
+    return None
+
+
+def _stage_copies(body: str) -> list[tuple[str, str]]:
+    """(context source, destination) of each COPY in a stage body that reads the build context."""
+    copies = []
+    for line in body.splitlines():
+        if line.strip().split(maxsplit=1)[:1] != ['COPY']:
+            continue
+        words = shlex.split(line, comments=True)
+        if any(word.startswith('--from') for word in words[1:]):
+            continue
+        operands = [word for word in words[1:] if not word.startswith('--')]
+        copies.extend((posixpath.normpath(source), operands[-1]) for source in operands[:-1])
+    return copies
+
+
+def _image_pythonpath_model() -> str:
+    return ':'.join(str(IMAGE_CODE_ROOT / entry) for entry in IMAGE_PYTHONPATH_ENTRIES)
+
+
+@pytest.mark.build_infra
+def test_every_image_runs_with_the_pythonpath_the_suite_mirrors():
+    """Every ENV PYTHONPATH is the code root, then the generated code's root, and every image inherits one.
+
+    The model is common/tests/image_path.py's, which the suite's subprocess tests hand their children.
+    So a Dockerfile that drops gen/proto/python, or a mirror that drifts from it, goes red here.
+    """
+    stages = _dockerfile_stages()
+    setters = {stage for stage, (_, body) in stages.items() if _stage_env(body, 'PYTHONPATH')}
+    assert setters >= {'base_build_image', 'base_deploy_image'}, f'stages that set PYTHONPATH: {sorted(setters)}'
+    model = _image_pythonpath_model()
+    wrong = sorted(
+        f'{stage}: {value!r}'
+        for stage in setters
+        for value in _stage_env(stages[stage][1], 'PYTHONPATH')
+        if value != model
+    )
+    assert not wrong, f'ENV PYTHONPATH must be {model!r} (common/tests/image_path.py) everywhere: {wrong}'
+    for target in IMAGE_TARGETS:
+        assert target in stages, f'the Dockerfile has no stage {target}'
+        assert _image_env(target, 'PYTHONPATH') == model, f'{target} does not run with PYTHONPATH {model!r}'
+
+
+@pytest.mark.build_infra
+def test_the_image_copies_the_generated_tree_where_its_pythonpath_looks():
+    """The COPY of ./gen/proto/python sits in the stage that copies ./common, onto the PYTHONPATH entry."""
+    stages = _dockerfile_stages()
+    with_common = sorted(
+        stage for stage, (_, body) in stages.items() if any(source == 'common' for source, _ in _stage_copies(body))
+    )
+    assert SHARED_COPY_STAGE in with_common, f'no stage copies ./common where expected: {with_common}'
+    destination = str(IMAGE_CODE_ROOT / GENERATED_PYTHON_ROOT)
+    for stage in with_common:
+        copies = _stage_copies(stages[stage][1])
+        assert (str(GENERATED_PYTHON_ROOT), destination) in copies, (
+            f'{stage} copies ./common but not ./{GENERATED_PYTHON_ROOT} to {destination}: {copies}. The image '
+            f'builds and starts without it, and fails at the first import of generated code.'
+        )
+
+
+@pytest.mark.build_infra
+def test_every_compose_mount_of_common_has_the_generated_tree_beside_it():
+    """Beside every ./common bind mount, ./gen/proto/python at the sibling target, read-only exactly when common is."""
+    found, missing = [], []
+    for path, name, service in _compose_services():
+        by_source: dict[str | None, list[dict]] = {}
+        for mount in map(compose_model.volume, service.get('volumes') or []):
+            if mount['type'] == 'bind':
+                by_source.setdefault(_context_relative(mount['source'], path.parent), []).append(mount)
+        for common in by_source.get('common', []):
+            label = f'{path.relative_to(REPO_ROOT)}:{name}'
+            found.append(label)
+            target = str(PurePosixPath(common['target']).parent / GENERATED_PYTHON_ROOT)
+            beside = [(mount['target'], mount['read_only']) for mount in by_source.get(str(GENERATED_PYTHON_ROOT), [])]
+            if (target, common['read_only']) not in beside:
+                missing.append(
+                    f'{label} mounts ./common at {common["target"]} but not ./{GENERATED_PYTHON_ROOT} at {target} '
+                    f'(read_only={common["read_only"]}); it has {beside}'
+                )
+    assert set(found) >= KNOWN_COMMON_MOUNTS, f'./common mounts found: {sorted(found)}'
+    assert not missing, '\n'.join(missing)
+
+
+@pytest.mark.build_infra
+def test_pytest_puts_the_generated_root_on_the_suites_path():
+    """pytest.ini's pythonpath names every image entry but the root, which rootdir already provides, and took effect."""
+    config = configparser.ConfigParser(interpolation=None)
+    config.read(PYTEST_INI, encoding='utf-8')
+    entries = config.get('pytest', 'pythonpath', fallback='').split()
+    expected = {str(entry) for entry in IMAGE_PYTHONPATH_ENTRIES[1:]}
+    assert expected <= set(entries), (
+        f'{PYTEST_INI.name} pythonpath is {entries}, missing {sorted(expected - set(entries))}'
+    )
+    on_path = {Path(entry).resolve() for entry in sys.path if entry}
+    assert (REPO_ROOT / GENERATED_PYTHON_ROOT).resolve() in on_path, 'the pythonpath option did not reach sys.path'
+    assert REPO_ROOT.resolve() in on_path, 'the repository root is no longer on the suite path'
+
+
+# THE RUNTIME PATH IN THE CONTAINERS, as compose builds each container's environment: the image's ENV,
+# overridden by each env_file in order, overridden by environment: (compose's documented precedence).
+# Every service env_file is a live file the checkout does not hold (.env, data/store/.env, ...); each
+# is read here through its committed template (<file>.default), which is what every launch starts
+# from: CI's System Testing copies .env.default to .env, the agent stack copies every committed root
+# variable into its generated root env file, and a developer's .env begins as a copy.
+SERVICE_CONTAINERS = ('data_store', 'data_ingest')
+_LAUNCH_SETS = {
+    'prod': compose_model.prod_model,
+    'dev': lambda: compose_model.merge([compose_model.load(COMPOSE_FILE), compose_model.load(OVERRIDE_FILE)]),
+    'system': compose_model.system_model,
+    'agent-stack': compose_model.agent_stack_model,
+}
+
+
+def _env_file_template(entry: object, base: Path) -> Path | None:
+    """The committed template behind one env_file entry, with ${...} defaults applied; None when it has none."""
+    raw = entry.get('path') if isinstance(entry, dict) else entry
+    path = base / interpolate(str(raw), {})
+    template = path.with_name(f'{path.name}.default')
+    return template if template.is_file() else None
+
+
+def _container_env(service: dict, image_env: dict[str, str], base: Path) -> dict[str, str]:
+    """A container's environment as compose builds it: image ENV < env_file (in order) < environment:."""
+    env = dict(image_env)
+    for entry in service.get('env_file') or []:
+        template = _env_file_template(entry, base)
+        if template is not None:
+            env |= _env_file_values(template)
+    environment = service.get('environment') or {}
+    if isinstance(environment, dict):
+        env |= {str(key): str(value) for key, value in environment.items() if value is not None}
+    else:
+        env |= dict(str(item).partition('=')[::2] for item in environment if '=' in str(item))
+    return env
+
+
+def _runtime_path_entries(pythonpath: str) -> list[str]:
+    """PYTHONPATH's entries as absolute container paths, a relative one read against WORKDIR, the code root."""
+    return [posixpath.normpath(posixpath.join(str(IMAGE_CODE_ROOT), entry)) for entry in pythonpath.split(':') if entry]
+
+
+@pytest.mark.build_infra
+def test_the_container_env_model_ranks_environment_over_env_file_over_the_image(tmp_path: Path):
+    """Non-vacuity for the runtime pin below: the model ranks the three sources as compose does."""
+    (tmp_path / '.env.default').write_text('PYTHONPATH=./\nOTHER=1\n', encoding='utf-8')
+    image = {'PYTHONPATH': '/code:/code/gen/proto/python'}
+    env_file = ['${ROOT_ENV_FILE:-.env}']
+    assert _container_env({}, image, tmp_path)['PYTHONPATH'] == image['PYTHONPATH']
+    assert _container_env({'env_file': env_file}, image, tmp_path)['PYTHONPATH'] == './'
+    for environment in ({'PYTHONPATH': '/x'}, ['PYTHONPATH=/x']):
+        service = {'env_file': env_file, 'environment': environment}
+        assert _container_env(service, image, tmp_path)['PYTHONPATH'] == '/x'
+    assert _runtime_path_entries('./:/code/gen/proto/python') == ['/code', '/code/gen/proto/python']
+    assert _env_file_template('${ROOT_ENV_FILE:-.env}', REPO_ROOT) == ENV_DEFAULT_FILE
+
+
+@pytest.mark.build_infra
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason=(
+        'FINDING, tj-3mk3u5.44 (builder-shared 18:12 UTC note; architect ruling pending): root .env.default sets '
+        'PYTHONPATH=./, every service reads it through env_file, and env_file outranks the image ENV, so '
+        '/code/gen/proto/python is off the service path at runtime in every launch set. Harmless only while '
+        "data_ingest's registered_services() is empty. Remove this marker with the fix."
+    ),
+)
+def test_every_service_container_finds_the_generated_code_at_runtime():
+    """The image's PYTHONPATH is what the service process gets, in every launch set, or the static pins mean nothing."""
+    generated = str(IMAGE_CODE_ROOT / GENERATED_PYTHON_ROOT)
+    offenders = []
+    for label, model in _LAUNCH_SETS.items():
+        services = model()['services']
+        for name in SERVICE_CONTAINERS:
+            service = services[name]
+            target = (service.get('build') or {}).get('target') or 'prod_image'
+            env = _container_env(service, {'PYTHONPATH': _image_env(target, 'PYTHONPATH') or ''}, REPO_ROOT)
+            if generated not in _runtime_path_entries(env.get('PYTHONPATH', '')):
+                offenders.append(f'{label}: {name} runs with PYTHONPATH={env.get("PYTHONPATH")!r}')
+    assert not offenders, f'service containers that cannot import trader_joe.proto at runtime: {offenders}'
 
 
 # Where each half of the toolchain belongs: the runtime in base, which both services install, and

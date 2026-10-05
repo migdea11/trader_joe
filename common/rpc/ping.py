@@ -1,4 +1,4 @@
-"""The Ping service: PIPELINE PROOF, NOT A CONTRACT (proto/trader_joe/ping/v1/ping.proto).
+"""The Ping service: PIPELINE PROOF, NOT A CONTRACT (proto/trader_joe/proto/ping/v1/ping.proto).
 
 It carries proto -> make proto -> committed generated code -> a grpc.aio server and channel end to
 end, before any real contract exists. It also shows the seam (ADR tj-8konfu D3): the generated
@@ -9,8 +9,8 @@ registers it yet, and nothing should come to depend on it.
 import grpc
 
 from common.rpc.channel import unary_call_options
-from common.rpc.generated.trader_joe.ping.v1 import ping_pb2, ping_pb2_grpc
 from common.rpc.server import ServiceRegistration
+from trader_joe.proto.ping.v1 import ping_pb2, ping_pb2_grpc
 
 
 SERVICE_NAME = ping_pb2.DESCRIPTOR.services_by_name['PingService'].full_name

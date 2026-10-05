@@ -46,6 +46,7 @@ from common.rpc.channel import create_channel
 from common.rpc.ping import SERVICE_NAME as PING_SERVICE_NAME
 from common.rpc.ping import ping, ping_service
 from common.rpc.server import GRPC_HOST_ENV, GRPC_PORT_ENV
+from common.tests.image_path import image_pythonpath
 from common.worker_pool import SharedWorkerPool
 from data.ingest.app import app_depends, grpc_host, ingest_control, main
 from data.ingest.app.brokers.interface import BarsQuery, BarsResponse
@@ -380,7 +381,9 @@ def test_the_process_exits_after_the_lifespan_whether_or_not_the_grpc_host_start
         done = subprocess.run(
             [sys.executable, '-c', EXIT_PROBE, case],
             cwd=REPO_ROOT,
-            env={'PYTHONPATH': str(REPO_ROOT)},
+            # The image's path: the probe runs the real lifespan, whose servicers import generated code
+            # once tj-3mk3u5.9/.10 register them (decision tj-3mk3u5.42 F1).
+            env={'PYTHONPATH': image_pythonpath(REPO_ROOT)},
             capture_output=True,
             text=True,
             timeout=EXIT_BUDGET_S,

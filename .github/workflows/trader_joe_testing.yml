@@ -76,7 +76,7 @@ env:
   # uv warns, then asserts the lock is current, so a stale lock still fails the job. Matches the
   # Makefile's exported UV_FROZEN.
   UV_FROZEN: "1"
-  SOURCE_PATHS: "./common ./routers ./schemas ./data ./tools"
+  SOURCE_PATHS: "./common ./routers ./schemas ./data ./tools ./gen/proto/python"
 
 jobs:
   testing:
@@ -126,25 +126,26 @@ jobs:
       run: |
         uv sync --all-groups --no-group security --no-group agent-mcp --locked
 
-    # THE STALENESS CHECK (ADR tj-8konfu D3). common/rpc/generated/ is committed protoc output, and a
-    # committed copy can disagree with its source; this step is the control that makes committing it
-    # safe, not an extra. It regenerates through `make proto`, the target a developer runs, so the
-    # protoc invocation has one definition, and fails if the tree then differs from the commit in any
-    # way: a changed file, a deleted one (a .proto removed without its module) or an untracked one (a
-    # .proto added without its generated code). That is why it reads `git status` and not `git diff`,
-    # which ignores untracked files. It runs before the linters so a stale tree is reported as stale.
+    # THE STALENESS CHECK (ADR tj-8konfu D3; decision tj-3mk3u5.42 F1). gen/proto/ is committed protoc
+    # output, one tree per language, and a committed copy can disagree with its source; this step is
+    # the control that makes committing it safe, not an extra. It regenerates through `make proto`, the
+    # target a developer runs, so the protoc invocation has one definition, and fails if the tree then
+    # differs from the commit in any way: a changed file, a deleted one (a .proto removed without its
+    # module) or an untracked one (a .proto added without its generated code). That is why it reads
+    # `git status` and not `git diff`, which ignores untracked files. It runs before the linters so a
+    # stale tree is reported as stale.
     - name: Check Generated gRPC Code
       run: |
         set -eu
         make proto
-        stale="$(git status --porcelain --untracked-files=all -- common/rpc/generated)"
+        stale="$(git status --porcelain --untracked-files=all -- gen/proto)"
         if [ -n "${stale}" ]; then
-          echo "::error::common/rpc/generated/ does not match what make proto writes from proto/; run 'make proto' and commit the result"
+          echo "::error::gen/proto/ does not match what make proto writes from proto/; run 'make proto' and commit the result"
           printf '%s\n' "${stale}"
-          git --no-pager diff -- common/rpc/generated
+          git --no-pager diff -- gen/proto
           exit 1
         fi
-        echo "common/rpc/generated/ matches what make proto writes from proto/."
+        echo "gen/proto/ matches what make proto writes from proto/."
 
     - name: Run Ruff Linting
       run: |

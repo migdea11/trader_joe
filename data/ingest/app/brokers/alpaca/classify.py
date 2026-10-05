@@ -32,10 +32,20 @@ from common.errors.vocabulary import ExogenousError, InvalidRequestError, Reason
 from data.ingest.app.brokers.rate_budget import RateBudget
 
 
-# What the vendor's client raises that means the vendor could not be served, and nothing else. A
-# connection error or a timeout comes out of alpaca-py's HTTP session unwrapped; an error status comes out
-# as APIError, after the SDK has already retried a 429 and a 504 itself.
-VENDOR_FAILURES: Final = (APIError, requests_exceptions.ConnectionError, requests_exceptions.Timeout)
+# What the HTTP session raises, unwrapped by alpaca-py, when the vendor cannot be reached, does not answer in
+# time, or drops the connection part-way through its answer. ChunkedEncodingError is that last one: requests
+# raises it when the connection is cut while the body is read (urllib3's ProtocolError, such as IncompleteRead),
+# and it is not a ConnectionError. Listed one by one, never as RequestException: the other subclasses
+# (InvalidURL, TooManyRedirects, InvalidHeader, ContentDecodingError) stay bugs (ADR tj-fa1rpu D5, D6).
+_TRANSPORT_FAILURES: Final = (
+    requests_exceptions.ConnectionError,
+    requests_exceptions.Timeout,
+    requests_exceptions.ChunkedEncodingError,
+)
+
+# What the vendor's client raises that means the vendor could not be served, and nothing else: an error status
+# comes out as APIError, after the SDK has already retried a 429 and a 504 itself, and the rest is transport.
+VENDOR_FAILURES: Final = (APIError, *_TRANSPORT_FAILURES)
 
 # Unix seconds, the instant the rate-limit window resets.
 RATE_LIMIT_RESET_HEADER: Final = 'X-RateLimit-Reset'
@@ -52,7 +62,8 @@ def classify_vendor_error(
 
     By status: 400 is VENDOR_INVALID_REQUEST (refused: Alpaca names a parameter invalid, such as an end
     before its start), 401 and 403 are VENDOR_AUTH, 429 is VENDOR_RATE_LIMITED with a reset_at, any other 4xx
-    is VENDOR_REJECTED, and 5xx is VENDOR_UNAVAILABLE, as is a connection error or a timeout.
+    is VENDOR_REJECTED, and 5xx is VENDOR_UNAVAILABLE, as is a connection error, a timeout, or a connection
+    cut while the body was read (ChunkedEncodingError).
 
     Args:
         error (BaseException): What the vendor's client raised.
@@ -70,9 +81,11 @@ def classify_vendor_error(
     classified: TraderJoeError | None
     if isinstance(error, APIError):
         classified = _classify_status(error, rate_budget, clock)
-    elif isinstance(error, requests_exceptions.ConnectionError | requests_exceptions.Timeout):
+    elif isinstance(error, _TRANSPORT_FAILURES):
         classified = ExogenousError(
-            Reason.VENDOR_UNAVAILABLE, 'Alpaca could not be reached, or did not answer in time.', metadata=_VENDOR
+            Reason.VENDOR_UNAVAILABLE,
+            'Alpaca could not be reached, did not answer in time, or cut its answer off.',
+            metadata=_VENDOR,
         )
     else:
         classified = None

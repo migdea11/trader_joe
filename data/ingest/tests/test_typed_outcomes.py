@@ -14,7 +14,11 @@ WHAT THIS FILE PINS, at AlpacaRead and the interface, with a stub vendor client:
 * only the named exceptions are converted (D6): a vendor failure keeps its exception as __cause__, the
   rate budget's RATE_BUDGET comes back as a failure with no cause, and a bug still raises (D5);
 * the re-parented errors and the new result types;
-* the crypto and option stubs and create_app's problem+json handlers.
+* the crypto and option stubs and create_app's problem+json handlers;
+* (TE-4 follow-up tj-3mk3u5.37.14) a connection cut mid-body (ChunkedEncodingError) is VENDOR_UNAVAILABLE
+  with the caught exception as its cause, while requests' other, non-transport exceptions still escape
+  as bugs; and match_client_request raises UNSUPPORTED_ASSET_TYPE for any triple it does not map. The
+  cut on a real socket, through alpaca-py's own session, is in test_alpaca_cut_connection.py.
 
 The recorded-vendor half (the real alpaca-py client, its retries, the recorded bodies, served-empty,
 the bars:null pin) is in test_alpaca_read_recorded.py; the classifier's own table in
@@ -24,6 +28,7 @@ test_read_seam.py.
 
 import dataclasses
 import inspect
+import itertools
 import os
 import typing
 from collections.abc import Iterator
@@ -36,9 +41,17 @@ import pytest
 import requests
 from alpaca.common.exceptions import APIError
 from alpaca.data.enums import DataFeed
+from alpaca.data.requests import (
+    StockBarsRequest,
+    StockLatestBarRequest,
+    StockLatestQuoteRequest,
+    StockLatestTradeRequest,
+    StockQuotesRequest,
+    StockTradesRequest,
+)
 from fastapi.testclient import TestClient
 
-from common.enums.data_select import AssetType
+from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Feed, Granularity
 from common.errors.vocabulary import REASONS, ExogenousError, InvalidRequestError, Outcome, Reason, TraderJoeError
 from data.ingest.app import ingest_control, main
@@ -391,6 +404,8 @@ async def test_as_of_is_read_after_the_vendor_answered(executor, budget):
         pytest.param(api_error(500, 'internal'), Reason.VENDOR_UNAVAILABLE, id='500'),
         pytest.param(requests.exceptions.ConnectionError('refused'), Reason.VENDOR_UNAVAILABLE, id='connection'),
         pytest.param(requests.exceptions.ReadTimeout('slow'), Reason.VENDOR_UNAVAILABLE, id='read-timeout'),
+        # tj-3mk3u5.37.14: the connection cut while the body is read.
+        pytest.param(requests.exceptions.ChunkedEncodingError('cut'), Reason.VENDOR_UNAVAILABLE, id='cut-mid-body'),
     ],
 )
 async def test_a_vendor_failure_is_returned_with_the_caught_exception_as_its_cause(executor, budget, raised, reason):
@@ -434,7 +449,15 @@ async def test_an_api_error_with_no_status_is_re_raised_as_a_bug(executor, budge
         pytest.param(AttributeError("'NoneType' object has no attribute 'items'"), id='attribute-error'),
         pytest.param(TypeError('a bug'), id='type-error'),
         pytest.param(KeyError('bars'), id='key-error'),
-        pytest.param(requests.exceptions.ChunkedEncodingError('cut'), id='other-requests-error'),
+        # requests' exceptions that are not transport failures stay bugs (tj-3mk3u5.37.14; D5, D6). Until
+        # that bead this list held ChunkedEncodingError, the cut body, pinned as built so the fix would red it.
+        pytest.param(requests.exceptions.RequestException('ambiguous'), id='bare-request-exception'),
+        pytest.param(requests.exceptions.InvalidURL('bad url'), id='invalid-url'),
+        pytest.param(requests.exceptions.TooManyRedirects('loop'), id='too-many-redirects'),
+        pytest.param(requests.exceptions.InvalidHeader('bad header'), id='invalid-header'),
+        pytest.param(requests.exceptions.ContentDecodingError('bad gzip'), id='content-decoding-error'),
+        pytest.param(requests.exceptions.RetryError('retries'), id='retry-error'),
+        pytest.param(requests.exceptions.HTTPError('unwrapped status'), id='unwrapped-http-error'),
     ],
 )
 async def test_anything_else_the_vendor_call_raises_propagates_unconverted(executor, budget, raised):
@@ -564,7 +587,8 @@ def test_broker_read_get_bars_returns_the_typed_result():
 
 
 # ---------------------------------------------------------------------------------------------
-# The unsupported-path stubs and create_app (TE-4 items 3 and 7)
+# The unsupported-path stubs, match_client_request's fallback, and create_app (TE-4 items 3 and 7;
+# tj-3mk3u5.37.14)
 # ---------------------------------------------------------------------------------------------
 
 
@@ -579,6 +603,67 @@ async def test_the_crypto_and_option_stubs_are_coroutines_that_refuse_with_unsup
 
     assert raised.value.reason is Reason.UNSUPPORTED_ASSET_TYPE
     assert type(raised.value) is InvalidRequestError
+
+
+# Every triple match_client_request maps, and what it maps each to: the six stock endpoints alpaca-py has.
+MAPPED_TRIPLES = {
+    (AssetType.STOCK, DataType.MARKET_ACTIVITY, False): ('get_stock_bars', StockBarsRequest),
+    (AssetType.STOCK, DataType.MARKET_ACTIVITY, True): ('get_stock_latest_bar', StockLatestBarRequest),
+    (AssetType.STOCK, DataType.QUOTE, False): ('get_stock_quotes', StockQuotesRequest),
+    (AssetType.STOCK, DataType.QUOTE, True): ('get_stock_latest_quote', StockLatestQuoteRequest),
+    (AssetType.STOCK, DataType.TRADE, False): ('get_stock_trades', StockTradesRequest),
+    (AssetType.STOCK, DataType.TRADE, True): ('get_stock_latest_trade', StockLatestTradeRequest),
+}
+
+# Every other (asset_type, data_type, latest) the enums can spell, a member added later included.
+UNMAPPED_TRIPLES = [
+    triple for triple in itertools.product(AssetType, DataType, (False, True)) if triple not in MAPPED_TRIPLES
+]
+
+
+def triple_id(triple: tuple[AssetType, DataType, bool]) -> str:
+    asset_type, data_type, latest = triple
+    return f'{asset_type.value}-{data_type.value}-{"latest" if latest else "range"}'
+
+
+@pytest.mark.parametrize(
+    ('asset_type', 'data_type', 'latest'), [pytest.param(*triple, id=triple_id(triple)) for triple in UNMAPPED_TRIPLES]
+)
+def test_an_unmapped_triple_is_refused_with_unsupported_asset_type(asset_type, data_type, latest):
+    """tj-3mk3u5.37.14: the fallback raises, as fetch_data_type's docstring says, and never returns None.
+
+    The dead fallback used to be 'case (_, _)', which cannot match a 3-tuple subject, so an unmapped triple
+    fell off the match and returned None.
+    """
+    client = Mock()
+
+    with pytest.raises(InvalidRequestError) as raised:
+        broker_api.match_client_request(client, asset_type, data_type, latest)
+
+    error = raised.value
+    assert type(error) is InvalidRequestError
+    assert error.reason is Reason.UNSUPPORTED_ASSET_TYPE
+    assert REASONS[error.reason].outcome is Outcome.REFUSED
+    assert f'asset_type={asset_type.value}' in error.detail
+    assert f'data_type={data_type.value}' in error.detail
+    assert error.__cause__ is None
+    assert client.mock_calls == []
+
+
+@pytest.mark.parametrize(
+    ('asset_type', 'data_type', 'latest', 'method', 'request_type'),
+    [pytest.param(*triple, *mapped, id=triple_id(triple)) for triple, mapped in MAPPED_TRIPLES.items()],
+)
+def test_each_stock_triple_still_maps_to_its_sdk_method_and_request(
+    asset_type, data_type, latest, method, request_type
+):
+    client = Mock()
+
+    mapped = broker_api.match_client_request(client, asset_type, data_type, latest)
+
+    assert mapped == (getattr(client, method), request_type)
+    assert mapped[0] is getattr(client, method)
+    assert client.mock_calls == [], 'mapping a request must not call the vendor'
 
 
 def test_create_app_installs_the_problem_handlers_and_declares_their_responses():

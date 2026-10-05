@@ -47,6 +47,9 @@ services:
     volumes:
       - ./data/store/app:/code/data/store/app
       - ./common:/code/common
+      # Beside ./common always: the generated code common/rpc imports (the image's PYTHONPATH
+      # names /code/gen/proto/python), so a `make proto` on the host reaches the container too.
+      - ./gen/proto/python:/code/gen/proto/python
       - ./routers:/code/routers
       - ./schemas:/code/schemas
     environment:
@@ -66,6 +69,8 @@ services:
     volumes:
       - ./data/ingest/app:/code/data/ingest/app
       - ./common:/code/common
+      # Beside ./common, as on data_store.
+      - ./gen/proto/python:/code/gen/proto/python
       - ./routers:/code/routers
       - ./schemas:/code/schemas
     environment:

@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-from common.rpc.generated.trader_joe.ping.v1 import ping_pb2 as common_dot_rpc_dot_generated_dot_trader__joe_dot_ping_dot_v1_dot_ping__pb2
+from trader_joe.proto.ping.v1 import ping_pb2 as trader__joe_dot_proto_dot_ping_dot_v1_dot_ping__pb2
 
 GRPC_GENERATED_VERSION = '1.81.1'
 GRPC_VERSION = grpc.__version__
@@ -18,7 +18,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in common/rpc/generated/trader_joe/ping/v1/ping_pb2_grpc.py depends on'
+        + ' but the generated code in trader_joe/proto/ping/v1/ping_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -36,9 +36,9 @@ class PingServiceStub:
             channel: A grpc.Channel.
         """
         self.Ping = channel.unary_unary(
-                '/trader_joe.ping.v1.PingService/Ping',
-                request_serializer=common_dot_rpc_dot_generated_dot_trader__joe_dot_ping_dot_v1_dot_ping__pb2.PingRequest.SerializeToString,
-                response_deserializer=common_dot_rpc_dot_generated_dot_trader__joe_dot_ping_dot_v1_dot_ping__pb2.PingResponse.FromString,
+                '/trader_joe.proto.ping.v1.PingService/Ping',
+                request_serializer=trader__joe_dot_proto_dot_ping_dot_v1_dot_ping__pb2.PingRequest.SerializeToString,
+                response_deserializer=trader__joe_dot_proto_dot_ping_dot_v1_dot_ping__pb2.PingResponse.FromString,
                 _registered_method=True)
 
 
@@ -57,14 +57,14 @@ def add_PingServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'Ping': grpc.unary_unary_rpc_method_handler(
                     servicer.Ping,
-                    request_deserializer=common_dot_rpc_dot_generated_dot_trader__joe_dot_ping_dot_v1_dot_ping__pb2.PingRequest.FromString,
-                    response_serializer=common_dot_rpc_dot_generated_dot_trader__joe_dot_ping_dot_v1_dot_ping__pb2.PingResponse.SerializeToString,
+                    request_deserializer=trader__joe_dot_proto_dot_ping_dot_v1_dot_ping__pb2.PingRequest.FromString,
+                    response_serializer=trader__joe_dot_proto_dot_ping_dot_v1_dot_ping__pb2.PingResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
-            'trader_joe.ping.v1.PingService', rpc_method_handlers)
+            'trader_joe.proto.ping.v1.PingService', rpc_method_handlers)
     server.add_generic_rpc_handlers((generic_handler,))
-    server.add_registered_method_handlers('trader_joe.ping.v1.PingService', rpc_method_handlers)
+    server.add_registered_method_handlers('trader_joe.proto.ping.v1.PingService', rpc_method_handlers)
 
 
  # This class is part of an EXPERIMENTAL API.
@@ -86,9 +86,9 @@ class PingService:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/trader_joe.ping.v1.PingService/Ping',
-            common_dot_rpc_dot_generated_dot_trader__joe_dot_ping_dot_v1_dot_ping__pb2.PingRequest.SerializeToString,
-            common_dot_rpc_dot_generated_dot_trader__joe_dot_ping_dot_v1_dot_ping__pb2.PingResponse.FromString,
+            '/trader_joe.proto.ping.v1.PingService/Ping',
+            trader__joe_dot_proto_dot_ping_dot_v1_dot_ping__pb2.PingRequest.SerializeToString,
+            trader__joe_dot_proto_dot_ping_dot_v1_dot_ping__pb2.PingResponse.FromString,
             options,
             channel_credentials,
             insecure,

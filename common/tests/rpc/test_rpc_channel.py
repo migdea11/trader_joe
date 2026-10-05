@@ -9,7 +9,7 @@ The client's reconnect backoff cap in common/rpc/config.py is pinned here too, b
 what keeps O1 true after a long outage (measured in tj-3mk3u5.23's notes), and nothing else in the
 suite would notice it go.
 
-Calls go through common.rpc.ping, never through common.rpc.generated (TID251, D3). Every server
+Calls go through common.rpc.ping, never through the generated trader_joe.proto (TID251, D3). Every server
 binds 127.0.0.1, and every network await is bounded by GUARD_S.
 """
 

@@ -112,36 +112,55 @@ lock:  ## Re-resolve uv.lock from pyproject.toml (the only target that changes t
 init: $(VENV_MARKER)  ## Initialize the project, including the security tooling
 	uv sync --all-groups --no-group agent-mcp
 
-# THE gRPC CODEGEN (ADR tj-8konfu D1 and D3, re-homed by addendum A1; tj-3mk3u5.23). proto/ at the
-# repository root is the source of truth for what crosses the wire, and common/rpc/generated/ is the
-# server's COMMITTED copy of protoc's output. This target is the one way that copy is written: run it
-# after any .proto change and commit both together. CI's lint-and-test job runs it and fails on any
-# difference, because committed generated code without that check is worse than generating at build
-# time -- a committed copy can go stale, and a build-time one cannot.
+# THE gRPC CODEGEN (ADR tj-8konfu D1 and D3, re-homed by addendum A1; decision tj-3mk3u5.42 F1).
+# proto/ at the repository root is the source of truth for what crosses the wire, and
+# gen/proto/python/ is the COMMITTED Python tree protoc writes from it: one tree per language
+# (gen/proto/<language>/), used by every Python consumer. This target is the one way that tree is
+# written: run it after any .proto change and commit both together. CI's lint-and-test job runs it and
+# fails on any difference, because committed generated code without that check is worse than
+# generating at build time -- a committed copy can go stale, and a build-time one cannot.
 #
-# THE IMPORT TRAP, AND WHY -I CARRIES A MAPPING. protoc writes a generated module's imports from the
-# .proto's path under its include root, never from where the output lands. With a plain -Iproto,
-# trader_joe/ping/v1/ping.proto yields `from trader_joe.ping.v1 import ping_pb2`: a package that is
-# nowhere on the path, under pytest (the repository root) or in the image (PYTHONPATH=/code). The
-# virtual include root -I$(PROTO_OUT)=$(PROTO_SRC) makes protoc see that file as
-# common/rpc/generated/trader_joe/ping/v1/ping.proto, so the import becomes
-# `from common.rpc.generated.trader_joe.ping.v1 import ping_pb2`, which resolves in both with no
-# sys.path change; --python_out=. then lands the tree under common/rpc/generated/. What that costs is
-# in proto/README.md: one .proto cannot import ANOTHER of this repo's .proto files by its canonical
-# path. Well-known types (google/protobuf/*.proto) are unaffected.
+# THE IMPORT TRAP, AND WHY THE PLAIN ROOT AVOIDS IT. protoc names every generated module, and writes
+# every import in it, after the .proto's path under the include root -- never after where the output
+# lands, and never after the proto package. With the plain -I$(PROTO_SRC), the output tree therefore
+# mirrors the proto packages: trader_joe/proto/ping/v1/ping.proto becomes
+# $(PROTO_GEN)/trader_joe/proto/ping/v1/ping_pb2.py, and ping_pb2_grpc.py imports it as
+# `from trader_joe.proto.ping.v1 import ping_pb2`. So imports resolve as protoc writes them, one .proto
+# can import another by its canonical path, and every descriptor records its canonical file name -- the
+# name every other consumer generating from proto/ records too. gen/proto/python reaches Python by
+# CONFIGURATION, never by code, in three places: pytest.ini's pythonpath, the image's PYTHONPATH plus
+# its COPY of ./gen/proto/python (Dockerfile), and a bind mount beside every ./common mount (the
+# compose files). NOTHING EDITS THE OUTPUT: no rewrite, no post-processing, no check of import lines.
+# What is committed is protoc's, byte for byte.
 #
-# Everything in the output directory but its package __init__.py is deleted first, so a removed
-# .proto leaves no stale module behind; the guard refuses to clear a directory that is not that
-# package. Inputs are sorted for a stable command line. grpcio-tools is pinned exactly in
-# pyproject.toml, because its version is written into every file it emits.
+# TWO GUARDS, before anything is deleted. $(PROTO_PKG)/__init__.py, hand-committed and the one file
+# there protoc does not write, must exist, so the target never clears a directory that is not the
+# generated package. And every .proto must lie under $(PROTO_SRC)/trader_joe/proto/, the reserved root
+# (every package is trader_joe.proto.<domain>.v1): a file anywhere else would generate outside the
+# directory cleared below, so what this target clears would no longer equal what it writes. Then
+# everything in $(PROTO_PKG) but its __init__.py is deleted, so a removed .proto leaves no stale module
+# behind. gen/proto/python/trader_joe/ gets no __init__.py, ever: trader_joe is a PEP 420 namespace the
+# hand-written trader_joe.common and trader_joe.client will share, and one __init__.py there makes the
+# other portions unimportable. Inputs are sorted for a stable command line. grpcio-tools is pinned
+# exactly in pyproject.toml, because its version is written into every file it emits.
+#
+# A SCRATCH TREE runs the real recipe without touching this one: override both roots on the command
+# line, e.g. `make proto PROTO_SRC=/tmp/x/proto PROTO_GEN=/tmp/x/gen/proto/python`. PROTO_PKG follows
+# PROTO_GEN, and the scratch PROTO_PKG needs its own __init__.py first.
 PROTO_SRC := proto
-PROTO_OUT := common/rpc/generated
+PROTO_GEN := gen/proto/python
+PROTO_PKG := $(PROTO_GEN)/trader_joe/proto
 
 .PHONY: proto
-proto: $(VENV_MARKER)  ## Regenerate common/rpc/generated/ from proto/ (commit both; CI fails on a stale tree)
-	@[ -f "$(PROTO_OUT)/__init__.py" ] || { echo "make proto: $(PROTO_OUT)/__init__.py is missing; refusing to clear a directory that is not the generated package." >&2; exit 1; }
-	find "$(PROTO_OUT)" -mindepth 1 -maxdepth 1 ! -name __init__.py -exec rm -rf {} +
-	uv run python -m grpc_tools.protoc -I$(PROTO_OUT)=$(PROTO_SRC) --python_out=. --grpc_python_out=. --pyi_out=. \
+proto: $(VENV_MARKER)  ## Regenerate gen/proto/python/ from proto/ (commit both; CI fails on a stale tree)
+	@[ -f "$(PROTO_PKG)/__init__.py" ] || { echo "make proto: $(PROTO_PKG)/__init__.py is missing; refusing to clear a directory that is not the generated package." >&2; exit 1; }
+	@outside="$$(find "$(PROTO_SRC)" -name '*.proto' ! -path "$(patsubst %/,%,$(PROTO_SRC))/trader_joe/proto/*" | LC_ALL=C sort)"; \
+	[ -z "$$outside" ] || { \
+		echo "make proto: every .proto must lie under $(PROTO_SRC)/trader_joe/proto/ (package trader_joe.proto.<domain>.v1); refusing, generating nothing. Outside it:" >&2; \
+		printf '%s\n' "$$outside" | sed 's/^/  /' >&2; \
+		exit 1; }
+	find "$(PROTO_PKG)" -mindepth 1 -maxdepth 1 ! -name __init__.py -exec rm -rf {} +
+	uv run python -m grpc_tools.protoc -I$(PROTO_SRC) --python_out=$(PROTO_GEN) --grpc_python_out=$(PROTO_GEN) --pyi_out=$(PROTO_GEN) \
 		$$(find $(PROTO_SRC) -name '*.proto' | LC_ALL=C sort)
 
 # Every compose target goes through one of these, and none omits -f. A bare
@@ -586,7 +605,9 @@ lint: $(VENV_MARKER)  ## Lint and format-check the project (scope with PATHS=)
 
 # ./tools holds the agent-stack MCP server (tools/agent_mcp, ADR tj-4rr0la section 6): build
 # tooling, but it holds Docker access, so bandit reads it like production source.
-SOURCE_DIRS := ./common ./routers ./schemas ./data ./tools
+# ./gen/proto/python is generated, but the image copies it and runs it, so bandit reads it too
+# (decision tj-3mk3u5.42 F1). CI's SOURCE_PATHS must name the same roots.
+SOURCE_DIRS := ./common ./routers ./schemas ./data ./tools ./gen/proto/python
 .PHONY: lint-fix
 lint-fix: $(VENV_MARKER)  ## Apply lint fixes and formatting (scope with PATHS=)
 	uv run ruff check --fix $(PATHS)
@@ -726,8 +747,9 @@ test-all: $(VENV_MARKER)  ## Run every test, external included: needs live crede
 #                               container's entrypoint refuses to start pytest at offset +0000.
 #   POSTGRES_ASYNC, POSTGRES_SYNC
 #                               the driver flags, as $(PYTEST_ENV) sets them for every host target.
-#   PYTHONPATH                  /code, the mount root, so `from data.store.app... import` resolves:
-#                               tests/system has no package chain above it.
+#   PYTHONPATH                  /code:/code/gen/proto/python, the image's model: the mount root, so
+#                               `from data.store.app... import` resolves (tests/system has no
+#                               package chain above it), then the generated code's root.
 #
 # THE RECIPE READS NO .env VALUE; .env only has to exist. Compose interpolates the credentials into
 # the container itself, so no secret passes through make's shell, a command line or this recipe's

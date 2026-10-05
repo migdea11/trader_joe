@@ -163,7 +163,7 @@ def match_client_request(
             return client.get_stock_latest_trade, StockLatestTradeRequest
         ### CRYPTO ###
         ### OPTION ###
-        case (_, _):
+        case _:
             raise InvalidRequestError(
                 Reason.UNSUPPORTED_ASSET_TYPE,
                 f'Alpaca does not serve this yet: asset_type={asset_type.value}, data_type={data_type.value}',
@@ -215,6 +215,7 @@ async def fetch_data_type(
             own retries of 429 and 504 are spent.
         requests.exceptions.ConnectionError: If the vendor cannot be reached.
         requests.exceptions.Timeout: If the vendor does not answer in time.
+        requests.exceptions.ChunkedEncodingError: If the connection is cut while the body is read.
     """
     client_request, client_request_type = match_client_request(
         client if client is not None else get_client(), AssetType.STOCK, data_type, latest

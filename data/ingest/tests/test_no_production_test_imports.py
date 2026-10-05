@@ -16,10 +16,11 @@ scan read through the same helper, so R4 is enforced at one strength in every sc
 
 SCOPE: every module under PRODUCTION_ROOTS, which mirror the source COPY lines of the Dockerfile's
 service_build_image stage, the stage both the dev and prod images copy /code from:
-    line 41  COPY ./common   -> common
-    line 42  COPY ./routers  -> routers    (all of it, not only routers/data_ingest)
-    line 43  COPY ./schemas  -> schemas
-    line 46  COPY ./${SERVICE_PATH}/${SERVICE_NAME}/app  -> data/ingest/app for this image
+    COPY ./common            -> common
+    COPY ./routers           -> routers           (all of it, not only routers/data_ingest)
+    COPY ./schemas           -> schemas
+    COPY ./gen/proto/python  -> gen/proto/python  (committed protoc output, decision tj-3mk3u5.42 F1)
+    COPY ./${SERVICE_PATH}/${SERVICE_NAME}/app  -> data/ingest/app for this image
 The roots are hard-coded, not parsed from the Dockerfile -- reading them from it would make the
 scan and its oracle the same code -- so a change to those COPY lines must be mirrored here by hand.
 test_the_roots_are_the_dockerfile_copy_sources asserts the mirror: the directory sources of that
@@ -28,6 +29,12 @@ recognise is a failure, never a skip. As a second backstop, the scan checks that
 first-party module data/ingest/app imports, transitively: a root narrowed below what the app
 actually loads goes red there. Test directories inside the roots are skipped; they are the test
 tree.
+
+FIRST-PARTY MEANS ON THE IMAGE'S PATH. A dotted name resolves against each of the image's PYTHONPATH
+entries in order (common/tests/image_path.py, pinned to the Dockerfile's ENV PYTHONPATH): the
+repository root, then gen/proto/python, where trader_joe.proto lives. Resolved from the root alone,
+generated code is invisible to the reach walk, and an app that imports it through common.rpc would
+pass that walk with the generated tree unscanned and uncopied.
 
 MARKER: data_ingest. Under pytest.ini's rule a test carries the marker of the component whose
 interface it drives; this one drives none, so the marker names the component whose production
@@ -39,12 +46,15 @@ from pathlib import Path
 
 import pytest
 
+from common.tests.image_path import image_import_roots
+
 
 pytestmark = pytest.mark.data_ingest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 APP_ROOT = 'data/ingest/app'
-PRODUCTION_ROOTS = (APP_ROOT, 'routers', 'common', 'schemas')
+GENERATED_ROOT = 'gen/proto/python'
+PRODUCTION_ROOTS = (APP_ROOT, 'routers', 'common', 'schemas', GENERATED_ROOT)
 TEST_PACKAGE = 'tests'
 DYNAMIC_IMPORTERS = ('import_module', '__import__')
 
@@ -276,12 +286,30 @@ def test_the_roots_are_the_dockerfile_copy_sources():
 
 
 def module_file(module: str) -> Path | None:
-    """The repo source file a dotted module name resolves to, or None when it is not first-party."""
-    base = REPO_ROOT.joinpath(*module.split('.'))
-    for candidate in (base.with_suffix('.py'), base / '__init__.py'):
-        if candidate.is_file():
-            return candidate
+    """The repo source file a dotted module name resolves to, or None when it is not first-party.
+
+    Searched as the image's interpreter searches: each PYTHONPATH entry in order, the repository root
+    first, then gen/proto/python (see FIRST-PARTY MEANS ON THE IMAGE'S PATH above).
+    """
+    for root in image_import_roots(REPO_ROOT):
+        base = root.joinpath(*module.split('.'))
+        for candidate in (base.with_suffix('.py'), base / '__init__.py'):
+            if candidate.is_file():
+                return candidate
     return None
+
+
+def test_the_resolver_finds_generated_code_on_the_images_second_root():
+    # Non-vacuous for the reach walk below: no app imports generated code yet (registered_services()
+    # is empty), so that walk alone would pass with a resolver that never looks past the root. The
+    # one importer today, common.rpc.ping, is followed here instead, as the walk will follow it.
+    generated = REPO_ROOT / GENERATED_ROOT / 'trader_joe' / 'proto' / 'ping' / 'v1'
+    assert module_file('trader_joe.proto.ping.v1.ping_pb2') == generated / 'ping_pb2.py'
+    assert module_file('trader_joe.proto.ping.v1.ping_pb2_grpc') == generated / 'ping_pb2_grpc.py'
+    assert module_file('common.rpc.ping') == REPO_ROOT / 'common' / 'rpc' / 'ping.py'
+    reached = {module_file(module) for _, module in imported_modules(REPO_ROOT / 'common' / 'rpc' / 'ping.py')}
+    assert generated / 'ping_pb2.py' in reached, 'common.rpc.ping no longer reaches the generated modules'
+    assert reached - {None} <= set(production_modules()), 'common.rpc.ping imports a module the scan does not read'
 
 
 def test_the_scan_reaches_every_module_the_app_imports():

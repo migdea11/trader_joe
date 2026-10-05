@@ -22,7 +22,9 @@ WORKDIR /code
 # cooldown in pyproject.toml. Matches Makefile UV_VERSION and the CI workflow.
 COPY --from=ghcr.io/astral-sh/uv:0.12.19@sha256:04d046b13e60d6bcec73cbc5e1cad25d680dea90c8573340950a0ac2d1aef424 /uv /uvx /bin/
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
-ENV PYTHONPATH="/code"
+# /code/gen/proto/python is the generated gRPC code's import root (trader_joe.proto; decision
+# tj-3mk3u5.42 F1), reached by configuration, never by code. pytest.ini's pythonpath mirrors it.
+ENV PYTHONPATH="/code:/code/gen/proto/python"
 ENV PATH="/code/.venv/bin:${PATH}"
 
 COPY ./pyproject.toml /code/pyproject.toml
@@ -45,11 +47,13 @@ RUN uv sync --only-group base --only-group ${SERVICE_PATH}-${SERVICE_NAME} --fro
 # GHCR. data/store/migrations/env.py calls load_dotenv('.env'), which is a no-op when the
 # file is absent; it reads DATABASE_URI from the process environment either way.
 
-# Add common files
+# Add common files. gen/proto/python is the committed protoc output common/rpc imports; without it
+# the image starts until the first servicer that imports generated code is registered, then fails.
 COPY ./entrypoint.sh /code/entrypoint.sh
 COPY ./common /code/common
 COPY ./routers /code/routers
 COPY ./schemas /code/schemas
+COPY ./gen/proto/python /code/gen/proto/python
 
 # Add service-specific files
 COPY ./${SERVICE_PATH}/${SERVICE_NAME}/app /code/${SERVICE_PATH}/${SERVICE_NAME}/app
@@ -64,7 +68,7 @@ RUN uv sync --only-group base --only-group ${SERVICE_PATH}-${SERVICE_NAME} --onl
 # Python plus the client-side dependencies -- with the testing group layered on top. When the
 # SDK image exists (tj-d2mhru) this becomes FROM that image instead.
 #
-# NO SOURCE IS COPIED: compose bind-mounts common, routers, schemas, data/store/app,
+# NO SOURCE IS COPIED: compose bind-mounts common, routers, schemas, gen/proto/python, data/store/app,
 # data/store/migrations, tests/system and pytest.ini read-only from the checkout, so a test edit
 # needs no rebuild and a stale image cannot run old tests. Placed before the deploy stages so
 # prod_image stays the last stage, the one a target-less `docker build` produces.
@@ -90,9 +94,9 @@ ARG SERVICE_NAME=none
 RUN addgroup --system appgroup && adduser --ingroup appgroup appuser
 USER appuser
 
-# Setup environment
+# Setup environment. PYTHONPATH as in base_build_image: the root, then the generated code's root.
 WORKDIR /code
-ENV PYTHONPATH="/code"
+ENV PYTHONPATH="/code:/code/gen/proto/python"
 ENV PATH="/code/.venv/bin/:${PATH}"
 
 # Setup service execution
