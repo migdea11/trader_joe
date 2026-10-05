@@ -84,9 +84,23 @@ pytestmark = pytest.mark.data_store
 # (data/store/*, routers, common, schemas) and the repository root (gen/proto/python). The two files
 # read by name below, Dockerfile and docker-compose.yaml, stay at the top of the repository and so
 # take REPO_ROOT directly.
-APP_ROOT = 'data/store/app'
-PRODUCTION_ROOTS = (APP_ROOT, 'routers', 'common', 'schemas', GENERATED_ROOT)
+#
+# AND THEY ARE SPELLED AS THE BUILD CONTEXT SPELLS THEM (tj-iontkq.4), because the mirror tests
+# compare these names with the Dockerfile's COPY sources and compose's bind sources as STRINGS:
+# those read server/common and ./server/data/store/migrations since the service trees moved, so
+# these must too. resolve_tree() keys on the first component and resolves either spelling, and
+# repo_relative() keeps naming a server file by its import path, so nothing else here changes.
+APP_ROOT = 'server/data/store/app'
+PRODUCTION_ROOTS = (APP_ROOT, 'server/routers', 'server/common', 'server/schemas', GENERATED_ROOT)
+# The DOTTED module name, which the move did not touch: PYTHONPATH points at the server root, so
+# the package is still data.store.seeds. It is what the import ban below matches on.
 SEED_PACKAGE = 'data.store.seeds'
+# The same tree as a BUILD-CONTEXT PATH, which is no longer the dotted name with dots swapped for
+# slashes. test_the_image_does_not_copy_the_seed_producer compares it against the COPY sources with
+# == and startswith, so a bare data/store/seeds could never match after the move and the guard
+# would pass WITHOUT GUARDING -- a seed producer copied into the image would stop being caught
+# (architect finding S1 on tj-iontkq.4). Derived from SEED_PACKAGE so the two cannot drift.
+SEED_DIRECTORY = f'server/{SEED_PACKAGE.replace(".", "/")}'
 DOCKERFILE = REPO_ROOT / 'Dockerfile'
 # The build args docker-compose.yaml passes for the data_store service.
 STORE_BUILD_ARGS = {'SERVICE_PATH': 'data', 'SERVICE_NAME': 'store'}
@@ -157,11 +171,10 @@ def test_the_roots_are_the_dockerfile_copy_sources():
 def test_the_image_does_not_copy_the_seed_producer():
     # The premise of forbidding the import: seeds is not shipped. If a COPY ever brought it in, the
     # rule here would be the wrong one, and that must be decided, not discovered in prod.
-    seed_directory = SEED_PACKAGE.replace('.', '/')
-    assert resolve_tree(seed_directory).is_dir(), f'{seed_directory} is gone; revisit this guard'
+    assert resolve_tree(SEED_DIRECTORY).is_dir(), f'{SEED_DIRECTORY} is gone; revisit this guard'
     copied = dockerfile_copy_directories()
-    assert not any(seed_directory == source or seed_directory.startswith(f'{source}/') for source in copied), (
-        f'{SOURCE_STAGE} copies {seed_directory} into the data_store image'
+    assert not any(source == SEED_DIRECTORY or SEED_DIRECTORY.startswith(f'{source}/') for source in copied), (
+        f'{SOURCE_STAGE} copies {SEED_DIRECTORY} into the data_store image'
     )
 
 
@@ -253,9 +266,11 @@ def test_no_shipped_module_imports_the_test_tree_or_the_seed_producer():
 
 COMPOSE_FILE = REPO_ROOT / 'docker-compose.yaml'
 COMPOSE_SERVICE = 'data_store'
-MIGRATIONS_ROOT = 'data/store/migrations'
+# Build-context spellings, as PRODUCTION_ROOTS above: these are compared with compose's ./ bind
+# sources, which now read ./server/data/store/... (tj-iontkq.4).
+MIGRATIONS_ROOT = 'server/data/store/migrations'
 MOUNTED_ROOTS = (MIGRATIONS_ROOT,)
-ALEMBIC_INI = 'data/store/alembic.ini'
+ALEMBIC_INI = 'server/data/store/alembic.ini'
 # A named volume: a bare identifier, which carries no source from the checkout.
 NAMED_VOLUME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*')
 

@@ -35,6 +35,7 @@ from pathlib import Path
 import pytest
 
 from common.errors.vocabulary import ERROR_DOMAIN, METADATA_KEYS, REASONS, RESERVED_REASONS, Reason
+from common.tests.roots import SERVER_ROOT
 from tools import errors_doc
 from tools.errors_doc import (
     _TABLE_COLUMNS,
@@ -51,6 +52,13 @@ from tools.errors_doc import (
 
 
 MODULE_PATH = REPO_ROOT / 'tools' / 'errors_doc.py'
+
+# THE TWO ROOTS A FIRST-PARTY IMPORT CAN RESOLVE AGAINST (tj-iontkq.4). errors_doc.py's own
+# REPO_ROOT is `tools/..`, which is still the true repository root because tools/ did not move --
+# but common/ did, so the generator's two halves no longer share one import root. Order matters as
+# it does on any PYTHONPATH: the server root first, as the service image has it.
+_FIRST_PARTY_ROOTS = (SERVER_ROOT, REPO_ROOT)
+_FIRST_PARTY_PYTHONPATH = os.pathsep.join(str(root) for root in _FIRST_PARTY_ROOTS)
 
 # A markdown cell boundary: a pipe the generator did not escape. Splitting on a bare '|' would cut a
 # cell whose text contains one in half, and the generator escapes exactly so that it does not have to.
@@ -236,7 +244,10 @@ def test_the_rendering_is_identical_under_a_different_hash_seed():
         done = subprocess.run(
             [sys.executable, '-c', 'from tools.errors_doc import render_document; print(render_document(), end="")'],
             cwd=REPO_ROOT,
-            env={**os.environ, 'PYTHONHASHSEED': seed},
+            # The child imports tools.errors_doc, which imports common.errors, and those two now
+            # live under different roots: tools/ stayed at the top of the repository and common/
+            # moved under server/ (tj-iontkq.4). cwd alone used to supply both.
+            env={**os.environ, 'PYTHONHASHSEED': seed, 'PYTHONPATH': _FIRST_PARTY_PYTHONPATH},
             capture_output=True,
             text=True,
             check=False,
@@ -360,7 +371,13 @@ def test_the_generator_imports_only_the_standard_library_and_the_repository():
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
             roots.add(node.module.split('.')[0])
 
-    first_party = {path.name for path in REPO_ROOT.iterdir() if (path / '__init__.py').exists()}
+    # BOTH ROOTS (tj-iontkq.4). A top-level importable package sits under the repository root
+    # (tools, tests) or under the server root (common, data, routers, schemas); before the move
+    # one iterdir() found them all, and a scan of the repository root alone would now report
+    # `common` as a third-party import.
+    first_party = {
+        path.name for root in _FIRST_PARTY_ROOTS for path in root.iterdir() if (path / '__init__.py').exists()
+    }
     assert roots, 'no imports were found, so this test is not reading the module it thinks it is'
     outside = sorted(root for root in roots if root not in _STDLIB and root not in first_party)
     assert outside == [], f'tools/errors_doc.py imports outside the standard library and the repository: {outside}'

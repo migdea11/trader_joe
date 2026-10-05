@@ -37,7 +37,7 @@ BUF_SHA256_AARCH64 := 902b75267db7f4391e99b7fa0756050e5354234cc0437ef50eee9c7889
 # run a BASH rule set, and on this tree that is FOUR rules over six files, against the 337 Python
 # rules it runs beside them. Four generic rules are not a shell linter. So the real static check the
 # ~770 lines of bash here had ever had was `bash -n`, which establishes that a file parses and
-# nothing else. That gap sat under tools/source_digest.sh and data/store/run_migrations.sh, which
+# nothing else. That gap sat under tools/source_digest.sh and server/data/store/run_migrations.sh, which
 # are a digest tool and a verification guard: the least-checked code in the tree was the code a
 # human is asked to trust. (And `make security` is still the wrong home for this -- shellcheck is a
 # linter, and that target must keep running the identical invocation CI runs.)
@@ -349,7 +349,7 @@ prod-down:  ## Stop the production stack
 # it reaches the database. It needs no egress and no devnet.
 .PHONY: migrate
 migrate:  ## Apply database migrations to the running production stack
-	./data/store/run_migrations.sh
+	./server/data/store/run_migrations.sh
 
 # READ-ONLY, and the approval for this target was conditional on staying that way: `current`
 # reads the alembic_version table, `history` reads the revision files, and neither writes
@@ -370,8 +370,8 @@ migrate:  ## Apply database migrations to the running production stack
 # alembic has no one command for both, and each container is --rm, so the cost is one extra start.
 .PHONY: migrate-status
 migrate-status:  ## Report the applied revision and the revision history (read-only)
-	./data/store/run_migrations.sh current
-	./data/store/run_migrations.sh history
+	./server/data/store/run_migrations.sh current
+	./server/data/store/run_migrations.sh history
 
 # THE DRIFT DIAGNOSTIC, AND IT IS NOT READ-ONLY -- which is the whole reason it is a target of its
 # own rather than a third line of `migrate-status`.
@@ -422,7 +422,7 @@ migrate-status:  ## Report the applied revision and the revision history (read-o
 # reads documents nothing.
 .PHONY: migrate-check
 migrate-check:  ## Compare the models with the live schema (writes alembic_version if absent). REFUSES unless the data_store image's source stamp matches this checkout's digest; an unstamped CI or system-launch image is the ordinary case, not a fault -- make prod-build fixes it. What the stamp does and does not cover: see the comment above. Escape hatch: MIGRATE_CHECK_ALLOW_STALE_IMAGE=1
-	./data/store/run_migrations.sh check
+	./server/data/store/run_migrations.sh check
 
 .PHONY: dev-build
 dev-build: $(VENV_MARKER)  ## Build the development images (:dev), stamped with the source digest
@@ -481,7 +481,7 @@ dev-prune: ## Prune development services
 # `launch-deps` ran dev while the help text said production, and `build` produced prod
 # images no target ever started (tj-6ap2vw). Failing here rather than deleting the names
 # outright means muscle memory gets a pointer instead of picking a stack silently -- and
-# data/store/run_migrations.sh still names `make launch-deps` in its error path, so that
+# server/data/store/run_migrations.sh still names `make launch-deps` in its error path, so that
 # hint degrades into this message rather than into nothing. No `##`: `make help` lists the
 # real targets only.
 .PHONY: build build-clean launch launch-deps launch-down
@@ -1146,7 +1146,10 @@ shellcheck-install:  ## Install the pinned shellcheck, checksum-verified, into S
 # tooling, but it holds Docker access, so bandit reads it like production source.
 # ./gen/proto/python is generated, but the image copies it and runs it, so bandit reads it too
 # (decision tj-3mk3u5.42 F1). CI's SOURCE_PATHS must name the same roots.
-SOURCE_DIRS := ./common ./routers ./schemas ./data ./tools ./gen/proto/python
+# The four service trees live under ./server since epic tj-iontkq; ./tools and ./gen stay at the
+# top of the repository. Get a root wrong and bandit scans nothing and exits 0, which is why
+# common/tests/test_ci_invariants.py asserts every scanner root here is a real directory.
+SOURCE_DIRS := ./server/common ./server/routers ./server/schemas ./server/data ./tools ./gen/proto/python
 
 # semgrep runs with --error, so a finding fails this target (and the CI step) instead of printing
 # and exiting 0 (tj-cg2i9p).
@@ -1203,9 +1206,9 @@ test-cov: $(VENV_MARKER)  ## Run the PR gate with coverage (scope with PATHS=)
 	uv run coverage xml
 
 # One parameterised target rather than one per component, so the set of components can change
-# without touching this file. `make test PATHS=data/store/tests` does the same job today, but
-# only until the Phase 1 restructure (tj-55cczk) moves every path -- markers survive that,
-# PATHS= does not. Component names are the `markers` list in pytest.ini.
+# without touching this file. `make test PATHS=server/data/store/tests` does the same job today,
+# but the path is exactly what the monorepo split (tj-iontkq.4) just rewrote -- markers survived
+# that move untouched, PATHS= did not. Component names are the `markers` list in pytest.ini.
 #
 # A COMPONENT that matches nothing is not silently green: pytest collects nothing and exits 5.
 # The guard is for the EMPTY case only, which would otherwise hand pytest the unparseable

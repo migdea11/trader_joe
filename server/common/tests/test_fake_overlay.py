@@ -36,6 +36,7 @@ from common.tests.test_ci_invariants import (
     _REFUSED_GUARDS,
     MAKEFILE,
     REPO_ROOT,
+    SERVER_ROOT,
     SYSTEM_GUARD,
     _compose_calls,
     _compose_projects,
@@ -53,7 +54,9 @@ pytestmark = pytest.mark.build_infra
 SYSTEM_LAUNCH = 'system-launch'
 FAKES_DIR = REPO_ROOT / 'tests' / 'fakes'
 LAUNCHER = FAKES_DIR / 'ingest_launcher.py'
-BROKER_API = REPO_ROOT / 'data' / 'ingest' / 'app' / 'brokers' / 'alpaca' / 'broker_api.py'
+# SERVER_ROOT: data/ingest travels with the service trees (tj-iontkq.4). tests/fakes above does
+# not -- it stays at the top of the repository, which is why the two take different roots.
+BROKER_API = SERVER_ROOT / 'data' / 'ingest' / 'app' / 'brokers' / 'alpaca' / 'broker_api.py'
 # Spelled out, not read from the overlay: the oracle must not be the file under test.
 FAKE_MOUNT = {'type': 'bind', 'source': './tests/fakes', 'target': '/code/tests/fakes', 'read_only': True}
 # The swapped command after compose's interpolation ($$ -> $), as the container's /bin/sh -c sees it:
@@ -346,7 +349,8 @@ def test_no_dockerfile_copy_reads_the_test_tree():
     file, is what keeps the fakes out of every image.
     """
     sources = _dockerfile_copy_sources()
-    assert {'common', 'routers', 'schemas', 'data/ingest/app'} <= sources, sources
+    # Build-context spellings: the service trees are COPYed out of ./server (tj-iontkq.4).
+    assert {'server/common', 'server/routers', 'server/schemas', 'server/data/ingest/app'} <= sources, sources
     test_tree = PurePosixPath('tests')
     offending = sorted(
         source

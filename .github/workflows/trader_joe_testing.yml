@@ -76,7 +76,11 @@ env:
   # uv warns, then asserts the lock is current, so a stale lock still fails the job. Matches the
   # Makefile's exported UV_FROZEN.
   UV_FROZEN: "1"
-  SOURCE_PATHS: "./common ./routers ./schemas ./data ./tools ./gen/proto/python"
+  # bandit's roots, and they must stay character-for-character the Makefile's SOURCE_DIRS:
+  # common/tests/test_ci_invariants.py compares the two invocations as argv. The four service
+  # trees moved under ./server in epic tj-iontkq.4; ./tools and ./gen stay at the top of the
+  # repository. Get a root wrong and bandit scans nothing and exits 0.
+  SOURCE_PATHS: "./server/common ./server/routers ./server/schemas ./server/data ./tools ./gen/proto/python"
 
 jobs:
   testing:

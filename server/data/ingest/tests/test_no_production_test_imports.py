@@ -59,9 +59,15 @@ pytestmark = pytest.mark.data_ingest
 #   * DOCKERFILE is the repository's own Dockerfile, which stays at the top: REPO_ROOT.
 #   * module_file() searches as the IMAGE's interpreter searches, so it is handed SERVER_ROOT, the
 #     directory the image calls /code.
-APP_ROOT = 'data/ingest/app'
+#
+# AND THEY ARE SPELLED AS THE BUILD CONTEXT SPELLS THEM (tj-iontkq.4), because
+# test_the_roots_are_the_dockerfile_copy_sources compares this tuple with the Dockerfile's COPY
+# sources as STRINGS: those read server/common since the service trees moved, so these must too.
+# resolve_tree() keys on the first component and resolves either spelling, and repo_relative()
+# keeps naming a server file by its import path, so nothing else in this file changes.
+APP_ROOT = 'server/data/ingest/app'
 GENERATED_ROOT = 'gen/proto/python'
-PRODUCTION_ROOTS = (APP_ROOT, 'routers', 'common', 'schemas', GENERATED_ROOT)
+PRODUCTION_ROOTS = (APP_ROOT, 'server/routers', 'server/common', 'server/schemas', GENERATED_ROOT)
 TEST_PACKAGE = 'tests'
 DYNAMIC_IMPORTERS = ('import_module', '__import__')
 

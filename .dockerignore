@@ -5,7 +5,7 @@ docker-compose.*.yaml
 Dockerfile
 .dockerignore
 
-# Environments. These hold live credentials -- data/ingest/.env carries the Alpaca API
+# Environments. These hold live credentials -- server/data/ingest/.env carries the Alpaca API
 # key -- and nothing in the image reads them: compose supplies configuration at runtime
 # via env_file:. Keeping them out of the build context means a stray COPY cannot pick
 # one up either. .env.default is committed and harmless, so it is not excluded.
@@ -36,12 +36,16 @@ volume_data/
 # C extensions
 *.so
 
-# Test directories under the Dockerfile's COPY roots (tj-v82dvm). The image copies common/,
-# routers/ and schemas/ whole, so without these their suites ship in every service image. No
-# production module imports them (decision tj-j4wknb R4). The top-level tests/ is never copied.
-common/tests/
-routers/tests/
-schemas/tests/
+# Test directories under the Dockerfile's COPY roots (tj-v82dvm). The image copies
+# server/common/, server/routers/ and server/schemas/ whole, so without these their suites ship in
+# every service image. No production module imports them (decision tj-j4wknb R4). The top-level
+# tests/ is never copied.
+# These are BUILD-CONTEXT paths, so they carry the server/ prefix the COPY sources carry (epic
+# tj-iontkq, R-2): a rule that still read common/tests/ would match nothing and fail silently --
+# the suites would simply start shipping again with every check still green.
+server/common/tests/
+server/routers/tests/
+server/schemas/tests/
 
 # The three root siblings that are not server code (tj-iontkq.1). Every service build sets
 # context: . -- docker-compose.yaml for both services, plus docker-compose.test-client.yaml and

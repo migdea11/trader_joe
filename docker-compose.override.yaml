@@ -41,13 +41,18 @@ services:
       target: dev_image
     read_only: true
     volumes:
-      - ./data/store/app:/code/data/store/app
-      - ./common:/code/common
-      # Beside ./common always: the generated code common/rpc imports (the image's PYTHONPATH
+      # HOST AND CONTAINER ARE NOT THE SAME LAYOUT, AND THAT IS DELIBERATE (epic tj-iontkq, R-2).
+      # The service trees live under ./server in the checkout and under /code in the image, so the
+      # left of the colon carries server/ and the right never does. The Dockerfile's COPY lines say
+      # the same thing. ./gen/proto/python and ./pytest.ini stay at the top of the repository and so
+      # keep their bare host paths -- only the four moved trees gained the prefix.
+      - ./server/data/store/app:/code/data/store/app
+      - ./server/common:/code/common
+      # Beside ./server/common always: the generated code common/rpc imports (the image's PYTHONPATH
       # names /code/gen/proto/python), so a `make proto` on the host reaches the container too.
       - ./gen/proto/python:/code/gen/proto/python
-      - ./routers:/code/routers
-      - ./schemas:/code/schemas
+      - ./server/routers:/code/routers
+      - ./server/schemas:/code/schemas
     environment:
       - LOG_LEVEL=debug
       # Latency harness client: serves GET /latency (see the header comment).
@@ -63,12 +68,12 @@ services:
     build:
       target: dev_image
     volumes:
-      - ./data/ingest/app:/code/data/ingest/app
-      - ./common:/code/common
-      # Beside ./common, as on data_store.
+      - ./server/data/ingest/app:/code/data/ingest/app
+      - ./server/common:/code/common
+      # Beside ./server/common, as on data_store.
       - ./gen/proto/python:/code/gen/proto/python
-      - ./routers:/code/routers
-      - ./schemas:/code/schemas
+      - ./server/routers:/code/routers
+      - ./server/schemas:/code/schemas
     environment:
       - LOG_LEVEL=debug
       # Latency harness server: answers data_store over REST and gRPC. Must match the

@@ -54,7 +54,7 @@ import pytest
 
 from common.tests import import_path_docker_stub as stub
 from common.tests.compose_model import BASE_FILE, interpolate, load, merge
-from common.tests.image_path import IMAGE_CODE_ROOT, IMAGE_PYTHONPATH_ENTRIES
+from common.tests.image_path import IMAGE_CODE_ROOT, IMAGE_PYTHONPATH_ENTRIES, image_pythonpath
 from common.tests.test_ci_invariants import (
     ENV_DEFAULT_FILE,
     IMPORT_CHECK_STEP,
@@ -62,6 +62,7 @@ from common.tests.test_ci_invariants import (
     MIGRATIONS_SCRIPT,
     PROJECT_DOCKERFILE,
     REPO_ROOT,
+    SERVER_ROOT,
     _compose_calls,
     _container_env,
     _dockerfile_stages,
@@ -99,7 +100,7 @@ KNOWN_MAKEFILE_SETS = frozenset(
 )
 MAKEFILE_SOURCE = 'Makefile'
 STACK_SOURCE = 'tools/agent_mcp/stack.py COMPOSE_FILES'
-MIGRATIONS_SOURCE = 'data/store/run_migrations.sh'
+MIGRATIONS_SOURCE = 'server/data/store/run_migrations.sh'
 WORKFLOW_SOURCE = 'workflow'
 # compose's own default when an invocation names no -f: the base file, then the override beside it.
 DEFAULT_COMPOSE_FILES = ('docker-compose.yaml', 'docker-compose.override.yaml')
@@ -414,11 +415,18 @@ def _run_step(tmp_path: Path, containers: Mapping[str, Mapping[str, str]]) -> tu
     (tmp_path / 'step.sh').write_text(script, encoding='utf-8')
     environment = {
         'PATH': f'{shim.parent}{os.pathsep}{os.environ.get("PATH", "")}',
-        'PYTHONPATH': str(REPO_ROOT),
+        # THE STUB PROCESS's own path, not the modelled container's. It imports common.tests.*, so
+        # it needs the host mirror of the first-party import path; the bare repository root stopped
+        # being enough when the service trees moved under server/ (tj-iontkq.4). It cannot reach the
+        # child the stub starts, which runs -E -P with the container environment and nothing else.
+        'PYTHONPATH': image_pythonpath(),
         'STUB_PYTHON': sys.executable,
         'STUB_IMPL': stub.__file__,
         'STUB_SCENARIO': str(tmp_path / 'scenario.json'),
-        'STUB_CODE_ROOT': str(REPO_ROOT),
+        # The two host directories the one image /code stands in for (tj-iontkq.4): the service
+        # trees under the server root, gen/proto/python under the repository root.
+        'STUB_CODE_ROOT': str(SERVER_ROOT),
+        'STUB_CONTEXT_ROOT': str(REPO_ROOT),
         'STUB_LOG': str(tmp_path / 'docker.log'),
         'STUB_UNMODELLED_LOG': str(tmp_path / 'unmodelled.log'),
     }

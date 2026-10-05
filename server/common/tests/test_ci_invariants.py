@@ -78,15 +78,25 @@ from common.tests.roots import REPO_ROOT, SERVER_ROOT
 # reason the cluster was written this way. On the host today the two roots are equal, so it is
 # correct as it stands.
 #
-# ONCE THEY DIVERGE, THE MOVE HAS TO RULE ON IT (tj-iontkq.4), and this comment is the hand-off
-# rather than a guess made here: the closure's paths would be server-relative while the COPY sources
-# and .dockerignore rules they are judged against are context-relative, and gen/proto/python stays at
-# the repository root while common/ goes down a level. Naming the constant CHECKOUT_CODE_ROOT keeps
-# that question visible instead of hiding it inside whichever sentinel happened to be picked. It is
-# also deliberately ONE value, because four tests below stand up a synthetic flat tree under tmp_path
-# and monkeypatch it -- they patch this name now, which the rename forces and which changes nothing
-# they assert.
-CHECKOUT_CODE_ROOT = SERVER_ROOT
+# THEY HAVE NOW DIVERGED, AND THE MOVE RULED ON IT (tj-iontkq.4): CHECKOUT_CODE_ROOT IS THE
+# BUILD-CONTEXT ROOT. Of the cluster's two jobs, only one can be served by the directory itself.
+# Every path it RENDERS is compared against committed, context-relative data -- the Dockerfile's
+# COPY sources, which now read server/common, and .dockerignore's rules, which now read
+# server/common/tests/ -- and the build context is and stays the repository root. The other job,
+# resolving a dotted module name to a file, is served by searching UNDER this root: the service
+# trees at CHECKOUT_SERVER_DIR, the generated tree and the bind-mounted tests/ at the root itself.
+# image_import_roots takes exactly those two arguments, so one value still drives the whole cluster.
+#
+# IT STAYS DELIBERATELY ONE VALUE, because four tests below stand up a synthetic tree under tmp_path
+# and monkeypatch this name. Both search roots are derived from it, so the monkeypatch still covers
+# every one of the six helpers; splitting it would leave the synthetic trees half-patched. Those
+# trees are flat -- no server/ level -- and they keep working for the reason the pre-move checkout
+# did: the context root is itself one of the search roots.
+#
+# The service trees' directory as the BUILD CONTEXT spells it: `server` since the move, `.` before
+# it. Derived from the two sentinels rather than written down, so it cannot drift from roots.py.
+CHECKOUT_CODE_ROOT = REPO_ROOT
+CHECKOUT_SERVER_DIR = SERVER_ROOT.relative_to(REPO_ROOT)
 
 WORKFLOW_DIR = REPO_ROOT / '.github' / 'workflows'
 COMPOSE_FILE = REPO_ROOT / 'docker-compose.yaml'
@@ -1189,7 +1199,9 @@ EXCLUDED_RULE_FAMILIES = ('PERF', 'RET', 'PIE', 'PTH')
 # - ASYNC109 on postgres_tools.py only: its `timeout` is a retry deadline, not an operation
 #   timeout. The user ruled on 2026-09-28 that it stays as it is (tj-mvqbaf).
 ALLOWED_PERMANENT_FAMILY_SUPPRESSIONS = frozenset(
-    {('**/tests/**', 'DTZ001'), ('common/database/postgres_tools.py', 'ASYNC109')}
+    # Path globs, so the service trees carry the server/ prefix they gained in tj-iontkq.4; the
+    # **/tests/** glob is depth-independent and did not move.
+    {('**/tests/**', 'DTZ001'), ('server/common/database/postgres_tools.py', 'ASYNC109')}
 )
 
 
@@ -1628,7 +1640,9 @@ def test_migrate_still_defaults_to_upgrade_head():
 # deletes. Its Python tree is a SOURCE_DIRS root (bandit reads it, because the image ships it), so
 # this prefix is what keeps the root out of ruff's list without a swallowed-source failure. It names
 # gen/proto/ only: common/rpc/, which imports the tree, is hand-written and stays linted.
-RUFF_UNLINTED_SOURCE_PREFIXES = ('data/store/migrations/versions/', 'gen/proto/')
+# Repository-relative prefixes, compared against `git ls-files` output, so the migrations tree
+# carries the server/ prefix it gained in tj-iontkq.4; gen/proto/ stays at the top and does not.
+RUFF_UNLINTED_SOURCE_PREFIXES = ('server/data/store/migrations/versions/', 'gen/proto/')
 
 
 def _run(*command: str) -> list[str]:
@@ -4888,16 +4902,28 @@ DATA_DIR_SAMPLE_FILE = 'PG_VERSION'
 # nothing cannot pass the "no COPY source is excluded" check vacuously. gen/proto/python is the
 # committed generated gRPC code (decision tj-3mk3u5.42 F1): no app imports it yet, so the closure
 # check below cannot miss it, and this floor is what notices its COPY going.
+# BUILD-CONTEXT SPELLING (tj-iontkq.4): the four service trees are COPYed out of ./server, so these
+# carry the prefix. gen/proto/python stays at the top of the repository and does not.
 KNOWN_COPY_SOURCES = frozenset(
-    {'common', 'routers', 'schemas', 'gen/proto/python', 'data/store/app', 'data/ingest/app'}
+    {
+        'server/common',
+        'server/routers',
+        'server/schemas',
+        'gen/proto/python',
+        'server/data/store/app',
+        'server/data/ingest/app',
+    }
 )
 # The one directory name under a COPY source that .dockerignore may exclude (tj-v82dvm).
 EXCLUDABLE_TEST_DIR = 'tests'
 # Non-vacuity for the reverse pin: the test directories under a COPY source when it was written.
-KNOWN_COPY_SOURCE_TEST_DIRS = frozenset({'common/tests', 'routers/tests', 'schemas/tests'})
+KNOWN_COPY_SOURCE_TEST_DIRS = frozenset({'server/common/tests', 'server/routers/tests', 'server/schemas/tests'})
 # Non-vacuity for the import closure: a module each service app is known to import, and a floor on
 # how many module files its closure reaches (61 for ingest and 74 for store when this was written).
-KNOWN_APP_IMPORTS = {'data/ingest/app': 'routers/common/ping.py', 'data/store/app': 'routers/common/ping.py'}
+KNOWN_APP_IMPORTS = {
+    'server/data/ingest/app': 'server/routers/common/ping.py',
+    'server/data/store/app': 'server/routers/common/ping.py',
+}
 APP_CLOSURE_FLOOR = 40
 
 # ${DATA_DIR}, ${DATA_DIR:-default}, ${DATA_DIR-default}, ${DATA_DIR:?message}, ${DATA_DIR?message} or
@@ -5195,8 +5221,10 @@ def _first_party_module_file(module: str) -> Path | None:
     is not first-party, and an app reaching it through common.rpc would pass the COPY check below
     with the generated tree uncopied (decision tj-3mk3u5.42 F1).
     """
-    # SERVER_ROOT, the import root: this resolves dotted module names (tj-iontkq.2).
-    for root in image_import_roots(CHECKOUT_CODE_ROOT):
+    # Both search roots come from the one context root (tj-iontkq.4): the service trees under
+    # CHECKOUT_SERVER_DIR, everything else -- gen/proto/python, the bind-mounted tests/ -- at the
+    # context root itself. A synthetic flat tree under tmp_path is covered by the second.
+    for root in image_import_roots(CHECKOUT_CODE_ROOT / CHECKOUT_SERVER_DIR, CHECKOUT_CODE_ROOT):
         base = root.joinpath(*module.split('.'))
         for candidate in (base.with_suffix('.py'), base / '__init__.py'):
             if candidate.is_file():
@@ -5453,10 +5481,10 @@ def test_the_copy_source_check_allows_a_tests_dir_and_nothing_else():
 
     Judged against these rules alone, not the committed file, so this pins the check, not the file.
     """
-    assert not _copy_sources_excluded(_dockerignore_rules('common/tests/'))
-    offenders = _copy_sources_excluded(_dockerignore_rules('common/database/'))
-    assert offenders, 'excluding common/database/ went unnoticed'
-    assert all(offender.startswith('common/database/') for offender in offenders), offenders
+    assert not _copy_sources_excluded(_dockerignore_rules('server/common/tests/'))
+    offenders = _copy_sources_excluded(_dockerignore_rules('server/common/database/'))
+    assert offenders, 'excluding server/common/database/ went unnoticed'
+    assert all(offender.startswith('server/common/database/') for offender in offenders), offenders
 
 
 @pytest.mark.build_infra
@@ -6234,7 +6262,10 @@ def _import_time_prints(source: str) -> list[int]:
     return sorted(found)
 
 
-COMMON_PACKAGE = 'common'
+# Repository-relative: it is handed to `git ls-files` from the repository root and joined onto
+# REPO_ROOT, so it carries the server/ prefix the tree gained in tj-iontkq.4. The IMPORT name
+# `common` is unchanged -- this is the path, not the package.
+COMMON_PACKAGE = 'server/common'
 
 
 @pytest.mark.common
@@ -6614,18 +6645,20 @@ SEAM_VIOLATIONS = (
     # module need not exist.
     'from trader_joe.proto.market.v1 import bar_pb2',
 )
+# Repository paths, handed to ruff as --stdin-filename, so they carry the server/ prefix the four
+# service trees gained (tj-iontkq.4) -- it is what the per-file-ignore for the seam now matches on.
 OUTSIDE_THE_SEAM = (
-    'common/probe.py',
-    'common/tests/test_probe.py',
-    'common/tests/rpc/test_probe.py',
-    'routers/common/probe.py',
-    'schemas/common/probe.py',
-    'data/store/app/probe.py',
-    'data/ingest/app/probe.py',
+    'server/common/probe.py',
+    'server/common/tests/test_probe.py',
+    'server/common/tests/rpc/test_probe.py',
+    'server/routers/common/probe.py',
+    'server/schemas/common/probe.py',
+    'server/data/store/app/probe.py',
+    'server/data/ingest/app/probe.py',
     'tests/system/test_probe.py',
     'tools/agent_mcp/probe.py',
 )
-INSIDE_THE_SEAM = ('common/rpc/probe.py', 'common/rpc/nested/probe.py')
+INSIDE_THE_SEAM = ('server/common/rpc/probe.py', 'server/common/rpc/nested/probe.py')
 
 
 def _ruff_codes_by_line(filename: str, source: str) -> dict[int, set[str]]:
@@ -6812,9 +6845,12 @@ def test_the_image_copies_the_generated_tree_where_its_pythonpath_looks():
     """The COPY of ./gen/proto/python sits in the stage that copies ./common, onto the PYTHONPATH entry."""
     stages = _dockerfile_stages()
     with_common = sorted(
-        stage for stage, (_, body) in stages.items() if any(source == 'common' for source, _ in _stage_copies(body))
+        stage
+        for stage, (_, body) in stages.items()
+        # The build-context spelling (tj-iontkq.4): the tree is COPYed out of ./server.
+        if any(source == 'server/common' for source, _ in _stage_copies(body))
     )
-    assert SHARED_COPY_STAGE in with_common, f'no stage copies ./common where expected: {with_common}'
+    assert SHARED_COPY_STAGE in with_common, f'no stage copies ./server/common where expected: {with_common}'
     destination = str(IMAGE_CODE_ROOT / GENERATED_PYTHON_ROOT)
     for stage in with_common:
         copies = _stage_copies(stages[stage][1])
@@ -6833,7 +6869,8 @@ def test_every_compose_mount_of_common_has_the_generated_tree_beside_it():
         for mount in map(compose_model.volume, service.get('volumes') or []):
             if mount['type'] == 'bind':
                 by_source.setdefault(_context_relative(mount['source'], path.parent), []).append(mount)
-        for common in by_source.get('common', []):
+        # The host spelling (tj-iontkq.4): the mount source is ./server/common, the target /code/common.
+        for common in by_source.get('server/common', []):
             label = f'{path.relative_to(REPO_ROOT)}:{name}'
             found.append(label)
             target = str(PurePosixPath(common['target']).parent / GENERATED_PYTHON_ROOT)
@@ -6843,7 +6880,7 @@ def test_every_compose_mount_of_common_has_the_generated_tree_beside_it():
                     f'{label} mounts ./common at {common["target"]} but not ./{GENERATED_PYTHON_ROOT} at {target} '
                     f'(read_only={common["read_only"]}); it has {beside}'
                 )
-    assert set(found) >= KNOWN_COMMON_MOUNTS, f'./common mounts found: {sorted(found)}'
+    assert set(found) >= KNOWN_COMMON_MOUNTS, f'./server/common mounts found: {sorted(found)}'
     assert not missing, '\n'.join(missing)
 
 
@@ -7072,7 +7109,10 @@ def _oracle_copy_sources(service_path: str, service_name: str) -> set[str]:
     yields every service's app directory at once; this keeps the one belonging to this service.
     """
     by_origin = _dockerfile_copy_sources_by_origin()
-    app = posixpath.join(service_path, service_name, 'app')
+    # SERVICE_PATH/SERVICE_NAME are the compose build args, which name the module path INSIDE the
+    # image and did not move; the COPY source is that path under the context's server directory
+    # (tj-iontkq.4, R-2 -- only the left of the COPY gained a prefix).
+    app = (CHECKOUT_SERVER_DIR / service_path / service_name / 'app').as_posix()
     from_args = {source for source, named_an_arg in by_origin if named_an_arg}
     assert app in from_args, f'the Dockerfile COPY parse found no {app} among the build-arg sources {from_args}'
     return {source for source, named_an_arg in by_origin if not named_an_arg} | {app}
@@ -7228,11 +7268,14 @@ def test_each_service_gets_its_own_digest_covering_only_its_own_app():
 # a file the context drops must not move the digest, and a file beside it that the context DOES
 # send must. The last entry is the control; without it every assertion here passes on a digest that
 # never moves at all.
+# Build-context paths (tj-iontkq.4): the COPY source is ./server/common and .dockerignore's rules
+# now read server/common/tests/, so a probe written at the bare old spelling would sit outside the
+# COPY source entirely and the control could never move the digest.
 _DIGEST_PROBES = [
-    ('common/tests/_source_digest_probe.txt', False),
-    ('common/__pycache__/_source_digest_probe.pyc', False),
-    ('common/_source_digest_probe.pyc', False),
-    ('common/_source_digest_probe_control.py', True),
+    ('server/common/tests/_source_digest_probe.txt', False),
+    ('server/common/__pycache__/_source_digest_probe.pyc', False),
+    ('server/common/_source_digest_probe.pyc', False),
+    ('server/common/_source_digest_probe_control.py', True),
 ]
 
 

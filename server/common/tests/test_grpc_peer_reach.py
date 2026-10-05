@@ -60,11 +60,11 @@ from common.rpc.ping import ping_service
 from common.rpc.server import GRPC_HOST_ENV, GRPC_PORT_ENV, BindAddress, GrpcServerHost
 from common.tests import grpc_peer_docker_stub as stub
 from common.tests.compose_model import BASE_FILE, interpolate, load
+from common.tests.image_path import image_pythonpath
 from common.tests.test_ci_invariants import (
     ENV_DEFAULT_FILE,
     LOCKDOWN_STEP,
     PEER_STEP,
-    REPO_ROOT,
     STAGED_ENV_FILE,
     _env_file_values,
     _system_step,
@@ -340,7 +340,10 @@ def _prepare_step(tmp_path: Path, step: str, scenario: dict) -> tuple[list[str],
     (tmp_path / STAGED_ENV_FILE).write_text(ENV_DEFAULT_FILE.read_text(encoding='utf-8'), encoding='utf-8')
     environment = {
         'PATH': f'{tmp_path / "bin"}{os.pathsep}{os.environ.get("PATH", "")}',
-        'PYTHONPATH': str(REPO_ROOT),
+        # A fresh interpreter importing common.tests.*, so it gets the same host mirror of the
+        # image's path every other subprocess probe gets. The bare repository root stopped being
+        # enough when the service trees moved under server/ (tj-iontkq.4).
+        'PYTHONPATH': image_pythonpath(),
         'STUB_PYTHON': sys.executable,
         'STUB_IMPL': stub.__file__,
         'STUB_SCENARIO': str(tmp_path / 'scenario.json'),

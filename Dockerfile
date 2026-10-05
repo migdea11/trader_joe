@@ -53,14 +53,26 @@ RUN uv sync --only-group base --only-group ${SERVICE_PATH}-${SERVICE_NAME} --fro
 
 # Add common files. gen/proto/python is the committed protoc output common/rpc imports; without it
 # the image starts until the first servicer that imports generated code is registered, then fails.
+#
+# THE CONTAINER LAYOUT IS DELIBERATELY NOT THE CHECKOUT LAYOUT (epic tj-iontkq, R-2). The service
+# trees live under ./server in the checkout and under /code in the image, so only the LEFT of each
+# COPY gained a server/ prefix. Everything downstream -- ENV PYTHONPATH="/code", APP_MODULE's
+# ${SERVICE_PATH}.${SERVICE_NAME}.app.main, entrypoint.sh, /code/alembic.ini, /code/migrations and
+# every compose mount target -- is unchanged, which is the whole reason the move was shaped this way.
+# entrypoint.sh and gen/proto/python stay at the top of the repository and keep their bare sources.
+#
+# WHY NOT JUST `COPY ./server /code` -- the obvious next question. Because it would put every
+# service's app, both test trees, data/store/migrations and data/store/seeds into every image. The
+# by-name copies are what keep one service's code out of the other's image, and
+# data/*/tests/test_no_production_test_imports.py asserts exactly that from this list.
 COPY ./entrypoint.sh /code/entrypoint.sh
-COPY ./common /code/common
-COPY ./routers /code/routers
-COPY ./schemas /code/schemas
+COPY ./server/common /code/common
+COPY ./server/routers /code/routers
+COPY ./server/schemas /code/schemas
 COPY ./gen/proto/python /code/gen/proto/python
 
 # Add service-specific files
-COPY ./${SERVICE_PATH}/${SERVICE_NAME}/app /code/${SERVICE_PATH}/${SERVICE_NAME}/app
+COPY ./server/${SERVICE_PATH}/${SERVICE_NAME}/app /code/${SERVICE_PATH}/${SERVICE_NAME}/app
 
 # Extending Base Build image to include dev deps
 FROM service_build_image AS service_build_image_dev

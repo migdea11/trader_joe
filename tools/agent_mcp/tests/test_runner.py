@@ -180,7 +180,7 @@ def test_migrate_needs_a_recorded_stack_up_and_a_revision(tmp_path: Path, monkey
     record_state(rig.layout, 'gone-worktree')
     assert rig.call('migrate', {})['status'] == 'refused'
     record_state(rig.layout)
-    for path in (rig.layout.worktree / 'data/store/migrations/versions').iterdir():
+    for path in (rig.layout.worktree / 'server/data/store/migrations/versions').iterdir():
         path.unlink()
     result = rig.call('migrate', {})
     assert result['status'] == 'refused' and 'no revision files' in result['message'], result
@@ -257,10 +257,10 @@ def test_a_timed_out_copy_stops_and_the_old_snapshot_survives_until_the_next_swa
     """G4 / D8: the verb's timeout sets the copy's cancel event; the copy thread stops without swapping."""
     rig = make_rig(tmp_path, monkeypatch)
     for index in range(60):
-        (rig.layout.worktree / 'common' / f'm{index}.py').write_text('')
+        (rig.layout.worktree / 'server' / 'common' / f'm{index}.py').write_text('')
     assert rig.call('stack_up', {'worktree': WORKTREE_NAME})['status'] == 'ok'
     before = tree_digest(rig.layout.snapshot)
-    (rig.layout.worktree / 'common' / 'changed.py').write_text('NEW = 1\n')
+    (rig.layout.worktree / 'server' / 'common' / 'changed.py').write_text('NEW = 1\n')
 
     real_tick = stack._Copy.tick
     monkeypatch.setattr(stack._Copy, 'tick', lambda self, relative: (time.sleep(0.02), real_tick(self, relative))[1])
@@ -277,7 +277,7 @@ def test_a_timed_out_copy_stops_and_the_old_snapshot_survives_until_the_next_swa
     monkeypatch.setattr(stack._Copy, 'tick', real_tick)
     monkeypatch.setitem(runner.VERB_TIMEOUT_SECONDS, 'stack_up', 1800)
     assert rig.call('stack_up', {'worktree': WORKTREE_NAME})['status'] == 'ok'
-    assert (rig.layout.snapshot / 'common' / 'changed.py').exists()
+    assert (rig.layout.snapshot / 'server' / 'common' / 'changed.py').exists()
 
 
 # --- timeouts, errors, output ----------------------------------------------------------------
@@ -430,7 +430,7 @@ def test_a_worktree_swapped_for_a_symlink_mid_verb_never_reaches_the_daemon(
 
     def swap_and_observe(step: stack.Step) -> None:
         layout = layout_holder['layout']
-        migrations = layout.worktree / 'data' / 'store' / 'migrations'
+        migrations = layout.worktree / 'server' / 'data' / 'store' / 'migrations'
         if 'build' in step.argv:
             outside = layout.root / 'attacker_migrations'
             outside.mkdir()
@@ -438,7 +438,7 @@ def test_a_worktree_swapped_for_a_symlink_mid_verb_never_reaches_the_daemon(
             shutil.rmtree(migrations)
             migrations.symlink_to(outside, target_is_directory=True)
         if 'up' in step.argv:
-            snapshot_migrations = layout.snapshot / 'data' / 'store' / 'migrations'
+            snapshot_migrations = layout.snapshot / 'server' / 'data' / 'store' / 'migrations'
             observed['is_link'] = snapshot_migrations.is_symlink()
             observed['files'] = sorted(str(p.relative_to(snapshot_migrations)) for p in snapshot_migrations.rglob('*'))
             observed['argv'] = step.argv

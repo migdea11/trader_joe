@@ -44,6 +44,7 @@ from common.tests.test_ci_invariants import (
     MAKEFILE,
     REPO_ROOT,
     SEED_DUMP_STEP,
+    SERVER_ROOT,
     START_STEP,
     UPLOAD_SEED_STEP,
     _compose_calls,
@@ -60,7 +61,8 @@ from common.tests.test_ci_invariants import (
 pytestmark = pytest.mark.build_infra
 
 LAUNCHER = REPO_ROOT / 'tests' / 'fakes' / 'ingest_launcher.py'
-LOGGING_MODULE = REPO_ROOT / 'common' / 'logging.py'
+# SERVER_ROOT: common/ travels with the service trees (tj-iontkq.4), unlike tests/fakes above.
+LOGGING_MODULE = SERVER_ROOT / 'common' / 'logging.py'
 FAKE_OVERLAY = REPO_ROOT / 'docker-compose.fake.yaml'
 UPLOAD_ACTION = 'actions/upload-artifact'
 _PINNED_ACTION = re.compile(r'^actions/upload-artifact@[0-9a-f]{40}$')

@@ -20,7 +20,7 @@ services:
     # missing env file still stops compose.
     env_file:
       - ${ROOT_ENV_FILE:-.env}
-      - ${STORE_ENV_FILE:-./data/store/.env}
+      - ${STORE_ENV_FILE:-./server/data/store/.env}
     environment:
       POSTGRES_DB: ${POSTGRES_DB_NAME}
       POSTGRES_USER: ${POSTGRES_USER}
@@ -81,19 +81,21 @@ services:
       - ingest_store
       - store_api
     volumes:
-      - ./data/store/alembic.ini:/code/alembic.ini
-      - ./data/store/migrations:/code/migrations
+      # Host side only (epic tj-iontkq, R-2): data/store moved under ./server in the checkout and
+      # /code did not move, so the targets are untouched.
+      - ./server/data/store/alembic.ini:/code/alembic.ini
+      - ./server/data/store/migrations:/code/migrations
     env_file:
       - ${ROOT_ENV_FILE:-.env}
-      - ${STORE_ENV_FILE:-./data/store/.env}
+      - ${STORE_ENV_FILE:-./server/data/store/.env}
     environment:
       # Built from the same variables Postgres itself is given, so there is one password
       # in one place and the app cannot drift from the server. The previous fallback,
       # postgresql://postgres:password@db:5432/postgres, was a working credential pair in
       # a committed file.
-      # This is the only definition of DATABASE_URI under compose: data/store/.env.default
+      # This is the only definition of DATABASE_URI under compose: server/data/store/.env.default
       # deliberately leaves it unset (tj-70ovb3), and `environment:` would take precedence
-      # over `env_file:` regardless. Its one consumer is data/store/migrations/env.py, which
+      # over `env_file:` regardless. Its one consumer is server/data/store/migrations/env.py, which
       # hands it to alembic; the app builds its own DSN from the discrete POSTGRES_* and
       # DATABASE_* variables.
       # The port is the container's 5432, not DATABASE_PORT -- that one is the host-side
@@ -178,7 +180,7 @@ services:
       ingest_egress: {}
     env_file:
       - ${ROOT_ENV_FILE:-.env}
-      - ${INGEST_ENV_FILE:-./data/ingest/.env}
+      - ${INGEST_ENV_FILE:-./server/data/ingest/.env}
     environment:
       # Where the gRPC server listens (common.rpc BindAddress.from_env, which has no default and
       # fails at startup when either is unset). Set here, in the base file, not only in

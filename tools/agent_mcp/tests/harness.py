@@ -79,34 +79,44 @@ SERVER_ROOT = _server_root(REPO_ROOT)
 
 
 def env_default_path(source: str) -> Path:
-    """One ENV_DEFAULT_SOURCES name under the root that owns it: data/ is server-side, the rest is not."""
-    return (SERVER_ROOT if source.startswith('data/') else REPO_ROOT) / source
+    """One ENV_DEFAULT_SOURCES name, resolved against the checkout.
+
+    Every name there is now repository-relative, the service templates included: they read
+    server/data/store/.env.default since the service trees moved (tj-iontkq.4). Before the move the
+    server-side names were bare and this had to pick a root per name; now the one root is correct
+    for all three, and SERVER_ROOT stays exported for the callers below that build server paths.
+    """
+    return REPO_ROOT / source
 
 
 WORKTREE_NAME = 'wt-one'
 
 # One file (or more) under every SNAPSHOT_SOURCES entry, so a snapshot of this tree is complete.
+# The fixture mirrors the real worktree's layout, so the four service trees sit under server/ since
+# epic tj-iontkq.4 and the root siblings -- gen/, tests/, pytest.ini and the three build files -- do
+# not. A key that lost its prefix would sit under no SNAPSHOT_SOURCES entry and silently stop being
+# copied, which is the completeness this dict exists to assert.
 WORKTREE_FILES = {
     'pyproject.toml': '[project]\nname = "fixture"\n',
     'uv.lock': 'version = 1\n',
     'entrypoint.sh': '#!/bin/sh\nexec "$@"\n',
-    'common/__init__.py': '',
-    'common/sub/module.py': 'VALUE = 1\n',
-    'common/.env.default': 'COMMITTED_TEMPLATE=1\n',
-    'routers/__init__.py': '',
-    'schemas/__init__.py': '',
+    'server/common/__init__.py': '',
+    'server/common/sub/module.py': 'VALUE = 1\n',
+    'server/common/.env.default': 'COMMITTED_TEMPLATE=1\n',
+    'server/routers/__init__.py': '',
+    'server/schemas/__init__.py': '',
     # The committed generated gRPC tree the Dockerfile COPYs and compose mounts (decision tj-3mk3u5.42
     # F1). trader_joe/ itself has no __init__.py, as in the real tree: it is a PEP 420 namespace.
     'gen/proto/python/trader_joe/proto/__init__.py': '# guard\n',
     'gen/proto/python/trader_joe/proto/ping/v1/ping_pb2.py': 'DESCRIPTOR = None\n',
-    'data/store/app/main.py': 'APP = "store"\n',
-    'data/ingest/app/main.py': 'APP = "ingest"\n',
-    'data/store/alembic.ini': '[alembic]\n',
-    'data/store/migrations/env.py': 'ENV = 1\n',
-    'data/store/migrations/versions/0001_initial.py': 'revision = "0001"\n',
+    'server/data/store/app/main.py': 'APP = "store"\n',
+    'server/data/ingest/app/main.py': 'APP = "ingest"\n',
+    'server/data/store/alembic.ini': '[alembic]\n',
+    'server/data/store/migrations/env.py': 'ENV = 1\n',
+    'server/data/store/migrations/versions/0001_initial.py': 'revision = "0001"\n',
     # The seed producer, test_client's read-only mount (ADR tj-4rr0la addendum 10 (2); tj-irhy0a.22).
-    'data/store/seeds/__init__.py': '',
-    'data/store/seeds/__main__.py': 'MAIN = 1\n',
+    'server/data/store/seeds/__init__.py': '',
+    'server/data/store/seeds/__main__.py': 'MAIN = 1\n',
     'tests/system/test_one.py': 'def test_one():\n    pass\n',
     'tests/system/sub/test_two.py': 'def test_two():\n    pass\n',
     # The fake-mode overlay's read-only mount source (docker-compose.fake.yaml; tj-vhboky.61).
@@ -136,9 +146,15 @@ def build_worktree(path: Path) -> Path:
 
 
 def plant_live_env_files(worktree: Path) -> list[Path]:
-    """Write live env files (.env, data/store/.env, common/.env.local) holding LIVE_ENV_SENTINEL."""
+    """Write live env files (.env, server/data/store/.env, server/common/.env.local) holding LIVE_ENV_SENTINEL."""
     planted = []
-    for relative in ('.env', 'data/store/.env', 'data/ingest/.env', 'common/.env', 'common/.env.local'):
+    for relative in (
+        '.env',
+        'server/data/store/.env',
+        'server/data/ingest/.env',
+        'server/common/.env',
+        'server/common/.env.local',
+    ):
         target = worktree / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(f'POSTGRES_PASS={LIVE_ENV_SENTINEL}\nALPACA_API_KEY={LIVE_ENV_SENTINEL}\n')

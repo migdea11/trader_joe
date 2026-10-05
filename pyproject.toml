@@ -182,7 +182,10 @@ exclude = [
     ".venv-devcontainer",
     ".vscode",
     "__pypackages__",
-    "data/store/migrations/versions/*",
+    # Generated alembic revisions. A PATH glob, resolved against this file's directory, so it took
+    # the server/ prefix with the move (epic tj-iontkq, C-5): a glob that stops matching does not
+    # fail lint, it quietly starts linting what it used to exclude.
+    "server/data/store/migrations/versions/*",
     # Committed protoc output (ADR tj-8konfu D3; decision tj-3mk3u5.42 F1), generated code like the
     # revisions above: `make proto` writes gen/proto/python and CI fails when it is stale, so it is
     # regenerated, never hand-edited or reformatted. Every language's tree whole, the hand-committed
@@ -255,22 +258,30 @@ runtime-evaluated-base-classes = ["pydantic.BaseModel"]
 "trader_joe.proto".msg = "generated gRPC code (trader_joe.proto) is private to common/rpc; use the hand-written API there (ADR tj-8konfu D3)"
 
 [tool.ruff.lint.per-file-ignores]
+# EVERY KEY HERE IS A PATH GLOB, resolved against this file's directory, so the four service trees
+# carry the server/ prefix they gained in epic tj-iontkq -- unlike known-first-party below, which
+# names import names and did not move. A glob that stops matching fails SILENTLY: the ignores just
+# stop applying, and nobody notices until someone touches a handler.
 # The one package allowed to import generated gRPC code: the seam above.
-"common/rpc/**" = ["TID251"]
+"server/common/rpc/**" = ["TID251"]
 # FastAPI evaluates handler annotations at runtime; B008 is the Depends() idiom
-"routers/**" = ["TC001", "TC002", "TC003", "B008"]
+"server/routers/**" = ["TC001", "TC002", "TC003", "B008"]
 # the tests build naive datetimes on purpose, to prove they are refused
 "**/tests/**" = ["DTZ001"]
 # `timeout` here is a retry deadline that returns False, not an operation timeout, so
 # asyncio.timeout would change behaviour; kept as-is by user ruling (tj-mvqbaf, 2026-09-28)
-"common/database/postgres_tools.py" = ["ASYNC109"]
+"server/common/database/postgres_tools.py" = ["ASYNC109"]
 
 [tool.ruff.lint.isort]
 lines-after-imports = 2
 # matches format.skip-magic-trailing-comma
 split-on-trailing-comma = false
-# becomes ["trader_joe"] after Phase 1. trader_joe is first-party already: the generated
-# trader_joe.proto (gen/proto/python) is this repository's own code.
+# IMPORT NAMES, NOT PATHS, so the move into server/ (epic tj-iontkq) left every one of them
+# correct: PYTHONPATH points at the server root, so common, data, routers and schemas are still
+# the top-level package names. Do not prefix these -- unlike the path globs above, which had to be.
+# (The superseded plan had this list become ["trader_joe"]; that is not what happened.)
+# trader_joe is first-party already: the generated trader_joe.proto (gen/proto/python) is this
+# repository's own code. tj-iontkq.5 adds the hand-written trader_joe.common beside it.
 known-first-party = ["common", "data", "routers", "schemas", "trader_joe"]
 section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
 

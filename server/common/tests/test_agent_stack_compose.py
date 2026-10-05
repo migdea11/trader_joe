@@ -38,6 +38,7 @@ from common.tests.test_ci_invariants import (
     MAKEFILE,
     MIGRATIONS_SCRIPT,
     REPO_ROOT,
+    SERVER_ROOT,
     _compose_calls,
     _expanded_make_variable,
     _load_yaml,
@@ -59,15 +60,18 @@ ENV_FILE_VARIABLES = {'ROOT_ENV_FILE': 'root', 'STORE_ENV_FILE': 'store', 'INGES
 OVERLAY_VARIABLES = frozenset({'DATABASE_NAME', 'STORE_API_NETWORK', 'DATA_DIR', *ENV_FILE_VARIABLES})
 # Today's env_file lists with the three variables unset, in order: root first, then the service
 # file -- the order decides which value wins in the container (ADR F1). Spelled out, not derived.
+# The service files moved under ./server with their trees (tj-iontkq.4); the root .env did not.
 PROD_ENV_FILES = {
-    'postgres': ['.env', './data/store/.env'],
-    'data_store': ['.env', './data/store/.env'],
-    'data_ingest': ['.env', './data/ingest/.env'],
+    'postgres': ['.env', './server/data/store/.env'],
+    'data_store': ['.env', './server/data/store/.env'],
+    'data_ingest': ['.env', './server/data/ingest/.env'],
 }
 ENV_DEFAULTS = (
+    # The root default stays at the top of the repository; the two service defaults travel with
+    # their trees, which is why these take different roots (tj-iontkq.4).
     REPO_ROOT / '.env.default',
-    REPO_ROOT / 'data' / 'store' / '.env.default',
-    REPO_ROOT / 'data' / 'ingest' / '.env.default',
+    SERVER_ROOT / 'data' / 'store' / '.env.default',
+    SERVER_ROOT / 'data' / 'ingest' / '.env.default',
 )
 # A sample of what the MCP's generated root env supplies, for rendering the overlay in-process.
 AGENT_ENV = {

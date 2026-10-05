@@ -6,7 +6,11 @@ file with the docker arguments, and describes the running stack through the envi
   STUB_SCENARIO         a JSON file: {"containers": {service: {NAME: value, ...}}}, the container
                         environment of each RUNNING service, as the compose model computes it. A service
                         it does not name is not running, and an exec into it fails as compose's does.
-  STUB_CODE_ROOT        the checkout, which stands in for the image's code root, /code
+  STUB_CODE_ROOT        the checkout's SERVER root, which stands in for the image's code root, /code
+  STUB_CONTEXT_ROOT     the checkout's REPOSITORY root, which stands in for everything else under
+                        /code -- gen/proto/python above all. In the image those are one directory;
+                        on the host they stopped being one when the service trees moved under
+                        server/ (tj-iontkq.4), so the stand-in needs both, as image_path.py does.
   STUB_LOG              each call's arguments, appended as one JSON array per line
   STUB_UNMODELLED_LOG   each call this file refuses
 
@@ -47,15 +51,23 @@ STACK_FILES = ['docker-compose.yaml']
 _SETTINGS = {name: value for name, value in os.environ.items() if name.startswith('STUB_')}
 
 # The child's first code: put the container's import path in place, then run the step's CODE as
-# `python -c` would, with argv[0] '-c' and the rest its ARGS. argv[1] is the checkout, argv[2] CODE.
+# `python -c` would, with argv[0] '-c' and the rest its ARGS. argv[1] is the checkout's server
+# root, argv[2] its repository root, argv[3] CODE.
+#
+# TWO HOST ROOTS FOR ONE IMAGE DIRECTORY (tj-iontkq.4). /code itself is the service trees, which
+# the image COPYs out of ./server, so it stands in as the server root; anything UNDER /code that
+# the image gets from elsewhere -- gen/proto/python, the bind-mounted tests/ -- stands in under the
+# repository root. Before the move both were the same directory and one argument served.
 _BOOTSTRAP = """
 import os, posixpath, sys
-_checkout, _code = sys.argv[1], sys.argv[2]
-sys.argv = ['-c', *sys.argv[3:]]
+_server, _repo, _code = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.argv = ['-c', *sys.argv[4:]]
 def _on_checkout(entry):
     path = posixpath.normpath(posixpath.join(CODE_ROOT, entry))
-    if path == CODE_ROOT or path.startswith(CODE_ROOT + '/'):
-        return _checkout + path[len(CODE_ROOT):]
+    if path == CODE_ROOT:
+        return _server
+    if path.startswith(CODE_ROOT + '/'):
+        return _repo + path[len(CODE_ROOT):]
     return path
 sys.path[0:0] = [_on_checkout('.')] + [
     _on_checkout(entry) for entry in os.environ.get('PYTHONPATH', '').split(':') if entry
@@ -81,8 +93,10 @@ def _exec(words: list[str], scenario: Mapping[str, Any]) -> int:
     if service not in containers:
         print(f'service "{service}" is not running', file=sys.stderr)
         return 1
+    # cwd is the server root, standing in for WORKDIR /code; -P keeps it off sys.path either way.
     checkout = _SETTINGS['STUB_CODE_ROOT']
-    argv = [sys.executable, '-E', '-P', '-c', _BOOTSTRAP, checkout, command[2], *command[3:]]
+    context = _SETTINGS['STUB_CONTEXT_ROOT']
+    argv = [sys.executable, '-E', '-P', '-c', _BOOTSTRAP, checkout, context, command[2], *command[3:]]
     # The container environment and nothing else: no PATH, no STUB_* setting, no PYTHONPATH of ours.
     environment = {str(name): str(value) for name, value in containers[service].items()}
     return subprocess.run(argv, env=environment, cwd=checkout, check=False).returncode

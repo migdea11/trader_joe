@@ -12,4 +12,4 @@
 # variable into its SQL would not be flagged here either. If migrations ever start taking
 # parameters from anywhere but the revision file itself, this entry should go and the
 # findings should be dispositioned one by one instead.
-data/store/migrations/versions/
+server/data/store/migrations/versions/

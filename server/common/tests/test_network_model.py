@@ -29,6 +29,7 @@ from common.tests.test_ci_invariants import (
     MAKEFILE,
     OVERRIDE_FILE,
     REPO_ROOT,
+    SERVER_ROOT,
     _env_file_values,
     _load_yaml,
     _make_recipe,
@@ -41,7 +42,9 @@ pytestmark = pytest.mark.build_infra
 TOOLS_FILE = REPO_ROOT / 'docker-compose.tools.yaml'
 DEVCONTAINER_COMPOSE = REPO_ROOT / '.devcontainer' / 'compose.yml'
 DEVCONTAINER_JSON = REPO_ROOT / '.devcontainer' / 'devcontainer.json'
-RUN_MIGRATIONS = REPO_ROOT / 'data' / 'store' / 'run_migrations.sh'
+# SERVER_ROOT: data/store travels with the service trees (tj-iontkq.4), unlike the compose and
+# devcontainer files above, which stay at the top of the repository.
+RUN_MIGRATIONS = SERVER_ROOT / 'data' / 'store' / 'run_migrations.sh'
 
 # Addendum 1, item 1'. The whole model, stated once; every test below is judged against it.
 INTERNAL_NETWORKS = frozenset({'store_db', 'ingest_store', 'store_api'})

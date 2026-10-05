@@ -32,6 +32,7 @@ from pathlib import Path
 
 import pytest
 
+from common.tests.roots import SERVER_ROOT
 from data.store.seeds import bundle as bundle_module
 from data.store.seeds.bundle import (
     BUNDLE_KEYS,
@@ -403,7 +404,9 @@ def test_the_repo_root_is_the_checkout():
     tests/ are what stay at the top of the repository, and tests/ is the directory the whole
     refusal below is about.
     """
-    assert (REPO_ROOT / 'data' / 'store' / 'seeds' / 'bundle.py').is_file()
+    # The move this docstring anticipated has happened (tj-iontkq.4): bundle.py is under the SERVER
+    # root now, and pytest.ini and tests/ below are the discriminators that stayed behind.
+    assert (SERVER_ROOT / 'data' / 'store' / 'seeds' / 'bundle.py').is_file()
     assert (REPO_ROOT / 'pytest.ini').is_file()
     assert (REPO_ROOT / 'tests').is_dir()
 

@@ -58,23 +58,27 @@ SEED_OUT_DEFAULT = 'output/seeds'
 # first group are the producer's import closure as tj-irhy0a.21 recorded it (architect, 04:49 UTC
 # 2026-09-30): data/store/seeds, tests/fakes and data/ingest/app are NEW; common, routers and
 # data/store/migrations were already there; schemas is not imported but was mounted before.
+# HOST SOURCE, THEN CONTAINER TARGET, and since epic tj-iontkq.4 the two are not the same
+# spelling: the four service trees live under ./server in the checkout and under /code in the
+# image, so the left of each pair carries the prefix and the right never does. tests/, pytest.ini
+# and gen/proto/python stayed at the top of the repository and keep their bare host paths.
 CLIENT_MOUNTS_BEFORE = {
-    ('./common', '/code/common'),
-    ('./routers', '/code/routers'),
-    ('./schemas', '/code/schemas'),
-    ('./data/store/app', '/code/data/store/app'),
-    ('./data/store/migrations', '/code/data/store/migrations'),
+    ('./server/common', '/code/common'),
+    ('./server/routers', '/code/routers'),
+    ('./server/schemas', '/code/schemas'),
+    ('./server/data/store/app', '/code/data/store/app'),
+    ('./server/data/store/migrations', '/code/data/store/migrations'),
     ('./tests/system', '/code/tests/system'),
     ('./pytest.ini', '/code/pytest.ini'),
 }
 PRODUCER_CLOSURE_MOUNTS = {
-    ('./data/store/seeds', '/code/data/store/seeds'),
+    ('./server/data/store/seeds', '/code/data/store/seeds'),
     ('./tests/fakes', '/code/tests/fakes'),
-    ('./data/ingest/app', '/code/data/ingest/app'),
+    ('./server/data/ingest/app', '/code/data/ingest/app'),
 }
 # tj-7294qb: the repository's alembic ini, a FILE, beside the migrations mount as data_store lays them
 # out, so tests/system/test_migration_with_data.py runs the alembic CLI from cwd data/store with it.
-ALEMBIC_INI_MOUNTS = {('./data/store/alembic.ini', '/code/data/store/alembic.ini')}
+ALEMBIC_INI_MOUNTS = {('./server/data/store/alembic.ini', '/code/data/store/alembic.ini')}
 # Decision tj-3mk3u5.42 F1: the committed generated gRPC code, beside ./common because common/rpc imports
 # it, and test_client's PYTHONPATH names it. The producer's closure includes data/ingest/app, which
 # reaches it once a servicer that imports generated code is registered there.
