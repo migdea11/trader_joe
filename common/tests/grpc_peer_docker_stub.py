@@ -5,6 +5,10 @@ file with the docker arguments, and describes the stack through the environment:
 
   STUB_SCENARIO         a JSON file:
                           container_env       data_ingest's container environment, a mapping
+                          store_env           data_store's container environment, a mapping. Separate from
+                                              container_env on purpose: since ADR tj-q9ae5u addendum 5 item 7
+                                              the peer step reads DATA_INGEST_GRPC_TARGET from THIS side and
+                                              dials it, so a scenario can set the two ends apart
                           exec_fails          services whose exec fails, as on a container that is not running
                           ps_id, networks     as in grpc_bind_docker_stub: what `compose ps -q data_ingest`
                                               prints, and data_ingest's NetworkSettings.Networks
@@ -191,7 +195,9 @@ def _exec(words: list[str], scenario: Mapping[str, Any]) -> int:
         return _postgres(command)
     if command[:2] != [VENV_PYTHON, '-c'] or len(command) < 3:
         raise Unmodelled(f'exec of {command[:2]} in {service}; only the image interpreter running -c is modelled')
-    environment = (scenario.get('container_env') or {}) if service == DATA_INGEST else {}
+    # Each service's own container environment: the step reads data_ingest's bind from one side and
+    # data_store's DATA_INGEST_GRPC_TARGET from the other, and a scenario may set them apart.
+    environment = scenario.get('container_env' if service == DATA_INGEST else 'store_env') or {}
     return _run_code(service, command[2], command[3:], environment, scenario)
 
 

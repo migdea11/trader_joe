@@ -148,6 +148,15 @@ services:
       # The import path, literal: the same entry and the same reasoning as data_ingest's PYTHONPATH
       # below (decision tj-3mk3u5.42 addendum F1-A).
       - PYTHONPATH=/code:/code/gen/proto/python
+      # Where data_store dials data_ingest's gRPC server (ADR tj-q9ae5u addendum 5), read by
+      # common.rpc.channel.target_from_env, which has NO default and fails startup naming this
+      # variable when it is missing. The host is LITERAL: data-ingest-grpc, the alias data_ingest's
+      # server binds (APP_INTERNAL_GRPC_HOST below). It is never the hostname, which on devnet can
+      # resolve to an address the server never bound. The port is the server's
+      # APP_INTERNAL_GRPC_PORT expression byte for byte, so any env file moves both ends together,
+      # and :-50051 is the real in-network port. environment: outranks env_file:, so no env file
+      # can strand the client.
+      - DATA_INGEST_GRPC_TARGET=data-ingest-grpc:${DATA_INGEST_GRPC_PORT:-50051}
     image: trader_joe_data_store:latest
     security_opt:
       - "no-new-privileges:true"

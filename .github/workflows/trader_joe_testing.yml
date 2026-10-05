@@ -784,40 +784,66 @@ jobs:
         run: |
           set -euo pipefail
           # THE PEER-REACH CHECK, the bind-network check's second half (ADR tj-q9ae5u addendum 3;
-          # tj-3mk3u5.25). From inside data_store -- the peer data_ingest's gRPC exists to serve -- call
-          # the standard grpc.health.v1 Health.Check for service '' on the host and port data_ingest's
-          # server bound, and require SERVING. data_ingest's own healthcheck already reads SERVING, but
-          # it dials from inside data_ingest, where it succeeds on whichever interface the server is
-          # bound to. Only a call from data_store proves the listener sits on the network the two share,
-          # ingest_store. The step before proved the name resolves to that network's address alone.
+          # tj-3mk3u5.25), and -- since addendum 5 item 7 -- the CLIENT-CONFIGURATION check too. From
+          # inside data_store -- the peer data_ingest's gRPC exists to serve -- call the standard
+          # grpc.health.v1 Health.Check for service '' and require SERVING. data_ingest's own healthcheck
+          # already reads SERVING, but it dials from inside data_ingest, where it succeeds on whichever
+          # interface the server is bound to. Only a call from data_store proves the listener sits on the
+          # network the two share, ingest_store. The step before proved the name resolves to that
+          # network's address alone.
           #
-          # The host and port are what data_ingest's server read from its CONTAINER environment, read
-          # back the same way as the step before; neither is a secret. Never a loopback address.
+          # WHAT IS DIALLED IS data_store's OWN DATA_INGEST_GRPC_TARGET (addendum 5): the one entry every
+          # data_store -> data_ingest client reads through common.rpc.channel's target_from_env, which has
+          # no default and fails loudly. Composing the address here from data_ingest's two variables
+          # instead would prove the network path while a missing or wrong target passed unnoticed -- and
+          # from tj-3mk3u5.10 the dataset path dials that target on every launch. CI System Testing is the
+          # one runtime check that sees compose precedence (environment: over env_file:), so it is the only
+          # place a target that drifted from the bind can be caught before a DEADLINE_EXCEEDED in prod.
+          #
+          # The equality check comes first and is not a fallback: on a mismatch the step fails with BOTH
+          # values and dials nothing. Reconstructing the address from the server's side would be exactly
+          # the hole this closes. data_ingest's host and port are read back from its CONTAINER environment
+          # the same way as the step before; none of these values is a secret. Never a loopback address.
           container_env() {
             docker compose -f docker-compose.yaml exec -T data_ingest /code/.venv/bin/python -c \
+              'import os, sys; print(os.environ.get(sys.argv[1], "").strip())' "$1"
+          }
+          store_env() {
+            docker compose -f docker-compose.yaml exec -T data_store /code/.venv/bin/python -c \
               'import os, sys; print(os.environ.get(sys.argv[1], "").strip())' "$1"
           }
           grpc_host="$(container_env APP_INTERNAL_GRPC_HOST)"
           grpc_port="$(container_env APP_INTERNAL_GRPC_PORT)"
           if [ -z "${grpc_host}" ] || [ -z "${grpc_port}" ]; then
-            echo "::error::data_ingest's container environment lacks APP_INTERNAL_GRPC_HOST or APP_INTERNAL_GRPC_PORT, so there is no address to dial"
+            echo "::error::data_ingest's container environment lacks APP_INTERNAL_GRPC_HOST or APP_INTERNAL_GRPC_PORT, so there is nothing to check data_store's target against"
+            exit 1
+          fi
+          target="$(store_env DATA_INGEST_GRPC_TARGET)"
+          echo "data_store DATA_INGEST_GRPC_TARGET=${target:-<unset or empty>}; data_ingest binds ${grpc_host}:${grpc_port}"
+          if [ -z "${target}" ]; then
+            echo "::error::data_store's container environment lacks DATA_INGEST_GRPC_TARGET; docker-compose.yaml's environment: block did not reach this launch, and every gRPC client in data_store would fail at startup (ADR tj-q9ae5u addendum 5)"
+            exit 1
+          fi
+          if [ "${target}" != "${grpc_host}:${grpc_port}" ]; then
+            echo "::error::data_store dials DATA_INGEST_GRPC_TARGET='${target}' but data_ingest binds '${grpc_host}:${grpc_port}'; the two must agree (ADR tj-q9ae5u addendum 5). Fix the compose entry or the env file that moved one end; never reconstruct the address here"
             exit 1
           fi
 
-          # data_store's own interpreter dials: grpcio and grpcio-health-checking are in the base group
-          # both images install. The sync API, one call with a 10 s deadline and no wait_for_ready: the
-          # stack is up and healthy, so the listener must answer now, and a refused or unreachable address
-          # fails at once with UNAVAILABLE rather than waiting. The future's exception() hands back a
-          # failed call's code and details without raising, so they are printed on stdout and captured
-          # here. Exit 0 on SERVING only: NOT_SERVING, SERVICE_UNKNOWN and every RPC error are red.
+          # data_store's own interpreter dials, and dials the target verbatim: grpcio and
+          # grpcio-health-checking are in the base group both images install. The sync API, one call with
+          # a 10 s deadline and no wait_for_ready: the stack is up and healthy, so the listener must answer
+          # now, and a refused or unreachable address fails at once with UNAVAILABLE rather than waiting.
+          # The future's exception() hands back a failed call's code and details without raising, so they
+          # are printed on stdout and captured here. Exit 0 on SERVING only: NOT_SERVING, SERVICE_UNKNOWN
+          # and every RPC error are red.
           if ! out="$(docker compose -f docker-compose.yaml exec -T data_store /code/.venv/bin/python -c \
-              'import sys, grpc; from grpc_health.v1 import health_pb2 as h, health_pb2_grpc as g; t = sys.argv[1] + ":" + sys.argv[2]; c = grpc.insecure_channel(t); f = g.HealthStub(c).Check.future(h.HealthCheckRequest(service=""), timeout=10); e = f.exception(); s = None if e else h.HealthCheckResponse.ServingStatus.Name(f.result().status); c.close(); print(f"{t}: {e.code().name}: {e.details()}" if e else f"{t}: {s}"); sys.exit(0 if s == "SERVING" else 1)' \
-              "${grpc_host}" "${grpc_port}")"; then
-            echo "::error::data_store did not get SERVING from data_ingest's gRPC health over ingest_store: ${out:-<no output>}"
+              'import sys, grpc; from grpc_health.v1 import health_pb2 as h, health_pb2_grpc as g; t = sys.argv[1]; c = grpc.insecure_channel(t); f = g.HealthStub(c).Check.future(h.HealthCheckRequest(service=""), timeout=10); e = f.exception(); s = None if e else h.HealthCheckResponse.ServingStatus.Name(f.result().status); c.close(); print(f"{t}: {e.code().name}: {e.details()}" if e else f"{t}: {s}"); sys.exit(0 if s == "SERVING" else 1)' \
+              "${target}")"; then
+            echo "::error::data_store did not get SERVING from data_ingest's gRPC health over ingest_store at its own DATA_INGEST_GRPC_TARGET: ${out:-<no output>}"
             exit 1
           fi
           echo "data_store -> ${out}"
-          echo "gRPC peer reach holds: data_store gets SERVING from data_ingest's gRPC health at ${grpc_host}:${grpc_port}."
+          echo "gRPC peer reach holds: data_store's own DATA_INGEST_GRPC_TARGET is data_ingest's bind ${grpc_host}:${grpc_port} and gets SERVING from its gRPC health."
 
       - name: Check Network Lockdown
         run: |

@@ -15,6 +15,7 @@ class LatencyRequest(InboundContract):
     class LatencyType(str, Enum):
         REST = 'rest'
         RPC_KAFKA = 'rpc_kafka'
+        GRPC = 'grpc'
 
     latency_type: LatencyType = Path(..., title='Latency type', description=LATENCY_TYPE_DESC)
     iterations: int | None = Query(..., title='Iterations', description=LOOP_DESC)

@@ -25,7 +25,8 @@ publish:
 
 commands:
   # Bound to make targets so the user, CI and agents run identical strings (ADR tj-x6rgd1).
-  # PATHS defaults to "."; agents pass their own scope. Requires make + uv in the container.
+  # PATHS defaults to "."; agents pass their own scope. Requires make + uv in the container, plus
+  # buf (pinned in the Makefile) when PATHS covers proto/ for lint, or . or common/ for test.
   test: "make test PATHS={path}"
   lint: "make lint PATHS={path}"
   format: "make lint-fix PATHS={path}"
@@ -66,6 +67,10 @@ agents:
   # test ownership (ADR tj-8fxxfb) are edited directly into .claude/agents/architect.md and
   # validator.md, because their role bodies come from kit templates rather than from slots below.
   # `update` will flag those files as edited instead of overwriting them; promote upstream later.
+  # LOCAL AMENDMENTS, 2026-10-02: the kit half of .devcontainer/Dockerfile carries two local
+  # changes, to promote upstream later: 62a15e0 (tj-gys6xn) installs Claude Code with the native
+  # installer instead of a root npm install; 94da586 (tj-3mk3u5.52) drops nodejs and npm from the
+  # first apt line.
   # NOTE: the monorepo split moves these four trees under server/ with their internals unchanged,
   # so every scope below gains a server/ prefix and nothing more; re-run update after it lands.
   # (The earlier src/trader_joe/ restructure, which would have redrawn these, was superseded.)

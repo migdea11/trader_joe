@@ -3014,6 +3014,11 @@ GRPC_BIND_STEP = 'Check gRPC Bind Network'
 # After the bind check and before the lockdown; stack-only. Its script, and the lockdown step's gRPC
 # half, are run under bash with docker stubbed in test_grpc_peer_reach.py.
 PEER_STEP = 'Check gRPC Peer Reach'
+# tj-3mk3u5.56 (decision tj-3mk3u5.42 addendum F1-A): inside every running service built from the
+# Dockerfile, common.rpc.ping imports the generated code, so compose's environment: PYTHONPATH held over
+# the root env file at runtime. After the stack is up and before the suite; stack-only. Its script is run
+# under bash with docker stubbed in test_service_pythonpath.py.
+IMPORT_CHECK_STEP = 'Check Generated Code Import'
 START_STEP = 'Start System'
 # tj-irhy0a.1 / tj-irhy0a.2: the fake-mode banner check, and the head seed's dump and upload.
 FAKE_CHECK_STEP = 'Check Fake Broker'
@@ -3030,6 +3035,7 @@ SYSTEM_JOB_STEP_ORDER = (
     PEER_STEP,
     LOCKDOWN_STEP,
     'Check Container Env',
+    IMPORT_CHECK_STEP,
     SYSTEM_TESTS_STEP,
     # After the suite (decision tj-vhboky.55) and BEFORE the lifecycle step, which blanks the write
     # secret the producer authenticates with (architect note of 04:45 UTC 2026-09-30 on tj-irhy0a.1).
@@ -3055,6 +3061,7 @@ SYSTEM_JOB_COMPOSE_STEPS = (
     GRPC_BIND_STEP,
     PEER_STEP,
     'Check Container Env',
+    IMPORT_CHECK_STEP,
     LIFECYCLE_STEP,
     DUMP_STEP,
     STOP_STEP,
@@ -3068,6 +3075,7 @@ SYSTEM_JOB_STACK_ONLY_STEPS = (
     GRPC_BIND_STEP,
     PEER_STEP,
     'Check Container Env',
+    IMPORT_CHECK_STEP,
     DUMP_STEP,
     STOP_STEP,
 )
@@ -6479,12 +6487,15 @@ def test_common_rpc_may_import_its_generated_code(filename: str):
 # THE GENERATED CODE'S IMPORT ROOT, BY CONFIGURATION ONLY (decision tj-3mk3u5.42 F1 rule 3;
 # tj-3mk3u5.44 gate item 7)
 #
-# gen/proto/python reaches Python in three places, and no code changes sys.path:
+# gen/proto/python reaches Python in four places, and no code changes sys.path:
 #   * pytest.ini's pythonpath, for every pytest run (make test, CI's plain `uv run pytest`, test_client);
 #   * the image: ENV PYTHONPATH=/code:/code/gen/proto/python, and COPY ./gen/proto/python beside common;
 #   * a bind mount of ./gen/proto/python beside every ./common bind mount, so a host `make proto`
 #     reaches a dev container, plus test_client's PYTHONPATH, because the seed producer it runs is
-#     not pytest.
+#     not pytest;
+#   * docker-compose.yaml's environment: PYTHONPATH on every service built from the service stages,
+#     because env_file: (the root env file's legacy PYTHONPATH=./) outranks the image's ENV (addendum
+#     F1-A, tj-3mk3u5.56; pinned in test_service_pythonpath.py).
 # A missing piece is silent: the image builds, the stack starts, and nothing fails until a servicer
 # that imports generated code is registered. data_ingest's registered_services() returns [] today,
 # so these static pins are the only control before tj-3mk3u5.9/.10. common/tests/image_path.py spells
@@ -6688,18 +6699,14 @@ def test_the_container_env_model_ranks_environment_over_env_file_over_the_image(
 
 
 @pytest.mark.build_infra
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        'FINDING, tj-3mk3u5.44 (builder-shared 18:12 UTC note; architect ruling pending): root .env.default sets '
-        'PYTHONPATH=./, every service reads it through env_file, and env_file outranks the image ENV, so '
-        '/code/gen/proto/python is off the service path at runtime in every launch set. Harmless only while '
-        "data_ingest's registered_services() is empty. Remove this marker with the fix."
-    ),
-)
 def test_every_service_container_finds_the_generated_code_at_runtime():
-    """The image's PYTHONPATH is what the service process gets, in every launch set, or the static pins mean nothing."""
+    """The image's PYTHONPATH is what the service process gets, in every launch set, or the static pins mean nothing.
+
+    Recorded as a strict xfail by tj-3mk3u5.44's gate (the FINDING: root .env.default's PYTHONPATH=./, read
+    through env_file, outranked the image ENV); a plain pin since the fix, tj-3mk3u5.56 (decision tj-3mk3u5.42
+    addendum F1-A). test_service_pythonpath.py holds the stricter form: every set read from its source, every
+    service derived from the Dockerfile builds, and the value EQUAL to the image's.
+    """
     generated = str(IMAGE_CODE_ROOT / GENERATED_PYTHON_ROOT)
     offenders = []
     for label, model in _LAUNCH_SETS.items():

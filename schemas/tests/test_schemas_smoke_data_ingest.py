@@ -29,6 +29,15 @@ from pydantic import BaseModel, ValidationError
 
 import schemas.data_ingest
 from common.enums.data_stock import ExpiryType, Feed, UpdateType
+from schemas.data_ingest.fetch_dataset import (
+    Bar,
+    BarPage,
+    FetchAccepted,
+    FetchDatasetRequest,
+    FetchDone,
+    FetchRefused,
+    ServedRange,
+)
 from schemas.data_ingest.get_dataset_request import (
     BaseGetDatasetRequest,
     CryptoDatasetRequest,
@@ -44,7 +53,7 @@ pytestmark = pytest.mark.data_ingest
 # Committed module inventory. Discovery on its own is vacuous -- a package that lost every module
 # would still 'import all of them'. Asserting the discovered set EQUALS this one is what makes the
 # import test fail on a module that was moved, renamed or deleted by the Phase 1 re-path.
-EXPECTED_MODULES = frozenset({'schemas.data_ingest.get_dataset_request'})
+EXPECTED_MODULES = frozenset({'schemas.data_ingest.get_dataset_request', 'schemas.data_ingest.fetch_dataset'})
 
 DATASET_ID = UUID('00000000-0000-0000-0000-000000000001')
 WHEN = datetime(2026, 1, 1, tzinfo=UTC)
@@ -82,6 +91,35 @@ _BASE_PAYLOAD: dict[str, Any] = {
 # against genuinely unknown keys. 32438a9 removed it rather than repairing it.
 _ASSET_PAYLOAD: dict[str, Any] = {'asset_symbol': 'VFV', 'asset_type': 'stock', 'data_types': ['market-activity']}
 
+# The internal FetchDataset contract's twins (tj-3mk3u5.27), each with its required fields and
+# nothing else. `end` and `feed` are optional on the fetch request, `metadata` has a default on the
+# refusal, and `trade_count`/`vwap` are absent-not-zero on a bar -- so none of them appears here.
+#
+# THESE ARE SMOKE CASES ONLY: reachability and shape. What the contract MEANS -- the ack's oneof, a
+# refusal travelling in-band, the field-for-field match with the .proto -- is
+# schemas/tests/test_fetch_dataset_contract.py's, which reads protoc's descriptors to check it.
+_FETCH_REQUEST_PAYLOAD: dict[str, Any] = {
+    'owner': 'rebalancer',
+    'source': 'ALPACA',
+    'asset_symbol': 'VFV',
+    'asset_type': 'stock',
+    'data_types': ['market-activity'],
+    'granularity': '1day',
+    'start': WHEN,
+    # A NamedIntEnum: its values are 1, 2, 3, and only its encoder puts the member name on the wire.
+    'update_type': UpdateType.STATIC,
+}
+_BAR_PAYLOAD: dict[str, Any] = {
+    'bar_start': WHEN,
+    'open': 1.0,
+    'high': 2.0,
+    'low': 0.5,
+    'close': 1.5,
+    'volume': 10.0,
+    'feed': Feed.IEX,
+}
+_SERVED_RANGE_PAYLOAD: dict[str, Any] = {'start': WHEN, 'end': WHEN}
+
 # Every public model in the package, with a minimal valid payload. Minimal means: every required
 # field and nothing else.
 CONSTRUCT_CASES: list[tuple[type[BaseModel], dict[str, Any]]] = [
@@ -90,12 +128,31 @@ CONSTRUCT_CASES: list[tuple[type[BaseModel], dict[str, Any]]] = [
     (StockDatasetRequest, _BASE_PAYLOAD | _ASSET_PAYLOAD),
     (CryptoDatasetRequest, _BASE_PAYLOAD | _ASSET_PAYLOAD),
     (OptionDatasetRequest, _BASE_PAYLOAD | _ASSET_PAYLOAD),
+    (FetchDatasetRequest, _FETCH_REQUEST_PAYLOAD),
+    (Bar, _BAR_PAYLOAD),
+    (BarPage, {'bars': [Bar(**_BAR_PAYLOAD)]}),
+    (FetchAccepted, {'feed': Feed.IEX}),
+    (FetchRefused, {'reason': 'FEED_NOT_AVAILABLE', 'domain': 'trader-joe', 'detail': 'no SIP entitlement'}),
+    (ServedRange, _SERVED_RANGE_PAYLOAD),
+    (FetchDone, {'bar_count': 0, 'served_range': ServedRange(**_SERVED_RANGE_PAYLOAD), 'as_of': WHEN}),
 ]
 
 # Public classes in the package that are NOT Pydantic models, and so are covered by a dedicated
 # test rather than by the construct/reject pair. Empty here; see the data_store module for the
 # case this list exists for.
 KNOWN_NON_MODELS: frozenset[str] = frozenset()
+
+# Models the construct/reject PAIR cannot express, each with the dedicated test that covers it
+# instead. Distinct from KNOWN_NON_MODELS above, which is about classes that are not models at all --
+# conflating the two would let a genuinely uncovered model hide behind the wrong excuse.
+#
+# FetchAck is the whole list. It is a Pydantic model, but every field has a default, so
+# test_model_rejects_empty_payload's contract -- "the empty payload reports exactly these fields as
+# MISSING" -- is not something it can satisfy: `FetchAck()` is refused by its oneof validator, which
+# is a `value_error` naming no field rather than a set of `missing` ones. Covered instead by
+# test_an_ack_sets_exactly_one_arm in schemas/tests/test_fetch_dataset_contract.py, which asserts
+# both failing directions and both arms; a second copy here would be the same assertion twice.
+COVERED_BY_A_DEDICATED_TEST: frozenset[str] = frozenset({'FetchAck'})
 
 
 def _public_classes(module) -> set[str]:
@@ -150,7 +207,7 @@ def test_every_public_model_is_covered():
     Without this the construct/reject pair silently stops being a smoke test of the package and
     becomes a smoke test of whatever someone last remembered to list.
     """
-    covered = {model.__name__ for model, _ in CONSTRUCT_CASES} | KNOWN_NON_MODELS
+    covered = {model.__name__ for model, _ in CONSTRUCT_CASES} | KNOWN_NON_MODELS | COVERED_BY_A_DEDICATED_TEST
     declared = set()
     for module_name in sorted(EXPECTED_MODULES):
         declared |= _public_classes(importlib.import_module(module_name))
@@ -257,8 +314,35 @@ _NAIVE_RPC_TIMES: dict[str, datetime] = {
     'expiry': datetime(2026, 2, 1),
 }
 
-_REQUEST_MODELS = [model for model, _ in CONSTRUCT_CASES]
+# THE KAFKA store->ingest REQUEST FAMILY, and only it. These tests drive BaseGetDatasetRequest's
+# three time fields -- start, end and expiry -- so they cannot be parametrized over every model in
+# the package: the FetchDataset twins (tj-3mk3u5.27) have no `expiry`, and feeding them one would be
+# an `extra_forbidden` error rather than the `timezone_aware` refusal under test.
+#
+# NAMED, not derived from CONSTRUCT_CASES as it was before those twins joined the package. The
+# derivation was the tripwire that caught a new request shape, so test_the_request_family_is_complete
+# below restores that property against the module these shapes actually live in.
+_REQUEST_MODELS: list[type[BaseModel]] = [
+    BaseGetDatasetRequest,
+    GetDatasetRequest,
+    StockDatasetRequest,
+    CryptoDatasetRequest,
+    OptionDatasetRequest,
+]
 _PAYLOADS = dict(CONSTRUCT_CASES)
+
+
+def test_the_request_family_is_complete():
+    """Fail on a request shape added to get_dataset_request.py that the naive-time sweep below misses.
+
+    _REQUEST_MODELS is a hand-written list, and a hand-written list silently stops being complete.
+    Deriving it from the module's own public classes is what makes "every request shape refuses a
+    naive time" true of the module rather than of whoever last edited the list.
+    """
+    declared = _public_classes(importlib.import_module('schemas.data_ingest.get_dataset_request'))
+
+    assert declared == {model.__name__ for model in _REQUEST_MODELS}
+
 
 _MINUS_FIVE = timezone(timedelta(hours=-5))
 

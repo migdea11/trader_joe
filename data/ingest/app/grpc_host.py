@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from common.enums.data_stock import DataSource
 from common.rpc.server import BindAddress, GrpcServerHost, ServiceRegistration
 from data.ingest.app.brokers.interface import BrokerRead
+from routers.common.latency import get_latency_services
 
 
 def registered_services(readers: Mapping[DataSource, BrokerRead]) -> list[ServiceRegistration]:
@@ -29,9 +30,10 @@ def registered_services(readers: Mapping[DataSource, BrokerRead]) -> list[Servic
             that read through one. None does yet.
 
     Returns:
-        list[ServiceRegistration]: The servicers to attach before the server starts. Empty today.
+        list[ServiceRegistration]: The servicers to attach before the server starts. Empty unless the
+            latency harness is on.
     """
-    return []
+    return [*get_latency_services()]
 
 
 def build_grpc_host(readers: Mapping[DataSource, BrokerRead]) -> GrpcServerHost:

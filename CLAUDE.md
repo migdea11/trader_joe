@@ -71,6 +71,12 @@ report which instruction you set aside, quoting it, rather than reaching for a l
 `PATHS` defaults to `.`. Scope it to your own component. If a command cannot run, report it as not
 run with the reason — never as passed, and never inferred from a command you did not run.
 
+`make lint` lints every language its scope covers: ruff for Python, and — when `PATHS` is `.` or
+under `proto/` — buf lint, a format check and buf breaking against `main` (report-only until the
+first SDK release). TypeScript joins it with the UI. `make lint-fix` adds `buf format` for the same
+scopes. Those scopes, and `make test` on `.` or under `common/`, need the pinned buf on `PATH`: the
+agent image provides it once rebuilt, and `make buf-install` until then.
+
 ## Task store
 
 Mode: `embedded`, `bd` pinned at `1.3.0`.

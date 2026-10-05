@@ -1,0 +1,46 @@
+// THE SHARED BAR (decision tj-3mk3u5.42 F1, rule 8). One OHLCV bar, the unit every market-data
+// contract carries. It lives in market/v1 so that a transport shape WRAPS it and never restates its
+// fields: duplicated structures drift apart. Every contract may import this; it imports nothing but
+// google/protobuf and this package's own enums, and it never imports a contract.
+syntax = "proto3";
+
+package trader_joe.proto.market.v1;
+
+import "google/protobuf/timestamp.proto";
+import "trader_joe/proto/market/v1/enums.proto";
+
+// One bar. Bars are raw and are never corrected: there is deliberately no split or dividend factor,
+// matching the stored shape in schemas/data_store.
+message Bar {
+  // WHEN THE BAR OPENS -- the start of its interval, and the DATA time: when the market did this,
+  // never when a server answered about it. ADR tj-r6vcgv B1 forbids a field named bare "timestamp"
+  // anywhere in a contract, because an unqualified name is what invites the data time and the
+  // server's response time to collapse into one, which silently turns a 1000x replay into a 1x one.
+  // B1 names no replacement, so "bar_start" is chosen here: it says which time this is and where in
+  // the interval it falls. The server's own response time is NOT on the bar -- on the fetch contract
+  // it is the single as_of that ends the stream, one per fetch rather than one per bar.
+  google.protobuf.Timestamp bar_start = 1;
+
+  double open = 2;
+  double high = 3;
+  double low = 4;
+  double close = 5;
+
+  // A double, not an integer: this is the broker-neutral bar as a reader produces it, and a vendor
+  // may report a fractional quantity. The stored stock shape narrows it to an integer downstream.
+  double volume = 6;
+
+  // Explicitly OPTIONAL, both of them: a vendor that reports neither is not reporting zero of each.
+  // proto3's `optional` gives these real presence, so the mapper can round-trip Python's None
+  // without inventing a sentinel.
+  optional int64 trade_count = 7;
+  optional double vwap = 8;
+
+  // WHICH TAPE THIS BAR CAME FROM. A bar is self-describing on purpose: market/v1 is shared
+  // vocabulary, and a bar reaching the UI or the external stream arrives with no fetch envelope to
+  // read a feed from. On the internal fetch contract the feed is ALSO settled once, in the ack, and
+  // the two must agree -- the mapper stamps every bar from the single resolved feed rather than
+  // deciding per bar, so they cannot disagree. Never FEED_UNSPECIFIED: a feed nobody resolved is an
+  // error, not a value (tj-vhboky.1).
+  Feed feed = 9;
+}

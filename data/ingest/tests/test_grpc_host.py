@@ -10,6 +10,8 @@ Pinned here, through the production lifespan (main.create_app -> app_depends.mak
 * health answers SERVING on the configured port while the app is up, and nothing answers after;
 * grpc_host.registered_services() is the one registration point: what it returns is what the
   lifespan's host serves, and it is handed the readers create_app received;
+* the latency arm is registered there when LATENCY_TEST_ENABLED is on and nothing is registered --
+  and no generated module is even imported -- when it is off (tj-3mk3u5.60);
 * the bind address is read when the host is built, never once at import;
 * an unset variable stops startup before Kafka, the worker pool or the readers are touched;
 * a gRPC start that fails (port taken, wildcard host) still runs the Kafka teardown, and the process
@@ -43,6 +45,7 @@ from common.enums.data_stock import DataSource
 from common.kafka.messaging.kafka_consumer import KafkaConsumerFactory
 from common.kafka.messaging.kafka_producer import KafkaProducerFactory
 from common.rpc.channel import create_channel
+from common.rpc.latency import LatencyProbeClient
 from common.rpc.ping import SERVICE_NAME as PING_SERVICE_NAME
 from common.rpc.ping import ping, ping_service
 from common.rpc.server import GRPC_HOST_ENV, GRPC_PORT_ENV
@@ -51,6 +54,7 @@ from common.worker_pool import SharedWorkerPool
 from data.ingest.app import app_depends, grpc_host, ingest_control, main
 from data.ingest.app.brokers.interface import BarsQuery, BarsResponse
 from data.ingest.tests.grpc_bind import GUARD_S, LOOPBACK, LoopbackGrpc, accepts_connections, free_loopback_port
+from routers.common import latency as latency_harness
 from routers.data_ingest import get_dataset_request
 
 
@@ -422,3 +426,95 @@ async def test_the_host_starts_after_the_kafka_rpc_servers_and_before_ready_and_
     started = [index for index, message in enumerate(caplog.messages) if message.startswith(listening_log)]
     assert len(started) == 1, caplog.messages
     assert started[0] < caplog.messages.index(READY_LOG)
+
+
+# ---------------------------------------------------------------------------------------------------
+# THE LATENCY ARM (tj-3mk3u5.60): REGISTERED WHEN THE HARNESS IS ON, ABSENT WHEN IT IS OFF
+
+# Spelled out, not imported from common.rpc.latency: what is pinned is the wire name the gRPC arm's
+# client dials (tj-3mk3u5.26), so a rename in the .proto has to turn this red rather than follow it.
+# Importing the generated symbol here is banned anyway outside common/rpc (ADR tj-8konfu D3, TID251).
+LATENCY_SERVICE_NAME: Final = 'trader_joe.proto.internal.latency.v1.LatencyService'
+
+# The harness-OFF pin runs in a FRESH INTERPRETER, because half of what it asserts is an IMPORT fact:
+# with the flag off, nothing on the path from grpc_host to registered_services() loads generated code.
+# This process cannot answer that -- it imports common.rpc.ping at the top of this file, which imports
+# trader_joe.proto.ping -- so an in-process check would be red on arrival and could never go green.
+# The child is given PYTHONPATH and nothing else, so LATENCY_TEST_ENABLED is unset, as in production.
+HARNESS_OFF_PROBE = """
+import sys
+
+from data.ingest.app.grpc_host import registered_services
+
+names = [service.name for service in registered_services({})]
+generated = sorted(name for name in sys.modules if name == 'trader_joe' or name.startswith('trader_joe.'))
+print('services=' + repr(names), flush=True)
+print('generated=' + repr(generated), flush=True)
+"""
+
+
+def test_with_the_latency_harness_off_nothing_is_registered_and_no_generated_module_is_loaded():
+    """The production default: a dev-only servicer is not served, and its generated tree is not even loaded.
+
+    The second half is the one that protects production. get_latency_services() imports
+    common.rpc.latency inside the flag check for exactly this reason, so a top-level import added
+    there later -- which would still leave the registration list empty -- is caught here.
+    """
+    try:
+        done = subprocess.run(
+            [sys.executable, '-c', HARNESS_OFF_PROBE],
+            cwd=REPO_ROOT,
+            env={'PYTHONPATH': image_pythonpath(REPO_ROOT)},
+            capture_output=True,
+            text=True,
+            timeout=EXIT_BUDGET_S,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as hung:
+        pytest.fail(f'the probe was still alive {EXIT_BUDGET_S}s in; it printed {hung.stdout!r}')
+
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.splitlines() == ['services=[]', 'generated=[]'], done.stderr
+
+
+def test_with_the_latency_harness_on_exactly_the_latency_servicer_is_registered(monkeypatch: pytest.MonkeyPatch):
+    """Flag on: one registration, the gRPC arm's, so tj-3mk3u5.26 has a server to dial.
+
+    LATENCY_TEST_ENABLED is read ONCE, at import of routers/common/latency.py (:22), into a module
+    attribute. Setting the environment variable now would change nothing -- the module was imported
+    long before this test ran -- so the pin flips the attribute the production code actually reads.
+    """
+    monkeypatch.setattr(latency_harness, 'LATENCY_TEST_ENABLED', True)
+
+    services = grpc_host.registered_services({})
+
+    assert [service.name for service in services] == [LATENCY_SERVICE_NAME]
+
+
+@pytest.mark.asyncio
+async def test_with_the_latency_harness_on_the_host_built_here_actually_serves_the_probe(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The registration's consequence, not just its name: a probe sent to the built host is answered.
+
+    A ServiceRegistration whose add_to_server did not match its name would pass the list pin above and
+    still leave the arm unreachable. .26's runtime proof is the dev launch; this is the local half of
+    it -- the same registration path, through build_grpc_host, over a real loopback channel.
+    """
+    monkeypatch.setattr(latency_harness, 'LATENCY_TEST_ENABLED', True)
+    monkeypatch.setenv(GRPC_HOST_ENV, LOOPBACK)
+    monkeypatch.setenv(GRPC_PORT_ENV, str(free_loopback_port()))
+
+    host = grpc_host.build_grpc_host({})
+    try:
+        await asyncio.wait_for(host.start(), GUARD_S)
+        status = await health_status(host.port, LATENCY_SERVICE_NAME)
+        channel = create_channel(f'{LOOPBACK}:{host.port}')
+        try:
+            await asyncio.wait_for(LatencyProbeClient(channel, timeout_s=5).probe('through data_ingest'), GUARD_S)
+        finally:
+            await channel.close()
+    finally:
+        await asyncio.wait_for(host.stop(), GUARD_S)
+
+    assert status == SERVING

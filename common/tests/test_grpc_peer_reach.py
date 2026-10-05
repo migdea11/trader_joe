@@ -15,6 +15,15 @@ alias, on ingest_store only, so nothing may dial loopback). The bead's validator
      (grpc_peer_docker_stub.py); the peer step's Health.Check is a real call to a real server. Their
      places in the job and their compose spellings are pinned with the rest of the job in
      test_ci_invariants.py (PEER_STEP).
+  2'. Since ADR tj-q9ae5u addendum 5 item 7 (tj-3mk3u5.62) the peer step is also the CLIENT-CONFIGURATION
+     check: what it dials is data_store's own DATA_INGEST_GRPC_TARGET, read from the data_store container,
+     and it must first equal data_ingest's bind. Composing the address from data_ingest's two variables
+     would prove the network path while a missing or wrong target passed unnoticed, and from tj-3mk3u5.10
+     the dataset path dials that target on every launch. So the pins below require, with a REACHABLE
+     listener in place throughout: no target -> exit 1 naming the variable and NOTHING dialled; a target
+     that differs from the bind -> exit 1 with BOTH values in one ::error:: and NOTHING dialled, even when
+     that wrong target would have reached the very same listener; a matching target -> the stripped
+     data_store value dialled, once.
   3. No depends_on between data_store and data_ingest, either way, in any file of any launch set.
   4. Dev reach was not taken, so test_grpc_bind_network.py keeps the alias strict in every set.
   5. No env file can redirect the host: test_grpc_bind_network.py,
@@ -46,6 +55,7 @@ import grpc
 import pytest
 from grpc_health.v1 import health, health_pb2, health_pb2_grpc
 
+from common.rpc.channel import DATA_INGEST_GRPC_TARGET_ENV
 from common.rpc.ping import ping_service
 from common.rpc.server import GRPC_HOST_ENV, GRPC_PORT_ENV, BindAddress, GrpcServerHost
 from common.tests import grpc_peer_docker_stub as stub
@@ -364,10 +374,19 @@ def _execs_into(docker: list[list[str]], service: str) -> list[list[str]]:
     return [call for call in docker if call[:6] == ['compose', '-f', 'docker-compose.yaml', 'exec', '-T', service]]
 
 
+# The two calls the step makes into data_store: reading its DATA_INGEST_GRPC_TARGET, then dialling it.
+STORE_CALLS = 2
+
+
 def _peer_scenario(port: int | str, **changes: object) -> dict:
-    """A healthy stack: data_ingest's environment names the alias; data_store resolves it to the listener."""
+    """A healthy, correctly configured stack: the bind data_ingest names, the target data_store carries, one listener.
+
+    container_env and store_env are each a whole container environment, so a scenario can set the
+    client's target apart from the server's bind -- the drift addendum 5 item 7 exists to catch.
+    """
     scenario = {
         'container_env': {GRPC_HOST_ENV: HOST, GRPC_PORT_ENV: str(port), 'PATH': CONTAINER_PATH},
+        'store_env': {DATA_INGEST_GRPC_TARGET_ENV: f'{HOST}:{port}', 'PATH': CONTAINER_PATH},
         'store_dns': {HOST: OFF_LOOPBACK},
     }
     scenario.update(changes)
@@ -382,9 +401,22 @@ def _env_with(name: str, value: str, port: int | str = PORT) -> dict[str, str]:
     return {**_peer_scenario(port)['container_env'], name: value}
 
 
+def _store_without(name: str, port: int | str = PORT) -> dict[str, str]:
+    return {key: value for key, value in _peer_scenario(port)['store_env'].items() if key != name}
+
+
+def _store_with(name: str, value: str, port: int | str = PORT) -> dict[str, str]:
+    return {**_peer_scenario(port)['store_env'], name: value}
+
+
+def _annotations(result: subprocess.CompletedProcess) -> list[str]:
+    """The step's ::error:: lines alone: the echo above them repeats both values, so it cannot stand in."""
+    return [line for line in result.stdout.splitlines() if line.startswith('::error::')]
+
+
 @pytest.mark.asyncio
 async def test_the_peer_check_passes_when_data_store_gets_serving(tmp_path: Path):
-    """From inside data_store, Health.Check '' on the host and port data_ingest's environment names, once."""
+    """From inside data_store, Health.Check '' on the target data_store carries, once."""
     async with _grpc_peer(OFF_LOOPBACK, 'SERVING') as port:
         result, logs = await _run_step(tmp_path, PEER_STEP, _peer_scenario(port))
     assert result.returncode == 0, _report(result)
@@ -392,8 +424,102 @@ async def test_the_peer_check_passes_when_data_store_gets_serving(tmp_path: Path
     assert logs['grpc'] == [{'target': f'{HOST}:{port}'}], (
         f'data_store must dial {HOST}:{port}, the host and port data_ingest names, once: {logs["grpc"]}'
     )
-    assert len(_execs_into(logs['docker'], DATA_STORE)) == 1, f'expected one call from data_store: {logs["docker"]}'
+    assert len(_execs_into(logs['docker'], DATA_STORE)) == STORE_CALLS, (
+        f'expected {STORE_CALLS} calls from data_store, its target read and the dial: {logs["docker"]}'
+    )
     assert f'{HOST}:{port}: SERVING' in result.stdout, _report(result)
+
+
+# A target compose hands over intact, and the same value with the whitespace a value picks up on its way
+# through an env file: the image interpreter strips it, exactly as it strips data_ingest's bind, so both
+# equal the bind and both dial the stripped value.
+_PEER_TARGET_ACCEPTED = {'as compose sets it': '{target}', 'with surrounding whitespace': '  {target}  '}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('spelling', list(_PEER_TARGET_ACCEPTED.values()), ids=list(_PEER_TARGET_ACCEPTED))
+async def test_the_peer_check_dials_the_target_data_store_itself_carries(tmp_path: Path, spelling: str):
+    """What is dialled is data_store's own DATA_INGEST_GRPC_TARGET, read from the data_store container.
+
+    addendum 5 item 7: the variable every data_store -> data_ingest client reads through
+    common.rpc.channel's target_from_env, which has no default. The step reads it with its own call into
+    data_store -- hence two calls, not one -- and hands that value to the channel.
+    """
+    async with _grpc_peer(OFF_LOOPBACK, 'SERVING') as port:
+        target = f'{HOST}:{port}'
+        store_env = _store_with(DATA_INGEST_GRPC_TARGET_ENV, spelling.format(target=target))
+        result, logs = await _run_step(tmp_path, PEER_STEP, _peer_scenario(port, store_env=store_env))
+    assert result.returncode == 0, _report(result)
+    assert not logs['unmodelled'], logs['unmodelled']
+    assert logs['grpc'] == [{'target': target}], f'data_store must dial its own target {target} once: {logs["grpc"]}'
+    assert len(_execs_into(logs['docker'], DATA_STORE)) == STORE_CALLS, (
+        f'the target must be read from the data_store container, not the runner environment: {logs["docker"]}'
+    )
+
+
+_PEER_NO_TARGET = {
+    'target unset': _store_without(DATA_INGEST_GRPC_TARGET_ENV),
+    'target empty': _store_with(DATA_INGEST_GRPC_TARGET_ENV, ''),
+    'target blank': _store_with(DATA_INGEST_GRPC_TARGET_ENV, '   '),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('store_env', list(_PEER_NO_TARGET.values()), ids=list(_PEER_NO_TARGET))
+async def test_the_peer_check_fails_naming_the_variable_when_data_store_has_no_target(tmp_path: Path, store_env: dict):
+    """No DATA_INGEST_GRPC_TARGET in data_store: exit 1 naming it, and nothing dialled.
+
+    The listener is up and data_ingest's bind is readable throughout, so a step that fell back to the
+    reconstructed address would pass here -- the fallback addendum 5 item 7 forbids.
+    """
+    async with _grpc_peer(OFF_LOOPBACK, 'SERVING') as port:
+        result, logs = await _run_step(tmp_path, PEER_STEP, _peer_scenario(port, store_env=store_env))
+    assert result.returncode == 1, _report(result)
+    assert not logs['unmodelled'], logs['unmodelled']
+    assert not logs['grpc'], f'the step dialled {logs["grpc"]} with no target in data_store'
+    assert len(_annotations(result)) == 1, _report(result)
+    assert DATA_INGEST_GRPC_TARGET_ENV in _annotations(result)[0], _report(result)
+
+
+# Each wrong target RESOLVES TO THE VERY SAME LISTENER in the scenario's store_dns, so reaching it would
+# succeed: only the equality check can make these red, and reachability must never bypass it.
+_PEER_MISMATCH = {
+    # ADR tj-q9ae5u addendum 5 item 6: never the REST hostname, which on devnet can resolve to an
+    # address the server never bound.
+    'the REST hostname': (DATA_INGEST, '{port}'),
+    'a loopback address': (LOOPBACK, '{port}'),
+    # A port an env file moved on the client end alone.
+    'a stale port': (HOST, '1'),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('host', 'port_spelling'), list(_PEER_MISMATCH.values()), ids=list(_PEER_MISMATCH))
+async def test_the_peer_check_fails_with_both_values_when_the_target_is_not_the_bind(
+    tmp_path: Path, host: str, port_spelling: str
+):
+    """A target that differs from data_ingest's bind: exit 1, one ::error:: carrying BOTH values, nothing dialled.
+
+    The equality check comes first and is not a fallback. Each wrong target here would have reached the
+    same live listener, so a step that dialled first and asked afterwards would pass -- the hole addendum 5
+    item 7 closes, and the reason the assertion is on what was dialled, not only on the exit status.
+    """
+    async with _grpc_peer(OFF_LOOPBACK, 'SERVING') as port:
+        target = f'{host}:{port_spelling.format(port=port)}'
+        scenario = _peer_scenario(
+            port,
+            store_env=_store_with(DATA_INGEST_GRPC_TARGET_ENV, target),
+            store_dns={HOST: OFF_LOOPBACK, DATA_INGEST: OFF_LOOPBACK, LOOPBACK: OFF_LOOPBACK},
+        )
+        result, logs = await _run_step(tmp_path, PEER_STEP, scenario)
+    assert result.returncode == 1, _report(result)
+    assert not logs['unmodelled'], logs['unmodelled']
+    assert not logs['grpc'], f'the step dialled {logs["grpc"]} although the target is not the bind'
+    annotations = _annotations(result)
+    assert len(annotations) == 1, _report(result)
+    assert target in annotations[0] and f'{HOST}:{port}' in annotations[0], (
+        f'the mismatch must print both {target} and {HOST}:{port}: {annotations}'
+    )
 
 
 @pytest.mark.asyncio

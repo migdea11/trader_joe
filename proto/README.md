@@ -42,6 +42,7 @@ accepted as a starting point (tj-3mk3u5.42 F1, rule 8):
 |---|---|
 | `trader_joe.proto.market.v1` | The shared vocabulary: `Bar` and the market-data enums. Imports `google/protobuf` only. |
 | `trader_joe.proto.internal.ingest.v1` | `FetchDataset`, the data_store to data_ingest contract. |
+| `trader_joe.proto.internal.latency.v1` | The latency harness probe, `LatencyService.Probe`. Internal: both ends deploy together. |
 | `trader_joe.proto.data.v1` | The external streaming contract. The name is provisional. |
 | `trader_joe.proto.ui.v1` | The UI's messages. |
 | `trader_joe.proto.ping.v1` | The pipeline proof. |
