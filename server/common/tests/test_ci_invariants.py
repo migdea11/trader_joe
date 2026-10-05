@@ -5724,10 +5724,18 @@ _CHECKOUT_ROOT = (
     r'(?:\./|\$\{PWD\}/|\$PWD/|\$\{GITHUB_WORKSPACE\}/|\$GITHUB_WORKSPACE/|\$\{\{\s*github\.workspace\s*\}\}/)?'
 )
 # An env file the finder can place, as a whole shell word: the staged root file, or a service's
-# own (`data/store/`, `data/ingest/`), under any root spelling. The `service` group is set for the
-# latter. Never `.env.default`; never a path under some other directory.
+# own (`server/data/store/`, `server/data/ingest/`), under any root spelling. The `service` group is
+# set for the latter. Never `.env.default`; never a path under some other directory.
+#
+# THE server/ PREFIX IS FORCED BY tj-iontkq.4, not chosen here. The service trees moved under
+# server/, so a workflow step that stages a service's own env file now writes
+# server/data/store/.env. This token and the workflow's spelling are one fact written twice, and
+# NEITHER HALF IS GREEN ALONE: the workflow change without this one fails
+# test_every_staged_env_read_takes_the_last_line_and_the_full_value because the path it finds is
+# not a known one, and this one without the workflow change fails it from the other side. They
+# are integrated together (tj-iontkq.8 and tj-iontkq.11).
 _KNOWN_ENV_PATH = re.compile(
-    rf'(?<![^\s"\'=(<>|;&]){_CHECKOUT_ROOT}(?P<service>data/(?:store|ingest)/)?'
+    rf'(?<![^\s"\'=(<>|;&]){_CHECKOUT_ROOT}(?P<service>server/data/(?:store|ingest)/)?'
     rf'{re.escape(STAGED_ENV_FILE)}(?![\w.-])'
 )
 # The env file's name as a path component, however it is prefixed: what _KNOWN_ENV_PATH must account for.
@@ -5954,7 +5962,7 @@ def test_writes_to_the_staged_env_file_are_not_taken_for_reads():
         f'printf \'KEY=%s\\n\' "${{value}}" >> {STAGED_ENV_FILE}',
         f"sed -i 's/^KEY=.*/KEY=/' {STAGED_ENV_FILE}",
         f'shred -u {STAGED_ENV_FILE} || rm -f {STAGED_ENV_FILE}',
-        f'cp artifact/data/store/.env.default data/store/{STAGED_ENV_FILE}',
+        f'cp artifact/data/store/.env.default server/data/store/{STAGED_ENV_FILE}',
         f'X="$(grep -E \'^X=\' {STAGED_ENV_FILE} | cut -d= -f2)"',
     ]
     reads = _staged_env_reads(lines)
@@ -6003,8 +6011,8 @@ def test_every_spelling_of_the_checkout_root_is_a_read(prefix: str, quote: str):
         f"ROOT_ENV_FILE='${{{{ github.workspace }}}}/{STAGED_ENV_FILE}' docker compose config --quiet",
         f'export ROOT_ENV_FILE={STAGED_ENV_FILE}',
         f'ROOT_ENV_FILE="$GITHUB_WORKSPACE/{STAGED_ENV_FILE}"',
-        f'DATA_DIR=/tmp/x ROOT_ENV_FILE="${{PWD}}/{STAGED_ENV_FILE}" STORE_ENV_FILE="${{PWD}}/data/store/'
-        f'{STAGED_ENV_FILE}" INGEST_ENV_FILE="${{PWD}}/data/ingest/{STAGED_ENV_FILE}" docker compose config',
+        f'DATA_DIR=/tmp/x ROOT_ENV_FILE="${{PWD}}/{STAGED_ENV_FILE}" STORE_ENV_FILE="${{PWD}}/server/data/store/'
+        f'{STAGED_ENV_FILE}" INGEST_ENV_FILE="${{PWD}}/server/data/ingest/{STAGED_ENV_FILE}" docker compose config',
     ],
     ids=['dot-prefix', 'pwd-quoted', 'workspace-single-quoted', 'export', 'standalone', 'agent-stack-render'],
 )
@@ -6038,8 +6046,8 @@ def test_a_substitution_on_the_right_of_an_assignment_is_still_a_read(line: str,
         f'rm -f "$GITHUB_WORKSPACE/{STAGED_ENV_FILE}"',
         f"sed -i 's/^KEY=.*/KEY=/' ${{PWD}}/{STAGED_ENV_FILE}",
         f'cp .env.default "${{{{ github.workspace }}}}/{STAGED_ENV_FILE}"',
-        f'grep K data/store/{STAGED_ENV_FILE} | cut -d= -f2-',
-        f'grep K "${{PWD}}/data/ingest/{STAGED_ENV_FILE}" | cut -d= -f2-',
+        f'grep K server/data/store/{STAGED_ENV_FILE} | cut -d= -f2-',
+        f'grep K "${{PWD}}/server/data/ingest/{STAGED_ENV_FILE}" | cut -d= -f2-',
     ],
     ids=['append-quoted', 'rm-workspace', 'sed-in-place', 'cp-expression', 'store-service', 'ingest-service'],
 )
