@@ -10,7 +10,8 @@ THE STACK MUST BE IN FAKE MODE: data_ingest's log carries the 'FAKE BROKER:' ban
 real broker these symbols are not tickers and every test here fails -- never skips.
 
 EVERY ENTRY HERE IS CREATED BY THE DATASET POST, the one route that reaches data_ingest: data_store
-upserts the entry, asks data_ingest over the Kafka RPC, and writes the bars it gets back. Entry ids
+upserts the entry, asks data_ingest over the FetchDataset gRPC stream, and writes the bars it gets
+back -- the Kafka RPC it used to ask over went on tj-3mk3u5.11 and .12. Entry ids
 are read by SQL (the POST answers with a count, not an id) and adopted for cleanup whether or not
 the POST succeeded. Bars are read back over HTTP, FILTERED BY dataset_id: data_store's read is
 closed at end while the broker range is half-open (tj-j4wknb addendum 5; tj-6w07z8 open), so an
@@ -23,18 +24,29 @@ FakeRead, which the test client mounts from the same tree as the stack, so a Fak
 appear on both sides and cancel. GAPS adds the scenario's documented rule (only even grid indices
 are served) through grid_index. vwap is not compared: the store's bar has no vwap column.
 
-FAILURE CLASS ONLY. A failure is asserted as NOT 2xx, never as a particular status code: the codes
-are PR 2's (gRPC and typed errors, tj-fa1rpu, tj-8konfu D6.4). Today a FakeRead failure becomes the
-bare {} at ingest's RPC edge and data_store's 5 s RPC deadline expires; that is not pinned here.
+FAILURE CLASS ONLY NO LONGER HOLDS, AND THE PARAGRAPH THAT SAID SO WAS LEFT STANDING TOO LONG
+(corrected on tj-3mk3u5.16). It read: "A failure is asserted as NOT 2xx, never as a particular
+status code ... Today a FakeRead failure becomes the bare {} at ingest's RPC edge and data_store's
+5 s RPC deadline expires; that is not pinned here." BOTH HALVES ARE NOW FALSE. tj-3mk3u5.11 deleted
+the edge that turned a BarsFailure into the bare {}, and tj-3mk3u5.10 replaced the 5 s deadline, so
+every failure here arrives as a TYPED one and the status is the thing a caller branches on. The
+tests pin the exact status accordingly (tj-xhcoyc, TE-7): 503 for a vendor or peer that is not
+there, 422 for a refusal the caller can fix. The reason is pinned beside it wherever the body is
+problem+json, because a reason's row can change the status while the reason stays the same.
 
 Items, tj-vhboky.14 numbering where they moved here from Sys-4:
-  * default round trip -- bars equal the generator's for the range, feed IEX, data_points equals
-    the count. Sent with the RIGHT secret and asserted 2xx: this CLOSES 7c FOR THE DATASET POST
-    (Sys-3 asserted its 409 half; architect note 16:51 UTC 2026-09-28 on tj-vhboky.63).
+  * default round trip -- bars equal the generator's for the range, data_points equals the count,
+    and the RESOLVED tape is recorded on BOTH the bars and the entry (tj-3mk3u5.16 A2). Sent with
+    the RIGHT secret and asserted 2xx: this CLOSES 7c FOR THE DATASET POST (Sys-3 asserted its 409
+    half; architect note 16:51 UTC 2026-09-28 on tj-vhboky.63).
+  * an unservable feed -- a POST naming a tape this deployment cannot serve is a 422
+    FEED_NOT_AVAILABLE naming the refused tape, and writes no entry and no bar (tj-3mk3u5.16 A2).
   * EMPTY, GAPS, FAIL, SLOW, FAILONCE -- one test each, symbols carrying the scenario's prefix.
   * 4 -- an exact repeat resolves to the same entry and adds none; changing only expiry_type, then
-    only owner, each makes a new entry; no entry takes the stronger expiry_type of the two. Feed is
-    not part of an entry's identity at this revision and is not varied.
+    only owner, each makes a new entry; no entry takes the stronger expiry_type of the two. Feed IS
+    part of an entry's identity since c4a1f7b2e905, but it cannot be varied from here: the entry
+    records the tape the ACK resolved, and this deployment resolves one. Varying it is the unit
+    tier's (data/store/tests/test_dataset_entry_identity.py).
   * 5 (success half) -- a different owner's overlapping range is a separate entry, and both hold
     their own bars at the shared instants.
   * 8 (HTTP half) -- a range of more bars than POSTGRES_MAX_BIND_PARAMETERS //
@@ -56,6 +68,7 @@ import pytest
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity
+from common.errors.vocabulary import Reason
 from data.store.app.database.crud.stock.asset_market_activity import POSTGRES_MAX_BIND_PARAMETERS
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from routers.data_store.app_endpoints import AssetDataInterface, AssetDatasetStoreInterface
@@ -70,6 +83,8 @@ from tests.fakes.market_data import (
     grid_index,
     grid_timestamps,
 )
+from tests.fakes.market_data import FEED as FAKE_DEPLOYMENT_FEED
+from tests.system.problem_json import assert_problem
 
 
 pytestmark = pytest.mark.data_store
@@ -85,6 +100,15 @@ READ_PATH = AssetDataInterface.GET_ASSET_DATA.format(
 
 # What a stored bar is compared on: (timestamp, open, high, low, close, volume, trade_count).
 BarTuple = tuple[datetime, float, float, float, float, int, int]
+
+# The tape this deployment serves, read off the fake rather than restated, so that rebuilding the
+# stack with another entitlement moves both halves of the feed pair together.
+SERVED_FEED = FAKE_DEPLOYMENT_FEED
+# A tape it does not serve. FakeRead refuses any named feed that is not its deployment feed, so
+# this is unservable by construction rather than by configuration. Restated rather than derived
+# from Feed, because a derived "any other member" silently becomes vacuous the day the enum has
+# one member; the guard below is what keeps the pair honest instead.
+UNSERVABLE_FEED = Feed.SIP
 
 # SLOW_MARGIN_SECONDS IS GONE (tj-xhcoyc). It padded a second read taken after FakeRead's SLOW_
 # delay, to catch a late RPC answer arriving once data_store had already given up on it. There is
@@ -196,6 +220,15 @@ def test_default_round_trip_stores_exactly_the_generated_bars(
     The pipeline loses, adds and changes nothing: the bars read back under the new entry are the
     generator's for [start, end), timestamps preserved, each labelled with FakeRead's feed (IEX),
     and data_points and the listing's item_count both equal the count.
+
+    THE RESOLVED FEED IS ASSERTED ON THE ENTRY AS WELL AS ON THE BARS (tj-3mk3u5.16 A2). The bar
+    assertion alone was the weaker half of the pair: a bar's feed is stamped from FetchAccepted
+    by the mapper, so bars could carry the resolved tape while the entry carried something else
+    entirely, and nothing here would have noticed. The entry's feed is the one tj-3mk3u5.31 made
+    a NOT NULL identity column, and the one a caller filters on, so it is the one that has to be
+    the resolution rather than a preference. This POST sends NO feed at all -- the ordinary
+    request, meaning "the deployment decides" -- which is what makes the stored value evidence of
+    a resolution: there was no preference for it to have been copied from.
     """
     expected = _expected(own_symbol)
 
@@ -205,11 +238,55 @@ def test_default_round_trip_stores_exactly_the_generated_bars(
     assert len(ids) == 1, f'expected one entry for {own_symbol}, found {ids}'
     assert response.json()['data_points'] == len(expected), data_store.describe(response)
     bars = _read(data_store, ids[0])
-    assert {bar['feed'] for bar in bars} == {Feed.IEX.value}, f'feeds read back: {sorted({b["feed"] for b in bars})}'
+    assert {bar['feed'] for bar in bars} == {SERVED_FEED.value}, f'feeds read back: {sorted({b["feed"] for b in bars})}'
     assert {bar['dataset_id'] for bar in bars} == {str(ids[0])}, 'a bar read back under another dataset id'
     stored = _stored(data_store, ids[0])
     assert stored == expected, _diff(stored, expected)
-    assert _listing(data_store, own_symbol)[str(ids[0])]['item_count'] == len(expected)
+    listed = _listing(data_store, own_symbol)[str(ids[0])]
+    assert listed['item_count'] == len(expected)
+    assert listed['feed'] == SERVED_FEED.value, f'the entry was stored with feed {listed["feed"]!r}'
+
+
+def test_an_unservable_feed_is_refused_and_leaves_no_entry_and_no_bar(
+    own_symbol: str, run_identity, data_store, adopt_entries: Callable[[str], list[UUID]]
+) -> None:
+    """A POST naming a tape this deployment cannot serve is refused, and writes nothing.
+
+    THE ONE IN-BAND FAILURE OF THE FETCH STREAM, which is why it earns a system test rather than
+    a unit one. FEED_NOT_AVAILABLE never travels as a gRPC status: data_ingest answers it on the
+    FetchDataset ack's refused arm and that ack is the stream's only event (tj-3mk3u5.22 Q5;
+    common/rpc/ingest.py, schemas/data_ingest/fetch_dataset.py::FetchRefused). So this is the one
+    failure that reaches data_store as a successful stream carrying a refusal, and the only place
+    the store has to turn one into a 4xx. Every other failure arrives as an error already.
+
+    NOTHING WRITTEN IS THE SECOND HALF AND IS NOT A RESTATEMENT OF THE FAIL SCENARIO. Both end
+    with no entry, but for different reasons that could regress apart: FAIL_ never produces an
+    ack at all, while this one produces an ack whose refused arm the store must read BEFORE it
+    upserts. The entry is upserted on the ACCEPTED ack (tj-3mk3u5.10), so an implementation that
+    wrote the entry first and read the arm second would pass the FAIL case and fail this one --
+    and it would store the caller's PREFERENCE as though it were a resolution, which is the exact
+    placeholder tj-3mk3u5.31 made impossible by making feed a NOT NULL identity column. No bar
+    can survive either: a bar has no dataset entry to point at.
+
+    THE REFUSED TAPE IS NAMED IN THE BODY, not just in its prose. feed is an allowlisted metadata
+    key (common/errors METADATA_KEYS) and becomes a member of the same name, so a caller can read
+    which tape was refused without parsing detail -- which tj-8feral ruled is prose.
+    """
+    assert UNSERVABLE_FEED is not SERVED_FEED, (
+        f'this test asks for {UNSERVABLE_FEED.value}, the tape the fake serves, so it proves nothing'
+    )
+
+    response, ids = _post(data_store, adopt_entries, own_symbol, _body(run_identity.owner, feed=UNSERVABLE_FEED.value))
+
+    problem = assert_problem(
+        response,
+        status=422,
+        reason=Reason.FEED_NOT_AVAILABLE.value,
+        title='Unprocessable Entity',
+        describe=data_store.describe,
+    )
+    assert problem['feed'] == UNSERVABLE_FEED.value, data_store.describe(response)
+    assert ids == [], f'a refused feed left {len(ids)} entry/entries for {own_symbol}: {ids}'
 
 
 # ---------------------------------------------------------------------------------------------
@@ -281,10 +358,16 @@ def test_fail_scenario_is_not_2xx_and_stores_no_bars(
     assert ids == [], f'a fetch that failed before the ack left {len(ids)} entry/entries for {symbol}: {ids}'
 
 
-def test_slow_scenario_is_not_2xx_and_the_late_answer_is_dropped(
+def test_slow_scenario_is_served_rather_than_abandoned(
     own_symbol: str, run_identity, data_store, scenario_entries: Callable[[str], list[UUID]]
 ) -> None:
     """A vendor slower than the old deadline but well inside the new one is SERVED, not abandoned.
+
+    THE NAME WAS test_slow_scenario_is_not_2xx_and_the_late_answer_is_dropped UNTIL tj-3mk3u5.16,
+    which is the opposite of what the body has asserted since tj-xhcoyc reversed it. I reversed
+    the assertions and left the name, so the file read as a suite where SLOW_ still failed; that
+    is a defect in a test of mine, found by reading the file for A2's citations rather than by
+    anything going red, and a stale name is exactly the kind a green suite never catches.
 
     THIS CASE NOW ASSERTS THE OPPOSITE OF WHAT IT USED TO, and the reversal is the ruling rather
     than a concession (tj-xhcoyc, item 2). It was written against data_store's Kafka RPC deadline
@@ -483,7 +566,18 @@ def test_naive_expiry_is_refused_at_the_edge_and_creates_nothing(
         data_store, adopt_entries, own_symbol, _body(run_identity.owner, expiry='2031-03-04T05:06:07')
     )
 
-    assert response.status_code == 422, data_store.describe(response)
-    errors = [(error['loc'], error['type']) for error in response.json()['detail']]
+    # The per-field issues moved from a bare `detail` list to the problem+json `errors` member
+    # under TE-6; loc and type are unchanged, so this is the same pin at a new address
+    # (tj-3mk3u5.37.9). The envelope assertion is new: a 422 that lost its reason would have
+    # passed the old one, and reason is what a caller branches on.
+    body = assert_problem(
+        response,
+        status=422,
+        reason=Reason.INVALID_REQUEST.value,
+        title='Unprocessable Entity',
+        describe=data_store.describe,
+    )
+    errors = [(error['loc'], error['type']) for error in body['errors']]
     assert errors == [(['body', 'expiry'], 'timezone_aware')], data_store.describe(response)
     assert ids == [], f'a refused POST created entries: {ids}'
+    assert 'served_range' not in body, 'a refusal carries a served_range, which only a served fetch has'

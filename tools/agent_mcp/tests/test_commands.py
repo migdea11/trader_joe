@@ -155,11 +155,11 @@ _EXPECTED_TAILS = {
         ['build', 'data_store', 'data_ingest', 'test_client'],
         # tj-zgq5v2: the infrastructure plain, then the snapshot-bound services force-recreated. Exact,
         # not a prefix (below), so a flag or a service moved between the two is red.
-        ['up', '-d', '--wait', '--wait-timeout', '300', 'postgres', 'kafka'],
+        ['up', '-d', '--wait', '--wait-timeout', '300', 'postgres'],
         ['up', '-d', '--wait', '--wait-timeout', '300', '--force-recreate', '--no-deps', 'data_store', 'data_ingest'],
     ],
     'stack_down': [['down', '--remove-orphans']],
-    'stack_wipe': [['down', '--remove-orphans'], ['run'], ['run']],
+    'stack_wipe': [['down', '--remove-orphans'], ['run']],
     'migrate': [
         ['ps', '-q', 'postgres'],
         *_INSPECTS,
@@ -480,7 +480,7 @@ def _overlay_data_targets() -> dict[str, str]:
 def test_data_mounts_are_the_overlays_data_dir_targets():
     """(3): the clear steps name exactly the services and container targets the overlay binds from DATA_DIR."""
     assert {service: os.path.normpath(target) for service, target in stack.DATA_MOUNTS} == _overlay_data_targets()
-    assert set(dict(stack.DATA_MOUNTS)) == {'postgres', 'kafka'}
+    assert set(dict(stack.DATA_MOUNTS)) == {'postgres'}
 
 
 def _relative_bind_sources(path: Path) -> set[str]:
@@ -580,8 +580,8 @@ def test_stack_up_force_recreates_exactly_the_snapshot_bound_services_after_the_
     """Ruling (2) and re-pin (c), run through AgentStack.
 
     The last step is an `up --force-recreate --no-deps` of exactly SNAPSHOT_BOUND_SERVICES; the `up`
-    before it names exactly the rest of SERVICES, with neither flag, so postgres and kafka keep their
-    containers and each app container is created once; together they cover SERVICES. Both up steps
+    before it names exactly the rest of SERVICES, with neither flag, so postgres keeps its
+    container and each app container is created once; together they cover SERVICES. Both up steps
     wait, both are flagged as builds, and the base inspects run once, before the build.
     """
     rig, result = _run_verb(tmp_path, monkeypatch, 'stack_up')

@@ -25,11 +25,12 @@ class BaseGetDatasetRequest(InboundContract):
     # through a field rather than past one.
     #
     # WHY IT SURVIVES ANYWAY, while StoreAssetDatasetBody.feed did not: nothing can populate it
-    # now. tj-rh4b7f (2026-09-25) deferred caller-selected feed, so the store body has no feed to
-    # forward and data_action_request.py's model_dump() splat leaves this at its default. This is
-    # the store->ingest channel the deferred transport work resolves a feed OVER, so it is the
-    # designated landing site rather than dead weight. It stays declared and honestly described;
-    # it does not stay described as working.
+    # now. tj-rh4b7f (2026-09-25) deferred caller-selected feed, so there is no feed to forward.
+    # NOTE, tj-mzaub8: this comment used to call the model the store->ingest channel and the
+    # designated landing site for that deferred work. It is neither any more. The live
+    # store->ingest channel is FetchDatasetRequest (schemas/data_ingest/fetch_dataset.py) over
+    # gRPC, and this module has no non-test importer left. Caller-selected feed lands there, not
+    # here. The model is retained but off every live path; its fate is undecided.
     #
     # It cannot be resolved from the vendor's answer either: Alpaca's bars response has no feed
     # field at any level, so the ruling's middle branch does not exist for the one vendor there is.
@@ -37,9 +38,9 @@ class BaseGetDatasetRequest(InboundContract):
 
     granularity: Granularity
     # AwareDatetime, REFUSE not convert (user ruling D2 = A on tj-vhboky.20, the tj-1bl90i rule).
-    # The one in-tree sender, data/store/app/ingest/data_action_request.py, builds this from
-    # StoreAssetDatasetBody, whose start/end/expiry are already aware, and the RPC carries it as
-    # model_dump_json(), which keeps the offset -- so tightening this receiver breaks no sender.
+    # The sender this was written for, data/store/app/ingest/data_action_request.py, built it from
+    # StoreAssetDatasetBody over an RPC that carried model_dump_json(). That path is gone: it now
+    # builds a FetchDatasetRequest instead, and this model has no sender at all.
     start: AwareDatetime
     end: AwareDatetime | None
 
@@ -61,9 +62,10 @@ class StockDatasetRequest(GetDatasetRequest):
 
     # This carried `extra = 'ignore'` with the comment "ignore asset_type", which never did that:
     # asset_type is a DECLARED field inherited from GetDatasetRequest, so it was already accepted
-    # and the override only ever relaxed the model against genuinely unknown keys. It is removed
-    # rather than repaired -- the router builds this from GetDatasetRequest.model_dump(), whose
-    # keys are exactly this model's fields, so there is nothing for it to have been ignoring.
+    # and the override only ever relaxed the model against genuinely unknown keys. It was removed
+    # rather than repaired -- the router that built this from GetDatasetRequest.model_dump() passed
+    # keys that were exactly this model's fields, so there was nothing for it to have been
+    # ignoring. That router is now an empty APIRouter and builds nothing.
 
 
 class CryptoDatasetRequest(StockDatasetRequest):

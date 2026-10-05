@@ -31,8 +31,7 @@ weaker version of the same assertion: the worker pool and the gRPC port are what
 properties were always about, since the pool's threads are the non-daemon ones that outlive a
 skipped teardown and the port is what a caller reaches.
 
-Only the latency server is replaced, at app_depends' own name for it, plus whatever of the Kafka
-startup still exists (data/ingest/tests/kafka_wiring.py -- transitional, tj-iwiq23). The gRPC host
+Only the latency server is replaced, at app_depends' own name for it. The gRPC host
 is the real one on 127.0.0.1 (grpc_bind.LoopbackGrpc). LoopbackGrpc fails any test whose lifespan
 left a host serving, then stops it, so that regression is red in every test here (and in the
 re-pointed lifespan tests of test_read_seam.py and test_fake_read.py) instead of hanging the run.
@@ -64,7 +63,6 @@ from common.worker_pool import SharedWorkerPool
 from data.ingest.app import app_depends, grpc_host, main
 from data.ingest.app.brokers.interface import BarsQuery, BarsResponse
 from data.ingest.tests.grpc_bind import GUARD_S, LOOPBACK, LoopbackGrpc, accepts_connections, free_loopback_port
-from data.ingest.tests.kafka_wiring import stub_kafka_startup
 from routers.common import latency as latency_harness
 
 
@@ -106,9 +104,10 @@ async def health_status(port: int, service: str = '', timeout_s: float = 5.0) ->
 class StubbedLifespan:
     """The production lifespan, with only what cannot run here stood in for.
 
-    Nothing inside the lifespan is replaced except the latency server, whatever of the Kafka startup
-    still exists (kafka_wiring.stub_kafka_startup -- transitional, see tj-iwiq23) and the recording
-    wrapper LoopbackGrpc puts around build_grpc_host.
+    Nothing inside the lifespan is replaced except the latency server and the recording wrapper
+    LoopbackGrpc puts around build_grpc_host. A tolerant Kafka stub sat beside them from
+    tj-3mk3u5.32 until tj-iwiq23; tj-3mk3u5.11 removed what it muzzled and tj-3mk3u5.14 the module,
+    and removing it changed no result here.
 
     It was called KafkaStubbed until tj-3mk3u5.32, and it recorded an event each time the Kafka RPC
     servers started or stopped, carrying whether the gRPC port accepted connections at that moment
@@ -134,7 +133,6 @@ class StubbedLifespan:
             None: While the lifespan is up.
         """
         with ExitStack() as stubs:
-            stub_kafka_startup(stubs)
             stubs.enter_context(patch.object(app_depends, 'initialize_latency_server', self.latency_server))
             async with self.grpc_bind, self.app.router.lifespan_context(self.app):
                 yield
@@ -318,8 +316,6 @@ from unittest.mock import Mock
 from common.rpc.server import GRPC_HOST_ENV, GRPC_PORT_ENV
 from common.worker_pool import SharedWorkerPool
 from data.ingest.app import app_depends, main
-from routers.data_ingest import get_dataset_request
-
 released = threading.Event()
 real_worker_startup = SharedWorkerPool.worker_startup
 real_worker_shutdown = SharedWorkerPool.worker_shutdown
@@ -338,20 +334,6 @@ def worker_shutdown():
 app_depends.initialize_latency_server = Mock()
 SharedWorkerPool.worker_startup = worker_startup
 SharedWorkerPool.worker_shutdown = worker_shutdown
-
-# The same two tolerant Kafka stubs as data/ingest/tests/kafka_wiring.py, spelled out rather than
-# imported: this child runs on the IMAGE path, which carries no test package, and reaching into one
-# from here is the very thing test_no_production_test_imports.py forbids. Without the first of them
-# the lifespan dies in get_consumer_params, casting an unset BROKER_PORT. Both go on tj-iwiq23.
-try:
-    from common.kafka.messaging.kafka_consumer import KafkaConsumerFactory
-except ModuleNotFoundError:
-    pass
-else:
-    KafkaConsumerFactory.wait_for_kafka = Mock(return_value=True)
-
-if getattr(get_dataset_request, 'rpc', None) is not None:
-    get_dataset_request.rpc.init_servers = Mock(return_value=Mock())
 
 holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 holder.bind(('127.0.0.1', 0))

@@ -42,8 +42,10 @@ def _member_names_schema(enum: type[NamedIntEnum]) -> WithJsonSchema:
 # contradicts both the wire (serialize_enum_name below sends names) and the documented default
 # ('BULK' is not in [1..5]). Schema only: validation and serialization are untouched, so the wire
 # bytes do not change and NamedIntEnum.validate still accepts an integer, undocumented.
-# FIELD-LOCAL, NOT A HOOK ON NamedIntEnum: GetDatasetRequest (schemas/data_ingest) carries these
-# same enums as integers on the Kafka wire, so a class-level schema would make that model lie.
+# FIELD-LOCAL, NOT A HOOK ON NamedIntEnum: GetDatasetRequest (schemas/data_ingest) still declares
+# these same enums as plain integers, so a class-level schema would make that model lie. Its Kafka
+# transport went on tj-3mk3u5.14 and it has no non-test importer left, but the model is still in
+# the tree and so is the reason this annotation is per field rather than on the enum class.
 ExpiryTypeByName = Annotated[ExpiryType, _member_names_schema(ExpiryType)]
 UpdateTypeByName = Annotated[UpdateType, _member_names_schema(UpdateType)]
 

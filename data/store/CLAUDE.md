@@ -1,6 +1,6 @@
 # Market data store
 
-Owner of all persisted market data. Requests data from data-ingest over Kafka RPC, writes it to Postgres, and serves it over `/store/...` and `/internal/asset-data/...`. Tables: `store_dataset_entry`, `stock_market_activity`.
+Owner of all persisted market data. Requests data from data-ingest over gRPC (`FetchDataset`), writes it to Postgres, and serves it over `/store/...` and `/internal/asset-data/...`. Tables: `store_dataset_entry`, `stock_market_activity`.
 
 ## Architecture reference
 
@@ -8,11 +8,31 @@ Owner of all persisted market data. Requests data from data-ingest over Kafka RP
 
 ## Tech stack
 
-Python 3.12, FastAPI, SQLAlchemy 2.0 async, asyncpg, Alembic, Postgres
+Python 3.12, FastAPI, SQLAlchemy 2.0 async, asyncpg, Alembic, Postgres, `grpc.aio` client of data-ingest
 
 ## Key invariants
 
 Sole owner of persisted market data. Every write goes through a repository; no raw SQL in routers. Migrations are additive.
+
+## Data freshness and completeness
+
+Removing Kafka removed consumer-group lag, which was this system's only free liveness signal.
+**Nothing has replaced it yet.** `tj-3mk3u5.4` and `tj-3mk3u5.5` are still open, and the tree today
+has no coverage ledger: no `missing_ranges` query, no `range_agg` subtraction, no freshness or
+completeness metric. Do not rely on one, and do not describe one as available.
+
+What can actually be asked right now, both straight against Postgres:
+
+| Question | Where the answer is |
+|---|---|
+| How fresh is a series? | the greatest `end` across that symbol's `store_dataset_entry` rows, measured against `now()` |
+| What was actually stored | the `stock_market_activity` rows falling inside that range |
+
+A short answer from a read path is **not** yet distinguishable from a complete one, so never infer
+completeness from a row count. Closing that is exactly what `tj-3mk3u5.5` is for: when the ledger
+lands, freshness becomes `now()` minus the upper bound of the newest covered range per series, and
+completeness becomes the `range_agg` subtraction over the coverage rows, with reads returning an
+explicit envelope naming the missing ranges instead of quietly returning fewer rows.
 
 ## Environment variables
 

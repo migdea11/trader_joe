@@ -156,13 +156,10 @@ updates:
   # ---------------------------------------------------------------------------
   # Docker Compose. A SEPARATE ecosystem from `docker` -- the docker entry above does
   # not cover compose files. This is the entry that actually has version-comparable
-  # pins to move today: postgres:17.11-trixie and confluentinc/cp-kafka:7.9.10.
+  # pins to move today: postgres:17.11-trixie.
   #
-  # Majors are ignored for both images, and that is a deliberate trade, not tidiness:
+  # The major is ignored for that image, and that is a deliberate trade, not tidiness:
   #
-  # * confluentinc/cp-kafka 8.x is Kafka 4.0, which removed the protocol api versions
-  #   kafka-python-ng still sends. The client swap is tracked in tj-q65ux6. Until it
-  #   lands, a major bump is a pull request that cannot be merged, only reclosed.
   # * postgres majors change the on-disk format. PGDATA is a bind mount, so a tag bump
   #   alone does not migrate anything -- it starts a server that refuses the data
   #   directory. That bump is a planned operation (tj-owduw0), not a pull request.
@@ -179,10 +176,9 @@ updates:
   # this block to "restore" security coverage that may never have been lost: doing so
   # lets through a major that cannot be merged here anyway.
   #
-  # The block is safe under EITHER reading. Both projects ship security fixes as patch
-  # releases on supported majors, patch and minor remain fully covered, and a cp-kafka
-  # 8.x or postgres major bump is unmergeable here regardless, for the two reasons
-  # above.
+  # The block is safe under EITHER reading. Postgres ships security fixes as patch
+  # releases on supported majors, patch and minor remain fully covered, and a postgres
+  # major bump is unmergeable here regardless, for the reason above.
   # ---------------------------------------------------------------------------
   - package-ecosystem: docker-compose
     directory: /
@@ -198,9 +194,6 @@ updates:
     commit-message:
       prefix: build
     ignore:
-      - dependency-name: confluentinc/cp-kafka
-        update-types:
-          - version-update:semver-major
       - dependency-name: postgres
         update-types:
           - version-update:semver-major

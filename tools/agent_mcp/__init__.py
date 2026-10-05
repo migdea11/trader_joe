@@ -50,13 +50,13 @@ THE GENERATED ENV FILES (stack.ensure_env_files; ADR addendum 2). Three files in
 directory, outside the repository, 0600, generated once from the committed .env.default files read at
 the main checkout's HEAD (git cat-file; no live env file is ever opened):
     agent_stack.env         root: the --env-file AND ROOT_ENV_FILE. Random POSTGRES_PASS and
-                            INSTANCE_WRITE_SECRET; the agent stack's DATABASE_NAME, BROKER_NAME,
+                            INSTANCE_WRITE_SECRET; the agent stack's DATABASE_NAME,
                             STORE_API_NETWORK and DATA_DIR; ROOT_ENV_FILE, STORE_ENV_FILE and
                             INGEST_ENV_FILE as absolute paths.
     agent_stack_store.env   data/store's committed variables.
     agent_stack_ingest.env  data/ingest's committed variables, ALPACA_API_KEY and ALPACA_API_SECRET
                             present and EMPTY (and absent from the other two files).
-THE F1 RULE: DATABASE_NAME, BROKER_NAME and STORE_API_NETWORK (and every other
+THE F1 RULE: DATABASE_NAME and STORE_API_NETWORK (and every other
 stack.ROOT_ONLY_VARIABLES name) are set in the ROOT file only. env_file order is root then service
 file, so a service-file value would win in the container while compose interpolated the root value --
 the apps would dial a host other than the container name.
@@ -88,7 +88,7 @@ DOCKER API SECTIONS THE VERBS NEED -- the socket proxy (tj-c4mosr.4) enables exa
 docker-socket-proxy's variables, everything else off:
     PING, VERSION, INFO    the CLI's and compose's handshake.
     CONTAINERS             create/start/stop/remove/inspect/logs/wait/attach: up, down, run, logs, ps.
-    IMAGES                 pull postgres, kafka and the BASE_IMAGES, tag and inspect images.
+    IMAGES                 pull postgres and the BASE_IMAGES, tag and inspect images.
     NETWORKS, VOLUMES      the project's networks; compose inspects volumes on up and down.
     BUILD, SESSION, GRPC   image builds through BuildKit (compose build, run --build).
     EVENTS                 compose up --wait and run follow container events.

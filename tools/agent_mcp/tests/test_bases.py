@@ -151,7 +151,6 @@ _CAN_BUILD = [
 ]
 _CANNOT_BUILD = [
     ['run', '--rm', '--no-deps', '--user', '0', '--entrypoint', 'sh', 'postgres', '-c', 'x', 'clear', '/d'],
-    ['run', '--rm', '--no-deps', '--user', '0', '--entrypoint', 'sh', 'kafka', '-c', 'x', 'clear', '/d'],
     ['ps', '--all'],
     ['ps', '-q', 'postgres'],
     ['logs', '--no-color', '--tail', '50', 'postgres'],
@@ -169,7 +168,7 @@ def test_builds_is_true_for_every_compose_command_that_can_build(tail: list[str]
 
 @pytest.mark.parametrize('tail', _CANNOT_BUILD, ids=lambda tail: ' '.join(tail) or 'empty')
 def test_builds_is_false_for_image_only_runs_and_read_only_commands(tail: list[str]):
-    """Addendum 15: stack_wipe's postgres/kafka clears, ps, logs (even of a built service), down."""
+    """Addendum 15: stack_wipe's postgres clear, ps, logs (even of a built service), down."""
     assert stack.builds(tail) is False
 
 
@@ -180,7 +179,7 @@ def test_builds_is_false_for_image_only_runs_and_read_only_commands(tail: list[s
 _BUILDER_SAMPLES = {
     'stack_up_steps': (),
     'stack_down_steps': (),
-    'wipe_clear_steps': (['postgres', 'kafka'],),
+    'wipe_clear_steps': (['postgres'],),
     'postgres_running_steps': (),
     'alembic_steps': (['upgrade', 'head'], ['current']),
     'system_tests_steps': (['tests/system'],),
@@ -261,7 +260,7 @@ def test_every_step_that_can_build_is_preceded_by_the_ensure_bases_steps(
 
     Run through AgentStack, with the bases present and absent. A build, --build, up or run of a
     built service is preceded by the inspects; a verb that cannot build runs no base step at all
-    (stack_wipe's postgres/kafka clears included); and no step anywhere passes --pull.
+    (stack_wipe's postgres clear included); and no step anywhere passes --pull.
     """
     assert set(VERB_SAMPLES) - DOCKERLESS_VERBS == BUILDING_VERBS | BASE_FREE_VERBS, 'classify the new verb here'
     rig, result = _run_verb(tmp_path, monkeypatch, verb, respond)
@@ -277,7 +276,7 @@ def test_every_step_that_can_build_is_preceded_by_the_ensure_bases_steps(
         assert building == [] and not [argv for argv in argvs if _is_base(argv)], argvs
         if verb == 'stack_wipe':
             runs = [argv[step_prefix_length() :] for argv in argvs if argv[step_prefix_length()] == 'run']
-            assert {run[7] for run in runs} == {'postgres', 'kafka'}, 'the clears did not run, so nothing was shown'
+            assert {run[7] for run in runs} == {'postgres'}, 'the clears did not run, so nothing was shown'
         return
     assert building, f'{verb} ran no step that can build: {argvs}'
     for index in building:

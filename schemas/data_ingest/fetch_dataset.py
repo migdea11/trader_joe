@@ -51,7 +51,8 @@ class FetchDatasetRequest(InboundContract):
     # invent one downstream. Nothing under data/ingest/app reads it today. Sensitive (tj-vhboky.45): kept
     # out of repr and str, still carried by model_dump -- see common/sensitive.py.
     owner: SensitiveStr
-    # Selects the reader; data/ingest/app/ingest_control.py dispatches on it.
+    # Selects the reader; routers/data_ingest/fetch_dataset_handler.py picks it out of the handler's
+    # injected readers mapping.
     source: DataSource
     asset_symbol: str
     # Selects the asset path. The stock reader then hard-codes AssetType.STOCK onto the instrument it
@@ -63,8 +64,8 @@ class FetchDatasetRequest(InboundContract):
     # Inclusive.
     start: AwareDatetime
     # None is an OPEN END, "up to whatever is current", which the reader serves as its as_of. Optional
-    # with a default, unlike the Kafka request's required-but-nullable end: on this contract an absent
-    # end is a real and ordinary request, not a field the caller forgot.
+    # with a default, unlike the superseded GetDatasetRequest's required-but-nullable end: on this
+    # contract an absent end is a real and ordinary request, not a field the caller forgot.
     end: AwareDatetime | None = None
     # Becomes the rate budget's priority: STREAM -> LIVE, STATIC -> BACKFILL, anything else ->
     # INTERACTIVE (data/ingest/app/brokers/rate_budget.py).

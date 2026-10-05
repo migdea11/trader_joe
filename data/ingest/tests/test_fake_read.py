@@ -33,7 +33,6 @@ import subprocess
 import sys
 import tomllib
 from collections.abc import Iterator
-from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta, timezone
 from importlib.metadata import packages_distributions
 from itertools import pairwise
@@ -63,7 +62,6 @@ from data.ingest.app.brokers.interface import (
 )
 from data.ingest.app.brokers.rate_budget import RequestPriority
 from data.ingest.tests.grpc_bind import LoopbackGrpc
-from data.ingest.tests.kafka_wiring import stub_kafka_startup
 from schemas.data_ingest.get_dataset_request import StockDatasetRequest
 from tests.fakes.market_data import (
     DEFAULT_SLOW_DELAY_SECONDS,
@@ -93,9 +91,6 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 FAKES_DIR = REPO_ROOT / 'tests' / 'fakes'
 LAUNCHER_MODULE = 'tests.fakes.ingest_launcher'
 
-# data_store's Kafka RPC deadline (common/kafka/rpc/kafka_rpc_client.py, timeout default 5). SLOW_
-# exists to outlive it.
-RPC_DEADLINE_SECONDS = 5.0
 
 HOUR = timedelta(hours=1)
 # 2026-01-05 is a Monday; 14:00 UTC is on the ONE_HOUR grid (whole hours since the epoch).
@@ -707,8 +702,33 @@ async def test_slow_really_waits_on_the_event_loop_by_default():
     assert loop.time() - began >= 0.2
 
 
-def test_slow_outlives_the_rpc_deadline_by_default_and_is_bounded():
-    assert FakeRead().slow_delay_seconds == DEFAULT_SLOW_DELAY_SECONDS > RPC_DEADLINE_SECONDS
+def test_slow_takes_its_default_delay_and_is_bounded():
+    """The default is a real delay and the ceiling is enforced at construction.
+
+    IT USED TO ASSERT SLOW_ OUTLIVES THE CALLER'S DEADLINE, against a module-level
+    RPC_DEADLINE_SECONDS = 5.0 that cited common/kafka/rpc/kafka_rpc_client.py. That file is deleted
+    and the comparison had stopped meaning anything: the fetch deadline is now
+    DEFAULT_FETCH_DEADLINE_S = 300 s (common/rpc/clients/ingest_fetch.py), set deliberately high on
+    tj-3mk3u5.10 because 5 s abandoned requests the vendor was still serving. 8.0 > 5.0 passed and
+    proved nothing against a number the system no longer uses.
+
+    NOR CAN THE PROPERTY BE REPAIRED BY RAISING THE NUMBER: MAX_SLOW_DELAY_SECONDS is 60, so no
+    permitted delay outlives a 300 s deadline. SLOW_ now exercises a vendor that is slow but SERVED,
+    which is what tests/system/test_ingest_e2e.py asserts -- it reversed this very expectation on
+    tj-xhcoyc item 2, and that reversal is the ruling rather than a concession.
+
+    SO WHAT IS LEFT TO PIN IS THAT SLOW_ IS SLOW AT ALL. A default of 0 would make the scenario
+    indistinguishable from DEFAULT and quietly delete it, which no other test here would notice --
+    the one that proves the delay is applied passes its own 0.2 explicitly. The comparison is
+    against 0 and the ceiling, NOT against DEFAULT_SLOW_DELAY_SECONDS: asserting the attribute
+    equals the constant that sets it cannot fail, and the first version of this repair did exactly
+    that. The specific value 8.0 no longer has a derivation, and inventing one here would be the
+    same mistake in the other direction.
+    """
+    assert 0 < DEFAULT_SLOW_DELAY_SECONDS <= MAX_SLOW_DELAY_SECONDS, (
+        'SLOW_ must be a real, bounded delay; at 0 it is the DEFAULT scenario under another name'
+    )
+    assert FakeRead().slow_delay_seconds == DEFAULT_SLOW_DELAY_SECONDS
     assert FakeRead(slow_delay_seconds=MAX_SLOW_DELAY_SECONDS).slow_delay_seconds == MAX_SLOW_DELAY_SECONDS
     for refused in (-0.1, MAX_SLOW_DELAY_SECONDS + 0.1, float('inf'), float('nan')):
         with pytest.raises(ValueError, match='slow_delay_seconds'):
@@ -839,10 +859,9 @@ def test_the_launcher_takes_the_slow_delay_from_its_environment_variable():
 async def test_the_launcher_apps_lifespan_serves_alpaca_through_its_fake_read(monkeypatch, tmp_path):
     """Fake mode's composition root: the launcher's app hands ITS FakeRead to what serves requests.
 
-    Only what cannot run here is stubbed -- the latency server, the debugger, and whatever of the
-    Kafka startup still exists (kafka_wiring.stub_kafka_startup, transitional, tj-iwiq23). The
-    lifespan itself, create_app and the registration are production's, and so is the gRPC host it
-    starts, bound to loopback here as the overlay binds it to the compose alias.
+    Only what cannot run here is stubbed -- the latency server and the debugger. The lifespan
+    itself, create_app and the registration are production's, and so is the gRPC host it starts,
+    bound to loopback here as the overlay binds it to the compose alias.
 
     RE-POINTED ON tj-3mk3u5.32, from the reader registry to the registration. It used to wrap
     ingest_control.install_readers and then prove dispatch really went through the installed fake by
@@ -864,16 +883,14 @@ async def test_the_launcher_apps_lifespan_serves_alpaca_through_its_fake_read(mo
         handed.append(dict(readers))
         return real_registered_services(readers)
 
-    with ExitStack() as stubs:
-        stub_kafka_startup(stubs)
-        monkeypatch.setattr(app_depends, 'initialize_latency_server', Mock())
-        monkeypatch.setattr(app_depends, 'init_debugger', Mock())
-        monkeypatch.setattr(grpc_host, 'registered_services', recording_registration)
-        launcher = importlib.import_module(LAUNCHER_MODULE)
-        assert isinstance(launcher.app, FastAPI)
+    monkeypatch.setattr(app_depends, 'initialize_latency_server', Mock())
+    monkeypatch.setattr(app_depends, 'init_debugger', Mock())
+    monkeypatch.setattr(grpc_host, 'registered_services', recording_registration)
+    launcher = importlib.import_module(LAUNCHER_MODULE)
+    assert isinstance(launcher.app, FastAPI)
 
-        async with LoopbackGrpc(), launcher.app.router.lifespan_context(launcher.app):
-            pass
+    async with LoopbackGrpc(), launcher.app.router.lifespan_context(launcher.app):
+        pass
 
     assert [set(readers) for readers in handed] == [{DataSource.ALPACA_API}]
     assert handed[0][DataSource.ALPACA_API] is launcher.reader
@@ -889,12 +906,18 @@ async def test_the_launcher_apps_lifespan_serves_alpaca_through_its_fake_read(mo
 # ties every name back to a distribution those groups declare, so this list cannot drift into the
 # testing group.
 #
-# 'aenum' and 'kafka' came out on tj-3mk3u5.32, ahead of the distributions themselves: tj-3mk3u5.14
-# drops aenum from pyproject.toml and tj-3mk3u5.15 drops kafka-python-ng, and a name left here whose
-# distribution is no longer declared reds the test below. Removing them early costs nothing, because
-# this is a WHITELIST of what tests/fakes may import and nothing under tests/fakes imports either --
-# checked, not assumed. The only effect today is that a fake which started importing one of them
-# would now be refused, which is the answer this list should already have been giving.
+# 'aenum' and 'kafka' came out on tj-3mk3u5.32, ahead of the distributions themselves, because a
+# name left here whose distribution is no longer declared reds the test below. Removing them early
+# cost nothing: this is a WHITELIST of what tests/fakes may import, and nothing under tests/fakes
+# imports either -- checked, not assumed.
+#
+# ONE HALF OF THAT REASONING WAS WRONG AND IS CORRECTED HERE. It said tj-3mk3u5.14 would drop aenum
+# from pyproject.toml. It did not: that bead's claim that common/kafka/topics.py was aenum's only
+# importer was REFUTED at the .14 gate -- common/enums/composed_enum.py imports Enum and
+# extend_enum from it directly, reached from common/enums/data_stock.py and two migrations -- so
+# aenum stays declared and dropping it would have broken production, not a test. 'aenum' is absent
+# from this set because tests/fakes does not import it, which was always the real reason.
+# kafka-python-ng still goes, on tj-3mk3u5.15.
 PRODUCTION_THIRD_PARTY = frozenset({'alpaca', 'dotenv', 'fastapi', 'httpx', 'pydantic', 'starlette', 'uvicorn'})
 PRODUCTION_GROUPS = ('base', 'data-ingest')
 

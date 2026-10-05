@@ -23,17 +23,16 @@
 # exists to prevent. STORE_API_NETWORK doubles as the sentinel: no user .env sets it, so a run that
 # fell back to the checkout's .env for interpolation stops at this file rather than starting a stack
 # on the user's names. The generated env sets, each distinct from the user's stack:
-#   DATABASE_NAME, BROKER_NAME  postgres's and kafka's container names, and by interpolation the
-#                               hosts compose writes into DATABASE_URI and the kafka listeners. The
-#                               apps read the same two names from their CONTAINER environment
-#                               instead (data/store/app/database/database.py,
-#                               common/kafka/kafka_config.py), which env_file supplies. The two agree
-#                               only because the root generated file is BOTH the --env-file and
-#                               ROOT_ENV_FILE, and neither the store nor the ingest generated file
-#                               sets either name.
+#   DATABASE_NAME               postgres's container name, and by interpolation the host compose
+#                               writes into DATABASE_URI. The app reads the same name from its
+#                               CONTAINER environment instead
+#                               (data/store/app/database/database.py), which env_file supplies.
+#                               The two agree only because the root generated file is BOTH the
+#                               --env-file and ROOT_ENV_FILE, and neither the store nor the ingest
+#                               generated file sets the name.
 #   STORE_API_NETWORK           store_api's fixed name, which the base file reads with the prod name
 #                               as its default.
-#   DATA_DIR                    postgres and kafka data, under the agent stack's own directory.
+#   DATA_DIR                    postgres data, under the agent stack's own directory.
 #   ROOT_ENV_FILE, STORE_ENV_FILE, INGEST_ENV_FILE
 #                               the absolute paths of the three generated service env files, which
 #                               the base file's env_file entries read in place of the checkout's own
@@ -56,8 +55,7 @@
 #                     fetch the registry token from inside agent_mcp, which has no egress (ADR
 #                     tj-4rr0la addendum 13).
 #   read-only binds   no service built from agent source gets a writable bind mount (data_store's
-#                     are restated :ro below); the only writable binds are postgres's and kafka's
-#                     DATA_DIR ones.
+#                     are restated :ro below); the only writable bind is postgres's DATA_DIR one.
 services:
   postgres:
     container_name: ${DATABASE_NAME:?the agent stack env sets DATABASE_NAME; there is no default}
@@ -73,15 +71,6 @@ services:
       # Same container target as the base file's entry, so compose replaces that entry rather than
       # adding a second mount: the agent stack never touches ./volume_data or the user's DATA_DIR.
       - ${DATA_DIR:?the agent stack env sets DATA_DIR; there is no default}/postgres:/var/lib/postgresql/data
-
-  kafka:
-    container_name: ${BROKER_NAME:?the agent stack env sets BROKER_NAME; there is no default}
-    labels:
-      trader_joe.agent_stack.root_env_file: ${ROOT_ENV_FILE:?the agent stack env sets ROOT_ENV_FILE; there is no default}
-      trader_joe.agent_stack.ingest_env_file: ${INGEST_ENV_FILE:?the agent stack env sets INGEST_ENV_FILE; there is no default}
-    volumes:
-      # Target spelled exactly as in the base file, trailing slash included, so it replaces that entry.
-      - ${DATA_DIR:?the agent stack env sets DATA_DIR; there is no default}/kafka:/var/lib/kafka/
 
   # Image tags are host-global, like container names. Without these the agent stack's build from an
   # arbitrary worktree would retag trader_joe_data_store:latest and trader_joe_data_ingest:latest --

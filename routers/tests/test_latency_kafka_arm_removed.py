@@ -14,9 +14,32 @@ ANY Kafka reference in routers/common or schemas/common holds the whole surface,
 as the surrounding deletions land.
 
 IT READS THE AST, NOT THE TEXT. Comments in routers/common/latency.py name Kafka deliberately, to
-explain what was removed and which bead removes the shim that is left; a text scan would call those
-drift and force them out. Imports, names and attributes are the references that would actually wire
-the arm back up, so those are what is checked.
+explain what was removed; a text scan would call those drift and force them out. Imports, names and
+attributes are the references that would actually wire the arm back up, so those are what is checked.
+
+WHAT THE SCAN IS STILL THE GUARD FOR, NARROWED HONESTLY ON tj-iwiq23, because common/kafka no longer
+exists and that changes what can reach this test at all. Measured, not reasoned about:
+
+* a Kafka IMPORT in a module some test imports      -> ModuleNotFoundError at collection. The
+                                                       interpreter gets there first; this scan never
+                                                       runs. That is a stronger guard, not a weaker
+                                                       one, and it needs no test to hold it.
+* a bare Kafka NAME in such a module                -> NameError at import. Same story.
+* a Kafka import in a module NO test here imports   -> THIS SCAN, and nothing else in this scope.
+                                                       routers/common/ping.py is exactly that module
+                                                       today: the routers suite never imports it, so
+                                                       a Kafka import there reaches collection
+                                                       intact. Verified by mutation.
+
+So the scan has gone from holding the whole surface to holding the part the interpreter cannot, and
+that part is real but small. Do not read a green run here as proof the trees are Kafka-free; read it
+together with the fact that the suite imports six of the seven modules in them.
+
+ONE KNOWN BLIND SPOT, recorded rather than fixed: _kafka_references walks Import, ImportFrom, Name
+and Attribute, so a Kafka-layer name RE-DECLARED locally -- `def get_rpc_params():` -- is matched by
+none of them and passes. Fixing it means walking FunctionDef and ClassDef too. It is left because
+the shape it would catch is someone reimplementing the Kafka layer under its old names, which the
+deletion of the package makes a deliberate act rather than an accident.
 """
 
 import ast
@@ -26,13 +49,7 @@ from typing import Final
 import pytest
 
 import routers.common.latency as latency
-from routers.tests.latency_harness import (
-    AppStub,
-    RecordingRestClient,
-    legacy_group_args,
-    rest_endpoint,
-    turn_harness_on,
-)
+from routers.tests.latency_harness import AppStub, RecordingRestClient, rest_endpoint, turn_harness_on
 from schemas.common.latency import LatencyRequest
 
 
@@ -40,11 +57,12 @@ pytestmark = pytest.mark.common
 
 REPO_ROOT: Final = Path(__file__).resolve().parents[2]
 
-# The two scopes tj-3mk3u5.35 cleared. data/ and common/ are NOT here, and the reason has changed
-# twice as the epic moved: the dataset path's Kafka wiring went on tj-3mk3u5.11 and .12, and
-# tj-3mk3u5.13 deleted common/kafka/rpc and the factory -- but NOT common/kafka itself, whose
-# messaging/, topics.py and kafka_config.py survive until tj-3mk3u5.14. So common/ is still a tree
-# with live Kafka in it and still does not belong in a scan that reds on any reference.
+# The two scopes tj-3mk3u5.35 cleared. data/ and common/ are NOT here, and the reason outlived the
+# deletions: these two trees were cleared of Kafka FIRST, while the rest of the repo still ran on
+# it, so a reference reappearing here was the regression worth tripping on. common/kafka is gone
+# outright since tj-3mk3u5.14, which makes a stray import there an ImportError rather than a
+# silent rewiring -- so the narrow scan is still the right shape and still the only thing that
+# would catch a reference re-entering these two trees from a merge or a revert.
 CLEARED_TREES: Final = ('routers/common', 'schemas/common')
 
 # Exact identifiers that belong to the Kafka RPC layer and carry no 'kafka' in their own spelling.
@@ -53,16 +71,6 @@ CLEARED_TREES: Final = ('routers/common', 'schemas/common')
 KAFKA_LAYER_NAMES: Final = frozenset(
     {'RpcEndpointTopic', 'LATENCY_TEST', 'BaseRpcAck', 'RpcEndpoint', 'get_rpc_params'}
 )
-
-# THE ONE SURVIVOR, allowed per file and per token, so that any OTHER Kafka reference in the same
-# file still reds. It is known residue with a named owner, not an oversight:
-#
-# routers/common/latency.py keeps `from common.kafka.topics import ConsumerGroup` only to type the
-# client_group/server_group parameters that initialize_latency_client and initialize_latency_server
-# still accept and no longer use. Dropping the parameters would change signatures that
-# data/store/app/app_depends.py and data/ingest/app/app_depends.py call, which is a cross-scope edit
-# tj-3mk3u5.35 deliberately did not make. Those call sites go on tj-3mk3u5.11 and .12.
-ALLOWED: Final = {'routers/common/latency.py': frozenset({'common.kafka.topics'})}
 
 
 def _is_kafka(name: str) -> bool:
@@ -120,54 +128,25 @@ def _scan() -> dict[str, list[tuple[str, int, str]]]:
 
 
 def test_no_kafka_reference_survives_in_routers_common_or_schemas_common():
-    """The arm is gone from both scopes tj-3mk3u5.35 cleared, and stays gone while .11/.12/.13 land."""
+    """The arm is gone from both scopes tj-3mk3u5.35 cleared, and stayed gone as .11 through .14 landed.
+
+    NO ALLOWANCES, since tj-iwiq23. Two entries excused known residue while the deletions were in
+    flight -- a ConsumerGroup import typing two dead parameters, and BaseRpcAck as LatencyResponse's
+    base. tj-3mk3u5.13 and .14 removed both, so the scan now reds on ANY Kafka reference in these
+    trees with nothing to argue about. That is the strongest form this test has ever had.
+    """
     references = _scan()
 
     offenders = [
         f'{relative}:{line}: {detail}'
         for relative, found in sorted(references.items())
-        for token, line, detail in found
-        if token not in ALLOWED.get(relative, frozenset())
+        for _token, line, detail in found
     ]
 
     assert references, f'the scan found no modules at all under {CLEARED_TREES}; it is proving nothing'
     assert offenders == [], (
         'the latency harness lost its Kafka arm on tj-3mk3u5.35 and these scopes were cleared with '
         'it. A reference is back:\n' + '\n'.join(offenders)
-    )
-
-
-def test_every_allowed_kafka_reference_is_still_excusing_something():
-    """The allowances above are load-bearing, so they are checked rather than trusted.
-
-    An allowlist entry that stops matching anything is the failure mode of every allowlist: it goes on
-    excusing a file long after the thing it excused has gone, and the next real reference to use that
-    name walks straight through. While common/kafka exists, that is a live hazard and this test is
-    what says each entry may now go.
-
-    ONCE common/kafka IS GONE (tj-3mk3u5.14) THE HAZARD IS GONE WITH IT, and so is this check. A
-    stale allowance can only mask a reference that could resolve, and after the deletion none can:
-    the scan above still holds the whole surface, and anything it would excuse would fail at import
-    long before it reached this allowlist. The gate is here rather than in a later edit because the
-    builder who deletes common/kafka must not have to touch a test to stay green (tj-3mk3u5.32); this
-    test and the gate both go on tj-iwiq23.
-    """
-    if not (REPO_ROOT / 'common' / 'kafka').is_dir():
-        pytest.skip('common/kafka is gone, so no allowance can mask a reference that resolves (tj-iwiq23)')
-
-    references = _scan()
-    stale = []
-    for relative, tokens in sorted(ALLOWED.items()):
-        if relative not in references:
-            stale.append(f'{relative} is allowed Kafka references but is not in the scanned trees')
-            continue
-        present = {token for token, _, _ in references[relative]}
-        for token in sorted(tokens - present):
-            stale.append(f'{relative} no longer references {token}')
-
-    assert stale == [], (
-        'an allowance in ALLOWED no longer excuses anything. Delete the entry; the reference it '
-        'covered is gone:\n' + '\n'.join(stale)
     )
 
 
@@ -183,28 +162,6 @@ def test_the_latency_harness_offers_exactly_rest_and_grpc():
         "LatencyRequest.LatencyType is the harness's whole menu of transports. The Kafka member went "
         'on tj-3mk3u5.35 after the tj-3mk3u5.26 measurement; adding an arm means adding a dispatch '
         'branch in routers/common/latency.py to match.'
-    )
-
-
-def test_the_topics_shim_is_importable_and_empty():
-    """get_latency_topics survives the arm it served, and must now create nothing.
-
-    It is kept only so the two lifespans keep calling it unchanged until tj-3mk3u5.11 and .12 remove
-    the call sites and .13 deletes it. Both halves matter and neither is obvious from the other: if it
-    stopped being importable both services would fail to start, and if it ever returned a topic again
-    the lifespans would go back to provisioning Kafka topics for an arm that no longer exists.
-
-    The guard below is the shim's own retirement, not a tolerated absence: tj-3mk3u5.13 deletes the
-    function, and on that commit there is no shim left to be empty. Deleting this test now instead
-    would leave the shim unpinned for the .11/.12 window, when it is still live and still called
-    (tj-3mk3u5.32). Delete it, and the guard, on tj-iwiq23.
-    """
-    if not hasattr(latency, 'get_latency_topics'):
-        pytest.skip('the topics shim was deleted with the Kafka layer; nothing is left to pin (tj-iwiq23)')
-
-    assert latency.get_latency_topics() == (), (
-        'the latency topics shim must stay empty: its callers hand the result straight to topic '
-        'creation, and the arm that consumed those topics went on tj-3mk3u5.35.'
     )
 
 
@@ -228,7 +185,7 @@ def harness_on(monkeypatch: pytest.MonkeyPatch):
 async def test_the_rest_arm_still_dispatches_to_the_rest_client(harness_on, monkeypatch: pytest.MonkeyPatch):
     """REST was the second branch and is now the first; it must still reach the REST client."""
     app = AppStub()
-    latency.initialize_latency_client(app, 'probe', 1, *legacy_group_args())
+    latency.initialize_latency_client(app, 'probe', 1)
 
     recorder = RecordingRestClient()
     monkeypatch.setattr(latency, '__REST_CLIENT', recorder)
@@ -252,7 +209,7 @@ async def test_the_grpc_arm_still_dispatches_to_the_probe_client(harness_on, mon
     that one probe happened per iteration and the REST client was never touched.
     """
     app = AppStub()
-    latency.initialize_latency_client(app, 'probe', 1, *legacy_group_args())
+    latency.initialize_latency_client(app, 'probe', 1)
 
     recorder = RecordingRestClient()
     monkeypatch.setattr(latency, '__REST_CLIENT', recorder)

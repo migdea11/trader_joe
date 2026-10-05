@@ -403,7 +403,7 @@ class AgentStack:
         """Snapshot WORKTREE, build the service and test-client images from it and start the agent stack, waiting for healthy.
 
         Every call force-recreates data_store and data_ingest, so the long-running services run the
-        code of the LAST stack_up -- tests/fakes included; postgres and kafka are kept.
+        code of the LAST stack_up -- tests/fakes included; postgres is kept.
         """
         name = stack.check_worktree_name(worktree)
         path = stack.resolve_worktree(name, await self._worktrees())

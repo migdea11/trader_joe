@@ -253,3 +253,65 @@ def test_the_devcontainer_environment_is_ignored_by_git() -> None:
         f'git does not ignore {probe} (git check-ignore exit {result.returncode}: {result.stderr.strip()}); '
         f'add {value}/ to .gitignore'
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# UV_FROZEN: THE THIRD PATH TO AN ACCIDENTAL RE-LOCK (tj-d3396o)
+#
+# tj-3zh7ss closed two paths -- the Makefile exports UV_FROZEN=1, CI sets it at workflow level --
+# and neither reaches a bare `uv run` or `uv sync` TYPED IN AN AGENT SHELL. That command
+# re-resolves and rewrites uv.lock, and the damage surfaces far from its cause: a stale lock is
+# what made `make security` fail with bandit missing, under four red test_security_make cases
+# whose output named neither uv nor the lock.
+#
+# WHAT THESE PIN, AND WHAT THEY DELIBERATELY DO NOT. They pin the CONFIGURATION: the value is in
+# the compose file, in the service the agent runs as, and `make lock` still strips it. They do NOT
+# pin that a running shell HAS it, because that is a property of a container built after this
+# commit, and no agent rebuilds its own container. At the time of writing this very shell has
+# UV_PROJECT_ENVIRONMENT set and UV_FROZEN unset, which is exactly the pre-rebuild state -- so a
+# runtime assertion would have to be skipped here and would then be skipped in CI too, where the
+# image is also not this devcontainer. Delivery is the user's rebuild and is checked by running
+# `env | grep UV_FROZEN` in a fresh agent shell, not by this file pretending to have done it.
+#
+# WHY compose.yml RATHER THAN devcontainer.json, verified rather than taken from the comment:
+# Makefile:417 sets AGENT_COMPOSE := docker compose -f .devcontainer/compose.yml and agent-build
+# runs `$(AGENT_COMPOSE) build`, so the make path never invokes the Dev Containers CLI and would
+# never read containerEnv/remoteEnv. The IDE path does read devcontainer.json -- but that file
+# delegates with dockerComposeFile: compose.yml and service: agent, so it arrives at this same
+# block. The compose environment is therefore the ONE placement that covers both paths; a
+# containerEnv entry would cover only the IDE one, which is the path agents do not use.
+
+
+def test_the_devcontainer_shell_is_configured_to_refuse_an_accidental_relock() -> None:
+    """tj-d3396o: UV_FROZEN=1 is set for the agent service, so a bare uv command cannot rewrite the lock.
+
+    Asserted against the compose file rather than os.environ on purpose -- see the note above on
+    configuration versus delivery.
+    """
+    value = _devcontainer_environment().get('UV_FROZEN')
+
+    assert value == '1', (
+        f'{DEVCONTAINER_COMPOSE.relative_to(REPO_ROOT)} service {DEVCONTAINER_SERVICE!r} sets '
+        f'UV_FROZEN={value!r}, expected "1". Without it a bare `uv run` or `uv sync` typed in an '
+        f'agent shell re-resolves and rewrites uv.lock, and the failure surfaces later as a sync '
+        f'that silently drops a dependency group.'
+    )
+
+
+def test_the_deliberate_relock_still_strips_uv_frozen() -> None:
+    """`make lock` is the one command that MUST re-resolve, so it unsets the variable for itself.
+
+    This is the half that makes the freeze safe to set: without it, freezing the shell would also
+    break the only supported way to update the lock, and the next person would turn the freeze off
+    rather than reach for `make lock`. Read from what make WOULD run, not from the Makefile's text.
+    """
+    recipe = subprocess.run(
+        ['make', '--no-print-directory', '-n', 'lock'], cwd=REPO_ROOT, capture_output=True, text=True, check=False
+    )
+
+    assert recipe.returncode == 0, f'make -n lock failed: {recipe.stderr.strip()}'
+    assert 'uv lock' in recipe.stdout, f'make lock no longer runs uv lock; it runs: {recipe.stdout.strip()}'
+    assert '-u UV_FROZEN' in recipe.stdout, (
+        f'make lock does not strip UV_FROZEN, so the deliberate re-lock is frozen too and would '
+        f'only validate the lock rather than update it. It runs: {recipe.stdout.strip()}'
+    )

@@ -52,11 +52,12 @@ followed by more), so at most one ever matches and the order they are tried in c
 * default (no prefix matches) -- every grid bar of the range.
 * EMPTY_ -- SERVED with zero bars, served_range as for any range (Q-EMPTY: never a failure).
 * GAPS_ -- every other bar missing: only grid points with an EVEN index k are served.
-* FAIL_ -- a BarsFailure, VENDOR_UNAVAILABLE, on every call, and nothing served. ingest_control
-  turns it into the bare {} at the Kafka RPC edge exactly as it does for the real reader, until
-  tj-3mk3u5.11 removes that edge.
-* SLOW_ -- sleeps slow_delay_seconds (default DEFAULT_SLOW_DELAY_SECONDS, longer than
-  data_store's 5 s RPC deadline; refused above MAX_SLOW_DELAY_SECONDS), then serves as default.
+* FAIL_ -- a BarsFailure, VENDOR_UNAVAILABLE, on every call, and nothing served. It reaches the
+  caller as the typed failure it is: the ingest_control edge that used to turn any BarsFailure
+  into a bare {} was deleted on tj-3mk3u5.11, so nothing swallows it any more.
+* SLOW_ -- sleeps slow_delay_seconds (default DEFAULT_SLOW_DELAY_SECONDS, refused above
+  MAX_SLOW_DELAY_SECONDS), then serves as default. Slow but SERVED: see the constant's own note
+  for why it no longer outlives its caller's deadline.
 * FAILONCE_ -- the first call for a given (symbol, granularity, start, end) fails as FAIL_ does;
   every later call serves as default. The memory is this INSTANCE's, in process: a service that
   runs more than one worker process fails once PER WORKER, so the fake-mode stack must run
@@ -96,7 +97,12 @@ GRID_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 # How many grid points an open-ended query (end None) serves, counted from the first at or after start.
 OPEN_ENDED_STEPS = 100
 
-# Longer than data_store's 5 s Kafka RPC deadline, so SLOW_ outlives the caller by default.
+# A vendor that is SLOW BUT STILL SERVED. This was chosen to be longer than data_store's 5 s Kafka
+# RPC deadline, so that SLOW_ outlived its caller; tj-3mk3u5.10 replaced that transport and set
+# DEFAULT_FETCH_DEADLINE_S to 300 s deliberately, because 5 s abandoned requests the vendor was
+# still serving. So 8 s outlives nothing now, and nothing permitted here would: the ceiling below
+# is 60 s. tests/system/test_ingest_e2e.py asserts the served outcome and reversed its own
+# expectation on tj-xhcoyc item 2 for this reason.
 DEFAULT_SLOW_DELAY_SECONDS = 8.0
 # SLOW_ is bounded: a delay above this is refused when the fake is built, never slept.
 MAX_SLOW_DELAY_SECONDS = 60.0

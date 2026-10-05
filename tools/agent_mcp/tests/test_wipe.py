@@ -58,7 +58,10 @@ def test_wipe_removes_the_data_directory_and_nothing_else(tmp_path: Path, monkey
     assert not os.path.lexists(rig.layout.data_dir)
     assert _bystanders_after(rig) == before
     tails = [step.argv[step_prefix_length()] for step in rig.docker.steps]
-    assert tails == ['down', 'run', 'run'], 'the stack must be down before its data is cleared'
+    # One `run` per DATA_MOUNTS entry, and `down` before all of them. Spelled from DATA_MOUNTS
+    # rather than counted by hand so removing a data mount (tj-3mk3u5.15 removed kafka's) cannot
+    # leave this asserting a count nothing produces.
+    assert tails == ['down', *['run'] * len(stack.DATA_MOUNTS)], 'the stack must be down before its data is cleared'
 
 
 def test_wipe_with_no_data_directory_is_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -131,7 +134,7 @@ def test_a_service_directory_left_non_empty_is_failed_naming_it_and_kept(
     rig = _wipe_rig(tmp_path, monkeypatch, clear=False)
     before = tree_digest(rig.layout.data_dir)
     result = rig.call('stack_wipe', {})
-    assert result['status'] == 'failed' and 'data/postgres' in result['message'] and 'data/kafka' in result['message']
+    assert result['status'] == 'failed' and 'data/postgres' in result['message']
     assert tree_digest(rig.layout.data_dir) == before
 
 
@@ -147,8 +150,46 @@ def test_a_service_symlink_gets_no_clear_step_and_is_reported_with_its_target_un
     result = rig.call('stack_wipe', {})
     assert result['status'] == 'failed' and 'data/postgres' in result['message'], result
     cleared = [step.argv[step_prefix_length() + 7] for step in rig.docker.steps if 'run' in step.argv]
-    assert cleared == ['kafka'], f'clear steps ran for {cleared}'
+    # Postgres is the only data mount since tj-3mk3u5.15 removed kafka's, so this is an empty list
+    # rather than "every other service was still cleared". The test below restores the control that
+    # went with the second mount; this one keeps the property as the REAL inventory produces it.
+    assert cleared == [], f'clear steps ran for {cleared}'
     assert tree_digest(target) == before and (rig.layout.data_dir / 'postgres').is_symlink()
+
+
+def test_a_service_symlink_is_skipped_while_another_service_is_still_cleared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The positive control the test above lost on tj-3mk3u5.15: the skip is TARGETED.
+
+    With postgres the only data mount, "no clear step ran" and "the skip is a blanket failure that
+    cleared nothing" produce the identical empty list, so the test above can no longer tell them
+    apart. That control went with kafka's mount, and no second real mount is coming back.
+
+    SO THE SECOND MOUNT HERE IS SYNTHETIC, and that is legitimate rather than a dodge, because the
+    property under test is wipe's own LOGIC -- does it skip exactly the symlinked entry? -- and not
+    which services the overlay happens to declare. The real inventory is pinned separately and by
+    equality, in test_commands.py: DATA_MOUNTS must match the overlay's mounts, and must be exactly
+    {'postgres'}. If a second real mount ever returns, that test reds and this one keeps working.
+
+    populate_data and clearing_hook both read stack.DATA_MOUNTS when _wipe_rig calls them, so
+    patching the constant first gives a consistent two-mount world: both directories are created,
+    and the hook can map either back from its container target.
+    """
+    monkeypatch.setattr(stack, 'DATA_MOUNTS', (*stack.DATA_MOUNTS, ('ledger', '/var/lib/ledger')))
+    rig = _wipe_rig(tmp_path, monkeypatch)
+    target = rig.layout.root / 'not_the_stack'
+    (rig.layout.data_dir / 'postgres').rename(target)
+    (rig.layout.data_dir / 'postgres').symlink_to(target, target_is_directory=True)
+
+    result = rig.call('stack_wipe', {})
+
+    assert result['status'] == 'failed' and 'data/postgres' in result['message'], result
+    cleared = [step.argv[step_prefix_length() + 7] for step in rig.docker.steps if 'run' in step.argv]
+    assert cleared == ['ledger'], (
+        f'clear steps ran for {cleared}; the symlinked postgres must be skipped and the OTHER '
+        'service still cleared, which is what distinguishes a targeted skip from clearing nothing'
+    )
 
 
 def test_a_stray_entry_in_data_is_failed_naming_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

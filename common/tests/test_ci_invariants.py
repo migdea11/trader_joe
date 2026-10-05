@@ -53,9 +53,11 @@ MAKEFILE = REPO_ROOT / 'Makefile'
 PYTEST_INI = REPO_ROOT / 'pytest.ini'
 
 # tj-8mt207. The harness is a load generator, not a feature: when it is on, data_store and
-# data_ingest each create the latency Kafka topics and an RPC consumer at startup, called or
-# not. It must be on in dev -- tj-3mk3u5.8 needs the REST vs Kafka vs gRPC comparison before
-# the Kafka arm can be deleted -- and off everywhere else.
+# data_ingest each stand up a latency arm at startup, called or not -- a gRPC servicer and a
+# client channel today, Kafka topics and an RPC consumer before tj-3mk3u5.13. It must be on in
+# dev, where it serves a live REST-against-gRPC comparison, and off everywhere else. It used to
+# say the comparison was needed "before the Kafka arm can be deleted"; that arm went on
+# tj-3mk3u5.35 once tj-3mk3u5.26 had banked the numbers, so nothing is gated on it now.
 LATENCY_FLAG = 'LATENCY_TEST_ENABLED'
 
 # Both halves, always. routers/common/latency.py guards the client (initialize_latency_client,
@@ -576,9 +578,9 @@ def test_every_compose_service_declares_a_healthcheck():
 def test_every_compose_healthcheck_declares_its_timings():
     """A healthcheck without a start_period fails `--wait` spuriously on a cold start.
 
-    Kafka in KRaft mode takes tens of seconds to format and start; the apps block in
-    lifespan on database.initialize() and wait_for_kafka(). A start_period shorter than
-    real startup is how `--wait` earns a reputation for flakiness and gets deleted.
+    The apps block in lifespan on database.initialize() before serving. A start_period
+    shorter than real startup is how `--wait` earns a reputation for flakiness and gets
+    deleted.
     """
     services = _load_yaml(COMPOSE_FILE)['services']
     required = {'test', 'interval', 'timeout', 'retries', 'start_period'}
@@ -658,10 +660,12 @@ def test_latency_harness_is_off_in_the_env_default(monkeypatch: pytest.MonkeyPat
     """tj-8mt207: .env.default is copied into every environment, so the harness must be off in it.
 
     This is the file CI copies to .env (trader_joe_testing.yml, "Stage Pipeline Configs") and the
-    file a prod deployment is seeded from. Shipping it on is how a load generator ended up running
-    in production: nothing fails, no probe goes red, both services just permanently hold a Kafka
-    RPC consumer and a set of topics nobody asked for. A regression here is silent, which is the
-    whole reason it is worth a test rather than a comment.
+    file a prod deployment is seeded from. Shipping it on is how a load generator ends up running
+    in production: nothing fails and no probe goes red, both services just permanently stand up a
+    latency arm nobody asked for. The cost used to be a Kafka RPC consumer and a set of topics,
+    which tj-3mk3u5.13 and .14 deleted; it is now a gRPC servicer and a client channel on each
+    side. A regression here is silent either way, which is the whole reason it is worth a test
+    rather than a comment.
     """
     values = _env_file_values(ENV_DEFAULT_FILE)
     assert LATENCY_FLAG in values, (
@@ -682,13 +686,17 @@ def test_latency_harness_is_on_for_both_services_in_the_dev_override(service: st
 
     Parametrized per service on purpose: the failure this exists to catch is someone removing or
     missing ONE of the two entries. data_store is the client -- it serves GET /latency -- and
-    data_ingest is the server that answers it over REST and Kafka RPC. Half a pair is worse than
+    data_ingest is the server that answers it over REST and gRPC. Half a pair is worse than
     neither half, because it looks configured: the stack comes up healthy and the endpoint hangs
     until LATENCY_TEST_TIMEOUT with nothing in the logs to say why.
 
-    The harness has to survive in dev because tj-3mk3u5.8 needs the REST vs Kafka vs gRPC
-    measurement before any deletion task in that epic can run, and that measurement is only
-    possible while all three transports exist.
+    WHY THE HARNESS SURVIVES IN DEV, restated because its original reason has expired. It used to
+    say tj-3mk3u5.8 needed the REST vs Kafka vs gRPC measurement "before any deletion task in that
+    epic can run, and that measurement is only possible while all three transports exist" -- a
+    BLOCKING PRECONDITION on deletions that have all since happened. The measurement was taken on
+    tj-3mk3u5.26, its p50/p99 banked on tj-q3zugf and the epic, and the Kafka arm removed on
+    tj-3mk3u5.35. What survives is a live REST-against-gRPC comparison, and the pairing above is
+    what keeps it working; nothing here gates anything any more.
     """
     environment = _compose_service_environment(OVERRIDE_FILE, service)
     assert LATENCY_FLAG in environment, (
@@ -1233,11 +1241,27 @@ def test_permanent_rule_families_are_suppressed_only_where_ruled():
 # rather than restated, so the two cannot drift apart.
 MIGRATIONS_SCRIPT = REPO_ROOT / 'data' / 'store' / 'run_migrations.sh'
 
-# An allow list, so that it fails closed: a subcommand nobody has classified is refused.
-# `current` reads alembic_version; `history`, `heads`, `branches` and `show` read the revision
-# files. stamp, upgrade, downgrade, merge, revision, edit and ensure_version all write to the
-# database or to the revision tree, and none of them is here.
-READ_ONLY_ALEMBIC_COMMANDS = frozenset({'current', 'history', 'heads', 'branches', 'show'})
+# An allow list of WHOLE INVOCATIONS, so that it fails closed AND cannot be fooled by an
+# argument (tj-k7xu0n). It used to key on the subcommand name alone, and that was unsound:
+# alembic.command.history has two branches, and the one `--indicate-current` or `-r current:head`
+# takes runs EnvironmentContext(...) -> script.run_env() with NO dont_mutate=True -- the same
+# shape that makes `check` write alembic_version on a never-migrated database. So `history` was
+# read-only on some argument lists and not others, while the classifier held the arguments and
+# threw them away.
+#
+# WHY WHOLE INVOCATIONS RATHER THAN A PREDICATE PER COMMAND. `check`'s conditionality is on THE
+# WORLD -- is this database already migrated -- which no command line reveals, so it cannot live
+# in a list at all and has its own target instead. `history`'s is on THE INVOCATION, which the
+# parser already has. Keying on it kills the --indicate-current hole by construction and keeps
+# this a plain readable set. A denylist of dangerous flags was rejected for failing OPEN: the
+# next alembic flag of the same shape would slip through it.
+#
+# MEASURED, not assumed, before narrowing: the only alembic invocations in the Makefile are the
+# bare script call (which is `upgrade head` by its own default), `current`, `history` and
+# `check`. `heads`, `branches` and `show` appeared in no recipe, so their entries were
+# speculative permissions in a fail-closed list and are gone. An invocation that needs adding is
+# a one-line change here, which is where that decision should be visible.
+READ_ONLY_ALEMBIC_INVOCATIONS = frozenset({('current',), ('history',)})
 
 # alembic's global options that take a value. Skipping their values finds the subcommand in
 # `alembic -c alembic.ini stamp head`, which would otherwise read `alembic.ini` as the command.
@@ -1293,33 +1317,67 @@ def _commands(recipe_line: str) -> list[list[str]]:
     return [command for command in commands if command]
 
 
-def _alembic_subcommand(command: list[str]) -> str | None:
-    """Return the alembic subcommand a simple command runs, or None if it does not run alembic.
+def _alembic_arguments(command: list[str]) -> list[str] | None:
+    """The arguments a simple command passes to alembic, or None if it does not run alembic.
 
     Two routes reach alembic: run_migrations.sh, whose arguments are alembic's and whose empty
-    argument list means the script's default, and alembic itself. A command that runs the
-    script or alembic with no subcommand to find returns the empty string, not None, so the
-    caller refuses it rather than mistaking it for something unrelated.
+    argument list means the script's default, and alembic itself.
+
+    Split out of _alembic_subcommand so the two classifiers below read the SAME argument list
+    (tj-k7xu0n). One wants the subcommand's name and the other the whole invocation; sharing the
+    route-finding means they cannot disagree about which commands reach alembic at all.
     """
     for index, word in enumerate(command):
         name = PurePosixPath(word).name
         if name == MIGRATIONS_SCRIPT.name:
-            arguments = command[index + 1 :] or _script_default_arguments()
-        elif name == 'alembic':
-            arguments = command[index + 1 :]
-        else:
-            continue
-        position = 0
-        while position < len(arguments):
-            argument = arguments[position]
-            if argument in _ALEMBIC_VALUE_OPTIONS:
-                position += 2
-            elif argument.startswith('-'):
-                position += 1
-            else:
-                return argument
-        return ''
+            return command[index + 1 :] or _script_default_arguments()
+        if name == 'alembic':
+            return command[index + 1 :]
     return None
+
+
+def _alembic_invocation(command: list[str]) -> tuple[str, ...] | None:
+    """The alembic invocation as the allow list keys on it: the subcommand and ITS arguments.
+
+    alembic's own global options are dropped, so `alembic -c alembic.ini current` and `alembic
+    current` are one invocation -- the config file does not change what the command does.
+    Everything from the subcommand onward is KEPT, which is the whole point: `history` and
+    `history --indicate-current` are different invocations because they take different branches
+    inside alembic, and only one of them is read-only.
+
+    Returns:
+        tuple: The normalised invocation, or the EMPTY tuple when alembic is reached with no
+        subcommand at all -- which is not in the allow list, so the caller refuses it. None only
+        when the command does not run alembic, which the caller distinguishes.
+    """
+    arguments = _alembic_arguments(command)
+    if arguments is None:
+        return None
+    position = 0
+    while position < len(arguments):
+        argument = arguments[position]
+        if argument in _ALEMBIC_VALUE_OPTIONS:
+            position += 2
+        elif argument.startswith('-'):
+            position += 1
+        else:
+            return tuple(arguments[position:])
+    return ()
+
+
+def _alembic_subcommand(command: list[str]) -> str | None:
+    """Return the alembic subcommand a simple command runs, or None if it does not run alembic.
+
+    The NAME only. The read-only allow list no longer uses this -- it keys on the whole
+    invocation (tj-k7xu0n) -- but the CI workflow check below genuinely wants the name, because
+    it asks which alembic verbs a step reaches and treats `upgrade` and the wrapper's `$1`
+    differently. A command that reaches alembic with no subcommand returns the empty string, not
+    None, so that caller refuses it rather than mistaking it for something unrelated.
+    """
+    invocation = _alembic_invocation(command)
+    if invocation is None:
+        return None
+    return invocation[0] if invocation else ''
 
 
 @pytest.mark.build_infra
@@ -1327,25 +1385,152 @@ def test_migrate_status_runs_only_read_only_alembic_commands():
     """tj-08dlh8: the approval of `make migrate-status` was conditional on it being read-only.
 
     Every simple command in the recipe must run alembic, directly or through
-    run_migrations.sh, with a subcommand in READ_ONLY_ALEMBIC_COMMANDS. A command that does
-    not run alembic at all is refused too: `$(SOMETHING)` or a second script could reach a
+    run_migrations.sh, with a WHOLE INVOCATION in READ_ONLY_ALEMBIC_INVOCATIONS. A command that
+    does not run alembic at all is refused too: `$(SOMETHING)` or a second script could reach a
     mutating command this test cannot see, and the target's whole job is to call alembic. If a
     new line is legitimate, the change to this test is where that gets decided.
+
+    IT KEYS ON THE INVOCATION, NOT THE SUBCOMMAND (tj-k7xu0n). `history` is read-only bare and
+    not read-only under `--indicate-current`, so a name-keyed allow list permitted a command
+    that writes. See the allow list for why a per-command predicate and a flag denylist were
+    both rejected.
     """
     offenders = []
     for line in _make_recipe('migrate-status'):
         for command in _commands(line):
-            subcommand = _alembic_subcommand(command)
-            if subcommand is None:
+            invocation = _alembic_invocation(command)
+            if invocation is None:
                 offenders.append(f'`{" ".join(command)}` does not run alembic')
-            elif subcommand not in READ_ONLY_ALEMBIC_COMMANDS:
-                offenders.append(f'`{" ".join(command)}` runs `alembic {subcommand or "<none>"}`')
+            elif invocation not in READ_ONLY_ALEMBIC_INVOCATIONS:
+                offenders.append(f'`{" ".join(command)}` runs `alembic {" ".join(invocation) or "<none>"}`')
     assert not offenders, (
         f'the migrate-status recipe in {MAKEFILE.name} is no longer read-only: {offenders}. The '
-        f'user approved it only on that condition (tj-4yvsb2). Read-only alembic commands are '
-        f'{sorted(READ_ONLY_ALEMBIC_COMMANDS)}; a bare run_migrations.sh call is '
+        f'user approved it only on that condition (tj-4yvsb2). Read-only alembic invocations are '
+        f'{sorted(READ_ONLY_ALEMBIC_INVOCATIONS)} -- WHOLE invocations, so an argument that '
+        f'changes what the command does is a different entry; a bare run_migrations.sh call is '
         f'`alembic {" ".join(_script_default_arguments())}`. A mutating step belongs behind its '
         f'own named target, the way `migrate` is.'
+    )
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    ('spelling', 'allowed'),
+    [
+        ('./data/store/run_migrations.sh current', True),
+        ('./data/store/run_migrations.sh history', True),
+        ('alembic -c alembic.ini current', True),
+        ('./data/store/run_migrations.sh history --indicate-current', False),
+        ('./data/store/run_migrations.sh history -r current:head', False),
+        ('./data/store/run_migrations.sh stamp head', False),
+        ('./data/store/run_migrations.sh', False),
+        ('alembic', False),
+    ],
+    ids=[
+        'bare-current',
+        'bare-history',
+        'current-with-a-config-file',
+        'history-indicate-current',
+        'history-with-a-range',
+        'stamp-head',
+        'bare-script-is-upgrade-head',
+        'alembic-with-no-subcommand',
+    ],
+)
+def test_the_read_only_allow_list_judges_whole_invocations(spelling: str, allowed: bool):
+    """The classifier itself, on the spellings that matter -- including the one that broke it.
+
+    THE GUARD ABOVE READS THE REAL MAKEFILE, so it can only ever judge the invocations that
+    happen to be in it today. That makes it silent about the dangerous spelling: nothing in the
+    repository runs `history --indicate-current`, so a name-keyed allow list stayed green for as
+    long as it existed while permitting a command that writes (tj-k7xu0n). This case produces
+    that forbidden state directly instead of waiting for someone to add it to a recipe.
+
+    THE TRUE CASES ARE AS LOAD-BEARING AS THE FALSE ONES. A classifier that refused everything
+    would satisfy the refusals alone, and `migrate-status` would then be red for the wrong
+    reason -- so bare `current` and bare `history` are pinned as ACCEPTED here, and the config
+    file case pins that a global option does not make an invocation unrecognisable.
+
+    Args:
+        spelling: One recipe-line spelling, as it would appear in the Makefile.
+        allowed: Whether the read-only allow list should accept it.
+    """
+    (command,) = _commands(spelling)
+    invocation = _alembic_invocation(command)
+    assert invocation is not None, f'{spelling!r} was not recognised as running alembic at all'
+    assert (invocation in READ_ONLY_ALEMBIC_INVOCATIONS) is allowed, (
+        f'{spelling!r} normalises to {invocation} and the allow list '
+        f'{"refuses" if allowed else "permits"} it. Read-only invocations are '
+        f'{sorted(READ_ONLY_ALEMBIC_INVOCATIONS)}.'
+    )
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize('target', ['dev-down', 'prod-down'])
+def test_the_teardown_targets_remove_orphans(target: str):
+    """tj-citjd6: both targets claim a clean teardown, and only --remove-orphans makes that true.
+
+    AN ORPHAN IS A CONTAINER THIS PROJECT OWNS WHOSE SERVICE IS NO LONGER IN THE COMPOSE FILE.
+    A plain `down` leaves it running with a warning, so a target advertised as stopping the
+    stack silently does not. That is not hypothetical: a kafka container outlived its service's
+    deletion and failed tj-3mk3u5.16's A0 after surviving every teardown for 38 hours.
+
+    WHY IT IS PINNED RATHER THAN LEFT TO THE COMMENT ABOVE IT. The flag was ABSENT here while
+    the same project had already chosen it twice -- the agent-MCP up at Makefile:638 and
+    stack_down_steps -- and both of those ARE pinned, by test_agent_mcp_make.py and by
+    test_commands.py's exact compose tails. So two of four equivalent commands were guarded and
+    two were not, and the two that were not are the two that drifted. This closes that asymmetry
+    rather than restating a literal for its own sake: what it defends is the agreement between
+    four commands, which is the thing nobody notices breaking.
+
+    Deliberately NOT asserted here: that the flag is safe. It DELETES, on a production path, and
+    that argument lives in the Makefile comment where someone running the command will read it.
+
+    Args:
+        target: The teardown target whose recipe must carry the flag.
+    """
+    recipe = _make_recipe(target)
+    downs = [line for line in recipe if ' down' in f' {line}']
+    assert downs, f'{target} runs no `down` at all, so {MAKEFILE.name} no longer tears anything down'
+    missing = [line for line in downs if '--remove-orphans' not in line]
+    assert not missing, (
+        f'{target} runs `down` without --remove-orphans: {missing}. A container whose service has '
+        f'left the compose file then survives the teardown, which is what cost tj-3mk3u5.16 its A0 '
+        f'run. The agent-MCP up and stack_down_steps already carry the flag; all four agree or none '
+        f'of the claims about a clean teardown are true.'
+    )
+
+
+@pytest.mark.build_infra
+def test_migrate_check_actually_runs_alembic_check():
+    """The positive half: `check` lives on its own target, and that target really runs it.
+
+    THE PAIR IS THE POINT (tj-9fxc46). The test above pins that `check` is NOT in
+    migrate-status, which is the dangerous direction and the one the user's read-only approval
+    turns on. On its own it is satisfied by a `check` that exists nowhere at all -- delete
+    migrate-check entirely and that test still passes. So the drift-detection the project
+    adopted could vanish silently while every guard stayed green. This is the other half.
+
+    WHY `check` IS NOT IN THE READ-ONLY ALLOW LIST, since the two tests sit together and the
+    asymmetry looks like an oversight: `check` writes alembic_version on a never-migrated
+    database -- command.check() passes no dont_mutate=True and the guard in
+    runtime/migration.py is `not self.as_sql and not heads and not dont_mutate` -- so it is
+    read-only only where heads already exist. That conditionality is on the WORLD rather than
+    on the command line, which is why it gets a target labelled as writing rather than a seat
+    in a list that keys on invocations (ADR tj-x3ig38, 2026-10-03 addendum superseding item 8).
+
+    Asserted as "some command in the recipe runs exactly `alembic check`", not as the whole
+    recipe text: the target may legitimately gain a guard or an echo, and a parity assertion
+    over the literal would make this test a copy of the Makefile rather than a claim about it.
+    """
+    invocations = [
+        _alembic_invocation(command) for line in _make_recipe('migrate-check') for command in _commands(line)
+    ]
+    assert ('check',) in invocations, (
+        f'the migrate-check recipe in {MAKEFILE.name} does not run `alembic check`; it runs '
+        f'{[i for i in invocations if i is not None]}. That target is the only place the '
+        f'model-versus-catalogue drift check runs (tj-o82yyu), and migrate-status must not take '
+        f'it back -- it keeps a read-only promise the user approved it on.'
     )
 
 
@@ -3517,11 +3702,10 @@ def test_network_lockdown_checks_non_resolution_and_no_egress():
     """N4 item 5: the network model as the RUNNING stack enforces it, not as the file declares it.
 
     - From test_client, a positive lookup of data_store comes first -- a client with no working DNS
-      would otherwise make every negative pass -- then the kafka container name and data_ingest
-      must NOT resolve, told apart from a failed run by getent's own not-found status, 2.
+      would otherwise make every negative pass -- then data_ingest must NOT resolve, told apart
+      from a failed run by getent's own not-found status, 2.
     - From postgres and from data_store, a TCP connect to a public LITERAL address (no DNS
       involved) must fail, told apart from a failed probe by a distinct status, 3.
-    The name probed as kafka is the one kafka's container_name interpolates.
 
     tj-3mk3u5.25 extension (the T3a gate's N1): data_ingest's gRPC bind alias -- the host its
     environment names, read from the compose file -- is among the names test_client must not
@@ -3551,14 +3735,8 @@ def test_network_lockdown_checks_non_resolution_and_no_egress():
         if f'lookup "${{{match.group(1)}}}"' in ' '.join(lines)
         for word in shlex.split(match.group(2))
     }
-    kafka_name = (_load_yaml(COMPOSE_FILE)['services']['kafka'] or {}).get('container_name')
-    kafka_service = 'kafka'
-    assert kafka_name and kafka_name in negatives and 'data_ingest' in negatives, (
-        f'{LOCKDOWN_STEP} must show {kafka_name} (kafka) and data_ingest do not resolve; it loops over {sorted(negatives)}'
-    )
-    assert kafka_service in negatives, (
-        f'{LOCKDOWN_STEP} must also show the service name {kafka_service!r} does not resolve, not only the '
-        f'container name {kafka_name!r}; it loops over {sorted(negatives)}'
+    assert 'data_ingest' in negatives, (
+        f'{LOCKDOWN_STEP} must show data_ingest does not resolve; it loops over {sorted(negatives)}'
     )
     grpc_alias = _compose_service_environment(COMPOSE_FILE, 'data_ingest').get('APP_INTERNAL_GRPC_HOST')
     assert grpc_alias, f'{COMPOSE_FILE.name} no longer names data_ingest APP_INTERNAL_GRPC_HOST'
@@ -5160,7 +5338,7 @@ def test_compose_declares_data_mounts_under_data_dir():
 def test_every_data_dir_mount_is_parsed():
     """tj-c4mosr.5 (00:55 gap (2)): a DATA_DIR-sourced mount the parser cannot read fails, never skips.
 
-    The agent-stack overlay mounts ${DATA_DIR:?...}/postgres and /kafka; the build-context check below
+    The agent-stack overlay mounts ${DATA_DIR:?...}/postgres; the build-context check below
     judges only the mounts _compose_data_mounts yields, so an unparsed spelling was a silent pass.
     """
     unparsed = [
@@ -5171,9 +5349,7 @@ def test_every_data_dir_mount_is_parsed():
     ]
     assert not unparsed, f'DATA_DIR mounts the build-context check cannot read, so it would skip them: {unparsed}'
     labels = {label for label, _, _ in _compose_data_mounts()}
-    assert {'docker-compose.agent-stack.yaml:postgres', 'docker-compose.agent-stack.yaml:kafka'} <= labels, sorted(
-        labels
-    )
+    assert {'docker-compose.agent-stack.yaml:postgres'} <= labels, sorted(labels)
 
 
 @pytest.mark.build_infra

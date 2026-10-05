@@ -57,7 +57,6 @@ from data.ingest.app.brokers.interface import (
 )
 from data.ingest.app.brokers.rate_budget import RequestPriority
 from data.ingest.tests.grpc_bind import LoopbackGrpc
-from data.ingest.tests.kafka_wiring import stub_kafka_startup
 from schemas.data_ingest.get_dataset_request import StockDatasetRequest
 
 
@@ -520,9 +519,10 @@ class LifespanProbe:
     """The lifespan's collaborators replaced, and the readers it handed to the gRPC registration.
 
     WHAT IS REPLACED, AND WHY IT IS SO LITTLE: the latency server, at app_depends' own name for it,
-    and whatever of the Kafka startup still exists (kafka_wiring.stub_kafka_startup, transitional --
-    tj-3mk3u5.11 unwires it and tj-iwiq23 deletes the stub). Nothing inside the lifespan under test
-    is patched. Enter the lifespan inside LoopbackGrpc, which gives its real gRPC host a loopback
+    and nothing else. A tolerant Kafka stub sat beside it from tj-3mk3u5.32 until tj-iwiq23, for the
+    window in which the lifespan still waited on a broker; tj-3mk3u5.11 removed the wait and
+    tj-3mk3u5.14 the module, and removing the stub changed no result. Nothing inside the lifespan
+    under test is patched. Enter the lifespan inside LoopbackGrpc, which gives its real gRPC host a loopback
     address and stops it whatever happens.
 
     REGISTERED_SERVICES IS WRAPPED, NOT REPLACED: the real one still runs and its services are still
@@ -539,7 +539,6 @@ class LifespanProbe:
         self.__stack = ExitStack()
 
     def __enter__(self) -> 'LifespanProbe':
-        stub_kafka_startup(self.__stack)
         self.__stack.enter_context(patch.object(app_depends, 'initialize_latency_server'))
         self.__stack.enter_context(
             patch.object(grpc_host, 'registered_services', side_effect=self.__registered_services)

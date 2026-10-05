@@ -39,8 +39,10 @@ from sqlalchemy.engine import Engine
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import Feed, Granularity
+from common.errors.vocabulary import Reason
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from routers.data_store.app_endpoints import AssetDataInterface
+from tests.system.problem_json import assert_problem
 
 
 pytestmark = pytest.mark.data_store
@@ -319,6 +321,20 @@ def test_malformed_read_is_422_naming_the_cause(
 ) -> None:
     response = data_store.get(READ_PATH, params=params)
 
-    assert response.status_code == 422, data_store.describe(response)
-    errors = [(error['loc'], error['type']) for error in response.json()['detail']]
+    # THE PER-FIELD ISSUES MOVED, THE PIN DID NOT (tj-3mk3u5.37.9). Before TE-6 these were
+    # FastAPI's default body, a bare LIST under `detail`; they are now the `errors` member of a
+    # problem+json envelope, with loc/msg/type unchanged. So the (loc, type) assertion below is
+    # the SAME assertion reading a new address -- it still says which field was rejected and
+    # which validator rejected it, which is the whole content of "naming the cause".
+    #
+    # The envelope is asserted too, and that is new: reason INVALID_REQUEST is what a caller
+    # branches on, and a 422 that lost its reason would still have passed the old assertion.
+    body = assert_problem(
+        response,
+        status=422,
+        reason=Reason.INVALID_REQUEST.value,
+        title='Unprocessable Entity',
+        describe=data_store.describe,
+    )
+    errors = [(error['loc'], error['type']) for error in body['errors']]
     assert errors == [(loc, error_type)], data_store.describe(response)

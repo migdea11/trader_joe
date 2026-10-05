@@ -52,6 +52,7 @@ from data.store.app.database.models.stock_market_activity import StockMarketActi
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from routers.common.instance_secret import INSTANCE_SECRET_REJECTION_DETAIL
 from routers.data_store.app_endpoints import AssetDataInterface, AssetDatasetStoreInterface
+from tests.system.problem_json import PROBLEM_JSON
 
 
 pytestmark = pytest.mark.data_store
@@ -157,7 +158,21 @@ def test_write_without_the_right_secret_is_401_and_changes_nothing(
     leaked = data_store.response_leaks_secret(response)
     assert not leaked, f'{route} {auth}: the 401 response carries the instance secret (value withheld)'
     assert response.status_code == 401, data_store.describe(response)
-    assert response.json() == {'detail': INSTANCE_SECRET_REJECTION_DETAIL}, data_store.describe(response)
+    assert response.headers['content-type'] == PROBLEM_JSON, data_store.describe(response)
+    # WHOLE-BODY EQUALITY IS KEPT, and keeping it is the point (tj-3mk3u5.37.9). The old assertion
+    # compared the body to exactly {'detail': ...}, which is what proved the 401 carries NOTHING
+    # ELSE -- no secret, no echo of the request, no stray member. TE-6 (caf68f5) re-rendered it as
+    # problem+json, so the literal moved; if it had been relaxed to a membership check at the same
+    # time, this test would have kept its name and quietly stopped guarding the thing it exists
+    # for. The 401 goes through the HTTPException handler, which is deliberately NOT one of ours:
+    # no reason, no domain and no error_id, which is why those three are absent here and asserting
+    # the whole body is what pins their absence.
+    assert response.json() == {
+        'type': 'about:blank',
+        'title': 'Unauthorized',
+        'status': 401,
+        'detail': INSTANCE_SECRET_REJECTION_DETAIL,
+    }, data_store.describe(response)
 
     # Nothing written, nothing removed.
     assert _entry_exists(pg_engine, seeded_entry.id), f'{route} {auth}: the seeded entry is gone after a 401'

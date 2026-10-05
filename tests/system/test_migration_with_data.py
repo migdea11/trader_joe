@@ -774,3 +774,173 @@ def test_alembic_check_is_clean_at_head(scratch: ScratchDb) -> None:
     assert 'No new upgrade operations detected' in run.output, (
         f'alembic check exited 0 without reporting a clean comparison, so it may not have run:\n{run.output[-4000:]}'
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# MIG-V (tj-3mk3u5.39): what `alembic check` is for, pinned against a real Postgres.
+#
+# THE TEST ABOVE IS NOT ENOUGH ON ITS OWN, and that is the whole reason this section exists. A
+# check that exits zero proves nothing about whether it is LOOKING: a filter that excluded every
+# object, or a comparison that silently did nothing, would pass it exactly as a correct one does.
+# The three tests below produce the forbidden states and watch the check find them, so the green
+# above means "no drift" rather than "no eyes".
+#
+# WHICH TARGET RUNS THIS. `make migrate-check`, not `make migrate-status` (MIG-2 tj-o82yyu as
+# shipped, and the 2026-10-03 addendum on ADR tj-x3ig38 that superseded item 8). migrate-status
+# runs `current` and `history` only and keeps the read-only promise its approval was conditional
+# on. These tests drive `alembic check` directly on a scratch database rather than through make,
+# because make cannot run in this container; what they pin is the BEHAVIOUR that target exposes.
+
+
+BAR_NATURAL_KEY_CONSTRAINT = 'uq_stock_market_activity_natural_key'
+
+# A table whose name only RESEMBLES the one OUT_OF_MODEL_TABLES excludes. The exclusion is an
+# exact-name list on purpose, so this must show as drift (tj-3mk3u5.38; ADR tj-x3ig38 addendum
+# item 1, "never a prefix or pattern, so a stray table still shows").
+STRAY_TABLE = 'stock_market_activity_superseded_x'
+
+ARCHIVE_TABLE = 'stock_market_activity_superseded_8f41c2d7a3b9'
+
+
+def _head_revision() -> str:
+    return next(rev.revision for rev in GRAPH.values() if rev.next_revision is None)
+
+
+def _execute(db: ScratchDb, statement: str) -> None:
+    """Run one DDL statement on the scratch database, outside alembic."""
+    with db.engine.begin() as conn:
+        conn.execute(sa.text(statement))
+
+
+def test_alembic_check_reds_when_the_bar_natural_key_is_dropped(scratch: ScratchDb) -> None:
+    """tj-5h30md's exact state, reproduced and caught: the permanent form of that bug's demonstration.
+
+    THE BUG THIS AUTOMATES. The user's live database sat at head while
+    uq_stock_market_activity_natural_key was missing -- dropped by hand during a host verification
+    and never restored. Nothing showed it until every bar upsert returned 500, because a manual
+    DROP leaves alembic_version untouched and `alembic current` reports the revision, not the
+    shape. This is the one failure mode `check` was adopted for, so it is pinned by reproducing
+    it rather than by trusting that it would be noticed.
+
+    THE PRECONDITION IS LOAD-BEARING. Asserting the constraint exists before dropping it stops
+    this passing for the wrong reason: against a head that never created it, the DROP would error
+    or the check would red for an unrelated cause, and either way the test would look like it had
+    demonstrated something it had not.
+    """
+    scratch.must('upgrade', _head_revision())
+    clean = scratch.alembic('check')
+    assert clean.returncode == 0, f'the scratch database is not clean before the drop:\n{clean.output[-2000:]}'
+
+    _execute(scratch, f'ALTER TABLE {BAR_TABLE} DROP CONSTRAINT {BAR_NATURAL_KEY_CONSTRAINT}')
+
+    run = scratch.alembic('check')
+
+    assert run.returncode != 0, (
+        'alembic check passed against a database missing uq_stock_market_activity_natural_key, '
+        f'which is tj-5h30md exactly:\n{run.output[-4000:]}'
+    )
+    assert BAR_NATURAL_KEY_CONSTRAINT in run.output, (
+        f'check failed but did not name the missing constraint, so it would not tell an operator '
+        f'what to restore:\n{run.output[-4000:]}'
+    )
+
+
+def test_the_out_of_model_filter_is_an_exact_name_list_not_a_pattern(scratch: ScratchDb) -> None:
+    """The archive table is ignored; a table whose name merely RESEMBLES it is not.
+
+    BOTH HALVES IN ONE TEST, because either alone is misleading. That the archive table is ignored
+    is already implied by the clean check above -- every database migrated through 8f41c2d7a3b9
+    carries it, and without the exclusion that check could never pass. What is NOT implied, and is
+    the thing the design actually promises, is that the exclusion is an exact-name list: a filter
+    written as a prefix or a pattern would hide this stray table too, and the check would go on
+    reporting clean while the database grew tables nobody declared.
+
+    IT IS ALSO THE ANTI-VACUITY TEST FOR THE WHOLE SECTION. A check that had stopped comparing, or
+    a filter that excluded everything, passes test_alembic_check_is_clean_at_head unchanged. This
+    is the case that reds when the filter is too wide, which is what makes that green mean
+    something.
+
+    The name used is the one the design names as the hazard: the archive table's name with a
+    different suffix. A misspelling behaves identically and for the same reason -- neither matches
+    exactly, so neither is excluded.
+    """
+    scratch.must('upgrade', _head_revision())
+    live = set(scratch.columns(ARCHIVE_TABLE))
+    assert live, f'{ARCHIVE_TABLE} is absent at head, so this test is not exercising the exclusion at all'
+
+    clean = scratch.alembic('check')
+    assert clean.returncode == 0, (
+        f'the archive table trips the check, so the exclusion is not working:\n{clean.output[-4000:]}'
+    )
+
+    _execute(scratch, f'CREATE TABLE {STRAY_TABLE} (id integer PRIMARY KEY)')
+
+    run = scratch.alembic('check')
+
+    assert run.returncode != 0, (
+        f'a stray table named {STRAY_TABLE} did not trip alembic check, so OUT_OF_MODEL_TABLES is '
+        f'matching by prefix or pattern rather than by exact name (tj-3mk3u5.38):\n{run.output[-4000:]}'
+    )
+    assert STRAY_TABLE in run.output, f'check failed but did not name the stray table:\n{run.output[-4000:]}'
+
+
+def test_alembic_check_refuses_when_the_database_is_behind_head(scratch: ScratchDb) -> None:
+    """Behind head is its own answer, and a different one from drift.
+
+    An operator who has not finished migrating gets "Target database is not up to date." rather
+    than a drift report, which is the useful distinction: the models legitimately describe a
+    schema the database has not reached yet, so comparing them would produce a diff that means
+    "you have not migrated" dressed up as "your schema is wrong".
+
+    The parent of head is used rather than a named revision so this does not need editing on every
+    new migration.
+    """
+    head = _head_revision()
+    parent = GRAPH[head].down_revision
+    assert parent is not None, f'head {head} has no parent, so there is no behind-head state to make'
+    scratch.must('upgrade', parent)
+
+    run = scratch.alembic('check')
+
+    assert run.returncode != 0, f'alembic check passed against a database behind head:\n{run.output[-4000:]}'
+    assert 'Target database is not up to date' in run.output, (
+        f'check refused, but not with the behind-head message, so an operator cannot tell this '
+        f'apart from real drift:\n{run.output[-4000:]}'
+    )
+
+
+def test_alembic_check_writes_nothing_to_an_already_migrated_database(scratch: ScratchDb) -> None:
+    """Read-only here -- and the reason it is, is the reason it is not always.
+
+    THE CONDITION IS THE POINT (ADR tj-x3ig38, 2026-10-03 addendum superseding item 8). alembic's
+    guard reads `if not self.as_sql and not heads and not dont_mutate: self._ensure_version_table()`.
+    command.check() passes no dont_mutate, unlike command.current(), so the only term saving it is
+    NOT HEADS: against a database that already has a revision, heads exist and the version table is
+    left alone. Against a never-migrated one it issues CREATE TABLE alembic_version, which is why
+    `make migrate-check` is labelled as writing it and why the loose claim "check writes" would be
+    just as wrong as the old claim that it never does.
+
+    SO THIS TEST PINS THE BRANCH THE AUTOMATED CALLER ACTUALLY TAKES. Every scratch database here,
+    and the stack's own, is migrated before anything runs a check, so the write branch is
+    unreachable in this suite. That is not a gap being papered over -- it is the condition that
+    makes the honest label on migrate-check true in practice, and it is asserted rather than
+    assumed by taking the version table's contents and both row counts either side of a run.
+
+    NOT PINNED HERE, deliberately: the mutating branch on a fresh database. Reaching it means a
+    database with no alembic_version, which this fixture cannot produce without abandoning the
+    scratch-is-migrated-first pattern every other test in this file depends on. It is measured in
+    the alembic source and recorded on the ADR; a test that created an empty database purely to
+    watch alembic write to it would pin alembic's behaviour, not ours.
+    """
+    scratch.must('upgrade', _head_revision())
+    with scratch.engine.connect() as conn:
+        before_version = sorted(conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalars())
+    before_counts = scratch.row_counts()
+
+    run = scratch.alembic('check')
+    assert run.returncode == 0, f'check did not pass, so this says nothing about what it wrote:\n{run.output[-2000:]}'
+
+    with scratch.engine.connect() as conn:
+        after_version = sorted(conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalars())
+    assert after_version == before_version, f'check changed alembic_version from {before_version} to {after_version}'
+    assert scratch.row_counts() == before_counts, 'check changed a row count'

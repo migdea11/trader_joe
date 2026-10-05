@@ -317,12 +317,12 @@ jobs:
         # The agent-stack set, spelled exactly as the Makefile's AGENT_STACK_COMPOSE: project
         # trader_joe_agent_stack, then base, test-client, the agent-stack overlay and the
         # fake-mode overlay LAST (ADR tj-4rr0la addendum 3 (3); decision tj-j4wknb R4). The
-        # agent-stack overlay reads seven variables through ":?" guards with no default --
-        # DATABASE_NAME, BROKER_NAME, STORE_API_NETWORK, DATA_DIR and the three *_ENV_FILE
+        # agent-stack overlay reads six variables through ":?" guards with no default --
+        # DATABASE_NAME, STORE_API_NETWORK, DATA_DIR and the three *_ENV_FILE
         # paths -- which the MCP server's generated env file supplies at run time, so this line
-        # sets throwaway placeholders for all seven, safe for the same reason as PGADMIN_*:
+        # sets throwaway placeholders for all six, safe for the same reason as PGADMIN_*:
         # `config` creates no container, network, volume or directory. The names differ from the
-        # user's defaults (db, kafka, trader_joe_store_api) only so a placeholder can never be
+        # user's defaults (db, trader_joe_store_api) only so a placeholder can never be
         # taken for a real resource. With --quiet this line proves that the set interpolates and
         # merges, and nothing more; which names the merged agent-stack model carries is pinned
         # in-process by the build_infra tests (tj-c4mosr.5). The three *_ENV_FILE placeholders
@@ -350,7 +350,7 @@ jobs:
         PGADMIN_EMAIL=unused PGADMIN_PASS=unused docker compose -f docker-compose.yaml \
           -f docker-compose.override.yaml -f docker-compose.tools.yaml config --quiet
         docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml config --quiet
-        DATABASE_NAME=agent_stack_render_db BROKER_NAME=agent_stack_render_kafka \
+        DATABASE_NAME=agent_stack_render_db \
           STORE_API_NETWORK=agent_stack_render_store_api DATA_DIR=/tmp/agent_stack_render_data \
           ROOT_ENV_FILE="${PWD}/.env" STORE_ENV_FILE="${PWD}/data/store/.env" \
           INGEST_ENV_FILE="${PWD}/data/ingest/.env" \
@@ -567,7 +567,7 @@ jobs:
           # containers are CREATED, so a service that boots and dies two seconds later still left
           # this step green. With every service declaring a healthcheck, --wait blocks until
           # each one reports healthy and exits non-zero if any goes unhealthy or dies; its
-          # --wait-timeout 300 sits well above kafka's 90s start_period plus the apps' own, so a
+          # --wait-timeout 300 sits well above the apps' own start periods, so a
           # hung stack fails the job rather than burn the runner's six hours.
           make system-launch
           docker compose -f docker-compose.yaml ps  # health column, not just liveness
@@ -600,7 +600,7 @@ jobs:
           # the next step would be red forever without this.
           #
           # --no-deps because the stack is already up and healthy; without it compose
-          # re-resolves postgres and kafka for a container that only needs the former.
+          # re-resolves postgres for a container that needs nothing started on its behalf.
           # `run` publishes no ports, so this cannot collide with the running data_store.
           # The command is an explicit argv: the image sets CMD, not ENTRYPOINT, so passing
           # one replaces entrypoint.sh rather than appending to it.
@@ -715,8 +715,8 @@ jobs:
           # healthchecks already probe, so re-asserting it adds nothing; this route runs
           # data_store's own path into Postgres end to end -- Depends(async_db) hands the
           # handler a session and search_entries() executes a real SELECT with an outer join
-          # and a GROUP BY against store_dataset_entry. It needs no broker and no Kafka RPC,
-          # which is what makes it the cheapest read that covers app -> database -> app.
+          # and a GROUP BY against store_dataset_entry. It reaches no peer service, which is
+          # what makes it the cheapest read that covers app -> database -> app.
           #
           # [] is the correct answer, not an empty-ish one: the query ran, matched no rows
           # for this deliberately synthetic symbol, and came back. A missing schema, a
@@ -869,17 +869,13 @@ jobs:
           # The prod network model (tj-q9ae5u addendum 1) as the running stack enforces it, not
           # as the compose file declares it: a network that lost `internal: true`, or a service
           # that gained one, still starts green and still passes every other step here.
-          #   test_client  sees data_store and Postgres only: neither the kafka container name,
-          #                its service name, data_ingest, nor data_ingest's gRPC bind alias
-          #                data-ingest-grpc resolves from it, and it cannot connect to data_ingest's
-          #                gRPC port even by address (tj-3mk3u5.25).
+          #   test_client  sees data_store and Postgres only: neither data_ingest nor data_ingest's
+          #                gRPC bind alias data-ingest-grpc resolves from it, and it cannot connect
+          #                to data_ingest's gRPC port even by address (tj-3mk3u5.25).
           #   postgres, data_store  have no egress: a TCP connect to a public address fails. A
           #                literal IP, so the check is about routing and no DNS is involved.
           # Every negative check needs a distinct exit status for "refused as expected", so that
           # a container that failed to start, or a missing binary, can never pass as blocked.
-          # BROKER_NAME is read with the Instance Secret Lifecycle step's env_value: last one wins.
-          env_value() { grep -E "^$1=" .env | tail -n 1 | cut -d= -f2-; }
-          BROKER_NAME="$(env_value BROKER_NAME)"
           PUBLIC_ADDRESS="1.1.1.1"
           PUBLIC_PORT="443"
           failed=0
@@ -897,11 +893,9 @@ jobs:
             echo "::error::test_client could not resolve data_store (exit $?), so its lookups prove nothing"
             exit 1
           fi
-          # kafka's container_name is ${BROKER_NAME} today, so this loop's first two words
-          # coincide -- a duplicate lookup when they do is harmless, and the service name kafka
-          # stays probed even if BROKER_NAME ever diverges from it. data-ingest-grpc is the alias
-          # data_ingest's gRPC server binds, scoped to ingest_store, which test_client never joins.
-          for name in "${BROKER_NAME}" kafka data_ingest data-ingest-grpc; do
+          # data-ingest-grpc is the alias data_ingest's gRPC server binds, scoped to ingest_store,
+          # which test_client never joins.
+          for name in data_ingest data-ingest-grpc; do
             if found="$(lookup "${name}")"; then
               echo "::error::test_client resolved ${name} to ${found}; it must see data_store and Postgres only"
               failed=1
@@ -997,7 +991,7 @@ jobs:
           if [ "${failed}" -ne 0 ]; then
             exit 1
           fi
-          echo "Network lockdown holds: test_client sees neither kafka nor data_ingest and cannot reach data_ingest's gRPC port; postgres and data_store have no egress."
+          echo "Network lockdown holds: test_client does not see data_ingest and cannot reach data_ingest's gRPC port; postgres and data_store have no egress."
 
       - name: Check Container Env
         run: |
@@ -1158,7 +1152,7 @@ jobs:
           fi
 
           # (e) An unset secret must never mean allow-everything. Blank it -- the template's own
-          # shipped state -- and recreate data_store alone; --no-deps leaves Postgres, kafka and
+          # shipped state -- and recreate data_store alone; --no-deps leaves Postgres and
           # data_ingest as they are, and --wait holds until the new container is healthy. The
           # fake-mode overlay stays loaded (the set make system-launch started), so this `up` sees
           # the same model the stack runs and data_ingest can never come back on the production

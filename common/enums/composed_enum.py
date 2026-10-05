@@ -11,10 +11,10 @@ exactly as long as there is one subset: two lists that must agree can agree perf
 are wrong, and nothing detects the day one of them is edited alone. Composing removes the second
 list rather than testing it.
 
-This generalises the pattern already in common/kafka/topics.py, where StaticTopic is extended from
-RpcEndpointTopic by a module-level extend_enum loop and RpcEndpointTopic.request/.response convert
-upward by constructing StaticTopic(...). That module is NOT retrofitted onto this base -- see
-compose() for why -- but it is where the pattern was proven.
+This generalises a pattern first proven in the Kafka topic registry, where a static topic enum was
+extended from an RPC-endpoint enum by a module-level extend_enum loop and converted upward by
+constructing the superset. That registry was deleted with the Kafka layer (tj-3mk3u5.14), so this
+base has no un-migrated second user: nothing is left to retrofit.
 
 WHAT A COMPOSED SUPERSET IS SAFE FOR, verified rather than assumed:
   * aenum.Enum subclasses stdlib enum.Enum, so Pydantic, FastAPI and OpenAPI treat a composed

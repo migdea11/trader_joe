@@ -3,11 +3,12 @@
 #
 # This file is also the one place the latency harness is switched on. .env.default ships
 # LATENCY_TEST_ENABLED=false because every environment is copied from it and the harness costs
-# startup work in both services even when nobody calls GET /latency -- each creates the latency
-# Kafka topics and its RPC consumer. Only the dev stack loads this override (PROD_COMPOSE never
-# does), so enabling it here keeps `make dev-launch` able to run the REST vs Kafka RPC comparison
-# that tj-3mk3u5.8 needs. Both services must carry it: data_store is the client and data_ingest
-# the server, and a client with no server just times out.
+# startup work in both services even when nobody calls GET /latency -- data_store builds a gRPC
+# channel and a REST client, and data_ingest registers the probe servicer and mounts the REST
+# route. Only the dev stack loads this override (PROD_COMPOSE never does), so enabling it here
+# keeps `make dev-launch` able to run the REST vs gRPC comparison that tj-3mk3u5.8 needs --
+# LatencyType is exactly those two arms. Both services must carry it: data_store is the client
+# and data_ingest the server, and a client with no server just times out.
 #
 # DEV REACH (decision record tj-q9ae5u, addendum 1, item 3'). This file also puts every stack
 # service on devnet, one external network that the devcontainer and pgAdmin join too, so a dev
@@ -29,11 +30,6 @@ services:
       # "5432:5432" would put this database on every interface the machine has. Solely for
       # psql or a GUI client on this machine.
       - "127.0.0.1:${DATABASE_PORT}:5432"
-
-  kafka:
-    # devnet only, and still no published port (see the base file's kafka comment).
-    networks:
-      - devnet
 
   data_store:
     networks:
@@ -75,7 +71,7 @@ services:
       - ./schemas:/code/schemas
     environment:
       - LOG_LEVEL=debug
-      # Latency harness server: answers data_store over REST and Kafka RPC. Must match the
+      # Latency harness server: answers data_store over REST and gRPC. Must match the
       # data_store setting above -- enabling one alone leaves a client with no server.
       - LATENCY_TEST_ENABLED=true
     image: trader_joe_data_ingest:dev

@@ -1,6 +1,6 @@
 # Shared schemas
 
-Pydantic v2 models shared across services — the cross-service data contract, separate from the transport contracts in `routers/*/app_endpoints.py`.
+Pydantic v2 models shared across services — the **HTTP** data contract, separate from the transport contracts in `routers/*/app_endpoints.py`. The contract *between* the two services is the `.proto` under `proto/`, not these models; where the two describe the same value, the `.proto` is the one that decides.
 
 ## Architecture reference
 
@@ -12,7 +12,7 @@ Pydantic v2
 
 ## Key invariants
 
-Models are the cross-service contract. Annotations are evaluated at runtime, so imports used in them must not move into TYPE_CHECKING blocks.
+Models are the contract for everything served over HTTP; the `.proto` is the contract between the services. Annotations are evaluated at runtime, so imports used in them must not move into TYPE_CHECKING blocks.
 
 ## Environment variables
 

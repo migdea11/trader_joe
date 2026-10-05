@@ -89,7 +89,7 @@ GIT = '/usr/bin/git'
 # addendum 1 (b)).
 DOCKER_HOST = 'tcp://socket_proxy:2375'
 
-SERVICES = ('postgres', 'kafka', 'data_store', 'data_ingest')
+SERVICES = ('postgres', 'data_store', 'data_ingest')
 # Built by stack_up; test_client is rebuilt by run_system_tests' own `run --build` as well. Exactly
 # the services with a build: key in COMPOSE_FILES, so builds() also reads it: a `run` of one of them
 # builds its image when it is missing.
@@ -106,7 +106,7 @@ SNAPSHOT_BOUND_SERVICES = ('data_store', 'data_ingest')
 TAIL_DEFAULT = 200
 TAIL_MAX = 2000
 MAX_TEST_PATHS = 50
-# The whole stack's --wait budget, as prod-launch's: kafka alone declares a 90s start_period.
+# The whole stack's --wait budget, as prod-launch's: room above data_store's 60s start_period.
 WAIT_TIMEOUT_SECONDS = 300
 
 # THE SNAPSHOT (ADR tj-4rr0la addendum 5, ruling 1): what refresh_snapshot() copies from a worktree
@@ -163,19 +163,17 @@ ENV_DEFAULT_SOURCES = {'root': '.env.default', 'store': 'data/store/.env.default
 ENV_FILE_NAMES = {'root': ROOT_ENV_NAME, 'store': STORE_ENV_NAME, 'ingest': INGEST_ENV_NAME}
 ENV_FILE_VARIABLES = {'root': 'ROOT_ENV_FILE', 'store': 'STORE_ENV_FILE', 'ingest': 'INGEST_ENV_FILE'}
 
-# The agent stack's own names, each distinct from the user's (.env.default: db, kafka,
+# The agent stack's own names, each distinct from the user's (.env.default: db,
 # trader_joe_store_api).
 AGENT_DATABASE_NAME = 'trader_joe_agent_stack_postgres'
-AGENT_BROKER_NAME = 'trader_joe_agent_stack_kafka'
 AGENT_STORE_API_NETWORK = 'trader_joe_agent_stack_store_api'
 
 # Set in the ROOT generated file only (tj-c4mosr.3, F1 note). env_file order is root then service
 # file, so a service-file value would silently win in the container while compose interpolated the
-# root one: DATABASE_NAME and BROKER_NAME would name one host in container_name and another in the
-# apps' environment. The secrets and paths follow the same rule so each has one value in one file.
+# root one: DATABASE_NAME would name one host in container_name and another in the apps'
+# environment. The secrets and paths follow the same rule so each has one value in one file.
 ROOT_ONLY_VARIABLES = (
     'DATABASE_NAME',
-    'BROKER_NAME',
     'STORE_API_NETWORK',
     'DATA_DIR',
     'POSTGRES_PASS',
@@ -453,7 +451,7 @@ def build_env_values(stack_dir: Path, defaults: Mapping[str, Mapping[str, str]])
     """The three files' contents: the committed defaults with the agent stack's overrides.
 
     Root: every committed root variable, then random POSTGRES_PASS and INSTANCE_WRITE_SECRET, the
-    agent stack's DATABASE_NAME, BROKER_NAME, STORE_API_NETWORK and DATA_DIR, and the three
+    agent stack's DATABASE_NAME, STORE_API_NETWORK and DATA_DIR, and the three
     *_ENV_FILE paths. Store and ingest: their committed variables, less every ROOT_ONLY_VARIABLES
     name. ALPACA_API_KEY and ALPACA_API_SECRET present and EMPTY in the ingest file only.
 
@@ -468,7 +466,6 @@ def build_env_values(stack_dir: Path, defaults: Mapping[str, Mapping[str, str]])
         POSTGRES_PASS=secrets.token_hex(24),
         INSTANCE_WRITE_SECRET=secrets.token_hex(32),
         DATABASE_NAME=AGENT_DATABASE_NAME,
-        BROKER_NAME=AGENT_BROKER_NAME,
         STORE_API_NETWORK=AGENT_STORE_API_NETWORK,
         DATA_DIR=str(stack_dir / DATA_DIR_NAME),
         ROOT_ENV_FILE=str(paths['root']),
@@ -526,8 +523,8 @@ def check_env_file_paths(settings: Settings, worktree_paths: Sequence[Path]) -> 
     each an absolute path, free of symlinks, of an existing regular file directly inside the agent
     stack's own directory, and under no worktree (the base file's defaults resolve to the user's
     live env files, and the MCP container can see the main checkout). Also refuses unless
-    ROOT_ENV_FILE is the --env-file itself; DATA_DIR is the stack directory's data/; DATABASE_NAME,
-    BROKER_NAME and STORE_API_NETWORK carry the agent stack's names and appear in the root file
+    ROOT_ENV_FILE is the --env-file itself; DATA_DIR is the stack directory's data/; DATABASE_NAME
+    and STORE_API_NETWORK carry the agent stack's names and appear in the root file
     only (the F1 rule); ALPACA_API_KEY and ALPACA_API_SECRET are present and empty in the ingest
     file and absent from the other two. And refuses when any of the three files sets a key starting
     COMPOSE_ or DOCKER_ (STEERING_PREFIXES): compose reads COMPOSE_* from the --env-file, so an edited
@@ -551,11 +548,7 @@ def check_env_file_paths(settings: Settings, worktree_paths: Sequence[Path]) -> 
             raise Refused(f'{variable} does not name a regular file')
     if root_values.get('DATA_DIR') != str(settings.stack_dir / DATA_DIR_NAME):
         raise Refused("DATA_DIR must be the agent stack's own data directory")
-    expected_names = {
-        'DATABASE_NAME': AGENT_DATABASE_NAME,
-        'BROKER_NAME': AGENT_BROKER_NAME,
-        'STORE_API_NETWORK': AGENT_STORE_API_NETWORK,
-    }
+    expected_names = {'DATABASE_NAME': AGENT_DATABASE_NAME, 'STORE_API_NETWORK': AGENT_STORE_API_NETWORK}
     for variable, expected in expected_names.items():
         if root_values.get(variable) != expected:
             raise Refused(f"{variable} must be the agent stack's own name, {expected}")
@@ -962,7 +955,7 @@ def builds(tail: Sequence[str]) -> bool:
 
     compose builds a missing image on up/run without --build, so this is: `build`; any `--build`;
     `up`, always (an `up` naming no service builds every one); or a `run` naming a BUILT_SERVICES
-    service (postgres and kafka are image-only, so stack_wipe's clear runs stay base-free). A word
+    service (postgres is image-only, so stack_wipe's clear runs stay base-free). A word
     that matches by coincidence costs an extra inspect, the safe direction.
     """
     if not tail:
@@ -997,8 +990,8 @@ def base_pull_step(ref: str, cwd: Path) -> Step:
 def stack_up_steps(stack_dir: Path, root_env_file: Path) -> list[Step]:
     """Build the images from the snapshot, start the infrastructure, then force-recreate the app services.
 
-    Three steps. The plain `up` of the services with no snapshot bind (postgres, kafka) recreates
-    them only on a config change, so their data and Kafka's start_period are not paid on every call.
+    Three steps. The plain `up` of the services with no snapshot bind (postgres) recreates
+    them only on a config change, so their data is not re-created on every call.
     The last `up` force-recreates SNAPSHOT_BOUND_SERVICES so their binds resolve in the snapshot just
     refreshed, and creates each once per stack_up; --no-deps is safe because the step before already
     waited for the infrastructure healthy. Both `up` steps can build (builds()), so the runner's
@@ -1021,11 +1014,11 @@ def stack_down_steps(stack_dir: Path, root_env_file: Path) -> list[Step]:
 
 
 # Each service's data mount target (docker-compose.agent-stack.yaml mounts ${DATA_DIR}/<service>
-# there), cleared from inside a one-off container of that service as root: Postgres and Kafka own
-# their files, not the MCP's user. The script takes the target as $1; the globs cover dotfiles, and
+# there), cleared from inside a one-off container of that service as root: Postgres owns its
+# files, not the MCP's user. The script takes the target as $1; the globs cover dotfiles, and
 # rm -f ignores a glob that matched nothing. The target is the container side of a mount the guard
 # has checked.
-DATA_MOUNTS = (('postgres', '/var/lib/postgresql/data'), ('kafka', '/var/lib/kafka'))
+DATA_MOUNTS = (('postgres', '/var/lib/postgresql/data'),)
 _CLEAR_SCRIPT = 'rm -rf -- "$1"/* "$1"/.[!.]* "$1"/..?*'
 
 

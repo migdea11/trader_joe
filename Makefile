@@ -199,8 +199,8 @@ errors-doc: $(VENV_MARKER)  ## Regenerate docs/errors.md from common/errors (com
 # dependency group, and the debugger of tj-g1qqf1), source bind mounts so reload sees host
 # edits, LOG_LEVEL=debug, and LATENCY_TEST_ENABLED=true on data_store and data_ingest. The
 # first three change how the services are built and how loudly they log; the last changes what
-# they DO at startup -- both create the latency Kafka topics and their RPC client/server
-# consumers, and data_store serves GET /latency (tj-8mt207). That is the whole reason
+# they DO at startup -- both stand up the latency client and server, and data_store serves
+# GET /latency (tj-8mt207). That is the whole reason
 # PROD_COMPOSE must never grow the override: loading it here would put the harness back into
 # prod, which is the environment this repo exists to keep it out of.
 #
@@ -240,8 +240,8 @@ DEV_NETWORK := trader_joe_devnet
 
 # --wait, matching the CI deploy step: it blocks until every started service reports
 # healthy and exits non-zero if one does not, so a broken deploy fails the command instead
-# of printing a cheerful "Started". 300s because kafka alone declares a 90s start_period
-# and data_store a 60s one. Detached is the consequence -- `prod-logs` is how you watch it.
+# of printing a cheerful "Started". 300s leaves room above data_store's 60s start_period
+# and data_ingest's own. Detached is the consequence -- `prod-logs` is how you watch it.
 PROD_UP := $(PROD_COMPOSE) up -d --wait --wait-timeout 300
 
 .PHONY: prod-build
@@ -253,8 +253,8 @@ prod-build-clean: $(VENV_MARKER)  ## Build the production images from scratch, n
 	$(PROD_COMPOSE) build --no-cache
 
 .PHONY: prod-deps
-prod-deps: $(VENV_MARKER)  ## Start the production dependencies (postgres, kafka)
-	$(PROD_UP) postgres kafka
+prod-deps: $(VENV_MARKER)  ## Start the production dependencies (postgres)
+	$(PROD_UP) postgres
 
 .PHONY: prod-launch
 prod-launch: prod-deps  ## Start the production services, waiting for healthy
@@ -264,9 +264,16 @@ prod-launch: prod-deps  ## Start the production services, waiting for healthy
 prod-logs:  ## Follow the production service logs
 	$(PROD_COMPOSE) logs -f data_store data_ingest
 
+# --remove-orphans, for the reason agent-up carries it (addendum 11 R3, line 633) and
+# stack_down_steps carries it: a service DROPPED from the compose file leaves a container this
+# project owns and no longer declares, and a plain `down` leaves it running with only a warning.
+# That is not hypothetical here -- a kafka container outlived the service's deletion and failed a
+# verification run (tj-citjd6). IT DELETES, and on the production path: any container in this
+# project whose service is no longer in the file goes, not just the one you were thinking of. That
+# is what "removes this stack cleanly" has always promised, and the flag is what makes it true.
 .PHONY: prod-down
 prod-down:  ## Stop the production stack
-	$(PROD_COMPOSE) down
+	$(PROD_COMPOSE) down --remove-orphans
 
 # The single spelling of "apply the migrations" — run it after every deploy, once the stack is
 # up. Nothing else creates the schema, so a healthy stack has an empty database until this runs.
@@ -292,7 +299,8 @@ migrate:  ## Apply database migrations to the running production stack
 # READ-ONLY, and the approval for this target was conditional on staying that way: `current`
 # reads the alembic_version table, `history` reads the revision files, and neither writes
 # anything. Nothing may be added here that mutates -- a mutating step belongs behind its own
-# named target, the way `migrate` is.
+# named target, the way `migrate` is. `alembic check` is NOT read-only and so lives behind
+# `migrate-check` below, which says why.
 #
 # It exists because the hazard run_migrations.sh's header documents had no diagnostic: the code
 # that runs comes from the deployed image, the revisions that get applied come from whatever is
@@ -309,6 +317,36 @@ migrate:  ## Apply database migrations to the running production stack
 migrate-status:  ## Report the applied revision and the revision history (read-only)
 	./data/store/run_migrations.sh current
 	./data/store/run_migrations.sh history
+
+# THE DRIFT DIAGNOSTIC, AND IT IS NOT READ-ONLY -- which is the whole reason it is a target of its
+# own rather than a third line of `migrate-status`.
+#
+# What it buys: `alembic check` compares the models with the live catalogue, and so sees what
+# `current` structurally cannot. Bug tj-5h30md is the case -- the database sat at head
+# eec8f88a7443 with uq_stock_market_activity_natural_key manually dropped, and `current` read
+# alembic_version, reported head, and was right, because a manual DROP leaves that table
+# untouched. Nothing surfaced the drift until every bar upsert returned 500.
+#
+# What it costs, MEASURED, not reasoned (validator, on tj-o82yyu): unlike `current`, `check` does
+# not pass dont_mutate=True, so MigrationContext.run_migrations reaches _ensure_version_table,
+# whose body is `self._version.create(self.connection, checkfirst=True)` -- a CREATE TABLE. On a
+# throwaway never-migrated SQLite database, `current` wrote nothing while `check` raised
+# CommandError AND created alembic_version. So it is read-only only against a database that has
+# already been migrated, and the case where it is not is a first run or a wiped volume -- exactly
+# when an operator reaches for a status command. ADR tj-x3ig38's 2026-10-02 addendum item 8 says
+# `check` writes nothing; that item is wrong, and this is the measurement that refutes it.
+#
+# Hence the split. `migrate-status` keeps a promise its approval was conditional on, this target
+# states its cost in its own help line, and the allowlist in common/tests/test_ci_invariants.py
+# stays as it is -- it names ensure_version among the writers it excludes, so it was right to
+# refuse `check`, and widening it would have bought a true-looking label over a false claim.
+#
+# A non-zero exit means drift, or "Target database is not up to date." when the database is behind
+# head. BLIND SPOTS: autogenerate compares neither enum labels nor server defaults, so a clean run
+# is no evidence about either (ADR tj-x3ig38 addendum items 2 and 4; migrations/env.py says why).
+.PHONY: migrate-check
+migrate-check:  ## Compare the models with the live schema (writes alembic_version if absent)
+	./data/store/run_migrations.sh check
 
 .PHONY: dev-build
 dev-build: $(VENV_MARKER)  ## Build the development images (:dev)
@@ -328,8 +366,8 @@ dev-network:  ## Create the shared dev network if it is missing (never removed)
 		|| docker network inspect $(DEV_NETWORK) > /dev/null
 
 .PHONY: dev-deps
-dev-deps: $(VENV_MARKER) dev-network  ## Start the development dependencies (postgres, kafka)
-	$(DEV_COMPOSE) up -d postgres kafka
+dev-deps: $(VENV_MARKER) dev-network  ## Start the development dependencies (postgres)
+	$(DEV_COMPOSE) up -d postgres
 
 # pgAdmin is a tool, not a dependency: it lives in docker-compose.tools.yaml, which dev-deps and
 # dev-launch never load (tj-ae3n49). This is the on-demand spelling, and the one target that
@@ -347,6 +385,9 @@ dev-launch: dev-deps  ## Start the development services in the foreground, with 
 
 # Through TOOLS_COMPOSE, so a pgAdmin started by dev-tools goes down with the rest instead of
 # being left running as an orphan on the project network. Costs nothing when it is not running.
+# That handles the service-in-a-file-you-forgot-to-load case; --remove-orphans handles the other
+# one, a service DROPPED from the file entirely, which widening the file list cannot reach. See
+# prod-down for what the flag deletes.
 #
 # The placeholder PGADMIN_* values exist only to get past the ":?" guards, so that stopping the
 # stack never requires pgAdmin credentials. They are safe here and ONLY here: `down` creates no
@@ -354,7 +395,7 @@ dev-launch: dev-deps  ## Start the development services in the foreground, with 
 # .env in compose interpolation, which is why they must never be copied onto an `up`.
 .PHONY: dev-down
 dev-down:  ## Stop the development stack, pgAdmin included
-	PGADMIN_EMAIL=unused PGADMIN_PASS=unused $(TOOLS_COMPOSE) down
+	PGADMIN_EMAIL=unused PGADMIN_PASS=unused $(TOOLS_COMPOSE) down --remove-orphans
 
 .PHONY: dev-prune
 dev-prune: ## Prune development services

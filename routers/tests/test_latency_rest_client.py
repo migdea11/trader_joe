@@ -43,13 +43,7 @@ import common.timer
 import routers.common.latency as latency
 from common.tests.image_path import image_pythonpath
 from routers.common.app_endpoints import InterfaceRest
-from routers.tests.latency_harness import (
-    AppStub,
-    RecordingRestClient,
-    legacy_group_args,
-    rest_endpoint,
-    turn_harness_on,
-)
+from routers.tests.latency_harness import AppStub, RecordingRestClient, rest_endpoint, turn_harness_on
 from schemas.common.latency import LatencyRequest
 
 
@@ -83,8 +77,6 @@ class _ForbiddenSocket(socket.socket):
 
 socket.socket = _ForbiddenSocket
 
-import inspect
-
 import routers.common.latency as latency
 
 
@@ -97,11 +89,7 @@ class _AppStub:
 
 
 app = _AppStub()
-# The dead consumer-group parameter, supplied only while the signature has one (tj-3mk3u5.32). The
-# probe cannot import routers.tests.latency_harness.legacy_group_args without widening what this
-# child is allowed to load, so the same two lines are spelled out here.
-legacy = (None,) if 'client_group' in inspect.signature(latency.initialize_latency_client).parameters else ()
-latency.initialize_latency_client(app, 'probe', 1, *legacy)
+latency.initialize_latency_client(app, 'probe', 1)
 
 print('client=' + repr(getattr(latency, '__REST_CLIENT')), flush=True)
 print('httpx_imported=' + repr('httpx' in sys.modules), flush=True)
@@ -169,7 +157,7 @@ def test_one_client_is_built_for_the_process_with_the_ruled_limits(harness_on, m
 
     monkeypatch.setattr(httpx, 'AsyncClient', recorder)
 
-    latency.initialize_latency_client(AppStub(), 'probe', 1, *legacy_group_args())
+    latency.initialize_latency_client(AppStub(), 'probe', 1)
 
     assert len(built) == 1, f'expected exactly one client for the process, got {len(built)}'
     assert built[0]['timeout'] == latency.LATENCY_TEST_TIMEOUT
@@ -190,7 +178,7 @@ async def test_the_handler_reuses_the_process_client_and_never_builds_its_own(
     in the failure rather than leaving it to be inferred from a post count of zero.
     """
     app = AppStub()
-    latency.initialize_latency_client(app, 'probe', 1, *legacy_group_args())
+    latency.initialize_latency_client(app, 'probe', 1)
 
     recorder = RecordingRestClient()
     monkeypatch.setattr(latency, '__REST_CLIENT', recorder)
@@ -220,7 +208,7 @@ async def test_the_rest_sample_posts_the_model_as_a_json_body(harness_on, monkey
     response says so, which is why it is pinned at the call rather than at the result.
     """
     app = AppStub()
-    latency.initialize_latency_client(app, 'probe', 1, *legacy_group_args())
+    latency.initialize_latency_client(app, 'probe', 1)
 
     recorder = RecordingRestClient()
     monkeypatch.setattr(latency, '__REST_CLIENT', recorder)

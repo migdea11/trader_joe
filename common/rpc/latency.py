@@ -1,12 +1,12 @@
 """The latency harness's gRPC arm (proto/trader_joe/proto/internal/latency/v1/latency.proto).
 
-MEASUREMENT TOOLING, NOT A DATA CONTRACT. routers/common/latency.py times this call beside its REST and
-Kafka-RPC arms (tj-3mk3u5.8), and the user records p50 and p99 for all three (tj-3mk3u5.26). This module
+MEASUREMENT TOOLING, NOT A DATA CONTRACT. routers/common/latency.py times this call beside its REST
+arm (tj-3mk3u5.8), and the user records p50 and p99 for both (tj-3mk3u5.26). This module
 is the arm's seam (ADR tj-8konfu D3): the generated symbols stay in this package, and the harness deals
 in a ServiceRegistration, a LatencyProbeClient and a plain string payload.
 
-The servicer acknowledges a probe without reading its payload, as the other two arms' servers do, so
-the three timings differ by transport and not by the work done on arrival. It does nothing blocking,
+The servicer acknowledges a probe without reading its payload, as the REST arm's server does, so
+the two timings differ by transport and not by the work done on arrival. It does nothing blocking,
 because grpc.aio runs every handler on the event loop (ADR tj-8konfu D2).
 
 THE PAYLOAD CEILING. A probe is one message, so the shared 4 MiB limit (common.rpc.config, D6.3) bounds

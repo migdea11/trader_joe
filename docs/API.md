@@ -81,9 +81,10 @@ document goes stale in one diff while the addresses survive. File and symbol are
 entry checkable — but they are marked *as of the dataset-model PR* and are deliberately never woven into prose,
 so updating them is a field edit rather than a rewrite.
 
-There is one place that rule breaks, and it is flagged inline at the entry: **R1's address is a Kafka
-topic**, and a topic name does not survive the Kafka removal. That entry is re-keyed at the cutover
-rather than replaced, so the inventory does not read as though a second interface appeared.
+That rule used to break in one place: **R1's address was a Kafka topic**, not a path. The Kafka
+removal (`tj-3mk3u5`) settled it by retiring the entry outright rather than re-keying it. data_ingest's
+interface is now the gRPC `IngestService`, which by ADR `tj-8konfu` D3 lives outside `routers/` and so
+is pinned where it lives — `data/ingest/tests/test_grpc_host.py` — instead of in this manifest.
 
 **One known blind spot in the manifest: matching is by path, not by method.** An interface enum
 member carries a path and no method, so the manifest cannot tell `GET /store/{id}` from
@@ -102,9 +103,7 @@ change.
 | Marker | Meaning |
 |---|---|
 | **Stable** | Expected to survive the migrations in flight, in substance. Its implementing file still moves at the monorepo split. |
-| **Route survives, outbound hop changes** | Callers keep the same address; what the handler calls downstream is replaced. |
-| **Address is re-keyed** | The address itself — the thing this document keys on — changes at the cutover. |
-| **Dies with Kafka** | Scheduled for deletion along with the Kafka transport, and not before. |
+| **Route survives, outbound hop changes** | Callers keep the same address; what the handler calls downstream is replaced. No entry carries it today — S1 was the only one, and its hop has already changed. |
 | **Fate undecided** | Genuinely not yet decided. Do not guess, and confirm before building on it. |
 | **Filed for implementation** | Decided and filed as work. Not built yet; the entry says which task owns it. |
 
@@ -116,31 +115,46 @@ ruling any more. The deleted declarations are recorded under
 [Declarations deleted by ruling](#declarations-deleted-by-ruling-2026-09-23) rather than dropped, so
 the reasoning survives the deletion.
 
+A third marker, **Dies with Kafka**, has also been retired — and it is worth saying why, because it
+is the one marker in this document that turned out to be **wrong**. It meant "scheduled for deletion
+along with the Kafka transport", and it was applied to C2 and C3. The Kafka transport is now gone and
+**C2 and C3 are still here**: what died was the latency harness's Kafka *arm*, not the routes. A
+reader who had acted on the marker would have deleted live code. The two entries are marked **Stable**
+below, and the harness's own entry says what actually changed.
+
 Every implementing file on this surface moves at the monorepo split (`tj-iontkq`), so that is not
 repeated per entry.
 
 ## The surface at a glance
 
-**Nine** interfaces are visible to the manifest as of the dataset-model PR, plus one declaration the manifest
-cannot see (`GET /store/{id}`, per the method-blind matching limit above). Four of the nine are
-stable. The count is taken from `routers/tests/interface_manifest/*.manifest` — three lines in
-`common.manifest`, five in `data_store.manifest`, one in `data_ingest.manifest` — not from the prose
-below.
+**Eight** interfaces are visible to the manifest, plus one declaration the manifest cannot see
+(`GET /store/{id}`, per the method-blind matching limit above). Six of the eight are stable. The count
+is taken from `routers/tests/interface_manifest/*.manifest` — three lines in `common.manifest`, five in
+`data_store.manifest` — not from the prose below. `data_ingest.manifest` holds a single `none` line,
+which is a declaration that the component exposes nothing this manifest can enumerate, not an
+interface; its real surface is the gRPC `IngestService`, pinned outside `routers/`.
+
+It was nine until the Kafka removal, when R1 left the table.
 
 | # | Address | Component | Kind | Auth | Stability |
 |---|---|---|---|---|---|
 | C1 | `GET /ping` | common | http | none | **Stable** |
-| C2 | `/latency/{latency_type}` | common | unbound-path | none | **Dies with Kafka** |
-| C3 | `/latency_internal` | common | unbound-path | none | **Dies with Kafka** |
-| S1 | `POST /store/{asset_type}/{data_type}/{asset_symbol}` | data_store | http | instance secret | **Route survives, outbound hop changes** |
+| C2 | `/latency/{latency_type}` | common | unbound-path | none | **Stable** |
+| C3 | `/latency_internal` | common | unbound-path | none | **Stable** |
+| S1 | `POST /store/{asset_type}/{data_type}/{asset_symbol}` | data_store | http | instance secret | **Stable** (outbound hop already changed) |
 | S2 | `GET /store/{asset_type}/{data_type}/{asset_symbol}` | data_store | http | none | **Stable** |
 | S3 | `DELETE /store/{id}` | data_store | http | instance secret | **Stable** |
 | S4 | `POST /internal/asset-data/{asset_type}/{data_type}` | data_store | http | instance secret | **Fate undecided** |
 | S5 | `GET /internal/asset-data/{asset_type}/{data_type}` | data_store | http | none | **Stable** |
-| R1 | `stock_market_activity_rpc` | data_ingest | rpc | none | **Address is re-keyed** |
 | — | `GET /store/{id}` | data_store | *invisible to the manifest* | n/a | **Filed for implementation** (`tj-2h1q3k`) |
 
-**Why nine and not ten.** The last row is the one entry in this table that is not a manifest line,
+data_ingest has no row. Its interface is the gRPC `IngestService.FetchDataset`, declared in
+`proto/trader_joe/proto/internal/ingest/v1/ingest.proto`, handled by
+`routers/data_ingest/fetch_dataset_handler.py :: IngestFetchHandler` and registered in
+`data/ingest/app/grpc_host.py`. It is outside this document's REST-shaped inventory by ADR
+`tj-8konfu` D3, and pinned by `data/ingest/tests/test_grpc_host.py`.
+
+**Why eight and not nine.** The last row is the one entry in this table that is not a manifest line,
 and it is marked so. The manifest matches by path and not by method, so `GET /store/{id}` is counted
 as bound by the `DELETE` at the same path and never appears as its own line. Every other row here is
 a manifest line, one for one. That single discrepancy is deliberate, and it is the reason a count
@@ -150,20 +164,21 @@ taken from this table and a count taken from the manifest differ by exactly one.
 kind was invented to describe: written code that mounts only under an environment flag. No
 data_store or data_ingest declaration sits unserved any more.
 
-**Four entries have left this surface since the inventory behind this document was taken.** One was a
+**Five entries have left this surface since the inventory behind this document was taken.** One was a
 real route: `DELETE /internal/asset-data/{asset_type}/{data_type}`, removed under `tj-h7ikz2` — handler,
-enum member and manifest line in one diff, which is what the manifest's rule demands. The other three
+enum member and manifest line in one diff, which is what the manifest's rule demands. Three
 were *declarations* that no code ever served, deleted under `tj-wc4pe8` and `tj-427x50` by user ruling; see
-[Declarations deleted by ruling](#declarations-deleted-by-ruling-2026-09-23). If you are reading an
+[Declarations deleted by ruling](#declarations-deleted-by-ruling-2026-09-23). The fifth is R1, the
+Kafka RPC handler, deleted with the transport under `tj-3mk3u5.11`; the `rpc` kind that enumerated it
+went with it on `tj-3mk3u5.32`, since no registration was left for it to describe. If you are reading an
 analysis or task note that says thirteen interfaces, it predates that route's removal; one that
-says twelve predates the first deletion by ruling.
+says twelve predates the first deletion by ruling; one that says nine predates the Kafka removal.
 
 ### The three kinds
 
 - **`http`** — a FastAPI route registered on a module-scope `APIRouter` while the module body ran.
-- **`rpc`** — a handler registered through `KafkaRpcFactory.add_server()` while the module body ran.
-  Enumerating one is proof the registration actually happened at import; if it stops happening, the
-  service starts and answers nothing.
+- **`none`** — the component exposes nothing this manifest can enumerate, said out loud. A single
+  `none` line is a declaration, which an accidentally empty file is not (decision `tj-3wgh03`).
 - **`unbound-path`** — a path declared in an interface enum that no import-time route serves. This
   kind exists because the import-time surface is not the whole declared surface, and that gap was
   invisible before the manifest existed.
@@ -274,11 +289,37 @@ can select a feed yet.
 
 These hold on every route unless the entry says otherwise.
 
+## Error bodies: RFC 9457 problem+json
+
+**Every error this surface returns on purpose is problem+json.** The full catalogue — every reason,
+its HTTP status, its gRPC code and whether it is retryable — is [`docs/errors.md`](errors.md), which
+is **generated** by `make errors-doc` from the single `Reason` table in `common/errors`. CI fails on
+a stale copy. Do not hand-edit it, and do not restate the per-reason table here; this section gives
+only the rules a client needs.
+
+- **`type` is always `about:blank`,** and `title` is the HTTP status phrase — which is what RFC 9457
+  asks for when the type is `about:blank`. No type URI namespace is published, so there is no URL to
+  resolve and nothing to branch on in either member.
+- **An error's identity is (`domain`, `reason`), with `domain` always `trader-joe`.** Clients branch
+  on **`reason`** and on nothing else — never on `detail`, never on `title`. `detail` is human text
+  and is never parsed. A client must survive a reason it has never heard of.
+- **`Retry-After`, `retry_after` and `reset_at` appear together,** whenever the error carries a time
+  at which the condition is expected to clear. `retry_after` is derived from `reset_at` at the moment
+  the answer is written, so a relayed error never carries a delay that went stale in transit. The
+  header and the body member always say the same number.
+
+**One ruled known gap: an unknown or misspelled symbol is not an error.** It is served empty — HTTP
+**200**, `data_points` 0, and a `served_range` covering the window that was asked for. That is a
+user ruling, not an oversight, and the refusal is filed as `tj-lldllr`. Because `served_range` is in
+the response body, the gap is at least *visible* to a client: a caller that needs to tell "no such
+symbol" from "no data in this window" must compare what it asked for against what it was served,
+and cannot rely on an error.
+
 | Convention | Behaviour |
 |---|---|
-| **Timezone-aware datetimes only** | Every datetime a caller sends — the create body's `start`, `end` and `expiry`; S2's `start`, `end`, `created_at`, `updated_at`; S4's bar `timestamp`; S5's `start`, `end`; and the RPC request R1 — must carry an offset or `Z`. A naive value is a **422** naming the field (type `timezone_aware`). It is refused, never assumed to be UTC. |
+| **Timezone-aware datetimes only** | Every datetime a caller sends — the create body's `start`, `end` and `expiry`; S2's `start`, `end`, `created_at`, `updated_at`; S4's bar `timestamp`; and S5's `start`, `end` — must carry an offset or `Z`. A naive value is a **422** naming the field (type `timezone_aware`). It is refused, never assumed to be UTC. |
 | **Unknown fields and parameters are refused** | Request models reject what they do not declare (`extra='forbid'`), so a misspelt field or query parameter is a **422** (type `extra_forbidden`) rather than silently ignored. On S2 and S5 this holds for query parameters because the query model is bound with `Query()`. A strict receiver means that when a field is **added** to a contract, the receiving side must deploy first. |
-| **Enum names on the wire** | `expiry_type` and `update_type` travel as member **names** — `BULK`, `BUFFER_1K`, `BUFFER_10K`, `BUFFER_100K`, `ROLLING`; `STATIC`, `DAILY`, `STREAM` — and the OpenAPI document declares them as string enums of those names, with defaults `BULK` and `STATIC`. An integer is still accepted on input but is undocumented. The Kafka RPC request (R1) still carries these two as integers. |
+| **Enum names on the wire** | `expiry_type` and `update_type` travel as member **names** — `BULK`, `BUFFER_1K`, `BUFFER_10K`, `BUFFER_100K`, `ROLLING`; `STATIC`, `DAILY`, `STREAM` — and the OpenAPI document declares them as string enums of those names, with defaults `BULK` and `STATIC`. An integer is still accepted on input but is undocumented. Over gRPC these travel as protobuf enums, declared in `proto/trader_joe/proto/market/v1/enums.proto`. |
 | **No orphan OpenAPI components** | The store app prunes any `components.schemas` entry no `$ref` reaches, so the leftover integer-enum components `ExpiryType` and `UpdateType` are no longer in the document. A client generated from it gets one type per component actually used. |
 | **Instance secret before schema validation** | On a guarded route the 401 is answered before path, query and body values are validated against their models, so an unauthenticated request with, say, a bad path value or a body that fails the schema is a 401, not a 422. **Except for a body that is not valid JSON:** FastAPI parses the JSON body before it runs the secret dependency, so an unparseable body is a 422 whether or not the secret is present. |
 | **One database session per request** | Every store route gets its session from the `async_db` dependency (`data/store/app/database/database.py`), which opens it through `PostgresSessionFactory.AsyncSessionHandle.session()` and closes it when the request ends, including when the request raises. Closing rolls back any transaction still open and returns the connection to the pool. There is no `get_session` and no task-scoped registry behind it; the registry it replaced leaked one pooled connection per read request (decision record `tj-8z213c`). |
@@ -303,12 +344,12 @@ These hold on every route unless the entry says otherwise.
 
 | | |
 |---|---|
-| **Stability** | **Stable.** Not Kafka-borne, and the gRPC work (`tj-8konfu`) keeps REST for admin, debug and health rather than re-hosting it. |
+| **Stability** | **Stable.** The gRPC work (`tj-8konfu`, landed) keeps REST for admin, debug and health rather than re-hosting it. |
 | **Auth** | none |
 | **Implementation** | `routers/common/ping.py :: ping` *(as of the dataset-model PR)* |
 | **Request** | none |
 | **Response** | undeclared — no `response_model`; the handler returns an ad-hoc dict |
-| **Touches** | nothing — no Postgres, no Kafka, no broker |
+| **Touches** | nothing — no Postgres, no gRPC, no broker |
 
 **Contract: a 2xx status.** Treat the status as the contract and not the body. `docker-compose.yaml`
 makes this route the container healthcheck for *both* services, and the probe reads and discards the
@@ -325,13 +366,13 @@ block on for both services.
 
 | | |
 |---|---|
-| **Stability** | **Dies with Kafka** — after one last job. See below; this is *not* dead code to delete today. |
+| **Stability** | **Stable.** It outlived the transport it was built to measure; see below. |
 | **Auth** | none |
 | **Declared at** | `routers/common/app_endpoints.py :: InterfaceRest.LATENCY` *(as of the dataset-model PR)* |
 | **Implemented in** | `routers/common/latency.py`, inside `initialize_latency_client()` |
 | **Request** | `schemas.common.latency.LatencyRequest` |
-| **Response** | undeclared — one of three ad-hoc dicts |
-| **Touches** | Kafka, and HTTP to the service's own `/latency_internal` |
+| **Response** | undeclared — ad-hoc dict |
+| **Touches** | a gRPC channel to data_ingest, and HTTP to the service's own `/latency_internal` |
 
 **This is the one interface in this document whose existence depends on an environment variable.**
 The router is built *inside* `initialize_latency_client()`, which runs only when
@@ -344,23 +385,25 @@ caller-supplied `payload_size` and `iterations`, allocates `os.urandom(payload_s
 fans that many requests out concurrently. That is a request amplifier, not merely an idle endpoint.
 Recorded on `tj-a0s7vl`.
 
-**Why it is not deleted now.** It is a Kafka-versus-REST latency measurement harness, and it has one
-scheduled job left: the staged gRPC cutover (`tj-8konfu`) adds gRPC as a third latency arm beside
-REST and Kafka-RPC, and says in terms that the REST arm — unlike the Kafka arm — is not deleted for
-it. The harness is the instrument for the cutover measurement, and it dies with the transport it was
-built to compare against.
+**It used to be marked "Dies with Kafka". That was wrong.** It was a Kafka-versus-REST latency
+harness, and the reasoning was that it would die with the transport it compared against. What
+actually happened on `tj-3mk3u5.35` is that the **Kafka arm** was removed and the harness kept: the
+gRPC cutover (`tj-8konfu`) added gRPC as an arm, and `LatencyRequest.LatencyType` is now exactly
+`REST` and `GRPC`. `routers/common/app_endpoints.py` no longer declares `InterfaceRpc` at all. So the
+harness now measures REST against gRPC, which is a live comparison rather than a retrospective one,
+and there is no scheduled deletion for it.
 
 ## C3 · `/latency_internal`
 
 | | |
 |---|---|
-| **Stability** | **Dies with Kafka**, with C2 — it exists only as C2's echo target. |
+| **Stability** | **Stable**, with C2 — it exists only as C2's echo target. |
 | **Auth** | none |
 | **Declared at** | `routers/common/app_endpoints.py :: InterfaceRest.INTERNAL_LATENCY` *(as of the dataset-model PR)* |
 | **Implemented in** | `routers/common/latency.py`, inside `initialize_latency_server()` |
 | **Request** | `schemas.common.latency.InternalLatencyRequest` |
 | **Response** | undeclared — ad-hoc dict |
-| **Touches** | Kafka (it also registers an RPC server) |
+| **Touches** | nothing beyond the request — it is a plain FastAPI POST handler that echoes the payload |
 
 Same environment-variable gate as C2, same category: written, switched off. One guard and one
 initialiser pair control both.
@@ -369,24 +412,24 @@ initialiser pair control both.
 
 # routers/data_store
 
-Every route in this component reaches Postgres. `POST /store/...` also reaches Kafka, and is the only
-interface in the component that crosses two external boundaries.
+Every route in this component reaches Postgres. `POST /store/...` also reaches data_ingest over gRPC,
+and is the only interface in the component that crosses two external boundaries.
 
 ## S1 · `POST /store/{asset_type}/{data_type}/{asset_symbol}`
 
 | | |
 |---|---|
-| **Stability** | **Route survives, outbound hop changes.** The address stays; its Kafka forward to data_ingest becomes a gRPC call. |
+| **Stability** | **Stable.** The address never changed, and its outbound hop already has: the Kafka forward to data_ingest became a gRPC call on `tj-3mk3u5.10`. |
 | **Auth** | **instance secret** (`X-Instance-Secret`), fail-closed; 401 otherwise |
 | **Implementation** | `routers/data_store/asset_dataset_store.py :: store_data` *(as of the dataset-model PR)* |
 | **Request** | `schemas.data_store.asset_dataset_store.StoreAssetDatasetPath` + `...StoreAssetDatasetBody` |
 | **Response** | **undeclared** — ad-hoc dict: `message` and `data_points` (bars written) |
-| **Touches** | Postgres (`AsyncSession`) **and** Kafka (`KafkaRpcFactory.RpcClients`) |
+| **Touches** | Postgres (`AsyncSession`) **and** gRPC (`common.rpc.clients.ingest_fetch.IngestFetchClient`) |
 
 This is the write path: it creates (or resolves) the dataset entry, triggers a fetch, forwards the
 request to data_ingest through `store_market_activity_worker`, and writes the returned bars against
 that entry. When the transport moves to gRPC (`tj-8konfu`), the seam that survives is
-`store_market_activity_worker`'s contract, not the Kafka client — anything built against the
+`store_market_activity_worker`'s contract, not the gRPC client — anything built against the
 transport is rewritten at the cutover.
 
 **The body is the dataset's identity.** `owner` (required, no default), `source`, `granularity`,
@@ -584,7 +627,8 @@ surface.
 `GET /store/{asset_type}/{data_type}/{asset_symbol}` returns a list and cannot address one entry,
 while `DELETE /store/{id}` already proves the id is a first-class address. **So the surface today lets
 you delete an entry by id but never read it by id.** It survives every migration in flight —
-unaffected by the Kafka removal, the gRPC re-host and the Phase 1 re-path, which is what separated it
+it came through the Kafka removal and the gRPC re-host untouched, and the Phase 1 re-path will not
+touch it either, which is what separated it
 from the three declarations deleted on the same day —
 `tj-3mk3u5` keeps REST for read and debug — and it becomes *more* useful once the entry row carries
 the fetch-ledger columns, because "what is the state of this fetch" is a read-by-id question (gap
@@ -598,65 +642,80 @@ path is untested across the whole component — do not add another ad-hoc dict.
 
 # routers/data_ingest
 
-data_ingest declares **no HTTP interface at all** today. It answers on one Kafka RPC topic.
+data_ingest declares **no HTTP interface at all**, and `data_ingest.manifest` says so with a single
+`none` line. Its interface is one gRPC method.
 
-## R1 · `stock_market_activity_rpc` (Kafka RPC topic)
+## I1 · `IngestService.FetchDataset` (gRPC, server-streaming)
 
 | | |
 |---|---|
-| **Stability** | **Address is re-keyed.** See the caveat below — this is the one entry whose key changes. |
+| **Stability** | **Stable.** This replaced the Kafka RPC entry (R1) when the transport was removed. |
 | **Auth** | none |
-| **Implementation** | `routers/data_ingest/get_dataset_request.py :: store_data` *(as of the dataset-model PR)*, registered by the `add_server` decorator while the module body runs |
-| **Request** | `schemas.data_ingest.get_dataset_request.GetDatasetRequest` |
-| **Response** | `schemas.data_store.stock.market_activity_data.BatchStockDataMarketActivityCreate` |
-| **Touches** | Kafka (the transport itself) and the broker, reached through a module-level import rather than injection |
+| **Contract** | `proto/trader_joe/proto/internal/ingest/v1/ingest.proto` — the source of truth; the Python stubs under `gen/proto/python/` are generated and committed, and CI fails on a stale tree |
+| **Implementation** | `routers/data_ingest/fetch_dataset_handler.py :: IngestFetchHandler.fetch`, registered in `data/ingest/app/grpc_host.py :: registered_services` |
+| **Request** | `FetchDatasetRequest` |
+| **Response** | `stream FetchDatasetResponse` — a `oneof` over `FetchAccepted`, `FetchRefused`, `BarPage` and `FetchDone` |
+| **Touches** | the broker (injected, as a `readers` mapping) |
+| **Pinned by** | `data/ingest/tests/test_grpc_host.py`, which asserts in a fresh interpreter that `registered_services()` returns exactly this service |
 
-**The keying rule breaks here, and this is the flag.** This document keys entries on address because
-an HTTP path survives the monorepo re-path. **A Kafka topic name does not survive the Kafka removal.**
-When the gRPC re-host lands (`tj-8konfu`), this entry is *re-keyed* to the gRPC method name. That
-re-key is the entry's migration event and belongs here as an addendum to this entry — not as a new
-entry, or the reference reads as though a second interface appeared.
+**The shape is ack-first.** An acknowledgement is *always* the first message on the stream:
+`FetchAccepted`, carrying the **resolved feed**, or `FetchRefused`, which is then the stream's only
+event. Bar pages follow, each non-empty and capped at `MAX_PAGE_BARS`, and `FetchDone` terminates an
+accepted stream — so a stream that merely stops is distinguishable from one that finished. That
+distinction is the point of the design; do not treat an ended stream as a completed one without
+`FetchDone`.
 
-This is the most consequential migration line on the surface. The transport is deleted by `tj-3mk3u5`
-and the method is re-hosted on gRPC by `tj-8konfu`; what survives the cutover is `store_data`'s own
-contract — `GetDatasetRequest` in, `BatchStockDataMarketActivityCreate` out — because the gRPC work
-decides the surface while the message shapes stay put. **Build against the handler signature, not the
-transport.**
+**This entry is not in the manifest, and that is deliberate.** This document's inventory is
+REST-shaped and keyed on path; a gRPC method has no path to key on. ADR `tj-8konfu` D3 keeps the
+generated package outside `routers/`, and decision `tj-3wgh03` D4 pins each surface where it lives,
+so this one is pinned by its own test rather than by `routers/tests/interface_manifest`.
 
-**The request now carries the dataset's identity and principal.** `GetDatasetRequest` carries
-`owner`, `dataset_id` and the other identity fields from S1, rejects unknown fields, and requires
-timezone-aware `start`, `end` and `expiry`. It also declares an optional `feed`, which **nothing in
-data_ingest reads**: the adapter resolves the tape once per fetch from `ALPACA_SIP_ENABLED` and stamps
-it on the returned batch. The response's `feed` is required, one per batch. `split_factor` and
-`dividends_factor` are gone from the bar data, and because the receiving model rejects unknown
-fields, a sender still emitting them fails loudly.
+**Why R1 is gone rather than re-keyed.** The earlier version of this document said R1's address — a
+Kafka topic name — would be *re-keyed* to a gRPC method, so the inventory would not read as though a
+second interface had appeared. That is not what happened: `tj-3mk3u5.11` deleted the handler,
+`tj-3mk3u5.32` deleted the `rpc` kind that enumerated it, and the replacement lives outside the
+manifest entirely. The entry left the table rather than changing its key.
 
-**Three asset classes are accepted; one is served.** The handler re-validates into
-`StockDatasetRequest`, `CryptoDatasetRequest` or `OptionDatasetRequest` on a caller-supplied
-`asset_type`. The crypto and option callbacks are **empty synchronous functions whose body is `pass`**
-(`data/ingest/app/ingest_control.py`). They return `None`, and the handler awaits the result — so the
-failure is a `TypeError: object NoneType can't be used in 'await' expression`, not a raise from the
-stub itself. A non-Alpaca `source` on the *stock* path does raise directly:
-`NotImplementedError('Data source not implemented')`. Stock-only is the correct scope today;
-accepting an argument that will 500 is not. See gap **G8**.
+**The request carries the dataset's identity and principal.** `FetchDatasetRequest` carries `owner`,
+the dataset identity fields from S1, and the window. The caller **may** name a `feed`, but the
+adapter alone decides whether that tape can be served; `BarsResponse.feed` is the resolved one, and
+it is what `FetchAccepted` reports back. A feed that cannot be served is refused with
+`FEED_NOT_AVAILABLE` rather than quietly substituted.
 
-**A vendor failure currently arrives as success.** The broker call swallows every exception and
-returns an empty result (`tj-fe19tu`), so a vendor error, a rate-limit rejection and a vendor-side
-auth rejection all reach the caller as an *empty dataset* — indistinguishable from a legitimately
-empty interval. Two narrowings worth knowing, neither of which retracts the defect:
+**The resolved feed is stamped once per fetch, never per bar.** Every bar on the stream takes the one
+feed resolved for the whole call; the encoder raises rather than overwrite a mismatch. Downstream,
+`feed` is part of the dataset entry's identity (`tj-3mk3u5.31`), which is why an IEX request and a SIP
+request over the same window are two datasets and not one.
 
-- **A missing credential now escapes.** The client is resolved once, before any task is spawned, so a
-  *configuration* failure raises `MissingCredentialsError` by name rather than dying inside a gathered
-  task. A vendor-side auth *rejection* is still swallowed.
-- **The swallow returns a bare `{}`**, not the declared `BatchStockDataMarketActivityCreate`. The
-  caller in data_store then reads `.dataset` off it, so the observable symptom downstream is an
-  `AttributeError` — the failure is silent at the broker layer and *misattributed* at the store layer.
+**Three asset classes are accepted; one is served — and the refusal is now typed.** A non-`STOCK`
+`asset_type` is refused up front with `UNSUPPORTED_ASSET_TYPE`, as are `QUOTE` and `TRADE` data
+types. This is a real improvement over the Kafka path, where crypto and option were empty `pass`
+callbacks that returned `None` into an `await` and surfaced as
+`TypeError: object NoneType can't be used in 'await' expression`. The check sits in the handler
+rather than in the reader on purpose: `BrokerRead`'s contract does not require a reader to refuse an
+asset type it does not serve, so leaving it to the reader would make the answer depend on which
+reader is installed. The surface still *accepts* three classes and serves one, so gap **G8** stands —
+but it now fails honestly.
 
-See gaps **G1** and **G2**, which compound here.
+**A vendor failure used to arrive as success. It no longer does.** The old defect (`tj-fe19tu`) was
+that the broker call swallowed every exception and returned an empty result, so a vendor error, a
+rate-limit rejection and a vendor-side auth rejection all reached the caller as an *empty dataset*,
+indistinguishable from a legitimately empty interval — and the swallow returned a bare `{}` rather
+than the declared batch, so the observable symptom downstream was an `AttributeError` in data_store:
+silent at the broker layer, misattributed at the store layer.
 
-data_ingest declares **no REST interface at all** now — not merely none that is bound. `tj-427x50`
+`BrokerRead.get_bars` now returns either a `BarsResponse` — served, possibly empty, carrying its
+`served_range` — or a typed `BarsFailure`, and raises only for a bug. `tj-3mk3u5.11` deleted the
+Kafka edge that turned a failure into a bare `{}`, so every typed failure reaches the gRPC servicer
+and is rendered there as a `google.rpc.Status` with `ErrorInfo`. **No sentinel survives.** An empty
+result now means an empty interval, and nothing else.
+
+Gaps **G1** and **G2** still apply to what happens *after* a failure is reported — there is still no
+way to ask what a dataset's coverage is, or to see and retry a failed fetch.
+
+data_ingest declares **no REST interface at all** — not merely none that is bound. `tj-427x50`
 deleted the last member of its `InterfaceRest` enum, and with it the empty enum class and its `Enum`
-import. The component's entire declared surface is the one RPC topic above. See
+import. Its entire interface is the gRPC method above. See
 [Declarations deleted by ruling](#declarations-deleted-by-ruling-2026-09-23).
 
 ---
@@ -717,8 +776,15 @@ and this is the entry where the reasoning matters more than the verdict. `tj-3mk
 ledger on `store_dataset_entry`, which makes the entry row mutable state with a lifecycle, and
 something must advance it. **That something is the fetch pipeline itself, internally.** A
 caller-writable ledger row is the exact failure the ledger exists to prevent: it would let a client
-assert coverage that was never fetched, and removing Kafka is only safe *because* the ledger is
-authoritative about what is missing. Writable from outside, it is not authoritative.
+assert coverage that was never fetched. The ledger must be authoritative about what is missing, and
+writable from outside it is not authoritative.
+
+**Note the sequencing, because this document used to state it the other way round.** It read
+"removing Kafka is only safe *because* the ledger is authoritative". Kafka has in fact been removed
+and **the ledger has not landed** — `tj-3mk3u5.4` and `tj-3mk3u5.5` are still open. So this is an
+outstanding obligation, not a satisfied precondition: until the ledger exists there is no
+authoritative answer to what is missing, and no replacement for the consumer-group lag the removal
+took away.
 
 > **What would bring it back:** it comes back as *internal pipeline* mutation, which needs no
 > interface. If anyone proposes it as REST again, it needs **its own decision record** first, because
@@ -734,7 +800,7 @@ authoritative about what is missing. Writable from outside, it is not authoritat
 > the dataset-model PR**. See [What a create does](#what-a-create-does).
 
 **`POST /broker/{asset_type}/{symbol}/{data_type}` — a REST door into the fetch path.** The same job
-as R1, but reachable by a human or a script instead of by data_store. *Deleted as a defer, not a no —
+as the ingest fetch call, but reachable by a human or a script instead of by data_store. *Deleted as a defer, not a no —
 the capability survives, this shape of it does not.* After the gRPC move the supported way to ask
 data_ingest for data is the gRPC batch call, and a second unauthenticated REST door into the same
 fetch path would bypass the single-flight collapse and the rate budget that exist to stop vendor
@@ -782,17 +848,19 @@ will record as fetched.
 
 ## G3 · No health/readiness distinction beyond `/ping` — **REAL GAP**, with a dated trigger
 
-`GET /ping` is answered by a handler that touches nothing — no Postgres, no Kafka, no broker — and it
+`GET /ping` is answered by a handler that touches nothing — no Postgres, no gRPC, no broker — and it
 is the container healthcheck for *both* services, which `make prod-launch` and CI's `up --wait`
 block on. So a container with a dead Postgres pool, unreachable peer or exhausted broker credentials
-reports healthy, and the launch reports success. (data_store's own start waits on postgres and kafka
-being healthy, through their own probes, not on data_ingest.)
+reports healthy, and the launch reports success. (data_store's own start waits on postgres being
+healthy, through its own probe, not on data_ingest.)
 
-The gRPC work (`tj-8konfu`) already names the sharper version of this: both healthchecks probe HTTP
-`/ping`, so a container whose gRPC listener is dead still reports healthy.
+The sharper version of this is now live, not forecast: both healthchecks probe HTTP `/ping`, so a
+container whose **gRPC** listener is dead still reports healthy — and since `tj-8konfu` landed, the
+gRPC listener is the one that carries all inter-service traffic. The gap got wider when the transport
+moved, because `/ping` says even less about the service than it used to.
 
-*Recommendation:* a readiness endpoint that actually checks dependencies, landing with the gRPC work.
-`/ping` stays as liveness and keeps its current shape.
+*Recommendation:* a readiness endpoint that actually checks dependencies, the gRPC listener included.
+`/ping` stays as liveness and keeps its current shape. Still unfiled.
 
 ## G4 · No caller authentication on any route — **REAL GAP**, the blocking one
 
@@ -852,10 +920,11 @@ gap itself: nothing documents the body to a generated client.
 
 ## G8 · The surface promises three asset classes and serves one — **REAL GAP in the contract**
 
-The RPC handler re-validates into a stock, crypto or option request on a caller-supplied `asset_type`,
-and the crypto and option callbacks are empty synchronous stubs that return `None`, which the handler
-then awaits — so the caller gets a `TypeError`, not a clean rejection (R1). No exception handler is
-registered anywhere in `routers/` or `data/store/app/`, so that reaches an S1 caller as a 500.
+**The ingest half of this is fixed.** It used to be that the RPC handler re-validated into a stock,
+crypto or option request and the crypto and option callbacks were empty synchronous stubs returning
+`None` into an `await`, so the caller got a `TypeError` rather than a clean rejection. The gRPC
+handler now refuses a non-`STOCK` `asset_type` up front with `UNSUPPORTED_ASSET_TYPE`, and refuses
+`QUOTE` and `TRADE` data types the same way.
 
 The data_store internal family is **fixed**: S4 and S5 refuse an unsupported pair at the path model
 with a 422, before the handler runs. Their `UnsupportedAssetType` branch is still in the handler but
@@ -864,8 +933,9 @@ is no longer reachable over HTTP.
 Stock-only is the correct **scope** today. But an interface that accepts an argument it will 500 on is
 a contract defect regardless of scope.
 
-*Recommendation:* state stock-only in terms — done, here — and reject an unsupported `asset_type` on
-S1 and R1 with a 4xx instead of raising, the way S4 and S5 now do. Cheap.
+*Recommendation:* state stock-only in terms — done, here. The ingest side now rejects cleanly and S4
+and S5 refuse at the path model. **What is left is S1**, which still accepts an `asset_type` it
+cannot serve and discovers it only downstream; it should refuse with a 4xx of its own. Cheap.
 
 ## G9 · Nothing here touches accounts, portfolios, orders or fills — **NOT-YET**, unambiguously
 
@@ -913,15 +983,21 @@ Recorded so the next reader does not re-raise them:
 
 # What will invalidate this document
 
-This is a snapshot with named successors, not a stable reference. Four pieces of scheduled work
-rewrite it, and knowing which is more useful than any individual entry above:
+This is a snapshot with named successors, not a stable reference. Two of the four pieces of work this
+section used to forecast have now **landed**, and they are kept here with what they actually did —
+because in both cases the prediction and the outcome differ, which is the most useful thing this
+table can record:
 
-| Work | What it changes here |
-|---|---|
-| `tj-3mk3u5` — Kafka removal | Deletes C2 and C3; re-keys R1's address; changes S1's outbound hop. Rewrites the transport story. |
-| `tj-8konfu` — gRPC surface (**proposed, not accepted**) | Re-hosts R1, adds a surface this document does not cover, and should settle versioning (G11) and readiness (G3). |
-| `tj-iontkq` — monorepo split | Moves the server code under `server/`, internals unchanged. Every file path above goes stale; addresses survive. |
-| `tj-a0s7vl` — authentication | Adds a real credential to every entry, replacing both `auth: none` and the deployment-level instance secret. |
+| Work | What it changed here | Status |
+|---|---|---|
+| `tj-3mk3u5` — Kafka removal | **Predicted:** deletes C2 and C3, re-keys R1's address, changes S1's outbound hop. **Actually:** C2 and C3 *survived* — only the harness's Kafka arm went; R1 was *retired*, not re-keyed, and its replacement sits outside this manifest; S1's hop did change, as forecast. | **Landed** |
+| `tj-8konfu` — gRPC surface | Re-hosted the fetch call as `IngestService.FetchDataset` and added a contract this document does not fully cover (see `proto/README.md`). It did **not** settle versioning (G11) or readiness (G3); both are still open. | **Landed** (accepted, not "proposed") |
+| `tj-iontkq` — monorepo split | Moves the server code under `server/`, internals unchanged. Every file path above goes stale; addresses survive. | Pending |
+| `tj-a0s7vl` — authentication | Adds a real credential to every entry, replacing both `auth: none` and the deployment-level instance secret. | Pending |
+
+The two landed rows stay in the table rather than being deleted: a reader who finds an older analysis
+predicting a re-keyed R1 or a doomed C2 needs to be able to see that those predictions were not borne
+out.
 
 Pending at the time of writing, beyond those four:
 

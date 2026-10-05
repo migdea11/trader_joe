@@ -77,9 +77,9 @@ from trader_joe.proto.internal.ingest.v1 import ingest_pb2, ingest_pb2_grpc
 
 # WHAT A FETCH IS ALLOWED TO TAKE, and why it is this number.
 #
-# It is NOT the Kafka RPC's 5 s. common/kafka/rpc/kafka_rpc_client.py defaults timeout=5, and that value is
-# what this migration REPLACES, not a baseline: tj-6znw1h records a single Alpaca 429 costing about 9 s of
-# SDK sleep, which already outlives it, so the old deadline abandoned requests the vendor was still serving.
+# It is NOT the 5 s the deleted Kafka RPC client defaulted to. That value is what this migration REPLACED,
+# not a baseline: tj-6znw1h records a single Alpaca 429 costing about 9 s of SDK sleep, which already
+# outlived it, so the old deadline abandoned requests the vendor was still serving.
 #
 # Transport is not the constraint either (tj-q3zugf): gRPC's fixed per-call cost on the measured rig is
 # about 4-5 ms and its p99 at 100 concurrent 512 KiB calls was 0.076 s. Both terms are noise here.

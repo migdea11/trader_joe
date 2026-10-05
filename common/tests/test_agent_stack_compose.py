@@ -55,13 +55,12 @@ AGENT_STACK_PROJECT = 'trader_joe_agent_stack'
 # The compose sets that must never load the agent-stack overlay (or the MCP's own file).
 OTHER_COMPOSE_VARIABLES = ('PROD_COMPOSE', 'DEV_COMPOSE', 'TOOLS_COMPOSE', 'TEST_CLIENT_COMPOSE', 'AGENT_COMPOSE')
 ENV_FILE_VARIABLES = {'ROOT_ENV_FILE': 'root', 'STORE_ENV_FILE': 'store', 'INGEST_ENV_FILE': 'ingest'}
-# The seven values the overlay reads, every one through ':?' with no default (ADR addendum 2).
-OVERLAY_VARIABLES = frozenset({'DATABASE_NAME', 'BROKER_NAME', 'STORE_API_NETWORK', 'DATA_DIR', *ENV_FILE_VARIABLES})
+# The six values the overlay reads, every one through ':?' with no default (ADR addendum 2).
+OVERLAY_VARIABLES = frozenset({'DATABASE_NAME', 'STORE_API_NETWORK', 'DATA_DIR', *ENV_FILE_VARIABLES})
 # Today's env_file lists with the three variables unset, in order: root first, then the service
 # file -- the order decides which value wins in the container (ADR F1). Spelled out, not derived.
 PROD_ENV_FILES = {
     'postgres': ['.env', './data/store/.env'],
-    'kafka': ['.env', './data/ingest/.env'],
     'data_store': ['.env', './data/store/.env'],
     'data_ingest': ['.env', './data/ingest/.env'],
 }
@@ -73,7 +72,6 @@ ENV_DEFAULTS = (
 # A sample of what the MCP's generated root env supplies, for rendering the overlay in-process.
 AGENT_ENV = {
     'DATABASE_NAME': 'trader_joe_agent_stack_postgres',
-    'BROKER_NAME': 'trader_joe_agent_stack_kafka',
     'STORE_API_NETWORK': 'trader_joe_agent_stack_store_api',
     'DATA_DIR': '/stack/data',
     'ROOT_ENV_FILE': '/stack/agent_stack.env',
@@ -250,12 +248,7 @@ def test_the_base_env_files_resolve_to_todays_lists_with_the_variables_unset():
 
 def test_each_base_env_file_entry_reads_its_own_variable_with_todays_path_as_default():
     services = load(BASE_FILE)['services']
-    service_variable = {
-        'postgres': 'STORE_ENV_FILE',
-        'data_store': 'STORE_ENV_FILE',
-        'kafka': 'INGEST_ENV_FILE',
-        'data_ingest': 'INGEST_ENV_FILE',
-    }
+    service_variable = {'postgres': 'STORE_ENV_FILE', 'data_store': 'STORE_ENV_FILE', 'data_ingest': 'INGEST_ENV_FILE'}
     for name, expected in PROD_ENV_FILES.items():
         spelled = services[name]['env_file']
         assert spelled == [f'${{ROOT_ENV_FILE:-{expected[0]}}}', f'${{{service_variable[name]}:-{expected[1]}}}'], (
@@ -393,16 +386,14 @@ def test_the_overlay_covers_every_container_name_and_every_data_dir_mount():
 
 
 def test_no_service_built_from_agent_source_has_a_writable_bind():
-    """O1, addendum 5: the only writable binds are postgres's and kafka's DATA_DIR ones."""
+    """O1, addendum 5: the only writable bind is postgres's DATA_DIR one."""
     writable = {}
     for name, spec in agent_stack_model()['services'].items():
         for entry in spec.get('volumes') or []:
             mount = volume(entry)
             if mount['type'] == 'bind' and not mount['read_only']:
                 writable[(name, mount['target'])] = mount['source']
-    assert set(writable) == {('postgres', '/var/lib/postgresql/data'), ('kafka', '/var/lib/kafka/')}, (
-        f'writable binds in the agent stack: {writable}'
-    )
+    assert set(writable) == {('postgres', '/var/lib/postgresql/data')}, f'writable binds in the agent stack: {writable}'
     assert all(source.startswith('${DATA_DIR:?') for source in writable.values()), writable
 
 

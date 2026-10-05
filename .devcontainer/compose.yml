@@ -81,12 +81,28 @@ services:
       # root, so each agent worktree keeps its own. The Makefile's VENV_DIR reads this same
       # variable, so its sync marker follows it. Ignored in .gitignore, .dockerignore and ruff.
       - UV_PROJECT_ENVIRONMENT=.venv-devcontainer
+
+      # THE THIRD PATH TO AN ACCIDENTAL RE-LOCK, and the last one open. tj-3zh7ss closed the other
+      # two: the Makefile exports UV_FROZEN=1 (line 38) and CI sets it at workflow level. Neither
+      # reaches a bare `uv run` or `uv sync` TYPED IN THIS SHELL, which would re-resolve and rewrite
+      # uv.lock -- and the damage surfaces far from its cause, as a sync that quietly drops a
+      # dependency group (a stale lock is what made `make security` fail with bandit missing, and
+      # what reddened four test_security_make cases whose output named neither uv nor the lock).
+      #
+      # HERE RATHER THAN IN devcontainer.json: containerEnv/remoteEnv are applied only by the Dev
+      # Containers CLI or an IDE, while this file is what `make agent-build` reads, so a value set
+      # there would be absent from exactly the shells the agents use. NOT the Dockerfile: ENV would
+      # bake it into the image, and tj-qenrpk is reviewing that file in this same PR.
+      #
+      # `make lock` is unaffected and must stay so: it is the one deliberate re-lock and runs
+      # `env -u UV_FROZEN uv lock` (Makefile:119), which strips this for that command only.
+      - UV_FROZEN=1
     command: ["sleep", "infinity"]
     networks:
       # default keeps this project's own network, and with it the agent's own egress.
       # devnet is dev reach (decision record tj-q9ae5u, addendum 1): the dev stack joins it through
       # docker-compose.override.yaml, so from here postgres (or its container name,
-      # DATABASE_NAME), kafka, data_store and data_ingest resolve by name. A prod launch never
+      # DATABASE_NAME), data_store and data_ingest resolve by name. A prod launch never
       # attaches devnet, so this reaches no prod stack on the same machine. The agent has no
       # Docker -- no socket, no CLI -- so this is for reaching services by name, not for running
       # the system suite.

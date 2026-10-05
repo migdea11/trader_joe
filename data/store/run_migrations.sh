@@ -24,20 +24,29 @@ set -euo pipefail
 # THE ALEMBIC COMMAND IS AN ARGUMENT because that silent disagreement needs a diagnostic, and
 # the diagnostic wants every check below unchanged: the repo root, the pinned compose file, the
 # postgres check, and above all the empty-versions guard, since `alembic history` reads the same
-# bind-mounted revision files whose absence is the symptom being looked for. `make migrate-status`
-# passes the read-only commands (`current`, `history`, `check`); a second compose invocation
-# elsewhere is exactly what this script's existence is meant to prevent (tj-4yvsb2). The default is
-# `upgrade head`, so callers that pass nothing — `make migrate`, the deploy step — are unchanged.
-# Nothing here validates the command: this is the plumbing, and it is the CALLER that promises
-# read-only. Anything mutating still belongs behind a named, reviewed target.
+# bind-mounted revision files whose absence is the symptom being looked for. The inspection
+# targets call this script rather than spelling out a second compose invocation, which is exactly
+# what this script's existence is meant to prevent (tj-4yvsb2). The default is `upgrade head`, so
+# callers that pass nothing — `make migrate`, the deploy step — are unchanged. Nothing here
+# validates the command: this is the plumbing, and it is the CALLER that promises read-only.
+# Anything mutating still belongs behind a named, reviewed target.
 #
-# `check` is read-only in the same sense as the other two: it reflects the live catalogue and
-# compares it with the models, writing nothing — no stamp, no DDL (ADR tj-x3ig38, 2026-10-02
-# addendum item 8). Unlike them it EXITS NON-ZERO when they disagree, which is the point: a
-# database stamped at head whose schema has drifted (tj-5h30md) is invisible to `current`. It
-# refuses with "Target database is not up to date." when the database is behind head. Its blind
-# spots are enum labels and server defaults, neither of which autogenerate compares here — see
-# migrations/env.py.
+# `check` IS NOT READ-ONLY ON A NEVER-MIGRATED DATABASE. That was measured, not argued:
+# `alembic.command.current` passes `dont_mutate=True`; `check` does not. So `check` reaches
+# `MigrationContext.run_migrations`, which calls `_ensure_version_table()` →
+# `_version.create(self.connection, checkfirst=True)` — a CREATE TABLE. Run against a throwaway
+# never-migrated SQLite database, `current` wrote nothing and `check` wrote `alembic_version`.
+# It is read-only only against a database ALREADY AT A REVISION, and the case that reaches the
+# other branch is a real one: a first run on a new environment, or a wiped volume. There it is
+# also meaningless, which is the other half of the same fact — with no schema to compare against
+# the models, everything reads as drift. Which target runs `check`, and behind what guard, is
+# settled in the Makefile; read it there, so this comment cannot go stale against it.
+#
+# Where it does run, `check` earns its place — unlike `current` and `history` it EXITS NON-ZERO
+# when the models and the live catalogue disagree, which is the point: a database stamped at head
+# whose schema has drifted (tj-5h30md) is invisible to `current`. It refuses with "Target database
+# is not up to date." when the database is behind head. Its blind spots are enum labels and server
+# defaults, neither of which autogenerate compares here — see migrations/env.py.
 
 REPO_ROOT="$(realpath "$(dirname "$0")/../..")"
 MIGRATION_DIR="$REPO_ROOT/data/store/migrations/versions"

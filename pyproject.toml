@@ -78,7 +78,6 @@ base = [
     # major, and grpcio-health-checking 1.81.1 already holds protobuf below 7 until those pins lift.
     "protobuf>=6.33.6",
     "httpx>=0.28.1",
-    "kafka-python-ng>=2.2.3",
     "pydantic>=2.13.5",
     "python-dotenv>=1.2.3",
     "uvicorn[standard]>=0.37.0",
@@ -209,8 +208,9 @@ select = ["E", "W", "F", "I", "B", "UP", "C4", "SIM", "RUF", "TID251", "TID252",
 ignore = [
     "E501", # line length — the formatter owns it
     "E402", # module-level import not at top: FastAPI pattern (routers imported after app)
-    # PEP 695 generics: no autofix, and the 17 sites are Pydantic generic models on the
-    # cross-service contract plus the Kafka RPC layer. Migrating them is its own task.
+    # PEP 695 generics: no autofix, and the 9 sites are Pydantic generic models on the
+    # cross-service contract. Migrating them is its own task. (Count re-derived on
+    # tj-mzaub8 after the Kafka RPC layer went: it was 17 while that layer existed.)
     "UP046",
     # UP047 is the function-level half of the same PEP 695 migration (get_env_var in
     # common/environment.py), ignored on UP046's reasoning rather than a new one. It
@@ -218,10 +218,11 @@ ignore = [
     "UP047",
     # Same re-lock, and NOT cosmetic: UP042 wants `class X(str, Enum)` to become
     # enum.StrEnum, which changes what str(X.MEMBER) returns -- 'X.MEMBER' for a str-Enum,
-    # the bare value for a StrEnum. These 7 enums are serialised across the Kafka RPC
-    # contract and Pydantic schemas, so the migration needs its own task and its own
-    # tests, not a line in a dependency bump. The sites also straddle three agents'
-    # scopes (common, schemas, routers/common, data/ingest), so no one owner can do it.
+    # the bare value for a StrEnum. These 4 enums are serialised across the gRPC
+    # cross-service contract and Pydantic schemas, so the migration needs its own task and
+    # its own tests, not a line in a dependency bump. The sites also straddle two agents'
+    # scopes (schemas, routers/common, data/ingest), so no one owner can do it. (Count and
+    # transport re-derived on tj-mzaub8; it was 7 across the Kafka RPC contract.)
     "UP042",
     # docstring style, not presence
     "D100",

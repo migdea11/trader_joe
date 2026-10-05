@@ -49,7 +49,6 @@ EGRESS_NETWORKS = frozenset({'ingest_egress'})
 STORE_API_NAME = 'trader_joe_store_api'
 PROD_MEMBERSHIP = {
     'postgres': {'store_db'},
-    'kafka': {'ingest_store'},
     'data_store': {'store_db', 'ingest_store', 'store_api'},
     'data_ingest': {'ingest_store', 'ingest_egress'},
 }
@@ -292,7 +291,7 @@ def test_the_override_carries_exactly_the_three_loopback_publishes():
     actual = {name: list(service['ports']) for name, service in services.items() if 'ports' in (service or {})}
     assert actual == DEV_PUBLISHES, (
         f"{OVERRIDE_FILE.name} publishes {actual}; expected {DEV_PUBLISHES} -- the base file's "
-        f'loopback publishes, moved verbatim (kafka stays unpublished).'
+        f'loopback publishes, moved verbatim.'
     )
 
 

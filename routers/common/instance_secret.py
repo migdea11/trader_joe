@@ -39,7 +39,7 @@ has leaked a credential into a public build log twice (tj-d5jjtm, tj-10jczr).
 WHY THIS LIVES IN routers/common AND NOT IN common/: it raises HTTPException and reads a request
 header, which are HTTP transport concerns. routers/ already imports common/ and fastapi, so this
 placement adds no import direction. Putting it in common/ would push an HTTP status code into the
-library that the Kafka workers, the SQLAlchemy layer and the migrations all import, for no gain.
+library that the gRPC layer, the SQLAlchemy layer and the migrations all import, for no gain.
 """
 
 import hmac

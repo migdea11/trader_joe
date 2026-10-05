@@ -87,10 +87,10 @@ def test_the_secrets_are_random_hex_and_differ_between_generations(tmp_path: Pat
 
 
 def test_the_agent_stack_names_are_its_own_and_in_the_root_file_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """(E), the F1 rule: DATABASE_NAME, BROKER_NAME, STORE_API_NETWORK distinct from the committed ones, root only."""
+    """(E), the F1 rule: DATABASE_NAME, STORE_API_NETWORK distinct from the committed ones, root only."""
     _, _, values = _generate(tmp_path, monkeypatch)
     committed = stack.parse_env_text(committed_defaults()['.env.default'])
-    user_names = {'DATABASE_NAME': committed['DATABASE_NAME'], 'BROKER_NAME': committed['BROKER_NAME']}
+    user_names = {'DATABASE_NAME': committed['DATABASE_NAME']}
     user_names['STORE_API_NETWORK'] = 'trader_joe_store_api'
     for name, user_value in user_names.items():
         assert values['root'][name] and values['root'][name] != user_value, (name, values['root'][name])
@@ -189,7 +189,7 @@ def _edit(path: Path, **changes: str | None) -> None:
 
 
 def _assert_refused(rig, match: str) -> None:
-    for verb, arguments in (('ps', {}), ('logs', {'service': 'kafka'}), ('stack_down', {})):
+    for verb, arguments in (('ps', {}), ('logs', {'service': 'postgres'}), ('stack_down', {})):
         result = rig.call(verb, arguments)
         assert result['status'] == 'refused', result
         assert match in result['message'], result['message']
@@ -208,7 +208,6 @@ _ROOT_EDITS = {
     'ROOT_ENV_FILE outside the stack dir': ({'ROOT_ENV_FILE': '{root}/agent_stack.env'}, 'ROOT_ENV_FILE must name'),
     'DATA_DIR elsewhere': ({'DATA_DIR': '{repo}/volumes'}, 'DATA_DIR'),
     "DATABASE_NAME the user's": ({'DATABASE_NAME': 'db'}, 'DATABASE_NAME'),
-    "BROKER_NAME the user's": ({'BROKER_NAME': 'kafka'}, 'BROKER_NAME'),
     "STORE_API_NETWORK the user's": ({'STORE_API_NETWORK': 'trader_joe_store_api'}, 'STORE_API_NETWORK'),
     'a broker credential in the root file': ({'ALPACA_API_KEY': ''}, 'broker credential'),
 }

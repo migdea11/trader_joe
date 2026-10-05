@@ -13,7 +13,7 @@ Dockerfile
 **/.env
 
 # Host bind-mount data (tj-ijpys9.17). Every host data directory compose declares sits under
-# ${DATA_DIR:-./volume_data}: postgres and kafka in docker-compose.yaml, pgadmin in
+# ${DATA_DIR:-./volume_data}: postgres in docker-compose.yaml, pgadmin in
 # docker-compose.tools.yaml. .env.default sets DATA_DIR=./volumes/trader_joe/, and the fallback
 # is ./volume_data. The Postgres directory is mode 0700 and owned by the container's uid, so a
 # build started while a stack is up -- make test-system's --build, in CI after Start System --

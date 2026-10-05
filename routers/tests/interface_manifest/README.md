@@ -51,7 +51,7 @@ answer: there is no schema to name.
 - **`none`** — the component exposes nothing this manifest can enumerate, said out loud.
 
 There was a fourth, **`rpc`** — a handler registered through `KafkaRpcFactory.add_server()` while the
-module body ran. `data_ingest.manifest` held the only line that ever used it, and tj-3mk3u5.11 deletes
+module body ran. `data_ingest.manifest` held the only line that ever used it, and tj-3mk3u5.11 deleted
 the handler, so the kind went with its enumerator on tj-3mk3u5.32 rather than being kept for a
 transport with no registrations left.
 
