@@ -188,7 +188,7 @@ jobs:
         echo "gen/proto/ matches what make proto writes from proto/."
 
     # THE SAME CONTROL FOR docs/errors.md (ADR tj-fa1rpu, Q-URI addendum; tj-3mk3u5.37.10). The catalogue
-    # is generated from the one Reason table in common/errors and committed, so it can go stale exactly as
+    # is generated from the one Reason table in server/common/errors and committed, so it can go stale exactly as
     # gen/proto/ can. It regenerates through `make errors-doc`, the target a developer runs, and reads
     # `git status` rather than `git diff` for the same reason the step above does: a file that is missing
     # or untracked is stale too. The generator's own `--check` mode is the in-suite twin of this step.

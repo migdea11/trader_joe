@@ -208,17 +208,26 @@ proto: $(VENV_MARKER)  ## Regenerate gen/proto/python/ from proto/ (commit both;
 		$$(find $(PROTO_SRC) -name '*.proto' | LC_ALL=C sort)
 
 # THE ERROR CATALOGUE (ADR tj-fa1rpu, the Q-URI addendum of 2026-10-02; tj-3mk3u5.37.10). docs/errors.md
-# is generated from the ONE Reason table in common/errors, and is committed like gen/proto/ above and for
+# is generated from the ONE Reason table in server/common/errors, and is committed like gen/proto/ above and for
 # the same reason: this is the proto pattern (ADR tj-8konfu D3), one target that writes it and a CI step
 # that regenerates and fails on any difference. Nobody edits the generated file -- change the table in
-# common/errors and regenerate in the same commit. The generator is standard-library only and imports
+# server/common/errors and regenerate in the same commit. The generator is standard-library only and imports
 # common.errors and nothing else of ours, so this needs no service, no transport and no database.
 #
 # `--check` writes nothing and exits non-zero when the committed file differs, which is what the
 # validator's in-suite twin of the CI step drives; `--path` points either mode at a scratch copy.
+#
+# PYTHONPATH IS SET HERE AND THIS IS THE ONLY HOST TARGET THAT NEEDS IT (tj-iontkq.4). The generator
+# runs on the host, outside pytest, so it gets neither pytest.ini's pythonpath nor the image's ENV --
+# the two places the import root is otherwise configured. Before the trees moved, `python -m` putting
+# the working directory on sys.path was enough, because common/ sat at the repository root; it now
+# sits under server/ and that stopped being true. The roots and their order are the pair
+# tools/tests/test_errors_doc.py already derives as the two a first-party import can resolve against:
+# the server root first, as the service image has it. THE TEST KNEW AND THE INVOCATION DID NOT, which
+# is why CI broke here and the suite stayed green -- nothing in the suite runs this target.
 .PHONY: errors-doc
 errors-doc: $(VENV_MARKER)  ## Regenerate docs/errors.md from server/common/errors (commit it; CI fails on a stale file)
-	uv run python -m tools.errors_doc
+	PYTHONPATH="$(CURDIR)/server:$(CURDIR)" uv run python -m tools.errors_doc
 
 # Every compose target goes through one of these, and none omits -f. A bare
 # `docker compose` auto-loads docker-compose.override.yaml, which is what made `launch`
@@ -1375,6 +1384,13 @@ system-launch:  ## Start the stack from the prod images with data_ingest on the 
 # Behind the SAME disposable-database guard as test-system: the producer writes its scenario into
 # whatever database the default compose project's stack holds. $(VENV_MARKER), unlike test-system,
 # because the writer runs in the host venv.
+#
+# ONLY THE WRITER GETS PYTHONPATH, and the asymmetry is the point (tj-iontkq.4). The producer runs
+# INSIDE the container, where the image's own ENV already names the import root and the trees sit at
+# /code unprefixed -- the move deliberately left the container layout alone. The writer runs in the
+# HOST venv, outside pytest, so it gets neither pytest.ini's pythonpath nor the image's ENV, and
+# data.store.seeds.bundle now resolves only with server/ on the path. Same roots and order as the
+# errors-doc target above.
 SEED_OUT ?= output/seeds
 SEED_DUMP_COMPOSE := $(SYSTEM_COMPOSE) -f docker-compose.test-client.yaml
 
@@ -1383,7 +1399,7 @@ seed-dump: $(VENV_MARKER)  ## Dump a seed from the fake-mode stack into SEED_OUT
 	$(SYSTEM_TEST_DISPOSABLE_GUARD)
 	@[ -f .env ] || { echo "make seed-dump: no .env in $(CURDIR); compose interpolates the stack's credentials from it." >&2; exit 1; }
 	$(SEED_DUMP_COMPOSE) run --rm -T --entrypoint /code/.venv/bin/python test_client -m data.store.seeds $(if $(DATE),--date "$$SEED_DUMP_DATE") \
-		| $(VENV_PYTHON) -m data.store.seeds.bundle --out "$$SEED_DUMP_OUT"; \
+		| PYTHONPATH="$(CURDIR)/server:$(CURDIR)" $(VENV_PYTHON) -m data.store.seeds.bundle --out "$$SEED_DUMP_OUT"; \
 		status=("$${PIPESTATUS[@]}"); \
 		if [ "$${status[0]}" -ne 0 ]; then exit "$${status[0]}"; fi; \
 		exit "$${status[1]}"
