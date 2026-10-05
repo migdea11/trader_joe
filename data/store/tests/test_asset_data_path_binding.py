@@ -40,6 +40,7 @@ from common.enums.data_select import AssetType, DataType
 from data.store.app.database.database import async_db
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.main import app
+from data.store.tests.problem_body import validation_errors
 from routers.common.instance_secret import INSTANCE_SECRET_ENV_VAR, INSTANCE_SECRET_HEADER
 from schemas.data_store.asset_data_interface import SUPPORTED_ASSET_DATA_PAIRS
 
@@ -175,8 +176,9 @@ def test_an_unsupported_pair_answers_422_at_the_path_and_touches_nothing(
 
     response = send(method, asset_type.value, data_type.value, session)
 
-    assert response.status_code == 422, f'{method} returned {response.status_code}: {response.text}'
-    errors = response.json()['detail']
+    # problem+json since TE-6 (tj-3mk3u5.37.8): the per-field list moved from `detail`, which is now
+    # the human sentence, to `errors`. validation_errors also pins the envelope -- see its docstring.
+    errors = validation_errors(response)
     assert [(error['loc'], error['type']) for error in errors] == [(['path'], 'value_error')], errors
     message = errors[0]['msg']
     assert f'{asset_type.value}/{data_type.value}' in message, f'the refusal does not name the pair: {message!r}'
@@ -234,7 +236,6 @@ def test_a_bad_enum_value_is_still_fastapis_per_field_422(
 
     response = send(method, asset_type, data_type, session)
 
-    assert response.status_code == 422, f'{method} returned {response.status_code}: {response.text}'
-    errors = [(error['loc'], error['type']) for error in response.json()['detail']]
+    errors = [(error['loc'], error['type']) for error in validation_errors(response)]
     assert errors == [(loc, 'enum')], errors
     _assert_untouched(session)

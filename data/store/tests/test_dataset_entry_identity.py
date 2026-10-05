@@ -35,6 +35,7 @@ THE RULINGS PINNED, each traceable to tj-vhboky.1 and its amendments:
 * An update changes the range and only by growth, and never touches an identity column or the id.
 """
 
+import dataclasses
 import logging
 import re
 from datetime import UTC, datetime
@@ -43,11 +44,12 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.dialects import postgresql, sqlite
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 
 from common.database.sql_alchemy_nullable_datetime import NullableDateTime
 from common.enums.data_select import AssetType, DataType
-from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateType
+from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
+from common.errors.vocabulary import ExogenousError, Reason
 from data.store.app.database.crud.stock import store_dataset_entry as crud
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
@@ -179,8 +181,20 @@ def _update_set_columns(sql: str) -> set[str]:
     return {assignment.split('=')[0].strip().strip('"') for assignment in clause.group(1).split(', ')}
 
 
-def create_request(end: datetime | None = None, owner: str = OWNER, symbol: str = 'AAPL') -> AssetDatasetStoreCreate:
-    """A create request. end defaults to None -- the open-ended case, where the sentinel bites."""
+def create_request(
+    end: datetime | None = None, owner: str = OWNER, symbol: str = 'AAPL', feed: Feed = Feed.IEX
+) -> AssetDatasetStoreCreate:
+    """A create request. end defaults to None -- the open-ended case, where the sentinel bites.
+
+    `feed` IS THE RESOLVED TAPE, not a caller preference (tj-3mk3u5.31). AssetDatasetStoreCreate
+    declares it REQUIRED on purpose, overriding StoreAssetDatasetBody's optional field of the same
+    name, so there is no default to omit here -- a fixture that left it out stopped building at all,
+    which is how this file found out the column had landed.
+
+    Spelled as a PARAMETER rather than a constant because the tests below have to be able to move
+    it independently of everything else: feed is identity but is NOT an overlap term (tj-xn3qa6 D1),
+    so the two keys disagree about exactly this one field and no fixture that pins it can show that.
+    """
     return AssetDatasetStoreCreate(
         owner=owner,
         asset_symbol=symbol,
@@ -188,6 +202,7 @@ def create_request(end: datetime | None = None, owner: str = OWNER, symbol: str 
         data_type=DataType.MARKET_ACTIVITY,
         source=DataSource.ALPACA_API,
         granularity=Granularity.ONE_DAY,
+        feed=feed,
         start=JANUARY,
         end=end,
         expiry=FEBRUARY,
@@ -197,7 +212,12 @@ def create_request(end: datetime | None = None, owner: str = OWNER, symbol: str 
 
 
 def update_request(
-    entry_id: UUID, start: datetime = JANUARY, end: datetime | None = APRIL, owner: str = OWNER, symbol: str = 'AAPL'
+    entry_id: UUID,
+    start: datetime = JANUARY,
+    end: datetime | None = APRIL,
+    owner: str = OWNER,
+    symbol: str = 'AAPL',
+    feed: Feed = Feed.IEX,
 ) -> AssetDatasetStoreUpdate:
     return AssetDatasetStoreUpdate(
         id=entry_id,
@@ -207,6 +227,7 @@ def update_request(
         data_type=DataType.MARKET_ACTIVITY,
         source=DataSource.ALPACA_API,
         granularity=Granularity.ONE_DAY,
+        feed=feed,
         start=start,
         end=end,
         expiry=FEBRUARY,
@@ -215,13 +236,36 @@ def update_request(
     )
 
 
+def overlap_key(end: datetime | None = None, owner: str = OWNER, symbol: str = 'AAPL') -> crud.OverlapKey:
+    """What check_own_overlap takes now: the overlap key, not an entry (tj-xn3qa6 D3).
+
+    IT TAKES NO feed PARAMETER AND CANNOT BE GIVEN ONE, which is the structural half of the
+    decision rather than an omission here -- OverlapKey declares ten fields and the tape is not
+    among them. See test_the_overlap_key_has_no_tape_to_be_keyed_on.
+
+    Projected from a create request through the real `of` classmethod rather than built field by
+    field, so this helper cannot drift from the fixture every other test in this file uses: the
+    same request produces the same key, and the one difference between them stays visible.
+    """
+    return crud.OverlapKey.of(create_request(end=end, owner=owner, symbol=symbol))
+
+
 def stored_entry(
-    entry_id: UUID, start: datetime = JANUARY, end: datetime = MARCH, owner: str = OWNER, symbol: str = 'AAPL'
+    entry_id: UUID,
+    start: datetime = JANUARY,
+    end: datetime = MARCH,
+    owner: str = OWNER,
+    symbol: str = 'AAPL',
+    feed: Feed = Feed.IEX,
 ) -> StoreDatasetEntry:
     """A detached ORM instance standing in for a row already in the table.
 
     `end` takes the stored representation, so an open-ended stored entry is spelled
     NullableDateTime.EPOCH here, exactly as the column holds it.
+
+    `feed` is a real NOT NULL column now (tj-3mk3u5.31). It is settable here because
+    _find_exact_collision reads identity -- feed included -- off the STORED entry rather than off
+    the incoming request, so a test of that path needs a stored row whose tape it can choose.
     """
     return StoreDatasetEntry(
         id=entry_id,
@@ -231,6 +275,7 @@ def stored_entry(
         data_type=DataType.MARKET_ACTIVITY,
         source=DataSource.ALPACA_API,
         granularity=Granularity.ONE_DAY,
+        feed=feed,
         start=start,
         end=end,
         expiry=FEBRUARY,
@@ -402,28 +447,405 @@ async def test_the_overlap_check_excludes_an_exact_repeat_from_its_own_result_se
     )
 
 
+# THE OWN-OVERLAP REFUSAL'S EQUALITY COLUMNS, RESTATED FROM THE DESIGN AND NOT DERIVED, which
+# reverses what this file used to do here and the reversal is the point (tj-xn3qa6 D1,
+# tj-3mk3u5.31).
+#
+# Until feed landed, this set was NATURAL_KEY minus the range, and deriving it was right: the two
+# were the same set, and a derived set could not desynchronise from an amendment. They are NO
+# LONGER THE SAME SET. Identity is eleven columns and the refusal keys on eight -- identity asks
+# "is this the same dataset", the refusal asks "does this owner already hold data covering this
+# window", and only the first gets the tape. So NATURAL_KEY minus the range is now the WRONG
+# expectation and nothing derivable from the model is the right one.
+#
+# NOR IS IT DERIVED FROM crud._OVERLAP_EQUALITY_COLUMNS, which is the tempting repair and is
+# vacuous: that constant IS the thing under test, so a test reading it follows a wrong edit down
+# and stays green through exactly the regression it exists to catch. (The sibling gate in
+# schemas/tests made the same call for the same reason -- it listed the models taking a resolved
+# feed by name rather than deriving them from is_required().) Restated here, a column added to or
+# removed from the refusal reddens this test, which is what a hand-maintained list buys.
+_REFUSAL_EQUALITY_COLUMNS = {
+    'owner',
+    'asset_symbol',
+    'asset_type',
+    'data_type',
+    'source',
+    'granularity',
+    'expiry_type',
+    'update_type',
+}
+
+
 @pytest.mark.asyncio
-async def test_the_overlap_check_equates_every_non_range_identity_column():
-    """The equality prefix, DERIVED from the key rather than restated, so an amendment cannot desynchronise it.
+async def test_the_overlap_check_equates_exactly_the_eight_columns_the_refusal_keys_on():
+    """The equality prefix, pinned in BOTH directions against a restated list.
 
-    Two rows only conflict when they are the same dataset, which means every identity column but
-    the range pair must be compared. Drop one and the check WIDENS: a different granularity, a
-    different source or a different data type starts reading as a collision, and a legitimate
-    create is rejected with someone else's id. Nothing else here notices -- only `owner` was
-    pinned, by test_the_overlap_check_is_scoped_to_the_requesting_owner.
+    Two rows only conflict when the owner already holds data covering this window, which means
+    every identity column but the range pair AND THE TAPE must be compared. Drop one and the check
+    WIDENS: a different granularity, a different source or a different data type starts reading as
+    a collision, and a legitimate create is rejected with someone else's id. Nothing else here
+    notices -- only `owner` is otherwise pinned, by
+    test_the_overlap_check_is_scoped_to_the_requesting_owner.
 
-    Derived the way test_the_insert_names_every_identity_column derives its set, because this set
-    has already moved once: tj-rh4b7f took it from nine columns to eight when `feed` was deferred
-    off the entry. A restated list would have had to be edited by hand then, and will again.
+    ADD one -- feed being the only candidate -- and the check NARROWS, which is the regression in
+    the other direction and the one tj-xn3qa6 D1 was written to prevent: a feed term makes the
+    refusal depend on a value only FetchAccepted carries, so the check could no longer run before
+    the stream and tj-hywf7w's saving (a 409 that costs no vendor call) silently becomes nominal.
+    Equality rather than a one-sided `missing` check is what catches that half.
     """
     db = FakeSession(FakeResult([]), FakeResult([(uuid4(),)]))
 
     await crud.upsert_entry(db, create_request(end=MARCH))
 
-    expected = set(StoreDatasetEntry.NATURAL_KEY) - {'start', 'end'}
+    # start and end are expected here and are NOT part of the prefix: they come from the
+    # exact-repeat exclusion, NOT(existing.start = request.start AND existing.end = request.end),
+    # which _equality_columns cannot tell from a prefix term because both spell `column =`. The
+    # exclusion has its own tests (test_the_overlap_check_excludes_an_exact_repeat_from_its_own_
+    # result_set and the two bound-predicate tests); naming the pair here rather than subtracting
+    # it keeps this assertion two-sided, so a ninth equality column still shows up as an extra.
     compared = _equality_columns(_sql(db.statements[0]))
-    missing = sorted(expected - compared)
-    assert missing == [], f'the overlap check ignores identity columns, so it reports false conflicts: {missing}'
+    expected = _REFUSAL_EQUALITY_COLUMNS | {'start', 'end'}
+    assert compared == expected, (
+        'the own-overlap refusal does not key on exactly the eight columns the design gives it: '
+        f'missing {sorted(expected - compared)}, extra {sorted(compared - expected)}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_overlap_check_does_not_equate_the_tape_although_it_is_identity():
+    """tj-xn3qa6 D1, asserted as its own claim rather than as a side effect of the set above.
+
+    THE TWO KEYS ARE DIFFERENT KEYS. This is the single column they disagree about, so it is the
+    whole content of the decision, and it is stated here separately so that the reason survives a
+    future edit to the eight-column list: a reader who sees only an equality assertion learns that
+    feed is absent, not that its absence is deliberate.
+
+    The second assertion is what keeps the first one honest. "feed is not an equality term" is also
+    trivially true of a build in which feed is not a column at all -- which is what HEAD looked
+    like before tj-3mk3u5.31 -- so this test would have passed for the wrong reason throughout the
+    deferral. Pinning that feed IS in NATURAL_KEY makes the pair say what it means: the column
+    exists, it is identity, and the refusal still does not read it.
+    """
+    db = FakeSession(FakeResult([]), FakeResult([(uuid4(),)]))
+
+    await crud.upsert_entry(db, create_request(end=MARCH))
+
+    compared = _equality_columns(_sql(db.statements[0]))
+    assert 'feed' not in compared, (
+        'the own-overlap refusal keys on feed, so it now depends on a value only FetchAccepted '
+        'carries and cannot run before the stream (tj-xn3qa6 D1)'
+    )
+    assert 'feed' in StoreDatasetEntry.NATURAL_KEY, (
+        'feed is not an identity column, so the assertion above passes vacuously -- it would hold '
+        'of a build with no feed column at all (tj-f2qz44)'
+    )
+
+
+def test_the_overlap_key_has_no_tape_to_be_keyed_on():
+    """The STRUCTURAL half of tj-xn3qa6 D1, which is the half that cannot be undone by accident.
+
+    The test above reads the SQL and so describes one build of _find_own_overlap. This one reads
+    the TYPE: OverlapKey declares ten fields and `feed` is not one of them, so there is no tape in
+    the value the refusal is handed and a feed term cannot be added to the refusal without first
+    changing this type. That is a much louder edit than adding a string to a tuple, and it is why
+    the builder's answer to D3 is better than passing feed=None.
+
+    THE SECOND ASSERTION IS THE ONE WITH TEETH. "feed is absent" is also true of a nine-field key
+    that dropped `source`, or of an empty dataclass, so the exact field set is pinned too -- a
+    refusal that silently stopped keying on granularity would otherwise read as this test's
+    success.
+    """
+    declared = tuple(key_field.name for key_field in dataclasses.fields(crud.OverlapKey))
+
+    assert 'feed' not in declared, (
+        'OverlapKey carries a tape, so the own-overlap refusal can be keyed on a value only '
+        'FetchAccepted carries and the check can no longer run before the stream (tj-xn3qa6 D1)'
+    )
+    assert declared == (
+        'owner',
+        'asset_type',
+        'asset_symbol',
+        'data_type',
+        'source',
+        'granularity',
+        'expiry_type',
+        'update_type',
+        'start',
+        'end',
+    ), f'the overlap key is not the ten fields tj-xn3qa6 D3 names: {declared}'
+
+
+def test_the_identity_key_is_the_refusal_key_plus_the_tape():
+    """The RELATIONSHIP between the two key constants, which is the thing the design actually states.
+
+    Derived on purpose, and the hazard that usually makes deriving wrong does not apply: this test
+    makes no claim about what either tuple CONTAINS -- test_the_overlap_check_equates_exactly_the_
+    eight_columns_the_refusal_keys_on owns that, from a restated list -- only that identity is the
+    refusal's columns with the tape appended and nothing else. A column added to one and forgotten
+    in the other reddens here; a column added wrongly to both reddens there.
+
+    WHY IT IS WORTH A TEST AT ALL: the two tuples are one `*` splat apart in the source today, so
+    the relationship looks self-evident. It is exactly the kind of thing a later edit "unrolls" for
+    readability, and the first divergence after that is silent -- a search filter or an ON CONFLICT
+    keyed on nine columns while the refusal keys on eight is not a syntax error.
+    """
+    # The computed side first: ruff reads an UPPER_CASE attribute as the constant of the comparison
+    # (SIM300), so the module constant goes on the right.
+    expected_identity = (*crud._OVERLAP_EQUALITY_COLUMNS, 'feed')
+    assert expected_identity == crud._IDENTITY_EQUALITY_COLUMNS, (
+        'identity is no longer the own-overlap key plus the tape, so the two keys have drifted: '
+        f'refusal {crud._OVERLAP_EQUALITY_COLUMNS}, identity {crud._IDENTITY_EQUALITY_COLUMNS}'
+    )
+
+
+def test_the_tape_sits_last_among_the_identity_key_s_equality_columns():
+    """The ORDERING ruling, which is about an index and is invisible to every other test here.
+
+    NATURAL_KEY's order is the order of the unique index behind it. A unique constraint is
+    order-blind, so nothing about correctness moves if feed moves -- but the own-overlap refusal
+    does NOT filter on feed and DOES filter on the other eight, so a feed sitting anywhere earlier
+    truncates the index prefix that check can use at feed. Last among the equality columns, and
+    immediately before the range, keeps the eight contiguous and leading.
+
+    Asserted as a POSITION rather than as the whole tuple so that the claim is the ruling and not
+    an incidental spelling: a column legitimately added later moves the literal tuple and must not
+    redden this.
+    """
+    key = StoreDatasetEntry.NATURAL_KEY
+    assert key[-3:] == ('feed', 'start', 'end'), (
+        'feed is not the last equality column before the range, so the own-overlap check loses the '
+        f'index prefix it does not need feed for (tj-3mk3u5.31): {key}'
+    )
+    assert len(key) == 11, f'the entry identity is not eleven columns: {key}'
+
+
+# ---------------------------------------------------------------------------------------------
+# check_own_overlap: the check as a thing a caller holds, and WHICH caller now holds it (tj-hywf7w)
+#
+# 12e1251 split the own-overlap refusal out of upsert_entry_in_transaction into a public
+# check_own_overlap, so that the dataset path can run it BEFORE it opens the FetchDataset stream --
+# ingest performs its vendor call and takes a rate-budget slot before it yields the ack, so a check
+# that ran on the ack had already cost a live fetch for a request that was about to be refused.
+#
+# IT WAS MOVED, NOT COPIED, and that is the contract this section exists for. Every test above
+# drives upsert_entry, the COMMITTING wrapper, which still runs the check -- so all of them stayed
+# green through the split and none of them can see it. Nothing anywhere pinned that the IN-
+# TRANSACTION core no longer runs it, which is exactly the thing a future caller gets silently
+# wrong: reach for upsert_entry_in_transaction because you own the transaction, and you skip the
+# overlap check entirely with no error and no red test. The two cases at the end of this section are
+# a PAIR and must be read as one claim -- the check is on the wrapper, and it is NOT on the core.
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_check_own_overlap_raises_naming_every_colliding_id_and_sends_only_its_select():
+    """The new public symbol, driven directly rather than through either of its two callers.
+
+    Both ids, not just the first: one request can overlap several of the same owner's datasets and a
+    caller builds auto-extend by reading the whole set, so an implementation returning
+    ``result.first()`` would satisfy a one-id assertion and strand a caller on the second collision.
+    That property is also asserted through upsert_entry above; what is new here is that it is
+    asserted of the FUNCTION, which now has callers that are not upsert_entry.
+
+    EXACTLY ONE STATEMENT, AND IT IS A SELECT, is the half that makes this a check rather than a
+    write. The dataset path runs this inside its transaction but before anything else, so anything
+    this function sent beyond its own probe would be issued for every fetch and, on the refusal path,
+    for a request that is about to be refused.
+    """
+    first, second = uuid4(), uuid4()
+    db = FakeSession(FakeResult([(first,), (second,)]))
+
+    with pytest.raises(crud.OwnOverlapConflict) as raised:
+        await crud.check_own_overlap(db, overlap_key())
+
+    assert raised.value.colliding_ids == [first, second], 'the refusal does not name every colliding dataset'
+    assert len(db.statements) == 1, f'check_own_overlap sent {len(db.statements)} statements, not just its probe'
+    assert _sql(db.statements[0]).startswith('SELECT'), 'the overlap check is no longer a select'
+
+
+@pytest.mark.parametrize('collision_count', [1, 2], ids=['one-colliding-dataset', 'two-colliding-datasets'])
+@pytest.mark.asyncio
+async def test_the_colliding_ids_metadata_says_the_same_as_the_attribute(collision_count: int):
+    """TWO COPIES OF ONE FACT, and the 409 body is built from the one nothing else pins.
+
+    TE-6 re-parented OwnOverlapConflict onto InvalidRequestError and gave it
+    ``metadata={'colliding_ids': [...]}``, because an extension member of a problem+json body can
+    only come from metadata (METADATA_KEYS is the allowlist). The class ALSO keeps its original
+    ``colliding_ids`` attribute, which is what every existing assertion in this file reads and what
+    a Python caller catching the exception uses.
+
+    SO THE SAME FACT IS NOW STORED TWICE, BY HAND, IN ONE CONSTRUCTOR, and nothing made them agree.
+    A constructor that passed the attribute but built the metadata from a stale local, sliced it,
+    or forgot to stringify leaves every attribute assertion in this file green while the 409 body
+    -- the thing tj-vhboky.8's caller contract is actually about -- carries the wrong ids or none.
+    The route-level case in test_store_dataset_entry_route.py would catch the body being wrong; it
+    could not say the attribute and the member had diverged, which is the shape of the bug.
+
+    THE METADATA IS STRINGS and the attribute is UUIDs: metadata values are str or sequences of str
+    by the vocabulary's own rule, since the raiser formats them so every renderer writes the same
+    text. So they are compared after stringifying, which is the conversion the constructor must do.
+
+    Args:
+        collision_count: How many of the owner's own datasets the request is told it overlaps.
+    """
+    colliding = [uuid4() for _ in range(collision_count)]
+    db = FakeSession(FakeResult([(entry_id,) for entry_id in colliding]))
+
+    with pytest.raises(crud.OwnOverlapConflict) as raised:
+        await crud.check_own_overlap(db, overlap_key())
+
+    assert list(raised.value.metadata['colliding_ids']) == [str(entry_id) for entry_id in raised.value.colliding_ids], (
+        f'the colliding_ids ATTRIBUTE says {raised.value.colliding_ids} and the METADATA says '
+        f'{raised.value.metadata["colliding_ids"]}. The problem+json body is built from the metadata, '
+        f'so these drifting apart means a caller reading the 409 gets different ids from one catching '
+        f'the exception.'
+    )
+    assert list(raised.value.metadata['colliding_ids']) == [str(entry_id) for entry_id in colliding], (
+        'the metadata does not name the ids the overlap select actually returned'
+    )
+
+
+@pytest.mark.parametrize(
+    'refusal',
+    [lambda ids: crud.OwnOverlapConflict(ids), lambda ids: crud.RangeCollision(ids[0])],
+    ids=['own-overlap-conflict', 'range-collision'],
+)
+def test_no_refusal_detail_carries_a_python_repr(refusal):
+    """tj-8feral: `detail` is read by a human who is not us, so it may not publish our language.
+
+    WHAT IT RENDERED. OwnOverlapConflict interpolated its `list[uuid.UUID]` straight into the
+    sentence, and a list formats its elements with repr(), so an operator and an SDK user read
+    "Overlaps existing dataset(s) of the same owner: [UUID('1111-...'), UUID('2222-...')]".
+
+    WHY IT IS WORTH A TEST THOUGH IT IS COSMETIC. RFC 9457 says a client never parses `detail` and
+    colliding_ids carries clean strings alongside, so nothing was broken. But this repo is the
+    public, generic framework consumed through a typed client SDK: `UUID(...)` tells a Go or
+    TypeScript caller's user that they are talking to Python, in the one field whose whole job is to
+    be read by a human. data/ingest's pitfall 4 already rules against the same shape with the vendor
+    in place of the standard library.
+
+    SUBSTRING-ABSENCE, DELIBERATELY, AND NOT THE TEXT. The rendering was NEVER PINNED -- the
+    existing assertion is that the sentence names every colliding id, which was true of both forms
+    -- and that restraint is why the fix was one line and not a negotiation. Pinning the exact
+    sentence now would re-create the problem for whoever next improves the wording. So this asserts
+    the one thing that must not come back, plus that the ids are still named.
+
+    BOTH REFUSALS, because they now share one helper. RangeCollision never had the defect -- a bare
+    UUID str()s correctly -- but it was rewritten the same way so the two cannot drift, and a test
+    of only the one that was broken would not notice the other acquiring a second id and a list.
+
+    Args:
+        refusal: Builds the refusal from a list of colliding ids.
+    """
+    ids = [uuid4(), uuid4()]
+    raised = refusal(ids)
+
+    assert 'UUID(' not in raised.detail, (
+        f'the refusal detail carries a Python repr, which publishes the server implementation '
+        f'language into a language-neutral contract (tj-8feral): {raised.detail!r}'
+    )
+    assert '[' not in raised.detail and ']' not in raised.detail, (
+        f'the refusal detail interpolates a collection, which is how the repr got in: {raised.detail!r}'
+    )
+    named = [str(entry_id) for entry_id in ids if str(entry_id) in raised.detail]
+    assert named, f'the refusal detail names none of the colliding ids: {raised.detail!r}'
+
+
+@pytest.mark.asyncio
+async def test_check_own_overlap_neither_commits_nor_rolls_back_on_either_outcome():
+    """IT OWNS NO TRANSACTION, on the passing path and on the raising one alike.
+
+    This is the property that makes hoisting it legal at all. The dataset path calls it INSIDE a
+    ``write_transaction`` it opened itself and then goes on to open a stream and write pages in that
+    same transaction; upsert_entry calls it inside its own. A commit here would end the caller's
+    transaction before its first write, and a rollback here would double the one the caller's
+    helper already performs on the way out -- and test_dataset_fetch_transaction.py's
+    ``session.rollbacks == 1`` is what would catch the second only on the paths that fail.
+
+    BOTH OUTCOMES ARE DRIVEN because they are different code, and the raising one is the one that
+    looks like it wants a rollback: a function that refuses a request reads as if it should clean up
+    after itself. It must not. ``write_transaction`` rolls back any exception leaving the block,
+    OwnOverlapConflict included, and already pins that it is not logged as a database error.
+    """
+    passing = FakeSession(FakeResult([]))
+    await crud.check_own_overlap(passing, overlap_key())
+    assert (passing.commits, passing.rollbacks) == (0, 0), 'the overlap check ended a transaction it does not own'
+
+    refusing = FakeSession(FakeResult([(uuid4(),)]))
+    with pytest.raises(crud.OwnOverlapConflict):
+        await crud.check_own_overlap(refusing, overlap_key())
+    assert (refusing.commits, refusing.rollbacks) == (0, 0), (
+        'the overlap check rolled back on refusal, so the failure path rolls back twice -- once here '
+        "and once in the caller's write_transaction"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_in_transaction_core_does_not_run_the_overlap_check():
+    """HALF ONE OF THE PAIR: upsert_entry_in_transaction was relieved of the check, not given a copy.
+
+    WHY THIS NEEDS A TEST OF ITS OWN, measured rather than assumed. Leaving a second copy of the
+    check in the core is the plausible wrong repair -- it looks strictly safer, it narrows the
+    check-to-insert window the hoist widens, and it is what "add the check to the caller" most
+    naturally becomes. It is also GREEN across every other case in this file and in
+    test_dataset_fetch_transaction.py, except for the journals, because a redundant SELECT answering
+    "no overlap" changes no outcome on any path those cases drive. What it costs in production is an
+    identical second SELECT on every successful fetch, for a race a re-check narrows but cannot
+    close (no lock is taken; the unique key catches only exact repeats). The builder made that call
+    deliberately and the architect is ruling on it; this case is what makes the ruling observable.
+
+    THE SESSION ANSWERS A COLLISION, which is what makes the assertion strong. If the core ran the
+    check it would read that row set and raise OwnOverlapConflict, so a copied-back check reds here
+    on the exception rather than on a statement count. Because the core does not, the row set is
+    consumed by the INSERT's RETURNING instead -- one statement, and the id comes back.
+
+    NO COMMIT AND NO ROLLBACK is asserted for the same reason as on check_own_overlap: this is the
+    non-committing core and its caller owns the transaction.
+    """
+    returned_id = uuid4()
+    db = FakeSession(FakeResult([(returned_id,)]))
+
+    returned = await crud.upsert_entry_in_transaction(db, create_request())
+
+    assert returned == returned_id
+    assert len(db.statements) == 1, (
+        f'upsert_entry_in_transaction sent {len(db.statements)} statements. The own-overlap check was '
+        f'MOVED out of it to check_own_overlap (tj-hywf7w), not copied: a second probe here is an '
+        f'identical SELECT on every successful fetch, since the caller has already run it'
+    )
+    assert _sql(db.statements[0]).startswith('INSERT'), 'the in-transaction core sends something other than its upsert'
+    assert (db.commits, db.rollbacks) == (0, 0), 'the non-committing core ended a transaction it does not own'
+
+
+@pytest.mark.asyncio
+async def test_the_committing_wrapper_still_runs_the_overlap_check_before_its_insert():
+    """HALF TWO OF THE PAIR: upsert_entry, which owns its transaction, kept the check.
+
+    The companion to the case above, and the reason the two are written together. Each on its own is
+    satisfied by a check that exists in neither place: delete ``check_own_overlap`` from
+    ``upsert_entry`` and the core case stays green, because it says nothing about the wrapper. A
+    caller that writes one entry and nothing else -- which is what this wrapper is for, and what the
+    POST /store route reaches when it is not fetching -- would then insert over an overlap with no
+    refusal at all.
+
+    The no-INSERT ordering half is test_the_overlap_check_runs_before_any_insert_is_sent's, above,
+    and is not restated. What this adds is the SEQUENCE: select THEN insert, in one transaction the
+    wrapper commits, on the path where there is no overlap. That is what the split had to preserve
+    and it is what "the committing wrapper is unchanged" means.
+    """
+    entry_id = uuid4()
+    db = FakeSession(FakeResult([]), FakeResult([(entry_id,)]))
+
+    returned = await crud.upsert_entry(db, create_request())
+
+    assert returned == entry_id
+    kinds = [_sql(statement).split()[0] for statement in db.statements]
+    assert kinds == ['SELECT', 'INSERT'], (
+        f'upsert_entry sent {kinds}. It owns its transaction and nothing expensive runs inside it, so '
+        f'it keeps the own-overlap check next to its insert (tj-hywf7w); a lone INSERT means a caller '
+        f'that writes a single entry no longer has its overlap refused at all'
+    )
+    assert (db.commits, db.rollbacks) == (1, 0), 'the committing wrapper no longer commits its own transaction'
 
 
 # ---------------------------------------------------------------------------------------------
@@ -861,6 +1283,24 @@ async def test_a_database_error_rolls_back_once_and_leaves_as_the_original_error
     assertion is identity, not type: a wrapper of any type, or a copy, fails here. The (0, 1)
     commit/rollback check is unchanged by that ruling.
 
+    ADDENDUM (validator, gating tj-3mk3u5.37.8): tj-fa1rpu IS RULED, AND THIS IS NOW THE BUG BRANCH.
+    The paragraph above says "with no wrapper type until tj-fa1rpu is ruled"; TE-6 ruled it, and
+    write_transaction now converts a SQLAlchemyError it can CLASSIFY into a typed ExogenousError.
+    These 9 cases did not go red, and the reason is the fixture rather than the design: ErroringSession
+    raises a bare ``SQLAlchemyError``, which is not a DBAPIError, carries no SQLSTATE and is none of
+    OperationalError / InterfaceError / IntegrityError -- so ``_reason_for`` returns None and the
+    helper takes its OTHER branch, re-raising unchanged because an unclassifiable error is a bug of
+    ours (D5). Identity is therefore still exactly right here, and these cases are still a genuine
+    pin -- of the bug branch.
+
+    THAT WAS AN ACCIDENT UNTIL NOW AND IS A DECISION FROM NOW ON. Nothing recorded which branch the
+    fixture selected, so a later edit making the fixture's error an OperationalError -- the obvious
+    "let's use a realistic error" tidy-up -- would have flipped all 9 cases to the conversion branch
+    and reported the identity assertion as a regression in production rather than in the fixture. The
+    assertion below makes the choice explicit, and the conversion branch gets its own case after this
+    one, so the two are visibly a pair rather than one of them being whatever the fixture happened to
+    produce.
+
     Args:
         case: (the write, the statement whose execute raises), and the case id a red is reported under.
     """
@@ -874,8 +1314,47 @@ async def test_a_database_error_rolls_back_once_and_leaves_as_the_original_error
 
     assert len(db.statements) == len(answers) + 1, 'the error was not raised by the statement this case targets'
     assert (db.commits, db.rollbacks) == (0, 1), f'{case} did not roll back exactly once without committing'
+    assert not isinstance(raised.value, ExogenousError), (
+        f'{case} was CONVERTED to a reason. This case is the bug branch, selected by the fixture '
+        f'raising a bare SQLAlchemyError that _reason_for cannot classify; if the fixture now raises '
+        f'something classifiable, that is a fixture change and the identity assertion below is the '
+        f'wrong one to keep -- see the conversion case that follows.'
+    )
     assert raised.value is db.error, f'{case} did not leave as the original error: {raised.value!r}'
     assert raised.value.__cause__ is None, f'{case} gained a chained cause: {raised.value.__cause__!r}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('write', list(_SUCCESS_ANSWERS), ids=list(_SUCCESS_ANSWERS))
+async def test_a_classifiable_database_error_reaches_every_write_as_its_reason(write: str):
+    """The conversion branch, through each crud write rather than through the helper alone.
+
+    THE COMPANION TO THE CASE ABOVE, and the half the bare-SQLAlchemyError fixture cannot reach.
+    test_write_transaction.py proves the classification table exhaustively; what it cannot show is
+    that each of THESE functions actually goes through the helper, so that a caller of any of them
+    gets the typed answer. A write that kept its own try/except -- which is what every one of them
+    had before d43582f -- would re-raise the OperationalError raw, answer a 500 instead of a 503,
+    and leave every assertion in this file green.
+
+    The first statement raises, so this reaches each write at its earliest database contact and does
+    not depend on how many statements that write goes on to send.
+
+    Args:
+        write: The crud write under test.
+    """
+    entry_id = uuid4()
+    db = ErroringSession(0)
+    db.error = OperationalError('SELECT ...', {}, Exception('server closed the connection'))
+
+    with pytest.raises(ExogenousError) as raised:
+        await _WRITES[write](db, entry_id)
+
+    assert raised.value.reason is Reason.DATABASE_UNAVAILABLE, (
+        f'{write} reported an OperationalError as {raised.value.reason}, so it is not going through '
+        f'write_transaction or the helper is not classifying it'
+    )
+    assert raised.value.__cause__ is db.error, f'{write} lost the original error from the cause chain'
+    assert (db.commits, db.rollbacks) == (0, 1), f'{write} did not roll back exactly once without committing'
 
 
 @pytest.mark.asyncio
@@ -1159,7 +1638,7 @@ async def test_a_grow_that_collides_names_the_other_entry_and_sends_no_update():
 async def test_the_collision_check_reads_identity_off_the_stored_entry_not_the_request():
     """The request's non-range fields are untrustworthy here, and this is the test that says so.
 
-    An extension may change only start and end, so the other eight identity columns come off the
+    An extension may change only start and end, so the other nine identity columns come off the
     stored row. Reading them off the request instead would let a caller send a different symbol and
     have the collision searched for under that symbol -- a check that passes while the real
     collision stands. The request below names MSFT; the stored entry is AAPL, and AAPL is what must
@@ -1176,6 +1655,42 @@ async def test_the_collision_check_reads_identity_off_the_stored_entry_not_the_r
     assert 'AAPL' in bound, 'the collision check trusted the request instead of the stored entry'
     assert 'MSFT' not in bound, 'the request could redirect the collision check to another symbol'
     assert 'store_dataset_entry.id !=' in _sql(collision_select), 'the entry is not excluded from its own collision set'
+
+
+@pytest.mark.asyncio
+async def test_the_grow_collision_check_keys_on_the_tape_unlike_the_own_overlap_refusal():
+    """THE OTHER SIDE OF tj-xn3qa6 D1, and the one the decision record does not spell out.
+
+    _find_exact_collision asks "would this grow make `existing` the SAME DATASET as another row",
+    which is the eleven-column unique constraint's question, so it keys on IDENTITY -- the tape
+    included. _find_own_overlap asks a different question and keys on eight. The two are therefore
+    deliberately inconsistent with each other, and that is the single most likely thing for a later
+    reader to "fix": both are overlap-ish checks over the same table in the same module, and one
+    reading `_OVERLAP_EQUALITY_COLUMNS` looks like the tidier code.
+
+    WHAT THE "TIDY" VERSION BREAKS, which is why this is a test and not a comment: left feed-blind,
+    a grow whose new range lands exactly on ANOTHER TAPE's entry is refused with a 409 naming that
+    entry -- a write Postgres would have accepted quite happily, because the two rows differ in
+    feed and so do not collide on the constraint. A spurious refusal of a legitimate extension,
+    reported against someone else's dataset id.
+
+    DRIVEN THROUGH update_entry, so it is the statement the real path builds. The stored entry is
+    SIP; the assertion is that the tape is bound and that it is the STORED one, since the same
+    argument that sends the other identity columns to the stored row sends this one there too.
+    """
+    entry_id = uuid4()
+    db = FakeSession(FakeResult([(stored_entry(entry_id, end=MARCH, feed=Feed.SIP),)]), FakeResult([]), FakeResult([]))
+
+    await crud.update_entry(db, update_request(entry_id, end=APRIL, feed=Feed.IEX))
+
+    collision_select = db.statements[1]
+    assert 'store_dataset_entry.feed =' in _sql(collision_select), (
+        "the grow-collision check is feed-blind, so an extension landing on another tape's entry "
+        'is refused with a 409 the database would not have raised (tj-xn3qa6 D1)'
+    )
+    bound = list(_params(collision_select).values())
+    assert Feed.SIP in bound, 'the collision check does not bind the STORED tape'
+    assert Feed.IEX not in bound, 'the request could redirect the collision check to another tape'
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1340,15 +1855,22 @@ _KEY_BASE: dict = {
     'granularity': Granularity.ONE_DAY,
     'expiry_type': ExpiryType.ROLLING,
     'update_type': UpdateType.STATIC,
+    'feed': Feed.IEX,
     'start': JANUARY,
     'end': None,
     'expiry': FEBRUARY,
 }
 
-# One entry per identity field of tj-vhboky.1 section 2, as amended by tj-rh4b7f: feed is NOT an
-# entry field any more, so there are ten, not the eleven tj-ilo73k was written against. This is
-# the DESIGN's list, written out on purpose -- test_every_entry_key_column_has_a_one_field_case
-# compares it against the model so that neither can move without the other.
+# One entry per identity field of tj-vhboky.1 section 2. ELEVEN now: tj-rh4b7f took the key from
+# eleven to ten by DEFERRING feed off the entry, and tj-3mk3u5.31 put it back (closing tj-f2qz44),
+# so the list is the one tj-ilo73k was originally written against again. This is the DESIGN's list,
+# written out on purpose -- test_every_entry_key_column_has_a_one_field_case compares it against
+# the model so that neither can move without the other.
+#
+# feed's case is the one tj-f2qz44 is ABOUT: an IEX request and a SIP request over the same window
+# must not resolve to one entry. It is the only member of this list that is identity WITHOUT being
+# an own-overlap term (tj-xn3qa6 D1), which is why the overlap section above pins its own column
+# set separately instead of deriving both from one list.
 _ONE_FIELD_CHANGES: dict = {
     'owner': 'strategy-b',
     'asset_symbol': 'MSFT',
@@ -1358,6 +1880,7 @@ _ONE_FIELD_CHANGES: dict = {
     'granularity': Granularity.ONE_HOUR,
     'expiry_type': ExpiryType.BUFFER_1K,
     'update_type': UpdateType.DAILY,
+    'feed': Feed.SIP,
     'start': FEBRUARY,
     'end': MARCH,
 }
@@ -1432,9 +1955,9 @@ def test_every_entry_key_column_has_a_one_field_case():
     """The model's key and the design's field list, compared both ways.
 
     A column added to the constraint without a case here would be an identity field nothing pins;
-    one removed from it reddens its case above and this. feed coming back onto the entry
-    (tj-rh4b7f defers it to the gRPC transport work) lands here first, which is the prompt to add
-    its case deliberately rather than by accident.
+    one removed from it reddens its case above and this. That is exactly how feed arrived: this
+    test went red when tj-3mk3u5.31 put it back on the key, which was the prompt to add its case
+    deliberately rather than by accident.
     """
     constraints = [
         c for c in StoreDatasetEntry.__table__.constraints if c.name == StoreDatasetEntry.NATURAL_KEY_CONSTRAINT

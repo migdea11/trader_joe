@@ -188,3 +188,20 @@ class FetchDone(InboundContract):
     served_range: ServedRange
     # When the vendor answered. UTC.
     as_of: AwareDatetime
+
+
+type FetchEvent = FetchAccepted | BarPage | FetchDone
+"""What a fetch yields, in order: the accepted ack, then zero or more pages, then the done.
+
+ONE HOME, AND IT IS HERE BECAUSE THIS IS A DOMAIN FACT (tj-47tzic). The union says what a fetch
+produces, not how it travels, so it belongs beside the three models it unions and not in either
+transport seam. Both common/rpc/ingest.py's FetchDatasetHandler and
+common/rpc/clients/ingest_fetch.py's IngestFetchClient import this one alias, which is what makes
+decision tj-tkm4tn D1's "one test double serves both ends" structural rather than coincidental.
+
+IT USED TO BE DECLARED TWICE, once per seam, with identical text (ADDENDUM 2 to tj-tkm4tn). Being
+PEP 695 aliases the two were distinct TypeAliasType objects that compare UNEQUAL, so the mirror
+rested on nobody editing one side alone; a fourth arm on either would have left every double still
+type-checking against the end it was written for. Re-declaring a local copy in a seam, or
+re-exporting this name from common/rpc as a convenience, brings that back in a new shape.
+"""

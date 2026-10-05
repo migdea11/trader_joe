@@ -178,6 +178,19 @@ proto: $(VENV_MARKER)  ## Regenerate gen/proto/python/ from proto/ (commit both;
 	uv run python -m grpc_tools.protoc -I$(PROTO_SRC) --python_out=$(PROTO_GEN) --grpc_python_out=$(PROTO_GEN) --pyi_out=$(PROTO_GEN) \
 		$$(find $(PROTO_SRC) -name '*.proto' | LC_ALL=C sort)
 
+# THE ERROR CATALOGUE (ADR tj-fa1rpu, the Q-URI addendum of 2026-10-02; tj-3mk3u5.37.10). docs/errors.md
+# is generated from the ONE Reason table in common/errors, and is committed like gen/proto/ above and for
+# the same reason: this is the proto pattern (ADR tj-8konfu D3), one target that writes it and a CI step
+# that regenerates and fails on any difference. Nobody edits the generated file -- change the table in
+# common/errors and regenerate in the same commit. The generator is standard-library only and imports
+# common.errors and nothing else of ours, so this needs no service, no transport and no database.
+#
+# `--check` writes nothing and exits non-zero when the committed file differs, which is what the
+# validator's in-suite twin of the CI step drives; `--path` points either mode at a scratch copy.
+.PHONY: errors-doc
+errors-doc: $(VENV_MARKER)  ## Regenerate docs/errors.md from common/errors (commit it; CI fails on a stale file)
+	uv run python -m tools.errors_doc
+
 # Every compose target goes through one of these, and none omits -f. A bare
 # `docker compose` auto-loads docker-compose.override.yaml, which is what made `launch`
 # start the dev images while its help text claimed production (tj-6ap2vw).

@@ -9,10 +9,12 @@ from sqlalchemy.exc import InvalidRequestError
 from starlette.routing import NoMatchFound
 
 from common.database.postgres_tools import PostgresSessionFactory
-from data.store.app.app_depends import get_rpc_clients
+from data.store.app.app_depends import get_ingest_fetch_client, get_rpc_clients
 from data.store.app.database.database import async_db
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.main import app
+from data.store.tests.fetch_double import RecordingFetchClient
+from data.store.tests.problem_body import validation_errors
 from routers.common.instance_secret import (
     INSTANCE_SECRET_ENV_VAR,
     INSTANCE_SECRET_HEADER,
@@ -20,7 +22,6 @@ from routers.common.instance_secret import (
     require_instance_secret,
 )
 from routers.tests.test_interface_surface import SEPARATOR, load_manifest
-from schemas.data_store.stock.market_activity_data import BatchStockDataMarketActivityCreate
 
 
 # THE data_store HTTP SMOKE TEST (tj-xerngg, ADR tj-fdb9gz).
@@ -39,15 +40,16 @@ from schemas.data_store.stock.market_activity_data import BatchStockDataMarketAc
 # parsers are two things to keep in step. A new route therefore costs a manifest line AND a CASES
 # entry below; a manifest line with no CASES entry FAILS rather than being quietly skipped.
 #
-# NO POSTGRES AND NO KAFKA ARE NEEDED, and that rests on two things, not one:
+# NO POSTGRES, NO KAFKA AND NO data_ingest ARE NEEDED, and that rests on two things, not one:
 #   1. The TestClient is NEVER entered as a context manager. Starlette runs the app's lifespan on
-#      __enter__, and data/store/app/app_depends.py lifespan() calls database.initialize() and
-#      KafkaConsumerFactory.wait_for_kafka() -- both of which need a live service. Constructing the
-#      client without `with` dispatches requests without ever running it. If you add a `with` here
-#      to make something work, you have just made this file need a database.
+#      __enter__, and data/store/app/app_depends.py lifespan() calls database.initialize(),
+#      KafkaConsumerFactory.wait_for_kafka() and -- since tj-3mk3u5.10 -- create_channel() against
+#      DATA_INGEST_GRPC_TARGET, which also fails outright when that variable is unset. Constructing
+#      the client without `with` dispatches requests without ever running it. If you add a `with`
+#      here to make something work, you have just made this file need a database.
 #   2. Both injected dependencies are replaced through app.dependency_overrides -- async_db and
-#      get_rpc_clients -- rather than by monkeypatching module globals, because the handlers take
-#      them as Depends() and that is the seam FastAPI gives you.
+#      get_ingest_fetch_client -- rather than by monkeypatching module globals, because the
+#      handlers take them as Depends() and that is the seam FastAPI gives you.
 # test_the_routes_are_driven_without_a_lifespan asserts both halves instead of trusting them.
 #
 # THE FAKES ARE DELIBERATELY FAITHFUL, NOT PERMISSIVE. FakeSession.add is SYNCHRONOUS because
@@ -345,27 +347,29 @@ class FakeSession:
                 setattr(instance, column, value)
 
 
-class FakeRpcClient:
-    """Answers an RPC request with an empty dataset, so no Kafka round trip happens."""
+def fake_fetch_client() -> RecordingFetchClient:
+    """An IngestFetchClient double answering with an accepted, empty, completed stream.
 
-    async def send_request(self, request: Any) -> BatchStockDataMarketActivityCreate:
-        # An empty `dataset` means the handler stores nothing and reports 0 data points. A
-        # populated one would be tj-19qp1q's job, and would need a database to store into.
-        #
-        # feed is the ingest adapter's resolved tape, and this fake stands in for the adapter, so
-        # it supplies one (tj-1njw7c). It went stale at eec8f88a7443 like the two payload
-        # constants above, but failed LATER than they did -- only once the body validated -- so
-        # the POST /store case reported the missing owner and hid this behind it.
-        return BatchStockDataMarketActivityCreate(
-            asset_symbol='AAPL', source='ALPACA', feed='IEX', granularity='1day', dataset_id=uuid.uuid4(), dataset={}
-        )
+    REPOINTED FROM THE KAFKA RPC FAKE (validator, gating tj-3mk3u5.10). POST /store now takes an
+    ``IngestFetchClient`` through ``get_ingest_fetch_client``, so the override below has to supply
+    one; the old ``FakeRpcClients`` answered a dependency the route no longer declares, and the
+    POST case failed with ``'NoneType' object has no attribute 'fetch'`` -- the real
+    ``get_ingest_fetch_client`` returning its un-initialised module global, which is itself
+    evidence that the lifespan never ran.
 
+    THE STREAM IS ACK-THEN-DONE WITH NO PAGES, which is the same decision the Kafka fake's empty
+    ``dataset`` made and for the same reason: the handler stores nothing and reports 0 data points,
+    because what a populated stream stores is tj-19qp1q's tier and would need a database to store
+    into. An empty window is a legitimate success here, not a degenerate one (ADR tj-fa1rpu D2).
 
-class FakeRpcClients:
-    """Stands in for KafkaRpcFactory.RpcClients."""
+    The ack still carries a resolved feed, as the Kafka fake's batch did (tj-1njw7c): ingest is the
+    only party entitled to decide the tape, and a fake that omitted it would be more permissive
+    than the thing it stands in for.
 
-    def get_client(self, endpoint: Any) -> FakeRpcClient:
-        return FakeRpcClient()
+    Returns:
+        RecordingFetchClient: A fresh double per request, matching the old fake's per-call shape.
+    """
+    return RecordingFetchClient()
 
 
 def manifest_entries(kind: str, *, allow_empty: bool = False) -> list[list[str]]:
@@ -553,7 +557,7 @@ def client():
     because `app` is a module-level singleton other test modules import.
     """
     app.dependency_overrides[async_db] = FakeSession
-    app.dependency_overrides[get_rpc_clients] = FakeRpcClients
+    app.dependency_overrides[get_ingest_fetch_client] = fake_fetch_client
     try:
         # raise_server_exceptions defaults to True and is left that way: an unhandled exception in
         # a handler reaches the test as its own traceback instead of an opaque 500, which is the
@@ -693,8 +697,8 @@ def test_a_malformed_request_is_rejected_with_422(address: str, client: TestClie
     # assertion to "401 or 422" instead would have made it pin neither.
     response = client.request(method, url, headers=secret_headers(address), **case.malformed_request)
 
-    assert response.status_code == 422, f'{method} {url} returned {response.status_code}: {response.text}'
-    complained_about = [error['loc'][-1] for error in response.json()['detail']]
+    # problem+json since TE-6 (tj-3mk3u5.37.8): the per-field list is `errors`, not `detail`.
+    complained_about = [error['loc'][-1] for error in validation_errors(response)]
     assert case.malformed_field in complained_about, (
         f'{method} {url} returned 422, but about {complained_about} rather than about '
         f'{case.malformed_field!r}, which is the only field this request corrupts.'
@@ -831,4 +835,13 @@ def test_the_routes_are_driven_without_a_lifespan(client: TestClient):
     assert get_rpc_clients() is None, (
         'the store app lifespan ran in this process: it is the only thing that sets the module '
         'global get_rpc_clients() reads, and running it needs a live Kafka broker'
+    )
+    # BOTH GLOBALS, since tj-3mk3u5.10 (validator). The lifespan now also builds the gRPC channel
+    # to data_ingest and the IngestFetchClient over it, and that half is the one the POST route
+    # actually depends on -- so an override that stopped taking effect would be caught by this
+    # line rather than by a confusing AttributeError inside the handler. Asserting only the Kafka
+    # global would go on passing if the lifespan were somehow half-run.
+    assert get_ingest_fetch_client() is None, (
+        'the store app lifespan ran in this process: it is the only thing that sets the module '
+        'global get_ingest_fetch_client() reads, and it opens a channel to data_ingest'
     )

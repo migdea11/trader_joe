@@ -25,16 +25,21 @@ over a connection, so those run against a real ``grpc.aio`` server registered th
 ``fetch_dataset_service()``.
 """
 
+import ast
 import asyncio
 import contextlib
 import inspect
 from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import get_args
 
 import grpc
 import pytest
 
+import common.rpc.clients.ingest_fetch
+import common.rpc.ingest
+import schemas.data_ingest.fetch_dataset
 from common.enums.data_stock import Feed
 from common.errors.vocabulary import Reason, TraderJoeError
 from common.rpc.clients.ingest_fetch import GrpcIngestFetchClient, IngestFetchClient
@@ -491,11 +496,23 @@ def test_the_server_seam_mirrors_the_client_seam_so_one_double_serves_both_ends(
     serves both ends" holds exactly when that parameter carries a default, as ``_Handler``'s does and as
     this test pins.
 
-    AND THE UNION IS DECLARED TWICE, NOT SHARED. ``common/rpc/ingest.py`` and
-    ``common/rpc/clients/ingest_fetch.py`` each spell out their own ``type FetchEvent = ...``; the two
-    alias OBJECTS are distinct and compare unequal, so the mirror rests on the two right-hand sides saying
-    the same thing. Nothing but this assertion notices if one of them gains a fourth arm -- the mirror
-    would be quietly false and every double would still type-check against the end it was written for.
+    THE UNION HAS ONE HOME, AND THIS IS NOW AN IDENTITY CHECK (tj-47tzic). It used to be declared TWICE,
+    once per seam, with identical text -- and the assertion here compared ``__value__``, the resolved
+    union, which is equal across two separate declarations. So the assertion that was supposed to hold the
+    mirror together was green under exactly the duplication it was meant to rule out; what it actually
+    caught was a fourth arm added to one side, and nothing else. c302ccf moved the alias to
+    ``schemas/data_ingest/fetch_dataset.py``, beside the three models it unions, and both seams import it.
+
+    SO THIS CASE IS NOW A REGRESSION GUARD RATHER THAN A CORRECTNESS CHECK, and it is written to be one.
+    An ``is`` comparison between two names bound to the same object is trivially true and could never
+    fail -- which is the thing this file refuses to ship -- so the claim is pinned at three points that
+    can each independently go red: the two seams resolve to ONE object, that object is the one schemas
+    declares, and it was DEFINED there rather than merely bound there. The third is not redundant: moving
+    the declaration into a seam and re-exporting it from schemas would satisfy the first two and recreate
+    the problem in a new shape, which the alias's own docstring warns about in those words.
+
+    Measured, not assumed: re-declaring a local ``type FetchEvent`` in either seam reds this. The mutation
+    log is on tj-47tzic.
     """
     server_side = inspect.signature(FetchDatasetHandler.fetch)
     client_side = inspect.signature(IngestFetchClient.fetch)
@@ -503,7 +520,21 @@ def test_the_server_seam_mirrors_the_client_seam_so_one_double_serves_both_ends(
     server_event, *rest = get_args(server_side.return_annotation)
     client_event, *_ = get_args(client_side.return_annotation)
     assert rest == [], 'AsyncIterator carries one argument; the seam yields one union'
-    assert server_event.__value__ == client_event.__value__
+    assert server_event is client_event, (
+        f'the two seams no longer yield the SAME alias object: server={server_event!r} from '
+        f'{getattr(server_event, "__module__", "?")}, client={client_event!r} from '
+        f'{getattr(client_event, "__module__", "?")}. A seam that re-declares a local copy makes '
+        f'tj-tkm4tn D1 -- one test double serves both ends -- rest on two texts agreeing again.'
+    )
+    assert server_event is domain.FetchEvent, (
+        'the seams agree with each other but not with schemas.data_ingest.fetch_dataset.FetchEvent, so '
+        'the union has moved out of its one home (tj-47tzic part A)'
+    )
+    assert server_event.__module__ == 'schemas.data_ingest.fetch_dataset', (
+        f'FetchEvent is defined in {server_event.__module__} and merely re-exported from schemas. The '
+        f'union is a DOMAIN fact and lives beside the three models it unions; a transport module that '
+        f'owns it makes both seams mirrors of a transport detail again.'
+    )
     assert get_args(server_event.__value__) == (domain.FetchAccepted, domain.BarPage, domain.FetchDone)
     assert server_side.parameters['request'].annotation == client_side.parameters['request'].annotation
     extra = set(server_side.parameters) - set(client_side.parameters)
@@ -512,6 +543,43 @@ def test_the_server_seam_mirrors_the_client_seam_so_one_double_serves_both_ends(
 
     double = inspect.signature(_Handler.fetch)
     assert double.parameters['deadline'].default is None, 'a default is what lets this double be read as a client'
+
+
+def test_neither_seam_declares_a_fetch_event_of_its_own():
+    """The same regression, caught by POSITION-INDEPENDENT evidence: the source, not the resolved object.
+
+    WHY THE IDENTITY CHECK ABOVE IS NOT ENOUGH ON ITS OWN, and this is the hole worth closing rather than
+    a second spelling of the same assertion. A Protocol's annotations are evaluated when the class body
+    runs, so ``AsyncIterator[FetchEvent]`` captures whatever that name was bound to AT THAT MOMENT. A
+    local ``type FetchEvent = ...`` placed BEFORE the Protocol shadows the import and reds the case above;
+    the same declaration placed AFTER it does not -- the annotation already holds the imported object, and
+    a stale duplicate sits in the file being used by whatever is defined below it. That is not a contrived
+    ordering: the original declarations sat at module level near the imports, and a later author adding
+    one back would put it wherever they happened to be editing.
+
+    SO THIS READS THE SOURCE. ``ast.TypeAlias`` is the PEP 695 ``type X = ...`` statement specifically, so
+    a docstring or a comment mentioning the name cannot satisfy or break it -- which a text search would
+    get wrong in both directions, and this file is full of prose naming the alias.
+
+    The assertion is over the two seams TOGETHER rather than one test each, so the failure message names
+    the whole rule and a reader does not have to find the sibling case to learn what the other half says.
+    """
+    offenders = {}
+    for module in (common.rpc.ingest, common.rpc.clients.ingest_fetch, schemas.data_ingest.fetch_dataset):
+        source = Path(module.__file__).read_text()
+        declared = [node.name.id for node in ast.walk(ast.parse(source)) if isinstance(node, ast.TypeAlias)]
+        offenders[module.__name__] = sorted(name for name in declared if name == 'FetchEvent')
+
+    assert offenders == {
+        'common.rpc.ingest': [],
+        'common.rpc.clients.ingest_fetch': [],
+        'schemas.data_ingest.fetch_dataset': ['FetchEvent'],
+    }, (
+        f'FetchEvent is declared in the wrong place, or in more than one: {offenders}. It has exactly one '
+        f'home, schemas/data_ingest/fetch_dataset.py (tj-47tzic), and both transport seams import it. Two '
+        f'declarations are two distinct TypeAliasType objects that compare unequal, which is how the '
+        f'mirror decision tj-tkm4tn D1 rests on came to rest on nothing.'
+    )
 
 
 def test_the_registration_names_the_service_the_descriptor_declares():

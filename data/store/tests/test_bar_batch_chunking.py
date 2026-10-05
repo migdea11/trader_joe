@@ -58,6 +58,7 @@ from sqlalchemy.exc import OperationalError
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Feed, Granularity
+from common.errors.vocabulary import ExogenousError, Reason
 from data.store.app.database.crud.stock.asset_market_activity import (
     ASYNCPG_LIMIT_VERIFIED_VERSION,
     ASYNCPG_MAX_QUERY_ARGUMENTS,
@@ -70,6 +71,7 @@ from data.store.app.database.crud.stock.asset_market_activity import (
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.transaction import write_transaction
 from data.store.app.ingest import data_action_request
+from data.store.tests.fetch_double import FetchScript, RecordingFetchClient, accepted_stream
 from schemas.data_store.asset_dataset_store import StoreAssetDatasetBody, StoreAssetDatasetPath
 from schemas.data_store.stock.market_activity_data import (
     BatchStockDataMarketActivityCreate,
@@ -423,6 +425,42 @@ def test_clamping_says_so(requested: int | None, caplog: pytest.LogCaptureFixtur
     assert str(DERIVED_CEILING) in caplog.records[0].getMessage(), 'the log does not name the size actually used'
 
 
+@pytest.mark.asyncio
+async def test_every_write_reports_the_chunk_size_it_actually_used(session, caplog: pytest.LogCaptureFixture):
+    """Decision tj-vz1eta item 3: a configured size far BELOW the ceiling has to be visible too.
+
+    THE GAP THE RESOLVER'S OWN WARNING LEAVES, and it is the gap that let MARKET_ACTIVITY_BATCH_SIZE
+    sit at 10 unnoticed. ``_resolve_chunk_size`` warns only when it has to CLAMP, so a deployment
+    paying for ten-row statements -- hundreds of round trips per page of a backfill -- produced no log
+    line at all: the setting was honoured, which is precisely the problem. The two cases above pin the
+    clamp warning and would both stay green with this line deleted, so the per-write line needs its
+    own case.
+
+    BOTH NUMBERS ARE ASSERTED, because each answers a different question. The effective chunk size is
+    what the operator compares against what they configured. The statement COUNT is what tells them
+    whether that size is costing them anything on the traffic they actually have, and it is also the
+    one that moves when the size does -- a line naming only the size would report 1000 identically for
+    a page of 5 bars and a page of 5000.
+
+    Args:
+        session: The recording session; its statements are what the count must match.
+        caplog: Captures the DEBUG line the write path is required to emit.
+    """
+    with caplog.at_level(logging.DEBUG):
+        await batch_create_market_activity_data(session, _batch_of(5), requested_chunk_size=2)
+
+    chunk_lines = [record.getMessage() for record in caplog.records if 'Chunked bar write' in record.getMessage()]
+    assert len(chunk_lines) == 1, (
+        f'the bar write reported its chunking {len(chunk_lines)} times; a configured size below the '
+        f'derived ceiling is silent otherwise, which is how MARKET_ACTIVITY_BATCH_SIZE=10 went unseen'
+    )
+    assert 'chunk size 2' in chunk_lines[0], f'the log does not name the size actually used: {chunk_lines[0]!r}'
+    assert '3 statement(s)' in chunk_lines[0], (
+        f'the log does not name how many statements five rows at a chunk size of two became: {chunk_lines[0]!r}'
+    )
+    assert len(_statements_sent(session)) == 3, 'the logged statement count does not match what was sent'
+
+
 # ---------------------------------------------------------------------------------------
 # THE PARTITION. That the loop covers the batch exactly once -- no dropped tail, no repeated row.
 
@@ -641,18 +679,23 @@ async def test_a_duplicate_beyond_the_first_chunk_is_rejected_before_anything_is
 # Distinctive enough that finding it in a log message can only mean the error's text was rendered
 # there. A real DBAPIError's str() carries the statement and the bound parameters; this one does too.
 LEAKED_SQL = 'INSERT INTO stock_market_activity -- validator-marker-7f3a'
+# The bound parameter half of the canary. It stands in for an owner, which is the value D8 names
+# and which really is bound into this table's writes.
+LEAKED_OWNER = 'validator-marker-owner'
 HELPER_LOGGER = write_transaction.__module__
 
 
 def _database_error() -> OperationalError:
-    return OperationalError(LEAKED_SQL, {'owner': 'validator-marker-owner'}, Exception('connection reset'))
+    return OperationalError(LEAKED_SQL, {'owner': LEAKED_OWNER}, Exception('connection reset'))
 
 
 def _error_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
     return [record for record in caplog.records if record.levelno >= logging.ERROR]
 
 
-def _assert_logged_once_without_its_text(caplog: pytest.LogCaptureFixture, error: OperationalError) -> None:
+def _assert_logged_once_without_its_text(
+    caplog: pytest.LogCaptureFixture, error: OperationalError, raised: BaseException | None = None
+) -> None:
     """Pin 5: one ERROR record, from the helper, and the error's text in no log message at all.
 
     ONE, not at least one. The deleted `log.error(f'...{e}')` fired in ADDITION to anything the
@@ -663,6 +706,18 @@ def _assert_logged_once_without_its_text(caplog: pytest.LogCaptureFixture, error
     The traceback is meant to travel as exc_info (Addendum 1, S3 revised: the user wants SQL and
     parameters kept, redacted where rendered by the D3 mechanism), so exc_info carrying this very
     object is asserted too; only the MESSAGE must be free of it.
+
+    AND NOW THE WIRE, TOO (validator, gating tj-3mk3u5.37.8). TE-6 made the caller's view of a
+    classified database failure a typed ExogenousError whose detail is a fixed sentence -- so the
+    marker has a second surface it must not reach, and it is the surface that gets rendered into a
+    problem+json body and sent to whoever asked. LEAKED_SQL was already a canary; this extends it
+    from the log to the answer, which is where a leak actually costs something.
+
+    Args:
+        caplog: The captured records.
+        error: The database error the fixture raised.
+        raised: What the caller received, when the case has one to offer. None keeps the original
+            log-only check for a path that raises nothing renderable.
     """
     (record,) = _error_records(caplog)
     assert record.name == HELPER_LOGGER, 'the database error was logged by someone other than the helper'
@@ -674,6 +729,14 @@ def _assert_logged_once_without_its_text(caplog: pytest.LogCaptureFixture, error
             f'the error text was formatted into a log message: {any_record.name} {any_record.getMessage()!r}'
         )
         assert str(error) not in any_record.getMessage()
+    if raised is not None:
+        for surface, rendered in (('detail', getattr(raised, 'detail', '')), ('str()', str(raised))):
+            assert LEAKED_SQL not in rendered, (
+                f"the statement reached the caller's {surface}, so it reaches the problem+json body (D8)"
+            )
+            assert LEAKED_OWNER not in rendered, (
+                f"a bound parameter reached the caller's {surface}, so it reaches the body (D8)"
+            )
 
 
 @pytest.mark.parametrize('failing_chunk', [1, 2, 3])
@@ -681,12 +744,22 @@ def _assert_logged_once_without_its_text(caplog: pytest.LogCaptureFixture, error
 async def test_a_database_error_on_any_chunk_rolls_back_once_and_leaves_as_itself(
     session, call_order: list[str], failing_chunk: int, caplog: pytest.LogCaptureFixture
 ):
-    """Pins 1 and 5: k executes, one rollback, no commit, the same object raised, one ERROR record.
+    """Pins 1 and 5: k executes, one rollback, no commit, the TYPED error raised, one ERROR record.
 
-    Identity, not type: the design's interim is RE-RAISE THE ORIGINAL UNCHANGED (Addendum 1, D1
-    interim, confirmed by the 03:42 correction -- conversion belongs in the store app's HTTP
-    exception handler, not in the helper). A wrapper of the same class, or a translation to any
-    other type, fails `is`.
+    REPOINTED (validator, gating tj-3mk3u5.37.8). This asserted IDENTITY -- `raised.value is error`
+    -- on the reasoning that "the design's interim is RE-RAISE THE ORIGINAL UNCHANGED (Addendum 1,
+    D1 interim, confirmed by the 03:42 correction -- conversion belongs in the store app's HTTP
+    exception handler, not in the helper)". That interim is over. ADR tj-fa1rpu D5 is ruled and
+    TE-6 implements it: conversion belongs in write_transaction after all, because the HTTP handler
+    cannot classify what it is handed without re-deriving the SQLSTATE at the edge, and an
+    OperationalError is DATABASE_UNAVAILABLE wherever it is read. The superseded reasoning is kept
+    above rather than deleted; the assertion it justified cannot be.
+
+    WHAT REPLACES IDENTITY IS NOT WEAKER. `__cause__ is error` keeps the exact object this case
+    used to assert on, so nothing about "the original is not discarded" is lost, and the reason is
+    asserted besides -- which identity never did, and which is the thing a caller branches on. The
+    canary check gains the caller's own surfaces, so this case now also pins that the statement and
+    the bound owner reach neither the log NOR the body.
 
     Args:
         session: The recording session, made to fail on one chunk.
@@ -707,23 +780,31 @@ async def test_a_database_error_on_any_chunk_rolls_back_once_and_leaves_as_itsel
 
     session.execute.side_effect = fail_on_the_nominated_chunk
 
-    with pytest.raises(OperationalError) as raised:
+    with pytest.raises(ExogenousError) as raised:
         await batch_create_market_activity_data(session, _batch_of(5), requested_chunk_size=2)
 
-    assert raised.value is error, 'the database error was replaced on its way out'
+    assert raised.value.reason is Reason.DATABASE_UNAVAILABLE, (
+        f'an OperationalError on a chunk was reported as {raised.value.reason}'
+    )
+    assert raised.value.__cause__ is error, 'the original database error is no longer chained to what the caller gets'
     assert call_order == ['execute'] * failing_chunk + ['rollback']
-    _assert_logged_once_without_its_text(caplog, error)
+    _assert_logged_once_without_its_text(caplog, error, raised.value)
 
 
 @pytest.mark.asyncio
 async def test_a_database_error_from_the_commit_rolls_back_once_and_leaves_as_itself(
     session, call_order: list[str], caplog: pytest.LogCaptureFixture
 ):
-    """Pins 2 and 5: the commit is inside the helper's catch, so its failure rolls back too.
+    """Pins 2 and 5: the commit is inside the helper's catch, so its failure rolls back AND converts.
 
     Every chunk has been sent when the commit fails, so this is the case where a missing rollback
     would leave the most behind on the session. It is also the case the old code covered only
     because its commit sat inside its own try; the helper has to reproduce that, not assume it.
+
+    Repointed with the case above (tj-3mk3u5.37.8): see its docstring for why identity gave way to
+    the reason plus the chained cause. The classification must reach the commit path too -- a
+    helper that converted errors from the block but re-raised the commit's unchanged would answer
+    one failure as a typed 503 and the other as a 500, for the same outage.
     """
     caplog.set_level(logging.DEBUG)
     error = _database_error()
@@ -734,12 +815,15 @@ async def test_a_database_error_from_the_commit_rolls_back_once_and_leaves_as_it
 
     session.commit.side_effect = fail_the_commit
 
-    with pytest.raises(OperationalError) as raised:
+    with pytest.raises(ExogenousError) as raised:
         await batch_create_market_activity_data(session, _batch_of(5), requested_chunk_size=2)
 
-    assert raised.value is error, 'the commit error was replaced on its way out'
+    assert raised.value.reason is Reason.DATABASE_UNAVAILABLE, (
+        f'an OperationalError from the commit was reported as {raised.value.reason}'
+    )
+    assert raised.value.__cause__ is error, 'the original commit error is no longer chained to what the caller gets'
     assert call_order == ['execute', 'execute', 'execute', 'commit', 'rollback']
-    _assert_logged_once_without_its_text(caplog, error)
+    _assert_logged_once_without_its_text(caplog, error, raised.value)
 
 
 @pytest.mark.parametrize(
@@ -779,6 +863,24 @@ async def test_an_empty_batch_touches_nothing(session, call_order: list[str], da
 # caller still passing nothing.
 
 
+def _overlap_free_session() -> AsyncMock:
+    """A session whose only answer is "this request overlaps nothing".
+
+    The worker opens its transaction and runs the hoisted own-overlap SELECT itself before it
+    reaches any collaborator (tj-hywf7w), so the case below cannot hand it a session that answers
+    nothing. It needs exactly one real answer and never reads a second: ``_find_own_overlap`` calls
+    ``result.all()`` and takes the first column of each row, so an empty list is no overlap. commit
+    and rollback are plain AsyncMocks because this file's subject is the chunk size, not the
+    transaction -- test_dataset_fetch_transaction.py owns what the worker commits and when.
+
+    Returns:
+        AsyncMock: The session, usable wherever the worker takes a ``db``.
+    """
+    db = AsyncMock()
+    db.execute = AsyncMock(return_value=MagicMock(all=MagicMock(return_value=[])))
+    return db
+
+
 @pytest.mark.asyncio
 async def test_the_worker_hands_the_configured_batch_size_to_the_write_path(monkeypatch: pytest.MonkeyPatch):
     """The defect as tj-rpyv5u actually words it: read at line 16 and then never applied.
@@ -796,33 +898,55 @@ async def test_the_worker_hands_the_configured_batch_size_to_the_write_path(monk
     is no conftest), and None is also what the parameter defaults to -- so asserting against None
     would pass against a call that omitted the argument entirely, which is precisely the defect.
 
+    REPOINTED AT THE FetchDataset SEAM (validator, gating tj-3mk3u5.10), and the pin is unchanged.
+    The worker's write collaborator is now ``write_market_activity_in_transaction`` -- the non-
+    committing core, because the worker owns the transaction -- and its data arrives as a stream of
+    pages rather than as one batch from an RPC reply. Neither of those is what this case asserts.
+    It still asserts the ONE seam that was broken in tj-rpyv5u: the configured setting reaching the
+    write path's ``requested_chunk_size``. Deleting that keyword argument from data_action_request
+    .py is still green across every other case in this file.
+
+    THE CHUNK SIZE IS NOW PER PAGE, which is a widening of the claim and not a narrowing: the
+    stream is scripted with TWO pages, so the assertion below reads every call rather than one, and
+    a worker that passed the configured size on the first page and defaulted on the rest would be
+    caught. That shape is reachable now in a way it was not when there was one call per fetch.
+
+    THE SESSION IS NO LONGER A BARE AsyncMock (validator, gating tj-hywf7w), and the pin is again
+    unchanged. 12e1251 hoists the own-overlap check ahead of the stream, so the worker issues one
+    real statement of its OWN -- a SELECT -- before it reaches either collaborator this case
+    replaces. An ``AsyncMock()`` answers that with a coroutine, which ``_find_own_overlap`` cannot
+    iterate, so the case died on a TypeError rather than on anything it asserts. ``_overlap_free
+    _session()`` below answers the probe with an empty row set and records nothing this case reads.
+
     Args:
-        monkeypatch: Replaces the module-level setting, already read at import, and the two
-            collaborators either side of the call under test.
+        monkeypatch: Replaces the module-level setting, already read at import, and the write
+            collaborator on the far side of the call under test.
     """
     configured_batch_size = 1234
     monkeypatch.setattr(data_action_request, 'MARKET_ACTIVITY_BATCH_SIZE', configured_batch_size)
-    monkeypatch.setattr(data_action_request, 'upsert_entry', AsyncMock(return_value=uuid4()))
+    monkeypatch.setattr(data_action_request, 'upsert_entry_in_transaction', AsyncMock(return_value=uuid4()))
     write_path = AsyncMock(return_value=7)
-    monkeypatch.setattr(data_action_request, 'batch_create_market_activity_data', write_path)
+    monkeypatch.setattr(data_action_request, 'write_market_activity_in_transaction', write_path)
 
-    reply = _batch_of(3)
-    rpc_client = MagicMock()
-    rpc_client.send_request = AsyncMock(return_value=reply)
-    rpc_clients = MagicMock()
-    rpc_clients.get_client = MagicMock(return_value=rpc_client)
+    fetch_client = RecordingFetchClient(FetchScript(events=accepted_stream([[0, 1, 2], [3, 4]])))
 
     written = await data_action_request.store_market_activity_worker(
         StoreAssetDatasetPath(asset_type=AssetType.STOCK, data_type=DataType.MARKET_ACTIVITY, asset_symbol='AAPL'),
         StoreAssetDatasetBody(
             owner='a-strategy', source=DataSource.ALPACA_API, granularity=Granularity.ONE_DAY, start=FIRST_TIMESTAMP
         ),
-        MagicMock(),
-        rpc_clients,
+        _overlap_free_session(),
+        fetch_client,
     )
 
-    assert written == 7, 'the worker no longer reports what the write path stored'
-    assert write_path.await_args.kwargs['requested_chunk_size'] == configured_batch_size, (
-        'the worker is not passing MARKET_ACTIVITY_BATCH_SIZE to the write path -- the setting is '
-        'read and discarded again'
+    # StoredDataset since TE-6 (tj-3mk3u5.37.8), not a bare int: the served range has to leave the
+    # transaction with the count. What this case asserts is unchanged -- the summed row count.
+    assert written.data_points == 14, 'the worker no longer reports the sum of what the write path stored per page'
+    assert write_path.await_count == 2, 'the two scripted pages did not reach the write path as two calls'
+    assert [call.kwargs['requested_chunk_size'] for call in write_path.await_args_list] == [
+        configured_batch_size,
+        configured_batch_size,
+    ], (
+        'the worker is not passing MARKET_ACTIVITY_BATCH_SIZE to the write path on every page -- '
+        'the setting is read and discarded again'
     )

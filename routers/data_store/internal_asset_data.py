@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.enums.data_select import AssetType, DataType
+from common.errors.vocabulary import InvalidRequestError, Reason
 from common.logging import get_logger
 from data.store.app.database.crud.stock import asset_market_activity as crud_stock_market_activity
 from data.store.app.database.database import async_db
@@ -23,9 +24,24 @@ router = APIRouter()
 log = get_logger(__name__)
 
 
-class UnsupportedAssetType(ValueError):
-    def __init__(self, asset_type: AssetType):
-        super().__init__(f'Asset type not supported: {asset_type}')
+def _unsupported(asset_type: AssetType) -> InvalidRequestError:
+    """The refusal both `case _` branches below raise, built in one place.
+
+    REPLACES THE TWO UnsupportedAssetType(ValueError) COPIES (C5, TE-6). One was here and one was
+    in data/store/app/database/crud/stock/asset_market_activity.py, where nothing ever raised it;
+    neither carried a reason, so both arrived at the edge as an unhandled 500 for input the caller
+    could have corrected. UNSUPPORTED_ASSET_TYPE renders as a 422 through the one handler set.
+
+    A function rather than a class: nothing catches this by type, and a leaf that adds no attribute
+    to InvalidRequestError would be a name for the vocabulary to carry with nothing behind it.
+
+    Args:
+        asset_type: The asset type the caller asked for.
+
+    Returns:
+        InvalidRequestError: The refusal, ready to raise.
+    """
+    return InvalidRequestError(Reason.UNSUPPORTED_ASSET_TYPE, f'Asset type not supported: {asset_type}')
 
 
 # dependencies=[...] ON THE DECORATOR, NOT A FUNCTION PARAMETER (tj-vhboky.8, routers/common/
@@ -62,7 +78,9 @@ async def create_stock_market_activity_data(
                 ) from e
             return await crud_stock_market_activity.create_market_activity_data(db, stock_market_activity)
         case _:
-            raise UnsupportedAssetType(asset_path.asset_type)
+            # Unreachable defence, kept deliberately (tj-vhboky.68 note on tj-fa1rpu): AssetDataPath
+            # already refuses any pair but this one, so nothing reaches here today.
+            raise _unsupported(asset_path.asset_type)
 
 
 @router.get(AssetDataInterface.GET_ASSET_DATA, response_model=list[StockDataMarketActivity])
@@ -103,4 +121,5 @@ async def read_stock_market_activity_data(
         case (AssetType.STOCK, DataType.MARKET_ACTIVITY):
             return await crud_stock_market_activity.read_market_activity_data(db, asset_query)
         case _:
-            raise UnsupportedAssetType(asset_path.asset_type)
+            # Unreachable defence, as above.
+            raise _unsupported(asset_path.asset_type)

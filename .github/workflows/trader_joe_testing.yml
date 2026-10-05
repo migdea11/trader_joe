@@ -166,6 +166,24 @@ jobs:
         fi
         echo "gen/proto/ matches what make proto writes from proto/."
 
+    # THE SAME CONTROL FOR docs/errors.md (ADR tj-fa1rpu, Q-URI addendum; tj-3mk3u5.37.10). The catalogue
+    # is generated from the one Reason table in common/errors and committed, so it can go stale exactly as
+    # gen/proto/ can. It regenerates through `make errors-doc`, the target a developer runs, and reads
+    # `git status` rather than `git diff` for the same reason the step above does: a file that is missing
+    # or untracked is stale too. The generator's own `--check` mode is the in-suite twin of this step.
+    - name: Check Generated Error Catalogue
+      run: |
+        set -eu
+        make errors-doc
+        stale="$(git status --porcelain --untracked-files=all -- docs/errors.md)"
+        if [ -n "${stale}" ]; then
+          echo "::error::docs/errors.md does not match what make errors-doc writes from common/errors; run 'make errors-doc' and commit the result"
+          printf '%s\n' "${stale}"
+          git --no-pager diff -- docs/errors.md
+          exit 1
+        fi
+        echo "docs/errors.md matches what make errors-doc writes from common/errors."
+
     # THE ONE LINT ENTRY POINT, the same target every agent and developer runs (tj-3mk3u5.54), so the
     # linters have one definition, as the staleness step's protoc does through make proto. PATHS
     # defaults to '.', so this is ruff check and ruff format --check on the whole tree, then the

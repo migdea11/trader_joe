@@ -5,7 +5,8 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import Insert, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from common.enums.data_select import AssetType, DataType
+from common.enums.data_select import DataType
+from common.errors.vocabulary import InvalidRequestError, Reason
 from common.logging import get_logger
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.transaction import write_transaction
@@ -36,12 +37,13 @@ ASYNCPG_LIMIT_VERIFIED_VERSION = '0.31.0'
 MAX_BIND_PARAMETERS = min(POSTGRES_MAX_BIND_PARAMETERS, ASYNCPG_MAX_QUERY_ARGUMENTS)
 
 
-class UnsupportedAssetType(ValueError):
-    def __init__(self, asset_type: AssetType):
-        super().__init__(f'Asset type not supported: {asset_type}')
+# UnsupportedAssetType IS GONE FROM HERE (C5, TE-6). This module's copy was never raised -- the
+# only raise sites were the two `case _` branches in routers/data_store/internal_asset_data.py,
+# which now raise InvalidRequestError(UNSUPPORTED_ASSET_TYPE) directly. A second class with the
+# same name and no raise site is exactly the duplication the one vocabulary replaces.
 
 
-class DuplicateBatchTimestamp(ValueError):
+class DuplicateBatchTimestamp(InvalidRequestError):
     """Raised when one batch carries two bars at the same timestamp.
 
     All rows in a batch share the same dataset_id, so two bars at the same timestamp collide on
@@ -50,10 +52,14 @@ class DuplicateBatchTimestamp(ValueError):
     command cannot affect row a second time", and takes the whole batch down with an opaque
     message. This defect is live on this branch today, unguarded, until this exception is raised
     here instead.
+
+    A LEAF OF InvalidRequestError carrying DUPLICATE_BAR_TIMESTAMP (ADR tj-fa1rpu D5, TE-6): the
+    batch as sent cannot be written whatever the database does, so it is the caller's to fix, and
+    the sentence this class has always formatted is now the error's detail.
     """
 
     def __init__(self, timestamp: datetime):
-        super().__init__(f'Duplicate timestamp within batch: {timestamp}')
+        super().__init__(Reason.DUPLICATE_BAR_TIMESTAMP, f'Duplicate timestamp within batch: {timestamp}')
 
 
 def _as_utc(timestamp: datetime) -> datetime:
@@ -127,14 +133,89 @@ def build_market_activity_upsert(values: list[dict[str, Any]]) -> Insert:
     return stmt.on_conflict_do_update(constraint=StockMarketActivity.NATURAL_KEY_CONSTRAINT, set_=updates)
 
 
+async def write_market_activity_in_transaction(
+    db: AsyncSession,
+    batch_asset_data: market_activity_data.BatchStockDataMarketActivityCreate,
+    requested_chunk_size: int | None = None,
+) -> int:
+    """Upsert a batch of bars INSIDE A TRANSACTION THE CALLER OWNS, chunked under the bind-parameter limit.
+
+    THIS FUNCTION NEVER COMMITS AND NEVER ROLLS BACK (tj-vz1eta s2, carried onto tj-3mk3u5.10).
+    It is the one shared bar writer: the dataset fetch calls it once per page as the page arrives
+    (data/store/app/ingest/data_action_request.py), inside the single transaction that also holds
+    that fetch's entry upsert, and nothing is committed until the stream's FetchDone. The ledger
+    work (tj-3mk3u5.34) moves that commit to once per page against this same function, and the
+    external stream reuses it -- which is why the commit is the caller's and not buried here.
+    batch_create_market_activity_data below is the committing wrapper.
+
+    THE BIND-PARAMETER GUARD IS STILL IN FORCE (tj-rpyv5u). Chunking is per CALL, so a caller
+    writing page by page gets the same ceiling per page that one large batch got across the
+    whole batch; _resolve_chunk_size clamps whatever MARKET_ACTIVITY_BATCH_SIZE asks for to what
+    the driver will actually accept.
+
+    THE DUPLICATE-TIMESTAMP GUARD IS PER CALL, AND THAT IS A REAL NARROWING FROM THE ONE-BATCH
+    PATH -- named rather than left to be discovered. It exists because a single INSERT ... ON
+    CONFLICT DO UPDATE whose VALUES list holds one conflict key twice fails outright with
+    Postgres 21000, and it still catches every case of that, since the whole of one call's rows
+    are checked before any chunk is built. What it no longer catches is the same timestamp
+    arriving in two different CALLS of one fetch -- two pages. That is not a 21000: the second
+    statement's ON CONFLICT DO UPDATE refreshes the row the first wrote, which is the idempotent
+    behaviour build_market_activity_upsert is built for. Carrying a per-fetch timestamp set
+    across pages would mean accumulating state proportional to the stream, which is the memory
+    profile the paged transport exists to remove.
+
+    Args:
+        db: The session, already inside the caller's transaction.
+        batch_asset_data: The bars to upsert, all sharing one dataset_id and one feed.
+        requested_chunk_size: Rows per statement, MARKET_ACTIVITY_BATCH_SIZE at the call site.
+            Unset, non-positive or above the driver's ceiling are all clamped; see
+            _resolve_chunk_size.
+
+    Returns:
+        int: How many bars were written. Zero for a batch carrying no market activity, which
+        touches the caller's transaction not at all.
+
+    Raises:
+        DuplicateBatchTimestamp: If two bars in THIS call share a timestamp.
+    """
+    batch_market_activity = batch_asset_data.dataset.get(DataType.MARKET_ACTIVITY)
+    if not batch_market_activity:
+        log.warning('No market activity data in batch')
+        return 0
+
+    log.debug(f'Batch storing market activity[{len(batch_market_activity)}]')
+    log.debug(f'Batch storing market activity: {next(iter(batch_market_activity))}')
+
+    seen_timestamps: set[datetime] = set()
+    for bar in batch_market_activity:
+        normalized_timestamp = _as_utc(bar.timestamp)
+        if normalized_timestamp in seen_timestamps:
+            raise DuplicateBatchTimestamp(bar.timestamp)
+        seen_timestamps.add(normalized_timestamp)
+
+    values = StockMarketActivity.from_batch_create(batch_asset_data)
+    chunk_size = _resolve_chunk_size(requested_chunk_size)
+    # The effective chunk size and the chunk count, per write (tj-vz1eta item 3). A configured
+    # size far BELOW the derived ceiling is silent otherwise -- _resolve_chunk_size only warns
+    # when it has to clamp -- so a deployment paying for ten-row statements has nothing to read.
+    chunk_count = -(-len(values) // chunk_size)
+    log.debug(f'Chunked bar write: {len(values)} rows at chunk size {chunk_size} -> {chunk_count} statement(s)')
+    for chunk_start in range(0, len(values), chunk_size):
+        chunk = values[chunk_start : chunk_start + chunk_size]
+        await db.execute(build_market_activity_upsert(chunk))
+
+    log.debug('Batch insert completed successfully')
+    return len(batch_market_activity)
+
+
 async def batch_create_market_activity_data(
     db: AsyncSession,
     batch_asset_data: market_activity_data.BatchStockDataMarketActivityCreate,
     requested_chunk_size: int | None = None,
 ) -> int:
-    """Upsert a batch of bars, chunked to stay under the wire-protocol bind-parameter limit.
+    """Upsert a batch of bars in a transaction of its own, for a caller writing nothing else.
 
-    ALL CHUNKS SHARE ONE TRANSACTION (tj-rpyv5u): every db.execute below runs inside one
+    ALL CHUNKS SHARE ONE TRANSACTION (tj-rpyv5u): every db.execute runs inside one
     write_transaction block, so an oversized batch either lands whole (the block's single commit
     on normal exit) or (on any exception, including one raised mid-chunk) rolls back whole.
     Committing per chunk was rejected deliberately -- it would turn one failed request into a
@@ -142,35 +223,22 @@ async def batch_create_market_activity_data(
     all-or-nothing failure.
 
     The empty-batch return is ABOVE the block: it neither commits nor rolls back anything, since
-    there is nothing to write. The duplicate-timestamp guard runs INSIDE the block, across the
-    WHOLE batch before any chunk is built, not per chunk: two bars at the same timestamp landing
-    in different chunks would each pass a per-chunk guard and still collide on the natural key.
+    there is nothing to write.
+
+    Args:
+        db: The session.
+        batch_asset_data: The bars to upsert, all sharing one dataset_id and one feed.
+        requested_chunk_size: Rows per statement; see write_market_activity_in_transaction.
+
+    Returns:
+        int: How many bars were written.
     """
-    batch_market_activity = batch_asset_data.dataset.get(DataType.MARKET_ACTIVITY)
-    if not batch_market_activity:
+    if not batch_asset_data.dataset.get(DataType.MARKET_ACTIVITY):
         log.warning('No market activity data in batch')
         return 0
 
     async with write_transaction(db, 'batch store market activity'):
-        log.debug(f'Batch storing market activity[{len(batch_market_activity)}]')
-        log.debug(f'Batch storing market activity: {next(iter(batch_market_activity))}')
-
-        seen_timestamps: set[datetime] = set()
-        for bar in batch_market_activity:
-            normalized_timestamp = _as_utc(bar.timestamp)
-            if normalized_timestamp in seen_timestamps:
-                raise DuplicateBatchTimestamp(bar.timestamp)
-            seen_timestamps.add(normalized_timestamp)
-
-        values = StockMarketActivity.from_batch_create(batch_asset_data)
-        chunk_size = _resolve_chunk_size(requested_chunk_size)
-        for chunk_start in range(0, len(values), chunk_size):
-            chunk = values[chunk_start : chunk_start + chunk_size]
-            await db.execute(build_market_activity_upsert(chunk))
-
-        log.debug('Batch insert completed successfully')
-
-    return len(batch_market_activity)
+        return await write_market_activity_in_transaction(db, batch_asset_data, requested_chunk_size)
 
 
 async def read_market_activity_data(

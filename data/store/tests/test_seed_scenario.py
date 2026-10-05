@@ -19,7 +19,7 @@ from itertools import combinations
 import pytest
 
 from common.enums.data_stock import ExpiryType
-from data.store.app.database.crud.stock.store_dataset_entry import _IDENTITY_EQUALITY_COLUMNS
+from data.store.app.database.crud.stock.store_dataset_entry import _OVERLAP_EQUALITY_COLUMNS
 from data.store.seeds import scenario
 from data.store.seeds.scenario import (
     OWNER_PATTERN,
@@ -176,7 +176,20 @@ def test_every_range_is_aware_utc_and_non_empty():
 
 
 def _identity(request: SeedRequest) -> tuple:
-    """The request's non-range identity, over the columns the store's own-overlap check compares."""
+    """The request's non-range identity, over the columns the store's own-overlap check compares.
+
+    THE OWN-OVERLAP KEY, NOT THE IDENTITY KEY, and the two stopped being the same tuple when feed
+    joined identity (tj-xn3qa6 D1, tj-3mk3u5.31). This function has always been about predicting a
+    409, which the docstring above said before the split and still says -- so it follows the
+    REFUSAL's eight columns. Keyed on identity instead it would read a tape off a body that has
+    none and raise KeyError, which is how this file found out the keys had diverged.
+
+    The seed requests name no feed, which costs this nothing: the refusal never reads one, and the
+    tape the entries end up recording is whatever the deployment resolves. If a seed request ever
+    DOES name a preference, note that two requests differing only in it would look like an exact
+    repeat to test_no_request_is_repeated_exactly below -- correctly, for the refusal's purposes,
+    and wrongly for the entry key's.
+    """
     body = request.body()
     values = {
         'owner': request.owner,
@@ -188,12 +201,19 @@ def _identity(request: SeedRequest) -> tuple:
         'expiry_type': body['expiry_type'],
         'update_type': body['update_type'],
     }
-    return tuple(values[column] for column in _IDENTITY_EQUALITY_COLUMNS)
+    return tuple(values[column] for column in _OVERLAP_EQUALITY_COLUMNS)
 
 
 def test_the_restated_identity_covers_every_equality_column():
-    """_identity above must know every column the store compares, or the overlap test below is blind."""
-    assert len(_identity(SEED_REQUESTS[0])) == len(_IDENTITY_EQUALITY_COLUMNS)
+    """_identity above must know every column the store compares, or the overlap test below is blind.
+
+    Length is the weaker half and the dict lookup above is the stronger one: a column added to the
+    refusal that `values` does not carry raises KeyError before this assertion is reached. What the
+    length catches is the opposite -- a column REMOVED from the refusal, which would leave
+    `values` carrying a term the store no longer compares and the overlap prediction below
+    narrower than the store's.
+    """
+    assert len(_identity(SEED_REQUESTS[0])) == len(_OVERLAP_EQUALITY_COLUMNS)
 
 
 def test_no_request_collides_with_the_same_owners_other_requests():

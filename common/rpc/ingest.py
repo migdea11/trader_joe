@@ -6,10 +6,12 @@ what ADR tj-8konfu D3 asks for and what ruff's TID251 enforces for every path bu
 that drove the encoder itself would hold and annotate generated messages, which is the thing D3 exists to
 prevent.
 
-THE HANDLER IS THE MIRROR IMAGE OF THE CLIENT SEAM. FetchDatasetHandler yields the same FetchEvent union
-that common/rpc/clients/ingest_fetch.py's IngestFetchClient yields on the decode side, so ONE test double
-serves both ends of the hop. It is a STRUCTURAL Protocol, as BrokerRead is: nothing in routers/data_ingest
-inherits from it, and conformance is by shape, so the handler does not have to import this module.
+THE HANDLER IS THE MIRROR IMAGE OF THE CLIENT SEAM. FetchDatasetHandler yields the very FetchEvent union
+that common/rpc/clients/ingest_fetch.py's IngestFetchClient yields on the decode side -- the ONE alias in
+schemas/data_ingest/fetch_dataset.py, imported by both and re-declared by neither (tj-47tzic), so the
+mirror is structural and not two texts that happen to agree. That is what lets ONE test double serve both
+ends of the hop. It is a STRUCTURAL Protocol, as BrokerRead is: nothing in routers/data_ingest inherits
+from it, and conformance is by shape, so the handler does not have to import this module.
 
 WHAT CROSSES THE SEAM FROM THE CALL IS A DEADLINE, NOT A CONTEXT. An aware UTC datetime, or None when the
 call carries no deadline. It is the only thing the handler needs from the call, it is already the shape
@@ -52,14 +54,11 @@ from common.errors.vocabulary import Reason, TraderJoeError
 from common.rpc.mapping import FetchStreamEncoder, ProtoMappingError, refused_response, request_to_domain
 from common.rpc.server import ServiceRegistration
 from schemas.data_ingest import fetch_dataset as domain
+from schemas.data_ingest.fetch_dataset import FetchEvent
 from trader_joe.proto.internal.ingest.v1 import ingest_pb2, ingest_pb2_grpc
 
 
 SERVICE_NAME = ingest_pb2.DESCRIPTOR.services_by_name['IngestService'].full_name
-
-
-type FetchEvent = domain.FetchAccepted | domain.BarPage | domain.FetchDone
-"""What a fetch yields, in order: the accepted ack, then zero or more pages, then the done."""
 
 
 class FetchDatasetHandler(Protocol):

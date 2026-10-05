@@ -55,11 +55,17 @@ ENTRY_TABLE = 'store_dataset_entry'
 BAR_TABLE = 'stock_market_activity'
 SEED_TABLES = (ENTRY_TABLE, BAR_TABLE)
 
-# The entry's natural key, for the deterministic id. Mirrors StoreDatasetEntry.NATURAL_KEY; "end" is
-# quoted because it is a keyword.
+# The entry's natural key, for the deterministic id. Mirrors StoreDatasetEntry.NATURAL_KEY, IN ITS
+# ORDER; "end" is quoted because it is a keyword.
+#
+# feed IS LOAD-BEARING HERE, not just newly present (tj-3mk3u5.31). This hash IS the seeded entry's
+# primary key, so a column missing from it is two different datasets hashing to one id -- and feed
+# joining the entry's identity is exactly what makes two entries differing in nothing else
+# possible (tj-f2qz44). Left out, the seed would fail on a duplicate primary key, or worse dump
+# only one of the pair.
 _ENTRY_ID_SQL = (
     "md5(concat_ws('|', asset_symbol, source::text, granularity::text, asset_type::text, data_type::text, owner, "
-    'expiry_type::text, update_type::text, start::text, "end"::text))::uuid'
+    'expiry_type::text, update_type::text, feed::text, start::text, "end"::text))::uuid'
 )
 
 NORMALISE_SQL = f"""

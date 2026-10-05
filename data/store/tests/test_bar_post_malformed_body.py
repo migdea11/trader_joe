@@ -49,6 +49,7 @@ from data.store.app.app_depends import get_rpc_clients
 from data.store.app.database.database import async_db
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.main import app
+from data.store.tests.problem_body import validation_errors
 from routers.common.instance_secret import INSTANCE_SECRET_ENV_VAR, INSTANCE_SECRET_HEADER
 
 
@@ -188,8 +189,7 @@ def test_a_malformed_bar_body_answers_422_at_its_body_loc(post_bar, body: dict, 
     """
     response = post_bar(RecordingSession(), body)
 
-    assert response.status_code == 422, f'returned {response.status_code}: {response.text}'
-    errors = [(error['loc'], error['type']) for error in response.json()['detail']]
+    errors = [(error['loc'], error['type']) for error in validation_errors(response)]
     assert errors == [(loc, error_type)], (
         f'the 422 should name exactly {loc} ({error_type}), the one field this body corrupts; it named {errors}'
     )
@@ -197,11 +197,18 @@ def test_a_malformed_bar_body_answers_422_at_its_body_loc(post_bar, body: dict, 
 
 @pytest.mark.parametrize(('body', 'loc', 'error_type'), MALFORMED)
 def test_a_malformed_bar_body_does_not_echo_the_secret(post_bar, body: dict, loc: list[str], error_type: str):
-    """The 422 carries the body's own input back to the caller, and the request carries the secret.
+    """Nothing of the request's own may come back in its refusal, and the request carries the secret.
 
     Two things keep this check from being vacuous. First, the status is asserted to be the 422 and not
     a 401, so the secret was accepted and the handler ran. Second, the check is a bool, so a leaked
     secret is never printed in the failure message.
+
+    THE PREMISE CHANGED AND THE CASE SURVIVES IT (validator, gating tj-3mk3u5.37.8). This used to open
+    "the 422 carries the body's own input back to the caller", which was true of FastAPI's native 422
+    and is the reason an echoed secret was reachable at all. TE-6's ValidationIssue drops `input`, so
+    that route to a leak is closed by construction. The case is NOT therefore retired: the secret
+    travels in a HEADER, and the assertion below reads the headers as well as the body, which no
+    structural guarantee about the errors array covers. What it pins is now narrower and still real.
     """
     response = post_bar(RecordingSession(), body)
 
@@ -255,8 +262,7 @@ def _native_422(session: RecordingSession) -> list[dict[str, Any]]:
         )
     finally:
         app.dependency_overrides.clear()
-    assert response.status_code == 422, f'the native route returned {response.status_code}: {response.text}'
-    return response.json()['detail']
+    return validation_errors(response)
 
 
 @pytest.mark.parametrize(('body', 'loc', 'error_type'), MALFORMED)
@@ -266,11 +272,22 @@ def test_no_malformed_bar_error_item_carries_a_url_key(post_bar, body: dict, loc
     The comparison test below uses one error kind ('enum'). This covers the four kinds in MALFORMED,
     so an error kind whose item gains a url some other way (a hand-built item in a later branch, say)
     is still caught.
+
+    THE GUARANTEE IS STRUCTURAL NOW, NOT INCIDENTAL (validator, gating tj-3mk3u5.37.8), and this case
+    is kept rather than deleted because it is the one that says so. Before TE-6 the item was whatever
+    FastAPI handed out, so the absence of pydantic's url key was a property of how the item happened
+    to be built and this assertion was the only thing holding it. Now every 422 item is rendered
+    through routers/common/errors.py's declared ValidationIssue, which has exactly loc, msg and type,
+    so the url key is unreachable by construction -- and the assertion below, read on its own, has
+    become one that cannot fail. What replaces it is the same check widened and moved into
+    validation_errors: no key BEYOND loc/msg/type, over every caller of that helper rather than over
+    this file's four bodies. The widening matters more than the url key ever did, because the key
+    that would actually hurt is `input`, which echoes the rejected value -- an owner, here -- back to
+    the caller (D8). The url assertion stays below as the named regression it was.
     """
     response = post_bar(RecordingSession(), body)
 
-    assert response.status_code == 422, f'returned {response.status_code}: {response.text}'
-    carrying = [error['loc'] for error in response.json()['detail'] if 'url' in error]
+    carrying = [error['loc'] for error in validation_errors(response) if 'url' in error]
     assert carrying == [], f"these error items still carry pydantic's url key: {carrying}"
 
 
@@ -289,8 +306,7 @@ def test_the_bar_422_items_have_the_keys_of_a_fastapi_native_422(post_bar):
     native = _native_422(RecordingSession())
     response = post_bar(RecordingSession(), {**VALID_BAR, 'source': UNKNOWN_SOURCE})
 
-    assert response.status_code == 422, f'returned {response.status_code}: {response.text}'
-    (bar_error,) = response.json()['detail']
+    (bar_error,) = validation_errors(response)
     (native_error,) = native
     assert bar_error['type'] == native_error['type'], (
         f'not a like-for-like comparison: the bar route answered {bar_error["type"]}, the native route '

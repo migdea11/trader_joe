@@ -43,6 +43,7 @@ from data.store.app.database.crud.stock import asset_market_activity as crud_mod
 from data.store.app.database.database import async_db
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.main import app
+from data.store.tests.problem_body import validation_errors
 from schemas.data_store.stock.market_activity_data import StockDataMarketActivityQuery
 
 
@@ -377,8 +378,9 @@ def _get(client: TestClient, params: dict[str, str]):
 
 
 def _errors(response) -> list[dict[str, Any]]:
-    assert response.status_code == 422, f'expected 422, got {response.status_code}: {response.text}'
-    return response.json()['detail']
+    # problem+json since TE-6 (tj-3mk3u5.37.8). The per-field list moved from `detail` to `errors`;
+    # validation_errors reads it and pins the envelope every case here now shares.
+    return validation_errors(response)
 
 
 ALL_PARAMS = {

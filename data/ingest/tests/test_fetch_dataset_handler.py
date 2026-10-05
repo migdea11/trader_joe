@@ -7,18 +7,27 @@ common/tests/rpc/, not here.
 
 WHAT THIS FILE PINS, and why each one earns its place:
 
-* THE MULTI-PAGE PROOF (tj-rh4b7f's third volume ceiling, tj-tkm4tn D2). MAX_PAGE_BARS + 1 bars must
-  come out as TWO pages, neither over the cap and no bar lost; exactly MAX_PAGE_BARS must come out as
-  ONE. Both sides of the boundary, because a handler that accumulated the dataset and sliced it once at
-  the end would pass a one-sided check while reinstating the single-message memory profile this
-  migration exists to remove. The 5000 is never re-spelled: it is imported, as the handler imports it.
+* THE MULTI-PAGE PROOF (tj-tkm4tn D2). MAX_PAGE_BARS + 1 bars must come out as TWO pages, neither over
+  the cap and no bar lost; exactly MAX_PAGE_BARS must come out as ONE. Both sides of the boundary. The
+  5000 is never re-spelled: it is imported, as the handler imports it.
+* CHUNK AS YOU GO (tj-rh4b7f's third volume ceiling; tj-r78vb5). SEPARATE from the page shapes above,
+  because the shapes alone cannot see it: a handler that drained the whole window into a list and
+  sliced it at the end yields exactly the same pages. What separates the two is the ORDER of vendor
+  pulls against yielded pages, so ScriptedRead journals its pulls and one named test reads the gap.
 * THE REFUSAL IS A RAISE BEFORE THE FIRST YIELD (tj-tkm4tn D3). Pinned as a position, not just as an
   exception type: the test asserts nothing was yielded, because 'raises eventually' is the bug the
   servicer's in-band conversion cannot survive -- once the ack is on the wire there is no refusal left
   to send.
 * EVERY KNOWABLE FAILURE LANDS BEFORE THE ACK. An ack is a promise the request is viable, so the empty
-  data_types, the unsupported data types and the missing reader are all pinned as raising with get_bars
-  never called at all -- which is stricter than the exception type and is the property the bead asks for.
+  data_types, the unsupported data types, the non-STOCK asset types and the missing reader are all
+  pinned as raising with get_bars never called at all -- which is stricter than the exception type and
+  is the property the bead asks for.
+* A NON-STOCK asset_type IS REFUSED BY THE HANDLER, NOT BY THE READER (tj-msd6qo). Pinned against
+  FakeRead, which serves every asset type, with a control in the same test showing that this very
+  reader answers that very instrument with bars -- so the refusal provably came from the handler.
+  Pinned against AlpacaRead it would prove nothing, since AlpacaRead refuses it anyway. Its wording is
+  pinned against the Kafka path's own two refusals, called rather than copied, because answering the
+  same as the path being replaced is the ruling's whole justification.
 * THE BARS ITERATOR IS CLOSED ON EVERY EXIT PATH (tj-tkm4tn D5), exactly once: exhaustion, a mid-stream
   raise from the adapter, an explicit aclose() after partial consumption, a double aclose(), and a task
   cancelled while the adapter is still awaiting. See the note on the asyncgen hook above those tests for
@@ -54,12 +63,14 @@ from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Feed, Granularity, UpdateType
 from common.errors.vocabulary import ExogenousError, InvalidRequestError, Reason, TraderJoeError
 from common.rpc.mapping.fetch_stream import MAX_PAGE_BARS
+from data.ingest.app import ingest_control
 from data.ingest.app.brokers.interface import Bar as BrokerBar
 from data.ingest.app.brokers.interface import BarsFailure, BarsQuery, BarsResponse, BrokerUnsupportedError, Instrument
 from data.ingest.app.brokers.interface import ServedRange as BrokerServedRange
 from data.ingest.app.brokers.rate_budget import RequestPriority
 from routers.data_ingest.fetch_dataset_handler import IngestFetchHandler
 from schemas.data_ingest import fetch_dataset as domain
+from tests.fakes.market_data import FakeRead
 
 
 pytestmark = pytest.mark.data_ingest
@@ -116,12 +127,21 @@ class ObservedBars:
         return self
 
     async def __anext__(self) -> BrokerBar:
-        """Pull the next bar from the wrapped generator.
+        """Pull the next bar from the wrapped generator, recording the pull.
+
+        Counting pulls here is what lets a test state the memory profile DIRECTLY -- how much of the
+        vendor's window the handler had read by the time it yielded its first page -- rather than infer
+        it from whether a generator's finally had run (tj-r78vb5).
 
         Returns:
             BrokerBar: The next bar.
         """
-        return await self.__inner.__anext__()
+        bar = await self.__inner.__anext__()
+        # Counted only once the pull SUCCEEDS, so the final __anext__ that raises StopAsyncIteration is
+        # not mistaken for a bar and the count stays comparable with len(self.bars).
+        self.__owner.pulls += 1
+        self.__owner.journal.append('pull')
+        return bar
 
     async def aclose(self) -> None:
         """Record that the handler discharged its one cancellation duty, and close the generator."""
@@ -171,6 +191,12 @@ class ScriptedRead:
         # Appended to by the generator's own finally, which is where an adapter would release a vendor
         # resource. Empty when the generator was never started, which is correct and not a miss.
         self.body_finalised: list[str] = []
+        # How many bars the handler has pulled, and the interleaving of those pulls with what the
+        # handler yielded. The journal is the gap analysis the paging tests cannot do: page SHAPES look
+        # identical whether the handler chunks as it reads or drains everything and slices it, so only
+        # the ORDER of pulls against yields tells the two apart (tj-r78vb5).
+        self.pulls = 0
+        self.journal: list[str] = []
         self.paused = asyncio.Event()
         self.__never_set = asyncio.Event()
 
@@ -296,6 +322,51 @@ async def test_exactly_the_page_cap_is_served_as_one_page_and_never_an_empty_sec
 
     pages = [event for event in events if isinstance(event, domain.BarPage)]
     assert [len(page.bars) for page in pages] == [MAX_PAGE_BARS]
+
+
+@pytest.mark.asyncio
+async def test_the_first_page_is_yielded_before_the_vendor_iterator_has_been_drained():
+    """CHUNK AS YOU GO, stated directly (tj-r78vb5). The two tests above cannot tell this apart.
+
+    Both page-shape tests yield [5000, 1] and [5000] whether the handler chunks as it reads or drains
+    the whole window into a list and slices it at the end. The shapes are identical; only the ORDER of
+    vendor pulls against yielded pages separates them. That order IS the memory profile -- tj-rh4b7f's
+    third volume ceiling, which is the entire reason tj-tkm4tn D2 puts the chunking in the handler,
+    beside the code draining the vendor iterator.
+
+    Until this test existed the property was pinned by one unlabelled line in a CLOSURE test, which
+    worked only because a materialising handler would have exhausted the adapter's generator and run
+    its finally. That is a proxy, in a test about something else, and one tidy-up away from being
+    deleted as redundant.
+
+    Two statements, because each catches what the other cannot:
+      THE COUNT   at the moment the first page is delivered, exactly one page's worth has been pulled.
+      THE GAP     at least one pull happens AFTER the first page -- the store side's gap analysis
+                  (test_every_page_is_written_before_the_next_one_is_pulled) read from the producer's
+                  end. That test proves the CONSUMER writes as it reads, but its double SCRIPTS pages
+                  rather than producing them from a vendor iterator, so it never runs this handler.
+    """
+    reader = ScriptedRead([broker_bar(index) for index in range(MAX_PAGE_BARS + 10)])
+    handler = IngestFetchHandler({DataSource.ALPACA_API: reader})
+
+    pulls_at_first_page = None
+    async for event in handler.fetch(a_request(), deadline=None):
+        reader.journal.append(type(event).__name__)
+        if isinstance(event, domain.BarPage) and pulls_at_first_page is None:
+            pulls_at_first_page = reader.pulls
+
+    assert pulls_at_first_page == MAX_PAGE_BARS, (
+        f'the handler had pulled {pulls_at_first_page} bars when it yielded its first page, not '
+        f'{MAX_PAGE_BARS}: it is reading more of the vendor window than one page needs, which is the '
+        'single-message memory profile this migration exists to remove (tj-rh4b7f, tj-tkm4tn D2)'
+    )
+
+    first_page = reader.journal.index(domain.BarPage.__name__)
+    assert 'pull' in reader.journal[first_page:], (
+        'every vendor pull happened before the first page was yielded, so the handler materialised the '
+        'whole dataset and then sliced it; pages must be produced as the bars arrive'
+    )
+    assert reader.pulls == MAX_PAGE_BARS + 10, 'the handler did not read the whole window it was asked for'
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -459,37 +530,117 @@ async def test_any_other_adapter_failure_is_also_re_raised_as_is_before_the_ack(
 
 
 @pytest.mark.parametrize(
-    ('data_types', 'expected_reason'),
+    ('request_kwargs', 'expected_reason'),
     [
-        ([], Reason.INVALID_REQUEST),
-        ([DataType.QUOTE], Reason.UNSUPPORTED_ASSET_TYPE),
-        ([DataType.TRADE], Reason.UNSUPPORTED_ASSET_TYPE),
-        ([DataType.MARKET_ACTIVITY, DataType.QUOTE], Reason.UNSUPPORTED_ASSET_TYPE),
+        ({'data_types': []}, Reason.INVALID_REQUEST),
+        ({'data_types': [DataType.QUOTE]}, Reason.UNSUPPORTED_ASSET_TYPE),
+        ({'data_types': [DataType.TRADE]}, Reason.UNSUPPORTED_ASSET_TYPE),
+        ({'data_types': [DataType.MARKET_ACTIVITY, DataType.QUOTE]}, Reason.UNSUPPORTED_ASSET_TYPE),
+        ({'asset_type': AssetType.CRYPTO}, Reason.UNSUPPORTED_ASSET_TYPE),
+        ({'asset_type': AssetType.OPTION}, Reason.UNSUPPORTED_ASSET_TYPE),
     ],
-    ids=['empty', 'quote', 'trade', 'bars-and-quote'],
+    ids=['empty', 'quote', 'trade', 'bars-and-quote', 'crypto', 'option'],
 )
 @pytest.mark.asyncio
-async def test_an_unservable_data_types_is_refused_before_the_ack_and_before_the_vendor_is_called(
-    data_types: list[DataType], expected_reason: Reason
+async def test_an_unservable_request_is_refused_before_the_ack_and_before_the_vendor_is_called(
+    request_kwargs: dict, expected_reason: Reason
 ):
     """'Validate everything that can be validated BEFORE acking' (tj-3mk3u5.9): an ack promises viability.
 
     The Kafka handler checks QUOTE and TRADE AFTER its get_bars, which is harmless there because nothing
     has been promised yet. On this contract it would not be: the ack would already be on the wire, the
     store would already have written its dataset entry, and the refusal would arrive as an INTERNAL.
-    The last case is the one that catches a handler checking only data_types[0].
+    'bars-and-quote' is the case that catches a handler checking only data_types[0].
+
+    THE TWO asset_type CASES ARE tj-msd6qo, and they join this parametrisation rather than starting a
+    second one because they are the same statement in the same position: this deployment does not serve
+    that kind of market data yet, refused before the ack, with the same reason. CRYPTO and OPTION are
+    both reachable -- the wire carries ASSET_TYPE_CRYPTO and ASSET_TYPE_OPTION (market/v1/enums.proto)
+    and the mapper decodes them -- so neither is hypothetical.
     """
     reader = ScriptedRead([broker_bar(0)])
     handler = IngestFetchHandler({DataSource.ALPACA_API: reader})
 
     yielded = []
     with pytest.raises(InvalidRequestError) as raised:
-        async for event in handler.fetch(a_request(data_types=data_types), deadline=None):
+        async for event in handler.fetch(a_request(**request_kwargs), deadline=None):
             yielded.append(event)
 
     assert yielded == []
     assert raised.value.reason is expected_reason
     assert reader.queries == [], 'the vendor was called for a request that was already known to be unservable'
+
+
+@pytest.mark.parametrize('asset_type', [AssetType.CRYPTO, AssetType.OPTION], ids=['crypto', 'option'])
+@pytest.mark.asyncio
+async def test_a_non_stock_asset_type_is_refused_even_by_a_reader_that_would_have_served_it(asset_type: AssetType):
+    """tj-msd6qo, and the ONLY form of this test that proves anything: drive it with the fake that serves everything.
+
+    The defect was relying on BrokerRead to refuse. AlpacaRead happens to refuse a non-STOCK asset_type
+    (alpaca/read.py:100), so a test using it would pass whether or not the handler checks at all -- it
+    would pin Alpaca's behaviour and call it the handler's. FakeRead deliberately does not refuse, and
+    that is ruled design, not an oversight in the fake (test_broker_read_contract.py: 'FakeRead's empty
+    list puts every Alpaca refusal here for FakeRead: it serves them').
+
+    THE CONTROL IS THE POINT. The second half calls FakeRead directly with the same non-STOCK instrument
+    and shows it answers with bars. So the refusal in the first half cannot have come from the reader,
+    and the only thing left that could have produced it is the handler. Without that control this is
+    just another test that something, somewhere, said no.
+    """
+    reader = FakeRead(slow_delay_seconds=0)
+    handler = IngestFetchHandler({DataSource.ALPACA_API: reader})
+
+    yielded = []
+    with pytest.raises(InvalidRequestError) as raised:
+        async for event in handler.fetch(a_request(asset_type=asset_type), deadline=None):
+            yielded.append(event)
+
+    assert yielded == [], 'the refusal must precede the ack, as every pre-ack refusal does'
+    assert raised.value.reason is Reason.UNSUPPORTED_ASSET_TYPE
+
+    # The control: this reader serves that very instrument, so the refusal above was the handler's.
+    served = await reader.get_bars(
+        BarsQuery(
+            instrument=Instrument(symbol='AAPL', asset_type=asset_type, exchange=None, currency=None),
+            granularity=Granularity.ONE_MINUTE,
+            start=START,
+            end=SERVED_END,
+            priority=RequestPriority.BACKFILL,
+        )
+    )
+    assert isinstance(served, BarsResponse), f'FakeRead refused {asset_type} itself, so the test above proved nothing'
+    assert [bar async for bar in served.bars], 'FakeRead served no bars, so the control establishes nothing'
+
+
+@pytest.mark.asyncio
+async def test_the_refusal_is_word_for_word_the_one_the_kafka_path_gives_for_the_same_asset_type():
+    """Parity with the path this replaces is the ruling's stated justification, so it is pinned, not assumed.
+
+    On the Kafka path the refusal lived in METHOD DISPATCH -- get_dataset_request maps asset_type to
+    store_retrieve_crypto or store_retrieve_option, which refuse before any reader is consulted. Those
+    two functions are called here rather than their messages copied, so the day someone reworks one of
+    them this turns red instead of quietly drifting: a caller migrating from Kafka to gRPC must not have
+    to parse two different sentences for the same refusal.
+    """
+    expected = {}
+    for asset_type, kafka_refusal in (
+        (AssetType.CRYPTO, ingest_control.store_retrieve_crypto),
+        (AssetType.OPTION, ingest_control.store_retrieve_option),
+    ):
+        # Both ignore the argument entirely and raise unconditionally; None documents that it is unread.
+        with pytest.raises(InvalidRequestError) as raised:
+            await kafka_refusal(None)
+        expected[asset_type] = (raised.value.reason, raised.value.detail)
+
+    handler = IngestFetchHandler({DataSource.ALPACA_API: ScriptedRead([broker_bar(0)])})
+    actual = {}
+    for asset_type in (AssetType.CRYPTO, AssetType.OPTION):
+        with pytest.raises(InvalidRequestError) as raised:
+            async for _ in handler.fetch(a_request(asset_type=asset_type), deadline=None):
+                pytest.fail('the fetch yielded an event for an asset type it refuses')
+        actual[asset_type] = (raised.value.reason, raised.value.detail)
+
+    assert actual == expected
 
 
 @pytest.mark.asyncio
@@ -575,7 +726,11 @@ async def test_abandoning_the_fetch_part_way_through_the_bars_closes_the_adapter
     assert isinstance(await anext(fetch), domain.FetchAccepted)
     assert isinstance(await anext(fetch), domain.BarPage)
     assert reader.closed_by_handler == 0, 'closed while the fetch was still live'
-    assert reader.body_finalised == []
+    assert reader.body_finalised == [], (
+        'the adapter generator had already run its finally, so it was exhausted before the first page '
+        'was yielded -- incidental here, and pinned deliberately by '
+        'test_the_first_page_is_yielded_before_the_vendor_iterator_has_been_drained (tj-r78vb5)'
+    )
 
     await fetch.aclose()
 

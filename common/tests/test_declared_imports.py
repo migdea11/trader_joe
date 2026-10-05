@@ -99,6 +99,12 @@ ENVIRONMENTS: dict[str, tuple[frozenset[str], bool]] = {
     'tools/__init__.py': (MCP_IMAGE, False),
     'tools/agent_mcp': (MCP_IMAGE, False),
     'tools/agent_mcp/tests': (TEST_VENV, True),
+    # The error-catalogue generator (tj-3mk3u5.37.10). It runs only in the venv, under `make errors-doc`
+    # and the CI step beside it; NO image copies it -- the MCP image takes tools/__init__.py and
+    # tools/agent_mcp/*.py and nothing else (the Dockerfile test below pins that both ways), and the
+    # service Dockerfile copies no tools tree at all. Not a test, so is_test is False.
+    'tools/errors_doc.py': (TEST_VENV, False),
+    'tools/tests': (TEST_VENV, True),
     'common/tests': (TEST_VENV, True),
     'data/ingest/tests': (TEST_VENV, True),
     'data/store/tests': (TEST_VENV, True),

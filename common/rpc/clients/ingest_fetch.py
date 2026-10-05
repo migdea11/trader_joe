@@ -71,6 +71,7 @@ from common.rpc.errors import from_rpc_error
 from common.rpc.mapping.fetch_dataset import ack_to_domain, done_to_domain, page_to_domain, request_to_proto
 from common.rpc.mapping.values import ProtoMappingError
 from schemas.data_ingest import fetch_dataset as domain
+from schemas.data_ingest.fetch_dataset import FetchEvent
 from trader_joe.proto.internal.ingest.v1 import ingest_pb2, ingest_pb2_grpc
 
 
@@ -101,9 +102,6 @@ DEFAULT_FETCH_DEADLINE_S: Final = 300.0
 _ACK: Final = 'ack'
 _PAGE: Final = 'page'
 _DONE: Final = 'done'
-
-type FetchEvent = domain.FetchAccepted | domain.BarPage | domain.FetchDone
-"""What a fetch yields, in order: the accepted ack, then zero or more pages, then the done."""
 
 
 def _protocol_error(why: str) -> ExogenousError:
