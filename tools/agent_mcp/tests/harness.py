@@ -52,8 +52,29 @@ from tools.agent_mcp.settings import Settings
 # it carries the three shared trees, otherwise the one child of it that does. Both raise rather than
 # fall back, for the reason roots.py gives: a sentinel that quietly returns the wrong directory makes
 # every file it names missing and leaves the assertions about them green.
+#
+# EACH MARKER MUST BE AN IMPORTABLE PACKAGE, NOT MERELY A DIRECTORY OF THAT NAME (bug tj-fts1lo).
+# THIS is the search that collapsed, and the downward direction is why: it tries the repository root
+# FIRST, so anything at the root answering the marker wins over the real server/ below it. `git mv`
+# relocates TRACKED files only, so every checkout that predates tj-iontkq.4 -- the user's, any
+# developer's, never CI's, which builds fresh -- still holds common/, routers/ and schemas/ at the
+# repository root containing nothing but untracked __pycache__. Those empty shells answered
+# `is_dir()`, _server_root returned the repository root, and the two roots collapsed back into the
+# single root this epic spent four tasks separating. It surfaced as one loud FileNotFoundError in
+# test_seed_dump, but the collapse restores the PRE-MOVE value, so every other caller that merely
+# needs *a* root went on passing -- vacuously. The leftovers are untracked, so nothing in version
+# control removes them and no clean checkout reproduces the condition: the marker has to
+# discriminate. None of the shells carries an __init__.py.
+#
+# roots.py keys on the same package marker, and so do the other two spellings of this same pair --
+# tests/fakes/record_alpaca.py (same downward shape, same direction, silent when it collapses) and,
+# in shell, server/data/store/run_migrations.sh. FOUR spellings, each forced by where it sits, so
+# common/tests/test_roots.py::test_every_derivation_of_the_two_roots_agrees enumerates all four and
+# holds each to the canonical one. A definition spelled in several places is only as strong as its
+# weakest spelling, and only an inventory can say how many places there are.
 
 SERVER_MARKERS = ('common', 'routers', 'schemas')
+PACKAGE_MARKER = '__init__.py'
 
 
 def _repo_root() -> Path:
@@ -66,12 +87,14 @@ def _repo_root() -> Path:
 
 
 def _server_root(repo_root: Path) -> Path:
-    """The directory holding all of SERVER_MARKERS: REPO_ROOT itself, or its one child that does."""
+    """The directory holding every SERVER_MARKERS name as a PACKAGE: REPO_ROOT, or its one child."""
     candidates = [repo_root, *sorted(child for child in repo_root.iterdir() if child.is_dir())]
     for candidate in candidates:
-        if all((candidate / marker).is_dir() for marker in SERVER_MARKERS):
+        if all((candidate / marker / PACKAGE_MARKER).is_file() for marker in SERVER_MARKERS):
             return candidate
-    raise RuntimeError(f'neither {repo_root} nor any child of it holds all of {SERVER_MARKERS}')
+    raise RuntimeError(
+        f'neither {repo_root} nor any child of it holds all of {SERVER_MARKERS} as packages (<name>/{PACKAGE_MARKER})'
+    )
 
 
 REPO_ROOT = _repo_root()

@@ -87,20 +87,53 @@ CREDENTIAL_VARS = ('ALPACA_API_KEY', 'ALPACA_API_SECRET')
 # server root from here anyway, since it is a sibling of tests/ rather than an ancestor of it. The
 # root is therefore found by stepping DOWN from the repository root. It raises rather than falling
 # back: writing recorded fixtures to a guessed directory is worse than not writing them.
+#
+# EACH MARKER MUST BE AN IMPORTABLE PACKAGE, NOT MERELY A DIRECTORY OF THAT NAME (bug tj-fts1lo).
+# This search has the same shape and the same direction as the one that collapsed in that bug
+# (tools/agent_mcp/tests/harness.py): it steps DOWNWARD and tries THE REPOSITORY ROOT FIRST, so
+# anything at the root answering the marker beats the real server/ beneath it. `git mv` relocates
+# TRACKED files only, so every checkout that predates tj-iontkq.4 -- the user's, any developer's,
+# never CI's, which builds fresh -- keeps common/, routers/ and schemas/ at the repository root
+# holding nothing but untracked __pycache__. Those shells answered the old `is_dir()` marker.
+#
+# AND HERE THE COLLAPSE IS SILENT RATHER THAN RED, which is why it is worth the comment. Nothing in
+# this file reads DEFAULT_OUT before writing to it: the write does `out.mkdir(parents=True,
+# exist_ok=True)`, so a collapsed root does not fail, it CREATES data/ingest/tests/fixtures/alpaca
+# at the repository root, writes a credentialed sitting's fixtures into it, prints success, and
+# leaves the suite reading the stale committed fixtures under server/. That is exactly the
+# "guessed directory" the paragraph above refuses -- the guess just arrives through the marker
+# rather than through a counted index. The leftovers are untracked, so nothing in version control
+# removes them and no clean checkout reproduces the condition: the marker has to discriminate, and
+# none of the shells carries an __init__.py.
+#
+# This is the THIRD of four spellings of the same pair of roots in this repository (roots.py,
+# harness.py, this file, and server/data/store/run_migrations.sh). Each is forced by where it sits
+# -- this one runs as a script, so sys.path[0] is tests/fakes and `common` is not importable at all
+# -- and common/tests/test_roots.py::test_every_derivation_of_the_two_roots_agrees holds all four
+# answerable to the canonical one.
 SERVER_MARKERS = ('common', 'routers', 'schemas')
+PACKAGE_MARKER = '__init__.py'
 
 
-def _server_root() -> Path:
-    """The directory holding all of SERVER_MARKERS: the repository root itself, or its one child."""
-    start = Path(__file__).resolve().parent
+def _server_root(start: Path | None = None) -> Path:
+    """The directory holding every SERVER_MARKERS name as a PACKAGE: the repo root, or its one child.
+
+    START defaults to this file's own directory and exists so the search can be exercised against a
+    synthetic checkout. The stale shells are untracked, so no clean checkout and no CI run carries
+    them: a tmp_path tree is the only way the discriminating case can be asserted at all.
+    """
+    start = (start or Path(__file__).parent).resolve()
     for repo_root in (start, *start.parents):
         if not (repo_root / 'pytest.ini').is_file():
             continue
         candidates = [repo_root, *sorted(child for child in repo_root.iterdir() if child.is_dir())]
         for candidate in candidates:
-            if all((candidate / marker).is_dir() for marker in SERVER_MARKERS):
+            if all((candidate / marker / PACKAGE_MARKER).is_file() for marker in SERVER_MARKERS):
                 return candidate
-        raise RuntimeError(f'neither {repo_root} nor any child of it holds all of {SERVER_MARKERS}')
+        raise RuntimeError(
+            f'neither {repo_root} nor any child of it holds all of {SERVER_MARKERS} '
+            f'as packages (<name>/{PACKAGE_MARKER})'
+        )
     raise RuntimeError(f'no ancestor of {start} carries pytest.ini, so no root can be located')
 
 

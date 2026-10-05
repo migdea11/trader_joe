@@ -41,11 +41,37 @@ from pathlib import Path, PurePosixPath
 REPO_MARKER = 'pytest.ini'
 
 # The server root is the directory holding the three trees every service imports from. ALL THREE
-# must be present and must be directories, so no single stray file or unrelated directory of the
-# same name can satisfy the search. data/ is deliberately not in the set: it is a service tree
-# rather than a shared one, and requiring it would make this module unusable from a checkout that
-# carried only the shared library.
+# must be present, so no single stray name can satisfy the search. data/ is deliberately not in the
+# set: it is a service tree rather than a shared one, and requiring it would make this module
+# unusable from a checkout that carried only the shared library.
 SERVER_MARKERS = ('common', 'routers', 'schemas')
+
+# AND EACH MUST BE AN IMPORTABLE PACKAGE, not merely a directory of that name (bug tj-fts1lo).
+# A bare `is_dir()` test was the original spelling and it is not discriminating enough after the
+# move: `git mv` relocates TRACKED files only, so a checkout that predates tj-iontkq.4 keeps
+# common/, routers/ and schemas/ at the REPOSITORY root holding nothing but untracked __pycache__.
+# Those empty shells answered `is_dir()` and so passed for the server root. The leftovers are
+# untracked, so no clean checkout and no CI run reproduces it and nothing in version control can
+# delete them -- the marker itself has to tell the two apart, and none of the shells carries an
+# __init__.py. It is also the better definition on its own terms: the server root is where the
+# PACKAGES live, not where directories with those names happen to sit.
+#
+# THIS MODULE'S OWN SEARCH WAS NEVER THE ONE THAT COLLAPSED, and the distinction is worth keeping:
+# it walks UPWARD from server/common/tests, so it reaches server/ before the repository root and
+# the shells are never examined. The sites that collapse search DOWNWARD from the repository root
+# and try the root itself first -- tools/agent_mcp/tests/harness.py, which was the reported one,
+# and tests/fakes/record_alpaca.py, which was not reported because its collapse is SILENT: it
+# mkdir -p's the directory it guessed and writes a credentialed sitting's fixtures into it. Both
+# now key on the package.
+#
+# THIS DEFINITION IS SPELLED FOUR TIMES, not two: here, in those two, and in shell in
+# server/data/store/run_migrations.sh. Each duplicate is forced by where it sits (a tools-scoped
+# pytest run cannot import this module; record_alpaca runs as a script; shell is shell), so the
+# control is conformance rather than de-duplication -- common/tests/test_roots.py::
+# test_every_derivation_of_the_two_roots_agrees enumerates all four and holds each to this one.
+# A shared definition is only as strong as its weakest spelling, and until that inventory existed
+# nothing said how many spellings there were.
+PACKAGE_MARKER = '__init__.py'
 
 # Where both searches start: this file's own directory. Both roots are ancestors of it in every
 # layout -- common/tests today, server/common/tests after the move -- so the result follows the
@@ -74,11 +100,18 @@ def find_repo_root(start: Path = _START) -> Path:
     return _nearest_ancestor(start, lambda candidate: (candidate / REPO_MARKER).is_file(), REPO_MARKER)
 
 
+def is_package(parent: Path, name: str) -> bool:
+    """True when PARENT/NAME is an importable package -- a directory carrying __init__.py."""
+    return (parent / name / PACKAGE_MARKER).is_file()
+
+
 def find_server_root(start: Path = _START, markers: Iterable[str] = SERVER_MARKERS) -> Path:
-    """The nearest ancestor of START containing every name in MARKERS as a directory."""
+    """The nearest ancestor of START containing every name in MARKERS as an importable package."""
     names = tuple(markers)
     return _nearest_ancestor(
-        start, lambda candidate: all((candidate / name).is_dir() for name in names), f'all of {names} as directories'
+        start,
+        lambda candidate: all(is_package(candidate, name) for name in names),
+        f'all of {names} as packages (<name>/{PACKAGE_MARKER})',
     )
 
 
