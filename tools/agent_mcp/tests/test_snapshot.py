@@ -57,22 +57,22 @@ def test_live_env_files_and_pycache_are_skipped_but_the_template_is_copied(tree:
     """S3: a sentinel .env under common/ never reaches the snapshot; .env.default does."""
     worktree, stack_dir = tree
     for name in ('.env', '.env.local', '.env.production'):
-        (worktree / 'common' / name).write_text('SECRET=sentinel\n')
-    (worktree / 'common' / '__pycache__').mkdir()
-    (worktree / 'common' / '__pycache__' / 'x.pyc').write_bytes(b'\0')
+        (worktree / 'server' / 'common' / name).write_text('SECRET=sentinel\n')
+    (worktree / 'server' / 'common' / '__pycache__').mkdir()
+    (worktree / 'server' / 'common' / '__pycache__' / 'x.pyc').write_bytes(b'\0')
     stack.refresh_snapshot(stack_dir, worktree)
-    common = stack_dir / 'source' / 'common'
+    common = stack_dir / 'source' / 'server' / 'common'
     assert sorted(path.name for path in common.iterdir()) == ['.env.default', '__init__.py', 'sub']
 
 
 def test_uncommitted_and_untracked_work_is_carried_over(tree: tuple[Path, Path]):
     """S4: the snapshot is of the WORKING TREE, so builders test before committing."""
     worktree, stack_dir = tree
-    (worktree / 'common' / 'sub' / 'module.py').write_text('VALUE = 2  # an uncommitted edit\n')
+    (worktree / 'server' / 'common' / 'sub' / 'module.py').write_text('VALUE = 2  # an uncommitted edit\n')
     (worktree / 'tests' / 'system' / 'test_new.py').write_text('def test_new():\n    pass\n')
     stack.refresh_snapshot(stack_dir, worktree)
     snapshot = stack_dir / 'source'
-    assert (snapshot / 'common' / 'sub' / 'module.py').read_text() == 'VALUE = 2  # an uncommitted edit\n'
+    assert (snapshot / 'server' / 'common' / 'sub' / 'module.py').read_text() == 'VALUE = 2  # an uncommitted edit\n'
     assert (snapshot / 'tests' / 'system' / 'test_new.py').exists()
 
 
@@ -97,37 +97,39 @@ def _outside(worktree: Path) -> Path:
 def test_a_symlink_at_the_top_of_an_entry_is_refused(tree: tuple[Path, Path]):
     worktree, stack_dir = tree
     target = _outside(worktree)
-    (worktree / 'routers').rename(worktree / 'routers_real')
-    (worktree / 'routers').symlink_to(target)
-    _refused_changes_nothing(stack_dir, worktree, 'routers is a symlink')
+    (worktree / 'server' / 'routers').rename(worktree / 'server' / 'routers_real')
+    (worktree / 'server' / 'routers').symlink_to(target)
+    _refused_changes_nothing(stack_dir, worktree, 'server/routers is a symlink')
 
 
 def test_a_symlink_to_a_file_deep_inside_an_entry_is_refused(tree: tuple[Path, Path]):
     worktree, stack_dir = tree
-    (worktree / 'common' / 'sub' / 'link.py').symlink_to(_outside(worktree) / 'secret.txt')
-    _refused_changes_nothing(stack_dir, worktree, 'common/sub/link.py is a symlink')
+    (worktree / 'server' / 'common' / 'sub' / 'link.py').symlink_to(_outside(worktree) / 'secret.txt')
+    _refused_changes_nothing(stack_dir, worktree, 'server/common/sub/link.py is a symlink')
 
 
 def test_a_symlink_to_a_directory_deep_inside_an_entry_is_refused(tree: tuple[Path, Path]):
     """G2 / D11: os.fwalk(follow_symlinks=False) SKIPS a directory link silently; the lstat of dirnames refuses it."""
     worktree, stack_dir = tree
-    (worktree / 'common' / 'sub' / 'dirlink').symlink_to(_outside(worktree), target_is_directory=True)
-    _refused_changes_nothing(stack_dir, worktree, 'common/sub/dirlink is a symlink')
+    (worktree / 'server' / 'common' / 'sub' / 'dirlink').symlink_to(_outside(worktree), target_is_directory=True)
+    _refused_changes_nothing(stack_dir, worktree, 'server/common/sub/dirlink is a symlink')
 
 
 def test_a_dangling_symlink_is_refused(tree: tuple[Path, Path]):
     worktree, stack_dir = tree
-    (worktree / 'schemas' / 'gone.py').symlink_to(worktree / 'nowhere.py')
-    _refused_changes_nothing(stack_dir, worktree, 'schemas/gone.py is a symlink')
+    (worktree / 'server' / 'schemas' / 'gone.py').symlink_to(worktree / 'nowhere.py')
+    _refused_changes_nothing(stack_dir, worktree, 'server/schemas/gone.py is a symlink')
 
 
 def test_a_symlinked_parent_of_a_nested_entry_is_refused(tree: tuple[Path, Path]):
     """data/store/app is an entry; a link at data/store must not be walked through either."""
     worktree, stack_dir = tree
     target = _outside(worktree)
-    (worktree / 'data' / 'store').rename(target / 'store')
-    (worktree / 'data' / 'store').symlink_to(target / 'store')
-    _refused_changes_nothing(stack_dir, worktree, 'data/store/app: store is missing, a symlink or not a directory')
+    (worktree / 'server' / 'data' / 'store').rename(target / 'store')
+    (worktree / 'server' / 'data' / 'store').symlink_to(target / 'store')
+    _refused_changes_nothing(
+        stack_dir, worktree, 'server/data/store/app: store is missing, a symlink or not a directory'
+    )
 
 
 def test_a_fifo_is_refused_without_blocking(tree: tuple[Path, Path]):
@@ -140,8 +142,8 @@ def test_a_socket_is_refused(tree: tuple[Path, Path]):
     worktree, stack_dir = tree
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        server.bind(str(worktree / 'common' / 'sock'))
-        _refused_changes_nothing(stack_dir, worktree, 'common/sock is not a regular file')
+        server.bind(str(worktree / 'server' / 'common' / 'sock'))
+        _refused_changes_nothing(stack_dir, worktree, 'server/common/sock is not a regular file')
     finally:
         server.close()
 
@@ -154,7 +156,7 @@ def test_a_missing_entry_is_refused(tree: tuple[Path, Path]):
 
 def test_the_byte_cap_is_enforced(tree: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch):
     worktree, stack_dir = tree
-    (worktree / 'common' / 'big.bin').write_bytes(b'\0' * 4096)
+    (worktree / 'server' / 'common' / 'big.bin').write_bytes(b'\0' * 4096)
     monkeypatch.setattr(stack, 'SNAPSHOT_MAX_BYTES', 2048)
     _refused_changes_nothing(stack_dir, worktree, 'cap of 2048 bytes')
 
@@ -162,7 +164,7 @@ def test_the_byte_cap_is_enforced(tree: tuple[Path, Path], monkeypatch: pytest.M
 def test_the_file_count_cap_is_enforced(tree: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch):
     worktree, stack_dir = tree
     for index in range(30):
-        (worktree / 'routers' / f'm{index}.py').write_text('')
+        (worktree / 'server' / 'routers' / f'm{index}.py').write_text('')
     monkeypatch.setattr(stack, 'SNAPSHOT_MAX_FILES', 25)
     _refused_changes_nothing(stack_dir, worktree, 'cap of 25 files')
 
@@ -171,7 +173,7 @@ def test_an_empty_directory_flood_hits_the_file_count_cap(tree: tuple[Path, Path
     """02:14 (2): directories tick too, so a flood of empty ones cannot slip under the cap."""
     worktree, stack_dir = tree
     for index in range(40):
-        (worktree / 'schemas' / f'd{index}').mkdir()
+        (worktree / 'server' / 'schemas' / f'd{index}').mkdir()
     monkeypatch.setattr(stack, 'SNAPSHOT_MAX_FILES', 30)
     _refused_changes_nothing(stack_dir, worktree, 'cap of 30 files')
 
@@ -179,7 +181,7 @@ def test_an_empty_directory_flood_hits_the_file_count_cap(tree: tuple[Path, Path
 def test_a_path_over_path_max_is_refused_and_the_next_refresh_recovers(tree: tuple[Path, Path]):
     """02:14 (2): Refused, not an uncaught OSError; the next refresh, with the tree fixed, succeeds."""
     worktree, stack_dir = tree
-    deep = worktree / 'common'
+    deep = worktree / 'server' / 'common'
     fd = os.open(deep, os.O_RDONLY | os.O_DIRECTORY)
     try:
         for _ in range(24):
@@ -194,9 +196,9 @@ def test_a_path_over_path_max_is_refused_and_the_next_refresh_recovers(tree: tup
         os.close(fd)
     _refused_changes_nothing(stack_dir, worktree, 'common')
 
-    shutil.rmtree(worktree / 'common' / ('d' * 200))
+    shutil.rmtree(worktree / 'server' / 'common' / ('d' * 200))
     stack.refresh_snapshot(stack_dir, worktree)
-    assert (stack_dir / 'source' / 'common' / '__init__.py').exists()
+    assert (stack_dir / 'source' / 'server' / 'common' / '__init__.py').exists()
 
 
 # --- T1 / L1: a failed copy leaves no source.new and the live snapshot as it was -------------------
@@ -331,10 +333,10 @@ def test_verify_refuses_a_link_or_special_file_anywhere_and_a_missing_entry(tree
     _, stack_dir = tree
     snapshot = stack_dir / 'source'
     stack.verify_snapshot(snapshot)
-    (snapshot / 'common' / 'link').symlink_to('/etc')
-    with pytest.raises(stack.Refused, match='common/link'):
+    (snapshot / 'server' / 'common' / 'link').symlink_to('/etc')
+    with pytest.raises(stack.Refused, match='server/common/link'):
         stack.verify_snapshot(snapshot)
-    (snapshot / 'common' / 'link').unlink()
+    (snapshot / 'server' / 'common' / 'link').unlink()
     (snapshot / 'uv.lock').unlink()
     with pytest.raises(stack.Refused, match=r'uv\.lock is missing'):
         stack.verify_snapshot(snapshot)

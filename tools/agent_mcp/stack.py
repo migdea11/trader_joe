@@ -179,19 +179,24 @@ DEV_FORBIDDEN_SHORT_PREFIXES = tuple(
 # checkout's live env files, .venv, data directories and .git are never copied, whatever the
 # (agent-writable) .dockerignore says. The build context '.' is the snapshot root itself.
 SOURCE_DIR_NAME = 'source'
+#
+# WORKTREE-RELATIVE PATHS, so the four service trees carry the server/ prefix they gained in epic
+# tj-iontkq.4 and the root siblings -- gen/, tests/, pyproject.toml, uv.lock, entrypoint.sh,
+# pytest.ini -- do not. The snapshot reproduces the worktree's own layout, so what compose and the
+# trusted Dockerfile resolve against it keeps working unchanged.
 SNAPSHOT_SOURCES = (
     'pyproject.toml',
     'uv.lock',
     'entrypoint.sh',
-    'common',
-    'routers',
-    'schemas',
+    'server/common',
+    'server/routers',
+    'server/schemas',
     'gen/proto/python',
-    'data/store/app',
-    'data/ingest/app',
-    'data/store/alembic.ini',
-    'data/store/migrations',
-    'data/store/seeds',
+    'server/data/store/app',
+    'server/data/ingest/app',
+    'server/data/store/alembic.ini',
+    'server/data/store/migrations',
+    'server/data/store/seeds',
     'tests/system',
     'tests/fakes',
     'pytest.ini',
@@ -201,7 +206,9 @@ SNAPSHOT_SOURCES = (
 SNAPSHOT_MAX_BYTES = 200 * 1024 * 1024
 SNAPSHOT_MAX_FILES = 20_000
 SYSTEM_TESTS_DIR = 'tests/system'
-MIGRATION_VERSIONS_DIR = 'data/store/migrations/versions'
+# Worktree- and snapshot-relative, like SNAPSHOT_SOURCES above: data/store travels with the
+# service trees under server/ (tj-iontkq.4), while tests/system stays at the top.
+MIGRATION_VERSIONS_DIR = 'server/data/store/migrations/versions'
 
 # ---------------------------------------------------------------------------------------------
 # THE STACK DIRECTORY (settings.stack_dir; ADR tj-4rr0la addenda 1 (d) and 2).
@@ -215,7 +222,13 @@ STATE_FILE_NAME = 'stack_worktree'
 
 # The committed defaults each generated file starts from, read from the main checkout's HEAD with
 # git cat-file -- never a working-tree file, so no live env file is ever opened.
-ENV_DEFAULT_SOURCES = {'root': '.env.default', 'store': 'data/store/.env.default', 'ingest': 'data/ingest/.env.default'}
+# Paths into the checkout, read from HEAD with git cat-file: the root template stays at the top of
+# the repository, the two service templates travel with their trees (tj-iontkq.4).
+ENV_DEFAULT_SOURCES = {
+    'root': '.env.default',
+    'store': 'server/data/store/.env.default',
+    'ingest': 'server/data/ingest/.env.default',
+}
 ENV_FILE_NAMES = {'root': ROOT_ENV_NAME, 'store': STORE_ENV_NAME, 'ingest': INGEST_ENV_NAME}
 ENV_FILE_VARIABLES = {'root': 'ROOT_ENV_FILE', 'store': 'STORE_ENV_FILE', 'ingest': 'INGEST_ENV_FILE'}
 

@@ -42,25 +42,30 @@ services:
       - "no-new-privileges:true"
     # The source, read-only, each onto its own path under /code. NEVER the repository root, an env
     # directory or an env file: the root would hand the container every .env in the checkout.
-    # data/store/migrations is there because test_schema_constraints reads the head revision
-    # from it with alembic's ScriptDirectory. data/store/alembic.ini sits beside it, as the
+    # server/data/store/migrations is there because test_schema_constraints reads the head revision
+    # from it with alembic's ScriptDirectory. server/data/store/alembic.ini sits beside it, as the
     # repository lays them out, so the migration check with data (tests/system, tj-vhboky.62) runs
     # the alembic CLI from cwd data/store with the repo's own ini -- its relative script_location
-    # resolves to the mounted migrations (tj-7294qb). data/store/seeds, tests/fakes and
-    # data/ingest/app are the seed producer's import closure beyond those (tj-irhy0a.21's
+    # resolves to the mounted migrations (tj-7294qb). server/data/store/seeds, tests/fakes and
+    # server/data/ingest/app are the seed producer's import closure beyond those (tj-irhy0a.21's
     # hand-off): the producer, the fake's synthetic prefixes it checks rows against, and the
     # ingest code the fake imports. gen/proto/python sits beside common because common/rpc imports
     # the generated code from it (decision tj-3mk3u5.42 F1); PYTHONPATH below names it.
+    #
+    # LEFT OF THE COLON ONLY (epic tj-iontkq, R-2). The four service trees moved to ./server in the
+    # checkout; /code inside the container did not move, so every target below is untouched. The
+    # paths that stayed at the top of the repository -- gen/proto/python, tests/, pytest.ini --
+    # keep their bare host spelling, and the mismatch between the two sides is the point.
     volumes:
-      - ./common:/code/common:ro
+      - ./server/common:/code/common:ro
       - ./gen/proto/python:/code/gen/proto/python:ro
-      - ./routers:/code/routers:ro
-      - ./schemas:/code/schemas:ro
-      - ./data/store/app:/code/data/store/app:ro
-      - ./data/store/alembic.ini:/code/data/store/alembic.ini:ro
-      - ./data/store/migrations:/code/data/store/migrations:ro
-      - ./data/store/seeds:/code/data/store/seeds:ro
-      - ./data/ingest/app:/code/data/ingest/app:ro
+      - ./server/routers:/code/routers:ro
+      - ./server/schemas:/code/schemas:ro
+      - ./server/data/store/app:/code/data/store/app:ro
+      - ./server/data/store/alembic.ini:/code/data/store/alembic.ini:ro
+      - ./server/data/store/migrations:/code/data/store/migrations:ro
+      - ./server/data/store/seeds:/code/data/store/seeds:ro
+      - ./server/data/ingest/app:/code/data/ingest/app:ro
       - ./tests/system:/code/tests/system:ro
       - ./tests/fakes:/code/tests/fakes:ro
       - ./pytest.ini:/code/pytest.ini:ro

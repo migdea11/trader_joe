@@ -22,10 +22,10 @@ import pytest
 
 from tools.agent_mcp import runner, seeds, stack
 from tools.agent_mcp.tests.harness import (
-    REPO_ROOT,
     SEED_MANIFEST,
     SEED_REVISION,
     SEED_SQL,
+    SERVER_ROOT,
     WORKTREE_NAME,
     FakeDocker,
     default_response,
@@ -158,7 +158,8 @@ def test_seed_dump_steps_caps_the_producers_stdout_and_nothing_else():
 
 def test_the_refused_exit_status_is_the_producers():
     """SEED_EXIT_REFUSED is the producer's EXIT_REFUSED (data/store/seeds/__main__.py), read by ast."""
-    tree = ast.parse((REPO_ROOT / 'data' / 'store' / 'seeds' / '__main__.py').read_text(encoding='utf-8'))
+    # SERVER_ROOT: the seed producer travels with the service trees (tj-iontkq.4).
+    tree = ast.parse((SERVER_ROOT / 'data' / 'store' / 'seeds' / '__main__.py').read_text(encoding='utf-8'))
     [value] = [
         ast.literal_eval(node.value)
         for node in tree.body

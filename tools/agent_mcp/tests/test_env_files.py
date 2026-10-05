@@ -169,7 +169,9 @@ def test_no_live_env_file_is_ever_opened(tmp_path: Path, monkeypatch: pytest.Mon
     assert all(path.exists() for path in planted)
     for name in (*FILE_NAMES.values(), stack.AUDIT_LOG_NAME):
         assert LIVE_ENV_SENTINEL not in real_read_text(rig.layout.stack_dir / name)
-    assert (rig.layout.snapshot / 'common' / '.env.default').exists(), 'the committed template is part of the source'
+    assert (rig.layout.snapshot / 'server' / 'common' / '.env.default').exists(), (
+        'the committed template is part of the source'
+    )
 
 
 # --- GUARD 2: every verb refuses before its first docker step --------------------------------------
@@ -292,7 +294,9 @@ def test_guard_2_refuses_a_steering_key_in_any_spelling_compose_reads(
     _assert_refused(rig, 'would steer compose')
 
 
-@pytest.mark.parametrize('source', ['.env.default', 'data/store/.env.default', 'data/ingest/.env.default'])
+@pytest.mark.parametrize(
+    'source', ['.env.default', 'server/data/store/.env.default', 'server/data/ingest/.env.default']
+)
 @pytest.mark.parametrize('key', ['COMPOSE_FILE', 'COMPOSE_PROFILES', 'DOCKER_HOST'])
 def test_a_committed_default_with_a_steering_key_is_refused_at_generation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str, key: str

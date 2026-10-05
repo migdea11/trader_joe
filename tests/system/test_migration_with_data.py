@@ -83,13 +83,16 @@ from alembic.script import ScriptDirectory
 from sqlalchemy.engine import URL, Engine
 
 from common.tests.image_path import image_pythonpath
+from common.tests.roots import SERVER_ROOT
 from data.store.seeds.scenario import is_synthetic
 
 
 pytestmark = pytest.mark.data_store
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-STORE_DIR = REPO_ROOT / 'data' / 'store'
+# THE SERVER ROOT (tj-iontkq.2). This module lives in tests/system, which STAYS at the top of the
+# repository, but both uses travel with the services: data/store/ below, and the root handed to
+# image_pythonpath() as a fresh interpreter's import root. SERVER_ROOT, never REPO_ROOT.
+STORE_DIR = SERVER_ROOT / 'data' / 'store'
 MIGRATIONS_DIR = STORE_DIR / 'migrations'
 # The repository's own ini, mounted into test_client (tj-7294qb); see the module docstring.
 ALEMBIC_INI_PATH = STORE_DIR / 'alembic.ini'
@@ -229,7 +232,7 @@ class ScratchDb:
         env = dict(os.environ)
         env['DATABASE_URI'] = self.url.render_as_string(hide_password=False)
         # The image's path model (decision tj-3mk3u5.42 F1): the root, then the generated gRPC code's.
-        env['PYTHONPATH'] = image_pythonpath(REPO_ROOT)
+        env['PYTHONPATH'] = image_pythonpath(SERVER_ROOT)
         argv = [sys.executable, '-m', 'alembic', '-c', str(self._ini_path), *args]
         done = subprocess.run(  # nosec B603 -- fixed argv, no shell
             argv, cwd=STORE_DIR, env=env, capture_output=True, text=True, timeout=ALEMBIC_TIMEOUT_SECONDS, check=False

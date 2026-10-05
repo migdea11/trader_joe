@@ -41,7 +41,6 @@ no migration driven from here) live in conftest.py.
 from collections.abc import Callable
 from datetime import timedelta
 from enum import Enum
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -50,6 +49,7 @@ from alembic.script import ScriptDirectory
 from sqlalchemy.engine import Connection, Engine
 
 from common.enums.data_stock import ExpiryType, Feed, UpdateType
+from common.tests.roots import SERVER_ROOT
 from data.store.app.database.crud.stock.asset_market_activity import build_market_activity_upsert
 from data.store.app.database.models.base_market_activity import BaseMarketActivity
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
@@ -58,8 +58,11 @@ from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 
 pytestmark = pytest.mark.data_store
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-MIGRATIONS_DIR = REPO_ROOT / 'data' / 'store' / 'migrations'
+# THE SERVER ROOT (tj-iontkq.2). This module lives in tests/system, which STAYS at the top of the
+# repository, but what it names -- data/store/migrations -- travels with the services, so the root
+# it needs is SERVER_ROOT. The counted parents[2] it replaces was the repository root, which is
+# exactly the index that would silently stop pointing at the migrations after the move.
+MIGRATIONS_DIR = SERVER_ROOT / 'data' / 'store' / 'migrations'
 
 ENTRY_TABLE = StoreDatasetEntry.__table__
 BAR_TABLE = StockMarketActivity.__table__

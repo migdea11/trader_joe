@@ -33,32 +33,113 @@ from tools.agent_mcp import runner, stack
 from tools.agent_mcp.settings import Settings
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+# THE TWO ROOTS, DERIVED LOCALLY AND DELIBERATELY NOT IMPORTED (tj-iontkq.2).
+#
+# committed_defaults() below reads three files that do NOT share a root: `.env.default` at the top of
+# the repository, and `data/store/.env.default` and `data/ingest/.env.default`, which travel with the
+# service trees. One counted parents[3] called REPO_ROOT served all three only because the two roots
+# are the same directory today.
+#
+# WHY THIS DOES NOT IMPORT common/tests/roots.py, which is the canonical definition of both
+# sentinels. Two reasons, and both are about the seam this module sits on:
+#   * tools/ stays at the top of the repository while common/ travels down, so `make test PATHS=tools`
+#     would have only the repository root on sys.path and `import common.tests.roots` would be an
+#     ImportError -- a whole-tree run would pass and a tools-scoped run would not collect at all.
+#   * the upward marker search cannot find the server root from here anyway: from
+#     tools/agent_mcp/tests the ancestors are tools/agent_mcp, tools and the repository root, and the
+#     server root is none of those once it is a sibling of tools/ rather than the root itself.
+# So the server root is found by stepping DOWN from the repository root instead -- the root itself if
+# it carries the three shared trees, otherwise the one child of it that does. Both raise rather than
+# fall back, for the reason roots.py gives: a sentinel that quietly returns the wrong directory makes
+# every file it names missing and leaves the assertions about them green.
+#
+# EACH MARKER MUST BE AN IMPORTABLE PACKAGE, NOT MERELY A DIRECTORY OF THAT NAME (bug tj-fts1lo).
+# THIS is the search that collapsed, and the downward direction is why: it tries the repository root
+# FIRST, so anything at the root answering the marker wins over the real server/ below it. `git mv`
+# relocates TRACKED files only, so every checkout that predates tj-iontkq.4 -- the user's, any
+# developer's, never CI's, which builds fresh -- still holds common/, routers/ and schemas/ at the
+# repository root containing nothing but untracked __pycache__. Those empty shells answered
+# `is_dir()`, _server_root returned the repository root, and the two roots collapsed back into the
+# single root this epic spent four tasks separating. It surfaced as one loud FileNotFoundError in
+# test_seed_dump, but the collapse restores the PRE-MOVE value, so every other caller that merely
+# needs *a* root went on passing -- vacuously. The leftovers are untracked, so nothing in version
+# control removes them and no clean checkout reproduces the condition: the marker has to
+# discriminate. None of the shells carries an __init__.py.
+#
+# roots.py keys on the same package marker, and so do the other two spellings of this same pair --
+# tests/fakes/record_alpaca.py (same downward shape, same direction, silent when it collapses) and,
+# in shell, server/data/store/run_migrations.sh. FOUR spellings, each forced by where it sits, so
+# common/tests/test_roots.py::test_every_derivation_of_the_two_roots_agrees enumerates all four and
+# holds each to the canonical one. A definition spelled in several places is only as strong as its
+# weakest spelling, and only an inventory can say how many places there are.
+
+SERVER_MARKERS = ('common', 'routers', 'schemas')
+PACKAGE_MARKER = '__init__.py'
+
+
+def _repo_root() -> Path:
+    """The nearest ancestor of this file containing pytest.ini -- the true repository root."""
+    start = Path(__file__).resolve().parent
+    for candidate in (start, *start.parents):
+        if (candidate / 'pytest.ini').is_file():
+            return candidate
+    raise RuntimeError(f'no ancestor of {start} carries pytest.ini, so the repository root cannot be located')
+
+
+def _server_root(repo_root: Path) -> Path:
+    """The directory holding every SERVER_MARKERS name as a PACKAGE: REPO_ROOT, or its one child."""
+    candidates = [repo_root, *sorted(child for child in repo_root.iterdir() if child.is_dir())]
+    for candidate in candidates:
+        if all((candidate / marker / PACKAGE_MARKER).is_file() for marker in SERVER_MARKERS):
+            return candidate
+    raise RuntimeError(
+        f'neither {repo_root} nor any child of it holds all of {SERVER_MARKERS} as packages (<name>/{PACKAGE_MARKER})'
+    )
+
+
+REPO_ROOT = _repo_root()
+SERVER_ROOT = _server_root(REPO_ROOT)
+
+
+def env_default_path(source: str) -> Path:
+    """One ENV_DEFAULT_SOURCES name, resolved against the checkout.
+
+    Every name there is now repository-relative, the service templates included: they read
+    server/data/store/.env.default since the service trees moved (tj-iontkq.4). Before the move the
+    server-side names were bare and this had to pick a root per name; now the one root is correct
+    for all three, and SERVER_ROOT stays exported for the callers below that build server paths.
+    """
+    return REPO_ROOT / source
+
 
 WORKTREE_NAME = 'wt-one'
 
 # One file (or more) under every SNAPSHOT_SOURCES entry, so a snapshot of this tree is complete.
+# The fixture mirrors the real worktree's layout, so the four service trees sit under server/ since
+# epic tj-iontkq.4 and the root siblings -- gen/, tests/, pytest.ini and the three build files -- do
+# not. A key that lost its prefix would sit under no SNAPSHOT_SOURCES entry and silently stop being
+# copied, which is the completeness this dict exists to assert.
 WORKTREE_FILES = {
     'pyproject.toml': '[project]\nname = "fixture"\n',
     'uv.lock': 'version = 1\n',
     'entrypoint.sh': '#!/bin/sh\nexec "$@"\n',
-    'common/__init__.py': '',
-    'common/sub/module.py': 'VALUE = 1\n',
-    'common/.env.default': 'COMMITTED_TEMPLATE=1\n',
-    'routers/__init__.py': '',
-    'schemas/__init__.py': '',
+    'server/common/__init__.py': '',
+    'server/common/sub/module.py': 'VALUE = 1\n',
+    'server/common/.env.default': 'COMMITTED_TEMPLATE=1\n',
+    'server/routers/__init__.py': '',
+    'server/schemas/__init__.py': '',
     # The committed generated gRPC tree the Dockerfile COPYs and compose mounts (decision tj-3mk3u5.42
     # F1). trader_joe/ itself has no __init__.py, as in the real tree: it is a PEP 420 namespace.
     'gen/proto/python/trader_joe/proto/__init__.py': '# guard\n',
     'gen/proto/python/trader_joe/proto/ping/v1/ping_pb2.py': 'DESCRIPTOR = None\n',
-    'data/store/app/main.py': 'APP = "store"\n',
-    'data/ingest/app/main.py': 'APP = "ingest"\n',
-    'data/store/alembic.ini': '[alembic]\n',
-    'data/store/migrations/env.py': 'ENV = 1\n',
-    'data/store/migrations/versions/0001_initial.py': 'revision = "0001"\n',
+    'server/data/store/app/main.py': 'APP = "store"\n',
+    'server/data/ingest/app/main.py': 'APP = "ingest"\n',
+    'server/data/store/alembic.ini': '[alembic]\n',
+    'server/data/store/migrations/env.py': 'ENV = 1\n',
+    'server/data/store/migrations/versions/0001_initial.py': 'revision = "0001"\n',
     # The seed producer, test_client's read-only mount (ADR tj-4rr0la addendum 10 (2); tj-irhy0a.22).
-    'data/store/seeds/__init__.py': '',
-    'data/store/seeds/__main__.py': 'MAIN = 1\n',
+    'server/data/store/seeds/__init__.py': '',
+    'server/data/store/seeds/__main__.py': 'MAIN = 1\n',
     'tests/system/test_one.py': 'def test_one():\n    pass\n',
     'tests/system/sub/test_two.py': 'def test_two():\n    pass\n',
     # The fake-mode overlay's read-only mount source (docker-compose.fake.yaml; tj-vhboky.61).
@@ -88,9 +169,15 @@ def build_worktree(path: Path) -> Path:
 
 
 def plant_live_env_files(worktree: Path) -> list[Path]:
-    """Write live env files (.env, data/store/.env, common/.env.local) holding LIVE_ENV_SENTINEL."""
+    """Write live env files (.env, server/data/store/.env, server/common/.env.local) holding LIVE_ENV_SENTINEL."""
     planted = []
-    for relative in ('.env', 'data/store/.env', 'data/ingest/.env', 'common/.env', 'common/.env.local'):
+    for relative in (
+        '.env',
+        'server/data/store/.env',
+        'server/data/ingest/.env',
+        'server/common/.env',
+        'server/common/.env.local',
+    ):
         target = worktree / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(f'POSTGRES_PASS={LIVE_ENV_SENTINEL}\nALPACA_API_KEY={LIVE_ENV_SENTINEL}\n')
@@ -142,7 +229,9 @@ def make_layout(tmp_path: Path) -> Layout:
 
 def committed_defaults() -> dict[str, str]:
     """The three committed .env.default files, as git cat-file would return them at HEAD."""
-    return {source: (REPO_ROOT / source).read_text(encoding='utf-8') for source in stack.ENV_DEFAULT_SOURCES.values()}
+    return {
+        source: env_default_path(source).read_text(encoding='utf-8') for source in stack.ENV_DEFAULT_SOURCES.values()
+    }
 
 
 def porcelain(paths: Sequence[Path]) -> str:

@@ -37,7 +37,7 @@ BUF_SHA256_AARCH64 := 902b75267db7f4391e99b7fa0756050e5354234cc0437ef50eee9c7889
 # run a BASH rule set, and on this tree that is FOUR rules over six files, against the 337 Python
 # rules it runs beside them. Four generic rules are not a shell linter. So the real static check the
 # ~770 lines of bash here had ever had was `bash -n`, which establishes that a file parses and
-# nothing else. That gap sat under tools/source_digest.sh and data/store/run_migrations.sh, which
+# nothing else. That gap sat under tools/source_digest.sh and server/data/store/run_migrations.sh, which
 # are a digest tool and a verification guard: the least-checked code in the tree was the code a
 # human is asked to trust. (And `make security` is still the wrong home for this -- shellcheck is a
 # linter, and that target must keep running the identical invocation CI runs.)
@@ -208,17 +208,26 @@ proto: $(VENV_MARKER)  ## Regenerate gen/proto/python/ from proto/ (commit both;
 		$$(find $(PROTO_SRC) -name '*.proto' | LC_ALL=C sort)
 
 # THE ERROR CATALOGUE (ADR tj-fa1rpu, the Q-URI addendum of 2026-10-02; tj-3mk3u5.37.10). docs/errors.md
-# is generated from the ONE Reason table in common/errors, and is committed like gen/proto/ above and for
+# is generated from the ONE Reason table in server/common/errors, and is committed like gen/proto/ above and for
 # the same reason: this is the proto pattern (ADR tj-8konfu D3), one target that writes it and a CI step
 # that regenerates and fails on any difference. Nobody edits the generated file -- change the table in
-# common/errors and regenerate in the same commit. The generator is standard-library only and imports
+# server/common/errors and regenerate in the same commit. The generator is standard-library only and imports
 # common.errors and nothing else of ours, so this needs no service, no transport and no database.
 #
 # `--check` writes nothing and exits non-zero when the committed file differs, which is what the
 # validator's in-suite twin of the CI step drives; `--path` points either mode at a scratch copy.
+#
+# PYTHONPATH IS SET HERE AND THIS IS THE ONLY HOST TARGET THAT NEEDS IT (tj-iontkq.4). The generator
+# runs on the host, outside pytest, so it gets neither pytest.ini's pythonpath nor the image's ENV --
+# the two places the import root is otherwise configured. Before the trees moved, `python -m` putting
+# the working directory on sys.path was enough, because common/ sat at the repository root; it now
+# sits under server/ and that stopped being true. The roots and their order are the pair
+# tools/tests/test_errors_doc.py already derives as the two a first-party import can resolve against:
+# the server root first, as the service image has it. THE TEST KNEW AND THE INVOCATION DID NOT, which
+# is why CI broke here and the suite stayed green -- nothing in the suite runs this target.
 .PHONY: errors-doc
-errors-doc: $(VENV_MARKER)  ## Regenerate docs/errors.md from common/errors (commit it; CI fails on a stale file)
-	uv run python -m tools.errors_doc
+errors-doc: $(VENV_MARKER)  ## Regenerate docs/errors.md from server/common/errors (commit it; CI fails on a stale file)
+	PYTHONPATH="$(CURDIR)/server:$(CURDIR)" uv run python -m tools.errors_doc
 
 # Every compose target goes through one of these, and none omits -f. A bare
 # `docker compose` auto-loads docker-compose.override.yaml, which is what made `launch`
@@ -349,7 +358,7 @@ prod-down:  ## Stop the production stack
 # it reaches the database. It needs no egress and no devnet.
 .PHONY: migrate
 migrate:  ## Apply database migrations to the running production stack
-	./data/store/run_migrations.sh
+	./server/data/store/run_migrations.sh
 
 # READ-ONLY, and the approval for this target was conditional on staying that way: `current`
 # reads the alembic_version table, `history` reads the revision files, and neither writes
@@ -370,8 +379,8 @@ migrate:  ## Apply database migrations to the running production stack
 # alembic has no one command for both, and each container is --rm, so the cost is one extra start.
 .PHONY: migrate-status
 migrate-status:  ## Report the applied revision and the revision history (read-only)
-	./data/store/run_migrations.sh current
-	./data/store/run_migrations.sh history
+	./server/data/store/run_migrations.sh current
+	./server/data/store/run_migrations.sh history
 
 # THE DRIFT DIAGNOSTIC, AND IT IS NOT READ-ONLY -- which is the whole reason it is a target of its
 # own rather than a third line of `migrate-status`.
@@ -422,7 +431,7 @@ migrate-status:  ## Report the applied revision and the revision history (read-o
 # reads documents nothing.
 .PHONY: migrate-check
 migrate-check:  ## Compare the models with the live schema (writes alembic_version if absent). REFUSES unless the data_store image's source stamp matches this checkout's digest; an unstamped CI or system-launch image is the ordinary case, not a fault -- make prod-build fixes it. What the stamp does and does not cover: see the comment above. Escape hatch: MIGRATE_CHECK_ALLOW_STALE_IMAGE=1
-	./data/store/run_migrations.sh check
+	./server/data/store/run_migrations.sh check
 
 .PHONY: dev-build
 dev-build: $(VENV_MARKER)  ## Build the development images (:dev), stamped with the source digest
@@ -481,7 +490,7 @@ dev-prune: ## Prune development services
 # `launch-deps` ran dev while the help text said production, and `build` produced prod
 # images no target ever started (tj-6ap2vw). Failing here rather than deleting the names
 # outright means muscle memory gets a pointer instead of picking a stack silently -- and
-# data/store/run_migrations.sh still names `make launch-deps` in its error path, so that
+# server/data/store/run_migrations.sh still names `make launch-deps` in its error path, so that
 # hint degrades into this message rather than into nothing. No `##`: `make help` lists the
 # real targets only.
 .PHONY: build build-clean launch launch-deps launch-down
@@ -1146,7 +1155,10 @@ shellcheck-install:  ## Install the pinned shellcheck, checksum-verified, into S
 # tooling, but it holds Docker access, so bandit reads it like production source.
 # ./gen/proto/python is generated, but the image copies it and runs it, so bandit reads it too
 # (decision tj-3mk3u5.42 F1). CI's SOURCE_PATHS must name the same roots.
-SOURCE_DIRS := ./common ./routers ./schemas ./data ./tools ./gen/proto/python
+# The four service trees live under ./server since epic tj-iontkq; ./tools and ./gen stay at the
+# top of the repository. Get a root wrong and bandit scans nothing and exits 0, which is why
+# common/tests/test_ci_invariants.py asserts every scanner root here is a real directory.
+SOURCE_DIRS := ./server/common ./server/routers ./server/schemas ./server/data ./tools ./gen/proto/python
 
 # semgrep runs with --error, so a finding fails this target (and the CI step) instead of printing
 # and exiting 0 (tj-cg2i9p).
@@ -1203,9 +1215,9 @@ test-cov: $(VENV_MARKER)  ## Run the PR gate with coverage (scope with PATHS=)
 	uv run coverage xml
 
 # One parameterised target rather than one per component, so the set of components can change
-# without touching this file. `make test PATHS=data/store/tests` does the same job today, but
-# only until the Phase 1 restructure (tj-55cczk) moves every path -- markers survive that,
-# PATHS= does not. Component names are the `markers` list in pytest.ini.
+# without touching this file. `make test PATHS=server/data/store/tests` does the same job today,
+# but the path is exactly what the monorepo split (tj-iontkq.4) just rewrote -- markers survived
+# that move untouched, PATHS= did not. Component names are the `markers` list in pytest.ini.
 #
 # A COMPONENT that matches nothing is not silently green: pytest collects nothing and exits 5.
 # The guard is for the EMPTY case only, which would otherwise hand pytest the unparseable
@@ -1372,6 +1384,13 @@ system-launch:  ## Start the stack from the prod images with data_ingest on the 
 # Behind the SAME disposable-database guard as test-system: the producer writes its scenario into
 # whatever database the default compose project's stack holds. $(VENV_MARKER), unlike test-system,
 # because the writer runs in the host venv.
+#
+# ONLY THE WRITER GETS PYTHONPATH, and the asymmetry is the point (tj-iontkq.4). The producer runs
+# INSIDE the container, where the image's own ENV already names the import root and the trees sit at
+# /code unprefixed -- the move deliberately left the container layout alone. The writer runs in the
+# HOST venv, outside pytest, so it gets neither pytest.ini's pythonpath nor the image's ENV, and
+# data.store.seeds.bundle now resolves only with server/ on the path. Same roots and order as the
+# errors-doc target above.
 SEED_OUT ?= output/seeds
 SEED_DUMP_COMPOSE := $(SYSTEM_COMPOSE) -f docker-compose.test-client.yaml
 
@@ -1380,7 +1399,7 @@ seed-dump: $(VENV_MARKER)  ## Dump a seed from the fake-mode stack into SEED_OUT
 	$(SYSTEM_TEST_DISPOSABLE_GUARD)
 	@[ -f .env ] || { echo "make seed-dump: no .env in $(CURDIR); compose interpolates the stack's credentials from it." >&2; exit 1; }
 	$(SEED_DUMP_COMPOSE) run --rm -T --entrypoint /code/.venv/bin/python test_client -m data.store.seeds $(if $(DATE),--date "$$SEED_DUMP_DATE") \
-		| $(VENV_PYTHON) -m data.store.seeds.bundle --out "$$SEED_DUMP_OUT"; \
+		| PYTHONPATH="$(CURDIR)/server:$(CURDIR)" $(VENV_PYTHON) -m data.store.seeds.bundle --out "$$SEED_DUMP_OUT"; \
 		status=("$${PIPESTATUS[@]}"); \
 		if [ "$${status[0]}" -ne 0 ]; then exit "$${status[0]}"; fi; \
 		exit "$${status[1]}"

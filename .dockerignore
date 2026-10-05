@@ -5,7 +5,7 @@ docker-compose.*.yaml
 Dockerfile
 .dockerignore
 
-# Environments. These hold live credentials -- data/ingest/.env carries the Alpaca API
+# Environments. These hold live credentials -- server/data/ingest/.env carries the Alpaca API
 # key -- and nothing in the image reads them: compose supplies configuration at runtime
 # via env_file:. Keeping them out of the build context means a stray COPY cannot pick
 # one up either. .env.default is committed and harmless, so it is not excluded.
@@ -36,12 +36,27 @@ volume_data/
 # C extensions
 *.so
 
-# Test directories under the Dockerfile's COPY roots (tj-v82dvm). The image copies common/,
-# routers/ and schemas/ whole, so without these their suites ship in every service image. No
-# production module imports them (decision tj-j4wknb R4). The top-level tests/ is never copied.
-common/tests/
-routers/tests/
-schemas/tests/
+# Test directories under the Dockerfile's COPY roots (tj-v82dvm). The image copies
+# server/common/, server/routers/ and server/schemas/ whole, so without these their suites ship in
+# every service image. No production module imports them (decision tj-j4wknb R4). The top-level
+# tests/ is never copied.
+# These are BUILD-CONTEXT paths, so they carry the server/ prefix the COPY sources carry (epic
+# tj-iontkq, R-2): a rule that still read common/tests/ would match nothing and fail silently --
+# the suites would simply start shipping again with every check still green.
+server/common/tests/
+server/routers/tests/
+server/schemas/tests/
+
+# The three root siblings that are not server code (tj-iontkq.1). Every service build sets
+# context: . -- docker-compose.yaml for both services, plus docker-compose.test-client.yaml and
+# docker-compose.agent-mcp.yaml -- so anything here is uploaded to the daemon on every build, and
+# that is the whole cost: web/ grows node_modules and client/ grows build artefacts and a .venv.
+# Nothing in a service image reads any of the three. proto/ is the hand-written contract source;
+# what the image needs is protoc's OUTPUT, and it gets exactly that from one COPY of
+# ./gen/proto/python (Dockerfile), which is deliberately NOT excluded here.
+web/
+client/
+proto/
 
 # Unit test / coverage reports
 .pytest_cache/

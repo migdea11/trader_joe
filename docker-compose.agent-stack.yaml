@@ -26,7 +26,7 @@
 #   DATABASE_NAME               postgres's container name, and by interpolation the host compose
 #                               writes into DATABASE_URI. The app reads the same name from its
 #                               CONTAINER environment instead
-#                               (data/store/app/database/database.py), which env_file supplies.
+#                               (server/data/store/app/database/database.py), which env_file supplies.
 #                               The two agree only because the root generated file is BOTH the
 #                               --env-file and ROOT_ENV_FILE, and neither the store nor the ingest
 #                               generated file sets the name.
@@ -87,8 +87,9 @@ services:
       # (docker-compose.yaml's data_store volumes), so compose replaces them rather than adding a
       # second mount. The agent's code runs in this container, and once chose its USER: a writable
       # bind would let it write into the snapshot the MCP later removes, as whatever user it picked.
-      - ./data/store/alembic.ini:/code/alembic.ini:ro
-      - ./data/store/migrations:/code/migrations:ro
+      # Host side only (epic tj-iontkq, R-2): /code is unchanged, the checkout gained ./server.
+      - ./server/data/store/alembic.ini:/code/alembic.ini:ro
+      - ./server/data/store/migrations:/code/migrations:ro
 
   data_ingest:
     image: trader_joe_agent_stack_data_ingest:latest

@@ -386,12 +386,12 @@ def test_the_mcp_build_context_admits_the_trusted_files_and_nothing_live():
     assert [path for path in sent if _is_excluded_from_context(path, rules)] == []
     kept_out = [
         '.env',
-        'data/store/.env',
-        'data/ingest/.env',
+        'server/data/store/.env',
+        'server/data/ingest/.env',
         'volumes/trader_joe/postgres/PG_VERSION',
         'tools/agent_mcp/tests/test_commands.py',
         '.claude/worktrees/x/docker-compose.yaml',
-        'common/__init__.py',
+        'server/common/__init__.py',
         '.git/config',
     ]
     assert [path for path in kept_out if not _is_excluded_from_context(path, rules)] == []
@@ -554,9 +554,9 @@ def test_snapshot_sources_are_exactly_what_the_trusted_files_read_from_the_proje
     expected = set(_dockerfile_copy_sources())
     for name in stack.COMPOSE_FILES:
         expected |= _relative_bind_sources(REPO_ROOT / name)
-    assert {'data/store/migrations', 'tests/system', 'tests/fakes', 'data/ingest/app', 'pytest.ini'} <= expected, (
-        expected
-    )
+    # The service trees moved under server/ (tj-iontkq.4); tests/ and pytest.ini did not.
+    floor = {'server/data/store/migrations', 'tests/system', 'tests/fakes', 'server/data/ingest/app', 'pytest.ini'}
+    assert floor <= expected, expected
     assert set(stack.SNAPSHOT_SOURCES) == expected, (
         f'SNAPSHOT_SOURCES {sorted(stack.SNAPSHOT_SOURCES)} vs what the trusted files read {sorted(expected)}'
     )
@@ -734,8 +734,8 @@ def test_the_only_git_commands_are_worktree_list_and_cat_file_of_a_committed_def
         )
     assert set(stack.ENV_DEFAULT_SOURCES.values()) == {
         '.env.default',
-        'data/store/.env.default',
-        'data/ingest/.env.default',
+        'server/data/store/.env.default',
+        'server/data/ingest/.env.default',
     }
 
 
