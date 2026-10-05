@@ -15,15 +15,26 @@ The range rule is decision tj-j4wknb ADDENDUM 5 (ruling on tj-irhy0a.15): get_ba
 [start, end), half-open, on instants. Alpaca's end is inclusive, so AlpacaRead drops a bar stamped
 exactly at end.
 
-FAILURE CONTRACT: until PR 2, get_bars RAISES on a vendor failure and yields nothing of that fetch
-(tj-j4wknb addendum 2 B, addendum 4 item 11). The tests assert the SDK's APIError propagating; PR
-2's typed errors (tj-fa1rpu) replace it and tighten these tests.
+FAILURE CONTRACT (TE-5 tj-3mk3u5.37.6, re-pointing these tests to TE-4 tj-3mk3u5.37.5): get_bars
+RETURNS a BarsFailure for every vendor failure, classified on the HTTP status alone (ADR tj-fa1rpu,
+the 2026-10-02 Q-EMPTY addendum item 3): 400 VENDOR_INVALID_REQUEST, another 4xx VENDOR_REJECTED, a 429
+after alpaca-py's own retries VENDOR_RATE_LIMITED with a reset_at, 500 and 504 VENDOR_UNAVAILABLE. The
+SDK's APIError is kept as the error's __cause__ and never reaches the caller raised. Nothing of a
+failed fetch is served, never a partial range. Every 200 is SERVED, empty included. A body this
+reader cannot read (a non-whole trade_count, a null 'bars') is a bug and raises (D5).
+
+PROVENANCE STAYS HONEST: error_400.json and bars_empty_absent_symbol.json are RECORDED; the 429, 500
+and 504 bodies, bars_empty_list.json and bars_null.json are DOCUMENTED guesses. Which headers a real
+429 carries is unknown, so the header tests attach them with with_headers() and say so.
+
+Every reader here is built on one injected clock, NOW, after every recorded bar.
 """
 
 import copy
 import math
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from itertools import pairwise
 
@@ -34,10 +45,29 @@ from alpaca.data.timeframe import TimeFrame
 
 from common.enums.data_select import AssetType
 from common.enums.data_stock import Feed, Granularity
+from common.errors.vocabulary import (
+    REASONS,
+    Disposition,
+    ExogenousError,
+    InvalidRequestError,
+    Outcome,
+    Reason,
+    TraderJoeError,
+)
+from data.ingest.app.brokers.alpaca import broker_api
 from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
+from data.ingest.app.brokers.alpaca.classify import RATE_LIMIT_RESET_HEADER, RETRY_AFTER_HEADER
 from data.ingest.app.brokers.alpaca.read import AlpacaRead
-from data.ingest.app.brokers.interface import Bar, BarsQuery, BarsResponse, BrokerUnsupportedError, Instrument
-from data.ingest.app.brokers.rate_budget import RequestPriority
+from data.ingest.app.brokers.interface import (
+    Bar,
+    BarsFailure,
+    BarsQuery,
+    BarsResponse,
+    BrokerUnsupportedError,
+    Instrument,
+    ServedRange,
+)
+from data.ingest.app.brokers.rate_budget import RateBudget, RequestPriority
 from data.ingest.tests.alpaca_recorded import (
     ALPACA_DATA_HOST,
     BARS_PATH,
@@ -50,6 +80,7 @@ from data.ingest.tests.alpaca_recorded import (
     parse_rfc3339,
     record_sdk_sleeps,
     recorded_client,
+    with_headers,
 )
 
 
@@ -74,6 +105,9 @@ WIRE_TIMEFRAME = {
 # alpaca-py 0.44.0's retry facts (tj-vhboky.54 16:44 UTC addendum; tj-vhboky.57 item 6).
 SDK_ATTEMPTS = 4
 SDK_SLEEPS = [3, 3, 3]
+
+# The readers' clock: after every recorded bar (all in 2022).
+NOW = datetime(2026, 10, 2, 12, 0, tzinfo=UTC)
 
 
 @pytest.fixture
@@ -108,11 +142,17 @@ def build_query(
 
 
 def build_reader(client, executor: ThreadPoolExecutor) -> AlpacaRead:
-    return AlpacaRead(client=client, executor_provider=lambda: executor)
+    return AlpacaRead(client=client, executor_provider=lambda: executor, clock=lambda: NOW)
 
 
 async def drain(response: BarsResponse) -> list[Bar]:
+    assert isinstance(response, BarsResponse), f'expected SERVED, got {response!r}'
     return [bar async for bar in response.bars]
+
+
+def failure_of(outcome: BarsResponse | BarsFailure) -> TraderJoeError:
+    assert isinstance(outcome, BarsFailure), f'expected a BarsFailure, got {outcome!r}'
+    return outcome.error
 
 
 def stamps(bars: list[Bar]) -> list[datetime]:
@@ -130,6 +170,52 @@ def test_every_scheme_is_answered_by_the_recorded_transport_and_no_other_host_is
         assert client._session.get_adapter(url) is transport
     with pytest.raises(AssertionError, match='left the recorded vendor host'):
         client._session.get('https://example.com/')
+
+
+def test_a_response_header_attached_to_a_fixture_reaches_the_sdks_error():
+    # TE-5 item 3: the harness answers with headers, so the 429 tests below can carry one or none.
+    recorded = with_headers(load('error_429'), {RETRY_AFTER_HEADER: '7'})
+    client, _transport = recorded_client(always(recorded))
+    start = datetime(2022, 1, 3, 5, tzinfo=UTC)
+    request = StockBarsRequest(symbol_or_symbols=SYMBOL, timeframe=TimeFrame.Day, start=start)
+    # The SDK's retries spent at once, so nothing sleeps: the first attempt raises.
+    client._retry = 0
+
+    with pytest.raises(APIError) as raised:
+        client.get_stock_bars(request)
+
+    assert raised.value.status_code == 429
+    assert raised.value.response.headers[RETRY_AFTER_HEADER] == '7'
+    # Headers are attached, never recorded: the fixture file itself holds none.
+    assert load('error_429').headers == {}
+
+
+def test_each_fixtures_provenance_says_recorded_or_documented_honestly():
+    """The recorded bodies stay 'recorded'; the guesses stay 'documented' (TE-5 item 3)."""
+    kinds = {
+        name: load(name).provenance['kind']
+        for name in (
+            'error_400',
+            'bars_empty_absent_symbol',
+            'error_429',
+            'error_500',
+            'error_504',
+            'bars_empty_list',
+            'bars_null',
+        )
+    }
+
+    assert kinds == {
+        'error_400': 'recorded',
+        'bars_empty_absent_symbol': 'recorded',
+        'error_429': 'documented',
+        'error_500': 'documented',
+        'error_504': 'documented',
+        'bars_empty_list': 'documented',
+        'bars_null': 'documented',
+    }
+    source = load('bars_null').provenance['source']
+    assert 'common/rest.py:395' in source and '/8954' in source and '/12212' in source
 
 
 # --------------------------------------------------------------------------------------------
@@ -266,20 +352,67 @@ async def test_an_open_ended_query_sends_no_end_and_serves_every_recorded_bar(ex
 
 
 # --------------------------------------------------------------------------------------------
-# EMPTY: both body shapes give zero bars (tj-vhboky.57 item 2 ruling: assert the outcome).
+# EMPTY: both body shapes are SERVED with zero bars (Q-EMPTY tj-3mk3u5.37.1, ADR tj-fa1rpu addendum
+# 03:29 UTC 2026-10-02 item 1): never NOT_READY, never a failure.
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('fixture', ['bars_empty_absent_symbol', 'bars_empty_list'], ids=['absent-key', 'empty-list'])
-async def test_both_empty_body_shapes_give_a_response_with_zero_bars(executor, fixture):
+@pytest.mark.parametrize(
+    'fixture',
+    [
+        pytest.param('bars_empty_absent_symbol', id='absent-key-recorded'),
+        pytest.param('bars_empty_list', id='empty-list-documented'),
+    ],
+)
+async def test_both_empty_body_shapes_are_served_with_zero_bars_and_the_asked_window(executor, fixture):
     client, transport = recorded_client(always(load(fixture)))
     start = datetime(2022, 1, 8, 5, tzinfo=UTC)
+    end = start + timedelta(days=2)
 
-    response = await build_reader(client, executor).get_bars(build_query(start, start + timedelta(days=2)))
+    response = await build_reader(client, executor).get_bars(build_query(start, end))
 
     assert isinstance(response, BarsResponse)
     assert response.feed is Feed.IEX
+    assert response.served_range == ServedRange(start, end)
+    assert response.as_of == NOW
     assert await drain(response) == []
+    assert len(transport.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_empty_open_ended_answer_is_served_up_to_as_of(executor):
+    client, _transport = recorded_client(always(load('bars_empty_absent_symbol')))
+    start = datetime(2022, 1, 8, 5, tzinfo=UTC)
+
+    response = await build_reader(client, executor).get_bars(build_query(start, None))
+
+    assert response.served_range == ServedRange(start, NOW)
+    assert await drain(response) == []
+
+
+# --------------------------------------------------------------------------------------------
+# A 200 whose 'bars' is JSON null is NEVER served (Q-EMPTY addendum item 4; TE-5 item 3 NEW PIN).
+
+
+@pytest.mark.asyncio
+async def test_a_null_bars_body_is_never_served_as_a_window(executor):
+    """A null 'bars' is never a SERVED window, whatever else get_bars does with it.
+
+    Not guarded today: alpaca-py raises AttributeError (D5, a loud bug). The pin is the property that
+    matters, so a later narrow guard (follow-up tj-lldllr) that returns a BarsFailure keeps it green.
+    """
+    client, transport = recorded_client(always(load('bars_null')))
+    start = datetime(2022, 1, 8, 5, tzinfo=UTC)
+    reader = build_reader(client, executor)
+
+    try:
+        outcome = await reader.get_bars(build_query(start, start + timedelta(days=2)))
+    except Exception as raised:
+        # Any raise satisfies the pin; only a SERVED answer fails it.
+        outcome = raised
+
+    assert not isinstance(outcome, BarsResponse), 'a null bars body was served as a window'
+    assert isinstance(outcome, BaseException | BarsFailure)
     assert len(transport.sent) == 1
 
 
@@ -358,23 +491,76 @@ async def test_a_null_trade_count_is_served_as_none(executor):
 
 
 # --------------------------------------------------------------------------------------------
-# Retries: 4 attempts, 3 flat 3 s sleeps, codes 429 and 504, then get_bars raises.
+# Retries: 4 attempts, 3 flat 3 s sleeps, codes 429 and 504, then get_bars RETURNS the failure.
+
+
+def whole_day_query() -> BarsQuery:
+    recorded = load('bars_1Day')
+    return build_query(recorded.timestamps[0], recorded.timestamps[-1] + Granularity.ONE_DAY.offset)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('status', [429, 504])
-async def test_a_retried_status_on_every_attempt_makes_four_attempts_then_get_bars_raises(
-    executor, monkeypatch, status
+@pytest.mark.parametrize(
+    ('status', 'reason'),
+    [
+        pytest.param(429, Reason.VENDOR_RATE_LIMITED, id='429-documented'),
+        pytest.param(504, Reason.VENDOR_UNAVAILABLE, id='504-documented'),
+    ],
+)
+async def test_a_retried_status_on_every_attempt_makes_four_attempts_then_returns_the_failure(
+    executor, monkeypatch, status, reason
 ):
     sleeps = record_sdk_sleeps(monkeypatch)
     client, transport = recorded_client(always(load(f'error_{status}')))
-    recorded = load('bars_1Day')
-    query = build_query(recorded.timestamps[0], recorded.timestamps[-1] + Granularity.ONE_DAY.offset)
 
-    with pytest.raises(APIError) as raised:
-        await build_reader(client, executor).get_bars(query)
+    error = failure_of(await build_reader(client, executor).get_bars(whole_day_query()))
 
-    assert raised.value.status_code == status
+    assert error.reason is reason
+    assert REASONS[error.reason].outcome is Outcome.NOT_READY
+    assert isinstance(error.__cause__, APIError)
+    assert error.__cause__.status_code == status
+    assert len(transport.sent) == SDK_ATTEMPTS
+    assert sleeps == SDK_SLEEPS
+
+
+@pytest.fixture
+def deployed_budget(monkeypatch) -> RateBudget:
+    """Alpaca's budget at the deployed default (3/s, burst 3): it refills from empty in 1 s."""
+    budget = RateBudget('ALPACA', rate_per_sec=3.0, burst=3.0)
+    monkeypatch.setattr(broker_api, '__RATE_BUDGET', budget)
+    return budget
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('headers', 'reset_at'),
+    [
+        pytest.param(
+            {RATE_LIMIT_RESET_HEADER: str((NOW + timedelta(seconds=42)).timestamp()), RETRY_AFTER_HEADER: '7'},
+            NOW + timedelta(seconds=42),
+            id='x-ratelimit-reset-wins',
+        ),
+        pytest.param({RETRY_AFTER_HEADER: '7'}, NOW + timedelta(seconds=7), id='retry-after-only'),
+        pytest.param({}, NOW + timedelta(seconds=1), id='no-header-the-budget-refill'),
+    ],
+)
+async def test_a_429_after_one_plus_three_attempts_says_when_the_window_resets(
+    executor, monkeypatch, deployed_budget, headers, reset_at
+):
+    """tj-vz1eta s3, TE-4 item 4: X-RateLimit-Reset, else Retry-After, else the budget's refill from empty.
+
+    The headers are ATTACHED to the documented 429 body: no recording shows which a real 429 sends.
+    """
+    sleeps = record_sdk_sleeps(monkeypatch)
+    client, transport = recorded_client(always(with_headers(load('error_429'), headers)))
+
+    error = failure_of(await build_reader(client, executor).get_bars(whole_day_query()))
+
+    assert type(error) is ExogenousError
+    assert error.reason is Reason.VENDOR_RATE_LIMITED
+    assert error.reset_at == reset_at
+    assert error.reset_at > NOW
+    assert error.retry_after == math.ceil((reset_at - NOW).total_seconds())
     assert len(transport.sent) == SDK_ATTEMPTS
     assert sleeps == SDK_SLEEPS
 
@@ -398,19 +584,21 @@ async def test_one_429_then_a_page_is_served_after_one_retry(executor, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_page_two_answering_500_raises_and_yields_no_bar_from_page_one(executor, monkeypatch):
+async def test_page_two_answering_500_returns_vendor_unavailable_and_no_bar_from_page_one(executor, monkeypatch):
     sleeps = record_sdk_sleeps(monkeypatch)
     page1, page2 = load('bars_1Day_page1'), load('bars_1Day_page2')
     client, transport = recorded_client(by_page_token({None: page1, page1.next_page_token: load('error_500')}))
     query = build_query(page1.timestamps[0], page2.timestamps[-1] + Granularity.ONE_DAY.offset)
     reader = build_reader(client, executor)
 
-    # get_bars itself raises, so no BarsResponse -- and no bar of page 1 -- ever reaches the
-    # caller. An error deferred into iteration would hand back a response first, and fail here.
-    with pytest.raises(APIError) as raised:
-        await reader.get_bars(query)
+    # get_bars itself returns the failure, so no BarsResponse -- and no bar of page 1 -- ever reaches
+    # the caller. An error deferred into iteration would hand back a response first, and fail here.
+    outcome = await reader.get_bars(query)
 
-    assert raised.value.status_code == 500
+    error = failure_of(outcome)
+    assert error.reason is Reason.VENDOR_UNAVAILABLE
+    assert error.__cause__.status_code == 500
+    assert not hasattr(outcome, 'bars')
     # Page 1 was answered and page 2 was asked for, once: 500 is not a retried status.
     assert [sent.params.get('page_token') for sent in transport.sent] == [None, page1.next_page_token]
     assert sleeps == []
@@ -439,40 +627,112 @@ def test_an_error_body_surfaces_from_the_sdk_as_api_error_with_status_and_messag
 
 
 @pytest.mark.asyncio
-async def test_the_sdk_error_reaches_the_reader_caller_unchanged(executor):
-    client, _transport = recorded_client(always(load('error_400')))
+async def test_the_recorded_400_is_returned_as_vendor_invalid_request_with_its_message(executor):
+    """Q-EMPTY addendum (3)(a): end before start is refused through Alpaca's RECORDED 400, on status alone.
+
+    VENDOR_INVALID_REQUEST is REFUSED and CLIENT_FIX: the caller's mistake, never a page to an
+    operator (which VENDOR_REJECTED would be). The vendor's message is the detail, never parsed.
+    """
+    recorded = load('error_400')
+    assert 'code' not in recorded.body, 'the recorded 400 has no code field'
+    client, transport = recorded_client(always(recorded))
     start = datetime(2022, 1, 3, 5, tzinfo=UTC)
 
-    with pytest.raises(APIError) as raised:
-        await build_reader(client, executor).get_bars(build_query(start, start + timedelta(days=1)))
+    error = failure_of(await build_reader(client, executor).get_bars(build_query(start, start - timedelta(days=1))))
 
-    assert raised.value.status_code == 400
-    assert raised.value.message
+    assert type(error) is InvalidRequestError
+    assert error.reason is Reason.VENDOR_INVALID_REQUEST
+    assert (REASONS[error.reason].outcome, REASONS[error.reason].disposition) == (
+        Outcome.REFUSED,
+        Disposition.CLIENT_FIX,
+    )
+    assert error.detail == recorded.body['message'] == 'end should not be before start'
+    assert error.__cause__.status_code == 400
+    assert error.reset_at is None
+    assert len(transport.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_another_4xx_is_returned_as_vendor_rejected(executor):
+    # Constructed, not recorded: Alpaca documents no other 4xx on bars, so one is a surprise worth a page.
+    stub_404 = RecordedResponse(
+        name='constructed_404', status=404, body={'message': 'not found'}, provenance={'kind': 'constructed'}
+    )
+    client, _transport = recorded_client(always(stub_404))
+
+    error = failure_of(await build_reader(client, executor).get_bars(whole_day_query()))
+
+    assert type(error) is ExogenousError
+    assert error.reason is Reason.VENDOR_REJECTED
+    assert (REASONS[error.reason].outcome, REASONS[error.reason].disposition) == (Outcome.REFUSED, Disposition.PAGE)
+    assert error.detail == 'not found'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fixture', ['error_400', 'error_429', 'error_500', 'error_504'])
+async def test_get_bars_never_reads_api_error_code(executor, monkeypatch, fixture):
+    """TE-5 item 3's guard: classified on status_code alone. Fails if anything on the path reads .code.
+
+    The recorded 400 has no code field, so a read there raises KeyError; the documented 429/500/504
+    bodies carry one, so a read there would succeed silently. This property makes every read loud.
+    """
+    reads: list[int | None] = []
+
+    def refuse(self: APIError) -> None:
+        reads.append(self.status_code)
+        raise AssertionError('APIError.code was read')
+
+    monkeypatch.setattr(APIError, 'code', property(refuse))
+    record_sdk_sleeps(monkeypatch)
+    client, _transport = recorded_client(always(load(fixture)))
+
+    outcome = await build_reader(client, executor).get_bars(whole_day_query())
+
+    assert reads == []
+    assert isinstance(outcome, BarsFailure)
 
 
 # --------------------------------------------------------------------------------------------
-# Refusals happen before any HTTP request (tj-j4wknb addendum 4 items 3 and 5).
+# Refusals happen before any HTTP request (tj-j4wknb addendum 4 items 3 and 5; TE-4 item 3).
 
 REFUSED = [
-    pytest.param({'asset_type': AssetType.CRYPTO}, id='asset_type-crypto'),
-    pytest.param({'asset_type': AssetType.OPTION}, id='asset_type-option'),
-    pytest.param({'adjustment': 'split'}, id='adjustment-split'),
-    pytest.param({'adjustment': 'all'}, id='adjustment-all'),
-    pytest.param({'exchange': 'XNAS'}, id='exchange-xnas'),
-    pytest.param({'currency': 'CAD'}, id='currency-cad'),
+    pytest.param({'asset_type': AssetType.CRYPTO}, Reason.UNSUPPORTED_ASSET_TYPE, id='asset_type-crypto'),
+    pytest.param({'asset_type': AssetType.OPTION}, Reason.UNSUPPORTED_ASSET_TYPE, id='asset_type-option'),
+    pytest.param({'adjustment': 'split'}, Reason.UNSUPPORTED_INSTRUMENT, id='adjustment-split'),
+    pytest.param({'adjustment': 'all'}, Reason.UNSUPPORTED_INSTRUMENT, id='adjustment-all'),
+    pytest.param({'exchange': 'XNAS'}, Reason.UNSUPPORTED_INSTRUMENT, id='exchange-xnas'),
+    pytest.param({'currency': 'CAD'}, Reason.UNSUPPORTED_INSTRUMENT, id='currency-cad'),
 ]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('refused', REFUSED)
-async def test_what_alpaca_cannot_serve_is_refused_with_zero_http_requests(executor, refused):
+@pytest.mark.parametrize(('refused', 'reason'), REFUSED)
+async def test_what_alpaca_cannot_serve_is_refused_with_zero_http_requests(executor, refused, reason):
     recorded = load('bars_1Day')
     client, transport = recorded_client(always(recorded))
     query = build_query(recorded.timestamps[0], recorded.timestamps[-1] + Granularity.ONE_DAY.offset, **refused)
 
-    with pytest.raises(BrokerUnsupportedError):
-        await build_reader(client, executor).get_bars(query)
+    error = failure_of(await build_reader(client, executor).get_bars(query))
 
+    assert type(error) is BrokerUnsupportedError
+    assert error.reason is reason
+    assert transport.sent == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('change', 'reason'),
+    [
+        pytest.param({'feed': Feed.SIP}, Reason.FEED_NOT_AVAILABLE, id='named-sip-on-iex'),
+        pytest.param({'start': NOW, 'end': NOW + timedelta(days=1)}, Reason.RANGE_IN_FUTURE, id='range-in-future'),
+    ],
+)
+async def test_the_pre_vendor_refusals_send_no_http_request(executor, change, reason):
+    client, transport = recorded_client(always(load('bars_1Day')))
+
+    error = failure_of(await build_reader(client, executor).get_bars(replace(whole_day_query(), **change)))
+
+    assert error.reason is reason
     assert transport.sent == []
 
 

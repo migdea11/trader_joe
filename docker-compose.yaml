@@ -229,9 +229,45 @@ services:
     healthcheck:
       # Same probe and the same reasoning as data_store: no curl in the image, the venv
       # interpreter is already there, and the check writes nothing under read_only: true.
-      test: ["CMD", "/code/.venv/bin/python", "-c", "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ['APP_INTERNAL_PORT'] + '/ping', timeout=5).read()"]
+      #
+      # TWO HALVES, BOTH MUST PASS (ADR tj-8konfu D6.5; tj-3mk3u5.25). HTTP /ping first, as data_store
+      # does, then the standard grpc.health.v1.Health service: Check for service '' must answer
+      # SERVING. /ping alone reports healthy a container whose gRPC listener is dead. The server
+      # reads NOT_SERVING from the moment it begins to stop, and that fails the check too.
+      #
+      # The gRPC half dials APP_INTERNAL_GRPC_HOST:APP_INTERNAL_GRPC_PORT read from the CONTAINER
+      # environment by os.environ when the check runs (not compose interpolation), i.e. exactly what
+      # the server bound, and NEVER 127.0.0.1. The server listens on the data-ingest-grpc alias's
+      # ingest_store address only, so a loopback probe always fails, and the "fix" that makes a
+      # loopback probe pass is a wildcard bind -- the false green common.rpc's no-default, no-wildcard
+      # rule exists to stop. This proves the listener answers on its own interface. It cannot prove
+      # data_store reaches it; CI System Testing's Check gRPC Peer Reach step does that.
+      #
+      # grpcio and grpcio-health-checking are in the base dependency group (common.rpc imports both),
+      # so this adds nothing to the image; a grpc_health_probe binary would. The sync grpc API is
+      # right for a one-shot probe process: grpc.aio (D2) governs the services' own transport. No
+      # wait_for_ready, so a refused connection fails at once with UNAVAILABLE instead of waiting.
+      #
+      # TIMINGS. timeout 15s: the two 5s call timeouts plus the interpreter's start and the grpc
+      # import must fit inside it, so a slow failure reports its own error rather than being killed.
+      # start_period stays 60s: the gRPC server starts inside the lifespan, before uvicorn answers
+      # /ping, so the second half adds no startup time; the lifespan is otherwise unchanged.
+      test:
+        - CMD
+        - /code/.venv/bin/python
+        - -c
+        - |
+          import os, sys, urllib.request
+          import grpc
+          from grpc_health.v1 import health_pb2, health_pb2_grpc
+          urllib.request.urlopen('http://127.0.0.1:' + os.environ['APP_INTERNAL_PORT'] + '/ping', timeout=5).read()
+          target = os.environ['APP_INTERNAL_GRPC_HOST'].strip() + ':' + os.environ['APP_INTERNAL_GRPC_PORT'].strip()
+          with grpc.insecure_channel(target) as channel:
+              reply = health_pb2_grpc.HealthStub(channel).Check(health_pb2.HealthCheckRequest(service=''), timeout=5)
+          if reply.status != health_pb2.HealthCheckResponse.SERVING:
+              sys.exit(f'gRPC health at {target} reads {health_pb2.HealthCheckResponse.ServingStatus.Name(reply.status)}, not SERVING')
       interval: 10s
-      timeout: 10s
+      timeout: 15s
       retries: 6
       start_period: 60s
     depends_on:

@@ -23,24 +23,46 @@ on. A wall-clock bound would make two identical queries disagree across a step b
 unbounded one would never finish. Scenarios then apply to that range as to any other, so no
 scenario runs forever.
 
+THE TYPED RESULT (ADR tj-fa1rpu D1(a), D2, D3; TE-5 tj-3mk3u5.37.6). get_bars RETURNS a
+BarsResponse (SERVED) or a BarsFailure, exactly as AlpacaRead does, and never raises for either.
+
+* SERVED carries served_range and as_of. as_of is when the fake "answered", read from its clock
+  after any SLOW_ delay. served_range starts at the query's start and ends at the range's end
+  (end, or the OPEN_ENDED_STEPS bound for end None) clamped to as_of: a vendor cannot have answered
+  for time after it answered, and a window this fake clamps by count is reported as clamped (D3
+  note a), never as the whole open range. Every bar served lies inside served_range.
+* Three REFUSALS come before any "vendor" work -- before a scenario is looked at, so no SLOW_
+  sleep is slept and no FAILONCE_ memory is spent -- mirroring AlpacaRead and the Q-EMPTY ruling
+  (tj-3mk3u5.37.1), so fake mode can show each end to end:
+    - a query naming a feed other than this fake's deployment feed: FEED_NOT_AVAILABLE
+      (BrokerUnsupportedError). The deployment feed is the `feed` argument, FEED unless set, so
+      in the fake-mode stack a request naming SIP is the rejection case (tj-3mk3u5.9, 16:36 UTC
+      2026-09-28: the fake's feed-entitlement setting);
+    - a start at or after the fake's clock: RANGE_IN_FUTURE;
+    - an end before the start: VENDOR_INVALID_REQUEST, as Alpaca's recorded 400 answers it.
+* A vendor failure (FAIL_, FAILONCE_, RATELIMIT_) carries a FakeReadError as its error's
+  __cause__, standing in for the exception a real adapter catches and keeps (D8, the 16:22 UTC
+  2026-10-02 addendum item 5).
+
 SCENARIOS are chosen by the requested symbol's PREFIX (no control channel, no restart, parallel
 tests cannot interfere). Import the constants rather than retyping them. data_store upper-cases
 symbols, so every prefix is upper case. No prefix starts with another (FAILONCE_ is not FAIL_
 followed by more), so at most one ever matches and the order they are tried in cannot matter.
 
 * default (no prefix matches) -- every grid bar of the range.
-* EMPTY_ -- a response with zero bars.
+* EMPTY_ -- SERVED with zero bars, served_range as for any range (Q-EMPTY: never a failure).
 * GAPS_ -- every other bar missing: only grid points with an EVEN index k are served.
-* FAIL_ -- get_bars raises FakeReadError and yields nothing, on every call. That is the
-  interface's failure contract in PR 1 (addendum 2 section B); ingest_control turns it into the
-  bare {} at the Kafka RPC edge exactly as it does for the real reader. PR 2's typed errors
-  tighten both.
+* FAIL_ -- a BarsFailure, VENDOR_UNAVAILABLE, on every call, and nothing served. ingest_control
+  turns it into the bare {} at the Kafka RPC edge exactly as it does for the real reader, until
+  tj-3mk3u5.11 removes that edge.
 * SLOW_ -- sleeps slow_delay_seconds (default DEFAULT_SLOW_DELAY_SECONDS, longer than
   data_store's 5 s RPC deadline; refused above MAX_SLOW_DELAY_SECONDS), then serves as default.
 * FAILONCE_ -- the first call for a given (symbol, granularity, start, end) fails as FAIL_ does;
   every later call serves as default. The memory is this INSTANCE's, in process: a service that
   runs more than one worker process fails once PER WORKER, so the fake-mode stack must run
   data_ingest with SERVICE_WORKERS=1.
+* RATELIMIT_ -- a BarsFailure, VENDOR_RATE_LIMITED, on every call, whose reset_at is the fake's
+  clock plus RATELIMIT_RESET_SECONDS: deterministic under an injected clock.
 
 A true hang is not a scenario: nothing here blocks forever.
 """
@@ -49,14 +71,23 @@ import asyncio
 import hashlib
 import math
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
 from common.enums.data_stock import Feed, Granularity
-from data.ingest.app.brokers.interface import Bar, BarsQuery, BarsResponse
+from common.errors.vocabulary import ExogenousError, InvalidRequestError, Reason
+from data.ingest.app.brokers.interface import (
+    Bar,
+    BarsFailure,
+    BarsQuery,
+    BarsResponse,
+    BrokerUnsupportedError,
+    ServedRange,
+)
 
 
-# The entitlement every fake response reports, known before iteration as the interface requires.
+# The deployment feed a FakeRead serves unless built with another: the entitlement every fake
+# response reports, known before iteration as the interface requires.
 FEED = Feed.IEX
 
 # Every bar timestamp is GRID_EPOCH + k * granularity.offset for an integer k.
@@ -70,11 +101,18 @@ DEFAULT_SLOW_DELAY_SECONDS = 8.0
 # SLOW_ is bounded: a delay above this is refused when the fake is built, never slept.
 MAX_SLOW_DELAY_SECONDS = 60.0
 
+# How far past the fake's clock a RATELIMIT_ failure says its window resets.
+RATELIMIT_RESET_SECONDS = 60.0
+
+# The detail of the end-before-start refusal: Alpaca's own recorded 400 message (error_400.json).
+END_BEFORE_START_DETAIL = 'end should not be before start'
+
 EMPTY_PREFIX = 'EMPTY_'
 GAPS_PREFIX = 'GAPS_'
 FAIL_PREFIX = 'FAIL_'
 SLOW_PREFIX = 'SLOW_'
 FAILONCE_PREFIX = 'FAILONCE_'
+RATELIMIT_PREFIX = 'RATELIMIT_'
 
 
 class Scenario(StrEnum):
@@ -86,6 +124,7 @@ class Scenario(StrEnum):
     FAIL = 'fail'
     SLOW = 'slow'
     FAILONCE = 'failonce'
+    RATELIMIT = 'ratelimit'
 
 
 # Every scenario but DEFAULT, by the prefix that selects it.
@@ -95,11 +134,20 @@ SCENARIO_PREFIXES: dict[str, Scenario] = {
     FAIL_PREFIX: Scenario.FAIL,
     SLOW_PREFIX: Scenario.SLOW,
     FAILONCE_PREFIX: Scenario.FAILONCE,
+    RATELIMIT_PREFIX: Scenario.RATELIMIT,
 }
 
 
 class FakeReadError(Exception):
-    """The failure FAIL_ and FAILONCE_ raise from get_bars, standing in for a vendor failure."""
+    """The vendor-side exception a FAIL_, FAILONCE_ or RATELIMIT_ failure carries as its error's __cause__.
+
+    Never raised out of get_bars: it stands for what a real adapter catches from its vendor and keeps
+    as the cause of the typed error it returns (ADR tj-fa1rpu D8, the 16:22 UTC 2026-10-02 addendum).
+    """
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 def scenario_for(symbol: str) -> Scenario:
@@ -142,13 +190,33 @@ def grid_timestamps(granularity: Granularity, start: datetime, end: datetime | N
         datetime: Each grid point t with start <= t < end.
     """
     step = granularity.offset
-    # Ceiling division: the index of the first grid point at or after start.
-    k = -((GRID_EPOCH - start) // step)
-    stop = GRID_EPOCH + (k + OPEN_ENDED_STEPS) * step if end is None else end
-    timestamp = GRID_EPOCH + k * step
+    stop = range_end(granularity, start, end)
+    timestamp = GRID_EPOCH + _first_index(granularity, start) * step
     while timestamp < stop:
         yield timestamp
         timestamp += step
+
+
+def _first_index(granularity: Granularity, start: datetime) -> int:
+    # Ceiling division: the index of the first grid point at or after start.
+    return -((GRID_EPOCH - start) // granularity.offset)
+
+
+def range_end(granularity: Granularity, start: datetime, end: datetime | None) -> datetime:
+    """The exclusive end of the range FakeRead serves for [start, end), before any clamp to its clock.
+
+    Args:
+        granularity (Granularity): Grid step.
+        start (datetime): Inclusive start, timezone aware.
+        end (datetime | None): Exclusive end, timezone aware, or None for an open-ended query.
+
+    Returns:
+        datetime: end itself, or for end None the grid point OPEN_ENDED_STEPS steps on from the first
+            grid point at or after start: the count bound.
+    """
+    if end is not None:
+        return end
+    return GRID_EPOCH + (_first_index(granularity, start) + OPEN_ENDED_STEPS) * granularity.offset
 
 
 def _unit(digest: bytes, slot: int) -> float:
@@ -195,14 +263,19 @@ def fake_bar(symbol: str, timestamp: datetime) -> Bar:
 class FakeRead:
     """A deterministic BrokerRead: bars from fake_bar(), behaviour chosen by the symbol's prefix.
 
-    See the module docstring for the grid, the half-open range, the open-ended bound and each
-    scenario.
+    See the module docstring for the grid, the half-open range, the open-ended bound, the typed
+    result, the refusals and each scenario.
 
     Args:
         slow_delay_seconds (float): How long SLOW_ sleeps before serving. Finite, 0 to
             MAX_SLOW_DELAY_SECONDS inclusive.
         sleep (Callable[[float], Awaitable[None]]): What SLOW_ awaits; asyncio.sleep unless a
             test injects its own.
+        clock (Callable[[], datetime]): Yields now, timezone aware: the future-range refusal, the
+            as_of a response is stamped with, the end served_range is clamped to and RATELIMIT_'s
+            reset_at all read it. Injectable, as AlpacaRead's is, so tests need not sleep.
+        feed (Feed): The deployment feed: the tape this fake serves, and the only one a query may
+            name. FEED unless set.
 
     Raises:
         ValueError: If slow_delay_seconds is not finite or lies outside 0 to MAX_SLOW_DELAY_SECONDS.
@@ -212,6 +285,8 @@ class FakeRead:
         self,
         slow_delay_seconds: float = DEFAULT_SLOW_DELAY_SECONDS,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        clock: Callable[[], datetime] = _utc_now,
+        feed: Feed = FEED,
     ) -> None:
         if not (math.isfinite(slow_delay_seconds) and 0 <= slow_delay_seconds <= MAX_SLOW_DELAY_SECONDS):
             raise ValueError(
@@ -220,6 +295,8 @@ class FakeRead:
             )
         self.__slow_delay_seconds = slow_delay_seconds
         self.__sleep = sleep
+        self.__clock = clock
+        self.__feed = feed
         self.__failed_once: set[tuple[str, Granularity, datetime, datetime | None]] = set()
 
     @property
@@ -227,37 +304,92 @@ class FakeRead:
         """How long SLOW_ sleeps before serving, in seconds."""
         return self.__slow_delay_seconds
 
-    async def get_bars(self, query: BarsQuery) -> BarsResponse:
+    @property
+    def feed(self) -> Feed:
+        """The deployment feed this fake serves."""
+        return self.__feed
+
+    async def get_bars(self, query: BarsQuery) -> BarsResponse | BarsFailure:
         """Serve fake bars for one instrument, per the scenario its symbol selects.
 
         Args:
             query (BarsQuery): What to fetch.
 
         Returns:
-            BarsResponse: FEED and the bars of [start, end), or of OPEN_ENDED_STEPS grid points
-                when end is None.
-
-        Raises:
-            FakeReadError: For FAIL_ always, and for FAILONCE_ on the first call per range.
+            BarsResponse | BarsFailure: The deployment feed, the bars of [start, end) (or of
+                OPEN_ENDED_STEPS grid points when end is None) up to as_of, served_range and as_of;
+                or the failure: FEED_NOT_AVAILABLE, RANGE_IN_FUTURE or VENDOR_INVALID_REQUEST before
+                any scenario, VENDOR_UNAVAILABLE for FAIL_ and a first FAILONCE_, VENDOR_RATE_LIMITED
+                for RATELIMIT_.
         """
+        refusal = self.__refusal(query)
+        if refusal is not None:
+            return BarsFailure(refusal)
+
         symbol = query.instrument.symbol
         scenario = scenario_for(symbol)
         if scenario is Scenario.FAIL:
-            raise FakeReadError(f'FAIL scenario: symbol={symbol!r}')
+            return self.__unavailable(f'FAIL scenario: symbol={symbol!r}')
         if scenario is Scenario.FAILONCE:
             key = (symbol, query.granularity, query.start, query.end)
             if key not in self.__failed_once:
                 self.__failed_once.add(key)
-                raise FakeReadError(f'FAILONCE scenario, first call: symbol={symbol!r}')
+                return self.__unavailable(f'FAILONCE scenario, first call: symbol={symbol!r}')
+        if scenario is Scenario.RATELIMIT:
+            return self.__rate_limited(symbol)
         if scenario is Scenario.SLOW:
             await self.__sleep(self.__slow_delay_seconds)
-        return BarsResponse(feed=FEED, bars=self.__iterate(query, scenario))
+
+        # When the "vendor" answered: after any delay, so a slow answer is stamped late, as a real one is.
+        as_of = self.__clock().astimezone(UTC)
+        served_end = min(range_end(query.granularity, query.start, query.end), as_of)
+        return BarsResponse(
+            feed=self.__feed,
+            bars=self.__iterate(query, scenario, served_end),
+            served_range=ServedRange(query.start, served_end),
+            as_of=as_of,
+        )
+
+    def __refusal(self, query: BarsQuery) -> BrokerUnsupportedError | InvalidRequestError | None:
+        """The refusal a query earns before any "vendor" work, or None to go on to the scenario."""
+        if query.feed is not None and query.feed != self.__feed:
+            return BrokerUnsupportedError(
+                Reason.FEED_NOT_AVAILABLE,
+                f'This deployment cannot serve the requested feed: feed={query.feed.value}',
+                metadata={'feed': query.feed.value},
+            )
+        now = self.__clock()
+        if query.start >= now:
+            return InvalidRequestError(
+                Reason.RANGE_IN_FUTURE,
+                f'The range starts at or after now: start={query.start.isoformat()}, now={now.isoformat()}',
+                metadata={'range_start': query.start.isoformat()},
+            )
+        if query.end is not None and query.end < query.start:
+            return InvalidRequestError(Reason.VENDOR_INVALID_REQUEST, END_BEFORE_START_DETAIL)
+        return None
 
     @staticmethod
-    async def __iterate(query: BarsQuery, scenario: Scenario) -> AsyncIterator[Bar]:
+    def __unavailable(cause: str) -> BarsFailure:
+        error = ExogenousError(Reason.VENDOR_UNAVAILABLE, 'The fake vendor failed on its side.')
+        error.__cause__ = FakeReadError(cause)
+        return BarsFailure(error)
+
+    def __rate_limited(self, symbol: str) -> BarsFailure:
+        error = ExogenousError(
+            Reason.VENDOR_RATE_LIMITED,
+            'The fake vendor rate-limited the request.',
+            reset_at=self.__clock() + timedelta(seconds=RATELIMIT_RESET_SECONDS),
+            clock=self.__clock,
+        )
+        error.__cause__ = FakeReadError(f'RATELIMIT scenario: symbol={symbol!r}')
+        return BarsFailure(error)
+
+    @staticmethod
+    async def __iterate(query: BarsQuery, scenario: Scenario, served_end: datetime) -> AsyncIterator[Bar]:
         if scenario is Scenario.EMPTY:
             return
-        for timestamp in grid_timestamps(query.granularity, query.start, query.end):
+        for timestamp in grid_timestamps(query.granularity, query.start, served_end):
             if scenario is Scenario.GAPS and grid_index(query.granularity, timestamp) % 2:
                 continue
             yield fake_bar(query.instrument.symbol, timestamp)

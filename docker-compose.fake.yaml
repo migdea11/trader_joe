@@ -21,7 +21,8 @@
 # The repository commits no tests/__init__.py either, so the host import path and the container's agree.
 #
 # data_ingest ONLY. Nothing else changes: same image, networks, env files and healthcheck (it probes
-# /ping on APP_INTERNAL_PORT, which the launcher's app serves like production's).
+# /ping on APP_INTERNAL_PORT and gRPC health on APP_INTERNAL_GRPC_HOST:APP_INTERNAL_GRPC_PORT, both of
+# which the launcher's app serves like production's, since it runs production's create_app and lifespan).
 services:
   data_ingest:
     volumes:

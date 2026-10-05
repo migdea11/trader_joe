@@ -16,7 +16,8 @@ The bead's validator gate, one section each:
      declared by no overlay (so none blanks or overrides them), non-blank once rendered.
   2. The host is an alias declared on data_ingest's ingest_store attachment and on no other network
      or service; not a service, host or container name; a plain RFC 1123 name, not loopback and not
-     an address literal (so not 0.0.0.0, :: or 0).
+     an address literal (so not 0.0.0.0, :: or 0). Written literally, with no interpolation, so no
+     env file can redirect it (tj-3mk3u5.25 gate item 5).
   3. The port renders to one integer 1..65535 with no DATA_INGEST_GRPC_PORT at all (an env file from
      before T3a; the agent stack's generated env), with it blank, and with .env.default's value --
      the same port each way -- and production's BindAddress.from_env accepts what compose renders.
@@ -264,9 +265,12 @@ def test_the_bind_host_is_an_alias_on_ingest_store_and_nowhere_else(launch_set: 
     An alias on any other network -- ingest_egress, or devnet in dev -- makes the name resolve to
     that address too, and the server could bind where data_store cannot reach it and still start
     cleanly. The service name, hostname or container name maps to whichever address /etc/hosts got
-    by attach order. Literal: the same under every interpolation env, so no env file can move it.
-    (Should tj-3mk3u5.25 take its optional dev reach -- the same alias on devnet, in the override --
-    its validator re-points the DEV and TOOLS cases here.)
+    by attach order. The same under every interpolation env named here; that alone does not show no
+    env file can move it (a ${VAR:-...} default renders the same under all three), which is
+    test_the_bind_host_and_its_alias_are_literal_in_the_base_file's job.
+    tj-3mk3u5.25 did NOT take its optional dev reach (its builder's decision note, 17:07 UTC
+    2026-10-02), so no devnet alias exists and every launch set, DEV and TOOLS included, stays strict
+    to {(data_ingest, ingest_store)} here (that task's gate item 4).
     """
     model = _model(launch_set)
     envs = _interpolation_envs()
@@ -285,6 +289,33 @@ def test_the_bind_host_is_an_alias_on_ingest_store_and_nowhere_else(launch_set: 
             f'it is an alias on {sorted(aliases)}'
         )
         assert not others, f'{launch_set} under {env_name}: {host!r} is also {others}; the alias must be its only use'
+
+
+def test_the_bind_host_and_its_alias_are_literal_in_the_base_file():
+    """No env file can redirect the host (tj-3mk3u5.25 gate item 5; the T3a gate's F-A).
+
+    The test above renders the host under three named envs, so a base value of
+    ${SOME_VAR:-data-ingest-grpc} passes it -- and any env file, shell or generated agent-stack env
+    that sets SOME_VAR would then move the listener, while CI's run, which never sets it, stays green.
+    So the value as WRITTEN in docker-compose.yaml carries no interpolation at all, and neither does
+    the ingest_store alias it must equal: compose substitutes nothing, and environment: outranks
+    every env_file, so the container receives exactly this text. No overlay sets either value
+    (test_the_base_file_sets_both_bind_variables_and_no_overlay_touches_them).
+    """
+    service = (load(BASE_FILE).get('services') or {}).get(DATA_INGEST) or {}
+    raw_host = _environment(service.get('environment')).get(GRPC_HOST_ENV)
+    assert raw_host, f'{BASE_FILE.name} does not set {DATA_INGEST} {GRPC_HOST_ENV}'
+    assert '$' not in raw_host, (
+        f'{BASE_FILE.name} sets {GRPC_HOST_ENV}={raw_host!r}; any interpolation lets an env file move the listener'
+    )
+    networks = service.get('networks')
+    attachment = (networks.get(BIND_NETWORK) if isinstance(networks, dict) else None) or {}
+    aliases = [str(alias) for alias in attachment.get('aliases') or []]
+    interpolated = [alias for alias in aliases if '$' in alias]
+    assert not interpolated, f'{BASE_FILE.name} {DATA_INGEST}/{BIND_NETWORK} aliases interpolate: {interpolated}'
+    assert raw_host in aliases, (
+        f'{GRPC_HOST_ENV}={raw_host!r} is not literally one of {DATA_INGEST}/{BIND_NETWORK} aliases {aliases}'
+    )
 
 
 # --- Item 3: the port, with or without an env file value -------------------------------------------

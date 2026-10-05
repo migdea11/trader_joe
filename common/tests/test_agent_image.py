@@ -7,7 +7,7 @@ to. An earlier attempt declared the dev container feature instead, which a plain
 build` never applies, and the image came out with no Claude at all -- silently (tj-gys6xn's notes).
 Nothing can build the image here (the agent container has no Docker), so these read the Dockerfile.
 
-Four properties, each one a silent failure if lost:
+Five properties, each one a silent failure if lost:
 
 * THE VERSION. The installer's version argument is the image's starting version, and the
   Dockerfile's own comment names .claude/workflow.yml's claude_code pin as "what to bump". Two
@@ -20,9 +20,13 @@ Four properties, each one a silent failure if lost:
   into grep -P and end in `|| true`, so an image without either one runs every hook as an allow.
   common/tests/test_harness_hooks.py checks the tools wherever the suite runs; this pins that the
   image itself carries them, which CI, running in a different image, cannot otherwise see.
+* NO NODE (tj-3mk3u5.52). nodejs and npm left the apt line with the npm install: nothing in the
+  image runs them, and an unused package manager is supply-chain surface. Nothing would notice
+  them slipping back in, so the pin makes adding them a decision instead.
 """
 
 import re
+import shlex
 from pathlib import Path
 
 import pytest
@@ -38,6 +42,13 @@ INSTALLER_URL = 'https://claude.ai/install.sh'
 # `curl ... install.sh | bash -s <version>`: the native installer's version argument.
 INSTALLER_VERSION = re.compile(re.escape(INSTALLER_URL) + r'\s*\|\s*bash\s+-s\s+(\S+)')
 ROOT_USERS = {'root', '0'}
+APT_FRONTENDS = {'apt-get', 'apt'}
+# apt options whose value is the next word, so that value is never read as a package or subcommand.
+APT_OPTIONS_WITH_A_VALUE = {'-o', '--option', '-c', '--config-file', '-t', '--target-release'}
+# `NAME=value` before a command word: an environment assignment, not the command.
+ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*=')
+# Removed with the npm install of Claude Code (tj-3mk3u5.52): nothing in the agent image runs them.
+UNUSED_PACKAGES = {'nodejs', 'npm'}
 
 
 def _instructions() -> list[tuple[str, str]]:
@@ -79,6 +90,53 @@ def _user_at(instructions: list[tuple[str, str]], index: int) -> str:
     """The USER in effect at instruction `index`: the last USER before it, or root when there is none."""
     users = [arguments for keyword, arguments in instructions[:index] if keyword == 'USER']
     return users[-1] if users else 'root'
+
+
+def _apt_install_packages(run: str) -> list[str]:
+    """The packages that each `apt-get install` or `apt install` in one RUN's shell text names, in order.
+
+    Tokenised the way the shell splits it: quotes are respected, and `&&`, `||`, `;` and `|` end a
+    command. So a package named outside an install (a purge, an echo) does not count, and an install
+    counts wherever it sits in the RUN. Version, architecture and release qualifiers are dropped:
+    `npm=9.2.0~ds1-1`, `nodejs:amd64` and `nodejs/bookworm-backports` name npm and nodejs.
+    """
+    lexer = shlex.shlex(run, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ''
+    commands: list[list[str]] = [[]]
+    for token in lexer:
+        if token and all(char in lexer.punctuation_chars for char in token):
+            commands.append([])
+        else:
+            commands[-1].append(token)
+    packages: list[str] = []
+    for words in commands:
+        while words and ASSIGNMENT.match(words[0]):
+            words = words[1:]
+        if not words or Path(words[0]).name not in APT_FRONTENDS:
+            continue
+        operands: list[str] = []
+        takes_value = False
+        for word in words[1:]:
+            if takes_value:
+                takes_value = False
+            elif word in APT_OPTIONS_WITH_A_VALUE:
+                takes_value = True
+            elif not word.startswith('-'):
+                operands.append(word)
+        if operands[:1] == ['install']:
+            packages.extend(re.split(r'[=:/]', operand, maxsplit=1)[0] for operand in operands[1:])
+    return packages
+
+
+def _apt_installs() -> list[tuple[str, str]]:
+    """(package, the RUN that installs it) for every package any apt install in the Dockerfile names."""
+    return [
+        (package, arguments)
+        for keyword, arguments in _instructions()
+        if keyword == 'RUN'
+        for package in _apt_install_packages(arguments)
+    ]
 
 
 def test_claude_code_installs_at_the_version_the_workflow_manifest_pins() -> None:
@@ -146,13 +204,58 @@ def test_the_agent_image_carries_the_hook_pipelines_tools() -> None:
         f"the agent image is built FROM {bases}; the hooks need a grep with -P, which Debian's "
         f'essential GNU grep provides. On another base, install one and update this pin.'
     )
-    apt_packages = {
-        word
-        for keyword, arguments in instructions
-        if keyword == 'RUN' and 'apt-get install' in arguments
-        for word in arguments.split()
-    }
+    apt_packages = {package for package, _ in _apt_installs()}
     assert 'jq' in apt_packages, (
         'no apt-get install in the agent image installs jq, which both PreToolUse hooks in '
         '.claude/settings.json pipe every command through; without it they allow everything.'
     )
+
+
+def test_no_apt_install_brings_back_nodejs_or_npm() -> None:
+    """The nodejs and npm packages left with the npm install of Claude Code (tj-3mk3u5.52), and stay out.
+
+    Nothing in the image runs them: claude is the native binary, the hooks run jq and grep, the
+    entrypoint is sh, .mcp.json's one server is http, and VS Code brings its own node. The
+    Dockerfile's note names what would justify adding them back (something that runs them, such as
+    an MCP server started through npx), and this pin makes that a decision rather than a word that
+    slips back onto an apt line.
+    """
+    installs = _apt_installs()
+    assert installs, f'found no apt install in {DOCKERFILE.relative_to(REPO_ROOT)}, so this pin would pass vacuously'
+    returned = [(package, run) for package, run in installs if package in UNUSED_PACKAGES]
+    assert not returned, (
+        f'the agent image apt-installs {sorted({package for package, _ in returned})} again: '
+        f'{[run for _, run in returned]}. tj-3mk3u5.52 removed them because nothing in the image runs '
+        "them. If something now does, name it in the Dockerfile's note and change this pin in the same commit."
+    )
+
+
+@pytest.mark.parametrize(
+    ('run', 'packages'),
+    [
+        pytest.param(
+            'apt-get update && apt-get install -y --no-install-recommends jq nodejs && rm -rf /var/lib/apt/lists/*',
+            ['jq', 'nodejs'],
+            id='chained-install',
+        ),
+        pytest.param(
+            'apt-get -y install npm=9.2.0~ds1-1 nodejs:amd64 nodejs/bookworm-backports',
+            ['npm', 'nodejs', 'nodejs'],
+            id='options-first-and-qualifiers',
+        ),
+        pytest.param(
+            'DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Use-Pty=0 -t bookworm-backports npm',
+            ['npm'],
+            id='assignment-and-valued-options',
+        ),
+        pytest.param('apt install nodejs; /usr/bin/apt-get install npm', ['nodejs', 'npm'], id='apt-and-absolute-path'),
+        pytest.param(
+            'apt-get purge -y nodejs npm && echo "apt-get install nodejs" && rm -rf /var/lib/apt',
+            [],
+            id='not-an-install',
+        ),
+    ],
+)
+def test_the_apt_reader_finds_what_each_install_names(run: str, packages: list[str]) -> None:
+    """The reader behind the apt pins. One that found nothing would pass every no-X pin vacuously."""
+    assert _apt_install_packages(run) == packages

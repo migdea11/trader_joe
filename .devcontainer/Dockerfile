@@ -14,7 +14,7 @@ ARG GID=1000
 # has to install Python on the host to use it. Distribution packages rather than pip, because a
 # bookworm base refuses pip installs into the system environment.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl git jq less openssh-client ripgrep tar nodejs npm \
+        ca-certificates curl git jq less openssh-client ripgrep tar \
         python3 python3-yaml \
     && rm -rf /var/lib/apt/lists/*
 
@@ -65,6 +65,10 @@ RUN set -eux; \
 # Not the dev container feature either: this image is built by `make agent-build`, a plain
 # `docker compose build`, and devcontainer.json's features are applied only by the Dev Containers
 # CLI or IDE extension. Declaring the feature installs nothing here — it leaves no Claude at all.
+#
+# nodejs and npm left the first apt line with the npm install (tj-3mk3u5.52): nothing else in this
+# image runs them, and VS Code brings its own node for its server. Something that does need them,
+# such as an MCP server started through npx, is the reason to add them back; name it here if so.
 
 # --- tailored for trader_joe from here down -------------------------------------------------
 # The project's own toolchain, so an agent can actually run `make test` / `make lint` instead of
@@ -132,6 +136,10 @@ USER ${USERNAME}
 # the image, but never re-seeds a populated one, so after a version bump the volume would still
 # hold the old payload while the image's launcher symlink pointed at a version that is not there.
 ENV PATH="/home/${USERNAME}/.local/bin:${PATH}"
+# No checksum is pinned on this script, unlike bd, dolt and uv above, and on purpose: accepted risk
+# tj-y9imnu. The trust root is the vendor origin, which the in-place updater pulls every later
+# version from anyway, so a pin here would protect one build and nothing after it; upstream
+# publishes no checksum to pin.
 RUN curl -fsSL https://claude.ai/install.sh | bash -s 2.1.274 \
     && claude --version
 

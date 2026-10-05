@@ -14,9 +14,15 @@ lifespan's gRPC host is the real one, bound to 127.0.0.1 by grpc_bind.LoopbackGr
 lifespan reads its bind address from the environment with no default (tj-3mk3u5.24). Readers
 standing in for a broker below ingest_control are plain classes that conform structurally, like any
 BrokerRead.
+
+THE TYPED RESULT (TE-5 tj-3mk3u5.37.6, re-pointing this file to TE-4 tj-3mk3u5.37.5): a refusal is a
+BarsFailure RETURNED by get_bars, not a raise, and RecordingRead returns one too. ingest_control, the
+Kafka edge, keeps today's bare {} for every BarsFailure until tj-3mk3u5.11 removes that edge, with one
+exception the architect rules on: a MissingCredentialsError still reaches the caller by name.
 """
 
 import inspect
+import logging
 import os
 from collections.abc import AsyncIterator, Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -31,6 +37,7 @@ import pytest
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
+from common.errors.vocabulary import REASONS, InvalidRequestError, Reason, TraderJoeError
 from common.kafka.messaging.kafka_consumer import KafkaConsumerFactory
 from data.ingest.app import app_depends, ingest_control, main
 from data.ingest.app.brokers.alpaca import broker_api
@@ -38,11 +45,13 @@ from data.ingest.app.brokers.alpaca.read import AlpacaRead
 from data.ingest.app.brokers.broker_errors import MissingCredentialsError
 from data.ingest.app.brokers.interface import (
     Bar,
+    BarsFailure,
     BarsQuery,
     BarsResponse,
     BrokerRead,
     BrokerUnsupportedError,
     Instrument,
+    ServedRange,
 )
 from data.ingest.app.brokers.rate_budget import RequestPriority
 from data.ingest.tests.grpc_bind import LoopbackGrpc
@@ -57,6 +66,8 @@ START = datetime(2026, 1, 2, 14, 30, tzinfo=UTC)
 END = START + timedelta(hours=1)
 BETWEEN = START + timedelta(minutes=30)
 AFTER = END + timedelta(minutes=30)
+# When RecordingRead's stand-in vendor answered.
+AS_OF = datetime(2026, 10, 2, 12, tzinfo=UTC)
 
 # What priority_for_update_type must give each update type, written out rather than re-derived
 # so the wiring tests below cannot agree with a wrong mapping. STATIC is the case that matters:
@@ -144,26 +155,33 @@ class RecordingRead:
 
     Args:
         timestamps (list[datetime]): One bar per timestamp.
-        error (BaseException | None): Raised by get_bars itself, before any response.
+        failure (TraderJoeError | None): RETURNED by get_bars as a BarsFailure: the typed result.
+        error (BaseException | None): Raised by get_bars itself, before any response: a bug (D5).
         iteration_error (BaseException | None): Raised while the bars are iterated.
     """
 
     def __init__(
         self,
         timestamps: tuple[datetime, ...] = (START,),
+        failure: TraderJoeError | None = None,
         error: BaseException | None = None,
         iteration_error: BaseException | None = None,
     ):
         self.timestamps = timestamps
+        self.failure = failure
         self.error = error
         self.iteration_error = iteration_error
         self.queries: list[BarsQuery] = []
 
-    async def get_bars(self, query: BarsQuery) -> BarsResponse:
+    async def get_bars(self, query: BarsQuery) -> BarsResponse | BarsFailure:
         self.queries.append(query)
         if self.error is not None:
             raise self.error
-        return BarsResponse(feed=Feed.IEX, bars=self.__iterate())
+        if self.failure is not None:
+            return BarsFailure(self.failure)
+        return BarsResponse(
+            feed=Feed.IEX, bars=self.__iterate(), served_range=ServedRange(query.start, AS_OF), as_of=AS_OF
+        )
 
     async def __iterate(self) -> AsyncIterator[Bar]:
         for timestamp in self.timestamps:
@@ -187,13 +205,20 @@ class KeyRecordingSingleFlight:
 
 
 class PriorityRecordingBudget:
-    """A rate budget that grants every token and records the priority each was asked for."""
+    """A rate budget that grants every token and records the priority and deadline each was asked for.
+
+    acquire's signature is RateBudget's since TE-4 (ADR tj-fa1rpu U4 = A): a priority and a deadline.
+    """
 
     def __init__(self):
-        self.priorities: list[RequestPriority] = []
+        self.calls: list[tuple[RequestPriority, datetime | None]] = []
 
-    async def acquire(self, priority: RequestPriority = RequestPriority.INTERACTIVE) -> None:
-        self.priorities.append(priority)
+    @property
+    def priorities(self) -> list[RequestPriority]:
+        return [priority for priority, _deadline in self.calls]
+
+    async def acquire(self, priority: RequestPriority = RequestPriority.INTERACTIVE, deadline=None) -> None:
+        self.calls.append((priority, deadline))
 
 
 def installed_readers() -> dict:
@@ -265,62 +290,103 @@ def test_alpaca_read_satisfies_the_broker_read_protocol():
 
 
 # ---------------------------------------------------------------------------------------------
-# Refusals: what Alpaca cannot serve raises BrokerUnsupportedError before any vendor call
+# Refusals: what Alpaca cannot serve is RETURNED as a BrokerUnsupportedError before any vendor call
 # ---------------------------------------------------------------------------------------------
 
 REFUSED = [
-    pytest.param({'instrument': Instrument('VFV', AssetType.STOCK, currency='CAD')}, 'currency', 'CAD', id='cad'),
-    pytest.param({'instrument': Instrument('VFV', AssetType.STOCK, currency='EUR')}, 'currency', 'EUR', id='eur'),
-    pytest.param({'instrument': Instrument('VFV', AssetType.STOCK, exchange='XNYS')}, 'exchange', 'XNYS', id='xnys'),
+    pytest.param(
+        {'instrument': Instrument('VFV', AssetType.STOCK, currency='CAD')},
+        'currency',
+        'CAD',
+        Reason.UNSUPPORTED_INSTRUMENT,
+        id='cad',
+    ),
+    pytest.param(
+        {'instrument': Instrument('VFV', AssetType.STOCK, currency='EUR')},
+        'currency',
+        'EUR',
+        Reason.UNSUPPORTED_INSTRUMENT,
+        id='eur',
+    ),
+    pytest.param(
+        {'instrument': Instrument('VFV', AssetType.STOCK, exchange='XNYS')},
+        'exchange',
+        'XNYS',
+        Reason.UNSUPPORTED_INSTRUMENT,
+        id='xnys',
+    ),
     pytest.param(
         {'instrument': Instrument('VFV', AssetType.STOCK, exchange='XNAS', currency='USD')},
         'exchange',
         'XNAS',
+        Reason.UNSUPPORTED_INSTRUMENT,
         id='xnas-even-in-usd',
     ),
-    pytest.param({'instrument': Instrument('BTC', AssetType.CRYPTO)}, 'asset_type', AssetType.CRYPTO, id='crypto'),
-    pytest.param({'instrument': Instrument('VFV', AssetType.OPTION)}, 'asset_type', AssetType.OPTION, id='option'),
-    pytest.param({'adjustment': 'split'}, 'adjustment', 'split', id='split-adjusted'),
-    pytest.param({'adjustment': 'all'}, 'adjustment', 'all', id='all-adjusted'),
+    pytest.param(
+        {'instrument': Instrument('BTC', AssetType.CRYPTO)},
+        'asset_type',
+        AssetType.CRYPTO,
+        Reason.UNSUPPORTED_ASSET_TYPE,
+        id='crypto',
+    ),
+    pytest.param(
+        {'instrument': Instrument('VFV', AssetType.OPTION)},
+        'asset_type',
+        AssetType.OPTION,
+        Reason.UNSUPPORTED_ASSET_TYPE,
+        id='option',
+    ),
+    # The builder's choice for an adjustment, the one of the three reasons that fits (TE-4 open point).
+    pytest.param({'adjustment': 'split'}, 'adjustment', 'split', Reason.UNSUPPORTED_INSTRUMENT, id='split-adjusted'),
+    pytest.param({'adjustment': 'all'}, 'adjustment', 'all', Reason.UNSUPPORTED_INSTRUMENT, id='all-adjusted'),
 ]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(('overrides', 'field', 'value'), REFUSED)
+@pytest.mark.parametrize(('overrides', 'field', 'value', 'reason'), REFUSED)
 async def test_alpaca_refuses_what_it_cannot_serve_before_any_vendor_call(
-    overrides: dict, field: str, value, executor: ThreadPoolExecutor, single_flight: KeyRecordingSingleFlight
+    overrides: dict, field: str, value, reason: Reason, executor: ThreadPoolExecutor, single_flight
 ):
     """Addendum 4 items 3 and 5: a handle that cannot serve the combination REFUSES, never guesses.
 
     Alpaca serves one consolidated US line per symbol, in dollars, stocks only, raw bars only.
-    Anything else would otherwise be silently served as a raw USD stock fetch. The error is a
-    typed one a caller catches by class, its message names the field and the value, and neither
-    the injected client nor the single flight (the only way to the vendor) is touched.
+    Anything else would otherwise be silently served as a raw USD stock fetch. The refusal is a
+    typed error RETURNED in a BarsFailure (TE-4), REFUSED by its reason, its detail names the field
+    and the value, and neither the injected client nor the single flight (the only way to the
+    vendor) is touched.
     """
     client = Mock()
     reader = AlpacaRead(client=client, executor_provider=lambda: executor)
 
-    with pytest.raises(BrokerUnsupportedError) as err:
-        await reader.get_bars(build_query(**overrides))
+    outcome = await reader.get_bars(build_query(**overrides))
 
-    assert field in str(err.value)
-    assert repr(value) in str(err.value)
+    assert isinstance(outcome, BarsFailure)
+    error = outcome.error
+    assert type(error) is BrokerUnsupportedError
+    assert isinstance(error, InvalidRequestError)
+    assert error.reason is reason
+    assert field in error.detail
+    assert repr(value) in error.detail
     assert client.mock_calls == [], 'the vendor client was touched before the refusal'
     assert single_flight.keys == [], 'a vendor call was attempted before the refusal'
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(('overrides', 'field', 'value'), REFUSED)
-async def test_a_refusal_comes_before_the_credential_is_even_resolved(overrides: dict, field: str, value):
+@pytest.mark.parametrize(('overrides', 'field', 'value', 'reason'), REFUSED)
+async def test_a_refusal_comes_before_the_credential_is_even_resolved(overrides: dict, field: str, value, reason):
     """With no client injected and no credentials set, the refusal still wins.
 
     So the refusal comes before broker_api.get_client() as well as before the vendor call: a
-    request Alpaca cannot serve is reported as unsupported, not as a missing credential.
+    request Alpaca cannot serve is reported as unsupported, not as a missing credential (VENDOR_AUTH).
     """
     reader = AlpacaRead()
 
-    with patch.dict(os.environ, {}, clear=True), pytest.raises(BrokerUnsupportedError):
-        await reader.get_bars(build_query(**overrides))
+    with patch.dict(os.environ, {}, clear=True):
+        outcome = await reader.get_bars(build_query(**overrides))
+
+    assert isinstance(outcome, BarsFailure)
+    assert type(outcome.error) is BrokerUnsupportedError
+    assert outcome.error.reason is reason
 
 
 @pytest.mark.asyncio
@@ -442,6 +508,28 @@ async def test_an_unmapped_source_raises_not_implemented(installed: dict):
     assert all(reader.queries == [] for reader in installed.values())
 
 
+def typed_error(reason: Reason) -> TraderJoeError:
+    """An error of the branch REASONS names for the reason, with a reset_at where the reason needs one."""
+    reset_at = AS_OF + timedelta(seconds=30) if REASONS[reason].requires_reset_at else None
+    return REASONS[reason].branch(reason, f'a {reason} failure', reset_at=reset_at)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('reason', list(Reason), ids=str)
+async def test_the_kafka_edge_answers_every_bars_failure_with_the_bare_empty_dict(reason: Reason):
+    """TE-4 item 6 / TE-5 item 6: the Kafka edge keeps today's bare {} for every BarsFailure (tj-fe19tu).
+
+    It is the one place D6's banned 'return a sentinel' form survives, deliberately and only until
+    tj-3mk3u5.11 removes the Kafka edge, which is when this test is deleted with it. Every reason in
+    the vocabulary is enumerated, so a reason added later is covered without an edit here.
+    """
+    reader = RecordingRead(failure=typed_error(reason))
+    ingest_control.install_readers({DataSource.ALPACA_API: reader})
+
+    assert await ingest_control.store_retrieve_stock(build_request()) == {}
+    assert len(reader.queries) == 1
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     'reader',
@@ -450,13 +538,12 @@ async def test_an_unmapped_source_raises_not_implemented(installed: dict):
         pytest.param(RecordingRead(iteration_error=RuntimeError('page 2 failed')), id='iteration-raises'),
     ],
 )
-async def test_a_reader_failure_is_swallowed_into_a_bare_empty_dict(reader: RecordingRead):
-    """TODAY'S SWALLOW, pinned so that changing it is deliberate (tj-fe19tu).
+async def test_a_reader_that_raises_is_still_swallowed_into_a_bare_empty_dict(reader: RecordingRead):
+    """TODAY'S SWALLOW of a raise, pinned so that changing it is deliberate (tj-fe19tu).
 
-    store_retrieve_stock is the Kafka RPC boundary and keeps the old observable behaviour: any
-    failure of get_bars or of iterating its bars comes back as a bare {} (decision tj-j4wknb
-    addendum 2 B, 'the swallow moves one layer up, it does not grow'). PR 2's typed errors
-    rewrite this, and this test is the one to invert when they do.
+    A bug raised by get_bars or by iterating its bars still comes back as a bare {} at this edge
+    (decision tj-j4wknb addendum 2 B, 'the swallow moves one layer up, it does not grow'), until
+    tj-3mk3u5.11 removes the edge and the servicer reports a bug as INTERNAL (D1(b)).
     """
     ingest_control.install_readers({DataSource.ALPACA_API: reader})
 
@@ -464,9 +551,26 @@ async def test_a_reader_failure_is_swallowed_into_a_bare_empty_dict(reader: Reco
 
 
 @pytest.mark.asyncio
+async def test_the_kafka_edge_logs_a_bars_failure_with_its_reason_and_its_cause_chain(caplog):
+    """D8: no caller on this edge sees the failure, so the edge's one log line carries it and its cause."""
+    cause = ConnectionError('the vendor hung up')
+    error = typed_error(Reason.VENDOR_UNAVAILABLE)
+    error.__cause__ = cause
+    ingest_control.install_readers({DataSource.ALPACA_API: RecordingRead(failure=error)})
+
+    with caplog.at_level(logging.ERROR, logger=ingest_control.log.name):
+        assert await ingest_control.store_retrieve_stock(build_request()) == {}
+
+    [record] = [record for record in caplog.records if record.name == ingest_control.log.name]
+    assert 'VENDOR_UNAVAILABLE' in record.getMessage()
+    assert record.exc_info is not None and record.exc_info[1] is cause
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     'reader',
     [
+        pytest.param(RecordingRead(failure=MissingCredentialsError('ALPACA_API_KEY unset')), id='returned'),
         pytest.param(RecordingRead(error=MissingCredentialsError('ALPACA_API_KEY unset')), id='get-bars-raises'),
         pytest.param(
             RecordingRead(iteration_error=MissingCredentialsError('ALPACA_API_KEY unset')), id='iteration-raises'
@@ -474,12 +578,20 @@ async def test_a_reader_failure_is_swallowed_into_a_bare_empty_dict(reader: Reco
     ],
 )
 async def test_a_missing_credential_is_not_swallowed(reader: RecordingRead):
-    # The one exception the swallow above must NOT eat: an operator needs the variable's name,
-    # not an empty batch that looks like a symbol with no data.
+    """The one failure the {} above must NOT eat: it reaches the caller by name, as it always has.
+
+    An operator needs the variable's name, not an empty batch that looks like a symbol with no data.
+    RETURNED is how AlpacaRead now answers it (a BarsFailure, VENDOR_AUTH); the edge re-raises it by
+    name. This is builder-ingest's flagged deviation from TE-4 item 6's '{} for ANY BarsFailure',
+    kept to preserve today's behaviour; the architect rules on it at the TE-4 gate (tj-3mk3u5.37.5).
+    """
     ingest_control.install_readers({DataSource.ALPACA_API: reader})
 
-    with pytest.raises(MissingCredentialsError):
+    with pytest.raises(MissingCredentialsError) as raised:
         await ingest_control.store_retrieve_stock(build_request())
+
+    assert raised.value.reason is Reason.VENDOR_AUTH
+    assert 'ALPACA_API_KEY' in raised.value.detail
 
 
 @pytest.mark.asyncio
@@ -498,13 +610,17 @@ async def test_empty_data_types_raise_value_error_before_any_get_bars_call():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('data_type', [DataType.QUOTE, DataType.TRADE], ids=['quote', 'trade'])
-async def test_quotes_and_trades_alone_raise_not_implemented_without_fetching_bars(data_type: DataType):
+async def test_quotes_and_trades_alone_are_refused_as_unsupported_without_fetching_bars(data_type: DataType):
+    # TE-4 item 3: the unsupported-path stubs raise InvalidRequestError(UNSUPPORTED_ASSET_TYPE), not
+    # NotImplementedError.
     reader = RecordingRead()
     ingest_control.install_readers({DataSource.ALPACA_API: reader})
 
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(InvalidRequestError) as raised:
         await ingest_control.store_retrieve_stock(build_request(data_types=[data_type]))
 
+    assert type(raised.value) is InvalidRequestError
+    assert raised.value.reason is Reason.UNSUPPORTED_ASSET_TYPE
     assert reader.queries == []
 
 
@@ -521,10 +637,16 @@ async def test_the_request_maps_onto_the_bars_query(update_type: UpdateType):
     Non-default granularity and a set end, so a mapping that dropped either would show. The
     instrument is the generic symbol with exchange and currency None -- 'the broker's own
     listing' -- because the request carries neither today (addendum 4 item 3).
+
+    feed and deadline are None (TE-4 item 6): the Kafka path names no feed, so the deployment
+    decides, even when the request names one (SIP here); and it passes no deadline, so it keeps
+    today's unbounded wait on the rate budget. The gRPC servicer (tj-3mk3u5.9) carries both.
     """
     reader = RecordingRead()
     ingest_control.install_readers({DataSource.ALPACA_API: reader})
-    request = build_request(granularity=Granularity.ONE_HOUR, end=END, update_type=update_type, asset_symbol='XIC')
+    request = build_request(
+        granularity=Granularity.ONE_HOUR, end=END, update_type=update_type, asset_symbol='XIC', feed=Feed.SIP
+    )
 
     await ingest_control.store_retrieve_stock(request)
 
@@ -536,6 +658,8 @@ async def test_the_request_maps_onto_the_bars_query(update_type: UpdateType):
             end=END,
             adjustment='raw',
             priority=EXPECTED_PRIORITY[update_type],
+            feed=None,
+            deadline=None,
         )
     ]
 
@@ -559,7 +683,8 @@ async def test_the_request_priority_reaches_the_alpaca_rate_budget(
     with patch.object(broker_api, '__RATE_BUDGET', budget):
         await ingest_control.store_retrieve_stock(build_request(update_type=update_type))
 
-    assert budget.priorities == [EXPECTED_PRIORITY[update_type]]
+    # The priority arrives, and no deadline with it: the Kafka path keeps today's unbounded wait.
+    assert budget.calls == [(EXPECTED_PRIORITY[update_type], None)]
 
 
 def test_a_bars_query_without_a_priority_is_a_type_error():

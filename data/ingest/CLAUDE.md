@@ -12,7 +12,7 @@ Python 3.12, FastAPI, alpaca-py, Kafka RPC server, grpc.aio server (health servi
 
 ## Key invariants
 
-Broker-facing layer only; data-store owns the data. Blocking SDK calls go through the shared worker pool, never inline in an async handler.
+Broker-facing layer only; data-store owns the data. Blocking SDK calls go through the shared worker pool, never inline in an async handler. `BrokerRead.get_bars` returns a `BarsResponse` (served, possibly empty, with its `served_range`) or a `BarsFailure` and raises only for a bug; the Kafka edge (`ingest_control`) is the one place a failure becomes a bare `{}`, until tj-3mk3u5.11 removes it.
 
 ## Environment variables
 
@@ -28,6 +28,7 @@ Broker-facing layer only; data-store owns the data. Blocking SDK calls go throug
 | 1 | The Alpaca client is built at import time, which breaks tests and secret rotation | Build it lazily |
 | 2 | A grpc.aio server still running when the event loop closes hangs process exit | Host it only with `async with` around the lifespan's yield (`app/grpc_host.py`); every test that starts one stops it in a `finally` |
 | 3 | Any test that enters the real lifespan raises from `BindAddress.from_env()` with the gRPC env unset | Set both variables to `127.0.0.1` and a free port, or patch `app_depends.build_grpc_host` |
+| 4 | Alpaca's error bodies carry no `code` field, so `APIError.code` raises `KeyError`; and `str(APIError)` is the raw vendor body | Classify on `APIError.status_code` only (`alpaca/classify.py`), write your own `detail`, and keep the exception as the error's `__cause__` |
 
 A pitfall lands here when it is true of this component and nowhere else. If it generalises past
 this project, it belongs in the kit's `lessons/` instead — and if it is a prohibition rather than

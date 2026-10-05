@@ -2979,6 +2979,10 @@ LOCKDOWN_STEP = 'Check Network Lockdown'
 # tj-3mk3u5.49 (T3a): data_ingest's gRPC bind name resolves to its ingest_store address alone. After
 # the stack is up; its script's pass/fail logic is exercised in test_grpc_bind_network.py.
 GRPC_BIND_STEP = 'Check gRPC Bind Network'
+# tj-3mk3u5.25 (T3b): data_store calls data_ingest's gRPC health over ingest_store and needs SERVING.
+# After the bind check and before the lockdown; stack-only. Its script, and the lockdown step's gRPC
+# half, are run under bash with docker stubbed in test_grpc_peer_reach.py.
+PEER_STEP = 'Check gRPC Peer Reach'
 START_STEP = 'Start System'
 # tj-irhy0a.1 / tj-irhy0a.2: the fake-mode banner check, and the head seed's dump and upload.
 FAKE_CHECK_STEP = 'Check Fake Broker'
@@ -2992,6 +2996,7 @@ SYSTEM_JOB_STEP_ORDER = (
     MIGRATE_STEP,
     SMOKE_STEP,
     GRPC_BIND_STEP,
+    PEER_STEP,
     LOCKDOWN_STEP,
     'Check Container Env',
     SYSTEM_TESTS_STEP,
@@ -3017,6 +3022,7 @@ SYSTEM_JOB_COMPOSE_STEPS = (
     FAKE_CHECK_STEP,
     MIGRATE_STEP,
     GRPC_BIND_STEP,
+    PEER_STEP,
     'Check Container Env',
     LIFECYCLE_STEP,
     DUMP_STEP,
@@ -3029,6 +3035,7 @@ SYSTEM_JOB_STACK_ONLY_STEPS = (
     FAKE_CHECK_STEP,
     MIGRATE_STEP,
     GRPC_BIND_STEP,
+    PEER_STEP,
     'Check Container Env',
     DUMP_STEP,
     STOP_STEP,
@@ -3476,6 +3483,13 @@ def test_network_lockdown_checks_non_resolution_and_no_egress():
     - From postgres and from data_store, a TCP connect to a public LITERAL address (no DNS
       involved) must fail, told apart from a failed probe by a distinct status, 3.
     The name probed as kafka is the one kafka's container_name interpolates.
+
+    tj-3mk3u5.25 extension (the T3a gate's N1): data_ingest's gRPC bind alias -- the host its
+    environment names, read from the compose file -- is among the names test_client must not
+    resolve, and the step also probes the gRPC port BY ADDRESS from test_client through the image
+    interpreter, since the name will not resolve there. That half's pass and fail behaviour, its
+    data_store positive control and its exit-3 convention are exercised by running the step itself in
+    test_grpc_peer_reach.py.
     """
     lines = _step_lines(_system_step(LOCKDOWN_STEP))
     calls = [call for line in lines for call in _compose_calls(line)]
@@ -3507,6 +3521,21 @@ def test_network_lockdown_checks_non_resolution_and_no_egress():
         f'{LOCKDOWN_STEP} must also show the service name {kafka_service!r} does not resolve, not only the '
         f'container name {kafka_name!r}; it loops over {sorted(negatives)}'
     )
+    grpc_alias = _compose_service_environment(COMPOSE_FILE, 'data_ingest').get('APP_INTERNAL_GRPC_HOST')
+    assert grpc_alias, f'{COMPOSE_FILE.name} no longer names data_ingest APP_INTERNAL_GRPC_HOST'
+    assert grpc_alias in negatives, (
+        f'{LOCKDOWN_STEP} must show data_ingest gRPC bind alias {grpc_alias!r} does not resolve from '
+        f'{TEST_CLIENT_SERVICE}; it loops over {sorted(negatives)}'
+    )
+    by_address = [
+        rest
+        for files, rest in calls
+        if files == _client_file_pair()
+        and rest[:1] == ['run']
+        and _compose_service(rest)[0] == TEST_CLIENT_SERVICE
+        and '/code/.venv/bin/python' in _compose_service(rest)[1]
+    ]
+    assert by_address, f'{LOCKDOWN_STEP} never probes data_ingest gRPC port by address from {TEST_CLIENT_SERVICE}'
     assert any(re.search(r'-eq 2\b', line) for line in lines), f'{LOCKDOWN_STEP} never requires getent not-found (2)'
 
     execs = {

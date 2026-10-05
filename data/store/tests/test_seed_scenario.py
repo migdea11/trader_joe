@@ -87,6 +87,20 @@ def test_other_symbols_are_refused(symbol):
 
 
 @pytest.mark.parametrize(
+    'prefix',
+    [
+        prefix
+        for prefix in market_data.SCENARIO_PREFIXES
+        if prefix not in (market_data.EMPTY_PREFIX, market_data.GAPS_PREFIX)
+    ],
+)
+def test_every_scenario_prefix_the_seed_does_not_use_is_refused(prefix):
+    """Enumerated from the fake, so a scenario added later (RATELIMIT_, TE-5 tj-3mk3u5.37.6) is covered too."""
+    assert not is_synthetic(f'{prefix}ZZSEEDAA')
+    assert not is_synthetic(f'{prefix}ZZSEEDAA', 'seed-owner-a')
+
+
+@pytest.mark.parametrize(
     'owner',
     [
         '',

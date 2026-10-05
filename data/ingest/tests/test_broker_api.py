@@ -280,19 +280,19 @@ async def test_the_resolved_feed_reaches_the_vendor_call_and_is_stamped_on_the_b
 
 @pytest.mark.asyncio
 async def test_a_tape_named_by_the_request_does_not_override_the_deployment(executor: ThreadPoolExecutor):
-    """``GetDatasetRequest.feed`` is DECLARED BUT INERT, pinned where it can actually be observed.
+    """``GetDatasetRequest.feed`` is INERT ON THE KAFKA PATH, pinned where it can actually be observed.
 
-    tj-rh4b7f deferred caller-selected feed: the store has no feed to forward, so the field stays
-    on the request as the landing site for the transport work rather than as a working selection.
-    Its comment says nothing in data/ingest reads it. A comment is not a test, and the failure it
-    describes is silent -- a request naming SIP against an IEX deployment would simply be served
-    IEX with nobody told.
+    tj-rh4b7f deferred caller-selected feed. Since TE-4 (tj-3mk3u5.37.5) a feed named in a BarsQuery
+    IS live at the adapter -- AlpacaRead serves it or refuses it with FEED_NOT_AVAILABLE before any
+    vendor call (test_typed_outcomes.py) -- but the Kafka edge, ingest_control, builds its BarsQuery
+    with feed=None, so the request's feed still reaches nothing. A request naming SIP against an IEX
+    deployment is served IEX, exactly as before.
 
     So this drives the request path -- store_retrieve_stock over a real AlpacaRead since
     tj-irhy0a.6 -- with a request that explicitly names SIP, in a deployment configured for IEX,
-    and asserts IEX wins at both sites. WHEN THE DEFERRED TRANSPORT WORK LANDS, THIS IS THE TEST
-    THAT MUST FAIL, and inverting it is the deliberate act that records the field becoming live.
-    It is not a test to repair around.
+    and asserts IEX wins at both sites. It stays green as the Kafka-edge pin until tj-3mk3u5.32 /
+    tj-3mk3u5.11 remove that edge; the gRPC servicer (tj-3mk3u5.9) carries the feed through. It is
+    not a test to repair around.
     """
     request = build_request(feed=Feed.SIP)
     assert request.feed is Feed.SIP, 'the request really does name the other tape'
@@ -393,9 +393,10 @@ async def test_two_tapes_do_not_share_one_single_flight_key(executor: ThreadPool
 async def test_a_request_without_credentials_or_a_client_fails_before_any_call(executor: ThreadPoolExecutor):
     # Re-pointed to the request path with the PRODUCTION AlpacaRead (no client injected), so the
     # credential is resolved by broker_api.get_client() exactly as in a deployment. The error must
-    # reach the caller by name -- store_retrieve_stock swallows every other exception into {} --
-    # and 'before any call' is observed: the single flight, the only way to the vendor, is never
-    # entered.
+    # reach the caller by name -- store_retrieve_stock answers every other failure with {} -- and
+    # 'before any call' is observed: the single flight, the only way to the vendor, is never
+    # entered. Since TE-4 AlpacaRead RETURNS it (a BarsFailure, VENDOR_AUTH) and the Kafka edge
+    # re-raises it by name: builder-ingest's flagged deviation, ruled at the TE-4 gate.
     request = build_request()
     install_alpaca(executor, client=None)
     recorder = KeyRecordingSingleFlight(getattr(broker_api, '__SINGLE_FLIGHT'))

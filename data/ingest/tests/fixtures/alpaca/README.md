@@ -36,8 +36,15 @@ tj-vhboky.57. Prices and volumes are illustrative. Each file's `provenance.kind`
 
 | File | Why it is not recorded |
 |---|---|
-| `error_429.json`, `error_504.json`, `error_500.json` | You cannot provoke a rate limit, a gateway timeout or a server error on purpose. They keep the documented `{code, message}` body. The recorded 400 suggests that real error bodies may carry only `message`, but no test reads `code`. |
-| `bars_empty_list.json` | This is the other empty-range shape (`{"bars": {"AAPL": []}}`). Alpaca sent the absent-key shape when recorded, but the reader must still handle both, so the tests keep both. |
+| `error_429.json`, `error_504.json`, `error_500.json` | You cannot provoke a rate limit, a gateway timeout or a server error on purpose. They keep the documented `{code, message}` body. The recorded 400 suggests that real error bodies may carry only `message`. Nothing reads `code`: the reader classifies on the HTTP status alone, and a test fails if anything on the path reads it. |
+| `bars_empty_list.json` | This is the other empty-range shape (`{"bars": {"AAPL": []}}`). Alpaca sent the absent-key shape when recorded, but the reader must still handle both, so the tests keep both. Both are served as an empty window. |
+| `bars_null.json` | A 200 whose `bars` is JSON `null`. It has never been recorded on this endpoint. It is inferred from alpaca-py 0.44.0 `common/rest.py:395` and two forum threads, which its `provenance` names. It pins one property: such a body is never served as a window. |
+
+## Headers
+
+No fixture records a response header, because the recorder writes none. Which headers a real 429
+carries (`X-RateLimit-Reset`, `Retry-After`, or neither) is unknown. A test that needs one attaches
+it with `with_headers()` from the harness, and its file says the headers are constructed.
 | `bars_1Day_fractional_trade_count.json`, `bars_1Day_null_trade_count.json` | Alpaca cannot be made to send either. Each one is FAKES-2's documented daily body with the second bar's `n` changed, as the table below shows. They do not follow the recorded `bars_1Day.json`, and the null-trade-count test pins their own values. |
 
 | File | Second bar's `n` | What it pins |

@@ -15,6 +15,13 @@ bar prices inline would be a second copy of it, not a check on it.
 THE CONTRACT SUITE (FAKES-3, tj-irhy0a.10) asserts the interface properties identically for every
 implementation. This file is FakeRead's own: its scenarios, its grid and its launcher, which no
 other implementation has.
+
+THE TYPED OUTCOMES (TE-5 tj-3mk3u5.37.6; ADR tj-fa1rpu D2, D3, D8; the Q-EMPTY ruling on
+tj-3mk3u5.37.1): FakeRead RETURNS a BarsResponse or a BarsFailure. FAIL_ and a first FAILONCE_ are
+VENDOR_UNAVAILABLE, RATELIMIT_ is VENDOR_RATE_LIMITED with a deterministic reset_at, EMPTY_ is
+SERVED with no bars, and three refusals (a named feed the fake's deployment feed is not, a start at or
+after its clock, an end before the start) come before any scenario. Tests of those use an injected
+clock, NOW; the older tests keep the real clock, whose ranges all lie in the past.
 """
 
 import ast
@@ -39,9 +46,19 @@ from fastapi import FastAPI
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
+from common.errors.vocabulary import REASONS, ExogenousError, InvalidRequestError, Outcome, Reason, TraderJoeError
 from data.ingest.app import app_depends, ingest_control
 from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
-from data.ingest.app.brokers.interface import Bar, BarsQuery, BrokerRead, Instrument
+from data.ingest.app.brokers.interface import (
+    Bar,
+    BarsFailure,
+    BarsQuery,
+    BarsResponse,
+    BrokerRead,
+    BrokerUnsupportedError,
+    Instrument,
+    ServedRange,
+)
 from data.ingest.app.brokers.rate_budget import RequestPriority
 from data.ingest.tests.grpc_bind import LoopbackGrpc
 from routers.data_ingest import get_dataset_request
@@ -51,15 +68,19 @@ from tests.fakes.market_data import (
     EMPTY_PREFIX,
     FAIL_PREFIX,
     FAILONCE_PREFIX,
+    FEED,
     GAPS_PREFIX,
     MAX_SLOW_DELAY_SECONDS,
     OPEN_ENDED_STEPS,
+    RATELIMIT_PREFIX,
+    RATELIMIT_RESET_SECONDS,
     SCENARIO_PREFIXES,
     SLOW_PREFIX,
     FakeRead,
     FakeReadError,
     Scenario,
     fake_bar,
+    range_end,
     scenario_for,
 )
 
@@ -79,12 +100,20 @@ HOUR = timedelta(hours=1)
 ON_GRID = datetime(2026, 1, 5, 14, tzinfo=UTC)
 PLUS_FIVE = timezone(timedelta(hours=5))
 
+# The injected clock of the typed-outcome tests: two hours and a half after ON_GRID, off the grid.
+NOW = ON_GRID + timedelta(hours=2, minutes=30)
+
+
+def at_now() -> datetime:
+    return NOW
+
 
 def query(
     symbol: str,
     start: datetime = ON_GRID,
     end: datetime | None = ON_GRID + 4 * HOUR,
     granularity: Granularity = Granularity.ONE_HOUR,
+    feed: Feed | None = None,
 ) -> BarsQuery:
     """Build a BarsQuery with the priority stated explicitly, as the interface requires.
 
@@ -93,6 +122,7 @@ def query(
         start (datetime): Inclusive start.
         end (datetime | None): Exclusive end, or None.
         granularity (Granularity): Bar size.
+        feed (Feed | None): The feed the query names, or None to leave it to the deployment.
 
     Returns:
         BarsQuery: The query.
@@ -103,7 +133,15 @@ def query(
         start=start,
         end=end,
         priority=RequestPriority.INTERACTIVE,
+        feed=feed,
     )
+
+
+async def failure(reader: FakeRead, bars_query: BarsQuery) -> TraderJoeError:
+    """Fetch, and return the error of the BarsFailure that must come back."""
+    outcome = await reader.get_bars(bars_query)
+    assert isinstance(outcome, BarsFailure), f'expected a BarsFailure, got {outcome!r}'
+    return outcome.error
 
 
 async def served(reader: FakeRead, bars_query: BarsQuery, cap: int = OPEN_ENDED_STEPS * 10) -> list[Bar]:
@@ -122,6 +160,7 @@ async def served(reader: FakeRead, bars_query: BarsQuery, cap: int = OPEN_ENDED_
         list[Bar]: The bars, in the order served.
     """
     response = await reader.get_bars(bars_query)
+    assert isinstance(response, BarsResponse), f'expected SERVED, got {response!r}'
     assert response.feed is Feed.IEX
     bars: list[Bar] = []
     async for bar in response.bars:
@@ -316,19 +355,24 @@ async def test_an_open_ended_query_serves_exactly_open_ended_steps_grid_points_f
 @pytest.mark.asyncio
 @pytest.mark.parametrize('prefix', ['', *SCENARIO_PREFIXES], ids=lambda prefix: prefix or 'default')
 async def test_no_scenario_runs_forever_on_an_open_ended_query(prefix: str):
-    # FAIL_ and FAILONCE_'s first call raise; the point is that every scenario RETURNS, inside a
-    # hard timeout, with at most OPEN_ENDED_STEPS bars.
+    # FAIL_, a first FAILONCE_ and RATELIMIT_ return a BarsFailure; the point is that every scenario
+    # RETURNS, inside a hard timeout, with at most OPEN_ENDED_STEPS bars.
     reader = FakeRead(slow_delay_seconds=0.0)
 
-    async def settle() -> list[Bar] | FakeReadError:
-        try:
-            return await served(reader, query(f'{prefix}VFV', end=None), cap=OPEN_ENDED_STEPS + 1)
-        except FakeReadError as error:
-            return error
+    async def settle() -> list[Bar] | BarsFailure:
+        outcome = await reader.get_bars(query(f'{prefix}VFV', end=None))
+        if isinstance(outcome, BarsFailure):
+            return outcome
+        bars: list[Bar] = []
+        async for bar in outcome.bars:
+            bars.append(bar)
+            if len(bars) > OPEN_ENDED_STEPS:
+                break
+        return bars
 
     outcome = await asyncio.wait_for(settle(), timeout=10)
 
-    assert isinstance(outcome, FakeReadError) or len(outcome) <= OPEN_ENDED_STEPS
+    assert isinstance(outcome, BarsFailure) or len(outcome) <= OPEN_ENDED_STEPS
 
 
 # ---------------------------------------------------------------------------------------------
@@ -357,6 +401,19 @@ async def test_empty_serves_the_feed_and_zero_bars():
 
 
 @pytest.mark.asyncio
+async def test_empty_is_served_with_the_asked_window_as_its_served_range_never_a_failure():
+    """Q-EMPTY (tj-3mk3u5.37.1): an empty window is SERVED, rows [], served_range = (start, min(end, as_of))."""
+    start, end = ON_GRID - 4 * HOUR, ON_GRID - HOUR
+
+    response = await FakeRead(clock=at_now).get_bars(query(f'{EMPTY_PREFIX}VFV', start=start, end=end))
+
+    assert isinstance(response, BarsResponse)
+    assert [bar async for bar in response.bars] == []
+    assert response.served_range == ServedRange(start, end)
+    assert response.as_of == NOW
+
+
+@pytest.mark.asyncio
 async def test_gaps_serves_exactly_the_even_grid_indices_and_nothing_else():
     # The grid index of an hour is hours since the epoch; 2026-01-05 14:00 UTC is 20_458 days and
     # 14 hours on, index 491_006, even, so of four hours from ON_GRID the 14:00 and 16:00 bars remain.
@@ -368,13 +425,21 @@ async def test_gaps_serves_exactly_the_even_grid_indices_and_nothing_else():
     assert bars == [fake_bar(symbol, ON_GRID), fake_bar(symbol, ON_GRID + 2 * HOUR)]
 
 
+def assert_vendor_unavailable(error: TraderJoeError) -> None:
+    """FAIL_'s failure: VENDOR_UNAVAILABLE, NOT_READY, with a FakeReadError as its cause and no reset_at."""
+    assert type(error) is ExogenousError
+    assert error.reason is Reason.VENDOR_UNAVAILABLE
+    assert REASONS[error.reason].outcome is Outcome.NOT_READY
+    assert isinstance(error.__cause__, FakeReadError)
+    assert error.reset_at is None
+
+
 @pytest.mark.asyncio
-async def test_fail_raises_on_every_call_and_never_yields_a_response():
+async def test_fail_returns_vendor_unavailable_on_every_call_and_never_a_response():
     reader = FakeRead()
 
     for _ in range(2):
-        with pytest.raises(FakeReadError):
-            await reader.get_bars(query(f'{FAIL_PREFIX}VFV'))
+        assert_vendor_unavailable(await failure(reader, query(f'{FAIL_PREFIX}VFV')))
 
 
 @pytest.mark.asyncio
@@ -382,8 +447,7 @@ async def test_failonce_fails_the_first_call_per_range_then_serves_the_default_b
     reader = FakeRead()
     symbol = f'{FAILONCE_PREFIX}VFV'
 
-    with pytest.raises(FakeReadError):
-        await reader.get_bars(query(symbol))
+    assert_vendor_unavailable(await failure(reader, query(symbol)))
     second = await served(reader, query(symbol))
     third = await served(reader, query(symbol))
 
@@ -394,18 +458,218 @@ async def test_failonce_fails_the_first_call_per_range_then_serves_the_default_b
 async def test_failonce_remembers_per_range_and_per_instance():
     reader = FakeRead()
     symbol = f'{FAILONCE_PREFIX}VFV'
-    with pytest.raises(FakeReadError):
-        await reader.get_bars(query(symbol))
+    assert_vendor_unavailable(await failure(reader, query(symbol)))
 
     # A different range of the same symbol is a first call of its own.
-    with pytest.raises(FakeReadError):
-        await reader.get_bars(query(symbol, end=ON_GRID + 5 * HOUR))
+    assert_vendor_unavailable(await failure(reader, query(symbol, end=ON_GRID + 5 * HOUR)))
     # The same range spelled in another offset is the same range.
-    await reader.get_bars(query(symbol, start=ON_GRID.astimezone(PLUS_FIVE)))
+    assert isinstance(await reader.get_bars(query(symbol, start=ON_GRID.astimezone(PLUS_FIVE))), BarsResponse)
     # The memory is the instance's: a second process (a second worker) fails again. Hence
     # SERVICE_WORKERS=1 for the fake-mode stack.
-    with pytest.raises(FakeReadError):
-        await FakeRead().get_bars(query(symbol))
+    assert_vendor_unavailable(await failure(FakeRead(), query(symbol)))
+
+
+@pytest.mark.asyncio
+async def test_ratelimit_returns_vendor_rate_limited_with_a_deterministic_reset_on_every_call():
+    reader = FakeRead(clock=at_now)
+
+    for _ in range(2):
+        error = await failure(reader, query(f'{RATELIMIT_PREFIX}VFV', end=ON_GRID + 2 * HOUR))
+
+        assert type(error) is ExogenousError
+        assert error.reason is Reason.VENDOR_RATE_LIMITED
+        assert REASONS[error.reason].outcome is Outcome.NOT_READY
+        assert error.reset_at == NOW + timedelta(seconds=RATELIMIT_RESET_SECONDS)
+        assert error.retry_after == RATELIMIT_RESET_SECONDS == 60
+        assert isinstance(error.__cause__, FakeReadError)
+
+
+# ---------------------------------------------------------------------------------------------
+# The refusals, before any scenario (Q-EMPTY tj-3mk3u5.37.1; tj-3mk3u5.9's feed-entitlement note)
+# ---------------------------------------------------------------------------------------------
+
+
+def recording_reader(feed: Feed = FEED) -> tuple[FakeRead, list[float]]:
+    """A FakeRead whose SLOW_ sleeps are recorded, so 'before any scenario' is observable."""
+    slept: list[float] = []
+
+    async def record(seconds: float) -> None:
+        slept.append(seconds)
+
+    return FakeRead(slow_delay_seconds=0.5, sleep=record, clock=at_now, feed=feed), slept
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('deployment', 'named'),
+    [
+        pytest.param(Feed.IEX, Feed.SIP, id='sip-on-the-default-iex'),
+        pytest.param(Feed.SIP, Feed.IEX, id='iex-on-a-sip-deployment'),
+        pytest.param(Feed.IEX, Feed.NOT_APPLICABLE, id='not-applicable'),
+    ],
+)
+async def test_a_named_feed_other_than_the_deployment_feed_is_refused_before_any_scenario(deployment, named):
+    reader, slept = recording_reader(deployment)
+
+    error = await failure(reader, query(f'{SLOW_PREFIX}VFV', end=ON_GRID + 2 * HOUR, feed=named))
+
+    assert type(error) is BrokerUnsupportedError
+    assert error.reason is Reason.FEED_NOT_AVAILABLE
+    assert REASONS[error.reason].outcome is Outcome.REFUSED
+    assert named.value in error.detail
+    assert dict(error.metadata) == {'feed': named.value}
+    assert slept == [], 'SLOW_ slept before the feed refusal'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('named', [None, Feed.SIP], ids=['unnamed', 'named-sip'])
+async def test_the_deployment_feed_is_served_and_reported_named_or_not(named):
+    reader, slept = recording_reader(Feed.SIP)
+
+    response = await reader.get_bars(query(f'{SLOW_PREFIX}VFV', end=ON_GRID + 2 * HOUR, feed=named))
+
+    assert isinstance(response, BarsResponse)
+    assert response.feed is Feed.SIP
+    assert reader.feed is Feed.SIP
+    # The same arrangement that is refused above does reach the scenario here, so 'no sleep' was not vacuous.
+    assert slept == [0.5]
+
+
+def test_the_default_deployment_feed_is_iex():
+    assert FakeRead().feed is FEED is Feed.IEX
+
+
+@pytest.mark.asyncio
+async def test_a_refused_failonce_query_does_not_spend_the_fail_once_memory():
+    reader, _slept = recording_reader()
+    symbol = f'{FAILONCE_PREFIX}VFV'
+
+    await failure(reader, query(symbol, end=ON_GRID + 2 * HOUR, feed=Feed.SIP))
+
+    # The first query that reaches the scenario is still the first call for the range.
+    assert_vendor_unavailable(await failure(reader, query(symbol, end=ON_GRID + 2 * HOUR)))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'start',
+    [
+        pytest.param(NOW, id='exactly-the-clock'),
+        pytest.param(NOW.astimezone(PLUS_FIVE), id='the-clock-at-plus-five'),
+        pytest.param(NOW + timedelta(microseconds=1), id='just-after'),
+        pytest.param(NOW + 30 * 24 * HOUR, id='next-month'),
+    ],
+)
+async def test_a_range_starting_at_or_after_the_clock_is_refused_before_any_scenario(start):
+    reader, slept = recording_reader()
+
+    error = await failure(reader, query(f'{SLOW_PREFIX}VFV', start=start, end=start + 2 * HOUR))
+
+    assert type(error) is InvalidRequestError
+    assert error.reason is Reason.RANGE_IN_FUTURE
+    assert error.reset_at is None
+    assert dict(error.metadata) == {'range_start': start.isoformat()}
+    assert slept == []
+
+
+@pytest.mark.asyncio
+async def test_a_range_starting_just_before_the_clock_is_served():
+    response = await FakeRead(clock=at_now).get_bars(query('VFV', start=NOW - timedelta(microseconds=1), end=None))
+
+    assert isinstance(response, BarsResponse)
+
+
+@pytest.mark.asyncio
+async def test_an_end_before_the_start_is_refused_as_alpacas_400_is_before_any_scenario():
+    reader, slept = recording_reader()
+
+    error = await failure(reader, query(f'{SLOW_PREFIX}VFV', start=ON_GRID, end=ON_GRID - HOUR))
+
+    assert type(error) is InvalidRequestError
+    assert error.reason is Reason.VENDOR_INVALID_REQUEST
+    assert REASONS[error.reason].outcome is Outcome.REFUSED
+    assert error.detail == 'end should not be before start'
+    assert slept == []
+
+
+@pytest.mark.asyncio
+async def test_an_end_equal_to_the_start_is_an_empty_window_served_not_refused():
+    response = await FakeRead(clock=at_now).get_bars(query('VFV', start=ON_GRID, end=ON_GRID))
+
+    assert isinstance(response, BarsResponse)
+    assert [bar async for bar in response.bars] == []
+    assert response.served_range == ServedRange(ON_GRID, ON_GRID)
+
+
+# ---------------------------------------------------------------------------------------------
+# served_range and as_of (D2, D3 note a)
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_past_range_is_served_as_asked_with_as_of_from_the_clock():
+    start, end = ON_GRID - 3 * HOUR, ON_GRID
+
+    response = await FakeRead(clock=at_now).get_bars(query('VFV', start=start, end=end))
+
+    assert response.served_range == ServedRange(start, end)
+    assert response.as_of == NOW
+    assert [bar.timestamp async for bar in response.bars] == hours(start, 3)
+
+
+@pytest.mark.asyncio
+async def test_a_range_ending_after_the_clock_is_served_up_to_as_of_and_no_bar_from_after_it():
+    # NOW is 16:30: the 14:00, 15:00 and 16:00 bars have happened; 17:00 has not.
+    response = await FakeRead(clock=at_now).get_bars(query('VFV', start=ON_GRID, end=ON_GRID + 6 * HOUR))
+
+    assert response.served_range == ServedRange(ON_GRID, NOW)
+    assert [bar.timestamp async for bar in response.bars] == hours(ON_GRID, 3)
+
+
+@pytest.mark.asyncio
+async def test_an_open_ended_query_reports_its_count_bound_as_the_served_end():
+    # D3 note (a): a window the fake clamps by count is reported clamped, never as the open range.
+    start = ON_GRID - 1000 * HOUR
+    bound = start + OPEN_ENDED_STEPS * HOUR
+    assert range_end(Granularity.ONE_HOUR, start, None) == bound < NOW
+
+    response = await FakeRead(clock=at_now).get_bars(query('VFV', start=start, end=None))
+
+    assert response.served_range == ServedRange(start, bound)
+    assert len([bar async for bar in response.bars]) == OPEN_ENDED_STEPS
+
+
+@pytest.mark.asyncio
+async def test_an_open_ended_query_reaching_the_clock_is_served_up_to_as_of():
+    response = await FakeRead(clock=at_now).get_bars(query('VFV', start=ON_GRID, end=None))
+
+    assert response.served_range == ServedRange(ON_GRID, NOW)
+    assert [bar.timestamp async for bar in response.bars] == hours(ON_GRID, 3)
+
+
+@pytest.mark.asyncio
+async def test_as_of_is_read_after_the_slow_delay():
+    readings = iter([NOW - HOUR, NOW])
+    slept: list[float] = []
+
+    async def record(seconds: float) -> None:
+        slept.append(seconds)
+
+    reader = FakeRead(slow_delay_seconds=1.0, sleep=record, clock=lambda: next(readings))
+
+    response = await reader.get_bars(query(f'{SLOW_PREFIX}VFV', start=ON_GRID - 3 * HOUR, end=None))
+
+    assert slept == [1.0]
+    assert response.as_of == NOW
+    assert response.served_range.end == NOW
+
+
+@pytest.mark.asyncio
+async def test_as_of_is_utc_whatever_offset_the_clock_answers_in():
+    response = await FakeRead(clock=lambda: NOW.astimezone(PLUS_FIVE)).get_bars(query('VFV', end=None))
+
+    assert response.as_of == NOW
+    assert response.as_of.utcoffset() == timedelta(0)
 
 
 @pytest.mark.asyncio
@@ -493,9 +757,13 @@ async def test_ingest_control_stores_the_fake_bars_under_the_fake_feed(fake_inst
 
 
 @pytest.mark.asyncio
-async def test_ingest_control_turns_a_fail_into_the_bare_empty_answer_as_for_the_real_reader(fake_installed: FakeRead):
-    # tj-fe19tu, kept at the RPC edge until PR 2: a failed fetch is a bare {}, never a batch.
-    assert await ingest_control.store_retrieve_stock(stock_request(f'{FAIL_PREFIX}VFV')) == {}
+@pytest.mark.parametrize('prefix', [FAIL_PREFIX, RATELIMIT_PREFIX])
+async def test_ingest_control_turns_a_failure_into_the_bare_empty_answer_as_for_the_real_reader(
+    fake_installed: FakeRead, prefix: str
+):
+    # tj-fe19tu, kept at the Kafka RPC edge until tj-3mk3u5.11 removes it: a BarsFailure is a bare {},
+    # never a batch.
+    assert await ingest_control.store_retrieve_stock(stock_request(f'{prefix}VFV')) == {}
 
 
 # ---------------------------------------------------------------------------------------------

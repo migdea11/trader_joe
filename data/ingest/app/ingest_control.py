@@ -1,7 +1,9 @@
 from collections.abc import Mapping
+from typing import NoReturn
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource
+from common.errors.vocabulary import InvalidRequestError, Reason
 from common.logging import get_logger
 from schemas.data_ingest.get_dataset_request import StockDatasetRequest
 from schemas.data_store.stock.market_activity_data import (
@@ -10,7 +12,7 @@ from schemas.data_store.stock.market_activity_data import (
 )
 
 from .brokers.broker_errors import MissingCredentialsError
-from .brokers.interface import BarsQuery, BrokerRead, Instrument
+from .brokers.interface import BarsFailure, BarsQuery, BrokerRead, Instrument
 from .brokers.rate_budget import priority_for_update_type
 
 
@@ -52,10 +54,11 @@ async def store_retrieve_stock(request: StockDatasetRequest) -> BatchStockDataMa
 
     Returns:
         BatchStockDataMarketActivityCreate: Converted dataset for the store. A bare {} when the
-            fetch failed (tj-fe19tu, kept at the RPC boundary until PR 2's typed errors).
+            fetch failed (tj-fe19tu, kept at this Kafka edge until tj-3mk3u5.11 unwires it).
 
     Raises:
-        NotImplementedError: If no handle serves the source, or quotes or trades are requested.
+        NotImplementedError: If no handle serves the source.
+        InvalidRequestError: With the reason UNSUPPORTED_ASSET_TYPE, if quotes or trades are requested.
         ValueError: If request.data_types is empty; raised before any get_bars call.
         MissingCredentialsError: If the broker has no credentials; surfaced before any vendor task.
     """
@@ -76,17 +79,33 @@ async def store_retrieve_stock(request: StockDatasetRequest) -> BatchStockDataMa
             start=request.start,
             end=request.end,
             priority=priority_for_update_type(request.update_type),
+            # The Kafka path names no feed, so the deployment decides (the request's own feed stays inert
+            # here; the gRPC servicer carries that half, tj-3mk3u5.9), and it passes no deadline, so it
+            # keeps today's unbounded wait on the rate budget.
+            feed=None,
+            deadline=None,
         )
         try:
             response = await reader.get_bars(query)
+            if isinstance(response, BarsFailure):
+                if isinstance(response.error, MissingCredentialsError):
+                    # Must reach the caller by name, before any vendor task, rather than be swallowed
+                    # into the bare {} below. It is what this edge has always done, and an operator needs
+                    # the variable's name, not an empty batch that looks like a symbol with no data. This
+                    # is the one BarsFailure that does not become {} (tj-3mk3u5.37.5 handoff).
+                    raise response.error
+                # THE ONE PLACE D6's banned 'return a sentinel' form SURVIVES, deliberately and only
+                # until tj-3mk3u5.11 unwires the Kafka edge: today's observable behaviour, byte for byte
+                # (tj-fe19tu). The typed failure is logged here, and no caller on this edge ever sees it.
+                log.error(str(response.error), exc_info=response.error.__cause__)
+                return {}
             bars = [bar async for bar in response.bars]
         except MissingCredentialsError:
-            # Must reach the caller by name, before any vendor task, rather than be swallowed
-            # into the bare {} below.
+            # As above, and for a reader that still raises it.
             raise
         except Exception as e:
             log.error(e)
-            # TODO better error handling (tj-fe19tu; PR 2's typed errors)
+            # TODO better error handling (tj-fe19tu; removed with the Kafka edge, tj-3mk3u5.11)
             return {}
 
         batch_response = BatchStockDataMarketActivityCreate(
@@ -114,16 +133,29 @@ async def store_retrieve_stock(request: StockDatasetRequest) -> BatchStockDataMa
             )
         log.debug(f'dataset bars: {len(bars)}')
     if DataType.QUOTE in request.data_types:
-        raise NotImplementedError('Quotes not implemented')
+        raise InvalidRequestError(Reason.UNSUPPORTED_ASSET_TYPE, 'Quotes are not supported yet: data_type=QUOTE')
     if DataType.TRADE in request.data_types:
-        raise NotImplementedError('Trades not implemented')
+        raise InvalidRequestError(Reason.UNSUPPORTED_ASSET_TYPE, 'Trades are not supported yet: data_type=TRADE')
 
     return batch_response
 
 
-def store_retrieve_crypto(request: StockDatasetRequest):
-    pass
+async def store_retrieve_crypto(request: StockDatasetRequest) -> NoReturn:
+    """Refuse a crypto dataset: this service serves stocks only today.
+
+    Async because the Kafka handler awaits whatever it dispatches to; this used to return None from a
+    plain function, which that await turned into an accidental TypeError.
+
+    Raises:
+        InvalidRequestError: Always, with the reason UNSUPPORTED_ASSET_TYPE.
+    """
+    raise InvalidRequestError(Reason.UNSUPPORTED_ASSET_TYPE, 'Crypto datasets are not supported yet: asset_type=CRYPTO')
 
 
-def store_retrieve_option(request: StockDatasetRequest):
-    pass
+async def store_retrieve_option(request: StockDatasetRequest) -> NoReturn:
+    """Refuse an option dataset: this service serves stocks only today.
+
+    Raises:
+        InvalidRequestError: Always, with the reason UNSUPPORTED_ASSET_TYPE.
+    """
+    raise InvalidRequestError(Reason.UNSUPPORTED_ASSET_TYPE, 'Option datasets are not supported yet: asset_type=OPTION')
