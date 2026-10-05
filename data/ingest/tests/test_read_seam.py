@@ -7,10 +7,13 @@ an unsupported request raises BrokerUnsupportedError), addendum 5 (the half-open
 the body's INJECTION section (create_app, readers installed by the lifespan before the RPC servers
 start and cleared at teardown).
 
-Zero network. The vendor is a stub client handed to AlpacaRead through its constructor, and the
-lifespan's Kafka and latency collaborators are replaced with mocks of their public entry points
-(decision tj-j4wknb R4: mock libraries are fine for in-process unit tests). Readers standing in for
-a broker below ingest_control are plain classes that conform structurally, like any BrokerRead.
+Zero network beyond loopback. The vendor is a stub client handed to AlpacaRead through its
+constructor, and the lifespan's Kafka and latency collaborators are replaced with mocks of their
+public entry points (decision tj-j4wknb R4: mock libraries are fine for in-process unit tests). The
+lifespan's gRPC host is the real one, bound to 127.0.0.1 by grpc_bind.LoopbackGrpc, because the
+lifespan reads its bind address from the environment with no default (tj-3mk3u5.24). Readers
+standing in for a broker below ingest_control are plain classes that conform structurally, like any
+BrokerRead.
 """
 
 import inspect
@@ -42,6 +45,7 @@ from data.ingest.app.brokers.interface import (
     Instrument,
 )
 from data.ingest.app.brokers.rate_budget import RequestPriority
+from data.ingest.tests.grpc_bind import LoopbackGrpc
 from routers.data_ingest import get_dataset_request
 from schemas.data_ingest.get_dataset_request import StockDatasetRequest
 
@@ -574,7 +578,8 @@ class LifespanProbe:
 
     Kafka is replaced at its public entry points -- KafkaConsumerFactory.wait_for_kafka and the
     ingest RPC factory's init_servers -- and the latency server at app_depends' own name for it.
-    Nothing inside the lifespan under test is patched.
+    Nothing inside the lifespan under test is patched. Enter the lifespan inside LoopbackGrpc, which
+    gives its real gRPC host a loopback address and stops it whatever happens.
     """
 
     def __init__(self):
@@ -612,7 +617,7 @@ async def test_the_lifespan_installs_readers_before_the_rpc_servers_start_and_cl
     app = main.create_app({DataSource.ALPACA_API: reader})
 
     with LifespanProbe() as probe:
-        async with app.router.lifespan_context(app):
+        async with LoopbackGrpc(), app.router.lifespan_context(app):
             serving = installed_readers()
         after = installed_readers()
 
@@ -632,7 +637,7 @@ async def test_the_production_app_serves_alpaca_through_alpaca_read_and_nothing_
     actually dispatched through. No fake, no second source, no flag (decision tj-j4wknb R4).
     """
     with LifespanProbe():
-        async with main.app.router.lifespan_context(main.app):
+        async with LoopbackGrpc(), main.app.router.lifespan_context(main.app):
             readers = installed_readers()
 
     assert set(readers) == {DataSource.ALPACA_API}

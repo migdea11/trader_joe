@@ -8,7 +8,7 @@ Broker-facing ingest service. Fetches market data from Alpaca and answers data-s
 
 ## Tech stack
 
-Python 3.12, FastAPI, alpaca-py, Kafka RPC server
+Python 3.12, FastAPI, alpaca-py, Kafka RPC server, grpc.aio server (health service only so far)
 
 ## Key invariants
 
@@ -19,12 +19,15 @@ Broker-facing layer only; data-store owns the data. Blocking SDK calls go throug
 | Variable | Purpose | Default |
 |---|---|---|
 | ALPACA_API_KEY / ALPACA_API_SECRET | broker credentials | unset |
+| APP_INTERNAL_GRPC_HOST / APP_INTERNAL_GRPC_PORT | where the gRPC server binds; startup fails if either is unset | unset, by design (compose sets them) |
 
 ## Common pitfalls
 
 | # | Pitfall | Do instead |
 |---|---|---|
 | 1 | The Alpaca client is built at import time, which breaks tests and secret rotation | Build it lazily |
+| 2 | A grpc.aio server still running when the event loop closes hangs process exit | Host it only with `async with` around the lifespan's yield (`app/grpc_host.py`); every test that starts one stops it in a `finally` |
+| 3 | Any test that enters the real lifespan raises from `BindAddress.from_env()` with the gRPC env unset | Set both variables to `127.0.0.1` and a free port, or patch `app_depends.build_grpc_host` |
 
 A pitfall lands here when it is true of this component and nowhere else. If it generalises past
 this project, it belongs in the kit's `lessons/` instead — and if it is a prohibition rather than

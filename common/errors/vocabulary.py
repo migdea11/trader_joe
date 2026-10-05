@@ -25,10 +25,14 @@ converts it to a reason.
 THE IDENTITY is (ERROR_DOMAIN, reason), and clients branch on the reason (tj-8konfu D6.4). Retryability
 is not a field. It is the reason's outcome in REASONS (D4). There is no problem+json type URI here: the
 type is about:blank for every error (U3 as amended 2026-10-02), and the problem+json renderer writes it.
+
+THE ERROR ID that ties an answer to its cause chain in the log (D8) is minted by new_error_id and nothing
+else, so both edges and every raise site spell it the same way.
 """
 
 import math
 import re
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -138,6 +142,20 @@ METADATA_KEYS: Final = frozenset(
 # Allowlisted, but carried by the reset_at attribute rather than the metadata argument. Each renderer writes
 # both from it. retry_after is derived at render time and never stored, because a stored copy goes stale.
 _DERIVED_METADATA_KEYS: Final = frozenset({'reset_at', 'retry_after'})
+
+
+def new_error_id() -> str:
+    """Return a new error_id, fresh on every call: the text of a uuid4.
+
+    The one spelling an id is minted in, by either transport's edge or by a raise site that logs its own cause
+    chain. Every typed answer carries an error_id, the error's own or one its edge mints, and the log line that
+    holds the cause chain names the same id (D8, as its 16:22 UTC 2026-10-02 addendum reads it through).
+
+    Returns:
+        str: The id, such as '0f8c2a4e-5b1d-4c3a-9e7f-2d6b8a1c4e5f'.
+    """
+    return str(uuid.uuid4())
+
 
 _ONE_SECOND: Final = timedelta(seconds=1)
 

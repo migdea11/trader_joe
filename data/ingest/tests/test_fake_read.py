@@ -43,6 +43,7 @@ from data.ingest.app import app_depends, ingest_control
 from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
 from data.ingest.app.brokers.interface import Bar, BarsQuery, BrokerRead, Instrument
 from data.ingest.app.brokers.rate_budget import RequestPriority
+from data.ingest.tests.grpc_bind import LoopbackGrpc
 from routers.data_ingest import get_dataset_request
 from schemas.data_ingest.get_dataset_request import StockDatasetRequest
 from tests.fakes.market_data import (
@@ -577,7 +578,8 @@ def test_the_launcher_takes_the_slow_delay_from_its_environment_variable():
 @pytest.mark.asyncio
 async def test_the_launcher_apps_lifespan_installs_a_fake_read_for_alpaca_and_clears_it(monkeypatch):
     # Kafka is the only thing stubbed: the wait for a broker, the RPC servers' consumers and the
-    # latency server. The lifespan itself, create_app and ingest_control are production's.
+    # latency server. The lifespan itself, create_app and ingest_control are production's, and so is
+    # the gRPC host it starts, bound to loopback here as the overlay binds it to the compose alias.
     installed: list[dict[DataSource, Any]] = []
     real_install = ingest_control.install_readers
 
@@ -593,7 +595,7 @@ async def test_the_launcher_apps_lifespan_installs_a_fake_read_for_alpaca_and_cl
     launcher = importlib.import_module(LAUNCHER_MODULE)
     assert isinstance(launcher.app, FastAPI)
 
-    async with launcher.app.router.lifespan_context(launcher.app):
+    async with LoopbackGrpc(), launcher.app.router.lifespan_context(launcher.app):
         batch = await ingest_control.store_retrieve_stock(stock_request('VFV'))
 
     assert [set(readers) for readers in installed] == [{DataSource.ALPACA_API}]

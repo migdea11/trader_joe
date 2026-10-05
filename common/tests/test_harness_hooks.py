@@ -183,9 +183,10 @@ KNOWN_BYPASSES: dict[str, str] = {
     'push:send-pack-plumbing': _FINDING + 'send-pack updates remote refs without the porcelain subcommand '
     'the regex names. Deny rules: no rule names it.',
     'dot-env:dot-source': _FINDING + '"." is not in the reader list, and sourcing loads every value into '
-    'the shell. Read deny rules: undocumented for "."; never for a file outside the session cwd.',
+    'the shell. Read deny rules: undocumented for ".", wherever the file is.',
     'dot-env:redirect-before-reader': _FINDING + 'the reader comes after the file name. Read deny rules '
-    'check input-redirect targets, but only at or under the session cwd.',
+    'check input-redirect targets: at or under the session cwd, and since 2aefba7 (tj-3mk3u5.51) at any '
+    'depth under /workspace from every session, per the docs; not probed with this form.',
     'dot-env:line-continuation': _FINDING + 'grep matches line by line, and a backslash-newline splits the '
     'reader from the file. Read deny rules: undocumented for line continuations.',
 }

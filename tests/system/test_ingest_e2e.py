@@ -247,13 +247,18 @@ def test_gaps_scenario_stores_exactly_the_served_bars(
 def test_fail_scenario_is_not_2xx_and_stores_no_bars(
     own_symbol: str, run_identity, data_store, scenario_entries: Callable[[str], list[UUID]]
 ) -> None:
+    """The entry is upserted before the fetch, so a failed fetch leaves exactly one entry, holding no bars.
+
+    The entry count comes first (tj-3mk3u5.53): without it, a POST refused before it ever reached
+    data_ingest -- no entry, not 2xx -- would pass this test with nothing asserted about the fetch.
+    """
     symbol = f'{FAIL_PREFIX}{own_symbol}'
 
     response, ids = _post(data_store, scenario_entries, symbol, _body(run_identity.owner))
 
     assert not _is_2xx(response), data_store.describe(response)
-    for entry_id in ids:
-        assert _read(data_store, entry_id) == [], f'bars stored under {entry_id} after a failed fetch'
+    assert len(ids) == 1, f'expected one entry for {symbol}, found {ids}'
+    assert _read(data_store, ids[0]) == [], f'bars stored under {ids[0]} after a failed fetch'
 
 
 def test_slow_scenario_is_not_2xx_and_the_late_answer_is_dropped(

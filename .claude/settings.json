@@ -9,6 +9,8 @@
     ],
     "deny": [
       "Read(**/.env)",
+      "Read(//workspace/.env)",
+      "Read(//workspace/**/.env)",
       "Bash(git push)",
       "Bash(git push *)"
     ]
