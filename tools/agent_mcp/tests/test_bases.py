@@ -34,6 +34,7 @@ from tools.agent_mcp.tests.harness import (
     FakeDocker,
     clearing_hook,
     default_response,
+    dev_step_prefix_length,
     make_rig,
     populate_data,
     record_state,
@@ -56,8 +57,10 @@ TRUSTED_COMPOSE_FILES = (
 # Addendum 15: the services a compose `run` can build, and the image-only ones stack_wipe clears.
 LITERAL_BUILT_SERVICES = {'data_store', 'data_ingest', 'test_client'}
 # The verbs that can build today, and the ones that must stay base-free (FINAL DESIGN note).
-BUILDING_VERBS = {'stack_up', 'run_system_tests', 'migrate', 'migrate_status', 'seed_dump'}
-BASE_FREE_VERBS = {'stack_down', 'stack_wipe', 'logs', 'ps'}
+BUILDING_VERBS = {'stack_up', 'run_system_tests', 'migrate', 'migrate_status', 'migrate_check', 'seed_dump'}
+# dev_ps and dev_logs are base-free by construction, not by choice: they hand compose no file, so
+# there is no service definition to build from (ADR tj-4rr0la addendum 18).
+BASE_FREE_VERBS = {'stack_down', 'stack_wipe', 'logs', 'ps', 'dev_ps', 'dev_logs'}
 
 
 # --- the Dockerfile's external refs ----------------------------------------------------------------
@@ -182,11 +185,15 @@ _BUILDER_SAMPLES = {
     'wipe_clear_steps': (['postgres'],),
     'postgres_running_steps': (),
     'alembic_steps': (['upgrade', 'head'], ['current']),
+    'alembic_check_steps': (),
     'system_tests_steps': (['tests/system'],),
     'seed_dump_steps': ('2026-01-02',),
     'logs_steps': ('data_store', 50),
     'ps_steps': (),
 }
+# The dev-project builders take no env file (they pass none), so they are swept separately below
+# rather than given a misleading second parameter. tj-tq2hn6 (B2) owns their containment tests.
+_DEV_BUILDER_SAMPLES = {'dev_ps_steps': (), 'dev_logs_steps': ('data_store', 50)}
 
 
 def _builders() -> dict[str, object]:
@@ -209,17 +216,22 @@ def _can_build(tail: list[str]) -> bool:
 def test_every_steps_builder_flags_each_step_that_can_build():
     """Pin (3), builder half: every *_steps builder sets Step.builds by the addendum-15 rule on every step."""
     builders = _builders()
-    assert set(builders) == set(_BUILDER_SAMPLES), (
-        f'builders {sorted(builders)} vs samples {sorted(_BUILDER_SAMPLES)}: add the new builder here'
+    assert set(builders) == set(_BUILDER_SAMPLES) | set(_DEV_BUILDER_SAMPLES), (
+        f'builders {sorted(builders)} vs samples {sorted(set(_BUILDER_SAMPLES) | set(_DEV_BUILDER_SAMPLES))}: '
+        'add the new builder here'
     )
     stack_dir, env_file = Path('/stack'), Path('/stack/agent_stack.env')
     flagged = 0
-    for name, builder in builders.items():
-        for step in builder(stack_dir, env_file, *_BUILDER_SAMPLES[name]):
+    for name, sample in _BUILDER_SAMPLES.items():
+        for step in builders[name](stack_dir, env_file, *sample):
             tail = list(step.argv[step_prefix_length() :])
             assert step.builds is _can_build(tail), f'{name}: {tail} has builds={step.builds}'
             flagged += step.builds
     assert flagged >= 5, 'the sweep found too few building steps to mean anything'
+    for name, sample in _DEV_BUILDER_SAMPLES.items():
+        for step in builders[name](stack_dir, *sample):
+            tail = list(step.argv[dev_step_prefix_length() :])
+            assert _can_build(tail) is False and step.builds is False, f'{name}: {tail} can build'
 
 
 # --- every verb ensures the bases before it can build -----------------------------------------------

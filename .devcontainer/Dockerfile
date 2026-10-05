@@ -117,6 +117,36 @@ RUN set -eux; \
     buf --version; \
     [ "$(buf --version)" = "${version}" ]
 
+# shellcheck, which `make lint` runs on every *.sh under PATHS (tj-xc6nfv): pinned and
+# checksum-verified on the same rule as bd, dolt, uv and buf. It lints only; nothing formats shell.
+# These values MIRROR the Makefile's SHELLCHECK_VERSION, SHELLCHECK_SHA256_X86_64 and
+# SHELLCHECK_SHA256_AARCH64, which are the one authority: this build's context is .devcontainer/, so
+# it cannot read the Makefile. All of them move together, in one commit.
+# A SEPARATE RUN from buf's, not folded into it: common/tests/test_agent_image.py executes the buf RUN
+# with dpkg, curl, sha256sum, install, rm and buf stubbed and asserts its exact call sequence, so an
+# extra command inside it breaks a test that is checking something else entirely.
+# NOT `apt-get install shellcheck`: bookworm ships 0.9.0, and a linter at a version other than the one
+# `make lint` pins reports a different set of findings.
+# .tar.gz, not the smaller .tar.xz, because the release's .xz needs an xz binary this image does not
+# have; tar and gzip are Essential in Debian. The archive holds shellcheck-v${version}/shellcheck.
+# Until this image is rebuilt, `make shellcheck-install` puts the same pin in ~/.local/bin.
+RUN set -eux; \
+    version='0.11.0'; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) asset="shellcheck-v${version}.linux.x86_64.tar.gz"; sum='b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6' ;; \
+      arm64) asset="shellcheck-v${version}.linux.aarch64.tar.gz"; sum='68a8133197a50beb8803f8d42f9908d1af1c5540d4bb05fdfca8c1fa47decefc' ;; \
+      *) echo "no shellcheck checksum pinned for ${arch}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/shellcheck.tar.gz \
+      "https://github.com/koalaman/shellcheck/releases/download/v${version}/${asset}"; \
+    echo "${sum}  /tmp/shellcheck.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/shellcheck.tar.gz -C /tmp; \
+    install -m 0755 "/tmp/shellcheck-v${version}/shellcheck" /usr/local/bin/shellcheck; \
+    rm -rf /tmp/shellcheck.tar.gz "/tmp/shellcheck-v${version}"; \
+    shellcheck --version; \
+    [ "$(shellcheck --version | awk '/^version:/ {print $2}')" = "${version}" ]
+
 # make drives every command binding in the manifest; bookworm ships Python 3.11, so uv supplies
 # the 3.12 the project requires. UV_PYTHON_INSTALL_DIR is outside $HOME so it survives the
 # config volume being replaced, and is readable by the agent user.

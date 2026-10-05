@@ -42,7 +42,8 @@ Items, tj-vhboky.14 numbering where they moved here from Sys-4:
   * an unservable feed -- a POST naming a tape this deployment cannot serve is a 422
     FEED_NOT_AVAILABLE naming the refused tape, and writes no entry and no bar (tj-3mk3u5.16 A2).
   * EMPTY, GAPS, FAIL, SLOW, FAILONCE -- one test each, symbols carrying the scenario's prefix.
-  * 4 -- an exact repeat resolves to the same entry and adds none; changing only expiry_type, then
+  * 4 -- an exact repeat resolves to the same entry, adds none, and answers with the SAME BODY
+    (tj-gp5xxi: data_points and served_range, not just a 200); changing only expiry_type, then
     only owner, each makes a new entry; no entry takes the stronger expiry_type of the two. Feed IS
     part of an entry's identity since c4a1f7b2e905, but it cannot be varied from here: the entry
     records the tape the ACK resolved, and this deployment resolves one. Varying it is the unit
@@ -452,6 +453,23 @@ def test_failonce_scenario_fails_then_the_identical_post_creates_the_entry_and_f
 def test_identity_repeat_resolves_and_policy_or_owner_change_makes_a_new_entry(
     own_symbol: str, run_identity, data_store, adopt_entries: Callable[[str], list[UUID]]
 ) -> None:
+    """The exact repeat is indistinguishable from the first POST, in the database AND on the wire.
+
+    THE REPEAT'S RESPONSE BODY IS ASSERTED, not just its status (tj-gp5xxi). This test used to read
+    `repeat.status_code` and nothing else of the repeat's answer, which left the one observable
+    tj-3mk3u5.16 Part B's U4 actually checks by hand -- "the same data_points" -- unpinned at every
+    tier. The database half was never the weak one: a mutation removing either ON CONFLICT DO
+    UPDATE, the entry's or the bar's, reds this test and nothing else in this file. What no test
+    reached was the COUNT THE CALLER IS TOLD, and a caller retrying a POST branches on that number
+    rather than on our row count. data_points is len(the bars written), not a database rowcount
+    (data/store/app/database/crud/stock/asset_market_activity.py), so a repeat reports the full
+    count and not zero -- and that, rather than "it is 30 either way", is the contract being
+    pinned here.
+
+    served_range is pinned beside it because the three-member response (message, data_points,
+    served_range) is then asserted whole for the repeat: a repeat that answered for a different
+    window would be a different answer to the same question.
+    """
     body = _body(run_identity.owner)
     expected = _expected(own_symbol)
 
@@ -460,6 +478,8 @@ def test_identity_repeat_resolves_and_policy_or_owner_change_makes_a_new_entry(
 
     assert first.status_code == 200, data_store.describe(first)
     assert repeat.status_code == 200, data_store.describe(repeat)
+    assert first.json()['data_points'] == len(expected), data_store.describe(first)
+    assert repeat.json() == first.json(), f'the exact repeat answered differently: {first.json()} then {repeat.json()}'
     assert len(after_first) == 1, f'expected one entry after the first POST, found {after_first}'
     assert after_repeat == after_first, f'the exact repeat added an entry: {after_first} -> {after_repeat}'
     original = after_first[0]

@@ -12,6 +12,7 @@ A green run here means the configuration still says the right thing, nothing mor
 
 import ast
 import configparser
+import contextlib
 import copy
 import fnmatch
 import importlib
@@ -6938,3 +6939,461 @@ def test_the_grpc_toolchain_is_pinned_exactly_and_moves_together():
         group for group, requirements in groups.items() if group != 'dev' and 'grpcio-tools' in requirements
     )
     assert not elsewhere, f'grpcio-tools is also declared in {elsewhere}; the generator belongs in dev only'
+
+
+# =================================================================================================
+# THE SOURCE STAMP: tools/source_digest.sh (decision tj-yb1bxj clauses 1, 5 and 6; task tj-9frycj)
+#
+# WHAT THE SCRIPT IS. The one definition of "a digest of exactly the source the Dockerfile COPYs
+# into a service image". The build stamps it on the image as trader_joe.source.digest and
+# migrate-check recomputes it from the checkout and refuses on a mismatch, so a stale image can no
+# longer be compared against a live schema and have the difference read as drift.
+#
+# WHAT THESE TESTS DO *NOT* ASSERT, so nobody reads a false reason out of them. They do NOT assert
+# that adding a COPY silently shrinks what the digest covers. It does not: copy_sources() parses
+# the path list out of the Dockerfile on every run, so a new COPY GROWS the coverage in the same
+# commit -- measured twice while C1 (tj-vj1d4h) was gated. Derivation prevents that drift; a test
+# would only notice it. The risk did not vanish, it MOVED INTO THE PARSER: coverage can shrink now
+# only if the Dockerfile or .dockerignore parser half-understands a form and quietly skips it. That
+# is what the two groups below are for -- cross-implementation equality, and the refusal vocabulary.
+#
+# >>> THE DRIFT SURFACE THESE TESTS EXIST TO HOLD TOGETHER, and it is the reason to keep them. <<<
+# .dockerignore IS INTERPRETED TWICE IN THIS REPOSITORY:
+#   * NARROWLY, in production bash -- tools/source_digest.sh's ignore_rules()/is_excluded(), which
+#     understands four deliberately small pattern kinds and hard-errors on anything else; and
+#   * GENERALLY, in this module's test helpers -- _dockerignore_pattern_regex, _dockerignore_rules
+#     and _is_excluded_from_context, a faithful subset of moby's patternmatcher, general over
+#     negations, `**`, multi-segment globs and last-rule-wins.
+# NOTHING ELSE HOLDS THE TWO IMPLEMENTATIONS TOGETHER. Decision tj-yb1bxj clause 5 asks for one
+# definition of the digest and did not anticipate this second spelling, precisely because the
+# second one is a test helper rather than part of the build. If you are reading this because you
+# changed one of them: THE OTHER ONE EXISTS, and the equality test below is what tells you so.
+#
+# THE TWO DIRECTIONS ARE NOT EQUALLY BAD, which is why they are asserted separately and never as
+# one symmetric difference:
+#   * script-minus-oracle is OVER-coverage. The stamp covers a file the context leaves out, so it
+#     moves while the image does not: a FALSE REFUSAL. Loud, and recoverable.
+#   * oracle-minus-script is UNDER-coverage. A file is in the image that the stamp does not cover,
+#     so the image can change while the stamp holds still: a FALSE MATCH -- the guard going hollow,
+#     which is the failure this whole epic exists to stop.
+# A single symmetric-difference assertion would report the fatal direction in the same breath as
+# the harmless one.
+#
+# WHAT NOBODY HAS MEASURED, declared rather than papered over: there is no docker CLI in the
+# devcontainer, so no image is built and no label is read back here. The Dockerfile's
+# ARG SOURCE_DIGEST / LABEL trader_joe.source.digest pair, and compose passing the build arg
+# through, stay unexercised by any test in this repository.
+SOURCE_DIGEST_SCRIPT = REPO_ROOT / 'tools' / 'source_digest.sh'
+SOURCE_DIGEST_HEX = re.compile(r'^[0-9a-f]{64}$')
+# Non-vacuity floors for the equality test: two sets that are both empty are equal. At 84f9775 the
+# real counts were 104 (data/store) and 105 (data/ingest); the floor is low enough not to need an
+# edit per file, high enough that a parser that found almost nothing cannot pass.
+SOURCE_DIGEST_FILE_FLOOR = 50
+
+
+def _digest_services() -> list[tuple[str, str]]:
+    """Every (SERVICE_PATH, SERVICE_NAME) pair a compose service declares as build args.
+
+    Derived, not listed: a third service gets covered by the tests below without an edit here.
+    """
+    pairs = sorted(
+        (args['SERVICE_PATH'], args['SERVICE_NAME'])
+        for args in _compose_build_args()
+        if 'SERVICE_PATH' in args and 'SERVICE_NAME' in args
+    )
+    assert pairs, 'no compose service declares SERVICE_PATH and SERVICE_NAME build args'
+    return pairs
+
+
+def _run_source_digest(script: Path, *arguments: str) -> subprocess.CompletedProcess:
+    """Run a source_digest.sh without checking its status; the status is what most tests assert."""
+    return subprocess.run([str(script), *arguments], capture_output=True, text=True, check=False)
+
+
+def _source_digest(*arguments: str) -> list[str]:
+    """Run the committed script, require success, and return its stdout lines."""
+    result = _run_source_digest(SOURCE_DIGEST_SCRIPT, *arguments)
+    assert result.returncode == 0, f'source_digest.sh {arguments} exited {result.returncode}: {result.stderr}'
+    return result.stdout.splitlines()
+
+
+def _oracle_copy_sources(service_path: str, service_name: str) -> set[str]:
+    """The COPY sources for one service, from this module's independent Dockerfile parser.
+
+    _dockerfile_copy_sources_by_origin expands a build-arg source once per compose service, so it
+    yields every service's app directory at once; this keeps the one belonging to this service.
+    """
+    by_origin = _dockerfile_copy_sources_by_origin()
+    app = posixpath.join(service_path, service_name, 'app')
+    from_args = {source for source, named_an_arg in by_origin if named_an_arg}
+    assert app in from_args, f'the Dockerfile COPY parse found no {app} among the build-arg sources {from_args}'
+    return {source for source, named_an_arg in by_origin if not named_an_arg} | {app}
+
+
+def _oracle_context_files(service_path: str, service_name: str) -> set[str]:
+    """Every file the build context delivers under one service's COPY sources, by the Python oracle.
+
+    The filesystem is walked, not `git ls-files`: docker sends untracked files too, and so does the
+    script. A symlink counts as a file and is never followed, matching the script's `find` type test.
+    """
+    rules = _committed_dockerignore_rules()
+    files = set()
+    for source in _oracle_copy_sources(service_path, service_name):
+        base = REPO_ROOT / source
+        candidates = [base] if base.is_file() or base.is_symlink() else base.rglob('*')
+        for path in candidates:
+            if path.is_dir() and not path.is_symlink():
+                continue
+            relative = path.relative_to(REPO_ROOT).as_posix()
+            if not _is_excluded_from_context(relative, rules):
+                files.add(relative)
+    return files
+
+
+@contextlib.contextmanager
+def _temporary_repo_file(relative: str) -> Iterator[None]:
+    """Create `relative` under the repository root for the body, then remove it and any directory made.
+
+    The probes below have to touch the real tree, because what is being measured is the COMMITTED
+    .dockerignore's effect on the COMMITTED Dockerfile's COPY sources; a sandbox would measure a
+    .dockerignore nobody ships.
+    """
+    path = REPO_ROOT / relative
+    assert not path.exists(), f'{relative} already exists; refusing to overwrite it with a probe'
+    made = []
+    parent = path.parent
+    while not parent.exists():
+        made.append(parent)
+        parent = parent.parent
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('source digest probe\n', encoding='utf-8')
+        yield
+    finally:
+        path.unlink(missing_ok=True)
+        for directory in made:
+            with contextlib.suppress(OSError):
+                directory.rmdir()
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(('service_path', 'service_name'), _digest_services())
+def test_the_digest_covers_exactly_the_files_the_python_oracle_finds(service_path: str, service_name: str):
+    """The script's file set equals the independent Python oracle's, in both directions, named apart.
+
+    THIS IS THE TEST THAT HOLDS THE TWO .dockerignore IMPLEMENTATIONS TOGETHER -- the narrow bash
+    one in tools/source_digest.sh and the general Python one in this module. See the section
+    comment above: nothing else does, and clause 5 of tj-yb1bxj did not anticipate the second one
+    because it is a test helper.
+    """
+    script_files = set(_source_digest('--list-files', service_path, service_name))
+    oracle_files = _oracle_context_files(service_path, service_name)
+
+    assert len(oracle_files) >= SOURCE_DIGEST_FILE_FLOOR, (
+        f'the oracle found only {len(oracle_files)} files under the COPY sources for '
+        f'{service_path}/{service_name}; equality against an almost-empty set proves nothing'
+    )
+    assert len(script_files) >= SOURCE_DIGEST_FILE_FLOOR, (
+        f'source_digest.sh listed only {len(script_files)} files for {service_path}/{service_name}'
+    )
+
+    over_coverage = sorted(script_files - oracle_files)
+    assert not over_coverage, (
+        f'OVER-coverage (script minus oracle) for {service_path}/{service_name}: {over_coverage}. '
+        'The stamp hashes files the build context leaves out, so it moves while the image does not: '
+        'a false refusal. Loud and recoverable, but the two .dockerignore readers now disagree.'
+    )
+    under_coverage = sorted(oracle_files - script_files)
+    assert not under_coverage, (
+        f'UNDER-coverage (oracle minus script) for {service_path}/{service_name}: {under_coverage}. '
+        'These files reach the image and the stamp does not cover them, so the image can change '
+        'while the stamp holds still -- a FALSE MATCH, which is the guard going hollow.'
+    )
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(('service_path', 'service_name'), _digest_services())
+def test_the_digest_claims_exactly_the_copy_sources_the_python_oracle_finds(service_path: str, service_name: str):
+    """--list-paths agrees with the independent COPY parser, so the two never drift apart silently."""
+    script_paths = set(_source_digest('--list-paths', service_path, service_name))
+    oracle_paths = _oracle_copy_sources(service_path, service_name)
+    assert script_paths == oracle_paths, (
+        f'source_digest.sh claims {sorted(script_paths)} for {service_path}/{service_name} but this '
+        f"module's Dockerfile parser finds {sorted(oracle_paths)}"
+    )
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(('service_path', 'service_name'), _digest_services())
+def test_list_files_prints_bare_paths_and_not_the_internal_manifest_format(service_path: str, service_name: str):
+    """--list-files emits one bare path per line.
+
+    Pinned because a review note once recorded the opposite -- that it emits `f <mode> <hash> <path>`
+    and `l <hash> <path>`. That is build_manifest()'s INTERNAL format, which --list-files never
+    prints. A consumer written against the note would parse every line's first word as a type tag.
+    """
+    lines = _source_digest('--list-files', service_path, service_name)
+    assert lines, f'--list-files printed nothing for {service_path}/{service_name}'
+    for line in lines:
+        assert ' ' not in line, f'--list-files printed {line!r}, which is not a bare path'
+        assert not re.match(r'^[fl] ', line), f'--list-files printed the internal manifest line {line!r}'
+        assert (REPO_ROOT / line).is_file() or (REPO_ROOT / line).is_symlink(), (
+            f'--list-files printed {line!r}, which is not a file relative to the repository root'
+        )
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(('service_path', 'service_name'), _digest_services())
+def test_the_digest_itself_is_one_line_of_64_hex(service_path: str, service_name: str):
+    """The output contract the Dockerfile label and migrate-check both key on."""
+    result = _run_source_digest(SOURCE_DIGEST_SCRIPT, service_path, service_name)
+    assert result.returncode == 0, f'source_digest.sh {service_path} {service_name} exited {result.returncode}'
+    lines = result.stdout.splitlines()
+    assert len(lines) == 1, f'expected exactly one line of stdout, read {lines}'
+    assert SOURCE_DIGEST_HEX.match(lines[0]), f'{lines[0]!r} is not a 64-hex digest'
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(('service_path', 'service_name'), _digest_services())
+def test_the_digest_is_deterministic_across_runs(service_path: str, service_name: str):
+    """Two runs on the same tree agree. Without this nothing else about the stamp means anything."""
+    first = _source_digest(service_path, service_name)
+    second = _source_digest(service_path, service_name)
+    assert first == second, f'two runs disagreed for {service_path}/{service_name}: {first} vs {second}'
+
+
+@pytest.mark.build_infra
+def test_each_service_gets_its_own_digest_covering_only_its_own_app():
+    """A per-service stamp: the digests differ, and no service's file list names another's app."""
+    services = _digest_services()
+    assert len(services) > 1, 'with one service there is nothing to tell apart'
+    digests = {service: _source_digest(*service)[0] for service in services}
+    assert len(set(digests.values())) == len(digests), f'two services share a digest: {digests}'
+    for service, files in ((service, _source_digest('--list-files', *service)) for service in services):
+        others = [f'{path}/{name}/app' for path, name in services if (path, name) != service]
+        intruders = sorted(line for line in files if any(line.startswith(f'{other}/') for other in others))
+        assert not intruders, f'{service} digest covers another service: {intruders}'
+
+
+# The committed .dockerignore excludes these from UNDER a COPY source, and over-exclusion is the
+# direction that makes a stale image read as FRESH -- so the pairing matters more than either half:
+# a file the context drops must not move the digest, and a file beside it that the context DOES
+# send must. The last entry is the control; without it every assertion here passes on a digest that
+# never moves at all.
+_DIGEST_PROBES = [
+    ('common/tests/_source_digest_probe.txt', False),
+    ('common/__pycache__/_source_digest_probe.pyc', False),
+    ('common/_source_digest_probe.pyc', False),
+    ('common/_source_digest_probe_control.py', True),
+]
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(('relative', 'moves'), _DIGEST_PROBES, ids=[probe for probe, _ in _DIGEST_PROBES])
+def test_only_a_file_the_build_context_sends_moves_the_digest(relative: str, moves: bool):
+    """A new file under a COPY source moves the stamp exactly when .dockerignore lets it through.
+
+    The excluded cases are the ones that matter in daily use: were a test edit or a .pyc to move the
+    stamp, migrate-check would refuse against a perfectly fresh image every day until somebody set
+    the escape hatch and stopped reading the output -- the outcome tj-yb1bxj names explicitly.
+    """
+    service_path, service_name = _digest_services()[0]
+    before = _source_digest(service_path, service_name)[0]
+    with _temporary_repo_file(relative):
+        after = _source_digest(service_path, service_name)[0]
+        listed = relative in _source_digest('--list-files', service_path, service_name)
+    if moves:
+        assert after != before, f'{relative} reaches the image, but the digest did not move'
+        assert listed, f'{relative} reaches the image, but --list-files does not name it'
+    else:
+        assert after == before, f'{relative} is kept out of the build context, but the digest moved'
+        assert not listed, f'{relative} is kept out of the build context, but --list-files names it'
+
+
+# -------------------------------------------------------------------------------------------------
+# THE REFUSAL VOCABULARY. Every form the parser does not fully understand exits NON-ZERO with ZERO
+# BYTES ON STDOUT. The empty stdout is the half that carries the weight: the Makefile assigns
+# SOURCE_DIGEST_DATA_STORE from a command substitution, so a failing script that printed a
+# plausible 64-hex line anyway would stamp an image with a digest covering less than it claims --
+# and an earlier draft of the script did exactly that, because each stage ran in a subshell where
+# `exit` killed only the subshell.
+#
+# These are driven against a THROWAWAY repository holding a copy of the real script, so a malformed
+# Dockerfile never touches the checkout. The sandbox exercises the parser, not the project's own
+# Dockerfile, which the equality tests above cover.
+_SANDBOX_DOCKERFILE = """\
+FROM scratch AS build
+ARG SERVICE_PATH=none
+ARG SERVICE_NAME=none
+COPY --from=somewhere/else:1 /from-another-image /elsewhere
+COPY ./pkg \\
+    /code/pkg
+COPY ./entry.sh /code/entry.sh
+COPY ./${SERVICE_PATH}/${SERVICE_NAME}/app /code/${SERVICE_PATH}/${SERVICE_NAME}/app
+"""
+_SANDBOX_DOCKERIGNORE = 'pkg/tests/\n**/__pycache__/\n**/*.py[cod]\n'
+_SANDBOX_SERVICE = ('svc', 'demo')
+
+
+@pytest.fixture
+def digest_sandbox(tmp_path: Path) -> Path:
+    """A throwaway repository root: a copy of the real script, a tiny Dockerfile and a tiny tree.
+
+    The script resolves its repository root from its own location, so copying it into <root>/tools
+    is all it takes to point it at a different tree.
+    """
+    (tmp_path / 'tools').mkdir()
+    shutil.copy2(SOURCE_DIGEST_SCRIPT, tmp_path / 'tools' / SOURCE_DIGEST_SCRIPT.name)
+    (tmp_path / 'pkg' / 'tests').mkdir(parents=True)
+    (tmp_path / 'pkg' / '__init__.py').write_text('', encoding='utf-8')
+    (tmp_path / 'pkg' / 'mod.py').write_text('VALUE = 1\n', encoding='utf-8')
+    (tmp_path / 'pkg' / 'tests' / 'test_mod.py').write_text('assert True\n', encoding='utf-8')
+    (tmp_path / 'svc' / 'demo' / 'app').mkdir(parents=True)
+    (tmp_path / 'svc' / 'demo' / 'app' / 'main.py').write_text('print(1)\n', encoding='utf-8')
+    entry = tmp_path / 'entry.sh'
+    entry.write_text('#! /bin/sh\n', encoding='utf-8')
+    entry.chmod(0o755)
+    (tmp_path / 'Dockerfile').write_text(_SANDBOX_DOCKERFILE, encoding='utf-8')
+    (tmp_path / '.dockerignore').write_text(_SANDBOX_DOCKERIGNORE, encoding='utf-8')
+    return tmp_path
+
+
+def _sandbox_run(root: Path, *arguments: str) -> subprocess.CompletedProcess:
+    return _run_source_digest(root / 'tools' / SOURCE_DIGEST_SCRIPT.name, *arguments)
+
+
+# (id, Dockerfile text or None to keep the sandbox's, .dockerignore text or None, expected exit).
+# Exit 3 is a parse refusal, exit 4 a source that exists in the Dockerfile but delivers no file.
+# Every one of these was reproduced by hand twice while C1 was gated; nothing re-measured them
+# until this table.
+_REFUSALS = [
+    ('dockerignore-negation', None, 'pkg/tests/\n!pkg/tests/test_mod.py\n', 3),
+    ('dockerignore-multi-segment-tail-after-globstar', None, '**/build/output\n', 3),
+    ('dockerignore-wildcard-inside-a-multi-segment-path', None, 'pkg/*.py\n', 3),
+    ('dockerignore-rule-erases-a-whole-copy-source', None, 'pkg\n', 4),
+    ('copy-source-names-an-unexpandable-build-arg', f'{_SANDBOX_DOCKERFILE}COPY ./${{OTHER}}/x /code/x\n', None, 3),
+    ('copy-source-does-not-exist', f'{_SANDBOX_DOCKERFILE}COPY ./absent /code/absent\n', None, 4),
+    ('json-array-copy', f'{_SANDBOX_DOCKERFILE}COPY ["pkg", "/code/pkg2"]\n', None, 3),
+    ('wildcard-copy-source', f'{_SANDBOX_DOCKERFILE}COPY ./pkg/*.py /code/pkg2/\n', None, 3),
+    ('copy-of-the-whole-context', f'{_SANDBOX_DOCKERFILE}COPY . /code/all\n', None, 3),
+    ('quoted-copy-operand', f'{_SANDBOX_DOCKERFILE}COPY "pkg" /code/pkg2\n', None, 3),
+    ('one-operand-copy', f'{_SANDBOX_DOCKERFILE}COPY ./pkg\n', None, 3),
+    ('no-copy-source-at-all', 'FROM scratch\nRUN true\n', None, 3),
+]
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    ('dockerfile', 'dockerignore', 'status'), [case[1:] for case in _REFUSALS], ids=[case[0] for case in _REFUSALS]
+)
+def test_a_form_the_parser_cannot_read_refuses_with_no_digest(
+    digest_sandbox: Path, dockerfile: str | None, dockerignore: str | None, status: int
+):
+    """Each unsupported form is a hard error with an empty stdout, never a quietly skipped line.
+
+    A skipped line is how coverage shrinks without anyone noticing, and a plausible-looking digest
+    printed alongside a failure is how a caller that forgets to check the status stamps an image
+    with a stamp that is wrong rather than absent.
+    """
+    if dockerfile is not None:
+        (digest_sandbox / 'Dockerfile').write_text(dockerfile, encoding='utf-8')
+    if dockerignore is not None:
+        (digest_sandbox / '.dockerignore').write_text(dockerignore, encoding='utf-8')
+    result = _sandbox_run(digest_sandbox, *_SANDBOX_SERVICE)
+    assert result.returncode == status, (
+        f'expected exit {status}, read {result.returncode}; stdout={result.stdout!r} stderr={result.stderr!r}'
+    )
+    assert result.stdout == '', f'a refusal printed {result.stdout!r} on stdout; it must print nothing at all'
+    assert result.stderr.strip(), 'a refusal must say why, on stderr'
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    'arguments',
+    [(), ('svc',), ('svc', 'demo', 'extra'), ('--bogus', 'svc', 'demo'), ('--list-files',), ('--list-paths', 'svc')],
+    ids=['none', 'one-operand', 'three-operands', 'unknown-option', 'mode-without-operands', 'mode-with-one-operand'],
+)
+def test_bad_arguments_refuse_with_no_digest(digest_sandbox: Path, arguments: tuple[str, ...]):
+    """Usage errors exit 2 and print nothing on stdout, same contract as a parse refusal."""
+    result = _sandbox_run(digest_sandbox, *arguments)
+    assert result.returncode == 2, f'expected exit 2 for {arguments}, read {result.returncode}'
+    assert result.stdout == '', f'a usage error printed {result.stdout!r} on stdout'
+
+
+@pytest.mark.build_infra
+def test_the_sandbox_itself_produces_a_digest(digest_sandbox: Path):
+    """Non-vacuity for every refusal above: unmutated, the same sandbox succeeds.
+
+    Without this, a sandbox broken in some unrelated way would make all twelve refusals pass by
+    failing for the wrong reason.
+    """
+    result = _sandbox_run(digest_sandbox, *_SANDBOX_SERVICE)
+    assert result.returncode == 0, f'the unmutated sandbox exited {result.returncode}: {result.stderr}'
+    assert SOURCE_DIGEST_HEX.match(result.stdout.strip()), f'{result.stdout!r} is not a 64-hex digest'
+    assert set(_sandbox_run(digest_sandbox, '--list-files', *_SANDBOX_SERVICE).stdout.split()) == {
+        'entry.sh',
+        'pkg/__init__.py',
+        'pkg/mod.py',
+        'svc/demo/app/main.py',
+    }, 'the sandbox must cover its COPY sources, skip --from=, join the continuation and drop pkg/tests'
+
+
+def _sandbox_touch(root: Path) -> None:
+    (root / 'pkg' / 'mod.py').touch()
+
+
+def _sandbox_edit_an_excluded_file(root: Path) -> None:
+    (root / 'pkg' / 'tests' / 'test_mod.py').write_text('assert True  # edited\n', encoding='utf-8')
+
+
+def _sandbox_add_bytecode(root: Path) -> None:
+    (root / 'pkg' / '__pycache__').mkdir()
+    (root / 'pkg' / '__pycache__' / 'mod.cpython-313.pyc').write_bytes(b'bytecode')
+    (root / 'pkg' / 'stray.pyc').write_bytes(b'bytecode')
+
+
+def _sandbox_edit_a_source_file(root: Path) -> None:
+    (root / 'pkg' / 'mod.py').write_text('VALUE = 2\n', encoding='utf-8')
+
+
+def _sandbox_rename_a_source_file(root: Path) -> None:
+    (root / 'pkg' / 'mod.py').rename(root / 'pkg' / 'renamed.py')
+
+
+def _sandbox_set_the_exec_bit(root: Path) -> None:
+    (root / 'pkg' / 'mod.py').chmod(0o755)
+
+
+def _sandbox_add_a_source_file(root: Path) -> None:
+    (root / 'pkg' / 'extra.py').write_text('EXTRA = 1\n', encoding='utf-8')
+
+
+# (id, mutation, does the digest move?). The first three are what the image does not see; the last
+# four are what it does. COPY preserves the executable bit and a rename changes the path the image
+# holds, so both have to move a digest that claims to cover "exactly the source it COPYs".
+_SANDBOX_MUTATIONS = [
+    ('touch-without-editing', _sandbox_touch, False),
+    ('edit-a-file-dockerignore-excludes', _sandbox_edit_an_excluded_file, False),
+    ('add-pycache-and-pyc-files', _sandbox_add_bytecode, False),
+    ('edit-a-source-file', _sandbox_edit_a_source_file, True),
+    ('rename-a-source-file', _sandbox_rename_a_source_file, True),
+    ('set-the-executable-bit', _sandbox_set_the_exec_bit, True),
+    ('add-a-source-file', _sandbox_add_a_source_file, True),
+]
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    ('mutate', 'moves'), [case[1:] for case in _SANDBOX_MUTATIONS], ids=[case[0] for case in _SANDBOX_MUTATIONS]
+)
+def test_the_digest_moves_for_what_the_image_sees_and_only_for_that(digest_sandbox: Path, mutate, moves: bool):
+    """mtime, an excluded file and bytecode leave the stamp alone; content, path and mode move it."""
+    before = _sandbox_run(digest_sandbox, *_SANDBOX_SERVICE)
+    assert before.returncode == 0, f'the sandbox would not digest before the mutation: {before.stderr}'
+    mutate(digest_sandbox)
+    after = _sandbox_run(digest_sandbox, *_SANDBOX_SERVICE)
+    assert after.returncode == 0, f'the sandbox would not digest after the mutation: {after.stderr}'
+    if moves:
+        assert after.stdout != before.stdout, 'the image would change, but the digest held still'
+    else:
+        assert after.stdout == before.stdout, 'the image would not change, but the digest moved'

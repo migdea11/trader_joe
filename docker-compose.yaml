@@ -51,6 +51,22 @@ services:
       args:
         SERVICE_PATH: data
         SERVICE_NAME: store
+        # THE SOURCE STAMP (decision tj-yb1bxj clause 1). tools/source_digest.sh's digest of
+        # exactly the source the Dockerfile COPYs into this service's image, which the Dockerfile
+        # records as the trader_joe.source.digest label so migrate-check can tell a stale image
+        # from a fresh one without starting a container.
+        #
+        # Compose interpolates this from the environment of whoever runs the build, and only the
+        # Makefile's prod-build and dev-build set it. Every other build path -- the agent stack,
+        # CI, a bare `docker compose build` -- leaves it unset and gets the ":-" empty string,
+        # which still produces a usable image, just an unstamped one. The variable is per service
+        # because data_store and data_ingest COPY different app directories and so have different
+        # digests; one shared variable would stamp each image with the other's source.
+        #
+        # ":-" rather than ":?" deliberately: a build outside make must not FAIL, it must produce
+        # an image that is honestly marked unverifiable. tj-ymsobh treats an empty stamp as
+        # "cannot verify", never as a match.
+        SOURCE_DIGEST: ${SOURCE_DIGEST_DATA_STORE:-}
     hostname: ${DATA_STORE_NAME:-data_store}
     networks:
       # Three internal networks and nothing else, so data_store has no gateway: no egress,
@@ -133,6 +149,9 @@ services:
       args:
         SERVICE_PATH: data
         SERVICE_NAME: ingest
+        # Per service, for the reason data_store's entry above spells out: a different app
+        # directory is COPYd here, so this is a different digest.
+        SOURCE_DIGEST: ${SOURCE_DIGEST_DATA_INGEST:-}
     hostname: ${DATA_INGEST_NAME:-data_ingest}
     networks:
       #   ingest_store   reaches data_store, and is reached by data_store.

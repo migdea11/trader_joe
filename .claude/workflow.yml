@@ -79,7 +79,7 @@ agents:
     model: opus
     slots:
       role_description: "Design authority for trader_joe."
-      tech_stack: "Python 3.12, FastAPI, SQLAlchemy 2.0 async, Pydantic v2, Kafka, Postgres; uv workspace."
+      tech_stack: "Python 3.12, FastAPI, SQLAlchemy 2.0 async, Pydantic v2, grpc.aio and protobuf, Postgres; uv workspace."
       key_invariants: "Turnover caps are per account and account-type-agnostic, and broker handles declare no capability flags (decision tj-j4wknb addendum 4). The order/fill event log is append-only. Nothing that touches money ships without a decision record."
 
   - name: builder-ingest
@@ -87,7 +87,7 @@ agents:
     scope: [data/ingest, routers/data_ingest]
     model: sonnet
     slots:
-      do_not: "Do not edit common/, schemas/ or routers/common — propose the change to builder-shared. data/ingest/tests is the validator's; a test you write there is not undone, but the validator owns it. Do not change the Kafka topic registry or RPC contracts unilaterally. Do not commit broker credentials or scratch data files."
+      do_not: "Do not edit common/, schemas/ or routers/common — propose the change to builder-shared. data/ingest/tests is the validator's; a test you write there is not undone, but the validator owns it. Do not change the `.proto` contracts or anything under `gen/` unilaterally. Do not commit broker credentials or scratch data files."
 
   - name: builder-store
     role: builder
@@ -131,16 +131,16 @@ components:
   - path: data/ingest
     slots:
       component_name: "Market data ingest"
-      component_summary: "Broker-facing ingest service. Fetches market data from Alpaca and answers data-store's Kafka RPC request; a request may also be a feed subscription that this service streams to Kafka. Stock only today — crypto and option paths are stubs."
+      component_summary: "Broker-facing ingest service. Fetches market data from Alpaca and answers data-store's `FetchDataset` gRPC request. Stock only today — crypto and option paths are stubs."
       arch_refs: "`bd list -t arch_index --all` — child of `trader_joe system` (tj-mtwvnu). Design diagram: `docs/img/design.jpg`."
-      tech_stack: "Python 3.12, FastAPI, alpaca-py, Kafka RPC server"
+      tech_stack: "Python 3.12, FastAPI, alpaca-py, grpc.aio server (health service and `FetchDataset`)"
       key_invariants: "Broker-facing layer only; data-store owns the data. Blocking SDK calls go through the shared worker pool, never inline in an async handler."
       env_vars: "| ALPACA_API_KEY / ALPACA_API_SECRET | broker credentials | unset |"
       pitfalls: "| 1 | The Alpaca client is built at import time, which breaks tests and secret rotation | Build it lazily |"
   - path: data/store
     slots:
       component_name: "Market data store"
-      component_summary: "Owner of all persisted market data. Requests data from data-ingest over Kafka RPC, writes it to Postgres, and serves it over `/store/...` and `/internal/asset-data/...`. Tables: `store_dataset_entry`, `stock_market_activity`."
+      component_summary: "Owner of all persisted market data. Requests data from data-ingest over gRPC (`FetchDataset`), writes it to Postgres, and serves it over `/store/...` and `/internal/asset-data/...`. Tables: `store_dataset_entry`, `stock_market_activity`."
       arch_refs: "`bd list -t arch_index --all` — child of `trader_joe system` (tj-mtwvnu). Design diagram: `docs/img/design.jpg`."
       tech_stack: "Python 3.12, FastAPI, SQLAlchemy 2.0 async, asyncpg, Alembic, Postgres"
       key_invariants: "Sole owner of persisted market data. Every write goes through a repository; no raw SQL in routers. Migrations are additive."
@@ -149,10 +149,10 @@ components:
   - path: common
     slots:
       component_name: "Shared library"
-      component_summary: "Shared library imported by both services: Kafka producer/consumer and the hand-written RPC layer, the topic registry, the Postgres session factory, custom SQLAlchemy types, and env/logging/worker-pool helpers."
+      component_summary: "Shared library imported by both services: the gRPC channel, server and client layer (`common/rpc`), the shared error vocabulary (`common/errors`), the Postgres session factory, custom SQLAlchemy types, and env/logging/worker-pool helpers."
       arch_refs: "`bd list -t arch_index --all` — child of `trader_joe system` (tj-mtwvnu). Design diagram: `docs/img/design.jpg`."
-      tech_stack: "Kafka producer/consumer and hand-written Kafka RPC, Postgres session factory, custom SQLAlchemy types, env/logging/worker pool"
-      key_invariants: "Changing anything here affects both services. The Kafka topic registry is the inter-service contract."
+      tech_stack: "`grpc.aio` and protobuf (contracts in `proto/`, generated code committed under `gen/`), Postgres session factory, custom SQLAlchemy types, shared error vocabulary, env/logging/worker pool"
+      key_invariants: "Changing anything here affects both services. The `.proto` files under `proto/` are the inter-service contract: they are the source of truth, the Python stubs under `gen/` are generated from them and committed, and a staleness check fails the build when the two disagree. Change the `.proto` and regenerate — never hand-edit anything under `gen/`."
       env_vars: "| RUN_MODE | dev enables the debugger | defaults to DEV (bug tj-g1qqf1) |"
       pitfalls: "| 1 | Env vars are read at import time, so importing a module requires them set | Keep reads lazy in new code |"
   - path: schemas

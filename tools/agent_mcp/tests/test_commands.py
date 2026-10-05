@@ -29,12 +29,14 @@ from common.tests.test_ci_invariants import (
 )
 from tools.agent_mcp import runner, stack
 from tools.agent_mcp.tests.harness import (
+    DEV_PROJECT_VERBS,
     DOCKERLESS_VERBS,
     REPO_ROOT,
     VERB_SAMPLES,
     WORKTREE_NAME,
     clearing_hook,
     default_response,
+    dev_step_prefix_length,
     make_rig,
     populate_data,
     record_state,
@@ -115,6 +117,14 @@ def test_every_verb_runs_only_the_fixed_compose_prefix_over_the_snapshot(
     rig, result = _run_verb(tmp_path, monkeypatch, verb, _bases_absent)
     layout = rig.layout
     assert result['status'] == 'ok', result
+    if verb in DEV_PROJECT_VERBS:
+        # Not this test's subject: the dev verbs reach the user's own project with a four-word
+        # prefix that spells no file, no project directory and no env file. The pin that matters
+        # for them -- that no other project and no mutating command is reachable -- is tj-tq2hn6's.
+        assert rig.docker.steps, f'{verb} ran no docker step, so there is nothing to pin'
+        assert all(list(step.argv[:2]) == [EXPECTED_DOCKER, 'compose'] for step in rig.docker.steps)
+        assert EXPECTED_PROJECT not in {word for step in rig.docker.steps for word in step.argv}
+        return
     if verb in DOCKERLESS_VERBS:
         assert rig.docker.steps == [], f'{verb} ran docker: {rig.docker.steps}'
         return
@@ -171,6 +181,14 @@ _EXPECTED_TAILS = {
         ['run', '--rm', '--no-deps', 'data_store', '/code/.venv/bin/alembic', 'current'],
         ['run', '--rm', '--no-deps', 'data_store', '/code/.venv/bin/alembic', 'history'],
     ],
+    # tj-yuz1e8: the ONE alembic run that carries --build. Spelled out beside the two that must not,
+    # so an implementation that put the flag on all three goes red here rather than silently
+    # changing what migrate does.
+    'migrate_check': [
+        ['ps', '-q', 'postgres'],
+        *_INSPECTS,
+        ['run', '--rm', '--no-deps', '--build', 'data_store', '/code/.venv/bin/alembic', 'check'],
+    ],
     'run_system_tests': [
         *_INSPECTS,
         ['run', '--rm', '--no-deps', '--build', 'test_client', 'tests/system/test_one.py'],
@@ -186,12 +204,44 @@ _EXPECTED_TAILS = {
     'ps': [['ps', '--all']],
 }
 
+# THE DEV PAIR, whole argv rather than a tail (tj-kzy7w2; ADR tj-4rr0la addendum 18). Spelled from
+# literals, including the project name: a test that read stack.DEV_PROJECT would agree with any
+# change to it, and the project name is the whole safety case here.
+EXPECTED_DEV_PROJECT = 'trader_joe'
+_EXPECTED_TAILS_DEV = {
+    'dev_ps': [[EXPECTED_DOCKER, 'compose', '-p', EXPECTED_DEV_PROJECT, 'ps', '--all']],
+    'dev_logs': [
+        [EXPECTED_DOCKER, 'compose', '-p', EXPECTED_DEV_PROJECT, 'logs', '--no-color', '--tail', '50', 'postgres']
+    ],
+}
+
 
 def _tail(step: stack.Step) -> list[str]:
-    """A compose step's words after the fixed prefix; a plain docker step (the bases) whole."""
-    if list(step.argv[:2]) == [EXPECTED_DOCKER, 'compose']:
-        return list(step.argv[step_prefix_length() :])
-    return list(step.argv)
+    """A compose step's words after its prefix; a plain docker step (the bases) whole.
+
+    Two prefixes exist: the agent stack's, and the dev pair's four words. Slicing a dev step by the
+    agent stack's length would read past its end, so the project name picks the prefix.
+    """
+    if list(step.argv[:2]) != [EXPECTED_DOCKER, 'compose']:
+        return list(step.argv)
+    dev = list(step.argv[:4]) == [EXPECTED_DOCKER, 'compose', '-p', EXPECTED_DEV_PROJECT]
+    return list(step.argv[(dev_step_prefix_length() if dev else step_prefix_length()) :])
+
+
+@pytest.mark.parametrize('verb', sorted(_EXPECTED_TAILS_DEV))
+def test_every_dev_verb_runs_exactly_its_fixed_read_only_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str
+):
+    """The dev pair's WHOLE argv, spelled from literals: four prefix words, then a read-only tail.
+
+    Whole rather than a tail, because for these verbs the prefix is the containment: a -f, a second
+    -p or an --env-file appearing here is the failure the verbs were allowed on condition of
+    preventing. The deeper pins -- that no other project is reachable by any accepted argument and
+    that no mutating command is constructible -- are tj-tq2hn6's (B2).
+    """
+    rig, result = _run_verb(tmp_path, monkeypatch, verb)
+    assert result['status'] == 'ok', result
+    assert [list(step.argv) for step in rig.docker.steps] == _EXPECTED_TAILS_DEV[verb]
 
 
 @pytest.mark.parametrize('verb', sorted(_EXPECTED_TAILS))
@@ -216,7 +266,9 @@ def test_every_verb_runs_exactly_its_fixed_tails(tmp_path: Path, monkeypatch: py
 
 def test_every_verb_with_fixed_tails_is_covered():
     """A verb that runs docker and has no _EXPECTED_TAILS entry would escape the tail pin."""
-    assert set(_EXPECTED_TAILS) == set(VERB_SAMPLES) - DOCKERLESS_VERBS
+    assert set(_EXPECTED_TAILS) | set(_EXPECTED_TAILS_DEV) == set(VERB_SAMPLES) - DOCKERLESS_VERBS
+    assert set(_EXPECTED_TAILS_DEV) == DEV_PROJECT_VERBS
+    assert not set(_EXPECTED_TAILS) & DEV_PROJECT_VERBS
 
 
 def test_stack_wipe_clears_only_the_data_mounts_as_root_in_one_off_containers(

@@ -274,7 +274,7 @@ def test_the_devcontainer_environment_is_ignored_by_git() -> None:
 # `env | grep UV_FROZEN` in a fresh agent shell, not by this file pretending to have done it.
 #
 # WHY compose.yml RATHER THAN devcontainer.json, verified rather than taken from the comment:
-# Makefile:417 sets AGENT_COMPOSE := docker compose -f .devcontainer/compose.yml and agent-build
+# the Makefile sets AGENT_COMPOSE := docker compose --env-file ... -f .devcontainer/compose.yml and agent-build
 # runs `$(AGENT_COMPOSE) build`, so the make path never invokes the Dev Containers CLI and would
 # never read containerEnv/remoteEnv. The IDE path does read devcontainer.json -- but that file
 # delegates with dockerComposeFile: compose.yml and service: agent, so it arrives at this same

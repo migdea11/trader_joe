@@ -11,6 +11,7 @@ F6) -- so refusals are asserted as 2, never 1. What only a daemon or an IDE can 
 does not rebuild, a real rebuild does, the devcontainer reaches the MCP) is tj-c4mosr.6 H0.
 """
 
+import functools
 import json
 import os
 import re
@@ -21,13 +22,34 @@ from pathlib import Path
 import pytest
 
 from common.tests.compose_model import AGENT_MCP_FILE, load
-from common.tests.test_ci_invariants import MAKEFILE, REPO_ROOT, _make_recipe, _make_variable
+from common.tests.test_ci_invariants import (
+    MAKEFILE,
+    REPO_ROOT,
+    _expanded_make_variable,
+    _make_recipe,
+    _make_variable,
+    _subprocess_env,
+)
 from common.tests.test_network_model import _make_prerequisites
 
 
 pytestmark = pytest.mark.build_infra
 
 MCP_PROJECT = 'trader_joe_agent_mcp'
+
+
+@functools.cache
+def _agent_compose_call() -> str:
+    """`$(AGENT_COMPOSE)` as the docker stub logs it, taken from make rather than respelled here.
+
+    AGENT_COMPOSE carries --env-file since tj-ywpuxx, and its value depends on the checkout: the
+    absolute path of the root .env when there is one, /dev/null when there is not. Spelling one of
+    them here would make these assertions pass or fail by whether the machine running them happens
+    to have a .env. What the flag is FOR is pinned on .devcontainer/compose.yml, not here.
+    """
+    return _expanded_make_variable('AGENT_COMPOSE', REPO_ROOT, _subprocess_env()).removeprefix('docker ')
+
+
 PLAIN_START_TARGETS = ('agent-mcp-up', 'agent-up')
 ADDENDUM_7 = 'the user ruling of ADR tj-4rr0la addendum 7'
 
@@ -165,7 +187,7 @@ def test_a_failed_mcp_start_warns_and_the_devcontainer_still_starts(host: Host):
     result = _make(host, 'agent-up', STUB_INTERNAL='false')
     assert result.returncode == 0, result.stderr
     assert 'make agent-mcp-up' in result.stderr and 'AGENT_MCP=off' in result.stderr, result.stderr
-    assert 'compose -f .devcontainer/compose.yml up -d' in host.docker_calls(), host.docker_calls()
+    assert f'{_agent_compose_call()} up -d' in host.docker_calls(), host.docker_calls()
 
 
 def test_agent_down_never_stops_the_mcp(host: Host):
@@ -177,7 +199,7 @@ def test_agent_down_never_stops_the_mcp(host: Host):
     )
     result = _make(host, 'agent-down')
     assert result.returncode == 0, result.stderr
-    assert host.docker_calls() == ['compose -f .devcontainer/compose.yml down'], (
+    assert host.docker_calls() == [f'{_agent_compose_call()} down'], (
         f'agent-down ran {host.docker_calls()}; it must not stop the MCP ({ADDENDUM_7})'
     )
 
@@ -610,7 +632,7 @@ def test_agent_build_rebuilds_the_mcp_as_a_warning_recipe_line_after_the_devcont
         result.stderr
     )
     calls = host.docker_calls()
-    build = calls.index('compose -f .devcontainer/compose.yml build')
+    build = calls.index(f'{_agent_compose_call()} build')
     rebuild = next(index for index, call in enumerate(calls) if call.startswith(f'compose -p {MCP_PROJECT}'))
     assert build < rebuild, 'the MCP rebuild ran before the devcontainer build'
 
@@ -623,6 +645,86 @@ def test_agent_build_skips_the_mcp_with_agent_mcp_off_and_stops_on_a_failed_devc
     assert result.returncode == 2 and not _mcp_compose_calls(host), (
         'the MCP was rebuilt after a failed devcontainer build'
     )
+
+
+# --- R3 (tj-ix1hbl): AGENT_COMPOSE's flags, pinned from literals and from both branches -------------
+#
+# WHY THESE ARE HERE AND NOT FOLDED INTO THE THREE ASSERTIONS ABOVE. _agent_compose_call() reads
+# AGENT_COMPOSE back out of make, so the `up -d`, `down` and `build` pins keep WHICH calls happen and
+# in WHAT ORDER -- and would agree with ANY value, including one with no --env-file at all. Before
+# this, the compose-file identity survived only INCIDENTALLY, through the docker stub's literal glob
+# at line 67 of this file. The surviving pin was not the intended one.
+
+DEVCONTAINER_COMPOSE_PATH = '.devcontainer/compose.yml'
+ROOT_ENV_FILE_NAME = '.env'
+NO_ENV_FILE = '/dev/null'
+
+
+def test_agent_compose_carries_an_env_file_flag_and_the_devcontainers_own_compose_file():
+    """R3, from the Makefile's LITERALS: the flag set, and that nothing else loads that compose file.
+
+    WHAT THE FLAG SET IS FOR, so whoever reads a red here knows whether to widen it or to revert:
+      -f .devcontainer/compose.yml
+          the devcontainer's own file -- the one whose environment: block names the allowed keys one
+          by one (pinned in test_agent_mcp_compose.py). Dropping or redirecting it moves the whole
+          key-set guard off the file that is actually started.
+      --env-file $(AGENT_ENV_FILE)
+          compose takes its project directory from the FIRST compose file's directory, so that -f
+          makes `.devcontainer` the project directory even though make runs from the repo root. The
+          env file compose would read BY DEFAULT is therefore `.devcontainer/.env` and NOT the repo
+          root's `.env`, where the two dev credentials live (Makefile:459-465). The flag names the
+          root file explicitly; without it the container starts with both sentinels, which is a
+          working-looking devcontainer with a dead password.
+
+    A NEW FLAG REDS THIS ON PURPOSE. If the user's ruling on tj-oxxl8a adds `-p` for the agent
+    devcontainer's compose project name, widening this is part of that work, in the same feature. Any
+    other addition is a revert and not a widening -- and `--env-file` pointing anywhere but the root
+    file is the documented trap, not a new flag.
+    """
+    value = _make_variable('AGENT_COMPOSE')
+    assert re.fullmatch(
+        rf'docker compose --env-file \$\(AGENT_ENV_FILE\) -f {re.escape(DEVCONTAINER_COMPOSE_PATH)}', value
+    ), (
+        f'AGENT_COMPOSE is `{value}`: it must be `docker compose --env-file $(AGENT_ENV_FILE) '
+        f"-f {DEVCONTAINER_COMPOSE_PATH}` -- see this test's docstring for what each flag is for"
+    )
+    folded = MAKEFILE.read_text(encoding='utf-8').replace('\\\n', ' ')
+    uses = [
+        line for line in folded.splitlines() if DEVCONTAINER_COMPOSE_PATH in line and not line.lstrip().startswith('#')
+    ]
+    assert uses == [f'AGENT_COMPOSE := {value}'], (
+        f'the devcontainer compose file is loaded outside AGENT_COMPOSE: {uses}. A second invocation would '
+        'not carry --env-file, and would start the container with both credential sentinels'
+    )
+
+
+@pytest.mark.parametrize('root_env', [True, False], ids=['root-env-present', 'root-env-absent'])
+def test_agent_env_file_is_the_absolute_root_env_file_or_dev_null(tmp_path: Path, root_env: bool):
+    """R3's conditional, BOTH branches, run for real.
+
+    AGENT_ENV_FILE is `$(if $(wildcard $(CURDIR)/.env),...)`, so only ONE branch is exercised on any
+    given checkout -- a literal pin would pass in a worktree with no .env and fail on the user's main
+    checkout, which is exactly why the three assertions above this section were loosened. Make is run
+    from a tmp directory instead, so the branch is chosen by this fixture rather than by whether the
+    machine happens to have a root .env.
+
+    ABSOLUTE on purpose: compose has resolved a relative --env-file against the invoking directory in
+    some versions and against the project directory in others (Makefile:467-469). /dev/null on a
+    checkout with no root .env, because compose refuses outright when a named --env-file is missing,
+    and a devcontainer you cannot stop is a worse failure than a credential you do not have.
+    """
+    if root_env:
+        (tmp_path / ROOT_ENV_FILE_NAME).write_text('# never read into make; compose interpolates on the host\n')
+    expected = str(tmp_path / ROOT_ENV_FILE_NAME) if root_env else NO_ENV_FILE
+    value = _expanded_make_variable('AGENT_ENV_FILE', tmp_path, _subprocess_env())
+    assert value == expected, f'AGENT_ENV_FILE is {value!r} with root .env present={root_env}, not {expected!r}'
+    assert Path(value).is_absolute(), f'a relative --env-file resolves differently across compose versions: {value}'
+    assert '.devcontainer' not in value, (
+        f'--env-file points into .devcontainer ({value}): that is the file compose reads BY DEFAULT and the '
+        'one place the two dev credentials are NOT, so this would start the container with both sentinels'
+    )
+    expanded = _expanded_make_variable('AGENT_COMPOSE', tmp_path, _subprocess_env())
+    assert expanded == f'docker compose --env-file {expected} -f {DEVCONTAINER_COMPOSE_PATH}', expanded
 
 
 # --- M4: the host path check, run for real -----------------------------------------------------------

@@ -104,8 +104,12 @@ jobs:
     # would go red (tj-3mk3u5.40). grep -P, the hooks' other tool, needs nothing here: bookworm's
     # grep is Essential, so the slim image has it, and it pre-depends on libpcre2-8-0.
     #
-    # curl because `make buf-install` (Install Buf, below) downloads the pinned buf release with it,
-    # and the slim image has none (tj-3mk3u5.54). ca-certificates serves it too: the download is https.
+    # curl because `make buf-install` (Install Buf, below) and `make shellcheck-install` (Install
+    # ShellCheck, below) download their pinned releases with it, and the slim image has none
+    # (tj-3mk3u5.54, tj-xc6nfv). ca-certificates serves them too: both downloads are https.
+    # tar and gzip need no entry: both are Essential in Debian, so the slim image has them, which is
+    # why the shellcheck pin takes the release's .tar.gz and not its smaller .tar.xz (xz-utils is not
+    # Essential, and the agent image has no xz binary at all).
     #
     # safe.directory: the runner creates the workspace as its own user and this container runs as
     # root, so git refuses the checkout for dubious ownership. actions/checkout marks the workspace
@@ -136,6 +140,19 @@ jobs:
     - name: Install Buf
       run: |
         make buf-install BUF_INSTALL_DIR=/usr/local/bin
+
+    # THE PINNED SHELLCHECK (tj-xc6nfv), through the target a developer runs, for the same reason buf
+    # goes through make buf-install: the version and both checksums have one definition, the
+    # Makefile's. NOT the Debian package -- bookworm ships shellcheck 0.9.0, and a linter at a
+    # different version than the one agents run locally reports a different set of findings, which
+    # makes a green local `make lint` mean nothing about CI. Before Run Linters, whose shell leg needs
+    # it, and also before Run Unit Tests, for the reason buf is: the suite runs the real pinned binary
+    # (test_make_lint.py's real_buf fixture, which FAILS rather than skips when it is absent). No test
+    # reaches shellcheck yet -- that is tj-s2tf38 -- and the step is ordered now so adding one later
+    # is a test change and not a CI change. No cache: one 4 MB download per run.
+    - name: Install ShellCheck
+      run: |
+        make shellcheck-install SHELLCHECK_INSTALL_DIR=/usr/local/bin
 
     # buf breaking's baseline (tj-3mk3u5.54). actions/checkout fetches one commit and no branch, so
     # main is fetched here as a remote-tracking ref, and make lint is pointed at it. Depth 1: make
@@ -186,8 +203,9 @@ jobs:
 
     # THE ONE LINT ENTRY POINT, the same target every agent and developer runs (tj-3mk3u5.54), so the
     # linters have one definition, as the staleness step's protoc does through make proto. PATHS
-    # defaults to '.', so this is ruff check and ruff format --check on the whole tree, then the
-    # proto leg: buf lint, buf format --diff --exit-code and buf breaking against main. Breaking is
+    # defaults to '.', so this is ruff check and ruff format --check on the whole tree, then the shell
+    # leg (shellcheck over every *.sh git lists, tj-xc6nfv), then the proto leg: buf lint, buf format
+    # --diff --exit-code and buf breaking against main. Breaking is
     # REPORT-ONLY until the first SDK release (tj-d2mhru): a break prints as annotations on the pull
     # request and does not fail the step; a broken check still does. After the staleness step, so a
     # stale tree is reported as stale.

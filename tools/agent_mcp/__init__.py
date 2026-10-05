@@ -4,11 +4,25 @@ Agents have no Docker socket and no docker CLI, by standing rule. This server ru
 container (tools/agent_mcp/Dockerfile, started by make agent-mcp-up) and gives them FIXED VERBS over
 ONE isolated compose project, trader_joe_agent_stack:
 
-    stack_up(worktree)  stack_down()  stack_wipe()  migrate()  migrate_status()
+    stack_up(worktree)  stack_down()  stack_wipe()  migrate()  migrate_status()  migrate_check()
     run_system_tests(worktree, paths)  seed_dump(worktree)  logs(service, tail)  ps()
+
+plus TWO READ-ONLY VERBS over a second project, the user's own dev stack (ADR tj-4rr0la addendum 18;
+tj-kzy7w2, approved on tj-wpnr7o (b)):
+
+    dev_ps()  dev_logs(service, tail)
 
 An agent passes a worktree NAME, test paths, a service from a closed set and a line count -- never a
 compose argument, an image, a container id, a command line or a host path.
+
+THE SECOND PROJECT, and why it costs less than it looks. The dev verbs run
+`docker compose -p <stack.DEV_PROJECT> ps|logs` and nothing else: no -f, no --project-directory, no
+--env-file. compose v2 loads no project when a project NAME is given and no file is, so these two
+work off the containers' com.docker.compose.project label -- with no compose file there is no build
+context, no bind mount and no service to act on, so nothing that creates, changes or removes
+anything is constructible, and the user's root .env is never opened. The project is a CONSTANT, not
+an argument, and stack.check_dev_argv() re-checks every argv before it is run. Nothing else in the
+server names any project but stack.PROJECT.
 
 MODULES
     settings.py  the server's own settings (host paths, port), from its container environment.
@@ -20,7 +34,8 @@ MODULES
 Everything but server.py imports the standard library only, so the dev venv -- which does not install
 the agent-mcp group -- can import and test it.
 
-COMMANDS. Every docker command but the base-image pair below is stack.compose_prefix() plus a fixed tail:
+COMMANDS. Every docker command but the base-image pair below and the two dev-project commands above
+is stack.compose_prefix() plus a fixed tail:
     /usr/local/bin/docker compose -p trader_joe_agent_stack --project-directory <stack dir>/source
         --env-file <stack dir>/agent_stack.env -f <each of stack.COMPOSE_FILES>
 stack.PROJECT and stack.COMPOSE_FILES mirror the Makefile's AGENT_STACK_PROJECT and
@@ -35,16 +50,28 @@ if absent -- and a failed pull stops the verb, naming the ref, before any build 
 The trusted Dockerfile pins those refs by digest; no build passes --pull.
 
 THE SNAPSHOT (ADR addendum 5). The Docker daemon never resolves a path an agent can change. Before
-stack_up, migrate, migrate_status and run_system_tests, stack.refresh_snapshot() copies the named (or
-recorded) worktree's stack.SNAPSHOT_SOURCES into <stack dir>/source -- no symlink, no special file,
+stack_up, migrate, migrate_status, migrate_check, run_system_tests and seed_dump,
+stack.refresh_snapshot() copies the named (or recorded) worktree's stack.SNAPSHOT_SOURCES
+into <stack dir>/source -- no symlink, no special file,
 capped in bytes and files, built beside the old copy, verified, swapped in by rename -- and that copy
 is the project directory: the build context and every relative bind source. stack.check_mount_sources,
 stack.resolve_test_paths and the migrations guard run on it. stack_down, stack_wipe, logs and ps read
-no worktree. The premise, checked by settings: nothing but the MCP writes under the stack directory.
+no worktree, and the two dev verbs use no snapshot at all. The premise, checked by settings: nothing but the MCP writes under the stack directory.
 The swap orphans a running container's snapshot binds, so stack_up force-recreates
 stack.SNAPSHOT_BOUND_SERVICES on every call: the long-running services run the code of the LAST
 stack_up, and run_system_tests rebuilds and recreates only test_client -- after editing anything a
 running service loads, tests/fakes included, call stack_up first (tj-zgq5v2).
+
+migrate_check IS THE ONE RUN THAT PASSES --build, AND THE ASYMMETRY WITH make migrate-check IS
+DELIBERATE (decision tj-yb1bxj, closing section; tj-yuz1e8). `alembic check` compares the models it
+imports, and migrations/env.py imports them from /code -- the IMAGE -- while only alembic.ini and
+migrations/ are bind-mounted. compose builds a MISSING image on `run` but never a STALE one, so
+without the flag the check would compare the last stack_up's models. The agent stack exists to
+reflect the worktree under test and has no deployed image to be faithful to, so it BUILDS and the
+answer is about the worktree. The deploy path wants the opposite -- there the image actually
+deployed IS the subject -- so data/store/run_migrations.sh verifies the image's digest stamp and
+refuses a mismatch instead. Nothing in this server routes through that script or inherits that
+guard, and nothing here should: a build and a stamp refusal answer different questions.
 
 THE GENERATED ENV FILES (stack.ensure_env_files; ADR addendum 2). Three files in the agent stack's own
 directory, outside the repository, 0600, generated once from the committed .env.default files read at
@@ -61,8 +88,10 @@ stack.ROOT_ONLY_VARIABLES name) are set in the ROOT file only. env_file order is
 file, so a service-file value would win in the container while compose interpolated the root value --
 the apps would dial a host other than the container name.
 
-GUARD 2 IS stack.check_env_file_paths(). Every verb that runs docker calls it (through
-AgentStack._guarded_env) before its first docker subprocess: ROOT_ENV_FILE, STORE_ENV_FILE and
+GUARD 2 IS stack.check_env_file_paths(). Every verb that hands compose an --env-file calls it
+(through AgentStack._guarded_env) before its first docker subprocess -- that is every verb but the
+two dev ones, which pass no env file, no bind source and no project directory, and are held instead
+by stack.check_dev_argv() on every argv they build: ROOT_ENV_FILE, STORE_ENV_FILE and
 INGEST_ENV_FILE must be absolute, symlink-free paths of regular files directly inside the agent stack's
 directory and under no worktree; plus the F1 rule, DATA_DIR, the empty broker credentials, and no
 COMPOSE_* or DOCKER_* key in any of the three files (refused, also at generation). (Guard 1 is the
@@ -96,4 +125,10 @@ docker-socket-proxy's variables, everything else off:
 NOT needed, keep off: EXEC, AUTH, SECRETS, CONFIGS, PLUGINS, SYSTEM, SWARM, NODES, SERVICES, TASKS,
 DISTRIBUTION, COMMIT. The list is read from what compose calls for these verbs and is confirmed at
 the host sitting (tj-c4mosr.6); a verb failing with 403 from the proxy names the missing section.
+THE DEV VERBS WIDEN NOTHING (tj-kzy7w2 asked this be checked rather than assumed): `compose ps` of a
+project is GET /containers/json filtered on the project label and `compose logs` adds GET
+/containers/{id}/logs, both CONTAINERS, already on for the agent stack's own ps and logs. The proxy
+is not what bounds these verbs in any case -- it has no notion of a compose project, and never did;
+the fixed verbs are, which is ADR tj-4rr0la addendum 1 (b) and is now load-bearing for a second
+project as well.
 """

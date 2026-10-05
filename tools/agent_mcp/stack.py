@@ -109,6 +109,62 @@ MAX_TEST_PATHS = 50
 # The whole stack's --wait budget, as prod-launch's: room above data_store's 60s start_period.
 WAIT_TIMEOUT_SECONDS = 300
 
+# ---------------------------------------------------------------------------------------------
+# THE USER'S OWN DEV COMPOSE PROJECT -- READ ONLY, TWO VERBS (tj-kzy7w2; user ruling on tj-wpnr7o (b),
+# recorded on tj-izzqub addendum 1; ADR tj-4rr0la addendum 18). This is the ONE place in the server
+# that names a project other than PROJECT, and everything below exists to keep it that way.
+#
+# WHY IT IS HERE. An agent already reaches the user's dev services by name over devnet (ADR tj-q9ae5u
+# item 3) but cannot see WHY one is unhealthy; logs and container state were the one diagnostic still
+# fetched by hand. The user ruled "read-only only" and ruled OUT a Docker socket, which is host root.
+#
+# WHAT MAKES THESE SAFE, and it is structural rather than conventional: the dev verbs run
+# `docker compose -p <project>` and NOTHING ELSE -- no -f, no --project-directory, no --env-file.
+# compose v2 does not load a project at all when a project NAME is given and no file is
+# (cmd/compose/compose.go, projectOrName: it builds a project only when ConfigPaths is non-empty or
+# the name is empty), and `ps` and `logs` then work off the com.docker.compose.project LABEL on the
+# running containers. With no compose file there is no build context, no bind mount, no service
+# definition and no interpolation, so `up`, `run`, `build` and `exec` are not merely unused here --
+# they have nothing to act on. The user's root .env, whose read guard this epic must not defeat, is
+# never opened: compose reads a project directory's env file only while loading a project.
+# check_dev_argv() below re-checks the words actually handed to the daemon, so the containment is a
+# property of the argv rather than of the builders that produce it.
+#
+# THE PROJECT NAME IS A CONSTANT, never an argument and never derived from anything an agent writes.
+# The dev targets pass no -p (Makefile, DEV_COMPOSE), so their project is compose's default: the
+# checkout directory's name, which is trader_joe in this repository (.devcontainer/compose.yml's
+# header states the same spelling for the repo directory). A checkout under another directory name
+# simply has no containers under this project and the verb says so -- it cannot reach a different one.
+#
+# WHAT THIS DOES NOT PROVE, stated because a comment that overclaims is worse than none: prod-launch
+# passes no -p either, so a prod stack brought up from a checkout ALSO named trader_joe is the same
+# compose project as dev and these two verbs would read it. Read-only, and only on that one host, but
+# real -- ADR tj-4rr0la addendum 18 records it, and giving prod its own explicit project name is the
+# fix, which is an ops change outside this task.
+DEV_PROJECT = 'trader_joe'
+# The long-running services of the dev pair (docker-compose.yaml plus docker-compose.override.yaml).
+# pgAdmin lives in docker-compose.tools.yaml, a file no verb here loads, and is deliberately absent.
+DEV_SERVICES = ('postgres', 'data_store', 'data_ingest')
+# The only compose subcommands a dev verb may spell. Both are read-only: `ps` lists the project's
+# containers, `logs` prints what they already wrote. Nothing is added here without the ADR addendum
+# that allowing it would need.
+DEV_READ_COMMANDS = frozenset({'ps', 'logs'})
+# Options that would point a dev verb at content, a different project or an env file. Refused
+# wherever they appear after the prefix -- `-p` included, so the one in the prefix stays the only one.
+DEV_FORBIDDEN_OPTIONS = frozenset(
+    {'-f', '--file', '-p', '--project-name', '--project-directory', '--env-file', '--profile'}
+)
+# The ATTACHED form of a forbidden SHORT option (tj-v4e9ke). docker's CLI reads `-fFILE` and `-pNAME`
+# exactly as the separated pair, and the scan's `=` split does not see them: only the attached LONG
+# form spells its value after an `=`. Derived from the set above rather than spelled a second time,
+# so a short option added there is refused in both forms. Short only: a long option's second
+# character is '-', so '--profile' does not start with '-p' and '--file' does not start with '-f'.
+# These are matched against the TAIL alone -- the prefix's own legitimate `-p DEV_PROJECT` sits in
+# the head that check_dev_argv compares against dev_compose_prefix(), ahead of the scan.
+DEV_FORBIDDEN_SHORT_PREFIXES = tuple(
+    sorted(option for option in DEV_FORBIDDEN_OPTIONS if len(option) == 2 and not option.startswith('--'))
+)
+
 # THE SNAPSHOT (ADR tj-4rr0la addendum 5, ruling 1): what refresh_snapshot() copies from a worktree
 # into <stack dir>/SOURCE_DIR_NAME, the compose project directory of every verb. EXACTLY the trusted
 # Dockerfile's COPY sources from the build context (pyproject.toml, uv.lock, entrypoint.sh, common,
@@ -383,6 +439,18 @@ def clamp_tail(tail: object) -> int:
     if isinstance(tail, bool) or not isinstance(tail, int):
         raise Refused('tail must be an integer')
     return max(1, min(tail, TAIL_MAX))
+
+
+def validate_dev_service(service: object) -> str:
+    """Service must be one of the closed set DEV_SERVICES. Separate from validate_service by design.
+
+    The two enums happen to hold the same names today, because both projects are built from
+    docker-compose.yaml. They are kept apart so that adding a service to one stack cannot silently
+    widen what the other's verb accepts (tj-kzy7w2: keep the two projects apart in the code).
+    """
+    if not isinstance(service, str) or service not in DEV_SERVICES:
+        raise Refused(f'service must be one of: {", ".join(DEV_SERVICES)}')
+    return service
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1053,13 +1121,51 @@ def postgres_running_steps(stack_dir: Path, root_env_file: Path) -> list[Step]:
     return _steps(stack_dir, root_env_file, ['ps', '-q', 'postgres'])
 
 
+# THE ONE SPELLING of an alembic invocation in the agent stack. Both builders below go through it,
+# so the only difference between them is the flag this function is asked for -- two spellings of the
+# same run would drift, and the drift would be invisible until one of them answered a question the
+# caller did not ask (decision tj-yb1bxj clause 5, applied to the tail rather than to a digest).
+def _alembic_tail(command: Sequence[str], *, build: bool) -> list[str]:
+    build_flag = ['--build'] if build else []
+    return ['run', '--rm', '--no-deps', *build_flag, 'data_store', '/code/.venv/bin/alembic', *command]
+
+
 def alembic_steps(stack_dir: Path, root_env_file: Path, *commands: Sequence[str]) -> list[Step]:
-    """One `run --rm --no-deps data_store alembic <command>` per command, as run_migrations.sh does."""
-    return _steps(
-        stack_dir,
-        root_env_file,
-        *(['run', '--rm', '--no-deps', 'data_store', '/code/.venv/bin/alembic', *command] for command in commands),
-    )
+    """One `run --rm --no-deps data_store alembic <command>` per command, NO --build (migrate, migrate_status).
+
+    These two apply or read revisions; neither COMPARES a model against the schema, so the image the
+    run uses makes no difference to the answer and a build would only cost time. alembic_check_steps
+    is the one that must build, and it is a separate function so that neither can gain or lose the
+    flag by an edit to the other.
+    """
+    return _steps(stack_dir, root_env_file, *(_alembic_tail(command, build=False) for command in commands))
+
+
+# migrate_check's single command. Named rather than inlined so the runner's message and the step it
+# describes cannot disagree about which alembic subcommand ran.
+ALEMBIC_CHECK_COMMAND = ('check',)
+
+
+def alembic_check_steps(stack_dir: Path, root_env_file: Path) -> list[Step]:
+    """One `run --rm --no-deps --build data_store alembic check` -- the ONLY alembic run that builds.
+
+    WHY IT BUILDS, and why this is the opposite of what data/store/run_migrations.sh does for
+    `make migrate-check` (decision tj-yb1bxj, closing section; tj-yuz1e8). `alembic check`
+    autogenerates against the models it IMPORTS, and migrations/env.py imports them from /code --
+    which is in the IMAGE, not in the bind mounts. So the question the command answers is settled by
+    which image it runs: the deployed one (Q1) or one built from the checkout (Q2).
+
+    compose builds a MISSING image on `run` but never a STALE one, so without --build this would
+    compare the models of whatever the LAST stack_up built. An agent who edits a model and calls
+    migrate_check would then be shown drift that exists only between two of its own builds. --build
+    makes Q2 true by construction: the image is this call's snapshot.
+
+    The deploy path cannot take this fix -- there the point is to check the image actually deployed,
+    so run_migrations.sh verifies a digest stamp and REFUSES a mismatch instead. The agent stack has
+    no deployed image to be faithful to, so it has no stamp to check and nothing to refuse. Do not
+    carry either half across: a build here, a refusal there.
+    """
+    return _steps(stack_dir, root_env_file, _alembic_tail(ALEMBIC_CHECK_COMMAND, build=True))
 
 
 def system_tests_steps(stack_dir: Path, root_env_file: Path, paths: Sequence[str]) -> list[Step]:
@@ -1101,3 +1207,71 @@ def logs_steps(stack_dir: Path, root_env_file: Path, service: str, tail: int) ->
 def ps_steps(stack_dir: Path, root_env_file: Path) -> list[Step]:
     """The agent stack's containers, stopped ones included, with their health."""
     return _steps(stack_dir, root_env_file, ['ps', '--all'])
+
+
+# ---------------------------------------------------------------------------------------------
+# THE DEV PROJECT'S TWO READ-ONLY COMMANDS (see DEV_PROJECT above). A separate prefix, a separate
+# step builder and a separate argv check, sharing nothing with the agent stack's: a change to one
+# cannot retarget the other, which is the failure this whole section is shaped to make impossible.
+def dev_compose_prefix() -> list[str]:
+    """`docker compose -p DEV_PROJECT`, and nothing else: no -f, no --project-directory, no --env-file.
+
+    Four words. Everything the agent stack's compose_prefix() adds is content or configuration, and
+    none of it may reach the user's own project.
+    """
+    return [DOCKER, 'compose', '-p', DEV_PROJECT]
+
+
+def check_dev_argv(argv: Sequence[str]) -> None:
+    """Refuse any dev argv but `docker compose -p DEV_PROJECT <ps|logs> ...` with no steering option.
+
+    Checked on the words that go to the daemon, not on the builders' intent, and raised as Refused so
+    a would-be violation is audited and no subprocess runs. The agent stack's own PROJECT is refused
+    here exactly as any other name is: these verbs reach one project and it is not that one.
+
+    All three spellings of a steering option are refused after the prefix: separated (`-f x`),
+    attached long (`--env-file=x`) and attached short (`-fx`, `-px`).
+    """
+    words = list(argv)
+    head = dev_compose_prefix()
+    if words[: len(head)] != head:
+        raise Refused(f'a dev verb runs only `docker compose -p {DEV_PROJECT}`')
+    tail = words[len(head) :]
+    if not tail or tail[0] not in DEV_READ_COMMANDS:
+        allowed = ', '.join(sorted(DEV_READ_COMMANDS))
+        raise Refused(
+            f'a dev verb runs only the read-only {allowed}; nothing that creates, changes or removes anything'
+        )
+    steering = [
+        word
+        for word in tail
+        if word.split('=', 1)[0] in DEV_FORBIDDEN_OPTIONS or word.startswith(DEV_FORBIDDEN_SHORT_PREFIXES)
+    ]
+    if steering:
+        raise Refused(f'a dev verb names no compose file, project or env file: {", ".join(steering)}')
+
+
+def _dev_steps(stack_dir: Path, *tails: Sequence[str]) -> list[Step]:
+    """One Step per tail, each checked by check_dev_argv and none of them able to build.
+
+    cwd is the stack directory: outside the repository, holding no compose file and no `.env`, so
+    even a compose that tried to discover one would find nothing. The snapshot is not used -- these
+    verbs read no worktree at all.
+    """
+    prefix = dev_compose_prefix()
+    steps = []
+    for tail in tails:
+        argv = tuple(prefix + list(tail))
+        check_dev_argv(argv)
+        steps.append(Step(argv, stack_dir))
+    return steps
+
+
+def dev_ps_steps(stack_dir: Path) -> list[Step]:
+    """The dev project's containers, stopped ones included, with their health."""
+    return _dev_steps(stack_dir, ['ps', '--all'])
+
+
+def dev_logs_steps(stack_dir: Path, service: str, tail: int) -> list[Step]:
+    """The last `tail` lines of one dev service's log. Never --follow: a verb returns."""
+    return _dev_steps(stack_dir, ['logs', '--no-color', '--tail', str(tail), service])

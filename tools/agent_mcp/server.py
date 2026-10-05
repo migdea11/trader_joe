@@ -1,4 +1,4 @@
-"""The MCP endpoint: the nine verbs as MCP tools over streamable HTTP, behind the bearer-token gate.
+"""The MCP endpoint: the verbs as MCP tools over streamable HTTP, behind the bearer-token gate.
 
 The only module that imports the MCP SDK (the agent-mcp uv group, installed in the MCP image alone).
 It uses the SDK's low-level server rather than FastMCP on purpose: FastMCP silently DROPS an unknown

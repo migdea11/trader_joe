@@ -108,6 +108,39 @@ COPY --from=service_build_image /home/appuser/.local/share/uv/python /home/appus
 ENV APP_MODULE="${SERVICE_PATH}.${SERVICE_NAME}.app.main:app"
 CMD ["/code/entrypoint.sh"]
 
+# THE SOURCE STAMP (decision tj-yb1bxj clauses 1 and 6), applied to both deploy stages below.
+#
+# WHAT IT IS FOR. data/store/migrations/env.py imports the models from /code -- IN THE IMAGE --
+# while only alembic.ini and migrations/ are bind-mounted, so `alembic check` always compares the
+# IMAGE'S models against the live schema and never the checkout's. On 2026-10-04 that reported
+# three drift items against a stale prod image that were all phantoms. This label is what lets
+# migrate-check (tj-ymsobh) tell a stale image from a fresh one instead of warning about it.
+#
+# THE VALUE is tools/source_digest.sh's output for this service: a sha256 over exactly the build
+# context the COPYs above deliver. That script PARSES ITS PATH LIST OUT OF THIS FILE, so adding a
+# COPY here grows what the digest covers in the same commit -- a hand-maintained list would let
+# coverage shrink silently and the guard go hollow a second time.
+#
+# PLACED LAST IN EACH STAGE, ON PURPOSE. An ARG invalidates every layer below it whenever its
+# value changes, and this value changes on every source edit. Declared any earlier, each build
+# would be a cold build. It feeds nothing but the LABEL, so it is declared and consumed at the
+# very bottom and only that one layer is rebuilt.
+#
+# WHEN IT IS EMPTY, AND WHAT EMPTY MEANS. docker-compose.yaml interpolates the value from the
+# environment of whoever runs the build, which the Makefile's prod-build and dev-build set. A
+# build started any other way -- the agent stack, CI, a bare `docker compose build` -- leaves it
+# unset, and compose then passes an empty string. Compose cannot omit a mapping-form build arg, so
+# the label is always present and the EMPTY VALUE is what says "unstamped"; an image built before
+# this change has no such label key at all. THE CONTRACT WITH tj-ymsobh IS THEREFORE: the stamp is
+# trustworthy only when the label exists AND matches ^[0-9a-f]{64}$. A missing key and an empty
+# value both mean "cannot verify", which is NOT "matches" -- conflating them is how this goes
+# hollow again. Nothing but a real digest can ever satisfy that pattern, so neither case can be
+# mistaken for a match.
+#
+# WHAT IT DOES NOT COVER: this file's own instructions. A new ENV or a different `uv sync` group
+# changes the image without moving the digest. Dependency changes ARE covered, because
+# pyproject.toml and uv.lock are COPY sources themselves. Stated limit, not an oversight.
+
 # Dev-specific stage
 FROM base_deploy_image AS dev_image
 # Copy dev service source and deps from build
@@ -116,9 +149,15 @@ COPY --from=service_build_image_dev /code /code
 ENV RUN_MODE="dev"
 ENV ADDITIONAL_ARGS="--reload"
 
+ARG SOURCE_DIGEST
+LABEL trader_joe.source.digest="${SOURCE_DIGEST}"
+
 # Prod-specific stage
 FROM base_deploy_image AS prod_image
 # Copy service source and deps from build
 COPY --from=service_build_image /code /code
 
 ENV RUN_MODE="prod"
+
+ARG SOURCE_DIGEST
+LABEL trader_joe.source.digest="${SOURCE_DIGEST}"

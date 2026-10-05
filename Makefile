@@ -28,6 +28,35 @@ BUF_VERSION := 1.73.0
 BUF_SHA256_X86_64 := 8f2986298ad08f0cc1bf999b9797b7c383adf32d7edf0f73d6f1e1a701baeac1
 BUF_SHA256_AARCH64 := 902b75267db7f4391e99b7fa0756050e5354234cc0437ef50eee9c788950c7a3
 
+# THE SHELLCHECK PIN (tj-xc6nfv). Same shape as the buf pin above, and this file is its one
+# authority. shellcheck lints this repository's *.sh inside `make lint` (the SHELLCHECK section,
+# above `lint`); it generates and formats nothing.
+# WHY IT EXISTS: before this pin, essentially nothing in `make lint` or `make security` read the
+# shell in this tree. ruff is Python, buf is proto, bandit is Python, pip-audit is the lockfile. The
+# one exception is worth stating precisely rather than rounding away: `semgrep --config=auto` does
+# run a BASH rule set, and on this tree that is FOUR rules over six files, against the 337 Python
+# rules it runs beside them. Four generic rules are not a shell linter. So the real static check the
+# ~770 lines of bash here had ever had was `bash -n`, which establishes that a file parses and
+# nothing else. That gap sat under tools/source_digest.sh and data/store/run_migrations.sh, which
+# are a digest tool and a verification guard: the least-checked code in the tree was the code a
+# human is asked to trust. (And `make security` is still the wrong home for this -- shellcheck is a
+# linter, and that target must keep running the identical invocation CI runs.)
+# THE CHECKSUMS ARE OURS, NOT UPSTREAM'S, and that is the one difference from buf. buf publishes a
+# sha256.txt with its release and these values are copied from it; shellcheck publishes no checksum
+# asset at all, so the two below are the sha256 of the artifacts verified at adoption (v0.11.0,
+# released 2025-08-04, fetched and run on 2026-10-04). The security property is the same from here
+# on -- a later re-upload under the same tag fails the check -- but the first fetch was trust-on-
+# first-use, which buf's was not. Say so rather than letting a reader assume an upstream manifest.
+# .tar.gz, NOT the smaller .tar.xz, because the agent image has no xz binary (measured: `tar -tJf`
+# fails with "xz: Cannot exec"), while tar and gzip are Essential in Debian and present everywhere
+# this runs, CI's debian:bookworm-slim included.
+# THE ONE MIRROR is .devcontainer/Dockerfile's shellcheck RUN, for the same reason buf has one:
+# that build's context is .devcontainer/, so it cannot read this file. A bump is these three values
+# and the Dockerfile's three, in one commit, then the agent-image rebuild.
+SHELLCHECK_VERSION := 0.11.0
+SHELLCHECK_SHA256_X86_64 := b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6
+SHELLCHECK_SHA256_AARCH64 := 68a8133197a50beb8803f8d42f9908d1af1c5540d4bb05fdfca8c1fa47decefc
+
 # THE LOCK IS FROZEN BY DEFAULT (tj-3zh7ss). Exported, so every uv below -- and every uv those
 # recipes start -- installs from uv.lock exactly as committed and never re-resolves it. Without
 # this, any `uv run` or `uv sync` re-locked whenever pyproject.toml had moved: a plain
@@ -244,13 +273,39 @@ DEV_NETWORK := trader_joe_devnet
 # and data_ingest's own. Detached is the consequence -- `prod-logs` is how you watch it.
 PROD_UP := $(PROD_COMPOSE) up -d --wait --wait-timeout 300
 
+# THE SOURCE STAMP (decision tj-yb1bxj clauses 1 and 5). tools/source_digest.sh is the ONE
+# definition of "a digest of exactly the source the Dockerfile COPYs"; both sides -- the build
+# here and the check in migrate-check (tj-ymsobh) -- call that same script, because two spellings
+# of "hash the source" would drift and a drifting comparison fails closed forever, which just
+# trains people to set the escape hatch.
+#
+# docker-compose.yaml interpolates SOURCE_DIGEST_DATA_STORE and SOURCE_DIGEST_DATA_INGEST from the
+# environment of whoever runs the build, so the build recipes export them. Two variables, not one:
+# the services COPY different app directories and so have different digests.
+#
+# NOT a `make` variable with $(shell ...): make expands an exported variable for EVERY recipe's
+# environment, so the tree would be hashed twice on `make test`, `make lint` and everything else.
+# Computed in the build recipes only.
+#
+# THE ASSIGNMENT IS SPLIT FROM THE export ON PURPOSE. `export VAR="$(cmd)"` takes its exit status
+# from the export builtin, which is 0 whatever cmd did, so `set -e` would not see the script fail
+# and compose would be handed an empty stamp -- an image silently marked unverifiable because of a
+# bug, which is the quiet failure this whole epic is about. A plain assignment propagates the
+# command substitution's status, so `set -e` fires and the build stops with the script's message.
+define WITH_SOURCE_STAMP
+set -euo pipefail; \
+SOURCE_DIGEST_DATA_STORE="$$(./tools/source_digest.sh data store)"; \
+SOURCE_DIGEST_DATA_INGEST="$$(./tools/source_digest.sh data ingest)"; \
+export SOURCE_DIGEST_DATA_STORE SOURCE_DIGEST_DATA_INGEST;
+endef
+
 .PHONY: prod-build
-prod-build: $(VENV_MARKER)  ## Build the production images (:latest)
-	$(PROD_COMPOSE) build
+prod-build: $(VENV_MARKER)  ## Build the production images (:latest), stamped with the source digest
+	$(WITH_SOURCE_STAMP) $(PROD_COMPOSE) build
 
 .PHONY: prod-build-clean
 prod-build-clean: $(VENV_MARKER)  ## Build the production images from scratch, no cache
-	$(PROD_COMPOSE) build --no-cache
+	$(WITH_SOURCE_STAMP) $(PROD_COMPOSE) build --no-cache
 
 .PHONY: prod-deps
 prod-deps: $(VENV_MARKER)  ## Start the production dependencies (postgres)
@@ -344,13 +399,34 @@ migrate-status:  ## Report the applied revision and the revision history (read-o
 # A non-zero exit means drift, or "Target database is not up to date." when the database is behind
 # head. BLIND SPOTS: autogenerate compares neither enum labels nor server defaults, so a clean run
 # is no evidence about either (ADR tj-x3ig38 addendum items 2 and 4; migrations/env.py says why).
+#
+# AND WHICH MODELS IT COMPARES IS NOW ESTABLISHED RATHER THAN ASSUMED (decision tj-yb1bxj). env.py
+# imports the models from /code -- in the IMAGE -- while only alembic.ini and migrations/ are bind
+# mounted, so `check` has always compared the IMAGE'S models against the live schema, and a stale
+# image reports phantom drift. run_migrations.sh refuses, before alembic runs, unless the image
+# carries a source stamp equal to this checkout's digest, and prints both on EVERY outcome. The
+# guard lives in the script and not in this recipe because the script owns the `-f
+# docker-compose.yaml` pin that decides which image the one-off container uses; the reasoning is
+# written out there. It is gated on the alembic command being `check`, so `migrate` is untouched.
+#
+# THE HELP LINE NAMES THE REFUSAL, THE ORDINARY UNSTAMPED CASE AND THE ESCAPE HATCH, AND POINTS AT
+# run_migrations.sh FOR THE REST (decision tj-yb1bxj addendum 2, item 2 — amending tj-ymsobh R4's
+# PLACEMENT, not its substance). R4 originally asked for all of this in the help line too, and a
+# literal reading produced a ~580-character single unwrapped `make help` row, roughly five times
+# the next-longest target's — worse for every target's help in order to document one. The limit
+# that extra text existed to carry — the stamp covers COPYd source, not the Dockerfile's own
+# instructions, so a changed `uv sync` group set still reads as fresh — lives in
+# verify_comparison_image's comparison comment and in the guard's own printed output on the MATCH
+# outcome (both in run_migrations.sh), which is where a reader meets it at the moment they are
+# already puzzled about why a check passed. That was R4's actual purpose, and a help row nobody
+# reads documents nothing.
 .PHONY: migrate-check
-migrate-check:  ## Compare the models with the live schema (writes alembic_version if absent)
+migrate-check:  ## Compare the models with the live schema (writes alembic_version if absent). REFUSES unless the data_store image's source stamp matches this checkout's digest; an unstamped CI or system-launch image is the ordinary case, not a fault -- make prod-build fixes it. What the stamp does and does not cover: see the comment above. Escape hatch: MIGRATE_CHECK_ALLOW_STALE_IMAGE=1
 	./data/store/run_migrations.sh check
 
 .PHONY: dev-build
-dev-build: $(VENV_MARKER)  ## Build the development images (:dev)
-	$(DEV_COMPOSE) build
+dev-build: $(VENV_MARKER)  ## Build the development images (:dev), stamped with the source digest
+	$(WITH_SOURCE_STAMP) $(DEV_COMPOSE) build
 
 # Idempotent, and safe against a concurrent create by the devcontainer's initializeCommand: look,
 # else create, else look again -- a create that lost the race fails, and the second look is what
@@ -414,7 +490,29 @@ build build-clean launch launch-deps launch-down:
 	@echo "Use the prod-* or dev-* target for the stack you want -- see 'make help'." >&2
 	@exit 1
 
-AGENT_COMPOSE := docker compose -f .devcontainer/compose.yml
+# THE ROOT ENV FILE, NAMED EXPLICITLY, and the reason it has to be. Compose takes its project
+# directory from the FIRST compose file's directory, so `-f .devcontainer/compose.yml` makes
+# .devcontainer the project directory even though make runs from the repo root -- and the env file
+# compose reads by default is therefore .devcontainer/.env, NOT the root .env where the two dev
+# credentials that file interpolates actually live (the same reason agent-mcp-up below passes
+# --env-file /dev/null: without it compose reads the PROJECT DIRECTORY's env file, whatever that
+# happens to be). Without this flag both values would fall back to the sentinel defaults
+# .devcontainer/compose.yml documents, which is a working-looking container with a dead password.
+#
+# ABSOLUTE ($(CURDIR)), because compose has resolved a relative --env-file against the invoking
+# directory in some versions and against the project directory in others; an absolute path means
+# the same file under either rule. /dev/null when this checkout has no root .env, so agent-down
+# and agent-build still work on a checkout nobody has configured -- compose refuses outright when
+# a named --env-file is missing, and a devcontainer you cannot stop is a worse failure than a
+# credential you do not have.
+#
+# NOTHING IS READ INTO MAKE'S SHELL. Compose interpolates on the HOST, out of this file, and only
+# the keys named one by one in that compose file's environment: block reach the container. Never
+# an env_file: entry pointing here -- that injects EVERY key in the root file, ALPACA_API_KEY and
+# ALPACA_API_SECRET with it, which the user's ruling keeps out of the agent container entirely
+# (decision record tj-izzqub addendum 1, rulings (a) and (d)).
+AGENT_ENV_FILE := $(if $(wildcard $(CURDIR)/.env),$(CURDIR)/.env,/dev/null)
+AGENT_COMPOSE := docker compose --env-file $(AGENT_ENV_FILE) -f .devcontainer/compose.yml
 
 # The agent config directory holds the session transcripts, bind-mounted from the host.
 # devcontainer.json's initializeCommand creates it when an IDE starts the container, but that
@@ -674,10 +772,16 @@ clean: dev-down  ## Clean up the project
 #                 when PATHS covers proto/ (the selector below). PATHS decides WHETHER buf runs, never
 #                 what it reads: module-level rules (package against directory, import cycles) need
 #                 every file in the module.
-#   lint-ts       NOT YET. PR 4 adds the third leg with the UI and its tooling: lint-ts and lint-fix-ts,
-#                 selected by web/, as a third prerequisite of lint and of lint-fix. Nothing stands in
+#   lint-shell    shellcheck over the *.sh files UNDER PATHS (tj-xc6nfv). Unlike proto, PATHS decides
+#                 WHICH FILES are read, as it does for ruff: a shell script is checked on its own, so
+#                 there is no module whose other files a rule needs. No *.sh under PATHS prints one
+#                 'not run' line and passes.
+#   lint-ts       NOT YET. PR 4 adds the fourth leg with the UI and its tooling: lint-ts and lint-fix-ts,
+#                 selected by web/, as a fourth prerequisite of lint and of lint-fix. Nothing stands in
 #                 for it before then: a leg that lints nothing is a green result with nothing behind it.
-# buf lint and buf breaking have no autofix, so lint-fix-proto is buf format -w alone.
+# buf lint and buf breaking have no autofix, so lint-fix-proto is buf format -w alone. lint-fix-shell
+# fixes NOTHING and says so out loud -- see the comment on that target for why shellcheck's
+# --format=diff is not a formatter and must not be applied in bulk.
 #
 # THE PROTO SELECTOR. PATHS is space-separated and relative to the repository root. Each word is
 # normalised -- one leading ./ stripped, then every trailing / -- and the proto leg is SELECTED when
@@ -780,13 +884,106 @@ case "$$status" in \
 esac
 endef
 
+# SHELLCHECK, the shell leg (tj-xc6nfv). SHELLCHECK is looked up on PATH and overridable, e.g. with
+# a stub, exactly as BUF is.
+#
+# SEVERITY IS NAMED RATHER THAN DEFAULTED. `style` is shellcheck 0.11.0's own default and reports
+# everything it has; spelling it out means a future shellcheck that narrows its default cannot
+# quietly narrow this gate. It FAILS from the first run rather than warning for a branch -- the
+# whole existing surface was brought to zero findings in the same change that added the leg, so
+# there is no backlog a warning would be covering for, and this project has already established
+# that a warning nobody must act on does not work (tj-yb1bxj, "why refuse rather than warn").
+#
+# OPTIONAL CHECKS ARE OFF, measured rather than assumed. `--enable=all` reports 187 findings on this
+# tree, 166 of them pure house style (SC2250 require-variable-braces x137, SC2292
+# require-double-brackets x29) -- a wall no one gets to green, and a lint gate nobody can get to
+# green is worse than none. The two narrower ones worth wanting, check-extra-masked-returns (SC2312)
+# and check-set-e-suppressed (SC2310), report four findings between them and every one sits on a
+# construct that is deliberate and commented at its site in run_migrations.sh and source_digest.sh.
+# Switching them on would demand either a behavioural edit to a verification guard or four
+# suppressions, so they stay off and the four sites are filed for a human to read (tj-7s225q), which
+# is where the decision to turn either check on belongs.
+#
+# THERE IS NO .shellcheckrc, ON PURPOSE. A repo-level rc is the blanket exclusion this work exists
+# to avoid: every exception in this tree is a `# shellcheck disable=CODE  # reason` on the line that
+# needs it, so the reason travels with the code and dies with it. Two of those already existed in
+# tools/source_digest.sh naming SC2254 -- `case`'s code -- for two `[[ ]]` tests whose code is
+# SC2053, which is to say they suppressed nothing at all and nobody could have known.
+SHELLCHECK ?= shellcheck
+SHELLCHECK_FORMAT ?= tty
+SHELLCHECK_SEVERITY ?= style
+
+# THE FILE SET. `git ls-files -z --cached --others --exclude-standard` is tracked files PLUS
+# untracked-and-not-ignored ones, so a script added to the tree is linted before it is ever
+# `git add`ed -- an unlinted new script would be precisely the silent hole this leg is for. It also
+# gets the exclusions free and correct: .venv and the rest are ignored, and git does not descend
+# into a nested worktree under .claude/worktrees because that directory has its own .git. The
+# explicit :(exclude) is belt-and-braces for that last one (tj-aov3ip: a repo-wide scan must never
+# read another agent's half-edited copy). PATHS words are git pathspecs relative to the repository
+# root, which is why this leg needs none of the ./ and trailing-/ normalisation the proto selector
+# does -- git handles `./tools/` itself.
+#
+# ONLY *.sh. Every shell script in this tree ends in .sh; one that did not would go unlinted, which
+# is the known edge of this selector and the reason to keep the convention.
+SHELLCHECK_PATHSPEC = $(or $(strip $(PATHS)),.) ':(exclude).claude/worktrees'
+
+# THE PROTO LEG GOES LAST, in `lint` and in `lint-fix` alike. buf breaking is REPORT-ONLY
+# (BUF_BREAKING_BLOCKING above), so it is the one leg that can print something a reader must act on
+# while the target still exits 0; last means its banner is the last thing on the screen rather than
+# scrolled off by another language's output.
 .PHONY: lint
-lint: lint-python lint-proto  ## Lint every language PATHS covers (Python: ruff; proto: buf, when PATHS is . or under proto/)
+lint: lint-python lint-shell lint-proto  ## Lint every language PATHS covers (Python: ruff; shell: shellcheck, for *.sh under PATHS; proto: buf, when PATHS is . or under proto/)
 
 .PHONY: lint-python
 lint-python: $(VENV_MARKER)  ## Lint and format-check Python with ruff (scope with PATHS=)
 	uv run ruff check $(PATHS)
 	uv run ruff format --check $(PATHS)
+
+# THE SELECTION IS MADE IN THE RECIPE, not at parse time with $(shell ...), because make expands a
+# parse-time $(shell) on EVERY invocation of EVERY target -- `make test` would run git ls-files too.
+#
+# IT GOES THROUGH A FILE AND NOT `< <(git ls-files ...)`, deliberately, and this is the one piece of
+# shell in this repository that was written from a measured failure rather than from taste: inside
+# tools/source_digest.sh the process-substitution form made `exit` kill only the subshell, so the
+# script printed a plausible digest and exited 0 on error. Here the same form would hide a FAILING
+# git -- no output, an empty array, "no *.sh file", a green lint -- which is the hollow guard this
+# whole leg exists to stop being possible. With a file, `set -e` sees git's status and the recipe
+# dies on it.
+#
+# A PATH WITH A SPACE in it would be split by the shell and reach shellcheck as two names that do
+# not exist, which shellcheck reports and fails on. Loud and wrong, never silent and green; -z/-0
+# would be exact, but `read -d ''` into an array is what makes the message above possible to write.
+.PHONY: lint-shell
+lint-shell:  ## shellcheck every *.sh under PATHS (nothing under PATHS: one 'not run' line, and passes)
+	@set -euo pipefail; \
+	list="$$(mktemp)"; \
+	trap 'rm -f "$$list"' EXIT; \
+	git ls-files -z --cached --others --exclude-standard -- $(SHELLCHECK_PATHSPEC) > "$$list"; \
+	files=(); \
+	while IFS= read -r -d '' path; do \
+		case "$$path" in *.sh) files+=("$$path") ;; esac; \
+	done < "$$list"; \
+	if [ "$${#files[@]}" -eq 0 ]; then \
+		echo "$@: not run: PATHS=$(PATHS) covers no *.sh file (shellcheck reads the *.sh under PATHS)"; \
+		exit 0; \
+	fi; \
+	if ! where="$$(command -v $(SHELLCHECK))"; then \
+		found='none: $(SHELLCHECK) is not on PATH'; \
+	elif ! version="$$($(SHELLCHECK) --version 2>&1 | awk '/^version:/ {print $$2}')"; then \
+		found="$$where, whose --version fails"; \
+	elif [ "$$version" != '$(SHELLCHECK_VERSION)' ]; then \
+		found="shellcheck $$version at $$where"; \
+	else \
+		found=''; \
+	fi; \
+	if [ -n "$$found" ]; then \
+		echo "make $@: PATHS=$(PATHS) covers $${#files[@]} *.sh file(s), which need shellcheck $(SHELLCHECK_VERSION) (SHELLCHECK=$(SHELLCHECK)); found $$found." >&2; \
+		echo "  Install the pin: make shellcheck-install (checksum-verified, into $(SHELLCHECK_INSTALL_DIR); SHELLCHECK_INSTALL_DIR= to change it)," >&2; \
+		echo "  or rebuild the agent image, which installs it at /usr/local/bin/shellcheck." >&2; \
+		exit 1; \
+	fi; \
+	echo "$(SHELLCHECK) --severity=$(SHELLCHECK_SEVERITY) --format=$(SHELLCHECK_FORMAT) ($${#files[@]} file(s): $${files[*]})"; \
+	$(SHELLCHECK) --severity=$(SHELLCHECK_SEVERITY) --format=$(SHELLCHECK_FORMAT) -- "$${files[@]}"
 
 .PHONY: lint-proto
 lint-proto:  ## buf lint, format check and breaking vs BUF_AGAINST_REF (report-only), when PATHS covers proto/
@@ -801,12 +998,38 @@ else
 endif
 
 .PHONY: lint-fix
-lint-fix: lint-fix-python lint-fix-proto  ## Apply lint fixes and formatting for every language PATHS covers (scope with PATHS=)
+lint-fix: lint-fix-python lint-fix-shell lint-fix-proto  ## Apply lint fixes and formatting for every language PATHS covers (scope with PATHS=)
 
 .PHONY: lint-fix-python
 lint-fix-python: $(VENV_MARKER)  ## Apply ruff's fixes and formatting (scope with PATHS=)
 	uv run ruff check --fix $(PATHS)
 	uv run ruff format $(PATHS)
+
+# THE LEG THAT FIXES NOTHING, and says so on every run instead of being absent. ruff and buf each
+# have a formatter, so each has a real lint-fix leg; shell has neither half here, for two separate
+# reasons worth keeping apart:
+#
+# 1. NO FORMATTER IS PINNED. shellcheck is a linter and ships no formatter. shfmt is the tool that
+#    would be the counterpart to `buf format`, and it is DEFERRED, not forgotten: pointing it at
+#    this tree reformats ~770 lines of existing bash, which is a whitespace diff a human has to
+#    review by hand to be sure it is only whitespace -- and it buys zero correctness, which is what
+#    tj-xc6nfv was raised about. It is filed as its own follow-up (tj-twwed3) so it is reviewed as a
+#    formatting change, on its own, rather than riding in under a lint bead.
+# 2. shellcheck's `--format=diff` IS NOT A FORMATTER AND MUST NOT BE APPLIED IN BULK. It emits a
+#    patch for the subset of findings it can rewrite, and those rewrites are BEHAVIOURAL by
+#    construction: its fix for SC2086 is to quote an expansion, and this repository has an expansion
+#    that must stay unquoted (entrypoint.sh's $ADDITIONAL_ARGS, which is an argument list that has
+#    to word-split and has to vanish when unset -- quoting it hands uvicorn one empty argument and
+#    breaks startup in prod). `buf format` moves whitespace; this changes what the program does.
+#    Running it from `make lint-fix`, which a developer reasonably expects to be safe, would make a
+#    quiet behavioural edit to a container entrypoint and a verification guard look like tidying.
+#
+# So the shell half of lint-fix is a human reading `make lint`'s findings. The line below is printed
+# so that is a stated fact rather than an unexplained gap between the legs.
+.PHONY: lint-fix-shell
+lint-fix-shell:  ## Fixes nothing, by design: no shell formatter is pinned (see the comment above)
+	@echo "$@: nothing to apply: no shell FORMATTER is pinned -- shellcheck is a linter and has none, and its --format=diff rewrites behaviour, not whitespace."
+	@echo "$@: run 'make lint PATHS=$(PATHS)' and fix what it reports by hand; an exception is a '# shellcheck disable=CODE  # reason' on the line that needs it."
 
 .PHONY: lint-fix-proto
 lint-fix-proto:  ## Apply buf format to proto/, when PATHS covers proto/
@@ -861,6 +1084,63 @@ buf-install:  ## Install the pinned buf, checksum-verified, into BUF_INSTALL_DIR
 	echo "make buf-install: installed buf $$("$$dir/buf" --version) at $$dir/buf (sha256 $$sum)"; \
 	resolved="$$(command -v buf || true)"; \
 	[ "$$resolved" = "$$dir/buf" ] || echo "make buf-install: note: 'buf' on PATH is $${resolved:-not found}, not $$dir/buf; make lint runs the first buf on PATH (or BUF=<path>)." >&2
+
+# THE ONE TARGET THAT DOWNLOADS SHELLCHECK (tj-xc6nfv), on buf-install's rule above and with its
+# guarantees: `make lint` never touches the network; Linux x86_64 and aarch64 only, and any other
+# platform fails naming ITSELF rather than as a checksum mismatch, which would read like a corrupted
+# download; the download is deleted and the installed shellcheck left untouched on either a checksum
+# or a version mismatch; and the move into place is a rename WITHIN one directory, which is atomic,
+# so agents sharing a container never run a half-written binary.
+#
+# ONE DIFFERENCE FROM buf-install, forced by the release's shape: buf ships a bare binary, shellcheck
+# ships a .tar.gz holding shellcheck-v<version>/shellcheck. So the download and the extraction happen
+# in a scratch directory and only the extracted binary is copied into SHELLCHECK_INSTALL_DIR, where
+# the final rename is still within that one directory. ONE trap covers both, set after both paths are
+# named: a second `trap ... EXIT` would silently replace the first and leak the scratch directory.
+# .tar.gz and not the smaller .tar.xz because no xz binary exists here (see the pin at the top).
+SHELLCHECK_RELEASE_URL ?= https://github.com/koalaman/shellcheck/releases/download
+SHELLCHECK_INSTALL_DIR ?= $(HOME)/.local/bin
+
+.PHONY: shellcheck-install
+shellcheck-install:  ## Install the pinned shellcheck, checksum-verified, into SHELLCHECK_INSTALL_DIR (default ~/.local/bin; the only target that downloads it)
+	@set -euo pipefail; \
+	platform="$$(uname -s) $$(uname -m)"; \
+	case "$$platform" in \
+		'Linux x86_64') asset='shellcheck-v$(SHELLCHECK_VERSION).linux.x86_64.tar.gz'; sum='$(SHELLCHECK_SHA256_X86_64)' ;; \
+		'Linux aarch64') asset='shellcheck-v$(SHELLCHECK_VERSION).linux.aarch64.tar.gz'; sum='$(SHELLCHECK_SHA256_AARCH64)' ;; \
+		*) echo "make shellcheck-install: no shellcheck checksum pinned for $$platform; shellcheck is pinned for Linux x86_64 and Linux aarch64 only (SHELLCHECK_SHA256_* in the Makefile)." >&2; exit 1 ;; \
+	esac; \
+	url='$(SHELLCHECK_RELEASE_URL)/v$(SHELLCHECK_VERSION)/'"$$asset"; \
+	dir='$(SHELLCHECK_INSTALL_DIR)'; \
+	mkdir -p "$$dir"; \
+	work="$$(mktemp -d)"; \
+	tmp="$$(mktemp "$$dir/.shellcheck-install.XXXXXX")"; \
+	trap 'rm -rf "$$work"; rm -f "$$tmp"' EXIT; \
+	echo "make shellcheck-install: fetching $$url"; \
+	curl -fsSL -o "$$work/release.tar.gz" "$$url"; \
+	if ! printf '%s  %s\n' "$$sum" "$$work/release.tar.gz" | sha256sum -c --status -; then \
+		echo "make shellcheck-install: checksum mismatch for $$url: expected $$sum, got $$(sha256sum "$$work/release.tar.gz" | cut -d ' ' -f 1). Deleted the download; $$dir/shellcheck is untouched." >&2; \
+		exit 1; \
+	fi; \
+	tar -xzf "$$work/release.tar.gz" -C "$$work"; \
+	binary="$$work/shellcheck-v$(SHELLCHECK_VERSION)/shellcheck"; \
+	if [ ! -f "$$binary" ]; then \
+		echo "make shellcheck-install: $$url matches its pinned checksum but holds no shellcheck-v$(SHELLCHECK_VERSION)/shellcheck; the release layout changed. Deleted the download; $$dir/shellcheck is untouched." >&2; \
+		exit 1; \
+	fi; \
+	cp "$$binary" "$$tmp"; \
+	chmod 0755 "$$tmp"; \
+	found="$$("$$tmp" --version 2>&1 | awk '/^version:/ {print $$2}')" || found=''; \
+	if [ "$$found" != '$(SHELLCHECK_VERSION)' ]; then \
+		echo "make shellcheck-install: $$url matches its pinned checksum but reports version $${found:-none}, not $(SHELLCHECK_VERSION): SHELLCHECK_VERSION and SHELLCHECK_SHA256_* disagree. Deleted the download; $$dir/shellcheck is untouched." >&2; \
+		exit 1; \
+	fi; \
+	mv -f "$$tmp" "$$dir/shellcheck"; \
+	rm -rf "$$work"; \
+	trap - EXIT; \
+	echo "make shellcheck-install: installed shellcheck $$("$$dir/shellcheck" --version | awk '/^version:/ {print $$2}') at $$dir/shellcheck (sha256 $$sum)"; \
+	resolved="$$(command -v shellcheck || true)"; \
+	[ "$$resolved" = "$$dir/shellcheck" ] || echo "make shellcheck-install: note: 'shellcheck' on PATH is $${resolved:-not found}, not $$dir/shellcheck; make lint runs the first shellcheck on PATH (or SHELLCHECK=<path>)." >&2
 
 # ./tools holds the agent-stack MCP server (tools/agent_mcp, ADR tj-4rr0la section 6): build
 # tooling, but it holds Docker access, so bandit reads it like production source.

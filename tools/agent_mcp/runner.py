@@ -39,6 +39,10 @@ VERB_TIMEOUT_SECONDS = {
     'stack_wipe': 600,
     'migrate': 600,
     'migrate_status': 300,
+    # migrate_check BUILDS data_store before it runs (stack.alembic_check_steps), and on a cold cache
+    # that build is the same uv sync as stack_up's. So its budget is the builders' 1800, not
+    # migrate's 600, which is sized for an upgrade that builds nothing; the check itself is seconds.
+    'migrate_check': 1800,
     'run_system_tests': 1800,
     # run_system_tests' budget, for the same work: a snapshot, a test_client build that on a cold
     # cache re-syncs the image's dependencies, then the producer's scenario POSTs, the fake ingest
@@ -46,6 +50,10 @@ VERB_TIMEOUT_SECONDS = {
     'seed_dump': 1800,
     'logs': 60,
     'ps': 60,
+    # The dev pair's budgets are their agent-stack siblings': the same two compose calls, against a
+    # project this server never starts or waits for.
+    'dev_logs': 60,
+    'dev_ps': 60,
 }
 
 # The docker CLI's whole environment. Fixed, never inherited: compose reads variables from its own
@@ -71,6 +79,7 @@ VERB_SCHEMAS: dict[str, dict[str, Any]] = {
     'stack_wipe': {'properties': {}, 'required': []},
     'migrate': {'properties': {}, 'required': []},
     'migrate_status': {'properties': {}, 'required': []},
+    'migrate_check': {'properties': {}, 'required': []},
     'run_system_tests': {
         'properties': {
             'worktree': _worktree_schema,
@@ -104,11 +113,29 @@ VERB_SCHEMAS: dict[str, dict[str, Any]] = {
         'required': ['service'],
     },
     'ps': {'properties': {}, 'required': []},
+    # THE USER'S DEV PROJECT, READ-ONLY (tj-kzy7w2). Neither schema has -- and neither verb could use
+    # -- a project, a compose file or a command argument: the target is stack.DEV_PROJECT, a
+    # constant. `service` is the closed stack.DEV_SERVICES enum and `tail` takes the same clamp as
+    # the agent stack's logs, so the pair is no looser than its siblings.
+    'dev_logs': {
+        'properties': {
+            'service': {'type': 'string', 'enum': list(stack.DEV_SERVICES)},
+            'tail': {
+                'type': 'integer',
+                'description': f'lines from the end, clamped to 1..{stack.TAIL_MAX}; default {stack.TAIL_DEFAULT}',
+            },
+        },
+        'required': ['service'],
+    },
+    'dev_ps': {'properties': {}, 'required': []},
 }
 for _schema in VERB_SCHEMAS.values():
     _schema.update(type='object', additionalProperties=False)
 
-_OPTIONAL_DEFAULTS: dict[str, dict[str, Any]] = {'logs': {'tail': stack.TAIL_DEFAULT}}
+_OPTIONAL_DEFAULTS: dict[str, dict[str, Any]] = {
+    'logs': {'tail': stack.TAIL_DEFAULT},
+    'dev_logs': {'tail': stack.TAIL_DEFAULT},
+}
 
 # The seed producer's exit status for a refusal (python -m data.store.seeds: 0 printed, 3 refused, 1
 # failed); seed_dump answers 'refused' for it.
@@ -240,7 +267,11 @@ class _Call:
 
 
 class AgentStack:
-    """The nine verbs over the one agent stack, serialised: a second caller is told 'busy'."""
+    """The verbs, serialised: a second caller is told 'busy'.
+
+    Ten over the one agent stack, plus the two READ-ONLY dev verbs of ADR tj-4rr0la addendum 18,
+    which reach the user's own compose project and can only read it.
+    """
 
     def __init__(
         self,
@@ -258,10 +289,13 @@ class AgentStack:
             'stack_wipe': self._stack_wipe,
             'migrate': self._migrate,
             'migrate_status': self._migrate_status,
+            'migrate_check': self._migrate_check,
             'run_system_tests': self._run_system_tests,
             'seed_dump': self._seed_dump,
             'logs': self._logs,
             'ps': self._ps,
+            'dev_logs': self._dev_logs,
+            'dev_ps': self._dev_ps,
         }
 
     @property
@@ -384,14 +418,18 @@ class AgentStack:
     def _state_file(self) -> Path:
         return self.settings.stack_dir / stack.STATE_FILE_NAME
 
-    async def _recorded_worktree(self) -> Path:
-        """The worktree the last stack_up named, re-resolved; refused when none is recorded or it is gone."""
+    async def _recorded_worktree(self) -> tuple[str, Path]:
+        """The worktree the last stack_up named, re-resolved; refused when none is recorded or it is gone.
+
+        The NAME comes back with the path because migrate_check reports what it compared, and
+        'the worktree you named at stack_up' is the half of that a reader can act on.
+        """
         worktrees = await self._worktrees()
         state = self._state_file()
         if not state.is_symlink() and state.is_file():
             name = state.read_text().strip()
             if name in worktrees:
-                return worktrees[name]
+                return name, worktrees[name]
         raise stack.Refused('no stack_up is recorded, or its worktree is gone: call stack_up first')
 
     # -----------------------------------------------------------------------------------------
@@ -454,8 +492,43 @@ class AgentStack:
         """Read-only: alembic current, then alembic history, against the agent stack."""
         return await self._alembic(call, ['current'], ['history'])
 
-    async def _alembic(self, call: _Call, *commands: list[str]) -> tuple[str, str]:
-        path = await self._recorded_worktree()
+    async def _migrate_check(self, call: _Call) -> tuple[str, str]:
+        """Rebuild data_store from a fresh snapshot of the worktree the stack was brought up from, then run `alembic check` against the agent stack: does THIS WORKTREE's model match the live schema?
+
+        IT BUILDS FIRST, AND THAT IS THE POINT. alembic check compares the models it imports, and
+        they come from the IMAGE, not from a bind mount. compose builds a missing image but never a
+        stale one, so without the build this would compare the models of whatever the last stack_up
+        built -- and an agent who had edited a model since would be shown drift between two of its
+        own builds. The question answered is therefore about the worktree you are editing, not about
+        any deployed image; `make migrate-check` on the deploy path answers the other one and
+        behaves differently on purpose.
+
+        IT WRITES, ON A DATABASE THAT WAS NEVER MIGRATED. alembic's check does not pass
+        dont_mutate=True, so MigrationContext.run_migrations reaches _ensure_version_table and
+        CREATES an empty alembic_version table where none exists. Against an already-migrated
+        database it is read-only. Call migrate first if you want it to stay that way.
+
+        A NON-ZERO EXIT MEANS ONE OF TWO THINGS, and the step's output says which: real drift
+        between the models and the schema, or 'Target database is not up to date.' -- which is not
+        drift at all, only the database sitting behind head, and is fixed by calling migrate.
+
+        WHAT A CLEAN RUN IS NOT EVIDENCE ABOUT. Autogenerate's comparison, which this uses, reads
+        neither enum labels nor server defaults (ADR tj-x3ig38 addendum items 2 and 4). A label
+        added to an enum, or a changed server default, passes this check silently. 'No drift' here
+        means no drift in what autogenerate compares.
+        """
+        return await self._alembic(call, build=True)
+
+    async def _alembic(self, call: _Call, *commands: list[str], build: bool = False) -> tuple[str, str]:
+        """Every alembic verb's shared path, through to the compose run; BUILD selects migrate_check's.
+
+        The preconditions are the same for all three and none is optional: the recorded worktree,
+        a fresh snapshot, check_mount_sources, the empty-versions guard, the guarded env file and
+        postgres actually running. BUILD takes no commands -- stack.alembic_check_steps spells its
+        own single one -- and takes migrate_check's outcomes with it, because 'alembic failed' is
+        the wrong thing to tell an agent that has just been shown drift.
+        """
+        name, path = await self._recorded_worktree()
         call.validated = {}
         snapshot = await self._refresh_snapshot(path)
         stack.check_mount_sources(snapshot)
@@ -469,9 +542,46 @@ class AgentStack:
         running = await call.step(stack.postgres_running_steps(stack_dir, env_file)[0])
         if running.exit_status != 0 or not running.stdout.strip():
             return 'failed', 'postgres is not running in the agent stack: call stack_up first'
+        if build:
+            return await self._alembic_check(call, stack_dir, env_file, name)
         if not await call.steps_until_failure(stack.alembic_steps(stack_dir, env_file, *commands)):
             return 'failed', 'alembic failed'
         return 'ok', 'alembic ' + '; '.join(' '.join(command) for command in commands)
+
+    async def _alembic_check(self, call: _Call, stack_dir: Path, env_file: Path, worktree: str) -> tuple[str, str]:
+        """migrate_check's own step and outcomes: the comparison basis first, then drift or no drift.
+
+        THE BASIS IS RECORDED BEFORE THE STEP RUNS, so a timeout or a failed build still says what
+        the call was comparing. Decision tj-yb1bxj clause 3 asks every outcome to name that, and the
+        reason -- a pasted transcript has to stay interpretable a week later -- does not depend on
+        there being a digest to print. Here there is none: --build makes the image this snapshot by
+        construction, so what the reader needs is which worktree and when, not a stamp.
+
+        The blind spots ride along with the result for the same reason they ride in the description:
+        'no drift' is read at the moment a reader is deciding whether to stop looking.
+        """
+        call.details = {
+            'compared': (
+                f'the models of a data_store image compose built from a snapshot of the {worktree} worktree, '
+                f'taken by this call, against the live schema of the agent stack'
+            ),
+            'worktree': worktree,
+            'started': datetime.now(UTC).isoformat(timespec='seconds'),
+            'not_compared': (
+                'enum labels and server defaults, which autogenerate does not read '
+                '(ADR tj-x3ig38 addendum items 2 and 4)'
+            ),
+        }
+        if not await call.steps_until_failure(stack.alembic_check_steps(stack_dir, env_file)):
+            return 'failed', (
+                f'alembic check exited {call.last_exit}: either the schema has drifted from the {worktree} '
+                "worktree's models, or the database is behind head ('Target database is not up to date.', "
+                'which migrate fixes) -- the step output says which'
+            )
+        return 'ok', (
+            f"no drift between the {worktree} worktree's models and the agent stack schema; "
+            'enum labels and server defaults were not compared'
+        )
 
     async def _run_system_tests(self, call: _Call, worktree: object, paths: object) -> tuple[str, str]:
         """Snapshot WORKTREE and run tests/system (or PATHS under it) from test_client, rebuilt from the snapshot, against the agent stack.
@@ -555,6 +665,34 @@ class AgentStack:
         if not await call.steps_until_failure(stack.ps_steps(self.settings.stack_dir, env_file)):
             return 'failed', 'compose ps failed'
         return 'ok', 'agent stack containers'
+
+    # -----------------------------------------------------------------------------------------
+    # THE USER'S OWN DEV PROJECT, READ-ONLY (stack.DEV_PROJECT; ADR tj-4rr0la addendum 18).
+    #
+    # These two run NO snapshot, NO git and NO generated env file, and that is deliberate rather than
+    # an omission. They read no worktree, so there is nothing to snapshot; they pass no --env-file and
+    # no bind source, so GUARD 2 (stack.check_env_file_paths, which exists to keep an agent-writable
+    # path out of compose's argv) has nothing to check for them. Calling it anyway would generate the
+    # agent stack's env files as a side effect and let an unrelated agent-stack fault refuse the one
+    # diagnostic the user reaches for when their own stack is broken -- which is the case these verbs
+    # were added for. What stands in its place is stack.check_dev_argv(), run on every argv as it is
+    # built, and it is strictly narrower: four fixed words, then one of two read-only subcommands.
+    async def _dev_ps(self, call: _Call) -> tuple[str, str]:
+        """READ-ONLY: the containers of the USER'S OWN dev compose project, stopped ones included, and their health. It starts, stops and changes nothing, and reaches no other project."""
+        call.validated = {}
+        if not await call.steps_until_failure(stack.dev_ps_steps(self.settings.stack_dir)):
+            return 'failed', f'compose ps failed for the {stack.DEV_PROJECT} project'
+        return 'ok', f'containers of the {stack.DEV_PROJECT} compose project'
+
+    async def _dev_logs(self, call: _Call, service: object, tail: object) -> tuple[str, str]:
+        """READ-ONLY: the last TAIL lines (clamped) of one service's log in the USER'S OWN dev compose project. It starts, stops and changes nothing, and reaches no other project."""
+        checked_service = stack.validate_dev_service(service)
+        lines = stack.clamp_tail(tail)
+        call.validated = {'service': checked_service, 'tail': lines}
+        steps = stack.dev_logs_steps(self.settings.stack_dir, checked_service, lines)
+        if not await call.steps_until_failure(steps):
+            return 'failed', f'compose logs failed for the {stack.DEV_PROJECT} project'
+        return 'ok', f'last {lines} lines of {checked_service} in the {stack.DEV_PROJECT} project'
 
     @property
     def verbs(self) -> tuple[str, ...]:

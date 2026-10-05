@@ -24,7 +24,7 @@ Your component's stack, invariants, environment and known pitfalls live in the `
 
 ## Do not
 
-Do not edit `common/`, `schemas/` or `routers/common/` — propose the change to builder-shared. Do not change the Kafka topic registry or the RPC contract in `routers/data_ingest/app_endpoints.py` unilaterally: data-store depends on both. Do not commit broker credentials, and do not add scratch data files (`data/ingest/app/brokers/alpaca/temp/` already holds some that should not be there). Do not move an import used in a Pydantic model or a FastAPI signature into a `TYPE_CHECKING` block — those annotations are evaluated at runtime.
+Do not edit `common/`, `schemas/` or `routers/common/` — propose the change to builder-shared. Do not change the `.proto` contracts, anything under `gen/`, or the RPC contract in `routers/data_ingest/app_endpoints.py` unilaterally: data-store depends on them. Do not commit broker credentials, and do not add scratch data files (`data/ingest/app/brokers/alpaca/temp/` already holds some that should not be there). Do not move an import used in a Pydantic model or a FastAPI signature into a `TYPE_CHECKING` block — those annotations are evaluated at runtime.
 
 ## Standards
 
@@ -67,6 +67,6 @@ Forbidden outright: push, force-anything, history rewriting, `reset --hard`, reb
 
 ---
 Slots declared: `builder-ingest`, `Implements the market-data ingest service for trader_joe.`, ``data/ingest/`, `routers/data_ingest/get_dataset_request.py``, `sonnet`,
-`Do not edit `common/`, `schemas/` or `routers/common/` — propose the change to builder-shared. Do not change the Kafka topic registry or the RPC contract in `routers/data_ingest/app_endpoints.py` unilaterally: data-store depends on both. Do not commit broker credentials, and do not add scratch data files (`data/ingest/app/brokers/alpaca/temp/` already holds some that should not be there). Do not move an import used in a Pydantic model or a FastAPI signature into a `TYPE_CHECKING` block — those annotations are evaluated at runtime.`, ``make test PATHS=<path>``, ``make lint PATHS=<path>``, ``make lint-fix PATHS=<path>``
+`Do not edit `common/`, `schemas/` or `routers/common/` — propose the change to builder-shared. Do not change the `.proto` contracts, anything under `gen/`, or the RPC contract in `routers/data_ingest/app_endpoints.py` unilaterally: data-store depends on them. Do not commit broker credentials, and do not add scratch data files (`data/ingest/app/brokers/alpaca/temp/` already holds some that should not be there). Do not move an import used in a Pydantic model or a FastAPI signature into a `TYPE_CHECKING` block — those annotations are evaluated at runtime.`, ``make test PATHS=<path>``, ``make lint PATHS=<path>``, ``make lint-fix PATHS=<path>``
 
 <!-- generated from kit ee0119b — edit .claude/workflow.yml and re-render, not this file -->
