@@ -1187,7 +1187,15 @@ jobs:
           # (routers/common/instance_secret.py). The bodies are {} on purpose: the guard is a
           # route dependency and runs before body validation, so a route that lost it answers
           # 422 here and fails the check, and a probe can never write anything.
-          want_body='{"detail":"Invalid or missing instance write secret"}'
+          #
+          # THE DETAIL, NOT THE WHOLE BODY. This asserted the entire body until the typed-error
+          # work wrapped every error in problem+json, which added type, title and status beside
+          # detail and failed all twelve probes against a guard that was answering correctly.
+          # The two properties this step owns are that the status is 401 -- not the 422 a route
+          # that lost the dependency would give -- and that the message is the fixed one rather
+          # than some other refusal. The envelope's own shape is pinned by the test suite, which
+          # runs on every push; re-pinning it here only buys a second place to forget to update.
+          want_detail='"detail":"Invalid or missing instance write secret"'
           # Sent from test_client by service name, like the Smoke Test: prod publishes no host
           # port. The client file is loaded for this request only; the blank and the recreate
           # above ran on docker-compose.yaml alone and never depended on it. The client's own
@@ -1208,8 +1216,8 @@ jobs:
             if [[ "${body}" == *"${former_secret}"* ]]; then
               echo "::error::${method} ${path} (${label}): HTTP ${status}, and the body carries the former secret (withheld)"
               failed=1
-            elif [ "${status}" != "401" ] || [ "${body}" != "${want_body}" ]; then
-              echo "::error::${method} ${path} (${label}): expected 401 ${want_body}, got ${status} ${body}"
+            elif [ "${status}" != "401" ] || [[ "${body}" != *"${want_detail}"* ]]; then
+              echo "::error::${method} ${path} (${label}): expected 401 carrying ${want_detail}, got ${status} ${body}"
               failed=1
             else
               echo "${method} ${path} (${label}): 401"
