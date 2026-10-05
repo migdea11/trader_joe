@@ -59,8 +59,10 @@ EMPTY = '-'
 # `unbound-path` exists because the import-time surface is not the whole declared surface, and the
 # gap was invisible before this file. routers/common/latency.py builds its APIRouter INSIDE
 # initialize_latency_client()/initialize_latency_server(), so /latency and /latency_internal are
-# registered only when LATENCY_TEST_ENABLED is set and those functions are called with a live Kafka
-# factory -- nothing a no-external test may do. routers/data_ingest declares a REST path and
+# registered only when LATENCY_TEST_ENABLED is set and those functions are called -- which a
+# collection-time scan does not do. (Until tj-3mk3u5.35 those calls also needed a live Kafka factory;
+# the harness's Kafka arm is gone, but the paths are still bound only at call time, so the
+# unbound-path kind is unchanged.) routers/data_ingest declares a REST path and
 # registers no route for it at all. Recording those as their own kind keeps them in the inventory
 # S6 reads, and keeps them under the same equality assertion as everything else: implement one, and
 # the `unbound-path` line has to become an `http` line in the same diff.

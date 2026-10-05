@@ -34,19 +34,17 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Final
 
 import httpx
 import pytest
-from fastapi.routing import APIRoute
 
-import common.rpc.latency as grpc_arm
 import common.timer
 import routers.common.latency as latency
 from common.kafka.topics import ConsumerGroup
 from common.tests.image_path import image_pythonpath
 from routers.common.app_endpoints import InterfaceRest
+from routers.tests.latency_harness import AppStub, RecordingRestClient, rest_endpoint, turn_harness_on
 from schemas.common.latency import LatencyRequest
 
 
@@ -128,99 +126,20 @@ def test_with_the_harness_off_no_rest_client_is_built_and_httpx_is_never_importe
 # ---------------------------------------------------------------------------------------------------
 # HARNESS ON: ONE CLIENT, THE RULED LIMITS, AND THE REQUEST LINE
 #
-# Everything the init touches besides the REST client is stood in for. The Kafka factory starts
-# threads and the gRPC arm wants a reachable target; neither is what this file is about, and the PR
-# gate may reach neither. What stays real is every line of initialize_latency_client that concerns the
-# REST arm, and the whole request handler.
-
-
-class _StubRpcClient:
-    async def send_request(self, request):
-        return SimpleNamespace(success=None)
-
-
-class _StubRpcClients:
-    def get_client(self, endpoint):
-        return _StubRpcClient()
-
-
-class _StubKafkaRpcFactory:
-    """Stands in for KafkaRpcFactory with the three calls initialize_latency_client makes."""
-
-    def __init__(self, params):
-        self.params = params
-
-    def add_client(self, endpoint, timeout):
-        return None
-
-    def init_clients(self):
-        return _StubRpcClients()
-
-
-class _StubProbeClient:
-    def __init__(self, channel, timeout_s):
-        self.channel = channel
-        self.timeout_s = timeout_s
-
-
-class _RecordingRestClient:
-    """Records every post the handler makes, and answers 200 without touching the network."""
-
-    def __init__(self):
-        self.posts: list[tuple[str, dict]] = []
-
-    async def post(self, url, **kwargs):
-        self.posts.append((url, kwargs))
-        return SimpleNamespace(status_code=200)
+# Everything the init touches besides the REST client is stood in for, by the shared scaffolding in
+# routers/tests/latency_harness.py. The gRPC arm wants a reachable target, which the PR gate may not
+# have; that is not what this file is about. What stays real is every line of
+# initialize_latency_client that concerns the REST arm, and the whole request handler.
+#
+# Until tj-3mk3u5.35 three more stubs stood in for the Kafka factory and its clients. The arm they
+# propped up is gone, so they are too: a stub for a transport that no longer exists is scaffolding
+# holding up nothing, and the next reader has to prove that before daring to delete it.
 
 
 @pytest.fixture
 def harness_on(monkeypatch: pytest.MonkeyPatch):
-    """Turn the harness on and neutralise everything in the init that is not the REST client.
-
-    LATENCY_TEST_ENABLED is read ONCE, at import of routers/common/latency.py (:22), into a module
-    attribute, so setting the environment variable now would change nothing. The module globals are
-    reset because initialize_latency_client refuses a second call once __APP_NAME is set, and
-    monkeypatch puts the real values back when the test ends.
-    """
-    monkeypatch.setattr(latency, 'LATENCY_TEST_ENABLED', True)
-    for name in ('__APP_NAME', '__APP_PORT', '__REST_CLIENT', '__GRPC_CLIENT', '__PRC_CLIENTS'):
-        monkeypatch.setattr(latency, name, None)
-    monkeypatch.setattr(latency, 'target_from_env', lambda env_var: 'stub-target:1')
-    monkeypatch.setattr(latency, 'create_channel', lambda target: SimpleNamespace(target=target))
-    monkeypatch.setattr(grpc_arm, 'LatencyProbeClient', _StubProbeClient)
-    monkeypatch.setattr(latency, 'get_rpc_params', lambda client_group: None)
-    monkeypatch.setattr(latency, 'KafkaRpcFactory', _StubKafkaRpcFactory)
-
-
-class _AppStub:
-    """Captures the APIRouter initialize_latency_client builds, in place of a FastAPI app.
-
-    FastAPI 0.141 defers an included router behind a private _IncludedRouter wrapper, so reading the
-    registered route back off a real app means reaching into an implementation detail that is free to
-    change. include_router is the only thing the init asks of the app.
-    """
-
-    def __init__(self):
-        self.routers = []
-
-    def include_router(self, router):
-        self.routers.append(router)
-
-
-def _rest_endpoint(app: _AppStub):
-    """The handler initialize_latency_client registered, called directly rather than over a TestClient.
-
-    Args:
-        app (_AppStub): The app stub the init was given.
-
-    Returns:
-        The route's endpoint coroutine function.
-    """
-    assert len(app.routers) == 1, app.routers
-    routes = [route for route in app.routers[0].routes if isinstance(route, APIRoute)]
-    assert [route.path for route in routes] == [InterfaceRest.LATENCY]
-    return routes[0].endpoint
+    """Turn the harness on with only the transports stubbed. See latency_harness.turn_harness_on."""
+    turn_harness_on(monkeypatch)
 
 
 def test_one_client_is_built_for_the_process_with_the_ruled_limits(harness_on, monkeypatch: pytest.MonkeyPatch):
@@ -240,7 +159,7 @@ def test_one_client_is_built_for_the_process_with_the_ruled_limits(harness_on, m
 
     monkeypatch.setattr(httpx, 'AsyncClient', recorder)
 
-    latency.initialize_latency_client(_AppStub(), 'probe', 1, ConsumerGroup.COMMON_GROUP)
+    latency.initialize_latency_client(AppStub(), 'probe', 1, ConsumerGroup.COMMON_GROUP)
 
     assert len(built) == 1, f'expected exactly one client for the process, got {len(built)}'
     assert built[0]['timeout'] == latency.LATENCY_TEST_TIMEOUT
@@ -260,10 +179,10 @@ async def test_the_handler_reuses_the_process_client_and_never_builds_its_own(
     per-call one. Building a client is forbidden outright for the duration, which names the regression
     in the failure rather than leaving it to be inferred from a post count of zero.
     """
-    app = _AppStub()
+    app = AppStub()
     latency.initialize_latency_client(app, 'probe', 1, ConsumerGroup.COMMON_GROUP)
 
-    recorder = _RecordingRestClient()
+    recorder = RecordingRestClient()
     monkeypatch.setattr(latency, '__REST_CLIENT', recorder)
 
     def forbidden(*args, **kwargs):
@@ -271,7 +190,7 @@ async def test_the_handler_reuses_the_process_client_and_never_builds_its_own(
 
     monkeypatch.setattr(httpx, 'AsyncClient', forbidden)
 
-    endpoint = _rest_endpoint(app)
+    endpoint = rest_endpoint(app)
     for _ in range(2):
         result = await endpoint(
             LatencyRequest(latency_type=LatencyRequest.LatencyType.REST, iterations=3, payload_size=1)
@@ -290,15 +209,13 @@ async def test_the_rest_sample_posts_the_model_as_a_json_body(harness_on, monkey
     422, and the harness counts the failure as a sample. That was 200 of 200 calls, and nothing in the
     response says so, which is why it is pinned at the call rather than at the result.
     """
-    app = _AppStub()
+    app = AppStub()
     latency.initialize_latency_client(app, 'probe', 1, ConsumerGroup.COMMON_GROUP)
 
-    recorder = _RecordingRestClient()
+    recorder = RecordingRestClient()
     monkeypatch.setattr(latency, '__REST_CLIENT', recorder)
 
-    await _rest_endpoint(app)(
-        LatencyRequest(latency_type=LatencyRequest.LatencyType.REST, iterations=1, payload_size=1)
-    )
+    await rest_endpoint(app)(LatencyRequest(latency_type=LatencyRequest.LatencyType.REST, iterations=1, payload_size=1))
 
     assert len(recorder.posts) == 1
     url, kwargs = recorder.posts[0]

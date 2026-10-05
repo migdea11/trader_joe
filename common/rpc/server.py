@@ -16,6 +16,13 @@ none: the container's own healthcheck would pass while the peer could not connec
 The health service is the standard grpc.health.v1.Health from grpcio-health-checking, not a bespoke
 ping (ADR tj-8konfu D6.5). The overall status ('') and each attached service read SERVING while the
 server runs, and every status reads NOT_SERVING from the moment stop() begins.
+
+EVERY SERVER BUILT HERE CARRIES THE ERROR BOUNDARY, and there is no way to turn it off. ADR
+tj-fa1rpu D1(b) calls the servicer's obligation absolute -- every escaping exception becomes a reply
+-- and an interceptor was chosen over a per-method decorator because a decorator is what a new
+method forgets. A host that only installed the boundary when asked would put that same forgettable
+opt-in one level up, so this one object, which builds every server in the repository, carries it
+instead. A test that wants gRPC's unguarded default builds its own grpc.aio.server.
 """
 
 import asyncio
@@ -32,6 +39,7 @@ from grpc_health.v1 import health, health_pb2, health_pb2_grpc
 from common.environment import get_env_var
 from common.logging import get_logger
 from common.rpc.config import server_options
+from common.rpc.errors import ErrorBoundaryInterceptor
 
 
 log = get_logger(__name__)
@@ -161,7 +169,7 @@ async def refuse_wildcard(host: str) -> None:
 
 
 class GrpcServerHost:
-    """A grpc.aio server with the health service and a fixed set of servicers.
+    """A grpc.aio server with the error boundary, the health service and a fixed set of servicers.
 
     Use it as an async context manager, typically from a FastAPI lifespan::
 
@@ -170,10 +178,34 @@ class GrpcServerHost:
 
     Every option comes from common.rpc.config. A host starts once and stops once; build a new one to
     serve again.
+
+    THE ERROR BOUNDARY IS INSTALLED BY DEFAULT AND CANNOT BE REMOVED (ADR tj-fa1rpu D1(b)). No caller
+    has to know ErrorBoundaryInterceptor exists, and a servicer attached later by someone who never
+    read common/rpc/errors.py is covered on the day it is attached: an exception escaping it answers
+    INTERNAL carrying only an error_id, never gRPC's UNKNOWN with the exception text on the wire
+    (D5, D8).
+
+    THE BOUNDARY IS FIRST IN THE INTERCEPTOR CHAIN, ahead of anything a caller supplies. grpc.aio
+    dispatches the chain in order, so first means outermost: the boundary guards whatever handler the
+    rest of the chain resolved, which is the handler an inner interceptor has already wrapped. An
+    auth or logging interceptor added later is therefore inside the guarantee rather than outside it
+    -- an exception from its wrapped behaviour becomes a reply exactly as a servicer's would. (An
+    interceptor that instead raises while RESOLVING the handler, out of its own intercept_service,
+    fails the call before any handler exists; that is gRPC's dispatch to answer, not this boundary's.)
+
+    THE HEALTH SERVICE IS INSIDE THE BOUNDARY TOO, and that is intended: Check and Watch are
+    dispatched through the same chain as every other method. It costs health nothing. Its own
+    deliberate context.abort -- NOT_FOUND for a service name it does not know -- raises
+    grpc.aio.AbortError, which the boundary re-raises untouched, and Watch is an async generator,
+    which the boundary wraps as one.
     """
 
     def __init__(
-        self, bind: BindAddress, services: Sequence[ServiceRegistration], stop_grace_s: float = DEFAULT_STOP_GRACE_S
+        self,
+        bind: BindAddress,
+        services: Sequence[ServiceRegistration],
+        stop_grace_s: float = DEFAULT_STOP_GRACE_S,
+        interceptors: Sequence[grpc.aio.ServerInterceptor] = (),
     ) -> None:
         """Configure the host. Nothing is bound and nothing is resolved until start().
 
@@ -181,10 +213,14 @@ class GrpcServerHost:
             bind: Where to listen.
             services: The servicers to attach, in addition to the health service.
             stop_grace_s: Seconds stop() lets in-flight calls finish before cancelling them.
+            interceptors: Interceptors to run in ADDITION to the error boundary, in the order given.
+                The boundary is always first, for the reason in the class docstring. There is no
+                argument that removes it.
         """
         self._bind = bind
         self._services = tuple(services)
         self._stop_grace_s = stop_grace_s
+        self._interceptors: tuple[grpc.aio.ServerInterceptor, ...] = (ErrorBoundaryInterceptor(), *interceptors)
         self._server: grpc.aio.Server | None = None
         self._health: health.aio.HealthServicer | None = None
         self._port: int | None = None
@@ -207,6 +243,9 @@ class GrpcServerHost:
     async def start(self) -> None:
         """Bind, attach the health service and every servicer, start serving, then report SERVING.
 
+        The server is built with the error boundary first in its interceptor chain, so every method
+        it goes on to serve -- health included -- is guarded before the first call arrives.
+
         Raises:
             RuntimeError: If this host was already started, or the bind fails.
             ValueError: If the bind host is a wildcard or does not resolve.
@@ -216,7 +255,7 @@ class GrpcServerHost:
         self._started = True
         await refuse_wildcard(self._bind.host)
 
-        server = grpc.aio.server(options=server_options())
+        server = grpc.aio.server(interceptors=self._interceptors, options=server_options())
         health_servicer = health.aio.HealthServicer()
         try:
             health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)

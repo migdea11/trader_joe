@@ -42,6 +42,7 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from common.enums.data_stock import Feed, UpdateType
+from common.tests.domain_fields import aware_datetime_fields
 from common.tests.proto_descriptors import field_names, file_named, messages, real_oneofs
 from schemas.data_ingest import fetch_dataset
 from schemas.data_ingest.fetch_dataset import (
@@ -421,23 +422,25 @@ def test_an_ack_sets_exactly_one_arm():
 
 # Every AwareDatetime field of the twins, with a payload that is valid apart from the naive time at
 # that field.
+_A_REQUEST: dict[str, Any] = {
+    'owner': 'rebalancer',
+    'source': 'ALPACA',
+    'asset_symbol': 'VFV',
+    'asset_type': 'stock',
+    'data_types': ['market-activity'],
+    'granularity': '1day',
+    'start': WHEN,
+    # UpdateType is a NamedIntEnum: its VALUES are 1, 2, 3 and only its encoder puts the
+    # member name on the wire, so the member itself is what constructs the model.
+    'update_type': UpdateType.STATIC,
+}
+
 _NAIVE_CASES: list[tuple[type[BaseModel], str, dict[str, Any]]] = [
-    (
-        FetchDatasetRequest,
-        'start',
-        {
-            'owner': 'rebalancer',
-            'source': 'ALPACA',
-            'asset_symbol': 'VFV',
-            'asset_type': 'stock',
-            'data_types': ['market-activity'],
-            'granularity': '1day',
-            'start': WHEN,
-            # UpdateType is a NamedIntEnum: its VALUES are 1, 2, 3 and only its encoder puts the
-            # member name on the wire, so the member itself is what constructs the model.
-            'update_type': UpdateType.STATIC,
-        },
-    ),
+    (FetchDatasetRequest, 'start', _A_REQUEST),
+    # `end` is OPTIONAL, and that is exactly why it was the one this sweep had missed (architect,
+    # tj-3mk3u5.29 item 6): an absent end is meaningful -- an open window -- so the field is easy to
+    # read as "nothing to check here". A naive value at it is still a naive value.
+    (FetchDatasetRequest, 'end', _A_REQUEST),
     (
         Bar,
         'bar_start',
@@ -447,6 +450,26 @@ _NAIVE_CASES: list[tuple[type[BaseModel], str, dict[str, Any]]] = [
     (ServedRange, 'end', {'start': WHEN, 'end': WHEN}),
     (FetchDone, 'as_of', {'bar_count': 0, 'served_range': ServedRange(start=WHEN, end=WHEN), 'as_of': WHEN}),
 ]
+
+
+def test_the_naive_sweep_drives_every_aware_field_the_twins_declare():
+    """THE TRIPWIRE THE SWEEP BESIDE IT DID NOT HAVE, and the reason it had already fallen behind.
+
+    ``_NAIVE_CASES`` is hand-written, and every other list in this file has something deriving it --
+    ``test_every_contract_message_is_either_twinned_or_listed_as_transport`` and
+    ``test_every_model_in_the_module_is_a_twin_of_something`` do it for ``TWINS``. This one had nothing,
+    and it was missing ``FetchDatasetRequest.end``. Worse, the gap was invisible from both directions: a
+    later edit widening that annotation to ``datetime | None`` would have dropped awareness on the one
+    time field whose absence is meaningful, and the field-parity pin above would not have seen it either,
+    because it compares NAMES and not annotations.
+
+    So the expected set is DERIVED from the annotations. A twin that gains a time field, or loses the
+    awareness on one it has, reds this -- which is the mutation the architect asked for as evidence.
+    """
+    driven = {(model, field) for model, field, _ in _NAIVE_CASES}
+    declared = {(model, field) for _, _, model in TWINS for field in aware_datetime_fields(model)}
+
+    assert driven == declared
 
 
 @pytest.mark.parametrize(

@@ -10,8 +10,12 @@ Pinned here, through the production lifespan (main.create_app -> app_depends.mak
 * health answers SERVING on the configured port while the app is up, and nothing answers after;
 * grpc_host.registered_services() is the one registration point: what it returns is what the
   lifespan's host serves, and it is handed the readers create_app received;
-* the latency arm is registered there when LATENCY_TEST_ENABLED is on and nothing is registered --
-  and no generated module is even imported -- when it is off (tj-3mk3u5.60);
+* FetchDataset is registered ALWAYS (tj-3mk3u5.9), and the latency arm joins it -- beside it, never
+  instead of it -- only when LATENCY_TEST_ENABLED is on, with common.rpc.latency left unimported when
+  it is off (tj-3mk3u5.60). That last clause replaces this file's older pin that NO generated module
+  was loaded with the harness off: FetchDataset has no flag and grpc_host imports common.rpc.ingest at
+  module level, so the broad version is dead and the narrow one it was protecting is what remains. The
+  reasoning is written out above HARNESS_OFF_PROBE;
 * the bind address is read when the host is built, never once at import;
 * an unset variable stops startup before Kafka, the worker pool or the readers are touched;
 * a gRPC start that fails (port taken, wildcard host) still runs the Kafka teardown, and the process
@@ -431,34 +435,55 @@ async def test_the_host_starts_after_the_kafka_rpc_servers_and_before_ready_and_
 # ---------------------------------------------------------------------------------------------------
 # THE LATENCY ARM (tj-3mk3u5.60): REGISTERED WHEN THE HARNESS IS ON, ABSENT WHEN IT IS OFF
 
-# Spelled out, not imported from common.rpc.latency: what is pinned is the wire name the gRPC arm's
-# client dials (tj-3mk3u5.26), so a rename in the .proto has to turn this red rather than follow it.
-# Importing the generated symbol here is banned anyway outside common/rpc (ADR tj-8konfu D3, TID251).
+# Spelled out, not imported from common.rpc.latency or common.rpc.ingest: what is pinned is the wire
+# name each arm's client dials (tj-3mk3u5.26, tj-3mk3u5.9), so a rename in the .proto has to turn this
+# red rather than follow it. Importing the generated symbols here is banned anyway outside common/rpc
+# (ADR tj-8konfu D3, TID251).
 LATENCY_SERVICE_NAME: Final = 'trader_joe.proto.internal.latency.v1.LatencyService'
+INGEST_SERVICE_NAME: Final = 'trader_joe.proto.internal.ingest.v1.IngestService'
 
-# The harness-OFF pin runs in a FRESH INTERPRETER, because half of what it asserts is an IMPORT fact:
-# with the flag off, nothing on the path from grpc_host to registered_services() loads generated code.
-# This process cannot answer that -- it imports common.rpc.ping at the top of this file, which imports
-# trader_joe.proto.ping -- so an in-process check would be red on arrival and could never go green.
-# The child is given PYTHONPATH and nothing else, so LATENCY_TEST_ENABLED is unset, as in production.
+# THE HARNESS-OFF PIN, INVERTED ON tj-3mk3u5.9, AND WHAT IT STOPPED PROTECTING.
+#
+# It used to assert 'services=[]' and 'generated=[]': with the flag off nothing was registered, and no
+# generated module was loaded anywhere on the path from grpc_host to registered_services(). BOTH HALVES
+# ARE NOW FALSE, and only one of them is replaceable.
+#
+#   services  FetchDataset is served ALWAYS -- it is production, not a dev harness, and has no flag to
+#             be off. So the pin becomes "exactly the ingest service, and nothing of the harness".
+#   generated THE GUARANTEE IS GONE, deliberately and irreversibly. grpc_host.py imports
+#             common.rpc.ingest at module top level, which loads trader_joe.proto.internal.ingest.v1;
+#             nothing could make that lazy and still register the service unconditionally. Weakening
+#             the assertion to "not many modules" would be a pin that cannot fail, so it is replaced
+#             rather than relaxed.
+#
+# WHAT THE SECOND HALF WAS ACTUALLY PROTECTING SURVIVES, and is pinned here in a stronger form. Its
+# stated purpose was that get_latency_services() keeps its import of common.rpc.latency INSIDE the flag
+# check, so that a top-level import added there later -- which would still leave the registration list
+# empty, and so would still pass the services half -- is caught. That property is untouched by
+# FetchDataset: with the harness off, common.rpc.latency must not be in sys.modules. Naming the one
+# module instead of the whole generated tree is narrower in scope and sharper in aim, because it fails
+# for exactly the regression the original sentence describes and for nothing else.
+#
+# STILL A FRESH INTERPRETER, for the same reason as before: what is asserted is an IMPORT fact, and this
+# process imports common.rpc.ping at the top of the file. The child is given PYTHONPATH and nothing
+# else, so LATENCY_TEST_ENABLED is unset, as in production.
 HARNESS_OFF_PROBE = """
 import sys
 
 from data.ingest.app.grpc_host import registered_services
 
 names = [service.name for service in registered_services({})]
-generated = sorted(name for name in sys.modules if name == 'trader_joe' or name.startswith('trader_joe.'))
 print('services=' + repr(names), flush=True)
-print('generated=' + repr(generated), flush=True)
+print('latency_loaded=' + repr('common.rpc.latency' in sys.modules), flush=True)
 """
 
 
-def test_with_the_latency_harness_off_nothing_is_registered_and_no_generated_module_is_loaded():
-    """The production default: a dev-only servicer is not served, and its generated tree is not even loaded.
+def test_with_the_latency_harness_off_only_fetch_dataset_is_registered_and_the_latency_module_is_unloaded():
+    """The production default: FetchDataset served, the dev-only arm neither served nor even imported.
 
     The second half is the one that protects production. get_latency_services() imports
     common.rpc.latency inside the flag check for exactly this reason, so a top-level import added
-    there later -- which would still leave the registration list empty -- is caught here.
+    there later -- which would still leave the harness unregistered -- is caught here.
     """
     try:
         done = subprocess.run(
@@ -474,13 +499,19 @@ def test_with_the_latency_harness_off_nothing_is_registered_and_no_generated_mod
         pytest.fail(f'the probe was still alive {EXIT_BUDGET_S}s in; it printed {hung.stdout!r}')
 
     assert done.returncode == 0, done.stderr
-    assert done.stdout.splitlines() == ['services=[]', 'generated=[]'], done.stderr
+    assert done.stdout.splitlines() == [f'services={[INGEST_SERVICE_NAME]!r}', 'latency_loaded=False'], done.stderr
 
 
-def test_with_the_latency_harness_on_exactly_the_latency_servicer_is_registered(monkeypatch: pytest.MonkeyPatch):
-    """Flag on: one registration, the gRPC arm's, so tj-3mk3u5.26 has a server to dial.
+def test_with_the_latency_harness_on_the_latency_servicer_joins_fetch_dataset_rather_than_replacing_it(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Flag on: two registrations, so tj-3mk3u5.26 has a server to dial and FetchDataset still answers.
 
-    LATENCY_TEST_ENABLED is read ONCE, at import of routers/common/latency.py (:22), into a module
+    The ORDER is pinned with them. registered_services() builds the list as [fetch, *harness], and a
+    dev-only arm that could displace production's own service -- rather than be appended beside it --
+    is the failure this spells out rather than leaves to a set comparison.
+
+    LATENCY_TEST_ENABLED is read ONCE, at import of routers/common/latency.py (:19), into a module
     attribute. Setting the environment variable now would change nothing -- the module was imported
     long before this test ran -- so the pin flips the attribute the production code actually reads.
     """
@@ -488,7 +519,25 @@ def test_with_the_latency_harness_on_exactly_the_latency_servicer_is_registered(
 
     services = grpc_host.registered_services({})
 
-    assert [service.name for service in services] == [LATENCY_SERVICE_NAME]
+    assert [service.name for service in services] == [INGEST_SERVICE_NAME, LATENCY_SERVICE_NAME]
+
+
+def test_registered_services_builds_the_fetch_handler_from_the_readers_it_was_handed(monkeypatch: pytest.MonkeyPatch):
+    """Decision tj-j4wknb: the servicer reads through the INJECTED readers, never a broker class.
+
+    The lifespan test above proves the mapping reaches registered_services(); this proves
+    registered_services() puts it into the handler it builds, which is the half that would otherwise be
+    covered only by a function that was monkeypatched away. A handler built from a fresh {} instead
+    would serve every FetchDataset call a NotImplementedError and pass every other test in this file.
+    """
+    built = []
+    monkeypatch.setattr(grpc_host, 'IngestFetchHandler', lambda readers: built.append(readers) or Mock())
+    readers = {DataSource.ALPACA_API: UnusedRead()}
+
+    grpc_host.registered_services(readers)
+
+    assert built == [readers]
+    assert built[0] is readers
 
 
 @pytest.mark.asyncio

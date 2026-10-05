@@ -20,9 +20,18 @@
 // with a google.rpc.Status + ErrorInfo, rendered by common/rpc (tj-3mk3u5.37.7), and the server never
 // deliberately returns UNAVAILABLE (ADR tj-8konfu D6.4).
 //
-// NO DEADLINE. This is a stream, and ADR tj-8konfu D6.1 puts no deadline on one; a client must not
-// call it with common.rpc.channel.unary_call_options(), whose wait_for_ready would then wait without
-// bound. A stream that fails with UNAVAILABLE resubscribes with backoff instead.
+// A FINITE DEADLINE, AND wait_for_ready WITH IT (architect ruling, tj-3mk3u5.28, 01:25 UTC
+// 2026-10-02, restated 05:58 UTC 2026-10-03). What ADR tj-8konfu D6.1 forbids is an UNBOUNDED
+// wait -- a deadline on an indefinitely-open SUBSCRIBE stream is a scheduled failure -- and this
+// stream is bounded work, one backfill, which ends. So the call carries a configurable finite
+// deadline together with wait_for_ready: D6.5 = O1's "wait_for_ready bounded by the call's own
+// deadline", and that bound is what makes the wait legal. STILL DO NOT ISSUE IT WITH
+// common.rpc.channel.unary_call_options(): the helper's options are the unary ones and not this
+// call's, so a client spells its own out. THE PYTHON SIDE IS AUTHORITATIVE --
+// common/rpc/clients/ingest_fetch.py's module docstring and DEFAULT_FETCH_DEADLINE_S (300 s,
+// derived from the vendor call and the size of a one-transaction backfill, NOT from the transport
+// and NOT from the Kafka RPC's 5 s). UNAVAILABLE reaches that seam's caller as PEER_UNAVAILABLE,
+// and retrying is the caller's decision.
 syntax = "proto3";
 
 package trader_joe.proto.internal.ingest.v1;

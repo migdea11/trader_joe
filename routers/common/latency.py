@@ -5,15 +5,12 @@ from fastapi import APIRouter, Depends, FastAPI
 
 from common.endpoints import get_endpoint_url
 from common.environment import get_env_var
-from common.kafka.kafka_config import get_rpc_params
-from common.kafka.kafka_rpc_factory import KafkaRpcFactory
-from common.kafka.rpc.kafka_rpc_base import BaseRpcAck
-from common.kafka.topics import ConsumerGroup, RpcEndpointTopic
+from common.kafka.topics import ConsumerGroup
 from common.logging import get_logger
 from common.rpc.channel import DATA_INGEST_GRPC_TARGET_ENV, create_channel, target_from_env
 from common.rpc.server import ServiceRegistration
 from common.timer import Timer
-from routers.common.app_endpoints import InterfaceRest, InterfaceRpc
+from routers.common.app_endpoints import InterfaceRest
 from schemas.common.latency import InternalLatencyRequest, LatencyRequest
 
 
@@ -21,19 +18,23 @@ log = get_logger(__name__)
 
 LATENCY_TEST_ENABLED = get_env_var('LATENCY_TEST_ENABLED', default=False, cast_type=bool)
 LATENCY_TEST_TIMEOUT = get_env_var('LATENCY_TEST_TIMEOUT', default=60, cast_type=int)
-__PRC_CLIENTS = None
 __GRPC_CLIENT = None
 __REST_CLIENT = None
-__RPC_SERVERS = None
 __APP_NAME = None
 __APP_PORT = None
 
 
 def get_latency_topics():
-    if not LATENCY_TEST_ENABLED:
-        return ()
+    """No topics: the harness lost its Kafka arm on tj-3mk3u5.35, once the measurement was recorded.
 
-    return (RpcEndpointTopic.LATENCY_TEST.request, RpcEndpointTopic.LATENCY_TEST.response)
+    A shim, kept importable only so that the two lifespans can keep calling it unchanged. Its call
+    sites go with the Kafka consumers they feed -- data/ingest/app/app_depends.py on tj-3mk3u5.11 and
+    data/store/app/app_depends.py on tj-3mk3u5.12 -- and tj-3mk3u5.13 deletes this function.
+
+    Returns:
+        tuple: Always empty.
+    """
+    return ()
 
 
 def get_latency_services() -> list[ServiceRegistration]:
@@ -72,6 +73,8 @@ def _percentile(ordered: list[float], percentile: int) -> float:
     return ordered[math.ceil(percentile * len(ordered) / 100) - 1]
 
 
+# client_group is unused since the Kafka arm went (tj-3mk3u5.35) and is kept only so that the lifespan
+# calling this keeps working untouched; it goes with that call site on tj-3mk3u5.12.
 def initialize_latency_client(app: FastAPI, app_name: str, app_port: int, client_group: ConsumerGroup):
     if not LATENCY_TEST_ENABLED:
         return
@@ -83,9 +86,11 @@ def initialize_latency_client(app: FastAPI, app_name: str, app_port: int, client
         return
 
     # Init gRPC Client, first: a missing or malformed DATA_INGEST_GRPC_TARGET stops startup here, naming
-    # the variable, before the Kafka client below starts threads that would keep a failed process alive.
-    # One channel for the process, never closed, like the Kafka clients (ruled on tj-3mk3u5.8). The arm is
-    # imported only now, for the reason get_latency_services() gives.
+    # the variable, before anything else is built. One channel for the process, never closed (the lifetime
+    # ruled on tj-3mk3u5.8), for the same reason as the REST client below: a channel per request would make
+    # every sample pay its own connection setup, and the harness exists to compare transports. Nothing
+    # closes it because this is a dev-only measurement process that exits with its container -- that is the
+    # ruling, not an oversight. The arm is imported only now, for the reason get_latency_services() gives.
     from common.rpc.latency import LatencyProbeClient
 
     global __GRPC_CLIENT
@@ -95,16 +100,9 @@ def initialize_latency_client(app: FastAPI, app_name: str, app_port: int, client
     __APP_NAME = app_name
     __APP_PORT = app_port
 
-    # Init RPC Client
-    rpc_client = KafkaRpcFactory(get_rpc_params(client_group))
-    rpc_client.add_client(InterfaceRpc.LATENCY, LATENCY_TEST_TIMEOUT)
-
-    global __PRC_CLIENTS
-    __PRC_CLIENTS = rpc_client.init_clients()
-
-    # Init REST Client. One client for the process, never closed, like the gRPC channel above and the
-    # Kafka clients (the lifetime ruled on tj-3mk3u5.8): a client per request would make every sample pay
-    # its own TCP connect, and the harness exists to compare transports, not connection setup.
+    # Init REST Client. One client for the process, never closed, like the gRPC channel above (the lifetime
+    # ruled on tj-3mk3u5.8): a client per request would make every sample pay its own TCP connect, and the
+    # harness exists to compare transports, not connection setup.
     # Concurrency is uncapped (max_connections=None) so that iterations never queue inside the client on
     # httpx's default of 100, which would inflate p99 for a reason that is not the transport. Idle
     # keep-alive stays at httpx's default of 20 on measured evidence (tj-3mk3u5.61, 2026-10-03): retaining
@@ -133,8 +131,6 @@ def initialize_latency_client(app: FastAPI, app_name: str, app_port: int, client
         rest_client = __REST_CLIENT
         url = get_endpoint_url(__APP_NAME, __APP_PORT, InterfaceRest.INTERNAL_LATENCY.value)
 
-        # Get RPC Client
-        rpc_client = __PRC_CLIENTS.get_client(InterfaceRpc.LATENCY)
         internal_request = InternalLatencyRequest(payload=payload)
 
         async def send_rest() -> bool:
@@ -142,10 +138,6 @@ def initialize_latency_client(app: FastAPI, app_name: str, app_port: int, client
                 url, content=internal_request.model_dump_json(), headers={'Content-Type': 'application/json'}
             )
             return response.status_code == 200
-
-        async def send_rpc_kafka():
-            response = await rpc_client.send_request(internal_request)
-            return response.success is BaseRpcAck.Success.SUCCESS
 
         async def send_grpc() -> bool:
             try:
@@ -155,9 +147,7 @@ def initialize_latency_client(app: FastAPI, app_name: str, app_port: int, client
                 return False
             return True
 
-        if request.latency_type is LatencyRequest.LatencyType.RPC_KAFKA:
-            send_type = send_rpc_kafka
-        elif request.latency_type is LatencyRequest.LatencyType.REST:
+        if request.latency_type is LatencyRequest.LatencyType.REST:
             log.debug(f'Sending REST request to {url}')
             send_type = send_rest
         elif request.latency_type is LatencyRequest.LatencyType.GRPC:
@@ -196,6 +186,8 @@ def initialize_latency_client(app: FastAPI, app_name: str, app_port: int, client
     app.include_router(router)
 
 
+# server_group is unused since the Kafka arm went (tj-3mk3u5.35), kept for the same reason as
+# initialize_latency_client's client_group above; it goes with its call site on tj-3mk3u5.11.
 def initialize_latency_server(app: FastAPI, app_name: str, app_port: int, server_group: ConsumerGroup):
     if not LATENCY_TEST_ENABLED:
         return
@@ -208,16 +200,6 @@ def initialize_latency_server(app: FastAPI, app_name: str, app_port: int, server
 
     __APP_NAME = app_name
     __APP_PORT = app_port
-
-    # Init RPC Server
-    rpc_server = KafkaRpcFactory(get_rpc_params(server_group))
-
-    @rpc_server.add_server(InterfaceRpc.LATENCY)
-    async def server_callback(request: InternalLatencyRequest) -> BaseRpcAck:
-        return BaseRpcAck()
-
-    global __RPC_SERVERS
-    __RPC_SERVERS = rpc_server.init_servers()
 
     # Init REST Server
     router = APIRouter()

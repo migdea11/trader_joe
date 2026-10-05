@@ -511,6 +511,20 @@ wheels = [
 ]
 
 [[package]]
+name = "grpcio-status"
+version = "1.81.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "googleapis-common-protos" },
+    { name = "grpcio" },
+    { name = "protobuf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/32/26/0aa9168c87882381fd810d140c279a2490ed6aee655f0515d6f56c5ca404/grpcio_status-1.81.1.tar.gz", hash = "sha256:9389a03e746017b10f0630c064289201458f3ce01f5d7ef4b0bebc1ef6cf82ad", size = 13923, upload-time = "2026-06-11T12:58:48.636Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e5/5e/5abfec5f7e89d3b7993d57cfb025ca5f968a2c18656d7fcda2b6919440b9/grpcio_status-1.81.1-py3-none-any.whl", hash = "sha256:08072fa9995f4a95c647fc6f4f85e2411573d00087bcabdf30f260114338f232", size = 14638, upload-time = "2026-06-11T12:58:31.982Z" },
+]
+
+[[package]]
 name = "grpcio-tools"
 version = "1.81.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1632,8 +1646,10 @@ agent-mcp = [
 base = [
     { name = "aenum" },
     { name = "fastapi" },
+    { name = "googleapis-common-protos" },
     { name = "grpcio" },
     { name = "grpcio-health-checking" },
+    { name = "grpcio-status" },
     { name = "httpx" },
     { name = "kafka-python-ng" },
     { name = "protobuf" },
@@ -1684,8 +1700,10 @@ agent-mcp = [
 base = [
     { name = "aenum", specifier = ">=3.1.16" },
     { name = "fastapi", specifier = ">=0.141.1" },
+    { name = "googleapis-common-protos", specifier = ">=1.75.3" },
     { name = "grpcio", specifier = "==1.81.1" },
     { name = "grpcio-health-checking", specifier = "==1.81.1" },
+    { name = "grpcio-status", specifier = "==1.81.1" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "kafka-python-ng", specifier = ">=2.2.3" },
     { name = "protobuf", specifier = ">=6.33.6" },

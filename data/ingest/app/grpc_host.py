@@ -1,9 +1,9 @@
 """data_ingest's gRPC server: the one place its services are registered, and the host that serves them.
 
 The lifespan (app_depends.make_lifespan) builds the host here and enters it around its yield, so a later
-task adds a service by appending to registered_services() and never edits the lifespan. Only the
-standard health service is served today (ADR tj-8konfu D6.5); the latency arm (tj-3mk3u5.8) and the
-dataset fetch (tj-3mk3u5.9) register into this list.
+task adds a service by appending to registered_services() and never edits the lifespan. The standard
+health service and FetchDataset (tj-3mk3u5.9) are served always, alongside the Kafka RPC server until it is
+unwired (tj-3mk3u5.11); the latency arm (tj-3mk3u5.8) registers into this list only when its harness is on.
 
 A servicer here never imports a broker class (decision tj-j4wknb): it receives the readers create_app
 injected, and calls through the BrokerRead interface. grpc.aio runs every handler on the event loop, so
@@ -14,9 +14,11 @@ never inline (ADR tj-8konfu D2).
 from collections.abc import Mapping
 
 from common.enums.data_stock import DataSource
+from common.rpc.ingest import fetch_dataset_service
 from common.rpc.server import BindAddress, GrpcServerHost, ServiceRegistration
 from data.ingest.app.brokers.interface import BrokerRead
 from routers.common.latency import get_latency_services
+from routers.data_ingest.fetch_dataset_handler import IngestFetchHandler
 
 
 def registered_services(readers: Mapping[DataSource, BrokerRead]) -> list[ServiceRegistration]:
@@ -26,14 +28,14 @@ def registered_services(readers: Mapping[DataSource, BrokerRead]) -> list[Servic
     in common/rpc (generated modules are private to it, ADR tj-8konfu D3).
 
     Args:
-        readers (Mapping[DataSource, BrokerRead]): Handle serving each data source, for the servicers
-            that read through one. None does yet.
+        readers (Mapping[DataSource, BrokerRead]): Handle serving each data source. FetchDataset reads
+            through it via IngestFetchHandler.
 
     Returns:
-        list[ServiceRegistration]: The servicers to attach before the server starts. Empty unless the
-            latency harness is on.
+        list[ServiceRegistration]: The servicers to attach before the server starts: FetchDataset always,
+            plus the latency harness when enabled.
     """
-    return [*get_latency_services()]
+    return [fetch_dataset_service(IngestFetchHandler(readers)), *get_latency_services()]
 
 
 def build_grpc_host(readers: Mapping[DataSource, BrokerRead]) -> GrpcServerHost:

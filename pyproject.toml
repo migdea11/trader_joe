@@ -58,6 +58,20 @@ base = [
     # run `make proto` and commit the regenerated tree.
     "grpcio==1.81.1",
     "grpcio-health-checking==1.81.1",
+    # The rich status on the wire: google.rpc.Status in the grpc-status-details-bin trailer, which
+    # carries ErrorInfo and RetryInfo beside the code (ADR tj-fa1rpu's 2026-09-30 addendum; tj-8konfu
+    # D6.4; AIP-193). common/rpc/errors.py renders and parses it. Pinned exactly and moving with the
+    # two pins above for the same reason grpcio-health-checking does: all three are published from one
+    # grpc release and grpcio-status declares `grpcio>=1.81.1`, so a lone bump would drag grpcio past
+    # the version the generated code was written against.
+    "grpcio-status==1.81.1",
+    # grpcio-status already requires it, but common/rpc/errors.py imports google.rpc.status_pb2 and
+    # google.rpc.error_details_pb2 by name, and this repo declares what its code imports rather than
+    # leaning on a transitive pin (common/tests/test_declared_imports.py, and the sqlalchemy[asyncio]
+    # comment in data-store). Until now it reached the lock only through the security group's
+    # opentelemetry, so no image installed it. A floor and no cap: it ships nothing but generated
+    # protobuf modules, and 1.75.3 is what the resolution already held.
+    "googleapis-common-protos>=1.75.3",
     # Imported by the generated *_pb2.py, which common/rpc loads in both prod images; it moves with the
     # grpc pins above. A floor and no <7 cap: the generated code's runtime check
     # (google/protobuf/runtime_version.py, 6.33.6) refuses a runtime OLDER than the gencode, not a newer
