@@ -198,12 +198,12 @@ jobs:
         make errors-doc
         stale="$(git status --porcelain --untracked-files=all -- docs/errors.md)"
         if [ -n "${stale}" ]; then
-          echo "::error::docs/errors.md does not match what make errors-doc writes from common/errors; run 'make errors-doc' and commit the result"
+          echo "::error::docs/errors.md does not match what make errors-doc writes from server/common/errors; run 'make errors-doc' and commit the result"
           printf '%s\n' "${stale}"
           git --no-pager diff -- docs/errors.md
           exit 1
         fi
-        echo "docs/errors.md matches what make errors-doc writes from common/errors."
+        echo "docs/errors.md matches what make errors-doc writes from server/common/errors."
 
     # THE ONE LINT ENTRY POINT, the same target every agent and developer runs (tj-3mk3u5.54), so the
     # linters have one definition, as the staleness step's protoc does through make proto. PATHS
@@ -350,7 +350,7 @@ jobs:
         # in-process by the build_infra tests (tj-c4mosr.5). The three *_ENV_FILE placeholders
         # are NOT arbitrary: `config` refuses an env_file that does not exist, so they name the
         # root, server/data/store and server/data/ingest env files Build Images already staged
-        # absolute paths the way the generated env file spells them (the step runs at the
+        # above, as absolute paths the way the generated env file spells them (the step runs at the
         # checkout root, so ${PWD} is it). Naming a path is not reading the file. Whoever
         # changes AGENT_STACK_COMPOSE updates this line.
         #

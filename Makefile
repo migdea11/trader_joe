@@ -217,7 +217,7 @@ proto: $(VENV_MARKER)  ## Regenerate gen/proto/python/ from proto/ (commit both;
 # `--check` writes nothing and exits non-zero when the committed file differs, which is what the
 # validator's in-suite twin of the CI step drives; `--path` points either mode at a scratch copy.
 .PHONY: errors-doc
-errors-doc: $(VENV_MARKER)  ## Regenerate docs/errors.md from common/errors (commit it; CI fails on a stale file)
+errors-doc: $(VENV_MARKER)  ## Regenerate docs/errors.md from server/common/errors (commit it; CI fails on a stale file)
 	uv run python -m tools.errors_doc
 
 # Every compose target goes through one of these, and none omits -f. A bare
