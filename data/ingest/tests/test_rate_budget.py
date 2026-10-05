@@ -146,10 +146,27 @@ def test_from_env_reads_the_vendor_specific_names():
     assert not budget.try_acquire(RequestPriority.BACKFILL)
 
 
-def test_update_type_maps_to_priority():
-    assert priority_for_update_type(UpdateType.STREAM) is RequestPriority.LIVE
-    assert priority_for_update_type(UpdateType.DAILY) is RequestPriority.INTERACTIVE
-    assert priority_for_update_type(UpdateType.STATIC) is RequestPriority.BACKFILL
+# The whole table, written out rather than derived from the function under test, with the
+# exhaustiveness check below it. The table and that check moved here from test_read_seam.py on
+# tj-3mk3u5.32: they lived beside the Kafka edge's own priority tests, because that was where every
+# UpdateType was driven end to end, and tj-3mk3u5.11 deletes the edge. Three hand-written
+# assertions stood here before, which pinned the three members that exist and would have let a
+# fourth be added with no priority at all.
+EXPECTED_PRIORITY = {
+    UpdateType.STREAM: RequestPriority.LIVE,
+    UpdateType.DAILY: RequestPriority.INTERACTIVE,
+    UpdateType.STATIC: RequestPriority.BACKFILL,
+}
+
+
+def test_the_expected_priority_table_covers_every_update_type():
+    # Otherwise a new UpdateType would silently fall out of the parametrization below.
+    assert set(EXPECTED_PRIORITY) == set(UpdateType)
+
+
+@pytest.mark.parametrize('update_type', list(EXPECTED_PRIORITY), ids=lambda update_type: update_type.name)
+def test_update_type_maps_to_priority(update_type: UpdateType):
+    assert priority_for_update_type(update_type) is EXPECTED_PRIORITY[update_type]
 
 
 # ---------------------------------------------------------------------------------------------

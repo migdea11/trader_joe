@@ -5,7 +5,6 @@ from fastapi import APIRouter, Depends, FastAPI
 
 from common.endpoints import get_endpoint_url
 from common.environment import get_env_var
-from common.kafka.topics import ConsumerGroup
 from common.logging import get_logger
 from common.rpc.channel import DATA_INGEST_GRPC_TARGET_ENV, create_channel, target_from_env
 from common.rpc.server import ServiceRegistration
@@ -24,24 +23,12 @@ __APP_NAME = None
 __APP_PORT = None
 
 
-def get_latency_topics():
-    """No topics: the harness lost its Kafka arm on tj-3mk3u5.35, once the measurement was recorded.
-
-    A shim, kept importable only so that the two lifespans can keep calling it unchanged. Its call
-    sites go with the Kafka consumers they feed -- data/ingest/app/app_depends.py on tj-3mk3u5.11 and
-    data/store/app/app_depends.py on tj-3mk3u5.12 -- and tj-3mk3u5.13 deletes this function.
-
-    Returns:
-        tuple: Always empty.
-    """
-    return ()
-
-
 def get_latency_services() -> list[ServiceRegistration]:
     """The servicers the latency harness adds to a gRPC server: its gRPC arm, when the harness is on.
 
-    The gRPC counterpart of get_latency_topics(), for data_ingest's one registration point
-    (data/ingest/app/grpc_host.py, registered_services). The server is built before the lifespan calls
+    The harness's one registration point, for data_ingest (data/ingest/app/grpc_host.py,
+    registered_services). It replaces the get_latency_topics() shim that served the Kafka arm, which
+    went with that arm's last caller. The server is built before the lifespan calls
     initialize_latency_server, so the servicer reaches it through that list rather than from here.
 
     Returns:
@@ -73,9 +60,7 @@ def _percentile(ordered: list[float], percentile: int) -> float:
     return ordered[math.ceil(percentile * len(ordered) / 100) - 1]
 
 
-# client_group is unused since the Kafka arm went (tj-3mk3u5.35) and is kept only so that the lifespan
-# calling this keeps working untouched; it goes with that call site on tj-3mk3u5.12.
-def initialize_latency_client(app: FastAPI, app_name: str, app_port: int, client_group: ConsumerGroup):
+def initialize_latency_client(app: FastAPI, app_name: str, app_port: int):
     if not LATENCY_TEST_ENABLED:
         return
 
@@ -186,9 +171,7 @@ def initialize_latency_client(app: FastAPI, app_name: str, app_port: int, client
     app.include_router(router)
 
 
-# server_group is unused since the Kafka arm went (tj-3mk3u5.35), kept for the same reason as
-# initialize_latency_client's client_group above; it goes with its call site on tj-3mk3u5.11.
-def initialize_latency_server(app: FastAPI, app_name: str, app_port: int, server_group: ConsumerGroup):
+def initialize_latency_server(app: FastAPI, app_name: str, app_port: int):
     if not LATENCY_TEST_ENABLED:
         return
 

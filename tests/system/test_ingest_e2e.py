@@ -86,9 +86,12 @@ READ_PATH = AssetDataInterface.GET_ASSET_DATA.format(
 # What a stored bar is compared on: (timestamp, open, high, low, close, volume, trade_count).
 BarTuple = tuple[datetime, float, float, float, float, int, int]
 
-# How long past FakeRead's SLOW_ delay the SLOW test waits before its second read, so the late RPC
-# answer has certainly arrived (and been dropped) by then.
-SLOW_MARGIN_SECONDS = 4.0
+# SLOW_MARGIN_SECONDS IS GONE (tj-xhcoyc). It padded a second read taken after FakeRead's SLOW_
+# delay, to catch a late RPC answer arriving once data_store had already given up on it. There is
+# no giving up to observe any more: the Kafka RPC's 5 s deadline became
+# DEFAULT_FETCH_DEADLINE_S = 300 s under tj-3mk3u5.10, so an 8 s vendor is served rather than
+# abandoned, and the SLOW case now asserts it completes. See that test for what is no longer
+# provable at this tier and where it is pinned instead.
 
 
 def _store_path(symbol: str) -> str:
@@ -247,44 +250,100 @@ def test_gaps_scenario_stores_exactly_the_served_bars(
 def test_fail_scenario_is_not_2xx_and_stores_no_bars(
     own_symbol: str, run_identity, data_store, scenario_entries: Callable[[str], list[UUID]]
 ) -> None:
-    """The entry is upserted before the fetch, so a failed fetch leaves exactly one entry, holding no bars.
+    """A failed fetch leaves NO entry and no bars: the whole POST is one transaction that rolls back.
 
-    The entry count comes first (tj-3mk3u5.53): without it, a POST refused before it ever reached
-    data_ingest -- no entry, not 2xx -- would pass this test with nothing asserted about the fetch.
+    RE-PINNED TO THE RULED ORDER (tj-xhcoyc, item 2). This case used to assert the opposite --
+    "the entry is upserted before the fetch, so a failed fetch leaves exactly one entry" -- and it
+    was CORRECT when d1e363b wrote it. tj-3mk3u5.10 then reversed the order: the store opens the
+    FetchDataset stream FIRST and upserts the entry on the ACK, because only the ack carries the
+    resolved feed, and the entry, every page and the commit live in ONE transaction that commits
+    after FetchDone. A fetch that fails before the ack therefore writes nothing at all. The
+    assertion was never re-pinned because nothing ran this suite between the cutover and
+    tj-3mk3u5.12's gate.
+
+    THE UNIT TIER PINS THE SAME CLAIM and is green:
+    data/store/tests/test_dataset_fetch_transaction.py::test_a_refusal_before_the_ack_writes_
+    nothing_at_all asserts no write statement is sent at all. What THIS tier adds is that the
+    transaction really rolled back in Postgres, which no fake session can show.
+
+    WHAT tj-3mk3u5.53's ORIGINAL POINT BECOMES. The old entry count existed so that a POST refused
+    before it ever reached data_ingest could not pass with nothing asserted about the fetch. Zero
+    entries no longer distinguishes those two cases, so the discrimination moves to the RESPONSE:
+    a refusal that never reached ingest is a 4xx from the edge, while the FAIL scenario is served
+    by data_ingest and comes back 503. Asserting the status rather than merely not-2xx is what
+    keeps this case about the fetch.
     """
     symbol = f'{FAIL_PREFIX}{own_symbol}'
 
     response, ids = _post(data_store, scenario_entries, symbol, _body(run_identity.owner))
 
-    assert not _is_2xx(response), data_store.describe(response)
-    assert len(ids) == 1, f'expected one entry for {symbol}, found {ids}'
-    assert _read(data_store, ids[0]) == [], f'bars stored under {ids[0]} after a failed fetch'
+    assert response.status_code == 503, data_store.describe(response)
+    assert ids == [], f'a fetch that failed before the ack left {len(ids)} entry/entries for {symbol}: {ids}'
 
 
 def test_slow_scenario_is_not_2xx_and_the_late_answer_is_dropped(
     own_symbol: str, run_identity, data_store, scenario_entries: Callable[[str], list[UUID]]
 ) -> None:
-    """SLOW_ outlives data_store's RPC deadline. Read again once FakeRead has answered: still no bars.
+    """A vendor slower than the old deadline but well inside the new one is SERVED, not abandoned.
 
-    The wait assumes the stack runs FakeRead's default delay (FAKE_READ_SLOW_SECONDS unset, as in
-    docker-compose.fake.yaml; data_ingest's banner states the delay in force).
+    THIS CASE NOW ASSERTS THE OPPOSITE OF WHAT IT USED TO, and the reversal is the ruling rather
+    than a concession (tj-xhcoyc, item 2). It was written against data_store's Kafka RPC deadline
+    of 5 s, which is why FakeRead's delay is 8 s -- tests/fakes/market_data.py still says, in the
+    comment on DEFAULT_SLOW_DELAY_SECONDS, "longer than data_store's 5 s Kafka RPC deadline, so
+    SLOW_ outlives the caller by default". tj-3mk3u5.10 replaced that transport, and
+    common/rpc/clients/ingest_fetch.py sets DEFAULT_FETCH_DEADLINE_S to 300 s DELIBERATELY: the
+    5 s deadline "abandoned requests the vendor was still serving", since one rate-limited Alpaca
+    call alone can cost 10 s or more of SDK sleep (tj-6znw1h). An 8 s vendor no longer outlives
+    anything.
+
+    SO THE SCENARIO STILL EARNS ITS PLACE, measuring the thing the new deadline was chosen FOR. A
+    fetch that takes 8 s completes: one entry, every bar, a 200. Had the deadline stayed at 5 s --
+    or were one reintroduced somewhere between the route and the stub -- this reds immediately,
+    which is the regression worth catching now that the number is large.
+
+    WHAT IS NO LONGER PROVABLE HERE, said plainly rather than quietly dropped: that a fetch
+    exceeding the deadline is abandoned and its late answer discarded. Reaching that would need a
+    vendor slower than 300 s, and FakeRead refuses any delay above MAX_SLOW_DELAY_SECONDS (60 s)
+    precisely so no test can sleep that long. The deadline's own behaviour is pinned where it is
+    cheap -- common/tests/rpc/ drives the client directly -- and this tier pins that the deadline
+    is not so tight that honest work is thrown away.
+
+    The elapsed-time assertion is what keeps the case honest: without it a fake that ignored the
+    delay entirely, or a store that answered from somewhere else, would read as success.
     """
     symbol = f'{SLOW_PREFIX}{own_symbol}'
+    expected = _expected(symbol)
     sent = time.monotonic()
 
     response, ids = _post(data_store, scenario_entries, symbol, _body(run_identity.owner))
+    elapsed = time.monotonic() - sent
 
-    assert not _is_2xx(response), data_store.describe(response)
-    assert len(ids) == 1, f'expected one entry for {symbol}, found {ids}'
-    assert _read(data_store, ids[0]) == [], 'bars stored before the slow answer could have arrived'
-    time.sleep(max(0.0, sent + DEFAULT_SLOW_DELAY_SECONDS + SLOW_MARGIN_SECONDS - time.monotonic()))
-    late = _read(data_store, ids[0])
-    assert late == [], f'{len(late)} bars stored from an RPC answer that arrived after the deadline'
+    assert response.status_code == 200, data_store.describe(response)
+    assert elapsed >= DEFAULT_SLOW_DELAY_SECONDS, (
+        f'the POST came back in {elapsed:.1f}s, faster than the {DEFAULT_SLOW_DELAY_SECONDS}s the fake sleeps, '
+        'so this run did not exercise a slow vendor at all'
+    )
+    assert len(ids) == 1, f'a served slow fetch left {len(ids)} entries for {symbol}, not one: {ids}'
+    stored = _stored(data_store, ids[0])
+    assert stored == expected, _diff(stored, expected)
 
 
-def test_failonce_scenario_fails_then_the_identical_post_fills_the_same_entry(
+def test_failonce_scenario_fails_then_the_identical_post_creates_the_entry_and_fills_it(
     own_symbol: str, run_identity, data_store, scenario_entries: Callable[[str], list[UUID]]
 ) -> None:
+    """A failed POST leaves nothing; the identical retry then creates the entry and fills it.
+
+    RE-PINNED TO THE RULED ORDER (tj-xhcoyc, item 2). The old version asserted the failed POST
+    left one entry and the retry resolved to THAT id -- true before tj-3mk3u5.10, when the entry
+    was written before the fetch. Under the ruled order the first POST rolls back entirely, so the
+    retry CREATES the entry rather than filling one.
+
+    THE RETRY CLAIM IS STRONGER AFTER THE CHANGE, NOT WEAKER, which is why this is a re-pin and
+    not a deletion. The old assertion could be satisfied by a store that never cleaned up after a
+    failure; this one requires that a failure leaves the database exactly as it was AND that the
+    identical request then succeeds in full -- one entry, every bar. That is the real idempotency
+    claim a retried POST rests on, and FAILONCE is the only scenario that can make it.
+    """
     symbol = f'{FAILONCE_PREFIX}{own_symbol}'
     body = _body(run_identity.owner)
     expected = _expected(symbol)
@@ -292,15 +351,14 @@ def test_failonce_scenario_fails_then_the_identical_post_fills_the_same_entry(
     first, first_ids = _post(data_store, scenario_entries, symbol, body)
 
     assert not _is_2xx(first), data_store.describe(first)
-    assert len(first_ids) == 1, f'expected one entry for {symbol} after the failed POST, found {first_ids}'
-    assert _read(data_store, first_ids[0]) == [], 'bars stored by the failed first POST'
+    assert first_ids == [], f'the failed first POST left {len(first_ids)} entry/entries for {symbol}: {first_ids}'
 
     second, second_ids = _post(data_store, scenario_entries, symbol, body)
 
     assert second.status_code == 200, data_store.describe(second)
-    assert second_ids == first_ids, f'the retry resolved to {second_ids}, not the first entry {first_ids}'
+    assert len(second_ids) == 1, f'the retry left {len(second_ids)} entries for {symbol}, not one: {second_ids}'
     assert second.json()['data_points'] == len(expected), data_store.describe(second)
-    stored = _stored(data_store, first_ids[0])
+    stored = _stored(data_store, second_ids[0])
     assert stored == expected, _diff(stored, expected)
 
 

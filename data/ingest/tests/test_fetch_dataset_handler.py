@@ -25,9 +25,11 @@ WHAT THIS FILE PINS, and why each one earns its place:
 * A NON-STOCK asset_type IS REFUSED BY THE HANDLER, NOT BY THE READER (tj-msd6qo). Pinned against
   FakeRead, which serves every asset type, with a control in the same test showing that this very
   reader answers that very instrument with bars -- so the refusal provably came from the handler.
-  Pinned against AlpacaRead it would prove nothing, since AlpacaRead refuses it anyway. Its wording is
-  pinned against the Kafka path's own two refusals, called rather than copied, because answering the
-  same as the path being replaced is the ruling's whole justification.
+  Pinned against AlpacaRead it would prove nothing, since AlpacaRead refuses it anyway. Its WORDING
+  was pinned against the Kafka path's own two refusals until tj-3mk3u5.32; that test is retired
+  where it stood, with the reasoning, because tj-3mk3u5.11 removes the path it compared against.
+* THE READER THE REQUEST NAMES IS THE ONE CALLED, with others installed beside it. Every other test
+  here builds the handler with one reader, so dispatch itself needs a case of its own.
 * THE BARS ITERATOR IS CLOSED ON EVERY EXIT PATH (tj-tkm4tn D5), exactly once: exhaustion, a mid-stream
   raise from the adapter, an explicit aclose() after partial consumption, a double aclose(), and a task
   cancelled while the adapter is still awaiting. See the note on the asyncgen hook above those tests for
@@ -63,7 +65,6 @@ from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Feed, Granularity, UpdateType
 from common.errors.vocabulary import ExogenousError, InvalidRequestError, Reason, TraderJoeError
 from common.rpc.mapping.fetch_stream import MAX_PAGE_BARS
-from data.ingest.app import ingest_control
 from data.ingest.app.brokers.interface import Bar as BrokerBar
 from data.ingest.app.brokers.interface import BarsFailure, BarsQuery, BarsResponse, BrokerUnsupportedError, Instrument
 from data.ingest.app.brokers.interface import ServedRange as BrokerServedRange
@@ -612,35 +613,53 @@ async def test_a_non_stock_asset_type_is_refused_even_by_a_reader_that_would_hav
     assert [bar async for bar in served.bars], 'FakeRead served no bars, so the control establishes nothing'
 
 
+# RETIRED ON tj-3mk3u5.32 (architect ruling, relayed with the tj-3mk3u5.11 amendment):
+# test_the_refusal_is_word_for_word_the_one_the_kafka_path_gives_for_the_same_asset_type.
+#
+# It CALLED ingest_control.store_retrieve_crypto/_option rather than copying their messages, so that
+# the two paths drifting apart turned red. That was the right design while two paths existed.
+# tj-3mk3u5.11 deletes the Kafka one, and with it the premise: THE DRIFT THIS GUARDED CANNOT HAPPEN
+# ANY MORE. ADDENDUM 3's rule -- a guard must be able to fail in the state it forbids -- then says
+# retire it rather than weaken it into something that still looks like a guard.
+#
+# INLINING THE TWO (reason, detail) PAIRS WAS CONSIDERED AND REJECTED. It would convert a parity
+# test into a pin on a human-readable sentence, and tj-8feral ruled that `detail` is prose a client
+# never parses. An exact-wording pin reds on a harmless reword and teaches people to edit tests.
+#
+# THE BEHAVIOUR IS NOT LOST, and that was verified rather than assumed before deleting: the crypto
+# and option cases of test_an_unservable_request_is_refused_before_the_ack_and_before_the_vendor_is_called
+# above pin the reason and that no vendor call is made, and
+# test_a_non_stock_asset_type_is_refused_even_by_a_reader_that_would_have_served_it proves the
+# refusal is the handler's rather than the reader's. What goes is only the word-for-word parity.
+#
+# THE PROVENANCE BELONGS IN THE CODE, NOT HERE: one line on the asset_type guard's comment in
+# routers/data_ingest/fetch_dataset_handler.py, recording that the wording was verified against the
+# Kafka path at a named SHA before that path was deleted. That is builder-ingest's to write; a
+# validator editing the file under review would destroy the review.
+
+
 @pytest.mark.asyncio
-async def test_the_refusal_is_word_for_word_the_one_the_kafka_path_gives_for_the_same_asset_type():
-    """Parity with the path this replaces is the ruling's stated justification, so it is pinned, not assumed.
+async def test_the_reader_for_the_requests_source_is_the_one_called_and_the_others_are_not():
+    """Positive dispatch: with several readers installed, the request's source picks exactly one.
 
-    On the Kafka path the refusal lived in METHOD DISPATCH -- get_dataset_request maps asset_type to
-    store_retrieve_crypto or store_retrieve_option, which refuse before any reader is consulted. Those
-    two functions are called here rather than their messages copied, so the day someone reworks one of
-    them this turns red instead of quietly drifting: a caller migrating from Kafka to gRPC must not have
-    to parse two different sentences for the same refusal.
+    NEW ON tj-3mk3u5.32, and it closes a real gap rather than restating a neighbour. Every other
+    test in this file builds the handler with a SINGLE reader, so a handler that ignored the mapping
+    and took next(iter(readers.values())) would pass all of them. The test below it proves there is
+    no FALLBACK when the source is absent; this proves there is no COLLAPSE when it is present.
+
+    The property was pinned until now by test_read_seam.py's
+    test_store_retrieve_stock_dispatches_by_the_request_source, which installed two readers into
+    ingest_control and asserted the same thing. tj-3mk3u5.11 deletes that module, so the pin moves
+    here, onto the constructor injection that replaced install_readers().
     """
-    expected = {}
-    for asset_type, kafka_refusal in (
-        (AssetType.CRYPTO, ingest_control.store_retrieve_crypto),
-        (AssetType.OPTION, ingest_control.store_retrieve_option),
-    ):
-        # Both ignore the argument entirely and raise unconditionally; None documents that it is unread.
-        with pytest.raises(InvalidRequestError) as raised:
-            await kafka_refusal(None)
-        expected[asset_type] = (raised.value.reason, raised.value.detail)
+    alpaca, ib = ScriptedRead([broker_bar(0)]), ScriptedRead([broker_bar(1)])
+    handler = IngestFetchHandler({DataSource.ALPACA_API: alpaca, DataSource.IB_API: ib})
 
-    handler = IngestFetchHandler({DataSource.ALPACA_API: ScriptedRead([broker_bar(0)])})
-    actual = {}
-    for asset_type in (AssetType.CRYPTO, AssetType.OPTION):
-        with pytest.raises(InvalidRequestError) as raised:
-            async for _ in handler.fetch(a_request(asset_type=asset_type), deadline=None):
-                pytest.fail('the fetch yielded an event for an asset type it refuses')
-        actual[asset_type] = (raised.value.reason, raised.value.detail)
+    async for _ in handler.fetch(a_request(source=DataSource.IB_API), deadline=None):
+        pass
 
-    assert actual == expected
+    assert len(ib.queries) == 1, 'the reader the request named was not the one asked'
+    assert alpaca.queries == [], 'a reader for another source was asked for this request'
 
 
 @pytest.mark.asyncio

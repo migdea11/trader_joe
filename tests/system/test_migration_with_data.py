@@ -483,11 +483,79 @@ def expect_e2_entries_only_round_trip(db: ScratchDb, seed: Seed) -> None:
         )
 
 
+def expect_e5_feed_wipes_both_tables(db: ScratchDb, seed: Seed) -> None:
+    """E5: c4a1f7b2e905 DESTROYS DATA BY DESIGN -- upgrade succeeds and empties both tables.
+
+    THE ONE EXPECTATION FOR ALL FOUR SEEDS AT eec8f88a7443, which is itself the claim worth
+    making. E1-E4 differ per seed because eec8f88a7443's outcome DEPENDS on the data it meets --
+    bars present or absent, a collision on one old key or another. This revision does not look at
+    the data at all: it DELETEs every bar and every entry, adds feed NOT NULL, and rebuilds the
+    identity constraint around eleven columns. A collision-bearing seed and a collision-free seed
+    are therefore indistinguishable to it, and binding the same function to all four says so --
+    if any seed ever produced a different outcome here, that would be the defect.
+
+    WHY A WIPE RATHER THAN A BACKFILL (user ruling, tj-3mk3u5.22 Q6, carried onto tj-3mk3u5.31):
+    there was no dataset data worth preserving at this stage. The recommended alternative --
+    derive each entry's feed from its own bars, give a bar-less entry iex, assert no entry holds
+    two tapes -- was considered and SUPERSEDED. So "lossless" is the wrong generic rule for this
+    revision, which is exactly why it carries the additive-exception marker and lands here.
+
+    THE DELETES ARE WHAT MAKE THE COLUMN LEGAL, and that is the half only a real Postgres can
+    show. ADD COLUMN feed ... NOT NULL with no server default is refused outright by a table that
+    holds rows, so on a seeded database this revision either empties both tables first or fails at
+    that statement. The unit tier (data/store/tests/test_head_revision_shape.py) asserts the op
+    ORDER against a recording stand-in; this asserts the database accepted the result.
+
+    DOWNGRADE IS ASSERTED TOO, AND IT SUCCEEDS ONLY BECAUSE THE TABLES ARE EMPTY. The revision's
+    own docstring warns that recreating the ten-column constraint FAILS when two entries differ
+    only by feed, which is routine once the application has run. After the upgrade's wipe there
+    are no rows to collide, so the schema round-trips cleanly -- and the rows do NOT come back,
+    which is the substance of the one-way door and is asserted rather than described.
+    """
+    assert seed.revision == 'eec8f88a7443', f'E5 is written for seeds at eec8f88a7443; got {seed.name}'
+    target = _child(seed.revision)
+    before = db.row_counts()
+    entry_columns_before = set(db.columns(ENTRY_TABLE))
+
+    db.must('upgrade', target)
+
+    # The wipe, stated as both halves: the seed HAD rows (or the emptiness proves nothing), and
+    # every one of them is gone.
+    assert sum(before.values()) > 0, f'E5 needs a seed with rows; {seed.name} loaded empty'
+    assert db.row_counts() == {ENTRY_TABLE: 0, BAR_TABLE: 0}, (
+        f'the feed revision left rows behind: {db.row_counts()} (seed {seed.name} had {before})'
+    )
+
+    entry_columns_after = set(db.columns(ENTRY_TABLE))
+    assert entry_columns_after - entry_columns_before == {'feed'}, (
+        f'the entry gained {sorted(entry_columns_after - entry_columns_before)} rather than exactly feed'
+    )
+    # Neither created nor dropped by this revision -- eec8f88a7443 owns it for the bar's column
+    # and the entry's new column reuses it, so it must simply still be here.
+    assert db.enum_exists('feed'), 'the feed enum type is missing after the upgrade'
+
+    db.must('downgrade', seed.revision)
+
+    assert set(db.columns(ENTRY_TABLE)) == entry_columns_before, (
+        'the downgrade did not restore the entry columns the seed revision had'
+    )
+    assert db.row_counts() == {ENTRY_TABLE: 0, BAR_TABLE: 0}, (
+        'the downgrade restored rows, which it cannot do -- the upgrade deleted them and nothing stages them'
+    )
+
+
 EXPECTATIONS: dict[str, dict[str, Callable[[ScratchDb, Seed], None]]] = {
     'eec8f88a7443': {
         '8f41c2d7a3b9': expect_e1_bars_refuse,
         '8f41c2d7a3b9.entries-only': expect_e2_entries_only_round_trip,
-    }
+    },
+    # E5. Every seed AT eec8f88a7443 maps to one function on purpose; see its docstring.
+    'c4a1f7b2e905': {
+        'eec8f88a7443': expect_e5_feed_wipes_both_tables,
+        'eec8f88a7443.collision-free': expect_e5_feed_wipes_both_tables,
+        'eec8f88a7443.collision-bars': expect_e5_feed_wipes_both_tables,
+        'eec8f88a7443.collision-entries': expect_e5_feed_wipes_both_tables,
+    },
 }
 
 
@@ -657,3 +725,52 @@ def test_the_scratch_database_is_the_one_migrated(scratch: ScratchDb) -> None:
     run = scratch.alembic('current')
     assert run.returncode == 0, run.output
     assert head in run.output, f'alembic current did not report {head}:\n{run.output}'
+
+
+def test_alembic_check_is_clean_at_head(scratch: ScratchDb) -> None:
+    """MIG-1's measurement: at head, the models and the migrated schema have NO drift between them.
+
+    IT CARRIED A STRICT xfail UNTIL tj-o3af47, AND THAT IS THE EVIDENCE IT WORKS. MIG-1
+    (tj-3mk3u5.38) wired the out-of-model exclusion so this could be clean; its builder could not
+    run it, because the only sanctioned route was a throwaway under tests/system and a validator
+    was live in that tree. Run here for the first time, it reported one real drift -- a redundant
+    unique=True on the entry's primary key, a model defect rather than a migration one, invisible
+    to every other test in the repo. tj-o3af47 dropped that unique=True and removed the marker in
+    the same commit, which is why this now asserts rather than expects a failure.
+
+    WHAT THIS CATCHES THAT NOTHING ELSE DOES. `alembic current` reports the version table and
+    nothing about the shape of the database -- tj-5h30md is the case in point: head was
+    eec8f88a7443, uq_stock_market_activity_natural_key was simply missing, and `current` showed
+    nothing wrong. Every model-against-revision test in the repo compares two things people
+    WROTE; this compares what the migrations BUILD against what the models DECLARE, which is the
+    only check that notices a revision that forgot something.
+
+    ON A SCRATCH DATABASE, NOT THE STACK'S. The suite's standing exception (tj-vhboky.62) is
+    narrow: a test here migrates only a database it creates and drops itself. Running `check`
+    against the stack's own database would need no migration and so look harmless, but it would
+    read a database other tests are concurrently writing, and its answer would depend on whoever
+    migrated it last. A scratch database upgraded to head here answers the same question
+    hermetically and is the honest form of the measurement.
+
+    IT IS LOAD-BEARING FOR tj-3mk3u5.38's EXCLUSION. env.py's include_object hides exactly one
+    out-of-model table, stock_market_activity_superseded_8f41c2d7a3b9, which 8f41c2d7a3b9 creates
+    and no model declares. Without the exclusion this test fails on every correctly migrated
+    database, with the exclusion it passes -- so a green result here is also the evidence that
+    the exclusion is doing its job and is not, say, swallowing a real drop.
+
+    tj-3mk3u5.39 (MIG-V) owns this measurement formally; it is taken here because the machinery
+    to take it already exists in this file and a number now is worth more than one deferred.
+    """
+    head = next(rev.revision for rev in GRAPH.values() if rev.next_revision is None)
+    scratch.must('upgrade', head)
+
+    run = scratch.alembic('check')
+
+    assert run.returncode == 0, (
+        'alembic check reports drift between the models and a database migrated to head. Either a '
+        'revision does not build what the models declare, or a table outside the models needs '
+        f'adding to OUT_OF_MODEL_TABLES in data/store/migrations/env.py:\n{run.output[-4000:]}'
+    )
+    assert 'No new upgrade operations detected' in run.output, (
+        f'alembic check exited 0 without reporting a clean comparison, so it may not have run:\n{run.output[-4000:]}'
+    )

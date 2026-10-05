@@ -1,6 +1,6 @@
 # Market data ingest
 
-Broker-facing ingest service. Fetches market data from Alpaca and answers data-store's Kafka RPC request; a request may also be a feed subscription that this service streams to Kafka. Stock only today — crypto and option paths are stubs.
+Broker-facing ingest service. Fetches market data from Alpaca and answers data-store's `FetchDataset` gRPC request. Stock only today — crypto and option paths are stubs.
 
 ## Architecture reference
 
@@ -8,11 +8,11 @@ Broker-facing ingest service. Fetches market data from Alpaca and answers data-s
 
 ## Tech stack
 
-Python 3.12, FastAPI, alpaca-py, Kafka RPC server, grpc.aio server (health service only so far)
+Python 3.12, FastAPI, alpaca-py, grpc.aio server (health service and `FetchDataset`)
 
 ## Key invariants
 
-Broker-facing layer only; data-store owns the data. Blocking SDK calls go through the shared worker pool, never inline in an async handler. `BrokerRead.get_bars` returns a `BarsResponse` (served, possibly empty, with its `served_range`) or a `BarsFailure` and raises only for a bug; the Kafka edge (`ingest_control`) is the one place a failure becomes a bare `{}`, until tj-3mk3u5.11 removes it.
+Broker-facing layer only; data-store owns the data. Blocking SDK calls go through the shared worker pool, never inline in an async handler. `BrokerRead.get_bars` returns a `BarsResponse` (served, possibly empty, with its `served_range`) or a `BarsFailure` and raises only for a bug; tj-3mk3u5.11 deleted the Kafka edge that turned a failure into a bare `{}`, so every typed failure now reaches the gRPC servicer and is rendered there — no sentinel survives.
 
 ## Environment variables
 

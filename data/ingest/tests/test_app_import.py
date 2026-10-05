@@ -13,17 +13,25 @@ from common.tests.image_path import image_pythonpath
 # a fresh interpreter at startup, so that is what this reproduces.
 #
 # To mirror this for another service, copy the file into that service's tests and change
-# APP_MODULE, RPC_MODULE and EXPECTED_RPC_SERVERS -- nothing else. The server count is
-# per-service: data_ingest registers its RPC server at module scope, data_store registers
-# inside a function, so data_store's count is 0.
+# APP_MODULE and ROUTER_MODULE -- nothing else.
 REPO_ROOT = Path(__file__).resolve().parents[3]
 APP_MODULE = 'data.ingest.app.main'
-RPC_MODULE = 'routers.data_ingest.get_dataset_request'
-EXPECTED_RPC_SERVERS = 1
+# Imported by name as well as through the app, so an import-time break in the router survives
+# main.py one day not mounting it. It is routers/data_ingest's only module with a module body worth
+# running: until tj-3mk3u5.11 it built a KafkaRpcFactory and decorated store_data at import, and
+# the probe counted the registrations that produced. Both are gone -- see the retirement note on
+# the probe below -- and what is left is an empty APIRouter that must still import cleanly.
+ROUTER_MODULE = 'routers.data_ingest.get_dataset_request'
 
-# Every prefix that carries a broker credential or a Kafka connection setting. BROKER_* is the
-# Kafka one -- common.kafka.kafka_config reads BROKER_NAME/BROKER_PORT/BROKER_CONN_TIMEOUT at
-# import time, and BROKER_PORT is cast to int, which is the exact read that used to explode.
+# Every prefix that carries a broker credential or a connection setting, used ONLY as a negative:
+# the probe refuses to run if the environment it was handed still has any of them set.
+#
+# BROKER_* and KAFKA_* STAY, with Kafka unwired (tj-3mk3u5.11). They named the read that used to
+# explode -- common.kafka.kafka_config cast BROKER_PORT to int at import -- and that module is no
+# longer in this app's closure, so the justification is gone but the prefixes are not. They cost
+# nothing and they keep the scan honest if one ever comes back, which is exactly why ALPACA_ is in
+# data_store's copy of this file, matching nothing there. A prefix this service DOES read, omitted,
+# is what would make the assertions below vacuous; a prefix it does not read cannot.
 CREDENTIAL_PREFIXES = ('ALPACA_', 'BROKER_', 'KAFKA_')
 
 # Runs in a subprocess, so it may only assume the standard library and the installed packages.
@@ -35,28 +43,26 @@ import sys
 
 PREFIXES = {prefixes!r}
 APP_MODULE = {app_module!r}
-RPC_MODULE = {rpc_module!r}
+ROUTER_MODULE = {router_module!r}
 
 leaked = sorted(name for name in os.environ if name.startswith(PREFIXES))
 if leaked:
     raise SystemExit('environment was not stripped, still set: ' + ', '.join(leaked))
 print('stripped-ok')
 
-if APP_MODULE in sys.modules or RPC_MODULE in sys.modules:
+if APP_MODULE in sys.modules or ROUTER_MODULE in sys.modules:
     raise SystemExit('module was already imported, so this proves nothing about import time')
 
 import importlib
 
 app_module = importlib.import_module(APP_MODULE)
-rpc_module = importlib.import_module(RPC_MODULE)
+importlib.import_module(ROUTER_MODULE)
 print('imported-ok')
 
 from fastapi import FastAPI
 
 if not isinstance(app_module.app, FastAPI):
     raise SystemExit('app is a ' + type(app_module.app).__name__ + ', not a FastAPI instance')
-
-print('rpc-servers=' + str(len(rpc_module.rpc._rpc_servers)))
 """
 
 
@@ -84,7 +90,7 @@ def import_probe() -> subprocess.CompletedProcess:
     actually lived, so an in-process reload would pass while the bug was present. Module-scoped
     so the whole file costs one fork.
     """
-    program = IMPORT_PROBE.format(prefixes=CREDENTIAL_PREFIXES, app_module=APP_MODULE, rpc_module=RPC_MODULE)
+    program = IMPORT_PROBE.format(prefixes=CREDENTIAL_PREFIXES, app_module=APP_MODULE, router_module=ROUTER_MODULE)
     return subprocess.run(
         [sys.executable, '-c', program],
         cwd=REPO_ROOT,
@@ -113,8 +119,27 @@ def test_no_credential_is_handed_to_the_probe_whatever_this_session_inherited():
     assert not [name for name in probe_env() if name.startswith(CREDENTIAL_PREFIXES)]
 
 
-def test_the_rpc_server_registers_while_the_module_body_runs(import_probe):
-    # routers/data_ingest/get_dataset_request.py decorates store_data at module scope. If that
-    # line stops running, the service starts and answers nothing -- so the count, not just the
-    # absence of an exception, is what this file is guarding.
-    assert f'rpc-servers={EXPECTED_RPC_SERVERS}' in import_probe.stdout
+# RETIRED ON tj-3mk3u5.11: test_the_rpc_server_registers_while_the_module_body_runs, and the
+# EXPECTED_RPC_SERVERS constant and `rpc-servers=` probe line it read.
+#
+# It asserted that get_dataset_request.py's module body had really decorated store_data with
+# @rpc.add_server(...), because a decorator that silently stopped running left a service that
+# starts and answers nothing -- the count, not merely the absence of an exception, was the guard.
+# tj-3mk3u5.11 deletes the factory, the decorator and store_data, so there is no registration left
+# to count and the probe line raised AttributeError instead of asserting anything.
+#
+# THE INVARIANT IT STOOD FOR DID NOT GO, IT MOVED, and it is pinned twice over. data_ingest's real
+# surface is the gRPC IngestService: test_grpc_host.py asserts in a fresh interpreter that
+# registered_services() returns exactly that service, which is the same claim -- the surface equals
+# a committed expectation, and a registration that stopped happening reds. The HTTP side is held by
+# the `none` declaration in routers/tests/interface_manifest/data_ingest.manifest, which still reds
+# if a route appears (decision tj-3wgh03 D4: each surface is pinned where it lives).
+#
+# THIS FILE'S OWN GUARD IS UNTOUCHED and is why it is not deleted: a module-scope dependency that
+# makes `import data.ingest.app.main` raise is still caught above, in a fresh interpreter, with the
+# credentials stripped. That is what it was written for (tj-8yix3i) and it has caught two real
+# regressions.
+#
+# FOUND BY tj-3mk3u5.11's OWN TEST RUN, not by the retirement pass that should have caught it:
+# tj-3mk3u5.32 retired every other Kafka-transport assertion ahead of this commit and missed this
+# file. One file, found by the next commit, which is when it should be found.

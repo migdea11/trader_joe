@@ -30,7 +30,10 @@ THE HANDLERS (D1(c): one set per app):
                             same id, and never to the wire (D8).
 
 WHY HERE AND NOT IN common/: like instance_secret.py, this is an HTTP transport concern. common/errors stays
-standard-library only and knows no protocol; the gRPC renderer in common/rpc is the other reader of it.
+standard-library only and knows no protocol; the gRPC renderer in common/rpc is the other reader of it. What
+is NOT a transport concern lives there and is called from here: own_error_id and has_cause_chain ask nothing
+about HTTP, and both edges must answer them identically or the same failure is named by two different ids in
+the two services' logs (tj-zxqn4r).
 """
 
 import http
@@ -54,7 +57,9 @@ from common.errors.vocabulary import (
     InvalidRequestError,
     Reason,
     TraderJoeError,
+    has_cause_chain,
     new_error_id,
+    own_error_id,
 )
 from common.logging import get_logger
 
@@ -182,26 +187,6 @@ def _respond(problem: ProblemDetails, headers: Mapping[str, str] | None = None) 
     )
 
 
-def _own_error_id(error: TraderJoeError) -> str | None:
-    # The error_id the error already carries, as one line of text for the log, or None when it carries none. Set
-    # by a raise site that logged its cause chain under it, or kept from a peer's answer. A value that names
-    # nothing is no id: '', an empty sequence, or a sequence of nothing but '' (TE-1 accepts all three). This is
-    # the edge's ONE test of 'has its own id': the body, the line and the chain decision all ask it 'is None', so
-    # the id sent and the id named are always the same, and the chain is logged exactly when the edge minted.
-    own = error.metadata.get(_ERROR_ID_KEY)
-    if isinstance(own, str):
-        return own or None
-    if own is None or not any(own):
-        return None
-    return ', '.join(own)
-
-
-def _has_cause_chain(error: BaseException) -> bool:
-    # 'raise ... from e' sets __cause__. A raise inside an except block sets __context__, unless 'from None'
-    # suppressed it.
-    return error.__cause__ is not None or (error.__context__ is not None and not error.__suppress_context__)
-
-
 def _describe(
     error: TraderJoeError, error_id: str | None = None, errors: list[ValidationIssue] | None = None
 ) -> tuple[ProblemDetails, dict[str, str]]:
@@ -213,7 +198,7 @@ def _describe(
     if retry_after is not None:
         headers['Retry-After'] = str(retry_after)
     metadata = dict(error.metadata)
-    if _own_error_id(error) is None:
+    if own_error_id(error) is None:
         metadata[_ERROR_ID_KEY] = error_id or new_error_id()
     problem = ProblemDetails(
         title=_status_phrase(status),
@@ -257,14 +242,14 @@ def _answer(request: Request, error: TraderJoeError, errors: list[ValidationIssu
     # D8 at the edge: the error's own id, else one minted here, on the wire and in the one log line. The line carries
     # the cause chain only under an id minted here. An error that arrived with an id was logged, chain and all, by
     # whoever set it, so logging the chain again would only repeat it.
-    own_id = _own_error_id(error)
+    own_id = own_error_id(error)
     error_id = new_error_id() if own_id is None else own_id
     response = _respond(*_describe(error, error_id, errors=errors))
     log.log(
         _LOG_LEVELS[REASONS[error.reason].disposition],
         f'{request.method} {request.url.path} -> {response.status_code} {error.reason}: {error.detail}; '
         f'error_id {error_id}',
-        exc_info=error if own_id is None and _has_cause_chain(error) else None,
+        exc_info=error if own_id is None and has_cause_chain(error) else None,
     )
     return response
 

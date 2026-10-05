@@ -33,6 +33,7 @@ import subprocess
 import sys
 import tomllib
 from collections.abc import Iterator
+from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta, timezone
 from importlib.metadata import packages_distributions
 from itertools import pairwise
@@ -48,7 +49,7 @@ from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from common.errors.vocabulary import REASONS, ExogenousError, InvalidRequestError, Outcome, Reason, TraderJoeError
 from common.tests.image_path import image_pythonpath
-from data.ingest.app import app_depends, ingest_control
+from data.ingest.app import app_depends, grpc_host
 from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
 from data.ingest.app.brokers.interface import (
     Bar,
@@ -62,7 +63,7 @@ from data.ingest.app.brokers.interface import (
 )
 from data.ingest.app.brokers.rate_budget import RequestPriority
 from data.ingest.tests.grpc_bind import LoopbackGrpc
-from routers.data_ingest import get_dataset_request
+from data.ingest.tests.kafka_wiring import stub_kafka_startup
 from schemas.data_ingest.get_dataset_request import StockDatasetRequest
 from tests.fakes.market_data import (
     DEFAULT_SLOW_DELAY_SECONDS,
@@ -738,33 +739,20 @@ def stock_request(symbol: str) -> StockDatasetRequest:
     )
 
 
-@pytest.fixture
-def fake_installed() -> Iterator[FakeRead]:
-    """Install a FakeRead in the ALPACA_API slot of ingest_control, and clear it afterwards."""
-    reader = FakeRead()
-    ingest_control.install_readers({DataSource.ALPACA_API: reader})
-    yield reader
-    ingest_control.clear_readers()
-
-
-@pytest.mark.asyncio
-async def test_ingest_control_stores_the_fake_bars_under_the_fake_feed(fake_installed: FakeRead):
-    batch = await ingest_control.store_retrieve_stock(stock_request('VFV'))
-
-    assert batch.feed is Feed.IEX
-    assert [created.data.close for created in batch.dataset[DataType.MARKET_ACTIVITY]] == [
-        fake_bar('VFV', timestamp).close for timestamp in hours(ON_GRID, 4)
-    ]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize('prefix', [FAIL_PREFIX, RATELIMIT_PREFIX])
-async def test_ingest_control_turns_a_failure_into_the_bare_empty_answer_as_for_the_real_reader(
-    fake_installed: FakeRead, prefix: str
-):
-    # tj-fe19tu, kept at the Kafka RPC edge until tj-3mk3u5.11 removes it: a BarsFailure is a bare {},
-    # never a batch.
-    assert await ingest_control.store_retrieve_stock(stock_request(f'{prefix}VFV')) == {}
+# RETIRED ON tj-3mk3u5.32, with the fake_installed fixture they shared:
+# test_ingest_control_stores_the_fake_bars_under_the_fake_feed and
+# test_ingest_control_turns_a_failure_into_the_bare_empty_answer_as_for_the_real_reader.
+#
+# Both drove ingest_control.store_retrieve_stock, which tj-3mk3u5.11 deletes along with the
+# install_readers slot the fixture filled. The second was explicit that it was pinning the Kafka RPC
+# edge's bare {} "until tj-3mk3u5.11 removes it", and that behaviour has no successor by design --
+# PR 2's typed errors replaced the swallow.
+#
+# The first says something that does survive, and it is already pinned where it belongs: that
+# FakeRead serves the bars and the feed it claims to. test_broker_read_contract.py runs FakeRead
+# through the same contract suite as every other reader, and the tests above in this file pin its
+# grid, its prefixes and its delays directly. What went with the edge is only the BATCH's view of
+# them.
 
 
 # ---------------------------------------------------------------------------------------------
@@ -848,39 +836,48 @@ def test_the_launcher_takes_the_slow_delay_from_its_environment_variable():
 
 
 @pytest.mark.asyncio
-async def test_the_launcher_apps_lifespan_installs_a_fake_read_for_alpaca_and_clears_it(monkeypatch):
-    # Kafka is the only thing stubbed: the wait for a broker, the RPC servers' consumers and the
-    # latency server. The lifespan itself, create_app and ingest_control are production's, and so is
-    # the gRPC host it starts, bound to loopback here as the overlay binds it to the compose alias.
-    installed: list[dict[DataSource, Any]] = []
-    real_install = ingest_control.install_readers
+async def test_the_launcher_apps_lifespan_serves_alpaca_through_its_fake_read(monkeypatch, tmp_path):
+    """Fake mode's composition root: the launcher's app hands ITS FakeRead to what serves requests.
 
-    def recording_install(readers):
-        installed.append(dict(readers))
-        real_install(readers)
+    Only what cannot run here is stubbed -- the latency server, the debugger, and whatever of the
+    Kafka startup still exists (kafka_wiring.stub_kafka_startup, transitional, tj-iwiq23). The
+    lifespan itself, create_app and the registration are production's, and so is the gRPC host it
+    starts, bound to loopback here as the overlay binds it to the compose alias.
 
-    monkeypatch.setattr(app_depends, 'initialize_latency_server', Mock())
-    monkeypatch.setattr(app_depends, 'init_debugger', Mock())
-    monkeypatch.setattr(app_depends.KafkaConsumerFactory, 'wait_for_kafka', Mock())
-    monkeypatch.setattr(get_dataset_request.rpc, 'init_servers', Mock())
-    monkeypatch.setattr(ingest_control, 'install_readers', recording_install)
-    launcher = importlib.import_module(LAUNCHER_MODULE)
-    assert isinstance(launcher.app, FastAPI)
+    RE-POINTED ON tj-3mk3u5.32, from the reader registry to the registration. It used to wrap
+    ingest_control.install_readers and then prove dispatch really went through the installed fake by
+    fetching a batch, and prove teardown by fetching again and expecting NotImplementedError.
+    tj-3mk3u5.11 deletes install_readers, clear_readers and store_retrieve_stock together: the
+    handler is CONSTRUCTED with its readers, so there is no install step to observe and no cleared
+    state to catch. What matters, and is what this asserts, is that the mapping reaching the
+    registration is the launcher's own fake and nothing else -- fake mode serving a real AlpacaRead
+    is the failure this guards, and it would be a live broker call in a test deployment.
 
-    async with LoopbackGrpc(), launcher.app.router.lifespan_context(launcher.app):
-        batch = await ingest_control.store_retrieve_stock(stock_request('VFV'))
+    The fake's own bars and feed are not re-asserted through the lifespan: they are pinned directly
+    above and through test_broker_read_contract.py, and routing them through a lifespan only to read
+    them back proves the fake twice and the wiring once.
+    """
+    handed: list[dict[DataSource, Any]] = []
+    real_registered_services = grpc_host.registered_services
 
-    assert [set(readers) for readers in installed] == [{DataSource.ALPACA_API}]
-    assert installed[0][DataSource.ALPACA_API] is launcher.reader
-    assert isinstance(launcher.reader, FakeRead)
-    # Dispatch really went through the installed fake: its bars, its feed.
-    assert batch.feed is Feed.IEX
-    assert [created.data.close for created in batch.dataset[DataType.MARKET_ACTIVITY]] == [
-        fake_bar('VFV', timestamp).close for timestamp in hours(ON_GRID, 4)
-    ]
-    # And teardown cleared it.
-    with pytest.raises(NotImplementedError):
-        await ingest_control.store_retrieve_stock(stock_request('VFV'))
+    def recording_registration(readers):
+        handed.append(dict(readers))
+        return real_registered_services(readers)
+
+    with ExitStack() as stubs:
+        stub_kafka_startup(stubs)
+        monkeypatch.setattr(app_depends, 'initialize_latency_server', Mock())
+        monkeypatch.setattr(app_depends, 'init_debugger', Mock())
+        monkeypatch.setattr(grpc_host, 'registered_services', recording_registration)
+        launcher = importlib.import_module(LAUNCHER_MODULE)
+        assert isinstance(launcher.app, FastAPI)
+
+        async with LoopbackGrpc(), launcher.app.router.lifespan_context(launcher.app):
+            pass
+
+    assert [set(readers) for readers in handed] == [{DataSource.ALPACA_API}]
+    assert handed[0][DataSource.ALPACA_API] is launcher.reader
+    assert isinstance(launcher.reader, FakeRead), 'fake mode wired something other than its fake reader'
 
 
 # ---------------------------------------------------------------------------------------------
@@ -891,9 +888,14 @@ async def test_the_launcher_apps_lifespan_installs_a_fake_read_for_alpaca_and_cl
 # image installs (Dockerfile: uv sync --only-group base --only-group data-ingest). The test below
 # ties every name back to a distribution those groups declare, so this list cannot drift into the
 # testing group.
-PRODUCTION_THIRD_PARTY = frozenset(
-    {'aenum', 'alpaca', 'dotenv', 'fastapi', 'httpx', 'kafka', 'pydantic', 'starlette', 'uvicorn'}
-)
+#
+# 'aenum' and 'kafka' came out on tj-3mk3u5.32, ahead of the distributions themselves: tj-3mk3u5.14
+# drops aenum from pyproject.toml and tj-3mk3u5.15 drops kafka-python-ng, and a name left here whose
+# distribution is no longer declared reds the test below. Removing them early costs nothing, because
+# this is a WHITELIST of what tests/fakes may import and nothing under tests/fakes imports either --
+# checked, not assumed. The only effect today is that a fake which started importing one of them
+# would now be refused, which is the answer this list should already have been giving.
+PRODUCTION_THIRD_PARTY = frozenset({'alpaca', 'dotenv', 'fastapi', 'httpx', 'pydantic', 'starlette', 'uvicorn'})
 PRODUCTION_GROUPS = ('base', 'data-ingest')
 
 # First-party code the data_ingest image contains (Dockerfile: COPY common, routers, schemas and

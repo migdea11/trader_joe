@@ -27,8 +27,8 @@ kind | address | file | symbol | request | response | touches
 
 | Field | Meaning |
 |---|---|
-| `kind` | `http`, `rpc` or `unbound-path` — see below |
-| `address` | `METHOD /path` for `http`, the Kafka RPC topic for `rpc`, the declared path for `unbound-path` |
+| `kind` | `http`, `unbound-path` or `none` — see below |
+| `address` | `METHOD /path` for `http`, the declared path for `unbound-path`, `-` for `none` |
 | `file` | Repository-relative path of the module whose body defines the endpoint or handler |
 | `symbol` | The endpoint or handler function, or `EnumClass.MEMBER` for a declared path |
 | `request` | Every parameter annotated with a Pydantic model, fully qualified, sorted |
@@ -40,24 +40,39 @@ kind | address | file | symbol | request | response | touches
 `request` and `touches` are split on "is it a Pydantic model", because in this repository every
 cross-boundary schema is one and everything else is injected plumbing. That makes `touches` the
 "what it touches" field of ADR tj-fdb9gz — `AsyncSession` says the route reaches Postgres,
-`KafkaRpcFactory.RpcClients` says it reaches Kafka — and it is what decides the tier of the test
+an `IngestFetchClient` says it reaches data_ingest — and it is what decides the tier of the test
 each interface eventually gets. An untyped body lands in `touches` as `dict`, which is the honest
 answer: there is no schema to name.
 
 ## The three kinds
 
 - **`http`** — a FastAPI route registered on a module-scope `APIRouter` while the module body ran.
-- **`rpc`** — a handler registered through `KafkaRpcFactory.add_server()` while the module body ran.
-  Enumerating one is proof the registration actually happened at import; if it stops happening, the
-  service starts and answers nothing.
 - **`unbound-path`** — a path declared in an interface enum that no import-time route serves.
+- **`none`** — the component exposes nothing this manifest can enumerate, said out loud.
+
+There was a fourth, **`rpc`** — a handler registered through `KafkaRpcFactory.add_server()` while the
+module body ran. `data_ingest.manifest` held the only line that ever used it, and tj-3mk3u5.11 deletes
+the handler, so the kind went with its enumerator on tj-3mk3u5.32 rather than being kept for a
+transport with no registrations left.
+
+`none` is decision tj-3wgh03, and it exists because the loader could not tell two very different files
+apart: one **accidentally** empty, which asserts nothing, and one that **declares** it has nothing to
+enumerate, which asserts a great deal. A single `none | - | - | - | - | - | -` line is that
+declaration. It may not sit beside a real line, and an HTTP route added to the component later still
+turns the test red.
+
+`data_ingest.manifest` is the one that uses it. Do not read it as "data_ingest has no interface": its
+interface is the gRPC `IngestService`, which lives outside `routers/` by ADR tj-8konfu D3 and decision
+tj-tkm4tn D1, and is pinned where it lives by `data/ingest/tests/test_grpc_host.py`. Each surface is
+pinned where it lives (tj-3wgh03 D4); a `routers/`-scoped enumerator reaching into `common/` and
+`data/` to find it would blur the boundary those decisions exist to hold.
 
 `unbound-path` exists because the import-time surface is not the whole declared surface, and the gap
 was invisible before this manifest. Two sit here today, and they are the latency pair:
 `routers/common/latency.py` builds its `APIRouter` *inside*
 `initialize_latency_client()`/`initialize_latency_server()`, so `/latency/{latency_type}` and
-`/latency_internal` appear only when `LATENCY_TEST_ENABLED` is set and a live Kafka factory is
-available — which a test that touches nothing external may not do. Both paths are real and served by
+`/latency_internal` appear only when `LATENCY_TEST_ENABLED` is set and those functions are called —
+which a test that touches nothing external may not do. Both paths are real and served by
 committed code; they are simply not enumerable at import. That is the kind doing the job it was
 invented for.
 

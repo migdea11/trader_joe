@@ -308,8 +308,11 @@ KNOWN_NON_MODELS: frozenset[str] = frozenset()
 # and said so, reasoning from schemas/inbound_contract.py's own words -- "Response and read models
 # do not need it -- they are what we send, and we are already the authority on their shape" -- and
 # the bead explicitly delegated the choice ("Whether they inherit InboundContract ... or a plain
-# BaseModel is your call"). That is a defensible reading, and schemas.common.latency.LatencyResponse
-# is the same shape, so this is not an oversight.
+# BaseModel is your call"). That is a defensible reading, and it had a precedent in
+# schemas.common.latency.LatencyResponse, which was the same shape -- a response model on a plain
+# BaseModel. THE PRECEDENT IS GONE RATHER THAN REVERSED: tj-3mk3u5.13 deleted LatencyResponse as
+# dead code, it having had no production caller, so the citation is kept as history and must not be
+# followed. The reasoning above stands on inbound_contract.py's own words, not on that class.
 #
 # WHAT IT COSTS, measured rather than asserted: StoreAssetDatasetResponse(**payload,
 # a_field_no_contract_declares=1) constructs and drops the key silently. TE-6 (tj-3mk3u5.37.8)

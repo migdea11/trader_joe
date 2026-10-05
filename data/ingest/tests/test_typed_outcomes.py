@@ -54,7 +54,7 @@ from fastapi.testclient import TestClient
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Feed, Granularity
 from common.errors.vocabulary import REASONS, ExogenousError, InvalidRequestError, Outcome, Reason, TraderJoeError
-from data.ingest.app import ingest_control, main
+from data.ingest.app import main
 from data.ingest.app.brokers import rate_budget as rate_budget_module
 from data.ingest.app.brokers.alpaca import broker_api
 from data.ingest.app.brokers.alpaca.read import AlpacaRead
@@ -592,17 +592,19 @@ def test_broker_read_get_bars_returns_the_typed_result():
 # ---------------------------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize('stub', [ingest_control.store_retrieve_crypto, ingest_control.store_retrieve_option])
-async def test_the_crypto_and_option_stubs_are_coroutines_that_refuse_with_unsupported_asset_type(stub):
-    # Awaited as the Kafka handler awaits them; a plain function returning None would be a TypeError.
-    assert inspect.iscoroutinefunction(stub)
-
-    with pytest.raises(InvalidRequestError) as raised:
-        await stub(Mock())
-
-    assert raised.value.reason is Reason.UNSUPPORTED_ASSET_TYPE
-    assert type(raised.value) is InvalidRequestError
+# RETIRED ON tj-3mk3u5.32:
+# test_the_crypto_and_option_stubs_are_coroutines_that_refuse_with_unsupported_asset_type.
+#
+# It parametrized directly over ingest_control.store_retrieve_crypto and store_retrieve_option,
+# which tj-3mk3u5.11 deletes with the rest of the Kafka edge -- so the module would not have
+# imported, let alone run. The coroutine half of it was about how the KAFKA handler awaited those
+# stubs; there is no such caller left to satisfy.
+#
+# The UNSUPPORTED_ASSET_TYPE half survives on the gRPC path, where the refusal is the handler's
+# rather than a dispatch stub's: test_fetch_dataset_handler.py's crypto and option cases of
+# test_an_unservable_request_is_refused_before_the_ack_and_before_the_vendor_is_called, with
+# test_a_non_stock_asset_type_is_refused_even_by_a_reader_that_would_have_served_it proving the
+# refusal comes from the handler and not from whichever reader happens to be installed.
 
 
 # Every triple match_client_request maps, and what it maps each to: the six stock endpoints alpaca-py has.

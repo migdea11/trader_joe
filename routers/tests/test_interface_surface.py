@@ -12,8 +12,6 @@ from fastapi import APIRouter
 from fastapi.routing import APIRoute
 from pydantic import BaseModel
 
-from common.kafka.kafka_rpc_factory import KafkaRpcFactory
-
 
 # THE INTERFACE MANIFEST (tj-ru24i2, ADR tj-fdb9gz).
 #
@@ -53,8 +51,18 @@ SEPARATOR = ' | '
 EMPTY = '-'
 
 # http          a FastAPI route registered on a module-scope APIRouter while the module body ran.
-# rpc           a handler registered through KafkaRpcFactory.add_server() while the module body ran.
 # unbound-path  a path declared in an interface enum with NO route bound to it at import time.
+# none          this component exposes NOTHING enumerable here, declared rather than left implicit.
+#
+# `none` is decision tj-3wgh03. The loader below refuses an empty manifest, because a file that is
+# ACCIDENTALLY empty asserts nothing -- but a file that DECLARES it has nothing to enumerate asserts
+# a great deal, and the two were indistinguishable. A single `none` line with every other field empty
+# is that declaration, so an HTTP route added to the component later still reds.
+#
+# There was an `rpc` kind until tj-3mk3u5.32: a handler registered through KafkaRpcFactory.add_server()
+# while the module body ran. data_ingest's lone RPC handler was the only line that ever used it, and
+# tj-3mk3u5.11 deletes it. The kind went with the enumerator rather than being kept for a transport
+# with no remaining registrations.
 #
 # `unbound-path` exists because the import-time surface is not the whole declared surface, and the
 # gap was invisible before this file. routers/common/latency.py builds its APIRouter INSIDE
@@ -66,7 +74,7 @@ EMPTY = '-'
 # registers no route for it at all. Recording those as their own kind keeps them in the inventory
 # S6 reads, and keeps them under the same equality assertion as everything else: implement one, and
 # the `unbound-path` line has to become an `http` line in the same diff.
-KINDS = ('http', 'rpc', 'unbound-path')
+KINDS = ('http', 'none', 'unbound-path')
 
 
 def _module_relpath(module: ModuleType) -> str:
@@ -163,7 +171,7 @@ def _split_parameters(function: Any) -> tuple[str, str]:
 
     A parameter annotated with a Pydantic model IS the request shape -- every cross-boundary
     schema in this repository is one. Everything else is injected plumbing: an AsyncSession says
-    the route reaches Postgres, KafkaRpcFactory.RpcClients says it reaches Kafka, and ADR
+    the route reaches Postgres, an IngestFetchClient says it reaches data_ingest, and ADR
     tj-fdb9gz records those outbound boundaries as the "what it touches" field of the interface
     that crosses them rather than as interfaces of their own, because that field is what decides
     the tier of the eventual test.
@@ -210,10 +218,9 @@ def _line(kind: str, address: str, file: str, symbol: str, request: str, respons
 def _component_modules(component: str) -> list[ModuleType]:
     """Import every module of a component's router package.
 
-    Importing IS the measurement. routers/data_ingest/get_dataset_request.py registers its Kafka
-    RPC handler with a decorator at module scope, so the handler is enumerable only if that
-    registration really ran -- and an import that raises fails this test rather than yielding a
-    shorter list, which is why nothing here catches ImportError.
+    Importing IS the measurement: a route is enumerable only if the registration that declares it
+    really ran while the module body executed. An import that raises therefore fails this test
+    rather than yielding a shorter list, which is why nothing here catches ImportError.
 
     Args:
         component (str): Component name.
@@ -282,49 +289,6 @@ def _http_lines(component: str, modules: list[ModuleType]) -> tuple[set[str], se
     return lines, bound_paths
 
 
-def _rpc_lines(component: str, modules: list[ModuleType]) -> set[str]:
-    """Enumerate the Kafka RPC handlers registered on the component's module-scope factories.
-
-    Reaches into KafkaRpcFactory._rpc_servers because the factory exposes no public view of what
-    has been registered; data/ingest/tests/test_app_import.py already does the same. A public
-    accessor would be an improvement to the factory, not to this file.
-
-    Args:
-        component (str): Component name.
-        modules (list[ModuleType]): The component's imported modules.
-
-    Returns:
-        set[str]: The manifest lines.
-    """
-    lines: set[str] = set()
-    package_name = COMPONENT_PACKAGES[component]
-    for module in modules:
-        for factory in vars(module).values():
-            if not isinstance(factory, KafkaRpcFactory):
-                continue
-            for server in factory._rpc_servers:
-                handler = server._rpc_function
-                defining_module = _defining_module(handler)
-                if not defining_module.__name__.startswith(package_name):
-                    raise AssertionError(
-                        f'a {component} RPC factory registered a handler implemented in '
-                        f'{defining_module.__name__}, so its component is ambiguous'
-                    )
-                _, touches = _split_parameters(handler)
-                lines.add(
-                    _line(
-                        'rpc',
-                        server.endpoint.topic.value,
-                        _module_relpath(defining_module),
-                        handler.__qualname__,
-                        _render_type(server.endpoint.request_model),
-                        _render_type(server.endpoint.response_model),
-                        touches,
-                    )
-                )
-    return lines
-
-
 def _unbound_path_lines(modules: list[ModuleType], bound_paths: set[str]) -> set[str]:
     """Enumerate paths declared in an interface enum that no import-time route serves.
 
@@ -378,7 +342,7 @@ def enumerate_interface_surface(component: str) -> set[str]:
     """
     modules = _component_modules(component)
     http, bound_paths = _http_lines(component, modules)
-    return http | _rpc_lines(component, modules) | _unbound_path_lines(modules, bound_paths)
+    return http | _unbound_path_lines(modules, bound_paths)
 
 
 def load_manifest(component: str) -> list[str]:
@@ -396,6 +360,7 @@ def load_manifest(component: str) -> list[str]:
     """
     path = MANIFEST_DIR / f'{component}.manifest'
     lines: list[str] = []
+    declares_none = False
     for number, raw in enumerate(path.read_text().splitlines(), start=1):
         stripped = raw.strip()
         if not stripped or stripped.startswith('#'):
@@ -408,9 +373,22 @@ def load_manifest(component: str) -> list[str]:
             raise ValueError(f'{where}: a field is empty; write "{EMPTY}" where an entry has no value')
         if fields[0] not in KINDS:
             raise ValueError(f'{where}: unknown kind {fields[0]!r}, expected one of {", ".join(KINDS)}')
+        if fields[0] == 'none':
+            if fields[1:] != [EMPTY] * (FIELD_COUNT - 1):
+                raise ValueError(f'{where}: a "none" line declares nothing, so every other field must be "{EMPTY}"')
+            declares_none = True
+            continue
         lines.append(SEPARATOR.join(fields))
-    if not lines:
-        raise ValueError(f'{path.name} declares no interfaces; an empty manifest asserts nothing')
+    if declares_none and lines:
+        raise ValueError(
+            f'{path.name} declares "none" beside {len(lines)} interface(s); "none" means there are no '
+            'interfaces to enumerate, so delete whichever of the two is wrong'
+        )
+    if not lines and not declares_none:
+        raise ValueError(
+            f'{path.name} declares no interfaces; an empty manifest asserts nothing. If the component '
+            'really exposes none, say so with a "none" line (decision tj-3wgh03)'
+        )
     duplicates = sorted({line for line in lines if lines.count(line) > 1})
     if duplicates:
         raise ValueError(f'{path.name} repeats a line:\n' + '\n'.join(duplicates))

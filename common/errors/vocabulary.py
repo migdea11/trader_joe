@@ -27,7 +27,10 @@ is not a field. It is the reason's outcome in REASONS (D4). There is no problem+
 type is about:blank for every error (U3 as amended 2026-10-02), and the problem+json renderer writes it.
 
 THE ERROR ID that ties an answer to its cause chain in the log (D8) is minted by new_error_id and nothing
-else, so both edges and every raise site spell it the same way.
+else, so both edges and every raise site spell it the same way. It is read back by own_error_id and the
+chain decision is made by has_cause_chain, here for the same reason: an edge that asked the question its
+own way would answer it differently from the other edge, and the one id a human quotes would stop being
+one id.
 """
 
 import math
@@ -332,6 +335,62 @@ class ExogenousError(TraderJoeError, _branch=True):
 
 class InvalidRequestError(TraderJoeError, _branch=True):
     """The caller asked for something that cannot be asked (D5)."""
+
+
+# The METADATA_KEYS key D8's correlation id travels under, on an error and on either transport's wire.
+_ERROR_ID_KEY: Final = 'error_id'
+
+# The ONE separator a sequence-valued metadata item is flattened with, wherever one string is needed: the
+# error_id in a log line, below, and every sequence-valued ErrorInfo metadata value on the gRPC hop, whose
+# _SEQUENCE_SEPARATOR is this constant rather than a second spelling of it. A comma and nothing else, because
+# that join is the one wire-visible one, and the id in each service's log must be the id on the wire.
+METADATA_SEQUENCE_SEPARATOR: Final = ','
+
+
+def own_error_id(error: TraderJoeError) -> str | None:
+    """Return the error_id the error already carries, as one line of text for the log, or None where it has none.
+
+    An error has an id of its own because a raise site that logged its cause chain set it, or because an edge
+    kept a peer's id when it converted that peer's answer back. BOTH TRANSPORTS ASK THIS ONE FUNCTION, so an
+    error relayed from one to the other is judged the same way on both and is named by the same string in
+    either service's log -- which is the correlation D8 exists to give an operator.
+
+    A value that names nothing is no id: '', an empty sequence, or a sequence of nothing but '', all three of
+    which TraderJoeError accepts. A sequence that does name something is joined with
+    METADATA_SEQUENCE_SEPARATOR, the spelling the gRPC hop writes on the wire.
+
+    This is each edge's ONE test of 'has its own id': the body or status it sends, the line it logs and its
+    decision whether to log the cause chain all ask this 'is None', so the id sent and the id named are always
+    the same, and the chain is logged exactly when the edge minted the id.
+
+    Args:
+        error: The error to read.
+
+    Returns:
+        str | None: The id, or None when the error carries none.
+    """
+    own = error.metadata.get(_ERROR_ID_KEY)
+    if isinstance(own, str):
+        return own or None
+    if own is None or not any(own):
+        return None
+    return METADATA_SEQUENCE_SEPARATOR.join(own)
+
+
+def has_cause_chain(exc: BaseException) -> bool:
+    """Return whether a traceback logged under this exception would show how it arose.
+
+    Both edges decide exc_info with this, so neither can come to answer it differently from the other.
+    'raise ... from e' sets __cause__. A raise inside an except block sets __context__, unless 'from None'
+    suppressed it.
+
+    Args:
+        exc: The exception to inspect.
+
+    Returns:
+        bool: True when the exception has a cause chain worth logging.
+    """
+    return exc.__cause__ is not None or (exc.__context__ is not None and not exc.__suppress_context__)
 
 
 # Every canonical gRPC status code name a failure can render as: all of them but OK.

@@ -35,7 +35,7 @@ from fastapi import FastAPI, Query
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException
 
-from common.errors.vocabulary import REASONS, Disposition, Reason, TraderJoeError
+from common.errors.vocabulary import METADATA_SEQUENCE_SEPARATOR, REASONS, Disposition, Reason, TraderJoeError
 from routers.common import errors
 from routers.common.errors import render
 from routers.tests.problem_app import ERRORS_LOGGER, answer_to, client_for, problem_app
@@ -325,11 +325,25 @@ def test_an_empty_own_id_is_no_id(empty: str | list[str], caplog: pytest.LogCapt
 def test_a_list_shaped_own_id_stays_a_list_on_the_wire_and_is_named_joined_in_the_line(
     own: list[str], caplog: pytest.LogCaptureFixture
 ):
-    """TE-1 lets error_id be a sequence. The wire keeps the list, the line names it joined, and no chain is logged."""
+    """TE-1 lets error_id be a sequence. The wire keeps the list, the line names it joined, and no chain is logged.
+
+    THE JOIN IS NOW ',' AND NOT ', ' (validator, re-pinned at the tj-zxqn4r gate). This edge had its own private
+    copy of the id reader, and that copy joined with ', ' while common/rpc/errors.py's joined with ',' -- two
+    copies that had diverged on their fourth line within two days of the second being written, under a comment
+    claiming they read an id identically. tj-zxqn4r's Part B ruled the comma join, because it is the WIRE-VISIBLE
+    one: the gRPC hop writes every sequence-valued metadata value that way. So the same error now names one
+    string in data_store's log, in ingest's log and on the wire between them, which is the correlation D8 exists
+    to give. THE BODY IS UNCHANGED -- it still carries the list -- and the one-empty-part case is what shows that
+    only the log line moved.
+
+    The separator is read from the shared constant rather than written out, so this case says "joined the way
+    both edges join" rather than making an independent claim about a comma; the literal has exactly one witness,
+    in common/tests/errors/test_errors_error_id.py.
+    """
     error = raised_from(build(ANY_REASON, error_id=own), a_cause())
     body, record = answer_and_line(error, caplog)
     assert body['error_id'] == own
-    assert record.getMessage().endswith(f'; error_id {", ".join(own)}')
+    assert record.getMessage().endswith(f'; error_id {METADATA_SEQUENCE_SEPARATOR.join(own)}')
     assert record.exc_info is None
 
 
@@ -352,7 +366,8 @@ def test_the_line_names_exactly_the_id_the_body_carries(own: str | list[str] | N
     """D8's correlation: the id an operator is quoted from the body is the id the line ends by naming."""
     body, record = answer_and_line(build(ANY_REASON, error_id=own), caplog)
     sent = body['error_id']
-    named = sent if isinstance(sent, str) else ', '.join(sent)
+    # ',' since tj-zxqn4r, and read from the shared constant: see the case above for the ruling.
+    named = sent if isinstance(sent, str) else METADATA_SEQUENCE_SEPARATOR.join(sent)
     assert named, f'the body carries {sent!r}, which names nothing'
     assert record.getMessage().endswith(f'; error_id {named}')
 

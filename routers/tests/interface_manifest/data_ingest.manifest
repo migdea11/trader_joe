@@ -2,8 +2,18 @@
 # Format, field meanings and why this file is committed rather than generated: see README.md.
 # Keep sorted. Adding an interface is meant to cost a line here, in the same diff.
 #
-# The rpc line is the one interface data_ingest answers on today, and enumerating it is proof that
-# the decorator in get_dataset_request.py really ran while the module body executed.
+# ZERO IS A DECLARATION HERE, NOT AN OVERSIGHT -- decision tj-3wgh03. data_ingest exposes nothing
+# this file can enumerate: routers/data_ingest holds a domain handler (fetch_dataset_handler.py) and
+# no wire type at all, by decision tj-tkm4tn D1, and it registers no HTTP route.
+#
+# DO NOT READ THIS AS "data_ingest HAS NO INTERFACE". Its real interface is the gRPC IngestService,
+# built by common/rpc/ingest.py and registered in data/ingest/app/grpc_host.py -- outside routers/,
+# where ADR tj-8konfu D3 keeps the generated package. It is pinned where it lives, by
+# data/ingest/tests/test_grpc_host.py, which asserts in a fresh interpreter that registered_services()
+# returns exactly that service. Each surface is pinned where it lives (tj-3wgh03 D4).
+#
+# Until tj-3mk3u5.32 this file held one `rpc` line, for the Kafka RPC handler that tj-3mk3u5.11
+# deletes. An HTTP route added to routers/data_ingest later still reds this test.
 #
 # kind | address | file | symbol | request | response | touches
-rpc | stock_market_activity_rpc | routers/data_ingest/get_dataset_request.py | store_data | schemas.data_ingest.get_dataset_request.GetDatasetRequest | schemas.data_store.stock.market_activity_data.BatchStockDataMarketActivityCreate | -
+none | - | - | - | - | - | -

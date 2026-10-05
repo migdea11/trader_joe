@@ -26,8 +26,13 @@ from typing import Final
 import pytest
 
 import routers.common.latency as latency
-from common.kafka.topics import ConsumerGroup
-from routers.tests.latency_harness import AppStub, RecordingRestClient, rest_endpoint, turn_harness_on
+from routers.tests.latency_harness import (
+    AppStub,
+    RecordingRestClient,
+    legacy_group_args,
+    rest_endpoint,
+    turn_harness_on,
+)
 from schemas.common.latency import LatencyRequest
 
 
@@ -35,8 +40,11 @@ pytestmark = pytest.mark.common
 
 REPO_ROOT: Final = Path(__file__).resolve().parents[2]
 
-# The two scopes tj-3mk3u5.35 cleared. data/ and common/ are NOT here: Kafka stays wired for the
-# dataset path until .11/.12, and common/kafka itself is .13's to delete.
+# The two scopes tj-3mk3u5.35 cleared. data/ and common/ are NOT here, and the reason has changed
+# twice as the epic moved: the dataset path's Kafka wiring went on tj-3mk3u5.11 and .12, and
+# tj-3mk3u5.13 deleted common/kafka/rpc and the factory -- but NOT common/kafka itself, whose
+# messaging/, topics.py and kafka_config.py survive until tj-3mk3u5.14. So common/ is still a tree
+# with live Kafka in it and still does not belong in a scan that reds on any reference.
 CLEARED_TREES: Final = ('routers/common', 'schemas/common')
 
 # Exact identifiers that belong to the Kafka RPC layer and carry no 'kafka' in their own spelling.
@@ -46,28 +54,15 @@ KAFKA_LAYER_NAMES: Final = frozenset(
     {'RpcEndpointTopic', 'LATENCY_TEST', 'BaseRpcAck', 'RpcEndpoint', 'get_rpc_params'}
 )
 
-# THE TWO SURVIVORS, each allowed per file and per token, so that any OTHER Kafka reference in the
-# same file still reds. Both are known residue with a named owner, not oversights:
+# THE ONE SURVIVOR, allowed per file and per token, so that any OTHER Kafka reference in the same
+# file still reds. It is known residue with a named owner, not an oversight:
 #
 # routers/common/latency.py keeps `from common.kafka.topics import ConsumerGroup` only to type the
 # client_group/server_group parameters that initialize_latency_client and initialize_latency_server
 # still accept and no longer use. Dropping the parameters would change signatures that
 # data/store/app/app_depends.py and data/ingest/app/app_depends.py call, which is a cross-scope edit
 # tj-3mk3u5.35 deliberately did not make. Those call sites go on tj-3mk3u5.11 and .12.
-#
-# schemas/common/latency.py keeps BaseRpcAck as the base class of LatencyResponse, which is dead
-# production code: it has no caller anywhere, and the only other file naming it is
-# schemas/tests/test_schemas_smoke_common.py, whose declared-equals-covered assertion names it ONLY
-# because the class exists. So LatencyResponse cannot be deleted by itself -- the class and those two
-# test lines go in one change, across two scopes -- and tj-3mk3u5.13 owns it. It is recorded here and
-# on tj-3mk3u5.35 because the Kafka-layer deletion breaks this import if it is forgotten.
-#
-# tj-3mk3u5.13 deletes common/kafka outright. At that point both entries must go, and the staleness
-# test below is what refuses to let them linger.
-ALLOWED: Final = {
-    'routers/common/latency.py': frozenset({'common.kafka.topics'}),
-    'schemas/common/latency.py': frozenset({'common.kafka.rpc.kafka_rpc_base', 'BaseRpcAck'}),
-}
+ALLOWED: Final = {'routers/common/latency.py': frozenset({'common.kafka.topics'})}
 
 
 def _is_kafka(name: str) -> bool:
@@ -147,9 +142,19 @@ def test_every_allowed_kafka_reference_is_still_excusing_something():
 
     An allowlist entry that stops matching anything is the failure mode of every allowlist: it goes on
     excusing a file long after the thing it excused has gone, and the next real reference to use that
-    name walks straight through. When tj-3mk3u5.11/.12 remove the parameters and .13 deletes
-    common/kafka and LatencyResponse, this test is what says each entry may now go.
+    name walks straight through. While common/kafka exists, that is a live hazard and this test is
+    what says each entry may now go.
+
+    ONCE common/kafka IS GONE (tj-3mk3u5.14) THE HAZARD IS GONE WITH IT, and so is this check. A
+    stale allowance can only mask a reference that could resolve, and after the deletion none can:
+    the scan above still holds the whole surface, and anything it would excuse would fail at import
+    long before it reached this allowlist. The gate is here rather than in a later edit because the
+    builder who deletes common/kafka must not have to touch a test to stay green (tj-3mk3u5.32); this
+    test and the gate both go on tj-iwiq23.
     """
+    if not (REPO_ROOT / 'common' / 'kafka').is_dir():
+        pytest.skip('common/kafka is gone, so no allowance can mask a reference that resolves (tj-iwiq23)')
+
     references = _scan()
     stale = []
     for relative, tokens in sorted(ALLOWED.items()):
@@ -188,7 +193,15 @@ def test_the_topics_shim_is_importable_and_empty():
     the call sites and .13 deletes it. Both halves matter and neither is obvious from the other: if it
     stopped being importable both services would fail to start, and if it ever returned a topic again
     the lifespans would go back to provisioning Kafka topics for an arm that no longer exists.
+
+    The guard below is the shim's own retirement, not a tolerated absence: tj-3mk3u5.13 deletes the
+    function, and on that commit there is no shim left to be empty. Deleting this test now instead
+    would leave the shim unpinned for the .11/.12 window, when it is still live and still called
+    (tj-3mk3u5.32). Delete it, and the guard, on tj-iwiq23.
     """
+    if not hasattr(latency, 'get_latency_topics'):
+        pytest.skip('the topics shim was deleted with the Kafka layer; nothing is left to pin (tj-iwiq23)')
+
     assert latency.get_latency_topics() == (), (
         'the latency topics shim must stay empty: its callers hand the result straight to topic '
         'creation, and the arm that consumed those topics went on tj-3mk3u5.35.'
@@ -215,7 +228,7 @@ def harness_on(monkeypatch: pytest.MonkeyPatch):
 async def test_the_rest_arm_still_dispatches_to_the_rest_client(harness_on, monkeypatch: pytest.MonkeyPatch):
     """REST was the second branch and is now the first; it must still reach the REST client."""
     app = AppStub()
-    latency.initialize_latency_client(app, 'probe', 1, ConsumerGroup.COMMON_GROUP)
+    latency.initialize_latency_client(app, 'probe', 1, *legacy_group_args())
 
     recorder = RecordingRestClient()
     monkeypatch.setattr(latency, '__REST_CLIENT', recorder)
@@ -239,7 +252,7 @@ async def test_the_grpc_arm_still_dispatches_to_the_probe_client(harness_on, mon
     that one probe happened per iteration and the REST client was never touched.
     """
     app = AppStub()
-    latency.initialize_latency_client(app, 'probe', 1, ConsumerGroup.COMMON_GROUP)
+    latency.initialize_latency_client(app, 'probe', 1, *legacy_group_args())
 
     recorder = RecordingRestClient()
     monkeypatch.setattr(latency, '__REST_CLIENT', recorder)

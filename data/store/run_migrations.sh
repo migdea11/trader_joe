@@ -25,11 +25,19 @@ set -euo pipefail
 # the diagnostic wants every check below unchanged: the repo root, the pinned compose file, the
 # postgres check, and above all the empty-versions guard, since `alembic history` reads the same
 # bind-mounted revision files whose absence is the symptom being looked for. `make migrate-status`
-# passes the read-only commands (`current`, `history`); a second compose invocation elsewhere is
-# exactly what this script's existence is meant to prevent (tj-4yvsb2). The default is
+# passes the read-only commands (`current`, `history`, `check`); a second compose invocation
+# elsewhere is exactly what this script's existence is meant to prevent (tj-4yvsb2). The default is
 # `upgrade head`, so callers that pass nothing — `make migrate`, the deploy step — are unchanged.
 # Nothing here validates the command: this is the plumbing, and it is the CALLER that promises
 # read-only. Anything mutating still belongs behind a named, reviewed target.
+#
+# `check` is read-only in the same sense as the other two: it reflects the live catalogue and
+# compares it with the models, writing nothing — no stamp, no DDL (ADR tj-x3ig38, 2026-10-02
+# addendum item 8). Unlike them it EXITS NON-ZERO when they disagree, which is the point: a
+# database stamped at head whose schema has drifted (tj-5h30md) is invisible to `current`. It
+# refuses with "Target database is not up to date." when the database is behind head. Its blind
+# spots are enum labels and server defaults, neither of which autogenerate compares here — see
+# migrations/env.py.
 
 REPO_ROOT="$(realpath "$(dirname "$0")/../..")"
 MIGRATION_DIR="$REPO_ROOT/data/store/migrations/versions"

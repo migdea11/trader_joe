@@ -8,8 +8,10 @@ DELIBERATELY RETURNS UNAVAILABLE, and CLIENTS BRANCH ON THE ErrorInfo REASON, NO
 This is the gRPC twin of routers/common/errors.py. Both read common/errors, which knows no protocol, and
 neither knows the other. Where they must agree -- that every typed answer carries an error_id, that the one
 log line names it, and that the line carries the cause chain only when the edge minted the id -- they agree
-by following the same record, not by sharing code: common/errors is standard-library only and may not hold a
-transport's helpers.
+BY CALLING THE SAME CODE: own_error_id and has_cause_chain live in common/errors beside new_error_id, where
+both edges read them. Neither needs a transport to answer its question, so the standard-library-only pin on
+that package is no obstacle, and two copies of a judgement cannot be kept in step by a comment -- these two
+were written as copies and had diverged on the sequence join within two days (tj-zxqn4r).
 
 THE THREE PIECES, in the order a failure meets them:
 
@@ -67,12 +69,15 @@ from grpc_status import rpc_status
 
 from common.errors.vocabulary import (
     ERROR_DOMAIN,
+    METADATA_SEQUENCE_SEPARATOR,
     REASONS,
     Disposition,
     ExogenousError,
     Reason,
     TraderJoeError,
+    has_cause_chain,
     new_error_id,
+    own_error_id,
 )
 from common.logging import get_logger
 
@@ -95,8 +100,10 @@ _ERROR_ID_KEY: Final = 'error_id'
 _RESET_AT_KEY: Final = 'reset_at'
 _DERIVED_METADATA_KEYS: Final = frozenset({_RESET_AT_KEY, 'retry_after'})
 
-# The one encoding for a sequence-valued metadata item on this hop (see the module docstring).
-_SEQUENCE_SEPARATOR: Final = ','
+# The one encoding for a sequence-valued metadata item on this hop (see the module docstring). It is the
+# shared constant itself, not a second spelling of it, so the join this hop writes on the wire and the join
+# own_error_id puts in a log line cannot be changed apart.
+_SEQUENCE_SEPARATOR: Final = METADATA_SEQUENCE_SEPARATOR
 
 # The whole message a bug's INTERNAL status carries, bar the id itself. One constant, used to write the
 # message and to read it back, so the two can never drift apart.
@@ -144,26 +151,6 @@ def _check_module() -> None:
 _check_module()
 
 
-def _own_error_id(error: TraderJoeError) -> str | None:
-    # The error_id the error already carries, as one line of text for the log, or None when it carries none.
-    # Set by a raise site that logged its cause chain under it, or kept from a peer by from_rpc_error. A
-    # value that names nothing is no id: '', an empty sequence, or a sequence of nothing but '' (TE-1
-    # accepts all three). Read exactly as routers/common/errors.py reads it, so an error relayed from one
-    # transport to the other is judged the same way on both.
-    own = error.metadata.get(_ERROR_ID_KEY)
-    if isinstance(own, str):
-        return own or None
-    if own is None or not any(own):
-        return None
-    return _SEQUENCE_SEPARATOR.join(own)
-
-
-def _has_cause_chain(error: BaseException) -> bool:
-    # 'raise ... from e' sets __cause__. A raise inside an except block sets __context__, unless 'from None'
-    # suppressed it.
-    return error.__cause__ is not None or (error.__context__ is not None and not error.__suppress_context__)
-
-
 def _wire_value(value: str | tuple[str, ...]) -> str:
     return value if isinstance(value, str) else _SEQUENCE_SEPARATOR.join(value)
 
@@ -207,7 +194,7 @@ def render(error: TraderJoeError, *, error_id: str | None = None) -> status_pb2.
         )
 
     metadata = {key: _wire_value(value) for key, value in error.metadata.items()}
-    if _own_error_id(error) is None:
+    if own_error_id(error) is None:
         metadata[_ERROR_ID_KEY] = error_id or new_error_id()
     # Read once each: the two are derived from one reset_at, and retry_after is re-derived from the clock on
     # every read, so a second read could name a different number than the one already written.
@@ -250,14 +237,14 @@ async def abort_with_error(
         ValueError: If the reason is never rendered as a gRPC status, as render() raises. The boundary below
             never lets that escape: it treats such a reason as the programming error it is.
     """
-    own_id = _own_error_id(error)
+    own_id = own_error_id(error)
     error_id = new_error_id() if own_id is None else own_id
     status = render(error, error_id=error_id)
     log.log(
         _LOG_LEVELS[REASONS[error.reason].disposition],
         f'{method or _UNNAMED_METHOD} -> {REASONS[error.reason].grpc_code} {error.reason}: {error.detail}; '
         f'error_id {error_id}',
-        exc_info=error if own_id is None and _has_cause_chain(error) else None,
+        exc_info=error if own_id is None and has_cause_chain(error) else None,
     )
     rich = rpc_status.to_status(status)
     await context.abort(rich.code, rich.details, rich.trailing_metadata)

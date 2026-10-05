@@ -14,9 +14,9 @@ from routers.data_ingest import get_dataset_request
 def create_app(readers: Mapping[DataSource, BrokerRead]) -> FastAPI:
     """Compose the ingest app around the broker handles it should serve requests through.
 
-    The composition root: the lifespan installs these handles before the RPC servers start and
-    clears them after shutdown. It also installs the problem+json handlers and declares their
-    responses, one set per app (ADR tj-fa1rpu D1(c)). Its HTTP surface is /ping and the latency
+    The composition root: it decides which handle serves each data source, and the lifespan hands
+    them to the gRPC servicers it registers. It also installs the problem+json handlers and declares
+    their responses, one set per app (ADR tj-fa1rpu D1(c)). Its HTTP surface is /ping and the latency
     harness, and no status there changes.
 
     Args:

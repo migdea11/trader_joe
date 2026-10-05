@@ -9,7 +9,7 @@ from sqlalchemy.exc import InvalidRequestError
 from starlette.routing import NoMatchFound
 
 from common.database.postgres_tools import PostgresSessionFactory
-from data.store.app.app_depends import get_ingest_fetch_client, get_rpc_clients
+from data.store.app.app_depends import get_ingest_fetch_client
 from data.store.app.database.database import async_db
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.main import app
@@ -832,15 +832,13 @@ def test_the_routes_are_driven_without_a_lifespan(client: TestClient):
         'driving a route opened a Postgres engine, so the database dependency override is not '
         'taking effect or the lifespan ran'
     )
-    assert get_rpc_clients() is None, (
-        'the store app lifespan ran in this process: it is the only thing that sets the module '
-        'global get_rpc_clients() reads, and running it needs a live Kafka broker'
-    )
-    # BOTH GLOBALS, since tj-3mk3u5.10 (validator). The lifespan now also builds the gRPC channel
-    # to data_ingest and the IngestFetchClient over it, and that half is the one the POST route
-    # actually depends on -- so an override that stopped taking effect would be caught by this
-    # line rather than by a confusing AttributeError inside the handler. Asserting only the Kafka
-    # global would go on passing if the lifespan were somehow half-run.
+    # THE gRPC GLOBAL, and it is the right one to ask. This pinned both globals between tj-3mk3u5.10
+    # and tj-3mk3u5.32: the Kafka one, get_rpc_clients(), and this one. The Kafka half went with the
+    # client tj-3mk3u5.12 unwires, and nothing is lost by its going -- the lifespan builds the gRPC
+    # channel to data_ingest and the IngestFetchClient over it, and that is the half the POST route
+    # actually depends on, so an override that stopped taking effect is caught here rather than by a
+    # confusing AttributeError inside the handler. It was the Kafka global that could have gone on
+    # passing against a half-run lifespan, not this one.
     assert get_ingest_fetch_client() is None, (
         'the store app lifespan ran in this process: it is the only thing that sets the module '
         'global get_ingest_fetch_client() reads, and it opens a channel to data_ingest'

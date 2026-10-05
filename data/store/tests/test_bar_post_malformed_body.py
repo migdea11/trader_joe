@@ -45,7 +45,6 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import InvalidRequestError
 
-from data.store.app.app_depends import get_rpc_clients
 from data.store.app.database.database import async_db
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.main import app
@@ -249,11 +248,12 @@ UNKNOWN_SOURCE = 'NOT-A-SOURCE'
 def _native_422(session: RecordingSession) -> list[dict[str, Any]]:
     """The error items FastAPI itself builds for a bad `source` on POST /store, from the same app.
 
-    The rpc factory is overridden with a sentinel only so that resolving the route's dependencies
-    reaches no Kafka; the body is refused before the handler runs, so nothing is asked of either.
+    Only the session is overridden. A sentinel for the Kafka rpc factory sat beside it until
+    tj-3mk3u5.32, on the theory that resolving the route's dependencies would otherwise reach Kafka;
+    it never did -- get_rpc_clients only reads a module global the lifespan sets -- and the body is
+    refused before the handler runs, so nothing is asked of either.
     """
     app.dependency_overrides[async_db] = lambda: session
-    app.dependency_overrides[get_rpc_clients] = lambda: object()
     try:
         response = TestClient(app, raise_server_exceptions=False).post(
             app.url_path_for(NATIVE_ROUTE_NAME, **NATIVE_PATH_PARAMS),

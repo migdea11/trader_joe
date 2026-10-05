@@ -2,8 +2,9 @@
 
 The lifespan (app_depends.make_lifespan) builds the host here and enters it around its yield, so a later
 task adds a service by appending to registered_services() and never edits the lifespan. The standard
-health service and FetchDataset (tj-3mk3u5.9) are served always, alongside the Kafka RPC server until it is
-unwired (tj-3mk3u5.11); the latency arm (tj-3mk3u5.8) registers into this list only when its harness is on.
+health service and FetchDataset (tj-3mk3u5.9) are served always -- and since tj-3mk3u5.11 unwired the Kafka
+RPC server, they are the whole of what this service answers; the latency arm (tj-3mk3u5.8) registers into
+this list only when its harness is on.
 
 A servicer here never imports a broker class (decision tj-j4wknb): it receives the readers create_app
 injected, and calls through the BrokerRead interface. grpc.aio runs every handler on the event loop, so

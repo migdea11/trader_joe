@@ -1,4 +1,4 @@
-"""data_ingest hosts a grpc.aio server in its lifespan, beside the Kafka RPC server (tj-3mk3u5.24).
+"""data_ingest hosts a grpc.aio server in its lifespan (tj-3mk3u5.24).
 
 The design is bead tj-3mk3u5.24 with its architect notes -- N3, binding: the host is entered only as
 'async with' around the lifespan's yield, so it stops on every exit path; the bind variables have no
@@ -17,17 +17,25 @@ Pinned here, through the production lifespan (main.create_app -> app_depends.mak
   module level, so the broad version is dead and the narrow one it was protecting is what remains. The
   reasoning is written out above HARNESS_OFF_PROBE;
 * the bind address is read when the host is built, never once at import;
-* an unset variable stops startup before Kafka, the worker pool or the readers are touched;
-* a gRPC start that fails (port taken, wildcard host) still runs the Kafka teardown, and the process
-  then exits instead of hanging on a consumer thread;
-* order: the host starts after the Kafka RPC servers and before the ready log, and stops before the
-  Kafka RPC servers shut down, while the readers are still installed.
+* an unset variable stops startup before the worker pool or the latency server are touched;
+* a gRPC start that fails (port taken, wildcard host) still runs the teardown, and the process then
+  exits instead of hanging on a pool thread;
+* order: the host is serving before the ready log, and has stopped before the worker pool it
+  dispatches onto is shut down.
 
-Kafka is replaced at its public entry points (wait_for_kafka, the ingest RPC factory's init_servers)
-and the latency server at app_depends' own name for it, as test_read_seam.py's LifespanProbe does.
-The gRPC host is the real one on 127.0.0.1 (grpc_bind.LoopbackGrpc). LoopbackGrpc fails any test
-whose lifespan left a host serving, then stops it, so that regression is red in every test here (and
-in the re-pointed lifespan tests of test_read_seam.py and test_fake_read.py) instead of hanging the run.
+THE LAST THREE WERE PHRASED AGAINST KAFKA until tj-3mk3u5.32 -- startup stopping "before Kafka",
+the Kafka teardown running, the host starting after the Kafka RPC servers and stopping before they
+shut down, with the readers still installed. tj-3mk3u5.11 deletes the RPC servers, the producer and
+ingest_control's reader registry, so each of those fixed points went. What replaced them is not a
+weaker version of the same assertion: the worker pool and the gRPC port are what the surviving
+properties were always about, since the pool's threads are the non-daemon ones that outlive a
+skipped teardown and the port is what a caller reaches.
+
+Only the latency server is replaced, at app_depends' own name for it, plus whatever of the Kafka
+startup still exists (data/ingest/tests/kafka_wiring.py -- transitional, tj-iwiq23). The gRPC host
+is the real one on 127.0.0.1 (grpc_bind.LoopbackGrpc). LoopbackGrpc fails any test whose lifespan
+left a host serving, then stops it, so that regression is red in every test here (and in the
+re-pointed lifespan tests of test_read_seam.py and test_fake_read.py) instead of hanging the run.
 """
 
 import asyncio
@@ -46,8 +54,6 @@ import pytest
 from grpc_health.v1 import health_pb2, health_pb2_grpc
 
 from common.enums.data_stock import DataSource
-from common.kafka.messaging.kafka_consumer import KafkaConsumerFactory
-from common.kafka.messaging.kafka_producer import KafkaProducerFactory
 from common.rpc.channel import create_channel
 from common.rpc.latency import LatencyProbeClient
 from common.rpc.ping import SERVICE_NAME as PING_SERVICE_NAME
@@ -55,11 +61,11 @@ from common.rpc.ping import ping, ping_service
 from common.rpc.server import GRPC_HOST_ENV, GRPC_PORT_ENV
 from common.tests.image_path import image_pythonpath
 from common.worker_pool import SharedWorkerPool
-from data.ingest.app import app_depends, grpc_host, ingest_control, main
+from data.ingest.app import app_depends, grpc_host, main
 from data.ingest.app.brokers.interface import BarsQuery, BarsResponse
 from data.ingest.tests.grpc_bind import GUARD_S, LOOPBACK, LoopbackGrpc, accepts_connections, free_loopback_port
+from data.ingest.tests.kafka_wiring import stub_kafka_startup
 from routers.common import latency as latency_harness
-from routers.data_ingest import get_dataset_request
 
 
 pytestmark = pytest.mark.data_ingest
@@ -74,18 +80,6 @@ class UnusedRead:
 
     async def get_bars(self, query: BarsQuery) -> BarsResponse:
         raise AssertionError(f'nothing in this file fetches bars, yet get_bars was called with {query!r}')
-
-
-def installed_readers() -> dict:
-    """A copy of the mapping store_retrieve_stock dispatches through right now (as test_read_seam.py)."""
-    return dict(getattr(ingest_control, '__READERS'))
-
-
-@pytest.fixture(autouse=True)
-def no_readers_leak_between_tests():
-    ingest_control.clear_readers()
-    yield
-    ingest_control.clear_readers()
 
 
 async def health_status(port: int, service: str = '', timeout_s: float = 5.0) -> int:
@@ -109,12 +103,18 @@ async def health_status(port: int, service: str = '', timeout_s: float = 5.0) ->
         await channel.close()
 
 
-class KafkaStubbed:
-    """The production lifespan with Kafka stubbed, recording when the Kafka RPC servers start and stop.
+class StubbedLifespan:
+    """The production lifespan, with only what cannot run here stood in for.
 
-    Each event records whether the gRPC port accepted connections at that moment and which readers
-    were installed. Nothing inside the lifespan is replaced except Kafka, the latency server, and the
-    recording wrapper LoopbackGrpc puts around build_grpc_host.
+    Nothing inside the lifespan is replaced except the latency server, whatever of the Kafka startup
+    still exists (kafka_wiring.stub_kafka_startup -- transitional, see tj-iwiq23) and the recording
+    wrapper LoopbackGrpc puts around build_grpc_host.
+
+    It was called KafkaStubbed until tj-3mk3u5.32, and it recorded an event each time the Kafka RPC
+    servers started or stopped, carrying whether the gRPC port accepted connections at that moment
+    and which readers ingest_control held. tj-3mk3u5.11 deletes the servers and the reader registry
+    both, so the events went with them; what the lifespan's order is now read against is the
+    worker pool and the gRPC port itself, which are what the surviving properties are about.
 
     Args:
         grpc_bind (LoopbackGrpc): The gRPC binding the lifespan will read.
@@ -124,18 +124,7 @@ class KafkaStubbed:
         self.grpc_bind = grpc_bind
         self.readers = {DataSource.ALPACA_API: UnusedRead()}
         self.app = main.create_app(self.readers)
-        self.events: list[tuple[str, bool, dict]] = []
-        self.rpc_servers = Mock()
-        self.rpc_servers.shutdown.side_effect = lambda: self.__record('rpc-shutdown')
-        self.wait_for_kafka = Mock(return_value=True)
         self.latency_server = Mock()
-
-    def __record(self, name: str) -> None:
-        self.events.append((name, accepts_connections(self.grpc_bind.port), installed_readers()))
-
-    def __start_rpc_servers(self):
-        self.__record('rpc-start')
-        return self.rpc_servers
 
     @asynccontextmanager
     async def running(self) -> AsyncIterator[None]:
@@ -145,11 +134,8 @@ class KafkaStubbed:
             None: While the lifespan is up.
         """
         with ExitStack() as stubs:
-            stubs.enter_context(patch.object(KafkaConsumerFactory, 'wait_for_kafka', self.wait_for_kafka))
+            stub_kafka_startup(stubs)
             stubs.enter_context(patch.object(app_depends, 'initialize_latency_server', self.latency_server))
-            stubs.enter_context(
-                patch.object(get_dataset_request.rpc, 'init_servers', side_effect=self.__start_rpc_servers)
-            )
             async with self.grpc_bind, self.app.router.lifespan_context(self.app):
                 yield
 
@@ -165,7 +151,7 @@ async def test_health_answers_serving_on_the_configured_port_while_up_and_nothin
     Before this task nothing listened. A lifespan that started the host but never stopped it would
     fail the second half (and, outside this harness, hang process exit: N3).
     """
-    probe = KafkaStubbed(LoopbackGrpc())
+    probe = StubbedLifespan(LoopbackGrpc())
 
     async with probe.running():
         assert await health_status(probe.grpc_bind.port) == SERVING
@@ -196,7 +182,7 @@ async def test_what_registered_services_returns_is_what_the_lifespan_serves_and_
         return [ping_service()]
 
     monkeypatch.setattr(grpc_host, 'registered_services', ping_only)
-    probe = KafkaStubbed(LoopbackGrpc())
+    probe = StubbedLifespan(LoopbackGrpc())
 
     async with probe.running():
         channel = create_channel(f'{LOOPBACK}:{probe.grpc_bind.port}')
@@ -247,24 +233,23 @@ async def test_the_bind_address_is_read_each_time_the_host_is_built_never_once_a
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('unset', [GRPC_HOST_ENV, GRPC_PORT_ENV])
-async def test_an_unset_bind_variable_stops_startup_before_kafka_the_worker_pool_or_the_readers(unset: str):
+async def test_an_unset_bind_variable_stops_startup_before_the_worker_pool_or_the_latency_server(unset: str):
     """No default, and no half-started app: the host is built FIRST, so the failure precedes every start.
 
-    Built after the Kafka RPC servers instead, the same error would leave their consumer threads
-    running, outside the finally that stops them, and the process would hang rather than exit.
+    Built later instead, the same error would leave whatever startup had already run going, outside
+    the finally that stops it, and the process would hang rather than exit. That was first written
+    about the Kafka consumer threads, which were the non-daemon ones; tj-3mk3u5.11 removes them, and
+    the worker pool is the thing that now has to not have been started (tj-3mk3u5.32).
     """
-    probe = KafkaStubbed(LoopbackGrpc(unset=(unset,)))
+    probe = StubbedLifespan(LoopbackGrpc(unset=(unset,)))
     worker_startup = Mock()
 
     with patch.object(SharedWorkerPool, 'worker_startup', worker_startup), pytest.raises(ValueError, match=unset):
         async with probe.running():
             pytest.fail(f'the lifespan came up with {unset} unset')
 
-    assert probe.wait_for_kafka.call_count == 0
-    assert probe.events == [], 'the Kafka RPC servers were started before the bind address was read'
-    assert worker_startup.call_count == 0
+    assert worker_startup.call_count == 0, 'the worker pool was started before the bind address was read'
     assert probe.latency_server.call_count == 0
-    assert installed_readers() == {}
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -273,47 +258,55 @@ async def test_an_unset_bind_variable_stops_startup_before_kafka_the_worker_pool
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('failure', ['port-taken', 'wildcard-host'])
-async def test_a_grpc_start_that_fails_still_tears_down_kafka_the_readers_and_the_worker_pool(
-    failure: str, caplog: pytest.LogCaptureFixture
-):
-    """The Kafka consumers are already running when the gRPC host starts, so its failure must reach the teardown.
+async def test_a_grpc_start_that_fails_still_runs_the_teardown(failure: str, caplog: pytest.LogCaptureFixture):
+    """The worker pool is already running when the gRPC host starts, so its failure must reach the finally.
 
     The two ways start() fails after the bind variables were read: the port is held by something
     else (A2 makes a second gRPC bind fail too), or the host is a wildcard (tj-r6vcgv A5).
+
+    It used to assert the Kafka half of the teardown as well -- that the RPC servers had started and
+    been shut down, that KafkaProducerFactory.shutdown ran, and that the readers had been cleared
+    out of ingest_control. tj-3mk3u5.11 deletes all three (tj-3mk3u5.32). The worker pool is what
+    remains of the teardown and it is the part that matters here anyway: its threads are what would
+    otherwise outlive a failed startup.
     """
     caplog.set_level(logging.INFO)
     worker_shutdown = Mock(wraps=SharedWorkerPool.worker_shutdown)
-    producer_shutdown = Mock(wraps=KafkaProducerFactory.shutdown)
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder, ExitStack() as spies:
         holder.bind((LOOPBACK, 0))
         holder.listen()
         if failure == 'port-taken':
-            probe = KafkaStubbed(LoopbackGrpc(port=holder.getsockname()[1]))
+            probe = StubbedLifespan(LoopbackGrpc(port=holder.getsockname()[1]))
             expected = pytest.raises(RuntimeError, match='bind')
         else:
             # The wildcard is what is under test here; the holder is simply not used.
-            probe = KafkaStubbed(LoopbackGrpc(host='0.0.0.0'))
+            probe = StubbedLifespan(LoopbackGrpc(host='0.0.0.0'))
             expected = pytest.raises(ValueError, match='wildcard')
         spies.enter_context(patch.object(SharedWorkerPool, 'worker_shutdown', worker_shutdown))
-        spies.enter_context(patch.object(KafkaProducerFactory, 'shutdown', producer_shutdown))
 
         with expected:
             async with probe.running():
                 pytest.fail(f'the lifespan came up despite {failure}')
 
-    assert [name for name, _, _ in probe.events] == ['rpc-start', 'rpc-shutdown']
-    assert worker_shutdown.call_count == 1
-    assert producer_shutdown.call_count == 1
-    assert installed_readers() == {}
+    assert worker_shutdown.call_count == 1, 'a failed gRPC start skipped the teardown'
     assert READY_LOG not in caplog.messages, 'the app logged ready although it never came up'
 
 
 # The exit probe runs in a fresh interpreter, because what is under test is whether that interpreter
-# EXITS. Its Kafka RPC consumer stand-in is a task on the shared worker pool that blocks until the RPC
-# servers' shutdown() releases it -- the shape of the real consumers, which block in 'for message in
-# consumer' on that pool until shutdown closes them. concurrent.futures joins its worker threads at
-# interpreter exit, so a teardown that never runs leaves the process waiting on that task forever.
+# EXITS. It submits a task to the shared worker pool that blocks until the lifespan's teardown
+# releases it -- the shape of a long-running consumer, which occupies a pool thread until something
+# in the teardown closes it. concurrent.futures joins its worker threads at interpreter exit, so a
+# teardown that never runs leaves the process waiting on that task forever.
+#
+# THE BLOCKING TASK USED TO BE A KAFKA RPC CONSUMER STAND-IN, submitted from a stubbed
+# rpc.init_servers and released by the servers' shutdown(). tj-3mk3u5.11 deletes both hooks, so it
+# now rides on the pool's own startup and is released from inside its shutdown (tj-3mk3u5.32).
+# Those are real lifespan steps on either side of the yield, so the shape is unchanged: startup
+# submits, teardown releases, and a teardown that is skipped hangs. It has to be worker_startup and
+# not an earlier step -- the lifespan builds the gRPC host FIRST, when there is no pool yet to
+# submit to. Releasing from INSIDE worker_shutdown, before it joins, is what keeps the probe
+# honest: the pool cannot join a task that was never released.
 EXIT_PROBE = """
 import asyncio
 import os
@@ -322,25 +315,43 @@ import sys
 import threading
 from unittest.mock import Mock
 
-from common.kafka.messaging.kafka_consumer import KafkaConsumerFactory
 from common.rpc.server import GRPC_HOST_ENV, GRPC_PORT_ENV
 from common.worker_pool import SharedWorkerPool
 from data.ingest.app import app_depends, main
 from routers.data_ingest import get_dataset_request
 
 released = threading.Event()
-servers = Mock()
-servers.shutdown.side_effect = released.set
+real_worker_startup = SharedWorkerPool.worker_startup
+real_worker_shutdown = SharedWorkerPool.worker_shutdown
 
 
-def init_servers():
+def worker_startup():
+    real_worker_startup()
     SharedWorkerPool.get_instance().submit(released.wait)
-    return servers
 
 
-KafkaConsumerFactory.wait_for_kafka = Mock(return_value=True)
+def worker_shutdown():
+    released.set()
+    return real_worker_shutdown()
+
+
 app_depends.initialize_latency_server = Mock()
-get_dataset_request.rpc.init_servers = init_servers
+SharedWorkerPool.worker_startup = worker_startup
+SharedWorkerPool.worker_shutdown = worker_shutdown
+
+# The same two tolerant Kafka stubs as data/ingest/tests/kafka_wiring.py, spelled out rather than
+# imported: this child runs on the IMAGE path, which carries no test package, and reaching into one
+# from here is the very thing test_no_production_test_imports.py forbids. Without the first of them
+# the lifespan dies in get_consumer_params, casting an unset BROKER_PORT. Both go on tj-iwiq23.
+try:
+    from common.kafka.messaging.kafka_consumer import KafkaConsumerFactory
+except ModuleNotFoundError:
+    pass
+else:
+    KafkaConsumerFactory.wait_for_kafka = Mock(return_value=True)
+
+if getattr(get_dataset_request, 'rpc', None) is not None:
+    get_dataset_request.rpc.init_servers = Mock(return_value=Mock())
 
 holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 holder.bind(('127.0.0.1', 0))
@@ -409,23 +420,38 @@ def test_the_process_exits_after_the_lifespan_whether_or_not_the_grpc_host_start
 
 
 @pytest.mark.asyncio
-async def test_the_host_starts_after_the_kafka_rpc_servers_and_before_ready_and_stops_before_they_shut_down(
+async def test_the_host_is_serving_before_the_ready_log_and_has_stopped_before_the_worker_pool(
     caplog: pytest.LogCaptureFixture,
 ):
-    """The host starts after the existing startup and before the ready log, and stops before Kafka does.
+    """The host serves before the app says it is ready, and stops before the pool it dispatches onto.
 
-    The first half is the bead's placement. The second is the teardown order: gRPC stops first, so a
-    call still in flight finds the readers and the worker pool it was dispatched to (the servicers of
-    .8 and .9 read through them).
+    THE TEARDOWN HALF IS THE ONE WITH TEETH. The host is entered as 'async with' around the yield,
+    so it stops before anything in the finally -- and the servicers dispatch their blocking vendor
+    calls onto the shared worker pool, which the finally shuts down. Stopping the host first is what
+    lets a call still in flight finish on a pool that is still alive. The spy records whether the
+    port was still accepting when worker_shutdown ran, which is that order stated as an observation
+    rather than read off the source.
+
+    It used to be phrased against Kafka -- the host starts after the Kafka RPC servers and stops
+    before they shut down, with the readers still installed. tj-3mk3u5.11 deletes the servers and
+    the reader registry, so the two fixed points are now the ready log and the worker pool
+    (tj-3mk3u5.32). The startup half is the bead's placement either way.
     """
     caplog.set_level(logging.INFO)
-    probe = KafkaStubbed(LoopbackGrpc())
+    probe = StubbedLifespan(LoopbackGrpc())
+    serving_at_shutdown = []
+    real_shutdown = SharedWorkerPool.worker_shutdown
 
-    async with probe.running():
-        listening_while_up = accepts_connections(probe.grpc_bind.port)
+    def recording_shutdown():
+        serving_at_shutdown.append(accepts_connections(probe.grpc_bind.port))
+        return real_shutdown()
 
-    assert listening_while_up
-    assert probe.events == [('rpc-start', False, probe.readers), ('rpc-shutdown', False, probe.readers)]
+    with patch.object(SharedWorkerPool, 'worker_shutdown', recording_shutdown):
+        async with probe.running():
+            listening_while_up = accepts_connections(probe.grpc_bind.port)
+
+    assert listening_while_up, 'the gRPC port was not accepting while the app was up'
+    assert serving_at_shutdown == [False], 'the worker pool was shut down while the gRPC host was still serving'
     listening_log = f'gRPC server listening on {LOOPBACK}:{probe.grpc_bind.port}'
     started = [index for index, message in enumerate(caplog.messages) if message.startswith(listening_log)]
     assert len(started) == 1, caplog.messages

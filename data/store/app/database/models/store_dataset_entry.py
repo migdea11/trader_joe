@@ -64,9 +64,11 @@ class StoreDatasetEntry(AppBase.DATA_STORE_BASE, CustomTypeTable):
         'end',
     )
 
-    id = Column(
-        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid(), unique=True, nullable=False
-    )
+    # NO unique=True HERE (tj-o3af47). primary_key=True already provides uniqueness; adding
+    # unique=True on top makes SQLAlchemy emit a SECOND, anonymous UNIQUE (id) that no revision
+    # ever created and no database has, so `alembic check` reports drift forever -- found by the
+    # first real run of that check, and the reason it is worth running at all.
+    id = Column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid(), nullable=False)
     # The caller's declared principal (tj-vhboky.1 section 5). NOT NULL because it is identity
     # and joins the unique constraint below -- Postgres treats NULL as distinct from NULL there,
     # so a nullable owner would silently stop the exact-repeat-returns-the-id guarantee from

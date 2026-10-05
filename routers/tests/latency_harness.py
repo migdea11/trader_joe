@@ -11,6 +11,7 @@ else runs for real -- the whole of initialize_latency_client, the APIRouter it b
 request handler including the dispatch chain, asyncio.gather, Timer and the percentile maths.
 """
 
+import inspect
 from types import SimpleNamespace
 
 from fastapi.routing import APIRoute
@@ -61,6 +62,31 @@ class AppStub:
 
     def include_router(self, router):
         self.routers.append(router)
+
+
+def legacy_group_args() -> tuple:
+    """The dead consumer-group argument initialize_latency_client still takes, while it still takes one.
+
+    initialize_latency_client and initialize_latency_server accept client_group/server_group and
+    never read them -- routers/common/latency.py says so where they are declared. The parameters are
+    Kafka-era residue that outlived their arm on tj-3mk3u5.35, and their only remaining purpose is to
+    keep two lifespan call sites compiling until tj-3mk3u5.11 and .12 reach them.
+
+    So the value handed over is None rather than a ConsumerGroup: importing common.kafka.topics to
+    fill a slot nothing reads would make every test here depend on a module tj-3mk3u5.14 deletes
+    (tj-3mk3u5.32). And the slot is filled only while the signature has one, so the eventual removal
+    of the parameters is a production edit that reds nothing here.
+
+    THIS IS NOT turn_harness_on's raising=False. That one warns against tolerating a missing name,
+    because a test that stops exercising an arm must say so loudly. Nothing is exercised here: the
+    argument is provably never read, so supplying it and not supplying it assert exactly the same
+    thing. Delete this helper with the parameters, on tj-iwiq23.
+
+    Returns:
+        tuple: (None,) while the parameter exists, otherwise ().
+    """
+    accepted = inspect.signature(latency.initialize_latency_client).parameters
+    return (None,) if 'client_group' in accepted else ()
 
 
 def turn_harness_on(monkeypatch):

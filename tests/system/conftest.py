@@ -263,6 +263,14 @@ def entry_values(run_identity: RunIdentity) -> Callable[..., dict[str, Any]]:
     OrderedEnum custom type, so they take the enum's integer value, exactly as upsert_entry binds
     them. Keyword overrides replace a column's value; omit=('owner',) leaves a column out of the
     INSERT entirely, so its server default applies.
+
+    "COMPLETE" IS A CLAIM THIS FIXTURE HAS TO KEEP EARNING, and it stopped being true once
+    (tj-xhcoyc). feed joined the entry as NOT NULL with no server default in migration
+    c4a1f7b2e905, and this dict did not gain it, so every test that inserts an entry through here
+    died on a NotNullViolation -- two whole files and most of a third. It went unnoticed at that
+    migration's gate because the only end-to-end check run there drove the HTTP route, which takes
+    its tape from the FetchDataset ack; nothing that reaches THIS fixture was run. A column added
+    to store_dataset_entry without a default has to be added here in the same change.
     """
 
     def _values(omit: tuple[str, ...] = (), **overrides: Any) -> dict[str, Any]:
@@ -273,6 +281,12 @@ def entry_values(run_identity: RunIdentity) -> Callable[..., dict[str, Any]]:
             'asset_type': AssetType.STOCK,
             'data_type': DataType.MARKET_ACTIVITY,
             'granularity': Granularity.ONE_MINUTE,
+            # The RESOLVED tape, and IEX for the same reason bar_values gives below: it is the tape
+            # an ALPACA_API deployment is actually served unless SIP is enabled. NOT NULL with no
+            # server default (the "no sentinel" ruling, tj-vhboky.1 item 1), so unlike owner this
+            # one cannot be left out and allowed to default -- omit=('feed',) produces a row
+            # Postgres refuses, which is what test_entry_requires_a_feed uses it for.
+            'feed': Feed.IEX,
             'start': BASE_START,
             'end': BASE_END,
             'expiry_type': ExpiryType.BULK.value,
@@ -291,10 +305,17 @@ def bar_values() -> Callable[..., dict[str, Any]]:
     """Build a complete, valid stock_market_activity row for one entry, as Core insert values.
 
     The natural-key columns other than dataset_id are copied from the entry row, so a bar always
-    agrees with the entry it belongs to unless a test overrides a column on purpose. feed is the
-    US-equity IEX tape, the tape an ALPACA_API entry is actually served. Bars are only ever
-    written under an entry this run created, so the cascade from insert_entry's cleanup takes
+    agrees with the entry it belongs to unless a test overrides a column on purpose. Bars are only
+    ever written under an entry this run created, so the cascade from insert_entry's cleanup takes
     them.
+
+    feed IS NOW COPIED FROM THE ENTRY TOO, and it is the sentence above that required the change
+    (tj-xhcoyc). feed is a natural-key column of the bar, so "copied from the entry row" always
+    covered it in intent -- but until c4a1f7b2e905 the entry HAD no feed to copy, so it was
+    hardcoded to IEX and the docstring was true only by coincidence. Now that the entry records
+    its resolved tape, hardcoding would let a SIP entry own IEX bars, which is exactly the
+    coverage lie tj-f2qz44 was filed about, one table over. The IEX default lives on the entry
+    fixture now, so every bar under a default entry is still IEX and nothing else moves.
     """
 
     def _values(entry: sa.Row, **overrides: Any) -> dict[str, Any]:
@@ -302,7 +323,7 @@ def bar_values() -> Callable[..., dict[str, Any]]:
             'dataset_id': entry.id,
             'source': entry.source,
             'asset_symbol': entry.asset_symbol,
-            'feed': Feed.IEX,
+            'feed': entry.feed,
             'granularity': entry.granularity,
             'timestamp': entry.start,
             'open': 10.0,

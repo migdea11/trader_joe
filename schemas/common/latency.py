@@ -2,7 +2,6 @@ from enum import Enum
 
 from fastapi import Path, Query
 
-from common.kafka.rpc.kafka_rpc_base import BaseRpcAck
 from schemas.inbound_contract import InboundContract
 
 
@@ -19,10 +18,6 @@ class LatencyRequest(InboundContract):
     latency_type: LatencyType = Path(..., title='Latency type', description=LATENCY_TYPE_DESC)
     iterations: int | None = Query(..., title='Iterations', description=LOOP_DESC)
     payload_size: int | None = Query(..., title='Payload size', description=PAYLOAD_SIZE_DESC)
-
-
-class LatencyResponse(BaseRpcAck):
-    latency: float
 
 
 class InternalLatencyRequest(InboundContract):
