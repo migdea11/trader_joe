@@ -61,9 +61,9 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
+from common.tests.roots import REPO_ROOT, repo_relative, resolve_tree
 from data.ingest.tests.test_no_production_test_imports import (
     GENERATED_ROOT,
-    REPO_ROOT,
     SOURCE_STAGE,
     TEST_PACKAGE,
     copy_source,
@@ -78,6 +78,12 @@ from data.ingest.tests.test_no_production_test_imports import (
 
 pytestmark = pytest.mark.data_store
 
+# BOTH ROOTS (tj-iontkq.2), as in the ingest module this one borrows from. Everything named as a
+# repository-relative TREE -- PRODUCTION_ROOTS, MOUNTED_ROOTS, ALEMBIC_INI, the seed package and the
+# compose mount sources -- goes through resolve_tree(), because those names span the server root
+# (data/store/*, routers, common, schemas) and the repository root (gen/proto/python). The two files
+# read by name below, Dockerfile and docker-compose.yaml, stay at the top of the repository and so
+# take REPO_ROOT directly.
 APP_ROOT = 'data/store/app'
 PRODUCTION_ROOTS = (APP_ROOT, 'routers', 'common', 'schemas', GENERATED_ROOT)
 SEED_PACKAGE = 'data.store.seeds'
@@ -95,8 +101,8 @@ def production_modules() -> list[Path]:
     return sorted(
         path
         for root in PRODUCTION_ROOTS
-        for path in (REPO_ROOT / root).rglob('*.py')
-        if TEST_PACKAGE not in path.relative_to(REPO_ROOT).parts
+        for path in resolve_tree(root).rglob('*.py')
+        if TEST_PACKAGE not in repo_relative(path).parts
     )
 
 
@@ -114,7 +120,7 @@ def test_the_scan_reads_every_production_root():
     # A root that moved or emptied would make the scan below pass having read nothing.
     modules = production_modules()
     for root in PRODUCTION_ROOTS:
-        assert any(path.is_relative_to(REPO_ROOT / root) for path in modules), f'{root} has no modules'
+        assert any(path.is_relative_to(resolve_tree(root)) for path in modules), f'{root} has no modules'
 
 
 def dockerfile_copy_directories() -> set[str]:
@@ -129,7 +135,7 @@ def dockerfile_copy_directories() -> set[str]:
     assert sources, f'{SOURCE_STAGE} has no COPY lines'
     directories: set[str] = set()
     for source in sources:
-        path = REPO_ROOT / source
+        path = resolve_tree(source)
         assert path.exists(), f'{SOURCE_STAGE} copies {source}, which does not exist'
         if path.is_dir():
             directories.add(source)
@@ -152,7 +158,7 @@ def test_the_image_does_not_copy_the_seed_producer():
     # The premise of forbidding the import: seeds is not shipped. If a COPY ever brought it in, the
     # rule here would be the wrong one, and that must be decided, not discovered in prod.
     seed_directory = SEED_PACKAGE.replace('.', '/')
-    assert (REPO_ROOT / seed_directory).is_dir(), f'{seed_directory} is gone; revisit this guard'
+    assert resolve_tree(seed_directory).is_dir(), f'{seed_directory} is gone; revisit this guard'
     copied = dockerfile_copy_directories()
     assert not any(seed_directory == source or seed_directory.startswith(f'{source}/') for source in copied), (
         f'{SOURCE_STAGE} copies {seed_directory} into the data_store image'
@@ -164,7 +170,7 @@ def test_the_scan_reaches_every_module_the_app_imports():
     # routers.common and routers.data_ingest -- would leave a shipped module unscanned while every
     # root still had modules.
     scanned = set(production_modules())
-    pending = [path for path in scanned if path.is_relative_to(REPO_ROOT / APP_ROOT)]
+    pending = [path for path in scanned if path.is_relative_to(resolve_tree(APP_ROOT))]
     reached: set[Path] = set()
     while pending:
         path = pending.pop()
@@ -176,9 +182,9 @@ def test_the_scan_reaches_every_module_the_app_imports():
             if target is not None and not is_forbidden(module):
                 pending.append(target)
 
-    unscanned = sorted(str(path.relative_to(REPO_ROOT)) for path in reached - scanned)
+    unscanned = sorted(str(repo_relative(path)) for path in reached - scanned)
     # Non-vacuous: the walk left the app, or a resolver that matched nothing would pass trivially.
-    assert any(not path.is_relative_to(REPO_ROOT / APP_ROOT) for path in reached), 'the walk never left the app'
+    assert any(not path.is_relative_to(resolve_tree(APP_ROOT)) for path in reached), 'the walk never left the app'
     assert not unscanned, 'the app imports modules outside PRODUCTION_ROOTS:\n' + '\n'.join(unscanned)
 
 
@@ -215,7 +221,7 @@ def test_the_resolver_names_each_import_form_from_inside_the_app(monkeypatch, tm
     # Relative imports resolve against the file's package, so the probe must be read as if it sat
     # where an app module does, data/store/app, without writing into the tree the scan reads: the
     # probe path is never created, and reading it returns the stand-in's source.
-    probe = REPO_ROOT / APP_ROOT / '_r4_probe.py'
+    probe = resolve_tree(APP_ROOT) / '_r4_probe.py'
     stand_in = tmp_path / 'probe.py'
     stand_in.write_text(source, encoding='utf-8')
     original = Path.read_text
@@ -231,7 +237,7 @@ def test_the_resolver_names_each_import_form_from_inside_the_app(monkeypatch, tm
 
 def test_no_shipped_module_imports_the_test_tree_or_the_seed_producer():
     offenders = [
-        f'{path.relative_to(REPO_ROOT)}:{line} imports {module}'
+        f'{repo_relative(path)}:{line} imports {module}'
         for path in production_modules()
         for line, module in scanned_imports(path)
         if is_forbidden(module)
@@ -315,7 +321,7 @@ def data_store_bind_mounts() -> dict[str, str]:
     """The data_store service's checkout bind mounts in the base compose file, each checked to exist."""
     mounts = compose_bind_mounts(COMPOSE_FILE.read_text(encoding='utf-8'), COMPOSE_SERVICE)
     for source in mounts:
-        assert (REPO_ROOT / source).exists(), f'{COMPOSE_SERVICE} mounts {source}, which does not exist'
+        assert resolve_tree(source).exists(), f'{COMPOSE_SERVICE} mounts {source}, which does not exist'
     return mounts
 
 
@@ -324,8 +330,8 @@ def mounted_modules() -> list[Path]:
     return sorted(
         path
         for root in MOUNTED_ROOTS
-        for path in (REPO_ROOT / root).rglob('*.py')
-        if TEST_PACKAGE not in path.relative_to(REPO_ROOT).parts
+        for path in resolve_tree(root).rglob('*.py')
+        if TEST_PACKAGE not in repo_relative(path).parts
     )
 
 
@@ -380,9 +386,9 @@ def test_the_scan_reads_every_mounted_root():
     # having scanned nothing alembic runs.
     modules = mounted_modules()
     for root in MOUNTED_ROOTS:
-        assert any(path.is_relative_to(REPO_ROOT / root) for path in modules), f'{root} has no modules'
-    assert REPO_ROOT / MIGRATIONS_ROOT / 'env.py' in modules, 'the scan does not read migrations/env.py'
-    revisions = [path for path in modules if path.parent == REPO_ROOT / MIGRATIONS_ROOT / 'versions']
+        assert any(path.is_relative_to(resolve_tree(root)) for path in modules), f'{root} has no modules'
+    assert resolve_tree(MIGRATIONS_ROOT) / 'env.py' in modules, 'the scan does not read migrations/env.py'
+    revisions = [path for path in modules if path.parent == resolve_tree(MIGRATIONS_ROOT) / 'versions']
     assert revisions, 'the scan reads no migration revision under migrations/versions'
 
 
@@ -402,7 +408,7 @@ def test_alembic_loads_scripts_only_from_a_scanned_mounted_root():
     mounts = data_store_bind_mounts()
     ini_target = PurePosixPath(mounts[ALEMBIC_INI])
     config = configparser.ConfigParser(interpolation=None)
-    config.read_string((REPO_ROOT / ALEMBIC_INI).read_text(encoding='utf-8'))
+    config.read_string(resolve_tree(ALEMBIC_INI).read_text(encoding='utf-8'))
     section = config['alembic']
     workdir = PurePosixPath('/code')
 
@@ -440,9 +446,9 @@ def test_the_mounted_scan_reaches_every_module_the_migrations_import():
             if target is not None and not is_forbidden(module):
                 pending.append(target)
 
-    unscanned = sorted(str(path.relative_to(REPO_ROOT)) for path in reached - scanned)
+    unscanned = sorted(str(repo_relative(path)) for path in reached - scanned)
     # Non-vacuous: env.py imports common and data.store.app, so the walk must leave the migrations.
-    assert any(not path.is_relative_to(REPO_ROOT / MIGRATIONS_ROOT) for path in reached), (
+    assert any(not path.is_relative_to(resolve_tree(MIGRATIONS_ROOT)) for path in reached), (
         'the walk never left the migrations'
     )
     assert not unscanned, 'the migrations import modules no scan reads:\n' + '\n'.join(unscanned)
@@ -469,7 +475,7 @@ def test_the_resolver_names_each_import_form_from_inside_the_migrations(
 ):
     # As for the app: the probe is read as if it sat in migrations/ or migrations/versions/, so
     # relative imports resolve against the repo location, without writing into the scanned tree.
-    probe = REPO_ROOT / MIGRATIONS_ROOT / location / '_r4_probe.py'
+    probe = resolve_tree(MIGRATIONS_ROOT) / location / '_r4_probe.py'
     stand_in = tmp_path / 'probe.py'
     stand_in.write_text(source, encoding='utf-8')
     original = Path.read_text
@@ -485,7 +491,7 @@ def test_the_resolver_names_each_import_form_from_inside_the_migrations(
 
 def test_no_mounted_migration_imports_the_test_tree_or_the_seed_producer():
     offenders = [
-        f'{path.relative_to(REPO_ROOT)}:{line} imports {module}'
+        f'{repo_relative(path)}:{line} imports {module}'
         for path in mounted_modules()
         for line, module in scanned_imports(path)
         if is_forbidden(module)

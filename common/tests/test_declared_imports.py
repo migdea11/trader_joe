@@ -47,10 +47,18 @@ from pathlib import Path
 
 import pytest
 
+from common.tests.roots import REPO_ROOT, repo_relative, resolve_tree
+
 
 pytestmark = pytest.mark.build_infra
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# BOTH ROOTS, AND THAT IS NOT AN OVERSIGHT (tj-iontkq.2). REPO_ROOT is the true repository root and
+# is right for everything this module reads by name -- pyproject.toml, uv.lock, Dockerfile,
+# tools/agent_mcp/Dockerfile and the COPY globs under tools/, all of which stay at the top of the
+# repository. SCANNED_ROOTS below is the other case: it is a tuple of repository-relative TREE names
+# that spans both roots -- common/, routers/, schemas/ and data/ travel with the services, while
+# gen/proto/python, tests/ and tools/ do not -- so those walks go through resolve_tree(), which
+# hands each name the root that owns it, and their results are named with repo_relative().
 PYPROJECT = tomllib.loads((REPO_ROOT / 'pyproject.toml').read_text(encoding='utf-8'))
 DECLARED_GROUPS = PYPROJECT['dependency-groups']
 MCP_DOCKERFILE = REPO_ROOT / 'tools' / 'agent_mcp' / 'Dockerfile'
@@ -187,9 +195,7 @@ def _in_a_test_directory(path: str) -> bool:
 
 
 def _scanned_files() -> list[str]:
-    return sorted(
-        str(path.relative_to(REPO_ROOT)) for root in SCANNED_ROOTS for path in (REPO_ROOT / root).rglob('*.py')
-    )
+    return sorted(str(repo_relative(path)) for root in SCANNED_ROOTS for path in resolve_tree(root).rglob('*.py'))
 
 
 def _third_party_imports() -> dict[str, list[tuple[str, int]]]:
@@ -200,7 +206,7 @@ def _third_party_imports() -> dict[str, list[tuple[str, int]]]:
     """
     found: dict[str, list[tuple[str, int]]] = defaultdict(list)
     for relative in _scanned_files():
-        path = REPO_ROOT / relative
+        path = resolve_tree(relative)
         for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'), filename=relative)):
             if isinstance(node, ast.Import):
                 names = [alias.name for alias in node.names]

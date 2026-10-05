@@ -54,8 +54,59 @@ set -euo pipefail
 # is not up to date." when the database is behind head. Its blind spots are enum labels and server
 # defaults, neither of which autogenerate compares here — see migrations/env.py.
 
-REPO_ROOT="$(realpath "$(dirname "$0")/../..")"
-MIGRATION_DIR="$REPO_ROOT/data/store/migrations/versions"
+# REPO_ROOT and SERVER_ROOT, not one REPO_ROOT counted by distance (tj-2bsw0k; epic tj-iontkq
+# risk R-1). REPO_ROOT is the TRUE repository root -- the directory holding pytest.ini, Makefile,
+# the compose files and tools/. SERVER_ROOT is the directory holding common/, routers/, schemas/
+# and data/ -- the one MIGRATION_DIR below actually wants. The two are the same directory today,
+# which is exactly why a single two-directories-up count read as correct: that count always lands
+# on the directory holding data/ (SERVER_ROOT's definition) no matter where this script itself
+# sits, so it was SERVER_ROOT computed under REPO_ROOT's name. Once the service trees move under
+# server/ (this epic), this script moves to server/data/store/run_migrations.sh, the same count
+# lands on server/, and every consumer of the old name that actually wanted the true root --
+# the `cd` below, so compose can find docker-compose.yaml, and tools/source_digest.sh further
+# down -- would have silently resolved into server/, where neither exists. Each root is now found by
+# searching upward for what only it carries, not by counting, so a further move cannot misalign
+# the count again; see common/tests/roots.py for the same two searches in Python.
+#
+# NEITHER SEARCH FALLS BACK: a marker search that quietly returned the filesystem root instead of
+# refusing would be the same vacuous-pass failure in a new place, since every path built from it
+# would exist nowhere -- the empty-versions guard just below exists to catch precisely that.
+find_repo_root() {
+    local dir="$1"
+    while true; do
+        if [ -f "$dir/pytest.ini" ]; then
+            printf '%s\n' "$dir"
+            return 0
+        fi
+        if [ "$dir" = / ]; then
+            break
+        fi
+        dir="$(dirname "$dir")"
+    done
+    echo "no ancestor of $1 carries pytest.ini; cannot locate the repository root" >&2
+    exit 1
+}
+
+find_server_root() {
+    local dir="$1"
+    while true; do
+        if [ -d "$dir/common" ] && [ -d "$dir/routers" ] && [ -d "$dir/schemas" ]; then
+            printf '%s\n' "$dir"
+            return 0
+        fi
+        if [ "$dir" = / ]; then
+            break
+        fi
+        dir="$(dirname "$dir")"
+    done
+    echo "no ancestor of $1 carries common/, routers/ and schemas/ as directories; cannot locate the server root" >&2
+    exit 1
+}
+
+SCRIPT_DIR="$(realpath "$(dirname "$0")")"
+REPO_ROOT="$(find_repo_root "$SCRIPT_DIR")"
+SERVER_ROOT="$(find_server_root "$SCRIPT_DIR")"
+MIGRATION_DIR="$SERVER_ROOT/data/store/migrations/versions"
 
 # "$@" is exempt from `set -u` when empty, so this is safe with no arguments; the array is
 # never empty afterwards, which keeps the expansions below safe too.

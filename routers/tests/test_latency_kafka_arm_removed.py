@@ -49,13 +49,17 @@ from typing import Final
 import pytest
 
 import routers.common.latency as latency
+from common.tests.roots import SERVER_ROOT
 from routers.tests.latency_harness import AppStub, RecordingRestClient, rest_endpoint, turn_harness_on
 from schemas.common.latency import LatencyRequest
 
 
 pytestmark = pytest.mark.common
 
-REPO_ROOT: Final = Path(__file__).resolve().parents[2]
+# THE SERVER ROOT (tj-iontkq.2): CLEARED_TREES below names routers/common and schemas/common, both
+# trees that travel with the services, and the scan reports its hits relative to the same root.
+# SERVER_ROOT, never REPO_ROOT -- which would make both rglob walks find no files at all and leave
+# this guard green having scanned nothing.
 
 # The two scopes tj-3mk3u5.35 cleared. data/ and common/ are NOT here, and the reason outlived the
 # deletions: these two trees were cleared of Kafka FIRST, while the rest of the repo still ran on
@@ -122,8 +126,8 @@ def _scan() -> dict[str, list[tuple[str, int, str]]]:
     """
     references = {}
     for tree in CLEARED_TREES:
-        for source in sorted((REPO_ROOT / tree).rglob('*.py')):
-            references[source.relative_to(REPO_ROOT).as_posix()] = _kafka_references(source)
+        for source in sorted((SERVER_ROOT / tree).rglob('*.py')):
+            references[source.relative_to(SERVER_ROOT).as_posix()] = _kafka_references(source)
     return references
 
 

@@ -44,11 +44,16 @@ from pathlib import Path
 import pytest
 from alembic.script import ScriptDirectory
 
+from common.tests.roots import REPO_ROOT, SERVER_ROOT
+
 
 pytestmark = pytest.mark.data_store
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-MIGRATIONS_DIR = REPO_ROOT / 'data' / 'store' / 'migrations'
+# BOTH ROOTS, in two adjacent lines (tj-iontkq.2), which is exactly what one name called REPO_ROOT
+# was hiding here. The migrations travel with data/store/; the committed seeds live in tests/system/,
+# which stays at the top of the repository. Swap either and the directory is simply absent, and the
+# guard below passes having found no revision to demand a seed for.
+MIGRATIONS_DIR = SERVER_ROOT / 'data' / 'store' / 'migrations'
 SEEDS_DIR = REPO_ROOT / 'tests' / 'system' / 'seeds'
 
 # CLOSED. Adding a member needs an architect ruling (tj-irhy0a.4 item 2); the test below fails otherwise.

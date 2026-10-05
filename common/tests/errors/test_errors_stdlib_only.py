@@ -17,13 +17,18 @@ from pathlib import Path
 import pytest
 
 import common.errors
+from common.tests.roots import SERVER_ROOT
 
 
 pytestmark = pytest.mark.common
 
+# THE SERVER ROOT (tj-iontkq.2). The root is used to turn a source path into a dotted module name
+# (common.errors.vocabulary) and as the cwd of a fresh interpreter that imports common.errors, so it
+# is the IMPORT root. The PACKAGE_DIR.parents[1] it replaces tracked the move by accident, being
+# derived from the imported module rather than from this file -- which is precisely the
+# accidentally-correct index the named sentinel exists to stop someone "fixing".
 PACKAGE = common.errors.__name__
 PACKAGE_DIR = Path(common.errors.__file__).resolve().parent
-REPO_ROOT = PACKAGE_DIR.parents[1]
 SOURCES = sorted(PACKAGE_DIR.rglob('*.py'))
 
 # Run in a fresh interpreter: print every module the import adds whose top-level package is not stdlib.
@@ -44,7 +49,7 @@ def _in_package(name: str) -> bool:
 
 def _imports(path: Path) -> Iterator[tuple[int, str]]:
     """Yield (line, absolute module name) for every import statement in path, at any depth."""
-    package = '.'.join(path.relative_to(REPO_ROOT).with_suffix('').parts[:-1])
+    package = '.'.join(path.relative_to(SERVER_ROOT).with_suffix('').parts[:-1])
     for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'), filename=str(path))):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -64,13 +69,13 @@ def test_the_package_has_source_to_check():
 def test_importing_the_vocabulary_loads_nothing_outside_the_standard_library():
     """A fresh interpreter that imports the vocabulary loads only the stdlib and the package's own modules."""
     result = subprocess.run(
-        [sys.executable, '-c', PROBE], cwd=REPO_ROOT, capture_output=True, text=True, check=False, timeout=60
+        [sys.executable, '-c', PROBE], cwd=SERVER_ROOT, capture_output=True, text=True, check=False, timeout=60
     )
     assert result.returncode == 0, result.stderr
     assert set(result.stdout.split()) == {'common', PACKAGE, f'{PACKAGE}.vocabulary'}
 
 
-@pytest.mark.parametrize('path', SOURCES, ids=lambda path: str(path.relative_to(REPO_ROOT)))
+@pytest.mark.parametrize('path', SOURCES, ids=lambda path: str(path.relative_to(SERVER_ROOT)))
 def test_every_import_in_the_package_is_stdlib_or_the_package_itself(path: Path):
     """No module under common/errors imports anything but the stdlib or common.errors, at any depth."""
     outside = [

@@ -22,8 +22,11 @@ from pathlib import Path
 
 from google.protobuf import descriptor_pb2
 
+from common.tests.roots import REPO_ROOT
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# THE TRUE REPOSITORY ROOT (tj-iontkq.2): proto/ is a root sibling of the service trees and is not
+# carried down with them, so this is REPO_ROOT and never SERVER_ROOT.
 PROTO_ROOT = REPO_ROOT / 'proto'
 # The one reserved root every .proto lies under (F1 rule 4), as a canonical path prefix.
 FIRST_PARTY_PREFIX = 'trader_joe/proto/'

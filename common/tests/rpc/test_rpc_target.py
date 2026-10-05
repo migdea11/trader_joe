@@ -29,10 +29,16 @@ import pytest
 
 import common.rpc.channel as channel_module
 from common.rpc.channel import DATA_INGEST_GRPC_TARGET_ENV, target_from_env
-from common.tests.image_path import REPO_ROOT, image_pythonpath
+from common.tests.image_path import image_pythonpath
+from common.tests.roots import SERVER_ROOT
 
 
 pytestmark = pytest.mark.common
+
+# THE SERVER ROOT (tj-iontkq.2): the only use is the cwd of a fresh interpreter that imports
+# common.rpc.channel, so it is the IMPORT root. This module used to take the name REPO_ROOT by
+# re-export from common/tests/image_path.py, which is how it stayed invisible to a search for the
+# counted derivation -- the count was one file away.
 
 VARIABLE = DATA_INGEST_GRPC_TARGET_ENV
 # A second name, so a message that names the variable is shown to name the one it was GIVEN.
@@ -110,7 +116,7 @@ def _child(script: str, *, env_overrides: dict[str, str | None]) -> subprocess.C
             env[name] = value
     return subprocess.run(
         [sys.executable, '-c', script],
-        cwd=REPO_ROOT,
+        cwd=SERVER_ROOT,
         env=env,
         capture_output=True,
         text=True,

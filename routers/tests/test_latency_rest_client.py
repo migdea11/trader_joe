@@ -42,6 +42,7 @@ import pytest
 import common.timer
 import routers.common.latency as latency
 from common.tests.image_path import image_pythonpath
+from common.tests.roots import SERVER_ROOT, repo_relative, resolve_tree
 from routers.common.app_endpoints import InterfaceRest
 from routers.tests.latency_harness import AppStub, RecordingRestClient, rest_endpoint, turn_harness_on
 from schemas.common.latency import LatencyRequest
@@ -49,7 +50,10 @@ from schemas.common.latency import LatencyRequest
 
 pytestmark = pytest.mark.common
 
-REPO_ROOT: Final = Path(__file__).resolve().parents[2]
+# TWO DIFFERENT NEEDS IN ONE MODULE (tj-iontkq.2). The subprocess below is started with
+# SERVER_ROOT as its cwd and import root, because it imports routers.common.latency. The repository
+# -wide scan at the bottom walks SOURCE_TREES, a tuple that spans both roots, so it goes through
+# resolve_tree() and names its hits with repo_relative().
 EXIT_BUDGET_S: Final = 30
 
 # The ruled configuration, spelled out rather than read from the module under test: a pin that imports
@@ -107,8 +111,8 @@ def test_with_the_harness_off_no_rest_client_is_built_and_httpx_is_never_importe
     try:
         done = subprocess.run(
             [sys.executable, '-c', HARNESS_OFF_PROBE],
-            cwd=REPO_ROOT,
-            env={'PYTHONPATH': image_pythonpath(REPO_ROOT)},
+            cwd=SERVER_ROOT,
+            env={'PYTHONPATH': image_pythonpath(SERVER_ROOT)},
             capture_output=True,
             text=True,
             timeout=EXIT_BUDGET_S,
@@ -247,11 +251,11 @@ def test_nothing_in_the_repository_reaches_for_common_timer_timeit():
     """No caller left anywhere, which is what makes the deletion safe rather than merely done."""
     offenders = []
     for tree in SOURCE_TREES:
-        for source in sorted((REPO_ROOT / tree).rglob('*.py')):
+        for source in sorted(resolve_tree(tree).rglob('*.py')):
             if source == Path(__file__):
                 continue
             for number, line in enumerate(source.read_text().splitlines(), start=1):
                 if TIMEIT_REFERENCE.search(line):
-                    offenders.append(f'{source.relative_to(REPO_ROOT)}:{number}: {line.strip()}')
+                    offenders.append(f'{repo_relative(source)}:{number}: {line.strip()}')
 
     assert offenders == [], 'common.timer.timeit was deleted on tj-3mk3u5.61:\n' + '\n'.join(offenders)

@@ -12,6 +12,8 @@ from fastapi import APIRouter
 from fastapi.routing import APIRoute
 from pydantic import BaseModel
 
+from common.tests.roots import SERVER_ROOT
+
 
 # THE INTERFACE MANIFEST (tj-ru24i2, ADR tj-fdb9gz).
 #
@@ -33,7 +35,12 @@ from pydantic import BaseModel
 # turn "the test went red" into a keystroke, which is exactly the friction the ruling asked for.
 # Edit the manifest by hand; the failure message below names the lines to add or remove verbatim.
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# THE SERVER ROOT (tj-iontkq.2). The only use is relative_to() on an implementing module's
+# __file__, to produce the manifests' file column -- lines such as
+# routers/data_store/asset_dataset_store.py, which are committed data and must stay byte-identical
+# across the move (epic tj-iontkq, invariant X-2). Those names are relative to the directory the
+# service trees live in, so this is SERVER_ROOT. REPO_ROOT would prefix every one of the 30
+# committed lines with the server directory and redline the whole manifest.
 MANIFEST_DIR = Path(__file__).resolve().parent / 'interface_manifest'
 
 # One manifest file per component, named for the component marker. The split is not cosmetic: it
@@ -89,7 +96,7 @@ def _module_relpath(module: ModuleType) -> str:
     module_file = getattr(module, '__file__', None)
     if module_file is None:
         raise AssertionError(f'{module.__name__} has no __file__, so its interfaces cannot be attributed to a file')
-    return Path(module_file).resolve().relative_to(REPO_ROOT).as_posix()
+    return Path(module_file).resolve().relative_to(SERVER_ROOT).as_posix()
 
 
 def _defining_module(function: Any) -> ModuleType:

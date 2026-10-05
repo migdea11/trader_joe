@@ -48,6 +48,7 @@ from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from common.errors.vocabulary import REASONS, ExogenousError, InvalidRequestError, Outcome, Reason, TraderJoeError
 from common.tests.image_path import image_pythonpath
+from common.tests.roots import REPO_ROOT, SERVER_ROOT, repo_relative
 from data.ingest.app import app_depends, grpc_host
 from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
 from data.ingest.app.brokers.interface import (
@@ -87,7 +88,17 @@ from tests.fakes.market_data import (
 
 pytestmark = pytest.mark.data_ingest
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+# BOTH ROOTS (tj-iontkq.2). tests/fakes and pyproject.toml stay at the top of the repository, so they
+# take REPO_ROOT. The two subprocess probes are handed SERVER_ROOT, because image_pythonpath()'s
+# argument is the directory the image calls /code -- the one `import common` resolves against.
+#
+# AND ONE THING THE SENTINELS SURFACE RATHER THAN SOLVE, which belongs to the move (tj-iontkq.4):
+# those probes import tests.fakes.market_data, which itself imports common.* and data.ingest.app.*,
+# so they need BOTH roots on PYTHONPATH. In the image that is one directory -- /code holds common/
+# and tests/fakes alike -- and on the host today the two roots are the same directory, so a single
+# entry serves. Once they diverge, image_pythonpath()'s single-root model no longer covers the host:
+# the probe needs REPO_ROOT on PYTHONPATH beside SERVER_ROOT, or tests/fakes has to travel with the
+# services. That is a decision for the move, not a guess to make here; naming it is the point.
 FAKES_DIR = REPO_ROOT / 'tests' / 'fakes'
 LAUNCHER_MODULE = 'tests.fakes.ingest_launcher'
 
@@ -319,8 +330,8 @@ def test_the_generator_serves_well_formed_bars_the_same_in_a_fresh_interpreter()
     )
     result = subprocess.run(
         [sys.executable, '-c', probe],
-        cwd=REPO_ROOT,
-        env={'PYTHONPATH': image_pythonpath(REPO_ROOT), 'PYTHONHASHSEED': '12345'},
+        cwd=SERVER_ROOT,
+        env={'PYTHONPATH': image_pythonpath(SERVER_ROOT), 'PYTHONHASHSEED': '12345'},
         capture_output=True,
         text=True,
         timeout=60,
@@ -805,8 +816,8 @@ def run_launcher_probe(**environ: str) -> subprocess.CompletedProcess:
     """
     return subprocess.run(
         [sys.executable, '-c', LAUNCHER_PROBE],
-        cwd=REPO_ROOT,
-        env={'PYTHONPATH': image_pythonpath(REPO_ROOT), **environ},
+        cwd=SERVER_ROOT,
+        env={'PYTHONPATH': image_pythonpath(SERVER_ROOT), **environ},
         capture_output=True,
         text=True,
         timeout=60,
@@ -963,7 +974,7 @@ def imports_of(path: Path) -> Iterator[tuple[int, str]]:
     Yields:
         tuple[int, str]: (line number, fully qualified module name).
     """
-    package = '.'.join(path.relative_to(REPO_ROOT).with_suffix('').parts[:-1])
+    package = '.'.join(repo_relative(path).with_suffix('').parts[:-1])
     for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -993,7 +1004,7 @@ def test_the_scan_covers_every_module_this_bead_wrote():
 
 def test_nothing_under_tests_fakes_imports_outside_the_production_image():
     violations = [
-        f'{path.relative_to(REPO_ROOT)}:{line}: {module}'
+        f'{repo_relative(path)}:{line}: {module}'
         for path in fakes_modules()
         for line, module in imports_of(path)
         if not import_is_allowed(module)

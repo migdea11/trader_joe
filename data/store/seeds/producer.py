@@ -32,7 +32,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from data.store.seeds.bundle import REPO_ROOT, Bundle, BundleRefused, render_bundle
+from common.tests.roots import SERVER_ROOT
+from data.store.seeds.bundle import Bundle, BundleRefused, render_bundle
 from data.store.seeds.dump import (
     BAR_TABLE,
     ENTRY_TABLE,
@@ -49,7 +50,18 @@ from routers.common.instance_secret import INSTANCE_SECRET_HEADER
 from tests.fakes.market_data import EMPTY_PREFIX
 
 
-VERSIONS_DIR: Path = REPO_ROOT / 'data' / 'store' / 'migrations' / 'versions'
+# SERVER_ROOT, not REPO_ROOT (tj-2bsw0k; epic tj-iontkq risk R-1). The migration revisions live
+# under <server>/data/store/migrations, where <server> is the directory holding common/, routers/
+# and schemas/ -- SERVER_ROOT's definition, not the true repository root bundle.py's REPO_ROOT
+# names. The two coincide today; after the service trees move under server/ (epic tj-iontkq) they
+# stop coinciding, and the old `REPO_ROOT / 'data' / ...` here would have resolved VERSIONS_DIR to
+# the repository root instead of server/, where no revisions exist.
+#
+# Imported from common.tests.roots rather than reproduced locally, unlike bundle.py: this package
+# never ships (see the package docstring) and already imports tests.fakes, so the stdlib-only
+# constraint that forced bundle.py's own marker search does not apply here, and importing the one
+# sentinel shared by every other site keeps this module from drifting out of step with it.
+VERSIONS_DIR: Path = SERVER_ROOT / 'data' / 'store' / 'migrations' / 'versions'
 
 
 class SeedRefused(Exception):

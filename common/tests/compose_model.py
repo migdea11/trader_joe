@@ -27,8 +27,12 @@ from typing import Any
 
 import yaml
 
+from common.tests.roots import REPO_ROOT
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# THE TRUE REPOSITORY ROOT (tj-iontkq.2). Every file below -- all five compose files and the two
+# .devcontainer files -- stays at the top of the repository, so this is REPO_ROOT and never
+# SERVER_ROOT.
 BASE_FILE = REPO_ROOT / 'docker-compose.yaml'
 TEST_CLIENT_FILE = REPO_ROOT / 'docker-compose.test-client.yaml'
 AGENT_STACK_FILE = REPO_ROOT / 'docker-compose.agent-stack.yaml'

@@ -1,10 +1,10 @@
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 
 from common.tests.image_path import image_pythonpath
+from common.tests.roots import SERVER_ROOT
 
 
 # The guard this file exists for (tj-4vnmik), mirroring data/ingest/tests/test_app_import.py: twice
@@ -19,7 +19,10 @@ from common.tests.image_path import image_pythonpath
 # APP_MODULE, RPC_MODULE and CREDENTIAL_PREFIXES. All three are per-service facts, not
 # boilerplate -- CREDENTIAL_PREFIXES especially, since it has to name what *this* service reads
 # at import time. Think about each one rather than carrying the previous copy's values over.
-REPO_ROOT = Path(__file__).resolve().parents[3]
+# THE SERVER ROOT (tj-iontkq.2): the only uses are the PYTHONPATH= and cwd= of the fresh
+# interpreter that imports APP_MODULE, so this is the IMPORT root. SERVER_ROOT, never REPO_ROOT --
+# and note the counted parents[3] it replaces would have stayed ACCIDENTALLY correct after the move,
+# which is why the name mattered more than the index.
 APP_MODULE = 'data.store.app.main'
 RPC_MODULE = 'routers.data_store.asset_dataset_store'
 
@@ -90,7 +93,7 @@ def probe_env() -> dict[str, str]:
     Returns:
         dict[str, str]: Every variable the probe process will see.
     """
-    return {'PYTHONPATH': image_pythonpath(REPO_ROOT)}
+    return {'PYTHONPATH': image_pythonpath(SERVER_ROOT)}
 
 
 @pytest.fixture(scope='module')
@@ -106,7 +109,7 @@ def import_probe() -> subprocess.CompletedProcess:
     program = IMPORT_PROBE.format(prefixes=CREDENTIAL_PREFIXES, app_module=APP_MODULE, rpc_module=RPC_MODULE)
     return subprocess.run(
         [sys.executable, '-c', program],
-        cwd=REPO_ROOT,
+        cwd=SERVER_ROOT,
         env=probe_env(),
         capture_output=True,
         text=True,

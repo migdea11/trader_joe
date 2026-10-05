@@ -1,10 +1,10 @@
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 
 from common.tests.image_path import image_pythonpath
+from common.tests.roots import SERVER_ROOT
 
 
 # The guard this file exists for (tj-8yix3i): twice now a module-scope dependency -- first the
@@ -14,7 +14,10 @@ from common.tests.image_path import image_pythonpath
 #
 # To mirror this for another service, copy the file into that service's tests and change
 # APP_MODULE and ROUTER_MODULE -- nothing else.
-REPO_ROOT = Path(__file__).resolve().parents[3]
+# THE SERVER ROOT (tj-iontkq.2): the only uses are the PYTHONPATH= and cwd= of the fresh
+# interpreter that imports APP_MODULE, so this is the IMPORT root. SERVER_ROOT, never REPO_ROOT --
+# and note the counted parents[3] it replaces would have stayed ACCIDENTALLY correct after the move,
+# which is why the name mattered more than the index.
 APP_MODULE = 'data.ingest.app.main'
 # Imported by name as well as through the app, so an import-time break in the router survives
 # main.py one day not mounting it. It is routers/data_ingest's only module with a module body worth
@@ -77,7 +80,7 @@ def probe_env() -> dict[str, str]:
     Returns:
         dict[str, str]: Every variable the probe process will see.
     """
-    return {'PYTHONPATH': image_pythonpath(REPO_ROOT)}
+    return {'PYTHONPATH': image_pythonpath(SERVER_ROOT)}
 
 
 @pytest.fixture(scope='module')
@@ -93,7 +96,7 @@ def import_probe() -> subprocess.CompletedProcess:
     program = IMPORT_PROBE.format(prefixes=CREDENTIAL_PREFIXES, app_module=APP_MODULE, router_module=ROUTER_MODULE)
     return subprocess.run(
         [sys.executable, '-c', program],
-        cwd=REPO_ROOT,
+        cwd=SERVER_ROOT,
         env=probe_env(),
         capture_output=True,
         text=True,

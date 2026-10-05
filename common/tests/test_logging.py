@@ -19,7 +19,6 @@ import logging
 import os
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 
@@ -27,11 +26,13 @@ from common.rpc.channel import create_channel
 from common.rpc.ping import ping, ping_service
 from common.rpc.server import BindAddress, GrpcServerHost
 from common.tests.image_path import image_pythonpath
+from common.tests.roots import SERVER_ROOT
 
 
 pytestmark = pytest.mark.common
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# THE SERVER ROOT (tj-iontkq.2): the only uses are the PYTHONPATH= and cwd= of a fresh interpreter
+# that imports common.logging_in_colour, so this is the IMPORT root. SERVER_ROOT, never REPO_ROOT.
 LOOPBACK = '127.0.0.1'
 GUARD_S = 10.0
 CALLS = 3
@@ -129,10 +130,10 @@ def test_the_service_logging_setup_drops_grpc_debug_and_keeps_its_own_debug_and_
     env = {name: value for name, value in os.environ.items() if name != 'PYTEST_ADDOPTS'}
     # The image's path model: common.rpc.ping imports trader_joe.proto, which a fresh interpreter
     # finds only on the image's second PYTHONPATH entry (decision tj-3mk3u5.42 F1).
-    env['PYTHONPATH'] = image_pythonpath(REPO_ROOT)
+    env['PYTHONPATH'] = image_pythonpath(SERVER_ROOT)
     result = subprocess.run(
         [sys.executable, '-c', _SERVICE_PROBE, own_debug, grpc_warning, CYGRPC],
-        cwd=REPO_ROOT,
+        cwd=SERVER_ROOT,
         env=env,
         capture_output=True,
         text=True,

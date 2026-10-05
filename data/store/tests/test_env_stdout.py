@@ -28,7 +28,6 @@ test_env_uri_masking.py documents.
 import runpy
 import subprocess
 import sys
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import alembic
@@ -36,12 +35,14 @@ import pytest
 from alembic.config import Config
 
 from common.tests.image_path import image_pythonpath
+from common.tests.roots import SERVER_ROOT
 
 
 pytestmark = pytest.mark.data_store
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-STORE_DIR = REPO_ROOT / 'data' / 'store'
+# THE SERVER ROOT (tj-iontkq.2): data/store/ travels with the services, and the root is also handed
+# to image_pythonpath() as the import root of a fresh interpreter. SERVER_ROOT, never REPO_ROOT.
+STORE_DIR = SERVER_ROOT / 'data' / 'store'
 ENV_PY = STORE_DIR / 'migrations' / 'env.py'
 
 # Port 1 on loopback: nothing listens there, so psycopg2 is refused immediately rather than
@@ -64,7 +65,7 @@ def alembic_current_env() -> dict[str, str]:
         dict[str, str]: Every variable the child process will see.
     """
     return {
-        'PYTHONPATH': image_pythonpath(REPO_ROOT),
+        'PYTHONPATH': image_pythonpath(SERVER_ROOT),
         'DATABASE_URI': UNREACHABLE_DATABASE_URI,
         'POSTGRES_ASYNC': 'true',
     }

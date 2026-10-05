@@ -26,12 +26,14 @@ from data.store.seeds.manifest import (
     head_revision,
     render_manifest,
 )
-from data.store.seeds.producer import REPO_ROOT, VERSIONS_DIR
+from data.store.seeds.producer import SERVER_ROOT, VERSIONS_DIR
 
 
 pytestmark = pytest.mark.data_store
 
-MIGRATIONS_DIR = REPO_ROOT / 'data' / 'store' / 'migrations'
+# SERVER_ROOT, not REPO_ROOT (tj-2bsw0k): VERSIONS_DIR's parent lives under the server root, which
+# is what producer.py now exports for this purpose -- see producer.py's VERSIONS_DIR comment.
+MIGRATIONS_DIR = SERVER_ROOT / 'data' / 'store' / 'migrations'
 
 
 # ---------------------------------------------------------------------------------------------

@@ -37,12 +37,14 @@ from pathlib import Path
 import pytest
 import yaml
 
+from common.tests.roots import REPO_ROOT
 from common.tests.test_ci_invariants import _expanded_make_variable
 
 
 pytestmark = pytest.mark.build_infra
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# THE TRUE REPOSITORY ROOT (tj-iontkq.2): .devcontainer/, .claude/ and the Makefile this module
+# reads all stay at the top of the repository, so this is REPO_ROOT and never SERVER_ROOT.
 DOCKERFILE = REPO_ROOT / '.devcontainer' / 'Dockerfile'
 WORKFLOW_MANIFEST = REPO_ROOT / '.claude' / 'workflow.yml'
 INSTALLER_URL = 'https://claude.ai/install.sh'

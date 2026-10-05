@@ -74,7 +74,37 @@ BARS_PATH = '/v2/stocks/bars'
 ASSET_PATH = '/v2/assets/{symbol}'
 DATA_URL = f'{DATA_HOST}{BARS_PATH}'
 CREDENTIAL_VARS = ('ALPACA_API_KEY', 'ALPACA_API_SECRET')
-DEFAULT_OUT = Path(__file__).resolve().parents[2] / 'data' / 'ingest' / 'tests' / 'fixtures' / 'alpaca'
+
+
+# THE SERVER ROOT, DERIVED LOCALLY AND DELIBERATELY NOT IMPORTED (tj-iontkq.2). The fixtures this
+# script writes live under data/ingest/, which travels with the service trees, while this script
+# lives under tests/, which stays at the top of the repository -- so the counted parents[2] it
+# replaces was the WRONG root and would quietly start writing fixtures into a directory nothing
+# reads. common/tests/roots.py is the canonical definition of both sentinels, and this does not
+# import it for two reasons: this file is run as a SCRIPT, never under pytest
+# (`uv run python tests/fakes/record_alpaca.py`), so sys.path[0] is tests/fakes and `common` is not
+# importable from it once common/ is a level down; and the upward marker search cannot reach the
+# server root from here anyway, since it is a sibling of tests/ rather than an ancestor of it. The
+# root is therefore found by stepping DOWN from the repository root. It raises rather than falling
+# back: writing recorded fixtures to a guessed directory is worse than not writing them.
+SERVER_MARKERS = ('common', 'routers', 'schemas')
+
+
+def _server_root() -> Path:
+    """The directory holding all of SERVER_MARKERS: the repository root itself, or its one child."""
+    start = Path(__file__).resolve().parent
+    for repo_root in (start, *start.parents):
+        if not (repo_root / 'pytest.ini').is_file():
+            continue
+        candidates = [repo_root, *sorted(child for child in repo_root.iterdir() if child.is_dir())]
+        for candidate in candidates:
+            if all((candidate / marker).is_dir() for marker in SERVER_MARKERS):
+                return candidate
+        raise RuntimeError(f'neither {repo_root} nor any child of it holds all of {SERVER_MARKERS}')
+    raise RuntimeError(f'no ancestor of {start} carries pytest.ini, so no root can be located')
+
+
+DEFAULT_OUT = _server_root() / 'data' / 'ingest' / 'tests' / 'fixtures' / 'alpaca'
 # What a stock-bars body or an error body may contain at the top level. Anything else is refused:
 # it would be a shape the tests do not know, and possibly data that is not market data.
 ALLOWED_TOP_LEVEL_KEYS = frozenset({'bars', 'next_page_token', 'currency', 'code', 'message'})

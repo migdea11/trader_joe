@@ -71,6 +71,7 @@ import pytest
 from common.enums.data_select import AssetType
 from common.enums.data_stock import Feed, Granularity
 from common.errors.vocabulary import REASONS, Disposition, Outcome, Reason, TraderJoeError
+from common.tests.roots import SERVER_ROOT, repo_relative, resolve_tree
 from data.ingest.app.brokers.alpaca import broker_api
 from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
 from data.ingest.app.brokers.alpaca.read import AlpacaRead
@@ -106,12 +107,15 @@ from tests.fakes.market_data import (
 
 pytestmark = pytest.mark.data_ingest
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-
 # Where a BrokerRead implementation may live: data_ingest's production tree and the fakes the
 # test-only launcher installs. The bead names data/ingest/app/brokers; the whole app tree is
 # scanned so an implementation placed beside the brokers package cannot slip past.
-IMPLEMENTATION_ROOTS = (REPO_ROOT / 'data' / 'ingest' / 'app', REPO_ROOT / 'tests' / 'fakes')
+#
+# THE TWO ROOTS SIT IN ONE TUPLE (tj-iontkq.2): data/ingest/app travels with the services and
+# tests/fakes stays at the top of the repository, so each name is resolved by resolve_tree() under
+# the root that owns it rather than both under one. test_the_scan_roots_exist_and_hold_the_interface
+# below is what would catch a wrong answer -- it asserts each root is a directory holding .py files.
+IMPLEMENTATION_ROOTS = (resolve_tree('data/ingest/app'), resolve_tree('tests/fakes'))
 
 # Bound offsets the range rule is checked under: it is on instants, whatever offset the query carries.
 OFFSETS = pytest.mark.parametrize(
@@ -809,7 +813,10 @@ async def test_two_identical_requests_give_equal_results(subject):
 
 
 def module_name(path: Path) -> str:
-    return '.'.join(path.relative_to(REPO_ROOT).with_suffix('').parts)
+    # repo_relative, not one root: a hit under data/ingest/app must name itself data.ingest.app.*
+    # and a hit under tests/fakes must name itself tests.fakes.* -- the two live under different
+    # roots once the service trees move down a level (tj-iontkq.2).
+    return '.'.join(repo_relative(path).with_suffix('').parts)
 
 
 def is_protocol(node: ast.ClassDef) -> bool:
@@ -848,7 +855,7 @@ def test_the_scan_roots_exist_and_hold_the_interface():
         assert root.is_dir(), root
         assert any(root.rglob('*.py')), root
     # The Protocol itself lives under a root and is not counted as an implementation.
-    interface = REPO_ROOT / 'data' / 'ingest' / 'app' / 'brokers' / 'interface.py'
+    interface = SERVER_ROOT / 'data' / 'ingest' / 'app' / 'brokers' / 'interface.py'
     assert interface.is_relative_to(IMPLEMENTATION_ROOTS[0])
     assert 'class BrokerRead(Protocol)' in interface.read_text(encoding='utf-8')
 

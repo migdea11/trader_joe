@@ -38,14 +38,17 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from functools import cache
-from pathlib import Path
 
 import pytest
+
+from common.tests.roots import REPO_ROOT
 
 
 pytestmark = pytest.mark.build_infra
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# THE TRUE REPOSITORY ROOT (tj-iontkq.2): .claude/settings.json stays at the top of the repository,
+# and the hooks it registers are run with the repository root as their cwd -- that is the directory
+# a hook's own path rules are written against. REPO_ROOT, never SERVER_ROOT.
 SETTINGS = REPO_ROOT / '.claude' / 'settings.json'
 TOOL = 'Bash'
 EVENT = 'PreToolUse'

@@ -47,11 +47,18 @@ from pathlib import Path
 import pytest
 
 from common.tests.image_path import image_import_roots
+from common.tests.roots import REPO_ROOT, SERVER_ROOT, repo_relative, resolve_tree
 
 
 pytestmark = pytest.mark.data_ingest
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+# THREE DIFFERENT NEEDS, which one name called REPO_ROOT could not tell apart (tj-iontkq.2):
+#   * PRODUCTION_ROOTS below spans BOTH roots -- data/ingest/app, routers, common and schemas travel
+#     with the services, gen/proto/python does not -- so every walk over it goes through
+#     resolve_tree() and names its hits with repo_relative().
+#   * DOCKERFILE is the repository's own Dockerfile, which stays at the top: REPO_ROOT.
+#   * module_file() searches as the IMAGE's interpreter searches, so it is handed SERVER_ROOT, the
+#     directory the image calls /code.
 APP_ROOT = 'data/ingest/app'
 GENERATED_ROOT = 'gen/proto/python'
 PRODUCTION_ROOTS = (APP_ROOT, 'routers', 'common', 'schemas', GENERATED_ROOT)
@@ -68,14 +75,14 @@ def production_modules() -> list[Path]:
     return sorted(
         path
         for root in PRODUCTION_ROOTS
-        for path in (REPO_ROOT / root).rglob('*.py')
-        if TEST_PACKAGE not in path.relative_to(REPO_ROOT).parts
+        for path in resolve_tree(root).rglob('*.py')
+        if TEST_PACKAGE not in repo_relative(path).parts
     )
 
 
 def package_of(path: Path) -> list[str]:
     """The dotted package a module sits in, as the parts a relative import resolves against."""
-    return list(path.relative_to(REPO_ROOT).parent.parts)
+    return list(repo_relative(path).parent.parts)
 
 
 def imported_modules(path: Path) -> list[tuple[int, str]]:
@@ -152,7 +159,7 @@ def is_test_tree(module: str) -> bool:
 def test_the_scan_reads_every_production_root():
     # A root that moved or emptied would make the scan below pass having read nothing.
     for root in PRODUCTION_ROOTS:
-        assert any(path.is_relative_to(REPO_ROOT / root) for path in production_modules()), f'{root} has no modules'
+        assert any(path.is_relative_to(resolve_tree(root)) for path in production_modules()), f'{root} has no modules'
 
 
 DOCKERFILE = REPO_ROOT / 'Dockerfile'
@@ -247,7 +254,7 @@ def dockerfile_copy_directories() -> set[str]:
     assert sources, f'{SOURCE_STAGE} has no COPY lines'
     directories: set[str] = set()
     for source in sources:
-        path = REPO_ROOT / source
+        path = resolve_tree(source)
         assert path.exists(), f'{SOURCE_STAGE} copies {source}, which does not exist'
         if path.is_dir():
             directories.add(source)
@@ -291,7 +298,7 @@ def module_file(module: str) -> Path | None:
     Searched as the image's interpreter searches: each PYTHONPATH entry in order, the repository root
     first, then gen/proto/python (see FIRST-PARTY MEANS ON THE IMAGE'S PATH above).
     """
-    for root in image_import_roots(REPO_ROOT):
+    for root in image_import_roots(SERVER_ROOT):
         base = root.joinpath(*module.split('.'))
         for candidate in (base.with_suffix('.py'), base / '__init__.py'):
             if candidate.is_file():
@@ -303,11 +310,11 @@ def test_the_resolver_finds_generated_code_on_the_images_second_root():
     # Non-vacuous for the reach walk below: no app imports generated code yet (registered_services()
     # is empty), so that walk alone would pass with a resolver that never looks past the root. The
     # one importer today, common.rpc.ping, is followed here instead, as the walk will follow it.
-    generated = REPO_ROOT / GENERATED_ROOT / 'trader_joe' / 'proto' / 'ping' / 'v1'
+    generated = resolve_tree(GENERATED_ROOT) / 'trader_joe' / 'proto' / 'ping' / 'v1'
     assert module_file('trader_joe.proto.ping.v1.ping_pb2') == generated / 'ping_pb2.py'
     assert module_file('trader_joe.proto.ping.v1.ping_pb2_grpc') == generated / 'ping_pb2_grpc.py'
-    assert module_file('common.rpc.ping') == REPO_ROOT / 'common' / 'rpc' / 'ping.py'
-    reached = {module_file(module) for _, module in imported_modules(REPO_ROOT / 'common' / 'rpc' / 'ping.py')}
+    assert module_file('common.rpc.ping') == SERVER_ROOT / 'common' / 'rpc' / 'ping.py'
+    reached = {module_file(module) for _, module in imported_modules(SERVER_ROOT / 'common' / 'rpc' / 'ping.py')}
     assert generated / 'ping_pb2.py' in reached, 'common.rpc.ping no longer reaches the generated modules'
     assert reached - {None} <= set(production_modules()), 'common.rpc.ping imports a module the scan does not read'
 
@@ -316,7 +323,7 @@ def test_the_scan_reaches_every_module_the_app_imports():
     # A root narrower than what the image loads -- routers/data_ingest where the app also imports
     # routers.common -- would leave a shipped module unscanned while every root still had modules.
     scanned = set(production_modules())
-    pending = [path for path in scanned if path.is_relative_to(REPO_ROOT / APP_ROOT)]
+    pending = [path for path in scanned if path.is_relative_to(resolve_tree(APP_ROOT))]
     reached: set[Path] = set()
     while pending:
         path = pending.pop()
@@ -328,9 +335,9 @@ def test_the_scan_reaches_every_module_the_app_imports():
             if target is not None and not is_test_tree(module):
                 pending.append(target)
 
-    unscanned = sorted(str(path.relative_to(REPO_ROOT)) for path in reached - scanned)
+    unscanned = sorted(str(repo_relative(path)) for path in reached - scanned)
     # Non-vacuous: the walk left the app, or a resolver that matched nothing would pass trivially.
-    assert any(not path.is_relative_to(REPO_ROOT / APP_ROOT) for path in reached), 'the walk never left the app'
+    assert any(not path.is_relative_to(resolve_tree(APP_ROOT)) for path in reached), 'the walk never left the app'
     assert not unscanned, 'the app imports modules outside PRODUCTION_ROOTS:\n' + '\n'.join(unscanned)
 
 
@@ -351,7 +358,7 @@ def read_as_app_module(monkeypatch, tmp_path, source: str) -> list[str]:
     module sits, without writing into the tree the scan reads: the probe path is never created,
     and reading it returns the stand-in's source.
     """
-    probe = REPO_ROOT / APP_ROOT / '_r4_probe.py'
+    probe = resolve_tree(APP_ROOT) / '_r4_probe.py'
     stand_in = tmp_path / 'probe.py'
     stand_in.write_text(source, encoding='utf-8')
     original = Path.read_text
@@ -406,7 +413,7 @@ def test_the_dynamic_read_does_not_flag_what_is_not_a_test_tree_import(monkeypat
 
 def test_no_production_module_imports_the_test_tree():
     offenders = [
-        f'{path.relative_to(REPO_ROOT)}:{line} imports {module}'
+        f'{repo_relative(path)}:{line} imports {module}'
         for path in production_modules()
         for line, module in scanned_imports(path)
         if is_test_tree(module)

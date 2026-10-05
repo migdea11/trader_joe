@@ -44,7 +44,6 @@ import subprocess
 import sys
 from collections.abc import AsyncIterator
 from contextlib import ExitStack, asynccontextmanager
-from pathlib import Path
 from typing import Final
 from unittest.mock import Mock, patch
 
@@ -59,6 +58,7 @@ from common.rpc.ping import SERVICE_NAME as PING_SERVICE_NAME
 from common.rpc.ping import ping, ping_service
 from common.rpc.server import GRPC_HOST_ENV, GRPC_PORT_ENV
 from common.tests.image_path import image_pythonpath
+from common.tests.roots import SERVER_ROOT
 from common.worker_pool import SharedWorkerPool
 from data.ingest.app import app_depends, grpc_host, main
 from data.ingest.app.brokers.interface import BarsQuery, BarsResponse
@@ -68,7 +68,8 @@ from routers.common import latency as latency_harness
 
 pytestmark = pytest.mark.data_ingest
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+# THE SERVER ROOT (tj-iontkq.2): the only uses are the cwd= and PYTHONPATH= of fresh interpreters
+# that import the ingest app, so this is the IMPORT root. SERVER_ROOT, never REPO_ROOT.
 SERVING = health_pb2.HealthCheckResponse.SERVING
 READY_LOG: Final = 'Data Ingest App Ready!!!'
 
@@ -381,10 +382,10 @@ def test_the_process_exits_after_the_lifespan_whether_or_not_the_grpc_host_start
     try:
         done = subprocess.run(
             [sys.executable, '-c', EXIT_PROBE, case],
-            cwd=REPO_ROOT,
+            cwd=SERVER_ROOT,
             # The image's path: the probe runs the real lifespan, whose servicers import generated code
             # once tj-3mk3u5.9/.10 register them (decision tj-3mk3u5.42 F1).
-            env={'PYTHONPATH': image_pythonpath(REPO_ROOT)},
+            env={'PYTHONPATH': image_pythonpath(SERVER_ROOT)},
             capture_output=True,
             text=True,
             timeout=EXIT_BUDGET_S,
@@ -496,8 +497,8 @@ def test_with_the_latency_harness_off_only_fetch_dataset_is_registered_and_the_l
     try:
         done = subprocess.run(
             [sys.executable, '-c', HARNESS_OFF_PROBE],
-            cwd=REPO_ROOT,
-            env={'PYTHONPATH': image_pythonpath(REPO_ROOT)},
+            cwd=SERVER_ROOT,
+            env={'PYTHONPATH': image_pythonpath(SERVER_ROOT)},
             capture_output=True,
             text=True,
             timeout=EXIT_BUDGET_S,

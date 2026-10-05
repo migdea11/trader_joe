@@ -34,10 +34,14 @@ from pathlib import Path
 
 import pytest
 
+from common.tests.roots import REPO_ROOT
+
 
 pytestmark = pytest.mark.build_infra
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# THE TRUE REPOSITORY ROOT (tj-iontkq.2): gen/ and proto/ are root siblings of the service trees,
+# the Makefile target this module invokes with `make -C` is at the root, and `git ls-files` must run
+# in the checkout root to list the whole repository. REPO_ROOT, never SERVER_ROOT.
 GENERATED_ROOT = REPO_ROOT / 'gen' / 'proto' / 'python'
 # The one hand-committed file in the generated package: make proto's guard, and kept when it clears.
 GUARD = Path('trader_joe') / 'proto' / '__init__.py'

@@ -43,9 +43,51 @@ from common.environment import get_env_var
 from common.tests import compose_model
 from common.tests.compose_model import InterpolationRefused, interpolate
 from common.tests.image_path import IMAGE_CODE_ROOT, IMAGE_PYTHONPATH_ENTRIES, image_import_roots
+from common.tests.roots import REPO_ROOT, SERVER_ROOT
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# THIS MODULE NEEDS BOTH ROOTS, AND IT IS THE FILE THE TWO NAMES EXIST FOR (tj-iontkq.2, epic risk
+# R-1). Until they were split, one counted index called REPO_ROOT served roughly fifty sites here, of
+# which a handful wanted a different directory. The failure that would follow is not an ImportError:
+# the root silently becomes the wrong directory, the files it names are simply absent, and a good
+# number of the ~30 assertions below pass having read nothing -- this project's recorded failure
+# shape (tj-0qxnzw, tj-06uflo).
+#
+# REPO_ROOT is the default and the right answer for the large majority. Everything this module reads
+# as repository configuration stays at the top of the repository: .github/workflows, the compose
+# files, .env.default, Makefile, pytest.ini, Dockerfile, .dockerignore, pyproject.toml, uv.lock,
+# tools/, tests/system/. So does everything measured in DOCKER BUILD CONTEXT terms -- the Dockerfile
+# COPY sources, the scanner roots from SOURCE_DIRS, .dockerignore matching, source_digest.sh's file
+# list -- because the build context IS the repository root, and so does anything compared against
+# `git ls-files` or run through `make`, `git` or `ruff` with the root as its cwd.
+#
+# SERVER_ROOT is the answer at exactly three kinds of site, each marked where it is used:
+#   * data/store/run_migrations.sh and data/store/migrations/versions, which travel with the service
+#     trees (MIGRATIONS_SCRIPT, MIGRATION_VERSIONS_DIR);
+#   * the import root pytest itself puts on sys.path, asserted in
+#     test_pytest_puts_the_generated_root_on_the_suites_path;
+#   * the import root pytest itself puts on sys.path, in the same test.
+#
+# AND THERE IS A THIRD ROOT HERE, WHICH IS WHY IT GETS ITS OWN NAME RATHER THAN BEING FILED UNDER
+# EITHER SENTINEL. The import-closure machinery -- _first_party_module_file, _imported_module_names,
+# _package_inits, _app_import_closure, _app_imports_outside_image, _app_imports_excluded -- models
+# ONE directory that is simultaneously two things: the import root, because it resolves dotted module
+# names to files, and the build-context root, because the paths it produces are compared against
+# Dockerfile COPY sources and matched against .dockerignore rules. In the service image those really
+# are one directory: /code holds common/, data/*/app and gen/proto/python alike, which is the whole
+# reason the cluster was written this way. On the host today the two roots are equal, so it is
+# correct as it stands.
+#
+# ONCE THEY DIVERGE, THE MOVE HAS TO RULE ON IT (tj-iontkq.4), and this comment is the hand-off
+# rather than a guess made here: the closure's paths would be server-relative while the COPY sources
+# and .dockerignore rules they are judged against are context-relative, and gen/proto/python stays at
+# the repository root while common/ goes down a level. Naming the constant CHECKOUT_CODE_ROOT keeps
+# that question visible instead of hiding it inside whichever sentinel happened to be picked. It is
+# also deliberately ONE value, because four tests below stand up a synthetic flat tree under tmp_path
+# and monkeypatch it -- they patch this name now, which the rename forces and which changes nothing
+# they assert.
+CHECKOUT_CODE_ROOT = SERVER_ROOT
+
 WORKFLOW_DIR = REPO_ROOT / '.github' / 'workflows'
 COMPOSE_FILE = REPO_ROOT / 'docker-compose.yaml'
 OVERRIDE_FILE = REPO_ROOT / 'docker-compose.override.yaml'
@@ -1240,7 +1282,8 @@ def test_permanent_rule_families_are_suppressed_only_where_ruled():
 # arguments to alembic and falls back to `upgrade head` when given none. So a bare call to
 # the script is an UPGRADE, and it is read as one here. The fallback is read from the script
 # rather than restated, so the two cannot drift apart.
-MIGRATIONS_SCRIPT = REPO_ROOT / 'data' / 'store' / 'run_migrations.sh'
+# SERVER_ROOT: data/store/ travels with the service trees (tj-iontkq.2).
+MIGRATIONS_SCRIPT = SERVER_ROOT / 'data' / 'store' / 'run_migrations.sh'
 
 # An allow list of WHOLE INVOCATIONS, so that it fails closed AND cannot be fooled by an
 # argument (tj-k7xu0n). It used to key on the subcommand name alone, and that was unsound:
@@ -3305,7 +3348,8 @@ _FUNCTION_HEAD = re.compile(r'^(\w+)\(\)\s*\{$')
 _CAPTURED_CALL = re.compile(r'^(\w+)="\$\((\w+) (\w+)\)"$')
 
 
-MIGRATION_VERSIONS_DIR = REPO_ROOT / 'data' / 'store' / 'migrations' / 'versions'
+# SERVER_ROOT: data/store/ travels with the service trees (tj-iontkq.2).
+MIGRATION_VERSIONS_DIR = SERVER_ROOT / 'data' / 'store' / 'migrations' / 'versions'
 # What common/database/postgres_tools.py printed at import before tj-ijpys9.20: stray stdout of
 # the kind awk's first field would have read as revisions, had anything in alembic's chain imported it.
 _IMPORT_TIME_STDOUT = 'Postgres async is enabled.\nPostgres sync is enabled.\n'
@@ -5151,7 +5195,8 @@ def _first_party_module_file(module: str) -> Path | None:
     is not first-party, and an app reaching it through common.rpc would pass the COPY check below
     with the generated tree uncopied (decision tj-3mk3u5.42 F1).
     """
-    for root in image_import_roots(REPO_ROOT):
+    # SERVER_ROOT, the import root: this resolves dotted module names (tj-iontkq.2).
+    for root in image_import_roots(CHECKOUT_CODE_ROOT):
         base = root.joinpath(*module.split('.'))
         for candidate in (base.with_suffix('.py'), base / '__init__.py'):
             if candidate.is_file():
@@ -5167,7 +5212,7 @@ def _imported_module_names(path: Path) -> list[str]:
     submodule rather than a name defined in x.
     """
     tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
-    package = list(path.relative_to(REPO_ROOT).parent.parts)
+    package = list(path.relative_to(CHECKOUT_CODE_ROOT).parent.parts)
     found: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -5184,12 +5229,12 @@ def _imported_module_names(path: Path) -> list[str]:
 
 
 def _package_inits(path: Path) -> set[Path]:
-    """Each package __init__.py between the repo root and `path`, where one exists."""
-    relative = path.relative_to(REPO_ROOT)
+    """Each package __init__.py between the import root and `path`, where one exists."""
+    relative = path.relative_to(CHECKOUT_CODE_ROOT)
     return {
         init
         for depth in range(1, len(relative.parts))
-        if (init := REPO_ROOT.joinpath(*relative.parts[:depth], '__init__.py')).is_file()
+        if (init := CHECKOUT_CODE_ROOT.joinpath(*relative.parts[:depth], '__init__.py')).is_file()
     }
 
 
@@ -5200,7 +5245,7 @@ def _app_import_closure(app: str) -> set[Path]:
     Each package __init__.py on a reached file's path runs when that file is imported, so it is
     walked like any other reached file, not merely added: what it imports is loaded too.
     """
-    pending = sorted((REPO_ROOT / app).rglob('*.py'))
+    pending = sorted((CHECKOUT_CODE_ROOT / app).rglob('*.py'))
     reached: set[Path] = set()
     while pending:
         path = pending.pop()
@@ -5255,7 +5300,7 @@ def _app_imports_outside_image(app: str, static_sources: set[str]) -> list[str]:
     ancestors = {parent.as_posix() for source in own for parent in PurePosixPath(source).parents} - {'.'}
     offenders = []
     for path in _app_import_closure(app):
-        relative = path.relative_to(REPO_ROOT).as_posix()
+        relative = path.relative_to(CHECKOUT_CODE_ROOT).as_posix()
         if any(_is_under(relative, source) for source in own):
             continue
         if path.name == '__init__.py' and PurePosixPath(relative).parent.as_posix() in ancestors:
@@ -5272,7 +5317,7 @@ def _app_imports_excluded(rules: _IgnoreRules) -> dict[str, list[str]]:
         app: sorted(
             relative
             for path in _app_import_closure(app)
-            if _is_excluded_from_context(relative := path.relative_to(REPO_ROOT).as_posix(), rules)
+            if _is_excluded_from_context(relative := path.relative_to(CHECKOUT_CODE_ROOT).as_posix(), rules)
         )
         for app in sorted(_dockerfile_service_apps())
     }
@@ -5420,7 +5465,7 @@ def test_the_service_apps_are_derived_from_the_dockerfile_and_their_closures_are
     apps = _dockerfile_service_apps()
     assert apps >= set(KNOWN_APP_IMPORTS), f'the COPY parse found service apps {sorted(apps)}'
     for app, known in KNOWN_APP_IMPORTS.items():
-        closure = {path.relative_to(REPO_ROOT).as_posix() for path in _app_import_closure(app)}
+        closure = {path.relative_to(CHECKOUT_CODE_ROOT).as_posix() for path in _app_import_closure(app)}
         assert known in closure, f'the import closure of {app} does not reach {known}'
         assert len(closure) >= APP_CLOSURE_FLOOR, f'the import closure of {app} reached only {len(closure)} files'
 
@@ -5453,7 +5498,7 @@ def test_the_import_closure_follows_guarded_and_deferred_imports(tmp_path: Path,
         '    import lib.lazy\n',
         encoding='utf-8',
     )
-    monkeypatch.setattr(sys.modules[__name__], 'REPO_ROOT', tmp_path)
+    monkeypatch.setattr(sys.modules[__name__], 'CHECKOUT_CODE_ROOT', tmp_path)
     closure = {path.relative_to(tmp_path).as_posix() for path in _app_import_closure('app')}
     assert closure == {
         'app/main.py',
@@ -5493,7 +5538,7 @@ def test_the_copy_coverage_check_names_what_the_image_does_not_copy(tmp_path: Pa
     for relative, text in files.items():
         (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / relative).write_text(text, encoding='utf-8')
-    monkeypatch.setattr(sys.modules[__name__], 'REPO_ROOT', tmp_path)
+    monkeypatch.setattr(sys.modules[__name__], 'CHECKOUT_CODE_ROOT', tmp_path)
     assert _app_imports_outside_image('svc/a/app', {'shared'}) == [
         'stray.py',
         'stray_from_init.py',
@@ -5527,7 +5572,7 @@ def test_the_copy_coverage_check_follows_generated_code_onto_the_images_second_r
     for relative, text in files.items():
         (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / relative).write_text(text, encoding='utf-8')
-    monkeypatch.setattr(sys.modules[__name__], 'REPO_ROOT', tmp_path)
+    monkeypatch.setattr(sys.modules[__name__], 'CHECKOUT_CODE_ROOT', tmp_path)
     closure = {path.relative_to(tmp_path).as_posix() for path in _app_import_closure('svc/app')}
     assert 'gen/proto/python/trader_joe/proto/x/v1/x_pb2.py' in closure, sorted(closure)
     assert _app_imports_outside_image('svc/app', {'shared', 'gen/proto/python'}) == []
@@ -5567,7 +5612,7 @@ def test_an_uncopied_ancestor_init_is_allowed_only_without_statements(
     for relative, content in files.items():
         (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / relative).write_text(content, encoding='utf-8')
-    monkeypatch.setattr(sys.modules[__name__], 'REPO_ROOT', tmp_path)
+    monkeypatch.setattr(sys.modules[__name__], 'CHECKOUT_CODE_ROOT', tmp_path)
     expected = [] if allowed else [f'svc/__init__.py ({_UNCOPIED_INIT_WITH_CODE})']
     assert _app_imports_outside_image('svc/a/app', {'shared'}) == expected
 
@@ -6814,7 +6859,10 @@ def test_pytest_puts_the_generated_root_on_the_suites_path():
     )
     on_path = {Path(entry).resolve() for entry in sys.path if entry}
     assert (REPO_ROOT / GENERATED_PYTHON_ROOT).resolve() in on_path, 'the pythonpath option did not reach sys.path'
-    assert REPO_ROOT.resolve() in on_path, 'the repository root is no longer on the suite path'
+    # SERVER_ROOT, not REPO_ROOT (tj-iontkq.2): what pytest's prepend import mode puts on sys.path is
+    # the directory the test packages' __init__.py chain walks up to -- the IMPORT root, which is the
+    # repository root today and the server root once the service trees move down a level.
+    assert SERVER_ROOT.resolve() in on_path, 'the import root is no longer on the suite path'
 
 
 # THE RUNTIME PATH IN THE CONTAINERS, as compose builds each container's environment: the image's ENV,

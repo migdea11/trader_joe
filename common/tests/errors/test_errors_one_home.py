@@ -35,13 +35,13 @@ separator -- proves the single home is REACHED, not that a second one cannot be 
 
 import ast
 import logging
-from pathlib import Path
 
 import pytest
 from google.rpc import error_details_pb2, status_pb2
 
 from common.errors.vocabulary import METADATA_SEQUENCE_SEPARATOR, InvalidRequestError, Reason, own_error_id
 from common.rpc.errors import abort_with_error
+from common.tests.roots import SERVER_ROOT
 from routers.tests.problem_app import answer_to
 
 
@@ -54,12 +54,15 @@ GRPC_LOGGER = 'common.rpc.errors'
 HTTP_LOGGER = 'routers.common.errors'
 
 # The two edge modules. Both are read as SOURCE for the structural claim, so the paths are resolved from the
-# repository root rather than from an imported module's __file__ -- a module that failed to import would
+# import root rather than from an imported module's __file__ -- a module that failed to import would
 # otherwise make the guard silently unrunnable rather than red.
-REPO_ROOT = Path(__file__).resolve().parents[3]
+#
+# THE SERVER ROOT (tj-iontkq.2): both paths name a tree that travels with the services -- common/ and
+# routers/ -- so this is SERVER_ROOT. REPO_ROOT would leave both files missing and the guard green
+# with nothing read.
 EDGE_SOURCES = {
-    'common/rpc/errors.py': REPO_ROOT / 'common' / 'rpc' / 'errors.py',
-    'routers/common/errors.py': REPO_ROOT / 'routers' / 'common' / 'errors.py',
+    'common/rpc/errors.py': SERVER_ROOT / 'common' / 'rpc' / 'errors.py',
+    'routers/common/errors.py': SERVER_ROOT / 'routers' / 'common' / 'errors.py',
 }
 
 # The two judgements that must have exactly one home, and the shared name each edge must reach them by.

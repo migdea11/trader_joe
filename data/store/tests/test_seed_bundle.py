@@ -47,6 +47,7 @@ from data.store.seeds.bundle import (
     write_bundle,
 )
 from data.store.seeds.manifest import render_manifest
+from data.store.seeds.producer import VERSIONS_DIR
 
 
 pytestmark = pytest.mark.data_store
@@ -311,8 +312,14 @@ def test_render_refuses_what_parse_would_refuse(seed):
 
 
 def test_every_revision_in_the_chain_passes_the_format_check():
-    """The 12-hex check must never refuse a real revision (alembic's default ids are 12 hex)."""
-    versions = REPO_ROOT / 'data' / 'store' / 'migrations' / 'versions'
+    """The 12-hex check must never refuse a real revision (alembic's default ids are 12 hex).
+
+    VERSIONS_DIR, not REPO_ROOT / 'data' / ... (tj-2bsw0k): the versions directory sits under the
+    SERVER root, which REPO_ROOT does not name (it is the TRUE repository root -- see bundle.py).
+    Importing producer's VERSIONS_DIR keeps this test from recomputing the server-root path itself,
+    the same one-name-two-roots shape site 1 of tj-2bsw0k fixed in producer.py.
+    """
+    versions = VERSIONS_DIR
     revisions = []
     for path in sorted(versions.glob('*.py')):
         for node in ast.parse(path.read_text(encoding='utf-8')).body:
@@ -388,7 +395,68 @@ def test_the_real_checkouts_tests_is_refused_by_default():
 
 
 def test_the_repo_root_is_the_checkout():
+    """The TRUE repository root, named by what only it carries.
+
+    `data/store/seeds/bundle.py` alone cannot be the discriminator: once the service trees move
+    under server/ (epic tj-iontkq) that path exists beneath BOTH roots, so this assertion would
+    hold just as well for the server root the old `parents[3]` count returned. pytest.ini and
+    tests/ are what stay at the top of the repository, and tests/ is the directory the whole
+    refusal below is about.
+    """
     assert (REPO_ROOT / 'data' / 'store' / 'seeds' / 'bundle.py').is_file()
+    assert (REPO_ROOT / 'pytest.ini').is_file()
+    assert (REPO_ROOT / 'tests').is_dir()
+
+
+# ---------------------------------------------------------------------------------------------
+# REPO_ROOT's own resolution (tj-qanatv): the marker search behind check_out_dir's default.
+#
+# Every test above either passes repo_root= explicitly or runs the default against TODAY's
+# checkout, where the true repository root and the server root are the same directory. None of
+# them can therefore tell a marker search from the `Path(__file__).resolve().parents[3]` count it
+# replaced -- measured, not assumed: with that count restored, and separately with the raise below
+# replaced by a silent filesystem-root fallback, the whole data/store suite stayed green at 1172
+# passed. The fabricated layouts here are the only shape in which either property is observable.
+
+
+def _post_move_tree(tmp_path: Path) -> Path:
+    """The shape epic tj-iontkq produces: the service trees one level down, tests/ left at the top."""
+    root = tmp_path / 'repo'
+    (root / 'tests' / 'system').mkdir(parents=True)
+    (root / 'pytest.ini').write_text('[pytest]\n', encoding='utf-8')
+    (root / 'server' / 'data' / 'store' / 'seeds').mkdir(parents=True)
+    return root
+
+
+def test_the_repo_root_is_found_by_marker_not_by_counting(tmp_path):
+    """Post-move the fixed count lands on server/; the marker search lands on the real root."""
+    root = _post_move_tree(tmp_path)
+    seeds = root / 'server' / 'data' / 'store' / 'seeds'
+    assert bundle_module._find_repo_root(seeds) == root
+    # The count this replaced, spelled out so the difference is visible rather than argued: it
+    # returns server/, and server/tests does not exist, which is why the refusal stopped firing.
+    assert seeds.parents[2] == root / 'server'
+    assert not (root / 'server' / 'tests').exists()
+
+
+def test_the_marker_search_keeps_the_refusal_firing_after_the_move(tmp_path):
+    """The property the search exists for, and the fail-open behaviour it replaces, side by side."""
+    root = _post_move_tree(tmp_path)
+    target = root / 'tests' / 'system' / 'seeds'
+    found = bundle_module._find_repo_root(root / 'server' / 'data' / 'store' / 'seeds')
+    with pytest.raises(BundleRefused, match='--allow-tests-dir'):
+        check_out_dir(target, repo_root=found)
+    # The old root, post-move: the same path through the same guard, permitted and silent. This
+    # is the fail-OPEN direction tj-qanatv was filed for, pinned so it cannot come back unnoticed.
+    assert check_out_dir(target, repo_root=root / 'server') == target.resolve()
+
+
+def test_a_tree_with_no_marker_raises_rather_than_falling_back(tmp_path):
+    """No fallback: a silent filesystem-root default is the same vacuous pass in a new place."""
+    orphan = tmp_path / 'no-marker' / 'data' / 'store' / 'seeds'
+    orphan.mkdir(parents=True)
+    with pytest.raises(RuntimeError, match=r'pytest\.ini'):
+        bundle_module._find_repo_root(orphan)
 
 
 def test_a_refused_directory_is_never_created(repo):

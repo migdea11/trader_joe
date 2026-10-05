@@ -33,7 +33,55 @@ from tools.agent_mcp import runner, stack
 from tools.agent_mcp.settings import Settings
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+# THE TWO ROOTS, DERIVED LOCALLY AND DELIBERATELY NOT IMPORTED (tj-iontkq.2).
+#
+# committed_defaults() below reads three files that do NOT share a root: `.env.default` at the top of
+# the repository, and `data/store/.env.default` and `data/ingest/.env.default`, which travel with the
+# service trees. One counted parents[3] called REPO_ROOT served all three only because the two roots
+# are the same directory today.
+#
+# WHY THIS DOES NOT IMPORT common/tests/roots.py, which is the canonical definition of both
+# sentinels. Two reasons, and both are about the seam this module sits on:
+#   * tools/ stays at the top of the repository while common/ travels down, so `make test PATHS=tools`
+#     would have only the repository root on sys.path and `import common.tests.roots` would be an
+#     ImportError -- a whole-tree run would pass and a tools-scoped run would not collect at all.
+#   * the upward marker search cannot find the server root from here anyway: from
+#     tools/agent_mcp/tests the ancestors are tools/agent_mcp, tools and the repository root, and the
+#     server root is none of those once it is a sibling of tools/ rather than the root itself.
+# So the server root is found by stepping DOWN from the repository root instead -- the root itself if
+# it carries the three shared trees, otherwise the one child of it that does. Both raise rather than
+# fall back, for the reason roots.py gives: a sentinel that quietly returns the wrong directory makes
+# every file it names missing and leaves the assertions about them green.
+
+SERVER_MARKERS = ('common', 'routers', 'schemas')
+
+
+def _repo_root() -> Path:
+    """The nearest ancestor of this file containing pytest.ini -- the true repository root."""
+    start = Path(__file__).resolve().parent
+    for candidate in (start, *start.parents):
+        if (candidate / 'pytest.ini').is_file():
+            return candidate
+    raise RuntimeError(f'no ancestor of {start} carries pytest.ini, so the repository root cannot be located')
+
+
+def _server_root(repo_root: Path) -> Path:
+    """The directory holding all of SERVER_MARKERS: REPO_ROOT itself, or its one child that does."""
+    candidates = [repo_root, *sorted(child for child in repo_root.iterdir() if child.is_dir())]
+    for candidate in candidates:
+        if all((candidate / marker).is_dir() for marker in SERVER_MARKERS):
+            return candidate
+    raise RuntimeError(f'neither {repo_root} nor any child of it holds all of {SERVER_MARKERS}')
+
+
+REPO_ROOT = _repo_root()
+SERVER_ROOT = _server_root(REPO_ROOT)
+
+
+def env_default_path(source: str) -> Path:
+    """One ENV_DEFAULT_SOURCES name under the root that owns it: data/ is server-side, the rest is not."""
+    return (SERVER_ROOT if source.startswith('data/') else REPO_ROOT) / source
+
 
 WORKTREE_NAME = 'wt-one'
 
@@ -142,7 +190,9 @@ def make_layout(tmp_path: Path) -> Layout:
 
 def committed_defaults() -> dict[str, str]:
     """The three committed .env.default files, as git cat-file would return them at HEAD."""
-    return {source: (REPO_ROOT / source).read_text(encoding='utf-8') for source in stack.ENV_DEFAULT_SOURCES.values()}
+    return {
+        source: env_default_path(source).read_text(encoding='utf-8') for source in stack.ENV_DEFAULT_SOURCES.values()
+    }
 
 
 def porcelain(paths: Sequence[Path]) -> str:

@@ -26,10 +26,13 @@ from pathlib import Path, PurePosixPath
 import pytest
 import yaml
 
+from common.tests.roots import REPO_ROOT
+
 
 pytestmark = pytest.mark.build_infra
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# THE TRUE REPOSITORY ROOT (tj-iontkq.2): the Makefile, .devcontainer/ and the git checkout this
+# module runs `make` and `git check-ignore` in are all at the top of the repository. REPO_ROOT.
 MAKEFILE = REPO_ROOT / 'Makefile'
 DEVCONTAINER_COMPOSE = REPO_ROOT / '.devcontainer' / 'compose.yml'
 DEVCONTAINER_SERVICE = 'agent'

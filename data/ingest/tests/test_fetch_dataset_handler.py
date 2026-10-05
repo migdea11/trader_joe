@@ -65,6 +65,7 @@ from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Feed, Granularity, UpdateType
 from common.errors.vocabulary import ExogenousError, InvalidRequestError, Reason, TraderJoeError
 from common.rpc.mapping.fetch_stream import MAX_PAGE_BARS
+from common.tests.roots import SERVER_ROOT
 from data.ingest.app.brokers.interface import Bar as BrokerBar
 from data.ingest.app.brokers.interface import BarsFailure, BarsQuery, BarsResponse, BrokerUnsupportedError, Instrument
 from data.ingest.app.brokers.interface import ServedRange as BrokerServedRange
@@ -850,8 +851,12 @@ def test_the_handler_module_does_not_import_the_protocol_it_conforms_to():
     common.rpc.ingest itself in the test below and would therefore see it loaded either way. The ban is
     on the handler module's text, and that is what is checked.
     """
+    # SERVER_ROOT, not REPO_ROOT (tj-iontkq.2): the module name is routers.data_ingest.*, so the path
+    # it spells is relative to the directory the service trees live in. The counted parents[3] this
+    # replaces was the repository root, which stops being that directory after the move -- and the
+    # failure would be a read_text on a path that does not exist, not a wrong assertion.
     source = Path(IngestFetchHandler.__module__.replace('.', '/') + '.py')
-    text = (Path(__file__).resolve().parents[3] / source).read_text(encoding='utf-8')
+    text = (SERVER_ROOT / source).read_text(encoding='utf-8')
     # Import STATEMENTS only. The module's prose names both of these to explain why it does not import
     # them, and a substring search over the whole file would be red on that prose alone.
     imports = [

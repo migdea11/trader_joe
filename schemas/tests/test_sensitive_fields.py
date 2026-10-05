@@ -29,7 +29,6 @@ import pkgutil
 import subprocess
 import sys
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -38,6 +37,7 @@ from pydantic import BaseModel, create_model
 
 import schemas
 from common.enums.data_stock import ExpiryType, UpdateType
+from common.tests.roots import SERVER_ROOT
 from schemas.data_ingest.get_dataset_request import BaseGetDatasetRequest
 from schemas.data_store.asset_dataset_store import (
     AssetDatasetStoreDelete,
@@ -46,7 +46,8 @@ from schemas.data_store.asset_dataset_store import (
 )
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# THE SERVER ROOT (tj-iontkq.2): the only use is the cwd of a fresh interpreter that imports
+# common.sensitive and the schemas.* modules, so it must be the IMPORT root. SERVER_ROOT.
 
 # The user's list (tj-vhboky.45). A field added to it is checked on every model in schemas/.
 SENSITIVE_FIELDS = ('owner',)
@@ -233,7 +234,7 @@ def test_the_schema_modules_raise_no_pydantic_warning():
     result = subprocess.run(
         [sys.executable, '-c', _WARNING_PROBE],
         input=json.dumps(modules),
-        cwd=REPO_ROOT,
+        cwd=SERVER_ROOT,
         capture_output=True,
         text=True,
         check=False,

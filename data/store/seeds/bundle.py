@@ -54,7 +54,46 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+# REPO_ROOT -- the TRUE repository root, found by searching upward for pytest.ini rather than by
+# counting parent directories (tj-qanatv; epic tj-iontkq risk R-1, fixed for the test tree by
+# tj-iontkq.2's common/tests/roots.py).
+#
+# check_out_dir's whole job is refusing an output directory under <repo>/tests, and its docstring
+# says the check runs on the resolved path too, so the root it compares against must be the root
+# that actually HOLDS tests/ in whatever layout is checked out -- not whichever directory happens
+# to sit a fixed distance above this file. The old `Path(__file__).resolve().parents[3]` was that
+# fixed distance: correct only because data/store/seeds sits three levels under the repository
+# root today. Once the service trees move a level down (epic tj-iontkq), parents[3] resolves to
+# the new server/ directory, server/tests/ does not exist, and the refusal stops firing with no
+# error at all -- the one upward-counted root in this epic that fails OPEN instead of closed.
+#
+# NOT common/tests/roots.py's sentinel: this module imports the standard library only
+# (see test_the_bundle_module_imports_the_standard_library_only) and production code must not
+# import from a tests package, so the search is reproduced locally rather than shared. This is
+# the only production site that needs a repository root.
+_REPO_MARKER = 'pytest.ini'
+
+
+def _find_repo_root(start: Path) -> Path:
+    """The nearest ancestor of START holding pytest.ini -- the true repository root.
+
+    Raising when nothing matches is the point: a sentinel that silently fell back to a default or
+    to the filesystem root would be the same vacuous-pass failure in a new place, since every path
+    built from it would exist nowhere.
+
+    Raises:
+        RuntimeError: If no ancestor of START, START included, carries pytest.ini.
+    """
+    for candidate in (start, *start.parents):
+        if (candidate / _REPO_MARKER).is_file():
+            return candidate
+    raise RuntimeError(
+        f'no ancestor of {start} carries {_REPO_MARKER}, so the repository root cannot be located. '
+        f'Searched {start} and its {len(start.parents)} parents up to {start.anchor!r}.'
+    )
+
+
+REPO_ROOT = _find_repo_root(Path(__file__).resolve().parent)
 
 BUNDLE_TAG = 'trader_joe-seed/1'
 BUNDLE_KEYS = frozenset({'bundle', 'revision', 'sql', 'manifest'})
