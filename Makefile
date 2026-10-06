@@ -154,11 +154,35 @@ init: $(VENV_MARKER)  ## Initialize the project, including the security tooling
 
 # THE gRPC CODEGEN (ADR tj-8konfu D1 and D3, re-homed by addendum A1; decision tj-3mk3u5.42 F1).
 # proto/ at the repository root is the source of truth for what crosses the wire, and
-# gen/proto/python/ is the COMMITTED Python tree protoc writes from it: one tree per language
+# gen/proto/python/ is the Python tree protoc writes from it: one tree per language
 # (gen/proto/<language>/), used by every Python consumer. This target is the one way that tree is
-# written: run it after any .proto change and commit both together. CI's lint-and-test job runs it and
-# fails on any difference, because committed generated code without that check is worse than
-# generating at build time -- a committed copy can go stale, and a build-time one cannot.
+# written.
+#
+# NOTHING UNDER gen/ IS COMMITTED (user ruling 2026-10-05, reversing ADR tj-8konfu D3 and decision
+# tj-3mk3u5.42 F1; see the addendum on tj-8konfu). .gitignore excludes the whole directory, so a
+# fresh clone has no gen/ at all and the tree is BUILT, not checked. That is why CI no longer carries
+# a staleness step: a committed copy can disagree with its source and needs a control to make it
+# safe, and a tree generated from proto/ on every run cannot. The pin on grpcio-tools in
+# pyproject.toml stays, and for a better reason than that check -- byte-reproducible output is what
+# keeps the Docker layer cache from thrashing and a future client wheel deterministic.
+#
+# WHO GENERATES, AND WHEN. The host, through this target, which every target that needs the tree
+# takes as a prerequisite: the five pytest targets, `security` (bandit reads gen/proto/python) and
+# the three image builds (the Dockerfile COPYs it out of the build context). It costs ~0.15s and is
+# unconditional -- no stamp file, because a stamp keyed on the .proto mtimes would not notice a
+# grpcio-tools bump, and a guard that can be stale is the hollow kind this repo keeps finding. The
+# targets that only RUN an image already built -- test-system, system-launch, migrate-check,
+# seed-dump -- deliberately keep no prerequisite: they have no $(VENV_MARKER) either, because the
+# host they run on may be a server with no usable uv, and they cannot be reached before a build.
+#
+# NOT IN THE DOCKERFILE, and this was measured rather than assumed. Generating in-image means the
+# builder stage installs grpcio-tools, and base_deploy_image does `COPY --from=service_build_image
+# /code /code` while the venv is /code/.venv -- so the toolchain would ship in the PROD image, not
+# merely in a discarded stage. Keeping it out would need a stage of its own, reached by
+# `COPY --from=`, which tools/source_digest.sh skips by design: the source stamp would stop covering
+# the generated code, and the image-reach tests derive their roots from the same COPY list. Host
+# generation leaves the Dockerfile, the compose mounts, the stamp and all of that derivation exactly
+# as they were.
 #
 # THE IMPORT TRAP, AND WHY THE PLAIN ROOT AVOIDS IT. protoc names every generated module, and writes
 # every import in it, after the .proto's path under the include root -- never after where the output
@@ -175,11 +199,20 @@ init: $(VENV_MARKER)  ## Initialize the project, including the security tooling
 # legacy PYTHONPATH=./ arrives through env_file:, which outranks an image's ENV (decision
 # tj-3mk3u5.42 addendum F1-A). NOTHING EDITS THE OUTPUT: no rewrite, no post-processing, no check of
 # import lines.
-# What is committed is protoc's, byte for byte.
+# What lands there is protoc's, byte for byte.
 #
-# TWO GUARDS, before anything is deleted. $(PROTO_PKG)/__init__.py, hand-committed and the one file
-# there protoc does not write, must exist, so the target never clears a directory that is not the
-# generated package. And every .proto must lie under $(PROTO_SRC)/trader_joe/proto/, the reserved root
+# THE PACKAGE MARKER IS WRITTEN HERE, not committed. protoc does not emit
+# $(PROTO_PKG)/__init__.py, and without it trader_joe.proto is not an importable package -- so it
+# used to be the one hand-committed file under gen/. With nothing committed it has to come from
+# somewhere, and this target is that somewhere; the alternative, an un-ignore chain in .gitignore
+# keeping one file tracked inside an otherwise ignored tree, would leave a fresh clone with a lone
+# marker in an empty directory and keep a generated-code path on main for no gain.
+#
+# TWO GUARDS, before anything is deleted. If $(PROTO_PKG) already EXISTS it must hold that marker,
+# so the target never clears a directory that is not the generated package -- the guard still covers
+# every case that can delete something, which is the only case it ever protected. A $(PROTO_PKG)
+# that does not exist yet (a fresh clone) is created below instead, and there is nothing to clear.
+# And every .proto must lie under $(PROTO_SRC)/trader_joe/proto/, the reserved root
 # (every package is trader_joe.proto.<domain>.v1): a file anywhere else would generate outside the
 # directory cleared below, so what this target clears would no longer equal what it writes. Then
 # everything in $(PROTO_PKG) but its __init__.py is deleted, so a removed .proto leaves no stale module
@@ -190,19 +223,21 @@ init: $(VENV_MARKER)  ## Initialize the project, including the security tooling
 #
 # A SCRATCH TREE runs the real recipe without touching this one: override both roots on the command
 # line, e.g. `make proto PROTO_SRC=/tmp/x/proto PROTO_GEN=/tmp/x/gen/proto/python`. PROTO_PKG follows
-# PROTO_GEN, and the scratch PROTO_PKG needs its own __init__.py first.
+# PROTO_GEN, and a scratch PROTO_PKG that does not exist is created like any other.
 PROTO_SRC := proto
 PROTO_GEN := gen/proto/python
 PROTO_PKG := $(PROTO_GEN)/trader_joe/proto
 
 .PHONY: proto
-proto: $(VENV_MARKER)  ## Regenerate gen/proto/python/ from proto/ (commit both; CI fails on a stale tree)
-	@[ -f "$(PROTO_PKG)/__init__.py" ] || { echo "make proto: $(PROTO_PKG)/__init__.py is missing; refusing to clear a directory that is not the generated package." >&2; exit 1; }
+proto: $(VENV_MARKER)  ## Generate gen/proto/python/ from proto/ (never committed; every target that needs it runs this first)
+	@! [ -e "$(PROTO_PKG)" ] || [ -f "$(PROTO_PKG)/__init__.py" ] || { echo "make proto: $(PROTO_PKG) exists but $(PROTO_PKG)/__init__.py is missing; refusing to clear a directory that is not the generated package." >&2; exit 1; }
 	@outside="$$(find "$(PROTO_SRC)" -name '*.proto' ! -path "$(patsubst %/,%,$(PROTO_SRC))/trader_joe/proto/*" | LC_ALL=C sort)"; \
 	[ -z "$$outside" ] || { \
 		echo "make proto: every .proto must lie under $(PROTO_SRC)/trader_joe/proto/ (package trader_joe.proto.<domain>.v1); refusing, generating nothing. Outside it:" >&2; \
 		printf '%s\n' "$$outside" | sed 's/^/  /' >&2; \
 		exit 1; }
+	@mkdir -p "$(PROTO_PKG)"
+	@printf '%s\n' '# Written by make proto: the package marker protoc does not emit. Nothing under gen/ is committed.' > "$(PROTO_PKG)/__init__.py"
 	find "$(PROTO_PKG)" -mindepth 1 -maxdepth 1 ! -name __init__.py -exec rm -rf {} +
 	uv run python -m grpc_tools.protoc -I$(PROTO_SRC) --python_out=$(PROTO_GEN) --grpc_python_out=$(PROTO_GEN) --pyi_out=$(PROTO_GEN) \
 		$$(find $(PROTO_SRC) -name '*.proto' | LC_ALL=C sort)
@@ -309,11 +344,11 @@ export SOURCE_DIGEST_DATA_STORE SOURCE_DIGEST_DATA_INGEST;
 endef
 
 .PHONY: prod-build
-prod-build: $(VENV_MARKER)  ## Build the production images (:latest), stamped with the source digest
+prod-build: $(VENV_MARKER) proto  ## Build the production images (:latest), stamped with the source digest
 	$(WITH_SOURCE_STAMP) $(PROD_COMPOSE) build
 
 .PHONY: prod-build-clean
-prod-build-clean: $(VENV_MARKER)  ## Build the production images from scratch, no cache
+prod-build-clean: $(VENV_MARKER) proto  ## Build the production images from scratch, no cache
 	$(WITH_SOURCE_STAMP) $(PROD_COMPOSE) build --no-cache
 
 .PHONY: prod-deps
@@ -434,7 +469,7 @@ migrate-check:  ## Compare the models with the live schema (writes alembic_versi
 	./server/data/store/run_migrations.sh check
 
 .PHONY: dev-build
-dev-build: $(VENV_MARKER)  ## Build the development images (:dev), stamped with the source digest
+dev-build: $(VENV_MARKER) proto  ## Build the development images (:dev), stamped with the source digest
 	$(WITH_SOURCE_STAMP) $(DEV_COMPOSE) build
 
 # Idempotent, and safe against a concurrent create by the devcontainer's initializeCommand: look,
@@ -1153,8 +1188,11 @@ shellcheck-install:  ## Install the pinned shellcheck, checksum-verified, into S
 
 # ./tools holds the agent-stack MCP server (tools/agent_mcp, ADR tj-4rr0la section 6): build
 # tooling, but it holds Docker access, so bandit reads it like production source.
-# ./gen/proto/python is generated, but the image copies it and runs it, so bandit reads it too
-# (decision tj-3mk3u5.42 F1). CI's SOURCE_PATHS must name the same roots.
+# ./gen/proto/python is generated and never committed, but the image copies it and runs it, so
+# bandit reads it too (decision tj-3mk3u5.42 F1). That is why `security` takes `proto` as a
+# prerequisite: the root has to exist before bandit is pointed at it, and a bandit root that is
+# missing is the scanning-nothing-and-exiting-0 failure the test below exists to catch.
+# CI's SOURCE_PATHS must name the same roots.
 # The four service trees live under ./server since epic tj-iontkq; ./tools and ./gen stay at the
 # top of the repository. Get a root wrong and bandit scans nothing and exits 0, which is why
 # common/tests/test_ci_invariants.py asserts every scanner root here is a real directory.
@@ -1180,7 +1218,7 @@ SOURCE_DIRS := ./server/common ./server/routers ./server/schemas ./server/data .
 # pip-audit then reads the escape code as line 1 and fails. The flag outranks every such variable,
 # so the file is plain text whoever runs this.
 .PHONY: security
-security: $(VENV_MARKER)  ## Check security vulnerabilities
+security: $(VENV_MARKER) proto  ## Check security vulnerabilities
 	uv run bandit -r $(SOURCE_DIRS) --exclude '*/tests/*'
 	uv run semgrep --config=auto --error --exclude=tests/ --exclude=.venv --exclude=docker-compose.override.yaml --exclude=.claude/worktrees .
 	uv export --all-groups --no-group dev --no-group testing --no-group security --locked --format requirements-txt --color never > requirements.txt || { status=$$?; rm -f requirements.txt; exit $$status; }
@@ -1204,13 +1242,13 @@ PYTEST_ENV := POSTGRES_ASYNC=true POSTGRES_SYNC=true
 PYTEST := $(PYTEST_ENV) uv run pytest
 
 .PHONY: test
-test: $(VENV_MARKER)  ## Run the PR gate: every test except `external` (scope with PATHS=)
+test: $(VENV_MARKER) proto  ## Run the PR gate: every test except `external` (scope with PATHS=)
 	$(PYTEST) $(PATHS)
 
 # coverage has to own the invocation -- `coverage run -m pytest` -- so this takes the env
 # prefix rather than $(PYTEST). pytest.ini still applies, so the selected set is identical.
 .PHONY: test-cov
-test-cov: $(VENV_MARKER)  ## Run the PR gate with coverage (scope with PATHS=)
+test-cov: $(VENV_MARKER) proto  ## Run the PR gate with coverage (scope with PATHS=)
 	$(PYTEST_ENV) uv run coverage run -m pytest $(PATHS)
 	uv run coverage xml
 
@@ -1223,7 +1261,7 @@ test-cov: $(VENV_MARKER)  ## Run the PR gate with coverage (scope with PATHS=)
 # The guard is for the EMPTY case only, which would otherwise hand pytest the unparseable
 # expression " and not external" and report a usage error instead of the missing variable.
 .PHONY: test-component
-test-component: $(VENV_MARKER)  ## Run one component, e.g. COMPONENT=data_store (scope with PATHS=)
+test-component: $(VENV_MARKER) proto  ## Run one component, e.g. COMPONENT=data_store (scope with PATHS=)
 	@[ -n "$(COMPONENT)" ] || { echo "make test-component needs COMPONENT=<name>; the names are the 'markers' list in pytest.ini." >&2; exit 1; }
 	$(PYTEST) -m "$(COMPONENT) and not external" $(PATHS)
 
@@ -1236,13 +1274,13 @@ test-component: $(VENV_MARKER)  ## Run one component, e.g. COMPONENT=data_store 
 # Named `broker` while the marker is named `external` on purpose, not by oversight: pytest.ini
 # records why.
 .PHONY: test-broker
-test-broker: $(VENV_MARKER)  ## Run the external broker tests: needs live credentials, never CI
+test-broker: $(VENV_MARKER) proto  ## Run the external broker tests: needs live credentials, never CI
 	$(PYTEST) -m external $(PATHS)
 
 # -m "" REPLACES the addopts filter rather than adding to it, leaving no selection at all, so
 # this is the gate plus the external set. Same caveat as test-broker: it needs live credentials.
 .PHONY: test-all
-test-all: $(VENV_MARKER)  ## Run every test, external included: needs live credentials
+test-all: $(VENV_MARKER) proto  ## Run every test, external included: needs live credentials
 	$(PYTEST) -m "" $(PATHS)
 
 # THE SYSTEM SUITE (tj-vhboky.48, ADR tj-fdb9gz; tj-q9ae5u addendum 1 items 4' and 6').
@@ -1307,6 +1345,13 @@ test-all: $(VENV_MARKER)  ## Run every test, external included: needs live crede
 # failure too: pytest exits 5 when it collects nothing, and the recipe ends on the compose run,
 # whose exit status is pytest's, so make returns it untouched.
 #
+# NO `proto` PREREQUISITE, for the same reason there is no $(VENV_MARKER): `make proto` needs the
+# host venv and this host may have no usable uv. But docker-compose.test-client.yaml bind-mounts
+# ./gen/proto/python into the client, nothing under gen/ is committed, and a bind mount whose source
+# is absent is CREATED by the daemon as a root-owned empty directory -- the suite would then fail on
+# a missing trader_joe.proto and leave behind a directory the user cannot delete. So the recipe
+# makes one venv-free existence check instead, beside the .env one, naming the target that writes it.
+#
 # The client invocation: the base file for the networks, the client file, and nothing else -- not
 # the dev override, so the client needs no devnet and behaves the same against a dev stack and in CI.
 TEST_CLIENT_COMPOSE := docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml
@@ -1334,6 +1379,7 @@ endef
 test-system:  ## Run tests/system from the test_client container against an up, migrated stack (SYSTEM_TEST_DISPOSABLE_DB=1)
 	$(SYSTEM_TEST_DISPOSABLE_GUARD)
 	@[ -f .env ] || { echo "make test-system: no .env in $(CURDIR); compose interpolates the stack's credentials from it." >&2; exit 1; }
+	@[ -d "$(PROTO_PKG)" ] || { echo "make test-system: $(PROTO_PKG) does not exist; it is generated, never committed. Run 'make proto' first (any image build does it for you)." >&2; exit 1; }
 	@echo "System suite from test_client against data_store (service data_store, on store_api) and Postgres (service postgres, on store_db); TZ set in docker-compose.test-client.yaml and checked by the client's entrypoint."
 	@echo "The database password and the instance write secret reach the container from .env through compose (values not shown)."
 	$(TEST_CLIENT_COMPOSE) run --rm --no-deps --build test_client $(SYSTEM_PATHS)

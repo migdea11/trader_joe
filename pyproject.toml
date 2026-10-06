@@ -186,10 +186,12 @@ exclude = [
     # the server/ prefix with the move (epic tj-iontkq, C-5): a glob that stops matching does not
     # fail lint, it quietly starts linting what it used to exclude.
     "server/data/store/migrations/versions/*",
-    # Committed protoc output (ADR tj-8konfu D3; decision tj-3mk3u5.42 F1), generated code like the
-    # revisions above: `make proto` writes gen/proto/python and CI fails when it is stale, so it is
-    # regenerated, never hand-edited or reformatted. Every language's tree whole, the hand-committed
-    # trader_joe/proto/__init__.py included.
+    # protoc output (ADR tj-8konfu D3 as reversed 2026-10-05; decision tj-3mk3u5.42 F1), generated
+    # code like the revisions above: `make proto` writes gen/proto/python and nothing under it is
+    # committed, so it is regenerated, never hand-edited or reformatted. Every language's tree
+    # whole, the package marker `make proto` writes at trader_joe/proto/__init__.py included. The
+    # exclusion still has to be here even though the tree is untracked: ruff walks the working
+    # directory, not the index, and `make test` has just written it.
     "gen/proto",
     # The UI's home (tj-iontkq.1). Not Python and not generated: TypeScript, its build config and
     # node_modules. Listed for the reason at the top of this list -- a tooling script dropped in
@@ -281,7 +283,8 @@ split-on-trailing-comma = false
 # the top-level package names. Do not prefix these -- unlike the path globs above, which had to be.
 # (The superseded plan had this list become ["trader_joe"]; that is not what happened.)
 # trader_joe is first-party already: the generated trader_joe.proto (gen/proto/python) is this
-# repository's own code. tj-iontkq.5 adds the hand-written trader_joe.common beside it.
+# repository's own code -- built from proto/ rather than committed, which changes nothing about
+# where its imports sort. tj-iontkq.5 adds the hand-written trader_joe.common beside it.
 known-first-party = ["common", "data", "routers", "schemas", "trader_joe"]
 section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
 

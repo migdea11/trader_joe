@@ -51,8 +51,13 @@ RUN uv sync --only-group base --only-group ${SERVICE_PATH}-${SERVICE_NAME} --fro
 # GHCR. data/store/migrations/env.py calls load_dotenv('.env'), which is a no-op when the
 # file is absent; it reads DATABASE_URI from the process environment either way.
 
-# Add common files. gen/proto/python is the committed protoc output common/rpc imports; without it
-# the image starts until the first servicer that imports generated code is registered, then fails.
+# Add common files. gen/proto/python is the protoc output common/rpc imports; without it the image
+# starts until the first servicer that imports generated code is registered, then fails. It is
+# GENERATED AND NEVER COMMITTED, so the build context only holds it because the build targets run
+# `make proto` on the host first (Makefile prod-build/dev-build, and a step in CI's Image Build and
+# System Testing jobs). Generating here instead would ship grpcio-tools in the prod image, because
+# base_deploy_image COPYs this stage's whole /code and the venv is /code/.venv -- the Makefile's
+# proto block records that measurement and why a stage of its own was rejected too.
 #
 # THE CONTAINER LAYOUT IS DELIBERATELY NOT THE CHECKOUT LAYOUT (epic tj-iontkq, R-2). The service
 # trees live under ./server in the checkout and under /code in the image, so only the LEFT of each

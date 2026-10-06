@@ -7,20 +7,22 @@ pointed at a temporary tree, so nothing in the checkout's proto/ or gen/ is read
   canonical path, the generated imports resolve as protoc writes them, and descriptor names are
   canonical ('trader_joe/proto/...') -- what every other consumer of proto/ records too;
 * rule 2, NOTHING POST-PROCESSES: the output equals a bare grpc_tools.protoc run of the same inputs,
-  byte for byte, apart from the hand-committed trader_joe/proto/__init__.py;
+  byte for byte, apart from the package marker the target writes at trader_joe/proto/__init__.py;
 * rule 3, CONFIGURATION ONLY: the output imports with its root on PYTHONPATH and nothing else, under
   `python -P`, so neither the working directory nor any code puts it on the path;
 * rule 4, THE RESERVED ROOT: a .proto outside proto/trader_joe/proto/ fails the target, named, before
   anything is cleared or written;
-* THE CLEARING (unpinned since T1, and invisible to CI's staleness step, which sees a stale module
-  only while it is still tracked and unchanged): a removed .proto leaves no module and no directory
-  behind, and nothing outside the generated package is touched;
+* THE CLEARING: a removed .proto leaves no module and no directory behind, and nothing outside the
+  generated package is touched;
 * rule 5, PEP 420: trader_joe is a namespace -- no trader_joe/__init__.py anywhere in gen/ or in git --
   and it shares that namespace with another portion in one process.
 
-What `make proto` writes into the COMMITTED tree is CI's staleness step's to check, not this file's
-(ADR tj-8konfu D3; see test_ci_invariants.py THE gRPC TOOLCHAIN). The static image path model -- the
-Dockerfile's PYTHONPATH and COPY, the compose mounts, pytest.ini -- is pinned there too.
+NOTHING UNDER gen/ IS COMMITTED (user ruling 2026-10-05, reversing ADR tj-8konfu D3 and so the
+staleness step this file used to defer to; see test_ci_invariants.py THE gRPC TOOLCHAIN). The target
+is therefore what every consumer gets, which is why these gates run it for real, and it writes the
+package marker protoc does not emit -- there is no longer a hand-committed file to keep. The static
+image path model -- the Dockerfile's PYTHONPATH and COPY, the compose mounts, pytest.ini -- is
+pinned in test_ci_invariants.py.
 """
 
 import ast
@@ -43,7 +45,7 @@ pytestmark = pytest.mark.build_infra
 # the Makefile target this module invokes with `make -C` is at the root, and `git ls-files` must run
 # in the checkout root to list the whole repository. REPO_ROOT, never SERVER_ROOT.
 GENERATED_ROOT = REPO_ROOT / 'gen' / 'proto' / 'python'
-# The one hand-committed file in the generated package: make proto's guard, and kept when it clears.
+# The package marker protoc does not emit: make proto writes it, and keeps it when it clears.
 GUARD = Path('trader_joe') / 'proto' / '__init__.py'
 MAKE_TIMEOUT_S = 180
 
@@ -326,8 +328,12 @@ def test_a_trailing_slash_on_the_proto_root_is_not_outside_it(tmp_path: Path):
     assert set(_files(gen)) == {GUARD} | _outputs(PROBE_PROTO) | _outputs(SHARED_PROTO)
 
 
-def test_without_its_guard_file_the_package_is_not_cleared(tmp_path: Path):
-    """The guard that keeps the target from clearing a directory that is not the generated package."""
+def test_without_its_guard_file_an_existing_package_is_not_cleared(tmp_path: Path):
+    """The guard that keeps the target from clearing a directory that is not the generated package.
+
+    It applies to a package that ALREADY EXISTS, which is the only case that can delete anything.
+    A generated root that does not exist yet is created instead -- the test below.
+    """
     src, gen = _scratch(tmp_path, PROTOS)
     first = _make_proto(src, gen)
     assert first.returncode == 0, _ran(first)
@@ -340,14 +346,38 @@ def test_without_its_guard_file_the_package_is_not_cleared(tmp_path: Path):
     assert _files(gen) == before, 'the refused run changed the generated tree'
 
 
+def test_a_generated_root_that_does_not_exist_yet_is_created_with_its_marker(tmp_path: Path):
+    """The fresh-clone case, which is now every clone: nothing under gen/ is committed.
+
+    protoc emits no trader_joe/proto/__init__.py and without it trader_joe.proto is not an importable
+    package, so the target writes it. Before the 2026-10-05 ruling that one file was hand-committed
+    and the target refused when it was absent; a checkout that refused to generate because the thing
+    generation produces was missing would be a bootstrap with no entry point.
+    """
+    src = tmp_path / 'proto'
+    for relative, text in PROTOS.items():
+        (src / relative).parent.mkdir(parents=True, exist_ok=True)
+        (src / relative).write_text(text, encoding='utf-8')
+    gen = tmp_path / 'gen' / 'proto' / 'python'
+    assert not gen.exists(), 'the point of this test is that nothing under the generated root exists yet'
+
+    result = _make_proto(src, gen)
+    assert result.returncode == 0, _ran(result)
+    assert set(_files(gen)) == {GUARD} | _outputs(PROBE_PROTO) | _outputs(SHARED_PROTO)
+    assert ast.parse((gen / GUARD).read_text(encoding='utf-8')).body == [], 'the marker must be a comment only'
+
+
 # ---------------------------------------------------------------------------------------------------
 # GATE 6: PEP 420 (F1 rule 5)
 
 
-def test_no_trader_joe_init_exists_and_the_guard_is_the_only_init_under_gen():
+def test_no_trader_joe_init_exists_and_the_marker_is_the_only_init_under_gen():
     """No portion may ship trader_joe/__init__.py; trader_joe/proto/__init__.py is the one __init__ in gen/.
 
-    Read from git (what every checkout and image gets) and from the disk (what this run imports).
+    The DISK is the authority now that nothing under gen/ is committed (user ruling 2026-10-05):
+    what this run imports, and what `make proto` just wrote, are the same tree. git is still read,
+    for the half that is about the index -- no portion may commit a namespace __init__.py, and
+    nothing under gen/ may be committed at all, which is the ruling itself.
     """
     tracked = subprocess.run(
         ['git', 'ls-files'], cwd=REPO_ROOT, capture_output=True, text=True, check=True
@@ -357,14 +387,10 @@ def test_no_trader_joe_init_exists_and_the_guard_is_the_only_init_under_gen():
         f'a trader_joe/__init__.py is tracked, which breaks every other portion: {namespace_inits}'
     )
     gen_root = GENERATED_ROOT.relative_to(REPO_ROOT).parent.parent
-    tracked_inits = {
-        Path(path) for path in tracked if Path(path).is_relative_to(gen_root) and path.endswith('/__init__.py')
-    }
-    assert tracked_inits == {GENERATED_ROOT.relative_to(REPO_ROOT) / GUARD}, sorted(map(str, tracked_inits))
+    tracked_under_gen = sorted(path for path in tracked if Path(path).is_relative_to(gen_root))
+    assert not tracked_under_gen, f'{gen_root}/ is generated and must not be committed; git tracks {tracked_under_gen}'
     on_disk = {path.relative_to(REPO_ROOT) for path in (REPO_ROOT / gen_root).rglob('__init__.py')}
-    assert on_disk == tracked_inits, (
-        f'untracked __init__.py files under {gen_root}: {sorted(map(str, on_disk - tracked_inits))}'
-    )
+    assert on_disk == {GENERATED_ROOT.relative_to(REPO_ROOT) / GUARD}, sorted(map(str, on_disk))
 
 
 def test_the_guard_file_does_nothing_on_import():
@@ -372,7 +398,7 @@ def test_the_guard_file_does_nothing_on_import():
     guard = GENERATED_ROOT / GUARD
     assert guard.is_file()
     assert ast.parse(guard.read_text(encoding='utf-8')).body == [], f'{guard} has statements'
-    assert guard.read_text(encoding='utf-8').strip(), f'{guard} is empty; it should say why it is hand-committed'
+    assert guard.read_text(encoding='utf-8').strip(), f'{guard} is empty; it should say where it comes from'
 
 
 _NAMESPACE_PROBE = """
