@@ -1,0 +1,26 @@
+/* Page basics, from the tokens (cssVars.ts sets the --tj-* variables on :root at startup). */
+:root {
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  background: var(--tj-ground);
+  color: var(--tj-text);
+  font-family: var(--tj-font-sans);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+a {
+  color: var(--tj-accent-tint);
+  text-decoration: none;
+}
+
+code,
+kbd,
+pre,
+samp,
+.tj-mono {
+  font-family: var(--tj-font-mono);
+}

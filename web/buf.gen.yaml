@@ -1,0 +1,11 @@
+# TypeScript codegen for the UI (tj-grna9p.29): protoc-gen-es, driven by buf, from the repo-root proto/
+# module. Output goes to the repo-root gen/proto/ts (the per-language tree beside gen/proto/python),
+# which is gitignored and never committed (2026-10-06 user ruling). `npm run gen:proto` runs this from
+# web/; the plugin is the locally installed, lockfile-pinned @bufbuild/protoc-gen-es.
+version: v2
+clean: true
+plugins:
+  - local: node_modules/.bin/protoc-gen-es
+    out: ../gen/proto/ts
+    opt:
+      - target=ts

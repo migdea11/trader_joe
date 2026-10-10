@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-ssr/
+
+# Vite / vue-tsc incremental build info
+node_modules/.tmp/
+*.tsbuildinfo
+
+# Vitest / coverage
+coverage/
+
+# Logs
+npm-debug.log*
+
+# Editor
+*.local

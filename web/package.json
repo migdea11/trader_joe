@@ -1,0 +1,50 @@
+{
+  "name": "trader-joe-web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "trader_joe UI: Vue 3 + TypeScript + Vite static SPA (tj-x5yghe).",
+  "scripts": {
+    "gen:proto": "buf generate ../proto --template buf.gen.yaml",
+    "predev": "npm run gen:proto",
+    "dev": "vite",
+    "prebuild": "npm run gen:proto",
+    "build": "vite build",
+    "lint": "eslint .",
+    "pretypecheck": "npm run gen:proto",
+    "typecheck": "vue-tsc --build --force",
+    "pretest": "npm run gen:proto",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "2.16.0",
+    "@lucide/vue": "1.52.0",
+    "@primeuix/themes": "^3.0.1",
+    "echarts": "^6.1.0",
+    "lightweight-charts": "~5.2.1",
+    "pinia": "^4.0.3",
+    "primevue": "^5.0.2",
+    "vue": "^3.5.43",
+    "vue-echarts": "^8.3.1",
+    "vue-router": "^5.3.1"
+  },
+  "devDependencies": {
+    "@bufbuild/protoc-gen-es": "2.16.0",
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^24.19.1",
+    "@vitejs/plugin-vue": "^6.0.9",
+    "@vue/eslint-config-typescript": "^14.9.0",
+    "@vue/test-utils": "^2.5.1",
+    "@vue/tsconfig": "^0.9.1",
+    "eslint": "^10.12.0",
+    "eslint-plugin-vue": "^10.11.1",
+    "globals": "^17.13.0",
+    "jsdom": "^30.1.2",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.71.1",
+    "vite": "^8.3.3",
+    "vitest": "^5.0.3",
+    "vue-eslint-parser": "^10.4.1",
+    "vue-tsc": "^3.3.12"
+  }
+}
