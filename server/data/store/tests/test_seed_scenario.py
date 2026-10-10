@@ -8,7 +8,7 @@ so a loosened pattern would pass every one of them until the day a real row went
 WHAT TIER THIS IS. Pure: no stack, no Postgres. The requests are checked against the store's real
 inbound contract (StoreAssetDatasetBody, StoreAssetDatasetPath) and against the store's own-overlap
 rule, restated here from data/store/app/database/crud/stock/store_dataset_entry.py _find_own_overlap
-(closed at both ends, an exact repeat excluded) -- that restatement is the one place this file
+(half-open [start, end), an exact repeat excluded) -- that restatement is the one place this file
 re-derives production logic, because the rule lives in an async SQL query. NOT PROVED HERE: that the
 real ingest serves the scenario, or that a POST answers 200 (tj-vhboky.65, through the MCP).
 """
@@ -217,12 +217,17 @@ def test_the_restated_identity_covers_every_equality_column():
 
 
 def test_no_request_collides_with_the_same_owners_other_requests():
-    """The store answers 409 to a same-identity overlap (closed at both ends, exact repeat excluded)."""
+    """The store answers 409 to a same-identity overlap (half-open [start, end), exact repeat excluded).
+
+    Half-open since tj-vhboky.1 addendum HALF-OPEN RANGES (2026-09-30), item 2: two ranges that only
+    touch share no bar and do not collide. The closed restatement this replaced was stricter than the
+    store, so it stayed green; it would have flagged an adjacent pair the store accepts.
+    """
     for a, b in combinations(SEED_REQUESTS, 2):
         if _identity(a) != _identity(b):
             continue
         exact = a.start == b.start and a.end == b.end
-        overlaps = a.start <= b.end and a.end >= b.start
+        overlaps = a.start < b.end and a.end > b.start
         assert exact or not overlaps, f'same-owner overlap would 409: {a} / {b}'
 
 

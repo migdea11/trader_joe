@@ -14,7 +14,7 @@ from data.store.app.database.database import async_db
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.main import app
 from data.store.tests.fetch_double import RecordingFetchClient
-from data.store.tests.problem_body import validation_errors
+from data.store.tests.problem_body import problem, validation_errors
 from routers.common.instance_secret import (
     INSTANCE_SECRET_ENV_VAR,
     INSTANCE_SECRET_HEADER,
@@ -145,6 +145,10 @@ class Case(NamedTuple):
         malformed_path_params: Path values for the malformed call.
         malformed_request: Extra httpx keyword arguments for the malformed call.
         malformed_field: The field the malformed call corrupts, which the 422 must name.
+        takes_no_input: The route declares no path, query or body parameter, so there is no field a malformed
+            call could corrupt and the malformed half is skipped as a case that does not exist (pytest.ini rule).
+        reads_one_row: The route reads one row by id, which the empty fake table does not hold, so a well-formed
+            call reaches the handler and is answered 404 NOT_FOUND by it. See READ-BY-ID ROUTES below.
     """
 
     path_params: dict[str, str]
@@ -152,6 +156,8 @@ class Case(NamedTuple):
     malformed_path_params: dict[str, str]
     malformed_request: dict[str, Any]
     malformed_field: str
+    reads_one_row: bool = False
+    takes_no_input: bool = False
 
 
 ASSET_PATH = {'asset_type': 'stock', 'data_type': 'market-activity'}
@@ -251,6 +257,60 @@ CASES: dict[str, Case] = {
         malformed_path_params={'id': 'not-a-uuid'},
         malformed_request={},
         malformed_field='id',
+    ),
+    # READ-BY-ID ROUTES (validator, gating tj-grna9p.20). Each reads one row by id, and the fake table is empty,
+    # so the well-formed call is answered 404 BY THE HANDLER. That 404 is told apart from an unmounted route's
+    # by its reason: the handler's names NOT_FOUND, the router's names none (problem_body.problem). Accepting
+    # it is therefore not the "404 means not mounted" hole UNREACHABLE_STATUSES exists to close. Their real
+    # rows are test_ui_datasets_route.py's subject, over SQLite.
+    'GET /store/{id}': Case(
+        path_params={'id': str(DELETE_ID)},
+        request={},
+        malformed_path_params={'id': 'not-a-uuid'},
+        malformed_request={},
+        malformed_field='id',
+        reads_one_row=True,
+    ),
+    # Reachability only; its behaviour is the tj-grna9p.45 validator pass's subject.
+    'GET /ui/v1/config': Case(
+        path_params={},
+        request={},
+        malformed_path_params={},
+        malformed_request={},
+        malformed_field='',
+        takes_no_input=True,
+    ),
+    'GET /ui/v1/datasets': Case(
+        path_params={},
+        request={},
+        malformed_path_params={},
+        malformed_request={'params': {'limit': 0}},
+        malformed_field='limit',
+    ),
+    'GET /ui/v1/datasets/facets': Case(
+        path_params={},
+        request={},
+        malformed_path_params={},
+        malformed_request={'params': {'status': 'not-a-status'}},
+        malformed_field='status',
+    ),
+    'GET /ui/v1/datasets/{dataset_id}': Case(
+        path_params={'dataset_id': str(DELETE_ID)},
+        request={},
+        malformed_path_params={'dataset_id': 'not-a-uuid'},
+        malformed_request={},
+        malformed_field='dataset_id',
+        reads_one_row=True,
+    ),
+    # The malformed half sends a NAIVE start: the half-open window is between instants, and a wall-clock time
+    # with no zone names none.
+    'GET /ui/v1/datasets/{dataset_id}/bars': Case(
+        path_params={'dataset_id': str(DELETE_ID)},
+        request={'params': {'start': '2026-01-02T00:00:00Z', 'end': '2026-01-03T00:00:00Z'}},
+        malformed_path_params={'dataset_id': str(DELETE_ID)},
+        malformed_request={'params': {'start': '2026-01-02T00:00:00'}},
+        malformed_field='start',
+        reads_one_row=True,
     ),
 }
 
@@ -667,6 +727,10 @@ def test_a_well_formed_request_reaches_the_handler(address: str, client: TestCli
 
     response = client.request(method, url, headers=secret_headers(address), **case.request)
 
+    if case.reads_one_row:
+        # The handler ran and looked the id up: only it names NOT_FOUND (see READ-BY-ID ROUTES above CASES).
+        problem(response, status=404, reason='NOT_FOUND')
+        return
     assert response.status_code not in UNREACHABLE_STATUSES, (
         f'{method} {url} returned {response.status_code}: the manifest declares this route but the '
         f'app does not answer it at that address.'
@@ -690,6 +754,8 @@ def test_a_well_formed_request_reaches_the_handler(address: str, client: TestCli
 @pytest.mark.parametrize('address', http_addresses())
 def test_a_malformed_request_is_rejected_with_422(address: str, client: TestClient):
     case = case_for(address)
+    if case.takes_no_input:
+        pytest.skip(f'{address} declares no parameter, so no request to it can be malformed')
     method = address.split(' ', 1)[0]
     url = app_url_for(address, symbol_for(address), case.malformed_path_params)
 

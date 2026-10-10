@@ -269,7 +269,9 @@ async def read_market_activity_data(
     if request.start is not None:
         conditions.append(asset_table.timestamp >= request.start)
     if request.end is not None:
-        conditions.append(asset_table.timestamp <= request.end)
+        # Half-open [start, end): a bar AT end belongs to the next range (tj-vhboky.1 addendum
+        # HALF-OPEN RANGES, 2026-09-30).
+        conditions.append(asset_table.timestamp < request.end)
 
     # ORDER BY timestamp, dataset_id -- NOTHING ELSE (user ruling, tj-vhboky.25 addendum, 21:41
     # UTC 2026-09-27). No row id: this is deterministic today because one feed serves one

@@ -456,6 +456,55 @@ def test_an_offset_less_datetime_answers_422_naming_its_field_and_writes_nothing
     assert fetch_client.requests == [], 'ingest was asked to fetch data for a request refused at the edge'
 
 
+# ---------------------------------------------------------------------------------------------
+# An empty or inverted range is refused at the edge (half-open ranges, tj-86g751.4)
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    'end',
+    ['2026-01-01T00:00:00Z', '2026-01-01T05:00:00+05:00', '2025-12-31T23:59:59.999999Z'],
+    ids=['end-equals-start', 'end-equals-start-written-at-plus-five', 'end-one-microsecond-before-start'],
+)
+def test_a_create_whose_end_is_not_after_its_start_answers_422_on_the_body_and_writes_nothing(post_dataset, end: str):
+    """tj-vhboky.1 addendum HALF-OPEN RANGES, item 3, at the route: [s, s) is empty and [s, e<s) never meant anything.
+
+    REQUEST_BODY's start is 2026-01-01T00:00:00Z. Each end here is not after it AS AN INSTANT -- the
+    +05:00 case reads five hours later on the wall clock and is the same instant. The refusal is
+    model-level, so its loc is ['body'] with no field (FastAPI's rendering of loc () on a body
+    model), and like the offset-less refusal above it happens before the database or ingest is
+    reached. The model-level half, with the open-ended and smallest-non-empty positives, is
+    schemas/tests/test_schemas_smoke_data_store.py, test_a_create_whose_end_is_not_after_its_start_is_refused.
+
+    Args:
+        post_dataset: Drives the real POST route against a fake session.
+        end: An end that is not after the body's start.
+    """
+    session = FakeSession()
+    fetch_client = RecordingFetchClient()
+
+    response = post_dataset(session, fetch_client, REQUEST_BODY | {'end': end})
+
+    errors = validation_errors(response)
+    assert [(error['loc'], error['type']) for error in errors] == [(['body'], 'value_error')], (
+        f'an empty or inverted range was not refused as one body-level 422: {response.text}'
+    )
+    assert 'half-open' in errors[0]['msg'], errors[0]['msg']
+    assert session.statements == [], 'a request refused at the edge still reached the database'
+    assert fetch_client.requests == [], 'ingest was asked to fetch data for a request refused at the edge'
+
+
+def test_a_create_one_microsecond_long_reaches_the_handler(post_dataset):
+    """The positive that keeps the refusal above honest: [s, s + 1us) is the smallest non-empty range, and is written."""
+    session = FakeSession(FakeResult(rows=[]), FakeResult(scalar=uuid.uuid4()))
+    fetch_client = RecordingFetchClient()
+
+    response = post_dataset(session, fetch_client, REQUEST_BODY | {'end': '2026-01-01T00:00:00.000001Z'})
+
+    assert response.status_code == 200, response.text
+    assert len(fetch_client.requests) == 1, 'a valid one-microsecond range never reached ingest'
+
+
 # The GET on the same address: the dataset SEARCH, bound to StoreAssetDatasetQuery with Query().
 SEARCH_ROUTE_NAME = 'get_data'
 

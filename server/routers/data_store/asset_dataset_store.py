@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from common.logging import get_logger
 from common.rpc.clients.ingest_fetch import IngestFetchClient
 from data.store.app.app_depends import get_ingest_fetch_client
-from data.store.app.database.crud.stock.store_dataset_entry import delete_entry_by_id, search_entries
+from data.store.app.database.crud.stock.store_dataset_entry import delete_entry_by_id, get_entry_by_id, search_entries
 from data.store.app.database.database import async_db
 from data.store.app.ingest.data_action_request import store_market_activity_worker
 from routers.common.instance_secret import require_instance_secret
@@ -14,6 +14,7 @@ from routers.data_store.app_endpoints import AssetDatasetStoreInterface
 from schemas.data_store.asset_dataset_store import (
     AssetDatasetStore,
     AssetDatasetStoreDelete,
+    AssetDatasetStoreGetById,
     ServedRange,
     StoreAssetDatasetBody,
     StoreAssetDatasetPath,
@@ -92,6 +93,26 @@ async def get_data(
     log.debug(f'Getting data for {request_path.asset_type.value}, {request_path.asset_symbol}')
     log.debug(f'Query: {request_query}')
     return await search_entries(db, request_path, request_query)
+
+
+@router.get(AssetDatasetStoreInterface.GET_STORE_ASSET_DATASET_BY_ID)
+async def get_data_by_id(
+    db: Annotated[AsyncSession, Depends(async_db)], request_path: Annotated[AssetDatasetStoreGetById, Depends()]
+) -> AssetDatasetStore:
+    """Return one dataset entry by id (tj-967trx). Open, like the other GETs.
+
+    NOTHING IS CAUGHT HERE (D6): an unknown id raises EntryNotFound, whose reason NOT_FOUND renders as a 404
+    problem+json.
+
+    Args:
+        db: The request's session.
+        request_path: The entry's id.
+
+    Returns:
+        AssetDatasetStore: The entry, with its bar count.
+    """
+    log.debug(f'Getting dataset {request_path.id}')
+    return await get_entry_by_id(db, request_path.id)
 
 
 @router.delete(

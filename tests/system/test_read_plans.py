@@ -431,7 +431,9 @@ def seeded_bars(
         target_entry=target_entry,
         target_symbol=target_symbol,
         window_start=start + timedelta(minutes=WINDOW_OFFSET_MINUTES),
-        window_end=start + timedelta(minutes=WINDOW_OFFSET_MINUTES + WINDOW_BARS - 1),
+        # Half-open [start, end) since tj-86g751: the end is the instant AFTER the window's last bar. The
+        # former `- 1` was the closed read's end and left this window one bar short (399 of 400).
+        window_end=start + timedelta(minutes=WINDOW_OFFSET_MINUTES + WINDOW_BARS),
         table_rows=int(table_rows),
         server_version=str(server_version),
         pages={str(name): int(count) for name, count in pages.items()},

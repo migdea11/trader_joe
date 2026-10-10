@@ -158,6 +158,20 @@ jobs:
       run: |
         make shellcheck-install SHELLCHECK_INSTALL_DIR=/usr/local/bin
 
+    # THE PINNED NODE AND THE WEB DEPENDENCIES (tj-grna9p.27), for Run Linters below: `make lint`
+    # covers web/ too (eslint and vue-tsc, the lint-ts leg), so this job installs what that leg needs
+    # rather than lint behaving differently here than for a developer. Through `make node-install`,
+    # for the buf reason: the version and both checksums have one definition, the Makefile's, and the
+    # tarball is sha256-verified. The slim image has curl, tar and gzip. The web job below runs the
+    # rest of the web chain.
+    - name: Install Node
+      run: |
+        make node-install NODE_INSTALL_DIR=/usr/local/bin NODE_HOME_DIR=/usr/local/lib/nodejs
+
+    - name: Install Web Dependencies
+      run: |
+        make web-install
+
     # buf breaking's baseline (tj-3mk3u5.54). actions/checkout fetches one commit and no branch, so
     # main is fetched here as a remote-tracking ref, and make lint is pointed at it. Depth 1: make
     # lint extracts one tree from it with git archive and needs no history. On a push to main this
@@ -214,6 +228,65 @@ jobs:
       run: |
         uv run pytest -s
 
+  # THE WEB JOB (tj-grna9p.27): the UI's whole chain from a clean checkout, every step through the
+  # make target a developer runs. Nothing generated is committed (user ruling 2026-10-06), so there
+  # is no staleness check: the TypeScript is regenerated from proto/ into gen/proto/ts, which this
+  # checkout does not have, and then type-checked, linted, tested and built. A proto change that
+  # breaks the UI fails here at vue-tsc.
+  # NODE has ONE authority, the Makefile's NODE_VERSION. This workflow holds no Node version and uses
+  # no setup-node: `make node-install` fetches that release and checks its sha256, and every web
+  # target refuses a node that does not report it. buf, which gen:proto needs, goes the same way.
+  # Both install under $HOME/.local/bin, put first on PATH for the later steps through GITHUB_PATH.
+  web:
+    name: Web (lint, typecheck, test, build, audit)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read  # checkout only
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+    - name: Install Buf
+      run: |
+        make buf-install BUF_INSTALL_DIR="${HOME}/.local/bin"
+        echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
+    - name: Install Node
+      run: |
+        make node-install NODE_INSTALL_DIR="${HOME}/.local/bin"
+        echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
+    - name: Install Web Dependencies
+      run: |
+        make web-install
+
+    - name: Generate TypeScript from Proto
+      run: |
+        make gen-proto-ts
+
+    - name: Lint
+      run: |
+        make web-lint
+
+    - name: Typecheck
+      run: |
+        make web-typecheck
+
+    - name: Test
+      run: |
+        make web-test
+
+    - name: Build
+      run: |
+        make web-build
+
+    # TWO PARTS (see web-audit in the Makefile): the full npm audit, dev tooling included, is
+    # REPORT-ONLY (dev-only findings are tracked as risk tj-s5dqya and must not turn this job red);
+    # then the gate, npm audit --omit=dev --audit-level=high, which fails on any high or critical
+    # finding in a runtime dependency. The full report prints first so it is in the log either way.
+    - name: Audit
+      run: |
+        make web-audit
+
   security:
     name: Security Checks
     runs-on: ubuntu-latest
@@ -241,10 +314,11 @@ jobs:
     # --error makes semgrep exit non-zero on any finding, so this step fails on findings rather
     # than only proving semgrep ran (tj-cg2i9p). A fresh checkout has no .claude/worktrees; the
     # exclude keeps this line identical to `make security`, where agent worktrees do exist
-    # (tj-aov3ip). Change both or neither.
+    # (tj-aov3ip). '*.spec.ts' keeps the web test specs out as tests/ keeps the Python tests out
+    # (tj-grna9p.106). Change both or neither.
     - name: Run SemGrep
       run: |
-        uv run semgrep --config=auto --error --exclude=tests/ --exclude=.venv --exclude=docker-compose.override.yaml --exclude=.claude/worktrees .
+        uv run semgrep --config=auto --error --exclude=tests/ --exclude='*.spec.ts' --exclude=.venv --exclude=docker-compose.override.yaml --exclude=.claude/worktrees .
 
     # --color never, the same command as the Makefile's security target (tj-3mk3u5.43): uv colours
     # its output when the environment forces colour, even into this redirect, and pip-audit cannot
@@ -342,6 +416,10 @@ jobs:
         # here for the same reason, because `config` creates no container and so no pgAdmin
         # account can ever be initialised from them.
         #
+        # The prod and dev sets now carry the web overlays (bead tj-mcrwrd), whose INSTANCE_WRITE_SECRET
+        # has a ":?" guard: it gets the same throwaway placeholder, safe for the same reason (`config`
+        # creates nothing, and the placeholder never reaches a container).
+        #
         # The agent-stack set, spelled exactly as the Makefile's AGENT_STACK_COMPOSE: project
         # trader_joe_agent_stack, then base, test-client, the agent-stack overlay and the
         # fake-mode overlay LAST (ADR tj-4rr0la addendum 3 (3); decision tj-j4wknb R4). The
@@ -373,10 +451,13 @@ jobs:
         AGENT_MCP_REPO_HOST_PATH=/tmp/agent_mcp_render_repo AGENT_MCP_STACK_DIR=/tmp/agent_mcp_render_stack \
           AGENT_MCP_SHARE_PATH=/tmp/agent_mcp_render_share AGENT_MCP_UID=1000 AGENT_MCP_GID=1000 \
           docker compose -p trader_joe_agent_mcp --env-file /dev/null -f docker-compose.agent-mcp.yaml config --quiet
-        docker compose -f docker-compose.yaml config --quiet
-        docker compose -f docker-compose.yaml -f docker-compose.override.yaml config --quiet
-        PGADMIN_EMAIL=unused PGADMIN_PASS=unused docker compose -f docker-compose.yaml \
-          -f docker-compose.override.yaml -f docker-compose.tools.yaml config --quiet
+        INSTANCE_WRITE_SECRET=unused docker compose -f docker-compose.yaml -f docker-compose.web.yaml \
+          config --quiet
+        INSTANCE_WRITE_SECRET=unused docker compose -f docker-compose.yaml -f docker-compose.override.yaml \
+          -f docker-compose.web.yaml -f docker-compose.web.dev.yaml config --quiet
+        PGADMIN_EMAIL=unused PGADMIN_PASS=unused INSTANCE_WRITE_SECRET=unused docker compose \
+          -f docker-compose.yaml -f docker-compose.override.yaml -f docker-compose.web.yaml \
+          -f docker-compose.web.dev.yaml -f docker-compose.tools.yaml config --quiet
         docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml config --quiet
         DATABASE_NAME=agent_stack_render_db \
           STORE_API_NETWORK=agent_stack_render_store_api DATA_DIR=/tmp/agent_stack_render_data \

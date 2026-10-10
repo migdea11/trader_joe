@@ -5,14 +5,17 @@ import sys
 from enum import Enum
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Annotated, Any
 
 import pytest
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.routing import APIRoute
+from google.protobuf.message import Message
 from pydantic import BaseModel
 
 from common.tests.roots import SERVER_ROOT
+from routers.common.proto_json import X_PROTO_MESSAGE, ProtoBody, ProtoJSONResponse, proto_route
+from routers.tests.proto_fixtures import SUMMARY_FULL_NAME, Summary, summary
 
 
 # THE INTERFACE MANIFEST (tj-ru24i2, ADR tj-fdb9gz).
@@ -193,12 +196,34 @@ def _split_parameters(function: Any) -> tuple[str, str]:
     touches: list[str] = []
     for parameter in inspect.signature(function).parameters.values():
         annotation = _unwrap_annotated(parameter.annotation)
-        rendered = _render_type(annotation)
         if isinstance(annotation, type) and issubclass(annotation, BaseModel):
-            request.append(rendered)
+            request.append(_render_type(annotation))
+        elif isinstance(annotation, type) and issubclass(annotation, Message):
+            # A /ui/v1 body parsed by ProtoBody (tj-grna9p.15): the contract is the .proto message, so it is
+            # recorded by its full proto name, the same name x-proto-message gives a response.
+            request.append(annotation.DESCRIPTOR.full_name)
         else:
-            touches.append(rendered)
+            touches.append(_render_type(annotation))
     return _join(request), _join(touches)
+
+
+def _route_fields(route: APIRoute) -> tuple[str, str, str]:
+    """Return a route's request, response and touches fields.
+
+    A /ui/v1 route has no response model: proto_route gives it ProtoJSONResponse and names its message under
+    x-proto-message instead (ADR tj-grna9p.4 section 4), so that name is its response. Without this, every such
+    route would record '-' and the manifest would hold no contract for it.
+
+    Args:
+        route (APIRoute): The route.
+
+    Returns:
+        tuple[str, str, str]: The request field, the response field and the touches field.
+    """
+    request, touches = _split_parameters(route.endpoint)
+    proto_message = (route.openapi_extra or {}).get(X_PROTO_MESSAGE)
+    response = proto_message if proto_message else _render_type(route.response_model)
+    return request, response, touches
 
 
 def _line(kind: str, address: str, file: str, symbol: str, request: str, response: str, touches: str) -> str:
@@ -278,8 +303,7 @@ def _http_lines(component: str, modules: list[ModuleType]) -> tuple[set[str], se
                         f'{route.path} is registered on a {component} router but implemented in '
                         f'{defining_module.__name__}, so its component is ambiguous'
                     )
-                request, touches = _split_parameters(route.endpoint)
-                response = _render_type(route.response_model)
+                request, response, touches = _route_fields(route)
                 bound_paths.add(route.path)
                 for method in route.methods:
                     lines.add(
@@ -440,3 +464,35 @@ def test_the_interface_surface_equals_the_committed_manifest(component: str):
     enumerated = enumerate_interface_surface(component)
     declared = set(load_manifest(component))
     assert enumerated == declared, _describe(component, enumerated - declared, declared - enumerated)
+
+
+# THE /ui/v1 CONTRACT IN THE MANIFEST (tj-grna9p.15; ADR tj-grna9p.4 section 4: x-proto-message exists "so the
+# interface manifest records the contract"). No /ui/v1 route is committed yet, so the enumerator's reading of one
+# is pinned on a route built here, exactly as a /ui/v1 module will declare it.
+def _proto_routes() -> dict[str, APIRoute]:
+    """Build a router with a proto read route and a proto body route, and return its routes by path.
+
+    Returns:
+        dict[str, APIRoute]: The routes.
+    """
+    router = APIRouter()
+
+    @router.get('/ui/v1/read', **proto_route(Summary))
+    async def read_summary() -> ProtoJSONResponse:
+        return ProtoJSONResponse(summary())
+
+    @router.post('/ui/v1/echo', **proto_route(Summary))
+    async def echo_summary(body: Annotated[Summary, Depends(ProtoBody(Summary))]) -> ProtoJSONResponse:
+        return ProtoJSONResponse(body)
+
+    return {route.path: route for route in router.routes if isinstance(route, APIRoute)}
+
+
+@pytest.mark.common
+def test_a_proto_route_records_its_x_proto_message_as_its_response():
+    assert _route_fields(_proto_routes()['/ui/v1/read']) == (EMPTY, SUMMARY_FULL_NAME, EMPTY)
+
+
+@pytest.mark.common
+def test_a_proto_body_is_recorded_as_the_request_by_its_proto_name():
+    assert _route_fields(_proto_routes()['/ui/v1/echo']) == (SUMMARY_FULL_NAME, SUMMARY_FULL_NAME, EMPTY)

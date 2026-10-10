@@ -8,6 +8,12 @@ branch is regrouped before review, and a regroup rewrites every SHA on it — bo
 a symbol. Check those before trusting an entry: if the file or symbol an entry names no longer
 exists, the entry is stale.
 
+**Updated for the UI read routes (2026-10).** Since that pass the tree gained the `/ui/v1` read
+routes the web UI uses (U1 to U5 below), the by-id read `GET /store/{id}` (S6), half-open ranges, and an
+optional `expiry` that defaults to none. Those entries and the entries they changed say so. The
+server code now lives under `server/`: file paths in this document are relative to it, and the
+manifest is at `server/routers/tests/interface_manifest/`.
+
 **Checked on real Postgres, with named gaps.** Every status code and behaviour below was checked in
 process, against the code and its tests. On 2026-09-29 the owner ran the system suite
 (`tests/system`, through `make test-system SYSTEM_TEST_DISPOSABLE_DB=1`) on the host against a
@@ -90,9 +96,9 @@ is pinned where it lives — `data/ingest/tests/test_grpc_host.py` — instead o
 member carries a path and no method, so the manifest cannot tell `GET /store/{id}` from
 `DELETE /store/{id}`. Binding the DELETE is enough to make the path count as bound, and the unserved
 GET at the same path never reaches the manifest's `unbound-path` list. This is the honest limit of
-what a declaration says, and it is the only known gap in an otherwise exact inventory — but a reader
-who trusts "bound" without it will draw the wrong conclusion. See
-[GET /store/{id}](#get-storeid--declared-unserved-and-invisible-to-the-manifest).
+what a declaration says. It hides nothing today: the GET at `/store/{id}` is served and has its own
+manifest line (S6), but a declaration added later that shares a path with a bound method would be
+hidden the same way.
 
 ### Stability markers
 
@@ -110,7 +116,7 @@ change.
 Two markers that appeared in the first version of this document — *Proposed for deletion* and
 *Proposed for implementation* — are gone. Both meant "the architect recommends, the user has not
 ruled". **The user ruled on 2026-09-23**: the three deletion recommendations were taken, and the one
-implementation recommendation was filed as `tj-2h1q3k`. Nothing on this surface is waiting on a
+implementation recommendation was filed and has since been built (S6). Nothing on this surface is waiting on a
 ruling any more. The deleted declarations are recorded under
 [Declarations deleted by ruling](#declarations-deleted-by-ruling-2026-09-23) rather than dropped, so
 the reasoning survives the deletion.
@@ -122,15 +128,14 @@ along with the Kafka transport", and it was applied to C2 and C3. The Kafka tran
 reader who had acted on the marker would have deleted live code. The two entries are marked **Stable**
 below, and the harness's own entry says what actually changed.
 
-Every implementing file on this surface moves at the monorepo split (`tj-iontkq`), so that is not
-repeated per entry.
+Every implementing file on this surface moved at the monorepo split (`tj-iontkq`) and is now under
+`server/`, so that is not repeated per entry.
 
 ## The surface at a glance
 
-**Eight** interfaces are visible to the manifest, plus one declaration the manifest cannot see
-(`GET /store/{id}`, per the method-blind matching limit above). Six of the eight are stable. The count
-is taken from `routers/tests/interface_manifest/*.manifest` — three lines in `common.manifest`, five in
-`data_store.manifest` — not from the prose below. `data_ingest.manifest` holds a single `none` line,
+**Fourteen** interfaces are visible to the manifest: three in `common.manifest` and eleven in
+`data_store.manifest`. The count is taken from `routers/tests/interface_manifest/*.manifest`, not from
+the prose below. `data_ingest.manifest` holds a single `none` line,
 which is a declaration that the component exposes nothing this manifest can enumerate, not an
 interface; its real surface is the gRPC `IngestService`, pinned outside `routers/`.
 
@@ -146,7 +151,12 @@ It was nine until the Kafka removal, when R1 left the table.
 | S3 | `DELETE /store/{id}` | data_store | http | instance secret | **Stable** |
 | S4 | `POST /internal/asset-data/{asset_type}/{data_type}` | data_store | http | instance secret | **Fate undecided** |
 | S5 | `GET /internal/asset-data/{asset_type}/{data_type}` | data_store | http | none | **Stable** |
-| — | `GET /store/{id}` | data_store | *invisible to the manifest* | n/a | **Filed for implementation** (`tj-2h1q3k`) |
+| S6 | `GET /store/{id}` | data_store | http | none | **Stable** |
+| U1 | `GET /ui/v1/config` | data_store | http (protobuf JSON) | none | **Stable** |
+| U2 | `GET /ui/v1/datasets` | data_store | http (protobuf JSON) | none | **Stable** |
+| U3 | `GET /ui/v1/datasets/facets` | data_store | http (protobuf JSON) | none | **Stable** |
+| U4 | `GET /ui/v1/datasets/{dataset_id}` | data_store | http (protobuf JSON) | none | **Stable** |
+| U5 | `GET /ui/v1/datasets/{dataset_id}/bars` | data_store | http (protobuf JSON) | none | **Stable** |
 
 data_ingest has no row. Its interface is the gRPC `IngestService.FetchDataset`, declared in
 `proto/trader_joe/proto/internal/ingest/v1/ingest.proto`, handled by
@@ -154,11 +164,8 @@ data_ingest has no row. Its interface is the gRPC `IngestService.FetchDataset`, 
 `data/ingest/app/grpc_host.py`. It is outside this document's REST-shaped inventory by ADR
 `tj-8konfu` D3, and pinned by `data/ingest/tests/test_grpc_host.py`.
 
-**Why eight and not nine.** The last row is the one entry in this table that is not a manifest line,
-and it is marked so. The manifest matches by path and not by method, so `GET /store/{id}` is counted
-as bound by the `DELETE` at the same path and never appears as its own line. Every other row here is
-a manifest line, one for one. That single discrepancy is deliberate, and it is the reason a count
-taken from this table and a count taken from the manifest differ by exactly one.
+**One row, one manifest line.** The method-blind blind spot that once hid `GET /store/{id}` is closed
+by serving it: it is S6 and has its own manifest line.
 
 **`unbound-path` is now a two-entry kind, and both are the latency pair.** That is the state the
 kind was invented to describe: written code that mounts only under an environment flag. No
@@ -223,7 +230,7 @@ to the higher-ranked value is gone.
   a tape, so feed on the entry is deferred to the gRPC transport work (`tj-rh4b7f`). Today one
   deployment serves one feed, so no two entries can differ by feed. The bar does carry `feed`.
 - `expiry` (when the dataset's data dies) is a column on the entry, not on the bar, and is **not**
-  identity.
+  identity. It is nullable: none means the dataset never expires.
 - `end` omitted means open-ended; it is stored as a 1970-01-01 sentinel so that two open-ended
   requests still collide on the key.
 - `owner`, `expiry_type` and `update_type` are `NOT NULL`. A null in a unique key is distinct from
@@ -235,8 +242,8 @@ to the higher-ranked value is gone.
 
 | Request | Outcome |
 |---|---|
-| Every identity field equal to an existing entry, range included | **No-op.** The existing entry's id is reused; only its `expiry` and `updated_at` are refreshed. This is what makes a retried POST safe. |
-| Same owner and same non-range fields, range overlapping but not equal | **409**, `detail.colliding_ids` listing the overlapping entries. Nothing is written. |
+| Every identity field equal to an existing entry, range included | **No-op.** The existing entry's id is reused; only its `expiry` and `updated_at` are refreshed, and `expiry` is taken from the request, so omitting it clears a stored one. This is what makes a retried POST safe. |
+| Same owner and same non-range fields, range overlapping but not equal (ranges are half-open, so ranges that only touch do not overlap) | **409**, with the overlapping entries' ids in the top-level `colliding_ids` member of the problem+json (`detail` is a sentence). Nothing is written. |
 | Anything else, including another owner's overlapping dataset | A new entry. Owner is identity, so a different owner's dataset is never a collision. |
 
 **There is no route to extend a dataset.** The 409 hands the caller an id, and the store's crud
@@ -331,8 +338,8 @@ and cannot rely on an error.
 |---|---|---|
 | 401 | Instance secret missing, wrong, or not configured on the server. One fixed message for all three causes. | S1, S3, S4 |
 | 403 | The declared `owner` does not own the entry (a missing owner is treated as a wrong one) | S3 |
-| 404 | No entry with that id | S3 |
-| 409 | The create overlaps the same owner's existing dataset; `detail.colliding_ids` lists them | S1 |
+| 404 | No entry or dataset with that id | S3, S6, U4, U5 |
+| 409 | The create overlaps the same owner's existing dataset; the top-level `colliding_ids` member of the problem+json lists them | S1 |
 | 422 | Validation: a naive datetime, an unknown field or parameter, a missing required field, a bars query naming no selector or a blank symbol, a `validate_fields` rule on the create body, an `asset_type`/`data_type` pair other than `stock`/`market_activity` on the internal asset-data path, or a malformed single-bar body | all |
 | 500 | Anything unmapped: a database error, a non-stock `asset_type` on S1 (gap **G8**), a duplicate timestamp inside one ingested batch | all |
 
@@ -423,7 +430,7 @@ and is the only interface in the component that crosses two external boundaries.
 | **Auth** | **instance secret** (`X-Instance-Secret`), fail-closed; 401 otherwise |
 | **Implementation** | `routers/data_store/asset_dataset_store.py :: store_data` *(as of the dataset-model PR)* |
 | **Request** | `schemas.data_store.asset_dataset_store.StoreAssetDatasetPath` + `...StoreAssetDatasetBody` |
-| **Response** | **undeclared** — ad-hoc dict: `message` and `data_points` (bars written) |
+| **Response** | `schemas.data_store.asset_dataset_store.StoreAssetDatasetResponse`: `message`, `data_points` (bars written) and `served_range` |
 | **Touches** | Postgres (`AsyncSession`) **and** gRPC (`common.rpc.clients.ingest_fetch.IngestFetchClient`) |
 
 This is the write path: it creates (or resolves) the dataset entry, triggers a fetch, forwards the
@@ -434,14 +441,22 @@ transport is rewritten at the cutover.
 
 **The body is the dataset's identity.** `owner` (required, no default), `source`, `granularity`,
 `start` (required), `end` (optional; omitted means open-ended), `expiry_type` (default `BULK`) and
-`update_type` (default `STATIC`), plus `expiry` (optional; defaults to one day from the request, and
-an explicit `null` is a 422). There is no `feed` field. The entry is resolved as described in
+`update_type` (default `STATIC`), plus `expiry` (optional; omitted or `null` means the dataset
+**never expires**). There is no `feed` field. The entry is resolved as described in
 [What a create does](#what-a-create-does): an exact repeat reuses the existing entry, an overlap with
 the same owner's dataset is a **409** carrying `colliding_ids`, anything else creates.
 
-**`validate_fields` rules, both 422:** `update_type` must be `STATIC` when `end` is given, and must be
-`STATIC` when `expiry_type` is `BULK`. The messages name members, e.g. *"The 'update_type' field must
-be 'STATIC' when 'end' is provided."*
+**`expiry` changed meaning in this release, a public contract change.** It used to default to one day
+after the request; it now defaults to none, and a caller that relied on the old default now gets a
+dataset that never lapses. Send an explicit `expiry` to get a dataset that does. Expiry is not
+identity, so an exact repeat of a request reuses the entry and **sets its expiry from the new body**: a
+repeat POST that omits `expiry` clears a stored one, and a `DAILY` or `STREAM` dataset that had an
+expiry (and so read as retired) is active again. A repeat that carries an `expiry` sets it.
+
+**Validation, all 422:** `update_type` must be `STATIC` when `end` is given, and must be `STATIC` when
+`expiry_type` is `BULK`; and a given `end` must be later than `start`, since ranges are half-open and
+an empty or inverted one can never be filled. The messages name members, e.g. *"The 'update_type'
+field must be 'STATIC' when 'end' is provided."*
 
 **Two things a retry does not avoid.** An exact repeat reuses the entry and the bar upsert is
 idempotent on the bar's natural key, so the stored data does not duplicate — but the vendor fetch is
@@ -470,8 +485,7 @@ event log will eventually sit behind. See gaps **G6** (undeclared response) and 
 | **Touches** | Postgres |
 
 Lists the dataset entries for one symbol, each with its `item_count` (bars held, 0 for an entry with
-none) and its own `expiry`. Returns a **list**, and has no way to address a single entry — which is
-the argument for implementing `GET /store/{id}`, below.
+none) and its own `expiry`. Returns a **list**; to read a single entry by id, use `GET /store/{id}` (S6).
 
 Optional query filters, each an exact match on the entry's column: `owner`, `source`, `granularity`,
 `start`, `end`, `expiry_type`, `update_type`, `created_at`, `updated_at`. The datetimes must be
@@ -502,11 +516,8 @@ absent owner is the degenerate case of a wrong one and gets the same 403, not a 
 holds only because `store_dataset_entry.owner` is `NOT NULL`; if that column ever became nullable, a
 missing owner would start matching rows.
 
-**Address collision.** `AssetDatasetStoreInterface` declares both `GET_STORE_ASSET_DATASET_BY_ID` and
-`DELETE_STORE_ASSET_DATASET_BY_ID` at the same path, `/store/{id}`, and only the DELETE is bound. The
-manifest cannot see the collision, because an enum member carries no method. `tj-wc4pe8` closed
-without resolving it — the two PUT declarations it also covered were deleted, but this pair is
-resolved by *implementing* the GET, which is now `tj-2h1q3k`.
+**Address.** `GET /store/{id}` is served at the same path as this route (S6). They are different
+methods on one declared path, and the manifest holds each as its own line.
 
 **Correction to an earlier version of this document.** The first version filed `tj-9dqfjo` —
 `AssetDataDeleteById` using `Field()` without being a Pydantic model — as a defect *in this route's
@@ -574,7 +585,7 @@ gRPC. Confirm before building on it.
 | `source` | the vendor |
 | `feed` | the tape: `IEX`, `SIP`, `NOT_APPLICABLE` |
 | `granularity` | the bar size |
-| `start`, `end` | the bar `timestamp`, **inclusive** at both ends (`timestamp >= start`, `timestamp <= end`); timezone-aware only |
+| `start`, `end` | the bar `timestamp`, **half-open** (`timestamp >= start`, `timestamp < end`): a bar stamped exactly at `end` is not returned and a bar at `start` is; timezone-aware only |
 
 **A selector is required.** A query must name `dataset_id` or `asset_symbol`; one naming neither is a
 **422** (loc `['query']`, type `value_error`), so an unbounded read of the whole table cannot be
@@ -597,46 +608,109 @@ a page. See gap **G5**.
 An unsupported `asset_type`/`data_type` pair is a **422** here too, from the same `Path()`-bound
 `AssetDataPath` as S4.
 
-## `GET /store/{id}` — declared, unserved, and invisible to the manifest
+## S6 · `GET /store/{id}`
 
 | | |
 |---|---|
-| **Stability** | **Filed for implementation** — `tj-2h1q3k`, user ruling 2026-09-23. Not built yet. |
-| **Auth** | n/a — nothing is served **yet** |
-| **Declared at** | `routers/data_store/app_endpoints.py :: AssetDatasetStoreInterface.GET_STORE_ASSET_DATASET_BY_ID` *(as of the dataset-model PR)* |
-| **Request / Response / Touches** | none — nothing is bound |
+| **Stability** | **Stable.** |
+| **Auth** | none |
+| **Implementation** | `routers/data_store/asset_dataset_store.py :: get_data_by_id` |
+| **Request** | `schemas.data_store.asset_dataset_store.AssetDatasetStoreGetById` — path `id` |
+| **Response** | `schemas.data_store.asset_dataset_store.AssetDatasetStore` |
+| **Touches** | Postgres |
 
-**This is the only entry in this document that is not implemented, and it is the only one left.** The
-other three unserved declarations were deleted (below). This one was ruled the other way on the same
-day and is filed as `tj-2h1q3k`, assigned to `builder-store`. It is scheduled work, not an open
-question — do not re-propose it, and do not treat its absence from the manifest as evidence it was
-forgotten.
+One dataset entry by id, shaped like one element of S2: the entry whole, plus `item_count` (bars held,
+0 for an entry with none). An unknown id is a **404** problem+json (reason `NOT_FOUND`). It shares its
+path with S3 and answers a different method; the manifest records the two as separate lines.
 
-**Why this one is not in the manifest at all, and why it is the reason the counts differ.** The enum
-declares GET and DELETE at the same path, `/store/{id}`, and only the DELETE is bound. **The manifest
-matches by path, not by method**, so the path already counts as bound and this declaration never
-reaches the `unbound-path` list. It is the one declared, unserved interface the machine-checked
-surface cannot see — which is exactly why the glance table above has ten rows against the manifest's
-nine. The architect found it by reading the enum, not by reading the manifest.
+---
 
-When `tj-2h1q3k` lands, the manifest **gains** a line (the path becomes `GET` *and* `DELETE`, two
-interfaces where it recorded one) and the recorded GET/DELETE collision dissolves.
+# routers/data_store — the UI read routes
 
-**Architect's verdict, ruled and taken — implement it.** It is the only read-by-id on the store
-surface.
-`GET /store/{asset_type}/{data_type}/{asset_symbol}` returns a list and cannot address one entry,
-while `DELETE /store/{id}` already proves the id is a first-class address. **So the surface today lets
-you delete an entry by id but never read it by id.** It survives every migration in flight —
-it came through the Kafka removal and the gRPC re-host untouched, and the Phase 1 re-path will not
-touch it either, which is what separated it
-from the three declarations deleted on the same day —
-`tj-3mk3u5` keeps REST for read and debug — and it becomes *more* useful once the entry row carries
-the fetch-ledger columns, because "what is the state of this fetch" is a read-by-id question (gap
-**G1**).
+Five read routes serve the web UI under `/ui/v1`. They are open like the other reads and write nothing;
+in a deployment the web container's proxy is what a browser reaches, and only these routes pass it.
+See the README's *The web UI*.
 
-**If it is implemented:** declare a response model (`schemas.data_store.asset_dataset_store.AssetDatasetStore`)
-and a real 404. Several routes on this surface already declare no response model and the not-found
-path is untested across the whole component — do not add another ad-hoc dict.
+**Protobuf canonical JSON, not Pydantic.** The response of every `/ui/v1` route is the protobuf
+canonical JSON of a message declared under `proto/trader_joe/proto/ui/v1/`: lowerCamelCase field
+names, enums by name, `int64` as a string, timestamps as RFC 3339 `Z`. The `.proto` file is the schema;
+OpenAPI records only the message's full name under the `x-proto-message` extension, and the manifest
+pins it (`trader_joe.proto.ui.v1.DatasetPage`, and so on). A client decodes with the generated schema
+and ignores a field it does not know, since proto changes are additive. The rendering is
+`routers/common/proto_json.py`: a handler returns `ProtoJSONResponse(message)`, a route declares its
+message with `proto_route`, and a body, when a route takes one, is parsed with `ProtoBody`, which
+refuses an unknown field or a non-object with a 422 that names the message type and never echoes the
+body. No `/ui/v1` route takes a body today.
+
+**Common behaviour.**
+
+| Topic | Rule |
+|---|---|
+| Ranges | Half-open `[start, end)`: `start` included, `end` excluded. Datetimes must be timezone-aware. |
+| Paging | Keyset, never offset. `next_cursor` is opaque and empty on the last page; pass it back as `cursor`. A dataset added or removed between pages never makes a client see one twice or skip one that was ahead. A cursor that does not decode, or was issued under another sort, is a 422. |
+| Unknown parameter | A 422 (`extra_forbidden`), not ignored. |
+| Enum filters | Take the member name, in any case, with or without the wire prefix: `source=ALPACA_API` and `source=DATA_SOURCE_ALPACA_API` are the same filter. |
+| Errors | problem+json as everywhere (see the conventions): 404 `NOT_FOUND` for an unknown dataset, 422 for a bad parameter. |
+| Credentials | None carried. `owner` is a free-text label, never a key. |
+
+### U1 · `GET /ui/v1/config`
+
+What the shell needs to know about the deployment: `UiConfig` with `allowedGroups` (only
+`ACCOUNT_GROUP_SIMULATION` for now), `deploymentLabel` (display only; empty when unset, and nothing may
+branch on it; from `DEPLOYMENT_LABEL`) and `serverVersion` (`SERVER_VERSION`, else the installed
+package version, else `unknown`). Nothing secret is read or returned.
+
+### U2 · `GET /ui/v1/datasets`
+
+One page of the catalog, a `DatasetPage` of `DatasetSummary` items: identity, range, `updateType`,
+`expiryType`, `expiry`, `state` (`ACTIVE` or `RETIRED`), the stored extent (`firstBar`, `lastBar`,
+`barCount`), `freshness` and the `siblings` (the same series at other granularities).
+
+| Parameter | Meaning |
+|---|---|
+| `asset_symbol` | symbols starting with this, case-insensitive |
+| `source`, `update_type` | exact, by member name |
+| `status` | the UI group: `healthy`, `late`, `failed` or `retired` |
+| `needs_attention` | only late and failed datasets |
+| `sort` | `symbol` (default), or `expires`: soonest first, no-expiry datasets last |
+| `cursor`, `limit` | page; `limit` 1 to 500, default 100 |
+
+**Freshness is computed on read, never stored**, over the source's trading calendar (a holiday or an
+early close moves what is expected). A source with no calendar has no computed freshness: its status is
+unspecified and it matches no `status` filter.
+
+| Update type | Status | Meaning |
+|---|---|---|
+| `DAILY` | `FRESH` | the last completed session in range is stored |
+| `DAILY` | `LATE` | not stored yet and the next session has not opened; pending, not a failure |
+| `DAILY` | `OVERDUE` | not stored by the next session's open; a failure |
+| `STREAM` | `FRESH` / `OVERDUE` | in hours, last bar within a few bar-lengths of now (`FRESHNESS_STREAM_BAR_MULTIPLE`, default 3); outside hours, relative to the last close |
+| `STATIC` | `COMPLETE` | every session in `[start, end)` has at least one bar |
+| `STATIC` | `GAPS` | some do not; `gapCount` is the number of missing sessions |
+| `DAILY` or `STREAM`, with an expiry set | `RETIRED` | no freshness is computed |
+
+The UI groups these as Healthy (`FRESH`, `COMPLETE`), Late (`LATE`), Failed (`OVERDUE`, `GAPS`) and
+Retired. Completeness is counted per session, so a weekly or monthly dataset, which has bars on fewer
+days than there are sessions, would read as full of gaps; none is stored yet.
+
+### U3 · `GET /ui/v1/datasets/facets`
+
+The sidebar's counts as a `DatasetFacets`, under the same filters U2 takes minus the page. Each count
+equals the total of the list it describes: `all` is the total with every filter except
+`needs_attention`, `needsAttention` is the total with every filter and `needs_attention` forced on,
+and each source, update type and status count is the total with every filter except that facet's own.
+
+### U4 · `GET /ui/v1/datasets/{dataset_id}`
+
+One `DatasetSummary`, as in U2. **404** for an unknown id.
+
+### U5 · `GET /ui/v1/datasets/{dataset_id}/bars`
+
+One `BarPage` of the dataset's bars, ascending by bar start, in `[start, end)`. `start` and `end` are
+each optional, and unset leaves that side open. `limit` is 1 to 10000, default 1000. The cursor is the
+last bar's timestamp, unique within a dataset, so paging is exact while bars are inserted. An empty or
+inverted window is an empty page, not an error. **404** for an unknown dataset, 422 for a bad cursor.
+Bars are raw (unadjusted), as on S5.
 
 ---
 
@@ -651,7 +725,7 @@ data_ingest declares **no HTTP interface at all**, and `data_ingest.manifest` sa
 |---|---|
 | **Stability** | **Stable.** This replaced the Kafka RPC entry (R1) when the transport was removed. |
 | **Auth** | none |
-| **Contract** | `proto/trader_joe/proto/internal/ingest/v1/ingest.proto` — the source of truth; the Python stubs under `gen/proto/python/` are generated and committed, and CI fails on a stale tree |
+| **Contract** | `proto/trader_joe/proto/internal/ingest/v1/ingest.proto` — the source of truth; the Python stubs under `gen/proto/python/` are generated by `make proto` and never committed |
 | **Implementation** | `routers/data_ingest/fetch_dataset_handler.py :: IngestFetchHandler.fetch`, registered in `data/ingest/app/grpc_host.py :: registered_services` |
 | **Request** | `FetchDatasetRequest` |
 | **Response** | `stream FetchDatasetResponse` — a `oneof` over `FetchAccepted`, `FetchRefused`, `BarPage` and `FetchDone` |
@@ -722,18 +796,19 @@ import. Its entire interface is the gRPC method above. See
 
 # Not implemented: two different things
 
-"Not implemented" used to pool three situations here. It now pools two, because the third — *never
-written* — was emptied by the deletions below.
+"Not implemented" used to pool three situations here. It now holds one: *never written* was emptied
+by the deletions below, and *declared and unserved* (`GET /store/{id}`) was emptied when that route
+was built (S6).
 
 | Sense | Which | What it means for you |
 |---|---|---|
 | **Written, switched off** | C2, C3 | The code exists in `routers/common/latency.py` and mounts only when `LATENCY_TEST_ENABLED` is set. `unbound-path` here means *conditionally mounted, off in production*. The initialisers are also single-shot, so a client and a server cannot both initialise in one process. |
-| **Declared, unserved, invisible to the manifest** | `GET /store/{id}` | Declared in the enum, never bound, and absent from the `unbound-path` list because the manifest matches by path and the DELETE at the same path is bound. Filed as `tj-2h1q3k`. |
 
 **The verdicts were taken, and this is now the state, not a forecast.** The `unbound-path` kind is
 empty for data_store and data_ingest and survives only for the two latency entries — which is the
-state that kind was invented to describe. `data_store.manifest` carries five `http` lines and nothing
-else; `data_ingest.manifest` carries one `rpc` line and nothing else.
+state that kind was invented to describe. `data_store.manifest` carries eleven `http` lines and nothing
+else (the five original routes, S6 and the five UI routes); `data_ingest.manifest` carries a single
+`none` line.
 
 ---
 
@@ -890,9 +965,9 @@ Specifics worth naming rather than leaving to inference:
 `GET /internal/asset-data/{asset_type}/{data_type}` (S5) no longer returns every row: it requires a
 `dataset_id` or `asset_symbol` selector, so the widest read it can express is one symbol across all
 its datasets and all time. `GET /store/{asset_type}/{data_type}/{asset_symbol}` (S2) is scoped to one
-symbol. Neither takes `limit` or `offset`, and there is no pagination anywhere on the surface. The bar
-table is unbounded with no retention policy, so one liquid symbol at minute granularity is still a
-large answer, returned 200 in one response.
+symbol. Neither takes `limit` or `offset`. The bar table is unbounded with no retention policy, so one
+liquid symbol at minute granularity is still a large answer, returned 200 in one response. The UI's
+routes do page (U2 and U5 take a keyset `cursor` and a `limit`); the gap is that S2 and S5 do not.
 
 ## G6 · Routes that declare no response model — **REAL GAP**, cheap, and it compounds
 
@@ -992,7 +1067,7 @@ table can record:
 |---|---|---|
 | `tj-3mk3u5` — Kafka removal | **Predicted:** deletes C2 and C3, re-keys R1's address, changes S1's outbound hop. **Actually:** C2 and C3 *survived* — only the harness's Kafka arm went; R1 was *retired*, not re-keyed, and its replacement sits outside this manifest; S1's hop did change, as forecast. | **Landed** |
 | `tj-8konfu` — gRPC surface | Re-hosted the fetch call as `IngestService.FetchDataset` and added a contract this document does not fully cover (see `proto/README.md`). It did **not** settle versioning (G11) or readiness (G3); both are still open. | **Landed** (accepted, not "proposed") |
-| `tj-iontkq` — monorepo split | Moves the server code under `server/`, internals unchanged. Every file path above goes stale; addresses survive. | Pending |
+| `tj-iontkq` — monorepo split | Moved the server code under `server/`, internals unchanged. Every file path above is now relative to `server/`; addresses survived. | **Landed** |
 | `tj-a0s7vl` — authentication | Adds a real credential to every entry, replacing both `auth: none` and the deployment-level instance secret. | Pending |
 
 The two landed rows stay in the table rather than being deleted: a reader who finds an older analysis
@@ -1012,9 +1087,7 @@ Pending at the time of writing, beyond those four:
 - The dataset update route (see the addendum under
   [Declarations deleted by ruling](#declarations-deleted-by-ruling-2026-09-23)) — ruled, not built.
 - The corporate-action events table and adjustment on read — decided, not built.
-- `tj-2h1q3k` — implements `GET /store/{id}`. When it lands, the last unimplemented entry in this
-  document becomes a served route, the manifest gains a line, and the GET/DELETE collision recorded
-  against S3 dissolves.
+- `GET /store/{id}` has landed as S6; no entry in this document is declared and unserved any more.
 
 `tj-6z03hd` (S5 ignoring its query) is **closed**: S5 is the filtering read described above.
 `tj-wc4pe8` and `tj-427x50` are **closed**, and their effect is already reflected above.

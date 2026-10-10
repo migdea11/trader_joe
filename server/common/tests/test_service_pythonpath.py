@@ -107,6 +107,10 @@ DEFAULT_COMPOSE_FILES = ('docker-compose.yaml', 'docker-compose.override.yaml')
 # The stack System Testing starts: Start System runs make system-launch, which runs $(SYSTEM_COMPOSE) up.
 SYSTEM_STACK_VARIABLE = 'SYSTEM_COMPOSE'
 GUARD_S = 120.0
+# Dockerfile stages that are not Python images, so PYTHONPATH means nothing in them and V1 skips them: the
+# web UI's Node build stage (also the dev web service's image, bead tj-mcrwrd) and its Caddy server
+# (tj-grna9p.26). Held to exactly the web_* stages by test_the_stages_skipped_as_not_python_are_exactly_the_web_stages.
+NON_PYTHON_STAGES = frozenset({'web_build_image', 'web_image'})
 DOCKER_SHIM = '#!/bin/sh\nexec "$STUB_PYTHON" -P "$STUB_IMPL" "$@"\n'
 
 
@@ -164,12 +168,15 @@ def _image_target(service: Mapping, project_dir: Path) -> str | None:
     return target
 
 
-def _built_services(model: dict, project_dir: Path) -> dict[str, str]:
-    """{service: the stage it builds} for every service of a merged model built from the repository's Dockerfile."""
+def _built_services(model: dict, project_dir: Path, *, include_non_python: bool = False) -> dict[str, str]:
+    """{service: the stage it builds} for every service of a merged model built from the repository's Dockerfile.
+
+    The NON_PYTHON_STAGES are left out unless asked for: they are not Python images.
+    """
     built = {}
     for name, service in (model.get('services') or {}).items():
         target = _image_target(service or {}, project_dir)
-        if target is not None:
+        if target is not None and (include_non_python or target not in NON_PYTHON_STAGES):
             built[name] = target
     return built
 
@@ -282,6 +289,7 @@ def test_every_container_built_from_the_dockerfile_runs_with_the_images_pythonpa
 
     Equality, not 'contains': a value that names the generated root but differs from the image -- an extra
     entry, another order -- is a second definition that drifts, and the image is the one definition.
+    The web stages are skipped (NON_PYTHON_STAGES); the next test holds that skip to exactly them.
     """
     offenders, checked = [], 0
     for label, files in _launch_sets().items():
@@ -290,6 +298,28 @@ def test_every_container_built_from_the_dockerfile_runs_with_the_images_pythonpa
         checked += len(effective)
     assert checked, 'no launch set runs a service built from the Dockerfile, so nothing was checked'
     assert not offenders, '\n'.join(offenders)
+
+
+def test_the_stages_skipped_as_not_python_are_exactly_the_web_stages():
+    """The skip above cannot hide a Python service: it is the web stages, built only by the web service.
+
+    Three ways it could widen, each refused: a stage added to NON_PYTHON_STAGES that is not a web_*
+    stage; a web_* stage that sets PYTHONPATH (it would then be a Python image after all); and a service
+    other than web, in any launch set, that builds one of the skipped stages.
+    """
+    stages = list(_dockerfile_stages())
+    web_stages = {stage for stage in stages if stage.startswith('web_')}
+    assert web_stages == NON_PYTHON_STAGES, (
+        f'skipped {sorted(NON_PYTHON_STAGES)}, the web stages are {sorted(web_stages)}'
+    )
+    python_web = {stage: _dockerfile_pythonpath(stage) for stage in NON_PYTHON_STAGES if _dockerfile_pythonpath(stage)}
+    assert not python_web, f'a skipped stage sets PYTHONPATH, so it is a Python image: {python_web}'
+    skipped: set[tuple[str, str]] = set()
+    for files in _launch_sets().values():
+        built = _built_services(merge(_documents(files)), files[0].parent, include_non_python=True)
+        skipped |= {(name, target) for name, target in built.items() if target in NON_PYTHON_STAGES}
+    # Non-vacuity: prod runs web_image, dev runs web_build_image (the Vite dev server, bead tj-mcrwrd).
+    assert skipped == {('web', 'web_image'), ('web', 'web_build_image')}, sorted(skipped)
 
 
 # --- V3: literal, and no interpolation environment moves it -------------------------------------------

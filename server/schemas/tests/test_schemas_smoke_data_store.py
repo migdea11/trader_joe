@@ -909,49 +909,48 @@ def test_the_entry_records_the_resolved_feed_and_the_bar_requires_one():
     assert built.model_dump()['feed'] is Feed.IEX
 
 
-def test_expiry_default_is_computed_per_instance(monkeypatch: pytest.MonkeyPatch):
-    """Pin tj-swean0: two bodies built at different times get different expiry defaults.
+# OMITTED expiry IS None, meaning the dataset never expires (owner ruling 2026-10-10 on tj-sww0b1,
+# pulling tj-grna9p.71 forward; code 57b4406). It used to default to now + 1 day, which forced the
+# request skill to send an explicit far-future expiry that then rendered as 2098/12/31. One payload
+# per update type, since a non-null expiry means something different on each (on DAILY and STREAM it
+# retires the dataset), and a default that varied by update type would be a second contract.
+_EXPIRY_BY_UPDATE_TYPE: dict[str, dict[str, Any]] = {
+    'STATIC': {},
+    'DAILY': {'update_type': UpdateType.DAILY, 'expiry_type': ExpiryType.ROLLING},
+    'STREAM': {'update_type': UpdateType.STREAM, 'expiry_type': ExpiryType.ROLLING},
+}
 
-    A plain ``datetime.now() + timedelta(days=1)`` default is evaluated ONCE, at import, so every
-    instance in a long-lived process would share an expiry frozen at process start. A wall-clock
-    delta between two consecutive constructions cannot assert that -- the microseconds differ under
-    either implementation -- so the model module's own ``datetime`` is replaced by a clock handing
-    out two known, far-apart instants. The default factory's lambda resolves ``datetime`` from
-    those module globals, which is what makes the substitution deterministic.
+
+@pytest.mark.parametrize('extra', list(_EXPIRY_BY_UPDATE_TYPE.values()), ids=list(_EXPIRY_BY_UPDATE_TYPE))
+def test_an_omitted_expiry_is_none_for_every_update_type(extra: dict[str, Any]):
+    """Pin the new default: omitted means None (never expires), not a computed instant.
+
+    The regression to catch is a return of the now + 1 day default factory, which would make a
+    dataset requested without an expiry quietly lapse a day later.
 
     Args:
-        monkeypatch: Replaces ``datetime`` in ``schemas.data_store.asset_dataset_store``.
+        extra: The update and expiry type fields that select the update type under test.
     """
-    instants = iter((datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 6, 1, tzinfo=UTC)))
-    # `*_` because the default factory now calls `datetime.now(UTC)`: the expiry column is
-    # timestamptz, and a naive local default made "when does this data die" environment-dependent
-    # (tj-vhboky.2 item J). The assertions below are unchanged -- this adapts the fake clock's
-    # signature, not what the test pins.
-    monkeypatch.setattr(
-        'schemas.data_store.asset_dataset_store.datetime', SimpleNamespace(now=lambda *_: next(instants))
-    )
+    body = StoreAssetDatasetBody(**_DATASET_BODY | extra)
 
-    first = StoreAssetDatasetBody(**_DATASET_BODY)
-    second = StoreAssetDatasetBody(**_DATASET_BODY)
-
-    assert first.expiry == datetime(2026, 1, 2, tzinfo=UTC)
-    assert second.expiry == datetime(2026, 6, 2, tzinfo=UTC)
-    # Cheap second line pinning the mechanism; it is not a substitute for the behaviour above.
-    assert StoreAssetDatasetBody.model_fields['expiry'].default_factory is not None
+    assert 'expiry' not in body.model_fields_set, 'the default was not the one exercised'
+    assert body.expiry is None
+    assert StoreAssetDatasetBody.model_fields['expiry'].default_factory is None
 
 
-def test_expiry_default_is_an_aware_utc_instant():
-    """Pin tzinfo, which the fake-clock test above cannot: it supplies its own instants.
+@pytest.mark.parametrize('extra', list(_EXPIRY_BY_UPDATE_TYPE.values()), ids=list(_EXPIRY_BY_UPDATE_TYPE))
+def test_an_explicit_aware_expiry_is_kept_as_sent(extra: dict[str, Any]):
+    """The other half: a None default must not swallow a value the caller did send.
 
-    This is the contract half of the UTC fix. The default was ``datetime.now()`` with no tzinfo,
-    bound for a column the model side stores as ``timestamptz``, which makes "when does this data
-    die" depend on the host's local zone. A naive default does not fail -- it is coerced, quietly,
-    against whatever the database believes local is.
+    Args:
+        extra: The update and expiry type fields that select the update type under test.
     """
-    expiry = StoreAssetDatasetBody(**_DATASET_BODY).expiry
-    assert expiry is not None
-    assert expiry.tzinfo is not None
-    assert expiry.utcoffset() == datetime.now(UTC).utcoffset()
+    expiry = datetime(2026, 2, 1, 16, tzinfo=timezone(timedelta(hours=-5)))
+
+    body = StoreAssetDatasetBody(**_DATASET_BODY | extra | {'expiry': expiry})
+
+    assert body.expiry == expiry
+    assert body.expiry.utcoffset() == timedelta(hours=-5)
 
 
 # The three create-body fields bound for timestamptz columns, each with an OFFSET-LESS instant that
@@ -1077,22 +1076,19 @@ def test_an_offset_bearing_json_string_is_accepted_as_the_instant_it_names(field
 
 
 def test_the_default_expiry_survives_a_round_trip_through_its_own_annotation():
-    """The default expiry is still aware, measured the way the new annotation measures it.
+    """A body built with the default, sent on as JSON, comes back with the same None.
 
-    A default_factory's output is NOT validated (pydantic's validate_default is off), so the
-    AwareDatetime annotation never inspects the default: a factory that went back to naive
-    ``datetime.now()`` would construct without complaint. test_expiry_default_is_an_aware_utc_instant
-    checks tzinfo directly; this checks the consequence that matters under the ruling -- a body the
-    store itself builds with the default, sent on as JSON (as data_action_request.py's downstream
-    requests are), must be one the same contract accepts rather than 422s.
+    The store re-serialises bodies it builds (data_action_request.py's downstream requests), so a
+    default the same contract would 422 on, or turn into something else, is caught here. The naive
+    refusal still applying beside the None default is pinned by
+    test_a_naive_datetime_is_refused_at_its_own_field, whose expiry case is unchanged.
     """
     body = StoreAssetDatasetBody(**_DATASET_BODY)
     assert 'expiry' not in body.model_fields_set, 'the default was not the one exercised'
 
     again = StoreAssetDatasetBody.model_validate_json(body.model_dump_json())
 
-    assert again.expiry.tzinfo is not None
-    assert again.expiry == body.expiry
+    assert again.expiry is None
 
 
 def test_owner_is_required_with_no_default():
@@ -1143,14 +1139,18 @@ def test_owner_rejects_an_explicit_null(model: type[BaseModel]):
     assert [error['loc'] for error in excinfo.value.errors()] == [('owner',)]
 
 
-@pytest.mark.parametrize('field', ['expiry', 'expiry_type', 'update_type'])
+@pytest.mark.parametrize('field', ['expiry_type', 'update_type'])
 def test_a_policy_field_rejects_an_explicit_null_rather_than_defaulting_it(field: str):
-    """One assertion, TWO DIFFERENT HAZARDS, and the docstring has to say which field carries which.
+    """Pin that an explicit null is refused on the two policy fields in the identity key.
 
-    All three fields have defaults, so OMITTING them is fine and the minimal payload leaves them
-    out. Sending ``null`` explicitly is a different request and must be rejected in every case.
-    What a null would COST differs by field, and naming only one reason for three parameters would
-    be a test whose stated purpose no longer matches what it checks:
+    Both fields have defaults, so OMITTING them is fine and the minimal payload leaves them out.
+    Sending ``null`` explicitly is a different request and must be rejected.
+
+    ``expiry`` USED TO BE A THIRD CASE HERE AND IS NOT ANY MORE. Under the owner ruling of 2026-10-10
+    (tj-sww0b1, code 57b4406) its default is None and an explicit null is ACCEPTED -- see
+    test_an_explicit_null_expiry_is_accepted_and_stays_none. The downstream hazard the old case
+    guarded (a None splatted into a required ``BaseGetDatasetRequest.expiry``) is gone with that
+    path; data_action_request.py builds its request field by field and carries no expiry.
 
     ``expiry_type`` and ``update_type`` -- THE CONTRACT HALF OF THE NULL-IN-A-UNIQUE-KEY HAZARD
     (tj-vhboky.1 section 2 pins the other). Both land in a UNIQUE constraint, and Postgres treats
@@ -1159,33 +1159,8 @@ def test_a_policy_field_rejects_an_explicit_null_rather_than_defaulting_it(field
     becomes "an exact repeat creates a second row" -- the duplication the whole identity model
     exists to make impossible.
 
-    ``expiry`` -- A DIFFERENT HAZARD AT A DIFFERENT SEAM, and deliberately not the one above:
-    expiry is NOT part of the identity key (expiry_TYPE is; the value itself is a policy the
-    request asks for, not a thing that makes one dataset different from another), so nothing about
-    the unique index applies to it. The cost is downstream. ``BaseGetDatasetRequest.expiry``
-    (schemas/data_ingest/get_dataset_request.py) is a REQUIRED, non-optional datetime, and
-    data/store/app/ingest/data_action_request.py builds that request by splatting this model's
-    ``model_dump()``. So an explicit ``"expiry": null`` passed body validation, carried None
-    through the splat, and blew up as a ValidationError on GetDatasetRequest -- a 500 on
-    caller-shaped input, which is the one class of failure a declared request schema must never
-    produce. It now 422s at the edge, naming the field.
-
-    THE REGRESSION TO CATCH ON expiry is a widening BACK to ``datetime | None``, and it looks
-    reasonable from two directions: StoreDatasetEntry.expiry is nullable=True and
-    AssetDatasetStore.expiry is ``datetime | None``. Both of those are correct and must STAY -- the
-    column is nullable for rows predating the default, and the READ model must be able to represent
-    them. It is the WRITE body that must not accept null. The other plausible wrong fix is making
-    the field required, which would break every caller that legitimately omits it; the positives
-    are pinned separately by test_expiry_default_is_computed_per_instance and
-    test_expiry_default_is_an_aware_utc_instant so that this test cannot invite it.
-
-    WHAT ACTUALLY PRODUCES THE REJECTION DIFFERS BY FIELD, and this paragraph used to say the
-    annotation did it in all three cases. It does not, and the difference decides what this test can
-    be read as pinning -- measured by mutating each guard alone, not inferred from the annotations.
-
-    ``expiry``: the non-Optional annotation IS the only mechanism. Nothing coerces this field before
-    the annotation is consulted, so re-widening it to ``datetime | None`` reds this case -- and reds
-    only this case, with the rest of the suite green. That is the regression described above.
+    WHAT ACTUALLY PRODUCES THE REJECTION is not the annotation alone, which decides what this test
+    can be read as pinning -- measured by mutating each guard alone, not inferred from the annotations.
 
     ``expiry_type`` and ``update_type``: DOUBLY GUARDED, so this case pins neither guard on its own
     and must not be read as pinning the annotation for them. Each has a ``mode='before'`` field
@@ -1195,8 +1170,8 @@ def test_a_policy_field_rejects_an_explicit_null_rather_than_defaulting_it(field
     pydantic_enums.py). Measured: widening either annotation to ``| None`` is green across the whole
     suite, and making the before-validator tolerate a null with the annotations untouched is green
     too; the case reds only when BOTH are relaxed for the same field. A ``| None`` annotation with a
-    non-None default and no before-validator would accept the null and carry it, which is what
-    ``expiry`` shows and what these two are protected from twice over.
+    non-None default and no before-validator would accept the null and carry it, which is what these
+    two are protected from twice over.
 
     Args:
         field: The policy field being sent as null.
@@ -1205,6 +1180,19 @@ def test_a_policy_field_rejects_an_explicit_null_rather_than_defaulting_it(field
     with pytest.raises(ValidationError) as excinfo:
         StoreAssetDatasetBody(**_DATASET_BODY | {field: None})
     assert [error['loc'] for error in excinfo.value.errors()] == [(field,)]
+
+
+def test_an_explicit_null_expiry_is_accepted_and_stays_none():
+    """An explicit ``"expiry": null`` now means the same as omitting it: never expires.
+
+    Reversed from the earlier contract, which refused it with a 422 (owner ruling 2026-10-10 on
+    tj-sww0b1). Sent as JSON because that is how a caller sends it, and the field is marked as set
+    so this is not the default being exercised by accident.
+    """
+    body = StoreAssetDatasetBody.model_validate_json(_as_json(_DATASET_BODY | {'expiry': None}))
+
+    assert 'expiry' in body.model_fields_set
+    assert body.expiry is None
 
 
 @pytest.mark.parametrize('dead_field', ['split_factor', 'dividends_factor'])
@@ -2180,6 +2168,92 @@ def test_rule_b_a_non_static_update_with_a_non_bulk_expiry_and_no_end_is_accepte
     assert built.end is None
     assert built.update_type is update_type
     assert built.expiry_type is expiry_type
+
+
+# ---------------------------------------------------------------------------------------------
+# HALF-OPEN RANGES (tj-86g751.4): validate_range_is_not_empty refuses end <= start
+# ---------------------------------------------------------------------------------------------
+#
+# The design is tj-vhboky.1 addendum HALF-OPEN RANGES (2026-09-30), item 3, accepted by the user
+# (epic tj-86g751, 04:11 UTC 2026-09-30): every data_store range is [start, end), so a create whose
+# declared end is not after its start names an entry nothing can ever fill, and is refused. end None
+# (open-ended) is untouched, and the READ queries are not covered by it -- an empty read window is a
+# valid query that returns nothing (addendum item 1). The route half (422, loc ['body']) is in
+# data/store/tests/test_store_dataset_entry_route.py; the read half is in
+# data/store/tests/test_filtering_read.py, test_an_empty_window_is_a_valid_query_that_admits_no_bar.
+_PLUS_FIVE = timezone(timedelta(hours=5))
+_TICK = timedelta(microseconds=1)
+
+# (end, id): each is NOT after WHEN (the payload's start) as an INSTANT. The +05:00 cases are the
+# ones a wall-clock compare would get wrong: their wall clock reads later than WHEN's.
+_NOT_AFTER_START = [
+    (WHEN, 'end-equals-start'),
+    (WHEN - _TICK, 'end-one-microsecond-before-start'),
+    (WHEN - timedelta(days=30), 'end-well-before-start'),
+    (WHEN.astimezone(_PLUS_FIVE), 'end-equals-start-written-at-plus-five'),
+    ((WHEN - _TICK).astimezone(_PLUS_FIVE), 'end-before-start-written-at-plus-five'),
+]
+
+
+@pytest.mark.parametrize('end', [end for end, _ in _NOT_AFTER_START], ids=[name for _, name in _NOT_AFTER_START])
+@pytest.mark.parametrize('model', _WRITE_MODELS, ids=lambda model: model.__name__)
+def test_a_create_whose_end_is_not_after_its_start_is_refused(model: type[BaseModel], end: datetime):
+    """Addendum item 3: end == start and end < start are both refused, model-level, comparing instants.
+
+    update_type is the STATIC default, so rule (a) cannot be what refuses it, and expiry_type is the
+    BULK default with STATIC, so rule (b) cannot either: exactly one error, from this validator.
+
+    Args:
+        model: The body, or one of the two write models that inherit its validator.
+        end: An end that is not after the payload's start, as an instant.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        model(**_write_payload(model) | {'end': end})
+
+    loc, error_type, message = _only_error(excinfo)
+    assert (loc, error_type) == ((), 'value_error')
+    assert "'end'" in message and "'start'" in message and 'half-open' in message, message
+
+
+@pytest.mark.parametrize(
+    'end',
+    [WHEN + _TICK, (WHEN + _TICK).astimezone(timezone(timedelta(hours=-5))), None],
+    ids=['one-microsecond-after-start', 'after-start-written-at-minus-five', 'open-ended'],
+)
+@pytest.mark.parametrize('model', _WRITE_MODELS, ids=lambda model: model.__name__)
+def test_a_create_whose_end_is_after_its_start_or_open_is_accepted(model: type[BaseModel], end: datetime | None):
+    """The positives that keep the refusal honest: the smallest non-empty range, and end None.
+
+    The -05:00 case has a wall clock EARLIER than WHEN's but names a later instant, so a validator
+    comparing wall clocks would refuse it. Without the open-ended case, a validator that refused
+    every end would pass the test above.
+
+    Args:
+        model: The body, or one of the two write models that inherit its validator.
+        end: An end strictly after the payload's start, or None.
+    """
+    built = model(**_write_payload(model) | {'end': end})
+
+    assert built.end == end
+
+
+@pytest.mark.parametrize(
+    ('model', 'scope'),
+    [(StoreAssetDatasetQuery, {}), (StockDataMarketActivityQuery, {'dataset_id': DATASET_ID})],
+    ids=['StoreAssetDatasetQuery', 'StockDataMarketActivityQuery'],
+)
+def test_an_empty_read_window_is_still_a_valid_query(model: type[BaseModel], scope: dict[str, Any]):
+    """Addendum item 1: start == end on a READ query is accepted; the refusal is for creates only.
+
+    Both read models carry start and end; neither may inherit the create's validator.
+
+    Args:
+        model: A read query model with start and end filters.
+        scope: Whatever else the model requires (the bar query needs a selector).
+    """
+    built = model(**scope, start=WHEN, end=WHEN)
+
+    assert (built.start, built.end) == (WHEN, WHEN)
 
 
 # ---------------------------------------------------------------------------------------------

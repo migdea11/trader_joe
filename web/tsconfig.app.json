@@ -1,0 +1,24 @@
+{
+  "extends": "@vue/tsconfig/tsconfig.dom.json",
+  // gen/proto/ts is composite-listed because src imports it through @generated; npm run gen:proto
+  // writes it before typecheck, test and build.
+  "include": ["env.d.ts", "src/**/*", "src/**/*.vue", "../gen/proto/ts/**/*"],
+  "exclude": ["src/**/__tests__/*", "src/**/*.spec.ts"],
+  "compilerOptions": {
+    "composite": true,
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo",
+    "paths": {
+      "@/*": ["./src/*"],
+      // Repo-root generated tree (proto/README.md "Generated code: one committed tree per
+      // language"; TS follows gen/proto/ts/, written by `buf generate`, never committed --
+      // 2026-10-06 user ruling on tj-grna9p.29). The directory does not exist until
+      // `npm run gen:proto` runs `buf generate`.
+      "@generated/*": ["../gen/proto/ts/*"],
+      // The generated files sit outside web/, so Node resolution never reaches web/node_modules for
+      // their `@bufbuild/protobuf` imports. Pin them to the one installed copy (mirrored in the
+      // vite alias, so web/src and gen/ share a single runtime).
+      "@bufbuild/protobuf": ["./node_modules/@bufbuild/protobuf/dist/esm/index.d.ts"],
+      "@bufbuild/protobuf/*": ["./node_modules/@bufbuild/protobuf/dist/esm/*/index.d.ts"]
+    }
+  }
+}

@@ -38,7 +38,7 @@ THE RULINGS PINNED, each traceable to tj-vhboky.1 and its amendments:
 import dataclasses
 import logging
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
@@ -53,6 +53,7 @@ from common.errors.vocabulary import ExogenousError, Reason
 from data.store.app.database.crud.stock import store_dataset_entry as crud
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
+from data.store.app.freshness import FreshnessStatus, calendar_for_source, evaluate_dataset
 from schemas.data_store.asset_dataset_store import (
     AssetDatasetStore,
     AssetDatasetStoreCreate,
@@ -182,7 +183,11 @@ def _update_set_columns(sql: str) -> set[str]:
 
 
 def create_request(
-    end: datetime | None = None, owner: str = OWNER, symbol: str = 'AAPL', feed: Feed = Feed.IEX
+    end: datetime | None = None,
+    owner: str = OWNER,
+    symbol: str = 'AAPL',
+    feed: Feed = Feed.IEX,
+    start: datetime = JANUARY,
 ) -> AssetDatasetStoreCreate:
     """A create request. end defaults to None -- the open-ended case, where the sentinel bites.
 
@@ -203,7 +208,7 @@ def create_request(
         source=DataSource.ALPACA_API,
         granularity=Granularity.ONE_DAY,
         feed=feed,
-        start=JANUARY,
+        start=start,
         end=end,
         expiry=FEBRUARY,
         expiry_type=ExpiryType.BULK,
@@ -236,7 +241,9 @@ def update_request(
     )
 
 
-def overlap_key(end: datetime | None = None, owner: str = OWNER, symbol: str = 'AAPL') -> crud.OverlapKey:
+def overlap_key(
+    end: datetime | None = None, owner: str = OWNER, symbol: str = 'AAPL', start: datetime = JANUARY
+) -> crud.OverlapKey:
     """What check_own_overlap takes now: the overlap key, not an entry (tj-xn3qa6 D3).
 
     IT TAKES NO feed PARAMETER AND CANNOT BE GIVEN ONE, which is the structural half of the
@@ -247,7 +254,7 @@ def overlap_key(end: datetime | None = None, owner: str = OWNER, symbol: str = '
     field, so this helper cannot drift from the fixture every other test in this file uses: the
     same request produces the same key, and the one difference between them stays visible.
     """
-    return crud.OverlapKey.of(create_request(end=end, owner=owner, symbol=symbol))
+    return crud.OverlapKey.of(create_request(end=end, owner=owner, symbol=symbol, start=start))
 
 
 def stored_entry(
@@ -335,6 +342,116 @@ async def test_the_conflict_update_touches_no_identity_column():
     assert 'expiry' in clause and 'updated_at' in clause, clause
     leaked = [column for column in StoreDatasetEntry.NATURAL_KEY if column in clause]
     assert leaked == [], f'the conflict update writes identity columns {leaked}: {clause}'
+
+
+# ---------------------------------------------------------------------------------------------
+# A repeat POST WITHOUT an expiry CLEARS the stored one (tj-grna9p.105, architect ruling)
+#
+# Since 57b4406 an omitted expiry is None, and the exact-repeat branch sets expiry from the body. So
+# a repeat of the same dataset (same owner, series and range) that omits expiry writes NULL over a
+# stored expiry. RULED ACCEPTED: the body declares the dataset's desired lifetime, no expiry means
+# never expires, and a repeat is last-writer-wins on expiry exactly as it already was for an
+# explicit value. "Update only when provided" was REJECTED, because omission and an explicit null
+# are one meaning on the wire, so it would leave no way to clear an expiry through POST at all.
+#
+# These pins are the unit half: the VALUE the DO UPDATE clause binds, on each of the two upserts. The
+# database half (Postgres actually taking that branch and storing NULL) is
+# tests/system/test_ingest_e2e.py, test_a_repeat_post_without_expiry_clears_the_stored_expiry.
+# ---------------------------------------------------------------------------------------------
+
+
+def _without_expiry(request: AssetDatasetStoreCreate) -> AssetDatasetStoreCreate:
+    """The same dataset with expiry OMITTED, rebuilt through the constructor so it validates."""
+    return AssetDatasetStoreCreate(**request.model_dump(exclude={'expiry'}))
+
+
+def _daily_request() -> AssetDatasetStoreCreate:
+    """A DAILY subscription: open-ended (DAILY forbids an end) under ROLLING (DAILY forbids BULK), expiry FEBRUARY."""
+    return AssetDatasetStoreCreate(
+        **create_request(end=None).model_dump(exclude={'expiry_type', 'update_type'}),
+        expiry_type=ExpiryType.ROLLING,
+        update_type=UpdateType.DAILY,
+    )
+
+
+async def _bound_conflict_expiry(request: AssetDatasetStoreCreate) -> datetime | None:
+    """Run the real upsert and return the value its ON CONFLICT DO UPDATE writes into expiry.
+
+    Asserted as a PLAIN BIND, `expiry = %(...)s`: a rewrite that keeps the stored value when the body
+    has none -- `coalesce(<bound>, store_dataset_entry.expiry)`, or dropping expiry from the SET when it
+    is None -- no longer matches, and is the regression the ruling forbids.
+    """
+    db = FakeSession(FakeResult([]), FakeResult([(uuid4(),)]))
+    await crud.upsert_entry(db, request)
+    statement = _only(db.statements, 'INSERT')
+    clause = _do_update_clause(_sql(statement))
+    bound = re.fullmatch(r'expiry = %\((\w+)\)s, updated_at = now\(\)', clause)
+    assert bound, (
+        f'the exact-repeat branch no longer writes the body expiry as-is, so a repeat POST without an '
+        f'expiry would keep the stored one (tj-grna9p.105 ruled that it clears it): {clause}'
+    )
+    return _params(statement)[bound.group(1)]
+
+
+@pytest.mark.asyncio
+async def test_a_static_repeat_without_expiry_writes_null_over_the_stored_expiry():
+    """STATIC: POST with an expiry stores it; the identical POST with expiry omitted sets it back to NULL.
+
+    This is documented behaviour, not an accident (tj-grna9p.105, architect ruling): the POST body
+    declares the dataset's lifetime and no expiry means never expires, so the repeat is last-writer-
+    wins on expiry. Keeping the old expiry when the body has none was considered and rejected, since
+    omission and null are one meaning on the wire and an expiry could then never be cleared.
+    """
+    with_expiry = create_request(end=MARCH)
+    assert with_expiry.expiry == FEBRUARY
+
+    assert await _bound_conflict_expiry(with_expiry) == FEBRUARY, 'a repeat WITH an expiry does not store it'
+    assert await _bound_conflict_expiry(_without_expiry(with_expiry)) is None, (
+        'a repeat POST without an expiry kept a stored expiry; the ruling is that it clears it to NULL'
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_daily_repeat_without_expiry_clears_the_expiry_and_brings_a_retired_dataset_back():
+    """DAILY: a retired subscription re-POSTed without an expiry is NOT retired any more. Documented, not accidental.
+
+    An expiry on a DAILY or STREAM dataset means it is RETIRED (freshness.evaluate_dataset: RETIRED
+    requires expiry is not None). The repeat without an expiry writes NULL over it, so the dataset
+    reads as a live subscription again. The architect flagged exactly this when ruling on
+    tj-grna9p.105 and ACCEPTED it: re-POSTing a dataset with no expiry declares it never expires, and
+    that is how a retired subscription is brought back through POST. If retiring is ever meant to be
+    sticky, this test is the one to change, deliberately.
+
+    The health is computed by the real freshness function from the value each upsert binds, so the
+    claim is the chain: what the second POST writes is what un-retires it.
+    """
+    retired = _daily_request()
+    now = datetime(2026, 3, 4, 21, tzinfo=UTC)  # a Wednesday after the close, well after start
+    calendar = calendar_for_source(DataSource.ALPACA_API)
+
+    def health(expiry: datetime | None) -> FreshnessStatus:
+        return evaluate_dataset(
+            update_type=UpdateType.DAILY,
+            granularity=Granularity.ONE_DAY,
+            expiry=expiry,
+            start=retired.start,
+            end=now,
+            last_bar=now - timedelta(days=1),
+            covered=None,
+            calendar=calendar,
+            now=now,
+        ).status
+
+    stored_first = await _bound_conflict_expiry(retired)
+    assert stored_first == FEBRUARY
+    assert health(stored_first) is FreshnessStatus.RETIRED, 'the control: a DAILY dataset with an expiry is retired'
+
+    stored_after_repeat = await _bound_conflict_expiry(_without_expiry(retired))
+    assert stored_after_repeat is None, 'a DAILY repeat without an expiry kept the stored expiry'
+    assert health(stored_after_repeat) is not FreshnessStatus.RETIRED, (
+        'a retired DAILY dataset re-POSTed without an expiry still reads RETIRED; the ruling '
+        '(tj-grna9p.105) is that the repeat clears the expiry and the subscription is live again'
+    )
 
 
 @pytest.mark.asyncio
@@ -858,17 +975,22 @@ async def test_an_open_ended_request_omits_the_upper_bound_predicate():
     """The half the builder only spot-checked, and the one most likely to stop working silently.
 
     An open-ended request stores end = 1970-01-01, a value in the PAST. The ADR's
-    `existing.start <= request.end` would then read "starts before 1970" and match nothing, so an
+    `existing.start < request.end` would then read "starts before 1970" and match nothing, so an
     open-ended request would collide with NOTHING and every overlap would be created as a
     duplicate dataset. The predicate is therefore dropped rather than evaluated, because an
     open-ended range has no upper bound to test.
+
+    STRENGTHENED for half-open ranges (tj-86g751.4). The probe used to be the substring
+    'start <=', which the strict predicate the store now builds ('start <') never contains -- so
+    after a3b9d0a this test would have stayed green with the predicate put BACK for an open-ended
+    request. 'start <' matches both spellings.
     """
     db = FakeSession(FakeResult([]), FakeResult([(uuid4(),)]))
 
     await crud.upsert_entry(db, create_request(end=None))
 
     sql = _sql(db.statements[0])
-    assert 'store_dataset_entry.start <=' not in sql, (
+    assert 'store_dataset_entry.start <' not in sql, (
         'an open-ended request compares existing.start against the EPOCH sentinel, so it can never collide'
     )
 
@@ -879,13 +1001,22 @@ async def test_a_bounded_request_keeps_the_upper_bound_predicate():
 
     A request with a declared end DOES have an upper bound, and dropping it there would make every
     later dataset of the same owner look like a collision.
+
+    STRICT since tj-vhboky.1 addendum HALF-OPEN RANGES (2026-09-30), item 2: existing.start <
+    request.end, so an entry that STARTS at the request's end is adjacent, not overlapping. The
+    superseded closed-range form, `start <=`, is asserted absent. The behaviour on real rows is
+    test_same_owner_ranges_overlap_only_when_they_share_an_instant below.
     """
     db = FakeSession(FakeResult([]), FakeResult([(uuid4(),)]))
 
     await crud.upsert_entry(db, create_request(end=MARCH))
 
     statement = db.statements[0]
-    assert 'store_dataset_entry.start <=' in _sql(statement), 'a bounded request lost its upper-bound predicate'
+    sql = _sql(statement)
+    assert re.search(r'store_dataset_entry\.start < %\(\w+\)s', sql), (
+        f'a bounded request lost its strict upper bound: {sql}'
+    )
+    assert 'store_dataset_entry.start <=' not in sql, f'the upper bound is closed, so adjacent ranges collide: {sql}'
     assert MARCH in _params(statement).values(), 'the upper bound is not the request end'
 
 
@@ -895,11 +1026,15 @@ async def test_a_stored_open_ended_entry_is_never_excluded_by_the_lower_bound(re
     """The other side of the sentinel: the STORED end, which is the one the ADR warned about.
 
     An entry with no declared end covers everything from its start onward, so it must satisfy
-    `existing.end >= request.start` unconditionally. Compared literally it would fail -- 1970 is
+    `existing.end > request.start` unconditionally. Compared literally it would fail -- 1970 is
     before any real start -- and an open-ended stored dataset would become invisible to every
     subsequent overlap check. The disjunction is asserted in BOTH request shapes because the
     open-ended branch above removes a predicate, and a refactor that removed this one with it would
     pass the open-ended test alone.
+
+    The bounded half of the disjunction is STRICT (`>`, not `>=`) since tj-vhboky.1 addendum
+    HALF-OPEN RANGES, item 2: an entry that ENDS at the request's start is adjacent, not
+    overlapping.
     """
     db = FakeSession(FakeResult([]), FakeResult([(uuid4(),)]))
 
@@ -907,11 +1042,215 @@ async def test_a_stored_open_ended_entry_is_never_excluded_by_the_lower_bound(re
 
     statement = db.statements[0]
     sql = _sql(statement)
-    assert re.search(r'\(store_dataset_entry\."end" = %\(\w+\)s OR store_dataset_entry\."end" >= %\(\w+\)s\)', sql), (
-        f'the stored EPOCH sentinel is no longer handled as "covers everything onward": {sql}'
+    assert re.search(r'\(store_dataset_entry\."end" = %\(\w+\)s OR store_dataset_entry\."end" > %\(\w+\)s\)', sql), (
+        f'the stored EPOCH sentinel is no longer handled as "covers everything onward", or the lower bound '
+        f'is no longer strict: {sql}'
     )
     assert NullableDateTime.EPOCH in _params(statement).values(), 'the sentinel value itself is not bound'
     assert JANUARY in _params(statement).values(), 'the lower bound is not the request start'
+
+
+# ---------------------------------------------------------------------------------------------
+# HALF-OPEN RANGES on real rows: check_own_overlap's own SELECT, evaluated (tj-86g751.4)
+# ---------------------------------------------------------------------------------------------
+#
+# The design is tj-vhboky.1 addendum HALF-OPEN RANGES (2026-09-30), item 2: same owner, same every
+# non-range field, not an exact repeat, and
+#
+#     (existing.end is EPOCH OR existing.end > request.start) AND
+#     (request.end is EPOCH OR existing.start < request.end)
+#
+# so ADJACENT entries [a, m) and [m, b) do not collide -- they share no bar.
+#
+# WHY SQLITE. The SQL-text tests above say which operators the statement carries; they cannot say
+# which ROWS it selects, and a fake session never evaluates a predicate. Here the stored entries are
+# real rows in StoreDatasetEntry's own table on an in-memory SQLite (the harness
+# test_a_null_owner_turns_an_exact_repeat_into_a_second_row_unless_the_column_refuses_it already
+# uses), and the statement check_own_overlap builds is EXECUTED against them, through the column
+# types' own bind processing -- the EPOCH sentinel included.
+#
+# WHAT THIS DOES NOT PROVE. SQLite's DateTime stores the wall clock and drops the offset, so every
+# instant here is UTC and comparisons are between equal-offset strings; that the comparison is
+# between INSTANTS on a timestamptz column is Postgres's to show (the read's version of that claim is
+# tests/system/test_http_bars.py, test_range_bounds_are_half_open_and_compare_instants). The 409
+# mapping above the exception is test_store_dataset_entry_route.py's, both ways: a conflict is 409
+# naming the ids, and an empty overlap set is a 200 write.
+_TICK = timedelta(microseconds=1)
+
+
+class _SqliteSession:
+    """Executes what the crud sends on a real SQLite connection. Only `execute` is used by the check."""
+
+    def __init__(self, connection):
+        self._connection = connection
+        self.statements: list = []
+
+    async def execute(self, statement):
+        self.statements.append(statement)
+        return self._connection.execute(statement)
+
+
+def _stored_row(start: datetime, end: datetime | None, owner: str = OWNER) -> tuple[UUID, dict]:
+    """One stored entry as column values, projected from a create request through the real key.
+
+    end None is stored as the EPOCH sentinel by OverlapKey.column_values, exactly as the column holds it.
+    """
+    request = create_request(start=start, end=end, owner=owner)
+    entry_id = uuid4()
+    values = crud.OverlapKey.of(request).column_values() | {
+        'id': entry_id,
+        'feed': request.feed,
+        'expiry': request.expiry,
+        'created_at': JANUARY,
+        'updated_at': JANUARY,
+    }
+    return entry_id, values
+
+
+async def _overlaps_on_real_rows(
+    stored: list[tuple[datetime, datetime | None]], request: tuple[datetime, datetime | None], owner: str = OWNER
+) -> tuple[list[UUID], list[UUID]]:
+    """Insert `stored` (same owner, same spec), run check_own_overlap for `request`, and return (stored ids, colliding ids).
+
+    Returns the colliding ids the refusal carried, or [] when the request was let through.
+    """
+    engine = create_engine('sqlite://')
+    StoreDatasetEntry.__table__.create(engine)
+    ids = []
+    with engine.begin() as connection:
+        for start, end in stored:
+            entry_id, values = _stored_row(start, end, owner=OWNER)
+            connection.execute(StoreDatasetEntry.__table__.insert().values(**values))
+            ids.append(entry_id)
+    with engine.connect() as connection:
+        session = _SqliteSession(connection)
+        try:
+            await crud.check_own_overlap(session, overlap_key(start=request[0], end=request[1], owner=owner))
+        except crud.OwnOverlapConflict as raised:
+            return ids, list(raised.colliding_ids)
+        finally:
+            assert len(session.statements) == 1, (
+                f'the check sent {len(session.statements)} statements, not its one probe'
+            )
+    return ids, []
+
+
+# (stored ranges, request range, index of the stored entry that must collide, or None). JANUARY..APRIL
+# are UTC month starts; _TICK is one microsecond, the column's resolution.
+_HALF_OPEN_CASES = {
+    # Item 2's headline: adjacent same-owner entries are BOTH accepted, in either order.
+    'adjacent-request-after-existing [J,F) then [F,M)': ([(JANUARY, FEBRUARY)], (FEBRUARY, MARCH), None),
+    'adjacent-request-before-existing [F,M) then [J,F)': ([(FEBRUARY, MARCH)], (JANUARY, FEBRUARY), None),
+    # One shared instant of interior overlap is still an overlap, on each side.
+    'one-instant-overlap-at-existing-end [J,F) vs [F-1us,M)': ([(JANUARY, FEBRUARY)], (FEBRUARY - _TICK, MARCH), 0),
+    'one-instant-overlap-at-existing-start [F,M) vs [J,F+1us)': ([(FEBRUARY, MARCH)], (JANUARY, FEBRUARY + _TICK), 0),
+    # An open-ended EXISTING entry covers everything from its start onward.
+    'open-existing [F,inf) vs request starting at its start': ([(FEBRUARY, None)], (FEBRUARY, MARCH), 0),
+    'open-existing [F,inf) vs request starting after its start': ([(FEBRUARY, None)], (MARCH, APRIL), 0),
+    'open-existing [F,inf) vs request ending at its start': ([(FEBRUARY, None)], (JANUARY, FEBRUARY), None),
+    # An open-ended REQUEST against an entry that ends exactly at its start is adjacent.
+    'open-request [F,inf) vs existing [J,F)': ([(JANUARY, FEBRUARY)], (FEBRUARY, None), None),
+    'open-request [F,inf) vs existing [J,F+1us)': ([(JANUARY, FEBRUARY + _TICK)], (FEBRUARY, None), 0),
+    # The exact repeat is excluded from the overlap set; the upsert's ON CONFLICT returns its id
+    # (test_an_exact_repeat_resolves_to_the_existing_id_without_a_second_insert).
+    'exact-repeat [J,F)': ([(JANUARY, FEBRUARY)], (JANUARY, FEBRUARY), None),
+    'exact-repeat open [J,inf)': ([(JANUARY, None)], (JANUARY, None), None),
+    # Both adjacent neighbours stored, request in the gap between them exactly: nothing collides.
+    'request filling the gap [J,F) [M,A) vs [F,M)': ([(JANUARY, FEBRUARY), (MARCH, APRIL)], (FEBRUARY, MARCH), None),
+    # ...and widened by one instant on each side: both neighbours collide, both are named.
+    'request overlapping both neighbours by one instant': (
+        [(JANUARY, FEBRUARY), (MARCH, APRIL)],
+        (FEBRUARY - _TICK, MARCH + _TICK),
+        'both',
+    ),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('stored', 'asked', 'collides'), list(_HALF_OPEN_CASES.values()), ids=list(_HALF_OPEN_CASES))
+async def test_same_owner_ranges_overlap_only_when_they_share_an_instant(stored, asked, collides):
+    """Addendum item 2, on real rows: a same-owner request is refused exactly when it shares a bar instant.
+
+    Each case is a boundary: the adjacent pairs and the one-microsecond overlaps differ by one tick,
+    so moving either strict comparison back to its closed form reds the adjacent cases, and moving
+    it the other way (or dropping a bound) reds the one-instant ones. The colliding ids are compared
+    whole, so the refusal names exactly the overlapped entries.
+    """
+    ids, colliding = await _overlaps_on_real_rows(stored, asked)
+
+    expected = ids if collides == 'both' else ([] if collides is None else [ids[collides]])
+    assert sorted(colliding) == sorted(expected), (
+        f'stored {stored}, request {asked}: expected collisions {expected}, the check reported {colliding}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_another_owners_overlapping_range_never_collides_on_real_rows():
+    """The control that shows the harness evaluates the OWNER term too: the same overlap, another owner, is let through."""
+    _, colliding = await _overlaps_on_real_rows([(JANUARY, MARCH)], (FEBRUARY, APRIL), owner='strategy-b')
+
+    assert colliding == [], 'another owner was refused for overlapping a range it does not hold'
+
+
+# ---------------------------------------------------------------------------------------------
+# UNCHANGED under half-open ranges, spot-pinned (addendum item 2, last sentence; tj-86g751.4 item 4)
+# ---------------------------------------------------------------------------------------------
+#
+# "Section 4's growth rule and exact-collision rule are unchanged (containment and equality mean the
+# same under either convention)." The behaviour of each is pinned elsewhere in this file
+# (test_an_update_that_shrinks_the_range_is_rejected, test_opening_a_bounded_entry_is_growth,
+# test_a_grow_that_collides_names_the_other_entry_and_sends_no_update); these two pin the boundary
+# that a half-open "consistency" edit is most likely to move by mistake.
+
+
+@pytest.mark.parametrize(
+    ('old', 'new', 'grows'),
+    [
+        ((JANUARY, MARCH), (JANUARY, MARCH), True),
+        ((FEBRUARY, MARCH), (JANUARY, MARCH), True),
+        ((JANUARY, MARCH), (JANUARY, MARCH + _TICK), True),
+        ((JANUARY, MARCH), (JANUARY, MARCH - _TICK), False),
+        ((JANUARY, MARCH), (JANUARY + _TICK, MARCH), False),
+        ((JANUARY, NullableDateTime.EPOCH), (JANUARY, NullableDateTime.EPOCH), True),
+    ],
+    ids=[
+        'same-range',
+        'start-pulled-back-end-equal',
+        'end-one-tick-later',
+        'end-one-tick-earlier',
+        'start-one-tick-later',
+        'open-stays-open',
+    ],
+)
+def test_growth_is_containment_with_equal_bounds_allowed(old: tuple, new: tuple, grows: bool):
+    """_is_growth: the new range contains the old one, equality included -- unchanged by half-open ranges.
+
+    The two equal-bound cases are the ones a reader "making it consistent" with the strict overlap
+    operators would break: under either convention [s, e) contains [s, e), so an update that keeps a
+    bound where it was is still growth.
+    """
+    assert crud._is_growth(old[0], old[1], new[0], new[1]) is grows
+
+
+@pytest.mark.asyncio
+async def test_the_grow_collision_is_exact_equality_on_both_bounds():
+    """_find_exact_collision: a grow collides only with an entry of EXACTLY the new range -- unchanged.
+
+    Equality on start and on end, not a range comparison: identity is the unique key, and the key
+    holds the bounds as values. A strict or closed range operator here would turn a grow next to
+    another entry into a spurious RangeCollision.
+    """
+    entry_id = uuid4()
+    db = FakeSession(FakeResult([(stored_entry(entry_id, end=MARCH),)]), FakeResult([]), FakeResult([]))
+
+    await crud.update_entry(db, update_request(entry_id, end=APRIL))
+
+    sql = _sql(db.statements[1])
+    assert re.search(r'store_dataset_entry\.start = %\(\w+\)s', sql), (
+        f'the grow collision no longer equates start: {sql}'
+    )
+    assert re.search(r'store_dataset_entry\."end" = %\(\w+\)s', sql), f'the grow collision no longer equates end: {sql}'
+    assert not re.search(r'store_dataset_entry\.(start|"end") [<>]', sql), f'the grow collision compares a range: {sql}'
 
 
 # ---------------------------------------------------------------------------------------------

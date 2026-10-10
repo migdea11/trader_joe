@@ -22,21 +22,26 @@ make migrate        # see below — nothing else creates the schema
 make prod-logs      # follow the service logs
 ```
 
+Both stacks include the web UI (see [The web UI](#the-web-ui)). The builds need the pinned Node and
+the web dependencies first: `make node-install` and `make web-install`.
+
 `make dev-deps`, `make dev-launch` and `make dev-tools` create the shared dev network first (see
 below); `make dev-network` does it on its own. The network is never removed by any target.
 
-## Networks: prod publishes nothing
+## Networks: prod publishes one loopback port
 
 The two stacks are wired differently on purpose (decision record `tj-q9ae5u`, addendum 1).
 
-**Prod** puts every service on named networks and publishes **no host port at all**:
+**Prod** puts every service on named networks and publishes **no host port**, with one deliberate
+exception: the web container's single port, on loopback only (see [The web UI](#the-web-ui)).
 
 | Network | Kind | Members |
 |---|---|---|
 | `store_db` | internal | postgres, data_store |
 | `ingest_store` | internal | data_store and data_ingest |
-| `store_api` | internal, fixed name `trader_joe_store_api` (`STORE_API_NETWORK`) | data_store and client containers |
+| `store_api` | internal, fixed name `trader_joe_store_api` (`STORE_API_NETWORK`) | data_store, client containers and the web container |
 | `ingest_egress` | ordinary bridge | data_ingest only |
+| `web_edge` | ordinary bridge | the web container only, because an internal network cannot publish a port |
 
 An internal network has no gateway, so postgres and data_store have no egress and cannot be
 reached from the host or the internet. data_ingest is the one component with internet access, for
@@ -48,17 +53,67 @@ container on `store_api`.
 The fixed name is read from `STORE_API_NETWORK`, defaulting to `trader_joe_store_api`; only the agent
 stack's generated env sets it (see [The agent-stack MCP](#the-agent-stack-mcp)), so it gets a
 network of its own. In the same way, every service's env files are read from `ROOT_ENV_FILE`,
-`STORE_ENV_FILE` and `INGEST_ENV_FILE`, defaulting to `.env`, `data/store/.env` and
-`data/ingest/.env`; a normal launch never sets them.
+`STORE_ENV_FILE` and `INGEST_ENV_FILE`, defaulting to `.env`, `server/data/store/.env` and
+`server/data/ingest/.env`; a normal launch never sets them.
+
+**Upgrading from the layout before the monorepo split:** the per-service env files moved with their
+directories, from `data/store/` and `data/ingest/` to `server/data/store/` and `server/data/ingest/`.
+Compose does not find an untracked file left at the old path, and `make dev-launch` stops on it. Move
+each one:
+
+```
+mv data/store/.env server/data/store/.env
+mv data/ingest/.env server/data/ingest/.env
+```
+
+The root `.env` has not moved. Each service directory also carries a `.env.default` to copy from if
+you never had a file.
 
 **Dev** adds one external network, `trader_joe_devnet`, created by `make dev-network`. The dev
 override attaches every stack service to it and publishes postgres, data_store and data_ingest on
 **loopback only** (`127.0.0.1`), for psql, `/docs` and curl from this machine. pgAdmin and the agent
 devcontainer join the same network, so a dev session reaches every service by name. A prod launch
-never loads the override, so it never attaches devnet.
+never loads the override, so it never attaches devnet. The web container's port is the one published
+by both stacks, on loopback in each.
 
 None of this is authentication. Inside the networks, every surface except the three write routes
 answers without credentials.
+
+## The web UI
+
+A browser UI for the dataset catalog and a per-dataset viewer (candles, volume and a paged bar table).
+Its source is in [`web/`](web/README.md): a Vue 3 single-page app, built once and served as static
+files.
+
+| Stack | Launch | What runs |
+|---|---|---|
+| Dev | `make dev-build`, `make dev-launch` | The Vite dev server with hot reload; edits under `web/src/` appear at once. |
+| Prod | `make prod-build`, `make prod-launch` | A Caddy container serving the built app. |
+
+Both are at `http://localhost:8088/`. `WEB_PORT` in the root env file changes the port, and prod and
+dev share it, so only one stack runs at a time. The port binds `127.0.0.1` only; reaching it from
+another machine is a host decision (a tunnel or an overlay network), not a setting here.
+
+**The proxy.** The browser talks to one origin. Caddy (`deploy/web/Caddyfile`) forwards
+`/api/store/ui/v1/*` to data_store with the `/api/store` prefix stripped, so
+`/api/store/ui/v1/datasets` becomes `/ui/v1/datasets`. Only `GET` and `HEAD` pass, only the UI routes
+are reachable (not `/store/*`, `/internal/*` or `/docs`), and there is no route to data_ingest. The
+instance secret is added to the proxied request inside the container, so the browser never holds it
+and a browser cannot use the proxy to write. The dev proxy is not
+that filter: the Vite proxy forwards everything under `/api/store`, any method and any path, strips the
+prefix and never injects the secret, so a write from the dev server reaches the store without it and is
+refused.
+There is no login: access is network-only, so run it only where the network is trusted.
+
+**The licence key.** The UI uses PrimeVue 5 under the PrimeUI Community licence, which needs a key.
+Put it in the root env file as `VITE_PRIMEUI_LICENSE_KEY`; `.env.default` carries the name empty, and
+the key is never committed. Prod bakes it into the JavaScript bundle at `make prod-build`, which the
+licence allows, so **never push an image built with a key to a public registry**. Without a key the
+app still builds and shows a licence notice.
+
+**Generated TypeScript** for the UI's messages is written to `gen/proto/ts/` by `make gen-proto-ts`
+and is never committed (`gen/` is gitignored). The build targets run it first. The routes the UI reads
+are in [`docs/API.md`](docs/API.md).
 
 ## Dependencies and the lockfile
 
@@ -103,6 +158,13 @@ it does nothing for the services' other surfaces, which answer anyone who can re
 container on the stack's networks, or this machine's loopback in dev. `docs/API.md` has the full
 contract.
 
+**Expiry is optional, and no expiry means the dataset never expires.** A request that omits `expiry`
+(or sends `null`) stores none. Before this release an omitted `expiry` defaulted to one day after the
+request, so a client that relied on that default now gets a dataset that never lapses; send an
+explicit `expiry` to keep the old behaviour. Repeating a request exactly reuses the stored dataset
+and sets its expiry **from the new body**, so a repeat POST without an expiry **clears** a stored one,
+and on a `DAILY` or `STREAM` dataset that un-retires it.
+
 The `owner` value is kept out of the text the store renders: request-model reprs, the entry row's
 repr, the bound parameters in a SQL error, and the search log line all show `<redacted>`. Two places
 still carry it: Postgres's own `DETAIL` text on a constraint violation, and any code that formats the
@@ -118,6 +180,12 @@ of its bars — a bar belongs to exactly one dataset and is deleted with it. Tha
 contents unambiguous and its deletion a cascade, at the cost of duplicate storage when datasets
 overlap. Repeating a request exactly reuses the existing dataset; overlapping one of your own datasets
 without matching it is refused with the colliding id.
+
+Every range is **half-open**, `[start, end)`: the start is included and the end is excluded. Two
+ranges that only touch (one ends where the next starts) do not overlap, a bar stamped exactly at
+`end` belongs to the next range, and a declared `end` that is not after `start` is refused with a 422.
+A dataset's freshness (healthy, late, failed or retired) and completeness are not stored: the server
+computes them on read, against a trading calendar for the dataset's source.
 
 Bars are stored **raw**. There are no split or dividend factors on a bar, and corporate-action
 adjustment on read is decided but **not built** — everything returned today is unadjusted.
@@ -150,7 +218,7 @@ postgres on `store_db`. That is still the right command on a dev stack, since bo
 one postgres container, but expect it to want the production image built (`make prod-build`).
 
 The revisions applied are the ones in **this checkout**, not the ones baked into the deployed
-image — `alembic.ini` and `data/store/migrations/` reach the container as bind mounts. Run it from
+image — `alembic.ini` and `server/data/store/migrations/` reach the container as bind mounts. Run it from
 a checkout that matches the image you deployed.
 
 ### Revisions that are not additive
@@ -193,7 +261,7 @@ passed through the agent-stack MCP; the stack's own database is never migrated b
 `<revision>.json` (its manifest: revision, row counts, digests). A file named
 `<revision>.<variant>.sql` is an extra, hand-written seed for a specific case and never stands in
 for the canonical one. **A revision without its canonical seed fails the PR gate**
-(`data/store/tests/test_seed_guard.py`, which runs in `make test`); only the initial revision,
+(`server/data/store/tests/test_seed_guard.py`, which runs in `make test`); only the initial revision,
 `2b88043cd13c`, is exempt.
 
 So a PR that adds a revision also needs a seed produced at the new head, by either route:
@@ -270,7 +338,8 @@ documented way in.
 | Command | What it runs |
 |---|---|
 | `make test` | The PR gate: every test except the `external` set, which needs live broker credentials. Scope with `PATHS=`. |
-| `make lint` | ruff check and ruff format check. It does not run the security scanners. |
+| `make lint` | ruff check and ruff format check, plus eslint and vue-tsc when `PATHS` covers `web/`, and buf when it covers `proto/`. It does not run the security scanners. |
+| `make web-check` | The whole web chain, in CI's order: install, generate, lint, typecheck, test, build, audit. `make test PATHS=web` runs just vitest. |
 | `make security` | bandit, semgrep and pip-audit — the same invocations as CI's Security Checks job. semgrep runs with `--error`, so a finding fails the target and the CI step. Run `make init` first: the tooling sits in a uv group the default sync omits. |
 | `make test-system SYSTEM_TEST_DISPOSABLE_DB=1` | The system suite, below. |
 

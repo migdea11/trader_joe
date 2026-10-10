@@ -20,12 +20,17 @@ Five properties, each one a silent failure if lost:
   into grep -P and end in `|| true`, so an image without either one runs every hook as an allow.
   common/tests/test_harness_hooks.py checks the tools wherever the suite runs; this pins that the
   image itself carries them, which CI, running in a different image, cannot otherwise see.
-* NO NODE (tj-3mk3u5.52). nodejs and npm left the apt line with the npm install: nothing in the
-  image runs them, and an unused package manager is supply-chain surface. Nothing would notice
-  them slipping back in, so the pin makes adding them a decision instead.
+* NO APT NODE (tj-3mk3u5.52). nodejs and npm left the apt line with the npm install, and an unused
+  package manager is supply-chain surface. Nothing would notice them slipping back in, so the pin
+  makes adding them a decision instead. Node did come back, for the web chain (tj-grna9p.97), as the
+  pinned release tarball below -- never as bookworm's apt packages, which are Node 18.
 * THE BUF PIN (tj-3mk3u5.54). The image's buf RUN mirrors the Makefile's BUF_VERSION and both
   SHA-256s, which nothing else compares: the build context cannot read the Makefile. A drift is a
   checksum failure at the user's next rebuild, or an image whose buf `make lint` refuses.
+* THE NODE PIN (tj-grna9p.97). The same shape: the image's node RUN mirrors the Makefile's
+  NODE_VERSION, NODE_SHA256_X86_64 and NODE_SHA256_AARCH64. A drift is a checksum failure at the
+  next rebuild, or an agent image whose Node differs from the one the root Dockerfile and CI build
+  the web chain with -- the version /web is tested with is then not the one it ships with.
 """
 
 import os
@@ -282,7 +287,8 @@ def test_the_apt_reader_finds_what_each_install_names(run: str, packages: list[s
 MAKEFILE = REPO_ROOT / 'Makefile'
 BUF_RELEASES = 'https://github.com/bufbuild/buf/releases/download'
 BUF_DESTINATION = '/usr/local/bin/buf'
-# One stand-in under six names. Each call is a log line: its name, then its arguments, US-separated.
+# One stand-in under every stubbed name. Each call is a log line: its name, then its arguments,
+# US-separated. The buf and node RUNs share it; each stubs only the commands it calls.
 RUN_STUB = r"""#!/bin/sh
 name="${0##*/}"
 { printf '%s' "$name"; for word in "$@"; do printf '\037%s' "$word"; done; printf '\n'; } >> "$STUB_LOG"
@@ -290,6 +296,8 @@ case "$name" in
   dpkg) printf '%s\n' "$DPKG_ARCH" ;;
   sha256sum) cat >> "$SHA256SUM_STDIN"; exit "${SHA256SUM_EXIT:-0}" ;;
   buf) printf '%s\n' "$BUF_REPORTS" ;;
+  node) printf '%s\n' "$NODE_REPORTS" ;;
+  npm) printf '%s\n' '0.0.0-stub' ;;
 esac
 exit 0
 """
@@ -310,15 +318,13 @@ def _make_pin(name: str) -> str:
     return _expanded_make_variable(name, REPO_ROOT, env)
 
 
-def _run_buf_install(
-    tmp_path: Path, arch: str, **variables: str
+def _run_stubbed(
+    run: str, stubbed: tuple[str, ...], tmp_path: Path, arch: str, **variables: str
 ) -> tuple[subprocess.CompletedProcess, list[list[str]], str]:
-    """The image's buf RUN, executed with every command it calls stubbed: (result, calls, sha256sum's stdin)."""
-    instructions = _instructions()
-    run = instructions[_buf_run_index(instructions)][1]
+    """One RUN's shell text, executed with STUBBED first on PATH: (result, calls, sha256sum's stdin)."""
     stubs = tmp_path / 'bin'
     stubs.mkdir()
-    for name in RUN_STUBBED:
+    for name in stubbed:
         (stubs / name).write_text(RUN_STUB, encoding='utf-8')
         (stubs / name).chmod(0o755)
     log, stdin = tmp_path / 'calls', tmp_path / 'sha256sum.stdin'
@@ -327,12 +333,20 @@ def _run_buf_install(
         'STUB_LOG': str(log),
         'SHA256SUM_STDIN': str(stdin),
         'DPKG_ARCH': arch,
-        'BUF_REPORTS': _make_pin('BUF_VERSION'),
         **variables,
     }
     result = subprocess.run(['/bin/sh', '-c', run], cwd=tmp_path, env=env, capture_output=True, text=True, check=False)
     calls = [line.split('\x1f') for line in log.read_text(encoding='utf-8').splitlines()] if log.exists() else []
     return result, calls, stdin.read_text(encoding='utf-8') if stdin.exists() else ''
+
+
+def _run_buf_install(
+    tmp_path: Path, arch: str, **variables: str
+) -> tuple[subprocess.CompletedProcess, list[list[str]], str]:
+    """The image's buf RUN, executed with every command it calls stubbed: (result, calls, sha256sum's stdin)."""
+    instructions = _instructions()
+    run = instructions[_buf_run_index(instructions)][1]
+    return _run_stubbed(run, RUN_STUBBED, tmp_path, arch, **{'BUF_REPORTS': _make_pin('BUF_VERSION'), **variables})
 
 
 def test_buf_installs_as_root_into_usr_local_bin() -> None:
@@ -378,6 +392,86 @@ def test_the_image_build_fails_on_an_unpinned_arch_a_mismatch_or_another_version
 ) -> None:
     """Each refusal stops the build: nothing is fetched for an unpinned arch, nothing installed on a mismatch."""
     result, calls, _ = _run_buf_install(tmp_path, arch, **variables)
+    assert result.returncode != 0, f'{result.stdout}\n{result.stderr}'
+    assert [call[0] for call in calls] == reached, calls
+    assert says in result.stderr
+
+
+# ---------------------------------------------------------------------------------------------------
+# THE NODE PIN'S ONE MIRROR (tj-grna9p.97). The same rule as buf's: the Makefile's NODE_VERSION and
+# both NODE_SHA256_* are the authority, the image's node RUN carries a copy, and that RUN is executed
+# under /bin/sh with every command it calls stubbed. The tarball unpacks into /usr/local, so `node`
+# and `npm` land on the default PATH; the final check compares `node --version` with the pin.
+
+NODE_RELEASES = 'https://nodejs.org/dist'
+NODE_DESTINATION = '/usr/local'
+NODE_RUN_STUBBED = ('dpkg', 'curl', 'sha256sum', 'tar', 'rm', 'node', 'npm')
+NODE_CALLS = ['dpkg', 'curl', 'sha256sum', 'tar', 'rm', 'node', 'npm', 'node']
+
+
+def _node_run_index(instructions: list[tuple[str, str]]) -> int:
+    found = [
+        i for i, (keyword, arguments) in enumerate(instructions) if keyword == 'RUN' and NODE_RELEASES in arguments
+    ]
+    assert len(found) == 1, f'expected exactly one RUN that installs node in {DOCKERFILE.name}, found {len(found)}'
+    return found[0]
+
+
+def _run_node_install(
+    tmp_path: Path, arch: str, **variables: str
+) -> tuple[subprocess.CompletedProcess, list[list[str]], str]:
+    """The image's node RUN, executed with every command it calls stubbed: (result, calls, sha256sum's stdin)."""
+    instructions = _instructions()
+    run = instructions[_node_run_index(instructions)][1]
+    reports = {'NODE_REPORTS': f'v{_make_pin("NODE_VERSION")}', **variables}
+    return _run_stubbed(run, NODE_RUN_STUBBED, tmp_path, arch, **reports)
+
+
+def test_node_installs_as_root_into_usr_local() -> None:
+    """Before the USER switch: /usr/local is root's to write, and the image build fails there otherwise."""
+    instructions = _instructions()
+    user = _user_at(instructions, _node_run_index(instructions))
+    assert user.split(':')[0] in ROOT_USERS, f'the node RUN runs as {user!r}, who cannot unpack into /usr/local'
+
+
+@pytest.mark.parametrize(
+    ('arch', 'node_arch', 'checksum'),
+    [('amd64', 'x64', 'NODE_SHA256_X86_64'), ('arm64', 'arm64', 'NODE_SHA256_AARCH64')],
+)
+def test_the_image_installs_the_makefiles_node_pin_for_each_arch(
+    tmp_path: Path, arch: str, node_arch: str, checksum: str
+) -> None:
+    """The Makefile's NODE_VERSION and this arch's checksum are the ones the image fetches and checks.
+
+    The release tarball is named by the Makefile's version, the downloaded file is checked against
+    the Makefile's checksum for this arch, and the file checked is the file unpacked into /usr/local.
+    """
+    version = _make_pin('NODE_VERSION')
+    result, calls, stdin = _run_node_install(tmp_path, arch)
+    assert result.returncode == 0, f'{result.stdout}\n{result.stderr}'
+    assert [call[0] for call in calls] == NODE_CALLS, calls
+    curl, tar = calls[1][1:], calls[3][1:]
+    assert curl[-1] == f'{NODE_RELEASES}/v{version}/node-v{version}-linux-{node_arch}.tar.gz', curl
+    downloaded = curl[curl.index('-o') + 1]
+    assert stdin == f'{_make_pin(checksum)}  {downloaded}\n', stdin
+    assert '-xzf' in tar and tar[tar.index('-xzf') + 1] == downloaded, tar
+    assert tar[tar.index('-C') + 1] == NODE_DESTINATION, tar
+
+
+@pytest.mark.parametrize(
+    ('arch', 'variables', 'reached', 'says'),
+    [
+        ('riscv64', {}, ['dpkg'], 'no node checksum pinned for riscv64'),
+        ('amd64', {'SHA256SUM_EXIT': '1'}, ['dpkg', 'curl', 'sha256sum'], ''),
+        ('amd64', {'NODE_REPORTS': 'v1.0.0'}, NODE_CALLS, ''),
+    ],
+    ids=['an-unpinned-arch', 'a-checksum-mismatch', 'another-version'],
+)
+def test_the_node_install_fails_on_an_unpinned_arch_a_mismatch_or_another_version(
+    tmp_path: Path, arch: str, variables: dict[str, str], reached: list[str], says: str
+) -> None:
+    """Each refusal stops the build: nothing fetched for an unpinned arch, nothing unpacked on a mismatch."""
+    result, calls, _ = _run_node_install(tmp_path, arch, **variables)
     assert result.returncode != 0, f'{result.stdout}\n{result.stderr}'
     assert [call[0] for call in calls] == reached, calls
     assert says in result.stderr

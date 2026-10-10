@@ -128,7 +128,8 @@ SCANNED_ROOTS = ('common', 'routers', 'schemas', 'gen/proto/python', 'data', 'te
 NOT_IN_THE_TEST_VENV = {'mcp': 'mcp'}
 
 # Undeclared imports the survey found, keyed like IMPORTS, each a strict xfail until its fix lands.
-# Empty since tj-3mk3u5.58 declared protobuf, packaging and PyYAML.
+# Empty since tj-3mk3u5.58 declared protobuf, packaging and PyYAML, and since 3c53437 declared pandas for
+# data/store/app/freshness.py (found by the validator gating tj-grna9p.17).
 FINDINGS: dict[str, str] = {}
 
 
@@ -247,6 +248,12 @@ def test_the_scan_reaches_the_importers_tj_3mk3u5_58_declared():
     assert 'tools/agent_mcp/server.py' in _importers('uvicorn')
     assert 'gen/proto/python/trader_joe/proto/ping/v1/ping_pb2.py' in _importers('google.protobuf')
     assert 'google' not in IMPORTS, IMPORTS.get('google')
+
+
+def test_the_scan_reaches_the_trading_calendar_importer_tj_grna9p_17():
+    """The freshness rules import the calendar and pandas directly; both are keyed, so both are checked."""
+    assert 'data/store/app/freshness.py' in _importers('exchange_calendars')
+    assert 'data/store/app/freshness.py' in _importers('pandas')
 
 
 def test_a_namespace_import_resolves_to_the_distribution_that_ships_its_subpackage():

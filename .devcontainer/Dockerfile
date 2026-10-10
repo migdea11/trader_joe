@@ -69,6 +69,9 @@ RUN set -eux; \
 # nodejs and npm left the first apt line with the npm install (tj-3mk3u5.52): nothing else in this
 # image runs them, and VS Code brings its own node for its server. Something that does need them,
 # such as an MCP server started through npx, is the reason to add them back; name it here if so.
+# The reason now is the web chain (npm ci, lint, typecheck, test, build in /web), which builder-ui
+# and the web validator run in an agent worktree (tj-grna9p.97). It is the pinned Node tarball
+# further down, not the apt packages: the test_no_apt_install_brings_back_nodejs_or_npm pin stands.
 
 # --- tailored for trader_joe from here down -------------------------------------------------
 # The project's own toolchain, so an agent can actually run `make test` / `make lint` instead of
@@ -146,6 +149,33 @@ RUN set -eux; \
     rm -rf /tmp/shellcheck.tar.gz "/tmp/shellcheck-v${version}"; \
     shellcheck --version; \
     [ "$(shellcheck --version | awk '/^version:/ {print $2}')" = "${version}" ]
+
+# Node and npm, which the web chain in /web runs (tj-grna9p.97): the official release tarball, pinned
+# and checksum-verified on the same rule as bd, dolt, uv, buf and shellcheck. npm is the one the
+# pinned Node bundles. These values MIRROR the Makefile's NODE_VERSION, NODE_SHA256_X86_64 and
+# NODE_SHA256_AARCH64, which are the one authority: this build's context is .devcontainer/, so it
+# cannot read the Makefile. All of them move together, in one commit.
+# NOT `apt-get install nodejs npm`: bookworm ships Node 18, and the version the web chain is built
+# and tested with has to equal the one the root Dockerfile and CI use.
+# The checksums are the release's own SHASUMS256.txt lines. .tar.gz, not .tar.xz, because this image
+# has no xz binary. The archive unpacks to node-v${version}-linux-<arch>/ with bin/, lib/, include/
+# and share/; the top-level docs are excluded so they do not land loose in /usr/local.
+RUN set -eux; \
+    version='24.21.0'; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) asset="node-v${version}-linux-x64.tar.gz"; sum='6e1db87ef58b8819e5d5402eff1536491b18edd8eb7bee5ef7897876e88dc5ff' ;; \
+      arm64) asset="node-v${version}-linux-arm64.tar.gz"; sum='724282c3b43aec998aa9527380465b45d229e021b58035f5f4f63095eabfe5d5' ;; \
+      *) echo "no node checksum pinned for ${arch}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/node.tar.gz "https://nodejs.org/dist/v${version}/${asset}"; \
+    echo "${sum}  /tmp/node.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1 \
+      --exclude='*/CHANGELOG.md' --exclude='*/LICENSE' --exclude='*/README.md'; \
+    rm /tmp/node.tar.gz; \
+    node --version; \
+    npm --version; \
+    [ "$(node --version)" = "v${version}" ]
 
 # make drives every command binding in the manifest; bookworm ships Python 3.11, so uv supplies
 # the 3.12 the project requires. UV_PYTHON_INSTALL_DIR is outside $HOME so it survives the

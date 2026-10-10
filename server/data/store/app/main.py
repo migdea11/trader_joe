@@ -6,7 +6,7 @@ from data.store.app.app_depends import lifespan
 from data.store.app.openapi_pruning import prune_unreferenced_schemas
 from routers.common import ping
 from routers.common.errors import PROBLEM_RESPONSES, install_error_handlers
-from routers.data_store import asset_dataset_store, internal_asset_data
+from routers.data_store import asset_dataset_store, internal_asset_data, ui_config, ui_datasets
 
 
 # EVERY NON-2xx THIS SERVICE ANSWERS IS problem+json (ADR tj-fa1rpu D1(c), TE-6). responses=... is
@@ -20,6 +20,8 @@ install_error_handlers(app)
 app.include_router(ping.router)
 app.include_router(internal_asset_data.router)
 app.include_router(asset_dataset_store.router)
+app.include_router(ui_config.router)
+app.include_router(ui_datasets.router)
 
 _generate_openapi = app.openapi
 

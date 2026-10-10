@@ -5,9 +5,11 @@ written by hand, and every consumer generates its code from them. Nothing in thi
 generated, and nothing in it is Python. (ADR tj-8konfu D1, with this root home from addendum A1; the
 generated layout is decision tj-3mk3u5.42, addendum F1.)
 
-Pydantic models stay the internal domain representation and keep the REST surface. Neither side is
-generated from the other: each consumer maps between generated messages and its own types by hand,
-in one place.
+Pydantic models stay the internal domain representation and keep the REST surface, with one
+exception: the `/ui/v1` routes answer with the protobuf canonical JSON of a `trader_joe.proto.ui.v1`
+message, so the web UI and the server share one definition of each shape. Neither side is generated
+from the other: each consumer maps between generated messages and its own types by hand, in one
+place.
 
 ## Layout
 
@@ -44,7 +46,7 @@ accepted as a starting point (tj-3mk3u5.42 F1, rule 8):
 | `trader_joe.proto.internal.ingest.v1` | `FetchDataset`, the data_store to data_ingest contract. |
 | `trader_joe.proto.internal.latency.v1` | The latency harness probe, `LatencyService.Probe`. Internal: both ends deploy together. |
 | `trader_joe.proto.data.v1` | The external streaming contract. The name is provisional. |
-| `trader_joe.proto.ui.v1` | The UI's messages. |
+| `trader_joe.proto.ui.v1` | The UI's messages: datasets, facets and bar pages (`data.proto`), and the shell configuration (`shell.proto`). Served as protobuf canonical JSON over REST, never as binary. Ranges in it are half-open `[start, end)`. |
 | `trader_joe.proto.ping.v1` | The pipeline proof. |
 
 The rules:
@@ -69,24 +71,25 @@ Imports from outside this repository:
   `.proto` files, and that package at runtime. Buf needs it too: a Buf Schema Registry dependency (a
   `buf.lock`, and the network) or a vendored copy. No contract needs it yet; decide when one does.
 
-## Generated code: one committed tree per language
+## Generated code: one generated tree per language, never committed
 
-Generated code lives at **`gen/proto/<language>/`** at the repository root. Each language has one
-tree, and every consumer in that language uses it. Python is at `gen/proto/python/` today, and
-TypeScript will follow at `gen/proto/ts/`.
+Generated code lives at **`gen/proto/<language>/`** at the repository root, and `gen/` is
+gitignored. Each language has one tree, and every consumer in that language uses it.
 
 | Language | Tree | Regenerate |
 |---|---|---|
 | Python (both services; later the SDK and Python clients) | `gen/proto/python/trader_joe/proto/<domain>/v1/` | `make proto` |
+| TypeScript (the web UI) | `gen/proto/ts/` | `make gen-proto-ts` |
 
 The rules for a generated tree:
 
 - **Never hand-edit it.** If a merge conflicts inside it, run `make proto` again.
-- **Nothing post-processes it either.** What is committed is protoc's output, byte for byte: no
+- **Nothing post-processes it either.** What is generated is protoc's output, byte for byte: no
   import rewrite and no other edit. When a contract changes, the hand-written code that uses it is
   changed by hand, in review.
-- **Commit it in the same commit as the `.proto` change.** CI regenerates it and fails on any
-  difference: a changed file, a deleted one or an untracked one.
+- **Never commit it.** Every target that needs a tree generates it first (the test, build and launch
+  targets run `make proto`, and the web targets run `make gen-proto-ts`), so a fresh clone has no
+  `gen/` until it builds. A change to a `.proto` commits only the `.proto`.
 - **Every consumer generates from the plain `proto/` include root** (`-Iproto`). protoc names every
   generated module, writes every import in it and records every descriptor file name after the
   `.proto` path under the include root. From the plain root those names are canonical
@@ -118,8 +121,9 @@ the image has it.
 **`trader_joe` is a PEP 420 namespace.** `gen/proto/python/trader_joe/` has no `__init__.py`, and
 **no distribution may ever ship `trader_joe/__init__.py`**: not this tree, not `trader_joe.common`,
 not `trader_joe.client`. If one portion of a namespace ships it, the other portions stop being
-importable. `gen/proto/python/trader_joe/proto/__init__.py` is committed by hand: `trader_joe.proto`
-is a regular package that only generated code owns, and that file is `make proto`'s guard.
+importable. `gen/proto/python/trader_joe/proto/__init__.py` is written by `make proto`, not by protoc:
+`trader_joe.proto` is a regular package that only generated code owns, and that file is `make proto`'s
+guard against clearing a directory that is not the generated package.
 
 **Only `common/rpc/` imports generated code.** On the server, nothing outside `common/rpc/` may
 import `trader_joe.proto`. Ruff rule TID251 enforces that, and the hand-written code in

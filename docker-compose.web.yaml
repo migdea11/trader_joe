@@ -1,0 +1,87 @@
+# The web UI: a Caddy container serving the built SPA and proxying /api/store/ui/v1/* to data_store
+# (decisions tj-grna9p.5, .6, .7; beads tj-grna9p.26 and tj-mcrwrd). Loaded ON TOP of the base file,
+# never alone. This is the PROD web service: a static Vite build behind Caddy, no reload.
+#
+#   docker compose -f docker-compose.yaml -f docker-compose.web.yaml up -d --build web
+#
+# The Makefile's PROD_COMPOSE is exactly this pair, so make prod-build builds the image, make
+# prod-launch starts it and waits for it to be healthy, and make prod-down stops it. DEV_COMPOSE loads
+# this file too and then docker-compose.web.dev.yaml, which swaps the service for the Vite dev server
+# with hot reload (same service name, same published port, same networks). Only one stack runs at a
+# time, which is why both use WEB_PORT. The agent stack (AGENT_STACK_COMPOSE) and the base file never
+# load it: the base file's invariants say prod publishes NOTHING and every service is built from the
+# Python stages and carries the source stamp, and the web container is the one deliberate exception.
+#
+# THE ONE PUBLISHED PORT is this container's, on loopback only: test_network_model.py requires every
+# published port in every compose file to bind 127.0.0.1, because a published port bypasses the host
+# firewall's ufw/firewalld chains. Access is network-only by ruling (tj-grna9p.6), so how a Meshnet
+# peer reaches this loopback port is a host-side decision recorded on tj-grna9p.26, not a setting
+# here. data_store and data_ingest publish nothing new.
+#
+# NETWORKS. store_api (internal; data_store's API network, defined in the base file) is how this
+# container reaches data_store, and web_edge is an ordinary bridge, because an internal network
+# cannot publish a port. It is NOT on ingest_store or ingest_egress, so it cannot reach data_ingest
+# at all, which is what the Caddyfile's "no data_ingest route" rests on.
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: web_image
+      # The Dockerfile's web stages COPY nothing from the context (see the comment there): they read
+      # these named contexts instead. web_gen is the generated TypeScript (gitignored, never committed):
+      # make gen-proto-ts writes it on the host and prod-build and dev-build run that first, so a bare
+      # `docker compose build` with no gen/proto/ts fails here, naming this path, rather than building
+      # an image without it. The container has no buf.
+      additional_contexts:
+        web_src: ./web
+        web_deploy: ./deploy/web
+        web_gen: ./gen/proto/ts
+      args:
+        # The PrimeUI Community licence key, BUILD TIME only (see .env.default). Compose interpolates it
+        # from the root .env or the shell without any env_file on the service; empty when unset, and the
+        # app then builds and shows a licence notice. It is deliberately not in environment: below.
+        VITE_PRIMEUI_LICENSE_KEY: ${VITE_PRIMEUI_LICENSE_KEY:-}
+    image: trader_joe_web:latest
+    networks:
+      - store_api
+      - web_edge
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8088}:8080"
+    # NO env_file: the root .env holds the database password and the broker keys, and the web
+    # container needs one secret. It gets exactly these two values and nothing else.
+    environment:
+      # Where Caddy forwards /api/store/ui/v1/*. The service name resolves on store_api; the port is
+      # data_store's in-container port, APP_INTERNAL_PORT.
+      DATA_STORE_UPSTREAM: ${DATA_STORE_NAME:-data_store}:${APP_INTERNAL_PORT:-80}
+      # Injected by Caddy as X-Instance-Secret on the proxied request; the browser never holds it.
+      # ":?" like POSTGRES_PASS: unset or empty refuses to start rather than run a proxy whose
+      # upstream requests carry an empty secret.
+      INSTANCE_WRITE_SECRET: ${INSTANCE_WRITE_SECRET:?set INSTANCE_WRITE_SECRET in .env; there is no default}
+    security_opt:
+      - "no-new-privileges:true"
+    read_only: true
+    tmpfs:
+      # Caddy's XDG state (the Dockerfile points XDG_DATA_HOME and XDG_CONFIG_HOME here).
+      - /tmp
+    # The official Caddy image's binary carries the file capability cap_net_bind_service, and a
+    # process whose bounding set lacks it cannot exec the binary at all. The set is dropped to that
+    # one, which the container then does not need: it listens on 8080.
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    healthcheck:
+      # busybox wget, in the Alpine image. /healthz is answered by Caddy itself, so this says the
+      # web server is up and nothing about data_store.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    depends_on:
+      data_store:
+        condition: service_healthy
+
+networks:
+  web_edge: {}

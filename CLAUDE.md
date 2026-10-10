@@ -36,15 +36,17 @@ architect plans → (user approves) → builder → validator → architect (tes
 | Agent | Role | Scope |
 |---|---|---|
 | architect | plans, never edits; gates tests against the design, closes functional work | reads everything |
-| builder-ingest | builder | `data/ingest`, `routers/data_ingest` |
-| builder-store | builder | `data/store`, `routers/data_store` |
-| builder-shared | builder | `common`, `schemas`, `routers/common`, build + CI files |
-| validator | quality gate, default test author, closes work that skips the architect gate | all `tests/` directories |
+| builder-ingest | builder | `server/data/ingest`, `server/routers/data_ingest` |
+| builder-store | builder | `server/data/store`, `server/routers/data_store` |
+| builder-ui | builder | `web` |
+| builder-shared | builder | `server/common`, `server/schemas`, `server/routers/common`, `tools`, `proto`, `buf.yaml`, `deploy/web/Caddyfile`, build + CI files |
+| validator | quality gate, default test author, closes work that skips the architect gate | all test directories: `tests`, `server/*/tests`, `server/data/*/tests`, `web/src/**/*.spec.ts` |
 | scribe | docs, at feature completion | all doc tiers |
 | researcher-broker | read-only research | broker and market-data APIs |
 
 Two agents run concurrently only if their scopes are disjoint. `builder-shared` overlaps nothing,
-but both service builders depend on what it owns — serialise against it.
+and builder-ui overlaps nothing either; builder-shared owns what the others depend on — `server/common`,
+`proto` and the Caddyfile included — so the service builders and builder-ui serialise against it.
 
 ## Shared rules
 

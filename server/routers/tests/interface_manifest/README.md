@@ -31,8 +31,8 @@ kind | address | file | symbol | request | response | touches
 | `address` | `METHOD /path` for `http`, the declared path for `unbound-path`, `-` for `none` |
 | `file` | Repository-relative path of the module whose body defines the endpoint or handler |
 | `symbol` | The endpoint or handler function, or `EnumClass.MEMBER` for a declared path |
-| `request` | Every parameter annotated with a Pydantic model, fully qualified, sorted |
-| `response` | The route's response model or the handler's declared response model, fully qualified |
+| `request` | Every parameter annotated with a Pydantic model, fully qualified, or with a protobuf message, by its full proto name; sorted |
+| `response` | The route's `x-proto-message` when it has one (a `/ui/v1` route), else its response model or the handler's declared response model, fully qualified |
 | `touches` | Every other parameter annotation, fully qualified, sorted |
 
 `-` means the entry has no value for that field; no field is ever empty.
@@ -43,6 +43,12 @@ cross-boundary schema is one and everything else is injected plumbing. That make
 an `IngestFetchClient` says it reaches data_ingest — and it is what decides the tier of the test
 each interface eventually gets. An untyped body lands in `touches` as `dict`, which is the honest
 answer: there is no schema to name.
+
+A `/ui/v1` route (ADR tj-grna9p.4 section 4) has no Pydantic model on either side: its contract is a
+`.proto` message. `proto_route` names the response message under the OpenAPI extension
+`x-proto-message`, and a body parsed by `ProtoBody` is annotated with the generated message class.
+Both are recorded by full proto name, e.g. `trader_joe.proto.ui.v1.DatasetPage`, so the manifest
+holds the contract the extension exists to record rather than a `-`.
 
 ## The three kinds
 

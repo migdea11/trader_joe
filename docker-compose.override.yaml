@@ -57,6 +57,10 @@ services:
       - LOG_LEVEL=debug
       # Latency harness client: serves GET /latency (see the header comment).
       - LATENCY_TEST_ENABLED=true
+      # The label the UI shows for this deployment, via GET /ui/v1/config. Dev only: the base file
+      # passes DEPLOYMENT_LABEL through as a bare key and prod never sets it, so prod shows no tag.
+      # Merges with that bare key by name, and outranks the env file's empty DEPLOYMENT_LABEL=.
+      - DEPLOYMENT_LABEL=dev
     image: trader_joe_data_store:dev
 
   data_ingest:

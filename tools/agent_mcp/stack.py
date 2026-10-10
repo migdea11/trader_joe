@@ -81,6 +81,7 @@ TRUSTED_DOCKERFILE = TRUSTED_COMPOSE_DIR / 'Dockerfile'
 BASE_IMAGES = (
     'debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251',
     'ghcr.io/astral-sh/uv:0.12.19@sha256:04d046b13e60d6bcec73cbc5e1cad25d680dea90c8573340950a0ac2d1aef424',
+    'caddy:2.11.7-alpine@sha256:d8542f48d34a9cf4e4c11a478865229840e87e4c96ea3f439101f31a5d35f75f',
 )
 
 DOCKER = '/usr/local/bin/docker'
