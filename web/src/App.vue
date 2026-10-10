@@ -1,6 +1,6 @@
 <script setup lang="ts">
-// The app shell (top bar, Data sub-tabs, sidebar) is built in tj-grna9p.30. For now this is
-// just the router outlet that proves the Vite/Vue/Router/Pinia/PrimeVue chain renders.
+// The router outlet. The app shell (top bar, Data sub-tabs, sidebar, footer) is shell/AppShell.vue,
+// the layout route every product route sits under (router/index.ts).
 </script>
 
 <template>

@@ -5,7 +5,8 @@
 # ref first, because buildx would otherwise fetch the registry token itself and fail. A digest bump
 # (Dependabot's docker entry, or by hand) updates BASE_IMAGES in the same change.
 # Digests taken 2026-10-01 from the registry API (the Docker-Content-Digest of the tag's index):
-# debian:bookworm-slim from registry-1.docker.io, uv:0.12.19 from ghcr.io.
+# debian:bookworm-slim and caddy:2.11.7-alpine (the web image's server, 2026-10-06) from
+# registry-1.docker.io, uv:0.12.19 from ghcr.io.
 
 # Base Build Image
 FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS base_build_image
@@ -105,6 +106,107 @@ RUN apt-get update \
 USER appuser
 
 RUN uv sync --only-group base --only-group data-store --only-group testing --frozen
+
+# THE WEB IMAGE (decisions tj-grna9p.5, .6, .7; bead tj-grna9p.26): two stages, a Node build and a Caddy
+# server, built only by docker-compose.web.yaml and its dev overlay. They sit before the deploy stages
+# for the reason system_test_image does: prod_image stays the LAST stage, the one a target-less
+# `docker build` makes.
+#
+# THE DEV SERVICE (bead tj-mcrwrd) USES web_build_image AS ITS TARGET, not a stage of its own: that
+# stage already holds the pinned Node, the installed dependencies (/web/node_modules, owned by the
+# non-root user) and a baked copy of the source, which is all `vite` needs. docker-compose.web.dev.yaml
+# runs vite from it and bind-mounts ./web/src over /web/src, so a host edit hot-reloads. The cost is one
+# `vite build` at dev-build time whose dist the dev server never reads. A stage of its own, FROM a
+# shared Node-and-dependencies stage, would avoid that and was written first; it moved the Node RUN
+# out of web_build_image, which the build-infra tests read it from, so it was folded back.
+#
+# NO COPY HERE READS THE BUILD CONTEXT, and that is deliberate. tools/source_digest.sh parses every
+# COPY source out of this file into every service image's digest, and the reach tests derive their
+# roots from the same list, so a `COPY web/...` would stamp each service image with the UI's source
+# and put web/ in the Python reach scan. The sources arrive as the NAMED BUILD CONTEXTS web_src
+# (./web) and web_deploy (./deploy/web), which docker-compose.web.yaml declares as additional_contexts,
+# read through `RUN --mount=type=bind,from=...`. NOT `COPY --from=<context>`: the digest-pin test
+# (tools/agent_mcp/tests/test_bases.py) reads every COPY --from operand that is not a stage as a
+# registry image and demands a digest of it, and a named context is a local directory, not an image.
+# No registry image is left unpinned by this; the two contexts are checkouts of this repository.
+# A named context is not filtered by .dockerignore, so the source step drops a host node_modules
+# and dist itself, below.
+#
+# THE NODE PIN. The three NODE_* values MIRROR the Makefile's NODE_VERSION, NODE_SHA256_X86_64 and
+# NODE_SHA256_AARCH64, which are the one authority (tj-grna9p.97), exactly as .devcontainer/Dockerfile
+# mirrors them: this build cannot read the Makefile, and a build arg fed from it would leave a build
+# outside make with no version. A bump is those three values here, in the devcontainer and in the
+# Makefile, in one commit. A test pins them equal. npm is whatever the pinned Node bundles.
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS web_build_image
+ARG NODE_VERSION=24.21.0
+ARG NODE_SHA256_X86_64=6e1db87ef58b8819e5d5402eff1536491b18edd8eb7bee5ef7897876e88dc5ff
+ARG NODE_SHA256_AARCH64=724282c3b43aec998aa9527380465b45d229e021b58035f5f4f63095eabfe5d5
+
+# Root for the package step and the Node install only. The official tarball, checksum-verified; .tar.gz
+# because it needs nothing beyond tar and gzip.
+USER root
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) asset="node-v${NODE_VERSION}-linux-x64.tar.gz"; sum="${NODE_SHA256_X86_64}" ;; \
+      arm64) asset="node-v${NODE_VERSION}-linux-arm64.tar.gz"; sum="${NODE_SHA256_AARCH64}" ;; \
+      *) echo "no node checksum pinned for ${arch}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/node.tar.gz "https://nodejs.org/dist/v${NODE_VERSION}/${asset}"; \
+    echo "${sum}  /tmp/node.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1 \
+      --exclude='*/CHANGELOG.md' --exclude='*/LICENSE' --exclude='*/README.md'; \
+    rm /tmp/node.tar.gz; \
+    [ "$(node --version)" = "v${NODE_VERSION}" ]
+
+RUN addgroup --system appgroup && adduser --ingroup appgroup appuser \
+    && install -d -o appuser -g appgroup /web
+USER appuser
+WORKDIR /web
+
+# The lockfile first, so the dependency layer is reused until it changes. npm ci installs exactly the
+# lockfile and fails when package.json disagrees with it. Two single-file bind mounts, so this layer's
+# cache key is those two files and not the whole of web/.
+RUN --mount=type=bind,from=web_src,source=package.json,target=/web/package.json \
+    --mount=type=bind,from=web_src,source=package-lock.json,target=/web/package-lock.json \
+    npm ci --no-audit --no-fund
+
+# The source, streamed through tar so that whatever node_modules or dist the host had is left behind:
+# the host's platform-specific binaries must never replace the ones npm ci just installed here.
+RUN --mount=type=bind,from=web_src,target=/mnt/web_src \
+    tar -C /mnt/web_src --exclude=./node_modules --exclude=./dist -cf - . | tar -C /web -xf -
+# The PrimeUI Community licence key, read by Vite at build time as import.meta.env.VITE_PRIMEUI_LICENSE_KEY
+# (web/src/config/licence.ts) from the process environment, hence ENV and not just ARG. Empty by default:
+# the app builds and works without it and shows a red "Invalid PrimeUI License" notice at runtime.
+# ENV records the value in this stage's image metadata, and the value ends up in the public JS bundle
+# anyway. That is acceptable ONLY because the Community licence allows the key in the shipped bundle. It
+# follows that an image built with a key must NEVER be pushed to a public registry unless the owner
+# decides so. Declared after the dependency layers so changing the key does not invalidate npm ci.
+ARG VITE_PRIMEUI_LICENSE_KEY=
+ENV VITE_PRIMEUI_LICENSE_KEY=$VITE_PRIMEUI_LICENSE_KEY
+
+# npm run build writes /web/dist, WITH --ignore-scripts: the `prebuild` pre-script is `npm run gen:proto`,
+# i.e. buf generate, and this image has no buf and no proto/. Nothing generated is committed (gen/ is
+# gitignored), so the host writes gen/proto/ts (make gen-proto-ts, a prerequisite of prod-build and
+# dev-build) and compose hands it over as the named context web_gen, mounted at /gen/proto/ts: with
+# WORKDIR /web, that is the ../gen/proto/ts the @generated alias in vite.config.ts points at. A bind
+# mount, so it adds no layer and the generated code is not copied into the image; the dist it helped
+# produce is. The build script itself is just `vite build`, which does not type-check.
+RUN --mount=type=bind,from=web_gen,target=/gen/proto/ts \
+    npm run build --ignore-scripts
+
+# The server. Caddy serves /srv and proxies the one data_store route (deploy/web/Caddyfile). Non-root
+# on the unprivileged port 8080. XDG_* point at /tmp, which compose mounts as tmpfs, because the root
+# filesystem is read-only there and Caddy writes a little state under them.
+FROM caddy:2.11.7-alpine@sha256:d8542f48d34a9cf4e4c11a478865229840e87e4c96ea3f439101f31a5d35f75f AS web_image
+COPY --from=web_build_image /web/dist /srv
+RUN --mount=type=bind,from=web_deploy,source=Caddyfile,target=/mnt/Caddyfile cp /mnt/Caddyfile /etc/caddy/Caddyfile
+ENV XDG_DATA_HOME=/tmp/caddy-data XDG_CONFIG_HOME=/tmp/caddy-config
+USER 65532:65532
+EXPOSE 8080
 
 # Base Deploy Image
 FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS base_deploy_image

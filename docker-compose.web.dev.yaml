@@ -1,0 +1,72 @@
+# The DEV web service: the Vite dev server with hot reload, replacing the prod Caddy build of
+# docker-compose.web.yaml (bead tj-mcrwrd). Loaded only by the Makefile's DEV_COMPOSE, after the base
+# file, docker-compose.override.yaml and docker-compose.web.yaml, in that order:
+#
+#   docker compose -f docker-compose.yaml -f docker-compose.override.yaml -f docker-compose.web.yaml \
+#     -f docker-compose.web.dev.yaml up web
+#
+# A separate file and not a block in the override, because the web service itself is defined in
+# docker-compose.web.yaml, which the override is loaded BEFORE: this file has to come after it to
+# amend it, and an overlay of an overlay is clearer than reordering the dev set around one service.
+# It adds nothing to the base file, PROD_COMPOSE or the agent stack, none of which load it.
+#
+# SAME SERVICE, SAME PORT. Merged over the prod definition it keeps the networks (store_api to reach
+# data_store, web_edge to publish), the loopback publish 127.0.0.1:${WEB_PORT:-8088}:8080 and the
+# depends_on on a healthy data_store, and Vite listens on 8080 inside the container so the very same
+# published-port entry serves it (a different container port would merge into a SECOND published port
+# claiming the same host port). Dev and prod therefore share WEB_PORT, and only one stack runs at a time.
+# Browse http://localhost:${WEB_PORT:-8088}/.
+#
+# HOT RELOAD. ./web/src is bind-mounted over the baked /web/src, so a host edit is seen at once, and
+# Vite pushes the update over its HMR websocket. The websocket needs no setting: with no hmr option in
+# vite.config.ts the client connects back to the page's own host and port, which is this published
+# loopback port. Source files only: config files and the lockfile are baked into the image, so
+# changing one is `make dev-build` (single-file bind mounts keep a stale inode after an editor's rename-save, and mounting all of web/ would shadow the image's node_modules).
+#
+# THE GENERATED TYPESCRIPT. ./gen/proto is mounted read-only at /gen/proto, so /gen/proto/ts sits
+# where ../gen/proto/ts resolves from /web (the aliases in vite.config.ts and tsconfig.app.json are
+# relative to web/). The PARENT is mounted, not gen/proto/ts: buf generate (clean: true) deletes and
+# recreates the output directory, and a bind mount of a directory that is replaced keeps pointing at
+# the deleted one. Run make gen-proto-ts on the host after a proto change; Vite sees it. No buf runs in
+# the container: vite is started directly, never through `npm run dev`, whose `predev` is buf generate.
+services:
+  web:
+    build:
+      target: web_build_image
+    image: trader_joe_web:dev
+    # init: vite is PID 1 otherwise, and a node PID 1 gets no default signal handling, so `docker stop`
+    # could wait out its timeout; tini forwards the signal and reaps children (esbuild workers).
+    init: true
+    # Plain exec of the pinned vite, never `npm run dev` (its predev is buf generate; no buf here).
+    command: ["./node_modules/.bin/vite", "--host", "0.0.0.0", "--port", "8080", "--strictPort"]
+    volumes:
+      - ./web/src:/web/src:ro
+      - ./gen/proto:/gen/proto:ro
+    environment:
+      # The PrimeUI licence key as the dev server reads it: Vite exposes VITE_* from the process
+      # environment (web/src/config/licence.ts). From the root .env or the shell by compose
+      # interpolation, never an env_file; empty is fine and shows the licence notice. In prod it is a
+      # build argument instead.
+      VITE_PRIMEUI_LICENSE_KEY: ${VITE_PRIMEUI_LICENSE_KEY:-}
+      # Where the Vite dev proxy forwards /api/store (web/vite.config.ts, absolute http(s) URL; from
+      # inside this container localhost is the container, so its default would not reach data_store).
+      # The same host and port interpolation as DATA_STORE_UPSTREAM in docker-compose.web.yaml (service
+      # name on store_api, data_store's in-container APP_INTERNAL_PORT), with the scheme written in front:
+      # compose cannot reuse DATA_STORE_UPSTREAM, it is a service value and not interpolation input.
+      VITE_DEV_PROXY_TARGET: http://${DATA_STORE_NAME:-data_store}:${APP_INTERNAL_PORT:-80}
+      # INSTANCE_WRITE_SECRET is blanked, overriding the prod file's ":?" value: the Vite proxy does not
+      # inject X-Instance-Secret and a browser must never hold it, so the dev container never needs the
+      # secret and does not get it. Dev reads work without it, because reads are open; a write through
+      # the dev server reaches data_store with no secret and is refused (the UI issues none today).
+      INSTANCE_WRITE_SECRET: ""
+    # Writable root: Vite writes its dependency cache to /web/node_modules/.vite and the container's
+    # layer is the only place that is possible without a named volume shadowing node_modules.
+    read_only: false
+    healthcheck:
+      # Vite answers / from its first request on; busybox wget is not here but curl is (web_build_image).
+      # A cold start pre-bundles dependencies, hence the long start_period.
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8080/"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 60s

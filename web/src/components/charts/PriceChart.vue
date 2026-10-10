@@ -29,6 +29,7 @@ import {
 import type { Bar } from '@generated/trader_joe/proto/market/v1/bar_pb'
 
 import { int64ToNumber } from '@/api/int64'
+import { useFormatters } from '@/format/useFormatters'
 import { colors } from '@/theme/tokens'
 import {
   lightweightCandlestickOptions,
@@ -59,6 +60,8 @@ const props = withDefaults(
     readonly smaPeriods?: readonly number[]
     /** Period of the average drawn over the volume pane. 0 hides it. */
     readonly volumeAveragePeriod?: number
+    /** Show the volume pane (with its average line). */
+    readonly showVolume?: boolean
     /** The visible logical range, bar-index units (two-way with ZoomNavigator). */
     readonly visibleRange?: LogicalRangeLike | null
     /** Chart height in px. */
@@ -67,6 +70,7 @@ const props = withDefaults(
   {
     smaPeriods: () => [20, 50],
     volumeAveragePeriod: 20,
+    showVolume: true,
     visibleRange: null,
     height: 420,
   },
@@ -121,6 +125,9 @@ function readBars(): readonly Bar[] {
 }
 
 const data = shallowRef<ChartData>(markRaw(buildData(readBars())))
+// Times and the date label are shown in the settings zone (override or browser zone); the zone is
+// re-applied to the live chart when it changes.
+const { chartLocalization, chartTimeScale, timeZone } = useFormatters()
 const container = useTemplateRef<HTMLDivElement>('container')
 
 // Chart objects live outside Vue's reactivity.
@@ -132,10 +139,10 @@ let smaSeries: Array<{ period: number; series: ISeriesApi<'Line'> }> = []
 let lastEmitted: LogicalRangeLike | null = null
 
 function applyData(): void {
-  if (!candleSeries || !volumeSeries) return
+  if (!candleSeries) return
   const d = data.value
   candleSeries.setData(d.candles)
-  volumeSeries.setData(d.volume)
+  volumeSeries?.setData(d.volume)
   for (const { period, series } of smaSeries) {
     series.setData(lineData(d.candles, simpleMovingAverage(d.closes, period)))
   }
@@ -150,6 +157,17 @@ function rebuildIndicators(): void {
   smaSeries = []
   if (volumeAverageSeries) chart.removeSeries(volumeAverageSeries)
   volumeAverageSeries = null
+  // The volume pane is the series on pane 1: removing its last series removes the pane.
+  if (volumeSeries && !props.showVolume) {
+    chart.removeSeries(volumeSeries)
+    volumeSeries = null
+  } else if (!volumeSeries && props.showVolume) {
+    volumeSeries = chart.addSeries(
+      HistogramSeries,
+      { priceFormat: { type: 'volume' }, priceLineVisible: false, lastValueVisible: false },
+      1,
+    )
+  }
 
   props.smaPeriods.forEach((period, i) => {
     const series = chart!.addSeries(LineSeries, {
@@ -163,7 +181,7 @@ function rebuildIndicators(): void {
     })
     smaSeries.push({ period, series })
   })
-  if (props.volumeAveragePeriod > 0) {
+  if (props.showVolume && props.volumeAveragePeriod > 0) {
     volumeAverageSeries = chart.addSeries(
       LineSeries,
       {
@@ -176,6 +194,9 @@ function rebuildIndicators(): void {
       1,
     )
   }
+  const panes = chart.panes()
+  panes[0]?.setStretchFactor(3)
+  panes[1]?.setStretchFactor(1)
   applyData()
 }
 
@@ -225,20 +246,13 @@ onMounted(() => {
       // Attribution lives in the About/Credits modal (credits.ts, tj-grna9p.54), not on the chart.
       attributionLogo: false,
     },
-    // Dates read YYYY/MM/DD (tj-mujie8 ruling 6).
-    localization: { dateFormat: 'yyyy/MM/dd' },
+    // Dates read YYYY/MM/DD and times are in the viewer's zone (tj-mujie8 ruling 6).
+    localization: chartLocalization(),
+    timeScale: { ...lightweightChartOptions.timeScale, ...chartTimeScale() },
     // Lightweight Charts observes the container itself, so resizing needs no handler of ours.
     autoSize: true,
   })
   candleSeries = chart.addSeries(CandlestickSeries, lightweightCandlestickOptions)
-  volumeSeries = chart.addSeries(
-    HistogramSeries,
-    { priceFormat: { type: 'volume' }, priceLineVisible: false, lastValueVisible: false },
-    1,
-  )
-  const panes = chart.panes()
-  panes[0]?.setStretchFactor(3)
-  panes[1]?.setStretchFactor(1)
 
   rebuildIndicators()
   chart.subscribeCrosshairMove(onCrosshairMove)
@@ -270,8 +284,12 @@ watch(
   },
 )
 
+watch(timeZone, () => {
+  chart?.applyOptions({ localization: chartLocalization(), timeScale: chartTimeScale() })
+})
+
 watch(
-  () => [props.smaPeriods, props.volumeAveragePeriod] as const,
+  () => [props.smaPeriods, props.volumeAveragePeriod, props.showVolume] as const,
   () => rebuildIndicators(),
 )
 

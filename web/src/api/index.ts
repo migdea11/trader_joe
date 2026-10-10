@@ -1,6 +1,14 @@
 export { API_BASE, getMessage } from './client'
 export type { GetOptions } from './client'
-export { getDataset, getDatasetBars, getDatasetFacets, getUiConfig, listDatasets } from './datasets'
+export {
+  getDataset,
+  getDatasetBars,
+  getDatasetBarsRequest,
+  getDatasetFacets,
+  getUiConfig,
+  listDatasets,
+  listDatasetsRequest,
+} from './datasets'
 export type {
   DatasetFilters,
   DatasetSort,

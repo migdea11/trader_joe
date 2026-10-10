@@ -374,16 +374,37 @@ def test_the_four_places_naming_the_mcp_network_agree_and_it_is_internal():
 # --- item 4. prod never loads what attaches devnet -------------------------------------------
 
 
-def test_prod_compose_names_the_base_file_alone():
-    """Extends test_prod_compose_command_does_not_load_the_dev_override: no second file at all.
+WEB_FILE = REPO_ROOT / 'docker-compose.web.yaml'
+
+
+def test_prod_compose_names_the_base_file_then_the_web_overlay_only():
+    """Extends test_prod_compose_command_does_not_load_the_dev_override: exactly two files, in order.
 
     That test forbids the override; this one forbids every other -f too (the tools file, the test
-    client of tj-ijpys9.10), because any extra file can attach devnet or a publish to prod.
+    client of tj-ijpys9.10), because any extra file can attach devnet or a publish to prod. The one
+    exception is the web overlay (owner ruling 2026-10-06, bead tj-mcrwrd): prod builds, starts and
+    stops the web service through the existing make targets, so PROD_COMPOSE is the base file plus
+    docker-compose.web.yaml, and the base file itself never gains the service.
     """
     prod_compose = shlex.split(_make_variable('PROD_COMPOSE'))
-    assert _compose_files_named(prod_compose) == [COMPOSE_FILE.name], (
-        f'PROD_COMPOSE is {prod_compose}; it must load {COMPOSE_FILE.name} and nothing else.'
+    assert _compose_files_named(prod_compose) == [COMPOSE_FILE.name, WEB_FILE.name], (
+        f'PROD_COMPOSE is {prod_compose}; it must load {COMPOSE_FILE.name}, then {WEB_FILE.name}, and nothing else.'
     )
+    assert 'web' not in (_load_yaml(COMPOSE_FILE).get('services') or {}), (
+        f'{COMPOSE_FILE.name} defines a web service; it belongs in {WEB_FILE.name} alone'
+    )
+
+
+def test_the_web_overlay_prod_loads_adds_the_web_service_alone_and_no_devnet():
+    """What makes the one extra prod file safe: it touches no other service and never attaches devnet.
+
+    The web service's single loopback publish is the deliberate exception to 2' and is pinned in
+    test_web_edge.py; a second service here, or devnet anywhere in the file, would reach prod unseen.
+    """
+    overlay = _load_yaml(WEB_FILE)
+    assert set(overlay.get('services') or {}) == {'web'}, sorted(overlay.get('services') or {})
+    assert DEVNET_KEY not in _service_networks(overlay['services']['web']), overlay['services']['web']
+    assert DEVNET_KEY not in (overlay.get('networks') or {}), overlay.get('networks')
 
 
 def test_run_migrations_names_the_base_file_alone():

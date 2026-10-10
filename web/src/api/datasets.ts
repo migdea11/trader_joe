@@ -17,7 +17,8 @@ import type {
 import { UiConfigSchema } from '@generated/trader_joe/proto/ui/v1/shell_pb'
 import type { UiConfig } from '@generated/trader_joe/proto/ui/v1/shell_pb'
 
-import { getMessage } from './client'
+import { API_BASE, getMessage } from './client'
+import { buildQuery } from './query'
 
 /** The status words the server filters by (a grouping of FreshnessStatus). */
 export type StatusGroup = 'healthy' | 'late' | 'failed' | 'retired'
@@ -70,12 +71,21 @@ function filterQuery(filters: DatasetFilters) {
   }
 }
 
+function listQuery(params: ListDatasetsParams) {
+  return { ...filterQuery(params), sort: params.sort, cursor: params.cursor, limit: params.limit }
+}
+
 /** GET /ui/v1/datasets: one page of the catalog. */
 export function listDatasets(params: ListDatasetsParams = {}): Promise<DatasetPage> {
   return getMessage(DatasetPageSchema, '/ui/v1/datasets', {
-    query: { ...filterQuery(params), sort: params.sort, cursor: params.cursor, limit: params.limit },
+    query: listQuery(params),
     signal: params.signal,
   })
+}
+
+/** The request listDatasets sends for these parameters, as the browser's path and query (Show Request). */
+export function listDatasetsRequest(params: ListDatasetsParams = {}): string {
+  return `${API_BASE}/ui/v1/datasets${buildQuery(listQuery(params))}`
 }
 
 /** GET /ui/v1/datasets/facets: the sidebar counts under the same filters. */
@@ -91,12 +101,21 @@ export function getDataset(id: string, signal?: AbortSignal): Promise<DatasetSum
   return getMessage(DatasetSummarySchema, `/ui/v1/datasets/${encodeURIComponent(id)}`, { signal })
 }
 
+function barsQuery(params: GetBarsParams) {
+  return { start: params.start, end: params.end, cursor: params.cursor, limit: params.limit }
+}
+
 /** GET /ui/v1/datasets/{id}/bars: one page of bars in the half-open window [start, end). */
 export function getDatasetBars(id: string, params: GetBarsParams = {}): Promise<BarPage> {
   return getMessage(BarPageSchema, `/ui/v1/datasets/${encodeURIComponent(id)}/bars`, {
-    query: { start: params.start, end: params.end, cursor: params.cursor, limit: params.limit },
+    query: barsQuery(params),
     signal: params.signal,
   })
+}
+
+/** The request getDatasetBars sends for these parameters, as the browser's path and query (Show Request). */
+export function getDatasetBarsRequest(id: string, params: GetBarsParams = {}): string {
+  return `${API_BASE}/ui/v1/datasets/${encodeURIComponent(id)}/bars${buildQuery(barsQuery(params))}`
 }
 
 /** GET /ui/v1/config: what the shell needs to know about this deployment. */

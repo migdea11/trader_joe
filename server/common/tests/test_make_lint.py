@@ -57,7 +57,7 @@ SEPARATOR = '\x1f'
 # What the Makefile reads with ?=, or what an outer make carries inward: under `make test PATHS=common/tests`
 # MAKEFLAGS holds PATHS=common/tests, and every make started here would silently inherit it.
 _CALLER_VARIABLES = frozenset({'MAKEFLAGS', 'MFLAGS', 'MAKELEVEL', 'PATHS', 'PYTEST_ADDOPTS'})
-_CALLER_PREFIXES = ('BUF', 'GIT_', 'UNAME_', 'CURL_')
+_CALLER_PREFIXES = ('BUF', 'GIT_', 'UNAME_', 'CURL_', 'NODE', 'NPM')
 # Scratch repositories only: the caller's git configuration cannot reach them.
 GIT_ISOLATION = {
     'GIT_CONFIG_NOSYSTEM': '1',
@@ -102,6 +102,24 @@ exit 97
 UV_STUB = r"""#!/bin/sh
 for word in "$@"; do printf '%s\037' "$word"; done >> "$UV_STUB_LOG"
 printf '\n' >> "$UV_STUB_LOG"
+"""
+# Stand-ins for the web leg (lint-ts, tj-grna9p.27). The buf-free PATH also drops /usr/local/bin, where the
+# image's node lives, so without these a run that selects web/ finds no node at all. node answers
+# --version with NODE_STUB_VERSION (the pin unless a test says otherwise); npm records every call.
+NODE_STUB = r"""#!/bin/sh
+for word in "$@"; do printf '%s\037' "$word"; done >> "$NODE_STUB_LOG"
+printf '\n' >> "$NODE_STUB_LOG"
+case "$1" in
+  --version) printf '%s\n' "$NODE_STUB_VERSION"; exit 0 ;;
+esac
+echo "node stub: unexpected call: $*" >&2
+exit 97
+"""
+NPM_STUB = r"""#!/bin/sh
+for word in "$@"; do printf '%s\037' "$word"; done >> "$NPM_STUB_LOG"
+printf '\n' >> "$NPM_STUB_LOG"
+if [ -n "${NPM_STUB_FAIL_CALL:-}" ] && [ "$*" = "$NPM_STUB_FAIL_CALL" ]; then exit 1; fi
+exit "${NPM_STUB_EXIT:-0}"
 """
 UNAME_STUB = r"""#!/bin/sh
 case "$*" in
@@ -268,6 +286,8 @@ class Stubs:
         self.bin.mkdir()
         self.buf_log = root / 'buf.calls'
         self.uv_log = root / 'uv.calls'
+        self.node_log = root / 'node.calls'
+        self.npm_log = root / 'npm.calls'
         self.baseline = root / 'baseline-buf-was-given'
         self.path = os.pathsep.join([str(self.bin), _path_without_buf()])
         missing = [tool for tool in RECIPE_TOOLS if not shutil.which(tool, path=self.path)]
@@ -284,6 +304,12 @@ class Stubs:
         _executable(self.bin / 'uv', UV_STUB)
         return self
 
+    def install_node(self) -> 'Stubs':
+        """A node reporting NODE_STUB_VERSION and an npm that records its calls, for the web leg."""
+        _executable(self.bin / 'node', NODE_STUB)
+        _executable(self.bin / 'npm', NPM_STUB)
+        return self
+
     def env(self, **extra: str) -> dict[str, str]:
         return (
             _clean_environment()
@@ -294,9 +320,18 @@ class Stubs:
                 'BUF_STUB_VERSION': _pin('BUF_VERSION'),
                 'BUF_STUB_BASELINE_COPY': str(self.baseline),
                 'UV_STUB_LOG': str(self.uv_log),
+                'NODE_STUB_LOG': str(self.node_log),
+                'NODE_STUB_VERSION': f'v{_pin("NODE_VERSION")}',
+                'NPM_STUB_LOG': str(self.npm_log),
             }
             | extra
         )
+
+    def node_calls(self) -> list[list[str]]:
+        return _calls(self.node_log)
+
+    def npm_calls(self) -> list[list[str]]:
+        return _calls(self.npm_log)
 
     def buf_calls(self) -> list[list[str]]:
         return _calls(self.buf_log)
@@ -669,33 +704,71 @@ def test_lint_fix_proto_applies_buf_format(stubs: Stubs, module_repo: Path):
     assert stubs.buf_calls() == [['--version'], ['format', '-w']]
 
 
+# What the web leg (lint-ts / lint-fix-ts, tj-grna9p.27) hands npm when PATHS selects web/.
+WEB_LINT_CALLS = [['--prefix', 'web', 'run', 'lint'], ['--prefix', 'web', 'run', 'typecheck']]
+# lint-fix-ts: ONE npm call on web/ carrying --fix. Its exact spelling is left to the recipe: whether eslint
+# then runs inside web/ is npm's semantics, which test_make_web.py checks with the real npm.
+WEB_LINT_FIX_CALLS = 'one npm call under --prefix web carrying --fix'
+
+
+def web_calls_match(calls: list[list[str]], expected: list[list[str]] | str) -> bool:
+    if expected == WEB_LINT_FIX_CALLS:
+        return len(calls) == 1 and calls[0][:2] == ['--prefix', 'web'] and '--fix' in calls[0]
+    return calls == expected
+
+
 @pytest.mark.parametrize(
-    ('arguments', 'ruff', 'checks'),
+    ('arguments', 'ruff', 'checks', 'web'),
     [
-        (['lint', 'PATHS=.'], [['run', 'ruff', 'check', '.'], ['run', 'ruff', 'format', '--check', '.']], 'lint'),
+        (
+            ['lint', 'PATHS=.'],
+            [['run', 'ruff', 'check', '.'], ['run', 'ruff', 'format', '--check', '.']],
+            'lint',
+            WEB_LINT_CALLS,
+        ),
         (
             ['lint', 'PATHS=common'],
             [['run', 'ruff', 'check', 'common'], ['run', 'ruff', 'format', '--check', 'common']],
             None,
+            [],
+        ),
+        (
+            ['lint-fix', 'PATHS=.'],
+            [['run', 'ruff', 'check', '--fix', '.'], ['run', 'ruff', 'format', '.']],
+            'lint-fix',
+            WEB_LINT_FIX_CALLS,
         ),
         (
             ['lint-fix', 'PATHS=proto'],
             [['run', 'ruff', 'check', '--fix', 'proto'], ['run', 'ruff', 'format', 'proto']],
             'lint-fix',
+            [],
         ),
         (
             ['lint-fix', 'PATHS=data/ingest'],
             [['run', 'ruff', 'check', '--fix', 'data/ingest'], ['run', 'ruff', 'format', 'data/ingest']],
             None,
+            [],
         ),
     ],
-    ids=['lint-everything', 'lint-a-component', 'lint-fix-proto', 'lint-fix-a-component'],
+    ids=['lint-everything', 'lint-a-component', 'lint-fix-everything', 'lint-fix-proto', 'lint-fix-a-component'],
 )
 def test_lint_and_lint_fix_run_ruff_as_before_and_the_proto_leg_when_selected(
-    stubs: Stubs, module_repo: Path, arguments: list[str], ruff: list[list[str]], checks: str | None
+    stubs: Stubs,
+    module_repo: Path,
+    arguments: list[str],
+    ruff: list[list[str]],
+    checks: str | None,
+    web: list[list[str]] | str,
 ):
-    """Item 3: one entry point, one leg per language. lint-python is the two ruff lines lint always ran."""
-    stubs.install_buf().install_uv()
+    """Item 3: one entry point, one leg per language. lint-python is the two ruff lines lint always ran.
+
+    Since tj-grna9p.27 the entry point has a web leg too: PATHS=. selects it, as it selects proto, so
+    the whole-tree run reaches npm's lint and typecheck (or eslint --fix); a component scope never
+    looks for node at all.
+    """
+    stubs.install_buf().install_uv().install_node()
+    (module_repo / 'web' / 'node_modules').mkdir(parents=True)
     env = stubs.env()
     marker = _expanded_make_variable('VENV_MARKER', module_repo, env)
     result = _make(module_repo, '-o', marker, *arguments, env=env)
@@ -707,6 +780,8 @@ def test_lint_and_lint_fix_run_ruff_as_before_and_the_proto_leg_when_selected(
         None: [],
     }[checks]
     assert stubs.checks_run() == expected, stubs.buf_calls()
+    assert web_calls_match(stubs.npm_calls(), web), (stubs.npm_calls(), _ran(result))
+    assert stubs.node_calls() == ([['--version']] if web else []), 'node was consulted by a run that does not lint web/'
     if checks is None:
         assert result.stdout.splitlines()[-1].endswith('does not cover proto/ (buf runs for PATHS=. or proto/...)')
 

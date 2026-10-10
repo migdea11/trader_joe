@@ -296,11 +296,22 @@ errors-doc: $(VENV_MARKER)  ## Regenerate docs/errors.md from server/common/erro
 # ":?" guards, and compose evaluates every file it is handed, so a file any other target loaded
 # would make those credentials a requirement of the whole dev stack. A profile does not avoid
 # that; a separate file does. PROD_COMPOSE never loads it.
-PROD_COMPOSE := docker compose -f docker-compose.yaml
+#
+# THE WEB UI (bead tj-mcrwrd). docker-compose.web.yaml is the PROD web service -- the static Vite build
+# served by Caddy, no reload -- and PROD_COMPOSE loads it, so prod-build builds the image, prod-launch
+# starts it and waits for healthy, and prod-down stops it. DEV_COMPOSE loads it too and then
+# docker-compose.web.dev.yaml, which turns the same service into the Vite dev server with hot reload
+# from the bind-mounted ./web/src. Both publish the one loopback port WEB_PORT (default 8088): only one
+# stack runs at a time, and a dev session never runs beside prod on the same machine anyway. The
+# agent stack never loads either file, and the base file never gains the service. The overlay's
+# INSTANCE_WRITE_SECRET carries a ":?" guard like POSTGRES_PASS, so every command through these sets
+# needs it in the root .env or the shell; prod-down and dev-down pass a placeholder the way dev-down
+# does for pgAdmin, for the same reason.
+PROD_COMPOSE := docker compose -f docker-compose.yaml -f docker-compose.web.yaml
 # Dev gains devnet through the override, which attaches every stack service to it (tj-q9ae5u
 # addendum 1). PROD_COMPOSE never loads the override, so a prod launch never attaches devnet --
 # which is also what keeps a dev session off a prod stack on the same machine.
-DEV_COMPOSE := docker compose -f docker-compose.yaml -f docker-compose.override.yaml
+DEV_COMPOSE := docker compose -f docker-compose.yaml -f docker-compose.override.yaml -f docker-compose.web.yaml -f docker-compose.web.dev.yaml
 TOOLS_COMPOSE := $(DEV_COMPOSE) -f docker-compose.tools.yaml
 # THE AGENT STACK (ADR tj-4rr0la section 1 and addendum 1). The isolated stack the agent-stack MCP
 # drives from an agent's worktree, under its own compose project so it never shares a container,
@@ -358,11 +369,11 @@ export SOURCE_DIGEST_DATA_STORE SOURCE_DIGEST_DATA_INGEST;
 endef
 
 .PHONY: prod-build
-prod-build: $(VENV_MARKER) proto  ## Build the production images (:latest), stamped with the source digest
+prod-build: $(VENV_MARKER) proto gen-proto-ts  ## Build the production images (:latest), web included, stamped with the source digest
 	$(WITH_SOURCE_STAMP) $(PROD_COMPOSE) build
 
 .PHONY: prod-build-clean
-prod-build-clean: $(VENV_MARKER) proto  ## Build the production images from scratch, no cache
+prod-build-clean: $(VENV_MARKER) proto gen-proto-ts  ## Build the production images from scratch, no cache
 	$(WITH_SOURCE_STAMP) $(PROD_COMPOSE) build --no-cache
 
 .PHONY: prod-deps
@@ -370,12 +381,12 @@ prod-deps: $(VENV_MARKER)  ## Start the production dependencies (postgres)
 	$(PROD_UP) postgres
 
 .PHONY: prod-launch
-prod-launch: prod-deps  ## Start the production services, waiting for healthy
-	$(PROD_UP) data_store data_ingest
+prod-launch: prod-deps  ## Start the production services, web included, waiting for healthy
+	$(PROD_UP) data_store data_ingest web
 
 .PHONY: prod-logs
 prod-logs:  ## Follow the production service logs
-	$(PROD_COMPOSE) logs -f data_store data_ingest
+	$(PROD_COMPOSE) logs -f data_store data_ingest web
 
 # --remove-orphans, for the reason agent-up carries it (addendum 11 R3, line 633) and
 # stack_down_steps carries it: a service DROPPED from the compose file leaves a container this
@@ -386,7 +397,7 @@ prod-logs:  ## Follow the production service logs
 # is what "removes this stack cleanly" has always promised, and the flag is what makes it true.
 .PHONY: prod-down
 prod-down:  ## Stop the production stack
-	$(PROD_COMPOSE) down --remove-orphans
+	INSTANCE_WRITE_SECRET=unused $(PROD_COMPOSE) down --remove-orphans
 
 # The single spelling of "apply the migrations" — run it after every deploy, once the stack is
 # up. Nothing else creates the schema, so a healthy stack has an empty database until this runs.
@@ -483,7 +494,7 @@ migrate-check:  ## Compare the models with the live schema (writes alembic_versi
 	./server/data/store/run_migrations.sh check
 
 .PHONY: dev-build
-dev-build: $(VENV_MARKER) proto  ## Build the development images (:dev), stamped with the source digest
+dev-build: $(VENV_MARKER) proto gen-proto-ts  ## Build the development images (:dev), web included, stamped with the source digest
 	$(WITH_SOURCE_STAMP) $(DEV_COMPOSE) build
 
 # Idempotent, and safe against a concurrent create by the devcontainer's initializeCommand: look,
@@ -514,8 +525,8 @@ dev-tools: $(VENV_MARKER) dev-network  ## Start pgAdmin against the development 
 # Foreground on purpose, unlike prod-launch: --reload prints what it reloaded and why, and
 # that output is the reason to run the dev stack at all. Ctrl-C stops it.
 .PHONY: dev-launch
-dev-launch: dev-deps  ## Start the development services in the foreground, with reload
-	$(DEV_COMPOSE) up data_store data_ingest
+dev-launch: dev-deps  ## Start the development services in the foreground, with reload (web: Vite hot reload)
+	$(DEV_COMPOSE) up data_store data_ingest web
 
 # Through TOOLS_COMPOSE, so a pgAdmin started by dev-tools goes down with the rest instead of
 # being left running as an orphan on the project network. Costs nothing when it is not running.
@@ -529,7 +540,7 @@ dev-launch: dev-deps  ## Start the development services in the foreground, with 
 # .env in compose interpolation, which is why they must never be copied onto an `up`.
 .PHONY: dev-down
 dev-down:  ## Stop the development stack, pgAdmin included
-	PGADMIN_EMAIL=unused PGADMIN_PASS=unused $(TOOLS_COMPOSE) down --remove-orphans
+	PGADMIN_EMAIL=unused PGADMIN_PASS=unused INSTANCE_WRITE_SECRET=unused $(TOOLS_COMPOSE) down --remove-orphans
 
 .PHONY: dev-prune
 dev-prune: ## Prune development services
@@ -834,9 +845,10 @@ clean: dev-down  ## Clean up the project
 #                 WHICH FILES are read, as it does for ruff: a shell script is checked on its own, so
 #                 there is no module whose other files a rule needs. No *.sh under PATHS prints one
 #                 'not run' line and passes.
-#   lint-ts       NOT YET. PR 4 adds the fourth leg with the UI and its tooling: lint-ts and lint-fix-ts,
-#                 selected by web/, as a fourth prerequisite of lint and of lint-fix. Nothing stands in
-#                 for it before then: a leg that lints nothing is a green result with nothing behind it.
+#   lint-ts       eslint and vue-tsc over web/ (tj-grna9p.27), when PATHS covers web/ (the selector
+#                 below). Like proto, PATHS decides WHETHER it runs, never what it reads: the web chain is
+#                 one package and type-checks as one. It needs the pinned Node and an installed web/
+#                 (make node-install, make web-install); never a skip when selected.
 # buf lint and buf breaking have no autofix, so lint-fix-proto is buf format -w alone. lint-fix-shell
 # fixes NOTHING and says so out loud -- see the comment on that target for why shellcheck's
 # --format=diff is not a formatter and must not be applied in bulk.
@@ -854,6 +866,14 @@ _lint_word = $(call _lint_strip_slashes,$(patsubst ./%,%,$(1)))
 _lint_selects_proto = $(if $(filter . proto proto/%,$(or $(call _lint_word,$(1)),.)),yes)
 LINT_PROTO_SELECTED := $(if $(strip $(PATHS)),$(strip $(foreach word,$(PATHS),$(call _lint_selects_proto,$(word)))),yes)
 LINT_PROTO_NOT_RUN = $@: not run: PATHS=$(PATHS) does not cover proto/ (buf runs for PATHS=. or proto/...)
+
+# THE WEB SELECTOR, the proto selector's twin: SELECTED when any word is '.' or empty (or PATHS is
+# empty), 'web', or under web/. NOT SELECTED, lint-ts prints one 'not run' line and passes WITHOUT
+# looking for Node, so a component-scoped run behaves as it did before the UI existed, Node installed
+# or not.
+_lint_selects_web = $(if $(filter . web web/%,$(or $(call _lint_word,$(1)),.)),yes)
+LINT_WEB_SELECTED := $(if $(strip $(PATHS)),$(strip $(foreach word,$(PATHS),$(call _lint_selects_web,$(word)))),yes)
+LINT_WEB_NOT_RUN = $@: not run: PATHS=$(PATHS) does not cover web/ (eslint and vue-tsc run for PATHS=. or web/...)
 
 # BUF is looked up on PATH; overridable, e.g. with a stub. BUF_ERROR_FORMAT goes to buf lint and buf
 # breaking; CI passes github-actions, so findings become annotations on the pull request.
@@ -990,7 +1010,7 @@ SHELLCHECK_PATHSPEC = $(or $(strip $(PATHS)),.) ':(exclude).claude/worktrees'
 # while the target still exits 0; last means its banner is the last thing on the screen rather than
 # scrolled off by another language's output.
 .PHONY: lint
-lint: lint-python lint-shell lint-proto  ## Lint every language PATHS covers (Python: ruff; shell: shellcheck, for *.sh under PATHS; proto: buf, when PATHS is . or under proto/)
+lint: lint-python lint-shell lint-ts lint-proto  ## Lint every language PATHS covers (Python: ruff; shell: shellcheck, for *.sh under PATHS; web: eslint and vue-tsc, when PATHS is . or under web/; proto: buf, when PATHS is . or under proto/)
 
 .PHONY: lint-python
 lint-python: $(VENV_MARKER)  ## Lint and format-check Python with ruff (scope with PATHS=)
@@ -1043,6 +1063,17 @@ lint-shell:  ## shellcheck every *.sh under PATHS (nothing under PATHS: one 'not
 	echo "$(SHELLCHECK) --severity=$(SHELLCHECK_SEVERITY) --format=$(SHELLCHECK_FORMAT) ($${#files[@]} file(s): $${files[*]})"; \
 	$(SHELLCHECK) --severity=$(SHELLCHECK_SEVERITY) --format=$(SHELLCHECK_FORMAT) -- "$${files[@]}"
 
+.PHONY: lint-ts
+lint-ts:  ## eslint and vue-tsc over web/, when PATHS covers web/ (needs the pinned Node and make web-install)
+ifeq ($(LINT_WEB_SELECTED),)
+	@echo "$(LINT_WEB_NOT_RUN)"
+else
+	$(NODE_PIN_CHECK)
+	$(WEB_MODULES_CHECK)
+	$(WEB_NPM) run lint
+	$(WEB_NPM) run typecheck
+endif
+
 .PHONY: lint-proto
 lint-proto:  ## buf lint, format check and breaking vs BUF_AGAINST_REF (report-only), when PATHS covers proto/
 ifeq ($(LINT_PROTO_SELECTED),)
@@ -1056,7 +1087,7 @@ else
 endif
 
 .PHONY: lint-fix
-lint-fix: lint-fix-python lint-fix-shell lint-fix-proto  ## Apply lint fixes and formatting for every language PATHS covers (scope with PATHS=)
+lint-fix: lint-fix-python lint-fix-shell lint-fix-ts lint-fix-proto  ## Apply lint fixes and formatting for every language PATHS covers (scope with PATHS=)
 
 .PHONY: lint-fix-python
 lint-fix-python: $(VENV_MARKER)  ## Apply ruff's fixes and formatting (scope with PATHS=)
@@ -1088,6 +1119,16 @@ lint-fix-python: $(VENV_MARKER)  ## Apply ruff's fixes and formatting (scope wit
 lint-fix-shell:  ## Fixes nothing, by design: no shell formatter is pinned (see the comment above)
 	@echo "$@: nothing to apply: no shell FORMATTER is pinned -- shellcheck is a linter and has none, and its --format=diff rewrites behaviour, not whitespace."
 	@echo "$@: run 'make lint PATHS=$(PATHS)' and fix what it reports by hand; an exception is a '# shellcheck disable=CODE  # reason' on the line that needs it."
+
+.PHONY: lint-fix-ts
+lint-fix-ts:  ## Apply eslint --fix to web/, when PATHS covers web/ (needs the pinned Node and make web-install)
+ifeq ($(LINT_WEB_SELECTED),)
+	@echo "$(LINT_WEB_NOT_RUN)"
+else
+	$(NODE_PIN_CHECK)
+	$(WEB_MODULES_CHECK)
+	$(WEB_NPM) run lint -- --fix
+endif
 
 .PHONY: lint-fix-proto
 lint-fix-proto:  ## Apply buf format to proto/, when PATHS covers proto/
@@ -1200,6 +1241,157 @@ shellcheck-install:  ## Install the pinned shellcheck, checksum-verified, into S
 	resolved="$$(command -v shellcheck || true)"; \
 	[ "$$resolved" = "$$dir/shellcheck" ] || echo "make shellcheck-install: note: 'shellcheck' on PATH is $${resolved:-not found}, not $$dir/shellcheck; make lint runs the first shellcheck on PATH (or SHELLCHECK=<path>)." >&2
 
+# THE WEB CHAIN (tj-grna9p.27): Node and npm run lint, typecheck, test and build over web/. Node comes
+# from ONE authority, NODE_VERSION at the top of this file: node-install fetches that release, CI
+# installs it through node-install (so the workflow holds no version), and every web target below
+# checks the node on PATH reports it, failing and naming the remedy otherwise. Nothing generated is
+# committed: the TS from proto/ lands in gen/proto/ts (gitignored) and the npm scripts' pre-scripts
+# regenerate it before typecheck, test, build and dev, so a clean build is rm -rf gen/proto/ts and
+# running them; there is no staleness check to run, only the regeneration.
+# THE TARGETS NEVER TOUCH THE NETWORK EXCEPT web-install, node-install and web-audit. The others fail
+# with the remedy when web/node_modules is missing, as lint-proto does for buf: never a silent skip.
+NODE ?= node
+NPM ?= npm
+WEB_DIR := web
+WEB_NPM = $(NPM) --prefix $(WEB_DIR)
+
+define NODE_PIN_CHECK
+@if ! where="$$(command -v $(NODE))"; then \
+	found='none: $(NODE) is not on PATH'; \
+elif ! version="$$($(NODE) --version 2>&1)"; then \
+	found="$$where, whose --version fails: $$version"; \
+elif [ "$$version" != 'v$(NODE_VERSION)' ]; then \
+	found="node $$version at $$where"; \
+elif ! command -v $(NPM) >/dev/null; then \
+	found='node, but $(NPM) is not on PATH'; \
+else \
+	found=''; \
+fi; \
+if [ -n "$$found" ]; then \
+	echo "make $@: PATHS=$(PATHS) needs node v$(NODE_VERSION) and its npm (NODE=$(NODE), NPM=$(NPM)); found $$found." >&2; \
+	echo "  Install the pin: make node-install (checksum-verified, into $(NODE_INSTALL_DIR); NODE_INSTALL_DIR= to change it)," >&2; \
+	echo "  or rebuild the agent image, which installs it at /usr/local/bin/node." >&2; \
+	exit 1; \
+fi
+endef
+
+define WEB_MODULES_CHECK
+@[ -d $(WEB_DIR)/node_modules ] || { \
+	echo "make $@: $(WEB_DIR)/node_modules is missing; run 'make web-install' (npm ci) first." >&2; \
+	exit 1; }
+endef
+
+.PHONY: web-install
+web-install:  ## npm ci in web/ (exact lockfile install; the network step of the web chain)
+	$(NODE_PIN_CHECK)
+	$(WEB_NPM) ci
+
+.PHONY: gen-proto-ts
+gen-proto-ts:  ## Generate gen/proto/ts from proto/ (never committed; typecheck, test and build run it first)
+	$(NODE_PIN_CHECK)
+	$(WEB_MODULES_CHECK)
+	$(WEB_NPM) run gen:proto
+
+.PHONY: web-lint
+web-lint:  ## eslint over web/
+	$(NODE_PIN_CHECK)
+	$(WEB_MODULES_CHECK)
+	$(WEB_NPM) run lint
+
+.PHONY: web-typecheck
+web-typecheck:  ## vue-tsc over web/ (the script regenerates gen/proto/ts first)
+	$(NODE_PIN_CHECK)
+	$(WEB_MODULES_CHECK)
+	$(WEB_NPM) run typecheck
+
+.PHONY: web-test
+web-test:  ## vitest over web/ (the script regenerates gen/proto/ts first)
+	$(NODE_PIN_CHECK)
+	$(WEB_MODULES_CHECK)
+	$(WEB_NPM) run test
+
+.PHONY: web-build
+web-build:  ## vite build of web/ into web/dist (the script regenerates gen/proto/ts first)
+	$(NODE_PIN_CHECK)
+	$(WEB_MODULES_CHECK)
+	$(WEB_NPM) run build
+
+# THE npm AUDIT, in two parts, in this order so both always print (architect ruling on tj-grna9p.27).
+# The report is the FULL audit, dev tooling included, REPORT-ONLY: its findings are dev-only, tracked
+# as a risk bead (tj-s5dqya), and must not turn CI red. The gate is --omit=dev at --audit-level=high:
+# runtime dependencies ship in the bundle, so zero tolerance at high. It is here and not in `make
+# security` because that target is Python-only, needs no Node, and is the identical line to CI's
+# security job; the web CI job calls this one. It queries the npm registry, so it needs the network.
+.PHONY: web-audit
+web-audit:  ## npm audit: full report (report-only), then the blocking runtime gate (--omit=dev --audit-level=high)
+	$(NODE_PIN_CHECK)
+	$(WEB_MODULES_CHECK)
+	@echo "web-audit: full npm audit, dev tooling included: REPORT-ONLY, findings here never fail the target (risk tj-s5dqya)."
+	-$(WEB_NPM) audit
+	@echo "web-audit: blocking gate: npm audit --omit=dev --audit-level=high."
+	$(WEB_NPM) audit --omit=dev --audit-level=high
+
+# Everything CI's web job runs, in CI's order, from a clean checkout. Sequenced through $(MAKE) so the
+# order holds under make -j.
+.PHONY: web-check
+web-check:  ## The whole web chain: web-install, gen-proto-ts, web-lint, web-typecheck, web-test, web-build, web-audit
+	$(MAKE) web-install
+	$(MAKE) gen-proto-ts
+	$(MAKE) web-lint
+	$(MAKE) web-typecheck
+	$(MAKE) web-test
+	$(MAKE) web-build
+	$(MAKE) web-audit
+
+# THE ONE TARGET THAT DOWNLOADS NODE, on buf-install's rule and with its guarantees: Linux x86_64 and
+# aarch64 only, failing naming the platform; the tarball is sha256-verified against the pin and run to
+# check it reports NODE_VERSION; a mismatch deletes the download and leaves any installed node
+# untouched. The release is a .tar.gz holding node-v<version>-linux-<arch>/ (bin, lib, ...): it is
+# extracted into NODE_HOME_DIR/node-v<version>, and node, npm and npx are symlinked into
+# NODE_INSTALL_DIR (default ~/.local/bin, first on the agent image's PATH; CI adds its directory to
+# GITHUB_PATH). The symlinks are replaced by rename, atomic within a directory.
+NODE_RELEASE_URL ?= https://nodejs.org/dist
+NODE_INSTALL_DIR ?= $(HOME)/.local/bin
+NODE_HOME_DIR ?= $(HOME)/.local/lib/nodejs
+
+.PHONY: node-install
+node-install:  ## Install the pinned Node, checksum-verified (symlinks into NODE_INSTALL_DIR, default ~/.local/bin; the only target that downloads it)
+	@set -euo pipefail; \
+	platform="$$(uname -s) $$(uname -m)"; \
+	case "$$platform" in \
+		'Linux x86_64') arch=x64; sum='$(NODE_SHA256_X86_64)' ;; \
+		'Linux aarch64') arch=arm64; sum='$(NODE_SHA256_AARCH64)' ;; \
+		*) echo "make node-install: no node checksum pinned for $$platform; node is pinned for Linux x86_64 and Linux aarch64 only (NODE_SHA256_* in the Makefile)." >&2; exit 1 ;; \
+	esac; \
+	name="node-v$(NODE_VERSION)-linux-$$arch"; \
+	url='$(NODE_RELEASE_URL)/v$(NODE_VERSION)/'"$$name.tar.gz"; \
+	bin='$(NODE_INSTALL_DIR)'; \
+	home='$(NODE_HOME_DIR)'; \
+	mkdir -p "$$bin" "$$home"; \
+	work="$$(mktemp -d "$$home/.node-install.XXXXXX")"; \
+	trap 'rm -rf "$$work"' EXIT; \
+	echo "make node-install: fetching $$url"; \
+	curl -fsSL -o "$$work/node.tar.gz" "$$url"; \
+	if ! printf '%s  %s\n' "$$sum" "$$work/node.tar.gz" | sha256sum -c --status -; then \
+		echo "make node-install: checksum mismatch for $$url: expected $$sum, got $$(sha256sum "$$work/node.tar.gz" | cut -d ' ' -f 1). Deleted the download; $$bin is untouched." >&2; \
+		exit 1; \
+	fi; \
+	tar -xzf "$$work/node.tar.gz" -C "$$work"; \
+	found="$$("$$work/$$name/bin/node" --version 2>&1)" || found="a failing --version ($$found)"; \
+	if [ "$$found" != 'v$(NODE_VERSION)' ]; then \
+		echo "make node-install: $$url matches its pinned checksum but reports version $$found, not v$(NODE_VERSION): NODE_VERSION and NODE_SHA256_* disagree. Deleted the download; $$bin is untouched." >&2; \
+		exit 1; \
+	fi; \
+	rm -rf "$$home/$$name"; \
+	mv "$$work/$$name" "$$home/$$name"; \
+	for tool in node npm npx; do \
+		ln -sfn "$$home/$$name/bin/$$tool" "$$bin/.$$tool.node-install"; \
+		mv -f "$$bin/.$$tool.node-install" "$$bin/$$tool"; \
+	done; \
+	echo "make node-install: installed node $$("$$bin/node" --version) at $$home/$$name, linked into $$bin (sha256 $$sum)"; \
+	resolved="$$(command -v node || true)"; \
+	[ "$$resolved" = "$$bin/node" ] || echo "make node-install: note: 'node' on PATH is $${resolved:-not found}, not $$bin/node; the web targets run the first node on PATH (or NODE=<path>)." >&2
+
 # ./tools holds the agent-stack MCP server (tools/agent_mcp, ADR tj-4rr0la section 6): build
 # tooling, but it holds Docker access, so bandit reads it like production source.
 # ./gen/proto/python is generated and never committed, but the image copies it and runs it, so
@@ -1255,9 +1447,27 @@ security: $(VENV_MARKER) proto  ## Check security vulnerabilities
 PYTEST_ENV := POSTGRES_ASYNC=true POSTGRES_SYNC=true
 PYTEST := $(PYTEST_ENV) uv run pytest
 
+# THE WEB WORDS OF PATHS (tj-grna9p.27). `make test PATHS=web` (or web/...) runs vitest through web-test
+# and NOT pytest; PATHS=. and every other word stay pytest's alone, exactly as before the UI existed,
+# so a component-scoped or whole-tree run needs no Node. A mixed PATHS runs both, each on its own
+# words. When no word is left for pytest it is not run at all, and neither is the venv or `make
+# proto` it would need: a web-only run needs Node and web/node_modules, nothing else. vitest runs
+# the whole web suite whatever the path under web/ (the scripts take no path).
+TEST_WEB_WORDS := $(filter web web/% ./web ./web/%,$(PATHS))
+TEST_PY_WORDS := $(filter-out web web/% ./web ./web/%,$(PATHS))
+TEST_PY_SELECTED := $(if $(strip $(PATHS)),$(strip $(TEST_PY_WORDS)),yes)
+TEST_PY_PREREQS = $(if $(TEST_PY_SELECTED),$(VENV_MARKER) proto)
+
 .PHONY: test
-test: $(VENV_MARKER) proto  ## Run the PR gate: every test except `external` (scope with PATHS=)
-	$(PYTEST) $(PATHS)
+test: $(TEST_PY_PREREQS)  ## Run the PR gate: every test except `external`; PATHS=web runs vitest instead (scope with PATHS=)
+ifneq ($(TEST_PY_SELECTED),)
+	$(PYTEST) $(TEST_PY_WORDS)
+else
+	@echo "test: pytest not run: PATHS=$(PATHS) names only web/ (vitest runs; no venv, no proto, python is not touched)"
+endif
+ifneq ($(strip $(TEST_WEB_WORDS)),)
+	$(MAKE) web-test
+endif
 
 # coverage has to own the invocation -- `coverage run -m pytest` -- so this takes the env
 # prefix rather than $(PYTEST). pytest.ini still applies, so the selected set is identical.

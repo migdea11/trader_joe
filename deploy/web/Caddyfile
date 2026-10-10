@@ -1,0 +1,106 @@
+# The web container's whole job (decisions tj-grna9p.5, .6, .7; bead tj-grna9p.26): serve the built
+# SPA, and reverse-proxy the UI's read routes to data_store with the instance secret added on the way.
+#
+# WHAT IS PROXIED, AND THE MAPPING. The browser calls /api/store/<route>; data_store serves <route>
+# with no prefix (/ui/v1/config, /ui/v1/datasets, ...). The prefix exists only so the SPA's one origin
+# can tell data_store's routes from its own static files and leaves room for others. It is stripped
+# here, so /api/store/ui/v1/config reaches data_store as /ui/v1/config, as the
+# Vite dev proxy in web/vite.config.ts does with its rewrite.
+# Only /api/store/ui/v1/* is forwarded: data_store's other routes (/store/* dataset reads and writes,
+# /internal/*, /docs, /ping, /latency) are not the UI's and stay unreachable from a browser, so the
+# secret below is never offered to them. Only GET and HEAD pass: no UI route writes in PR 4, and the
+# secret authenticates writes, so a browser on this network cannot use the proxy as a write path.
+# When the UI grows a write, widen exactly that one route and method here and nowhere else.
+#
+# NOTHING FOR data_ingest. There is no data_ingest upstream in this file and the web container is not
+# on a network data_ingest shares (docker-compose.web.yaml joins store_api only), so a route to it
+# could not work even if one were added. Every UI call goes through data_store.
+#
+# THE SECRET. header_up SETS X-Instance-Secret on the upstream request from the container's
+# environment, replacing any value the browser sent. The browser never receives it: it is a request
+# header to the upstream, never in a response, a static file, the image or this file. Caddy reads the
+# environment at start; compose supplies it (INSTANCE_WRITE_SECRET, required there). No access log
+# records it: the log below deletes the header from the logged request even if a client sent one.
+#
+# AUTH. None here, by ruling tj-grna9p.6: access is network-only (Meshnet plus the host firewall) in
+# PR 4, and a login (tj-3x21xj) comes later. docker-compose.web.yaml publishes the port on loopback
+# unless WEB_BIND_HOST says otherwise.
+#
+# The listener is :8080 plain HTTP -- TLS is not terminated here, auto HTTPS is off, and the admin
+# API is off so no config endpoint exists to reach.
+{
+	admin off
+	auto_https off
+}
+
+:8080 {
+	encode zstd gzip
+
+	log {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>headers>X-Instance-Secret delete
+			}
+		}
+	}
+
+	# Headers normal for a static SPA served over plain HTTP: no HSTS (meaningless without TLS).
+	# style-src allows 'unsafe-inline' because PrimeVue injects its theme as <style>; scripts stay
+	# 'self' only. connect-src 'self' covers fetch and the same-origin WebSocket.
+	header {
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+		Cross-Origin-Opener-Policy "same-origin"
+		Cross-Origin-Resource-Policy "same-origin"
+		-Server
+	}
+
+	# The container healthcheck's target. Answered here, never proxied, so it says the web server is
+	# up and nothing about data_store.
+	handle /healthz {
+		respond "ok" 200
+	}
+
+	# A traversal attempt never reaches the upstream, whatever the route.
+	@traversal path *..*
+	handle @traversal {
+		respond "bad request" 400
+	}
+
+	# THE ONE PROXIED ROUTE. See the header for the mapping and the method restriction.
+	@store_ui {
+		method GET HEAD
+		path /api/store/ui/v1/*
+	}
+	handle @store_ui {
+		uri strip_prefix /api/store
+		reverse_proxy {$DATA_STORE_UPSTREAM} {
+			header_up X-Instance-Secret "{$INSTANCE_WRITE_SECRET}"
+			# A response from the upstream is never cached by the browser or a shared cache: the
+			# data is live.
+			header_down Cache-Control "no-store"
+		}
+	}
+
+	# Everything else under /api/ -- another method, another data_store route, a data_ingest path --
+	# ends here rather than falling through to the SPA's index.html.
+	handle /api/* {
+		respond "not found" 404
+	}
+
+	# The SPA: real files as they are, any other path to index.html so the router's history mode works.
+	handle {
+		root * /srv
+		@assets path /assets/*
+		header @assets Cache-Control "public, max-age=31536000, immutable"
+		@shell not path /assets/*
+		header @shell Cache-Control "no-cache"
+		try_files {path} /index.html
+		file_server
+	}
+}
