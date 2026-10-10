@@ -269,16 +269,19 @@ def _equality_conditions(values: dict, columns: tuple[str, ...]) -> list:
 async def _find_own_overlap(db: AsyncSession, field_values: dict) -> list[uuid.UUID]:
     """Find existing entries of the SAME owner whose range overlaps this request's, excluding an exact repeat.
 
-    The formula, from the ADR (tj-vhboky.1 section 3):
+    Ranges are half-open, [start, end). The formula, from the ADR (tj-vhboky.1 section 3 as amended
+    by the addendum HALF-OPEN RANGES, 2026-09-30):
 
-        existing.start <= request.end AND existing.end >= request.start
+        existing.start < request.end AND existing.end > request.start
         AND NOT (existing.start = request.start AND existing.end = request.end)
+
+    so two ranges that merely touch (one's end equals the other's start) do NOT overlap.
 
     `end` uses the EPOCH sentinel for "no end", not a NULL (common/database/
     sql_alchemy_nullable_datetime.py: None in the schema maps to 1970-01-01 in the column, so two
     open-ended entries still collide on the unique key). EPOCH is far in the PAST, so a naive
-    `existing.end >= request.start` reads backwards for an open-ended EXISTING entry, and a naive
-    `existing.start <= request.end` reads backwards for an open-ended REQUEST. Both are handled
+    `existing.end > request.start` reads backwards for an open-ended EXISTING entry, and a naive
+    `existing.start < request.end` reads backwards for an open-ended REQUEST. Both are handled
     explicitly rather than compared as literal values.
 
     FEED IS NOT ONE OF THE EQUALITY TERMS (tj-xn3qa6 D1). See OverlapKey for why: this asks whether
@@ -299,12 +302,12 @@ async def _find_own_overlap(db: AsyncSession, field_values: dict) -> list[uuid.U
     new_end = field_values['end']
 
     conditions = _equality_conditions(field_values, _OVERLAP_EQUALITY_COLUMNS)
-    # existing.end >= request.start, with an open-ended existing entry (end == EPOCH) always
-    # satisfying it: an entry with no declared end covers everything from its start onward.
-    conditions.append(or_(StoreDatasetEntry.end == NullableDateTime.EPOCH, StoreDatasetEntry.end >= new_start))
+    # existing.end > request.start (strict, half-open), with an open-ended existing entry (end ==
+    # EPOCH) always satisfying it: an entry with no declared end covers everything from its start onward.
+    conditions.append(or_(StoreDatasetEntry.end == NullableDateTime.EPOCH, StoreDatasetEntry.end > new_start))
     if new_end != NullableDateTime.EPOCH:
-        # existing.start <= request.end, only when the request itself has a declared end.
-        conditions.append(StoreDatasetEntry.start <= new_end)
+        # existing.start < request.end (strict), only when the request itself has a declared end.
+        conditions.append(StoreDatasetEntry.start < new_end)
     # else: the request is open-ended, so nothing can start "after" its end -- no upper-bound
     # predicate is needed; every existing start already satisfies it.
     conditions.append(not_(and_(StoreDatasetEntry.start == new_start, StoreDatasetEntry.end == new_end)))
@@ -544,10 +547,33 @@ async def update_entry_lifecycle(db: AsyncSession, id: uuid.UUID, owner: str) ->
 
 
 async def get_entry_by_id(db: AsyncSession, id: uuid.UUID) -> asset_dataset_store.AssetDatasetStore:
-    """Retrieve an entry by its ID."""
-    stmt = select(StoreDatasetEntry).where(StoreDatasetEntry.id == id)
-    result = await db.execute(stmt)
-    return asset_dataset_store.AssetDatasetStore.model_validate(result.first())
+    """Retrieve an entry by its ID, with its bar count, as GET /store/{id} answers it (tj-967trx).
+
+    Shaped exactly like one element of search_entries: the entry whole, plus item_count from an OUTER join so
+    an entry with no bars reads 0 rather than vanishing. This used to hand a Row to model_validate, which
+    never worked (tj-b2uqfl), and had no caller.
+
+    Args:
+        db: The session.
+        id: The entry's id.
+
+    Returns:
+        asset_dataset_store.AssetDatasetStore: The entry.
+
+    Raises:
+        EntryNotFound: If no entry has this id (NOT_FOUND, a 404 at the edge).
+    """
+    stmt = (
+        select(StoreDatasetEntry, func.count(StockMarketActivity.id).label('item_count'))
+        .outerjoin(StockMarketActivity, StoreDatasetEntry.id == StockMarketActivity.dataset_id)
+        .where(StoreDatasetEntry.id == id)
+        .group_by(StoreDatasetEntry.id)
+    )
+    found = (await db.execute(stmt)).first()
+    if found is None:
+        raise EntryNotFound(id)
+    entry, item_count = found
+    return entry.to_validated_schema(asset_dataset_store.AssetDatasetStore, additional={'item_count': item_count})
 
 
 async def search_entries(

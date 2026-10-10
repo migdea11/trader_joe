@@ -114,6 +114,12 @@ services:
       # and :-50051 is the real in-network port. environment: outranks env_file:, so no env file
       # can strand the client.
       - DATA_INGEST_GRPC_TARGET=data-ingest-grpc:${DATA_INGEST_GRPC_PORT:-50051}
+      # Read by GET /ui/v1/config (server/data/store/app/ui_config.py). Bare keys: compose passes
+      # the value from the shell or the project .env, and omits the variable when neither sets it,
+      # so the route's own fallbacks stay in force. No ":-" default here, on purpose -- a default
+      # would mask them.
+      - DEPLOYMENT_LABEL
+      - SERVER_VERSION
     image: trader_joe_data_store:latest
     security_opt:
       - "no-new-privileges:true"

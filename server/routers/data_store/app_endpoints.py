@@ -24,3 +24,20 @@ class AssetDatasetStoreInterface(StrEnum):
 
     GET_STORE_ASSET_DATASET_BY_ID = '/store/{id}'
     DELETE_STORE_ASSET_DATASET_BY_ID = '/store/{id}'
+
+
+class UiDatasetsInterface(StrEnum):
+    """The /ui/v1 read routes of the Data section (tj-grna9p.20). Served as protobuf canonical JSON."""
+
+    GET_UI_DATASETS = '/ui/v1/datasets'
+    # Declared and registered BEFORE the by-id path: a router matches in order, and 'facets' would
+    # otherwise be taken as a dataset id.
+    GET_UI_DATASET_FACETS = '/ui/v1/datasets/facets'
+    GET_UI_DATASET = '/ui/v1/datasets/{dataset_id}'
+    GET_UI_DATASET_BARS = '/ui/v1/datasets/{dataset_id}/bars'
+
+
+class UiConfigInterface(StrEnum):
+    """The shell's configuration read (tj-grna9p.45). Served as protobuf canonical JSON."""
+
+    GET_UI_CONFIG = '/ui/v1/config'

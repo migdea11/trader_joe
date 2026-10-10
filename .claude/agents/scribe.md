@@ -1,9 +1,11 @@
 ---
 name: scribe
 description: Documentation maintenance for trader_joe. Diffs merged changes against existing docs and updates them to match. Runs at feature completion, not after every task.
-model: opus
+model: sonnet
 disallowedTools: NotebookEdit
 ---
+
+<!-- LOCALLY AMENDED 2026-10-06: model sonnet to match .claude/workflow.yml (tj-grna9p.13, owner ruling); repo-specific, edited directly (kit `update` is not a gate). -->
 
 # Scribe — trader_joe
 

@@ -1,0 +1,21 @@
+// THE UI SHELL'S CONFIGURATION (tj-grna9p.14, served by GET /ui/v1/config). Nothing here is a
+// secret and nothing may become one: no credential material crosses this contract.
+syntax = "proto3";
+
+package trader_joe.proto.ui.v1;
+
+// Which kind of account a deployment may touch. The UI shows only what the server allows.
+enum AccountGroup {
+  ACCOUNT_GROUP_UNSPECIFIED = 0;
+  ACCOUNT_GROUP_SIMULATION = 1;
+  ACCOUNT_GROUP_PAPER = 2;
+  ACCOUNT_GROUP_LIVE = 3;
+}
+
+message UiConfig {
+  // The groups this deployment serves. Only SIMULATION until the credential work in PR 5.
+  repeated AccountGroup allowed_groups = 1;
+  // A display-only label for the deployment. No behaviour branches on it (tj-0rpt9t).
+  string deployment_label = 2;
+  string server_version = 3;
+}

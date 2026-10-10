@@ -1,0 +1,153 @@
+// THE UI'S DATA VOCABULARY, PHASE 1 (tj-grna9p.14): datasets, their facets, and bar pages, as the
+// web UI reads them over /ui/v1 (canonical protobuf JSON). It imports the shared market vocabulary
+// (market/v1) and never restates a Bar or an enum from it. Later phases add messages and fields
+// ADDITIVELY -- buf breaking runs against main for this package -- so nothing here is renumbered.
+//
+// HALF-OPEN RANGES. Every range in this file is [start, end): the start is included and the end is
+// excluded, matching the store (tj-86g751). A range is never empty or inverted: end is after start.
+//
+// NO CREDENTIAL MATERIAL crosses here, and none may be added: owner is a free-text label, not a key.
+syntax = "proto3";
+
+package trader_joe.proto.ui.v1;
+
+import "google/protobuf/timestamp.proto";
+import "trader_joe/proto/market/v1/bar.proto";
+import "trader_joe/proto/market/v1/enums.proto";
+
+// How a dataset's rows expire. Mirrors common.enums.data_stock.ExpiryType by member NAME. It is
+// defined here, not in market/v1, because only the UI contract carries it (tj-grna9p.14); the zero
+// value exists for proto3 only and is never a real expiry type.
+enum ExpiryType {
+  EXPIRY_TYPE_UNSPECIFIED = 0;
+  EXPIRY_TYPE_BULK = 1;
+  EXPIRY_TYPE_BUFFER_1K = 2;
+  EXPIRY_TYPE_BUFFER_10K = 3;
+  EXPIRY_TYPE_BUFFER_100K = 4;
+  EXPIRY_TYPE_ROLLING = 5;
+}
+
+// Whether the dataset is being kept. A dataset whose expiry has been set on a DAILY or STREAM
+// subscription is RETIRED: it no longer collects, and is deleted on its expiry.
+enum DatasetState {
+  DATASET_STATE_UNSPECIFIED = 0;
+  DATASET_STATE_ACTIVE = 1;
+  DATASET_STATE_RETIRED = 2;
+}
+
+// The server's computed judgement of how current or complete a dataset is. Computed on read, never
+// stored (tj-grna9p.8). The UI words differ: OVERDUE is shown as Failed, LATE as Late, and so on.
+enum FreshnessStatus {
+  FRESHNESS_STATUS_UNSPECIFIED = 0;
+  // DAILY or STREAM: the last bar is at or after expected_last_bar.
+  FRESHNESS_STATUS_FRESH = 1;
+  // DAILY: awaiting the next session's collection deadline; not yet a failure.
+  FRESHNESS_STATUS_LATE = 2;
+  // A missed collection deadline: a failure. Named OVERDUE, not STALE, because the UI uses Stale
+  // for datasets nobody reads (usage), which is a different thing.
+  FRESHNESS_STATUS_OVERDUE = 3;
+  // STATIC: every session in [start, end) has at least one bar.
+  FRESHNESS_STATUS_COMPLETE = 4;
+  // STATIC: some sessions in [start, end) have no bar; see gap_count.
+  FRESHNESS_STATUS_GAPS = 5;
+  // The dataset is retired: it has no freshness.
+  FRESHNESS_STATUS_RETIRED = 6;
+}
+
+// Freshness or completeness of one dataset, computed over its trading calendar at as_of.
+message Freshness {
+  FreshnessStatus status = 1;
+  // DAILY and STREAM only, and not a session close. DAILY: the local midnight (calendar time zone)
+  // of the session that should be stored, i.e. the timestamp its daily bar carries. STREAM: the
+  // oldest last-bar instant that still reads FRESH.
+  google.protobuf.Timestamp expected_last_bar = 2;
+  // STATIC only (status GAPS): how many sessions in [start, end) have no bar. Zero otherwise.
+  int32 gap_count = 3;
+  // The server time this was computed at.
+  google.protobuf.Timestamp as_of = 4;
+}
+
+// The same series at another bar width, so the UI can offer a switch without a second listing.
+message DatasetSibling {
+  string id = 1;
+  trader_joe.proto.market.v1.Granularity granularity = 2;
+}
+
+// One dataset, as the catalog lists it and the viewer opens it.
+message DatasetSummary {
+  // The dataset's UUID, as text.
+  string id = 1;
+  string asset_symbol = 2;
+  trader_joe.proto.market.v1.AssetType asset_type = 3;
+  trader_joe.proto.market.v1.DataType data_type = 4;
+  trader_joe.proto.market.v1.DataSource source = 5;
+  trader_joe.proto.market.v1.Feed feed = 6;
+  trader_joe.proto.market.v1.Granularity granularity = 7;
+
+  // The requested range, half-open [start, end): start included, end excluded. end is always set;
+  // for an open-ended dataset it is the server time of the read, or one microsecond after start when the
+  // dataset starts in the future (end is never before start).
+  google.protobuf.Timestamp start = 8;
+  google.protobuf.Timestamp end = 9;
+
+  trader_joe.proto.market.v1.UpdateType update_type = 10;
+  ExpiryType expiry_type = 11;
+  // When the dataset is deleted. Unset only when nothing is scheduled.
+  google.protobuf.Timestamp expiry = 12;
+  // A free-text label for who asked for the dataset ('operator' for the UI). Never a credential.
+  string owner = 13;
+  DatasetState state = 14;
+
+  // The stored data's extent. first_bar and last_bar are bar_start times of the first and last bar
+  // (inclusive, so last_bar is NOT the exclusive end of a range). Unset when bar_count is zero.
+  google.protobuf.Timestamp first_bar = 15;
+  google.protobuf.Timestamp last_bar = 16;
+  int64 bar_count = 17;
+
+  Freshness freshness = 18;
+
+  // Other granularities held for the same symbol, source, feed and data type. Excludes this one.
+  repeated DatasetSibling siblings = 19;
+}
+
+// One page of the catalog. Keyset paging over (asset_symbol, id); the cursor is opaque.
+message DatasetPage {
+  repeated DatasetSummary items = 1;
+  // Pass back to fetch the next page; empty on the last page.
+  string next_cursor = 2;
+}
+
+// A count for one filter value, over the datasets matching the other active filters.
+message SourceFacet {
+  trader_joe.proto.market.v1.DataSource source = 1;
+  int64 count = 2;
+}
+
+message UpdateTypeFacet {
+  trader_joe.proto.market.v1.UpdateType update_type = 1;
+  int64 count = 2;
+}
+
+message StatusFacet {
+  FreshnessStatus status = 1;
+  int64 count = 2;
+}
+
+// The sidebar's counts: per saved view and per filter option, so a count always equals the total
+// the matching list would return.
+message DatasetFacets {
+  // The All Datasets view.
+  int64 all = 1;
+  // The Needs Attention view: freshness LATE, OVERDUE or GAPS (the UI's Late or Failed, tj-grna9p.60).
+  int64 needs_attention = 2;
+  repeated SourceFacet sources = 3;
+  repeated UpdateTypeFacet update_types = 4;
+  repeated StatusFacet statuses = 5;
+}
+
+// One page of a dataset's bars, ascending by bar_start, within the requested half-open [start, end).
+message BarPage {
+  repeated trader_joe.proto.market.v1.Bar bars = 1;
+  // Pass back to fetch the next page; empty on the last page.
+  string next_cursor = 2;
+}

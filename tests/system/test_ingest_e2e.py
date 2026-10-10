@@ -13,10 +13,10 @@ EVERY ENTRY HERE IS CREATED BY THE DATASET POST, the one route that reaches data
 upserts the entry, asks data_ingest over the FetchDataset gRPC stream, and writes the bars it gets
 back -- the Kafka RPC it used to ask over went on tj-3mk3u5.11 and .12. Entry ids
 are read by SQL (the POST answers with a count, not an id) and adopted for cleanup whether or not
-the POST succeeded. Bars are read back over HTTP, FILTERED BY dataset_id: data_store's read is
-closed at end while the broker range is half-open (tj-j4wknb addendum 5; tj-6w07z8 open), so an
-unfiltered read over two owners' overlapping ranges would show the other entry's bar at this
-entry's end and make a comparison lie.
+the POST succeeded. Bars are read back over HTTP, FILTERED BY dataset_id: the store's read is
+half-open [start, end) like the broker range since tj-86g751.3 (tj-j4wknb addendum 5), but two
+owners' overlapping ranges still share instants, so an unfiltered read would mix the other
+entry's bars into this entry's and make a comparison lie.
 
 WHAT A STORED BAR MUST EQUAL is computed here from the generator, tests.fakes.market_data's
 grid_timestamps and fake_bar, over the request's [start, end) -- deliberately NOT by calling

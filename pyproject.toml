@@ -116,6 +116,13 @@ data-ingest = [
 data-store = [
     "alembic>=1.20.0",
     "asyncpg>=0.31.0",
+    # The trading calendar the freshness and completeness rules read (decision tj-grna9p.8 item 3):
+    # offline, Apache-2.0, XNYS and XTSE among others. data-store only; no other group installs it.
+    "exchange-calendars>=4.13.2",
+    # Imported directly by data/store/app/freshness.py (calendar session and timestamp arithmetic);
+    # it also arrives through exchange-calendars, but this repo declares what its code imports
+    # (common/tests/test_declared_imports.py). A floor, matching the lock's 3.0.6.
+    "pandas>=3.0.6",
     "psycopg2-binary>=2.9.13",
     # The [asyncio] extra, not the plain distribution: the async store imports
     # sqlalchemy.ext.asyncio, which runs on greenlet. Plain sqlalchemy declares greenlet

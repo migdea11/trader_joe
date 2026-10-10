@@ -101,7 +101,8 @@ async def read_stock_market_activity_data(
 
     dataset_id, asset_symbol, source, feed and granularity each filter on an exact match when
     given; an absent parameter puts no constraint on that column (tj-vhboky.1 section 8). start
-    and end bound the timestamp range and are INCLUSIVE (timestamp >= start, timestamp <= end);
+    and end bound the timestamp range, which is HALF-OPEN (timestamp >= start, timestamp < end;
+    tj-vhboky.1 addendum HALF-OPEN RANGES);
     both are AwareDatetime, so a naive start or end is refused with a 422 (loc ['query',
     '<field>'], type timezone_aware), and an unknown parameter is refused with a 422 (loc ['query',
     '<name>'], type extra_forbidden), both before the handler runs. Results are ordered by

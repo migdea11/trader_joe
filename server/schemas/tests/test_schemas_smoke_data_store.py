@@ -2183,6 +2183,92 @@ def test_rule_b_a_non_static_update_with_a_non_bulk_expiry_and_no_end_is_accepte
 
 
 # ---------------------------------------------------------------------------------------------
+# HALF-OPEN RANGES (tj-86g751.4): validate_range_is_not_empty refuses end <= start
+# ---------------------------------------------------------------------------------------------
+#
+# The design is tj-vhboky.1 addendum HALF-OPEN RANGES (2026-09-30), item 3, accepted by the user
+# (epic tj-86g751, 04:11 UTC 2026-09-30): every data_store range is [start, end), so a create whose
+# declared end is not after its start names an entry nothing can ever fill, and is refused. end None
+# (open-ended) is untouched, and the READ queries are not covered by it -- an empty read window is a
+# valid query that returns nothing (addendum item 1). The route half (422, loc ['body']) is in
+# data/store/tests/test_store_dataset_entry_route.py; the read half is in
+# data/store/tests/test_filtering_read.py, test_an_empty_window_is_a_valid_query_that_admits_no_bar.
+_PLUS_FIVE = timezone(timedelta(hours=5))
+_TICK = timedelta(microseconds=1)
+
+# (end, id): each is NOT after WHEN (the payload's start) as an INSTANT. The +05:00 cases are the
+# ones a wall-clock compare would get wrong: their wall clock reads later than WHEN's.
+_NOT_AFTER_START = [
+    (WHEN, 'end-equals-start'),
+    (WHEN - _TICK, 'end-one-microsecond-before-start'),
+    (WHEN - timedelta(days=30), 'end-well-before-start'),
+    (WHEN.astimezone(_PLUS_FIVE), 'end-equals-start-written-at-plus-five'),
+    ((WHEN - _TICK).astimezone(_PLUS_FIVE), 'end-before-start-written-at-plus-five'),
+]
+
+
+@pytest.mark.parametrize('end', [end for end, _ in _NOT_AFTER_START], ids=[name for _, name in _NOT_AFTER_START])
+@pytest.mark.parametrize('model', _WRITE_MODELS, ids=lambda model: model.__name__)
+def test_a_create_whose_end_is_not_after_its_start_is_refused(model: type[BaseModel], end: datetime):
+    """Addendum item 3: end == start and end < start are both refused, model-level, comparing instants.
+
+    update_type is the STATIC default, so rule (a) cannot be what refuses it, and expiry_type is the
+    BULK default with STATIC, so rule (b) cannot either: exactly one error, from this validator.
+
+    Args:
+        model: The body, or one of the two write models that inherit its validator.
+        end: An end that is not after the payload's start, as an instant.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        model(**_write_payload(model) | {'end': end})
+
+    loc, error_type, message = _only_error(excinfo)
+    assert (loc, error_type) == ((), 'value_error')
+    assert "'end'" in message and "'start'" in message and 'half-open' in message, message
+
+
+@pytest.mark.parametrize(
+    'end',
+    [WHEN + _TICK, (WHEN + _TICK).astimezone(timezone(timedelta(hours=-5))), None],
+    ids=['one-microsecond-after-start', 'after-start-written-at-minus-five', 'open-ended'],
+)
+@pytest.mark.parametrize('model', _WRITE_MODELS, ids=lambda model: model.__name__)
+def test_a_create_whose_end_is_after_its_start_or_open_is_accepted(model: type[BaseModel], end: datetime | None):
+    """The positives that keep the refusal honest: the smallest non-empty range, and end None.
+
+    The -05:00 case has a wall clock EARLIER than WHEN's but names a later instant, so a validator
+    comparing wall clocks would refuse it. Without the open-ended case, a validator that refused
+    every end would pass the test above.
+
+    Args:
+        model: The body, or one of the two write models that inherit its validator.
+        end: An end strictly after the payload's start, or None.
+    """
+    built = model(**_write_payload(model) | {'end': end})
+
+    assert built.end == end
+
+
+@pytest.mark.parametrize(
+    ('model', 'scope'),
+    [(StoreAssetDatasetQuery, {}), (StockDataMarketActivityQuery, {'dataset_id': DATASET_ID})],
+    ids=['StoreAssetDatasetQuery', 'StockDataMarketActivityQuery'],
+)
+def test_an_empty_read_window_is_still_a_valid_query(model: type[BaseModel], scope: dict[str, Any]):
+    """Addendum item 1: start == end on a READ query is accepted; the refusal is for creates only.
+
+    Both read models carry start and end; neither may inherit the create's validator.
+
+    Args:
+        model: A read query model with start and end filters.
+        scope: Whatever else the model requires (the bar query needs a selector).
+    """
+    built = model(**scope, start=WHEN, end=WHEN)
+
+    assert (built.start, built.end) == (WHEN, WHEN)
+
+
+# ---------------------------------------------------------------------------------------------
 # M1 (tj-vhboky.32): what the v2 serializer that replaced json_encoders must also keep
 # ---------------------------------------------------------------------------------------------
 #

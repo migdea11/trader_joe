@@ -10,8 +10,8 @@ WHAT THE SCENARIO COVERS, and why each is there:
     old six-column ENTRY key collision and, because both datasets hold a bar at every instant, the
     old four-column BAR key collision (E4 in tj-vhboky.55);
   * two owners over OVERLAPPING, different ranges (ZZSEEDAA, mid-February onward), so ranges
-    overlap without being equal. No owner overlaps itself: the store refuses that with a 409, and
-    its check is inclusive at both ends, so even two adjacent ranges of one owner would refuse;
+    overlap without being equal. No owner overlaps itself: the store refuses that with a 409. Its
+    check is half-open, so two ADJACENT ranges of one owner do not collide (none are seeded);
   * a differing expiry_type (ROLLING against BULK) on ZZSEEDBB;
   * one EMPTY_ range (an entry that holds no bars) and one GAPS_ range (every other bar missing);
   * one 1hour dataset, so more than one granularity is present; everything else is default.

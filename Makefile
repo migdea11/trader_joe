@@ -57,6 +57,20 @@ SHELLCHECK_VERSION := 0.11.0
 SHELLCHECK_SHA256_X86_64 := b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6
 SHELLCHECK_SHA256_AARCH64 := 68a8133197a50beb8803f8d42f9908d1af1c5540d4bb05fdfca8c1fa47decefc
 
+# THE NODE PIN (tj-grna9p.97). Same shape as the buf pin above, and this file is its one authority.
+# Node (and the npm it bundles) runs the web chain in /web -- npm ci, lint, typecheck, test, build --
+# for builder-ui and the web validator inside an agent worktree. Node 24 "Krypton" is the Active LTS
+# line; v24.21.0 (2026-09-07) is its newest release, bundling npm 11.19.0, read from
+# https://nodejs.org/dist/index.json. The checksums are the release's own SHASUMS256.txt lines for the
+# node-v<version>-linux-<arch>.tar.gz archives (https://nodejs.org/dist/v24.21.0/SHASUMS256.txt).
+# THE ONE MIRROR is .devcontainer/Dockerfile's node RUN, whose build context is .devcontainer/ and so
+# cannot read this file. The root Dockerfile's web build stage and CI take this same version; npm is
+# not pinned separately, it is whatever the pinned Node bundles. A bump is these three values and the
+# Dockerfile's three, in one commit, then the agent-image rebuild.
+NODE_VERSION := 24.21.0
+NODE_SHA256_X86_64 := 6e1db87ef58b8819e5d5402eff1536491b18edd8eb7bee5ef7897876e88dc5ff
+NODE_SHA256_AARCH64 := 724282c3b43aec998aa9527380465b45d229e021b58035f5f4f63095eabfe5d5
+
 # THE LOCK IS FROZEN BY DEFAULT (tj-3zh7ss). Exported, so every uv below -- and every uv those
 # recipes start -- installs from uv.lock exactly as committed and never re-resolves it. Without
 # this, any `uv run` or `uv sync` re-locked whenever pyproject.toml had moved: a plain

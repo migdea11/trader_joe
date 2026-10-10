@@ -168,6 +168,22 @@ class StoreAssetDatasetBody(InboundContract):
             )
         return self
 
+    # RANGES ARE HALF-OPEN [start, end) (tj-vhboky.1 addendum, 2026-09-30), so a declared end that is
+    # not after the start names an entry nothing can ever fill: end == start is empty, end < start
+    # never meant anything. Refused at the edge as a 422. end None (open-ended) is untouched. Both
+    # bounds are AwareDatetime, so the comparison is between instants. Inherited by the create and
+    # update models and by the read model AssetDatasetStore; the latter is safe because no stored
+    # row violates it (tj-86g751.1, waived by the user as the data is disposable). Not applied to
+    # StoreAssetDatasetQuery: an empty read window is a valid query that returns nothing.
+    @model_validator(mode='after')
+    def validate_range_is_not_empty(self) -> Self:
+        if self.end is not None and self.end <= self.start:
+            raise ValueError(
+                f"The 'end' field must be after the 'start' field: ranges are half-open [start, end), "
+                f'so end ({self.end.isoformat()}) must be later than start ({self.start.isoformat()}).'
+            )
+        return self
+
     @field_validator('expiry_type', mode='before')
     def validate_expiry_type(cls, value):
         return ExpiryType.validate(value)

@@ -39,6 +39,9 @@ explicit envelope naming the missing ranges instead of quietly returning fewer r
 | Variable | Purpose | Default |
 |---|---|---|
 | DATABASE_URI | primary DSN | fails closed |
+| FRESHNESS_STREAM_BAR_MULTIPLE | STREAM freshness: a last bar within this many bar-lengths of now is FRESH in hours (`app/freshness.py`, read by `FreshnessConfig.from_env`) | 3 |
+| DEPLOYMENT_LABEL | display-only label in GET /ui/v1/config; nothing may branch on it (`app/ui_config.py`) | empty |
+| SERVER_VERSION | server_version in GET /ui/v1/config; else the installed distribution version, else `unknown` | unset |
 
 ## Common pitfalls
 

@@ -1,8 +1,8 @@
 """Bars over real HTTP: single-bar refresh after commit, and the filtering read (tj-vhboky.50, Sys-3).
 
 tj-vhboky.14 items 9 and 11, and the tj-vhboky.43 gate's finding c. Design: tj-vhboky.25 (the
-filtering read: selectors, filters, inclusive bounds, ORDER BY timestamp then dataset_id, the
-422s), tj-vhboky.26 and .28 (a query must name dataset_id or a non-blank asset_symbol),
+filtering read: selectors, filters, ORDER BY timestamp then dataset_id, the 422s; its bounds are
+half-open [start, end) since the tj-vhboky.1 addendum HALF-OPEN RANGES), tj-vhboky.26 and .28 (a query must name dataset_id or a non-blank asset_symbol),
 tj-vhboky.43 (the single-bar write through write_transaction), tj-p78ng6 (feed filter),
 tj-6z03hd (a filtered read returns fewer rows than a symbol-only one).
 
@@ -136,13 +136,19 @@ A_MINUTES = (0, 1, 2, 3, 4, 5, 6)
 B_MINUTES = (1, 2, 3)
 C_MINUTES = (0, 5)  # 5-minute bars stay on 5-minute boundaries
 
-# The item-11 read: granularity plus an inclusive window, in minutes from the seed's start. Chosen
-# WITH the seed above so that each of the three filters removes a seeded bar the other two admit:
-# granularity removes C's minute 5, start removes A's minute 0, end removes A's minute 6. The test
-# asserts that as a precondition (tj-3mk3u5.41; tj-vhboky.14 F1 is the window that did not).
+# The item-11 read: granularity plus a half-open window [start, end), in minutes from the seed's
+# start. Chosen WITH the seed above so that each of the three filters removes a seeded bar the other
+# two admit: granularity removes C's minute 5, start removes A's minute 0, end removes A's minute 6.
+# The test asserts that as a precondition (tj-3mk3u5.41; tj-vhboky.14 F1 is the window that did not).
+#
+# THE END MOVED FROM MINUTE 5 TO MINUTE 6 WITH THE HALF-OPEN READ (tj-86g751.4). Under [1, 5) the end
+# bound itself excludes C's minute 5, so the granularity filter would remove nothing on its own and
+# the precondition would fail -- the 04:34 UTC 2026-10-02 architect note on that bead asked for
+# exactly this to stay true under [start, end). [1, 6) keeps all three: A's minute 6 sits AT the end
+# and is excluded by it, which also pins the half-open edge on this read.
 FILTER_GRANULARITY = Granularity.ONE_MINUTE
 FILTER_FIRST_MINUTE = 1
-FILTER_LAST_MINUTE = 5
+FILTER_END_MINUTE = 6
 
 
 @dataclass(frozen=True)
@@ -203,11 +209,11 @@ def test_filtered_read_returns_only_the_seeded_matches_and_fewer_than_symbol_onl
     and the granularity predicate went unpinned. It is computed from the seed's own keys, so a
     later edit to the seed or the window cannot vacate a filter silently.
     """
-    start, end = read_seed.instant(FILTER_FIRST_MINUTE), read_seed.instant(FILTER_LAST_MINUTE)
+    start, end = read_seed.instant(FILTER_FIRST_MINUTE), read_seed.instant(FILTER_END_MINUTE)
     admitted_by: dict[str, Callable[[BarKey], bool]] = {
         'granularity': lambda key: key[3] == FILTER_GRANULARITY.value,
         'start': lambda key: key[1] >= start,
-        'end': lambda key: key[1] <= end,
+        'end': lambda key: key[1] < end,  # half-open: a bar AT end is out
     }
     for name, admits in admitted_by.items():
         others = [other for other_name, other in admitted_by.items() if other_name != name]
@@ -242,8 +248,17 @@ def test_filtered_read_returns_only_the_seeded_matches_and_fewer_than_symbol_onl
     assert len(filtered) < len(symbol_only) <= table_rows, counts
 
 
-def test_range_bounds_are_inclusive_and_compare_instants(read_seed: ReadSeed, data_store) -> None:
-    """Item 9: start and end are inclusive on timestamptz, whatever offset the bound is written in."""
+def test_range_bounds_are_half_open_and_compare_instants(read_seed: ReadSeed, data_store) -> None:
+    """Item 9, half-open: on timestamptz a bar AT start is in and a bar AT end is out, whatever offset the bound is written in.
+
+    RENAMED FROM test_range_bounds_are_inclusive_and_compare_instants, end edge INVERTED (tj-86g751.4).
+    SUPERSEDED DESIGN: both bounds inclusive, so [1, 3] returned minutes 1-3. THE DESIGN NOW:
+    tj-vhboky.1 addendum HALF-OPEN RANGES (2026-09-30), item 1 -- timestamp >= start AND timestamp <
+    end -- so [1, 3) returns minutes 1 and 2, and an empty window [2, 2) is a valid query that
+    returns nothing. The first read writes both bounds in America/Toronto, so the bar at minute 3 is
+    excluded by an end that names its INSTANT under a different wall clock. The unit tier's twin is
+    data/store/tests/test_filtering_read.py, test_the_bounds_are_half_open_start_included_end_excluded.
+    """
     first, last = read_seed.instant(1), read_seed.instant(3)
     selector = {'dataset_id': str(read_seed.a.id)}
 
@@ -251,11 +266,18 @@ def test_range_bounds_are_inclusive_and_compare_instants(read_seed: ReadSeed, da
         data_store,
         {**selector, 'start': first.astimezone(BOUND_ZONE).isoformat(), 'end': last.astimezone(BOUND_ZONE).isoformat()},
     )
-    assert [key[1] for key in on_the_edges] == [read_seed.instant(m) for m in (1, 2, 3)], on_the_edges
+    assert [key[1] for key in on_the_edges] == [read_seed.instant(m) for m in (1, 2)], on_the_edges
 
     nudge = timedelta(microseconds=1)
-    _, inside = _read(data_store, {**selector, 'start': (first + nudge).isoformat(), 'end': (last - nudge).isoformat()})
+    _, end_past_the_bar = _read(data_store, {**selector, 'start': first.isoformat(), 'end': (last + nudge).isoformat()})
+    assert [key[1] for key in end_past_the_bar] == [read_seed.instant(m) for m in (1, 2, 3)], end_past_the_bar
+
+    _, inside = _read(data_store, {**selector, 'start': (first + nudge).isoformat(), 'end': last.isoformat()})
     assert [key[1] for key in inside] == [read_seed.instant(2)], inside
+
+    middle = read_seed.instant(2).isoformat()
+    _, empty_window = _read(data_store, {**selector, 'start': middle, 'end': middle})
+    assert empty_window == [], f'an empty window [s, s) returned bars: {empty_window}'
 
 
 def test_feed_filter_returns_one_tape(read_seed: ReadSeed, data_store) -> None:

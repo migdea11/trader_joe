@@ -5,8 +5,10 @@ tj-vhboky.8 (409 carrying the colliding ids; 403 for a non-owner), tj-vhboky.11 
 belongs to exactly one entry, so two overlapping fetches store two rows per instant).
 
 Entries are seeded by SQL through conftest's insert_entry: the only HTTP route that creates one
-is the dataset POST, which reaches data_ingest and the broker (never driven here; decision
-tj-vhboky.54, Sys-7 tj-vhboky.63). Bars are written over HTTP through the internal single-bar
+is the dataset POST, which reaches data_ingest and the broker (decision tj-vhboky.54, Sys-7
+tj-vhboky.63). The one exception is the last section, same-owner adjacent ranges (tj-lvbes5),
+whose subject IS that POST's overlap check; it relies on the agent stack's FakeRead, as
+test_ingest_e2e.py does. Bars are written over HTTP through the internal single-bar
 POST, and every delete, list and read goes over HTTP. Row counts are read by SQL, because the
 point of item 6 is what the DATABASE holds after the cascade, not what an endpoint reports.
 
@@ -35,6 +37,7 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from common.enums.data_select import AssetType, DataType
+from common.enums.data_stock import DataSource, Granularity
 from common.errors.vocabulary import Reason
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
@@ -259,3 +262,93 @@ def test_owner_delete_cascades_to_its_bars_and_leaves_the_other_entry_whole(
     # And the shared instants now hold one row each: Y's.
     per_instant = _rows_per_instant(pg_engine, own_symbol)
     assert set(per_instant.values()) == {1}, f'{counts}; rows per instant after: {per_instant}'
+
+
+# ---------------------------------------------------------------------------------------------
+# Same-owner ADJACENT ranges on timestamptz (tj-lvbes5; ADR tj-vhboky.1 addendum HALF-OPEN RANGES item 2).
+#
+# check_own_overlap's half-open SELECT (existing.start < new.end AND new.start < existing.end, with the
+# open end bound as the EPOCH sentinel) had run on real rows only in SQLite, every instant UTC
+# (server/data/store/tests/test_dataset_entry_identity.py). These drive it on Postgres through the one
+# route that creates an entry, the dataset POST -- which, UNLIKE the rest of this module, reaches
+# data_ingest. The agent stack runs data_ingest on FakeRead (ADR tj-4rr0la addendum 3), whose default
+# scenario serves the range; test_ingest_e2e.py pins what it stores, so these assert only the entries.
+# Every entry a POST makes is adopted for cleanup whether or not the POST succeeded.
+
+ADJACENT_A = datetime.fromisoformat('2001-02-05T14:30:00+00:00')
+ADJACENT_M = ADJACENT_A + timedelta(minutes=10)
+ADJACENT_B = ADJACENT_A + timedelta(minutes=20)
+ONE_MICROSECOND = timedelta(microseconds=1)
+
+
+def _post_dataset(
+    data_store,
+    adopt_entries: Callable[[str], list[UUID]],
+    symbol: str,
+    owner: str,
+    start: datetime,
+    end: datetime | None,
+):
+    """POST a dataset request for [start, end), end None for open-ended. Returns (response, entry ids oldest first)."""
+    body: dict[str, Any] = {
+        'owner': owner,
+        'source': DataSource.ALPACA_API.value,
+        'granularity': Granularity.ONE_MINUTE.value,
+        'start': start.isoformat(),
+    }
+    if end is not None:
+        body['end'] = end.isoformat()
+    path = AssetDatasetStoreInterface.POST_STORE_ASSET_DATASET.format(
+        asset_type=AssetType.STOCK.value, data_type=DataType.MARKET_ACTIVITY.value, asset_symbol=symbol
+    )
+    try:
+        response = data_store.post(path, json=body, auth='right')
+    finally:
+        ids = adopt_entries(symbol)
+    return response, ids
+
+
+def _assert_own_overlap(data_store, response, colliding: UUID) -> None:
+    problem = assert_problem(
+        response, status=409, reason=Reason.OWN_OVERLAP_CONFLICT.value, title='Conflict', describe=data_store.describe
+    )
+    assert problem['colliding_ids'] == [str(colliding)], data_store.describe(response)
+
+
+def test_same_owner_adjacent_ranges_are_both_created_and_one_microsecond_more_is_409(
+    own_symbol: str, run_identity, data_store, adopt_entries: Callable[[str], list[UUID]]
+) -> None:
+    """[a, m) then [m, b) for one owner: two entries. [m - 1us, m) then overlaps only the first: 409 naming it."""
+    owner = run_identity.owner
+
+    first, after_first = _post_dataset(data_store, adopt_entries, own_symbol, owner, ADJACENT_A, ADJACENT_M)
+    second, after_second = _post_dataset(data_store, adopt_entries, own_symbol, owner, ADJACENT_M, ADJACENT_B)
+    overlap, after_overlap = _post_dataset(
+        data_store, adopt_entries, own_symbol, owner, ADJACENT_M - ONE_MICROSECOND, ADJACENT_M
+    )
+
+    assert first.status_code == 200, data_store.describe(first)
+    assert second.status_code == 200, f'the adjacent [m, b) was refused: {data_store.describe(second)}'
+    assert len(after_first) == 1 and len(after_second) == 2, f'entries: {after_first} then {after_second}'
+    assert after_second[0] == after_first[0] != after_second[1], f'entries: {after_first} then {after_second}'
+    _assert_own_overlap(data_store, overlap, colliding=after_first[0])
+    assert after_overlap == after_second, f'the refused POST changed the entries: {after_second} -> {after_overlap}'
+
+
+def test_same_owner_open_ended_range_adjacent_to_a_closed_one(
+    own_symbol: str, run_identity, data_store, adopt_entries: Callable[[str], list[UUID]]
+) -> None:
+    """[a, m) then [m - 1us, open) is 409 naming [a, m); [m, open) is accepted. The open end binds as EPOCH."""
+    owner = run_identity.owner
+
+    closed, after_closed = _post_dataset(data_store, adopt_entries, own_symbol, owner, ADJACENT_A, ADJACENT_M)
+    overlap, after_overlap = _post_dataset(
+        data_store, adopt_entries, own_symbol, owner, ADJACENT_M - ONE_MICROSECOND, None
+    )
+    adjacent, after_adjacent = _post_dataset(data_store, adopt_entries, own_symbol, owner, ADJACENT_M, None)
+
+    assert closed.status_code == 200, data_store.describe(closed)
+    _assert_own_overlap(data_store, overlap, colliding=after_closed[0])
+    assert after_overlap == after_closed, f'the refused POST changed the entries: {after_closed} -> {after_overlap}'
+    assert adjacent.status_code == 200, f'the adjacent open-ended [m, ...) was refused: {data_store.describe(adjacent)}'
+    assert len(after_adjacent) == 2 and after_adjacent[0] == after_closed[0], f'entries: {after_adjacent}'

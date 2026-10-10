@@ -18,7 +18,7 @@ TWO TIERS, AND WHAT NEITHER PROVES.
    Kafka is needed (the same seam test_http_smoke.py documents). What the crud RECEIVED is asserted.
 
 NO DATABASE RUNS HERE (the agent container has no Docker). What Postgres returns for these
-statements -- the row counts, the inclusive edges on a timestamptz column, one tape's rows and not
+statements -- the row counts, the half-open edges on a timestamptz column, one tape's rows and not
 the other's -- is proved on real rows at tj-vhboky.14 stage 2 item 9 (ADR tj-fdb9gz: a test that
 concedes what it cannot prove names where it is proved).
 
@@ -27,7 +27,7 @@ THE MODEL-LEVEL HALF of #23 is NOT here: schemas/tests/test_schemas_smoke_data_s
 """
 
 import operator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
@@ -65,7 +65,8 @@ FIELD_VALUES: dict[str, Any] = {
     'end': END,
 }
 
-# The ONE predicate each field must add: (column, comparison, value). Bounds are inclusive.
+# The ONE predicate each field must add: (column, comparison, value). Bounds are half-open,
+# [start, end): >= start, < end (tj-vhboky.1 addendum HALF-OPEN RANGES, 2026-09-30).
 EXPECTED_PREDICATE: dict[str, tuple[str, Any, Any]] = {
     'dataset_id': ('dataset_id', operator.eq, DATASET_ID),
     'asset_symbol': ('asset_symbol', operator.eq, 'AAPL'),
@@ -73,7 +74,7 @@ EXPECTED_PREDICATE: dict[str, tuple[str, Any, Any]] = {
     'feed': ('feed', operator.eq, Feed.IEX),
     'granularity': ('granularity', operator.eq, Granularity.ONE_DAY),
     'start': ('timestamp', operator.ge, START),
-    'end': ('timestamp', operator.le, END),
+    'end': ('timestamp', operator.lt, END),
 }
 
 ORDER_BY_EXACTLY = f'{StockMarketActivity.__tablename__}.timestamp, {StockMarketActivity.__tablename__}.dataset_id'
@@ -187,7 +188,7 @@ async def test_each_field_adds_exactly_its_own_predicate(field: str):
     Each field is driven with the one selector the model requires, so the expected WHERE clause
     is exactly two predicates. Set equality covers both halves: a missing predicate (the field is
     silently unfiltered -- source was, before fe0d683) and an extra one (an omitted field filtering
-    anyway) are both red. Bounds are asserted as >= and <=, the inclusive edges.
+    anyway) are both red. Bounds are asserted as >= and <, the half-open edges [start, end).
     """
     selector = _selector_for(field)
     statement = await _executed_statement(_query(**{selector: FIELD_VALUES[selector], field: FIELD_VALUES[field]}))
@@ -289,19 +290,70 @@ async def test_the_read_is_ordered_by_timestamp_then_dataset_id_and_nothing_else
 
 
 @pytest.mark.asyncio
-async def test_the_bounds_are_inclusive_at_both_edges():
-    """F2 coverage item 5: a bar at exactly start and a bar at exactly end are both included.
+async def test_the_bounds_are_half_open_start_included_end_excluded():
+    """F2 coverage item 5, under half-open ranges: a bar at exactly start is IN, one at exactly end is OUT.
 
+    RENAMED FROM test_the_bounds_are_inclusive_at_both_edges, and its end edge INVERTED (tj-86g751.4).
+    SUPERSEDED DESIGN: both bounds were inclusive (timestamp <= end), so a bar at exactly end was
+    included. THE DESIGN NOW: tj-vhboky.1 addendum HALF-OPEN RANGES (2026-09-30, user ruling on
+    tj-6w07z8), item 1 -- timestamp >= start AND timestamp < end, the same rule as the broker read,
+    so a bar at end belongs to the next range.
+
+    Pinned at all four sides of the two edges, so either bound drifting by one comparison is red: a
+    bar at end - 1us is still in, a bar at end is out; at start it is in, at start - 1us it is out.
     Evaluated against the statement's own predicates. On a real timestamptz column this is
-    tj-vhboky.14 stage 2 item 9.
+    tj-vhboky.14 stage 2 item 9 (tests/system/test_http_bars.py, test_range_bounds_are_half_open_and_compare_instants).
     """
     predicates = _predicates(await _executed_statement(_query(dataset_id=DATASET_ID, start=START, end=END)))
 
-    assert _satisfies(_bar_row(timestamp=START), predicates), 'a bar at exactly start was excluded'
-    assert _satisfies(_bar_row(timestamp=END), predicates), 'a bar at exactly end was excluded'
     tick = timedelta(microseconds=1)
+    assert _satisfies(_bar_row(timestamp=START), predicates), 'a bar at exactly start was excluded'
+    assert not _satisfies(_bar_row(timestamp=END), predicates), 'a bar at exactly end was included'
+    assert _satisfies(_bar_row(timestamp=END - tick), predicates), 'a bar just before end was excluded'
     assert not _satisfies(_bar_row(timestamp=START - tick), predicates), 'a bar before start was included'
     assert not _satisfies(_bar_row(timestamp=END + tick), predicates), 'a bar after end was included'
+
+
+@pytest.mark.asyncio
+async def test_an_offset_end_excludes_the_bar_at_the_instant_it_names():
+    """The half-open end compares INSTANTS: an end written at +05:00 excludes the bar at that instant.
+
+    END_AT_PLUS_FIVE is END written in another offset -- the same instant, a different wall clock.
+    The bar at END (stored in UTC) is excluded, the bar one microsecond earlier is in, and a bar at
+    the end's WALL-CLOCK reading taken as UTC (five hours later, what a naive compare would treat as
+    the bound) is out too. The start bound is given in the same offset and still admits the bar at
+    START. The route half -- that an offset bound reaches the crud as its instant -- is
+    test_an_offset_bound_is_the_instant_it_names below.
+    """
+    plus_five = timezone(timedelta(hours=5))
+    start_at_plus_five = START.astimezone(plus_five)
+    end_at_plus_five = END.astimezone(plus_five)
+    assert end_at_plus_five == END and end_at_plus_five.utcoffset() == timedelta(hours=5), 'fixture precondition'
+
+    predicates = _predicates(
+        await _executed_statement(_query(dataset_id=DATASET_ID, start=start_at_plus_five, end=end_at_plus_five))
+    )
+
+    tick = timedelta(microseconds=1)
+    assert _satisfies(_bar_row(timestamp=START), predicates), 'a bar at the start instant was excluded'
+    assert not _satisfies(_bar_row(timestamp=END), predicates), 'a bar at the end instant was included'
+    assert _satisfies(_bar_row(timestamp=END - tick), predicates), 'a bar just before the end instant was excluded'
+    wall_clock_as_utc = end_at_plus_five.replace(tzinfo=UTC)
+    assert not _satisfies(_bar_row(timestamp=wall_clock_as_utc), predicates), (
+        'a bar at the end wall-clock reading taken as UTC was included'
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_empty_window_is_a_valid_query_that_admits_no_bar():
+    """Addendum item 1: start == end is a valid query (not refused, unlike a create) and admits nothing.
+
+    The model half -- StockDataMarketActivityQuery and StoreAssetDatasetQuery accept start == end --
+    is schemas/tests/test_schemas_smoke_data_store.py, test_an_empty_read_window_is_still_a_valid_query.
+    """
+    predicates = _predicates(await _executed_statement(_query(dataset_id=DATASET_ID, start=START, end=START)))
+
+    assert not _satisfies(_bar_row(timestamp=START), predicates), 'an empty window [s, s) admitted the bar at s'
 
 
 @pytest.mark.asyncio

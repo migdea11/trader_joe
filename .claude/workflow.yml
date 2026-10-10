@@ -71,9 +71,12 @@ agents:
   # changes, to promote upstream later: 62a15e0 (tj-gys6xn) installs Claude Code with the native
   # installer instead of a root npm install; 94da586 (tj-3mk3u5.52) drops nodejs and npm from the
   # first apt line.
-  # NOTE: the monorepo split moves these four trees under server/ with their internals unchanged,
-  # so every scope below gains a server/ prefix and nothing more; re-run update after it lands.
-  # (The earlier src/trader_joe/ restructure, which would have redrawn these, was superseded.)
+  # NOTE: the monorepo split has landed: the four Python trees live under server/ and every scope
+  # below carries that prefix. Agent files are edited directly with this file; the kit `update`
+  # command is not a gate (owner ruling 2026-10-06).
+  # LOCAL AMENDMENTS, 2026-10-06 (tj-grna9p.13, decision tj-grna9p.7): builder-ui owns web/;
+  # builder-shared gains proto/, buf.yaml and deploy/web/Caddyfile; the validator gains the web
+  # test files (web/src/**/*.spec.ts); builder-shared and scribe run on sonnet.
   - name: architect
     role: architect
     model: opus
@@ -84,32 +87,39 @@ agents:
 
   - name: builder-ingest
     role: builder
-    scope: [data/ingest, routers/data_ingest]
+    scope: [server/data/ingest, server/routers/data_ingest]
     model: sonnet
     slots:
-      do_not: "Do not edit common/, schemas/ or routers/common — propose the change to builder-shared. data/ingest/tests is the validator's; a test you write there is not undone, but the validator owns it. Do not change the `.proto` contracts or anything under `gen/` unilaterally. Do not commit broker credentials or scratch data files."
+      do_not: "Do not edit server/common/, server/schemas/ or server/routers/common — propose the change to builder-shared. server/data/ingest/tests is the validator's; a test you write there is not undone, but the validator owns it. Do not change the `.proto` contracts under `proto/` or anything under `gen/` unilaterally. Do not commit broker credentials or scratch data files."
 
   - name: builder-store
     role: builder
-    scope: [data/store, routers/data_store]
+    scope: [server/data/store, server/routers/data_store]
     model: sonnet
     slots:
-      do_not: "Do not edit common/ or schemas/ — propose the change to builder-shared. data/store/tests is the validator's; a test you write there is not undone, but the validator owns it. Migrations are additive only; never edit an applied revision, and never run reset_migrations.sh against data that matters."
+      do_not: "Do not edit server/common/ or server/schemas/ — propose the change to builder-shared. server/data/store/tests is the validator's; a test you write there is not undone, but the validator owns it. Migrations are additive only; never edit an applied revision, and never run reset_migrations.sh against data that matters."
+
+  - name: builder-ui
+    role: builder
+    scope: [web]
+    model: sonnet
+    slots:
+      do_not: "Never edit proto/, server/, or build and CI files (Dockerfile, docker-compose*.yaml, Makefile, .github, deploy/web/Caddyfile) — request them from builder-shared; the npm script names are the seam. Tests under web/ (web/src/**/*.spec.ts) are the validator's; add only scaffolding smoke you need. Do not hand-edit generated output under web/src/generated. Do not add a dependency without proposing it first."
 
   - name: builder-shared
     role: builder
-    scope: [common, schemas, routers/common, tools, pyproject.toml, uv.lock, Dockerfile, entrypoint.sh, docker-compose*.yaml, Makefile, .github, .gitignore, pytest.ini, .dockerignore, .env.default, .devcontainer]
-    model: opus
+    scope: [server/common, server/schemas, server/routers/common, tools, proto, buf.yaml, deploy/web/Caddyfile, pyproject.toml, uv.lock, Dockerfile, entrypoint.sh, docker-compose*.yaml, Makefile, .github, .gitignore, pytest.ini, .dockerignore, .env.default, .devcontainer]
+    model: sonnet
     slots:
-      do_not: "Do not refactor inside another builder's scope without filing the follow-up task for that builder. common/tests, routers/tests and schemas/tests are the validator's; pytest.ini and the Makefile are yours. Do not add a dependency without proposing it first. Do not weaken a security control to make a build pass."
+      do_not: "Do not refactor inside another builder's scope (server/data/ingest, server/data/store, server/routers/data_ingest, server/routers/data_store, web) without filing the follow-up task for that builder. server/common/tests, server/routers/tests and server/schemas/tests are the validator's; pytest.ini and the Makefile are yours. Do not add a dependency without proposing it first. Do not weaken a security control to make a build pass."
 
   - name: validator
     role: validator
-    scope: [tests, common/tests, data/ingest/tests, data/store/tests, routers/tests, schemas/tests]
+    scope: [tests, server/common/tests, server/data/ingest/tests, server/data/store/tests, server/routers/tests, server/schemas/tests, web/src/**/*.spec.ts]
     model: opus
     slots:
       role_description: "Quality gate for trader_joe."
-      test_paths: "tests (the repo-root system suite), common/tests, data/ingest/tests, data/store/tests, routers/tests, schemas/tests — every test directory in the repo, including the two that do not exist yet. You are the default author of tests (ADR tj-8fxxfb). pytest.ini and the Makefile are build config, not tests, and stay with builder-shared."
+      test_paths: "tests (the repo-root system suite), server/common/tests, server/data/ingest/tests, server/data/store/tests, server/routers/tests, server/schemas/tests, and the web Vitest files web/src/**/*.spec.ts — every test directory and test file in the repo. You are the default author of tests (ADR tj-8fxxfb). pytest.ini and the Makefile are build config, not tests, and stay with builder-shared."
 
   - name: scribe
     role: scribe
