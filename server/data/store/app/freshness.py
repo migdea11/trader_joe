@@ -33,6 +33,7 @@ would read as full of gaps; nothing in PR 4 stores one, and it is a follow-up wh
 """
 
 import os
+from bisect import bisect_left, bisect_right
 from collections.abc import Collection, Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -120,15 +121,32 @@ class ExchangeCalendarAdapter:
         self._last = calendar.last_session.date()
         # What the calendar was built to cover. Days between this and the first session are known to hold none.
         self._start = start if start is not None else self._first
+        # The session table, read out of pandas once: a session's open and close are looked up by date and a range
+        # is a bisect over the sorted dates. A pandas scalar lookup costs tens of microseconds, and a STATIC dataset
+        # over nine years asked for thousands of them per request (tj-sww0b1 item 7).
+        self._sessions: list[date] = list(calendar.sessions.date)
+        self._opens: dict[date, datetime] = dict(
+            zip(self._sessions, (ts.to_pydatetime() for ts in calendar.opens), strict=True)
+        )
+        self._closes: dict[date, datetime] = dict(
+            zip(self._sessions, (ts.to_pydatetime() for ts in calendar.closes), strict=True)
+        )
 
     @property
     def tz(self) -> ZoneInfo:
         return self._tz
 
     def session_open(self, session: date) -> datetime:
+        known = self._opens.get(session)
+        if known is not None:
+            return known
+        # Not a session: the calendar's own refusal, unchanged.
         return self._cal.session_open(pandas.Timestamp(session)).to_pydatetime()
 
     def session_close(self, session: date) -> datetime:
+        known = self._closes.get(session)
+        if known is not None:
+            return known
         return self._cal.session_close(pandas.Timestamp(session)).to_pydatetime()
 
     def _require_covered(self, day: date, what: str) -> None:
@@ -142,9 +160,8 @@ class ExchangeCalendarAdapter:
         last = min(end.astimezone(self._tz).date() + timedelta(days=1), self._last)
         if first > last:
             return []
-        labels = self._cal.sessions_in_range(pandas.Timestamp(first), pandas.Timestamp(last))
-        sessions = [label.date() for label in labels]
-        return [s for s in sessions if self.session_open(s) < end and self.session_close(s) > start]
+        window = self._sessions[bisect_left(self._sessions, first) : bisect_right(self._sessions, last)]
+        return [s for s in window if self._opens[s] < end and self._closes[s] > start]
 
     def last_completed_session(self, now: datetime) -> date | None:
         local = now.astimezone(self._tz).date()

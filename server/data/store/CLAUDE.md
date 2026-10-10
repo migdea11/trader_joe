@@ -1,6 +1,6 @@
 # Market data store
 
-Owner of all persisted market data. Requests data from data-ingest over gRPC (`FetchDataset`), writes it to Postgres, and serves it over `/store/...` and `/internal/asset-data/...`. Tables: `store_dataset_entry`, `stock_market_activity`.
+Owner of all persisted market data. Requests data from data-ingest over gRPC (`FetchDataset`), writes it to Postgres, and serves it over `/store/...`, `/internal/asset-data/...` and, to the web UI, the read-only `/ui/v1/...` routes as protobuf canonical JSON. Tables: `store_dataset_entry`, `stock_market_activity`.
 
 ## Architecture reference
 
@@ -16,23 +16,32 @@ Sole owner of persisted market data. Every write goes through a repository; no r
 
 ## Data freshness and completeness
 
-Removing Kafka removed consumer-group lag, which was this system's only free liveness signal.
-**Nothing has replaced it yet.** `tj-3mk3u5.4` and `tj-3mk3u5.5` are still open, and the tree today
-has no coverage ledger: no `missing_ranges` query, no `range_agg` subtraction, no freshness or
-completeness metric. Do not rely on one, and do not describe one as available.
+Freshness and completeness are **computed on read and never stored**, by `app/freshness.py` (pure: the
+clock and the calendar are arguments) and composed with the queries in `app/dataset_catalog.py`. They
+serve the `/ui/v1` routes. There is still no coverage ledger: no `missing_ranges` query, no `range_agg`
+subtraction, and the older read routes (`/store/...`, `/internal/asset-data/...`) say nothing about
+completeness, so a short answer from them is not distinguishable from a complete one.
 
-What can actually be asked right now, both straight against Postgres:
-
-| Question | Where the answer is |
+| Concern | Where it lives |
 |---|---|
-| How fresh is a series? | the greatest `end` across that symbol's `store_dataset_entry` rows, measured against `now()` |
-| What was actually stored | the `stock_market_activity` rows falling inside that range |
+| Status per dataset (`FRESH`, `LATE`, `OVERDUE`, `COMPLETE`, `GAPS`, `RETIRED`) | `evaluate_dataset` in `app/freshness.py` |
+| Trading calendar | one per data source (`SOURCE_CALENDARS`, offline `exchange_calendars`); a source with none has no computed freshness |
+| Status vocabulary the UI filters by | `StatusGroup` in `app/dataset_catalog.py`: healthy, late, failed, retired |
+| Catalog listing, facets, bar paging | `app/dataset_catalog.py` over `app/database/crud/stock/dataset_catalog.py`; keyset cursors, opaque, bound to their sort |
 
-A short answer from a read path is **not** yet distinguishable from a complete one, so never infer
-completeness from a row count. Closing that is exactly what `tj-3mk3u5.5` is for: when the ledger
-lands, freshness becomes `now()` minus the upper bound of the newest covered range per series, and
-completeness becomes the `range_agg` subtraction over the coverage rows, with reads returning an
-explicit envelope naming the missing ranges instead of quietly returning fewer rows.
+Things that bite:
+
+- **Completeness is per session**: a session counts as covered if it has at least one bar. That is right
+  for 1-minute to 1-day granularities; a weekly or monthly dataset would read as full of gaps.
+- **A bar belongs to the session whose local date, in the calendar's time zone, its timestamp falls on.**
+- **Ranges are half-open `[start, end)`** in the store, the bar reads and the overlap check: a bar at
+  `end` is in the next range, and ranges that only touch do not collide. A declared `end` not after
+  `start` is refused at the edge.
+- **Filtering on status needs freshness for every matching dataset**, not one page, so that a facet count
+  equals the filtered list's total. A request with no status filter evaluates the page only. The
+  request's statement count is constant, never one per dataset.
+- **Expiry is optional.** None means the dataset never expires; setting one on a `DAILY` or `STREAM`
+  dataset retires it, and a repeat request sets expiry from its body, so omitting it clears a stored one.
 
 ## Environment variables
 

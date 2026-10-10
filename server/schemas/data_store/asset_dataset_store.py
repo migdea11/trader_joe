@@ -1,4 +1,4 @@
-from datetime import UTC, datetime, timedelta
+from datetime import datetime
 from typing import Annotated, Self
 from uuid import UUID
 
@@ -52,6 +52,10 @@ UpdateTypeByName = Annotated[UpdateType, _member_names_schema(UpdateType)]
 
 class StoreAssetDatasetBody(InboundContract):
     """The fields a caller supplies to ask for a dataset.
+
+    CONTRACT CHANGE (user ruling 2026-10-06, tj-grna9p.71): expiry is optional and defaults to None,
+    meaning the dataset never expires. It used to default to now + 1 day. A caller that relied on
+    the old default and wants a dataset that lapses must now send an explicit expiry.
 
     EVERY FIELD HERE IS IDENTITY (tj-vhboky.1 section 2) WITH ONE NAMED EXCEPTION, feed, which is
     a preference rather than a value written -- see its own paragraph below. Two requests name the
@@ -131,22 +135,21 @@ class StoreAssetDatasetBody(InboundContract):
     start: AwareDatetime
     end: AwareDatetime | None = None
 
-    # default_factory, not a computed default: a plain default is evaluated once at import, so
-    # every instance in a long-lived process would share an expiry frozen at process start.
-    # UTC, not naive local: this is stored as timestamptz, and datetime.now() with no tzinfo makes
-    # "when does this data die" an environment-dependent answer.
+    # OPTIONAL, DEFAULT None: NO EXPIRY (user ruling 2026-10-06 on tj-grna9p.71, option A; PUBLIC
+    # CONTRACT CHANGE, see the class docstring). This used to default to now + 1 day, so a caller who
+    # said nothing got a dataset that was due to die tomorrow; it is now null, "never expires", and
+    # a time is stored only when the caller sets one. Both null and omission mean the same thing.
     #
-    # NOT `datetime | None`, and the default_factory is deliberately the ONLY source of a value.
-    # Optional here was the same seam defect as `start` above, one field over: BaseGetDatasetRequest
-    # .expiry (schemas/data_ingest/get_dataset_request.py) is a REQUIRED, non-optional datetime, and
-    # data/store/app/ingest/data_action_request.py builds that request by splatting this model's
-    # model_dump(). So an explicit "expiry": null passed body validation, carried None through the
-    # splat, and blew up as a ValidationError on GetDatasetRequest -- a 500 on caller-shaped input,
-    # which is the one class of failure a declared request schema must never produce. Omitting the
-    # field is still fine and still means "a day from now"; only an explicit null now 422s, naming
-    # the field, at the edge. Fixed the same way `start` was under tj-6yk4qs: make the declared
-    # contract honest, rather than patch the handler into tolerating a body it should have refused.
-    expiry: AwareDatetime = Field(default_factory=lambda: datetime.now(UTC) + timedelta(days=1))
+    # The earlier reason this was NOT optional no longer holds: it was that BaseGetDatasetRequest
+    # .expiry (schemas/data_ingest/get_dataset_request.py) is required and the store splatted this
+    # body into it. That path is gone (data/store/app/ingest/data_action_request.py builds a
+    # FetchDatasetRequest field by field, which carries no expiry), and the entry column is
+    # nullable (tj-vhboky.1 Amendment 1 item P). Nothing is written into a unique-key column by
+    # this, because expiry is not identity.
+    #
+    # AwareDatetime when set, REFUSE not convert (the tj-1bl90i rule above). On DAILY and STREAM a
+    # non-null expiry retires the dataset (tj-vhboky.1 addenda); a null one means it never does.
+    expiry: AwareDatetime | None = None
     # json_schema_extra keeps the documented default the NAME the wire carries. The JSON schema's
     # default is encoded from the config, never from a field serializer, so without it the OpenAPI
     # default would silently turn from 'BULK' into 1 when json_encoders was replaced below.

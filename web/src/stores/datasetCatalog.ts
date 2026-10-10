@@ -19,6 +19,11 @@ export interface CatalogError {
   errorId: string | undefined
 }
 
+/** No view or sidebar filter is set, so the facets response is the whole catalog's. */
+function isUnfiltered(filters: CatalogFilters): boolean {
+  return Object.values(toApiFilters(filters)).every((value) => value === undefined)
+}
+
 export function describeError(error: unknown): CatalogError {
   if (error instanceof ApiError) return { message: error.message, errorId: error.errorId }
   return { message: 'Request failed', errorId: undefined }
@@ -52,10 +57,16 @@ export const useDatasetCatalogStore = defineStore('datasetCatalog', () => {
       if (controller.signal.aborted) return
       facets.value = facetCounts(result)
       facetsError.value = null
+      // Under no filter these ARE the whole-catalog counts the tiles show: no second request.
+      if (isUnfiltered(filters)) {
+        tiles.value = facets.value
+        tilesError.value = null
+      }
     } catch (error) {
       if (controller.signal.aborted) return
       // The previous counts stay on screen next to the error rather than being blanked.
       facetsError.value = describeError(error)
+      if (isUnfiltered(filters)) tilesError.value = facetsError.value
     }
   }
 
@@ -96,11 +107,29 @@ export const useDatasetCatalogStore = defineStore('datasetCatalog', () => {
     listError.value = describeError(error)
   }
 
+  /**
+   * Load the sidebar and tile counts: one request when no filter is active (the same response
+   * serves both), otherwise the filtered facets and the unfiltered tiles in parallel.
+   */
+  function loadCounts(filters: CatalogFilters): void {
+    void loadFacets(filters)
+    if (!isUnfiltered(filters)) void loadTiles()
+  }
+
+  /**
+   * The filters changed: refetch the counts under them. The tiles do not follow the filters, so they
+   * are fetched again only if no whole-catalog counts have arrived yet (the first request was
+   * superseded by this filter change before it answered).
+   */
+  function filtersChanged(filters: CatalogFilters): void {
+    void loadFacets(filters)
+    if (!isUnfiltered(filters) && tiles.value === null) void loadTiles()
+  }
+
   /** Reload the list from its first page and the counts. The caller passes the current filters. */
   function refresh(filters: CatalogFilters): void {
     refreshKey.value += 1
-    void loadFacets(filters)
-    void loadTiles()
+    loadCounts(filters)
   }
 
   return {
@@ -115,6 +144,8 @@ export const useDatasetCatalogStore = defineStore('datasetCatalog', () => {
     listDone,
     loadFacets,
     loadTiles,
+    loadCounts,
+    filtersChanged,
     listLoading,
     listPage,
     listFailed,

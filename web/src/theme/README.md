@@ -1,6 +1,6 @@
 # theme/
 
-The visual language (tj-mujie8), dark only. `tokens.ts` is the one source of colour, type and
+The visual language, dark only. `tokens.ts` is the one source of colour, type and
 spacing values; everything else here is built from it.
 
 | File | Role |

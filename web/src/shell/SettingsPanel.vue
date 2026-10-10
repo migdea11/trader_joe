@@ -2,31 +2,20 @@
 // The Settings panel (phase 1): the time zone override and the About and Credits link. Stale After
 // days moves in with its screens (tj-grna9p.87); the store already holds it. Settings are saved in
 // this browser only (tj-grna9p.58); when storage is unavailable the panel says so quietly.
-import { computed } from 'vue'
 import Button from 'primevue/button'
 import Dialog from 'primevue/dialog'
 import Select from 'primevue/select'
 import { storeToRefs } from 'pinia'
 
-import { browserTimeZone, useSettingsStore } from '@/stores/settings'
+import { useSettingsStore } from '@/stores/settings'
 import { useShellModals } from './useShellModals'
+import { useZoneOptions } from './useZoneOptions'
 
 const settings = useSettingsStore()
 const { timeZone, timeZoneOverride, storageOk } = storeToRefs(settings)
 const { settingsOpen, closeSettings, openAbout } = useShellModals()
 
-const browserZone = browserTimeZone()
-
-// Every zone the browser knows, plus UTC and the current override, which Intl may omit.
-const zoneOptions = computed(() => {
-  let known: string[]
-  try {
-    known = Intl.supportedValuesOf('timeZone')
-  } catch {
-    known = []
-  }
-  return [...new Set(['UTC', browserZone, ...known, timeZone.value])].sort()
-})
+const { zoneOptions, browserZone } = useZoneOptions()
 
 function onZoneChange(zone: string | null): void {
   if (zone !== null) settings.setTimeZoneOverride(zone)

@@ -53,6 +53,7 @@ from common.errors.vocabulary import ExogenousError, Reason
 from data.store.app.database.crud.stock import store_dataset_entry as crud
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
+from data.store.app.freshness import FreshnessStatus, calendar_for_source, evaluate_dataset
 from schemas.data_store.asset_dataset_store import (
     AssetDatasetStore,
     AssetDatasetStoreCreate,
@@ -341,6 +342,116 @@ async def test_the_conflict_update_touches_no_identity_column():
     assert 'expiry' in clause and 'updated_at' in clause, clause
     leaked = [column for column in StoreDatasetEntry.NATURAL_KEY if column in clause]
     assert leaked == [], f'the conflict update writes identity columns {leaked}: {clause}'
+
+
+# ---------------------------------------------------------------------------------------------
+# A repeat POST WITHOUT an expiry CLEARS the stored one (tj-grna9p.105, architect ruling)
+#
+# Since 57b4406 an omitted expiry is None, and the exact-repeat branch sets expiry from the body. So
+# a repeat of the same dataset (same owner, series and range) that omits expiry writes NULL over a
+# stored expiry. RULED ACCEPTED: the body declares the dataset's desired lifetime, no expiry means
+# never expires, and a repeat is last-writer-wins on expiry exactly as it already was for an
+# explicit value. "Update only when provided" was REJECTED, because omission and an explicit null
+# are one meaning on the wire, so it would leave no way to clear an expiry through POST at all.
+#
+# These pins are the unit half: the VALUE the DO UPDATE clause binds, on each of the two upserts. The
+# database half (Postgres actually taking that branch and storing NULL) is
+# tests/system/test_ingest_e2e.py, test_a_repeat_post_without_expiry_clears_the_stored_expiry.
+# ---------------------------------------------------------------------------------------------
+
+
+def _without_expiry(request: AssetDatasetStoreCreate) -> AssetDatasetStoreCreate:
+    """The same dataset with expiry OMITTED, rebuilt through the constructor so it validates."""
+    return AssetDatasetStoreCreate(**request.model_dump(exclude={'expiry'}))
+
+
+def _daily_request() -> AssetDatasetStoreCreate:
+    """A DAILY subscription: open-ended (DAILY forbids an end) under ROLLING (DAILY forbids BULK), expiry FEBRUARY."""
+    return AssetDatasetStoreCreate(
+        **create_request(end=None).model_dump(exclude={'expiry_type', 'update_type'}),
+        expiry_type=ExpiryType.ROLLING,
+        update_type=UpdateType.DAILY,
+    )
+
+
+async def _bound_conflict_expiry(request: AssetDatasetStoreCreate) -> datetime | None:
+    """Run the real upsert and return the value its ON CONFLICT DO UPDATE writes into expiry.
+
+    Asserted as a PLAIN BIND, `expiry = %(...)s`: a rewrite that keeps the stored value when the body
+    has none -- `coalesce(<bound>, store_dataset_entry.expiry)`, or dropping expiry from the SET when it
+    is None -- no longer matches, and is the regression the ruling forbids.
+    """
+    db = FakeSession(FakeResult([]), FakeResult([(uuid4(),)]))
+    await crud.upsert_entry(db, request)
+    statement = _only(db.statements, 'INSERT')
+    clause = _do_update_clause(_sql(statement))
+    bound = re.fullmatch(r'expiry = %\((\w+)\)s, updated_at = now\(\)', clause)
+    assert bound, (
+        f'the exact-repeat branch no longer writes the body expiry as-is, so a repeat POST without an '
+        f'expiry would keep the stored one (tj-grna9p.105 ruled that it clears it): {clause}'
+    )
+    return _params(statement)[bound.group(1)]
+
+
+@pytest.mark.asyncio
+async def test_a_static_repeat_without_expiry_writes_null_over_the_stored_expiry():
+    """STATIC: POST with an expiry stores it; the identical POST with expiry omitted sets it back to NULL.
+
+    This is documented behaviour, not an accident (tj-grna9p.105, architect ruling): the POST body
+    declares the dataset's lifetime and no expiry means never expires, so the repeat is last-writer-
+    wins on expiry. Keeping the old expiry when the body has none was considered and rejected, since
+    omission and null are one meaning on the wire and an expiry could then never be cleared.
+    """
+    with_expiry = create_request(end=MARCH)
+    assert with_expiry.expiry == FEBRUARY
+
+    assert await _bound_conflict_expiry(with_expiry) == FEBRUARY, 'a repeat WITH an expiry does not store it'
+    assert await _bound_conflict_expiry(_without_expiry(with_expiry)) is None, (
+        'a repeat POST without an expiry kept a stored expiry; the ruling is that it clears it to NULL'
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_daily_repeat_without_expiry_clears_the_expiry_and_brings_a_retired_dataset_back():
+    """DAILY: a retired subscription re-POSTed without an expiry is NOT retired any more. Documented, not accidental.
+
+    An expiry on a DAILY or STREAM dataset means it is RETIRED (freshness.evaluate_dataset: RETIRED
+    requires expiry is not None). The repeat without an expiry writes NULL over it, so the dataset
+    reads as a live subscription again. The architect flagged exactly this when ruling on
+    tj-grna9p.105 and ACCEPTED it: re-POSTing a dataset with no expiry declares it never expires, and
+    that is how a retired subscription is brought back through POST. If retiring is ever meant to be
+    sticky, this test is the one to change, deliberately.
+
+    The health is computed by the real freshness function from the value each upsert binds, so the
+    claim is the chain: what the second POST writes is what un-retires it.
+    """
+    retired = _daily_request()
+    now = datetime(2026, 3, 4, 21, tzinfo=UTC)  # a Wednesday after the close, well after start
+    calendar = calendar_for_source(DataSource.ALPACA_API)
+
+    def health(expiry: datetime | None) -> FreshnessStatus:
+        return evaluate_dataset(
+            update_type=UpdateType.DAILY,
+            granularity=Granularity.ONE_DAY,
+            expiry=expiry,
+            start=retired.start,
+            end=now,
+            last_bar=now - timedelta(days=1),
+            covered=None,
+            calendar=calendar,
+            now=now,
+        ).status
+
+    stored_first = await _bound_conflict_expiry(retired)
+    assert stored_first == FEBRUARY
+    assert health(stored_first) is FreshnessStatus.RETIRED, 'the control: a DAILY dataset with an expiry is retired'
+
+    stored_after_repeat = await _bound_conflict_expiry(_without_expiry(retired))
+    assert stored_after_repeat is None, 'a DAILY repeat without an expiry kept the stored expiry'
+    assert health(stored_after_repeat) is not FreshnessStatus.RETIRED, (
+        'a retired DAILY dataset re-POSTed without an expiry still reads RETIRED; the ruling '
+        '(tj-grna9p.105) is that the repeat clears the expiry and the subscription is live again'
+    )
 
 
 @pytest.mark.asyncio

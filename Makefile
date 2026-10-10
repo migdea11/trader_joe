@@ -304,14 +304,23 @@ errors-doc: $(VENV_MARKER)  ## Regenerate docs/errors.md from server/common/erro
 # from the bind-mounted ./web/src. Both publish the one loopback port WEB_PORT (default 8088): only one
 # stack runs at a time, and a dev session never runs beside prod on the same machine anyway. The
 # agent stack never loads either file, and the base file never gains the service. The overlay's
-# INSTANCE_WRITE_SECRET carries a ":?" guard like POSTGRES_PASS, so every command through these sets
-# needs it in the root .env or the shell; prod-down and dev-down pass a placeholder the way dev-down
-# does for pgAdmin, for the same reason.
+# INSTANCE_WRITE_SECRET carries a ":?" guard like POSTGRES_PASS, so every command through PROD_COMPOSE
+# needs it in the root .env or the shell; prod-down passes a placeholder the way dev-down does for
+# pgAdmin, for the same reason. DEV_COMPOSE and TOOLS_COMPOSE do not need it (tj-grna9p.104): compose
+# interpolates every file before merging, so the guard fires on the prod web file even though the dev
+# overlay blanks the value afterwards, and a DEV .env that leaves the secret empty (its shipped state)
+# would fail dev-build, dev-deps, dev-tools and dev-launch before anything started. DEV_COMPOSE
+# therefore carries a placeholder that is only a fallback: the shell-default form keeps a value the
+# shell already holds. The placeholder reaches nothing but interpolation -- the dev web service blanks
+# the variable and a browser must never hold it, and data_store reads the real secret from its
+# env_file, which compose does not take from the shell. A value that lives only in the root .env is
+# not visible to the shell, so the placeholder outranks it in interpolation, which changes nothing a
+# container receives. PROD_COMPOSE never carries a placeholder: the prod proxy injects the real secret.
 PROD_COMPOSE := docker compose -f docker-compose.yaml -f docker-compose.web.yaml
 # Dev gains devnet through the override, which attaches every stack service to it (tj-q9ae5u
 # addendum 1). PROD_COMPOSE never loads the override, so a prod launch never attaches devnet --
 # which is also what keeps a dev session off a prod stack on the same machine.
-DEV_COMPOSE := docker compose -f docker-compose.yaml -f docker-compose.override.yaml -f docker-compose.web.yaml -f docker-compose.web.dev.yaml
+DEV_COMPOSE := INSTANCE_WRITE_SECRET="$${INSTANCE_WRITE_SECRET:-unused}" docker compose -f docker-compose.yaml -f docker-compose.override.yaml -f docker-compose.web.yaml -f docker-compose.web.dev.yaml
 TOOLS_COMPOSE := $(DEV_COMPOSE) -f docker-compose.tools.yaml
 # THE AGENT STACK (ADR tj-4rr0la section 1 and addendum 1). The isolated stack the agent-stack MCP
 # drives from an agent's worktree, under its own compose project so it never shares a container,
@@ -537,10 +546,11 @@ dev-launch: dev-deps  ## Start the development services in the foreground, with 
 # The placeholder PGADMIN_* values exist only to get past the ":?" guards, so that stopping the
 # stack never requires pgAdmin credentials. They are safe here and ONLY here: `down` creates no
 # container, so no pgAdmin account can ever be initialised from them. Shell variables outrank
-# .env in compose interpolation, which is why they must never be copied onto an `up`.
+# .env in compose interpolation, which is why they must never be copied onto an `up`. The
+# INSTANCE_WRITE_SECRET placeholder comes from DEV_COMPOSE (tj-grna9p.104), where it is a fallback.
 .PHONY: dev-down
 dev-down:  ## Stop the development stack, pgAdmin included
-	PGADMIN_EMAIL=unused PGADMIN_PASS=unused INSTANCE_WRITE_SECRET=unused $(TOOLS_COMPOSE) down --remove-orphans
+	PGADMIN_EMAIL=unused PGADMIN_PASS=unused $(TOOLS_COMPOSE) down --remove-orphans
 
 .PHONY: dev-prune
 dev-prune: ## Prune development services
@@ -1409,6 +1419,10 @@ SOURCE_DIRS := ./server/common ./server/routers ./server/schemas ./server/data .
 # semgrep scans '.', so it would also scan other agents' live worktrees under .claude/worktrees
 # (tj-aov3ip) -- half-edited copies of this repo. bandit needs no exclude: SOURCE_DIRS names
 # its roots explicitly and none of them contains .claude.
+# --exclude='*.spec.ts' keeps the web test specs (web/src/**/*.spec.ts) out of the scan the way
+# --exclude=tests/ keeps the Python tests out: they are test code, and a spec that must name a
+# rejected insecure-websocket URL otherwise trips the websocket rule (tj-grna9p.106). Production
+# .ts under web/src is still scanned. The CI Run SemGrep step carries the same flag; change both.
 # bandit's exclude is '*/tests/*', never a bare 'tests/' (tj-vhboky.67). bandit rewrites an exclude
 # that names an EXISTING directory, relative to the cwd, into '<dir>/*' before matching, so once the
 # repository-root tests/ appeared, 'tests/' became 'tests/*' and stopped matching the nested
@@ -1426,7 +1440,7 @@ SOURCE_DIRS := ./server/common ./server/routers ./server/schemas ./server/data .
 .PHONY: security
 security: $(VENV_MARKER) proto  ## Check security vulnerabilities
 	uv run bandit -r $(SOURCE_DIRS) --exclude '*/tests/*'
-	uv run semgrep --config=auto --error --exclude=tests/ --exclude=.venv --exclude=docker-compose.override.yaml --exclude=.claude/worktrees .
+	uv run semgrep --config=auto --error --exclude=tests/ --exclude='*.spec.ts' --exclude=.venv --exclude=docker-compose.override.yaml --exclude=.claude/worktrees .
 	uv export --all-groups --no-group dev --no-group testing --no-group security --locked --format requirements-txt --color never > requirements.txt || { status=$$?; rm -f requirements.txt; exit $$status; }
 	uv run pip-audit -r requirements.txt --disable-pip; status=$$?; rm -f requirements.txt; exit $$status
 

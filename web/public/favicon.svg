@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="TraderJoe">
+  <title>TraderJoe</title>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M13 14 H8 V50 H13 M51 14 H56 V50 H51" stroke="#a58aec" stroke-width="4"/>
+    <path d="M17 22 H31 M24 22 V42 M45 22 V36 A6 6 0 0 1 33 36" stroke="#e6edf3" stroke-width="5"/>
+  </g>
+</svg>

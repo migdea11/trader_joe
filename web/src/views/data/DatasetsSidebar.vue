@@ -254,10 +254,7 @@ function clearFilters(): void {
 }
 
 .side-option input {
-  accent-color: var(--tj-accent-tint);
   margin: 0;
-  width: 15px;
-  height: 15px;
 }
 
 .side-count {

@@ -32,9 +32,11 @@ evaluates the `handle` blocks is Caddy's, not this file's, and is not pinned her
 """
 
 import json
+import os
 import posixpath
 import re
 import shlex
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -218,11 +220,21 @@ def test_the_admin_api_and_automatic_https_are_off(caddy: Block):
         ('X-Frame-Options', 'DENY'),
         ('Referrer-Policy', 'no-referrer'),
         ('Cross-Origin-Opener-Policy', 'same-origin'),
+        ('Cross-Origin-Resource-Policy', 'same-origin'),
+        ('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=()'),
     ],
 )
 def test_the_security_headers_are_set(site: Block, header: str, value: str):
     (headers,) = site.named('header')
     assert headers.named(header) == [Block([header, value])], [child.words for child in headers.children]
+
+
+def test_the_server_header_is_removed_and_no_hsts_is_sent_over_plain_http(site: Block):
+    """-Server hides the software banner; Strict-Transport-Security means nothing on a plain-HTTP listener."""
+    (headers,) = site.named('header')
+    words = [child.words for child in headers.children]
+    assert ['-Server'] in words, words
+    assert not [w for w in words if w[0].lstrip('-+').lower() == 'strict-transport-security'], words
 
 
 def test_the_content_security_policy_keeps_scripts_and_framing_locked(site: Block):
@@ -394,6 +406,19 @@ def test_web_image_runs_as_a_non_root_user():
     users = [arguments for keyword, arguments in _stage_instructions('web_image') if keyword == 'USER']
     assert users, 'web_image never sets USER, so Caddy runs as root'
     assert users[-1].split(':')[0] not in ROOT_USERS, users
+
+
+def test_the_web_build_runs_npm_as_a_non_root_user():
+    """The npm ci and npm run build RUNs execute package code (scripts skipped, bundlers not): never as root."""
+    user = None
+    npm_users = []
+    for keyword, arguments in _stage_instructions('web_build_image'):
+        if keyword == 'USER':
+            user = arguments.split(':')[0]
+        elif keyword == 'RUN' and re.search(r'\bnpm (ci|run)\b', arguments):
+            npm_users.append(user)
+    assert len(npm_users) == 2, npm_users
+    assert all(user is not None and user not in ROOT_USERS for user in npm_users), npm_users
 
 
 def test_web_image_serves_the_built_dist_with_the_repository_caddyfile():
@@ -818,12 +843,78 @@ def test_dev_launch_starts_web():
     assert _make_recipe('dev-launch') == ['$(DEV_COMPOSE) up data_store data_ingest web'], _make_recipe('dev-launch')
 
 
-@pytest.mark.parametrize(('target', 'compose'), [('prod-down', '$(PROD_COMPOSE)'), ('dev-down', '$(TOOLS_COMPOSE)')])
-def test_the_downs_pass_the_secret_placeholder(target: str, compose: str):
-    """The web overlay's ':?' guard is evaluated on every command through the set, a down included."""
-    (recipe,) = _make_recipe(target)
-    prefix = recipe.split(compose, 1)[0].split()
+def test_prod_down_passes_the_secret_placeholder():
+    """The web overlay's ':?' guard is evaluated on every command through PROD_COMPOSE, a down included."""
+    (recipe,) = _make_recipe('prod-down')
+    prefix = recipe.split('$(PROD_COMPOSE)', 1)[0].split()
     assert PLACEHOLDER_SECRET in prefix, recipe
+
+
+# THE DEV SETS CARRY THEIR OWN FALLBACK (tj-grna9p.104). compose interpolates every file before merging,
+# so the prod web overlay's ':?' rule fires on DEV_COMPOSE too, although docker-compose.web.dev.yaml blanks
+# the value afterwards; a dev .env that leaves the secret empty (its shipped state) failed dev-build,
+# dev-deps, dev-tools and dev-launch. DEV_COMPOSE now opens with a SHELL-DEFAULT placeholder, so a value
+# the shell already holds still wins, and TOOLS_COMPOSE inherits it. PROD_COMPOSE carries none: prod keeps
+# the required rule, because there the proxy injects the real secret.
+DEV_TARGETS = ('dev-build', 'dev-deps', 'dev-tools', 'dev-launch', 'dev-down')
+SECRET = 'INSTANCE_WRITE_SECRET'
+
+
+def _dev_compose_prefix() -> str:
+    """DEV_COMPOSE's text before `docker compose`, with make's `$$` turned into the shell's `$`."""
+    value = _make_variable('DEV_COMPOSE')
+    assert ' docker compose ' in f' {value} ', value
+    return value.split('docker compose', 1)[0].replace('$$', '$').strip()
+
+
+@pytest.mark.parametrize('target', DEV_TARGETS)
+def test_every_dev_target_reaches_compose_through_the_set_that_carries_the_fallback(target: str):
+    """Each dev target's compose call is $(DEV_COMPOSE) or $(TOOLS_COMPOSE), and sets no secret of its own.
+
+    A recipe that wrote its own INSTANCE_WRITE_SECRET= would be a second copy of the rule, and a bare
+    `docker compose` would skip the fallback and fail on the shipped dev .env again.
+    """
+    recipe = ' '.join(_make_recipe(target))
+    assert '$(DEV_COMPOSE)' in recipe or '$(TOOLS_COMPOSE)' in recipe, recipe
+    assert f'{SECRET}=' not in recipe, f'{target} sets the secret itself instead of through DEV_COMPOSE: {recipe}'
+
+
+def test_the_tools_set_extends_the_dev_set():
+    """TOOLS_COMPOSE gets the fallback only by starting with $(DEV_COMPOSE)."""
+    assert _make_variable('TOOLS_COMPOSE').startswith('$(DEV_COMPOSE) '), _make_variable('TOOLS_COMPOSE')
+
+
+@pytest.mark.parametrize(
+    ('environment', 'expected'),
+    [({}, 'unused'), ({SECRET: ''}, 'unused'), ({SECRET: 's3cret'}, 's3cret')],
+    ids=['unset-falls-back', 'empty-falls-back', 'shell-value-wins'],
+)
+def test_the_dev_set_passes_a_fallback_that_a_shell_value_outranks(environment: dict[str, str], expected: str):
+    """DEV_COMPOSE's prefix, run by sh: the placeholder when the shell has no value, the shell's when it has.
+
+    Executed rather than read, so the claim is the shell's evaluation of the `:-` default: a plain
+    `INSTANCE_WRITE_SECRET=unused` would overwrite a real value (the shell-value-wins case reds), and
+    dropping the prefix leaves the variable unset (the fallback cases red).
+    """
+    prefix = _dev_compose_prefix()
+    assert prefix, 'DEV_COMPOSE carries no assignment before docker compose'
+    base = {key: value for key, value in os.environ.items() if key != SECRET}
+    result = subprocess.run(
+        ['/bin/sh', '-c', f'{prefix} env'], env=base | environment, capture_output=True, text=True, check=True
+    )
+    seen = dict(line.split('=', 1) for line in result.stdout.splitlines() if line.startswith(f'{SECRET}='))
+    assert seen.get(SECRET) == expected, f'{prefix!r} under {environment} gave {seen.get(SECRET)!r}'
+
+
+def test_the_prod_set_carries_no_fallback_and_the_overlay_keeps_the_rule_required():
+    """Prod never gets a placeholder: PROD_COMPOSE names no secret, and the web overlay's value stays ':?'.
+
+    test_the_secret_is_required shows the ':?' refuses an unset or empty value; this pins that nothing in
+    PROD_COMPOSE pre-empts it the way DEV_COMPOSE's fallback does for dev.
+    """
+    assert SECRET not in _make_variable('PROD_COMPOSE'), _make_variable('PROD_COMPOSE')
+    value = compose_model.load(WEB_COMPOSE)['services']['web']['environment'][SECRET]
+    assert value.startswith('${INSTANCE_WRITE_SECRET:?'), value
 
 
 def test_every_ci_render_of_a_set_with_the_web_overlay_passes_the_secret_placeholder():

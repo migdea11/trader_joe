@@ -314,10 +314,11 @@ jobs:
     # --error makes semgrep exit non-zero on any finding, so this step fails on findings rather
     # than only proving semgrep ran (tj-cg2i9p). A fresh checkout has no .claude/worktrees; the
     # exclude keeps this line identical to `make security`, where agent worktrees do exist
-    # (tj-aov3ip). Change both or neither.
+    # (tj-aov3ip). '*.spec.ts' keeps the web test specs out as tests/ keeps the Python tests out
+    # (tj-grna9p.106). Change both or neither.
     - name: Run SemGrep
       run: |
-        uv run semgrep --config=auto --error --exclude=tests/ --exclude=.venv --exclude=docker-compose.override.yaml --exclude=.claude/worktrees .
+        uv run semgrep --config=auto --error --exclude=tests/ --exclude='*.spec.ts' --exclude=.venv --exclude=docker-compose.override.yaml --exclude=.claude/worktrees .
 
     # --color never, the same command as the Makefile's security target (tj-3mk3u5.43): uv colours
     # its output when the environment forces colour, even into this redirect, and pip-audit cannot

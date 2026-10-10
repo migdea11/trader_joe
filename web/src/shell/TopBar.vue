@@ -2,19 +2,30 @@
 // The top bar (canvas "Shell" boards): logo, the six sections, and on the right the time zone
 // control, the deployment tag, the trading-group toggle and the Settings button. Only Data is built;
 // the other sections are disabled in place with a "Not built yet" tooltip and no route.
-import { ChevronDown, Globe, Settings } from '@lucide/vue'
+import { Settings } from '@lucide/vue'
+import Select from 'primevue/select'
 import { useRoute } from 'vue-router'
 
+import BrandMark from '@/components/brand/BrandMark.vue'
 import { useFormatters } from '@/format/useFormatters'
+import { useSettingsStore } from '@/stores/settings'
 import { useUiConfigStore } from '@/stores/uiConfig'
 import { NOT_BUILT_TOOLTIP, SECTIONS } from './navigation'
 import TradingGroupToggle from './TradingGroupToggle.vue'
 import { useShellModals } from './useShellModals'
+import { useZoneOptions } from './useZoneOptions'
 
 const route = useRoute()
 const config = useUiConfigStore()
+const settings = useSettingsStore()
 const { timeZone } = useFormatters()
 const { openSettings } = useShellModals()
+const { zoneOptions } = useZoneOptions()
+
+// The same override the Settings panel sets: picking here and there is one setting.
+function onZoneChange(zone: string | null): void {
+  if (zone !== null) settings.setTimeZoneOverride(zone)
+}
 
 // The Data section is active for every /data route.
 function isActive(to: string): boolean {
@@ -26,10 +37,7 @@ function isActive(to: string): boolean {
 <template>
   <header class="top-bar">
     <div class="top-bar__brand">
-      <span
-        class="top-bar__logo"
-        aria-hidden="true"
-      />
+      <BrandMark />
       <span class="top-bar__name">trader_joe</span>
     </div>
 
@@ -73,26 +81,19 @@ function isActive(to: string): boolean {
     </nav>
 
     <div class="top-bar__right">
-      <button
-        type="button"
+      <Select
+        :model-value="timeZone"
+        :options="zoneOptions"
+        filter
+        aria-label="Time zone"
         class="top-bar__zone"
-        :aria-label="`Time zone: ${timeZone}, change`"
-        @click="openSettings"
-      >
-        <Globe
-          :size="14"
-          aria-hidden="true"
-        />
-        {{ timeZone }}
-        <ChevronDown
-          :size="14"
-          aria-hidden="true"
-        />
-      </button>
+        data-testid="time-zone-select"
+        @update:model-value="onZoneChange"
+      />
       <span
+        v-if="config.deploymentTag !== null"
         class="top-bar__tag tj-mono"
-        :class="{ 'is-unset': !config.hasDeploymentLabel }"
-        :title="config.hasDeploymentLabel ? 'Deployment' : 'The server sent no deployment label'"
+        :title="config.deploymentTag"
         data-testid="deployment-tag"
       >{{ config.deploymentTag }}</span>
       <TradingGroupToggle />
@@ -127,13 +128,6 @@ function isActive(to: string): boolean {
   display: flex;
   align-items: center;
   gap: 10px;
-}
-
-.top-bar__logo {
-  width: 22px;
-  height: 22px;
-  border-radius: 5px;
-  background: var(--tj-accent-fill);
 }
 
 .top-bar__name {
@@ -180,26 +174,29 @@ function isActive(to: string): boolean {
   color: var(--tj-text2);
 }
 
+/* A compact real select: the PrimeVue Select's own border, radius and colours come from the
+   preset; only the height, width and type size are set here. */
 .top-bar__zone {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
   height: 32px;
-  padding: 0 10px;
-  background: transparent;
-  border: 1px solid var(--tj-line);
-  border-radius: var(--tj-radius-control);
-  color: var(--tj-text2);
-  font: inherit;
-  cursor: pointer;
+  min-width: 11rem;
+  font-size: 13px;
 }
 
+/* A highlighted tag for a non-prod deployment: warn text and border on a 16% warn wash. Warn on
+   the ground measures 7.5:1. Long labels truncate; the full text is in the title. */
 .top-bar__tag {
-  color: var(--tj-text3);
-}
-
-.top-bar__tag.is-unset {
-  font-style: italic;
+  max-width: 14ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0 8px;
+  line-height: calc(var(--tj-tag-height) - 2px);
+  border: 1px solid var(--tj-status-warn);
+  border-radius: var(--tj-radius-tag);
+  background: color-mix(in srgb, var(--tj-status-warn), transparent 84%);
+  color: var(--tj-status-warn);
+  font-size: 12px;
+  font-weight: 500;
 }
 
 .top-bar__settings {

@@ -21,7 +21,7 @@ describe('app shell smoke', () => {
   beforeEach(() => {
     getUiConfig.mockResolvedValue({
       allowedGroups: [AccountGroup.SIMULATION],
-      deploymentLabel: 'Prod',
+      deploymentLabel: 'Dev',
       serverVersion: '1.2.3',
     })
   })
@@ -33,7 +33,7 @@ describe('app shell smoke', () => {
     await flushPromises()
 
     expect(router.currentRoute.value.path).toBe('/data/datasets')
-    expect(wrapper.find('[data-testid="deployment-tag"]').text()).toBe('Prod')
+    expect(wrapper.find('[data-testid="deployment-tag"]').text()).toBe('Dev')
     expect(wrapper.find('[data-group="paper"]').attributes('aria-disabled')).toBe('true')
     expect(wrapper.find('[data-group="simulation"]').attributes('aria-pressed')).toBe('true')
     expect(router.currentRoute.value.query.group).toBe('simulation')

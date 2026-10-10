@@ -54,25 +54,29 @@ Items, tj-vhboky.14 numbering where they moved here from Sys-4:
     StockMarketActivity.bind_params_per_row() lands whole.
   * 13 -- an aware, non-UTC expiry reads back as the same instant with an offset, under the
     client's non-UTC TZ (docker-compose.test-client.yaml); a naive expiry is a 422 at the edge
-    (tj-1bl90i: refuse) and creates nothing.
+    (tj-1bl90i: refuse) and creates nothing. No expiry at all stores NULL and the /ui/v1 detail
+    leaves it unset (tj-sww0b1: the default is none, no longer now + 1 day).
 """
 
 import time
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
+import sqlalchemy as sa
+from sqlalchemy.engine import Engine
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity
 from common.errors.vocabulary import Reason
 from data.store.app.database.crud.stock.asset_market_activity import POSTGRES_MAX_BIND_PARAMETERS
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
-from routers.data_store.app_endpoints import AssetDataInterface, AssetDatasetStoreInterface
+from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
+from routers.data_store.app_endpoints import AssetDataInterface, AssetDatasetStoreInterface, UiDatasetsInterface
 from tests.fakes.market_data import (
     DEFAULT_SLOW_DELAY_SECONDS,
     EMPTY_PREFIX,
@@ -98,6 +102,7 @@ END = START + timedelta(minutes=30)
 READ_PATH = AssetDataInterface.GET_ASSET_DATA.format(
     asset_type=AssetType.STOCK.value, data_type=DataType.MARKET_ACTIVITY.value
 )
+ENTRY_TABLE = StoreDatasetEntry.__table__
 
 # What a stored bar is compared on: (timestamp, open, high, low, close, volume, trade_count).
 BarTuple = tuple[datetime, float, float, float, float, int, int]
@@ -577,6 +582,72 @@ def test_aware_non_utc_expiry_reads_back_as_the_same_instant(
     listed = _listing(data_store, own_symbol)[str(ids[0])]
     assert listed['expiry'] is not None, f'no expiry listed: {listed}'
     assert _instant(listed['expiry']) == expiry, f'expiry {listed["expiry"]} is not {expiry.isoformat()}'
+    # The control for the default-none test below: a set expiry IS on the UI detail, so its absence there is news.
+    detail = _ui_detail(data_store, ids[0])
+    assert 'expiry' in detail and _instant(detail['expiry']) == expiry, detail
+
+
+def _ui_detail(data_store, dataset_id: UUID) -> dict[str, Any]:
+    response = data_store.get(UiDatasetsInterface.GET_UI_DATASET.format(dataset_id=dataset_id))
+    assert response.status_code == 200, data_store.describe(response)
+    return response.json()
+
+
+def test_a_post_without_expiry_stores_none_and_the_ui_detail_leaves_it_unset(
+    own_symbol: str, run_identity, data_store, adopt_entries: Callable[[str], list[UUID]], pg_engine: Engine
+) -> None:
+    """Expiry defaults to none (57b4406, tj-sww0b1 item 1): NULL in the column, null on /store, unset on /ui/v1.
+
+    The body before the change defaulted to now + 1 day, so this POST would have stored an instant a day out.
+    """
+    body = _body(run_identity.owner)
+    assert 'expiry' not in body
+
+    response, ids = _post(data_store, adopt_entries, own_symbol, body)
+
+    assert response.status_code == 200, data_store.describe(response)
+    assert len(ids) == 1, f'expected one entry for {own_symbol}, found {ids}'
+    with pg_engine.connect() as connection:
+        stored = connection.execute(sa.select(ENTRY_TABLE.c.expiry).where(ENTRY_TABLE.c.id == ids[0])).scalar_one()
+    assert stored is None, f'expiry stored as {stored}, not NULL'
+    listed = _listing(data_store, own_symbol)[str(ids[0])]
+    assert listed['expiry'] is None, f'/store lists expiry {listed["expiry"]}'
+    detail = _ui_detail(data_store, ids[0])
+    assert 'expiry' not in detail, f'/ui/v1 detail carries expiry {detail.get("expiry")}'
+
+
+def _stored_expiry(pg_engine: Engine, dataset_id: UUID) -> datetime | None:
+    with pg_engine.connect() as connection:
+        return connection.execute(sa.select(ENTRY_TABLE.c.expiry).where(ENTRY_TABLE.c.id == dataset_id)).scalar_one()
+
+
+def test_a_repeat_post_without_expiry_clears_the_stored_expiry(
+    own_symbol: str, run_identity, data_store, adopt_entries: Callable[[str], list[UUID]], pg_engine: Engine
+) -> None:
+    """A repeat of the same dataset with expiry OMITTED writes NULL over a stored expiry (tj-grna9p.105, ruled).
+
+    Documented behaviour: the body declares the dataset's lifetime, no expiry means never expires, and the
+    exact repeat is last-writer-wins on expiry. Keeping the stored expiry when the body has none was rejected,
+    because omission and null mean the same on the wire and an expiry could then never be cleared. This is the
+    Postgres half, where ON CONFLICT DO UPDATE actually fires; the bound value, and the DAILY consequence (a
+    retired subscription reads live again), are pinned in server/data/store/tests/test_dataset_entry_identity.py.
+    """
+    expiry = datetime(2031, 3, 4, 5, 6, 7, tzinfo=UTC)
+    body = _body(run_identity.owner)
+
+    first, ids = _post(data_store, adopt_entries, own_symbol, {**body, 'expiry': expiry.isoformat()})
+    assert first.status_code == 200, data_store.describe(first)
+    assert len(ids) == 1, f'expected one entry for {own_symbol}, found {ids}'
+    assert _stored_expiry(pg_engine, ids[0]) == expiry, 'the control: the first POST did not store its expiry'
+
+    repeat, after_repeat = _post(data_store, adopt_entries, own_symbol, body)
+
+    assert repeat.status_code == 200, data_store.describe(repeat)
+    assert after_repeat == ids, f'the exact repeat did not resolve to the same entry: {ids} -> {after_repeat}'
+    stored = _stored_expiry(pg_engine, ids[0])
+    assert stored is None, f'the repeat without an expiry kept {stored}; the ruling is that it clears it to NULL'
+    detail = _ui_detail(data_store, ids[0])
+    assert 'expiry' not in detail, f'/ui/v1 detail still carries expiry {detail.get("expiry")}'
 
 
 def test_naive_expiry_is_refused_at_the_edge_and_creates_nothing(

@@ -25,6 +25,8 @@ SESSION'S OPEN, and OVERDUE (the ruling's STALE, renamed 2026-10-06) from that o
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import exchange_calendars
+import pandas
 import pytest
 
 from common.enums.data_stock import DataSource, Granularity, UpdateType
@@ -33,6 +35,7 @@ from data.store.app.freshness import (
     DEFAULT_STREAM_BAR_MULTIPLE,
     STREAM_BAR_MULTIPLE_ENV,
     CalendarRangeError,
+    ExchangeCalendarAdapter,
     FreshnessConfig,
     FreshnessStatus,
     GapInterval,
@@ -780,3 +783,189 @@ def test_the_calendar_start_itself_is_covered():
     assert XNYS.session_in_progress(NEW_YEAR_1990_LOCAL) is None
     assert XNYS.next_session(date(1990, 1, 1)) == date(1990, 1, 2)
     assert XNYS.sessions_overlapping(NEW_YEAR_1990_LOCAL, datetime(1990, 1, 3, tzinfo=NEW_YORK)) == [date(1990, 1, 2)]
+
+
+# ------------------------------------------------------------------------------ the session table against the calendar
+#
+# a8a3046 (tj-sww0b1 item 7) stopped asking pandas for each session's open and close and reads them once into a
+# list and two dicts, bisecting the list for a range. It is a pure speed change, so the pin is EQUIVALENCE: over
+# every day below, the adapter answers exactly what the exchange_calendars calendar it wraps answers, asked
+# directly. The oracle is the calendar's own data and calls (opens, closes, session_open, date_to_session), never
+# the adapter's arithmetic; the boolean masks over opens and closes are the Protocol's own definitions.
+#
+# THE DAYS: a DST change (Sun 1 Nov 2026), Thanksgiving and its half-day, Christmas Eve's half-day, Christmas, New
+# Year's Day 2027, the weekends between; the September 2001 closure; the calendar's first session (Tue 2 Jan 1990,
+# after the 1 Jan holiday) and its last, the two ends where the range is clamped and the bisect sits on the edge.
+# Non-session days are in every span, so session_open and session_close take their fallback branch there.
+
+ORACLE = exchange_calendars.get_calendar('XNYS', start=pandas.Timestamp(CALENDAR_START))
+TABLE = ExchangeCalendarAdapter(ORACLE, CALENDAR_START)
+ORACLE_LAST = ORACLE.last_session.date()
+
+
+def _span(first: date, last: date) -> list[date]:
+    return [first + timedelta(days=offset) for offset in range((last - first).days + 1)]
+
+
+EQUIVALENCE_DAYS = sorted(
+    set(_span(date(2026, 10, 28), date(2027, 1, 6)))
+    | set(_span(date(2001, 9, 7), date(2001, 9, 19)))
+    | set(_span(CALENDAR_START, date(1990, 1, 5)))
+    | set(_span(ORACLE_LAST - timedelta(days=4), ORACLE_LAST))
+)
+
+
+def _is_session(day: date) -> bool:
+    return pandas.Timestamp(day) in ORACLE.sessions
+
+
+def _oracle_open(day: date) -> datetime:
+    return ORACLE.session_open(pandas.Timestamp(day)).to_pydatetime()
+
+
+def _oracle_close(day: date) -> datetime:
+    return ORACLE.session_close(pandas.Timestamp(day)).to_pydatetime()
+
+
+def _instants() -> list[datetime]:
+    """Each day's local and UTC midnight, and every session's open and close with a tick either side."""
+    found = set()
+    for day in EQUIVALENCE_DAYS:
+        found.add(datetime.combine(day, datetime.min.time(), tzinfo=NEW_YORK))
+        found.add(datetime.combine(day, datetime.min.time(), tzinfo=ZoneInfo('UTC')))
+        found.add(datetime.combine(day, datetime.min.time().replace(hour=12), tzinfo=NEW_YORK))
+        if _is_session(day):
+            for edge in (_oracle_open(day), _oracle_close(day)):
+                found.update({edge - TICK, edge, edge + TICK})
+    # Only instants on or after the calendar start: before it is a CalendarRangeError, pinned above.
+    return sorted(i for i in found if i.astimezone(NEW_YORK).date() >= CALENDAR_START)
+
+
+INSTANTS = _instants()
+
+
+def _dates(index) -> list[date]:
+    return [label.date() for label in index]
+
+
+def _oracle_overlapping(start: datetime, end: datetime) -> list[date]:
+    """The Protocol's definition, over the whole table: [open, close) meets [start, end)."""
+    mask = (ORACLE.opens < pandas.Timestamp(end)) & (ORACLE.closes > pandas.Timestamp(start))
+    return _dates(ORACLE.opens.index[mask])
+
+
+def _oracle_last_completed(now: datetime) -> date | None:
+    done = ORACLE.closes.index[ORACLE.closes <= pandas.Timestamp(now)]
+    return done[-1].date() if len(done) else None
+
+
+def _oracle_in_progress(now: datetime) -> date | None:
+    stamp = pandas.Timestamp(now)
+    found = _dates(ORACLE.opens.index[(ORACLE.opens <= stamp) & (ORACLE.closes > stamp)])
+    assert len(found) <= 1, found
+    return found[0] if found else None
+
+
+def _windows() -> list[tuple[datetime, datetime]]:
+    """From every instant: a tick, each of the next eight instants, three days and ten days."""
+    windows = []
+    for index, start in enumerate(INSTANTS):
+        ends = [start + TICK, start + timedelta(days=3), start + timedelta(days=10)]
+        ends += INSTANTS[index + 1 : index + 9]
+        windows.extend((start, end) for end in ends)
+    return windows
+
+
+def test_the_equivalence_span_holds_what_it_claims():
+    """Guard the guard: half-days, a holiday, weekends, the 2001 closure and both ends of the table are in it."""
+    sessions = [day for day in EQUIVALENCE_DAYS if _is_session(day)]
+    non_sessions = [day for day in EQUIVALENCE_DAYS if not _is_session(day)]
+    assert {date(2026, 11, 27), date(2026, 12, 24)} <= set(sessions)
+    assert {date(2026, 11, 26), date(2026, 12, 25), date(2027, 1, 1), date(2001, 9, 11), date(1990, 1, 1)} <= set(
+        non_sessions
+    )
+    assert any(day.weekday() >= 5 for day in non_sessions)
+    assert _oracle_close(date(2026, 11, 27)) == z('2026-11-27T18:00:00Z'), 'the half-day is not a half-day'
+    assert ORACLE.first_session.date() in sessions and ORACLE_LAST in sessions
+    assert calendar_for_source(DataSource.ALPACA_API).__class__ is ExchangeCalendarAdapter
+
+
+def test_session_open_and_close_equal_the_calendars_on_every_session():
+    for day in EQUIVALENCE_DAYS:
+        if _is_session(day):
+            for got, want in (
+                (TABLE.session_open(day), _oracle_open(day)),
+                (TABLE.session_close(day), _oracle_close(day)),
+            ):
+                assert (got, got.tzinfo) == (want, want.tzinfo), (day, got, want)
+
+
+@pytest.mark.parametrize('method', ['session_open', 'session_close'])
+def test_a_non_session_day_gets_the_calendars_own_refusal(method: str):
+    """The fallback branch: not in the table, so the calendar is asked, and its NotSessionError comes back as is."""
+    refused = 0
+    for day in EQUIVALENCE_DAYS:
+        if _is_session(day):
+            continue
+        with pytest.raises(exchange_calendars.errors.NotSessionError) as table_error:
+            getattr(TABLE, method)(day)
+        with pytest.raises(exchange_calendars.errors.NotSessionError) as oracle_error:
+            getattr(ORACLE, method)(pandas.Timestamp(day))
+        assert str(table_error.value) == str(oracle_error.value), day
+        refused += 1
+    assert refused > 20, refused
+
+
+def test_sessions_overlapping_equals_the_calendar_over_every_boundary_window():
+    windows = _windows()
+    assert len(windows) > 5000, len(windows)
+    differ = [
+        (start, end, got, want)
+        for start, end in windows
+        if (got := TABLE.sessions_overlapping(start, end)) != (want := _oracle_overlapping(start, end))
+    ]
+    assert not differ, differ[:5]
+
+
+def test_sessions_overlapping_reaches_both_ends_of_the_table():
+    """The clamped edges, where the bisect bounds are the table's first and last sessions themselves."""
+    first, last = ORACLE.first_session.date(), ORACLE_LAST
+    assert TABLE.sessions_overlapping(
+        datetime(1990, 1, 1, tzinfo=NEW_YORK), datetime(1990, 1, 2, 12, tzinfo=NEW_YORK)
+    ) == [first]
+    tail = TABLE.sessions_overlapping(_oracle_open(last) - timedelta(days=1), _oracle_close(last) + timedelta(days=30))
+    assert tail[-1] == last and tail == _oracle_overlapping(_oracle_open(last) - timedelta(days=1), _oracle_close(last))
+
+
+def test_last_completed_session_and_session_in_progress_equal_the_calendar_at_every_instant():
+    differ = [
+        (now, TABLE.last_completed_session(now), _oracle_last_completed(now))
+        for now in INSTANTS
+        if TABLE.last_completed_session(now) != _oracle_last_completed(now)
+    ]
+    differ += [
+        (now, TABLE.session_in_progress(now), _oracle_in_progress(now))
+        for now in INSTANTS
+        if TABLE.session_in_progress(now) != _oracle_in_progress(now)
+    ]
+    assert not differ, differ[:5]
+
+
+def test_next_session_equals_the_calendar_on_every_day_before_the_last():
+    for day in EQUIVALENCE_DAYS:
+        if day < ORACLE_LAST:
+            want = ORACLE.date_to_session(pandas.Timestamp(day + timedelta(days=1)), direction='next').date()
+            assert TABLE.next_session(day) == want, day
+
+
+def test_the_table_still_refuses_before_the_calendar_start():
+    """The session table changed nothing at the lower bound: every entry point still raises CalendarRangeError."""
+    before = datetime(1989, 12, 31, 12, tzinfo=NEW_YORK)
+    for call in (
+        lambda: TABLE.sessions_overlapping(before, z('1990-01-10T00:00:00Z')),
+        lambda: TABLE.last_completed_session(before),
+        lambda: TABLE.session_in_progress(before),
+        lambda: TABLE.next_session(date(1989, 12, 29)),
+    ):
+        with pytest.raises(CalendarRangeError):
+            call()

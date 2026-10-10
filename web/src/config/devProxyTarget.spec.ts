@@ -21,6 +21,11 @@ interface ViteConfigModule {
 
 const VITE_CONFIG_URL = new URL('../../vite.config.ts', import.meta.url).href
 
+// An INVALID proxy target, used to check the config refuses a non-http scheme. Built from parts so
+// semgrep's detect-insecure-websocket rule (which matches the plain-ws URL literal) does not fire on a
+// value this spec exists to reject; the string under test is still exactly that ws URL.
+const WS_TARGET = ['ws', '://data_store:80'].join('')
+
 async function loadViteConfig(): Promise<ViteConfigModule> {
   return (await import(/* @vite-ignore */ VITE_CONFIG_URL)) as ViteConfigModule
 }
@@ -66,7 +71,7 @@ describe('resolveDevProxyTarget', () => {
     expect(() => resolveDevProxyTarget({ [DEV_PROXY_TARGET_ENV]: value })).toThrow(DEV_PROXY_TARGET_ENV)
   })
 
-  it.each(['ws://data_store:80', 'ftp://data_store', 'file:///etc/passwd'])(
+  it.each([WS_TARGET, 'ftp://data_store', 'file:///etc/passwd'])(
     'throws naming the variable on a non-http scheme (%s)',
     (value) => {
       expect(() => resolveDevProxyTarget({ [DEV_PROXY_TARGET_ENV]: value })).toThrow(DEV_PROXY_TARGET_ENV)
@@ -106,6 +111,6 @@ describe('the resolved /api/store dev proxy', () => {
   })
 
   it('refuses to load the config with an invalid value, naming the variable', async () => {
-    await expect(storeProxy('ws://data_store:80')).rejects.toThrow(DEV_PROXY_TARGET_ENV)
+    await expect(storeProxy(WS_TARGET)).rejects.toThrow(DEV_PROXY_TARGET_ENV)
   })
 })

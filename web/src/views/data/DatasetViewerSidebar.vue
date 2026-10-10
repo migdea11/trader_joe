@@ -369,9 +369,6 @@ const hasRange = computed(() => range.value.from !== undefined || range.value.to
 }
 
 .side-option input {
-  accent-color: var(--tj-accent-tint);
   margin: 0;
-  width: 15px;
-  height: 15px;
 }
 </style>

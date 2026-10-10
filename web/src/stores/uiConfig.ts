@@ -12,8 +12,8 @@ import type { AccountGroupName } from '@/theme/semantics'
 
 export type UiConfigStatus = 'idle' | 'loading' | 'ready' | 'error'
 
-/** Shown for an empty deployment_label: the server named nothing. */
-export const NO_DEPLOYMENT_LABEL = 'Unlabelled'
+/** Labels (lower case) that mean production, which carries no header tag. */
+const PROD_LABELS: ReadonlySet<string> = new Set(['prod', 'production'])
 /** Shown for an empty server_version. */
 export const UNKNOWN_VERSION = 'Unknown'
 
@@ -64,9 +64,11 @@ export const useUiConfigStore = defineStore('uiConfig', () => {
     }
   }
 
-  /** The tag text: the label, or an explicit "none set" state, never a made-up name. */
-  const deploymentTag = computed(() => (deploymentLabel.value === '' ? NO_DEPLOYMENT_LABEL : deploymentLabel.value))
-  const hasDeploymentLabel = computed(() => deploymentLabel.value !== '')
+  /** The header tag text, or null when none is shown: an empty label and prod render nothing. */
+  const deploymentTag = computed(() => {
+    const label = deploymentLabel.value
+    return label === '' || PROD_LABELS.has(label.toLowerCase()) ? null : label
+  })
   const serverVersionText = computed(() => (serverVersion.value === '' ? UNKNOWN_VERSION : serverVersion.value))
   const uiVersionText = computed(() => (UI_VERSION === '' ? UNKNOWN_VERSION : UI_VERSION))
 
@@ -76,7 +78,6 @@ export const useUiConfigStore = defineStore('uiConfig', () => {
     deploymentLabel,
     serverVersion,
     deploymentTag,
-    hasDeploymentLabel,
     serverVersionText,
     uiVersionText,
     load,

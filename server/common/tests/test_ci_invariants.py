@@ -3223,6 +3223,47 @@ def test_semgrep_fails_on_findings(source: str):
     )
 
 
+# The web test specs are test code, excluded the way --exclude=tests/ excludes the Python tests
+# (tj-grna9p.106): a spec that must name a rejected insecure-websocket URL otherwise trips semgrep's
+# websocket rule, and had to build the URL from parts to pass. Parity above keeps the two sides equal;
+# this pins that the exclude is on them, which parity cannot see when both sides drop it together.
+SEMGREP_SPEC_EXCLUDE = '--exclude=*.spec.ts'
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize('source', ['Makefile', 'workflow'])
+def test_semgrep_leaves_the_web_test_specs_out(source: str):
+    """tj-grna9p.106: every semgrep invocation excludes *.spec.ts, as argv (the shell strips the quotes)."""
+    invocations = (
+        {'Makefile security target': _makefile_semgrep_invocation()}
+        if source == 'Makefile'
+        else _workflow_semgrep_invocations()
+    )
+    missing = {
+        where: shlex.join(words)
+        for where, words in invocations.items()
+        if SEMGREP_SPEC_EXCLUDE not in _semgrep_arguments(words)
+    }
+    assert not missing, (
+        f'semgrep scans the web test specs, so a spec naming a rejected URL fails the gate: {missing}. '
+        f'Put {SEMGREP_SPEC_EXCLUDE} back on both the Makefile and the workflow line.'
+    )
+
+
+@pytest.mark.build_infra
+def test_the_makefile_names_no_insecure_websocket_url():
+    """The Makefile is scanned and is not a test, so a ws:// literal in it, even in a comment, trips semgrep.
+
+    tj-grna9p.106: the comment explaining the *.spec.ts exclude must describe the URL, not spell it.
+    """
+    lines = [
+        f'{number}: {line}'
+        for number, line in enumerate(MAKEFILE.read_text(encoding='utf-8').splitlines(), start=1)
+        if 'ws://' in line.lower()
+    ]
+    assert not lines, f'{MAKEFILE.name} spells an insecure websocket URL, which make security flags: {lines}'
+
+
 # ---------------------------------------------------------------------------------------
 # THE SYSTEM TESTING JOB (Sys-5 tj-vhboky.52, pinned by Sys-6 tj-vhboky.53)
 #

@@ -29,3 +29,48 @@ samp,
 .tj-mono {
   font-family: var(--tj-font-mono);
 }
+
+/* Native checkboxes (the Datasets and viewer sidebars). The browser default paints the unchecked
+   box white; this draws it from the tokens instead: raised fill, text3 border (over the 3:1
+   non-text minimum on the ground and the surface), accent tint when checked. The tick is drawn
+   in the ground colour on the tint (shape only, no hex). */
+input[type='checkbox'] {
+  appearance: none;
+  position: relative;
+  flex-shrink: 0;
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  box-sizing: border-box;
+  border: 1px solid var(--tj-text3);
+  border-radius: 3px;
+  background: var(--tj-raised);
+  cursor: pointer;
+}
+
+input[type='checkbox']:hover:not(:disabled) {
+  border-color: var(--tj-text2);
+}
+
+input[type='checkbox']:checked {
+  background: var(--tj-accent-tint);
+  border-color: var(--tj-accent-tint);
+}
+
+input[type='checkbox']:checked::after {
+  content: '';
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  width: 4px;
+  height: 8px;
+  border: solid var(--tj-ground);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+/* Keyboard focus keeps the global 2px accent ring (:focus-visible above). */
+input[type='checkbox']:disabled {
+  opacity: 0.55;
+  cursor: default;
+}

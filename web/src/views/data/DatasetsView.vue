@@ -18,8 +18,8 @@ import { useDatasetCatalogStore } from '@/stores/datasetCatalog'
 
 const { filters } = useCatalogFilters()
 const store = useDatasetCatalogStore()
-const { facets, loadedRows, listDone, listStatus } = storeToRefs(store)
-const { setFooterSummary } = useFooterSummary()
+const { facets, facetsError, tilesError, listError, loadedRows, listDone, listStatus } = storeToRefs(store)
+const { setFooterSummary, setFooterUpdated, setFooterProblem } = useFooterSummary()
 
 const showRequest = ref(false)
 
@@ -29,13 +29,12 @@ const requestText = computed(() => `GET ${listDatasetsRequest({ ...toApiFilters(
 // The counts under the filters, for the sidebar. A filter change refetches them.
 watch(
   () => filtersKey(filters.value),
-  () => void store.loadFacets(filters.value),
+  () => store.filtersChanged(filters.value),
 )
 
-onMounted(() => {
-  void store.loadFacets(filters.value)
-  void store.loadTiles()
-})
+// One facets request serves the sidebar and the tiles when no filter is active; with a filter set
+// on arrival the filtered facets and the whole-catalog tiles go out in parallel.
+onMounted(() => store.loadCounts(filters.value))
 
 // "9 of 38 datasets · sorted by symbol": rows loaded so far over the total under the filters (the
 // view's own count from the facets; the loaded count itself once the last page is in).
@@ -56,7 +55,34 @@ watch(
   { immediate: true },
 )
 
-onBeforeUnmount(() => setFooterSummary(null))
+// "Updated <time>": the list loaded (or came back empty). The page does not poll, so this is how
+// stale the rows on screen are; the header's Refresh reloads.
+watch(
+  listStatus,
+  (status) => {
+    if (status === 'ready' || status === 'empty') setFooterUpdated(Date.now())
+  },
+  { immediate: true },
+)
+
+// A failed list, facets or tiles request is the footer's problem line; it clears on success.
+watch(
+  [listError, facetsError, tilesError],
+  ([list, facet, tile]) => {
+    const failed = list ?? facet ?? tile
+    if (failed === null) return setFooterProblem(null)
+    const what = list !== null ? 'datasets' : 'counts'
+    const id = failed.errorId === undefined ? '' : ` (error id ${failed.errorId})`
+    setFooterProblem(`Could not load ${what}: ${failed.message}${id}`)
+  },
+  { immediate: true },
+)
+
+onBeforeUnmount(() => {
+  setFooterSummary(null)
+  setFooterUpdated(null)
+  setFooterProblem(null)
+})
 </script>
 
 <template>
