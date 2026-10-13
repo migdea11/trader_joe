@@ -38,6 +38,8 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from common.enums.data_stock import Feed
 from common.errors.vocabulary import ERROR_DOMAIN, TraderJoeError, own_error_id
 from common.logging import get_logger
@@ -48,10 +50,11 @@ from data.store.app.database.crud.ingest_run import (
     acknowledge_run,
     fail_interrupted_runs,
     finish_run,
+    ingest_run_table_exists,
     start_run,
 )
 from data.store.app.database.database import own_session
-from data.store.app.database.models.ingest_run import IngestRunState, IngestRunTrigger
+from data.store.app.database.models.ingest_run import IngestRun, IngestRunState, IngestRunTrigger
 from data.store.app.events import IngestRunChanged, publish
 from schemas.data_store.asset_dataset_store import StoreAssetDatasetBody, StoreAssetDatasetPath
 
@@ -199,6 +202,19 @@ async def _begin(
         return None
 
 
+async def _table_is_missing(session: AsyncSession) -> bool:
+    """True only when the probe ran and the table is absent; a probe that fails answers False.
+
+    A failed probe must fall through to the sweep's own path, which logs and returns as before. The
+    session is rolled back first, since a failed statement leaves the connection's transaction aborted.
+    """
+    try:
+        return not await ingest_run_table_exists(session)
+    except Exception:
+        await session.rollback()
+        return False
+
+
 async def sweep_interrupted_runs() -> int:
     """Fail every run a previous process left RUNNING, as FAILED / INTERRUPTED. Called once at startup.
 
@@ -209,6 +225,12 @@ async def sweep_interrupted_runs() -> int:
     """
     try:
         async with own_session() as session:
+            if await _table_is_missing(session):
+                log.warning(
+                    f'Startup sweep skipped: table {IngestRun.__tablename__} does not exist; '
+                    'the database has not been migrated, run make migrate'
+                )
+                return 0
             swept = await fail_interrupted_runs(session)
     except Exception as error:
         log.error(f'Could not sweep interrupted runs: {type(error).__name__}')

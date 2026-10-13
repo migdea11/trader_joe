@@ -420,6 +420,136 @@ async def test_a_sweep_that_cannot_run_is_logged_and_startup_goes_on(recorder, c
     assert any('Could not sweep' in record.message for record in caplog.records)
 
 
+# --- the sweep on a never-migrated database (tj-s6r3rt.5) -----------------------------------------------------------
+#
+# DESIGN: tj-s6r3rt.5. Before its UPDATE the sweep asks whether ingest_run exists, by a READ (to_regclass) that does
+# not go through write_transaction. Missing: ONE warning naming the table and make migrate, no UPDATE, return 0, no
+# traceback -- write_transaction (transaction.py, unchanged) logs every unclassified write failure with exc_info, and
+# that was the ~100 lines. Present: the sweep as before. The probe raising: fall through to the sweep as before.
+#
+# SQLite has no to_regclass, so `to_regclass` below registers a stand-in with Postgres's contract (the name when the
+# table exists, NULL when it does not) on the test's one connection. That runs the crud's real statement end to end
+# against a table that is really there or really dropped. What it cannot show is Postgres binding the argument
+# (asyncpg); that half is tests/system's.
+
+
+@pytest_asyncio.fixture
+async def to_regclass(engine: AsyncEngine) -> None:
+    async with engine.connect() as connection:
+        driver = (await connection.get_raw_connection()).driver_connection
+        catalogue = driver._conn  # aiosqlite's sqlite3 handle; the stand-in runs on aiosqlite's own thread
+
+        def stand_in(name: str) -> str | None:
+            row = catalogue.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", (name,))
+            return None if row.fetchone() is None else name
+
+        await driver.create_function('to_regclass', 1, stand_in)
+
+
+def _spy(monkeypatch: pytest.MonkeyPatch, name: str) -> list[object]:
+    """Journal each call of run_recording.<name> and what it returned, still calling the real one."""
+    journal: list[object] = []
+    real = getattr(run_recording, name)
+
+    async def spy(*args, **kwargs):
+        result = await real(*args, **kwargs)
+        journal.append(result)
+        return result
+
+    monkeypatch.setattr(run_recording, name, spy)
+    return journal
+
+
+async def _two_running_runs(engine: AsyncEngine) -> list[crud.IngestRunRecord]:
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        return [await crud.start_run(session, _new_run()) for _ in range(2)]
+
+
+@pytest.mark.asyncio
+async def test_on_a_never_migrated_database_the_sweep_warns_once_and_writes_nothing(
+    recorder, engine, to_regclass, caplog, monkeypatch
+):
+    async with engine.begin() as connection:
+        await connection.run_sync(lambda sync: IngestRun.__table__.drop(sync))
+    probed = _spy(monkeypatch, 'ingest_run_table_exists')
+    updates = _spy(monkeypatch, 'fail_interrupted_runs')
+
+    with caplog.at_level(logging.DEBUG):
+        assert await run_recording.sweep_interrupted_runs() == 0
+
+    assert probed == [False], 'the probe must have run, and answered that the table is missing'
+    assert updates == [], 'no UPDATE may be attempted against a table that does not exist'
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == [], 'no ERROR, from transaction.py or anywhere'
+    assert [r for r in caplog.records if r.exc_info] == [], 'no traceback'
+    (warning,) = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warning.name == run_recording.__name__
+    assert IngestRun.__tablename__ in warning.getMessage() and 'make migrate' in warning.getMessage()
+
+
+@pytest.mark.asyncio
+async def test_on_a_migrated_database_the_probe_finds_the_table_and_the_sweep_runs(
+    recorder, engine, to_regclass, caplog, monkeypatch
+):
+    left = await _two_running_runs(engine)
+    probed = _spy(monkeypatch, 'ingest_run_table_exists')
+
+    with caplog.at_level(logging.DEBUG):
+        assert await run_recording.sweep_interrupted_runs() == 2
+
+    assert probed == [True]
+    rows = {row.id: row for row in await recorder.rows()}
+    assert {(rows[r.id].state, rows[r.id].error_reason) for r in left} == {(IngestRunState.FAILED, INTERRUPTED_REASON)}
+    assert not any('Startup sweep skipped' in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('probe', ['raises', 'unknown function'])
+async def test_a_probe_that_fails_falls_through_to_the_sweep(recorder, engine, caplog, monkeypatch, probe):
+    """A probe that cannot answer leaves the sweep exactly as it was.
+
+    'unknown function' is SQLite without the stand-in: the probe's own statement fails, as on a database
+    that cannot answer it; 'raises' is any exception out of the probe.
+    """
+    left = await _two_running_runs(engine)
+    if probe == 'raises':
+
+        async def failing_probe(db):
+            raise RuntimeError('the catalogue cannot be read')
+
+        monkeypatch.setattr(run_recording, 'ingest_run_table_exists', failing_probe)
+
+    with caplog.at_level(logging.DEBUG):
+        assert await run_recording.sweep_interrupted_runs() == 2
+
+    rows = {row.id: row for row in await recorder.rows()}
+    assert {rows[r.id].state for r in left} == {IngestRunState.FAILED}
+    assert not any('Startup sweep skipped' in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('exists', [True, False])
+async def test_the_probe_is_one_to_regclass_read_of_the_models_table_name(exists):
+    """Under the Postgres dialect: SELECT to_regclass(<IngestRun.__tablename__>) IS NOT NULL, a plain read."""
+    from sqlalchemy.dialects import postgresql
+
+    executed = []
+
+    class Result:
+        def scalar_one(self):
+            return exists
+
+    class Session:
+        async def execute(self, statement):
+            executed.append(statement)
+            return Result()
+
+    assert await crud.ingest_run_table_exists(Session()) is exists
+    (statement,) = executed
+    compiled = statement.compile(dialect=postgresql.dialect())
+    assert str(compiled).replace('\n', ' ') == 'SELECT to_regclass(%(to_regclass_1)s) IS NOT NULL AS anon_1'
+    assert compiled.params == {'to_regclass_1': IngestRun.__tablename__}
+
+
 @pytest.mark.asyncio
 async def test_the_lifespan_sweeps_after_the_database_is_initialised(monkeypatch):
     """Item 5: the sweep runs in data_store's lifespan, AFTER database.initialize, before anything is served."""

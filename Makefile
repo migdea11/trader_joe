@@ -417,16 +417,30 @@ prod-down:  ## Stop the production stack
 # and it would make the production migration path depend on uv being usable on the server.
 # The script resolves the repo root itself, so this works from any directory.
 #
-# Production-shaped, and deliberately not a prerequisite of any launch target: the accepted
-# direction (tj-x3ig38) is that migrations are a deploy-script step, never a compose
-# dependency and never the entrypoint, because a rollback re-runs `compose up` and would
-# re-apply the migration from the wrong revision directory. The script passes
-# -f docker-compose.yaml itself, so this runs against the production data_store definition
-# even when the dev stack is what is up -- postgres is the same container either way, and the
-# one-off data_store container joins data_store's prod networks, store_db included, which is how
-# it reaches the database. It needs no egress and no devnet.
+# Applies to the RUNNING stack, with no new command: the script reads the compose config_files
+# label of the running postgres container and uses the DEV definition (docker-compose.yaml +
+# docker-compose.override.yaml) when postgres was started with docker-compose.override.yaml, and
+# the PRODUCTION definition (docker-compose.yaml) in every other case, every ambiguous one
+# included, so a selection problem never refuses the remedy. One line on stderr says which
+# definition was chosen and why; stdout is untouched. (superseded: "always the production
+# definition, even when the dev stack is up" -- see tj-slxynv, tj-x3ig38 addendum 2026-10-12.)
+#
+# The code that runs is the IMAGE of the chosen definition: :dev after `make dev-build`, :latest
+# after `make prod-build`. The revisions applied come from this checkout in both cases. On the
+# production definition the two can disagree silently. On the dev definition they cannot: the
+# override bind-mounts the code as well, so there is no image/revision split in dev.
+#
+# Deliberately not a prerequisite of any launch target, and that reasoning still applies to
+# production: the accepted direction (tj-x3ig38) is that migrations are a deploy-script step,
+# never a compose dependency and never the entrypoint, because a rollback re-runs `compose up`
+# and would re-apply the migration from the wrong revision directory. The one-off data_store
+# container joins data_store's networks, store_db included, which is how it reaches the
+# database. The migration itself needs no egress and no devnet. On a DEV stack it is attached to
+# devnet all the same, because the override adds devnet to data_store and the one-off container
+# inherits data_store's networks; devnet is an ordinary bridge, so it can reach out there like any
+# dev service. On the production definition it has store_db only.
 .PHONY: migrate
-migrate:  ## Apply database migrations to the running production stack
+migrate:  ## Apply database migrations to the running stack (dev or prod; prints which)
 	./server/data/store/run_migrations.sh
 
 # READ-ONLY, and the approval for this target was conditional on staying that way: `current`
@@ -442,8 +456,9 @@ migrate:  ## Apply database migrations to the running production stack
 # thing", which no other command here could ask.
 #
 # Two runs of the same script rather than a second compose invocation, for every reason `migrate`
-# goes through it: the repo root, the pinned -f docker-compose.yaml (so the dev override cannot
-# swap in the dev image), the postgres check, and the empty-versions guard -- which matters most
+# goes through it: the repo root, the stack selection (so status reports through the same
+# definition `migrate` uses, dev or production; superseded: a pinned -f docker-compose.yaml, see
+# tj-slxynv), the postgres check, and the empty-versions guard -- which matters most
 # here, since an empty versions/ is the wrong-checkout symptom this target is used to diagnose.
 # alembic has no one command for both, and each container is --rm, so the cost is one extra start.
 .PHONY: migrate-status
@@ -483,9 +498,11 @@ migrate-status:  ## Report the applied revision and the revision history (read-o
 # mounted, so `check` has always compared the IMAGE'S models against the live schema, and a stale
 # image reports phantom drift. run_migrations.sh refuses, before alembic runs, unless the image
 # carries a source stamp equal to this checkout's digest, and prints both on EVERY outcome. The
-# guard lives in the script and not in this recipe because the script owns the `-f
-# docker-compose.yaml` pin that decides which image the one-off container uses; the reasoning is
-# written out there. It is gated on the alembic command being `check`, so `migrate` is untouched.
+# guard lives in the script and not in this recipe because the script owns the stack selection
+# that decides which image the one-off container uses: on a dev stack the comparison image is
+# :dev and the FIX line names `make dev-build` (tj-yb1bxj addendum 4), otherwise :latest and
+# `make prod-build`. The reasoning is written out there. It is gated on the alembic command
+# being `check`, so `migrate` is untouched.
 #
 # THE HELP LINE NAMES THE REFUSAL, THE ORDINARY UNSTAMPED CASE AND THE ESCAPE HATCH, AND POINTS AT
 # run_migrations.sh FOR THE REST (decision tj-yb1bxj addendum 2, item 2 — amending tj-ymsobh R4's
@@ -499,7 +516,7 @@ migrate-status:  ## Report the applied revision and the revision history (read-o
 # already puzzled about why a check passed. That was R4's actual purpose, and a help row nobody
 # reads documents nothing.
 .PHONY: migrate-check
-migrate-check:  ## Compare the models with the live schema (writes alembic_version if absent). REFUSES unless the data_store image's source stamp matches this checkout's digest; an unstamped CI or system-launch image is the ordinary case, not a fault -- make prod-build fixes it. What the stamp does and does not cover: see the comment above. Escape hatch: MIGRATE_CHECK_ALLOW_STALE_IMAGE=1
+migrate-check:  ## Compare the models with the live schema (writes alembic_version if absent). REFUSES unless the data_store image's source stamp matches this checkout's digest; an unstamped CI or system-launch image is the ordinary case, not a fault -- make prod-build (make dev-build on a dev stack) fixes it. What the stamp does and does not cover: see the comment above. Escape hatch: MIGRATE_CHECK_ALLOW_STALE_IMAGE=1
 	./server/data/store/run_migrations.sh check
 
 .PHONY: dev-build

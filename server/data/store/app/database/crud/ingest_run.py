@@ -222,6 +222,23 @@ async def finish_run(
         return IngestRunRecord.from_row((await db.execute(stmt)).one())
 
 
+async def ingest_run_table_exists(db: AsyncSession) -> bool:
+    """Whether the ingest_run table exists, by one catalogue read that does not open a write transaction.
+
+    The startup sweep asks before its UPDATE: on a never-migrated database the UPDATE would fail with
+    UndefinedTable, which write_transaction (rightly, for every write) logs as a bug with its full
+    traceback. A read here keeps that out of the sweep without softening write_transaction.
+
+    Args:
+        db: The recorder's own session.
+
+    Returns:
+        bool: True when the table resolves on the session's search path.
+    """
+    result = await db.execute(select(func.to_regclass(IngestRun.__tablename__).is_not(None)))
+    return bool(result.scalar_one())
+
+
 async def fail_interrupted_runs(db: AsyncSession) -> int:
     """Turn every RUNNING row FAILED / INTERRUPTED. The startup sweep.
 
