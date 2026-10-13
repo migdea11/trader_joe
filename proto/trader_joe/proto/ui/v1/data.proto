@@ -158,6 +158,31 @@ message BarPage {
   string next_cursor = 2;
 }
 
+// Where one chart page of a bar window starts (tj-eozqhi).
+message BarPageStart {
+  // bar_start of the page's first bar; read the page's bars with start = this, end = the window's end.
+  google.protobuf.Timestamp start = 1;
+  // The page's first bar as a 0-based position among the window's bars, ascending by bar_start.
+  int64 offset = 2;
+}
+
+// The page index of a bar window [start, end), half-open (tj-eozqhi). Pages are fixed blocks of
+// page_size bars counted back from the newest bar; with r = bar_count mod page_size the offsets are
+// [0 when r > 0], r, r + page_size, ..., bar_count - page_size, and a window of at most page_size bars
+// is the single page [0]. The earliest page (offset 0) holds page_size bars and so overlaps the next
+// block. overlap is the look-ahead a client adds from the next block; it does not move the offsets.
+// The page count is pages.length, exact.
+message BarPageIndex {
+  // Bars in the half-open window [start, end).
+  int64 bar_count = 1;
+  // The page size the index was cut with, in bars.
+  int32 page_size = 2;
+  // The look-ahead the client adds from the next block, in bars, as asked for.
+  int32 overlap = 3;
+  // Ascending by offset; empty when bar_count is 0, one entry when bar_count <= page_size.
+  repeated BarPageStart pages = 4;
+}
+
 // PHASE 2 (tj-grna9p.70): collection runs and the request body. Additive to everything above.
 
 // What started a collection run.

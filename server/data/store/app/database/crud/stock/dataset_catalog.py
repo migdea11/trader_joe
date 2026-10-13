@@ -11,6 +11,7 @@ for however many datasets it is asked about:
     covered_dates       the session dates holding a bar, for a set of STATIC entries, in one statement per time zone
     siblings            the other granularities of a set of entries' series, in one statement
     read_bar_page       one dataset's bars in a window, in one statement
+    read_bar_page_starts  the page index of a window (count and the start of every page), in one statement
 
 THE BAR LOOKUPS KEY ON THE ENTRY'S OWN IDENTITY COLUMNS, NOT ON dataset_id ALONE. The bar table's only index that
 leads with dataset_id is the natural key (dataset_id, asset_symbol, source, feed, granularity, timestamp), so a
@@ -25,7 +26,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import date, datetime
 
-from sqlalchemy import ColumnElement, and_, func, select
+from sqlalchemy import ColumnElement, and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.database.sql_alchemy_nullable_datetime import NullableDateTime
@@ -93,6 +94,19 @@ class CatalogRow:
     expiry: datetime | None
     owner: str
     last_bar: datetime | None
+
+
+@dataclass(frozen=True)
+class BarPageOffset:
+    """Where one page of a bar window starts.
+
+    Attributes:
+        offset: The 0-based rank, ascending by timestamp, of the page's first bar within the window.
+        start: That bar's timestamp.
+    """
+
+    offset: int
+    start: datetime
 
 
 @dataclass(frozen=True)
@@ -320,6 +334,16 @@ async def read_bar_page(
     Returns:
         list[StockMarketActivity]: At most `limit` bars, ascending.
     """
+    conditions = _window_conditions(row, start, end)
+    if after is not None:
+        conditions.append(Bar.timestamp > after)
+    stmt = select(Bar).where(*conditions).order_by(Bar.timestamp).limit(limit)
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+def _window_conditions(row: CatalogRow, start: datetime | None, end: datetime | None) -> list[ColumnElement[bool]]:
+    """The five-column identity predicate plus the half-open window [start, end), shared by every bar read."""
     conditions: list[ColumnElement[bool]] = [
         Bar.dataset_id == row.id,
         Bar.asset_symbol == row.asset_symbol,
@@ -332,8 +356,67 @@ async def read_bar_page(
     if end is not None:
         # Half-open [start, end): a bar AT end belongs to the next range (tj-86g751).
         conditions.append(Bar.timestamp < end)
-    if after is not None:
-        conditions.append(Bar.timestamp > after)
-    stmt = select(Bar).where(*conditions).order_by(Bar.timestamp).limit(limit)
+    return conditions
+
+
+async def read_bar_page_starts(
+    db: AsyncSession, row: CatalogRow, *, start: datetime | None, end: datetime | None, size: int, overlap: int
+) -> tuple[int, list[BarPageOffset]]:
+    """The page index of a dataset's bar window [start, end): its bar count and where every page starts.
+
+    N is the number of bars in the half-open window. Pages are FIXED blocks of `size` bars counted back from the
+    NEWEST bar (owner ruling, tj-eozqhi 2026-10-13): with q = N div size and r = N mod size the pages are
+    offsets r, r + size, ..., N - size (the full blocks), plus offset 0 first when r > 0 (the earliest page, a
+    display exception that holds `size` bars and so overlaps the next block). When r = 0 the first full block is
+    already at 0 and is listed once. N <= size is the single page [0]; N = 0 has no pages. An offset is a 0-based
+    rank ascending by timestamp, the order of read_bar_page, so page k's bars are read_bar_page with
+    start=pages[k].start, end=<the window's end>, limit=size (plus the client's look-ahead).
+
+    ONE STATEMENT, however many bars: this shape:
+        SELECT timestamp, rank, n FROM (
+            SELECT timestamp, row_number() OVER (ORDER BY timestamp) - 1 AS rank,
+                   (SELECT count(*) FROM <window>) AS n
+            FROM <window>) AS ranked
+        WHERE (rank >= n % size AND (rank - n % size) % size = 0) OR rank = 0
+    The count is an uncorrelated scalar subquery (an index-only range scan, evaluated once) and the ranks stream
+    through a WindowAgg over the same index range in timestamp order, so nothing is buffered and only the wanted
+    rows, about N / size of them, leave the database. Both read one snapshot because it is one statement. The
+    window is the five-column equality prefix with timestamp next, an index range scan of the natural key.
+    `rank >= r` is spelled out so the modulo never sees a negative operand, which SQLite and Postgres would
+    otherwise sign differently.
+
+    Args:
+        db: The request's session.
+        row: The dataset whose bars to index.
+        start: Include bars at or after this instant, or None for no lower bound.
+        end: Exclude bars at or after this instant, or None for no upper bound.
+        size: The page width in bars, at least 1.
+        overlap: Unused by the page rule: the look-ahead the client adds from the next block, validated by the
+            caller and carried here only so the signature mirrors the route.
+
+    Returns:
+        tuple[int, list[BarPageOffset]]: N, and the pages ascending by offset; (0, []) for an empty window.
+    """
+    conditions = _window_conditions(row, start, end)
+    count = select(func.count()).select_from(Bar).where(*conditions).correlate(None).scalar_subquery()
+    ranked = (
+        select(
+            Bar.timestamp.label('ts'),
+            (func.row_number().over(order_by=Bar.timestamp) - 1).label('rk'),
+            count.label('n'),
+        )
+        .where(*conditions)
+        .subquery()
+    )
+    # r = n mod size; the full blocks start at r, r + size, ... and the earliest page at 0 is always listed.
+    remainder = ranked.c.n % size
+    stmt = (
+        select(ranked.c.ts, ranked.c.rk, ranked.c.n)
+        .where(or_(and_(ranked.c.rk >= remainder, (ranked.c.rk - remainder) % size == 0), ranked.c.rk == 0))
+        .order_by(ranked.c.rk)
+    )
     result = await db.execute(stmt)
-    return list(result.scalars().all())
+    rows = result.all()
+    if not rows:
+        return 0, []
+    return int(rows[0].n), [BarPageOffset(offset=int(r.rk), start=r.ts) for r in rows]

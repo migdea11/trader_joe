@@ -41,7 +41,8 @@ from zoneinfo import ZoneInfo
 import httpx
 import pytest
 import pytest_asyncio
-from sqlalchemy import event
+from google.protobuf import json_format
+from sqlalchemy import event, insert
 from sqlalchemy.dialects.sqlite import DATETIME
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -76,6 +77,7 @@ from data.store.app.main import app
 from data.store.tests.problem_body import problem, validation_errors
 from data.store.tests.test_coverage_buckets import XTKS
 from routers.data_store.ui_datasets import utc_now
+from routers.data_store.ui_mapping import BarPageIndexMessage
 
 
 pytestmark = pytest.mark.data_store
@@ -698,14 +700,48 @@ async def test_a_bar_inserted_ahead_of_the_cursor_is_served_and_one_behind_it_is
 
 
 @pytest.mark.asyncio
-async def test_the_default_bar_page_is_1000_and_10000_is_the_most(client, engine):
+async def test_the_default_bar_page_is_1000(client, engine):
     dataset = entry('MANY', granularity=Granularity.ONE_MINUTE, source=DataSource.IB_API)
     start = z('2026-10-01T00:00:00Z')
     await store(engine, dataset, *(bar(dataset, start + timedelta(minutes=minute)) for minute in range(1001)))
     url = f'/ui/v1/datasets/{dataset.id}/bars'
     default = (await client.get(url)).json()
     assert (len(default['bars']), bool(default.get('nextCursor'))) == (1000, True)
-    assert len((await client.get(url, params={'limit': 10_000})).json()['bars']) == 1001
+    assert len((await client.get(url, params={'limit': 1001})).json()['bars']) == 1001
+
+
+# tj-grna9p.125 (owner ruling 2026-10-13): the most bars one read returns is 50,000 (was 10,000); the default stays
+# 1,000. The series below is 50,123 bars, so a 50,000 read is a FULL page with a cursor and the next page is 123.
+MAX_BARS = 50_000
+OVER_MAX = 50_123
+
+
+@pytest.mark.asyncio
+async def test_a_50000_bar_read_is_a_full_page_and_its_cursor_continues_without_loss(client, engine):
+    """Up to 50,000 rows in one answer, ascending, then the cursor's page carries on at bar 50,000 to the end."""
+    dataset = await minute_series(engine, OVER_MAX, symbol='MAXBARS')
+    url = f'/ui/v1/datasets/{dataset.id}/bars'
+
+    first = await client.get(url, params={'limit': MAX_BARS})
+    assert first.status_code == 200, first.text
+    body = first.json()
+    assert len(body['bars']) == MAX_BARS, 'a full page at the cap, not clipped to the old 10,000'
+    assert [item['barStart'] for item in body['bars']] == [stamp(minute(index)) for index in range(MAX_BARS)]
+    assert [item['close'] for item in body['bars'][-2:]] == [49_998.0, 49_999.0], 'the values travel with the rows'
+    assert body.get('nextCursor'), 'a full page carries a cursor'
+
+    rest = (await client.get(url, params={'limit': MAX_BARS, 'cursor': body['nextCursor']})).json()
+    assert [item['barStart'] for item in rest['bars']] == [stamp(minute(index)) for index in range(MAX_BARS, OVER_MAX)]
+    assert 'nextCursor' not in rest, 'the short last page ends the walk'
+
+
+@pytest.mark.asyncio
+async def test_the_bars_limit_is_bounded_1_to_50000_and_the_refusal_names_the_cap(client, bars):
+    url = f'/ui/v1/datasets/{bars.dataset.id}/bars'
+    assert len((await client.get(url, params={'limit': MAX_BARS})).json()['bars']) == 10, 'the cap itself is accepted'
+    errors = validation_errors(await client.get(url, params={'limit': MAX_BARS + 1}))
+    assert [error['loc'][-1] for error in errors] == ['limit'], errors
+    assert '50000' in errors[0]['msg'], f'the refusal names the cap: {errors}'
 
 
 @pytest.mark.asyncio
@@ -726,7 +762,7 @@ LIMIT_CASES = {
     'list unknown parameter': ('/ui/v1/datasets', {'stale_days': 3}, 'stale_days'),
     'facets ignores no unknown parameter': ('/ui/v1/datasets/facets', {'limit': 5}, 'limit'),
     'bars limit 0': ('/ui/v1/datasets/{id}/bars', {'limit': 0}, 'limit'),
-    'bars limit 10001': ('/ui/v1/datasets/{id}/bars', {'limit': 10_001}, 'limit'),
+    'bars limit 50001': ('/ui/v1/datasets/{id}/bars', {'limit': 50_001}, 'limit'),
     'bars naive start': ('/ui/v1/datasets/{id}/bars', {'start': '2026-10-05T14:00:00'}, 'start'),
     'bars naive end': ('/ui/v1/datasets/{id}/bars', {'end': '2026-10-05T14:00:00'}, 'end'),
 }
@@ -842,6 +878,9 @@ async def test_a_request_runs_a_constant_number_of_statements_not_one_per_datase
             'detail': await count(f'/ui/v1/datasets/{catalog.ddd.id}'),
             # tj-grna9p.63: the entry and its covered dates, never the detail's five.
             'coverage': await count(f'/ui/v1/datasets/{catalog.ddd.id}/coverage'),
+            # tj-grna9p.120: the entry, then the page index (count and ranks) in one statement. Its growth with
+            # the WINDOW rather than with the datasets is pinned in the bar page index section below.
+            'bar pages': await count(f'/ui/v1/datasets/{catalog.ddd.id}/bar-pages'),
         }
 
     # One running dataset in the small set too, so the running-filtered page is not empty: an empty page skips
@@ -862,6 +901,7 @@ async def test_a_request_runs_a_constant_number_of_statements_not_one_per_datase
         'facets': 3,
         'detail': 5,
         'coverage': 2,
+        'bar pages': 2,
     }, large
 
 
@@ -1709,3 +1749,403 @@ async def test_a_coverage_read_is_two_selects_whatever_the_datasets_and_bars(cli
 
     assert len(few) == len(many) == 2, (few, many)
     assert all(statement.lstrip().upper().startswith('SELECT') for statement in few + many), many
+
+
+# ------------------------------------------------------------------------------------------------- bar page index
+#
+# GET /ui/v1/datasets/{id}/bar-pages (validator, gating tj-grna9p.120; design: the 2026-10-13 OWNER RULINGS note on
+# decision tj-eozqhi, FIXED BLOCKS, which supersedes the decision's item 1, the 950 step). With N bars in the
+# half-open window, q = N div size and r = N mod size: pages are fixed blocks of `size` bars counted BACK FROM THE
+# NEWEST bar, so their offsets are r, r + size, ..., N - size; the earliest page is a display exception at offset 0,
+# listed first when r > 0, which still holds `size` bars and so overlaps its newer neighbour by size - r; when r = 0
+# the first block is already at 0 and is listed once. N <= size is the single page [0], N = 0 has no pages, and
+# M = q + (r > 0). `overlap` is now the LOOK-AHEAD the client adds from the next block (fetch limit size + overlap,
+# none past the newest page): it is still validated 0 <= overlap < size and never moves an offset.
+#
+# The offsets below are the ruling's table written out by hand, not recomputed by the rule, so a test cannot share
+# a mistake with the code it checks. (Re-pinned from the 950-step rule; every changed row says why under the new
+# rule. Rows the two rules agree on -- 0, 1, 999, 1000, 1001, 1950 -- are unchanged.)
+#
+# NOT CLAIMED HERE (SQLite): the plan and its cost. The index-range scan, the streaming WindowAgg and the timings on
+# a million-bar window are Postgres's: tests/system/test_http_ui_bar_pages.py and the measurement on the bead.
+
+PAGE_EPOCH = z('2026-10-01T00:00:00Z')
+
+OFFSET_TABLE = {
+    0: [],
+    1: [0],
+    999: [0],  # r = 999 but N <= size: the single page, never [0, 999]
+    1000: [0],  # r = 0, q = 1: the one full block IS offset 0, listed once
+    1001: [0, 1],  # r = 1: the earliest page [0, 1000) overlaps the newest block [1, 1001) by 999
+    1950: [0, 950],
+    1951: [0, 951],  # was [0, 950, 951]: the newest block is [951, 1951), the earliest anchored at 0
+    1952: [0, 952],  # was [0, 950, 952]
+    2500: [0, 500, 1500],  # r = 500: blocks [500, 1500) and [1500, 2500), plus the earliest
+    3000: [0, 1000, 2000],  # r = 0: three disjoint blocks, offset 0 once; was [0, 950, 1900, 2000]
+}
+
+# 180,437 bars (the ruling's example: about a year of one-minute bars): r = 437, so the earliest page at 0, then
+# 180 full blocks from 437 to 179,437. 181 pages. Spelled with range() for length, then checked against literals.
+LARGE_WINDOW = 180_437
+LARGE_OFFSETS = [0, *range(437, LARGE_WINDOW, 1000)]
+assert (len(LARGE_OFFSETS), LARGE_OFFSETS[:4], LARGE_OFFSETS[-1]) == (181, [0, 437, 1437, 2437], 179_437)
+
+
+def minute(index: int) -> datetime:
+    return PAGE_EPOCH + timedelta(minutes=index)
+
+
+async def minute_series(engine: AsyncEngine, count: int, symbol: str = 'PAGES') -> StoreDatasetEntry:
+    """A 1min dataset of its own holding COUNT bars, one a minute from PAGE_EPOCH. Source IB: no freshness.
+
+    The entry goes through the ORM; the bars through one Core executemany, so a 180k- or 50k-bar series costs
+    seconds, not the ORM's unit of work per row. The values are bar()'s, column for column.
+    """
+    dataset = entry(symbol, granularity=Granularity.ONE_MINUTE, source=DataSource.IB_API)
+    await store(engine, dataset)
+    template = bar(dataset, PAGE_EPOCH)
+    columns = {
+        column.key: getattr(template, column.key)
+        for column in StockMarketActivity.__table__.columns
+        if getattr(template, column.key, None) is not None
+    }
+    rows = [{**columns, 'timestamp': minute(index), 'close': float(index)} for index in range(count)]
+    if rows:
+        async with engine.begin() as connection:
+            await connection.execute(insert(StockMarketActivity.__table__), rows)
+    return dataset
+
+
+def bar_pages_path(dataset_id: uuid.UUID) -> str:
+    return f'/ui/v1/datasets/{dataset_id}/bar-pages'
+
+
+async def page_index(client: httpx.AsyncClient, dataset_id: uuid.UUID, **params: Any) -> dict:
+    response = await client.get(bar_pages_path(dataset_id), params=params)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def offsets_of(body: dict) -> list[int]:
+    """Each page's offset. Canonical JSON writes an int64 as a string and OMITS a zero, so absent reads as 0."""
+    return [int(page.get('offset', '0')) for page in body.get('pages', [])]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('count', 'expected'), OFFSET_TABLE.items(), ids=[f'N={n}' for n in OFFSET_TABLE])
+async def test_the_page_offsets_are_the_owner_s_fixed_block_table(client, engine, count, expected):
+    """At size 1000, overlap 50: M = len(pages) exactly, ascending, each start the timestamp of the bar at its offset."""
+    dataset = await minute_series(engine, count)
+    body = await page_index(client, dataset.id, size=1000, overlap=50)
+
+    assert int(body.get('barCount', '0')) == count
+    assert offsets_of(body) == expected
+    assert [page['start'] for page in body.get('pages', [])] == [stamp(minute(offset)) for offset in expected]
+    assert (body['pageSize'], body['overlap']) == (1000, 50), 'the index names the geometry it was cut with'
+    if count:
+        # The newest page ends on the window's last bar, full whenever the window holds a full page.
+        assert expected[-1] + min(count, 1000) == count
+    else:
+        assert 'pages' not in body and 'barCount' not in body, body
+
+
+@pytest.mark.asyncio
+async def test_a_year_of_minutes_is_181_pages_counted_back_from_the_newest_bar(client, engine):
+    """N = 180,437, r = 437: [0, 437, 1437, ..., 179437]. M = q + (r > 0) = 180 + 1, exactly, in one request."""
+    dataset = await minute_series(engine, LARGE_WINDOW)
+    body = await page_index(client, dataset.id)
+
+    assert int(body['barCount']) == LARGE_WINDOW
+    assert offsets_of(body) == LARGE_OFFSETS
+    starts = [page['start'] for page in body['pages']]
+    assert (starts[0], starts[1], starts[-1]) == (stamp(minute(0)), stamp(minute(437)), stamp(minute(179_437)))
+    assert starts == [stamp(minute(offset)) for offset in LARGE_OFFSETS]
+
+
+@pytest.mark.asyncio
+async def test_size_and_overlap_default_to_1000_and_50(client, engine):
+    dataset = await minute_series(engine, 1951)
+    default = await page_index(client, dataset.id)
+    assert default == await page_index(client, dataset.id, size=1000, overlap=50)
+    # Was [0, 950, 951] under the 950 step: now the earliest page and the one full block counted from the newest.
+    assert offsets_of(default) == [0, 951]
+
+
+# (size, overlap, N, offsets). Off the default geometry: the step is SIZE whatever the overlap, blocks are counted
+# back from the newest bar, the earliest page is anchored at 0 when r > 0, and r = 0 lists offset 0 once.
+GEOMETRY_CASES = {
+    'no overlap, r = 0, offset 0 not repeated': (1000, 0, 3000, [0, 1000, 2000]),
+    # was [0, 1000, 1500] (blocks from the oldest bar, last anchored): now from the newest, r = 500.
+    'no overlap, r = 500': (1000, 0, 2500, [0, 500, 1500]),
+    # was [0, 1, 2] (a step of one): the overlap no longer shortens the step. r = 2: blocks [2, 12), earliest [0, 10).
+    'overlap size - 1 does not shorten the step': (10, 9, 12, [0, 2]),
+    'size 1 is one page per bar': (1, 0, 3, [0, 1, 2]),
+    # was [0, 7, 14, 20] (step 7): now three disjoint blocks of 10, r = 0.
+    'small pages, default-like overlap, r = 0': (10, 3, 30, [0, 10, 20]),
+    'small pages, r = 7': (10, 3, 27, [0, 7, 17]),
+    'small pages, r = 1, earliest overlaps by 9': (10, 5, 11, [0, 1]),
+    'small pages, N = size': (10, 9, 10, [0]),
+    'small pages, N < size': (10, 0, 9, [0]),
+    'odd size, r = 2': (7, 6, 23, [0, 2, 9, 16]),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('size', 'overlap', 'count', 'expected'), GEOMETRY_CASES.values(), ids=GEOMETRY_CASES)
+async def test_other_page_geometries_follow_the_same_rule(client, engine, size, overlap, count, expected):
+    dataset = await minute_series(engine, count)
+    body = await page_index(client, dataset.id, size=size, overlap=overlap)
+    assert (int(body['barCount']), offsets_of(body)) == (count, expected)
+    assert [page['start'] for page in body['pages']] == [stamp(minute(offset)) for offset in expected]
+    assert (body['pageSize'], body.get('overlap', 0)) == (size, overlap), 'the overlap asked for is echoed'
+
+
+# (size, N, the overlaps to try). Every valid overlap, 0 to size - 1, must give the same offsets: it is the
+# client's look-ahead and never enters the page rule.
+OVERLAP_INVARIANCE = {
+    'size 1000, N 2500': (1000, 2500, [0, 1, 50, 500, 999]),
+    'size 1000, N 3000': (1000, 3000, [0, 1, 50, 999]),
+    'size 10, N 27, every overlap': (10, 27, list(range(10))),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('size', 'count', 'overlaps'), OVERLAP_INVARIANCE.values(), ids=OVERLAP_INVARIANCE)
+async def test_the_overlap_never_moves_an_offset(client, engine, size, count, overlaps):
+    dataset = await minute_series(engine, count)
+    seen = {
+        overlap: offsets_of(await page_index(client, dataset.id, size=size, overlap=overlap)) for overlap in overlaps
+    }
+    assert len({tuple(offsets) for offsets in seen.values()}) == 1, seen
+    assert seen[overlaps[0]] == {2500: [0, 500, 1500], 3000: [0, 1000, 2000], 27: [0, 7, 17]}[count]
+
+
+@pytest.mark.asyncio
+async def test_the_window_is_half_open_and_offsets_count_from_its_first_bar(client, engine):
+    """[minute 10, minute 1962): the bar AT start is offset 0, the bar AT end is not counted. N = 1952, r = 952."""
+    dataset = await minute_series(engine, 2000)
+    window = {'start': stamp(minute(10)), 'end': stamp(minute(1962))}
+    body = await page_index(client, dataset.id, **window)
+
+    # Was [0, 950, 952]: now the earliest page and the one full block [952, 1952) of the window.
+    assert (int(body['barCount']), offsets_of(body)) == (1952, [0, 952])
+    assert [page['start'] for page in body['pages']] == [stamp(minute(10 + offset)) for offset in (0, 952)]
+
+
+# (first bar of the window, N): the window is [minute(first), minute(first + N)) over a 3,100-bar series, so the
+# offsets are relative to a window that does not start at the series' first bar.
+READ_BACK_WINDOWS = {
+    'r = 952, two pages': (10, 1952),
+    'r = 500, three pages': (37, 2500),
+    'r = 0, three disjoint blocks': (5, 3000),
+    'r = 1, earliest overlaps by 999': (90, 1001),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('first', 'count'), READ_BACK_WINDOWS.values(), ids=READ_BACK_WINDOWS)
+async def test_each_page_read_back_through_the_bars_route_is_one_fixed_block(client, engine, first, count):
+    """The docstring's contract: page k = bars?start=pages[k].start&end=<window end>&limit=size = [offset, +size).
+
+    Under the fixed-block rule (replacing 'consecutive pages share at least the overlap'): every page is exactly
+    `size` bars; the full blocks never overlap one another and tile the window's newest q * size bars; the earliest
+    page overlaps its newer neighbour by exactly size - r when r > 0 (and is itself a block when r = 0); the window's
+    last bar is the newest page's last bar; together the pages hold every bar of the window once over.
+    """
+    size, remainder = 1000, count % 1000
+    dataset = await minute_series(engine, 3100)
+    end = stamp(minute(first + count))
+    body = await page_index(client, dataset.id, start=stamp(minute(first)), end=end)
+    window = [stamp(minute(index)) for index in range(first, first + count)]
+
+    pages: list[list[str]] = []
+    for offset, page in zip(offsets_of(body), body['pages'], strict=True):
+        response = await client.get(
+            f'/ui/v1/datasets/{dataset.id}/bars', params={'start': page['start'], 'end': end, 'limit': size}
+        )
+        read = [item['barStart'] for item in response.json()['bars']]
+        assert read == window[offset : offset + size]
+        assert len(read) == size, 'every page of a window over size bars is exactly size bars'
+        pages.append(read)
+
+    shared = [len(set(before) & set(after)) for before, after in pairwise(pages)]
+    if remainder:
+        assert shared == [size - remainder] + [0] * (len(pages) - 2), shared
+    else:
+        assert shared == [0] * (len(pages) - 1), shared
+    assert pages[-1][-1] == window[-1], 'the window ends on the newest page'
+    assert sorted({start for page in pages for start in page}) == window
+
+
+@pytest.mark.asyncio
+async def test_a_window_of_at_most_one_page_reads_back_as_that_page(client, engine):
+    """The single-page exception: N = 999 is one page of 999 bars, not a short page plus a full one."""
+    dataset = await minute_series(engine, 1200)
+    end = stamp(minute(1009))
+    body = await page_index(client, dataset.id, start=stamp(minute(10)), end=end)
+    assert (int(body['barCount']), offsets_of(body)) == (999, [0])
+    response = await client.get(
+        f'/ui/v1/datasets/{dataset.id}/bars', params={'start': body['pages'][0]['start'], 'end': end, 'limit': 1000}
+    )
+    assert [item['barStart'] for item in response.json()['bars']] == [stamp(minute(index)) for index in range(10, 1009)]
+
+
+@pytest.mark.asyncio
+async def test_a_page_read_with_its_look_ahead_takes_the_next_block_s_first_bars(client, engine):
+    """The client's read, limit = size + overlap: page k gains the NEXT (newer) block's first `overlap` bars.
+
+    The newest page has none, because the window's end bounds it. N = 2500, r = 500, overlap 50.
+    """
+    dataset = await minute_series(engine, 2600)
+    end = stamp(minute(2510))
+    body = await page_index(client, dataset.id, start=stamp(minute(10)), end=end)
+    window = [stamp(minute(index)) for index in range(10, 2510)]
+    assert offsets_of(body) == [0, 500, 1500]
+
+    reads = []
+    for page in body['pages']:
+        response = await client.get(
+            f'/ui/v1/datasets/{dataset.id}/bars', params={'start': page['start'], 'end': end, 'limit': 1050}
+        )
+        reads.append([item['barStart'] for item in response.json()['bars']])
+    assert reads[0] == window[0:1050], 'the earliest page plus 50 bars past its own end, inside the next block'
+    assert reads[1] == window[500:1550], "block [500, 1500) plus the next block [1500, ...)'s first 50"
+    assert reads[2] == window[1500:2500], 'the newest page: no look-ahead past the window'
+
+
+@pytest.mark.asyncio
+async def test_bars_of_another_granularity_or_feed_never_enter_the_index(client, engine):
+    """Same symbol, other width: a sibling dataset AND stray rows under this dataset's own id are not counted.
+
+    The stray rows pin the five-column identity predicate the index shares with the bars read: if either read
+    dropped a column, the index's offsets and the bars route's pages would disagree.
+    """
+    dataset = await minute_series(engine, 1001)
+    sibling = entry('PAGES', granularity=Granularity.ONE_HOUR, source=DataSource.IB_API)
+    strays = []
+    for index in range(1001):
+        for granularity, feed in ((Granularity.ONE_HOUR, dataset.feed), (dataset.granularity, Feed.SIP)):
+            stray = bar(dataset, minute(index) + timedelta(seconds=30))
+            stray.granularity, stray.feed = granularity, feed
+            strays.append(stray)
+    await store(engine, sibling, *(bar(sibling, minute(index)) for index in range(1500)), *strays)
+
+    body = await page_index(client, dataset.id)
+    assert (int(body['barCount']), offsets_of(body)) == (1001, [0, 1])
+    assert [page['start'] for page in body['pages']] == [stamp(minute(0)), stamp(minute(1))]
+
+
+@pytest.mark.asyncio
+async def test_an_empty_or_inverted_window_is_an_empty_index_not_an_error(client, engine):
+    """As the bars read (test_no_bounds_reads_everything_and_an_empty_or_inverted_window_is_an_empty_page)."""
+    dataset = await minute_series(engine, 20)
+    for start, end in ((minute(5), minute(5)), (minute(9), minute(2)), (minute(100), minute(200))):
+        body = await page_index(client, dataset.id, start=stamp(start), end=stamp(end))
+        assert body == {'pageSize': 1000, 'overlap': 50}, body
+
+
+@pytest.mark.asyncio
+async def test_bar_pages_of_an_unknown_dataset_is_a_404(client, engine):
+    await minute_series(engine, 3)
+    problem(await client.get(bar_pages_path(uuid.uuid4())), status=404, reason='NOT_FOUND')
+
+
+BAR_PAGES_REFUSALS = {
+    'size 0': ({'size': 0}, 'size'),
+    'size 1001': ({'size': 1001}, 'size'),
+    'negative overlap': ({'overlap': -1}, 'overlap'),
+    'naive start': ({'start': '2026-10-01T00:00:00'}, 'start'),
+    'naive end': ({'end': '2026-10-01T00:00:00'}, 'end'),
+    'unknown parameter': ({'limit': 1000}, 'limit'),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('params', 'field'), BAR_PAGES_REFUSALS.values(), ids=BAR_PAGES_REFUSALS)
+async def test_a_bad_bar_pages_parameter_is_a_422_naming_it(client, engine, params, field):
+    dataset = await minute_series(engine, 3)
+    response = await client.get(bar_pages_path(dataset.id), params=params)
+    assert field in [error['loc'][-1] for error in validation_errors(response)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('size', 'overlap'), [(1000, 1000), (1000, 1001), (10, 50), (1, 1)])
+async def test_an_overlap_not_below_the_size_is_a_422(client, engine, size, overlap):
+    """An overlap >= size would be a step of zero or less: a 422 INVALID_REQUEST, never a page list."""
+    dataset = await minute_series(engine, 30)
+    body = problem(
+        await client.get(bar_pages_path(dataset.id), params={'size': size, 'overlap': overlap}),
+        status=422,
+        reason='INVALID_REQUEST',
+    )
+    assert 'overlap' in body['detail'], body
+
+
+@pytest.mark.asyncio
+async def test_the_size_and_overlap_bounds_are_inclusive(client, engine):
+    dataset = await minute_series(engine, 5)
+    assert offsets_of(await page_index(client, dataset.id, size=1000, overlap=999)) == [0]
+    assert offsets_of(await page_index(client, dataset.id, size=1, overlap=0)) == [0, 1, 2, 3, 4]
+
+
+@pytest.mark.asyncio
+async def test_the_first_page_has_no_offset_on_the_wire_and_parses_as_offset_0(client, engine):
+    """proto3 canonical JSON omits a zero int64: the raw body has no 'offset' key, and a parser reads 0.
+
+    The Python half is here; the generated TypeScript client's reading of it is the web bead's (tj-grna9p.121).
+    """
+    dataset = await minute_series(engine, 1001)
+    response = await client.get(bar_pages_path(dataset.id))
+    raw = response.json()
+    assert 'offset' not in raw['pages'][0], raw
+    assert raw['pages'][1]['offset'] == '1', 'an int64 is a JSON string in canonical JSON'
+
+    parsed = json_format.Parse(response.text, BarPageIndexMessage())
+    assert [(page.offset, page.start.ToDatetime(tzinfo=UTC)) for page in parsed.pages] == [
+        (0, minute(0)),
+        (1, minute(1)),
+    ]
+    assert (parsed.bar_count, parsed.page_size, parsed.overlap) == (1001, 1000, 50)
+
+
+@pytest.mark.asyncio
+async def test_a_bar_pages_request_is_two_selects_however_large_the_window(client, engine):
+    """The entry, then the index: flat from 5 bars to 3000, never one statement per page or per bar."""
+    statements: list[str] = []
+    event.listen(engine.sync_engine, 'before_cursor_execute', lambda *args: statements.append(args[2]))
+
+    async def read(dataset: StoreDatasetEntry) -> list[str]:
+        statements.clear()
+        await page_index(client, dataset.id)
+        return list(statements)
+
+    small = await read(await minute_series(engine, 5, symbol='SMALL'))
+    large = await read(await minute_series(engine, 3000, symbol='LARGE'))
+    assert len(small) == len(large) == 2, (small, large)
+    assert all(statement.lstrip().upper().startswith('SELECT') for statement in small + large), large
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('count', 'pages'), [(3000, 3), (2500, 3), (2999, 3), (1001, 2)])
+async def test_the_index_fetches_one_row_per_page_never_one_per_bar(client, engine, monkeypatch, count, pages):
+    """The page filter runs in SQL: the rows leaving the database are exactly the pages, q + (r > 0) of them.
+
+    Re-pinned from 'at most ceil(N / 950) + 1': under fixed blocks the count is exact, so it is asserted exactly.
+    """
+    original = AsyncSession.execute
+    fetched: list[int] = []
+
+    async def spying(self, statement, *args, **kwargs):
+        result = await original(self, statement, *args, **kwargs)
+        if 'row_number' not in str(statement):
+            return result
+        frozen = result.freeze()
+        fetched.append(len(frozen.data))
+        return frozen()
+
+    monkeypatch.setattr(AsyncSession, 'execute', spying)
+    dataset = await minute_series(engine, count)
+    body = await page_index(client, dataset.id)
+
+    assert fetched == [len(body['pages'])] == [pages], fetched
+    assert pages == count // 1000 + (count % 1000 > 0)

@@ -316,6 +316,14 @@ NEW_MESSAGES = {
         _f('quota_key', 3, S),
         _f('percent_of_window', 4, D),
     ],
+    # tj-grna9p.119 (decision tj-eozqhi): the Viewer's chart page index.
+    (DATA, 'BarPageStart'): [_f('start', 1, T), _f('offset', 2, I64)],
+    (DATA, 'BarPageIndex'): [
+        _f('bar_count', 1, I64),
+        _f('page_size', 2, I32),
+        _f('overlap', 3, I32),
+        _f('pages', 4, f'{UI}BarPageStart', True),
+    ],
     (OPS, 'OpsHealth'): [
         _f('healthy', 1, I64),
         _f('late', 2, I64),

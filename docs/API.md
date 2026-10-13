@@ -15,9 +15,9 @@ server code now lives under `server/`: file paths in this document are relative 
 manifest is at `server/routers/tests/interface_manifest/`.
 
 **Updated for the collection record and live events (2026-10).** The tree then gained the dataset's
-run history and coverage strip (U6, U7), the live-event socket (U8), the `ingest_run` record behind
-S1, and two request-body fields that are accepted and ignored. Those entries and the ones they
-changed say so. What is *not* built is named where it would be looked for: no request log, queue or
+run history and coverage strip (U6, U7), the live-event socket (U8), the Viewer's page index (U9), the
+`ingest_run` record behind S1, and two request-body fields that are accepted and ignored. The U5
+`limit` maximum went from 10,000 to 50,000. Those entries and the ones they changed say so. What is *not* built is named where it would be looked for: no request log, queue or
 scheduler, no write route under `/ui/v1`, and no ops or collection-statistics read.
 
 **Checked on real Postgres, with named gaps.** Every status code and behaviour below was checked in
@@ -166,6 +166,7 @@ It was nine until the Kafka removal, when R1 left the table.
 | U6 | `GET /ui/v1/datasets/{dataset_id}/runs` | data_store | http (protobuf JSON) | none | **Stable** |
 | U7 | `GET /ui/v1/datasets/{dataset_id}/coverage` | data_store | http (protobuf JSON) | none | **Stable** |
 | U8 | `WS /ui/v1/events` | data_store | ws (protobuf JSON frames) | none | **Stable** |
+| U9 | `GET /ui/v1/datasets/{dataset_id}/bar-pages` | data_store | http (protobuf JSON) | none | **Stable** |
 
 data_ingest has no row. Its interface is the gRPC `IngestService.FetchDataset`, declared in
 `proto/trader_joe/proto/internal/ingest/v1/ingest.proto`, handled by
@@ -749,10 +750,52 @@ One `DatasetSummary`, as in U2, with `lastRun`. **404** for an unknown id.
 ### U5 · `GET /ui/v1/datasets/{dataset_id}/bars`
 
 One `BarPage` of the dataset's bars, ascending by bar start, in `[start, end)`. `start` and `end` are
-each optional, and unset leaves that side open. `limit` is 1 to 10000, default 1000. The cursor is the
+each optional, and unset leaves that side open. `limit` is 1 to 50000, default 1000 (the maximum was
+10000 before 2026-10-13; the Viewer keeps reading 1,000-bar pages, and the larger maximum is for
+programmatic readers and the Viewer's CSV export, which reads 50,000 at a time). The cursor is the
 last bar's timestamp, unique within a dataset, so paging is exact while bars are inserted. An empty or
 inverted window is an empty page, not an error. **404** for an unknown dataset, 422 for a bad cursor.
 Bars are raw (unadjusted), as on S5.
+
+### U9 · `GET /ui/v1/datasets/{dataset_id}/bar-pages`
+
+The page index of a bar window: where each fixed-size block of the window starts, so a client can
+read any page of U5 with one index seek instead of walking a cursor from the start. One
+`BarPageIndex`: `bar_count` (bars in the window), `page_size`, `overlap` (both echoed, so the answer
+is self-describing) and `pages`, oldest first, each a `BarPageStart` of `start` (the page's first
+bar) and `offset` (its 0-based position among the window's bars).
+
+| Parameter | Rule |
+|---|---|
+| `start`, `end` | the window, exactly as U5: optional, timezone-aware, half-open `[start, end)` |
+| `size` | 1 to 1000, default 1000. 422 `INVALID_REQUEST` outside that |
+| `overlap` | 0 to `size` - 1, default 50. 422 `INVALID_REQUEST` outside that |
+
+**The page rule.** Let N be the bars in the window and r = N mod `size`. Blocks of `size` bars are
+counted back from the **newest** bar, so the newest page is always full and the remainder is at the
+old end. The offsets, oldest first, are `[0 when r > 0]`, then r, r + `size`, ..., N - `size`, which
+is M = ceil(N / `size`) pages. N = 0 has no pages and N <= `size` is the one page `[0]`. The earliest
+page, when r > 0, holds a full `size` bars and so overlaps its newer neighbour; every page holds the
+same number of bars.
+
+`overlap` is a look-ahead and never moves an offset: page k is read with U5 using
+`start = pages[k].start`, the window's own `end`, and `limit = size + overlap`, which adds the first
+`overlap` bars of the next (newer) block; the newest page has none. Whatever `overlap` is, the pages
+and offsets are the same.
+
+**Offset 0 is absent from the JSON.** Protobuf canonical JSON omits a field at its default, so the
+earliest page's `offset` is missing and a client reads a missing `offset` as 0. A client that
+indexes `pages[k].offset` without that default reads `undefined`.
+
+**404** for an unknown dataset; **422** `INVALID_REQUEST` for a `size` or `overlap` out of range, a
+naive `start` or `end`, or a parameter the route does not know. An empty or inverted window is an
+empty index (`bar_count` 0, no pages), not an error, as in U5.
+
+**Cost.** Two statements: the dataset's entry, then one read that scans the window twice (a count and
+the ranking of its bars). Measured on Postgres 17 with one-minute bars: about 30 ms at 100,000 bars,
+0.3 s at 1,000,000 and 0.7 s at 2,400,000. The Viewer pays it once per From or
+To change, never per page. The index is a snapshot: bars appended to an open-ended window do not
+show until the next read of it.
 
 ### U6 · `GET /ui/v1/datasets/{dataset_id}/runs`
 

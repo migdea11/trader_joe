@@ -312,6 +312,16 @@ CASES: dict[str, Case] = {
         malformed_field='start',
         reads_one_row=True,
     ),
+    # tj-grna9p.120. The entry is looked up first (the empty table's 404 NOT_FOUND here); the malformed half sends
+    # size 0, below the floor of 1. Its real rows are test_ui_datasets_route.py's bar page index section.
+    'GET /ui/v1/datasets/{dataset_id}/bar-pages': Case(
+        path_params={'dataset_id': str(DELETE_ID)},
+        request={'params': {'start': '2026-01-02T00:00:00Z', 'end': '2026-01-03T00:00:00Z'}},
+        malformed_path_params={'dataset_id': str(DELETE_ID)},
+        malformed_request={'params': {'size': 0}},
+        malformed_field='size',
+        reads_one_row=True,
+    ),
     # tj-grna9p.72. The dataset is looked up first (an empty table here, so the handler's 404 NOT_FOUND); the
     # malformed half sends limit 0, below the route's floor of 1. Its real rows are test_ui_runs_route.py's.
     'GET /ui/v1/datasets/{dataset_id}/runs': Case(

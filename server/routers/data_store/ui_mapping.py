@@ -24,6 +24,7 @@ from data.store.app.database.crud.ingest_run import IngestRunRecord
 from data.store.app.database.crud.stock.dataset_catalog import BarExtent
 from data.store.app.database.models.ingest_run import IngestRunState
 from data.store.app.dataset_catalog import (
+    BarPageIndexResult,
     BarPageResult,
     CoverageResult,
     DatasetDetail,
@@ -46,6 +47,7 @@ DatasetPageMessage = data_pb2.DatasetPage
 DatasetSummaryMessage = data_pb2.DatasetSummary
 DatasetFacetsMessage = data_pb2.DatasetFacets
 BarPageMessage = data_pb2.BarPage
+BarPageIndexMessage = data_pb2.BarPageIndex
 IngestRunPageMessage = data_pb2.IngestRunPage
 CoverageStripMessage = stats_pb2.CoverageStrip
 UiEventMessage = events_pb2.UiEvent
@@ -163,6 +165,22 @@ def facets_message(facets: Facets) -> data_pb2.DatasetFacets:
         data_pb2.StatusFacet(status=_enum_value(data_pb2.FreshnessStatus, 'FRESHNESS_STATUS_', status), count=count)
         for status, count in facets.statuses.items()
     )
+    return message
+
+
+def bar_page_index_message(index: BarPageIndexResult) -> data_pb2.BarPageIndex:
+    """A bar window's page index as a BarPageIndex message.
+
+    Args:
+        index: The index the catalog produced.
+
+    Returns:
+        data_pb2.BarPageIndex: The bar count, the size and overlap it was cut with, and each page's start.
+    """
+    message = data_pb2.BarPageIndex(bar_count=index.bar_count, page_size=index.page_size, overlap=index.overlap)
+    for page in index.pages:
+        entry = message.pages.add(offset=page.offset)
+        entry.start.CopyFrom(to_timestamp(page.start))
     return message
 
 
@@ -322,6 +340,7 @@ def ui_event_message(event: DomainEvent, server_time: datetime) -> events_pb2.Ui
 
 
 __all__ = [
+    'BarPageIndexMessage',
     'BarPageMessage',
     'CoverageStripMessage',
     'DatasetFacetsMessage',
@@ -330,6 +349,7 @@ __all__ = [
     'IngestRunPageMessage',
     'UiConfigMessage',
     'UiEventMessage',
+    'bar_page_index_message',
     'bar_page_message',
     'coverage_strip_message',
     'dataset_page_message',

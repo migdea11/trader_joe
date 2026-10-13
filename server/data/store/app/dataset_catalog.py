@@ -50,7 +50,7 @@ from data.store.app.database.crud.ingest_run import (
     running_dataset_ids,
 )
 from data.store.app.database.crud.stock import dataset_catalog as repo
-from data.store.app.database.crud.stock.dataset_catalog import BarExtent, CatalogFilter, CatalogRow
+from data.store.app.database.crud.stock.dataset_catalog import BarExtent, BarPageOffset, CatalogFilter, CatalogRow
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.freshness import (
     CalendarRangeError,
@@ -75,7 +75,13 @@ MAX_PAGE_LIMIT: Final = 500
 DEFAULT_RUN_LIMIT: Final = 50
 MAX_RUN_LIMIT: Final = 500
 DEFAULT_BAR_LIMIT: Final = 1000
-MAX_BAR_LIMIT: Final = 10_000
+# The most bars one /bars read returns. About 220 B of JSON per bar: 50,000 bars is about 10 MB uncompressed and
+# about 1 MB gzipped, so a million bars is 20 requests. The UI keeps its own 1,000-bar pages (DEFAULT_BAR_LIMIT);
+# the cap is for programmatic readers and the CSV export, which walks the cursor at this size (tj-grna9p.125).
+MAX_BAR_LIMIT: Final = 50_000
+DEFAULT_PAGE_INDEX_SIZE: Final = 1000
+MAX_PAGE_INDEX_SIZE: Final = 1000
+DEFAULT_PAGE_INDEX_OVERLAP: Final = 50
 DEFAULT_COVERAGE_BUCKETS: Final = 120
 MAX_COVERAGE_BUCKETS: Final = 400
 MAX_COVERAGE_GAPS: Final = 500
@@ -239,6 +245,23 @@ class BarPageResult:
 
     bars: list[StockMarketActivity]
     next_cursor: str
+
+
+@dataclass(frozen=True)
+class BarPageIndexResult:
+    """The page index of a bar window.
+
+    Attributes:
+        bar_count: How many bars the half-open window holds.
+        page_size: The page width the index was cut with.
+        overlap: The look-ahead the client adds from the next block, as the index was asked for.
+        pages: Where each page starts, ascending by offset; empty when bar_count is 0.
+    """
+
+    bar_count: int
+    page_size: int
+    overlap: int
+    pages: list[BarPageOffset]
 
 
 @dataclass(frozen=True)
@@ -689,6 +712,46 @@ async def bar_page(
     page = bars[:limit]
     next_cursor = _encode_cursor({'t': page[-1].timestamp.isoformat()}) if len(bars) > limit else ''
     return BarPageResult(bars=page, next_cursor=next_cursor)
+
+
+async def bar_page_index(
+    db: AsyncSession, dataset_id: uuid.UUID, *, start: datetime | None, end: datetime | None, size: int, overlap: int
+) -> BarPageIndexResult | None:
+    """The page index of a dataset's bars in [start, end), or None when no such dataset exists.
+
+    The rule, for N bars in the half-open window, q = N div size, r = N mod size: N = 0 has no pages; N <= size
+    is one page at offset 0; otherwise the pages, oldest first, are offset 0 when r > 0 (the earliest page, which
+    holds `size` bars and so overlaps the next block), then r, r + size, ..., N - size: the full blocks counted
+    back from the newest bar (r = 0 lists offset 0 once). Page k's bars are the bars read (bar_page) with
+    start=pages[k].start, end=<this window's end> and limit=size + overlap, the overlap being the look-ahead
+    taken from the next block (none past the newest). `overlap` does not enter the rule. An empty or inverted
+    window is an empty index, not an error.
+
+    Two statements whatever N: the entry, then the index read (repo.read_bar_page_starts).
+
+    Args:
+        db: The request's session.
+        dataset_id: The dataset's id.
+        start: Include bars at or after this instant, or None for no lower bound.
+        end: Exclude bars at or after this instant, or None for no upper bound.
+        size: The page width, 1 to MAX_PAGE_INDEX_SIZE.
+        overlap: The look-ahead bars the client adds from the next block, 0 to size - 1.
+
+    Returns:
+        BarPageIndexResult | None: The index, or None for an unknown dataset.
+
+    Raises:
+        InvalidRequestError: If size or overlap is out of range, or overlap is not below size (422).
+    """
+    if not 1 <= size <= MAX_PAGE_INDEX_SIZE:
+        raise InvalidRequestError(Reason.INVALID_REQUEST, f'size must be between 1 and {MAX_PAGE_INDEX_SIZE}.')
+    if not 0 <= overlap < size:
+        raise InvalidRequestError(Reason.INVALID_REQUEST, 'overlap must be at least 0 and less than size.')
+    row = await repo.get_catalog_row(db, dataset_id)
+    if row is None:
+        return None
+    bar_count, pages = await repo.read_bar_page_starts(db, row, start=start, end=end, size=size, overlap=overlap)
+    return BarPageIndexResult(bar_count=bar_count, page_size=size, overlap=overlap, pages=pages)
 
 
 def _bar_cursor_timestamp(cursor: str) -> datetime:

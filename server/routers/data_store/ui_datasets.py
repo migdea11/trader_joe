@@ -31,16 +31,20 @@ from data.store.app.database.database import async_db
 from data.store.app.dataset_catalog import (
     DEFAULT_BAR_LIMIT,
     DEFAULT_COVERAGE_BUCKETS,
+    DEFAULT_PAGE_INDEX_OVERLAP,
+    DEFAULT_PAGE_INDEX_SIZE,
     DEFAULT_PAGE_LIMIT,
     DEFAULT_RUN_LIMIT,
     MAX_BAR_LIMIT,
     MAX_COVERAGE_BUCKETS,
+    MAX_PAGE_INDEX_SIZE,
     MAX_PAGE_LIMIT,
     MAX_RUN_LIMIT,
     CatalogQuery,
     DatasetSort,
     StatusGroup,
     bar_page,
+    bar_page_index,
     dataset_coverage,
     dataset_detail,
     facets,
@@ -50,12 +54,14 @@ from data.store.app.dataset_catalog import (
 from routers.common.proto_json import ProtoJSONResponse, proto_route
 from routers.data_store.app_endpoints import UiDatasetsInterface
 from routers.data_store.ui_mapping import (
+    BarPageIndexMessage,
     BarPageMessage,
     CoverageStripMessage,
     DatasetFacetsMessage,
     DatasetPageMessage,
     DatasetSummaryMessage,
     IngestRunPageMessage,
+    bar_page_index_message,
     bar_page_message,
     coverage_strip_message,
     dataset_page_message,
@@ -157,6 +163,23 @@ class UiBarsQuery(InboundContract):
     end: AwareDatetime | None = None
     cursor: Annotated[str | None, Field(min_length=1, max_length=512)] = None
     limit: Annotated[int, Field(ge=1, le=MAX_BAR_LIMIT)] = DEFAULT_BAR_LIMIT
+
+
+class UiBarPagesQuery(InboundContract):
+    """The bar page index's query: a half-open window and the page geometry.
+
+    Attributes:
+        start: Include bars at or after this instant. Timezone-aware.
+        end: Exclude bars at or after this instant. Timezone-aware.
+        size: The page width in bars.
+        overlap: The look-ahead bars the client adds from the next block; must be below size. It does not move
+            the page offsets.
+    """
+
+    start: AwareDatetime | None = None
+    end: AwareDatetime | None = None
+    size: Annotated[int, Field(ge=1, le=MAX_PAGE_INDEX_SIZE)] = DEFAULT_PAGE_INDEX_SIZE
+    overlap: Annotated[int, Field(ge=0)] = DEFAULT_PAGE_INDEX_OVERLAP
 
 
 class UiCoverageQuery(InboundContract):
@@ -272,7 +295,7 @@ async def get_dataset_bars(
 
     The cursor is the last bar's timestamp, which is unique within a dataset, so bars inserted while a client
     pages are never shown twice and never make it skip one that was ahead of it. The limit defaults to 1000 and
-    is at most 10000. An empty or inverted window is not an error: it is an empty page.
+    is at most 50000. An empty or inverted window is not an error: it is an empty page.
 
     Args:
         db: The request's session.
@@ -296,6 +319,48 @@ async def get_dataset_bars(
     if page is None:
         raise _not_found(dataset_id)
     return ProtoJSONResponse(bar_page_message(page))
+
+
+@router.get(UiDatasetsInterface.GET_UI_DATASET_BAR_PAGES, **proto_route(BarPageIndexMessage))
+async def get_dataset_bar_pages(
+    db: Annotated[AsyncSession, Depends(async_db)],
+    dataset_id: Annotated[UUID, Path()],
+    request_query: Annotated[UiBarPagesQuery, Query()],
+) -> ProtoJSONResponse:
+    """The page index of a dataset's bar window [start, end), as a BarPageIndex: the Viewer's pager.
+
+    Pages are fixed blocks of size bars counted back from the newest bar. With N bars in the half-open window, q =
+    N div size and r = N mod size: N = 0 has no pages and N <= size is one page at offset 0. Otherwise the pages,
+    oldest first, are offset 0 when r > 0 (the earliest page, which holds size bars and so overlaps the next
+    block), then r, r + size, ..., N - size (r = 0 lists offset 0 once). Page k's bars are the bars read with
+    start=pages[k].start, the same end and limit=size + overlap, the overlap being the look-ahead taken from the
+    next block. The read runs once per window in a constant number of statements. size defaults to 1000 (at most
+    1000), overlap to 50 (below size; it does not move the offsets). An empty or inverted window is an empty
+    index, not an error.
+
+    Args:
+        db: The request's session.
+        dataset_id: The dataset's id.
+        request_query: The window, page size and overlap.
+
+    Returns:
+        ProtoJSONResponse: A BarPageIndex.
+
+    Raises:
+        InvalidRequestError: NOT_FOUND (404) for an unknown dataset; INVALID_REQUEST (422) when overlap is not
+            below size.
+    """
+    index = await bar_page_index(
+        db,
+        dataset_id,
+        start=request_query.start,
+        end=request_query.end,
+        size=request_query.size,
+        overlap=request_query.overlap,
+    )
+    if index is None:
+        raise _not_found(dataset_id)
+    return ProtoJSONResponse(bar_page_index_message(index))
 
 
 @router.get(UiDatasetsInterface.GET_UI_DATASET_RUNS, **proto_route(IngestRunPageMessage))
