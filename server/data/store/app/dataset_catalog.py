@@ -43,11 +43,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from common.enums.data_stock import DataSource, Granularity, UpdateType
 from common.errors.vocabulary import InvalidRequestError, Reason
 from common.logging import get_logger
+from data.store.app.database.crud.ingest_run import (
+    IngestRunRecord,
+    latest_runs_for_datasets,
+    list_runs_for_dataset,
+    running_dataset_ids,
+)
 from data.store.app.database.crud.stock import dataset_catalog as repo
-from data.store.app.database.crud.stock.dataset_catalog import BarExtent, CatalogFilter, CatalogRow
+from data.store.app.database.crud.stock.dataset_catalog import BarExtent, BarPageOffset, CatalogFilter, CatalogRow
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.freshness import (
     CalendarRangeError,
+    CoverageBucket,
     DatasetHealth,
     FreshnessConfig,
     FreshnessStatus,
@@ -55,15 +62,29 @@ from data.store.app.freshness import (
     UnknownCalendarError,
     calendar_for_source,
     evaluate_dataset,
+    gap_intervals,
+    local_midnight,
 )
+from data.store.app.freshness import coverage_buckets as compute_coverage_buckets
 
 
 log = get_logger(__name__)
 
 DEFAULT_PAGE_LIMIT: Final = 100
 MAX_PAGE_LIMIT: Final = 500
+DEFAULT_RUN_LIMIT: Final = 50
+MAX_RUN_LIMIT: Final = 500
 DEFAULT_BAR_LIMIT: Final = 1000
-MAX_BAR_LIMIT: Final = 10_000
+# The most bars one /bars read returns. About 220 B of JSON per bar: 50,000 bars is about 10 MB uncompressed and
+# about 1 MB gzipped, so a million bars is 20 requests. The UI keeps its own 1,000-bar pages (DEFAULT_BAR_LIMIT);
+# the cap is for programmatic readers and the CSV export, which walks the cursor at this size (tj-grna9p.125).
+MAX_BAR_LIMIT: Final = 50_000
+DEFAULT_PAGE_INDEX_SIZE: Final = 1000
+MAX_PAGE_INDEX_SIZE: Final = 1000
+DEFAULT_PAGE_INDEX_OVERLAP: Final = 50
+DEFAULT_COVERAGE_BUCKETS: Final = 120
+MAX_COVERAGE_BUCKETS: Final = 400
+MAX_COVERAGE_GAPS: Final = 500
 
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
 _ONE_MICROSECOND: Final = timedelta(microseconds=1)
@@ -105,6 +126,8 @@ class CatalogQuery:
         catalog_filter: The SQL-level filters (symbol prefix, source, update type).
         status: Keep datasets whose computed freshness is in this group.
         needs_attention: Keep only Late and Failed datasets.
+        running: Keep only datasets with a run in state RUNNING. Orthogonal to status: a dataset can be Running
+            and Late at once, and how the two rank in one column is the UI's choice.
         sort: The order of the list.
         cursor: The opaque cursor of the previous page, or None for the first.
         limit: The page size.
@@ -113,6 +136,7 @@ class CatalogQuery:
     catalog_filter: CatalogFilter = field(default_factory=CatalogFilter)
     status: StatusGroup | None = None
     needs_attention: bool = False
+    running: bool = False
     sort: DatasetSort = DatasetSort.SYMBOL
     cursor: str | None = None
     limit: int = DEFAULT_PAGE_LIMIT
@@ -146,6 +170,7 @@ class DatasetPage:
         siblings: The other granularities of each dataset on the page.
         next_cursor: The cursor for the next page; empty on the last.
         as_of: The instant freshness was computed at.
+        last_runs: The newest run of each dataset on the page that has one, whatever its state.
     """
 
     views: list[DatasetView]
@@ -153,6 +178,7 @@ class DatasetPage:
     siblings: dict[uuid.UUID, list[tuple[uuid.UUID, Granularity]]]
     next_cursor: str
     as_of: datetime
+    last_runs: dict[uuid.UUID, IngestRunRecord] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -165,6 +191,7 @@ class Facets:
         sources: A count for every source.
         update_types: A count for every update type.
         statuses: A count for every computed freshness status.
+        running: Datasets with a RUNNING run, under every filter except running itself.
     """
 
     all: int
@@ -172,6 +199,7 @@ class Facets:
     sources: dict[DataSource, int]
     update_types: dict[UpdateType, int]
     statuses: dict[FreshnessStatus, int]
+    running: int = 0
 
 
 @dataclass(frozen=True)
@@ -183,12 +211,27 @@ class DatasetDetail:
         extent: What is stored.
         siblings: The other granularities of the series.
         as_of: The instant freshness was computed at.
+        last_run: The dataset's newest run, whatever its state, or None when it has never run.
     """
 
     view: DatasetView
     extent: BarExtent
     siblings: list[tuple[uuid.UUID, Granularity]]
     as_of: datetime
+    last_run: IngestRunRecord | None = None
+
+
+@dataclass(frozen=True)
+class RunPageResult:
+    """One page of a dataset's runs.
+
+    Attributes:
+        runs: The runs, newest first.
+        next_cursor: The cursor for the next page; empty on the last.
+    """
+
+    runs: list[IngestRunRecord]
+    next_cursor: str
 
 
 @dataclass(frozen=True)
@@ -202,6 +245,59 @@ class BarPageResult:
 
     bars: list[StockMarketActivity]
     next_cursor: str
+
+
+@dataclass(frozen=True)
+class BarPageIndexResult:
+    """The page index of a bar window.
+
+    Attributes:
+        bar_count: How many bars the half-open window holds.
+        page_size: The page width the index was cut with.
+        overlap: The look-ahead the client adds from the next block, as the index was asked for.
+        pages: Where each page starts, ascending by offset; empty when bar_count is 0.
+    """
+
+    bar_count: int
+    page_size: int
+    overlap: int
+    pages: list[BarPageOffset]
+
+
+@dataclass(frozen=True)
+class CoverageGapWindow:
+    """A gap as the strip lists it: the half-open window that holds exactly the missing sessions' bars.
+
+    Attributes:
+        start: The local midnight of the gap's first session.
+        end: The local midnight of the day after the gap's last session.
+        sessions: How many sessions are missing.
+    """
+
+    start: datetime
+    end: datetime
+    sessions: int
+
+
+@dataclass(frozen=True)
+class CoverageResult:
+    """A dataset's coverage over its range.
+
+    Attributes:
+        start: The range start, half-open.
+        end: The range end, as DatasetSummary.end reads it.
+        buckets: The strip's buckets, tiling [start, end); empty when the range holds no session.
+        gaps: The first MAX_COVERAGE_GAPS gaps, ascending.
+        gap_count: The number of gaps, which may exceed len(gaps).
+        as_of: The instant coverage was computed at.
+    """
+
+    start: datetime
+    end: datetime
+    buckets: list[CoverageBucket]
+    gaps: list[CoverageGapWindow]
+    gap_count: int
+    as_of: datetime
 
 
 def invalid_cursor() -> InvalidRequestError:
@@ -336,7 +432,10 @@ def _matches(
     update_type: UpdateType | None,
     status: StatusGroup | None,
     needs_attention: bool,
+    running: frozenset[uuid.UUID] | None = None,
 ) -> bool:
+    if running is not None and view.row.id not in running:
+        return False
     if source is not None and view.row.source != source:
         return False
     if update_type is not None and view.row.update_type != update_type:
@@ -365,6 +464,10 @@ async def list_page(
     """
     after = None if query.cursor is None else _key_from_cursor(query.cursor, query.sort)
     rows = sorted(await repo.list_catalog(db, query.catalog_filter), key=lambda row: _sort_key(row, query.sort))
+    if query.running:
+        # One more statement, only for a request that asks for it; rows narrow before freshness is judged.
+        in_flight = await running_dataset_ids(db)
+        rows = [row for row in rows if row.id in in_flight]
     judged_everywhere = query.status is not None or query.needs_attention
 
     views: list[DatasetView]
@@ -390,6 +493,10 @@ async def list_page(
         siblings=await repo.siblings(db, page_rows),
         next_cursor=_cursor_for(page[-1].row, query.sort) if has_more else '',
         as_of=now,
+        # ONE statement for the whole page, never one per dataset. latest_runs_for_datasets ranks each
+        # dataset's runs with a row_number() window function: DISTINCT ON is Postgres-only and would
+        # silently misbehave on the suite's sqlite.
+        last_runs=await latest_runs_for_datasets(db, [row.id for row in page_rows]),
     )
 
 
@@ -421,6 +528,7 @@ async def facets(db: AsyncSession, query: CatalogQuery, now: datetime, config: F
     flt = query.catalog_filter
     rows = await repo.list_catalog(db, CatalogFilter(asset_symbol_prefix=flt.asset_symbol_prefix))
     views = await evaluate_views(db, rows, now, config)
+    in_flight = await running_dataset_ids(db)
 
     def match(view: DatasetView, *, omit: str | None = None, attention: bool | None = None) -> bool:
         return _matches(
@@ -429,6 +537,7 @@ async def facets(db: AsyncSession, query: CatalogQuery, now: datetime, config: F
             update_type=None if omit == 'update_type' else flt.update_type,
             status=None if omit == 'status' else query.status,
             needs_attention=query.needs_attention if attention is None else attention,
+            running=in_flight if query.running and omit != 'running' else None,
         )
 
     def by(key: Callable[[DatasetView], Any], omit: str) -> dict[Any, int]:
@@ -443,6 +552,8 @@ async def facets(db: AsyncSession, query: CatalogQuery, now: datetime, config: F
         sources={member: source_counts.get(member, 0) for member in DataSource},
         update_types={member: update_counts.get(member, 0) for member in UpdateType},
         statuses={member: status_counts.get(member, 0) for member in FreshnessStatus},
+        # Under every filter but running itself, so with running=true it equals the list's total.
+        running=sum(match(view, omit='running') and view.row.id in in_flight for view in views),
     )
 
 
@@ -466,7 +577,106 @@ async def dataset_detail(
     (view,) = await evaluate_views(db, [row], now, config)
     extents = await repo.bar_extents(db, [row])
     siblings = await repo.siblings(db, [row])
-    return DatasetDetail(view=view, extent=extents[row.id], siblings=siblings[row.id], as_of=now)
+    last_run = (await latest_runs_for_datasets(db, [row.id])).get(row.id)
+    return DatasetDetail(view=view, extent=extents[row.id], siblings=siblings[row.id], as_of=now, last_run=last_run)
+
+
+async def dataset_coverage(
+    db: AsyncSession, dataset_id: uuid.UUID, now: datetime, buckets: int = DEFAULT_COVERAGE_BUCKETS
+) -> CoverageResult | None:
+    """A dataset's coverage strip over the trading calendar, or None when no such dataset exists (tj-grna9p.63).
+
+    Two statements, whatever the range: the entry, and the dates its bars fall on. The calendar logic is
+    freshness.py's, unchanged: the same completed-session rule and the same maximal runs as the GAPS status.
+    The range is the one DatasetSummary shows (start, effective_end). It applies to every update type, and a
+    retired DAILY or STREAM dataset is computed over the same range (when its retirement began is not recorded).
+    A bar belongs to the session whose local date it falls on, so a gap's window runs from the local midnight of
+    its first session to the local midnight of the day after its last: it holds exactly the missing sessions' bars.
+
+    Args:
+        db: The request's session.
+        dataset_id: The dataset's id.
+        now: The instant to judge at; aware.
+        buckets: The number of buckets wanted, at most; the caller bounds it to 1..MAX_COVERAGE_BUCKETS.
+
+    Returns:
+        CoverageResult | None: The strip, or None for an unknown dataset.
+
+    Raises:
+        InvalidRequestError: INVALID_REQUEST (422) when no trading calendar covers the dataset: its source has
+            none, or its range starts before the calendar does. Never an empty strip, which would read as no gaps.
+    """
+    row = await repo.get_catalog_row(db, dataset_id)
+    if row is None:
+        return None
+    end = effective_end(row, now)
+    try:
+        calendar = calendar_for_source(row.source)
+        covered = (await repo.covered_dates(db, [row], str(calendar.tz)))[row.id]
+        strip = compute_coverage_buckets(row.start, end, covered, calendar, now, buckets)
+        intervals = gap_intervals(row.start, end, covered, calendar, now)
+    except (UnknownCalendarError, CalendarRangeError):
+        raise InvalidRequestError(
+            Reason.INVALID_REQUEST, 'No trading calendar covers this dataset, so its coverage cannot be computed.'
+        ) from None
+    gaps = [
+        CoverageGapWindow(
+            start=local_midnight(interval.first_session, calendar),
+            end=local_midnight(interval.last_session + timedelta(days=1), calendar),
+            sessions=interval.sessions,
+        )
+        for interval in intervals[:MAX_COVERAGE_GAPS]
+    ]
+    return CoverageResult(start=row.start, end=end, buckets=strip, gaps=gaps, gap_count=len(intervals), as_of=now)
+
+
+def _run_cursor_key(cursor: str) -> tuple[datetime, uuid.UUID]:
+    payload = _decode_cursor(cursor)
+    key = payload.get('k')
+    if payload.get('o') != 'runs' or not isinstance(key, list) or len(key) != 2:
+        raise invalid_cursor()
+    started_at, run_id = key
+    if not isinstance(started_at, str) or not isinstance(run_id, str):
+        raise invalid_cursor()
+    try:
+        moment = datetime.fromisoformat(started_at)
+        parsed_id = uuid.UUID(run_id)
+    except ValueError:
+        raise invalid_cursor() from None
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise invalid_cursor()
+    return moment, parsed_id
+
+
+async def run_page(db: AsyncSession, dataset_id: uuid.UUID, *, cursor: str | None, limit: int) -> RunPageResult | None:
+    """One page of a dataset's runs, newest first, or None when no such dataset exists.
+
+    Keyset on (started_at DESC, id DESC): a run inserted while a client pages starts later than every cursor, so
+    it never shifts a page the client has not read yet. A deleted dataset's runs are not reachable here.
+
+    Args:
+        db: The request's session.
+        dataset_id: The dataset's id.
+        cursor: The opaque cursor of the previous page, or None for the first.
+        limit: How many runs at most.
+
+    Returns:
+        RunPageResult | None: The page, or None for an unknown dataset.
+
+    Raises:
+        InvalidRequestError: If the cursor does not decode (422).
+    """
+    after = None if cursor is None else _run_cursor_key(cursor)
+    if not await repo.dataset_exists(db, dataset_id):
+        return None
+    runs = await list_runs_for_dataset(db, dataset_id, limit=limit + 1, after=after)
+    page = runs[:limit]
+    next_cursor = (
+        _encode_cursor({'o': 'runs', 'k': [page[-1].started_at.isoformat(), str(page[-1].id)]})
+        if len(runs) > limit
+        else ''
+    )
+    return RunPageResult(runs=page, next_cursor=next_cursor)
 
 
 async def bar_page(
@@ -502,6 +712,46 @@ async def bar_page(
     page = bars[:limit]
     next_cursor = _encode_cursor({'t': page[-1].timestamp.isoformat()}) if len(bars) > limit else ''
     return BarPageResult(bars=page, next_cursor=next_cursor)
+
+
+async def bar_page_index(
+    db: AsyncSession, dataset_id: uuid.UUID, *, start: datetime | None, end: datetime | None, size: int, overlap: int
+) -> BarPageIndexResult | None:
+    """The page index of a dataset's bars in [start, end), or None when no such dataset exists.
+
+    The rule, for N bars in the half-open window, q = N div size, r = N mod size: N = 0 has no pages; N <= size
+    is one page at offset 0; otherwise the pages, oldest first, are offset 0 when r > 0 (the earliest page, which
+    holds `size` bars and so overlaps the next block), then r, r + size, ..., N - size: the full blocks counted
+    back from the newest bar (r = 0 lists offset 0 once). Page k's bars are the bars read (bar_page) with
+    start=pages[k].start, end=<this window's end> and limit=size + overlap, the overlap being the look-ahead
+    taken from the next block (none past the newest). `overlap` does not enter the rule. An empty or inverted
+    window is an empty index, not an error.
+
+    Two statements whatever N: the entry, then the index read (repo.read_bar_page_starts).
+
+    Args:
+        db: The request's session.
+        dataset_id: The dataset's id.
+        start: Include bars at or after this instant, or None for no lower bound.
+        end: Exclude bars at or after this instant, or None for no upper bound.
+        size: The page width, 1 to MAX_PAGE_INDEX_SIZE.
+        overlap: The look-ahead bars the client adds from the next block, 0 to size - 1.
+
+    Returns:
+        BarPageIndexResult | None: The index, or None for an unknown dataset.
+
+    Raises:
+        InvalidRequestError: If size or overlap is out of range, or overlap is not below size (422).
+    """
+    if not 1 <= size <= MAX_PAGE_INDEX_SIZE:
+        raise InvalidRequestError(Reason.INVALID_REQUEST, f'size must be between 1 and {MAX_PAGE_INDEX_SIZE}.')
+    if not 0 <= overlap < size:
+        raise InvalidRequestError(Reason.INVALID_REQUEST, 'overlap must be at least 0 and less than size.')
+    row = await repo.get_catalog_row(db, dataset_id)
+    if row is None:
+        return None
+    bar_count, pages = await repo.read_bar_page_starts(db, row, start=start, end=end, size=size, overlap=overlap)
+    return BarPageIndexResult(bar_count=bar_count, page_size=size, overlap=overlap, pages=pages)
 
 
 def _bar_cursor_timestamp(cursor: str) -> datetime:

@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
 import type { VueWrapper } from '@vue/test-utils'
@@ -9,14 +12,28 @@ import { timestampFromMs } from '@bufbuild/protobuf/wkt'
 import type { ColDef, IDatasource, IGetRowsParams } from 'ag-grid-community'
 
 import { DataSource, Feed, Granularity, UpdateType } from '@generated/trader_joe/proto/market/v1/enums_pb'
-import { DatasetSummarySchema, FreshnessStatus, type DatasetSummary } from '@generated/trader_joe/proto/ui/v1/data_pb'
+import {
+  DatasetSummarySchema,
+  FreshnessStatus,
+  IngestRunState,
+  type DatasetSummary,
+} from '@generated/trader_joe/proto/ui/v1/data_pb'
+import { DatasetChange } from '@generated/trader_joe/proto/ui/v1/events_pb'
 import { AccountGroup } from '@generated/trader_joe/proto/ui/v1/shell_pb'
+import { CoverageStripSchema } from '@generated/trader_joe/proto/ui/v1/stats_pb'
 
+import { fakeEvents } from '@/__tests__/fakeEvents'
 import { ApiError } from '@/api'
+import { COALESCE_MS } from '@/catalog/useCatalogLiveRefresh'
+import CoverageCell from '@/components/catalog/CoverageCell.vue'
 import StatusCell from '@/components/catalog/StatusCell.vue'
+import SymbolCell from '@/components/catalog/SymbolCell.vue'
 import router from '@/router'
 import AppShell from '@/shell/AppShell.vue'
+import { useDatasetCoverageStore } from '@/stores/datasetCoverage'
 import { useSettingsStore } from '@/stores/settings'
+import { COVERAGE_UNIT, titleCase } from '@/theme/copy'
+import { colors } from '@/theme/tokens'
 
 // tj-grna9p.32 phase 1 Datasets, mounted in the real shell under the real router.
 //
@@ -27,9 +44,14 @@ import { useSettingsStore } from '@/stores/settings'
 // the grid would (getRows by block). Hidden: AG Grid's own block scheduling and scrolling, its
 // rendering of cells (the column value getters and the Status cell are exercised directly), and
 // AG Grid destroying the datasource it replaces.
+//
+// Phase 2 (tj-grna9p.77): the fake GridApi also counts refreshInfiniteCache, which is how a live event
+// reloads the rows in place (the same datasource, invalidated); the events socket is the fixture in
+// src/__tests__/fakeEvents.ts.
 const grid = vi.hoisted(() => ({
   props: null as Record<string, unknown> | null,
   datasources: [] as IDatasource[],
+  refreshes: 0,
 }))
 
 vi.mock('ag-grid-vue3', () => ({
@@ -55,6 +77,9 @@ vi.mock('ag-grid-vue3', () => ({
             setGridOption: (key: string, value: unknown) => {
               if (key === 'datasource') grid.datasources.push(value as IDatasource)
             },
+            refreshInfiniteCache: () => {
+              grid.refreshes += 1
+            },
           },
         }),
       )
@@ -69,7 +94,13 @@ const mocks = vi.hoisted(() => ({
   listDatasets: vi.fn(),
   getDataset: vi.fn(),
   getDatasetBars: vi.fn(),
+  getDatasetCoverage: vi.fn(),
 }))
+// The shell opens the shared events socket on mount (tj-grna9p.76): replaced so no real WebSocket opens,
+// and driven below to deliver dataset and run events and a reconnect (tj-grna9p.77).
+vi.mock('@/api/events', async (importOriginal) =>
+  (await import('@/__tests__/fakeEvents')).fakeEventsModule(await importOriginal<object>()),
+)
 vi.mock('@/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/api')>()),
   ...mocks,
@@ -93,6 +124,7 @@ function row(id: string, symbol: string, extra: MessageInitShape<typeof DatasetS
 const FACETS = {
   all: 12n,
   needsAttention: 3n,
+  running: 2n,
   sources: [
     { source: DataSource.ALPACA_API, count: 12n },
     { source: DataSource.IB_API, count: 0n },
@@ -145,6 +177,9 @@ beforeEach(() => {
   setActivePinia(createPinia())
   grid.props = null
   grid.datasources.length = 0
+  grid.refreshes = 0
+  fakeEvents.reset()
+  mocks.getDatasetCoverage.mockResolvedValue(create(CoverageStripSchema, {}))
   mocks.getUiConfig.mockResolvedValue({ allowedGroups: [AccountGroup.SIMULATION], deploymentLabel: '', serverVersion: '' })
   mocks.getDatasetFacets.mockResolvedValue(FACETS)
   mocks.listDatasets.mockResolvedValue({ items: [row('a', 'AAA'), row('b', 'BBB')], nextCursor: '' })
@@ -255,6 +290,71 @@ describe('filters', () => {
     expect(listArgs()).toMatchObject({ status: 'retired', updateType: UpdateType.STATIC })
   })
 
+  // tj-grna9p.117 (owner 2026-10-13): the group reads Status, not Collection. 'Collection' came from a
+  // two-badge idea (Collection and Usage) and Usage does not exist, so Status is the plain word. The
+  // data-collection hook is an identifier and is kept.
+  it('the Status group lists Running first, its count is DatasetFacets.running', async () => {
+    const shell = await screenAt('/data/datasets')
+    const group = shell.find('[data-collection="running"]').element.closest('fieldset')!
+    expect(group.querySelector('legend')!.textContent!.trim()).toBe(titleCase('Status'))
+    // Running is the group's first option, before the freshness words.
+    expect(group.querySelector('label')!.getAttribute('data-collection')).toBe('running')
+    expect(shell.find('[data-collection="running"]').text()).toContain('Running')
+    expect(shell.find('[data-collection="running"] .side-count').text()).toBe('2')
+  })
+
+  it('the Status group holds Running as its own toggle beside the freshness words, and ticking it writes ?running=true', async () => {
+    const shell = await screenAt('/data/datasets')
+    const legends = shell.findAll('fieldset legend').map((l) => l.text())
+    expect(legends).toContain(titleCase('Status'))
+    expect(legends).not.toContain('Collection')
+    const group = shell.findAll('fieldset').find((f) => f.find('legend').text() === titleCase('Status'))!
+    // Running is inside the Status group, not a group of its own or outside it.
+    expect(group.find('[data-collection="running"]').exists()).toBe(true)
+    expect(shell.findAll('[data-collection="running"]')).toHaveLength(1)
+    expect(group.findAll('label').map((l) => l.attributes('data-collection') ?? l.attributes('data-status'))).toEqual([
+      'running',
+      'healthy',
+      'late',
+      'failed',
+      'retired',
+    ])
+    // Its own checkbox: ticking it sets running, not status.
+    await group.find('[data-collection="running"] input').trigger('change')
+    await flushPromises()
+    // The router is shared across specs and may carry the trading group; the filter keys are exact.
+    expect(router.currentRoute.value.query.running).toBe('true')
+    expect(router.currentRoute.value.query.status).toBeUndefined()
+    expect(Object.keys(router.currentRoute.value.query).filter((k) => k !== 'group')).toEqual(['running'])
+  })
+
+  it('ticking Running writes ?running=true, keeps the status, and sends running to the list and the counts', async () => {
+    const shell = await screenAt('/data/datasets?status=late')
+    const before = grid.datasources.length
+    await shell.find('[data-collection="running"] input').trigger('change')
+    await flushPromises()
+    expect(router.currentRoute.value.query).toMatchObject({ status: 'late', running: 'true' })
+    expect(grid.datasources.length).toBe(before + 1)
+    expect(mocks.getDatasetFacets.mock.calls.at(-1)![0]).toMatchObject({ status: 'late', running: true })
+    await getRows(latest(), 0)
+    expect(listArgs()).toMatchObject({ status: 'late', running: true, cursor: undefined })
+    // Ticking it again clears it.
+    await shell.find('[data-collection="running"] input').trigger('change')
+    await flushPromises()
+    expect(router.currentRoute.value.query.running).toBeUndefined()
+    expect(router.currentRoute.value.query.status).toBe('late')
+  })
+
+  it('a URL with running=true shows Running checked and sends it; Clear removes it', async () => {
+    const shell = await screenAt('/data/datasets?running=true')
+    expect((shell.find('[data-collection="running"] input').element as HTMLInputElement).checked).toBe(true)
+    await getRows(latest(), 0)
+    expect(listArgs().running).toBe(true)
+    await shell.find('.side-clear').trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value.query.running).toBeUndefined()
+  })
+
   it('a URL naming update=stream is ignored, and Stream is shown disabled', async () => {
     const shell = await screenAt('/data/datasets?update=stream')
     await getRows(latest(), 0)
@@ -328,26 +428,69 @@ describe('Refresh and Show Request', () => {
 })
 
 describe('rows', () => {
-  it('a plain row click opens the Viewer; a modified click is left to the browser', async () => {
+  // tj-grna9p.109 (owner feedback 2026-10-12) reverses tj-grna9p.77 item 4: the data is the default
+  // destination, so a plain row click opens the Viewer at /data/datasets/:id/viewer. The Dataset
+  // detail stays at /data/datasets/:id, reached by the details icon instead (in the Coverage cell
+  // since tj-grna9p.114).
+  it('a plain row click opens the Viewer; a ctrl, meta, shift or alt click is left to the browser', async () => {
     await screenAt('/data/datasets')
     const gridStub = mounted[0]!.findComponent({ name: 'AgGridVueStub' })
-    gridStub.vm.$emit('row-clicked', { data: row('ds 1', 'AAA'), event: new MouseEvent('click', { metaKey: true }) })
-    await flushPromises()
-    expect(router.currentRoute.value.name).toBe('data-datasets')
-    gridStub.vm.$emit('row-clicked', { data: row('ds 1', 'AAA'), event: new MouseEvent('click', { ctrlKey: true }) })
-    await flushPromises()
-    expect(router.currentRoute.value.name).toBe('data-datasets')
+    for (const modifier of ['metaKey', 'ctrlKey', 'shiftKey', 'altKey']) {
+      gridStub.vm.$emit('row-clicked', { data: row('ds 1', 'AAA'), event: new MouseEvent('click', { [modifier]: true }) })
+      await flushPromises()
+      expect(router.currentRoute.value.name, modifier).toBe('data-datasets')
+    }
     gridStub.vm.$emit('row-clicked', { data: row('ds 1', 'AAA'), event: new MouseEvent('click') })
     await flushPromises()
     expect(router.currentRoute.value.name).toBe('data-dataset-viewer')
+    expect(router.currentRoute.value.path).toBe('/data/datasets/ds 1/viewer')
     expect(router.currentRoute.value.params.id).toBe('ds 1')
+    expect(router.resolve({ name: 'data-dataset-detail', params: { id: 'ds 1' } }).href).toBe('/data/datasets/ds%201')
   })
 
-  it('columns: symbol links the Viewer, source and feed, granularity, update, and Expires date or dash', async () => {
+  // A real grid would never deliver the icon's click to the row (CoverageCell stops it), but the row
+  // guards as well: a click whose target sits inside the details icon opens nothing from the row.
+  it('a row click that started on the details icon does not open the Viewer', async () => {
+    await screenAt('/data/datasets')
+    const gridStub = mounted[0]!.findComponent({ name: 'AgGridVueStub' })
+    const icon = document.createElement('a')
+    icon.className = 'details-link'
+    const glyph = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
+    icon.append(glyph)
+    document.body.append(icon)
+    const event = new MouseEvent('click', { bubbles: true })
+    glyph.dispatchEvent(event)
+    icon.remove()
+    gridStub.vm.$emit('row-clicked', { data: row('ds 1', 'AAA'), event })
+    await flushPromises()
+    expect(router.currentRoute.value.name).toBe('data-datasets')
+  })
+
+  // Phase 2 (tj-grna9p.77 items 1 and 2): the status column shows Running over the freshness word
+  // and a Coverage column sits after it; tj-grna9p.117 (owner 2026-10-13) named its header Status
+  // (it was Collection; colId 'collection' is an identifier and is kept). tj-grna9p.109: the Symbol
+  // link follows the row to the Viewer. tj-grna9p.114: the details icon moved into the Coverage cell,
+  // so the Coverage column is handed the detail URL and the Symbol column only the Viewer's.
+  it('columns: symbol links the Viewer and the Coverage cell\'s icon the Dataset detail, source and feed, granularity, update, Status, Coverage, and Expires date or dash', async () => {
     useSettingsStore().setTimeZoneOverride('America/Toronto')
     await screenAt('/data/datasets')
     const cols = grid.props!.columnDefs as ColDef<DatasetSummary>[]
-    expect(cols.map((c) => c.headerName)).toEqual(['Symbol', 'Source · Feed', 'Gran.', 'Update', 'Status', 'Expires'])
+    expect(cols.map((c) => c.headerName)).toEqual([
+      'Symbol',
+      'Source · Feed',
+      'Gran.',
+      'Update',
+      titleCase('Status'),
+      // tj-grna9p.112: the cell shows only x/y, so the unit moved into the header. Built from the
+      // same constant and titleCase the screen uses, so renaming the unit word moves both together.
+      `${titleCase('Coverage')} (${titleCase(COVERAGE_UNIT)})`,
+      'Expires',
+    ])
+    // The status column (colId kept as 'collection') is headed Status; no header anywhere reads Collection.
+    expect(cols.find((c) => c.colId === 'collection')!.headerName).toBe(titleCase('Status'))
+    expect(cols.filter((c) => /\bcollection\b/i.test(c.headerName ?? ''))).toEqual([])
+    expect(cols.find((c) => c.colId === 'collection')!.cellRenderer).toBe(StatusCell)
+    expect(cols.find((c) => c.colId === 'coverage')!.cellRenderer).toBe(CoverageCell)
     const value = (colId: string, data: DatasetSummary) =>
       (cols.find((c) => c.colId === colId)!.valueGetter as (p: { data: DatasetSummary }) => unknown)({ data })
     const withExpiry = row('x', 'X', { expiry: timestampFromMs(EXPIRY), updateType: UpdateType.STATIC })
@@ -358,7 +501,22 @@ describe('rows', () => {
     expect(value('expires', withExpiry)).toBe('2026/12/31')
     expect(value('expires', row('y', 'Y'))).toBe('—')
     const symbol = cols.find((c) => c.colId === 'symbol')!
-    expect((symbol.cellRendererParams as { href: (id: string) => string }).href('a/b')).toBe('/data/datasets/a%2Fb/viewer')
+    expect(symbol.cellRenderer).toBe(SymbolCell)
+    const params = symbol.cellRendererParams as { href: (id: string) => string }
+    expect(Object.keys(params)).toEqual(['href'])
+    expect(params.href('a/b')).toBe('/data/datasets/a%2Fb/viewer')
+    const coverageParams = cols.find((c) => c.colId === 'coverage')!.cellRendererParams as { detailHref: (id: string) => string }
+    expect(Object.keys(coverageParams)).toEqual(['detailHref'])
+    expect(coverageParams.detailHref('a/b')).toBe('/data/datasets/a%2Fb')
+  })
+
+  it('the Status cell reads Running while the last run is in flight, whatever the freshness', () => {
+    const cell = (extra: MessageInitShape<typeof DatasetSummarySchema>) =>
+      mount(StatusCell, { props: { params: { data: row('r', 'R', extra) } as never } }).text()
+    expect(cell({ freshness: { status: FreshnessStatus.LATE }, lastRun: { state: IngestRunState.RUNNING } })).toBe('Running')
+    expect(cell({ freshness: { status: FreshnessStatus.GAPS }, lastRun: { state: IngestRunState.RUNNING } })).toBe('Running')
+    expect(cell({ freshness: { status: FreshnessStatus.LATE }, lastRun: { state: IngestRunState.SUCCEEDED } })).toBe('Late')
+    expect(cell({ freshness: { status: FreshnessStatus.FRESH } })).toBe('Healthy')
   })
 
   it('the Status cell shows Unknown for a row with no health, and nothing for a row still loading', () => {
@@ -369,6 +527,224 @@ describe('rows', () => {
     })
     expect(failed.text()).toBe('Failed')
     expect(mount(StatusCell, { props: { params: { data: undefined } as never } }).text()).toBe('')
+  })
+})
+
+// tj-grna9p.109, reshaped by tj-grna9p.114 (owner feedback 2026-10-13): the Symbol cell holds only
+// the Symbol link (to the Viewer, styled as text); the details icon lives in the Coverage cell. Each
+// cell is mounted alone under the real router with the params the grid hands it, inside a parent that
+// stands in for the AG Grid row (its click listener is the row's click). Hidden: AG Grid's own event
+// delegation, and a browser following an unprevented link (jsdom does not navigate), so a click left
+// to the browser is shown by its default NOT being prevented.
+describe('Symbol cell and its details icon', () => {
+  const viewerHref = (id: string) => router.resolve({ name: 'data-dataset-viewer', params: { id } }).href
+  const detailHref = (id: string) => router.resolve({ name: 'data-dataset-detail', params: { id } }).href
+
+  async function inRow(component: typeof SymbolCell | typeof CoverageCell, params: Record<string, unknown>) {
+    await router.push('/data/datasets')
+    await router.isReady()
+    const rowEl = document.createElement('div')
+    const rowClick = vi.fn()
+    rowEl.addEventListener('click', rowClick)
+    document.body.append(rowEl)
+    const host = document.createElement('div')
+    rowEl.append(host)
+    const wrapper = mount(component as never, {
+      props: { params } as never,
+      global: { plugins: [router] },
+      attachTo: host,
+    }) as VueWrapper
+    mounted.push(wrapper)
+    return { wrapper, rowClick }
+  }
+
+  async function symbolCell(symbol = 'VFV', id = 'ds 1') {
+    return inRow(SymbolCell, { data: row(id, symbol), href: viewerHref })
+  }
+
+  async function coverageCell(symbol = 'VFV', id = 'ds 1') {
+    const { wrapper, rowClick } = await inRow(CoverageCell, { data: row(id, symbol), detailHref })
+    return { wrapper, rowClick, icon: wrapper.find('[data-testid="dataset-details-link"]') }
+  }
+
+  // Dispatched by hand so the spec can read defaultPrevented after the handlers ran.
+  function click(el: Element, init: MouseEventInit = {}): MouseEvent {
+    const event = new MouseEvent('click', { bubbles: true, cancelable: true, ...init })
+    el.dispatchEvent(event)
+    return event
+  }
+
+  it('the Symbol is a real link to the Viewer and the only thing in its cell: no details icon there', async () => {
+    const { wrapper } = await symbolCell('VFV', 'a/b')
+    const symbol = wrapper.find('.symbol-link')
+    expect(symbol.element.tagName).toBe('A')
+    expect(symbol.text()).toBe('VFV')
+    expect(symbol.attributes('href')).toBe('/data/datasets/a%2Fb/viewer')
+    expect(wrapper.findAll('a')).toHaveLength(1)
+    expect(wrapper.find('[data-testid="dataset-details-link"]').exists()).toBe(false)
+    expect(wrapper.find('svg').exists()).toBe(false)
+  })
+
+  it('the Coverage cell\'s icon is a real link to the detail, labelled with the symbol', async () => {
+    const { icon } = await coverageCell('VFV', 'a/b')
+    expect(icon.element.tagName).toBe('A')
+    expect(icon.attributes('href')).toBe('/data/datasets/a%2Fb')
+    expect(icon.attributes('aria-label')).toBe('Dataset details for VFV')
+    expect(icon.attributes('title')).toBe('Dataset details')
+    // The glyph is decorative: the link's label is its whole accessible name.
+    expect(icon.find('svg').attributes('aria-hidden')).toBe('true')
+    expect(icon.text()).toBe('')
+  })
+
+  it('both links are keyboard reachable: real hrefs, never taken out of the tab order', async () => {
+    const { wrapper } = await symbolCell()
+    const { icon } = await coverageCell()
+    for (const link of [wrapper.find('.symbol-link'), icon]) {
+      expect(link.attributes('href')).toBeTruthy()
+      expect(link.attributes('tabindex')).toBeUndefined()
+      ;(link.element as HTMLElement).focus()
+      expect(document.activeElement).toBe(link.element)
+    }
+  })
+
+  it('a plain click on the icon opens the Dataset detail in the app and never reaches the row', async () => {
+    const { icon, rowClick } = await coverageCell()
+    const event = click(icon.element)
+    await flushPromises()
+    expect(rowClick).not.toHaveBeenCalled()
+    expect(event.defaultPrevented).toBe(true)
+    // The detail, never the Viewer.
+    expect(router.currentRoute.value.name).toBe('data-dataset-detail')
+    expect(router.currentRoute.value.params.id).toBe('ds 1')
+  })
+
+  it('a click on the icon\'s glyph is the icon\'s click too', async () => {
+    const { icon, rowClick } = await coverageCell()
+    click(icon.find('svg').element)
+    await flushPromises()
+    expect(rowClick).not.toHaveBeenCalled()
+    expect(router.currentRoute.value.name).toBe('data-dataset-detail')
+  })
+
+  it.each(['metaKey', 'ctrlKey', 'shiftKey', 'altKey'])('a %s click on the icon is left to the browser and still never reaches the row', async (modifier) => {
+    const { icon, rowClick } = await coverageCell()
+    const event = click(icon.element, { [modifier]: true })
+    await flushPromises()
+    expect(event.defaultPrevented).toBe(false)
+    expect(rowClick).not.toHaveBeenCalled()
+    expect(router.currentRoute.value.name).toBe('data-datasets')
+  })
+
+  it('a plain click on the Symbol is cancelled for the row to handle; a modified one is the browser\'s', async () => {
+    const { wrapper, rowClick } = await symbolCell()
+    const plain = click(wrapper.find('.symbol-link').element)
+    expect(plain.defaultPrevented).toBe(true)
+    expect(rowClick).toHaveBeenCalledTimes(1)
+    const modified = click(wrapper.find('.symbol-link').element, { ctrlKey: true })
+    expect(modified.defaultPrevented).toBe(false)
+    await flushPromises()
+    // The Symbol itself never navigates: the row (DatasetGrid) opens the Viewer.
+    expect(router.currentRoute.value.name).toBe('data-datasets')
+  })
+
+  it('a row still loading (no data) renders nothing in either cell', () => {
+    const symbol = mount(SymbolCell, {
+      props: { params: { data: undefined, href: viewerHref } as never },
+      global: { plugins: [router] },
+    })
+    const coverage = mount(CoverageCell, {
+      props: { params: { data: undefined, detailHref } as never },
+      global: { plugins: [router] },
+    })
+    mounted.push(symbol, coverage)
+    expect(symbol.find('a').exists()).toBe(false)
+    expect(coverage.find('a').exists()).toBe(false)
+  })
+})
+
+// tj-grna9p.114 (owner feedback 2026-10-13): the whole row is the click target, so the Symbol must not
+// look like a link of its own: the text colour, semibold, no accent and no underline at rest; the
+// underline shows on hover and on keyboard focus, and the global :focus-visible ring stays. The row
+// shows that it is clickable instead: the grid theme's row hover (the raised surface) and a pointer.
+// jsdom does not compute scoped CSS and the grid is a stub here, so the rules are read from the
+// components' stylesheets on disk and the theme's parameters from the theme object (as the Google
+// font check above does). Unverified without a real browser: the hover paint, the pointer, the
+// clipping of a narrow Coverage column, and Tab reaching a link inside an AG Grid cell.
+describe('the row is the click target; the Symbol reads as text (tj-grna9p.114)', () => {
+  const source = (path: string) => readFileSync(resolve(import.meta.dirname, path), 'utf8')
+  const symbolSource = () => source('../../components/catalog/SymbolCell.vue')
+  const styleOf = (sfc: string) => /<style scoped>([\s\S]*)<\/style>/.exec(sfc)![1]!
+  /** Every rule whose selector list names `.symbol-link`, as [selector, body]. */
+  function symbolRules(): [string, string][] {
+    return [...styleOf(symbolSource()).replace(/\/\*[\s\S]*?\*\//g, '').matchAll(/([^{}]+)\{([^}]*)\}/g)]
+      .map((m) => [m[1]!.trim(), m[2]!] as [string, string])
+      .filter(([selector]) => selector.includes('.symbol-link'))
+  }
+  const rest = () => symbolRules().find(([s]) => s === '.symbol-link')![1]
+
+  it('at rest the Symbol is the text colour, semibold, with no underline', () => {
+    expect(rest()).toMatch(/(^|;|\s)color:\s*var\(--tj-text\)\s*;/)
+    expect(rest()).toMatch(/font-weight:\s*600\s*;/)
+    expect(rest()).toMatch(/text-decoration:\s*none\s*;/)
+  })
+
+  it('no rule gives the Symbol the accent colour', () => {
+    for (const [selector, body] of symbolRules()) {
+      expect(body, selector).not.toMatch(/accent/)
+      // Only the rest rule sets a colour, and it is the text colour.
+      if (selector !== '.symbol-link') expect(body, selector).not.toMatch(/(^|;|\s)color:/)
+    }
+    expect(symbolSource()).not.toMatch(/--tj-accent|accentTint|accentFill/)
+  })
+
+  it('the underline shows on hover and on keyboard focus, and only there', () => {
+    const underlined = symbolRules().filter(([, body]) => /text-decoration:\s*underline/.test(body))
+    expect(underlined).toHaveLength(1)
+    const selectors = underlined[0]![0].split(',').map((s) => s.trim()).sort()
+    expect(selectors).toEqual(['.symbol-link:focus-visible', '.symbol-link:hover'])
+  })
+
+  it('the global :focus-visible ring is untouched and the Symbol does not override it', () => {
+    const base = source('../../theme/base.css')
+    expect(base).toMatch(/\n:focus-visible\s*\{\s*outline:\s*2px solid var\(--tj-accent-tint\);\s*outline-offset:\s*2px;\s*\}/)
+    for (const [selector, body] of symbolRules()) expect(body, selector).not.toMatch(/outline/)
+  })
+
+  it('the row hover is the raised surface and a row shows a pointer', async () => {
+    const { gridTheme } = await import('@/catalog/agGrid')
+    const modes = (gridTheme as unknown as { _getModeParams(): Record<string, Record<string, unknown>> })._getModeParams()
+    const hover = Object.values(modes).map((mode) => mode.rowHoverColor)
+    expect(hover.length).toBeGreaterThan(0)
+    for (const value of hover) expect(value).toBe(colors.raised)
+    const grid = styleOf(source('../../components/catalog/DatasetGrid.vue'))
+    expect(grid).toMatch(/\.grid\s+:deep\(\.ag-row\)\s*\{[^}]*cursor:\s*pointer\s*;[^}]*\}/)
+  })
+
+  // The Coverage column must fit bar + gap + numbers + gap + icon + the cell's own padding at its
+  // narrowest. Every part is read from where it is defined: the widths and gaps from the two
+  // stylesheets, the padding from the grid theme, minWidth from the column the screen builds. The
+  // numbers' slot is in ch, which jsdom cannot measure; it is counted at 0.5em of its 12px font, a
+  // floor (a digit is never narrower than half an em in the app's sans), so this pins "nothing was
+  // forgotten", not the last pixel (see the verdict note on tj-grna9p.114).
+  it('the Coverage column\'s minWidth fits the bar, the numbers, the icon, their gaps and the padding', async () => {
+    await screenAt('/data/datasets')
+    const cols = grid.props!.columnDefs as ColDef<DatasetSummary>[]
+    const minWidth = cols.find((c) => c.colId === 'coverage')!.minWidth!
+    const cell = styleOf(source('../../components/catalog/CoverageCell.vue'))
+    const strip = styleOf(source('../../components/charts/CoverageStrip.vue'))
+    const px = (css: string, re: RegExp) => Number(re.exec(css)![1])
+    const bar = px(cell, /--coverage-bar-width:\s*(\d+)px/)
+    const icon = px(cell, /--coverage-icon-width:\s*(\d+)px/)
+    const textCh = px(cell, /--coverage-text-width:\s*(\d+)ch/)
+    const cellGap = px(cell, /\n\.coverage-cell\s*\{[^}]*\sgap:\s*(\d+)px/)
+    const rowGap = px(strip, /\n\.coverage__row\s*\{[^}]*\sgap:\s*(\d+)px/)
+    const summaryFont = px(strip, /\n\.coverage__summary\s*\{[^}]*font-size:\s*(\d+)px/)
+    const { gridTheme } = await import('@/catalog/agGrid')
+    const modes = (gridTheme as unknown as { _getModeParams(): Record<string, Record<string, unknown>> })._getModeParams()
+    const padding = Number(Object.values(modes)[0]!.cellHorizontalPadding)
+    expect(padding).toBeGreaterThan(0)
+    const needed = bar + rowGap + textCh * summaryFont * 0.5 + cellGap + icon + 2 * padding
+    expect(minWidth).toBeGreaterThanOrEqual(Math.ceil(needed))
   })
 })
 
@@ -424,10 +800,149 @@ describe('load states', () => {
     expect(shell.find('footer [data-testid="footer-summary"]').text()).toBe('100 of 250 datasets · sorted by symbol')
   })
 
+  // tj-grna9p.117: the word Collection is gone from the Datasets page. The rendered page (shell, tiles,
+  // sidebar, grid area, footer) is read as the user sees it: its text and its accessible names. The
+  // capitalised word is what a label would be; lower-case 'collection' in prose is allowed. The grid is
+  // a stub here, so its headers are checked through the column definitions ('columns:' above).
+  it('no visible text or accessible name on the Datasets page is the word Collection', async () => {
+    const shell = await screenAt('/data/datasets?running=true&status=late')
+    await getRows(latest(), 0)
+    await flushPromises()
+    const page = shell.element as HTMLElement
+    // The page really rendered: the Status legend, a tile and the footer are in the text read below.
+    expect(page.textContent).toContain(titleCase('Status'))
+    expect(page.querySelector('[data-tile="failed"]')).not.toBeNull()
+    expect(page.querySelector('[data-testid="footer-summary"]')).not.toBeNull()
+    expect(page.textContent).not.toMatch(/\bCollection\b/)
+    const walker = document.createTreeWalker(page, NodeFilter.SHOW_TEXT)
+    const words: string[] = []
+    for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) words.push(node.textContent!.trim())
+    expect(words.filter((w) => w.toLowerCase() === 'collection')).toEqual([])
+    const named = [...page.querySelectorAll('[aria-label], [title], [placeholder]')].flatMap((el) =>
+      ['aria-label', 'title', 'placeholder'].map((a) => el.getAttribute(a) ?? ''),
+    )
+    expect(named.filter((n) => /\bCollection\b/.test(n))).toEqual([])
+  })
+
   it('the footer counts loaded rows over the view total, then the true total at the end', async () => {
     const shell = await screenAt('/data/datasets')
     await getRows(latest(), 0)
     await flushPromises()
     expect(shell.find('[data-testid="footer-summary"]').text()).toBe('2 of 2 datasets · sorted by symbol')
+  })
+})
+
+// tj-grna9p.77 item 5: an event is a hint to refetch over REST. A burst is coalesced into ONE reload
+// of the counts and of the rows the grid holds (in place: same datasource, refreshInfiniteCache), and
+// only the coverage strips of the datasets the burst named are dropped. A reconnect reloads the same
+// way and drops every strip. Only setTimeout and clearTimeout are faked (flushPromises needs the rest).
+describe('live refresh', () => {
+  const coverageIds = () => mocks.getDatasetCoverage.mock.calls.map(([id]) => id as string)
+
+  async function liveScreen() {
+    const shell = await screenAt('/data/datasets')
+    await getRows(latest(), 0)
+    await flushPromises()
+    const coverage = useDatasetCoverageStore()
+    for (const id of ['a', 'b', 'held']) coverage.acquire(id, 60)
+    await flushPromises()
+    expect(coverageIds().sort()).toEqual(['a', 'b', 'held'])
+    mocks.getDatasetCoverage.mockClear()
+    mocks.listDatasets.mockClear()
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    return { shell, facetCalls: mocks.getDatasetFacets.mock.calls.length, datasources: grid.datasources.length }
+  }
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('subscribes to DatasetChanged and IngestRunChanged while mounted, and lets go on unmount', async () => {
+    const { shell } = await liveScreen()
+    expect(fakeEvents.subscribers('datasetChanged')).toBe(1)
+    expect(fakeEvents.subscribers('ingestRunChanged')).toBe(1)
+    shell.unmount()
+    mounted.splice(0)
+    expect(fakeEvents.subscribers('datasetChanged')).toBe(0)
+    expect(fakeEvents.subscribers('ingestRunChanged')).toBe(0)
+  })
+
+  it('a burst of five events reloads the counts and the rows ONCE, after COALESCE_MS, in place', async () => {
+    const { facetCalls, datasources } = await liveScreen()
+    fakeEvents.emit({ event: { case: 'datasetChanged', value: { id: 'a', change: DatasetChange.UPDATED } } })
+    fakeEvents.emit({ event: { case: 'ingestRunChanged', value: { run: { id: 'r1', datasetId: 'b', state: IngestRunState.RUNNING } } } })
+    fakeEvents.emit({ event: { case: 'ingestRunChanged', value: { run: { id: 'r1', datasetId: 'b', state: IngestRunState.SUCCEEDED } } } })
+    fakeEvents.emit({ event: { case: 'datasetChanged', value: { id: 'a', change: DatasetChange.UPDATED } } })
+    // A run not yet acknowledged has no dataset id: the rows still reload.
+    fakeEvents.emit({ event: { case: 'ingestRunChanged', value: { run: { id: 'r2', datasetId: '' } } } })
+    vi.advanceTimersByTime(COALESCE_MS - 1)
+    await flushPromises()
+    expect(grid.refreshes).toBe(0)
+    expect(mocks.getDatasetFacets.mock.calls.length).toBe(facetCalls)
+
+    vi.advanceTimersByTime(1)
+    await flushPromises()
+    expect(grid.refreshes).toBe(1)
+    const oneReload = mocks.getDatasetFacets.mock.calls.length - facetCalls
+    expect(oneReload).toBeGreaterThanOrEqual(1)
+    // In place: no new datasource (so no scroll reset and no loading panel), and its next getRows starts
+    // the cursor chain over.
+    expect(grid.datasources.length).toBe(datasources)
+    await getRows(latest(), 0)
+    expect(mocks.listDatasets).toHaveBeenCalledTimes(1)
+    expect(listArgs().cursor).toBeUndefined()
+    // Only the named datasets' strips are fetched again, once each; an untouched strip is kept.
+    expect(coverageIds().sort()).toEqual(['a', 'b'])
+
+    // A later single event is its own window: one more reload, the same counts fetch as before.
+    vi.advanceTimersByTime(COALESCE_MS * 10)
+    await flushPromises()
+    expect(grid.refreshes).toBe(1)
+    fakeEvents.emit({ event: { case: 'datasetChanged', value: { id: 'held', change: DatasetChange.UPDATED } } })
+    vi.advanceTimersByTime(COALESCE_MS)
+    await flushPromises()
+    expect(grid.refreshes).toBe(2)
+    expect(mocks.getDatasetFacets.mock.calls.length - facetCalls).toBe(2 * oneReload)
+  })
+
+  it('a steady trickle cannot postpone the reload: the window closes COALESCE_MS after its FIRST event', async () => {
+    await liveScreen()
+    for (let i = 0; i < 4; i += 1) {
+      fakeEvents.emit({ event: { case: 'datasetChanged', value: { id: 'a', change: DatasetChange.UPDATED } } })
+      vi.advanceTimersByTime(COALESCE_MS / 4)
+    }
+    await flushPromises()
+    expect(grid.refreshes).toBe(1)
+  })
+
+  it('a reconnect reloads the counts and rows once, at once, and drops every coverage strip', async () => {
+    const { facetCalls, datasources } = await liveScreen()
+    fakeEvents.reconnect()
+    await flushPromises()
+    expect(grid.refreshes).toBe(1)
+    expect(mocks.getDatasetFacets.mock.calls.length).toBeGreaterThan(facetCalls)
+    expect(grid.datasources.length).toBe(datasources)
+    expect(coverageIds().sort()).toEqual(['a', 'b', 'held'])
+  })
+
+  it('leaving the screen inside a window cancels its reload', async () => {
+    const { shell } = await liveScreen()
+    fakeEvents.emit({ event: { case: 'datasetChanged', value: { id: 'a', change: DatasetChange.UPDATED } } })
+    shell.unmount()
+    mounted.splice(0)
+    vi.advanceTimersByTime(COALESCE_MS * 2)
+    await flushPromises()
+    expect(grid.refreshes).toBe(0)
+    expect(mocks.getDatasetCoverage).not.toHaveBeenCalled()
+  })
+
+  it('the screen never polls: no setInterval while it is mounted and receiving events', async () => {
+    const interval = vi.spyOn(globalThis, 'setInterval')
+    await liveScreen()
+    fakeEvents.emit({ event: { case: 'datasetChanged', value: { id: 'a', change: DatasetChange.UPDATED } } })
+    vi.advanceTimersByTime(COALESCE_MS)
+    fakeEvents.reconnect()
+    await flushPromises()
+    expect(interval).not.toHaveBeenCalled()
   })
 })

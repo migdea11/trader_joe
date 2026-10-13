@@ -3,6 +3,8 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 import AppShell from '@/shell/AppShell.vue'
 import { DATA_HOME } from '@/shell/navigation'
 import { GROUP_QUERY_PARAM } from '@/stores/tradingGroup'
+import DatasetDetailSidebar from '@/views/data/DatasetDetailSidebar.vue'
+import DatasetDetailView from '@/views/data/DatasetDetailView.vue'
 import DatasetsSidebar from '@/views/data/DatasetsSidebar.vue'
 import DatasetsView from '@/views/data/DatasetsView.vue'
 import DatasetViewerSidebar from '@/views/data/DatasetViewerSidebar.vue'
@@ -27,6 +29,12 @@ const shellChildren: RouteRecordRaw[] = [
     path: 'data/datasets',
     name: 'data-datasets',
     components: { default: DatasetsView, sidebar: DatasetsSidebar },
+  },
+  // Dataset detail (tj-grna9p.34). A catalog row opens the Viewer; its details icon opens this, which links on to the Viewer.
+  {
+    path: 'data/datasets/:id',
+    name: 'data-dataset-detail',
+    components: { default: DatasetDetailView, sidebar: DatasetDetailSidebar },
   },
   {
     path: 'data/datasets/:id/viewer',

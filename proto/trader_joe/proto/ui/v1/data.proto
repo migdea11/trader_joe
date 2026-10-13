@@ -108,6 +108,10 @@ message DatasetSummary {
 
   // Other granularities held for the same symbol, source, feed and data type. Excludes this one.
   repeated DatasetSibling siblings = 19;
+
+  // The dataset's most recent collection run, whatever its state. Unset when it has never run
+  // (tj-grna9p.70, phase 2).
+  IngestRun last_run = 20;
 }
 
 // One page of the catalog. Keyset paging over (asset_symbol, id); the cursor is opaque.
@@ -143,6 +147,8 @@ message DatasetFacets {
   repeated SourceFacet sources = 3;
   repeated UpdateTypeFacet update_types = 4;
   repeated StatusFacet statuses = 5;
+  // Datasets with a run in state RUNNING right now (tj-grna9p.70, phase 2).
+  int64 running = 6;
 }
 
 // One page of a dataset's bars, ascending by bar_start, within the requested half-open [start, end).
@@ -150,4 +156,166 @@ message BarPage {
   repeated trader_joe.proto.market.v1.Bar bars = 1;
   // Pass back to fetch the next page; empty on the last page.
   string next_cursor = 2;
+}
+
+// Where one chart page of a bar window starts (tj-eozqhi).
+message BarPageStart {
+  // bar_start of the page's first bar; read the page's bars with start = this, end = the window's end.
+  google.protobuf.Timestamp start = 1;
+  // The page's first bar as a 0-based position among the window's bars, ascending by bar_start.
+  int64 offset = 2;
+}
+
+// The page index of a bar window [start, end), half-open (tj-eozqhi). Pages are fixed blocks of
+// page_size bars counted back from the newest bar; with r = bar_count mod page_size the offsets are
+// [0 when r > 0], r, r + page_size, ..., bar_count - page_size, and a window of at most page_size bars
+// is the single page [0]. The earliest page (offset 0) holds page_size bars and so overlaps the next
+// block. overlap is the look-ahead a client adds from the next block; it does not move the offsets.
+// The page count is pages.length, exact.
+message BarPageIndex {
+  // Bars in the half-open window [start, end).
+  int64 bar_count = 1;
+  // The page size the index was cut with, in bars.
+  int32 page_size = 2;
+  // The look-ahead the client adds from the next block, in bars, as asked for.
+  int32 overlap = 3;
+  // Ascending by offset; empty when bar_count is 0, one entry when bar_count <= page_size.
+  repeated BarPageStart pages = 4;
+}
+
+// PHASE 2 (tj-grna9p.70): collection runs and the request body. Additive to everything above.
+
+// What started a collection run.
+enum RunTrigger {
+  RUN_TRIGGER_UNSPECIFIED = 0;
+  // A person (or a strategy) asked for the dataset.
+  RUN_TRIGGER_REQUEST = 1;
+  // The daily pass collected it.
+  RUN_TRIGGER_SCHEDULE = 2;
+  // A retry of an earlier run.
+  RUN_TRIGGER_RETRY = 3;
+}
+
+enum IngestRunState {
+  INGEST_RUN_STATE_UNSPECIFIED = 0;
+  INGEST_RUN_STATE_RUNNING = 1;
+  INGEST_RUN_STATE_SUCCEEDED = 2;
+  // The vendor answered and held no bars for the range.
+  INGEST_RUN_STATE_EMPTY = 3;
+  INGEST_RUN_STATE_FAILED = 4;
+}
+
+// Why a run failed. domain and reason are the server's typed error vocabulary (docs/errors.md);
+// message is human text and carries no credential material.
+message IngestRunError {
+  string domain = 1;
+  string reason = 2;
+  string message = 3;
+}
+
+// One attempt to collect a dataset.
+message IngestRun {
+  // The run's UUID, as text.
+  string id = 1;
+  // The dataset's UUID, as text. EMPTY until the run's acknowledgement: a new dataset's entry is
+  // written when the fetch is accepted, so the id does not exist before then.
+  string dataset_id = 2;
+  // The dataset's display label (symbol and granularity), so a run lists without a join.
+  string label = 3;
+  RunTrigger trigger = 4;
+  // A free-text label for who caused the run; never a credential.
+  string actor = 5;
+  // The range the run asked for, half-open [start, end): start included, end excluded. end is
+  // unset for an open-ended request.
+  google.protobuf.Timestamp start = 6;
+  google.protobuf.Timestamp end = 7;
+  IngestRunState state = 8;
+  int64 bars_written = 9;
+  // Set only when state is FAILED.
+  IngestRunError error = 10;
+  google.protobuf.Timestamp started_at = 11;
+  // Unset while RUNNING.
+  google.protobuf.Timestamp finished_at = 12;
+  // The request-log entry that caused the run, as text. Empty for a scheduled run.
+  string request_id = 13;
+  // The quota scope the run was charged to: a non-secret configured label, never key material.
+  string quota_key = 14;
+}
+
+// One page of runs. Keyset paging; the cursor is opaque.
+message IngestRunPage {
+  repeated IngestRun items = 1;
+  // Pass back to fetch the next page; empty on the last page.
+  string next_cursor = 2;
+}
+
+// The body of a request for datasets, one dataset per symbol. Mirrors POST /store's body; owner
+// is not here because the server stamps it ('operator' for the UI).
+message RequestDatasetRequest {
+  repeated string symbols = 1;
+  trader_joe.proto.market.v1.AssetType asset_type = 2;
+  trader_joe.proto.market.v1.DataType data_type = 3;
+  trader_joe.proto.market.v1.DataSource source = 4;
+  // The caller's tape preference. UNSPECIFIED means the deployment decides.
+  trader_joe.proto.market.v1.Feed feed = 5;
+  trader_joe.proto.market.v1.Granularity granularity = 6;
+  // STATIC: a half-open range [start, end): start included, end excluded, end after start.
+  // DAILY: a subscription from start; end is unset.
+  google.protobuf.Timestamp start = 7;
+  google.protobuf.Timestamp end = 8;
+  trader_joe.proto.market.v1.UpdateType update_type = 9;
+  ExpiryType expiry_type = 10;
+  // Unset means the dataset never expires.
+  google.protobuf.Timestamp expiry = 11;
+  // Carried and inert in PR 4: stored with the request, never acted on.
+  google.protobuf.Timestamp ready_by = 12;
+  bool best_effort = 13;
+}
+
+// Why one symbol of a request was not accepted.
+message RequestDatasetError {
+  string reason = 1;
+  string message = 2;
+}
+
+// The outcome for one symbol: request_id is set (accepted and enqueued), or error is. There is no
+// refusal outcome in PR 4.
+message RequestDatasetResult {
+  string symbol = 1;
+  // The request-log entry's id, as text.
+  string request_id = 2;
+  // EMPTY until the fetch's acknowledgement, except for a repeat of an existing dataset, which
+  // answers with that dataset's id at once.
+  string dataset_id = 3;
+  RequestDatasetError error = 4;
+}
+
+message RequestDatasetResponse {
+  repeated RequestDatasetResult results = 1;
+}
+
+// The informational estimate for a request, before it is made. It never refuses and never
+// predicts a shortfall.
+message RequestEstimateRequest {
+  repeated string symbols = 1;
+  trader_joe.proto.market.v1.AssetType asset_type = 2;
+  trader_joe.proto.market.v1.DataType data_type = 3;
+  trader_joe.proto.market.v1.DataSource source = 4;
+  trader_joe.proto.market.v1.Feed feed = 5;
+  trader_joe.proto.market.v1.Granularity granularity = 6;
+  // Half-open [start, end): start included, end excluded. end unset means up to now.
+  google.protobuf.Timestamp start = 7;
+  google.protobuf.Timestamp end = 8;
+  trader_joe.proto.market.v1.UpdateType update_type = 9;
+}
+
+message RequestEstimateResponse {
+  // The bars the request is expected to return, over all symbols.
+  int64 estimated_bars = 1;
+  // The vendor calls the request is expected to cost, over all symbols.
+  int64 estimated_vendor_calls = 2;
+  // The quota scope the calls would be charged to: a non-secret configured label.
+  string quota_key = 3;
+  // The share of the scope's current window the calls would use, 0 to 100 (may exceed 100).
+  double percent_of_window = 4;
 }

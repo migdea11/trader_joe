@@ -2,18 +2,33 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ESLint } from 'eslint'
 
+import { create, toJson } from '@bufbuild/protobuf'
+import { timestampFromMs } from '@bufbuild/protobuf/wkt'
+
 import { DataSource, Granularity, UpdateType } from '@generated/trader_joe/proto/market/v1/enums_pb'
-import { DatasetState, ExpiryType, FreshnessStatus } from '@generated/trader_joe/proto/ui/v1/data_pb'
+import {
+  DatasetState,
+  ExpiryType,
+  FreshnessStatus,
+  IngestRunPageSchema,
+  IngestRunState,
+  RunTrigger,
+} from '@generated/trader_joe/proto/ui/v1/data_pb'
 import { AccountGroup } from '@generated/trader_joe/proto/ui/v1/shell_pb'
+import { CoverageStripSchema } from '@generated/trader_joe/proto/ui/v1/stats_pb'
 
 import {
   API_BASE,
   ApiError,
   buildQuery,
   getDataset,
+  getDatasetBarPages,
+  getDatasetBarPagesRequest,
   getDatasetBars,
   getDatasetBarsRequest,
+  getDatasetCoverage,
   getDatasetFacets,
+  getDatasetRuns,
   getUiConfig,
   int64ToNumber,
   listDatasets,
@@ -279,6 +294,132 @@ describe('request shape', () => {
       '/api/store/ui/v1/datasets/x%2Fy/bars?start=2026-01-02T05%3A00%3A00.000Z&end=2026-01-03T05%3A00%3A00.000Z&cursor=k&limit=10000',
     )
     expect(getDatasetBarsRequest('x/y', params)).toBe(calledUrl())
+  })
+})
+
+// tj-grna9p.121: the chart's page index, GET /ui/v1/datasets/{id}/bar-pages (route tj-grna9p.120,
+// decision tj-eozqhi). The JSON is canonical proto3 as the server's to_proto_json writes it: int64 as a
+// string, and a zero value OMITTED, so the earliest page (offset 0) carries no offset key.
+describe('bar pages (tj-grna9p.121)', () => {
+  const BAR_PAGES_JSON = {
+    barCount: '2500',
+    pageSize: 1000,
+    overlap: 50,
+    pages: [
+      { start: '2026-01-05T14:30:00Z' },
+      { start: '2026-01-06T14:30:00Z', offset: '500' },
+      { start: '2026-01-07T14:30:00Z', offset: '1500' },
+    ],
+  }
+
+  it('sends the window, size and look-ahead under the server names and the caller signal', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(BAR_PAGES_JSON))
+    const controller = new AbortController()
+    const params = {
+      start: new Date(Date.UTC(2026, 0, 2, 5)),
+      end: new Date(Date.UTC(2026, 0, 3, 5)),
+      size: 1000,
+      overlap: 50,
+      signal: controller.signal,
+    }
+    await getDatasetBarPages('x/y', params)
+    expect(calledUrl()).toBe(
+      '/api/store/ui/v1/datasets/x%2Fy/bar-pages?start=2026-01-02T05%3A00%3A00.000Z&end=2026-01-03T05%3A00%3A00.000Z&size=1000&overlap=50',
+    )
+    expect(fetchMock.mock.calls[0]![1]!.signal).toBe(controller.signal)
+    expect(getDatasetBarPagesRequest('x/y', params)).toBe(calledUrl())
+  })
+
+  it('with nothing set sends no query, so the server defaults apply', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(BAR_PAGES_JSON))
+    await getDatasetBarPages('ds-1')
+    expect(calledUrl()).toBe('/api/store/ui/v1/datasets/ds-1/bar-pages')
+    expect(getDatasetBarPagesRequest('ds-1')).toBe('/api/store/ui/v1/datasets/ds-1/bar-pages')
+  })
+
+  it('decodes the index: int64 as bigint, and the omitted zero offset as 0n', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(BAR_PAGES_JSON))
+    const index = await getDatasetBarPages('ds-1')
+    expect(index.barCount).toBe(2500n)
+    expect(index.pageSize).toBe(1000)
+    expect(index.overlap).toBe(50)
+    expect(index.pages.map((p) => p.offset)).toEqual([0n, 500n, 1500n])
+    expect(index.pages[0]!.start?.seconds).toBe(BigInt(Date.UTC(2026, 0, 5, 14, 30) / 1000))
+  })
+
+  it('an empty window decodes to no pages and a zero count', async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ pageSize: 1000, overlap: 50 }))
+    const index = await getDatasetBarPages('ds-1')
+    expect(index.barCount).toBe(0n)
+    expect(index.pages).toEqual([])
+  })
+})
+
+// tj-grna9p.34 and .77: the runs page and the coverage strip. The JSON is rendered from messages built
+// with create(Schema) by toJson, the canonical form the server's to_proto_json also writes (int64 as
+// a string, enum member names, zero values omitted).
+describe('runs and coverage (phase 2)', () => {
+  const RUNS_JSON = toJson(
+    IngestRunPageSchema,
+    create(IngestRunPageSchema, {
+      items: [
+        {
+          id: 'run-2',
+          datasetId: 'ds-1',
+          trigger: RunTrigger.REQUEST,
+          state: IngestRunState.FAILED,
+          barsWritten: 2n ** 53n + 1n,
+          error: { domain: 'VENDOR', reason: 'RATE_LIMITED', message: 'slow down' },
+          startedAt: timestampFromMs(Date.UTC(2026, 9, 12, 14)),
+        },
+      ],
+      nextCursor: 'k/2',
+    }),
+  )
+  const COVERAGE_JSON = toJson(
+    CoverageStripSchema,
+    create(CoverageStripSchema, {
+      buckets: [{ expectedSessions: 5, sessionsWithBars: 4, start: timestampFromMs(Date.UTC(2026, 0, 5, 5)) }],
+      gaps: [{ sessions: 1 }],
+      gapCount: 3,
+    }),
+  )
+
+  it('getDatasetRuns: GET /ui/v1/datasets/{id}/runs with cursor and limit, decoded with bigint intact', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(RUNS_JSON))
+    const controller = new AbortController()
+    const page = await getDatasetRuns('a/b', { cursor: 'k/1', limit: 50, signal: controller.signal })
+    expect(calledUrl()).toBe('/api/store/ui/v1/datasets/a%2Fb/runs?cursor=k%2F1&limit=50')
+    expect(fetchMock.mock.calls[0]![1]!.signal).toBe(controller.signal)
+    expect(page.nextCursor).toBe('k/2')
+    expect(page.items[0]!.barsWritten).toBe(2n ** 53n + 1n)
+    expect(page.items[0]!.state).toBe(IngestRunState.FAILED)
+    expect(page.items[0]!.error).toMatchObject({ domain: 'VENDOR', reason: 'RATE_LIMITED', message: 'slow down' })
+  })
+
+  it('getDatasetRuns with nothing set sends no query (the server pages 50 newest first)', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(RUNS_JSON))
+    await getDatasetRuns('ds-1')
+    expect(calledUrl()).toBe('/api/store/ui/v1/datasets/ds-1/runs')
+  })
+
+  it('getDatasetCoverage: GET /ui/v1/datasets/{id}/coverage?buckets=N with the signal, decoded', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(COVERAGE_JSON))
+    const controller = new AbortController()
+    const strip = await getDatasetCoverage('a/b', 60, controller.signal)
+    expect(calledUrl()).toBe('/api/store/ui/v1/datasets/a%2Fb/coverage?buckets=60')
+    expect(fetchMock.mock.calls[0]![1]!.signal).toBe(controller.signal)
+    expect(strip.gapCount).toBe(3)
+    expect(strip.buckets[0]).toMatchObject({ expectedSessions: 5, sessionsWithBars: 4 })
+  })
+
+  it('a 422 from the coverage route is an ApiError with status 422 (the "no calendar" case)', async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ status: 422, reason: 'NO_TRADING_CALENDAR' }, 422, 'application/problem+json'),
+    )
+    const error = await rejection(getDatasetCoverage('ds-1', 120))
+    expect(error).toBeInstanceOf(ApiError)
+    expect((error as ApiError).status).toBe(422)
   })
 })
 

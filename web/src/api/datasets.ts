@@ -3,19 +3,25 @@
 
 import { DataSource, UpdateType } from '@generated/trader_joe/proto/market/v1/enums_pb'
 import {
+  BarPageIndexSchema,
   BarPageSchema,
   DatasetFacetsSchema,
   DatasetPageSchema,
   DatasetSummarySchema,
+  IngestRunPageSchema,
 } from '@generated/trader_joe/proto/ui/v1/data_pb'
 import type {
   BarPage,
+  BarPageIndex,
   DatasetFacets,
   DatasetPage,
   DatasetSummary,
+  IngestRunPage,
 } from '@generated/trader_joe/proto/ui/v1/data_pb'
 import { UiConfigSchema } from '@generated/trader_joe/proto/ui/v1/shell_pb'
 import type { UiConfig } from '@generated/trader_joe/proto/ui/v1/shell_pb'
+import { CoverageStripSchema } from '@generated/trader_joe/proto/ui/v1/stats_pb'
+import type { CoverageStrip } from '@generated/trader_joe/proto/ui/v1/stats_pb'
 
 import { API_BASE, getMessage } from './client'
 import { buildQuery } from './query'
@@ -33,6 +39,8 @@ export interface DatasetFilters {
   status?: StatusGroup
   /** Only late and failed datasets. */
   needsAttention?: boolean
+  /** Only datasets with a collection run in flight (orthogonal to `status`). */
+  running?: boolean
   signal?: AbortSignal
 }
 
@@ -51,7 +59,7 @@ export interface GetBarsParams {
   /** Exclude bars at or after this instant (half-open window). */
   end?: Date
   cursor?: string
-  /** Server default 1000, at most 10000. */
+  /** Server default 1000, at most 50000. */
   limit?: number
   signal?: AbortSignal
 }
@@ -68,6 +76,7 @@ function filterQuery(filters: DatasetFilters) {
     update_type: enumName(UpdateType, filters.updateType),
     status: filters.status,
     needs_attention: filters.needsAttention,
+    running: filters.running,
   }
 }
 
@@ -101,6 +110,22 @@ export function getDataset(id: string, signal?: AbortSignal): Promise<DatasetSum
   return getMessage(DatasetSummarySchema, `/ui/v1/datasets/${encodeURIComponent(id)}`, { signal })
 }
 
+export interface GetBarPagesParams {
+  /** Include bars at or after this instant. */
+  start?: Date
+  /** Exclude bars at or after this instant (half-open window). */
+  end?: Date
+  /** Bars per page; the server default and cap are its own (1000). */
+  size?: number
+  /** The look-ahead: bars of the next block a page shows (it does not move the offsets). */
+  overlap?: number
+  signal?: AbortSignal
+}
+
+function barPagesQuery(params: GetBarPagesParams) {
+  return { start: params.start, end: params.end, size: params.size, overlap: params.overlap }
+}
+
 function barsQuery(params: GetBarsParams) {
   return { start: params.start, end: params.end, cursor: params.cursor, limit: params.limit }
 }
@@ -116,6 +141,43 @@ export function getDatasetBars(id: string, params: GetBarsParams = {}): Promise<
 /** The request getDatasetBars sends for these parameters, as the browser's path and query (Show Request). */
 export function getDatasetBarsRequest(id: string, params: GetBarsParams = {}): string {
   return `${API_BASE}/ui/v1/datasets/${encodeURIComponent(id)}/bars${buildQuery(barsQuery(params))}`
+}
+
+/** GET /ui/v1/datasets/{id}/bar-pages: where each chart page of the half-open window [start, end) starts. */
+export function getDatasetBarPages(id: string, params: GetBarPagesParams = {}): Promise<BarPageIndex> {
+  return getMessage(BarPageIndexSchema, `/ui/v1/datasets/${encodeURIComponent(id)}/bar-pages`, {
+    query: barPagesQuery(params),
+    signal: params.signal,
+  })
+}
+
+/** The request getDatasetBarPages sends for these parameters, as the browser's path and query (Show Request). */
+export function getDatasetBarPagesRequest(id: string, params: GetBarPagesParams = {}): string {
+  return `${API_BASE}/ui/v1/datasets/${encodeURIComponent(id)}/bar-pages${buildQuery(barPagesQuery(params))}`
+}
+
+export interface GetRunsParams {
+  /** The previous page's nextCursor. */
+  cursor?: string
+  /** Server default 50, at most 500. */
+  limit?: number
+  signal?: AbortSignal
+}
+
+/** GET /ui/v1/datasets/{id}/runs: one page of the dataset's collection runs, newest first. */
+export function getDatasetRuns(id: string, params: GetRunsParams = {}): Promise<IngestRunPage> {
+  return getMessage(IngestRunPageSchema, `/ui/v1/datasets/${encodeURIComponent(id)}/runs`, {
+    query: { cursor: params.cursor, limit: params.limit },
+    signal: params.signal,
+  })
+}
+
+/** GET /ui/v1/datasets/{id}/coverage: the bucketed coverage strip and the gap windows, half-open [start, end). */
+export function getDatasetCoverage(id: string, buckets: number, signal?: AbortSignal): Promise<CoverageStrip> {
+  return getMessage(CoverageStripSchema, `/ui/v1/datasets/${encodeURIComponent(id)}/coverage`, {
+    query: { buckets },
+    signal,
+  })
 }
 
 /** GET /ui/v1/config: what the shell needs to know about this deployment. */

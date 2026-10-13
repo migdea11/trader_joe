@@ -1,8 +1,10 @@
 <script setup lang="ts">
 // The Datasets sidebar (tj-grna9p.32), the `sidebar` view of the data-datasets route: Views (All
-// Datasets, Needs Attention) and Filters (Status, Source, Update) with counts from the facets. The
-// server filters by one value per group, so each group is a single choice: ticking an option
-// replaces the group's current one, and ticking it again clears the group. Stream is shown disabled
+// Datasets, Needs Attention) and Filters (Status, Source, Update) with counts from the facets.
+// The server filters by one value per group, so each group is a single choice: ticking an option
+// replaces the group's current one, and ticking it again clears the group. Running in the Status
+// group is the exception: it is orthogonal to the freshness words (a Late dataset can be running a
+// retry), so it is its own toggle and combines with one of them. Stream is shown disabled
 // (a later phase). Everything is written to the URL (catalog/useCatalogFilters.ts).
 import { computed } from 'vue'
 import { storeToRefs } from 'pinia'
@@ -46,6 +48,10 @@ const updateOptions = computed(() => [
 // An option's checked state toggles: choosing the chosen option clears the group.
 function toggleStatus(value: StatusGroup): void {
   void setFilters({ ...filters.value, status: filters.value.status === value ? undefined : value })
+}
+
+function toggleRunning(): void {
+  void setFilters({ ...filters.value, running: filters.value.running === true ? undefined : true })
 }
 
 function toggleSource(value: DataSource): void {
@@ -102,8 +108,20 @@ function clearFilters(): void {
 
     <fieldset class="side-group">
       <legend class="side-group__title">
-        Status
+        {{ titleCase('Status') }}
       </legend>
+      <label
+        class="side-option"
+        data-collection="running"
+      >
+        <input
+          type="checkbox"
+          :checked="filters.running === true"
+          @change="toggleRunning"
+        >
+        Running
+        <span class="side-count">{{ facets?.running ?? '—' }}</span>
+      </label>
       <label
         v-for="status in STATUS_GROUPS"
         :key="status"

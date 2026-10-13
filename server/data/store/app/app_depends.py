@@ -8,6 +8,7 @@ from common.rpc.channel import DATA_INGEST_GRPC_TARGET_ENV, create_channel, targ
 from common.rpc.clients.ingest_fetch import GrpcIngestFetchClient, IngestFetchClient
 from common.worker_pool import SharedWorkerPool
 from data.store.app.database import database
+from data.store.app.ingest.run_recording import sweep_interrupted_runs
 from routers.common.latency import initialize_latency_client
 from routers.data_ingest.app_endpoints import APP_NAME as INGEST_APP_NAME
 from routers.data_ingest.app_endpoints import APP_PORT_INTERNAL as INGEST_APP_PORT
@@ -31,6 +32,9 @@ async def lifespan(app: FastAPI):
 
     # Setup Database
     await database.initialize()
+    # A run a previous process left RUNNING will never finish: this process holds none yet. Safe
+    # only because data_store runs ONE process (see the store CLAUDE.md).
+    await sweep_interrupted_runs()
 
     # THE DATASET PATH'S PEER. One channel to data_ingest's gRPC server, shared by every stub that
     # dials it, created inside the running loop and closed on teardown (ADR tj-q9ae5u addendum 5:

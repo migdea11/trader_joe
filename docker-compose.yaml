@@ -120,6 +120,16 @@ services:
       # would mask them.
       - DEPLOYMENT_LABEL
       - SERVER_VERSION
+      # ONE WORKER, LITERAL, never from an env file. entrypoint.sh reads SERVICE_WORKERS and
+      # server/data/store/.env.default sets 1, but compose reads the OPERATOR'S copy of that file
+      # (STORE_ENV_FILE above), so nothing checked in would otherwise hold the number. environment:
+      # outranks env_file:, so this does. Two things in data_store are correct only in one process:
+      #   - the startup sweep of RUNNING ingest runs (run_recording.sweep_interrupted_runs): with
+      #     two workers, one worker's sweep fails the run the other is executing;
+      #   - the in-process events hub (app/events.py): an event reaches only the clients connected
+      #     to the worker that published it.
+      # More than one worker needs Postgres LISTEN/NOTIFY for the hub and a sweep keyed by process.
+      - SERVICE_WORKERS=1
     image: trader_joe_data_store:latest
     security_opt:
       - "no-new-privileges:true"

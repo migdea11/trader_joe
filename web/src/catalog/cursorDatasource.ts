@@ -38,11 +38,22 @@ export interface CursorDatasourceOptions<T> {
   onError?: (error: unknown, info: { loadedRows: number }) => void
 }
 
-export function createCursorDatasource<T>(options: CursorDatasourceOptions<T>): IDatasource {
+export interface CursorDatasource extends IDatasource {
+  /**
+   * Forget every fetched page, so the NEXT getRows walks the cursor chain from the first page again,
+   * and ignore answers to requests already in flight. The grid's refreshInfiniteCache() then reloads
+   * the rows in place, keeping scroll position and row count (a live refresh), where a new
+   * datasource would reset them.
+   */
+  invalidate(): void
+}
+
+export function createCursorDatasource<T>(options: CursorDatasourceOptions<T>): CursorDatasource {
   const { fetchPage, pageSize } = options
   const controller = new AbortController()
   const blocks = new Map<number, Promise<CursorPage<T>>>()
   const loadedByBlock = new Map<number, number>()
+  let generation = 0
 
   const loadedRows = (): number => {
     let total = 0
@@ -75,20 +86,25 @@ export function createCursorDatasource<T>(options: CursorDatasourceOptions<T>): 
     getRows(params: IGetRowsParams): void {
       // The grid requests whole blocks (cacheBlockSize = pageSize), so startRow is aligned.
       const start = params.startRow - (params.startRow % pageSize)
+      const asked = generation
       block(start).then(
         (page) => {
-          if (controller.signal.aborted) return
+          if (controller.signal.aborted || asked !== generation) return
           loadedByBlock.set(start, page.items.length)
           const done = page.nextCursor === ''
           options.onPage?.({ loadedRows: loadedRows(), done })
           params.successCallback([...page.items], done ? start + page.items.length : undefined)
         },
         (error: unknown) => {
-          if (controller.signal.aborted) return
+          if (controller.signal.aborted || asked !== generation) return
           options.onError?.(error, { loadedRows: loadedRows() })
           params.failCallback()
         },
       )
+    },
+    invalidate(): void {
+      generation += 1
+      blocks.clear()
     },
     destroy(): void {
       controller.abort()

@@ -2,7 +2,8 @@
 // The Datasets catalog (tj-grna9p.32, canvas board "Shell · Datasets", phase 1): title, Refresh and
 // Show Request, the Datasets, Failed and Late tiles, and the grid. The sidebar (DatasetsSidebar.vue)
 // is the route's `sidebar` view. The filters live in the URL; this page and the sidebar both read
-// them. No polling and no events in phase 1: the page reloads on a filter change and on Refresh.
+// them. No polling: the page reloads on a filter change, on Refresh, and on a live event or a
+// reconnect (catalog/useCatalogLiveRefresh.ts).
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { Code, RefreshCw } from '@lucide/vue'
@@ -10,6 +11,7 @@ import { Code, RefreshCw } from '@lucide/vue'
 import { listDatasetsRequest } from '@/api'
 import { filtersKey, toApiFilters } from '@/catalog/filters'
 import { useCatalogFilters } from '@/catalog/useCatalogFilters'
+import { useCatalogLiveRefresh } from '@/catalog/useCatalogLiveRefresh'
 import DatasetGrid from '@/components/catalog/DatasetGrid.vue'
 import DatasetTiles from '@/components/catalog/DatasetTiles.vue'
 import { formatNumber } from '@/format/formatters'
@@ -18,7 +20,7 @@ import { useDatasetCatalogStore } from '@/stores/datasetCatalog'
 
 const { filters } = useCatalogFilters()
 const store = useDatasetCatalogStore()
-const { facets, facetsError, tilesError, listError, loadedRows, listDone, listStatus } = storeToRefs(store)
+const { facets, facetsError, tilesError, listError, loadedRows, listDone, listStatus, pageTick } = storeToRefs(store)
 const { setFooterSummary, setFooterUpdated, setFooterProblem } = useFooterSummary()
 
 const showRequest = ref(false)
@@ -35,6 +37,10 @@ watch(
 // One facets request serves the sidebar and the tiles when no filter is active; with a filter set
 // on arrival the filtered facets and the whole-catalog tiles go out in parallel.
 onMounted(() => store.loadCounts(filters.value))
+
+// Dataset and run events refetch the counts and the rows on screen once per burst; a reconnect does
+// the same (the grid fetches its own first page on mount, as before).
+useCatalogLiveRefresh(filters)
 
 // "9 of 38 datasets · sorted by symbol": rows loaded so far over the total under the filters (the
 // view's own count from the facets; the loaded count itself once the last page is in).
@@ -55,11 +61,11 @@ watch(
   { immediate: true },
 )
 
-// "Updated <time>": the list loaded (or came back empty). The page does not poll, so this is how
-// stale the rows on screen are; the header's Refresh reloads.
+// "Updated <time>": the list loaded (or came back empty), or a live reload brought a page in. This is
+// how stale the rows on screen are; the header's Refresh reloads.
 watch(
-  listStatus,
-  (status) => {
+  [listStatus, pageTick],
+  ([status]) => {
     if (status === 'ready' || status === 'empty') setFooterUpdated(Date.now())
   },
   { immediate: true },

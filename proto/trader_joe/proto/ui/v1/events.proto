@@ -1,0 +1,47 @@
+// THE UI'S LIVE-EVENT VOCABULARY, PHASE 2 (tj-grna9p.70): what /ui/v1/events pushes. A client
+// treats every event as a hint to reload, so an event carries the changed object rather than a
+// diff. There is no settings event: settings live in the browser. No credential material crosses.
+syntax = "proto3";
+
+package trader_joe.proto.ui.v1;
+
+import "google/protobuf/timestamp.proto";
+import "trader_joe/proto/ui/v1/data.proto";
+import "trader_joe/proto/ui/v1/ops.proto";
+
+enum DatasetChange {
+  DATASET_CHANGE_UNSPECIFIED = 0;
+  DATASET_CHANGE_CREATED = 1;
+  DATASET_CHANGE_UPDATED = 2;
+  DATASET_CHANGE_RETIRED = 3;
+  DATASET_CHANGE_RESUMED = 4;
+  DATASET_CHANGE_DELETED = 5;
+}
+
+message DatasetChanged {
+  // The dataset's UUID, as text.
+  string id = 1;
+  DatasetChange change = 2;
+}
+
+message IngestRunChanged {
+  IngestRun run = 1;
+}
+
+message RequestChanged {
+  RequestLogEntry entry = 1;
+}
+
+// The expiry reaper has deletions waiting for confirmation, or it no longer does.
+message ReaperPendingChanged {}
+
+message UiEvent {
+  // The server's clock when the event was sent.
+  google.protobuf.Timestamp server_time = 1;
+  oneof event {
+    DatasetChanged dataset_changed = 2;
+    IngestRunChanged ingest_run_changed = 3;
+    RequestChanged request_changed = 4;
+    ReaperPendingChanged reaper_pending_changed = 5;
+  }
+}

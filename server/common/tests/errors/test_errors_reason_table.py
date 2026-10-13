@@ -67,8 +67,9 @@ PLANNED = {
     'DATABASE_CONFLICT': (EXO, NOT_READY, RECORD, None, 503),
 }
 
-# Fixed by records for later PRs; the bead names each one's source.
-PLANNED_RESERVED = {'OUTSIDE_LOOKBACK', 'COVERAGE_GAP', 'ADMISSION_REFUSED', 'SUBSCRIBER_TOO_SLOW'}
+# Fixed by records for later PRs; the bead names each one's source. NOT_BOOTSTRAPPED is tj-grna9p.44's
+# re-baseline item 6: reserved as a name only, its member and REASONS row land with tj-grna9p.52.
+PLANNED_RESERVED = {'OUTSIDE_LOOKBACK', 'COVERAGE_GAP', 'ADMISSION_REFUSED', 'SUBSCRIBER_TOO_SLOW', 'NOT_BOOTSTRAPPED'}
 
 # D8 as written, then the three keys TE-1 adds, each for a recorded reason.
 D8_METADATA_KEYS = {'asset_symbol', 'range_start', 'range_end', 'feed', 'granularity', 'vendor', 'retry_after'}
@@ -174,8 +175,8 @@ def test_the_table_cannot_be_edited_at_runtime():
         spec.http_status = 500  # type: ignore[misc]
 
 
-def test_reserved_reasons_are_the_four_names_the_records_fix():
-    """The bead: RESERVED_REASONS is a tuple of plain str naming the four reserved names, each once."""
+def test_reserved_reasons_are_the_names_the_records_fix():
+    """The beads: RESERVED_REASONS is a tuple of plain str naming the five reserved names, each once."""
     assert isinstance(RESERVED_REASONS, tuple)
     assert all(type(name) is str for name in RESERVED_REASONS)
     assert len(RESERVED_REASONS) == len(set(RESERVED_REASONS)), f'a name is repeated: {RESERVED_REASONS}'

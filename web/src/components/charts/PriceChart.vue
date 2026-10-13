@@ -9,7 +9,17 @@
 //
 // int64: protobuf-es decodes the bar timestamp's seconds as bigint. int64ToNumber (the only
 // bigint-to-number conversion in the UI) is called here, at the chart boundary, and nowhere else.
-import { markRaw, onBeforeUnmount, onMounted, shallowRef, toRaw, isReactive, useTemplateRef, watch } from 'vue'
+import {
+  computed,
+  markRaw,
+  onBeforeUnmount,
+  onMounted,
+  shallowRef,
+  toRaw,
+  isReactive,
+  useTemplateRef,
+  watch,
+} from 'vue'
 import {
   CandlestickSeries,
   createChart,
@@ -31,6 +41,7 @@ import type { Bar } from '@generated/trader_joe/proto/market/v1/bar_pb'
 import { int64ToNumber } from '@/api/int64'
 import { useFormatters } from '@/format/useFormatters'
 import { colors } from '@/theme/tokens'
+import { titleCase } from '@/theme/copy'
 import {
   lightweightCandlestickOptions,
   lightweightChartOptions,
@@ -38,6 +49,7 @@ import {
 } from '@/theme/charts'
 import { simpleMovingAverage } from './indicators'
 import { sameRange, type LogicalRangeLike } from './navigatorMath'
+import { sessionStarts, visibleBreaks } from './sessionBreaks'
 
 /** What the hover readout shows for the bar under the crosshair. */
 export interface PriceHover {
@@ -56,6 +68,13 @@ const props = withDefaults(
   defineProps<{
     /** Ascending by bar_start. Pass a shallowRef or markRaw array, never a deep ref. */
     readonly bars: readonly Bar[]
+    /**
+     * Bars just BEFORE `bars` (the older neighbour's tail, ascending), used only to warm the moving
+     * averages up: SMA and volume average run over warm-up + bars and only `bars` is drawn, so the
+     * lines start at the first bar. Never drawn, never counted in the visible range. Empty (the
+     * default) or late: the averages start late and fill in when it arrives.
+     */
+    readonly warmupBars?: readonly Bar[]
     /** SMA overlay periods, in bars. */
     readonly smaPeriods?: readonly number[]
     /** Period of the average drawn over the volume pane. 0 hides it. */
@@ -66,13 +85,41 @@ const props = withDefaults(
     readonly visibleRange?: LogicalRangeLike | null
     /** Chart height in px. */
     readonly height?: number
+    /**
+     * The shown bars the next page shows too, as bar indices of `bars` (inclusive): a tinted band
+     * labelled Overlap on the plot. Null (the default): no band.
+     */
+    readonly overlapFrom?: number | null
+    readonly overlapTo?: number | null
+    /** Hover title of the overlap band's label. */
+    readonly overlapHint?: string
+    /**
+     * The shown bars the PREVIOUS page shows too (its look-ahead runs into this page), as bar indices
+     * of `bars` (inclusive): the same band on the left. Null (the default): no band.
+     */
+    readonly overlapBeforeFrom?: number | null
+    readonly overlapBeforeTo?: number | null
+    readonly overlapBeforeHint?: string
+    /**
+     * Mark where each trading day ends (intraday datasets only): a thin dashed line at every gap of
+     * SESSION_GAP_SECONDS or more between consecutive bars (sessionBreaks.ts). Warm-up bars get none.
+     */
+    readonly sessionMarkers?: boolean
   }>(),
   {
+    warmupBars: () => [],
     smaPeriods: () => [20, 50],
     volumeAveragePeriod: 20,
     showVolume: true,
     visibleRange: null,
     height: 420,
+    overlapFrom: null,
+    overlapTo: null,
+    overlapHint: 'These bars are also on the next page',
+    overlapBeforeFrom: null,
+    overlapBeforeTo: null,
+    overlapBeforeHint: 'These bars are also on the previous page',
+    sessionMarkers: false,
   },
 )
 
@@ -84,17 +131,28 @@ const emit = defineEmits<{
 interface ChartData {
   candles: CandlestickData<UTCTimestamp>[]
   volume: HistogramData<UTCTimestamp>[]
+  /** Warm-up closes then the drawn bars' closes: what the averages run over. */
   closes: Float64Array
   volumes: Float64Array
+  /** Entries of `closes` / `volumes` before the first drawn bar. */
+  lead: number
+  /** Candle indices that start a new session (see sessionBreaks.ts); only the drawn bars count. */
+  sessions: number[]
 }
 
 // Bars without a bar_start cannot be placed on the time axis and are skipped; the server always
-// sets it.
-function buildData(bars: readonly Bar[]): ChartData {
+// sets it. The warm-up bars only feed the averages' input.
+function buildData(bars: readonly Bar[], warmup: readonly Bar[]): ChartData {
   const candles: CandlestickData<UTCTimestamp>[] = []
   const volume: HistogramData<UTCTimestamp>[] = []
   const closes: number[] = []
   const volumes: number[] = []
+  for (const bar of warmup) {
+    if (!bar.barStart) continue
+    closes.push(bar.close)
+    volumes.push(bar.volume)
+  }
+  const lead = closes.length
   for (const bar of bars) {
     if (!bar.barStart) continue
     const time = int64ToNumber(bar.barStart.seconds) as UTCTimestamp
@@ -105,7 +163,8 @@ function buildData(bars: readonly Bar[]): ChartData {
     closes.push(bar.close)
     volumes.push(bar.volume)
   }
-  return { candles, volume, closes: Float64Array.from(closes), volumes: Float64Array.from(volumes) }
+  const sessions = sessionStarts(candles.map((c) => c.time))
+  return { candles, volume, closes: Float64Array.from(closes), volumes: Float64Array.from(volumes), lead, sessions }
 }
 
 // An SMA as line data over the candle times; the warm-up points are whitespace.
@@ -124,7 +183,11 @@ function readBars(): readonly Bar[] {
   return raw
 }
 
-const data = shallowRef<ChartData>(markRaw(buildData(readBars())))
+function buildAll(): ChartData {
+  return buildData(readBars(), toRaw(props.warmupBars))
+}
+
+const data = shallowRef<ChartData>(markRaw(buildAll()))
 // Times and the date label are shown in the settings zone (override or browser zone); the zone is
 // re-applied to the live chart when it changes.
 const { chartLocalization, chartTimeScale, timeZone } = useFormatters()
@@ -136,19 +199,97 @@ let candleSeries: ISeriesApi<'Candlestick'> | null = null
 let volumeSeries: ISeriesApi<'Histogram'> | null = null
 let volumeAverageSeries: ISeriesApi<'Line'> | null = null
 let smaSeries: Array<{ period: number; series: ISeriesApi<'Line'> }> = []
-let lastEmitted: LogicalRangeLike | null = null
+// The range the parent holds: the prop as last seen, or what this component last emitted. A chart
+// range is news to the parent only when it differs from this. Comparing with the prop alone is wrong
+// (the prop lags an emit by a render), and lost the final range of a page move: see onRangeChange.
+let known: LogicalRangeLike | null = props.visibleRange ? { ...props.visibleRange } : null
+// A range or fit is queued in the chart (setVisibleLogicalRange and fitContent apply on the next
+// frame, not at the call) and has not been reported yet.
+let applying = false
+// True while this component itself reads the chart's range: the read can make the library report
+// the range it has just recomputed, which is not a user's move.
+let reading = false
+
+// The plot's overlays (overlap bands, session lines) are not chart drawings: they need only the
+// visible logical range (bar-index units), the loaded bar count, and how much of the container the
+// price and time axes take. A range-change handler updates both refs.
+const viewRange = shallowRef<LogicalRangeLike | null>(null)
+const plotInset = shallowRef({ right: 0, bottom: 0 })
+
+// The overlap band as fractions of the plot width. A bar i is centred on logical index i and the
+// visible range [from, to] puts bar `from` half a bar in from the left edge, so the plot holds
+// to - from + 1 bars and bar i spans [(i - from) / n, (i + 1 - from) / n]. Not clamped: the plot
+// clips what is off screen.
+function bandOf(first: number | null, last: number | null): { left: number; width: number } | null {
+  const count = data.value.candles.length
+  if (first === null || last === null || count === 0 || last < first) return null
+  const range = viewRange.value ?? { from: 0, to: count - 1 }
+  const bars = range.to - range.from + 1
+  if (!(bars > 0)) return null
+  const left = (first - range.from) / bars
+  const right = (last + 1 - range.from) / bars
+  if (right <= 0 || left >= 1) return null
+  return { left: left * 100, width: (right - left) * 100 }
+}
+const overlapBand = computed(() => bandOf(props.overlapFrom, props.overlapTo))
+const overlapBeforeBand = computed(() => bandOf(props.overlapBeforeFrom, props.overlapBeforeTo))
+
+// Session boundaries inside the view, as percentages of the plot width. Cheap: one pass over the
+// (few) boundaries on every range change, never over the bars.
+const sessionLines = computed(() => {
+  if (!props.sessionMarkers) return []
+  const sessions = data.value.sessions
+  const count = data.value.candles.length
+  if (sessions.length === 0 || count === 0) return []
+  const range = viewRange.value ?? { from: 0, to: count - 1 }
+  return visibleBreaks(sessions, range.from, range.to).map((fraction) => fraction * 100)
+})
+const hasOverlay = computed(
+  () => overlapBand.value !== null || overlapBeforeBand.value !== null || sessionLines.value.length > 0,
+)
+
+const overlapFill = `${colors.accentTint}1f`
+
+// The chart's range now. While a programmatic range is queued the library still holds its previous
+// (default) range and reports it when asked; that report is a transient, never the parent's news.
+function readRange(): LogicalRangeLike | null {
+  if (!chart) return null
+  reading = true
+  try {
+    return chart.timeScale().getVisibleLogicalRange()
+  } finally {
+    reading = false
+  }
+}
+
+function syncView(range?: LogicalRangeLike | null): void {
+  // A queued range is the view to come; the library still reports its previous one until the frame.
+  viewRange.value = range ?? (applying ? props.visibleRange : null) ?? readRange() ?? props.visibleRange ?? null
+  if (!chart) return
+  // The axes' sizes are known to the library only; jsdom and a not-yet-laid-out chart report none.
+  const right = typeof chart.priceScale === 'function' ? chart.priceScale('right').width() : 0
+  const bottom = chart.timeScale().height?.() ?? 0
+  const cur = plotInset.value
+  if (right !== cur.right || bottom !== cur.bottom) plotInset.value = { right, bottom }
+}
+
+// The averages run over warm-up + drawn bars; only the drawn bars' points are kept.
+function applyIndicators(): void {
+  const d = data.value
+  for (const { period, series } of smaSeries) {
+    series.setData(lineData(d.candles, simpleMovingAverage(d.closes, period).subarray(d.lead)))
+  }
+  volumeAverageSeries?.setData(
+    lineData(d.candles, simpleMovingAverage(d.volumes, props.volumeAveragePeriod).subarray(d.lead)),
+  )
+}
 
 function applyData(): void {
   if (!candleSeries) return
   const d = data.value
   candleSeries.setData(d.candles)
   volumeSeries?.setData(d.volume)
-  for (const { period, series } of smaSeries) {
-    series.setData(lineData(d.candles, simpleMovingAverage(d.closes, period)))
-  }
-  volumeAverageSeries?.setData(
-    lineData(d.candles, simpleMovingAverage(d.volumes, props.volumeAveragePeriod)),
-  )
+  applyIndicators()
 }
 
 function rebuildIndicators(): void {
@@ -229,10 +370,16 @@ function onCrosshairMove(param: MouseEventParams): void {
 
 function onRangeChange(range: LogicalRangeLike | null): void {
   if (!range) return
+  syncView(range)
+  // Our own read of the chart while a range is queued: the library's pre-apply state, not a move.
+  if (reading && applying) return
   const next = { from: range.from, to: range.to }
-  // Echo suppression: a range we just applied from the prop is not news to the parent.
-  if (sameRange(next, lastEmitted) || sameRange(next, props.visibleRange)) return
-  lastEmitted = next
+  // Not echoing what the parent already holds. The library also reports transient ranges of its own
+  // inside the frame that applies a queued range (its default range, then the applied one), so the
+  // applied range can arrive AFTER a transient one was emitted: it must then be emitted too, which is
+  // why this compares with what the parent was last told and not with the (stale) prop.
+  if (sameRange(next, known)) return
+  known = next
   emit('update:visibleRange', next)
 }
 
@@ -258,9 +405,26 @@ onMounted(() => {
   chart.subscribeCrosshairMove(onCrosshairMove)
   chart.timeScale().subscribeVisibleLogicalRangeChange(onRangeChange)
 
-  if (props.visibleRange) chart.timeScale().setVisibleLogicalRange(props.visibleRange)
+  applying = true
+  if (props.visibleRange) chart.timeScale().setVisibleLogicalRange({ ...props.visibleRange })
   else chart.timeScale().fitContent()
+  syncView()
+  // Both apply in the library's next frame, which reports the result; ours follows it.
+  settleApply()
 })
+
+// Clears `applying` after the chart's next frame, where a queued range has been applied and reported
+// (the library's frame callback is registered before ours, so it runs first). Only the latest apply
+// clears it.
+let applyToken = 0
+function settleApply(): void {
+  const token = (applyToken += 1)
+  const done = (): void => {
+    if (token === applyToken) applying = false
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(done)
+  else setTimeout(done, 0)
+}
 
 onBeforeUnmount(() => {
   if (!chart) return
@@ -279,8 +443,19 @@ onBeforeUnmount(() => {
 watch(
   () => props.bars,
   () => {
-    data.value = markRaw(buildData(readBars()))
+    data.value = markRaw(buildAll())
     applyData()
+    syncView()
+  },
+)
+
+// The older neighbour landing (or changing): only the averages' input changed, so the candles and
+// the visible range are left alone.
+watch(
+  () => props.warmupBars,
+  () => {
+    data.value = markRaw(buildAll())
+    applyIndicators()
   },
 )
 
@@ -296,25 +471,125 @@ watch(
 watch(
   () => props.visibleRange,
   (range) => {
+    known = range ? { from: range.from, to: range.to } : null
     if (!chart || !range) return
-    const current = chart.timeScale().getVisibleLogicalRange()
-    if (sameRange(current, range)) return
-    lastEmitted = { from: range.from, to: range.to }
-    chart.timeScale().setVisibleLogicalRange(range)
+    const current = readRange()
+    if (sameRange(current, range)) {
+      syncView(range)
+      return
+    }
+    applying = true
+    chart.timeScale().setVisibleLogicalRange({ from: range.from, to: range.to })
+    syncView(range)
+    settleApply()
   },
 )
 </script>
 
 <template>
   <div
-    ref="container"
-    class="price-chart"
+    class="price-chart-frame"
     :style="{ height: `${height}px` }"
-  />
+  >
+    <div
+      ref="container"
+      class="price-chart"
+    />
+    <!-- The plot's decorations: the overlap bands (the shown bars a neighbouring page shows too) and
+         the session boundaries. Clipped to the plot; only a band's label takes pointer events (for
+         the title). -->
+    <div
+      v-if="hasOverlay"
+      class="price-chart__plot"
+      :style="{ right: `${plotInset.right}px`, bottom: `${plotInset.bottom}px` }"
+      aria-hidden="true"
+    >
+      <div
+        v-for="(left, i) in sessionLines"
+        :key="`s${i}`"
+        class="price-chart__session"
+        data-testid="price-chart-session"
+        :style="{ left: `${left}%` }"
+      />
+      <div
+        v-if="overlapBeforeBand"
+        class="price-chart__overlap price-chart__overlap--before"
+        data-testid="price-chart-overlap-before"
+        :style="{ left: `${overlapBeforeBand.left}%`, width: `${overlapBeforeBand.width}%` }"
+      >
+        <span
+          class="price-chart__overlap-label"
+          :title="overlapBeforeHint"
+        >{{ titleCase('Overlap') }}</span>
+      </div>
+      <div
+        v-if="overlapBand"
+        class="price-chart__overlap"
+        data-testid="price-chart-overlap"
+        :style="{ left: `${overlapBand.left}%`, width: `${overlapBand.width}%` }"
+      >
+        <span
+          class="price-chart__overlap-label"
+          :title="overlapHint"
+        >{{ titleCase('Overlap') }}</span>
+      </div>
+    </div>
+  </div>
 </template>
 
 <style scoped>
+.price-chart-frame {
+  position: relative;
+  width: 100%;
+  /* Lightweight Charts stacks its canvases at z-index 1 and 2 (and paints an opaque background), so
+     anything laid over the plot must sit above them; isolating keeps those indices inside the frame. */
+  isolation: isolate;
+}
 .price-chart {
   width: 100%;
+  height: 100%;
+}
+/* The plot area, for clipping the overlap band; it takes no pointer events. */
+.price-chart__plot {
+  position: absolute;
+  top: 0;
+  left: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 5;
+}
+/* The overlap: tinted, a dashed accent border on the side facing the page's own bars. */
+.price-chart__overlap {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  box-sizing: border-box;
+  background: v-bind('overlapFill');
+  border-left: 1px dashed v-bind('colors.accentTint');
+}
+.price-chart__overlap-label {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  max-width: calc(100% - 16px);
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: 11px;
+  color: v-bind('colors.accentTint');
+  pointer-events: auto;
+}
+/* A session boundary: a thin dashed vertical line between the last bar of one session and the first
+   of the next, over the plot but never in the way of the crosshair. */
+.price-chart__session {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-left: 1px dashed v-bind('colors.hatch');
+}
+/* The overlap on the left: the dashed border faces the page's own bars, so it is on the right. */
+.price-chart__overlap--before {
+  border-left: 0;
+  border-right: 1px dashed v-bind('colors.accentTint');
 }
 </style>

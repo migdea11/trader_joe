@@ -1,9 +1,14 @@
 <script setup lang="ts">
 // The catalog grid (tj-grna9p.32, ADR tj-grna9p.2): AG Grid Community, infinite row model over the
 // keyset-paged /ui/v1/datasets (catalog/cursorDatasource.ts). Columns: Symbol, Source and Feed,
-// Gran., Update, Status, Expires. A new datasource (so an empty block cache and no cursor) is made
-// when the filters change or the store's refreshKey is bumped; the old one aborts its requests.
-// A row click opens the Viewer. Loading, empty and error states are panels over the grid.
+// Gran., Update, Status (Running, Healthy, Late, Failed, Retired), Coverage (a lazily fetched
+// strip, CoverageCell.vue), Expires. A new datasource (so an empty block cache and no cursor) is made
+// when the filters change or the store's refreshKey is bumped; the old one aborts its requests. A
+// live event bumps liveKey instead: the same datasource forgets its pages and the grid reloads the
+// rows it holds in place, so scroll position and the loaded rows stay. A row click opens the Viewer;
+// the details icon in the Coverage cell opens the Dataset detail. The row is the click target, with
+// the grid theme's row hover (raised surface) and a pointer cursor; the Symbol is a real link styled
+// as text. Loading, empty and error states are panels over the grid.
 import { computed, onBeforeUnmount, shallowRef, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
@@ -15,15 +20,19 @@ import type { DatasetSummary } from '@generated/trader_joe/proto/ui/v1/data_pb'
 import { listDatasets } from '@/api'
 import { gridTheme, registerGridModules } from '@/catalog/agGrid'
 import { createCursorDatasource } from '@/catalog/cursorDatasource'
+import type { CursorDatasource } from '@/catalog/cursorDatasource'
 import { filtersKey, toApiFilters } from '@/catalog/filters'
 import type { CatalogFilters } from '@/catalog/filters'
 import { granularityLabel, sourceFeedLabel, updateTypeLabel } from '@/catalog/labels'
-import { VIEWER_ROUTE } from '@/catalog/rows'
+import { DETAIL_ROUTE, VIEWER_ROUTE } from '@/catalog/rows'
+import CoverageCell from '@/components/catalog/CoverageCell.vue'
 import SymbolCell from '@/components/catalog/SymbolCell.vue'
 import StatusCell from '@/components/catalog/StatusCell.vue'
 import { MISSING, timestampToInstant } from '@/format/formatters'
 import { useFormatters } from '@/format/useFormatters'
 import { useDatasetCatalogStore } from '@/stores/datasetCatalog'
+import { useDatasetCoverageStore } from '@/stores/datasetCoverage'
+import { COVERAGE_UNIT, titleCase } from '@/theme/copy'
 
 const props = defineProps<{ filters: CatalogFilters }>()
 
@@ -34,13 +43,21 @@ const PAGE_SIZE = 100
 
 const router = useRouter()
 const store = useDatasetCatalogStore()
-const { listStatus, listError, loadedRows, refreshKey } = storeToRefs(store)
+const coverage = useDatasetCoverageStore()
+const { listStatus, listError, loadedRows, refreshKey, liveKey } = storeToRefs(store)
 const { date } = useFormatters()
 
 const api = shallowRef<GridApi<DatasetSummary> | null>(null)
+let datasource: CursorDatasource | null = null
 
+// The data is the default destination: a row and its Symbol link open the Viewer; the details icon
+// in the Coverage cell goes straight to the Dataset detail.
 function viewerHref(id: string): string {
   return router.resolve({ name: VIEWER_ROUTE, params: { id } }).href
+}
+
+function detailHref(id: string): string {
+  return router.resolve({ name: DETAIL_ROUTE, params: { id } }).href
 }
 
 const columnDefs: ColDef<DatasetSummary>[] = [
@@ -73,11 +90,21 @@ const columnDefs: ColDef<DatasetSummary>[] = [
     minWidth: 100,
   },
   {
-    colId: 'status',
-    headerName: 'Status',
+    colId: 'collection',
+    headerName: titleCase('Status'),
     cellRenderer: StatusCell,
     flex: 1.2,
     minWidth: 120,
+  },
+  {
+    colId: 'coverage',
+    // The cell shows only x/y; the unit lives here, built from the constant so a rename moves it.
+    headerName: `${titleCase('Coverage')} (${titleCase(COVERAGE_UNIT)})`,
+    cellRenderer: CoverageCell,
+    cellRendererParams: { detailHref },
+    flex: 1.8,
+    // Bar, numbers and the details icon's slot, plus the cell padding.
+    minWidth: 240,
   },
   {
     colId: 'expires',
@@ -103,18 +130,16 @@ function getRowId(params: GetRowIdParams<DatasetSummary>): string {
 function install(): void {
   if (api.value === null) return
   store.listLoading()
-  api.value.setGridOption(
-    'datasource',
-    createCursorDatasource<DatasetSummary>({
-      pageSize: PAGE_SIZE,
-      fetchPage: async (cursor, limit, signal) => {
-        const page = await listDatasets({ ...toApiFilters(props.filters), cursor, limit, signal })
-        return { items: page.items, nextCursor: page.nextCursor }
-      },
-      onPage: (info) => store.listPage(info),
-      onError: (error, info) => store.listFailed(error, info),
-    }),
-  )
+  datasource = createCursorDatasource<DatasetSummary>({
+    pageSize: PAGE_SIZE,
+    fetchPage: async (cursor, limit, signal) => {
+      const page = await listDatasets({ ...toApiFilters(props.filters), cursor, limit, signal })
+      return { items: page.items, nextCursor: page.nextCursor }
+    },
+    onPage: (info) => store.listPage(info),
+    onError: (error, info) => store.listFailed(error, info),
+  })
+  api.value.setGridOption('datasource', datasource)
 }
 
 function onGridReady(event: GridReadyEvent<DatasetSummary>): void {
@@ -124,15 +149,28 @@ function onGridReady(event: GridReadyEvent<DatasetSummary>): void {
 
 watch([() => filtersKey(props.filters), refreshKey], install)
 
+// Refresh asks for the strips again as well (a filter change does not: a strip does not depend on one).
+watch(refreshKey, () => coverage.invalidateAll())
+
+// A live event or a reconnect: the rows reload in place, without the loading panel or a scroll reset.
+watch(liveKey, () => {
+  if (api.value === null || datasource === null) return
+  datasource.invalidate()
+  api.value.refreshInfiniteCache()
+})
+
 function onRowClicked(event: RowClickedEvent<DatasetSummary>): void {
   const mouse = event.event as MouseEvent | null | undefined
   // A modified click is the browser's (new tab on the Symbol link); the row only handles a plain one.
   if (mouse && (mouse.metaKey || mouse.ctrlKey || mouse.shiftKey || mouse.altKey)) return
+  // The details icon is its own link and goes to the detail; it never opens the Viewer too.
+  if ((mouse?.target as Element | null | undefined)?.closest?.('.details-link')) return
   if (event.data) void router.push({ name: VIEWER_ROUTE, params: { id: event.data.id } })
 }
 
 onBeforeUnmount(() => {
   api.value = null
+  datasource = null
 })
 
 const showLoading = computed(() => listStatus.value === 'loading')

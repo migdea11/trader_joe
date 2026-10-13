@@ -21,6 +21,12 @@ set -euo pipefail
 # disagree silently. Shipping the revisions inside the image is a build-infra change, not this
 # script's job — tj-y3sj8x.
 #
+# THAT SPLIT EXISTS ONLY ON THE PRODUCTION DEFINITION. On the dev definition the override
+# bind-mounts app/, common/, routers/, schemas/ and gen/proto/python over /code as well, so the
+# models, the enums the revisions import and the revisions themselves all come from this checkout:
+# there is no image/revision split in dev. Which definition runs is chosen from the running stack;
+# see WHICH STACK below.
+#
 # "Run this from a checkout that matches the running image" is what this header used to say, and
 # saying it was all it did. On 2026-10-04 a careful operator did exactly what it warned against
 # and read three phantom drift items as real. For `check` — and only for `check` — that sentence
@@ -123,23 +129,173 @@ cd "$REPO_ROOT"
 
 # -f docker-compose.yaml explicitly, matching `make build` and the CI migrate step. A bare
 # `docker compose` also auto-loads docker-compose.override.yaml, which swaps data_store to
-# the dev image; migrations belong against the production service definition.
+# the dev image. THE DEFAULT IS THE PRODUCTION DEFINITION: the dev definition (base + override)
+# is selected only when the running stack is unambiguously dev, by select_stack below, and
+# everything ambiguous stays on this line (tj-slxynv; tj-x3ig38 addendum 2026-10-12). Keep this
+# top-level line literal: test_network_model.py reads the first ^COMPOSE=(...) line.
 COMPOSE=(docker compose -f docker-compose.yaml)
+
+# WHICH make TARGET REBUILDS THE IMAGE THE SELECTED DEFINITION RUNS. Only the FIX: lines of the
+# `check` guard read it; select_stack sets it to dev-build when it selects the dev definition.
+BUILD_TARGET=prod-build
+
+# =================================================================================================
+# WHICH STACK (decision tj-slxynv option (b); tj-x3ig38 addendum 2026-10-12; tj-yb1bxj addendum 4).
+#
+# `make dev-build` then dev launch then `make migrate` used to fail from migrations/env.py: this
+# script ran the production image (:latest, which only `make prod-build` builds) while the stack up
+# was dev (:dev). So the definition follows the stack that is RUNNING, read from the label compose
+# stamps on every container it creates, com.docker.compose.project.config_files: the config files
+# of the `up` that CREATED the container, as absolute paths joined by commas.
+#
+#   * The postgres container is the one asked: postgres is already required to be up, it is the
+#     one container dev-deps alone starts, and docker-compose.yaml gives it a fixed container_name
+#     so a project never has two.
+#   * DEV iff some entry's FILE NAME is exactly docker-compose.override.yaml. NEVER a full-path
+#     comparison: the label holds the paths as seen by whoever ran `up` (a host path, or a
+#     devcontainer's /workspace), so comparing against $REPO_ROOT would misread a correct dev stack.
+#   * A dev postgres is cross-checked against a running data_store, whose label must say dev too.
+#   * AMBIGUOUS MEANS PRODUCTION AND STILL RUNS ALEMBIC. No label, an empty or malformed label, a
+#     failed inspect or ps, more than one postgres or data_store container, a dev postgres with a
+#     non-dev data_store. Detection never exits by itself: `upgrade head` is the remedy and a
+#     selection problem must not refuse it (tj-yb1bxj addendum 3 item 6, addendum 4 item 4).
+#   * The dev list is -f docker-compose.yaml -f docker-compose.override.yaml and NOTHING else. The
+#     web file carries an INSTANCE_WRITE_SECRET:? guard that compose interpolates even for a run of
+#     another service, and a dev .env leaves it empty.
+#
+# ONE line goes to STDERR saying which definition was chosen and why. STDOUT is untouched: CI-style
+# callers parse `alembic current` from it.
+#
+# BEGIN classify_config_files: the whole label -> verdict decision, with no globals and no docker,
+# so a test can extract this block and drive it with a label string. Prints one line:
+#   DEV                  some entry's file name is exactly docker-compose.override.yaml
+#   PROD                 well formed, and no entry is the override
+#   UNKNOWN: <reason>    empty, or malformed (an empty or relative entry, or a newline)
+# A path that itself contains a comma lands in UNKNOWN as malformed: fail closed.
+classify_config_files() {
+    local label="$1" entry
+    local -a entries
+
+    if [ -z "$label" ]; then
+        echo "UNKNOWN: the container carries no compose config_files label"
+        return 0
+    fi
+    case "$label" in
+        ,* | *, | *,,* | *$'\n'*)
+            echo "UNKNOWN: malformed label: $label"
+            return 0
+            ;;
+    esac
+
+    IFS=',' read -r -a entries <<< "$label"
+    for entry in "${entries[@]}"; do
+        if [ -z "$entry" ] || [ "${entry#/}" = "$entry" ]; then
+            echo "UNKNOWN: malformed label: $label"
+            return 0
+        fi
+    done
+    for entry in "${entries[@]}"; do
+        if [ "${entry##*/}" = docker-compose.override.yaml ]; then
+            echo DEV
+            return 0
+        fi
+    done
+    echo PROD
+}
+# END classify_config_files
+
+# Classify one container id: reads its label and hands it to classify_config_files. A failed
+# inspect is UNKNOWN, never an exit. The `with` guard matters: .Config.Labels is nil on a
+# container with no labels at all, and `index` on a nil map errors without it.
+classify_container() {
+    local label
+    if ! label="$(docker inspect \
+        --format '{{ with .Config.Labels }}{{ index . "com.docker.compose.project.config_files" }}{{ end }}' \
+        "$1" 2> /dev/null)"; then
+        echo "UNKNOWN: could not read the container's compose label"
+        return 0
+    fi
+    classify_config_files "$label"
+}
+
+# Number of lines in a possibly empty `ps -q` result.
+count_lines() {
+    if [ -z "$1" ]; then
+        echo 0
+    else
+        local newlines="${1//[!$'\n']/}"
+        echo $((${#newlines} + 1))
+    fi
+}
+
+# Chooses COMPOSE and BUILD_TARGET and prints the one stderr line. $1 is postgres's container id(s),
+# already captured by the caller. Run AFTER the postgres-is-running check and BEFORE the `check`
+# guard, which asks the selected definition which image the one-off container will run.
+select_stack() {
+    local postgres_ids="$1" reason verdict data_store_ids count
+
+    reason="the running postgres was started without docker-compose.override.yaml"
+    count="$(count_lines "$postgres_ids")"
+    if [ "$count" -ne 1 ]; then
+        reason="$count postgres containers in this project; cannot tell which stack"
+    else
+        verdict="$(classify_container "$postgres_ids")"
+        case "$verdict" in
+            DEV)
+                if ! data_store_ids="$("${COMPOSE[@]}" ps -q data_store 2> /dev/null)"; then
+                    reason="could not list the data_store containers to cross-check the stack"
+                else
+                    count="$(count_lines "$data_store_ids")"
+                    if [ "$count" -eq 0 ]; then
+                        reason=""
+                    elif [ "$count" -ne 1 ]; then
+                        reason="$count data_store containers; cannot tell which stack"
+                    else
+                        verdict="$(classify_container "$data_store_ids")"
+                        if [ "$verdict" = DEV ]; then
+                            reason=""
+                        else
+                            reason="postgres was started by the dev definition but data_store by ${verdict}: mixed stack"
+                        fi
+                    fi
+                fi
+                ;;
+            PROD) ;;
+            *) reason="${verdict#UNKNOWN: }" ;;
+        esac
+    fi
+
+    if [ -z "$reason" ]; then
+        COMPOSE=(docker compose -f docker-compose.yaml -f docker-compose.override.yaml)
+        BUILD_TARGET=dev-build
+        echo "run_migrations.sh: using the DEV definition (docker-compose.yaml + docker-compose.override.yaml): the running postgres was started with docker-compose.override.yaml" >&2
+    else
+        echo "run_migrations.sh: using the PRODUCTION definition (docker-compose.yaml): $reason" >&2
+    fi
+}
+# =================================================================================================
 
 # =================================================================================================
 # THE COMPARISON IMAGE IS VERIFIED BEFORE `check` RUNS (decision tj-yb1bxj clauses 2-4; tj-ymsobh).
 #
-# WHY. migrations/env.py imports the models from /code — IN THE IMAGE — while only alembic.ini and
-# migrations/ are bind-mounted. So `alembic check` ALWAYS compares the IMAGE'S models against the
-# live schema and never this checkout's, and nothing in its output says which image it used. On
-# 2026-10-04 that reported three drift items that were all phantoms of a stale prod image, one of
+# WHY. migrations/env.py imports the models from /code. On the PRODUCTION definition /code is the
+# IMAGE's, and only alembic.ini and migrations/ are bind-mounted, so there `alembic check` compares
+# the IMAGE'S models against the live schema and never this checkout's, and nothing in its output
+# says which image it used. On the DEV definition the override also bind-mounts app/, common/,
+# routers/, schemas/ and gen/proto/python over /code, so the models come from this checkout and
+# that image/revision split does not arise. The guard below still runs there, and deliberately:
+# the stamp compares what is baked into the :dev image (the dependencies, which no bind mount
+# replaces), and a :dev image whose stamp does not match the checkout is refused (tj-yb1bxj
+# addendum 4 item 3; do not relax it). On 2026-10-04 the production case reported three drift
+# items that were all phantoms of a stale prod image, one of
 # them a bug the branch had already removed. A drift check whose comparison base is unverified is
 # not a weak check, it is an uninterpretable one, and an uninterpretable green is worse than none.
 #
 # WHY IT LIVES IN THIS SCRIPT RATHER THAN IN THE `migrate-check` TARGET, which is the other place
 # it could have gone. The guard has to name the image the one-off container will actually use, and
-# this script is the only thing that knows it: the `-f docker-compose.yaml` pin above is what
-# excludes the dev override, so the image is a consequence of THIS file's compose invocation.
+# this script is the only thing that knows it: select_stack above decides whether the dev override
+# is loaded, so the image (:dev or :latest) is a consequence of THIS file's compose invocation, and
+# the guard follows that selection rather than assuming the production image.
 # Deriving it again in the Makefile would be a second spelling of the thing this script exists to
 # be the single spelling of (tj-4yvsb2), and the two would drift. Gating on the COMMAND rather than
 # on the caller also means a future caller that passes `check` — a deploy script, a human — gets
@@ -156,9 +312,10 @@ COMPOSE=(docker compose -f docker-compose.yaml)
 # bind-mounted revision scripts, and a revision script may import image code and derive the DDL it
 # emits from it. Today exactly one statement does — FEED_TYPE.create() in
 # migrations/versions/eec8f88a7443_per_dataset_identity_and_feed.py, whose CREATE TYPE label list
-# is read off the IMAGE's common.enums.data_stock.Feed. A stale image there emits a different
-# CREATE TYPE, with no ImportError, and alembic check cannot see it — enum labels are one of the
-# two blind spots this file's header already names.
+# is read off the IMAGE's common.enums.data_stock.Feed on the PRODUCTION definition (on the dev
+# definition common/ is bind-mounted, so it is read off this checkout). A stale image there emits
+# a different CREATE TYPE, with no ImportError, and alembic check cannot see it — enum labels are
+# one of the two blind spots this file's header already names.
 #
 # IT IS STILL NOT GUARDED, and the reason is the COST OF REFUSING, not the absence of exposure.
 # migrate-check is advisory and re-runnable, so refusing it costs an operator one build.
@@ -290,7 +447,7 @@ Left to proceed, compose would build this image implicitly as part of \`run\` �
 checkout, but WITHOUT the stamp, because only the build recipes export it. The next run would
 then land in "cannot verify" rather than here.
 
-FIX: make prod-build
+FIX: make $BUILD_TARGET
 EOF
         return 0
     fi
@@ -316,7 +473,7 @@ THIS IS THE ORDINARY CASE AND NOTHING IS WRONG WITH YOUR IMAGE. Only \`make prod
 --build) or by a bare \`docker compose build\` has no stamp — it may well be perfectly current;
 it simply cannot be SHOWN to be, and a check nobody can interpret is the thing being replaced.
 
-FIX: make prod-build
+FIX: make $BUILD_TARGET
 EOF
         return 0
     fi
@@ -331,7 +488,7 @@ $(describe_comparison "$image_ref" "$image_stamp" "$checkout_digest")
 every difference as drift. That is the 2026-10-04 failure verbatim: three drift items, all
 phantoms of a stale image, one of them a bug the branch had already removed.
 
-FIX: make prod-build
+FIX: make $BUILD_TARGET
 EOF
         return 0
     fi
@@ -377,6 +534,11 @@ if [ -z "$postgres_container" ]; then
     echo "postgres is not running — start it first (make launch-deps), then re-run." >&2
     exit 1
 fi
+
+# AFTER the postgres check and BEFORE the guard below: the guard asks the selected definition which
+# image will run, and verify_comparison_image's containment comment depends on the postgres check
+# having run first. Never exits; ambiguous means the production definition.
+select_stack "$postgres_container"
 
 # Last, because the two checks above are cheaper and because an operator with a stopped database
 # wants to hear about the database first. Still BEFORE alembic runs, which is the requirement: a

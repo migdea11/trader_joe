@@ -10,7 +10,7 @@ import { BarSchema, type Bar } from '@generated/trader_joe/proto/market/v1/bar_p
 import PriceChart, { type PriceHover } from '@/components/charts/PriceChart.vue'
 import ZoomNavigator from '@/components/charts/ZoomNavigator.vue'
 import { VChart } from '@/components/charts/echarts'
-import type { LogicalRangeLike } from '@/components/charts/navigatorMath'
+import type { LogicalRangeLike, SeekRequest } from '@/components/charts/navigatorMath'
 import { CHART_CREDITS } from '@/components/charts/credits'
 import { colors } from '@/theme/tokens'
 
@@ -63,6 +63,45 @@ const closes = computed(() => Float64Array.from(bars.value, (bar) => bar.close))
 const visibleRange = ref<LogicalRangeLike | null>(null)
 const hover = ref<PriceHover | null>(null)
 
+// The pager: 189 pages of 1000 bars with 50 overlap (a 180,000-bar window), the real page rule of
+// tj-eozqhi. The page's closes are synthetic; a seek loads the page holding the leading edge.
+const PAGE_SIZE = 1000
+const PAGE_STEP = 950
+const WINDOW_BARS = 180_000
+const pageStarts: number[] = []
+for (let at = 0; at + PAGE_SIZE < WINDOW_BARS; at += PAGE_STEP) pageStarts.push(at)
+pageStarts.push(WINDOW_BARS - PAGE_SIZE)
+const pagesAll = pageStarts.length
+
+const pageIndex = ref(pagesAll - 1)
+const pageRange = ref<LogicalRangeLike | null>({ from: 300, to: 700 })
+const pageOffset = computed(() => pageStarts[pageIndex.value])
+const pageCloses = computed(() => {
+  const rand = prng(pageIndex.value + 1)
+  let price = 100 + (pageIndex.value % 40)
+  return Float64Array.from({ length: PAGE_SIZE }, () => (price *= 1 + (rand() - 0.5) * 0.01))
+})
+const pageLabel = computed(
+  () => `Page ${(pageIndex.value + 1).toLocaleString('en-US')} of ${pagesAll.toLocaleString('en-US')}`,
+)
+
+function onSeek(request: SeekRequest): void {
+  // The page holding the leading edge (the edge in the direction of travel).
+  const edge = request.direction === 'left' ? request.from : request.to
+  let k = pageStarts.findIndex((start) => edge < start + PAGE_SIZE)
+  if (k < 0) k = pagesAll - 1
+  pageIndex.value = k
+  const offset = pageStarts[k]
+  if (request.direction === 'page') {
+    // Page navigation: the whole page.
+    pageRange.value = { from: 0, to: PAGE_SIZE - 1 }
+    return
+  }
+  const width = request.to - request.from
+  const from = Math.min(Math.max(request.from - offset, 0), PAGE_SIZE - 1 - width)
+  pageRange.value = { from, to: from + width }
+}
+
 // A bare vue-echarts example in the app theme: stacked bars with a line and a marked cap.
 const days = Array.from({ length: 14 }, (_, i) => `2026/09/${String(i + 1).padStart(2, '0')}`)
 const rand = prng(11)
@@ -114,6 +153,23 @@ const option = {
       <ZoomNavigator
         v-model:visible-range="visibleRange"
         :values="closes"
+      />
+    </section>
+
+    <section>
+      <h2>ZoomNavigator as the pager (189 pages)</h2>
+      <p class="note">
+        Drag the window past the block's edge, press Page Up, Page Down, Home or End, or click the
+        hatched area: each seeks another page.
+      </p>
+      <ZoomNavigator
+        v-model:visible-range="pageRange"
+        :values="pageCloses"
+        :total-bars="WINDOW_BARS"
+        :page-offset="pageOffset"
+        :page-size="PAGE_SIZE"
+        :label="pageLabel"
+        @seek="onSeek"
       />
     </section>
 

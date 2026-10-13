@@ -14,6 +14,13 @@ optional `expiry` that defaults to none. Those entries and the entries they chan
 server code now lives under `server/`: file paths in this document are relative to it, and the
 manifest is at `server/routers/tests/interface_manifest/`.
 
+**Updated for the collection record and live events (2026-10).** The tree then gained the dataset's
+run history and coverage strip (U6, U7), the live-event socket (U8), the Viewer's page index (U9), the
+`ingest_run` record behind S1, and two request-body fields that are accepted and ignored. The U5
+`limit` maximum went from 10,000 to 50,000. Those entries and the ones they changed say so. What is
+*not* built is named where it would be looked for: no request log, queue or scheduler, no write route
+under `/ui/v1`, and no ops or collection-statistics read.
+
 **Checked on real Postgres, with named gaps.** Every status code and behaviour below was checked in
 process, against the code and its tests. On 2026-09-29 the owner ran the system suite
 (`tests/system`, through `make test-system SYSTEM_TEST_DISPOSABLE_DB=1`) on the host against a
@@ -133,7 +140,7 @@ Every implementing file on this surface moved at the monorepo split (`tj-iontkq`
 
 ## The surface at a glance
 
-**Fourteen** interfaces are visible to the manifest: three in `common.manifest` and eleven in
+**Seventeen** interfaces are visible to the manifest: three in `common.manifest` and fourteen in
 `data_store.manifest`. The count is taken from `routers/tests/interface_manifest/*.manifest`, not from
 the prose below. `data_ingest.manifest` holds a single `none` line,
 which is a declaration that the component exposes nothing this manifest can enumerate, not an
@@ -157,6 +164,10 @@ It was nine until the Kafka removal, when R1 left the table.
 | U3 | `GET /ui/v1/datasets/facets` | data_store | http (protobuf JSON) | none | **Stable** |
 | U4 | `GET /ui/v1/datasets/{dataset_id}` | data_store | http (protobuf JSON) | none | **Stable** |
 | U5 | `GET /ui/v1/datasets/{dataset_id}/bars` | data_store | http (protobuf JSON) | none | **Stable** |
+| U6 | `GET /ui/v1/datasets/{dataset_id}/runs` | data_store | http (protobuf JSON) | none | **Stable** |
+| U7 | `GET /ui/v1/datasets/{dataset_id}/coverage` | data_store | http (protobuf JSON) | none | **Stable** |
+| U8 | `WS /ui/v1/events` | data_store | ws (protobuf JSON frames) | none | **Stable** |
+| U9 | `GET /ui/v1/datasets/{dataset_id}/bar-pages` | data_store | http (protobuf JSON) | none | **Stable** |
 
 data_ingest has no row. Its interface is the gRPC `IngestService.FetchDataset`, declared in
 `proto/trader_joe/proto/internal/ingest/v1/ingest.proto`, handled by
@@ -181,9 +192,12 @@ went with it on `tj-3mk3u5.32`, since no registration was left for it to describ
 analysis or task note that says thirteen interfaces, it predates that route's removal; one that
 says twelve predates the first deletion by ruling; one that says nine predates the Kafka removal.
 
-### The three kinds
+### The four kinds
 
 - **`http`** — a FastAPI route registered on a module-scope `APIRouter` while the module body ran.
+- **`ws`** — a FastAPI WebSocket route on a module-scope `APIRouter`. One today, U8. It has no
+  response model, so the manifest's `response` field is `-`; its frame type is pinned by the events
+  tests.
 - **`none`** — the component exposes nothing this manifest can enumerate, said out loud. A single
   `none` line is a declaration, which an accidentally empty file is not (decision `tj-3wgh03`).
 - **`unbound-path`** — a path declared in an interface enum that no import-time route serves. This
@@ -338,9 +352,9 @@ and cannot rely on an error.
 |---|---|---|
 | 401 | Instance secret missing, wrong, or not configured on the server. One fixed message for all three causes. | S1, S3, S4 |
 | 403 | The declared `owner` does not own the entry (a missing owner is treated as a wrong one) | S3 |
-| 404 | No entry or dataset with that id | S3, S6, U4, U5 |
+| 404 | No entry or dataset with that id | S3, S6, U4, U5, U6, U7 |
 | 409 | The create overlaps the same owner's existing dataset; the top-level `colliding_ids` member of the problem+json lists them | S1 |
-| 422 | Validation: a naive datetime, an unknown field or parameter, a missing required field, a bars query naming no selector or a blank symbol, a `validate_fields` rule on the create body, an `asset_type`/`data_type` pair other than `stock`/`market_activity` on the internal asset-data path, or a malformed single-bar body | all |
+| 422 | Validation: a naive datetime, an unknown field or parameter, a missing required field, a bars query naming no selector or a blank symbol, a `validate_fields` rule on the create body, an `asset_type`/`data_type` pair other than `stock`/`market_activity` on the internal asset-data path, or a malformed single-bar body; a `STREAM` create or a naive `ready_by` on S1; a coverage read for a dataset no trading calendar covers (U7) | all |
 | 500 | Anything unmapped: a database error, a non-stock `asset_type` on S1 (gap **G8**), a duplicate timestamp inside one ingested batch | all |
 
 ---
@@ -458,6 +472,25 @@ expiry (and so read as retired) is active again. A repeat that carries an `expir
 an empty or inverted one can never be filled. The messages name members, e.g. *"The 'update_type'
 field must be 'STATIC' when 'end' is provided."*
 
+**A `STREAM` create is refused** with a 422 (reason `INVALID_REQUEST`) while streaming is not built.
+The refusal runs on this body only, so a dataset already stored as `STREAM` still reads, and `STREAM`
+is still accepted as a filter on S2.
+
+**`ready_by` and `best_effort` are accepted, validated and ignored.** `ready_by` is optional and must
+be timezone-aware (a naive value is a 422); `best_effort` is a boolean, default `false`. Nothing
+stores or reads either, so they change nothing about the request, are not part of the dataset's
+identity, and do not appear on S2 or S6. They are on the body so a client can send them ahead of the
+scheduler that will use them.
+
+**Every call is recorded as an ingest run.** S1 writes one `ingest_run` row around the fetch, in its
+own transactions: `RUNNING` before the stream opens, the dataset id at ingest's acknowledgement, and
+`SUCCEEDED` (bars written), `EMPTY` (the vendor held none) or `FAILED` (with the typed error) at the
+end. The record is best effort: a failure to write it is logged and the fetch goes ahead, and the
+error S1 answers with is the fetch's own. A run left `RUNNING` by a process that stopped is marked
+`FAILED` with reason `INTERRUPTED` at the next start. The runs are read through U6, and S1 also
+publishes to U8: an `IngestRunChanged` at each of the three points and a `DatasetChanged` `UPDATED`
+after the commit.
+
 **Two things a retry does not avoid.** An exact repeat reuses the entry and the bar upsert is
 idempotent on the bar's natural key, so the stored data does not duplicate — but the vendor fetch is
 repeated on every call, and a batch carrying two bars at the same timestamp fails the whole write with
@@ -509,7 +542,9 @@ identically, so do not read the difference as significant — it is noted only s
 | **Response** | **undeclared** — ad-hoc dict |
 | **Touches** | Postgres |
 
-Deletes one entry and, by `ON DELETE CASCADE`, exactly that entry's bars. **401** without the
+Deletes one entry and, by `ON DELETE CASCADE`, exactly that entry's bars, then publishes a
+`DatasetChanged` `DELETED` on U8. The dataset's run history is not deleted with it, but it is no longer
+reachable: U6 answers 404 for an unknown dataset. **401** without the
 secret; **403** when `owner` is missing or does not match the entry's owner (the body does not reveal
 the real one); **404** for an unknown id. `owner` is optional at the schema level on purpose: an
 absent owner is the degenerate case of a wrong one and gets the same 403, not a 422. That refusal
@@ -627,7 +662,7 @@ path with S3 and answers a different method; the manifest records the two as sep
 
 # routers/data_store — the UI read routes
 
-Five read routes serve the web UI under `/ui/v1`. They are open like the other reads and write nothing;
+Seven read routes and one socket serve the web UI under `/ui/v1`. They are open like the other reads and write nothing;
 in a deployment the web container's proxy is what a browser reaches, and only these routes pass it.
 See the README's *The web UI*.
 
@@ -664,7 +699,13 @@ package version, else `unknown`). Nothing secret is read or returned.
 
 One page of the catalog, a `DatasetPage` of `DatasetSummary` items: identity, range, `updateType`,
 `expiryType`, `expiry`, `state` (`ACTIVE` or `RETIRED`), the stored extent (`firstBar`, `lastBar`,
-`barCount`), `freshness` and the `siblings` (the same series at other granularities).
+`barCount`), `freshness`, the `siblings` (the same series at other granularities) and `lastRun`: the
+dataset's newest collection run, whatever its state, unset when it has never run (an `IngestRun`, see
+U6).
+
+**Running means a run is in flight and ingest has acknowledged it.** `lastRun.state` is `RUNNING`, and
+a run is attached to a dataset only from ingest's acknowledgement, so a first-time request is not
+visible as Running while the vendor is still answering. Running is not a freshness status.
 
 | Parameter | Meaning |
 |---|---|
@@ -672,6 +713,7 @@ One page of the catalog, a `DatasetPage` of `DatasetSummary` items: identity, ra
 | `source`, `update_type` | exact, by member name |
 | `status` | the UI group: `healthy`, `late`, `failed` or `retired` |
 | `needs_attention` | only late and failed datasets |
+| `running` | `true`: only datasets with a run in flight. Orthogonal to `status`: a dataset can be Late and Running at once |
 | `sort` | `symbol` (default), or `expires`: soonest first, no-expiry datasets last |
 | `cursor`, `limit` | page; `limit` 1 to 500, default 100 |
 
@@ -699,18 +741,132 @@ The sidebar's counts as a `DatasetFacets`, under the same filters U2 takes minus
 equals the total of the list it describes: `all` is the total with every filter except
 `needs_attention`, `needsAttention` is the total with every filter and `needs_attention` forced on,
 and each source, update type and status count is the total with every filter except that facet's own.
+`running` is the number of datasets with a run in flight, under every filter except `running` itself,
+so with `running=true` it equals the list's total.
 
 ### U4 · `GET /ui/v1/datasets/{dataset_id}`
 
-One `DatasetSummary`, as in U2. **404** for an unknown id.
+One `DatasetSummary`, as in U2, with `lastRun`. **404** for an unknown id.
 
 ### U5 · `GET /ui/v1/datasets/{dataset_id}/bars`
 
 One `BarPage` of the dataset's bars, ascending by bar start, in `[start, end)`. `start` and `end` are
-each optional, and unset leaves that side open. `limit` is 1 to 10000, default 1000. The cursor is the
+each optional, and unset leaves that side open. `limit` is 1 to 50000, default 1000 (the maximum was
+10000 before 2026-10-13; the Viewer keeps reading 1,000-bar pages, and the larger maximum is for
+programmatic readers and the Viewer's CSV export, which reads 50,000 at a time). The cursor is the
 last bar's timestamp, unique within a dataset, so paging is exact while bars are inserted. An empty or
 inverted window is an empty page, not an error. **404** for an unknown dataset, 422 for a bad cursor.
 Bars are raw (unadjusted), as on S5.
+
+### U9 · `GET /ui/v1/datasets/{dataset_id}/bar-pages`
+
+The page index of a bar window: where each fixed-size block of the window starts, so a client can
+read any page of U5 with one index seek instead of walking a cursor from the start. One
+`BarPageIndex`: `bar_count` (bars in the window), `page_size`, `overlap` (both echoed, so the answer
+is self-describing) and `pages`, oldest first, each a `BarPageStart` of `start` (the page's first
+bar) and `offset` (its 0-based position among the window's bars).
+
+| Parameter | Rule |
+|---|---|
+| `start`, `end` | the window, exactly as U5: optional, timezone-aware, half-open `[start, end)` |
+| `size` | 1 to 1000, default 1000. 422 `INVALID_REQUEST` outside that |
+| `overlap` | 0 to `size` - 1, default 50. 422 `INVALID_REQUEST` outside that |
+
+**The page rule.** Let N be the bars in the window and r = N mod `size`. Blocks of `size` bars are
+counted back from the **newest** bar, so the newest page is always full and the remainder is at the
+old end. The offsets, oldest first, are `[0 when r > 0]`, then r, r + `size`, ..., N - `size`, which
+is M = ceil(N / `size`) pages. N = 0 has no pages and N <= `size` is the one page `[0]`. The earliest
+page, when r > 0, holds a full `size` bars and so overlaps its newer neighbour; every page holds the
+same number of bars.
+
+`overlap` is a look-ahead and never moves an offset: page k is read with U5 using
+`start = pages[k].start`, the window's own `end`, and `limit = size + overlap`, which adds the first
+`overlap` bars of the next (newer) block; the newest page has none. Whatever `overlap` is, the pages
+and offsets are the same.
+
+**Offset 0 is absent from the JSON.** Protobuf canonical JSON omits a field at its default, so the
+earliest page's `offset` is missing and a client reads a missing `offset` as 0. A client that
+indexes `pages[k].offset` without that default reads `undefined`.
+
+**404** for an unknown dataset; **422** `INVALID_REQUEST` for a `size` or `overlap` out of range, a
+naive `start` or `end`, or a parameter the route does not know. An empty or inverted window is an
+empty index (`bar_count` 0, no pages), not an error, as in U5.
+
+**Cost.** Two statements: the dataset's entry, then one read that scans the window twice (a count and
+the ranking of its bars). Measured on Postgres 17 with one-minute bars: about 30 ms at 100,000 bars,
+0.3 s at 1,000,000 and 0.7 s at 2,400,000. The Viewer pays it once per From or
+To change, never per page. The index is a snapshot: bars appended to an open-ended window do not
+show until the next read of it.
+
+### U6 · `GET /ui/v1/datasets/{dataset_id}/runs`
+
+One `IngestRunPage` of the dataset's collection runs, **newest first**: keyset on `(started_at, id)`
+with an opaque `next_cursor` (empty on the last page), so a run that starts while a client pages never
+shifts a page it has not read. `limit` is 1 to 500, default 50. **404** for an unknown dataset, 422
+for a cursor that does not decode.
+
+An `IngestRun` carries `id`, `datasetId` (empty until ingest's acknowledgement), `label` (symbol and
+granularity), `trigger`, `actor` (the request body's `owner`, a label and never a credential), the
+requested `start` and `end`, `state` (`RUNNING`, `SUCCEEDED`, `EMPTY` or `FAILED`), `barsWritten`,
+`error` (set only when `FAILED`: `domain`, `reason`, `message`), `startedAt` and `finishedAt` (unset
+while `RUNNING`). Only `REQUEST` runs exist today: `SCHEDULE` and `RETRY` are in the vocabulary and
+nothing writes them. `requestId` and `quotaKey` are always empty. A run swept at startup reads
+`FAILED` with `reason` `INTERRUPTED`, which is a marker of the run record and not a member of the
+error vocabulary in [`errors.md`](errors.md).
+
+### U7 · `GET /ui/v1/datasets/{dataset_id}/coverage`
+
+A `CoverageStrip`: the dataset's range over its trading calendar, bucketed for a strip, and its gaps.
+Computed on read, never stored, from the same calendar and completed-session rule as the freshness
+status (a session counts as covered when it has at least one bar). It records no usage.
+
+| Part | Rule |
+|---|---|
+| `buckets` (query) | at most this many; default 120, 1 to 400, and 422 above 400. Fewer when the range holds fewer sessions |
+| `start`, `end` | the range, half-open: the dataset's `start` and `end` as `DatasetSummary` reads them at `asOf` |
+| `buckets` (field) | contiguous groups of near-equal session counts that tile `[start, end)`. `expectedSessions` counts completed sessions only, so a bucket with none is not yet due; `sessionsWithBars` is how many of those hold a bar |
+| `gaps` | at most the first 500, ascending. A gap is a maximal run of missing completed sessions; weekends and holidays never split or form one |
+| gap window | **whole sessions**: `start` is the local midnight of the first missing session, `end` the local midnight of the day after the last. It can begin before or end after the dataset's range when the range starts or ends mid-session; buckets are clipped to the range, gaps are not |
+| `gapCount` | the number of gap **intervals**, which may exceed `gaps`. `Freshness.gapCount` (U2) counts missing **sessions**; for a `STATIC` dataset the sessions of all gaps add up to it |
+
+**404** for an unknown dataset. **422** (`INVALID_REQUEST`) when no trading calendar covers the dataset
+(its source has none, or its range starts before the calendar does): an error, never an empty strip,
+which would read as no gaps. A read costs two statements. A retired `DAILY` or `STREAM` dataset is
+computed over its whole range, because when its retirement began is not recorded.
+
+### U8 · `WS /ui/v1/events`
+
+The UI's one live socket. Each frame is one text message of protobuf canonical JSON of a `UiEvent`
+(`serverTime`, and one of the oneof members). The route is open, like the GETs, and takes no inbound
+message: anything a client sends is read and ignored.
+
+**Events are notifications, not data.** A client treats each one as a hint to reload over REST, and
+reloads on every reconnect, so a frame that is dropped or missed is never the only copy of anything.
+The event is published after the commit it announces.
+
+| Event | Published when |
+|---|---|
+| `IngestRunChanged` (carries the `IngestRun`) | a run starts, is acknowledged by ingest, and finishes |
+| `DatasetChanged` `UPDATED` | after S1 commits |
+| `DatasetChanged` `DELETED` | after S3 commits |
+
+`DatasetChanged` is **never `CREATED`**, `RETIRED` or `RESUMED`: a new dataset arrives as `UPDATED`,
+because the upsert does not tell a create from a repeat. `RequestChanged` and `ReaperPendingChanged`
+are in the proto and typed, and **nothing publishes them**: they are reserved. An acknowledgement's
+`IngestRunChanged` can name a dataset whose entry is not committed yet, so a reload by id may 404
+briefly.
+
+**One process, one worker.** The hub that fans events out lives in data_store's memory, so the socket
+is correct only while data_store runs one worker; `docker-compose.yaml` pins `SERVICE_WORKERS=1`. With
+more, an event would reach only the clients connected to the worker that published it.
+
+**A slow client is dropped, not waited for.** Each client has a bounded queue,
+`EVENTS_CLIENT_QUEUE_SIZE` events (default 256). When it fills, the client is closed with WebSocket
+code **1013** (try again later) and is expected to reconnect and reload.
+
+**Through the web container's proxy** the upgrade is a `GET` under `/api/store/ui/v1/`, which is what
+Caddy forwards, so the socket passes with no change to the filter. The dev proxy forwards it with
+`ws: true`.
 
 ---
 
@@ -784,8 +940,16 @@ Kafka edge that turned a failure into a bare `{}`, so every typed failure reache
 and is rendered there as a `google.rpc.Status` with `ErrorInfo`. **No sentinel survives.** An empty
 result now means an empty interval, and nothing else.
 
-Gaps **G1** and **G2** still apply to what happens *after* a failure is reported — there is still no
-way to ask what a dataset's coverage is, or to see and retry a failed fetch.
+**Declared, and served by nothing yet.** `ingest.proto` also declares `IngestService.Quote`, and
+`internal/store/v1/store.proto` declares `StoreService.Bootstrap`. Neither has a server and neither
+has a caller: they are reserved for the scheduler work and `Bootstrap` is due to be rewritten.
+`FetchDatasetRequest` gained `request_id`, `ready_by` and `best_effort`, which are carried and unused,
+and `FetchAccepted.quota_key` and `FetchDone.vendor_stats` are on the wire but not yet mapped into
+the domain.
+
+Gaps **G1** and **G2** still apply to what happens *after* a failure is reported. G1 is narrowed:
+U7 answers what a dataset holds and what is missing, per session. G2 is narrowed too: U6 shows each
+failed run and its typed error. There is still no retry.
 
 data_ingest declares **no REST interface at all** — not merely none that is bound. `tj-427x50`
 deleted the last member of its `InterfaceRest` enum, and with it the empty enum class and its `Enum`
@@ -806,8 +970,8 @@ was built (S6).
 
 **The verdicts were taken, and this is now the state, not a forecast.** The `unbound-path` kind is
 empty for data_store and data_ingest and survives only for the two latency entries — which is the
-state that kind was invented to describe. `data_store.manifest` carries eleven `http` lines and nothing
-else (the five original routes, S6 and the five UI routes); `data_ingest.manifest` carries a single
+state that kind was invented to describe. `data_store.manifest` carries thirteen `http` lines and one `ws`
+line (the five original routes, S6, the seven UI reads and the events socket); `data_ingest.manifest` carries a single
 `none` line.
 
 ---
@@ -908,6 +1072,10 @@ rows (`tj-3mk3u5`). The **read interface** onto it is named nowhere.
 
 *Recommendation:* file the interface against the ledger work, not just the columns.
 
+**Narrowed since:** U7 answers the question for the UI, per dataset, computed on read over the trading
+calendar. It is not the ledger: it says which sessions hold at least one bar, not what was fetched,
+and the older read routes (S2, S5) still say nothing about completeness.
+
 ## G2 · No way to see or retry a failed fetch — **REAL GAP**, and worse than merely missing
 
 The broker call swallows every exception and returns an empty result (`tj-fe19tu`), so a vendor error,
@@ -920,6 +1088,10 @@ surface reports fetch outcome, and a swallowed error becomes a permanent silent 
 will record as fetched.
 
 *Recommendation:* one status read answers G1 and G2 together. Design them as one interface, not two.
+
+**Narrowed since:** every store-driven fetch is now recorded as an ingest run, with its typed error,
+and U6 and U8 expose that. A failed fetch is therefore visible. A retry is not built, and a run's
+history is per dataset: a request that failed before any dataset existed is listed under no dataset.
 
 ## G3 · No health/readiness distinction beyond `/ping` — **REAL GAP**, with a dated trigger
 

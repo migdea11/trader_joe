@@ -35,9 +35,18 @@ class UiDatasetsInterface(StrEnum):
     GET_UI_DATASET_FACETS = '/ui/v1/datasets/facets'
     GET_UI_DATASET = '/ui/v1/datasets/{dataset_id}'
     GET_UI_DATASET_BARS = '/ui/v1/datasets/{dataset_id}/bars'
+    GET_UI_DATASET_BAR_PAGES = '/ui/v1/datasets/{dataset_id}/bar-pages'
+    GET_UI_DATASET_RUNS = '/ui/v1/datasets/{dataset_id}/runs'
+    GET_UI_DATASET_COVERAGE = '/ui/v1/datasets/{dataset_id}/coverage'
 
 
 class UiConfigInterface(StrEnum):
     """The shell's configuration read (tj-grna9p.45). Served as protobuf canonical JSON."""
 
     GET_UI_CONFIG = '/ui/v1/config'
+
+
+class UiEventsInterface(StrEnum):
+    """The UI's live-event socket (tj-grna9p.73). A WebSocket, so it appears under no HTTP method."""
+
+    UI_EVENTS = '/ui/v1/events'

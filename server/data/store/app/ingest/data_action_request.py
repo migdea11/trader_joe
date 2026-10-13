@@ -46,6 +46,7 @@ THE FETCH DOES NOT CARRY A dataset_id. Correlation belongs to the transport and 
 its own rows (ADR tj-8konfu D7.2); nothing here builds a GetDatasetRequest any more.
 """
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from uuid import UUID
@@ -240,6 +241,7 @@ async def store_market_activity_worker(
     request_body: StoreAssetDatasetBody,
     db: AsyncSession,
     fetch_client: IngestFetchClient,
+    on_ack: Callable[[UUID, Feed], Awaitable[None]] | None = None,
 ) -> StoredDataset:
     """Fetch one dataset over the FetchDataset seam and write it, entry and bars, in one transaction.
 
@@ -258,6 +260,10 @@ async def store_market_activity_worker(
         db: The request's session. This function owns the transaction on it.
         fetch_client: The seam, as the INTERFACE -- a replay backend or a test double is an
             ordinary implementation of it (ADR tj-8konfu D3).
+        on_ack: Called with the entry's id and the resolved feed right after the ack's upsert, still
+            inside the fetch transaction. It is how the run recorder learns the dataset id
+            (app/ingest/run_recording.py); it must not touch `db`. None for a caller with nothing to
+            tell.
 
     Returns:
         StoredDataset: How many bars were written, and the window the fetch was answered for.
@@ -326,6 +332,8 @@ async def store_market_activity_worker(
                     # same type and would validate silently here. See _entry_on_ack.
                     entry = _entry_on_ack(overlap_key, request_body.expiry, event)
                     dataset_id = await upsert_entry_in_transaction(db, entry)
+                    if on_ack is not None:
+                        await on_ack(dataset_id, feed)
                 case fetch_dataset.BarPage():
                     item_count += await write_market_activity_in_transaction(
                         db,

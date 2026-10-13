@@ -78,3 +78,4 @@ member may take one of them to mean something else:
 - `COVERAGE_GAP`
 - `ADMISSION_REFUSED`
 - `SUBSCRIBER_TOO_SLOW`
+- `NOT_BOOTSTRAPPED`

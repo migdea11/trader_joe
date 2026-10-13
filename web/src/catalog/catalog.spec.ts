@@ -2,14 +2,17 @@ import { describe, expect, it, vi } from 'vitest'
 import { create } from '@bufbuild/protobuf'
 import type { IGetRowsParams } from 'ag-grid-community'
 
-import { DataSource, Feed, Granularity, UpdateType } from '@generated/trader_joe/proto/market/v1/enums_pb'
+import { DataSource, DataType, Feed, Granularity, UpdateType } from '@generated/trader_joe/proto/market/v1/enums_pb'
 import {
   DatasetFacetsSchema,
   DatasetSummarySchema,
   FreshnessStatus,
+  IngestRunState,
 } from '@generated/trader_joe/proto/ui/v1/data_pb'
 
 import { ApiError } from '@/api'
+import { MISSING } from '@/format/formatters'
+import { RUNNING_BADGE } from '@/theme/semantics'
 import { createCursorDatasource } from './cursorDatasource'
 import type { CursorPage } from './cursorDatasource'
 import { facetCounts } from './facets'
@@ -21,10 +24,11 @@ import {
   toCatalogQuery,
   withView,
 } from './filters'
-import { dataTypeLabel, granularityLabel, isIntraday, sourceFeedLabel, updateTypeLabel } from './labels'
-import { rowBadge } from './rows'
+import { dataTypeLabel, datasetIdentityLabel, granularityLabel, isIntraday, sourceFeedLabel, updateTypeLabel } from './labels'
+import { DETAIL_ROUTE, VIEWER_ROUTE, isRunning, rowBadge } from './rows'
 
-// tj-grna9p.32 phase 1 Datasets: the pure modules behind the sidebar, tiles and grid.
+// tj-grna9p.32 phase 1 Datasets: the pure modules behind the sidebar, tiles and grid; tj-grna9p.77
+// phase 2 added the Running filter, the Collection badge and the datasource's in-place invalidate.
 
 describe('parseCatalogQuery', () => {
   it('reads every filter from the URL', () => {
@@ -116,6 +120,38 @@ describe('toApiFilters and helpers', () => {
   })
 })
 
+describe('the Running filter (tj-grna9p.77)', () => {
+  it('?running=true reads as running, any other value as unset', () => {
+    expect(parseCatalogQuery({ running: 'true' }).running).toBe(true)
+    expect(parseCatalogQuery({ running: ['true', 'false'] }).running).toBe(true)
+    for (const value of ['false', '1', 'TRUE', '']) expect(parseCatalogQuery({ running: value }).running).toBeUndefined()
+    expect(parseCatalogQuery({}).running).toBeUndefined()
+  })
+
+  it('is written as running=true, combines with a status, and an unset one leaves no key', () => {
+    expect(toCatalogQuery({ view: 'all', status: 'late', running: true })).toEqual({ status: 'late', running: 'true' })
+    expect(toCatalogQuery({ view: 'all', running: undefined })).toEqual({})
+    expect(toCatalogQuery({ view: 'all' }, { group: 'paper', running: 'true' })).toEqual({ group: 'paper' })
+  })
+
+  it('round trips through the URL', () => {
+    const filters = { view: 'needs-attention' as const, status: 'failed' as const, running: true }
+    const query = toCatalogQuery(filters) as Record<string, string>
+    expect(parseCatalogQuery(query)).toMatchObject(filters)
+  })
+
+  it('sends running: true to the API only when set, and counts as an active filter', () => {
+    expect(toApiFilters({ view: 'all', running: true }).running).toBe(true)
+    expect(toApiFilters({ view: 'all' }).running).toBeUndefined()
+    expect(hasActiveFilters({ view: 'all', running: true })).toBe(true)
+    expect(hasActiveFilters({ view: 'all', running: undefined })).toBe(false)
+  })
+
+  it('filtersKey changes with it, so the grid re-queries', () => {
+    expect(filtersKey({ view: 'all', running: true })).not.toBe(filtersKey({ view: 'all' }))
+  })
+})
+
 describe('facetCounts', () => {
   const facets = create(DatasetFacetsSchema, {
     all: 40n,
@@ -159,11 +195,21 @@ describe('facetCounts', () => {
     expect(counts.needsAttention).toBe(5)
   })
 
+  it('the Running count is DatasetFacets.running as a number (tj-grna9p.77), never derived from the statuses', () => {
+    expect(facetCounts(create(DatasetFacetsSchema, { ...facets, running: 4n })).running).toBe(4)
+    expect(facetCounts(facets).running).toBe(0)
+    expect(() => facetCounts(create(DatasetFacetsSchema, { running: 2n ** 60n }))).toThrow(RangeError)
+  })
+
+  // Phase 2 (tj-grna9p.77) added the Running filter value, so the empty-facets shape carries its count
+  // too: a zero the server omits must still read 0 (the sidebar shows "0", not a dash), exactly like
+  // the other counts in this object.
   it('an empty response is all zeros, not missing', () => {
     const counts = facetCounts(create(DatasetFacetsSchema, {}))
     expect(counts).toEqual({
       all: 0,
       needsAttention: 0,
+      running: 0,
       status: { healthy: 0, late: 0, failed: 0, retired: 0 },
       sources: [],
       updateTypes: { 0: 0, 1: 0, 2: 0, 3: 0 },
@@ -192,6 +238,44 @@ describe('row labels and badge', () => {
     expect(rowBadge(create(DatasetSummarySchema, {})).label).toBe('Unknown')
   })
 
+  // tj-grna9p.77: the Collection badge is Running while the latest run is in flight, WHATEVER the
+  // freshness says (a Late or Failed dataset may be running its catch-up); otherwise the freshness word.
+  it.each([
+    FreshnessStatus.FRESH,
+    FreshnessStatus.LATE,
+    FreshnessStatus.GAPS,
+    FreshnessStatus.RETIRED,
+    FreshnessStatus.UNSPECIFIED,
+  ])('a RUNNING last run reads Running over freshness %s', (status) => {
+    const row = create(DatasetSummarySchema, { freshness: { status }, lastRun: { state: IngestRunState.RUNNING } })
+    expect(isRunning(row)).toBe(true)
+    expect(rowBadge(row)).toEqual(RUNNING_BADGE)
+  })
+
+  it('Running overlays a row with no health at all, too', () => {
+    expect(rowBadge(create(DatasetSummarySchema, { lastRun: { state: IngestRunState.RUNNING } })).label).toBe('Running')
+  })
+
+  it.each([
+    [IngestRunState.SUCCEEDED, 'Late'],
+    [IngestRunState.EMPTY, 'Late'],
+    [IngestRunState.FAILED, 'Late'],
+    [IngestRunState.UNSPECIFIED, 'Late'],
+  ])('a finished last run (%s) leaves the freshness word: %s', (state, label) => {
+    const row = create(DatasetSummarySchema, { freshness: { status: FreshnessStatus.LATE }, lastRun: { state } })
+    expect(isRunning(row)).toBe(false)
+    expect(rowBadge(row).label).toBe(label)
+  })
+
+  it('no last run is not running', () => {
+    expect(isRunning(create(DatasetSummarySchema, { freshness: { status: FreshnessStatus.FRESH } }))).toBe(false)
+  })
+
+  it('the row and its Symbol open the Dataset detail; the Viewer keeps its own route', () => {
+    expect(DETAIL_ROUTE).toBe('data-dataset-detail')
+    expect(VIEWER_ROUTE).toBe('data-dataset-viewer')
+  })
+
   it('source and feed, granularity, update and data type words', () => {
     expect(sourceFeedLabel(DataSource.ALPACA_API, Feed.IEX)).toBe('Alpaca · IEX')
     expect(sourceFeedLabel(DataSource.ALPACA_API, Feed.UNSPECIFIED)).toBe('Alpaca')
@@ -202,6 +286,57 @@ describe('row labels and badge', () => {
     expect(dataTypeLabel(1)).toBe('bars')
     expect(isIntraday(Granularity.ONE_HOUR)).toBe(true)
     expect(isIntraday(Granularity.ONE_DAY)).toBe(false)
+  })
+
+  // tj-grna9p.113: the dataset crumb's hover title, every field of the identity on one line. An
+  // unknown value reads the way the other helpers read it: an unknown source, data type or width is
+  // the dash (MISSING); a feed that does not apply is left out, as sourceFeedLabel leaves it.
+  describe('datasetIdentityLabel', () => {
+    const vfv = {
+      assetSymbol: 'VFV',
+      dataType: DataType.MARKET_ACTIVITY,
+      granularity: Granularity.ONE_DAY,
+      source: DataSource.ALPACA_API,
+      feed: Feed.IEX,
+    }
+
+    it('joins symbol, data type, width and source with feed, in that order', () => {
+      expect(datasetIdentityLabel(vfv)).toBe(
+        ['VFV', dataTypeLabel(vfv.dataType), granularityLabel(vfv.granularity), sourceFeedLabel(vfv.source, vfv.feed)].join(' · '),
+      )
+      expect(datasetIdentityLabel(vfv).split(' · ')).toEqual(['VFV', 'bars', '1d', 'Alpaca', 'IEX'])
+    })
+
+    it('every field reaches the line', () => {
+      const other = {
+        assetSymbol: 'XIC',
+        dataType: DataType.QUOTE,
+        granularity: Granularity.ONE_HOUR,
+        source: DataSource.IB_API,
+        feed: Feed.SIP,
+      }
+      expect(datasetIdentityLabel(other)).toBe(
+        ['XIC', dataTypeLabel(DataType.QUOTE), granularityLabel(Granularity.ONE_HOUR), sourceFeedLabel(DataSource.IB_API, Feed.SIP)].join(' · '),
+      )
+      // Each field changed alone changes the line.
+      for (const key of ['assetSymbol', 'dataType', 'granularity', 'source', 'feed'] as const) {
+        expect(datasetIdentityLabel({ ...vfv, [key]: other[key] })).not.toBe(datasetIdentityLabel(vfv))
+      }
+    })
+
+    it('a feed that does not apply is left out; an unknown source, data type or width is the dash', () => {
+      expect(datasetIdentityLabel({ ...vfv, feed: Feed.UNSPECIFIED })).toBe(
+        ['VFV', 'bars', '1d', sourceFeedLabel(DataSource.ALPACA_API, Feed.UNSPECIFIED)].join(' · '),
+      )
+      expect(datasetIdentityLabel({ ...vfv, feed: Feed.UNSPECIFIED }).split(' · ')).toEqual(['VFV', 'bars', '1d', 'Alpaca'])
+      expect(datasetIdentityLabel({ ...vfv, source: DataSource.UNSPECIFIED, feed: Feed.UNSPECIFIED })).toBe(
+        ['VFV', 'bars', '1d', MISSING].join(' · '),
+      )
+      expect(datasetIdentityLabel({ ...vfv, source: DataSource.UNSPECIFIED })).toBe(['VFV', 'bars', '1d', MISSING, 'IEX'].join(' · '))
+      expect(datasetIdentityLabel({ ...vfv, dataType: DataType.UNSPECIFIED, granularity: Granularity.UNSPECIFIED })).toBe(
+        ['VFV', MISSING, MISSING, 'Alpaca', 'IEX'].join(' · '),
+      )
+    })
   })
 })
 
@@ -305,5 +440,44 @@ describe('cursor datasource', () => {
     await Promise.resolve()
     expect(onPage).not.toHaveBeenCalled()
     expect(success).not.toHaveBeenCalled()
+  })
+
+  // tj-grna9p.77: a live event reloads the rows IN PLACE (grid.refreshInfiniteCache on the same
+  // datasource), so invalidate must forget the cached pages: the next getRows walks the cursor chain
+  // from page one again and serves what the server says now, not the rows fetched before the event.
+  it('invalidate serves fresh rows: every cursor is fetched again, from the first page', async () => {
+    const pages: Record<string, CursorPage<Row>> = {
+      '<first>': { items: ['a', 'b'], nextCursor: 'c1' },
+      c1: { items: ['c'], nextCursor: '' },
+    }
+    const h = harness(pages)
+    await h.request(0)
+    await h.request(2)
+    pages['<first>'] = { items: ['a', 'b2'], nextCursor: 'c1' }
+    pages.c1 = { items: ['c2', 'd'], nextCursor: '' }
+    h.source.invalidate()
+    expect(await h.request(2)).toEqual({ rows: ['c2', 'd'], lastRow: 4 })
+    expect(await h.request(0)).toEqual({ rows: ['a', 'b2'], lastRow: undefined })
+    expect(h.cursors()).toEqual([undefined, 'c1', undefined, 'c1'])
+  })
+
+  it('an answer to a request made before invalidate is dropped, not handed to the grid', async () => {
+    let release: (page: CursorPage<Row>) => void = () => undefined
+    const fetchPage = vi.fn(
+      () =>
+        new Promise<CursorPage<Row>>((resolve) => {
+          release = resolve
+        }),
+    )
+    const onPage = vi.fn()
+    const success = vi.fn()
+    const source = createCursorDatasource<Row>({ fetchPage, pageSize: 2, onPage })
+    source.getRows({ startRow: 0, endRow: 2, successCallback: success, failCallback: vi.fn() } as unknown as IGetRowsParams)
+    source.invalidate()
+    release({ items: ['stale'], nextCursor: '' })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(success).not.toHaveBeenCalled()
+    expect(onPage).not.toHaveBeenCalled()
   })
 })

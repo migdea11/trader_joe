@@ -4,7 +4,8 @@
 //   default   the main area
 //   sidebar   the 248px left column (the screen's own views, filters and controls)
 // A route that declares no `sidebar` component leaves the column empty but present, so the main
-// area never shifts. The shell loads the UiConfig once and keeps the trading group in the URL.
+// area never shifts. The shell loads the UiConfig once, keeps the trading group in the URL and holds
+// the events connection (indicator in the top bar, reload on reconnect).
 import { onMounted } from 'vue'
 
 import { useUiConfigStore } from '@/stores/uiConfig'
@@ -14,9 +15,12 @@ import DataSubTabs from './DataSubTabs.vue'
 import SettingsPanel from './SettingsPanel.vue'
 import StatusFooter from './StatusFooter.vue'
 import TopBar from './TopBar.vue'
+import { useEventsConnection } from './useEventsReload'
 
 const config = useUiConfigStore()
 useTradingGroupUrlSync()
+// Opens the events socket and reloads the mounted screen on a reconnect (useEventsReload.ts).
+useEventsConnection()
 onMounted(() => {
   void config.load()
 })

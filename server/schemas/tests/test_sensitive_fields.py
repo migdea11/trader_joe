@@ -42,6 +42,7 @@ from schemas.data_ingest.get_dataset_request import BaseGetDatasetRequest
 from schemas.data_store.asset_dataset_store import (
     AssetDatasetStoreDelete,
     StoreAssetDatasetBody,
+    StoreAssetDatasetFields,
     StoreAssetDatasetQuery,
 )
 
@@ -64,6 +65,17 @@ _REQUIRED = ...
 # default). The old declaration is what the JSON schema is compared against. Two use the required
 # alias and two the optional one, so both aliases are covered.
 DECLARATION_CASES = [
+    # tj-grna9p.71 moved the body's fields, owner included, into StoreAssetDatasetFields, which the
+    # body and every entry model now inherit. So the DECLARATION site is the fields class; the body is
+    # kept as a case below as an INHERITOR, because it is still the model the route validates and logs.
+    pytest.param(
+        StoreAssetDatasetFields,
+        {'owner': SECRET, 'source': 'ALPACA', 'granularity': '1day', 'start': WHEN},
+        str,
+        _REQUIRED,
+        id='StoreAssetDatasetFields',
+        marks=pytest.mark.data_store,
+    ),
     pytest.param(
         StoreAssetDatasetBody,
         {'owner': SECRET, 'source': 'ALPACA', 'granularity': '1day', 'start': WHEN},
@@ -107,7 +119,9 @@ DECLARATION_CASES = [
         marks=pytest.mark.data_ingest,
     ),
 ]
-DECLARING_MODELS = frozenset(case.values[0] for case in DECLARATION_CASES)
+# The models whose OWN annotations declare owner. The body inherits it and is excluded by name.
+INHERITING_CASES = frozenset({'StoreAssetDatasetBody'})
+DECLARING_MODELS = frozenset(case.values[0] for case in DECLARATION_CASES if case.id not in INHERITING_CASES)
 
 
 def _schema_modules() -> list[str]:

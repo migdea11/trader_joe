@@ -58,6 +58,7 @@ from common.rpc.mapping import (
 from common.tests.domain_fields import aware_datetime_fields
 from common.tests.proto_descriptors import PROTO_ROOT
 from schemas.data_ingest import fetch_dataset as domain
+from schemas.data_ingest import quote as quote_domain
 
 
 pytestmark = pytest.mark.common
@@ -73,6 +74,42 @@ EPOCH_BASE = datetime(2026, 1, 1, tzinfo=UTC)
 REPEATED = 2
 
 GOOGLE = 'google.protobuf'
+
+INGEST = 'trader_joe.proto.internal.ingest.v1'
+
+# THE ONLY FIELDS A ROUND TRIP MAY LOSE, each a ruled deferral and not an oversight. tj-grna9p.44's
+# re-baseline (architect, 2026-10-11, item 8 FOLLOW-UP) put quota_key on the ack and vendor_stats on the
+# done into the .proto now and left mapping them into the domain models and the encoder to a follow-up
+# needed before tj-grna9p.48, .24 and .49. Until it lands, they are dropped on the way in. Every other
+# field still has to survive, and test_each_deferred_field_is_declared_and_still_dropped goes red the
+# moment one of these IS mapped, so this table cannot outlive the deferral it names.
+DEFERRED_FIELDS: Mapping[tuple[str, str], str] = {
+    (f'{INGEST}.FetchAccepted', 'quota_key'): 'tj-grna9p.44 FOLLOW-UP: the ack quota_key is not mapped yet',
+    (f'{INGEST}.FetchDone', 'vendor_stats'): 'tj-grna9p.44 FOLLOW-UP: the done vendor_stats are not mapped yet',
+}
+
+
+def _deferred_on(descriptor: Descriptor) -> set[str]:
+    return {field for (message, field) in DEFERRED_FIELDS if message == descriptor.full_name}
+
+
+def _without_deferred(message: Message) -> Message:
+    # A copy with every deferred field cleared, at whatever depth its message type appears: FetchAck
+    # carries FetchAccepted under its `accepted` arm, so the ack's quota_key is reached through it.
+    stripped = type(message)()
+    stripped.CopyFrom(message)
+    _clear_deferred(stripped)
+    return stripped
+
+
+def _clear_deferred(message: Message) -> None:
+    for field in _deferred_on(message.DESCRIPTOR):
+        message.ClearField(field)
+    for field, value in message.ListFields():
+        if field.message_type is None or _is_map(field) or _is_well_known(field.message_type):
+            continue
+        for sub in value if field.is_repeated else [value]:
+            _clear_deferred(sub)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -273,9 +310,34 @@ def test_a_fully_populated_message_survives_proto_to_domain_to_proto(name: str, 
     """
     message = _built(mapper, choices)
 
-    assert mapper.to_proto(mapper.to_domain(message)) == message, (
+    # Exactly the DEFERRED_FIELDS may be lost, and nothing else: the comparison is with the original
+    # minus those fields, so a third dropped field still makes this red.
+    assert mapper.to_proto(mapper.to_domain(message)) == _without_deferred(message), (
         f'{name} does not survive the mapping; a field declared on the .proto is not mapped in '
         'common/rpc/mapping, so it crosses the wire carrying nothing'
+    )
+
+
+@pytest.mark.parametrize(('message_name', 'field'), sorted(DEFERRED_FIELDS), ids=lambda part: part.rsplit('.', 1)[-1])
+def test_each_deferred_field_is_declared_and_still_dropped(message_name: str, field: str):
+    """The deferral table's own tripwire: an entry is valid only while its field exists and is NOT mapped.
+
+    When the follow-up maps the field, this goes red and the entry has to be removed, so the exemption
+    cannot quietly cover a later regression of the same field.
+
+    Args:
+        message_name: The proto message carrying the deferred field.
+        field: The deferred field.
+    """
+    mapper = MESSAGE_MAPPERS[message_name]
+    assert field in mapper.proto_type.DESCRIPTOR.fields_by_name, f'{message_name}.{field} is no longer declared'
+    assert field not in mapper.domain_type.model_fields, f'{message_name}.{field} has a domain twin field now'
+
+    message = _built(mapper, {})
+    assert field in {set_field.name for set_field, _ in message.ListFields()}
+    round_tripped = mapper.to_proto(mapper.to_domain(message))
+    assert field not in {set_field.name for set_field, _ in round_tripped.ListFields()}, (
+        f'{message_name}.{field} is mapped now: remove it from DEFERRED_FIELDS'
     )
 
 
@@ -295,6 +357,7 @@ def test_the_domain_side_receives_a_value_for_every_field_the_case_sets(name: st
     model = mapper.to_domain(_built(mapper, choices))
 
     declared = {field.name for field in _chosen(mapper.proto_type.DESCRIPTOR, choices, '')}
+    declared -= _deferred_on(mapper.proto_type.DESCRIPTOR)
 
     assert {name for name in type(model).model_fields if getattr(model, name) is not None} == declared
 
@@ -449,10 +512,14 @@ def _twins_at(when: datetime) -> dict[type[BaseModel], BaseModel]:
             end=when + timedelta(hours=1),
             update_type=2,
             feed=Feed.IEX,
+            ready_by=when + timedelta(hours=2),
         ),
         domain.Bar: domain.Bar(bar_start=when, open=1.0, high=2.0, low=0.5, close=1.5, volume=10.0, feed=Feed.IEX),
         domain.ServedRange: served,
         domain.FetchDone: domain.FetchDone(bar_count=3, served_range=served, as_of=when),
+        quote_domain.ScopeCapacity: quote_domain.ScopeCapacity(
+            quota_key='alpaca-a', cap=200, remaining=150, window_seconds=60, reset_at=when
+        ),
     }
 
 
@@ -533,6 +600,30 @@ def test_an_absent_end_stays_absent_in_both_directions():
     bounded = open_ended.model_copy(update={'end': datetime(2026, 6, 1, 12, 30, tzinfo=UTC)})
     assert request_to_proto(bounded).HasField('end')
     assert request_to_domain(request_to_proto(bounded)).end == bounded.end
+
+
+def test_the_requests_queue_fields_are_absent_unless_set_and_round_trip_when_set():
+    """FetchDatasetRequest.request_id, ready_by and best_effort (tj-grna9p.44 item 3 and 8a).
+
+    request_id has no ``optional`` on the wire, so the empty string is "no request-log entry" and must
+    decode to None, never to ''. ready_by is a message field, so unset stays unset rather than the epoch.
+    best_effort defaults to False. Set, all three survive the trip both ways.
+    """
+    mapper = MESSAGE_MAPPERS['trader_joe.proto.internal.ingest.v1.FetchDatasetRequest']
+    message = _built(mapper, {})
+    for field in ('request_id', 'ready_by', 'best_effort'):
+        message.ClearField(field)
+
+    bare = request_to_domain(message)
+    assert (bare.request_id, bare.ready_by, bare.best_effort) == (None, None, False)
+    assert request_to_proto(bare) == message
+    assert not request_to_proto(bare).HasField('ready_by')
+
+    ready_by = datetime(2026, 6, 1, 9, 30, tzinfo=timezone(timedelta(hours=-4)))
+    queued = bare.model_copy(update={'request_id': 'req-1', 'ready_by': ready_by, 'best_effort': True})
+    decoded = request_to_domain(request_to_proto(queued))
+    assert (decoded.request_id, decoded.ready_by, decoded.best_effort) == ('req-1', ready_by, True)
+    assert decoded.ready_by.utcoffset() == timedelta(0)
 
 
 def test_an_absent_optional_on_a_bar_stays_absent_rather_than_becoming_zero():

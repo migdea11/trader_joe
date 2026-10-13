@@ -19,6 +19,8 @@ need the real database, one section each below:
      and one missing a session reads GAPS. SQLite returns text there, so the unit tier only has STATIC datasets
      WITHOUT bars. Two cases put a bar where the UTC date and the New York date differ, in both directions, so a
      date taken in UTC rather than the calendar's zone turns one of them the wrong way.
+  4. THE COVERAGE STRIP (tj-grna9p.63, added by its validator): a known three-session gap read end to end over
+     those real dates, its local-midnight window, and the gap closed by bars placed inside that window.
 
 Entries are seeded by SQL through conftest's insert_entry (or, for the 1000, one multi-row INSERT registered with
 the same entry_registry), so session teardown deletes them by id and the cascade takes their bars. Bars are
@@ -39,7 +41,7 @@ import time
 import warnings
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
@@ -48,10 +50,13 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
-from common.enums.data_stock import UpdateType
+from common.enums.data_stock import DataSource, UpdateType
+from common.errors.vocabulary import Reason
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
+from data.store.app.freshness import calendar_for_source, local_midnight
 from routers.data_store.app_endpoints import UiDatasetsInterface
+from tests.system.problem_json import assert_problem
 
 
 pytestmark = pytest.mark.data_store
@@ -390,3 +395,104 @@ def test_static_listing_status_filters_and_facets_agree_with_the_detail(static_s
     assert {UUID(item['id']) for item in failed.get('items', [])} == by_status[GAPS], failed
     counts = {status: count for status, count in _status_counts(facets).items() if count}
     assert counts == {status: len(ids) for status, ids in by_status.items()}, facets
+
+
+# ---------------------------------------------------------------------------------------------
+# 4. The coverage strip on Postgres (tj-grna9p.63 acceptance a; validator, gating it).
+#
+# The unit tier (server/data/store/tests/test_ui_datasets_route.py, section 'coverage') parses SQLite's TEXT dates;
+# here covered_dates' real date() decides. A STATIC dataset over February 2026 misses three consecutive sessions
+# straddling a weekend, and the session before them holds ONE bar, at 20:00 New York, whose UTC date is the first
+# missing session: a UTC-date rule would read that session covered and the one before it missing. Every expected
+# value comes from the calendar (freshness.calendar_for_source, local_midnight), never written out.
+
+XNYS = calendar_for_source(DataSource.ALPACA_API)
+COVERAGE_FIRST, COVERAGE_AFTER = date(2026, 2, 2), date(2026, 3, 2)
+
+
+def _coverage_path(dataset_id: UUID) -> str:
+    return UiDatasetsInterface.GET_UI_DATASET_COVERAGE.format(dataset_id=dataset_id)
+
+
+def _midnight(session: date) -> datetime:
+    return local_midnight(session, XNYS)
+
+
+def _three_across_a_weekend(sessions: list[date]) -> list[date]:
+    for index in range(2, len(sessions) - 2):
+        if (sessions[index + 1] - sessions[index]).days > 1:
+            return sessions[index - 1 : index + 2]
+    raise AssertionError('precondition: no weekend in the range')
+
+
+def test_coverage_of_a_known_three_session_gap_on_postgres(
+    insert_entry: Callable[..., sa.Row],
+    bar_values: Callable[..., dict[str, Any]],
+    pg_engine: Engine,
+    run_identity,
+    data_store,
+) -> None:
+    start, end = _midnight(COVERAGE_FIRST), _midnight(COVERAGE_AFTER)
+    sessions = XNYS.sessions_overlapping(start, end)
+    missing = _three_across_a_weekend(sessions)
+    before = sessions[sessions.index(missing[0]) - 1]
+    evening = XNYS.session_open(before).astimezone(XNYS.tz).replace(hour=20, minute=0)
+    assert evening.astimezone(UTC).date() == missing[0], 'precondition: the evening bar has the next UTC date'
+    entry = insert_entry(
+        asset_symbol=run_identity.alt_symbol('COV'), update_type=UpdateType.STATIC.value, start=start, end=end
+    )
+    held = [s for s in sessions if s not in missing and s != before]
+    _insert_bars(pg_engine, _bars_at(entry, bar_values, [XNYS.session_open(s) for s in held] + [evening]))
+
+    body = _ok(data_store, _coverage_path(entry.id))
+
+    gaps = [(_instant(g['start']), _instant(g['end']), g['sessions']) for g in body.get('gaps', [])]
+    assert body.get('gapCount') == 1 and gaps == [
+        (_midnight(missing[0]), _midnight(missing[-1] + timedelta(days=1)), 3)
+    ]
+    buckets = body['buckets']
+    assert sum(b.get('expectedSessions', 0) for b in buckets) == len(sessions)
+    assert sum(b.get('expectedSessions', 0) - b.get('sessionsWithBars', 0) for b in buckets) == len(missing)
+    assert (_instant(body['start']), _instant(body['end'])) == (start, end)
+    detail = _ok(data_store, _dataset_path(entry.id))['freshness']
+    assert int(detail['gapCount']) == len(missing), detail
+
+    # A daily bar at each missing session's local midnight -- inside the window -- closes the gap.
+    _insert_bars(pg_engine, _bars_at(entry, bar_values, [_midnight(s) for s in missing]))
+    closed = _ok(data_store, _coverage_path(entry.id))
+    assert 'gaps' not in closed and 'gapCount' not in closed, closed
+
+
+# Added by tj-grna9p.81 (RESCOPED item 2): the coverage read's two refusals, over real HTTP.
+BEFORE_CALENDAR = datetime(1985, 3, 4, 14, 30, tzinfo=UTC)
+
+
+def test_coverage_of_an_unknown_dataset_is_a_404_and_of_a_pre_calendar_one_a_422(
+    insert_entry: Callable[..., sa.Row], run_identity, data_store
+) -> None:
+    """404 NOT_FOUND for an id nobody holds; 422 INVALID_REQUEST for a dataset starting before CALENDAR_START (1990).
+
+    The second must not read as an empty strip or a complete one: no calendar covers 1985, so nothing can be said.
+    """
+    unknown = UUID('00000000-0000-4000-8000-0000000000a1')
+    assert_problem(
+        data_store.get(_coverage_path(unknown)),
+        status=404,
+        reason=Reason.NOT_FOUND.value,
+        title='Not Found',
+        describe=data_store.describe,
+    )
+
+    old = insert_entry(
+        asset_symbol=run_identity.alt_symbol('PRE'),
+        update_type=UpdateType.STATIC.value,
+        start=BEFORE_CALENDAR,
+        end=BEFORE_CALENDAR + timedelta(days=2),
+    )
+    assert_problem(
+        data_store.get(_coverage_path(old.id)),
+        status=422,
+        reason=Reason.INVALID_REQUEST.value,
+        title='Unprocessable Entity',
+        describe=data_store.describe,
+    )

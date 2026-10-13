@@ -4,6 +4,12 @@ framework for testing trading algos
 ## Design
 ![Design Image](docs/img/design.jpg)
 
+**Direction, not built:** request scheduling moves to ingest, with the store keeping the request log
+and each request's state (decided by the owner on 2026-10-12, recorded on decision record `tj-pd41mt`,
+whose end-state design is still being written up). Today there is no
+request log, queue or scheduler: a request is a `POST /store`, and the store only records each fetch
+it drives as a run.
+
 ## Getting Started
 Take a look at the `Makefile` for all the major commands. Every compose target names the stack it
 means — `dev-*` builds and runs the development images (live reload, debug logging, the debugger,
@@ -81,7 +87,9 @@ answers without credentials.
 
 ## The web UI
 
-A browser UI for the dataset catalog and a per-dataset viewer (candles, volume and a paged bar table).
+A browser UI for the dataset catalog, a per-dataset detail (coverage and gaps, run history) and a
+viewer (candles, volume and a paged bar table). It updates live: data_store pushes a notification over
+a WebSocket whenever a dataset or a collection run changes, and the UI refetches.
 Its source is in [`web/`](web/README.md): a Vue 3 single-page app, built once and served as static
 files.
 
@@ -103,6 +111,11 @@ and a browser cannot use the proxy to write. The dev proxy is not
 that filter: the Vite proxy forwards everything under `/api/store`, any method and any path, strips the
 prefix and never injects the secret, so a write from the dev server reaches the store without it and is
 refused.
+The live socket, `GET /api/store/ui/v1/events`, is an upgraded `GET` and passes the same filter.
+data_store must run **one worker** for it to be correct, because the hub that fans events out is in
+the process's memory: `docker-compose.yaml` pins `SERVICE_WORKERS=1` for it, and the env file cannot
+change that. `EVENTS_CLIENT_QUEUE_SIZE` (default 256) is how many events a slow client may hold
+before it is dropped and reconnects.
 There is no login: access is network-only, so run it only where the network is trusted.
 
 **The licence key.** The UI uses PrimeVue 5 under the PrimeUI Community licence, which needs a key.
@@ -187,6 +200,12 @@ ranges that only touch (one ends where the next starts) do not overlap, a bar st
 A dataset's freshness (healthy, late, failed or retired) and completeness are not stored: the server
 computes them on read, against a trading calendar for the dataset's source.
 
+What *is* stored about collection is a **run**: each store-driven fetch writes one `ingest_run` row,
+`RUNNING` while the vendor answers and then `SUCCEEDED`, `EMPTY` (the vendor held no bars) or `FAILED`
+with the typed error. A run left `RUNNING` by a process that stopped is marked `FAILED` with reason
+`INTERRUPTED` at the next start. Runs outlive their dataset's deletion but are read per dataset, so a
+deleted dataset's runs are no longer reachable.
+
 Bars are stored **raw**. There are no split or dividend factors on a bar, and corporate-action
 adjustment on read is decided but **not built** — everything returned today is unadjusted.
 
@@ -205,21 +224,45 @@ deploy step, not part of starting the stack (decision record `tj-x3ig38`). `make
 only supported spelling of that step: run it by hand today, and the server deploy script will call
 the same target once it exists.
 
-Start the database first — `make prod-deps` (or `make prod-launch`), then `make migrate`. The
-target requires postgres to already be running and exits non-zero with a pointer if it is not. It
+Start the database first — `make dev-deps` (or `make dev-launch`) on a dev stack, `make prod-deps`
+(or `make prod-launch`) on prod — then `make migrate`. The target requires postgres to already be running and exits non-zero with a pointer if it is not. It
 will not start the database itself on purpose: bringing the stack `up` recreates a container whose
 config has changed, and a migration must never restart the database it is migrating. For the same
 reason it is not wired into any launch target: a rollback re-runs `compose up`, and a migration
 hanging off that would re-apply from whichever revision directory happened to be checked out.
 
-`make migrate` is production-shaped — it applies the revisions through the production `data_store`
-service definition, in a one-off container on data_store's prod networks, which is how it reaches
-postgres on `store_db`. That is still the right command on a dev stack, since both stacks share the
-one postgres container, but expect it to want the production image built (`make prod-build`).
+`make migrate` applies the revisions to the **running** stack, through that stack's own `data_store`
+service definition, in a one-off container. It reads which stack is running from the postgres
+container, which is already required to be up:
 
-The revisions applied are the ones in **this checkout**, not the ones baked into the deployed
-image — `alembic.ini` and `server/data/store/migrations/` reach the container as bind mounts. Run it from
-a checkout that matches the image you deployed.
+| The running postgres was started with | `make migrate` uses | Image it runs |
+|---|---|---|
+| `docker-compose.override.yaml` (the dev stack) | the dev definition, base plus override | `:dev`, from `make dev-build` |
+| anything else | the production definition, `docker-compose.yaml` alone | `:latest`, from `make prod-build` |
+
+So `make dev-build`, `make dev-launch`, `make migrate` works with no production build. It prints one
+line to stderr saying which definition it chose and why. Anything it cannot tell unambiguously — no
+compose label, more than one postgres or `data_store` container, a dev postgres beside a non-dev
+`data_store` — falls back to production and still runs the migration; it never refuses over the
+choice.
+
+The revisions applied are the ones in **this checkout**, not the ones baked into the image —
+`alembic.ini` and `server/data/store/migrations/` reach the container as bind mounts. Where the
+rest of the code comes from depends on the definition:
+
+- **Production definition.** The app code, including the models, comes from the `:latest` image,
+  while `alembic.ini` and `migrations/` come from the checkout. After a model change, rebuild with
+  `make prod-build` so the two agree.
+- **Dev definition.** `docker-compose.override.yaml` bind-mounts the app, `common`, routers,
+  schemas and generated code over `/code`, so the models, the enums and the revisions all come from
+  your checkout; only the baked-in dependencies come from the `:dev` image. A `make dev-build` after
+  a model change matters for `make migrate-check`'s image stamp check and for dependencies, not for
+  what `make migrate` runs.
+
+Run it from a checkout that matches the stack you brought up.
+
+On a database that has never been migrated, `data_store` still starts. It logs one startup warning
+naming the missing `ingest_run` table and skips the interrupted-run sweep, until `make migrate` is run.
 
 ### Revisions that are not additive
 
@@ -291,7 +334,7 @@ apply. Nothing in it writes. It goes through the same script as `make migrate`, 
 postgres running and fails the same way on an empty revisions directory.
 
 Read the two answers together. Because the applied revisions come from the checkout while the
-running code comes from the deployed image, the two can disagree with nothing saying so — a
+running code comes from the image, the two can disagree with nothing saying so — a
 database at a revision this checkout has never heard of means you are in the wrong checkout, and
 a history that runs past `current` means the deploy is missing `make migrate`.
 
@@ -304,7 +347,9 @@ make migrate-check
 ```
 
 It runs `alembic check`, comparing the models against the live catalogue; a non-zero exit means
-drift, or "Target database is not up to date." when the database is simply behind head. **It is not
+drift, or "Target database is not up to date." when the database is simply behind head. It also
+**refuses** unless the `data_store` image of the chosen definition carries a source stamp matching
+this checkout; the fix is `make dev-build` on a dev stack and `make prod-build` on prod. **It is not
 read-only**, which is why it is not folded into `make migrate-status`: `check` does not pass
 `dont_mutate=True`, so against a database that has never been migrated it creates `alembic_version`.
 Against an already-migrated database it writes nothing. Two blind spots: autogenerate compares
@@ -322,8 +367,8 @@ docker compose -f docker-compose.yaml exec postgres \
 
 The variables are expanded **inside the container**, which is why they are in single quotes: the
 credentials come from `.env` via compose, and compose does not export them into your own shell.
-`-f docker-compose.yaml` for the same reason `make migrate` pins it — a bare `docker compose` also
-loads the dev override. The one postgres container is shared by both stacks, so this reaches the
+`-f docker-compose.yaml` because a bare `docker compose` also loads the dev override, which a
+production stack was not started with. The one postgres container is shared by both stacks, so this reaches the
 same database either way. With the dev stack up, a host `psql` can also connect to
 `127.0.0.1:$DATABASE_PORT`; prod publishes no port, so there the command above is the way in.
 

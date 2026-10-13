@@ -44,7 +44,7 @@ from pydantic import BaseModel, ValidationError
 from common.enums.data_stock import Feed, UpdateType
 from common.tests.domain_fields import aware_datetime_fields
 from common.tests.proto_descriptors import field_names, file_named, messages, real_oneofs
-from schemas.data_ingest import fetch_dataset
+from schemas.data_ingest import fetch_dataset, quote
 from schemas.data_ingest.fetch_dataset import (
     Bar,
     BarPage,
@@ -55,6 +55,7 @@ from schemas.data_ingest.fetch_dataset import (
     FetchRefused,
     ServedRange,
 )
+from schemas.data_ingest.quote import QuoteResult, ScopeCapacity
 
 
 pytestmark = pytest.mark.data_ingest
@@ -86,7 +87,9 @@ def test_fetch_dataset_is_one_server_stream_at_the_wire_path_the_design_names():
     assert [service.name for service in file.service] == ['IngestService']
 
     methods = {method.name: method for method in file.service[0].method}
-    assert list(methods) == ['FetchDataset']
+    # Quote is tj-grna9p.44's second method (re-baseline item 2): data_ingest serves it on the same
+    # service, so the list is exactly these two, in declaration order.
+    assert list(methods) == ['FetchDataset', 'Quote']
     fetch = methods['FetchDataset']
     assert fetch.server_streaming is True, 'bar pages need a stream; a unary call cannot carry them'
     assert fetch.client_streaming is False
@@ -95,6 +98,41 @@ def test_fetch_dataset_is_one_server_stream_at_the_wire_path_the_design_names():
 
     wire_path = f'/{file.package}.{file.service[0].name}/{fetch.name}'
     assert wire_path == '/trader_joe.proto.internal.ingest.v1.IngestService/FetchDataset'
+
+
+def test_quote_is_unary_at_its_own_wire_path_with_the_buf_standard_names():
+    """tj-grna9p.44 re-baseline items 1 and 2: rpc Quote(QuoteRequest) returns (QuoteResponse), unary.
+
+    One fetch per quote -- QuoteRequest wraps exactly one FetchDatasetRequest, and the store sums the
+    quotes of a multi-symbol request -- so the request carries nothing beside it. The reply is named
+    QuoteResponse, not QuoteReply, because buf STANDARD requires <Rpc>Response.
+    """
+    file = file_named(CONTRACT)
+    quote = {method.name: method for method in file.service[0].method}['Quote']
+
+    assert (quote.client_streaming, quote.server_streaming) == (False, False), 'a quote is one answer'
+    assert quote.input_type == f'{INGEST}.QuoteRequest'
+    assert quote.output_type == f'{INGEST}.QuoteResponse'
+    assert f'/{file.package}.{file.service[0].name}/{quote.name}' == (
+        '/trader_joe.proto.internal.ingest.v1.IngestService/Quote'
+    )
+
+    declared = messages(file)
+    assert [(field.name, field.number, field.type_name) for field in declared['QuoteRequest'].field] == [
+        ('fetch', 1, f'{INGEST}.FetchDatasetRequest')
+    ]
+    assert [(field.name, field.number, field.type_name) for field in declared['QuoteResponse'].field] == [
+        ('estimated_vendor_calls', 1, ''),
+        ('quota_key', 2, ''),
+        ('scopes', 3, f'{INGEST}.ScopeCapacity'),
+    ]
+    assert [(field.name, field.number, field.type_name) for field in declared['ScopeCapacity'].field] == [
+        ('quota_key', 1, ''),
+        ('cap', 2, ''),
+        ('remaining', 3, ''),
+        ('window_seconds', 4, ''),
+        ('reset_at', 5, TIMESTAMP),
+    ]
 
 
 def test_the_stream_is_ack_then_pages_then_done_and_the_ack_is_arm_one():
@@ -133,15 +171,21 @@ def test_the_ack_is_a_oneof_of_accepted_and_refused():
     ]
 
 
-def test_the_accepted_arm_carries_the_resolved_feed_and_nothing_else():
-    """The one value only ingest may decide, and the reason this whole shape exists (tj-ugl90j, tj-rh4b7f).
+def test_the_accepted_arm_carries_the_resolved_feed_and_the_quota_key_and_nothing_else():
+    """The values only ingest may decide, and the reason this whole shape exists (tj-ugl90j, tj-rh4b7f).
 
-    "And nothing else" is load-bearing: the ack is not a general-purpose preamble. A second field here
-    would be a thing the store must decide what to do with before it writes its dataset entry.
+    "And nothing else" is load-bearing: the ack is not a general-purpose preamble. The second field is
+    a RULED one: tj-grna9p.44 re-baseline item 4 put quota_key on the ack, number 2, because it must
+    arrive before any page so the store can record the charged scope before the fetch ends. It is a
+    plain string label, never key material -- the contract test below reads that off the comment.
     """
     accepted = messages(file_named(CONTRACT))['FetchAccepted']
 
-    assert [(field.name, field.type_name) for field in accepted.field] == [('feed', f'{MARKET}.Feed')]
+    assert [(field.name, field.number, field.type_name) for field in accepted.field] == [
+        ('feed', 1, f'{MARKET}.Feed'),
+        ('quota_key', 2, ''),
+    ]
+    assert accepted.field[1].type == accepted.field[1].TYPE_STRING
 
 
 def test_a_refusal_is_reachable_only_inside_the_ack_and_never_as_a_status_shape():
@@ -229,10 +273,13 @@ def test_done_carries_the_count_and_the_served_provenance():
     declared = messages(file_named(CONTRACT))
     done = declared['FetchDone']
 
-    assert [(field.name, field.type_name) for field in done.field] == [
-        ('bar_count', ''),
-        ('served_range', f'{INGEST}.ServedRange'),
-        ('as_of', TIMESTAMP),
+    # vendor_stats = 4 is tj-grna9p.44 re-baseline item 4: on the DONE and not the ack, because the
+    # stats exist only after the vendor calls were made.
+    assert [(field.name, field.number, field.type_name) for field in done.field] == [
+        ('bar_count', 1, ''),
+        ('served_range', 2, f'{INGEST}.ServedRange'),
+        ('as_of', 3, TIMESTAMP),
+        ('vendor_stats', 4, f'{INGEST}.VendorCallStats'),
     ]
     assert done.field[0].type == done.field[0].TYPE_UINT64
 
@@ -240,6 +287,32 @@ def test_done_carries_the_count_and_the_served_provenance():
         ('start', TIMESTAMP),
         ('end', TIMESTAMP),
     ]
+
+
+def test_the_vendor_stats_are_ingests_count_with_the_vendors_figures_as_optional_corroboration():
+    """VendorCallStats and VendorReported as tj-grna9p.44 names them, numbers included.
+
+    The vendor's own limit and remaining are ``optional``: a vendor that reports nothing is not
+    reporting a limit of zero, which would read as "throttled".
+    """
+    declared = messages(file_named(CONTRACT))
+
+    assert [(field.name, field.number, field.type_name) for field in declared['VendorCallStats'].field] == [
+        ('calls', 1, ''),
+        ('pages', 2, ''),
+        ('throttled_429', 3, ''),
+        ('retries', 4, ''),
+        ('first_call_at', 5, TIMESTAMP),
+        ('last_call_at', 6, TIMESTAMP),
+        ('vendor_reported', 7, f'{INGEST}.VendorReported'),
+    ]
+    reported = declared['VendorReported']
+    assert [(field.name, field.number, field.proto3_optional) for field in reported.field] == [
+        ('limit', 1, True),
+        ('remaining', 2, True),
+        ('reset_at', 3, False),
+    ]
+    assert reported.field[2].type_name == TIMESTAMP
 
 
 # ---------------------------------------------------------------------------------------------
@@ -265,9 +338,18 @@ def test_the_request_carries_exactly_what_a_reader_consumes():
         ('end', 8, TIMESTAMP),
         ('update_type', 9, f'{MARKET}.UpdateType'),
         ('feed', 10, f'{MARKET}.Feed'),
+        # tj-grna9p.44 re-baseline item 3. request_id is the store's request-log handle (decision
+        # tj-grna9p.9 item 6), NOT a page correlation key; ready_by and best_effort are carried and
+        # inert under PR 4's FIFO queue, so no ingest reader consumes them yet -- the exception to
+        # this test's title, and a ruled one.
+        ('request_id', 11, ''),
+        ('ready_by', 12, TIMESTAMP),
+        ('best_effort', 13, ''),
     ]
     by_name = {field.name: field for field in request.field}
     assert by_name['data_types'].label == by_name['data_types'].LABEL_REPEATED, 'at least one, so repeated'
+    assert by_name['request_id'].type == by_name['request_id'].TYPE_STRING
+    assert by_name['best_effort'].type == by_name['best_effort'].TYPE_BOOL
 
 
 def test_an_unset_end_is_distinguishable_from_the_epoch_but_an_unset_feed_is_not():
@@ -317,7 +399,7 @@ def test_every_time_on_this_contract_is_a_well_known_timestamp():
         for file in files
         for message in file.message_type
         for field in message.field
-        if field.name in {'start', 'end', 'as_of', 'bar_start'}
+        if field.name in {'start', 'end', 'as_of', 'bar_start', 'ready_by'} or field.name.endswith('_at')
     ]
     assert times, 'the sweep found no time fields at all, so it is asserting nothing'
     for file_name, message_name, field_name, type_name in times:
@@ -340,12 +422,32 @@ TWINS: list[tuple[str, str, type[BaseModel]]] = [
     (CONTRACT, 'FetchDone', FetchDone),
     (CONTRACT, 'ServedRange', ServedRange),
     (BAR, 'Bar', Bar),
+    # tj-grna9p.44 item 8b: the Quote answer's twins live in schemas/data_ingest/quote.py. The answer is
+    # named QuoteResult on the domain side; its fields still match QuoteResponse name for name.
+    (CONTRACT, 'QuoteResponse', QuoteResult),
+    (CONTRACT, 'ScopeCapacity', ScopeCapacity),
 ]
 
-# The one contract message with no domain twin, and why. The stream's envelope is pure transport: the
-# client seam dispatches the oneof and yields the ack, the pages and the done, so no domain model
-# restates it. Listed rather than merely absent, so "we forgot one" cannot pass as "deliberate".
-NOT_MODELLED: frozenset[str] = frozenset({'FetchDatasetResponse'})
+# The contract messages with no domain twin, and why. Listed rather than merely absent, so "we forgot
+# one" cannot pass as "deliberate".
+NOT_MODELLED: dict[str, str] = {
+    # The stream's envelope is pure transport: the client seam dispatches the oneof and yields the ack,
+    # the pages and the done, so no domain model restates it.
+    'FetchDatasetResponse': 'transport envelope',
+    # A wrapper around the one FetchDatasetRequest, which is already twinned (tj-grna9p.44 item 2).
+    'QuoteRequest': 'wrapper around a twinned request',
+    # Deferred by tj-grna9p.44's re-baseline (item 8, FOLLOW-UP): mapped with FetchDone.vendor_stats,
+    # before tj-grna9p.48. common/rpc/mapping names the same two in ENVELOPE_MESSAGES until then.
+    'VendorCallStats': 'deferred: tj-grna9p.44 follow-up',
+    'VendorReported': 'deferred: tj-grna9p.44 follow-up',
+}
+
+# Proto fields whose twin field is DEFERRED by the same follow-up, and only these. Removing an entry is
+# the follow-up's job; test_a_domain_twin_declares_exactly_its_protos_fields keeps the rest exact.
+DEFERRED_TWIN_FIELDS: dict[str, frozenset[str]] = {
+    'FetchAccepted': frozenset({'quota_key'}),
+    'FetchDone': frozenset({'vendor_stats'}),
+}
 
 
 @pytest.mark.parametrize(('file_name', 'message_name', 'model'), TWINS, ids=[name for _, name, _ in TWINS])
@@ -361,9 +463,14 @@ def test_a_domain_twin_declares_exactly_its_protos_fields(file_name: str, messag
         message_name: The proto message.
         model: The Pydantic model that mirrors it.
     """
+    deferred = DEFERRED_TWIN_FIELDS.get(message_name, frozenset())
     proto_fields = field_names(messages(file_named(file_name))[message_name])
+    assert deferred <= set(proto_fields), f'{message_name} no longer declares a deferred field: {deferred}'
+    assert not deferred & set(model.model_fields), (
+        f'{model.__name__} twins a deferred field now: remove it from DEFERRED_TWIN_FIELDS'
+    )
 
-    assert list(model.model_fields) == proto_fields, (
+    assert list(model.model_fields) == [name for name in proto_fields if name not in deferred], (
         f'{model.__name__} and {message_name} have drifted apart; every field name matches its proto '
         f'field name on purpose, so that tj-3mk3u5.29 needs no entry in the mapper name table'
     )
@@ -376,7 +483,7 @@ def test_every_contract_message_is_either_twinned_or_listed_as_transport():
     check on whatever someone last remembered to add to TWINS.
     """
     declared = set(messages(file_named(CONTRACT)))
-    covered = {name for file_name, name, _ in TWINS if file_name == CONTRACT} | NOT_MODELLED
+    covered = {name for file_name, name, _ in TWINS if file_name == CONTRACT} | NOT_MODELLED.keys()
 
     assert declared == covered
 
@@ -388,13 +495,14 @@ def test_every_model_in_the_module_is_a_twin_of_something():
     contract; a model here that nothing on the wire corresponds to is either dead or is a field the
     mapper will have to invent a value for.
     """
-    declared = {
-        name
-        for name, obj in vars(fetch_dataset).items()
-        if not name.startswith('_') and inspect.isclass(obj) and obj.__module__ == fetch_dataset.__name__
-    }
+    for module in (fetch_dataset, quote):
+        declared = {
+            name
+            for name, obj in vars(module).items()
+            if not name.startswith('_') and inspect.isclass(obj) and obj.__module__ == module.__name__
+        }
 
-    assert declared == {model.__name__ for _, _, model in TWINS}
+        assert declared == {model.__name__ for _, _, model in TWINS if model.__module__ == module.__name__}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -441,6 +549,9 @@ _NAIVE_CASES: list[tuple[type[BaseModel], str, dict[str, Any]]] = [
     # tj-3mk3u5.29 item 6): an absent end is meaningful -- an open window -- so the field is easy to
     # read as "nothing to check here". A naive value at it is still a naive value.
     (FetchDatasetRequest, 'end', _A_REQUEST),
+    # tj-grna9p.44: optional like end, and refused naive like it (refuse, don't convert; tj-1bl90i).
+    (FetchDatasetRequest, 'ready_by', _A_REQUEST),
+    (ScopeCapacity, 'reset_at', {'quota_key': 'alpaca-a', 'cap': 200, 'remaining': 150, 'window_seconds': 60}),
     (
         Bar,
         'bar_start',

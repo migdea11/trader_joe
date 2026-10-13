@@ -9,7 +9,7 @@ from typing import Annotated, Any
 
 import pytest
 from fastapi import APIRouter, Depends
-from fastapi.routing import APIRoute
+from fastapi.routing import APIRoute, APIWebSocketRoute
 from google.protobuf.message import Message
 from pydantic import BaseModel
 
@@ -84,7 +84,13 @@ EMPTY = '-'
 # registers no route for it at all. Recording those as their own kind keeps them in the inventory
 # S6 reads, and keeps them under the same equality assertion as everything else: implement one, and
 # the `unbound-path` line has to become an `http` line in the same diff.
-KINDS = ('http', 'none', 'unbound-path')
+#
+# ws            a FastAPI WebSocket route (APIWebSocketRoute) on a module-scope APIRouter. Added for
+#               WS /ui/v1/events (tj-grna9p.73), the first one: before it the enumerator saw only APIRoute,
+#               so a served socket was recorded as an `unbound-path` -- a line claiming the opposite of the
+#               truth. Its response field is '-': a socket declares no response model, and its frame type
+#               (UiEvent) is pinned by the events tests, not by this inventory.
+KINDS = ('http', 'none', 'unbound-path', 'ws')
 
 
 def _module_relpath(module: ModuleType) -> str:
@@ -295,6 +301,10 @@ def _http_lines(component: str, modules: list[ModuleType]) -> tuple[set[str], se
             if not isinstance(router, APIRouter):
                 continue
             for route in router.routes:
+                if isinstance(route, APIWebSocketRoute):
+                    lines.add(_ws_line(component, route))
+                    bound_paths.add(route.path)
+                    continue
                 if not isinstance(route, APIRoute):
                     continue
                 defining_module = _defining_module(route.endpoint)
@@ -318,6 +328,25 @@ def _http_lines(component: str, modules: list[ModuleType]) -> tuple[set[str], se
                         )
                     )
     return lines, bound_paths
+
+
+def _ws_line(component: str, route: APIWebSocketRoute) -> str:
+    """Render a WebSocket route's manifest line, attributed like an http route to its defining module.
+
+    Args:
+        component (str): Component name.
+        route (APIWebSocketRoute): The socket route.
+
+    Returns:
+        str: The canonical line.
+    """
+    defining_module = _defining_module(route.endpoint)
+    if not defining_module.__name__.startswith(COMPONENT_PACKAGES[component]):
+        raise AssertionError(f'{route.path} is a {component} socket implemented in {defining_module.__name__}')
+    request, touches = _split_parameters(route.endpoint)
+    return _line(
+        'ws', f'WS {route.path}', _module_relpath(defining_module), route.endpoint.__qualname__, request, EMPTY, touches
+    )
 
 
 def _unbound_path_lines(modules: list[ModuleType], bound_paths: set[str]) -> set[str]:

@@ -50,16 +50,25 @@ ExpiryTypeByName = Annotated[ExpiryType, _member_names_schema(ExpiryType)]
 UpdateTypeByName = Annotated[UpdateType, _member_names_schema(UpdateType)]
 
 
-class StoreAssetDatasetBody(InboundContract):
-    """The fields a caller supplies to ask for a dataset.
+class StoreAssetDatasetFields(InboundContract):
+    """The fields that describe a dataset, shared by the request body and every entry model.
+
+    SPLIT FROM StoreAssetDatasetBody (tj-grna9p.71). The body adds what belongs to a REQUEST and not to
+    an entry -- ready_by, best_effort and the STREAM refusal -- and AssetDatasetStoreCreate, the update
+    model and the read model AssetDatasetStore inherit THIS class instead, so none of the three grows a
+    request-only field, and the refusal does not run when a stored row is validated (a stored STREAM
+    entry must stay readable). Everything below describes the body's fields as the callers see them;
+    the text was written when this class was the body and is kept whole.
 
     CONTRACT CHANGE (user ruling 2026-10-06, tj-grna9p.71): expiry is optional and defaults to None,
     meaning the dataset never expires. It used to default to now + 1 day. A caller that relied on
     the old default and wants a dataset that lapses must now send an explicit expiry.
 
     EVERY FIELD HERE IS IDENTITY (tj-vhboky.1 section 2) WITH ONE NAMED EXCEPTION, feed, which is
-    a preference rather than a value written -- see its own paragraph below. Two requests name the
-    same dataset only
+    a preference rather than a value written -- see its own paragraph below. ready_by and
+    best_effort, declared on the StoreAssetDatasetBody subclass, are named exceptions too: they
+    belong to the request, stay off OverlapKey and off the entry, and are never identity. Two
+    requests name the same dataset only
     if they agree on all of owner, asset_symbol, asset_type, data_type, source, granularity,
     expiry_type, update_type, start and end -- the range included. They back a UNIQUE constraint,
     which is why the policy fields below are NOT optional: Postgres treats NULL as distinct from
@@ -204,6 +213,38 @@ class StoreAssetDatasetBody(InboundContract):
         return value.name
 
 
+class StoreAssetDatasetBody(StoreAssetDatasetFields):
+    """The fields a caller supplies to ask for a dataset: the dataset's fields plus the request's own.
+
+    ready_by AND best_effort BELONG TO THE REQUEST, NOT THE ENTRY (tj-grna9p.71). They are accepted and
+    validated (a naive ready_by is a 422) and are currently IGNORED: nothing stores them and nothing
+    reads them, so they do not change what happens to the request. They are not identity: they are not
+    on OverlapKey, not on the entry, and not on any model that inherits StoreAssetDatasetFields, so
+    GET /store does not carry them.
+
+    A STREAM CREATE IS REFUSED while STREAM is deferred (decision tj-grna9p.9 item 2). The refusal is
+    a ValueError, which install_error_handlers renders as a 422 problem+json with reason
+    INVALID_REQUEST. No new Reason: a temporary refusal does not earn a vocabulary change, and the
+    stream PR removes it. It runs here and only here, so an entry that is already stored as STREAM
+    still validates when it is read back, and StoreAssetDatasetQuery still accepts STREAM as a filter.
+    """
+
+    # Optional, default None. When the requester wants the data by. AwareDatetime, REFUSE not convert
+    # (the tj-1bl90i rule above): a naive value is a 422 naming the field.
+    ready_by: AwareDatetime | None = None
+    # The requester accepts a partial or late answer. Accepted and currently ignored.
+    best_effort: bool = False
+
+    @model_validator(mode='after')
+    def refuse_stream_create(self) -> Self:
+        if self.update_type is UpdateType.STREAM:
+            raise ValueError(
+                f"The 'update_type' field cannot be '{UpdateType.STREAM.name}' yet: streaming datasets are not "
+                f"available. Use '{UpdateType.STATIC.name}' or '{UpdateType.DAILY.name}'."
+            )
+        return self
+
+
 class StoreAssetDatasetPath(InboundContract):
     asset_type: AssetType = Field(..., description=ASSET_TYPE_DESC)
     data_type: DataType = Field(..., description=DATA_TYPE_DESC)
@@ -264,7 +305,7 @@ class StoreAssetDatasetQuery(InboundContract):
         return value.name
 
 
-class AssetDatasetStoreCreate(StoreAssetDatasetPath, StoreAssetDatasetBody):
+class AssetDatasetStoreCreate(StoreAssetDatasetPath, StoreAssetDatasetFields):
     """The entry as it is WRITTEN: the caller's body, the path, and the tape that was resolved.
 
     THIS MODEL'S feed AND THE BODY'S ARE TWO DIFFERENT VALUES THAT SHARE A NAME, and keeping them

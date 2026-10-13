@@ -25,6 +25,7 @@ of env.py is exactly what makes the alembic command exit non-zero. The fake cont
 test_env_uri_masking.py documents.
 """
 
+import ast
 import runpy
 import subprocess
 import sys
@@ -49,8 +50,30 @@ ENV_PY = STORE_DIR / 'migrations' / 'env.py'
 # waiting on a timeout. Fixture credentials, not real ones.
 UNREACHABLE_DATABASE_URI = 'postgresql://joe:fixture-pass@127.0.0.1:1/unreachable'
 
-# env.py's ALLOWED_MODELS, restated rather than imported: reading it would mean executing env.py.
-ALLOWED_MODELS = ('base_market_activity', 'stock_market_activity', 'store_dataset_entry')
+# env.py's ALLOWED_MODELS, restated rather than imported: reading it would mean executing env.py. The
+# restatement once omitted ingest_run (tj-s6r3rt.3), so the propagation test silently skipped it;
+# test_the_restated_models_match_env_py below reads the literal from env.py's source to stop that recurring.
+ALLOWED_MODELS = ('base_market_activity', 'ingest_run', 'stock_market_activity', 'store_dataset_entry')
+
+
+def _env_py_allowed_models() -> set[str]:
+    """ALLOWED_MODELS as env.py's source spells it, read with ast and never executed."""
+    tree = ast.parse(ENV_PY.read_text(encoding='utf-8'), filename=str(ENV_PY))
+    values = [
+        node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign) and [getattr(t, 'id', None) for t in node.targets] == ['ALLOWED_MODELS']
+    ]
+    assert len(values) == 1, f'{ENV_PY} must assign ALLOWED_MODELS exactly once at module scope'
+    return set(ast.literal_eval(values[0]))
+
+
+def test_the_restated_models_match_env_py():
+    assert set(ALLOWED_MODELS) == _env_py_allowed_models(), (
+        'this module restates env.py ALLOWED_MODELS for the propagation test below; the two disagree, so a '
+        'model is either untested or invented here'
+    )
+    assert len(ALLOWED_MODELS) == len(set(ALLOWED_MODELS))
 
 
 def alembic_current_env() -> dict[str, str]:

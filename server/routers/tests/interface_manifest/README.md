@@ -27,8 +27,8 @@ kind | address | file | symbol | request | response | touches
 
 | Field | Meaning |
 |---|---|
-| `kind` | `http`, `unbound-path` or `none` — see below |
-| `address` | `METHOD /path` for `http`, the declared path for `unbound-path`, `-` for `none` |
+| `kind` | `http`, `ws`, `unbound-path` or `none` — see below |
+| `address` | `METHOD /path` for `http`, `WS /path` for `ws`, the declared path for `unbound-path`, `-` for `none` |
 | `file` | Repository-relative path of the module whose body defines the endpoint or handler |
 | `symbol` | The endpoint or handler function, or `EnumClass.MEMBER` for a declared path |
 | `request` | Every parameter annotated with a Pydantic model, fully qualified, or with a protobuf message, by its full proto name; sorted |
@@ -50,9 +50,13 @@ A `/ui/v1` route (ADR tj-grna9p.4 section 4) has no Pydantic model on either sid
 Both are recorded by full proto name, e.g. `trader_joe.proto.ui.v1.DatasetPage`, so the manifest
 holds the contract the extension exists to record rather than a `-`.
 
-## The three kinds
+## The four kinds
 
 - **`http`** — a FastAPI route registered on a module-scope `APIRouter` while the module body ran.
+- **`ws`** — a FastAPI WebSocket route on a module-scope `APIRouter` (first: `WS /ui/v1/events`,
+  tj-grna9p.73). Before it the enumerator saw only `APIRoute`, so a served socket read as an
+  `unbound-path`. A socket has no response model, so `response` is `-`; its frame type is pinned by
+  the events tests.
 - **`unbound-path`** — a path declared in an interface enum that no import-time route serves.
 - **`none`** — the component exposes nothing this manifest can enumerate, said out loud.
 

@@ -46,6 +46,12 @@ service IngestService {
   // Server-streaming. The wire path is
   // /trader_joe.proto.internal.ingest.v1.IngestService/FetchDataset.
   rpc FetchDataset(FetchDatasetRequest) returns (stream FetchDatasetResponse);
+
+  // Unary. What one fetch would cost and what capacity is left, without making it (tj-grna9p.44).
+  // INFORMATIONAL: data_store uses the answer for the estimate card, the request's stored snapshot
+  // and the quota cap, and never to refuse a request. The wire path is
+  // /trader_joe.proto.internal.ingest.v1.IngestService/Quote.
+  rpc Quote(QuoteRequest) returns (QuoteResponse);
 }
 
 // WHAT INGEST ACTUALLY READS, and deliberately nothing more. Established by reading data/ingest
@@ -91,6 +97,18 @@ message FetchDatasetRequest {
   // against it (tj-3mk3u5.22 Q5). There is deliberately no `optional` keyword: with one, "unset" and
   // "set to FEED_UNSPECIFIED" would be two spellings of the same request.
   trader_joe.proto.market.v1.Feed feed = 10;
+
+  // The store's request-log handle for this fetch, so the vendor calls ingest makes can be tied back
+  // to the request that caused them (decision tj-grna9p.9 item 6). Empty when the fetch has no
+  // request-log entry (a scheduled pass). It is NOT a page correlation key: pages still carry none.
+  string request_id = 11;
+
+  // When the requester wants the data by. Unset means none. Carried and unused: PR 4's queue is
+  // plain FIFO.
+  google.protobuf.Timestamp ready_by = 12;
+
+  // The requester accepts a partial or late answer. Carried and unused, like ready_by.
+  bool best_effort = 13;
 }
 
 // One message of the stream. The oneof is declared from day one, as ADR tj-8konfu D7.1 requires:
@@ -119,6 +137,11 @@ message FetchAccepted {
   // value only ingest may decide. Never FEED_UNSPECIFIED -- a feed nobody resolved is an error, not a
   // value (tj-vhboky.1), so the mapper refuses the zero here.
   trader_joe.proto.market.v1.Feed feed = 1;
+
+  // The quota scope this fetch is charged to. A NON-SECRET CONFIGURED LABEL: never key material and
+  // never a hash of it. It arrives before any page so the store can record it before the fetch ends.
+  // The request's ownership key is a separate field and is not this.
+  string quota_key = 2;
 }
 
 // The fetch is refused, and this is the stream's only event. In ADR tj-fa1rpu's terms it is a REFUSED
@@ -178,6 +201,54 @@ message FetchDone {
 
   // When the vendor answered. UTC.
   google.protobuf.Timestamp as_of = 3;
+
+  // What the fetch cost at the vendor. It exists only here, because the stats exist only after the
+  // calls were made. A fetch that ends in a status or a refused ack carries none.
+  VendorCallStats vendor_stats = 4;
+}
+
+// The vendor calls one fetch made. Counted by ingest; the vendor's own figures are corroboration.
+message VendorCallStats {
+  uint64 calls = 1;
+  uint64 pages = 2;
+  // Calls the vendor answered with a rate-limit status (HTTP 429).
+  uint64 throttled_429 = 3;
+  uint64 retries = 4;
+  google.protobuf.Timestamp first_call_at = 5;
+  google.protobuf.Timestamp last_call_at = 6;
+  // Unset when the vendor reported nothing. Corroboration only; ingest's own count is the record.
+  VendorReported vendor_reported = 7;
+}
+
+// What the vendor's response headers said about its limit, when they said anything.
+message VendorReported {
+  optional uint64 limit = 1;
+  optional uint64 remaining = 2;
+  google.protobuf.Timestamp reset_at = 3;
+}
+
+// One fetch to be quoted. The store sums the quotes of a multi-symbol request.
+message QuoteRequest {
+  FetchDatasetRequest fetch = 1;
+}
+
+message QuoteResponse {
+  // The vendor calls the fetch would make (paging and batching are broker-specific).
+  uint64 estimated_vendor_calls = 1;
+  // The scope ingest would charge now: a non-secret configured label, never key material.
+  string quota_key = 2;
+  // Every scope in the pool, with its capacity now.
+  repeated ScopeCapacity scopes = 3;
+}
+
+message ScopeCapacity {
+  // A non-secret configured label.
+  string quota_key = 1;
+  // Calls allowed per window. Zero when the scope declares no cap.
+  uint64 cap = 2;
+  uint64 remaining = 3;
+  uint64 window_seconds = 4;
+  google.protobuf.Timestamp reset_at = 5;
 }
 
 // The served window. Mirrors the ServedRange named tuple in data/ingest's broker interface, and the

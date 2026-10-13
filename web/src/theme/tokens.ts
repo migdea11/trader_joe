@@ -17,6 +17,9 @@ export const colors = {
   surface: '#141a22',
   raised: '#1b232e',
   line: '#283241',
+  // The stripe of the scroll bar's hatched not-loaded area and the chart's session lines: neutral, never
+  // a status colour (tj-grna9p.122).
+  hatch: '#3a4657',
   text: '#e6edf3',
   text2: '#a3b3c5',
   text3: '#8494a8',

@@ -1,4 +1,5 @@
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import asynccontextmanager
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -38,6 +39,21 @@ async def async_db() -> AsyncGenerator[AsyncSession, None]:
 
     Yields:
         AsyncSession: The request's session.
+    """
+    async with PostgresSessionFactory.AsyncSessionHandle.session(DATABASE_ASYNC_URI) as session:
+        yield session
+
+
+@asynccontextmanager
+async def own_session() -> AsyncIterator[AsyncSession]:
+    """A session of the caller's own, for work that must commit apart from the request's transaction.
+
+    The run recorder's (app/ingest/run_recording.py): its rows are written in their own short
+    transactions, never inside the fetch's all-or-nothing one. Same factory as async_db, so the
+    session is closed and its connection returned when the block exits.
+
+    Yields:
+        AsyncSession: A session, closed when the block exits.
     """
     async with PostgresSessionFactory.AsyncSessionHandle.session(DATABASE_ASYNC_URI) as session:
         yield session

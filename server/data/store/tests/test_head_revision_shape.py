@@ -68,6 +68,12 @@ DATASET_MODEL_FILE = f'{DATASET_MODEL_REVISION}_per_dataset_identity_and_feed.py
 # model/revision agreement tests at the bottom of this file read it rather than the revision above.
 FEED_REVISION = 'c4a1f7b2e905'
 FEED_FILE = f'{FEED_REVISION}_feed_on_the_dataset_entry.py'
+# THE HEAD SINCE tj-grna9p.18: ingest_run, PURELY ADDITIVE and directly on the feed revision (the
+# architect's re-baseline names down_revision 'c4a1f7b2e905'). It touches no table this file is about,
+# so the entry-identity agreement tests below still read FEED_REVISION, which still owns that
+# constraint; the new revision's own shape is pinned in test_ingest_run_revision.py.
+INGEST_RUN_REVISION = '6f5a798746a1'
+INGEST_RUN_FILE = f'{INGEST_RUN_REVISION}_ingest_run.py'
 # The parent the epic's design names for its one revision (tj-vhboky.12 item 1).
 PARENT_REVISION = '8f41c2d7a3b9'
 PARENT_FILE = f'{PARENT_REVISION}_bar_natural_key_and_upsert.py'
@@ -219,12 +225,20 @@ def test_each_revision_of_the_two_epics_sits_directly_on_the_one_before_it():
     (head_id,) = script.get_heads()
     head_revision = script.get_revision(head_id)
 
-    assert head_revision.module.__file__.endswith(FEED_FILE), (
-        f'the head is not {FEED_FILE}: {head_revision.module.__file__}'
+    # A THIRD ONE-REVISION PROMISE since tj-grna9p.18, and it went red the correct way when it landed:
+    # the head is the ingest_run revision, directly on the feed revision, and the chain below is the
+    # same as before. A fourth revision slipped in between would still re-point one of these hops.
+    assert head_revision.module.__file__.endswith(INGEST_RUN_FILE), (
+        f'the head is not {INGEST_RUN_FILE}: {head_revision.module.__file__}'
     )
+    assert head_revision.down_revision == FEED_REVISION, (
+        f'the head does not sit directly on {FEED_REVISION}: {head_revision.down_revision}'
+    )
+    feed_revision = script.get_revision(FEED_REVISION)
+    assert feed_revision.module.__file__.endswith(FEED_FILE), f'{FEED_REVISION} is not {FEED_FILE}'
     # With the chain linear (the test below), each of these is "exactly one revision follows".
-    assert head_revision.down_revision == DATASET_MODEL_REVISION, (
-        f'the head does not sit directly on {DATASET_MODEL_REVISION}: {head_revision.down_revision}'
+    assert feed_revision.down_revision == DATASET_MODEL_REVISION, (
+        f'{FEED_REVISION} does not sit directly on {DATASET_MODEL_REVISION}: {feed_revision.down_revision}'
     )
     assert script.get_revision(DATASET_MODEL_REVISION).down_revision == PARENT_REVISION, (
         f'{DATASET_MODEL_REVISION} no longer sits directly on {PARENT_REVISION}'

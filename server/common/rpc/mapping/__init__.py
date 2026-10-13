@@ -50,6 +50,13 @@ from common.rpc.mapping.fetch_dataset import (
     served_range_to_proto,
 )
 from common.rpc.mapping.fetch_stream import MAX_PAGE_BARS, FetchStreamEncoder, refused_response
+from common.rpc.mapping.quote import (
+    quote_request_to_proto,
+    quote_to_domain,
+    quote_to_proto,
+    scope_capacity_to_domain,
+    scope_capacity_to_proto,
+)
 from common.rpc.mapping.values import (
     ASSET_TYPE,
     DATA_SOURCE,
@@ -65,6 +72,7 @@ from common.rpc.mapping.values import (
     to_timestamp,
 )
 from schemas.data_ingest import fetch_dataset as domain
+from schemas.data_ingest import quote as quote_domain
 from trader_joe.proto.internal.ingest.v1 import ingest_pb2
 from trader_joe.proto.market.v1 import bar_pb2, enums_pb2
 
@@ -100,6 +108,10 @@ _MAPPERS: Final[tuple[MessageMapper, ...]] = (
     MessageMapper(ingest_pb2.FetchDone, domain.FetchDone, done_to_domain, done_to_proto),
     MessageMapper(ingest_pb2.ServedRange, domain.ServedRange, served_range_to_domain, served_range_to_proto),
     MessageMapper(bar_pb2.Bar, domain.Bar, bar_to_domain, bar_to_proto),
+    MessageMapper(ingest_pb2.QuoteResponse, quote_domain.QuoteResult, quote_to_domain, quote_to_proto),
+    MessageMapper(
+        ingest_pb2.ScopeCapacity, quote_domain.ScopeCapacity, scope_capacity_to_domain, scope_capacity_to_proto
+    ),
 )
 
 # The mapper for each message, by the message's full proto name.
@@ -122,7 +134,20 @@ ENVELOPE_MESSAGES: Final[Mapping[str, str]] = MappingProxyType(
             "the stream's envelope is pure transport. Its oneof arm is dispatched by the client seam and "
             'set by the server-side encoder, and no domain model restates it (schemas/data_ingest/'
             'fetch_dataset.py, WHAT IS DELIBERATELY ABSENT)'
-        )
+        ),
+        'trader_joe.proto.internal.ingest.v1.QuoteRequest': (
+            'a wrapper around the one FetchDatasetRequest, which already has its domain twin; it is built '
+            'from that request by quote_request_to_proto and carries nothing else (tj-grna9p.44)'
+        ),
+        # Mapped by the follow-up that carries quota_key and vendor_stats into the domain models and the
+        # encoder (tj-grna9p.44 architect note, FOLLOW-UP, needed before tj-grna9p.48 and .24). Named here
+        # so the import-time totality check holds in the meantime; REMOVE these two when it lands.
+        'trader_joe.proto.internal.ingest.v1.VendorCallStats': (
+            'no domain twin yet: FetchDone.vendor_stats is not mapped until the tj-grna9p.48 follow-up'
+        ),
+        'trader_joe.proto.internal.ingest.v1.VendorReported': (
+            'no domain twin yet: it is a member of VendorCallStats, mapped with it by the same follow-up'
+        ),
     }
 )
 
@@ -188,11 +213,16 @@ __all__ = [
     'done_to_proto',
     'page_to_domain',
     'page_to_proto',
+    'quote_request_to_proto',
+    'quote_to_domain',
+    'quote_to_proto',
     'refused_response',
     'refused_to_domain',
     'refused_to_proto',
     'request_to_domain',
     'request_to_proto',
+    'scope_capacity_to_domain',
+    'scope_capacity_to_proto',
     'served_range_to_domain',
     'served_range_to_proto',
     'timestamp_field',

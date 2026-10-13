@@ -8,7 +8,9 @@ from common.rpc.clients.ingest_fetch import IngestFetchClient
 from data.store.app.app_depends import get_ingest_fetch_client
 from data.store.app.database.crud.stock.store_dataset_entry import delete_entry_by_id, get_entry_by_id, search_entries
 from data.store.app.database.database import async_db
+from data.store.app.events import DatasetChange, DatasetChanged, publish
 from data.store.app.ingest.data_action_request import store_market_activity_worker
+from data.store.app.ingest.run_recording import recorded_run
 from routers.common.instance_secret import require_instance_secret
 from routers.data_store.app_endpoints import AssetDatasetStoreInterface
 from schemas.data_store.asset_dataset_store import (
@@ -73,7 +75,17 @@ async def store_data(
         including a served window with no bars, where data_points is 0.
     """
     log.debug(f'Storing data for {request_path.asset_type.value}, {request_path.asset_symbol}')
-    stored = await store_market_activity_worker(request_path, request_body, db, fetch_client)
+    # THE RUN RECORD IS WRITTEN OUTSIDE THE FETCH'S TRANSACTION, on its own session (tj-grna9p.18),
+    # and an exception still passes through it unchanged: this handler still catches nothing (D6).
+    async with recorded_run(request_path, request_body) as run:
+        stored = await store_market_activity_worker(
+            request_path, request_body, db, fetch_client, on_ack=run.acknowledge
+        )
+        await run.succeed(stored.data_points)
+    # AFTER the fetch's commit, never inside it. The upsert's xmax is not read, so CREATED cannot be told
+    # from a repeat without changing the upsert's contract; the client reloads either way.
+    if run.dataset_id is not None:
+        publish(DatasetChanged(run.dataset_id, DatasetChange.UPDATED))
     return StoreAssetDatasetResponse(
         message='Data stored',
         data_points=stored.data_points,
@@ -128,4 +140,6 @@ async def delete_data(
     # OwnerMismatch refuses to format it, and `owner` is not an allowlisted metadata key. A None
     # owner is the degenerate case of a wrong one, so an owner-less delete is still a 403.
     await delete_entry_by_id(db, request_path.id, request_path.owner)
+    # delete_entry_by_id has committed (or raised, and nothing is published).
+    publish(DatasetChanged(request_path.id, DatasetChange.DELETED))
     return {'message': 'Data deleted'}

@@ -92,11 +92,15 @@ class Reason(StrEnum):
 #   COVERAGE_GAP         the coverage-ledger PR; named in tj-8konfu D6.4 beside RATE_BUDGET and DEADLINE.
 #   ADMISSION_REFUSED    the streaming PR; tj-8konfu D6.4, rendered RESOURCE_EXHAUSTED.
 #   SUBSCRIBER_TOO_SLOW  the streaming PR; tj-8konfu D6.4, rendered RESOURCE_EXHAUSTED.
+#   NOT_BOOTSTRAPPED     tj-grna9p.44: data_ingest has not completed its start-up bootstrap against
+#                        data_store, so it cannot yet charge a quota scope. Reserved as a NAME only;
+#                        the member and its REASONS row land with the bead that raises it (tj-grna9p.52).
 RESERVED_REASONS: Final[tuple[str, ...]] = (
     'OUTSIDE_LOOKBACK',
     'COVERAGE_GAP',
     'ADMISSION_REFUSED',
     'SUBSCRIBER_TOO_SLOW',
+    'NOT_BOOTSTRAPPED',
 )
 
 

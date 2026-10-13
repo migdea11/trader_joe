@@ -18,6 +18,8 @@ export interface FacetCounts {
   all: number
   /** The Needs Attention view (late, overdue or gaps). */
   needsAttention: number
+  /** Datasets with a collection run in flight (the Running filter value). */
+  running: number
   /** Per Status filter value. A dataset with no health is in none of them. */
   status: Record<StatusGroup, number>
   sources: SourceCount[]
@@ -51,6 +53,7 @@ export function facetCounts(facets: DatasetFacets): FacetCounts {
   return {
     all: int64ToNumber(facets.all),
     needsAttention: int64ToNumber(facets.needsAttention),
+    running: int64ToNumber(facets.running),
     status,
     sources: facets.sources
       .filter((entry) => entry.source !== DataSource.UNSPECIFIED)
