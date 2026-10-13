@@ -9,7 +9,7 @@
 # registry-1.docker.io, uv:0.12.19 from ghcr.io.
 
 # Base Build Image
-FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS base_build_image
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS base_build_image
 ARG SERVICE_PATH=none
 ARG SERVICE_NAME=none
 
@@ -137,7 +137,7 @@ RUN uv sync --only-group base --only-group data-store --only-group testing --fro
 # mirrors them: this build cannot read the Makefile, and a build arg fed from it would leave a build
 # outside make with no version. A bump is those three values here, in the devcontainer and in the
 # Makefile, in one commit. A test pins them equal. npm is whatever the pinned Node bundles.
-FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS web_build_image
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS web_build_image
 ARG NODE_VERSION=24.21.0
 ARG NODE_SHA256_X86_64=6e1db87ef58b8819e5d5402eff1536491b18edd8eb7bee5ef7897876e88dc5ff
 ARG NODE_SHA256_AARCH64=724282c3b43aec998aa9527380465b45d229e021b58035f5f4f63095eabfe5d5
@@ -209,7 +209,7 @@ USER 65532:65532
 EXPOSE 8080
 
 # Base Deploy Image
-FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS base_deploy_image
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS base_deploy_image
 ARG SERVICE_PATH=none
 ARG SERVICE_NAME=none
 
