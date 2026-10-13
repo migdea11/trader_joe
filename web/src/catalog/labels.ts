@@ -83,3 +83,14 @@ export function sourceFeedLabel(source: DataSource, feed: Feed): string {
   const feedLabel = FEED_LABELS[feed]
   return feedLabel === undefined ? sourceLabel(source) : `${sourceLabel(source)} · ${feedLabel}`
 }
+
+/** The whole identity of a dataset on one line, for a hover title: "VFV · bars · 1d · Alpaca · IEX". */
+export function datasetIdentityLabel(d: {
+  assetSymbol: string
+  dataType: DataType
+  granularity: Granularity
+  source: DataSource
+  feed: Feed
+}): string {
+  return [d.assetSymbol, dataTypeLabel(d.dataType), granularityLabel(d.granularity), sourceFeedLabel(d.source, d.feed)].join(' · ')
+}

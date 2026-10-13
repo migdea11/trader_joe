@@ -2,7 +2,7 @@
 // The Data Viewer (tj-grna9p.33, canvas board "Shell · Viewer", phase 1): the dataset's header, the
 // candles and volume chart with its zoom navigator and hover readout, and the paged bar table. Raw
 // bars only (owner ruling, tj-kqsnxb). The sidebar (DatasetViewerSidebar.vue) is the route's
-// `sidebar` view. Reached from a Datasets row click; the header badge comes from the dataset
+// `sidebar` view. Reached from a Datasets row click (the default destination; its Details link goes on to the Dataset detail); the header badge comes from the dataset
 // detail's freshness. No polling and no events: it loads when the dataset or the range changes.
 //
 // The chart holds a bounded number of bars (viewer/barWindow.ts: 10,000 per page, at most 50,000);
@@ -15,9 +15,11 @@ import { Code, Download } from '@lucide/vue'
 import type { Bar } from '@generated/trader_joe/proto/market/v1/bar_pb'
 
 import { getDatasetBars, getDatasetBarsRequest, int64ToNumber } from '@/api'
-import { dataTypeLabel, granularityLabel, isIntraday, sourceFeedLabel, updateTypeLabel } from '@/catalog/labels'
-import { rowBadge } from '@/catalog/rows'
+import { dataTypeLabel, datasetIdentityLabel, granularityLabel, isIntraday, sourceFeedLabel, updateTypeLabel } from '@/catalog/labels'
+import { DETAIL_ROUTE, rowBadge } from '@/catalog/rows'
 import StatusBadge from '@/components/StatusBadge.vue'
+import PageBreadcrumbs from '@/components/nav/PageBreadcrumbs.vue'
+import type { BreadcrumbItem } from '@/components/nav/PageBreadcrumbs.vue'
 import PriceChart from '@/components/charts/PriceChart.vue'
 import type { PriceHover } from '@/components/charts/PriceChart.vue'
 import ZoomNavigator from '@/components/charts/ZoomNavigator.vue'
@@ -25,6 +27,7 @@ import type { LogicalRangeLike } from '@/components/charts/navigatorMath'
 import BarTable from '@/components/viewer/BarTable.vue'
 import { MISSING, formatCompact, formatNumber, timestampToInstant } from '@/format/formatters'
 import { useFormatters } from '@/format/useFormatters'
+import { titleCase } from '@/theme/copy'
 import { useFooterSummary } from '@/shell/useFooterSummary'
 import { describeError, type CatalogError } from '@/stores/datasetCatalog'
 import { useDatasetViewerStore } from '@/stores/datasetViewer'
@@ -52,6 +55,21 @@ const title = computed(() =>
     ? `${dataset.value.assetSymbol} · ${dataTypeLabel(dataset.value.dataType)} · ${granularityLabel(dataset.value.granularity)}`
     : 'Viewer',
 )
+// Datasets > <symbol>; the current page is the last crumb. The label is the symbol only (the Detail
+// trail's dataset crumb reads the same), the whole identity is the hover title. Until the dataset is
+// known, or when it is not found or failed to load, there is no dataset to name, so the last crumb
+// is the screen's own name, as the Detail's is: Datasets > Viewer. Like the Back to Datasets link,
+// the first crumb carries no filter state.
+const crumbs = computed<BreadcrumbItem[]>(() => {
+  const trail: BreadcrumbItem[] = [{ label: titleCase('Datasets'), to: { name: 'data-datasets' } }]
+  const d = dataset.value
+  if (status.value === 'ready' && d) {
+    trail.push({ label: d.assetSymbol, hint: datasetIdentityLabel(d) })
+  } else {
+    trail.push({ label: titleCase('Viewer') })
+  }
+  return trail
+})
 const barCount = computed(() => (dataset.value ? int64ToNumber(dataset.value.barCount) : 0))
 const hasBars = computed(() => barCount.value > 0)
 const problem = computed(() => rangeProblem(range.value))
@@ -183,6 +201,8 @@ const extent = computed(() => {
 
 <template>
   <section class="viewer">
+    <PageBreadcrumbs :items="crumbs" />
+
     <div
       v-if="status === 'loading' || status === 'idle'"
       class="panel"
@@ -242,6 +262,13 @@ const extent = computed(() => {
           data-testid="viewer-badge"
         />
         <div class="viewer__actions">
+          <RouterLink
+            class="btn"
+            :to="{ name: DETAIL_ROUTE, params: { id: dataset.id } }"
+            data-testid="open-details"
+          >
+            {{ titleCase('Details') }}
+          </RouterLink>
           <button
             type="button"
             class="btn"
@@ -481,6 +508,7 @@ const extent = computed(() => {
   font: inherit;
   font-size: 13px;
   font-weight: 500;
+  text-decoration: none;
   cursor: pointer;
 }
 

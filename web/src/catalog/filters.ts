@@ -16,10 +16,12 @@ export interface CatalogFilters {
   status?: StatusGroup
   source?: DataSource
   updateType?: UpdateType
+  /** Only datasets with a collection run in flight; independent of `status`. */
+  running?: boolean
 }
 
 /** The URL query keys this screen owns. Others (the trading group) are not touched. */
-export const QUERY_KEYS = ['view', 'status', 'source', 'update'] as const
+export const QUERY_KEYS = ['view', 'status', 'source', 'update', 'running'] as const
 
 export const STATUS_GROUPS: readonly StatusGroup[] = ['healthy', 'late', 'failed', 'retired']
 
@@ -51,6 +53,7 @@ export function parseCatalogQuery(query: LocationQuery): CatalogFilters {
     status: STATUS_GROUPS.find((group) => group === status),
     source: source === undefined ? undefined : sourceFromName(source),
     updateType: update === undefined ? undefined : updateTypeFromName(update),
+    running: first(query.running) === 'true' ? true : undefined,
   }
 }
 
@@ -64,6 +67,7 @@ export function toCatalogQuery(filters: CatalogFilters, base: LocationQuery = {}
   if (filters.view === 'needs-attention') query.view = 'needs-attention'
   if (filters.status !== undefined) query.status = filters.status
   if (filters.source !== undefined) query.source = DataSource[filters.source].toLowerCase()
+  if (filters.running === true) query.running = 'true'
   if (filters.updateType !== undefined) query.update = UpdateType[filters.updateType].toLowerCase()
   return query
 }
@@ -75,12 +79,18 @@ export function toApiFilters(filters: CatalogFilters): DatasetFilters {
     source: filters.source,
     updateType: filters.updateType,
     needsAttention: filters.view === 'needs-attention' ? true : undefined,
+    running: filters.running === true ? true : undefined,
   }
 }
 
 /** Whether any sidebar filter (not the view) is set: the Clear link shows then. */
 export function hasActiveFilters(filters: CatalogFilters): boolean {
-  return filters.status !== undefined || filters.source !== undefined || filters.updateType !== undefined
+  return (
+    filters.status !== undefined ||
+    filters.source !== undefined ||
+    filters.updateType !== undefined ||
+    filters.running === true
+  )
 }
 
 /** The same filters with the view set to the given one. */
@@ -90,5 +100,5 @@ export function withView(filters: CatalogFilters, view: CatalogView): CatalogFil
 
 /** Key for a filter-set: changes exactly when a re-query is needed. */
 export function filtersKey(filters: CatalogFilters): string {
-  return JSON.stringify([filters.view, filters.status, filters.source, filters.updateType])
+  return JSON.stringify([filters.view, filters.status, filters.source, filters.updateType, filters.running])
 }

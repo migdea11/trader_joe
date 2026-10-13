@@ -18,6 +18,10 @@ const mocks = vi.hoisted(() => ({
   getDataset: vi.fn(),
   getDatasetBars: vi.fn(),
 }))
+// The shell opens the shared events socket on mount (tj-grna9p.76): replaced so no real WebSocket opens.
+vi.mock('@/api/events', async (importOriginal) =>
+  (await import('@/__tests__/fakeEvents')).fakeEventsModule(await importOriginal<object>()),
+)
 vi.mock('@/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/api')>()),
   ...mocks,

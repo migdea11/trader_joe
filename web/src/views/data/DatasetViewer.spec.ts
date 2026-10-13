@@ -14,12 +14,14 @@ import { DatasetSummarySchema, FreshnessStatus } from '@generated/trader_joe/pro
 import { AccountGroup } from '@generated/trader_joe/proto/ui/v1/shell_pb'
 
 import { ApiError } from '@/api'
+import { dataTypeLabel, granularityLabel, sourceFeedLabel } from '@/catalog/labels'
 import PriceChart from '@/components/charts/PriceChart.vue'
 import ZoomNavigator from '@/components/charts/ZoomNavigator.vue'
 import BarTable from '@/components/viewer/BarTable.vue'
 import router from '@/router'
 import AppShell from '@/shell/AppShell.vue'
 import { useSettingsStore } from '@/stores/settings'
+import { titleCase } from '@/theme/copy'
 import { barsToCsv } from '@/viewer/csv'
 
 // tj-grna9p.33 Data Viewer, mounted in the real shell under the real router, with the API mocked at
@@ -65,6 +67,10 @@ const mocks = vi.hoisted(() => ({
   getDatasetFacets: vi.fn(),
   listDatasets: vi.fn(),
 }))
+// The shell opens the shared events socket on mount (tj-grna9p.76): replaced so no real WebSocket opens.
+vi.mock('@/api/events', async (importOriginal) =>
+  (await import('@/__tests__/fakeEvents')).fakeEventsModule(await importOriginal<object>()),
+)
 vi.mock('@/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/api')>()),
   ...mocks,
@@ -153,6 +159,94 @@ describe('header and states', () => {
     expect(meta).toContain('2026/09/01')
     expect(meta).toContain('2026/09/03')
     expect(shell.find('[data-testid="viewer-symbol"]').text()).toBe('VFV')
+  })
+
+  // tj-grna9p.109: the Viewer is now where a Datasets row lands, so its header links on to the
+  // Dataset detail. tj-grna9p.113 keeps this link; the way back from the detail is its breadcrumb.
+  it('the header\'s Details link is a real link to the Dataset detail, and following it opens the detail', async () => {
+    const shell = await viewerAt('/data/datasets/ds-1/viewer')
+    const details = shell.find('[data-testid="open-details"]')
+    expect(details.element.tagName).toBe('A')
+    expect(details.text()).toBe('Details')
+    expect(details.attributes('href')).toBe('/data/datasets/ds-1')
+    expect(details.attributes('tabindex')).toBeUndefined()
+    await details.trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value.name).toBe('data-dataset-detail')
+    expect(router.currentRoute.value.params.id).toBe('ds-1')
+  })
+
+  it('the Details link escapes an id that is not URL-safe', async () => {
+    mocks.getDataset.mockResolvedValue(summary({ id: 'a/b' }))
+    const shell = await viewerAt('/data/datasets/a%2Fb/viewer')
+    expect(shell.find('[data-testid="open-details"]').attributes('href')).toBe('/data/datasets/a%2Fb')
+  })
+
+  // tj-grna9p.113 (owner 2026-10-13): the Viewer is the dataset's own page in the hierarchy
+  // Datasets > <dataset> > Details, so its trail is Datasets > <dataset>, the dataset the current
+  // page. The owner then ruled the dataset crumb reads the asset symbol only, the same crumb as on the
+  // Detail, with the whole identity as its hover title and no aria-label (its accessible name is the
+  // visible symbol). The page title keeps the full name. Its Details link (above) is unchanged.
+  const crumbNav = (shell: VueWrapper) => shell.find('section.viewer [data-testid="breadcrumbs"]')
+  const crumbTrail = (shell: VueWrapper) => crumbNav(shell).findAll('li').map((li) => li.text())
+
+  it('the breadcrumb trail is Datasets > <symbol>: Datasets links the catalog, the symbol is the current page', async () => {
+    const shell = await viewerAt('/data/datasets/ds-1/viewer')
+    const nav = crumbNav(shell)
+    expect(nav.element.tagName).toBe('NAV')
+    expect(nav.attributes('aria-label')).toBe('Breadcrumb')
+    expect(crumbTrail(shell)).toEqual([titleCase('Datasets'), 'VFV'])
+    expect(shell.find('[data-testid="viewer-title"]').text()).toBe('VFV · bars · 1d')
+    const links = nav.findAll('[data-testid="breadcrumb-link"]')
+    expect(links.map((a) => [a.element.tagName, a.text(), a.attributes('href')])).toEqual([['A', 'Datasets', '/data/datasets']])
+    const current = nav.find('[data-testid="breadcrumb-current"]')
+    expect(current.element.tagName).toBe('SPAN')
+    expect(current.text()).toBe('VFV')
+    expect(current.attributes('aria-current')).toBe('page')
+    expect(nav.findAll('[aria-current]')).toHaveLength(1)
+    await links[0]!.trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value.name).toBe('data-datasets')
+  })
+
+  it('the current crumb\'s hover title is the whole identity; it has no aria-label, so its name is the symbol', async () => {
+    const shell = await viewerAt('/data/datasets/ds-1/viewer')
+    const d = summary()
+    const identity = [d.assetSymbol, dataTypeLabel(d.dataType), granularityLabel(d.granularity), sourceFeedLabel(d.source, d.feed)].join(' · ')
+    const current = crumbNav(shell).find('[data-testid="breadcrumb-current"]')
+    expect(current.attributes('title')).toBe(identity)
+    expect(current.attributes('aria-label')).toBeUndefined()
+    expect(current.attributes('aria-labelledby')).toBeUndefined()
+    expect(current.text()).toBe('VFV')
+    expect(crumbNav(shell).find('[data-testid="breadcrumb-link"]').attributes('title')).toBeUndefined()
+  })
+
+  it('while the dataset is loading the trail is Datasets > Viewer, with no hover title', async () => {
+    mocks.getDataset.mockReturnValue(new Promise(() => undefined))
+    const shell = await viewerAt('/data/datasets/ds-1/viewer')
+    expect(crumbTrail(shell)).toEqual([titleCase('Datasets'), titleCase('Viewer')])
+    const current = crumbNav(shell).find('[data-testid="breadcrumb-current"]')
+    expect(current.attributes('aria-current')).toBe('page')
+    expect(current.attributes('title')).toBeUndefined()
+  })
+
+  it('a dataset not found (404) has the trail Datasets > Viewer', async () => {
+    mocks.getDataset.mockRejectedValue(new ApiError({ status: 404, reason: 'NOT_FOUND' }))
+    const shell = await viewerAt('/data/datasets/missing/viewer')
+    expect(shell.find('[data-testid="viewer-not-found"]').exists()).toBe(true)
+    expect(crumbTrail(shell)).toEqual([titleCase('Datasets'), titleCase('Viewer')])
+    expect(crumbNav(shell).findAll('[data-testid="breadcrumb-link"]').map((a) => a.attributes('href'))).toEqual(['/data/datasets'])
+  })
+
+  it('a failed load has the trail Datasets > Viewer, and Datasets > <symbol> once Try Again succeeds', async () => {
+    mocks.getDataset.mockRejectedValueOnce(new ApiError({ status: 503, errorId: 'v-6' }))
+    const shell = await viewerAt('/data/datasets/ds-1/viewer')
+    const panel = shell.find('[data-testid="viewer-error"]')
+    expect(panel.exists()).toBe(true)
+    expect(crumbTrail(shell)).toEqual([titleCase('Datasets'), titleCase('Viewer')])
+    await panel.find('button').trigger('click')
+    await flushPromises()
+    expect(crumbTrail(shell)).toEqual([titleCase('Datasets'), 'VFV'])
   })
 
   it('an unset health shows the Unknown badge', async () => {
@@ -311,6 +405,8 @@ describe('sidebar controls', () => {
     await shell.find('[data-granularity="1h"]').trigger('click')
     await flushPromises()
     expect(router.currentRoute.value.params.id).toBe('ds-1h')
+    // tj-grna9p.109: the switch stays on the Viewer; it never lands on the sibling's detail.
+    expect(router.currentRoute.value.name).toBe('data-dataset-viewer')
     expect(router.currentRoute.value.query.from).toBe('2026-09-01')
     expect(mocks.getDataset).toHaveBeenLastCalledWith('ds-1h', expect.any(AbortSignal))
   })

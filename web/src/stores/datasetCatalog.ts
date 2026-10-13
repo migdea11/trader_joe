@@ -1,7 +1,7 @@
 // The Datasets screen's shared state (tj-grna9p.32): the facet counts the sidebar and the tiles both
 // read, and the grid's load state the footer and the empty and error panels read. The filters
 // themselves live in the URL (catalog/filters.ts), not here. Nothing refetches by itself: a filter
-// change or the Refresh button does (no polling, no events in phase 1).
+// change, the Refresh button or a live event does (catalog/useCatalogLiveRefresh.ts; no polling).
 import { ref } from 'vue'
 import { defineStore } from 'pinia'
 
@@ -37,6 +37,10 @@ export const useDatasetCatalogStore = defineStore('datasetCatalog', () => {
   const tilesError = ref<CatalogError | null>(null)
   /** Bumped by refresh(): the grid makes a new datasource (cursors reset) when it changes. */
   const refreshKey = ref(0)
+  /** Bumped by reloadLive(): the grid reloads the rows it holds in place (scroll and rows stay). */
+  const liveKey = ref(0)
+  /** Bumped when a page arrives, so a reload that changed no status still ticks "Updated". */
+  const pageTick = ref(0)
 
   const listStatus = ref<CatalogLoadStatus>('loading')
   const listError = ref<CatalogError | null>(null)
@@ -97,6 +101,7 @@ export const useDatasetCatalogStore = defineStore('datasetCatalog', () => {
   function listPage(info: { loadedRows: number; done: boolean }): void {
     loadedRows.value = info.loadedRows
     listDone.value = info.done
+    pageTick.value += 1
     listStatus.value = info.loadedRows === 0 ? 'empty' : 'ready'
     listError.value = null
   }
@@ -132,12 +137,23 @@ export const useDatasetCatalogStore = defineStore('datasetCatalog', () => {
     loadCounts(filters)
   }
 
+  /**
+   * A live event or a reconnect: refetch the counts and have the grid reload the rows it holds, in
+   * place. Unlike refresh() it does not start the list over or show the loading panel.
+   */
+  function reloadLive(filters: CatalogFilters): void {
+    liveKey.value += 1
+    loadCounts(filters)
+  }
+
   return {
     facets,
     facetsError,
     tiles,
     tilesError,
     refreshKey,
+    liveKey,
+    pageTick,
     listStatus,
     listError,
     loadedRows,
@@ -150,5 +166,6 @@ export const useDatasetCatalogStore = defineStore('datasetCatalog', () => {
     listPage,
     listFailed,
     refresh,
+    reloadLive,
   }
 })

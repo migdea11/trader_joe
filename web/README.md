@@ -118,7 +118,7 @@ reconnects the same way.
 
 | Screen | Route | Holds |
 |---|---|---|
-| Datasets | `/data/datasets` | the catalog grid. The **Collection** column reads Running while the dataset's latest run is in flight and its freshness word otherwise; the **Coverage** column is a strip fetched lazily for the rows in view. The sidebar's Collection group has Running as its own toggle (`?running=true`), combinable with one freshness choice. A row opens the detail |
+| Datasets | `/data/datasets` | the catalog grid. The **Status** column reads Running while the dataset's latest run is in flight and its freshness word otherwise; the **Coverage** column is a strip fetched lazily for the rows in view. The sidebar's Status group has Running as its own toggle (`?running=true`), combinable with one freshness choice. A row opens the detail |
 | Dataset detail | `/data/datasets/:id` | **Overview** (owner, range, bars, last bar, a link to the Viewer), **Coverage** (the strip and its gap list), **History** (the dataset's runs, newest first, Load More by cursor) and **Retention**, which is read-only: the expiry type and time, with no control |
 | Viewer | `/data/datasets/:id/viewer` | candles, volume and a paged bar table |
 

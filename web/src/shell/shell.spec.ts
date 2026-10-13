@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
 import type { VueWrapper } from '@vue/test-utils'
@@ -43,6 +45,10 @@ const mocks = vi.hoisted(() => ({
   getDatasetFacets: vi.fn(),
   listDatasets: vi.fn(),
 }))
+// The shell opens the shared events socket on mount (tj-grna9p.76): replaced so no real WebSocket opens.
+vi.mock('@/api/events', async (importOriginal) =>
+  (await import('@/__tests__/fakeEvents')).fakeEventsModule(await importOriginal<object>()),
+)
 vi.mock('@/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/api')>()),
   ...mocks,
@@ -515,6 +521,73 @@ describe('browser tab title (tj-sww0b1 item 2)', () => {
     const { readFileSync } = await import('node:fs')
     const html = readFileSync(`${import.meta.dirname}/../../index.html`, 'utf8')
     expect(/<title>([^<]*)<\/title>/.exec(html)?.[1]).toBe('TraderJoe')
+  })
+})
+
+// tj-grna9p.110 (owner ruling 2026-10-11, direction 2026-10-12): the top bar shows the mark, then the
+// product name TraderJoe in the logo's two colours, "Trader" in the text colour and "Joe" in the
+// accent tint. The colours are scoped CSS, which Vitest does not process, so they are read from
+// TopBar.vue on disk; the structure is read from the rendered shell.
+describe('top bar product name (tj-grna9p.110)', () => {
+  async function shellAt(): Promise<VueWrapper> {
+    await router.push('/data/datasets')
+    const shell = mountWith(AppShell)
+    await flushPromises()
+    return shell
+  }
+
+  function rule(selector: string): string {
+    const source = readFileSync(`${import.meta.dirname}/TopBar.vue`, 'utf8')
+    const match = new RegExp(`\\n${selector.replace(/\./g, '\\.')}\\s*\\{([^}]*)\\}`).exec(source)
+    expect(match, `${selector} rule`).not.toBeNull()
+    return match![1]!
+  }
+
+  it('reads exactly TraderJoe, as two adjacent spans Trader and Joe with nothing between them', async () => {
+    const shell = await shellAt()
+    const name = shell.find('.top-bar__name')
+    expect(name.element.textContent).toBe('TraderJoe')
+    const nodes = [...name.element.childNodes]
+    // No whitespace (or any other) text node between or around the two spans.
+    expect(nodes.map((n) => n.nodeType)).toEqual([Node.ELEMENT_NODE, Node.ELEMENT_NODE])
+    const [trader, joe] = nodes as HTMLElement[]
+    expect(trader!.tagName).toBe('SPAN')
+    expect(joe!.tagName).toBe('SPAN')
+    expect(trader!.textContent).toBe('Trader')
+    expect(joe!.textContent).toBe('Joe')
+    expect(trader!.classList.contains('top-bar__name-trader')).toBe(true)
+    expect(joe!.classList.contains('top-bar__name-joe')).toBe(true)
+    // Nothing hides the name from assistive technology: it is the visible accessible name.
+    expect(name.attributes('aria-hidden')).toBeUndefined()
+    expect(name.attributes('aria-label')).toBeUndefined()
+  })
+
+  it('Trader is in the text colour and Joe in the accent tint, the logo\'s two colours', () => {
+    expect(rule('.top-bar__name-trader')).toMatch(/(^|[;\s])color:\s*var\(--tj-text\)\s*;/)
+    expect(rule('.top-bar__name-joe')).toMatch(/(^|[;\s])color:\s*var\(--tj-accent-tint\)\s*;/)
+  })
+
+  it('the mark comes first, then the name, in the brand block', async () => {
+    const shell = await shellAt()
+    const brand = shell.find('.top-bar__brand')
+    const children = [...brand.element.children]
+    expect(children.map((c) => c.getAttribute('class'))).toEqual([
+      expect.stringContaining('brand-mark'),
+      'top-bar__name',
+    ])
+    expect(children[0]!.tagName.toLowerCase()).toBe('svg')
+  })
+
+  it('no trader_joe anywhere the user can see or hear: the rendered shell, its About modal, the tab title', async () => {
+    const shell = await shellAt()
+    expect(shell.html()).not.toContain('trader_joe')
+    expect(shell.text()).toContain('TraderJoe')
+    useShellModals().openAbout()
+    await flushPromises()
+    // The About and Credits modal is open (its TradingView notice is there), and it is clean too.
+    expect(document.body.textContent).toContain('TradingView')
+    expect(document.body.innerHTML).not.toContain('trader_joe')
+    expect(document.title).not.toContain('trader_joe')
   })
 })
 

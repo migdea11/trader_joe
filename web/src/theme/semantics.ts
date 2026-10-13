@@ -109,6 +109,24 @@ export function requestBadge(state: string): BadgeSpec {
     : { label: state, color: colors.status.fail }
 }
 
+// --- Events connection (api/events.ts EventsConnectionState) -----------------------------------
+
+// The shell indicator's words. "Live" is avoided on purpose: it is a trading group and owns its
+// colour. A dropped socket reads Reconnecting (the client retries on its own, so it is never
+// a dead end); the data on screen is a refetch away either way.
+export const EVENTS_CONNECTION_BADGES = {
+  connecting: { label: 'Connecting', color: colors.status.info },
+  open: { label: 'Connected', color: colors.status.ok },
+  reconnecting: { label: 'Reconnecting', color: colors.status.warn },
+} as const satisfies Record<string, BadgeSpec>
+
+// What the indicator's tooltip says, as a sentence.
+export const EVENTS_CONNECTION_HINTS: Readonly<Record<keyof typeof EVENTS_CONNECTION_BADGES, string>> = {
+  connecting: 'Opening the live updates connection',
+  open: 'Receiving live updates',
+  reconnecting: 'Live updates dropped; retrying. Screens reload when it returns',
+}
+
 // --- Trading groups (AccountGroup) -------------------------------------------------------------
 
 export const ACCOUNT_GROUP_VALUES = [

@@ -51,3 +51,7 @@ export function isTitleCase(text: string): boolean {
 // The Data section's tab names, which are also the exact page titles.
 export const DATA_TABS = ['Datasets', 'Requests', 'Health', 'Usage'] as const
 export type DataTab = (typeof DATA_TABS)[number]
+
+// The unit the coverage text counts in: "248/250 sessions". A session is one trading day of the
+// dataset's calendar, the unit completeness is counted in. One constant so the word can change.
+export const COVERAGE_UNIT = 'sessions'

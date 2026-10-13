@@ -10,6 +10,7 @@ import BrandMark from '@/components/brand/BrandMark.vue'
 import { useFormatters } from '@/format/useFormatters'
 import { useSettingsStore } from '@/stores/settings'
 import { useUiConfigStore } from '@/stores/uiConfig'
+import EventsIndicator from './EventsIndicator.vue'
 import { NOT_BUILT_TOOLTIP, SECTIONS } from './navigation'
 import TradingGroupToggle from './TradingGroupToggle.vue'
 import { useShellModals } from './useShellModals'
@@ -38,7 +39,8 @@ function isActive(to: string): boolean {
   <header class="top-bar">
     <div class="top-bar__brand">
       <BrandMark />
-      <span class="top-bar__name">trader_joe</span>
+      <!-- The name in the logo's two colours: no space between the spans, so the text reads TraderJoe. -->
+      <span class="top-bar__name"><span class="top-bar__name-trader">Trader</span><span class="top-bar__name-joe">Joe</span></span>
     </div>
 
     <nav
@@ -81,6 +83,7 @@ function isActive(to: string): boolean {
     </nav>
 
     <div class="top-bar__right">
+      <EventsIndicator />
       <Select
         :model-value="timeZone"
         :options="zoneOptions"
@@ -130,8 +133,18 @@ function isActive(to: string): boolean {
   gap: 10px;
 }
 
+/* The logo's two colours: the mark's TJ glyph is the text colour, its brackets the accent tint.
+   accentTint on the ground measures 6.7:1 (6.2:1 on the surface), over the 4.5:1 text minimum. */
 .top-bar__name {
   font-weight: 600;
+}
+
+.top-bar__name-trader {
+  color: var(--tj-text);
+}
+
+.top-bar__name-joe {
+  color: var(--tj-accent-tint);
 }
 
 .top-bar__sections {
