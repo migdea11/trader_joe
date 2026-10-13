@@ -1,4 +1,4 @@
-"""The /ui/v1 read routes of the Data section: dataset catalog, facets, detail and bar pages (tj-grna9p.20).
+"""The /ui/v1 read routes of the Data section: dataset catalog, facets, detail, bar pages, runs and coverage.
 
 SERVED AS PROTOBUF CANONICAL JSON (ADR tj-grna9p.4): each handler returns ProtoJSONResponse(message) and each
 route declares its message with proto_route, so OpenAPI records only the message's name under x-proto-message
@@ -31,8 +31,10 @@ from data.store.app.database.database import async_db
 from data.store.app.dataset_catalog import (
     DEFAULT_BAR_LIMIT,
     DEFAULT_PAGE_LIMIT,
+    DEFAULT_RUN_LIMIT,
     MAX_BAR_LIMIT,
     MAX_PAGE_LIMIT,
+    MAX_RUN_LIMIT,
     CatalogQuery,
     DatasetSort,
     StatusGroup,
@@ -40,6 +42,7 @@ from data.store.app.dataset_catalog import (
     dataset_detail,
     facets,
     list_page,
+    run_page,
 )
 from routers.common.proto_json import ProtoJSONResponse, proto_route
 from routers.data_store.app_endpoints import UiDatasetsInterface
@@ -48,10 +51,12 @@ from routers.data_store.ui_mapping import (
     DatasetFacetsMessage,
     DatasetPageMessage,
     DatasetSummaryMessage,
+    IngestRunPageMessage,
     bar_page_message,
     dataset_page_message,
     dataset_summary_message,
     facets_message,
+    ingest_run_page_message,
 )
 from schemas.inbound_contract import InboundContract
 
@@ -96,6 +101,7 @@ class UiDatasetFiltersQuery(InboundContract):
         update_type: Keep datasets of this update type.
         status: Keep datasets whose freshness is in this UI group: healthy, late, failed or retired.
         needs_attention: Keep only late and failed datasets.
+        running: Keep only datasets with a run in flight. Orthogonal to status.
     """
 
     asset_symbol: Annotated[str | None, Field(min_length=1, max_length=32)] = None
@@ -103,6 +109,7 @@ class UiDatasetFiltersQuery(InboundContract):
     update_type: Annotated[UpdateType | None, *_member_by_name(UpdateType, 'UPDATE_TYPE_')] = None
     status: Annotated[StatusGroup | None, BeforeValidator(_lowered)] = None
     needs_attention: bool = False
+    running: bool = False
 
 
 class UiDatasetsQuery(UiDatasetFiltersQuery):
@@ -117,6 +124,18 @@ class UiDatasetsQuery(UiDatasetFiltersQuery):
     sort: DatasetSort = DatasetSort.SYMBOL
     cursor: Annotated[str | None, Field(min_length=1, max_length=512)] = None
     limit: Annotated[int, Field(ge=1, le=MAX_PAGE_LIMIT)] = DEFAULT_PAGE_LIMIT
+
+
+class UiRunsQuery(InboundContract):
+    """The runs list's query: a page.
+
+    Attributes:
+        cursor: The next_cursor of the previous page. Opaque.
+        limit: The page size.
+    """
+
+    cursor: Annotated[str | None, Field(min_length=1, max_length=512)] = None
+    limit: Annotated[int, Field(ge=1, le=MAX_RUN_LIMIT)] = DEFAULT_RUN_LIMIT
 
 
 class UiBarsQuery(InboundContract):
@@ -167,6 +186,7 @@ async def list_datasets(
         catalog_filter=_catalog_filter(request_query),
         status=request_query.status,
         needs_attention=request_query.needs_attention,
+        running=request_query.running,
         sort=request_query.sort,
         cursor=request_query.cursor,
         limit=request_query.limit,
@@ -197,6 +217,7 @@ async def get_dataset_facets(
         catalog_filter=_catalog_filter(request_query),
         status=request_query.status,
         needs_attention=request_query.needs_attention,
+        running=request_query.running,
     )
     return ProtoJSONResponse(facets_message(await facets(db, query, now)))
 
@@ -260,3 +281,32 @@ async def get_dataset_bars(
     if page is None:
         raise _not_found(dataset_id)
     return ProtoJSONResponse(bar_page_message(page))
+
+
+@router.get(UiDatasetsInterface.GET_UI_DATASET_RUNS, **proto_route(IngestRunPageMessage))
+async def get_dataset_runs(
+    db: Annotated[AsyncSession, Depends(async_db)],
+    dataset_id: Annotated[UUID, Path()],
+    request_query: Annotated[UiRunsQuery, Query()],
+) -> ProtoJSONResponse:
+    """One page of a dataset's collection runs, newest first, as an IngestRunPage.
+
+    Keyset on (started_at, id) with an opaque cursor, so a run inserted while a client pages never shifts a page
+    it has not read. The limit defaults to 50 and is at most 500. The runs of a deleted dataset are not reached
+    here: the dataset is unknown, which is a 404.
+
+    Args:
+        db: The request's session.
+        dataset_id: The dataset's id.
+        request_query: The cursor and page size.
+
+    Returns:
+        ProtoJSONResponse: An IngestRunPage.
+
+    Raises:
+        InvalidRequestError: NOT_FOUND (404) for an unknown dataset; INVALID_REQUEST (422) for a bad cursor.
+    """
+    page = await run_page(db, dataset_id, cursor=request_query.cursor, limit=request_query.limit)
+    if page is None:
+        raise _not_found(dataset_id)
+    return ProtoJSONResponse(ingest_run_page_message(page))

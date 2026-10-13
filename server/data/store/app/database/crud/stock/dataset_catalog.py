@@ -185,6 +185,19 @@ async def get_catalog_row(db: AsyncSession, dataset_id: uuid.UUID) -> CatalogRow
     return None if found is None else _row(found[0], found[1])
 
 
+async def dataset_exists(db: AsyncSession, dataset_id: uuid.UUID) -> bool:
+    """Whether an entry with this id exists, without reading its bars.
+
+    Args:
+        db: The request's session.
+        dataset_id: The entry's id.
+
+    Returns:
+        bool: True when the entry exists.
+    """
+    return (await db.execute(select(Entry.id).where(Entry.id == dataset_id))).first() is not None
+
+
 async def bar_extents(db: AsyncSession, rows: list[CatalogRow]) -> dict[uuid.UUID, BarExtent]:
     """First bar, last bar and count for each of these entries, in one statement.
 

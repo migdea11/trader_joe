@@ -53,9 +53,11 @@ from data.store.app.database.crud.stock import store_dataset_entry as crud
 from data.store.app.database.database import async_db
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
+from data.store.app.events import DatasetChange, DatasetChanged
 from data.store.app.main import app
 from data.store.tests.problem_body import problem
 from routers.common.instance_secret import INSTANCE_SECRET_ENV_VAR, INSTANCE_SECRET_HEADER
+from routers.data_store import asset_dataset_store
 
 
 pytestmark = pytest.mark.data_store
@@ -404,3 +406,47 @@ def test_the_owner_column_refuses_null_and_says_what_depends_on_it():
         'store_dataset_entry.owner lost its server default, so the column can no longer be added '
         'NOT NULL in one step and pre-owner rows would need a separate backfill to stay non-NULL'
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# DatasetChanged(DELETED) after the commit (tj-grna9p.73 item 4)
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def published(monkeypatch: pytest.MonkeyPatch) -> list:
+    """Every event the DELETE route publishes, with the commit count at the moment of each publish."""
+    seen: list = []
+    monkeypatch.setattr(asset_dataset_store, 'publish', seen.append)
+    return seen
+
+
+def test_a_delete_publishes_dataset_deleted_after_its_commit(delete_entry, published, monkeypatch):
+    entry_id = uuid.uuid4()
+    session = FakeSession(FakeResult(stored_entry(entry_id)), FakeResult(rowcount=1))
+    commits_at_publish: list[int] = []
+    monkeypatch.setattr(
+        asset_dataset_store,
+        'publish',
+        lambda event: (published.append(event), commits_at_publish.append(session.commits)),
+    )
+
+    assert delete_entry(session, entry_id, OWNER).status_code == 200
+
+    assert published == [DatasetChanged(entry_id, DatasetChange.DELETED)]
+    assert commits_at_publish == [1], 'the event was published before the delete committed'
+
+
+@pytest.mark.parametrize(
+    ('results', 'owner'),
+    [
+        (lambda entry_id: [FakeResult(stored_entry(entry_id))], 'someone-else'),
+        (lambda entry_id: [FakeResult(None)], OWNER),
+    ],
+    ids=['403 wrong owner', '404 unknown id'],
+)
+def test_a_refused_delete_publishes_nothing(delete_entry, published, results, owner):
+    entry_id = uuid.uuid4()
+    response = delete_entry(FakeSession(*results(entry_id)), entry_id, owner)
+    assert response.status_code in (403, 404)
+    assert published == [], 'a delete that did not happen was announced'

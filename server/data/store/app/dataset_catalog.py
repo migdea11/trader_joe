@@ -43,6 +43,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from common.enums.data_stock import DataSource, Granularity, UpdateType
 from common.errors.vocabulary import InvalidRequestError, Reason
 from common.logging import get_logger
+from data.store.app.database.crud.ingest_run import (
+    IngestRunRecord,
+    latest_runs_for_datasets,
+    list_runs_for_dataset,
+    running_dataset_ids,
+)
 from data.store.app.database.crud.stock import dataset_catalog as repo
 from data.store.app.database.crud.stock.dataset_catalog import BarExtent, CatalogFilter, CatalogRow
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
@@ -62,6 +68,8 @@ log = get_logger(__name__)
 
 DEFAULT_PAGE_LIMIT: Final = 100
 MAX_PAGE_LIMIT: Final = 500
+DEFAULT_RUN_LIMIT: Final = 50
+MAX_RUN_LIMIT: Final = 500
 DEFAULT_BAR_LIMIT: Final = 1000
 MAX_BAR_LIMIT: Final = 10_000
 
@@ -105,6 +113,8 @@ class CatalogQuery:
         catalog_filter: The SQL-level filters (symbol prefix, source, update type).
         status: Keep datasets whose computed freshness is in this group.
         needs_attention: Keep only Late and Failed datasets.
+        running: Keep only datasets with a run in state RUNNING. Orthogonal to status: a dataset can be Running
+            and Late at once, and how the two rank in one column is the UI's choice.
         sort: The order of the list.
         cursor: The opaque cursor of the previous page, or None for the first.
         limit: The page size.
@@ -113,6 +123,7 @@ class CatalogQuery:
     catalog_filter: CatalogFilter = field(default_factory=CatalogFilter)
     status: StatusGroup | None = None
     needs_attention: bool = False
+    running: bool = False
     sort: DatasetSort = DatasetSort.SYMBOL
     cursor: str | None = None
     limit: int = DEFAULT_PAGE_LIMIT
@@ -146,6 +157,7 @@ class DatasetPage:
         siblings: The other granularities of each dataset on the page.
         next_cursor: The cursor for the next page; empty on the last.
         as_of: The instant freshness was computed at.
+        last_runs: The newest run of each dataset on the page that has one, whatever its state.
     """
 
     views: list[DatasetView]
@@ -153,6 +165,7 @@ class DatasetPage:
     siblings: dict[uuid.UUID, list[tuple[uuid.UUID, Granularity]]]
     next_cursor: str
     as_of: datetime
+    last_runs: dict[uuid.UUID, IngestRunRecord] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -165,6 +178,7 @@ class Facets:
         sources: A count for every source.
         update_types: A count for every update type.
         statuses: A count for every computed freshness status.
+        running: Datasets with a RUNNING run, under every filter except running itself.
     """
 
     all: int
@@ -172,6 +186,7 @@ class Facets:
     sources: dict[DataSource, int]
     update_types: dict[UpdateType, int]
     statuses: dict[FreshnessStatus, int]
+    running: int = 0
 
 
 @dataclass(frozen=True)
@@ -183,12 +198,27 @@ class DatasetDetail:
         extent: What is stored.
         siblings: The other granularities of the series.
         as_of: The instant freshness was computed at.
+        last_run: The dataset's newest run, whatever its state, or None when it has never run.
     """
 
     view: DatasetView
     extent: BarExtent
     siblings: list[tuple[uuid.UUID, Granularity]]
     as_of: datetime
+    last_run: IngestRunRecord | None = None
+
+
+@dataclass(frozen=True)
+class RunPageResult:
+    """One page of a dataset's runs.
+
+    Attributes:
+        runs: The runs, newest first.
+        next_cursor: The cursor for the next page; empty on the last.
+    """
+
+    runs: list[IngestRunRecord]
+    next_cursor: str
 
 
 @dataclass(frozen=True)
@@ -336,7 +366,10 @@ def _matches(
     update_type: UpdateType | None,
     status: StatusGroup | None,
     needs_attention: bool,
+    running: frozenset[uuid.UUID] | None = None,
 ) -> bool:
+    if running is not None and view.row.id not in running:
+        return False
     if source is not None and view.row.source != source:
         return False
     if update_type is not None and view.row.update_type != update_type:
@@ -365,6 +398,10 @@ async def list_page(
     """
     after = None if query.cursor is None else _key_from_cursor(query.cursor, query.sort)
     rows = sorted(await repo.list_catalog(db, query.catalog_filter), key=lambda row: _sort_key(row, query.sort))
+    if query.running:
+        # One more statement, only for a request that asks for it; rows narrow before freshness is judged.
+        in_flight = await running_dataset_ids(db)
+        rows = [row for row in rows if row.id in in_flight]
     judged_everywhere = query.status is not None or query.needs_attention
 
     views: list[DatasetView]
@@ -390,6 +427,10 @@ async def list_page(
         siblings=await repo.siblings(db, page_rows),
         next_cursor=_cursor_for(page[-1].row, query.sort) if has_more else '',
         as_of=now,
+        # ONE statement for the whole page, never one per dataset. latest_runs_for_datasets ranks each
+        # dataset's runs with a row_number() window function: DISTINCT ON is Postgres-only and would
+        # silently misbehave on the suite's sqlite.
+        last_runs=await latest_runs_for_datasets(db, [row.id for row in page_rows]),
     )
 
 
@@ -421,6 +462,7 @@ async def facets(db: AsyncSession, query: CatalogQuery, now: datetime, config: F
     flt = query.catalog_filter
     rows = await repo.list_catalog(db, CatalogFilter(asset_symbol_prefix=flt.asset_symbol_prefix))
     views = await evaluate_views(db, rows, now, config)
+    in_flight = await running_dataset_ids(db)
 
     def match(view: DatasetView, *, omit: str | None = None, attention: bool | None = None) -> bool:
         return _matches(
@@ -429,6 +471,7 @@ async def facets(db: AsyncSession, query: CatalogQuery, now: datetime, config: F
             update_type=None if omit == 'update_type' else flt.update_type,
             status=None if omit == 'status' else query.status,
             needs_attention=query.needs_attention if attention is None else attention,
+            running=in_flight if query.running and omit != 'running' else None,
         )
 
     def by(key: Callable[[DatasetView], Any], omit: str) -> dict[Any, int]:
@@ -443,6 +486,8 @@ async def facets(db: AsyncSession, query: CatalogQuery, now: datetime, config: F
         sources={member: source_counts.get(member, 0) for member in DataSource},
         update_types={member: update_counts.get(member, 0) for member in UpdateType},
         statuses={member: status_counts.get(member, 0) for member in FreshnessStatus},
+        # Under every filter but running itself, so with running=true it equals the list's total.
+        running=sum(match(view, omit='running') and view.row.id in in_flight for view in views),
     )
 
 
@@ -466,7 +511,57 @@ async def dataset_detail(
     (view,) = await evaluate_views(db, [row], now, config)
     extents = await repo.bar_extents(db, [row])
     siblings = await repo.siblings(db, [row])
-    return DatasetDetail(view=view, extent=extents[row.id], siblings=siblings[row.id], as_of=now)
+    last_run = (await latest_runs_for_datasets(db, [row.id])).get(row.id)
+    return DatasetDetail(view=view, extent=extents[row.id], siblings=siblings[row.id], as_of=now, last_run=last_run)
+
+
+def _run_cursor_key(cursor: str) -> tuple[datetime, uuid.UUID]:
+    payload = _decode_cursor(cursor)
+    key = payload.get('k')
+    if payload.get('o') != 'runs' or not isinstance(key, list) or len(key) != 2:
+        raise invalid_cursor()
+    started_at, run_id = key
+    if not isinstance(started_at, str) or not isinstance(run_id, str):
+        raise invalid_cursor()
+    try:
+        moment = datetime.fromisoformat(started_at)
+        parsed_id = uuid.UUID(run_id)
+    except ValueError:
+        raise invalid_cursor() from None
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise invalid_cursor()
+    return moment, parsed_id
+
+
+async def run_page(db: AsyncSession, dataset_id: uuid.UUID, *, cursor: str | None, limit: int) -> RunPageResult | None:
+    """One page of a dataset's runs, newest first, or None when no such dataset exists.
+
+    Keyset on (started_at DESC, id DESC): a run inserted while a client pages starts later than every cursor, so
+    it never shifts a page the client has not read yet. A deleted dataset's runs are not reachable here.
+
+    Args:
+        db: The request's session.
+        dataset_id: The dataset's id.
+        cursor: The opaque cursor of the previous page, or None for the first.
+        limit: How many runs at most.
+
+    Returns:
+        RunPageResult | None: The page, or None for an unknown dataset.
+
+    Raises:
+        InvalidRequestError: If the cursor does not decode (422).
+    """
+    after = None if cursor is None else _run_cursor_key(cursor)
+    if not await repo.dataset_exists(db, dataset_id):
+        return None
+    runs = await list_runs_for_dataset(db, dataset_id, limit=limit + 1, after=after)
+    page = runs[:limit]
+    next_cursor = (
+        _encode_cursor({'o': 'runs', 'k': [page[-1].started_at.isoformat(), str(page[-1].id)]})
+        if len(runs) > limit
+        else ''
+    )
+    return RunPageResult(runs=page, next_cursor=next_cursor)
 
 
 async def bar_page(

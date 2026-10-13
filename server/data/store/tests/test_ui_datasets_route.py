@@ -50,6 +50,7 @@ from data.store.app import dataset_catalog as dataset_catalog_module
 from data.store.app.database.crud.stock import dataset_catalog as catalog_repo
 from data.store.app.database.crud.stock.dataset_catalog import CatalogFilter
 from data.store.app.database.database import async_db
+from data.store.app.database.models.ingest_run import IngestRun, IngestRunState, IngestRunTrigger
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.dataset_catalog import evaluate_views
@@ -125,7 +126,10 @@ async def engine(aware_sqlite_datetimes) -> AsyncIterator[AsyncEngine]:
     async with engine.begin() as connection:
         await connection.run_sync(
             lambda sync: StoreDatasetEntry.metadata.create_all(
-                sync, tables=[StoreDatasetEntry.__table__, StockMarketActivity.__table__]
+                # ingest_run since tj-grna9p.72: every list, detail and facets read now joins in the latest
+                # run (last_run) and the RUNNING set (the running filter and facet).
+                sync,
+                tables=[StoreDatasetEntry.__table__, StockMarketActivity.__table__, IngestRun.__table__],
             )
         )
     try:
@@ -204,11 +208,41 @@ def bar(of: StoreDatasetEntry, at: datetime, close: float = 1.0) -> StockMarketA
     )
 
 
+def run_of(
+    of: StoreDatasetEntry | None,
+    *,
+    minutes_ago: int,
+    state: IngestRunState = IngestRunState.SUCCEEDED,
+    run_id: uuid.UUID | None = None,
+) -> IngestRun:
+    """One ingest_run row (tj-grna9p.18), started MINUTES_AGO before NOW. OF None is a run with no dataset yet."""
+    return IngestRun(
+        id=run_id or uuid.uuid4(),
+        dataset_id=None if of is None else of.id,
+        trigger=IngestRunTrigger.REQUEST,
+        actor=OWNER,
+        asset_symbol='NONE' if of is None else of.asset_symbol,
+        asset_type=AssetType.STOCK,
+        data_type=DataType.MARKET_ACTIVITY,
+        source=DataSource.ALPACA_API,
+        granularity=Granularity.ONE_DAY,
+        update_type=UpdateType.STATIC.value,
+        feed=None if of is None else of.feed,
+        requested_start=ny_midnight(1, 9),
+        state=state,
+        bars_written=0 if state is IngestRunState.RUNNING else 7,
+        started_at=NOW - timedelta(minutes=minutes_ago),
+        finished_at=None
+        if state is IngestRunState.RUNNING
+        else NOW - timedelta(minutes=minutes_ago) + timedelta(seconds=3),
+    )
+
+
 async def store(engine: AsyncEngine, *rows: Any) -> None:
     async with AsyncSession(engine, expire_on_commit=False) as db:
         db.add_all([row for row in rows if isinstance(row, StoreDatasetEntry)])
         await db.flush()
-        db.add_all([row for row in rows if isinstance(row, StockMarketActivity)])
+        db.add_all([row for row in rows if isinstance(row, StockMarketActivity | IngestRun)])
         await db.commit()
 
 
@@ -765,7 +799,14 @@ async def test_an_over_long_cursor_is_refused_without_echoing_it(client, catalog
 
 @pytest.mark.asyncio
 async def test_a_request_runs_a_constant_number_of_statements_not_one_per_dataset(client, catalog, engine):
-    """tj-grna9p.8 item 2: one statement for the entries, then one each for extents, covered dates and siblings."""
+    """tj-grna9p.8 item 2: one statement for the entries, then one each for extents, covered dates and siblings.
+
+    tj-grna9p.72 adds exactly ONE statement to the list and the detail -- the latest run per dataset for the
+    whole page, a window function, never one per dataset -- and the RUNNING set to the facets and to the
+    running filter. So the budget is pinned per route, exactly, rather than as one ceiling: list and detail 5
+    (was 4), facets 3, and the large set below gives MANY datasets runs, so a per-dataset last_run read would
+    show as growth.
+    """
     statements: list[str] = []
     event.listen(engine.sync_engine, 'before_cursor_execute', lambda *args: statements.append(args[2]))
 
@@ -774,21 +815,33 @@ async def test_a_request_runs_a_constant_number_of_statements_not_one_per_datase
         assert (await client.get(path, params=params)).status_code == 200
         return len(statements)
 
-    small = {
-        'list': await count('/ui/v1/datasets', limit=500),
-        'list filtered by status': await count('/ui/v1/datasets', limit=500, status='healthy'),
-        'facets': await count('/ui/v1/datasets/facets'),
-        'detail': await count(f'/ui/v1/datasets/{catalog.ddd.id}'),
-    }
-    await store(engine, *(entry(f'X{index:03d}', **WEEKEND) for index in range(40)))
-    large = {
-        'list': await count('/ui/v1/datasets', limit=500),
-        'list filtered by status': await count('/ui/v1/datasets', limit=500, status='healthy'),
-        'facets': await count('/ui/v1/datasets/facets'),
-        'detail': await count(f'/ui/v1/datasets/{catalog.ddd.id}'),
-    }
+    async def counts() -> dict[str, int]:
+        return {
+            'list': await count('/ui/v1/datasets', limit=500),
+            'list filtered by status': await count('/ui/v1/datasets', limit=500, status='healthy'),
+            'list filtered by running': await count('/ui/v1/datasets', limit=500, running='true'),
+            'facets': await count('/ui/v1/datasets/facets'),
+            'detail': await count(f'/ui/v1/datasets/{catalog.ddd.id}'),
+        }
+
+    # One running dataset in the small set too, so the running-filtered page is not empty: an empty page skips
+    # the per-page statements, which would read as growth when it is only a smaller answer.
+    await store(engine, run_of(catalog.ddd, minutes_ago=1, state=IngestRunState.RUNNING))
+    small = await counts()
+    many = [entry(f'X{index:03d}', **WEEKEND) for index in range(40)]
+    await store(engine, *many)
+    await store(engine, *(run_of(of, minutes_ago=index) for index, of in enumerate(many)))
+    await store(engine, *(run_of(of, minutes_ago=0, state=IngestRunState.RUNNING) for of in many[:10]))
+    large = await counts()
     assert small == large, f'the statement count grew with the number of datasets: {small} -> {large}'
-    assert max(large.values()) <= 4, large
+    # The running filter reads the RUNNING set once more, and only when asked for.
+    assert large == {
+        'list': 5,
+        'list filtered by status': 5,
+        'list filtered by running': 6,
+        'facets': 3,
+        'detail': 5,
+    }, large
 
 
 @pytest.mark.asyncio
@@ -987,3 +1040,274 @@ async def test_no_status_filter_matches_a_pre_1990_dataset(client, catalog, earl
     listed = {item['id'] for item in await list_all(client, **params)}
     assert listed, 'each group holds a judged dataset, so an empty answer proves nothing'
     assert not listed & catalog.ids(*early.unjudged), params
+
+
+# ------------------------------------------------------------------------------------------------- runs (tj-grna9p.72)
+#
+# The design is tj-grna9p.72's architect re-baseline of 2026-10-11: GET /ui/v1/datasets/{id}/runs is an IngestRunPage
+# keyset on (started_at DESC, id DESC) with an opaque cursor, limit 50 by default and at most 500, a 404 NOT_FOUND for
+# an unknown dataset and a 422 for a bad cursor; DatasetSummary.last_run is the newest run on list and detail, read for
+# the whole page in ONE statement; running=true lists exactly the datasets with a RUNNING run, orthogonal to status,
+# and DatasetFacets.running counts them under every OTHER filter. The ingest_run rows are written directly, so these
+# tests read the routes and nothing about the recorder (test_run_recording.py).
+
+
+async def all_runs(client: httpx.AsyncClient, dataset_id: uuid.UUID, *, limit: int) -> list[dict]:
+    """Every run of a dataset, following next_cursor. Asserts no page repeats a run."""
+    items: list[dict] = []
+    cursor = None
+    for _ in range(100):
+        params = {'limit': limit, **({'cursor': cursor} if cursor else {})}
+        response = await client.get(f'/ui/v1/datasets/{dataset_id}/runs', params=params)
+        assert response.status_code == 200, response.text
+        body = response.json()
+        items.extend(body.get('items', []))
+        cursor = body.get('nextCursor')
+        if not cursor:
+            break
+    ids = [item['id'] for item in items]
+    assert len(ids) == len(set(ids)), f'a run was served twice: {ids}'
+    return items
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('limit', [1, 2, 3, 7, 500])
+async def test_runs_page_newest_first_with_equal_start_times_broken_by_id(client, catalog, engine, limit):
+    tied = sorted((uuid.uuid4() for _ in range(3)), reverse=True)
+    runs = [
+        run_of(catalog.aaa_day, minutes_ago=30),
+        *(run_of(catalog.aaa_day, minutes_ago=10, run_id=run_id) for run_id in tied),
+        run_of(catalog.aaa_day, minutes_ago=5, state=IngestRunState.FAILED),
+        run_of(catalog.aaa_day, minutes_ago=1, state=IngestRunState.RUNNING),
+        # Another dataset's run and an unacknowledged run never appear on this dataset's page.
+        run_of(catalog.bbb, minutes_ago=2),
+        run_of(None, minutes_ago=3),
+    ]
+    await store(engine, *runs)
+
+    items = await all_runs(client, catalog.aaa_day.id, limit=limit)
+
+    expected = [runs[5], runs[4], *runs[1:4], runs[0]]
+    assert [item['id'] for item in items] == [str(run.id) for run in expected]
+
+
+@pytest.mark.asyncio
+async def test_a_run_inserted_while_paging_does_not_shift_the_pages_not_yet_read(client, catalog, engine):
+    """A NEWER run lands before the cursor and is not served; an OLDER one behind it is, in its place."""
+    runs = [run_of(catalog.aaa_day, minutes_ago=minutes) for minutes in (10, 20, 30, 40)]
+    await store(engine, *runs)
+    path = f'/ui/v1/datasets/{catalog.aaa_day.id}/runs'
+    first = (await client.get(path, params={'limit': 2})).json()
+    assert [item['id'] for item in first['items']] == [str(runs[0].id), str(runs[1].id)]
+
+    newer, older = run_of(catalog.aaa_day, minutes_ago=0), run_of(catalog.aaa_day, minutes_ago=35)
+    await store(engine, newer, older)
+    rest = (await client.get(path, params={'limit': 5, 'cursor': first['nextCursor']})).json()
+
+    assert [item['id'] for item in rest['items']] == [str(runs[2].id), str(older.id), str(runs[3].id)]
+    assert 'nextCursor' not in rest
+
+
+@pytest.mark.asyncio
+async def test_a_run_renders_as_the_ingest_run_message(client, catalog, engine):
+    """Every column the UI reads, by its wire name, and the error only on a FAILED run."""
+    failed = run_of(catalog.ddd, minutes_ago=5, state=IngestRunState.FAILED)
+    failed.error_domain, failed.error_reason, failed.error_message = 'trader-joe', 'PEER_UNAVAILABLE', 'ingest is down'
+    failed.requested_end = ny_midnight(6)
+    # A failed fetch writes nothing (its transaction rolls back), and zero is omitted in canonical JSON.
+    failed.bars_written = 0
+    await store(engine, failed, run_of(catalog.ddd, minutes_ago=50))
+
+    items = (await client.get(f'/ui/v1/datasets/{catalog.ddd.id}/runs')).json()['items']
+
+    assert items[0] == {
+        'id': str(failed.id),
+        'datasetId': str(catalog.ddd.id),
+        'label': 'DDD 1day',
+        'trigger': 'RUN_TRIGGER_REQUEST',
+        'actor': OWNER,
+        'start': '2026-09-01T04:00:00Z',
+        'end': '2026-10-06T04:00:00Z',
+        'state': 'INGEST_RUN_STATE_FAILED',
+        'error': {'domain': 'trader-joe', 'reason': 'PEER_UNAVAILABLE', 'message': 'ingest is down'},
+        'startedAt': '2026-10-06T21:55:00Z',
+        'finishedAt': '2026-10-06T21:55:03Z',
+    }
+    assert items[1]['state'] == 'INGEST_RUN_STATE_SUCCEEDED' and 'error' not in items[1]
+    assert items[1]['barsWritten'] == '7'
+
+
+@pytest.mark.asyncio
+async def test_runs_of_an_unknown_dataset_is_a_404(client, catalog, engine):
+    """A dataset that does not exist -- including one whose runs survive its deletion -- is NOT_FOUND here."""
+    orphan = run_of(catalog.aaa_day, minutes_ago=5)
+    orphan.dataset_id = uuid.uuid4()
+    await store(engine, orphan)
+    for dataset_id in (uuid.uuid4(), orphan.dataset_id):
+        problem(await client.get(f'/ui/v1/datasets/{dataset_id}/runs'), status=404, reason='NOT_FOUND')
+
+
+@pytest.mark.asyncio
+async def test_a_dataset_with_no_runs_answers_an_empty_last_page(client, catalog):
+    assert (await client.get(f'/ui/v1/datasets/{catalog.abx.id}/runs')).json() == {}
+
+
+BAD_RUN_CURSORS = {
+    'not base64': '%%%',
+    'a list cursor': encode({'o': 'symbol', 'k': ['AAA', str(uuid.uuid4())]}),
+    'the wrong order tag': encode({'o': 'symbol', 'k': ['2026-10-06T21:00:00+00:00', str(uuid.uuid4())]}),
+    'a naive start': encode({'o': 'runs', 'k': ['2026-10-06T21:00:00', str(uuid.uuid4())]}),
+    'a key that is no uuid': encode({'o': 'runs', 'k': ['2026-10-06T21:00:00+00:00', 'not-a-uuid']}),
+    'a key one part short': encode({'o': 'runs', 'k': ['2026-10-06T21:00:00+00:00']}),
+    'not a timestamp': encode({'o': 'runs', 'k': ['yesterday', str(uuid.uuid4())]}),
+    'numbers': encode({'o': 'runs', 'k': [5, 6]}),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('cursor', BAD_RUN_CURSORS.values(), ids=BAD_RUN_CURSORS)
+async def test_a_bad_runs_cursor_is_a_422_that_never_echoes_it(client, catalog, engine, cursor):
+    await store(engine, run_of(catalog.aaa_day, minutes_ago=5))
+    response = await client.get(f'/ui/v1/datasets/{catalog.aaa_day.id}/runs', params={'cursor': cursor})
+    problem(response, status=422, reason='INVALID_REQUEST')
+    assert cursor not in response.text
+
+
+@pytest.mark.asyncio
+async def test_runs_and_list_cursors_are_not_interchangeable(client, catalog, engine):
+    await store(engine, *(run_of(catalog.aaa_day, minutes_ago=minutes) for minutes in (1, 2, 3)))
+    path = f'/ui/v1/datasets/{catalog.aaa_day.id}/runs'
+    runs_cursor = (await client.get(path, params={'limit': 1})).json()['nextCursor']
+    list_cursor = (await client.get('/ui/v1/datasets', params={'limit': 1})).json()['nextCursor']
+    problem(await client.get('/ui/v1/datasets', params={'cursor': runs_cursor}), status=422, reason='INVALID_REQUEST')
+    problem(await client.get(path, params={'cursor': list_cursor}), status=422, reason='INVALID_REQUEST')
+
+
+@pytest.mark.asyncio
+async def test_the_runs_limit_defaults_to_50_and_is_bounded_1_to_500(client, catalog, engine):
+    await store(engine, *(run_of(catalog.aaa_day, minutes_ago=minutes) for minutes in range(51)))
+    path = f'/ui/v1/datasets/{catalog.aaa_day.id}/runs'
+    page = (await client.get(path)).json()
+    assert len(page['items']) == 50 and page['nextCursor']
+    assert len((await client.get(path, params={'limit': 500})).json()['items']) == 51
+    for limit in (0, 501):
+        errors = validation_errors(await client.get(path, params={'limit': limit}))
+        assert [error['loc'] for error in errors] == [['query', 'limit']], errors
+
+
+# ------------------------------------------------------------------------------------------------- last_run
+
+
+@pytest.mark.asyncio
+async def test_last_run_is_the_newest_run_on_list_and_detail_and_absent_without_one(client, catalog, engine):
+    older = run_of(catalog.aaa_day, minutes_ago=30)
+    newest = run_of(catalog.aaa_day, minutes_ago=2, state=IngestRunState.RUNNING)
+    bbb_only = run_of(catalog.bbb, minutes_ago=60, state=IngestRunState.FAILED)
+    await store(engine, older, newest, bbb_only, run_of(None, minutes_ago=0))
+
+    listed = {item['id']: item for item in await list_all(client)}
+    detail = (await client.get(f'/ui/v1/datasets/{catalog.aaa_day.id}')).json()
+
+    assert listed[str(catalog.aaa_day.id)]['lastRun']['id'] == str(newest.id)
+    assert detail['lastRun'] == listed[str(catalog.aaa_day.id)]['lastRun']
+    assert detail['lastRun']['state'] == 'INGEST_RUN_STATE_RUNNING' and 'finishedAt' not in detail['lastRun']
+    assert listed[str(catalog.bbb.id)]['lastRun']['id'] == str(bbb_only.id)
+    without = [item for item in listed.values() if item['id'] not in catalog.ids(catalog.aaa_day, catalog.bbb)]
+    assert without and not [item['id'] for item in without if 'lastRun' in item]
+    assert 'lastRun' not in (await client.get(f'/ui/v1/datasets/{catalog.ddd.id}')).json()
+
+
+@pytest.mark.asyncio
+async def test_last_run_breaks_an_equal_start_time_by_the_higher_id(client, catalog, engine):
+    low, high = sorted((uuid.uuid4(), uuid.uuid4()))
+    await store(engine, *(run_of(catalog.aaa_day, minutes_ago=4, run_id=run_id) for run_id in (low, high)))
+    detail = (await client.get(f'/ui/v1/datasets/{catalog.aaa_day.id}')).json()
+    assert detail['lastRun']['id'] == str(high), 'last_run and the runs list disagree on which run is newest'
+
+
+@pytest.mark.asyncio
+async def test_the_latest_runs_are_read_in_one_statement_for_the_whole_page(client, catalog, engine):
+    """Store CLAUDE.md: a constant statement count. The ingest_run reads on a list request, counted."""
+    await store(engine, *(run_of(row, minutes_ago=index) for index, row in enumerate(catalog.rows)))
+    statements: list[str] = []
+    event.listen(engine.sync_engine, 'before_cursor_execute', lambda *args: statements.append(args[2]))
+
+    assert (await client.get('/ui/v1/datasets', params={'limit': 500})).status_code == 200
+
+    run_reads = [statement for statement in statements if 'ingest_run' in statement]
+    assert len(run_reads) == 1, run_reads
+
+
+# ------------------------------------------------------------------------------------------------- running
+
+
+@pytest_asyncio.fixture
+async def running(engine: AsyncEngine, catalog: Catalog) -> set[str]:
+    """RUNNING runs on aaa_day (FRESH), bbb (LATE) and ccc (OVERDUE), twice on bbb; finished runs elsewhere.
+
+    A RUNNING run with no dataset yet (before its ack) names no dataset and must be counted nowhere.
+    """
+    await store(
+        engine,
+        run_of(catalog.aaa_day, minutes_ago=1, state=IngestRunState.RUNNING),
+        run_of(catalog.bbb, minutes_ago=1, state=IngestRunState.RUNNING),
+        run_of(catalog.bbb, minutes_ago=2, state=IngestRunState.RUNNING),
+        run_of(catalog.ccc, minutes_ago=1, state=IngestRunState.RUNNING),
+        run_of(catalog.ddd, minutes_ago=1, state=IngestRunState.FAILED),
+        run_of(catalog.eee, minutes_ago=1),
+        run_of(None, minutes_ago=1, state=IngestRunState.RUNNING),
+    )
+    return catalog.ids(catalog.aaa_day, catalog.bbb, catalog.ccc)
+
+
+@pytest.mark.asyncio
+async def test_running_true_lists_exactly_the_datasets_with_a_running_run(client, catalog, running):
+    assert {item['id'] for item in await list_all(client, running='true')} == running
+    assert len(await list_all(client, running='false')) == len(catalog.rows), 'false is no filter'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'params',
+    [
+        {},
+        {'status': 'healthy'},
+        {'status': 'late'},
+        {'needs_attention': 'true'},
+        {'asset_symbol': 'B'},
+        {'update_type': 'DAILY'},
+        {'status': 'failed', 'update_type': 'STREAM'},
+    ],
+    ids=['no filter', 'healthy', 'late', 'needs attention', 'symbol', 'update type', 'combined'],
+)
+async def test_the_running_facet_equals_the_running_filtered_total_under_every_other_filter(
+    client, catalog, running, params
+):
+    """The facet rule: facets.running under the OTHER filters is the total running=true returns under them."""
+    listed = await list_all(client, **params, running='true')
+    for facet_params in (params, {**params, 'running': 'true'}):
+        facets = (await client.get('/ui/v1/datasets/facets', params=facet_params)).json()
+        assert int(facets.get('running', '0')) == len(listed), (facet_params, facets, [item['id'] for item in listed])
+    assert {item['id'] for item in listed} <= running
+
+
+@pytest.mark.asyncio
+async def test_running_is_orthogonal_to_status_so_a_late_dataset_can_be_running(client, catalog, running):
+    listed = await list_all(client, running='true', status='late')
+    assert [item['id'] for item in listed] == [str(catalog.bbb.id)]
+    assert status_of(listed[0]) == 'FRESHNESS_STATUS_LATE'
+
+
+@pytest.mark.asyncio
+async def test_with_running_true_the_other_facets_count_only_running_datasets(client, catalog, running):
+    facets = (await client.get('/ui/v1/datasets/facets', params={'running': 'true'})).json()
+    assert facets['all'] == '3'
+    statuses = {facet['status']: int(facet.get('count', '0')) for facet in facets['statuses']}
+    assert statuses['FRESHNESS_STATUS_FRESH'] == 1 and statuses['FRESHNESS_STATUS_LATE'] == 1
+    assert statuses['FRESHNESS_STATUS_OVERDUE'] == 1 and statuses['FRESHNESS_STATUS_GAPS'] == 0
+
+
+@pytest.mark.asyncio
+async def test_no_running_run_means_a_zero_facet_and_an_empty_running_list(client, catalog):
+    assert 'running' not in (await client.get('/ui/v1/datasets/facets')).json()
+    assert await list_all(client, running='true') == []

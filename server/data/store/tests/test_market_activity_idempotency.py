@@ -51,7 +51,9 @@ MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / 'migrations'
 # its model.
 NATURAL_KEY_REVISION = '8f41c2d7a3b9'
 BAR_IDENTITY_REVISION = 'eec8f88a7443'
-CURRENT_HEAD = 'c4a1f7b2e905'
+# 6f5a798746a1 since tj-grna9p.18: ingest_run, a new table that touches neither the bar nor the entry,
+# so as at c4a1f7b2e905 this one line is the only edit this file needed.
+CURRENT_HEAD = '6f5a798746a1'
 
 # The natural key as 8f41c2d7a3b9 itself declares it, written out as a HISTORIC LITERAL rather
 # than read off BaseMarketActivity. A past revision's job is to describe the schema as it was;

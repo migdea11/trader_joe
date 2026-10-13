@@ -67,6 +67,7 @@ like every other case here. That is a fixture correction and changes nothing eit
 
 import uuid
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
@@ -77,10 +78,12 @@ from sqlalchemy.dialects.postgresql import Insert as PostgresInsert
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
+from common.errors.vocabulary import ExogenousError, Reason
 from data.store.app.app_depends import get_ingest_fetch_client
 from data.store.app.database.database import async_db
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
-from data.store.app.ingest import data_action_request
+from data.store.app.events import DatasetChange, DatasetChanged
+from data.store.app.ingest import data_action_request, run_recording
 from data.store.app.main import app
 from data.store.tests.fetch_double import (
     FetchScript,
@@ -91,6 +94,7 @@ from data.store.tests.fetch_double import (
 )
 from data.store.tests.problem_body import problem, validation_errors
 from routers.common.instance_secret import INSTANCE_SECRET_ENV_VAR, INSTANCE_SECRET_HEADER
+from routers.data_store import asset_dataset_store
 from schemas.data_ingest.fetch_dataset import FetchDatasetRequest
 from schemas.data_store.asset_dataset_store import AssetDatasetStoreCreate, StoreAssetDatasetBody, StoreAssetDatasetPath
 
@@ -969,3 +973,98 @@ def test_the_store_openapi_documents_the_search_filters_as_nullable_names(field:
     assert branches == [{'type': 'string', 'enum': [member.name for member in enum]}], (
         f'GET /store ?{field} documents {branches!r}, not a string enum of member names'
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# tj-grna9p.73 item 4: DatasetChanged after the commit; tj-grna9p.71: the STREAM create refusal
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def announced(monkeypatch: pytest.MonkeyPatch) -> list:
+    """The route's DatasetChanged publishes, and the recorder kept off any database.
+
+    own_session refusing is the recorder's best-effort path (test_run_recording.py pins it): the run is not
+    recorded, the fetch goes ahead, and the handle still learns the dataset id from the ack. It keeps this
+    file at the unit tier rather than letting the recorder dial the Postgres the environment names.
+    """
+
+    @asynccontextmanager
+    async def no_database():
+        raise ConnectionRefusedError('no database at the unit tier')
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(run_recording, 'own_session', no_database)
+    monkeypatch.setattr(run_recording, 'publish', lambda event: None)
+    seen: list = []
+    monkeypatch.setattr(asset_dataset_store, 'publish', seen.append)
+    return seen
+
+
+def test_a_stored_dataset_is_announced_updated_once_after_its_commit(post_dataset, announced, monkeypatch):
+    """UPDATED, not CREATED: the builder left xmax unread, so a create cannot be told from a repeat (reported).
+
+    The event names the id the ack's upsert returned, and it is published only once the fetch transaction
+    has committed -- an event for a write that then rolled back would be a lie the UI acts on.
+    """
+    new_entry_id = uuid.uuid4()
+    session = FakeSession(FakeResult(rows=[]), FakeResult(scalar=new_entry_id))
+    commits_at_publish: list[int] = []
+
+    def record(event) -> None:
+        announced.append(event)
+        commits_at_publish.append(session.commits)
+
+    monkeypatch.setattr(asset_dataset_store, 'publish', record)
+
+    response = post_dataset(session, RecordingFetchClient())
+
+    assert response.status_code == 200, response.text
+    assert announced == [DatasetChanged(new_entry_id, DatasetChange.UPDATED)]
+    assert commits_at_publish == [1], 'the dataset was announced before the fetch transaction committed'
+
+
+def test_a_refused_or_failed_store_announces_nothing(post_dataset, announced):
+    """A rolled-back write publishes nothing: an own-overlap 409, and a fetch that breaks after its ack."""
+    overlap = FakeSession(FakeResult(rows=[(uuid.uuid4(),)]))
+    assert post_dataset(overlap, RecordingFetchClient()).status_code == 409
+
+    broken = FakeSession(FakeResult(rows=[]), FakeResult(scalar=uuid.uuid4()))
+    script = FetchScript(
+        events=accepted_stream()[:-1], raises=ExogenousError(Reason.PEER_INTERNAL, 'broke after the ack')
+    )
+    response = post_dataset(broken, RecordingFetchClient(script))
+    assert response.status_code == 502, response.text
+    assert broken.rollbacks == 1 and broken.commits == 0
+
+    assert announced == [], 'a write that never committed was announced'
+
+
+@pytest.mark.parametrize('update_type', ['STREAM', 'stream'])
+def test_a_stream_create_answers_422_invalid_request_and_never_reaches_ingest(post_dataset, announced, update_type):
+    """tj-grna9p.71: refused at the edge as INVALID_REQUEST, naming STREAM, before any SQL or fetch."""
+    session = FakeSession()
+    fetch_client = RecordingFetchClient()
+    body = REQUEST_BODY | {'update_type': update_type, 'expiry_type': 'ROLLING'}
+
+    response = post_dataset(session, fetch_client, body)
+
+    problem_body = problem(response, status=422, reason='INVALID_REQUEST')
+    assert 'STREAM' in response.text, problem_body
+    assert session.statements == [] and fetch_client.requests == [] and announced == []
+
+
+@pytest.mark.parametrize('update_type', ['STATIC', 'DAILY'])
+def test_a_non_stream_create_without_the_new_fields_still_reaches_the_handler(post_dataset, announced, update_type):
+    """ready_by and best_effort are optional: a body from before them is accepted unchanged."""
+    session = FakeSession(FakeResult(rows=[]), FakeResult(scalar=uuid.uuid4()))
+    extra = {} if update_type == 'STATIC' else {'update_type': 'DAILY', 'expiry_type': 'ROLLING'}
+
+    response = post_dataset(session, RecordingFetchClient(), REQUEST_BODY | extra)
+
+    assert response.status_code == 200, response.text
+
+
+def test_a_naive_ready_by_is_a_422_naming_the_field(post_dataset, announced):
+    response = post_dataset(FakeSession(), RecordingFetchClient(), REQUEST_BODY | {'ready_by': '2026-02-01T09:30:00'})
+    assert [error['loc'] for error in validation_errors(response)] == [['body', 'ready_by']]
