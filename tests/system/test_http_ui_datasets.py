@@ -51,10 +51,12 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from common.enums.data_stock import DataSource, UpdateType
+from common.errors.vocabulary import Reason
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.freshness import calendar_for_source, local_midnight
 from routers.data_store.app_endpoints import UiDatasetsInterface
+from tests.system.problem_json import assert_problem
 
 
 pytestmark = pytest.mark.data_store
@@ -459,3 +461,38 @@ def test_coverage_of_a_known_three_session_gap_on_postgres(
     _insert_bars(pg_engine, _bars_at(entry, bar_values, [_midnight(s) for s in missing]))
     closed = _ok(data_store, _coverage_path(entry.id))
     assert 'gaps' not in closed and 'gapCount' not in closed, closed
+
+
+# Added by tj-grna9p.81 (RESCOPED item 2): the coverage read's two refusals, over real HTTP.
+BEFORE_CALENDAR = datetime(1985, 3, 4, 14, 30, tzinfo=UTC)
+
+
+def test_coverage_of_an_unknown_dataset_is_a_404_and_of_a_pre_calendar_one_a_422(
+    insert_entry: Callable[..., sa.Row], run_identity, data_store
+) -> None:
+    """404 NOT_FOUND for an id nobody holds; 422 INVALID_REQUEST for a dataset starting before CALENDAR_START (1990).
+
+    The second must not read as an empty strip or a complete one: no calendar covers 1985, so nothing can be said.
+    """
+    unknown = UUID('00000000-0000-4000-8000-0000000000a1')
+    assert_problem(
+        data_store.get(_coverage_path(unknown)),
+        status=404,
+        reason=Reason.NOT_FOUND.value,
+        title='Not Found',
+        describe=data_store.describe,
+    )
+
+    old = insert_entry(
+        asset_symbol=run_identity.alt_symbol('PRE'),
+        update_type=UpdateType.STATIC.value,
+        start=BEFORE_CALENDAR,
+        end=BEFORE_CALENDAR + timedelta(days=2),
+    )
+    assert_problem(
+        data_store.get(_coverage_path(old.id)),
+        status=422,
+        reason=Reason.INVALID_REQUEST.value,
+        title='Unprocessable Entity',
+        describe=data_store.describe,
+    )

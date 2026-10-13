@@ -12,6 +12,14 @@ Design: tj-grna9p.18's architect re-baseline of 2026-10-11 and its ACCEPTANCE fo
 
 -- and tj-grna9p.71's: a STREAM create is a 422 INVALID_REQUEST while a STORED STREAM entry still reads.
 
+ADDED BY tj-grna9p.81 (phase 2 system check, RESCOPED note of 2026-10-12, item 1), at the end of this module:
+last_run on the list and the detail after a real POST, and the running filter, DatasetFacets.running and
+last_run's newest-wins rule over run rows seeded by SQL. Seeded, not driven by a SLOW_ POST, because a SLOW_ run
+is never "running" in the catalog's sense: FakeRead sleeps inside get_bars, which ingest awaits BEFORE the ack, and
+running_dataset_ids counts only acknowledged runs (dataset_id set). The property under test there is the read
+over Postgres (the partial index on RUNNING rows, the window function behind last_run), which a seeded row
+exercises exactly.
+
 WHAT ONLY THIS TIER SHOWS. The recorder writes on its OWN session while the fetch holds its transaction open:
 SQLite has one writer, so the unit tier (data/store/tests/test_run_recording.py) cannot hold the two side by
 side. Here the fetch transaction is a real Postgres one that commits at FetchDone or rolls back, and the run row
@@ -218,7 +226,10 @@ def test_a_stream_create_is_refused_and_a_stored_stream_entry_still_reads(
 
     # As a STREAM entry created before the refusal existed would be stored: open-ended, a non-BULK expiry type.
     stored = insert_entry(
-        asset_symbol=run_identity.alt_symbol('STRM'),
+        # NOT 'STRM': test_http_ui_datasets.py scopes its STATIC listing to the prefix alt_symbol('ST'), and an
+        # entry whose symbol starts with it is judged in that listing too (it went red in a full-suite run,
+        # tj-grna9p.81). 'X' is not a hex digit, so no own_symbol digest can start with it either.
+        asset_symbol=run_identity.alt_symbol('XSTRM'),
         update_type=UpdateType.STREAM.value,
         expiry_type=ExpiryType.ROLLING.value,
         # The open end as the write path stores it: the EPOCH sentinel (OverlapKey.column_values).
@@ -227,3 +238,115 @@ def test_a_stream_create_is_refused_and_a_stored_stream_entry_still_reads(
     read = data_store.get(f'/store/{stored.id}')
     assert read.status_code == 200, data_store.describe(read)
     assert read.json()['update_type'] == 'STREAM'
+
+
+# ---------------------------------------------------------------------------------------------
+# last_run, the running filter and DatasetFacets.running (tj-grna9p.81, RESCOPED item 1).
+
+LIST_PATH = UiDatasetsInterface.GET_UI_DATASETS.value
+FACETS_PATH = UiDatasetsInterface.GET_UI_DATASET_FACETS.value
+WIRE_RUNNING = 'INGEST_RUN_STATE_RUNNING'
+WIRE_SUCCEEDED = 'INGEST_RUN_STATE_SUCCEEDED'
+
+
+def _ok(data_store, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    response = data_store.get(path, params=params)
+    assert response.status_code == 200, data_store.describe(response)
+    return response.json()
+
+
+def test_a_served_post_is_the_last_run_on_the_list_and_the_detail(
+    own_symbol, run_identity, data_store, pg_engine, adopt_entries
+):
+    response, ids = _post(data_store, adopt_entries, own_symbol, _body(run_identity.owner))
+    assert response.status_code == 200, data_store.describe(response)
+    (run,) = _runs(pg_engine, own_symbol)
+
+    (item,) = _ok(data_store, LIST_PATH, {'asset_symbol': own_symbol})['items']
+    detail = _ok(data_store, UiDatasetsInterface.GET_UI_DATASET.format(dataset_id=ids[0]))
+
+    for where, last_run in (('list', item['lastRun']), ('detail', detail['lastRun'])):
+        assert (last_run['id'], last_run['datasetId'], last_run['state']) == (
+            str(run.id),
+            str(ids[0]),
+            WIRE_SUCCEEDED,
+        ), f'{where}: {last_run}'
+        assert int(last_run['barsWritten']) == response.json()['data_points'], f'{where}: {last_run}'
+        assert last_run['label'] == f'{own_symbol} {GRANULARITY.value}' and 'finishedAt' in last_run, where
+
+
+def _seed_run(pg_engine: Engine, entry: sa.Row, state: IngestRunState, started_at: datetime) -> UUID:
+    """One run row for `entry`, as the recorder would leave it: acknowledged (dataset_id set), in `state`."""
+    finished = state is not IngestRunState.RUNNING
+    values = {
+        'dataset_id': entry.id,
+        'trigger': IngestRunTrigger.REQUEST,
+        'actor': entry.owner,
+        'asset_symbol': entry.asset_symbol,
+        'asset_type': entry.asset_type,
+        'data_type': entry.data_type,
+        'source': entry.source,
+        'granularity': entry.granularity,
+        'update_type': entry.update_type,
+        'feed': entry.feed,
+        'requested_start': entry.start,
+        'requested_end': entry.end,
+        'state': state,
+        'bars_written': 5 if finished else 0,
+        'started_at': started_at,
+        'finished_at': started_at + timedelta(seconds=1) if finished else None,
+    }
+    with pg_engine.begin() as conn:
+        return conn.execute(sa.insert(RUNS).values(values).returning(RUNS.c.id)).scalar_one()
+
+
+def _finish(pg_engine: Engine, run_id: UUID, state: IngestRunState, finished_at: datetime) -> None:
+    with pg_engine.begin() as conn:
+        conn.execute(sa.update(RUNS).where(RUNS.c.id == run_id).values(state=state, finished_at=finished_at))
+
+
+def test_the_running_filter_facet_and_last_run_follow_the_run_rows_on_postgres(
+    own_symbol, insert_entry, data_store, pg_engine
+):
+    """Two datasets, each with an older and a newer run: last_run is the newest, running is any RUNNING row.
+
+    last_run is the NEWEST run whatever its state; running means "has a run in state RUNNING right now",
+    whichever run that is. A: an older success, a newer RUNNING run. B: an older RUNNING row (stale) under a newer success. Both read as
+    running until B's stale row is finished; then running=true lists A alone and DatasetFacets.running counts it,
+    equal to that list's total. Finishing A's run empties both.
+    """
+    entry_a = insert_entry(asset_symbol=f'{own_symbol}A')
+    entry_b = insert_entry(asset_symbol=f'{own_symbol}B')
+    t0 = datetime.fromisoformat('2026-10-01T12:00:00+00:00')
+    _seed_run(pg_engine, entry_a, IngestRunState.SUCCEEDED, t0)
+    running_a = _seed_run(pg_engine, entry_a, IngestRunState.RUNNING, t0 + timedelta(hours=1))
+    stale_b = _seed_run(pg_engine, entry_b, IngestRunState.RUNNING, t0)
+    newest_b = _seed_run(pg_engine, entry_b, IngestRunState.SUCCEEDED, t0 + timedelta(hours=1))
+    scoped = {'asset_symbol': own_symbol}
+
+    by_id = {UUID(item['id']): item['lastRun'] for item in _ok(data_store, LIST_PATH, scoped)['items']}
+    assert set(by_id) == {entry_a.id, entry_b.id}, by_id
+    assert (by_id[entry_a.id]['id'], by_id[entry_a.id]['state']) == (str(running_a), WIRE_RUNNING), by_id
+    assert 'finishedAt' not in by_id[entry_a.id], by_id
+    assert (by_id[entry_b.id]['id'], by_id[entry_b.id]['state']) == (str(newest_b), WIRE_SUCCEEDED), by_id
+    detail_a = _ok(data_store, UiDatasetsInterface.GET_UI_DATASET.format(dataset_id=entry_a.id))
+    assert detail_a['lastRun']['id'] == str(running_a), detail_a
+
+    both = _ok(data_store, LIST_PATH, {**scoped, 'running': 'true'})
+    assert {UUID(item['id']) for item in both['items']} == {entry_a.id, entry_b.id}, both
+    assert int(_ok(data_store, FACETS_PATH, scoped).get('running', '0')) == 2
+
+    _finish(pg_engine, stale_b, IngestRunState.FAILED, t0 + timedelta(seconds=1))
+
+    only_a = _ok(data_store, LIST_PATH, {**scoped, 'running': 'true'})
+    assert [UUID(item['id']) for item in only_a['items']] == [entry_a.id], only_a
+    facets = _ok(data_store, FACETS_PATH, scoped)
+    assert (int(facets.get('running', '0')), int(facets['all'])) == (1, 2), facets
+    # Under running=true the facets describe the filtered list: all equals its total, and so does running.
+    filtered = _ok(data_store, FACETS_PATH, {**scoped, 'running': 'true'})
+    assert (int(filtered['all']), int(filtered.get('running', '0'))) == (1, 1), filtered
+
+    _finish(pg_engine, running_a, IngestRunState.SUCCEEDED, t0 + timedelta(hours=2))
+
+    assert _ok(data_store, LIST_PATH, {**scoped, 'running': 'true'}).get('items', []) == []
+    assert 'running' not in _ok(data_store, FACETS_PATH, scoped), 'canonical JSON omits a zero count'
