@@ -322,6 +322,16 @@ CASES: dict[str, Case] = {
         malformed_field='limit',
         reads_one_row=True,
     ),
+    # tj-grna9p.63. Looked up first like runs (the handler's 404 NOT_FOUND over the empty table); the malformed
+    # half sends buckets 0, below the floor of 1. Its real rows are test_ui_datasets_route.py's, section coverage.
+    'GET /ui/v1/datasets/{dataset_id}/coverage': Case(
+        path_params={'dataset_id': str(DELETE_ID)},
+        request={},
+        malformed_path_params={'dataset_id': str(DELETE_ID)},
+        malformed_request={'params': {'buckets': 0}},
+        malformed_field='buckets',
+        reads_one_row=True,
+    ),
 }
 
 

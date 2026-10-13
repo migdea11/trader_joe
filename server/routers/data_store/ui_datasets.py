@@ -30,15 +30,18 @@ from data.store.app.database.crud.stock.dataset_catalog import CatalogFilter
 from data.store.app.database.database import async_db
 from data.store.app.dataset_catalog import (
     DEFAULT_BAR_LIMIT,
+    DEFAULT_COVERAGE_BUCKETS,
     DEFAULT_PAGE_LIMIT,
     DEFAULT_RUN_LIMIT,
     MAX_BAR_LIMIT,
+    MAX_COVERAGE_BUCKETS,
     MAX_PAGE_LIMIT,
     MAX_RUN_LIMIT,
     CatalogQuery,
     DatasetSort,
     StatusGroup,
     bar_page,
+    dataset_coverage,
     dataset_detail,
     facets,
     list_page,
@@ -48,11 +51,13 @@ from routers.common.proto_json import ProtoJSONResponse, proto_route
 from routers.data_store.app_endpoints import UiDatasetsInterface
 from routers.data_store.ui_mapping import (
     BarPageMessage,
+    CoverageStripMessage,
     DatasetFacetsMessage,
     DatasetPageMessage,
     DatasetSummaryMessage,
     IngestRunPageMessage,
     bar_page_message,
+    coverage_strip_message,
     dataset_page_message,
     dataset_summary_message,
     facets_message,
@@ -152,6 +157,16 @@ class UiBarsQuery(InboundContract):
     end: AwareDatetime | None = None
     cursor: Annotated[str | None, Field(min_length=1, max_length=512)] = None
     limit: Annotated[int, Field(ge=1, le=MAX_BAR_LIMIT)] = DEFAULT_BAR_LIMIT
+
+
+class UiCoverageQuery(InboundContract):
+    """The coverage strip's query.
+
+    Attributes:
+        buckets: How many buckets at most. Fewer when the range holds fewer sessions.
+    """
+
+    buckets: Annotated[int, Field(ge=1, le=MAX_COVERAGE_BUCKETS)] = DEFAULT_COVERAGE_BUCKETS
 
 
 def _catalog_filter(query: UiDatasetFiltersQuery) -> CatalogFilter:
@@ -310,3 +325,35 @@ async def get_dataset_runs(
     if page is None:
         raise _not_found(dataset_id)
     return ProtoJSONResponse(ingest_run_page_message(page))
+
+
+@router.get(UiDatasetsInterface.GET_UI_DATASET_COVERAGE, **proto_route(CoverageStripMessage))
+async def get_dataset_coverage(
+    db: Annotated[AsyncSession, Depends(async_db)],
+    dataset_id: Annotated[UUID, Path()],
+    request_query: Annotated[UiCoverageQuery, Query()],
+    now: Annotated[datetime, Depends(utc_now)],
+) -> ProtoJSONResponse:
+    """A dataset's coverage over the trading calendar, as a CoverageStrip: bucketed sessions and its gaps.
+
+    Ranges are half-open [start, end). No pagination: one strip per dataset, at most 400 buckets and the first
+    500 gaps (gap_count says how many there are). Metadata: a read records no usage. The rules are in
+    data/store/app/dataset_catalog.py (dataset_coverage).
+
+    Args:
+        db: The request's session.
+        dataset_id: The dataset's id.
+        request_query: The bucket count.
+        now: The instant coverage is computed at.
+
+    Returns:
+        ProtoJSONResponse: A CoverageStrip.
+
+    Raises:
+        InvalidRequestError: NOT_FOUND (404) for an unknown dataset; INVALID_REQUEST (422) when no trading
+            calendar covers the dataset.
+    """
+    coverage = await dataset_coverage(db, dataset_id, now, request_query.buckets)
+    if coverage is None:
+        raise _not_found(dataset_id)
+    return ProtoJSONResponse(coverage_strip_message(coverage))

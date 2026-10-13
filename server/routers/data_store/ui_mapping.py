@@ -25,6 +25,7 @@ from data.store.app.database.crud.stock.dataset_catalog import BarExtent
 from data.store.app.database.models.ingest_run import IngestRunState
 from data.store.app.dataset_catalog import (
     BarPageResult,
+    CoverageResult,
     DatasetDetail,
     DatasetPage,
     DatasetView,
@@ -36,7 +37,7 @@ from data.store.app.dataset_catalog import (
 from data.store.app.events import DatasetChanged, DomainEvent, IngestRunChanged, ReaperPendingChanged, RequestChanged
 from data.store.app.ui_config import UiConfigView
 from schemas.data_ingest import fetch_dataset as domain
-from trader_joe.proto.ui.v1 import data_pb2, events_pb2, shell_pb2  # noqa: TID251
+from trader_joe.proto.ui.v1 import data_pb2, events_pb2, shell_pb2, stats_pb2  # noqa: TID251
 
 
 # The message types the routes declare as x-proto-message (routers.common.proto_json.proto_route). Re-exported so a
@@ -46,6 +47,7 @@ DatasetSummaryMessage = data_pb2.DatasetSummary
 DatasetFacetsMessage = data_pb2.DatasetFacets
 BarPageMessage = data_pb2.BarPage
 IngestRunPageMessage = data_pb2.IngestRunPage
+CoverageStripMessage = stats_pb2.CoverageStrip
 UiEventMessage = events_pb2.UiEvent
 UiConfigMessage = shell_pb2.UiConfig
 
@@ -195,6 +197,32 @@ def bar_page_message(page: BarPageResult) -> data_pb2.BarPage:
     return message
 
 
+def coverage_strip_message(coverage: CoverageResult) -> stats_pb2.CoverageStrip:
+    """A dataset's coverage as a CoverageStrip message.
+
+    Args:
+        coverage: What the catalog computed.
+
+    Returns:
+        stats_pb2.CoverageStrip: The range, the buckets, the listed gaps, the total gap count and as_of.
+    """
+    message = stats_pb2.CoverageStrip(gap_count=coverage.gap_count)
+    message.start.CopyFrom(to_timestamp(coverage.start))
+    message.end.CopyFrom(to_timestamp(coverage.end))
+    message.as_of.CopyFrom(to_timestamp(coverage.as_of))
+    for bucket in coverage.buckets:
+        entry = message.buckets.add(
+            expected_sessions=bucket.expected_sessions, sessions_with_bars=bucket.sessions_with_bars
+        )
+        entry.start.CopyFrom(to_timestamp(bucket.start))
+        entry.end.CopyFrom(to_timestamp(bucket.end))
+    for gap in coverage.gaps:
+        entry = message.gaps.add(sessions=gap.sessions)
+        entry.start.CopyFrom(to_timestamp(gap.start))
+        entry.end.CopyFrom(to_timestamp(gap.end))
+    return message
+
+
 def ui_config_message(config: UiConfigView) -> shell_pb2.UiConfig:
     """Build the UiConfig the shell reads, enums by their prefixed member names."""
     return shell_pb2.UiConfig(
@@ -295,6 +323,7 @@ def ui_event_message(event: DomainEvent, server_time: datetime) -> events_pb2.Ui
 
 __all__ = [
     'BarPageMessage',
+    'CoverageStripMessage',
     'DatasetFacetsMessage',
     'DatasetPageMessage',
     'DatasetSummaryMessage',
@@ -302,6 +331,7 @@ __all__ = [
     'UiConfigMessage',
     'UiEventMessage',
     'bar_page_message',
+    'coverage_strip_message',
     'dataset_page_message',
     'dataset_summary_message',
     'facets_message',

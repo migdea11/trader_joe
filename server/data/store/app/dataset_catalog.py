@@ -54,6 +54,7 @@ from data.store.app.database.crud.stock.dataset_catalog import BarExtent, Catalo
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.freshness import (
     CalendarRangeError,
+    CoverageBucket,
     DatasetHealth,
     FreshnessConfig,
     FreshnessStatus,
@@ -61,7 +62,10 @@ from data.store.app.freshness import (
     UnknownCalendarError,
     calendar_for_source,
     evaluate_dataset,
+    gap_intervals,
+    local_midnight,
 )
+from data.store.app.freshness import coverage_buckets as compute_coverage_buckets
 
 
 log = get_logger(__name__)
@@ -72,6 +76,9 @@ DEFAULT_RUN_LIMIT: Final = 50
 MAX_RUN_LIMIT: Final = 500
 DEFAULT_BAR_LIMIT: Final = 1000
 MAX_BAR_LIMIT: Final = 10_000
+DEFAULT_COVERAGE_BUCKETS: Final = 120
+MAX_COVERAGE_BUCKETS: Final = 400
+MAX_COVERAGE_GAPS: Final = 500
 
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
 _ONE_MICROSECOND: Final = timedelta(microseconds=1)
@@ -232,6 +239,42 @@ class BarPageResult:
 
     bars: list[StockMarketActivity]
     next_cursor: str
+
+
+@dataclass(frozen=True)
+class CoverageGapWindow:
+    """A gap as the strip lists it: the half-open window that holds exactly the missing sessions' bars.
+
+    Attributes:
+        start: The local midnight of the gap's first session.
+        end: The local midnight of the day after the gap's last session.
+        sessions: How many sessions are missing.
+    """
+
+    start: datetime
+    end: datetime
+    sessions: int
+
+
+@dataclass(frozen=True)
+class CoverageResult:
+    """A dataset's coverage over its range.
+
+    Attributes:
+        start: The range start, half-open.
+        end: The range end, as DatasetSummary.end reads it.
+        buckets: The strip's buckets, tiling [start, end); empty when the range holds no session.
+        gaps: The first MAX_COVERAGE_GAPS gaps, ascending.
+        gap_count: The number of gaps, which may exceed len(gaps).
+        as_of: The instant coverage was computed at.
+    """
+
+    start: datetime
+    end: datetime
+    buckets: list[CoverageBucket]
+    gaps: list[CoverageGapWindow]
+    gap_count: int
+    as_of: datetime
 
 
 def invalid_cursor() -> InvalidRequestError:
@@ -513,6 +556,55 @@ async def dataset_detail(
     siblings = await repo.siblings(db, [row])
     last_run = (await latest_runs_for_datasets(db, [row.id])).get(row.id)
     return DatasetDetail(view=view, extent=extents[row.id], siblings=siblings[row.id], as_of=now, last_run=last_run)
+
+
+async def dataset_coverage(
+    db: AsyncSession, dataset_id: uuid.UUID, now: datetime, buckets: int = DEFAULT_COVERAGE_BUCKETS
+) -> CoverageResult | None:
+    """A dataset's coverage strip over the trading calendar, or None when no such dataset exists (tj-grna9p.63).
+
+    Two statements, whatever the range: the entry, and the dates its bars fall on. The calendar logic is
+    freshness.py's, unchanged: the same completed-session rule and the same maximal runs as the GAPS status.
+    The range is the one DatasetSummary shows (start, effective_end). It applies to every update type, and a
+    retired DAILY or STREAM dataset is computed over the same range (when its retirement began is not recorded).
+    A bar belongs to the session whose local date it falls on, so a gap's window runs from the local midnight of
+    its first session to the local midnight of the day after its last: it holds exactly the missing sessions' bars.
+
+    Args:
+        db: The request's session.
+        dataset_id: The dataset's id.
+        now: The instant to judge at; aware.
+        buckets: The number of buckets wanted, at most; the caller bounds it to 1..MAX_COVERAGE_BUCKETS.
+
+    Returns:
+        CoverageResult | None: The strip, or None for an unknown dataset.
+
+    Raises:
+        InvalidRequestError: INVALID_REQUEST (422) when no trading calendar covers the dataset: its source has
+            none, or its range starts before the calendar does. Never an empty strip, which would read as no gaps.
+    """
+    row = await repo.get_catalog_row(db, dataset_id)
+    if row is None:
+        return None
+    end = effective_end(row, now)
+    try:
+        calendar = calendar_for_source(row.source)
+        covered = (await repo.covered_dates(db, [row], str(calendar.tz)))[row.id]
+        strip = compute_coverage_buckets(row.start, end, covered, calendar, now, buckets)
+        intervals = gap_intervals(row.start, end, covered, calendar, now)
+    except (UnknownCalendarError, CalendarRangeError):
+        raise InvalidRequestError(
+            Reason.INVALID_REQUEST, 'No trading calendar covers this dataset, so its coverage cannot be computed.'
+        ) from None
+    gaps = [
+        CoverageGapWindow(
+            start=local_midnight(interval.first_session, calendar),
+            end=local_midnight(interval.last_session + timedelta(days=1), calendar),
+            sessions=interval.sessions,
+        )
+        for interval in intervals[:MAX_COVERAGE_GAPS]
+    ]
+    return CoverageResult(start=row.start, end=end, buckets=strip, gaps=gaps, gap_count=len(intervals), as_of=now)
 
 
 def _run_cursor_key(cursor: str) -> tuple[datetime, uuid.UUID]:

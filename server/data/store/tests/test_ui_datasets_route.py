@@ -30,8 +30,11 @@ import base64
 import json
 import logging
 import uuid
+from collections import Counter
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime, timedelta
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
+from itertools import pairwise
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -53,10 +56,25 @@ from data.store.app.database.database import async_db
 from data.store.app.database.models.ingest_run import IngestRun, IngestRunState, IngestRunTrigger
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
-from data.store.app.dataset_catalog import evaluate_views
-from data.store.app.freshness import FreshnessStatus, NaiveDatetimeError, UnknownCalendarError
+from data.store.app.dataset_catalog import (
+    DEFAULT_COVERAGE_BUCKETS,
+    MAX_COVERAGE_BUCKETS,
+    MAX_COVERAGE_GAPS,
+    evaluate_views,
+)
+from data.store.app.freshness import (
+    FreshnessStatus,
+    NaiveDatetimeError,
+    TradingCalendar,
+    UnknownCalendarError,
+    calendar_for_source,
+    gap_intervals,
+    local_midnight,
+    session_of,
+)
 from data.store.app.main import app
 from data.store.tests.problem_body import problem, validation_errors
+from data.store.tests.test_coverage_buckets import XTKS
 from routers.data_store.ui_datasets import utc_now
 
 
@@ -822,6 +840,8 @@ async def test_a_request_runs_a_constant_number_of_statements_not_one_per_datase
             'list filtered by running': await count('/ui/v1/datasets', limit=500, running='true'),
             'facets': await count('/ui/v1/datasets/facets'),
             'detail': await count(f'/ui/v1/datasets/{catalog.ddd.id}'),
+            # tj-grna9p.63: the entry and its covered dates, never the detail's five.
+            'coverage': await count(f'/ui/v1/datasets/{catalog.ddd.id}/coverage'),
         }
 
     # One running dataset in the small set too, so the running-filtered page is not empty: an empty page skips
@@ -841,6 +861,7 @@ async def test_a_request_runs_a_constant_number_of_statements_not_one_per_datase
         'list filtered by running': 6,
         'facets': 3,
         'detail': 5,
+        'coverage': 2,
     }, large
 
 
@@ -1311,3 +1332,380 @@ async def test_with_running_true_the_other_facets_count_only_running_datasets(cl
 async def test_no_running_run_means_a_zero_facet_and_an_empty_running_list(client, catalog):
     assert 'running' not in (await client.get('/ui/v1/datasets/facets')).json()
     assert await list_all(client, running='true') == []
+
+
+# ------------------------------------------------------------------------------------------------- coverage
+#
+# GET /ui/v1/datasets/{dataset_id}/coverage (tj-grna9p.63; design: the architect's 'RESCOPED (phase 2,
+# 2026-10-12)' note on that bead, items 1 to 8 and acceptance a to h). The pure bucket rule is pinned in
+# test_coverage_buckets.py; this section drives the route over real rows.
+#
+# STATIC DATASETS WITH BARS, HERE ONLY. The file header says SQLite returns covered_dates' date() as TEXT, so a
+# STATIC dataset with bars is judged wrongly at this tier. The coverage tests need bars, so they take the
+# fixture below: it runs the REAL covered_dates statement (the statement budget still counts it) and only parses
+# the 'YYYY-MM-DD' text SQLite returns into the date Postgres returns. The local date itself is computed by the
+# timezone() stand-in in the calendar's zone, as Postgres would; tests/system/test_http_ui_datasets.py pins the
+# Postgres side of covered_dates, and its coverage section the known gap end to end.
+#
+# NOTHING IS INVENTED: every expected session, count and window is derived from the phase 1 calendar
+# (sessions_overlapping, session_close, local_midnight, session_of, gap_intervals).
+
+XNYS = calendar_for_source(DataSource.ALPACA_API)
+TICK = timedelta(microseconds=1)
+DAY = timedelta(days=1)
+# Every session of September 2026: all closed before NOW.
+SEPTEMBER = XNYS.sessions_overlapping(ny_midnight(1, 9), ny_midnight(1, 10))
+
+
+@pytest.fixture
+def covered_dates_as_dates(monkeypatch: pytest.MonkeyPatch) -> None:
+    real = catalog_repo.covered_dates
+
+    async def as_dates(db: AsyncSession, rows: list, tz_name: str) -> dict[uuid.UUID, frozenset[date]]:
+        found = await real(db, rows, tz_name)
+        return {
+            key: frozenset(day if isinstance(day, date) else date.fromisoformat(day) for day in days)
+            for key, days in found.items()
+        }
+
+    monkeypatch.setattr(catalog_repo, 'covered_dates', as_dates)
+
+
+def midnight(session: date, calendar: TradingCalendar = XNYS) -> datetime:
+    """A session's local midnight as UTC, the only offset SQLite can hold."""
+    return local_midnight(session, calendar).astimezone(UTC)
+
+
+def window(first: date, last: date, calendar: TradingCalendar = XNYS) -> tuple[datetime, datetime, int]:
+    """The gap the design says a run of missing sessions FIRST..LAST reads as (item 6), counted in the calendar."""
+    sessions = calendar.sessions_overlapping(midnight(first, calendar), midnight(last + DAY, calendar))
+    return midnight(first, calendar), midnight(last + DAY, calendar), len(sessions)
+
+
+@dataclass(frozen=True)
+class Strip:
+    start: datetime
+    end: datetime
+    buckets: list[tuple[datetime, datetime, int, int]]
+    gaps: list[tuple[datetime, datetime, int]]
+    gap_count: int
+    as_of: datetime
+
+    @property
+    def expected(self) -> int:
+        return sum(bucket[2] for bucket in self.buckets)
+
+    @property
+    def missing(self) -> int:
+        return sum(bucket[2] - bucket[3] for bucket in self.buckets)
+
+
+def coverage_path(dataset_id: uuid.UUID) -> str:
+    return f'/ui/v1/datasets/{dataset_id}/coverage'
+
+
+async def coverage(client: httpx.AsyncClient, dataset: StoreDatasetEntry, **params: Any) -> Strip:
+    response = await client.get(coverage_path(dataset.id), params=params)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    instant = datetime.fromisoformat
+    return Strip(
+        start=instant(body['start']),
+        end=instant(body['end']),
+        buckets=[
+            (instant(b['start']), instant(b['end']), b.get('expectedSessions', 0), b.get('sessionsWithBars', 0))
+            for b in body.get('buckets', [])
+        ],
+        gaps=[(instant(g['start']), instant(g['end']), g.get('sessions', 0)) for g in body.get('gaps', [])],
+        gap_count=body.get('gapCount', 0),
+        as_of=instant(body['asOf']),
+    )
+
+
+def assert_tiles(strip: Strip) -> None:
+    assert strip.buckets[0][0] == strip.start and strip.buckets[-1][1] == strip.end, strip
+    for earlier, later in pairwise(strip.buckets):
+        assert earlier[1] == later[0], (earlier, later)
+    assert all(start < end for start, end, _, _ in strip.buckets), strip.buckets
+
+
+def pin_clock(now: datetime) -> None:
+    """Move the routes' clock for one test; the client fixture clears every override afterwards."""
+
+    async def pinned() -> datetime:
+        return now
+
+    app.dependency_overrides[utc_now] = pinned
+
+
+def daily_bars(of: StoreDatasetEntry, sessions: list[date], calendar: TradingCalendar = XNYS) -> list:
+    return [bar(of, midnight(session, calendar)) for session in sessions]
+
+
+def _weekend_run(sessions: list[date]) -> list[date]:
+    """Three consecutive sessions whose last two straddle a weekend, from the calendar."""
+    for index in range(1, len(sessions) - 2):
+        if (sessions[index + 1] - sessions[index]).days > 1:
+            return sessions[index - 1 : index + 2]
+    raise AssertionError('precondition: no weekend in the range')
+
+
+@pytest.mark.asyncio
+async def test_a_known_three_session_gap_reads_as_one_local_midnight_window(client, engine, covered_dates_as_dates):
+    """Acceptance a, b, c, g: one gap spanning a weekend, its window, the bucket sums, the GAPS count agree."""
+    missing = _weekend_run(SEPTEMBER)
+    dataset = entry('COV', start=midnight(SEPTEMBER[0]), end=midnight(SEPTEMBER[-1] + DAY))
+    await store(engine, dataset, *daily_bars(dataset, [s for s in SEPTEMBER if s not in missing]))
+
+    strip = await coverage(client, dataset)
+
+    assert (strip.start, strip.end, strip.as_of) == (dataset.start, dataset.end, NOW)
+    assert strip.gap_count == 1 and strip.gaps == [window(missing[0], missing[-1])], strip.gaps
+    assert strip.gaps[0][2] == len(missing) == 3
+    assert strip.expected == len(SEPTEMBER) and strip.missing == len(missing)
+    assert_tiles(strip)
+    assert len(strip.buckets) == min(DEFAULT_COVERAGE_BUCKETS, len(SEPTEMBER))
+    # g: the same rule as freshness -- the GAPS count (missing SESSIONS) equals the sessions the gaps hold.
+    detail = (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['freshness']
+    assert (detail['status'], detail['gapCount']) == ('FRESHNESS_STATUS_GAPS', sum(g[2] for g in strip.gaps))
+
+
+@pytest.mark.asyncio
+async def test_the_gap_window_holds_exactly_the_missing_sessions_bars(client, engine, covered_dates_as_dates):
+    """A bar a tick before the window closes nothing; one a tick before its end closes the last missing session.
+
+    (A bar AT the end is the next session's own daily bar, already stored: the end is excluded.)
+    """
+    missing = _weekend_run(SEPTEMBER)
+    dataset = entry('WIN', start=midnight(SEPTEMBER[0]), end=midnight(SEPTEMBER[-1] + DAY))
+    await store(engine, dataset, *daily_bars(dataset, [s for s in SEPTEMBER if s not in missing]))
+    start, end, _ = window(missing[0], missing[-1])
+
+    assert session_of(end, XNYS) in SEPTEMBER and session_of(end, XNYS) not in missing, 'precondition'
+    await store(engine, bar(dataset, start - TICK))
+    assert (await coverage(client, dataset)).gaps == [window(missing[0], missing[-1])]
+
+    await store(engine, bar(dataset, end - TICK))
+    assert (await coverage(client, dataset)).gaps == [window(missing[0], missing[-2])]
+
+    await store(engine, *daily_bars(dataset, missing[:-1]))
+    closed = await coverage(client, dataset)
+    assert (closed.gaps, closed.gap_count, closed.missing) == ([], 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_weekends_holidays_and_early_closes_are_never_gaps(client, engine, covered_dates_as_dates):
+    """Acceptance b, over the 2025 holiday season: a mid-week holiday joins its neighbours into ONE gap."""
+    start, end = midnight(date(2025, 11, 3)), midnight(date(2026, 1, 10))
+    sessions = XNYS.sessions_overlapping(start, end)
+    close_times = Counter(XNYS.session_close(s).astimezone(XNYS.tz).time() for s in sessions)
+    regular_close = close_times.most_common(1)[0][0]
+    early = [s for s in sessions if XNYS.session_close(s).astimezone(XNYS.tz).time() < regular_close]
+    holidays = [
+        day
+        for day in (sessions[0] + timedelta(days=n) for n in range((sessions[-1] - sessions[0]).days))
+        if day.weekday() in (1, 2, 3) and day not in sessions
+    ]
+    assert early and holidays, ('precondition', early, holidays)
+
+    def neighbours(holiday: date) -> list[date]:
+        return [max(s for s in sessions if s < holiday), min(s for s in sessions if s > holiday)]
+
+    # The first mid-week holiday whose neighbours close on time, so every early close stays covered.
+    missing = next(neighbours(h) for h in holidays if not set(neighbours(h)) & set(early))
+    dataset = entry('HOL', start=start, end=end)
+    held = [s for s in sessions if s not in missing]
+    # An early close holds one intraday bar at its open; every other session a daily bar at local midnight.
+    await store(
+        engine,
+        dataset,
+        *(bar(dataset, XNYS.session_open(s).astimezone(UTC)) for s in held if s in early),
+        *daily_bars(dataset, [s for s in held if s not in early]),
+    )
+
+    strip = await coverage(client, dataset)
+
+    assert strip.gaps == [window(missing[0], missing[-1])] and strip.gap_count == 1, strip.gaps
+    assert strip.gaps[0][2] == len(missing), 'the holiday is not a session, so it is not counted'
+    assert strip.expected == len(sessions) and strip.missing == len(missing)
+    for session in early:
+        assert not any(gap_start <= midnight(session) < gap_end for gap_start, gap_end, _ in strip.gaps), session
+
+
+@pytest.mark.asyncio
+async def test_sessions_in_progress_or_in_the_future_are_neither_expected_nor_gaps(client, engine):
+    """Acceptance d: a DAILY dataset created today owes nothing yet; a STATIC one ending next week owes only the past."""
+    today = XNYS.next_session(SEPTEMBER[-1] + timedelta(days=5))
+    now = XNYS.session_open(today) + timedelta(hours=1)
+    assert XNYS.session_close(today) > now, 'precondition: today is in progress'
+    daily = entry('NEWD', update_type=UpdateType.DAILY, start=midnight(today))
+    static = entry('FUT', start=midnight(today) - timedelta(days=7), end=midnight(today) + timedelta(days=7))
+    await store(engine, daily, static)
+    pin_clock(now)
+
+    fresh = await coverage(client, daily)
+    assert (fresh.gaps, fresh.gap_count, fresh.expected) == ([], 0, 0)
+    assert fresh.end == now and len(fresh.buckets) == 1, fresh
+
+    later = await coverage(client, static)
+    sessions = XNYS.sessions_overlapping(static.start, static.end)
+    completed = [s for s in sessions if XNYS.session_close(s) <= now]
+    assert today in sessions and today not in completed
+    assert later.expected == len(completed) < len(sessions)
+    assert sum(gap[2] for gap in later.gaps) == len(completed)
+    assert all(gap_end <= midnight(today) for _, gap_end, _ in later.gaps), later.gaps
+    assert len(later.buckets) == len(sessions), 'future sessions are still bucketed, just not expected'
+
+
+S = SEPTEMBER
+# name -> (start, end, the sessions the strip must expect). Half-open, at both ends.
+BOUND_CASES = {
+    'local midnights': (lambda: midnight(S[1]), lambda: midnight(S[4]), lambda: S[1:4]),
+    'end at the next open': (lambda: midnight(S[1]), lambda: XNYS.session_open(S[4]), lambda: S[1:4]),
+    'end a tick past the next open': (lambda: midnight(S[1]), lambda: XNYS.session_open(S[4]) + TICK, lambda: S[1:5]),
+    'start at a close': (lambda: XNYS.session_close(S[1]), lambda: midnight(S[4]), lambda: S[2:4]),
+    'start a tick before a close': (lambda: XNYS.session_close(S[1]) - TICK, lambda: midnight(S[4]), lambda: S[1:4]),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('start', 'end', 'sessions'), BOUND_CASES.values(), ids=BOUND_CASES)
+async def test_the_range_is_half_open_at_the_dataset_s_start_and_end(client, engine, start, end, sessions):
+    dataset = entry('BND', start=start().astimezone(UTC), end=end().astimezone(UTC))
+    await store(engine, dataset)
+
+    strip = await coverage(client, dataset)
+
+    assert (strip.start, strip.end) == (dataset.start, dataset.end)
+    assert strip.expected == len(sessions()) == strip.missing
+    assert strip.gaps == [(midnight(sessions()[0]), midnight(sessions()[-1] + DAY), len(sessions()))]
+    assert_tiles(strip)
+
+
+DST_RANGES = {'spring': (date(2026, 3, 2), date(2026, 3, 14)), 'autumn': (date(2025, 10, 27), date(2025, 11, 8))}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('first', 'last'), DST_RANGES.values(), ids=DST_RANGES)
+async def test_a_gap_across_a_dst_change_runs_local_midnight_to_local_midnight(
+    client, engine, covered_dates_as_dates, first, last
+):
+    start, end = midnight(first), midnight(last)
+    sessions = XNYS.sessions_overlapping(start, end)
+    pair = next(
+        [a, b]
+        for a, b in pairwise(sessions)
+        if local_midnight(a, XNYS).utcoffset() != local_midnight(b, XNYS).utcoffset()
+    )
+    dataset = entry('DST', start=start, end=end)
+    await store(engine, dataset, *daily_bars(dataset, [s for s in sessions if s not in pair]))
+
+    strip = await coverage(client, dataset)
+
+    assert strip.gaps == [window(pair[0], pair[1])], strip.gaps
+    gap_start, gap_end, _ = strip.gaps[0]
+    assert (gap_end - gap_start) % DAY != timedelta(0), 'precondition: the window crosses an offset change'
+    assert session_of(gap_start, XNYS) == pair[0] and session_of(gap_start - TICK, XNYS) == pair[0] - DAY
+    assert session_of(gap_end - TICK, XNYS) == pair[1] and session_of(gap_end, XNYS) == pair[1] + DAY
+    for instant in (gap_start, gap_end):
+        assert instant.astimezone(XNYS.tz).time() == datetime.min.time(), instant
+    assert_tiles(strip)
+
+
+@pytest.mark.asyncio
+async def test_a_gap_on_an_exchange_whose_local_day_is_not_utc_s(client, engine, covered_dates_as_dates, monkeypatch):
+    """XTKS (+09:00) in place of the source's calendar: midnight in Tokyo is the previous UTC date.
+
+    The calendar reaches dataset_coverage through the name it looks it up by; the covered dates are computed in
+    Asia/Tokyo by the same statement, because the zone passed is the calendar's. A rule that took a UTC date or a
+    UTC midnight puts the window a day off.
+    """
+    monkeypatch.setattr(dataset_catalog_module, 'calendar_for_source', lambda source: XTKS)
+    sessions = XTKS.sessions_overlapping(midnight(date(2025, 6, 2), XTKS), midnight(date(2025, 6, 28), XTKS))
+    missing = sessions[3:5]
+    dataset = entry('TKY', start=midnight(sessions[0], XTKS), end=midnight(sessions[-1] + DAY, XTKS))
+    await store(engine, dataset, *daily_bars(dataset, [s for s in sessions if s not in missing], XTKS))
+
+    strip = await coverage(client, dataset)
+
+    assert strip.gaps == [window(missing[0], missing[-1], XTKS)], strip.gaps
+    gap_start, gap_end, count = strip.gaps[0]
+    assert count == len(missing)
+    assert gap_start.astimezone(UTC).date() == missing[0] - DAY, 'Tokyo midnight is the previous UTC date'
+    assert session_of(gap_start, XTKS) == missing[0] and session_of(gap_end - TICK, XTKS) == missing[-1]
+    assert strip.expected == len(sessions) and strip.missing == len(missing)
+    assert_tiles(strip)
+
+
+@pytest.mark.asyncio
+async def test_more_than_500_gaps_lists_the_first_500_and_counts_them_all(client, engine, covered_dates_as_dates):
+    start, end = midnight(date(2021, 1, 4)), midnight(date(2026, 1, 5))
+    sessions = XNYS.sessions_overlapping(start, end)
+    held = sessions[::2]
+    dataset = entry('MANY', start=start, end=end)
+    await store(engine, dataset, *daily_bars(dataset, held))
+    intervals = gap_intervals(start, end, frozenset(held), XNYS, NOW)
+    assert len(intervals) > MAX_COVERAGE_GAPS, 'precondition'
+
+    strip = await coverage(client, dataset)
+
+    assert strip.gap_count == len(intervals)
+    assert strip.gaps == [window(i.first_session, i.last_session) for i in intervals[:MAX_COVERAGE_GAPS]]
+    assert len(strip.gaps) == MAX_COVERAGE_GAPS == 500
+    assert strip.missing == sum(i.sessions for i in intervals) > sum(gap[2] for gap in strip.gaps)
+
+
+@pytest.mark.asyncio
+async def test_buckets_default_to_120_and_are_bounded_1_to_400(client, engine):
+    year = entry('YEAR', start=midnight(date(2025, 1, 2)), end=midnight(date(2026, 1, 2)))
+    await store(engine, year)
+    sessions = XNYS.sessions_overlapping(year.start, year.end)
+    assert DEFAULT_COVERAGE_BUCKETS < len(sessions) < MAX_COVERAGE_BUCKETS, 'precondition'
+
+    assert len((await coverage(client, year)).buckets) == DEFAULT_COVERAGE_BUCKETS == 120
+    assert len((await coverage(client, year, buckets=1)).buckets) == 1
+    every = await coverage(client, year, buckets=MAX_COVERAGE_BUCKETS)
+    assert MAX_COVERAGE_BUCKETS == 400 and len(every.buckets) == len(sessions)
+    assert {bucket[2] for bucket in every.buckets} == {1}
+    for buckets in (0, MAX_COVERAGE_BUCKETS + 1, 'many'):
+        errors = validation_errors(await client.get(coverage_path(year.id), params={'buckets': buckets}))
+        assert [error['loc'] for error in errors] == [['query', 'buckets']], errors
+
+
+@pytest.mark.asyncio
+async def test_coverage_of_an_unknown_dataset_is_the_detail_s_404(client, catalog):
+    unknown = uuid.uuid4()
+    body = problem(await client.get(coverage_path(unknown)), status=404, reason='NOT_FOUND')
+    detail = problem(await client.get(f'/ui/v1/datasets/{unknown}'), status=404, reason='NOT_FOUND')
+    assert body['detail'] == detail['detail']
+
+
+@pytest.mark.asyncio
+async def test_coverage_with_no_calendar_is_a_typed_422_never_an_empty_strip(client, catalog, early):
+    """Acceptance e: a source with no calendar, and a range before the calendar's start, are 422 INVALID_REQUEST."""
+    for dataset in (catalog.ggg, early.static, early.daily):
+        body = problem(await client.get(coverage_path(dataset.id)), status=422, reason='INVALID_REQUEST')
+        assert 'calendar' in body['detail'], body
+
+
+@pytest.mark.asyncio
+async def test_a_coverage_read_is_two_selects_whatever_the_datasets_and_bars(client, engine, covered_dates_as_dates):
+    """Acceptance f: the entry and its covered dates; no write; flat as datasets and bars grow."""
+    dataset = entry('FLAT', start=midnight(SEPTEMBER[0]), end=midnight(SEPTEMBER[-1] + DAY))
+    await store(engine, dataset, *daily_bars(dataset, SEPTEMBER[:3]))
+    statements: list[str] = []
+    event.listen(engine.sync_engine, 'before_cursor_execute', lambda *args: statements.append(args[2]))
+
+    async def read() -> list[str]:
+        statements.clear()
+        await coverage(client, dataset)
+        return list(statements)
+
+    few = await read()
+    others = [entry(f'F{index:03d}', start=dataset.start, end=dataset.end) for index in range(40)]
+    await store(engine, *others)
+    await store(engine, *daily_bars(dataset, SEPTEMBER[3:]), *(b for o in others for b in daily_bars(o, SEPTEMBER)))
+    many = await read()
+
+    assert len(few) == len(many) == 2, (few, many)
+    assert all(statement.lstrip().upper().startswith('SELECT') for statement in few + many), many

@@ -299,6 +299,63 @@ def gap_intervals(
     return runs
 
 
+@dataclass(frozen=True)
+class CoverageBucket:
+    """A stretch of sessions of the coverage strip, half-open [start, end).
+
+    Attributes:
+        start: The first instant of the bucket (the strip's start for the first bucket, else the local midnight of
+            the bucket's first session).
+        end: The first instant of the next bucket, or the strip's end for the last.
+        expected_sessions: The COMPLETED sessions in the bucket.
+        sessions_with_bars: How many of those hold at least one bar.
+    """
+
+    start: datetime
+    end: datetime
+    expected_sessions: int
+    sessions_with_bars: int
+
+
+def local_midnight(session: date, calendar: TradingCalendar) -> datetime:
+    """The first instant of a session's local date in the calendar's zone (where a daily bar is stamped)."""
+    return datetime.combine(session, datetime.min.time(), tzinfo=calendar.tz)
+
+
+def coverage_buckets(
+    start: datetime, end: datetime, covered: Collection[date], calendar: TradingCalendar, now: datetime, buckets: int
+) -> list[CoverageBucket]:
+    """Partition the sessions of [start, end) into at most `buckets` contiguous, near-equal groups (tj-grna9p.63).
+
+    Every session overlapping the range is partitioned, expected or not, into min(buckets, sessions) groups whose
+    sizes differ by at most one (the earlier groups take the remainder). The buckets tile [start, end) with no hole
+    or overlap. A session counts as EXPECTED only when completed, exactly as gap_intervals does, so an in-progress or
+    future session is counted in no bucket's expected_sessions. No sessions give no buckets.
+
+    Raises:
+        ValueError: If `buckets` is below 1.
+    """
+    _require_aware(start=start, end=end, now=now)
+    if buckets < 1:
+        raise ValueError('buckets must be >= 1')
+    sessions = calendar.sessions_overlapping(start, end)
+    if not sessions:
+        return []
+    groups = min(buckets, len(sessions))
+    size, remainder = divmod(len(sessions), groups)
+    out: list[CoverageBucket] = []
+    first = 0
+    for index in range(groups):
+        last = first + size + (1 if index < remainder else 0)
+        members = sessions[first:last]
+        expected = [s for s in members if calendar.session_close(s) <= now]
+        bucket_start = start if index == 0 else local_midnight(members[0], calendar)
+        bucket_end = end if index == groups - 1 else local_midnight(sessions[last], calendar)
+        out.append(CoverageBucket(bucket_start, bucket_end, len(expected), sum(s in covered for s in expected)))
+        first = last
+    return out
+
+
 def evaluate_dataset(
     *,
     update_type: UpdateType,
@@ -386,6 +443,7 @@ __all__ = [
     'SOURCE_CALENDARS',
     'STREAM_BAR_MULTIPLE_ENV',
     'CalendarRangeError',
+    'CoverageBucket',
     'DatasetHealth',
     'ExchangeCalendarAdapter',
     'FreshnessConfig',
@@ -395,8 +453,10 @@ __all__ = [
     'TradingCalendar',
     'UnknownCalendarError',
     'calendar_for_source',
+    'coverage_buckets',
     'covered_sessions',
     'evaluate_dataset',
     'gap_intervals',
+    'local_midnight',
     'session_of',
 ]

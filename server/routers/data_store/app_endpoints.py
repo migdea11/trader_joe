@@ -36,6 +36,7 @@ class UiDatasetsInterface(StrEnum):
     GET_UI_DATASET = '/ui/v1/datasets/{dataset_id}'
     GET_UI_DATASET_BARS = '/ui/v1/datasets/{dataset_id}/bars'
     GET_UI_DATASET_RUNS = '/ui/v1/datasets/{dataset_id}/runs'
+    GET_UI_DATASET_COVERAGE = '/ui/v1/datasets/{dataset_id}/coverage'
 
 
 class UiConfigInterface(StrEnum):
