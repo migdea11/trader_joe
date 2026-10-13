@@ -1,12 +1,11 @@
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it } from 'vitest'
 import { create } from '@bufbuild/protobuf'
 import { timestampFromMs } from '@bufbuild/protobuf/wkt'
 
 import { BarSchema, type Bar } from '@generated/trader_joe/proto/market/v1/bar_pb'
 
-import { CHART_PAGE_SIZE, MAX_CHART_BARS, TABLE_PAGE_SIZE, loadBarWindow } from './barWindow'
-import type { BarPageResult } from './barWindow'
-import { CSV_HEADER, barsToCsv } from './csv'
+import { TABLE_PAGE_SIZE } from './barWindow'
+import { CSV_HEADER, barsToCsv, barsToCsvRows } from './csv'
 import {
   displayDay,
   parseDay,
@@ -17,68 +16,19 @@ import {
   zonedDayStart,
 } from './range'
 
-// tj-grna9p.33: the Viewer's bounded bar load, its half-open range and its CSV export.
+// tj-grna9p.33: the Viewer's half-open range and its CSV text. The bounded chart load
+// (loadBarWindow, the 50,000-bar cap and its truncated flag) is gone: the chart holds one page of the
+// server's page index (chartPages.spec.ts, decision tj-eozqhi). barWindow.ts keeps only the table's
+// page size.
 
 const bar = (ms: number, close = 1): Bar =>
   create(BarSchema, { barStart: timestampFromMs(ms), open: 1, high: 2, low: 0.5, close, volume: 10 })
 
-// A server that holds `total` bars and answers each page with at most `limit` of them.
-function server(total: number) {
-  return vi.fn(async (cursor: string | undefined, limit: number): Promise<BarPageResult> => {
-    const offset = cursor === undefined ? 0 : Number(cursor)
-    const count = Math.max(0, Math.min(limit, total - offset))
-    const bars = Array.from({ length: count }, (_, i) => bar(offset + i))
-    const next = offset + count
-    return { bars, nextCursor: next < total ? String(next) : '' }
-  })
-}
-
-describe('loadBarWindow', () => {
-  it('caps the chart at 50,000 bars in five 10,000-bar pages and reports truncated', async () => {
-    expect(MAX_CHART_BARS).toBe(50_000)
-    expect(CHART_PAGE_SIZE).toBe(10_000)
+describe('barWindow', () => {
+  it('holds only the table page size; the chart load and its cap are gone', async () => {
     expect(TABLE_PAGE_SIZE).toBe(500)
-    const fetchPage = server(73_000)
-    const result = await loadBarWindow({ fetchPage, signal: new AbortController().signal })
-    expect(result.bars).toHaveLength(50_000)
-    expect(result.truncated).toBe(true)
-    expect(result.pages).toBe(5)
-    expect(fetchPage.mock.calls.map(([cursor, limit]) => [cursor, limit])).toEqual([
-      [undefined, 10_000],
-      ['10000', 10_000],
-      ['20000', 10_000],
-      ['30000', 10_000],
-      ['40000', 10_000],
-    ])
-  })
-
-  it('the last request asks only for the room left under the cap', async () => {
-    const fetchPage = server(100)
-    const result = await loadBarWindow({ fetchPage, signal: new AbortController().signal, cap: 25, pageSize: 10 })
-    expect(fetchPage.mock.calls.map(([, limit]) => limit)).toEqual([10, 10, 5])
-    expect(result.bars).toHaveLength(25)
-    expect(result.truncated).toBe(true)
-  })
-
-  it('a window that ends exactly at the cap is not truncated', async () => {
-    const result = await loadBarWindow({ fetchPage: server(50_000), signal: new AbortController().signal })
-    expect(result.bars).toHaveLength(50_000)
-    expect(result.truncated).toBe(false)
-  })
-
-  it('a short window loads in one request; an empty one is empty and not truncated', async () => {
-    const short = await loadBarWindow({ fetchPage: server(7), signal: new AbortController().signal })
-    expect(short).toMatchObject({ truncated: false, pages: 1 })
-    expect(short.bars).toHaveLength(7)
-    const empty = await loadBarWindow({ fetchPage: server(0), signal: new AbortController().signal })
-    expect(empty).toEqual({ bars: [], truncated: false, pages: 1 })
-  })
-
-  it('passes the signal through and rejects as the fetch does', async () => {
-    const controller = new AbortController()
-    const fetchPage = vi.fn().mockRejectedValue(new DOMException('aborted', 'AbortError'))
-    await expect(loadBarWindow({ fetchPage, signal: controller.signal })).rejects.toThrow('aborted')
-    expect(fetchPage).toHaveBeenCalledWith(undefined, CHART_PAGE_SIZE, controller.signal)
+    const module = await import('./barWindow')
+    expect(Object.keys(module)).toEqual(['TABLE_PAGE_SIZE'])
   })
 })
 
@@ -170,5 +120,33 @@ describe('barsToCsv', () => {
   it('skips a bar with no start and an empty list is the header alone', () => {
     expect(barsToCsv([create(BarSchema, { close: 1 })], 'UTC', false)).toBe(`${CSV_HEADER}\n`)
     expect(barsToCsv([], 'UTC', false)).toBe(`${CSV_HEADER}\n`)
+  })
+})
+
+// tj-grna9p.126: the export writes a file in chunks, one per page read. The header plus the chunks
+// must be the same bytes barsToCsv writes for the same bars in one go.
+describe('barsToCsvRows', () => {
+  const bars = [
+    create(BarSchema, { barStart: timestampFromMs(Date.UTC(2026, 8, 1, 13, 30)), open: 1.5, high: 2.25, low: 1, close: 2, volume: 1200 }),
+    create(BarSchema, { close: 9 }),
+    create(BarSchema, { barStart: timestampFromMs(Date.UTC(2026, 8, 2, 3, 59)), open: 2, high: 3, low: 1.75, close: 2.5, volume: 0 }),
+    create(BarSchema, { barStart: timestampFromMs(Date.UTC(2026, 8, 3, 14)), open: 3, high: 4, low: 2.5, close: 3.5, volume: 7 }),
+  ]
+
+  it.each([false, true])('header + rows of any split is byte-identical to barsToCsv (intraday %s)', (intraday) => {
+    const whole = barsToCsv(bars, 'America/Toronto', intraday)
+    for (const cut of [0, 1, 2, 3, 4]) {
+      const pieced =
+        `${CSV_HEADER}\n` +
+        barsToCsvRows(bars.slice(0, cut), 'America/Toronto', intraday) +
+        barsToCsvRows(bars.slice(cut), 'America/Toronto', intraday)
+      expect(pieced).toBe(whole)
+    }
+  })
+
+  it('every row ends in a newline, carries no header, and no bars is the empty string', () => {
+    expect(barsToCsvRows(bars.slice(0, 1), 'UTC', true)).toBe('2026/09/01 13:30,1.5,2.25,1,2,1200\n')
+    expect(barsToCsvRows([], 'UTC', false)).toBe('')
+    expect(barsToCsvRows(bars.slice(1, 2), 'UTC', false)).toBe('')
   })
 })

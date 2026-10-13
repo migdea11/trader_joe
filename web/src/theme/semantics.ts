@@ -13,7 +13,7 @@ export interface BadgeSpec {
   color: string
 }
 
-// --- Collection health (FreshnessStatus) -------------------------------------------------------
+// --- Status (FreshnessStatus) -------------------------------------------------------
 
 export const FRESHNESS_STATUS_VALUES = [
   'FRESHNESS_STATUS_UNSPECIFIED',

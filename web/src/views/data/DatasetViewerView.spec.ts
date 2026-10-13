@@ -17,6 +17,8 @@ const mocks = vi.hoisted(() => ({
   getUiConfig: vi.fn(),
   getDataset: vi.fn(),
   getDatasetBars: vi.fn(),
+  // The chart's page index (tj-grna9p.124): mocked so the smoke never reaches a real fetch.
+  getDatasetBarPages: vi.fn(),
 }))
 // The shell opens the shared events socket on mount (tj-grna9p.76): replaced so no real WebSocket opens.
 vi.mock('@/api/events', async (importOriginal) =>
@@ -68,6 +70,7 @@ describe('dataset viewer smoke', () => {
       bars: [create(BarSchema, { open: 1, high: 2, low: 1, close: 2, volume: 10 })],
       nextCursor: '',
     })
+    mocks.getDatasetBarPages.mockResolvedValue({ barCount: 1n, pageSize: 1000, overlap: 50, pages: [{ start: create(TimestampSchema, { seconds: 1_788_000_000n }), offset: 0n }] })
   })
 
   it('shows the header from the detail, with an unknown badge when health is unset', async () => {

@@ -17,8 +17,9 @@ manifest is at `server/routers/tests/interface_manifest/`.
 **Updated for the collection record and live events (2026-10).** The tree then gained the dataset's
 run history and coverage strip (U6, U7), the live-event socket (U8), the Viewer's page index (U9), the
 `ingest_run` record behind S1, and two request-body fields that are accepted and ignored. The U5
-`limit` maximum went from 10,000 to 50,000. Those entries and the ones they changed say so. What is *not* built is named where it would be looked for: no request log, queue or
-scheduler, no write route under `/ui/v1`, and no ops or collection-statistics read.
+`limit` maximum went from 10,000 to 50,000. Those entries and the ones they changed say so. What is
+*not* built is named where it would be looked for: no request log, queue or scheduler, no write route
+under `/ui/v1`, and no ops or collection-statistics read.
 
 **Checked on real Postgres, with named gaps.** Every status code and behaviour below was checked in
 process, against the code and its tests. On 2026-09-29 the owner ran the system suite

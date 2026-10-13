@@ -36,6 +36,7 @@ completeness, so a short answer from them is not distinguishable from a complete
 | Trading calendar | one per data source (`SOURCE_CALENDARS`, offline `exchange_calendars`); a source with none has no computed freshness |
 | Status vocabulary the UI filters by | `StatusGroup` in `app/dataset_catalog.py`: healthy, late, failed, retired |
 | Catalog listing, facets, bar paging | `app/dataset_catalog.py` over `app/database/crud/stock/dataset_catalog.py`; keyset cursors, opaque, bound to their sort |
+| Bar page index (`GET /ui/v1/datasets/{id}/bar-pages`, the Viewer's paging) | `bar_page_index` in `app/dataset_catalog.py`, `read_bar_page_starts` in `app/database/crud/stock/dataset_catalog.py` |
 | Coverage strip (`GET /ui/v1/datasets/{id}/coverage`): buckets and gap windows | `coverage_buckets` and `local_midnight` in `app/freshness.py`, composed by `dataset_coverage` in `app/dataset_catalog.py` |
 
 Things that bite:
@@ -51,6 +52,8 @@ Things that bite:
   request's statement count is constant, never one per dataset.
 - **Two gap counts, in different units.** `CoverageStrip.gap_count` counts gap *intervals* (maximal runs of missing completed sessions); `Freshness.gap_count` counts missing *sessions*. For a `STATIC` dataset the sessions of all gaps add up to the freshness count. The strip lists at most 500 gaps (`MAX_COVERAGE_GAPS`), so `gap_count` may exceed the list.
 - **A gap window is whole sessions**: from the local midnight of its first session to the local midnight after its last, so it can start before or end after the dataset's range. Buckets are clipped to the range; gaps are not. A coverage read costs two statements and records no usage. With no trading calendar covering the dataset it is a 422, never an empty strip, which would read as no gaps.
+- **The page index is fixed blocks counted back from the newest bar**, so the earliest page, not the newest, takes the remainder and overlaps its neighbour. Offsets are `[0 if r > 0], r, r + size, ..., N - size` with r = N mod size; `overlap` is the client's look-ahead and never moves one. It is two statements (the entry, then one read that scans the window twice: a count and the ranks), about 0.7 s at 2.4M bars, and it is a snapshot of the window it was read for.
+- **Two maximums, kept apart.** `MAX_BAR_LIMIT` (the UI bars read) is 50,000 and `MAX_PAGE_INDEX_SIZE` (the page index `size`) is 1,000. Raising the first does not raise the second.
 - **Expiry is optional.** None means the dataset never expires; setting one on a `DAILY` or `STREAM`
   dataset retires it, and a repeat request sets expiry from its body, so omitting it clears a stored one.
 

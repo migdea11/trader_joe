@@ -3,6 +3,8 @@ export type { GetOptions } from './client'
 export {
   getDataset,
   getDatasetCoverage,
+  getDatasetBarPages,
+  getDatasetBarPagesRequest,
   getDatasetBars,
   getDatasetBarsRequest,
   getDatasetFacets,
@@ -14,6 +16,7 @@ export {
 export type {
   DatasetFilters,
   DatasetSort,
+  GetBarPagesParams,
   GetBarsParams,
   GetRunsParams,
   ListDatasetsParams,
