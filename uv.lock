@@ -1722,6 +1722,7 @@ testing = [
     { name = "pyyaml" },
     { name = "ruff" },
     { name = "urllib3" },
+    { name = "websockets" },
 ]
 
 [package.metadata]
@@ -1777,6 +1778,7 @@ testing = [
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "ruff", specifier = ">=0.14.1" },
     { name = "urllib3", specifier = ">=2.8.0" },
+    { name = "websockets", specifier = ">=17.1" },
 ]
 
 [[package]]

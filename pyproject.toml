@@ -107,6 +107,10 @@ testing = [
     "packaging>=26.3",
     # Imported directly by common/tests (compose_model.py, test_ci_invariants.py, ...) and tools/agent_mcp/tests.
     "pyyaml>=6.0.3",
+    # Imported directly by tests/system/test_ws_ui_events.py (websockets.sync.client). It also arrives
+    # through uvicorn[standard] in base, but this repo declares what its code imports. Test-only, so
+    # never in base or a service group. A floor, matching the lock's 17.1.
+    "websockets>=17.1",
 ]
 data-ingest = [
     "alpaca-py>=0.42.2",
