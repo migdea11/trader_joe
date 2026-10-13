@@ -1,6 +1,6 @@
 # Web UI
 
-The UI: a static Vue 3 single-page app that reads data_store over same-origin REST. Today it holds the Data section: the dataset catalog and the Viewer. Run, build and make targets are in `web/README.md`.
+The UI: a static Vue 3 single-page app that reads data_store over same-origin REST. Today it holds the Data section: the dataset catalog, the Dataset detail and the Viewer. Run, build and make targets are in `web/README.md`.
 
 ## Architecture reference
 
@@ -20,7 +20,10 @@ Vue 3 with `<script setup>` and TypeScript, Vite, Pinia, Vue Router (history mod
 | Ranges are half-open | `[start, end)` everywhere: bar windows, dataset ranges, the Viewer's range controls. |
 | Raw bars only | The Viewer shows unadjusted bars. Split, All and Compare Raw vs Adjusted are disabled with their reason. |
 | Server decides | Freshness, status groups, facet counts and the allowed trading groups come from the server; the UI maps them to words and colours (`src/theme/semantics.ts`) and computes none. Market data is shared across trading groups, so Data pages ignore the toggle. |
-| No polling | `setInterval` is banned by lint. Data refetches on a user action. |
+| No polling | `setInterval` is banned by lint. Data refetches on a user action, on a server event, and once per reconnect of the events socket. |
+| Events are hints | `src/api/events.ts` holds the one shared socket to `/api/store/ui/v1/events` and delivers typed `UiEvent` messages. An event only triggers a REST refetch; a screen never builds state from one alone, except placing a run's own row in the detail's history. A reload signal is emitted after every re-open and never on the first, because screens fetch on mount. |
+| Screens opt in to reload | A screen calls `useEventsReload(refetch)` (`src/shell/useEventsReload.ts`) to refetch after a reconnect. Datasets and Dataset detail do; the Viewer does not yet. |
+| Coverage dates are UTC | A strip or gap boundary is the calendar's local midnight, read as a UTC date (`src/catalog/coverage.ts`), because the client is not told the zone. Correct west of UTC. |
 | Settings stay in the browser | One versioned `localStorage` object (`src/stores/settings.ts`); storage that is missing or throws falls back to defaults in memory. |
 
 ## Generated code
@@ -68,5 +71,6 @@ The About and Credits modal is generated from data, not written by hand. `src/sh
 | 2 | `npm run dev` runs `buf generate` first and the dev container has no buf | the compose file runs `vite` directly; regenerate on the host with `make gen-proto-ts` |
 | 3 | A new `/ui/v1` message field is invisible until `gen/proto/ts` is regenerated | `make gen-proto-ts`, then restart a stuck dev server |
 | 4 | A server field the UI does not know is ignored on decode, so a stale build keeps working but cannot show it | rebuild after a proto change |
+| 5 | Every component test that mounts the shell opens an events socket unless the events client is mocked | `vi.mock('@/api/events', ...)` with the fixture in `src/__tests__/fakeEvents.ts`, as `shell.spec.ts` does |
 
 A pitfall lands here when it is true of this component and nowhere else.

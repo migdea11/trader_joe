@@ -4,6 +4,12 @@ framework for testing trading algos
 ## Design
 ![Design Image](docs/img/design.jpg)
 
+**Direction, not built:** request scheduling moves to ingest, with the store keeping the request log
+and each request's state (decided by the owner on 2026-10-12, recorded on decision record `tj-pd41mt`,
+whose end-state design is still being written up). Today there is no
+request log, queue or scheduler: a request is a `POST /store`, and the store only records each fetch
+it drives as a run.
+
 ## Getting Started
 Take a look at the `Makefile` for all the major commands. Every compose target names the stack it
 means — `dev-*` builds and runs the development images (live reload, debug logging, the debugger,
@@ -81,7 +87,9 @@ answers without credentials.
 
 ## The web UI
 
-A browser UI for the dataset catalog and a per-dataset viewer (candles, volume and a paged bar table).
+A browser UI for the dataset catalog, a per-dataset detail (coverage and gaps, run history) and a
+viewer (candles, volume and a paged bar table). It updates live: data_store pushes a notification over
+a WebSocket whenever a dataset or a collection run changes, and the UI refetches.
 Its source is in [`web/`](web/README.md): a Vue 3 single-page app, built once and served as static
 files.
 
@@ -103,6 +111,11 @@ and a browser cannot use the proxy to write. The dev proxy is not
 that filter: the Vite proxy forwards everything under `/api/store`, any method and any path, strips the
 prefix and never injects the secret, so a write from the dev server reaches the store without it and is
 refused.
+The live socket, `GET /api/store/ui/v1/events`, is an upgraded `GET` and passes the same filter.
+data_store must run **one worker** for it to be correct, because the hub that fans events out is in
+the process's memory: `docker-compose.yaml` pins `SERVICE_WORKERS=1` for it, and the env file cannot
+change that. `EVENTS_CLIENT_QUEUE_SIZE` (default 256) is how many events a slow client may hold
+before it is dropped and reconnects.
 There is no login: access is network-only, so run it only where the network is trusted.
 
 **The licence key.** The UI uses PrimeVue 5 under the PrimeUI Community licence, which needs a key.
@@ -186,6 +199,12 @@ ranges that only touch (one ends where the next starts) do not overlap, a bar st
 `end` belongs to the next range, and a declared `end` that is not after `start` is refused with a 422.
 A dataset's freshness (healthy, late, failed or retired) and completeness are not stored: the server
 computes them on read, against a trading calendar for the dataset's source.
+
+What *is* stored about collection is a **run**: each store-driven fetch writes one `ingest_run` row,
+`RUNNING` while the vendor answers and then `SUCCEEDED`, `EMPTY` (the vendor held no bars) or `FAILED`
+with the typed error. A run left `RUNNING` by a process that stopped is marked `FAILED` with reason
+`INTERRUPTED` at the next start. Runs outlive their dataset's deletion but are read per dataset, so a
+deleted dataset's runs are no longer reachable.
 
 Bars are stored **raw**. There are no split or dividend factors on a bar, and corporate-action
 adjustment on read is decided but **not built** — everything returned today is unadjusted.

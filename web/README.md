@@ -2,9 +2,10 @@
 
 The UI: a static single-page app. Vue 3, TypeScript and Vite, with PrimeVue 5 for components, Pinia,
 Vue Router, AG Grid Community for tables, Lightweight Charts and Apache ECharts for charts, and Lucide
-for icons. It shows the Data section: the dataset catalog (**Datasets**) and a per-dataset **Viewer**
-with a candle chart and a paged bar table. Requests, Health and Usage are placeholders until their
-routes exist.
+for icons. It shows the Data section: the dataset catalog (**Datasets**), a per-dataset **Dataset
+detail** (overview, coverage and gaps, run history) and a **Viewer** with a candle chart and a paged
+bar table. Requests, Health and Usage are placeholders: their tabs render disabled ("Not built yet")
+until their routes exist.
 
 ## Why the UI lives in this public repo
 
@@ -17,6 +18,8 @@ Strategy-specific metrics are add-ons, and only the add-ons are private.
 
 - **REST carrying JSON**, same-origin, GET only today. No gRPC on the browser wire: browsers cannot
   read HTTP/2 trailers, which is how gRPC signals status.
+- **One WebSocket**, `/api/store/ui/v1/events`, which pushes notifications that something changed. It
+  carries no data: an event is a hint to refetch over REST. See [Live events](#live-events).
 - **The `.proto` files are the one definition of the message types**, for the Python server and for
   this app. A UI payload is the protobuf canonical JSON of a generated message, decoded with
   `fromJson` from the generated schema, never a hand-written TypeScript twin. Endpoint paths and
@@ -88,16 +91,55 @@ is written into `web/`, and nothing under `gen/` is edited by hand.
 `make lint` also runs eslint and vue-tsc when `PATHS` is `.` or under `web/`. CI runs the same chain in
 its Web job.
 
+## Live events
+
+The app holds one WebSocket to `/api/store/ui/v1/events` (`src/api/events.ts`), opened by the first
+subscriber and kept for the app's life. Each text frame is the protobuf canonical JSON of a `UiEvent`,
+decoded with `fromJson`; a frame that does not decode is logged and dropped. A drop reconnects with a
+backoff of 1 second doubling to 30, and a close with 1013 (the server dropped a slow client)
+reconnects the same way.
+
+- **Published today:** `IngestRunChanged` and `DatasetChanged`. `RequestChanged` and
+  `ReaperPendingChanged` are typed and have no publisher, so nothing consumes them.
+- **The connection indicator** in the top bar reads Connecting (before the first open), Connected, or
+  Reconnecting (after a drop). There is no Offline state: a drop is Reconnecting.
+- **Reload on reconnect.** After every re-open, never the first, each mounted **Datasets** and
+  **Dataset detail** screen refetches over REST, since events may have been missed while the socket
+  was down. It is a refetch, not a page reload: filters, selection and scroll stay. The **Viewer is
+  not live yet**: it neither refetches on events nor reloads on reconnect.
+- **Bursts are coalesced.** A run writes several state changes, so a screen waits 500 ms after the
+  first event and refetches once. Datasets refetches the counts, the rows it holds and the coverage
+  strips of the datasets that changed; Dataset detail updates the run's row in place and refetches
+  the overview and coverage once.
+- **Events are hints.** An event can name a dataset the store has not committed yet, so a reload by
+  id may briefly 404. REST is the truth.
+
+## The Data screens
+
+| Screen | Route | Holds |
+|---|---|---|
+| Datasets | `/data/datasets` | the catalog grid. The **Collection** column reads Running while the dataset's latest run is in flight and its freshness word otherwise; the **Coverage** column is a strip fetched lazily for the rows in view. The sidebar's Collection group has Running as its own toggle (`?running=true`), combinable with one freshness choice. A row opens the detail |
+| Dataset detail | `/data/datasets/:id` | **Overview** (owner, range, bars, last bar, a link to the Viewer), **Coverage** (the strip and its gap list), **History** (the dataset's runs, newest first, Load More by cursor) and **Retention**, which is read-only: the expiry type and time, with no control |
+| Viewer | `/data/datasets/:id/viewer` | candles, volume and a paged bar table |
+
+- **Gap and strip dates are UTC days.** The client is not told the calendar's time zone, so a
+  boundary, which is the calendar's local midnight, is read as a UTC date, whatever the display zone
+  setting says. That is right for calendars west of UTC, and the only calendar mapped is NYSE.
+- **Running appears only once ingest has acknowledged the fetch**, so a first-time request is not
+  shown as Running while the vendor is still answering.
+- **Not built:** Requests, Health and Usage (disabled tabs; their routes show a not-built page); any retention control; Request the Gap
+  and All Runs; a Quota Key column, since the server does not record one.
+
 ## Layout
 
 | Path | Holds |
 |---|---|
-| `src/api/` | the fetch wrapper (`client.ts`), typed dataset reads, error mapping |
-| `src/stores/` | Pinia stores: catalog, viewer, settings, trading group, UI config |
-| `src/shell/` | the frame: top bar, sub-tabs, status footer, settings panel, About and Credits |
-| `src/views/data/` | the Datasets and Viewer screens and their sidebars |
-| `src/catalog/`, `src/viewer/` | pure logic behind those screens: filters, facets, cursor paging, range and bar windows |
-| `src/components/` | grid, tiles, charts, bar table, badges |
+| `src/api/` | the fetch wrapper (`client.ts`), typed dataset reads, error mapping, the events client (`events.ts`) |
+| `src/stores/` | Pinia stores: catalog, dataset detail, dataset coverage, viewer, settings, trading group, UI config |
+| `src/shell/` | the frame: top bar, sub-tabs, status footer, settings panel, About and Credits, the events indicator and reload hook |
+| `src/views/data/` | the Datasets, Dataset detail and Viewer screens and their sidebars |
+| `src/catalog/`, `src/viewer/` | pure logic behind those screens: filters, facets, cursor paging, coverage wording, range and bar windows |
+| `src/components/` | grid, tiles, charts (including the coverage strip), runs table, bar table, badges |
 | `src/theme/` | tokens and everything derived from them; see its README |
 | `src/format/` | number, price, date and time-zone formatting |
 
@@ -112,4 +154,5 @@ settings route.
 
 ## Why no polling
 
-`setInterval` is banned in `web/src`. The UI refetches on a user action, and later on a server event.
+`setInterval` is banned in `web/src`. The UI refetches on a user action, on a server event (see
+[Live events](#live-events)) and once after a reconnect. Nothing polls.

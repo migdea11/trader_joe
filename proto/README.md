@@ -43,10 +43,11 @@ accepted as a starting point (tj-3mk3u5.42 F1, rule 8):
 | Package | Holds |
 |---|---|
 | `trader_joe.proto.market.v1` | The shared vocabulary: `Bar` and the market-data enums. Imports `google/protobuf` only. |
-| `trader_joe.proto.internal.ingest.v1` | `FetchDataset`, the data_store to data_ingest contract. |
+| `trader_joe.proto.internal.ingest.v1` | `FetchDataset`, the data_store to data_ingest contract. `Quote` is declared here too and is **reserved**: no server and no caller. |
+| `trader_joe.proto.internal.store.v1` | `StoreService.Bootstrap`, data_ingest to data_store at start-up. **Reserved**: declared, no server and no caller, and due to be rewritten. |
 | `trader_joe.proto.internal.latency.v1` | The latency harness probe, `LatencyService.Probe`. Internal: both ends deploy together. |
 | `trader_joe.proto.data.v1` | The external streaming contract. The name is provisional. |
-| `trader_joe.proto.ui.v1` | The UI's messages: datasets, facets and bar pages (`data.proto`), and the shell configuration (`shell.proto`). Served as protobuf canonical JSON over REST, never as binary. Ranges in it are half-open `[start, end)`. |
+| `trader_joe.proto.ui.v1` | The UI's messages, served as protobuf canonical JSON over REST (and, for events, over a WebSocket), never as binary. Ranges in it are half-open `[start, end)`. `data.proto`: datasets, facets, bar pages and runs (`IngestRun`, `IngestRunPage`); `stats.proto`: `CoverageStrip`; `events.proto`: `UiEvent`; `shell.proto`: the shell configuration. **Served:** the dataset, facet, bar, run and coverage messages and `UiEvent` with `DatasetChanged` and `IngestRunChanged`. **Reserved, no server, and due to change before the SDK release:** the request and request-log messages in `data.proto` and `ops.proto`, the collection statistics in `stats.proto`, and `RequestChanged` and `ReaperPendingChanged`. |
 | `trader_joe.proto.ping.v1` | The pipeline proof. |
 
 The rules:
