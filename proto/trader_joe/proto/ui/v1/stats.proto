@@ -1,0 +1,81 @@
+// THE UI'S COVERAGE AND COLLECTION STATISTICS, PHASE 2 (tj-grna9p.70).
+//
+// HALF-OPEN RANGES. Every range here is [start, end): start included, end excluded.
+//
+// A DAY is a UTC calendar day as a 'YYYY-MM-DD' string. google.type.Date would need a googleapis
+// include root, which is also why ingest.proto mirrors ErrorInfo rather than importing it.
+//
+// No credential material crosses here.
+syntax = "proto3";
+
+package trader_joe.proto.ui.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+// A stretch of sessions, with how many of them hold bars.
+message CoverageBucket {
+  // Half-open [start, end): start included, end excluded.
+  google.protobuf.Timestamp start = 1;
+  google.protobuf.Timestamp end = 2;
+  int32 expected_sessions = 3;
+  int32 sessions_with_bars = 4;
+}
+
+// A run of consecutive sessions with no bar.
+message CoverageGap {
+  // Half-open [start, end): start included, end excluded.
+  google.protobuf.Timestamp start = 1;
+  google.protobuf.Timestamp end = 2;
+  int32 sessions = 3;
+}
+
+// A dataset's coverage over its range, bucketed for a strip.
+message CoverageStrip {
+  // The range covered, half-open [start, end): start included, end excluded.
+  google.protobuf.Timestamp start = 1;
+  google.protobuf.Timestamp end = 2;
+  repeated CoverageBucket buckets = 3;
+  repeated CoverageGap gaps = 4;
+  // The total number of gaps, which may exceed the length of gaps if the server truncates it.
+  int32 gap_count = 5;
+  google.protobuf.Timestamp as_of = 6;
+}
+
+message BarsPerDayEntry {
+  // A UTC calendar day, 'YYYY-MM-DD'.
+  string day = 1;
+  // Bars written that day, by what started the run.
+  int64 schedule = 2;
+  int64 request = 3;
+  int64 retry = 4;
+}
+
+message BarsPerDay {
+  repeated BarsPerDayEntry days = 1;
+}
+
+message RunDurationEntry {
+  // A UTC calendar day, 'YYYY-MM-DD'.
+  string day = 1;
+  google.protobuf.Duration p50 = 2;
+  google.protobuf.Duration p95 = 3;
+  // The runs the percentiles are over.
+  int64 runs = 4;
+}
+
+message RunDurationPerDay {
+  repeated RunDurationEntry days = 1;
+}
+
+message RunOutcomesEntry {
+  // A UTC calendar day, 'YYYY-MM-DD'.
+  string day = 1;
+  int64 succeeded = 2;
+  int64 empty = 3;
+  int64 failed = 4;
+}
+
+message RunOutcomesPerDay {
+  repeated RunOutcomesEntry days = 1;
+}

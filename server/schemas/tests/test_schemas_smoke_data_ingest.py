@@ -45,6 +45,7 @@ from schemas.data_ingest.get_dataset_request import (
     OptionDatasetRequest,
     StockDatasetRequest,
 )
+from schemas.data_ingest.quote import QuoteResult, ScopeCapacity
 
 
 pytestmark = pytest.mark.data_ingest
@@ -53,7 +54,14 @@ pytestmark = pytest.mark.data_ingest
 # Committed module inventory. Discovery on its own is vacuous -- a package that lost every module
 # would still 'import all of them'. Asserting the discovered set EQUALS this one is what makes the
 # import test fail on a module that was moved, renamed or deleted by the Phase 1 re-path.
-EXPECTED_MODULES = frozenset({'schemas.data_ingest.get_dataset_request', 'schemas.data_ingest.fetch_dataset'})
+EXPECTED_MODULES = frozenset(
+    {
+        'schemas.data_ingest.get_dataset_request',
+        'schemas.data_ingest.fetch_dataset',
+        # tj-grna9p.44 item 8b: the domain side of the internal Quote call.
+        'schemas.data_ingest.quote',
+    }
+)
 
 DATASET_ID = UUID('00000000-0000-0000-0000-000000000001')
 WHEN = datetime(2026, 1, 1, tzinfo=UTC)
@@ -119,6 +127,7 @@ _BAR_PAYLOAD: dict[str, Any] = {
     'feed': Feed.IEX,
 }
 _SERVED_RANGE_PAYLOAD: dict[str, Any] = {'start': WHEN, 'end': WHEN}
+_SCOPE_PAYLOAD: dict[str, Any] = {'quota_key': 'alpaca-a', 'cap': 200, 'remaining': 150, 'window_seconds': 60}
 
 # Every public model in the package, with a minimal valid payload. Minimal means: every required
 # field and nothing else.
@@ -135,6 +144,9 @@ CONSTRUCT_CASES: list[tuple[type[BaseModel], dict[str, Any]]] = [
     (FetchRefused, {'reason': 'FEED_NOT_AVAILABLE', 'domain': 'trader-joe', 'detail': 'no SIP entitlement'}),
     (ServedRange, _SERVED_RANGE_PAYLOAD),
     (FetchDone, {'bar_count': 0, 'served_range': ServedRange(**_SERVED_RANGE_PAYLOAD), 'as_of': WHEN}),
+    # reset_at is optional (None when the scope has no known reset), so it is not in the minimal set.
+    (ScopeCapacity, _SCOPE_PAYLOAD),
+    (QuoteResult, {'estimated_vendor_calls': 0, 'quota_key': 'alpaca-a', 'scopes': [ScopeCapacity(**_SCOPE_PAYLOAD)]}),
 ]
 
 # Public classes in the package that are NOT Pydantic models, and so are covered by a dedicated

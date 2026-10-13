@@ -1,0 +1,52 @@
+// THE data_ingest -> data_store BOOTSTRAP CONTRACT (tj-grna9p.44; decision tj-grna9p.9 item 6).
+// This is the OPPOSITE direction to ingest.proto: data_store serves it and data_ingest calls it,
+// once, at start-up, to rebuild what ingest holds only in memory.
+//
+// INTERNAL: both ends ship from this repository in one release, and buf's breaking checks ignore
+// trader_joe.proto.internal. A contract may import market/v1 and never another contract, which is
+// why nothing here embeds the fetch request: a request is named by a RequestRef instead.
+//
+// NO CREDENTIAL MATERIAL crosses here. quota_key is a non-secret configured label, never key
+// material and never a hash of it.
+syntax = "proto3";
+
+package trader_joe.proto.internal.store.v1;
+
+service StoreService {
+  // Unary. The wire path is /trader_joe.proto.internal.store.v1.StoreService/Bootstrap.
+  rpc Bootstrap(BootstrapRequest) returns (BootstrapResponse);
+}
+
+// The quota windows ingest wants usage for.
+message QuotaWindow {
+  string quota_key = 1;
+  uint64 window_seconds = 2;
+}
+
+message BootstrapRequest {
+  repeated QuotaWindow windows = 1;
+}
+
+// A request in the store's log, by handle.
+message RequestRef {
+  // The request-log id, as text.
+  string request_id = 1;
+  // The scope it was charged to, empty when it was not yet charged.
+  string quota_key = 2;
+  uint64 estimated_vendor_calls = 3;
+}
+
+// Vendor calls already charged to a scope in its current window.
+message WindowUsage {
+  string quota_key = 1;
+  uint64 window_seconds = 2;
+  uint64 calls_in_window = 3;
+}
+
+message BootstrapResponse {
+  // Requests the store had sent to ingest and not seen finish.
+  repeated RequestRef in_flight = 1;
+  // Requests queued and not yet sent.
+  repeated RequestRef pending = 2;
+  repeated WindowUsage usage = 3;
+}

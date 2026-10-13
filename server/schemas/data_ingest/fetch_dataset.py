@@ -74,6 +74,14 @@ class FetchDatasetRequest(InboundContract):
     # tape, or a refused ack": ingest resolves the tape it is entitled to and can only CHECK a named feed
     # against it, never be steered by one (tj-3mk3u5.22 Q5).
     feed: Feed | None = None
+    # The store's request-log handle for this fetch (tj-grna9p.44). None, which is the empty string on
+    # the wire, means the fetch has no request-log entry. It is NOT a page correlation key: pages carry
+    # none, because correlation belongs to the transport.
+    request_id: str | None = None
+    # When the requester wants the data by. None means none. Carried and unused: PR 4's queue is FIFO.
+    ready_by: AwareDatetime | None = None
+    # The requester accepts a partial or late answer. Carried and unused, like ready_by.
+    best_effort: bool = False
 
 
 class Bar(InboundContract):

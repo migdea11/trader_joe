@@ -55,6 +55,7 @@ from schemas.data_store.asset_dataset_store import (
     AssetDatasetStoreUpdate,
     ServedRange,
     StoreAssetDatasetBody,
+    StoreAssetDatasetFields,
     StoreAssetDatasetPath,
     StoreAssetDatasetQuery,
     StoreAssetDatasetResponse,
@@ -199,6 +200,10 @@ CONSTRUCT_CASES: list[tuple[type[BaseModel], dict[str, Any]]] = [
         | _BAR_IDENTITY
         | {'data': _OPAQUE_DATA, 'id': 1, 'created_at': WHEN, 'updated_at': WHEN},
     ),
+    # tj-grna9p.71 split the body: StoreAssetDatasetFields holds the dataset's fields and is what the
+    # entry models inherit; the body adds the request-only ready_by, best_effort and STREAM refusal.
+    # Same required set on both, because the two request-only fields have defaults.
+    (StoreAssetDatasetFields, _DATASET_BODY),
     (StoreAssetDatasetBody, _DATASET_BODY),
     (StoreAssetDatasetPath, _DATASET_PATH),
     (AssetDatasetStoreCreate, _DATASET_BODY | _DATASET_PATH | _RESOLVED),
@@ -920,37 +925,154 @@ _EXPIRY_BY_UPDATE_TYPE: dict[str, dict[str, Any]] = {
     'STREAM': {'update_type': UpdateType.STREAM, 'expiry_type': ExpiryType.ROLLING},
 }
 
+# WHICH MODEL CARRIES EACH UPDATE TYPE since tj-grna9p.71. The body refuses a STREAM create, so the
+# body is driven with STATIC and DAILY only (STREAM's refusal is pinned by its own tests below). The
+# expiry default still matters for STREAM, because a stored STREAM entry is validated through
+# StoreAssetDatasetFields, the class every entry model inherits -- so STREAM is driven there.
+_EXPIRY_CASES: list[tuple[type[BaseModel], dict[str, Any]]] = [
+    (StoreAssetDatasetBody, _EXPIRY_BY_UPDATE_TYPE['STATIC']),
+    (StoreAssetDatasetBody, _EXPIRY_BY_UPDATE_TYPE['DAILY']),
+    (StoreAssetDatasetFields, _EXPIRY_BY_UPDATE_TYPE['STATIC']),
+    (StoreAssetDatasetFields, _EXPIRY_BY_UPDATE_TYPE['DAILY']),
+    (StoreAssetDatasetFields, _EXPIRY_BY_UPDATE_TYPE['STREAM']),
+]
+_EXPIRY_CASE_IDS = ['Body-STATIC', 'Body-DAILY', 'Fields-STATIC', 'Fields-DAILY', 'Fields-STREAM']
 
-@pytest.mark.parametrize('extra', list(_EXPIRY_BY_UPDATE_TYPE.values()), ids=list(_EXPIRY_BY_UPDATE_TYPE))
-def test_an_omitted_expiry_is_none_for_every_update_type(extra: dict[str, Any]):
+
+@pytest.mark.parametrize(('model', 'extra'), _EXPIRY_CASES, ids=_EXPIRY_CASE_IDS)
+def test_an_omitted_expiry_is_none_for_every_update_type(model: type[BaseModel], extra: dict[str, Any]):
     """Pin the new default: omitted means None (never expires), not a computed instant.
 
     The regression to catch is a return of the now + 1 day default factory, which would make a
     dataset requested without an expiry quietly lapse a day later.
 
     Args:
+        model: The body, or the fields class the entry models inherit.
         extra: The update and expiry type fields that select the update type under test.
     """
-    body = StoreAssetDatasetBody(**_DATASET_BODY | extra)
+    body = model(**_DATASET_BODY | extra)
 
     assert 'expiry' not in body.model_fields_set, 'the default was not the one exercised'
     assert body.expiry is None
-    assert StoreAssetDatasetBody.model_fields['expiry'].default_factory is None
+    assert model.model_fields['expiry'].default_factory is None
 
 
-@pytest.mark.parametrize('extra', list(_EXPIRY_BY_UPDATE_TYPE.values()), ids=list(_EXPIRY_BY_UPDATE_TYPE))
-def test_an_explicit_aware_expiry_is_kept_as_sent(extra: dict[str, Any]):
+@pytest.mark.parametrize(('model', 'extra'), _EXPIRY_CASES, ids=_EXPIRY_CASE_IDS)
+def test_an_explicit_aware_expiry_is_kept_as_sent(model: type[BaseModel], extra: dict[str, Any]):
     """The other half: a None default must not swallow a value the caller did send.
 
     Args:
+        model: The body, or the fields class the entry models inherit.
         extra: The update and expiry type fields that select the update type under test.
     """
     expiry = datetime(2026, 2, 1, 16, tzinfo=timezone(timedelta(hours=-5)))
 
-    body = StoreAssetDatasetBody(**_DATASET_BODY | extra | {'expiry': expiry})
+    body = model(**_DATASET_BODY | extra | {'expiry': expiry})
 
     assert body.expiry == expiry
     assert body.expiry.utcoffset() == timedelta(hours=-5)
+
+
+# ---------------------------------------------------------------------------------------------
+# tj-grna9p.71: THE REQUEST-ONLY FIELDS, AND THE STREAM CREATE REFUSAL
+
+
+def test_a_body_without_ready_by_or_best_effort_yields_none_and_false():
+    """Acceptance (.78): the old body validates unchanged, and the two new fields take their defaults."""
+    body = StoreAssetDatasetBody(**_DATASET_BODY)
+
+    assert (body.ready_by, body.best_effort) == (None, False)
+    assert not {'ready_by', 'best_effort'} & body.model_fields_set, 'the defaults were not the ones exercised'
+
+
+@pytest.mark.parametrize('form', ['object', 'json'])
+def test_ready_by_and_best_effort_round_trip_on_the_body(form: str):
+    """Both values survive construction and a JSON round trip, and ready_by keeps its offset.
+
+    Args:
+        form: Built from Python values, or validated from the JSON a caller sends.
+    """
+    ready_by = datetime(2026, 2, 1, 9, 30, tzinfo=timezone(timedelta(hours=-5)))
+    payload = _DATASET_BODY | {'ready_by': ready_by, 'best_effort': True}
+
+    if form == 'object':
+        body = StoreAssetDatasetBody(**payload)
+    else:
+        body = StoreAssetDatasetBody.model_validate_json(_as_json(payload))
+    again = StoreAssetDatasetBody.model_validate_json(body.model_dump_json())
+
+    for value in (body, again):
+        assert (value.ready_by, value.best_effort) == (ready_by, True)
+        assert value.ready_by.utcoffset() == timedelta(hours=-5)
+
+
+@pytest.mark.parametrize('form', ['object', 'json'])
+def test_a_naive_ready_by_is_refused_at_its_own_field(form: str):
+    """REFUSE, don't convert (tj-1bl90i), on the new field as on every other instant of the body.
+
+    Args:
+        form: A naive Python datetime, or offset-less ISO text in JSON.
+    """
+    naive = datetime(2026, 2, 1, 9, 30)
+    with pytest.raises(ValidationError) as excinfo:
+        if form == 'object':
+            StoreAssetDatasetBody(**_DATASET_BODY | {'ready_by': naive})
+        else:
+            StoreAssetDatasetBody.model_validate_json(_as_json(_DATASET_BODY | {'ready_by': naive}))
+
+    assert [(error['loc'], error['type']) for error in excinfo.value.errors()] == [(('ready_by',), 'timezone_aware')]
+
+
+@pytest.mark.parametrize(
+    'model', [StoreAssetDatasetFields, AssetDatasetStoreCreate, AssetDatasetStoreUpdate, AssetDatasetStore]
+)
+def test_no_entry_model_carries_the_request_only_fields(model: type[BaseModel]):
+    """Acceptance (.78): ready_by and best_effort belong to the REQUEST, never to the entry.
+
+    So the fields class and every model that inherits it -- the write models and the read model behind
+    GET /store -- declare neither, and refuse both as unknown fields rather than storing or echoing them.
+
+    Args:
+        model: The fields class or an entry model.
+    """
+    assert not {'ready_by', 'best_effort'} & set(model.model_fields)
+    assert not issubclass(model, StoreAssetDatasetBody), f'{model.__name__} inherits the request body again'
+
+
+def test_a_stream_create_body_is_refused_naming_stream_and_the_alternatives():
+    """Decision tj-grna9p.9 item 2: STREAM is deferred, so a STREAM create is a value error on the body.
+
+    A model-level ValueError, which install_error_handlers renders as a 422 INVALID_REQUEST (pinned at
+    the route in data/store/tests). One error, and its message names STREAM and the two offered types.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        StoreAssetDatasetBody(**_DATASET_BODY | _EXPIRY_BY_UPDATE_TYPE['STREAM'])
+
+    errors = excinfo.value.errors()
+    assert [error['type'] for error in errors] == ['value_error']
+    assert 'STREAM' in errors[0]['msg']
+    assert 'STATIC' in errors[0]['msg'] and 'DAILY' in errors[0]['msg']
+
+
+@pytest.mark.parametrize('model', [StoreAssetDatasetFields, AssetDatasetStore])
+def test_a_stored_stream_entry_still_validates(model: type[BaseModel]):
+    """The refusal runs on the body ONLY: a STREAM entry already stored must stay readable (GET /store).
+
+    Args:
+        model: The fields class, or the read model a stored row is validated into.
+    """
+    payload = _DATASET_BODY | _EXPIRY_BY_UPDATE_TYPE['STREAM']
+    if model is AssetDatasetStore:
+        payload |= (
+            _DATASET_PATH | _RESOLVED | {'id': DATASET_ID, 'item_count': 0, 'created_at': WHEN, 'updated_at': WHEN}
+        )
+
+    assert model(**payload).update_type is UpdateType.STREAM
+
+
+def test_the_search_query_still_accepts_stream():
+    """StoreAssetDatasetQuery is a filter over stored entries, and STREAM entries exist (tj-grna9p.71)."""
+    assert StoreAssetDatasetQuery(update_type=UpdateType.STREAM.name).update_type is UpdateType.STREAM
 
 
 # The three create-body fields bound for timestamptz columns, each with an OFFSET-LESS instant that
@@ -963,7 +1085,12 @@ _NAIVE_INSTANTS: dict[str, datetime] = {
     'expiry': datetime(2026, 2, 1),
 }
 
-_WRITE_MODELS = [StoreAssetDatasetBody, AssetDatasetStoreCreate, AssetDatasetStoreUpdate]
+# StoreAssetDatasetFields joined with tj-grna9p.71: it now DECLARES the validators the body used to,
+# so it is the one model where they are pinned independent of the body's own STREAM refusal.
+_WRITE_MODELS = [StoreAssetDatasetBody, StoreAssetDatasetFields, AssetDatasetStoreCreate, AssetDatasetStoreUpdate]
+
+# The models validated WITHOUT the path and the resolved feed: the body and the fields class it extends.
+_BODY_SHAPED = (StoreAssetDatasetBody, StoreAssetDatasetFields)
 
 
 def _write_payload(model: type[BaseModel]) -> dict[str, Any]:
@@ -976,7 +1103,7 @@ def _write_payload(model: type[BaseModel]) -> dict[str, Any]:
         dict[str, Any]: The payload, ready to have one field replaced.
     """
     payload = dict(_DATASET_BODY)
-    if model is not StoreAssetDatasetBody:
+    if model not in _BODY_SHAPED:
         # The entry models require the RESOLVED feed; the body's own feed is optional and stays
         # out, so these payloads also keep the two values apart (tj-3mk3u5.30).
         payload |= _DATASET_PATH | _RESOLVED
@@ -1807,9 +1934,11 @@ def test_a_dataset_search_bound_stays_optional_and_none_means_no_constraint(fiel
 # what the private SDK reads, so the pin at the HTTP layer lives in
 # data/store/tests/test_store_dataset_entry_route.py beside these.
 #
-# The five models that carry the encoders, directly or by inheritance.
+# The six models that carry the encoders, directly or by inheritance. StoreAssetDatasetFields is the
+# declaring class since tj-grna9p.71; the body inherits them from it.
 _ENUM_WIRE_MODELS = [
     StoreAssetDatasetBody,
+    StoreAssetDatasetFields,
     StoreAssetDatasetQuery,
     AssetDatasetStoreCreate,
     AssetDatasetStoreUpdate,
@@ -1823,6 +1952,18 @@ _ENUM_WIRE_MODELS = [
 _ENUM_WIRE_PAIRS: list[tuple[ExpiryType, UpdateType]] = [(member, UpdateType.STATIC) for member in ExpiryType] + [
     (ExpiryType.ROLLING, member) for member in UpdateType if member is not UpdateType.STATIC
 ]
+
+# Every (model, expiry, update) the wire tests drive: every model under every pair, EXCEPT the body
+# under STREAM, which the body refuses by design (tj-grna9p.71; pinned by
+# test_a_stream_create_body_is_refused_naming_stream_and_the_alternatives). STREAM's wire form is still
+# pinned on the fields class and the entry and query models, which is where a stored STREAM row lives.
+_ENUM_WIRE_CASES = [
+    (model, expiry_type, update_type)
+    for model in _ENUM_WIRE_MODELS
+    for expiry_type, update_type in _ENUM_WIRE_PAIRS
+    if not (model is StoreAssetDatasetBody and update_type is UpdateType.STREAM)
+]
+_ENUM_WIRE_IDS = [f'{model.__name__}-{e.name}-{u.name}' for model, e, u in _ENUM_WIRE_CASES]
 
 
 def _enum_wire_payload(model: type[BaseModel], expiry_type: ExpiryType, update_type: UpdateType) -> dict[str, Any]:
@@ -1842,7 +1983,7 @@ def _enum_wire_payload(model: type[BaseModel], expiry_type: ExpiryType, update_t
     if model is StoreAssetDatasetQuery:
         return policy
     payload = _DATASET_BODY | {'expiry': WHEN} | policy
-    if model is not StoreAssetDatasetBody:
+    if model not in _BODY_SHAPED:
         payload |= _DATASET_PATH | _RESOLVED
     if model in (AssetDatasetStoreUpdate, AssetDatasetStore):
         payload |= {'id': DATASET_ID}
@@ -1851,10 +1992,7 @@ def _enum_wire_payload(model: type[BaseModel], expiry_type: ExpiryType, update_t
     return payload
 
 
-@pytest.mark.parametrize(
-    ('expiry_type', 'update_type'), _ENUM_WIRE_PAIRS, ids=[f'{e.name}-{u.name}' for e, u in _ENUM_WIRE_PAIRS]
-)
-@pytest.mark.parametrize('model', _ENUM_WIRE_MODELS, ids=lambda model: model.__name__)
+@pytest.mark.parametrize(('model', 'expiry_type', 'update_type'), _ENUM_WIRE_CASES, ids=_ENUM_WIRE_IDS)
 def test_a_dataset_store_model_puts_enum_names_on_the_wire(
     model: type[BaseModel], expiry_type: ExpiryType, update_type: UpdateType
 ):
@@ -1931,10 +2069,7 @@ def test_feed_reaches_the_wire_as_its_member_name_with_no_serializer(member: Fee
     )
 
 
-@pytest.mark.parametrize(
-    ('expiry_type', 'update_type'), _ENUM_WIRE_PAIRS, ids=[f'{e.name}-{u.name}' for e, u in _ENUM_WIRE_PAIRS]
-)
-@pytest.mark.parametrize('model', _ENUM_WIRE_MODELS, ids=lambda model: model.__name__)
+@pytest.mark.parametrize(('model', 'expiry_type', 'update_type'), _ENUM_WIRE_CASES, ids=_ENUM_WIRE_IDS)
 def test_a_dumped_dataset_store_model_validates_back_to_the_same_members(
     model: type[BaseModel], expiry_type: ExpiryType, update_type: UpdateType
 ):
@@ -1965,9 +2100,19 @@ def test_a_dumped_dataset_store_model_validates_back_to_the_same_members(
 # ``expiry`` and every unset search filter) and that no other field changed its encoding. Decision
 # tj-vhboky.30 says byte-identical, so the comparison is on the string, not a parsed dict.
 _EXACT_WIRE_CASES: list[tuple[type[BaseModel], dict[str, Any], str]] = [
+    # tj-grna9p.71: the BODY now ends with the two request-only fields at their defaults -- null kept, not
+    # dropped, and false -- while the fields class keeps the pre-split document byte for byte, and the
+    # entry models below are unchanged, which is the acceptance "GET /store's JSON does not move".
     (
         StoreAssetDatasetBody,
         _enum_wire_payload(StoreAssetDatasetBody, ExpiryType.BUFFER_10K, UpdateType.STATIC),
+        '{"owner":"rebalancer","source":"ALPACA","feed":null,"granularity":"1day","start":"2026-01-01T00:00:00Z",'
+        '"end":null,"expiry":"2026-01-01T00:00:00Z","expiry_type":"BUFFER_10K","update_type":"STATIC",'
+        '"ready_by":null,"best_effort":false}',
+    ),
+    (
+        StoreAssetDatasetFields,
+        _enum_wire_payload(StoreAssetDatasetFields, ExpiryType.BUFFER_10K, UpdateType.STATIC),
         '{"owner":"rebalancer","source":"ALPACA","feed":null,"granularity":"1day","start":"2026-01-01T00:00:00Z",'
         '"end":null,"expiry":"2026-01-01T00:00:00Z","expiry_type":"BUFFER_10K","update_type":"STATIC"}',
     ),
@@ -2015,6 +2160,7 @@ _EXACT_WIRE_CASES: list[tuple[type[BaseModel], dict[str, Any], str]] = [
     _EXACT_WIRE_CASES,
     ids=[
         'StoreAssetDatasetBody',
+        'StoreAssetDatasetFields',
         'AssetDatasetStoreCreate',
         'AssetDatasetStoreUpdate',
         'AssetDatasetStore-null-expiry',
@@ -2148,9 +2294,21 @@ def test_rule_b_a_non_static_update_with_a_bulk_expiry_is_refused(model: type[Ba
     assert not [value for value in _BARE_VALUES if value in message], f'bare enum value in {message!r}'
 
 
+# Every write model under every non-STATIC update, EXCEPT the body under STREAM: the body refuses a
+# STREAM create outright (tj-grna9p.71), so the positive is pinned there on the fields class, which
+# declares the rule, and on the entry models, which inherit it.
+_RULE_B_POSITIVE = [
+    (model, update_type)
+    for model in _WRITE_MODELS
+    for update_type in _NON_STATIC_UPDATES
+    if not (model is StoreAssetDatasetBody and update_type is UpdateType.STREAM)
+]
+
+
 @pytest.mark.parametrize('expiry_type', _NON_BULK_EXPIRIES, ids=lambda member: member.name)
-@pytest.mark.parametrize('update_type', _NON_STATIC_UPDATES, ids=lambda member: member.name)
-@pytest.mark.parametrize('model', _WRITE_MODELS, ids=lambda model: model.__name__)
+@pytest.mark.parametrize(
+    ('model', 'update_type'), _RULE_B_POSITIVE, ids=[f'{m.__name__}-{u.name}' for m, u in _RULE_B_POSITIVE]
+)
 def test_rule_b_a_non_static_update_with_a_non_bulk_expiry_and_no_end_is_accepted(
     model: type[BaseModel], update_type: UpdateType, expiry_type: ExpiryType
 ):
@@ -2326,10 +2484,7 @@ def test_the_dataset_search_documents_no_enum_default(mode: str):
     assert properties['update_type']['default'] is None
 
 
-@pytest.mark.parametrize(
-    ('expiry_type', 'update_type'), _ENUM_WIRE_PAIRS, ids=[f'{e.name}-{u.name}' for e, u in _ENUM_WIRE_PAIRS]
-)
-@pytest.mark.parametrize('model', _ENUM_WIRE_MODELS, ids=lambda model: model.__name__)
+@pytest.mark.parametrize(('model', 'expiry_type', 'update_type'), _ENUM_WIRE_CASES, ids=_ENUM_WIRE_IDS)
 def test_a_python_mode_dump_keeps_the_enum_members(
     model: type[BaseModel], expiry_type: ExpiryType, update_type: UpdateType
 ):

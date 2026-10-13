@@ -1,0 +1,173 @@
+// THE UI'S REQUEST AND COLLECTION-HEALTH VOCABULARY, PHASE 2 (tj-grna9p.70): the request log, quota
+// usage, the health summary, run timelines and retry. It imports ui/v1 data.proto, market/v1 and
+// google protobuf only, never an internal contract. Additive-only under buf breaking.
+//
+// HALF-OPEN RANGES. Every range here is [start, end): start included, end excluded.
+//
+// NO CREDENTIAL MATERIAL crosses here. quota_key is a configured label, never key material and
+// never a hash of it.
+syntax = "proto3";
+
+package trader_joe.proto.ui.v1;
+
+import "google/protobuf/timestamp.proto";
+import "trader_joe/proto/market/v1/enums.proto";
+import "trader_joe/proto/ui/v1/data.proto";
+
+// Where a request is in the queue. ADMITTED and REFUSED are defined and DOCUMENTED UNUSED: no
+// component sets them until the planner (tj-lfd48x) exists; PR 4's queue is plain FIFO.
+enum RequestState {
+  REQUEST_STATE_UNSPECIFIED = 0;
+  REQUEST_STATE_QUEUED = 1;
+  // Unused until the planner (tj-lfd48x).
+  REQUEST_STATE_ADMITTED = 2;
+  REQUEST_STATE_IN_FLIGHT = 3;
+  REQUEST_STATE_SUCCEEDED = 4;
+  REQUEST_STATE_EMPTY = 5;
+  REQUEST_STATE_FAILED = 6;
+  // Unused until the planner (tj-lfd48x).
+  REQUEST_STATE_REFUSED = 7;
+}
+
+enum ActorKind {
+  ACTOR_KIND_UNSPECIFIED = 0;
+  ACTOR_KIND_PERSON_OR_STRATEGY = 1;
+  ACTOR_KIND_SCHEDULER = 2;
+}
+
+// One quota scope's capacity at the time a request was quoted.
+message ScopeCapacity {
+  // A non-secret configured label for the scope.
+  string quota_key = 1;
+  // Calls allowed per window. Zero when the scope declares no cap.
+  int64 cap = 2;
+  int64 remaining = 3;
+  int64 window_seconds = 4;
+  google.protobuf.Timestamp reset_at = 5;
+}
+
+// The informational quote stored with a request. Never a reason to refuse.
+message QuoteSnapshot {
+  int64 estimated_vendor_calls = 1;
+  repeated ScopeCapacity scopes = 2;
+  google.protobuf.Timestamp quoted_at = 3;
+}
+
+// One request in the log.
+message RequestLogEntry {
+  // The request's UUID, as text.
+  string id = 1;
+  // The dataset's UUID, as text. EMPTY until the fetch's acknowledgement, because a new dataset's
+  // entry is written then.
+  string dataset_id = 2;
+  string label = 3;
+  trader_joe.proto.market.v1.DataSource source = 4;
+  trader_joe.proto.market.v1.UpdateType update_type = 5;
+  // The requested range, half-open [start, end): start included, end excluded; end unset is open.
+  google.protobuf.Timestamp start = 6;
+  google.protobuf.Timestamp end = 7;
+  // A free-text label for who asked; never a credential.
+  string actor = 8;
+  ActorKind actor_kind = 9;
+  RequestState state = 10;
+  // Carried and inert in PR 4.
+  google.protobuf.Timestamp ready_by = 11;
+  bool best_effort = 12;
+  string quota_key = 13;
+  QuoteSnapshot quote = 14;
+  // Position in the queue, 1 for next. Set only while QUEUED.
+  int32 queue_position = 15;
+  google.protobuf.Timestamp enqueued_at = 16;
+  google.protobuf.Timestamp created_at = 17;
+  // Unset until the request reaches a final state.
+  google.protobuf.Timestamp finished_at = 18;
+  // A DAILY dataset's next daily pass would collect this range anyway.
+  bool covered_by_next_daily_pass = 19;
+  // The runs this request caused, newest first.
+  repeated IngestRun runs = 20;
+}
+
+// One page of the request log. Keyset paging; the cursor is opaque.
+message RequestLogPage {
+  repeated RequestLogEntry items = 1;
+  // Pass back to fetch the next page; empty on the last page.
+  string next_cursor = 2;
+}
+
+// The Requests sidebar's counts: per saved view and per filter option, each equal to the total the
+// matching list would return.
+message RequestLogFacets {
+  int64 all = 1;
+  int64 queued = 2;
+  int64 in_flight = 3;
+  int64 succeeded = 4;
+  int64 empty = 5;
+  int64 failed = 6;
+  // Requests made by the scheduler rather than a person or strategy.
+  int64 scheduled = 7;
+}
+
+// One quota scope's usage over its current window.
+message QuotaScopeUsage {
+  string quota_key = 1;
+  // Vendor calls charged in the current window.
+  int64 calls_in_window = 2;
+  int64 window_seconds = 3;
+  // The scope's cap from the latest snapshot. Unset when no snapshot has been taken.
+  optional int64 cap = 4;
+  int64 last_hour_peak = 5;
+  google.protobuf.Timestamp next_reset_at = 6;
+  int64 throttled_429 = 7;
+  int64 retries = 8;
+}
+
+// The collection-health summary.
+message OpsHealth {
+  // Datasets that are fresh or complete.
+  int64 healthy = 1;
+  int64 late = 2;
+  int64 failed = 3;
+  int64 retired = 4;
+  // Datasets with a RUNNING run.
+  int64 running = 5;
+  int64 queue_depth = 6;
+  int64 failed_runs_24h = 7;
+}
+
+// A dataset that needs a person's attention.
+message NeedsAttentionEntry {
+  string dataset_id = 1;
+  string label = 2;
+  FreshnessStatus health = 3;
+  // Since when the dataset has been in this state.
+  google.protobuf.Timestamp since = 4;
+  string reason = 5;
+  // The most recent request for the dataset, as text. Empty when there is none.
+  string latest_request_id = 6;
+  RequestState latest_request_state = 7;
+}
+
+message NeedsAttentionPage {
+  repeated NeedsAttentionEntry items = 1;
+  // Pass back to fetch the next page; empty on the last page.
+  string next_cursor = 2;
+}
+
+// One step in a run's story.
+message RunTimelineEntry {
+  google.protobuf.Timestamp at = 1;
+  // A short machine label, e.g. 'queued', 'started', 'page', 'finished'.
+  string kind = 2;
+  string message = 3;
+}
+
+message RunTimeline {
+  string run_id = 1;
+  repeated RunTimelineEntry entries = 2;
+}
+
+// Ask for a failed or empty request to be run again. Creates a request with trigger RETRY.
+message RetryRequest {
+  // The request-log entry to retry, as text.
+  string request_id = 1;
+}

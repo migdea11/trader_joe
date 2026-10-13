@@ -65,7 +65,8 @@ def request_to_proto(request: domain.FetchDatasetRequest) -> ingest_pb2.FetchDat
 
     Returns:
         ingest_pb2.FetchDatasetRequest: The same request on the wire. An absent end stays absent, and an
-        absent feed is the FEED_UNSPECIFIED zero, which means "the deployment decides".
+        absent feed is the FEED_UNSPECIFIED zero, which means "the deployment decides". An absent
+        request_id is the empty string and an absent ready_by is unset.
 
     Raises:
         ProtoMappingError: If a value cannot be put on the wire.
@@ -84,6 +85,11 @@ def request_to_proto(request: domain.FetchDatasetRequest) -> ingest_pb2.FetchDat
         message.end.CopyFrom(to_timestamp(request.end))
     if request.feed is not None:
         message.feed = FEED.to_proto(request.feed)
+    if request.request_id is not None:
+        message.request_id = request.request_id
+    if request.ready_by is not None:
+        message.ready_by.CopyFrom(to_timestamp(request.ready_by))
+    message.best_effort = request.best_effort
     return message
 
 
@@ -113,6 +119,10 @@ def request_to_domain(message: ingest_pb2.FetchDatasetRequest) -> domain.FetchDa
         end=timestamp_field(message, 'end') if message.HasField('end') else None,
         update_type=UPDATE_TYPE.to_domain(message.update_type),
         feed=None if message.feed == _FEED_UNSPECIFIED else FEED.to_domain(message.feed),
+        # No `optional` on the wire: an empty request_id is "no request-log entry", so it stays None.
+        request_id=message.request_id or None,
+        ready_by=timestamp_field(message, 'ready_by') if message.HasField('ready_by') else None,
+        best_effort=message.best_effort,
     )
 
 
