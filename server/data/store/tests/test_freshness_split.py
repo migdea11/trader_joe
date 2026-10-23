@@ -77,6 +77,12 @@ EXPECTED: dict[str, str] = {
     'period_start': 'completeness',
     'DEFAULT_STREAM_BAR_MULTIPLE': 'health',
     'STREAM_BAR_MULTIPLE_ENV': 'health',
+    # tj-grna9p.172: the settle margin, the one setting the DAILY refresh and the final-bar rule share. daily_refresh
+    # re-exports SETTLE_ENV and DEFAULT_SETTLE_MINUTES; it is not one of the three modules, so no exporter here.
+    'SETTLE_ENV': 'health',
+    'DEFAULT_SETTLE_MINUTES': 'health',
+    'DEFAULT_SETTLE_MARGIN': 'health',
+    'settle_margin_from_env': 'health',
     'DatasetHealth': 'health',
     'FreshnessConfig': 'health',
     'FreshnessStatus': 'health',

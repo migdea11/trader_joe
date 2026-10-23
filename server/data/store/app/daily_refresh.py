@@ -77,7 +77,17 @@ from data.store.app.database.models.ingest_run import IngestRun, IngestRunState,
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.dataset_catalog import effective_end, is_retired
 from data.store.app.events import DatasetChange, DatasetChanged, publish
-from data.store.app.health import FreshnessStatus, evaluate_dataset, last_bar_is_provisional
+from data.store.app.health import (
+    DEFAULT_SETTLE_MINUTES as DEFAULT_SETTLE_MINUTES,  # the refresh's setting, defined once in health and re-exported
+)
+from data.store.app.health import SETTLE_ENV as SETTLE_ENV
+from data.store.app.health import (
+    FreshnessConfig,
+    FreshnessStatus,
+    evaluate_dataset,
+    last_bar_is_provisional,
+    settle_margin_from_env,
+)
 from data.store.app.ingest.data_action_request import DatasetRetiredDuringFetch, store_market_activity_worker
 from data.store.app.ingest.run_recording import recorded_run
 from data.store.app.trading_calendar import (
@@ -93,11 +103,9 @@ from schemas.data_store.asset_dataset_store import StoreAssetDatasetBody, StoreA
 log = get_logger(__name__)
 
 ENABLED_ENV: Final = 'DAILY_REFRESH_ENABLED'
-SETTLE_ENV: Final = 'DAILY_REFRESH_SETTLE_MINUTES'
 MAX_PER_PASS_ENV: Final = 'DAILY_REFRESH_MAX_PER_PASS'
 BACKOFF_ENV: Final = 'DAILY_REFRESH_BACKOFF_SECONDS'
 
-DEFAULT_SETTLE_MINUTES: Final = 30
 DEFAULT_MAX_PER_PASS: Final = 10
 DEFAULT_BACKOFF_SECONDS: Final = 30
 
@@ -135,13 +143,16 @@ def _as_aware(instant: datetime) -> datetime:
 def _fetch_start(row: CatalogRow, calendar: TradingCalendar) -> datetime:
     """Where the refresh's tail starts: the declared start with no bars, else just after the newest bar.
 
-    A newest bar written before its period closed may be the vendor's part-way bar (see last_bar_is_provisional), so
+    A newest bar written before its period closed and settled may be the vendor's part-way bar (see
+    last_bar_is_provisional; for 1min..1hour the period is the whole session, not the bar's own), so
     the tail starts AT that bar and the upsert overwrites it with the final one. Once it is rewritten after the close
     it is final and the tail starts after it again.
     """
     if row.last_bar is None:
         return row.start
-    if last_bar_is_provisional(row.last_bar, row.last_bar_written_at, calendar, row.granularity):
+    if last_bar_is_provisional(
+        row.last_bar, row.last_bar_written_at, calendar, row.granularity, settle_margin_from_env()
+    ):
         return row.last_bar
     return row.last_bar + row.granularity.offset
 
@@ -233,8 +244,7 @@ def _positive_int(name: str, default: int) -> int:
 
 def settle_delay() -> timedelta:
     """The wait after a session's close before the pass; zero is allowed, a negative or malformed value is the default."""
-    minutes = get_env_var(SETTLE_ENV, default=DEFAULT_SETTLE_MINUTES, cast_type=int)
-    return timedelta(minutes=minutes if minutes >= 0 else DEFAULT_SETTLE_MINUTES)
+    return settle_margin_from_env()
 
 
 def max_per_pass() -> int:
@@ -449,6 +459,8 @@ class DailyRefresher:
     ) -> list[CatalogRow]:
         """The rows to refresh, oldest newest-bar first: DAILY, active, not running, and LATE or OVERDUE."""
         owed: list[CatalogRow] = []
+        # Only the settle margin, from the refresh's own setting: the stream multiple means nothing to a DAILY dataset.
+        config = FreshnessConfig(settle_margin=settle_margin_from_env())
         for row in rows:
             if is_retired(row) or row.id in running:
                 continue
@@ -464,6 +476,7 @@ class DailyRefresher:
                     calendar=calendar,
                     now=now,
                     last_bar_written_at=row.last_bar_written_at,
+                    config=config,
                 )
             except CalendarRangeError:
                 continue
