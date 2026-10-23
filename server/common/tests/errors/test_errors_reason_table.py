@@ -39,7 +39,7 @@ REFUSED, NOT_READY = Outcome.REFUSED, Outcome.NOT_READY
 PAGE, RECORD, CLIENT_FIX = Disposition.PAGE, Disposition.RECORD, Disposition.CLIENT_FIX
 
 # reason: (branch, outcome, disposition, grpc_code, http_status), from the bead as amended 2026-10-02 by the
-# Q-URI and Q-EMPTY rulings. 24 members.
+# Q-URI and Q-EMPTY rulings, plus OVERRIDE_REQUIRED (tj-grna9p.16). 25 members.
 PLANNED = {
     'INVALID_REQUEST': (INV, REFUSED, CLIENT_FIX, 'INVALID_ARGUMENT', 422),
     'UNSUPPORTED_ASSET_TYPE': (INV, REFUSED, CLIENT_FIX, 'INVALID_ARGUMENT', 422),
@@ -50,6 +50,10 @@ PLANNED = {
     'VENDOR_REJECTED': (EXO, REFUSED, PAGE, 'INVALID_ARGUMENT', 422),
     'NOT_FOUND': (INV, REFUSED, CLIENT_FIX, 'NOT_FOUND', 404),
     'OWNER_MISMATCH': (INV, REFUSED, CLIENT_FIX, 'PERMISSION_DENIED', 403),
+    # tj-grna9p.16 (architect gate, 2026-10-14): an operator write on another owner's dataset without a
+    # confirmed override. 409 FAILED_PRECONDITION as RANGE_SHRINK: the state of the dataset, not the
+    # caller's identity, is what refuses it, so not OWNER_MISMATCH's 403.
+    'OVERRIDE_REQUIRED': (INV, REFUSED, CLIENT_FIX, 'FAILED_PRECONDITION', 409),
     'OWN_OVERLAP_CONFLICT': (INV, REFUSED, CLIENT_FIX, 'ALREADY_EXISTS', 409),
     'RANGE_COLLISION': (INV, REFUSED, CLIENT_FIX, 'ALREADY_EXISTS', 409),
     'RANGE_SHRINK': (INV, REFUSED, CLIENT_FIX, 'FAILED_PRECONDITION', 409),
@@ -92,7 +96,7 @@ def _row(spec: ReasonSpec) -> tuple:
 
 
 def test_reason_is_the_planned_closed_set():
-    """D4: exactly the 24 planned members. Adding one is a reviewed change; renaming or removing one breaks clients."""
+    """D4: exactly the 25 planned members. Adding one is a reviewed change; renaming or removing one breaks clients."""
     actual = {reason.value for reason in Reason}
     assert actual == set(PLANNED), (
         f'not in the plan: {sorted(actual - set(PLANNED))}; planned but missing: {sorted(set(PLANNED) - actual)}'

@@ -37,6 +37,7 @@ carries a delay that went stale on the way.
 | VENDOR_REJECTED | REFUSED | PAGE | 422 | INVALID_ARGUMENT | The market-data vendor refused the request for a reason it does not document; do not retry it unchanged until an operator has looked. |
 | NOT_FOUND | REFUSED | CLIENT_FIX | 404 | NOT_FOUND | The entity named in the request does not exist; check the identifier, or create the entity first. |
 | OWNER_MISMATCH | REFUSED | CLIENT_FIX | 403 | PERMISSION_DENIED | The entity is not owned by the principal the request declares; act only on entities that principal owns. |
+| OVERRIDE_REQUIRED | REFUSED | CLIENT_FIX | 409 | FAILED_PRECONDITION | The dataset belongs to another owner: send override with a non-blank reason and confirmed true. |
 | OWN_OVERLAP_CONFLICT | REFUSED | CLIENT_FIX | 409 | ALREADY_EXISTS | The request overlaps datasets the same owner already holds, listed in colliding_ids; extend one of those instead. |
 | RANGE_COLLISION | REFUSED | CLIENT_FIX | 409 | ALREADY_EXISTS | Growing the range would make the dataset identical to another the same owner holds, listed in colliding_ids; use that one instead. |
 | RANGE_SHRINK | REFUSED | CLIENT_FIX | 409 | FAILED_PRECONDITION | The update would shrink a dataset's range, and ranges only grow; delete the dataset and create a smaller one. |

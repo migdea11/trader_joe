@@ -1068,3 +1068,35 @@ def test_a_non_stream_create_without_the_new_fields_still_reaches_the_handler(po
 def test_a_naive_ready_by_is_a_422_naming_the_field(post_dataset, announced):
     response = post_dataset(FakeSession(), RecordingFetchClient(), REQUEST_BODY | {'ready_by': '2026-02-01T09:30:00'})
     assert [error['loc'] for error in validation_errors(response)] == [['body', 'ready_by']]
+
+
+# ---------------------------------------------------------------------------------------------
+# tj-grna9p.174 (decision tj-hhy3dk section 3): the optional collect intent on the public body
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('collect', [True, False])
+@pytest.mark.parametrize('static', [{}, {'update_type': 'STATIC', 'expiry_type': 'BULK'}], ids=['default', 'named'])
+def test_collect_on_a_static_create_answers_422_invalid_request_and_never_reaches_ingest(
+    post_dataset, announced, collect, static
+):
+    """Any value, true included, on STATIC: refused at the edge with the subscriptions-only text."""
+    session = FakeSession()
+    fetch_client = RecordingFetchClient()
+
+    response = post_dataset(session, fetch_client, REQUEST_BODY | static | {'collect': collect})
+
+    problem_body = problem(response, status=422, reason='INVALID_REQUEST')
+    assert 'collect applies to subscriptions only' in response.text, problem_body
+    assert session.statements == [] and fetch_client.requests == [] and announced == []
+
+
+@pytest.mark.parametrize('collect', [True, False, None])
+def test_collect_on_a_daily_create_is_accepted_at_the_edge(post_dataset, announced, collect):
+    """true, false and an explicit null all reach the handler on DAILY (what false then does is tj-grna9p.175)."""
+    session = FakeSession(FakeResult(rows=[]), FakeResult(scalar=uuid.uuid4()))
+    body = REQUEST_BODY | {'update_type': 'DAILY', 'expiry_type': 'ROLLING', 'collect': collect}
+
+    response = post_dataset(session, RecordingFetchClient(), body)
+
+    assert response.status_code == 200, response.text
