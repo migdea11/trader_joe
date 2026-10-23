@@ -1468,10 +1468,11 @@ def test_zero_or_several_containers_are_refused_with_no_exec(
 
 
 def test_the_migrate_status_docstring_scopes_writes_nothing_to_the_database():
-    doc = runner.AgentStack._dev_migrate_status.__doc__ or ''
+    """dev_migrate_status' scoping, kept by migrate_status (tj-iee6sn.10), which adds that it charges no budget."""
+    doc = runner.AgentStack._migrate_status.__doc__ or ''
     assert (
-        'Takes no argument and writes nothing to the database (Python may write bytecode caches into the '
-        'bind-mounted checkout, as make migrate-status does);'
+        'Takes no argument, charges no budget and writes nothing to the database (Python may write bytecode '
+        'caches into the bind-mounted checkout, as make migrate-status does);'
     ) in doc
     assert 'Takes no argument, writes nothing,' not in doc
 

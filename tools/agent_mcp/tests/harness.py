@@ -355,7 +355,11 @@ DEV_DB_TABLES_STDOUT = (
     b'ingest_run|t\nstore_dataset_entry|t\nstock_market_activity|t\nalembic_version|t\n'
     b'version_num|d7e2a9c35b18\n'
 )
-# What the dev_migrate_status script prints (tj-iee6sn.13.5): a header per alembic subcommand, then
+# The data_ingest container's id in the rig: distinct from DEV_CONTAINER_ID so that migrate's TEST-mode stamp
+# gate (tj-iee6sn.10), which reads each RUNNING data_store and data_ingest container by id, can be answered
+# per service. No other verb looks data_ingest up.
+DEV_INGEST_CONTAINER_ID = 'c0ffee000002'
+# What migrate_status' exec script prints (tj-iee6sn.13.5, folded into migrate_status by tj-iee6sn.10): a header per alembic subcommand, then
 # its redacted output. Told apart from dev_db_tables' exec by its option set, `-w /code` (the table of
 # stack.DEV_EXEC_COMMANDS), spelled here from literals.
 DEV_MIGRATE_STATUS_STDOUT = (
@@ -378,35 +382,63 @@ def is_dev_exec(step: stack.Step) -> bool:
 
 
 def is_dev_stamp_read(step: stack.Step) -> bool:
-    """dev_migrate_check's `docker image inspect` printing the data_store :dev image's source-stamp label."""
+    """A `docker image inspect` printing one image's source-stamp label (test_up reads both :test images)."""
     return (
         list(step.argv[:4]) == ['/usr/local/bin/docker', 'image', 'inspect', '--format']
         and 'trader_joe.source.digest' in step.argv[4]
     )
 
 
+def is_container_stamp_read(step: stack.Step) -> bool:
+    """A `docker inspect --type container` printing a RUNNING container's source-stamp label (migrate's TEST gate)."""
+    return (
+        list(step.argv[:5]) == ['/usr/local/bin/docker', 'inspect', '--type', 'container', '--format']
+        and 'trader_joe.source.digest' in step.argv[5]
+    )
+
+
+def is_mode_guard(step: stack.Step) -> bool:
+    """The mode guard's `docker ps -a ... --format {{.Label "...config_files"}}`."""
+    return list(step.argv[:3]) == ['/usr/local/bin/docker', 'ps', '-a'] and 'config_files' in step.argv[-1]
+
+
+# The config_files label of a container `make dev-up` started: the override present, the fake file absent.
+# The rig's default project is in DEV mode, so a sample of every guarded verb is admitted, migrate and
+# migrate_status included (they refuse an empty project, tj-iee6sn.10). Spelled from literals.
+DEV_MODE_LINE = b'/r/docker-compose.yaml,/r/docker-compose.override.yaml,/r/docker-compose.web.yaml\n'
+
+
 def default_response(step: stack.Step) -> runner.ProcessResult:
     """Every docker step succeeds; `ps -q postgres` answers with one container id (postgres is running).
 
     The seed producer's run answers with SEED_STDOUT, a valid bundle. The dev lookup answers with
-    one id and a dev exec with DEV_DB_TABLES_STDOUT, the shape the dev_db_tables script prints, or,
-    for the `-w /code` exec of dev_migrate_status, DEV_MIGRATE_STATUS_STDOUT, or, for the option-less
-    exec of dev_http_get, DEV_HTTP_GET_STDOUT. The D7 prod guard's `docker ps` falls through to the
-    empty answer, an empty project, which the guard passes, so a sample dev_down/dev_restart ends 'ok'.
-    dev_build's digest steps answer with their service's DEV_DIGESTS line, so a sample dev_build ends 'ok'.
-    dev_migrate_check's stamp read (tj-iee6sn.10) answers with the data/store digest, the stamp of a
-    current image, so a sample dev_migrate_check ends 'ok' (an empty answer is 'cannot verify').
+    one id (DEV_INGEST_CONTAINER_ID for data_ingest, else DEV_CONTAINER_ID) and a dev exec with
+    DEV_DB_TABLES_STDOUT, the shape the dev_db_tables script prints, or, for the `-w /code` exec of
+    migrate_status, DEV_MIGRATE_STATUS_STDOUT, or, for the option-less exec of dev_http_get,
+    DEV_HTTP_GET_STDOUT. The mode guard's `docker ps` answers with one DEV container (DEV_MODE_LINE),
+    which every guarded verb accepts, so a sample dev_down/dev_restart/migrate ends 'ok'. dev_build's
+    digest steps answer with their service's DEV_DIGESTS line, so a sample dev_build ends 'ok'. An
+    image stamp read answers with its own service's digest (a current image), and a container stamp
+    read with the digest of the service whose id the lookup gave (a current running container).
     """
     if list(step.argv[-3:]) == ['ps', '-q', 'postgres']:
         return runner.ProcessResult(0, b'0123456789ab\n', b'')
+    if is_mode_guard(step):
+        return runner.ProcessResult(0, DEV_MODE_LINE, b'')
     if is_dev_digest(step):
         return runner.ProcessResult(0, f'{DEV_DIGESTS[tuple(step.argv[-2:])]}\n'.encode(), b'')
     if is_dev_stamp_read(step):
-        return runner.ProcessResult(0, f'{DEV_DIGESTS[("data", "store")]}\n'.encode(), b'')
+        # Each image's stamp is its own service's digest (tj-iee6sn.24: test_up reads both :test images).
+        service = ('data', 'ingest') if step.argv[-1].startswith('trader_joe_data_ingest:') else ('data', 'store')
+        return runner.ProcessResult(0, f'{DEV_DIGESTS[service]}\n'.encode(), b'')
+    if is_container_stamp_read(step):
+        service = ('data', 'ingest') if step.argv[-1] == DEV_INGEST_CONTAINER_ID else ('data', 'store')
+        return runner.ProcessResult(0, f'{DEV_DIGESTS[service]}\n'.encode(), b'')
     if is_seed_producer(step):
         return runner.ProcessResult(0, SEED_STDOUT, b'')
     if is_dev_lookup(step):
-        return runner.ProcessResult(0, f'{DEV_CONTAINER_ID}\n'.encode(), b'')
+        ingest = 'label=com.docker.compose.service=data_ingest' in step.argv
+        return runner.ProcessResult(0, f'{DEV_INGEST_CONTAINER_ID if ingest else DEV_CONTAINER_ID}\n'.encode(), b'')
     if is_dev_exec(step) and list(step.argv[2:4]) == ['-w', '/code']:
         return runner.ProcessResult(0, DEV_MIGRATE_STATUS_STDOUT, b'')
     if is_dev_exec(step) and len(step.argv) > 2 and not step.argv[2].startswith('-'):
@@ -414,6 +446,109 @@ def default_response(step: stack.Step) -> runner.ProcessResult:
     if is_dev_exec(step):
         return runner.ProcessResult(0, DEV_DB_TABLES_STDOUT, b'')
     return runner.ProcessResult(0, b'', b'')
+
+
+# THE SYSTEM-SUITE PAIR (tj-iee6sn.20; ADR tj-4rr0la addenda 26-27). run_system_tests and seed_dump act on
+# TEST mode ONLY, and only once the running postgres's data mount is the test directory, so the rig's DEV
+# default refuses them. system_suite_response(layout) is the answer under which a sample of either ends 'ok':
+# the mode guard sees one TEST container (base + fake, as make system-launch and test_up start it) and the
+# postgres mount read prints <repo host path>/volume_data/test/postgres. Every other step falls through to
+# BASE (default_response unless given), so the lookups and the stamps stay current. Spelled from literals.
+SYSTEM_SUITE_VERBS = frozenset({'run_system_tests', 'seed_dump'})
+TEST_MODE_LINE = b'/r/docker-compose.yaml,/r/docker-compose.fake.yaml\n'
+POSTGRES_DATA_TARGET = '/var/lib/postgresql/data'
+
+
+def is_postgres_mount_read(step: stack.Step) -> bool:
+    """The rail's `docker inspect --type container --format <the postgres data mount's Source>` of one id."""
+    return (
+        list(step.argv[:5]) == ['/usr/local/bin/docker', 'inspect', '--type', 'container', '--format']
+        and POSTGRES_DATA_TARGET in step.argv[5]
+    )
+
+
+def is_base_step(step: stack.Step) -> bool:
+    """One of the ensure-bases pair (ADR tj-4rr0la addendum 14 (3)): the inspect or the pull of a BASE_IMAGES ref."""
+    return any(
+        tuple(step.argv)
+        in (
+            ('/usr/local/bin/docker', 'image', 'inspect', '--format', '{{.Id}}', ref),
+            ('/usr/local/bin/docker', 'pull', ref),
+        )
+        for ref in stack.BASE_IMAGES
+    )
+
+
+def postgres_test_source(layout: Layout) -> str:
+    """The only data mount source test mode's postgres has: <repo host path>/volume_data/test/postgres."""
+    return f'{layout.repo_host_path}/volume_data/test/postgres'
+
+
+def system_suite_response(
+    layout: Layout, base: Callable[[stack.Step], runner.ProcessResult] = default_response
+) -> Callable[[stack.Step], runner.ProcessResult]:
+    """BASE, but the mode guard answers TEST_MODE_LINE and the mount read the test directory."""
+
+    def respond(step: stack.Step) -> runner.ProcessResult:
+        if is_mode_guard(step):
+            return runner.ProcessResult(0, TEST_MODE_LINE, b'')
+        if is_postgres_mount_read(step):
+            return runner.ProcessResult(0, f'{postgres_test_source(layout)}\n'.encode(), b'')
+        return base(step)
+
+    return respond
+
+
+def response_for(
+    verb: str, layout: Layout, base: Callable[[stack.Step], runner.ProcessResult] = default_response
+) -> Callable[[stack.Step], runner.ProcessResult]:
+    """The answer under which VERB's sample is admitted: system_suite_response for the system-suite pair, else BASE."""
+    return system_suite_response(layout, base) if verb in SYSTEM_SUITE_VERBS else base
+
+
+# The client's command (tj-iee6sn.20; no shell wrapper since 5a38b7f), spelled from literals:
+#   docker compose -p trader_joe --project-directory <stack>/source --env-file <host>/.env
+#   -f <trusted>/docker-compose.yaml -f <trusted>/docker-compose.test-client.yaml -f <trusted>/docker-compose.agent-client.yaml
+CLIENT_FILES = ('docker-compose.yaml', 'docker-compose.test-client.yaml', 'docker-compose.agent-client.yaml')
+
+
+def client_prefix_words_for(stack_dir: Path, repo_host_path: Path) -> list[str]:
+    """Every word of a client step before its tail, for STACK_DIR and REPO_HOST_PATH: compose's, unwrapped."""
+    return [
+        '/usr/local/bin/docker',
+        'compose',
+        '-p',
+        'trader_joe',
+        '--project-directory',
+        f'{stack_dir}/source',
+        '--env-file',
+        f'{repo_host_path}/.env',
+        *(word for name in CLIENT_FILES for word in ('-f', f'/opt/agent_mcp/compose/{name}')),
+    ]
+
+
+def client_prefix_words(layout: Layout) -> list[str]:
+    """client_prefix_words_for the rig's stack directory and repository host path."""
+    return client_prefix_words_for(layout.stack_dir, layout.repo_host_path)
+
+
+def is_client_step(step: stack.Step) -> bool:
+    """A step under the client's prefix: `docker compose -p trader_joe --project-directory D --env-file F`.
+
+    The --env-file right after the project directory is what tells it from every other file-based compose step.
+    """
+    return (
+        len(step.argv) > 7
+        and list(step.argv[:5]) == ['/usr/local/bin/docker', 'compose', '-p', 'trader_joe', '--project-directory']
+        and step.argv[6] == '--env-file'
+    )
+
+
+def client_tail(step: stack.Step, layout: Layout) -> list[str]:
+    """The words of a client step after its whole fixed prefix (asserted, word for word)."""
+    prefix = client_prefix_words(layout)
+    assert list(step.argv[: len(prefix)]) == prefix, step.argv
+    return list(step.argv[len(prefix) :])
 
 
 @dataclass
@@ -493,6 +628,11 @@ def make_rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, docker: FakeDocker
     return Rig(layout=layout, git=git, docker=fake_docker, agent=runner.AgentStack(layout.settings, run=fake_docker))
 
 
+def budget_spent(rig: Rig) -> int:
+    """How many state-changing calls the rig's S10 budget holds in its window (read in place, never charged)."""
+    return len(rig.agent.dev_budget._calls)
+
+
 def populate_data(layout: Layout) -> None:
     """What a running agent stack leaves under data/: a file (and a dotfile) in each service mount."""
     for service, _ in stack.DATA_MOUNTS:
@@ -533,7 +673,6 @@ VERB_SAMPLES: Mapping[str, dict[str, Any]] = {
     'stack_wipe': {},
     'migrate': {},
     'migrate_status': {},
-    'migrate_check': {},
     'run_system_tests': {'worktree': WORKTREE_NAME, 'paths': ['tests/system/test_one.py']},
     'seed_dump': {'worktree': WORKTREE_NAME},
     'logs': {'service': 'postgres', 'tail': 50},
@@ -541,15 +680,14 @@ VERB_SAMPLES: Mapping[str, dict[str, Any]] = {
     'dev_logs': {'service': 'postgres', 'tail': 50},
     'dev_ps': {},
     'dev_db_tables': {},
-    'dev_migrate_status': {},
     'dev_http_get': {'name': 'ping'},
     'dev_down': {},
     'dev_restart': {'service': 'data_store'},
     'dev_build': {},
     'dev_up': {},
-    'dev_migrate': {},
-    'dev_migrate_check': {},
     'dev_tools': {},
+    'test_build': {},
+    'test_up': {},
 }
 # Verbs that run no docker at all. None since tj-irhy0a.22 wired seed_dump; kept so a future verb
 # that runs no docker is classified here rather than tripping the docker sweeps.
@@ -563,20 +701,23 @@ DEV_PROJECT_VERBS = frozenset(
         'dev_ps',
         'dev_logs',
         'dev_db_tables',
-        'dev_migrate_status',
         'dev_http_get',
         'dev_down',
         'dev_restart',
         'dev_build',
         'dev_up',
-        'dev_migrate',
-        'dev_migrate_check',
         'dev_tools',
+        'test_build',
+        'test_up',
+        # tj-iee6sn.10: the unified pair acts on the one project (DEV or TEST mode), not the agent stack.
+        'migrate',
+        'migrate_status',
     }
 )
 # The subset that runs PLAIN docker -- a label lookup, then `docker exec` -- rather than the dev
 # compose prefix (ADR tj-4rr0la addendum 22). test_dev_exec.py owns their containment tests.
-DEV_EXEC_VERBS = frozenset({'dev_db_tables', 'dev_migrate_status', 'dev_http_get'})
+# migrate_status runs the mode guard's `docker ps` first, then the same lookup and exec.
+DEV_EXEC_VERBS = frozenset({'dev_db_tables', 'migrate_status', 'dev_http_get'})
 # The STATE-CHANGING label-only pair (tj-iee6sn.7): the D7 guard's plain `docker ps`, then ONE step
 # under the four-word dev prefix. test_dev_label_verbs.py owns their order, argv and refusal tests.
 DEV_LABEL_LIFECYCLE_VERBS = frozenset({'dev_down', 'dev_restart'})
@@ -588,17 +729,22 @@ DEV_FILE_LIFECYCLE_VERBS = frozenset({'dev_build'})
 # :dev images, the trusted digests, the label-only down, the devnet `docker network` pair, the bases,
 # then the file-based up carried by the fixed `sh -c` secret wrapper. test_dev_up.py owns its tests.
 DEV_UP_VERBS = frozenset({'dev_up'})
-# The STATE-CHANGING migration pair (tj-iee6sn.10), file-based and not label-only: the D7 guard's `docker
-# ps`, the postgres and data_store lookups (`docker ps`), the data_store :dev image inspect, for
-# dev_migrate_check the data/store digest (bash) and the stamp read (`docker image inspect`), the bases
-# (the one-off `run` of data_store is flagged as building), then the one-off alembic run carried by
-# dev_up's fixed `sh -c` secret wrapper. test_dev_migrate.py owns their tests.
-DEV_MIGRATE_VERBS = frozenset({'dev_migrate', 'dev_migrate_check'})
+# migrate (tj-iee6sn.10), STATE-CHANGING, file-based and not label-only: the mode guard's `docker ps`, the
+# postgres and data_store lookups (`docker ps`), the mode's data_store image inspect, in TEST mode the
+# data_ingest lookup, the two digests (bash) and a container stamp read per running service, the bases (the
+# one-off `run` of data_store is flagged as building), then the one-off alembic run: in DEV carried by
+# dev_up's fixed `sh -c` secret wrapper, in TEST plain over base + fake. test_dev_migrate.py owns its tests.
+DEV_MIGRATE_VERBS = frozenset({'migrate'})
 # dev_tools (tj-iee6sn.14), `make dev-tools`: the D7 guard's `docker ps`, the devnet `docker network` pair,
 # then ONE file-based up of pgAdmin (the dev files plus docker-compose.tools.yaml, stack.dev_tools_prefix)
 # carried by dev_up's fixed `sh -c` secret wrapper. No image inspect, no digest, no base: pgadmin and
 # postgres are image-only. test_dev_tools.py owns its tests.
 DEV_TOOLS_VERBS = frozenset({'dev_tools'})
+# TEST MODE (tj-iee6sn.24; ADR tj-4rr0la addenda 26-27), over the same project. test_build: the trusted
+# digests, the bases, then ONE file-based build over base + fake + the MCP-only test overlay. test_up: the
+# mode guard's `docker ps`, the two :test image inspects, the digests, the two stamp reads, the bases, the
+# label-only down, then ONE plain (unwrapped) file-based up over base + fake. test_test_mode.py owns both.
+TEST_MODE_VERBS = frozenset({'test_build', 'test_up'})
 # The wrapper's four constant leading words, spelled here from literals except the script, which is
 # pinned whole in test_dev_up.py; the helper and the env file follow them.
 DEV_UP_WRAPPER_LEAD = ('sh', '-c')

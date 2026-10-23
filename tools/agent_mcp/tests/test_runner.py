@@ -31,9 +31,12 @@ from tools.agent_mcp.tests.harness import (
     VERB_SAMPLES,
     WORKTREE_NAME,
     FakeDocker,
+    budget_spent,
+    client_tail,
+    is_base_step,
+    is_client_step,
     make_rig,
-    record_state,
-    step_prefix_length,
+    system_suite_response,
     tree_digest,
 )
 
@@ -134,71 +137,86 @@ def test_a_worktree_outside_the_repository_is_not_listed(tmp_path: Path, monkeyp
     assert rig.docker.steps == []
 
 
-def test_a_test_path_symlinked_out_of_tests_system_is_refused_before_docker(
+def _suite_rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A rig whose project is in TEST mode on the test postgres mount, so run_system_tests passes its rails (tj-iee6sn.20)."""
+    rig = make_rig(tmp_path, monkeypatch)
+    rig.docker.respond = system_suite_response(rig.layout)
+    return rig
+
+
+def test_a_test_path_symlinked_out_of_tests_system_is_refused_before_the_client(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """Body bullet 2: a symlink out of tests/system is refused -- by the snapshot, which copies no link."""
-    rig = make_rig(tmp_path, monkeypatch)
+    """Body bullet 2: a symlink out of tests/system is refused -- by the snapshot, which copies no link.
+
+    Re-pinned by tj-iee6sn.20: the rails' docker reads now run before the snapshot, so what is pinned is
+    that no client step (and no base step) ran, and that the budget was not charged.
+    """
+    rig = _suite_rig(tmp_path, monkeypatch)
     (rig.layout.worktree / 'tests' / 'system' / 'out').symlink_to(rig.layout.repo / 'common', target_is_directory=True)
     result = rig.call('run_system_tests', {'worktree': WORKTREE_NAME, 'paths': ['tests/system/out']})
     assert result['status'] == 'refused' and 'symlink' in result['message'], result
-    assert rig.docker.steps == []
+    assert rig.docker.steps, 'the rails ran no docker read, so the refusal shows nothing about their order'
+    assert not [step for step in rig.docker.steps if is_client_step(step) or is_base_step(step)]
+    assert budget_spent(rig) == 0
 
 
-def test_a_test_path_missing_from_the_snapshot_is_refused_before_docker(
+def test_a_test_path_missing_from_the_snapshot_is_refused_before_the_client(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    rig = make_rig(tmp_path, monkeypatch)
+    rig = _suite_rig(tmp_path, monkeypatch)
     result = rig.call('run_system_tests', {'worktree': WORKTREE_NAME, 'paths': ['tests/system/missing.py']})
     assert result['status'] == 'refused' and 'does not resolve' in result['message'], result
-    assert rig.docker.steps == []
+    assert not [step for step in rig.docker.steps if is_client_step(step) or is_base_step(step)]
+    assert budget_spent(rig) == 0
 
 
 def test_valid_test_paths_are_normalised_and_an_empty_list_runs_the_suite(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    rig = make_rig(tmp_path, monkeypatch)
-    rig.call(
-        'run_system_tests',
-        {'worktree': WORKTREE_NAME, 'paths': ['tests/system/./sub/../test_one.py', 'tests/system/sub']},
+    rig = _suite_rig(tmp_path, monkeypatch)
+    assert (
+        rig.call(
+            'run_system_tests',
+            {'worktree': WORKTREE_NAME, 'paths': ['tests/system/./sub/../test_one.py', 'tests/system/sub']},
+        )['status']
+        == 'ok'
     )
-    rig.call('run_system_tests', {'worktree': WORKTREE_NAME, 'paths': []})
-    # Each call first inspects every BASE_IMAGES ref (ADR tj-4rr0la addendum 14 (3); re-pinned,
-    # tj-c4mosr.14). The path normalisation below is unchanged.
+    assert rig.call('run_system_tests', {'worktree': WORKTREE_NAME, 'paths': []})['status'] == 'ok'
+    # Each call inspects every BASE_IMAGES ref (ADR tj-4rr0la addendum 14 (3)) right before its one client
+    # step. The path normalisation below is unchanged (re-pinned to the client prefix by tj-iee6sn.20).
     inspects = [('/usr/local/bin/docker', 'image', 'inspect', '--format', '{{.Id}}', ref) for ref in stack.BASE_IMAGES]
-    assert [step.argv for step in rig.docker.steps if step.argv[1] != 'compose'] == inspects * 2
-    steps = rig.docker.steps
-    assert [step.argv for step in steps[: len(inspects)]] == inspects
-    assert [step.argv for step in steps[len(inspects) + 1 : 2 * len(inspects) + 1]] == inspects
-    tails = [list(step.argv[step_prefix_length() :]) for step in steps if step.argv[1] == 'compose']
+    assert [step.argv for step in rig.docker.steps if is_base_step(step)] == inspects * 2
+    clients = [index for index, step in enumerate(rig.docker.steps) if is_client_step(step)]
+    assert len(clients) == 2
+    for index in clients:
+        assert [step.argv for step in rig.docker.steps[index - len(inspects) : index]] == inspects
+    tails = [client_tail(rig.docker.steps[index], rig.layout) for index in clients]
     assert tails == [
         ['run', '--rm', '--no-deps', '--build', 'test_client', 'tests/system/test_one.py', 'tests/system/sub'],
         ['run', '--rm', '--no-deps', '--build', 'test_client', 'tests/system'],
     ]
 
 
-def test_migrate_needs_a_recorded_stack_up_and_a_revision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """D4: migrate uses the worktree the last stack_up recorded, refused when none is; no docker either way."""
+def test_migrate_reads_the_root_checkouts_revisions_and_no_worktree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """tj-iee6sn.10: migrate acts on the mode that is up, with the ROOT checkout's revisions (make migrate's).
+
+    The agent-stack migrate (the recorded stack_up's worktree, its snapshot, `ps -q postgres`) is gone: no
+    recorded worktree is needed, emptying the agent WORKTREE's versions/ changes nothing, and emptying the
+    ROOT checkout's refuses with the empty-versions guard and no docker step after the mode guard.
+    """
     rig = make_rig(tmp_path, monkeypatch)
-    for verb in ('migrate', 'migrate_status'):
-        result = rig.call(verb, {})
-        assert result['status'] == 'refused' and 'call stack_up first' in result['message'], result
-    record_state(rig.layout, 'gone-worktree')
-    assert rig.call('migrate', {})['status'] == 'refused'
-    record_state(rig.layout)
+    assert not (rig.layout.stack_dir / stack.STATE_FILE_NAME).exists()
     for path in (rig.layout.worktree / 'server/data/store/migrations/versions').iterdir():
         path.unlink()
+    assert rig.call('migrate', {})['status'] == 'ok'
+    assert not rig.layout.snapshot.exists(), 'migrate took a snapshot'
+    for path in (rig.layout.repo / 'server/data/store/migrations/versions').iterdir():
+        path.unlink()
+    rig.docker.steps.clear()
     result = rig.call('migrate', {})
     assert result['status'] == 'refused' and 'no revision files' in result['message'], result
-    assert rig.docker.steps == []
-
-
-def test_migrate_fails_when_postgres_is_not_running(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    rig = make_rig(tmp_path, monkeypatch, FakeDocker(respond=lambda step: runner.ProcessResult(0, b'', b'')))
-    record_state(rig.layout)
-    result = rig.call('migrate', {})
-    assert result['status'] == 'failed' and 'postgres is not running' in result['message']
-    assert [step.argv[step_prefix_length() :] for step in rig.docker.steps] == [('ps', '-q', 'postgres')]
+    assert [step.argv[:3] for step in rig.docker.steps] == [('/usr/local/bin/docker', 'ps', '-a')], 'the guard only'
 
 
 # --- one verb at a time ------------------------------------------------------------------------
@@ -429,7 +447,8 @@ def test_a_worktree_swapped_for_a_symlink_mid_verb_never_reaches_the_daemon(
 
     During the build step the worktree's data/store/migrations becomes a symlink out of it. The later
     up step still names only the snapshot, whose migrations is a real directory with the original
-    content; the next migrate refuses the symlinked worktree with zero docker calls.
+    content; the next stack_up refuses the symlinked worktree with zero docker calls. (Its companion was the
+    agent-stack migrate, removed by tj-iee6sn.10; stack_up snapshots the same worktree the same way.)
     """
     layout_holder: dict[str, Any] = {}
     observed: dict[str, Any] = {}
@@ -458,29 +477,18 @@ def test_a_worktree_swapped_for_a_symlink_mid_verb_never_reaches_the_daemon(
     assert not [word for word in observed['argv'] if str(rig.layout.worktree) in word or 'attacker' in word]
 
     rig.docker.steps.clear()
-    migrate = rig.call('migrate', {})
-    assert migrate['status'] == 'refused' and 'symlink' in migrate['message'], migrate
+    again = rig.call('stack_up', {'worktree': WORKTREE_NAME})
+    assert again['status'] == 'refused' and 'symlink' in again['message'], again
     assert rig.docker.steps == []
 
 
 # The dev pair belongs here too (tj-v4e9ke, from tj-tq2hn6's residual): _dev_steps's docstring claims
 # 'the snapshot is not used -- these verbs read no worktree at all', and until they were listed that
-# claim was unpinned. migrate_check, added after this list was written, does NOT belong: it BUILDS
-# data_store before it compares (stack.alembic_check_steps), so it is a BUILDING_VERB in test_bases
-# and reads the snapshot like every other alembic verb. Everything here is in BASE_FREE_VERBS.
+# claim was unpinned. Everything here is in BASE_FREE_VERBS, migrate_status included (tj-iee6sn.10: the
+# mode guard, a lookup and an exec into the running data_store; the agent-stack alembic verbs are gone).
 @pytest.mark.parametrize(
     'verb',
-    [
-        'stack_down',
-        'stack_wipe',
-        'logs',
-        'ps',
-        'dev_ps',
-        'dev_logs',
-        'dev_db_tables',
-        'dev_migrate_status',
-        'dev_http_get',
-    ],
+    ['stack_down', 'stack_wipe', 'logs', 'ps', 'dev_ps', 'dev_logs', 'dev_db_tables', 'migrate_status', 'dev_http_get'],
 )
 def test_verbs_that_build_nothing_read_no_worktree_and_need_no_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str

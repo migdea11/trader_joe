@@ -4,7 +4,7 @@ Agents have no Docker socket and no docker CLI, by standing rule. This server ru
 container (tools/agent_mcp/Dockerfile, started by make agent-mcp-up) and gives them FIXED VERBS over
 ONE isolated compose project, trader_joe_agent_stack:
 
-    stack_up(worktree)  stack_down()  stack_wipe()  migrate()  migrate_status()  migrate_check()
+    stack_up(worktree)  stack_down()  stack_wipe()
     run_system_tests(worktree, paths)  seed_dump(worktree)  logs(service, tail)  ps()
 
 plus TWO READ-ONLY VERBS over a second project, the user's own dev stack (ADR tj-4rr0la addendum 18;
@@ -14,14 +14,15 @@ tj-kzy7w2, approved on tj-wpnr7o (b)):
 
 and THREE READ-ONLY EXEC VERBS into that project (ADR tj-4rr0la addendum 22; the proxy's EXEC section):
 
-    dev_db_tables()  dev_migrate_status()  dev_http_get(name)
+    dev_db_tables()  migrate_status()  dev_http_get(name)
 
 It finds the dev postgres container by label (exactly one running, else it refuses) and execs one
 fixed psql script in it as user postgres in a read-only transaction: which of the store's tables
 exist, and the alembic revision. No agent argument reaches the argv; stack.check_dev_exec_argv()
 re-checks it as built, against a table that binds each whole command to its one option set. The script
-redacts the container's own secret variables in-container. dev_migrate_status() does the same in the
-running data_store, running alembic current and history, and refuses when data_store is not running.
+redacts the container's own secret variables in-container. migrate_status() does the same in the
+running data_store of whichever mode is up, running alembic current and history, and refuses when
+data_store is not running.
 dev_http_get(name) does one GET of one of three fixed paths (name is a closed enum; no URL, path or
 header) in the running data_store, reads at most 64 KB of the body and redacts it in-container.
 
@@ -73,19 +74,44 @@ so no credential reaches an argv, the audit line or the output; when one is unse
 creating the container. The D7, S6, D6 and D5 checks and the budget are dev_up's. dev_down removes pgAdmin
 with the rest of the project (label-only).
 
-and TWO MIGRATION VERBS over the running dev instance (tj-iee6sn.10; owner ruling D4):
+and TWO MIGRATION VERBS over whichever mode of the one project is up (tj-iee6sn.10; owner ruling: ONE
+migrate, make migrate's semantics):
 
-    dev_migrate()  dev_migrate_check()
+    migrate()  migrate_status()
 
-dev_migrate is make migrate: `alembic upgrade head` in a one-off data_store container (file-based
-`run --rm --no-deps`, the baked compose files, dev_up's secret wrapper) against the postgres that is
-running now. It WRITES the dev database; the project permission for it is meant to be "ask" (the user's
-setting, not this server's). dev_migrate_check is make migrate-check: `alembic check`, refused unless the
-data_store :dev image's source stamp equals the checkout's digest (there is NO escape hatch; the fix is
-dev_build), and it writes an empty alembic_version table on a never-migrated database. Both are refused
-by the D7 guard on a non-dev project, with no or several postgres or several data_store containers, with
-no revision file in the checkout, without the :dev image, and on the S6/D6/D5 checks of dev_up; neither
-builds.
+migrate is make migrate: it reads the mode from the mode guard (DEV or TEST; the message starts with the
+definition it chose, as make migrate prints) and runs `alembic upgrade head` in a one-off data_store
+container (file-based `run --rm --no-deps`, the baked compose files) against the postgres that is
+running now. DEV: the dev files and the :dev image, through dev_up's secret wrapper. TEST: the base file
+and docker-compose.fake.yaml and the :test image (no wrapper), DATA_DIR pinned to ./volume_data/test; a
+prod image bakes the code in, so it is refused unless the RUNNING data_store and data_ingest containers
+carry a source stamp equal to the checkout's digest (stack.check_container_stamp: stale test stack, call
+test_build then test_up). It WRITES the database of the mode that is up, the owner's own dev database in
+DEV mode; the permission for it is the owner's client setting, not this server's. It is refused when
+nothing is up, under a PROD container or both modes, with no or several postgres or several data_store
+containers, with no revision file in the checkout, without the mode's data_store image, and on the
+S6/D6/D5 checks of dev_up; it builds nothing. migrate_status is read-only: alembic current and history by
+exec in the running data_store of whichever mode is up, charging no budget. alembic check is not offered:
+make migrate-check covers it on the host.
+
+and TWO TEST-MODE VERBS over the same project (tj-iee6sn.24; ADR tj-4rr0la addenda 26-27):
+
+    test_build()  test_up()
+
+test_build is make test-build: the TEST-mode images (data_store and data_ingest, named by docker-compose.fake.yaml, the
+prod target, stamped with the source digests) from the baked base file, docker-compose.fake.yaml and the
+MCP-only docker-compose.agent-test.yaml, which sets build.dockerfile alone. No file set it can use names
+:latest, so it never builds or tags that tag, which may be a real deployment's. test_up is make
+system-launch: it stops the project, then starts postgres, data_store and data_ingest from the base and
+fake files with DATA_DIR pinned to ./volume_data/test in the step environment (never the owner's dev
+data), data_ingest on the fake broker. It never builds: both :test images must exist and carry a source
+stamp equal to the checkout's digest (stack.check_dev_image_stamp), else it is refused naming test_build.
+
+THE MODE GUARD. Every state-changing verb that acts on the project first lists its non-one-off containers
+and classifies each by the basename of its compose files (stack.classify_mode, run_migrations.sh's
+classifier): DEV (override, no fake), TEST (fake, no override), PROD (anything else, both together
+included). Any PROD container, or DEV and TEST together, refuses the verb; dev_tools acts on DEV (or an
+empty project) only, and migrate and migrate_status on DEV or TEST (an empty project is refused). dev_up and test_up act on any non-PROD state because they stop it.
 
 An agent passes a worktree NAME, test paths, a service from a closed set and a line count -- never a
 compose argument, an image, a container id, a command line or a host path.
@@ -125,28 +151,23 @@ if absent -- and a failed pull stops the verb, naming the ref, before any build 
 The trusted Dockerfile pins those refs by digest; no build passes --pull.
 
 THE SNAPSHOT (ADR addendum 5). The Docker daemon never resolves a path an agent can change. Before
-stack_up, migrate, migrate_status, migrate_check, run_system_tests and seed_dump,
+stack_up, run_system_tests and seed_dump,
 stack.refresh_snapshot() copies the named (or recorded) worktree's stack.SNAPSHOT_SOURCES
 into <stack dir>/source -- no symlink, no special file,
 capped in bytes and files, built beside the old copy, verified, swapped in by rename -- and that copy
 is the project directory: the build context and every relative bind source. stack.check_mount_sources,
-stack.resolve_test_paths and the migrations guard run on it. stack_down, stack_wipe, logs and ps read
+stack.resolve_test_paths run on it. stack_down, stack_wipe, logs and ps read
 no worktree, and the two dev verbs use no snapshot at all. The premise, checked by settings: nothing but the MCP writes under the stack directory.
 The swap orphans a running container's snapshot binds, so stack_up force-recreates
 stack.SNAPSHOT_BOUND_SERVICES on every call: the long-running services run the code of the LAST
-stack_up, and run_system_tests rebuilds and recreates only test_client -- after editing anything a
-running service loads, tests/fakes included, call stack_up first (tj-zgq5v2).
-
-migrate_check IS THE ONE RUN THAT PASSES --build, AND THE ASYMMETRY WITH make migrate-check IS
-DELIBERATE (decision tj-yb1bxj, closing section; tj-yuz1e8). `alembic check` compares the models it
-imports, and migrations/env.py imports them from /code -- the IMAGE -- while only alembic.ini and
-migrations/ are bind-mounted. compose builds a MISSING image on `run` but never a STALE one, so
-without the flag the check would compare the last stack_up's models. The agent stack exists to
-reflect the worktree under test and has no deployed image to be faithful to, so it BUILDS and the
-answer is about the worktree. The deploy path wants the opposite -- there the image actually
-deployed IS the subject -- so data/store/run_migrations.sh verifies the image's digest stamp and
-refuses a mismatch instead. Nothing in this server routes through that script or inherits that
-guard, and nothing here should: a build and a stamp refusal answer different questions.
+stack_up (tj-zgq5v2). run_system_tests and seed_dump no longer touch the agent stack (tj-iee6sn.20):
+they run test_client of the ONE project (trader_joe) against TEST mode, started by test_up. The services
+there run the :test images of the ROOT checkout; test_client and every mount it has come from the
+snapshot of the named worktree, so a worktree's unintegrated tests reach the client. Rails, in order and
+each refusing before anything runs: only TEST mode is up (the mode guard), the running postgres's data
+mount is <repo host path>/volume_data/test/postgres (stack.check_test_postgres_mount), every running
+data_store and data_ingest container's source stamp equals the checkout's digest; then the snapshot and
+one charge of the state-changing budget. The compose command is stack.check_testclient_argv's.
 
 THE GENERATED ENV FILES (stack.ensure_env_files; ADR addendum 2). Three files in the agent stack's own
 directory, outside the repository, 0600, generated once from the committed .env.default files read at
@@ -197,7 +218,7 @@ docker-socket-proxy's variables, everything else off:
     BUILD, SESSION, GRPC   image builds through BuildKit (compose build, run --build).
     EVENTS                 compose up --wait and run follow container events.
     EXEC                   start and inspect an exec: the read-only dev diagnostics (dev_db_tables,
-                           dev_migrate_status; ADR tj-4rr0la addendum 22). Creating one is POST under CONTAINERS.
+                           migrate_status; ADR tj-4rr0la addendum 22). Creating one is POST under CONTAINERS.
     POST=1                 every one of the above that writes.
 NOT needed, keep off: AUTH, SECRETS, CONFIGS, PLUGINS, SYSTEM, SWARM, NODES, SERVICES, TASKS,
 DISTRIBUTION, COMMIT. The list is read from what compose calls for these verbs and is confirmed at

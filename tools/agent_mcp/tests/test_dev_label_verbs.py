@@ -40,6 +40,10 @@ GUARD = (
     '-a',
     '--filter',
     f'label=com.docker.compose.project={PROJECT}',
+    # ADR tj-4rr0la addendum 26 (2), tj-iee6sn.24: one-off containers (alembic runs, test_client) are
+    # ignored by the mode classification, as the lookups already ignore them.
+    '--filter',
+    'label=com.docker.compose.oneoff=False',
     '--format',
     '{{.Label "com.docker.compose.project.config_files"}}',
 )
@@ -78,11 +82,18 @@ STEERING_NAMES = (
 )
 PROD_LINE = b'/r/docker-compose.yaml,/r/docker-compose.web.yaml\n'
 DEV_LINE = b'/r/docker-compose.yaml,/r/docker-compose.override.yaml,/r/docker-compose.web.yaml\n'
+# The mode guard's PROD refusal, the text tj-iee6sn.24's WHAT (1) gives, exactly.
 GUARD_REFUSAL = (
-    'project trader_joe has containers not started from the dev files (a prod-mode launch, or make '
-    'system-launch or make seed-dump, from a checkout named trader_joe): stop them with the compose files '
-    'that started them (make prod-down for a prod-mode launch), or run the make target yourself; tj-oxxl8a'
+    'project trader_joe has containers not started from the dev or test files (a prod launch?): '
+    'stop them with make prod-down; tj-oxxl8a'
 )
+# DEV and TEST containers together (tj-iee6sn.24): which mode is up cannot be told.
+MIXED_REFUSAL = (
+    'project trader_joe holds dev and test containers together, so which mode is up cannot be told: '
+    'stop them with make dev-down'
+)
+# What make system-launch's containers carry: the base file and the fake overlay (TEST mode).
+TEST_LINE = b'/r/docker-compose.yaml,/r/docker-compose.fake.yaml\n'
 GUARD_FAILED = 'could not list the containers of project trader_joe, so nothing was changed'
 BUDGET_REFUSAL = '12 state-changing dev verbs in the last hour is the budget; wait, or run the make target yourself'
 SERVICE_REFUSAL = 'service must be one of: data_store, data_ingest, web'

@@ -1,0 +1,15 @@
+# THE AGENT-STACK MCP'S OVERLAY FOR THE SYSTEM-TEST CLIENT (ADR tj-4rr0la addenda 26-27; tj-iee6sn.20).
+# MCP-ONLY: no Makefile target loads it. It is the LAST file of the MCP's client set
+# (stack.SYSTEM_CLIENT_COMPOSE_FILES): docker-compose.yaml, docker-compose.test-client.yaml, then this one.
+# run_system_tests and seed_dump use that set to build and run test_client from a snapshot of a worktree,
+# against the services of test mode (the :test images, started by test_up).
+#
+# IT SETS build.dockerfile AND NOTHING ELSE, for the one service the set builds: no image tag, no mount,
+# no network, no environment. The reasoning is docker-compose.agent-dev.yaml's: the build context is the
+# snapshot of a worktree, which an agent can write, so the Dockerfile is the MCP image's own trusted copy
+# and a worktree-edited one is never read (ADR tj-4rr0la addendum 5, ruling 2). Absolute path, as the
+# other overlays write it: a relative dockerfile resolves against the context.
+services:
+  test_client:
+    build:
+      dockerfile: /opt/agent_mcp/compose/Dockerfile

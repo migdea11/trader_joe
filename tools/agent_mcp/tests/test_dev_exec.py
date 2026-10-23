@@ -110,7 +110,7 @@ def expected_exec(container_id: str = CONTAINER_ID) -> list[str]:
 
 
 def expected_migrate_exec(container_id: str = CONTAINER_ID) -> list[str]:
-    """dev_migrate_status' exec (tj-iee6sn.13.5): in /code, as the image's user, then sh -c <its script>."""
+    """migrate_status' exec (tj-iee6sn.13.5): in /code, as the image's user, then sh -c <its script>."""
     return [EXPECTED_DOCKER, 'exec', '-w', '/code', container_id, 'sh', '-c', stack.DEV_MIGRATE_STATUS_SCRIPT]
 
 
@@ -1420,9 +1420,10 @@ def test_a_large_output_with_a_few_secrets_is_scrubbed_in_time(megabytes: int, b
 
 
 # ===============================================================================================
-# dev_migrate_status (tj-iee6sn.13.5): alembic current, then history, by exec in the RUNNING dev
-# data_store, -w /code, through the shared redact constant; refused, naming dev_db_tables, when
-# data_store is not running. Design: ADR tj-4rr0la addendum 22 (4); the bead's 21:47 and 23:33 notes.
+# migrate_status' exec (tj-iee6sn.13.5, folded into migrate_status by tj-iee6sn.10): alembic current, then
+# history, by exec in the RUNNING data_store, -w /code, through the shared redact constant; refused, naming
+# dev_db_tables, when data_store is not running. Design: ADR tj-4rr0la addendum 22 (4); the bead's 21:47
+# and 23:33 notes.
 # ===============================================================================================
 
 MIGRATE_SCRIPT = stack.DEV_MIGRATE_STATUS_SCRIPT
@@ -1462,91 +1463,10 @@ def test_the_migrate_status_builder_refuses_a_non_id(container_id: object):
         stack.dev_migrate_status_steps(STACK_DIR, container_id)  # type: ignore[arg-type]
 
 
-def test_the_whole_migrate_status_verb_runs_the_lookup_then_the_exec_into_the_id_it_found(tmp_path: Path, monkeypatch):
-    found = 'abcdef0123456789'
-
-    def respond(step: stack.Step) -> runner.ProcessResult:
-        if step.argv[1] == 'ps':
-            return runner.ProcessResult(0, f'{found}\n'.encode(), b'')
-        return default_response(step)
-
-    rig = make_rig(tmp_path, monkeypatch, FakeDocker(respond=respond))
-    result = rig.call('dev_migrate_status', {})
-    assert result['status'] == 'ok', result
-    assert result['message'] == 'alembic current and history from the running dev data_store container'
-    expected = [expected_lookup('data_store'), expected_migrate_exec(found)]
-    assert [list(step.argv) for step in rig.docker.steps] == expected
-    assert all(step.cwd == rig.layout.stack_dir for step in rig.docker.steps)
-    audit = json.loads(rig.audit_lines()[-1])
-    assert audit['verb'] == 'dev_migrate_status' and audit['status'] == 'ok' and audit['arguments'] == {}, audit
-
-
-_MIGRATE_LOOKUP_ANSWERS = {
-    'no running container': (runner.ProcessResult(0, b'', b''), 'no running data_store container'),
-    'blank lines': (runner.ProcessResult(0, b'\n \n', b''), 'no running data_store container'),
-    'two running containers': (runner.ProcessResult(0, b'c0ffee000001\nc0ffee000002\n', b''), '2 running data_store'),
-    'a non-hex answer': (runner.ProcessResult(0, b'trader_joe-data_store-1\n', b''), 'not a container id'),
-    'the lookup failed': (runner.ProcessResult(1, b'', b'403 Forbidden'), 'the container lookup failed'),
-}
-
-
-@pytest.mark.parametrize('case', list(_MIGRATE_LOOKUP_ANSWERS), ids=list(_MIGRATE_LOOKUP_ANSWERS))
-def test_dev_migrate_status_refuses_without_exec_unless_the_lookup_found_exactly_one(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
-):
-    """Zero, several, a non-id or a failed lookup: 'refused', ZERO exec subprocesses; zero names dev_db_tables."""
-    answer, match = _MIGRATE_LOOKUP_ANSWERS[case]
-
-    def respond(step: stack.Step) -> runner.ProcessResult:
-        if step.argv[1] == 'ps':
-            return answer
-        return default_response(step)
-
-    rig = make_rig(tmp_path, monkeypatch, FakeDocker(respond=respond))
-    result = rig.call('dev_migrate_status', {})
-    assert result['status'] == 'refused', result
-    assert match in result['message'], result
-    assert [list(step.argv) for step in rig.docker.steps] == [expected_lookup('data_store')], 'an exec ran'
-    names_fallback = 'use dev_db_tables, which works while data_store is down' in result['message']
-    assert names_fallback is match.startswith('no running'), result['message']
-    assert 'c0ffee' not in result['message']
-    audit = json.loads(rig.audit_lines()[-1])
-    assert audit['verb'] == 'dev_migrate_status' and audit['status'] == 'refused', audit
-
-
-def test_a_failed_alembic_is_failed_with_its_exit_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    def respond(step: stack.Step) -> runner.ProcessResult:
-        if step.argv[1] == 'exec':
-            return runner.ProcessResult(3, b'== alembic current ==\nboom\n', b'')
-        return default_response(step)
-
-    rig = make_rig(tmp_path, monkeypatch, FakeDocker(respond=respond))
-    result = rig.call('dev_migrate_status', {})
-    assert result['status'] == 'failed' and result['exit_status'] == 3, result
-    assert result['message'] == 'alembic exited 3 in the running dev data_store; see the steps'
-
-
-def test_dev_migrate_status_takes_nothing_and_has_a_sixty_second_budget():
-    schema = runner.VERB_SCHEMAS['dev_migrate_status']
-    assert schema == {'properties': {}, 'required': [], 'type': 'object', 'additionalProperties': False}
-    assert runner.VERB_TIMEOUT_SECONDS['dev_migrate_status'] == EXPECTED_TIMEOUT_SECONDS
-
-
-@pytest.mark.parametrize(
-    'arguments',
-    [{'revision': 'head'}, {'command': 'upgrade'}, {'container': CONTAINER_ID}, {'service': 'postgres'}, 'x', None],
-    ids=['revision', 'command', 'container', 'service', 'positional', 'none'],
-)
-def test_no_argument_reaches_dev_migrate_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arguments: object):
-    rig = make_rig(tmp_path, monkeypatch)
-    result = rig.call('dev_migrate_status', arguments)
-    assert result['status'] == 'refused', result
-    assert rig.docker.steps == []
-
-
-def test_the_migrate_status_handler_and_builder_take_no_caller_string():
-    assert list(inspect.signature(stack.dev_migrate_status_steps).parameters) == ['stack_dir', 'container_id']
-    assert list(inspect.signature(runner.AgentStack._dev_migrate_status).parameters) == ['self', 'call']
+# THE VERB. dev_migrate_status was folded into migrate_status by tj-iee6sn.10 (the mode guard first, then this
+# lookup and this exec). Its verb-level tests -- the whole run, each lookup refusal running no exec, a failed
+# alembic, the schema, the timeout and the handler signature -- live with migrate's in test_dev_migrate.py.
+# The builder, its argv and its script stay pinned here.
 
 
 # --- the script, by its parts ----------------------------------------------------------------------

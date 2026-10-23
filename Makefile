@@ -503,8 +503,8 @@ migrate-status:  ## Report the applied revision and the revision history (read-o
 # carries a source stamp equal to this checkout's digest, and prints both on EVERY outcome. The
 # guard lives in the script and not in this recipe because the script owns the stack selection
 # that decides which image the one-off container uses: on a dev stack the comparison image is
-# :dev and the FIX line names `make dev-build` (tj-yb1bxj addendum 4), otherwise :latest and
-# `make prod-build`. The reasoning is written out there. It is gated on the alembic command
+# :dev and the FIX line names `make dev-build` (tj-yb1bxj addendum 4); on a test stack (make system-launch) it is :test and
+# names `make test-build`; otherwise :latest and `make prod-build`. The reasoning is written out there. It is gated on the alembic command
 # being `check`, so `migrate` is untouched.
 #
 # THE HELP LINE NAMES THE REFUSAL, THE ORDINARY UNSTAMPED CASE AND THE ESCAPE HATCH, AND POINTS AT
@@ -519,7 +519,7 @@ migrate-status:  ## Report the applied revision and the revision history (read-o
 # already puzzled about why a check passed. That was R4's actual purpose, and a help row nobody
 # reads documents nothing.
 .PHONY: migrate-check
-migrate-check:  ## Compare the models with the live schema (writes alembic_version if absent). REFUSES unless the data_store image's source stamp matches this checkout's digest; an unstamped CI or system-launch image is the ordinary case, not a fault -- make prod-build (make dev-build on a dev stack) fixes it. What the stamp does and does not cover: see the comment above. Escape hatch: MIGRATE_CHECK_ALLOW_STALE_IMAGE=1
+migrate-check:  ## Compare the models with the live schema (writes alembic_version if absent). REFUSES unless the data_store image's source stamp matches this checkout's digest; an unstamped image (CI's, or one compose built implicitly) is the ordinary case, not a fault -- the stack's own build fixes it: make dev-build (dev), make test-build (test), make prod-build (prod). What the stamp does and does not cover: see the comment above. Escape hatch: MIGRATE_CHECK_ALLOW_STALE_IMAGE=1
 	./server/data/store/run_migrations.sh check
 
 .PHONY: dev-build
@@ -539,8 +539,27 @@ dev-network:  ## Create the shared dev network if it is missing (never removed)
 		|| docker network create --driver bridge $(DEV_NETWORK) > /dev/null \
 		|| docker network inspect $(DEV_NETWORK) > /dev/null
 
+# Launching dev tears down fake mode (ADR tj-4rr0la addendum 26 (4)). A fake-mode container (the
+# test mode: docker-compose.fake.yaml among its com.docker.compose.project.config_files) is
+# on ./volume_data/test; an `up` of the dev files would recreate postgres onto the owner's DATA_DIR
+# while that fake data_ingest kept running, and fake bars would reach the owner's database. So this
+# downs the project, by dev-up's own line (same compose set, so the same project, whatever the
+# checkout's directory is called), ONLY when a running container of the project carries the fake file
+# by basename. Otherwise it does nothing, and in particular it never takes down a dev stack: a plain
+# dev-deps next to a running dev stack stays an in-place `up`. The project is resolved by compose
+# (DEV_COMPOSE ps), not spelled; a real prod container carries no fake file, so prod is not matched.
+# dev-up downs unconditionally and needs no prerequisite.
+.PHONY: leave-fake-mode
+leave-fake-mode:
+	@ids="$$($(DEV_COMPOSE) ps -q 2>/dev/null)"; \
+	if [ -n "$$ids" ] && docker inspect --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}' $$ids 2>/dev/null \
+		| grep -Eq '(^|[,/])docker-compose\.fake\.yaml(,|$$)'; then \
+		echo "leave-fake-mode: a fake-mode container is up; taking the project down first."; \
+		PGADMIN_EMAIL=unused PGADMIN_PASS=unused $(TOOLS_COMPOSE) down; \
+	fi
+
 .PHONY: dev-deps
-dev-deps: $(VENV_MARKER) dev-network  ## Start the development dependencies (postgres)
+dev-deps: $(VENV_MARKER) dev-network leave-fake-mode  ## Start the development dependencies (postgres)
 	$(DEV_COMPOSE) up -d postgres
 
 # pgAdmin is a tool, not a dependency: it lives in docker-compose.tools.yaml, which dev-deps and
@@ -548,7 +567,7 @@ dev-deps: $(VENV_MARKER) dev-network  ## Start the development dependencies (pos
 # needs PGADMIN_EMAIL/PGADMIN_PASS set. compose brings postgres up first, because pgadmin
 # depends on it being healthy. Stop it with dev-down.
 .PHONY: dev-tools
-dev-tools: $(VENV_MARKER) dev-network  ## Start pgAdmin against the development database (needs PGADMIN_*)
+dev-tools: $(VENV_MARKER) dev-network leave-fake-mode  ## Start pgAdmin against the development database (needs PGADMIN_*)
 	$(TOOLS_COMPOSE) up -d pgadmin
 
 # Foreground on purpose, unlike prod-launch: --reload prints what it reloaded and why, and
@@ -1654,10 +1673,11 @@ define SYSTEM_TEST_DISPOSABLE_GUARD
 	echo "  compose project's stack holds -- and this host may also run the production deployment, in that" >&2; \
 	echo "  same compose project:" >&2; \
 	echo "    test-system:   the suite's client joins its networks and writes to its database;" >&2; \
-	echo "    system-launch: replaces its data_ingest with the fake, which writes fake bars;" >&2; \
+	echo "    system-launch: takes that project DOWN, then starts the fake-mode stack on" >&2; \
+	echo "                   ./volume_data/test (fake bars go there, not into the project's own data);" >&2; \
 	echo "    seed-dump:     the producer POSTs its scenario into it." >&2; \
 	echo "  Run it only against a stack you can wipe: bring one up and migrate it" >&2; \
-	echo "  (make system-launch or make dev-launch, then make migrate), then run:" >&2; \
+	echo "  (make system-launch, then make migrate), then run:" >&2; \
 	echo "    make $@ SYSTEM_TEST_DISPOSABLE_DB=1" >&2; \
 	exit 1; \
 fi
@@ -1675,24 +1695,54 @@ test-system:  ## Run tests/system from the test_client container against an up, 
 # THE FAKE-MODE STACK (decision tj-j4wknb R4; tj-vhboky.61): the stack docker-compose.yaml defines,
 # from the PROD images, with docker-compose.fake.yaml on top -- data_ingest runs the test-only launcher
 # on FakeRead from a read-only mount of tests/fakes, one worker, broker keys blanked. Nothing else
-# differs from prod-launch. The system suite runs against it: make system-launch, make migrate, then
-# make test-system.
+# differs from prod-launch. The system suite runs against it: make test-build, make system-launch, make
+# migrate, then make test-system.
 #
 # PROD_COMPOSE never loads the fake-mode overlay, just as it never loads the dev override: the prod
 # image holds no fakes, and the only way a fake reaches a running service is this file list (or the
 # agent stack's, AGENT_STACK_COMPOSE).
-SYSTEM_COMPOSE := docker compose -f docker-compose.yaml -f docker-compose.fake.yaml
+#
+# THE TEST DATA DIR (ADR tj-4rr0la addendum 26 (3)). SYSTEM_COMPOSE sets DATA_DIR on the command line,
+# which outranks .env, so system-launch and seed-dump put postgres on ./volume_data/test and never
+# touch the owner's dev data (their DATA_DIR, default ./volume_data). The directory is inside the
+# ignored /volume_data/ and never overlaps ./volume_data/postgres or ./volume_data/pgadmin.
+TEST_DATA_DIR := ./volume_data/test
+SYSTEM_COMPOSE := DATA_DIR=$(TEST_DATA_DIR) docker compose -f docker-compose.yaml -f docker-compose.fake.yaml
+# The two refs docker-compose.fake.yaml names, which make test-build builds and system-launch requires.
+TEST_IMAGES := trader_joe_data_store:test trader_joe_data_ingest:test
+
+# THE TEST-MODE IMAGES (ADR tj-4rr0la addendum 27). The prod stage of the Dockerfile, built through the
+# test file set (base + fake), which names the images :test, so :latest -- possibly a real deployment's
+# -- is never built over or run by test mode. Stamped with the source digest like prod-build. No
+# gen-proto-ts and no web: test mode has no web service. Only data_store and data_ingest: test_client
+# has its own image.
+.PHONY: test-build
+test-build: $(VENV_MARKER) proto  ## Build the test-mode images (:test, prod target, stamped); never touches :latest
+	$(WITH_SOURCE_STAMP) $(SYSTEM_COMPOSE) build data_store data_ingest
 
 # Behind the SAME disposable-database guard as test-system: this runs in the default compose project,
 # the one prod-launch uses, so on a host that runs the production deployment it would recreate that
 # stack's data_ingest as the fake, and fake bars would reach its database. The same --wait as PROD_UP
-# (spelled out rather than shared, so PROD_UP stays as it is). No build: like prod-launch it starts the
-# images prod-build made, so build first after a change. No $(VENV_MARKER), for the reason test-system
-# has none. No stop target of its own: every service here is in docker-compose.yaml, so `make
-# prod-down` (or dev-down) stops and removes this stack cleanly.
+# (spelled out rather than shared, so PROD_UP stays as it is). No build: it starts the :test
+# images make test-build made (docker-compose.fake.yaml names them), so build first after a change, and
+# REFUSES when either is missing, because compose would otherwise build the absent one itself,
+# unstamped. That refusal comes after the guard and BEFORE the down, so a refused run takes nothing
+# down. No $(VENV_MARKER), for the reason test-system has none. No stop target of its own: every
+# service here is in docker-compose.yaml, so `make prod-down` (or dev-down) stops and removes this
+# stack cleanly.
+#
+# IT DOWNS THE PROJECT FIRST (addendum 26 (4)), by dev-up's own line, so only one mode is ever up and
+# the stack it starts is on ./volume_data/test (TEST_DATA_DIR), never the owner's dev data. That down
+# reaches whatever the default compose project holds, a real production deployment on a shared host
+# included, which is why the disposable-database attestation stays on this target: the guard above the
+# down is the only thing between a mistaken run and a prod stack taken down. The down uses TOOLS_COMPOSE
+# (the same project as the up, whatever the checkout's directory is called) and dev-down's placeholder
+# credentials, safe on a down only.
 .PHONY: system-launch
 system-launch:  ## Start the stack from the prod images with data_ingest on the fake broker, waiting for healthy (SYSTEM_TEST_DISPOSABLE_DB=1)
 	$(SYSTEM_TEST_DISPOSABLE_GUARD)
+	@docker image inspect $(TEST_IMAGES) >/dev/null 2>&1 || { echo "make system-launch: the :test images do not exist; run make test-build first (compose would otherwise build them unstamped)" >&2; exit 1; }
+	PGADMIN_EMAIL=unused PGADMIN_PASS=unused $(TOOLS_COMPOSE) down
 	$(SYSTEM_COMPOSE) up -d --wait --wait-timeout 300
 
 # THE SEED DUMP (ADR tj-4rr0la addendum 10 (4); decision tj-vhboky.55 S9-S11). Against the stack

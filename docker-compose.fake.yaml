@@ -10,6 +10,11 @@
 # to the Makefile's AGENT_STACK_COMPOSE, after docker-compose.agent-stack.yaml (ADR tj-4rr0la addendum
 # 3 (3)). PROD_COMPOSE never loads it, and neither do DEV_COMPOSE, TOOLS_COMPOSE or TEST_CLIENT_COMPOSE.
 #
+# THIS IS THE TEST-MODE OVERLAY (ADR tj-4rr0la addendum 27). The test pair, data_store and data_ingest,
+# builds (`make test-build`) and runs as :test ONLY, never :latest: the image: keys below are the only
+# place in the repository that names a :test tag. :latest can be a real deployment's image, and test
+# mode, the MCP's included, must never build over it or run it. The images are the prod target.
+#
 # THE PROD IMAGE HOLDS NO FAKES. The Dockerfile copies only common, routers, schemas and
 # <service>/app, never anything under tests/; this file only MOUNTS tests/fakes, read-only, into a
 # prod_image container. data/ingest/tests/test_no_production_test_imports.py pins that production
@@ -26,7 +31,10 @@
 # /ping on APP_INTERNAL_PORT and gRPC health on APP_INTERNAL_GRPC_HOST:APP_INTERNAL_GRPC_PORT, both of
 # which the launcher's app serves like production's, since it runs production's create_app and lifespan).
 services:
+  data_store:
+    image: trader_joe_data_store:test
   data_ingest:
+    image: trader_joe_data_ingest:test
     volumes:
       # Read-only: the container runs agent-changeable code and must not write into the tree it runs
       # from (in the agent stack, the MCP's snapshot; ADR tj-4rr0la addendum 5).

@@ -1,0 +1,23 @@
+# THE AGENT-STACK MCP'S OVERLAY FOR TEST MODE'S BUILD (ADR tj-4rr0la addenda 26-27; tj-iee6sn.24).
+# MCP-ONLY: no Makefile target loads it. It is the LAST file of the MCP's test_build set
+# (stack.TEST_BUILD_COMPOSE_FILES): docker-compose.yaml, docker-compose.fake.yaml, then this one -- the
+# Makefile's SYSTEM_COMPOSE list plus this overlay, and a validator test pins that the two agree.
+# test_up runs the set WITHOUT this file (stack.TEST_COMPOSE_FILES), because it never builds.
+#
+# IT SETS build.dockerfile AND NOTHING ELSE, for the two services test mode builds: no image tag
+# (docker-compose.fake.yaml names the :test refs, which is why this set can only ever build :test), no
+# mount, no network, no environment. The reasoning is docker-compose.agent-dev.yaml's: the build
+# context is the live root checkout, which an agent can write, so the Dockerfile is the MCP image's own
+# trusted copy and a checkout-edited one is never read.
+#
+# THE TWO SERVICES are data_store and data_ingest. Test mode has no web service, and compose refuses an
+# override that names a service the set does not define, so docker-compose.agent-dev.yaml (which also
+# names web) cannot be reused here. Absolute path, as that file writes it: a relative dockerfile
+# resolves against the context.
+services:
+  data_store:
+    build:
+      dockerfile: /opt/agent_mcp/compose/Dockerfile
+  data_ingest:
+    build:
+      dockerfile: /opt/agent_mcp/compose/Dockerfile

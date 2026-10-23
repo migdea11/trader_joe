@@ -31,16 +31,20 @@ from tools.agent_mcp.tests.harness import (
     DEV_PROJECT_VERBS,
     DOCKERLESS_VERBS,
     REPO_ROOT,
+    SYSTEM_SUITE_VERBS,
     VERB_SAMPLES,
     FakeDocker,
     clearing_hook,
+    client_prefix_words_for,
     default_response,
     dev_step_prefix_length,
     dev_up_compose_argv,
+    is_client_step,
     is_dev_up_wrapper,
     make_rig,
     populate_data,
     record_state,
+    response_for,
     step_prefix_length,
 )
 
@@ -66,22 +70,22 @@ LITERAL_BUILT_SERVICES = {'data_store', 'data_ingest', 'test_client'}
 BUILDING_VERBS = {
     'stack_up',
     'run_system_tests',
-    'migrate',
-    'migrate_status',
-    'migrate_check',
     'seed_dump',
     'dev_build',
     'dev_up',
-    # tj-iee6sn.10: the one-off `run` of data_store can build (compose builds a missing image on run),
-    # so the bases come before it although the data_store :dev image was found present first.
-    'dev_migrate',
-    'dev_migrate_check',
+    # tj-iee6sn.10: migrate's one-off `run` of data_store can build (compose builds a missing image on run),
+    # so the bases come before it although the mode's data_store image was found present first.
+    'migrate',
+    # tj-iee6sn.24: test_build's file-based `build` of the two :test images, and test_up's file-based `up`
+    # (compose builds a missing image on up, so the bases come first although both images were found).
+    'test_build',
+    'test_up',
 }
 # dev_ps and dev_logs are base-free by construction, not by choice: they hand compose no file, so
 # there is no service definition to build from (ADR tj-4rr0la addendum 18).
 # dev_db_tables likewise (addendum 22): a plain `docker ps` lookup and a `docker exec` into a running
-# container, neither of which can build or pull anything. dev_migrate_status the same (tj-iee6sn.13.5):
-# it execs into the RUNNING data_store, unlike migrate_status, whose one-off `run` can build.
+# container, neither of which can build or pull anything. migrate_status the same (tj-iee6sn.13.5, folded
+# into migrate_status by tj-iee6sn.10): the mode guard's `docker ps`, then an exec into the RUNNING data_store.
 # dev_http_get too (tj-iee6sn.13.6): the same lookup and one exec into the running data_store.
 # dev_down and dev_restart too (tj-iee6sn.7): a plain `docker ps` (the D7 guard) and one label-only
 # compose down or restart, which load no file and so have nothing to build from.
@@ -96,7 +100,7 @@ BASE_FREE_VERBS = {
     'dev_ps',
     'dev_logs',
     'dev_db_tables',
-    'dev_migrate_status',
+    'migrate_status',
     # dev_tools (tj-iee6sn.14): its `up` names pgadmin alone, and neither pgadmin nor postgres (its one
     # depends_on) has a build: key in any file dev_tools loads, so the up has nothing to build from. Its
     # tail is the one `up` exempted from the literal rule below, and only after the files are checked.
@@ -237,14 +241,14 @@ _BUILDER_SAMPLES = {
     'stack_up_steps': (),
     'stack_down_steps': (),
     'wipe_clear_steps': (['postgres'],),
-    'postgres_running_steps': (),
-    'alembic_steps': (['upgrade', 'head'], ['current']),
-    'alembic_check_steps': (),
-    'system_tests_steps': (['tests/system'],),
-    'seed_dump_steps': ('2026-01-02',),
     'logs_steps': ('data_store', 50),
     'ps_steps': (),
 }
+# The system-test client's builders (tj-iee6sn.20) take the repository's HOST path, not an env file: their
+# steps are dev_up's secret wrapper around `docker compose -p trader_joe --project-directory <snapshot>
+# --env-file <host>/.env` and the three trusted client files, so they are swept by that prefix.
+_CLIENT_BUILDER_SAMPLES = {'system_tests_steps': (['tests/system'],), 'seed_dump_steps': ('2026-01-02',)}
+_CLIENT_HOST = Path('/home/someone/repos/trader_joe')
 # The dev-project builders take no env file (they pass none), so they are swept separately below
 # rather than given a misleading second parameter. tj-tq2hn6 (B2) owns their containment tests.
 _DEV_BUILDER_SAMPLES = {
@@ -269,7 +273,10 @@ _DEV_DIGEST_BUILDER_SAMPLES = {'dev_digest_steps': (Path('/home/someone/repos/tr
 # dev_up's two plain-docker builders (tj-iee6sn.9): the `docker image inspect` of each :dev image, and the
 # devnet `docker network` inspect/create pair. Neither touches compose, so neither can build. dev_up's up
 # step comes from dev_up_step (singular), pinned in test_dev_up.py to be flagged as building.
-_DEV_PLAIN_BUILDER_SAMPLES = {'dev_image_steps': (), 'dev_network_steps': ()}
+# test_up's plain-docker builder (tj-iee6sn.24) likewise: one `docker image inspect` per :test image.
+# test_build's and test_up's compose steps come from testmode_build_step / testmode_up_step (singular),
+# pinned in test_test_mode.py to be flagged as building.
+_DEV_PLAIN_BUILDER_SAMPLES = {'dev_image_steps': (), 'dev_network_steps': (), 'testmode_image_steps': ()}
 
 
 def _builders() -> dict[str, object]:
@@ -294,6 +301,7 @@ def test_every_steps_builder_flags_each_step_that_can_build():
     builders = _builders()
     samples = (
         set(_BUILDER_SAMPLES)
+        | set(_CLIENT_BUILDER_SAMPLES)
         | set(_DEV_BUILDER_SAMPLES)
         | set(_DEV_EXEC_BUILDER_SAMPLES)
         | set(_DEV_DIGEST_BUILDER_SAMPLES)
@@ -307,6 +315,13 @@ def test_every_steps_builder_flags_each_step_that_can_build():
     for name, sample in _BUILDER_SAMPLES.items():
         for step in builders[name](stack_dir, env_file, *sample):
             tail = list(step.argv[step_prefix_length() :])
+            assert step.builds is _can_build(tail), f'{name}: {tail} has builds={step.builds}'
+            flagged += step.builds
+    client_prefix = client_prefix_words_for(stack_dir, _CLIENT_HOST)
+    for name, sample in _CLIENT_BUILDER_SAMPLES.items():
+        for step in builders[name](stack_dir, _CLIENT_HOST, *sample):
+            assert list(step.argv[: len(client_prefix)]) == client_prefix, f'{name}: {step.argv}'
+            tail = list(step.argv[len(client_prefix) :])
             assert step.builds is _can_build(tail), f'{name}: {tail} has builds={step.builds}'
             flagged += step.builds
     assert flagged >= 5, 'the sweep found too few building steps to mean anything'
@@ -348,7 +363,9 @@ def _is_base(argv: tuple[str, ...]) -> bool:
 
 
 def _run_verb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str, respond=default_response):
-    rig = make_rig(tmp_path, monkeypatch, FakeDocker(respond=respond))
+    rig = make_rig(tmp_path, monkeypatch, FakeDocker())
+    # tj-iee6sn.20: the system-suite pair runs only in TEST mode on the test postgres mount.
+    rig.docker.respond = response_for(verb, rig.layout, respond)
     record_state(rig.layout)
     populate_data(rig.layout)
     rig.docker.hook = clearing_hook(rig.layout)
@@ -384,12 +401,24 @@ def test_every_step_that_can_build_is_preceded_by_the_ensure_bases_steps(
     argvs = [dev_up_compose_argv(step) if is_dev_up_wrapper(step) else step.argv for step in rig.docker.steps]
 
     dev_tools_prefix = tuple(stack.dev_tools_prefix(rig.layout.repo_host_path))
+    # tj-iee6sn.24: the two TEST sets, the build set first (the up set is a word-prefix of it).
+    test_prefixes = (
+        tuple(stack.testmode_build_prefix(rig.layout.repo_host_path)),
+        tuple(stack.testmode_prefix(rig.layout.repo_host_path)),
+    )
+    # tj-iee6sn.20: the system-test client's compose prefix (unwrapped since 5a38b7f).
+    client_prefix = tuple(client_prefix_words_for(rig.layout.stack_dir, rig.layout.repo_host_path))
 
     def compose_tail(argv: tuple[str, ...]) -> list[str]:
         # The file-based dev prefix (tj-iee6sn.8) is not the agent stack's; slice each by its own. The
         # dev_tools prefix (tj-iee6sn.14) is the dev one with the tools file inserted, so it is tried first.
         if argv[: len(dev_tools_prefix)] == dev_tools_prefix:
             return list(argv[len(dev_tools_prefix) :])
+        if argv[: len(client_prefix)] == client_prefix:
+            return list(argv[len(client_prefix) :])
+        for prefix in test_prefixes:
+            if argv[: len(prefix)] == prefix:
+                return list(argv[len(prefix) :])
         if argv[: len(dev_file_prefix)] == dev_file_prefix:
             return list(argv[len(dev_file_prefix) :])
         return list(argv[step_prefix_length() :])
@@ -415,7 +444,9 @@ def test_every_step_that_can_build_is_preceded_by_the_ensure_bases_steps(
         assert missing == [], f'{verb}: {shlex.join(argvs[index])} runs before the inspect of {missing}'
     # The bases run where the build that needs them runs: the snapshot for the agent stack, the stack
     # directory for a dev verb, which never reads the snapshot.
-    base_cwd = rig.layout.stack_dir if verb in DEV_PROJECT_VERBS else rig.layout.snapshot
+    # tj-iee6sn.20: the system-suite pair now runs every step, its bases included, from the stack directory
+    # (its compose call names the snapshot only as --project-directory).
+    base_cwd = rig.layout.stack_dir if verb in DEV_PROJECT_VERBS | SYSTEM_SUITE_VERBS else rig.layout.snapshot
     for step in rig.docker.steps:
         if _is_base(step.argv):
             assert step.cwd == base_cwd and step.builds is False, step
@@ -452,14 +483,15 @@ def test_the_dev_tools_up_can_build_nothing():
 
 
 def test_the_bases_are_ensured_once_per_verb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Pin (3a): migrate_status runs ps, the inspects once, then both alembic runs -- no second inspect pair."""
-    rig, result = _run_verb(tmp_path, monkeypatch, 'migrate_status')
+    """Pin (3a): stack_up runs the inspects once, then its three building steps -- no second inspect set.
+
+    Re-pointed by tj-iee6sn.10 from the agent-stack migrate_status (removed; its two alembic runs were the
+    two building steps) to stack_up, whose build and two ups are three building steps in one call.
+    """
+    rig, result = _run_verb(tmp_path, monkeypatch, 'stack_up')
     assert result['status'] == 'ok', result
-    shape = [
-        'inspect' if _is_base(step.argv) else ' '.join(step.argv[step_prefix_length() :][:1] + step.argv[-1:])
-        for step in rig.docker.steps
-    ]
-    assert shape == ['ps postgres', *['inspect'] * len(stack.BASE_IMAGES), 'run current', 'run history'], shape
+    shape = ['inspect' if _is_base(step.argv) else step.argv[step_prefix_length()] for step in rig.docker.steps]
+    assert shape == [*['inspect'] * len(stack.BASE_IMAGES), 'build', 'up', 'up'], shape
 
 
 def test_a_base_is_pulled_only_when_its_inspect_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -507,6 +539,8 @@ def test_a_failed_pull_stops_the_verb_naming_the_ref(
     assert argvs[-1] == _pull(ref), f'{verb} ran on after the failed pull: {argvs}'
     assert [step['command'] for step in result['steps']][-1] == shlex.join(_pull(ref))
     assert not [argv for argv in argvs if argv[1] == 'compose' and _can_build(list(argv[step_prefix_length() :]))]
+    # tj-iee6sn.20: no client step of the system-suite pair may follow either.
+    assert not [step for step in rig.docker.steps if is_client_step(step)], f'{verb} ran the client after the pull'
     assert not [other for other in stack.BASE_IMAGES[failing + 1 :] if _inspect(other) in argvs]
 
 

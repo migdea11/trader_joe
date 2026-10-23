@@ -28,10 +28,13 @@ from tools.agent_mcp.tests.harness import (
     SERVER_ROOT,
     WORKTREE_NAME,
     FakeDocker,
+    client_tail,
     default_response,
+    is_base_step,
+    is_client_step,
     is_seed_producer,
     make_rig,
-    step_prefix_length,
+    system_suite_response,
     tree_digest,
 )
 
@@ -59,11 +62,15 @@ def _producer_answers(result: runner.ProcessResult):
 
 
 def _rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, respond=default_response):
-    return make_rig(tmp_path, monkeypatch, FakeDocker(respond=respond))
+    """A rig in TEST mode with the test postgres mount (tj-iee6sn.20), RESPOND answering every other step."""
+    rig = make_rig(tmp_path, monkeypatch, FakeDocker())
+    rig.docker.respond = system_suite_response(rig.layout, respond)
+    return rig
 
 
 def _tails(rig) -> list[list[str]]:
-    return [list(step.argv[step_prefix_length() :]) for step in rig.docker.steps if step.argv[1] == 'compose']
+    """The tail of every client step, after its whole fixed prefix (tj-iee6sn.20: wrapper, -p trader_joe, snapshot)."""
+    return [client_tail(step, rig.layout) for step in rig.docker.steps if is_client_step(step)]
 
 
 def _seeds_dir(rig) -> Path:
@@ -197,10 +204,17 @@ def test_only_seed_dump_carries_details(tmp_path: Path, monkeypatch: pytest.Monk
 def test_the_bases_are_ensured_before_the_build_and_the_producer_runs_last(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """Addendum 14: the step list starts with the ensure-bases step, then the build, then the run."""
+    """Addendum 14: after the rails, the ensure-bases steps, then the build, then the run, and nothing after.
+
+    Re-pinned by tj-iee6sn.20: the rails (test_system_suite.py pins them in order) now run first, so the
+    shape is checked from the first base step on, and every step after the bases is a client step.
+    """
     rig = _rig(tmp_path, monkeypatch)
-    rig.call('seed_dump', {'worktree': WORKTREE_NAME})
-    kinds = ['base' if step.argv[1] == 'image' else step.argv[step_prefix_length()] for step in rig.docker.steps]
+    assert rig.call('seed_dump', {'worktree': WORKTREE_NAME})['status'] == 'ok'
+    steps = rig.docker.steps
+    first_base = next(index for index, step in enumerate(steps) if is_base_step(step))
+    assert not [step for step in steps[:first_base] if is_client_step(step)], 'a client step ran before the bases'
+    kinds = ['base' if is_base_step(step) else client_tail(step, rig.layout)[0] for step in steps[first_base:]]
     assert kinds == ['base'] * len(stack.BASE_IMAGES) + ['build', 'run'], kinds
 
 
@@ -275,7 +289,7 @@ def test_any_other_non_zero_exit_fails_and_writes_nothing(tmp_path: Path, monkey
 
 def test_a_failed_build_stops_before_the_producer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     def respond(step: stack.Step) -> runner.ProcessResult:
-        if step.argv[1] == 'compose' and step.argv[step_prefix_length()] == 'build':
+        if is_client_step(step) and step.argv[-2:] == ('build', 'test_client'):
             return runner.ProcessResult(1, b'', b'build failed\n')
         return default_response(step)
 

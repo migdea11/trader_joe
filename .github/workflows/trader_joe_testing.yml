@@ -625,13 +625,15 @@ jobs:
       # nothing on this runner can reach data_store from outside the stack: every HTTP request
       # this job makes to it goes from test_client, a container on store_api, by service name.
       # Three compose spellings, and only three, in this job:
-      #   the stack   docker compose -f docker-compose.yaml ...  -- run --no-deps, exec, logs,
-      #               ps, down. It never loads the client file, so migrating, blanking and
-      #               inspecting data_store cannot depend on it. None of these creates a service
-      #               container, so they keep the base file alone.
+      #   the stack   docker compose -f docker-compose.yaml ...  -- exec, logs, ps, down. It never
+      #               loads the client file, so blanking and inspecting data_store cannot depend
+      #               on it. None of these creates a container or resolves an image, so they keep
+      #               the base file alone.
       #   the fake stack
       #               docker compose -f docker-compose.yaml -f docker-compose.fake.yaml -- for
-      #               `up` and nothing else (FAKE MODE, decision tj-j4wknb R4): make
+      #               `up` and for `run --no-deps data_store` (the migrations): both resolve the
+      #               :test images that file names, so nothing in test mode resolves :latest
+      #               (ADR tj-4rr0la addendum 27). (FAKE MODE, decision tj-j4wknb R4): make
       #               system-launch starts the stack with it, so data_ingest runs the test-only
       #               launcher on FakeRead, and the lifecycle step's data_store recreate repeats
       #               it, so no container is ever created without the overlay -- or data_ingest
@@ -658,6 +660,11 @@ jobs:
 
           docker tag ${{ needs.build.outputs.IMAGE_STORE }} trader_joe_data_store
           docker tag ${{ needs.build.outputs.IMAGE_INGEST }} trader_joe_data_ingest
+          # The :test tags docker-compose.fake.yaml names (ADR tj-4rr0la addendum 27): the test-mode
+          # stack and every `run` below resolve these, never :latest. Same images, a second tag --
+          # the Image Build job above is untouched and still pushes :latest for deploy.
+          docker tag ${{ needs.build.outputs.IMAGE_STORE }} trader_joe_data_store:test
+          docker tag ${{ needs.build.outputs.IMAGE_INGEST }} trader_joe_data_ingest:test
           docker images  # Verify images are loaded
 
       # No "Add Runtime Configs" step: this job writes no ALPACA_* value at all, not
@@ -731,7 +738,7 @@ jobs:
           # data/store/tests/test_market_activity_idempotency.py, whose docstring concedes the
           # Postgres-only property that tests/system now checks against this database.
           set -euo pipefail
-          docker compose -f docker-compose.yaml run --rm --no-deps data_store \
+          docker compose -f docker-compose.yaml -f docker-compose.fake.yaml run --rm --no-deps data_store \
             /code/.venv/bin/alembic upgrade head
 
           # Then prove it landed where it was aimed: the revision the database records must be
@@ -749,7 +756,7 @@ jobs:
           # data, so it moved with the seed work to the fake-broker PR (epic tj-irhy0a,
           # tj-vhboky.62).
           revisions() {
-            docker compose -f docker-compose.yaml run --rm --no-deps -T --pull never data_store \
+            docker compose -f docker-compose.yaml -f docker-compose.fake.yaml run --rm --no-deps -T --pull never data_store \
               /code/.venv/bin/alembic "$1" | { grep -Eo '^[0-9a-f]{12}\b' || [ $? -eq 1 ]; }
           }
           heads="$(revisions heads)"

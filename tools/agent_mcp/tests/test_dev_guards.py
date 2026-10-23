@@ -1,13 +1,15 @@
 """The dev lifecycle's checks (tj-iee6sn.6; ADR tj-4rr0la addendum 23; owner rulings D5-D7 on tj-iee6sn.1).
 
-The verbs (B4 dev_down/dev_restart, B5 dev_build, B6 dev_up, B7 dev_migrate, B8 dev_tools) come with
+The verbs (B4 dev_down/dev_restart, B5 dev_build, B6 dev_up, B7 migrate, B8 dev_tools) come with
 their own beads and their own tests; B4's, which call the guards in order, are test_dev_label_verbs.py.
 What is pinned here is each check on its own, so that gutting one turns ITS tests red (addendum 19 (A)):
 
   * check_dev_lifecycle_argv: one whole row of a fixed table under its own prefix, and the
     forbidden words named in every spelling;
-  * the D7 prod guard: its one `docker ps`, and the classification of its output, which must agree
-    with run_migrations.sh's classify_config_files as the script itself answers;
+  * the mode guard (D7 generalised, tj-iee6sn.24): its one `docker ps` over the non-one-off
+    containers, and the DEV/TEST/PROD classification of its output, which must agree with
+    run_migrations.sh's classify_config_files as the script itself answers, fake-file labels included;
+  * the two TEST-mode file sets and the rows only they accept (tj-iee6sn.24);
   * the D6 symlink check over the bind sources parsed from the trusted dev files;
   * the D5 env-file preflight, which lstats and never opens;
   * the pinned and placeholder step environments, derived from the compose files' own defaults;
@@ -23,6 +25,7 @@ import itertools
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess  # nosec B404 -- a fixed bash invocation of the repository's own classifier block
 import threading
@@ -33,6 +36,7 @@ from pathlib import Path
 import pytest
 
 from common.tests import compose_model
+from common.tests.test_ci_invariants import _make_recipe, _make_variable
 from tools.agent_mcp import runner, stack
 from tools.agent_mcp.tests.harness import REPO_ROOT, SERVER_ROOT, make_rig
 from tools.agent_mcp.tests.test_commands import EXPECTED_DEV_BAKES, _baked_into_trusted
@@ -73,17 +77,40 @@ TOOLS_PREFIX = [
     *(word for name in EXPECTED_TOOLS_COMPOSE_FILES for word in ('-f', f'{EXPECTED_TRUSTED_DIR}/{name}')),
 ]
 
+# TEST mode's two sets (tj-iee6sn.24; ADR tj-4rr0la addendum 27): test_up's is the Makefile's SYSTEM_COMPOSE
+# (base, then the fake overlay that names the :test tags); test_build's adds the MCP-only overlay LAST.
+EXPECTED_TEST_COMPOSE_FILES = ('docker-compose.yaml', 'docker-compose.fake.yaml')
+EXPECTED_TEST_BUILD_COMPOSE_FILES = (*EXPECTED_TEST_COMPOSE_FILES, 'docker-compose.agent-test.yaml')
+TEST_PREFIX = [
+    *LABEL_PREFIX,
+    '--project-directory',
+    str(HOST),
+    *(word for name in EXPECTED_TEST_COMPOSE_FILES for word in ('-f', f'{EXPECTED_TRUSTED_DIR}/{name}')),
+]
+TEST_BUILD_PREFIX = [
+    *LABEL_PREFIX,
+    '--project-directory',
+    str(HOST),
+    *(word for name in EXPECTED_TEST_BUILD_COMPOSE_FILES for word in ('-f', f'{EXPECTED_TRUSTED_DIR}/{name}')),
+]
+
 LABEL = 'label-only'
 FILE = 'file-based'
 TOOLS = 'file-based+tools'
-KINDS = (LABEL, FILE, TOOLS)
+TEST = 'file-based+test'
+TEST_BUILD = 'file-based+test-build'
+KINDS = (LABEL, FILE, TOOLS, TEST, TEST_BUILD)
+# make test-build's build and make system-launch's up, word for word (no service names on the up).
+TEST_BUILD_TAIL = ('build', 'data_store', 'data_ingest')
+TEST_UP_TAIL = ('up', '-d', '--wait', '--wait-timeout', '300')
 ALEMBIC = '/code/.venv/bin/alembic'
 UP_TAIL = ('up', '-d', '--wait', '--wait-timeout', '300', 'postgres', 'data_store', 'data_ingest', 'web')
 # make dev-tools' `up -d pgadmin` plus --wait, the one documented deviation (the 18:37 readiness note (2)).
 TOOLS_TAIL = ('up', '-d', '--wait', 'pgadmin')
 # Every command the dev lifecycle may run, whole, with the prefix it runs under (addendum 23 (2); the
 # 22:05/22:08 notes on the bead: label-only down, label-only restart of the three apps, the file-based
-# build, the up of make dev-up, and make migrate / make migrate-check's alembic run).
+# build, the up of make dev-up, and make migrate's alembic run; tj-iee6sn.10 removed make migrate-check's).
+MIGRATE_TAIL = ('run', '--rm', '--no-deps', 'data_store', ALEMBIC, 'upgrade', 'head')
 EXPECTED_ROWS = {
     ('down',): LABEL,
     ('restart', 'data_store'): LABEL,
@@ -91,12 +118,26 @@ EXPECTED_ROWS = {
     ('restart', 'web'): LABEL,
     ('build', 'data_store', 'data_ingest', 'web'): FILE,
     UP_TAIL: FILE,
-    ('run', '--rm', '--no-deps', 'data_store', ALEMBIC, 'upgrade', 'head'): FILE,
-    ('run', '--rm', '--no-deps', 'data_store', ALEMBIC, 'check'): FILE,
+    MIGRATE_TAIL: FILE,
     # tj-iee6sn.14: make dev-tools' up of pgAdmin, under the tools prefix and no other.
     TOOLS_TAIL: TOOLS,
+    # tj-iee6sn.24: make test-build's build ONLY under the test build set (the one set that can build
+    # :test and nothing else), make system-launch's up ONLY under the test set.
+    TEST_BUILD_TAIL: TEST_BUILD,
+    TEST_UP_TAIL: TEST,
 }
 ROW_IDS = [' '.join(tail[:2]) + (' ...' if len(tail) > 2 else '') for tail in EXPECTED_ROWS]
+# tj-iee6sn.10: the SAME migrate words are also accepted under the TEST set (make migrate's TEST definition:
+# base + docker-compose.fake.yaml), from a second table, so one tail is accepted under exactly two prefixes.
+EXPECTED_TEST_ONEOFF_ROWS = {MIGRATE_TAIL: TEST}
+
+
+def _accepted_kinds(tail) -> list[str]:
+    """The kinds TAIL must be accepted under, in KINDS order: its row's, plus its TEST one-off row's."""
+    wanted = {EXPECTED_ROWS[tail], EXPECTED_TEST_ONEOFF_ROWS.get(tail)}
+    return [kind for kind in KINDS if kind in wanted]
+
+
 EXPECTED_FORBIDDEN = {
     '-v',
     '-V',
@@ -116,7 +157,14 @@ EXPECTED_FORBIDDEN = {
 
 
 def _argv(tail, kind: str = LABEL) -> list[str]:
-    return [*{LABEL: LABEL_PREFIX, FILE: FILE_PREFIX, TOOLS: TOOLS_PREFIX}[kind], *tail]
+    prefixes = {
+        LABEL: LABEL_PREFIX,
+        FILE: FILE_PREFIX,
+        TOOLS: TOOLS_PREFIX,
+        TEST: TEST_PREFIX,
+        TEST_BUILD: TEST_BUILD_PREFIX,
+    }
+    return [*prefixes[kind], *tail]
 
 
 def _check(argv, host: Path | None = HOST) -> None:
@@ -130,9 +178,22 @@ def _check(argv, host: Path | None = HOST) -> None:
 
 def test_the_table_holds_exactly_these_rows_each_with_its_kind():
     """Membership: a row added (stop, rm, a restart of postgres) or a kind swapped is red here."""
-    kinds = {stack._DEV_LABEL_ONLY: LABEL, stack._DEV_FILE_BASED: FILE, stack._DEV_TOOLS_FILE_BASED: TOOLS}
+    kinds = {
+        stack._DEV_LABEL_ONLY: LABEL,
+        stack._DEV_FILE_BASED: FILE,
+        stack._DEV_TOOLS_FILE_BASED: TOOLS,
+        stack._TEST_FILE_BASED: TEST,
+        stack._TEST_BUILD_FILE_BASED: TEST_BUILD,
+    }
     assert {tail: kinds[kind] for tail, kind in stack.DEV_LIFECYCLE_COMMANDS.items()} == EXPECTED_ROWS
-    assert (stack._DEV_LABEL_ONLY, stack._DEV_FILE_BASED, stack._DEV_TOOLS_FILE_BASED) == KINDS
+    assert {tail: kinds[kind] for tail, kind in stack.TEST_ONEOFF_COMMANDS.items()} == EXPECTED_TEST_ONEOFF_ROWS
+    assert (
+        stack._DEV_LABEL_ONLY,
+        stack._DEV_FILE_BASED,
+        stack._DEV_TOOLS_FILE_BASED,
+        stack._TEST_FILE_BASED,
+        stack._TEST_BUILD_FILE_BASED,
+    ) == KINDS
 
 
 def test_the_forbidden_set_is_exactly_the_data_losing_and_steering_words():
@@ -150,16 +211,17 @@ def test_each_row_is_refused_under_every_other_prefix(tail, kind):
     """Wrong kind, every way, for each row.
 
     A label-only down never loads files, a file-based up never runs without them, the pgAdmin up never
-    runs without the tools file, and no other row runs with it (tj-iee6sn.14).
+    runs without the tools file, and no other row runs with it (tj-iee6sn.14). The migrate one-off is the one
+    tail with a second accepted prefix, the TEST set (tj-iee6sn.10); every other prefix still refuses it.
     """
     for other in KINDS:
-        if other != kind:
+        if other not in _accepted_kinds(tail):
             with pytest.raises(stack.Refused, match='one of its fixed commands'):
                 _check(_argv(tail, other))
 
 
 def test_every_row_is_accepted_exactly_once_over_the_three_prefixes():
-    """Each tail is accepted under one prefix and only one, and no two rows share a tail."""
+    """Each tail is accepted under one prefix and only one -- the migrate one-off under DEV's and TEST's."""
     for tail in EXPECTED_ROWS:
         accepted = []
         for kind in KINDS:
@@ -168,7 +230,47 @@ def test_every_row_is_accepted_exactly_once_over_the_three_prefixes():
                 accepted.append(kind)
             except stack.Refused:
                 pass
-        assert accepted == [EXPECTED_ROWS[tail]], (tail, accepted)
+        assert accepted == _accepted_kinds(tail), (tail, accepted)
+    assert _accepted_kinds(MIGRATE_TAIL) == [FILE, TEST], 'non-vacuity: the one tail with two prefixes'
+
+
+@pytest.mark.parametrize(
+    'tail',
+    [TEST_UP_TAIL, TEST_BUILD_TAIL, UP_TAIL, TOOLS_TAIL, ('build', 'data_store', 'data_ingest', 'web')],
+    ids=['test up', 'test build', 'dev up', 'tools up', 'dev build'],
+)
+def test_the_test_oneoff_table_admits_no_other_row_under_the_test_prefix(tail):
+    """TEST_ONEOFF_COMMANDS widens the TEST prefix by the migrate words alone: a DEV row stays refused under it.
+
+    And the TEST up row stays refused under the dev prefix: the second table is consulted for the TEST kind only.
+    """
+    accepted = [kind for kind in KINDS if _try(_argv(tail, kind))]
+    assert accepted == [EXPECTED_ROWS[tail]], (tail, accepted)
+
+
+def _try(argv) -> bool:
+    try:
+        _check(argv)
+    except stack.Refused:
+        return False
+    return True
+
+
+@pytest.mark.parametrize(
+    'tail',
+    [
+        (*MIGRATE_TAIL[:-1], 'heads'),
+        (*MIGRATE_TAIL[:-2], 'check'),
+        (*MIGRATE_TAIL[:-2], 'downgrade', 'base'),
+        (*MIGRATE_TAIL, '--sql'),
+        ('run', '--rm', '--no-deps', '--build', 'data_store', ALEMBIC, 'upgrade', 'head'),
+        ('run', '--rm', 'data_store', ALEMBIC, 'upgrade', 'head'),
+        ('run', '--rm', '--no-deps', 'data_ingest', ALEMBIC, 'upgrade', 'head'),
+    ],
+    ids=['heads', 'check', 'downgrade', '--sql', '--build', 'no --no-deps', 'data_ingest'],
+)
+def test_no_neighbour_of_the_migrate_words_is_accepted_under_any_prefix(tail):
+    assert not [kind for kind in KINDS if _try(_argv(tail, kind))], tail
 
 
 # Every spelling of every forbidden word: separated, `=` attached, short attached, short cluster.
@@ -368,6 +470,93 @@ def test_the_tools_prefix_is_the_dev_one_with_the_tools_file_before_the_overlay(
     assert 'docker-compose.tools.yaml' not in stack.DEV_COMPOSE_FILES
 
 
+def _trusted(*names: str) -> list[str]:
+    return [
+        *LABEL_PREFIX,
+        '--project-directory',
+        str(HOST),
+        *(w for n in names for w in ('-f', f'{EXPECTED_TRUSTED_DIR}/{n}')),
+    ]
+
+
+# Every near miss of the two TEST sets (tj-iee6sn.24 TESTS: "the lifecycle check accepts the build row
+# ONLY under that file set (refuses it under the base file alone so :latest cannot be built, and refuses
+# `up` under the build set)"). The base file alone names :latest (docker-compose.yaml l.133, l.222).
+_BAD_TEST_PREFIXES = {
+    'the base file alone (would build :latest)': _trusted('docker-compose.yaml'),
+    'the base and the test overlay, no fake file (would build :latest)': _trusted(
+        'docker-compose.yaml', 'docker-compose.agent-test.yaml'
+    ),
+    'the fake file first': _trusted('docker-compose.fake.yaml', 'docker-compose.yaml'),
+    'the test overlay before the fake file': _trusted(
+        'docker-compose.yaml', 'docker-compose.agent-test.yaml', 'docker-compose.fake.yaml'
+    ),
+    'the fake file twice': _trusted('docker-compose.yaml', 'docker-compose.fake.yaml', 'docker-compose.fake.yaml'),
+    'the override added': _trusted('docker-compose.yaml', 'docker-compose.override.yaml', 'docker-compose.fake.yaml'),
+    'the dev overlay in place of the test one': _trusted(
+        'docker-compose.yaml', 'docker-compose.fake.yaml', 'docker-compose.agent-dev.yaml'
+    ),
+    "the checkout's fake file": [*TEST_PREFIX[:-1], f'{HOST}/docker-compose.fake.yaml'],
+    "the checkout's test overlay": [*TEST_BUILD_PREFIX[:-1], f'{HOST}/docker-compose.agent-test.yaml'],
+    'another host path': [*LABEL_PREFIX, '--project-directory', '/srv/other', *TEST_BUILD_PREFIX[6:]],
+}
+
+
+@pytest.mark.parametrize('tail', [TEST_BUILD_TAIL, TEST_UP_TAIL], ids=['test build', 'test up'])
+@pytest.mark.parametrize('prefix', list(_BAD_TEST_PREFIXES.values()), ids=list(_BAD_TEST_PREFIXES))
+def test_the_test_rows_under_any_other_file_list_are_refused(prefix, tail):
+    assert prefix not in (TEST_PREFIX, TEST_BUILD_PREFIX)
+    with pytest.raises(stack.Refused):
+        _check([*prefix, *tail])
+
+
+def test_the_test_build_row_is_refused_under_the_test_up_set_and_the_up_under_the_build_set():
+    """Spelled out beside the sweep: neither TEST row runs under the other TEST set, nor the build under dev's.
+
+    A build without the overlay would read the checkout's Dockerfile; the up never runs with the build
+    overlay (test_up never builds).
+    """
+    with pytest.raises(stack.Refused, match='one of its fixed commands'):
+        _check([*TEST_PREFIX, *TEST_BUILD_TAIL])
+    with pytest.raises(stack.Refused, match='one of its fixed commands'):
+        _check([*TEST_BUILD_PREFIX, *TEST_UP_TAIL])
+    with pytest.raises(stack.Refused, match='one of its fixed commands'):
+        _check([*FILE_PREFIX, *TEST_BUILD_TAIL])
+
+
+def test_the_test_prefixes_are_the_makefiles_system_compose_plus_the_overlay():
+    """stack.testmode_prefix / testmode_build_prefix from literals; the sets agree with SYSTEM_COMPOSE.
+
+    The Makefile's SYSTEM_COMPOSE -f list (the overlay's own header says a validator pins this), with
+    the MCP-only overlay unknown to the Makefile.
+    """
+    assert stack.testmode_prefix(HOST) == TEST_PREFIX
+    assert stack.testmode_build_prefix(HOST) == TEST_BUILD_PREFIX
+    assert stack.TEST_COMPOSE_FILES == EXPECTED_TEST_COMPOSE_FILES
+    assert stack.TEST_BUILD_COMPOSE_FILES == EXPECTED_TEST_BUILD_COMPOSE_FILES
+    words = shlex.split(_make_variable('SYSTEM_COMPOSE'))
+    files = tuple(value for flag, value in itertools.pairwise(words) if flag in ('-f', '--file'))
+    assert files == EXPECTED_TEST_COMPOSE_FILES, words
+    assert 'docker-compose.agent-test.yaml' not in (REPO_ROOT / 'Makefile').read_text(encoding='utf-8')
+
+
+def test_the_agent_test_overlay_sets_only_build_dockerfile_for_the_two_test_services():
+    """tj-iee6sn.24 WHAT (3): build.dockerfile (the trusted Dockerfile) for data_store and data_ingest only.
+
+    Nothing else: no image tag (the fake overlay names :test), no mount, no network, no environment, no web.
+    """
+    model = compose_model.load(REPO_ROOT / 'docker-compose.agent-test.yaml')
+    assert set(model) == {'services'}, model
+    assert model['services'] == {
+        'data_store': {'build': {'dockerfile': f'{EXPECTED_TRUSTED_DIR}/Dockerfile'}},
+        'data_ingest': {'build': {'dockerfile': f'{EXPECTED_TRUSTED_DIR}/Dockerfile'}},
+    }
+    # The services it names are exactly the ones make test-build builds (its recipe's last words).
+    recipe = _make_recipe('test-build')
+    assert len(recipe) == 1 and recipe[0].endswith('$(SYSTEM_COMPOSE) build data_store data_ingest'), recipe
+    assert tuple(model['services']) == tuple(recipe[0].split()[-2:]) == TEST_BUILD_TAIL[1:]
+
+
 def test_a_project_dev_tools_started_still_passes_the_prod_guard():
     """The config_files label of a container dev_tools started classifies DEV.
 
@@ -376,7 +565,7 @@ def test_a_project_dev_tools_started_still_passes_the_prod_guard():
     """
     label = ','.join(f'{EXPECTED_TRUSTED_DIR}/{name}' for name in EXPECTED_TOOLS_COMPOSE_FILES)
     assert stack.classify_config_files(label) == 'DEV'
-    stack.check_dev_prod_guard(0, f'{label}\n'.encode())
+    assert stack.check_mode_guard(0, f'{label}\n'.encode()) == 'DEV'
 
 
 _BAD_FILE_PREFIXES = {
@@ -412,7 +601,7 @@ def test_a_wrong_project_or_program_is_refused(prefix):
 
 
 # ===============================================================================================
-# THE D7 PROD GUARD
+# THE MODE GUARD (D7 generalised; ADR tj-4rr0la addenda 26 (2) and 27 (1); tj-iee6sn.24 WHAT (1))
 # ===============================================================================================
 
 EXPECTED_GUARD_ARGV = (
@@ -421,22 +610,29 @@ EXPECTED_GUARD_ARGV = (
     '-a',
     '--filter',
     f'label=com.docker.compose.project={EXPECTED_PROJECT}',
+    # Addendum 26 (2): one-off containers (oneoff=True: alembic runs, test_client) are ignored by the
+    # classification, as the lookups already ignore them.
+    '--filter',
+    'label=com.docker.compose.oneoff=False',
     '--format',
     '{{.Label "com.docker.compose.project.config_files"}}',
 )
 
 
-def test_the_guard_argv_is_exactly_one_docker_ps_printing_the_config_files_label():
-    """Ruling D7 on tj-iee6sn.1, spelled there word for word."""
+def test_the_guard_argv_is_exactly_one_docker_ps_of_the_non_one_off_containers_printing_one_label():
+    """Ruling D7 on tj-iee6sn.1, with addendum 26 (2)'s one-off filter, spelled word for word."""
     assert stack.dev_prod_guard_argv() == EXPECTED_GUARD_ARGV
     step = stack.dev_prod_guard_step(Path('/stack'))
     assert step.argv == EXPECTED_GUARD_ARGV and step.cwd == Path('/stack') and step.env == ()
+    assert step.builds is False
 
 
 _BAD_GUARD_ARGVS = {
     'running only': EXPECTED_GUARD_ARGV[:2] + EXPECTED_GUARD_ARGV[3:],
     'another project': (*EXPECTED_GUARD_ARGV[:4], 'label=com.docker.compose.project=other', *EXPECTED_GUARD_ARGV[5:]),
-    'another format': (*EXPECTED_GUARD_ARGV[:6], '{{.ID}}'),
+    'one-offs included (no oneoff filter)': (*EXPECTED_GUARD_ARGV[:5], *EXPECTED_GUARD_ARGV[7:]),
+    'one-offs only': (*EXPECTED_GUARD_ARGV[:6], 'label=com.docker.compose.oneoff=True', *EXPECTED_GUARD_ARGV[7:]),
+    'another format': (*EXPECTED_GUARD_ARGV[:8], '{{.ID}}'),
     'an extra word': (*EXPECTED_GUARD_ARGV, '--no-trunc'),
     'empty': (),
 }
@@ -444,7 +640,7 @@ _BAD_GUARD_ARGVS = {
 
 @pytest.mark.parametrize('argv', list(_BAD_GUARD_ARGVS.values()), ids=list(_BAD_GUARD_ARGVS))
 def test_the_guard_argv_check_refuses_any_other_argv(argv):
-    with pytest.raises(stack.Refused, match='the dev prod guard is'):
+    with pytest.raises(stack.Refused, match='the mode guard is'):
         stack.check_dev_prod_guard_argv(argv)
 
 
@@ -452,62 +648,176 @@ DEV_LINE = '/r/docker-compose.yaml,/r/docker-compose.override.yaml,/r/docker-com
 MCP_LINE = ','.join(f'{EXPECTED_TRUSTED_DIR}/{name}' for name in EXPECTED_DEV_COMPOSE_FILES)
 TOOLS_LINE = f'{DEV_LINE},/r/docker-compose.web.dev.yaml,/r/docker-compose.tools.yaml'
 PROD_LINE = '/r/docker-compose.yaml,/r/docker-compose.web.yaml'
+# TEST mode (addendum 27 (1)): make system-launch's set, the MCP's test_up set (trusted copies), and
+# test_build's set (the MCP-only overlay last), which a built-but-never-started container never carries
+# but which must classify TEST all the same.
+TEST_LINE = '/r/docker-compose.yaml,/r/docker-compose.fake.yaml'
+MCP_TEST_LINE = f'{EXPECTED_TRUSTED_DIR}/docker-compose.yaml,{EXPECTED_TRUSTED_DIR}/docker-compose.fake.yaml'
+MCP_TEST_BUILD_LINE = f'{MCP_TEST_LINE},{EXPECTED_TRUSTED_DIR}/docker-compose.agent-test.yaml'
+# Both files: no target launches that pair, so it is not a mode at all (PROD, fail closed).
+BOTH_LINE = '/r/docker-compose.yaml,/r/docker-compose.override.yaml,/r/docker-compose.fake.yaml'
+
+EXPECTED_MODES_ANY = frozenset({'DEV', 'TEST', None})
+EXPECTED_MODES_DEV_OR_EMPTY = frozenset({'DEV', None})
+
+
+def test_the_mode_constants_and_the_accepted_sets_are_these_literals():
+    assert (stack.MODE_DEV, stack.MODE_TEST, stack.MODE_PROD) == ('DEV', 'TEST', 'PROD')
+    assert stack.MODES_ANY == EXPECTED_MODES_ANY
+    assert stack.MODES_DEV_OR_EMPTY == EXPECTED_MODES_DEV_OR_EMPTY
+    assert 'PROD' not in stack.MODES_ANY | stack.MODES_DEV_OR_EMPTY
+    # The default accepted set is the widest one that is still never PROD.
+    assert inspect.signature(stack.check_mode_guard).parameters['accepted'].default == EXPECTED_MODES_ANY
 
 
 @pytest.mark.parametrize(
-    'stdout',
-    [b'', f'{DEV_LINE}\n'.encode(), f'{DEV_LINE}\n{MCP_LINE}\n{TOOLS_LINE}\n'.encode()],
-    ids=['an empty project', 'one dev container', 'make, MCP and pgAdmin containers'],
+    ('stdout', 'mode'),
+    [
+        (b'', None),
+        (f'{DEV_LINE}\n'.encode(), 'DEV'),
+        (f'{DEV_LINE}\n{MCP_LINE}\n{TOOLS_LINE}\n'.encode(), 'DEV'),
+        (f'{TEST_LINE}\n'.encode(), 'TEST'),
+        (f'{TEST_LINE}\n{MCP_TEST_LINE}\n{MCP_TEST_BUILD_LINE}\n'.encode(), 'TEST'),
+    ],
+    ids=[
+        'an empty project',
+        'one dev container',
+        'make, MCP and pgAdmin containers',
+        'one test container',
+        'make and MCP test containers',
+    ],
 )
-def test_the_guard_passes_an_empty_project_and_an_all_dev_one(stdout):
-    stack.check_dev_prod_guard(0, stdout)
+def test_the_guard_returns_the_mode_of_an_empty_an_all_dev_or_an_all_test_project(stdout, mode):
+    assert stack.check_mode_guard(0, stdout) == mode
+    assert stack.check_mode_guard(0, stdout, EXPECTED_MODES_ANY) == mode
 
 
 _GUARD_REFUSALS = {
     'one prod container': f'{PROD_LINE}\n',
     'mixed dev and prod': f'{DEV_LINE}\n{PROD_LINE}\n',
     'prod then dev': f'{PROD_LINE}\n{DEV_LINE}\n',
+    'test and prod': f'{TEST_LINE}\n{PROD_LINE}\n',
+    'dev, test and prod: PROD answers, not the mix': f'{DEV_LINE}\n{TEST_LINE}\n{PROD_LINE}\n',
+    'both the override and the fake file': f'{BOTH_LINE}\n',
+    'both files beside a dev container': f'{DEV_LINE}\n{BOTH_LINE}\n',
     'a relative entry': '/r/docker-compose.yaml,docker-compose.override.yaml\n',
     'a trailing comma': f'{DEV_LINE},\n',
     'a leading comma': f',{DEV_LINE}\n',
     'a double comma': '/r/docker-compose.yaml,,/r/docker-compose.override.yaml\n',
     'a blank line (a container with no label)': f'{DEV_LINE}\n\n{DEV_LINE}\n',
+    'a blank line among test containers': f'{TEST_LINE}\n\n',
     'only a blank line': '\n',
     'no final newline': DEV_LINE,
+    'no final newline, test': TEST_LINE,
     'a carriage return': '/r/docker-compose.yaml,/r/docker-compose.override.yaml\r\n',
     'the override as a directory': '/r/docker-compose.override.yaml/x.yaml\n',
     'the override with a suffix': '/r/docker-compose.override.yaml.bak\n',
+    'the fake file as .yml': '/r/docker-compose.yaml,/r/docker-compose.fake.yml\n',
+    'the fake file with a suffix': '/r/docker-compose.yaml,/r/docker-compose.fake.yaml.bak\n',
+    'the fake file as a directory': '/r/docker-compose.yaml,/r/docker-compose.fake.yaml/x.yaml\n',
+    'the fake file relative': '/r/docker-compose.yaml,docker-compose.fake.yaml\n',
 }
 
 
-# F2 (tj-iee6sn.6 gate), fixed on tj-iee6sn.7: the text the 14:59 UTC note there gives, exactly. A
-# non-dev container may be make system-launch or make seed-dump output, not only a prod-mode launch.
+# The PROD refusal, tj-iee6sn.24 WHAT (1)'s text exactly.
 EXPECTED_GUARD_REFUSAL = (
-    'project trader_joe has containers not started from the dev files (a prod-mode launch, or make '
-    'system-launch or make seed-dump, from a checkout named trader_joe): stop them with the compose files '
-    'that started them (make prod-down for a prod-mode launch), or run the make target yourself; tj-oxxl8a'
+    'project trader_joe has containers not started from the dev or test files (a prod launch?): '
+    'stop them with make prod-down; tj-oxxl8a'
+)
+EXPECTED_MIXED_REFUSAL = (
+    'project trader_joe holds dev and test containers together, so which mode is up cannot be told: '
+    'stop them with make dev-down'
 )
 
 
+@pytest.mark.parametrize('accepted', [EXPECTED_MODES_ANY, EXPECTED_MODES_DEV_OR_EMPTY], ids=['any', 'dev or empty'])
 @pytest.mark.parametrize('stdout', list(_GUARD_REFUSALS.values()), ids=list(_GUARD_REFUSALS))
-def test_the_guard_refuses_anything_not_dev(stdout):
+def test_the_guard_refuses_any_prod_container_whatever_the_verb_accepts(stdout, accepted):
     with pytest.raises(stack.Refused) as refused:
-        stack.check_dev_prod_guard(0, stdout.encode())
+        stack.check_mode_guard(0, stdout.encode(), accepted, 'the verb hint')
     assert str(refused.value) == EXPECTED_GUARD_REFUSAL
+
+
+@pytest.mark.parametrize(
+    'stdout',
+    [f'{DEV_LINE}\n{TEST_LINE}\n', f'{MCP_TEST_LINE}\n{MCP_LINE}\n', f'{TOOLS_LINE}\n{TEST_LINE}\n{DEV_LINE}\n'],
+    ids=['dev then test', 'test then dev (MCP files)', 'pgAdmin among them'],
+)
+@pytest.mark.parametrize('accepted', [EXPECTED_MODES_ANY, EXPECTED_MODES_DEV_OR_EMPTY], ids=['any', 'dev or empty'])
+def test_dev_and_test_containers_together_refuse_whatever_the_verb_accepts(stdout, accepted):
+    with pytest.raises(stack.Refused) as refused:
+        stack.check_mode_guard(0, stdout.encode(), accepted, 'the verb hint')
+    assert str(refused.value) == EXPECTED_MIXED_REFUSAL
+
+
+@pytest.mark.parametrize(('stdout', 'mode'), [(b'', None), (f'{DEV_LINE}\n'.encode(), 'DEV')], ids=['empty', 'dev'])
+def test_a_dev_only_verb_passes_dev_and_an_empty_project(stdout, mode):
+    assert stack.check_mode_guard(0, stdout, EXPECTED_MODES_DEV_OR_EMPTY, 'test mode is up: dev_up first') == mode
+
+
+def test_a_dev_only_verb_refuses_test_mode_with_its_own_hint():
+    for line in (TEST_LINE, MCP_TEST_LINE):
+        with pytest.raises(stack.Refused) as refused:
+            stack.check_mode_guard(
+                0, f'{line}\n'.encode(), EXPECTED_MODES_DEV_OR_EMPTY, 'test mode is up: dev_up first'
+            )
+        assert str(refused.value) == 'test mode is up: dev_up first'
+
+
+def test_a_mode_outside_the_accepted_set_without_a_hint_names_the_mode():
+    with pytest.raises(stack.Refused) as refused:
+        stack.check_mode_guard(0, f'{TEST_LINE}\n'.encode(), frozenset({'DEV'}))
+    assert str(refused.value) == 'TEST mode is up, which this verb does not act on'
+    with pytest.raises(stack.Refused):
+        stack.check_mode_guard(0, b'', frozenset({'DEV', 'TEST'}))
 
 
 def test_the_guard_refuses_bytes_that_are_not_utf8():
-    with pytest.raises(stack.Refused) as refused:
-        stack.check_dev_prod_guard(0, b'/r/docker-compose.override.yaml\xff\n')
-    assert str(refused.value) == EXPECTED_GUARD_REFUSAL
+    for stdout in (b'/r/docker-compose.override.yaml\xff\n', b'/r/docker-compose.fake.yaml\xff\n'):
+        with pytest.raises(stack.Refused) as refused:
+            stack.check_mode_guard(0, stdout)
+        assert str(refused.value) == EXPECTED_GUARD_REFUSAL
 
 
 @pytest.mark.parametrize('exit_status', [1, 125, -9, None])
 def test_the_guard_refuses_when_the_listing_failed_whatever_it_printed(exit_status):
     """Fail closed: a failed `docker ps` with an empty stdout must not read as an empty project."""
-    for stdout in (b'', f'{DEV_LINE}\n'.encode()):
+    for stdout in (b'', f'{DEV_LINE}\n'.encode(), f'{TEST_LINE}\n'.encode()):
         with pytest.raises(stack.Refused, match='could not list the containers'):
-            stack.check_dev_prod_guard(exit_status, stdout)
+            stack.check_mode_guard(exit_status, stdout)
+
+
+# THE CLASSIFIER TABLE (tj-iee6sn.24 TESTS): classify_config_files is run_migrations.sh's port
+# (UNKNOWN for both files), and classify_mode is what the guard acts on (UNKNOWN, malformed and
+# missing all become PROD). Literal rows; the agreement with the script is the test below.
+_CLASSIFIER_TABLE = {
+    'dev (make)': (DEV_LINE, 'DEV', 'DEV'),
+    'dev (MCP, trusted copies)': (MCP_LINE, 'DEV', 'DEV'),
+    'dev with pgAdmin': (TOOLS_LINE, 'DEV', 'DEV'),
+    'test (make system-launch)': (TEST_LINE, 'TEST', 'TEST'),
+    'test (MCP test_up, trusted copies)': (MCP_TEST_LINE, 'TEST', 'TEST'),
+    'test (MCP test_build set)': (MCP_TEST_BUILD_LINE, 'TEST', 'TEST'),
+    'the fake file alone': ('/opt/agent_mcp/compose/docker-compose.fake.yaml', 'TEST', 'TEST'),
+    'the fake file first': ('/r/docker-compose.fake.yaml,/r/docker-compose.yaml', 'TEST', 'TEST'),
+    'both files': (BOTH_LINE, 'UNKNOWN', 'PROD'),
+    'both files, fake first': ('/r/docker-compose.fake.yaml,/r/docker-compose.override.yaml', 'UNKNOWN', 'PROD'),
+    'neither file (prod)': (PROD_LINE, 'PROD', 'PROD'),
+    'the base file alone': ('/r/docker-compose.yaml', 'PROD', 'PROD'),
+    'missing (empty label)': ('', 'UNKNOWN', 'PROD'),
+    'malformed (relative)': ('docker-compose.fake.yaml', 'UNKNOWN', 'PROD'),
+    'malformed (trailing comma)': (f'{TEST_LINE},', 'UNKNOWN', 'PROD'),
+    'malformed (newline)': ('/r/a\n/docker-compose.fake.yaml', 'UNKNOWN', 'PROD'),
+    'near miss: fake.yml': ('/r/docker-compose.yaml,/r/docker-compose.fake.yml', 'PROD', 'PROD'),
+    'near miss: fake.yaml.bak': ('/r/docker-compose.yaml,/r/docker-compose.fake.yaml.bak', 'PROD', 'PROD'),
+    'near miss: fake.yaml as a directory': ('/r/docker-compose.fake.yaml/x.yaml', 'PROD', 'PROD'),
+    'near miss: prefixed fake': ('/r/xdocker-compose.fake.yaml', 'PROD', 'PROD'),
+}
+
+
+@pytest.mark.parametrize(('label', 'verdict', 'mode'), list(_CLASSIFIER_TABLE.values()), ids=list(_CLASSIFIER_TABLE))
+def test_the_classifier_table(label, verdict, mode):
+    assert stack.classify_config_files(label) == verdict
+    assert stack.classify_mode(label) == mode
 
 
 # THE CLASSIFIER AGREES WITH THE SCRIPT. Expected verdicts come from run_migrations.sh's own
@@ -534,13 +844,35 @@ _ATOMS = (
     '/r/$(x)\\',
     '/',
 )
+# THE FAKE-FILE LABELS (the architect's 09:30 note (B) on tj-iee6sn.24): without them the MCP port's
+# missing TEST passed this test unnoticed. The fake file under a checkout, the devcontainer path and
+# the MCP image's trusted copy, beside the base file and the override (so base + fake and override +
+# fake both occur), and its near misses (.yml, .bak, a directory, relative, prefixed).
+_MODE_ATOMS = (
+    '',
+    '/r/docker-compose.yaml',
+    '/r/docker-compose.override.yaml',
+    '/r/docker-compose.fake.yaml',
+    '/workspace/docker-compose.fake.yaml',
+    '/opt/agent_mcp/compose/docker-compose.fake.yaml',
+    '/opt/agent_mcp/compose/docker-compose.agent-test.yaml',
+    '/r/docker-compose.fake.yml',
+    '/r/docker-compose.fake.yaml.bak',
+    '/r/docker-compose.fake.yaml/',
+    'docker-compose.fake.yaml',
+    '/r/xdocker-compose.fake.yaml',
+)
+# The script's verdict -> the MCP's mode: the script's UNKNOWN is production to its own selection
+# (fail closed), and PROD to the MCP's guard.
+SCRIPT_TO_MODE = {'DEV': 'DEV', 'TEST': 'TEST', 'PROD': 'PROD', 'UNKNOWN': 'PROD'}
 
 
 def _labels() -> list[str]:
     labels = set()
-    for depth in (1, 2, 3):
-        for atoms in itertools.product(_ATOMS, repeat=depth):
-            labels.add(','.join(atoms))
+    for atom_set in (_ATOMS, _MODE_ATOMS):
+        for depth in (1, 2, 3):
+            for atoms in itertools.product(atom_set, repeat=depth):
+                labels.add(','.join(atoms))
     return sorted(labels)
 
 
@@ -573,13 +905,37 @@ def _script_verdicts(labels: list[str]) -> list[str]:
 def test_classify_config_files_agrees_with_run_migrations_sh_on_every_case():
     labels = _labels()
     verdicts = _script_verdicts(labels)
-    assert set(verdicts) == {'DEV', 'PROD', 'UNKNOWN'}, 'the cases must reach every verdict of the script'
+    assert set(verdicts) == {'DEV', 'TEST', 'PROD', 'UNKNOWN'}, 'the cases must reach every verdict of the script'
     disagreements = [
         (label, script, stack.classify_config_files(label))
         for label, script in zip(labels, verdicts, strict=True)
         if stack.classify_config_files(label) != script
     ]
     assert not disagreements, disagreements[:10]
+    # And the guard's mode is the script's verdict with UNKNOWN as PROD, on every case.
+    mode_disagreements = [
+        (label, script, stack.classify_mode(label))
+        for label, script in zip(labels, verdicts, strict=True)
+        if stack.classify_mode(label) != SCRIPT_TO_MODE[script]
+    ]
+    assert not mode_disagreements, mode_disagreements[:10]
+
+
+@pytest.mark.skipif(BASH is None, reason='bash is needed to run the script classifier')
+def test_the_classifier_tables_rows_are_the_scripts_own_verdicts():
+    """The architect's named rows (his 09:30 note (B)), through the SCRIPT itself.
+
+    base + fake is TEST in both; override + fake is UNKNOWN (production) in the script and PROD in the
+    MCP; the trusted-copy path; the near misses.
+    """
+    labels = [label for label, _, _ in _CLASSIFIER_TABLE.values()]
+    script = _script_verdicts(labels)
+    assert script == [verdict for _, verdict, _ in _CLASSIFIER_TABLE.values()], list(zip(labels, script, strict=True))
+    assert [SCRIPT_TO_MODE[verdict] for verdict in script] == [mode for _, _, mode in _CLASSIFIER_TABLE.values()]
+    named = dict(zip(labels, script, strict=True))
+    assert named[TEST_LINE] == 'TEST' and stack.classify_mode(TEST_LINE) == 'TEST'
+    assert named[BOTH_LINE] == 'UNKNOWN' and stack.classify_mode(BOTH_LINE) == 'PROD'
+    assert named['/opt/agent_mcp/compose/docker-compose.fake.yaml'] == 'TEST'
 
 
 # ===============================================================================================
@@ -1010,8 +1366,23 @@ def test_an_env_file_setting_the_redirecting_variables_cannot_change_the_step_en
 # forgets turns the membership pin and its one-byte, missing and symlink cases red. EXPECTED_DEV_BAKES
 # is test_commands.py's literal list of what tj-iee6sn.5 bakes, itself pinned there against the
 # Dockerfile's COPY lines; docker-compose.yaml and the Dockerfile are baked for the agent stack and are
-# the dev set's base file and build file too. The agent stack's own overlays are not dev files.
-EXPECTED_COPY_NAMES = frozenset({'docker-compose.yaml', 'Dockerfile', *EXPECTED_DEV_BAKES})
+# the dev set's base file and build file too. The agent stack's own overlays are not dev files, except
+# docker-compose.fake.yaml, which TEST mode's test_up and test_build load (tj-iee6sn.24 WHAT (3): "add it
+# and fake.yaml to S6"); docker-compose.agent-test.yaml arrives through EXPECTED_DEV_BAKES. tj-iee6sn.20 adds the
+# system-test client's two: docker-compose.test-client.yaml (baked for the agent stack, now loaded by
+# run_system_tests and seed_dump too) and docker-compose.agent-client.yaml, through EXPECTED_DEV_BAKES.
+EXPECTED_COPY_NAMES = frozenset(
+    {
+        'docker-compose.yaml',
+        'docker-compose.fake.yaml',
+        'docker-compose.test-client.yaml',
+        'Dockerfile',
+        *EXPECTED_DEV_BAKES,
+    }
+)
+# What the MCP image bakes into the trusted directory and S6 does NOT compare: the agent stack's own
+# overlay, which no verb of the one project loads (tj-iee6sn.21 removes it with the agent stack).
+BAKED_BUT_NOT_COMPARED = frozenset({'docker-compose.agent-stack.yaml'})
 COPY_NAMES = sorted(EXPECTED_COPY_NAMES)
 
 
@@ -1030,14 +1401,41 @@ def test_every_compared_copy_is_read_where_the_mcp_dockerfile_puts_it():
         assert landed.get(checkout) == f'{EXPECTED_TRUSTED_DIR}/{baked}', (checkout, landed.get(checkout))
 
 
-def test_the_bake_list_is_the_dev_files_the_tools_file_and_the_two_scripts():
-    """Non-vacuity for the derived pin: the list it is built from still names what tj-iee6sn.5 baked."""
+def test_the_bake_list_is_the_dev_files_the_tools_file_the_test_overlay_and_the_two_scripts():
+    """Non-vacuity for the derived pin: the list still names what tj-iee6sn.5 and tj-iee6sn.24 baked."""
     assert set(EXPECTED_DEV_BAKES) == {
         *EXPECTED_DEV_COMPOSE_FILES[1:],
         'docker-compose.tools.yaml',
+        'docker-compose.agent-test.yaml',
+        'docker-compose.agent-client.yaml',
         'tools/dev_instance_secret.sh',
         'tools/source_digest.sh',
     }
+
+
+def test_the_compared_copies_are_exactly_what_the_mcp_dockerfile_bakes_but_the_agent_stack_overlay():
+    """tj-iee6sn.20: the S6 list EQUALS the Dockerfile's bake list into the trusted directory, minus one named file.
+
+    Read from the COPY lines, so a file baked and not compared (S6 would let it go stale) or compared and not
+    baked (S6 would refuse every call) is red, and so is the exception growing beyond the agent-stack overlay.
+    """
+    baked = set(_baked_into_trusted())
+    compared = {checkout for checkout, _ in stack.DEV_TRUSTED_COPIES}
+    assert baked >= BAKED_BUT_NOT_COMPARED, 'the exception names a file the image no longer bakes: drop it'
+    assert compared == baked - BAKED_BUT_NOT_COMPARED, compared ^ (baked - BAKED_BUT_NOT_COMPARED)
+    assert {'docker-compose.test-client.yaml', 'docker-compose.agent-client.yaml'} <= compared
+
+
+def test_s6_covers_both_system_client_files():
+    """tj-iee6sn.20: the client file and the MCP-only client overlay are compared like the dev files."""
+    checkout_names = {checkout for checkout, _ in stack.DEV_TRUSTED_COPIES}
+    assert {'docker-compose.test-client.yaml', 'docker-compose.agent-client.yaml'} <= checkout_names, checkout_names
+
+
+def test_s6_covers_both_test_mode_files():
+    """tj-iee6sn.24 WHAT (3): the fake overlay and the MCP-only test overlay are compared like the dev files."""
+    checkout_names = {checkout for checkout, _ in stack.DEV_TRUSTED_COPIES}
+    assert {'docker-compose.fake.yaml', 'docker-compose.agent-test.yaml'} <= checkout_names, checkout_names
 
 
 def _copies(tmp_path: Path) -> tuple[Path, Path]:

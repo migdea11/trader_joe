@@ -3334,6 +3334,9 @@ SYSTEM_JOB_STEP_ORDER = (
 # production entrypoint (tj-irhy0a.1 item 1).
 FAKE_OVERLAY_FILE = REPO_ROOT / 'docker-compose.fake.yaml'
 CONTAINER_CREATING_SUBCOMMANDS = frozenset({'up', 'create'})
+# What the base file ALONE may still run in System Testing (ADR tj-4rr0la addendum 27 (2)): only the
+# calls that resolve no image, since the base file names :latest and the test pair runs :test.
+STACK_ALONE_SUBCOMMANDS = frozenset({'exec', 'logs', 'ps', 'down'})
 # The steps that may, and must, carry SYSTEM_TEST_DISPOSABLE_DB=1: each runs a make target behind the
 # disposable-database guard (test-system, system-launch, seed-dump), and nothing else may inherit it.
 ATTESTING_STEPS = frozenset({SYSTEM_TESTS_STEP, START_STEP, SEED_DUMP_STEP})
@@ -3704,22 +3707,34 @@ def test_system_job_loads_the_stack_alone_and_the_client_only_as_a_pair():
     the job, and it must carry the overlay. The base file alone stays the spelling for everything
     that creates no service container (run --no-deps of a one-off, exec, logs, ps, down); the overlay
     is loaded for nothing but `up`; the client pair is unchanged.
+
+    tj-iee6sn.19 RE-PIN (ADR tj-4rr0la addendum 27 (2)): the fake overlay names the :test images, so
+    every call that RESOLVES a data_store or data_ingest image goes through the fake-mode set -- `up`
+    anywhere, and `run --no-deps data_store` in the Migrate Database step (its upgrade and its
+    revisions() helper), and nowhere else. The base file alone resolves :latest, so it keeps only the
+    calls that resolve no image: exec, logs, ps, down. Migrate Database must use the fake set.
     """
     fake_stack = [COMPOSE_FILE.name, FAKE_OVERLAY_FILE.name]
-    seen, client_steps, fake_ups, offenders = set(), set(), set(), []
+    seen, client_steps, fake_ups, fake_runs, offenders = set(), set(), set(), set(), []
     for step in _system_steps():
         name = step.get('name')
         for line in _step_lines(step):
             for files, rest in _compose_calls(line):
                 seen.add(name)
                 if files == fake_stack:
-                    if rest[:1] != ['up']:
-                        offenders.append(f'{name}: the fake-mode set runs {rest[:1]}, not up: {line}')
-                    fake_ups.add(name)
+                    if rest[:1] == ['run']:
+                        service, options, _ = _compose_service(rest)
+                        if name != MIGRATE_STEP or service != 'data_store' or '--no-deps' not in options:
+                            offenders.append(f'{name}: the fake-mode set runs a one-off outside the migration: {line}')
+                        fake_runs.add(name)
+                    elif rest[:1] != ['up']:
+                        offenders.append(f'{name}: the fake-mode set runs {rest[:1]}, not up or the migration: {line}')
+                    else:
+                        fake_ups.add(name)
                     continue
                 if files == [COMPOSE_FILE.name]:
-                    if rest[:1] and rest[0] in CONTAINER_CREATING_SUBCOMMANDS:
-                        offenders.append(f'{name}: `{rest[0]}` on the base file alone drops the fake overlay: {line}')
+                    if not rest[:1] or rest[0] not in STACK_ALONE_SUBCOMMANDS:
+                        offenders.append(f'{name}: `{rest[:1]}` on the base file alone resolves :latest: {line}')
                     continue
                 if files != _client_file_pair():
                     offenders.append(f'{name}: -f {files} in {line}')
@@ -3738,6 +3753,7 @@ def test_system_job_loads_the_stack_alone_and_the_client_only_as_a_pair():
     assert not missing, f'no docker compose invocation found in {missing}, so this check saw less than the job runs'
     assert not offenders, f'{SYSTEM_JOB_NAME} loads compose files outside the three spellings: {offenders}'
     assert LIFECYCLE_STEP in fake_ups, f'{LIFECYCLE_STEP} recreates data_store without the fake-mode overlay'
+    assert fake_runs == {MIGRATE_STEP}, f'{MIGRATE_STEP} does not migrate through the fake-mode set: {fake_runs}'
     without_client = sorted(set(SYSTEM_JOB_CLIENT_STEPS) - client_steps)
     assert not without_client, f'{without_client} send nothing from {TEST_CLIENT_SERVICE}'
 

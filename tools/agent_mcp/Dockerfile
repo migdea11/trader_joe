@@ -106,6 +106,13 @@ COPY Dockerfile /opt/agent_mcp/compose/Dockerfile
 # is ever passed to compose.
 COPY docker-compose.override.yaml docker-compose.web.yaml docker-compose.web.dev.yaml \
     docker-compose.agent-dev.yaml docker-compose.tools.yaml /opt/agent_mcp/compose/
+# TEST MODE'S BUILD OVERLAY (stack.TEST_BUILD_COMPOSE_FILES; tj-iee6sn.24): it sets only build.dockerfile
+# for data_store and data_ingest, after the base file and docker-compose.fake.yaml (both copied above).
+COPY docker-compose.agent-test.yaml /opt/agent_mcp/compose/
+# THE SYSTEM-TEST CLIENT'S OVERLAY (stack.SYSTEM_CLIENT_COMPOSE_FILES; tj-iee6sn.20): sets only test_client's
+# build.dockerfile, after the base file and docker-compose.test-client.yaml (both copied above), so the
+# client built from a worktree's snapshot uses the trusted Dockerfile below, never the snapshot's own.
+COPY docker-compose.agent-client.yaml /opt/agent_mcp/compose/
 # THE TWO SCRIPTS the dev verbs run from here instead of the checkout's (an agent-writable file run
 # inside agent_mcp would hold the Docker API): dev_instance_secret.sh resolves the dev web container's
 # INSTANCE_WRITE_SECRET, source_digest.sh stamps the images. In a tools/ directory beside the trusted
