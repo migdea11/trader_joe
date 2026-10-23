@@ -557,6 +557,36 @@ dev-tools: $(VENV_MARKER) dev-network  ## Start pgAdmin against the development 
 dev-launch: dev-deps  ## Start the development services in the foreground, with reload (web: Vite hot reload)
 	$(DEV_COMPOSE) up data_store data_ingest web
 
+# Detached, for a caller that must get its terminal back (tj-iee6sn.5, ADR tj-4rr0la addendum 23
+# (2), owner ruling R6). The agent-stack MCP's dev_up runs this recipe's up with the same flags and
+# services, through its own prefix; its down matches this one in effect, not in spelling (below). It
+# brings the dev project DOWN first, so there is never more than one instance of it: compose allows
+# one container per service per project, and a make dev-launch still attached in a terminal would
+# otherwise be left watching containers this target replaced. The down DELIBERATELY ends that session.
+# The down goes through TOOLS_COMPOSE, the same compose set as dev-down and the same project as the
+# up below, so both lines name one project in any checkout, whatever its directory is called. A down
+# spelled -p trader_joe would address a different project from the up's wherever the checkout is
+# not named trader_joe, so this recipe does not use that spelling. The MCP does: every one of its dev
+# verbs passes -p trader_joe, so its label-only compose -p trader_joe down reaches the project its
+# own up creates. The two downs address the same project when this checkout's project is trader_joe.
+# They then remove the same containers unless the project holds an orphan: the label-only down
+# removes every container in the project, this one only the services its files define, pgAdmin
+# included. Neither -v nor --remove-orphans is spelled (D2). pgAdmin goes down with the rest, on
+# placeholder credentials that are safe on a down only (see dev-down). The database is a host bind
+# (DATA_DIR/postgres), not a volume, and survives.
+# Postgres is in the up list: the down removed it with the rest, and compose recreates it onto the
+# same data. --wait returns once every listed service is healthy (data_store's start_period is 60s).
+.PHONY: dev-up
+dev-up: dev-network  ## Stop the dev stack, then start postgres and the dev services detached, waiting for healthy (ends an attached dev-launch)
+	PGADMIN_EMAIL=unused PGADMIN_PASS=unused $(TOOLS_COMPOSE) down
+	$(DEV_COMPOSE) up -d --wait --wait-timeout 300 postgres data_store data_ingest web
+
+# The dev counterpart of prod-logs, there being none until now. Follows the three app services;
+# Ctrl-C stops the follow and leaves the containers running.
+.PHONY: dev-logs
+dev-logs:  ## Follow the development service logs
+	$(DEV_COMPOSE) logs -f data_store data_ingest web
+
 # Through TOOLS_COMPOSE, so a pgAdmin started by dev-tools goes down with the rest instead of
 # being left running as an orphan on the project network. Costs nothing when it is not running.
 # That handles the service-in-a-file-you-forgot-to-load case; --remove-orphans handles the other

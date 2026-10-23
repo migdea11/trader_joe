@@ -25,6 +25,68 @@ running data_store, running alembic current and history, and refuses when data_s
 dev_http_get(name) does one GET of one of three fixed paths (name is a closed enum; no URL, path or
 header) in the running data_store, reads at most 64 KB of the body and redacts it in-container.
 
+and TWO STATE-CHANGING LABEL-ONLY VERBS over the same project (tj-iee6sn.7):
+
+    dev_down()  dev_restart(service)       service: data_store, data_ingest or web, never postgres
+
+dev_down is `docker compose -p trader_joe down`: containers and project networks removed, never a
+volume, an image or an orphan (the database is a host bind and survives). dev_restart restarts one
+existing container. Neither loads a compose file or an env file. Each refuses, running nothing after
+the refusal, unless the D7 guard finds every project container started from the dev files; dev_restart
+also refuses a symlinked bind source (D6); both refuse a compose file or dotenv file in the stack
+directory or a parent (compose would search there) and are limited to 12 state-changing dev calls an hour.
+
+and ONE FILE-BASED BUILD VERB over it (tj-iee6sn.8):
+
+    dev_build()
+
+dev_build is make dev-build's build: the three :dev images from the checkout, as one plain call of up to
+30 minutes (not a job). It loads the project from the MCP image's baked copies of the dev compose files
+(stack.dev_file_prefix) with the repository's host path as the build context, reads no env file (a
+placeholder step environment, COMPOSE_ENV_FILES=/dev/null), and stamps the images with digests from
+the baked source_digest.sh run with --context over the checkout. It starts no container, so it has no
+prod guard; it refuses a stale baked copy (stack.check_trusted_copies_current) and missing or old
+generated code, and is limited by the same hourly budget.
+
+and ONE MORE STATE-CHANGING VERB, make dev-up (tj-iee6sn.9):
+
+    dev_up()
+
+dev_up stops the dev project (label-only down, so there is only ever one instance), makes sure the
+trader_joe_devnet network exists, and starts postgres, data_store, data_ingest and web detached from the
+baked compose files, waiting up to 300 s for healthy; a plain call of up to 10 minutes. It never builds
+(the :dev images must exist: call dev_build). Compose reads the env files itself under the lstat
+preflight; the instance write secret comes from the baked dev_instance_secret.sh run inside a fixed
+`sh -c` wrapper (stack.DEV_UP_WRAPPER_SCRIPT) that receives the compose argv as positional arguments, so
+the value lives only in the child process and the compose argv is never script text.
+
+and ONE MORE, make dev-tools (tj-iee6sn.14):
+
+    dev_tools()
+
+dev_tools makes sure the trader_joe_devnet network exists and starts pgAdmin detached (`up -d --wait
+pgadmin`; compose starts postgres through depends_on), from the baked dev compose files plus the baked
+docker-compose.tools.yaml (stack.dev_tools_prefix), in dev_up's secret wrapper under the pinned
+environment. A plain call of up to 5 minutes; it never builds, stops or removes anything. PGADMIN_EMAIL
+and PGADMIN_PASS are read by compose from the root env file: this server neither reads nor passes them,
+so no credential reaches an argv, the audit line or the output; when one is unset compose refuses before
+creating the container. The D7, S6, D6 and D5 checks and the budget are dev_up's. dev_down removes pgAdmin
+with the rest of the project (label-only).
+
+and TWO MIGRATION VERBS over the running dev instance (tj-iee6sn.10; owner ruling D4):
+
+    dev_migrate()  dev_migrate_check()
+
+dev_migrate is make migrate: `alembic upgrade head` in a one-off data_store container (file-based
+`run --rm --no-deps`, the baked compose files, dev_up's secret wrapper) against the postgres that is
+running now. It WRITES the dev database; the project permission for it is meant to be "ask" (the user's
+setting, not this server's). dev_migrate_check is make migrate-check: `alembic check`, refused unless the
+data_store :dev image's source stamp equals the checkout's digest (there is NO escape hatch; the fix is
+dev_build), and it writes an empty alembic_version table on a never-migrated database. Both are refused
+by the D7 guard on a non-dev project, with no or several postgres or several data_store containers, with
+no revision file in the checkout, without the :dev image, and on the S6/D6/D5 checks of dev_up; neither
+builds.
+
 An agent passes a worktree NAME, test paths, a service from a closed set and a line count -- never a
 compose argument, an image, a container id, a command line or a host path.
 

@@ -862,12 +862,19 @@ def test_the_base_file_has_no_web_service():
 
 
 def test_the_agent_stack_never_loads_the_web_overlay():
-    """The agent stack's compose set, in the Makefile, in tools/agent_mcp and in the MCP image's copies."""
+    """The agent stack's compose set, in the Makefile, in tools/agent_mcp and in the agent stack's own prefix.
+
+    Since tj-iee6sn.5 the MCP IMAGE bakes a copy of docker-compose.web.yaml, for the user's DEV
+    project only (stack.DEV_COMPOSE_FILES). What must hold is that the agent stack never loads it:
+    not in COMPOSE_FILES, not among the -f words compose_prefix() spells, and no file it does load
+    defines web.
+    """
     agent_set = _make_variable('AGENT_STACK_COMPOSE')
     assert agent_set.startswith('docker compose') and 'docker-compose.web.yaml' not in agent_set, agent_set
     assert 'docker-compose.web.yaml' not in stack.COMPOSE_FILES, stack.COMPOSE_FILES
-    mcp_dockerfile = (REPO_ROOT / 'tools' / 'agent_mcp' / 'Dockerfile').read_text(encoding='utf-8')
-    assert 'docker-compose.web.yaml' not in mcp_dockerfile
+    prefix = stack.compose_prefix(Path('/stack'), Path('/stack/agent_stack.env'))
+    assert not [word for word in prefix if 'docker-compose.web' in word], prefix
+    assert 'docker-compose.web.yaml' in stack.DEV_COMPOSE_FILES, stack.DEV_COMPOSE_FILES
     for name in stack.COMPOSE_FILES:
         assert 'web' not in (compose_model.load(REPO_ROOT / name).get('services') or {}), name
 
@@ -1206,8 +1213,12 @@ def test_only_the_dev_and_tools_sets_load_the_dev_overlay_after_the_web_overlay(
             assert names.index('docker-compose.override.yaml') < names.index(WEB_COMPOSE.name) < dev, names
     assert loading == WEB_DEV_SETS, sorted(loading)
     assert WEB_DEV_COMPOSE.name not in stack.COMPOSE_FILES, stack.COMPOSE_FILES
-    mcp_dockerfile = (REPO_ROOT / 'tools' / 'agent_mcp' / 'Dockerfile').read_text(encoding='utf-8')
-    assert WEB_DEV_COMPOSE.name not in mcp_dockerfile
+    prefix = stack.compose_prefix(Path('/stack'), Path('/stack/agent_stack.env'))
+    assert not [word for word in prefix if WEB_DEV_COMPOSE.name in word], prefix
+    # The MCP's DEV set (tj-iee6sn.5) loads it as the Makefile's dev set does: after the override and
+    # the web overlay. The MCP image bakes it for that set only.
+    dev = list(stack.DEV_COMPOSE_FILES)
+    assert dev.index('docker-compose.override.yaml') < dev.index(WEB_COMPOSE.name) < dev.index(WEB_DEV_COMPOSE.name)
 
 
 # ---------------------------------------------------------------------------------------------------

@@ -22,6 +22,7 @@ from common.tests.compose_model import (
     DEVCONTAINER_COMPOSE,
     DEVCONTAINER_JSON,
     REPO_ROOT,
+    InterpolationRefused,
     interpolate,
     load,
     service_networks,
@@ -239,6 +240,79 @@ def test_agent_mcp_is_hardened_and_healthchecked_on_the_token_gate():
     assert '401' in check and '127.0.0.1:8765/mcp' in check, check
 
 
+# --- tj-iee6sn.16: an init as PID 1, and agent_mcp's keys exactly -----------------------------------
+
+# agent_mcp's top-level keys, EXACTLY (tj-iee6sn.16 (ii)). Compared as a set: the order of a
+# service's keys changes nothing about the container, an added or removed key changes what it is.
+AGENT_MCP_KEYS = frozenset(
+    {
+        'build',
+        'image',
+        'init',
+        'depends_on',
+        'environment',
+        'volumes',
+        'security_opt',
+        'cap_drop',
+        'healthcheck',
+        'networks',
+    }
+)
+
+
+def _comment_above(key_line: str) -> str:
+    """The whole-line comment block directly above the line KEY_LINE (stripped), joined."""
+    lines = AGENT_MCP_FILE.read_text(encoding='utf-8').splitlines()
+    matches = [number for number, line in enumerate(lines) if line.strip() == key_line]
+    assert len(matches) == 1, f'{key_line!r} appears {len(matches)} times in {AGENT_MCP_FILE.name}'
+    block = []
+    for line in reversed(lines[: matches[0]]):
+        if not line.strip().startswith('#'):
+            break
+        block.insert(0, line.strip().lstrip('#').strip())
+    return ' '.join(block)
+
+
+def test_agent_mcp_runs_under_an_init():
+    """tj-iee6sn.16 (i): `init: true` on agent_mcp, the boolean itself.
+
+    Python as PID 1 reaps only the pids asyncio spawned, so the members of a timed-out step's killed
+    process group (tj-iee6sn.15) would stay zombies until the container is recreated. `is True`, not
+    truthiness: a quoted 'true' is a string that compose would reject or misread, and is red here.
+    """
+    mcp = _services()['agent_mcp']
+    assert 'init' in mcp, 'agent_mcp has no init: python is PID 1 and the killed step groups leave zombies'
+    assert mcp['init'] is True, (
+        f'agent_mcp init is {mcp["init"]!r} ({type(mcp["init"]).__name__}), not the boolean true'
+    )
+
+
+def test_the_init_comment_states_why():
+    """The reason sits beside the switch: reaping the zombies of killed step groups."""
+    comment = _comment_above('init: true')
+    assert re.search(r'zombie|reap', comment, re.IGNORECASE), f'the init comment does not say why: {comment!r}'
+
+
+def test_agent_mcp_has_exactly_todays_top_level_keys():
+    """tj-iee6sn.16 (ii): every key of the service is pinned, so a new one is a reviewed act.
+
+    The hardening test above names the keys that must stay OUT (ports, env_file, cap_add, privileged);
+    a key it does not name -- pid, userns_mode, devices, read_only, user -- reached the container green.
+    """
+    keys = set(_services()['agent_mcp'])
+    assert keys == AGENT_MCP_KEYS, (
+        f'agent_mcp keys changed: added {sorted(keys - AGENT_MCP_KEYS)}, removed {sorted(AGENT_MCP_KEYS - keys)}. '
+        'A new key needs an architect ruling: this container holds the Docker API through the proxy '
+        '(ADR tj-4rr0la addendum 1)'
+    )
+
+
+def test_the_proxy_has_no_init():
+    """tj-iee6sn.16 (iii): socket_proxy is left alone -- haproxy spawns no step children."""
+    proxy = _services()['socket_proxy']
+    assert 'init' not in proxy, f'socket_proxy gained init: {proxy["init"]!r}; the ruling scoped it to agent_mcp'
+
+
 # --- body bullet 7: agent_mcp's reach ------------------------------------------------------------
 
 
@@ -273,12 +347,19 @@ def _mcp_mounts() -> list[dict]:
     return [volume(entry) for entry in _services()['agent_mcp']['volumes']]
 
 
+REPO_HOST_PATH = '${AGENT_MCP_REPO_HOST_PATH:?set by make agent-mcp-up}'
+
+
 def test_agent_mcp_sees_the_repository_read_only_at_the_devcontainers_workspace():
-    """M1, addendum 11 R1: /workspace in four places that must agree."""
+    """M1, addendum 11 R1: /workspace in four places that must agree.
+
+    Since addendum 23 (tj-iee6sn.5) the checkout is mounted twice, both read-only: here at /workspace,
+    and at its own host path for the dev verbs (pinned below).
+    """
     mcp = _services()['agent_mcp']
-    repo_mounts = [mount for mount in _mcp_mounts() if 'AGENT_MCP_REPO_HOST_PATH' in mount['source']]
+    repo_mounts = [mount for mount in _mcp_mounts() if mount['target'] == WORKSPACE]
     assert len(repo_mounts) == 1, _mcp_mounts()
-    assert repo_mounts[0]['target'] == WORKSPACE and repo_mounts[0]['read_only'] is True, repo_mounts
+    assert repo_mounts[0]['source'] == REPO_HOST_PATH and repo_mounts[0]['read_only'] is True, repo_mounts
     assert mcp['environment']['AGENT_MCP_REPO_ROOT'] == WORKSPACE
     agent = load(DEVCONTAINER_COMPOSE)['services']['agent']
     project_mounts = [volume(entry) for entry in agent['volumes'] if volume(entry)['source'] == '..']
@@ -287,24 +368,58 @@ def test_agent_mcp_sees_the_repository_read_only_at_the_devcontainers_workspace(
     assert devcontainer_json()['workspaceFolder'] == WORKSPACE
 
 
-def test_agent_mcp_mounts_exactly_three_paths_and_never_the_claude_config():
-    """M2, addendum 11 R2: repo ro at /workspace, the stack dir at its own path, the share at /agent_mcp_share."""
+def test_agent_mcp_mounts_exactly_four_paths_and_never_the_claude_config():
+    """M2, addendum 11 R2, and addendum 23 (tj-iee6sn.5): exactly four mounts, every one a bind.
+
+    The repository read-only at /workspace and read-only again at its own HOST path (source ==
+    target, the way the stack dir is mounted), the stack dir at its own path, the share at
+    /agent_mcp_share. Compared as one exact list, so a fifth mount, a writable repository mount or a
+    host-path mount moved to another target are each red.
+    """
     mounts = _mcp_mounts()
-    shape = sorted((re.findall(r'\$\{(\w+)', mount['source']), mount['target'], mount['read_only']) for mount in mounts)
+    shape = sorted((mount['type'], mount['source'], mount['target'], mount['read_only']) for mount in mounts)
     assert shape == sorted(
         [
-            (['AGENT_MCP_REPO_HOST_PATH'], WORKSPACE, True),
-            (['AGENT_MCP_STACK_DIR'], '${AGENT_MCP_STACK_DIR:?set by make agent-mcp-up}', False),
-            (['AGENT_MCP_SHARE_PATH'], SHARE_TARGET, False),
+            ('bind', REPO_HOST_PATH, WORKSPACE, True),
+            ('bind', REPO_HOST_PATH, REPO_HOST_PATH, True),
+            (
+                'bind',
+                '${AGENT_MCP_STACK_DIR:?set by make agent-mcp-up}',
+                '${AGENT_MCP_STACK_DIR:?set by make agent-mcp-up}',
+                False,
+            ),
+            ('bind', '${AGENT_MCP_SHARE_PATH:?set by make agent-mcp-up}', SHARE_TARGET, False),
         ]
     ), mounts
     stack_mount = next(mount for mount in mounts if 'AGENT_MCP_STACK_DIR' in mount['source'])
     assert stack_mount['source'] == stack_mount['target'], 'the stack dir must be mounted at its own host path'
+    repository = [mount for mount in mounts if 'AGENT_MCP_REPO_HOST_PATH' in mount['source']]
+    assert len(repository) == 2 and all(mount['read_only'] is True for mount in repository), (
+        f'every mount of the checkout must be read-only: anything in agent_mcp holds the Docker API, so a '
+        f'writable checkout would let it rewrite the code the dev verbs build: {repository}'
+    )
     mcp = _services()['agent_mcp']
     for value in [mount['source'] for mount in mounts] + [str(value) for value in mcp['environment'].values()]:
         assert 'AGENT_HOME_PATH' not in value and '.claude' not in value, (
             f'agent_mcp reaches the Claude config: {value}'
         )
+
+
+def test_the_server_is_told_the_host_path_it_is_mounted_at_and_an_unset_one_refuses_to_render():
+    """Addendum 23 (tj-iee6sn.5): AGENT_MCP_REPO_HOST_PATH reaches the server as the same guarded string.
+
+    settings.load_settings requires it, and the dev verbs pass it as --project-directory, so it must be
+    the exact string the second mount targets. ':?', never ':-': an unset value refuses to render,
+    rather than mounting and naming some default directory the daemon would bind into dev containers.
+    """
+    environment = _services()['agent_mcp']['environment']
+    assert environment['AGENT_MCP_REPO_HOST_PATH'] == REPO_HOST_PATH, environment
+    host_mount = next(mount for mount in _mcp_mounts() if mount['target'] == REPO_HOST_PATH)
+    assert host_mount['source'] == host_mount['target'] == environment['AGENT_MCP_REPO_HOST_PATH']
+    for state in ({}, {'AGENT_MCP_REPO_HOST_PATH': ''}):
+        with pytest.raises(InterpolationRefused, match='AGENT_MCP_REPO_HOST_PATH: set by make agent-mcp-up'):
+            interpolate(REPO_HOST_PATH, state)
+    assert interpolate(REPO_HOST_PATH, {'AGENT_MCP_REPO_HOST_PATH': '/home/u/trader_joe'}) == '/home/u/trader_joe'
 
 
 # --- M3 / P4: the share directory agrees in every place --------------------------------------------

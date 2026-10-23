@@ -75,7 +75,7 @@ DEV_PUBLISHES = {
 
 # Item 3': the targets that bring a dev-side container up, each of which needs devnet first.
 DEV_NETWORK_TARGET = 'dev-network'
-TARGETS_NEEDING_DEVNET = ('dev-deps', 'dev-tools', 'agent-up')
+TARGETS_NEEDING_DEVNET = ('dev-deps', 'dev-tools', 'dev-up', 'agent-up')
 
 
 def _service_networks(service: dict) -> list[str]:

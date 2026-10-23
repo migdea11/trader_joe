@@ -16,6 +16,7 @@ the host sitting's (tj-c4mosr.6 H1-H3), not this suite's.
 """
 
 import asyncio
+import functools
 import hashlib
 import json
 import os
@@ -194,11 +195,17 @@ class Layout:
     worktree: Path
     stack_dir: Path
     home: Path
+    # The root checkout at its HOST path (ADR tj-4rr0la addendum 23; tj-iee6sn.5): in agent_mcp the
+    # same tree bind-mounted read-only a second time. Here a symlink to repo/, so the string differs
+    # from repo_root (a verb that names the wrong one is visible in its argv) while every file under
+    # it is the same file.
+    repo_host_path: Path
 
     @property
     def settings(self) -> Settings:
         return Settings(
             repo_root=self.repo,
+            repo_host_path=self.repo_host_path,
             stack_dir=self.stack_dir,
             token_file=self.home / 'agent_mcp_token',
             bind='0.0.0.0',
@@ -214,17 +221,73 @@ class Layout:
     def data_dir(self) -> Path:
         return self.stack_dir / stack.DATA_DIR_NAME
 
+    @property
+    def trusted_dir(self) -> Path:
+        """The stand-in for /opt/agent_mcp/compose that make_rig points the S6 check at."""
+        return self.root / TRUSTED_DIR_NAME
+
+
+# dev_build (tj-iee6sn.8) refuses unless the generated code is no older than the newest .proto, read
+# through the repository root. The ROOT checkout gets one generated TypeScript file and one .proto an
+# hour older than everything else, so a sample dev_build passes the precondition. Only the root
+# checkout: no worktree, and so no snapshot, holds them.
+DEV_BUILD_ROOT_FILES = {
+    'gen/proto/ts/trader_joe/proto/ping/v1/ping_pb.ts': 'export {};\n',
+    'proto/trader_joe/proto/ping/v1/ping.proto': 'syntax = "proto3";\n',
+}
+DEV_BUILD_PROTO_AGE_SECONDS = 3600
+# The TRUSTED directory a rig's dev_build compares the checkout with (S6), in place of the image's
+# /opt/agent_mcp/compose, which no test machine has. make_layout writes every stack.DEV_TRUSTED_COPIES
+# file into BOTH it and the root checkout, identical, so a sample call passes the stale-copy check.
+TRUSTED_DIR_NAME = 'trusted'
+# What a digest step prints in the rig: one 64-hex line per service, distinct and from literals.
+DEV_DIGESTS = {('data', 'store'): '1' * 64, ('data', 'ingest'): '2' * 64}
+TRUSTED_SOURCE_DIGEST_SCRIPT = '/opt/agent_mcp/compose/tools/source_digest.sh'
+
+
+def is_dev_digest(step: stack.Step) -> bool:
+    """The trusted source_digest.sh run by bash: dev_build's only argv that is not docker."""
+    return list(step.argv[:2]) == ['/usr/bin/bash', TRUSTED_SOURCE_DIGEST_SCRIPT]
+
+
+def write_dev_build_fixtures(root: Path, repo: Path) -> Path:
+    """The generated-code files and the identical trusted copies dev_build needs; returns the trusted directory."""
+    for relative, text in DEV_BUILD_ROOT_FILES.items():
+        target = repo / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+    proto = repo / 'proto/trader_joe/proto/ping/v1/ping.proto'
+    old = time.time() - DEV_BUILD_PROTO_AGE_SECONDS
+    os.utime(proto, (old, old))
+    trusted = root / TRUSTED_DIR_NAME
+    for checkout_name, baked_name in stack.DEV_TRUSTED_COPIES:
+        source = repo / checkout_name
+        if not source.exists():
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text(f'# fixture copy of {checkout_name}\n')
+        target = trusted / baked_name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(source.read_bytes())
+    return trusted
+
 
 def make_layout(tmp_path: Path) -> Layout:
-    """repo/ (the main checkout), repo/.claude/worktrees/wt-one, stack/ (0700) and share/, all real."""
+    """repo/ (the main checkout), repo/.claude/worktrees/wt-one, stack/ (0700), share/, and host/repo -> repo."""
     root = Path(os.path.realpath(tmp_path))
     repo = build_worktree(root / 'repo')
+    write_dev_build_fixtures(root, repo)
     worktree = build_worktree(repo / '.claude' / 'worktrees' / WORKTREE_NAME)
     stack_dir = root / 'stack'
     stack_dir.mkdir(mode=0o700)
     home = root / 'share'
     home.mkdir(mode=0o700)
-    return Layout(root=root, repo=repo, worktree=worktree, stack_dir=stack_dir, home=home)
+    host = root / 'host'
+    host.mkdir()
+    repo_host_path = host / 'repo'
+    repo_host_path.symlink_to(repo, target_is_directory=True)
+    return Layout(
+        root=root, repo=repo, worktree=worktree, stack_dir=stack_dir, home=home, repo_host_path=repo_host_path
+    )
 
 
 def committed_defaults() -> dict[str, str]:
@@ -314,16 +377,32 @@ def is_dev_exec(step: stack.Step) -> bool:
     return list(step.argv[:2]) == ['/usr/local/bin/docker', 'exec']
 
 
+def is_dev_stamp_read(step: stack.Step) -> bool:
+    """dev_migrate_check's `docker image inspect` printing the data_store :dev image's source-stamp label."""
+    return (
+        list(step.argv[:4]) == ['/usr/local/bin/docker', 'image', 'inspect', '--format']
+        and 'trader_joe.source.digest' in step.argv[4]
+    )
+
+
 def default_response(step: stack.Step) -> runner.ProcessResult:
     """Every docker step succeeds; `ps -q postgres` answers with one container id (postgres is running).
 
     The seed producer's run answers with SEED_STDOUT, a valid bundle. The dev lookup answers with
     one id and a dev exec with DEV_DB_TABLES_STDOUT, the shape the dev_db_tables script prints, or,
     for the `-w /code` exec of dev_migrate_status, DEV_MIGRATE_STATUS_STDOUT, or, for the option-less
-    exec of dev_http_get, DEV_HTTP_GET_STDOUT.
+    exec of dev_http_get, DEV_HTTP_GET_STDOUT. The D7 prod guard's `docker ps` falls through to the
+    empty answer, an empty project, which the guard passes, so a sample dev_down/dev_restart ends 'ok'.
+    dev_build's digest steps answer with their service's DEV_DIGESTS line, so a sample dev_build ends 'ok'.
+    dev_migrate_check's stamp read (tj-iee6sn.10) answers with the data/store digest, the stamp of a
+    current image, so a sample dev_migrate_check ends 'ok' (an empty answer is 'cannot verify').
     """
     if list(step.argv[-3:]) == ['ps', '-q', 'postgres']:
         return runner.ProcessResult(0, b'0123456789ab\n', b'')
+    if is_dev_digest(step):
+        return runner.ProcessResult(0, f'{DEV_DIGESTS[tuple(step.argv[-2:])]}\n'.encode(), b'')
+    if is_dev_stamp_read(step):
+        return runner.ProcessResult(0, f'{DEV_DIGESTS[("data", "store")]}\n'.encode(), b'')
     if is_seed_producer(step):
         return runner.ProcessResult(0, SEED_STDOUT, b'')
     if is_dev_lookup(step):
@@ -403,6 +482,12 @@ def make_rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, docker: FakeDocker
     layout = make_layout(tmp_path)
     git = FakeGit(worktree_paths=[layout.repo, layout.worktree])
     monkeypatch.setattr(stack, 'run_git', git)
+    # The REAL S6 check, comparing with the layout's trusted directory instead of the image's.
+    monkeypatch.setattr(
+        stack,
+        'check_trusted_copies_current',
+        functools.partial(stack.check_trusted_copies_current, trusted_dir=layout.trusted_dir),
+    )
     forbid_real_subprocesses(monkeypatch)
     fake_docker = docker or FakeDocker()
     return Rig(layout=layout, git=git, docker=fake_docker, agent=runner.AgentStack(layout.settings, run=fake_docker))
@@ -458,6 +543,13 @@ VERB_SAMPLES: Mapping[str, dict[str, Any]] = {
     'dev_db_tables': {},
     'dev_migrate_status': {},
     'dev_http_get': {'name': 'ping'},
+    'dev_down': {},
+    'dev_restart': {'service': 'data_store'},
+    'dev_build': {},
+    'dev_up': {},
+    'dev_migrate': {},
+    'dev_migrate_check': {},
+    'dev_tools': {},
 }
 # Verbs that run no docker at all. None since tj-irhy0a.22 wired seed_dump; kept so a future verb
 # that runs no docker is classified here rather than tripping the docker sweeps.
@@ -466,10 +558,61 @@ DOCKERLESS_VERBS: frozenset[str] = frozenset()
 # addendum 18). They run docker, but NOT through stack.compose_prefix(): no -f, no
 # --project-directory, no --env-file, so the agent-stack sweeps must exclude them rather than
 # mis-slice their four-word prefix. tj-tq2hn6 (B2) owns the containment tests that take their place.
-DEV_PROJECT_VERBS = frozenset({'dev_ps', 'dev_logs', 'dev_db_tables', 'dev_migrate_status', 'dev_http_get'})
+DEV_PROJECT_VERBS = frozenset(
+    {
+        'dev_ps',
+        'dev_logs',
+        'dev_db_tables',
+        'dev_migrate_status',
+        'dev_http_get',
+        'dev_down',
+        'dev_restart',
+        'dev_build',
+        'dev_up',
+        'dev_migrate',
+        'dev_migrate_check',
+        'dev_tools',
+    }
+)
 # The subset that runs PLAIN docker -- a label lookup, then `docker exec` -- rather than the dev
 # compose prefix (ADR tj-4rr0la addendum 22). test_dev_exec.py owns their containment tests.
 DEV_EXEC_VERBS = frozenset({'dev_db_tables', 'dev_migrate_status', 'dev_http_get'})
+# The STATE-CHANGING label-only pair (tj-iee6sn.7): the D7 guard's plain `docker ps`, then ONE step
+# under the four-word dev prefix. test_dev_label_verbs.py owns their order, argv and refusal tests.
+DEV_LABEL_LIFECYCLE_VERBS = frozenset({'dev_down', 'dev_restart'})
+# The FILE-BASED dev lifecycle verbs (tj-iee6sn.8 on): the trusted digest script under bash, the
+# ensure-bases pair, then compose under the file-based dev prefix (stack.dev_file_prefix), which names
+# the trusted dev files and the repository's host path. test_dev_build.py owns dev_build's tests.
+DEV_FILE_LIFECYCLE_VERBS = frozenset({'dev_build'})
+# dev_up (tj-iee6sn.9) mixes all three: the D7 guard's `docker ps`, three `docker image inspect`s of the
+# :dev images, the trusted digests, the label-only down, the devnet `docker network` pair, the bases,
+# then the file-based up carried by the fixed `sh -c` secret wrapper. test_dev_up.py owns its tests.
+DEV_UP_VERBS = frozenset({'dev_up'})
+# The STATE-CHANGING migration pair (tj-iee6sn.10), file-based and not label-only: the D7 guard's `docker
+# ps`, the postgres and data_store lookups (`docker ps`), the data_store :dev image inspect, for
+# dev_migrate_check the data/store digest (bash) and the stamp read (`docker image inspect`), the bases
+# (the one-off `run` of data_store is flagged as building), then the one-off alembic run carried by
+# dev_up's fixed `sh -c` secret wrapper. test_dev_migrate.py owns their tests.
+DEV_MIGRATE_VERBS = frozenset({'dev_migrate', 'dev_migrate_check'})
+# dev_tools (tj-iee6sn.14), `make dev-tools`: the D7 guard's `docker ps`, the devnet `docker network` pair,
+# then ONE file-based up of pgAdmin (the dev files plus docker-compose.tools.yaml, stack.dev_tools_prefix)
+# carried by dev_up's fixed `sh -c` secret wrapper. No image inspect, no digest, no base: pgadmin and
+# postgres are image-only. test_dev_tools.py owns its tests.
+DEV_TOOLS_VERBS = frozenset({'dev_tools'})
+# The wrapper's four constant leading words, spelled here from literals except the script, which is
+# pinned whole in test_dev_up.py; the helper and the env file follow them.
+DEV_UP_WRAPPER_LEAD = ('sh', '-c')
+
+
+def is_dev_up_wrapper(step: stack.Step) -> bool:
+    """The up step: `sh -c <script> sh <helper> <env file> <compose argv>`, the server's one shell."""
+    return tuple(step.argv[:2]) == DEV_UP_WRAPPER_LEAD and len(step.argv) > 6 and step.argv[3] == 'sh'
+
+
+def dev_up_compose_argv(step: stack.Step) -> tuple[str, ...]:
+    """The compose argv the wrapper execs: every word after its six fixed ones."""
+    assert is_dev_up_wrapper(step), step.argv
+    return tuple(step.argv[6:])
 
 
 def tree_digest(path: Path) -> dict[str, str]:

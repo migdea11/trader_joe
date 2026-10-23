@@ -31,7 +31,12 @@ from tools.agent_mcp import runner, stack
 from tools.agent_mcp.tests.harness import (
     DEV_CONTAINER_ID,
     DEV_EXEC_VERBS,
+    DEV_FILE_LIFECYCLE_VERBS,
+    DEV_LABEL_LIFECYCLE_VERBS,
+    DEV_MIGRATE_VERBS,
     DEV_PROJECT_VERBS,
+    DEV_TOOLS_VERBS,
+    DEV_UP_VERBS,
     DOCKERLESS_VERBS,
     REPO_ROOT,
     VERB_SAMPLES,
@@ -39,6 +44,9 @@ from tools.agent_mcp.tests.harness import (
     clearing_hook,
     default_response,
     dev_step_prefix_length,
+    dev_up_compose_argv,
+    is_dev_digest,
+    is_dev_up_wrapper,
     make_rig,
     populate_data,
     record_state,
@@ -79,8 +87,11 @@ def _base_pull_argv(ref: str) -> list[str]:
 
 
 def _bases_absent(step: stack.Step) -> runner.ProcessResult:
-    """Every base inspect fails (the daemon lacks it), so ensure-bases pulls each ref; the rest as default."""
-    if list(step.argv[1:3]) == ['image', 'inspect']:
+    """Every base inspect fails (the daemon lacks it), so ensure-bases pulls each ref; the rest as default.
+
+    Only the BASE_IMAGES refs: dev_up (tj-iee6sn.9) also inspects its three :dev images, which are there.
+    """
+    if list(step.argv[1:3]) == ['image', 'inspect'] and step.argv[-1] in stack.BASE_IMAGES:
         return runner.ProcessResult(1, b'', b'Error: No such image')
     return default_response(step)
 
@@ -126,8 +137,53 @@ def test_every_verb_runs_only_the_fixed_compose_prefix_over_the_snapshot(
         assert rig.docker.steps, f'{verb} ran no docker step, so there is nothing to pin'
         # The exec verbs run plain docker: a label lookup (`ps`), then `exec` (ADR tj-4rr0la
         # addendum 22). Their whole argv is pinned in _EXPECTED_TAILS_DEV and test_dev_exec.py.
-        heads = [['compose']] if verb not in DEV_EXEC_VERBS else [['ps'], ['exec']]
-        assert all(list(step.argv[1:2]) in heads and step.argv[0] == EXPECTED_DOCKER for step in rig.docker.steps)
+        # The label-only lifecycle pair (tj-iee6sn.7) runs the D7 guard's plain `ps`, then compose.
+        heads = [['compose']]
+        steps = rig.docker.steps
+        if verb in DEV_EXEC_VERBS:
+            heads = [['ps'], ['exec']]
+        elif verb in DEV_LABEL_LIFECYCLE_VERBS:
+            heads = [['ps'], ['compose']]
+        elif verb in DEV_FILE_LIFECYCLE_VERBS:
+            # tj-iee6sn.8: the trusted digest script under bash (its whole argv is pinned in
+            # _EXPECTED_TAILS_DEV), then the ensure-bases pair, then compose.
+            heads = [['image'], ['pull'], ['compose']]
+            steps = [step for step in steps if not is_dev_digest(step)]
+            assert len(steps) < len(rig.docker.steps), f'{verb} ran no digest step'
+        elif verb in DEV_UP_VERBS:
+            # tj-iee6sn.9: the guard's `ps`, the :dev image inspects, the digests (bash), the label-only
+            # down, the devnet `network` pair, the bases, then the wrapped up, whose compose argv is
+            # every word after the wrapper's six (its whole argv is pinned in _EXPECTED_TAILS_DEV).
+            heads = [['ps'], ['image'], ['pull'], ['network'], ['compose']]
+            wrapped = [step for step in steps if is_dev_up_wrapper(step)]
+            assert len(wrapped) == 1, f'{verb} ran {len(wrapped)} wrapped steps'
+            steps = [
+                stack.Step(dev_up_compose_argv(step), step.cwd) if is_dev_up_wrapper(step) else step
+                for step in steps
+                if not is_dev_digest(step)
+            ]
+        elif verb in DEV_MIGRATE_VERBS:
+            # tj-iee6sn.10: the guard's and the two lookups' `ps`, the :dev image inspect (and, for
+            # dev_migrate_check, the digest under bash and the stamp read), the bases, then the wrapped
+            # one-off alembic run, whose compose argv is every word after the wrapper's six.
+            heads = [['ps'], ['image'], ['pull'], ['compose']]
+            wrapped = [step for step in steps if is_dev_up_wrapper(step)]
+            assert len(wrapped) == 1, f'{verb} ran {len(wrapped)} wrapped steps'
+            steps = [
+                stack.Step(dev_up_compose_argv(step), step.cwd) if is_dev_up_wrapper(step) else step
+                for step in steps
+                if not is_dev_digest(step)
+            ]
+        elif verb in DEV_TOOLS_VERBS:
+            # tj-iee6sn.14: the guard's `ps`, the devnet `network` pair, then the wrapped up of pgAdmin,
+            # whose compose argv is every word after the wrapper's six. No image, pull or digest step.
+            heads = [['ps'], ['network'], ['compose']]
+            wrapped = [step for step in steps if is_dev_up_wrapper(step)]
+            assert len(wrapped) == 1, f'{verb} ran {len(wrapped)} wrapped steps'
+            steps = [
+                stack.Step(dev_up_compose_argv(step), step.cwd) if is_dev_up_wrapper(step) else step for step in steps
+            ]
+        assert all(list(step.argv[1:2]) in heads and step.argv[0] == EXPECTED_DOCKER for step in steps)
         assert EXPECTED_PROJECT not in {word for step in rig.docker.steps for word in step.argv}
         return
     if verb in DOCKERLESS_VERBS:
@@ -213,6 +269,62 @@ _EXPECTED_TAILS = {
 # literals, including the project name: a test that read stack.DEV_PROJECT would agree with any
 # change to it, and the project name is the whole safety case here.
 EXPECTED_DEV_PROJECT = 'trader_joe'
+_EXPECTED_DEV_GUARD = [
+    EXPECTED_DOCKER,
+    'ps',
+    '-a',
+    '--filter',
+    f'label=com.docker.compose.project={EXPECTED_DEV_PROJECT}',
+    '--format',
+    '{{.Label "com.docker.compose.project.config_files"}}',
+]
+_EXPECTED_DEV_FILES = (
+    'docker-compose.yaml',
+    'docker-compose.override.yaml',
+    'docker-compose.web.yaml',
+    'docker-compose.web.dev.yaml',
+    'docker-compose.agent-dev.yaml',
+)
+
+
+def _expected_dev_lookup(service: str) -> list[str]:
+    """The label lookup of SERVICE's running, non-one-off containers in the dev project, ids only."""
+    return [
+        EXPECTED_DOCKER,
+        'ps',
+        '--filter',
+        'status=running',
+        '--filter',
+        f'label=com.docker.compose.project={EXPECTED_DEV_PROJECT}',
+        '--filter',
+        f'label=com.docker.compose.service={service}',
+        '--filter',
+        'label=com.docker.compose.oneoff=False',
+        '--format',
+        '{{.ID}}',
+    ]
+
+
+def _expected_dev_wrapped(tail: list[str]) -> list[str]:
+    """dev_up's six wrapper words, then the file-based dev compose prefix, then TAIL."""
+    return [
+        'sh',
+        '-c',
+        stack.DEV_UP_WRAPPER_SCRIPT,
+        'sh',
+        f'{EXPECTED_TRUSTED_DIR}/tools/dev_instance_secret.sh',
+        '<HOST>/.env',
+        EXPECTED_DOCKER,
+        'compose',
+        '-p',
+        EXPECTED_DEV_PROJECT,
+        '--project-directory',
+        '<HOST>',
+        *(word for name in _EXPECTED_DEV_FILES for word in ('-f', f'{EXPECTED_TRUSTED_DIR}/{name}')),
+        *tail,
+    ]
+
+
 _EXPECTED_TAILS_DEV = {
     'dev_ps': [[EXPECTED_DOCKER, 'compose', '-p', EXPECTED_DEV_PROJECT, 'ps', '--all']],
     'dev_logs': [
@@ -288,7 +400,165 @@ _EXPECTED_TAILS_DEV = {
         ],
         [EXPECTED_DOCKER, 'exec', DEV_CONTAINER_ID, 'sh', '-c', stack.DEV_HTTP_GET_TAILS['ping'][2]],
     ],
+    # tj-iee6sn.7: the D7 guard's ONE `docker ps` over the config_files label (ruling D7, word for
+    # word), then ONE label-only compose step: down with no -v, --rmi or --remove-orphans (D2, the
+    # 04:31 amendment), or restart of the sampled service (data_store).
+    'dev_down': [_EXPECTED_DEV_GUARD, [EXPECTED_DOCKER, 'compose', '-p', EXPECTED_DEV_PROJECT, 'down']],
+    'dev_restart': [
+        _EXPECTED_DEV_GUARD,
+        [EXPECTED_DOCKER, 'compose', '-p', EXPECTED_DEV_PROJECT, 'restart', 'data_store'],
+    ],
+    # tj-iee6sn.8: the TRUSTED source_digest.sh over the repository's host path, once per stamped
+    # image; the bases; then ONE file-based build of the three :dev images. HOST_MARK is the rig's
+    # host path, filled in by the test.
+    'dev_build': [
+        ['/usr/bin/bash', f'{EXPECTED_TRUSTED_DIR}/tools/source_digest.sh', '--context', '<HOST>', 'data', 'store'],
+        ['/usr/bin/bash', f'{EXPECTED_TRUSTED_DIR}/tools/source_digest.sh', '--context', '<HOST>', 'data', 'ingest'],
+        *_INSPECTS,
+        [
+            EXPECTED_DOCKER,
+            'compose',
+            '-p',
+            EXPECTED_DEV_PROJECT,
+            '--project-directory',
+            '<HOST>',
+            *(
+                word
+                for name in (
+                    'docker-compose.yaml',
+                    'docker-compose.override.yaml',
+                    'docker-compose.web.yaml',
+                    'docker-compose.web.dev.yaml',
+                    'docker-compose.agent-dev.yaml',
+                )
+                for word in ('-f', f'{EXPECTED_TRUSTED_DIR}/{name}')
+            ),
+            'build',
+            'data_store',
+            'data_ingest',
+            'web',
+        ],
+    ],
+    # tj-iee6sn.9 (17:02 order, 17:33 gate ruling F-A): the D7 guard; one inspect per :dev image; the two
+    # trusted digests; the bases (the up can build; ensured BEFORE anything is stopped, so a failed pull
+    # leaves the project untouched); the label-only down; the devnet inspect (present, so no create); then
+    # the up inside the fixed secret wrapper, with no second base inspect. The script word is the module
+    # constant, pinned literally in test_dev_up.py; everything after the wrapper's six words is the
+    # file-based up, exactly.
+    'dev_up': [
+        _EXPECTED_DEV_GUARD,
+        *(
+            [EXPECTED_DOCKER, 'image', 'inspect', '--format', '{{.Id}}', f'trader_joe_{name}:dev']
+            for name in ('data_store', 'data_ingest', 'web')
+        ),
+        ['/usr/bin/bash', f'{EXPECTED_TRUSTED_DIR}/tools/source_digest.sh', '--context', '<HOST>', 'data', 'store'],
+        ['/usr/bin/bash', f'{EXPECTED_TRUSTED_DIR}/tools/source_digest.sh', '--context', '<HOST>', 'data', 'ingest'],
+        *_INSPECTS,
+        [EXPECTED_DOCKER, 'compose', '-p', EXPECTED_DEV_PROJECT, 'down'],
+        [EXPECTED_DOCKER, 'network', 'inspect', '--format', '{{.Name}}', 'trader_joe_devnet'],
+        [
+            'sh',
+            '-c',
+            stack.DEV_UP_WRAPPER_SCRIPT,
+            'sh',
+            f'{EXPECTED_TRUSTED_DIR}/tools/dev_instance_secret.sh',
+            '<HOST>/.env',
+            EXPECTED_DOCKER,
+            'compose',
+            '-p',
+            EXPECTED_DEV_PROJECT,
+            '--project-directory',
+            '<HOST>',
+            *(
+                word
+                for name in (
+                    'docker-compose.yaml',
+                    'docker-compose.override.yaml',
+                    'docker-compose.web.yaml',
+                    'docker-compose.web.dev.yaml',
+                    'docker-compose.agent-dev.yaml',
+                )
+                for word in ('-f', f'{EXPECTED_TRUSTED_DIR}/{name}')
+            ),
+            'up',
+            '-d',
+            '--wait',
+            '--wait-timeout',
+            '300',
+            'postgres',
+            'data_store',
+            'data_ingest',
+            'web',
+        ],
+    ],
+    # tj-iee6sn.10: the D7 guard; the lookup of postgres (exactly one running) and of data_store (at most
+    # one); the inspect of the data_store :dev image; the bases (the one-off run of data_store is flagged
+    # as building); then `make migrate`'s alembic run inside dev_up's fixed secret wrapper.
+    'dev_migrate': [
+        _EXPECTED_DEV_GUARD,
+        *(_expected_dev_lookup(service) for service in ('postgres', 'data_store')),
+        [EXPECTED_DOCKER, 'image', 'inspect', '--format', '{{.Id}}', 'trader_joe_data_store:dev'],
+        *_INSPECTS,
+        _expected_dev_wrapped(['run', '--rm', '--no-deps', 'data_store', '/code/.venv/bin/alembic', 'upgrade', 'head']),
+    ],
+    # The same, then -- before the budget and the bases -- the data/store digest and the stamp read
+    # (run_migrations.sh's verify_comparison_image), then `make migrate-check`'s alembic run.
+    'dev_migrate_check': [
+        _EXPECTED_DEV_GUARD,
+        *(_expected_dev_lookup(service) for service in ('postgres', 'data_store')),
+        [EXPECTED_DOCKER, 'image', 'inspect', '--format', '{{.Id}}', 'trader_joe_data_store:dev'],
+        ['/usr/bin/bash', f'{EXPECTED_TRUSTED_DIR}/tools/source_digest.sh', '--context', '<HOST>', 'data', 'store'],
+        [
+            EXPECTED_DOCKER,
+            'image',
+            'inspect',
+            '--format',
+            '{{ with .Config.Labels }}{{ index . "trader_joe.source.digest" }}{{ end }}',
+            'trader_joe_data_store:dev',
+        ],
+        *_INSPECTS,
+        _expected_dev_wrapped(['run', '--rm', '--no-deps', 'data_store', '/code/.venv/bin/alembic', 'check']),
+    ],
+    # tj-iee6sn.14, `make dev-tools`: the D7 guard; the devnet inspect (present, so no create); then the
+    # up of pgAdmin alone inside dev_up's fixed secret wrapper, over the dev files with the TRUSTED
+    # docker-compose.tools.yaml inserted BEFORE the MCP-only overlay (which stays last). postgres is not
+    # named (compose starts it through pgadmin's depends_on); no image inspect, no digest, no base.
+    'dev_tools': [
+        _EXPECTED_DEV_GUARD,
+        [EXPECTED_DOCKER, 'network', 'inspect', '--format', '{{.Name}}', 'trader_joe_devnet'],
+        [
+            'sh',
+            '-c',
+            stack.DEV_UP_WRAPPER_SCRIPT,
+            'sh',
+            f'{EXPECTED_TRUSTED_DIR}/tools/dev_instance_secret.sh',
+            '<HOST>/.env',
+            EXPECTED_DOCKER,
+            'compose',
+            '-p',
+            EXPECTED_DEV_PROJECT,
+            '--project-directory',
+            '<HOST>',
+            *(
+                word
+                for name in (
+                    'docker-compose.yaml',
+                    'docker-compose.override.yaml',
+                    'docker-compose.web.yaml',
+                    'docker-compose.web.dev.yaml',
+                    'docker-compose.tools.yaml',
+                    'docker-compose.agent-dev.yaml',
+                )
+                for word in ('-f', f'{EXPECTED_TRUSTED_DIR}/{name}')
+            ),
+            'up',
+            '-d',
+            '--wait',
+            'pgadmin',
+        ],
+    ],
 }
+HOST_MARK = '<HOST>'
 
 
 def _tail(step: stack.Step) -> list[str]:
@@ -316,7 +586,13 @@ def test_every_dev_verb_runs_exactly_its_fixed_read_only_argv(
     """
     rig, result = _run_verb(tmp_path, monkeypatch, verb)
     assert result['status'] == 'ok', result
-    assert [list(step.argv) for step in rig.docker.steps] == _EXPECTED_TAILS_DEV[verb]
+    host = str(rig.layout.repo_host_path)
+    # A word that IS the mark, or starts with it (dev_up's `<HOST>/.env`), names the rig's host path.
+    expected = [
+        [host + word[len(HOST_MARK) :] if word.startswith(HOST_MARK) else word for word in argv]
+        for argv in _EXPECTED_TAILS_DEV[verb]
+    ]
+    assert [list(step.argv) for step in rig.docker.steps] == expected
 
 
 @pytest.mark.parametrize('verb', sorted(_EXPECTED_TAILS))
@@ -414,18 +690,46 @@ def _mcp_dockerfile_copies() -> list[tuple[list[str], str]]:
     return copies
 
 
-def test_the_mcp_image_bakes_in_exactly_the_trusted_compose_files_and_dockerfile():
-    """D1 and O3: the image COPYs COMPOSE_FILES and the root Dockerfile into TRUSTED_COMPOSE_DIR."""
+# What tj-iee6sn.5 adds to the trusted directory for the USER'S DEV project (ADR tj-4rr0la addendum
+# 23), spelled from literals: the dev set's files the agent stack does not already bake, pgAdmin's file
+# for dev_tools (B8), and the two scripts the dev verbs run instead of the checkout's.
+EXPECTED_DEV_BAKES = {
+    'docker-compose.override.yaml': f'{EXPECTED_TRUSTED_DIR}/docker-compose.override.yaml',
+    'docker-compose.web.yaml': f'{EXPECTED_TRUSTED_DIR}/docker-compose.web.yaml',
+    'docker-compose.web.dev.yaml': f'{EXPECTED_TRUSTED_DIR}/docker-compose.web.dev.yaml',
+    'docker-compose.agent-dev.yaml': f'{EXPECTED_TRUSTED_DIR}/docker-compose.agent-dev.yaml',
+    'docker-compose.tools.yaml': f'{EXPECTED_TRUSTED_DIR}/docker-compose.tools.yaml',
+    'tools/dev_instance_secret.sh': f'{EXPECTED_TRUSTED_DIR}/tools/dev_instance_secret.sh',
+    'tools/source_digest.sh': f'{EXPECTED_TRUSTED_DIR}/tools/source_digest.sh',
+}
+
+
+def _baked_into_trusted() -> dict[str, str]:
+    """Source -> the file it lands at in the image, for every COPY into TRUSTED_COMPOSE_DIR or below it."""
     into_trusted = {}
     for sources, destination in _mcp_dockerfile_copies():
-        if destination.rstrip('/') == EXPECTED_TRUSTED_DIR:
-            for source in sources:
-                into_trusted[source] = f'{EXPECTED_TRUSTED_DIR}/{source}'
-        elif destination.startswith(EXPECTED_TRUSTED_DIR + '/'):
-            for source in sources:
-                into_trusted[source] = destination
-    assert set(into_trusted) == {*stack.COMPOSE_FILES, 'Dockerfile'}, into_trusted
+        if not (destination.rstrip('/') == EXPECTED_TRUSTED_DIR or destination.startswith(EXPECTED_TRUSTED_DIR + '/')):
+            continue
+        for source in sources:
+            # COPY semantics: a destination ending in '/' is a directory, and the file keeps its basename.
+            into_trusted[source] = (
+                f'{destination.rstrip("/")}/{posixpath.basename(source)}'
+                if destination.endswith('/') or destination.rstrip('/') == EXPECTED_TRUSTED_DIR
+                else destination
+            )
+    return into_trusted
+
+
+def test_the_mcp_image_bakes_in_exactly_the_trusted_compose_files_and_dockerfile():
+    """D1 and O3: the image COPYs COMPOSE_FILES and the root Dockerfile into TRUSTED_COMPOSE_DIR.
+
+    tj-iee6sn.5 widened the set by exactly EXPECTED_DEV_BAKES, each at the path the dev verbs name.
+    """
+    into_trusted = _baked_into_trusted()
+    assert set(into_trusted) == {*stack.COMPOSE_FILES, 'Dockerfile', *EXPECTED_DEV_BAKES}, into_trusted
     assert into_trusted['Dockerfile'] == str(stack.TRUSTED_DOCKERFILE)
+    for source, landed in EXPECTED_DEV_BAKES.items():
+        assert into_trusted[source] == landed, (source, into_trusted[source])
 
 
 def test_the_mcp_image_bakes_in_the_fake_overlay_and_admits_it_but_never_the_fakes():
@@ -731,14 +1035,16 @@ def test_stack_up_force_recreates_exactly_the_snapshot_bound_services_after_the_
     assert build == ['build', *stack.BUILT_SERVICES]
 
 
-@pytest.mark.parametrize('verb', sorted(set(VERB_SAMPLES) - DOCKERLESS_VERBS - {'stack_up'}))
+@pytest.mark.parametrize('verb', sorted(set(VERB_SAMPLES) - DOCKERLESS_VERBS - {'stack_up', 'dev_restart'}))
 def test_no_other_verb_recreates_or_restarts_a_running_service(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str
 ):
     """Ruling, rejected option: only stack_up recreates a running service.
 
     run_system_tests in particular must not restart the stack between a validator's focused runs --
-    it recreates test_client alone, by `run`.
+    it recreates test_client alone, by `run`. dev_restart is the one other exception, by owner ruling
+    (tj-iee6sn.1 D1, bead tj-iee6sn.7): it restarts one service of the USER'S dev project, never the
+    agent stack, and its whole argv is pinned in _EXPECTED_TAILS_DEV and test_dev_label_verbs.py.
     """
     rig, result = _run_verb(tmp_path, monkeypatch, verb)
     assert result['status'] == 'ok', result

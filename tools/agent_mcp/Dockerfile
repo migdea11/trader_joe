@@ -99,6 +99,21 @@ COPY docker-compose.yaml docker-compose.test-client.yaml docker-compose.agent-st
 # builds, so the worktree's own Dockerfile is never read and FROM / COPY --from cannot reach other
 # images on the host daemon. Same rebuild rule as the compose files.
 COPY Dockerfile /opt/agent_mcp/compose/Dockerfile
+# THE TRUSTED COPIES FOR THE USER'S DEV PROJECT (stack.DEV_COMPOSE_FILES; ADR tj-4rr0la addendum 23,
+# epic tj-iee6sn). The dev set's -f list: the base file (copied above), the override, the web prod
+# and web dev files, and the MCP-only overlay that points build.dockerfile at the trusted Dockerfile
+# above. docker-compose.tools.yaml (pgAdmin) is for dev_tools. Nothing from the checkout's own files
+# is ever passed to compose.
+COPY docker-compose.override.yaml docker-compose.web.yaml docker-compose.web.dev.yaml \
+    docker-compose.agent-dev.yaml docker-compose.tools.yaml /opt/agent_mcp/compose/
+# THE TWO SCRIPTS the dev verbs run from here instead of the checkout's (an agent-writable file run
+# inside agent_mcp would hold the Docker API): dev_instance_secret.sh resolves the dev web container's
+# INSTANCE_WRITE_SECRET, source_digest.sh stamps the images. In a tools/ directory beside the trusted
+# Dockerfile, the repository's own layout, because source_digest.sh finds the Dockerfile at ../Dockerfile
+# from itself. They need sh, bash, awk, sed, sort, find, tr, mktemp, realpath and sha256sum, all of
+# which the Debian slim base provides (no package is installed for them). Same rebuild rule as the
+# compose files.
+COPY tools/dev_instance_secret.sh tools/source_digest.sh /opt/agent_mcp/compose/tools/
 
 ENV PATH="/opt/agent_mcp/.venv/bin:${PATH}" \
     PYTHONPATH=/opt/agent_mcp \

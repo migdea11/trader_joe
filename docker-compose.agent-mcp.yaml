@@ -110,6 +110,11 @@ services:
         UID: ${AGENT_MCP_UID:?set by make agent-mcp-up}
         GID: ${AGENT_MCP_GID:?set by make agent-mcp-up}
     image: trader_joe_agent_mcp:latest
+    # An init as PID 1 (the daemon's docker-init, tini), so the zombies of a timed-out step's killed
+    # process group are reaped: python as PID 1 reaps only the pids asyncio spawned (tj-iee6sn.15).
+    # It also forwards SIGTERM to python. Applied only by `make agent-mcp-rebuild`, like every edit
+    # to this file.
+    init: true
     depends_on:
       - socket_proxy
     environment:
@@ -117,9 +122,10 @@ services:
       # /workspace, the DEVCONTAINER's path to the checkout (addendum 11 R1): the harness creates
       # agent worktrees inside the devcontainer, so git records them as
       # /workspace/.claude/worktrees/<name>, and only a repository seen at /workspace resolves
-      # them. The daemon never sees a repository path (addendum 5: the project directory, every
-      # bind source and the build context are the snapshot in the stack directory), so the host
-      # path has no consumer here. Must agree with .devcontainer/compose.yml ('..:/workspace',
+      # them. The AGENT stack's daemon never sees a repository path (addendum 5: the project
+      # directory, every bind source and the build context are the snapshot in the stack
+      # directory); only the DEV verbs name the host path (AGENT_MCP_REPO_HOST_PATH below,
+      # addendum 23). Must agree with .devcontainer/compose.yml ('..:/workspace',
       # working_dir) and devcontainer.json's workspaceFolder.
       AGENT_MCP_REPO_ROOT: /workspace
       # A HOST path mounted at the SAME path (addendum 1 (d)): the daemon resolves the snapshot's
@@ -132,13 +138,29 @@ services:
       # The server sets DOCKER_HOST per subprocess itself (runner.DOCKER_ENV); stated here too so
       # anything else in the container can only ever reach the proxy.
       DOCKER_HOST: tcp://socket_proxy:2375
-    # NO docker.sock, NO ports:, NO env_file. Three mounts, nothing else.
+      # The root checkout's HOST path, which is also where the second read-only repository mount
+      # below puts it inside this container (tools/agent_mcp/settings.py checks that it is the same
+      # tree as AGENT_MCP_REPO_ROOT). The dev verbs (ADR tj-4rr0la addendum 23) name it as compose's
+      # --project-directory.
+      AGENT_MCP_REPO_HOST_PATH: ${AGENT_MCP_REPO_HOST_PATH:?set by make agent-mcp-up}
+    # NO docker.sock, NO ports:, NO env_file. Four mounts, nothing else.
     volumes:
       # The repository, READ-ONLY, at /workspace (see AGENT_MCP_REPO_ROOT above): git plumbing and
       # the snapshot's copy source (addendum 5 1(d); addendum 11 R1).
       - type: bind
         source: ${AGENT_MCP_REPO_HOST_PATH:?set by make agent-mcp-up}
         target: /workspace
+        read_only: true
+      # The SAME checkout again, READ-ONLY, at its HOST path (source and target alike). The dev verbs
+      # run compose against the user's dev project with --project-directory set to this path, and the
+      # two halves of a compose call resolve it differently: the CLI, here in this container, reads
+      # the build context and the env files locally, so the path must exist here; the daemon resolves
+      # every relative bind source and the build context on the HOST, so the string must be the host's
+      # own. One path that is both is the host path mounted at itself, the way AGENT_MCP_STACK_DIR is.
+      # Read-only, so nothing in this container can write the checkout through either mount.
+      - type: bind
+        source: ${AGENT_MCP_REPO_HOST_PATH:?set by make agent-mcp-up}
+        target: ${AGENT_MCP_REPO_HOST_PATH:?set by make agent-mcp-up}
         read_only: true
       # The agent stack's own directory, read-write: generated env files, data, snapshot, audit log.
       - type: bind

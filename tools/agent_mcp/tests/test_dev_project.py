@@ -49,9 +49,10 @@ EXPECTED_DEV_PROJECT = 'trader_joe'
 EXPECTED_AGENT_PROJECT = 'trader_joe_agent_stack'
 EXPECTED_DOCKER = '/usr/local/bin/docker'
 EXPECTED_DEV_PREFIX = [EXPECTED_DOCKER, 'compose', '-p', EXPECTED_DEV_PROJECT]
-# R3: the closed service enum, by membership. pgAdmin is deliberately absent -- it lives in
-# docker-compose.tools.yaml, a file no verb loads.
-EXPECTED_DEV_SERVICES = ('postgres', 'data_store', 'data_ingest')
+# R3: the closed service enum, by membership. web joined it with ADR tj-4rr0la addendum 23 (2)
+# ("dev_logs: its enum gains web"; tj-iee6sn.6). pgAdmin is deliberately absent -- it lives in
+# docker-compose.tools.yaml, a file no log or ps verb loads.
+EXPECTED_DEV_SERVICES = ('postgres', 'data_store', 'data_ingest', 'web')
 # The only two subcommands a dev verb may spell, both read-only.
 EXPECTED_DEV_READ_COMMANDS = {'ps', 'logs'}
 # The options that would point a dev verb at content, another project or an env file.
@@ -98,7 +99,7 @@ def test_the_dev_project_is_exactly_one_fixed_name():
     assert stack.DEV_PROJECT != EXPECTED_AGENT_PROJECT, 'the dev verbs must not share the agent stack project'
 
 
-def test_the_dev_service_enum_holds_exactly_these_three_names():
+def test_the_dev_service_enum_holds_exactly_these_four_names():
     """R3: DEV_SERVICES widened with an arbitrary name left the whole suite green. Pinned by membership."""
     assert tuple(stack.DEV_SERVICES) == EXPECTED_DEV_SERVICES, (
         "DEV_SERVICES is the set of services an agent may name in the user's own project; "
@@ -106,7 +107,7 @@ def test_the_dev_service_enum_holds_exactly_these_three_names():
     )
 
 
-def test_the_advertised_dev_logs_enum_is_the_same_three_names():
+def test_the_advertised_dev_logs_enum_is_the_same_four_names():
     """The schema an MCP client reads and the set the server enforces must not drift apart."""
     assert runner.VERB_SCHEMAS['dev_logs']['properties']['service']['enum'] == list(EXPECTED_DEV_SERVICES)
 

@@ -10,10 +10,12 @@ first await, so it still admits one verb at a time.
 """
 
 import asyncio
+import contextlib
 import errno
 import json
 import os
 import shlex
+import signal
 import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -61,6 +63,23 @@ VERB_TIMEOUT_SECONDS = {
     'dev_migrate_status': 60,
     # One `docker ps` lookup and one GET with a 10 s HTTP timeout; far below the .mcp.json timeout.
     'dev_http_get': 60,
+    # The label-only pair: the prod guard's `docker ps`, then one compose down or restart (docker's own
+    # 10 s stop grace per container); far below the .mcp.json timeout.
+    'dev_down': 300,
+    'dev_restart': 300,
+    # A plain call, not a job: a cold build is the same uv sync and web build as stack_up's. The
+    # .mcp.json timeout (tj-iee6sn.4) outlasts it.
+    'dev_build': 1800,
+    # A plain call: the down, the network lookup and the up with its own 300 s --wait-timeout. Under the
+    # .mcp.json timeout. It never builds (dev_build does), so no build time is in this.
+    'dev_up': 600,
+    # A plain call: the D7 guard, the budget, the network lookup and one up of pgAdmin (postgres through
+    # its depends_on, which waits for healthy). Never builds. Under the .mcp.json timeout.
+    'dev_tools': 300,
+    # A plain call each: the D7 guard, two lookups, one image inspect and one one-off alembic start
+    # (dev_migrate_check adds a digest walk and a label read). Neither builds. Under the .mcp.json timeout.
+    'dev_migrate': 600,
+    'dev_migrate_check': 600,
 }
 
 # The docker CLI's whole environment. Fixed, never inherited: compose reads variables from its own
@@ -150,6 +169,23 @@ VERB_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         'required': ['name'],
     },
+    # THE USER'S DEV PROJECT, STATE-CHANGING, LABEL-ONLY. dev_down takes nothing; dev_restart's one
+    # input is the closed stack.DEV_RESTART_SERVICES enum (postgres is not in it).
+    'dev_down': {'properties': {}, 'required': []},
+    'dev_restart': {
+        'properties': {'service': {'type': 'string', 'enum': list(stack.DEV_RESTART_SERVICES)}},
+        'required': ['service'],
+    },
+    # Takes nothing: the services, the files and the digests are constants and computed values.
+    'dev_build': {'properties': {}, 'required': []},
+    # Takes nothing: the services, the files, the network and the secret wrapper are constants.
+    'dev_up': {'properties': {}, 'required': []},
+    # Takes nothing: the service, the files, the network and the secret wrapper are constants, and
+    # the pgAdmin credentials are read by compose from the root env file, never by this server.
+    'dev_tools': {'properties': {}, 'required': []},
+    # Take nothing: the program, its arguments, the files and the image are constants.
+    'dev_migrate': {'properties': {}, 'required': []},
+    'dev_migrate_check': {'properties': {}, 'required': []},
 }
 for _schema in VERB_SCHEMAS.values():
     _schema.update(type='object', additionalProperties=False)
@@ -179,6 +215,32 @@ class ProcessResult:
 
 _READ_CHUNK = 64 * 1024
 
+# How long a cancelled step's process group gets to exit on SIGTERM before SIGKILL takes the rest.
+_KILL_GRACE_SECONDS = 2.0
+
+
+def _signal_group(pgid: int, sig: signal.Signals) -> None:
+    """Signal a whole process group; one that is already gone is not an error."""
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(pgid, sig)
+
+
+async def _kill_group(process: asyncio.subprocess.Process) -> None:
+    """SIGTERM the step's process group, SIGKILL it after the grace, and reap the leader.
+
+    The SIGKILL goes out even when the leader has exited: a child that ignored SIGTERM, or sits
+    blocked on a FIFO, is in the group still and must not outlive the verb.
+    """
+    pgid = process.pid
+    _signal_group(pgid, signal.SIGTERM)
+    try:
+        await asyncio.wait_for(asyncio.shield(process.wait()), _KILL_GRACE_SECONDS)
+    except TimeoutError:
+        pass
+    finally:
+        _signal_group(pgid, signal.SIGKILL)
+    await process.wait()
+
 
 async def _read_capped(stream: asyncio.StreamReader, cap: int) -> bytes:
     """Read a stream to its end, keeping at most cap + 1 bytes: one over says 'over the cap' without the rest."""
@@ -192,18 +254,25 @@ async def _read_capped(stream: asyncio.StreamReader, cap: int) -> bytes:
 async def run_process(step: stack.Step) -> ProcessResult:
     """Run one argument list -- never a shell -- in DOCKER_ENV, capturing both streams.
 
+    A step's own env (stack.Step.env, the dev lifecycle's pinned variables) is merged over DOCKER_ENV
+    for that subprocess alone; it appears in no recorded command and no audit line.
+
     A step with stdout_cap has its stdout read to the end but kept only up to the cap plus one byte,
-    so a runaway producer cannot fill the server's memory. Cancelled (the verb's timeout), it kills
-    the process before letting the cancellation through, so no docker client outlives the verb that
-    started it.
+    so a runaway producer cannot fill the server's memory.
+
+    Every step runs in its OWN session, hence its own process group. Cancelled (the verb's timeout),
+    the whole group is killed (SIGTERM, then SIGKILL after a short grace) and the leader reaped
+    before the cancellation goes through: nothing the step started -- a docker client, a command
+    blocked on a FIFO, a shell's children -- outlives the verb that started it.
     """
     process = await asyncio.create_subprocess_exec(
         *step.argv,
         cwd=step.cwd,
-        env=DOCKER_ENV,
+        env={**DOCKER_ENV, **dict(step.env)},
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
     try:
         if step.stdout_cap is None or process.stdout is None or process.stderr is None:
@@ -212,8 +281,7 @@ async def run_process(step: stack.Step) -> ProcessResult:
             stdout, stderr = await asyncio.gather(_read_capped(process.stdout, step.stdout_cap), process.stderr.read())
             await process.wait()
     except asyncio.CancelledError:
-        process.kill()
-        await process.wait()
+        await _kill_group(process)
         raise
     return ProcessResult(process.returncode, stdout, stderr)
 
@@ -293,7 +361,9 @@ class AgentStack:
 
     Ten over the one agent stack, plus the two READ-ONLY dev verbs of ADR tj-4rr0la addendum 18,
     which reach the user's own compose project and can only read it, and the READ-ONLY exec verbs
-    dev_db_tables and dev_migrate_status of addendum 22.
+    dev_db_tables and dev_migrate_status of addendum 22, and the two STATE-CHANGING label-only dev
+    verbs dev_down and dev_restart (tj-iee6sn.7), held by the D6/D7 guards, the steering guard and
+    the budget.
     """
 
     def __init__(
@@ -322,7 +392,16 @@ class AgentStack:
             'dev_db_tables': self._dev_db_tables,
             'dev_migrate_status': self._dev_migrate_status,
             'dev_http_get': self._dev_http_get,
+            'dev_down': self._dev_down,
+            'dev_restart': self._dev_restart,
+            'dev_build': self._dev_build,
+            'dev_up': self._dev_up,
+            'dev_tools': self._dev_tools,
+            'dev_migrate': self._dev_migrate,
+            'dev_migrate_check': self._dev_migrate_check,
         }
+        # S10: at most stack.DEV_BUDGET_LIMIT state-changing dev verbs per rolling hour, in memory.
+        self.dev_budget = stack.DevBudget()
 
     @property
     def audit_log(self) -> Path:
@@ -780,6 +859,219 @@ class AgentStack:
                 return 'failed', f'GET {path} got no HTTP response from the running dev data_store; see the steps'
             return 'failed', f'GET {path} returned HTTP {status} from the running dev data_store; see the steps'
         return 'ok', f'GET {path} returned HTTP {status} from the running dev data_store'
+
+    # THE STATE-CHANGING LABEL-ONLY VERBS (tj-iee6sn.7). Each runs the same order, and a refusal at any
+    # point runs nothing after it: the D7 prod guard (one `docker ps`), then -- dev_restart only, which
+    # STARTS containers whose bind sources the daemon resolves at every start -- the D6 symlink check,
+    # then the steering guard, then the budget charge (so only an admitted call is counted), then the
+    # compose step. No snapshot, no git, no caller string in any argv.
+    async def _dev_prod_guard(self, call: _Call) -> None:
+        """D7: refuse unless every container of the dev project was started from the dev files."""
+        result = await call.step(stack.dev_prod_guard_step(self.settings.stack_dir))
+        stack.check_dev_prod_guard(result.exit_status, result.stdout)
+
+    async def _dev_admit(self, *, binds: bool) -> None:
+        """The checks between the prod guard and the compose step; BINDS adds the D6 symlink check."""
+        if binds:
+            await asyncio.to_thread(stack.check_dev_bind_sources, self.settings.repo_root)
+        await asyncio.to_thread(stack.check_dev_steering_files, self.settings.stack_dir)
+        self.dev_budget.charge()
+
+    async def _dev_down(self, call: _Call) -> tuple[str, str]:
+        """STATE-CHANGING: `docker compose -p trader_joe down` on the USER'S OWN dev compose project: its containers and project networks are stopped and removed. It never removes a volume or an image and never passes --remove-orphans; the database is a host bind and survives. It reads no compose file and no env file, takes no argument and builds nothing. Refused when the project holds a container not started from the dev files (a prod-mode launch, make system-launch, make seed-dump), when a compose file or dotenv file sits in the stack directory or a parent, and after 12 state-changing dev calls in an hour."""
+        call.validated = {}
+        await self._dev_prod_guard(call)
+        await self._dev_admit(binds=False)
+        if not await call.steps_until_failure(stack.dev_down_steps(self.settings.stack_dir)):
+            return 'failed', f'compose down failed for the {stack.DEV_PROJECT} project'
+        return 'ok', f'the {stack.DEV_PROJECT} compose project is down; no volume or image was removed'
+
+    async def _dev_restart(self, call: _Call, service: object) -> tuple[str, str]:
+        """STATE-CHANGING: `docker compose -p trader_joe restart <service>` on the USER'S OWN dev compose project, SERVICE one of data_store, data_ingest, web (never postgres). Restarts the existing container with its existing image and configuration; it creates, removes and rebuilds nothing and loads no compose file or env file. Refused when the project holds a container not started from the dev files (a prod-mode launch, make system-launch, make seed-dump), when a repository bind source is a symlink, when a compose file or dotenv file sits in the stack directory or a parent, and after 12 state-changing dev calls in an hour."""
+        checked = stack.validate_dev_restart_service(service)
+        call.validated = {'service': checked}
+        await self._dev_prod_guard(call)
+        await self._dev_admit(binds=True)
+        if not await call.steps_until_failure(stack.dev_restart_steps(self.settings.stack_dir, checked)):
+            return 'failed', f'compose restart of {checked} failed for the {stack.DEV_PROJECT} project'
+        return 'ok', f'{checked} restarted in the {stack.DEV_PROJECT} project'
+
+    # dev_build (tj-iee6sn.8) is a PLAIN call, not a job, and starts nothing, so none of the guards above
+    # apply: no prod guard, no symlink check (no container, no bind), no steering walk (every -f is given
+    # and the env is the placeholder one). Order, a refusal at any point running nothing after it: the S6
+    # stale-copy check, the generated-code freshness, the budget (so only an admitted call is counted),
+    # the two digests from the TRUSTED source_digest.sh (a failed or malformed digest stops the call
+    # before the build: an unstamped image is the quiet failure tj-yb1bxj forbids), then the build.
+    async def _dev_build(self, call: _Call) -> tuple[str, str]:
+        """STATE-CHANGING: builds the :dev images of the USER'S OWN dev compose project (data_store, data_ingest, web) from the checkout, as make dev-build does and stamped with the same source digests. Runs to completion, up to 30 minutes (a cold build takes minutes): it returns ok or failed itself and is not a background job. It builds with the MCP image's baked copies of the compose files and Dockerfile and reads no env file; it creates and starts no container and removes nothing. Refused when the MCP image is stale (run make agent-mcp-rebuild on the host), when gen/proto/python or gen/proto/ts is missing or older than the .proto files (run make proto gen-proto-ts in the root checkout), and after 12 state-changing dev calls in an hour."""
+        call.validated = {}
+        await asyncio.to_thread(stack.check_trusted_copies_current, self.settings.repo_root)
+        await asyncio.to_thread(stack.check_generated_code_fresh, self.settings.repo_root)
+        self.dev_budget.charge()
+        digests = []
+        for step in stack.dev_digest_steps(self.settings.stack_dir, self.settings.repo_host_path):
+            result = await call.step(step)
+            digest = stack.parse_source_digest(result.exit_status, result.stdout)
+            if digest is None:
+                return 'failed', f'the source digest failed ({" ".join(step.argv[-2:])}); nothing was built'
+            digests.append(digest)
+        build = stack.dev_build_step(self.settings.stack_dir, self.settings.repo_host_path, digests)
+        if not await call.steps_until_failure([build]):
+            return 'failed', f'compose build failed for the {stack.DEV_PROJECT} project'
+        return 'ok', f'the {stack.DEV_PROJECT} :dev images (data_store, data_ingest, web) are built and stamped'
+
+    # dev_up (tj-iee6sn.9) is a PLAIN call. Order, a refusal at any point running nothing after it and
+    # charging nothing: the D7 prod guard, the S6 stale-copy check, the D6 symlink check, the D5 env-file
+    # preflight, the steering guard (the label-only down searches the stack directory), the generated-code
+    # freshness, the three :dev images present, the budget, the two digests (a failed digest returns
+    # BEFORE the down, so it never leaves the stack down), the base images (a failed pull likewise stops
+    # before the down), the label-only down, the devnet network, and
+    # the up, wrapped to supply the instance secret in the child (stack.DEV_UP_WRAPPER_SCRIPT).
+    async def _dev_up(self, call: _Call) -> tuple[str, str]:
+        """STATE-CHANGING: `make dev-up` on the USER'S OWN dev compose project. Stops the project first (docker compose -p trader_joe down: it never removes a volume or an image, and the database is a host bind), so there is never more than one instance; a foreground make dev-launch session is ended by that. Then makes sure the trader_joe_devnet network exists and starts postgres, data_store, data_ingest and web detached from the MCP image's baked compose files, waiting up to 300 s for healthy (a missing postgres container is created). Takes no argument and never builds: the three :dev images must exist, else it is refused and says to call dev_build. Compose reads the root env file itself; the instance write secret is derived in the child process from it (as make dev-up does) and never passes through this server. Refused when the project holds a container not started from the dev files, when the MCP image is stale (run make agent-mcp-rebuild), when a repository bind source or an env file is a symlink or not a regular file, when a compose file or dotenv file sits in the stack directory or a parent, when gen/proto/python or gen/proto/ts is missing or older than the .proto files, and after 12 state-changing dev calls in an hour. Up to 10 minutes; returns ok or failed itself and is not a background job."""
+        call.validated = {}
+        settings = self.settings
+        await self._dev_prod_guard(call)
+        await asyncio.to_thread(stack.check_trusted_copies_current, settings.repo_root)
+        await asyncio.to_thread(stack.check_dev_bind_sources, settings.repo_root)
+        await asyncio.to_thread(stack.env_file_preflight, settings.repo_root)
+        await asyncio.to_thread(stack.check_dev_steering_files, settings.stack_dir)
+        await asyncio.to_thread(stack.check_generated_code_fresh, settings.repo_root)
+        for step in stack.dev_image_steps(settings.stack_dir):
+            if (await call.step(step)).exit_status != 0:
+                raise stack.Refused(f'the image {step.argv[-1]} is not on the daemon: call dev_build first')
+        self.dev_budget.charge()
+        digests = []
+        for step in stack.dev_digest_steps(settings.stack_dir, settings.repo_host_path):
+            result = await call.step(step)
+            digest = stack.parse_source_digest(result.exit_status, result.stdout)
+            if digest is None:
+                return (
+                    'failed',
+                    f'the source digest failed ({" ".join(step.argv[-2:])}); nothing was stopped or started',
+                )
+            digests.append(digest)
+        # The base images are pulled HERE, before anything is stopped: the up step is flagged as building,
+        # so the runner would otherwise ensure them just before the up, after the down, and a failed pull
+        # would leave the project down. The up's own ensure is then a no-op (bases_present).
+        await call.ensure_bases(settings.stack_dir)
+        if not await call.steps_until_failure(stack.dev_down_steps(settings.stack_dir)):
+            return 'failed', f'compose down failed for the {stack.DEV_PROJECT} project; nothing was started'
+        inspect, create = stack.dev_network_steps(settings.stack_dir)
+        # Look, else create, else look again (a create that lost a race to another creator still leaves it there).
+        network_ready = (await call.step(inspect)).exit_status == 0
+        if not network_ready:
+            await call.step(create)
+            network_ready = (await call.step(inspect)).exit_status == 0
+        if not network_ready:
+            return 'failed', f'the {stack.DEV_NETWORK} network could not be created; the project is down'
+        up = stack.dev_up_step(settings.stack_dir, settings.repo_host_path, digests)
+        if not await call.steps_until_failure([up]):
+            return 'failed', f'compose up failed for the {stack.DEV_PROJECT} project; see the steps and dev_logs'
+        return (
+            'ok',
+            f'the {stack.DEV_PROJECT} project was stopped and postgres, data_store, data_ingest and web are up and healthy',
+        )
+
+    # dev_tools (tj-iee6sn.14) is a PLAIN call, `make dev-tools`. Order, a refusal at any point running
+    # nothing after it and charging nothing: the D7 prod guard, the S6 stale-copy check (the tools file
+    # included), the D6 symlink check, the D5 env-file preflight, the budget, the devnet network, then the
+    # wrapped up of pgAdmin. No steering walk (every -f is given, nothing label-only runs), no generated
+    # code and no image checks (pgAdmin and postgres are image-only), no digest. The PGADMIN credentials
+    # are read by compose from the root env file: this server never opens, passes or prints them.
+    async def _dev_tools(self, call: _Call) -> tuple[str, str]:
+        """STATE-CHANGING: `make dev-tools` on the USER'S OWN dev compose project: makes sure the trader_joe_devnet network exists and starts pgAdmin (with postgres, through its depends_on, if it is not up) detached from the MCP image's baked dev compose files plus docker-compose.tools.yaml, waiting for it to run. pgAdmin listens on 127.0.0.1 at POSTGRES_UI_PORT on the host. Takes no argument and never builds or stops anything. Compose reads PGADMIN_EMAIL and PGADMIN_PASS from the root env file itself: this server never reads, passes or prints them, and when either is unset compose refuses and the step says which variable to set, never a value. The instance write secret is derived in the child process as for dev_up. dev_down removes pgAdmin with the rest of the project. Refused when the project holds a container not started from the dev files, when the MCP image is stale (run make agent-mcp-rebuild), when a repository bind source or an env file is a symlink or not a regular file, and after 12 state-changing dev calls in an hour. Up to 5 minutes; returns ok or failed itself and is not a background job."""
+        call.validated = {}
+        settings = self.settings
+        await self._dev_prod_guard(call)
+        await asyncio.to_thread(stack.check_trusted_copies_current, settings.repo_root)
+        await asyncio.to_thread(stack.check_dev_bind_sources, settings.repo_root)
+        await asyncio.to_thread(stack.env_file_preflight, settings.repo_root)
+        self.dev_budget.charge()
+        inspect, create = stack.dev_network_steps(settings.stack_dir)
+        network_ready = (await call.step(inspect)).exit_status == 0
+        if not network_ready:
+            await call.step(create)
+            network_ready = (await call.step(inspect)).exit_status == 0
+        if not network_ready:
+            return 'failed', f'the {stack.DEV_NETWORK} network could not be created; pgAdmin was not started'
+        tools = stack.dev_tools_step(settings.stack_dir, settings.repo_host_path)
+        if not await call.steps_until_failure([tools]):
+            return 'failed', (
+                f'compose up of pgadmin failed for the {stack.DEV_PROJECT} project; if the step output names '
+                'PGADMIN_EMAIL or PGADMIN_PASS, set it in the root env file (the pgAdmin password needs 6+ '
+                'characters); see the steps and dev_logs'
+            )
+        return 'ok', f'pgAdmin is running in the {stack.DEV_PROJECT} project; stop it with dev_down'
+
+    # dev_migrate and dev_migrate_check (tj-iee6sn.10) are PLAIN calls. Order, a refusal at any point
+    # running nothing after it and charging nothing: the D7 prod guard, the S6 stale-copy check, the D6
+    # symlink check, the D5 env-file preflight, the empty-versions guard of run_migrations.sh, exactly
+    # one running postgres and at most one running data_store (its selection counts), the data_store
+    # :dev image present, and -- dev_migrate_check only -- the stamp verification (one digest, one label
+    # read), then the budget, then the wrapped one-off alembic run. No steering walk: every -f is given
+    # and nothing label-only runs.
+    async def _dev_migrate_admit(self, call: _Call) -> None:
+        """The preconditions both migrate verbs share; Refused at the first that fails."""
+        settings = self.settings
+        await self._dev_prod_guard(call)
+        await asyncio.to_thread(stack.check_trusted_copies_current, settings.repo_root)
+        await asyncio.to_thread(stack.check_dev_bind_sources, settings.repo_root)
+        await asyncio.to_thread(stack.env_file_preflight, settings.repo_root)
+        versions = settings.repo_root / stack.MIGRATION_VERSIONS_DIR
+        # run_migrations.sh's guard: upgrade head over no revisions is a successful no-op.
+        if not await asyncio.to_thread(lambda: versions.is_dir() and any(versions.glob('*.py'))):
+            raise stack.Refused(f'no revision files in {stack.MIGRATION_VERSIONS_DIR}: wrong checkout?')
+        await self._dev_exec_target(call, 'postgres')
+        lookup = await call.step(stack.dev_lookup_step(settings.stack_dir, 'data_store'))
+        if lookup.exit_status != 0:
+            raise stack.Refused(f'the container lookup failed (exit {lookup.exit_status}); see the steps')
+        stack.refuse_several_dev_containers('data_store', lookup.stdout)
+        if (await call.step(stack.dev_data_store_image_step(settings.stack_dir))).exit_status != 0:
+            raise stack.Refused(f'the image {stack.DEV_IMAGES[0]} is not on the daemon: call dev_build first')
+
+    async def _dev_migrate(self, call: _Call) -> tuple[str, str]:
+        """STATE-CHANGING, and it WRITES THE USER'S DEV DATABASE: `make migrate` on the RUNNING dev instance. Runs `alembic upgrade head` in a one-off data_store container (docker compose run --rm --no-deps) from the MCP image's baked dev compose files, against the postgres that is running now, applying the revisions in the checkout's server/data/store/migrations/versions. Takes no argument. Only the dev definition is ever selected; the call is refused when the project holds a container not started from the dev files, when no or several postgres or several data_store containers run, when the checkout holds no revision files, when the data_store :dev image does not exist (call dev_build), when the MCP image is stale (run make agent-mcp-rebuild), when a repository bind source or an env file is a symlink or not a regular file, and after 12 state-changing dev calls in an hour. Compose reads the env files itself; the instance write secret is derived in the child process and never passes through this server. A migration can drop columns and this call has no dry run: the project permission for it is meant to be ask. Up to 10 minutes; returns ok or failed itself."""
+        call.validated = {}
+        settings = self.settings
+        await self._dev_migrate_admit(call)
+        self.dev_budget.charge()
+        if not await call.steps_until_failure([stack.dev_migrate_step(settings.stack_dir, settings.repo_host_path)]):
+            return 'failed', 'alembic upgrade head failed in the one-off data_store container; see the steps'
+        return 'ok', f'alembic upgrade head applied to the running dev database ({stack.DEV_MIGRATE_SELECTION})'
+
+    async def _dev_migrate_check(self, call: _Call) -> tuple[str, str]:
+        """STATE-CHANGING: `make migrate-check` on the RUNNING dev instance: `alembic check` in a one-off data_store container (docker compose run --rm --no-deps) compares the models of the data_store :dev image with the live schema. IT WRITES an empty alembic_version table when the dev database was never migrated (alembic's check does not pass dont_mutate; against a migrated database it changes nothing). It is REFUSED unless the image's source stamp (the trader_joe.source.digest label) equals the digest of the checkout's data/store source, computed by the baked source_digest.sh as make dev-build does; an unstamped image, a stale one and a missing one all refuse, naming dev_build to fix it. There is NO escape hatch. A non-zero exit means either real drift or a database behind head (call dev_migrate); the step output says which. A clean run compares neither enum labels nor server defaults. Takes no argument. Same other refusals as dev_migrate. Up to 10 minutes; returns ok or failed itself."""
+        call.validated = {}
+        settings = self.settings
+        await self._dev_migrate_admit(call)
+        digest_step = stack.dev_digest_steps(settings.stack_dir, settings.repo_host_path)[0]
+        digest_result = await call.step(digest_step)
+        digest = stack.parse_source_digest(digest_result.exit_status, digest_result.stdout)
+        if digest is None:
+            return 'failed', f'the source digest failed ({" ".join(digest_step.argv[-2:])}); nothing was checked'
+        stamp = await call.step(stack.dev_stamp_step(settings.stack_dir))
+        stack.check_dev_image_stamp(stamp.exit_status, stamp.stdout, digest)
+        self.dev_budget.charge()
+        call.details = {
+            'compared': (
+                f'the models of {stack.DEV_IMAGES[0]}, whose source stamp matches this checkout, against the live '
+                'schema of the running dev database'
+            ),
+            'not_compared': 'enum labels and server defaults, which autogenerate does not read',
+        }
+        step = stack.dev_migrate_check_step(settings.stack_dir, settings.repo_host_path)
+        if not await call.steps_until_failure([step]):
+            return 'failed', (
+                f'alembic check exited {call.last_exit}: either the schema has drifted from the models, or the '
+                "database is behind head ('Target database is not up to date.', which dev_migrate fixes) -- the "
+                'step output says which'
+            )
+        return (
+            'ok',
+            'no drift between the verified data_store :dev image and the dev schema; '
+            'enum labels and server defaults were not compared',
+        )
 
     @property
     def verbs(self) -> tuple[str, ...]:

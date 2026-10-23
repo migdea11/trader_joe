@@ -9,10 +9,15 @@ whole sleep instead of when the verb answered.
 """
 
 import asyncio
+import contextlib
 import json
 import os
+import secrets
 import shutil
+import signal
+import subprocess  # nosec B404 -- a sleeping sibling in this process's group, by argument list
 import time
+from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +27,7 @@ from tools.agent_mcp import runner, stack
 from tools.agent_mcp.tests.harness import (
     DEV_PROJECT_VERBS,
     LIVE_ENV_SENTINEL,
+    REPO_ROOT,
     VERB_SAMPLES,
     WORKTREE_NAME,
     FakeDocker,
@@ -542,3 +548,252 @@ def test_run_process_kills_its_child_when_the_verb_is_cancelled(tmp_path: Path):
     asyncio.run(scenario())
     time.sleep(1.0)
     assert not marker.exists(), 'the child outlived the cancelled verb'
+
+
+# --- a cancelled step's WHOLE process group dies (tj-iee6sn.15, B5b) -------------------------------
+#
+# Design checked against: tj-iee6sn.15's WHAT (2) and TESTS (iv), from ruling (1)(b) of the architect's
+# 16:59 UTC gate note on tj-iee6sn.8: the runner promises nothing a step started outlives the verb, so
+# every step gets its own session, and on cancellation the group gets SIGTERM, then -- always --
+# SIGKILL after the grace, and the leader is reaped. Liveness is read from /proc/<pid>/status: a killed
+# orphan stays a zombie (state Z) where nothing reaps it, and os.kill(pid, 0) succeeds on a zombie.
+# Every process is found by a MARKER in its command line, a sleep duration no other process uses, and
+# the fixture SIGKILLs whatever is still alive afterwards, pass or fail (tj-smsty8).
+
+_BASH = shutil.which('bash') or '/bin/bash'
+# A scenario that hangs (a mutation that never sends SIGKILL, or kills no group) fails here, not forever.
+_SCENARIO_TIMEOUT = 15.0
+
+
+def _cmdline(pid: int) -> bytes:
+    try:
+        with open(f'/proc/{pid}/cmdline', 'rb') as handle:
+            return handle.read()
+    except OSError:
+        return b''
+
+
+def _proc_field(pid: int, name: str) -> str | None:
+    try:
+        with open(f'/proc/{pid}/status', encoding='utf-8') as handle:
+            for line in handle:
+                if line.startswith(f'{name}:'):
+                    return line.split()[1]
+    except OSError:
+        return None
+    return None
+
+
+def _marked(marker: str) -> list[int]:
+    """Every pid but this one whose command line carries MARKER, zombies included."""
+    token = marker.encode()
+    pids = (int(name) for name in os.listdir('/proc') if name.isdigit())
+    return [pid for pid in pids if pid != os.getpid() and token in _cmdline(pid)]
+
+
+def _alive(marker: str) -> list[int]:
+    """The marked pids that are still running: gone, zombie (Z) and dead (X) all count as dead."""
+    return [pid for pid in _marked(marker) if _proc_field(pid, 'State') not in (None, 'Z', 'X')]
+
+
+def _kill_marked(marker: str) -> None:
+    for pid in _alive(marker):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, signal.SIGKILL)
+
+
+@pytest.fixture
+def marker() -> Iterator[str]:
+    """A sleep duration of 600 s and change, unique to this test; whatever carries it is killed after."""
+    token = f'{600 + secrets.randbelow(100)}.{secrets.randbelow(10**9):09d}'
+    try:
+        yield token
+    finally:
+        _kill_marked(token)
+
+
+async def _until(predicate: Callable[[], bool], seconds: float = 10.0) -> None:
+    deadline = time.monotonic() + seconds
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError('the condition never held')
+        await asyncio.sleep(0.02)
+
+
+def _children_of_this_process(marker: str) -> list[int]:
+    return [pid for pid in _marked(marker) if _proc_field(pid, 'PPid') == str(os.getpid())]
+
+
+async def _start_then_cancel(
+    step: stack.Step, marker: str, ready: Callable[[], bool], spare: int | None = None
+) -> tuple[int, float]:
+    """Start STEP, wait for READY, cancel it, and return (the leader's pid, seconds from cancel to done)."""
+    task = asyncio.create_task(runner.run_process(step))
+    await _until(ready)
+    (leader,) = [pid for pid in _children_of_this_process(marker) if pid != spare]
+    started = time.monotonic()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    return leader, time.monotonic() - started
+
+
+def _run_scenario(scenario: Awaitable[Any]) -> Any:
+    async def bounded() -> Any:
+        return await asyncio.wait_for(scenario, _SCENARIO_TIMEOUT)
+
+    return asyncio.run(bounded())
+
+
+def test_a_cancelled_step_leaves_no_descendant_alive_even_one_ignoring_sigterm(tmp_path: Path, marker: str):
+    """A shell and two children all ignoring SIGTERM: the SIGKILL after the grace takes every one."""
+    script = f'trap "" TERM; sleep {marker} & sleep {marker} & wait'
+    step = stack.Step((_BASH, '-c', script), tmp_path)
+    leader, took = _run_scenario(_start_then_cancel(step, marker, lambda: len(_alive(marker)) == 3))
+    assert _alive(marker) == [], f'outlived the cancelled verb: {_alive(marker)}'
+    assert not os.path.exists(f'/proc/{leader}'), 'the leader was not reaped'
+    assert took >= runner._KILL_GRACE_SECONDS * 0.9, f'SIGKILL came before the grace: {took:.2f}s'
+
+
+def test_a_child_left_behind_by_an_exited_leader_is_killed_too(tmp_path: Path, marker: str):
+    """The leader is gone, its child holds stdout open: killing the leader's pid alone would kill nothing."""
+    step = stack.Step((_BASH, '-c', f'trap "" TERM; sleep {marker} & exit 0'), tmp_path)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(runner.run_process(step))
+        await _until(lambda: len(_alive(marker)) == 1 and not _children_of_this_process(marker), 10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # The leader was reaped long ago, so run_process returns before the loop has seen the killed
+        # child's pipes close; let it, or the transport is collected after asyncio.run closed the loop.
+        await asyncio.sleep(0.3)
+
+    # The leader exits at once and is reaped by the child watcher; the sleep, re-parented, is what is left.
+    _run_scenario(scenario())
+    assert _alive(marker) == [], f'outlived the cancelled verb: {_alive(marker)}'
+
+
+def test_the_group_gets_sigterm_then_always_sigkill_by_its_own_id(
+    tmp_path: Path, marker: str, monkeypatch: pytest.MonkeyPatch
+):
+    """SIGTERM, then SIGKILL to the group even after the leader exited on SIGTERM inside the grace.
+
+    A member that ignored SIGTERM would otherwise survive. Both signals name the step's own group, never ours.
+    """
+    sent: list[tuple[int, int]] = []
+    real_killpg = os.killpg
+
+    def recording_killpg(pgid: int, sig: int) -> None:
+        sent.append((pgid, sig))
+        real_killpg(pgid, sig)
+
+    monkeypatch.setattr(os, 'killpg', recording_killpg)
+    step = stack.Step((_BASH, '-c', f'sleep {marker}; :'), tmp_path)
+    leader, took = _run_scenario(_start_then_cancel(step, marker, lambda: len(_alive(marker)) == 2))
+    assert sent == [(leader, signal.SIGTERM), (leader, signal.SIGKILL)], sent
+    assert leader != os.getpgrp()
+    assert took < runner._KILL_GRACE_SECONDS, f'a group that exits on SIGTERM waited out the grace: {took:.2f}s'
+    assert _alive(marker) == []
+
+
+def test_each_step_is_its_own_session_and_the_kill_spares_this_process_group(tmp_path: Path, marker: str):
+    """A sibling in the MCP's own process group survives the cancel; the step's group is not ours."""
+    sibling = subprocess.Popen(['sleep', marker])  # nosec B603 B607 -- in this process's group, on purpose
+    try:
+        groups: dict[str, int] = {}
+        step = stack.Step((_BASH, '-c', f'trap "" TERM; sleep {marker} & wait'), tmp_path)
+
+        def ready() -> bool:
+            children = [pid for pid in _children_of_this_process(marker) if pid != sibling.pid]
+            if len(_alive(marker)) != 3 or len(children) != 1:
+                return False
+            groups['step'] = os.getpgid(children[0])
+            groups['session'] = os.getsid(children[0])
+            groups['leader'] = children[0]
+            return True
+
+        _run_scenario(_start_then_cancel(step, marker, ready, spare=sibling.pid))
+        assert groups['step'] == groups['session'] == groups['leader'], groups
+        assert groups['step'] != os.getpgrp() and os.getpgid(sibling.pid) == os.getpgrp()
+        assert sibling.poll() is None and _proc_field(sibling.pid, 'State') not in (None, 'Z', 'X')
+        assert _alive(marker) == [sibling.pid], _alive(marker)
+    finally:
+        sibling.kill()
+        sibling.wait(timeout=10)
+
+
+def test_a_digest_blocked_on_a_fifo_swapped_in_leaves_nothing_behind(tmp_path: Path, marker: str):
+    """The case that made this bead: the REAL script, a COPY source swapped for a FIFO after the walk.
+
+    The read of the FIFO blocks in the command substitution's subshell, a child of the script's bash;
+    killing bash alone left it blocked after the verb returned. TMPDIR is the step's own, so the test
+    can see the walk finish (the sorted `files` list exists) before it swaps the regular file for the
+    FIFO; the many files ahead of it in the manifest keep the window wide.
+    """
+    trusted = tmp_path / f'trusted-{marker}'
+    (trusted / 'tools').mkdir(parents=True)
+    shutil.copy2(REPO_ROOT / 'tools' / 'source_digest.sh', trusted / 'tools' / 'source_digest.sh')
+    (trusted / 'Dockerfile').write_text('FROM scratch\nCOPY ./a_many /a\nCOPY ./z_target /z\n')
+    checkout = tmp_path / 'checkout'
+    (checkout / 'a_many').mkdir(parents=True)
+    for index in range(600):
+        (checkout / 'a_many' / f'f{index:04d}.py').write_text(f'{index}\n')
+    target = checkout / 'z_target'
+    target.write_text('regular\n')
+    (checkout / '.dockerignore').write_text('')
+    work = tmp_path / 'tmp'
+    work.mkdir()
+    script = str(trusted / 'tools' / 'source_digest.sh')
+    step = stack.Step((_BASH, script, '--context', str(checkout), 'x', 'y'), tmp_path, env=(('TMPDIR', str(work)),))
+
+    async def scenario() -> None:
+        task = asyncio.create_task(runner.run_process(step))
+        await _until(lambda: any(work.glob('tmp.*/files')), 20)
+        target.unlink()
+        os.mkfifo(target)
+        done, _ = await asyncio.wait({task}, timeout=4)
+        assert not done, f'the digest did not block on the FIFO: {task.result() if done else None}'
+        assert len(_alive(marker)) >= 2, 'expected the script and its blocked subshell'
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    _run_scenario(scenario())
+    assert _alive(marker) == [], f'outlived the cancelled verb: {_alive(marker)}'
+
+
+def test_a_step_that_finishes_returns_its_status_streams_and_cap_and_is_sent_no_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The normal path is unchanged: exit status, both streams, the stdout cap, and no killpg at all."""
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, 'killpg', lambda pgid, sig: sent.append((pgid, sig)))
+    plain = stack.Step((_BASH, '-c', 'printf out; printf err >&2; exit 3'), tmp_path)
+    capped = stack.Step((_BASH, '-c', 'printf 0123456789; printf err >&2'), tmp_path, stdout_cap=4)
+
+    async def scenario() -> tuple[runner.ProcessResult, runner.ProcessResult, float]:
+        started = time.monotonic()
+        first = await runner.run_process(plain)
+        second = await runner.run_process(capped)
+        return first, second, time.monotonic() - started
+
+    first, second, took = _run_scenario(scenario())
+    assert first == runner.ProcessResult(3, b'out', b'err')
+    assert second == runner.ProcessResult(0, b'01234', b'err')
+    assert sent == [] and took < runner._KILL_GRACE_SECONDS
+
+
+def test_a_child_that_exits_before_the_timeout_is_not_killed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Inside the verb's timeout, a step that ends by itself ends with its own status, untouched."""
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, 'killpg', lambda pgid, sig: sent.append((pgid, sig)))
+    done = tmp_path / 'done'
+    step = stack.Step((_BASH, '-c', f'sleep 0.3; touch {done}; exit 0'), tmp_path)
+
+    async def scenario() -> runner.ProcessResult:
+        async with asyncio.timeout(5):
+            return await runner.run_process(step)
+
+    assert _run_scenario(scenario()).exit_status == 0
+    assert done.exists() and sent == []

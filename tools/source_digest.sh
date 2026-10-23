@@ -5,11 +5,22 @@ set -euo pipefail
 # (decision tj-yb1bxj clauses 1, 5 and 6).
 #
 # Usage:
-#   tools/source_digest.sh <service-path> <service-name>      # print one 64-hex digest
-#   tools/source_digest.sh --list-paths <path> <name>         # print the COPY sources it covers
-#   tools/source_digest.sh --list-files <path> <name>         # print every file it hashes
+#   tools/source_digest.sh [--context <dir>] <service-path> <service-name>   # print one 64-hex digest
+#   tools/source_digest.sh [--context <dir>] --list-paths <path> <name>      # print the COPY sources it covers
+#   tools/source_digest.sh [--context <dir>] --list-files <path> <name>      # print every file it hashes
 #
 # e.g.  tools/source_digest.sh data store
+#
+# --context <dir>, which must come first, digests ANOTHER checkout with THIS script. The Dockerfile is
+# still the one beside the script (../Dockerfile, the parsed COPY list), but the files hashed and the
+# .dockerignore honoured are <dir>'s, and a .dockerignore there that is missing, a symlink or not a
+# regular file is a hard error (no stdout, status 2). It exists for the agent-stack MCP, which runs a
+# TRUSTED copy of this script and Dockerfile baked into its image over the repository checkout
+# (tools/agent_mcp, tj-iee6sn.8): beside the baked copy there are no sources and no .dockerignore, so
+# without the flag it cannot digest the checkout. Without the flag nothing below changes: the
+# repository is the script's own, and a missing .dockerignore is tolerated, as make dev-build,
+# prod-build and run_migrations.sh have always run it. Under the flag, a COPY source that is a
+# symlink, or that sits below one at any component, is refused: exit 4, nothing on stdout.
 #
 # WHY IT EXISTS. data/store/migrations/env.py imports the models from /code, which is IN THE IMAGE,
 # while only alembic.ini and migrations/ are bind-mounted. So `alembic check` always compares the
@@ -74,9 +85,33 @@ DOCKERFILE="$REPO_ROOT/Dockerfile"
 DOCKERIGNORE="$REPO_ROOT/.dockerignore"
 
 usage() {
-    echo "usage: $(basename "$0") [--list-paths|--list-files] <service-path> <service-name>" >&2
+    echo "usage: $(basename "$0") [--context <dir>] [--list-paths|--list-files] <service-path> <service-name>" >&2
     echo "  e.g. $(basename "$0") data store" >&2
 }
+
+# --context <dir>: the directory digested instead of the script's own repository. DOCKERFILE stays
+# the one beside this script; the root every path is relative to, and the .dockerignore, become
+# <dir>'s.
+if [ "${1:-}" = --context ]; then
+    if [ $# -lt 2 ]; then
+        echo "$(basename "$0"): --context needs a directory" >&2
+        usage
+        exit 2
+    fi
+    if ! CONTEXT="$(realpath -e -- "$2" 2> /dev/null)" || [ ! -d "$CONTEXT" ]; then
+        echo "$(basename "$0"): --context '$2' is not a directory" >&2
+        usage
+        exit 2
+    fi
+    shift 2
+    REPO_ROOT="$CONTEXT"
+    DOCKERIGNORE="$CONTEXT/.dockerignore"
+    if [ -L "$DOCKERIGNORE" ] || [ ! -f "$DOCKERIGNORE" ]; then
+        echo "$(basename "$0"): --context '$CONTEXT' has no regular .dockerignore; refusing to digest" >&2
+        echo "  without the exclusions the build honours (it would over-include)." >&2
+        exit 2
+    fi
+fi
 
 MODE=digest
 case "${1:-}" in
@@ -294,6 +329,36 @@ fi
 if [ "$MODE" = paths ]; then
     printf '%s\n' "${SOURCES[@]}"
     exit 0
+fi
+
+# --context ONLY: refuse a COPY source whose path passes through a symlink at ANY component, the
+# source itself included. The checkout is agent-writable and this script is trusted code running
+# over it: a link at `server` (or at the source) would make find and sha256sum read files outside
+# the tree, and the stamp would stop describing what the image holds (tj-yb1bxj). Each prefix is
+# tested with [ -L ], which does not follow the link it tests. Links INSIDE a directory source are
+# unchanged: recorded by target, never followed. A missing source is left to collect_files (exit 4).
+# Without --context nothing is checked, so make dev-build, prod-build and run_migrations.sh run as
+# they always have.
+refuse_symlinked_sources() {
+    local source prefix component rest
+    for source in "${SOURCES[@]}"; do
+        prefix=""
+        rest="$source"
+        while [ -n "$rest" ]; do
+            component="${rest%%/*}"
+            if [ "$component" = "$rest" ]; then rest=""; else rest="${rest#*/}"; fi
+            [ -n "$component" ] || continue
+            prefix="${prefix:+$prefix/}$component"
+            if [ -L "$prefix" ]; then
+                echo "source_digest: COPY source '$source' passes through a symlink at '$prefix'; refusing to digest" >&2
+                exit 4
+            fi
+        done
+    done
+}
+
+if [ -n "${CONTEXT:-}" ]; then
+    refuse_symlinked_sources
 fi
 
 # Every file the build context delivers under each COPY source, sorted bytewise. A source that
