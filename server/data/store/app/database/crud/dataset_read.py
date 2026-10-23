@@ -427,3 +427,130 @@ async def read_client_datasets(
         ClientDatasets(client_id, ReadClientKind(kind), int(count))
         for client_id, kind, count in (await db.execute(stmt)).all()
     ]
+
+
+@dataclass(frozen=True)
+class ClientDayReads:
+    """Reads on one UTC day by one client. client_id is repr=False: it is never logged."""
+
+    day: date
+    client_id: str = field(repr=False)
+    client_kind: ReadClientKind
+    reads: int
+
+
+async def read_client_day_reads(
+    db: AsyncSession,
+    dataset_ids: Collection[uuid.UUID] | None,
+    *,
+    now: datetime,
+    days: int,
+    client_kinds: Collection[ReadClientKind] | None = None,
+    client_ids: Collection[str] | None = None,
+) -> list[ClientDayReads]:
+    """Reads per UTC day per client over the last `days` UTC days INCLUDING today, over per-read rows and the rollup.
+
+    The union of dataset_read (reads only: a stream session is not a read) and dataset_read_daily is summed per
+    (day, client id, kind), so a day split across the rollup boundary is one entry and the series is continuous.
+    Only days with a read appear. Used by tj-grna9p.64.
+
+    Args:
+        db: A session; the read is one statement.
+        dataset_ids: Count only these datasets, or None for every dataset with a read.
+        now: The instant the window ends at; aware, else ValueError.
+        days: The window's length in UTC days, today included (1 is today only).
+        client_kinds: Count only these kinds. Default {SDK}. Ignored when client_ids is given.
+        client_ids: Count only these client ids instead of filtering by kind.
+
+    Returns:
+        list[ClientDayReads]: Ascending by day, then client id, then kind.
+    """
+    since_day = _window_start_day(now, days - 1)
+    per_read_day = _utc_day(_READ.c.read_at)
+    per_read = (
+        select(per_read_day.label('day'), _READ.c.client_id, _READ.c.client_kind, func.count().label('reads'))
+        .where(_READ.c.kind == DatasetReadKind.READ, per_read_day >= since_day)
+        .group_by(per_read_day, _READ.c.client_id, _READ.c.client_kind)
+    )
+    daily = (
+        select(_DAILY.c.day, _DAILY.c.client_id, _DAILY.c.client_kind, func.sum(_DAILY.c.reads).label('reads'))
+        .where(_DAILY.c.day >= since_day)
+        .group_by(_DAILY.c.day, _DAILY.c.client_id, _DAILY.c.client_kind)
+    )
+    if dataset_ids is not None:
+        per_read = per_read.where(_READ.c.dataset_id.in_(list(dataset_ids)))
+        daily = daily.where(_DAILY.c.dataset_id.in_(list(dataset_ids)))
+    if client_ids is not None:
+        per_read = per_read.where(_READ.c.client_id.in_(list(client_ids)))
+        daily = daily.where(_DAILY.c.client_id.in_(list(client_ids)))
+    else:
+        kinds = list(client_kinds) if client_kinds is not None else [ReadClientKind.SDK]
+        per_read = per_read.where(_READ.c.client_kind.in_(kinds))
+        daily = daily.where(_DAILY.c.client_kind.in_(kinds))
+    both = union_all(per_read, daily).subquery('client_reads_by_day')
+    total = cast(func.sum(both.c.reads), BigInteger)
+    stmt = (
+        select(both.c.day, both.c.client_id, both.c.client_kind, total)
+        .group_by(both.c.day, both.c.client_id, both.c.client_kind)
+        .having(func.sum(both.c.reads) > 0)
+        .order_by(both.c.day, both.c.client_id, both.c.client_kind)
+    )
+    return [
+        ClientDayReads(day, client_id, ReadClientKind(kind), int(reads))
+        for day, client_id, kind, reads in (await db.execute(stmt)).all()
+    ]
+
+
+@dataclass(frozen=True)
+class ClientLastReadAt:
+    """When one client last read one dataset. client_id is repr=False."""
+
+    dataset_id: uuid.UUID
+    client_id: str = field(repr=False)
+    client_kind: ReadClientKind
+    last_read_at: datetime
+
+
+async def read_client_last_reads(db: AsyncSession, dataset_ids: Collection[uuid.UUID]) -> list[ClientLastReadAt]:
+    """The latest read of each of `dataset_ids` by every client that ever read it, whatever the client filter.
+
+    Over per-read rows and the rollup (`last_read_at` of a folded day), a stream session counting as a read, as in
+    read_dataset_usage.
+
+    Args:
+        db: A session; the read is one statement, and none for an empty `dataset_ids`.
+        dataset_ids: The datasets to report.
+
+    Returns:
+        list[ClientLastReadAt]: Ordered by dataset id, then client id.
+    """
+    if not dataset_ids:
+        return []
+    ids = list(dataset_ids)
+    per_read = (
+        select(
+            _READ.c.dataset_id, _READ.c.client_id, _READ.c.client_kind, func.max(_READ.c.read_at).label('last_read_at')
+        )
+        .where(_READ.c.dataset_id.in_(ids))
+        .group_by(_READ.c.dataset_id, _READ.c.client_id, _READ.c.client_kind)
+    )
+    daily = (
+        select(
+            _DAILY.c.dataset_id,
+            _DAILY.c.client_id,
+            _DAILY.c.client_kind,
+            func.max(_DAILY.c.last_read_at).label('last_read_at'),
+        )
+        .where(_DAILY.c.dataset_id.in_(ids))
+        .group_by(_DAILY.c.dataset_id, _DAILY.c.client_id, _DAILY.c.client_kind)
+    )
+    both = union_all(per_read, daily).subquery('client_last_reads')
+    stmt = (
+        select(both.c.dataset_id, both.c.client_id, both.c.client_kind, func.max(both.c.last_read_at))
+        .group_by(both.c.dataset_id, both.c.client_id, both.c.client_kind)
+        .order_by(both.c.dataset_id, both.c.client_id)
+    )
+    return [
+        ClientLastReadAt(dataset_id, client_id, ReadClientKind(kind), last_read_at)
+        for dataset_id, client_id, kind, last_read_at in (await db.execute(stmt)).all()
+    ]

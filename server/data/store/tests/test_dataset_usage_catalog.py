@@ -27,6 +27,7 @@ import pytest
 from sqlalchemy.exc import OperationalError
 
 from data.store.app import dataset_catalog as catalog_module
+from data.store.app import usage_recorder as recorder_module
 from data.store.app.client_label import CLIENT_ID_HEADER, OPERATOR_PRINCIPAL, UNATTRIBUTED, ClientLabel
 from data.store.app.database.crud import dataset_read
 from data.store.app.database.crud.dataset_read import DatasetUsage
@@ -273,6 +274,20 @@ async def test_no_other_route_records_and_a_404_or_422_records_nothing(client, b
         response = await client.get(path, params=params, headers={CLIENT_ID_HEADER: OPERATOR_PRINCIPAL})
         assert response.status_code < 500, (path, response.text)
     assert recorder.reads == []
+
+
+@pytest.mark.asyncio
+async def test_the_store_get_owner_filter_is_never_recorded_as_the_reader(client, catalog, monkeypatch):  # noqa: F811
+    """OPTION R: the /store GET `owner` query is a search filter; that GET answers entries and records no read."""
+    recorded: list[Any] = []
+    monkeypatch.setattr(recorder_module.UsageRecorder, 'record_read', lambda self, *a, **k: recorded.append(a))
+    monkeypatch.setattr(recorder_module.UsageRecorder, '_append', lambda self, *a, **k: recorded.append(a))
+    for headers in ({}, {CLIENT_ID_HEADER: 'robot-7'}):
+        response = await client.get(
+            '/store/stock/market-activity/AAA', params={'owner': catalog.aaa_day.owner}, headers=headers
+        )
+        assert response.status_code == 200 and response.json(), response.text
+    assert recorded == []
 
 
 @pytest.mark.asyncio

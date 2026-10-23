@@ -102,6 +102,23 @@ Every bar read is recorded as one `dataset_read` row by the usage recorder (`app
 - **`GET /ui/v1/datasets/{id}/bars` records one read per call WITHOUT a cursor** (the `X-Client-Id` label; `operator` is kind UI, no header is `_unattributed`); a call with a cursor, and every other `/ui/v1` route, records nothing.
 - **Usage on the catalog** (`app/dataset_catalog.py`): `DatasetSummary.usage` on list and detail, the `client_id` (wins, repeatable) / `client_kind` (default SDK) filter, `usage` = `READ_30D` / `STALE` / `NEVER_READ` with `stale_days` (1..3650, default 90, never-read is stale; day-aligned on the UTC date of the last read, stream sessions count, so READ_30D and STALE are complements at 30; the detail route takes the same client filter), `sort=last_read`, and `expires_before` (Expiring Soon: expiry before it, plus the reaper's pending set; ignores the client filter; the facets default it to now + `EXPIRING_SOON_DAYS`). The `owner` query filter is never the reader. Each facet count equals the filtered list's total. The window functions refuse a naive `now`. An unmigrated database reads as zero usage with one warning (`make migrate`).
 
+## Usage statistics (`/ui/v1/stats/...`)
+
+Five open GETs in `routers/data_store/ui_stats.py`, composed in `app/dataset_catalog.py` (`usage_summary`, `last_read_buckets`, `reads_per_day`, `stale_page`, `storage_current`). None records usage; each runs a constant number of statements.
+
+| Route | What it serves |
+|---|---|
+| `usage/summary?stale_days&source` | `UsageSummary`: stale, read_last_30d, never_read, total, reads_today, distinct_clients_today |
+| `usage/last-read-buckets?source` | `LastReadBuckets`: [0,1) [1,8) [8,31) [31,91) [91,open) whole UTC days, plus never_read; sum = total |
+| `usage/reads-per-day?days&dataset_id&source` | `ReadsPerDay`: one entry per UTC day, client id and kind, continuous over the rollup |
+| `usage/stale?stale_days&source&cursor&limit` | `StaleDatasetPage`: never-read first, then oldest last read, then id; est_bytes and last read per client |
+| `storage/current?source` | `StorageCurrent`: the bar table's size, split per (source, feed) as estimates |
+
+- **Every usage route takes the list's client filter** (`UiClientFilterQuery`, `_client_filter`) and echoes it. Storage takes none.
+- **`read_within` in `app/dataset_catalog.py` is the one day-aligned staleness rule**: the list's usage filter, the facets, the summary and the stale list all decide through it, so their stale counts agree for one filter.
+- **Estimates**: a share is `bar_count * total_bytes // total_bars` (`estimate_bytes`); with a `source` the storage total is the sum of that source's shares, so the split always sums to it. Quota burn is not served (tj-lenn8u).
+- **The stale cursor** is bound to stale_days, source and the client filter by a digest, so it carries no client id.
+
 ## Operator writes (expiry and delete)
 
 `PATCH /ui/v1/datasets/{id}/expiry` (200, the updated `DatasetSummary`) and `DELETE /ui/v1/datasets/{id}` (204) are the UI's writes, in `routers/data_store/ui_dataset_writes.py`. Both need the instance secret; bodies are `SetExpiryRequest` / `DeleteDatasetRequest` parsed by `ProtoBody`, with no pydantic model.

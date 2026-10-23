@@ -376,6 +376,44 @@ CASES: dict[str, Case] = {
         malformed_request={'params': {'limit': 0}},
         malformed_field='limit',
     ),
+    # The usage and storage statistics (tj-grna9p.64). Over the fake session an empty catalog answers the zero
+    # view. Each malformed half sends a value just outside its bound. The figures themselves are
+    # test_ui_stats_route.py's, over SQLite, and tests/system/test_http_ui_stats.py's, over Postgres.
+    'GET /ui/v1/stats/usage/summary': Case(
+        path_params={},
+        request={},
+        malformed_path_params={},
+        malformed_request={'params': {'stale_days': 3651}},
+        malformed_field='stale_days',
+    ),
+    'GET /ui/v1/stats/usage/last-read-buckets': Case(
+        path_params={},
+        request={},
+        malformed_path_params={},
+        malformed_request={'params': {'source': 'not-a-source'}},
+        malformed_field='source',
+    ),
+    'GET /ui/v1/stats/usage/reads-per-day': Case(
+        path_params={},
+        request={},
+        malformed_path_params={},
+        malformed_request={'params': {'days': 366}},
+        malformed_field='days',
+    ),
+    'GET /ui/v1/stats/usage/stale': Case(
+        path_params={},
+        request={},
+        malformed_path_params={},
+        malformed_request={'params': {'limit': 501}},
+        malformed_field='limit',
+    ),
+    'GET /ui/v1/stats/storage/current': Case(
+        path_params={},
+        request={},
+        malformed_path_params={},
+        malformed_request={'params': {'client_id': 'storage-takes-no-client'}},
+        malformed_field='client_id',
+    ),
 }
 
 
@@ -412,6 +450,10 @@ class FakeResult:
         return uuid.uuid4()
 
     def first(self) -> None:
+        return None
+
+    def scalar(self) -> None:
+        # read_bar_storage's pg_total_relation_size (tj-grna9p.64): NULL, as for a table that does not exist.
         return None
 
     def one(self) -> tuple[bool, bool]:

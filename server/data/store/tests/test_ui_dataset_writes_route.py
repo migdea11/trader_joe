@@ -34,7 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engin
 from sqlalchemy.pool import StaticPool
 
 from common.enums.data_stock import ExpiryType, Granularity, UpdateType
-from data.store.app.client_label import OPERATOR_PRINCIPAL
+from data.store.app.client_label import CLIENT_ID_HEADER, OPERATOR_PRINCIPAL
 from data.store.app.database.crud import dataset_override
 from data.store.app.database.crud.dataset_override import OperatorOverrideInput, OverrideRequired, overriding_reason
 from data.store.app.database.crud.stock import store_dataset_entry as repo
@@ -46,6 +46,7 @@ from data.store.app.database.models.stock_market_activity import StockMarketActi
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.events import DatasetChange, DatasetChanged
 from data.store.app.main import app
+from data.store.app.usage_recorder import UsageRecorder
 from data.store.tests.problem_body import problem
 from data.store.tests.test_ui_datasets_route import (  # noqa: F401 (aware_sqlite_datetimes is a fixture)
     NOW,
@@ -415,6 +416,33 @@ async def test_an_overriding_patch_writes_exactly_one_trimmed_override_row(clien
         'rebalance cleanup',
     )
     assert row.at is not None
+
+
+@pytest.mark.asyncio
+async def test_a_write_route_ignores_the_client_id_header(client, world, monkeypatch, caplog):
+    """OPTION R (tj-grna9p.131): X-Client-Id is a read label, never an authority, an actor or a recorded read."""
+    recorded: list[Any] = []
+    monkeypatch.setattr(UsageRecorder, 'record_read', lambda self, *a, **k: recorded.append(a))
+    monkeypatch.setattr(UsageRecorder, '_append', lambda self, *a, **k: recorded.append(a))
+    caplog.set_level(logging.DEBUG)
+    as_operator = {**HEADERS, CLIENT_ID_HEADER: OPERATOR_PRINCIPAL}
+    as_owner = {**HEADERS, CLIENT_ID_HEADER: FOREIGN_OWNER}
+
+    # Claiming to be the operator, or the dataset's owner, does not stand in for the override.
+    assert (await patch(client, world.foreign.id, {'expiry': FUTURE}, as_operator)).status_code == 409
+    assert (await delete(client, world.foreign.id, None, as_owner)).status_code == 409
+    await assert_untouched(world, world.foreign.id, world.foreign.expiry)
+
+    label = 'write-route-label-7f3a'
+    with_label = {**HEADERS, CLIENT_ID_HEADER: label}
+    assert (
+        await patch(client, world.foreign.id, {'expiry': FUTURE, 'override': GOOD_OVERRIDE}, with_label)
+    ).status_code == 200
+    assert (await delete(client, world.foreign.id, {'override': GOOD_OVERRIDE}, with_label)).status_code == 204
+    overrides, deletions = await world.audit_rows()
+    assert [row.actor for row in [*overrides, *deletions]] == [OPERATOR_PRINCIPAL] * 3, 'the header became the actor'
+    assert recorded == [], 'a write recorded a read'
+    assert label not in caplog.text
 
 
 @pytest.mark.asyncio

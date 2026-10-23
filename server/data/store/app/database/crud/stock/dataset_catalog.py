@@ -485,3 +485,38 @@ async def read_bar_page_starts(
     if not rows:
         return 0, []
     return int(rows[0].n), [BarPageOffset(offset=int(r.rk), start=r.ts) for r in rows]
+
+
+@dataclass(frozen=True)
+class BarStorage:
+    """What the bar table holds now, measured once.
+
+    Attributes:
+        total_bytes: pg_total_relation_size of the bar table: heap, indexes and TOAST.
+        by_source: The bar count of each (source, feed) holding bars, ordered by source then feed.
+    """
+
+    total_bytes: int
+    by_source: list[tuple[DataSource, Feed, int]]
+
+
+async def read_bar_storage(db: AsyncSession) -> BarStorage:
+    """The bar table's total size and its bar count per (source, feed). Two statements, whatever the table holds.
+
+    The size is the measured whole; a per-source split of it can only be an estimate (the caller multiplies a count
+    by the average row size), because Postgres does not account storage per value of a column.
+
+    Args:
+        db: The request's session.
+
+    Returns:
+        BarStorage: The size, and a count per (source, feed) that holds at least one bar.
+    """
+    size = await db.execute(select(func.pg_total_relation_size(func.to_regclass(Bar.__tablename__))))
+    counts = await db.execute(
+        select(Bar.source, Bar.feed, func.count()).group_by(Bar.source, Bar.feed).order_by(Bar.source, Bar.feed)
+    )
+    return BarStorage(
+        total_bytes=int(size.scalar() or 0),
+        by_source=[(DataSource(source), Feed(feed), int(count)) for source, feed, count in counts.all()],
+    )

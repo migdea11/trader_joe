@@ -37,7 +37,12 @@ from data.store.app.dataset_catalog import (
     DatasetUsageView,
     DatasetView,
     Facets,
+    LastReadBucketsResult,
+    ReadsPerDayResult,
     RunPageResult,
+    StaleDatasetPageResult,
+    StorageCurrent,
+    UsageSummary,
     effective_end,
     is_retired,
 )
@@ -58,6 +63,11 @@ BarPageIndexMessage = data_pb2.BarPageIndex
 IngestRunPageMessage = data_pb2.IngestRunPage
 ReaperPendingPageMessage = data_pb2.ReaperPendingPage
 CoverageStripMessage = stats_pb2.CoverageStrip
+UsageSummaryMessage = stats_pb2.UsageSummary
+LastReadBucketsMessage = stats_pb2.LastReadBuckets
+ReadsPerDayMessage = stats_pb2.ReadsPerDay
+StaleDatasetPageMessage = stats_pb2.StaleDatasetPage
+StorageCurrentMessage = stats_pb2.StorageCurrent
 UiEventMessage = events_pb2.UiEvent
 UiConfigMessage = shell_pb2.UiConfig
 # The request bodies of the expiry and delete writes (tj-grna9p.86); parsed by ProtoBody, never by a pydantic model.
@@ -271,6 +281,89 @@ def facets_message(facets: Facets) -> data_pb2.DatasetFacets:
     message.statuses.extend(
         data_pb2.StatusFacet(status=_enum_value(data_pb2.FreshnessStatus, 'FRESHNESS_STATUS_', status), count=count)
         for status, count in facets.statuses.items()
+    )
+    return message
+
+
+def usage_summary_message(summary: UsageSummary) -> stats_pb2.UsageSummary:
+    """The usage page's headline figures as a UsageSummary message, with the client filter echoed."""
+    client_ids, client_kinds = _echo(summary.client_filter)
+    return stats_pb2.UsageSummary(
+        stale=summary.stale,
+        read_last_30d=summary.read_last_30d,
+        total=summary.total,
+        never_read=summary.never_read,
+        reads_today=summary.reads_today,
+        distinct_clients_today=summary.distinct_clients_today,
+        client_ids=client_ids,
+        client_kinds=client_kinds,
+        stale_days=summary.stale_days,
+    )
+
+
+def last_read_buckets_message(result: LastReadBucketsResult) -> stats_pb2.LastReadBuckets:
+    """The datasets by days since last read as a LastReadBuckets message; the open bucket has no max_days."""
+    client_ids, client_kinds = _echo(result.client_filter)
+    message = stats_pb2.LastReadBuckets(never_read=result.never_read, client_ids=client_ids, client_kinds=client_kinds)
+    for min_days, max_days, datasets in result.buckets:
+        bucket = message.buckets.add(min_days=min_days, datasets=datasets)
+        if max_days is not None:
+            bucket.max_days = max_days
+    return message
+
+
+def reads_per_day_message(result: ReadsPerDayResult) -> stats_pb2.ReadsPerDay:
+    """Reads per UTC day per client as a ReadsPerDay message, days as 'YYYY-MM-DD'."""
+    client_ids, client_kinds = _echo(result.client_filter)
+    message = stats_pb2.ReadsPerDay(client_ids=client_ids, client_kinds=client_kinds)
+    message.days.extend(
+        stats_pb2.ReadsPerDayEntry(
+            day=entry.day.isoformat(),
+            client_id=entry.client_id,
+            client_kind=_client_kind(entry.client_kind),
+            reads=entry.reads,
+        )
+        for entry in result.entries
+    )
+    return message
+
+
+def stale_dataset_page_message(result: StaleDatasetPageResult) -> stats_pb2.StaleDatasetPage:
+    """One page of stale datasets as a StaleDatasetPage message: each row with its size estimate and last reads."""
+    page = result.page
+    client_ids, client_kinds = _echo(page.client_filter)
+    message = stats_pb2.StaleDatasetPage(
+        next_cursor=page.next_cursor, client_ids=client_ids, client_kinds=client_kinds, stale_days=result.stale_days
+    )
+    for view in page.views:
+        row = message.items.add(est_bytes=result.est_bytes[view.row.id])
+        row.dataset.CopyFrom(
+            _summary(
+                view,
+                page.extents[view.row.id],
+                page.siblings[view.row.id],
+                page.as_of,
+                page.last_runs.get(view.row.id),
+                reaper_pending=view.row.id in page.reaper_pending,
+                usage=page.usage.get(view.row.id),
+                client_filter=page.client_filter,
+            )
+        )
+        for read in result.last_reads.get(view.row.id, []):
+            item = row.last_read_by_client.add(client_id=read.client_id, client_kind=_client_kind(read.client_kind))
+            item.last_read_at.CopyFrom(to_timestamp(read.last_read_at))
+    return message
+
+
+def storage_current_message(result: StorageCurrent) -> stats_pb2.StorageCurrent:
+    """The bar table's size and its estimated split by source and feed as a StorageCurrent message."""
+    message = stats_pb2.StorageCurrent(total_bytes=result.total_bytes)
+    message.as_of.CopyFrom(to_timestamp(result.as_of))
+    message.by_source.extend(
+        stats_pb2.StorageBySource(
+            source=DATA_SOURCE.to_proto(share.source), feed=FEED.to_proto(share.feed), est_bytes=share.est_bytes
+        )
+        for share in result.by_source
     )
     return message
 

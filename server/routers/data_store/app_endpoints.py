@@ -40,6 +40,16 @@ class UiDatasetsInterface(StrEnum):
     GET_UI_DATASET_COVERAGE = '/ui/v1/datasets/{dataset_id}/coverage'
 
 
+class UiStatsInterface(StrEnum):
+    """The /ui/v1 usage and storage statistics (tj-grna9p.64). Open reads; none records usage."""
+
+    GET_UI_USAGE_SUMMARY = '/ui/v1/stats/usage/summary'
+    GET_UI_USAGE_LAST_READ_BUCKETS = '/ui/v1/stats/usage/last-read-buckets'
+    GET_UI_USAGE_READS_PER_DAY = '/ui/v1/stats/usage/reads-per-day'
+    GET_UI_USAGE_STALE = '/ui/v1/stats/usage/stale'
+    GET_UI_STORAGE_CURRENT = '/ui/v1/stats/storage/current'
+
+
 class UiDatasetWritesInterface(StrEnum):
     """The /ui/v1 expiry and delete writes (tj-grna9p.86). They take the instance secret."""
 

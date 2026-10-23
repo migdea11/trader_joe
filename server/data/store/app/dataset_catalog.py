@@ -43,6 +43,7 @@ sort key. It is bound to the sort it was made under, and anything that does not 
 
 import base64
 import binascii
+import hashlib
 import json
 import uuid
 import weakref
@@ -54,13 +55,16 @@ from typing import Any, Final
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from common.enums.data_stock import DataSource, Granularity, UpdateType
+from common.enums.data_stock import DataSource, Feed, Granularity, UpdateType
 from common.errors.vocabulary import InvalidRequestError, Reason
 from common.logging import get_logger
 from data.store.app.database.crud.dataset_read import (
     ClientDatasets,
+    ClientDayReads,
     DatasetUsage,
     read_client_datasets,
+    read_client_day_reads,
+    read_client_last_reads,
     read_dataset_usage,
     read_readers,
     usage_tables_exist,
@@ -72,7 +76,13 @@ from data.store.app.database.crud.ingest_run import (
     running_dataset_ids,
 )
 from data.store.app.database.crud.stock import dataset_catalog as repo
-from data.store.app.database.crud.stock.dataset_catalog import BarExtent, BarPageOffset, CatalogFilter, CatalogRow
+from data.store.app.database.crud.stock.dataset_catalog import (
+    BarExtent,
+    BarPageOffset,
+    BarStorage,
+    CatalogFilter,
+    CatalogRow,
+)
 from data.store.app.database.models.dataset_read import ReadClientKind
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.freshness import (
@@ -648,27 +658,39 @@ def _client_args(client_filter: ClientFilter) -> dict[str, Any]:
     return {'client_kinds': client_filter.applied_kinds}
 
 
+def utc_today(now: datetime) -> date:
+    """Today's UTC calendar date at `now`; a naive `now` is refused, as the usage helpers refuse it."""
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError('now must be timezone-aware')
+    return now.astimezone(UTC).date()
+
+
+def read_within(last_read_at: datetime | None, now: datetime, days: int) -> bool:
+    """THE DAY-ALIGNED READ RULE, written once: the last read's UTC date is on or after today's UTC date minus `days`.
+
+    No read at all is within no window. The usage filters (READ_30D, STALE), the facets, the usage summary and the
+    stale list all decide through this, so their counts can never disagree about which datasets are stale.
+    """
+    if last_read_at is None:
+        return False
+    return last_read_at.astimezone(UTC).date() >= utc_today(now) - timedelta(days=days)
+
+
 def _usage_predicate(
     group: UsageFilter, usage: dict[uuid.UUID, DatasetUsage], now: datetime, stale_days: int
 ) -> Callable[[CatalogRow], bool]:
     """The membership test of one usage group, over the usage read under the client filter."""
-    today = now.astimezone(UTC).date()
-
-    def read_within(found: DatasetUsage | None, days: int) -> bool:
-        """Whether the last read's UTC date is on or after today's UTC date minus `days`."""
-        if found is None or found.last_read_at is None:
-            return False
-        return found.last_read_at.astimezone(UTC).date() >= today - timedelta(days=days)
 
     def test(row: CatalogRow) -> bool:
         found = usage.get(row.id)
+        last_read_at = None if found is None else found.last_read_at
         match group:
             case UsageFilter.NEVER_READ:
-                return found is None or found.last_read_at is None
+                return last_read_at is None
             case UsageFilter.READ_30D:
-                return read_within(found, 30)
+                return read_within(last_read_at, now, 30)
             case _:
-                return not read_within(found, stale_days)
+                return not read_within(last_read_at, now, stale_days)
 
     return test
 
@@ -1151,3 +1173,409 @@ def _bar_cursor_timestamp(cursor: str) -> datetime:
     if moment.tzinfo is None or moment.utcoffset() is None:
         raise invalid_cursor()
     return moment
+
+
+# USAGE STATISTICS (tj-grna9p.64). Each read below runs a constant number of statements and records no usage.
+# Every one of them decides staleness through read_within, the one day-aligned rule the list's usage filter and
+# the facets use, so the summary, the stale list and the Stale facet agree for the same filter.
+
+# The first day of each last-read bucket, in whole UTC days since the last read (0 = today); the last is open.
+LAST_READ_BUCKET_STARTS: Final = (0, 1, 8, 31, 91)
+DEFAULT_READS_PER_DAY_DAYS: Final = 30
+MAX_READS_PER_DAY_DAYS: Final = 365
+
+
+@dataclass(frozen=True)
+class UsageSummary:
+    """The usage page's headline figures under a client filter.
+
+    Attributes:
+        stale: Datasets not read within stale_days by the selected clients, never-read included.
+        read_last_30d: Datasets read within 30 days; the Facets.read_30d figure.
+        total: Datasets matching the source.
+        never_read: Datasets the selected clients never read.
+        reads_today: Reads on today's UTC date by the selected clients.
+        distinct_clients_today: Distinct client ids among them. Labels, counted only.
+        client_filter: The client filter applied.
+        stale_days: The threshold used.
+    """
+
+    stale: int
+    read_last_30d: int
+    total: int
+    never_read: int
+    reads_today: int
+    distinct_clients_today: int
+    client_filter: ClientFilter
+    stale_days: int
+
+
+@dataclass(frozen=True)
+class LastReadBucketsResult:
+    """Datasets by whole UTC days since their last read.
+
+    Attributes:
+        buckets: (min_days, max_days, datasets) per bucket, ascending, half-open [min, max); max is None for the
+            open last bucket.
+        never_read: Datasets never read by the selected clients. buckets plus never_read sum to the total.
+        client_filter: The client filter applied.
+    """
+
+    buckets: list[tuple[int, int | None, int]]
+    never_read: int
+    client_filter: ClientFilter
+
+
+@dataclass(frozen=True)
+class ReadsPerDayResult:
+    """Reads per UTC day per client.
+
+    Attributes:
+        entries: One per (day, client id, kind) with a read, ascending by day then client id.
+        client_filter: The client filter applied.
+    """
+
+    entries: list[ClientDayReads]
+    client_filter: ClientFilter
+
+
+@dataclass(frozen=True)
+class ClientLastReadView:
+    """When one client last read a dataset. client_id is repr=False."""
+
+    client_id: str = field(repr=False)
+    client_kind: ReadClientKind
+    last_read_at: datetime
+
+
+@dataclass(frozen=True)
+class StaleDatasetPageResult:
+    """One page of stale datasets.
+
+    Attributes:
+        page: The datasets, with the usage under the client filter, as the catalog list carries them; its
+            next_cursor is the stale list's own.
+        est_bytes: The estimated stored size of each dataset: its bar count times the average row size.
+        last_reads: The last read of each dataset by every client that ever read it, whatever the filter.
+        stale_days: The threshold used.
+    """
+
+    page: DatasetPage
+    est_bytes: dict[uuid.UUID, int]
+    last_reads: dict[uuid.UUID, list[ClientLastReadView]]
+    stale_days: int
+
+
+@dataclass(frozen=True)
+class StorageShare:
+    """The estimated storage of one (source, feed).
+
+    Attributes:
+        source: The vendor.
+        feed: The tape.
+        bar_count: The bars held.
+        est_bytes: bar_count times the average row size; an estimate.
+    """
+
+    source: DataSource
+    feed: Feed
+    bar_count: int
+    est_bytes: int
+
+
+@dataclass(frozen=True)
+class StorageCurrent:
+    """What the bar table holds now. The split is an ESTIMATE; the total is measured unless a source was asked for.
+
+    Attributes:
+        total_bytes: pg_total_relation_size of the bar table; with a source filter, the sum of that source's
+            estimates, so the split always sums to the total (within rounding).
+        by_source: One share per (source, feed) holding bars.
+        as_of: The instant it was read at.
+    """
+
+    total_bytes: int
+    by_source: list[StorageShare]
+    as_of: datetime
+
+
+def estimate_bytes(bar_count: int, total_bytes: int, total_bars: int) -> int:
+    """A bar count's share of the table's bytes: bar_count times the average row size (total_bytes / total_bars).
+
+    Computed as bar_count * total_bytes // total_bars, so a split's parts add up to the total within one byte per
+    part. 0 when the table holds no bars. An estimate: every bar is assumed as large as the average.
+    """
+    if total_bars <= 0:
+        return 0
+    return bar_count * total_bytes // total_bars
+
+
+async def _read_day_reads(
+    db: AsyncSession, dataset_ids: list[uuid.UUID] | None, client_filter: ClientFilter, now: datetime, days: int
+) -> list[ClientDayReads]:
+    if (dataset_ids is not None and not dataset_ids) or not await _usage_ready(db):
+        return []
+    return await read_client_day_reads(db, dataset_ids, now=now, days=days, **_client_args(client_filter))
+
+
+def _last_read(usage: dict[uuid.UUID, DatasetUsage], dataset_id: uuid.UUID) -> datetime | None:
+    found = usage.get(dataset_id)
+    return None if found is None else found.last_read_at
+
+
+async def usage_summary(
+    db: AsyncSession,
+    now: datetime,
+    *,
+    client_filter: ClientFilter,
+    stale_days: int = DEFAULT_STALE_DAYS,
+    source: DataSource | None = None,
+) -> UsageSummary:
+    """The usage page's headline figures: a constant number of statements, whatever the store holds.
+
+    Args:
+        db: The request's session.
+        now: The instant the figures are judged at; aware, else ValueError.
+        client_filter: Whose reads count.
+        stale_days: The staleness threshold, 1..MAX_STALE_DAYS.
+        source: Count only this source's datasets (and the reads of them), or None for every dataset.
+
+    Returns:
+        UsageSummary: Everything never read, and no reads today, on an unmigrated database.
+    """
+    utc_today(now)
+    rows = await repo.list_catalog(db, CatalogFilter(source=source))
+    usage = await _read_usage(db, None, client_filter, now)
+    last_reads = [_last_read(usage, row.id) for row in rows]
+    reads_today = await _read_day_reads(
+        db, None if source is None else [row.id for row in rows], client_filter, now, days=1
+    )
+    return UsageSummary(
+        stale=sum(not read_within(last, now, stale_days) for last in last_reads),
+        read_last_30d=sum(read_within(last, now, 30) for last in last_reads),
+        total=len(rows),
+        never_read=sum(last is None for last in last_reads),
+        reads_today=sum(entry.reads for entry in reads_today),
+        distinct_clients_today=len({entry.client_id for entry in reads_today}),
+        client_filter=client_filter,
+        stale_days=stale_days,
+    )
+
+
+async def last_read_buckets(
+    db: AsyncSession, now: datetime, *, client_filter: ClientFilter, source: DataSource | None = None
+) -> LastReadBucketsResult:
+    """Datasets by whole UTC days since the last read, in [0,1), [1,8), [8,31), [31,91) and [91, open), plus never.
+
+    The days run from the UTC date of the last read to today's UTC date, so 0 is today, as reads_today and the
+    reads per day are. The buckets and never_read sum to the number of datasets.
+
+    Args:
+        db: The request's session.
+        now: The instant the buckets are judged at; aware, else ValueError.
+        client_filter: Whose reads count.
+        source: Count only this source's datasets, or None for every dataset.
+
+    Returns:
+        LastReadBucketsResult: Every bucket present, with a zero where nothing falls in it.
+    """
+    today = utc_today(now)
+    rows = await repo.list_catalog(db, CatalogFilter(source=source))
+    usage = await _read_usage(db, None, client_filter, now)
+    counts = [0] * len(LAST_READ_BUCKET_STARTS)
+    never_read = 0
+    for row in rows:
+        last = _last_read(usage, row.id)
+        if last is None:
+            never_read += 1
+            continue
+        # A read dated after today (a skewed clock) is today's: it must land in a bucket.
+        days = max(0, (today - last.astimezone(UTC).date()).days)
+        position = max(index for index, start in enumerate(LAST_READ_BUCKET_STARTS) if days >= start)
+        counts[position] += 1
+    ends: list[int | None] = [*LAST_READ_BUCKET_STARTS[1:], None]
+    return LastReadBucketsResult(
+        buckets=list(zip(LAST_READ_BUCKET_STARTS, ends, counts, strict=True)),
+        never_read=never_read,
+        client_filter=client_filter,
+    )
+
+
+async def reads_per_day(
+    db: AsyncSession,
+    now: datetime,
+    *,
+    client_filter: ClientFilter,
+    days: int = DEFAULT_READS_PER_DAY_DAYS,
+    dataset_id: uuid.UUID | None = None,
+    source: DataSource | None = None,
+) -> ReadsPerDayResult:
+    """Reads per UTC day per client over the last `days` days, today included, across the 90-day rollup.
+
+    One entry per (day, client id, kind) with a read. The per-read rows and the daily summaries are summed in one
+    statement, so a day split across the rollup boundary is one entry. With neither dataset_id nor source it counts
+    every read, those of deleted datasets too, which is also what the summary's reads_today counts.
+
+    Args:
+        db: The request's session.
+        now: The instant the window ends at; aware, else ValueError.
+        client_filter: Whose reads count.
+        days: The window, 1..MAX_READS_PER_DAY_DAYS.
+        dataset_id: Count only this dataset (Dataset detail), or None.
+        source: Count only this source's datasets, or None. With a dataset_id of another source the answer is empty.
+
+    Returns:
+        ReadsPerDayResult: Empty on an unmigrated database.
+    """
+    utc_today(now)
+    dataset_ids: list[uuid.UUID] | None = None
+    if source is not None:
+        rows = await repo.list_catalog(db, CatalogFilter(source=source))
+        dataset_ids = [row.id for row in rows if dataset_id is None or row.id == dataset_id]
+    elif dataset_id is not None:
+        dataset_ids = [dataset_id]
+    entries = await _read_day_reads(db, dataset_ids, client_filter, now, days=days)
+    return ReadsPerDayResult(entries=entries, client_filter=client_filter)
+
+
+def _stale_fingerprint(client_filter: ClientFilter, stale_days: int, source: DataSource | None) -> str:
+    """What a stale cursor is bound to, as a digest so the cursor does not carry the client ids it was made under."""
+    material = json.dumps(
+        [
+            stale_days,
+            None if source is None else source.name,
+            sorted(client_filter.applied_ids),
+            [kind.value for kind in client_filter.applied_kinds],
+        ],
+        separators=(',', ':'),
+    )
+    return hashlib.sha256(material.encode()).hexdigest()[:16]
+
+
+def _stale_key(row: CatalogRow, usage: dict[uuid.UUID, DatasetUsage]) -> tuple[int, int, str]:
+    """Never-read first (0), then the oldest last read, then the id."""
+    last = _last_read(usage, row.id)
+    if last is None:
+        return (0, 0, str(row.id))
+    return (1, _micros(last), str(row.id))
+
+
+def _stale_key_from_cursor(cursor: str, fingerprint: str) -> tuple[Any, ...]:
+    payload = _decode_cursor(cursor)
+    key = payload.get('k')
+    if payload.get('o') != 'stale' or payload.get('f') != fingerprint or not isinstance(key, list) or len(key) != 3:
+        raise invalid_cursor()
+    shape: tuple[type, ...] = (int, int, str)
+    if any(isinstance(part, bool) or not isinstance(part, kind) for part, kind in zip(key, shape, strict=True)):
+        raise invalid_cursor()
+    try:
+        uuid.UUID(key[-1])
+    except ValueError:
+        raise invalid_cursor() from None
+    return tuple(key)
+
+
+async def stale_page(
+    db: AsyncSession,
+    now: datetime,
+    *,
+    client_filter: ClientFilter,
+    stale_days: int = DEFAULT_STALE_DAYS,
+    source: DataSource | None = None,
+    cursor: str | None = None,
+    limit: int = DEFAULT_PAGE_LIMIT,
+    config: FreshnessConfig | None = None,
+) -> StaleDatasetPageResult:
+    """One page of the stale group under the client filter, never-read first, then by last read, then id.
+
+    The group is the STALE usage filter's: the Stale facet's count equals the total of this list. Keyset paged with
+    an opaque cursor bound to stale_days, the source and the client filter (one made under another is a 422).
+    A constant number of statements: the entries, the usage of all of them, then for the page its freshness,
+    extents, siblings, runs, reaper flag, readers, last read per client and the table's storage. Records no usage.
+
+    Args:
+        db: The request's session.
+        now: The instant staleness and freshness are judged at; aware, else ValueError.
+        client_filter: Whose reads count toward the usage under dataset.usage.
+        stale_days: The staleness threshold, 1..MAX_STALE_DAYS.
+        source: Only this source's datasets, or None.
+        cursor: The next_cursor of the previous page, or None for the first.
+        limit: The page size.
+        config: The freshness settings; the environment's when omitted.
+
+    Returns:
+        StaleDatasetPageResult: The page; next_cursor is empty on the last.
+
+    Raises:
+        InvalidRequestError: If the cursor does not decode or was made under another filter (422).
+    """
+    utc_today(now)
+    fingerprint = _stale_fingerprint(client_filter, stale_days, source)
+    after = None if cursor is None else _stale_key_from_cursor(cursor, fingerprint)
+    rows = await repo.list_catalog(db, CatalogFilter(source=source))
+    usage = await _read_usage(db, None, client_filter, now)
+    keep = _usage_predicate(UsageFilter.STALE, usage, now, stale_days)
+    keyed = sorted(((_stale_key(row, usage), row) for row in rows if keep(row)), key=lambda item: item[0])
+    if after is not None:
+        keyed = [item for item in keyed if item[0] > after]
+    window = keyed[: limit + 1]
+    has_more = len(window) > limit
+    page_rows = [row for _, row in window[:limit]]
+    page_ids = [row.id for row in page_rows]
+
+    storage = await repo.read_bar_storage(db) if page_rows else BarStorage(total_bytes=0, by_source=[])
+    extents = await repo.bar_extents(db, page_rows)
+    total_bars = sum(count for _, _, count in storage.by_source)
+    last_reads: dict[uuid.UUID, list[ClientLastReadView]] = {dataset_id: [] for dataset_id in page_ids}
+    if page_ids and await _usage_ready(db):
+        for item in await read_client_last_reads(db, page_ids):
+            last_reads[item.dataset_id].append(ClientLastReadView(item.client_id, item.client_kind, item.last_read_at))
+    page = DatasetPage(
+        views=await evaluate_views(db, page_rows, now, config),
+        extents=extents,
+        siblings=await repo.siblings(db, page_rows),
+        next_cursor=(
+            _encode_cursor({'o': 'stale', 'k': list(window[limit - 1][0]), 'f': fingerprint}) if has_more else ''
+        ),
+        as_of=now,
+        usage=await _page_usage(db, page_ids, usage, client_filter, now),
+        reaper_pending=await repo.pending_ids(db, now, page_ids),
+        client_filter=client_filter,
+        last_runs=await latest_runs_for_datasets(db, page_ids),
+    )
+    return StaleDatasetPageResult(
+        page=page,
+        est_bytes={row.id: estimate_bytes(extents[row.id].count, storage.total_bytes, total_bars) for row in page_rows},
+        last_reads=last_reads,
+        stale_days=stale_days,
+    )
+
+
+async def storage_current(db: AsyncSession, now: datetime, *, source: DataSource | None = None) -> StorageCurrent:
+    """The bar table's size now, split by (source, feed) as ESTIMATES. Two statements. No history.
+
+    The average row size is the table's measured total over its bar count; a share is its bar count times that.
+    With `source` the split is that source's only and total_bytes is the sum of its shares, so the split always
+    sums to the total.
+
+    Args:
+        db: The request's session.
+        now: The instant it was read at; aware, else ValueError.
+        source: Only this source, or None for the whole table.
+
+    Returns:
+        StorageCurrent: Zero bytes and no shares for an empty table.
+    """
+    utc_today(now)
+    storage = await repo.read_bar_storage(db)
+    total_bars = sum(count for _, _, count in storage.by_source)
+    shares = [
+        StorageShare(held_source, feed, count, estimate_bytes(count, storage.total_bytes, total_bars))
+        for held_source, feed, count in storage.by_source
+        if source is None or held_source is source
+    ]
+    return StorageCurrent(
+        total_bytes=storage.total_bytes if source is None else sum(share.est_bytes for share in shares),
+        by_source=shares,
+        as_of=now,
+    )
