@@ -1330,10 +1330,13 @@ jobs:
           for route in \
               "POST /store/stock/market-activity/LIFECYCLE" \
               "DELETE /store/00000000-0000-0000-0000-000000000000?owner=ci-secret-lifecycle" \
-              "POST /internal/asset-data/stock/market-activity"; do
+              "POST /internal/asset-data/stock/market-activity" \
+              "PATCH /ui/v1/datasets/00000000-0000-0000-0000-000000000000/expiry" \
+              "PATCH /ui/v1/datasets/00000000-0000-0000-0000-000000000000/collecting" \
+              "DELETE /ui/v1/datasets/00000000-0000-0000-0000-000000000000"; do
             method="${route%% *}"; path="${route#* }"
             data=()
-            if [ "${method}" = "POST" ]; then data=(--data '{}'); fi
+            if [ "${method}" = "POST" ] || [ "${method}" = "PATCH" ]; then data=(--data '{}'); fi
             probe "${method}" "${path}" "no header" "${data[@]}"
             probe "${method}" "${path}" "empty header" -H 'X-Instance-Secret;' "${data[@]}"
             probe "${method}" "${path}" "arbitrary header" -H "X-Instance-Secret: ${arbitrary}" "${data[@]}"

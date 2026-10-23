@@ -306,21 +306,24 @@ errors-doc: $(VENV_MARKER)  ## Regenerate docs/errors.md from server/common/erro
 # agent stack never loads either file, and the base file never gains the service. The overlay's
 # INSTANCE_WRITE_SECRET carries a ":?" guard like POSTGRES_PASS, so every command through PROD_COMPOSE
 # needs it in the root .env or the shell; prod-down passes a placeholder the way dev-down does for
-# pgAdmin, for the same reason. DEV_COMPOSE and TOOLS_COMPOSE do not need it (tj-grna9p.104): compose
-# interpolates every file before merging, so the guard fires on the prod web file even though the dev
-# overlay blanks the value afterwards, and a DEV .env that leaves the secret empty (its shipped state)
-# would fail dev-build, dev-deps, dev-tools and dev-launch before anything started. DEV_COMPOSE
-# therefore carries a placeholder that is only a fallback: the shell-default form keeps a value the
-# shell already holds. The placeholder reaches nothing but interpolation -- the dev web service blanks
-# the variable and a browser must never hold it, and data_store reads the real secret from its
-# env_file, which compose does not take from the shell. A value that lives only in the root .env is
-# not visible to the shell, so the placeholder outranks it in interpolation, which changes nothing a
-# container receives. PROD_COMPOSE never carries a placeholder: the prod proxy injects the real secret.
+# pgAdmin, for the same reason. DEV_COMPOSE and TOOLS_COMPOSE are not required to have it set
+# (tj-grna9p.104, .133): compose interpolates every file before merging, so the guard fires on the
+# prod web file, and a DEV .env that leaves the secret empty (its shipped state) would otherwise fail
+# dev-build, dev-deps, dev-tools and dev-launch before anything started. DEV_COMPOSE therefore sets
+# INSTANCE_WRITE_SECRET itself, from tools/dev_instance_secret.sh, in the recipe's shell: the shell's
+# value if non-empty, else the last INSTANCE_WRITE_SECRET= line of the root .env, else the placeholder
+# "unused". A shell value outranks the root .env in compose interpolation, so a bare shell default
+# would hide a configured .env value, the dev web container would get "unused" and data_store (which
+# reads the real secret from its env_file) would refuse every dev write; reading .env here is what
+# makes dev writes work. With the shipped empty .env the placeholder reaches the dev web container:
+# reads work and writes are refused, which is the safe default. The command substitution is expanded
+# by the recipe's shell, never by make, so `make -n` and make's echoed commands show the call and
+# never the value. PROD_COMPOSE never carries a placeholder: the prod proxy injects the real secret.
 PROD_COMPOSE := docker compose -f docker-compose.yaml -f docker-compose.web.yaml
 # Dev gains devnet through the override, which attaches every stack service to it (tj-q9ae5u
 # addendum 1). PROD_COMPOSE never loads the override, so a prod launch never attaches devnet --
 # which is also what keeps a dev session off a prod stack on the same machine.
-DEV_COMPOSE := INSTANCE_WRITE_SECRET="$${INSTANCE_WRITE_SECRET:-unused}" docker compose -f docker-compose.yaml -f docker-compose.override.yaml -f docker-compose.web.yaml -f docker-compose.web.dev.yaml
+DEV_COMPOSE := INSTANCE_WRITE_SECRET="$$(sh tools/dev_instance_secret.sh)" docker compose -f docker-compose.yaml -f docker-compose.override.yaml -f docker-compose.web.yaml -f docker-compose.web.dev.yaml
 TOOLS_COMPOSE := $(DEV_COMPOSE) -f docker-compose.tools.yaml
 # THE AGENT STACK (ADR tj-4rr0la section 1 and addendum 1). The isolated stack the agent-stack MCP
 # drives from an agent's worktree, under its own compose project so it never shares a container,
@@ -564,7 +567,7 @@ dev-launch: dev-deps  ## Start the development services in the foreground, with 
 # stack never requires pgAdmin credentials. They are safe here and ONLY here: `down` creates no
 # container, so no pgAdmin account can ever be initialised from them. Shell variables outrank
 # .env in compose interpolation, which is why they must never be copied onto an `up`. The
-# INSTANCE_WRITE_SECRET placeholder comes from DEV_COMPOSE (tj-grna9p.104), where it is a fallback.
+# INSTANCE_WRITE_SECRET comes from DEV_COMPOSE (tj-grna9p.104, .133), resolved from the shell or .env.
 .PHONY: dev-down
 dev-down:  ## Stop the development stack, pgAdmin included
 	PGADMIN_EMAIL=unused PGADMIN_PASS=unused $(TOOLS_COMPOSE) down --remove-orphans

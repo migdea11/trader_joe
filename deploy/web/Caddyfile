@@ -8,9 +8,12 @@
 # Vite dev proxy in web/vite.config.ts does with its rewrite.
 # Only /api/store/ui/v1/* is forwarded: data_store's other routes (/store/* dataset reads and writes,
 # /internal/*, /docs, /ping, /latency) are not the UI's and stay unreachable from a browser, so the
-# secret below is never offered to them. Only GET and HEAD pass: no UI route writes in PR 4, and the
-# secret authenticates writes, so a browser on this network cannot use the proxy as a write path.
-# When the UI grows a write, widen exactly that one route and method here and nowhere else.
+# secret below is never offered to them. Only GET and HEAD pass, plus exactly three UI writes: PATCH
+# /api/store/ui/v1/datasets/<uuid>/expiry, PATCH /api/store/ui/v1/datasets/<uuid>/collecting and DELETE
+# /api/store/ui/v1/datasets/<uuid>. The secret authenticates writes, so each is matched by an anchored
+# regex on one method and one path shape; no other method (PUT, POST, ...) and no other path can use
+# the proxy as a write path.
+# When the UI grows another write, widen exactly that one route and method here and nowhere else.
 #
 # NOTHING FOR data_ingest. There is no data_ingest upstream in this file and the web container is not
 # on a network data_ingest shares (docker-compose.web.yaml joins store_api only), so a route to it
@@ -66,18 +69,84 @@
 		respond "ok" 200
 	}
 
-	# A traversal attempt never reaches the upstream, whatever the route.
+	# This rule is NOT what refuses traversal under /api: Caddy orders the routes (the four proxied rules,
+	# /healthz, /api/*, then this one, then the SPA), so it answers 400 only for a path off /api (/x..y).
+	# Under /api a dot-segment traversal (../, %2e%2e/, ..%2f, %2E%2E) is refused by Caddy's own matching on
+	# the decoded, cleaned path: the cleaned path leaves /api/store/ui/v1/ and is never forwarded. It lands
+	# on the /api/* 404 while it stays under /api, and on the SPA (index.html) once it climbs off /api; this
+	# 400 fires only if the cleaned path still holds a literal '..' (/x..y, /api/../a..b). A literal '..'
+	# inside one segment (a..b) under /api/store/ui/v1/ is not a traversal and IS forwarded, as are %252e,
+	# %5c and %2f spellings that stay under /ui/v1; data_store answers those 404 or the same route. The three
+	# write rules' anchored regexes see the decoded path, so a write reaches only the three UI write routes
+	# whatever its spelling. Caddy 2.11.7 was run with the expiry and delete rules only (tj-grna9p.94):
+	# both forwarded their own shape and refused it spelled with %2e%2e, and the decoded match was seen on
+	# the expiry rule, which matched and forwarded PATCH <uuid>%2fexpiry. The collecting rule is a
+	# line-for-line twin of the expiry rule and was not itself run through Caddy.
+	# The dev proxy (web/vite.config.ts) is deliberately stricter and answers 400 to all of these.
 	@traversal path *..*
 	handle @traversal {
 		respond "bad request" 400
 	}
 
-	# THE ONE PROXIED ROUTE. See the header for the mapping and the method restriction.
+	# THE PROXIED ROUTES: the read rule, then the three write rules below it, each with the same forwarding
+	# block. See the header for the mapping and the method restriction.
 	@store_ui {
 		method GET HEAD
 		path /api/store/ui/v1/*
 	}
 	handle @store_ui {
+		uri strip_prefix /api/store
+		reverse_proxy {$DATA_STORE_UPSTREAM} {
+			header_up X-Instance-Secret "{$INSTANCE_WRITE_SECRET}"
+			# A response from the upstream is never cached by the browser or a shared cache: the
+			# data is live.
+			header_down Cache-Control "no-store"
+		}
+	}
+
+	# UI write: set or clear a dataset's expiry. PATCH only, one UUID, nothing after /expiry.
+	# The plain path line beside the regex is for ordering: Caddy ranks a route with a path matcher
+	# by path length and a regex-only one equal to 'handle /api/*', which would leave the winner to
+	# file position. With it this rule outranks the 404 below by specificity; it also stays above it.
+	@store_ui_expiry {
+		method PATCH
+		path /api/store/ui/v1/datasets/*
+		path_regexp ^/api/store/ui/v1/datasets/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/expiry$
+	}
+	handle @store_ui_expiry {
+		uri strip_prefix /api/store
+		reverse_proxy {$DATA_STORE_UPSTREAM} {
+			header_up X-Instance-Secret "{$INSTANCE_WRITE_SECRET}"
+			# A response from the upstream is never cached by the browser or a shared cache: the
+			# data is live.
+			header_down Cache-Control "no-store"
+		}
+	}
+
+	# UI write: set a dataset's collect intent (Stop or Start). The twin of the expiry rule above:
+	# the same method, matchers and forwarding block, ending /collecting instead of /expiry.
+	@store_ui_collecting {
+		method PATCH
+		path /api/store/ui/v1/datasets/*
+		path_regexp ^/api/store/ui/v1/datasets/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/collecting$
+	}
+	handle @store_ui_collecting {
+		uri strip_prefix /api/store
+		reverse_proxy {$DATA_STORE_UPSTREAM} {
+			header_up X-Instance-Secret "{$INSTANCE_WRITE_SECRET}"
+			# A response from the upstream is never cached by the browser or a shared cache: the
+			# data is live.
+			header_down Cache-Control "no-store"
+		}
+	}
+
+	# UI write: delete a dataset. DELETE only, one UUID, no trailing slash or sub-path.
+	@store_ui_delete {
+		method DELETE
+		path /api/store/ui/v1/datasets/*
+		path_regexp ^/api/store/ui/v1/datasets/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$
+	}
+	handle @store_ui_delete {
 		uri strip_prefix /api/store
 		reverse_proxy {$DATA_STORE_UPSTREAM} {
 			header_up X-Instance-Secret "{$INSTANCE_WRITE_SECRET}"

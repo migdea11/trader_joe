@@ -3389,7 +3389,12 @@ TEARDOWN_CONDITIONS = frozenset({'failure()', 'always()'})
 # this module never spells a path that holds real credentials.
 STAGED_ENV_FILE = ENV_DEFAULT_FILE.stem
 # The write routes the lifecycle step must refuse with the secret blank, and how it probes each.
-LIFECYCLE_ROUTE_COUNT = 3
+# Six since tj-grna9p.184: the /store POST and DELETE, the /internal/asset-data POST, and the
+# /ui/v1 expiry PATCH, collecting PATCH and dataset DELETE. WHICH six is
+# test_every_secret_guarded_route_is_proven_to_refuse's job, derived from the app; this count only
+# pins the loop's length, so it must move with that set.
+LIFECYCLE_ROUTE_COUNT = 6
+LIFECYCLE_ROUTE_METHODS = frozenset({'POST', 'PATCH', 'DELETE'})
 LIFECYCLE_HEADER_VARIANTS = 4
 # docker compose global options that take a value, so the subcommand can be told from a value.
 _COMPOSE_VALUE_OPTIONS = frozenset(
@@ -4176,7 +4181,7 @@ def test_instance_secret_lifecycle_scans_logs_then_proves_a_blank_secret_refuses
     assert len(loops) == 1, f'{LIFECYCLE_STEP} must probe from one route loop, found {loops}'
     routes = loops[0][3:]
     assert len(routes) == LIFECYCLE_ROUTE_COUNT, f'expected {LIFECYCLE_ROUTE_COUNT} write routes, probed {routes}'
-    assert {route.split()[0] for route in routes} == {'POST', 'DELETE'}, routes
+    assert {route.split()[0] for route in routes} == LIFECYCLE_ROUTE_METHODS, routes
     probes = [line for line in lines if line.startswith('probe ')]
     assert len(probes) == LIFECYCLE_HEADER_VARIANTS, f'expected one probe per header variant, found {probes}'
     assert any('!= "401"' in line for line in lines), f'{LIFECYCLE_STEP} never requires HTTP 401'

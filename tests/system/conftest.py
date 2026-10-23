@@ -707,8 +707,13 @@ class DataStoreHttp:
     def post(self, path: str, *, json: Any, auth: WriteAuth) -> httpx.Response:
         return self.request('POST', path, json=json, auth=auth)
 
-    def delete(self, path: str, *, params: dict[str, Any] | None = None, auth: WriteAuth) -> httpx.Response:
-        return self.request('DELETE', path, params=params, auth=auth)
+    def patch(self, path: str, *, json: Any, auth: WriteAuth) -> httpx.Response:
+        return self.request('PATCH', path, json=json, auth=auth)
+
+    def delete(
+        self, path: str, *, params: dict[str, Any] | None = None, json: Any = None, auth: WriteAuth
+    ) -> httpx.Response:
+        return self.request('DELETE', path, params=params, json=json, auth=auth)
 
     def leaks_secret(self, text: str) -> bool:
         """Whether `text` contains the deployment's secret. Assert on the returned bool, never on this call."""

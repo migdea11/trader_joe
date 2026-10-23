@@ -3,9 +3,11 @@
 Bead tj-grna9p.26; decisions tj-grna9p.5, .6 and .7 as ruled. The ruled shape, each line of which is a
 silent failure if lost:
 
-* THE PROXY (tj-grna9p.5 addendum, .26 phase-1 note). One reverse_proxy, to data_store only, for the
-  UI's read routes: /api/store/ui/v1/*, GET and HEAD, the /api/store prefix stripped. Nothing reaches
-  data_ingest. Every other /api path is a 404 answered by Caddy, never the SPA's index.html.
+* THE PROXY (tj-grna9p.5 addendum, .26 phase-1 note, .133, .184). Four forwarding rules, to data_store
+  only, each stripping the /api/store prefix: the UI's read routes, /api/store/ui/v1/*, GET and HEAD;
+  and exactly three UI writes, PATCH .../datasets/<uuid>/expiry, PATCH .../datasets/<uuid>/collecting
+  (the expiry rule's twin, tj-grna9p.184) and DELETE .../datasets/<uuid>, each an anchored regex. No PUT or POST anywhere. Nothing reaches data_ingest. Every other /api path is a 404
+  answered by Caddy, never the SPA's index.html.
 * THE SECRET (tj-grna9p.6). The proxy sets X-Instance-Secret from the container environment; the
   browser never holds it, so the Caddyfile carries a placeholder and never a value, and the access log
   drops the header.
@@ -27,8 +29,10 @@ silent failure if lost:
 
 Not provable here, and NOT RUN: the image build, `docker compose config` and a container smoke test
 (the agent container has no Docker), and Caddy's own parse of the file (no caddy binary here; the
-builder validated it with caddy 2.11.7 outside the repository). In particular the ORDER in which Caddy
-evaluates the `handle` blocks is Caddy's, not this file's, and is not pinned here.
+builder validated it with caddy 2.11.7 outside the repository; the two write rules of tj-grna9p.133
+and the collecting rule of tj-grna9p.184 have had no Caddy parse at all, tj-mx97hu). The ORDER in which Caddy evaluates the `handle` blocks is Caddy's; the
+one part of it that rests on this file's order (the write rules before the /api/* 404) is pinned, and
+which request is forwarded is evaluated from the file's own matchers, not by a running Caddy.
 """
 
 import json
@@ -36,6 +40,7 @@ import os
 import posixpath
 import re
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -70,6 +75,7 @@ ENV_DEFAULT = REPO_ROOT / '.env.default'
 STORE_UI_PATH = '/api/store/ui/v1/*'
 SECRET_HEADER = 'X-Instance-Secret'
 SECRET_PLACEHOLDER = '{$INSTANCE_WRITE_SECRET}'
+SECRET = 'INSTANCE_WRITE_SECRET'
 UPSTREAM_PLACEHOLDER = '{$DATA_STORE_UPSTREAM}'
 
 
@@ -129,17 +135,25 @@ def site(caddy: Block) -> Block:
     return sites[0]
 
 
-def _the_proxy(site: Block) -> tuple[Block, Block]:
-    """(the handle block holding the reverse_proxy, the reverse_proxy block)."""
-    found = [
+def _the_proxies(site: Block) -> list[tuple[Block, Block]]:
+    """Every (handle block holding a reverse_proxy, that reverse_proxy block), in file order."""
+    return [
         (handle, proxy)
         for handle in site.children
         if handle.words[:1] == ['handle']
         for proxy in handle.walk()
         if proxy.words[:1] == ['reverse_proxy']
     ]
-    assert len(found) == 1, f'expected the one reverse_proxy inside a handle, found {len(found)}'
-    return found[0]
+
+
+def _matcher_conditions(site: Block, handle: Block) -> list[list[str]]:
+    """The sorted conditions of the one named matcher a handle is guarded by."""
+    assert len(handle.words) == 2 and handle.words[1].startswith('@'), (
+        f'a proxy handle is matched by {handle.words[1:]}, not one named matcher'
+    )
+    matchers = site.named(handle.words[1])
+    assert len(matchers) == 1, f'{handle.words[1]} is defined {len(matchers)} times'
+    return sorted(child.words for child in matchers[0].children)
 
 
 def test_the_parse_reads_the_whole_file(caddy: Block):
@@ -150,35 +164,369 @@ def test_the_parse_reads_the_whole_file(caddy: Block):
     assert nodes == len(lines) - closes, (nodes, len(lines), closes)
 
 
-def test_there_is_exactly_one_reverse_proxy_and_its_upstream_is_data_store_from_the_environment(caddy: Block):
+# THE FOUR FORWARDING RULES (tj-grna9p.133 and .184, on tj-grna9p.6). The UI's reads, GET and HEAD on
+# /api/store/ui/v1/*, unchanged; and exactly three writes, each one method on one anchored regex: PATCH
+# .../datasets/<uuid>/expiry, PATCH .../datasets/<uuid>/collecting and DELETE .../datasets/<uuid>. The
+# regexes are compiled by Caddy with Go's RE2 against the cleaned, decoded path (caddyhttp MatchPathRE);
+# no placeholder is expanded in them.
+UUID_CLASS = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+EXPIRY_REGEX = f'^/api/store/ui/v1/datasets/{UUID_CLASS}/expiry$'
+COLLECTING_REGEX = f'^/api/store/ui/v1/datasets/{UUID_CLASS}/collecting$'
+DELETE_REGEX = f'^/api/store/ui/v1/datasets/{UUID_CLASS}$'
+# Each write matcher also carries a plain `path` (round 2, architect ruling on this bead): it gives the
+# rule a path length, so Caddy ranks it above `handle /api/*` by specificity and not by file position.
+# ANDed with the regex, it widens nothing.
+WRITE_ORDER_PATH = '/api/store/ui/v1/datasets/*'
+PROXY_RULES = {
+    '@store_ui': [['method', 'GET', 'HEAD'], ['path', STORE_UI_PATH]],
+    '@store_ui_expiry': [['method', 'PATCH'], ['path', WRITE_ORDER_PATH], ['path_regexp', EXPIRY_REGEX]],
+    '@store_ui_collecting': [['method', 'PATCH'], ['path', WRITE_ORDER_PATH], ['path_regexp', COLLECTING_REGEX]],
+    '@store_ui_delete': [['method', 'DELETE'], ['path', WRITE_ORDER_PATH], ['path_regexp', DELETE_REGEX]],
+}
+# The read rule as it stood before the writes were added (1e681eb), comment lines aside: byte for byte.
+READ_RULE_TEXT = """\
+@store_ui {
+method GET HEAD
+path /api/store/ui/v1/*
+}
+handle @store_ui {
+uri strip_prefix /api/store
+reverse_proxy {$DATA_STORE_UPSTREAM} {
+header_up X-Instance-Secret "{$INSTANCE_WRITE_SECRET}"
+header_down Cache-Control "no-store"
+}
+}"""
+
+
+def test_there_are_exactly_four_reverse_proxies_and_each_upstream_is_data_store_from_the_environment(caddy: Block):
     """The only upstream is DATA_STORE_UPSTREAM, which the overlay sets to data_store on store_api."""
     proxies = [block for block in caddy.walk() if block.words[:1] == ['reverse_proxy']]
-    assert len(proxies) == 1, [block.words for block in proxies]
-    assert proxies[0].words == ['reverse_proxy', UPSTREAM_PLACEHOLDER], proxies[0].words
+    assert [block.words for block in proxies] == [['reverse_proxy', UPSTREAM_PLACEHOLDER]] * 4, [
+        block.words for block in proxies
+    ]
 
 
-def test_the_proxied_route_is_the_store_ui_read_routes_with_the_prefix_stripped(site: Block):
-    """GET and HEAD on /api/store/ui/v1/* only; data_store sees /ui/v1/... (the prefix is the SPA's)."""
-    handle, _ = _the_proxy(site)
-    assert len(handle.words) == 2 and handle.words[1].startswith('@'), (
-        f'the proxy handle is matched by {handle.words[1:]}, not one named matcher'
+def test_the_proxied_routes_are_the_read_rule_and_exactly_the_three_writes(site: Block):
+    """Each reverse_proxy sits in a handle guarded by one named matcher, and the four are these, in this order."""
+    rules = {handle.words[1]: _matcher_conditions(site, handle) for handle, _ in _the_proxies(site)}
+    assert list(rules) == list(PROXY_RULES), list(rules)
+    assert rules == PROXY_RULES, rules
+
+
+@pytest.mark.parametrize('matcher', list(PROXY_RULES))
+def test_every_forwarding_block_strips_the_prefix_sets_the_secret_and_forbids_caching(site: Block, matcher: str):
+    """The same block in all three: data_store sees /ui/v1/..., the proxy's secret replaces any browser value."""
+    ((handle, proxy),) = [(handle, proxy) for handle, proxy in _the_proxies(site) if handle.words[1] == matcher]
+    assert [child.words for child in handle.children] == [
+        ['uri', 'strip_prefix', '/api/store'],
+        ['reverse_proxy', UPSTREAM_PLACEHOLDER],
+    ], [child.words for child in handle.children]
+    assert [child.words for child in proxy.children] == [
+        ['header_up', SECRET_HEADER, SECRET_PLACEHOLDER],
+        ['header_down', 'Cache-Control', 'no-store'],
+    ], [child.words for child in proxy.children]
+
+
+def test_the_read_rule_is_unchanged_byte_for_byte():
+    """GET and HEAD on /api/store/ui/v1/* exactly as before the writes: the writes widened nothing else."""
+    lines = _caddy_lines(CADDYFILE.read_text(encoding='utf-8'))
+    start = lines.index('@store_ui {')
+    assert '\n'.join(lines[start : start + len(READ_RULE_TEXT.splitlines())]) == READ_RULE_TEXT
+
+
+def test_no_rule_names_a_method_beyond_get_head_patch_and_delete(caddy: Block):
+    """No PUT, no POST, no other write anywhere: PATCH only on the expiry and collecting rules, DELETE only on delete."""
+    methods = [block.words for block in caddy.walk() if block.words[:1] == ['method']]
+    assert methods == [['method', 'GET', 'HEAD'], ['method', 'PATCH'], ['method', 'PATCH'], ['method', 'DELETE']], (
+        methods
     )
-    matchers = site.named(handle.words[1])
-    assert len(matchers) == 1, f'{handle.words[1]} is defined {len(matchers)} times'
-    conditions = sorted(child.words for child in matchers[0].children)
-    assert conditions == [['method', 'GET', 'HEAD'], ['path', STORE_UI_PATH]], conditions
-    assert handle.named('uri') == [Block(['uri', 'strip_prefix', '/api/store'])], [b.words for b in handle.children]
+    code = '\n'.join(_caddy_lines(CADDYFILE.read_text(encoding='utf-8')))
+    assert not re.search(r'\b(PUT|POST|OPTIONS|CONNECT|TRACE)\b', code), code
 
 
-def test_the_secret_is_set_from_the_environment_and_never_written_down(caddy: Block, site: Block):
-    """header_up sets it from INSTANCE_WRITE_SECRET; the header appears nowhere else but the log's delete."""
-    _, proxy = _the_proxy(site)
-    assert proxy.named('header_up', SECRET_HEADER) == [Block(['header_up', SECRET_HEADER, SECRET_PLACEHOLDER])]
+def test_the_write_rules_outrank_the_api_404_by_path_and_by_position(site: Block):
+    """Every proxy rule sorts ahead of `handle /api/*` by Caddy's rule, and also sits above it in the file.
+
+    Caddy sorts handle routes by path specificity (httpcaddyfile sortRoutes): when both routes carry a
+    single `path`, the longer (trailing * trimmed) goes first; a route with no `path` key compares equal to
+    `/api/*` and the stable sort keeps FILE order. Each proxy rule therefore needs a longer path than the
+    404's, and the file order is pinned as the second line of defence. (Caddy's own `adapt` is NOT RUN.)
+    """
+    handles = [child.words[1] if len(child.words) > 1 else '' for child in site.children if child.words[0] == 'handle']
+    api_404 = handles.index('/api/*')
+    for matcher, conditions in PROXY_RULES.items():
+        assert handles.index(matcher) < api_404, handles
+        paths = [words[1] for words in conditions if words[0] == 'path']
+        assert len(paths) == 1 and len(paths[0].rstrip('*')) > len('/api/*'.rstrip('*')), (matcher, paths)
+    rules = {handle.words[1]: _matcher_conditions(site, handle) for handle, _ in _the_proxies(site)}
+    assert rules == PROXY_RULES, rules
+
+
+def test_the_secret_is_set_from_the_environment_and_never_written_down(caddy: Block):
+    """header_up sets it from INSTANCE_WRITE_SECRET, once per proxy; elsewhere only the log's delete names it."""
     mentions = [block.words for block in caddy.walk() if any(SECRET_HEADER in word for word in block.words)]
     assert mentions == [
         [f'request>headers>{SECRET_HEADER}', 'delete'],
         ['header_up', SECRET_HEADER, SECRET_PLACEHOLDER],
+        ['header_up', SECRET_HEADER, SECRET_PLACEHOLDER],
+        ['header_up', SECRET_HEADER, SECRET_PLACEHOLDER],
+        ['header_up', SECRET_HEADER, SECRET_PLACEHOLDER],
     ], mentions
+    code = '\n'.join(_caddy_lines(CADDYFILE.read_text(encoding='utf-8')))
+    assert 'INSTANCE_WRITE_SECRET' not in code.replace(SECRET_PLACEHOLDER, ''), (
+        'the secret is named outside its placeholder'
+    )
+
+
+# WHICH REQUEST IS FORWARDED. Read from the file, not restated: each proxy rule's method list and path
+# condition, evaluated the way Caddy does. A `path` with a trailing * is a prefix match; a path_regexp is
+# Go RE2, whose `$` is the end of the text (Python's would also match before a final newline, so it is
+# rewritten to \Z); RE2 has no lookaround or backreferences, so a regex using them would not compile there.
+LOWER_UUID = '0f8fad5b-d9cb-469f-a165-70867728950e'
+UPPER_UUID = '0F8FAD5B-D9CB-469F-A165-70867728950E'
+DATASETS = '/api/store/ui/v1/datasets'
+_RE2_UNSUPPORTED = re.compile(r'\(\?[=!<]|\\[1-9]|\(\?P=')
+
+
+def _forwarded_by(site: Block, method: str, path: str) -> list[str]:
+    """The proxy rules a request would match: [] means Caddy's /api/* 404 answers it."""
+    hits = []
+    for handle, _ in _the_proxies(site):
+        conditions = {words[0]: words[1:] for words in _matcher_conditions(site, handle)}
+        assert set(conditions) <= {'method', 'path', 'path_regexp'}, (
+            f'a matcher this model cannot evaluate: {conditions}'
+        )
+        # Caddy ANDs the matchers of one named set (and ORs the values within one matcher, as `method`'s).
+        results = [method in conditions['method']]
+        if 'path' in conditions:
+            (pattern,) = conditions['path']
+            assert pattern.endswith('*') and '*' not in pattern[:-1], pattern
+            # MatchPath is case-insensitive: it lowercases both sides.
+            results.append(path.lower().startswith(pattern[:-1].lower()))
+        if 'path_regexp' in conditions:
+            (pattern,) = conditions['path_regexp']
+            assert not _RE2_UNSUPPORTED.search(pattern), f'not RE2: {pattern}'
+            assert pattern.startswith('^') and pattern.endswith('$'), f'unanchored: {pattern}'
+            results.append(re.search(pattern[:-1] + r'\Z', path) is not None)
+        if all(results):
+            hits.append(handle.words[1])
+    return hits
+
+
+@pytest.mark.parametrize(
+    ('method', 'path', 'rule'),
+    [
+        ('PATCH', f'{DATASETS}/{LOWER_UUID}/expiry', '@store_ui_expiry'),
+        ('PATCH', f'{DATASETS}/{UPPER_UUID}/expiry', '@store_ui_expiry'),
+        ('PATCH', f'{DATASETS}/{LOWER_UUID}/collecting', '@store_ui_collecting'),
+        ('PATCH', f'{DATASETS}/{UPPER_UUID}/collecting', '@store_ui_collecting'),
+        ('DELETE', f'{DATASETS}/{LOWER_UUID}', '@store_ui_delete'),
+        ('DELETE', f'{DATASETS}/{UPPER_UUID}', '@store_ui_delete'),
+        ('GET', f'{DATASETS}/{LOWER_UUID}/bars', '@store_ui'),
+        ('HEAD', '/api/store/ui/v1/config', '@store_ui'),
+    ],
+    ids=[
+        'patch-lower',
+        'patch-upper',
+        'collecting-lower',
+        'collecting-upper',
+        'delete-lower',
+        'delete-upper',
+        'get-read',
+        'head-read',
+    ],
+)
+def test_the_ui_requests_are_forwarded_by_exactly_their_rule(site: Block, method: str, path: str, rule: str):
+    assert _forwarded_by(site, method, path) == [rule]
+
+
+_REFUSED_WRITE_PATHS = {
+    'bars': f'{DATASETS}/{LOWER_UUID}/bars',
+    'coverage': f'{DATASETS}/{LOWER_UUID}/coverage',
+    'bar-pages': f'{DATASETS}/{LOWER_UUID}/bar-pages',
+    'not-a-uuid': f'{DATASETS}/not-a-uuid',
+    'uuid-no-dashes': f'{DATASETS}/{LOWER_UUID.replace("-", "")}',
+    'uuid-short': f'{DATASETS}/{LOWER_UUID[:-1]}',
+    'uuid-long': f'{DATASETS}/{LOWER_UUID}0',
+    'uuid-non-hex': f'{DATASETS}/{LOWER_UUID[:-1]}g',
+    'trailing-slash': f'{DATASETS}/{LOWER_UUID}/',
+    'expiry-trailing-slash': f'{DATASETS}/{LOWER_UUID}/expiry/',
+    'expiry-extra-segment': f'{DATASETS}/{LOWER_UUID}/expiry/x',
+    'expiry-uppercase': f'{DATASETS}/{LOWER_UUID}/EXPIRY',
+    'collecting-trailing-slash': f'{DATASETS}/{LOWER_UUID}/collecting/',
+    'collecting-extra-segment': f'{DATASETS}/{LOWER_UUID}/collecting/x',
+    'collecting-uppercase': f'{DATASETS}/{LOWER_UUID}/COLLECTING',
+    'collecting-not-a-uuid': f'{DATASETS}/not-a-uuid/collecting',
+    'collecting-encoded-slash': f'{DATASETS}/{LOWER_UUID}%2Fcollecting',
+    'collecting-dot-segment': f'{DATASETS}/{LOWER_UUID}/../{LOWER_UUID}/collecting',
+    'trailing-newline': f'{DATASETS}/{LOWER_UUID}\n',
+    'the-list': DATASETS,
+    'the-list-slash': f'{DATASETS}/',
+    'store-route': f'/api/store/store/datasets/{LOWER_UUID}',
+    'unprefixed': f'/ui/v1/datasets/{LOWER_UUID}',
+    'prefix-in-front': f'/x{DATASETS}/{LOWER_UUID}',
+    'other-version': f'/api/store/ui/v2/datasets/{LOWER_UUID}',
+}
+
+
+@pytest.mark.parametrize('method', ['PATCH', 'DELETE'])
+@pytest.mark.parametrize('path', list(_REFUSED_WRITE_PATHS.values()), ids=list(_REFUSED_WRITE_PATHS))
+def test_a_write_on_any_other_path_is_not_forwarded(site: Block, method: str, path: str):
+    """Caddy's 404 answers it: the three regexes accept one path shape each and nothing near it."""
+    assert _forwarded_by(site, method, path) == [], (method, path)
+
+
+@pytest.mark.parametrize(
+    ('method', 'path'),
+    [
+        ('DELETE', f'{DATASETS}/{LOWER_UUID}/expiry'),
+        ('PATCH', f'{DATASETS}/{LOWER_UUID}'),
+        ('PUT', f'{DATASETS}/{LOWER_UUID}/expiry'),
+        ('PUT', f'{DATASETS}/{LOWER_UUID}'),
+        ('POST', f'{DATASETS}/{LOWER_UUID}/expiry'),
+        ('POST', DATASETS),
+        ('OPTIONS', f'{DATASETS}/{LOWER_UUID}'),
+        ('GET', f'/api/store/store/datasets/{LOWER_UUID}'),
+        ('GET', '/api/store/internal/asset-data'),
+    ],
+    ids=[
+        'delete-on-expiry',
+        'patch-on-dataset',
+        'put-expiry',
+        'put-dataset',
+        'post-expiry',
+        'post-list',
+        'options',
+        'get-store',
+        'get-internal',
+    ],
+)
+def test_the_wrong_method_or_a_non_ui_route_is_not_forwarded(site: Block, method: str, path: str):
+    assert _forwarded_by(site, method, path) == [], (method, path)
+
+
+# THE COLLECTING RULE (tj-grna9p.184). The expiry rule's twin: the same method, matchers and forwarding
+# block, its regex ending /collecting. Its Caddy behaviour is NOT measured (no caddy binary, tj-mx97hu):
+# what is pinned is that it is textually the expiry rule's twin, so it inherits whatever the expiry rule
+# does, and that its regex, evaluated as RE2 would, accepts one path shape.
+COLLECTING_PATH = f'{DATASETS}/{LOWER_UUID}/collecting'
+WRITE_RULES = [matcher for matcher in PROXY_RULES if matcher != '@store_ui']
+
+
+def _rule_lines(matcher: str) -> list[str]:
+    """A rule's non-comment lines: its matcher block through its handle block, as the file spells them."""
+    lines = _caddy_lines(CADDYFILE.read_text(encoding='utf-8'))
+    start = lines.index(f'{matcher} {{')
+    handle = lines.index(f'handle {matcher} {{')
+    depth, end = 0, handle
+    for end in range(handle, len(lines)):
+        depth += lines[end].endswith('{') - (lines[end] == '}')
+        if depth == 0:
+            break
+    assert depth == 0, f'{matcher} never closes its handle'
+    return lines[start : end + 1]
+
+
+def test_the_collecting_rule_is_the_expiry_rule_but_for_its_name_and_suffix():
+    """Line for line, comments aside: the only differences are the matcher's name and /expiry$ -> /collecting$."""
+    expiry = _rule_lines('@store_ui_expiry')
+    collecting = _rule_lines('@store_ui_collecting')
+    twin = [
+        line.replace('@store_ui_expiry', '@store_ui_collecting').replace('/expiry$', '/collecting$') for line in expiry
+    ]
+    assert collecting == twin, (collecting, twin)
+    changed = [(a, b) for a, b in zip(expiry, collecting, strict=True) if a != b]
+    assert len(changed) == 3, changed
+
+
+def test_the_collecting_rule_sits_with_the_writes_above_the_api_404():
+    """After the expiry rule and before the delete rule, every one of them above `handle /api/*`."""
+    handles = [line for line in _caddy_lines(CADDYFILE.read_text(encoding='utf-8')) if line.startswith('handle')]
+    order = [f'handle {matcher} {{' for matcher in PROXY_RULES] + ['handle /api/* {']
+    assert [line for line in handles if line in order] == order, handles
+
+
+@pytest.mark.parametrize('method', ['GET', 'HEAD', 'PUT', 'POST', 'DELETE', 'OPTIONS', 'CONNECT', 'TRACE'])
+def test_no_other_method_on_the_collecting_path_reaches_a_write_rule(site: Block, method: str):
+    """Only PATCH is a write there; GET and HEAD are the read rule's (data_store has no such read), others 404."""
+    hits = _forwarded_by(site, method, COLLECTING_PATH)
+    assert not set(hits) & set(WRITE_RULES), (method, hits)
+    assert hits == (['@store_ui'] if method in ('GET', 'HEAD') else []), (method, hits)
+
+
+def _file_regex(site: Block, matcher: str) -> re.Pattern:
+    """The matcher's path_regexp as the file spells it, compiled with RE2's end-of-text `$`."""
+    (block,) = site.named(matcher)
+    (pattern,) = [child.words[1] for child in block.children if child.words[0] == 'path_regexp']
+    assert pattern.startswith('^') and pattern.endswith('$'), pattern
+    assert not _RE2_UNSUPPORTED.search(pattern), f'not RE2: {pattern}'
+    return re.compile(pattern[:-1] + r'\Z')
+
+
+MIXED_UUID = '0f8FAD5b-D9cb-469F-a165-70867728950E'
+_COLLECTING_TABLE = {
+    'lower': (COLLECTING_PATH, True),
+    'upper-uuid': (f'{DATASETS}/{UPPER_UUID}/collecting', True),
+    'mixed-uuid': (f'{DATASETS}/{MIXED_UUID}/collecting', True),
+    'upper-suffix': (f'{DATASETS}/{LOWER_UUID}/COLLECTING', False),
+    'title-suffix': (f'{DATASETS}/{LOWER_UUID}/Collecting', False),
+    'trailing-slash': (f'{COLLECTING_PATH}/', False),
+    'extra-segment': (f'{COLLECTING_PATH}/x', False),
+    'suffix-longer': (f'{COLLECTING_PATH}x', False),
+    'suffix-shorter': (f'{DATASETS}/{LOWER_UUID}/collectin', False),
+    'double-slash': (f'{DATASETS}/{LOWER_UUID}//collecting', False),
+    'segment-before': (f'{DATASETS}/x/{LOWER_UUID}/collecting', False),
+    'not-a-uuid': (f'{DATASETS}/not-a-uuid/collecting', False),
+    'uuid-no-dashes': (f'{DATASETS}/{LOWER_UUID.replace("-", "")}/collecting', False),
+    'uuid-short': (f'{DATASETS}/{LOWER_UUID[:-1]}/collecting', False),
+    'uuid-long': (f'{DATASETS}/{LOWER_UUID}0/collecting', False),
+    'uuid-non-hex': (f'{DATASETS}/{LOWER_UUID[:-1]}g/collecting', False),
+    'encoded-slash': (f'{DATASETS}/{LOWER_UUID}%2Fcollecting', False),
+    'encoded-suffix': (f'{DATASETS}/{LOWER_UUID}/%63ollecting', False),
+    'dot-dot-segment': (f'{DATASETS}/{LOWER_UUID}/../{LOWER_UUID}/collecting', False),
+    'dot-dot-after': (f'{COLLECTING_PATH}/../expiry', False),
+    'encoded-dot-dot': (f'{DATASETS}/%2e%2e/{LOWER_UUID}/collecting', False),
+    'dot-segment': (f'{DATASETS}/./{LOWER_UUID}/collecting', False),
+    'trailing-newline': (f'{COLLECTING_PATH}\n', False),
+    'prefix-in-front': (f'/x{COLLECTING_PATH}', False),
+    'unprefixed': (f'/ui/v1/datasets/{LOWER_UUID}/collecting', False),
+    'store-route': (f'/api/store/store/datasets/{LOWER_UUID}/collecting', False),
+    'expiry': (f'{DATASETS}/{LOWER_UUID}/expiry', False),
+    'the-dataset': (f'{DATASETS}/{LOWER_UUID}', False),
+}
+
+
+@pytest.mark.parametrize(('path', 'accepted'), list(_COLLECTING_TABLE.values()), ids=list(_COLLECTING_TABLE))
+def test_the_collecting_regex_accepts_exactly_the_lower_case_suffix_on_one_uuid(site: Block, path: str, accepted: bool):
+    """The regex as written in the file, not this module's copy: one UUID (any hex case), then /collecting."""
+    assert (_file_regex(site, '@store_ui_collecting').search(path) is not None) is accepted, path
+
+
+def test_a_patch_the_collecting_regex_accepts_is_forwarded_by_that_rule_alone(site: Block):
+    """No two write rules accept the same request, so which handle forwards it never rests on Caddy's order."""
+    for path, accepted in _COLLECTING_TABLE.values():
+        if accepted:
+            assert _forwarded_by(site, 'PATCH', path) == ['@store_ui_collecting'], path
+
+
+def test_every_guarded_ui_write_has_exactly_one_edge_rule_and_every_write_rule_one_route(site: Block):
+    """Derived from data_store's app (test_ci_invariants): the edge forwards exactly the secret-guarded UI writes.
+
+    A guarded /ui/v1 route the edge does not forward is unreachable from the browser; an edge write rule
+    with no guarded route behind it offers the secret to something that does not ask for it.
+    """
+    from common.tests.test_ci_invariants import _data_store_app, _guarded_routes
+
+    guarded = sorted((method, path) for method, path in _guarded_routes(_data_store_app()) if path.startswith('/ui/'))
+    assert guarded, 'data_store guards no /ui/ route, so this comparison is vacuous'
+    reached = {}
+    for method, template in guarded:
+        concrete = '/api/store' + re.sub(r'\{[^}]+\}', LOWER_UUID, template)
+        hits = [hit for hit in _forwarded_by(site, method, concrete) if hit in WRITE_RULES]
+        assert len(hits) == 1, (method, template, hits)
+        reached[hits[0]] = (method, template)
+    assert sorted(reached) == sorted(WRITE_RULES), reached
+    assert reached['@store_ui_collecting'] == ('PATCH', '/ui/v1/datasets/{dataset_id}/collecting'), reached
 
 
 def test_the_access_log_deletes_the_secret_header(site: Block):
@@ -700,7 +1048,7 @@ def test_no_web_stage_runs_buf():
 # The Vite dev server with hot reload, the same service merged over the prod definition: web_build_image
 # as its image, vite run directly (never `npm run dev`, whose predev is buf generate), the same one
 # loopback port, read-only source and generated mounts, the licence key interpolated and never written,
-# the secret blanked, no env_file, the proxy target derived from the same variables as Caddy's upstream.
+# the secret under the prod ':?' guard and never a VITE_ name (tj-grna9p.133: the dev server injects it), no env_file, the proxy target derived from the same variables as Caddy's upstream.
 # Loaded by DEV_COMPOSE and TOOLS_COMPOSE only. Compose's own render (`docker compose config`) and a
 # running dev server are NOT RUN here: no Docker in the agent container.
 
@@ -769,10 +1117,55 @@ def test_the_dev_web_service_reads_the_licence_key_by_interpolation_only(web_dev
     assert compose_model.interpolate(value, {LICENCE_KEY: 'k'}) == 'k'
 
 
-def test_the_dev_web_service_blanks_the_secret(web_dev: dict, dev_model: dict):
-    """The dev proxy injects no secret, so the container gets none, overriding the prod file's required one."""
-    assert web_dev['environment']['INSTANCE_WRITE_SECRET'] == '', web_dev['environment']
-    assert dev_model['environment']['INSTANCE_WRITE_SECRET'] == '', dev_model['environment']
+def test_the_dev_web_service_gets_the_secret_under_the_prod_guard(web: dict, web_dev: dict, dev_model: dict):
+    """tj-grna9p.133: the Vite dev SERVER injects it, so the container needs the real one, required like prod's."""
+    value = web_dev['environment']['INSTANCE_WRITE_SECRET']
+    assert value == web['environment']['INSTANCE_WRITE_SECRET'], (value, web['environment'])
+    assert value.startswith('${INSTANCE_WRITE_SECRET:?'), value
+    assert dev_model['environment']['INSTANCE_WRITE_SECRET'] == value, dev_model['environment']
+    for environment in ({}, {'INSTANCE_WRITE_SECRET': ''}):
+        with pytest.raises(compose_model.InterpolationRefused) as refused:
+            compose_model.interpolate(value, environment)
+        assert refused.value.variable == 'INSTANCE_WRITE_SECRET'
+    assert compose_model.interpolate(value, {'INSTANCE_WRITE_SECRET': 's3cret'}) == 's3cret'
+
+
+def test_no_vite_named_setting_carries_the_secret(web_dev: dict, dev_model: dict):
+    """Vite exposes VITE_* to the client bundle: the secret is never under, nor interpolated into, such a name."""
+    for environment in (web_dev['environment'], dev_model['environment']):
+        offending = {
+            name: value
+            for name, value in environment.items()
+            if name.upper().startswith('VITE_') and ('SECRET' in name.upper() or 'INSTANCE_WRITE_SECRET' in str(value))
+        }
+        assert not offending, offending
+
+
+@pytest.mark.parametrize(
+    ('env_file', 'shell', 'expected'),
+    [
+        (f'{SECRET}=fake-from-env-file\n', {}, 'fake-from-env-file'),
+        (f'{SECRET}=fake-from-env-file\n', {SECRET: 'fake-from-shell'}, 'fake-from-shell'),
+        (f'{SECRET}=\n', {}, 'unused'),
+        (None, {}, 'unused'),
+    ],
+    ids=['env-file-value-reaches-it', 'shell-value-wins', 'empty-env-file-placeholder', 'no-env-file-placeholder'],
+)
+def test_the_dev_set_hands_the_dev_web_container_the_secret_from_the_env_file(
+    tmp_path: Path, dev_model: dict, env_file: str | None, shell: dict[str, str], expected: str
+):
+    """What the dev web container receives through DEV_COMPOSE, the root env file holding the secret or not.
+
+    Compose's precedence (documented): the shell environment outranks the project env file in
+    interpolation. The shell compose sees is DEV_COMPOSE's own prefix, run by sh in a project directory
+    holding a FAKE env file and the repository's helper; the rendered value is the dev overlay's
+    interpolated with the file underneath the shell, as compose layers them. Before tj-grna9p.133's round
+    two, the env-file case gave 'unused' (a strict xfail recorded it).
+    """
+    seen = _dev_prefix_secret(tmp_path, _dev_compose_prefix(), env_file, shell)
+    file_values = {SECRET: env_file.split('=', 1)[1].strip()} if env_file else {}
+    rendered = compose_model.interpolate(dev_model['environment'][SECRET], file_values | {SECRET: seen})
+    assert rendered == expected, f'the dev web container receives {rendered!r}, expected {expected!r}'
 
 
 def test_the_dev_web_service_has_no_env_file(web_dev: dict, dev_model: dict):
@@ -853,11 +1246,12 @@ def test_prod_down_passes_the_secret_placeholder():
 # THE DEV SETS CARRY THEIR OWN FALLBACK (tj-grna9p.104). compose interpolates every file before merging,
 # so the prod web overlay's ':?' rule fires on DEV_COMPOSE too, although docker-compose.web.dev.yaml blanks
 # the value afterwards; a dev .env that leaves the secret empty (its shipped state) failed dev-build,
-# dev-deps, dev-tools and dev-launch. DEV_COMPOSE now opens with a SHELL-DEFAULT placeholder, so a value
-# the shell already holds still wins, and TOOLS_COMPOSE inherits it. PROD_COMPOSE carries none: prod keeps
+# dev-deps, dev-tools and dev-launch. DEV_COMPOSE now opens with a placeholder that is only a fallback,
+# and TOOLS_COMPOSE inherits it. Since tj-grna9p.133 (round two) the dev web container USES the secret
+# (the Vite dev server injects it), so the prefix is tools/dev_instance_secret.sh: the shell's value,
+# else the root env file's (a bare shell default outranked that file in interpolation), else 'unused'. PROD_COMPOSE carries none: prod keeps
 # the required rule, because there the proxy injects the real secret.
 DEV_TARGETS = ('dev-build', 'dev-deps', 'dev-tools', 'dev-launch', 'dev-down')
-SECRET = 'INSTANCE_WRITE_SECRET'
 
 
 def _dev_compose_prefix() -> str:
@@ -865,6 +1259,39 @@ def _dev_compose_prefix() -> str:
     value = _make_variable('DEV_COMPOSE')
     assert ' docker compose ' in f' {value} ', value
     return value.split('docker compose', 1)[0].replace('$$', '$').strip()
+
+
+# NEVER THE REAL SECRET. Every run below gets a SCRUBBED environment (PATH and HOME only, plus what the
+# case sets) and a temporary project directory holding a FAKE env file and a copy of the helper, so
+# neither the agent's own INSTANCE_WRITE_SECRET nor a checkout's root env file can reach a process, an
+# assertion message or a log. Only the one variable is read back from the child's environment.
+DEV_SECRET_HELPER = REPO_ROOT / 'tools' / 'dev_instance_secret.sh'
+_CLEAN_ENV = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': os.environ.get('HOME', '/tmp')}
+
+
+def _dev_project(tmp_path: Path, env_file: str | None) -> Path:
+    """A project directory as the recipe sees it: tools/dev_instance_secret.sh and, if given, a FAKE env file."""
+    project = tmp_path / 'project'
+    (project / 'tools').mkdir(parents=True)
+    shutil.copy(DEV_SECRET_HELPER, project / 'tools' / DEV_SECRET_HELPER.name)
+    if env_file is not None:
+        (project / '.env').write_text(env_file, encoding='utf-8', newline='')
+    return project
+
+
+def _dev_prefix_secret(tmp_path: Path, prefix: str, env_file: str | None, shell: dict[str, str]) -> str | None:
+    """The INSTANCE_WRITE_SECRET a command prefixed by PREFIX runs with, in a fake project, under SHELL."""
+    assert SECRET not in _CLEAN_ENV
+    result = subprocess.run(
+        ['/bin/sh', '-c', f'{prefix} env'],
+        cwd=_dev_project(tmp_path, env_file),
+        env=_CLEAN_ENV | shell,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    seen = [line.split('=', 1)[1] for line in result.stdout.splitlines() if line.startswith(f'{SECRET}=')]
+    return seen[0] if seen else None
 
 
 @pytest.mark.parametrize('target', DEV_TARGETS)
@@ -884,26 +1311,96 @@ def test_the_tools_set_extends_the_dev_set():
     assert _make_variable('TOOLS_COMPOSE').startswith('$(DEV_COMPOSE) '), _make_variable('TOOLS_COMPOSE')
 
 
-@pytest.mark.parametrize(
-    ('environment', 'expected'),
-    [({}, 'unused'), ({SECRET: ''}, 'unused'), ({SECRET: 's3cret'}, 's3cret')],
-    ids=['unset-falls-back', 'empty-falls-back', 'shell-value-wins'],
-)
-def test_the_dev_set_passes_a_fallback_that_a_shell_value_outranks(environment: dict[str, str], expected: str):
-    """DEV_COMPOSE's prefix, run by sh: the placeholder when the shell has no value, the shell's when it has.
+_FAKE_FILE = f'{SECRET}=fake-from-env-file\n'
 
-    Executed rather than read, so the claim is the shell's evaluation of the `:-` default: a plain
-    `INSTANCE_WRITE_SECRET=unused` would overwrite a real value (the shell-value-wins case reds), and
-    dropping the prefix leaves the variable unset (the fallback cases red).
+
+@pytest.mark.parametrize(
+    ('env_file', 'environment', 'expected'),
+    [
+        (None, {}, 'unused'),
+        (None, {SECRET: ''}, 'unused'),
+        (None, {SECRET: 'fake-from-shell'}, 'fake-from-shell'),
+        (f'{SECRET}=\n', {}, 'unused'),
+        (_FAKE_FILE, {}, 'fake-from-env-file'),
+        (_FAKE_FILE, {SECRET: ''}, 'fake-from-env-file'),
+        (_FAKE_FILE, {SECRET: 'fake-from-shell'}, 'fake-from-shell'),
+    ],
+    ids=[
+        'unset-falls-back',
+        'empty-falls-back',
+        'shell-value-wins',
+        'empty-env-file-falls-back',
+        'env-file-value',
+        'empty-shell-reads-env-file',
+        'shell-value-wins-over-env-file',
+    ],
+)
+def test_the_dev_set_passes_a_fallback_that_a_shell_value_outranks(
+    tmp_path: Path, env_file: str | None, environment: dict[str, str], expected: str
+):
+    """DEV_COMPOSE's prefix, run by sh: the shell's value, else the env file's, else the placeholder.
+
+    Executed rather than read, in a fake project (see _dev_project), so a checkout's real env file is
+    never read: a plain `INSTANCE_WRITE_SECRET=unused` would overwrite a real value (the shell and
+    env-file cases red), and dropping the prefix leaves the variable unset (the fallback cases red).
     """
     prefix = _dev_compose_prefix()
     assert prefix, 'DEV_COMPOSE carries no assignment before docker compose'
-    base = {key: value for key, value in os.environ.items() if key != SECRET}
+    seen = _dev_prefix_secret(tmp_path, prefix, env_file, environment)
+    assert seen == expected, f'{prefix!r} under {environment} with {env_file!r} gave {seen!r}'
+
+
+def _dev_dry_run(tmp_path: Path, target: str) -> list[str]:
+    """`make -n TARGET` in a fake project with a FAKE env file: its compose lines, prerequisites not remade."""
+    venv = 'venv-dry-run'
+    skipped = [
+        prerequisite.replace('$(VENV_MARKER)', f'{venv}/.trader_joe_synced')
+        for prerequisite in _make_prerequisites(target)
+    ]
+    project = _dev_project(tmp_path, f'{SECRET}=fake-dry-run-value\n')
     result = subprocess.run(
-        ['/bin/sh', '-c', f'{prefix} env'], env=base | environment, capture_output=True, text=True, check=True
+        ['make', '-n', '-s', '--no-print-directory', '-C', str(project), '-f', str(MAKEFILE)]
+        + [f'--old-file={name}' for name in skipped]
+        + [target],
+        env=_CLEAN_ENV | {'UV_PROJECT_ENVIRONMENT': venv},
+        capture_output=True,
+        text=True,
     )
-    seen = dict(line.split('=', 1) for line in result.stdout.splitlines() if line.startswith(f'{SECRET}='))
-    assert seen.get(SECRET) == expected, f'{prefix!r} under {environment} gave {seen.get(SECRET)!r}'
+    assert result.returncode == 0, result.stderr
+    assert 'fake-dry-run-value' not in result.stdout + result.stderr, 'make printed the secret value'
+    return [line for line in result.stdout.splitlines() if ' docker compose ' in f' {line} ']
+
+
+@pytest.mark.parametrize('target', DEV_TARGETS)
+def test_make_n_on_every_dev_target_prints_the_helper_call_and_never_the_value(tmp_path: Path, target: str):
+    """Make never expands the secret: its echoed and dry-run commands show the call, the shell resolves it."""
+    lines = _dev_dry_run(tmp_path, target)
+    assert lines, f'{target} printed no compose command'
+    for line in lines:
+        assert line.startswith(f'{SECRET}="$(sh tools/dev_instance_secret.sh)" ') or (
+            f' {SECRET}="$(sh tools/dev_instance_secret.sh)" docker compose ' in line
+        ), line
+
+
+@pytest.mark.parametrize('target', DEV_TARGETS)
+@pytest.mark.parametrize(
+    ('env_file', 'expected'), [(f'{SECRET}=\n', 'unused'), (_FAKE_FILE, 'fake-from-env-file')], ids=['empty', 'set']
+)
+def test_every_dev_target_starts_with_the_shipped_empty_env_file_and_passes_a_set_one(
+    tmp_path: Path, web: dict, target: str, env_file: str, expected: str
+):
+    """The command make would run for TARGET, its prefix executed: the prod overlay's ':?' passes either way.
+
+    Empty (the shipped state): the placeholder, so dev-build, dev-deps, dev-tools, dev-launch and dev-down
+    all get past compose's guard. Set: that value, the one the dev web container is then handed.
+    """
+    for index, line in enumerate(_dev_dry_run(tmp_path / 'dry', target)):
+        # The assignments in front of compose: the last simple command before it (dev-build's recipe
+        # computes source digests first, which need the whole repository and are not this test's).
+        prefix = line.split('docker compose', 1)[0].rsplit(';', 1)[-1]
+        seen = _dev_prefix_secret(tmp_path / f'run-{index}', prefix, env_file, {})
+        assert seen == expected, (target, seen)
+        assert compose_model.interpolate(web['environment'][SECRET], {SECRET: seen}) == expected
 
 
 def test_the_prod_set_carries_no_fallback_and_the_overlay_keeps_the_rule_required():

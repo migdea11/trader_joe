@@ -54,11 +54,11 @@ services:
       # name on store_api, data_store's in-container APP_INTERNAL_PORT), with the scheme written in front:
       # compose cannot reuse DATA_STORE_UPSTREAM, it is a service value and not interpolation input.
       VITE_DEV_PROXY_TARGET: http://${DATA_STORE_NAME:-data_store}:${APP_INTERNAL_PORT:-80}
-      # INSTANCE_WRITE_SECRET is blanked, overriding the prod file's ":?" value: the Vite proxy does not
-      # inject X-Instance-Secret and a browser must never hold it, so the dev container never needs the
-      # secret and does not get it. Dev reads work without it, because reads are open; a write through
-      # the dev server reaches data_store with no secret and is refused (the UI issues none today).
-      INSTANCE_WRITE_SECRET: ""
+      # The instance secret, from the project env with the same ":?" guard as docker-compose.web.yaml.
+      # The Vite dev SERVER (a node process in this container) injects it as X-Instance-Secret on the
+      # proxied request (web/vite.config.ts); the browser never receives it. Never give it a VITE_ name:
+      # Vite exposes VITE_* to the client bundle.
+      INSTANCE_WRITE_SECRET: ${INSTANCE_WRITE_SECRET:?set INSTANCE_WRITE_SECRET in .env; there is no default}
     # Writable root: Vite writes its dependency cache to /web/node_modules/.vite and the container's
     # layer is the only place that is possible without a named volume shadowing node_modules.
     read_only: false
