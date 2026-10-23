@@ -3387,6 +3387,20 @@ RENDERED_COMPOSE_VARIABLES = (
     # landed with tj-irhy0a.24.
     'SYSTEM_COMPOSE',
 )
+# THE DEV/TEST COMPOSE PROJECT (ADR tj-4rr0la addendum 29; owner ruling on tj-oxxl8a): the Makefile's
+# DEV_PROJECT, passed as -p on every dev and test set. PROD_COMPOSE passes none, so prod keeps compose's
+# default project (the checkout directory's name) and today's launch.
+DEV_PROJECT = 'trader_joe_dev'
+# The project each rendered set carries in the Makefile, so a set that gains or loses its -p goes red
+# here as well as wherever its recipes are pinned.
+MAKEFILE_SET_PROJECTS = {
+    'PROD_COMPOSE': None,
+    'DEV_COMPOSE': DEV_PROJECT,
+    'TOOLS_COMPOSE': DEV_PROJECT,
+    TEST_CLIENT_COMPOSE_VARIABLE: DEV_PROJECT,
+    'AGENT_MCP_COMPOSE': 'trader_joe_agent_mcp',
+    'SYSTEM_COMPOSE': DEV_PROJECT,
+}
 TEARDOWN_CONDITIONS = frozenset({'failure()', 'always()'})
 # The staged project env file the job writes and reads back. Named through the template's stem so
 # this module never spells a path that holds real credentials.
@@ -3930,7 +3944,19 @@ def test_image_build_renders_every_compose_set_quietly():
     trader_joe_agent_mcp is rendered too; a workflow line that drops its -p renders a different
     project and goes red. tj-iee6sn.27: the retired agent-stack set is no longer rendered, and the
     equality below reds a line that renders it again as surely as a line that goes missing.
+
+    Re-pinned for tj-grna9p.161 (ADR tj-4rr0la addendum 29): the dev and test sets now carry -p
+    trader_joe_dev in the Makefile, and the bead rules the render checks UNCHANGED, project-free. A
+    render's project changes nothing `config --quiet` validates while no compose file interpolates
+    COMPOSE_PROJECT_NAME and only the MCP's file names a project, both asserted below. So each
+    DEV_PROJECT set must render project-FREE (exactly None, not "either"), the MCP's under its own -p,
+    and the Makefile side is pinned set by set against MAKEFILE_SET_PROJECTS.
     """
+    for path in sorted(REPO_ROOT.glob('docker-compose*.yaml')):
+        assert 'COMPOSE_PROJECT_NAME' not in path.read_text(encoding='utf-8'), (
+            f'{path.name} interpolates COMPOSE_PROJECT_NAME, so a project-free render no longer validates '
+            'what the Makefile set loads'
+        )
     steps = _image_build_job().get('steps') or []
     names = [step.get('name') for step in steps]
     assert names.count(RENDER_STEP) == 1 and 'Build Images' in names, f'{IMAGE_BUILD_JOB_NAME} steps: {names}'
@@ -3949,6 +3975,9 @@ def test_image_build_renders_every_compose_set_quietly():
         expanded = _expanded_make_variable(name, REPO_ROOT, env)
         (files, rest), project = _compose_calls(expanded)[0], _compose_projects(expanded)[0]
         assert not rest, f'{name} is {expanded!r}; a compose set names files, not a subcommand'
+        assert project == MAKEFILE_SET_PROJECTS[name], f'{name} is {expanded!r}, project {project!r}'
+        if project == DEV_PROJECT:
+            project = None  # rendered project-free by design (see the docstring)
         # AGENT_MCP_COMPOSE names its file under the root checkout's absolute path; CI renders from
         # the checkout root, so the file's name is what the two must agree on.
         expected.append((tuple(PurePosixPath(file).name if file.startswith('/') else file for file in files), project))

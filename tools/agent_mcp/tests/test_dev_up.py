@@ -10,7 +10,7 @@ charging nothing, and a failure before the down never stopping anything:
     walk (the label-only down passes no -f, so compose searches the stack directory and its parents)
     -> generated-code freshness -> one `docker image inspect` per :dev image (missing: 'call build')
     -> ONE budget charge -> the two trusted digests (a failure returns BEFORE the down) -> the
-    label-only `docker compose -p trader_joe down` -> devnet inspect, else create, else inspect again
+    label-only `docker compose -p trader_joe_dev down` -> devnet inspect, else create, else inspect again
     -> the bases (the up can build) -> the file-based up of postgres and the three apps, run by the
     fixed `sh -c` wrapper that derives INSTANCE_WRITE_SECRET inside the child.
 
@@ -61,7 +61,10 @@ pytestmark = pytest.mark.build_infra
 REAL_CREATE_SUBPROCESS_EXEC = asyncio.create_subprocess_exec
 
 DOCKER = '/usr/local/bin/docker'
-PROJECT = 'trader_joe'
+PROJECT = 'trader_joe_dev'
+# The Makefile's DEV_PROJECT since tj-grna9p.161 (ADR tj-4rr0la addendum 29), spelled out so the
+# oracle is not the file under test. PROJECT above is the MCP's, which tj-iee6sn.31 moved to this.
+MAKEFILE_DEV_PROJECT = 'trader_joe_dev'
 TRUSTED = '/opt/agent_mcp/compose'
 HELPER = f'{TRUSTED}/tools/dev_instance_secret.sh'
 BASH = '/usr/bin/bash'
@@ -94,10 +97,10 @@ PINNED_ENV = (
     *STEERING_ENV,
 )
 UP_ENV = (*PINNED_ENV, ('SOURCE_DIGEST_DATA_STORE', STORE_DIGEST), ('SOURCE_DIGEST_DATA_INGEST', INGEST_DIGEST))
-OK_MESSAGE = 'the trader_joe project was stopped and postgres, data_store, data_ingest and web are up and healthy'
-DOWN_FAILED = 'compose down failed for the trader_joe project; nothing was started'
+OK_MESSAGE = 'the trader_joe_dev project was stopped and postgres, data_store, data_ingest and web are up and healthy'
+DOWN_FAILED = 'compose down failed for the trader_joe_dev project; nothing was started'
 NETWORK_FAILED = 'the trader_joe_devnet network could not be created; the project is down'
-UP_FAILED = 'compose up failed for the trader_joe project; see the steps and call logs'
+UP_FAILED = 'compose up failed for the trader_joe_dev project; see the steps and call logs'
 BUDGET_REFUSAL = '12 state-changing dev verbs in the last hour is the budget; wait, or run the make target yourself'
 STALE_PREFIX = 'the MCP image is stale: '
 GENERATE_HINT = 'run make proto gen-proto-ts in the root checkout'
@@ -408,7 +411,7 @@ PAIRS = {
     'steering before freshness': (_steering_file, _stale_generated, 'would steer compose'),
     'freshness before the images': (_stale_generated, _missing_image(0), 'gen/proto/ts is missing or empty'),
     'the images before the budget': (_missing_image(0), _spent_budget, 'the image trader_joe_data_store:dev'),
-    'D7 before S6': (_prod_container, _stale_copy, 'project trader_joe has containers not started'),
+    'D7 before S6': (_prod_container, _stale_copy, 'project trader_joe_dev holds a container not started'),
 }
 
 
@@ -429,7 +432,7 @@ def test_the_guard_runs_first_even_with_every_later_check_failing(tmp_path: Path
     for breaks in (_stale_copy, _symlinked_bind_source, _steering_file, _stale_generated):
         breaks(rig, responder)
     result = _call(rig)
-    assert result['message'] == 'could not list the containers of project trader_joe, so nothing was changed'
+    assert result['message'] == 'could not list the containers of project trader_joe_dev, so nothing was changed'
     assert _argvs(rig) == [GUARD]
 
 
@@ -917,7 +920,7 @@ def test_dev_up_is_on_the_tool_list_saying_what_it_stops_and_that_it_never_build
     agent = runner.AgentStack(settings=None)  # type: ignore[arg-type] -- only the verb table is read
     assert 'up' in agent.verbs
     text = agent.describe('up')
-    assert 'STATE-CHANGING' in text and 'docker compose -p trader_joe down' in text, text
+    assert 'STATE-CHANGING' in text and 'docker compose -p trader_joe_dev down' in text, text
     assert 'never builds' in text and 'call build' in text, text
     assert 'never removes a volume or an image' in text, text
 
@@ -956,7 +959,9 @@ def test_both_downs_remove_no_volume_image_or_orphan_and_name_the_ups_project(
     """MIRROR (a), not word for word: no -v/--volumes/--rmi/--remove-orphans, and the up's own project.
 
     make: the down goes through $(TOOLS_COMPOSE), which is $(DEV_COMPOSE) plus one -f and no project
-    option, so both lines name the same default project. The MCP: -p trader_joe on both.
+    option of its own, so both lines name DEV_COMPOSE's one project: -p $(DEV_PROJECT), trader_joe_dev
+    since tj-grna9p.161 (ADR tj-4rr0la addendum 29). The MCP: -p trader_joe_dev on both since
+    tj-iee6sn.31, so make's down and the MCP's down stop the SAME project, read from the Makefile.
     """
     _, lines = _recipe('dev-up')
     down = shlex.split(lines[0])
@@ -966,9 +971,14 @@ def test_both_downs_remove_no_volume_image_or_orphan_and_name_the_ups_project(
     tools = shlex.split(_make_variable('TOOLS_COMPOSE'))
     assert tools[0] == '$(DEV_COMPOSE)' and tools[1:] == ['-f', 'docker-compose.tools.yaml'], tools
     dev_compose = shlex.split(_make_variable('DEV_COMPOSE'))
+    project_options = {'-p', '--project-name', '--project-directory'}
     for words in (down, tools, dev_compose):
         assert not destructive & set(words), words
-        assert not {'-p', '--project-name', '--project-directory'} & set(words), words
+    for words in (down, tools):
+        assert not project_options & set(words), words
+    assert [word for word in dev_compose if word.partition('=')[0] in project_options] == ['-p'], dev_compose
+    assert dev_compose[dev_compose.index('-p') + 1] == '$(DEV_PROJECT)', dev_compose
+    assert _make_variable('DEV_PROJECT') == MAKEFILE_DEV_PROJECT
     rig, _ = _rig(tmp_path, monkeypatch)
     assert _call(rig)['status'] == 'ok'
     compose_down = [argv for argv in _argvs(rig) if argv[:2] == (DOCKER, 'compose')]
@@ -977,6 +987,8 @@ def test_both_downs_remove_no_volume_image_or_orphan_and_name_the_ups_project(
     for argv in (DOWN, up):
         assert argv[2:4] == ('-p', PROJECT) and argv.count('-p') == 1, argv
         assert not destructive & set(argv), argv
+    # One project on both sides (tj-iee6sn.31): the MCP's argv word equals make's own DEV_PROJECT.
+    assert PROJECT == MAKEFILE_DEV_PROJECT == _make_variable('DEV_PROJECT')
 
 
 def test_the_network_steps_mirror_make_dev_network():

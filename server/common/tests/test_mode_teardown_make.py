@@ -26,6 +26,7 @@ import pytest
 
 from common.tests.compose_model import BASE_FILE, FAKE_FILE, load
 from common.tests.test_ci_invariants import (
+    DEV_PROJECT,
     MAKEFILE,
     REPO_ROOT,
     SYSTEM_GUARD,
@@ -176,6 +177,8 @@ def _assert_is_the_placeholder_down(call: Call) -> None:
     """dev-up's down: TOOLS_COMPOSE's files, a bare `down` (no -v, no --remove-orphans), on the placeholders."""
     files, rest = call.compose()
     assert files == _files('TOOLS_COMPOSE'), call
+    # tj-grna9p.161 (ADR tj-4rr0la addendum 29 (2)): a dev/test teardown reaches ONLY trader_joe_dev.
+    assert _compose_projects(call.line) == [DEV_PROJECT], call
     assert rest == ['down'], f'the down must be bare -- never -v or --remove-orphans (D2): {call}'
     assert (call.pgadmin_email, call.pgadmin_pass) == (PLACEHOLDER, PLACEHOLDER), call
     assert FAKE_FILE.name not in files, call
@@ -207,7 +210,7 @@ def test_seed_dump_compose_carries_the_same_data_dir():
     """(3): seed-dump's compose line is SYSTEM_COMPOSE's, so its run never recreates postgres elsewhere."""
     expanded = _expanded_make_variable('SEED_DUMP_COMPOSE', REPO_ROOT, _subprocess_env())
     assert expanded.split()[0] == f'DATA_DIR={TEST_DATA_DIR}', expanded
-    assert expanded.count('DATA_DIR=') == 1 and _compose_projects(expanded) == [None], expanded
+    assert expanded.count('DATA_DIR=') == 1 and _compose_projects(expanded) == [DEV_PROJECT], expanded
 
 
 def test_no_dev_or_prod_set_pins_data_dir():
@@ -338,15 +341,15 @@ def test_ci_tags_the_test_images_before_start_system_runs_make_system_launch():
     assert all(tag < start for tag in tags), (tags, start)
 
 
-def test_system_launchs_down_and_up_address_the_same_default_project():
+def test_system_launchs_down_and_up_address_the_same_dev_project():
     """Review (1): the down and the up name one project, whatever the checkout is called.
 
-    Neither line passes -p, and both sets start with the base file, so compose derives the one
-    project name (the checkout directory's) for both.
+    Re-pinned for tj-grna9p.161 (ADR tj-4rr0la addendum 29): both lines pass -p trader_joe_dev, so
+    they name the dev/test project in any checkout and never the default project prod keeps.
     """
     tools = _expanded_make_variable('TOOLS_COMPOSE', REPO_ROOT, _subprocess_env())
     system = _expanded_make_variable('SYSTEM_COMPOSE', REPO_ROOT, _subprocess_env())
-    assert _compose_projects(tools) == _compose_projects(system) == [None], (tools, system)
+    assert _compose_projects(tools) == _compose_projects(system) == [DEV_PROJECT], (tools, system)
     assert _files('TOOLS_COMPOSE')[0] == _files('SYSTEM_COMPOSE')[0] == BASE_FILE.name
 
 
@@ -458,14 +461,15 @@ def test_a_running_fake_mode_container_makes_it_run_the_down(tmp_path: Path, ps:
 def test_it_asks_compose_for_the_dev_sets_running_containers_and_inspects_exactly_those(tmp_path: Path):
     """How the mode is read: DEV_COMPOSE ps -q, then one inspect of exactly those ids.
 
-    ps -q lists running, non-one-off containers, with no -p; the inspect uses the fixed label
-    format -- run_migrations.sh's basename rule, not a spelled project name.
+    ps -q lists running, non-one-off containers of the dev/test project: -p trader_joe_dev since
+    tj-grna9p.161, so the lookup can never see prod's containers and the down that may follow reaches
+    the same project. The inspect uses the fixed label format -- run_migrations.sh's basename rule.
     """
     result, calls = _run(tmp_path, LEAVE, STUB_PS='c1\nc2', STUB_LABELS=f'{DEV_LABEL}\n{DEV_LABEL}')
     assert result.returncode == 0, result.stderr
     ps, inspect = calls
     assert ps.compose() == (_files('DEV_COMPOSE'), ['ps', '-q']), ps
-    assert _compose_projects(ps.line) == [None], ps
+    assert _compose_projects(ps.line) == [DEV_PROJECT], ps
     assert inspect.argv == ['inspect', '--format', INSPECT_FORMAT, 'c1', 'c2'], inspect
 
 
@@ -601,7 +605,8 @@ def test_make_n_system_launch_leaves_no_make_variable_unexpanded():
     assert len(lines) == 2, result.stdout
     assert lines[0].startswith('PGADMIN_EMAIL=unused PGADMIN_PASS=unused INSTANCE_WRITE_SECRET='), lines
     assert lines[0].endswith(' -f docker-compose.tools.yaml down'), lines
+    assert _compose_projects(lines[0]) == [DEV_PROJECT], lines
     assert (
         lines[1]
-        == f'DATA_DIR={TEST_DATA_DIR} docker compose -f docker-compose.yaml -f docker-compose.fake.yaml up -d --wait --wait-timeout 300'
+        == f'DATA_DIR={TEST_DATA_DIR} docker compose -p {DEV_PROJECT} -f docker-compose.yaml -f docker-compose.fake.yaml up -d --wait --wait-timeout 300'
     ), lines

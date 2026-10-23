@@ -73,9 +73,9 @@ TOOLS_FILE = 'docker-compose.tools.yaml'
 TOOLS_FILES = (*DEV_FILES[:4], TOOLS_FILE, DEV_FILES[4])
 # make dev-tools' `up -d pgadmin`, plus --wait: the one documented deviation from the recipe.
 TOOLS_TAIL = ('up', '-d', '--wait', 'pgadmin')
-OK_MESSAGE = 'pgAdmin is running in the trader_joe project; stop it with the down verb'
+OK_MESSAGE = 'pgAdmin is running in the trader_joe_dev project; stop it with the down verb'
 UP_FAILED = (
-    'compose up of pgadmin failed for the trader_joe project; if the step output names PGADMIN_EMAIL or '
+    'compose up of pgadmin failed for the trader_joe_dev project; if the step output names PGADMIN_EMAIL or '
     'PGADMIN_PASS, set it in the root env file (the pgAdmin password needs 6+ characters); see the steps and call logs'
 )
 NETWORK_FAILED = 'the trader_joe_devnet network could not be created; pgAdmin was not started'
@@ -320,7 +320,7 @@ def test_each_refusal_runs_only_the_guard_and_charges_nothing(
 
 
 PAIRS = {
-    'D7 before S6': (_prod_container, _stale_tools_file, 'project trader_joe has containers not started'),
+    'D7 before S6': (_prod_container, _stale_tools_file, 'project trader_joe_dev holds a container not started'),
     'S6 before D6': (_stale_tools_file, _symlinked_bind_source, STALE_PREFIX),
     'D6 before D5': (_symlinked_bind_source, _env_file_a_directory, 'a symlink at server/common'),
     'D5 before the budget': (_env_file_a_directory, _spent_budget, 'server/data/store/.env is not a regular file'),
@@ -343,7 +343,7 @@ def test_a_failed_guard_listing_runs_nothing_else(tmp_path: Path, monkeypatch: p
     responder.guard = (1, b'')
     _stale_tools_file(rig, responder)
     result = _call(rig)
-    assert result['message'] == 'could not list the containers of project trader_joe, so nothing was changed'
+    assert result['message'] == 'could not list the containers of project trader_joe_dev, so nothing was changed'
     assert _argvs(rig) == [GUARD] and _charges_left(rig) == BUDGET
 
 

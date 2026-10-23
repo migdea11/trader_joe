@@ -69,7 +69,7 @@ def _rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, respond=default_respon
 
 
 def _tails(rig) -> list[list[str]]:
-    """The tail of every client step, after its whole fixed prefix (tj-iee6sn.20: wrapper, -p trader_joe, snapshot)."""
+    """The tail of every client step, after its whole fixed prefix (tj-iee6sn.20: wrapper, -p trader_joe_dev, snapshot)."""
     return [client_tail(step, rig.layout) for step in rig.docker.steps if is_client_step(step)]
 
 

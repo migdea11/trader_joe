@@ -1,7 +1,7 @@
 """down and restart, the label-only STATE-CHANGING dev verbs (bead tj-iee6sn.7).
 
 Design checked against: the bead's 22:05 and 04:31 UTC notes (down is label-only `docker compose
--p trader_joe down`: never -v, --volumes, --rmi or --remove-orphans, no compose file, no env file),
+-p trader_joe down`, now `-p trader_joe_dev down` (tj-iee6sn.31): never -v, --volumes, --rmi or --remove-orphans, no compose file, no env file),
 its 14:59 UTC notes (1)-(5) (D6 on restart only; the F2 and F4 wording; the F8 steering guard),
 owner rulings D1/D2/D6/D7 on tj-iee6sn.1 and ADR tj-4rr0la addenda 22-24.
 
@@ -32,7 +32,10 @@ from tools.agent_mcp.tests.harness import REPO_ROOT, FakeDocker, Rig, default_re
 pytestmark = pytest.mark.build_infra
 
 DOCKER = '/usr/local/bin/docker'
-PROJECT = 'trader_joe'
+# Dev and test's explicit project (ADR tj-4rr0la addendum 29, decision tj-oxxl8a option A; tj-iee6sn.31).
+PROJECT = 'trader_joe_dev'
+# Prod's project, compose's default: no verb here may ever see or touch a container of it.
+PROD_PROJECT = 'trader_joe'
 APPS = ('data_store', 'data_ingest', 'web')
 GUARD = (
     DOCKER,
@@ -82,19 +85,21 @@ STEERING_NAMES = (
 )
 PROD_LINE = b'/r/docker-compose.yaml,/r/docker-compose.web.yaml\n'
 DEV_LINE = b'/r/docker-compose.yaml,/r/docker-compose.override.yaml,/r/docker-compose.web.yaml\n'
-# The mode guard's PROD refusal, the text tj-iee6sn.24's WHAT (1) gives, exactly.
+# The mode guard's PROD refusal, exactly: tj-iee6sn.24's WHAT (1) as tj-iee6sn.31 rewords it. Prod no
+# longer lives in this project, so a prod-labelled container here is a stray, and make dev-down (the
+# down of this very project) is what removes it -- never make prod-down, which would stop real prod.
 GUARD_REFUSAL = (
-    'project trader_joe has containers not started from the dev or test files (a prod launch?): '
-    'stop them with make prod-down; tj-oxxl8a'
+    'project trader_joe_dev holds a container not started from the dev or test files (a prod launch?): '
+    'stop it with make dev-down; tj-oxxl8a'
 )
 # DEV and TEST containers together (tj-iee6sn.24): which mode is up cannot be told.
 MIXED_REFUSAL = (
-    'project trader_joe holds dev and test containers together, so which mode is up cannot be told: '
+    'project trader_joe_dev holds dev and test containers together, so which mode is up cannot be told: '
     'stop them with make dev-down'
 )
 # What make system-launch's containers carry: the base file and the fake overlay (TEST mode).
 TEST_LINE = b'/r/docker-compose.yaml,/r/docker-compose.fake.yaml\n'
-GUARD_FAILED = 'could not list the containers of project trader_joe, so nothing was changed'
+GUARD_FAILED = 'could not list the containers of project trader_joe_dev, so nothing was changed'
 BUDGET_REFUSAL = '12 state-changing dev verbs in the last hour is the budget; wait, or run the make target yourself'
 SERVICE_REFUSAL = 'service must be one of: data_store, data_ingest, web'
 BUDGET = 12
@@ -194,11 +199,11 @@ def test_both_verbs_are_on_the_tool_list_with_a_description_of_what_they_never_d
     agent = runner.AgentStack(settings=None)  # type: ignore[arg-type] -- only the verb table is read
     assert {'down', 'restart'} <= set(agent.verbs)
     down = agent.describe('down')
-    assert 'STATE-CHANGING' in down and '`docker compose -p trader_joe down`' in down, down
+    assert 'STATE-CHANGING' in down and '`docker compose -p trader_joe_dev down`' in down, down
     assert 'never removes a volume or an image and never passes --remove-orphans' in down, down
     assert 'reads no compose file and no env file' in down, down
     again = agent.describe('restart')
-    assert 'STATE-CHANGING' in again and '`docker compose -p trader_joe restart <service>`' in again, again
+    assert 'STATE-CHANGING' in again and '`docker compose -p trader_joe_dev restart <service>`' in again, again
     assert 'data_store, data_ingest, web (never postgres)' in again, again
     assert 'creates, removes and rebuilds nothing' in again, again
 
@@ -219,12 +224,12 @@ def test_both_timeouts_are_300_seconds_inside_the_client_timeout():
 
 
 def test_dev_down_runs_the_guard_then_exactly_a_label_only_down(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """D2 and the 04:31 amendment: no -v/--volumes/--rmi/--remove-orphans, no -f, no env file, -p trader_joe."""
+    """D2 and the 04:31 amendment: no -v/--volumes/--rmi/--remove-orphans, no -f, no env file, -p trader_joe_dev."""
     rig, _ = _rig(tmp_path, monkeypatch)
     result, argvs = _call(rig, 'down', {})
     assert result['status'] == 'ok', result
     assert argvs == [GUARD, DOWN]
-    assert result['message'] == 'the trader_joe compose project is down; no volume or image was removed'
+    assert result['message'] == 'the trader_joe_dev compose project is down; no volume or image was removed'
 
 
 @pytest.mark.parametrize('service', APPS)
@@ -236,7 +241,7 @@ def test_dev_restart_runs_the_guard_then_exactly_a_restart_of_the_service(
     result, argvs = _call(rig, 'restart', {'service': service})
     assert result['status'] == 'ok', result
     assert argvs == [GUARD, restart(service)]
-    assert result['message'] == f'{service} restarted in the trader_joe project'
+    assert result['message'] == f'{service} restarted in the trader_joe_dev project'
 
 
 def test_the_step_builders_build_one_unbuilding_step_in_the_stack_dir_with_the_steering_env():
@@ -292,8 +297,8 @@ def test_a_failed_compose_step_reports_failed(tmp_path: Path, monkeypatch: pytes
     assert result['status'] == 'failed' and result['exit_status'] == 1, result
     assert argvs == [GUARD, EXPECTED_STEP[verb]]
     expected = {
-        'down': 'compose down failed for the trader_joe project',
-        'restart': 'compose restart of data_store failed for the trader_joe project',
+        'down': 'compose down failed for the trader_joe_dev project',
+        'restart': 'compose restart of data_store failed for the trader_joe_dev project',
     }
     assert result['message'] == expected[verb]
 

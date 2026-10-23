@@ -225,7 +225,7 @@ _INSPECTS = [_base_inspect_argv(ref) for ref in stack.BASE_IMAGES]
 # THE DEV PAIR, whole argv rather than a tail (tj-kzy7w2; ADR tj-4rr0la addendum 18). Spelled from
 # literals, including the project name: a test that read stack.DEV_PROJECT would agree with any
 # change to it, and the project name is the whole safety case here.
-EXPECTED_DEV_PROJECT = 'trader_joe'
+EXPECTED_DEV_PROJECT = 'trader_joe_dev'
 _EXPECTED_DEV_GUARD = [
     EXPECTED_DOCKER,
     'ps',
@@ -571,7 +571,7 @@ HOST_MARK = '<HOST>'
 # THE SYSTEM-SUITE PAIR (tj-iee6sn.20; ADR tj-4rr0la addenda 26-27), whole argv from literals: the rails in
 # order -- the mode guard; the postgres lookup and the ONE fixed inspect of its data mount; the data_store
 # lookup; the two trusted digests; the data_ingest lookup and each running container's stamp read -- then
-# the bases, then the client steps, NO secret wrapper (5a38b7f): `docker compose -p trader_joe
+# the bases, then the client steps, NO secret wrapper (5a38b7f): `docker compose -p trader_joe_dev
 # --project-directory <stack>/source --env-file <host>/.env` and the three trusted client files, then the
 # tail. STACK_MARK is the rig's stack directory. tj-irhy0a.22 V1: seed_dump's producer is the ONE
 # invocation make seed-dump also spells (ADR tj-4rr0la addendum 10 (1)); --date only when given.
@@ -1034,9 +1034,20 @@ def test_only_the_launchers_and_dev_restart_start_a_service(tmp_path: Path, monk
 def test_the_compose_tail_reader_skips_every_prefix_the_verbs_spell():
     """The reader under the sweep above: the label-only, file-based and client prefixes all reach `up`."""
     prefixes = [
-        [EXPECTED_DOCKER, 'compose', '-p', 'trader_joe'],
-        [EXPECTED_DOCKER, 'compose', '-p', 'trader_joe', '--project-directory', '/h', '-f', '/a.yaml', '-f', '/b.yaml'],
-        [EXPECTED_DOCKER, 'compose', '-p', 'trader_joe', '--project-directory', '/s', '--env-file', '/h/.env'],
+        [EXPECTED_DOCKER, 'compose', '-p', EXPECTED_DEV_PROJECT],
+        [
+            EXPECTED_DOCKER,
+            'compose',
+            '-p',
+            EXPECTED_DEV_PROJECT,
+            '--project-directory',
+            '/h',
+            '-f',
+            '/a.yaml',
+            '-f',
+            '/b.yaml',
+        ],
+        [EXPECTED_DOCKER, 'compose', '-p', EXPECTED_DEV_PROJECT, '--project-directory', '/s', '--env-file', '/h/.env'],
     ]
     for prefix in prefixes:
         assert _compose_tail([*prefix, 'up', '-d', 'postgres']) == ['up', '-d', 'postgres'], prefix

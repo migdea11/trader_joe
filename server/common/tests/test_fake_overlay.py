@@ -26,6 +26,7 @@ from common.tests.compose_model import BASE_FILE, FAKE_FILE, interpolate, load, 
 from common.tests.test_ci_invariants import (
     _ACCEPTED_GUARDS,
     _REFUSED_GUARDS,
+    DEV_PROJECT,
     MAKEFILE,
     REPO_ROOT,
     SERVER_ROOT,
@@ -236,18 +237,19 @@ def test_every_set_that_loads_the_overlay_runs_the_fake():
 # --- who loads the overlay ------------------------------------------------------------------------
 
 
-def test_system_compose_is_the_base_file_then_the_overlay_in_the_default_project():
+def test_system_compose_is_the_base_file_then_the_overlay_in_the_dev_project():
     """Item 2: SYSTEM_COMPOSE is docker-compose.yaml plus the fake overlay, nothing else.
 
-    No -p: the default project, as TEST_CLIENT_COMPOSE has, so `make test-system` after `make
-    system-launch` joins the fake stack's networks. Never the dev override, the test client, the
-    MCP's files, or the tools file.
+    The same project as TEST_CLIENT_COMPOSE, so `make test-system` after `make system-launch` joins
+    the fake stack's networks. Re-pinned for tj-grna9p.161 (ADR tj-4rr0la addendum 29): both carry
+    -p trader_joe_dev, never the default project prod keeps. Never the dev override, the test
+    client, the MCP's files, or the tools file.
     """
     env = _subprocess_env()
     expanded = _expanded_make_variable('SYSTEM_COMPOSE', REPO_ROOT, env)
     assert _compose_calls(expanded) == [([BASE_FILE.name, FAKE_FILE.name], [])], expanded
     client = _expanded_make_variable('TEST_CLIENT_COMPOSE', REPO_ROOT, env)
-    assert _compose_projects(expanded) == _compose_projects(client) == [None], (expanded, client)
+    assert _compose_projects(expanded) == _compose_projects(client) == [DEV_PROJECT], (expanded, client)
 
 
 @pytest.mark.parametrize('variable', NON_FAKE_VARIABLES)

@@ -63,7 +63,7 @@ from tools.agent_mcp.tests.test_dev_up import PINNED_ENV
 pytestmark = pytest.mark.build_infra
 
 DOCKER = '/usr/local/bin/docker'
-PROJECT = 'trader_joe'
+PROJECT = 'trader_joe_dev'
 TRUSTED = '/opt/agent_mcp/compose'
 BASH = '/usr/bin/bash'
 DIGEST_SCRIPT = f'{TRUSTED}/tools/source_digest.sh'
@@ -83,7 +83,7 @@ STALE_PREFIX = 'the MCP image is stale: '
 TEST_GENERATE_HINT = 'run make proto in the root checkout'
 TEST_MODE_HINT = 'test mode is up: call up first'
 UP_OK = (
-    'the trader_joe project was stopped and test mode is up and healthy: postgres on ./volume_data/test, '
+    'the trader_joe_dev project was stopped and test mode is up and healthy: postgres on ./volume_data/test, '
     'data_store and data_ingest from the :test images, data_ingest on the fake broker'
 )
 BUILD_OK = 'the :test images (data_store, data_ingest) are built and stamped; :latest was not touched'
@@ -427,7 +427,7 @@ def test_a_failed_build_answers_failed_and_is_charged_once(tmp_path: Path, monke
     responder.compose_exit = 1
     result = rig.call('test_build', {})
     assert result['status'] == 'failed', result
-    assert result['message'] == 'compose build of the test images failed for the trader_joe project'
+    assert result['message'] == 'compose build of the test images failed for the trader_joe_dev project'
     assert _charges_left(rig) == BUDGET - 1
 
 
@@ -769,7 +769,7 @@ def test_a_failed_guard_listing_runs_nothing_else(tmp_path: Path, monkeypatch: p
     responder.guard = (1, b'')
     _stale_copy('docker-compose.fake.yaml')(rig, responder)
     result = rig.call('test_up', {})
-    assert result['message'] == 'could not list the containers of project trader_joe, so nothing was changed'
+    assert result['message'] == 'could not list the containers of project trader_joe_dev, so nothing was changed'
     assert _argvs(rig) == [GUARD] and _charges_left(rig) == BUDGET
 
 
@@ -805,7 +805,7 @@ def test_a_failed_down_starts_nothing(tmp_path: Path, monkeypatch: pytest.Monkey
     responder.down_exit = 1
     result = rig.call('test_up', {})
     assert result['status'] == 'failed', result
-    assert result['message'] == 'compose down failed for the trader_joe project; nothing was started'
+    assert result['message'] == 'compose down failed for the trader_joe_dev project; nothing was started'
     assert _argvs(rig)[-1] == DOWN
 
 
@@ -814,7 +814,10 @@ def test_a_failed_up_answers_failed(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     responder.compose_exit = 1
     result = rig.call('test_up', {})
     assert result['status'] == 'failed', result
-    assert result['message'] == 'compose up failed for the trader_joe project in test mode; see the steps and call logs'
+    assert (
+        result['message']
+        == 'compose up failed for the trader_joe_dev project in test mode; see the steps and call logs'
+    )
     assert _charges_left(rig) == BUDGET - 1
 
 

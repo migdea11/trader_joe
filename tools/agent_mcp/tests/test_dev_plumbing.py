@@ -46,7 +46,11 @@ pytestmark = pytest.mark.build_infra
 MAKEFILE = REPO_ROOT / 'Makefile'
 OVERLAY_NAME = 'docker-compose.agent-dev.yaml'
 OVERLAY = REPO_ROOT / OVERLAY_NAME
-EXPECTED_DEV_PROJECT = 'trader_joe'
+# The MCP's DEV_PROJECT since tj-iee6sn.31 and the Makefile's since tj-grna9p.161 (ADR tj-4rr0la
+# addendum 29, decision tj-oxxl8a option A): ONE name on both sides. Spelled out, not read from
+# stack.py or the Makefile, so the oracle is not the file under test.
+EXPECTED_DEV_PROJECT = 'trader_joe_dev'
+MAKEFILE_DEV_PROJECT = 'trader_joe_dev'
 # The Makefile's DEV_COMPOSE -f list (base, override, web, web dev), then the overlay.
 EXPECTED_DEV_COMPOSE_FILES = (
     'docker-compose.yaml',
@@ -62,9 +66,9 @@ TRUSTED_DOCKERFILE = f'{EXPECTED_TRUSTED_DIR}/Dockerfile'
 
 # Ruling R6 on tj-iee6sn.1, as the architect's 22:45 note on tj-iee6sn.5 spells it: "make dev-up = the
 # dev-down recipe, then $(DEV_COMPOSE) up -d --wait --wait-timeout 300 postgres data_store data_ingest
-# web". The down goes through the dev file set (TOOLS_COMPOSE, so pgAdmin goes too), never `-p
-# trader_joe`: the up names its project by compose's default (the checkout directory), so only a down
-# through the same set is guaranteed to stop the instance the up replaces, in any checkout. Its
+# web". The down goes through the dev file set (TOOLS_COMPOSE, so pgAdmin goes too) and so through
+# DEV_COMPOSE's one -p $(DEV_PROJECT): the down and the up name the same project by construction,
+# so the down is guaranteed to stop the instance the up replaces, in any checkout. Its
 # --remove-orphans is dropped (D2): with pgAdmin's file loaded there is no orphan it would need to catch.
 # The PGADMIN placeholders are dev-down's: `down` creates no container, so no account is made from them.
 EXPECTED_DEV_UP_RECIPE = [
@@ -173,11 +177,13 @@ def test_dev_up_downs_the_dev_project_then_ups_postgres_and_the_apps_detached():
 
 
 def test_dev_up_downs_and_ups_the_same_compose_project_in_any_checkout():
-    """The down's set is the up's set plus pgAdmin's file, and neither names a project, so both use the default.
+    """The down's set is the up's set plus pgAdmin's file, and both carry DEV_COMPOSE's one -p.
 
-    `-p trader_joe` on the down alone would stop project trader_joe while the up starts the checkout
-    directory's project: in a checkout named anything else, the instance dev-up exists to replace is
-    left running, and another checkout's dev stack is taken down instead.
+    Re-pinned for tj-grna9p.161 (ADR tj-4rr0la addendum 29): DEV_COMPOSE passes -p $(DEV_PROJECT),
+    DEV_PROJECT is trader_joe_dev, and nothing built on it -- TOOLS_COMPOSE, either dev-up line --
+    passes a project of its own. A second -p on the down alone would stop a different project from
+    the one the up starts, leaving the instance dev-up exists to replace running; the one inherited
+    -p makes both lines name trader_joe_dev in any checkout, and never the default project prod keeps.
     """
     tools_set = _make_variable('TOOLS_COMPOSE')
     assert shlex.split(tools_set)[0] == '$(DEV_COMPOSE)', tools_set
@@ -185,15 +191,19 @@ def test_dev_up_downs_and_ups_the_same_compose_project_in_any_checkout():
         *(path.name for path in _set_files('DEV_COMPOSE')),
         'docker-compose.tools.yaml',
     ]
-    for variable in ('DEV_COMPOSE', 'TOOLS_COMPOSE'):
-        words = shlex.split(_make_variable(variable))
-        assert not [word for word in words if word.partition('=')[0] in PROJECT_OPTIONS], (variable, words)
+    assert _make_variable('DEV_PROJECT') == MAKEFILE_DEV_PROJECT
+    dev_words = shlex.split(_make_variable('DEV_COMPOSE'))
+    assert [word for word in dev_words if word.partition('=')[0] in PROJECT_OPTIONS] == ['-p'], dev_words
+    assert dev_words[dev_words.index('-p') + 1] == '$(DEV_PROJECT)', dev_words
+    words = shlex.split(tools_set)
+    assert not [word for word in words if word.partition('=')[0] in PROJECT_OPTIONS], ('TOOLS_COMPOSE', words)
     for line in _make_recipe('dev-up'):
         words = shlex.split(line)
         assert not [word for word in words if word.partition('=')[0] in PROJECT_OPTIONS], line
-    # Equal to the MCP's label-only down (-p DEV_PROJECT) exactly when the default project is
-    # trader_joe, the only project the MCP's dev verbs address (S2).
-    assert stack.DEV_PROJECT == EXPECTED_DEV_PROJECT
+    # THE MCP AND MAKE NAME ONE PROJECT (tj-iee6sn.31): the MCP's label-only down and make dev-up's
+    # down address the same project, read here from the Makefile as make itself defines it, so the
+    # two can never drift apart again without this line going red.
+    assert stack.DEV_PROJECT == EXPECTED_DEV_PROJECT == MAKEFILE_DEV_PROJECT == _make_variable('DEV_PROJECT')
 
 
 def test_the_dev_up_down_sets_pgadmin_placeholders_and_the_up_sets_none():

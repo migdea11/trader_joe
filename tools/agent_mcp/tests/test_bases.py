@@ -234,7 +234,7 @@ def test_builds_is_false_for_image_only_runs_and_read_only_commands(tail: list[s
 # goes red in the sweep below, so a later build verb is swept too. The agent stack's five builders
 # (stack_up_steps, stack_down_steps, wipe_clear_steps, logs_steps, ps_steps) went with it (tj-iee6sn.21).
 # The system-test client's builders (tj-iee6sn.20) take the repository's HOST path, not an env file: their
-# steps are up's secret wrapper around `docker compose -p trader_joe --project-directory <snapshot>
+# steps are up's secret wrapper around `docker compose -p trader_joe_dev --project-directory <snapshot>
 # --env-file <host>/.env` and the three trusted client files, so they are swept by that prefix.
 _CLIENT_BUILDER_SAMPLES = {'system_tests_steps': (['tests/system'],), 'seed_dump_steps': ('2026-01-02',)}
 _CLIENT_HOST = Path('/home/someone/repos/trader_joe')

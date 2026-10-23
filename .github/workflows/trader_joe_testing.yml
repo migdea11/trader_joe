@@ -421,7 +421,7 @@ jobs:
         # creates nothing, and the placeholder never reaches a container).
         #
         # The fake-mode system set, spelled as the Makefile's SYSTEM_COMPOSE (what make
-        # system-launch starts; tj-vhboky.61): the default project, base then the fake-mode
+        # system-launch starts; tj-vhboky.61): the dev/test project (trader_joe_dev), base then the fake-mode
         # overlay. The overlay adds no variable, so it needs no env beyond the base file's.
         #
         # The agent-stack MCP's own project (docker-compose.agent-mcp.yaml; ADR tj-4rr0la addendum
@@ -501,6 +501,14 @@ jobs:
       packages: read  # pulls the images Image Build pushed
     needs:
       - build
+    # THE COMPOSE PROJECT (ADR tj-4rr0la addendum 29). make system-launch and make test-system pass
+    # -p trader_joe_dev (the Makefile's DEV_PROJECT); every direct `docker compose` call in this job
+    # (exec, logs, ps, run, up, down) has to address that same project or it would see an empty
+    # one, the checkout directory's default. Set at job level, not per call, so no call can be added
+    # that forgets it: compose reads COMPOSE_PROJECT_NAME from the environment, and the make
+    # recipes' explicit -p agrees with it. Pinned in server/common/tests.
+    env:
+      COMPOSE_PROJECT_NAME: trader_joe_dev
 
     steps:
       # The stack still runs from the images Image Build pushed and the configs it staged; the

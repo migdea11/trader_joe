@@ -41,9 +41,11 @@ from tools.agent_mcp.tests.harness import FakeDocker, forbid_real_subprocesses, 
 pytestmark = pytest.mark.build_infra
 
 # --- the constants, from literals --------------------------------------------------------------
-# The user's own dev compose project: the checkout directory's name, which is what the Makefile's
-# DEV_COMPOSE targets get from compose's default because they pass no -p.
-EXPECTED_DEV_PROJECT = 'trader_joe'
+# The user's own dev compose project: the explicit trader_joe_dev the Makefile's DEV_COMPOSE passes
+# as -p (ADR tj-4rr0la addendum 29, decision tj-oxxl8a option A; tj-iee6sn.31).
+EXPECTED_DEV_PROJECT = 'trader_joe_dev'
+# PROD's project: compose's default, the checkout directory's name. No MCP argv may ever name it.
+EXPECTED_PROD_PROJECT = 'trader_joe'
 # The RETIRED agent stack's project (tj-iee6sn.21), spelled here so a test can assert the dev verbs
 # cannot reach it either. These verbs reach one project and it is not this one.
 EXPECTED_AGENT_PROJECT = 'trader_joe_agent_stack'
@@ -97,6 +99,7 @@ def test_the_dev_project_is_exactly_one_fixed_name():
     assert stack.DEV_PROJECT == EXPECTED_DEV_PROJECT
     assert stack.dev_compose_prefix() == EXPECTED_DEV_PREFIX, 'the dev prefix is four words and nothing more'
     assert stack.DEV_PROJECT != EXPECTED_AGENT_PROJECT, 'the dev verbs must not share the agent stack project'
+    assert stack.DEV_PROJECT != EXPECTED_PROD_PROJECT, "the dev verbs must not share prod's default project"
 
 
 def test_the_dev_service_enum_holds_exactly_these_four_names():
@@ -152,7 +155,9 @@ def test_both_dev_verbs_carry_a_timeout_budget():
 _BAD_PREFIXES = {
     'another project': [EXPECTED_DOCKER, 'compose', '-p', 'someone_elses_stack', 'ps'],
     'the agent stack project': [EXPECTED_DOCKER, 'compose', '-p', EXPECTED_AGENT_PROJECT, 'ps'],
-    'the dev project as a prefix of a longer name': [EXPECTED_DOCKER, 'compose', '-p', 'trader_joe_prod', 'ps'],
+    'the dev project as a prefix of a longer name': [EXPECTED_DOCKER, 'compose', '-p', 'trader_joe_dev_prod', 'ps'],
+    "prod's default project": [EXPECTED_DOCKER, 'compose', '-p', EXPECTED_PROD_PROJECT, 'ps'],
+    'a truncation of the dev project': [EXPECTED_DOCKER, 'compose', '-p', 'trader_joe_de', 'ps'],
     'no project at all': [EXPECTED_DOCKER, 'compose', 'ps'],
     'the long project option': [EXPECTED_DOCKER, 'compose', '--project-name', EXPECTED_DEV_PROJECT, 'ps'],
     'another binary': ['/usr/bin/docker', 'compose', '-p', EXPECTED_DEV_PROJECT, 'ps'],
@@ -433,6 +438,7 @@ def test_no_accepted_argument_changes_the_project_or_adds_a_word(
     extra = {word for word in _words(rig) if word not in _PERMITTED_WORDS and not word.isdigit()}
     assert not extra, f'{verb} handed the daemon {sorted(extra)}, which is outside the permitted vocabulary'
     assert EXPECTED_AGENT_PROJECT not in _words(rig), 'a dev verb reached the agent stack project'
+    assert EXPECTED_PROD_PROJECT not in _words(rig), "a dev verb reached prod's default project"
 
 
 @pytest.mark.parametrize(('verb', 'arguments'), list(_ACCEPTED_CALLS.values()), ids=list(_ACCEPTED_CALLS))
@@ -589,6 +595,7 @@ _ATTACHED_SHORT_OPTIONS = (
     '-f/workspace/docker-compose.yaml',
     f'-p{EXPECTED_AGENT_PROJECT}',
     '-ptrader_joe_prod',
+    f'-p{EXPECTED_PROD_PROJECT}',
     '-p/etc',
 )
 

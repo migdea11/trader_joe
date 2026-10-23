@@ -83,7 +83,7 @@ pytestmark = pytest.mark.build_infra
 REAL_CREATE_SUBPROCESS_EXEC = asyncio.create_subprocess_exec
 
 DOCKER = '/usr/local/bin/docker'
-PROJECT = 'trader_joe'
+PROJECT = 'trader_joe_dev'
 TRUSTED = '/opt/agent_mcp/compose'
 TEST_FILES = ('docker-compose.yaml', 'docker-compose.fake.yaml')
 DEV_STORE_IMAGE = 'trader_joe_data_store:dev'
@@ -107,11 +107,11 @@ LINES = {'DEV': DEV_LINE, 'TEST': TEST_LINE}
 # The selection line each result starts with (owner ruling: 'prints which one it used', as make migrate does).
 SELECTION = {
     'DEV': (
-        'using the DEV definition (docker-compose.yaml + docker-compose.override.yaml) of project trader_joe '
+        'using the DEV definition (docker-compose.yaml + docker-compose.override.yaml) of project trader_joe_dev '
         'in DEV mode (revisions from the root checkout)'
     ),
     'TEST': (
-        'using the TEST definition (docker-compose.yaml + docker-compose.fake.yaml) of project trader_joe '
+        'using the TEST definition (docker-compose.yaml + docker-compose.fake.yaml) of project trader_joe_dev '
         'in TEST mode (the :test image; alembic.ini and revisions from the root checkout)'
     ),
 }
@@ -119,7 +119,7 @@ NOTHING_UP = 'nothing is up: call up (your dev data) or test_up first'
 EMPTY_VERSIONS = f'no revision files in {VERSIONS}: wrong checkout?'
 # 183f296: the hint is mode-neutral (it used to say 'start the dev stack first', wrong under TEST).
 NEUTRAL_HINT = 'start the project first: up (your dev data) or test_up (test mode)'
-NO_POSTGRES = f'no running postgres container in the trader_joe project: {NEUTRAL_HINT}'
+NO_POSTGRES = f'no running postgres container in the trader_joe_dev project: {NEUTRAL_HINT}'
 # The stamp read of the :test data_store IMAGE, the image the TEST one-off runs (d6b942f).
 IMAGE_STAMP_READ = (DOCKER, 'image', 'inspect', '--format', STAMP_FORMAT, TEST_STORE_IMAGE)
 LOOKUP_FAILED = 'the container lookup failed (exit 1); see the steps'
@@ -507,7 +507,7 @@ REFUSALS = {
     'the postgres lookup failed': (_postgres_lookup_failed, LOOKUP_FAILED, 2),
     'two running data_store': (
         _two_data_store,
-        '2 running data_store containers in the trader_joe project; cannot tell which stack',
+        '2 running data_store containers in the trader_joe_dev project; cannot tell which stack',
         3,
     ),
     'the data_store lookup failed': (_data_store_lookup_failed, LOOKUP_FAILED, 3),
@@ -528,7 +528,7 @@ def test_each_refusal_runs_only_the_steps_before_it_no_alembic_and_charges_nothi
     if breaks is _stale_copy:
         assert result['message'].startswith(f'{STALE_PREFIX}tools/source_digest.sh differs'), result
     elif breaks is _two_postgres:
-        assert result['message'].startswith('2 running postgres containers in the trader_joe project'), result
+        assert result['message'].startswith('2 running postgres containers in the trader_joe_dev project'), result
     elif breaks is _missing_image:
         assert result['message'] == IMAGE_REFUSAL[mode], result
     else:
@@ -574,7 +574,7 @@ def test_d6_checks_the_bind_sources_of_the_mode_that_is_up(
 
 # Two things broken at once: the EARLIER check of the designed order must be the one that answers.
 PAIRS = {
-    'the guard before S6': (_prod, _stale_copy, 'project trader_joe has containers not started'),
+    'the guard before S6': (_prod, _stale_copy, 'project trader_joe_dev holds a container not started'),
     'empty before S6': (_empty, _stale_copy, NOTHING_UP),
     'S6 before D6': (_stale_copy, _symlinked_migrations, STALE_PREFIX),
     'D6 before D5': (_symlinked_migrations, _env_file_a_directory, 'a symlink at server/data/store/migrations'),
@@ -773,7 +773,7 @@ def test_a_failed_digest_answers_failed_before_any_stamp_and_charges_nothing(
 @pytest.mark.parametrize(
     ('answer', 'message'),
     [
-        ((0, f'{INGEST_ID}\n{STORE_ID}\n'.encode()), '2 running data_ingest containers in the trader_joe project'),
+        ((0, f'{INGEST_ID}\n{STORE_ID}\n'.encode()), '2 running data_ingest containers in the trader_joe_dev project'),
         ((1, b''), LOOKUP_FAILED),
         ((0, b'trader_joe-data_ingest-1\n'), 'the container lookup returned something that is not a container id'),
     ],
@@ -1281,7 +1281,7 @@ def test_every_no_container_refusal_carries_the_mode_neutral_hint(
     responder.lookups[service] = (0, b'')
     result = rig.call(verb, arguments)
     assert result['status'] == 'refused', result
-    assert result['message'].startswith(f'no running {service} container in the trader_joe project: {NEUTRAL_HINT}')
+    assert result['message'].startswith(f'no running {service} container in the trader_joe_dev project: {NEUTRAL_HINT}')
     assert 'start the dev stack first' not in result['message']
 
 
@@ -1377,10 +1377,14 @@ def test_the_test_data_dir_is_the_makefiles():
     text = (REPO_ROOT / 'Makefile').read_text(encoding='utf-8')
     match = re.search(r'^TEST_DATA_DIR\s*:?=\s*(\S+)\s*$', text, re.MULTILINE)
     assert match is not None and match.group(1) == TEST_DATA_DIR, match
+    # Re-pinned for tj-grna9p.161 (ADR tj-4rr0la addendum 29): the Makefile's test set now carries
+    # -p $(DEV_PROJECT) (trader_joe_dev). This pins the Makefile side only; the MCP's own test-mode
+    # project moves with tj-iee6sn.31, not here.
     assert (
-        'SYSTEM_COMPOSE := DATA_DIR=$(TEST_DATA_DIR) docker compose -f docker-compose.yaml -f docker-compose.fake.yaml'
-        in text
-    )
+        'SYSTEM_COMPOSE := DATA_DIR=$(TEST_DATA_DIR) docker compose -p $(DEV_PROJECT) -f docker-compose.yaml '
+        '-f docker-compose.fake.yaml'
+    ) in text
+    assert re.search(r'^DEV_PROJECT\s*:=\s*trader_joe_dev\s*$', text, re.MULTILINE), 'DEV_PROJECT is not trader_joe_dev'
 
 
 def _services(name: str) -> dict[str, Any]:

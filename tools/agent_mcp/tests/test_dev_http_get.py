@@ -45,7 +45,7 @@ pytestmark = pytest.mark.build_infra
 
 # --- the constants, from literals --------------------------------------------------------------
 EXPECTED_DOCKER = '/usr/local/bin/docker'
-EXPECTED_DEV_PROJECT = 'trader_joe'
+EXPECTED_DEV_PROJECT = 'trader_joe_dev'
 CONTAINER_ID = 'c0ffee000001'
 STACK_DIR = Path('/stack')
 EXPECTED_PATHS = {'ping': '/ping', 'ui_config': '/ui/v1/config', 'usage_summary': '/ui/v1/stats/usage/summary'}

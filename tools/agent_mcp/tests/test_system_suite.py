@@ -8,7 +8,7 @@ the paths (spelling, then git); the mode guard, TEST only; the S6 stale-copy che
 preflight; the postgres data mount (one lookup, then ONE fixed inspect, accepted only when its source is
 <repo host path>/volume_data/test/postgres); a running data_store (the builder's deviation 2), the two
 digests and the stamp of every running data_store and data_ingest container; then the snapshot and its
-checks, and ONE budget charge. THE CLIENT: up's secret wrapper around `docker compose -p trader_joe
+checks, and ONE budget charge. THE CLIENT: up's secret wrapper around `docker compose -p trader_joe_dev
 --project-directory <snapshot> --env-file <repo host path>/.env` and three trusted files, the third an
 MCP-only overlay that sets test_client's build.dockerfile alone. check_testclient_argv admits only the
 three client tails, and the dev lifecycle check refuses that prefix.
@@ -67,10 +67,13 @@ from tools.agent_mcp.tests.test_dev_label_verbs import (
 pytestmark = pytest.mark.build_infra
 
 DOCKER = '/usr/local/bin/docker'
+# Dev and test's explicit project (ADR tj-4rr0la addendum 29; tj-iee6sn.31); prod keeps the default.
+PROJECT = 'trader_joe_dev'
+PROD_PROJECT = 'trader_joe'
 TRUSTED = '/opt/agent_mcp/compose'
 MODE_REFUSAL = 'the system suite runs only in test mode: call test_up first; your dev data is not touched'
 STALE_STACK = 'stale test stack: call test_build, then test_up'
-NO_DATA_STORE = 'no running data_store container in the trader_joe project: call test_up'
+NO_DATA_STORE = 'no running data_store container in the trader_joe_dev project: call test_up'
 MOUNT_FORMAT = '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Source}}{{end}}{{end}}'
 CLIENT_FILES = ('docker-compose.yaml', 'docker-compose.test-client.yaml', 'docker-compose.agent-client.yaml')
 OVERLAY = REPO_ROOT / 'docker-compose.agent-client.yaml'
@@ -515,7 +518,7 @@ def test_the_client_prefix_spelled_from_literals(tmp_path: Path):
         DOCKER,
         'compose',
         '-p',
-        'trader_joe',
+        PROJECT,
         '--project-directory',
         '/stack/source',
         '--env-file',
@@ -561,7 +564,7 @@ def _prefix_with(files: tuple[str, ...], project_dir: str = '/stack/source', env
         DOCKER,
         'compose',
         '-p',
-        'trader_joe',
+        PROJECT,
         '--project-directory',
         project_dir,
         '--env-file',
@@ -629,6 +632,8 @@ _REFUSED_PREFIXES = {
         'trader_joe_agent_stack',
         *_prefix_with(CLIENT_FILES)[4:],
     ],
+    # tj-iee6sn.31: prod's default project, the one name no client command may ever carry.
+    "prod's default project": ['/usr/local/bin/docker', 'compose', '-p', PROD_PROJECT, *_prefix_with(CLIENT_FILES)[4:]],
 }
 
 
@@ -681,7 +686,7 @@ def test_the_client_command_is_compose_itself_with_no_wrapper(
         DOCKER,
         'compose',
         '-p',
-        'trader_joe',
+        PROJECT,
         '--project-directory',
         f'{stack_dir}/source',
         '--env-file',

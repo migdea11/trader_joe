@@ -109,17 +109,12 @@ MAX_TEST_PATHS = 50
 # property of the argv rather than of the builders that produce it.
 #
 # THE PROJECT NAME IS A CONSTANT, never an argument and never derived from anything an agent writes.
-# The dev targets pass no -p (Makefile, DEV_COMPOSE), so their project is compose's default: the
-# checkout directory's name, which is trader_joe in this repository (.devcontainer/compose.yml's
-# header states the same spelling for the repo directory). A checkout under another directory name
-# simply has no containers under this project and the verb says so -- it cannot reach a different one.
-#
-# WHAT THIS DOES NOT PROVE, stated because a comment that overclaims is worse than none: prod-launch
-# passes no -p either, so a prod stack brought up from a checkout ALSO named trader_joe is the same
-# compose project as dev and these two verbs would read it. Read-only, and only on that one host, but
-# real -- ADR tj-4rr0la addendum 18 records it, and giving prod its own explicit project name is the
-# fix, which is an ops change outside this task.
-DEV_PROJECT = 'trader_joe'
+# Dev and test run as the explicit compose project trader_joe_dev (Makefile -p; ADR tj-4rr0la
+# addendum 29, decision tj-oxxl8a option A). PROD keeps compose's default project (the checkout
+# directory's name) and no MCP command ever names it: no argv, lookup filter, pinned
+# COMPOSE_PROJECT_NAME or text here uses the bare name. A prod stack therefore sits in a different
+# project from everything these verbs reach, and the mode guard below stays as defence in depth.
+DEV_PROJECT = 'trader_joe_dev'
 # The long-running services of the dev set (docker-compose.yaml, the override and the web files).
 # pgAdmin lives in docker-compose.tools.yaml, a file no log or ps verb loads, and is deliberately absent.
 DEV_SERVICES = ('postgres', 'data_store', 'data_ingest', 'web')
@@ -754,7 +749,7 @@ def base_pull_step(ref: str, cwd: Path) -> Step:
 # verbs run test_client of the ONE project, in TEST mode: the services are the :test images test_up
 # started from the root checkout, and the client and every mount it has come from the SNAPSHOT of the named
 # worktree, so a worktree's unintegrated tests and code reach the client. The command is
-#   docker compose -p trader_joe --project-directory <snapshot> --env-file <repo host path>/.env
+#   docker compose -p trader_joe_dev --project-directory <snapshot> --env-file <repo host path>/.env
 #   -f <trusted base> -f <trusted client file> -f <trusted client overlay> <tail>
 # No secret wrapper: test_up starts data_store unwrapped, so its INSTANCE_WRITE_SECRET is the root env
 # file's value as compose interpolates it, and the client interpolates the same file the same way -- the
@@ -1262,10 +1257,10 @@ def check_dev_bind_sources(repo_root: Path, sources: Sequence[str] = DEV_BIND_SO
 TEST_BIND_SOURCES = ('server/data/store/alembic.ini', 'server/data/store/migrations', 'tests/fakes')
 
 
-# D7 GENERALISED INTO THE MODE GUARD (ADR tj-4rr0la addenda 26-27; tj-iee6sn.24). Neither the prod nor the
-# dev nor the test compose set passes -p, so all name the project after the checkout directory,
-# trader_joe; a prod-mode stack launched from such a checkout IS this project, and a state-changing verb
-# would act on it. One `docker ps` over the config_files label, over the project's NON-one-off
+# D7 GENERALISED INTO THE MODE GUARD (ADR tj-4rr0la addenda 26-27, 29; tj-iee6sn.24, .31). Dev and test
+# run in the explicit project trader_joe_dev and prod in the default one, so a prod stack is no longer
+# this project; should a prod-labelled container ever be found here anyway, a state-changing verb would
+# act on it, so it is refused. One `docker ps` over the config_files label, over the project's NON-one-off
 # containers (alembic runs and test_client are `run` containers and are ignored), classified by the
 # basename of each container's files exactly as run_migrations.sh's classify_config_files does:
 #   DEV   the override present, the fake file absent        (make dev-up, MCP up)
@@ -1360,8 +1355,8 @@ def check_mode_guard(
     command, bytes that are not UTF-8, a missing final newline, a blank line (a container with no label).
     """
     prod = (
-        f'project {DEV_PROJECT} has containers not started from the dev or test files (a prod launch?): '
-        'stop them with make prod-down; tj-oxxl8a'
+        f'project {DEV_PROJECT} holds a container not started from the dev or test files (a prod launch?): '
+        'stop it with make dev-down; tj-oxxl8a'
     )
     if exit_status != 0:
         raise Refused(f'could not list the containers of project {DEV_PROJECT}, so nothing was changed')
@@ -1461,7 +1456,7 @@ class DevBudget:
 
 # ---------------------------------------------------------------------------------------------
 # THE LABEL-ONLY MUTATING VERBS, down AND restart (tj-iee6sn.7; owner rulings D1, D2, D6, D7).
-# `docker compose -p trader_joe down` and `... restart <service>` pass no -f, so compose may search the
+# `docker compose -p trader_joe_dev down` and `... restart <service>` pass no -f, so compose may search the
 # step's working directory (the stack directory) and every parent for a compose file, and reads a .env
 # beside one. The step's environment is pinned (dev_label_only_step_env) and this refuses, before the
 # step, if anything of that kind is there. lstat only, nothing is opened.
@@ -1516,12 +1511,12 @@ def _dev_lifecycle_label_steps(stack_dir: Path, tail: Sequence[str]) -> list[Ste
 
 
 def dev_down_steps(stack_dir: Path) -> list[Step]:
-    """`docker compose -p trader_joe down`: containers and project networks removed; no -v, no --rmi, no --remove-orphans."""
+    """`docker compose -p trader_joe_dev down`: containers and project networks removed; no -v, no --rmi, no --remove-orphans."""
     return _dev_lifecycle_label_steps(stack_dir, ['down'])
 
 
 def dev_restart_steps(stack_dir: Path, service: str) -> list[Step]:
-    """`docker compose -p trader_joe restart <service>` for one member of DEV_RESTART_SERVICES."""
+    """`docker compose -p trader_joe_dev restart <service>` for one member of DEV_RESTART_SERVICES."""
     return _dev_lifecycle_label_steps(stack_dir, ['restart', validate_dev_restart_service(service)])
 
 
@@ -1615,7 +1610,7 @@ def parse_source_digest(exit_status: int | None, stdout: bytes) -> str | None:
 
 
 def dev_build_step(stack_dir: Path, repo_host_path: Path, digests: Sequence[str]) -> Step:
-    """`docker compose -p trader_joe ... build data_store data_ingest web`, checked as built.
+    """`docker compose -p trader_joe_dev ... build data_store data_ingest web`, checked as built.
 
     The step env is the placeholder env plus the two digests, which are validated 64-hex values
     (parse_source_digest) and appear in no argv. Building, so the runner makes the bases present first.
@@ -1758,7 +1753,7 @@ def dev_network_steps(stack_dir: Path) -> tuple[Step, Step]:
 # INSTANCE_WRITE_SECRET guard (that is the web files') and name no devnet; the services read their own
 # env_file through compose, as under make system-launch.
 def testmode_build_step(stack_dir: Path, repo_host_path: Path, digests: Sequence[str]) -> Step:
-    """`docker compose -p trader_joe ... build data_store data_ingest` over the test build set, checked as built.
+    """`docker compose -p trader_joe_dev ... build data_store data_ingest` over the test build set, checked as built.
 
     The step env is the placeholder env (no env file is read), DATA_DIR on the test dir and the two
     validated source digests, which appear in no argv. Building, so the runner makes the bases present first.
@@ -1774,7 +1769,7 @@ def testmode_build_step(stack_dir: Path, repo_host_path: Path, digests: Sequence
 
 
 def testmode_up_step(stack_dir: Path, repo_host_path: Path) -> Step:
-    """`docker compose -p trader_joe ... up -d --wait --wait-timeout 300` over the test set, checked as built.
+    """`docker compose -p trader_joe_dev ... up -d --wait --wait-timeout 300` over the test set, checked as built.
 
     The step env is the pinned env (compose reads the project's env files itself) with DATA_DIR on the
     test dir. No digest: test_up requires both images to exist and match the checkout, so nothing is built.

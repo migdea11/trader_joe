@@ -43,7 +43,9 @@ pytestmark = pytest.mark.build_infra
 
 # --- the constants, from literals --------------------------------------------------------------
 EXPECTED_DOCKER = '/usr/local/bin/docker'
-EXPECTED_DEV_PROJECT = 'trader_joe'
+EXPECTED_DEV_PROJECT = 'trader_joe_dev'
+# Prod's project, compose's default (ADR tj-4rr0la addendum 29): no lookup may ever filter on it.
+EXPECTED_PROD_PROJECT = 'trader_joe'
 EXPECTED_AGENT_PROJECT = 'trader_joe_agent_stack'
 EXPECTED_DEV_SERVICES = ('postgres', 'data_store', 'data_ingest')
 # Read-only for every statement of the session: libpq hands PGOPTIONS to the server at connect.

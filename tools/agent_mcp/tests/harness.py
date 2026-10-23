@@ -480,9 +480,12 @@ def response_for(
 
 
 # The client's command (tj-iee6sn.20; no shell wrapper since 5a38b7f), spelled from literals:
-#   docker compose -p trader_joe --project-directory <stack>/source --env-file <host>/.env
+#   docker compose -p trader_joe_dev --project-directory <stack>/source --env-file <host>/.env
 #   -f <trusted>/docker-compose.yaml -f <trusted>/docker-compose.test-client.yaml -f <trusted>/docker-compose.agent-client.yaml
 CLIENT_FILES = ('docker-compose.yaml', 'docker-compose.test-client.yaml', 'docker-compose.agent-client.yaml')
+# The one project the client runs in: dev and test's explicit trader_joe_dev (ADR tj-4rr0la addendum 29,
+# tj-iee6sn.31), never prod's default. A literal, never stack.DEV_PROJECT, so the oracle is not the code.
+CLIENT_PROJECT = 'trader_joe_dev'
 
 
 def client_prefix_words_for(stack_dir: Path, repo_host_path: Path) -> list[str]:
@@ -491,7 +494,7 @@ def client_prefix_words_for(stack_dir: Path, repo_host_path: Path) -> list[str]:
         '/usr/local/bin/docker',
         'compose',
         '-p',
-        'trader_joe',
+        CLIENT_PROJECT,
         '--project-directory',
         f'{stack_dir}/source',
         '--env-file',
@@ -506,13 +509,13 @@ def client_prefix_words(layout: Layout) -> list[str]:
 
 
 def is_client_step(step: stack.Step) -> bool:
-    """A step under the client's prefix: `docker compose -p trader_joe --project-directory D --env-file F`.
+    """A step under the client's prefix: `docker compose -p trader_joe_dev --project-directory D --env-file F`.
 
     The --env-file right after the project directory is what tells it from every other file-based compose step.
     """
     return (
         len(step.argv) > 7
-        and list(step.argv[:5]) == ['/usr/local/bin/docker', 'compose', '-p', 'trader_joe', '--project-directory']
+        and list(step.argv[:5]) == ['/usr/local/bin/docker', 'compose', '-p', CLIENT_PROJECT, '--project-directory']
         and step.argv[6] == '--env-file'
     )
 

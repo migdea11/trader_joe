@@ -39,7 +39,7 @@ from tools.agent_mcp.tests.test_commands import _mcp_dockerfile_copies
 pytestmark = pytest.mark.build_infra
 
 DOCKER = '/usr/local/bin/docker'
-PROJECT = 'trader_joe'
+PROJECT = 'trader_joe_dev'
 TRUSTED = '/opt/agent_mcp/compose'
 BASH = '/usr/bin/bash'
 DIGEST_SCRIPT = f'{TRUSTED}/tools/source_digest.sh'
@@ -76,8 +76,8 @@ PLACEHOLDER_ENV = (
     ('COMPOSE_BAKE', 'false'),
 )
 BUILD_ENV = (*PLACEHOLDER_ENV, ('SOURCE_DIGEST_DATA_STORE', STORE_DIGEST), ('SOURCE_DIGEST_DATA_INGEST', INGEST_DIGEST))
-OK_MESSAGE = 'the trader_joe :dev images (data_store, data_ingest, web) are built and stamped'
-BUILD_FAILED = 'compose build failed for the trader_joe project'
+OK_MESSAGE = 'the trader_joe_dev :dev images (data_store, data_ingest, web) are built and stamped'
+BUILD_FAILED = 'compose build failed for the trader_joe_dev project'
 BUDGET_REFUSAL = '12 state-changing dev verbs in the last hour is the budget; wait, or run the make target yourself'
 STALE_PREFIX = 'the MCP image is stale: '
 GENERATE_HINT = 'run make proto gen-proto-ts in the root checkout'

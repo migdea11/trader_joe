@@ -45,7 +45,7 @@ from tools.agent_mcp.tests.test_commands import EXPECTED_DEV_BAKES, _baked_into_
 pytestmark = pytest.mark.build_infra
 
 EXPECTED_DOCKER = '/usr/local/bin/docker'
-EXPECTED_PROJECT = 'trader_joe'
+EXPECTED_PROJECT = 'trader_joe_dev'
 EXPECTED_TRUSTED_DIR = '/opt/agent_mcp/compose'
 EXPECTED_DEV_COMPOSE_FILES = (
     'docker-compose.yaml',
@@ -719,13 +719,14 @@ _GUARD_REFUSALS = {
 }
 
 
-# The PROD refusal, tj-iee6sn.24 WHAT (1)'s text exactly.
+# The PROD refusal, tj-iee6sn.24 WHAT (1)'s text as tj-iee6sn.31 rewords it, exactly: the project is
+# trader_joe_dev, and the stray is stopped by make dev-down (the down of this project), never prod-down.
 EXPECTED_GUARD_REFUSAL = (
-    'project trader_joe has containers not started from the dev or test files (a prod launch?): '
-    'stop them with make prod-down; tj-oxxl8a'
+    'project trader_joe_dev holds a container not started from the dev or test files (a prod launch?): '
+    'stop it with make dev-down; tj-oxxl8a'
 )
 EXPECTED_MIXED_REFUSAL = (
-    'project trader_joe holds dev and test containers together, so which mode is up cannot be told: '
+    'project trader_joe_dev holds dev and test containers together, so which mode is up cannot be told: '
     'stop them with make dev-down'
 )
 

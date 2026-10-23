@@ -2,7 +2,7 @@
 
 Agents have no Docker socket and no docker CLI, by standing rule. This server runs in its own
 container (tools/agent_mcp/Dockerfile, started by make agent-mcp-up) and gives them FIXED VERBS over
-ONE compose project, the owner's own (stack.DEV_PROJECT, trader_joe), in its DEV or TEST mode. There
+ONE compose project, the owner's own (stack.DEV_PROJECT, trader_joe_dev), in its DEV or TEST mode. There
 is no second, isolated stack: the separate agent stack (its own compose project, generated env files
 and data directory, and its own verbs stack_up, stack_down and stack_wipe, plus its separate
 logs and ps, which the one-project logs and ps below replace) was retired in favour of modes of
@@ -17,7 +17,7 @@ TWO READ-ONLY VERBS (ADR tj-4rr0la addendum 18; tj-kzy7w2, approved on tj-wpnr7o
 
     ps()  logs(service, tail)
 
-They run `docker compose -p trader_joe ps|logs` and nothing else.
+They run `docker compose -p trader_joe_dev ps|logs` and nothing else.
 
 and THREE READ-ONLY EXEC VERBS into that project (ADR tj-4rr0la addendum 22; the proxy's EXEC section):
 
@@ -37,7 +37,7 @@ and TWO STATE-CHANGING LABEL-ONLY VERBS over the same project (tj-iee6sn.7):
 
     down()  restart(service)       service: data_store, data_ingest or web, never postgres
 
-down is `docker compose -p trader_joe down`: containers and project networks removed, never a
+down is `docker compose -p trader_joe_dev down`: containers and project networks removed, never a
 volume, an image or an orphan (the database is a host bind and survives). restart restarts one
 existing container. Neither loads a compose file or an env file. Each refuses, running nothing after
 the refusal, unless the D7 guard finds every project container started from the dev files; restart
@@ -141,7 +141,7 @@ MODULES
 Everything but server.py imports the standard library only, so the dev venv -- which does not install
 the agent-mcp group -- can import and test it.
 
-COMMANDS. Every docker command but the base-image pair below is `docker compose -p trader_joe` plus a
+COMMANDS. Every docker command but the base-image pair below is `docker compose -p trader_joe_dev` plus a
 prefix and a fixed tail, built in stack.py and re-checked as built:
     label-only (ps, logs, down, restart): the four words, nothing else.
     file-based (build, up, tools, migrate, test_build, test_up): --project-directory is the
@@ -168,7 +168,7 @@ directory of test_client: its build context and every relative bind source. stac
 and stack.resolve_test_paths run on it. No other verb reads a worktree or takes a snapshot (migrate
 included: it runs from the baked files against the checkout's host path). The premise, checked by
 settings: nothing but the MCP writes under the stack directory.
-run_system_tests and seed_dump run test_client of the ONE project (trader_joe) against TEST mode,
+run_system_tests and seed_dump run test_client of the ONE project (trader_joe_dev) against TEST mode,
 started by test_up. The services there run the :test images of the ROOT checkout; test_client and
 every mount it has come from the snapshot of the named worktree, so a worktree's unintegrated tests
 reach the client. Rails, in order and each refusing before anything runs: only TEST mode is up (the
