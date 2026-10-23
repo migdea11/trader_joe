@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
 import { create } from '@bufbuild/protobuf'
+import { timestampFromMs } from '@bufbuild/protobuf/wkt'
 import type { IGetRowsParams } from 'ag-grid-community'
 
 import { DataSource, DataType, Feed, Granularity, UpdateType } from '@generated/trader_joe/proto/market/v1/enums_pb'
 import {
+  ClientKind,
   DatasetFacetsSchema,
   DatasetSummarySchema,
   FreshnessStatus,
@@ -15,7 +17,7 @@ import { MISSING } from '@/format/formatters'
 import { RUNNING_BADGE } from '@/theme/semantics'
 import { createCursorDatasource } from './cursorDatasource'
 import type { CursorPage } from './cursorDatasource'
-import { facetCounts } from './facets'
+import { facetCounts, usageCount } from './facets'
 import {
   filtersKey,
   hasActiveFilters,
@@ -92,13 +94,20 @@ describe('toCatalogQuery', () => {
 })
 
 describe('toApiFilters and helpers', () => {
-  it('the Needs Attention view sends needsAttention true, All sends nothing', () => {
+  // tj-grna9p.88: the Read By kinds and the fixed stale threshold always go out, so every usage
+  // figure answers for the Read By choice; nothing else is sent under All.
+  it('the Needs Attention view sends needsAttention true, All sends only the usage parameters', () => {
     expect(toApiFilters({ view: 'needs-attention' }).needsAttention).toBe(true)
-    expect(toApiFilters({ view: 'all' })).toEqual({
+    expect(toApiFilters({ view: 'all' })).toStrictEqual({
       status: undefined,
       source: undefined,
       updateType: undefined,
       needsAttention: undefined,
+      running: undefined,
+      usage: undefined,
+      expiresBefore: undefined,
+      clientKinds: [ClientKind.SDK],
+      staleDays: 90,
     })
     expect(toApiFilters({ view: 'all', status: 'failed', source: DataSource.ALPACA_API })).toMatchObject({
       status: 'failed',
@@ -213,7 +222,34 @@ describe('facetCounts', () => {
       status: { healthy: 0, late: 0, failed: 0, retired: 0 },
       sources: [],
       updateTypes: { 0: 0, 1: 0, 2: 0, 3: 0 },
+      stale: 0,
+      read30d: 0,
+      neverRead: 0,
+      expiringSoon: 0,
     })
+  })
+
+  it('the threshold and Expiring Soon bound echoes are carried, unset when the server sent none', () => {
+    const bound = Date.UTC(2026, 9, 21, 6, 30)
+    const counts = facetCounts(create(DatasetFacetsSchema, { ...facets, staleDays: 30, expiresBefore: timestampFromMs(bound) }))
+    expect(counts.staleDays).toBe(30)
+    expect(counts.expiresBefore).toEqual(new Date(bound))
+    const none = facetCounts(create(DatasetFacetsSchema, {}))
+    expect(none.staleDays).toBeUndefined()
+    expect(none.expiresBefore).toBeUndefined()
+  })
+
+  it('usageCount is the one usage-group-to-count mapping', () => {
+    const counts = facetCounts(create(DatasetFacetsSchema, { stale: 9n, read30d: 21n, neverRead: 4n, all: 40n }))
+    expect(usageCount(counts, 'read-30d')).toBe(21)
+    expect(usageCount(counts, 'stale')).toBe(9)
+    expect(usageCount(counts, 'never-read')).toBe(4)
+  })
+
+  it('the usage counts (tj-grna9p.88) are DatasetFacets.stale, read_30d, never_read and expiring_soon as numbers', () => {
+    const counts = facetCounts(create(DatasetFacetsSchema, { ...facets, stale: 9n, read30d: 21n, neverRead: 4n, expiringSoon: 3n }))
+    expect([counts.stale, counts.read30d, counts.neverRead, counts.expiringSoon]).toEqual([9, 21, 4, 3])
+    expect(() => facetCounts(create(DatasetFacetsSchema, { stale: 2n ** 60n }))).toThrow(RangeError)
   })
 
   it('a count beyond the safe-integer range is a RangeError, not a rounded number', () => {

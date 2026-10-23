@@ -8,7 +8,7 @@ import { defineStore } from 'pinia'
 import { ApiError, getDatasetFacets } from '@/api'
 import { facetCounts } from '@/catalog/facets'
 import type { FacetCounts } from '@/catalog/facets'
-import { toApiFilters } from '@/catalog/filters'
+import { effectiveClientKinds, hasActiveFilters, toApiFilters, toUsageFilters } from '@/catalog/filters'
 import type { CatalogFilters } from '@/catalog/filters'
 
 export type CatalogLoadStatus = 'loading' | 'ready' | 'empty' | 'error'
@@ -19,9 +19,21 @@ export interface CatalogError {
   errorId: string | undefined
 }
 
-/** No view or sidebar filter is set, so the facets response is the whole catalog's. */
+/**
+ * No view or sidebar filter is set, so the facets response is the whole catalog's. The Read By
+ * choice is not a filter here: the tiles and the sidebar both answer for it.
+ */
 function isUnfiltered(filters: CatalogFilters): boolean {
-  return Object.values(toApiFilters(filters)).every((value) => value === undefined)
+  return filters.view === 'all' && !hasActiveFiltersExceptReadBy(filters)
+}
+
+function hasActiveFiltersExceptReadBy(filters: CatalogFilters): boolean {
+  return hasActiveFilters({ ...filters, clientKinds: undefined })
+}
+
+/** What the tiles' usage counts depend on: when it changes, the tiles are fetched again. */
+function usageKey(filters: CatalogFilters): string {
+  return JSON.stringify(effectiveClientKinds(filters))
 }
 
 export function describeError(error: unknown): CatalogError {
@@ -50,6 +62,8 @@ export const useDatasetCatalogStore = defineStore('datasetCatalog', () => {
 
   let inflight: AbortController | null = null
   let tilesInflight: AbortController | null = null
+  /** The Read By choice the tiles' counts were fetched under. */
+  let tilesUsageKey: string | null = null
 
   /** Fetch the counts under the filters. A call still in flight is cancelled. */
   async function loadFacets(filters: CatalogFilters): Promise<void> {
@@ -65,6 +79,7 @@ export const useDatasetCatalogStore = defineStore('datasetCatalog', () => {
       if (isUnfiltered(filters)) {
         tiles.value = facets.value
         tilesError.value = null
+        tilesUsageKey = usageKey(filters)
       }
     } catch (error) {
       if (controller.signal.aborted) return
@@ -74,16 +89,17 @@ export const useDatasetCatalogStore = defineStore('datasetCatalog', () => {
     }
   }
 
-  /** Fetch the tile counts (no filters). A call still in flight is cancelled. */
-  async function loadTiles(): Promise<void> {
+  /** Fetch the tile counts (no filters but Read By). A call still in flight is cancelled. */
+  async function loadTiles(filters: CatalogFilters = { view: 'all' }): Promise<void> {
     tilesInflight?.abort()
     const controller = new AbortController()
     tilesInflight = controller
     try {
-      const result = await getDatasetFacets({ signal: controller.signal })
+      const result = await getDatasetFacets({ ...toUsageFilters(filters), signal: controller.signal })
       if (controller.signal.aborted) return
       tiles.value = facetCounts(result)
       tilesError.value = null
+      tilesUsageKey = usageKey(filters)
     } catch (error) {
       if (controller.signal.aborted) return
       tilesError.value = describeError(error)
@@ -118,17 +134,20 @@ export const useDatasetCatalogStore = defineStore('datasetCatalog', () => {
    */
   function loadCounts(filters: CatalogFilters): void {
     void loadFacets(filters)
-    if (!isUnfiltered(filters)) void loadTiles()
+    if (!isUnfiltered(filters)) void loadTiles(filters)
   }
 
   /**
    * The filters changed: refetch the counts under them. The tiles do not follow the filters, so they
    * are fetched again only if no whole-catalog counts have arrived yet (the first request was
-   * superseded by this filter change before it answered).
+   * superseded by this filter change before it answered), or the Read By choice they answer for
+   * changed (the Stale tile follows it).
    */
   function filtersChanged(filters: CatalogFilters): void {
     void loadFacets(filters)
-    if (!isUnfiltered(filters) && tiles.value === null) void loadTiles()
+    if (!isUnfiltered(filters) && (tiles.value === null || tilesUsageKey !== usageKey(filters))) {
+      void loadTiles(filters)
+    }
   }
 
   /** Reload the list from its first page and the counts. The caller passes the current filters. */

@@ -13,9 +13,11 @@ import type { ColDef, IDatasource, IGetRowsParams } from 'ag-grid-community'
 
 import { DataSource, Feed, Granularity, UpdateType } from '@generated/trader_joe/proto/market/v1/enums_pb'
 import {
+  ClientKind,
   DatasetSummarySchema,
   FreshnessStatus,
   IngestRunState,
+  UsageFilter,
   type DatasetSummary,
 } from '@generated/trader_joe/proto/ui/v1/data_pb'
 import { DatasetChange } from '@generated/trader_joe/proto/ui/v1/events_pb'
@@ -26,8 +28,10 @@ import { fakeEvents } from '@/__tests__/fakeEvents'
 import { ApiError } from '@/api'
 import { COALESCE_MS } from '@/catalog/useCatalogLiveRefresh'
 import CoverageCell from '@/components/catalog/CoverageCell.vue'
+import ExpiresCell from '@/components/catalog/ExpiresCell.vue'
 import StatusCell from '@/components/catalog/StatusCell.vue'
 import SymbolCell from '@/components/catalog/SymbolCell.vue'
+import UsageCell from '@/components/catalog/UsageCell.vue'
 import router from '@/router'
 import AppShell from '@/shell/AppShell.vue'
 import { useDatasetCoverageStore } from '@/stores/datasetCoverage'
@@ -420,8 +424,9 @@ describe('Refresh and Show Request', () => {
     const shell = await screenAt('/data/datasets?view=needs-attention&status=failed')
     const button = shell.findAll('button').find((b) => b.text() === 'Show Request')!
     await button.trigger('click')
+    // tj-grna9p.88: the Read By kinds (default SDK) and the fixed stale threshold always go out.
     expect(shell.find('[data-testid="catalog-request"]').text()).toBe(
-      'GET /api/store/ui/v1/datasets?status=failed&needs_attention=true&limit=100',
+      'GET /api/store/ui/v1/datasets?status=failed&needs_attention=true&client_kind=SDK&stale_days=90&limit=100',
     )
     expect(button.attributes('aria-pressed')).toBe('true')
   })
@@ -484,6 +489,8 @@ describe('rows', () => {
       // tj-grna9p.112: the cell shows only x/y, so the unit moved into the header. Built from the
       // same constant and titleCase the screen uses, so renaming the unit word moves both together.
       `${titleCase('Coverage')} (${titleCase(COVERAGE_UNIT)})`,
+      // tj-grna9p.88: the usage column sits before Expires; architect ruling (B) heads it Last Read.
+      'Last Read',
       'Expires',
     ])
     // The status column (colId kept as 'collection') is headed Status; no header anywhere reads Collection.
@@ -497,9 +504,12 @@ describe('rows', () => {
     expect(value('source', withExpiry)).toBe('Alpaca · IEX')
     expect(value('granularity', withExpiry)).toBe('1d')
     expect(value('update', withExpiry)).toBe('Bulk')
-    // 2027-01-01T03:00Z is still 2026/12/31 in Toronto.
-    expect(value('expires', withExpiry)).toBe('2026/12/31')
-    expect(value('expires', row('y', 'Y'))).toBe('—')
+    // tj-grna9p.88: Expires and Usage are cell renderers now (their text is pinned in 'usage and
+    // retention' below); the Usage cell is handed the filters in force for the Read By choice.
+    expect(cols.find((c) => c.colId === 'expires')!.cellRenderer).toBe(ExpiresCell)
+    expect(cols.find((c) => c.colId === 'usage')!.cellRenderer).toBe(UsageCell)
+    const usageParams = cols.find((c) => c.colId === 'usage')!.cellRendererParams as { filters: () => unknown }
+    expect(usageParams.filters()).toMatchObject({ view: 'all' })
     const symbol = cols.find((c) => c.colId === 'symbol')!
     expect(symbol.cellRenderer).toBe(SymbolCell)
     const params = symbol.cellRendererParams as { href: (id: string) => string }
@@ -829,6 +839,473 @@ describe('load states', () => {
     await getRows(latest(), 0)
     await flushPromises()
     expect(shell.find('[data-testid="footer-summary"]').text()).toBe('2 of 2 datasets · sorted by symbol')
+  })
+})
+
+// tj-grna9p.88 (phase 3): the Stale and Expiring Soon views, the Usage group, the Read By filter, the
+// Stale tile, and the Usage and Expires cells. The server decides every usage count and membership;
+// the screen carries the choice to it (client_kind, usage, stale_days, sort, expires_before) and
+// shows what comes back. Hidden by the mocks: the X-Client-Id header (pinned in api.spec.ts, below
+// the typed client mocked here) and real AG Grid cell rendering (the cells are mounted alone).
+describe('usage and retention (tj-grna9p.88)', () => {
+  const DAY = 86_400_000
+  const USAGE_FACETS = { ...FACETS, stale: 4n, read30d: 6n, neverRead: 2n, expiringSoon: 3n }
+
+  const facetArgs = (call = -1) => mocks.getDatasetFacets.mock.calls.at(call)![0] as Record<string, unknown>
+  const checkbox = (shell: VueWrapper, selector: string) => shell.find(`${selector} input`).element as HTMLInputElement
+  const count = (shell: VueWrapper, selector: string) => shell.find(`${selector} .side-count`).text()
+
+  beforeEach(() => {
+    mocks.getDatasetFacets.mockResolvedValue(USAGE_FACETS)
+  })
+
+  describe('views', () => {
+    it('All, Needs Attention, Stale with its threshold and Expiring Soon, each with its server count', async () => {
+      const shell = await screenAt('/data/datasets')
+      const views = shell.findAll('.side-view')
+      expect(views.map((v) => v.attributes('data-view'))).toEqual(['all', 'needs-attention', 'stale', 'expiring-soon'])
+      expect(views.map((v) => v.find('span').text())).toEqual([
+        'All Datasets',
+        'Needs Attention',
+        'Stale: 90 d',
+        'Expiring Soon',
+      ])
+      expect(count(shell, '[data-view="stale"]')).toBe('4')
+      expect(count(shell, '[data-view="expiring-soon"]')).toBe('3')
+      expect(views.every((v) => v.element.tagName === 'BUTTON')).toBe(true)
+    })
+
+    it('the Stale view is the Usage group\'s Stale value: ?usage=stale, sent as STALE, sorted by last read', async () => {
+      const shell = await screenAt('/data/datasets')
+      await shell.find('[data-view="stale"]').trigger('click')
+      await flushPromises()
+      expect(router.currentRoute.value.query.usage).toBe('stale')
+      expect(router.currentRoute.value.query.view).toBeUndefined()
+      expect(shell.find('[data-view="stale"]').attributes('aria-current')).toBe('true')
+      expect(shell.find('[data-view="stale"]').classes()).toContain('is-active')
+      expect(shell.find('[data-view="all"]').attributes('aria-current')).toBeUndefined()
+      expect(checkbox(shell, '[data-usage="stale"]').checked).toBe(true)
+      await getRows(latest(), 0)
+      expect(listArgs()).toMatchObject({ usage: UsageFilter.STALE, sort: 'last_read', clientKinds: [ClientKind.SDK], staleDays: 90 })
+      expect(facetArgs()).toMatchObject({ usage: UsageFilter.STALE, clientKinds: [ClientKind.SDK], staleDays: 90 })
+      expect(facetArgs().sort).toBeUndefined()
+    })
+
+    it('another view leaves the Stale view (drops usage=stale) but keeps any other usage value', async () => {
+      const shell = await screenAt('/data/datasets?usage=stale')
+      await shell.find('[data-view="needs-attention"]').trigger('click')
+      await flushPromises()
+      expect(router.currentRoute.value.query.view).toBe('needs-attention')
+      expect(router.currentRoute.value.query.usage).toBeUndefined()
+
+      await shell.find('[data-usage="never-read"] input').trigger('change')
+      await flushPromises()
+      await shell.find('[data-view="all"]').trigger('click')
+      await flushPromises()
+      expect(router.currentRoute.value.query.view).toBeUndefined()
+      expect(router.currentRoute.value.query.usage).toBe('never-read')
+      expect(shell.find('[data-view="all"]').attributes('aria-current')).toBe('true')
+    })
+
+    it('Expiring Soon sends expires_before = now + 7 days to the list and the counts, sorted by soonest expiry', async () => {
+      const before = Date.now()
+      const shell = await screenAt('/data/datasets')
+      await shell.find('[data-view="expiring-soon"]').trigger('click')
+      await flushPromises()
+      expect(router.currentRoute.value.query.view).toBe('expiring-soon')
+      expect(shell.find('[data-view="expiring-soon"]').attributes('aria-current')).toBe('true')
+      await getRows(latest(), 0)
+      const sent = (listArgs().expiresBefore as Date).getTime()
+      expect(sent).toBeGreaterThanOrEqual(before + 7 * DAY)
+      expect(sent).toBeLessThanOrEqual(Date.now() + 7 * DAY)
+      expect(listArgs()).toMatchObject({ sort: 'expires', needsAttention: undefined })
+      expect(facetArgs().expiresBefore).toBeInstanceOf(Date)
+    })
+
+    it('outside Expiring Soon no expires_before goes out: its count is the server\'s own default window', async () => {
+      await screenAt('/data/datasets?view=needs-attention')
+      await getRows(latest(), 0)
+      expect(listArgs().expiresBefore).toBeUndefined()
+      expect(mocks.getDatasetFacets.mock.calls.every(([f]) => (f as Record<string, unknown>).expiresBefore === undefined)).toBe(true)
+    })
+  })
+
+  // Architect CORRECTION 2026-10-14: a SENT expires_before is a filter on the store (list and facets,
+  // facets.all included), so only the Expiring Soon view sends it; the tiles never do.
+  describe('expires_before is a filter: Expiring Soon only', () => {
+    const BOUND = Date.UTC(2026, 9, 21, 6, 30)
+
+    it('the All view sends none on the list or the counts, so facets.all counts expiring and non-expiring alike', async () => {
+      mocks.getDatasetFacets.mockImplementation(async (filters: Record<string, unknown>) =>
+        // What the store does: a sent bound narrows every count, all included.
+        filters.expiresBefore === undefined ? { ...USAGE_FACETS, all: 2n } : { ...USAGE_FACETS, all: 1n },
+      )
+      mocks.listDatasets.mockResolvedValue({
+        items: [
+          row('soon', 'SOON', { expiry: timestampFromMs(Date.now() + DAY), reaperPending: false }),
+          row('never', 'NEVER'),
+        ],
+        nextCursor: '',
+      })
+      const shell = await screenAt('/data/datasets')
+      expect(count(shell, '[data-view="all"]')).toBe('2')
+      await getRows(latest(), 0)
+      await flushPromises()
+      expect(listArgs().expiresBefore).toBeUndefined()
+      expect(mocks.getDatasetFacets.mock.calls.every(([f]) => (f as Record<string, unknown>).expiresBefore === undefined)).toBe(true)
+      expect(shell.find('[data-testid="footer-summary"]').text()).toBe('2 of 2 datasets · sorted by symbol')
+    })
+
+    it('in Expiring Soon the list and its counts carry the same kind of bound; the tiles\' request never does', async () => {
+      const before = Date.now()
+      await screenAt('/data/datasets?view=expiring-soon&status=late')
+      await getRows(latest(), 0)
+      const listBound = (listArgs().expiresBefore as Date).getTime()
+      expect(listBound).toBeGreaterThanOrEqual(before + 7 * DAY)
+      expect(listBound).toBeLessThanOrEqual(Date.now() + 7 * DAY)
+      const calls = mocks.getDatasetFacets.mock.calls.map(([f]) => f as Record<string, unknown>)
+      const filtered = calls.filter((f) => f.status === 'late')
+      const tiles = calls.filter((f) => f.status === undefined)
+      expect(filtered.length).toBeGreaterThan(0)
+      expect(tiles).toHaveLength(1)
+      for (const f of filtered) {
+        expect((f.expiresBefore as Date).getTime()).toBeGreaterThanOrEqual(before + 7 * DAY)
+        expect((f.expiresBefore as Date).getTime()).toBeLessThanOrEqual(Date.now() + 7 * DAY)
+      }
+      expect(tiles[0]!.expiresBefore).toBeUndefined()
+    })
+
+    // Architect ruling on the round 2 escalation: Show Request is exactly what the browser sends. The
+    // store echoes a bound on EVERY facets response (its default when none was sent), so the All view's
+    // text must still carry none.
+    it('Show Request in the All view carries no expires_before even when the counts echo a bound', async () => {
+      mocks.getDatasetFacets.mockResolvedValue({ ...USAGE_FACETS, staleDays: 30, expiresBefore: timestampFromMs(BOUND) })
+      const shell = await screenAt('/data/datasets')
+      await shell.findAll('button').find((b) => b.text() === 'Show Request')!.trigger('click')
+      await getRows(latest(), 0)
+      expect(listArgs().expiresBefore).toBeUndefined()
+      expect(shell.find('[data-testid="catalog-request"]').text()).toBe(
+        'GET /api/store/ui/v1/datasets?client_kind=SDK&stale_days=90&limit=100',
+      )
+      // The Stale tile still reads the echo (staleDays) in the All view. No tile shows the bound.
+      expect(shell.find('[data-tile="stale"] .tile__note').text()).toBe('unread by SDK 30+ days')
+      expect(shell.find('[data-tile="stale"] .tile__label').text()).toBe('Stale: 30 d')
+    })
+
+    it('Show Request in Expiring Soon shows the request\'s own bound until the counts arrive, then the echo', async () => {
+      vi.useFakeTimers({ now: Date.UTC(2026, 9, 14, 6), toFake: ['Date'] })
+      try {
+        // The view's counts and the tiles' counts are separate calls: hold both, then answer both.
+        const pending: ((value: unknown) => void)[] = []
+        const answer = (value: unknown) => pending.splice(0).forEach((resolve) => resolve(value))
+        mocks.getDatasetFacets.mockImplementation(() => new Promise((resolve) => pending.push(resolve)))
+        const shell = await screenAt('/data/datasets?view=expiring-soon')
+        await shell.findAll('button').find((b) => b.text() === 'Show Request')!.trigger('click')
+        // now + 7 days, from the client clock: 2026-10-21T06:00Z.
+        expect(shell.find('[data-testid="catalog-request"]').text()).toBe(
+          'GET /api/store/ui/v1/datasets?client_kind=SDK&stale_days=90&expires_before=2026-10-21T06%3A00%3A00.000Z&sort=expires&limit=100',
+        )
+        answer({ ...USAGE_FACETS, expiresBefore: timestampFromMs(BOUND) })
+        await flushPromises()
+        expect(shell.find('[data-testid="catalog-request"]').text()).toBe(
+          'GET /api/store/ui/v1/datasets?client_kind=SDK&stale_days=90&expires_before=2026-10-21T06%3A30%3A00.000Z&sort=expires&limit=100',
+        )
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('Show Request in Expiring Soon shows the bound the server echoed, not a client value', async () => {
+      mocks.getDatasetFacets.mockResolvedValue({ ...USAGE_FACETS, expiresBefore: timestampFromMs(BOUND) })
+      const shell = await screenAt('/data/datasets?view=expiring-soon')
+      await shell.findAll('button').find((b) => b.text() === 'Show Request')!.trigger('click')
+      expect(shell.find('[data-testid="catalog-request"]').text()).toBe(
+        'GET /api/store/ui/v1/datasets?client_kind=SDK&stale_days=90&expires_before=2026-10-21T06%3A30%3A00.000Z&sort=expires&limit=100',
+      )
+    })
+  })
+
+  describe('labels from the echoed threshold', () => {
+    it('an echo of 30 days reads Stale: 30 d in the view, the Usage option and the tile', async () => {
+      mocks.getDatasetFacets.mockResolvedValue({ ...USAGE_FACETS, staleDays: 30 })
+      const shell = await screenAt('/data/datasets')
+      expect(shell.find('[data-view="stale"] span').text()).toBe('Stale: 30 d')
+      expect(shell.find('[data-usage="stale"]').text()).toContain('Stale: unread by SDK 30+ days')
+      expect(shell.find('[data-tile="stale"] .tile__label').text()).toBe('Stale: 30 d')
+      expect(shell.find('[data-tile="stale"] .tile__note').text()).toBe('unread by SDK 30+ days')
+    })
+
+    it('an echo of 90 reads Stale: 90 d, the unit never title-cased', async () => {
+      mocks.getDatasetFacets.mockResolvedValue({ ...USAGE_FACETS, staleDays: 90 })
+      const shell = await screenAt('/data/datasets')
+      expect(shell.find('[data-view="stale"] span').text()).toBe('Stale: 90 d')
+      expect(shell.find('[data-tile="stale"] .tile__label').text()).toBe('Stale: 90 d')
+    })
+  })
+
+  describe('the Usage group', () => {
+    it('Read in the last 30 days, Stale and Never read, worded for Read By, with the server counts', async () => {
+      const shell = await screenAt('/data/datasets')
+      const group = shell.find('[data-usage="read-30d"]').element.closest('fieldset')!
+      expect(group.querySelector('legend')!.textContent!.trim()).toBe('Usage')
+      expect([...group.querySelectorAll('label')].map((l) => l.getAttribute('data-usage'))).toEqual([
+        'read-30d',
+        'stale',
+        'never-read',
+      ])
+      expect(shell.find('[data-usage="read-30d"]').text()).toContain('Read in the last 30 days')
+      expect(shell.find('[data-usage="stale"]').text()).toContain('Stale: unread by SDK 90+ days')
+      expect(shell.find('[data-usage="never-read"]').text()).toContain('Never read by SDK')
+      expect(count(shell, '[data-usage="read-30d"]')).toBe('6')
+      expect(count(shell, '[data-usage="stale"]')).toBe('4')
+      expect(count(shell, '[data-usage="never-read"]')).toBe('2')
+    })
+
+    it('one value at a time: ticking writes ?usage=, sends it, sorts by last read; ticking again clears', async () => {
+      const shell = await screenAt('/data/datasets')
+      await shell.find('[data-usage="read-30d"] input').trigger('change')
+      await flushPromises()
+      expect(router.currentRoute.value.query.usage).toBe('read-30d')
+      await shell.find('[data-usage="never-read"] input').trigger('change')
+      await flushPromises()
+      expect(router.currentRoute.value.query.usage).toBe('never-read')
+      expect(checkbox(shell, '[data-usage="read-30d"]').checked).toBe(false)
+      await getRows(latest(), 0)
+      expect(listArgs()).toMatchObject({ usage: UsageFilter.NEVER_READ, sort: 'last_read' })
+      await flushPromises()
+      expect(shell.find('[data-testid="footer-summary"]').text()).toBe('2 of 2 datasets · sorted by last read')
+      await shell.find('[data-usage="never-read"] input').trigger('change')
+      await flushPromises()
+      expect(router.currentRoute.value.query.usage).toBeUndefined()
+      await getRows(latest(), 0)
+      expect(listArgs().usage).toBeUndefined()
+      expect(listArgs().sort).toBeUndefined()
+    })
+
+    // The server's facets.all applies the usage filter, so it is the list's total there (ruling: the
+    // footer's usage branch is removed). The fixture gives all and read30d different values to show
+    // which one the footer reads; on the real server they are equal under usage=read-30d.
+    it('under a usage value the footer total is facets.all; under Expiring Soon its count', async () => {
+      mocks.listDatasets.mockResolvedValue({ items: Array.from({ length: 100 }, (_, i) => row(`r${i}`, `S${i}`)), nextCursor: 'k1' })
+      mocks.getDatasetFacets.mockResolvedValue({ ...USAGE_FACETS, all: 250n, read30d: 140n, expiringSoon: 120n })
+      let shell = await screenAt('/data/datasets?usage=read-30d')
+      await getRows(latest(), 0)
+      await flushPromises()
+      expect(shell.find('[data-testid="footer-summary"]').text()).toBe('100 of 250 datasets · sorted by last read')
+      mounted.splice(0).forEach((w) => w.unmount())
+      shell = await screenAt('/data/datasets?view=expiring-soon')
+      await getRows(latest(), 0)
+      await flushPromises()
+      expect(shell.find('[data-testid="footer-summary"]').text()).toBe('100 of 120 datasets · sorted by expiry')
+    })
+  })
+
+  describe('Read By', () => {
+    it('a filter group of SDK and UI, SDK ticked by default; the last ticked box is disabled', async () => {
+      const shell = await screenAt('/data/datasets')
+      const group = shell.find('[data-read-by="SDK"]').element.closest('fieldset')!
+      expect(group.querySelector('legend')!.textContent!.trim()).toBe('Read By')
+      expect([...group.querySelectorAll('label')].map((l) => l.textContent!.trim())).toEqual(['SDK', 'UI'])
+      expect(checkbox(shell, '[data-read-by="SDK"]').checked).toBe(true)
+      expect(checkbox(shell, '[data-read-by="SDK"]').disabled).toBe(true)
+      expect(checkbox(shell, '[data-read-by="UI"]').checked).toBe(false)
+      expect(checkbox(shell, '[data-read-by="UI"]').disabled).toBe(false)
+      // It is a sidebar filter, not a Setting: nothing about it is in the browser settings object.
+      expect(window.localStorage.getItem('trader_joe.ui.settings.v1') ?? '').not.toMatch(/sdk|client|read/i)
+    })
+
+    it('ticking UI writes ?readby=sdk,ui and sends both kinds to the list and the counts; both boxes enable', async () => {
+      const shell = await screenAt('/data/datasets')
+      await shell.find('[data-read-by="UI"] input').trigger('change')
+      await flushPromises()
+      expect(router.currentRoute.value.query.readby).toBe('sdk,ui')
+      expect(checkbox(shell, '[data-read-by="SDK"]').disabled).toBe(false)
+      expect(checkbox(shell, '[data-read-by="UI"]').disabled).toBe(false)
+      await getRows(latest(), 0)
+      expect(listArgs().clientKinds).toEqual([ClientKind.SDK, ClientKind.UI])
+      expect(facetArgs().clientKinds).toEqual([ClientKind.SDK, ClientKind.UI])
+      expect(shell.find('[data-usage="never-read"]').text()).toContain('Never read by SDK and UI')
+
+      await shell.find('[data-read-by="SDK"] input').trigger('change')
+      await flushPromises()
+      expect(router.currentRoute.value.query.readby).toBe('ui')
+      expect(checkbox(shell, '[data-read-by="UI"]').disabled).toBe(true)
+      await getRows(latest(), 0)
+      expect(listArgs().clientKinds).toEqual([ClientKind.UI])
+    })
+
+    it('the last ticked box cannot be cleared, even by a change event that gets past the disabled state', async () => {
+      const shell = await screenAt('/data/datasets?readby=ui')
+      const before = grid.datasources.length
+      checkbox(shell, '[data-read-by="UI"]').dispatchEvent(new Event('change'))
+      await flushPromises()
+      expect(router.currentRoute.value.query.readby).toBe('ui')
+      expect(grid.datasources.length).toBe(before)
+      expect(checkbox(shell, '[data-read-by="UI"]').checked).toBe(true)
+    })
+
+    it('a Read By other than SDK counts as a filter: Clear puts it back to SDK and keeps the view', async () => {
+      const shell = await screenAt('/data/datasets?view=expiring-soon&readby=ui&usage=never-read')
+      await shell.find('.side-clear').trigger('click')
+      await flushPromises()
+      expect(router.currentRoute.value.query.readby).toBeUndefined()
+      expect(router.currentRoute.value.query.usage).toBeUndefined()
+      expect(router.currentRoute.value.query.view).toBe('expiring-soon')
+      expect(checkbox(shell, '[data-read-by="SDK"]').checked).toBe(true)
+    })
+  })
+
+  describe('the Stale tile', () => {
+    it('shows the threshold, the whole catalog\'s stale count and the Read By choice', async () => {
+      const shell = await screenAt('/data/datasets')
+      const tile = shell.find('[data-tile="stale"]')
+      expect(tile.find('.tile__label').text()).toBe('Stale: 90 d')
+      expect(tile.find('.tile__value').text()).toBe('4')
+      expect(tile.find('.tile__note').text()).toBe('unread by SDK 90+ days')
+      expect(shell.findAll('[data-tile]').map((t) => t.attributes('data-tile'))).toEqual(['datasets', 'failed', 'late', 'stale'])
+    })
+
+    it('does not follow the Usage filter, but is fetched again when Read By changes', async () => {
+      mocks.getDatasetFacets.mockImplementation(async (filters: Record<string, unknown>) => {
+        const kinds = (filters.clientKinds as ClientKind[] | undefined) ?? []
+        const stale = kinds.includes(ClientKind.UI) ? 1n : 4n
+        return filters.status === undefined && filters.usage === undefined
+          ? { ...USAGE_FACETS, stale }
+          : { ...USAGE_FACETS, all: 1n, stale: 0n }
+      })
+      const shell = await screenAt('/data/datasets?status=late&usage=never-read')
+      expect(shell.find('[data-tile="stale"] .tile__value').text()).toBe('4')
+      const tileCalls = () =>
+        mocks.getDatasetFacets.mock.calls
+          .map(([f]) => f as Record<string, unknown>)
+          .filter((f) => f.status === undefined && f.usage === undefined)
+      expect(tileCalls()).toHaveLength(1)
+      // The tiles' call carries only what the usage counts depend on.
+      const { signal, ...sent } = tileCalls()[0]!
+      expect(signal).toBeInstanceOf(AbortSignal)
+      expect(sent).toEqual({ clientKinds: [ClientKind.SDK], staleDays: 90 })
+
+      // Another filter change does not refetch the tiles.
+      await shell.find('[data-status="failed"] input').trigger('change')
+      await flushPromises()
+      expect(tileCalls()).toHaveLength(1)
+
+      await shell.find('[data-read-by="UI"] input').trigger('change')
+      await flushPromises()
+      expect(tileCalls()).toHaveLength(2)
+      expect(tileCalls()[1]!.clientKinds).toEqual([ClientKind.SDK, ClientKind.UI])
+      expect(shell.find('[data-tile="stale"] .tile__value').text()).toBe('1')
+      expect(shell.find('[data-tile="stale"] .tile__note').text()).toBe('unread by SDK and UI 90+ days')
+    })
+
+    it('with only Read By set the counts are the whole catalog\'s, so the tiles take them without a second call', async () => {
+      const shell = await screenAt('/data/datasets?readby=ui')
+      expect(mocks.getDatasetFacets).toHaveBeenCalledTimes(1)
+      expect(facetArgs().clientKinds).toEqual([ClientKind.UI])
+      expect(shell.find('[data-tile="stale"] .tile__note').text()).toBe('unread by UI 90+ days')
+    })
+  })
+
+  describe('cells', () => {
+    function usageCell(extra: MessageInitShape<typeof DatasetSummarySchema>, readBy: ClientKind[] | undefined = undefined) {
+      const data = extra === null ? undefined : row('u', 'U', extra)
+      return mount(UsageCell, {
+        props: { params: { data, filters: () => ({ view: 'all', clientKinds: readBy }) } as never },
+      })
+    }
+
+    // Architect ruling (B): the age only, in whole UTC calendar days; no Stale word, no muting.
+    function ago(days: number) {
+      const midnight = Math.floor(Date.now() / DAY) * DAY
+      return timestampFromMs(midnight - days * DAY)
+    }
+
+    it('Usage: never read, today, N d ago with a thousands separator; never the word Stale, never muted', () => {
+      const cells = [
+        usageCell({}),
+        usageCell({ usage: { lastReadAt: ago(0) } }),
+        usageCell({ usage: { lastReadAt: ago(3) } }),
+        usageCell({ usage: { lastReadAt: ago(120) } }),
+        usageCell({ usage: { lastReadAt: ago(1234) } }),
+      ]
+      expect(cells.map((c) => c.text())).toEqual(['Never read', 'today', '3 d ago', '120 d ago', '1,234 d ago'])
+      for (const cell of cells) {
+        expect(cell.text()).not.toMatch(/stale/i)
+        expect(cell.find('.usage-cell').classes()).toEqual(['usage-cell'])
+        expect(cell.find('.usage-cell').attributes('style')).toBeUndefined()
+      }
+    })
+
+    it('Usage: a read 90 days and a few hours ago shows its age and no Stale, past the server\'s threshold or not', () => {
+      vi.useFakeTimers({ now: Date.UTC(2026, 9, 14, 4), toFake: ['Date'] })
+      try {
+        // 90 calendar days and 3 hours: inside the server's 90-day window, so not in its Stale group.
+        expect(usageCell({ usage: { lastReadAt: timestampFromMs(Date.UTC(2026, 6, 16, 1)) } }).text()).toBe('90 d ago')
+        // 90 days and 5 hours by the clock, but read late on its day: 91 calendar days, the server's Stale.
+        expect(usageCell({ usage: { lastReadAt: timestampFromMs(Date.UTC(2026, 6, 15, 23)) } }).text()).toBe('91 d ago')
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('in the All view the only Stale words are the server-backed view, option and tile', async () => {
+      mocks.listDatasets.mockResolvedValue({
+        items: [row('s', 'OLD', { usage: { lastReadAt: ago(400) } }), row('n', 'NEW', { usage: { lastReadAt: ago(1) } })],
+        nextCursor: '',
+      })
+      const shell = await screenAt('/data/datasets')
+      const { rows } = await getRows(latest(), 0)
+      await flushPromises()
+      const walker = document.createTreeWalker(shell.element, NodeFilter.SHOW_TEXT)
+      const owners: string[] = []
+      for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
+        if (!/stale/i.test(node.textContent ?? '')) continue
+        const owner = node.parentElement!.closest('[data-view], [data-usage], [data-tile]')
+        const marker = ['data-view', 'data-usage', 'data-tile'].find((a) => owner?.hasAttribute(a))
+        owners.push(owner === null || marker === undefined ? 'elsewhere' : `${marker}=${owner.getAttribute(marker)}`)
+      }
+      expect(owners.sort()).toEqual(['data-tile=stale', 'data-usage=stale', 'data-view=stale'])
+      const texts = rows!.map((data) =>
+        mount(UsageCell, { props: { params: { data, filters: () => ({ view: 'all' }) } as never } }).text(),
+      )
+      expect(texts).toEqual(['400 d ago', '1 d ago'])
+    })
+
+    it('Usage: UI only where the UI alone read it in 30 days under a Read By without UI', () => {
+      const uiOnly = { usage: { readBy30d: [ClientKind.UI] } }
+      const cell = usageCell(uiOnly)
+      expect(cell.text()).toBe('Never read UI only')
+      expect(cell.find('[data-testid="usage-ui-only"]').text()).toBe('UI only')
+      expect(usageCell(uiOnly, [ClientKind.SDK, ClientKind.UI]).find('[data-testid="usage-ui-only"]').exists()).toBe(false)
+      expect(
+        usageCell({ usage: { readBy30d: [ClientKind.UI, ClientKind.SDK] } }).find('[data-testid="usage-ui-only"]').exists(),
+      ).toBe(false)
+    })
+
+    it('Usage: a row still loading renders nothing', () => {
+      const loading = mount(UsageCell, { props: { params: { data: undefined, filters: () => ({ view: 'all' }) } as never } })
+      expect(loading.text()).toBe('')
+    })
+
+    function expiresCell(data: DatasetSummary | undefined) {
+      const pinia = createPinia()
+      setActivePinia(pinia)
+      useSettingsStore().setTimeZoneOverride('America/Toronto')
+      return mount(ExpiresCell, { props: { params: { data } as never }, global: { plugins: [pinia] } })
+    }
+
+    it('Expires: the date in the chosen zone or a dash; Would be deleted where the reaper holds it, in words', () => {
+      // 2027-01-01T03:00Z is still 2026/12/31 in Toronto.
+      expect(expiresCell(row('x', 'X', { expiry: timestampFromMs(EXPIRY) })).text()).toBe('2026/12/31')
+      expect(expiresCell(row('y', 'Y')).text()).toBe('—')
+      const pending = expiresCell(row('p', 'P', { expiry: timestampFromMs(Date.UTC(2026, 0, 2, 12)), reaperPending: true }))
+      expect(pending.text()).toBe('2026/01/02 Would be deleted')
+      expect(pending.find('[data-testid="would-be-deleted"]').text()).toBe('Would be deleted')
+      expect(expiresCell(row('q', 'Q', { expiry: timestampFromMs(EXPIRY) })).find('[data-testid="would-be-deleted"]').exists()).toBe(
+        false,
+      )
+      expect(expiresCell(undefined).text()).toBe('')
+    })
   })
 })
 

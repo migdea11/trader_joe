@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // The Datasets catalog (tj-grna9p.32, canvas board "Shell · Datasets", phase 1): title, Refresh and
-// Show Request, the Datasets, Failed and Late tiles, and the grid. The sidebar (DatasetsSidebar.vue)
+// Show Request, the Datasets, Failed, Late and Stale tiles, and the grid. The sidebar (DatasetsSidebar.vue)
 // is the route's `sidebar` view. The filters live in the URL; this page and the sidebar both read
 // them. No polling: the page reloads on a filter change, on Refresh, and on a live event or a
 // reconnect (catalog/useCatalogLiveRefresh.ts).
@@ -9,7 +9,7 @@ import { storeToRefs } from 'pinia'
 import { Code, RefreshCw } from '@lucide/vue'
 
 import { listDatasetsRequest } from '@/api'
-import { filtersKey, toApiFilters } from '@/catalog/filters'
+import { filtersKey, listSort, toApiFilters } from '@/catalog/filters'
 import { useCatalogFilters } from '@/catalog/useCatalogFilters'
 import { useCatalogLiveRefresh } from '@/catalog/useCatalogLiveRefresh'
 import DatasetGrid from '@/components/catalog/DatasetGrid.vue'
@@ -26,7 +26,14 @@ const { setFooterSummary, setFooterUpdated, setFooterProblem } = useFooterSummar
 const showRequest = ref(false)
 
 // The call behind the view: the first page under the current filters, as the browser sends it.
-const requestText = computed(() => `GET ${listDatasetsRequest({ ...toApiFilters(filters.value), limit: 100 })}`)
+// expires_before appears only when the view sends it (Expiring Soon); there it is the echoed bound
+// once the counts are in (the request's own until then). Elsewhere the text carries none.
+const requestText = computed(() => {
+  const api = toApiFilters(filters.value)
+  const expiresBefore =
+    api.expiresBefore === undefined ? undefined : (facets.value?.expiresBefore ?? api.expiresBefore)
+  return `GET ${listDatasetsRequest({ ...api, expiresBefore, sort: listSort(filters.value), limit: 100 })}`
+})
 
 // The counts under the filters, for the sidebar. A filter change refetches them.
 watch(
@@ -47,16 +54,19 @@ useCatalogLiveRefresh(filters)
 const total = computed(() => {
   if (listDone.value) return loadedRows.value
   if (facets.value === null) return null
+  if (filters.value.view === 'expiring-soon') return facets.value.expiringSoon
   return filters.value.view === 'needs-attention' ? facets.value.needsAttention : facets.value.all
 })
 
+const SORT_WORDS = { symbol: 'symbol', expires: 'expiry', last_read: 'last read' } as const
+
 watch(
-  [loadedRows, total, listStatus],
+  [loadedRows, total, listStatus, filters],
   () => {
     if (listStatus.value === 'loading') return setFooterSummary(null)
     const loaded = formatNumber(loadedRows.value)
     const of = total.value === null ? '' : ` of ${formatNumber(total.value)}`
-    setFooterSummary(`${loaded}${of} datasets · sorted by symbol`)
+    setFooterSummary(`${loaded}${of} datasets · sorted by ${SORT_WORDS[listSort(filters.value) ?? 'symbol']}`)
   },
   { immediate: true },
 )

@@ -4,6 +4,8 @@
 import { DataSource, UpdateType } from '@generated/trader_joe/proto/market/v1/enums_pb'
 import {
   BarPageIndexSchema,
+  ClientKind,
+  UsageFilter,
   BarPageSchema,
   DatasetFacetsSchema,
   DatasetPageSchema,
@@ -28,7 +30,7 @@ import { buildQuery } from './query'
 
 /** The status words the server filters by (a grouping of FreshnessStatus). */
 export type StatusGroup = 'healthy' | 'late' | 'failed' | 'retired'
-export type DatasetSort = 'symbol' | 'expires'
+export type DatasetSort = 'symbol' | 'expires' | 'last_read'
 
 /** The filters the list and the facets share. */
 export interface DatasetFilters {
@@ -41,6 +43,14 @@ export interface DatasetFilters {
   needsAttention?: boolean
   /** Only datasets with a collection run in flight (orthogonal to `status`). */
   running?: boolean
+  /** Whose reads the usage figures and the usage filter count; the server's default is SDK. */
+  clientKinds?: readonly ClientKind[]
+  /** Only datasets in this usage group under the client filter. */
+  usage?: UsageFilter
+  /** The threshold of the Stale group, in days. */
+  staleDays?: number
+  /** Only datasets expiring before this instant, plus those the reaper would delete. */
+  expiresBefore?: Date
   signal?: AbortSignal
 }
 
@@ -77,6 +87,10 @@ function filterQuery(filters: DatasetFilters) {
     status: filters.status,
     needs_attention: filters.needsAttention,
     running: filters.running,
+    client_kind: filters.clientKinds?.map((kind) => ClientKind[kind]),
+    usage: enumName(UsageFilter, filters.usage),
+    stale_days: filters.staleDays,
+    expires_before: filters.expiresBefore,
   }
 }
 

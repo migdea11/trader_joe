@@ -6,6 +6,7 @@ import type { DescMessage, MessageShape } from '@bufbuild/protobuf'
 
 import { ApiError, apiErrorFromResponse } from './errors'
 import { buildQuery } from './query'
+import { OPERATOR_CLIENT_ID } from './usage'
 import type { QueryValue } from './query'
 
 /**
@@ -38,7 +39,7 @@ export async function getMessage<Desc extends DescMessage>(
   try {
     response = await fetch(`${API_BASE}${path}${buildQuery(options.query ?? {})}`, {
       method: 'GET',
-      headers: { Accept: 'application/json' },
+      headers: { Accept: 'application/json', 'X-Client-Id': OPERATOR_CLIENT_ID },
       signal: options.signal,
     })
   } catch (error) {

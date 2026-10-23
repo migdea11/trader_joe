@@ -7,8 +7,10 @@ import { timestampFromMs } from '@bufbuild/protobuf/wkt'
 
 import { DataSource, Granularity, UpdateType } from '@generated/trader_joe/proto/market/v1/enums_pb'
 import {
+  ClientKind,
   DatasetState,
   ExpiryType,
+  UsageFilter,
   FreshnessStatus,
   IngestRunPageSchema,
   IngestRunState,
@@ -21,6 +23,10 @@ import {
   API_BASE,
   ApiError,
   buildQuery,
+  DEFAULT_CLIENT_KINDS,
+  EXPIRING_SOON_DAYS,
+  OPERATOR_CLIENT_ID,
+  STALE_DAYS,
   getDataset,
   getDatasetBarPages,
   getDatasetBarPagesRequest,
@@ -182,6 +188,36 @@ describe('fromJson decode of real server JSON', () => {
     ])
   })
 
+  // Hand-written in the canonical JSON names of ui/v1 data.proto fields 21 and 22 and DatasetFacets
+  // 7..15 (tj-grna9p.88): not rendered by the server like the fixtures above.
+  it('DatasetSummary usage and reaper_pending, and the DatasetFacets usage counts', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        ...SUMMARY_JSON,
+        usage: {
+          lastReadAt: '2026-10-01T12:00:00Z',
+          reads30d: '4',
+          readBy30d: ['CLIENT_KIND_UI'],
+          clientKinds: ['CLIENT_KIND_SDK'],
+        },
+        reaperPending: true,
+      }),
+    )
+    const summary = await getDataset(SUMMARY_JSON.id)
+    expect(summary.reaperPending).toBe(true)
+    expect(summary.usage?.lastReadAt?.seconds).toBe(BigInt(Date.UTC(2026, 9, 1, 12) / 1000))
+    expect(summary.usage?.reads30d).toBe(4n)
+    expect(summary.usage?.readBy30d).toEqual([ClientKind.UI])
+    expect(summary.usage?.clientKinds).toEqual([ClientKind.SDK])
+
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ ...FACETS_JSON, stale: '5', read30d: '6', neverRead: '2', expiringSoon: '3', staleDays: 90 }),
+    )
+    const facets = await getDatasetFacets()
+    expect([facets.stale, facets.read30d, facets.neverRead, facets.expiringSoon]).toEqual([5n, 6n, 2n, 3n])
+    expect(facets.staleDays).toBe(90)
+  })
+
   it('BarPage, with optional fields present on one bar and absent on the other', async () => {
     fetchMock.mockResolvedValue(jsonResponse(BARS_JSON))
     const page = await getDatasetBars('ds-1')
@@ -221,7 +257,7 @@ describe('fromJson decode of real server JSON', () => {
 })
 
 describe('request shape', () => {
-  it('GETs same-origin under /api/store with an Accept header and the caller signal', async () => {
+  it('GETs same-origin under /api/store with an Accept header, X-Client-Id: operator and the caller signal', async () => {
     fetchMock.mockResolvedValue(jsonResponse(CONFIG_JSON))
     const controller = new AbortController()
     await getUiConfig(controller.signal)
@@ -229,8 +265,65 @@ describe('request shape', () => {
     expect(calledUrl()).toBe('/api/store/ui/v1/config')
     const init = fetchMock.mock.calls[0]![1]!
     expect(init.method).toBe('GET')
-    expect(init.headers).toEqual({ Accept: 'application/json' })
+    expect(init.headers).toEqual({ Accept: 'application/json', 'X-Client-Id': 'operator' })
     expect(init.signal).toBe(controller.signal)
+  })
+
+  // tj-grna9p.131 option R: the label the store records reads by, and derives kind UI from.
+  it('every data_store call sends X-Client-Id: operator, from the one constant', async () => {
+    fetchMock.mockImplementation(async () => jsonResponse({}))
+    expect(OPERATOR_CLIENT_ID).toBe('operator')
+    await listDatasets()
+    await getDatasetFacets()
+    await getDataset('ds-1')
+    await getDatasetBars('ds-1')
+    await getDatasetBarPages('ds-1')
+    await getDatasetRuns('ds-1')
+    await getDatasetCoverage('ds-1', 10)
+    await getUiConfig()
+    expect(fetchMock).toHaveBeenCalledTimes(8)
+    for (const [, init] of fetchMock.mock.calls) {
+      expect((init!.headers as Record<string, string>)['X-Client-Id']).toBe(OPERATOR_CLIENT_ID)
+    }
+  })
+
+  it('listDatasets sends the usage parameters: client_kind repeated by member name, usage, stale_days, sort=last_read, expires_before', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(PAGE_JSON))
+    const params = {
+      clientKinds: [ClientKind.SDK, ClientKind.UI],
+      usage: UsageFilter.READ_30D,
+      staleDays: 90,
+      expiresBefore: new Date(Date.UTC(2026, 9, 21, 6)),
+      sort: 'last_read' as const,
+    }
+    await listDatasets(params)
+    const url = new URL(calledUrl(), 'http://x')
+    expect([...url.searchParams.entries()]).toEqual([
+      ['client_kind', 'SDK'],
+      ['client_kind', 'UI'],
+      ['usage', 'READ_30D'],
+      ['stale_days', '90'],
+      ['expires_before', '2026-10-21T06:00:00.000Z'],
+      ['sort', 'last_read'],
+    ])
+    expect(listDatasetsRequest(params)).toBe(calledUrl())
+  })
+
+  it.each([
+    [UsageFilter.STALE, 'STALE'],
+    [UsageFilter.NEVER_READ, 'NEVER_READ'],
+  ])('usage %s goes out as %s; an empty clientKinds sends no client_kind', async (usage, name) => {
+    fetchMock.mockResolvedValue(jsonResponse(FACETS_JSON))
+    await getDatasetFacets({ usage, clientKinds: [] })
+    expect(calledUrl()).toBe(`/api/store/ui/v1/datasets/facets?usage=${name}`)
+  })
+
+  it('getDatasetFacets sends the usage parameters too', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(FACETS_JSON))
+    await getDatasetFacets({ clientKinds: [ClientKind.UI], staleDays: 90, expiresBefore: new Date(Date.UTC(2026, 0, 1)) })
+    expect(calledUrl()).toBe(
+      '/api/store/ui/v1/datasets/facets?client_kind=UI&stale_days=90&expires_before=2026-01-01T00%3A00%3A00.000Z',
+    )
   })
 
   it('listDatasets sends every parameter under the server names, enums by member name', async () => {
@@ -528,6 +621,16 @@ describe('int64ToNumber', () => {
   )
 })
 
+// tj-grna9p.88: one module holds the usage constants (owner rulings tj-utqd77 Q3, tj-grna9p.131).
+describe('usage constants', () => {
+  it('stale 90 days fixed, expiring soon 7 days, Read By defaults to SDK alone, the UI is operator', () => {
+    expect(STALE_DAYS).toBe(90)
+    expect(EXPIRING_SOON_DAYS).toBe(7)
+    expect(DEFAULT_CLIENT_KINDS).toEqual([ClientKind.SDK])
+    expect(OPERATOR_CLIENT_ID).toBe('operator')
+  })
+})
+
 describe('buildQuery', () => {
   it('is empty when nothing is set', () => {
     expect(buildQuery({})).toBe('')
@@ -540,6 +643,12 @@ describe('buildQuery', () => {
 
   it('writes a Date as a UTC instant with Z', () => {
     expect(buildQuery({ at: new Date(Date.UTC(2026, 9, 10, 4, 5, 6, 7)) })).toBe('?at=2026-10-10T04%3A05%3A06.007Z')
+  })
+
+  it('repeats the key for each array element, in order, and an empty array sends nothing', () => {
+    expect(buildQuery({ a: ['x', 'y'], b: [], c: 1 })).toBe('?a=x&a=y&c=1')
+    expect(buildQuery({ k: [new Date(Date.UTC(2026, 0, 1)), 2, false] })).toBe('?k=2026-01-01T00%3A00%3A00.000Z&k=2&k=false')
+    expect(buildQuery({ only: [] })).toBe('')
   })
 
   it('encodes reserved characters', () => {

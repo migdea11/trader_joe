@@ -10,10 +10,9 @@
 // (every calendar in use) falls on the same UTC calendar date as its local date.
 import type { CoverageBucket, CoverageGap, CoverageStrip } from '@generated/trader_joe/proto/ui/v1/stats_pb'
 
+import { DAY_MS } from '@/format/days'
 import { formatDate, MISSING, timestampToInstant } from '@/format/formatters'
 import { COVERAGE_UNIT } from '@/theme/copy'
-
-const DAY_MS = 24 * 60 * 60 * 1000
 
 export interface CoverageTotals {
   /** Sessions due (completed) over the whole strip. */

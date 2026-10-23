@@ -2,7 +2,7 @@
 // The catalog grid (tj-grna9p.32, ADR tj-grna9p.2): AG Grid Community, infinite row model over the
 // keyset-paged /ui/v1/datasets (catalog/cursorDatasource.ts). Columns: Symbol, Source and Feed,
 // Gran., Update, Status (Running, Healthy, Late, Failed, Retired), Coverage (a lazily fetched
-// strip, CoverageCell.vue), Expires. A new datasource (so an empty block cache and no cursor) is made
+// strip, CoverageCell.vue), Usage (UsageCell.vue), Expires (ExpiresCell.vue, with the reaper flag). A new datasource (so an empty block cache and no cursor) is made
 // when the filters change or the store's refreshKey is bumped; the old one aborts its requests. A
 // live event bumps liveKey instead: the same datasource forgets its pages and the grid reloads the
 // rows it holds in place, so scroll position and the loaded rows stay. A row click opens the Viewer;
@@ -21,15 +21,15 @@ import { listDatasets } from '@/api'
 import { gridTheme, registerGridModules } from '@/catalog/agGrid'
 import { createCursorDatasource } from '@/catalog/cursorDatasource'
 import type { CursorDatasource } from '@/catalog/cursorDatasource'
-import { filtersKey, toApiFilters } from '@/catalog/filters'
+import { filtersKey, listSort, toApiFilters } from '@/catalog/filters'
 import type { CatalogFilters } from '@/catalog/filters'
 import { granularityLabel, sourceFeedLabel, updateTypeLabel } from '@/catalog/labels'
 import { DETAIL_ROUTE, VIEWER_ROUTE } from '@/catalog/rows'
 import CoverageCell from '@/components/catalog/CoverageCell.vue'
 import SymbolCell from '@/components/catalog/SymbolCell.vue'
 import StatusCell from '@/components/catalog/StatusCell.vue'
-import { MISSING, timestampToInstant } from '@/format/formatters'
-import { useFormatters } from '@/format/useFormatters'
+import ExpiresCell from '@/components/catalog/ExpiresCell.vue'
+import UsageCell from '@/components/catalog/UsageCell.vue'
 import { useDatasetCatalogStore } from '@/stores/datasetCatalog'
 import { useDatasetCoverageStore } from '@/stores/datasetCoverage'
 import { COVERAGE_UNIT, titleCase } from '@/theme/copy'
@@ -45,7 +45,6 @@ const router = useRouter()
 const store = useDatasetCatalogStore()
 const coverage = useDatasetCoverageStore()
 const { listStatus, listError, loadedRows, refreshKey, liveKey } = storeToRefs(store)
-const { date } = useFormatters()
 
 const api = shallowRef<GridApi<DatasetSummary> | null>(null)
 let datasource: CursorDatasource | null = null
@@ -107,15 +106,21 @@ const columnDefs: ColDef<DatasetSummary>[] = [
     minWidth: 240,
   },
   {
+    colId: 'usage',
+    // Last read by the selected clients (the Read By filter), or "Never read".
+    headerName: 'Last Read',
+    cellRenderer: UsageCell,
+    cellRendererParams: { filters: () => props.filters },
+    flex: 1.2,
+    minWidth: 130,
+  },
+  {
     colId: 'expires',
     headerName: 'Expires',
-    // Nothing scheduled: a dash, as on the canvas.
-    valueGetter: ({ data }) => {
-      if (!data) return undefined
-      return data.expiry === undefined ? MISSING : date(timestampToInstant(data.expiry))
-    },
-    flex: 1,
-    minWidth: 110,
+    // Nothing scheduled: a dash, as on the canvas; the reaper's pending set is flagged.
+    cellRenderer: ExpiresCell,
+    flex: 1.4,
+    minWidth: 190,
   },
 ]
 
@@ -133,7 +138,13 @@ function install(): void {
   datasource = createCursorDatasource<DatasetSummary>({
     pageSize: PAGE_SIZE,
     fetchPage: async (cursor, limit, signal) => {
-      const page = await listDatasets({ ...toApiFilters(props.filters), cursor, limit, signal })
+      const page = await listDatasets({
+        ...toApiFilters(props.filters),
+        sort: listSort(props.filters),
+        cursor,
+        limit,
+        signal,
+      })
       return { items: page.items, nextCursor: page.nextCursor }
     },
     onPage: (info) => store.listPage(info),
