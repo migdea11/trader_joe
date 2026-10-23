@@ -120,6 +120,13 @@ const sidebar = (shell: VueWrapper) => shell.findAll('aside.app-shell__sidebar')
 const tile = (shell: VueWrapper, key: string) => shell.find(`[data-tile="${key}"]`)
 const tableRow = (shell: VueWrapper, id: string) => shell.find(`[data-testid="stale-table"] tr[data-dataset-id="${id}"]`)
 const dialog = (shell: VueWrapper) => shell.find('[data-testid="expiry-dialog"]')
+// A cell's own text, without its child elements' (the expires cell also holds the reaper flag).
+const ownText = (cell: { element: Element }) =>
+  Array.from(cell.element.childNodes)
+    .filter((node) => node.nodeType === Node.TEXT_NODE)
+    .map((node) => node.textContent ?? '')
+    .join('')
+    .trim()
 async function click(shell: VueWrapper, selector: string) {
   await shell.find(selector).trigger('click')
   await flushPromises()
@@ -320,10 +327,22 @@ describe('Stale Datasets table', () => {
     expect(b.find('a').text()).toBe('XIU 1h')
     expect(b.find('[data-cell="last-read"]').text()).toBe('Never read')
     expect(b.find('[data-cell="read-by"]').text()).toBe('—')
-    expect(b.find('[data-cell="expires"]').text()).toContain('—')
+    // tj-grna9p.144: a dataset with no expiry reads Never, as the grid and the card do; the flag is apart.
+    expect(ownText(b.find('[data-cell="expires"]'))).toBe('Never')
+    expect(b.find('[data-cell="expires"]').text()).not.toContain('—')
     expect(b.find('[data-testid="would-be-deleted"]').text()).toBe('Would be deleted')
     expect(tableRow(shell, 'ds-a').find('[data-testid="would-be-deleted"]').exists()).toBe(false)
     expect(shell.find('[data-testid="stale-table"] tbody').text()).not.toMatch(/stale/i)
+  })
+
+  it('a row with no dataset at all keeps the dash in Expires: Never is said only of a dataset', async () => {
+    mocks.getStaleDatasets.mockResolvedValueOnce(stalePage([...ROWS(), create(StaleDatasetRowSchema, { estBytes: 1n })]))
+    const shell = await usageAt()
+    const orphan = shell.find('[data-testid="stale-table"] tbody tr:not([data-dataset-id])')
+    expect(orphan.exists()).toBe(true)
+    expect(orphan.find('[data-cell="expires"]').text()).toBe('—')
+    expect(ownText(tableRow(shell, 'ds-b').find('[data-cell="expires"]'))).toBe('Never')
+    expect(ownText(tableRow(shell, 'ds-a').find('[data-cell="expires"]'))).toBe('2027/01/01')
   })
 
   it('Load More asks for the next page and appends it', async () => {
@@ -373,6 +392,31 @@ describe('Set Expiry dialog', () => {
     expect(document.activeElement).toBe(shell.find('[data-testid="expiry-day"]').element)
     expect(mocks.setDatasetExpiry).not.toHaveBeenCalled()
     expect(tableRow(shell, 'ds-a').find('[data-testid="set-expiry-open"]').attributes('aria-label')).toBe('Set Expiry for VFV 1d')
+  })
+
+  // tj-grna9p.144: the dialog's explanation names the control the operator sees on the dataset's page, Never.
+  // Runs of whitespace are one space: the v-if branch leaves a second one where it joins the first sentence.
+  const explanation = (shell: VueWrapper) => dialog(shell).find('p.text').text().replace(/\s+/g, ' ')
+
+  it('STATIC: the explanation says the dataset is deleted on that date and Never on its page keeps it', async () => {
+    const shell = await evening()
+    await open(shell, 'ds-a')
+    expect(explanation(shell)).toBe(
+      "Set an expiry for VFV 1d. The dataset is deleted on that date. Choosing Never on the dataset's page keeps it.",
+    )
+  })
+
+  it.each([
+    ['DAILY', UpdateType.DAILY],
+    ['STREAM', UpdateType.STREAM],
+  ])('%s is a subscription: the explanation says it retires at once and Never on its page resumes it', async (_name, updateType) => {
+    mocks.getStaleDatasets.mockResolvedValue(stalePage([row('ds-s', 'XEQT', { updateType })]))
+    const shell = await evening()
+    await open(shell, 'ds-s')
+    expect(explanation(shell)).toBe(
+      'Set an expiry for XEQT 1d. This retires the subscription at once: it stops updating, stays readable, and is deleted on that date. ' +
+        "Choosing Never on the dataset's page before then resumes it.",
+    )
   })
 
   it('Set Expiry waits for a real day, saying so by aria-describedby', async () => {

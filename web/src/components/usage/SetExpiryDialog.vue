@@ -144,10 +144,10 @@ function onKeydown(event: KeyboardEvent): void {
         Set an expiry for {{ name }}.
         <template v-if="subscription">
           This retires the subscription at once: it stops updating, stays readable, and is deleted on that
-          date. Clearing the expiry on the dataset's page before then resumes it.
+          date. Choosing Never on the dataset's page before then resumes it.
         </template>
         <template v-else>
-          The dataset is deleted on that date. Clearing the expiry on the dataset's page keeps it.
+          The dataset is deleted on that date. Choosing Never on the dataset's page keeps it.
         </template>
       </p>
 

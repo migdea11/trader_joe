@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // The Dataset detail's Retention card (tj-grna9p.89): the expiry type (locked: fixed when the dataset
-// is created), the Expiry Time (empty is Keep Forever) with Tomorrow and Clear, and the two writes,
+// is created), the Expiry Time (empty is Never) with Tomorrow and Never, and the two writes,
 // Retire Subscription or Set Expiry (PATCH expiry) and Delete Now (DELETE, behind a typed
 // confirmation). A dataset another owner holds shows its owner and a warning, and both writes then
 // need a non-blank reason and a confirmation before they send `override`; the operator's own dataset
@@ -48,7 +48,7 @@ const EXPIRY_TYPE_LABELS: Partial<Record<ExpiryType, string>> = {
 
 const expiryType = computed(() => EXPIRY_TYPE_LABELS[props.dataset.expiryType] ?? MISSING)
 const currentExpiry = computed(() =>
-  props.dataset.expiry === undefined ? 'None' : dateTime(timestampToInstant(props.dataset.expiry)),
+  props.dataset.expiry === undefined ? 'Never' : dateTime(timestampToInstant(props.dataset.expiry)),
 )
 const retired = computed(() => props.dataset.state === DatasetState.RETIRED)
 // A DAILY or STREAM dataset is a subscription: an expiry retires it. A bulk (STATIC) one just has a date.
@@ -98,7 +98,7 @@ const hasExpiry = computed(() => props.dataset.expiry !== undefined)
 
 // What the primary button does with the field as it stands.
 const applyLabel = computed(() => {
-  if (keepForever.value && hasExpiry.value) return titleCase(subscription.value ? 'Resume Subscription' : 'Clear Expiry')
+  if (keepForever.value && hasExpiry.value) return titleCase(subscription.value ? 'Resume Subscription' : 'Set to Never')
   return titleCase(subscription.value ? 'Retire Subscription' : 'Set Expiry')
 })
 const canApply = computed(
@@ -236,7 +236,7 @@ watch(
           v-model="expiryText"
           type="text"
           inputmode="numeric"
-          placeholder="Keep Forever"
+          placeholder="Never"
           :disabled="busy"
           :aria-invalid="dayProblem"
           data-testid="expiry-input"
@@ -258,7 +258,7 @@ watch(
           data-testid="expiry-clear"
           @click="clearField"
         >
-          {{ titleCase('Clear') }}
+          {{ titleCase('Never') }}
         </button>
       </div>
       <p
@@ -266,16 +266,16 @@ watch(
         class="hint hint--error"
         data-testid="expiry-problem"
       >
-        Type the day as YYYY/MM/DD, or leave it empty to keep the dataset forever.
+        Type the day as YYYY/MM/DD, or choose Never to keep the dataset forever.
       </p>
       <p class="hint">
         The day starts at midnight in {{ timeZone }}.
         <template v-if="subscription">
           Setting an expiry retires this subscription at once: it stops updating, stays readable, and is
-          deleted on that date. Clearing the expiry before then resumes it.
+          deleted on that date. Choosing Never before then resumes it.
         </template>
         <template v-else>
-          The dataset is deleted on that date. Clearing the expiry keeps it.
+          The dataset is deleted on that date. Choosing Never keeps it.
         </template>
       </p>
     </div>

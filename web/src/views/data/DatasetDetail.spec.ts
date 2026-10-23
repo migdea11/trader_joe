@@ -586,22 +586,33 @@ describe('retention: the card', () => {
     expect(section.findAll('a')).toHaveLength(0)
   })
 
-  it('no expiry reads None; a retired dataset says it no longer collects', async () => {
+  // tj-grna9p.142: an unset expiry is the explicit Never (the server stores null), never 'None'.
+  it('no expiry reads Never; a retired dataset says it no longer collects', async () => {
     mocks.getDataset.mockResolvedValue(dataset({ expiry: undefined, state: DatasetState.RETIRED }))
     const shell = await detailAt()
-    expect(shell.find('[data-fact="expiry"]').text()).toBe('None')
+    expect(shell.find('[data-fact="expiry"]').text()).toBe('Never')
     expect(shell.find('[data-fact="expiry-type"]').text()).toBe('Rolling')
     expect(shell.find('#detail-retention').text()).toContain('Retired: no longer collecting')
   })
 
-  it('the Expiry Time field is empty for Keep Forever, labelled, with Tomorrow and Clear', async () => {
+  it.each([
+    ['STATIC', UpdateType.STATIC],
+    ['DAILY', UpdateType.DAILY],
+    ['STREAM', UpdateType.STREAM],
+  ])('%s with no expiry: the fact reads Never', async (_name, updateType) => {
+    mocks.getDataset.mockResolvedValue(dataset({ updateType, expiry: undefined }))
+    const shell = await detailAt()
+    expect(shell.find('[data-fact="expiry"]').text()).toBe('Never')
+  })
+
+  it('the Expiry Time field is empty for Never, labelled, with Tomorrow and Never', async () => {
     const shell = await detailAt()
     const input = shell.find('[data-testid="expiry-input"]')
     expect((input.element as HTMLInputElement).value).toBe('')
-    expect(input.attributes('placeholder')).toBe('Keep Forever')
+    expect(input.attributes('placeholder')).toBe('Never')
     expect(shell.find(`label[for="${input.attributes('id')}"]`).text()).toBe('Expiry Time')
     expect(shell.find('[data-testid="expiry-tomorrow"]').text()).toBe('Tomorrow')
-    expect(shell.find('[data-testid="expiry-clear"]').text()).toBe('Clear')
+    expect(shell.find('[data-testid="expiry-clear"]').text()).toBe('Never')
   })
 
   it('STATIC: the write is Set Expiry, disabled while the field is empty and there is nothing to clear', async () => {
@@ -609,8 +620,10 @@ describe('retention: the card', () => {
     const apply = shell.find('[data-testid="expiry-apply"]')
     expect(apply.text()).toBe('Set Expiry')
     expect(apply.attributes('disabled')).toBeDefined()
-    expect(shell.find('#detail-retention').text()).toContain('The dataset is deleted on that date. Clearing the expiry keeps it.')
+    // tj-grna9p.144: the hint names the control the operator sees, Never, not "clearing".
+    expect(shell.find('#detail-retention').text()).toContain('The dataset is deleted on that date. Choosing Never keeps it.')
     expect(shell.find('#detail-retention').text()).not.toContain('retires this subscription')
+    expect(shell.find('#detail-retention').text()).not.toContain('Clearing the expiry')
   })
 
   it.each([
@@ -621,8 +634,10 @@ describe('retention: the card', () => {
     const shell = await detailAt()
     expect(shell.find('[data-testid="expiry-apply"]').text()).toBe('Retire Subscription')
     expect(shell.find('#detail-retention').text()).toContain(
-      'Setting an expiry retires this subscription at once: it stops updating, stays readable, and is deleted on that date. Clearing the expiry before then resumes it.',
+      'Setting an expiry retires this subscription at once: it stops updating, stays readable, and is deleted on that date. Choosing Never before then resumes it.',
     )
+    expect(shell.find('#detail-retention').text()).not.toContain('Clearing the expiry')
+    expect(shell.find('#detail-retention').text()).not.toContain('Choosing Never keeps it.')
   })
 })
 
@@ -665,7 +680,7 @@ describe('retention: writes', () => {
     expect(notice(shell).exists()).toBe(false)
   })
 
-  it('Tomorrow then Clear round-trips: set, then the empty field clears the expiry (Clear Expiry)', async () => {
+  it('Tomorrow then Never round-trips: set, then the empty field clears the expiry (Set to Never)', async () => {
     const shell = await at(EVENING)
     await click(shell, 'expiry-tomorrow')
     await click(shell, 'expiry-apply')
@@ -673,12 +688,51 @@ describe('retention: writes', () => {
     await click(shell, 'expiry-tomorrow')
     await click(shell, 'expiry-clear')
     expect(value(shell)).toBe('')
-    expect(apply(shell).text()).toBe('Clear Expiry')
+    // titleCase keeps the small word 'to' lower case (web/CLAUDE.md copy conventions).
+    expect(apply(shell).text()).toBe('Set to Never')
     expect(apply(shell).attributes('disabled')).toBeUndefined()
     await click(shell, 'expiry-apply')
     expect(mocks.setDatasetExpiry).toHaveBeenCalledTimes(2)
-    expect(mocks.setDatasetExpiry.mock.calls[1]![1].expiry).toBeUndefined()
-    expect(shell.find('[data-fact="expiry"]').text()).toBe('None')
+    // The clear is the omitted expiry, exactly as before the wording change: no sentinel date.
+    expect(mocks.setDatasetExpiry.mock.calls[1]![1]).toEqual({ expiry: undefined, override: undefined })
+    expect(shell.find('[data-fact="expiry"]').text()).toBe('Never')
+  })
+
+  it('STATIC with a stored expiry: the empty field reads Set to Never at once and sends the clear', async () => {
+    const shell = await at(EVENING, dataset({ expiry: timestampFromMs(OCT_16_TORONTO) }))
+    expect(value(shell)).toBe('')
+    expect(apply(shell).text()).toBe('Set to Never')
+    expect(apply(shell).text()).not.toBe('Clear Expiry')
+    await click(shell, 'expiry-apply')
+    expect(mocks.setDatasetExpiry).toHaveBeenCalledTimes(1)
+    expect(mocks.setDatasetExpiry.mock.calls[0]![1]).toEqual({ expiry: undefined, override: undefined })
+  })
+
+  it('the Never button empties a typed day; with a stored expiry, STATIC applies Set to Never', async () => {
+    const shell = await at(EVENING, dataset({ expiry: timestampFromMs(OCT_16_TORONTO) }))
+    await input(shell).setValue('2027/03/04')
+    expect(apply(shell).text()).toBe('Set Expiry')
+    await click(shell, 'expiry-clear')
+    expect(value(shell)).toBe('')
+    expect(apply(shell).text()).toBe('Set to Never')
+  })
+
+  it('STATIC with no stored expiry: an empty field stays Set Expiry (disabled), never Set to Never', async () => {
+    const shell = await at(EVENING, dataset({ expiry: undefined }))
+    await input(shell).setValue('2027/03/04')
+    await click(shell, 'expiry-clear')
+    expect(apply(shell).text()).toBe('Set Expiry')
+    expect(apply(shell).attributes('disabled')).toBeDefined()
+  })
+
+  it.each([
+    ['DAILY', UpdateType.DAILY],
+    ['STREAM', UpdateType.STREAM],
+  ])('%s with a stored expiry: Never then the apply reads Resume Subscription, not Set to Never', async (_name, updateType) => {
+    const shell = await at(EVENING, dataset({ updateType, state: DatasetState.RETIRED, expiry: timestampFromMs(OCT_16_TORONTO) }))
+    await input(shell).setValue('2027/03/04')
+    await click(shell, 'expiry-clear')
+    expect(apply(shell).text()).toBe('Resume Subscription')
   })
 
   it('a retired subscription with an expiry: the empty field reads Resume Subscription and sends the clear', async () => {
@@ -691,7 +745,9 @@ describe('retention: writes', () => {
   it('a typed day that is not a real YYYY/MM/DD says so, marks the field invalid and sends nothing', async () => {
     const shell = await at(EVENING)
     await input(shell).setValue('2026/02/30')
-    expect(shell.find('[data-testid="expiry-problem"]').text()).toContain('YYYY/MM/DD')
+    expect(shell.find('[data-testid="expiry-problem"]').text()).toBe(
+      'Type the day as YYYY/MM/DD, or choose Never to keep the dataset forever.',
+    )
     expect(input(shell).attributes('aria-invalid')).toBe('true')
     expect(apply(shell).attributes('disabled')).toBeDefined()
     await input(shell).trigger('keydown', { key: 'Enter' })
@@ -1014,7 +1070,7 @@ describe('retention: writes', () => {
       answer(dataset({ expiry: timestampFromMs(OCT_15_TORONTO) }))
       await flushPromises()
       expect(shell.find('[data-testid="detail-title"]').text()).toBe('XIU · bars · 1d')
-      expect(shell.find('[data-fact="expiry"]').text()).toBe('None')
+      expect(shell.find('[data-fact="expiry"]').text()).toBe('Never')
       expect(shell.find('[data-testid="retention-notice"]').exists()).toBe(false)
     })
 

@@ -1302,10 +1302,13 @@ describe('usage and retention (tj-grna9p.88)', () => {
       return mount(ExpiresCell, { props: { params: { data } as never }, global: { plugins: [pinia] } })
     }
 
-    it('Expires: the date in the chosen zone or a dash; Would be deleted where the reaper holds it, in words', () => {
+    it('Expires: the date in the chosen zone or Never; Would be deleted where the reaper holds it, in words', () => {
       // 2027-01-01T03:00Z is still 2026/12/31 in Toronto.
       expect(expiresCell(row('x', 'X', { expiry: timestampFromMs(EXPIRY) })).text()).toBe('2026/12/31')
-      expect(expiresCell(row('y', 'Y')).text()).toBe('—')
+      // tj-grna9p.142: an unset expiry is the explicit Never, for a subscription (row's DAILY) and a bulk one.
+      expect(expiresCell(row('y', 'Y')).text()).toBe('Never')
+      expect(expiresCell(row('s', 'S', { updateType: UpdateType.STATIC })).text()).toBe('Never')
+      expect(expiresCell(row('t', 'T', { updateType: UpdateType.STREAM })).text()).toBe('Never')
       const pending = expiresCell(row('p', 'P', { expiry: timestampFromMs(Date.UTC(2026, 0, 2, 12)), reaperPending: true }))
       expect(pending.text()).toBe('2026/01/02 Would be deleted')
       expect(pending.find('[data-testid="would-be-deleted"]').text()).toBe('Would be deleted')

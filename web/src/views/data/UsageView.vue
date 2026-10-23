@@ -129,8 +129,10 @@ function size(row: StaleDatasetRow): string {
 }
 
 function expires(row: StaleDatasetRow): string {
-  const expiry = row.dataset?.expiry
-  return expiry === undefined ? MISSING : date(timestampToInstant(expiry))
+  // A row with no dataset has no expiry to speak of; a dataset with none is kept forever.
+  if (row.dataset === undefined) return MISSING
+  const expiry = row.dataset.expiry
+  return expiry === undefined ? 'Never' : date(timestampToInstant(expiry))
 }
 
 const COLUMNS = ['Dataset', 'Last Read', 'Read By', 'Size (Est.)', 'Owner', 'Expires'] as const
