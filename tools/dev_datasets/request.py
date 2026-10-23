@@ -17,6 +17,18 @@ unless deploymentLabel is 'dev' or 'test'. A prod stack answers an empty label a
 request. The label also picks the backend, from the one plan: dev is real Alpaca bars under SPY, QQQ and DIA; test is
 the fake broker under ZZDS-prefixed synthetic symbols, so the public repo never shows fake prices under a real ticker.
 
+THE DATABASE RAIL. The HTTP label proves only the store that answered, not the database the tool writes to (they are
+named separately). So every database connection the tool opens first reads, as its FIRST statement and on THAT
+connection, the row of pg_settings named cluster_name (readable by any role), before any count, reset or degrade
+statement. It refuses unless exactly one row came back whose source is 'command line', whose value is 'dev' or 'test',
+and which equals the label the store reported. cluster_name is set only by docker-compose.override.yaml (dev) and
+docker-compose.fake.yaml (test), as a postgres server option (-c cluster_name=dev); a prod database never has it from
+the command line and is refused. The source is what makes it a proof: a client that sets the value itself (PGOPTIONS, a
+session SET) shows source 'client' or 'session', and ALTER ROLE or ALTER DATABASE ... SET shows 'user' or 'database';
+all are refused, as is no row, a NULL or empty value and any other source. What it does not prove: someone with
+superuser rights or access to the server's command line can still set it. A refusal names the value and the source
+only and changes nothing.
+
 THE SECRETS. INSTANCE_WRITE_SECRET and POSTGRES_PASS come ONLY from the environment. Each is held in a Secret,
 whose repr and str are masked, and is revealed at exactly one place: the header the HTTP call sends, the password
 the DB connect call takes. Neither reaches stdout, stderr, a log, an argv, an exception message or a traceback:
@@ -68,6 +80,13 @@ SDK_READER: Final = 'dev-datasets-sdk'
 DEV_LABEL: Final = 'dev'
 TEST_LABEL: Final = 'test'
 RAIL_LABELS: Final = (DEV_LABEL, TEST_LABEL)
+
+# The database's own identity: the built-in cluster_name, which the dev and test compose files put on the postgres
+# command line (-c cluster_name=dev, -c cluster_name=test) and the prod files never set. A built-in is listed in
+# pg_settings with its source; a custom placeholder setting is hidden from that view, so it could not be proven.
+STACK_SETTING: Final = 'cluster_name'
+STACK_SQL: Final = "SELECT setting, source FROM pg_settings WHERE name = 'cluster_name'"
+STACK_SOURCE: Final = 'command line'
 
 # The test backend's symbols are synthetic: an optional fake-broker scenario prefix (tests/fakes/market_data.py
 # EMPTY_PREFIX, GAPS_PREFIX, FAILONCE_PREFIX), then 'ZZDS', then the dev symbol. Never a real ticker on its own.
@@ -712,6 +731,47 @@ def _connect(env: Environment) -> Any:
     )
 
 
+def check_database_stack(connection: Any, label: str) -> None:
+    """The database rail: refuse unless this server's cluster_name came from its command line and is the store's label.
+
+    The one statement run on a fresh connection, before anything else touches it. Fails closed.
+
+    Raises:
+        DevDatasetsError: Unless exactly one pg_settings row came back with source 'command line' and a value of 'dev'
+            or 'test' equal to label. The connection is rolled back and closed first, and only the value and the
+            source are named.
+    """
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(STACK_SQL)
+            rows = cursor.fetchall()
+    except Exception as exc:
+        connection.close()
+        raise DevDatasetsError(f'the database identity check failed ({type(exc).__name__})') from None
+    stack, source = rows[0] if len(rows) == 1 else (None, None)
+    if source == STACK_SOURCE and stack in RAIL_LABELS and stack == label:
+        return
+    connection.rollback()
+    connection.close()
+    shown = stack[:40] if isinstance(stack, str) and stack else 'none'
+    shown_source = source[:40] if isinstance(source, str) and source else 'none'
+    raise DevDatasetsError(
+        f'refused: the database is not this dev or test stack ({STACK_SETTING} {shown!r} from source {shown_source!r}, '
+        f'the store says {label!r}); nothing was changed'
+    )
+
+
+def checked_connect(connect: Callable[[], Any], label: str) -> Callable[[], Any]:
+    """connect, but every connection it returns has passed check_database_stack(label) first."""
+
+    def open_checked() -> Any:
+        connection = connect()
+        check_database_stack(connection, label)
+        return connection
+
+    return open_checked
+
+
 def run_degrade(connect: Callable[[], Any], rows: Sequence[PlanRow], today: date, out: Reporter) -> None:
     """Delete whole sessions of bars from the plan's dev-degraded datasets, in ONE transaction.
 
@@ -734,10 +794,7 @@ def run_degrade(connect: Callable[[], Any], rows: Sequence[PlanRow], today: date
         targets.append(row)
     if not targets:
         return
-    try:
-        connection = connect()
-    except Exception as exc:
-        raise DevDatasetsError(f'the database connection failed ({type(exc).__name__})') from None
+    connection = _open(connect)
     try:
         with connection.cursor() as cursor:
             for row in targets:
@@ -763,6 +820,8 @@ def run_degrade(connect: Callable[[], Any], rows: Sequence[PlanRow], today: date
 def _open(connect: Callable[[], Any]) -> Any:
     try:
         return connect()
+    except DevDatasetsError:
+        raise
     except Exception as exc:
         raise DevDatasetsError(f'the database connection failed ({type(exc).__name__})') from None
 
@@ -1029,7 +1088,7 @@ def run(
         client = http or HttpClient(env.store_url)
         label = check_rail(client, out)
         rows = [row.on_backend(label) for row in rows]
-        open_db = connect or (lambda: _connect(env))
+        open_db = checked_connect(connect or (lambda: _connect(env)), label)
         if resets:
             if arguments.dry_run:
                 return _dry_run_reset(env, mode, rows, bodies, today, open_db, out)

@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from tools.dev_datasets import request as tool
-from tools.dev_datasets.tests.doubles import FakeDb, dataset_id, run_tool, store_for
+from tools.dev_datasets.tests.doubles import STACK_TEXT, FakeDb, dataset_id, run_tool, store_for
 
 
 pytestmark = pytest.mark.build_infra
@@ -25,13 +25,20 @@ def degrade(db: FakeDb, *extra: str):
     return run_tool(['degrade', *extra], http=store_for(), connect=db.connect)
 
 
-def test_one_connection_one_commit_and_the_four_statements_in_order():
+def test_one_connection_one_commit_the_identity_query_then_the_four_statements_in_order():
+    # tj-grna9p.194: the database rail's identity query is the connection's first statement.
     db = FakeDb.with_plan_entries()
     outcome = degrade(db)
     assert outcome.status == 0, outcome.text
     assert (db.connects, db.commits, db.rollbacks, db.closes) == (1, 1, 0, 1)
-    assert [sql for sql, _ in db.statements] == [tool.LOOKUP_SQL, tool.DELETE_SQL, tool.LOOKUP_SQL, tool.DELETE_SQL]
-    assert [params for _, params in db.statements][0::2] == [R12_KEY, R13_KEY]
+    assert [sql for sql, _ in db.statements] == [
+        STACK_TEXT,
+        tool.LOOKUP_SQL,
+        tool.DELETE_SQL,
+        tool.LOOKUP_SQL,
+        tool.DELETE_SQL,
+    ]
+    assert [params for _, params in db.statements][1::2] == [R12_KEY, R13_KEY]
 
 
 def test_each_delete_is_bound_to_the_looked_up_id_and_the_dev_degraded_owner():
@@ -61,7 +68,11 @@ def test_the_lookup_text_keys_on_owner_symbol_and_granularity_and_only_reads():
 def test_no_statement_names_another_table_or_writes_anything_but_the_bar_delete():
     db = FakeDb.with_plan_entries()
     assert degrade(db).status == 0
+    # tj-grna9p.194: the one read outside the dataset tables is the database rail's identity query, exactly.
+    assert [sql for sql, _ in db.statements if 'pg_settings' in sql] == [STACK_TEXT]
     for sql, _ in db.statements:
+        if sql == STACK_TEXT:
+            continue
         lowered = sql.lower()
         for table in OTHER_TABLES:
             assert not re.search(rf'\b{table}\b', lowered), (table, sql)
@@ -170,8 +181,9 @@ def test_a_row_whose_owner_is_not_dev_degraded_is_refused_before_connecting():
 def test_row_limits_degrade_to_that_row():
     db = FakeDb.with_plan_entries()
     assert degrade(db, '--row', 'r13').status == 0
-    assert db.statements[0][1] == R13_KEY
-    assert len(db.statements) == 2
+    assert db.statements[0][0] == STACK_TEXT
+    assert db.statements[1][1] == R13_KEY
+    assert len(db.statements) == 3
 
 
 def test_rows_without_a_degrade_are_never_touched():

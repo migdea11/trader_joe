@@ -4,6 +4,9 @@ tj-grna9p.148: the database double also answers the reset's count SELECTs, TRUNC
 transaction boundaries (events); the store double can answer as a TEST stack, filing rows under synthetic symbols.
 tj-grna9p.150: it answers the reset's RUNNING count too, and its sleep() stands in for the wait after a reset, during
 which work in flight may write (written_while_waiting); run_tool injects that wait into every run.
+tj-grna9p.194: it answers the database rail's identity query, the pg_settings row of cluster_name as (setting, source):
+stack and source by default, identity_rows to answer any rows at all (none, two). It records the query in statements
+and events like any other statement, so a test sees what ran before and after it.
 
 Nothing here reaches a network or a database. Every credential is a fake with a distinctive canary inside it, so a
 leak shows up as a substring anywhere in the output, whatever the formatting around it.
@@ -63,6 +66,12 @@ _COUNT = re.compile(r'^SELECT count\(\*\) FROM ([a-z_]+)$', re.IGNORECASE)
 # tj-grna9p.150 (5a): the reset's RUNNING count, written out from the design (the store writes the enum's value,
 # 'RUNNING', into ingest_run.state; test_reset.py checks that against the store model's source).
 RUNNING_COUNT_TEXT = "SELECT count(*) FROM ingest_run WHERE state = 'RUNNING'"
+# tj-grna9p.194, THE DATABASE RAIL (architect's option 3): the identity query every connection runs first, written out
+# from the design. The built-in cluster_name, which the dev and test compose files put on the postgres command line;
+# pg_settings lists it with its source, and only 'command line' proves the server was started that way.
+STACK_NAME = 'cluster_name'
+STACK_TEXT = "SELECT setting, source FROM pg_settings WHERE name = 'cluster_name'"
+COMMAND_LINE = 'command line'
 # tj-grna9p.150 (5b): the wait after a reset is two usage flush intervals of 5 s each.
 QUIESCE_SECONDS = 10
 
@@ -216,9 +225,19 @@ class FakeCursor:
     def execute(self, sql, params=()):
         self.db.statements.append((sql, tuple(params)))
         self.db.events.append(('execute', sql))
+        text = ' '.join(sql.split())
+        if text == STACK_TEXT:
+            # The identity query fails only when told to by name (identity_error, or fail_on naming it), so the
+            # failure tests of the work statements still reach the statement they target.
+            if self.db.identity_error is not None:
+                raise self.db.identity_error
+            if self.db.execute_error is not None and self.db.fail_on is not None and self.db.fail_on in sql:
+                raise self.db.execute_error
+            rows = self.db.identity_rows
+            self._result = list(rows) if rows is not None else [(self.db.stack, self.db.source)]
+            return
         if self.db.execute_error is not None and (self.db.fail_on is None or self.db.fail_on in sql):
             raise self.db.execute_error
-        text = ' '.join(sql.split())
         count = _COUNT.match(text)
         if text == RUNNING_COUNT_TEXT:
             self._result = [(self.db.running,)]
@@ -268,6 +287,13 @@ class FakeDb:
     # Every wait the tool asked for, in seconds; never a real one.
     sleeps: list[float] = field(default_factory=list)
     autocommit: bool = False
+    # The pg_settings row of cluster_name on this server: setting 'dev' as the dev override sets it, 'test' as the fake
+    # overlay does, '' from source 'default' on a server started without it (prod). identity_rows, when set, is the
+    # whole answer instead (no row, two rows). identity_error: the query itself fails.
+    stack: str | None = 'dev'
+    source: str | None = COMMAND_LINE
+    identity_rows: list[tuple] | None = None
+    identity_error: Exception | None = None
     connects: int = 0
     commits: int = 0
     rollbacks: int = 0
@@ -282,7 +308,7 @@ class FakeDb:
                 symbol = TESTMODE_SYMBOLS[row.id] if label == 'test' else row.symbol
                 key = (row.owner, symbol, tool.GRANULARITY_DB_LABELS[row.granularity])
                 lookups[key] = [(dataset_id(row.id),)]
-        return cls(lookups=lookups)
+        return cls(lookups=lookups, stack=label)
 
     def connect(self):
         self.connects += 1
@@ -320,6 +346,16 @@ class FakeDb:
     def sql(self) -> list[str]:
         """Every statement's text, whitespace collapsed."""
         return [' '.join(sql.split()) for sql, _ in self.statements]
+
+    def per_connection(self) -> list[list[str]]:
+        """The statements of each connection, in order: events split at every connect, whitespace collapsed."""
+        groups: list[list[str]] = []
+        for event in self.events:
+            if event[0] == 'connect':
+                groups.append([])
+            elif event[0] == 'execute':
+                groups[-1].append(' '.join(event[1].split()))
+        return groups
 
     def writes(self) -> list[str]:
         """Every statement that is not a read or a session setting."""

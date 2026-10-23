@@ -38,6 +38,7 @@ from tools.dev_datasets.tests.doubles import (
     QUIESCE_SECONDS,
     RUNNING_COUNT_TEXT,
     SEVEN_TABLES,
+    STACK_TEXT,
     TABLE_COUNTS,
     TEST_CONFIG,
     ExplodingHttp,
@@ -194,12 +195,13 @@ def test_a_confirmed_reset_is_one_transaction_lock_timeout_then_the_running_coun
     db = FakeDb()
     outcome = reset(db, '--yes-reset')
     assert outcome.status == 0, outcome.text
-    assert db.sql() == [LOCK, RUNNING_COUNT_TEXT, *COUNTS, TRUNCATE, *COUNTS, *COUNTS]
+    # tj-grna9p.194: each of the two connections asks the database rail's identity query first.
+    assert db.sql() == [STACK_TEXT, LOCK, RUNNING_COUNT_TEXT, *COUNTS, TRUNCATE, *COUNTS, STACK_TEXT, *COUNTS]
     kinds = [event[0] for event in db.events]
     assert kinds == [
-        *['connect', *['execute'] * 17, 'commit', 'close'],
+        *['connect', *['execute'] * 18, 'commit', 'close'],
         'sleep',
-        *['connect', *['execute'] * 7, 'rollback', 'close'],
+        *['connect', *['execute'] * 8, 'rollback', 'close'],
     ]
     assert (db.connects, db.commits, db.rollbacks, db.closes) == (2, 1, 1, 2)
     assert db.autocommit is False
@@ -227,7 +229,11 @@ def test_reset_sends_no_http_but_the_rail():
 def test_reset_never_names_alembic_version_or_any_other_table():
     db = FakeDb()
     assert reset(db, '--yes-reset').status == 0
+    # tj-grna9p.194: the one read outside the seven is the database rail's identity query, exactly, once per connection.
+    assert [sql for sql in db.sql() if 'pg_settings' in sql] == [STACK_TEXT, STACK_TEXT]
     for sql in db.sql():
+        if sql == STACK_TEXT:
+            continue
         assert 'alembic_version' not in sql
         named = set(re.findall(r'\b(?:FROM|TABLE)\s+([a-z_]+)', sql))
         named |= (
@@ -309,7 +315,8 @@ def test_without_yes_reset_the_counts_are_printed_nothing_changes_and_the_exit_i
         f'refused: nothing was changed. {mode} resets first; pass --yes-reset to confirm{hint}',
     ]
     assert db.writes() == []
-    assert all(COUNT_TEXT.match(sql) for sql in db.sql())
+    assert db.sql()[0] == STACK_TEXT
+    assert all(COUNT_TEXT.match(sql) for sql in db.sql()[1:])
     assert db.commits == 0
     assert db.counts == TABLE_COUNTS
     assert store.writes() == []
@@ -378,7 +385,8 @@ def test_seed_resets_and_commits_before_its_first_lookup_or_post():
     # tj-grna9p.150 (5b): the plan goes out only after the wait and the clean recount.
     sleep_at = timeline.events.index('SLEEP')
     assert timeline.events.index('COMMIT') < sleep_at < first_store_call
-    assert timeline.events[sleep_at + 1 : first_store_call] == ['SELECT'] * 7 + ['ROLLBACK']
+    # The recount's connection: the identity query (a SELECT), the seven counts, the rollback.
+    assert timeline.events[sleep_at + 1 : first_store_call] == ['SELECT'] * 8 + ['ROLLBACK']
     assert len(store.posts()) == 14
     assert db.commits == 1
     assert outcome.sleeps == [QUIESCE_SECONDS]
@@ -463,7 +471,7 @@ def test_the_rail_refuses_before_any_sql(argv, label):
 
 
 def test_the_reset_passes_the_test_label():
-    db = FakeDb()
+    db = FakeDb(stack='test')
     outcome = reset(db, '--yes-reset', store=store_for(config=TEST_CONFIG))
     assert outcome.status == 0
     assert outcome.lines[0] == "rail: deploymentLabel is 'test' (fake broker backend)"
@@ -487,13 +495,14 @@ def test_the_placeholder_stops_a_confirmed_reset_before_any_call(variable):
 @pytest.mark.parametrize('label', ['dev', 'test'])
 @pytest.mark.parametrize('mode', ['seed', 'reset'])
 def test_a_dry_run_reads_the_rail_and_the_counts_and_writes_nothing(mode, label):
-    db = FakeDb()
+    db = FakeDb(stack=label)
     store = store_for(config=tool.Response(200, {'deploymentLabel': label}))
     outcome = run_tool([mode, '--dry-run'], http=store, connect=db.connect)
     assert outcome.status == 0, outcome.text
     assert [(c.method, c.route) for c in store.calls] == [('GET', '/ui/v1/config')]
     assert store.writes() == []
-    assert [COUNT_TEXT.match(sql).group(1) for sql in db.sql()] == list(SEVEN_TABLES)
+    assert db.sql()[0] == STACK_TEXT
+    assert [COUNT_TEXT.match(sql).group(1) for sql in db.sql()[1:]] == list(SEVEN_TABLES)
     assert db.writes() == []
     assert db.commits == 0
     assert db.counts == TABLE_COUNTS
@@ -604,9 +613,9 @@ def test_a_running_ingest_run_refuses_the_reset_before_the_truncate_and_changes_
     assert outcome.status == 1
     assert outcome.lines == [RAIL_DEV, refused_line(running)]
     # Counted after the lock timeout, in the transaction, and nothing after it: no TRUNCATE, no other count.
-    assert db.sql() == [LOCK, RUNNING_COUNT_TEXT]
+    assert db.sql() == [STACK_TEXT, LOCK, RUNNING_COUNT_TEXT]
     assert db.writes() == []
-    assert [event[0] for event in db.events] == ['connect', 'execute', 'execute', 'rollback', 'close']
+    assert [event[0] for event in db.events] == ['connect', 'execute', 'execute', 'execute', 'rollback', 'close']
     assert (db.connects, db.commits, db.rollbacks, db.closes) == (1, 0, 1, 1)
     assert db.counts == TABLE_COUNTS
     assert outcome.sleeps == []
@@ -622,7 +631,8 @@ def test_the_running_count_is_in_the_same_transaction_as_the_truncate_and_before
     assert transaction[0] == ('connect',)
     assert all(event[0] == 'execute' for event in transaction[1:])
     statements = [' '.join(event[1].split()) for event in transaction[1:]]
-    assert statements.index(RUNNING_COUNT_TEXT) == 1
+    assert statements[0] == STACK_TEXT
+    assert statements.index(RUNNING_COUNT_TEXT) == 2
     assert statements.index(RUNNING_COUNT_TEXT) < statements.index(TRUNCATE)
 
 

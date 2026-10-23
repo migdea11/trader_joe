@@ -33,6 +33,11 @@
 # /ping on APP_INTERNAL_PORT and gRPC health on APP_INTERNAL_GRPC_HOST:APP_INTERNAL_GRPC_PORT, both of
 # which the launcher's app serves like production's, since it runs production's create_app and lifespan).
 services:
+  postgres:
+    # THE DATABASE'S OWN TEST MARKER (tj-grna9p.194), the counterpart of docker-compose.override.yaml's dev one:
+    # tools/dev_datasets reads cluster_name and its source from pg_settings on its own connection before any reset
+    # or degrade. Test mode's postgres has its own data directory and project, so it is marked here, never dev.
+    command: ["postgres", "-c", "cluster_name=test"]
   data_store:
     image: trader_joe_data_store:test
     environment:

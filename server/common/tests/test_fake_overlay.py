@@ -73,6 +73,9 @@ FAKE_KEYS = frozenset({'volumes', 'command', 'environment'})
 # the test-mode label. Spelled out, not read from the overlay.
 FAKE_STORE_KEYS = frozenset({'environment'})
 FAKE_STORE_ENVIRONMENT = {'DEPLOYMENT_LABEL': 'test'}
+# tj-grna9p.194 (the database rail): the overlay may set postgres's command and nothing else, and the command is
+# exactly the image's default (postgres) plus the test-mode marker. Spelled out, not read from the overlay.
+FAKE_POSTGRES = {'command': ['postgres', '-c', 'cluster_name=test']}
 # The test-mode images (ADR tj-4rr0la addendum 27 (2)): the overlay names the test pair :test, so
 # every compose call through it builds and runs :test, never the :latest a deployment may run.
 # Spelled out, not read from the overlay: the oracle must not be the file under test.
@@ -115,11 +118,16 @@ def test_the_overlay_sets_the_test_images_and_only_data_ingest_mount_command_and
 
     tj-grna9p.148 re-pin (design (3)): data_store also gains an `environment` holding exactly
     DEPLOYMENT_LABEL=test, the test-mode label GET /ui/v1/config reports and tools/dev_datasets' rail reads.
+
+    tj-grna9p.194 re-pin (the database rail): postgres joins, holding exactly FAKE_POSTGRES -- its command,
+    the image's default plus -c cluster_name=test (the architect's option 3) -- and no other key.
     """
     overlay = load(FAKE_FILE)
     assert set(overlay) == {'services'}, f'the fake overlay sets top-level {sorted(overlay)}'
     services = overlay['services']
-    assert set(services) == set(TEST_IMAGES), f'the fake overlay touches {sorted(services)}'
+    assert set(services) == {*TEST_IMAGES, 'postgres'}, f'the fake overlay touches {sorted(services)}'
+    assert services['postgres'] == FAKE_POSTGRES, services['postgres']
+    services = {name: spec for name, spec in services.items() if name != 'postgres'}
     assert set(services['data_store']) == FAKE_STORE_KEYS | {'image'}, (
         f'the fake overlay sets data_store keys {sorted(services["data_store"])}'
     )
@@ -204,12 +212,18 @@ def test_the_system_stack_is_prod_but_for_the_test_tags_and_data_ingest_mount_co
 
     tj-grna9p.148 re-pin (design (3)): and the label. data_store's environment differs from prod's in
     DEPLOYMENT_LABEL alone, '' on prod and 'test' here; every other variable is prod's.
+
+    tj-grna9p.194 re-pin (the database rail): postgres differs from prod's in its command alone, which prod
+    leaves to the image (no command key) and test mode sets to FAKE_POSTGRES's.
     """
     system, prod = system_model(), prod_model()
     assert system['networks'] == prod['networks']
     assert set(system['services']) == set(prod['services'])
     for name, spec in prod['services'].items():
-        if name not in TEST_IMAGES:
+        if name == 'postgres':
+            assert 'command' not in spec, spec.get('command')
+            assert system['services'][name] == {**spec, **FAKE_POSTGRES}, f'fake mode changes {name}'
+        elif name not in TEST_IMAGES:
             assert system['services'][name] == spec, f'fake mode changes {name}'
     store_env, prod_store_env = (
         system['services']['data_store']['environment'],
