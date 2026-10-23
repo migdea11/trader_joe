@@ -112,6 +112,12 @@ ENVIRONMENTS: dict[str, tuple[frozenset[str], bool]] = {
     # tools/agent_mcp/*.py and nothing else (the Dockerfile test below pins that both ways), and the
     # service Dockerfile copies no tools tree at all. Not a test, so is_test is False.
     'tools/errors_doc.py': (TEST_VENV, False),
+    # The dev dataset generator (tj-grna9p.145). It runs only in the venv, as `uv run python -m
+    # tools.dev_datasets.request` from the repository root; no image copies it. Its one third-party
+    # import, psycopg2 (lazily, inside _connect), is declared by the data-store group, which the venv
+    # sync installs. Not a test, so is_test is False; its own tests are mapped beside it.
+    'tools/dev_datasets': (TEST_VENV, False),
+    'tools/dev_datasets/tests': (TEST_VENV, True),
     'tools/tests': (TEST_VENV, True),
     'common/tests': (TEST_VENV, True),
     'data/ingest/tests': (TEST_VENV, True),

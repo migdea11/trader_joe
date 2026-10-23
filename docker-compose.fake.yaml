@@ -35,6 +35,12 @@
 services:
   data_store:
     image: trader_joe_data_store:test
+    environment:
+      # The test-mode label GET /ui/v1/config reports (the UI shows a 'test' tag), and what tools/dev_datasets reads
+      # to choose its fake-broker backend and to pass its rail (dev or test). Display and tooling only: nothing in
+      # the service branches on it. Merges by name with the base file's bare DEPLOYMENT_LABEL key, and outranks the
+      # env file's empty DEPLOYMENT_LABEL=. Prod never loads this file (the enumeration pin, tj-iee6sn.27).
+      DEPLOYMENT_LABEL: test
   data_ingest:
     image: trader_joe_data_ingest:test
     volumes:

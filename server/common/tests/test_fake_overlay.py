@@ -69,6 +69,10 @@ FAKE_SHELL_WORDS = [
 ]
 # The only keys the overlay may set on data_ingest's behaviour: the mount, the command, the blanked keys.
 FAKE_KEYS = frozenset({'volumes', 'command', 'environment'})
+# The only key the overlay may set on data_store's behaviour (tj-grna9p.148 (3)): its environment, holding exactly
+# the test-mode label. Spelled out, not read from the overlay.
+FAKE_STORE_KEYS = frozenset({'environment'})
+FAKE_STORE_ENVIRONMENT = {'DEPLOYMENT_LABEL': 'test'}
 # The test-mode images (ADR tj-4rr0la addendum 27 (2)): the overlay names the test pair :test, so
 # every compose call through it builds and runs :test, never the :latest a deployment may run.
 # Spelled out, not read from the overlay: the oracle must not be the file under test.
@@ -108,14 +112,18 @@ def test_the_overlay_sets_the_test_images_and_only_data_ingest_mount_command_and
     tj-iee6sn.19 re-pin (ADR tj-4rr0la addendum 27 (1)-(2)): the overlay is now the test-mode
     overlay, so it also names the test pair's images -- data_store gains an entry holding `image`
     and nothing else, and data_ingest's keys gain `image` -- each exactly its :test tag.
+
+    tj-grna9p.148 re-pin (design (3)): data_store also gains an `environment` holding exactly
+    DEPLOYMENT_LABEL=test, the test-mode label GET /ui/v1/config reports and tools/dev_datasets' rail reads.
     """
     overlay = load(FAKE_FILE)
     assert set(overlay) == {'services'}, f'the fake overlay sets top-level {sorted(overlay)}'
     services = overlay['services']
     assert set(services) == set(TEST_IMAGES), f'the fake overlay touches {sorted(services)}'
-    assert set(services['data_store']) == {'image'}, (
+    assert set(services['data_store']) == FAKE_STORE_KEYS | {'image'}, (
         f'the fake overlay sets data_store keys {sorted(services["data_store"])}'
     )
+    assert services['data_store']['environment'] == FAKE_STORE_ENVIRONMENT, services['data_store']['environment']
     assert set(_fake_ingest()) == FAKE_KEYS | {'image'}, (
         f'the fake overlay sets data_ingest keys {sorted(_fake_ingest())}'
     )
@@ -193,6 +201,9 @@ def test_the_system_stack_is_prod_but_for_the_test_tags_and_data_ingest_mount_co
     tj-iee6sn.19 re-pin (ADR tj-4rr0la addendum 27 (2)): the one other difference is the tag. The
     test pair is the prod build -- the same build: section, prod_image target -- tagged :test, while
     prod keeps :latest. postgres is untouched.
+
+    tj-grna9p.148 re-pin (design (3)): and the label. data_store's environment differs from prod's in
+    DEPLOYMENT_LABEL alone, '' on prod and 'test' here; every other variable is prod's.
     """
     system, prod = system_model(), prod_model()
     assert system['networks'] == prod['networks']
@@ -200,7 +211,14 @@ def test_the_system_stack_is_prod_but_for_the_test_tags_and_data_ingest_mount_co
     for name, spec in prod['services'].items():
         if name not in TEST_IMAGES:
             assert system['services'][name] == spec, f'fake mode changes {name}'
-    allowed = {'data_store': {'image'}, 'data_ingest': FAKE_KEYS | {'image'}}
+    store_env, prod_store_env = (
+        system['services']['data_store']['environment'],
+        prod['services']['data_store']['environment'],
+    )
+    differing = {key for key in set(store_env) | set(prod_store_env) if store_env.get(key) != prod_store_env.get(key)}
+    assert differing == {'DEPLOYMENT_LABEL'}, sorted(differing)
+    assert (store_env['DEPLOYMENT_LABEL'], prod_store_env['DEPLOYMENT_LABEL']) == ('test', '')
+    allowed = {'data_store': FAKE_STORE_KEYS | {'image'}, 'data_ingest': FAKE_KEYS | {'image'}}
     for name, keys in allowed.items():
         service, prod_service = system['services'][name], prod['services'][name]
         changed = {key for key in set(service) | set(prod_service) if service.get(key) != prod_service.get(key)}
@@ -232,6 +250,9 @@ def test_every_set_that_loads_the_overlay_runs_the_fake():
         keys = {name: ingest['environment'][name] for name in _credential_vars()}
         assert keys == dict.fromkeys(_credential_vars(), ''), label
         assert ingest['image'] == TEST_IMAGES['data_ingest'], label
+        # tj-grna9p.148 (3): no file loaded after the overlay undoes the test label either.
+        store = merge([load(path) for path in files])['services']['data_store']
+        assert store['environment'].get('DEPLOYMENT_LABEL') == 'test', label
 
 
 # --- who loads the overlay ------------------------------------------------------------------------
