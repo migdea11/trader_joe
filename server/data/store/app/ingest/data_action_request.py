@@ -62,6 +62,7 @@ from data.store.app.database.crud.stock.asset_market_activity import write_marke
 from data.store.app.database.crud.stock.store_dataset_entry import (
     OverlapKey,
     check_own_overlap,
+    lock_active_entry,
     upsert_entry_in_transaction,
 )
 from data.store.app.database.transaction import write_transaction
@@ -79,6 +80,14 @@ if TYPE_CHECKING:
 log = get_logger(__name__)
 
 MARKET_ACTIVITY_BATCH_SIZE = get_env_var('MARKET_ACTIVITY_BATCH_SIZE', cast_type=int)
+
+
+class DatasetRetiredDuringFetch(Exception):
+    """The scheduled refresh's dataset was retired, or deleted, while the vendor call was in flight.
+
+    Not a TraderJoeError: it never reaches an edge. It leaves the fetch's transaction, which rolls back
+    and writes nothing, and the DAILY refresh catches it and drops the answer.
+    """
 
 
 @dataclass(frozen=True)
@@ -106,13 +115,17 @@ class StoredDataset:
 
 
 def _fetch_request(
-    request_path: StoreAssetDatasetPath, request_body: StoreAssetDatasetBody
+    request_path: StoreAssetDatasetPath, request_body: StoreAssetDatasetBody, fetch_start: 'datetime | None' = None
 ) -> fetch_dataset.FetchDatasetRequest:
     """Build the fetch from the caller's request.
 
     TRANSPORT PARITY: this asks for the range the caller asked for, exactly as the Kafka request
     did. Driving the request from the coverage ledger -- "ask for exactly what is missing" -- is
     tj-3mk3u5.34, which needs a ledger that does not exist yet.
+
+    THE ONE DEPARTURE IS fetch_start (tj-grna9p.22): the DAILY refresh asks ingest for the missing
+    tail only, while the entry keeps its declared range as identity. It replaces the START of the
+    ingest request and nothing else; the entry, the overlap check and the bar stamping never see it.
 
     Spelled out field by field rather than splatted. FetchDatasetRequest is an InboundContract, so
     it forbids extras, and the body carries three fields it does not declare (expiry, expiry_type
@@ -129,6 +142,7 @@ def _fetch_request(
     Args:
         request_path: The asset and data type being stored.
         request_body: What the caller asked for.
+        fetch_start: The instant to ask ingest from instead of the body's start, or None.
 
     Returns:
         fetch_dataset.FetchDatasetRequest: The fetch, in domain terms.
@@ -141,7 +155,7 @@ def _fetch_request(
         asset_type=request_path.asset_type,
         data_types=[request_path.data_type],
         granularity=request_body.granularity,
-        start=request_body.start,
+        start=request_body.start if fetch_start is None else fetch_start,
         end=request_body.end,
         update_type=request_body.update_type,
     )
@@ -242,6 +256,9 @@ async def store_market_activity_worker(
     db: AsyncSession,
     fetch_client: IngestFetchClient,
     on_ack: Callable[[UUID, Feed], Awaitable[None]] | None = None,
+    *,
+    fetch_start: 'datetime | None' = None,
+    preserve_lifecycle: bool = False,
 ) -> StoredDataset:
     """Fetch one dataset over the FetchDataset seam and write it, entry and bars, in one transaction.
 
@@ -264,11 +281,21 @@ async def store_market_activity_worker(
             inside the fetch transaction. It is how the run recorder learns the dataset id
             (app/ingest/run_recording.py); it must not touch `db`. None for a caller with nothing to
             tell.
+        fetch_start: Ask ingest from this instant instead of the body's start (aware). The entry
+            is still the body's identity, so an existing entry is matched as an exact repeat and no
+            second one is created. None, which every request path sends, asks for the body's range.
+        preserve_lifecycle: True for the scheduled DAILY refresh (tj-grna9p.22) and nothing else. The
+            refresh must not write the entry's expiry or any lifecycle field, and must not undo an
+            operator's retire that landed during the fetch: the entry is locked and re-checked on the
+            ack, and the answer is dropped when it is retired or gone. False, which every request path
+            sends, is the interactive behaviour, unchanged.
 
     Returns:
         StoredDataset: How many bars were written, and the window the fetch was answered for.
 
     Raises:
+        DatasetRetiredDuringFetch: Only with preserve_lifecycle: the entry was retired or deleted
+            while the fetch was in flight. Nothing is written.
         TraderJoeError: A refused ack (before anything is written), a failed call, a stream that
             breaks the contract, or a database failure out of write_transaction. Deliberately not
             caught here or in the route: the edge renders it as problem+json (D6).
@@ -276,7 +303,7 @@ async def store_market_activity_worker(
             renders it as a 409 carrying colliding_ids. Raised before the stream is opened, so no
             vendor call is made for it (step 0 of the module docstring's order).
     """
-    request = _fetch_request(request_path, request_body)
+    request = _fetch_request(request_path, request_body, fetch_start)
     # ONE OVERLAP KEY FOR THE WHOLE FETCH, built here and EXTENDED into the entry on the ack
     # (tj-xn3qa6 D3). What the check below and the write on the ack share is now exactly the part
     # that must agree -- the ten identity fields minus the tape -- rather than a whole entry that
@@ -331,7 +358,18 @@ async def store_market_activity_worker(
                     # request body cannot be reached from: the body's feed is a PREFERENCE of the
                     # same type and would validate silently here. See _entry_on_ack.
                     entry = _entry_on_ack(overlap_key, request_body.expiry, event)
-                    dataset_id = await upsert_entry_in_transaction(db, entry)
+                    if preserve_lifecycle:
+                        # THE SCHEDULED REFRESH. Lock the entry and re-check, right before any bar is written,
+                        # that it still exists and is not retired: an operator's retire may have committed
+                        # while the vendor call was in flight. Retired or gone means the answer is dropped and
+                        # nothing is written. The lock is held to the commit below, so a retire that comes
+                        # later waits for it. The refresh never creates an entry and never writes a
+                        # lifecycle field.
+                        if await lock_active_entry(db, entry) is None:
+                            raise DatasetRetiredDuringFetch
+                        dataset_id = await upsert_entry_in_transaction(db, entry, preserve_lifecycle=True)
+                    else:
+                        dataset_id = await upsert_entry_in_transaction(db, entry)
                     if on_ack is not None:
                         await on_ack(dataset_id, feed)
                 case fetch_dataset.BarPage():

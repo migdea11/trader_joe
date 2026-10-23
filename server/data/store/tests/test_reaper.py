@@ -1055,6 +1055,9 @@ async def test_the_lifespan_starts_the_reaper_and_stops_it_before_the_database(m
         await real_stop(task)
 
     monkeypatch.setattr(reaper_module, 'reaper', FakeReaper())
+    # The lifespan also starts the interim DAILY refresh (tj-grna9p.22), on by default; it is not this test's subject
+    # and would run a real pass against the uninitialised database module and the fake channel (tj-grna9p.92).
+    monkeypatch.setenv('DAILY_REFRESH_ENABLED', 'false')
     monkeypatch.setattr(app_depends, 'start_reaper_loop', start)
     monkeypatch.setattr(app_depends, 'stop_reaper_loop', stop)
     monkeypatch.setattr(app_depends, 'database', FakeDatabase())

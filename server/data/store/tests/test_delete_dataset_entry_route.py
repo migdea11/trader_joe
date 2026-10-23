@@ -249,6 +249,26 @@ def test_a_wrong_owner_is_refused_with_403_and_nothing_is_deleted(delete_entry):
     assert session.commits == 0
 
 
+def test_the_operator_principal_gets_no_override_on_store(delete_entry):
+    """The operator override of /ui/v1 does not widen /store (tj-grna9p.86; traceability gap filled by tj-grna9p.92).
+
+    The UI's writes act as OPERATOR_PRINCIPAL and may override another owner's dataset, with an audited reason. The
+    /store DELETE is owner-scoped and has no override: declaring `operator` there must be refused like any other
+    wrong owner, with no DELETE and no audit INSERT sent.
+    """
+    from data.store.app.client_label import OPERATOR_PRINCIPAL
+
+    entry_id = uuid.uuid4()
+    session = FakeSession(FakeResult(stored_entry(entry_id, owner=OWNER)))
+
+    response = delete_entry(session, entry_id, OPERATOR_PRINCIPAL)
+
+    problem(response, status=403, reason='OWNER_MISMATCH')
+    assert _sent_delete(session) == [], "the operator principal deleted another owner's entry through /store"
+    assert not [s for s in session.statements if _sql(s).startswith('INSERT')], 'an audit row was written'
+    assert session.commits == 0
+
+
 @pytest.mark.parametrize('stored_owner', [OWNER, UNASSIGNED], ids=['a-normal-owner', 'the-migration-default'])
 def test_an_owner_less_request_is_refused_with_403(delete_entry, stored_owner: str):
     """THE CASE THAT MATTERS MOST, and the reason it is parametrized. Read the module header first.

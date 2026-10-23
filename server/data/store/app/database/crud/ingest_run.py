@@ -322,6 +322,34 @@ async def latest_runs_for_datasets(db: AsyncSession, dataset_ids: list[uuid.UUID
     return {row.dataset_id: IngestRunRecord.from_row(row) for row in (await db.execute(stmt)).scalars()}
 
 
+async def finished_scheduled_runs(db: AsyncSession, source: DataSource, since: datetime) -> list[IngestRunRecord]:
+    """The finished runs the DAILY refresh itself made for a source since an instant, oldest first.
+
+    What the refresh's fairness is derived from (tj-grna9p.22): when a dataset was last attempted and how it
+    ended, with no job store. A run that failed before its acknowledgement has no dataset id, which is why the
+    caller matches those on the request's own fields and not on the id.
+
+    Args:
+        db: A session.
+        source: The vendor.
+        since: The earliest start to read; aware.
+
+    Returns:
+        list[IngestRunRecord]: Trigger SCHEDULE runs of the source that are not RUNNING, by started_at.
+    """
+    stmt = (
+        select(IngestRun)
+        .where(
+            IngestRun.trigger == IngestRunTrigger.SCHEDULE,
+            IngestRun.source == source,
+            IngestRun.state != IngestRunState.RUNNING,
+            IngestRun.started_at >= since,
+        )
+        .order_by(IngestRun.started_at, IngestRun.id)
+    )
+    return [IngestRunRecord.from_row(row) for row in (await db.execute(stmt)).scalars()]
+
+
 async def running_dataset_ids(db: AsyncSession) -> frozenset[uuid.UUID]:
     """The datasets that have a run in state RUNNING right now, in one statement.
 

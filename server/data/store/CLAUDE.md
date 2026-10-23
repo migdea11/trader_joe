@@ -18,7 +18,7 @@ Sole owner of persisted market data. Every write goes through a repository; no r
 
 - the startup sweep of `RUNNING` ingest runs (`sweep_interrupted_runs` in `app/ingest/run_recording.py`, `fail_interrupted_runs` in `app/database/crud/ingest_run.py`) marks every `RUNNING` row `FAILED` / `INTERRUPTED`; a second worker starting would fail the run the first is executing;
 - the events hub (`app/events.py`) lives in process memory, so an event reaches only the clients connected to the worker that published it;
-- the scheduler's store side (decision `tj-pd41mt`, proposed, not built) assumes the same.
+- the DAILY refresh loop (below) and the scheduler's store side (decision `tj-pd41mt`, proposed, not built) assume the same.
 
 `docker-compose.yaml` pins `SERVICE_WORKERS=1` as a literal in `environment:`, which outranks the operator's env file. Running more than one needs two changes first: Postgres `LISTEN`/`NOTIFY` so each worker republishes into its own hub, and a sweep keyed by process rather than by "every `RUNNING` row".
 
@@ -154,6 +154,26 @@ A periodic pass (`app/reaper.py`, the shared `run_periodic` with `Every`, starte
 - **A dataset with a `RUNNING` ingest is skipped** and retried on the next pass.
 - **`ReaperPendingChanged`** is published when the pending ids differ from the previous pass's, after enabled-mode deletions, and once on the first pass after start, in dry-run too. Whether deletions are on is `ReaperPendingPage.deletes_enabled`. The previous ids live in process memory (one worker).
 
+## DAILY refresh (interim scheduler)
+
+An INTERIM store loop (`app/daily_refresh.py`, tj-grna9p.22) that keeps DAILY datasets current until ingest's own scheduler (tj-pd41mt Addendum 1) lands; then it is removed. The store triggers, and ingest sees an ordinary `FetchDataset` request: no new message type and no request queue. One shared `run_periodic` per source in `SOURCE_CALENDARS`, on `AfterTradingEvent(calendar, CLOSE, settle)`, started after the fetch client in the lifespan and stopped before its channel closes.
+
+| Concern | Where it lives |
+|---|---|
+| The pass, the env, the loops | `app/daily_refresh.py` |
+| The fetch it drives: the same worker and run recorder as `POST /store`, trigger `SCHEDULE`, actor `scheduler` | `store_market_activity_worker(..., fetch_start=)` in `app/ingest/data_action_request.py`, `recorded_run(..., actor=, requested_start=)` in `app/ingest/run_recording.py` |
+
+- **The work is read from the database on every pass**, never stored or replayed: DAILY entries that are not retired (`is_retired`: an expiry retires at once, clearing it resumes), have no `RUNNING` ingest, and read LATE or OVERDUE under the freshness rule (last bar before the last completed session). A pass also runs once at start, so datasets requested earlier are backfilled.
+- **Only the missing tail is requested**: from the last bar plus one bar (the declared start when there are no bars). The entry keeps its declared range as identity, so the refresh extends the existing entry; `fetch_start` replaces only the start of the ingest request. The stored feed is named as the preference, so a tape ingest can no longer serve is a refused ack, never a second entry.
+- **Bounded**: one dataset at a time, at most `DAILY_REFRESH_MAX_PER_PASS` REQUESTED per pass (skipped datasets do not count). A TRANSIENT failure is logged by exception type only, backs off (doubling, capped at 600 s), and the pass stops after 3 in a row or at once on an error that names `reset_at` (a rate limit). The rest is the next pass's. **No automatic retry** (decision tj-grna9p.55; Retry Now is manual): a dataset that failed transiently waits for the next session close or the catch-up at start; the backoff only paces the next dataset.
+- **Permanent versus transient** is the error vocabulary's own outcome (`REASONS[reason].outcome`, `is_permanent`): REFUSED (a tape ingest cannot serve, an invalid request, a vendor 4xx, own overlap, a constraint violation) cannot succeed on retry; NOT_READY (peer or vendor unavailable, deadline, rate limit, rate budget, vendor auth, 5xx, database unavailable) and an error nobody typed are transient. A permanent refusal neither counts toward the stop nor backs off; it is counted in `PassResult.refused`. A stored row that no longer validates as a request is never sent (`skipped`).
+- **Fair, from the database**: the order and the "tried already" state are the `ingest_run` history of trigger `SCHEDULE` (`finished_scheduled_runs`, last 7 days), with no job store. Never-attempted datasets go first (oldest newest-bar first), then least recently attempted. A dataset whose last scheduled attempt asked for the same tail and finished EMPTY or as a permanent FAILED since the last session close is not requested again until the next close; once due again it shares the pass with the rest, at most half the cap while others wait. A run that failed before the ack has no dataset id and is matched on symbol, asset type, data type, granularity and requested start; two owners of one symbol with the same tail therefore share that outcome.
+- **The refresh never writes a lifecycle field.** `store_market_activity_worker(..., preserve_lifecycle=True)` locks the entry `FOR UPDATE` on the ack (`lock_active_entry`) and upserts with `preserve_lifecycle=True`, whose `ON CONFLICT` sets `updated_at` only, so an operator's expiry is never overwritten. A dataset retired or deleted while the vendor call was in flight has the answer DROPPED (nothing stored, counted in `PassResult.discarded`, the run recorded EMPTY with no bars). POST /store is unchanged: a repeat sets expiry from its body.
+- **An unmigrated database** logs one warning naming `make migrate` per process and the pass does nothing.
+- **Nothing counts vendor quota here** (ingest's counting, tj-grna9p.24, is not built). What bounds the spend is the cap, the serialisation, ingest's per-vendor rate budget (`<SOURCE>_RATE_LIMIT_PER_SEC`; unset means unthrottled) and the missing-tail-only request. Ingest treats a DAILY request as INTERACTIVE priority, the same as a UI request.
+- **A fetch not yet acknowledged has no dataset id** (tj-jc635p), so the running-ingest check cannot see a request that is in flight; its bars write idempotently, so the cost is a duplicate vendor call, never duplicate bars.
+- **`DAILY_REFRESH_ENABLED=false` is the kill switch**, read at start: a change needs a restart.
+
 ## Environment variables
 
 | Variable | Purpose | Default |
@@ -170,6 +190,10 @@ A periodic pass (`app/reaper.py`, the shared `run_periodic` with `Every`, starte
 | USAGE_ROLLUP_INTERVAL_SECONDS | how often the rollup runs | 3600 |
 | REAPER_INTERVAL_SECONDS | seconds between expiry-reaper passes; a non-positive or malformed value is the default (`app/reaper.py`) | 3600 |
 | REAPER_DELETES_ENABLED | the reaper deletes only when this is exactly `true` (any case); anything else is dry-run (`app/reaper.py`) | false |
+| DAILY_REFRESH_ENABLED | the interim DAILY refresh loop runs unless this is `false`, `0`, `no` or `off`; read at start (`app/daily_refresh.py`) | true |
+| DAILY_REFRESH_SETTLE_MINUTES | minutes after a session's close before the refresh pass; negative or malformed is the default | 30 |
+| DAILY_REFRESH_MAX_PER_PASS | datasets one pass refreshes at most; non-positive or malformed is the default | 10 |
+| DAILY_REFRESH_BACKOFF_SECONDS | wait after a first failed fetch, doubled per further failure in a row, capped at 600 | 30 |
 | SERVICE_WORKERS | uvicorn workers; must stay 1 (see Key invariants). `docker-compose.yaml` pins it as a literal, so the env file cannot change it there | 1 |
 
 ## Common pitfalls

@@ -426,8 +426,43 @@ def _check_owner(existing: StoreDatasetEntry, declared_owner: str) -> None:
         raise OwnerMismatch(existing.id)
 
 
+async def lock_active_entry(db: AsyncSession, entry: asset_dataset_store.AssetDatasetStoreCreate) -> uuid.UUID | None:
+    """Lock the entry this identity names and return its id, unless it is gone or retired. The scheduled refresh's check.
+
+    tj-grna9p.22. The DAILY refresh read its dataset at the start of its pass; an operator may have retired it (set
+    an expiry) while the vendor call was in flight. The row is read FOR UPDATE, as reaper_delete_entry does, so a
+    retire that commits later waits for this transaction and one that committed earlier is seen here. The lock is
+    held until the caller's transaction ends, which is the fetch's commit: bars are never written for a dataset
+    that was retired before them.
+
+    The retired rule is the one the UI judges by (app/dataset_catalog.is_retired): an expiry on a DAILY or STREAM
+    dataset. It is spelled here because that module imports this layer.
+
+    Args:
+        db: The session, inside the caller's transaction.
+        entry: The entry the fetch's ack resolved, whole identity (the tape included).
+
+    Returns:
+        uuid.UUID | None: The locked entry's id, or None when it no longer exists or is retired.
+    """
+    values = StoreDatasetEntry.get_fields(entry, exclude_none=True)
+    conditions = [
+        getattr(StoreDatasetEntry, column) == values[column]
+        for column in (*_IDENTITY_EQUALITY_COLUMNS, *_RANGE_COLUMNS)
+    ]
+    result = await db.execute(
+        select(StoreDatasetEntry).where(*conditions).with_for_update().execution_options(populate_existing=True)
+    )
+    existing = result.scalar_one_or_none()
+    if existing is None:
+        return None
+    if existing.expiry is not None and UpdateType(existing.update_type) in (UpdateType.DAILY, UpdateType.STREAM):
+        return None
+    return existing.id
+
+
 async def upsert_entry_in_transaction(
-    db: AsyncSession, entry: asset_dataset_store.AssetDatasetStoreCreate
+    db: AsyncSession, entry: asset_dataset_store.AssetDatasetStoreCreate, *, preserve_lifecycle: bool = False
 ) -> uuid.UUID:
     """Create a dataset entry, or resolve an exact repeat, INSIDE A TRANSACTION THE CALLER OWNS.
 
@@ -452,6 +487,10 @@ async def upsert_entry_in_transaction(
     Args:
         db: The session, already inside the caller's transaction.
         entry: The dataset to create or match.
+        preserve_lifecycle: True for a SYSTEM caller (the scheduled DAILY refresh, tj-grna9p.22): an exact repeat
+            then refreshes updated_at and NOTHING ELSE, so the stored expiry is left exactly as the operator set it.
+            False, which every request path sends, is the interactive behaviour: a repeat sets expiry from the
+            body, so omitting it clears a stored one.
 
     Returns:
         uuid.UUID: The id of the created entry, or of the one an exact repeat matched.
@@ -460,9 +499,13 @@ async def upsert_entry_in_transaction(
     field_values = StoreDatasetEntry.get_fields(entry, exclude_none=True)
 
     stmt = postgresql.insert(StoreDatasetEntry).values(**field_values, created_at=func.now(), updated_at=func.now())
-    stmt = stmt.on_conflict_do_update(
-        constraint=StoreDatasetEntry.NATURAL_KEY_CONSTRAINT,
-        set_={
+    if preserve_lifecycle:
+        # THE SYSTEM CALLER LEAVES EVERY LIFECYCLE FIELD ALONE (tj-grna9p.22). The scheduled refresh sends the
+        # expiry it read at the start of its pass, which an operator's retire may have replaced since; writing it
+        # back would undo the retire with no override-log row. Identity columns are never in set_.
+        conflict_values = {'updated_at': func.now()}
+    else:
+        conflict_values = {
             # An exact repeat refreshes expiry and updated_at and nothing else (tj-vhboky.1
             # section 3(a) / Amendment 1 item P) -- still a no-op in the sense idempotency
             # requires: the entry id does not change and no bar moves.
@@ -475,8 +518,8 @@ async def upsert_entry_in_transaction(
             # scope here (common/ is builder-shared's) -- worked around, not fixed.
             'expiry': field_values['expiry'],
             'updated_at': func.now(),
-        },
-    )
+        }
+    stmt = stmt.on_conflict_do_update(constraint=StoreDatasetEntry.NATURAL_KEY_CONSTRAINT, set_=conflict_values)
     stmt = stmt.returning(StoreDatasetEntry.id)
     result = await db.execute(stmt)
     return result.scalar_one()

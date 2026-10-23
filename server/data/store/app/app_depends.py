@@ -7,6 +7,7 @@ from common.logging import get_logger
 from common.rpc.channel import DATA_INGEST_GRPC_TARGET_ENV, create_channel, target_from_env
 from common.rpc.clients.ingest_fetch import GrpcIngestFetchClient, IngestFetchClient
 from common.worker_pool import SharedWorkerPool
+from data.store.app.daily_refresh import start_daily_refresh_loops, stop_daily_refresh_loops
 from data.store.app.database import database
 from data.store.app.ingest.run_recording import sweep_interrupted_runs
 from data.store.app.reaper import start_reaper_loop, stop_reaper_loop
@@ -58,11 +59,15 @@ async def lifespan(app: FastAPI):
     global __INGEST_CHANNEL, __INGEST_FETCH_CLIENT
     __INGEST_CHANNEL = create_channel(target_from_env(DATA_INGEST_GRPC_TARGET_ENV))
     __INGEST_FETCH_CLIENT = GrpcIngestFetchClient(__INGEST_CHANNEL)
+    # The interim DAILY refresh (tj-grna9p.22): needs the client, so it starts after it. One worker only.
+    refresh_tasks = await start_daily_refresh_loops(__INGEST_FETCH_CLIENT)
 
     log.info('Data Store App Ready!!!')
     yield
 
     # cleanup tasks
+    # Before the channel it fetches through closes.
+    await stop_daily_refresh_loops(refresh_tasks)
     teardown_logs(app)
     await __INGEST_CHANNEL.close()
     SharedWorkerPool.worker_shutdown()
