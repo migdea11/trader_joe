@@ -13,6 +13,7 @@ WHAT THIS DOES NOT PROVE, and the system suite does (tests/system, through the a
 revision applies, downgrades and re-applies against a real Postgres holding seeds.
 """
 
+import ast
 import importlib.util
 from pathlib import Path
 from typing import Any
@@ -150,7 +151,13 @@ def test_no_column_is_a_foreign_key_and_the_dataset_and_request_ids_are_nullable
 
 def test_the_migration_env_loads_the_model_so_autogenerate_sees_the_table():
     """env.py imports only ALLOWED_MODELS; without ingest_run there, alembic check would want to drop it."""
-    text = (MIGRATIONS_DIR / 'env.py').read_text(encoding='utf-8')
-    allowed = next(line for line in text.splitlines() if line.startswith('ALLOWED_MODELS'))
+    # Read with ast, not by line: since tj-grna9p.46 the set spans several lines, and a first-line match
+    # pinned the formatting rather than the membership.
+    tree = ast.parse((MIGRATIONS_DIR / 'env.py').read_text(encoding='utf-8'))
+    (allowed,) = [
+        ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign) and [getattr(t, 'id', None) for t in node.targets] == ['ALLOWED_MODELS']
+    ]
 
-    assert "'ingest_run'" in allowed, allowed
+    assert 'ingest_run' in allowed, allowed

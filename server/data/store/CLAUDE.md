@@ -1,6 +1,6 @@
 # Market data store
 
-Owner of all persisted market data. Requests data from data-ingest over gRPC (`FetchDataset`), writes it to Postgres, and serves it over `/store/...`, `/internal/asset-data/...` and, to the web UI, the read-only `/ui/v1/...` routes as protobuf canonical JSON. Tables: `store_dataset_entry`, `stock_market_activity`, `ingest_run`.
+Owner of all persisted market data. Requests data from data-ingest over gRPC (`FetchDataset`), writes it to Postgres, and serves it over `/store/...`, `/internal/asset-data/...` and, to the web UI, the read-only `/ui/v1/...` routes as protobuf canonical JSON. Tables: `store_dataset_entry`, `stock_market_activity`, `ingest_run`, `dataset_read`, `dataset_read_daily`.
 
 ## Architecture reference
 
@@ -81,6 +81,25 @@ It is separate from the entry and its bars, and is not part of the fetch's trans
 - **An event can name a dataset whose entry is not committed yet**: the acknowledgement's `IngestRunChanged` is published before the fetch commits, so a reload by id may 404 briefly. REST is the truth.
 - **A slow client is dropped, never waited for.** Its queue is bounded (`EVENTS_CLIENT_QUEUE_SIZE`); when it fills the hub drops the client and the router closes the socket with 1013. The client reloads over REST on reconnect.
 
+## Usage record (consumption)
+
+Every bar read is recorded as one `dataset_read` row by the usage recorder (`app/usage_recorder.py`): buffered in process, inserted in batches, so the read path issues no INSERT. Rows past the rollup window are folded into `dataset_read_daily` and deleted. Distinct from `ingest_run`, which is collection.
+
+| Concern | Where it lives |
+|---|---|
+| Tables (no foreign key: usage outlives a dataset), migration `b3d9e1a47c62` | `app/database/models/dataset_read.py`, `dataset_read_daily.py` |
+| Writes, the rollup (one data-modifying CTE) and the usage query helper (`read_dataset_usage`, `read_daily_reads`) | `app/database/crud/dataset_read.py` |
+| Buffer, flush loop, rollup loop, stream-session open/close API | `app/usage_recorder.py`, started from the lifespan |
+| The reader's label, its kind and `OPERATOR_PRINCIPAL` | `app/client_label.py` |
+
+- **The label is the dataset `owner` string the caller already uses, sent in the `X-Client-Id` header** (tj-grna9p.131). It is self-asserted: a label, never an authority. The `owner` QUERY filter on `/store` GETs is a search filter and is never the label. Missing, empty, over 128 characters, a control character or a leading `_` is `_unattributed`; never truncated.
+- **Kind is UI iff the label equals `OPERATOR_PRINCIPAL` (`operator`), else SDK.**
+- **At most 32 distinct ids per dataset per UTC day**; later ones are `_overflow`. Applied at flush against the stored ids. The operator and the reserved values are exempt.
+- **One read per call** on `GET /internal/asset-data`, per dataset it returned bars of (a query by dataset id that returns none records 0 bars). Listing, metadata, bar-page and coverage reads record nothing. There is no bar GET under `/store`: those routes return dataset entries.
+- **Best effort.** A failed flush is logged by type and retried from the buffer; the buffer is bounded and drops its oldest past `USAGE_BUFFER_MAX`. On an unmigrated database one warning names `make migrate` and the rows are dropped.
+- **`client_id` is a `SensitiveString`**: never logged, never in a repr.
+- **`dataset_read_daily.last_read_at`** keeps the latest read of a folded day, so staleness stays exact after the rows are gone.
+
 ## Environment variables
 
 | Variable | Purpose | Default |
@@ -90,6 +109,11 @@ It is separate from the entry and its bars, and is not part of the fetch's trans
 | DEPLOYMENT_LABEL | display-only label in GET /ui/v1/config; nothing may branch on it (`app/ui_config.py`) | empty |
 | SERVER_VERSION | server_version in GET /ui/v1/config; else the installed distribution version, else `unknown` | unset |
 | EVENTS_CLIENT_QUEUE_SIZE | events a `/ui/v1/events` client may hold undelivered before the hub drops it and the socket closes 1013 (`app/events.py`, `QUEUE_SIZE_ENV`) | 256 |
+| USAGE_FLUSH_INTERVAL_SECONDS | how often buffered reads are written (`app/usage_recorder.py`) | 5 |
+| USAGE_FLUSH_BATCH_SIZE | buffered reads that wake the flush early | 500 |
+| USAGE_BUFFER_MAX | reads held in process before the oldest are dropped | 10000 |
+| USAGE_ROLLUP_AFTER_DAYS | per-read rows older than this are folded into daily summaries | 90 |
+| USAGE_ROLLUP_INTERVAL_SECONDS | how often the rollup runs | 3600 |
 | SERVICE_WORKERS | uvicorn workers; must stay 1 (see Key invariants). `docker-compose.yaml` pins it as a literal, so the env file cannot change it there | 1 |
 
 ## Common pitfalls

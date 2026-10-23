@@ -74,6 +74,11 @@ FEED_FILE = f'{FEED_REVISION}_feed_on_the_dataset_entry.py'
 # constraint; the new revision's own shape is pinned in test_ingest_run_revision.py.
 INGEST_RUN_REVISION = '6f5a798746a1'
 INGEST_RUN_FILE = f'{INGEST_RUN_REVISION}_ingest_run.py'
+# THE HEAD SINCE tj-grna9p.46: dataset_read and dataset_read_daily, PURELY ADDITIVE and directly on the
+# ingest_run revision. It touches no table this file is about either; its own shape is pinned in
+# test_dataset_read_revision.py.
+DATASET_READ_REVISION = 'b3d9e1a47c62'
+DATASET_READ_FILE = f'{DATASET_READ_REVISION}_dataset_read.py'
 # The parent the epic's design names for its one revision (tj-vhboky.12 item 1).
 PARENT_REVISION = '8f41c2d7a3b9'
 PARENT_FILE = f'{PARENT_REVISION}_bar_natural_key_and_upsert.py'
@@ -228,11 +233,19 @@ def test_each_revision_of_the_two_epics_sits_directly_on_the_one_before_it():
     # A THIRD ONE-REVISION PROMISE since tj-grna9p.18, and it went red the correct way when it landed:
     # the head is the ingest_run revision, directly on the feed revision, and the chain below is the
     # same as before. A fourth revision slipped in between would still re-point one of these hops.
-    assert head_revision.module.__file__.endswith(INGEST_RUN_FILE), (
-        f'the head is not {INGEST_RUN_FILE}: {head_revision.module.__file__}'
+    # A FOURTH since tj-grna9p.46: the head is the dataset_read revision, directly on ingest_run.
+    assert head_revision.module.__file__.endswith(DATASET_READ_FILE), (
+        f'the head is not {DATASET_READ_FILE}: {head_revision.module.__file__}'
     )
-    assert head_revision.down_revision == FEED_REVISION, (
-        f'the head does not sit directly on {FEED_REVISION}: {head_revision.down_revision}'
+    assert head_revision.down_revision == INGEST_RUN_REVISION, (
+        f'the head does not sit directly on {INGEST_RUN_REVISION}: {head_revision.down_revision}'
+    )
+    ingest_run_revision = script.get_revision(INGEST_RUN_REVISION)
+    assert ingest_run_revision.module.__file__.endswith(INGEST_RUN_FILE), (
+        f'{INGEST_RUN_REVISION} is not {INGEST_RUN_FILE}'
+    )
+    assert ingest_run_revision.down_revision == FEED_REVISION, (
+        f'{INGEST_RUN_REVISION} does not sit directly on {FEED_REVISION}: {ingest_run_revision.down_revision}'
     )
     feed_revision = script.get_revision(FEED_REVISION)
     assert feed_revision.module.__file__.endswith(FEED_FILE), f'{FEED_REVISION} is not {FEED_FILE}'

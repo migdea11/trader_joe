@@ -2,10 +2,11 @@ import importlib
 import inspect
 import pkgutil
 import sys
+import types
 from enum import Enum
 from pathlib import Path
 from types import ModuleType
-from typing import Annotated, Any
+from typing import Annotated, Any, Union
 
 import pytest
 from fastapi import APIRouter, Depends
@@ -157,6 +158,11 @@ def _render_type(annotation: Any) -> str:
         return 'unannotated'
     origin = getattr(annotation, '__origin__', None)
     args = getattr(annotation, '__args__', ())
+    if isinstance(annotation, types.UnionType) or origin is Union:
+        # `str | None` has no __origin__, and str() of it is 'str | None' -- the manifest's own field
+        # separator, which made the line unparseable (tj-grna9p.46, the X-Client-Id header). Both
+        # spellings of a union render the same way, with None spelled out.
+        return f'union[{", ".join("None" if arg is type(None) else _render_type(arg) for arg in args)}]'
     if origin is not None and args:
         rendered_args = ', '.join(_render_type(arg) for arg in args)
         return f'{_render_type(origin)}[{rendered_args}]'
@@ -250,6 +256,10 @@ def _line(kind: str, address: str, file: str, symbol: str, request: str, respons
     fields = (kind, address, file, symbol, request, response, touches)
     if len(fields) != FIELD_COUNT:
         raise AssertionError('FIELD_COUNT and _line() disagree')
+    # A rendered field holding the separator would produce a line the loader cannot split back.
+    clashing = [field for field in fields if SEPARATOR.strip() in field]
+    if clashing:
+        raise AssertionError(f'a manifest field contains the separator {SEPARATOR!r}: {clashing}')
     return SEPARATOR.join(fields)
 
 
