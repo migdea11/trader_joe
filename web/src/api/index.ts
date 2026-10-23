@@ -9,11 +9,17 @@ export {
   getDatasetBarsRequest,
   getDatasetFacets,
   getDatasetRuns,
+  getReadsPerDay,
   getUiConfig,
+  deleteDataset,
   listDatasets,
   listDatasetsRequest,
+  setDatasetExpiry,
 } from './datasets'
 export type {
+  ClientSelection,
+  GetReadsPerDayParams,
+  OperatorOverride,
   DatasetFilters,
   DatasetSort,
   GetBarPagesParams,

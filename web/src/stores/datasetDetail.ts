@@ -6,16 +6,60 @@
 // (views/data/useDatasetDetailLive.ts), and on a reconnect. A refetch caused by an event is SOFT: the
 // data on screen stays until the new data replaces it, and a failure leaves it with a notice.
 import { computed, ref, shallowRef } from 'vue'
+import { clone } from '@bufbuild/protobuf'
 import { defineStore } from 'pinia'
-import type { DatasetSummary, IngestRun } from '@generated/trader_joe/proto/ui/v1/data_pb'
+import { DatasetSummarySchema } from '@generated/trader_joe/proto/ui/v1/data_pb'
+import type { ClientKind, DatasetSummary, IngestRun } from '@generated/trader_joe/proto/ui/v1/data_pb'
+import type { ReadsPerDay } from '@generated/trader_joe/proto/ui/v1/stats_pb'
 
-import { ApiError, getDataset, getDatasetRuns } from '@/api'
+import {
+  ApiError,
+  DEFAULT_CLIENT_KINDS,
+  OPERATOR_CLIENT_ID,
+  deleteDataset,
+  getDataset,
+  getDatasetRuns,
+  getReadsPerDay,
+  setDatasetExpiry,
+} from '@/api'
+import type { OperatorOverride } from '@/api'
 import { describeError } from '@/stores/datasetCatalog'
 import type { CatalogError } from '@/stores/datasetCatalog'
 
 /** idle (nothing asked), loading (first fetch), ready, not-found (unknown id, 404), error. */
 export type DetailLoadStatus = 'idle' | 'loading' | 'ready' | 'not-found' | 'error'
 export type RunsLoadStatus = 'idle' | 'loading' | 'ready' | 'error'
+
+/** The reads-per-day window of the Usage section, in UTC days. */
+export const READS_WINDOW_DAYS = 30
+
+/**
+ * What a Retention write came to. Every refusal leaves the card and the dataset as they were:
+ * `override-required` is the 409 (the reason prompt re-opens), `not-found` the 404 (the dataset is
+ * gone), `unavailable` the 503 (the audit tables are missing: Run make migrate), `invalid` the 422
+ * (a bug), `error` anything else.
+ */
+export type WriteOutcome =
+  | { kind: 'ok' }
+  /** The page left this dataset while the write was in flight: the answer was dropped. */
+  | { kind: 'stale' }
+  | { kind: 'override-required' }
+  | { kind: 'not-found' }
+  | { kind: 'unavailable'; error: CatalogError }
+  | { kind: 'invalid'; error: CatalogError }
+  | { kind: 'error'; error: CatalogError }
+
+function writeOutcome(caught: unknown): WriteOutcome {
+  if (caught instanceof ApiError) {
+    if (caught.status === 404) return { kind: 'not-found' }
+    if (caught.status === 409 && caught.reason === 'OVERRIDE_REQUIRED') return { kind: 'override-required' }
+    if (caught.status === 422) return { kind: 'invalid', error: describeError(caught) }
+    if (caught.status === 503 && caught.reason === 'DATABASE_UNAVAILABLE') {
+      return { kind: 'unavailable', error: describeError(caught) }
+    }
+  }
+  return { kind: 'error', error: describeError(caught) }
+}
 
 /** How many runs a page asks for. The server's default and maximum are 50 and 500. */
 export const RUNS_PAGE_SIZE = 50
@@ -49,6 +93,13 @@ export const useDatasetDetailStore = defineStore('datasetDetail', () => {
   /** A soft refetch failed: what is on screen is the last data that arrived. */
   const refreshProblem = ref<CatalogError | null>(null)
 
+  /** Whose reads the Usage section counts: Read By, SDK by default. */
+  const clientKinds = ref<readonly ClientKind[]>([...DEFAULT_CLIENT_KINDS])
+  const reads = shallowRef<ReadsPerDay | null>(null)
+  const readsError = ref<CatalogError | null>(null)
+  /** A write is in flight: the Retention card's buttons wait. */
+  const writing = ref(false)
+
   const runs = shallowRef<readonly IngestRun[]>([])
   const runsStatus = ref<RunsLoadStatus>('idle')
   const runsError = ref<CatalogError | null>(null)
@@ -59,20 +110,25 @@ export const useDatasetDetailStore = defineStore('datasetDetail', () => {
   const hasMoreRuns = computed(() => runsCursor.value !== '')
 
   let currentId = ''
+  /** Bumped by every load and reset: a write answer from an earlier one is dropped. */
+  let generation = 0
   let datasetInflight: AbortController | null = null
   let runsInflight: AbortController | null = null
+  let readsInflight: AbortController | null = null
   let moreInflight: AbortController | null = null
 
   function abortAll(): void {
     datasetInflight?.abort()
     runsInflight?.abort()
     moreInflight?.abort()
-    datasetInflight = runsInflight = moreInflight = null
+    readsInflight?.abort()
+    datasetInflight = runsInflight = moreInflight = readsInflight = null
   }
 
   /** The first fetch for an id, and Try Again: everything on screen is dropped and asked for again. */
   async function load(id: string): Promise<void> {
     abortAll()
+    generation += 1
     currentId = id
     dataset.value = null
     error.value = null
@@ -85,7 +141,9 @@ export const useDatasetDetailStore = defineStore('datasetDetail', () => {
     loadingMore.value = false
     status.value = 'loading'
     runsStatus.value = 'loading'
-    await Promise.all([fetchDataset(id, false), fetchRuns(id, false)])
+    reads.value = null
+    readsError.value = null
+    await Promise.all([fetchDataset(id, false), fetchRuns(id, false), fetchReads(id)])
   }
 
   async function fetchDataset(id: string, soft: boolean): Promise<void> {
@@ -93,7 +151,7 @@ export const useDatasetDetailStore = defineStore('datasetDetail', () => {
     const controller = new AbortController()
     datasetInflight = controller
     try {
-      const result = await getDataset(id, controller.signal)
+      const result = await getDataset(id, controller.signal, { clientKinds: clientKinds.value })
       if (controller.signal.aborted) return
       dataset.value = result
       status.value = 'ready'
@@ -110,6 +168,88 @@ export const useDatasetDetailStore = defineStore('datasetDetail', () => {
       error.value = describeError(caught)
       // An unknown id is its own state, not a failure to retry.
       status.value = notFound ? 'not-found' : 'error'
+    }
+  }
+
+  /** This dataset's reads per day and client over the window, for the Read By choice. */
+  async function fetchReads(id: string): Promise<void> {
+    readsInflight?.abort()
+    const controller = new AbortController()
+    readsInflight = controller
+    try {
+      const result = await getReadsPerDay({
+        days: READS_WINDOW_DAYS,
+        datasetId: id,
+        clientKinds: clientKinds.value,
+        signal: controller.signal,
+      })
+      if (controller.signal.aborted) return
+      reads.value = result
+      readsError.value = null
+    } catch (caught) {
+      if (controller.signal.aborted) return
+      // The chart already on screen stays next to the notice.
+      readsError.value = describeError(caught)
+    }
+  }
+
+  /** Read By changed: the usage figures and the chart are asked for again under the new kinds. */
+  async function setClientKinds(kinds: readonly ClientKind[]): Promise<void> {
+    clientKinds.value = kinds
+    if (currentId === '' || status.value !== 'ready') return
+    await Promise.all([fetchDataset(currentId, true), fetchReads(currentId)])
+  }
+
+  /**
+   * Set the expiry (clear it when `expiry` is undefined). On 200 the card re-renders from the
+   * dataset the server answers with. `override` is sent only for another owner's dataset, and never
+   * for the operator's own.
+   */
+  async function setExpiry(expiry: Date | undefined, override?: OperatorOverride): Promise<WriteOutcome> {
+    if (currentId === '' || dataset.value === null || writing.value) return { kind: 'error', error: describeError(null) }
+    const id = currentId
+    const started = generation
+    writing.value = true
+    try {
+      const result = await setDatasetExpiry(id, {
+        expiry,
+        override: dataset.value.owner === OPERATOR_CLIENT_ID ? undefined : override,
+      })
+      if (generation !== started || currentId !== id) return { kind: 'stale' }
+      // The answer's usage is counted for the default (SDK) filter. Under another Read By choice the
+      // answer's retention facts are kept and the usage held for that choice stays.
+      const kinds = clientKinds.value
+      const isDefault = kinds.length === DEFAULT_CLIENT_KINDS.length && kinds.every((k) => DEFAULT_CLIENT_KINDS.includes(k))
+      if (isDefault || dataset.value === null) {
+        dataset.value = result
+      } else {
+        const merged = clone(DatasetSummarySchema, result)
+        merged.usage = dataset.value.usage
+        dataset.value = merged
+      }
+      return { kind: 'ok' }
+    } catch (caught) {
+      return generation !== started || currentId !== id ? { kind: 'stale' } : writeOutcome(caught)
+    } finally {
+      writing.value = false
+    }
+  }
+
+  /** Delete the dataset. On 204 the caller leaves the screen; a refusal leaves everything as it was. */
+  async function deleteNow(override?: OperatorOverride): Promise<WriteOutcome> {
+    if (currentId === '' || dataset.value === null || writing.value) return { kind: 'error', error: describeError(null) }
+    const id = currentId
+    const started = generation
+    writing.value = true
+    try {
+      await deleteDataset(id, {
+        override: dataset.value.owner === OPERATOR_CLIENT_ID ? undefined : override,
+      })
+      return generation !== started || currentId !== id ? { kind: 'stale' } : { kind: 'ok' }
+    } catch (caught) {
+      return generation !== started || currentId !== id ? { kind: 'stale' } : writeOutcome(caught)
+    } finally {
+      writing.value = false
     }
   }
 
@@ -200,12 +340,15 @@ export const useDatasetDetailStore = defineStore('datasetDetail', () => {
   /** A reconnect: the same fetches the mount ran, softly, so the screen keeps what it shows. */
   async function reload(): Promise<void> {
     if (currentId === '') return
-    if (status.value === 'ready') await Promise.all([fetchDataset(currentId, true), fetchRuns(currentId, true)])
+    if (status.value === 'ready') {
+      await Promise.all([fetchDataset(currentId, true), fetchRuns(currentId, true), fetchReads(currentId)])
+    }
     else await load(currentId)
   }
 
   function reset(): void {
     abortAll()
+    generation += 1
     currentId = ''
     dataset.value = null
     error.value = null
@@ -218,6 +361,10 @@ export const useDatasetDetailStore = defineStore('datasetDetail', () => {
     loadingMore.value = false
     status.value = 'idle'
     runsStatus.value = 'idle'
+    reads.value = null
+    readsError.value = null
+    writing.value = false
+    clientKinds.value = [...DEFAULT_CLIENT_KINDS]
   }
 
   return {
@@ -233,7 +380,14 @@ export const useDatasetDetailStore = defineStore('datasetDetail', () => {
     loadingMore,
     moreError,
     hasMoreRuns,
+    clientKinds,
+    reads,
+    readsError,
+    writing,
     load,
+    setClientKinds,
+    setExpiry,
+    deleteNow,
     reload,
     refresh,
     reloadRuns,

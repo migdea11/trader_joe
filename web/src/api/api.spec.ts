@@ -9,6 +9,7 @@ import { DataSource, Granularity, UpdateType } from '@generated/trader_joe/proto
 import {
   ClientKind,
   DatasetState,
+  DatasetSummarySchema,
   ExpiryType,
   UsageFilter,
   FreshnessStatus,
@@ -19,6 +20,8 @@ import {
 import { AccountGroup } from '@generated/trader_joe/proto/ui/v1/shell_pb'
 import { CoverageStripSchema } from '@generated/trader_joe/proto/ui/v1/stats_pb'
 
+import { deleteRequest, patchMessage } from './client'
+import { clientQuery } from './datasets'
 import {
   API_BASE,
   ApiError,
@@ -27,6 +30,9 @@ import {
   EXPIRING_SOON_DAYS,
   OPERATOR_CLIENT_ID,
   STALE_DAYS,
+  deleteDataset,
+  getReadsPerDay,
+  setDatasetExpiry,
   getDataset,
   getDatasetBarPages,
   getDatasetBarPagesRequest,
@@ -667,4 +673,145 @@ describe('no polling', () => {
     }
     expect(timeout!.messages.filter((m) => /No polling/.test(m.message))).toEqual([])
   }, 60_000)
+})
+
+// tj-grna9p.89: the two Retention writes and the Usage reads. The bodies are protobuf canonical JSON
+// (SetExpiryRequest, DeleteDatasetRequest in data.proto); the reads-per-day parameters follow the
+// .64 brief (days, dataset_id, client_id | client_kind; no source, no expires_before).
+describe('writes (tj-grna9p.89)', () => {
+  const init = (index = 0): RequestInit => fetchMock.mock.calls[index]![1]!
+  const headers = (index = 0) => init(index).headers as Record<string, string>
+  const body = (index = 0): unknown => {
+    const text = init(index).body
+    return text === undefined ? undefined : JSON.parse(String(text))
+  }
+
+  it('patchMessage PATCHes under API_BASE with a JSON body and the operator id, and decodes the answer', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(SUMMARY_JSON))
+    const summary = await patchMessage(DatasetSummarySchema, '/ui/v1/x', { body: { a: 1 } })
+    expect(calledUrl()).toBe(`${API_BASE}/ui/v1/x`)
+    expect(init().method).toBe('PATCH')
+    expect(headers()).toEqual({
+      Accept: 'application/json',
+      'X-Client-Id': OPERATOR_CLIENT_ID,
+      'Content-Type': 'application/json',
+    })
+    expect(body()).toEqual({ a: 1 })
+    expect(summary.assetSymbol).toBe('VFV')
+  })
+
+  it('patchMessage: a 2xx body that does not decode is MALFORMED_RESPONSE', async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ barCount: 'lots' }))
+    const error = (await rejection(patchMessage(DatasetSummarySchema, '/ui/v1/x'))) as ApiError
+    expect(error.status).toBe(200)
+    expect(error.reason).toBe('MALFORMED_RESPONSE')
+  })
+
+  it('deleteRequest with no body sends no body and no Content-Type, and resolves on 204', async () => {
+    fetchMock.mockResolvedValue(new Response(null, { status: 204 }))
+    await expect(deleteRequest('/ui/v1/x')).resolves.toBeUndefined()
+    expect(init().method).toBe('DELETE')
+    expect(init().body).toBeUndefined()
+    expect(headers()).toEqual({ Accept: 'application/json', 'X-Client-Id': OPERATOR_CLIENT_ID })
+  })
+
+  it.each([
+    ['409 OVERRIDE_REQUIRED', 409, 'OVERRIDE_REQUIRED'],
+    ['503 DATABASE_UNAVAILABLE', 503, 'DATABASE_UNAVAILABLE'],
+    ['404 NOT_FOUND', 404, 'NOT_FOUND'],
+    ['422 INVALID_REQUEST', 422, 'INVALID_REQUEST'],
+  ])('a write refused with %s is an ApiError with that status and reason, never the detail', async (_name, status, reason) => {
+    const refusal = () =>
+      jsonResponse({ reason, error_id: 'w-1', detail: 'SECRET held by someone-else: my reason' }, status, 'application/problem+json')
+    fetchMock.mockResolvedValueOnce(refusal()).mockResolvedValueOnce(refusal())
+    for (const call of [patchMessage(DatasetSummarySchema, '/ui/v1/x', { body: {} }), deleteRequest('/ui/v1/x')]) {
+      const error = (await rejection(call)) as ApiError
+      expect(error).toBeInstanceOf(ApiError)
+      expect([error.status, error.reason, error.errorId]).toEqual([status, reason, 'w-1'])
+      expect(`${error.message} ${String(error)}`).not.toMatch(/SECRET|someone-else|my reason/)
+    }
+  })
+
+  it('a write: a network failure is status 0, an abort is rethrown as itself', async () => {
+    fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch'))
+    expect(((await rejection(deleteRequest('/ui/v1/x'))) as ApiError).status).toBe(0)
+    const abort = new DOMException('aborted', 'AbortError')
+    fetchMock.mockRejectedValueOnce(abort)
+    expect(await rejection(patchMessage(DatasetSummarySchema, '/ui/v1/x'))).toBe(abort)
+  })
+
+  it('setDatasetExpiry: PATCH .../{id}/expiry with the expiry as an RFC 3339 instant; the id is encoded', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(SUMMARY_JSON))
+    const result = await setDatasetExpiry('a/b c', { expiry: new Date(Date.UTC(2026, 9, 15, 4)) })
+    expect(calledUrl()).toBe(`${API_BASE}/ui/v1/datasets/a%2Fb%20c/expiry`)
+    expect(init().method).toBe('PATCH')
+    expect(body()).toEqual({ expiry: '2026-10-15T04:00:00.000Z' })
+    expect(result.id).toBe(SUMMARY_JSON.id)
+  })
+
+  it('setDatasetExpiry: no expiry is the clear, an empty object (unset expiry), and no override key', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(SUMMARY_JSON))
+    await setDatasetExpiry('ds-1', {})
+    expect(body()).toEqual({})
+  })
+
+  it('setDatasetExpiry and deleteDataset carry the override as {reason, confirmed: true} when given', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(SUMMARY_JSON)).mockResolvedValueOnce(new Response(null, { status: 204 }))
+    const override = { reason: 'cleanup', confirmed: true as const }
+    await setDatasetExpiry('ds-1', { override })
+    await deleteDataset('ds-1', { override })
+    expect(body(0)).toEqual({ override: { reason: 'cleanup', confirmed: true } })
+    expect(calledUrl(1)).toBe(`${API_BASE}/ui/v1/datasets/ds-1`)
+    expect(init(1).method).toBe('DELETE')
+    expect(body(1)).toEqual({ override: { reason: 'cleanup', confirmed: true } })
+  })
+
+  it('deleteDataset with no override sends no body at all (the store reads none as an empty request)', async () => {
+    fetchMock.mockResolvedValue(new Response(null, { status: 204 }))
+    await deleteDataset('ds-1')
+    expect(init().body).toBeUndefined()
+    expect(headers()['Content-Type']).toBeUndefined()
+  })
+})
+
+describe('client selection and reads per day (tj-grna9p.89)', () => {
+  it('clientQuery: kinds by enum name; ids win over kinds; nothing chosen sends nothing', () => {
+    expect(clientQuery({ clientKinds: [ClientKind.SDK, ClientKind.UI] })).toEqual({ client_id: undefined, client_kind: ['SDK', 'UI'] })
+    expect(clientQuery({ clientKinds: [ClientKind.UI], clientIds: ['bot-1'] })).toEqual({ client_id: ['bot-1'], client_kind: undefined })
+    expect(clientQuery({ clientIds: [], clientKinds: [ClientKind.SDK] }).client_kind).toEqual(['SDK'])
+    expect(buildQuery(clientQuery())).toBe('')
+  })
+
+  it('getDataset sends the Read By choice as client_kind (a selection, not a filter)', async () => {
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(SUMMARY_JSON)))
+    await getDataset('ds-1', undefined, { clientKinds: [ClientKind.SDK, ClientKind.UI] })
+    expect(calledUrl()).toBe(`${API_BASE}/ui/v1/datasets/ds-1?client_kind=SDK&client_kind=UI`)
+    await getDataset('ds-1')
+    expect(calledUrl(1)).toBe(`${API_BASE}/ui/v1/datasets/ds-1`)
+  })
+
+  it('getReadsPerDay: days, dataset_id and client_kind; never source or expires_before', async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        days: [{ day: '2026-10-13', clientId: 'bot-1', clientKind: 'CLIENT_KIND_SDK', reads: '7' }],
+        clientKinds: ['CLIENT_KIND_SDK'],
+      }),
+    )
+    const reads = await getReadsPerDay({ days: 30, datasetId: 'ds-1', clientKinds: [ClientKind.SDK] })
+    const url = new URL(calledUrl(), 'http://x')
+    expect(url.pathname).toBe(`${API_BASE}/ui/v1/stats/usage/reads-per-day`)
+    expect([...url.searchParams.entries()]).toEqual([
+      ['days', '30'],
+      ['dataset_id', 'ds-1'],
+      ['client_kind', 'SDK'],
+    ])
+    expect(reads.days[0]!.reads).toBe(7n)
+    expect(reads.days[0]!.clientKind).toBe(ClientKind.SDK)
+  })
+
+  it('getReadsPerDay with client ids sends client_id and no client_kind', async () => {
+    fetchMock.mockResolvedValue(jsonResponse({}))
+    await getReadsPerDay({ clientIds: ['a', 'b'], clientKinds: [ClientKind.UI] })
+    expect(calledUrl()).toBe(`${API_BASE}/ui/v1/stats/usage/reads-per-day?client_id=a&client_id=b`)
+  })
 })
