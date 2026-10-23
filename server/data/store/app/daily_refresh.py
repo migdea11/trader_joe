@@ -14,7 +14,8 @@ It reads the DAILY entries of its source, drops the retired ones (an expiry on a
 the same rule the UI judges by: is_retired), drops those with a RUNNING ingest, and keeps the ones the freshness rule
 reads LATE or OVERDUE: the last stored bar is before the last completed session. For each, oldest first, it asks
 ingest for ONLY the missing range: from the last stored bar plus one bar (the declared start when there are no
-bars), through the same fetch path POST /store uses (store_market_activity_worker, through the run recorder with
+bars; from the last bar ITSELF when it was written before its period closed, so the vendor's part-way bar is
+overwritten by the final one, tj-grna9p.167), through the same fetch path POST /store uses (store_market_activity_worker, through the run recorder with
 trigger SCHEDULE and actor `scheduler`). The entry keeps its declared range as identity, so the refresh extends the
 existing entry and never creates a second one. A dataset requested earlier is therefore picked up by the next pass.
 
@@ -84,6 +85,7 @@ from data.store.app.freshness import (
     UnknownCalendarError,
     calendar_for_source,
     evaluate_dataset,
+    last_bar_is_provisional,
 )
 from data.store.app.ingest.data_action_request import DatasetRetiredDuringFetch, store_market_activity_worker
 from data.store.app.ingest.run_recording import recorded_run
@@ -132,13 +134,29 @@ def _as_aware(instant: datetime) -> datetime:
     return instant if instant.tzinfo is not None else instant.replace(tzinfo=UTC)
 
 
-def _request_for(row: CatalogRow) -> tuple[StoreAssetDatasetPath, StoreAssetDatasetBody, datetime]:
+def _fetch_start(row: CatalogRow, calendar: TradingCalendar) -> datetime:
+    """Where the refresh's tail starts: the declared start with no bars, else just after the newest bar.
+
+    A newest bar written before its period closed may be the vendor's part-way bar (see last_bar_is_provisional), so
+    the tail starts AT that bar and the upsert overwrites it with the final one. Once it is rewritten after the close
+    it is final and the tail starts after it again.
+    """
+    if row.last_bar is None:
+        return row.start
+    if last_bar_is_provisional(row.last_bar, row.last_bar_written_at, calendar, row.granularity):
+        return row.last_bar
+    return row.last_bar + row.granularity.offset
+
+
+def _request_for(
+    row: CatalogRow, calendar: TradingCalendar
+) -> tuple[StoreAssetDatasetPath, StoreAssetDatasetBody, datetime]:
     """The request a dataset's refresh sends: its path, its body and the start of the tail it asks ingest for.
 
     Raises:
         ValidationError: The stored row no longer validates as a request.
     """
-    fetch_start = row.start if row.last_bar is None else row.last_bar + row.granularity.offset
+    fetch_start = _fetch_start(row, calendar)
     # The entry's own identity, so ingest's ack resolves to THIS entry. The stored tape is named as the
     # preference: a tape ingest can no longer serve is a refused ack, never a second entry.
     body = StoreAssetDatasetBody(
@@ -315,7 +333,7 @@ class DailyRefresher:
             history = await finished_scheduled_runs(session, source, now - ATTEMPT_LOOKBACK)
 
         owed = self._behind(rows, running, calendar, now)
-        due, skipped = self._plan(owed, history, _last_close(calendar, now))
+        due, skipped = self._plan(owed, history, _last_close(calendar, now), calendar)
         batch = self._take(due, max_per_pass())
         refreshed = failed = refused = discarded = 0
         deferred = len(due[0]) + len(due[1]) - len(batch)
@@ -367,7 +385,7 @@ class DailyRefresher:
 
     @staticmethod
     def _plan(
-        owed: list[CatalogRow], history: list[IngestRunRecord], last_close: datetime | None
+        owed: list[CatalogRow], history: list[IngestRunRecord], last_close: datetime | None, calendar: TradingCalendar
     ) -> tuple[tuple[list[_Planned], list[_Planned]], int]:
         """Split the behind datasets into ((productive, due-again), skipped_count), each list in request order.
 
@@ -391,7 +409,7 @@ class DailyRefresher:
         skipped = 0
         for row in owed:
             try:
-                path, body, fetch_start = _request_for(row)
+                path, body, fetch_start = _request_for(row, calendar)
             except ValidationError:
                 # A stored row that no longer validates as a request: never sent, and nothing to record.
                 skipped += 1
@@ -447,6 +465,7 @@ class DailyRefresher:
                     covered=None,
                     calendar=calendar,
                     now=now,
+                    last_bar_written_at=row.last_bar_written_at,
                 )
             except CalendarRangeError:
                 continue

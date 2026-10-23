@@ -476,6 +476,7 @@ def evaluate_dataset(
     calendar: TradingCalendar,
     now: datetime,
     config: FreshnessConfig | None = None,
+    last_bar_written_at: datetime | None = None,
 ) -> DatasetHealth:
     """Health of one dataset at `now`.
 
@@ -485,8 +486,14 @@ def evaluate_dataset(
     only the completed sessions inside it (none closed yet reads FRESH with nothing expected; no
     bars at all means the first session in range is the first one missed). STREAM ignores it, since
     it chases the present. Naive datetimes are refused with NaiveDatetimeError.
+
+    `last_bar_written_at` is when the newest bar was last written (None: unknown, taken as final). Only DAILY reads
+    it: a newest bar of the expected period written before that period closed is provisional, and the dataset reads
+    LATE (see last_bar_is_provisional).
     """
-    _require_aware(expiry=expiry, start=start, end=end, last_bar=last_bar, now=now)
+    _require_aware(
+        expiry=expiry, start=start, end=end, last_bar=last_bar, now=now, last_bar_written_at=last_bar_written_at
+    )
     config = config or FreshnessConfig()
 
     if expiry is not None and update_type in (UpdateType.DAILY, UpdateType.STREAM):
@@ -497,8 +504,41 @@ def evaluate_dataset(
             return DatasetHealth(FreshnessStatus.GAPS, gap_count=len(missing))
         return DatasetHealth(FreshnessStatus.COMPLETE)
     if update_type == UpdateType.DAILY:
-        return _daily(start, end, last_bar, calendar, now, granularity)
+        return _daily(start, end, last_bar, calendar, now, granularity, last_bar_written_at)
     return _stream(last_bar, granularity, calendar, now, config)
+
+
+def bar_period_close(bar: datetime, calendar: TradingCalendar, granularity: Granularity) -> datetime | None:
+    """The instant the period holding `bar` closes: a bar written at or after it can no longer be partial.
+
+    1min..1hour: the bar's own period end (timestamp + granularity). 1day: the close of the bar's session. 1week and
+    1month: the close of the last session of the bar's week or month, in the calendar's zone. None when the period
+    holds no session (a stray bar on a weekend or holiday), which nothing can have been partial of.
+    """
+    _require_aware(bar=bar)
+    if granularity not in _PERIODIC and granularity is not Granularity.ONE_DAY:
+        return bar + granularity.offset
+    period = period_start(session_of(bar, calendar), granularity)
+    sessions = calendar.sessions_overlapping(
+        local_midnight(period, calendar), local_midnight(_next_period_start(period, granularity), calendar)
+    )
+    return calendar.session_close(sessions[-1]) if sessions else None
+
+
+def last_bar_is_provisional(
+    last_bar: datetime | None, last_bar_written_at: datetime | None, calendar: TradingCalendar, granularity: Granularity
+) -> bool:
+    """Whether the newest bar was written before its period closed, so the vendor may have sent it part-way.
+
+    A bar is FINAL only if it was written at or after the close of its period (see bar_period_close), judged against
+    the calendar and never the wall clock. Unknown (no bar, or no write time) is not provisional. A bar re-fetched
+    after the close is rewritten by the upsert with a later write time and becomes final.
+    """
+    if last_bar is None or last_bar_written_at is None:
+        return False
+    _require_aware(last_bar_written_at=last_bar_written_at)
+    closes = bar_period_close(last_bar, calendar, granularity)
+    return closes is not None and last_bar_written_at < closes
 
 
 def _daily(
@@ -508,6 +548,7 @@ def _daily(
     calendar: TradingCalendar,
     now: datetime,
     granularity: Granularity = Granularity.ONE_DAY,
+    last_bar_written_at: datetime | None = None,
 ) -> DatasetHealth:
     # A DAILY dataset owes only the completed periods inside [start, end) (a period is a session for 1min..1day).
     # Capping the range at `now` loses nothing (a session that has closed opened before now) and keeps the calendar
@@ -520,14 +561,20 @@ def _daily(
     expected = owed[-1]
     expected_bar = local_midnight(expected, calendar)
     last_period = None if last_bar is None else period_start(session_of(last_bar, calendar), granularity)
-    if last_period is not None and last_period >= expected:
+    # The expected period's bar counts only once FINAL (written after its period closed); a provisional one is pending,
+    # LATE with the normal deadline, until a re-fetch after the close rewrites it. A newer, still open period holds
+    # nothing owed, and the period that closes later is judged then.
+    provisional = last_period == expected and last_bar_is_provisional(
+        last_bar, last_bar_written_at, calendar, granularity
+    )
+    if last_period is not None and last_period >= expected and not provisional:
         return DatasetHealth(FreshnessStatus.FRESH, expected, expected_bar)
     # Stored late is fine until the first session AFTER the missed period opens; after that it is a failure. The
     # deadline that counts is the one of the FIRST period not stored: a dataset that missed an earlier period already
     # failed at that deadline, and must not read LATE again once a later period ends. With no bars that is the
     # first period in range.
-    missed = owed[0]
-    if last_period is not None:
+    missed = expected if provisional else owed[0]
+    if last_period is not None and not provisional:
         after_last = calendar.next_session(_next_period_start(last_period, granularity) - _DAY)
         missed = min(expected, period_start(after_last, granularity))
     deadline = calendar.session_open(calendar.next_session(_next_period_start(missed, granularity) - _DAY))
@@ -569,11 +616,13 @@ __all__ = [
     'NaiveDatetimeError',
     'TradingCalendar',
     'UnknownCalendarError',
+    'bar_period_close',
     'calendar_for_source',
     'coverage_buckets',
     'covered_sessions',
     'evaluate_dataset',
     'gap_intervals',
+    'last_bar_is_provisional',
     'local_midnight',
     'period_start',
     'session_of',

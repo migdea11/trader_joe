@@ -81,6 +81,7 @@ class CatalogRow:
         expiry: When the dataset is deleted, or None when nothing is scheduled.
         owner: The free-text label of who asked for it.
         last_bar: The newest stored bar's timestamp, or None when there are no bars.
+        last_bar_written_at: When that newest bar was last written (its updated_at), or None when there are no bars.
     """
 
     id: uuid.UUID
@@ -97,6 +98,7 @@ class CatalogRow:
     expiry: datetime | None
     owner: str
     last_bar: datetime | None
+    last_bar_written_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -138,7 +140,19 @@ def _bar_matches_entry() -> list[ColumnElement[bool]]:
     ]
 
 
-def _row(entry: Entry, last_bar: datetime | None) -> CatalogRow:
+def _last_bar_written_at() -> ColumnElement[datetime]:
+    """The newest bar's updated_at, a correlated scalar subquery: one more index range scan per entry."""
+    return (
+        select(Bar.updated_at)
+        .where(*_bar_matches_entry())
+        .order_by(Bar.timestamp.desc())
+        .limit(1)
+        .correlate(Entry)
+        .scalar_subquery()
+    )
+
+
+def _row(entry: Entry, last_bar: datetime | None, last_bar_written_at: datetime | None = None) -> CatalogRow:
     """Build a CatalogRow from an ORM entry, mapping the open-end sentinel back to None."""
     end = None if entry.end == NullableDateTime.EPOCH else entry.end
     return CatalogRow(
@@ -158,6 +172,7 @@ def _row(entry: Entry, last_bar: datetime | None) -> CatalogRow:
         expiry=entry.expiry,
         owner=entry.owner,
         last_bar=last_bar,
+        last_bar_written_at=last_bar_written_at,
     )
 
 
@@ -175,7 +190,9 @@ async def list_catalog(db: AsyncSession, catalog_filter: CatalogFilter) -> list[
         list[CatalogRow]: All matching entries, ascending by (asset_symbol, id). Empty for an empty store.
     """
     last_bar = select(func.max(Bar.timestamp)).where(*_bar_matches_entry()).correlate(Entry).scalar_subquery()
-    stmt = select(Entry, last_bar.label('last_bar')).order_by(Entry.asset_symbol, Entry.id)
+    stmt = select(Entry, last_bar.label('last_bar'), _last_bar_written_at().label('last_bar_written_at')).order_by(
+        Entry.asset_symbol, Entry.id
+    )
     if catalog_filter.asset_symbol_prefix is not None:
         stmt = stmt.where(Entry.asset_symbol.istartswith(catalog_filter.asset_symbol_prefix, autoescape=True))
     if catalog_filter.source is not None:
@@ -183,7 +200,7 @@ async def list_catalog(db: AsyncSession, catalog_filter: CatalogFilter) -> list[
     if catalog_filter.update_type is not None:
         stmt = stmt.where(Entry.update_type == catalog_filter.update_type)
     result = await db.execute(stmt)
-    return [_row(entry, newest) for entry, newest in result.all()]
+    return [_row(entry, newest, written) for entry, newest, written in result.all()]
 
 
 async def get_catalog_row(db: AsyncSession, dataset_id: uuid.UUID) -> CatalogRow | None:
@@ -197,9 +214,13 @@ async def get_catalog_row(db: AsyncSession, dataset_id: uuid.UUID) -> CatalogRow
         CatalogRow | None: The entry, or None.
     """
     last_bar = select(func.max(Bar.timestamp)).where(*_bar_matches_entry()).correlate(Entry).scalar_subquery()
-    result = await db.execute(select(Entry, last_bar.label('last_bar')).where(Entry.id == dataset_id))
+    result = await db.execute(
+        select(Entry, last_bar.label('last_bar'), _last_bar_written_at().label('last_bar_written_at')).where(
+            Entry.id == dataset_id
+        )
+    )
     found = result.first()
-    return None if found is None else _row(found[0], found[1])
+    return None if found is None else _row(found[0], found[1], found[2])
 
 
 def _past_expiry(now: datetime) -> ColumnElement[bool]:
@@ -229,14 +250,18 @@ async def list_pending(
         list[CatalogRow]: The pending datasets, ascending by (expiry, id).
     """
     last_bar = select(func.max(Bar.timestamp)).where(*_bar_matches_entry()).correlate(Entry).scalar_subquery()
-    stmt = select(Entry, last_bar.label('last_bar')).where(_past_expiry(now)).order_by(Entry.expiry, Entry.id)
+    stmt = (
+        select(Entry, last_bar.label('last_bar'), _last_bar_written_at().label('last_bar_written_at'))
+        .where(_past_expiry(now))
+        .order_by(Entry.expiry, Entry.id)
+    )
     if after is not None:
         after_expiry, after_id = after
         stmt = stmt.where(or_(Entry.expiry > after_expiry, and_(Entry.expiry == after_expiry, Entry.id > after_id)))
     if limit is not None:
         stmt = stmt.limit(limit)
     result = await db.execute(stmt)
-    return [_row(entry, newest) for entry, newest in result.all()]
+    return [_row(entry, newest, written) for entry, newest, written in result.all()]
 
 
 async def pending_ids(

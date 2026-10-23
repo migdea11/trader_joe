@@ -14,7 +14,9 @@ entry upsert and the bar write are Postgres statements that cannot run):
     last bar (a restart re-requests only what is missing);
   * a refused ack (the stored tape is one this deployment cannot serve) leaves no second entry and no bar, and its
     run is FAILED with FEED_NOT_AVAILABLE;
-  * the recorded runs round-trip trigger SCHEDULE, actor `scheduler` and the narrowed requested_start.
+  * the recorded runs round-trip trigger SCHEDULE, actor `scheduler` and the narrowed requested_start;
+  * (tj-grna9p.167) a newest bar written before its session closed is asked for again INCLUSIVELY, and the real
+    ON CONFLICT DO UPDATE rewrites that row with an updated_at past the close, so it then reads FRESH.
 
 THE FAKE BROKER. This client container is not on the ingest_store network, so it cannot dial the stack's
 data-ingest-grpc. The same thing is built here instead: data_ingest's own registered_services (the real FetchDataset
@@ -48,12 +50,14 @@ from data.ingest.app.grpc_host import registered_services
 from data.store.app import daily_refresh as refresh_module
 from data.store.app.client_label import OPERATOR_PRINCIPAL
 from data.store.app.daily_refresh import SCHEDULER_ACTOR, DailyRefresher, PassResult
+from data.store.app.database.crud.stock.dataset_catalog import get_catalog_row
 from data.store.app.database.models.dataset_override_log import DatasetOverrideLog
 from data.store.app.database.models.ingest_run import IngestRun, IngestRunState, IngestRunTrigger
 from data.store.app.events import DatasetChange, DatasetChanged
+from data.store.app.freshness import FreshnessStatus, calendar_for_source, evaluate_dataset
 from data.store.app.ingest import data_action_request, run_recording
 from tests.fakes.market_data import FEED as FAKE_FEED
-from tests.fakes.market_data import FakeRead
+from tests.fakes.market_data import FakeRead, fake_bar
 from tests.system import test_reaper_race as race
 from tests.system import test_usage_record
 from tests.system.conftest import BAR_TABLE, ENTRY_TABLE
@@ -346,3 +350,113 @@ async def test_a_retire_after_the_ack_waits_for_the_refresh_and_is_kept_on_postg
     assert entry.expiry == RETIRE_AT, 'the PATCH that waited for the refresh lost its expiry'
     assert _bar_times(scratch_db.engine, dataset_id) == SEEDED + [SEEDED[-1] + DAY * k for k in range(1, 5)]
     assert _override_rows(scratch_db.engine) == 0
+
+
+# ---------------------------------------------------------------------------------------------
+# tj-grna9p.167: a newest bar written before its period closed is the vendor's part-way bar. The pass re-fetches FROM
+# that bar (inclusive), and the real INSERT ... ON CONFLICT DO UPDATE rewrites it: new OHLCV and an updated_at past
+# the close, so the catalog's write time (the crud's newest-bar subquery, here on Postgres) then reads it final.
+# Only this tier runs the upsert: on SQLite it is a recorder, so nothing there shows updated_at really moving.
+#
+# FakeRead stamps a daily bar at UTC midnight, the previous evening in New York: 7 Oct 00:00Z is the 6th's session
+# (close 20:00Z). At 7 Oct 01:00Z the expected session is the 6th, the newest bar IS the 6th's, and it was written at
+# 16:16Z, mid-session: LATE, not FRESH. FakeRead serves nothing past its clock, so the tail is that one bar.
+
+PROVISIONAL_NOW = datetime(2026, 10, 7, 1, 0, tzinfo=UTC)
+PROVISIONAL_BAR = datetime(2026, 10, 7, 0, 0, tzinfo=UTC)
+MID_SESSION = datetime(2026, 10, 6, 16, 16, tzinfo=UTC)
+OCT6_CLOSE = datetime(2026, 10, 6, 20, 0, tzinfo=UTC)
+
+
+def _bar_row(engine: sa.Engine, dataset_id: uuid.UUID, timestamp: datetime) -> sa.Row:
+    with engine.connect() as conn:
+        return conn.execute(
+            sa.select(BAR_TABLE).where(BAR_TABLE.c.dataset_id == dataset_id, BAR_TABLE.c.timestamp == timestamp)
+        ).one()
+
+
+async def _health(scratch_async: AsyncEngine, dataset_id: uuid.UUID, now: datetime):
+    async with AsyncSession(scratch_async) as session:
+        row = await get_catalog_row(session, dataset_id)
+    assert row is not None
+    health = evaluate_dataset(
+        update_type=row.update_type,
+        granularity=row.granularity,
+        expiry=row.expiry,
+        start=row.start,
+        end=row.end or datetime(2100, 1, 1, tzinfo=UTC),
+        last_bar=row.last_bar,
+        covered=None,
+        calendar=calendar_for_source(DataSource.ALPACA_API),
+        now=now,
+        last_bar_written_at=row.last_bar_written_at,
+    )
+    return row, health
+
+
+@pytest.mark.asyncio
+async def test_a_provisional_newest_bar_is_re_fetched_and_rewritten_final_on_postgres(
+    scratch_db, scratch_async, point_refresh, entry_values, bar_values, run_identity
+):
+    scratch_db.must('upgrade', _head())
+    times = [START + DAY * k for k in range(10)]  # 28 Sep .. 7 Oct 00:00Z
+    assert times[-1] == PROVISIONAL_BAR
+    with scratch_db.engine.begin() as conn:
+        row = conn.execute(
+            sa.insert(ENTRY_TABLE)
+            .values(
+                entry_values(
+                    asset_symbol=run_identity.alt_symbol('drprov'),
+                    update_type=UpdateType.DAILY.value,
+                    expiry_type=ExpiryType.ROLLING.value,
+                    granularity=Granularity.ONE_DAY,
+                    start=START,
+                    end=NullableDateTime.EPOCH,
+                )
+            )
+            .returning(ENTRY_TABLE)
+        ).one()
+        for timestamp in times[:-1]:
+            conn.execute(sa.insert(BAR_TABLE).values(bar_values(row, timestamp=timestamp)))
+        # The part-way bar: written mid-session, with a volume the vendor's final bar never has (FakeRead's >= 1000).
+        conn.execute(
+            sa.insert(BAR_TABLE).values(
+                bar_values(row, timestamp=PROVISIONAL_BAR, volume=1, created_at=MID_SESSION, updated_at=MID_SESSION)
+            )
+        )
+    dataset_id = row.id
+    before = _bar_row(scratch_db.engine, dataset_id, PROVISIONAL_BAR)
+
+    # The real Postgres subquery reads the newest bar's write time, and the dataset is LATE, not FRESH.
+    catalog_row, health = await _health(scratch_async, dataset_id, PROVISIONAL_NOW)
+    assert (catalog_row.last_bar, catalog_row.last_bar_written_at) == (PROVISIONAL_BAR, MID_SESSION)
+    assert health.status is FreshnessStatus.LATE
+
+    clock = Clock(PROVISIONAL_NOW)
+    async with _ingest(clock) as (client, reader):
+        result = await DailyRefresher(client, clock=clock).run_pass(DataSource.ALPACA_API)
+        assert result == PassResult(behind=1, refreshed=1)
+        assert _asked(reader) == [(FAKE_FEED, PROVISIONAL_BAR)], 'the tail did not start at the provisional bar'
+
+        # Rewritten in place by ON CONFLICT DO UPDATE: the same row, the vendor's values, updated_at moved past the
+        # close (the database's now(), the real wall clock), created_at untouched. No second bar.
+        after = _bar_row(scratch_db.engine, dataset_id, PROVISIONAL_BAR)
+        served = fake_bar(row.asset_symbol, PROVISIONAL_BAR)
+        assert after.id == before.id
+        assert (after.volume, after.close) == (served.volume, served.close)
+        assert after.created_at == MID_SESSION
+        assert after.updated_at > OCT6_CLOSE
+        assert after.updated_at > before.updated_at
+        assert _bar_times(scratch_db.engine, dataset_id) == times
+        (run,) = _runs(scratch_db.engine)
+        assert (run.requested_start, run.bars_written) == (PROVISIONAL_BAR, 1)
+
+        # Final now: FRESH, and the next pass at the same clock asks for nothing.
+        catalog_row, health = await _health(scratch_async, dataset_id, PROVISIONAL_NOW)
+        assert catalog_row.last_bar_written_at == after.updated_at
+        assert health.status is FreshnessStatus.FRESH
+        reader.queries.clear()
+        second = await DailyRefresher(client, clock=clock).run_pass(DataSource.ALPACA_API)
+
+    assert second == PassResult()
+    assert reader.queries == []

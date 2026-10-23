@@ -524,6 +524,7 @@ async def evaluate_views(
                     calendar=calendar,
                     now=now,
                     config=config,
+                    last_bar_written_at=row.last_bar_written_at,
                 )
             except CalendarRangeError as err:
                 # A range before the calendar's start cannot be judged. It is a known state of the data (nothing
