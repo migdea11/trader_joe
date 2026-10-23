@@ -38,7 +38,6 @@ tools/agent_mcp/tests
 tools/agent_mcp/__pycache__
 !docker-compose.yaml
 !docker-compose.test-client.yaml
-!docker-compose.agent-stack.yaml
 !docker-compose.fake.yaml
 !docker-compose.override.yaml
 !docker-compose.web.yaml

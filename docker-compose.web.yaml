@@ -8,7 +8,7 @@
 # prod-launch starts it and waits for it to be healthy, and make prod-down stops it. DEV_COMPOSE loads
 # this file too and then docker-compose.web.dev.yaml, which swaps the service for the Vite dev server
 # with hot reload (same service name, same published port, same networks). Only one stack runs at a
-# time, which is why both use WEB_PORT. The agent stack (AGENT_STACK_COMPOSE) and the base file never
+# time, which is why both use WEB_PORT. The base file and the MCP's own project never
 # load it: the base file's invariants say prod publishes NOTHING and every service is built from the
 # Python stages and carries the source stamp, and the web container is the one deliberate exception.
 #

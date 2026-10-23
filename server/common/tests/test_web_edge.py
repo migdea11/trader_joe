@@ -743,7 +743,7 @@ def test_the_web_stages_copy_only_from_stages_and_mount_only_the_named_contexts(
 
 
 def test_web_image_is_from_the_pinned_caddy_digest_in_base_images():
-    """Digest-pinned, and the same ref the agent stack pre-pulls (stack.BASE_IMAGES)."""
+    """Digest-pinned, and the same ref the MCP pre-pulls before a build (stack.BASE_IMAGES)."""
     parent, _ = _dockerfile_stages()['web_image']
     assert parent.startswith('caddy:') and '@sha256:' in parent, parent
     assert parent in stack.BASE_IMAGES, stack.BASE_IMAGES
@@ -861,22 +861,24 @@ def test_the_base_file_has_no_web_service():
     assert 'web' not in compose_model.load(compose_model.BASE_FILE)['services']
 
 
-def test_the_agent_stack_never_loads_the_web_overlay():
-    """The agent stack's compose set, in the Makefile, in tools/agent_mcp and in the agent stack's own prefix.
+# The MCP's file sets that must never carry web (re-pointed from the retired agent stack's COMPOSE_FILES,
+# tj-iee6sn.21): test mode's up and build sets, the prod images plus the fake as make system-launch runs
+# them, and the system-test client's. Only the MCP's two DEV sets load the web overlays.
+MCP_WEBLESS_SETS = ('TEST_COMPOSE_FILES', 'TEST_BUILD_COMPOSE_FILES', 'SYSTEM_CLIENT_COMPOSE_FILES')
 
-    Since tj-iee6sn.5 the MCP IMAGE bakes a copy of docker-compose.web.yaml, for the user's DEV
-    project only (stack.DEV_COMPOSE_FILES). What must hold is that the agent stack never loads it:
-    not in COMPOSE_FILES, not among the -f words compose_prefix() spells, and no file it does load
-    defines web.
+
+@pytest.mark.parametrize('name', MCP_WEBLESS_SETS)
+def test_the_mcp_test_and_client_sets_never_load_the_web_overlays(name: str):
+    """Since tj-iee6sn.5 the MCP IMAGE bakes docker-compose.web.yaml, for the DEV sets only.
+
+    What must hold is that test mode and the client never load it or the dev web overlay, and that no file
+    they do load defines web.
     """
-    agent_set = _make_variable('AGENT_STACK_COMPOSE')
-    assert agent_set.startswith('docker compose') and 'docker-compose.web.yaml' not in agent_set, agent_set
-    assert 'docker-compose.web.yaml' not in stack.COMPOSE_FILES, stack.COMPOSE_FILES
-    prefix = stack.compose_prefix(Path('/stack'), Path('/stack/agent_stack.env'))
-    assert not [word for word in prefix if 'docker-compose.web' in word], prefix
+    files = getattr(stack, name)
+    assert not [file for file in files if file.startswith('docker-compose.web')], (name, files)
+    for file in files:
+        assert 'web' not in (compose_model.load(REPO_ROOT / file).get('services') or {}), (name, file)
     assert 'docker-compose.web.yaml' in stack.DEV_COMPOSE_FILES, stack.DEV_COMPOSE_FILES
-    for name in stack.COMPOSE_FILES:
-        assert 'web' not in (compose_model.load(REPO_ROOT / name).get('services') or {}), name
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -1203,7 +1205,7 @@ def test_the_dev_proxy_target_renders_to_the_data_store_caddy_reaches(
 
 
 def test_only_the_dev_and_tools_sets_load_the_dev_overlay_after_the_web_overlay():
-    """Not PROD_COMPOSE and not the agent stack; where loaded, after the override and the web overlay."""
+    """Not PROD_COMPOSE and no MCP set but the dev ones; where loaded, after the override and the web overlay."""
     loading = set()
     for variable in sorted(set(_COMPOSE_SET.findall(MAKEFILE.read_text(encoding='utf-8')))):
         names = [path.name for path in _set_files(variable)]
@@ -1212,9 +1214,10 @@ def test_only_the_dev_and_tools_sets_load_the_dev_overlay_after_the_web_overlay(
             dev = names.index(WEB_DEV_COMPOSE.name)
             assert names.index('docker-compose.override.yaml') < names.index(WEB_COMPOSE.name) < dev, names
     assert loading == WEB_DEV_SETS, sorted(loading)
-    assert WEB_DEV_COMPOSE.name not in stack.COMPOSE_FILES, stack.COMPOSE_FILES
-    prefix = stack.compose_prefix(Path('/stack'), Path('/stack/agent_stack.env'))
-    assert not [word for word in prefix if WEB_DEV_COMPOSE.name in word], prefix
+    # Re-pointed from the retired agent stack's COMPOSE_FILES and prefix (tj-iee6sn.21).
+    for name in MCP_WEBLESS_SETS:
+        assert WEB_DEV_COMPOSE.name not in getattr(stack, name), (name, getattr(stack, name))
+    assert WEB_DEV_COMPOSE.name in stack.DEV_TOOLS_COMPOSE_FILES, stack.DEV_TOOLS_COMPOSE_FILES
     # The MCP's DEV set (tj-iee6sn.5) loads it as the Makefile's dev set does: after the override and
     # the web overlay. The MCP image bakes it for that set only.
     dev = list(stack.DEV_COMPOSE_FILES)

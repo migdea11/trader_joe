@@ -33,8 +33,10 @@ from tools.agent_mcp.tests.harness import (
     FakeDocker,
     budget_spent,
     client_tail,
+    default_response,
     is_base_step,
     is_client_step,
+    is_seed_producer,
     make_rig,
     system_suite_response,
     tree_digest,
@@ -53,8 +55,10 @@ def _no_subprocess(rig, *, git_list_calls: int = 0) -> None:
 
 _BAD_NAMES = ['../x', '/abs', '', 'a b', '-p', '.hidden', 'x' * 101, 'x;y', 'wt/one', 5, None, ['wt-one']]
 
+# Re-pointed from the retired agent-stack verbs (stack_up, stack_down, ps, logs; tj-iee6sn.21) to the
+# surviving verbs that take the same argument shapes: seed_dump and run_system_tests a worktree NAME,
+# down none, ps none, logs a closed service enum and a clamped tail.
 _SHAPE_REFUSALS = {
-    **{f'stack_up-name-{index}': ('stack_up', {'worktree': name}) for index, name in enumerate(_BAD_NAMES)},
     **{
         f'run_system_tests-name-{index}': ('run_system_tests', {'worktree': name, 'paths': []})
         for index, name in enumerate(_BAD_NAMES)
@@ -66,9 +70,9 @@ _SHAPE_REFUSALS = {
     # test_commands.test_every_verb_has_a_sample pins equal to AgentStack's verb table, so the next
     # verb added is covered by construction rather than by memory.
     **{f'unknown keyword on {verb}': (verb, {**sample, 'bogus': 1}) for verb, sample in VERB_SAMPLES.items()},
-    'a compose argument smuggled as a keyword': ('stack_down', {'volumes': True}),
-    'missing required': ('stack_up', {}),
-    'positional (a list)': ('stack_up', [WORKTREE_NAME]),
+    'a compose argument smuggled as a keyword': ('down', {'volumes': True}),
+    'missing required': ('seed_dump', {}),
+    'positional (a list)': ('seed_dump', [WORKTREE_NAME]),
     'positional (a string)': ('ps', 'ps --all'),
     'service outside the enum': ('logs', {'service': 'redis'}),
     'service with a shell tail': ('logs', {'service': 'postgres; rm -rf /'}),
@@ -115,7 +119,7 @@ def test_every_verb_is_swept_for_an_unknown_keyword():
     assert swept == set(VERB_SAMPLES), f'not swept: {sorted(set(VERB_SAMPLES) - swept)}'
 
 
-@pytest.mark.parametrize('verb', ['stack_up', 'run_system_tests', 'seed_dump'])
+@pytest.mark.parametrize('verb', ['run_system_tests', 'seed_dump'])
 def test_a_worktree_git_does_not_list_is_refused_after_one_listing_and_no_docker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str
 ):
@@ -132,7 +136,7 @@ def test_a_worktree_outside_the_repository_is_not_listed(tmp_path: Path, monkeyp
     elsewhere = rig.layout.root / 'elsewhere' / 'wt-far'
     shutil.copytree(rig.layout.worktree, elsewhere)
     rig.git.worktree_paths.append(elsewhere)
-    result = rig.call('stack_up', {'worktree': 'wt-far'})
+    result = rig.call('seed_dump', {'worktree': 'wt-far'})
     assert result['status'] == 'refused', result
     assert rig.docker.steps == []
 
@@ -206,7 +210,6 @@ def test_migrate_reads_the_root_checkouts_revisions_and_no_worktree(tmp_path: Pa
     ROOT checkout's refuses with the empty-versions guard and no docker step after the mode guard.
     """
     rig = make_rig(tmp_path, monkeypatch)
-    assert not (rig.layout.stack_dir / stack.STATE_FILE_NAME).exists()
     for path in (rig.layout.worktree / 'server/data/store/migrations/versions').iterdir():
         path.unlink()
     assert rig.call('migrate', {})['status'] == 'ok'
@@ -234,10 +237,12 @@ def test_a_second_verb_while_one_runs_answers_busy_and_the_lock_is_released_afte
             entered.set()
             await release.wait()
 
+    # seed_dump's client `build` step is held (re-pointed from stack_up's build, tj-iee6sn.21).
     rig = make_rig(tmp_path, monkeypatch, FakeDocker(hook=hold))
+    rig.docker.respond = system_suite_response(rig.layout)
 
     async def scenario() -> tuple[dict, dict, dict]:
-        first = asyncio.create_task(rig.agent.call('stack_up', {'worktree': WORKTREE_NAME}))
+        first = asyncio.create_task(rig.agent.call('seed_dump', {'worktree': WORKTREE_NAME}))
         await asyncio.wait_for(entered.wait(), 10)
         busy = await rig.agent.call('ps', {})
         release.set()
@@ -246,7 +251,7 @@ def test_a_second_verb_while_one_runs_answers_busy_and_the_lock_is_released_afte
         return up, busy, after
 
     up, busy, after = asyncio.run(scenario())
-    assert busy['status'] == 'busy' and 'stack_up is running' in busy['message'], busy
+    assert busy['status'] == 'busy' and 'seed_dump is running' in busy['message'], busy
     assert busy['steps'] == []
     assert up['status'] == 'ok' and after['status'] == 'ok'
     assert [json.loads(line)['status'] for line in rig.audit_lines()] == ['busy', 'ok', 'ok']
@@ -258,11 +263,12 @@ def test_a_slow_git_answers_busy_promptly_and_the_timeout_fires_during_it(
     """L: git runs off the loop, so a blocked git thread neither delays 'busy' nor the verb's timeout."""
     rig = make_rig(tmp_path, monkeypatch)
     rig.git.delay = 1.5
-    monkeypatch.setitem(runner.VERB_TIMEOUT_SECONDS, 'stack_up', 0.5)
+    # seed_dump lists the worktrees (git) before any docker step, as stack_up did (tj-iee6sn.21).
+    monkeypatch.setitem(runner.VERB_TIMEOUT_SECONDS, 'seed_dump', 0.5)
 
     async def scenario() -> tuple[dict, float, dict, float]:
         start = time.monotonic()
-        first = asyncio.create_task(rig.agent.call('stack_up', {'worktree': WORKTREE_NAME}))
+        first = asyncio.create_task(rig.agent.call('seed_dump', {'worktree': WORKTREE_NAME}))
         await asyncio.sleep(0.05)
         busy = await rig.agent.call('ps', {})
         busy_at = time.monotonic() - start
@@ -278,29 +284,33 @@ def test_a_slow_git_answers_busy_promptly_and_the_timeout_fires_during_it(
 def test_a_timed_out_copy_stops_and_the_old_snapshot_survives_until_the_next_swap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """G4 / D8: the verb's timeout sets the copy's cancel event; the copy thread stops without swapping."""
-    rig = make_rig(tmp_path, monkeypatch)
+    """G4 / D8: the verb's timeout sets the copy's cancel event; the copy thread stops without swapping.
+
+    Re-pointed from stack_up to seed_dump (tj-iee6sn.21): its rails' docker reads run before the copy, so
+    what is pinned is that no client step and no base step ran after the timed-out copy.
+    """
+    rig = _suite_rig(tmp_path, monkeypatch)
     for index in range(60):
         (rig.layout.worktree / 'server' / 'common' / f'm{index}.py').write_text('')
-    assert rig.call('stack_up', {'worktree': WORKTREE_NAME})['status'] == 'ok'
+    assert rig.call('seed_dump', {'worktree': WORKTREE_NAME})['status'] == 'ok'
     before = tree_digest(rig.layout.snapshot)
     (rig.layout.worktree / 'server' / 'common' / 'changed.py').write_text('NEW = 1\n')
 
     real_tick = stack._Copy.tick
     monkeypatch.setattr(stack._Copy, 'tick', lambda self, relative: (time.sleep(0.02), real_tick(self, relative))[1])
-    monkeypatch.setitem(runner.VERB_TIMEOUT_SECONDS, 'stack_up', 0.3)
+    monkeypatch.setitem(runner.VERB_TIMEOUT_SECONDS, 'seed_dump', 0.3)
     rig.docker.steps.clear()
-    timed_out = rig.call('stack_up', {'worktree': WORKTREE_NAME})
+    timed_out = rig.call('seed_dump', {'worktree': WORKTREE_NAME})
     assert timed_out['status'] == 'timeout', timed_out
-    assert rig.docker.steps == []
+    assert not [step for step in rig.docker.steps if is_client_step(step) or is_base_step(step)], rig.docker.steps
     assert stack._SNAPSHOT_LOCK.acquire(timeout=10), 'the copy thread never stopped'
     stack._SNAPSHOT_LOCK.release()
     assert tree_digest(rig.layout.snapshot) == before, 'the cancelled copy was swapped in anyway'
     assert not os.path.lexists(rig.layout.stack_dir / 'source.new')
 
     monkeypatch.setattr(stack._Copy, 'tick', real_tick)
-    monkeypatch.setitem(runner.VERB_TIMEOUT_SECONDS, 'stack_up', 1800)
-    assert rig.call('stack_up', {'worktree': WORKTREE_NAME})['status'] == 'ok'
+    monkeypatch.setitem(runner.VERB_TIMEOUT_SECONDS, 'seed_dump', 1800)
+    assert rig.call('seed_dump', {'worktree': WORKTREE_NAME})['status'] == 'ok'
     assert (rig.layout.snapshot / 'server' / 'common' / 'changed.py').exists()
 
 
@@ -338,20 +348,22 @@ def test_an_unexpected_exception_is_status_error_and_still_audited(tmp_path: Pat
 
 
 def test_a_failing_step_stops_the_verb_as_failed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    def fail_build(step: stack.Step) -> runner.ProcessResult:
-        return runner.ProcessResult(1 if 'build' in step.argv else 0, b'', b'boom')
+    """Nothing runs after a failed step: seed_dump's client build fails, so the producer's run never starts.
 
-    rig = make_rig(tmp_path, monkeypatch, FakeDocker(respond=fail_build))
-    result = rig.call('stack_up', {'worktree': WORKTREE_NAME})
+    Re-pointed from stack_up's build-then-up (tj-iee6sn.21) to seed_dump's build-then-run.
+    """
+
+    def fail_build(step: stack.Step) -> runner.ProcessResult:
+        return runner.ProcessResult(1, b'', b'boom') if 'build' in step.argv else default_response(step)
+
+    rig = make_rig(tmp_path, monkeypatch)
+    rig.docker.respond = system_suite_response(rig.layout, fail_build)
+    result = rig.call('seed_dump', {'worktree': WORKTREE_NAME})
     assert result['status'] == 'failed' and result['exit_status'] == 1
-    # The base inspects run (and succeed) before the build (re-pinned, tj-c4mosr.14). The property:
-    # nothing runs after the failed step -- the failed build is LAST and `up` never ran.
     exits = [step['exit_status'] for step in result['steps']]
-    assert exits == [0] * len(stack.BASE_IMAGES) + [1], result['steps']
-    commands = [step['command'].split() for step in result['steps']]
-    assert 'build' in commands[-1], f'the last step is not the failed build: {commands[-1]}'
-    assert not any('up' in command for command in commands), 'a step ran after a failed one: up'
-    assert [step.argv for step in rig.docker.steps if 'up' in step.argv] == []
+    assert exits[-1] == 1 and set(exits[:-1]) <= {0}, result['steps']
+    assert 'build' in rig.docker.steps[-1].argv, f'the last step is not the failed build: {rig.docker.steps[-1].argv}'
+    assert not [step for step in rig.docker.steps if is_seed_producer(step)], 'a step ran after a failed one'
 
 
 def test_output_keeps_its_tail_and_says_it_was_cut(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -390,14 +402,14 @@ def test_every_call_writes_exactly_one_audit_line_with_no_secret_in_it(tmp_path:
     statuses = []
     statuses.append(rig.call('no_such_verb', {'x': LIVE_ENV_SENTINEL})['status'])
     statuses.append(rig.call('ps', {'secret': LIVE_ENV_SENTINEL})['status'])
-    statuses.append(rig.call('stack_up', {'worktree': f'../{LIVE_ENV_SENTINEL}'})['status'])
+    statuses.append(rig.call('seed_dump', {'worktree': f'../{LIVE_ENV_SENTINEL}'})['status'])
     statuses.append(rig.call('logs', {'service': 'postgres'})['status'])
     mode['value'] = 'hang'
     statuses.append(rig.call('ps', {})['status'])
     mode['value'] = 'error'
     statuses.append(rig.call('ps', {})['status'])
     mode['value'] = 'ok'
-    rig.agent._running = 'stack_up'
+    rig.agent._running = 'up'
     statuses.append(rig.call('ps', {})['status'])
     rig.agent._running = None
     lines = [json.loads(line) for line in rig.audit_lines()]
@@ -408,9 +420,9 @@ def test_every_call_writes_exactly_one_audit_line_with_no_secret_in_it(tmp_path:
     assert all(line['arguments'] is None for index, line in enumerate(lines) if statuses[index] == 'refused')
     assert set(lines[0]) == {'time', 'verb', 'known', 'arguments', 'status', 'exit_status', 'duration_s'}
     text = (rig.layout.stack_dir / stack.AUDIT_LOG_NAME).read_text()
-    root_env = stack.parse_env_text((rig.layout.stack_dir / 'agent_stack.env').read_text())
-    for secret in (LIVE_ENV_SENTINEL, root_env['POSTGRES_PASS'], root_env['INSTANCE_WRITE_SECRET']):
-        assert secret not in text, 'a secret, an argument value or command output reached the audit log'
+    # The MCP holds no secret of its own since the agent stack's generated env went (tj-iee6sn.21): the
+    # sentinel stands for an argument value and for command output, both of which must stay out.
+    assert LIVE_ENV_SENTINEL not in text, 'an argument value or command output reached the audit log'
     assert os.stat(rig.layout.stack_dir / stack.AUDIT_LOG_NAME).st_mode & 0o777 == 0o600
 
 
@@ -445,10 +457,11 @@ def test_a_worktree_swapped_for_a_symlink_mid_verb_never_reaches_the_daemon(
 ):
     """S5, the regression for the RE on tj-c4mosr.3 item 1, and its companion (02:14 (3)).
 
-    During the build step the worktree's data/store/migrations becomes a symlink out of it. The later
-    up step still names only the snapshot, whose migrations is a real directory with the original
-    content; the next stack_up refuses the symlinked worktree with zero docker calls. (Its companion was the
-    agent-stack migrate, removed by tj-iee6sn.10; stack_up snapshots the same worktree the same way.)
+    During the client build step the worktree's data/store/migrations becomes a symlink out of it. The
+    later producer run still names only the snapshot, whose migrations is a real directory with the
+    original content; the next seed_dump refuses the symlinked worktree before any client or base step.
+    Re-pointed from stack_up's build-then-up to seed_dump's build-then-run (tj-iee6sn.21), which snapshot
+    the same worktree the same way.
     """
     layout_holder: dict[str, Any] = {}
     observed: dict[str, Any] = {}
@@ -462,44 +475,36 @@ def test_a_worktree_swapped_for_a_symlink_mid_verb_never_reaches_the_daemon(
             (outside / 'evil.py').write_text('EVIL = 1\n')
             shutil.rmtree(migrations)
             migrations.symlink_to(outside, target_is_directory=True)
-        if 'up' in step.argv:
+        if is_seed_producer(step):
             snapshot_migrations = layout.snapshot / 'server' / 'data' / 'store' / 'migrations'
             observed['is_link'] = snapshot_migrations.is_symlink()
             observed['files'] = sorted(str(p.relative_to(snapshot_migrations)) for p in snapshot_migrations.rglob('*'))
             observed['argv'] = step.argv
 
     rig = make_rig(tmp_path, monkeypatch, FakeDocker(hook=swap_and_observe))
+    rig.docker.respond = system_suite_response(rig.layout)
     layout_holder['layout'] = rig.layout
-    result = rig.call('stack_up', {'worktree': WORKTREE_NAME})
+    result = rig.call('seed_dump', {'worktree': WORKTREE_NAME})
     assert result['status'] == 'ok', result
-    assert observed, 'the up step never ran'
+    assert observed, 'the producer run never ran'
     assert observed['is_link'] is False and observed['files'] == ['env.py', 'versions', 'versions/0001_initial.py']
     assert not [word for word in observed['argv'] if str(rig.layout.worktree) in word or 'attacker' in word]
 
     rig.docker.steps.clear()
-    again = rig.call('stack_up', {'worktree': WORKTREE_NAME})
+    again = rig.call('seed_dump', {'worktree': WORKTREE_NAME})
     assert again['status'] == 'refused' and 'symlink' in again['message'], again
-    assert rig.docker.steps == []
+    assert not [step for step in rig.docker.steps if is_client_step(step) or is_base_step(step)], rig.docker.steps
 
 
-# The dev pair belongs here too (tj-v4e9ke, from tj-tq2hn6's residual): _dev_steps's docstring claims
-# 'the snapshot is not used -- these verbs read no worktree at all', and until they were listed that
-# claim was unpinned. Everything here is in BASE_FREE_VERBS, migrate_status included (tj-iee6sn.10: the
-# mode guard, a lookup and an exec into the running data_store; the agent-stack alembic verbs are gone).
-@pytest.mark.parametrize(
-    'verb',
-    ['stack_down', 'stack_wipe', 'logs', 'ps', 'dev_ps', 'dev_logs', 'dev_db_tables', 'migrate_status', 'dev_http_get'],
-)
+# Every verb but the system-suite pair (tj-iee6sn.21: the agent stack's stack_down, stack_wipe, logs and
+# ps, which needed an empty snapshot as their --project-directory, are gone): _dev_steps's docstring
+# claims 'the snapshot is not used -- these verbs read no worktree at all' (tj-v4e9ke), and the file-based
+# verbs name the repository's host path as their project directory, never the snapshot.
+@pytest.mark.parametrize('verb', sorted(DEV_PROJECT_VERBS))
 def test_verbs_that_build_nothing_read_no_worktree_and_need_no_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str
 ):
-    """S6: never a copy from any worktree; an empty snapshot is made when there is none.
-
-    The dev pair is held to the STRONGER half of that, and it is the half _dev_steps claims in so
-    many words: the snapshot is not used at all. An agent-stack verb still needs the directory to
-    exist because compose is handed it as --project-directory; a dev verb names no project
-    directory, so the snapshot must still be absent after it has run.
-    """
+    """S6: never a copy from any worktree, no git call, and no snapshot directory made at all."""
     rig = make_rig(tmp_path, monkeypatch)
 
     def no_copy(*args: Any, **kwargs: Any) -> None:
@@ -510,11 +515,8 @@ def test_verbs_that_build_nothing_read_no_worktree_and_need_no_snapshot(
     assert not rig.layout.snapshot.exists()
     result = rig.call(verb, dict(VERB_SAMPLES[verb]))
     assert result['status'] == 'ok', result
-    if verb in DEV_PROJECT_VERBS:
-        assert not rig.layout.snapshot.exists(), 'a dev verb reached the snapshot'
-    else:
-        assert rig.layout.snapshot.is_dir() and list(rig.layout.snapshot.iterdir()) == []
-    assert all(call == ('worktree', 'list', '--porcelain') or call[0] == 'cat-file' for call in rig.git.calls)
+    assert not rig.layout.snapshot.exists(), f'{verb} reached the snapshot'
+    assert rig.git.calls == [], f'{verb} ran git: {rig.git.calls}'
 
 
 # --- the subprocess itself: a fixed environment, never the container's --------------------------

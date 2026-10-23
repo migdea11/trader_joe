@@ -112,7 +112,7 @@ services:
       # this container -- nothing in docker-compose.yaml or the prod-* targets reads this file --
       # so no prod value can arrive here. These exist for ad-hoc troubleshooting against the
       # user's own running dev stack; anything reproducible belongs in the system suite instead,
-      # which the agent-stack MCP already runs credential-free (tj-izzqub clause 1).
+      # which the agent-stack MCP also runs, with the owner's dev credentials from the root env file (ADR tj-4rr0la addendum 28).
       # THE COST, STATED RATHER THAN IMPLIED: an agent holding these can print them and echo them
       # into a note, a commit message or a transcript, and this repository is public. The bet is
       # that a throwaway local database password and a dev write token are worth that. The log

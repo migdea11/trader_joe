@@ -11,7 +11,15 @@ from typing import Final
 
 import pytest
 
-from common.tests.compose_model import BASE_FILE, agent_stack_model, client_model, load, merge, prod_model, system_model
+from common.tests.compose_model import (
+    BASE_FILE,
+    client_model,
+    load,
+    merge,
+    prod_model,
+    system_client_model,
+    system_model,
+)
 from common.tests.roots import REPO_ROOT
 from common.tests.test_grpc_bind_network import _set_files
 
@@ -29,7 +37,10 @@ def test_data_store_receives_both_settings_as_bare_keys():
         assert not [entry for entry in environment if entry.startswith(f'{key}=')], f'{key} must carry no value'
 
 
-@pytest.mark.parametrize('model', [prod_model, client_model, agent_stack_model, system_model])
+# tj-iee6sn.27: the retired agent stack's model (base, client, its overlay, fake) is re-pointed to
+# system_client_model -- base, fake, client, as make seed-dump loads it -- the surviving set that
+# carries both the fake overlay and the client file.
+@pytest.mark.parametrize('model', [prod_model, client_model, system_client_model, system_model])
 def test_no_launch_set_gives_either_setting_a_value(model):
     environment = model()['services'][SERVICE]['environment']
     for key in BARE_KEYS:

@@ -1,4 +1,4 @@
-"""The dev EXEC family's containment, and dev_db_tables: fixed argv, one running target, a constant script.
+"""The dev EXEC family's containment, and db_tables: fixed argv, one running target, a constant script.
 
 tj-iee6sn.13.4 (slice 1 of epic tj-iee6sn). Design: ADR tj-4rr0la addendum 22 (4) and (7), with the
 plan-revision-2 ruling on tj-iee6sn.13 (no DEV classifier here: D7 applies only to state changes, so
@@ -48,7 +48,7 @@ EXPECTED_AGENT_PROJECT = 'trader_joe_agent_stack'
 EXPECTED_DEV_SERVICES = ('postgres', 'data_store', 'data_ingest')
 # Read-only for every statement of the session: libpq hands PGOPTIONS to the server at connect.
 EXPECTED_PGOPTIONS = 'PGOPTIONS=-c default_transaction_read_only=on'
-# The tables dev_db_tables reports, in the order of the models (addendum 22 (4)).
+# The tables db_tables reports, in the order of the models (addendum 22 (4)).
 EXPECTED_TABLES = (
     'dataset_read',
     'dataset_read_daily',
@@ -94,7 +94,7 @@ def expected_lookup(service: str, project: str = EXPECTED_DEV_PROJECT) -> list[s
 
 
 def expected_exec(container_id: str = CONTAINER_ID) -> list[str]:
-    """dev_db_tables' exec: user postgres, the read-only PGOPTIONS, the id, then sh -c <the script>."""
+    """db_tables' exec: user postgres, the read-only PGOPTIONS, the id, then sh -c <the script>."""
     return [
         EXPECTED_DOCKER,
         'exec',
@@ -160,7 +160,7 @@ def test_the_whole_verb_runs_the_lookup_then_the_exec_into_the_id_it_found(tmp_p
         return default_response(step)
 
     rig = make_rig(tmp_path, monkeypatch, FakeDocker(respond=respond))
-    result = rig.call('dev_db_tables', {})
+    result = rig.call('db_tables', {})
     assert result['status'] == 'ok', result
     assert [list(step.argv) for step in rig.docker.steps] == [expected_lookup('postgres'), expected_exec(found)]
     assert all(step.cwd == rig.layout.stack_dir for step in rig.docker.steps)
@@ -409,7 +409,7 @@ def test_the_upgrade_substitution_really_changes_the_tail():
 
 def test_the_exec_command_table_holds_exactly_these_rows():
     """Membership, not just refusal: a row that grew, or an option set that widened, passes every refusal."""
-    # tj-iee6sn.13.6: three more rows, one per dev_http_get name, each with NO option at all (no user,
+    # tj-iee6sn.13.6: three more rows, one per http_get name, each with NO option at all (no user,
     # no workdir, no variable). Their scripts are pinned by their parts and by running them, in
     # test_dev_http_get.py. reaper_pending was DROPPED (ADR tj-4rr0la addendum 24): its items carry
     # owner strings (owner, last_run.actor, usage.readByClients30d) that redact cannot know.
@@ -420,7 +420,7 @@ def test_the_exec_command_table_holds_exactly_these_rows():
         ('sh', '-c', stack.DEV_HTTP_GET_TAILS['ui_config'][2]): (),
         ('sh', '-c', stack.DEV_HTTP_GET_TAILS['usage_summary'][2]): (),
     } == stack.DEV_EXEC_COMMANDS
-    assert len(stack.DEV_EXEC_COMMANDS) == 5, 'two dev_http_get names share one script'
+    assert len(stack.DEV_EXEC_COMMANDS) == 5, 'two http_get names share one script'
     assert 'reaper_pending' not in stack.DEV_HTTP_GET_TAILS
     assert stack.DEV_EXEC_PGOPTIONS == EXPECTED_PGOPTIONS
     assert stack.DEV_DB_TABLES_TAIL == ('sh', '-c', SCRIPT)
@@ -442,7 +442,7 @@ def test_the_exec_builders_run_check_dev_exec_argv(monkeypatch: pytest.MonkeyPat
         stack.dev_db_tables_steps(STACK_DIR, CONTAINER_ID)
     assert seen == [tuple(expected_exec())]
     rig = make_rig(tmp_path, monkeypatch)
-    result = rig.call('dev_db_tables', {})
+    result = rig.call('db_tables', {})
     assert result['status'] == 'refused' and result['message'] == 'spy refusal', result
     assert [step.argv[1] for step in rig.docker.steps] == ['ps'], 'an exec ran past a refusing check'
 
@@ -541,12 +541,12 @@ def test_dev_db_tables_refuses_without_exec_unless_the_lookup_found_exactly_one(
         return default_response(step)
 
     rig = make_rig(tmp_path, monkeypatch, FakeDocker(respond=respond))
-    result = rig.call('dev_db_tables', {})
+    result = rig.call('db_tables', {})
     assert result['status'] == 'refused', result
     assert [list(step.argv) for step in rig.docker.steps] == [expected_lookup('postgres')], 'an exec ran'
     assert 'details' not in result
     audit = json.loads(rig.audit_lines()[-1])
-    assert audit['verb'] == 'dev_db_tables' and audit['status'] == 'refused', audit
+    assert audit['verb'] == 'db_tables' and audit['status'] == 'refused', audit
 
 
 # ===============================================================================================
@@ -555,9 +555,9 @@ def test_dev_db_tables_refuses_without_exec_unless_the_lookup_found_exactly_one(
 
 
 def test_dev_db_tables_takes_nothing_and_has_a_sixty_second_budget():
-    schema = runner.VERB_SCHEMAS['dev_db_tables']
+    schema = runner.VERB_SCHEMAS['db_tables']
     assert schema == {'properties': {}, 'required': [], 'type': 'object', 'additionalProperties': False}
-    assert runner.VERB_TIMEOUT_SECONDS['dev_db_tables'] == EXPECTED_TIMEOUT_SECONDS
+    assert runner.VERB_TIMEOUT_SECONDS['db_tables'] == EXPECTED_TIMEOUT_SECONDS
 
 
 @pytest.mark.parametrize(
@@ -568,7 +568,7 @@ def test_dev_db_tables_takes_nothing_and_has_a_sixty_second_budget():
 def test_no_argument_reaches_dev_db_tables(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arguments: object):
     """The SQL, the container and the program are constants: any argument at all is refused before docker."""
     rig = make_rig(tmp_path, monkeypatch)
-    result = rig.call('dev_db_tables', arguments)
+    result = rig.call('db_tables', arguments)
     assert result['status'] == 'refused', result
     assert rig.docker.steps == []
 
@@ -581,7 +581,7 @@ def test_the_handler_and_the_builder_take_no_caller_string():
 
 def test_dev_db_tables_reports_the_table_map_and_the_revision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     rig = make_rig(tmp_path, monkeypatch)
-    result = rig.call('dev_db_tables', {})
+    result = rig.call('db_tables', {})
     assert result['status'] == 'ok', result
     assert result['details'] == {'tables': dict.fromkeys(EXPECTED_TABLES, True), 'alembic_revision': 'd7e2a9c35b18'}
     assert result['message'] == '8 of 8 tables present; alembic revision: d7e2a9c35b18'
@@ -599,7 +599,7 @@ def test_dev_db_tables_reports_absent_tables_and_no_revision(tmp_path: Path, mon
         return default_response(step)
 
     rig = make_rig(tmp_path, monkeypatch, FakeDocker(respond=respond))
-    result = rig.call('dev_db_tables', {})
+    result = rig.call('db_tables', {})
     assert result['status'] == 'ok', result
     tables = result['details']['tables']
     assert tables == {name: bool(index % 2) for index, name in enumerate(EXPECTED_TABLES[:-1])} | {
@@ -616,7 +616,7 @@ def test_a_failed_exec_is_failed_and_reports_no_details(tmp_path: Path, monkeypa
         return default_response(step)
 
     rig = make_rig(tmp_path, monkeypatch, FakeDocker(respond=respond))
-    result = rig.call('dev_db_tables', {})
+    result = rig.call('db_tables', {})
     assert result['status'] == 'failed' and 'details' not in result, result
     assert result['exit_status'] == 1
 
@@ -852,7 +852,7 @@ def test_the_real_environment_is_never_handed_to_the_script_under_test(tmp_path:
 #   matching  literal (index), never a regex: a value's metacharacters mean nothing
 #   empty     an empty value is never a secret
 #   truncated REDACT_TRUNCATED=1, a constant the caller sets, also redacts the longest trailing proper
-#             prefix of any secret (the cut of a byte bound); off by default; dev_db_tables never sets it
+#             prefix of any secret (the cut of a byte bound); off by default; db_tables never sets it
 #
 # Each test hands the script's ONE query an exact output through a fake psql and pins the exact bytes
 # printed. Exact, not `not in`: a partial leak (the rest of a longer value around <redacted>) is the
@@ -1394,7 +1394,7 @@ def test_dev_db_tables_never_sets_the_truncated_signal(tmp_path: Path):
 
 
 def test_the_db_tables_script_embeds_the_redact_constant_verbatim():
-    """Slices 2 and 3 pipe through the same constant; dev_db_tables carries it, not a copy."""
+    """Slices 2 and 3 pipe through the same constant; db_tables carries it, not a copy."""
     assert stack._DEV_DB_TABLES_TEMPLATE.startswith(stack._DEV_REDACT_FUNCTION + '\n')
     assert SCRIPT.startswith(stack._DEV_REDACT_FUNCTION + '\n')
     assert SCRIPT.count('redact() {') == 1
@@ -1422,7 +1422,7 @@ def test_a_large_output_with_a_few_secrets_is_scrubbed_in_time(megabytes: int, b
 # ===============================================================================================
 # migrate_status' exec (tj-iee6sn.13.5, folded into migrate_status by tj-iee6sn.10): alembic current, then
 # history, by exec in the RUNNING data_store, -w /code, through the shared redact constant; refused, naming
-# dev_db_tables, when data_store is not running. Design: ADR tj-4rr0la addendum 22 (4); the bead's 21:47
+# db_tables, when data_store is not running. Design: ADR tj-4rr0la addendum 22 (4); the bead's 21:47
 # and 23:33 notes.
 # ===============================================================================================
 

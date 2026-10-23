@@ -8,7 +8,7 @@
 # A separate file and not a block in the override, because the web service itself is defined in
 # docker-compose.web.yaml, which the override is loaded BEFORE: this file has to come after it to
 # amend it, and an overlay of an overlay is clearer than reordering the dev set around one service.
-# It adds nothing to the base file, PROD_COMPOSE or the agent stack, none of which load it.
+# It adds nothing to the base file, PROD_COMPOSE or the MCP's own project, none of which load it.
 #
 # SAME SERVICE, SAME PORT. Merged over the prod definition it keeps the networks (store_api to reach
 # data_store, web_edge to publish), the loopback publish 127.0.0.1:${WEB_PORT:-8088}:8080 and the

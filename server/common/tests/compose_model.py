@@ -1,7 +1,7 @@
 """A small, faithful-enough model of compose interpolation and file merging, for the build_infra pins.
 
-No test functions here, so a test module imports exactly what it uses (the agent-stack pins of
-tj-c4mosr.5 and the network re-pins). The invariant tests parse compose files with yaml.safe_load and
+No test functions here, so a test module imports exactly what it uses (the compose pins of
+tj-c4mosr.5, whose agent-stack half was retired by tj-iee6sn.27, and the network re-pins). The invariant tests parse compose files with yaml.safe_load and
 never start a daemon, so the two things `docker compose config` would otherwise do are done here:
 
 INTERPOLATION (compose-spec interpolation.md): ${VAR}, $VAR, ${VAR:-default}, ${VAR-default},
@@ -35,7 +35,6 @@ from common.tests.roots import REPO_ROOT
 # SERVER_ROOT.
 BASE_FILE = REPO_ROOT / 'docker-compose.yaml'
 TEST_CLIENT_FILE = REPO_ROOT / 'docker-compose.test-client.yaml'
-AGENT_STACK_FILE = REPO_ROOT / 'docker-compose.agent-stack.yaml'
 AGENT_MCP_FILE = REPO_ROOT / 'docker-compose.agent-mcp.yaml'
 FAKE_FILE = REPO_ROOT / 'docker-compose.fake.yaml'
 DEVCONTAINER_COMPOSE = REPO_ROOT / '.devcontainer' / 'compose.yml'
@@ -283,19 +282,23 @@ def client_model() -> dict:
     return merge([load(BASE_FILE), load(TEST_CLIENT_FILE)])
 
 
-def agent_stack_model() -> dict:
-    """The merged agent-stack model, in AGENT_STACK_COMPOSE's order.
-
-    Base, test client, the agent-stack overlay, then the fake-mode overlay LAST (ADR tj-4rr0la
-    addendum 3 (3); tj-vhboky.61) -- so every property pinned on this model holds for the stack the
-    MCP really starts, fake data_ingest included.
-    """
-    return merge([load(BASE_FILE), load(TEST_CLIENT_FILE), load(AGENT_STACK_FILE), load(FAKE_FILE)])
-
-
 def system_model() -> dict:
-    """The merged fake-mode stack make system-launch starts: SYSTEM_COMPOSE, base then the fake overlay."""
+    """The merged test-mode stack make system-launch starts: SYSTEM_COMPOSE, base then the fake overlay.
+
+    Also the services the MCP's test mode runs (ADR tj-4rr0la addenda 26-27): the separate agent
+    stack and its model are retired (tj-iee6sn.27), and every property its model carried is pinned on
+    this one or on client_model.
+    """
     return merge([load(BASE_FILE), load(FAKE_FILE)])
+
+
+def system_client_model() -> dict:
+    """The test-mode stack with the test client: base, the fake overlay, then the test client.
+
+    The order CI's System Testing job and make test-system run the client in. The client file adds
+    only the test_client service, so the services this model shares with system_model are the same.
+    """
+    return merge([load(BASE_FILE), load(FAKE_FILE), load(TEST_CLIENT_FILE)])
 
 
 def service_networks(service: dict) -> list[str]:

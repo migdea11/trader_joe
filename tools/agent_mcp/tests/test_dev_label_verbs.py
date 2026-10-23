@@ -1,14 +1,14 @@
-"""dev_down and dev_restart, the label-only STATE-CHANGING dev verbs (bead tj-iee6sn.7).
+"""down and restart, the label-only STATE-CHANGING dev verbs (bead tj-iee6sn.7).
 
-Design checked against: the bead's 22:05 and 04:31 UTC notes (dev_down is label-only `docker compose
+Design checked against: the bead's 22:05 and 04:31 UTC notes (down is label-only `docker compose
 -p trader_joe down`: never -v, --volumes, --rmi or --remove-orphans, no compose file, no env file),
-its 14:59 UTC notes (1)-(5) (D6 on dev_restart only; the F2 and F4 wording; the F8 steering guard),
+its 14:59 UTC notes (1)-(5) (D6 on restart only; the F2 and F4 wording; the F8 steering guard),
 owner rulings D1/D2/D6/D7 on tj-iee6sn.1 and ADR tj-4rr0la addenda 22-24.
 
 Every call goes through the REAL AgentStack with the fake-docker rig, so the order is the order the
 verbs run, and a refusal is shown to run nothing after it by the steps the fake recorded:
 
-    D7 prod guard (one `docker ps`)  ->  D6 symlink check (dev_restart only)
+    D7 prod guard (one `docker ps`)  ->  D6 symlink check (restart only)
         ->  steering guard  ->  budget charge  ->  the ONE compose step
 
 Expected values are literals, never read from stack.py.
@@ -99,8 +99,8 @@ BUDGET_REFUSAL = '12 state-changing dev verbs in the last hour is the budget; wa
 SERVICE_REFUSAL = 'service must be one of: data_store, data_ingest, web'
 BUDGET = 12
 
-VERBS = {'dev_down': {}, 'dev_restart': {'service': 'data_store'}}
-EXPECTED_STEP = {'dev_down': DOWN, 'dev_restart': restart('data_store')}
+VERBS = {'down': {}, 'restart': {'service': 'data_store'}}
+EXPECTED_STEP = {'down': DOWN, 'restart': restart('data_store')}
 
 
 def steering_refusal(path: Path) -> str:
@@ -174,30 +174,30 @@ SYMLINK_REFUSAL = symlink_refusal('server/common', 'server/common')
 
 
 def test_the_schemas_are_closed_and_restart_takes_only_the_three_apps():
-    assert runner.VERB_SCHEMAS['dev_down'] == {
+    assert runner.VERB_SCHEMAS['down'] == {
         'type': 'object',
         'additionalProperties': False,
         'properties': {},
         'required': [],
     }
-    assert runner.VERB_SCHEMAS['dev_restart'] == {
+    assert runner.VERB_SCHEMAS['restart'] == {
         'type': 'object',
         'additionalProperties': False,
         'properties': {'service': {'type': 'string', 'enum': list(APPS)}},
         'required': ['service'],
     }
     assert tuple(stack.DEV_RESTART_SERVICES) == APPS
-    assert 'postgres' not in runner.VERB_SCHEMAS['dev_restart']['properties']['service']['enum']
+    assert 'postgres' not in runner.VERB_SCHEMAS['restart']['properties']['service']['enum']
 
 
 def test_both_verbs_are_on_the_tool_list_with_a_description_of_what_they_never_do():
     agent = runner.AgentStack(settings=None)  # type: ignore[arg-type] -- only the verb table is read
-    assert {'dev_down', 'dev_restart'} <= set(agent.verbs)
-    down = agent.describe('dev_down')
+    assert {'down', 'restart'} <= set(agent.verbs)
+    down = agent.describe('down')
     assert 'STATE-CHANGING' in down and '`docker compose -p trader_joe down`' in down, down
     assert 'never removes a volume or an image and never passes --remove-orphans' in down, down
     assert 'reads no compose file and no env file' in down, down
-    again = agent.describe('dev_restart')
+    again = agent.describe('restart')
     assert 'STATE-CHANGING' in again and '`docker compose -p trader_joe restart <service>`' in again, again
     assert 'data_store, data_ingest, web (never postgres)' in again, again
     assert 'creates, removes and rebuilds nothing' in again, again
@@ -205,8 +205,8 @@ def test_both_verbs_are_on_the_tool_list_with_a_description_of_what_they_never_d
 
 def test_both_timeouts_are_300_seconds_inside_the_client_timeout():
     """300 s each (the bead); the .mcp.json margin sweep holds the client above the longest verb."""
-    assert runner.VERB_TIMEOUT_SECONDS['dev_down'] == 300
-    assert runner.VERB_TIMEOUT_SECONDS['dev_restart'] == 300
+    assert runner.VERB_TIMEOUT_SECONDS['down'] == 300
+    assert runner.VERB_TIMEOUT_SECONDS['restart'] == 300
     client_ms = json.loads((REPO_ROOT / '.mcp.json').read_text(encoding='utf-8'))['mcpServers']['agent-stack'][
         'timeout'
     ]
@@ -221,7 +221,7 @@ def test_both_timeouts_are_300_seconds_inside_the_client_timeout():
 def test_dev_down_runs_the_guard_then_exactly_a_label_only_down(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """D2 and the 04:31 amendment: no -v/--volumes/--rmi/--remove-orphans, no -f, no env file, -p trader_joe."""
     rig, _ = _rig(tmp_path, monkeypatch)
-    result, argvs = _call(rig, 'dev_down', {})
+    result, argvs = _call(rig, 'down', {})
     assert result['status'] == 'ok', result
     assert argvs == [GUARD, DOWN]
     assert result['message'] == 'the trader_joe compose project is down; no volume or image was removed'
@@ -233,7 +233,7 @@ def test_dev_restart_runs_the_guard_then_exactly_a_restart_of_the_service(
 ):
     """D1: restart of ONE existing container -- no up, no create, no recreate, so never two instances."""
     rig, _ = _rig(tmp_path, monkeypatch)
-    result, argvs = _call(rig, 'dev_restart', {'service': service})
+    result, argvs = _call(rig, 'restart', {'service': service})
     assert result['status'] == 'ok', result
     assert argvs == [GUARD, restart(service)]
     assert result['message'] == f'{service} restarted in the trader_joe project'
@@ -292,8 +292,8 @@ def test_a_failed_compose_step_reports_failed(tmp_path: Path, monkeypatch: pytes
     assert result['status'] == 'failed' and result['exit_status'] == 1, result
     assert argvs == [GUARD, EXPECTED_STEP[verb]]
     expected = {
-        'dev_down': 'compose down failed for the trader_joe project',
-        'dev_restart': 'compose restart of data_store failed for the trader_joe project',
+        'down': 'compose down failed for the trader_joe project',
+        'restart': 'compose restart of data_store failed for the trader_joe project',
     }
     assert result['message'] == expected[verb]
 
@@ -345,27 +345,19 @@ def test_a_bad_service_is_refused_before_any_subprocess_and_never_audited(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, service: object
 ):
     rig, _ = _rig(tmp_path, monkeypatch)
-    result, argvs = _call(rig, 'dev_restart', {'service': service})
+    result, argvs = _call(rig, 'restart', {'service': service})
     assert result['status'] == 'refused' and result['message'] == SERVICE_REFUSAL, result
     assert argvs == []
     assert _audit(rig)['arguments'] is None
 
 
 EXTRA_KEYS = {
-    'dev_down with a service': ('dev_down', {'service': 'web'}, "dev_down takes no argument named 'service'"),
-    'dev_down with volumes': ('dev_down', {'volumes': True}, "dev_down takes no argument named 'volumes'"),
-    'dev_restart with an extra key': (
-        'dev_restart',
-        {'service': 'web', 'extra': 1},
-        "dev_restart takes no argument named 'extra'",
-    ),
-    'dev_restart with a tail': (
-        'dev_restart',
-        {'service': 'web', 'tail': 5},
-        "dev_restart takes no argument named 'tail'",
-    ),
-    'dev_restart with no service': ('dev_restart', {}, 'dev_restart needs service'),
-    'dev_down positional': ('dev_down', ['down', '-v'], 'arguments must be an object'),
+    'down with a service': ('down', {'service': 'web'}, "down takes no argument named 'service'"),
+    'down with volumes': ('down', {'volumes': True}, "down takes no argument named 'volumes'"),
+    'restart with an extra key': ('restart', {'service': 'web', 'extra': 1}, "restart takes no argument named 'extra'"),
+    'restart with a tail': ('restart', {'service': 'web', 'tail': 5}, "restart takes no argument named 'tail'"),
+    'restart with no service': ('restart', {}, 'restart needs service'),
+    'down positional': ('down', ['down', '-v'], 'arguments must be an object'),
 }
 
 
@@ -388,23 +380,23 @@ def test_extra_missing_or_positional_arguments_are_refused_before_any_subprocess
 @pytest.mark.parametrize('service', APPS)
 def test_the_audit_line_carries_the_validated_service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, service: str):
     rig, _ = _rig(tmp_path, monkeypatch)
-    rig.call('dev_restart', {'service': service})
+    rig.call('restart', {'service': service})
     audit = _audit(rig)
-    assert audit['verb'] == 'dev_restart' and audit['known'] is True, audit
+    assert audit['verb'] == 'restart' and audit['known'] is True, audit
     assert audit['arguments'] == {'service': service} and audit['status'] == 'ok', audit
 
 
 def test_the_audit_line_of_dev_down_carries_no_arguments(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     rig, _ = _rig(tmp_path, monkeypatch)
-    rig.call('dev_down', {})
+    rig.call('down', {})
     audit = _audit(rig)
-    assert audit['verb'] == 'dev_down' and audit['arguments'] == {} and audit['status'] == 'ok', audit
+    assert audit['verb'] == 'down' and audit['arguments'] == {} and audit['status'] == 'ok', audit
 
 
 def test_a_guard_refused_restart_is_audited_with_its_validated_service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     rig, responder = _rig(tmp_path, monkeypatch)
     responder.guard_stdout = PROD_LINE
-    rig.call('dev_restart', {'service': 'web'})
+    rig.call('restart', {'service': 'web'})
     audit = _audit(rig)
     assert audit['arguments'] == {'service': 'web'} and audit['status'] == 'refused', audit
 
@@ -451,7 +443,7 @@ def test_an_all_dev_project_passes_the_guard(tmp_path: Path, monkeypatch: pytest
 
 
 # ===============================================================================================
-# THE D6 SYMLINK CHECK: dev_restart only (it STARTS a container), never dev_down
+# THE D6 SYMLINK CHECK: restart only (it STARTS a container), never down
 # ===============================================================================================
 
 
@@ -459,10 +451,10 @@ def test_an_all_dev_project_passes_the_guard(tmp_path: Path, monkeypatch: pytest
 def test_a_symlinked_bind_source_refuses_dev_restart_after_only_the_guard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, service: str
 ):
-    """The 14:59 note (1): with a symlinked bind source dev_restart runs only the `docker ps`."""
+    """The 14:59 note (1): with a symlinked bind source restart runs only the `docker ps`."""
     rig, _ = _rig(tmp_path, monkeypatch)
     _symlink_a_bind_source(rig)
-    result, argvs = _call(rig, 'dev_restart', {'service': service})
+    result, argvs = _call(rig, 'restart', {'service': service})
     assert result['status'] == 'refused' and result['message'] == SYMLINK_REFUSAL, result
     assert argvs == [GUARD]
 
@@ -472,16 +464,16 @@ def test_a_symlinked_parent_of_a_bind_source_refuses_naming_the_link(tmp_path: P
     repo = rig.layout.repo
     shutil.move(str(repo / 'server'), str(rig.layout.root / 'moved-server'))
     (repo / 'server').symlink_to(rig.layout.worktree / 'server', target_is_directory=True)
-    result, argvs = _call(rig, 'dev_restart', {'service': 'web'})
+    result, argvs = _call(rig, 'restart', {'service': 'web'})
     assert result['message'] == symlink_refusal('server', 'server/data/store/app'), result
     assert argvs == [GUARD]
 
 
 def test_dev_down_ignores_a_symlinked_bind_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """dev_down starts nothing, so the daemon resolves no bind source: D6 does not apply to it."""
+    """The down verb starts nothing, so the daemon resolves no bind source: D6 does not apply to it."""
     rig, _ = _rig(tmp_path, monkeypatch)
     _symlink_a_bind_source(rig)
-    result, argvs = _call(rig, 'dev_down', {})
+    result, argvs = _call(rig, 'down', {})
     assert result['status'] == 'ok', result
     assert argvs == [GUARD, DOWN]
 
@@ -644,7 +636,7 @@ def test_an_lstat_error_refuses_the_verb_with_only_the_guard_run(tmp_path: Path,
         return real_lstat(path, *args, **kwargs)
 
     monkeypatch.setattr(os, 'lstat', lstat)
-    result, argvs = _call(rig, 'dev_down', {})
+    result, argvs = _call(rig, 'down', {})
     assert result['status'] == 'refused' and result['message'] == f'{target} could not be checked: Input/output error'
     assert argvs == [GUARD]
 
@@ -667,7 +659,7 @@ def test_not_a_directory_reads_as_not_there(tmp_path: Path, monkeypatch: pytest.
 
 def _exhaust(rig: Rig) -> None:
     for index in range(BUDGET):
-        verb = 'dev_down' if index % 2 else 'dev_restart'
+        verb = 'down' if index % 2 else 'restart'
         assert rig.call(verb, VERBS[verb])['status'] == 'ok'
 
 
@@ -692,7 +684,7 @@ def test_the_symlink_check_runs_before_the_steering_and_budget_checks(tmp_path: 
     _exhaust(rig)
     _symlink_a_bind_source(rig)
     (rig.layout.stack_dir / '.env').write_text('x\n')
-    result, argvs = _call(rig, 'dev_restart', {'service': 'web'})
+    result, argvs = _call(rig, 'restart', {'service': 'web'})
     assert result['message'] == SYMLINK_REFUSAL, result
     assert argvs == [GUARD]
 
@@ -728,8 +720,8 @@ def test_the_thirteenth_admitted_call_refuses_after_only_the_guard(
 def test_twelve_of_one_verb_exhaust_the_other(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     rig, _ = _rig(tmp_path, monkeypatch)
     for _ in range(BUDGET):
-        assert rig.call('dev_down', {})['status'] == 'ok'
-    assert rig.call('dev_restart', {'service': 'web'})['message'] == BUDGET_REFUSAL
+        assert rig.call('down', {})['status'] == 'ok'
+    assert rig.call('restart', {'service': 'web'})['message'] == BUDGET_REFUSAL
 
 
 def test_refused_calls_are_never_charged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -737,23 +729,23 @@ def test_refused_calls_are_never_charged(tmp_path: Path, monkeypatch: pytest.Mon
     rig, responder = _rig(tmp_path, monkeypatch)
     for _ in range(3):
         responder.guard_stdout = PROD_LINE
-        assert rig.call('dev_down', {})['message'] == GUARD_REFUSAL
+        assert rig.call('down', {})['message'] == GUARD_REFUSAL
         responder.guard_stdout = b''
         responder.guard_exit = 1
-        assert rig.call('dev_restart', {'service': 'web'})['message'] == GUARD_FAILED
+        assert rig.call('restart', {'service': 'web'})['message'] == GUARD_FAILED
         responder.guard_exit = 0
         _symlink_a_bind_source(rig)
-        assert rig.call('dev_restart', {'service': 'web'})['message'] == SYMLINK_REFUSAL
+        assert rig.call('restart', {'service': 'web'})['message'] == SYMLINK_REFUSAL
         _unlink_the_bind_source(rig)
         (rig.layout.stack_dir / 'compose.yaml').write_text('x\n')
-        assert rig.call('dev_down', {})['status'] == 'refused'
+        assert rig.call('down', {})['status'] == 'refused'
         (rig.layout.stack_dir / 'compose.yaml').unlink()
-        assert rig.call('dev_restart', {'service': 'postgres'})['message'] == SERVICE_REFUSAL
-        assert rig.call('dev_down', {'volumes': True})['status'] == 'refused'
+        assert rig.call('restart', {'service': 'postgres'})['message'] == SERVICE_REFUSAL
+        assert rig.call('down', {'volumes': True})['status'] == 'refused'
     assert _charged(rig) == 0
     _exhaust(rig)
     assert _charged(rig) == BUDGET
-    assert rig.call('dev_down', {})['message'] == BUDGET_REFUSAL
+    assert rig.call('down', {})['message'] == BUDGET_REFUSAL
     assert _charged(rig) == BUDGET
 
 
@@ -761,7 +753,7 @@ def test_a_budget_refusal_is_not_charged_either(tmp_path: Path, monkeypatch: pyt
     rig, _ = _rig(tmp_path, monkeypatch)
     _exhaust(rig)
     for _ in range(5):
-        assert rig.call('dev_down', {})['message'] == BUDGET_REFUSAL
+        assert rig.call('down', {})['message'] == BUDGET_REFUSAL
     assert _charged(rig) == BUDGET
 
 
@@ -769,14 +761,14 @@ def test_an_admitted_call_whose_compose_step_fails_is_charged(tmp_path: Path, mo
     """It was admitted and its step ran (and may have changed state), so it counts."""
     rig, responder = _rig(tmp_path, monkeypatch)
     responder.step_exit = 1
-    assert rig.call('dev_down', {})['status'] == 'failed'
+    assert rig.call('down', {})['status'] == 'failed'
     assert _charged(rig) == 1
 
 
 def test_read_only_dev_verbs_are_not_charged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     rig, _ = _rig(tmp_path, monkeypatch)
     for _ in range(BUDGET + 1):
-        assert rig.call('dev_ps', {})['status'] == 'ok'
+        assert rig.call('ps', {})['status'] == 'ok'
     assert _charged(rig) == 0
     _exhaust(rig)
-    assert rig.call('dev_down', {})['message'] == BUDGET_REFUSAL
+    assert rig.call('down', {})['message'] == BUDGET_REFUSAL

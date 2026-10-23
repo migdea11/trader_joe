@@ -1,16 +1,16 @@
-"""dev_tools, the file-based STATE-CHANGING `make dev-tools` over the user's dev project (bead tj-iee6sn.14).
+"""tools, the file-based STATE-CHANGING `make dev-tools` over the user's dev project (bead tj-iee6sn.14).
 
 Design checked against: the bead's description and the architect's 18:37 UTC readiness note on
 tj-iee6sn.14 (the mirror is `up -d pgadmin`; --wait is kept only as the ONE named deviation; the file set
 is the wrapper plus the dev prefix plus the trusted docker-compose.tools.yaml; one new lifecycle row;
 PGADMIN_* never in a step env, argv or audit), the 14:59 note (S6 covers the tools file), owner rulings
-D5-D7 and R2 on tj-iee6sn.1, and ADR tj-4rr0la addenda 22-24. dev_tools is a PLAIN call (300 s, no job).
+D5-D7 and R2 on tj-iee6sn.1, and ADR tj-4rr0la addenda 22-24. tools is a PLAIN call (300 s, no job).
 Order, a refusal at any point running nothing after it and charging nothing:
 
     D7 guard -> S6 stale copies (the tools file included) -> D6 bind-source symlinks -> D5 env-file
     preflight -> ONE budget charge -> devnet inspect, else create, else inspect again -> the file-based
     `up -d --wait pgadmin` over the dev files with the tools file inserted before the MCP-only overlay,
-    run by dev_up's fixed `sh -c` wrapper that derives INSTANCE_WRITE_SECRET inside the child.
+    run by up's fixed `sh -c` wrapper that derives INSTANCE_WRITE_SECRET inside the child.
 
 No steering walk (every -f is given), no generated-code check, no :dev image inspect, no digest and no
 base: pgadmin and postgres are image-only (test_bases.py::test_the_dev_tools_up_can_build_nothing).
@@ -73,10 +73,10 @@ TOOLS_FILE = 'docker-compose.tools.yaml'
 TOOLS_FILES = (*DEV_FILES[:4], TOOLS_FILE, DEV_FILES[4])
 # make dev-tools' `up -d pgadmin`, plus --wait: the one documented deviation from the recipe.
 TOOLS_TAIL = ('up', '-d', '--wait', 'pgadmin')
-OK_MESSAGE = 'pgAdmin is running in the trader_joe project; stop it with dev_down'
+OK_MESSAGE = 'pgAdmin is running in the trader_joe project; stop it with the down verb'
 UP_FAILED = (
     'compose up of pgadmin failed for the trader_joe project; if the step output names PGADMIN_EMAIL or '
-    'PGADMIN_PASS, set it in the root env file (the pgAdmin password needs 6+ characters); see the steps and dev_logs'
+    'PGADMIN_PASS, set it in the root env file (the pgAdmin password needs 6+ characters); see the steps and call logs'
 )
 NETWORK_FAILED = 'the trader_joe_devnet network could not be created; pgAdmin was not started'
 BUDGET_REFUSAL = '12 state-changing dev verbs in the last hour is the budget; wait, or run the make target yourself'
@@ -102,7 +102,7 @@ def full_run(host: Path) -> list[tuple[str, ...]]:
 
 
 class Responder:
-    """The fake daemon of a dev_tools: each step's answer is a field the test can change."""
+    """The fake daemon of a tools: each step's answer is a field the test can change."""
 
     def __init__(self) -> None:
         self.guard: tuple[int, bytes] = (0, b'')
@@ -131,7 +131,7 @@ def _rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Rig, Responde
 
 
 def _call(rig: Rig, arguments: Any = None) -> dict[str, Any]:
-    return rig.call('dev_tools', {} if arguments is None else arguments)
+    return rig.call('tools', {} if arguments is None else arguments)
 
 
 def _argvs(rig: Rig) -> list[tuple[str, ...]]:
@@ -265,7 +265,7 @@ def _stale_script(rig: Rig, responder: Responder) -> None:
 
 
 def _stale_tools_file(rig: Rig, responder: Responder) -> None:
-    """The 14:59 note: S6 covers docker-compose.tools.yaml, the one file only dev_tools loads."""
+    """The 14:59 note: S6 covers docker-compose.tools.yaml, the one file only tools loads."""
     path = rig.layout.repo / TOOLS_FILE
     path.write_bytes(path.read_bytes() + b'# the checkout moved on\n')
 
@@ -350,7 +350,7 @@ def test_a_failed_guard_listing_runs_nothing_else(tmp_path: Path, monkeypatch: p
 def test_a_project_with_a_dev_tools_pgadmin_in_it_passes_the_next_guard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """The container dev_tools made labels itself with the tools -f list, which loads the override: DEV."""
+    """The container tools made labels itself with the tools -f list, which loads the override: DEV."""
     rig, responder = _rig(tmp_path, monkeypatch)
     label = ','.join(f'{TRUSTED}/{name}' for name in TOOLS_FILES)
     responder.guard = (0, f'{label}\n'.encode())
@@ -420,8 +420,8 @@ _REFUSED = {
         (*wrapper_head(_HOST), *file_prefix(_HOST), *TOOLS_TAIL),
         _TABLE_MESSAGE,
     ),
-    'the tools file on the dev_up row': ((*wrapper_head(_HOST), *tools_prefix(_HOST), *UP_TAIL), _TABLE_MESSAGE),
-    'the dev_up argv itself': ((*wrapper_head(_HOST), *file_prefix(_HOST), *UP_TAIL), _ROW_MESSAGE),
+    'the tools file on the up row': ((*wrapper_head(_HOST), *tools_prefix(_HOST), *UP_TAIL), _TABLE_MESSAGE),
+    'the up argv itself': ((*wrapper_head(_HOST), *file_prefix(_HOST), *UP_TAIL), _ROW_MESSAGE),
     'the tools file after the overlay': (
         # The dev prefix then matches whole, and the moved -f is a forbidden word of the tail.
         (*_GOOD[: _TOOLS_AT - 1], *_GOOD[_TOOLS_AT + 1 : -4], '-f', _GOOD[_TOOLS_AT], *TOOLS_TAIL),
@@ -464,7 +464,7 @@ def test_check_dev_tools_argv_refuses_every_other_argv(argv: tuple[str, ...], me
 
 
 def test_the_dev_up_check_refuses_the_dev_tools_argv():
-    """The two wrapped checks do not overlap: dev_up's never accepts the pgAdmin up."""
+    """The two wrapped checks do not overlap: up's never accepts the pgAdmin up."""
     with pytest.raises(stack.Refused, match='the dev up wrapper runs the fixed up command'):
         stack.check_dev_up_argv(_GOOD, _HOST)
 
@@ -637,9 +637,9 @@ def _env_default_names() -> set[str]:
 
 
 def test_every_variable_the_tools_file_reads_comes_from_the_root_env_file_or_has_a_default():
-    """Every reference of the tools file is sourced under dev_tools' own env.
+    """Every reference of the tools file is sourced under tools' own env.
 
-    dev_tools passes no value of its own: compose has the pinned env and the root env file, nothing make
+    tools passes no value of its own: compose has the pinned env and the root env file, nothing make
     adds. So every reference of the tools file is guarded, defaulted, or a key of .env.default (which the
     user's root env file is copied from). A reference only make supplies -- APP_INTERNAL_PORT's bug class --
     would render empty here, and none may exist.
@@ -670,7 +670,7 @@ def test_the_pgadmin_port_is_published_on_loopback_only():
 
 
 def test_the_schema_is_closed_and_takes_nothing():
-    assert runner.VERB_SCHEMAS['dev_tools'] == {
+    assert runner.VERB_SCHEMAS['tools'] == {
         'type': 'object',
         'properties': {},
         'required': [],
@@ -690,20 +690,20 @@ def test_any_argument_is_refused_with_no_step_and_no_charge(tmp_path: Path, monk
 
 
 def test_the_timeout_is_five_minutes_inside_the_clients():
-    assert runner.VERB_TIMEOUT_SECONDS['dev_tools'] == 300
+    assert runner.VERB_TIMEOUT_SECONDS['tools'] == 300
     config = json.loads((REPO_ROOT / '.mcp.json').read_text(encoding='utf-8'))
     assert config['mcpServers']['agent-stack']['timeout'] >= (300 + 30) * 1000
 
 
 def test_dev_tools_is_on_the_tool_list_saying_what_it_starts_and_what_it_never_touches():
     agent = runner.AgentStack(settings=None)  # type: ignore[arg-type] -- only the verb table is read
-    assert 'dev_tools' in agent.verbs
-    text = agent.describe('dev_tools')
+    assert 'tools' in agent.verbs
+    text = agent.describe('tools')
     assert text.startswith('STATE-CHANGING: `make dev-tools`'), text
     assert 'starts pgAdmin' in text and '127.0.0.1' in text and 'POSTGRES_UI_PORT' in text, text
     assert 'never builds or stops anything' in text, text
     assert 'PGADMIN_EMAIL and PGADMIN_PASS' in text and 'never reads, passes or prints them' in text, text
-    assert 'dev_down removes pgAdmin' in text and 'Up to 5 minutes' in text, text
+    assert 'down removes pgAdmin' in text and 'Up to 5 minutes' in text, text
 
 
 # ===============================================================================================

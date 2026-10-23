@@ -2,7 +2,7 @@
 
 Design checked against: bead tj-iee6sn.24's WHAT (1)-(4) and TESTS, the builder's 00:21/00:31 UTC notes
 there (the deviations the orchestrator accepted: test_up has no secret wrapper and no devnet step;
-dev_down and dev_restart still act on an empty project), and ADR tj-4rr0la addendum 26 (as amended)
+down and restart still act on an empty project), and ADR tj-4rr0la addendum 26 (as amended)
 and addendum 27 (1)-(3): test mode is make system-launch's set (base + docker-compose.fake.yaml) on the
 :test images, built by make test-build, never :latest; the MCP refuses while any PROD container exists.
 
@@ -81,7 +81,7 @@ DOWN = (DOCKER, 'compose', '-p', PROJECT, 'down')
 BUDGET = 12
 STALE_PREFIX = 'the MCP image is stale: '
 TEST_GENERATE_HINT = 'run make proto in the root checkout'
-TEST_MODE_HINT = 'test mode is up: dev_up first'
+TEST_MODE_HINT = 'test mode is up: call up first'
 UP_OK = (
     'the trader_joe project was stopped and test mode is up and healthy: postgres on ./volume_data/test, '
     'data_store and data_ingest from the :test images, data_ingest on the fake broker'
@@ -89,7 +89,7 @@ UP_OK = (
 BUILD_OK = 'the :test images (data_store, data_ingest) are built and stamped; :latest was not touched'
 # test_up's up env: the pinned env (compose reads the project's env files itself), then DATA_DIR.
 UP_ENV = (*PINNED_ENV, ('DATA_DIR', TEST_DATA_DIR))
-# test_build's build env: dev_build's placeholders (no env file is read), DATA_DIR, the two digests.
+# test_build's build env: build's placeholders (no env file is read), DATA_DIR, the two digests.
 BUILD_ENV = (
     *EXPECTED_PLACEHOLDER,
     ('DATA_DIR', TEST_DATA_DIR),
@@ -264,7 +264,7 @@ def test_test_build_runs_the_digests_the_bases_then_one_build_over_the_test_buil
 
 
 def test_test_build_runs_no_mode_guard_even_on_a_prod_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """WHAT (1): 'dev_build, test_build: no guard (they build images only)'."""
+    """WHAT (1): 'build, test_build: no guard (they build images only)'."""
     rig, responder = _rig(tmp_path, monkeypatch)
     responder.guard = (0, PROD_LINE)
     assert rig.call('test_build', {})['status'] == 'ok'
@@ -376,10 +376,10 @@ def test_test_build_does_not_need_the_typescript_tree(tmp_path: Path, monkeypatc
     rig, _ = _rig(tmp_path, monkeypatch)
     shutil.rmtree(rig.layout.repo / 'gen' / 'proto' / 'ts')
     assert rig.call('test_build', {})['status'] == 'ok'
-    # And dev_build, which builds web, still needs it: the narrowing is test_build's alone.
+    # And build, which builds web, still needs it: the narrowing is test_build's alone.
     rig2, _ = _rig(tmp_path / 'dev', monkeypatch)
     shutil.rmtree(rig2.layout.repo / 'gen' / 'proto' / 'ts')
-    assert rig2.call('dev_build', {})['status'] == 'refused'
+    assert rig2.call('build', {})['status'] == 'refused'
 
 
 def test_test_build_refuses_on_a_spent_budget_before_any_step(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -599,7 +599,7 @@ def test_every_in_repo_bind_of_every_compose_file_the_lifecycle_loads_is_checked
 
 @pytest.mark.parametrize('source', ['server/data/store/migrations', 'server/data/store/alembic.ini'])
 def test_a_symlinked_alembic_bind_source_refuses_test_up(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str):
-    """The daemon resolves data_store's alembic binds at every start: a link planted there must refuse, as dev_up's does."""
+    """The daemon resolves data_store's alembic binds at every start: a link planted there must refuse, as up's does."""
     rig, _ = _rig(tmp_path, monkeypatch)
     path = rig.layout.repo / source
     moved = rig.layout.root / 'moved'
@@ -814,7 +814,7 @@ def test_a_failed_up_answers_failed(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     responder.compose_exit = 1
     result = rig.call('test_up', {})
     assert result['status'] == 'failed', result
-    assert result['message'] == 'compose up failed for the trader_joe project in test mode; see the steps and dev_logs'
+    assert result['message'] == 'compose up failed for the trader_joe project in test mode; see the steps and call logs'
     assert _charges_left(rig) == BUDGET - 1
 
 
@@ -822,12 +822,12 @@ def test_a_failed_up_answers_failed(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 # THE PER-VERB MODE TABLE (WHAT (1), as the orchestrator accepted the builder's deviation (2))
 # ===============================================================================================
 
-ANY = {'dev_up', 'test_up', 'dev_down', 'dev_restart'}
-DEV_OR_EMPTY = {'dev_tools': TEST_MODE_HINT}
+ANY = {'up', 'test_up', 'down', 'restart'}
+DEV_OR_EMPTY = {'tools': TEST_MODE_HINT}
 # tj-iee6sn.10: migrate and migrate_status act on whichever mode is UP, DEV or TEST; an empty project refuses.
-MIGRATE_EMPTY_HINT = 'nothing is up: call dev_up (your dev data) or test_up first'
+MIGRATE_EMPTY_HINT = 'nothing is up: call up (your dev data) or test_up first'
 DEV_OR_TEST = {'migrate': MIGRATE_EMPTY_HINT, 'migrate_status': MIGRATE_EMPTY_HINT}
-NO_GUARD = {'dev_build', 'test_build'}
+NO_GUARD = {'build', 'test_build'}
 STATES = {'empty': b'', 'dev': DEV_LINE, 'test': TEST_LINE, 'mixed': DEV_LINE + TEST_LINE, 'prod': PROD_LINE}
 
 
@@ -855,17 +855,23 @@ class _GuardOnly:
 
 
 def test_the_mode_table_covers_every_state_changing_verb():
-    """Every verb on the one project: the dev_/test_ ones minus the read-only four, plus the migrate pair.
+    """Every verb on the one project but the read-only four and the two test-suite verbs.
 
+    The names carry no dev_ prefix to select by any more (tj-iee6sn.26), so the exclusions are spelled out.
     migrate_status is read-only but guarded (it acts on the mode that is up, tj-iee6sn.10), so it is here.
     """
-    state_changing = {verb for verb in VERB_SAMPLES if verb.startswith(('dev_', 'test_'))} - {
-        'dev_ps',
-        'dev_logs',
-        'dev_db_tables',
-        'dev_http_get',
+    state_changing = set(VERB_SAMPLES) - {'ps', 'logs', 'db_tables', 'http_get', 'run_system_tests', 'seed_dump'}
+    assert state_changing == {
+        'up',
+        'build',
+        'tools',
+        'down',
+        'restart',
+        'test_up',
+        'test_build',
+        'migrate',
+        'migrate_status',
     }
-    state_changing |= {'migrate', 'migrate_status'}
     assert ANY | set(DEV_OR_EMPTY) | set(DEV_OR_TEST) | NO_GUARD == state_changing, state_changing
 
 
@@ -991,18 +997,18 @@ def test_a_dev_images_stamp_check_still_names_dev_build():
     image = 'trader_joe_data_store:dev'
     with pytest.raises(stack.Refused) as refused:
         stack.check_dev_image_stamp(0, f'{OTHER}\n'.encode(), STORE_DIGEST)
-    assert str(refused.value).startswith(f'STALE IMAGE: {image}') and str(refused.value).endswith('call dev_build')
-    assert stack.stamp_image_fix(image) == 'call dev_build'
+    assert str(refused.value).startswith(f'STALE IMAGE: {image}') and str(refused.value).endswith('call build')
+    assert stack.stamp_image_fix(image) == 'call build'
     assert [stack.stamp_image_fix(ref) for ref in TEST_IMAGES] == ['call test_build'] * 2
 
 
 def test_the_stamp_checks_docstring_names_both_fixes_and_the_unstamped_cases():
-    """The architect's 09:30 note (A), loosely: the text names call test_build beside call dev_build.
+    """The architect's 09:30 note (A), loosely: the text names call test_build beside call build.
 
     And an unstamped image as one CI pulled and retagged, or one compose made implicitly.
     """
     doc = ' '.join((stack.check_dev_image_stamp.__doc__ or '').split())
-    assert 'call test_build' in doc and 'call dev_build' in doc, doc
+    assert 'call test_build' in doc and 'call build' in doc, doc
     assert 'CI pulled and retagged' in doc and 'implicitly' in doc, doc
     assert 'make system-launch' not in doc, doc
 

@@ -1,8 +1,8 @@
-"""dev_build, the file-based STATE-CHANGING build verb over the user's dev project (bead tj-iee6sn.8).
+"""build, the file-based STATE-CHANGING build verb over the user's dev project (bead tj-iee6sn.8).
 
 Design checked against: the architect's 17:25 UTC note on tj-iee6sn.8 (it wins over the description), its
 14:59 note, the 04:08 validator finding, owner rulings D5 and D8 on tj-iee6sn.1 and ADR tj-4rr0la addenda
-22-24. dev_build is a PLAIN call (D8, timeout 1800 s, no job): it returns ok or failed itself. It reads
+22-24. build is a PLAIN call (D8, timeout 1800 s, no job): it returns ok or failed itself. It reads
 no env file (D5): its build step runs in the placeholder env with COMPOSE_ENV_FILES=/dev/null. It has no
 prod guard, no D6 check and no steering walk (it starts nothing; every -f is given). Order, a refusal at
 any point running nothing after it:
@@ -122,7 +122,7 @@ def _rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Rig, Responde
 
 
 def _call(rig: Rig, arguments: Any = None) -> dict[str, Any]:
-    return rig.call('dev_build', {} if arguments is None else arguments)
+    return rig.call('build', {} if arguments is None else arguments)
 
 
 def _charges_left(rig: Rig) -> int:
@@ -365,16 +365,16 @@ def test_the_real_digest_argv_run_by_the_runner_gives_the_in_tree_digest(tmp_pat
         assert stack.parse_source_digest(mine.exit_status, mine.stdout) is not None
 
 
-# tj-iee6sn.15 TESTS (v): dev_build end to end over a checkout with a symlinked COPY-source component.
+# tj-iee6sn.15 TESTS (v): build end to end over a checkout with a symlinked COPY-source component.
 # The digest steps run the REAL script (a trusted tmp copy standing in for /opt/agent_mcp/compose)
-# with the argv dev_build built, over the rig's root checkout at its host path; every docker step is
+# with the argv build built, over the rig's root checkout at its host path; every docker step is
 # the fake. make_rig forbids real subprocesses by patching the module attributes, so the real run is
 # taken from here, before any rig exists.
 _REAL_SUBPROCESS_RUN = subprocess.run
 
 
 class _RealDigestResponder(Responder):
-    """Responder, except that each digest step runs the real trusted script with dev_build's argv."""
+    """Responder, except that each digest step runs the real trusted script with build's argv."""
 
     def __init__(self, trusted_script: Path) -> None:
         super().__init__()
@@ -640,7 +640,7 @@ def test_twelve_builds_an_hour_and_the_thirteenth_is_refused(tmp_path: Path, mon
 def test_the_budget_is_shared_with_the_label_only_verbs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     rig, _ = _rig(tmp_path, monkeypatch)
     for _ in range(BUDGET):
-        assert rig.call('dev_down', {})['status'] == 'ok'
+        assert rig.call('down', {})['status'] == 'ok'
     assert _call(rig)['message'] == BUDGET_REFUSAL
 
 
@@ -664,7 +664,7 @@ def test_a_failed_base_pull_runs_no_build(tmp_path: Path, monkeypatch: pytest.Mo
 
 
 def test_the_schema_is_closed_and_takes_nothing():
-    assert runner.VERB_SCHEMAS['dev_build'] == {
+    assert runner.VERB_SCHEMAS['build'] == {
         'type': 'object',
         'properties': {},
         'required': [],
@@ -683,7 +683,7 @@ def test_any_argument_is_refused_with_no_step(tmp_path: Path, monkeypatch: pytes
 
 def test_the_timeout_is_thirty_minutes_inside_the_clients():
     """D8 (slice 0, tj-iee6sn.4): the client's per-server timeout outlasts the verb's, with a margin."""
-    assert runner.VERB_TIMEOUT_SECONDS['dev_build'] == 1800
+    assert runner.VERB_TIMEOUT_SECONDS['build'] == 1800
     config = json.loads((REPO_ROOT / '.mcp.json').read_text(encoding='utf-8'))
     client_ms = config['mcpServers']['agent-stack']['timeout']
     assert client_ms >= (1800 + 30) * 1000, client_ms
@@ -692,7 +692,7 @@ def test_the_timeout_is_thirty_minutes_inside_the_clients():
 
 def test_dev_build_is_a_verb_of_the_server():
     agent = runner.AgentStack(settings=None)  # type: ignore[arg-type] -- only the verb table is read
-    assert 'dev_build' in agent.verbs
+    assert 'build' in agent.verbs
 
 
 # ===============================================================================================
@@ -726,10 +726,10 @@ def test_dev_build_stamps_the_variables_make_dev_build_stamps_from_the_same_serv
 
 
 def test_make_dev_build_builds_exactly_the_services_dev_build_names():
-    """MIRROR: make dev-build and dev_build build the same three services.
+    """MIRROR: make dev-build and build build the same three services.
 
     `$(WITH_SOURCE_STAMP) $(DEV_COMPOSE) build` names no service, so it builds every service with a
-    build: key in DEV_COMPOSE's files; dev_build names them.
+    build: key in DEV_COMPOSE's files; build names them.
     """
     text = (REPO_ROOT / 'Makefile').read_text(encoding='utf-8')
     recipe = re.search(r'^dev-build:.*\n\t(.*)$', text, re.MULTILINE)
@@ -742,7 +742,7 @@ def test_make_dev_build_builds_exactly_the_services_dev_build_names():
         built |= {service for service, spec in services.items() if isinstance(spec, dict) and 'build' in spec}
     assert built == {'data_store', 'data_ingest', 'web'}, built
     assert set(stack.DEV_BUILD_TAIL[1:]) == built and stack.DEV_BUILD_TAIL[0] == 'build'
-    # dev_build's -f list is make's plus the MCP-only overlay that points build.dockerfile at the trusted copy.
+    # build's -f list is make's plus the MCP-only overlay that points build.dockerfile at the trusted copy.
     assert (*files, 'docker-compose.agent-dev.yaml') == stack.DEV_COMPOSE_FILES == DEV_FILES
 
 
@@ -947,14 +947,14 @@ def _strings(node: Any) -> list[str]:
 
 
 def test_every_structural_value_of_the_dev_files_is_loadable_under_the_build_steps_env():
-    """D5, the whole audit: every reference in the five files dev_build loads, rendered as compose would.
+    """D5, the whole audit: every reference in the five files build loads, rendered as compose would.
 
     The env is the build step's (DOCKER_ENV, stack's placeholder env, the two digests). A `:?` that
     fires, a reference the stand-in cannot read (left as `${`), and an empty or malformed value in a
     position compose parses -- image, container_name, hostname, ports (short and long), expose,
     volumes (short and long), env_file, build.context/dockerfile, ulimits, top-level network names --
     are each a load failure before anything builds. docker-compose.tools.yaml is not loaded by
-    dev_build (the -f list is pinned above), so it is not audited here.
+    build (the -f list is pinned above), so it is not audited here.
     """
     # stack's own placeholder env (not the PLACEHOLDER_ENV literal), so a change to it is audited here.
     env = {**runner.DOCKER_ENV, **dict(stack.dev_placeholder_step_env()), **dict(BUILD_ENV[-2:])}

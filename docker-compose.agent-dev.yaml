@@ -13,14 +13,13 @@
 # resolved against --project-directory), which an agent can write. BuildKit reads the Dockerfile from
 # the context, so an agent-edited Dockerfile would choose which images a build on the host daemon
 # reads (FROM, COPY --from, RUN --mount from=, a syntax= frontend). The MCP image's own copy of the
-# service Dockerfile is fixed instead (stack.TRUSTED_DOCKERFILE, baked by tools/agent_mcp/Dockerfile),
-# exactly as docker-compose.agent-stack.yaml does for the agent stack (addendum 5, ruling 2). compose
-# merges build keys, so context, target and args stay from the files above. The path exists only
+# service Dockerfile is fixed instead (stack.TRUSTED_DOCKERFILE, baked by tools/agent_mcp/Dockerfile).
+# compose merges build keys, so context, target and args stay from the files above. The path exists only
 # inside the MCP image; loading this file anywhere else fails to find it.
 #
 # THE THREE SERVICES are the ones the dev set builds (data_store and data_ingest from the base file,
-# web from docker-compose.web.yaml); postgres and pgAdmin run stock images. Absolute path, as the
-# agent-stack overlay writes it: a relative dockerfile resolves against the context.
+# web from docker-compose.web.yaml); postgres and pgAdmin run stock images. Absolute path: a
+# relative dockerfile resolves against the context.
 services:
   data_store:
     build:

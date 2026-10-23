@@ -368,6 +368,64 @@ def test_the_makefile_share_default(host: Host, xdg: str | None, expected: str):
     assert result.stdout.strip() == expected.format(uid=os.getuid())
 
 
+# THE STACK DIRECTORY'S DEFAULT (tj-iee6sn.27; the architect's ruling 1 on tj-iee6sn.21): named like the
+# MCP's project and network, no longer after the retired agent stack. The old name is spelled in pieces so
+# this file holds none of it (test_agent_stack_files_retired.py scans every tracked file for it).
+STACK_DIR_NAME = 'trader_joe_agent_mcp'
+OLD_STACK_DIR_NAME = 'trader_joe_agent' + '_stack'
+
+
+@pytest.mark.parametrize(
+    ('xdg', 'expected'),
+    [('/data/home', '/data/home/' + STACK_DIR_NAME), (None, None), ('', None)],
+    ids=['xdg-set', 'xdg-unset', 'xdg-empty'],
+)
+def test_the_makefile_stack_dir_default(host: Host, xdg: str | None, expected: str | None):
+    """Run for real: $(XDG_DATA_HOME)/trader_joe_agent_mcp, else $(HOME)/.local/share/trader_joe_agent_mcp."""
+    result = _make(host, '-s', '--eval', 'pv: ; @echo $(AGENT_MCP_STACK_DIR)', 'pv', paths=False, XDG_DATA_HOME=xdg)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == (expected or f'{host.root}/.local/share/{STACK_DIR_NAME}')
+
+
+def test_agent_mcp_up_mounts_creates_and_checks_the_new_default_stack_dir(host: Host):
+    """Make -n agent-mcp-up with no AGENT_MCP_STACK_DIR: the new default reaches compose and agent-mcp-paths.
+
+    compose gets it (the MCP's same-path mount reads the variable), agent-mcp-paths creates it 0700 and
+    checks it apart from the repository, the agent home and the share; the old directory is named nowhere.
+    """
+    stack_dir = f'{host.root}/.local/share/{STACK_DIR_NAME}'
+    printed = _dry_run_without_stack_dir(host, 'agent-mcp-up')
+    assert f'AGENT_MCP_STACK_DIR="{stack_dir}"' in printed, printed
+    assert f'mkdir -p -m 0700 "{stack_dir}"' in printed, printed
+    assert f'stack=$(realpath "{stack_dir}")' in printed, printed
+    assert OLD_STACK_DIR_NAME not in printed, printed
+
+
+@pytest.mark.parametrize('target', ['agent-mcp-up', 'agent-mcp-rebuild', 'agent-mcp-down', 'agent-mcp-paths'])
+def test_every_mcp_target_dry_runs_and_never_names_the_old_stack_dir(host: Host, target: str):
+    """Each MCP target tj-iee6sn.27 touched parses under make -n, and none expands to the retired directory."""
+    printed = _dry_run_without_stack_dir(host, target)
+    assert OLD_STACK_DIR_NAME not in printed, printed
+    assert OLD_STACK_DIR_NAME not in MAKEFILE.read_text(encoding='utf-8')
+
+
+def _dry_run_without_stack_dir(host: Host, target: str) -> str:
+    """`make -n TARGET` with the other three host paths given and AGENT_MCP_STACK_DIR left to its default."""
+    result = _make(
+        host,
+        '-n',
+        target,
+        f'AGENT_MCP_REPO_HOST_PATH={host.repo}',
+        f'AGENT_HOME_PATH={host.home}',
+        f'AGENT_MCP_SHARE_PATH={host.share}',
+        paths=False,
+        XDG_DATA_HOME=None,
+        AGENT_MCP_STACK_DIR=None,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
 # --- (d), P9: the initializeCommand's MCP step and its networks ------------------------------------
 
 

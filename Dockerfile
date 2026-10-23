@@ -1,7 +1,7 @@
 # EXTERNAL IMAGES ARE DIGEST-PINNED (ADR tj-4rr0la addenda 13-14). Every FROM and COPY --from that
 # names a registry image is tag@sha256:<multi-arch INDEX digest> -- the manifest list, not one
-# platform's manifest -- and tools/agent_mcp/stack.py BASE_IMAGES lists exactly these refs. The agent
-# stack builds this file from inside agent_mcp, which has no egress: the MCP has the DAEMON pull each
+# platform's manifest -- and tools/agent_mcp/stack.py BASE_IMAGES lists exactly these refs. The MCP
+# drives builds of this file from inside agent_mcp, which has no egress: the MCP has the DAEMON pull each
 # ref first, because buildx would otherwise fetch the registry token itself and fail. A digest bump
 # (Dependabot's docker entry, or by hand) updates BASE_IMAGES in the same change.
 # Digests taken 2026-10-01 from the registry API (the Docker-Content-Digest of the tag's index):
@@ -246,9 +246,9 @@ CMD ["/code/entrypoint.sh"]
 # very bottom and only that one layer is rebuilt.
 #
 # WHEN IT IS EMPTY, AND WHAT EMPTY MEANS. docker-compose.yaml interpolates the value from the
-# environment of whoever runs the build, which the Makefile's prod-build and dev-build set. A
-# build started any other way -- the agent stack, CI, a bare `docker compose build` -- leaves it
-# unset, and compose then passes an empty string. Compose cannot omit a mapping-form build arg, so
+# environment of whoever runs the build, which the Makefile's prod-build, dev-build and test-build set, and so do the MCP's
+# build, up and test_build. A build started any other way -- CI, a bare `docker compose build` --
+# leaves it unset, and compose then passes an empty string. Compose cannot omit a mapping-form build arg, so
 # the label is always present and the EMPTY VALUE is what says "unstamped"; an image built before
 # this change has no such label key at all. THE CONTRACT WITH tj-ymsobh IS THEREFORE: the stamp is
 # trustworthy only when the label exists AND matches ^[0-9a-f]{64}$. A missing key and an empty

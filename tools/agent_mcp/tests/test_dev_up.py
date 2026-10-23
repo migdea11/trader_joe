@@ -1,14 +1,14 @@
-"""dev_up, the file-based STATE-CHANGING `make dev-up` over the user's dev project (bead tj-iee6sn.9).
+"""up, the file-based STATE-CHANGING `make dev-up` over the user's dev project (bead tj-iee6sn.9).
 
 Design checked against: the architect's 17:02 UTC consolidated note on tj-iee6sn.9 (it wins over the
 description and the earlier notes, restating the 04:31 amendment and the 14:59 F9 wrapper), owner
 rulings D1, D3, D5 and D8 on tj-iee6sn.1, and ADR tj-4rr0la addenda 22-24 (addendum 23 (3): the secret).
-dev_up is a PLAIN call (D8, 600 s, no job). Order, a refusal at any point running nothing after it and
+up is a PLAIN call (D8, 600 s, no job). Order, a refusal at any point running nothing after it and
 charging nothing, and a failure before the down never stopping anything:
 
     D7 guard -> S6 stale copies -> D6 bind-source symlinks -> D5 env-file preflight -> the steering
     walk (the label-only down passes no -f, so compose searches the stack directory and its parents)
-    -> generated-code freshness -> one `docker image inspect` per :dev image (missing: 'call dev_build')
+    -> generated-code freshness -> one `docker image inspect` per :dev image (missing: 'call build')
     -> ONE budget charge -> the two trusted digests (a failure returns BEFORE the down) -> the
     label-only `docker compose -p trader_joe down` -> devnet inspect, else create, else inspect again
     -> the bases (the up can build) -> the file-based up of postgres and the three apps, run by the
@@ -97,7 +97,7 @@ UP_ENV = (*PINNED_ENV, ('SOURCE_DIGEST_DATA_STORE', STORE_DIGEST), ('SOURCE_DIGE
 OK_MESSAGE = 'the trader_joe project was stopped and postgres, data_store, data_ingest and web are up and healthy'
 DOWN_FAILED = 'compose down failed for the trader_joe project; nothing was started'
 NETWORK_FAILED = 'the trader_joe_devnet network could not be created; the project is down'
-UP_FAILED = 'compose up failed for the trader_joe project; see the steps and dev_logs'
+UP_FAILED = 'compose up failed for the trader_joe project; see the steps and call logs'
 BUDGET_REFUSAL = '12 state-changing dev verbs in the last hour is the budget; wait, or run the make target yourself'
 STALE_PREFIX = 'the MCP image is stale: '
 GENERATE_HINT = 'run make proto gen-proto-ts in the root checkout'
@@ -146,7 +146,7 @@ def full_run(host: Path) -> list[tuple[str, ...]]:
 
 
 class Responder:
-    """The fake daemon of a dev_up: each step's answer is a field the test can change."""
+    """The fake daemon of an up call: each step's answer is a field the test can change."""
 
     def __init__(self) -> None:
         self.guard: tuple[int, bytes] = (0, b'')
@@ -189,7 +189,7 @@ def _rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Rig, Responde
 
 
 def _call(rig: Rig, arguments: Any = None) -> dict[str, Any]:
-    return rig.call('dev_up', {} if arguments is None else arguments)
+    return rig.call('up', {} if arguments is None else arguments)
 
 
 def _argvs(rig: Rig) -> list[tuple[str, ...]]:
@@ -357,7 +357,7 @@ def _missing_image(index: int):
 
 
 def _image_refusal(index: int) -> str:
-    return f'the image {DEV_IMAGES[index]} is not on the daemon: call dev_build first'
+    return f'the image {DEV_IMAGES[index]} is not on the daemon: call build first'
 
 
 # name -> (break it, the refusal message, how many steps ran: the guard plus the inspects up to it)
@@ -538,7 +538,7 @@ def test_a_failed_base_pull_stops_nothing_and_starts_nothing(
     result = _call(rig)
     assert result['status'] == 'failed', result
     assert result['message'] == (
-        f'dev_up stopped: base image {ref} is not on the daemon and could not be pulled; nothing was built'
+        f'up stopped: base image {ref} is not on the daemon and could not be pulled; nothing was built'
     )
     host = rig.layout.repo_host_path
     assert _argvs(rig) == [*before_bases(host), *base_inspects()[:failing], image_inspect(ref), (DOCKER, 'pull', ref)]
@@ -868,17 +868,17 @@ def test_a_second_dev_up_while_one_runs_is_told_busy_and_runs_nothing(tmp_path: 
     rig.docker.hook = hold
 
     async def scenario() -> tuple[dict, dict, dict]:
-        first = asyncio.create_task(rig.agent.call('dev_up', {}))
+        first = asyncio.create_task(rig.agent.call('up', {}))
         await asyncio.wait_for(entered.wait(), 10)
-        again = await rig.agent.call('dev_up', {})
-        down = await rig.agent.call('dev_down', {})
+        again = await rig.agent.call('up', {})
+        down = await rig.agent.call('down', {})
         release.set()
         return await first, again, down
 
     first, again, down = asyncio.run(scenario())
     assert first['status'] == 'ok', first
     for other in (again, down):
-        assert other['status'] == 'busy' and 'dev_up is running' in other['message'], other
+        assert other['status'] == 'busy' and 'up is running' in other['message'], other
         assert other['steps'] == []
     assert _argvs(rig).count(DOWN) == 1 and _argvs(rig).count(GUARD) == 1
     assert _charges_left(rig) == BUDGET - 1
@@ -890,7 +890,7 @@ def test_a_second_dev_up_while_one_runs_is_told_busy_and_runs_nothing(tmp_path: 
 
 
 def test_the_schema_is_closed_and_takes_nothing():
-    assert runner.VERB_SCHEMAS['dev_up'] == {
+    assert runner.VERB_SCHEMAS['up'] == {
         'type': 'object',
         'properties': {},
         'required': [],
@@ -908,17 +908,17 @@ def test_any_argument_is_refused_with_no_step_and_no_charge(tmp_path: Path, monk
 
 
 def test_the_timeout_is_ten_minutes_inside_the_clients():
-    assert runner.VERB_TIMEOUT_SECONDS['dev_up'] == 600
+    assert runner.VERB_TIMEOUT_SECONDS['up'] == 600
     config = json.loads((REPO_ROOT / '.mcp.json').read_text(encoding='utf-8'))
     assert config['mcpServers']['agent-stack']['timeout'] >= (600 + 30) * 1000
 
 
 def test_dev_up_is_on_the_tool_list_saying_what_it_stops_and_that_it_never_builds():
     agent = runner.AgentStack(settings=None)  # type: ignore[arg-type] -- only the verb table is read
-    assert 'dev_up' in agent.verbs
-    text = agent.describe('dev_up')
+    assert 'up' in agent.verbs
+    text = agent.describe('up')
     assert 'STATE-CHANGING' in text and 'docker compose -p trader_joe down' in text, text
-    assert 'never builds' in text and 'call dev_build' in text, text
+    assert 'never builds' in text and 'call build' in text, text
     assert 'never removes a volume or an image' in text, text
 
 
@@ -943,7 +943,7 @@ def test_the_up_is_make_dev_ups_up_line_exactly():
     words = shlex.split(lines[1])
     assert words[0] == '$(DEV_COMPOSE)', words
     assert tuple(words[1:]) == UP_TAIL == stack.DEV_UP_TAIL
-    # dev_up's compose files are make's DEV_COMPOSE list plus the MCP-only overlay, last.
+    # up's compose files are make's DEV_COMPOSE list plus the MCP-only overlay, last.
     make_files = [
         value for flag, value in itertools.pairwise(shlex.split(_make_variable('DEV_COMPOSE'))) if flag == '-f'
     ]

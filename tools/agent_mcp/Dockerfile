@@ -92,17 +92,16 @@ COPY tools/agent_mcp/*.py /opt/agent_mcp/tools/agent_mcp/
 # THE TRUSTED COMPOSE FILES (stack.TRUSTED_COMPOSE_DIR): the -f list the verbs pass, taken from the
 # checkout the image is built from, never from an agent's worktree at run time. A compose change
 # reaches the MCP when this image is rebuilt (make agent-mcp-up).
-COPY docker-compose.yaml docker-compose.test-client.yaml docker-compose.agent-stack.yaml docker-compose.fake.yaml \
-    /opt/agent_mcp/compose/
+COPY docker-compose.yaml docker-compose.test-client.yaml docker-compose.fake.yaml /opt/agent_mcp/compose/
 # THE TRUSTED DOCKERFILE (stack.TRUSTED_DOCKERFILE; ADR tj-4rr0la addendum 5, ruling 2): the service
-# Dockerfile, which docker-compose.agent-stack.yaml names as build.dockerfile for every service it
-# builds, so the worktree's own Dockerfile is never read and FROM / COPY --from cannot reach other
-# images on the host daemon. Same rebuild rule as the compose files.
+# Dockerfile, which the MCP-only overlays below (docker-compose.agent-dev.yaml, -test.yaml and -client.yaml)
+# name as build.dockerfile for what they build, so the worktree's own Dockerfile is never read and
+# FROM / COPY --from cannot reach other images on the host daemon. Same rebuild rule as the compose files.
 COPY Dockerfile /opt/agent_mcp/compose/Dockerfile
 # THE TRUSTED COPIES FOR THE USER'S DEV PROJECT (stack.DEV_COMPOSE_FILES; ADR tj-4rr0la addendum 23,
 # epic tj-iee6sn). The dev set's -f list: the base file (copied above), the override, the web prod
 # and web dev files, and the MCP-only overlay that points build.dockerfile at the trusted Dockerfile
-# above. docker-compose.tools.yaml (pgAdmin) is for dev_tools. Nothing from the checkout's own files
+# above. docker-compose.tools.yaml (pgAdmin) is for tools. Nothing from the checkout's own files
 # is ever passed to compose.
 COPY docker-compose.override.yaml docker-compose.web.yaml docker-compose.web.dev.yaml \
     docker-compose.agent-dev.yaml docker-compose.tools.yaml /opt/agent_mcp/compose/

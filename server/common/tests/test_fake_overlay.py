@@ -3,10 +3,11 @@
 tj-vhboky.61 (FB-4a). Design: decision tj-j4wknb R4 -- no test instrumentation in production; a
 test-only launcher in tests/fakes; a fake-mode compose overlay mounts the test tree read-only into
 data_ingest and swaps its command; the prod image holds no fakes -- with the architect's 01:55 UTC
-ruling on tj-irhy0a.8 (one worker, literal) and ADR tj-4rr0la addenda 3 (3) and 5 (the agent stack
-loads the overlay LAST; tests/fakes is snapshot-sourced and mounted :ro). The agent stack's file list
-and the MCP image's copy of the overlay are pinned beside the other MCP pins
-(test_agent_stack_compose.py, tools/agent_mcp/tests/test_commands.py).
+ruling on tj-irhy0a.8 (one worker, literal) and ADR tj-4rr0la addenda 3 (3) and 5 (no file loaded
+after the overlay undoes it; tests/fakes is mounted :ro). The separate agent stack is retired (addenda
+26-27; tj-iee6sn.27): EVERY file set allowed to load the overlay is enumerated, exactly, by
+test_agent_stack_files_retired.py, and the MCP image's copy of the overlay is pinned beside the other
+MCP pins (tools/agent_mcp/tests/test_dev_guards.py).
 
 Docker-free, like every build_infra pin: the compose files are read with yaml.safe_load and merged by
 compose_model, and make runs for real with `docker` stubbed first on PATH. What only a daemon can show
@@ -21,16 +22,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from common.tests.compose_model import (
-    BASE_FILE,
-    FAKE_FILE,
-    agent_stack_model,
-    interpolate,
-    load,
-    prod_model,
-    system_model,
-    volume,
-)
+from common.tests.compose_model import BASE_FILE, FAKE_FILE, interpolate, load, merge, prod_model, system_model, volume
 from common.tests.test_ci_invariants import (
     _ACCEPTED_GUARDS,
     _REFUSED_GUARDS,
@@ -47,6 +39,7 @@ from common.tests.test_ci_invariants import (
     _run_make,
     _subprocess_env,
 )
+from common.tests.test_service_pythonpath import _launch_sets
 
 
 pytestmark = pytest.mark.build_infra
@@ -82,7 +75,8 @@ TEST_IMAGES = {'data_store': 'trader_joe_data_store:test', 'data_ingest': 'trade
 PROD_IMAGES = {'data_store': 'trader_joe_data_store:latest', 'data_ingest': 'trader_joe_data_ingest:latest'}
 TEST_BUILD = 'test-build'
 # The sets that must never run a fake: the prod, dev and tools stacks, and everything else the
-# Makefile starts. SYSTEM_COMPOSE and AGENT_STACK_COMPOSE are the only two that load the overlay.
+# Makefile starts. SYSTEM_COMPOSE is the only Makefile assignment that names the overlay (SEED_DUMP_COMPOSE
+# reaches it through $(SYSTEM_COMPOSE)); the retired agent-stack set was the other (tj-iee6sn.27).
 NON_FAKE_VARIABLES = (
     'PROD_COMPOSE',
     'PROD_UP',
@@ -92,7 +86,7 @@ NON_FAKE_VARIABLES = (
     'AGENT_COMPOSE',
     'AGENT_MCP_COMPOSE',
 )
-FAKE_LOADING_VARIABLES = frozenset({'SYSTEM_COMPOSE', 'AGENT_STACK_COMPOSE'})
+FAKE_LOADING_VARIABLES = frozenset({'SYSTEM_COMPOSE'})
 
 DOCKER_STUB = """#!/bin/sh
 printf '%s\\n' "$*" >> "$STUB_LOG"
@@ -214,12 +208,29 @@ def test_the_system_stack_is_prod_but_for_the_test_tags_and_data_ingest_mount_co
         assert (service['image'], prod_service['image']) == (TEST_IMAGES[name], PROD_IMAGES[name]), name
 
 
-def test_the_agent_stack_runs_the_fake_because_the_overlay_is_last():
-    """Addendum 3 (3): no earlier file can undo the swap -- the merged agent model runs the launcher."""
-    ingest = agent_stack_model()['services']['data_ingest']
-    assert ingest['command'] == _fake_ingest()['command']
-    assert FAKE_MOUNT in [volume(entry) for entry in ingest['volumes']]
-    assert {name: ingest['environment'][name] for name in _credential_vars()} == dict.fromkeys(_credential_vars(), '')
+def _fake_loading_sets() -> dict[str, tuple[Path, ...]]:
+    """Every file set that loads the overlay, read from where each is spelled (test_service_pythonpath's reader)."""
+    return {label: files for label, files in _launch_sets().items() if FAKE_FILE in files}
+
+
+def test_every_set_that_loads_the_overlay_runs_the_fake():
+    """Addendum 3 (3), re-pointed by tj-iee6sn.27 from the retired agent-stack model to every fake-loading set.
+
+    No file in a set, before the overlay or after it (the test client, the MCP's build overlay), undoes the
+    swap: the merged data_ingest runs the launcher, mounts the fakes read-only and has the broker keys
+    blank, in make system-launch's, make seed-dump's, the MCP's test_up and test_build sets,
+    run_migrations.sh's TEST definition and CI's. Which sets those are is enumerated exactly by
+    test_agent_stack_files_retired.py; this asserts what each of them runs.
+    """
+    sets = _fake_loading_sets()
+    assert len(sets) >= 4, f'found only {sorted(sets)}; a parsing slip must not empty this check'
+    for label, files in sets.items():
+        ingest = merge([load(path) for path in files])['services']['data_ingest']
+        assert ingest['command'] == _fake_ingest()['command'], label
+        assert FAKE_MOUNT in [volume(entry) for entry in ingest['volumes']], label
+        keys = {name: ingest['environment'][name] for name in _credential_vars()}
+        assert keys == dict.fromkeys(_credential_vars(), ''), label
+        assert ingest['image'] == TEST_IMAGES['data_ingest'], label
 
 
 # --- who loads the overlay ------------------------------------------------------------------------
@@ -230,7 +241,7 @@ def test_system_compose_is_the_base_file_then_the_overlay_in_the_default_project
 
     No -p: the default project, as TEST_CLIENT_COMPOSE has, so `make test-system` after `make
     system-launch` joins the fake stack's networks. Never the dev override, the test client, the
-    agent-stack or MCP files, or the tools file.
+    MCP's files, or the tools file.
     """
     env = _subprocess_env()
     expanded = _expanded_make_variable('SYSTEM_COMPOSE', REPO_ROOT, env)
@@ -251,8 +262,11 @@ def _makefile_code_lines() -> list[str]:
     return [line for line in text.splitlines() if not line.lstrip().startswith('#')]
 
 
-def test_only_system_compose_and_the_agent_stack_name_the_overlay_in_the_makefile():
-    """Every Makefile line that names the file is one of the two assignments; any new one goes red."""
+def test_only_system_compose_names_the_overlay_in_the_makefile():
+    """Every Makefile line that names the file is the one assignment; any new one goes red.
+
+    tj-iee6sn.27 re-pin: the second assignment, the retired agent-stack set, is gone.
+    """
     naming = {line.split(':=')[0].strip() for line in _makefile_code_lines() if FAKE_FILE.name in line}
     assert naming == FAKE_LOADING_VARIABLES, f'Makefile lines naming {FAKE_FILE.name}: {naming}'
 

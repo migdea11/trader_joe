@@ -147,8 +147,8 @@ def test_the_seed_dump_stack_adds_no_writable_bind_and_test_client_has_none():
     client), the writable binds are exactly the fake stack's own (system-launch's model), none of
     them test_client's.
 
-    The agent stack's O1 (no service built from agent source has a writable bind) is pinned on the
-    merged agent model in test_agent_stack_compose.py, which loads the same test-client file.
+    The retired agent stack's O1 (no service built from agent source has a writable bind) went with
+    test_agent_stack_compose.py (tj-iee6sn.27); this set, which the MCP's seed_dump mirrors, is pinned here.
     """
     model = merge([load(BASE_FILE), load(FAKE_FILE), load(TEST_CLIENT_FILE)])
     without_client = merge([load(BASE_FILE), load(FAKE_FILE)])

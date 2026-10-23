@@ -1,6 +1,6 @@
 """The dev-project plumbing the file-based dev verbs stand on (tj-iee6sn.5; ADR tj-4rr0la addendum 23).
 
-No verb uses these yet; the later beads' mirror tests (B5 dev_build, B6 dev_up, B8 dev_tools) take
+No verb uses these yet; the later beads' mirror tests (B5 build, B6 up, B8 tools) take
 them as given, so what is pinned here is that they agree with the Makefile and with the MCP image:
 
   * stack.DEV_COMPOSE_FILES is the Makefile's DEV_COMPOSE -f list, in its order, then the MCP-only
@@ -149,7 +149,11 @@ def test_no_makefile_line_and_no_compose_set_loads_the_overlay():
     """MCP-only: its dockerfile path exists only inside the MCP image, so loading it anywhere else fails."""
     code = [line for line in MAKEFILE.read_text(encoding='utf-8').splitlines() if not line.lstrip().startswith('#')]
     assert not [line for line in code if OVERLAY_NAME in line], 'a Makefile line names the MCP-only overlay'
-    assert OVERLAY_NAME not in stack.COMPOSE_FILES, stack.COMPOSE_FILES
+    # Within the MCP, only the two dev sets load it; test mode's and the client's never do (re-pointed from
+    # the retired agent-stack COMPOSE_FILES, tj-iee6sn.21).
+    for files in (stack.TEST_COMPOSE_FILES, stack.TEST_BUILD_COMPOSE_FILES, stack.SYSTEM_CLIENT_COMPOSE_FILES):
+        assert OVERLAY_NAME not in files, files
+    assert OVERLAY_NAME in stack.DEV_COMPOSE_FILES and OVERLAY_NAME in stack.DEV_TOOLS_COMPOSE_FILES
 
 
 # --- make dev-up and make dev-logs -------------------------------------------------------------------
@@ -158,7 +162,7 @@ def test_no_makefile_line_and_no_compose_set_loads_the_overlay():
 def test_dev_up_downs_the_dev_project_then_ups_postgres_and_the_apps_detached():
     """R6: the two lines, exactly, in this order: the down runs BEFORE the up.
 
-    Exact, so the B6 mirror test has one spelling to compare dev_up's steps against, and so an option
+    Exact, so the B6 mirror test has one spelling to compare up's steps against, and so an option
     added to either line is red here before anything else sees it.
     """
     recipe = _make_recipe('dev-up')

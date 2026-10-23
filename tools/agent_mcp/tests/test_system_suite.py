@@ -8,7 +8,7 @@ the paths (spelling, then git); the mode guard, TEST only; the S6 stale-copy che
 preflight; the postgres data mount (one lookup, then ONE fixed inspect, accepted only when its source is
 <repo host path>/volume_data/test/postgres); a running data_store (the builder's deviation 2), the two
 digests and the stamp of every running data_store and data_ingest container; then the snapshot and its
-checks, and ONE budget charge. THE CLIENT: dev_up's secret wrapper around `docker compose -p trader_joe
+checks, and ONE budget charge. THE CLIENT: up's secret wrapper around `docker compose -p trader_joe
 --project-directory <snapshot> --env-file <repo host path>/.env` and three trusted files, the third an
 MCP-only overlay that sets test_client's build.dockerfile alone. check_testclient_argv admits only the
 three client tails, and the dev lifecycle check refuses that prefix.
@@ -613,15 +613,16 @@ _REFUSED_PREFIXES = {
     'no client overlay': _prefix_with(CLIENT_FILES[:2]),
     'the fake file added': _prefix_with((*CLIENT_FILES, 'docker-compose.fake.yaml')),
     'the overlay first': _prefix_with((CLIENT_FILES[2], *CLIENT_FILES[:2])),
-    'the agent-stack overlay': _prefix_with((*CLIENT_FILES[:2], 'docker-compose.agent-stack.yaml')),
+    # The retired overlay's name (tj-iee6sn.27), which no longer exists, in place of the client overlay.
+    'the retired agent-stack overlay': _prefix_with((*CLIENT_FILES[:2], 'docker-compose.agent-stack.yaml')),
     'the root checkout as project directory': _prefix_with(CLIENT_FILES, project_dir='/home/u/trader_joe'),
     'the worktree as project directory': _prefix_with(
         CLIENT_FILES, project_dir='/home/u/trader_joe/.claude/worktrees/wt'
     ),
     'another env file': _prefix_with(CLIENT_FILES, env_file='/stack/source/.env'),
-    'the agent stack env': _prefix_with(CLIENT_FILES, env_file='/stack/agent_stack.env'),
+    'the retired agent stack env': _prefix_with(CLIENT_FILES, env_file='/stack/agent_stack.env'),
     'no env file': [w for w in _prefix_with(CLIENT_FILES) if w not in ('--env-file', '/home/u/trader_joe/.env')],
-    'the agent stack project': [
+    'the retired agent stack project': [
         '/usr/local/bin/docker',
         'compose',
         '-p',
@@ -641,7 +642,7 @@ WRAPPER_REFUSAL = 'a client command has no shell wrapper: the secret is read fro
 
 
 def _wrapper_head() -> list[str]:
-    """dev_up's six wrapper words, spelled here: the form the client command must never take (5a38b7f)."""
+    """The up verb's six wrapper words, spelled here: the form the client command must never take (5a38b7f)."""
     return ['sh', '-c', stack.DEV_UP_WRAPPER_SCRIPT, 'sh', f'{TRUSTED}/tools/dev_instance_secret.sh', f'{HOST}/.env']
 
 

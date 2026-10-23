@@ -13,11 +13,10 @@ services:
       # loopback publish for psql lives in docker-compose.override.yaml, with devnet.
       - store_db
     # Every service's env files read ROOT_ENV_FILE, STORE_ENV_FILE and INGEST_ENV_FILE, defaulting
-    # to the paths they always had, so the isolated agent stack (docker-compose.agent-stack.yaml,
-    # ADR tj-4rr0la addendum 2) can point its services at its own generated, credential-free files
-    # outside the repository instead of the user's. Nothing but the agent stack's generated env sets
-    # them: unset, as in every .env, this renders exactly as before. Short form on purpose -- a
-    # missing env file still stops compose.
+    # to the paths they always had. Unset, as in every .env, this renders exactly as it always has. The
+    # MCP pins them to these same defaults for the verbs that start services, and to /dev/null for
+    # its builds and the system-test client (tools/agent_mcp/stack.py, _DEV_ENV_FILE_VARIABLES).
+    # Short form on purpose -- a missing env file still stops compose.
     env_file:
       - ${ROOT_ENV_FILE:-.env}
       - ${STORE_ENV_FILE:-./server/data/store/.env}
@@ -56,9 +55,9 @@ services:
         # records as the trader_joe.source.digest label so migrate-check can tell a stale image
         # from a fresh one without starting a container.
         #
-        # Compose interpolates this from the environment of whoever runs the build, and only the
-        # Makefile's prod-build and dev-build set it. Every other build path -- the agent stack,
-        # CI, a bare `docker compose build` -- leaves it unset and gets the ":-" empty string,
+        # Compose interpolates this from the environment of whoever runs the build, and the
+        # Makefile's prod-build, dev-build and test-build set it, as do the MCP's build, up and
+        # test_build. Every other build path -- CI, a bare `docker compose build` -- leaves it unset and gets the ":-" empty string,
         # which still produces a usable image, just an unstamped one. The variable is per service
         # because data_store and data_ingest COPY different app directories and so have different
         # digests; one shared variable would stamp each image with the other's source.
@@ -201,9 +200,8 @@ services:
       # Where the gRPC server listens (common.rpc BindAddress.from_env, which has no default and
       # fails at startup when either is unset). Set here, in the base file, not only in
       # .env.default: every launch loads this file, and environment: outranks env_file:, so no
-      # env file can move the listener. The agent stack's env files are generated once and never
-      # regenerated, and a user's .env predates these variables, so a value in .env.default
-      # alone would reach neither. The :-50051 fallback serves those same older env files; it is
+      # env file can move the listener. A user's .env predates these variables, so a value in
+      # .env.default alone would not reach it. The :-50051 fallback serves those same older env files; it is
       # the real in-network port, so falling back never puts the listener where the peer cannot
       # reach it. The host is literal: the alias above, never an env-file value.
       APP_INTERNAL_GRPC_HOST: data-ingest-grpc
@@ -283,9 +281,8 @@ services:
 #
 # store_api has a fixed name so another compose project (a strategy stack, the private repo's
 # clients) can declare it external and join it. The other three keep compose's project prefix.
-# The name reads STORE_API_NETWORK, defaulting to trader_joe_store_api, so the isolated agent stack
-# (docker-compose.agent-stack.yaml, ADR tj-4rr0la) can run beside this one without joining its
-# store_api. Nothing else sets it: unset, as in every .env, this renders exactly as before.
+# The name reads STORE_API_NETWORK, defaulting to trader_joe_store_api. Nothing in the repository
+# sets it now: unset, as in every .env, this renders exactly as it always has.
 #
 # Dev adds one more, devnet, in docker-compose.override.yaml only. PROD_COMPOSE never loads that
 # file, so a prod launch never attaches devnet.

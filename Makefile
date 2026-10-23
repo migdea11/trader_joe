@@ -303,7 +303,7 @@ errors-doc: $(VENV_MARKER)  ## Regenerate docs/errors.md from server/common/erro
 # docker-compose.web.dev.yaml, which turns the same service into the Vite dev server with hot reload
 # from the bind-mounted ./web/src. Both publish the one loopback port WEB_PORT (default 8088): only one
 # stack runs at a time, and a dev session never runs beside prod on the same machine anyway. The
-# agent stack never loads either file, and the base file never gains the service. The overlay's
+# MCP's own project never loads either file, and the base file never gains the service. The overlay's
 # INSTANCE_WRITE_SECRET carries a ":?" guard like POSTGRES_PASS, so every command through PROD_COMPOSE
 # needs it in the root .env or the shell; prod-down passes a placeholder the way dev-down does for
 # pgAdmin, for the same reason. DEV_COMPOSE and TOOLS_COMPOSE are not required to have it set
@@ -325,21 +325,6 @@ PROD_COMPOSE := docker compose -f docker-compose.yaml -f docker-compose.web.yaml
 # which is also what keeps a dev session off a prod stack on the same machine.
 DEV_COMPOSE := INSTANCE_WRITE_SECRET="$$(sh tools/dev_instance_secret.sh)" docker compose -f docker-compose.yaml -f docker-compose.override.yaml -f docker-compose.web.yaml -f docker-compose.web.dev.yaml
 TOOLS_COMPOSE := $(DEV_COMPOSE) -f docker-compose.tools.yaml
-# THE AGENT STACK (ADR tj-4rr0la section 1 and addendum 1). The isolated stack the agent-stack MCP
-# drives from an agent's worktree, under its own compose project so it never shares a container,
-# network or volume with the stack prod-launch or the dev targets start (both use the default
-# project, the checkout's directory name). The base file, the test client, then
-# docker-compose.agent-stack.yaml so its names and image tags win over both, then the fake-mode
-# overlay docker-compose.fake.yaml AFTER it (tj-vhboky.61; ADR tj-4rr0la addendum 3 (3)), so the
-# agent stack's data_ingest always runs on FakeRead -- it has no egress and no broker key anyway,
-# and the fake overlay touches nothing the agent-stack overlay sets. The server passes its
-# generated env file as well, never the user's .env, and that env also points the services' env
-# files outside the repository (ROOT_ENV_FILE, STORE_ENV_FILE, INGEST_ENV_FILE; addendum 2). No
-# target here uses these: the MCP server is their only reader. And the mirror of the rule above:
-# PROD_COMPOSE, DEV_COMPOSE and TOOLS_COMPOSE never load the agent-stack overlay, and this set
-# never loads the dev override or the tools file -- no devnet, no publish.
-AGENT_STACK_PROJECT := trader_joe_agent_stack
-AGENT_STACK_COMPOSE := docker compose -p $(AGENT_STACK_PROJECT) -f docker-compose.yaml -f docker-compose.test-client.yaml -f docker-compose.agent-stack.yaml -f docker-compose.fake.yaml
 
 # The dev network: an ordinary bridge (NOT internal) owned by neither compose project, which the
 # dev stack, pgAdmin and the agent devcontainer all join, so either side can start first. Its
@@ -577,7 +562,7 @@ dev-launch: dev-deps  ## Start the development services in the foreground, with 
 	$(DEV_COMPOSE) up data_store data_ingest web
 
 # Detached, for a caller that must get its terminal back (tj-iee6sn.5, ADR tj-4rr0la addendum 23
-# (2), owner ruling R6). The agent-stack MCP's dev_up runs this recipe's up with the same flags and
+# (2), owner ruling R6). The agent-stack MCP's up verb runs this recipe's up with the same flags and
 # services, through its own prefix; its down matches this one in effect, not in spelling (below). It
 # brings the dev project DOWN first, so there is never more than one instance of it: compose allows
 # one container per service per project, and a make dev-launch still attached in a terminal would
@@ -757,10 +742,11 @@ AGENT_MCP_NETWORK := trader_joe_agent_mcp
 # and the MCP project's own --project-directory. Recursive (=), so git runs only when an MCP recipe
 # expands it, never on `make test`.
 AGENT_MCP_REPO_HOST_PATH = $(patsubst %/.git,%,$(shell git rev-parse --path-format=absolute --git-common-dir))
-# The agent stack's own directory, outside the repository, AGENT_HOME_PATH and the share directory
-# (agent-mcp-paths refuses otherwise): generated env files, data, snapshot, audit log.
+# The MCP's own directory, outside the repository, AGENT_HOME_PATH and the share directory
+# (agent-mcp-paths refuses otherwise): the snapshot, the audit log and the MCP's other state. Named
+# like the MCP's project and network (trader_joe_agent_mcp); an owner who set the variable is unaffected.
 # tools/agent_mcp/settings.py documents it.
-AGENT_MCP_STACK_DIR ?= $(or $(XDG_DATA_HOME),$(HOME)/.local/share)/trader_joe_agent_stack
+AGENT_MCP_STACK_DIR ?= $(or $(XDG_DATA_HOME),$(HOME)/.local/share)/trader_joe_agent_mcp
 AGENT_MCP_COMPOSE = AGENT_MCP_REPO_HOST_PATH="$(AGENT_MCP_REPO_HOST_PATH)" \
 	AGENT_MCP_STACK_DIR="$(AGENT_MCP_STACK_DIR)" AGENT_MCP_SHARE_PATH="$(AGENT_MCP_SHARE_PATH)" \
 	AGENT_MCP_UID="$$(id -u)" AGENT_MCP_GID="$$(id -g)" \
@@ -896,10 +882,9 @@ agent-mcp-rebuild: agent-mcp-network agent-mcp-paths  ## Rebuild and recreate th
 
 # STOPS the MCP and its proxy and KEEPS the containers (addendum 9 (a)), so the next plain start
 # re-reads no compose file. `docker stop` by label, like the start: no compose file read here either.
-# The agent STACK the MCP drives is a separate project: stop it first with the stack_down verb (or
-# leave it; it keeps its data). The external network stays.
+# The external network stays. The dev project the MCP drives is not touched.
 .PHONY: agent-mcp-down
-agent-mcp-down:  ## Stop (not remove) the agent-stack MCP and its socket proxy (the agent stack itself: stack_down verb)
+agent-mcp-down:  ## Stop (not remove) the agent-stack MCP and its socket proxy only
 	@ids="$$($(call AGENT_MCP_CONTAINER,agent_mcp)) $$($(call AGENT_MCP_CONTAINER,socket_proxy))"; \
 	[ -z "$$(echo $$ids)" ] || docker stop $$ids > /dev/null
 
@@ -1699,8 +1684,8 @@ test-system:  ## Run tests/system from the test_client container against an up, 
 # migrate, then make test-system.
 #
 # PROD_COMPOSE never loads the fake-mode overlay, just as it never loads the dev override: the prod
-# image holds no fakes, and the only way a fake reaches a running service is this file list (or the
-# agent stack's, AGENT_STACK_COMPOSE).
+# image holds no fakes, and the only way a fake reaches a running service is a test-mode file list
+# (this one, run_migrations.sh's TEST definition, or the MCP's test-mode sets).
 #
 # THE TEST DATA DIR (ADR tj-4rr0la addendum 26 (3)). SYSTEM_COMPOSE sets DATA_DIR on the command line,
 # which outranks .env, so system-launch and seed-dump put postgres on ./volume_data/test and never

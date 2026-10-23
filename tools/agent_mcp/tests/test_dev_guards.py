@@ -1,6 +1,6 @@
 """The dev lifecycle's checks (tj-iee6sn.6; ADR tj-4rr0la addendum 23; owner rulings D5-D7 on tj-iee6sn.1).
 
-The verbs (B4 dev_down/dev_restart, B5 dev_build, B6 dev_up, B7 migrate, B8 dev_tools) come with
+The verbs (B4 down/restart, B5 build, B6 up, B7 migrate, B8 tools) come with
 their own beads and their own tests; B4's, which call the guards in order, are test_dev_label_verbs.py.
 What is pinned here is each check on its own, so that gutting one turns ITS tests red (addendum 19 (A)):
 
@@ -63,7 +63,7 @@ FILE_PREFIX = [
     *(word for name in EXPECTED_DEV_COMPOSE_FILES for word in ('-f', f'{EXPECTED_TRUSTED_DIR}/{name}')),
 ]
 
-# dev_tools' prefix (tj-iee6sn.14): the dev files with the trusted docker-compose.tools.yaml inserted
+# tools' prefix (tj-iee6sn.14): the dev files with the trusted docker-compose.tools.yaml inserted
 # BEFORE the MCP-only overlay, which stays last (the Makefile's TOOLS_COMPOSE plus the overlay).
 EXPECTED_TOOLS_COMPOSE_FILES = (
     *EXPECTED_DEV_COMPOSE_FILES[:-1],
@@ -432,7 +432,7 @@ def test_the_tools_row_without_the_host_path_is_refused():
 
 
 _TOOLS_INDEX = TOOLS_PREFIX.index(f'{EXPECTED_TRUSTED_DIR}/docker-compose.tools.yaml')
-# The tools prefix with its own file moved, doubled or swapped: never the dev_tools row (tj-iee6sn.14).
+# The tools prefix with its own file moved, doubled or swapped: never the tools row (tj-iee6sn.14).
 _BAD_TOOLS_PREFIXES = {
     'the tools file after the overlay': [
         *TOOLS_PREFIX[: _TOOLS_INDEX - 1],
@@ -558,10 +558,10 @@ def test_the_agent_test_overlay_sets_only_build_dockerfile_for_the_two_test_serv
 
 
 def test_a_project_dev_tools_started_still_passes_the_prod_guard():
-    """The config_files label of a container dev_tools started classifies DEV.
+    """The config_files label of a container tools started classifies DEV.
 
-    pgAdmin's container carries the dev_tools -f list as that label; were it not DEV, the next dev verb
-    after a dev_tools would refuse the project as a prod launch.
+    pgAdmin's container carries the tools -f list as that label; were it not DEV, the next dev verb
+    after a tools would refuse the project as a prod launch.
     """
     label = ','.join(f'{EXPECTED_TRUSTED_DIR}/{name}' for name in EXPECTED_TOOLS_COMPOSE_FILES)
     assert stack.classify_config_files(label) == 'DEV'
@@ -752,16 +752,16 @@ def test_dev_and_test_containers_together_refuse_whatever_the_verb_accepts(stdou
 
 @pytest.mark.parametrize(('stdout', 'mode'), [(b'', None), (f'{DEV_LINE}\n'.encode(), 'DEV')], ids=['empty', 'dev'])
 def test_a_dev_only_verb_passes_dev_and_an_empty_project(stdout, mode):
-    assert stack.check_mode_guard(0, stdout, EXPECTED_MODES_DEV_OR_EMPTY, 'test mode is up: dev_up first') == mode
+    assert stack.check_mode_guard(0, stdout, EXPECTED_MODES_DEV_OR_EMPTY, 'test mode is up: call up first') == mode
 
 
 def test_a_dev_only_verb_refuses_test_mode_with_its_own_hint():
     for line in (TEST_LINE, MCP_TEST_LINE):
         with pytest.raises(stack.Refused) as refused:
             stack.check_mode_guard(
-                0, f'{line}\n'.encode(), EXPECTED_MODES_DEV_OR_EMPTY, 'test mode is up: dev_up first'
+                0, f'{line}\n'.encode(), EXPECTED_MODES_DEV_OR_EMPTY, 'test mode is up: call up first'
             )
-        assert str(refused.value) == 'test mode is up: dev_up first'
+        assert str(refused.value) == 'test mode is up: call up first'
 
 
 def test_a_mode_outside_the_accepted_set_without_a_hint_names_the_mode():
@@ -1190,7 +1190,7 @@ EXPECTED_STEERING = (
     # set and compose would promote. false is the classic path make dev-build takes.
     ('COMPOSE_BAKE', 'false'),
 )
-# D5 for dev_build (the 17:25 note (B)): in the PLACEHOLDER env only, COMPOSE_ENV_FILES is /dev/null,
+# D5 for build (the 17:25 note (B)): in the PLACEHOLDER env only, COMPOSE_ENV_FILES is /dev/null,
 # so compose reads no <project-dir>/.env; it overrides the shared steering value IN PLACE, once.
 EXPECTED_PLACEHOLDER_STEERING = tuple(
     (name, '/dev/null' if name == 'COMPOSE_ENV_FILES' else value) for name, value in EXPECTED_STEERING
@@ -1241,7 +1241,7 @@ def test_the_placeholder_env_names_one_env_file_set_and_it_is_dev_null():
     names = [name for name, _ in stack.dev_placeholder_step_env()]
     assert names.count('COMPOSE_ENV_FILES') == 1, names
     assert dict(stack.dev_placeholder_step_env())['COMPOSE_ENV_FILES'] == '/dev/null'
-    # Only the placeholder env: dev_up and friends let compose read the root file (D5), so '' stays.
+    # Only the placeholder env: up and friends let compose read the root file (D5), so '' stays.
     assert dict(stack.dev_pinned_step_env())['COMPOSE_ENV_FILES'] == ''
 
 
@@ -1278,7 +1278,7 @@ def test_the_placeholders_cover_every_required_variable_of_the_dev_files():
 def test_the_placeholder_container_port_is_the_committed_default():
     """APP_INTERNAL_PORT, the container port, must be .env.default's (the rest: the test below).
 
-    The services listen on the value their env file gives them, so a dev_build that interpolated a
+    The services listen on the value their env file gives them, so a build that interpolated a
     different container port would load a project whose publish entries point nowhere. A port bakes
     nothing into an image, so the committed default is the only value that is right without reading
     an env file (D5).
@@ -1288,7 +1288,7 @@ def test_the_placeholder_container_port_is_the_committed_default():
     )
     assert len(assignments) == 1, assignments
     assert dict(stack.dev_placeholder_step_env())['APP_INTERNAL_PORT'] == assignments[0].strip()
-    # Only the placeholder env: dev_up and friends read the real value from the env files.
+    # Only the placeholder env: up and friends read the real value from the env files.
     assert 'APP_INTERNAL_PORT' not in dict(stack.dev_pinned_step_env())
 
 
@@ -1365,12 +1365,11 @@ def test_an_env_file_setting_the_redirecting_variables_cannot_change_the_step_en
 # (A) on tj-iee6sn.8): every dev file the image bakes is compared, so a file a later bead bakes and S6
 # forgets turns the membership pin and its one-byte, missing and symlink cases red. EXPECTED_DEV_BAKES
 # is test_commands.py's literal list of what tj-iee6sn.5 bakes, itself pinned there against the
-# Dockerfile's COPY lines; docker-compose.yaml and the Dockerfile are baked for the agent stack and are
-# the dev set's base file and build file too. The agent stack's own overlays are not dev files, except
-# docker-compose.fake.yaml, which TEST mode's test_up and test_build load (tj-iee6sn.24 WHAT (3): "add it
-# and fake.yaml to S6"); docker-compose.agent-test.yaml arrives through EXPECTED_DEV_BAKES. tj-iee6sn.20 adds the
-# system-test client's two: docker-compose.test-client.yaml (baked for the agent stack, now loaded by
-# run_system_tests and seed_dump too) and docker-compose.agent-client.yaml, through EXPECTED_DEV_BAKES.
+# Dockerfile's COPY lines; docker-compose.yaml and the Dockerfile are the base file and build file of
+# every set. docker-compose.fake.yaml is loaded by TEST mode's test_up and test_build (tj-iee6sn.24 WHAT
+# (3): "add it and fake.yaml to S6"); docker-compose.agent-test.yaml arrives through EXPECTED_DEV_BAKES.
+# tj-iee6sn.20 adds the system-test client's two: docker-compose.test-client.yaml (loaded by
+# run_system_tests and seed_dump) and docker-compose.agent-client.yaml, through EXPECTED_DEV_BAKES.
 EXPECTED_COPY_NAMES = frozenset(
     {
         'docker-compose.yaml',
@@ -1380,9 +1379,8 @@ EXPECTED_COPY_NAMES = frozenset(
         *EXPECTED_DEV_BAKES,
     }
 )
-# What the MCP image bakes into the trusted directory and S6 does NOT compare: the agent stack's own
-# overlay, which no verb of the one project loads (tj-iee6sn.21 removes it with the agent stack).
-BAKED_BUT_NOT_COMPARED = frozenset({'docker-compose.agent-stack.yaml'})
+# The retired agent stack's overlay: the image no longer bakes it and S6 does not compare it (tj-iee6sn.21).
+RETIRED_OVERLAY = 'docker-compose.agent-stack.yaml'
 COPY_NAMES = sorted(EXPECTED_COPY_NAMES)
 
 
@@ -1413,16 +1411,18 @@ def test_the_bake_list_is_the_dev_files_the_tools_file_the_test_overlay_and_the_
     }
 
 
-def test_the_compared_copies_are_exactly_what_the_mcp_dockerfile_bakes_but_the_agent_stack_overlay():
-    """tj-iee6sn.20: the S6 list EQUALS the Dockerfile's bake list into the trusted directory, minus one named file.
+def test_the_compared_copies_are_exactly_what_the_mcp_dockerfile_bakes():
+    """tj-iee6sn.20, tightened by tj-iee6sn.21: the S6 list EQUALS the Dockerfile's bake list, with NO exception.
 
     Read from the COPY lines, so a file baked and not compared (S6 would let it go stale) or compared and not
-    baked (S6 would refuse every call) is red, and so is the exception growing beyond the agent-stack overlay.
+    baked (S6 would refuse every call) is red. The one exception there was, the agent-stack overlay, is gone
+    from the bake, so restoring it to the COPY without S6 is red here as well as in test_commands.py.
     """
     baked = set(_baked_into_trusted())
     compared = {checkout for checkout, _ in stack.DEV_TRUSTED_COPIES}
-    assert baked >= BAKED_BUT_NOT_COMPARED, 'the exception names a file the image no longer bakes: drop it'
-    assert compared == baked - BAKED_BUT_NOT_COMPARED, compared ^ (baked - BAKED_BUT_NOT_COMPARED)
+    assert RETIRED_OVERLAY not in baked and RETIRED_OVERLAY not in compared
+    assert compared == baked, compared ^ baked
+    assert compared == EXPECTED_COPY_NAMES, compared ^ EXPECTED_COPY_NAMES
     assert {'docker-compose.test-client.yaml', 'docker-compose.agent-client.yaml'} <= compared
 
 
@@ -1629,7 +1629,7 @@ def test_a_steps_env_appears_in_no_recorded_command_and_no_audit_line(tmp_path: 
         return [replace(step, env=(('INSTANCE_WRITE_SECRET', SENTINEL),)) for step in real_steps(stack_dir)]
 
     monkeypatch.setattr(stack, 'dev_ps_steps', with_env)
-    result = rig.call('dev_ps', {})
+    result = rig.call('ps', {})
     assert result['status'] == 'ok', result
     assert rig.docker.steps and all(dict(step.env) == {'INSTANCE_WRITE_SECRET': SENTINEL} for step in rig.docker.steps)
     assert SENTINEL not in json.dumps(result), result

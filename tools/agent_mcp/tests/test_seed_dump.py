@@ -156,7 +156,8 @@ def test_the_schema_takes_an_optional_date_and_the_timeout_is_the_system_suites(
 
 def test_seed_dump_steps_caps_the_producers_stdout_and_nothing_else():
     """Step.stdout_cap marks the bundle as data: on the producer's run only, at the bundle cap."""
-    build, run = stack.seed_dump_steps(Path('/stack'), Path('/stack/agent_stack.env'), None)
+    # The second argument is the repository's HOST path (tj-iee6sn.20), no longer a generated env file.
+    build, run = stack.seed_dump_steps(Path('/stack'), Path('/home/someone/repos/trader_joe'), None)
     assert build.stdout_cap is None and run.stdout_cap == seeds.MAX_BUNDLE_BYTES == 8 * 1024 * 1024
     assert build.builds and run.builds, 'both can build, so the bases are ensured before the first'
     assert stack.Step(('x',), Path('/')).stdout_cap is None

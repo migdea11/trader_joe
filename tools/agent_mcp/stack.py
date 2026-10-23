@@ -1,18 +1,21 @@
-"""The agent stack's constants, argument validation, the snapshot, generated env files and command builders.
+"""The MCP's constants, argument validation, the worktree snapshot and the command builders of the dev and test modes.
 
-Nothing here runs Docker. The only subprocesses in this module are two read-only git plumbing calls,
-both through run_git(): `git worktree list --porcelain` and `git cat-file blob HEAD:<path>`. Every
-docker command is built here as an argument list and run by runner.py.
+Nothing here runs Docker. The only subprocess in this module is one read-only git plumbing call,
+through run_git(): `git worktree list --porcelain`. Every docker command is built here as an
+argument list and run by runner.py.
 
 THE DAEMON ONLY EVER SEES MCP-OWNED INPUTS (ADR tj-4rr0la addendum 5). The Docker daemon is root on
 the host and resolves bind-mount sources and the build context there; BuildKit reads the Dockerfile.
 A check on an agent-writable tree is always a race, so neither is ever pointed at one:
     THE SNAPSHOT. Before a verb builds or creates a container from a worktree, refresh_snapshot()
         copies the worktree's SNAPSHOT_SOURCES into <stack dir>/source, refusing any symlink or
-        special file, and --project-directory is ALWAYS that copy (compose_prefix takes no
-        worktree). The build context and every relative bind source are then MCP-owned, and the
-        checks on them (check_mount_sources, resolve_test_paths, the migrations guard) are stable.
-    THE TRUSTED DOCKERFILE. The agent-stack overlay sets build.dockerfile to TRUSTED_DOCKERFILE, the
+        special file. The snapshot serves only run_system_tests and seed_dump: it is the project
+        directory and the build context of test_client (testclient_prefix), and the checks on it
+        (check_mount_sources, resolve_test_paths) are stable. Every other verb (the dev ones,
+        test_build, test_up, migrate and migrate_status) reads no worktree and takes no snapshot: their compose files are the MCP image's
+        baked copies and their project directory is the repository's host path.
+    THE TRUSTED DOCKERFILE. The MCP-only overlays (docker-compose.agent-dev.yaml, -test.yaml and
+        -client.yaml) set build.dockerfile to TRUSTED_DOCKERFILE, the
         MCP image's own copy of the repository's Dockerfile. The worktree's Dockerfile is never read,
         so FROM, COPY --from, RUN --mount from= and a syntax= frontend are fixed: a build cannot read
         prod images, the private repository's images or any other image on the host daemon. Its
@@ -30,7 +33,6 @@ import contextlib
 import datetime
 import os
 import re
-import secrets
 import shutil
 import stat
 import subprocess  # nosec B404 -- argument lists only, never a shell; see run_git
@@ -41,34 +43,21 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from tools.agent_mcp.seeds import MAX_BUNDLE_BYTES
-from tools.agent_mcp.settings import Settings
 
 
 class Refused(Exception):
     """A verb refuses: raised before any docker subprocess runs."""
 
 
-# ---------------------------------------------------------------------------------------------
-# THE STACK. These two mirror the Makefile's AGENT_STACK_PROJECT and AGENT_STACK_COMPOSE exactly --
-# the project name and the -f file names in the same order (base, test client, the agent-stack
-# overlay, then the fake-mode overlay AFTER it; ADR tj-4rr0la addendum 3 (3), tj-vhboky.61). A
-# validator test pins that they agree (tj-c4mosr.5).
-PROJECT = 'trader_joe_agent_stack'
-COMPOSE_FILES = (
-    'docker-compose.yaml',
-    'docker-compose.test-client.yaml',
-    'docker-compose.agent-stack.yaml',
-    'docker-compose.fake.yaml',
-)
-
-# Where the MCP image carries its OWN copies of COMPOSE_FILES (tools/agent_mcp/Dockerfile). Never the
+# Where the MCP image carries its OWN copies of the compose files (tools/agent_mcp/Dockerfile). Never the
 # worktree's: a worktree is agent-writable, and compose content from it could mount any host path,
 # add privileged: or the Docker socket -- raw compose pass-through, which ADR tj-4rr0la rejects (C).
 # --project-directory points relative paths (build contexts, bind mounts) at the snapshot instead.
 TRUSTED_COMPOSE_DIR = Path('/opt/agent_mcp/compose')
-# The MCP image's own copy of the repository's Dockerfile, which docker-compose.agent-stack.yaml names
-# as build.dockerfile for every service it builds (ADR tj-4rr0la addendum 5, ruling 2). A Dockerfile
-# change reaches the agent stack when the MCP image is rebuilt, as a compose change does.
+# The MCP image's own copy of the repository's Dockerfile, which the three MCP-only overlays
+# (docker-compose.agent-dev.yaml, -test.yaml and -client.yaml) name as build.dockerfile for what they build
+# (ADR tj-4rr0la addendum 5, ruling 2). A Dockerfile change reaches the MCP when its image is rebuilt, as a
+# compose change does.
 TRUSTED_DOCKERFILE = TRUSTED_COMPOSE_DIR / 'Dockerfile'
 # Every external image TRUSTED_DOCKERFILE names (FROM and COPY --from; stage names are not external),
 # exactly as it spells them: tag@sha256:<multi-arch index digest>. Before any build the MCP has the
@@ -91,30 +80,17 @@ GIT = '/usr/bin/git'
 # addendum 1 (b)).
 DOCKER_HOST = 'tcp://socket_proxy:2375'
 
-SERVICES = ('postgres', 'data_store', 'data_ingest')
-# Built by stack_up; test_client is rebuilt by run_system_tests' own `run --build` as well. Exactly
-# the services with a build: key in COMPOSE_FILES, so builds() also reads it: a `run` of one of them
-# builds its image when it is missing.
+# Test mode's built services (data_store and data_ingest) and the system-test client; builds() reads it: a
+# `run` of one of them builds its image when it is missing.
 BUILT_SERVICES = ('data_store', 'data_ingest', 'test_client')
-# The long-running SERVICES with a snapshot bind: exactly those whose merged model under
-# COMPOSE_FILES has a bind mount with a relative source, resolved in the SNAPSHOT (data_store's
-# alembic.ini and migrations, data_ingest's tests/fakes in fake mode). refresh_snapshot() swaps the
-# snapshot by rename and removes the old generation, so a running container's binds point at a
-# removed directory after any refresh, and a plain `up` recreates only on an image or config
-# change. stack_up therefore force-recreates these on every call, so the long-running services run
-# the code of the LAST stack_up (tj-zgq5v2). A validator test pins the equality by parsing those
-# files, so a new bind into a long-running service without an entry goes red.
-SNAPSHOT_BOUND_SERVICES = ('data_store', 'data_ingest')
 TAIL_DEFAULT = 200
 TAIL_MAX = 2000
 MAX_TEST_PATHS = 50
-# The whole stack's --wait budget, as prod-launch's: room above data_store's 60s start_period.
-WAIT_TIMEOUT_SECONDS = 300
 
 # ---------------------------------------------------------------------------------------------
 # THE USER'S OWN DEV COMPOSE PROJECT -- READ ONLY, TWO VERBS (tj-kzy7w2; user ruling on tj-wpnr7o (b),
 # recorded on tj-izzqub addendum 1; ADR tj-4rr0la addendum 18). This is the ONE place in the server
-# that names a project other than PROJECT, and everything below exists to keep it that way.
+# that names a compose project, DEV_PROJECT, and everything below exists to keep it that way.
 #
 # WHY IT IS HERE. An agent already reaches the user's dev services by name over devnet (ADR tj-q9ae5u
 # item 3) but cannot see WHY one is unhealthy; logs and container state were the one diagnostic still
@@ -159,7 +135,7 @@ DEV_COMPOSE_FILES = (
     'docker-compose.web.dev.yaml',
     'docker-compose.agent-dev.yaml',
 )
-# dev_tools' set: the Makefile's TOOLS_COMPOSE (the first four plus the tools file, pgAdmin and nothing
+# tools' set: the Makefile's TOOLS_COMPOSE (the first four plus the tools file, pgAdmin and nothing
 # else), then the MCP-only overlay last.
 DEV_TOOLS_COMPOSE_FILE = 'docker-compose.tools.yaml'
 DEV_TOOLS_COMPOSE_FILES = (*DEV_COMPOSE_FILES[:-1], DEV_TOOLS_COMPOSE_FILE, DEV_COMPOSE_FILES[-1])
@@ -253,54 +229,9 @@ SYSTEM_TESTS_DIR = 'tests/system'
 MIGRATION_VERSIONS_DIR = 'server/data/store/migrations/versions'
 
 # ---------------------------------------------------------------------------------------------
-# THE STACK DIRECTORY (settings.stack_dir; ADR tj-4rr0la addenda 1 (d) and 2).
-ROOT_ENV_NAME = 'agent_stack.env'
-STORE_ENV_NAME = 'agent_stack_store.env'
-INGEST_ENV_NAME = 'agent_stack_ingest.env'
-DATA_DIR_NAME = 'data'
+# THE STACK DIRECTORY (settings.stack_dir; ADR tj-4rr0la addenda 1 (d) and 5): the snapshot and the audit log.
 AUDIT_LOG_NAME = 'audit.log'
-# The worktree NAME the last stack_up used, re-resolved on every read.
-STATE_FILE_NAME = 'stack_worktree'
 
-# The committed defaults each generated file starts from, read from the main checkout's HEAD with
-# git cat-file -- never a working-tree file, so no live env file is ever opened.
-# Paths into the checkout, read from HEAD with git cat-file: the root template stays at the top of
-# the repository, the two service templates travel with their trees (tj-iontkq.4).
-ENV_DEFAULT_SOURCES = {
-    'root': '.env.default',
-    'store': 'server/data/store/.env.default',
-    'ingest': 'server/data/ingest/.env.default',
-}
-ENV_FILE_NAMES = {'root': ROOT_ENV_NAME, 'store': STORE_ENV_NAME, 'ingest': INGEST_ENV_NAME}
-ENV_FILE_VARIABLES = {'root': 'ROOT_ENV_FILE', 'store': 'STORE_ENV_FILE', 'ingest': 'INGEST_ENV_FILE'}
-
-# The agent stack's own names, each distinct from the user's (.env.default: db,
-# trader_joe_store_api).
-AGENT_DATABASE_NAME = 'trader_joe_agent_stack_postgres'
-AGENT_STORE_API_NETWORK = 'trader_joe_agent_stack_store_api'
-
-# Set in the ROOT generated file only (tj-c4mosr.3, F1 note). env_file order is root then service
-# file, so a service-file value would silently win in the container while compose interpolated the
-# root one: DATABASE_NAME would name one host in container_name and another in the apps'
-# environment. The secrets and paths follow the same rule so each has one value in one file.
-ROOT_ONLY_VARIABLES = (
-    'DATABASE_NAME',
-    'STORE_API_NETWORK',
-    'DATA_DIR',
-    'POSTGRES_PASS',
-    'INSTANCE_WRITE_SECRET',
-    'ROOT_ENV_FILE',
-    'STORE_ENV_FILE',
-    'INGEST_ENV_FILE',
-)
-BROKER_CREDENTIALS = ('ALPACA_API_KEY', 'ALPACA_API_SECRET')
-# Keys that steer compose or the docker CLI rather than the stack: compose reads COMPOSE_* (the file
-# list, the project name, the profiles) from the --env-file itself. The committed defaults come from a
-# HEAD agents can move, so such a key is REFUSED, at generation and by guard 2 -- never dropped, which
-# would hide a committed change that tries to steer compose.
-STEERING_PREFIXES = ('COMPOSE_', 'DOCKER_')
-
-_ENV_LINE = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)=(.*)$')
 _WORKTREE_NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$')
 # seed_dump's --date: ASCII digits only (\d would take any Unicode digit), then a real calendar date.
 _SEED_DATE = re.compile(r'^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
@@ -382,12 +313,6 @@ def list_worktrees(repo_root: Path) -> dict[str, Path]:
     for name in ambiguous:
         del named[name]
     return named
-
-
-def all_worktree_paths(repo_root: Path) -> list[Path]:
-    """Every worktree path git knows, usable or not, resolved -- for the under-no-worktree check."""
-    entries = parse_worktree_porcelain(run_git(repo_root, ['worktree', 'list', '--porcelain']))
-    return [Path(os.path.realpath(path)) for path, _ in entries] + [repo_root]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -482,13 +407,6 @@ def check_seed_date(value: object) -> str | None:
     return value
 
 
-def validate_service(service: object) -> str:
-    """Service must be one of the closed set SERVICES."""
-    if not isinstance(service, str) or service not in SERVICES:
-        raise Refused(f'service must be one of: {", ".join(SERVICES)}')
-    return service
-
-
 def clamp_tail(tail: object) -> int:
     """An integer, clamped to 1..TAIL_MAX."""
     if isinstance(tail, bool) or not isinstance(tail, int):
@@ -509,257 +427,10 @@ def validate_dev_service(service: object) -> str:
 
 
 # ---------------------------------------------------------------------------------------------
-# THE GENERATED ENV FILES (tj-c4mosr.3 item 3 as amended; ADR tj-4rr0la addendum 2).
-def parse_env_text(text: str) -> dict[str, str]:
-    """KEY=VALUE lines, in order; comments, blanks and anything else are dropped. Values verbatim."""
-    values: dict[str, str] = {}
-    for line in text.splitlines():
-        match = _ENV_LINE.match(line.strip())
-        if match:
-            values[match.group(1)] = match.group(2)
-    return values
-
-
-def env_line_keys(text: str) -> list[str]:
-    """Every key a line of TEXT could set, in the looser spellings compose's own parser also takes.
-
-    parse_env_text() keeps only strict KEY=VALUE lines; compose also reads `export KEY=VALUE`,
-    `KEY = VALUE` and `KEY: VALUE`. Guard 2's steering-key check reads keys through this, so a
-    spelling parse_env_text drops cannot slip a COMPOSE_ key past it.
-    """
-    keys = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith('#'):
-            continue
-        stripped = re.sub(r'^export\s+', '', stripped)
-        keys.append(re.split(r'[=:]', stripped, maxsplit=1)[0].strip())
-    return keys
-
-
-def render_env(values: Mapping[str, str]) -> str:
-    """Render an env file. Refuses a value that would break the one-line-per-variable format."""
-    lines = [
-        '# GENERATED by the agent-stack MCP (tools/agent_mcp, ADR tj-4rr0la addendum 2). The agent',
-        "# stack's own env: never the user's. Deleting the stack directory regenerates it.",
-    ]
-    for key, value in values.items():
-        if '\n' in value or '\r' in value:
-            raise Refused(f'{key} holds a line break; refusing to write it')
-        lines.append(f'{key}={value}')
-    return '\n'.join(lines) + '\n'
-
-
-def refuse_steering_keys(source: str, values: Mapping[str, str]) -> None:
-    """Refuse when SOURCE sets a key that steers compose or the docker CLI (STEERING_PREFIXES)."""
-    steering = sorted(key for key in values if key.startswith(STEERING_PREFIXES))
-    if steering:
-        raise Refused(f'{source} sets {", ".join(steering)}, which would steer compose; refusing')
-
-
-def read_committed_defaults(repo_root: Path) -> dict[str, dict[str, str]]:
-    """The three committed .env.default files, read from the main checkout's HEAD commit."""
-    return {
-        kind: parse_env_text(run_git(repo_root, ['cat-file', 'blob', f'HEAD:{source}']))
-        for kind, source in ENV_DEFAULT_SOURCES.items()
-    }
-
-
-def env_file_paths(stack_dir: Path) -> dict[str, Path]:
-    """The three generated env files' absolute paths, by kind."""
-    return {kind: stack_dir / name for kind, name in ENV_FILE_NAMES.items()}
-
-
-def build_env_values(stack_dir: Path, defaults: Mapping[str, Mapping[str, str]]) -> dict[str, dict[str, str]]:
-    """The three files' contents: the committed defaults with the agent stack's overrides.
-
-    Root: every committed root variable, then random POSTGRES_PASS and INSTANCE_WRITE_SECRET, the
-    agent stack's DATABASE_NAME, STORE_API_NETWORK and DATA_DIR, and the three
-    *_ENV_FILE paths. Store and ingest: their committed variables, less every ROOT_ONLY_VARIABLES
-    name. ALPACA_API_KEY and ALPACA_API_SECRET present and EMPTY in the ingest file only.
-
-    Refuses when any committed default's key starts with one of STEERING_PREFIXES.
-    """
-    for kind, values in defaults.items():
-        refuse_steering_keys(ENV_DEFAULT_SOURCES.get(kind, kind), values)
-    paths = env_file_paths(stack_dir)
-    root = {k: v for k, v in defaults['root'].items() if k not in BROKER_CREDENTIALS}
-    root.update(
-        # Hex, as .env.default asks: these land unencoded in DATABASE_URI.
-        POSTGRES_PASS=secrets.token_hex(24),
-        INSTANCE_WRITE_SECRET=secrets.token_hex(32),
-        DATABASE_NAME=AGENT_DATABASE_NAME,
-        STORE_API_NETWORK=AGENT_STORE_API_NETWORK,
-        DATA_DIR=str(stack_dir / DATA_DIR_NAME),
-        ROOT_ENV_FILE=str(paths['root']),
-        STORE_ENV_FILE=str(paths['store']),
-        INGEST_ENV_FILE=str(paths['ingest']),
-    )
-    dropped = set(ROOT_ONLY_VARIABLES) | set(BROKER_CREDENTIALS)
-    store = {k: v for k, v in defaults['store'].items() if k not in dropped}
-    ingest = {k: v for k, v in defaults['ingest'].items() if k not in dropped}
-    ingest.update(dict.fromkeys(BROKER_CREDENTIALS, ''))
-    return {'root': root, 'store': store, 'ingest': ingest}
-
-
-def _write_private(path: Path, text: str) -> None:
-    """Write a 0600 file atomically: a temporary beside it, then a rename over any old one."""
-    temporary = path.with_name(f'.{path.name}.tmp')
-    temporary.unlink(missing_ok=True)
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, 'w') as handle:
-        handle.write(text)
-    os.replace(temporary, path)
-
-
-def ensure_env_files(settings: Settings) -> Path:
-    """Generate the three env files at first use; afterwards reuse them. Returns the root one.
-
-    The secrets live in the root file only, and it is written LAST, so its presence means the set is
-    complete. A missing store or ingest file is rewritten from the committed defaults (it holds no
-    secret); the root file is never regenerated while it exists, because Postgres keeps the password
-    it was initialised with.
-    """
-    paths = env_file_paths(settings.stack_dir)
-    if paths['root'].exists() and paths['store'].exists() and paths['ingest'].exists():
-        return paths['root']
-    values = build_env_values(settings.stack_dir, read_committed_defaults(settings.repo_root))
-    for kind in ('store', 'ingest'):
-        if not paths[kind].exists():
-            _write_private(paths[kind], render_env(values[kind]))
-    if not paths['root'].exists():
-        _write_private(paths['root'], render_env(values['root']))
-    return paths['root']
-
-
-def read_env_file(path: Path) -> dict[str, str]:
-    """Read one generated env file. It must be a regular file, not a symlink."""
-    if path.is_symlink() or not path.is_file():
-        raise Refused(f'{path.name} is missing, or is not a regular file')
-    return parse_env_text(path.read_text())
-
-
-def check_env_file_paths(settings: Settings, worktree_paths: Sequence[Path]) -> Path:
-    """GUARD 2 of ADR tj-4rr0la addendum 2 -- runs before ANY docker subprocess of every verb.
-
-    Refuses unless ROOT_ENV_FILE, STORE_ENV_FILE and INGEST_ENV_FILE in the root generated file are
-    each an absolute path, free of symlinks, of an existing regular file directly inside the agent
-    stack's own directory, and under no worktree (the base file's defaults resolve to the user's
-    live env files, and the MCP container can see the main checkout). Also refuses unless
-    ROOT_ENV_FILE is the --env-file itself; DATA_DIR is the stack directory's data/; DATABASE_NAME
-    and STORE_API_NETWORK carry the agent stack's names and appear in the root file
-    only (the F1 rule); ALPACA_API_KEY and ALPACA_API_SECRET are present and empty in the ingest
-    file and absent from the other two. And refuses when any of the three files sets a key starting
-    COMPOSE_ or DOCKER_ (STEERING_PREFIXES): compose reads COMPOSE_* from the --env-file, so an edited
-    file could change the -f list or the project. Returns the root file's path for --env-file.
-    """
-    paths = env_file_paths(settings.stack_dir)
-    root_values = read_env_file(paths['root'])
-    for kind, path in paths.items():
-        read_env_file(path)  # a regular file, not a symlink, before its raw text is read
-        refuse_steering_keys(ENV_FILE_NAMES[kind], dict.fromkeys(env_line_keys(path.read_text()), ''))
-    for kind, variable in ENV_FILE_VARIABLES.items():
-        raw = root_values.get(variable, '')
-        if not raw or not os.path.isabs(raw):
-            raise Refused(f'{variable} must be set to an absolute path')
-        resolved = Path(os.path.realpath(raw))
-        if str(resolved) != raw or resolved.parent != settings.stack_dir or resolved != paths[kind]:
-            raise Refused(f"{variable} must name the agent stack's own {ENV_FILE_NAMES[kind]}, with no symlink")
-        if any(_within(resolved, worktree) for worktree in worktree_paths):
-            raise Refused(f'{variable} lies under a worktree')
-        if resolved.is_symlink() or not resolved.is_file():
-            raise Refused(f'{variable} does not name a regular file')
-    if root_values.get('DATA_DIR') != str(settings.stack_dir / DATA_DIR_NAME):
-        raise Refused("DATA_DIR must be the agent stack's own data directory")
-    expected_names = {'DATABASE_NAME': AGENT_DATABASE_NAME, 'STORE_API_NETWORK': AGENT_STORE_API_NETWORK}
-    for variable, expected in expected_names.items():
-        if root_values.get(variable) != expected:
-            raise Refused(f"{variable} must be the agent stack's own name, {expected}")
-    for kind in ('store', 'ingest'):
-        values = read_env_file(paths[kind])
-        leaked = [name for name in ROOT_ONLY_VARIABLES if name in values]
-        if leaked:
-            raise Refused(f'{ENV_FILE_NAMES[kind]} sets {", ".join(leaked)}, which belong in the root file only')
-    for kind in ('root', 'store'):
-        values = root_values if kind == 'root' else read_env_file(paths[kind])
-        if any(name in values for name in BROKER_CREDENTIALS):
-            raise Refused(f'{ENV_FILE_NAMES[kind]} sets a broker credential variable')
-    ingest_values = read_env_file(paths['ingest'])
-    if any(ingest_values.get(name, None) != '' for name in BROKER_CREDENTIALS):
-        raise Refused(f'{INGEST_ENV_NAME} must carry ALPACA_API_KEY and ALPACA_API_SECRET, empty')
-    return paths['root']
-
-
-# ---------------------------------------------------------------------------------------------
-# THE DATA DIRECTORY (stack_wipe; tj-c4mosr.3 item 5).
-def check_data_dir(settings: Settings) -> Path | None:
-    """The agent stack's data directory, checked; None when it does not exist yet.
-
-    Refuses when the path is a symlink, when resolving it gives anything but the configured absolute
-    path (a symlink anywhere above it), or when it is not a directory.
-    """
-    expected = settings.stack_dir / DATA_DIR_NAME
-    if expected.is_symlink():
-        raise Refused('the data directory is a symlink; refusing to delete anything')
-    if not expected.exists():
-        return None
-    if Path(os.path.realpath(expected)) != expected or not expected.is_dir():
-        raise Refused('the data directory does not resolve to its configured path; refusing to delete anything')
-    return expected
-
-
-def is_plain_dir(path: Path) -> bool:
-    """True when PATH is a directory itself, by lstat: a symlink to a directory is not one, nor is a missing path.
-
-    stack_wipe clears only these service mounts (ADR tj-4rr0la addendum 6, INFO): the daemon would
-    follow a data/<service> link as root, so a link is left for remove_data_dir to report as 'failed'.
-    """
-    try:
-        return stat.S_ISDIR(os.lstat(path).st_mode)
-    except FileNotFoundError:
-        return False
-
-
-def remove_data_dir(settings: Settings) -> list[str]:
-    """Re-check, then remove the data directory, which the clear steps have emptied. Returns what is left.
-
-    os.rmdir only, never a tree walk: Postgres leaves its data directory owned by its own uid with
-    mode 0700, which the server's user cannot open but, owning the parent, can remove once it is
-    empty. So each DATA_MOUNTS service directory is removed, then the data directory itself. Anything
-    that will not go -- a directory the clear step left non-empty, a symlink, an unexpected entry --
-    is returned by its path under the stack directory, the data kept; an empty list means removed
-    (or never there). The caller reports a non-empty list as 'failed', never as an error.
-    """
-    checked = check_data_dir(settings)
-    if checked is None:
-        return []
-    remaining = []
-    for service, _ in DATA_MOUNTS:
-        entry = checked / service
-        if not entry.is_symlink() and not entry.exists():
-            continue
-        try:
-            os.rmdir(entry)  # refuses a symlink (ENOTDIR) and a non-empty directory alike
-        except OSError:
-            remaining.append(f'{DATA_DIR_NAME}/{service}')
-    if remaining:
-        return remaining
-    try:
-        os.rmdir(checked)
-    except OSError:
-        try:
-            left = sorted(os.listdir(checked))
-        except OSError:
-            left = []
-        return [f'{DATA_DIR_NAME}/{name}' for name in left] or [DATA_DIR_NAME]
-    return []
-
-
-# ---------------------------------------------------------------------------------------------
 # THE SNAPSHOT (ADR tj-4rr0la addendum 5, ruling 1). PREMISE, named: nothing but the MCP writes under
 # the stack directory. settings.load_settings refuses a stack directory inside or containing the
-# repository or AGENT_HOME_PATH (the devcontainer mounts both), and the agent stack's containers get
-# no writable bind into the snapshot (the overlay mounts data_store's sources :ro).
+# repository or AGENT_HOME_PATH (the devcontainer mounts both), and test_client gets no writable bind
+# into the snapshot (its mounts are read-only).
 #
 # One snapshot operation at a time, across threads: a verb that timed out leaves its copy thread
 # running until it next checks its cancel event, and the next verb's copy must not interleave with it.
@@ -772,8 +443,8 @@ _COPY_CHUNK = 1024 * 1024
 def _make_snapshot_dir(path: Path, *, parents: bool = False) -> None:
     """Create a snapshot directory 0755, whatever the umask.
 
-    World-readable on purpose: the agent stack's containers read the snapshot through bind mounts
-    as their own users (appuser, not the MCP's), and BuildKit sends it as the build context. It holds
+    World-readable on purpose: test_client reads the snapshot through bind mounts
+    as its own user (appuser, not the MCP's), and BuildKit sends it as the build context. It holds
     only the worktree's own source, which the agent can already read; live env files are never
     copied (_skipped_file).
 
@@ -1016,31 +687,18 @@ def refresh_snapshot(stack_dir: Path, worktree: Path, cancel: threading.Event | 
     return live
 
 
-def ensure_snapshot(stack_dir: Path) -> Path:
-    """The existing snapshot, or an empty one when there is none. Reads no worktree.
-
-    For the verbs that build and mount nothing from source (stack_down, stack_wipe, logs, ps): compose
-    still needs a project directory, and it is always the snapshot.
-    """
-    live = snapshot_dir(stack_dir)
-    with _SNAPSHOT_LOCK:
-        if live.is_symlink() or (live.exists() and not live.is_dir()):
-            _remove_generation(live)
-        if not live.exists():
-            _make_snapshot_dir(live)
-    return live
-
-
 # ---------------------------------------------------------------------------------------------
-# COMMANDS. Every docker command starts with compose_prefix(): the fixed project, the SNAPSHOT as the
-# project directory, the generated --env-file, then the trusted -f files in COMPOSE_FILES order. The
-# builders take the stack directory, never a worktree: no compose argv carries a repository path.
+# COMMANDS. Every docker command is built here as an argument list: the dev and test-mode builders start
+# from dev_compose_prefix() (project DEV_PROJECT, the trusted -f files, the repository's host path as the
+# project directory), the system-test client from testclient_prefix() (the snapshot as the project
+# directory). The builders take the stack directory, never a worktree: no compose argv carries a
+# repository path an agent chose.
 @dataclass(frozen=True)
 class Step:
     """One subprocess: its argument list and the directory it runs in (the snapshot).
 
     builds is True for a step that CAN build an image from TRUSTED_DOCKERFILE -- compose builds a
-    missing image on up/run without --build (ADR tj-4rr0la addendum 15). _steps() sets it from the
+    missing image on up/run without --build (ADR tj-4rr0la addendum 15). the step builders set it from the
     compose command (builds()), so no builder can add a build without it; the runner makes BASE_IMAGES
     present before the first such step of a verb and never runs it when a base could not be pulled.
 
@@ -1060,30 +718,12 @@ class Step:
     env: tuple[tuple[str, str], ...] = ()
 
 
-def compose_prefix(stack_dir: Path, root_env_file: Path) -> list[str]:
-    """The prefix: docker compose -p PROJECT --project-directory <stack_dir>/source --env-file <root> -f <each>."""
-    project_directory = str(snapshot_dir(stack_dir))
-    prefix = [
-        DOCKER,
-        'compose',
-        '-p',
-        PROJECT,
-        '--project-directory',
-        project_directory,
-        '--env-file',
-        str(root_env_file),
-    ]
-    for name in COMPOSE_FILES:
-        prefix += ['-f', str(TRUSTED_COMPOSE_DIR / name)]
-    return prefix
-
-
 def builds(tail: Sequence[str]) -> bool:
-    """Whether a compose command (the words after compose_prefix) CAN build.
+    """Whether a compose command (the words after the project prefix) CAN build.
 
     compose builds a missing image on up/run without --build, so this is: `build`; any `--build`;
     `up`, always (an `up` naming no service builds every one); or a `run` naming a BUILT_SERVICES
-    service (postgres is image-only, so stack_wipe's clear runs stay base-free). A word
+    service (postgres is image-only, so a run of it stays base-free). A word
     that matches by coincidence costs an extra inspect, the safe direction.
     """
     if not tail:
@@ -1094,11 +734,6 @@ def builds(tail: Sequence[str]) -> bool:
         or '--build' in tail
         or (first == 'run' and any(word in BUILT_SERVICES for word in tail))
     )
-
-
-def _steps(stack_dir: Path, root_env_file: Path, *tails: Sequence[str]) -> list[Step]:
-    prefix = compose_prefix(stack_dir, root_env_file)
-    return [Step(tuple(prefix + list(tail)), snapshot_dir(stack_dir), builds(tail)) for tail in tails]
 
 
 # THE BASES. Plain docker commands, not compose: through the same socket proxy (DOCKER_HOST in the
@@ -1113,67 +748,6 @@ def base_inspect_step(ref: str, cwd: Path) -> Step:
 def base_pull_step(ref: str, cwd: Path) -> Step:
     """`docker pull` of one BASE_IMAGES ref, run only after its inspect found it absent."""
     return Step((DOCKER, 'pull', ref), cwd)
-
-
-def stack_up_steps(stack_dir: Path, root_env_file: Path) -> list[Step]:
-    """Build the images from the snapshot, start the infrastructure, then force-recreate the app services.
-
-    Three steps. The plain `up` of the services with no snapshot bind (postgres) recreates
-    them only on a config change, so their data is not re-created on every call.
-    The last `up` force-recreates SNAPSHOT_BOUND_SERVICES so their binds resolve in the snapshot just
-    refreshed, and creates each once per stack_up; --no-deps is safe because the step before already
-    waited for the infrastructure healthy. Both `up` steps can build (builds()), so the runner's
-    BASE_IMAGES check still runs before the first building step (ADR tj-4rr0la addenda 14-15).
-    """
-    wait = ['-d', '--wait', '--wait-timeout', str(WAIT_TIMEOUT_SECONDS)]
-    infrastructure = [service for service in SERVICES if service not in SNAPSHOT_BOUND_SERVICES]
-    return _steps(
-        stack_dir,
-        root_env_file,
-        ['build', *BUILT_SERVICES],
-        ['up', *wait, *infrastructure],
-        ['up', *wait, '--force-recreate', '--no-deps', *SNAPSHOT_BOUND_SERVICES],
-    )
-
-
-def stack_down_steps(stack_dir: Path, root_env_file: Path) -> list[Step]:
-    """Stop and remove the agent stack's containers and networks."""
-    return _steps(stack_dir, root_env_file, ['down', '--remove-orphans'])
-
-
-# Each service's data mount target (docker-compose.agent-stack.yaml mounts ${DATA_DIR}/<service>
-# there), cleared from inside a one-off container of that service as root: Postgres owns its
-# files, not the MCP's user. The script takes the target as $1; the globs cover dotfiles, and
-# rm -f ignores a glob that matched nothing. The target is the container side of a mount the guard
-# has checked.
-DATA_MOUNTS = (('postgres', '/var/lib/postgresql/data'),)
-_CLEAR_SCRIPT = 'rm -rf -- "$1"/* "$1"/.[!.]* "$1"/..?*'
-
-
-def wipe_clear_steps(stack_dir: Path, root_env_file: Path, services: Sequence[str]) -> list[Step]:
-    """Clear the named services' data mounts from inside the containers."""
-    targets = dict(DATA_MOUNTS)
-    return _steps(
-        stack_dir,
-        root_env_file,
-        *(
-            [
-                'run',
-                '--rm',
-                '--no-deps',
-                '--user',
-                '0',
-                '--entrypoint',
-                'sh',
-                service,
-                '-c',
-                _CLEAR_SCRIPT,
-                'clear',
-                targets[service],
-            ]
-            for service in services
-        ),
-    )
 
 
 # THE SYSTEM-TEST CLIENT (run_system_tests, seed_dump; tj-iee6sn.20; ADR tj-4rr0la addenda 26-27). Both
@@ -1309,25 +883,15 @@ def seed_dump_steps(stack_dir: Path, repo_host_path: Path, date: str | None) -> 
     return [build, replace(run, stdout_cap=MAX_BUNDLE_BYTES)]
 
 
-def logs_steps(stack_dir: Path, root_env_file: Path, service: str, tail: int) -> list[Step]:
-    """The last `tail` lines of one service's log."""
-    return _steps(stack_dir, root_env_file, ['logs', '--no-color', '--tail', str(tail), service])
-
-
-def ps_steps(stack_dir: Path, root_env_file: Path) -> list[Step]:
-    """The agent stack's containers, stopped ones included, with their health."""
-    return _steps(stack_dir, root_env_file, ['ps', '--all'])
-
-
 # ---------------------------------------------------------------------------------------------
 # THE DEV PROJECT'S TWO READ-ONLY COMMANDS (see DEV_PROJECT above). A separate prefix, a separate
-# step builder and a separate argv check, sharing nothing with the agent stack's: a change to one
+# step builder and a separate argv check, sharing nothing with the file-based builders': a change to one
 # cannot retarget the other, which is the failure this whole section is shaped to make impossible.
 def dev_compose_prefix() -> list[str]:
     """`docker compose -p DEV_PROJECT`, and nothing else: no -f, no --project-directory, no --env-file.
 
-    Four words. Everything the agent stack's compose_prefix() adds is content or configuration, and
-    none of it may reach the user's own project.
+    Four words. Everything the file-based prefixes add (-f, --project-directory) is content or
+    configuration, and none of it may reach the label-only verbs.
     """
     return [DOCKER, 'compose', '-p', DEV_PROJECT]
 
@@ -1352,7 +916,7 @@ def dev_file_prefix(repo_host_path: Path) -> list[str]:
 
 
 def dev_tools_prefix(repo_host_path: Path) -> list[str]:
-    """dev_file_prefix with the TRUSTED docker-compose.tools.yaml (pgAdmin) added, for dev_tools alone.
+    """dev_file_prefix with the TRUSTED docker-compose.tools.yaml (pgAdmin) added, for tools alone.
 
     The Makefile's TOOLS_COMPOSE is the dev four plus the tools file; the MCP-only overlay stays LAST so
     its build.dockerfile wins, as in dev_file_prefix. No other verb loads this file: it carries `:?`
@@ -1386,8 +950,8 @@ def check_dev_argv(argv: Sequence[str]) -> None:
     """Refuse any dev argv but `docker compose -p DEV_PROJECT <ps|logs> ...` with no steering option.
 
     Checked on the words that go to the daemon, not on the builders' intent, and raised as Refused so
-    a would-be violation is audited and no subprocess runs. The agent stack's own PROJECT is refused
-    here exactly as any other name is: these verbs reach one project and it is not that one.
+    a would-be violation is audited and no subprocess runs. Any other project name is refused
+    here: these verbs reach DEV_PROJECT and nothing else.
 
     All three spellings of a steering option are refused after the prefix: separated (`-f x`),
     attached long (`--env-file=x`) and attached short (`-fx`, `-px`).
@@ -1506,12 +1070,12 @@ def check_dev_lifecycle_argv(argv: Sequence[str], repo_host_path: Path | None = 
     """Refuse any dev lifecycle argv but one row of DEV_LIFECYCLE_COMMANDS under its own prefix, whole.
 
     A label-only row runs under dev_compose_prefix() alone; a file-based row under
-    dev_file_prefix(repo_host_path), so REPO_HOST_PATH is required to accept one; the dev_tools row
+    dev_file_prefix(repo_host_path), so REPO_HOST_PATH is required to accept one; the tools row
     only under dev_tools_prefix (the tools file added), the test_build row only under testmode_build_prefix
     (the fake and test-overlay files, the only set that can build :test), the test_up row only under
     testmode_prefix, and no other row under any of them. Checked on the
     words that go to the daemon, not on the builders' intent. check_dev_argv stays as it is, for the
-    read-only dev_ps and dev_logs.
+    read-only ps and logs.
     """
     words = list(argv)
     label_prefix = dev_compose_prefix()
@@ -1600,10 +1164,10 @@ def dev_pinned_step_env() -> tuple[tuple[str, str], ...]:
 
 
 def dev_placeholder_step_env() -> tuple[tuple[str, str], ...]:
-    """The step environment of a verb that creates nothing (dev_build): placeholders, env files at /dev/null.
+    """The step environment of a verb that creates nothing (build): placeholders, env files at /dev/null.
 
     COMPOSE_ENV_FILES is /dev/null here, not the shared steering value '': compose may read an empty
-    value as unset and then load <project-directory>/.env for interpolation, and dev_build reads no env
+    value as unset and then load <project-directory>/.env for interpolation, and build reads no env
     file (D5). The key appears once, in the shared steering position.
     """
     steering = tuple((name, '/dev/null' if name == 'COMPOSE_ENV_FILES' else value) for name, value in _DEV_STEERING_ENV)
@@ -1620,7 +1184,7 @@ def testmode_pinned_step_env() -> tuple[tuple[str, str], ...]:
 
 
 def testmode_placeholder_step_env() -> tuple[tuple[str, str], ...]:
-    """test_build's step environment: dev_build's placeholders (no env file is read) plus DATA_DIR on the test dir."""
+    """test_build's step environment: build's placeholders (no env file is read) plus DATA_DIR on the test dir."""
     return (*dev_placeholder_step_env(), ('DATA_DIR', TEST_DATA_DIR))
 
 
@@ -1704,7 +1268,7 @@ TEST_BIND_SOURCES = ('server/data/store/alembic.ini', 'server/data/store/migrati
 # would act on it. One `docker ps` over the config_files label, over the project's NON-one-off
 # containers (alembic runs and test_client are `run` containers and are ignored), classified by the
 # basename of each container's files exactly as run_migrations.sh's classify_config_files does:
-#   DEV   the override present, the fake file absent        (make dev-up, MCP dev_up)
+#   DEV   the override present, the fake file absent        (make dev-up, MCP up)
 #   TEST  the fake file present, the override absent        (make system-launch, MCP test_up)
 #   PROD  anything else: neither file, both together (no target launches that pair), a malformed or
 #         missing label
@@ -1717,9 +1281,9 @@ DEV_CONFIG_FILES_LABEL = 'com.docker.compose.project.config_files'
 MODE_DEV = 'DEV'
 MODE_TEST = 'TEST'
 MODE_PROD = 'PROD'
-# The modes each verb acts on; None is an empty project. dev_up and test_up stop the project first, so
-# they act on any non-PROD state. dev_down and dev_restart act on whatever launched mode is up.
-# dev_tools is dev-only; migrate and migrate_status act on DEV or TEST (an empty project is refused).
+# The modes each verb acts on; None is an empty project. up and test_up stop the project first, so
+# they act on any non-PROD state. down and restart act on whatever launched mode is up.
+# tools is dev-only; migrate and migrate_status act on DEV or TEST (an empty project is refused).
 MODES_ANY = frozenset({MODE_DEV, MODE_TEST, None})
 MODES_DEV_OR_EMPTY = frozenset({MODE_DEV, None})
 MODES_DEV_OR_TEST = frozenset({MODE_DEV, MODE_TEST})
@@ -1826,7 +1390,7 @@ def check_mode_guard(
 # S6. The compose files, the Dockerfile and the two scripts the file-based dev verbs use are run from
 # copies baked into the MCP image; when the checkout's differ, the verb would create containers from
 # yesterday's files. Fail-safe: a difference can only refuse. docker-compose.tools.yaml is baked too
-# (dev_tools and the down fallback load it), so it is compared with the rest, and so are the test
+# (tools and the down fallback load it), so it is compared with the rest, and so are the test
 # mode's two (docker-compose.fake.yaml, docker-compose.agent-test.yaml).
 DEV_TRUSTED_COPIES = (
     *((name, name) for name in DEV_COMPOSE_FILES),
@@ -1896,7 +1460,7 @@ class DevBudget:
 
 
 # ---------------------------------------------------------------------------------------------
-# THE LABEL-ONLY MUTATING VERBS, dev_down AND dev_restart (tj-iee6sn.7; owner rulings D1, D2, D6, D7).
+# THE LABEL-ONLY MUTATING VERBS, down AND restart (tj-iee6sn.7; owner rulings D1, D2, D6, D7).
 # `docker compose -p trader_joe down` and `... restart <service>` pass no -f, so compose may search the
 # step's working directory (the stack directory) and every parent for a compose file, and reads a .env
 # beside one. The step's environment is pinned (dev_label_only_step_env) and this refuses, before the
@@ -1938,7 +1502,7 @@ def dev_label_only_step_env() -> tuple[tuple[str, str], ...]:
 
 
 def validate_dev_restart_service(service: object) -> str:
-    """dev_restart's service must be one of the closed DEV_RESTART_SERVICES (postgres is not one)."""
+    """The restart verb's service must be one of the closed DEV_RESTART_SERVICES (postgres is not one)."""
     if not isinstance(service, str) or service not in DEV_RESTART_SERVICES:
         raise Refused(f'service must be one of: {", ".join(DEV_RESTART_SERVICES)}')
     return service
@@ -1962,7 +1526,7 @@ def dev_restart_steps(stack_dir: Path, service: str) -> list[Step]:
 
 
 # ---------------------------------------------------------------------------------------------
-# dev_build (tj-iee6sn.8; owner rulings D5, D8). `make dev-build` minus its host prerequisites, as a
+# build (tj-iee6sn.8; owner rulings D5, D8). `make dev-build` minus its host prerequisites, as a
 # PLAIN call: file-based, so the project is loaded from the TRUSTED baked compose files with
 # --project-directory the repository's host path. It creates and starts nothing and reads no env file
 # (the step env is dev_placeholder_step_env), so it needs no prod guard, no symlink check and no
@@ -2059,7 +1623,7 @@ def dev_build_step(stack_dir: Path, repo_host_path: Path, digests: Sequence[str]
     if len(digests) != len(DEV_DIGEST_VARIABLES) or not all(
         _DIGEST_PATTERN.fullmatch(f'{digest}\n'.encode()) for digest in digests
     ):
-        raise Refused('dev_build needs exactly one valid source digest per image')
+        raise Refused('build needs exactly one valid source digest per image')
     argv = tuple(dev_file_prefix(repo_host_path) + list(DEV_BUILD_TAIL))
     check_dev_lifecycle_argv(argv, repo_host_path)
     env = (*dev_placeholder_step_env(), *zip(DEV_DIGEST_VARIABLES, digests, strict=True))
@@ -2067,7 +1631,7 @@ def dev_build_step(stack_dir: Path, repo_host_path: Path, digests: Sequence[str]
 
 
 # ---------------------------------------------------------------------------------------------
-# dev_up (tj-iee6sn.9; owner rulings D1, D3, D5, D8; ADR tj-4rr0la addenda 22-24). `make dev-up` as a
+# up (tj-iee6sn.9; owner rulings D1, D3, D5, D8; ADR tj-4rr0la addenda 22-24). `make dev-up` as a
 # PLAIN call: the label-only down (single instance, D1), the devnet network, then the file-based up of
 # postgres and the three app services. It never builds on purpose (a build cannot fit its 600 s), so the
 # three :dev images must already exist.
@@ -2133,7 +1697,7 @@ def dev_up_step(stack_dir: Path, repo_host_path: Path, digests: Sequence[str]) -
     if len(digests) != len(DEV_DIGEST_VARIABLES) or not all(
         _DIGEST_PATTERN.fullmatch(f'{digest}\n'.encode()) for digest in digests
     ):
-        raise Refused('dev_up needs exactly one valid source digest per image')
+        raise Refused('up needs exactly one valid source digest per image')
     argv = (*dev_up_wrapper_head(repo_host_path), *dev_file_prefix(repo_host_path), *DEV_UP_TAIL)
     check_dev_up_argv(argv, repo_host_path)
     env = (*dev_pinned_step_env(), *zip(DEV_DIGEST_VARIABLES, digests, strict=True))
@@ -2295,7 +1859,7 @@ def check_test_postgres_mount(exit_status: int | None, stdout: bytes, repo_host_
 # DEV from TEST (any PROD container, or both modes, was refused), and the MCP adds the script's own
 # one-postgres / at-most-one-data_store counts. DEV runs the file-based one-off `run --rm --no-deps data_store
 # alembic upgrade head` over the dev files, wrapped (compose interpolates the web files' INSTANCE_WRITE_SECRET
-# `:?` guard even for a one-off of data_store, so it goes through dev_up's fixed secret wrapper, under the
+# `:?` guard even for a one-off of data_store, so it goes through up's fixed secret wrapper, under the
 # pinned environment; make migrate loads only the first two files and needs no secret). TEST runs the same
 # words over the TEST set (base + docker-compose.fake.yaml: the :test image, no web file, no wrapper), with
 # DATA_DIR pinned on the test dir as test_up's is.
@@ -2381,8 +1945,8 @@ def refuse_several_dev_containers(service: str, lookup_stdout: bytes) -> None:
 
 
 def stamp_image_fix(image: str) -> str:
-    """The verb that rebuilds IMAGE: test_build for a :test image, dev_build for a :dev one."""
-    return 'call test_build' if image in TEST_IMAGES else 'call dev_build'
+    """The verb that rebuilds IMAGE: test_build for a :test image, build for a :dev one."""
+    return 'call test_build' if image in TEST_IMAGES else 'call build'
 
 
 def dev_stamp_argv(image: str = DEV_IMAGES[0]) -> tuple[str, ...]:
@@ -2432,7 +1996,7 @@ def check_dev_image_stamp(
 ) -> None:
     """run_migrations.sh's verify_comparison_image, minus its escape hatch: Refused unless the stamp equals the digest.
 
-    Three refusals, all naming the fix (stamp_image_fix(IMAGE): call dev_build, or call test_build for a
+    Three refusals, all naming the fix (stamp_image_fix(IMAGE): call build, or call test_build for a
     :test image). A failed read means the image is not there; a stamp that is not 64 lowercase hex (an
     unstamped image: one CI pulled and retagged, or one a bare compose build or run made implicitly) cannot be verified; a valid stamp
     that differs is a stale image. A match returns.
@@ -2513,7 +2077,7 @@ DEV_EXEC_PGOPTIONS = 'PGOPTIONS=-c default_transaction_read_only=on'
 _DEV_EXEC_OPTIONS_POSTGRES = ('-u', 'postgres', '-e', DEV_EXEC_PGOPTIONS)
 _DEV_EXEC_OPTIONS_CODE = ('-w', '/code')
 
-# dev_db_tables: the tables whose presence it reports (to_regclass, so a missing one is false, not an
+# db_tables: the tables whose presence it reports (to_regclass, so a missing one is false, not an
 # error), in the order of the models under server/data/store/app/database/models. The schema is the
 # default, public: no model names another. alembic_version is alembic's own bookkeeping table.
 DEV_DB_TABLES = (
@@ -2617,7 +2181,7 @@ done"""
 )
 DEV_MIGRATE_STATUS_TAIL = ('sh', '-c', DEV_MIGRATE_STATUS_SCRIPT)
 
-# dev_http_get: ONE GET of one of three fixed paths, by exec in the RUNNING data_store container
+# http_get: ONE GET of one of three fixed paths, by exec in the RUNNING data_store container
 # against http://127.0.0.1:$APP_INTERNAL_PORT, the way that service's own healthcheck probes /ping (the
 # image has python, no curl). The only caller input is NAME, a key of DEV_HTTP_GET_PATHS; the path is a
 # literal baked into that name's script, so no caller string reaches the argv or the script. The paths
@@ -2782,7 +2346,7 @@ def pick_dev_target(service: str, lookup_stdout: bytes) -> str:
     if not ids:
         raise Refused(
             f'no running {service} container in the {DEV_PROJECT} project: '
-            'start the project first: dev_up (your dev data) or test_up (test mode)'
+            'start the project first: up (your dev data) or test_up (test mode)'
         )
     if len(ids) > 1:
         raise Refused(
@@ -2833,7 +2397,7 @@ def dev_exec_steps(stack_dir: Path, container_id: str, tail: Sequence[str]) -> l
 
 
 def dev_db_tables_steps(stack_dir: Path, container_id: str) -> list[Step]:
-    """dev_db_tables' one exec: the fixed psql script, as user postgres, in a read-only session."""
+    """db_tables' one exec: the fixed psql script, as user postgres, in a read-only session."""
     return dev_exec_steps(stack_dir, container_id, DEV_DB_TABLES_TAIL)
 
 
@@ -2850,7 +2414,7 @@ def validate_dev_http_get_name(name: object) -> str:
 
 
 def dev_http_get_steps(stack_dir: Path, container_id: str, name: str) -> list[Step]:
-    """dev_http_get's one exec: the fixed GET script of NAME's path, in the running data_store."""
+    """http_get's one exec: the fixed GET script of NAME's path, in the running data_store."""
     return dev_exec_steps(stack_dir, container_id, DEV_HTTP_GET_TAILS[validate_dev_http_get_name(name)])
 
 
@@ -2865,7 +2429,7 @@ def parse_http_get_status(stdout: bytes) -> int | None:
     return int(match.group(1)) if match else None
 
 
-# dev_db_tables' output, parsed. A line is `<table>|t` or `<table>|f` for a DEV_DB_TABLES name, or
+# db_tables' output, parsed. A line is `<table>|t` or `<table>|f` for a DEV_DB_TABLES name, or
 # `version_num|<revision>`; anything else is not reported as data (the raw, redacted output stays in
 # the step). A revision is alembic's: letters, digits and underscores.
 _REVISION = re.compile(r'^[A-Za-z0-9_]{1,64}$')

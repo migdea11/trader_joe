@@ -340,14 +340,3 @@ def test_verify_refuses_a_link_or_special_file_anywhere_and_a_missing_entry(tree
     (snapshot / 'uv.lock').unlink()
     with pytest.raises(stack.Refused, match=r'uv\.lock is missing'):
         stack.verify_snapshot(snapshot)
-
-
-def test_ensure_snapshot_reads_no_worktree_and_replaces_a_planted_link(tmp_path: Path):
-    stack_dir = Path(os.path.realpath(tmp_path)) / 'stack'
-    stack_dir.mkdir()
-    outside = tmp_path / 'outside'
-    outside.mkdir()
-    (stack_dir / 'source').symlink_to(outside, target_is_directory=True)
-    live = stack.ensure_snapshot(stack_dir)
-    assert live == stack_dir / 'source' and live.is_dir() and not live.is_symlink()
-    assert list(live.iterdir()) == [] and outside.exists()

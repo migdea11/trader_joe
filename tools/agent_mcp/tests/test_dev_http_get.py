@@ -1,4 +1,4 @@
-"""dev_http_get(name): one GET of one of three fixed paths, by exec in the running dev data_store.
+"""http_get(name): one GET of one of three fixed paths, by exec in the running dev data_store.
 
 tj-iee6sn.13.6 (slice 1 of epic tj-iee6sn). Design: ADR tj-4rr0la addendum 22 (4) and (7) and addendum
 24; the bead's WHAT and TESTS, the architect's 21:47, 22:34 and 23:33 notes, the 00:55 consolidated
@@ -362,7 +362,7 @@ def test_validate_dev_http_get_name_accepts_the_three(name: str):
 
 
 def test_the_schema_is_closed_with_one_required_enum_name():
-    schema = runner.VERB_SCHEMAS['dev_http_get']
+    schema = runner.VERB_SCHEMAS['http_get']
     assert schema['type'] == 'object' and schema['additionalProperties'] is False
     assert schema['required'] == ['name']
     assert list(schema['properties']) == ['name']
@@ -407,14 +407,14 @@ def test_the_verb_refuses_every_other_input_before_docker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arguments: object
 ):
     rig = make_rig(tmp_path, monkeypatch)
-    result = rig.call('dev_http_get', arguments)
+    result = rig.call('http_get', arguments)
     assert result['status'] == 'refused', result
     assert rig.docker.steps == []
 
 
 def test_the_budget_is_sixty_seconds_inside_the_mcp_client_timeout():
     """60 s for one lookup and one GET with a 10 s timeout; the client waits at least 30 s longer."""
-    assert runner.VERB_TIMEOUT_SECONDS['dev_http_get'] == EXPECTED_TIMEOUT_SECONDS
+    assert runner.VERB_TIMEOUT_SECONDS['http_get'] == EXPECTED_TIMEOUT_SECONDS
     client_ms = json.loads(MCP_CONFIG.read_text(encoding='utf-8'))['mcpServers']['agent-stack']['timeout']
     assert client_ms >= EXPECTED_TIMEOUT_SECONDS * 1000 + 30_000
 
@@ -1190,7 +1190,7 @@ def test_the_overall_deadline_is_twenty_seconds_on_top_of_a_ten_second_socket_ti
     assert python.index('body = resp.read(LIMIT + 1)') < python.index('status = resp.status')
     assert python.index('status = resp.status') < python.index('signal.alarm(0)') < python.index('except Exception')
     # Well inside the verb's 60 s, so the in-container process ends before the docker client is killed.
-    assert runner.VERB_TIMEOUT_SECONDS['dev_http_get'] > EXPECTED_OVERALL_DEADLINE + 10
+    assert runner.VERB_TIMEOUT_SECONDS['http_get'] > EXPECTED_OVERALL_DEADLINE + 10
 
 
 def _is_alarm_zero(node: ast.stmt) -> bool:
@@ -1382,19 +1382,19 @@ def test_an_ok_get_runs_the_lookup_then_the_exec_and_reports_the_status(
     rig = make_rig(
         tmp_path, monkeypatch, FakeDocker(respond=_exec_answer(0, f'== GET {path} -> HTTP 200 ==\n{{}}\n'.encode()))
     )
-    result = rig.call('dev_http_get', {'name': name})
+    result = rig.call('http_get', {'name': name})
     assert result['status'] == 'ok', result
     assert result['message'] == f'GET {path} returned HTTP 200 from the running dev data_store'
     assert result['details'] == {'name': name, 'path': path, 'http_status': 200}
     assert [list(step.argv) for step in rig.docker.steps] == [expected_lookup(), expected_exec(name)]
     assert all(step.cwd == rig.layout.stack_dir for step in rig.docker.steps)
     audit = json.loads(rig.audit_lines()[-1])
-    assert audit['verb'] == 'dev_http_get' and audit['status'] == 'ok' and audit['arguments'] == {'name': name}
+    assert audit['verb'] == 'http_get' and audit['status'] == 'ok' and audit['arguments'] == {'name': name}
 
 
 def test_a_non_2xx_is_failed_with_its_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     rig = make_rig(tmp_path, monkeypatch, FakeDocker(respond=_exec_answer(1, b'== GET /ping -> HTTP 404 ==\n{}\n')))
-    result = rig.call('dev_http_get', {'name': 'ping'})
+    result = rig.call('http_get', {'name': 'ping'})
     assert result['status'] == 'failed' and result['exit_status'] == 1, result
     assert result['message'] == 'GET /ping returned HTTP 404 from the running dev data_store; see the steps'
     assert result['details'] == {'name': 'ping', 'path': '/ping', 'http_status': 404}
@@ -1404,7 +1404,7 @@ def test_a_non_2xx_is_failed_with_its_status(tmp_path: Path, monkeypatch: pytest
 def test_no_http_response_is_failed_with_no_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rc: int):
     stdout = b'== GET /ping: no HTTP response ==\nConnectionRefusedError: [Errno 111]\n'
     rig = make_rig(tmp_path, monkeypatch, FakeDocker(respond=_exec_answer(rc, stdout)))
-    result = rig.call('dev_http_get', {'name': 'ping'})
+    result = rig.call('http_get', {'name': 'ping'})
     assert result['status'] == 'failed' and result['exit_status'] == rc, result
     assert result['message'] == 'GET /ping got no HTTP response from the running dev data_store; see the steps'
     assert result['details'] == {'name': 'ping', 'path': '/ping', 'http_status': None}
@@ -1419,7 +1419,7 @@ def test_the_status_is_read_from_the_whole_stdout_not_the_capped_step_text(
     """
     stdout = b'== GET /ping -> HTTP 200 ==\n' + b'a' * EXPECTED_LIMIT + b'\n== body cut at 65536 bytes ==\n'
     rig = make_rig(tmp_path, monkeypatch, FakeDocker(respond=_exec_answer(0, stdout)))
-    result = rig.call('dev_http_get', {'name': 'ping'})
+    result = rig.call('http_get', {'name': 'ping'})
     assert result['status'] == 'ok' and result['details']['http_status'] == 200, result
     step = result['steps'][-1]
     assert step['stdout']['truncated'] is True and step['stdout']['text'].endswith('== body cut at 65536 bytes ==\n')
@@ -1450,16 +1450,16 @@ def test_zero_or_several_containers_are_refused_with_no_exec(
         return default_response(step)
 
     rig = make_rig(tmp_path, monkeypatch, FakeDocker(respond=respond))
-    result = rig.call('dev_http_get', {'name': 'usage_summary'})
+    result = rig.call('http_get', {'name': 'usage_summary'})
     assert result['status'] == 'refused', result
     assert match in result['message'], result
     assert [list(step.argv) for step in rig.docker.steps] == [expected_lookup()], 'an exec ran'
-    names_fallback = 'use dev_db_tables, which works while data_store is down' in result['message']
+    names_fallback = 'use db_tables, which works while data_store is down' in result['message']
     assert names_fallback is match.startswith('no running'), result['message']
     assert 'c0ffee' not in result['message']
     assert 'details' not in result
     audit = json.loads(rig.audit_lines()[-1])
-    assert audit['verb'] == 'dev_http_get' and audit['status'] == 'refused', audit
+    assert audit['verb'] == 'http_get' and audit['status'] == 'refused', audit
 
 
 # ===============================================================================================
@@ -1483,7 +1483,7 @@ def test_the_http_get_docstring_names_the_three_paths_and_the_bound():
     for name, path in EXPECTED_PATHS.items():
         assert f'{name} ({path})' in doc
     assert DROPPED_NAME not in doc and 'reaper' not in doc
-    assert '64 KB' in doc and 'use dev_db_tables' in doc
+    assert '64 KB' in doc and 'use db_tables' in doc
     # R5, in one clause; R3's two bounds by name.
     assert (
         'GET only; Accept is the only header the script sets (http.client adds Host and Accept-Encoding: '
@@ -1517,4 +1517,4 @@ def test_the_stack_comment_states_exactly_what_is_sent_and_both_bounds():
     paths_comment = _comment_before(source, 'DEV_HTTP_GET_PATHS: dict[str, str] = {')
     assert 'one of three fixed paths' in paths_comment and 'REAPER' not in paths_comment
     package_doc = sys.modules['tools.agent_mcp'].__doc__ or ''
-    assert 'dev_http_get(name) does one GET of one of three fixed paths' in package_doc
+    assert 'http_get(name) does one GET of one of three fixed paths' in package_doc

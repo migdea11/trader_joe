@@ -1,8 +1,8 @@
 """The server's own settings, read once from its container environment (tj-c4mosr.4 sets them).
 
 AGENT_MCP_STACK_DIR and AGENT_MCP_REPO_HOST_PATH are HOST absolute paths mounted at the same path (ADR
-tj-4rr0la addendum 1 (d) and addendum 23), because the Docker daemon resolves the snapshot's and the data
-directory's bind sources, and the dev project's, on the host. The other two are CONTAINER paths since addendum 11: AGENT_MCP_REPO_ROOT is /workspace, where
+tj-4rr0la addendum 1 (d) and addendum 23), because the Docker daemon resolves the snapshot's bind sources,
+and the dev and test projects', on the host. The other two are CONTAINER paths since addendum 11: AGENT_MCP_REPO_ROOT is /workspace, where
 the repository is mounted read-only (R1), and AGENT_HOME_PATH is the share directory, /agent_mcp_share
 (R2) -- the token file and seed output, never the user's Claude config. None has a default: a default
 computed from $HOME inside the container would name a directory the daemon has never seen, so an unset
@@ -96,11 +96,11 @@ def load_settings(environ: Mapping[str, str]) -> Settings:
                          default, and refused unless it is the very tree AGENT_MCP_REPO_ROOT is
                          (the .git/HEAD file is one file through both paths), so a wrong path stops
                          the server at start instead of aiming compose at another directory.
-    AGENT_MCP_STACK_DIR  the agent stack's own directory (env files, data, snapshot, audit log), a
-                         HOST path mounted at the same path, outside the repository and
-                         AGENT_HOME_PATH; default on the host
-                         ${XDG_DATA_HOME:-$HOME/.local/share}/trader_joe_agent_stack, computed by the
-                         host make target, not here.
+    AGENT_MCP_STACK_DIR  the MCP's own working directory: the worktree snapshot (source/) and the
+                         audit log. A HOST path mounted at the same path, outside the repository and
+                         AGENT_HOME_PATH; its default is computed by the host make target, not here.
+                         It holds no env file and no compose data: the one project's data lives under
+                         the checkout's ./volume_data.
     AGENT_HOME_PATH      the share directory, /agent_mcp_share, a container path (addendum 11 R2):
                          the token file is AGENT_HOME_PATH/agent_mcp_token, and seed_dump writes under
                          AGENT_HOME_PATH/agent_mcp_seeds. The name is kept from before R2.

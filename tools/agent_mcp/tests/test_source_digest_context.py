@@ -96,7 +96,7 @@ def _refused(result: subprocess.CompletedProcess) -> None:
 
 @pytest.mark.parametrize(('service_path', 'service_name'), SERVICES, ids=['store', 'ingest'])
 def test_the_trusted_copy_over_the_checkout_gives_the_in_tree_digest(tmp_path: Path, service_path, service_name):
-    """The bead's acceptance, without docker: the digest make dev-build stamps equals dev_build's."""
+    """The bead's acceptance, without docker: the digest make dev-build stamps equals build's."""
     trusted = _trusted(tmp_path / 'compose')
     in_tree = _digest(SCRIPT, service_path, service_name)
     assert _digest(trusted, '--context', str(REPO_ROOT), service_path, service_name) == in_tree

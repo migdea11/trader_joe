@@ -8,7 +8,7 @@ short option, R6 prod is not nameable.
 
 WHAT THIS MODULE IS NOT. test_commands.py:224 already pins each dev verb's WHOLE argv from literals
 and was reddened six ways (DEV_PROJECT retargeted, the prefix growing a -f, the prefix growing an
---env-file, dev_ps becoming a mutating `down`, dev_logs growing --follow). The END STATE is covered
+--env-file, ps becoming a mutating `down`, logs growing --follow). The END STATE is covered
 there. What is covered HERE is the GUARD layer -- the three refusals a mutation could gut with the
 whole suite staying green, which is the definition of an unguarded guard:
     check_dev_argv        gutted to a bare `return`              -> 3005 green
@@ -35,7 +35,7 @@ from typing import Any
 import pytest
 
 from tools.agent_mcp import runner, stack
-from tools.agent_mcp.tests.harness import FakeDocker, forbid_real_subprocesses, make_rig, record_state
+from tools.agent_mcp.tests.harness import FakeDocker, forbid_real_subprocesses, make_rig
 
 
 pytestmark = pytest.mark.build_infra
@@ -44,13 +44,13 @@ pytestmark = pytest.mark.build_infra
 # The user's own dev compose project: the checkout directory's name, which is what the Makefile's
 # DEV_COMPOSE targets get from compose's default because they pass no -p.
 EXPECTED_DEV_PROJECT = 'trader_joe'
-# The agent stack's OWN project, spelled here so a test can assert the dev verbs cannot reach it
-# either. These verbs reach one project and it is not this one.
+# The RETIRED agent stack's project (tj-iee6sn.21), spelled here so a test can assert the dev verbs
+# cannot reach it either. These verbs reach one project and it is not this one.
 EXPECTED_AGENT_PROJECT = 'trader_joe_agent_stack'
 EXPECTED_DOCKER = '/usr/local/bin/docker'
 EXPECTED_DEV_PREFIX = [EXPECTED_DOCKER, 'compose', '-p', EXPECTED_DEV_PROJECT]
 # R3: the closed service enum, by membership. web joined it with ADR tj-4rr0la addendum 23 (2)
-# ("dev_logs: its enum gains web"; tj-iee6sn.6). pgAdmin is deliberately absent -- it lives in
+# ("logs: its enum gains web"; tj-iee6sn.6). pgAdmin is deliberately absent -- it lives in
 # docker-compose.tools.yaml, a file no log or ps verb loads.
 EXPECTED_DEV_SERVICES = ('postgres', 'data_store', 'data_ingest', 'web')
 # The only two subcommands a dev verb may spell, both read-only.
@@ -65,13 +65,13 @@ EXPECTED_DEV_FORBIDDEN_OPTIONS = {
     '--env-file',
     '--profile',
 }
-# The agent stack's logs clamp, which the dev pair must share rather than invent a second rule.
+# The one logs clamp (stack.clamp_tail), which logs must use rather than invent a second rule.
 EXPECTED_TAIL_MAX = 2000
 EXPECTED_TAIL_DEFAULT = 200
 # Both dev budgets are their read-only siblings': the same two compose calls.
 EXPECTED_DEV_TIMEOUT_SECONDS = 60
 
-DEV_VERBS = ('dev_ps', 'dev_logs')
+DEV_VERBS = ('ps', 'logs')
 
 
 def _dev_steps(rig) -> list[list[str]]:
@@ -109,7 +109,7 @@ def test_the_dev_service_enum_holds_exactly_these_four_names():
 
 def test_the_advertised_dev_logs_enum_is_the_same_four_names():
     """The schema an MCP client reads and the set the server enforces must not drift apart."""
-    assert runner.VERB_SCHEMAS['dev_logs']['properties']['service']['enum'] == list(EXPECTED_DEV_SERVICES)
+    assert runner.VERB_SCHEMAS['logs']['properties']['service']['enum'] == list(EXPECTED_DEV_SERVICES)
 
 
 def test_only_two_read_only_subcommands_are_spellable():
@@ -139,8 +139,6 @@ def test_both_dev_verbs_carry_a_timeout_budget():
     """The bead's 'timeout budgets exist for both', from a literal rather than from the sibling's entry."""
     for verb in DEV_VERBS:
         assert runner.VERB_TIMEOUT_SECONDS[verb] == EXPECTED_DEV_TIMEOUT_SECONDS, verb
-    assert runner.VERB_TIMEOUT_SECONDS['logs'] == runner.VERB_TIMEOUT_SECONDS['dev_logs']
-    assert runner.VERB_TIMEOUT_SECONDS['ps'] == runner.VERB_TIMEOUT_SECONDS['dev_ps']
 
 
 # ===============================================================================================
@@ -258,7 +256,7 @@ def test_the_dev_step_builders_run_check_dev_argv_on_the_argv_they_hand_the_daem
         raise stack.Refused('spy refusal')
 
     monkeypatch.setattr(stack, 'check_dev_argv', spy)
-    for verb, arguments in (('dev_ps', {}), ('dev_logs', {'service': 'postgres', 'tail': 50})):
+    for verb, arguments in (('ps', {}), ('logs', {'service': 'postgres', 'tail': 50})):
         seen.clear()
         rig = make_rig(tmp_path / verb, monkeypatch, FakeDocker())
         result = rig.call(verb, arguments)
@@ -327,27 +325,12 @@ def test_dev_logs_refuses_a_service_outside_the_enum_before_docker_is_reached(
     'ok'. The refusal must be audited and no subprocess may run.
     """
     rig = make_rig(tmp_path, monkeypatch)
-    result = rig.call('dev_logs', {'service': service, 'tail': 50})
+    result = rig.call('logs', {'service': service, 'tail': 50})
     assert result['status'] == 'refused' and 'service must be one of' in result['message'], result
     assert rig.docker.steps == [], f'{service!r} reached docker'
     audit = json.loads(rig.audit_lines()[-1])
-    assert audit['verb'] == 'dev_logs' and audit['status'] == 'refused', audit
+    assert audit['verb'] == 'logs' and audit['status'] == 'refused', audit
     assert audit['arguments'] is None, 'a refused argument reached the audit log'
-
-
-def test_the_two_service_enums_are_separate_objects_so_widening_one_cannot_widen_the_other(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    """The agent stack's SERVICES and the dev project's DEV_SERVICES hold the same names by accident today.
-
-    They are kept apart so that adding a service to one stack cannot silently widen what the other's
-    verb accepts. Widening SERVICES here must leave dev_logs refusing the new name.
-    """
-    monkeypatch.setattr(stack, 'SERVICES', (*stack.SERVICES, 'pgadmin'))
-    rig = make_rig(tmp_path, monkeypatch)
-    result = rig.call('dev_logs', {'service': 'pgadmin', 'tail': 50})
-    assert result['status'] == 'refused', result
-    assert rig.docker.steps == []
 
 
 # ===============================================================================================
@@ -388,24 +371,24 @@ _FORBIDDEN_SCHEMA_FIELDS = (
 
 def test_neither_dev_schema_has_a_project_a_file_or_a_command_field():
     """R6: the project is not an argument because there is no argument that could carry it."""
-    assert set(runner.VERB_SCHEMAS['dev_ps']['properties']) == set(), 'dev_ps takes no argument at all'
-    assert set(runner.VERB_SCHEMAS['dev_logs']['properties']) == {'service', 'tail'}
+    assert set(runner.VERB_SCHEMAS['ps']['properties']) == set(), 'ps takes no argument at all'
+    assert set(runner.VERB_SCHEMAS['logs']['properties']) == {'service', 'tail'}
     for verb in DEV_VERBS:
         schema = runner.VERB_SCHEMAS[verb]
         assert schema['additionalProperties'] is False and schema['type'] == 'object', verb
         present = [field for field in _FORBIDDEN_SCHEMA_FIELDS if field in schema['properties']]
         assert not present, f'{verb} advertises {present}, which could steer compose'
-    assert runner.VERB_SCHEMAS['dev_logs']['required'] == ['service'], 'service is not optional'
+    assert runner.VERB_SCHEMAS['logs']['required'] == ['service'], 'service is not optional'
 
 
 # Every argument either verb accepts: the whole cross product of the enum and the clamp's interesting
-# values, plus dev_logs with `tail` omitted (its default). If the project were reachable from an
+# values, plus logs with `tail` omitted (its default). If the project were reachable from an
 # argument at all, it would be reachable from one of these.
 _ACCEPTED_CALLS: dict[str, tuple[str, dict[str, Any]]] = {
-    'dev_ps': ('dev_ps', {}),
-    'dev_logs default tail': ('dev_logs', {'service': 'postgres'}),
+    'ps': ('ps', {}),
+    'logs default tail': ('logs', {'service': 'postgres'}),
     **{
-        f'dev_logs {service} tail={tail}': ('dev_logs', {'service': service, 'tail': tail})
+        f'logs {service} tail={tail}': ('logs', {'service': service, 'tail': tail})
         for service in EXPECTED_DEV_SERVICES
         for tail in (-(10**9), -1, 0, 1, 50, EXPECTED_TAIL_DEFAULT, EXPECTED_TAIL_MAX, EXPECTED_TAIL_MAX + 1, 10**9)
     },
@@ -471,7 +454,7 @@ def test_the_dev_verbs_run_outside_the_repository_and_name_no_path(tmp_path: Pat
     guard this epic must not defeat, is never named and never reachable by discovery.
     """
     rig = make_rig(tmp_path, monkeypatch)
-    for verb, arguments in (('dev_ps', {}), ('dev_logs', {'service': 'postgres', 'tail': 50})):
+    for verb, arguments in (('ps', {}), ('logs', {'service': 'postgres', 'tail': 50})):
         rig.docker.steps.clear()
         assert rig.call(verb, dict(arguments))['status'] == 'ok'
         for step in rig.docker.steps:
@@ -479,23 +462,6 @@ def test_the_dev_verbs_run_outside_the_repository_and_name_no_path(tmp_path: Pat
             named = [word for word in step.argv if str(rig.layout.repo) in word or str(rig.layout.worktree) in word]
             assert not named, f'{verb} hands the daemon a repository path: {named}'
             assert not [word for word in step.argv if word.endswith(('.yaml', '.yml', '.env'))], list(step.argv)
-
-
-def test_the_agent_stack_verbs_still_target_the_agent_stack_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """The worst available outcome is a change here that quietly RETARGETS an existing verb.
-
-    test_commands.py pins the agent stack's prefix in full; this is the cross-check from the other
-    side -- the agent stack's own read-only siblings must not drift onto the dev project.
-    """
-    rig = make_rig(tmp_path, monkeypatch)
-    record_state(rig.layout)
-    for verb, arguments in (('ps', {}), ('logs', {'service': 'postgres', 'tail': 50})):
-        rig.docker.steps.clear()
-        assert rig.call(verb, dict(arguments))['status'] == 'ok'
-        for step in rig.docker.steps:
-            argv = list(step.argv)
-            assert argv[:4] == [EXPECTED_DOCKER, 'compose', '-p', EXPECTED_AGENT_PROJECT], argv
-            assert EXPECTED_DEV_PROJECT not in argv, f'{verb} reached the dev project: {argv}'
 
 
 # ===============================================================================================
@@ -517,25 +483,19 @@ def test_the_agent_stack_verbs_still_target_the_agent_stack_project(tmp_path: Pa
         (10**9, EXPECTED_TAIL_MAX),
     ],
 )
-def test_the_dev_tail_is_clamped_at_both_ends_by_the_same_rule_as_the_agent_stack_logs(
+def test_the_dev_tail_is_clamped_at_both_ends_by_the_one_clamp_rule(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, given: int, expected: int
 ):
-    """Clamped at BOTH ends, and by the EXISTING rule rather than a second one.
+    """Clamped at BOTH ends, and by stack.clamp_tail rather than a second rule.
 
-    The two verbs are run with the same `tail` and their --tail words compared, so a dev verb that
-    grew its own clamp would go red even if that clamp also happened to be 1..2000.
+    Re-pointed from a comparison with the agent stack's logs verb (removed, tj-iee6sn.21): the --tail
+    word must equal the literal expectation AND what clamp_tail itself returns, so a dev verb that grew
+    its own clamp, or a clamp_tail changed alone, goes red.
     """
     rig = make_rig(tmp_path, monkeypatch)
-    assert rig.call('dev_logs', {'service': 'postgres', 'tail': given})['status'] == 'ok'
-    dev_argv = _dev_steps(rig)[-1]
-    assert dev_argv[dev_argv.index('--tail') + 1] == str(expected), dev_argv
-
-    rig.docker.steps.clear()
     assert rig.call('logs', {'service': 'postgres', 'tail': given})['status'] == 'ok'
-    sibling = _dev_steps(rig)[-1]
-    assert sibling[sibling.index('--tail') + 1] == dev_argv[dev_argv.index('--tail') + 1], (
-        'the dev clamp and the agent stack clamp disagree, so one of them is a second rule'
-    )
+    dev_argv = _dev_steps(rig)[-1]
+    assert dev_argv[dev_argv.index('--tail') + 1] == str(expected) == str(stack.clamp_tail(given)), dev_argv
 
 
 @pytest.mark.parametrize('tail', ['10', True, 1.0, None, [10], {'tail': 10}])
@@ -544,19 +504,19 @@ def test_a_dev_tail_that_is_not_an_integer_is_refused_before_docker(
 ):
     """The schema's `type` is never applied by _check_arguments, so clamp_tail is the only gate here too."""
     rig = make_rig(tmp_path, monkeypatch)
-    result = rig.call('dev_logs', {'service': 'postgres', 'tail': tail})
+    result = rig.call('logs', {'service': 'postgres', 'tail': tail})
     assert result['status'] == 'refused' and 'tail must be an integer' in result['message'], result
     assert rig.docker.steps == []
 
 
 def test_dev_logs_omitting_tail_uses_the_shared_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     rig = make_rig(tmp_path, monkeypatch)
-    assert rig.call('dev_logs', {'service': 'postgres'})['status'] == 'ok'
+    assert rig.call('logs', {'service': 'postgres'})['status'] == 'ok'
     argv = _dev_steps(rig)[-1]
     assert argv[argv.index('--tail') + 1] == str(EXPECTED_TAIL_DEFAULT), argv
 
 
-@pytest.mark.parametrize(('verb', 'arguments'), [('dev_ps', {}), ('dev_logs', {'service': 'postgres', 'tail': 50})])
+@pytest.mark.parametrize(('verb', 'arguments'), [('ps', {}), ('logs', {'service': 'postgres', 'tail': 50})])
 def test_an_accepted_dev_call_is_audited_with_its_arguments(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str, arguments: dict[str, Any]
 ):
@@ -567,18 +527,18 @@ def test_an_accepted_dev_call_is_audited_with_its_arguments(
     assert len(lines) == 1, lines
     audit = json.loads(lines[-1])
     assert audit['verb'] == verb and audit['known'] is True and audit['status'] == 'ok', audit
-    expected_arguments = {'tail': EXPECTED_TAIL_DEFAULT, **arguments} if verb == 'dev_logs' else {}
+    expected_arguments = {'tail': EXPECTED_TAIL_DEFAULT, **arguments} if verb == 'logs' else {}
     assert audit['arguments'] == expected_arguments, audit
 
 
 @pytest.mark.parametrize(
     ('verb', 'arguments'),
     [
-        ('dev_logs', {'service': 'redis'}),
-        ('dev_logs', {}),
-        ('dev_logs', {'service': 'postgres', 'bogus': 1}),
-        ('dev_ps', {'service': 'postgres'}),
-        ('dev_ps', 'ps --all'),
+        ('logs', {'service': 'redis'}),
+        ('logs', {}),
+        ('logs', {'service': 'postgres', 'bogus': 1}),
+        ('ps', {'service': 'postgres'}),
+        ('ps', 'ps --all'),
     ],
     ids=[
         'service outside the enum',
@@ -653,6 +613,6 @@ def test_an_attached_short_option_is_not_reachable_from_any_accepted_argument(
     silent.
     """
     rig = make_rig(tmp_path, monkeypatch)
-    result = rig.call('dev_logs', {'service': word, 'tail': 50})
+    result = rig.call('logs', {'service': word, 'tail': 50})
     assert result['status'] == 'refused', result
     assert rig.docker.steps == [], f'{word} reached the daemon'

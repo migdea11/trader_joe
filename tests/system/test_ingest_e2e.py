@@ -4,7 +4,8 @@ Design: decision tj-j4wknb (the fake is a BrokerRead in tests/fakes, run by the 
 the fake-mode overlay starts; addendum 5: the broker range is half-open), tj-vhboky.54 DECISION 4
 (what a failure test asserts), tj-vhboky.6 (identity, own overlap, no policy merge), tj-vhboky.8
 (write routes), tj-1bl90i (a naive expiry is refused, not converted), ADR tj-4rr0la addendum 3 (3)
-(the agent stack loads the fake overlay last, so data_ingest runs FakeRead).
+(test mode, make system-launch or the MCP's test_up, loads the fake overlay, so data_ingest runs FakeRead;
+addendum 27).
 
 THE STACK MUST BE IN FAKE MODE: data_ingest's log carries the 'FAKE BROKER:' banner. Against a
 real broker these symbols are not tickers and every test here fails -- never skips.

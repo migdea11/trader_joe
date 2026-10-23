@@ -120,7 +120,7 @@ updates:
   # A DIGEST BUMP IS TWO EDITS. The agent-stack MCP pulls exactly the refs listed in
   # tools/agent_mcp/stack.py BASE_IMAGES before it builds, so a Dependabot pull request
   # that moves a digest here must update BASE_IMAGES in the same pull request; the
-  # validator's equality pin fails until it does. It reaches the agent stack only on
+  # validator's equality pin fails until it does. It reaches the MCP only on
   # `make agent-mcp-rebuild`.
   #
   # NOT VERIFIED: whether Dependabot tracks the `COPY --from=ghcr.io/astral-sh/uv` ref at

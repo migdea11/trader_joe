@@ -29,7 +29,7 @@ from common.tests.compose_model import (
     volume,
 )
 from common.tests.test_ci_invariants import SYSTEM_SECRET_KEYS, _every_compose_file
-from tools.agent_mcp import stack
+from common.tests.test_fake_overlay import _credential_vars
 
 
 pytestmark = pytest.mark.build_infra
@@ -65,12 +65,13 @@ def _mentions_socket(value: object) -> bool:
 def test_docker_sock_is_mounted_by_exactly_one_service_in_the_repository():
     """Body bullet 6 / addendum 1 (f): socket_proxy in docker-compose.agent-mcp.yaml, and nothing else anywhere.
 
-    Every compose file (base, override, tools, test-client, agent-stack, agent-mcp, devcontainer), every
-    service, every key -- volumes, environment (DOCKER_HOST=unix://...), devices, anything.
+    Every compose file (base, override, tools, test-client, the MCP-only overlays, agent-mcp, devcontainer),
+    every service, every key -- volumes, environment (DOCKER_HOST=unix://...), devices, anything. The floor
+    names an MCP-only overlay in place of the retired agent-stack one (tj-iee6sn.21).
     """
     files = _every_compose_file()
     names = {path.name for path in files}
-    assert {'docker-compose.agent-mcp.yaml', 'docker-compose.agent-stack.yaml', 'compose.yml'} <= names, names
+    assert {'docker-compose.agent-mcp.yaml', 'docker-compose.agent-dev.yaml', 'compose.yml'} <= names, names
     holders = [
         (path.relative_to(REPO_ROOT).as_posix(), name)
         for path in files
@@ -116,7 +117,7 @@ def _docstring_sections() -> tuple[set[str], set[str]]:
 # The sections the verbs need, from literals. Every one but EXEC since addendum 1; EXEC since ADR
 # tj-4rr0la addendum 22 (owner ruling D9 on tj-iee6sn.13.1): creating an exec is POST
 # /containers/{id}/exec, under CONTAINERS, but STARTING it is /exec/{id}/start, which only this
-# section opens, so the read-only dev diagnostics (dev_db_tables first) cannot run without it.
+# section opens, so the read-only dev diagnostics (db_tables first) cannot run without it.
 EXPECTED_PROXY_NEEDED = {
     'PING',
     'VERSION',
@@ -509,11 +510,13 @@ DEVCONTAINER_AGENT_ENVIRONMENT_KEYS = frozenset(
 # turns up in whatever authentication error a missing credential goes on to cause: it must stay
 # non-empty, and must stay unmistakable for a credential.
 AGENT_CREDENTIAL_SENTINEL = 'UNSET-start-with-make-agent-up-from-the-repo-root'
-# The broker family, from the one definition the repository already has (tools/agent_mcp/stack.py:231),
-# never respelled here -- so a third broker key added THERE is refused HERE automatically. The vendor
-# prefixes are derived from those same names, so ALPACA_ANYTHING is refused without naming 'ALPACA'.
-BROKER_FAMILY = frozenset(stack.BROKER_CREDENTIALS)
-BROKER_PREFIXES = tuple(sorted({f'{name.partition("_")[0]}_' for name in stack.BROKER_CREDENTIALS}))
+# The broker family, from the definition production reads its keys from (broker_api.py's
+# ALPACA_CREDENTIAL_VARS, by ast through test_fake_overlay's reader), never respelled here -- so a third
+# broker key added THERE is refused HERE automatically. Re-pointed from stack.BROKER_CREDENTIALS, which
+# went with the agent stack's generated env files (tj-iee6sn.21). The vendor prefixes are derived from
+# those same names, so ALPACA_ANYTHING is refused without naming 'ALPACA'.
+BROKER_FAMILY = frozenset(_credential_vars())
+BROKER_PREFIXES = tuple(sorted({f'{name.partition("_")[0]}_' for name in BROKER_FAMILY}))
 # A value that is nothing but an interpolation of ONE named variable with a literal default.
 _PURE_INTERPOLATION = re.compile(r'\$\{(\w+):-([^${}]+)\}')
 
@@ -642,8 +645,8 @@ def test_no_broker_family_key_reaches_the_agent_container():
     framework API to have ingest run queries." An agent reaches a real vendor fetch by driving
     data_ingest over devnet, never by holding a vendor key.
 
-    Keyed on the family, not on two spellings: the names come from tools/agent_mcp/stack.py's
-    BROKER_CREDENTIALS, and the vendor prefixes are derived from them, so a third broker key added
+    Keyed on the family, not on two spellings: the names come from broker_api.py's
+    ALPACA_CREDENTIAL_VARS, and the vendor prefixes are derived from them, so a third broker key added
     there is refused here with no edit. Scanned over the WHOLE service and not just the environment
     block -- a key smuggled in through command:, build.args or a volume is the same credential.
     """

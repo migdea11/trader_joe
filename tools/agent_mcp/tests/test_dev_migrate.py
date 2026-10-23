@@ -12,13 +12,13 @@ migrate, a refusal at any point running nothing after it and charging nothing:
     the mode guard FIRST (one `docker ps`; DEV or TEST; empty, PROD and mixed refuse) -> S6 stale copies
     -> D6 on the MODE's bind sources -> D5 env-file preflight -> the empty-versions guard (no step) -> the
     postgres lookup (exactly one) -> the data_store lookup (several refuse, none passes, as select_stack)
-    -> `docker image inspect` of the mode's data_store image (:dev 'call dev_build' / :test 'call
+    -> `docker image inspect` of the mode's data_store image (:dev 'call build' / :test 'call
     test_build') -> TEST ONLY, the stamp gate: the data_ingest lookup, then -- when data_store or
     data_ingest runs -- the two trusted digests (a failure answers failed, uncharged) and one container
     stamp read per RUNNING service (stale, unstamped or unreadable: 'stale test stack: call test_build,
     then test_up') -> ONE budget charge -> the bases (the one-off `run` of data_store is flagged as
     building) -> the one-off `run --rm --no-deps data_store /code/.venv/bin/alembic upgrade head`:
-        DEV   through dev_up's fixed `sh -c` secret wrapper over the dev files, dev_pinned_step_env()
+        DEV   through up's fixed `sh -c` secret wrapper over the dev files, dev_pinned_step_env()
         TEST  UNWRAPPED over base + docker-compose.fake.yaml, the pinned env plus DATA_DIR=./volume_data/test
 
 migrate_status: the mode guard (DEV or TEST), the data_store lookup, ONE exec of alembic current and
@@ -115,16 +115,16 @@ SELECTION = {
         'in TEST mode (the :test image; alembic.ini and revisions from the root checkout)'
     ),
 }
-NOTHING_UP = 'nothing is up: call dev_up (your dev data) or test_up first'
+NOTHING_UP = 'nothing is up: call up (your dev data) or test_up first'
 EMPTY_VERSIONS = f'no revision files in {VERSIONS}: wrong checkout?'
 # 183f296: the hint is mode-neutral (it used to say 'start the dev stack first', wrong under TEST).
-NEUTRAL_HINT = 'start the project first: dev_up (your dev data) or test_up (test mode)'
+NEUTRAL_HINT = 'start the project first: up (your dev data) or test_up (test mode)'
 NO_POSTGRES = f'no running postgres container in the trader_joe project: {NEUTRAL_HINT}'
 # The stamp read of the :test data_store IMAGE, the image the TEST one-off runs (d6b942f).
 IMAGE_STAMP_READ = (DOCKER, 'image', 'inspect', '--format', STAMP_FORMAT, TEST_STORE_IMAGE)
 LOOKUP_FAILED = 'the container lookup failed (exit 1); see the steps'
 IMAGE_REFUSAL = {
-    'DEV': f'the image {DEV_STORE_IMAGE} is not on the daemon: call dev_build first',
+    'DEV': f'the image {DEV_STORE_IMAGE} is not on the daemon: call build first',
     'TEST': f'the image {TEST_STORE_IMAGE} is not on the daemon: call test_build first',
 }
 STALE_FIX = 'stale test stack: call test_build, then test_up'
@@ -1172,13 +1172,13 @@ _STATUS_LOOKUP_ANSWERS = {
 def test_migrate_status_refuses_without_exec_unless_the_lookup_found_exactly_one(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, answer, start: str
 ):
-    """Zero, several, a non-id or a failed lookup: 'refused', ZERO exec; zero names dev_db_tables."""
+    """Zero, several, a non-id or a failed lookup: 'refused', ZERO exec; zero names db_tables."""
     rig, responder = _rig(tmp_path, monkeypatch, mode)
     responder.lookups['data_store'] = answer
     result = rig.call('migrate_status', {})
     assert result['status'] == 'refused' and result['message'].startswith(start), result
     assert _argvs(rig) == status_run()[:2], 'an exec ran'
-    names_fallback = result['message'].endswith('; use dev_db_tables, which works while data_store is down')
+    names_fallback = result['message'].endswith('; use db_tables, which works while data_store is down')
     assert names_fallback is start.startswith('no running'), result['message']
     assert STORE_ID not in result['message'] and _charges_left(rig) == BUDGET
 
@@ -1269,14 +1269,14 @@ def test_the_dead_empty_branch_is_gone_and_the_guard_alone_refuses_empty():
         ('migrate', {}, 'postgres', 'TEST'),
         ('migrate_status', {}, 'data_store', 'DEV'),
         ('migrate_status', {}, 'data_store', 'TEST'),
-        ('dev_db_tables', {}, 'postgres', 'DEV'),
-        ('dev_http_get', {'name': 'ping'}, 'data_store', 'DEV'),
+        ('db_tables', {}, 'postgres', 'DEV'),
+        ('http_get', {'name': 'ping'}, 'data_store', 'DEV'),
     ],
 )
 def test_every_no_container_refusal_carries_the_mode_neutral_hint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str, arguments: dict, service: str, mode: str
 ):
-    """183f296: pick_dev_target names dev_up AND test_up; 'start the dev stack first' is gone (wrong under TEST)."""
+    """183f296: pick_dev_target names up AND test_up; 'start the dev stack first' is gone (wrong under TEST)."""
     rig, responder = _rig(tmp_path, monkeypatch, mode)
     responder.lookups[service] = (0, b'')
     result = rig.call(verb, arguments)
@@ -1299,7 +1299,7 @@ def test_migrate_says_it_writes_the_database_of_the_mode_that_is_up():
     assert text.startswith('STATE-CHANGING, and it WRITES THE DATABASE OF THE MODE THAT IS UP'), text
     assert "the USER'S OWN dev database in DEV mode" in text and './volume_data/test' in text, text
     assert 'alembic upgrade head' in text and 'run --rm --no-deps' in text and 'no dry run' in text, text
-    assert "owner's client setting" in text and 'call dev_build or test_build' in text, text
+    assert "owner's client setting" in text and 'call build or test_build' in text, text
     # aa886b6: the image AND each running container carry the stamp; several data_ingest refuse in TEST only.
     assert (
         'REFUSED unless the :test data_store image and each running data_store and data_ingest container carry '
@@ -1310,7 +1310,7 @@ def test_migrate_says_it_writes_the_database_of_the_mode_that_is_up():
     assert 'stale test stack: call test_build, then test_up' in text and 'Never touches prod' in text, text
     status = agent.describe('migrate_status')
     assert status.startswith('READ-ONLY: `alembic current` then `alembic history` on the mode that is up'), status
-    assert 'charges no budget' in status and 'dev_db_tables' in status, status
+    assert 'charges no budget' in status and 'db_tables' in status, status
 
 
 # ===============================================================================================

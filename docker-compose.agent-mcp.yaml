@@ -8,9 +8,9 @@
 # ONLY WHEN THE CONTAINERS ARE CREATED: at the first start, or by `make agent-mcp-rebuild`. A plain
 # start `docker start`s the existing containers and a stop keeps them (addendum 9 (a)), so an edit
 # here does nothing until a rebuild the user runs. PROD_COMPOSE,
-# DEV_COMPOSE, TOOLS_COMPOSE and AGENT_STACK_COMPOSE never load this file, and it loads none of
-# theirs: it is its own compose project, and the agent STACK it drives is started only by the
-# server's stack_up verb.
+# DEV_COMPOSE and TOOLS_COMPOSE never load this file, and it loads none of theirs: it is its own
+# compose project, and the user's dev project it drives is started by it only through up and test_up
+# (make dev-up, dev-launch and system-launch start it too).
 #
 # THE DOCKER SOCKET IS MOUNTED HERE ONCE, in socket_proxy -- the only place in the repository that
 # mounts it. Its ':ro' protects only the socket FILE (no chmod, no replacing it); it narrows no API
@@ -68,7 +68,7 @@ services:
       # tj-iee6sn.1). Creating an exec is POST /containers/{id}/exec (CONTAINERS, already on);
       # starting and inspecting it is /exec/{id}/start and /exec/{id}/json, which is this section.
       # WHAT IT REACHES: the proxy has no notion of a compose project, so agent_mcp can exec any
-      # command in ANY running container on the host daemon -- dev, the agent stack, a prod-mode
+      # command in ANY running container on the host daemon -- dev, a test-mode project, a prod-mode
       # stack, and socket_proxy itself. That is no new ceiling: CONTAINERS with POST already lets it
       # create any container with any mount, the socket included. The control is the same as ever
       # (addendum 1 (b)): the server execs only fixed argv built from module constants into a
@@ -122,14 +122,15 @@ services:
       # /workspace, the DEVCONTAINER's path to the checkout (addendum 11 R1): the harness creates
       # agent worktrees inside the devcontainer, so git records them as
       # /workspace/.claude/worktrees/<name>, and only a repository seen at /workspace resolves
-      # them. The AGENT stack's daemon never sees a repository path (addendum 5: the project
-      # directory, every bind source and the build context are the snapshot in the stack
-      # directory); only the DEV verbs name the host path (AGENT_MCP_REPO_HOST_PATH below,
-      # addendum 23). Must agree with .devcontainer/compose.yml ('..:/workspace',
-      # working_dir) and devcontainer.json's workspaceFolder.
+      # them. Only the file-based verbs (up, build, tools, test_up, test_build and migrate) name the
+      # root checkout's HOST path as their project directory (AGENT_MCP_REPO_HOST_PATH below; addenda
+      # 23 and 26 (5)). ps, logs, down and restart pass no project directory; db_tables, http_get and
+      # migrate_status are docker exec calls into the running container. Only the system-test client
+      # (run_system_tests, seed_dump) builds from the snapshot in the stack directory (addendum 5).
+      # Must agree with .devcontainer/compose.yml ('..:/workspace', working_dir) and devcontainer.json's workspaceFolder.
       AGENT_MCP_REPO_ROOT: /workspace
       # A HOST path mounted at the SAME path (addendum 1 (d)): the daemon resolves the snapshot's
-      # and the data directories' bind sources on the host.
+      # bind sources on the host.
       AGENT_MCP_STACK_DIR: ${AGENT_MCP_STACK_DIR:?set by make agent-mcp-up}
       # In THIS container the server's AGENT_HOME_PATH names the SHARE directory -- token file and
       # seed output only -- never the user's Claude config, which the MCP must not see (addendum 11
@@ -162,7 +163,7 @@ services:
         source: ${AGENT_MCP_REPO_HOST_PATH:?set by make agent-mcp-up}
         target: ${AGENT_MCP_REPO_HOST_PATH:?set by make agent-mcp-up}
         read_only: true
-      # The agent stack's own directory, read-write: generated env files, data, snapshot, audit log.
+      # The MCP's own directory, read-write: the snapshot, the audit log and its other state.
       - type: bind
         source: ${AGENT_MCP_STACK_DIR:?set by make agent-mcp-up}
         target: ${AGENT_MCP_STACK_DIR:?set by make agent-mcp-up}
