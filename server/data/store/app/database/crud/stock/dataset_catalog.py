@@ -10,6 +10,8 @@ for however many datasets it is asked about:
     bar_extents         first bar, last bar and count for a set of entries, in one statement
     covered_dates       the session dates holding a bar, for a set of STATIC entries, in one statement per time zone
     siblings            the other granularities of a set of entries' series, in one statement
+    list_pending        the datasets whose expiry has passed (the reaper's pending set), keyset paged, in one statement
+    pending_ids         the same set as ids, or those among a page's ids, in one statement
     read_bar_page       one dataset's bars in a window, in one statement
     read_bar_page_starts  the page index of a window (count and the start of every page), in one statement
 
@@ -23,6 +25,7 @@ scans. That is why this task adds no migration.
 """
 
 import uuid
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import date, datetime
 
@@ -77,7 +80,9 @@ class CatalogRow:
         expiry_type: How the dataset's rows expire.
         expiry: When the dataset is deleted, or None when nothing is scheduled.
         owner: The free-text label of who asked for it.
+        collect: The operator's collect intent: True or False for a DAILY or STREAM subscription, None for STATIC.
         last_bar: The newest stored bar's timestamp, or None when there are no bars.
+        last_bar_written_at: When that newest bar was last written (its updated_at), or None when there are no bars.
     """
 
     id: uuid.UUID
@@ -94,6 +99,8 @@ class CatalogRow:
     expiry: datetime | None
     owner: str
     last_bar: datetime | None
+    last_bar_written_at: datetime | None = None
+    collect: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -135,7 +142,19 @@ def _bar_matches_entry() -> list[ColumnElement[bool]]:
     ]
 
 
-def _row(entry: Entry, last_bar: datetime | None) -> CatalogRow:
+def _last_bar_written_at() -> ColumnElement[datetime]:
+    """The newest bar's updated_at, a correlated scalar subquery: one more index range scan per entry."""
+    return (
+        select(Bar.updated_at)
+        .where(*_bar_matches_entry())
+        .order_by(Bar.timestamp.desc())
+        .limit(1)
+        .correlate(Entry)
+        .scalar_subquery()
+    )
+
+
+def _row(entry: Entry, last_bar: datetime | None, last_bar_written_at: datetime | None = None) -> CatalogRow:
     """Build a CatalogRow from an ORM entry, mapping the open-end sentinel back to None."""
     end = None if entry.end == NullableDateTime.EPOCH else entry.end
     return CatalogRow(
@@ -155,6 +174,8 @@ def _row(entry: Entry, last_bar: datetime | None) -> CatalogRow:
         expiry=entry.expiry,
         owner=entry.owner,
         last_bar=last_bar,
+        last_bar_written_at=last_bar_written_at,
+        collect=entry.collect,
     )
 
 
@@ -172,7 +193,9 @@ async def list_catalog(db: AsyncSession, catalog_filter: CatalogFilter) -> list[
         list[CatalogRow]: All matching entries, ascending by (asset_symbol, id). Empty for an empty store.
     """
     last_bar = select(func.max(Bar.timestamp)).where(*_bar_matches_entry()).correlate(Entry).scalar_subquery()
-    stmt = select(Entry, last_bar.label('last_bar')).order_by(Entry.asset_symbol, Entry.id)
+    stmt = select(Entry, last_bar.label('last_bar'), _last_bar_written_at().label('last_bar_written_at')).order_by(
+        Entry.asset_symbol, Entry.id
+    )
     if catalog_filter.asset_symbol_prefix is not None:
         stmt = stmt.where(Entry.asset_symbol.istartswith(catalog_filter.asset_symbol_prefix, autoescape=True))
     if catalog_filter.source is not None:
@@ -180,7 +203,7 @@ async def list_catalog(db: AsyncSession, catalog_filter: CatalogFilter) -> list[
     if catalog_filter.update_type is not None:
         stmt = stmt.where(Entry.update_type == catalog_filter.update_type)
     result = await db.execute(stmt)
-    return [_row(entry, newest) for entry, newest in result.all()]
+    return [_row(entry, newest, written) for entry, newest, written in result.all()]
 
 
 async def get_catalog_row(db: AsyncSession, dataset_id: uuid.UUID) -> CatalogRow | None:
@@ -194,9 +217,79 @@ async def get_catalog_row(db: AsyncSession, dataset_id: uuid.UUID) -> CatalogRow
         CatalogRow | None: The entry, or None.
     """
     last_bar = select(func.max(Bar.timestamp)).where(*_bar_matches_entry()).correlate(Entry).scalar_subquery()
-    result = await db.execute(select(Entry, last_bar.label('last_bar')).where(Entry.id == dataset_id))
+    result = await db.execute(
+        select(Entry, last_bar.label('last_bar'), _last_bar_written_at().label('last_bar_written_at')).where(
+            Entry.id == dataset_id
+        )
+    )
     found = result.first()
-    return None if found is None else _row(found[0], found[1])
+    return None if found is None else _row(found[0], found[1], found[2])
+
+
+def _past_expiry(now: datetime) -> ColumnElement[bool]:
+    """THE PENDING-SET PREDICATE, written once: an expiry is set and has passed (`expiry <= now`).
+
+    Whatever the update type and whatever collect says (decision tj-hhy3dk): a collecting or a stopped subscription is
+    pending once its expiry has passed, the same as a STATIC one. Both pending reads below use it, so the reaper's pass, GET /ui/v1/reaper/pending and the
+    DatasetSummary.reaper_pending flag can never disagree about which datasets are pending.
+    """
+    return and_(Entry.expiry.is_not(None), Entry.expiry <= now)
+
+
+async def list_pending(
+    db: AsyncSession, now: datetime, *, after: tuple[datetime, uuid.UUID] | None = None, limit: int | None = None
+) -> list[CatalogRow]:
+    """The datasets whose expiry has passed, oldest expiry first, with their newest bar. One statement.
+
+    Reads record no usage. Keyset paged over (expiry, id): `after` is the last row's pair.
+
+    Args:
+        db: A session.
+        now: The instant expiry is judged at; aware.
+        after: Keep only rows strictly after this (expiry, id), or None for the first page.
+        limit: The most rows to return, or None for all of them.
+
+    Returns:
+        list[CatalogRow]: The pending datasets, ascending by (expiry, id).
+    """
+    last_bar = select(func.max(Bar.timestamp)).where(*_bar_matches_entry()).correlate(Entry).scalar_subquery()
+    stmt = (
+        select(Entry, last_bar.label('last_bar'), _last_bar_written_at().label('last_bar_written_at'))
+        .where(_past_expiry(now))
+        .order_by(Entry.expiry, Entry.id)
+    )
+    if after is not None:
+        after_expiry, after_id = after
+        stmt = stmt.where(or_(Entry.expiry > after_expiry, and_(Entry.expiry == after_expiry, Entry.id > after_id)))
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    result = await db.execute(stmt)
+    return [_row(entry, newest, written) for entry, newest, written in result.all()]
+
+
+async def pending_ids(
+    db: AsyncSession, now: datetime, dataset_ids: Collection[uuid.UUID] | None = None
+) -> frozenset[uuid.UUID]:
+    """The ids of the pending datasets, or those among `dataset_ids` that are pending. One statement.
+
+    This is what DatasetSummary.reaper_pending reads on list and detail reads: pass the page's ids and test
+    membership. The predicate is the one list_pending uses.
+
+    Args:
+        db: A session.
+        now: The instant expiry is judged at; aware.
+        dataset_ids: Restrict the answer to these ids; None means every pending dataset. An empty collection
+            answers an empty set without a statement.
+
+    Returns:
+        frozenset[uuid.UUID]: The pending ids.
+    """
+    if dataset_ids is not None and not dataset_ids:
+        return frozenset()
+    stmt = select(Entry.id).where(_past_expiry(now))
+    if dataset_ids is not None:
+        stmt = stmt.where(Entry.id.in_(list(dataset_ids)))
+    return frozenset((await db.execute(stmt)).scalars())
 
 
 async def dataset_exists(db: AsyncSession, dataset_id: uuid.UUID) -> bool:
@@ -245,8 +338,8 @@ async def bar_extents(db: AsyncSession, rows: list[CatalogRow]) -> dict[uuid.UUI
 async def covered_dates(db: AsyncSession, rows: list[CatalogRow], tz_name: str) -> dict[uuid.UUID, frozenset[date]]:
     """For each entry, the set of calendar dates (in tz_name) on which it holds at least one bar.
 
-    This is the `covered` input of freshness.evaluate_dataset: a bar belongs to the session whose local date its
-    timestamp falls on (freshness.session_of), and Postgres computes that date in the calendar's own zone, so the
+    This is the `covered` input of health.evaluate_dataset: a bar belongs to the session whose local date its
+    timestamp falls on (trading_calendar.session_of), and Postgres computes that date in the calendar's own zone, so the
     two agree without shipping every timestamp to Python. One statement for however many entries.
 
     Args:
@@ -420,3 +513,38 @@ async def read_bar_page_starts(
     if not rows:
         return 0, []
     return int(rows[0].n), [BarPageOffset(offset=int(r.rk), start=r.ts) for r in rows]
+
+
+@dataclass(frozen=True)
+class BarStorage:
+    """What the bar table holds now, measured once.
+
+    Attributes:
+        total_bytes: pg_total_relation_size of the bar table: heap, indexes and TOAST.
+        by_source: The bar count of each (source, feed) holding bars, ordered by source then feed.
+    """
+
+    total_bytes: int
+    by_source: list[tuple[DataSource, Feed, int]]
+
+
+async def read_bar_storage(db: AsyncSession) -> BarStorage:
+    """The bar table's total size and its bar count per (source, feed). Two statements, whatever the table holds.
+
+    The size is the measured whole; a per-source split of it can only be an estimate (the caller multiplies a count
+    by the average row size), because Postgres does not account storage per value of a column.
+
+    Args:
+        db: The request's session.
+
+    Returns:
+        BarStorage: The size, and a count per (source, feed) that holds at least one bar.
+    """
+    size = await db.execute(select(func.pg_total_relation_size(func.to_regclass(Bar.__tablename__))))
+    counts = await db.execute(
+        select(Bar.source, Bar.feed, func.count()).group_by(Bar.source, Bar.feed).order_by(Bar.source, Bar.feed)
+    )
+    return BarStorage(
+        total_bytes=int(size.scalar() or 0),
+        by_source=[(DataSource(source), Feed(feed), int(count)) for source, feed, count in counts.all()],
+    )

@@ -98,7 +98,7 @@ def test_every_reason_in_the_table_is_in_exactly_one_of_the_two_groups():
     """
     assert set(RENDERABLE) | set(CODELESS) == set(Reason)
     assert not set(RENDERABLE) & set(CODELESS)
-    assert len(RENDERABLE) == 17 and len(CODELESS) == 7, 'the table changed; check that the new row is gated here'
+    assert len(RENDERABLE) == 18 and len(CODELESS) == 7, 'the table changed; check that the new row is gated here'
 
 
 # -----------------------------------------------------------------------------------------------------

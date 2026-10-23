@@ -6,9 +6,16 @@
 # the ALPACA_API slot. It logs one WARNING starting 'FAKE BROKER:' at import, so its logs say which
 # mode a service is in.
 #
-# Loaded by `make system-launch` (base file, then this one) and by the agent-stack MCP, appended LAST
-# to the Makefile's AGENT_STACK_COMPOSE, after docker-compose.agent-stack.yaml (ADR tj-4rr0la addendum
-# 3 (3)). PROD_COMPOSE never loads it, and neither do DEV_COMPOSE, TOOLS_COMPOSE or TEST_CLIENT_COMPOSE.
+# Loaded by `make system-launch`, `make test-build` and `make seed-dump` (the Makefile's SYSTEM_COMPOSE:
+# base file, then this one), by run_migrations.sh's TEST definition, by CI's System Testing job and by
+# the agent-stack MCP's test_build, test_up and test migrate, which append it to their test file sets
+# (ADR tj-4rr0la addenda 26-27). PROD_COMPOSE never loads it,
+# and neither do DEV_COMPOSE, TOOLS_COMPOSE or TEST_CLIENT_COMPOSE.
+#
+# THIS IS THE TEST-MODE OVERLAY (ADR tj-4rr0la addendum 27). The test pair, data_store and data_ingest,
+# builds (`make test-build`) and runs as :test ONLY, never :latest: the image: keys below are the only
+# place in the repository that names a :test tag. :latest can be a real deployment's image, and test
+# mode, the MCP's included, must never build over it or run it. The images are the prod target.
 #
 # THE PROD IMAGE HOLDS NO FAKES. The Dockerfile copies only common, routers, schemas and
 # <service>/app, never anything under tests/; this file only MOUNTS tests/fakes, read-only, into a
@@ -26,10 +33,25 @@
 # /ping on APP_INTERNAL_PORT and gRPC health on APP_INTERNAL_GRPC_HOST:APP_INTERNAL_GRPC_PORT, both of
 # which the launcher's app serves like production's, since it runs production's create_app and lifespan).
 services:
+  postgres:
+    # THE DATABASE'S OWN TEST MARKER (tj-grna9p.194), the counterpart of docker-compose.override.yaml's dev one:
+    # tools/dev_datasets reads cluster_name and its source from pg_settings on its own connection before any reset
+    # or degrade. Test mode's postgres has its own data directory and project, so it is marked here, never dev.
+    command: ["postgres", "-c", "cluster_name=test"]
+  data_store:
+    image: trader_joe_data_store:test
+    environment:
+      # The test-mode label GET /ui/v1/config reports (the UI shows a 'test' tag), and what tools/dev_datasets reads
+      # to choose its fake-broker backend and to pass its rail (dev or test). Display and tooling only: nothing in
+      # the service branches on it. Merges by name with the base file's bare DEPLOYMENT_LABEL key, and outranks the
+      # env file's empty DEPLOYMENT_LABEL=. Prod never loads this file (the enumeration pin, tj-iee6sn.27).
+      DEPLOYMENT_LABEL: test
   data_ingest:
+    image: trader_joe_data_ingest:test
     volumes:
       # Read-only: the container runs agent-changeable code and must not write into the tree it runs
-      # from (in the agent stack, the MCP's snapshot; ADR tj-4rr0la addendum 5).
+      # from (the checkout: ./tests/fakes is the project directory's, which for the MCP's test_up
+      # is the root checkout).
       - ./tests/fakes:/code/tests/fakes:ro
     # The prod image's CMD is entrypoint.sh (`uvicorn "$APP_MODULE" --host 0.0.0.0 --port
     # "$APP_INTERNAL_PORT" --workers "$SERVICE_WORKERS" $ADDITIONAL_ARGS`); this replaces it with the same

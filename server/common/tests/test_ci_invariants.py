@@ -2201,6 +2201,15 @@ def _expanded_make_variable(name: str, cwd: Path, env: dict[str, str]) -> str:
     return result.stdout.rstrip('\n')
 
 
+def _made_variable(name: str) -> str:
+    """The value make gives `name` from the repo root under this process's environment.
+
+    For a pin on a variable's VALUE, where _make_variable's source-text regex is the wrong oracle: it
+    misses an `override NAME := ...` assignment (tj-grna9p.192) and cannot see what make makes of it.
+    """
+    return _expanded_make_variable(name, REPO_ROOT, _subprocess_env())
+
+
 def _run_make(cwd: Path, *arguments: str, env: dict[str, str]) -> subprocess.CompletedProcess:
     """Run the repository Makefile from `cwd`, never remaking the venv marker.
 
@@ -3334,6 +3343,9 @@ SYSTEM_JOB_STEP_ORDER = (
 # production entrypoint (tj-irhy0a.1 item 1).
 FAKE_OVERLAY_FILE = REPO_ROOT / 'docker-compose.fake.yaml'
 CONTAINER_CREATING_SUBCOMMANDS = frozenset({'up', 'create'})
+# What the base file ALONE may still run in System Testing (ADR tj-4rr0la addendum 27 (2)): only the
+# calls that resolve no image, since the base file names :latest and the test pair runs :test.
+STACK_ALONE_SUBCOMMANDS = frozenset({'exec', 'logs', 'ps', 'down'})
 # The steps that may, and must, carry SYSTEM_TEST_DISPOSABLE_DB=1: each runs a make target behind the
 # disposable-database guard (test-system, system-launch, seed-dump), and nothing else may inherit it.
 ATTESTING_STEPS = frozenset({SYSTEM_TESTS_STEP, START_STEP, SEED_DUMP_STEP})
@@ -3371,25 +3383,44 @@ CLIENT_RUN_OPTIONS = frozenset({'--rm', '--no-deps', '-T'})
 IMAGE_BUILD_JOB_NAME = 'Image Build'
 RENDER_STEP = 'Check Compose Renders'
 # The Makefile's compose sets the render check must cover, each in the Makefile's own file order.
-# Re-pinned for tj-c4mosr.5: the agent-stack set (tj-c4mosr.8) and the MCP's own project (tj-c4mosr.4,
-# ADR tj-4rr0la addendum 11 R5 (c)) are rendered too, each under the project the Makefile gives it.
+# Re-pinned for tj-c4mosr.5: the MCP's own project (tj-c4mosr.4, ADR tj-4rr0la addendum 11 R5 (c)) is
+# rendered too, under the project the Makefile gives it. tj-iee6sn.27: the retired agent-stack set
+# (and its render line) is gone; the agent stack's test mode is SYSTEM_COMPOSE's set (addendum 27).
 RENDERED_COMPOSE_VARIABLES = (
     'PROD_COMPOSE',
     'DEV_COMPOSE',
     'TOOLS_COMPOSE',
     TEST_CLIENT_COMPOSE_VARIABLE,
-    'AGENT_STACK_COMPOSE',
     'AGENT_MCP_COMPOSE',
-    # The fake-mode stack make system-launch starts (tj-vhboky.61), default project. Its render line,
-    # and the fake overlay as the agent-stack line's fourth file, landed with tj-irhy0a.24.
+    # The fake-mode stack make system-launch starts (tj-vhboky.61), default project. Its render line
+    # landed with tj-irhy0a.24.
     'SYSTEM_COMPOSE',
 )
+# THE DEV/TEST COMPOSE PROJECT (ADR tj-4rr0la addendum 29; owner ruling on tj-oxxl8a): the Makefile's
+# DEV_PROJECT, passed as -p on every dev and test set. PROD_COMPOSE passes none, so prod keeps compose's
+# default project (the checkout directory's name) and today's launch.
+DEV_PROJECT = 'trader_joe_dev'
+# The project each rendered set carries in the Makefile, so a set that gains or loses its -p goes red
+# here as well as wherever its recipes are pinned.
+MAKEFILE_SET_PROJECTS = {
+    'PROD_COMPOSE': None,
+    'DEV_COMPOSE': DEV_PROJECT,
+    'TOOLS_COMPOSE': DEV_PROJECT,
+    TEST_CLIENT_COMPOSE_VARIABLE: DEV_PROJECT,
+    'AGENT_MCP_COMPOSE': 'trader_joe_agent_mcp',
+    'SYSTEM_COMPOSE': DEV_PROJECT,
+}
 TEARDOWN_CONDITIONS = frozenset({'failure()', 'always()'})
 # The staged project env file the job writes and reads back. Named through the template's stem so
 # this module never spells a path that holds real credentials.
 STAGED_ENV_FILE = ENV_DEFAULT_FILE.stem
 # The write routes the lifecycle step must refuse with the secret blank, and how it probes each.
-LIFECYCLE_ROUTE_COUNT = 3
+# Six since tj-grna9p.184: the /store POST and DELETE, the /internal/asset-data POST, and the
+# /ui/v1 expiry PATCH, collecting PATCH and dataset DELETE. WHICH six is
+# test_every_secret_guarded_route_is_proven_to_refuse's job, derived from the app; this count only
+# pins the loop's length, so it must move with that set.
+LIFECYCLE_ROUTE_COUNT = 6
+LIFECYCLE_ROUTE_METHODS = frozenset({'POST', 'PATCH', 'DELETE'})
 LIFECYCLE_HEADER_VARIANTS = 4
 # docker compose global options that take a value, so the subcommand can be told from a value.
 _COMPOSE_VALUE_OPTIONS = frozenset(
@@ -3699,22 +3730,34 @@ def test_system_job_loads_the_stack_alone_and_the_client_only_as_a_pair():
     the job, and it must carry the overlay. The base file alone stays the spelling for everything
     that creates no service container (run --no-deps of a one-off, exec, logs, ps, down); the overlay
     is loaded for nothing but `up`; the client pair is unchanged.
+
+    tj-iee6sn.19 RE-PIN (ADR tj-4rr0la addendum 27 (2)): the fake overlay names the :test images, so
+    every call that RESOLVES a data_store or data_ingest image goes through the fake-mode set -- `up`
+    anywhere, and `run --no-deps data_store` in the Migrate Database step (its upgrade and its
+    revisions() helper), and nowhere else. The base file alone resolves :latest, so it keeps only the
+    calls that resolve no image: exec, logs, ps, down. Migrate Database must use the fake set.
     """
     fake_stack = [COMPOSE_FILE.name, FAKE_OVERLAY_FILE.name]
-    seen, client_steps, fake_ups, offenders = set(), set(), set(), []
+    seen, client_steps, fake_ups, fake_runs, offenders = set(), set(), set(), set(), []
     for step in _system_steps():
         name = step.get('name')
         for line in _step_lines(step):
             for files, rest in _compose_calls(line):
                 seen.add(name)
                 if files == fake_stack:
-                    if rest[:1] != ['up']:
-                        offenders.append(f'{name}: the fake-mode set runs {rest[:1]}, not up: {line}')
-                    fake_ups.add(name)
+                    if rest[:1] == ['run']:
+                        service, options, _ = _compose_service(rest)
+                        if name != MIGRATE_STEP or service != 'data_store' or '--no-deps' not in options:
+                            offenders.append(f'{name}: the fake-mode set runs a one-off outside the migration: {line}')
+                        fake_runs.add(name)
+                    elif rest[:1] != ['up']:
+                        offenders.append(f'{name}: the fake-mode set runs {rest[:1]}, not up or the migration: {line}')
+                    else:
+                        fake_ups.add(name)
                     continue
                 if files == [COMPOSE_FILE.name]:
-                    if rest[:1] and rest[0] in CONTAINER_CREATING_SUBCOMMANDS:
-                        offenders.append(f'{name}: `{rest[0]}` on the base file alone drops the fake overlay: {line}')
+                    if not rest[:1] or rest[0] not in STACK_ALONE_SUBCOMMANDS:
+                        offenders.append(f'{name}: `{rest[:1]}` on the base file alone resolves :latest: {line}')
                     continue
                 if files != _client_file_pair():
                     offenders.append(f'{name}: -f {files} in {line}')
@@ -3733,6 +3776,7 @@ def test_system_job_loads_the_stack_alone_and_the_client_only_as_a_pair():
     assert not missing, f'no docker compose invocation found in {missing}, so this check saw less than the job runs'
     assert not offenders, f'{SYSTEM_JOB_NAME} loads compose files outside the three spellings: {offenders}'
     assert LIFECYCLE_STEP in fake_ups, f'{LIFECYCLE_STEP} recreates data_store without the fake-mode overlay'
+    assert fake_runs == {MIGRATE_STEP}, f'{MIGRATE_STEP} does not migrate through the fake-mode set: {fake_runs}'
     without_client = sorted(set(SYSTEM_JOB_CLIENT_STEPS) - client_steps)
     assert not without_client, f'{without_client} send nothing from {TEST_CLIENT_SERVICE}'
 
@@ -3905,10 +3949,23 @@ def test_image_build_renders_every_compose_set_quietly():
     Each set exactly as the Makefile spells it -- the files in order AND the project -- so the check
     cannot drift from what make loads. A broken override or tools file otherwise surfaces only on a
     developer's machine. ALWAYS quiet: without it `config` prints the interpolated model, POSTGRES_PASS
-    inside DATABASE_URI included. Re-pinned for tj-c4mosr.5: the agent-stack set under
-    trader_joe_agent_stack and the MCP's file under trader_joe_agent_mcp are rendered too; a
-    workflow line that drops its -p renders a different project and goes red.
+    inside DATABASE_URI included. Re-pinned for tj-c4mosr.5: the MCP's file under
+    trader_joe_agent_mcp is rendered too; a workflow line that drops its -p renders a different
+    project and goes red. tj-iee6sn.27: the retired agent-stack set is no longer rendered, and the
+    equality below reds a line that renders it again as surely as a line that goes missing.
+
+    Re-pinned for tj-grna9p.161 (ADR tj-4rr0la addendum 29): the dev and test sets now carry -p
+    trader_joe_dev in the Makefile, and the bead rules the render checks UNCHANGED, project-free. A
+    render's project changes nothing `config --quiet` validates while no compose file interpolates
+    COMPOSE_PROJECT_NAME and only the MCP's file names a project, both asserted below. So each
+    DEV_PROJECT set must render project-FREE (exactly None, not "either"), the MCP's under its own -p,
+    and the Makefile side is pinned set by set against MAKEFILE_SET_PROJECTS.
     """
+    for path in sorted(REPO_ROOT.glob('docker-compose*.yaml')):
+        assert 'COMPOSE_PROJECT_NAME' not in path.read_text(encoding='utf-8'), (
+            f'{path.name} interpolates COMPOSE_PROJECT_NAME, so a project-free render no longer validates '
+            'what the Makefile set loads'
+        )
     steps = _image_build_job().get('steps') or []
     names = [step.get('name') for step in steps]
     assert names.count(RENDER_STEP) == 1 and 'Build Images' in names, f'{IMAGE_BUILD_JOB_NAME} steps: {names}'
@@ -3927,6 +3984,9 @@ def test_image_build_renders_every_compose_set_quietly():
         expanded = _expanded_make_variable(name, REPO_ROOT, env)
         (files, rest), project = _compose_calls(expanded)[0], _compose_projects(expanded)[0]
         assert not rest, f'{name} is {expanded!r}; a compose set names files, not a subcommand'
+        assert project == MAKEFILE_SET_PROJECTS[name], f'{name} is {expanded!r}, project {project!r}'
+        if project == DEV_PROJECT:
+            project = None  # rendered project-free by design (see the docstring)
         # AGENT_MCP_COMPOSE names its file under the root checkout's absolute path; CI renders from
         # the checkout root, so the file's name is what the two must agree on.
         expected.append((tuple(PurePosixPath(file).name if file.startswith('/') else file for file in files), project))
@@ -3954,29 +4014,6 @@ def test_every_compose_render_failure_fails_the_step():
     assert errexit, f'{RENDER_STEP} does not set errexit before its first render'
     swallowed = [line for line in lines if _SWALLOWED_STATUS.search(line)]
     assert not swallowed, f'{RENDER_STEP} swallows a failure: {swallowed}'
-
-
-@pytest.mark.build_infra
-def test_the_agent_stack_render_names_the_env_files_build_images_staged():
-    """Each *_ENV_FILE placeholder on the agent-stack render line names a staged file.
-
-    tj-c4mosr.5 (01:50 item 2, optional, taken): the placeholder names a file Build Images copies from its .env.default before the render step. A rename on
-    either side otherwise surfaces only when CI's `config` refuses a missing env_file.
-    """
-    steps = {step.get('name'): step for step in _image_build_job().get('steps') or []}
-    staged = set()
-    for line in _step_lines(steps['Build Images']):
-        words = shlex.split(line)
-        if words[:1] == ['cp'] and len(words) == 3 and words[1] == f'{words[2]}.default':
-            staged.add(posixpath.normpath(words[2]))
-    placeholders = {}
-    for line in _step_lines(steps[RENDER_STEP]):
-        for variable, value in re.findall(r'\b(ROOT_ENV_FILE|STORE_ENV_FILE|INGEST_ENV_FILE)="([^"]*)"', line):
-            placeholders[variable] = posixpath.normpath(value.removeprefix('${PWD}/'))
-    assert set(placeholders) == {'ROOT_ENV_FILE', 'STORE_ENV_FILE', 'INGEST_ENV_FILE'}, placeholders
-    assert set(placeholders.values()) <= staged, (
-        f'{RENDER_STEP} names {placeholders}; Build Images stages {sorted(staged)}'
-    )
 
 
 @pytest.mark.build_infra
@@ -4176,7 +4213,7 @@ def test_instance_secret_lifecycle_scans_logs_then_proves_a_blank_secret_refuses
     assert len(loops) == 1, f'{LIFECYCLE_STEP} must probe from one route loop, found {loops}'
     routes = loops[0][3:]
     assert len(routes) == LIFECYCLE_ROUTE_COUNT, f'expected {LIFECYCLE_ROUTE_COUNT} write routes, probed {routes}'
-    assert {route.split()[0] for route in routes} == {'POST', 'DELETE'}, routes
+    assert {route.split()[0] for route in routes} == LIFECYCLE_ROUTE_METHODS, routes
     probes = [line for line in lines if line.startswith('probe ')]
     assert len(probes) == LIFECYCLE_HEADER_VARIANTS, f'expected one probe per header variant, found {probes}'
     assert any('!= "401"' in line for line in lines), f'{LIFECYCLE_STEP} never requires HTTP 401'
@@ -4969,8 +5006,9 @@ APP_CLOSURE_FLOOR = 40
 
 # ${DATA_DIR}, ${DATA_DIR:-default}, ${DATA_DIR-default}, ${DATA_DIR:?message}, ${DATA_DIR?message} or
 # $DATA_DIR, then the rest of the path. The guarded forms carry no default and resolve like a bare
-# ${DATA_DIR}; before tj-c4mosr.5 they were not parsed at all, and the agent-stack overlay's two data
-# mounts were skipped in silence. test_every_data_dir_mount_is_parsed now fails on any it cannot read.
+# ${DATA_DIR}; before tj-c4mosr.5 they were not parsed at all, and a guarded data mount (the retired
+# agent-stack overlay had two) was skipped in silence. test_every_data_dir_mount_is_parsed now fails on
+# any it cannot read, and test_the_data_dir_parser_reads_every_spelling holds each form.
 _DATA_DIR_INTERPOLATION = re.compile(
     rf'^(?:\$\{{{DATA_DIR_VARIABLE}(?::?-(?P<default>[^}}]*)|:?\?[^}}]*)?\}}|\${DATA_DIR_VARIABLE}(?!\w))(?P<rest>.*)$'
 )
@@ -5453,8 +5491,11 @@ def test_compose_declares_data_mounts_under_data_dir():
 def test_every_data_dir_mount_is_parsed():
     """tj-c4mosr.5 (00:55 gap (2)): a DATA_DIR-sourced mount the parser cannot read fails, never skips.
 
-    The agent-stack overlay mounts ${DATA_DIR:?...}/postgres; the build-context check below
-    judges only the mounts _compose_data_mounts yields, so an unparsed spelling was a silent pass.
+    The build-context check below judges only the mounts _compose_data_mounts yields, so an unparsed
+    spelling was a silent pass. tj-iee6sn.27 re-pin: the guarded ${DATA_DIR:?...}/postgres this
+    floor named was the retired agent-stack overlay's; the floor is now the two surviving data mounts,
+    postgres's in the base file and pgAdmin's in the tools file, and every spelling the parser must
+    read is held by test_the_data_dir_parser_reads_every_spelling instead of by a live file.
     """
     unparsed = [
         f'{path.relative_to(REPO_ROOT)}:{name} {source}'
@@ -5464,7 +5505,33 @@ def test_every_data_dir_mount_is_parsed():
     ]
     assert not unparsed, f'DATA_DIR mounts the build-context check cannot read, so it would skip them: {unparsed}'
     labels = {label for label, _, _ in _compose_data_mounts()}
-    assert {'docker-compose.agent-stack.yaml:postgres'} <= labels, sorted(labels)
+    assert {'docker-compose.yaml:postgres', 'docker-compose.tools.yaml:pgadmin'} <= labels, sorted(labels)
+
+
+_DATA_DIR_SPELLINGS = {
+    'bare-braced': ('${DATA_DIR}/postgres', None, '/postgres'),
+    'colon-default': ('${DATA_DIR:-./volume_data}/postgres', './volume_data', '/postgres'),
+    'dash-default': ('${DATA_DIR-./volume_data}/pgadmin', './volume_data', '/pgadmin'),
+    'colon-guard': ('${DATA_DIR:?set by the launcher}/postgres', None, '/postgres'),
+    'guard': ('${DATA_DIR?set by the launcher}/postgres', None, '/postgres'),
+    'unbraced': ('$DATA_DIR/postgres', None, '/postgres'),
+}
+
+
+@pytest.mark.build_infra
+@pytest.mark.parametrize(
+    ('source', 'default', 'rest'), list(_DATA_DIR_SPELLINGS.values()), ids=list(_DATA_DIR_SPELLINGS)
+)
+def test_the_data_dir_parser_reads_every_spelling(source: str, default: str | None, rest: str):
+    """Each ${DATA_DIR...} form compose accepts is parsed, the guarded ones with no default (tj-iee6sn.27).
+
+    The guarded forms were held only by the retired agent-stack overlay's mounts; this keeps the parser's
+    reach pinned without a live file that spells them.
+    """
+    match = _DATA_DIR_INTERPOLATION.match(source)
+    assert match is not None, f'{source!r} is not parsed'
+    assert (match.group('default'), match.group('rest')) == (default, rest), match.groupdict()
+    assert _DATA_DIR_INTERPOLATION.match('${DATA_DIRS}/x') is None, 'a longer name is not DATA_DIR'
 
 
 @pytest.mark.build_infra
@@ -6055,7 +6122,7 @@ def test_every_spelling_of_the_checkout_root_is_a_read(prefix: str, quote: str):
         f'DATA_DIR=/tmp/x ROOT_ENV_FILE="${{PWD}}/{STAGED_ENV_FILE}" STORE_ENV_FILE="${{PWD}}/server/data/store/'
         f'{STAGED_ENV_FILE}" INGEST_ENV_FILE="${{PWD}}/server/data/ingest/{STAGED_ENV_FILE}" docker compose config',
     ],
-    ids=['dot-prefix', 'pwd-quoted', 'workspace-single-quoted', 'export', 'standalone', 'agent-stack-render'],
+    ids=['dot-prefix', 'pwd-quoted', 'workspace-single-quoted', 'export', 'standalone', 'three-env-files'],
 )
 def test_an_assignment_names_the_staged_env_file_without_reading_it(line: str):
     """tj-0pobey.4 item 2: `NAME=path` hands a path on; nothing reads the file, so nothing is judged."""
@@ -6950,14 +7017,14 @@ def test_pytest_puts_the_generated_root_on_the_suites_path():
 # overridden by each env_file in order, overridden by environment: (compose's documented precedence).
 # Every service env_file is a live file the checkout does not hold (.env, data/store/.env, ...); each
 # is read here through its committed template (<file>.default), which is what every launch starts
-# from: CI's System Testing copies .env.default to .env, the agent stack copies every committed root
-# variable into its generated root env file, and a developer's .env begins as a copy.
+# from: CI's System Testing copies .env.default to .env, and a developer's .env begins as a copy.
+# 'system' is also the MCP's test mode (ADR tj-4rr0la addenda 26-27; the retired agent stack's entry
+# went with tj-iee6sn.27). test_service_pythonpath.py reads every set, the MCP's included, from its source.
 SERVICE_CONTAINERS = ('data_store', 'data_ingest')
 _LAUNCH_SETS = {
     'prod': compose_model.prod_model,
     'dev': lambda: compose_model.merge([compose_model.load(COMPOSE_FILE), compose_model.load(OVERRIDE_FILE)]),
     'system': compose_model.system_model,
-    'agent-stack': compose_model.agent_stack_model,
 }
 
 

@@ -127,6 +127,7 @@ message OpsHealth {
   int64 healthy = 1;
   int64 late = 2;
   int64 failed = 3;
+  // Datasets that are not collecting (a subscription whose collect intent is false).
   int64 retired = 4;
   // Datasets with a RUNNING run.
   int64 running = 5;

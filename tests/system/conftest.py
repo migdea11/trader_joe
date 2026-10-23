@@ -295,6 +295,14 @@ def entry_values(run_identity: RunIdentity) -> Callable[..., dict[str, Any]]:
         unknown = (set(overrides) | set(omit)) - set(ENTRY_TABLE.c.keys())
         assert not unknown, f'not columns of {ENTRY_TABLE.name}: {sorted(unknown)}'
         values.update(overrides)
+        # collect (tj-grna9p.176, migration e5c8b1d4f703): its CHECK wants NULL exactly for STATIC, which the
+        # column's NULL default already gives, so only a subscription gets a value: TRUE, collecting, unless the
+        # test passes collect=False to stop it. Never derived from the expiry (decision tj-hhy3dk, tj-grna9p.175):
+        # the expiry is the deletion date only, and a fixture coupling the two would hide an expiry that retires
+        # again. Left out for STATIC on purpose, so a STATIC row still inserts into a scratch database migrated to
+        # a revision before the column.
+        if 'collect' not in overrides and values['update_type'] != UpdateType.STATIC.value:
+            values['collect'] = True
         return {key: value for key, value in values.items() if key not in omit}
 
     return _values
@@ -348,9 +356,20 @@ def insert_entry(
     """Insert one entry in its own committed transaction; return the full row it produced.
 
     The row is registered for cleanup before the caller sees it. Arguments are entry_values'.
+
+    asset_symbol IS REQUIRED HERE (tj-7qfzdf). This fixture is session-scoped and its rows stay
+    until the session ends, so two tests that each took entry_values' default symbol inserted the
+    SAME natural key, and the second died on uq_store_dataset_entry_identity. That happened only
+    when both ran in one pytest session: make test-system, which CI runs, and never the per-file
+    chunks the suite had been checked in. Pass own_symbol from a test, or run_identity.alt_symbol
+    from a fixture whose scope is wider than a test.
     """
 
     def _insert(omit: tuple[str, ...] = (), **overrides: Any) -> sa.Row:
+        assert 'asset_symbol' in overrides, (
+            'insert_entry needs an explicit asset_symbol (own_symbol, or run_identity.alt_symbol): '
+            "the run's default symbol is shared by every test in the session (tj-7qfzdf)"
+        )
         with pg_engine.begin() as conn:
             row = conn.execute(
                 sa.insert(ENTRY_TABLE).values(entry_values(omit, **overrides)).returning(*ENTRY_TABLE.c)
@@ -688,8 +707,13 @@ class DataStoreHttp:
     def post(self, path: str, *, json: Any, auth: WriteAuth) -> httpx.Response:
         return self.request('POST', path, json=json, auth=auth)
 
-    def delete(self, path: str, *, params: dict[str, Any] | None = None, auth: WriteAuth) -> httpx.Response:
-        return self.request('DELETE', path, params=params, auth=auth)
+    def patch(self, path: str, *, json: Any, auth: WriteAuth) -> httpx.Response:
+        return self.request('PATCH', path, json=json, auth=auth)
+
+    def delete(
+        self, path: str, *, params: dict[str, Any] | None = None, json: Any = None, auth: WriteAuth
+    ) -> httpx.Response:
+        return self.request('DELETE', path, params=params, json=json, auth=auth)
 
     def leaks_secret(self, text: str) -> bool:
         """Whether `text` contains the deployment's secret. Assert on the returned bool, never on this call."""

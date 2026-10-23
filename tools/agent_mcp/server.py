@@ -37,7 +37,7 @@ log = logging.getLogger('agent_mcp')
 
 def build_server(agent_stack: AgentStack) -> Server:
     """The MCP server: list_tools from VERB_SCHEMAS, call_tool into AgentStack.call."""
-    server: Server = Server('trader_joe_agent_stack')
+    server: Server = Server('agent-stack')
 
     @server.list_tools()
     async def list_tools() -> list[types.Tool]:

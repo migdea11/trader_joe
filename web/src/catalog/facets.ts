@@ -7,6 +7,8 @@ import type { DatasetFacets } from '@generated/trader_joe/proto/ui/v1/data_pb'
 
 import { int64ToNumber } from '@/api'
 import type { StatusGroup } from '@/api'
+import type { UsageGroup } from '@/catalog/filters'
+import { timestampToInstant } from '@/format/formatters'
 
 export interface SourceCount {
   source: DataSource
@@ -25,6 +27,18 @@ export interface FacetCounts {
   sources: SourceCount[]
   /** Per update type; a type the server did not list is zero. */
   updateTypes: Record<UpdateType, number>
+  /** The Stale view and the Usage group's Stale option: unread by the selected clients for the threshold. */
+  stale: number
+  /** The Usage group: read by the selected clients in the last 30 days. */
+  read30d: number
+  /** The Usage group: never read by the selected clients. */
+  neverRead: number
+  /** The Expiring Soon view: expiring inside the window, plus everything the reaper would delete. */
+  expiringSoon: number
+  /** The stale threshold the server counted under (its echo); undefined when it sent none. */
+  staleDays: number | undefined
+  /** The Expiring Soon bound the server counted under (its echo); undefined when it sent none. */
+  expiresBefore: Date | undefined
 }
 
 // A status filter value covers these freshness states (the server's mapping, tj-grna9p.8).
@@ -35,6 +49,11 @@ const STATUS_OF: Partial<Record<FreshnessStatus, StatusGroup>> = {
   [FreshnessStatus.OVERDUE]: 'failed',
   [FreshnessStatus.GAPS]: 'failed',
   [FreshnessStatus.RETIRED]: 'retired',
+}
+
+/** The count the server gives a Usage group (the sidebar option and the footer total). */
+export function usageCount(facets: FacetCounts, group: UsageGroup): number {
+  return { 'read-30d': facets.read30d, stale: facets.stale, 'never-read': facets.neverRead }[group]
 }
 
 export function facetCounts(facets: DatasetFacets): FacetCounts {
@@ -59,5 +78,12 @@ export function facetCounts(facets: DatasetFacets): FacetCounts {
       .filter((entry) => entry.source !== DataSource.UNSPECIFIED)
       .map((entry) => ({ source: entry.source, count: int64ToNumber(entry.count) })),
     updateTypes,
+    stale: int64ToNumber(facets.stale),
+    read30d: int64ToNumber(facets.read30d),
+    neverRead: int64ToNumber(facets.neverRead),
+    expiringSoon: int64ToNumber(facets.expiringSoon),
+    staleDays: facets.staleDays > 0 ? facets.staleDays : undefined,
+    expiresBefore:
+      facets.expiresBefore === undefined ? undefined : new Date(timestampToInstant(facets.expiresBefore)),
   }
 }

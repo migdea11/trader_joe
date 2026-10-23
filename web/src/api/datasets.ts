@@ -4,6 +4,8 @@
 import { DataSource, UpdateType } from '@generated/trader_joe/proto/market/v1/enums_pb'
 import {
   BarPageIndexSchema,
+  ClientKind,
+  UsageFilter,
   BarPageSchema,
   DatasetFacetsSchema,
   DatasetPageSchema,
@@ -20,15 +22,15 @@ import type {
 } from '@generated/trader_joe/proto/ui/v1/data_pb'
 import { UiConfigSchema } from '@generated/trader_joe/proto/ui/v1/shell_pb'
 import type { UiConfig } from '@generated/trader_joe/proto/ui/v1/shell_pb'
-import { CoverageStripSchema } from '@generated/trader_joe/proto/ui/v1/stats_pb'
-import type { CoverageStrip } from '@generated/trader_joe/proto/ui/v1/stats_pb'
+import { CoverageStripSchema, ReadsPerDaySchema } from '@generated/trader_joe/proto/ui/v1/stats_pb'
+import type { CoverageStrip, ReadsPerDay } from '@generated/trader_joe/proto/ui/v1/stats_pb'
 
-import { API_BASE, getMessage } from './client'
+import { API_BASE, deleteRequest, getMessage, patchMessage } from './client'
 import { buildQuery } from './query'
 
 /** The status words the server filters by (a grouping of FreshnessStatus). */
 export type StatusGroup = 'healthy' | 'late' | 'failed' | 'retired'
-export type DatasetSort = 'symbol' | 'expires'
+export type DatasetSort = 'symbol' | 'expires' | 'last_read'
 
 /** The filters the list and the facets share. */
 export interface DatasetFilters {
@@ -41,6 +43,14 @@ export interface DatasetFilters {
   needsAttention?: boolean
   /** Only datasets with a collection run in flight (orthogonal to `status`). */
   running?: boolean
+  /** Whose reads the usage figures and the usage filter count; the server's default is SDK. */
+  clientKinds?: readonly ClientKind[]
+  /** Only datasets in this usage group under the client filter. */
+  usage?: UsageFilter
+  /** The threshold of the Stale group, in days. */
+  staleDays?: number
+  /** Only datasets expiring before this instant, plus those the reaper would delete. */
+  expiresBefore?: Date
   signal?: AbortSignal
 }
 
@@ -65,7 +75,7 @@ export interface GetBarsParams {
 }
 
 // The server reads an enum filter from the member name, with or without the wire prefix.
-function enumName(names: Record<number, string>, value: number | undefined): string | undefined {
+export function enumName(names: Record<number, string>, value: number | undefined): string | undefined {
   return value === undefined ? undefined : names[value]
 }
 
@@ -77,6 +87,10 @@ function filterQuery(filters: DatasetFilters) {
     status: filters.status,
     needs_attention: filters.needsAttention,
     running: filters.running,
+    client_kind: filters.clientKinds?.map((kind) => ClientKind[kind]),
+    usage: enumName(UsageFilter, filters.usage),
+    stale_days: filters.staleDays,
+    expires_before: filters.expiresBefore,
   }
 }
 
@@ -105,9 +119,80 @@ export function getDatasetFacets(filters: DatasetFilters = {}): Promise<DatasetF
   })
 }
 
-/** GET /ui/v1/datasets/{id}: one dataset with its siblings and freshness. */
-export function getDataset(id: string, signal?: AbortSignal): Promise<DatasetSummary> {
-  return getMessage(DatasetSummarySchema, `/ui/v1/datasets/${encodeURIComponent(id)}`, { signal })
+/**
+ * Whose reads a dataset's usage figures count. A selection, never a filter on the dataset: the
+ * server counts the chosen clients' reads and returns the dataset either way. Client ids win over
+ * kinds, so a caller sends one or the other.
+ */
+export interface ClientSelection {
+  clientKinds?: readonly ClientKind[]
+  clientIds?: readonly string[]
+}
+
+/** The query parameters of a client selection (the usage routes and the dataset detail share them). */
+export function clientQuery(client: ClientSelection = {}) {
+  const ids = client.clientIds ?? []
+  return {
+    client_id: ids.length > 0 ? ids : undefined,
+    client_kind: ids.length > 0 ? undefined : client.clientKinds?.map((kind) => ClientKind[kind]),
+  }
+}
+
+/** GET /ui/v1/datasets/{id}: one dataset with its siblings, freshness and usage under `client`. */
+export function getDataset(id: string, signal?: AbortSignal, client: ClientSelection = {}): Promise<DatasetSummary> {
+  return getMessage(DatasetSummarySchema, `/ui/v1/datasets/${encodeURIComponent(id)}`, {
+    query: clientQuery(client),
+    signal,
+  })
+}
+
+/** The operator's acknowledgement for acting on a dataset another owner holds. */
+export interface OperatorOverride {
+  reason: string
+  confirmed: true
+}
+
+/**
+ * PATCH /ui/v1/datasets/{id}/expiry: set the expiry, or clear it when `expiry` is undefined. Answers
+ * the updated dataset. `override` is sent only for another owner's dataset.
+ */
+export function setDatasetExpiry(
+  id: string,
+  params: { expiry?: Date; override?: OperatorOverride; signal?: AbortSignal },
+): Promise<DatasetSummary> {
+  return patchMessage(DatasetSummarySchema, `/ui/v1/datasets/${encodeURIComponent(id)}/expiry`, {
+    body: {
+      ...(params.expiry === undefined ? {} : { expiry: params.expiry.toISOString() }),
+      ...(params.override === undefined ? {} : { override: params.override }),
+    },
+    signal: params.signal,
+  })
+}
+
+/**
+ * PATCH /ui/v1/datasets/{id}/collecting: turn a subscription's (DAILY or STREAM) collection on or off.
+ * Answers the updated dataset. `collect` is always sent, true or false: the server refuses a body without
+ * the key, and a false must not be dropped. `override` as for the expiry write.
+ */
+export function setDatasetCollecting(
+  id: string,
+  params: { collect: boolean; override?: OperatorOverride; signal?: AbortSignal },
+): Promise<DatasetSummary> {
+  return patchMessage(DatasetSummarySchema, `/ui/v1/datasets/${encodeURIComponent(id)}/collecting`, {
+    body: {
+      collect: params.collect,
+      ...(params.override === undefined ? {} : { override: params.override }),
+    },
+    signal: params.signal,
+  })
+}
+
+/** DELETE /ui/v1/datasets/{id}: delete the dataset and its bars. `override` as for the expiry write. */
+export function deleteDataset(id: string, params: { override?: OperatorOverride; signal?: AbortSignal } = {}): Promise<void> {
+  return deleteRequest(`/ui/v1/datasets/${encodeURIComponent(id)}`, {
+    body: params.override === undefined ? undefined : { override: params.override },
+    signal: params.signal,
+  })
 }
 
 export interface GetBarPagesParams {
@@ -177,6 +262,29 @@ export function getDatasetCoverage(id: string, buckets: number, signal?: AbortSi
   return getMessage(CoverageStripSchema, `/ui/v1/datasets/${encodeURIComponent(id)}/coverage`, {
     query: { buckets },
     signal,
+  })
+}
+
+export interface GetReadsPerDayParams extends ClientSelection {
+  /** The window in UTC days ending today: a parameter, not a filter (server default 30, 1..365). */
+  days?: number
+  /** Only this dataset's reads: a filter. */
+  datasetId?: string
+  /** Only this source's datasets: a filter, sent only when chosen. */
+  source?: DataSource
+  signal?: AbortSignal
+}
+
+/** GET /ui/v1/stats/usage/reads-per-day: reads per UTC day and client, from the selected clients. */
+export function getReadsPerDay(params: GetReadsPerDayParams = {}): Promise<ReadsPerDay> {
+  return getMessage(ReadsPerDaySchema, '/ui/v1/stats/usage/reads-per-day', {
+    query: {
+      days: params.days,
+      dataset_id: params.datasetId,
+      source: enumName(DataSource, params.source),
+      ...clientQuery(params),
+    },
+    signal: params.signal,
   })
 }
 

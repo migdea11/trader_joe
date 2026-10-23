@@ -4,7 +4,8 @@ Design: decision tj-j4wknb (the fake is a BrokerRead in tests/fakes, run by the 
 the fake-mode overlay starts; addendum 5: the broker range is half-open), tj-vhboky.54 DECISION 4
 (what a failure test asserts), tj-vhboky.6 (identity, own overlap, no policy merge), tj-vhboky.8
 (write routes), tj-1bl90i (a naive expiry is refused, not converted), ADR tj-4rr0la addendum 3 (3)
-(the agent stack loads the fake overlay last, so data_ingest runs FakeRead).
+(test mode, make system-launch or the MCP's test_up, loads the fake overlay, so data_ingest runs FakeRead;
+addendum 27).
 
 THE STACK MUST BE IN FAKE MODE: data_ingest's log carries the 'FAKE BROKER:' banner. Against a
 real broker these symbols are not tickers and every test here fails -- never skips.
@@ -629,8 +630,9 @@ def test_a_repeat_post_without_expiry_clears_the_stored_expiry(
     Documented behaviour: the body declares the dataset's lifetime, no expiry means never expires, and the
     exact repeat is last-writer-wins on expiry. Keeping the stored expiry when the body has none was rejected,
     because omission and null mean the same on the wire and an expiry could then never be cleared. This is the
-    Postgres half, where ON CONFLICT DO UPDATE actually fires; the bound value, and the DAILY consequence (a
-    retired subscription reads live again), are pinned in server/data/store/tests/test_dataset_entry_identity.py.
+    Postgres half, where ON CONFLICT DO UPDATE actually fires; the bound values, expiry and collect, are pinned in
+    server/data/store/tests/test_dataset_entry_identity.py. Since tj-grna9p.175 the expiry is the deletion date
+    only: clearing it resumes nothing, and the repeat's collect (omitted means true) is what decides RETIRED.
     """
     expiry = datetime(2031, 3, 4, 5, 6, 7, tzinfo=UTC)
     body = _body(run_identity.owner)

@@ -53,7 +53,16 @@ UNREACHABLE_DATABASE_URI = 'postgresql://joe:fixture-pass@127.0.0.1:1/unreachabl
 # env.py's ALLOWED_MODELS, restated rather than imported: reading it would mean executing env.py. The
 # restatement once omitted ingest_run (tj-s6r3rt.3), so the propagation test silently skipped it;
 # test_the_restated_models_match_env_py below reads the literal from env.py's source to stop that recurring.
-ALLOWED_MODELS = ('base_market_activity', 'ingest_run', 'stock_market_activity', 'store_dataset_entry')
+ALLOWED_MODELS = (
+    'base_market_activity',
+    'dataset_deletion',
+    'dataset_override_log',
+    'dataset_read',
+    'dataset_read_daily',
+    'ingest_run',
+    'stock_market_activity',
+    'store_dataset_entry',
+)
 
 
 def _env_py_allowed_models() -> set[str]:

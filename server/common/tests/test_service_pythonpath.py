@@ -14,7 +14,7 @@ The bead's validator gate, one section each:
       the Dockerfile's ENV PYTHONPATH for the stage the service builds, and so names /code/gen/proto/python.
       The services are derived from the compose files' build: sections, never listed, so a new service is
       covered the day it appears. The launch sets are read from where they are spelled: the Makefile's
-      *_COMPOSE variables as make expands them, tools/agent_mcp/stack.py COMPOSE_FILES, every `docker
+      *_COMPOSE variables as make expands them, tools/agent_mcp/stack.py's *_COMPOSE_FILES, every `docker
       compose` in the workflows, and data/store/run_migrations.sh. test_client is a derived service, so
       its PYTHONPATH is held EQUAL to the Dockerfile's, tightening tj-3mk3u5.44 gate item 7 (its
       working_dir form stays pinned by test_ci_invariants.py test_the_client_hands_the_suite_the_env_contract).
@@ -35,7 +35,7 @@ The bead's validator gate, one section each:
       pinned with the rest of the job in test_ci_invariants.py (IMPORT_CHECK_STEP).
 
 What only Docker can show -- the image build, compose's real render and precedence, the step against the
-live stack -- is CI System Testing's run, and for the agent stack the user's batched MCP rebuild
+live stack -- is CI System Testing's run, and for the MCP's sets the user's batched MCP rebuild
 (tj-3mk3u5.52, check H). CI runs this suite as root, so nothing here depends on mode bits being enforced:
 the shim is made executable and that is all.
 """
@@ -88,18 +88,21 @@ LEGACY_VALUE = './'
 # and the sets checked are whatever the files say.
 KNOWN_SERVICES = frozenset({'data_store', 'data_ingest', 'test_client'})
 KNOWN_MAKEFILE_SETS = frozenset(
-    {
-        'PROD_COMPOSE',
-        'DEV_COMPOSE',
-        'TOOLS_COMPOSE',
-        'TEST_CLIENT_COMPOSE',
-        'AGENT_STACK_COMPOSE',
-        'SYSTEM_COMPOSE',
-        'SEED_DUMP_COMPOSE',
-    }
+    {'PROD_COMPOSE', 'DEV_COMPOSE', 'TOOLS_COMPOSE', 'TEST_CLIENT_COMPOSE', 'SYSTEM_COMPOSE', 'SEED_DUMP_COMPOSE'}
 )
 MAKEFILE_SOURCE = 'Makefile'
-STACK_SOURCE = 'tools/agent_mcp/stack.py COMPOSE_FILES'
+# The MCP's file sets (tj-iee6sn.21 re-pointed this from the retired agent stack's stack.COMPOSE_FILES): the
+# dev set and pgAdmin's, test mode's up and build sets, and the system-test client's. Every *_COMPOSE_FILES
+# tuple stack.py defines is one of these (test_the_mcp_sets_read_are_every_set_stack_py_defines), so a set
+# the MCP gains is checked from the day it appears.
+STACK_SOURCE = 'tools/agent_mcp/stack.py'
+MCP_SET_NAMES = (
+    'DEV_COMPOSE_FILES',
+    'DEV_TOOLS_COMPOSE_FILES',
+    'TEST_COMPOSE_FILES',
+    'TEST_BUILD_COMPOSE_FILES',
+    'SYSTEM_CLIENT_COMPOSE_FILES',
+)
 MIGRATIONS_SOURCE = 'server/data/store/run_migrations.sh'
 WORKFLOW_SOURCE = 'workflow'
 # compose's own default when an invocation names no -f: the base file, then the override beside it.
@@ -129,7 +132,8 @@ def _launch_sets() -> dict[str, tuple[Path, ...]]:
     sets: dict[str, tuple[Path, ...]] = {}
     for variable in sorted(set(_COMPOSE_SET.findall(MAKEFILE.read_text(encoding='utf-8')))):
         sets[f'{MAKEFILE_SOURCE} {variable}'] = _set_files(variable)
-    sets[STACK_SOURCE] = tuple(REPO_ROOT / name for name in stack.COMPOSE_FILES)
+    for name in MCP_SET_NAMES:
+        sets[f'{STACK_SOURCE} {name}'] = tuple(REPO_ROOT / file for file in getattr(stack, name))
     for line in _run_lines(MIGRATIONS_SCRIPT.read_text(encoding='utf-8')):
         if line.startswith('COMPOSE=(') and line.endswith(')'):
             for files, _ in _compose_calls(line[len('COMPOSE=(') : -1]):
@@ -149,7 +153,7 @@ def _committed_root_env() -> dict[str, str]:
 def _image_target(service: Mapping, project_dir: Path) -> str | None:
     """The Dockerfile stage a service's image is built from; None when it is not built from the repository's Dockerfile.
 
-    The agent stack builds the same file through the MCP image's own copy of it (stack.TRUSTED_DOCKERFILE).
+    The MCP's sets build the same file through the MCP image's own copy of it (stack.TRUSTED_DOCKERFILE).
     With no target, compose builds the Dockerfile's last stage.
     """
     build = service.get('build')
@@ -271,6 +275,18 @@ def test_the_launch_sets_are_read_from_every_place_one_is_spelled():
     assert makefile >= KNOWN_MAKEFILE_SETS, f'the Makefile sets read are {sorted(makefile)}'
     missing = sorted(f'{label}: {path.name}' for label, files in sets.items() for path in files if not path.is_file())
     assert not missing, f'launch sets name compose files the checkout does not hold: {missing}'
+
+
+def test_the_mcp_sets_read_are_every_set_stack_py_defines():
+    """The MCP half of the launch sets cannot fall behind stack.py: every *_COMPOSE_FILES tuple is read.
+
+    Also the guard that the retired agent stack's COMPOSE_FILES stays retired (tj-iee6sn.21): re-added, it
+    is a set this module does not read, and is red here until it is deliberately listed.
+    """
+    defined = {
+        name for name, value in vars(stack).items() if name.endswith('COMPOSE_FILES') and isinstance(value, tuple)
+    }
+    assert defined == set(MCP_SET_NAMES), defined ^ set(MCP_SET_NAMES)
 
 
 def test_the_services_are_derived_from_the_dockerfile_builds():

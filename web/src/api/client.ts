@@ -6,6 +6,7 @@ import type { DescMessage, MessageShape } from '@bufbuild/protobuf'
 
 import { ApiError, apiErrorFromResponse } from './errors'
 import { buildQuery } from './query'
+import { OPERATOR_CLIENT_ID } from './usage'
 import type { QueryValue } from './query'
 
 /**
@@ -38,7 +39,7 @@ export async function getMessage<Desc extends DescMessage>(
   try {
     response = await fetch(`${API_BASE}${path}${buildQuery(options.query ?? {})}`, {
       method: 'GET',
-      headers: { Accept: 'application/json' },
+      headers: { Accept: 'application/json', 'X-Client-Id': OPERATOR_CLIENT_ID },
       signal: options.signal,
     })
   } catch (error) {
@@ -52,4 +53,57 @@ export async function getMessage<Desc extends DescMessage>(
   } catch {
     throw new ApiError({ status: response.status, reason: 'MALFORMED_RESPONSE' })
   }
+}
+
+/** A write's JSON body, in protobuf canonical JSON (a Timestamp is an RFC 3339 string). */
+export type WriteBody = Readonly<Record<string, unknown>>
+
+export interface WriteOptions {
+  /** The request body; omitted for a write that carries none. */
+  body?: WriteBody
+  signal?: AbortSignal
+}
+
+async function send(method: 'PATCH' | 'DELETE', path: string, options: WriteOptions): Promise<Response> {
+  let response: Response
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      method,
+      headers: {
+        Accept: 'application/json',
+        'X-Client-Id': OPERATOR_CLIENT_ID,
+        ...(options.body === undefined ? {} : { 'Content-Type': 'application/json' }),
+      },
+      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      signal: options.signal,
+    })
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error
+    throw new ApiError({ status: 0 })
+  }
+  if (!response.ok) throw await apiErrorFromResponse(response)
+  return response
+}
+
+/**
+ * PATCH `path` (under API_BASE) with a JSON body and decode the 2xx body as `schema`'s message.
+ *
+ * @throws ApiError as getMessage does.
+ */
+export async function patchMessage<Desc extends DescMessage>(
+  schema: Desc,
+  path: string,
+  options: WriteOptions = {},
+): Promise<MessageShape<Desc>> {
+  const response = await send('PATCH', path, options)
+  try {
+    return fromJson(schema, await response.json(), { ignoreUnknownFields: true })
+  } catch {
+    throw new ApiError({ status: response.status, reason: 'MALFORMED_RESPONSE' })
+  }
+}
+
+/** DELETE `path` (under API_BASE), with an optional JSON body, for a write that answers 204. */
+export async function deleteRequest(path: string, options: WriteOptions = {}): Promise<void> {
+  await send('DELETE', path, options)
 }

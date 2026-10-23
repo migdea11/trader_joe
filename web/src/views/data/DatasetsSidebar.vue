@@ -5,16 +5,31 @@
 // replaces the group's current one, and ticking it again clears the group. Running in the Status
 // group is the exception: it is orthogonal to the freshness words (a Late dataset can be running a
 // retry), so it is its own toggle and combines with one of them. Stream is shown disabled
-// (a later phase). Everything is written to the URL (catalog/useCatalogFilters.ts).
+// (a later phase). Phase 3 adds the Stale and Expiring Soon views, the Usage group (Read in the last
+// 30 days, Stale, Never read) and the Read By group (SDK and UI, at least one ticked, default SDK):
+// whose reads the usage counts and the Stale view follow. The Stale view is the Usage group's Stale
+// option under another name; the one filter value backs both. Everything is written to the URL
+// (catalog/useCatalogFilters.ts).
 import { computed } from 'vue'
 import { storeToRefs } from 'pinia'
 
 import { DataSource, UpdateType } from '@generated/trader_joe/proto/market/v1/enums_pb'
 
 import type { StatusGroup } from '@/api'
-import { hasActiveFilters, STATUS_GROUPS, withView } from '@/catalog/filters'
-import type { CatalogView } from '@/catalog/filters'
+import { ClientKind } from '@generated/trader_joe/proto/ui/v1/data_pb'
+
+import {
+  CLIENT_KIND_OPTIONS,
+  effectiveClientKinds,
+  hasActiveFilters,
+  STATUS_GROUPS,
+  USAGE_GROUPS,
+  withView,
+} from '@/catalog/filters'
+import type { CatalogFilters, CatalogView, UsageGroup } from '@/catalog/filters'
 import { sourceLabel } from '@/catalog/labels'
+import { usageCount } from '@/catalog/facets'
+import { clientKindLabel, staleLabel, usageOptionLabel } from '@/catalog/usage'
 import { useCatalogFilters } from '@/catalog/useCatalogFilters'
 import { useDatasetCatalogStore } from '@/stores/datasetCatalog'
 import { titleCase } from '@/theme/copy'
@@ -22,21 +37,69 @@ import { titleCase } from '@/theme/copy'
 const { filters, setFilters } = useCatalogFilters()
 const { facets } = storeToRefs(useDatasetCatalogStore())
 
-const VIEWS: readonly { view: CatalogView; label: string }[] = [
-  { view: 'all', label: titleCase('All Datasets') },
-  { view: 'needs-attention', label: titleCase('Needs Attention') },
-]
+// The Stale view is not a CatalogView of its own: it is the Usage filter's stale value, so its
+// entry is active on that value.
+interface ViewEntry {
+  key: string
+  label: string
+  view: CatalogView | 'stale'
+}
+
+const VIEWS = computed<readonly ViewEntry[]>(() => [
+  { key: 'all', view: 'all', label: titleCase('All Datasets') },
+  { key: 'needs-attention', view: 'needs-attention', label: titleCase('Needs Attention') },
+  { key: 'stale', view: 'stale', label: staleLabel(facets.value?.staleDays) },
+  { key: 'expiring-soon', view: 'expiring-soon', label: titleCase('Expiring Soon') },
+])
 
 const STATUS_LABELS: Record<StatusGroup, string> = {
   healthy: 'Healthy',
   late: 'Late',
   failed: 'Failed',
-  retired: 'Retired',
+  retired: 'Stopped',
 }
 
-function viewCount(view: CatalogView): number | null {
+function viewCount(view: ViewEntry['view']): number | null {
   if (facets.value === null) return null
+  if (view === 'stale') return facets.value.stale
+  if (view === 'expiring-soon') return facets.value.expiringSoon
   return view === 'all' ? facets.value.all : facets.value.needsAttention
+}
+
+function viewActive(view: ViewEntry['view']): boolean {
+  const staleView = filters.value.usage === 'stale' && filters.value.view === 'all'
+  if (view === 'stale') return staleView
+  return filters.value.view === view && !(view === 'all' && staleView)
+}
+
+// Choosing a view leaves the Usage group alone except for the Stale view, which is that group's
+// Stale value (so the other views drop it).
+function selectView(view: ViewEntry['view']): void {
+  const next: CatalogFilters =
+    view === 'stale'
+      ? { ...filters.value, view: 'all', usage: 'stale' }
+      : { ...withView(filters.value, view), usage: filters.value.usage === 'stale' ? undefined : filters.value.usage }
+  void setFilters(next)
+}
+
+const usageCounts = computed<Record<UsageGroup, number | undefined>>(() => ({
+  'read-30d': facets.value === null ? undefined : usageCount(facets.value, 'read-30d'),
+  stale: facets.value === null ? undefined : usageCount(facets.value, 'stale'),
+  'never-read': facets.value === null ? undefined : usageCount(facets.value, 'never-read'),
+}))
+
+function toggleUsage(value: UsageGroup): void {
+  void setFilters({ ...filters.value, usage: filters.value.usage === value ? undefined : value })
+}
+
+const readBy = computed(() => effectiveClientKinds(filters.value))
+
+// At least one kind stays ticked: the last one cannot be cleared.
+function toggleReadBy(kind: ClientKind): void {
+  const current = readBy.value
+  const next = current.includes(kind) ? current.filter((entry) => entry !== kind) : [...current, kind]
+  if (next.length === 0) return
+  void setFilters({ ...filters.value, clientKinds: next })
 }
 
 const updateOptions = computed(() => [
@@ -76,13 +139,13 @@ function clearFilters(): void {
     <div class="side-views">
       <button
         v-for="entry in VIEWS"
-        :key="entry.view"
+        :key="entry.key"
         type="button"
         class="side-view"
-        :class="{ 'is-active': filters.view === entry.view }"
-        :aria-current="filters.view === entry.view ? 'true' : undefined"
-        :data-view="entry.view"
-        @click="setFilters(withView(filters, entry.view))"
+        :class="{ 'is-active': viewActive(entry.view) }"
+        :aria-current="viewActive(entry.view) ? 'true' : undefined"
+        :data-view="entry.key"
+        @click="selectView(entry.view)"
       >
         <span>{{ entry.label }}</span>
         <span class="side-count">{{ viewCount(entry.view) ?? '—' }}</span>
@@ -177,6 +240,46 @@ function clearFilters(): void {
         >
         {{ option.label }}
         <span class="side-count">{{ facets?.updateTypes[option.value] ?? '—' }}</span>
+      </label>
+    </fieldset>
+
+    <fieldset class="side-group">
+      <legend class="side-group__title">
+        {{ titleCase('Usage') }}
+      </legend>
+      <label
+        v-for="group in USAGE_GROUPS"
+        :key="group"
+        class="side-option"
+        :data-usage="group"
+      >
+        <input
+          type="checkbox"
+          :checked="filters.usage === group"
+          @change="toggleUsage(group)"
+        >
+        {{ usageOptionLabel(group, filters, facets?.staleDays) }}
+        <span class="side-count">{{ usageCounts[group] ?? '—' }}</span>
+      </label>
+    </fieldset>
+
+    <fieldset class="side-group">
+      <legend class="side-group__title">
+        {{ titleCase('Read By') }}
+      </legend>
+      <label
+        v-for="kind in CLIENT_KIND_OPTIONS"
+        :key="kind"
+        class="side-option"
+        :data-read-by="ClientKind[kind]"
+      >
+        <input
+          type="checkbox"
+          :checked="readBy.includes(kind)"
+          :disabled="readBy.length === 1 && readBy.includes(kind)"
+          @change="toggleReadBy(kind)"
+        >
+        {{ clientKindLabel(kind) }}
       </label>
     </fieldset>
   </section>

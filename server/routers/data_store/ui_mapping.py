@@ -14,29 +14,42 @@ carry (ExpiryType, DatasetState, FreshnessStatus) are looked up by their own pre
 """
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
+
+from fastapi import Request
 
 from common.enums.data_stock import ExpiryType, Granularity
 from common.rpc.mapping.fetch_dataset import bar_to_proto
 from common.rpc.mapping.values import ASSET_TYPE, DATA_SOURCE, DATA_TYPE, FEED, GRANULARITY, UPDATE_TYPE, to_timestamp
+from data.store.app.database.crud.dataset_override import OperatorOverrideInput
 from data.store.app.database.crud.ingest_run import IngestRunRecord
 from data.store.app.database.crud.stock.dataset_catalog import BarExtent
+from data.store.app.database.models.dataset_read import ReadClientKind
 from data.store.app.database.models.ingest_run import IngestRunState
 from data.store.app.dataset_catalog import (
     BarPageIndexResult,
     BarPageResult,
+    ClientFilter,
     CoverageResult,
     DatasetDetail,
     DatasetPage,
+    DatasetUsageView,
     DatasetView,
     Facets,
+    LastReadBucketsResult,
+    ReadsPerDayResult,
     RunPageResult,
+    StaleDatasetPageResult,
+    StorageCurrent,
+    UsageSummary,
     effective_end,
+    is_collecting,
     is_retired,
 )
 from data.store.app.events import DatasetChanged, DomainEvent, IngestRunChanged, ReaperPendingChanged, RequestChanged
 from data.store.app.ui_config import UiConfigView
+from routers.common.proto_json import ProtoBody
 from schemas.data_ingest import fetch_dataset as domain
 from trader_joe.proto.ui.v1 import data_pb2, events_pb2, shell_pb2, stats_pb2  # noqa: TID251
 
@@ -49,9 +62,19 @@ DatasetFacetsMessage = data_pb2.DatasetFacets
 BarPageMessage = data_pb2.BarPage
 BarPageIndexMessage = data_pb2.BarPageIndex
 IngestRunPageMessage = data_pb2.IngestRunPage
+ReaperPendingPageMessage = data_pb2.ReaperPendingPage
 CoverageStripMessage = stats_pb2.CoverageStrip
+UsageSummaryMessage = stats_pb2.UsageSummary
+LastReadBucketsMessage = stats_pb2.LastReadBuckets
+ReadsPerDayMessage = stats_pb2.ReadsPerDay
+StaleDatasetPageMessage = stats_pb2.StaleDatasetPage
+StorageCurrentMessage = stats_pb2.StorageCurrent
 UiEventMessage = events_pb2.UiEvent
 UiConfigMessage = shell_pb2.UiConfig
+# The request bodies of the expiry and delete writes (tj-grna9p.86); parsed by ProtoBody, never by a pydantic model.
+SetExpiryRequestMessage = data_pb2.SetExpiryRequest
+DeleteDatasetRequestMessage = data_pb2.DeleteDatasetRequest
+SetCollectingRequestMessage = data_pb2.SetCollectingRequest
 
 
 def _enum_value(enum_type: Any, prefix: str, member: Any) -> int:
@@ -72,12 +95,39 @@ def _freshness(view: DatasetView, as_of: datetime) -> data_pb2.Freshness:
     return message
 
 
+def _client_kind(kind: ReadClientKind) -> int:
+    return _enum_value(data_pb2.ClientKind, 'CLIENT_KIND_', kind)
+
+
+def _echo(client_filter: ClientFilter) -> tuple[list[str], list[int]]:
+    """The client filter's echo: exactly one of the two lists is non-empty (the ECHO RULE in data.proto)."""
+    ids = list(client_filter.applied_ids)
+    return ids, [] if ids else [_client_kind(kind) for kind in client_filter.applied_kinds]
+
+
+def _usage(usage: DatasetUsageView, client_filter: ClientFilter) -> data_pb2.DatasetUsage:
+    client_ids, client_kinds = _echo(client_filter)
+    message = data_pb2.DatasetUsage(
+        reads_30d=usage.reads_30d,
+        read_by_30d=[_client_kind(kind) for kind in usage.read_by_30d],
+        read_by_clients_30d=usage.read_by_clients_30d,
+        client_ids=client_ids,
+        client_kinds=client_kinds,
+    )
+    if usage.last_read_at is not None:
+        message.last_read_at.CopyFrom(to_timestamp(usage.last_read_at))
+    return message
+
+
 def _summary(
     view: DatasetView,
     extent: BarExtent,
     siblings: list[tuple[uuid.UUID, Granularity]],
     as_of: datetime,
     last_run: IngestRunRecord | None = None,
+    reaper_pending: bool = False,
+    usage: DatasetUsageView | None = None,
+    client_filter: ClientFilter | None = None,
 ) -> data_pb2.DatasetSummary:
     row = view.row
     message = data_pb2.DatasetSummary(
@@ -93,6 +143,9 @@ def _summary(
         owner=row.owner,
         state=data_pb2.DATASET_STATE_RETIRED if is_retired(row) else data_pb2.DATASET_STATE_ACTIVE,
         bar_count=extent.count,
+        reaper_pending=reaper_pending,
+        # Derived: a subscription's collect intent; for STATIC, whether its latest run is RUNNING (no extra read).
+        collecting=is_collecting(row, last_run is not None and last_run.state is IngestRunState.RUNNING),
     )
     message.start.CopyFrom(to_timestamp(row.start))
     message.end.CopyFrom(to_timestamp(effective_end(row, as_of)))
@@ -109,6 +162,8 @@ def _summary(
     )
     if last_run is not None:
         message.last_run.CopyFrom(ingest_run_message(last_run))
+    # Always set on a list or detail read, an unread dataset included (the zero view).
+    message.usage.CopyFrom(_usage(usage or DatasetUsageView(), client_filter or ClientFilter()))
     return message
 
 
@@ -124,7 +179,43 @@ def dataset_page_message(page: DatasetPage) -> data_pb2.DatasetPage:
     message = data_pb2.DatasetPage(next_cursor=page.next_cursor)
     message.items.extend(
         _summary(
-            view, page.extents[view.row.id], page.siblings[view.row.id], page.as_of, page.last_runs.get(view.row.id)
+            view,
+            page.extents[view.row.id],
+            page.siblings[view.row.id],
+            page.as_of,
+            page.last_runs.get(view.row.id),
+            reaper_pending=view.row.id in page.reaper_pending,
+            usage=page.usage.get(view.row.id),
+            client_filter=page.client_filter,
+        )
+        for view in page.views
+    )
+    return message
+
+
+def reaper_pending_page_message(page: DatasetPage, deletes_enabled: bool) -> data_pb2.ReaperPendingPage:
+    """The reaper's pending page as a ReaperPendingPage message.
+
+    Args:
+        page: The page the catalog produced from the pending set.
+        deletes_enabled: Whether the reaper deletes; False means dry-run.
+
+    Returns:
+        data_pb2.ReaperPendingPage: One summary per pending dataset, each with reaper_pending true, the next cursor
+        (empty on the last page), deletes_enabled and as_of.
+    """
+    message = data_pb2.ReaperPendingPage(next_cursor=page.next_cursor, deletes_enabled=deletes_enabled)
+    message.as_of.CopyFrom(to_timestamp(page.as_of))
+    message.items.extend(
+        _summary(
+            view,
+            page.extents[view.row.id],
+            page.siblings[view.row.id],
+            page.as_of,
+            page.last_runs.get(view.row.id),
+            reaper_pending=True,
+            usage=page.usage.get(view.row.id),
+            client_filter=page.client_filter,
         )
         for view in page.views
     )
@@ -140,7 +231,16 @@ def dataset_summary_message(detail: DatasetDetail) -> data_pb2.DatasetSummary:
     Returns:
         data_pb2.DatasetSummary: The dataset with its freshness, extent and siblings.
     """
-    return _summary(detail.view, detail.extent, detail.siblings, detail.as_of, detail.last_run)
+    return _summary(
+        detail.view,
+        detail.extent,
+        detail.siblings,
+        detail.as_of,
+        detail.last_run,
+        reaper_pending=detail.reaper_pending,
+        usage=detail.usage,
+        client_filter=detail.client_filter,
+    )
 
 
 def facets_message(facets: Facets) -> data_pb2.DatasetFacets:
@@ -150,9 +250,30 @@ def facets_message(facets: Facets) -> data_pb2.DatasetFacets:
         facets: The counts the catalog produced.
 
     Returns:
-        data_pb2.DatasetFacets: The two view totals and a count for every source, update type and status.
+        data_pb2.DatasetFacets: The two view totals and a count for every source, update type and status, the
+        usage and expiry counts with the filter echo, and the clients seen reading.
     """
-    message = data_pb2.DatasetFacets(all=facets.all, needs_attention=facets.needs_attention, running=facets.running)
+    client_ids, client_kinds = _echo(facets.client_filter)
+    message = data_pb2.DatasetFacets(
+        all=facets.all,
+        needs_attention=facets.needs_attention,
+        running=facets.running,
+        client_ids=client_ids,
+        client_kinds=client_kinds,
+        stale=facets.stale,
+        read_30d=facets.read_30d,
+        never_read=facets.never_read,
+        expiring_soon=facets.expiring_soon,
+        stale_days=facets.stale_days,
+    )
+    if facets.expires_before is not None:
+        message.expires_before.CopyFrom(to_timestamp(facets.expires_before))
+    message.clients.extend(
+        data_pb2.ClientCount(
+            client_id=item.client_id, client_kind=_client_kind(item.client_kind), datasets=item.datasets
+        )
+        for item in facets.clients
+    )
     message.sources.extend(
         data_pb2.SourceFacet(source=DATA_SOURCE.to_proto(source), count=count)
         for source, count in facets.sources.items()
@@ -164,6 +285,89 @@ def facets_message(facets: Facets) -> data_pb2.DatasetFacets:
     message.statuses.extend(
         data_pb2.StatusFacet(status=_enum_value(data_pb2.FreshnessStatus, 'FRESHNESS_STATUS_', status), count=count)
         for status, count in facets.statuses.items()
+    )
+    return message
+
+
+def usage_summary_message(summary: UsageSummary) -> stats_pb2.UsageSummary:
+    """The usage page's headline figures as a UsageSummary message, with the client filter echoed."""
+    client_ids, client_kinds = _echo(summary.client_filter)
+    return stats_pb2.UsageSummary(
+        stale=summary.stale,
+        read_last_30d=summary.read_last_30d,
+        total=summary.total,
+        never_read=summary.never_read,
+        reads_today=summary.reads_today,
+        distinct_clients_today=summary.distinct_clients_today,
+        client_ids=client_ids,
+        client_kinds=client_kinds,
+        stale_days=summary.stale_days,
+    )
+
+
+def last_read_buckets_message(result: LastReadBucketsResult) -> stats_pb2.LastReadBuckets:
+    """The datasets by days since last read as a LastReadBuckets message; the open bucket has no max_days."""
+    client_ids, client_kinds = _echo(result.client_filter)
+    message = stats_pb2.LastReadBuckets(never_read=result.never_read, client_ids=client_ids, client_kinds=client_kinds)
+    for min_days, max_days, datasets in result.buckets:
+        bucket = message.buckets.add(min_days=min_days, datasets=datasets)
+        if max_days is not None:
+            bucket.max_days = max_days
+    return message
+
+
+def reads_per_day_message(result: ReadsPerDayResult) -> stats_pb2.ReadsPerDay:
+    """Reads per UTC day per client as a ReadsPerDay message, days as 'YYYY-MM-DD'."""
+    client_ids, client_kinds = _echo(result.client_filter)
+    message = stats_pb2.ReadsPerDay(client_ids=client_ids, client_kinds=client_kinds)
+    message.days.extend(
+        stats_pb2.ReadsPerDayEntry(
+            day=entry.day.isoformat(),
+            client_id=entry.client_id,
+            client_kind=_client_kind(entry.client_kind),
+            reads=entry.reads,
+        )
+        for entry in result.entries
+    )
+    return message
+
+
+def stale_dataset_page_message(result: StaleDatasetPageResult) -> stats_pb2.StaleDatasetPage:
+    """One page of stale datasets as a StaleDatasetPage message: each row with its size estimate and last reads."""
+    page = result.page
+    client_ids, client_kinds = _echo(page.client_filter)
+    message = stats_pb2.StaleDatasetPage(
+        next_cursor=page.next_cursor, client_ids=client_ids, client_kinds=client_kinds, stale_days=result.stale_days
+    )
+    for view in page.views:
+        row = message.items.add(est_bytes=result.est_bytes[view.row.id])
+        row.dataset.CopyFrom(
+            _summary(
+                view,
+                page.extents[view.row.id],
+                page.siblings[view.row.id],
+                page.as_of,
+                page.last_runs.get(view.row.id),
+                reaper_pending=view.row.id in page.reaper_pending,
+                usage=page.usage.get(view.row.id),
+                client_filter=page.client_filter,
+            )
+        )
+        for read in result.last_reads.get(view.row.id, []):
+            item = row.last_read_by_client.add(client_id=read.client_id, client_kind=_client_kind(read.client_kind))
+            item.last_read_at.CopyFrom(to_timestamp(read.last_read_at))
+    return message
+
+
+def storage_current_message(result: StorageCurrent) -> stats_pb2.StorageCurrent:
+    """The bar table's size and its estimated split by source and feed as a StorageCurrent message."""
+    message = stats_pb2.StorageCurrent(total_bytes=result.total_bytes)
+    message.as_of.CopyFrom(to_timestamp(result.as_of))
+    message.by_source.extend(
+        stats_pb2.StorageBySource(
+            source=DATA_SOURCE.to_proto(share.source), feed=FEED.to_proto(share.feed), est_bytes=share.est_bytes
+        )
+        for share in result.by_source
     )
     return message
 
@@ -360,3 +564,69 @@ __all__ = [
     'ui_config_message',
     'ui_event_message',
 ]
+
+
+def _override_input(request: Any) -> OperatorOverrideInput | None:
+    """The override a write body carried, as plain values; None when the body has none."""
+    if not request.HasField('override'):
+        return None
+    return OperatorOverrideInput(reason=request.override.reason, confirmed=request.override.confirmed)
+
+
+def set_expiry_values(request: data_pb2.SetExpiryRequest) -> tuple[datetime | None, OperatorOverrideInput | None]:
+    """A SetExpiryRequest as plain values: the new expiry (None clears it) and the override, if sent.
+
+    Args:
+        request: The parsed body.
+
+    Returns:
+        tuple[datetime | None, OperatorOverrideInput | None]: The aware UTC expiry and the override.
+    """
+    expiry = request.expiry.ToDatetime(tzinfo=UTC) if request.HasField('expiry') else None
+    return expiry, _override_input(request)
+
+
+def set_collecting_values(request: data_pb2.SetCollectingRequest) -> tuple[bool | None, OperatorOverrideInput | None]:
+    """A SetCollectingRequest as plain values: the collect intent and the override, if sent.
+
+    Args:
+        request: The parsed body.
+
+    Returns:
+        tuple[bool | None, OperatorOverrideInput | None]: collect, or None when the body did not carry it
+        (presence: a missing key is never read as false), and the override.
+    """
+    collect = request.collect if request.HasField('collect') else None
+    return collect, _override_input(request)
+
+
+def delete_values(request: data_pb2.DeleteDatasetRequest) -> OperatorOverrideInput | None:
+    """A DeleteDatasetRequest's override as plain values; None when the body has none.
+
+    Args:
+        request: The parsed body.
+
+    Returns:
+        OperatorOverrideInput | None: The override.
+    """
+    return _override_input(request)
+
+
+_parse_delete_body = ProtoBody(DeleteDatasetRequestMessage)
+
+
+async def delete_request_body(request: Request) -> data_pb2.DeleteDatasetRequest:
+    """The body of a dataset delete: ProtoBody's parse, except that no body at all is an empty request.
+
+    A DELETE of the operator's own dataset needs no override, so a client may send no body. Anything sent is
+    parsed strictly: an unknown field or a body that is not a JSON object is still a 422.
+
+    Args:
+        request: The request.
+
+    Returns:
+        data_pb2.DeleteDatasetRequest: The parsed body, or an empty message.
+    """
+    if not (await request.body()).strip():
+        return DeleteDatasetRequestMessage()
+    return await _parse_delete_body(request)

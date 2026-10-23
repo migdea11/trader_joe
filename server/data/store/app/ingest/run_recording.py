@@ -37,6 +37,7 @@ import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -142,6 +143,8 @@ async def recorded_run(
     *,
     trigger: IngestRunTrigger = IngestRunTrigger.REQUEST,
     request_id: uuid.UUID | None = None,
+    actor: str | None = None,
+    requested_start: datetime | None = None,
 ) -> AsyncIterator[RunHandle]:
     """Record one fetch: a RUNNING row before the body runs, a terminal row after it.
 
@@ -154,11 +157,15 @@ async def recorded_run(
         trigger: What started the run. POST /store is a REQUEST.
         request_id: The request-log entry that caused the run. NULL until the scheduler's
             request log exists (tj-pd41mt), which adds the foreign key.
+        actor: The run's actor when it is not the body's owner: the DAILY refresh runs as `scheduler`
+            (tj-grna9p.22), whatever dataset owner it works for.
+        requested_start: The start the run actually asked ingest for, when it narrows the body's
+            (the DAILY refresh asks for the missing tail only). None records the body's start.
 
     Yields:
         RunHandle: The run's handle.
     """
-    record = await _begin(request_path, request_body, trigger, request_id)
+    record = await _begin(request_path, request_body, trigger, request_id, actor, requested_start)
     handle = RunHandle(record)
     if record is not None:
         publish(IngestRunChanged(record))
@@ -179,18 +186,20 @@ async def _begin(
     request_body: StoreAssetDatasetBody,
     trigger: IngestRunTrigger,
     request_id: uuid.UUID | None,
+    actor: str | None,
+    requested_start: datetime | None,
 ) -> IngestRunRecord | None:
     """Commit the RUNNING row, or return None when it cannot be written."""
     run = NewRun(
         trigger=trigger,
-        actor=request_body.owner,
+        actor=request_body.owner if actor is None else actor,
         asset_symbol=request_path.asset_symbol,
         asset_type=request_path.asset_type,
         data_type=request_path.data_type,
         source=request_body.source,
         granularity=request_body.granularity,
         update_type=request_body.update_type,
-        requested_start=request_body.start,
+        requested_start=request_body.start if requested_start is None else requested_start,
         requested_end=request_body.end,
         request_id=request_id,
     )

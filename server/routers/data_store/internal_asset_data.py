@@ -1,6 +1,7 @@
+from collections import Counter
 from typing import Annotated
 
-from fastapi import APIRouter, Body, Depends, Path, Query
+from fastapi import APIRouter, Body, Depends, Header, Path, Query
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -8,8 +9,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from common.enums.data_select import AssetType, DataType
 from common.errors.vocabulary import InvalidRequestError, Reason
 from common.logging import get_logger
+from data.store.app.client_label import CLIENT_ID_HEADER, classify_client_label
 from data.store.app.database.crud.stock import asset_market_activity as crud_stock_market_activity
 from data.store.app.database.database import async_db
+from data.store.app.usage_recorder import usage_recorder
 from routers.common.instance_secret import require_instance_secret
 from routers.data_store.app_endpoints import AssetDataInterface
 from schemas.data_store.asset_data_interface import AssetDataPath
@@ -88,8 +91,14 @@ async def read_stock_market_activity_data(
     db: Annotated[AsyncSession, Depends(async_db)],
     asset_path: Annotated[AssetDataPath, Path()],
     asset_query: Annotated[StockDataMarketActivityQuery, Query()],
+    # The reader's label (tj-grna9p.131 OPTION R): the caller's dataset owner string, a usage-telemetry
+    # label and never an authority. Absent, empty, over-long or malformed is recorded as '_unattributed'.
+    client_id_header: Annotated[str | None, Header(alias=CLIENT_ID_HEADER)] = None,
 ):
     """Read stock market activity data.
+
+    EACH CALL IS RECORDED AS A READ of every dataset it returned bars of (tj-grna9p.46), labelled by the
+    X-Client-Id header. Recording is buffered and best effort and never changes the answer.
 
     Repointed at read_market_activity_data (tj-vhboky.8 / tj-xoz4ll): the function this route used
     to call, read_all_asset_market_activity_data, no longer exists -- tj-vhboky.5 deleted it, and
@@ -120,7 +129,17 @@ async def read_stock_market_activity_data(
     log.debug(f'Reading data: /{asset_path.asset_type}/{asset_path.data_type}')
     match (asset_path.asset_type, asset_path.data_type):
         case (AssetType.STOCK, DataType.MARKET_ACTIVITY):
-            return await crud_stock_market_activity.read_market_activity_data(db, asset_query)
+            bars = await crud_stock_market_activity.read_market_activity_data(db, asset_query)
+            # ONE CALL IS ONE READ per dataset it returned bars of (this route has no cursor). Buffered in
+            # process and written by the usage recorder's flush: no statement, no await, and no way to fail
+            # the read (tj-grna9p.46).
+            counts = Counter(bar.dataset_id for bar in bars)
+            if asset_query.dataset_id is not None:
+                counts.setdefault(asset_query.dataset_id, 0)
+            label = classify_client_label(client_id_header)
+            for dataset_id, count in counts.items():
+                usage_recorder.record_read(dataset_id, label, AssetDataInterface.GET_ASSET_DATA.value, count)
+            return bars
         case _:
             # Unreachable defence, as above.
             raise _unsupported(asset_path.asset_type)

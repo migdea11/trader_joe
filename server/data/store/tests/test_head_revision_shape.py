@@ -74,6 +74,25 @@ FEED_FILE = f'{FEED_REVISION}_feed_on_the_dataset_entry.py'
 # constraint; the new revision's own shape is pinned in test_ingest_run_revision.py.
 INGEST_RUN_REVISION = '6f5a798746a1'
 INGEST_RUN_FILE = f'{INGEST_RUN_REVISION}_ingest_run.py'
+# THE HEAD SINCE tj-grna9p.46: dataset_read and dataset_read_daily, PURELY ADDITIVE and directly on the
+# ingest_run revision. It touches no table this file is about either; its own shape is pinned in
+# test_dataset_read_revision.py.
+DATASET_READ_REVISION = 'b3d9e1a47c62'
+DATASET_READ_FILE = f'{DATASET_READ_REVISION}_dataset_read.py'
+# THE HEAD SINCE tj-grna9p.86: dataset_override_log and dataset_deletion, PURELY ADDITIVE and directly on the
+# dataset_read revision. Its own shape is pinned in test_override_log_revision.py.
+OVERRIDE_LOG_REVISION = 'd7e2a9c35b18'
+OVERRIDE_LOG_FILE = f'{OVERRIDE_LOG_REVISION}_dataset_override_log_and_deletion.py'
+# THE HEAD SINCE tj-grna9p.176: store_dataset_entry.collect, PURELY ADDITIVE and directly on the override-log
+# revision. It adds a nullable column and a CHECK to the entry, outside every unique key, so the entry-identity
+# agreement tests below still read FEED_REVISION; its own shape is pinned in test_dataset_entry_collect_revision.py.
+COLLECT_REVISION = 'e5c8b1d4f703'
+COLLECT_FILE = f'{COLLECT_REVISION}_dataset_entry_collect.py'
+# THE HEAD SINCE tj-grna9p.183: override_action gains SET_COLLECTING, PURELY ADDITIVE (one enum value) and directly
+# on the collect revision. It touches no table's columns or keys; its own shape is pinned in
+# test_override_action_set_collecting_revision.py.
+SET_COLLECTING_REVISION = 'a6d3f8e1c205'
+SET_COLLECTING_FILE = f'{SET_COLLECTING_REVISION}_override_action_set_collecting.py'
 # The parent the epic's design names for its one revision (tj-vhboky.12 item 1).
 PARENT_REVISION = '8f41c2d7a3b9'
 PARENT_FILE = f'{PARENT_REVISION}_bar_natural_key_and_upsert.py'
@@ -228,11 +247,42 @@ def test_each_revision_of_the_two_epics_sits_directly_on_the_one_before_it():
     # A THIRD ONE-REVISION PROMISE since tj-grna9p.18, and it went red the correct way when it landed:
     # the head is the ingest_run revision, directly on the feed revision, and the chain below is the
     # same as before. A fourth revision slipped in between would still re-point one of these hops.
-    assert head_revision.module.__file__.endswith(INGEST_RUN_FILE), (
-        f'the head is not {INGEST_RUN_FILE}: {head_revision.module.__file__}'
+    # A FOURTH since tj-grna9p.46: the dataset_read revision, directly on ingest_run.
+    # A FIFTH since tj-grna9p.86: the override-log revision, directly on dataset_read.
+    # A SIXTH since tj-grna9p.176: the collect revision, directly on the override-log revision.
+    # A SEVENTH since tj-grna9p.183: the head is the SET_COLLECTING enum revision, directly on the collect revision.
+    assert head_revision.module.__file__.endswith(SET_COLLECTING_FILE), (
+        f'the head is not {SET_COLLECTING_FILE}: {head_revision.module.__file__}'
     )
-    assert head_revision.down_revision == FEED_REVISION, (
-        f'the head does not sit directly on {FEED_REVISION}: {head_revision.down_revision}'
+    assert head_revision.down_revision == COLLECT_REVISION, (
+        f'the head does not sit directly on {COLLECT_REVISION}: {head_revision.down_revision}'
+    )
+    collect_revision = script.get_revision(COLLECT_REVISION)
+    assert collect_revision.module.__file__.endswith(COLLECT_FILE), f'{COLLECT_REVISION} is not {COLLECT_FILE}'
+    assert collect_revision.down_revision == OVERRIDE_LOG_REVISION, (
+        f'{COLLECT_REVISION} does not sit directly on {OVERRIDE_LOG_REVISION}: {collect_revision.down_revision}'
+    )
+    override_log_revision = script.get_revision(OVERRIDE_LOG_REVISION)
+    assert override_log_revision.module.__file__.endswith(OVERRIDE_LOG_FILE), (
+        f'{OVERRIDE_LOG_REVISION} is not {OVERRIDE_LOG_FILE}'
+    )
+    assert override_log_revision.down_revision == DATASET_READ_REVISION, (
+        f'{OVERRIDE_LOG_REVISION} does not sit directly on {DATASET_READ_REVISION}: '
+        f'{override_log_revision.down_revision}'
+    )
+    dataset_read_revision = script.get_revision(DATASET_READ_REVISION)
+    assert dataset_read_revision.module.__file__.endswith(DATASET_READ_FILE), (
+        f'{DATASET_READ_REVISION} is not {DATASET_READ_FILE}'
+    )
+    assert dataset_read_revision.down_revision == INGEST_RUN_REVISION, (
+        f'{DATASET_READ_REVISION} does not sit directly on {INGEST_RUN_REVISION}: {dataset_read_revision.down_revision}'
+    )
+    ingest_run_revision = script.get_revision(INGEST_RUN_REVISION)
+    assert ingest_run_revision.module.__file__.endswith(INGEST_RUN_FILE), (
+        f'{INGEST_RUN_REVISION} is not {INGEST_RUN_FILE}'
+    )
+    assert ingest_run_revision.down_revision == FEED_REVISION, (
+        f'{INGEST_RUN_REVISION} does not sit directly on {FEED_REVISION}: {ingest_run_revision.down_revision}'
     )
     feed_revision = script.get_revision(FEED_REVISION)
     assert feed_revision.module.__file__.endswith(FEED_FILE), f'{FEED_REVISION} is not {FEED_FILE}'

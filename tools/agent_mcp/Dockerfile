@@ -92,13 +92,36 @@ COPY tools/agent_mcp/*.py /opt/agent_mcp/tools/agent_mcp/
 # THE TRUSTED COMPOSE FILES (stack.TRUSTED_COMPOSE_DIR): the -f list the verbs pass, taken from the
 # checkout the image is built from, never from an agent's worktree at run time. A compose change
 # reaches the MCP when this image is rebuilt (make agent-mcp-up).
-COPY docker-compose.yaml docker-compose.test-client.yaml docker-compose.agent-stack.yaml docker-compose.fake.yaml \
-    /opt/agent_mcp/compose/
+COPY docker-compose.yaml docker-compose.test-client.yaml docker-compose.fake.yaml /opt/agent_mcp/compose/
 # THE TRUSTED DOCKERFILE (stack.TRUSTED_DOCKERFILE; ADR tj-4rr0la addendum 5, ruling 2): the service
-# Dockerfile, which docker-compose.agent-stack.yaml names as build.dockerfile for every service it
-# builds, so the worktree's own Dockerfile is never read and FROM / COPY --from cannot reach other
-# images on the host daemon. Same rebuild rule as the compose files.
+# Dockerfile, which the MCP-only overlays below (docker-compose.agent-dev.yaml, -test.yaml and -client.yaml)
+# name as build.dockerfile for what they build, so the worktree's own Dockerfile is never read and
+# FROM / COPY --from cannot reach other images on the host daemon. Same rebuild rule as the compose files.
 COPY Dockerfile /opt/agent_mcp/compose/Dockerfile
+# THE TRUSTED COPIES FOR THE USER'S DEV PROJECT (stack.DEV_COMPOSE_FILES; ADR tj-4rr0la addendum 23,
+# epic tj-iee6sn). The dev set's -f list: the base file (copied above), the override, the web prod
+# and web dev files, and the MCP-only overlay that points build.dockerfile at the trusted Dockerfile
+# above. docker-compose.tools.yaml (pgAdmin) is for tools. Nothing from the checkout's own files
+# is ever passed to compose.
+COPY docker-compose.override.yaml docker-compose.web.yaml docker-compose.web.dev.yaml \
+    docker-compose.agent-dev.yaml docker-compose.tools.yaml /opt/agent_mcp/compose/
+# TEST MODE'S BUILD OVERLAY (stack.TEST_BUILD_COMPOSE_FILES; tj-iee6sn.24): it sets only build.dockerfile
+# for data_store and data_ingest, after the base file and docker-compose.fake.yaml (both copied above).
+COPY docker-compose.agent-test.yaml /opt/agent_mcp/compose/
+# THE SYSTEM-TEST CLIENT'S OVERLAY (stack.SYSTEM_CLIENT_COMPOSE_FILES; tj-iee6sn.20): sets only test_client's
+# build.dockerfile, after the base file and docker-compose.test-client.yaml (both copied above), so the
+# client built from a worktree's snapshot uses the trusted Dockerfile below, never the snapshot's own.
+COPY docker-compose.agent-client.yaml /opt/agent_mcp/compose/
+# THE TWO SCRIPTS the dev verbs run from here instead of the checkout's (an agent-writable file run
+# inside agent_mcp would hold the Docker API): dev_instance_secret.sh resolves the dev web container's
+# INSTANCE_WRITE_SECRET, source_digest.sh stamps the images. In a tools/ directory beside the trusted
+# Dockerfile, the repository's own layout, because source_digest.sh finds the Dockerfile at ../Dockerfile
+# from itself. They need sh, bash, awk, sed, sort, find, tr, mktemp, realpath and sha256sum, all of
+# which the Debian slim base provides (no package is installed for them). Same rebuild rule as the
+# compose files.
+# proto_digest.sh (tj-iee6sn.33) is the third: it recomputes the content stamp of gen/proto/<kind>, run
+# with --context over the repository mount, and needs only bash, find, sort, sha256sum and realpath.
+COPY tools/dev_instance_secret.sh tools/source_digest.sh tools/proto_digest.sh /opt/agent_mcp/compose/tools/
 
 ENV PATH="/opt/agent_mcp/.venv/bin:${PATH}" \
     PYTHONPATH=/opt/agent_mcp \

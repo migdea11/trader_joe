@@ -98,14 +98,19 @@ def served_done(bar_count: int) -> fetch_dataset.FetchDone:
 
 
 class FakeResult:
-    """One canned answer, with the two accessors the create path reads."""
+    """One canned answer, with the three accessors the create path reads."""
 
-    def __init__(self, *, rows: list[tuple] | None = None, scalar: uuid.UUID | None = None):
+    def __init__(self, *, rows: list[tuple] | None = None, scalar: uuid.UUID | None = None, stored: bool | None = None):
         self._rows = rows if rows is not None else []
         self._scalar = scalar
+        self._stored = stored
 
     def all(self) -> list[tuple]:
         return self._rows
+
+    def scalar_one_or_none(self) -> bool | None:
+        """The stored collect the pre-upsert lock reads (tj-grna9p.189); None is no row yet."""
+        return self._stored
 
     def scalar_one(self) -> uuid.UUID:
         assert self._scalar is not None, 'the create path read an id back from a result that was not given one'
@@ -142,10 +147,11 @@ class FakeSession:
 def _accepting_session(bar_statements: int = 0) -> FakeSession:
     """A session that finds no overlap, returns a fresh entry id, and answers each bar write.
 
-    Three kinds of statement reach it on a served fetch, in this order: the hoisted own-overlap
-    SELECT, the entry upsert (whose RETURNING id is read back), and one INSERT per chunk of bars.
-    Only the first two have results anyone reads, but the fake insists on having one per statement
-    so that a path issuing an unplanned statement fails loudly rather than silently.
+    Four kinds of statement reach it on a served fetch, in this order: the hoisted own-overlap
+    SELECT, the stored-collect SELECT ... FOR UPDATE on the ack (tj-grna9p.189; no row, a create),
+    the entry upsert (whose RETURNING id is read back), and one INSERT per chunk of bars. Only the
+    first three have results anyone reads, but the fake insists on having one per statement so that
+    a path issuing an unplanned statement fails loudly rather than silently.
 
     Args:
         bar_statements: How many bar-write statements the scripted pages will produce.
@@ -153,7 +159,7 @@ def _accepting_session(bar_statements: int = 0) -> FakeSession:
     Returns:
         FakeSession: The session.
     """
-    answers = [FakeResult(rows=[]), FakeResult(scalar=uuid.uuid4())]
+    answers = [FakeResult(rows=[]), FakeResult(stored=None), FakeResult(scalar=uuid.uuid4())]
     answers.extend(FakeResult() for _ in range(bar_statements))
     return FakeSession(*answers)
 

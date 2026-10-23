@@ -19,7 +19,7 @@ The bead's validator gate, one section each:
      an address literal (so not 0.0.0.0, :: or 0). Written literally, with no interpolation, so no
      env file can redirect it (tj-3mk3u5.25 gate item 5).
   3. The port renders to one integer 1..65535 with no DATA_INGEST_GRPC_PORT at all (an env file from
-     before T3a; the agent stack's generated env), with it blank, and with .env.default's value --
+     before T3a), with it blank, and with .env.default's value --
      the same port each way -- and production's BindAddress.from_env accepts what compose renders.
   4. System Testing's Check gRPC Bind Network step, its own script run under bash with `docker`
      stubbed (grpc_bind_docker_stub.py), passes only when the name resolves inside data_ingest to
@@ -79,13 +79,14 @@ DATA_INGEST_LAUNCH_SETS = (
     'PROD_COMPOSE',
     'DEV_COMPOSE',
     'TOOLS_COMPOSE',
-    'AGENT_STACK_COMPOSE',
     'TEST_CLIENT_COMPOSE',
     'SYSTEM_COMPOSE',
     'SEED_DUMP_COMPOSE',
 )
-# The four the bead's gate names; a floor, so a parsing slip cannot shrink the set to nothing.
-GATE_LAUNCH_SETS = frozenset({'PROD_COMPOSE', 'DEV_COMPOSE', 'SYSTEM_COMPOSE', 'AGENT_STACK_COMPOSE'})
+# The bead's gate names; a floor, so a parsing slip cannot shrink the set to nothing. The fourth it named,
+# the agent stack's file set, is retired (tj-iee6sn.27): its successor, the MCP's test mode, is
+# SYSTEM_COMPOSE's file set, already here.
+GATE_LAUNCH_SETS = frozenset({'PROD_COMPOSE', 'DEV_COMPOSE', 'SYSTEM_COMPOSE'})
 _COMPOSE_SET = re.compile(r'^(\w+_COMPOSE)\s*[:?+]?=', re.MULTILINE)
 # A plain RFC 1123 name: letters, digits and hyphens, no '_', no leading or trailing hyphen.
 _RFC1123 = re.compile(
@@ -96,7 +97,7 @@ _RFC1123 = re.compile(
 def _interpolation_envs() -> dict[str, dict[str, str]]:
     """The interpolation environments a launch renders under, as the bead's item 3 names them."""
     return {
-        f'no {PORT_SETTING} (an env file from before T3a, or the agent stack generated env)': {},
+        f'no {PORT_SETTING} (an env file from before T3a)': {},
         f'{PORT_SETTING} blank': {PORT_SETTING: ''},
         '.env.default': _env_file_values(ENV_DEFAULT_FILE),
     }
@@ -141,8 +142,8 @@ def _data_ingest_environment(variable: str) -> dict[str, str | None]:
 def _rendered(text: object, env: Mapping[str, str]) -> str:
     """TEXT interpolated under ENV. A ':?' guard that refuses gets a placeholder that names no service.
 
-    The guard means the real launch supplies a value (the agent stack generates its own names), and
-    no generated value is the bind alias, so a placeholder stands in for it.
+    The guard means the real launch supplies a value (make agent-mcp-up, for the MCP's own file), and
+    no supplied value is the bind alias, so a placeholder stands in for it.
     """
     env = dict(env)
     while True:
@@ -190,9 +191,8 @@ def test_the_base_file_sets_both_bind_variables_and_no_overlay_touches_them(laun
     """Item 1: the values live in the base file's environment:, which outranks every env_file.
 
     Declared by the base file, which every set loads, and by no other file in the set, so no overlay
-    blanks, overrides or passes either through from the shell. The agent stack's env files are
-    generated once and a user's .env predates these variables, so a value anywhere else would miss
-    one of them (ruling on tj-3mk3u5.24).
+    blanks, overrides or passes either through from the shell. A user's .env predates these
+    variables, so a value anywhere else would miss it (ruling on tj-3mk3u5.24).
     """
     files = _set_files(launch_set)
     assert BASE_FILE in files, f'{launch_set} does not load {BASE_FILE.name}: {[path.name for path in files]}'
@@ -295,7 +295,7 @@ def test_the_bind_host_and_its_alias_are_literal_in_the_base_file():
     """No env file can redirect the host (tj-3mk3u5.25 gate item 5; the T3a gate's F-A).
 
     The test above renders the host under three named envs, so a base value of
-    ${SOME_VAR:-data-ingest-grpc} passes it -- and any env file, shell or generated agent-stack env
+    ${SOME_VAR:-data-ingest-grpc} passes it -- and any env file or shell
     that sets SOME_VAR would then move the listener, while CI's run, which never sets it, stays green.
     So the value as WRITTEN in docker-compose.yaml carries no interpolation at all, and neither does
     the ingest_store alias it must equal: compose substitutes nothing, and environment: outranks
@@ -437,7 +437,8 @@ _PASSING = {
     'dev: devnet attached, the alias still on ingest_store alone': _scenario(
         networks={STORE_NET: _net(STORE_V4), EGRESS_NET: _net(EGRESS_V4), DEVNET: _net(DEVNET_V4)}
     ),
-    'another project prefix (the agent stack)': _scenario(
+    # The retired agent stack's project name, kept as a prefix no live project uses (tj-iee6sn.27).
+    'another project prefix (not the checkout directory)': _scenario(
         networks={
             'trader_joe_agent_stack_ingest_store': _net(STORE_V4),
             'trader_joe_agent_stack_ingest_egress': _net(EGRESS_V4),

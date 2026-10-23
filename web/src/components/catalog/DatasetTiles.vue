@@ -1,16 +1,20 @@
 <script setup lang="ts">
-// The three summary tiles (tj-grna9p.32): Datasets with the daily and bulk split, Failed, Late. They
-// count the whole catalog and do not follow the sidebar filters. Quota, Stale and Last Hour come in
-// later phases. Words and colours are the canvas's (Failed in the fail colour, Late in warn).
+// The summary tiles (tj-grna9p.32, .88): Datasets with the daily and bulk split, Failed, Late and
+// Stale. They count the whole catalog and do not follow the sidebar filters; Stale does follow the
+// Read By choice, which says whose reads it counts. Words and colours are the canvas's (Failed in
+// the fail colour, Late in warn; Stale is neutral, a separate meaning from health).
 import { computed } from 'vue'
 import { storeToRefs } from 'pinia'
 
+import { staleLabel, staleNote } from '@/catalog/usage'
+import { useCatalogFilters } from '@/catalog/useCatalogFilters'
 import { useDatasetCatalogStore } from '@/stores/datasetCatalog'
 import { colors } from '@/theme/tokens'
 import { UpdateType } from '@generated/trader_joe/proto/market/v1/enums_pb'
 import { formatNumber } from '@/format/formatters'
 
 const { tiles, tilesError } = storeToRefs(useDatasetCatalogStore())
+const { filters } = useCatalogFilters()
 
 const cards = computed(() => {
   const counts = tiles.value
@@ -39,6 +43,13 @@ const cards = computed(() => {
       value: value(counts?.status.late),
       color: colors.status.warn,
       note: 'past its expected update',
+    },
+    {
+      key: 'stale',
+      label: staleLabel(counts?.staleDays),
+      value: value(counts?.stale),
+      color: colors.text2,
+      note: staleNote(filters.value, counts?.staleDays),
     },
   ]
 })

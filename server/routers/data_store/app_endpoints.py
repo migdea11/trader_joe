@@ -40,6 +40,30 @@ class UiDatasetsInterface(StrEnum):
     GET_UI_DATASET_COVERAGE = '/ui/v1/datasets/{dataset_id}/coverage'
 
 
+class UiStatsInterface(StrEnum):
+    """The /ui/v1 usage and storage statistics (tj-grna9p.64). Open reads; none records usage."""
+
+    GET_UI_USAGE_SUMMARY = '/ui/v1/stats/usage/summary'
+    GET_UI_USAGE_LAST_READ_BUCKETS = '/ui/v1/stats/usage/last-read-buckets'
+    GET_UI_USAGE_READS_PER_DAY = '/ui/v1/stats/usage/reads-per-day'
+    GET_UI_USAGE_STALE = '/ui/v1/stats/usage/stale'
+    GET_UI_STORAGE_CURRENT = '/ui/v1/stats/storage/current'
+
+
+class UiDatasetWritesInterface(StrEnum):
+    """The /ui/v1 expiry and delete writes (tj-grna9p.86). They take the instance secret."""
+
+    PATCH_UI_DATASET_EXPIRY = '/ui/v1/datasets/{dataset_id}/expiry'
+    PATCH_UI_DATASET_COLLECTING = '/ui/v1/datasets/{dataset_id}/collecting'
+    DELETE_UI_DATASET = '/ui/v1/datasets/{dataset_id}'
+
+
+class UiReaperInterface(StrEnum):
+    """The expiry reaper's pending-deletions read (tj-grna9p.23). Open, like the other /ui/v1 GETs."""
+
+    GET_UI_REAPER_PENDING = '/ui/v1/reaper/pending'
+
+
 class UiConfigInterface(StrEnum):
     """The shell's configuration read (tj-grna9p.45). Served as protobuf canonical JSON."""
 

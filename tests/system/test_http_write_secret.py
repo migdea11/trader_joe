@@ -5,8 +5,9 @@ routers/common/instance_secret.py. This is the one property the unit tier cannot
 unit test overrides the dependency, so only a request through the running service shows the
 header is actually checked on each write route, and that a rejection does not echo the secret.
 
-THE MATRIX, for every write route -- the dataset POST, the dataset DELETE and the internal
-single-bar POST:
+THE MATRIX, for every write route -- the dataset POST, the dataset DELETE, the internal
+single-bar POST, the /ui/v1 expiry PATCH and dataset DELETE (tj-grna9p.86, added by
+tj-grna9p.136), and the /ui/v1 collecting PATCH (tj-grna9p.175):
   * 7a no header, and an EMPTY header value -> 401, and nothing written or removed;
   * 7b a wrong secret -> 401, and nothing written or removed;
   * 7c the right secret -> the handler runs (below);
@@ -25,6 +26,20 @@ accepted; a 409 means it was. And a regression that let a rejected POST through 
 at that 409 rather than reach ingest. Any entry a dataset POST might create is adopted into the
 cleanup registry regardless.
 
+THE /ui/v1 WRITES CARRY A CONFIRMED OVERRIDE, ON PURPOSE. The seeded entry is the run's owner's,
+not the operator's, so without an override the handler would stop at 409 OVERRIDE_REQUIRED and a
+regression that dropped the guard would change nothing either way -- the 401 test's "nothing
+changed" would then be vacuous for these two routes. With the override, a request that got past
+the guard really sets the expiry or really deletes the entry, so the 401 test's checks bite, and
+7c is the write itself: PATCH 200 with the expiry stored, DELETE 204 with the entry gone, each
+with its audit row. The audit rows are this module's to delete, by the seeded entry's id.
+
+THE COLLECTING PATCH NEEDS A SUBSCRIPTION. The seeded entry is STATIC, and a STATIC dataset is a 422
+on that route, so a regression that dropped its guard would stop at the 422 and change nothing: the
+401 test's "nothing changed" would be vacuous. Its case therefore turns the seeded entry into a DAILY
+subscription that is collecting (by SQL, before the one request), and the request stops it with a
+confirmed override: past the guard, collect really goes false and an override row is written.
+
 NOT HERE: 7e (secret unset, restart -> every write 401) and 7f (no secret in the container logs)
 need container control; they are shell steps in the CI job (Sys-5, tj-vhboky.52).
 
@@ -37,8 +52,8 @@ assertion expression contains a response body from a write route. See DataStoreH
 conftest.py for how a failure is kept from printing it.
 """
 
-from collections.abc import Callable
-from datetime import datetime
+from collections.abc import Callable, Iterator
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -48,10 +63,13 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from common.enums.data_select import AssetType, DataType
+from common.enums.data_stock import ExpiryType, UpdateType
+from data.store.app.database.models.dataset_deletion import DatasetDeletion
+from data.store.app.database.models.dataset_override_log import DatasetOverrideLog
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from routers.common.instance_secret import INSTANCE_SECRET_REJECTION_DETAIL
-from routers.data_store.app_endpoints import AssetDataInterface, AssetDatasetStoreInterface
+from routers.data_store.app_endpoints import AssetDataInterface, AssetDatasetStoreInterface, UiDatasetWritesInterface
 from tests.system.problem_json import PROBLEM_JSON
 
 
@@ -59,6 +77,12 @@ pytestmark = pytest.mark.data_store
 
 BAR_TABLE = StockMarketActivity.__table__
 ENTRY_TABLE = StoreDatasetEntry.__table__
+OVERRIDE_TABLE = DatasetOverrideLog.__table__
+DELETION_TABLE = DatasetDeletion.__table__
+
+# The seeded entry is another owner's from the operator's point of view; see the module docstring.
+UI_OVERRIDE = {'reason': 'secret probe', 'confirmed': True}
+UI_EXPIRY = datetime(2031, 1, 2, tzinfo=UTC)
 
 SEED_START = datetime.fromisoformat('2001-01-02T14:30:00+00:00')
 SEED_END = datetime.fromisoformat('2001-03-30T21:00:00+00:00')
@@ -71,6 +95,9 @@ class WriteRoute(StrEnum):
     DATASET_POST = 'dataset-post'
     DATASET_DELETE = 'dataset-delete'
     BAR_POST = 'bar-post'
+    UI_EXPIRY_PATCH = 'ui-expiry-patch'
+    UI_DATASET_DELETE = 'ui-dataset-delete'
+    UI_COLLECTING_PATCH = 'ui-collecting-patch'
 
 
 REJECTED = ('absent', 'empty', 'wrong')
@@ -105,14 +132,58 @@ def _entry_exists(pg_engine: Engine, entry_id: Any) -> bool:
         )
 
 
-@pytest.fixture
-def seeded_entry(insert_entry: Callable[..., sa.Row], own_symbol: str) -> sa.Row:
-    """One entry of the run's owner, Jan-Mar, seeded by SQL: the target every write in a test addresses."""
-    return insert_entry(asset_symbol=own_symbol, start=SEED_START, end=SEED_END)
+def _stored_expiry(pg_engine: Engine, entry_id: Any) -> Any:
+    with pg_engine.connect() as conn:
+        return conn.execute(sa.select(ENTRY_TABLE.c.expiry).where(ENTRY_TABLE.c.id == entry_id)).scalar_one()
+
+
+def _stored_collect(pg_engine: Engine, entry_id: Any) -> Any:
+    with pg_engine.connect() as conn:
+        return conn.execute(sa.select(ENTRY_TABLE.c.collect).where(ENTRY_TABLE.c.id == entry_id)).scalar_one()
+
+
+def _as_collecting_subscription(pg_engine: Engine, entry_id: Any) -> None:
+    """The seeded STATIC entry as a collecting DAILY subscription, so the collecting PATCH can act on it."""
+    with pg_engine.begin() as conn:
+        conn.execute(
+            sa.update(ENTRY_TABLE)
+            .where(ENTRY_TABLE.c.id == entry_id)
+            .values(update_type=UpdateType.DAILY.value, expiry_type=ExpiryType.ROLLING.value, collect=True)
+        )
+
+
+def _collect_before(route: 'WriteRoute', entry: sa.Row) -> Any:
+    """The collect the entry holds when its one request is sent: the collecting case made it a collecting DAILY."""
+    return True if route is WriteRoute.UI_COLLECTING_PATCH else entry.collect
+
+
+def _audit_rows(pg_engine: Engine, entry_id: Any) -> tuple[int, int]:
+    """(override-log rows, deletion rows) recorded against `entry_id`."""
+    with pg_engine.connect() as conn:
+        return tuple(
+            conn.execute(
+                sa.select(sa.func.count()).select_from(table).where(table.c.dataset_id == entry_id)
+            ).scalar_one()
+            for table in (OVERRIDE_TABLE, DELETION_TABLE)
+        )
 
 
 @pytest.fixture
-def send_write(data_store, run_identity, bar_create_body, adopt_entries) -> Callable[..., httpx.Response]:
+def seeded_entry(insert_entry: Callable[..., sa.Row], own_symbol: str, pg_engine: Engine) -> Iterator[sa.Row]:
+    """One entry of the run's owner, Jan-Mar, seeded by SQL: the target every write in a test addresses.
+
+    Teardown deletes the audit rows a /ui/v1 write recorded against it (test infrastructure, as in
+    test_http_ui_dataset_writes.py); the entry itself goes with conftest's registry.
+    """
+    entry = insert_entry(asset_symbol=own_symbol, start=SEED_START, end=SEED_END)
+    yield entry
+    with pg_engine.begin() as conn:
+        for table in (OVERRIDE_TABLE, DELETION_TABLE):
+            conn.execute(sa.delete(table).where(table.c.dataset_id == entry.id))
+
+
+@pytest.fixture
+def send_write(data_store, run_identity, bar_create_body, adopt_entries, pg_engine) -> Callable[..., httpx.Response]:
     """Send one write on `route` against `entry`, carrying `auth`. The owner is always the entry's own."""
 
     def _send(route: WriteRoute, entry: sa.Row, auth: str) -> httpx.Response:
@@ -134,6 +205,17 @@ def send_write(data_store, run_identity, bar_create_body, adopt_entries) -> Call
                 return data_store.delete(path, params={'owner': run_identity.owner}, auth=auth)
             case WriteRoute.BAR_POST:
                 return data_store.post(_bar_path(), json=bar_create_body(entry, entry.start), auth=auth)
+            case WriteRoute.UI_EXPIRY_PATCH:
+                path = UiDatasetWritesInterface.PATCH_UI_DATASET_EXPIRY.format(dataset_id=entry.id)
+                body = {'expiry': UI_EXPIRY.isoformat(), 'override': UI_OVERRIDE}
+                return data_store.patch(path, json=body, auth=auth)
+            case WriteRoute.UI_DATASET_DELETE:
+                path = UiDatasetWritesInterface.DELETE_UI_DATASET.format(dataset_id=entry.id)
+                return data_store.delete(path, json={'override': UI_OVERRIDE}, auth=auth)
+            case WriteRoute.UI_COLLECTING_PATCH:
+                _as_collecting_subscription(pg_engine, entry.id)
+                path = UiDatasetWritesInterface.PATCH_UI_DATASET_COLLECTING.format(dataset_id=entry.id)
+                return data_store.patch(path, json={'collect': False, 'override': UI_OVERRIDE}, auth=auth)
         raise AssertionError(f'unhandled route {route!r}')
 
     return _send
@@ -181,6 +263,12 @@ def test_write_without_the_right_secret_is_401_and_changes_nothing(
     )
     bars = _bars_under(pg_engine, seeded_entry.id)
     assert bars == 0, f'{route} {auth}: {bars} bar(s) under the seeded entry after a 401'
+    expiry = _stored_expiry(pg_engine, seeded_entry.id)
+    assert expiry == seeded_entry.expiry, f'{route} {auth}: the expiry moved to {expiry} after a 401'
+    collect = _stored_collect(pg_engine, seeded_entry.id)
+    assert collect == _collect_before(route, seeded_entry), f'{route} {auth}: collect moved to {collect} after a 401'
+    audit = _audit_rows(pg_engine, seeded_entry.id)
+    assert audit == (0, 0), f'{route} {auth}: (override, deletion) audit rows {audit} after a 401'
 
 
 @pytest.mark.parametrize('route', list(WriteRoute))
@@ -196,7 +284,9 @@ def test_write_with_the_right_secret_reaches_the_handler(
 
     Dataset POST: 409 own-overlap on the seeded entry -- the handler ran; see the module
     docstring for why this is the success signal here. DELETE: 200 and the entry is gone. Bar
-    POST: 200 and the bar is stored.
+    POST: 200 and the bar is stored. /ui/v1 PATCH: 200, the expiry stored and one override row.
+    /ui/v1 DELETE: 204, the entry gone, one override row and one deletion row. /ui/v1 collecting
+    PATCH: 200, collect stored false and one override row.
     """
     response = send_write(route, seeded_entry, 'right')
 
@@ -216,6 +306,18 @@ def test_write_with_the_right_secret_reaches_the_handler(
             assert response.status_code == 200, data_store.describe(response)
             bars = _bars_under(pg_engine, seeded_entry.id)
             assert bars == 1, f'{bars} bar(s) under the seeded entry; {data_store.describe(response)}'
+        case WriteRoute.UI_EXPIRY_PATCH:
+            assert response.status_code == 200, data_store.describe(response)
+            assert _stored_expiry(pg_engine, seeded_entry.id) == UI_EXPIRY, data_store.describe(response)
+            assert _audit_rows(pg_engine, seeded_entry.id) == (1, 0), data_store.describe(response)
+        case WriteRoute.UI_DATASET_DELETE:
+            assert response.status_code == 204, data_store.describe(response)
+            assert not _entry_exists(pg_engine, seeded_entry.id), data_store.describe(response)
+            assert _audit_rows(pg_engine, seeded_entry.id) == (1, 1), data_store.describe(response)
+        case WriteRoute.UI_COLLECTING_PATCH:
+            assert response.status_code == 200, data_store.describe(response)
+            assert _stored_collect(pg_engine, seeded_entry.id) is False, data_store.describe(response)
+            assert _audit_rows(pg_engine, seeded_entry.id) == (1, 0), data_store.describe(response)
 
 
 @pytest.mark.parametrize('auth', ['absent', 'wrong'])

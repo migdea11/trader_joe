@@ -23,6 +23,12 @@
 # a container on internal networks alone has no gateway to publish through.
 services:
   postgres:
+    # THE DATABASE'S OWN DEV MARKER (tj-grna9p.194). A server option, not an env var: tools/dev_datasets reads
+    # cluster_name and its source in pg_settings on the very connection it truncates through and refuses unless
+    # the source is the server command line and the value is dev or test and matches the store's label. Only this
+    # file (dev) and docker-compose.fake.yaml (test) set it; docker-compose.yaml and the prod set never do, so a
+    # prod database is refused. The first word restates the image's default command, which a command: key replaces.
+    command: ["postgres", "-c", "cluster_name=dev"]
     networks:
       - devnet
     ports:

@@ -603,7 +603,8 @@ _LOCKDOWN_PASSING = {
         lambda: _lockdown_scenario(_DUAL_REACH, **_DUAL_STACK),
         [STORE_V4, STORE_V6],
     ),
-    'another project prefix (the agent stack)': (
+    # The retired agent stack's project name, kept as a prefix no live project uses (tj-iee6sn.27).
+    'another project prefix (not the checkout directory)': (
         lambda: _lockdown_scenario(
             networks={
                 'trader_joe_agent_stack_ingest_store': _net(STORE_V4),

@@ -51,6 +51,7 @@ from common.database.sql_alchemy_nullable_datetime import NullableDateTime
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from data.store.app import dataset_catalog as dataset_catalog_module
+from data.store.app.completeness import gap_intervals
 from data.store.app.database.crud.stock import dataset_catalog as catalog_repo
 from data.store.app.database.crud.stock.dataset_catalog import CatalogFilter
 from data.store.app.database.database import async_db
@@ -63,17 +64,16 @@ from data.store.app.dataset_catalog import (
     MAX_COVERAGE_GAPS,
     evaluate_views,
 )
-from data.store.app.freshness import (
-    FreshnessStatus,
+from data.store.app.health import DatasetHealth, FreshnessStatus
+from data.store.app.main import app
+from data.store.app.trading_calendar import (
     NaiveDatetimeError,
     TradingCalendar,
     UnknownCalendarError,
     calendar_for_source,
-    gap_intervals,
     local_midnight,
     session_of,
 )
-from data.store.app.main import app
 from data.store.tests.problem_body import problem, validation_errors
 from data.store.tests.test_coverage_buckets import XTKS
 from routers.data_store.ui_datasets import utc_now
@@ -186,7 +186,10 @@ def entry(
     expiry: datetime | None = None,
     source: DataSource = DataSource.ALPACA_API,
     feed: Feed = Feed.IEX,
+    collect: bool | None = None,
 ) -> StoreDatasetEntry:
+    if collect is None and update_type is not UpdateType.STATIC:
+        collect = True
     return StoreDatasetEntry(
         id=uuid.uuid4(),
         owner=OWNER,
@@ -204,6 +207,11 @@ def entry(
         # (GET /store/{id}) validates every row it reads back against that rule.
         expiry_type=ExpiryType.BULK if update_type is UpdateType.STATIC else ExpiryType.ROLLING,
         update_type=update_type,
+        # collect (decision tj-hhy3dk): NULL for STATIC unless a test passes one to reach the CHECK; a subscription
+        # collects (true) unless the test stops it with collect=False. It is NEVER derived from the expiry: the
+        # expiry is the deletion date only (tj-grna9p.175), so a fixture that coupled the two would hide an expiry
+        # that retires again.
+        collect=collect,
         created_at=NOW,
         updated_at=NOW,
     )
@@ -298,7 +306,8 @@ class Catalog:
         self.bbb = entry('BBB', update_type=UpdateType.DAILY, end=None)
         self.ccc = entry('CCC', granularity=Granularity.ONE_MINUTE, update_type=UpdateType.STREAM)
         self.ddd = entry('DDD', start=ny_midnight(1), end=ny_midnight(6), expiry=z('2026-10-10T00:00:00Z'))
-        self.eee = entry('EEE', update_type=UpdateType.DAILY, expiry=z('2026-10-20T00:00:00Z'))
+        # Retired by its collect intent; its expiry is only the deletion date (decision tj-hhy3dk).
+        self.eee = entry('EEE', update_type=UpdateType.DAILY, expiry=z('2026-10-20T00:00:00Z'), collect=False)
         self.ggg = entry('GGG', update_type=UpdateType.DAILY, source=DataSource.IB_API)
         self.rows = [
             self.aaa_day,
@@ -759,8 +768,20 @@ LIMIT_CASES = {
     'list unknown status': ('/ui/v1/datasets', {'status': 'stale'}, 'status'),
     'list unknown source': ('/ui/v1/datasets', {'source': 'NYSE'}, 'source'),
     'list empty symbol prefix': ('/ui/v1/datasets', {'asset_symbol': ''}, 'asset_symbol'),
-    'list unknown parameter': ('/ui/v1/datasets', {'stale_days': 3}, 'stale_days'),
+    # Was stale_days until tj-grna9p.85 made it a parameter. owner is the /store search filter and never the reader
+    # (tj-grna9p.131), so the catalog must refuse it rather than take it for a client filter.
+    'list unknown parameter': ('/ui/v1/datasets', {'owner': 'operator'}, 'owner'),
     'facets ignores no unknown parameter': ('/ui/v1/datasets/facets', {'limit': 5}, 'limit'),
+    'facets unknown owner parameter': ('/ui/v1/datasets/facets', {'owner': 'operator'}, 'owner'),
+    'list stale_days 0': ('/ui/v1/datasets', {'stale_days': 0}, 'stale_days'),
+    'list stale_days 3651': ('/ui/v1/datasets', {'stale_days': 3651}, 'stale_days'),
+    'facets stale_days 0': ('/ui/v1/datasets/facets', {'stale_days': 0}, 'stale_days'),
+    'facets stale_days 3651': ('/ui/v1/datasets/facets', {'stale_days': 3651}, 'stale_days'),
+    'list unknown usage': ('/ui/v1/datasets', {'usage': 'cold'}, 'usage'),
+    'facets unknown client kind': ('/ui/v1/datasets/facets', {'client_kind': 'BOT'}, 'client_kind'),
+    'list empty client id': ('/ui/v1/datasets', {'client_id': ''}, 'client_id'),
+    'list naive expires_before': ('/ui/v1/datasets', {'expires_before': '2026-10-10T00:00:00'}, 'expires_before'),
+    'list unknown sort last_used': ('/ui/v1/datasets', {'sort': 'last_used'}, 'sort'),
     'bars limit 0': ('/ui/v1/datasets/{id}/bars', {'limit': 0}, 'limit'),
     'bars limit 50001': ('/ui/v1/datasets/{id}/bars', {'limit': 50_001}, 'limit'),
     'bars naive start': ('/ui/v1/datasets/{id}/bars', {'start': '2026-10-05T14:00:00'}, 'start'),
@@ -772,7 +793,8 @@ LIMIT_CASES = {
 @pytest.mark.parametrize(('path', 'params', 'field'), LIMIT_CASES.values(), ids=LIMIT_CASES)
 async def test_a_bad_parameter_is_a_422_naming_it(client, bars, path, params, field):
     response = await client.get(path.replace('{id}', str(bars.dataset.id)), params=params)
-    assert field in [error['loc'][-1] for error in validation_errors(response)]
+    # A repeatable parameter's error ends with the item's index (['query', 'client_kind', 0]), so match any part.
+    assert any(field in error['loc'] for error in validation_errors(response))
 
 
 @pytest.mark.asyncio
@@ -860,6 +882,11 @@ async def test_a_request_runs_a_constant_number_of_statements_not_one_per_datase
     running filter. So the budget is pinned per route, exactly, rather than as one ceiling: list and detail 5
     (was 4), facets 3, and the large set below gives MANY datasets runs, so a per-dataset last_run read would
     show as growth.
+
+    tj-grna9p.85 adds TWO to the list, the detail and the facets HERE: the usage tables' to_regclass probe (once
+    per request) and the reaper's pending set. On SQLite the probe itself fails (no to_regclass), so usage reads
+    as the zero view and the usage, readers and clients reads never run. Their budget, with the tables present,
+    is pinned on Postgres: tests/system/test_http_ui_dataset_usage.py.
     """
     statements: list[str] = []
     event.listen(engine.sync_engine, 'before_cursor_execute', lambda *args: statements.append(args[2]))
@@ -895,11 +922,11 @@ async def test_a_request_runs_a_constant_number_of_statements_not_one_per_datase
     assert small == large, f'the statement count grew with the number of datasets: {small} -> {large}'
     # The running filter reads the RUNNING set once more, and only when asked for.
     assert large == {
-        'list': 5,
-        'list filtered by status': 5,
-        'list filtered by running': 6,
-        'facets': 3,
-        'detail': 5,
+        'list': 7,
+        'list filtered by status': 7,
+        'list filtered by running': 8,
+        'facets': 5,
+        'detail': 7,
         'coverage': 2,
         'bar pages': 2,
     }, large
@@ -943,9 +970,9 @@ class Early:
         minute = Granularity.ONE_MINUTE
         self.static = entry('OLDS', start=OLD_START, end=OLD_END)
         self.daily = entry('OLDD', update_type=UpdateType.DAILY, start=OLD_START)
-        self.daily_retired = entry('OLDR', update_type=UpdateType.DAILY, start=OLD_START, expiry=EXPIRY)
+        self.daily_retired = entry('OLDR', update_type=UpdateType.DAILY, start=OLD_START, expiry=EXPIRY, collect=False)
         self.stream_retired = entry(
-            'OLDX', granularity=minute, update_type=UpdateType.STREAM, start=OLD_START, expiry=EXPIRY
+            'OLDX', granularity=minute, update_type=UpdateType.STREAM, start=OLD_START, expiry=EXPIRY, collect=False
         )
         self.stream = entry('OLDT', granularity=minute, update_type=UpdateType.STREAM, start=OLD_START)
         # The two that cannot be judged: no health, in the list, the facets and the detail alike.
@@ -1003,8 +1030,16 @@ async def test_a_retired_pre_1990_subscription_still_reads_retired(engine, catal
     views = await views_by_id(engine, only=catalog.ids(early.daily_retired, early.stream_retired))
     assert len(views) == 2
     for row in (early.daily_retired, early.stream_retired):
-        assert views[str(row.id)].health.status is FreshnessStatus.RETIRED, row.asset_symbol
-        assert views[str(row.id)].health.retired_on == row.expiry
+        assert views[str(row.id)].health == DatasetHealth(FreshnessStatus.RETIRED), row.asset_symbol
+
+
+@pytest.mark.asyncio
+async def test_a_pre_1990_subscription_with_only_an_expiry_is_not_retired_and_stays_unjudged(engine, catalog, early):
+    """Decision tj-hhy3dk: an expiry is the deletion date, so it does not short-circuit the range read to RETIRED."""
+    dated = entry('OLDE', update_type=UpdateType.DAILY, start=OLD_START, expiry=EXPIRY)
+    await store(engine, dated)
+    views = await views_by_id(engine, only=catalog.ids(dated))
+    assert views[str(dated.id)].health is None
 
 
 @pytest.mark.asyncio
@@ -2149,3 +2184,135 @@ async def test_the_index_fetches_one_row_per_page_never_one_per_bar(client, engi
 
     assert fetched == [len(body['pages'])] == [pages], fetched
     assert pages == count // 1000 + (count % 1000 > 0)
+
+
+# ------------------------------------------------------------------------------------------------- 1week and 1month
+#
+# tj-grna9p.151 (decision tj-grna9p.8, addendum of 2026-10-20): a 1week or 1month dataset is judged BY PERIOD, and
+# the catalog callers pass row.granularity (dataset_catalog.py evaluate_views and dataset_coverage). The pure rules
+# are pinned in test_freshness_periods.py; this drives them end to end through the list, the detail and the coverage
+# strip. Under the per-session rule every case below reads otherwise (the weekly one as 35 missing sessions).
+#
+# NOW is Tue 6 Oct 2026 22:00Z: the week of 28 Sep has ended (Fri 2 Oct), the week of 5 Oct has not.
+
+WEEKLY_BARS = [date(2026, 8, day) for day in (3, 10, 17, 24, 31)] + [
+    # Labor Day week: the vendor stamps the first session, Tuesday 8 Sep.
+    date(2026, 9, 8),
+    date(2026, 9, 14),
+    date(2026, 9, 21),
+    date(2026, 9, 28),
+]
+
+
+def weekly_static(bars: list[date]) -> tuple[StoreDatasetEntry, list]:
+    dataset = entry('WKLY', granularity=Granularity.ONE_WEEK, start=midnight(date(2026, 8, 3)), end=ny_midnight(5))
+    return dataset, daily_bars(dataset, bars)
+
+
+@pytest.mark.asyncio
+async def test_a_complete_weekly_dataset_reads_complete_with_no_gap_windows(client, engine, covered_dates_as_dates):
+    dataset, bars = weekly_static(WEEKLY_BARS)
+    await store(engine, dataset, *bars)
+
+    detail = (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['freshness']
+    assert detail['status'] == 'FRESHNESS_STATUS_COMPLETE' and 'gapCount' not in detail, detail
+    listed = {item['id']: item for item in await list_all(client)}
+    assert status_of(listed[str(dataset.id)]) == 'FRESHNESS_STATUS_COMPLETE'
+    strip = await coverage(client, dataset)
+    assert (strip.gaps, strip.gap_count, strip.missing) == ([], 0, 0), strip
+    # Buckets still count SESSIONS: Mon 3 Aug to Fri 2 Oct, 44 of them (Labor Day is not one).
+    assert strip.expected == 44 == len(XNYS.sessions_overlapping(dataset.start, dataset.end))
+    assert_tiles(strip)
+
+
+@pytest.mark.asyncio
+async def test_a_weekly_dataset_missing_a_week_reads_its_five_sessions_in_one_window(
+    client, engine, covered_dates_as_dates
+):
+    dataset, bars = weekly_static([day for day in WEEKLY_BARS if day != date(2026, 8, 31)])
+    await store(engine, dataset, *bars)
+
+    detail = (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['freshness']
+    assert (detail['status'], detail['gapCount']) == ('FRESHNESS_STATUS_GAPS', 5)
+    strip = await coverage(client, dataset)
+    assert strip.gaps == [window(date(2026, 8, 31), date(2026, 9, 4))] and strip.gaps[0][2] == 5, strip.gaps
+    assert (strip.gap_count, strip.missing, strip.expected) == (1, 5, 44)
+
+
+@pytest.mark.asyncio
+async def test_a_complete_monthly_dataset_reads_complete(client, engine, covered_dates_as_dates):
+    """Bars on each 1st, Jan to Sep 2026, whatever the weekday (1 Jan is a holiday, 1 Feb and 1 Mar are Sundays)."""
+    dataset = entry('MNTH', granularity=Granularity.ONE_MONTH, start=ny_midnight(1, 1), end=ny_midnight(1, 10))
+    await store(engine, dataset, *daily_bars(dataset, [date(2026, month, 1) for month in range(1, 10)]))
+
+    detail = (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['freshness']
+    assert detail['status'] == 'FRESHNESS_STATUS_COMPLETE', detail
+    strip = await coverage(client, dataset)
+    assert (strip.gaps, strip.gap_count, strip.missing) == ([], 0, 0), strip
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('last', 'status'),
+    [(date(2026, 9, 28), 'FRESHNESS_STATUS_FRESH'), (date(2026, 9, 21), 'FRESHNESS_STATUS_OVERDUE')],
+    ids=['last ended week stored', 'a week behind'],
+)
+async def test_a_weekly_subscription_reads_by_its_last_ended_week(client, engine, last, status):
+    """The week of 28 Sep ended Fri 2 Oct; its deadline was Monday 5 Oct's open.
+
+    That week's local midnight (04:00Z, EDT) is the wire's expected_last_bar.
+    """
+    dataset = entry('WSUB', granularity=Granularity.ONE_WEEK, update_type=UpdateType.DAILY, start=ny_midnight(7, 9))
+    await store(engine, dataset, *daily_bars(dataset, [day for day in WEEKLY_BARS[5:] if day <= last]))
+
+    for freshness in (
+        (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['freshness'],
+        {item['id']: item for item in await list_all(client)}[str(dataset.id)]['freshness'],
+    ):
+        assert (freshness['status'], freshness['expectedLastBar']) == (status, '2026-09-28T04:00:00Z'), freshness
+
+
+# tj-grna9p.156 (the clarification on decision tj-grna9p.8 of 2026-10-20): over a range ending mid-period, the week that
+# straddles the end is expected, but only its sessions inside [start, end) are counted. The list, the detail and the
+# coverage strip read the same count. [Mon 3 Aug, Thu 1 Oct): the week of 28 Sep has three sessions in range (28, 29,
+# 30 Sep); 1 and 2 Oct are outside. Before the fix the list and the detail read 5 here and the strip's buckets 3.
+MID_WEEK_END = ny_midnight(1)
+MID_WEEK_CASES = {
+    'the straddling week missing': (date(2026, 9, 28), date(2026, 9, 28), date(2026, 9, 30), 3),
+    'an interior week missing': (date(2026, 8, 31), date(2026, 8, 31), date(2026, 9, 4), 5),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('dropped', 'first', 'last', 'count'), MID_WEEK_CASES.values(), ids=MID_WEEK_CASES)
+async def test_a_weekly_dataset_ending_mid_week_reads_one_count_on_list_detail_and_strip(
+    client, engine, covered_dates_as_dates, dropped, first, last, count
+):
+    dataset = entry('WKMD', granularity=Granularity.ONE_WEEK, start=midnight(date(2026, 8, 3)), end=MID_WEEK_END)
+    await store(engine, dataset, *daily_bars(dataset, [day for day in WEEKLY_BARS if day != dropped]))
+
+    detail = (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['freshness']
+    listed = {item['id']: item for item in await list_all(client)}[str(dataset.id)]['freshness']
+    for freshness in (detail, listed):
+        assert (freshness['status'], freshness['gapCount']) == ('FRESHNESS_STATUS_GAPS', count), freshness
+    strip = await coverage(client, dataset)
+    assert strip.gaps == [window(first, last)] and strip.gaps[0][2] == count, strip.gaps
+    assert (strip.gap_count, strip.missing) == (1, count), strip
+    # 44 sessions Mon 3 Aug..Fri 2 Oct, less Thu 1 and Fri 2 Oct.
+    assert strip.expected == 42 == len(XNYS.sessions_overlapping(dataset.start, dataset.end))
+    # No window reaches past the range end.
+    assert all(gap_end <= MID_WEEK_END for _, gap_end, _ in strip.gaps), strip.gaps
+    assert_tiles(strip)
+
+
+@pytest.mark.asyncio
+async def test_a_complete_weekly_dataset_ending_mid_week_reads_complete(client, engine, covered_dates_as_dates):
+    dataset = entry('WKMC', granularity=Granularity.ONE_WEEK, start=midnight(date(2026, 8, 3)), end=MID_WEEK_END)
+    await store(engine, dataset, *daily_bars(dataset, WEEKLY_BARS))
+
+    detail = (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['freshness']
+    assert detail['status'] == 'FRESHNESS_STATUS_COMPLETE' and 'gapCount' not in detail, detail
+    listed = {item['id']: item for item in await list_all(client)}
+    assert status_of(listed[str(dataset.id)]) == 'FRESHNESS_STATUS_COMPLETE'
+    strip = await coverage(client, dataset)
+    assert (strip.gaps, strip.gap_count, strip.missing, strip.expected) == ([], 0, 0, 42), strip

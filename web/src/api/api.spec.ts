@@ -7,8 +7,11 @@ import { timestampFromMs } from '@bufbuild/protobuf/wkt'
 
 import { DataSource, Granularity, UpdateType } from '@generated/trader_joe/proto/market/v1/enums_pb'
 import {
+  ClientKind,
   DatasetState,
+  DatasetSummarySchema,
   ExpiryType,
+  UsageFilter,
   FreshnessStatus,
   IngestRunPageSchema,
   IngestRunState,
@@ -17,10 +20,30 @@ import {
 import { AccountGroup } from '@generated/trader_joe/proto/ui/v1/shell_pb'
 import { CoverageStripSchema } from '@generated/trader_joe/proto/ui/v1/stats_pb'
 
+import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { join, relative } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+import { deleteRequest, patchMessage } from './client'
+import * as datasetsModule from './datasets'
+import { clientQuery } from './datasets'
+import * as usageStatsModule from './usageStats'
 import {
   API_BASE,
   ApiError,
   buildQuery,
+  DEFAULT_CLIENT_KINDS,
+  EXPIRING_SOON_DAYS,
+  OPERATOR_CLIENT_ID,
+  STALE_DAYS,
+  deleteDataset,
+  getLastReadBuckets,
+  getReadsPerDay,
+  getStaleDatasets,
+  getStorageCurrent,
+  getUsageSummary,
+  setDatasetCollecting,
+  setDatasetExpiry,
   getDataset,
   getDatasetBarPages,
   getDatasetBarPagesRequest,
@@ -182,6 +205,36 @@ describe('fromJson decode of real server JSON', () => {
     ])
   })
 
+  // Hand-written in the canonical JSON names of ui/v1 data.proto fields 21 and 22 and DatasetFacets
+  // 7..15 (tj-grna9p.88): not rendered by the server like the fixtures above.
+  it('DatasetSummary usage and reaper_pending, and the DatasetFacets usage counts', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        ...SUMMARY_JSON,
+        usage: {
+          lastReadAt: '2026-10-01T12:00:00Z',
+          reads30d: '4',
+          readBy30d: ['CLIENT_KIND_UI'],
+          clientKinds: ['CLIENT_KIND_SDK'],
+        },
+        reaperPending: true,
+      }),
+    )
+    const summary = await getDataset(SUMMARY_JSON.id)
+    expect(summary.reaperPending).toBe(true)
+    expect(summary.usage?.lastReadAt?.seconds).toBe(BigInt(Date.UTC(2026, 9, 1, 12) / 1000))
+    expect(summary.usage?.reads30d).toBe(4n)
+    expect(summary.usage?.readBy30d).toEqual([ClientKind.UI])
+    expect(summary.usage?.clientKinds).toEqual([ClientKind.SDK])
+
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ ...FACETS_JSON, stale: '5', read30d: '6', neverRead: '2', expiringSoon: '3', staleDays: 90 }),
+    )
+    const facets = await getDatasetFacets()
+    expect([facets.stale, facets.read30d, facets.neverRead, facets.expiringSoon]).toEqual([5n, 6n, 2n, 3n])
+    expect(facets.staleDays).toBe(90)
+  })
+
   it('BarPage, with optional fields present on one bar and absent on the other', async () => {
     fetchMock.mockResolvedValue(jsonResponse(BARS_JSON))
     const page = await getDatasetBars('ds-1')
@@ -221,7 +274,7 @@ describe('fromJson decode of real server JSON', () => {
 })
 
 describe('request shape', () => {
-  it('GETs same-origin under /api/store with an Accept header and the caller signal', async () => {
+  it('GETs same-origin under /api/store with an Accept header, X-Client-Id: operator and the caller signal', async () => {
     fetchMock.mockResolvedValue(jsonResponse(CONFIG_JSON))
     const controller = new AbortController()
     await getUiConfig(controller.signal)
@@ -229,8 +282,106 @@ describe('request shape', () => {
     expect(calledUrl()).toBe('/api/store/ui/v1/config')
     const init = fetchMock.mock.calls[0]![1]!
     expect(init.method).toBe('GET')
-    expect(init.headers).toEqual({ Accept: 'application/json' })
+    expect(init.headers).toEqual({ Accept: 'application/json', 'X-Client-Id': 'operator' })
     expect(init.signal).toBe(controller.signal)
+  })
+
+  // tj-grna9p.131 option R: the label the store records reads by, and derives kind UI from.
+  it('every data_store call sends X-Client-Id: operator, from the one constant', async () => {
+    fetchMock.mockImplementation(async () => jsonResponse({}))
+    expect(OPERATOR_CLIENT_ID).toBe('operator')
+    await listDatasets()
+    await getDatasetFacets()
+    await getDataset('ds-1')
+    await getDatasetBars('ds-1')
+    await getDatasetBarPages('ds-1')
+    await getDatasetRuns('ds-1')
+    await getDatasetCoverage('ds-1', 10)
+    await getUiConfig()
+    expect(fetchMock).toHaveBeenCalledTimes(8)
+    for (const [, init] of fetchMock.mock.calls) {
+      expect((init!.headers as Record<string, string>)['X-Client-Id']).toBe(OPERATOR_CLIENT_ID)
+    }
+  })
+
+  // tj-grna9p.93: the list above predates .89's and .62's calls. This one is built from the modules'
+  // exports, so a call added later is covered without editing the spec.
+  it('EVERY exported network function of datasets.ts and usageStats.ts sends X-Client-Id: operator', async () => {
+    fetchMock.mockImplementation(async () => jsonResponse({}))
+    const PURE = new Set(['enumName', 'clientQuery'])
+    const callers = Object.entries({ ...datasetsModule, ...usageStatsModule }).filter(
+      ([name, value]) => typeof value === 'function' && !PURE.has(name) && !name.endsWith('Request'),
+    )
+    expect(callers.map(([name]) => name).sort()).toEqual(
+      expect.arrayContaining([
+        'deleteDataset',
+        'getReadsPerDay',
+        'getStorageCurrent',
+        'getUsageSummary',
+        'setDatasetCollecting',
+        'setDatasetExpiry',
+      ]),
+    )
+    for (const [name, call] of callers) {
+      fetchMock.mockClear()
+      await (call as (...args: unknown[]) => Promise<unknown>)('ds-1', {})
+      expect(fetchMock, name).toHaveBeenCalledTimes(1)
+      const headers = fetchMock.mock.calls[0]![1]!.headers as Record<string, string>
+      expect(headers['X-Client-Id'], name).toBe(OPERATOR_CLIENT_ID)
+    }
+  })
+
+  it('the client is the ONE place web/src talks HTTP; the events socket is the one WebSocket', () => {
+    const SRC = fileURLToPath(new URL('..', import.meta.url))
+    const files = (dir: string): string[] =>
+      readdirSync(dir).flatMap((name) => {
+        const path = join(dir, name)
+        return statSync(path).isDirectory() ? files(path) : [path]
+      })
+    const sources = files(SRC).filter((p) => /\.(ts|vue)$/.test(p) && !p.endsWith('.spec.ts') && !p.includes('__tests__'))
+    const using = (pattern: RegExp) => sources.filter((p) => pattern.test(readFileSync(p, 'utf8'))).map((p) => relative(SRC, p))
+    expect(using(/\bfetch\(/)).toEqual([join('api', 'client.ts')])
+    expect(using(/new WebSocket\b/)).toEqual([join('api', 'events.ts')])
+    expect(using(/XMLHttpRequest|EventSource|sendBeacon/)).toEqual([])
+  })
+
+  it('listDatasets sends the usage parameters: client_kind repeated by member name, usage, stale_days, sort=last_read, expires_before', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(PAGE_JSON))
+    const params = {
+      clientKinds: [ClientKind.SDK, ClientKind.UI],
+      usage: UsageFilter.READ_30D,
+      staleDays: 90,
+      expiresBefore: new Date(Date.UTC(2026, 9, 21, 6)),
+      sort: 'last_read' as const,
+    }
+    await listDatasets(params)
+    const url = new URL(calledUrl(), 'http://x')
+    expect([...url.searchParams.entries()]).toEqual([
+      ['client_kind', 'SDK'],
+      ['client_kind', 'UI'],
+      ['usage', 'READ_30D'],
+      ['stale_days', '90'],
+      ['expires_before', '2026-10-21T06:00:00.000Z'],
+      ['sort', 'last_read'],
+    ])
+    expect(listDatasetsRequest(params)).toBe(calledUrl())
+  })
+
+  it.each([
+    [UsageFilter.STALE, 'STALE'],
+    [UsageFilter.NEVER_READ, 'NEVER_READ'],
+  ])('usage %s goes out as %s; an empty clientKinds sends no client_kind', async (usage, name) => {
+    fetchMock.mockResolvedValue(jsonResponse(FACETS_JSON))
+    await getDatasetFacets({ usage, clientKinds: [] })
+    expect(calledUrl()).toBe(`/api/store/ui/v1/datasets/facets?usage=${name}`)
+  })
+
+  it('getDatasetFacets sends the usage parameters too', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(FACETS_JSON))
+    await getDatasetFacets({ clientKinds: [ClientKind.UI], staleDays: 90, expiresBefore: new Date(Date.UTC(2026, 0, 1)) })
+    expect(calledUrl()).toBe(
+      '/api/store/ui/v1/datasets/facets?client_kind=UI&stale_days=90&expires_before=2026-01-01T00%3A00%3A00.000Z',
+    )
   })
 
   it('listDatasets sends every parameter under the server names, enums by member name', async () => {
@@ -528,6 +679,16 @@ describe('int64ToNumber', () => {
   )
 })
 
+// tj-grna9p.88: one module holds the usage constants (owner rulings tj-utqd77 Q3, tj-grna9p.131).
+describe('usage constants', () => {
+  it('stale 90 days fixed, expiring soon 7 days, Read By defaults to SDK alone, the UI is operator', () => {
+    expect(STALE_DAYS).toBe(90)
+    expect(EXPIRING_SOON_DAYS).toBe(7)
+    expect(DEFAULT_CLIENT_KINDS).toEqual([ClientKind.SDK])
+    expect(OPERATOR_CLIENT_ID).toBe('operator')
+  })
+})
+
 describe('buildQuery', () => {
   it('is empty when nothing is set', () => {
     expect(buildQuery({})).toBe('')
@@ -540,6 +701,12 @@ describe('buildQuery', () => {
 
   it('writes a Date as a UTC instant with Z', () => {
     expect(buildQuery({ at: new Date(Date.UTC(2026, 9, 10, 4, 5, 6, 7)) })).toBe('?at=2026-10-10T04%3A05%3A06.007Z')
+  })
+
+  it('repeats the key for each array element, in order, and an empty array sends nothing', () => {
+    expect(buildQuery({ a: ['x', 'y'], b: [], c: 1 })).toBe('?a=x&a=y&c=1')
+    expect(buildQuery({ k: [new Date(Date.UTC(2026, 0, 1)), 2, false] })).toBe('?k=2026-01-01T00%3A00%3A00.000Z&k=2&k=false')
+    expect(buildQuery({ only: [] })).toBe('')
   })
 
   it('encodes reserved characters', () => {
@@ -558,4 +725,310 @@ describe('no polling', () => {
     }
     expect(timeout!.messages.filter((m) => /No polling/.test(m.message))).toEqual([])
   }, 60_000)
+})
+
+// tj-grna9p.89: the two Retention writes and the Usage reads. The bodies are protobuf canonical JSON
+// (SetExpiryRequest, DeleteDatasetRequest in data.proto); the reads-per-day parameters follow the
+// .64 brief (days, dataset_id, client_id | client_kind; no source, no expires_before).
+describe('writes (tj-grna9p.89)', () => {
+  const init = (index = 0): RequestInit => fetchMock.mock.calls[index]![1]!
+  const headers = (index = 0) => init(index).headers as Record<string, string>
+  const body = (index = 0): unknown => {
+    const text = init(index).body
+    return text === undefined ? undefined : JSON.parse(String(text))
+  }
+
+  it('patchMessage PATCHes under API_BASE with a JSON body and the operator id, and decodes the answer', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(SUMMARY_JSON))
+    const summary = await patchMessage(DatasetSummarySchema, '/ui/v1/x', { body: { a: 1 } })
+    expect(calledUrl()).toBe(`${API_BASE}/ui/v1/x`)
+    expect(init().method).toBe('PATCH')
+    expect(headers()).toEqual({
+      Accept: 'application/json',
+      'X-Client-Id': OPERATOR_CLIENT_ID,
+      'Content-Type': 'application/json',
+    })
+    expect(body()).toEqual({ a: 1 })
+    expect(summary.assetSymbol).toBe('VFV')
+  })
+
+  it('patchMessage: a 2xx body that does not decode is MALFORMED_RESPONSE', async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ barCount: 'lots' }))
+    const error = (await rejection(patchMessage(DatasetSummarySchema, '/ui/v1/x'))) as ApiError
+    expect(error.status).toBe(200)
+    expect(error.reason).toBe('MALFORMED_RESPONSE')
+  })
+
+  it('deleteRequest with no body sends no body and no Content-Type, and resolves on 204', async () => {
+    fetchMock.mockResolvedValue(new Response(null, { status: 204 }))
+    await expect(deleteRequest('/ui/v1/x')).resolves.toBeUndefined()
+    expect(init().method).toBe('DELETE')
+    expect(init().body).toBeUndefined()
+    expect(headers()).toEqual({ Accept: 'application/json', 'X-Client-Id': OPERATOR_CLIENT_ID })
+  })
+
+  it.each([
+    ['409 OVERRIDE_REQUIRED', 409, 'OVERRIDE_REQUIRED'],
+    ['503 DATABASE_UNAVAILABLE', 503, 'DATABASE_UNAVAILABLE'],
+    ['404 NOT_FOUND', 404, 'NOT_FOUND'],
+    ['422 INVALID_REQUEST', 422, 'INVALID_REQUEST'],
+  ])('a write refused with %s is an ApiError with that status and reason, never the detail', async (_name, status, reason) => {
+    const refusal = () =>
+      jsonResponse({ reason, error_id: 'w-1', detail: 'SECRET held by someone-else: my reason' }, status, 'application/problem+json')
+    fetchMock.mockResolvedValueOnce(refusal()).mockResolvedValueOnce(refusal())
+    for (const call of [patchMessage(DatasetSummarySchema, '/ui/v1/x', { body: {} }), deleteRequest('/ui/v1/x')]) {
+      const error = (await rejection(call)) as ApiError
+      expect(error).toBeInstanceOf(ApiError)
+      expect([error.status, error.reason, error.errorId]).toEqual([status, reason, 'w-1'])
+      expect(`${error.message} ${String(error)}`).not.toMatch(/SECRET|someone-else|my reason/)
+    }
+  })
+
+  it('a write: a network failure is status 0, an abort is rethrown as itself', async () => {
+    fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch'))
+    expect(((await rejection(deleteRequest('/ui/v1/x'))) as ApiError).status).toBe(0)
+    const abort = new DOMException('aborted', 'AbortError')
+    fetchMock.mockRejectedValueOnce(abort)
+    expect(await rejection(patchMessage(DatasetSummarySchema, '/ui/v1/x'))).toBe(abort)
+  })
+
+  it('setDatasetExpiry: PATCH .../{id}/expiry with the expiry as an RFC 3339 instant; the id is encoded', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(SUMMARY_JSON))
+    const result = await setDatasetExpiry('a/b c', { expiry: new Date(Date.UTC(2026, 9, 15, 4)) })
+    expect(calledUrl()).toBe(`${API_BASE}/ui/v1/datasets/a%2Fb%20c/expiry`)
+    expect(init().method).toBe('PATCH')
+    expect(body()).toEqual({ expiry: '2026-10-15T04:00:00.000Z' })
+    expect(result.id).toBe(SUMMARY_JSON.id)
+  })
+
+  it('setDatasetExpiry: no expiry is the clear, an empty object (unset expiry), and no override key', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(SUMMARY_JSON))
+    await setDatasetExpiry('ds-1', {})
+    expect(body()).toEqual({})
+  })
+
+  it('setDatasetExpiry and deleteDataset carry the override as {reason, confirmed: true} when given', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(SUMMARY_JSON)).mockResolvedValueOnce(new Response(null, { status: 204 }))
+    const override = { reason: 'cleanup', confirmed: true as const }
+    await setDatasetExpiry('ds-1', { override })
+    await deleteDataset('ds-1', { override })
+    expect(body(0)).toEqual({ override: { reason: 'cleanup', confirmed: true } })
+    expect(calledUrl(1)).toBe(`${API_BASE}/ui/v1/datasets/ds-1`)
+    expect(init(1).method).toBe('DELETE')
+    expect(body(1)).toEqual({ override: { reason: 'cleanup', confirmed: true } })
+  })
+
+  // tj-grna9p.177 (the F1 ruling on tj-grna9p.174): the collecting PATCH body ALWAYS carries collect, true
+  // or false; the route answers a body without it with 422. The override is the expiry write's.
+  it.each([
+    ['collect true', true],
+    ['collect false', false],
+  ])('setDatasetCollecting (%s): PATCH .../{id}/collecting, the id encoded, the body exactly {collect}', async (_name, collect) => {
+    fetchMock.mockResolvedValue(jsonResponse({ ...SUMMARY_JSON, collecting: collect }))
+    const result = await setDatasetCollecting('a/b c', { collect })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(calledUrl()).toBe(`${API_BASE}/ui/v1/datasets/a%2Fb%20c/collecting`)
+    expect(init().method).toBe('PATCH')
+    expect(headers()).toEqual({ Accept: 'application/json', 'X-Client-Id': OPERATOR_CLIENT_ID, 'Content-Type': 'application/json' })
+    // The raw text, not only the parsed object: the key is present, never dropped as a default.
+    expect(init().body).toBe(JSON.stringify({ collect }))
+    expect(body()).toEqual({ collect })
+    expect(Object.keys(body() as object)).toEqual(['collect'])
+    expect(result.id).toBe(SUMMARY_JSON.id)
+    expect(result.collecting).toBe(collect)
+  })
+
+  it('setDatasetCollecting carries the override beside collect, and still never omits collect', async () => {
+    fetchMock.mockImplementation(async () => jsonResponse(SUMMARY_JSON))
+    const override = { reason: 'cleanup', confirmed: true as const }
+    await setDatasetCollecting('ds-1', { collect: false, override })
+    await setDatasetCollecting('ds-1', { collect: true, override })
+    expect(body(0)).toEqual({ collect: false, override: { reason: 'cleanup', confirmed: true } })
+    expect(body(1)).toEqual({ collect: true, override: { reason: 'cleanup', confirmed: true } })
+    expect(calledUrl(1)).toBe(`${API_BASE}/ui/v1/datasets/ds-1/collecting`)
+  })
+
+  it('setDatasetCollecting with override undefined sends no override key at all', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(SUMMARY_JSON))
+    await setDatasetCollecting('ds-1', { collect: false, override: undefined })
+    expect(init().body).toBe('{"collect":false}')
+  })
+
+  it('setDatasetCollecting passes the caller signal', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(SUMMARY_JSON))
+    const controller = new AbortController()
+    await setDatasetCollecting('ds-1', { collect: true, signal: controller.signal })
+    expect(init().signal).toBe(controller.signal)
+  })
+
+  it.each([
+    ['409 OVERRIDE_REQUIRED', 409, 'OVERRIDE_REQUIRED'],
+    ['422 INVALID_REQUEST', 422, 'INVALID_REQUEST'],
+  ])('setDatasetCollecting refused with %s is an ApiError with that status and reason', async (_name, status, reason) => {
+    fetchMock.mockResolvedValue(jsonResponse({ reason, error_id: 'c-1', detail: 'held by bot-7' }, status, 'application/problem+json'))
+    const error = (await rejection(setDatasetCollecting('ds-1', { collect: false }))) as ApiError
+    expect(error).toBeInstanceOf(ApiError)
+    expect([error.status, error.reason, error.errorId]).toEqual([status, reason, 'c-1'])
+    expect(String(error)).not.toContain('bot-7')
+  })
+
+  it('setDatasetExpiry never sends collect: the expiry write is the deletion date only', async () => {
+    fetchMock.mockImplementation(async () => jsonResponse(SUMMARY_JSON))
+    await setDatasetExpiry('ds-1', { expiry: new Date(Date.UTC(2026, 9, 15, 4)) })
+    await setDatasetExpiry('ds-1', {})
+    expect(Object.keys(body(0) as object)).toEqual(['expiry'])
+    expect(body(1)).toEqual({})
+    expect(calledUrl(0)).toBe(`${API_BASE}/ui/v1/datasets/ds-1/expiry`)
+  })
+
+  it('setDatasetCollecting is exported from the api index', () => {
+    expect(datasetsModule.setDatasetCollecting).toBe(setDatasetCollecting)
+  })
+
+  it('deleteDataset with no override sends no body at all (the store reads none as an empty request)', async () => {
+    fetchMock.mockResolvedValue(new Response(null, { status: 204 }))
+    await deleteDataset('ds-1')
+    expect(init().body).toBeUndefined()
+    expect(headers()['Content-Type']).toBeUndefined()
+  })
+})
+
+describe('client selection and reads per day (tj-grna9p.89)', () => {
+  it('clientQuery: kinds by enum name; ids win over kinds; nothing chosen sends nothing', () => {
+    expect(clientQuery({ clientKinds: [ClientKind.SDK, ClientKind.UI] })).toEqual({ client_id: undefined, client_kind: ['SDK', 'UI'] })
+    expect(clientQuery({ clientKinds: [ClientKind.UI], clientIds: ['bot-1'] })).toEqual({ client_id: ['bot-1'], client_kind: undefined })
+    expect(clientQuery({ clientIds: [], clientKinds: [ClientKind.SDK] }).client_kind).toEqual(['SDK'])
+    expect(buildQuery(clientQuery())).toBe('')
+  })
+
+  it('getDataset sends the Read By choice as client_kind (a selection, not a filter)', async () => {
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(SUMMARY_JSON)))
+    await getDataset('ds-1', undefined, { clientKinds: [ClientKind.SDK, ClientKind.UI] })
+    expect(calledUrl()).toBe(`${API_BASE}/ui/v1/datasets/ds-1?client_kind=SDK&client_kind=UI`)
+    await getDataset('ds-1')
+    expect(calledUrl(1)).toBe(`${API_BASE}/ui/v1/datasets/ds-1`)
+  })
+
+  it('getReadsPerDay: days, dataset_id and client_kind; never source or expires_before', async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        days: [{ day: '2026-10-13', clientId: 'bot-1', clientKind: 'CLIENT_KIND_SDK', reads: '7' }],
+        clientKinds: ['CLIENT_KIND_SDK'],
+      }),
+    )
+    const reads = await getReadsPerDay({ days: 30, datasetId: 'ds-1', clientKinds: [ClientKind.SDK] })
+    const url = new URL(calledUrl(), 'http://x')
+    expect(url.pathname).toBe(`${API_BASE}/ui/v1/stats/usage/reads-per-day`)
+    expect([...url.searchParams.entries()]).toEqual([
+      ['days', '30'],
+      ['dataset_id', 'ds-1'],
+      ['client_kind', 'SDK'],
+    ])
+    expect(reads.days[0]!.reads).toBe(7n)
+    expect(reads.days[0]!.clientKind).toBe(ClientKind.SDK)
+  })
+
+  it('getReadsPerDay sends source by enum name only when given (tj-grna9p.62)', async () => {
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse({})))
+    await getReadsPerDay({ days: 30, clientKinds: [ClientKind.SDK], source: DataSource.ALPACA_API })
+    expect(calledUrl()).toBe(`${API_BASE}/ui/v1/stats/usage/reads-per-day?days=30&source=ALPACA_API&client_kind=SDK`)
+    await getReadsPerDay({ days: 30, clientKinds: [ClientKind.SDK] })
+    expect(calledUrl(1)).toBe(`${API_BASE}/ui/v1/stats/usage/reads-per-day?days=30&client_kind=SDK`)
+  })
+
+  it('getReadsPerDay with client ids sends client_id and no client_kind', async () => {
+    fetchMock.mockResolvedValue(jsonResponse({}))
+    await getReadsPerDay({ clientIds: ['a', 'b'], clientKinds: [ClientKind.UI] })
+    expect(calledUrl()).toBe(`${API_BASE}/ui/v1/stats/usage/reads-per-day?client_id=a&client_id=b`)
+  })
+})
+
+// tj-grna9p.62: the Usage tab's stats routes (server/routers/data_store/ui_stats.py). Presence matters:
+// the client selection always goes, stale_days is the threshold, source only when picked, storage
+// takes no client parameter (a 422), and no stats route ever gets expires_before or dataset_id.
+describe('usage stats routes (tj-grna9p.62)', () => {
+  const params = (index = 0) => {
+    const url = new URL(calledUrl(index), 'http://x')
+    return { path: url.pathname, query: [...url.searchParams.entries()] }
+  }
+  const headers = (index = 0) => fetchMock.mock.calls[index]![1]!.headers as Record<string, string>
+  beforeEach(() => {
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse({})))
+  })
+
+  it('getUsageSummary: stale_days and the kinds; source only when picked; X-Client-Id operator', async () => {
+    await getUsageSummary({ clientKinds: [ClientKind.SDK], staleDays: 90 })
+    await getUsageSummary({ clientKinds: [ClientKind.SDK, ClientKind.UI], staleDays: 90, source: DataSource.ALPACA_API })
+    await getUsageSummary({ clientIds: ['bot-1'], clientKinds: [ClientKind.SDK], staleDays: 90 })
+    expect(params(0)).toEqual({
+      path: `${API_BASE}/ui/v1/stats/usage/summary`,
+      query: [['stale_days', '90'], ['client_kind', 'SDK']],
+    })
+    expect(params(1).query).toEqual([['stale_days', '90'], ['source', 'ALPACA_API'], ['client_kind', 'SDK'], ['client_kind', 'UI']])
+    expect(params(2).query).toEqual([['stale_days', '90'], ['client_id', 'bot-1']])
+    expect(headers()['X-Client-Id']).toBe(OPERATOR_CLIENT_ID)
+  })
+
+  it('getLastReadBuckets: the client selection and source only when picked; no stale_days', async () => {
+    await getLastReadBuckets({ clientKinds: [ClientKind.UI] })
+    await getLastReadBuckets({ clientIds: ['a', 'b'], source: DataSource.ALPACA_API })
+    expect(params(0)).toEqual({ path: `${API_BASE}/ui/v1/stats/usage/last-read-buckets`, query: [['client_kind', 'UI']] })
+    expect(params(1).query).toEqual([['source', 'ALPACA_API'], ['client_id', 'a'], ['client_id', 'b']])
+  })
+
+  it('getStaleDatasets: stale_days, cursor, limit and the selection; source only when picked', async () => {
+    await getStaleDatasets({ clientKinds: [ClientKind.SDK], staleDays: 90, limit: 100 })
+    await getStaleDatasets({ clientKinds: [ClientKind.SDK], staleDays: 90, cursor: 'k1', limit: 100, source: DataSource.ALPACA_API })
+    expect(params(0)).toEqual({
+      path: `${API_BASE}/ui/v1/stats/usage/stale`,
+      query: [['stale_days', '90'], ['limit', '100'], ['client_kind', 'SDK']],
+    })
+    expect(params(1).query).toEqual([
+      ['stale_days', '90'],
+      ['source', 'ALPACA_API'],
+      ['cursor', 'k1'],
+      ['limit', '100'],
+      ['client_kind', 'SDK'],
+    ])
+  })
+
+  it('getStorageCurrent: source only when picked, and never a client parameter', async () => {
+    await getStorageCurrent()
+    await getStorageCurrent({ source: DataSource.ALPACA_API })
+    expect(params(0)).toEqual({ path: `${API_BASE}/ui/v1/stats/storage/current`, query: [] })
+    expect(params(1).query).toEqual([['source', 'ALPACA_API']])
+    // Even a caller holding a selection cannot pass one through: the function takes none.
+    await getStorageCurrent({ clientKinds: [ClientKind.SDK], clientIds: ['x'] } as Parameters<typeof getStorageCurrent>[0])
+    expect(params(2).query).toEqual([])
+  })
+
+  it('no stats route ever carries expires_before or dataset_id', async () => {
+    await getUsageSummary({ clientKinds: [ClientKind.SDK], staleDays: 90 })
+    await getLastReadBuckets({ clientKinds: [ClientKind.SDK] })
+    await getStaleDatasets({ clientKinds: [ClientKind.SDK], staleDays: 90 })
+    await getStorageCurrent()
+    for (let i = 0; i < 4; i += 1) {
+      const keys = params(i).query.map(([key]) => key)
+      expect(keys).not.toContain('expires_before')
+      expect(keys).not.toContain('dataset_id')
+    }
+  })
+
+  it('decodes the server messages: summary counts, buckets with an open last bucket, a stale page, storage', async () => {
+    fetchMock.mockReset()
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ stale: '4', readLast30d: '2', total: '9', staleDays: 90, clientKinds: ['CLIENT_KIND_SDK'] }))
+      .mockResolvedValueOnce(jsonResponse({ buckets: [{ minDays: 0, maxDays: 1, datasets: '3' }, { minDays: 91, datasets: '1' }], neverRead: '2' }))
+      .mockResolvedValueOnce(jsonResponse({ items: [{ dataset: { id: 'ds-1', assetSymbol: 'VFV' }, estBytes: '1000' }], nextCursor: 'k2', staleDays: 90 }))
+      .mockResolvedValueOnce(jsonResponse({ totalBytes: '5000', bySource: [{ source: 'DATA_SOURCE_ALPACA_API', feed: 'FEED_IEX', estBytes: '5000' }] }))
+    const summary = await getUsageSummary()
+    const buckets = await getLastReadBuckets()
+    const stale = await getStaleDatasets()
+    const storage = await getStorageCurrent()
+    expect([summary.stale, summary.total, summary.staleDays]).toEqual([4n, 9n, 90])
+    expect(buckets.buckets[1]!.maxDays).toBeUndefined()
+    expect(buckets.neverRead).toBe(2n)
+    expect([stale.items[0]!.dataset?.id, stale.items[0]!.estBytes, stale.nextCursor]).toEqual(['ds-1', 1000n, 'k2'])
+    expect([storage.totalBytes, storage.bySource[0]!.source]).toEqual([5000n, DataSource.ALPACA_API])
+  })
 })

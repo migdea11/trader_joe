@@ -240,7 +240,9 @@ PHASE_ONE_NUMBERING = {
     'BarPage': [('bars', 1), ('next_cursor', 2)],
 }
 
-# The phase 2 appendix to phase 1 messages, exactly: the re-baseline's "next free numbers".
+# The phase 2 appendix to phase 1 messages, exactly: the re-baseline's "next free numbers". Later
+# phases append after it (phase 3, tj-grna9p.84: DatasetSummary.usage = 21, DatasetFacets.clients = 7);
+# their fields are pinned by their own validate bead (tj-grna9p.90), not here.
 PHASE_TWO_APPENDED = {
     'DatasetSummary': [('last_run', 20, '.trader_joe.proto.ui.v1.IngestRun', FIELD.TYPE_MESSAGE)],
     'DatasetFacets': [('running', 6, '', FIELD.TYPE_INT64)],
@@ -249,17 +251,21 @@ PHASE_TWO_APPENDED = {
 
 @pytest.mark.parametrize('message', sorted(PHASE_ONE_NUMBERING))
 def test_phase_one_numbers_and_names_are_unchanged_and_only_appended_to(message: str):
-    """The phase 1 prefix is identical; anything after it is exactly the ruled phase 2 addition.
+    """The phase 1 prefix is identical; right after it comes exactly the ruled phase 2 addition.
+
+    Anything after the phase 2 addition is a later phase's, so a later phase can append without editing
+    this pin but cannot insert before it or renumber it (protoc itself refuses a reused number).
 
     Args:
         message: A phase 1 message of data.proto.
     """
     fields = list(messages(file_named(DATA))[message].field)
     prefix = PHASE_ONE_NUMBERING[message]
+    phase_two = PHASE_TWO_APPENDED.get(message, [])
 
     assert [(field.name, field.number) for field in fields[: len(prefix)]] == prefix
     appended = [(field.name, field.number, field.type_name, field.type) for field in fields[len(prefix) :]]
-    assert appended == PHASE_TWO_APPENDED.get(message, [])
+    assert appended[: len(phase_two)] == phase_two
 
 
 # ---------------------------------------------------------------------------------------------------

@@ -26,7 +26,7 @@ import {
 } from '@/format/formatters'
 import { useFormatters } from '@/format/useFormatters'
 import router from '@/router'
-import { SETTINGS_STORAGE_KEY, STALE_DAYS_DEFAULT, useSettingsStore } from '@/stores/settings'
+import { SETTINGS_STORAGE_KEY, useSettingsStore } from '@/stores/settings'
 import { useTradingGroupStore } from '@/stores/tradingGroup'
 import { useUiConfigStore } from '@/stores/uiConfig'
 import { colors } from '@/theme/tokens'
@@ -44,6 +44,12 @@ const mocks = vi.hoisted(() => ({
   getUiConfig: vi.fn(),
   getDatasetFacets: vi.fn(),
   listDatasets: vi.fn(),
+  // The Usage tab (tj-grna9p.62) loads these on mount; they stay pending here.
+  getUsageSummary: vi.fn(),
+  getLastReadBuckets: vi.fn(),
+  getReadsPerDay: vi.fn(),
+  getStaleDatasets: vi.fn(),
+  getStorageCurrent: vi.fn(),
 }))
 // The shell opens the shared events socket on mount (tj-grna9p.76): replaced so no real WebSocket opens.
 vi.mock('@/api/events', async (importOriginal) =>
@@ -86,7 +92,11 @@ beforeEach(() => {
   pinia = createPinia()
   setActivePinia(pinia)
   config([AccountGroup.SIMULATION])
-  mocks.getDatasetFacets.mockResolvedValue({ all: 0n, needsAttention: 0n, sources: [], updateTypes: [], statuses: [] })
+  // `clients` is always present on a decoded DatasetFacets (a repeated field); the Usage sidebar reads it.
+  mocks.getDatasetFacets.mockResolvedValue({ all: 0n, needsAttention: 0n, sources: [], updateTypes: [], statuses: [], clients: [] })
+  for (const usage of [mocks.getUsageSummary, mocks.getLastReadBuckets, mocks.getReadsPerDay, mocks.getStaleDatasets, mocks.getStorageCurrent]) {
+    usage.mockReturnValue(new Promise(() => undefined))
+  }
   mocks.listDatasets.mockResolvedValue({ items: [], nextCursor: '' })
 })
 
@@ -98,30 +108,28 @@ afterEach(() => {
 })
 
 describe('settings store', () => {
-  it('defaults to the browser zone and 90 days with nothing stored', () => {
+  // The stale threshold left Settings (tj-grna9p.88, owner ruling tj-utqd77 Q3): the store holds the
+  // time zone override only, and an object saved by an older build still loads.
+  it('defaults to the browser zone with nothing stored, and holds no stale threshold', () => {
     browserZoneIs('America/Toronto')
     const settings = useSettingsStore()
     expect(settings.timeZoneOverride).toBeNull()
     expect(settings.timeZone).toBe('America/Toronto')
-    expect(settings.staleDays).toBe(90)
     expect(settings.storageOk).toBe(true)
+    expect(Object.keys(settings.$state).sort()).toEqual(['storageOk', 'timeZoneOverride'])
+    expect('staleDays' in settings).toBe(false)
+    expect('setStaleDays' in settings).toBe(false)
   })
 
-  it('a saved override and stale days survive a reload (a new store over the same storage)', () => {
+  it('a saved override survives a reload (a new store over the same storage), stored without stale days', () => {
     const first = useSettingsStore()
     expect(first.setTimeZoneOverride('Asia/Tokyo')).toBe(true)
-    expect(first.setStaleDays(30)).toBe(true)
-    expect(JSON.parse(window.localStorage.getItem(SETTINGS_STORAGE_KEY)!)).toEqual({
-      v: 1,
-      timeZone: 'Asia/Tokyo',
-      staleDays: 30,
-    })
+    expect(JSON.parse(window.localStorage.getItem(SETTINGS_STORAGE_KEY)!)).toEqual({ v: 1, timeZone: 'Asia/Tokyo' })
 
     setActivePinia(createPinia())
     const reloaded = useSettingsStore()
     expect(reloaded.timeZoneOverride).toBe('Asia/Tokyo')
     expect(reloaded.timeZone).toBe('Asia/Tokyo')
-    expect(reloaded.staleDays).toBe(30)
   })
 
   it('Use Browser Zone clears the override and persists that', () => {
@@ -142,22 +150,17 @@ describe('settings store', () => {
     expect(settings.timeZoneOverride).toBe('Asia/Tokyo')
   })
 
-  it.each([0, -1, 3651, 1.5, Number.NaN])('refuses stale days %s', (days) => {
-    const settings = useSettingsStore()
-    expect(settings.setStaleDays(days)).toBe(false)
-    expect(settings.staleDays).toBe(90)
-  })
-
-  it.each([1, 3650])('accepts stale days %i at the boundary', (days) => {
-    expect(useSettingsStore().setStaleDays(days)).toBe(true)
-  })
-
-  it.each([0, 3651, -5, 2.5, '30', null])('a stored stale days of %j falls back to 90 and keeps a valid zone', (bad) => {
-    window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({ v: 1, timeZone: 'Asia/Tokyo', staleDays: bad }))
-    const settings = useSettingsStore()
-    expect(settings.staleDays).toBe(STALE_DAYS_DEFAULT)
-    expect(settings.timeZoneOverride).toBe('Asia/Tokyo')
-  })
+  it.each([30, 0, 3651, -5, 2.5, '30', null])(
+    'an older saved object with staleDays %j still loads its zone, and the next write drops the key',
+    (old) => {
+      window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({ v: 1, timeZone: 'Asia/Tokyo', staleDays: old }))
+      const settings = useSettingsStore()
+      expect(settings.timeZoneOverride).toBe('Asia/Tokyo')
+      expect(settings.storageOk).toBe(true)
+      expect(settings.setTimeZoneOverride('Europe/London')).toBe(true)
+      expect(JSON.parse(window.localStorage.getItem(SETTINGS_STORAGE_KEY)!)).toEqual({ v: 1, timeZone: 'Europe/London' })
+    },
+  )
 
   it.each([
     ['unreadable JSON', '{nope'],
@@ -171,12 +174,11 @@ describe('settings store', () => {
     expect(settings.storageOk).toBe(true)
   })
 
-  it('with storage throwing: browser zone, 90 days, changes kept in memory, storage flagged', () => {
+  it('with storage throwing: browser zone, changes kept in memory, storage flagged', () => {
     browserZoneIs('America/Toronto')
     blockStorage()
     const settings = useSettingsStore()
     expect(settings.timeZone).toBe('America/Toronto')
-    expect(settings.staleDays).toBe(90)
     expect(settings.storageOk).toBe(false)
     expect(settings.setTimeZoneOverride('Asia/Tokyo')).toBe(true)
     expect(settings.timeZone).toBe('Asia/Tokyo')
@@ -192,8 +194,8 @@ describe('settings store', () => {
     })
     const settings = useSettingsStore()
     expect(settings.storageOk).toBe(false)
-    expect(settings.setStaleDays(45)).toBe(true)
-    expect(settings.staleDays).toBe(45)
+    expect(settings.setTimeZoneOverride('Asia/Tokyo')).toBe(true)
+    expect(settings.timeZoneOverride).toBe('Asia/Tokyo')
     expect(settings.storageOk).toBe(false)
   })
 
@@ -202,9 +204,9 @@ describe('settings store', () => {
     const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementationOnce(() => {
       throw new Error('quota')
     })
-    settings.setStaleDays(10)
+    settings.setTimeZoneOverride('Asia/Tokyo')
     expect(settings.storageOk).toBe(false)
-    settings.setStaleDays(11)
+    settings.setTimeZoneOverride('Europe/London')
     expect(setItem).toHaveBeenCalledTimes(2)
     expect(settings.storageOk).toBe(true)
   })
@@ -228,6 +230,19 @@ describe('settings store', () => {
     mountWith(SettingsPanel)
     await flushPromises()
     expect(document.body.querySelector('[data-testid="storage-hint"]')!.textContent!.trim()).toBe('Saved in this browser')
+  })
+
+  // tj-grna9p.93 (owner rulings tj-utqd77 Q3 and the Read By scope): the stale threshold is a fixed
+  // constant and Read By is a screen filter, so the Settings panel offers neither.
+  it('the panel has no stale threshold control and no Read By control: the time zone is its only setting', async () => {
+    useShellModals().openSettings()
+    mountWith(SettingsPanel)
+    await flushPromises()
+    const panel = document.body.querySelector('.settings')!
+    expect(panel.textContent).toContain('Time Zone')
+    expect(panel.textContent).not.toMatch(/stale|read by|\bSDK\b/i)
+    expect(panel.querySelectorAll('input[type="number"]')).toHaveLength(0)
+    expect([...panel.querySelectorAll('input[type="checkbox"]')]).toHaveLength(0)
   })
 })
 
@@ -480,23 +495,45 @@ describe('sections and sub-tabs not built yet', () => {
     expect(router.currentRoute.value.path).toBe('/data/datasets')
   })
 
-  it('Requests, Health and Usage are disabled in place; Datasets links and stays active under the Viewer', async () => {
+  // tj-grna9p.62 built the Usage tab: it links now; Requests and Health stay disabled in place.
+  it('Requests and Health are disabled in place; Usage links; Datasets links and stays active under the Viewer', async () => {
     await router.push('/data/datasets/abc/viewer')
     const tabs = mountWith(DataSubTabs)
     const all = tabs.findAll('.sub-tabs__tab')
     expect(all.map((t) => t.text())).toEqual(['Datasets', 'Requests', 'Health', 'Usage'])
-    expect(all.slice(1).map((t) => [t.attributes('aria-disabled'), t.attributes('title')])).toEqual([
-      ['true', 'Not built yet'],
+    expect(all.slice(1, 3).map((t) => [t.attributes('aria-disabled'), t.attributes('title')])).toEqual([
       ['true', 'Not built yet'],
       ['true', 'Not built yet'],
     ])
+    const usage = all[3]!
+    expect(usage.attributes('aria-disabled')).toBeUndefined()
+    expect(usage.attributes('title')).toBeUndefined()
+    expect(usage.attributes('href')).toBe('/data/usage')
+    expect(usage.attributes('aria-current')).toBeUndefined()
     expect(all[0]!.attributes('aria-current')).toBe('page')
+  })
+
+  it('the Usage tab is the current page on /data/usage, and following it from Datasets opens it', async () => {
+    await router.push('/data/datasets')
+    const tabs = mountWith(DataSubTabs)
+    await tabs.findAll('.sub-tabs__tab')[3]!.trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value.name).toBe('data-usage')
+    expect(tabs.findAll('.sub-tabs__tab')[3]!.attributes('aria-current')).toBe('page')
+  })
+
+  it('a typed URL /data/usage shows the Usage screen and its sidebar, not the placeholder', async () => {
+    await router.push('/data/usage')
+    const shell = mountWith(AppShell)
+    await flushPromises()
+    expect(shell.find('main h1').text()).toBe('Usage')
+    expect(shell.find('main').text()).not.toContain('Not built yet')
+    expect(shell.findAll('aside.app-shell__sidebar').at(-1)!.find('[data-testid="read-by"]').exists()).toBe(true)
   })
 
   it.each([
     ['/data/requests', 'Requests'],
     ['/data/health', 'Health'],
-    ['/data/usage', 'Usage'],
   ])('a typed URL %s shows the placeholder titled %s', async (path, title) => {
     await router.push(path)
     const shell = mountWith(AppShell)

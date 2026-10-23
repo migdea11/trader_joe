@@ -1,7 +1,7 @@
 """The dataset catalog the /ui/v1 routes serve: filtering, keyset paging, facets and freshness (tj-grna9p.20).
 
-This module composes the read repository (database/crud/stock/dataset_catalog.py) with the pure freshness rules
-(freshness.py). The routes call it and map its results to messages; it knows no HTTP and no protobuf.
+This module composes the read repository (database/crud/stock/dataset_catalog.py) with the pure health and
+completeness rules (health.py, completeness.py). The routes call it and map its results to messages; it knows no HTTP and no protobuf.
 
 THE QUERY BUDGET. A request runs a constant number of statements, never one per dataset (tj-grna9p.8 item 2):
 the matching entries with their newest bar in one, and then, for the datasets the answer needs, one each for
@@ -23,6 +23,19 @@ THE COUNTS, defined so each equals a list total. Given the filters of a request:
     each update type the total with every filter except update_type, and that update type
     each status      the total with every filter except status, and that status (the raw freshness status)
 
+THE USAGE FILTERS (tj-grna9p.85). The client filter picks whose reads count: client_id (repeatable, wins) else
+client_kind (repeatable), with neither the kind SDK. Under it:
+    READ_30D   read within 30 days: the UTC date of the last read by them is on or after today's UTC date minus 30
+    STALE      NOT read within stale_days (the same day-aligned rule), never-read included
+    NEVER_READ no read by them at all
+One clock decides all three: whole UTC calendar days, 0 = today, as the last-read buckets, from the last-read
+time over the selected clients (a stream session counts as a read); so READ_30D and STALE are exact opposites at
+stale_days = 30. DatasetUsage.reads_30d still counts ordinary reads only.
+Expiring Soon is expiry < expires_before PLUS every dataset in the reaper's pending set, and ignores the client
+filter. Each usage count of a facets read omits the usage filter itself and equals the list's total with it set;
+expiring_soon omits the expires_before filter. The usage of the datasets is read in one statement for every
+dataset when a filter or the sort needs all of them, else for the page's, so the count stays constant.
+
 THE CURSOR is opaque to clients: URL-safe base64 of a small JSON document holding the sort and the last item's
 sort key. It is bound to the sort it was made under, and anything that does not decode to exactly that shape is a
 422, never a 500 and never echoed.
@@ -30,8 +43,10 @@ sort key. It is bound to the sort it was made under, and anything that does not 
 
 import base64
 import binascii
+import hashlib
 import json
 import uuid
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -40,9 +55,22 @@ from typing import Any, Final
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from common.enums.data_stock import DataSource, Granularity, UpdateType
+from common.enums.data_stock import DataSource, Feed, Granularity, UpdateType
 from common.errors.vocabulary import InvalidRequestError, Reason
 from common.logging import get_logger
+from data.store.app.completeness import CoverageBucket, gap_intervals
+from data.store.app.completeness import coverage_buckets as compute_coverage_buckets
+from data.store.app.database.crud.dataset_read import (
+    ClientDatasets,
+    ClientDayReads,
+    DatasetUsage,
+    read_client_datasets,
+    read_client_day_reads,
+    read_client_last_reads,
+    read_dataset_usage,
+    read_readers,
+    usage_tables_exist,
+)
 from data.store.app.database.crud.ingest_run import (
     IngestRunRecord,
     latest_runs_for_datasets,
@@ -50,22 +78,23 @@ from data.store.app.database.crud.ingest_run import (
     running_dataset_ids,
 )
 from data.store.app.database.crud.stock import dataset_catalog as repo
-from data.store.app.database.crud.stock.dataset_catalog import BarExtent, BarPageOffset, CatalogFilter, CatalogRow
+from data.store.app.database.crud.stock.dataset_catalog import (
+    BarExtent,
+    BarPageOffset,
+    BarStorage,
+    CatalogFilter,
+    CatalogRow,
+)
+from data.store.app.database.models.dataset_read import ReadClientKind
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
-from data.store.app.freshness import (
+from data.store.app.health import DatasetHealth, FreshnessConfig, FreshnessStatus, evaluate_dataset
+from data.store.app.trading_calendar import (
     CalendarRangeError,
-    CoverageBucket,
-    DatasetHealth,
-    FreshnessConfig,
-    FreshnessStatus,
     TradingCalendar,
     UnknownCalendarError,
     calendar_for_source,
-    evaluate_dataset,
-    gap_intervals,
     local_midnight,
 )
-from data.store.app.freshness import coverage_buckets as compute_coverage_buckets
 
 
 log = get_logger(__name__)
@@ -85,6 +114,12 @@ DEFAULT_PAGE_INDEX_OVERLAP: Final = 50
 DEFAULT_COVERAGE_BUCKETS: Final = 120
 MAX_COVERAGE_BUCKETS: Final = 400
 MAX_COVERAGE_GAPS: Final = 500
+# The usage window of reads_30d, read_by_30d and the client picker's counts.
+USAGE_WINDOW_DAYS: Final = 30
+DEFAULT_STALE_DAYS: Final = 90
+MAX_STALE_DAYS: Final = 3650
+# Expiring Soon with no expires_before sent: expiry before now plus this.
+EXPIRING_SOON_DAYS: Final = 7
 
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
 _ONE_MICROSECOND: Final = timedelta(microseconds=1)
@@ -105,6 +140,16 @@ class DatasetSort(StrEnum):
     SYMBOL = 'symbol'
     # Soonest expiry first, datasets with no expiry last.
     EXPIRES = 'expires'
+    # Most recently read first (by the selected clients), never-read datasets last.
+    LAST_READ = 'last_read'
+
+
+class UsageFilter(StrEnum):
+    """The list's usage filter, by the member names of ui/v1 UsageFilter (without the USAGE_FILTER_ prefix)."""
+
+    READ_30D = 'read_30d'
+    STALE = 'stale'
+    NEVER_READ = 'never_read'
 
 
 _GROUP_OF: Final[dict[FreshnessStatus, StatusGroup]] = {
@@ -119,6 +164,58 @@ _ATTENTION: Final = frozenset({StatusGroup.LATE, StatusGroup.FAILED})
 
 
 @dataclass(frozen=True)
+class ClientFilter:
+    """Whose reads count. ids win over kinds; with neither the kind is SDK.
+
+    Attributes:
+        client_ids: Exact client ids (labels, never logged). Empty means filter by kind.
+        client_kinds: The kinds, used when no id is given. Empty means the default, SDK.
+    """
+
+    client_ids: tuple[str, ...] = field(default=(), repr=False)
+    client_kinds: tuple[ReadClientKind, ...] = ()
+
+    @property
+    def applied_ids(self) -> tuple[str, ...]:
+        """The ids applied, in the order sent without repeats; empty when the kind filter applies."""
+        return tuple(dict.fromkeys(self.client_ids))
+
+    @property
+    def applied_kinds(self) -> tuple[ReadClientKind, ...]:
+        """The kinds applied, EMPTY when ids were sent (the echo rule); [SDK] by default."""
+        if self.client_ids:
+            return ()
+        kinds = set(self.client_kinds) or {ReadClientKind.SDK}
+        return tuple(kind for kind in ReadClientKind if kind in kinds)
+
+
+@dataclass(frozen=True)
+class DatasetUsageView:
+    """How one dataset was read, as DatasetSummary.usage carries it.
+
+    Attributes:
+        last_read_at: The latest read by the selected clients, or None when they never read it.
+        reads_30d: Reads by the selected clients in the last 30 days.
+        read_by_30d: The kinds that read it in the last 30 days, whatever the filter.
+        read_by_clients_30d: The client ids that did (sorted), whatever the filter. Labels, never logged.
+    """
+
+    last_read_at: datetime | None = None
+    reads_30d: int = 0
+    read_by_30d: tuple[ReadClientKind, ...] = ()
+    read_by_clients_30d: tuple[str, ...] = field(default=(), repr=False)
+
+
+@dataclass(frozen=True)
+class ClientCountView:
+    """A client seen reading, for the picker. client_id is repr=False."""
+
+    client_id: str = field(repr=False)
+    client_kind: ReadClientKind
+    datasets: int
+
+
+@dataclass(frozen=True)
 class CatalogQuery:
     """What a list or facets request asks for.
 
@@ -128,6 +225,11 @@ class CatalogQuery:
         needs_attention: Keep only Late and Failed datasets.
         running: Keep only datasets with a run in state RUNNING. Orthogonal to status: a dataset can be Running
             and Late at once, and how the two rank in one column is the UI's choice.
+        client_filter: Whose reads the usage figures and the usage filter count.
+        usage: Keep datasets in this usage group under the client filter.
+        stale_days: The staleness threshold of the STALE group, 1..MAX_STALE_DAYS.
+        expires_before: The Expiring Soon filter: keep datasets whose expiry is before this or that the reaper
+            would delete. None applies no such filter (a facets read then counts against now + 7 days).
         sort: The order of the list.
         cursor: The opaque cursor of the previous page, or None for the first.
         limit: The page size.
@@ -137,6 +239,10 @@ class CatalogQuery:
     status: StatusGroup | None = None
     needs_attention: bool = False
     running: bool = False
+    client_filter: ClientFilter = field(default_factory=ClientFilter)
+    usage: UsageFilter | None = None
+    stale_days: int = DEFAULT_STALE_DAYS
+    expires_before: datetime | None = None
     sort: DatasetSort = DatasetSort.SYMBOL
     cursor: str | None = None
     limit: int = DEFAULT_PAGE_LIMIT
@@ -171,6 +277,9 @@ class DatasetPage:
         next_cursor: The cursor for the next page; empty on the last.
         as_of: The instant freshness was computed at.
         last_runs: The newest run of each dataset on the page that has one, whatever its state.
+        usage: The usage of each dataset on the page (an unread one has the zero view).
+        reaper_pending: The page's datasets the reaper would delete.
+        client_filter: The client filter the usage figures were computed under.
     """
 
     views: list[DatasetView]
@@ -179,6 +288,9 @@ class DatasetPage:
     next_cursor: str
     as_of: datetime
     last_runs: dict[uuid.UUID, IngestRunRecord] = field(default_factory=dict)
+    usage: dict[uuid.UUID, DatasetUsageView] = field(default_factory=dict)
+    reaper_pending: frozenset[uuid.UUID] = frozenset()
+    client_filter: ClientFilter = field(default_factory=ClientFilter)
 
 
 @dataclass(frozen=True)
@@ -192,6 +304,14 @@ class Facets:
         update_types: A count for every update type.
         statuses: A count for every computed freshness status.
         running: Datasets with a RUNNING run, under every filter except running itself.
+        clients: Each client seen reading in the last 30 days; ignores the client filter.
+        client_filter: The client filter applied.
+        stale: The list's total with usage=STALE, under the other filters.
+        read_30d: The list's total with usage=READ_30D.
+        never_read: The list's total with usage=NEVER_READ.
+        expiring_soon: The list's total with expires_before (the default when none was sent), under the others.
+        stale_days: The threshold used.
+        expires_before: The bound used.
     """
 
     all: int
@@ -200,6 +320,14 @@ class Facets:
     update_types: dict[UpdateType, int]
     statuses: dict[FreshnessStatus, int]
     running: int = 0
+    clients: list[ClientCountView] = field(default_factory=list)
+    client_filter: ClientFilter = field(default_factory=ClientFilter)
+    stale: int = 0
+    read_30d: int = 0
+    never_read: int = 0
+    expiring_soon: int = 0
+    stale_days: int = DEFAULT_STALE_DAYS
+    expires_before: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -212,6 +340,9 @@ class DatasetDetail:
         siblings: The other granularities of the series.
         as_of: The instant freshness was computed at.
         last_run: The dataset's newest run, whatever its state, or None when it has never run.
+        usage: How it was read, under the default client filter.
+        reaper_pending: Whether the reaper would delete it.
+        client_filter: The client filter the usage was computed under.
     """
 
     view: DatasetView
@@ -219,6 +350,9 @@ class DatasetDetail:
     siblings: list[tuple[uuid.UUID, Granularity]]
     as_of: datetime
     last_run: IngestRunRecord | None = None
+    usage: DatasetUsageView = field(default_factory=DatasetUsageView)
+    reaper_pending: bool = False
+    client_filter: ClientFilter = field(default_factory=ClientFilter)
 
 
 @dataclass(frozen=True)
@@ -321,8 +455,27 @@ def _decode_cursor(cursor: str) -> dict[str, Any]:
 
 
 def is_retired(row: CatalogRow) -> bool:
-    """Whether the dataset is retired: an expiry on a DAILY or STREAM subscription means it stopped collecting."""
-    return row.expiry is not None and row.update_type in (UpdateType.DAILY, UpdateType.STREAM)
+    """Whether the dataset is retired: a DAILY or STREAM subscription whose collect intent is false.
+
+    The expiry is the deletion date and is never read here (decision tj-hhy3dk): a subscription with an expiry
+    keeps collecting until the operator stops it.
+    """
+    return row.update_type in (UpdateType.DAILY, UpdateType.STREAM) and row.collect is False
+
+
+def is_collecting(row: CatalogRow, running: bool) -> bool:
+    """Whether the dataset is being collected: a subscription's collect intent; for STATIC, whether its latest run is RUNNING.
+
+    Args:
+        row: The entry.
+        running: Whether the dataset's latest run is RUNNING; read only for a STATIC dataset.
+
+    Returns:
+        bool: DatasetSummary.collecting.
+    """
+    if row.update_type is UpdateType.STATIC:
+        return running
+    return row.collect is not False
 
 
 def effective_end(row: CatalogRow, now: datetime) -> datetime:
@@ -372,13 +525,13 @@ async def evaluate_views(
     for row in rows:
         calendar = calendars[row.id]
         if calendar is None:
-            health = DatasetHealth(FreshnessStatus.RETIRED, retired_on=row.expiry) if is_retired(row) else None
+            health = DatasetHealth(FreshnessStatus.RETIRED) if is_retired(row) else None
         else:
             try:
                 health = evaluate_dataset(
                     update_type=row.update_type,
                     granularity=row.granularity,
-                    expiry=row.expiry,
+                    collect=row.collect,
                     start=row.start,
                     end=effective_end(row, now),
                     last_bar=row.last_bar,
@@ -386,6 +539,7 @@ async def evaluate_views(
                     calendar=calendar,
                     now=now,
                     config=config,
+                    last_bar_written_at=row.last_bar_written_at,
                 )
             except CalendarRangeError as err:
                 # A range before the calendar's start cannot be judged. It is a known state of the data (nothing
@@ -397,17 +551,29 @@ async def evaluate_views(
     return views
 
 
-def _sort_key(row: CatalogRow, sort: DatasetSort) -> tuple[Any, ...]:
+def _micros(moment: datetime) -> int:
+    return (moment - _EPOCH) // _ONE_MICROSECOND
+
+
+def _sort_key(
+    row: CatalogRow, sort: DatasetSort, usage: dict[uuid.UUID, DatasetUsage] | None = None
+) -> tuple[Any, ...]:
     tail = (row.asset_symbol, str(row.id))
     if sort is DatasetSort.SYMBOL:
         return tail
+    if sort is DatasetSort.LAST_READ:
+        # Newest read first: the negated microseconds ascend; never-read rows (key 1) come last.
+        last_read = None if usage is None or row.id not in usage else usage[row.id].last_read_at
+        if last_read is None:
+            return (1, 0, *tail)
+        return (0, -_micros(last_read), *tail)
     if row.expiry is None:
         return (1, 0, *tail)
     return (0, (row.expiry - _EPOCH) // _ONE_MICROSECOND, *tail)
 
 
-def _cursor_for(row: CatalogRow, sort: DatasetSort) -> str:
-    return _encode_cursor({'o': sort.value, 'k': list(_sort_key(row, sort))})
+def _cursor_for(row: CatalogRow, sort: DatasetSort, usage: dict[uuid.UUID, DatasetUsage] | None = None) -> str:
+    return _encode_cursor({'o': sort.value, 'k': list(_sort_key(row, sort, usage))})
 
 
 def _key_from_cursor(cursor: str, sort: DatasetSort) -> tuple[Any, ...]:
@@ -433,8 +599,14 @@ def _matches(
     status: StatusGroup | None,
     needs_attention: bool,
     running: frozenset[uuid.UUID] | None = None,
+    usage: Callable[[CatalogRow], bool] | None = None,
+    expiring: Callable[[CatalogRow], bool] | None = None,
 ) -> bool:
     if running is not None and view.row.id not in running:
+        return False
+    if usage is not None and not usage(view.row):
+        return False
+    if expiring is not None and not expiring(view.row):
         return False
     if source is not None and view.row.source != source:
         return False
@@ -443,6 +615,138 @@ def _matches(
     if status is not None and view.group != status:
         return False
     return not (needs_attention and view.group not in _ATTENTION)
+
+
+_warned_usage_missing = False
+# The probe's answer per request session, forgotten with the session.
+_usage_ready_by_session: 'weakref.WeakKeyDictionary[AsyncSession, bool]' = weakref.WeakKeyDictionary()
+
+
+async def _usage_ready(db: AsyncSession) -> bool:
+    """Whether the usage tables exist; when not, usage reads as empty (one warning names `make migrate`).
+
+    An unmigrated database must not turn a catalog read into a 500: the figures are then the zero view, the same
+    as the recorder skipping its writes. A failing probe is not swallowed: it propagates with its own cause.
+    """
+    global _warned_usage_missing
+    # Asked once per request: the answer is kept against the request's session, never across requests.
+    if (cached := _usage_ready_by_session.get(db)) is not None:
+        return cached
+    # to_regclass is NULL for a missing table and never raises: a real database failure propagates, unwarned.
+    ready = await usage_tables_exist(db)
+    _usage_ready_by_session[db] = ready
+    if not ready and not _warned_usage_missing:
+        _warned_usage_missing = True
+        log.warning(
+            'Dataset usage reads as empty: the usage tables do not exist; the database has not been migrated, run make migrate'
+        )
+    return ready
+
+
+async def _read_usage(
+    db: AsyncSession, dataset_ids: list[uuid.UUID] | None, client_filter: ClientFilter, now: datetime
+) -> dict[uuid.UUID, DatasetUsage]:
+    if not await _usage_ready(db):
+        return {}
+    return await read_dataset_usage(
+        db, dataset_ids, now=now, window_days=USAGE_WINDOW_DAYS, **_client_args(client_filter)
+    )
+
+
+async def _read_readers(
+    db: AsyncSession, dataset_ids: list[uuid.UUID], now: datetime
+) -> dict[uuid.UUID, tuple[frozenset[ReadClientKind], frozenset[str]]]:
+    if not dataset_ids or not await _usage_ready(db):
+        return {}
+    return await read_readers(db, dataset_ids, now=now, window_days=USAGE_WINDOW_DAYS)
+
+
+async def _read_clients(db: AsyncSession, dataset_ids: list[uuid.UUID], now: datetime) -> list[ClientDatasets]:
+    if not dataset_ids or not await _usage_ready(db):
+        return []
+    return await read_client_datasets(db, dataset_ids, now=now, window_days=USAGE_WINDOW_DAYS)
+
+
+def _client_args(client_filter: ClientFilter) -> dict[str, Any]:
+    """The client selection as read_dataset_usage's keyword arguments."""
+    if client_filter.client_ids:
+        return {'client_ids': client_filter.applied_ids}
+    return {'client_kinds': client_filter.applied_kinds}
+
+
+def utc_today(now: datetime) -> date:
+    """Today's UTC calendar date at `now`; a naive `now` is refused, as the usage helpers refuse it."""
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError('now must be timezone-aware')
+    return now.astimezone(UTC).date()
+
+
+def read_within(last_read_at: datetime | None, now: datetime, days: int) -> bool:
+    """THE DAY-ALIGNED READ RULE, written once: the last read's UTC date is on or after today's UTC date minus `days`.
+
+    No read at all is within no window. The usage filters (READ_30D, STALE), the facets, the usage summary and the
+    stale list all decide through this, so their counts can never disagree about which datasets are stale.
+    """
+    if last_read_at is None:
+        return False
+    return last_read_at.astimezone(UTC).date() >= utc_today(now) - timedelta(days=days)
+
+
+def _usage_predicate(
+    group: UsageFilter, usage: dict[uuid.UUID, DatasetUsage], now: datetime, stale_days: int
+) -> Callable[[CatalogRow], bool]:
+    """The membership test of one usage group, over the usage read under the client filter."""
+
+    def test(row: CatalogRow) -> bool:
+        found = usage.get(row.id)
+        last_read_at = None if found is None else found.last_read_at
+        match group:
+            case UsageFilter.NEVER_READ:
+                return last_read_at is None
+            case UsageFilter.READ_30D:
+                return read_within(last_read_at, now, 30)
+            case _:
+                return not read_within(last_read_at, now, stale_days)
+
+    return test
+
+
+def _expiring_predicate(expires_before: datetime, pending: frozenset[uuid.UUID]) -> Callable[[CatalogRow], bool]:
+    """Expiring Soon: an expiry before the bound, or a dataset the reaper would delete."""
+
+    def test(row: CatalogRow) -> bool:
+        return row.id in pending or (row.expiry is not None and row.expiry < expires_before)
+
+    return test
+
+
+async def _page_usage(
+    db: AsyncSession,
+    page_ids: list[uuid.UUID],
+    known: dict[uuid.UUID, DatasetUsage] | None,
+    client_filter: ClientFilter,
+    now: datetime,
+) -> dict[uuid.UUID, DatasetUsageView]:
+    """The usage view of each page dataset: two statements at most, whatever the page holds.
+
+    `known` is the usage already read for every dataset, when a filter or the sort needed it.
+    """
+    if not page_ids:
+        return {}
+    if known is None:
+        known = await _read_usage(db, page_ids, client_filter, now)
+    readers = await _read_readers(db, page_ids, now)
+    views: dict[uuid.UUID, DatasetUsageView] = {}
+    for dataset_id in page_ids:
+        found = known.get(dataset_id)
+        kinds, clients = readers.get(dataset_id, (frozenset(), frozenset()))
+        views[dataset_id] = DatasetUsageView(
+            last_read_at=None if found is None else found.last_read_at,
+            reads_30d=0 if found is None else found.reads_in_window,
+            read_by_30d=tuple(kind for kind in ReadClientKind if kind in kinds),
+            read_by_clients_30d=tuple(sorted(clients)),
+        )
+    return views
 
 
 async def list_page(
@@ -463,7 +767,20 @@ async def list_page(
         InvalidRequestError: If the cursor does not decode, or was made under a different sort (422).
     """
     after = None if query.cursor is None else _key_from_cursor(query.cursor, query.sort)
-    rows = sorted(await repo.list_catalog(db, query.catalog_filter), key=lambda row: _sort_key(row, query.sort))
+    rows = await repo.list_catalog(db, query.catalog_filter)
+    # Usage for EVERY dataset in one statement, only when the filter or the sort needs it; else the page's own.
+    usage_all: dict[uuid.UUID, DatasetUsage] | None = None
+    if query.usage is not None or query.sort is DatasetSort.LAST_READ:
+        usage_all = await _read_usage(db, None, query.client_filter, now)
+    pending_all: frozenset[uuid.UUID] | None = None
+    if query.expires_before is not None:
+        pending_all = await repo.pending_ids(db, now)
+        keep_expiring = _expiring_predicate(query.expires_before, pending_all)
+        rows = [row for row in rows if keep_expiring(row)]
+    if query.usage is not None and usage_all is not None:
+        keep_usage = _usage_predicate(query.usage, usage_all, now, query.stale_days)
+        rows = [row for row in rows if keep_usage(row)]
+    rows = sorted(rows, key=lambda row: _sort_key(row, query.sort, usage_all))
     if query.running:
         # One more statement, only for a request that asks for it; rows narrow before freshness is judged.
         in_flight = await running_dataset_ids(db)
@@ -480,23 +797,90 @@ async def list_page(
     else:
         views = [DatasetView(row=row, health=None) for row in rows]
     if after is not None:
-        views = [view for view in views if _sort_key(view.row, query.sort) > after]
+        views = [view for view in views if _sort_key(view.row, query.sort, usage_all) > after]
     window = views[: query.limit + 1]
     has_more = len(window) > query.limit
     page = window[: query.limit]
     if not judged_everywhere:
         page = await evaluate_views(db, [view.row for view in page], now, config)
     page_rows = [view.row for view in page]
+    page_ids = [row.id for row in page_rows]
     return DatasetPage(
         views=page,
         extents=await repo.bar_extents(db, page_rows),
         siblings=await repo.siblings(db, page_rows),
-        next_cursor=_cursor_for(page[-1].row, query.sort) if has_more else '',
+        next_cursor=_cursor_for(page[-1].row, query.sort, usage_all) if has_more else '',
         as_of=now,
+        usage=await _page_usage(db, page_ids, usage_all, query.client_filter, now),
+        reaper_pending=(
+            await repo.pending_ids(db, now, page_ids) if pending_all is None else pending_all & frozenset(page_ids)
+        ),
+        client_filter=query.client_filter,
         # ONE statement for the whole page, never one per dataset. latest_runs_for_datasets ranks each
         # dataset's runs with a row_number() window function: DISTINCT ON is Postgres-only and would
         # silently misbehave on the suite's sqlite.
+        last_runs=await latest_runs_for_datasets(db, page_ids),
+    )
+
+
+def _pending_cursor_for(row: CatalogRow) -> str:
+    if row.expiry is None:
+        raise ValueError('a pending dataset always has an expiry')
+    return _encode_cursor({'o': 'reaper', 'k': [(row.expiry - _EPOCH) // _ONE_MICROSECOND, str(row.id)]})
+
+
+def _pending_key_from_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
+    payload = _decode_cursor(cursor)
+    key = payload.get('k')
+    if payload.get('o') != 'reaper' or not isinstance(key, list) or len(key) != 2:
+        raise invalid_cursor()
+    micros, dataset_id = key
+    if isinstance(micros, bool) or not isinstance(micros, int) or not isinstance(dataset_id, str):
+        raise invalid_cursor()
+    try:
+        return _EPOCH + timedelta(microseconds=micros), uuid.UUID(dataset_id)
+    except (ValueError, OverflowError):
+        raise invalid_cursor() from None
+
+
+async def reaper_pending_page(
+    db: AsyncSession, now: datetime, *, cursor: str | None, limit: int, config: FreshnessConfig | None = None
+) -> DatasetPage:
+    """One page of the datasets the reaper would delete: those whose expiry has passed, oldest expiry first.
+
+    Keyset paged over (expiry, id) with an opaque cursor bound to this read (one made by the catalog list is a
+    422). Records no usage. The page carries what DatasetPage carries, so the route maps its items like the
+    catalog's, with reaper_pending true and usage under the default client filter.
+
+    Args:
+        db: The request's session.
+        now: The instant the pending set is computed at; aware.
+        cursor: The next_cursor of the previous page, or None for the first.
+        limit: The page size.
+        config: The freshness settings; the environment's when omitted.
+
+    Returns:
+        DatasetPage: The page; next_cursor is empty on the last.
+
+    Raises:
+        InvalidRequestError: If the cursor does not decode (422).
+    """
+    after = None if cursor is None else _pending_key_from_cursor(cursor)
+    rows = await repo.list_pending(db, now, after=after, limit=limit + 1)
+    has_more = len(rows) > limit
+    page_rows = rows[:limit]
+    client_filter = ClientFilter()
+    return DatasetPage(
+        views=await evaluate_views(db, page_rows, now, config),
+        extents=await repo.bar_extents(db, page_rows),
+        siblings=await repo.siblings(db, page_rows),
+        next_cursor=_pending_cursor_for(page_rows[-1]) if has_more else '',
+        as_of=now,
         last_runs=await latest_runs_for_datasets(db, [row.id for row in page_rows]),
+        # The default client filter (SDK): the page has no client parameter.
+        usage=await _page_usage(db, [row.id for row in page_rows], None, client_filter, now),
+        reaper_pending=frozenset(row.id for row in page_rows),
+        client_filter=client_filter,
     )
 
 
@@ -529,19 +913,34 @@ async def facets(db: AsyncSession, query: CatalogQuery, now: datetime, config: F
     rows = await repo.list_catalog(db, CatalogFilter(asset_symbol_prefix=flt.asset_symbol_prefix))
     views = await evaluate_views(db, rows, now, config)
     in_flight = await running_dataset_ids(db)
+    usage = await _read_usage(db, None, query.client_filter, now)
+    pending = await repo.pending_ids(db, now)
+    bound = query.expires_before or now + timedelta(days=EXPIRING_SOON_DAYS)
+    expiring = _expiring_predicate(bound, pending)
+    in_group = {group: _usage_predicate(group, usage, now, query.stale_days) for group in UsageFilter}
 
-    def match(view: DatasetView, *, omit: str | None = None, attention: bool | None = None) -> bool:
+    def match(view: DatasetView, *, omit: frozenset[str] = frozenset(), attention: bool | None = None) -> bool:
         return _matches(
             view,
-            source=None if omit == 'source' else flt.source,
-            update_type=None if omit == 'update_type' else flt.update_type,
-            status=None if omit == 'status' else query.status,
+            source=None if 'source' in omit else flt.source,
+            update_type=None if 'update_type' in omit else flt.update_type,
+            status=None if 'status' in omit else query.status,
             needs_attention=query.needs_attention if attention is None else attention,
-            running=in_flight if query.running and omit != 'running' else None,
+            running=in_flight if query.running and 'running' not in omit else None,
+            usage=None if query.usage is None or 'usage' in omit else in_group[query.usage],
+            # An expires_before that was sent filters like the list's; one defaulted here only feeds its count.
+            expiring=None if query.expires_before is None or 'expiring' in omit else expiring,
         )
 
     def by(key: Callable[[DatasetView], Any], omit: str) -> dict[Any, int]:
-        return _count_where(views, lambda view: match(view, omit=omit), key)
+        return _count_where(views, lambda view: match(view, omit=frozenset({omit})), key)
+
+    def group_count(group: UsageFilter) -> int:
+        return sum(match(view, omit=frozenset({'usage'})) and in_group[group](view.row) for view in views)
+
+    # The picker ignores the client filter, and the usage and expiry views, which are not structure.
+    picker_ids = [view.row.id for view in views if match(view, omit=frozenset({'usage', 'expiring'}))]
+    clients = await _read_clients(db, picker_ids, now)
 
     source_counts = by(lambda view: view.row.source, 'source')
     update_counts = by(lambda view: view.row.update_type, 'update_type')
@@ -553,20 +952,33 @@ async def facets(db: AsyncSession, query: CatalogQuery, now: datetime, config: F
         update_types={member: update_counts.get(member, 0) for member in UpdateType},
         statuses={member: status_counts.get(member, 0) for member in FreshnessStatus},
         # Under every filter but running itself, so with running=true it equals the list's total.
-        running=sum(match(view, omit='running') and view.row.id in in_flight for view in views),
+        running=sum(match(view, omit=frozenset({'running'})) and view.row.id in in_flight for view in views),
+        clients=[ClientCountView(item.client_id, item.client_kind, item.datasets) for item in clients],
+        client_filter=query.client_filter,
+        stale=group_count(UsageFilter.STALE),
+        read_30d=group_count(UsageFilter.READ_30D),
+        never_read=group_count(UsageFilter.NEVER_READ),
+        expiring_soon=sum(match(view, omit=frozenset({'expiring'})) and expiring(view.row) for view in views),
+        stale_days=query.stale_days,
+        expires_before=bound,
     )
 
 
 async def dataset_detail(
-    db: AsyncSession, dataset_id: uuid.UUID, now: datetime, config: FreshnessConfig | None = None
+    db: AsyncSession,
+    dataset_id: uuid.UUID,
+    now: datetime,
+    config: FreshnessConfig | None = None,
+    client_filter: ClientFilter | None = None,
 ) -> DatasetDetail | None:
-    """One dataset with its freshness, extent and siblings, or None when no such dataset exists.
+    """One dataset with its freshness, extent, siblings and usage, or None when no such dataset exists.
 
     Args:
         db: The request's session.
         dataset_id: The dataset's id.
         now: The instant to judge freshness at; aware.
         config: The freshness settings; the environment's when omitted.
+        client_filter: Whose reads the usage counts; the default (kind SDK) when omitted.
 
     Returns:
         DatasetDetail | None: The dataset, or None.
@@ -578,7 +990,18 @@ async def dataset_detail(
     extents = await repo.bar_extents(db, [row])
     siblings = await repo.siblings(db, [row])
     last_run = (await latest_runs_for_datasets(db, [row.id])).get(row.id)
-    return DatasetDetail(view=view, extent=extents[row.id], siblings=siblings[row.id], as_of=now, last_run=last_run)
+    client_filter = client_filter or ClientFilter()
+    usage = (await _page_usage(db, [row.id], None, client_filter, now))[row.id]
+    return DatasetDetail(
+        view=view,
+        extent=extents[row.id],
+        siblings=siblings[row.id],
+        as_of=now,
+        last_run=last_run,
+        usage=usage,
+        reaper_pending=row.id in await repo.pending_ids(db, now, [row.id]),
+        client_filter=client_filter,
+    )
 
 
 async def dataset_coverage(
@@ -587,7 +1010,7 @@ async def dataset_coverage(
     """A dataset's coverage strip over the trading calendar, or None when no such dataset exists (tj-grna9p.63).
 
     Two statements, whatever the range: the entry, and the dates its bars fall on. The calendar logic is
-    freshness.py's, unchanged: the same completed-session rule and the same maximal runs as the GAPS status.
+    completeness.py's, unchanged: the same completed-session rule and the same maximal runs as the GAPS status.
     The range is the one DatasetSummary shows (start, effective_end). It applies to every update type, and a
     retired DAILY or STREAM dataset is computed over the same range (when its retirement began is not recorded).
     A bar belongs to the session whose local date it falls on, so a gap's window runs from the local midnight of
@@ -613,8 +1036,8 @@ async def dataset_coverage(
     try:
         calendar = calendar_for_source(row.source)
         covered = (await repo.covered_dates(db, [row], str(calendar.tz)))[row.id]
-        strip = compute_coverage_buckets(row.start, end, covered, calendar, now, buckets)
-        intervals = gap_intervals(row.start, end, covered, calendar, now)
+        strip = compute_coverage_buckets(row.start, end, covered, calendar, now, buckets, row.granularity)
+        intervals = gap_intervals(row.start, end, covered, calendar, now, row.granularity)
     except (UnknownCalendarError, CalendarRangeError):
         raise InvalidRequestError(
             Reason.INVALID_REQUEST, 'No trading calendar covers this dataset, so its coverage cannot be computed.'
@@ -766,3 +1189,409 @@ def _bar_cursor_timestamp(cursor: str) -> datetime:
     if moment.tzinfo is None or moment.utcoffset() is None:
         raise invalid_cursor()
     return moment
+
+
+# USAGE STATISTICS (tj-grna9p.64). Each read below runs a constant number of statements and records no usage.
+# Every one of them decides staleness through read_within, the one day-aligned rule the list's usage filter and
+# the facets use, so the summary, the stale list and the Stale facet agree for the same filter.
+
+# The first day of each last-read bucket, in whole UTC days since the last read (0 = today); the last is open.
+LAST_READ_BUCKET_STARTS: Final = (0, 1, 8, 31, 91)
+DEFAULT_READS_PER_DAY_DAYS: Final = 30
+MAX_READS_PER_DAY_DAYS: Final = 365
+
+
+@dataclass(frozen=True)
+class UsageSummary:
+    """The usage page's headline figures under a client filter.
+
+    Attributes:
+        stale: Datasets not read within stale_days by the selected clients, never-read included.
+        read_last_30d: Datasets read within 30 days; the Facets.read_30d figure.
+        total: Datasets matching the source.
+        never_read: Datasets the selected clients never read.
+        reads_today: Reads on today's UTC date by the selected clients.
+        distinct_clients_today: Distinct client ids among them. Labels, counted only.
+        client_filter: The client filter applied.
+        stale_days: The threshold used.
+    """
+
+    stale: int
+    read_last_30d: int
+    total: int
+    never_read: int
+    reads_today: int
+    distinct_clients_today: int
+    client_filter: ClientFilter
+    stale_days: int
+
+
+@dataclass(frozen=True)
+class LastReadBucketsResult:
+    """Datasets by whole UTC days since their last read.
+
+    Attributes:
+        buckets: (min_days, max_days, datasets) per bucket, ascending, half-open [min, max); max is None for the
+            open last bucket.
+        never_read: Datasets never read by the selected clients. buckets plus never_read sum to the total.
+        client_filter: The client filter applied.
+    """
+
+    buckets: list[tuple[int, int | None, int]]
+    never_read: int
+    client_filter: ClientFilter
+
+
+@dataclass(frozen=True)
+class ReadsPerDayResult:
+    """Reads per UTC day per client.
+
+    Attributes:
+        entries: One per (day, client id, kind) with a read, ascending by day then client id.
+        client_filter: The client filter applied.
+    """
+
+    entries: list[ClientDayReads]
+    client_filter: ClientFilter
+
+
+@dataclass(frozen=True)
+class ClientLastReadView:
+    """When one client last read a dataset. client_id is repr=False."""
+
+    client_id: str = field(repr=False)
+    client_kind: ReadClientKind
+    last_read_at: datetime
+
+
+@dataclass(frozen=True)
+class StaleDatasetPageResult:
+    """One page of stale datasets.
+
+    Attributes:
+        page: The datasets, with the usage under the client filter, as the catalog list carries them; its
+            next_cursor is the stale list's own.
+        est_bytes: The estimated stored size of each dataset: its bar count times the average row size.
+        last_reads: The last read of each dataset by every client that ever read it, whatever the filter.
+        stale_days: The threshold used.
+    """
+
+    page: DatasetPage
+    est_bytes: dict[uuid.UUID, int]
+    last_reads: dict[uuid.UUID, list[ClientLastReadView]]
+    stale_days: int
+
+
+@dataclass(frozen=True)
+class StorageShare:
+    """The estimated storage of one (source, feed).
+
+    Attributes:
+        source: The vendor.
+        feed: The tape.
+        bar_count: The bars held.
+        est_bytes: bar_count times the average row size; an estimate.
+    """
+
+    source: DataSource
+    feed: Feed
+    bar_count: int
+    est_bytes: int
+
+
+@dataclass(frozen=True)
+class StorageCurrent:
+    """What the bar table holds now. The split is an ESTIMATE; the total is measured unless a source was asked for.
+
+    Attributes:
+        total_bytes: pg_total_relation_size of the bar table; with a source filter, the sum of that source's
+            estimates, so the split always sums to the total (within rounding).
+        by_source: One share per (source, feed) holding bars.
+        as_of: The instant it was read at.
+    """
+
+    total_bytes: int
+    by_source: list[StorageShare]
+    as_of: datetime
+
+
+def estimate_bytes(bar_count: int, total_bytes: int, total_bars: int) -> int:
+    """A bar count's share of the table's bytes: bar_count times the average row size (total_bytes / total_bars).
+
+    Computed as bar_count * total_bytes // total_bars, so a split's parts add up to the total within one byte per
+    part. 0 when the table holds no bars. An estimate: every bar is assumed as large as the average.
+    """
+    if total_bars <= 0:
+        return 0
+    return bar_count * total_bytes // total_bars
+
+
+async def _read_day_reads(
+    db: AsyncSession, dataset_ids: list[uuid.UUID] | None, client_filter: ClientFilter, now: datetime, days: int
+) -> list[ClientDayReads]:
+    if (dataset_ids is not None and not dataset_ids) or not await _usage_ready(db):
+        return []
+    return await read_client_day_reads(db, dataset_ids, now=now, days=days, **_client_args(client_filter))
+
+
+def _last_read(usage: dict[uuid.UUID, DatasetUsage], dataset_id: uuid.UUID) -> datetime | None:
+    found = usage.get(dataset_id)
+    return None if found is None else found.last_read_at
+
+
+async def usage_summary(
+    db: AsyncSession,
+    now: datetime,
+    *,
+    client_filter: ClientFilter,
+    stale_days: int = DEFAULT_STALE_DAYS,
+    source: DataSource | None = None,
+) -> UsageSummary:
+    """The usage page's headline figures: a constant number of statements, whatever the store holds.
+
+    Args:
+        db: The request's session.
+        now: The instant the figures are judged at; aware, else ValueError.
+        client_filter: Whose reads count.
+        stale_days: The staleness threshold, 1..MAX_STALE_DAYS.
+        source: Count only this source's datasets (and the reads of them), or None for every dataset.
+
+    Returns:
+        UsageSummary: Everything never read, and no reads today, on an unmigrated database.
+    """
+    utc_today(now)
+    rows = await repo.list_catalog(db, CatalogFilter(source=source))
+    usage = await _read_usage(db, None, client_filter, now)
+    last_reads = [_last_read(usage, row.id) for row in rows]
+    reads_today = await _read_day_reads(
+        db, None if source is None else [row.id for row in rows], client_filter, now, days=1
+    )
+    return UsageSummary(
+        stale=sum(not read_within(last, now, stale_days) for last in last_reads),
+        read_last_30d=sum(read_within(last, now, 30) for last in last_reads),
+        total=len(rows),
+        never_read=sum(last is None for last in last_reads),
+        reads_today=sum(entry.reads for entry in reads_today),
+        distinct_clients_today=len({entry.client_id for entry in reads_today}),
+        client_filter=client_filter,
+        stale_days=stale_days,
+    )
+
+
+async def last_read_buckets(
+    db: AsyncSession, now: datetime, *, client_filter: ClientFilter, source: DataSource | None = None
+) -> LastReadBucketsResult:
+    """Datasets by whole UTC days since the last read, in [0,1), [1,8), [8,31), [31,91) and [91, open), plus never.
+
+    The days run from the UTC date of the last read to today's UTC date, so 0 is today, as reads_today and the
+    reads per day are. The buckets and never_read sum to the number of datasets.
+
+    Args:
+        db: The request's session.
+        now: The instant the buckets are judged at; aware, else ValueError.
+        client_filter: Whose reads count.
+        source: Count only this source's datasets, or None for every dataset.
+
+    Returns:
+        LastReadBucketsResult: Every bucket present, with a zero where nothing falls in it.
+    """
+    today = utc_today(now)
+    rows = await repo.list_catalog(db, CatalogFilter(source=source))
+    usage = await _read_usage(db, None, client_filter, now)
+    counts = [0] * len(LAST_READ_BUCKET_STARTS)
+    never_read = 0
+    for row in rows:
+        last = _last_read(usage, row.id)
+        if last is None:
+            never_read += 1
+            continue
+        # A read dated after today (a skewed clock) is today's: it must land in a bucket.
+        days = max(0, (today - last.astimezone(UTC).date()).days)
+        position = max(index for index, start in enumerate(LAST_READ_BUCKET_STARTS) if days >= start)
+        counts[position] += 1
+    ends: list[int | None] = [*LAST_READ_BUCKET_STARTS[1:], None]
+    return LastReadBucketsResult(
+        buckets=list(zip(LAST_READ_BUCKET_STARTS, ends, counts, strict=True)),
+        never_read=never_read,
+        client_filter=client_filter,
+    )
+
+
+async def reads_per_day(
+    db: AsyncSession,
+    now: datetime,
+    *,
+    client_filter: ClientFilter,
+    days: int = DEFAULT_READS_PER_DAY_DAYS,
+    dataset_id: uuid.UUID | None = None,
+    source: DataSource | None = None,
+) -> ReadsPerDayResult:
+    """Reads per UTC day per client over the last `days` days, today included, across the 90-day rollup.
+
+    One entry per (day, client id, kind) with a read. The per-read rows and the daily summaries are summed in one
+    statement, so a day split across the rollup boundary is one entry. With neither dataset_id nor source it counts
+    every read, those of deleted datasets too, which is also what the summary's reads_today counts.
+
+    Args:
+        db: The request's session.
+        now: The instant the window ends at; aware, else ValueError.
+        client_filter: Whose reads count.
+        days: The window, 1..MAX_READS_PER_DAY_DAYS.
+        dataset_id: Count only this dataset (Dataset detail), or None.
+        source: Count only this source's datasets, or None. With a dataset_id of another source the answer is empty.
+
+    Returns:
+        ReadsPerDayResult: Empty on an unmigrated database.
+    """
+    utc_today(now)
+    dataset_ids: list[uuid.UUID] | None = None
+    if source is not None:
+        rows = await repo.list_catalog(db, CatalogFilter(source=source))
+        dataset_ids = [row.id for row in rows if dataset_id is None or row.id == dataset_id]
+    elif dataset_id is not None:
+        dataset_ids = [dataset_id]
+    entries = await _read_day_reads(db, dataset_ids, client_filter, now, days=days)
+    return ReadsPerDayResult(entries=entries, client_filter=client_filter)
+
+
+def _stale_fingerprint(client_filter: ClientFilter, stale_days: int, source: DataSource | None) -> str:
+    """What a stale cursor is bound to, as a digest so the cursor does not carry the client ids it was made under."""
+    material = json.dumps(
+        [
+            stale_days,
+            None if source is None else source.name,
+            sorted(client_filter.applied_ids),
+            [kind.value for kind in client_filter.applied_kinds],
+        ],
+        separators=(',', ':'),
+    )
+    return hashlib.sha256(material.encode()).hexdigest()[:16]
+
+
+def _stale_key(row: CatalogRow, usage: dict[uuid.UUID, DatasetUsage]) -> tuple[int, int, str]:
+    """Never-read first (0), then the oldest last read, then the id."""
+    last = _last_read(usage, row.id)
+    if last is None:
+        return (0, 0, str(row.id))
+    return (1, _micros(last), str(row.id))
+
+
+def _stale_key_from_cursor(cursor: str, fingerprint: str) -> tuple[Any, ...]:
+    payload = _decode_cursor(cursor)
+    key = payload.get('k')
+    if payload.get('o') != 'stale' or payload.get('f') != fingerprint or not isinstance(key, list) or len(key) != 3:
+        raise invalid_cursor()
+    shape: tuple[type, ...] = (int, int, str)
+    if any(isinstance(part, bool) or not isinstance(part, kind) for part, kind in zip(key, shape, strict=True)):
+        raise invalid_cursor()
+    try:
+        uuid.UUID(key[-1])
+    except ValueError:
+        raise invalid_cursor() from None
+    return tuple(key)
+
+
+async def stale_page(
+    db: AsyncSession,
+    now: datetime,
+    *,
+    client_filter: ClientFilter,
+    stale_days: int = DEFAULT_STALE_DAYS,
+    source: DataSource | None = None,
+    cursor: str | None = None,
+    limit: int = DEFAULT_PAGE_LIMIT,
+    config: FreshnessConfig | None = None,
+) -> StaleDatasetPageResult:
+    """One page of the stale group under the client filter, never-read first, then by last read, then id.
+
+    The group is the STALE usage filter's: the Stale facet's count equals the total of this list. Keyset paged with
+    an opaque cursor bound to stale_days, the source and the client filter (one made under another is a 422).
+    A constant number of statements: the entries, the usage of all of them, then for the page its freshness,
+    extents, siblings, runs, reaper flag, readers, last read per client and the table's storage. Records no usage.
+
+    Args:
+        db: The request's session.
+        now: The instant staleness and freshness are judged at; aware, else ValueError.
+        client_filter: Whose reads count toward the usage under dataset.usage.
+        stale_days: The staleness threshold, 1..MAX_STALE_DAYS.
+        source: Only this source's datasets, or None.
+        cursor: The next_cursor of the previous page, or None for the first.
+        limit: The page size.
+        config: The freshness settings; the environment's when omitted.
+
+    Returns:
+        StaleDatasetPageResult: The page; next_cursor is empty on the last.
+
+    Raises:
+        InvalidRequestError: If the cursor does not decode or was made under another filter (422).
+    """
+    utc_today(now)
+    fingerprint = _stale_fingerprint(client_filter, stale_days, source)
+    after = None if cursor is None else _stale_key_from_cursor(cursor, fingerprint)
+    rows = await repo.list_catalog(db, CatalogFilter(source=source))
+    usage = await _read_usage(db, None, client_filter, now)
+    keep = _usage_predicate(UsageFilter.STALE, usage, now, stale_days)
+    keyed = sorted(((_stale_key(row, usage), row) for row in rows if keep(row)), key=lambda item: item[0])
+    if after is not None:
+        keyed = [item for item in keyed if item[0] > after]
+    window = keyed[: limit + 1]
+    has_more = len(window) > limit
+    page_rows = [row for _, row in window[:limit]]
+    page_ids = [row.id for row in page_rows]
+
+    storage = await repo.read_bar_storage(db) if page_rows else BarStorage(total_bytes=0, by_source=[])
+    extents = await repo.bar_extents(db, page_rows)
+    total_bars = sum(count for _, _, count in storage.by_source)
+    last_reads: dict[uuid.UUID, list[ClientLastReadView]] = {dataset_id: [] for dataset_id in page_ids}
+    if page_ids and await _usage_ready(db):
+        for item in await read_client_last_reads(db, page_ids):
+            last_reads[item.dataset_id].append(ClientLastReadView(item.client_id, item.client_kind, item.last_read_at))
+    page = DatasetPage(
+        views=await evaluate_views(db, page_rows, now, config),
+        extents=extents,
+        siblings=await repo.siblings(db, page_rows),
+        next_cursor=(
+            _encode_cursor({'o': 'stale', 'k': list(window[limit - 1][0]), 'f': fingerprint}) if has_more else ''
+        ),
+        as_of=now,
+        usage=await _page_usage(db, page_ids, usage, client_filter, now),
+        reaper_pending=await repo.pending_ids(db, now, page_ids),
+        client_filter=client_filter,
+        last_runs=await latest_runs_for_datasets(db, page_ids),
+    )
+    return StaleDatasetPageResult(
+        page=page,
+        est_bytes={row.id: estimate_bytes(extents[row.id].count, storage.total_bytes, total_bars) for row in page_rows},
+        last_reads=last_reads,
+        stale_days=stale_days,
+    )
+
+
+async def storage_current(db: AsyncSession, now: datetime, *, source: DataSource | None = None) -> StorageCurrent:
+    """The bar table's size now, split by (source, feed) as ESTIMATES. Two statements. No history.
+
+    The average row size is the table's measured total over its bar count; a share is its bar count times that.
+    With `source` the split is that source's only and total_bytes is the sum of its shares, so the split always
+    sums to the total.
+
+    Args:
+        db: The request's session.
+        now: The instant it was read at; aware, else ValueError.
+        source: Only this source, or None for the whole table.
+
+    Returns:
+        StorageCurrent: Zero bytes and no shares for an empty table.
+    """
+    utc_today(now)
+    storage = await repo.read_bar_storage(db)
+    total_bars = sum(count for _, _, count in storage.by_source)
+    shares = [
+        StorageShare(held_source, feed, count, estimate_bytes(count, storage.total_bytes, total_bars))
+        for held_source, feed, count in storage.by_source
+        if source is None or held_source is source
+    ]
+    return StorageCurrent(
+        total_bytes=storage.total_bytes if source is None else sum(share.est_bytes for share in shares),
+        by_source=shares,
+        as_of=now,
+    )

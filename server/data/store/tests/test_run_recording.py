@@ -570,6 +570,8 @@ async def test_the_lifespan_sweeps_after_the_database_is_initialised(monkeypatch
     for name in ('initialize_latency_client', 'init_debugger', 'startup_logs'):
         monkeypatch.setattr(app_depends, name, lambda *args, **kwargs: None)
     monkeypatch.setattr(app_depends.SharedWorkerPool, 'worker_startup', lambda *args, **kwargs: None)
+    # Never reached (the sweep stops the lifespan first), but if it were, no real DAILY refresh pass (tj-grna9p.92).
+    monkeypatch.setenv('DAILY_REFRESH_ENABLED', 'false')
 
     with pytest.raises(_Stop):
         async with app_depends.lifespan(object()):

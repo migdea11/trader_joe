@@ -14,12 +14,12 @@ sets, restates or removes it; test_client carries none; the committed root env f
 One section each:
 
   1. THE EFFECTIVE VALUE. For every launch set that runs data_store -- read from where each is spelled, the
-     Makefile's *_COMPOSE variables as make expands them, tools/agent_mcp/stack.py, every `docker compose` in
+     Makefile's *_COMPOSE variables as make expands them, tools/agent_mcp/stack.py's sets, every `docker compose` in
      the workflows and data/store/run_migrations.sh (test_service_pythonpath.py's _launch_sets) --
      data_store's container value, under compose's precedence (image ENV < each env file's committed
      template < environment: as interpolated), EQUALS data_ingest's effective
      APP_INTERNAL_GRPC_HOST:APP_INTERNAL_GRPC_PORT. Under the committed root env file, one lacking
-     DATA_INGEST_GRPC_PORT (a user's older .env, the never-regenerated agent-stack files), one with it blank,
+     DATA_INGEST_GRPC_PORT (a user's older .env), one with it blank,
      and one MOVING it, where both ends must have moved to the new port. Production's reader accepts each.
   2. AS WRITTEN. The host half carries no interpolation and is literally the server's APP_INTERNAL_GRPC_HOST,
      an alias on data_ingest's ingest_store attachment; the port half is the server's port expression, byte
@@ -34,7 +34,7 @@ One section each:
 
 What only Docker can show -- compose's real render and precedence, the alias resolving from data_store, a
 dial reaching the listener -- is CI System Testing's (Check gRPC Peer Reach, which tj-3mk3u5.62 changes to
-dial this very value) and, for the agent stack, the batched MCP rebuild (addendum 5 item 8). Nothing here
+dial this very value) and, for the MCP's sets, the batched MCP rebuild (addendum 5 item 8). Nothing here
 needs Docker, and nothing depends on mode bits (CI runs the suite as root).
 """
 
@@ -68,9 +68,12 @@ KNOWN_CLIENT_SETS = frozenset(
         f'{MAKEFILE_SOURCE} PROD_COMPOSE',
         f'{MAKEFILE_SOURCE} DEV_COMPOSE',
         f'{MAKEFILE_SOURCE} SYSTEM_COMPOSE',
-        f'{MAKEFILE_SOURCE} AGENT_STACK_COMPOSE',
         f'{MAKEFILE_SOURCE} TEST_CLIENT_COMPOSE',
-        STACK_SOURCE,
+        # The MCP's sets, re-pointed from the retired agent stack's (tj-iee6sn.21).
+        f'{STACK_SOURCE} DEV_COMPOSE_FILES',
+        f'{STACK_SOURCE} TEST_COMPOSE_FILES',
+        f'{STACK_SOURCE} TEST_BUILD_COMPOSE_FILES',
+        f'{STACK_SOURCE} SYSTEM_CLIENT_COMPOSE_FILES',
     }
 )
 KNOWN_OVERLAYS = frozenset(
@@ -78,8 +81,11 @@ KNOWN_OVERLAYS = frozenset(
         'docker-compose.override.yaml',
         'docker-compose.fake.yaml',
         'docker-compose.test-client.yaml',
-        'docker-compose.agent-stack.yaml',
         'docker-compose.tools.yaml',
+        # The MCP-only overlays, which replaced the agent-stack overlay among the files scanned (tj-iee6sn.21).
+        'docker-compose.agent-dev.yaml',
+        'docker-compose.agent-test.yaml',
+        'docker-compose.agent-client.yaml',
     }
 )
 

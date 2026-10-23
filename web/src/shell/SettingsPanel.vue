@@ -1,7 +1,7 @@
 <script setup lang="ts">
-// The Settings panel (phase 1): the time zone override and the About and Credits link. Stale After
-// days moves in with its screens (tj-grna9p.87); the store already holds it. Settings are saved in
-// this browser only (tj-grna9p.58); when storage is unavailable the panel says so quietly.
+// The Settings panel (phase 1): the time zone override and the About and Credits link. The stale
+// threshold is a fixed constant, not a setting (api/usage.ts). Settings are saved in this browser
+// only (tj-grna9p.58); when storage is unavailable the panel says so quietly.
 import Button from 'primevue/button'
 import Dialog from 'primevue/dialog'
 import Select from 'primevue/select'

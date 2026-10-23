@@ -156,8 +156,9 @@ class StoreAssetDatasetFields(InboundContract):
     # nullable (tj-vhboky.1 Amendment 1 item P). Nothing is written into a unique-key column by
     # this, because expiry is not identity.
     #
-    # AwareDatetime when set, REFUSE not convert (the tj-1bl90i rule above). On DAILY and STREAM a
-    # non-null expiry retires the dataset (tj-vhboky.1 addenda); a null one means it never does.
+    # AwareDatetime when set, REFUSE not convert (the tj-1bl90i rule above). The expiry is the DELETION
+    # DATE and nothing else, for every update type (decision tj-hhy3dk); whether a DAILY or STREAM
+    # subscription collects is the separate collect intent on StoreAssetDatasetBody.
     expiry: AwareDatetime | None = None
     # json_schema_extra keeps the documented default the NAME the wire carries. The JSON schema's
     # default is encoded from the config, never from a field serializer, so without it the OpenAPI
@@ -222,6 +223,11 @@ class StoreAssetDatasetBody(StoreAssetDatasetFields):
     on OverlapKey, not on the entry, and not on any model that inherits StoreAssetDatasetFields, so
     GET /store does not carry them.
 
+    collect IS AN ADDITIVE CHANGE TO THE PUBLIC /store API (decision tj-hhy3dk, tj-grna9p.174). It is
+    optional: omitted means true for DAILY and STREAM, so every existing caller is unchanged. A value
+    on a STATIC request is a 422 ('collect applies to subscriptions only'). It is a request field
+    like ready_by: not identity and not on any entry model.
+
     A STREAM CREATE IS REFUSED while STREAM is deferred (decision tj-grna9p.9 item 2). The refusal is
     a ValueError, which install_error_handlers renders as a 422 problem+json with reason
     INVALID_REQUEST. No new Reason: a temporary refusal does not earn a vocabulary change, and the
@@ -234,6 +240,20 @@ class StoreAssetDatasetBody(StoreAssetDatasetFields):
     ready_by: AwareDatetime | None = None
     # The requester accepts a partial or late answer. Accepted and currently ignored.
     best_effort: bool = False
+    # The operator's collect INTENT for a subscription (decision tj-hhy3dk). Omitted (None) means true
+    # for DAILY and STREAM; false creates the subscription stopped. A request-only field like ready_by:
+    # not identity, not on the entry model. On STATIC any value, true included, is a 422, because a
+    # bulk dataset has no intent (its collecting status is derived).
+    collect: bool | None = None
+
+    @model_validator(mode='after')
+    def refuse_collect_on_static(self) -> Self:
+        if self.collect is not None and self.update_type is UpdateType.STATIC:
+            raise ValueError(
+                f"The 'collect' field is refused for '{UpdateType.STATIC.name}' datasets: "
+                'collect applies to subscriptions only.'
+            )
+        return self
 
     @model_validator(mode='after')
     def refuse_stream_create(self) -> Self:

@@ -1,0 +1,32 @@
+# THE AGENT-STACK MCP'S OVERLAY OVER THE USER'S DEV PROJECT (ADR tj-4rr0la addendum 23; tj-iee6sn.5).
+# MCP-ONLY: no Makefile target loads it, and no human needs to. It is the LAST file of the dev set the
+# MCP passes (stack.DEV_COMPOSE_FILES): docker-compose.yaml, docker-compose.override.yaml,
+# docker-compose.web.yaml, docker-compose.web.dev.yaml, then this one -- the Makefile's DEV_COMPOSE list
+# plus this overlay, and a validator test pins that the two agree.
+#
+# IT SETS build.dockerfile AND NOTHING ELSE: no image tag, no mount, no network, no environment.
+# Everything else about the dev services -- their :dev image tags, the bind mounts of the live
+# checkout, devnet -- stays as the user's own files define it, so a container the MCP makes is the
+# container `make dev-launch` makes.
+#
+# WHY build.dockerfile. The build context is the live root checkout (the compose files' `context: .`,
+# resolved against --project-directory), which an agent can write. BuildKit reads the Dockerfile from
+# the context, so an agent-edited Dockerfile would choose which images a build on the host daemon
+# reads (FROM, COPY --from, RUN --mount from=, a syntax= frontend). The MCP image's own copy of the
+# service Dockerfile is fixed instead (stack.TRUSTED_DOCKERFILE, baked by tools/agent_mcp/Dockerfile).
+# compose merges build keys, so context, target and args stay from the files above. The path exists only
+# inside the MCP image; loading this file anywhere else fails to find it.
+#
+# THE THREE SERVICES are the ones the dev set builds (data_store and data_ingest from the base file,
+# web from docker-compose.web.yaml); postgres and pgAdmin run stock images. Absolute path: a
+# relative dockerfile resolves against the context.
+services:
+  data_store:
+    build:
+      dockerfile: /opt/agent_mcp/compose/Dockerfile
+  data_ingest:
+    build:
+      dockerfile: /opt/agent_mcp/compose/Dockerfile
+  web:
+    build:
+      dockerfile: /opt/agent_mcp/compose/Dockerfile

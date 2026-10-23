@@ -53,7 +53,8 @@ from common.errors.vocabulary import ExogenousError, Reason
 from data.store.app.database.crud.stock import store_dataset_entry as crud
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
-from data.store.app.freshness import FreshnessStatus, calendar_for_source, evaluate_dataset
+from data.store.app.health import FreshnessStatus, evaluate_dataset
+from data.store.app.trading_calendar import calendar_for_source
 from schemas.data_store.asset_dataset_store import (
     AssetDatasetStore,
     AssetDatasetStoreCreate,
@@ -374,23 +375,49 @@ def _daily_request() -> AssetDatasetStoreCreate:
     )
 
 
-async def _bound_conflict_expiry(request: AssetDatasetStoreCreate) -> datetime | None:
-    """Run the real upsert and return the value its ON CONFLICT DO UPDATE writes into expiry.
+# What _bound_conflict reports for collect when the exact-repeat branch does not SET it at all: the stored intent is
+# left as it is (tj-hhy3dk addendum, tj-grna9p.189). A sentinel, not None, so "kept" can never be mistaken for
+# "wrote NULL".
+KEPT = 'kept'
 
-    Asserted as a PLAIN BIND, `expiry = %(...)s`: a rewrite that keeps the stored value when the body
-    has none -- `coalesce(<bound>, store_dataset_entry.expiry)`, or dropping expiry from the SET when it
-    is None -- no longer matches, and is the regression the ruling forbids.
+
+async def _bound_conflict(
+    request: AssetDatasetStoreCreate, **upsert_kwargs: object
+) -> tuple[datetime | None, bool | str | None, bool | None]:
+    """Run the real upsert; return the expiry and collect its ON CONFLICT DO UPDATE writes, and the collect it INSERTs.
+
+    Asserted as PLAIN BINDS, `expiry = %(...)s[, collect = %(...)s]`: a rewrite that keeps the stored expiry when the
+    body has none -- `coalesce(<bound>, store_dataset_entry.expiry)`, or dropping expiry from the SET when it is None
+    -- no longer matches, and is the regression tj-grna9p.105 forbids. collect is the OPPOSITE rule (tj-hhy3dk
+    addendum, tj-grna9p.189): an exact repeat SETs it only when the body carried it, so the SET either names it as a
+    plain bind or does not name it at all, and the latter is reported as KEPT.
     """
     db = FakeSession(FakeResult([]), FakeResult([(uuid4(),)]))
-    await crud.upsert_entry(db, request)
+    await crud.upsert_entry(db, request, **upsert_kwargs)
     statement = _only(db.statements, 'INSERT')
-    clause = _do_update_clause(_sql(statement))
-    bound = re.fullmatch(r'expiry = %\((\w+)\)s, updated_at = now\(\)', clause)
+    sql = _sql(statement)
+    clause = _do_update_clause(sql)
+    bound = re.fullmatch(r'expiry = %\((\w+)\)s(?:, collect = %\((\w+)\)s)?, updated_at = now\(\)', clause)
     assert bound, (
-        f'the exact-repeat branch no longer writes the body expiry as-is, so a repeat POST without an '
-        f'expiry would keep the stored one (tj-grna9p.105 ruled that it clears it): {clause}'
+        f'the exact-repeat branch no longer writes the body expiry (and an explicit collect) as plain binds, so a '
+        f'repeat POST would not set them from the body (tj-grna9p.105, tj-grna9p.189): {clause}'
     )
-    return _params(statement)[bound.group(1)]
+    params = _params(statement)
+    inserted = re.search(r'VALUES \((.*?)\) ON CONFLICT', sql)
+    assert inserted, sql
+    columns = re.search(r'INSERT INTO store_dataset_entry \((.*?)\) VALUES', sql)
+    assert columns, sql
+    names = [name.strip() for name in columns.group(1).split(',')]
+    values = [value.strip() for value in inserted.group(1).split(',')]
+    assert 'collect' in names, f'the INSERT does not name collect, so the CHECK would refuse a subscription: {sql}'
+    insert_bind = re.fullmatch(r'%\((\w+)\)s', values[names.index('collect')])
+    assert insert_bind, f'collect is not a plain bind in the INSERT: {sql}'
+    conflict_collect = KEPT if bound.group(2) is None else params[bound.group(2)]
+    return params[bound.group(1)], conflict_collect, params[insert_bind.group(1)]
+
+
+async def _bound_conflict_expiry(request: AssetDatasetStoreCreate) -> datetime | None:
+    return (await _bound_conflict(request))[0]
 
 
 @pytest.mark.asyncio
@@ -400,41 +427,96 @@ async def test_a_static_repeat_without_expiry_writes_null_over_the_stored_expiry
     This is documented behaviour, not an accident (tj-grna9p.105, architect ruling): the POST body
     declares the dataset's lifetime and no expiry means never expires, so the repeat is last-writer-
     wins on expiry. Keeping the old expiry when the body has none was considered and rejected, since
-    omission and null are one meaning on the wire and an expiry could then never be cleared.
+    omission and null are one meaning on the wire and an expiry could then never be cleared. collect is
+    INSERTed NULL, as the CHECK demands of STATIC, and a repeat never SETs it (it has no intent to change).
     """
     with_expiry = create_request(end=MARCH)
     assert with_expiry.expiry == FEBRUARY
 
-    assert await _bound_conflict_expiry(with_expiry) == FEBRUARY, 'a repeat WITH an expiry does not store it'
-    assert await _bound_conflict_expiry(_without_expiry(with_expiry)) is None, (
+    assert await _bound_conflict(with_expiry) == (FEBRUARY, KEPT, None), 'a repeat WITH an expiry does not store it'
+    assert await _bound_conflict(_without_expiry(with_expiry)) == (None, KEPT, None), (
         'a repeat POST without an expiry kept a stored expiry; the ruling is that it clears it to NULL'
     )
 
 
 @pytest.mark.asyncio
-async def test_a_daily_repeat_without_expiry_clears_the_expiry_and_brings_a_retired_dataset_back():
-    """DAILY: a retired subscription re-POSTed without an expiry is NOT retired any more. Documented, not accidental.
+@pytest.mark.parametrize('collect', [True, False, None], ids=['collect true', 'collect false', 'collect omitted'])
+async def test_a_static_upsert_writes_collect_null_whatever_it_is_passed(collect):
+    """The CHECK wants NULL exactly for STATIC; the crud resolves it so, even if a caller passed a value.
 
-    An expiry on a DAILY or STREAM dataset means it is RETIRED (freshness.evaluate_dataset: RETIRED
-    requires expiry is not None). The repeat without an expiry writes NULL over it, so the dataset
-    reads as a live subscription again. The architect flagged exactly this when ruling on
-    tj-grna9p.105 and ACCEPTED it: re-POSTing a dataset with no expiry declares it never expires, and
-    that is how a retired subscription is brought back through POST. If retiring is ever meant to be
-    sticky, this test is the one to change, deliberately.
-
-    The health is computed by the real freshness function from the value each upsert binds, so the
-    claim is the chain: what the second POST writes is what un-retires it.
+    The INSERT binds NULL and the repeat never SETs collect: a non-NULL value could only fail the CHECK.
     """
-    retired = _daily_request()
+    assert (await _bound_conflict(create_request(end=MARCH), collect=collect))[1:] == (KEPT, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('update_type', [UpdateType.DAILY, UpdateType.STREAM], ids=str)
+async def test_a_subscription_create_defaults_collect_to_true_and_a_repeat_without_it_keeps_the_stored_one(update_type):
+    """tj-hhy3dk addendum: an OMITTED collect INSERTs true on a create and leaves the stored intent on a repeat.
+
+    This is what stops an SDK retry of its original body (which never named collect) from undoing an operator's
+    Stop: the exact-repeat branch does not SET collect at all, so whatever the operator stored survives.
+    """
+    request = AssetDatasetStoreCreate(
+        **create_request(end=None).model_dump(exclude={'expiry_type', 'update_type'}),
+        expiry_type=ExpiryType.ROLLING,
+        update_type=update_type,
+    )
+    assert await _bound_conflict(request) == (FEBRUARY, KEPT, True)
+    assert await _bound_conflict(request, collect=None) == (FEBRUARY, KEPT, True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('collect', [True, False], ids=['true', 'false'])
+@pytest.mark.parametrize('update_type', [UpdateType.DAILY, UpdateType.STREAM], ids=str)
+async def test_a_subscription_create_and_exact_repeat_write_an_explicit_collect_from_the_body(update_type, collect):
+    """POST /store: an EXPLICIT collect is INSERTed on a create and SET on an exact repeat, true and false alike.
+
+    Explicit false is not omitted: it stops the subscription. Explicit true resumes a stopped one.
+    """
+    request = AssetDatasetStoreCreate(
+        **create_request(end=None).model_dump(exclude={'expiry_type', 'update_type'}),
+        expiry_type=ExpiryType.ROLLING,
+        update_type=update_type,
+    )
+    assert await _bound_conflict(request, collect=collect) == (FEBRUARY, collect, collect)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('collect', [True, False, None], ids=['true', 'false', 'omitted'])
+async def test_the_refresh_upsert_never_writes_collect_on_a_conflict(collect):
+    """preserve_lifecycle (the system caller) refreshes updated_at only: an operator's stop is never undone.
+
+    Whatever collect it is handed: the refresh path passes none, and even an explicit one must not reach its SET.
+    """
+    db = FakeSession(FakeResult([(uuid4(),)]))
+    await crud.upsert_entry_in_transaction(db, _daily_request(), preserve_lifecycle=True, collect=collect)
+    clause = _do_update_clause(_sql(_only(db.statements, 'INSERT')))
+    assert clause == 'updated_at = now()', clause
+
+
+@pytest.mark.asyncio
+async def test_a_daily_repeat_without_expiry_clears_the_expiry_and_only_an_explicit_collect_decides_retired():
+    """DAILY (decision tj-hhy3dk): the repeat's expiry is only the deletion date; an explicit collect decides RETIRED.
+
+    tj-grna9p.105 still holds for the expiry: a repeat without one writes NULL over it. What changed with
+    tj-grna9p.175 is what that means: an expiry retires nothing, so neither setting nor clearing it changes the
+    health. collect follows the tj-hhy3dk addendum (tj-grna9p.189): a repeat that omits it leaves the stored intent,
+    so a stopped subscription stays RETIRED, and only an explicit value flips it.
+
+    The health is computed by the real freshness function from the value the row holds after each repeat, so the
+    claim is the chain: what the POST writes (or leaves) is what the health reads.
+    """
+    request = _daily_request()
     now = datetime(2026, 3, 4, 21, tzinfo=UTC)  # a Wednesday after the close, well after start
     calendar = calendar_for_source(DataSource.ALPACA_API)
 
-    def health(expiry: datetime | None) -> FreshnessStatus:
+    def health(collect: bool | None) -> FreshnessStatus:
         return evaluate_dataset(
             update_type=UpdateType.DAILY,
             granularity=Granularity.ONE_DAY,
-            expiry=expiry,
-            start=retired.start,
+            collect=collect,
+            start=request.start,
             end=now,
             last_bar=now - timedelta(days=1),
             covered=None,
@@ -442,16 +524,25 @@ async def test_a_daily_repeat_without_expiry_clears_the_expiry_and_brings_a_reti
             now=now,
         ).status
 
-    stored_first = await _bound_conflict_expiry(retired)
-    assert stored_first == FEBRUARY
-    assert health(stored_first) is FreshnessStatus.RETIRED, 'the control: a DAILY dataset with an expiry is retired'
+    def after(stored: bool, written: bool | str) -> bool:
+        return stored if written == KEPT else written
 
-    stored_after_repeat = await _bound_conflict_expiry(_without_expiry(retired))
-    assert stored_after_repeat is None, 'a DAILY repeat without an expiry kept the stored expiry'
-    assert health(stored_after_repeat) is not FreshnessStatus.RETIRED, (
-        'a retired DAILY dataset re-POSTed without an expiry still reads RETIRED; the ruling '
-        '(tj-grna9p.105) is that the repeat clears the expiry and the subscription is live again'
-    )
+    expiry, collect, _ = await _bound_conflict(request, collect=False)
+    assert (expiry, collect) == (FEBRUARY, False)
+    assert health(after(True, collect)) is FreshnessStatus.RETIRED, 'the control: explicit false stops it'
+
+    expiry, collect, _ = await _bound_conflict(_without_expiry(request))
+    assert (expiry, collect) == (None, KEPT), 'a DAILY repeat without collect wrote one over the stored intent'
+    assert health(after(False, collect)) is FreshnessStatus.RETIRED, 'a repeat without collect resumed a stopped one'
+    assert health(after(True, collect)) is not FreshnessStatus.RETIRED, 'clearing the expiry stopped a collecting one'
+
+    expiry, collect, _ = await _bound_conflict(request)
+    assert (expiry, collect) == (FEBRUARY, KEPT)
+    assert health(after(True, collect)) is not FreshnessStatus.RETIRED, 'an expiry on a collecting DAILY retired it'
+
+    expiry, collect, _ = await _bound_conflict(_without_expiry(request), collect=True)
+    assert (expiry, collect) == (None, True)
+    assert health(after(False, collect)) is not FreshnessStatus.RETIRED, 'explicit true did not resume it'
 
 
 @pytest.mark.asyncio

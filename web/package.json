@@ -5,7 +5,7 @@
   "type": "module",
   "description": "trader_joe UI: Vue 3 + TypeScript + Vite static SPA (tj-x5yghe).",
   "scripts": {
-    "gen:proto": "buf generate ../proto --template buf.gen.yaml",
+    "gen:proto": "sh scripts/gen-proto.sh",
     "predev": "npm run gen:proto",
     "dev": "vite",
     "prebuild": "npm run gen:proto",

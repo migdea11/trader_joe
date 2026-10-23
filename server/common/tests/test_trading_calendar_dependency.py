@@ -7,7 +7,7 @@ on XNYS, from the package's own offline data. That `import exchange_calendars` w
 the third half and needs docker (make prod-build); it is not run here and the verdict note says so.
 
 What makes the declaration complete is test_declared_imports.py's subject, not this file's: it parametrises over
-every import the tree makes, so freshness.py's exchange_calendars import is checked there by construction, and so
+every import the tree makes, so trading_calendar.py's exchange_calendars import is checked there by construction, and so
 is its pandas import (a FINDINGS entry there until pandas is declared).
 """
 

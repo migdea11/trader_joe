@@ -8,6 +8,8 @@
 # -- which is why the networks below are referenced by the keys the base file declares. Never
 # loaded by PROD_COMPOSE, DEV_COMPOSE or data/store/run_migrations.sh, and never with the dev
 # override: the client joins no devnet, so it behaves the same against a dev stack and in CI.
+# The agent-stack MCP's run_system_tests and seed_dump load it too (tj-iee6sn.20), from its trusted copy,
+# with docker-compose.agent-client.yaml after it and --project-directory a snapshot of a worktree.
 #
 # NOT A PURE STRATEGY CLIENT. A strategy or SDK client joins store_api and nothing else, and sees
 # data_store's API only. This one also joins store_db, a documented harness-only exception: the

@@ -49,7 +49,16 @@ if config.config_file_name is not None:
 # revision id, and anything printed here is read as a revision (tj-ijpys9.19). Log, never print.
 # An ImportError propagates: a model that fails to import leaves target_metadata incomplete, so
 # carrying on would migrate/autogenerate against a partial schema.
-ALLOWED_MODELS = {'base_market_activity', 'ingest_run', 'stock_market_activity', 'store_dataset_entry'}
+ALLOWED_MODELS = {
+    'base_market_activity',
+    'dataset_deletion',
+    'dataset_override_log',
+    'dataset_read',
+    'dataset_read_daily',
+    'ingest_run',
+    'stock_market_activity',
+    'store_dataset_entry',
+}
 for model_name in ALLOWED_MODELS:
     importlib.import_module(f'data.store.app.database.models.{model_name}')  # nosem
     log.debug(f'Imported model {model_name}')

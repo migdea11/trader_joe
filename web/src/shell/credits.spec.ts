@@ -59,6 +59,12 @@ const mocks = vi.hoisted(() => ({
   listDatasets: vi.fn(),
   getDataset: vi.fn(),
   getDatasetBars: vi.fn(),
+  // The Usage tab (tj-grna9p.62) loads these on mount; they stay pending here.
+  getUsageSummary: vi.fn(),
+  getLastReadBuckets: vi.fn(),
+  getReadsPerDay: vi.fn(),
+  getStaleDatasets: vi.fn(),
+  getStorageCurrent: vi.fn(),
 }))
 // The shell opens the shared events socket on mount (tj-grna9p.76): replaced so no real WebSocket opens.
 vi.mock('@/api/events', async (importOriginal) =>
@@ -74,7 +80,11 @@ const mounted: VueWrapper[] = []
 beforeEach(() => {
   setActivePinia(createPinia())
   mocks.getUiConfig.mockResolvedValue({ allowedGroups: [AccountGroup.SIMULATION], deploymentLabel: '', serverVersion: '0.4.0' })
-  mocks.getDatasetFacets.mockResolvedValue({ all: 0n, needsAttention: 0n, sources: [], updateTypes: [], statuses: [] })
+  // `clients` is always present on a decoded DatasetFacets; the Usage sidebar (tj-grna9p.62) reads it.
+  mocks.getDatasetFacets.mockResolvedValue({ all: 0n, needsAttention: 0n, sources: [], updateTypes: [], statuses: [], clients: [] })
+  for (const usage of [mocks.getUsageSummary, mocks.getLastReadBuckets, mocks.getReadsPerDay, mocks.getStaleDatasets, mocks.getStorageCurrent]) {
+    usage.mockReturnValue(new Promise(() => undefined))
+  }
   mocks.listDatasets.mockResolvedValue({ items: [], nextCursor: '' })
   mocks.getDataset.mockRejectedValue(new ApiError({ status: 404, reason: 'NOT_FOUND' }))
   mocks.getDatasetBars.mockResolvedValue({ bars: [], nextCursor: '' })

@@ -1,18 +1,21 @@
-"""The agent stack's constants, argument validation, the snapshot, generated env files and command builders.
+"""The MCP's constants, argument validation, the worktree snapshot and the command builders of the dev and test modes.
 
-Nothing here runs Docker. The only subprocesses in this module are two read-only git plumbing calls,
-both through run_git(): `git worktree list --porcelain` and `git cat-file blob HEAD:<path>`. Every
-docker command is built here as an argument list and run by runner.py.
+Nothing here runs Docker. The only subprocess in this module is one read-only git plumbing call,
+through run_git(): `git worktree list --porcelain`. Every docker command is built here as an
+argument list and run by runner.py.
 
 THE DAEMON ONLY EVER SEES MCP-OWNED INPUTS (ADR tj-4rr0la addendum 5). The Docker daemon is root on
 the host and resolves bind-mount sources and the build context there; BuildKit reads the Dockerfile.
 A check on an agent-writable tree is always a race, so neither is ever pointed at one:
     THE SNAPSHOT. Before a verb builds or creates a container from a worktree, refresh_snapshot()
         copies the worktree's SNAPSHOT_SOURCES into <stack dir>/source, refusing any symlink or
-        special file, and --project-directory is ALWAYS that copy (compose_prefix takes no
-        worktree). The build context and every relative bind source are then MCP-owned, and the
-        checks on them (check_mount_sources, resolve_test_paths, the migrations guard) are stable.
-    THE TRUSTED DOCKERFILE. The agent-stack overlay sets build.dockerfile to TRUSTED_DOCKERFILE, the
+        special file. The snapshot serves only run_system_tests and seed_dump: it is the project
+        directory and the build context of test_client (testclient_prefix), and the checks on it
+        (check_mount_sources, resolve_test_paths) are stable. Every other verb (the dev ones,
+        test_build, test_up, migrate and migrate_status) reads no worktree and takes no snapshot: their compose files are the MCP image's
+        baked copies and their project directory is the repository's host path.
+    THE TRUSTED DOCKERFILE. The MCP-only overlays (docker-compose.agent-dev.yaml, -test.yaml and
+        -client.yaml) set build.dockerfile to TRUSTED_DOCKERFILE, the
         MCP image's own copy of the repository's Dockerfile. The worktree's Dockerfile is never read,
         so FROM, COPY --from, RUN --mount from= and a syntax= frontend are fixed: a build cannot read
         prod images, the private repository's images or any other image on the host daemon. Its
@@ -30,44 +33,31 @@ import contextlib
 import datetime
 import os
 import re
-import secrets
 import shutil
 import stat
 import subprocess  # nosec B404 -- argument lists only, never a shell; see run_git
 import threading
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 from tools.agent_mcp.seeds import MAX_BUNDLE_BYTES
-from tools.agent_mcp.settings import Settings
 
 
 class Refused(Exception):
     """A verb refuses: raised before any docker subprocess runs."""
 
 
-# ---------------------------------------------------------------------------------------------
-# THE STACK. These two mirror the Makefile's AGENT_STACK_PROJECT and AGENT_STACK_COMPOSE exactly --
-# the project name and the -f file names in the same order (base, test client, the agent-stack
-# overlay, then the fake-mode overlay AFTER it; ADR tj-4rr0la addendum 3 (3), tj-vhboky.61). A
-# validator test pins that they agree (tj-c4mosr.5).
-PROJECT = 'trader_joe_agent_stack'
-COMPOSE_FILES = (
-    'docker-compose.yaml',
-    'docker-compose.test-client.yaml',
-    'docker-compose.agent-stack.yaml',
-    'docker-compose.fake.yaml',
-)
-
-# Where the MCP image carries its OWN copies of COMPOSE_FILES (tools/agent_mcp/Dockerfile). Never the
+# Where the MCP image carries its OWN copies of the compose files (tools/agent_mcp/Dockerfile). Never the
 # worktree's: a worktree is agent-writable, and compose content from it could mount any host path,
 # add privileged: or the Docker socket -- raw compose pass-through, which ADR tj-4rr0la rejects (C).
 # --project-directory points relative paths (build contexts, bind mounts) at the snapshot instead.
 TRUSTED_COMPOSE_DIR = Path('/opt/agent_mcp/compose')
-# The MCP image's own copy of the repository's Dockerfile, which docker-compose.agent-stack.yaml names
-# as build.dockerfile for every service it builds (ADR tj-4rr0la addendum 5, ruling 2). A Dockerfile
-# change reaches the agent stack when the MCP image is rebuilt, as a compose change does.
+# The MCP image's own copy of the repository's Dockerfile, which the three MCP-only overlays
+# (docker-compose.agent-dev.yaml, -test.yaml and -client.yaml) name as build.dockerfile for what they build
+# (ADR tj-4rr0la addendum 5, ruling 2). A Dockerfile change reaches the MCP when its image is rebuilt, as a
+# compose change does.
 TRUSTED_DOCKERFILE = TRUSTED_COMPOSE_DIR / 'Dockerfile'
 # Every external image TRUSTED_DOCKERFILE names (FROM and COPY --from; stage names are not external),
 # exactly as it spells them: tag@sha256:<multi-arch index digest>. Before any build the MCP has the
@@ -90,30 +80,17 @@ GIT = '/usr/bin/git'
 # addendum 1 (b)).
 DOCKER_HOST = 'tcp://socket_proxy:2375'
 
-SERVICES = ('postgres', 'data_store', 'data_ingest')
-# Built by stack_up; test_client is rebuilt by run_system_tests' own `run --build` as well. Exactly
-# the services with a build: key in COMPOSE_FILES, so builds() also reads it: a `run` of one of them
-# builds its image when it is missing.
+# Test mode's built services (data_store and data_ingest) and the system-test client; builds() reads it: a
+# `run` of one of them builds its image when it is missing.
 BUILT_SERVICES = ('data_store', 'data_ingest', 'test_client')
-# The long-running SERVICES with a snapshot bind: exactly those whose merged model under
-# COMPOSE_FILES has a bind mount with a relative source, resolved in the SNAPSHOT (data_store's
-# alembic.ini and migrations, data_ingest's tests/fakes in fake mode). refresh_snapshot() swaps the
-# snapshot by rename and removes the old generation, so a running container's binds point at a
-# removed directory after any refresh, and a plain `up` recreates only on an image or config
-# change. stack_up therefore force-recreates these on every call, so the long-running services run
-# the code of the LAST stack_up (tj-zgq5v2). A validator test pins the equality by parsing those
-# files, so a new bind into a long-running service without an entry goes red.
-SNAPSHOT_BOUND_SERVICES = ('data_store', 'data_ingest')
 TAIL_DEFAULT = 200
 TAIL_MAX = 2000
 MAX_TEST_PATHS = 50
-# The whole stack's --wait budget, as prod-launch's: room above data_store's 60s start_period.
-WAIT_TIMEOUT_SECONDS = 300
 
 # ---------------------------------------------------------------------------------------------
 # THE USER'S OWN DEV COMPOSE PROJECT -- READ ONLY, TWO VERBS (tj-kzy7w2; user ruling on tj-wpnr7o (b),
 # recorded on tj-izzqub addendum 1; ADR tj-4rr0la addendum 18). This is the ONE place in the server
-# that names a project other than PROJECT, and everything below exists to keep it that way.
+# that names a compose project, DEV_PROJECT, and everything below exists to keep it that way.
 #
 # WHY IT IS HERE. An agent already reaches the user's dev services by name over devnet (ADR tj-q9ae5u
 # item 3) but cannot see WHY one is unhealthy; logs and container state were the one diagnostic still
@@ -132,20 +109,55 @@ WAIT_TIMEOUT_SECONDS = 300
 # property of the argv rather than of the builders that produce it.
 #
 # THE PROJECT NAME IS A CONSTANT, never an argument and never derived from anything an agent writes.
-# The dev targets pass no -p (Makefile, DEV_COMPOSE), so their project is compose's default: the
-# checkout directory's name, which is trader_joe in this repository (.devcontainer/compose.yml's
-# header states the same spelling for the repo directory). A checkout under another directory name
-# simply has no containers under this project and the verb says so -- it cannot reach a different one.
-#
-# WHAT THIS DOES NOT PROVE, stated because a comment that overclaims is worse than none: prod-launch
-# passes no -p either, so a prod stack brought up from a checkout ALSO named trader_joe is the same
-# compose project as dev and these two verbs would read it. Read-only, and only on that one host, but
-# real -- ADR tj-4rr0la addendum 18 records it, and giving prod its own explicit project name is the
-# fix, which is an ops change outside this task.
-DEV_PROJECT = 'trader_joe'
-# The long-running services of the dev pair (docker-compose.yaml plus docker-compose.override.yaml).
-# pgAdmin lives in docker-compose.tools.yaml, a file no verb here loads, and is deliberately absent.
-DEV_SERVICES = ('postgres', 'data_store', 'data_ingest')
+# Dev and test run as the explicit compose project trader_joe_dev (Makefile -p; ADR tj-4rr0la
+# addendum 29, decision tj-oxxl8a option A). PROD keeps compose's default project (the checkout
+# directory's name) and no MCP command ever names it: no argv, lookup filter, pinned
+# COMPOSE_PROJECT_NAME or text here uses the bare name. A prod stack therefore sits in a different
+# project from everything these verbs reach, and the mode guard below stays as defence in depth.
+DEV_PROJECT = 'trader_joe_dev'
+# The long-running services of the dev set (docker-compose.yaml, the override and the web files).
+# pgAdmin lives in docker-compose.tools.yaml, a file no log or ps verb loads, and is deliberately absent.
+DEV_SERVICES = ('postgres', 'data_store', 'data_ingest', 'web')
+# THE FILE-BASED DEV SET (ADR tj-4rr0la addendum 23; tj-iee6sn.5), for the verbs that build or create
+# containers. The Makefile's DEV_COMPOSE -f list, in its order, then the MCP-only overlay LAST so its
+# build.dockerfile wins. These are names; dev_file_prefix() resolves each one in TRUSTED_COMPOSE_DIR, the
+# copies baked into the MCP image, never the checkout's own. A validator test pins the first four equal
+# to DEV_COMPOSE, so a file added to or reordered in the Makefile turns it red.
+DEV_COMPOSE_FILES = (
+    'docker-compose.yaml',
+    'docker-compose.override.yaml',
+    'docker-compose.web.yaml',
+    'docker-compose.web.dev.yaml',
+    'docker-compose.agent-dev.yaml',
+)
+# tools' set: the Makefile's TOOLS_COMPOSE (the first four plus the tools file, pgAdmin and nothing
+# else), then the MCP-only overlay last.
+DEV_TOOLS_COMPOSE_FILE = 'docker-compose.tools.yaml'
+DEV_TOOLS_COMPOSE_FILES = (*DEV_COMPOSE_FILES[:-1], DEV_TOOLS_COMPOSE_FILE, DEV_COMPOSE_FILES[-1])
+# TEST MODE's sets (ADR tj-4rr0la addendum 27; tj-iee6sn.24). TEST_COMPOSE_FILES is the Makefile's
+# SYSTEM_COMPOSE list, base then the fake-mode overlay (which names the :test image tags), for test_up.
+# TEST_BUILD_COMPOSE_FILES adds the MCP-only overlay LAST, which sets build.dockerfile for data_store and
+# data_ingest alone, for test_build. Neither set holds the override, the web files or the tools file.
+TEST_COMPOSE_FILES = ('docker-compose.yaml', 'docker-compose.fake.yaml')
+TEST_OVERLAY_FILE = 'docker-compose.agent-test.yaml'
+TEST_BUILD_COMPOSE_FILES = (*TEST_COMPOSE_FILES, TEST_OVERLAY_FILE)
+# THE SYSTEM-TEST CLIENT's set (run_system_tests, seed_dump; tj-iee6sn.20): the Makefile's
+# TEST_CLIENT_COMPOSE (the base file and the client file), then the MCP-only overlay LAST, which sets
+# test_client's build.dockerfile alone. It holds no fake file: only test_client is run from it, against the
+# services test_up started.
+SYSTEM_CLIENT_FILE = 'docker-compose.test-client.yaml'
+SYSTEM_CLIENT_OVERLAY_FILE = 'docker-compose.agent-client.yaml'
+SYSTEM_CLIENT_COMPOSE_FILES = (TEST_COMPOSE_FILES[0], SYSTEM_CLIENT_FILE, SYSTEM_CLIENT_OVERLAY_FILE)
+# The Makefile's TEST_DATA_DIR. Pinned in the step env of test_up and test_build ONLY (process env
+# outranks the project's .env), never of a dev verb: DEV keeps the owner's own DATA_DIR.
+TEST_DATA_DIR = './volume_data/test'
+# The trusted copies of the scripts the dev verbs run, in a tools/ directory beside the trusted
+# Dockerfile (tools/agent_mcp/Dockerfile): dev_instance_secret.sh resolves the dev web container's
+# INSTANCE_WRITE_SECRET, source_digest.sh computes the source stamp.
+TRUSTED_DEV_INSTANCE_SECRET = TRUSTED_COMPOSE_DIR / 'tools' / 'dev_instance_secret.sh'
+TRUSTED_SOURCE_DIGEST = TRUSTED_COMPOSE_DIR / 'tools' / 'source_digest.sh'
+# The third baked script: the content stamp of the generated protobuf code (tj-iee6sn.33).
+TRUSTED_PROTO_DIGEST = TRUSTED_COMPOSE_DIR / 'tools' / 'proto_digest.sh'
 # The only compose subcommands a dev verb may spell. Both are read-only: `ps` lists the project's
 # containers, `logs` prints what they already wrote. Nothing is added here without the ADR addendum
 # that allowing it would need.
@@ -214,54 +226,9 @@ SYSTEM_TESTS_DIR = 'tests/system'
 MIGRATION_VERSIONS_DIR = 'server/data/store/migrations/versions'
 
 # ---------------------------------------------------------------------------------------------
-# THE STACK DIRECTORY (settings.stack_dir; ADR tj-4rr0la addenda 1 (d) and 2).
-ROOT_ENV_NAME = 'agent_stack.env'
-STORE_ENV_NAME = 'agent_stack_store.env'
-INGEST_ENV_NAME = 'agent_stack_ingest.env'
-DATA_DIR_NAME = 'data'
+# THE STACK DIRECTORY (settings.stack_dir; ADR tj-4rr0la addenda 1 (d) and 5): the snapshot and the audit log.
 AUDIT_LOG_NAME = 'audit.log'
-# The worktree NAME the last stack_up used, re-resolved on every read.
-STATE_FILE_NAME = 'stack_worktree'
 
-# The committed defaults each generated file starts from, read from the main checkout's HEAD with
-# git cat-file -- never a working-tree file, so no live env file is ever opened.
-# Paths into the checkout, read from HEAD with git cat-file: the root template stays at the top of
-# the repository, the two service templates travel with their trees (tj-iontkq.4).
-ENV_DEFAULT_SOURCES = {
-    'root': '.env.default',
-    'store': 'server/data/store/.env.default',
-    'ingest': 'server/data/ingest/.env.default',
-}
-ENV_FILE_NAMES = {'root': ROOT_ENV_NAME, 'store': STORE_ENV_NAME, 'ingest': INGEST_ENV_NAME}
-ENV_FILE_VARIABLES = {'root': 'ROOT_ENV_FILE', 'store': 'STORE_ENV_FILE', 'ingest': 'INGEST_ENV_FILE'}
-
-# The agent stack's own names, each distinct from the user's (.env.default: db,
-# trader_joe_store_api).
-AGENT_DATABASE_NAME = 'trader_joe_agent_stack_postgres'
-AGENT_STORE_API_NETWORK = 'trader_joe_agent_stack_store_api'
-
-# Set in the ROOT generated file only (tj-c4mosr.3, F1 note). env_file order is root then service
-# file, so a service-file value would silently win in the container while compose interpolated the
-# root one: DATABASE_NAME would name one host in container_name and another in the apps'
-# environment. The secrets and paths follow the same rule so each has one value in one file.
-ROOT_ONLY_VARIABLES = (
-    'DATABASE_NAME',
-    'STORE_API_NETWORK',
-    'DATA_DIR',
-    'POSTGRES_PASS',
-    'INSTANCE_WRITE_SECRET',
-    'ROOT_ENV_FILE',
-    'STORE_ENV_FILE',
-    'INGEST_ENV_FILE',
-)
-BROKER_CREDENTIALS = ('ALPACA_API_KEY', 'ALPACA_API_SECRET')
-# Keys that steer compose or the docker CLI rather than the stack: compose reads COMPOSE_* (the file
-# list, the project name, the profiles) from the --env-file itself. The committed defaults come from a
-# HEAD agents can move, so such a key is REFUSED, at generation and by guard 2 -- never dropped, which
-# would hide a committed change that tries to steer compose.
-STEERING_PREFIXES = ('COMPOSE_', 'DOCKER_')
-
-_ENV_LINE = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)=(.*)$')
 _WORKTREE_NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$')
 # seed_dump's --date: ASCII digits only (\d would take any Unicode digit), then a real calendar date.
 _SEED_DATE = re.compile(r'^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
@@ -343,12 +310,6 @@ def list_worktrees(repo_root: Path) -> dict[str, Path]:
     for name in ambiguous:
         del named[name]
     return named
-
-
-def all_worktree_paths(repo_root: Path) -> list[Path]:
-    """Every worktree path git knows, usable or not, resolved -- for the under-no-worktree check."""
-    entries = parse_worktree_porcelain(run_git(repo_root, ['worktree', 'list', '--porcelain']))
-    return [Path(os.path.realpath(path)) for path, _ in entries] + [repo_root]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -443,13 +404,6 @@ def check_seed_date(value: object) -> str | None:
     return value
 
 
-def validate_service(service: object) -> str:
-    """Service must be one of the closed set SERVICES."""
-    if not isinstance(service, str) or service not in SERVICES:
-        raise Refused(f'service must be one of: {", ".join(SERVICES)}')
-    return service
-
-
 def clamp_tail(tail: object) -> int:
     """An integer, clamped to 1..TAIL_MAX."""
     if isinstance(tail, bool) or not isinstance(tail, int):
@@ -470,257 +424,10 @@ def validate_dev_service(service: object) -> str:
 
 
 # ---------------------------------------------------------------------------------------------
-# THE GENERATED ENV FILES (tj-c4mosr.3 item 3 as amended; ADR tj-4rr0la addendum 2).
-def parse_env_text(text: str) -> dict[str, str]:
-    """KEY=VALUE lines, in order; comments, blanks and anything else are dropped. Values verbatim."""
-    values: dict[str, str] = {}
-    for line in text.splitlines():
-        match = _ENV_LINE.match(line.strip())
-        if match:
-            values[match.group(1)] = match.group(2)
-    return values
-
-
-def env_line_keys(text: str) -> list[str]:
-    """Every key a line of TEXT could set, in the looser spellings compose's own parser also takes.
-
-    parse_env_text() keeps only strict KEY=VALUE lines; compose also reads `export KEY=VALUE`,
-    `KEY = VALUE` and `KEY: VALUE`. Guard 2's steering-key check reads keys through this, so a
-    spelling parse_env_text drops cannot slip a COMPOSE_ key past it.
-    """
-    keys = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith('#'):
-            continue
-        stripped = re.sub(r'^export\s+', '', stripped)
-        keys.append(re.split(r'[=:]', stripped, maxsplit=1)[0].strip())
-    return keys
-
-
-def render_env(values: Mapping[str, str]) -> str:
-    """Render an env file. Refuses a value that would break the one-line-per-variable format."""
-    lines = [
-        '# GENERATED by the agent-stack MCP (tools/agent_mcp, ADR tj-4rr0la addendum 2). The agent',
-        "# stack's own env: never the user's. Deleting the stack directory regenerates it.",
-    ]
-    for key, value in values.items():
-        if '\n' in value or '\r' in value:
-            raise Refused(f'{key} holds a line break; refusing to write it')
-        lines.append(f'{key}={value}')
-    return '\n'.join(lines) + '\n'
-
-
-def refuse_steering_keys(source: str, values: Mapping[str, str]) -> None:
-    """Refuse when SOURCE sets a key that steers compose or the docker CLI (STEERING_PREFIXES)."""
-    steering = sorted(key for key in values if key.startswith(STEERING_PREFIXES))
-    if steering:
-        raise Refused(f'{source} sets {", ".join(steering)}, which would steer compose; refusing')
-
-
-def read_committed_defaults(repo_root: Path) -> dict[str, dict[str, str]]:
-    """The three committed .env.default files, read from the main checkout's HEAD commit."""
-    return {
-        kind: parse_env_text(run_git(repo_root, ['cat-file', 'blob', f'HEAD:{source}']))
-        for kind, source in ENV_DEFAULT_SOURCES.items()
-    }
-
-
-def env_file_paths(stack_dir: Path) -> dict[str, Path]:
-    """The three generated env files' absolute paths, by kind."""
-    return {kind: stack_dir / name for kind, name in ENV_FILE_NAMES.items()}
-
-
-def build_env_values(stack_dir: Path, defaults: Mapping[str, Mapping[str, str]]) -> dict[str, dict[str, str]]:
-    """The three files' contents: the committed defaults with the agent stack's overrides.
-
-    Root: every committed root variable, then random POSTGRES_PASS and INSTANCE_WRITE_SECRET, the
-    agent stack's DATABASE_NAME, STORE_API_NETWORK and DATA_DIR, and the three
-    *_ENV_FILE paths. Store and ingest: their committed variables, less every ROOT_ONLY_VARIABLES
-    name. ALPACA_API_KEY and ALPACA_API_SECRET present and EMPTY in the ingest file only.
-
-    Refuses when any committed default's key starts with one of STEERING_PREFIXES.
-    """
-    for kind, values in defaults.items():
-        refuse_steering_keys(ENV_DEFAULT_SOURCES.get(kind, kind), values)
-    paths = env_file_paths(stack_dir)
-    root = {k: v for k, v in defaults['root'].items() if k not in BROKER_CREDENTIALS}
-    root.update(
-        # Hex, as .env.default asks: these land unencoded in DATABASE_URI.
-        POSTGRES_PASS=secrets.token_hex(24),
-        INSTANCE_WRITE_SECRET=secrets.token_hex(32),
-        DATABASE_NAME=AGENT_DATABASE_NAME,
-        STORE_API_NETWORK=AGENT_STORE_API_NETWORK,
-        DATA_DIR=str(stack_dir / DATA_DIR_NAME),
-        ROOT_ENV_FILE=str(paths['root']),
-        STORE_ENV_FILE=str(paths['store']),
-        INGEST_ENV_FILE=str(paths['ingest']),
-    )
-    dropped = set(ROOT_ONLY_VARIABLES) | set(BROKER_CREDENTIALS)
-    store = {k: v for k, v in defaults['store'].items() if k not in dropped}
-    ingest = {k: v for k, v in defaults['ingest'].items() if k not in dropped}
-    ingest.update(dict.fromkeys(BROKER_CREDENTIALS, ''))
-    return {'root': root, 'store': store, 'ingest': ingest}
-
-
-def _write_private(path: Path, text: str) -> None:
-    """Write a 0600 file atomically: a temporary beside it, then a rename over any old one."""
-    temporary = path.with_name(f'.{path.name}.tmp')
-    temporary.unlink(missing_ok=True)
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(descriptor, 'w') as handle:
-        handle.write(text)
-    os.replace(temporary, path)
-
-
-def ensure_env_files(settings: Settings) -> Path:
-    """Generate the three env files at first use; afterwards reuse them. Returns the root one.
-
-    The secrets live in the root file only, and it is written LAST, so its presence means the set is
-    complete. A missing store or ingest file is rewritten from the committed defaults (it holds no
-    secret); the root file is never regenerated while it exists, because Postgres keeps the password
-    it was initialised with.
-    """
-    paths = env_file_paths(settings.stack_dir)
-    if paths['root'].exists() and paths['store'].exists() and paths['ingest'].exists():
-        return paths['root']
-    values = build_env_values(settings.stack_dir, read_committed_defaults(settings.repo_root))
-    for kind in ('store', 'ingest'):
-        if not paths[kind].exists():
-            _write_private(paths[kind], render_env(values[kind]))
-    if not paths['root'].exists():
-        _write_private(paths['root'], render_env(values['root']))
-    return paths['root']
-
-
-def read_env_file(path: Path) -> dict[str, str]:
-    """Read one generated env file. It must be a regular file, not a symlink."""
-    if path.is_symlink() or not path.is_file():
-        raise Refused(f'{path.name} is missing, or is not a regular file')
-    return parse_env_text(path.read_text())
-
-
-def check_env_file_paths(settings: Settings, worktree_paths: Sequence[Path]) -> Path:
-    """GUARD 2 of ADR tj-4rr0la addendum 2 -- runs before ANY docker subprocess of every verb.
-
-    Refuses unless ROOT_ENV_FILE, STORE_ENV_FILE and INGEST_ENV_FILE in the root generated file are
-    each an absolute path, free of symlinks, of an existing regular file directly inside the agent
-    stack's own directory, and under no worktree (the base file's defaults resolve to the user's
-    live env files, and the MCP container can see the main checkout). Also refuses unless
-    ROOT_ENV_FILE is the --env-file itself; DATA_DIR is the stack directory's data/; DATABASE_NAME
-    and STORE_API_NETWORK carry the agent stack's names and appear in the root file
-    only (the F1 rule); ALPACA_API_KEY and ALPACA_API_SECRET are present and empty in the ingest
-    file and absent from the other two. And refuses when any of the three files sets a key starting
-    COMPOSE_ or DOCKER_ (STEERING_PREFIXES): compose reads COMPOSE_* from the --env-file, so an edited
-    file could change the -f list or the project. Returns the root file's path for --env-file.
-    """
-    paths = env_file_paths(settings.stack_dir)
-    root_values = read_env_file(paths['root'])
-    for kind, path in paths.items():
-        read_env_file(path)  # a regular file, not a symlink, before its raw text is read
-        refuse_steering_keys(ENV_FILE_NAMES[kind], dict.fromkeys(env_line_keys(path.read_text()), ''))
-    for kind, variable in ENV_FILE_VARIABLES.items():
-        raw = root_values.get(variable, '')
-        if not raw or not os.path.isabs(raw):
-            raise Refused(f'{variable} must be set to an absolute path')
-        resolved = Path(os.path.realpath(raw))
-        if str(resolved) != raw or resolved.parent != settings.stack_dir or resolved != paths[kind]:
-            raise Refused(f"{variable} must name the agent stack's own {ENV_FILE_NAMES[kind]}, with no symlink")
-        if any(_within(resolved, worktree) for worktree in worktree_paths):
-            raise Refused(f'{variable} lies under a worktree')
-        if resolved.is_symlink() or not resolved.is_file():
-            raise Refused(f'{variable} does not name a regular file')
-    if root_values.get('DATA_DIR') != str(settings.stack_dir / DATA_DIR_NAME):
-        raise Refused("DATA_DIR must be the agent stack's own data directory")
-    expected_names = {'DATABASE_NAME': AGENT_DATABASE_NAME, 'STORE_API_NETWORK': AGENT_STORE_API_NETWORK}
-    for variable, expected in expected_names.items():
-        if root_values.get(variable) != expected:
-            raise Refused(f"{variable} must be the agent stack's own name, {expected}")
-    for kind in ('store', 'ingest'):
-        values = read_env_file(paths[kind])
-        leaked = [name for name in ROOT_ONLY_VARIABLES if name in values]
-        if leaked:
-            raise Refused(f'{ENV_FILE_NAMES[kind]} sets {", ".join(leaked)}, which belong in the root file only')
-    for kind in ('root', 'store'):
-        values = root_values if kind == 'root' else read_env_file(paths[kind])
-        if any(name in values for name in BROKER_CREDENTIALS):
-            raise Refused(f'{ENV_FILE_NAMES[kind]} sets a broker credential variable')
-    ingest_values = read_env_file(paths['ingest'])
-    if any(ingest_values.get(name, None) != '' for name in BROKER_CREDENTIALS):
-        raise Refused(f'{INGEST_ENV_NAME} must carry ALPACA_API_KEY and ALPACA_API_SECRET, empty')
-    return paths['root']
-
-
-# ---------------------------------------------------------------------------------------------
-# THE DATA DIRECTORY (stack_wipe; tj-c4mosr.3 item 5).
-def check_data_dir(settings: Settings) -> Path | None:
-    """The agent stack's data directory, checked; None when it does not exist yet.
-
-    Refuses when the path is a symlink, when resolving it gives anything but the configured absolute
-    path (a symlink anywhere above it), or when it is not a directory.
-    """
-    expected = settings.stack_dir / DATA_DIR_NAME
-    if expected.is_symlink():
-        raise Refused('the data directory is a symlink; refusing to delete anything')
-    if not expected.exists():
-        return None
-    if Path(os.path.realpath(expected)) != expected or not expected.is_dir():
-        raise Refused('the data directory does not resolve to its configured path; refusing to delete anything')
-    return expected
-
-
-def is_plain_dir(path: Path) -> bool:
-    """True when PATH is a directory itself, by lstat: a symlink to a directory is not one, nor is a missing path.
-
-    stack_wipe clears only these service mounts (ADR tj-4rr0la addendum 6, INFO): the daemon would
-    follow a data/<service> link as root, so a link is left for remove_data_dir to report as 'failed'.
-    """
-    try:
-        return stat.S_ISDIR(os.lstat(path).st_mode)
-    except FileNotFoundError:
-        return False
-
-
-def remove_data_dir(settings: Settings) -> list[str]:
-    """Re-check, then remove the data directory, which the clear steps have emptied. Returns what is left.
-
-    os.rmdir only, never a tree walk: Postgres leaves its data directory owned by its own uid with
-    mode 0700, which the server's user cannot open but, owning the parent, can remove once it is
-    empty. So each DATA_MOUNTS service directory is removed, then the data directory itself. Anything
-    that will not go -- a directory the clear step left non-empty, a symlink, an unexpected entry --
-    is returned by its path under the stack directory, the data kept; an empty list means removed
-    (or never there). The caller reports a non-empty list as 'failed', never as an error.
-    """
-    checked = check_data_dir(settings)
-    if checked is None:
-        return []
-    remaining = []
-    for service, _ in DATA_MOUNTS:
-        entry = checked / service
-        if not entry.is_symlink() and not entry.exists():
-            continue
-        try:
-            os.rmdir(entry)  # refuses a symlink (ENOTDIR) and a non-empty directory alike
-        except OSError:
-            remaining.append(f'{DATA_DIR_NAME}/{service}')
-    if remaining:
-        return remaining
-    try:
-        os.rmdir(checked)
-    except OSError:
-        try:
-            left = sorted(os.listdir(checked))
-        except OSError:
-            left = []
-        return [f'{DATA_DIR_NAME}/{name}' for name in left] or [DATA_DIR_NAME]
-    return []
-
-
-# ---------------------------------------------------------------------------------------------
 # THE SNAPSHOT (ADR tj-4rr0la addendum 5, ruling 1). PREMISE, named: nothing but the MCP writes under
 # the stack directory. settings.load_settings refuses a stack directory inside or containing the
-# repository or AGENT_HOME_PATH (the devcontainer mounts both), and the agent stack's containers get
-# no writable bind into the snapshot (the overlay mounts data_store's sources :ro).
+# repository or AGENT_HOME_PATH (the devcontainer mounts both), and test_client gets no writable bind
+# into the snapshot (its mounts are read-only).
 #
 # One snapshot operation at a time, across threads: a verb that timed out leaves its copy thread
 # running until it next checks its cancel event, and the next verb's copy must not interleave with it.
@@ -733,8 +440,8 @@ _COPY_CHUNK = 1024 * 1024
 def _make_snapshot_dir(path: Path, *, parents: bool = False) -> None:
     """Create a snapshot directory 0755, whatever the umask.
 
-    World-readable on purpose: the agent stack's containers read the snapshot through bind mounts
-    as their own users (appuser, not the MCP's), and BuildKit sends it as the build context. It holds
+    World-readable on purpose: test_client reads the snapshot through bind mounts
+    as its own user (appuser, not the MCP's), and BuildKit sends it as the build context. It holds
     only the worktree's own source, which the agent can already read; live env files are never
     copied (_skipped_file).
 
@@ -977,69 +684,43 @@ def refresh_snapshot(stack_dir: Path, worktree: Path, cancel: threading.Event | 
     return live
 
 
-def ensure_snapshot(stack_dir: Path) -> Path:
-    """The existing snapshot, or an empty one when there is none. Reads no worktree.
-
-    For the verbs that build and mount nothing from source (stack_down, stack_wipe, logs, ps): compose
-    still needs a project directory, and it is always the snapshot.
-    """
-    live = snapshot_dir(stack_dir)
-    with _SNAPSHOT_LOCK:
-        if live.is_symlink() or (live.exists() and not live.is_dir()):
-            _remove_generation(live)
-        if not live.exists():
-            _make_snapshot_dir(live)
-    return live
-
-
 # ---------------------------------------------------------------------------------------------
-# COMMANDS. Every docker command starts with compose_prefix(): the fixed project, the SNAPSHOT as the
-# project directory, the generated --env-file, then the trusted -f files in COMPOSE_FILES order. The
-# builders take the stack directory, never a worktree: no compose argv carries a repository path.
+# COMMANDS. Every docker command is built here as an argument list: the dev and test-mode builders start
+# from dev_compose_prefix() (project DEV_PROJECT, the trusted -f files, the repository's host path as the
+# project directory), the system-test client from testclient_prefix() (the snapshot as the project
+# directory). The builders take the stack directory, never a worktree: no compose argv carries a
+# repository path an agent chose.
 @dataclass(frozen=True)
 class Step:
     """One subprocess: its argument list and the directory it runs in (the snapshot).
 
     builds is True for a step that CAN build an image from TRUSTED_DOCKERFILE -- compose builds a
-    missing image on up/run without --build (ADR tj-4rr0la addendum 15). _steps() sets it from the
+    missing image on up/run without --build (ADR tj-4rr0la addendum 15). the step builders set it from the
     compose command (builds()), so no builder can add a build without it; the runner makes BASE_IMAGES
     present before the first such step of a verb and never runs it when a base could not be pulled.
 
     stdout_cap, when set, marks the step's stdout as DATA rather than output (seed_dump's bundle):
     the runner reads it in full up to stdout_cap bytes plus one -- not under the OUTPUT_CAP_BYTES
     tail rule -- and withholds it from the response and the audit line.
+
+    env, when set, is merged over the runner's fixed environment for THIS step only (the dev
+    lifecycle's pinned variables, dev_pinned_step_env). It is never rendered into the recorded
+    command and never audited. Pairs, not a dict, so a Step stays hashable.
     """
 
     argv: tuple[str, ...]
     cwd: Path
     builds: bool = False
     stdout_cap: int | None = None
-
-
-def compose_prefix(stack_dir: Path, root_env_file: Path) -> list[str]:
-    """The prefix: docker compose -p PROJECT --project-directory <stack_dir>/source --env-file <root> -f <each>."""
-    project_directory = str(snapshot_dir(stack_dir))
-    prefix = [
-        DOCKER,
-        'compose',
-        '-p',
-        PROJECT,
-        '--project-directory',
-        project_directory,
-        '--env-file',
-        str(root_env_file),
-    ]
-    for name in COMPOSE_FILES:
-        prefix += ['-f', str(TRUSTED_COMPOSE_DIR / name)]
-    return prefix
+    env: tuple[tuple[str, str], ...] = ()
 
 
 def builds(tail: Sequence[str]) -> bool:
-    """Whether a compose command (the words after compose_prefix) CAN build.
+    """Whether a compose command (the words after the project prefix) CAN build.
 
     compose builds a missing image on up/run without --build, so this is: `build`; any `--build`;
     `up`, always (an `up` naming no service builds every one); or a `run` naming a BUILT_SERVICES
-    service (postgres is image-only, so stack_wipe's clear runs stay base-free). A word
+    service (postgres is image-only, so a run of it stays base-free). A word
     that matches by coincidence costs an extra inspect, the safe direction.
     """
     if not tail:
@@ -1050,11 +731,6 @@ def builds(tail: Sequence[str]) -> bool:
         or '--build' in tail
         or (first == 'run' and any(word in BUILT_SERVICES for word in tail))
     )
-
-
-def _steps(stack_dir: Path, root_env_file: Path, *tails: Sequence[str]) -> list[Step]:
-    prefix = compose_prefix(stack_dir, root_env_file)
-    return [Step(tuple(prefix + list(tail)), snapshot_dir(stack_dir), builds(tail)) for tail in tails]
 
 
 # THE BASES. Plain docker commands, not compose: through the same socket proxy (DOCKER_HOST in the
@@ -1071,122 +747,109 @@ def base_pull_step(ref: str, cwd: Path) -> Step:
     return Step((DOCKER, 'pull', ref), cwd)
 
 
-def stack_up_steps(stack_dir: Path, root_env_file: Path) -> list[Step]:
-    """Build the images from the snapshot, start the infrastructure, then force-recreate the app services.
+# THE SYSTEM-TEST CLIENT (run_system_tests, seed_dump; tj-iee6sn.20; ADR tj-4rr0la addenda 26-27). Both
+# verbs run test_client of the ONE project, in TEST mode: the services are the :test images test_up
+# started from the root checkout, and the client and every mount it has come from the SNAPSHOT of the named
+# worktree, so a worktree's unintegrated tests and code reach the client. The command is
+#   docker compose -p trader_joe_dev --project-directory <snapshot> --env-file <repo host path>/.env
+#   -f <trusted base> -f <trusted client file> -f <trusted client overlay> <tail>
+# No secret wrapper: test_up starts data_store unwrapped, so its INSTANCE_WRITE_SECRET is the root env
+# file's value as compose interpolates it, and the client interpolates the same file the same way -- the
+# two always agree, and a blank value fails conftest's clear missing-variable check instead of a 401. The
+# secret is on no command line. The --env-file is a fixed word of THIS prefix: every other check refuses
+# it, and check_testclient_argv accepts it here and nowhere else. The step env pins the redirecting
+# variables and points the three service env-file variables at /dev/null (the client reads no env file,
+# and the snapshot holds none); it carries no DATA_DIR and no placeholder, so the client never sees the
+# test data directory and the real credentials come from --env-file alone.
+SYSTEM_CLIENT_BUILD_TAIL = ('build', 'test_client')
+SYSTEM_TESTS_RUN_HEAD = ('run', '--rm', '--no-deps', '--build', 'test_client')
 
-    Three steps. The plain `up` of the services with no snapshot bind (postgres) recreates
-    them only on a config change, so their data is not re-created on every call.
-    The last `up` force-recreates SNAPSHOT_BOUND_SERVICES so their binds resolve in the snapshot just
-    refreshed, and creates each once per stack_up; --no-deps is safe because the step before already
-    waited for the infrastructure healthy. Both `up` steps can build (builds()), so the runner's
-    BASE_IMAGES check still runs before the first building step (ADR tj-4rr0la addenda 14-15).
+
+def testclient_prefix(stack_dir: Path, repo_host_path: Path) -> list[str]:
+    """`docker compose -p DEV_PROJECT --project-directory <snapshot> --env-file <repo host path>/.env` and one trusted -f per client file."""
+    words = [
+        DOCKER,
+        'compose',
+        '-p',
+        DEV_PROJECT,
+        '--project-directory',
+        str(snapshot_dir(stack_dir)),
+        '--env-file',
+        str(repo_host_path / DEV_ENV_FILES[0]),
+    ]
+    for name in SYSTEM_CLIENT_COMPOSE_FILES:
+        words += ['-f', str(TRUSTED_COMPOSE_DIR / name)]
+    return words
+
+
+def testclient_step_env() -> tuple[tuple[str, str], ...]:
+    """The client steps' environment: the steering variables pinned and the three service env files at /dev/null. No DATA_DIR, no credential."""
+    return (*((name, '/dev/null') for name, _ in _DEV_ENV_FILE_VARIABLES), *_DEV_STEERING_ENV)
+
+
+def _check_suite_path(path: str) -> None:
+    """Refuse a run_system_tests path that is not a normalised relative path at or under tests/system."""
+    if (
+        not path
+        or '\0' in path
+        or path.startswith('-')
+        or os.path.isabs(path)
+        or os.path.normpath(path) != path
+        or (path != SYSTEM_TESTS_DIR and not path.startswith(f'{SYSTEM_TESTS_DIR}/'))
+    ):
+        raise Refused(f'a client path is a normalised path at or under {SYSTEM_TESTS_DIR}, and nothing else')
+
+
+def check_testclient_argv(argv: Sequence[str], stack_dir: Path, repo_host_path: Path) -> None:
+    """Refuse any argv but the client prefix and then exactly one of the three client tails; the secret wrapper is refused.
+
+    The tails: `build test_client`; `run --rm --no-deps --build test_client <paths under tests/system>`; the
+    seed producer's one invocation with an optional `--date D` (a real ASCII calendar date). Checked on the
+    words that go to the daemon, not on the builders' intent.
     """
-    wait = ['-d', '--wait', '--wait-timeout', str(WAIT_TIMEOUT_SECONDS)]
-    infrastructure = [service for service in SERVICES if service not in SNAPSHOT_BOUND_SERVICES]
-    return _steps(
-        stack_dir,
-        root_env_file,
-        ['build', *BUILT_SERVICES],
-        ['up', *wait, *infrastructure],
-        ['up', *wait, '--force-recreate', '--no-deps', *SNAPSHOT_BOUND_SERVICES],
-    )
+    words = tuple(argv)
+    if any(word in ('sh', '-c', DEV_UP_WRAPPER_SCRIPT) for word in words):
+        raise Refused('a client command has no shell wrapper: the secret is read from the root env file by compose')
+    prefix = tuple(testclient_prefix(stack_dir, repo_host_path))
+    compose = words
+    if compose[: len(prefix)] != prefix:
+        raise Refused(
+            'a client command names exactly the trusted client compose files, the snapshot and the root env file'
+        )
+    tail = compose[len(prefix) :]
+    forbidden = _forbidden_lifecycle_words(tail)
+    if forbidden:
+        raise Refused(
+            f'a client command names no compose file, project or env file and removes nothing: {", ".join(forbidden)}'
+        )
+    if tail in (SYSTEM_CLIENT_BUILD_TAIL, SEED_PRODUCER_RUN):
+        return
+    if tail[: len(SYSTEM_TESTS_RUN_HEAD)] == SYSTEM_TESTS_RUN_HEAD:
+        paths = tail[len(SYSTEM_TESTS_RUN_HEAD) :]
+        if 0 < len(paths) <= MAX_TEST_PATHS:
+            for path in paths:
+                _check_suite_path(path)
+            return
+    elif tail[: len(SEED_PRODUCER_RUN)] == SEED_PRODUCER_RUN and len(tail) == len(SEED_PRODUCER_RUN) + 2:
+        flag, date = tail[len(SEED_PRODUCER_RUN) :]
+        if flag == '--date' and check_seed_date(date) == date:
+            return
+    raise Refused('a client command is one of its fixed commands, with its fixed arguments, and no other')
 
 
-def stack_down_steps(stack_dir: Path, root_env_file: Path) -> list[Step]:
-    """Stop and remove the agent stack's containers and networks."""
-    return _steps(stack_dir, root_env_file, ['down', '--remove-orphans'])
+def _testclient_steps(stack_dir: Path, repo_host_path: Path, *tails: Sequence[str]) -> list[Step]:
+    """One Step per tail, each checked as built and run from the stack directory under the client's step env."""
+    steps = []
+    for tail in tails:
+        argv = (*testclient_prefix(stack_dir, repo_host_path), *tail)
+        check_testclient_argv(argv, stack_dir, repo_host_path)
+        steps.append(Step(argv, stack_dir, builds(tail), env=testclient_step_env()))
+    return steps
 
 
-# Each service's data mount target (docker-compose.agent-stack.yaml mounts ${DATA_DIR}/<service>
-# there), cleared from inside a one-off container of that service as root: Postgres owns its
-# files, not the MCP's user. The script takes the target as $1; the globs cover dotfiles, and
-# rm -f ignores a glob that matched nothing. The target is the container side of a mount the guard
-# has checked.
-DATA_MOUNTS = (('postgres', '/var/lib/postgresql/data'),)
-_CLEAR_SCRIPT = 'rm -rf -- "$1"/* "$1"/.[!.]* "$1"/..?*'
-
-
-def wipe_clear_steps(stack_dir: Path, root_env_file: Path, services: Sequence[str]) -> list[Step]:
-    """Clear the named services' data mounts from inside the containers."""
-    targets = dict(DATA_MOUNTS)
-    return _steps(
-        stack_dir,
-        root_env_file,
-        *(
-            [
-                'run',
-                '--rm',
-                '--no-deps',
-                '--user',
-                '0',
-                '--entrypoint',
-                'sh',
-                service,
-                '-c',
-                _CLEAR_SCRIPT,
-                'clear',
-                targets[service],
-            ]
-            for service in services
-        ),
-    )
-
-
-def postgres_running_steps(stack_dir: Path, root_env_file: Path) -> list[Step]:
-    """Run `compose ps -q postgres`: empty output means it is not running."""
-    return _steps(stack_dir, root_env_file, ['ps', '-q', 'postgres'])
-
-
-# THE ONE SPELLING of an alembic invocation in the agent stack. Both builders below go through it,
-# so the only difference between them is the flag this function is asked for -- two spellings of the
-# same run would drift, and the drift would be invisible until one of them answered a question the
-# caller did not ask (decision tj-yb1bxj clause 5, applied to the tail rather than to a digest).
-def _alembic_tail(command: Sequence[str], *, build: bool) -> list[str]:
-    build_flag = ['--build'] if build else []
-    return ['run', '--rm', '--no-deps', *build_flag, 'data_store', '/code/.venv/bin/alembic', *command]
-
-
-def alembic_steps(stack_dir: Path, root_env_file: Path, *commands: Sequence[str]) -> list[Step]:
-    """One `run --rm --no-deps data_store alembic <command>` per command, NO --build (migrate, migrate_status).
-
-    These two apply or read revisions; neither COMPARES a model against the schema, so the image the
-    run uses makes no difference to the answer and a build would only cost time. alembic_check_steps
-    is the one that must build, and it is a separate function so that neither can gain or lose the
-    flag by an edit to the other.
-    """
-    return _steps(stack_dir, root_env_file, *(_alembic_tail(command, build=False) for command in commands))
-
-
-# migrate_check's single command. Named rather than inlined so the runner's message and the step it
-# describes cannot disagree about which alembic subcommand ran.
-ALEMBIC_CHECK_COMMAND = ('check',)
-
-
-def alembic_check_steps(stack_dir: Path, root_env_file: Path) -> list[Step]:
-    """One `run --rm --no-deps --build data_store alembic check` -- the ONLY alembic run that builds.
-
-    WHY IT BUILDS, and why this is the opposite of what data/store/run_migrations.sh does for
-    `make migrate-check` (decision tj-yb1bxj, closing section; tj-yuz1e8). `alembic check`
-    autogenerates against the models it IMPORTS, and migrations/env.py imports them from /code --
-    which is in the IMAGE, not in the bind mounts. So the question the command answers is settled by
-    which image it runs: the deployed one (Q1) or one built from the checkout (Q2).
-
-    compose builds a MISSING image on `run` but never a STALE one, so without --build this would
-    compare the models of whatever the LAST stack_up built. An agent who edits a model and calls
-    migrate_check would then be shown drift that exists only between two of its own builds. --build
-    makes Q2 true by construction: the image is this call's snapshot.
-
-    The deploy path cannot take this fix -- there the point is to check the image actually deployed,
-    so run_migrations.sh verifies a digest stamp and REFUSES a mismatch instead. The agent stack has
-    no deployed image to be faithful to, so it has no stamp to check and nothing to refuse. Do not
-    carry either half across: a build here, a refusal there.
-    """
-    return _steps(stack_dir, root_env_file, _alembic_tail(ALEMBIC_CHECK_COMMAND, build=True))
-
-
-def system_tests_steps(stack_dir: Path, root_env_file: Path, paths: Sequence[str]) -> list[Step]:
-    """The test client, rebuilt from the snapshot, run against the agent stack."""
-    return _steps(stack_dir, root_env_file, ['run', '--rm', '--no-deps', '--build', 'test_client', *paths])
+def system_tests_steps(stack_dir: Path, repo_host_path: Path, paths: Sequence[str]) -> list[Step]:
+    """The test client, rebuilt from the snapshot (PATHS already resolved under tests/system), run against test mode."""
+    return _testclient_steps(stack_dir, repo_host_path, [*SYSTEM_TESTS_RUN_HEAD, *paths])
 
 
 # THE SEED PRODUCER'S ONE INVOCATION (ADR tj-4rr0la addendum 10 (1)), spelled exactly as make
@@ -1204,46 +867,88 @@ SEED_PRODUCER_RUN = (
 )
 
 
-def seed_dump_steps(stack_dir: Path, root_env_file: Path, date: str | None) -> list[Step]:
+def seed_dump_steps(stack_dir: Path, repo_host_path: Path, date: str | None) -> list[Step]:
     """Build test_client from the snapshot, then run the producer in it; its stdout is the bundle.
 
     The build is a step of its own so the run is the one invocation make seed-dump also uses; both
     steps can build, so the runner makes BASE_IMAGES present before the first (addenda 14-15).
     """
     date_args = ['--date', date] if date is not None else []
-    build, run = _steps(stack_dir, root_env_file, ['build', 'test_client'], [*SEED_PRODUCER_RUN, *date_args])
+    build, run = _testclient_steps(
+        stack_dir, repo_host_path, SYSTEM_CLIENT_BUILD_TAIL, [*SEED_PRODUCER_RUN, *date_args]
+    )
     return [build, replace(run, stdout_cap=MAX_BUNDLE_BYTES)]
-
-
-def logs_steps(stack_dir: Path, root_env_file: Path, service: str, tail: int) -> list[Step]:
-    """The last `tail` lines of one service's log."""
-    return _steps(stack_dir, root_env_file, ['logs', '--no-color', '--tail', str(tail), service])
-
-
-def ps_steps(stack_dir: Path, root_env_file: Path) -> list[Step]:
-    """The agent stack's containers, stopped ones included, with their health."""
-    return _steps(stack_dir, root_env_file, ['ps', '--all'])
 
 
 # ---------------------------------------------------------------------------------------------
 # THE DEV PROJECT'S TWO READ-ONLY COMMANDS (see DEV_PROJECT above). A separate prefix, a separate
-# step builder and a separate argv check, sharing nothing with the agent stack's: a change to one
+# step builder and a separate argv check, sharing nothing with the file-based builders': a change to one
 # cannot retarget the other, which is the failure this whole section is shaped to make impossible.
 def dev_compose_prefix() -> list[str]:
     """`docker compose -p DEV_PROJECT`, and nothing else: no -f, no --project-directory, no --env-file.
 
-    Four words. Everything the agent stack's compose_prefix() adds is content or configuration, and
-    none of it may reach the user's own project.
+    Four words. Everything the file-based prefixes add (-f, --project-directory) is content or
+    configuration, and none of it may reach the label-only verbs.
     """
     return [DOCKER, 'compose', '-p', DEV_PROJECT]
+
+
+def dev_file_prefix(repo_host_path: Path) -> list[str]:
+    """The FILE-BASED dev prefix: `docker compose -p DEV_PROJECT --project-directory <host path> -f <trusted copy> ...`.
+
+    For the verbs that build or create containers, which need the project loaded. The files are the
+    TRUSTED copies baked into the image (DEV_COMPOSE_FILES in TRUSTED_COMPOSE_DIR), never the
+    checkout's. --project-directory is the repository's HOST path (settings.repo_host_path), mounted
+    read-only at the same path in this container: the CLI reads the build context and the project's env
+    files there, and the daemon resolves every relative bind source there. There is no --env-file, so
+    compose reads the root env file in that directory itself and the MCP's Python never opens it
+    (addendum 23 (3)); the step builders pin the redirecting variables in the step environment.
+
+    Label-only verbs use dev_compose_prefix() instead.
+    """
+    words = [*dev_compose_prefix(), '--project-directory', str(repo_host_path)]
+    for name in DEV_COMPOSE_FILES:
+        words += ['-f', str(TRUSTED_COMPOSE_DIR / name)]
+    return words
+
+
+def dev_tools_prefix(repo_host_path: Path) -> list[str]:
+    """dev_file_prefix with the TRUSTED docker-compose.tools.yaml (pgAdmin) added, for tools alone.
+
+    The Makefile's TOOLS_COMPOSE is the dev four plus the tools file; the MCP-only overlay stays LAST so
+    its build.dockerfile wins, as in dev_file_prefix. No other verb loads this file: it carries `:?`
+    guards on PGADMIN_EMAIL and PGADMIN_PASS that every command loading it would then need.
+    """
+    words = [*dev_compose_prefix(), '--project-directory', str(repo_host_path)]
+    for name in DEV_TOOLS_COMPOSE_FILES:
+        words += ['-f', str(TRUSTED_COMPOSE_DIR / name)]
+    return words
+
+
+def _trusted_file_prefix(repo_host_path: Path, names: Sequence[str]) -> list[str]:
+    """`docker compose -p DEV_PROJECT --project-directory <host path>` and one trusted -f per name."""
+    words = [*dev_compose_prefix(), '--project-directory', str(repo_host_path)]
+    for name in names:
+        words += ['-f', str(TRUSTED_COMPOSE_DIR / name)]
+    return words
+
+
+def testmode_prefix(repo_host_path: Path) -> list[str]:
+    """The FILE-BASED TEST prefix, for test_up: the trusted base file and docker-compose.fake.yaml, as make system-launch's up."""
+    return _trusted_file_prefix(repo_host_path, TEST_COMPOSE_FILES)
+
+
+def testmode_build_prefix(repo_host_path: Path) -> list[str]:
+    """testmode_prefix plus the trusted MCP-only overlay, for test_build alone (build.dockerfile, nothing else)."""
+    return _trusted_file_prefix(repo_host_path, TEST_BUILD_COMPOSE_FILES)
 
 
 def check_dev_argv(argv: Sequence[str]) -> None:
     """Refuse any dev argv but `docker compose -p DEV_PROJECT <ps|logs> ...` with no steering option.
 
     Checked on the words that go to the daemon, not on the builders' intent, and raised as Refused so
-    a would-be violation is audited and no subprocess runs. The agent stack's own PROJECT is refused
-    here exactly as any other name is: these verbs reach one project and it is not that one.
+    a would-be violation is audited and no subprocess runs. Any other project name is refused
+    here: these verbs reach DEV_PROJECT and nothing else.
 
     All three spellings of a steering option are refused after the prefix: separated (`-f x`),
     attached long (`--env-file=x`) and attached short (`-fx`, `-px`).
@@ -1291,3 +996,1474 @@ def dev_ps_steps(stack_dir: Path) -> list[Step]:
 def dev_logs_steps(stack_dir: Path, service: str, tail: int) -> list[Step]:
     """The last `tail` lines of one dev service's log. Never --follow: a verb returns."""
     return _dev_steps(stack_dir, ['logs', '--no-color', '--tail', str(tail), service])
+
+
+# ---------------------------------------------------------------------------------------------
+# THE DEV LIFECYCLE'S CHECKS (tj-iee6sn.6; ADR tj-4rr0la addenda 22-24; owner rulings D5-D7 on
+# tj-iee6sn.1). Checks and helpers only: the verbs that use them (down, restart, build, up, migrate)
+# come with their own beads. Each check is deliberately small and refuses only what a normal dev
+# checkout never produces.
+#
+# THE ARGV TABLE. Every lifecycle command is one row, whole: a word the table does not hold is
+# refused, so nothing is allowed by omission. The forbidden-word scan runs first only so the refusal
+# can name what was wrong.
+_DEV_LABEL_ONLY = 'label-only'
+_DEV_FILE_BASED = 'file-based'
+_DEV_TOOLS_FILE_BASED = 'file-based+tools'
+_TEST_FILE_BASED = 'file-based+test'
+_TEST_BUILD_FILE_BASED = 'file-based+test-build'
+DEV_RESTART_SERVICES = ('data_store', 'data_ingest', 'web')
+DEV_BUILD_TAIL = ('build', 'data_store', 'data_ingest', 'web')
+DEV_UP_TAIL = ('up', '-d', '--wait', '--wait-timeout', '300', 'postgres', 'data_store', 'data_ingest', 'web')
+# `make dev-tools` is `up -d pgadmin`; --wait is the MCP's addition (the verb returns when pgAdmin runs).
+# postgres is not named: compose starts it through pgadmin's depends_on, as make does.
+DEV_TOOLS_TAIL = ('up', '-d', '--wait', 'pgadmin')
+# TEST MODE. `make test-build` is `build data_store data_ingest` over the test set; `make system-launch`'s
+# up is `up -d --wait --wait-timeout 300` over the same set WITHOUT service names, so it starts what the
+# files define (postgres, data_store, data_ingest) -- the words are the Makefile's, nothing added.
+TEST_BUILD_TAIL = ('build', 'data_store', 'data_ingest')
+TEST_UP_TAIL = ('up', '-d', '--wait', '--wait-timeout', '300')
+DEV_ALEMBIC_PROGRAM = '/code/.venv/bin/alembic'
+DEV_MIGRATE_TAIL = ('run', '--rm', '--no-deps', 'data_store', DEV_ALEMBIC_PROGRAM, 'upgrade', 'head')
+DEV_LIFECYCLE_COMMANDS: dict[tuple[str, ...], str] = {
+    ('down',): _DEV_LABEL_ONLY,
+    **{('restart', service): _DEV_LABEL_ONLY for service in DEV_RESTART_SERVICES},
+    DEV_BUILD_TAIL: _DEV_FILE_BASED,
+    DEV_UP_TAIL: _DEV_FILE_BASED,
+    DEV_TOOLS_TAIL: _DEV_TOOLS_FILE_BASED,
+    TEST_BUILD_TAIL: _TEST_BUILD_FILE_BASED,
+    TEST_UP_TAIL: _TEST_FILE_BASED,
+    DEV_MIGRATE_TAIL: _DEV_FILE_BASED,
+}
+# The one-off migrate over the TEST set is the SAME words as DEV_MIGRATE_TAIL under a different prefix, so it
+# cannot be a second key of the table above (one kind per tail): it is its own row, accepted only under
+# testmode_prefix (the base file and docker-compose.fake.yaml, as run_migrations.sh's TEST definition).
+TEST_ONEOFF_COMMANDS: dict[tuple[str, ...], str] = {DEV_MIGRATE_TAIL: _TEST_FILE_BASED}
+# Data-losing words, refused wherever they appear after the prefix, on top of DEV_FORBIDDEN_OPTIONS
+# (file, project, directory, env file, profile). -V is `up`'s --renew-anon-volumes.
+DEV_LIFECYCLE_FORBIDDEN = DEV_FORBIDDEN_OPTIONS | frozenset(
+    {'-v', '-V', '--volumes', '--renew-anon-volumes', '--rmi', '--remove-orphans', 'prune'}
+)
+
+
+def _forbidden_lifecycle_words(tail: Sequence[str]) -> list[str]:
+    """Every word of TAIL that spells a forbidden option, in any of its spellings.
+
+    Separated (`-v`), attached long (`--volumes=true`), attached short (`-fx`) and a short cluster
+    (`-dv`: a single-dash word of several letters holding v or V).
+    """
+    found = []
+    for word in tail:
+        if (
+            word.split('=', 1)[0] in DEV_LIFECYCLE_FORBIDDEN
+            or word.startswith(DEV_FORBIDDEN_SHORT_PREFIXES)
+            or (word.startswith('-') and not word.startswith('--') and ('v' in word or 'V' in word))
+        ):
+            found.append(word)
+    return found
+
+
+def check_dev_lifecycle_argv(argv: Sequence[str], repo_host_path: Path | None = None) -> None:
+    """Refuse any dev lifecycle argv but one row of DEV_LIFECYCLE_COMMANDS under its own prefix, whole.
+
+    A label-only row runs under dev_compose_prefix() alone; a file-based row under
+    dev_file_prefix(repo_host_path), so REPO_HOST_PATH is required to accept one; the tools row
+    only under dev_tools_prefix (the tools file added), the test_build row only under testmode_build_prefix
+    (the fake and test-overlay files, the only set that can build :test), the test_up row only under
+    testmode_prefix, and no other row under any of them. Checked on the
+    words that go to the daemon, not on the builders' intent. check_dev_argv stays as it is, for the
+    read-only ps and logs.
+    """
+    words = list(argv)
+    label_prefix = dev_compose_prefix()
+    if words[: len(label_prefix)] != label_prefix:
+        raise Refused(f'a dev lifecycle verb runs only `docker compose -p {DEV_PROJECT}`')
+    file_based = words[len(label_prefix) : len(label_prefix) + 1] == ['--project-directory']
+    kind_wanted = _DEV_LABEL_ONLY
+    if file_based:
+        if repo_host_path is None:
+            raise Refused('a file-based dev lifecycle command needs the repository host path to be checked')
+        # Longest first: testmode_prefix is a word-prefix of testmode_build_prefix, so the build set must be
+        # tried before the up set (the up set would otherwise read the overlay's -f as a forbidden tail word).
+        candidates = (
+            (dev_tools_prefix(repo_host_path), _DEV_TOOLS_FILE_BASED),
+            (testmode_build_prefix(repo_host_path), _TEST_BUILD_FILE_BASED),
+            (testmode_prefix(repo_host_path), _TEST_FILE_BASED),
+            (dev_file_prefix(repo_host_path), _DEV_FILE_BASED),
+        )
+        for candidate, candidate_kind in candidates:
+            if words[: len(candidate)] == candidate:
+                prefix, kind_wanted = candidate, candidate_kind
+                break
+        else:
+            raise Refused('a file-based dev lifecycle command names exactly the trusted dev compose files')
+    else:
+        prefix = label_prefix
+    tail = words[len(prefix) :]
+    forbidden = _forbidden_lifecycle_words(tail)
+    if forbidden:
+        raise Refused(
+            'a dev lifecycle command removes no volume, image or orphan and names no compose file, project '
+            f'or env file: {", ".join(forbidden)}'
+        )
+    kind = DEV_LIFECYCLE_COMMANDS.get(tuple(tail))
+    if kind != kind_wanted and TEST_ONEOFF_COMMANDS.get(tuple(tail)) != kind_wanted:
+        raise Refused('a dev lifecycle command is one of its fixed commands, with its fixed arguments, and no other')
+
+
+# THE ENVIRONMENT. compose reads its own environment AHEAD of the project's env files, so a verb that
+# lets compose read them (D5: the MCP never opens them) pins the variables that would redirect it.
+# The in-repo defaults are the compose files' own (`${ROOT_ENV_FILE:-.env}` and its two siblings),
+# resolved against --project-directory.
+DEV_ENV_FILES = ('.env', 'server/data/store/.env', 'server/data/ingest/.env')
+_DEV_ENV_FILE_VARIABLES = (
+    ('ROOT_ENV_FILE', '.env'),
+    ('STORE_ENV_FILE', './server/data/store/.env'),
+    ('INGEST_ENV_FILE', './server/data/ingest/.env'),
+)
+_DEV_STEERING_ENV = (
+    ('COMPOSE_PROJECT_NAME', DEV_PROJECT),
+    ('COMPOSE_FILE', ''),
+    ('COMPOSE_PATH_SEPARATOR', ':'),
+    ('COMPOSE_ENV_FILES', ''),
+    ('COMPOSE_PROFILES', ''),
+    ('COMPOSE_REMOVE_ORPHANS', 'false'),
+    ('COMPOSE_IGNORE_ORPHANS', 'false'),
+    # The build engine: a COMPOSE* variable a project .env could otherwise set and compose would
+    # promote when unset. false is the classic build path, the one make dev-build takes.
+    ('COMPOSE_BAKE', 'false'),
+)
+# What a verb that creates nothing (a build) needs for compose to interpolate the dev files: the
+# `:?` variables set to a throwaway word and every env-file variable to /dev/null, so no env file
+# is read and no secret is needed.
+_DEV_PLACEHOLDER_ENV = (
+    ('POSTGRES_PASS', 'unused'),
+    ('INSTANCE_WRITE_SECRET', 'unused'),
+    # The container half of the override's publish entries ('127.0.0.1:${DATA_STORE_PORT}:${APP_INTERNAL_PORT}');
+    # empty, compose refuses the entry. The .env.default value.
+    ('APP_INTERNAL_PORT', '80'),
+    # Interpolated in fields compose validates at config time: postgres container_name (empty is
+    # refused) and the override's published host ports (an empty one makes the entry invalid). The
+    # .env.default values; POSTGRES_USER and POSTGRES_DB_NAME only warn when unset, set to silence it.
+    ('DATABASE_NAME', 'db'),
+    ('DATABASE_PORT', '5432'),
+    ('DATA_STORE_PORT', '8080'),
+    ('DATA_INGEST_PORT', '8081'),
+    ('POSTGRES_USER', 'postgres'),
+    ('POSTGRES_DB_NAME', 'postgres'),
+    *((name, '/dev/null') for name, _ in _DEV_ENV_FILE_VARIABLES),
+)
+
+
+def dev_pinned_step_env() -> tuple[tuple[str, str], ...]:
+    """The step environment of a verb that lets compose read the project's env files: pinned, no value read."""
+    return (*_DEV_ENV_FILE_VARIABLES, *_DEV_STEERING_ENV)
+
+
+def dev_placeholder_step_env() -> tuple[tuple[str, str], ...]:
+    """The step environment of a verb that creates nothing (build): placeholders, env files at /dev/null.
+
+    COMPOSE_ENV_FILES is /dev/null here, not the shared steering value '': compose may read an empty
+    value as unset and then load <project-directory>/.env for interpolation, and build reads no env
+    file (D5). The key appears once, in the shared steering position.
+    """
+    steering = tuple((name, '/dev/null' if name == 'COMPOSE_ENV_FILES' else value) for name, value in _DEV_STEERING_ENV)
+    return (*_DEV_PLACEHOLDER_ENV, *steering)
+
+
+def testmode_pinned_step_env() -> tuple[tuple[str, str], ...]:
+    """test_up's step environment: the pinned env (compose reads the env files itself) plus DATA_DIR on the test dir.
+
+    DATA_DIR is a literal, never read from the owner's env file: process env outranks the project's
+    .env, so postgres lands on ./volume_data/test and never on the owner's dev data.
+    """
+    return (*dev_pinned_step_env(), ('DATA_DIR', TEST_DATA_DIR))
+
+
+def testmode_placeholder_step_env() -> tuple[tuple[str, str], ...]:
+    """test_build's step environment: build's placeholders (no env file is read) plus DATA_DIR on the test dir."""
+    return (*dev_placeholder_step_env(), ('DATA_DIR', TEST_DATA_DIR))
+
+
+def _lstat_below(root: Path, relative: str) -> os.stat_result | None:
+    """Lstat every component of RELATIVE under ROOT, root down; Refused on a symlink, None when it is missing.
+
+    No component is opened or followed. A component that is not a directory (ENOTDIR) counts as
+    missing, as the path then names nothing; any other error is Refused rather than guessed past.
+    A refusal names the component that IS the link, relative to ROOT, and the path it was found on
+    the way to; a link at the leaf is named once.
+    """
+    current = root
+    found: os.stat_result | None = None
+    parts = relative.split('/')
+    for index, part in enumerate(parts):
+        current = current / part
+        try:
+            found = os.lstat(current)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        except OSError as error:
+            raise Refused(f'{relative} could not be checked: {error.strerror}') from error
+        if stat.S_ISLNK(found.st_mode):
+            link = '/'.join(parts[: index + 1])
+            on_the_way = '' if link == relative else f' (on the way to {relative})'
+            raise Refused(f'a symlink at {link}{on_the_way}: remove the link, or start the stack yourself')
+    return found
+
+
+def env_file_preflight(repo_root: Path) -> None:
+    """D5: lstat the three in-repo env files WITHOUT opening them; refuse a symlink or a non-regular file.
+
+    A missing optional file is allowed, as compose allows it. The files' contents are never read here:
+    compose reads them itself.
+    """
+    for relative in DEV_ENV_FILES:
+        found = _lstat_below(repo_root, relative)
+        if found is not None and not stat.S_ISREG(found.st_mode):
+            raise Refused(f'{relative} is not a regular file: remove it, or start the stack yourself')
+
+
+# D6, MINIMAL. The in-repo bind sources of the trusted dev files; a validator test pins this list
+# against the parsed files, so the runtime stays a plain list. The Docker daemon resolves a bind
+# source on the host as root and follows symlinks, so a planted link at (or above) a source would
+# mount whatever it points at. Residual, recorded: the milliseconds between this check and the mount,
+# and DATA_DIR, which lies outside the repository.
+DEV_BIND_SOURCES = (
+    'server/data/store/app',
+    'server/data/ingest/app',
+    'server/common',
+    'server/routers',
+    'server/schemas',
+    'gen/proto/python',
+    'server/data/store/alembic.ini',
+    'server/data/store/migrations',
+    'web/src',
+    'gen/proto',
+)
+
+
+def check_dev_bind_sources(repo_root: Path, sources: Sequence[str] = DEV_BIND_SOURCES) -> None:
+    """Refuse when any component of any SOURCES path under REPO_ROOT is a symlink (default: DEV_BIND_SOURCES).
+
+    Run right before a verb that creates or starts containers. A MISSING source is not refused:
+    behaviour for a checkout without it is unchanged.
+    """
+    for relative in sources:
+        _lstat_below(repo_root, relative)
+
+
+# D6 for test mode: every in-repo bind source of the test set (docker-compose.yaml binds data_store's
+# alembic.ini and migrations; docker-compose.fake.yaml mounts tests/fakes read-only into data_ingest;
+# docker-compose.agent-test.yaml mounts nothing). The only other bind is postgres' data directory,
+# under ./volume_data/test, the residual DEV_BIND_SOURCES' comment records.
+TEST_BIND_SOURCES = ('server/data/store/alembic.ini', 'server/data/store/migrations', 'tests/fakes')
+
+
+# D7 GENERALISED INTO THE MODE GUARD (ADR tj-4rr0la addenda 26-27, 29; tj-iee6sn.24, .31). Dev and test
+# run in the explicit project trader_joe_dev and prod in the default one, so a prod stack is no longer
+# this project; should a prod-labelled container ever be found here anyway, a state-changing verb would
+# act on it, so it is refused. One `docker ps` over the config_files label, over the project's NON-one-off
+# containers (alembic runs and test_client are `run` containers and are ignored), classified by the
+# basename of each container's files exactly as run_migrations.sh's classify_config_files does:
+#   DEV   the override present, the fake file absent        (make dev-up, MCP up)
+#   TEST  the fake file present, the override absent        (make system-launch, MCP test_up)
+#   PROD  anything else: neither file, both together (no target launches that pair), a malformed or
+#         missing label
+# Any PROD container, or two modes at once, refuses every state-changing verb; a mode a verb does not
+# act on refuses it with that verb's own hint. tj-oxxl8a (an explicit prod project name) is the
+# structural fix.
+DEV_OVERRIDE_FILE = 'docker-compose.override.yaml'
+TEST_FAKE_FILE = 'docker-compose.fake.yaml'
+DEV_CONFIG_FILES_LABEL = 'com.docker.compose.project.config_files'
+MODE_DEV = 'DEV'
+MODE_TEST = 'TEST'
+MODE_PROD = 'PROD'
+# The modes each verb acts on; None is an empty project. up and test_up stop the project first, so
+# they act on any non-PROD state. down and restart act on whatever launched mode is up.
+# tools is dev-only; migrate and migrate_status act on DEV or TEST (an empty project is refused).
+MODES_ANY = frozenset({MODE_DEV, MODE_TEST, None})
+MODES_DEV_OR_EMPTY = frozenset({MODE_DEV, None})
+MODES_DEV_OR_TEST = frozenset({MODE_DEV, MODE_TEST})
+# run_system_tests and seed_dump act on TEST mode alone: they write the database, and only test mode's own
+# launch (./volume_data/test, the fake broker) makes that database disposable.
+MODES_TEST = frozenset({MODE_TEST})
+SYSTEM_SUITE_MODE_HINT = 'the system suite runs only in test mode: call test_up first; your dev data is not touched'
+
+
+def dev_prod_guard_argv() -> tuple[str, ...]:
+    """`docker ps -a` over every NON-one-off container of DEV_PROJECT, printing the config_files label only."""
+    return (
+        DOCKER,
+        'ps',
+        '-a',
+        '--filter',
+        f'label={DEV_LABEL_PROJECT}={DEV_PROJECT}',
+        '--filter',
+        f'label={DEV_LABEL_ONEOFF}=False',
+        '--format',
+        f'{{{{.Label "{DEV_CONFIG_FILES_LABEL}"}}}}',
+    )
+
+
+def check_dev_prod_guard_argv(argv: Sequence[str]) -> None:
+    """Refuse any argv but dev_prod_guard_argv(), word for word."""
+    if tuple(argv) != dev_prod_guard_argv():
+        raise Refused('the mode guard is `docker ps` over the project label, printing one label, and nothing else')
+
+
+def dev_prod_guard_step(stack_dir: Path) -> Step:
+    """The guard's one docker call, checked as built."""
+    argv = dev_prod_guard_argv()
+    check_dev_prod_guard_argv(argv)
+    return Step(argv, stack_dir)
+
+
+def classify_config_files(label: str) -> str:
+    """A port of run_migrations.sh's classify_config_files: 'DEV', 'TEST', 'PROD', or 'UNKNOWN'.
+
+    DEV: well formed, some entry's file name is exactly docker-compose.override.yaml and none is
+    docker-compose.fake.yaml. TEST: the reverse. PROD: well formed, and neither is present. UNKNOWN:
+    empty, or malformed (an empty or relative entry, or a newline), or BOTH files (no target launches
+    that pair). A path holding a comma is malformed: fail closed. The script says UNKNOWN where
+    classify_mode says PROD; a test pins that the two agree on every case.
+    """
+    if not label or '\n' in label:
+        return 'UNKNOWN'
+    entries = label.split(',')
+    if any(not entry or not entry.startswith('/') for entry in entries):
+        return 'UNKNOWN'
+    names = {entry.rsplit('/', 1)[-1] for entry in entries}
+    has_override, has_fake = DEV_OVERRIDE_FILE in names, TEST_FAKE_FILE in names
+    if has_override and has_fake:
+        return 'UNKNOWN'
+    if has_override:
+        return MODE_DEV
+    return MODE_TEST if has_fake else MODE_PROD
+
+
+def classify_mode(label: str) -> str:
+    """The mode of one container's config_files label: DEV, TEST or PROD (UNKNOWN, malformed and missing are PROD)."""
+    verdict = classify_config_files(label)
+    return verdict if verdict in (MODE_DEV, MODE_TEST) else MODE_PROD
+
+
+def check_mode_guard(
+    exit_status: int | None, stdout: bytes, accepted: frozenset[str | None] = MODES_ANY, unaccepted: str = ''
+) -> str | None:
+    """The mode the project is in (DEV, TEST, or None for an empty project); Refused unless ACCEPTED holds it.
+
+    Refused on any PROD container, on DEV and TEST containers together, and on a mode outside
+    ACCEPTED (UNACCEPTED is the verb's own hint). Fail closed on anything else unexpected: a failed
+    command, bytes that are not UTF-8, a missing final newline, a blank line (a container with no label).
+    """
+    prod = (
+        f'project {DEV_PROJECT} holds a container not started from the dev or test files (a prod launch?): '
+        'stop it with make dev-down; tj-oxxl8a'
+    )
+    if exit_status != 0:
+        raise Refused(f'could not list the containers of project {DEV_PROJECT}, so nothing was changed')
+    mode: str | None = None
+    if stdout:
+        try:
+            text = stdout.decode('utf-8')
+        except UnicodeDecodeError:
+            raise Refused(prod) from None
+        if not text.endswith('\n'):
+            raise Refused(prod)
+        modes = {classify_mode(line) for line in text[:-1].split('\n')}
+        if MODE_PROD in modes:
+            raise Refused(prod)
+        if len(modes) > 1:
+            raise Refused(
+                f'project {DEV_PROJECT} holds dev and test containers together, so which mode is up cannot be '
+                'told: stop them with make dev-down'
+            )
+        (mode,) = modes
+    if mode not in accepted:
+        raise Refused(unaccepted or f'{mode} mode is up, which this verb does not act on')
+    return mode
+
+
+# S6. The compose files, the Dockerfile and the three scripts the file-based dev verbs use are run from
+# copies baked into the MCP image; when the checkout's differ, the verb would create containers from
+# yesterday's files. Fail-safe: a difference can only refuse. docker-compose.tools.yaml is baked too
+# (tools and the down fallback load it), so it is compared with the rest, and so are the test
+# mode's two (docker-compose.fake.yaml, docker-compose.agent-test.yaml).
+DEV_TRUSTED_COPIES = (
+    *((name, name) for name in DEV_COMPOSE_FILES),
+    ('docker-compose.tools.yaml', 'docker-compose.tools.yaml'),
+    # Test mode's set (test_up, test_build): the fake-mode overlay and the MCP-only build overlay.
+    *((name, name) for name in (*TEST_COMPOSE_FILES[1:], TEST_OVERLAY_FILE)),
+    # The system-test client's two (run_system_tests, seed_dump): the client file and the MCP-only overlay.
+    *((name, name) for name in SYSTEM_CLIENT_COMPOSE_FILES[1:]),
+    ('Dockerfile', 'Dockerfile'),
+    ('tools/dev_instance_secret.sh', 'tools/dev_instance_secret.sh'),
+    ('tools/source_digest.sh', 'tools/source_digest.sh'),
+    ('tools/proto_digest.sh', 'tools/proto_digest.sh'),
+)
+_TRUSTED_COPY_MAX_BYTES = 1024 * 1024
+
+
+def _read_regular(path: Path) -> bytes | None:
+    """The bytes of a regular file opened without following a link; None when absent, special or too big."""
+    try:
+        descriptor = os.open(path, _O_NOFOLLOW_FILE)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None
+        data = os.read(descriptor, _TRUSTED_COPY_MAX_BYTES + 1)
+    finally:
+        os.close(descriptor)
+    return None if len(data) > _TRUSTED_COPY_MAX_BYTES else data
+
+
+def check_trusted_copies_current(repo_root: Path, trusted_dir: Path = TRUSTED_COMPOSE_DIR) -> None:
+    """Refuse when any DEV_TRUSTED_COPIES file baked into TRUSTED_DIR differs byte for byte from REPO_ROOT's."""
+    for checkout_name, baked_name in DEV_TRUSTED_COPIES:
+        checkout = _read_regular(repo_root / checkout_name)
+        if checkout is None or checkout != _read_regular(trusted_dir / baked_name):
+            raise Refused(
+                f'the MCP image is stale: {checkout_name} differs from the checkout (or is missing); '
+                'run make agent-mcp-rebuild on the host, then reconnect the MCP'
+            )
+
+
+# S10. A looping agent must be stopped, not served: starting data_ingest can trigger the daily refresh
+# against the owner's paper quota. In memory, so an MCP restart resets it.
+DEV_BUDGET_LIMIT = 12
+DEV_BUDGET_WINDOW_SECONDS = 3600.0
+
+
+class DevBudget:
+    """At most DEV_BUDGET_LIMIT state-changing dev verbs per rolling DEV_BUDGET_WINDOW_SECONDS."""
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic):
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._calls: list[float] = []
+
+    def charge(self) -> None:
+        """Count one verb, or Refused when the window already holds the limit; a refused call is not counted."""
+        now = self._clock()
+        with self._lock:
+            self._calls = [at for at in self._calls if now - at < DEV_BUDGET_WINDOW_SECONDS]
+            if len(self._calls) >= DEV_BUDGET_LIMIT:
+                raise Refused(
+                    f'{DEV_BUDGET_LIMIT} state-changing dev verbs in the last hour is the budget; wait, '
+                    'or run the make target yourself'
+                )
+            self._calls.append(now)
+
+
+# ---------------------------------------------------------------------------------------------
+# THE LABEL-ONLY MUTATING VERBS, down AND restart (tj-iee6sn.7; owner rulings D1, D2, D6, D7).
+# `docker compose -p trader_joe_dev down` and `... restart <service>` pass no -f, so compose may search the
+# step's working directory (the stack directory) and every parent for a compose file, and reads a .env
+# beside one. The step's environment is pinned (dev_label_only_step_env) and this refuses, before the
+# step, if anything of that kind is there. lstat only, nothing is opened.
+_STEERING_NAMES = (
+    'compose.yaml',
+    'compose.yml',
+    'compose.override.yaml',
+    'compose.override.yml',
+    'docker-compose.yaml',
+    'docker-compose.yml',
+    'docker-compose.override.yaml',
+    'docker-compose.override.yml',
+    '.env',
+)
+
+
+def check_dev_steering_files(stack_dir: Path) -> None:
+    """Refuse when STACK_DIR or any parent up to / holds a compose file (or an override of one) or a .env.
+
+    A name that exists in any form refuses (a file, a directory, a link, a dangling link), and so does
+    an lstat error other than 'not there': fail closed. The refusal names the path.
+    """
+    for directory in (stack_dir, *stack_dir.parents):
+        for name in _STEERING_NAMES:
+            candidate = directory / name
+            try:
+                os.lstat(candidate)
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError as error:
+                raise Refused(f'{candidate} could not be checked: {error.strerror}') from error
+            raise Refused(f'{candidate} would steer compose: remove it, or run the make target yourself')
+
+
+def dev_label_only_step_env() -> tuple[tuple[str, str], ...]:
+    """The step environment of a label-only mutating verb: the steering variables pinned, no env file named."""
+    return _DEV_STEERING_ENV
+
+
+def validate_dev_restart_service(service: object) -> str:
+    """The restart verb's service must be one of the closed DEV_RESTART_SERVICES (postgres is not one)."""
+    if not isinstance(service, str) or service not in DEV_RESTART_SERVICES:
+        raise Refused(f'service must be one of: {", ".join(DEV_RESTART_SERVICES)}')
+    return service
+
+
+def _dev_lifecycle_label_steps(stack_dir: Path, tail: Sequence[str]) -> list[Step]:
+    """One label-only lifecycle Step, checked as built by check_dev_lifecycle_argv, with the pinned env."""
+    argv = tuple(dev_compose_prefix() + list(tail))
+    check_dev_lifecycle_argv(argv)
+    return [Step(argv, stack_dir, env=dev_label_only_step_env())]
+
+
+def dev_down_steps(stack_dir: Path) -> list[Step]:
+    """`docker compose -p trader_joe_dev down`: containers and project networks removed; no -v, no --rmi, no --remove-orphans."""
+    return _dev_lifecycle_label_steps(stack_dir, ['down'])
+
+
+def dev_restart_steps(stack_dir: Path, service: str) -> list[Step]:
+    """`docker compose -p trader_joe_dev restart <service>` for one member of DEV_RESTART_SERVICES."""
+    return _dev_lifecycle_label_steps(stack_dir, ['restart', validate_dev_restart_service(service)])
+
+
+# ---------------------------------------------------------------------------------------------
+# build (tj-iee6sn.8; owner rulings D5, D8). `make dev-build` minus its host prerequisites, as a
+# PLAIN call: file-based, so the project is loaded from the TRUSTED baked compose files with
+# --project-directory the repository's host path. It creates and starts nothing and reads no env file
+# (the step env is dev_placeholder_step_env), so it needs no prod guard, no symlink check and no
+# steering walk: every -f is given, and a `:dev` image is not a container. What it does run, in
+# order: the stale-copy check (S6), the generated-code freshness precondition, the budget, the two
+# source digests from the TRUSTED source_digest.sh, then the build (the runner has the base images
+# present first, as for every building step).
+DEV_GENERATED_DIRS = ('gen/proto/python', 'gen/proto/ts')
+# make test-build runs `proto` and no gen-proto-ts: test mode has no web service, so only the Python half.
+TEST_GENERATED_DIRS = ('gen/proto/python',)
+DEV_DIGEST_SERVICES = (('data', 'store'), ('data', 'ingest'))
+DEV_DIGEST_VARIABLES = ('SOURCE_DIGEST_DATA_STORE', 'SOURCE_DIGEST_DATA_INGEST')
+# bash by absolute path: the step env's PATH is the runner's, and the script is `#! /bin/bash` anyway.
+DEV_DIGEST_BASH = '/usr/bin/bash'
+_DIGEST_PATTERN = re.compile(rb'[0-9a-f]{64}\n')
+_GENERATE_HINT = 'run make proto gen-proto-ts in the root checkout'
+TEST_GENERATE_HINT = 'run make proto in the root checkout'
+
+
+def _has_regular_file(root: Path) -> bool:
+    """True when a regular file sits under ROOT, found without following a link (a planted link is not counted)."""
+    for directory, _, names in os.walk(root, followlinks=False):
+        for name in names:
+            try:
+                if stat.S_ISREG(os.lstat(Path(directory) / name).st_mode):
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def proto_digest_argv(repo_root: Path, kind: str, trusted_script: Path = TRUSTED_PROTO_DIGEST) -> tuple[str, ...]:
+    """The TRUSTED proto_digest.sh over REPO_ROOT: bash <script> --context <root> <kind>."""
+    return (DEV_DIGEST_BASH, str(trusted_script), '--context', str(repo_root), kind)
+
+
+def _current_proto_digest(repo_root: Path, kind: str, trusted_script: Path, hint: str) -> bytes:
+    """The digest of REPO_ROOT's protos for KIND, computed by the baked script; refuses when it cannot be."""
+    try:
+        completed = subprocess.run(  # nosec B603 -- fixed argument list, no shell, the baked script
+            proto_digest_argv(repo_root, kind, trusted_script),
+            env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+            cwd='/',
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise Refused(f'the {kind} proto digest could not be computed ({type(error).__name__}): {hint}') from error
+    if completed.returncode != 0 or not _DIGEST_PATTERN.fullmatch(completed.stdout):
+        reason = completed.stderr.decode('utf-8', 'replace').strip().splitlines()[:1]
+        raise Refused(f'the {kind} proto digest could not be computed ({"".join(reason) or "bad output"}): {hint}')
+    return completed.stdout
+
+
+def check_generated_code_fresh(
+    repo_root: Path,
+    generated_dirs: Sequence[str] = DEV_GENERATED_DIRS,
+    hint: str = _GENERATE_HINT,
+    trusted_script: Path = TRUSTED_PROTO_DIGEST,
+) -> None:
+    """Refuse unless each of GENERATED_DIRS (default gen/proto/python and gen/proto/ts) was generated from the current protos.
+
+    Content, not time (tj-iee6sn.33, over tj-grna9p.164): <tree>.digest, beside the tree, is what make
+    proto / gen-proto-ts wrote, and it must equal the digest the BAKED trusted proto_digest.sh computes
+    over the repository now (never the checkout's own copy, which an agent can write). The stamp is read
+    without following a link, and a missing, linked, non-regular or unequal one refuses. Nothing is
+    generated here; the MCP cannot run the generators, so every refusal names the fix.
+    """
+    for relative in generated_dirs:
+        if not _has_regular_file(repo_root / relative):
+            raise Refused(f'{relative} is missing or empty: {hint}')
+        stamp = _read_regular(repo_root / f'{relative}.digest')
+        if stamp is None:
+            raise Refused(
+                f'no generation stamp: {relative}.digest is missing, unreadable or not a regular file: {hint}'
+            )
+        if stamp != _current_proto_digest(repo_root, relative.rsplit('/', 1)[-1], trusted_script, hint):
+            raise Refused(f'generated code is not from the current protos: {relative}: {hint}')
+
+
+def dev_digest_argv(repo_host_path: Path, service_path: str, service_name: str) -> tuple[str, ...]:
+    """The TRUSTED source_digest.sh, run over the repository's host path: bash <script> --context <path> <path> <name>."""
+    return (DEV_DIGEST_BASH, str(TRUSTED_SOURCE_DIGEST), '--context', str(repo_host_path), service_path, service_name)
+
+
+def check_dev_digest_argv(argv: Sequence[str], repo_host_path: Path) -> None:
+    """Refuse any argv but one of the fixed digest commands, word for word."""
+    allowed = {dev_digest_argv(repo_host_path, path, name) for path, name in DEV_DIGEST_SERVICES}
+    if tuple(argv) not in allowed:
+        raise Refused('the dev source digest is the trusted source_digest.sh over the repository, and nothing else')
+
+
+def dev_digest_steps(stack_dir: Path, repo_host_path: Path) -> list[Step]:
+    """One digest Step per DEV_DIGEST_SERVICES entry, each checked as built. cwd is the stack directory (the script moves itself)."""
+    steps = []
+    for path, name in DEV_DIGEST_SERVICES:
+        argv = dev_digest_argv(repo_host_path, path, name)
+        check_dev_digest_argv(argv, repo_host_path)
+        steps.append(Step(argv, stack_dir))
+    return steps
+
+
+def parse_source_digest(exit_status: int | None, stdout: bytes) -> str | None:
+    """The digest a digest step printed, or None unless it exited 0 and printed exactly 64 lowercase hex and a newline."""
+    if exit_status != 0 or not _DIGEST_PATTERN.fullmatch(stdout):
+        return None
+    return stdout[:-1].decode('ascii')
+
+
+def dev_build_step(stack_dir: Path, repo_host_path: Path, digests: Sequence[str]) -> Step:
+    """`docker compose -p trader_joe_dev ... build data_store data_ingest web`, checked as built.
+
+    The step env is the placeholder env plus the two digests, which are validated 64-hex values
+    (parse_source_digest) and appear in no argv. Building, so the runner makes the bases present first.
+    """
+    if len(digests) != len(DEV_DIGEST_VARIABLES) or not all(
+        _DIGEST_PATTERN.fullmatch(f'{digest}\n'.encode()) for digest in digests
+    ):
+        raise Refused('build needs exactly one valid source digest per image')
+    argv = tuple(dev_file_prefix(repo_host_path) + list(DEV_BUILD_TAIL))
+    check_dev_lifecycle_argv(argv, repo_host_path)
+    env = (*dev_placeholder_step_env(), *zip(DEV_DIGEST_VARIABLES, digests, strict=True))
+    return Step(argv, stack_dir, builds(DEV_BUILD_TAIL), env=env)
+
+
+# ---------------------------------------------------------------------------------------------
+# up (tj-iee6sn.9; owner rulings D1, D3, D5, D8; ADR tj-4rr0la addenda 22-24). `make dev-up` as a
+# PLAIN call: the label-only down (single instance, D1), the devnet network, then the file-based up of
+# postgres and the three app services. It never builds on purpose (a build cannot fit its 600 s), so the
+# three :dev images must already exist.
+DEV_IMAGES = ('trader_joe_data_store:dev', 'trader_joe_data_ingest:dev', 'trader_joe_web:dev')
+DEV_NETWORK = 'trader_joe_devnet'
+# The two images test mode builds and runs, the refs docker-compose.fake.yaml names (service order:
+# data_store, data_ingest, so TEST_IMAGES pairs with DEV_DIGEST_SERVICES). test_build writes only these,
+# test_up requires them, and nothing in the MCP names an image tagged :latest.
+TEST_IMAGES = ('trader_joe_data_store:test', 'trader_joe_data_ingest:test')
+
+# THE SECRET WRAPPER (F9). The one shell in the server. The up needs INSTANCE_WRITE_SECRET, which make
+# derives with tools/dev_instance_secret.sh from the root env file; the MCP never reads that file, so a
+# fixed `sh -c` does it inside the child and execs compose with the value in ITS environment only. The
+# script is this constant, never formatted or interpolated: the helper and the env file arrive as $1 and
+# $2, and the compose argv as the positional arguments after them, so no word of it is ever script text.
+# An empty value in the env file makes the helper print "unused", as for make: reads work, writes are
+# refused.
+DEV_UP_WRAPPER_SCRIPT = (
+    'INSTANCE_WRITE_SECRET="$(sh "$1" "$2")" || exit 1\nexport INSTANCE_WRITE_SECRET\nshift 2\nexec "$@"'
+)
+_DEV_UP_WRAPPER_WORDS = ('sh', '-c', DEV_UP_WRAPPER_SCRIPT, 'sh')
+
+
+def dev_up_wrapper_head(repo_host_path: Path) -> tuple[str, ...]:
+    """The six fixed leading words: sh -c SCRIPT sh <trusted helper> <repo host path>/.env."""
+    return (*_DEV_UP_WRAPPER_WORDS, str(TRUSTED_DEV_INSTANCE_SECRET), str(repo_host_path / DEV_ENV_FILES[0]))
+
+
+def _check_dev_wrapped_argv(
+    argv: Sequence[str],
+    repo_host_path: Path,
+    tail: Sequence[str],
+    name: str,
+    prefix_for: Callable[[Path], list[str]] = dev_file_prefix,
+) -> None:
+    """Refuse any argv but the fixed wrapper head and then exactly the file-based compose command of TAIL.
+
+    The remainder is checked by check_dev_lifecycle_argv, and must then be TAIL itself (the table also
+    holds the other rows, which this wrapper never carries). NAME only words the refusals.
+    """
+    words = tuple(argv)
+    head = dev_up_wrapper_head(repo_host_path)
+    if words[: len(head)] != head:
+        raise Refused(f'the dev {name} wrapper is its six fixed words and nothing else')
+    compose = words[len(head) :]
+    check_dev_lifecycle_argv(compose, repo_host_path)
+    if compose != (*prefix_for(repo_host_path), *tail):
+        raise Refused(f'the dev {name} wrapper runs the fixed {name} command, and no other')
+
+
+def check_dev_up_argv(argv: Sequence[str], repo_host_path: Path) -> None:
+    """Refuse any up argv but the fixed wrapper head and then exactly the file-based `up` compose command."""
+    _check_dev_wrapped_argv(argv, repo_host_path, DEV_UP_TAIL, 'up')
+
+
+def dev_up_step(stack_dir: Path, repo_host_path: Path, digests: Sequence[str]) -> Step:
+    """The wrapped `docker compose ... up -d --wait --wait-timeout 300 postgres data_store data_ingest web`, checked as built.
+
+    The step env is the full pinned env (compose reads the project's env files itself) plus the two
+    validated source digests, so an image compose builds anyway is stamped. The secret is in no env
+    here: the wrapper's child derives it.
+    """
+    if len(digests) != len(DEV_DIGEST_VARIABLES) or not all(
+        _DIGEST_PATTERN.fullmatch(f'{digest}\n'.encode()) for digest in digests
+    ):
+        raise Refused('up needs exactly one valid source digest per image')
+    argv = (*dev_up_wrapper_head(repo_host_path), *dev_file_prefix(repo_host_path), *DEV_UP_TAIL)
+    check_dev_up_argv(argv, repo_host_path)
+    env = (*dev_pinned_step_env(), *zip(DEV_DIGEST_VARIABLES, digests, strict=True))
+    return Step(argv, stack_dir, builds(DEV_UP_TAIL), env=env)
+
+
+def check_dev_tools_argv(argv: Sequence[str], repo_host_path: Path) -> None:
+    """Refuse any argv but the fixed wrapper head and then exactly the tools-file `up -d --wait pgadmin` command."""
+    _check_dev_wrapped_argv(argv, repo_host_path, DEV_TOOLS_TAIL, 'tools', dev_tools_prefix)
+
+
+def dev_tools_step(stack_dir: Path, repo_host_path: Path) -> Step:
+    """The wrapped `docker compose ... -f docker-compose.tools.yaml up -d --wait pgadmin`, checked as built.
+
+    The step env is the pinned env: compose reads the root env file itself, PGADMIN_EMAIL and
+    PGADMIN_PASS with it, so no credential is in an argv, the environment this server builds or its
+    output (it reads none of them). An unset one is compose's `:?` refusal, which names the variable
+    and never a value. No digest and not building: pgadmin is an image-only service, as is postgres.
+    """
+    argv = (*dev_up_wrapper_head(repo_host_path), *dev_tools_prefix(repo_host_path), *DEV_TOOLS_TAIL)
+    check_dev_tools_argv(argv, repo_host_path)
+    return Step(argv, stack_dir, env=dev_pinned_step_env())
+
+
+def dev_image_steps(stack_dir: Path) -> list[Step]:
+    """One fixed `docker image inspect --format {{.Id}}` per DEV_IMAGES entry: exit 0 when the image exists."""
+    return [base_inspect_step(ref, stack_dir) for ref in DEV_IMAGES]
+
+
+def dev_network_argv(create: bool) -> tuple[str, ...]:
+    """`docker network inspect DEV_NETWORK`, or `docker network create --driver bridge DEV_NETWORK` (make dev-network)."""
+    if create:
+        return (DOCKER, 'network', 'create', '--driver', 'bridge', DEV_NETWORK)
+    return (DOCKER, 'network', 'inspect', '--format', '{{.Name}}', DEV_NETWORK)
+
+
+def check_dev_network_argv(argv: Sequence[str]) -> None:
+    """Refuse any argv but one of the two dev_network_argv() commands, word for word."""
+    if tuple(argv) not in (dev_network_argv(False), dev_network_argv(True)):
+        raise Refused('the dev network step is inspect or create of the fixed network, and nothing else')
+
+
+def dev_network_steps(stack_dir: Path) -> tuple[Step, Step]:
+    """The inspect step and the create step (run only when the inspect fails), each checked as built."""
+    steps = []
+    for create in (False, True):
+        argv = dev_network_argv(create)
+        check_dev_network_argv(argv)
+        steps.append(Step(argv, stack_dir))
+    return steps[0], steps[1]
+
+
+# ---------------------------------------------------------------------------------------------
+# TEST MODE: test_build and test_up (tj-iee6sn.24; ADR tj-4rr0la addenda 26-27). `make test-build` and
+# `make system-launch` as PLAIN calls, on the :test images only. Neither command line can reach :latest:
+# the only file sets they are checked against hold docker-compose.fake.yaml, which names the :test refs.
+# test_up needs no secret wrapper and no network step: the base and fake files carry no
+# INSTANCE_WRITE_SECRET guard (that is the web files') and name no devnet; the services read their own
+# env_file through compose, as under make system-launch.
+def testmode_build_step(stack_dir: Path, repo_host_path: Path, digests: Sequence[str]) -> Step:
+    """`docker compose -p trader_joe_dev ... build data_store data_ingest` over the test build set, checked as built.
+
+    The step env is the placeholder env (no env file is read), DATA_DIR on the test dir and the two
+    validated source digests, which appear in no argv. Building, so the runner makes the bases present first.
+    """
+    if len(digests) != len(DEV_DIGEST_VARIABLES) or not all(
+        _DIGEST_PATTERN.fullmatch(f'{digest}\n'.encode()) for digest in digests
+    ):
+        raise Refused('test_build needs exactly one valid source digest per image')
+    argv = tuple(testmode_build_prefix(repo_host_path) + list(TEST_BUILD_TAIL))
+    check_dev_lifecycle_argv(argv, repo_host_path)
+    env = (*testmode_placeholder_step_env(), *zip(DEV_DIGEST_VARIABLES, digests, strict=True))
+    return Step(argv, stack_dir, builds(TEST_BUILD_TAIL), env=env)
+
+
+def testmode_up_step(stack_dir: Path, repo_host_path: Path) -> Step:
+    """`docker compose -p trader_joe_dev ... up -d --wait --wait-timeout 300` over the test set, checked as built.
+
+    The step env is the pinned env (compose reads the project's env files itself) with DATA_DIR on the
+    test dir. No digest: test_up requires both images to exist and match the checkout, so nothing is built.
+    """
+    argv = tuple(testmode_prefix(repo_host_path) + list(TEST_UP_TAIL))
+    check_dev_lifecycle_argv(argv, repo_host_path)
+    return Step(argv, stack_dir, builds(TEST_UP_TAIL), env=testmode_pinned_step_env())
+
+
+def testmode_image_steps(stack_dir: Path) -> list[Step]:
+    """One fixed `docker image inspect --format {{.Id}}` per TEST_IMAGES entry: exit 0 when the image exists."""
+    return [base_inspect_step(ref, stack_dir) for ref in TEST_IMAGES]
+
+
+# THE TEST DATABASE RAIL (run_system_tests, seed_dump; tj-iee6sn.20). The suite and the producer WRITE the
+# database of the running postgres, and the owner's attestation (SYSTEM_TEST_DISPOSABLE_DB=1) lives on the
+# make targets only. What stands in its place is a read of the running postgres container's own data mount:
+# one fixed `docker inspect`, and the verb is refused unless that mount's host source is exactly
+# <repo host path>/volume_data/test/postgres, the directory test_up pins. A dev postgres, or any other
+# mount, is refused whatever mode label its container carries.
+POSTGRES_DATA_TARGET = '/var/lib/postgresql/data'
+_POSTGRES_MOUNT_FORMAT = (
+    f'{{{{range .Mounts}}}}{{{{if eq .Destination "{POSTGRES_DATA_TARGET}"}}}}{{{{.Source}}}}{{{{end}}}}{{{{end}}}}'
+)
+
+
+def expected_test_postgres_mount(repo_host_path: Path) -> str:
+    """The only data mount source a test-mode postgres has: <repo host path>/volume_data/test/postgres."""
+    return str(repo_host_path / TEST_DATA_DIR / 'postgres')
+
+
+def postgres_mount_argv(container_id: str) -> tuple[str, ...]:
+    """`docker inspect` printing only the host source of the container's postgres data mount, by its checked id."""
+    return (
+        DOCKER,
+        'inspect',
+        '--type',
+        'container',
+        '--format',
+        _POSTGRES_MOUNT_FORMAT,
+        check_container_id(container_id),
+    )
+
+
+def check_postgres_mount_argv(argv: Sequence[str]) -> None:
+    """Refuse any argv but postgres_mount_argv() over a well-formed container id, word for word."""
+    words = tuple(argv)
+    if len(words) != 7 or words != postgres_mount_argv(words[-1]):
+        raise Refused('the postgres mount read is `docker inspect` of one container id, printing one mount source')
+
+
+def postgres_mount_step(stack_dir: Path, container_id: str) -> Step:
+    """The mount read of the running postgres container, checked as built."""
+    argv = postgres_mount_argv(container_id)
+    check_postgres_mount_argv(argv)
+    return Step(argv, stack_dir)
+
+
+def check_test_postgres_mount(exit_status: int | None, stdout: bytes, repo_host_path: Path) -> None:
+    """Refused unless the running postgres's data mount source is exactly <repo host path>/volume_data/test/postgres.
+
+    A failed read, bytes that are not UTF-8, an empty answer (no such mount) and any other source all refuse,
+    with the same fix; the refusal names the expected directory and, for a different source, that source.
+    """
+    expected = expected_test_postgres_mount(repo_host_path)
+    fix = f'the system suite writes only the postgres on {expected}: call test_up'
+    if exit_status != 0:
+        raise Refused(f'the running postgres container could not be read, so its data mount is unknown: {fix}')
+    try:
+        text = stdout.decode('utf-8')
+    except UnicodeDecodeError:
+        raise Refused(f'the postgres data mount is unreadable: {fix}') from None
+    source = text[:-1] if text.endswith('\n') else text
+    if source != expected:
+        shown = f'{source[:200]!r}' if source else 'none'
+        raise Refused(f'the running postgres data mount is {shown}, not the test directory: {fix}')
+
+
+# ---------------------------------------------------------------------------------------------
+# migrate (tj-iee6sn.10; owner ruling: ONE migrate, `make migrate`'s semantics, on whichever mode is up).
+# run_migrations.sh selects the definition from the running postgres; here the mode guard has already told
+# DEV from TEST (any PROD container, or both modes, was refused), and the MCP adds the script's own
+# one-postgres / at-most-one-data_store counts. DEV runs the file-based one-off `run --rm --no-deps data_store
+# alembic upgrade head` over the dev files, wrapped (compose interpolates the web files' INSTANCE_WRITE_SECRET
+# `:?` guard even for a one-off of data_store, so it goes through up's fixed secret wrapper, under the
+# pinned environment; make migrate loads only the first two files and needs no secret). TEST runs the same
+# words over the TEST set (base + docker-compose.fake.yaml: the :test image, no web file, no wrapper), with
+# DATA_DIR pinned on the test dir as test_up's is.
+#
+# NO ESCAPE HATCH, NO DRY RUN, NO CHECK. alembic check is not offered (make migrate-check covers it).
+def migrate_selection(mode: str) -> str:
+    """The selection line a migrate/migrate_status result starts with: the definition and mode chosen, as make migrate prints."""
+    if mode == MODE_TEST:
+        return (
+            f'using the TEST definition (docker-compose.yaml + docker-compose.fake.yaml) of project {DEV_PROJECT} '
+            'in TEST mode (the :test image; alembic.ini and revisions from the root checkout)'
+        )
+    return (
+        f'using the DEV definition (docker-compose.yaml + docker-compose.override.yaml) of project {DEV_PROJECT} '
+        'in DEV mode (revisions from the root checkout)'
+    )
+
+
+DEV_SOURCE_STAMP_LABEL = 'trader_joe.source.digest'
+_STAMP_PATTERN = re.compile(r'[0-9a-f]{64}')
+# The images whose build stamps the label (web is not stamped), and the one inspect format that reads it,
+# from an image or from a container started from one.
+STAMPED_IMAGES = (DEV_IMAGES[0], DEV_IMAGES[1], *TEST_IMAGES)
+_STAMP_FORMAT = f'{{{{ with .Config.Labels }}}}{{{{ index . "{DEV_SOURCE_STAMP_LABEL}" }}}}{{{{ end }}}}'
+
+
+def check_dev_migrate_argv(argv: Sequence[str], repo_host_path: Path) -> None:
+    """Refuse any argv but the fixed wrapper head and then exactly the `alembic upgrade head` compose command."""
+    _check_dev_wrapped_argv(argv, repo_host_path, DEV_MIGRATE_TAIL, 'migrate')
+
+
+def _dev_alembic_step(stack_dir: Path, repo_host_path: Path, tail: Sequence[str], check: Callable[..., None]) -> Step:
+    """The wrapped file-based one-off for TAIL, checked as built, under the pinned environment.
+
+    Nothing is added to the environment: no digest (the image exists, so compose builds nothing) and
+    no secret (the wrapper's child derives it).
+    """
+    argv = (*dev_up_wrapper_head(repo_host_path), *dev_file_prefix(repo_host_path), *tail)
+    check(argv, repo_host_path)
+    return Step(argv, stack_dir, builds(tail), env=dev_pinned_step_env())
+
+
+def dev_migrate_step(stack_dir: Path, repo_host_path: Path) -> Step:
+    """`... run --rm --no-deps data_store /code/.venv/bin/alembic upgrade head`, wrapped, checked as built."""
+    return _dev_alembic_step(stack_dir, repo_host_path, DEV_MIGRATE_TAIL, check_dev_migrate_argv)
+
+
+def check_testmode_migrate_argv(argv: Sequence[str], repo_host_path: Path) -> None:
+    """Refuse any argv but exactly the `alembic upgrade head` compose command over the TEST set, with no wrapper."""
+    words = tuple(argv)
+    check_dev_lifecycle_argv(words, repo_host_path)
+    if words != (*testmode_prefix(repo_host_path), *DEV_MIGRATE_TAIL):
+        raise Refused('the test migrate is the fixed `alembic upgrade head` command over the test set, and no other')
+
+
+def testmode_migrate_step(stack_dir: Path, repo_host_path: Path) -> Step:
+    """`... -f docker-compose.yaml -f docker-compose.fake.yaml run --rm --no-deps data_store /code/.venv/bin/alembic upgrade head`, checked as built.
+
+    The step env is the pinned env (compose reads the project's env files itself) with DATA_DIR on the test
+    dir. No wrapper (the base and fake files need no secret) and no digest: the :test image exists and is
+    verified by the caller, so compose builds nothing.
+    """
+    argv = (*testmode_prefix(repo_host_path), *DEV_MIGRATE_TAIL)
+    check_testmode_migrate_argv(argv, repo_host_path)
+    return Step(argv, stack_dir, builds(DEV_MIGRATE_TAIL), env=testmode_pinned_step_env())
+
+
+def testmode_data_store_image_step(stack_dir: Path) -> Step:
+    """`docker image inspect` of the data_store :test image: exit 0 when it exists (else compose would build it unstamped)."""
+    return base_inspect_step(TEST_IMAGES[0], stack_dir)
+
+
+def dev_data_store_image_step(stack_dir: Path) -> Step:
+    """`docker image inspect` of the data_store :dev image: exit 0 when it exists (else compose would build it unstamped)."""
+    return base_inspect_step(DEV_IMAGES[0], stack_dir)
+
+
+def refuse_several_dev_containers(service: str, lookup_stdout: bytes) -> None:
+    """Refuse when the lookup found more than one running SERVICE container: run_migrations.sh cannot tell which stack."""
+    count = len([line for line in lookup_stdout.decode('utf-8', errors='replace').splitlines() if line.strip()])
+    if count > 1:
+        raise Refused(f'{count} running {service} containers in the {DEV_PROJECT} project; cannot tell which stack')
+
+
+def stamp_image_fix(image: str) -> str:
+    """The verb that rebuilds IMAGE: test_build for a :test image, build for a :dev one."""
+    return 'call test_build' if image in TEST_IMAGES else 'call build'
+
+
+def dev_stamp_argv(image: str = DEV_IMAGES[0]) -> tuple[str, ...]:
+    """`docker image inspect` printing only the source-stamp label of IMAGE (default the data_store :dev image).
+
+    IMAGE is one of STAMPED_IMAGES, the four images whose build stamps the label; anything else is Refused.
+    """
+    if image not in STAMPED_IMAGES:
+        raise Refused(f'the source stamp is read from one of {", ".join(STAMPED_IMAGES)}, and no other image')
+    return (DOCKER, 'image', 'inspect', '--format', _STAMP_FORMAT, image)
+
+
+def check_dev_stamp_argv(argv: Sequence[str], image: str = DEV_IMAGES[0]) -> None:
+    """Refuse any argv but dev_stamp_argv(IMAGE), word for word."""
+    if tuple(argv) != dev_stamp_argv(image):
+        raise Refused(f'the stamp read is `docker image inspect` of {image}, printing one label')
+
+
+def dev_stamp_step(stack_dir: Path, image: str = DEV_IMAGES[0]) -> Step:
+    """The stamp read's one docker call for IMAGE, checked as built."""
+    argv = dev_stamp_argv(image)
+    check_dev_stamp_argv(argv, image)
+    return Step(argv, stack_dir)
+
+
+def container_stamp_argv(container_id: str) -> tuple[str, ...]:
+    """`docker inspect` printing only the source-stamp label of ONE RUNNING container, by its checked id."""
+    return (DOCKER, 'inspect', '--type', 'container', '--format', _STAMP_FORMAT, check_container_id(container_id))
+
+
+def check_container_stamp_argv(argv: Sequence[str]) -> None:
+    """Refuse any argv but container_stamp_argv() over a well-formed container id, word for word."""
+    words = tuple(argv)
+    if len(words) != 7 or words != container_stamp_argv(words[-1]):
+        raise Refused('the container stamp read is `docker inspect` of one container id, printing one label')
+
+
+def container_stamp_step(stack_dir: Path, container_id: str) -> Step:
+    """The stamp read of a running container (what the image it was started from was stamped with), checked as built."""
+    argv = container_stamp_argv(container_id)
+    check_container_stamp_argv(argv)
+    return Step(argv, stack_dir)
+
+
+def check_dev_image_stamp(
+    exit_status: int | None, stdout: bytes, checkout_digest: str, image: str = DEV_IMAGES[0]
+) -> None:
+    """run_migrations.sh's verify_comparison_image, minus its escape hatch: Refused unless the stamp equals the digest.
+
+    Three refusals, all naming the fix (stamp_image_fix(IMAGE): call build, or call test_build for a
+    :test image). A failed read means the image is not there; a stamp that is not 64 lowercase hex (an
+    unstamped image: one CI pulled and retagged, or one a bare compose build or run made implicitly) cannot be verified; a valid stamp
+    that differs is a stale image. A match returns.
+    """
+    fix = stamp_image_fix(image)
+    if exit_status != 0:
+        raise Refused(f'the image {image} could not be read, so there is nothing to compare against: {fix}')
+    stamp = stdout.decode('utf-8', errors='replace').strip()
+    if image in TEST_IMAGES:
+        if not _STAMP_PATTERN.fullmatch(stamp):
+            raise Refused(
+                f'CANNOT VERIFY: the image {image} carries no usable source stamp (absent is not a match): {fix}'
+            )
+        if stamp != checkout_digest:
+            raise Refused(
+                f'STALE: {image} was built from different source than this checkout '
+                f'(image stamp {stamp}, checkout digest {checkout_digest}): {fix}'
+            )
+        return
+    if not _STAMP_PATTERN.fullmatch(stamp):
+        raise Refused(
+            f'CANNOT VERIFY: the image {image} carries no usable source stamp, so what alembic check would '
+            f'compare cannot be established; absent is not a match: {fix}'
+        )
+    if stamp != checkout_digest:
+        raise Refused(
+            f'STALE IMAGE: {image} was built from different source than this checkout '
+            f'(image stamp {stamp}, checkout digest {checkout_digest}); alembic check would report phantom '
+            f'drift: {fix}'
+        )
+
+
+def check_container_stamp(exit_status: int | None, stdout: bytes, checkout_digest: str, service: str) -> None:
+    """The TEST gate of migrate: Refused unless the RUNNING SERVICE container's source stamp equals the checkout digest.
+
+    A running container keeps the image it was started from, and test_build can have retagged :test
+    since, so the container's own stamp is what proves the stack is current (a prod image bakes the code
+    in). A failed read, a stamp that is not 64 lowercase hex and a stamp that differs all refuse with the
+    same fix, and the digests of a mismatch are named.
+    """
+    fix = 'stale test stack: call test_build, then test_up'
+    if exit_status != 0:
+        raise Refused(f'the running {service} container could not be read, so its source stamp is unknown: {fix}')
+    stamp = stdout.decode('utf-8', errors='replace').strip()
+    if not _STAMP_PATTERN.fullmatch(stamp):
+        raise Refused(f'CANNOT VERIFY: the running {service} container carries no usable source stamp: {fix}')
+    if stamp != checkout_digest:
+        raise Refused(
+            f'STALE: the running {service} container was built from different source than this checkout '
+            f'(container stamp {stamp}, checkout digest {checkout_digest}): {fix}'
+        )
+
+
+# ---------------------------------------------------------------------------------------------
+# THE DEV PROJECT'S EXEC FAMILY (ADR tj-4rr0la addenda 22-23; owner ruling D9 on tj-iee6sn.1). A
+# SECOND argv family beside the compose one above, held by check_dev_exec_argv() instead of
+# check_dev_argv(): plain `docker exec`, never compose, so it reads no compose file and no env file.
+#
+# WHAT HOLDS IT. The agent names nothing: no container, no command, no SQL, no URL, no header. Every
+# exec argv is built from the module constants below and re-checked as built. The target container
+# comes from a label lookup (dev_lookup_argv), which must find exactly ONE RUNNING container.
+#
+# The labels compose puts on every container it creates. oneoff=False keeps `run` containers out.
+DEV_LABEL_PROJECT = 'com.docker.compose.project'
+DEV_LABEL_SERVICE = 'com.docker.compose.service'
+DEV_LABEL_ONEOFF = 'com.docker.compose.oneoff'
+# `docker ps --format` prints the short container id, 12 lowercase hex digits; the id is checked
+# before it is handed to exec, so nothing but an id can take its place in the argv.
+_CONTAINER_ID = re.compile(r'^[0-9a-f]{12,64}$')
+
+# Read-only for every statement of the session, whatever the SQL: psql reads PGOPTIONS (libpq).
+DEV_EXEC_PGOPTIONS = 'PGOPTIONS=-c default_transaction_read_only=on'
+# The option sets an exec may carry, each whole. Which one goes with which command is DEV_EXEC_COMMANDS
+# below: the options are bound to the command, never chosen separately, so the database script cannot
+# run as root or without the read-only option, nor the alembic wrapper as user postgres. -i, -t,
+# --privileged, --env-file, --env, any other -e and the attached spellings (-ePATH=x, -uroot) have no
+# set and so are refused.
+_DEV_EXEC_OPTIONS_POSTGRES = ('-u', 'postgres', '-e', DEV_EXEC_PGOPTIONS)
+_DEV_EXEC_OPTIONS_CODE = ('-w', '/code')
+
+# db_tables: the tables whose presence it reports (to_regclass, so a missing one is false, not an
+# error), in the order of the models under server/data/store/app/database/models. The schema is the
+# default, public: no model names another. alembic_version is alembic's own bookkeeping table.
+DEV_DB_TABLES = (
+    'dataset_read',
+    'dataset_read_daily',
+    'dataset_override_log',
+    'dataset_deletion',
+    'ingest_run',
+    'store_dataset_entry',
+    'stock_market_activity',
+    'alembic_version',
+)
+DEV_DB_VERSION_TABLE = 'alembic_version'
+_DEV_DB_TABLES_QUERY = ' UNION ALL '.join(
+    f"SELECT '{name}', to_regclass('public.{name}') IS NOT NULL" for name in DEV_DB_TABLES
+)
+# The second statement runs only when the first reported alembic_version present.
+_DEV_DB_VERSION_QUERY = "SELECT 'version_num', version_num FROM public.alembic_version ORDER BY version_num"
+# Run INSIDE the postgres container by `sh -c`, as user postgres, in a read-only session (PGOPTIONS).
+# POSTGRES_USER and POSTGRES_DB expand in the container and are never printed. Every byte printed
+# goes through redact: the values of the container's own secret variables, and of any variable
+# holding a database URL, become <redacted> before they leave the container. The scrub contract
+# (tj-4kyqk9), shared by every exec wrapper that pipes through redact: the secrets are the non-empty
+# values, plus each non-empty line of a multi-line value as its own secret, de-duplicated and redacted
+# over the whole output (awk reads it all, so a value spanning lines still matches); an empty value
+# is never a secret. The SQL is a constant with no placeholder: nothing is interpolated.
+_DEV_REDACT_NAMES = 'INSTANCE_WRITE_SECRET POSTGRES_PASS POSTGRES_PASSWORD ALPACA_API_KEY ALPACA_API_SECRET'
+# The scrub is the UNION of every match span: every occurrence of every secret is found over the
+# ORIGINAL text (stepping one character past each match start, so self-overlapping occurrences are
+# all found), overlapping and abutting spans merge, and each merged span becomes ONE <redacted>.
+# Order of secrets is irrelevant; over-redacting is acceptable, under-redacting is not. The input is
+# held as lines joined pairwise (O(n log n), no per-line growth of one string) and scanned in
+# windows so the cost stays near-linear; output is written piece by piece. When the caller sets
+# REDACT_TRUNCATED=1 (a constant signal, never a value) the input was cut by a byte bound, so the
+# longest trailing suffix that is a proper prefix of any secret is redacted too. Off by default.
+_DEV_REDACT_FUNCTION = r"""redact() { awk 'function put(s) { if (s != "" && !(s in seen)) { seen[s] = 1; secrets[++m] = s } }
+function add(v,  c, parts, q) { if (v == "") return; put(v); c = split(v, parts, "\n"); if (c > 1) for (q = 1; q <= c; q++) put(parts[q]) }
+function emit() { printf "%s<redacted>", substr(buf, pos, cs - pos); pos = ce + 1 }
+BEGIN { n = split("@NAMES@", names, " "); m = 0; maxl = 0
+  for (i = 1; i <= n; i++) add(ENVIRON[names[i]])
+  for (k in ENVIRON) if (ENVIRON[k] ~ /^postgres(ql)?(\+[a-z0-9]+)?:\/\//) add(ENVIRON[k])
+  for (a = 1; a <= m; a++) if (length(secrets[a]) > maxl) maxl = length(secrets[a])
+  trunc = (ENVIRON["REDACT_TRUNCATED"] == "1") }
+{ L[NR] = $0 }
+END { if (NR == 0) exit
+  for (c = NR; c > 1; c = int((c + 1) / 2)) { h = int(c / 2)
+    for (i = 1; i <= h; i++) L[i] = L[2 * i - 1] "\n" L[2 * i]
+    if (c % 2) L[h + 1] = L[c] }
+  buf = L[1]; N = length(buf); open = 0; pos = 1; B = (maxl > 4096 ? maxl : 4096)
+  for (base = 0; base < N && m > 0; base += B) {
+    win = substr(buf, base + 1, B + maxl - 1); cnt = 0; split("", mark)
+    for (j = 1; j <= m; j++) { v = secrets[j]; lv = length(v); rest = win; off = 0
+      while ((p = index(rest, v)) > 0) { off += p; if (off > B) break
+        s = base + off; e = s + lv - 1; if (!(s in mark) || mark[s] < e) mark[s] = e; cnt++
+        rest = substr(rest, p + 1) } }
+    if (cnt) for (i = base + 1; i <= base + B; i++) if (i in mark) { e = mark[i]
+      if (open && i <= ce + 1) { if (e > ce) ce = e } else { if (open) emit(); open = 1; cs = i; ce = e } } }
+  if (trunc) { kmax = 0
+    for (j = 1; j <= m; j++) { v = secrets[j]; k = length(v) - 1; if (k > N) k = N
+      for (; k > kmax; k--) if (substr(buf, N - k + 1) == substr(v, 1, k)) { kmax = k; break } }
+    if (kmax > 0) { i = N - kmax + 1
+      if (open && i <= ce + 1) ce = N; else { if (open) emit(); open = 1; cs = i; ce = N } } }
+  if (open) emit()
+  printf "%s\n", substr(buf, pos) }'; }""".replace('@NAMES@', _DEV_REDACT_NAMES)
+_DEV_DB_TABLES_TEMPLATE = (
+    _DEV_REDACT_FUNCTION
+    + r"""
+query() { psql -X -At -F '|' -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "$1" 2>&1; }
+tables=$(query "@TABLES@") || { printf '%s\n' "$tables" | redact; exit 1; }
+printf '%s\n' "$tables" | redact
+case "
+$tables
+" in *"
+@VERSION_TABLE@|t
+"*) version=$(query "@VERSION@") || { printf '%s\n' "$version" | redact; exit 1; }
+printf '%s\n' "$version" | redact;; esac"""
+)
+DEV_DB_TABLES_SCRIPT = (
+    _DEV_DB_TABLES_TEMPLATE.replace('@TABLES@', _DEV_DB_TABLES_QUERY)
+    .replace('@VERSION_TABLE@', DEV_DB_VERSION_TABLE)
+    .replace('@VERSION@', _DEV_DB_VERSION_QUERY)
+)
+DEV_DB_TABLES_TAIL = ('sh', '-c', DEV_DB_TABLES_SCRIPT)
+
+# migrate_status (DEV or TEST mode): alembic's `current`, then `history`, run in the RUNNING data_store container by
+# its own interpreter environment (PATH, DATABASE_URI) and its mounted alembic.ini and migrations/;
+# no env file and no compose file is read. Read-only against the database: `current` reads
+# alembic_version (dont_mutate) and `history` reads the revision files. Nothing is interpolated: the
+# two subcommands are literals, so no upgrade, stamp or check is constructible. alembic's output can
+# echo an environment value on error, so every printed line, errors included, goes through redact; the
+# first non-zero exit status is the script's. A header names each section.
+DEV_MIGRATE_STATUS_SCRIPT = (
+    _DEV_REDACT_FUNCTION
+    + r"""
+for sub in current history; do
+printf '== alembic %s ==\n' "$sub"
+out=$(/code/.venv/bin/alembic "$sub" 2>&1); rc=$?
+printf '%s\n' "$out" | redact
+[ "$rc" -eq 0 ] || exit "$rc"
+done"""
+)
+DEV_MIGRATE_STATUS_TAIL = ('sh', '-c', DEV_MIGRATE_STATUS_SCRIPT)
+
+# http_get: ONE GET of one of three fixed paths, by exec in the RUNNING data_store container
+# against http://127.0.0.1:$APP_INTERNAL_PORT, the way that service's own healthcheck probes /ping (the
+# image has python, no curl). The only caller input is NAME, a key of DEV_HTTP_GET_PATHS; the path is a
+# literal baked into that name's script, so no caller string reaches the argv or the script. The paths
+# are the app_endpoints constants (routers/common PING; routers/data_store GET_UI_CONFIG,
+# GET_UI_USAGE_SUMMARY), restated here because this server cannot import them.
+DEV_HTTP_GET_PATHS: dict[str, str] = {
+    'ping': '/ping',
+    'ui_config': '/ui/v1/config',
+    'usage_summary': '/ui/v1/stats/usage/summary',
+}
+# At most this many body bytes are handed on; one more is read to learn the body was longer. The bound
+# is the memory, time and scrub-cost bound (the redact awk is super-linear in merged spans).
+DEV_HTTP_GET_BODY_LIMIT = 65536
+# GET only (http.client, no redirects followed). Accept is the only header the script sets; http.client
+# adds Host and Accept-Encoding: identity itself; nothing else is sent, no X-Instance-Secret, nothing
+# from the caller. 10 s per socket operation, 20 s overall (a SIGALRM handler raises TimeoutError, so a
+# body trickled one byte at a time ends in the transport-failure path). Prints `@@<status>@@<cut>` then
+# up to LIMIT body bytes; the cut flag is the result of a length test on the bytes read (more than
+# LIMIT), never read from the body. A transport failure prints `@@000@@0` and the error text; the
+# except clears the alarm first, so a socket timeout just before the deadline cannot let SIGALRM fire
+# inside the handler. Exit: 0 for 2xx, 1 for any other status, 2 for a transport failure. The sh runs it
+# as `python -I` with its stderr discarded. No single quote may appear: it is embedded in single
+# quotes in the sh below.
+_DEV_HTTP_GET_PYTHON = r"""import http.client, os, signal, sys
+LIMIT = @LIMIT@
+def deadline(signum, frame):
+    raise TimeoutError("overall deadline of 20 s exceeded")
+signal.signal(signal.SIGALRM, deadline)
+signal.alarm(20)
+try:
+    conn = http.client.HTTPConnection("127.0.0.1", int(os.environ["APP_INTERNAL_PORT"]), timeout=10)
+    conn.request("GET", sys.argv[1], headers={"Accept": "application/json"})
+    resp = conn.getresponse()
+    body = resp.read(LIMIT + 1)
+    status = resp.status
+    signal.alarm(0)
+except Exception as exc:
+    signal.alarm(0)
+    sys.stdout.write("@@000@@0\n" + type(exc).__name__ + ": " + str(exc) + "\n")
+    sys.exit(2)
+cut = len(body) > LIMIT
+sys.stdout.write("@@%03d@@%d\n" % (status, 1 if cut else 0))
+sys.stdout.flush()
+sys.stdout.buffer.write(body[:LIMIT])
+sys.exit(0 if 200 <= status < 300 else 1)""".replace('@LIMIT@', str(DEV_HTTP_GET_BODY_LIMIT))
+# The sh around it. The header is validated against a fixed pattern before it is believed; the body
+# and any error text are printed only through redact (embedded verbatim), with REDACT_TRUNCATED=1 (the
+# literal, a signal) exported exactly when the python reported the cut. The container's own copy of
+# that variable is unset first. python runs with -I (the container's PYTHONPATH holds an agent-writable
+# directory, so a planted package could shadow the standard library) and its stderr goes to /dev/null:
+# only its stdout, which the except fills before any body, reaches redact. The script never reads
+# INSTANCE_WRITE_SECRET itself: only redact does. Two rules read the exit status rc alone, never the
+# body. (1) No valid header: a python that exits 0 or 1 did not report an HTTP status (1 is a
+# traceback, e.g. the alarm landing inside the except), so both report rc 2; rc above 2 keeps its value
+# and a `python exited <rc>` line. (2) A valid header and rc other than 0 or 1: python was killed
+# mid-write, so the body may end inside a secret; REDACT_TRUNCATED=1 is set for redact and `python
+# exited <rc>, body incomplete` follows the body (after the cut line, when that printed too).
+_DEV_HTTP_GET_TEMPLATE = (
+    _DEV_REDACT_FUNCTION
+    + r"""
+GET_PATH=@PATH@
+unset REDACT_TRUNCATED
+cut=
+res=$(/code/.venv/bin/python -I -c '@PYTHON@' "$GET_PATH" 2>/dev/null); rc=$?
+hdr=${res%%
+*}
+body=${res#*
+}
+[ "$res" = "$hdr" ] && body=
+status=
+case "$hdr" in
+@@000@@0) ;;
+@@[0-9][0-9][0-9]@@0) status=${hdr#@@}; status=${status%@@0};;
+@@[0-9][0-9][0-9]@@1) status=${hdr#@@}; status=${status%@@1}; cut=1; export REDACT_TRUNCATED=1;;
+esac
+if [ -z "$status" ]; then
+[ "$hdr" != '@@000@@0' ] || res=$body
+printf '== GET %s: no HTTP response ==\n' "$GET_PATH"
+printf '%s\n' "$res" | redact
+case "$rc" in 0|1|2) ;; *) printf 'python exited %s\n' "$rc";; esac
+[ "$rc" -gt 1 ] || rc=2
+exit "$rc"
+fi
+printf '== GET %s -> HTTP %s ==\n' "$GET_PATH" "$status"
+case "$rc" in 0|1) ;; *) export REDACT_TRUNCATED=1;; esac
+printf '%s\n' "$body" | redact
+[ -z "$cut" ] || printf '== body cut at @LIMIT@ bytes ==\n'
+case "$rc" in 0|1) ;; *) printf 'python exited %s, body incomplete\n' "$rc";; esac
+exit $rc"""
+)
+
+
+def _dev_http_get_script(path: str) -> str:
+    return (
+        _DEV_HTTP_GET_TEMPLATE.replace('@PYTHON@', _DEV_HTTP_GET_PYTHON)
+        .replace('@PATH@', path)
+        .replace('@LIMIT@', str(DEV_HTTP_GET_BODY_LIMIT))
+    )
+
+
+# name -> its whole tail. Each is a literal row of DEV_EXEC_COMMANDS below.
+DEV_HTTP_GET_TAILS: dict[str, tuple[str, ...]] = {
+    name: ('sh', '-c', _dev_http_get_script(path)) for name, path in DEV_HTTP_GET_PATHS.items()
+}
+
+# THE TABLE. Each whole tail an exec may run (program, flag and script) maps to the ONE option set it
+# runs with. A tail not listed is refused even when its program is `sh`; a listed tail with any other
+# option set is refused.
+DEV_EXEC_COMMANDS: dict[tuple[str, ...], tuple[str, ...]] = {
+    DEV_DB_TABLES_TAIL: _DEV_EXEC_OPTIONS_POSTGRES,
+    DEV_MIGRATE_STATUS_TAIL: _DEV_EXEC_OPTIONS_CODE,
+    **dict.fromkeys(DEV_HTTP_GET_TAILS.values(), ()),
+}
+
+
+def dev_lookup_argv(service: str) -> tuple[str, ...]:
+    """`docker ps` for the running, non-one-off containers of DEV_PROJECT's SERVICE; prints ids only."""
+    return (
+        DOCKER,
+        'ps',
+        '--filter',
+        'status=running',
+        '--filter',
+        f'label={DEV_LABEL_PROJECT}={DEV_PROJECT}',
+        '--filter',
+        f'label={DEV_LABEL_SERVICE}={service}',
+        '--filter',
+        f'label={DEV_LABEL_ONEOFF}=False',
+        '--format',
+        '{{.ID}}',
+    )
+
+
+def check_dev_lookup_argv(argv: Sequence[str]) -> None:
+    """Refuse any lookup argv but dev_lookup_argv() of one DEV_SERVICES member, word for word."""
+    words = tuple(argv)
+    if not any(words == dev_lookup_argv(service) for service in DEV_SERVICES):
+        raise Refused('a dev lookup is `docker ps` filtered to one dev service of the project, printing ids only')
+
+
+def dev_lookup_step(stack_dir: Path, service: str) -> Step:
+    """The label lookup of one dev service's running container(s), checked as built."""
+    argv = dev_lookup_argv(validate_dev_service(service))
+    check_dev_lookup_argv(argv)
+    return Step(argv, stack_dir)
+
+
+def check_container_id(value: object) -> str:
+    """A container id as `docker ps --format {{.ID}}` prints it: lowercase hex, 12 to 64 digits."""
+    if not isinstance(value, str) or not _CONTAINER_ID.fullmatch(value):
+        raise Refused('the container lookup returned something that is not a container id')
+    return value
+
+
+def pick_dev_target(service: str, lookup_stdout: bytes) -> str:
+    """The one running container the lookup found; Refused on none or several, naming the count.
+
+    Refusing on several is deliberate: guessing between two containers of one service would exec into
+    one the user did not mean. The ids are never listed.
+    """
+    ids = [line.strip() for line in lookup_stdout.decode('utf-8', errors='replace').splitlines() if line.strip()]
+    if not ids:
+        raise Refused(
+            f'no running {service} container in the {DEV_PROJECT} project: '
+            'start the project first: up (your dev data) or test_up (test mode)'
+        )
+    if len(ids) > 1:
+        raise Refused(
+            f'{len(ids)} running {service} containers in the {DEV_PROJECT} project; '
+            'refusing to guess which one to exec into'
+        )
+    return check_container_id(ids[0])
+
+
+def optional_dev_target(service: str, lookup_stdout: bytes) -> str | None:
+    """The one running container the lookup found, None when SERVICE is not running; Refused on several."""
+    refuse_several_dev_containers(service, lookup_stdout)
+    ids = [line.strip() for line in lookup_stdout.decode('utf-8', errors='replace').splitlines() if line.strip()]
+    return check_container_id(ids[0]) if ids else None
+
+
+def check_dev_exec_argv(argv: Sequence[str]) -> None:
+    """Refuse any argv but `docker exec <options> <id> <tail>` for one row of DEV_EXEC_COMMANDS, whole.
+
+    Checked on the words that go to the daemon, not on the builders' intent. The tail must be wholly a
+    key of the table and the words between `exec` and the container id must be exactly that key's one
+    option set, in order: no other option, no other value, no other combination, no attached spelling.
+    The id is a container id as the lookup prints it.
+    """
+    words = tuple(argv)
+    if words[:2] != (DOCKER, 'exec'):
+        raise Refused('a dev exec runs only `docker exec`')
+    for tail, options in DEV_EXEC_COMMANDS.items():
+        head = (DOCKER, 'exec', *options)
+        if words[: len(head)] == head and len(words) == len(head) + 1 + len(tail) and words[len(head) + 1 :] == tail:
+            check_container_id(words[len(head)])
+            return
+    raise Refused('a dev exec runs only its fixed programs with their fixed arguments and options')
+
+
+def dev_exec_steps(stack_dir: Path, container_id: str, tail: Sequence[str]) -> list[Step]:
+    """One `docker exec` Step: the checked id, a tail from DEV_EXEC_COMMANDS and that tail's own options.
+
+    The options come from the table and are not arguments: a caller cannot choose a user, a working
+    directory or the read-only variable. Checked as built.
+    """
+    options = DEV_EXEC_COMMANDS.get(tuple(tail))
+    if options is None:
+        raise Refused('a dev exec runs only its fixed programs with their fixed arguments and options')
+    argv = (DOCKER, 'exec', *options, check_container_id(container_id), *tail)
+    check_dev_exec_argv(argv)
+    return [Step(argv, stack_dir)]
+
+
+def dev_db_tables_steps(stack_dir: Path, container_id: str) -> list[Step]:
+    """db_tables' one exec: the fixed psql script, as user postgres, in a read-only session."""
+    return dev_exec_steps(stack_dir, container_id, DEV_DB_TABLES_TAIL)
+
+
+def dev_migrate_status_steps(stack_dir: Path, container_id: str) -> list[Step]:
+    """migrate_status' one exec: alembic current and history in the running data_store, in /code."""
+    return dev_exec_steps(stack_dir, container_id, DEV_MIGRATE_STATUS_TAIL)
+
+
+def validate_dev_http_get_name(name: object) -> str:
+    """NAME must be a key of the closed DEV_HTTP_GET_PATHS; anything else (a path, a URL, empty) is Refused."""
+    if not isinstance(name, str) or name not in DEV_HTTP_GET_PATHS:
+        raise Refused(f'name must be one of: {", ".join(DEV_HTTP_GET_PATHS)}')
+    return name
+
+
+def dev_http_get_steps(stack_dir: Path, container_id: str, name: str) -> list[Step]:
+    """http_get's one exec: the fixed GET script of NAME's path, in the running data_store."""
+    return dev_exec_steps(stack_dir, container_id, DEV_HTTP_GET_TAILS[validate_dev_http_get_name(name)])
+
+
+# The status the script reports on its FIRST line (never a later one: the body follows it and is not
+# trusted): `== GET <path> -> HTTP <status> ==`.
+_HTTP_GET_STATUS = re.compile(r'== GET \S+ -> HTTP (\d{3}) ==(?:\n|\Z)')
+
+
+def parse_http_get_status(stdout: bytes) -> int | None:
+    """The HTTP status the script printed, or None when it reported no HTTP response."""
+    match = _HTTP_GET_STATUS.match(stdout.decode('utf-8', errors='replace'))
+    return int(match.group(1)) if match else None
+
+
+# db_tables' output, parsed. A line is `<table>|t` or `<table>|f` for a DEV_DB_TABLES name, or
+# `version_num|<revision>`; anything else is not reported as data (the raw, redacted output stays in
+# the step). A revision is alembic's: letters, digits and underscores.
+_REVISION = re.compile(r'^[A-Za-z0-9_]{1,64}$')
+
+
+def parse_db_tables(stdout: bytes) -> tuple[dict[str, bool], str | None]:
+    """({table: present}, revision or None) from the script's stdout; unknown lines are ignored."""
+    tables: dict[str, bool] = {}
+    version: str | None = None
+    for line in stdout.decode('utf-8', errors='replace').splitlines():
+        name, _, value = line.partition('|')
+        if name in DEV_DB_TABLES and value in ('t', 'f'):
+            tables[name] = value == 't'
+        elif name == 'version_num' and _REVISION.fullmatch(value):
+            version = value
+    return tables, version

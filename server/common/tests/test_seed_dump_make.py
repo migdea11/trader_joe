@@ -24,6 +24,7 @@ from common.tests.compose_model import BASE_FILE, FAKE_FILE, TEST_CLIENT_FILE, l
 from common.tests.test_ci_invariants import (
     _ACCEPTED_GUARDS,
     _REFUSED_GUARDS,
+    DEV_PROJECT,
     MAKEFILE,
     REPO_ROOT,
     SYSTEM_GUARD,
@@ -50,7 +51,8 @@ PRODUCER_WORDS = [
     '-m',
     'data.store.seeds',
 ]
-# Item 3: base + fake overlay + test-client file, the default project (the stack system-launch started).
+# Item 3: base + fake overlay + test-client file, in the stack system-launch started: project trader_joe_dev
+# since tj-grna9p.161 (ADR tj-4rr0la addendum 29), never the default project prod keeps.
 SEED_DUMP_FILES = [BASE_FILE.name, FAKE_FILE.name, TEST_CLIENT_FILE.name]
 SEED_OUT_DEFAULT = 'output/seeds'
 
@@ -147,8 +149,8 @@ def test_the_seed_dump_stack_adds_no_writable_bind_and_test_client_has_none():
     client), the writable binds are exactly the fake stack's own (system-launch's model), none of
     them test_client's.
 
-    The agent stack's O1 (no service built from agent source has a writable bind) is pinned on the
-    merged agent model in test_agent_stack_compose.py, which loads the same test-client file.
+    The retired agent stack's O1 (no service built from agent source has a writable bind) went with
+    test_agent_stack_compose.py (tj-iee6sn.27); this set, which the MCP's seed_dump mirrors, is pinned here.
     """
     model = merge([load(BASE_FILE), load(FAKE_FILE), load(TEST_CLIENT_FILE)])
     without_client = merge([load(BASE_FILE), load(FAKE_FILE)])
@@ -157,11 +159,11 @@ def test_the_seed_dump_stack_adds_no_writable_bind_and_test_client_has_none():
     assert not [bind for bind in _writable_binds(model) if bind[0] == 'test_client']
 
 
-def test_seed_dump_compose_is_the_fake_stack_plus_the_test_client_in_the_default_project():
-    """Item 3: base + fake overlay + test-client file; no -p, so it joins the stack system-launch started."""
+def test_seed_dump_compose_is_the_fake_stack_plus_the_test_client_in_the_dev_project():
+    """Item 3: base + fake overlay + test-client file; -p trader_joe_dev, so it joins the stack system-launch started."""
     expanded = _expanded_make_variable('SEED_DUMP_COMPOSE', REPO_ROOT, _subprocess_env())
     assert _compose_calls(expanded) == [(SEED_DUMP_FILES, [])], expanded
-    assert _compose_projects(expanded) == [None], expanded
+    assert _compose_projects(expanded) == [DEV_PROJECT], expanded
 
 
 # --- V7 and the recipe: the guard, the .env check, the invocation ----------------------------------
@@ -231,7 +233,7 @@ def test_make_n_prints_the_guard_before_the_compose_run(tmp_path: Path):
     assert result.returncode == 0, result.stderr
     text = re.sub(r'\\\n\t?', ' ', result.stdout)
     guard = text.find('if [ "" != "1" ]')
-    run = text.find('compose -f')
+    run = text.find(f'docker compose -p {DEV_PROJECT} -f')
     assert guard != -1 and run != -1 and guard < run, text
 
 
@@ -262,7 +264,7 @@ def test_seed_dump_runs_the_one_invocation_and_pipes_it_to_the_host_writer(
     [call] = _lines(logs['docker'])
     [(files, rest)] = _compose_calls(f'docker {call}')
     assert files == SEED_DUMP_FILES and rest == PRODUCER_WORDS, call
-    assert '-p' not in call.split() and 'exec' not in call.split(), call
+    assert _compose_projects(f'docker {call}') == [DEV_PROJECT] and 'exec' not in call.split(), call
     assert _lines(logs['writer']) == [f'-m data.store.seeds.bundle --out {SEED_OUT_DEFAULT}']
     assert logs['stdin'].read_text(encoding='utf-8') == BUNDLE_LINE + '\n', 'the writer did not get the bundle'
 

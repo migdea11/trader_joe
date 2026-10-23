@@ -19,8 +19,8 @@ FILTERING. The hub fans every event out to every socket, so each assertion keeps
 test's symbol (a run's label is '<symbol> <granularity>') or this test's dataset id. The suite runs serially, so
 nothing else should be publishing, but the filter keeps the tests honest if something does.
 
-NOT PROVED HERE: the upgrade through Caddy at /api/store/ui/v1/events. The agent stack has no web service
-(ADR tj-4rr0la); that is a host step on tj-grna9p.81.
+NOT PROVED HERE: the upgrade through Caddy at /api/store/ui/v1/events. Test mode has no web service
+(ADR tj-4rr0la addendum 27: base file plus the fake overlay); that is a host step on tj-grna9p.81.
 
 CLEANUP. ingest_run has no foreign key, so the entry cascade does not reach it: this module deletes the run rows
 carrying this run's symbol at the end, as test_http_ingest_runs.py does.

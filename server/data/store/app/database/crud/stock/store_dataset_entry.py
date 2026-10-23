@@ -13,6 +13,18 @@ from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, U
 from common.errors.vocabulary import InvalidRequestError, Reason
 from common.logging import get_logger
 from common.sensitive import REDACTED
+from data.store.app.client_label import OPERATOR_PRINCIPAL
+from data.store.app.database.crud.dataset_override import (
+    AuditUnavailable,
+    OperatorOverrideInput,
+    append_deletion,
+    append_override,
+    audit_tables_exist,
+    overriding_reason,
+)
+from data.store.app.database.crud.ingest_run import dataset_has_running_run
+from data.store.app.database.models.dataset_deletion import DatasetDeletion
+from data.store.app.database.models.dataset_override_log import OverrideAction
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.database.transaction import write_transaction
@@ -414,8 +426,96 @@ def _check_owner(existing: StoreDatasetEntry, declared_owner: str) -> None:
         raise OwnerMismatch(existing.id)
 
 
+async def lock_active_entry(db: AsyncSession, entry: asset_dataset_store.AssetDatasetStoreCreate) -> uuid.UUID | None:
+    """Lock the entry this identity names and return its id, unless it is gone or retired. The scheduled refresh's check.
+
+    tj-grna9p.22. The DAILY refresh read its dataset at the start of its pass; an operator may have retired it (set
+    collect to false) while the vendor call was in flight. The row is read FOR UPDATE, as reaper_delete_entry does, so a
+    retire that commits later waits for this transaction and one that committed earlier is seen here. The lock is
+    held until the caller's transaction ends, which is the fetch's commit: bars are never written for a dataset
+    that was retired before them.
+
+    The retired rule is the one the UI judges by (app/dataset_catalog.is_retired): a DAILY or STREAM dataset whose
+    collect is false; the expiry is never read. It is spelled here because that module imports this layer.
+
+    Args:
+        db: The session, inside the caller's transaction.
+        entry: The entry the fetch's ack resolved, whole identity (the tape included).
+
+    Returns:
+        uuid.UUID | None: The locked entry's id, or None when it no longer exists or is retired.
+    """
+    values = StoreDatasetEntry.get_fields(entry, exclude_none=True)
+    conditions = [
+        getattr(StoreDatasetEntry, column) == values[column]
+        for column in (*_IDENTITY_EQUALITY_COLUMNS, *_RANGE_COLUMNS)
+    ]
+    result = await db.execute(
+        select(StoreDatasetEntry).where(*conditions).with_for_update().execution_options(populate_existing=True)
+    )
+    existing = result.scalar_one_or_none()
+    if existing is None:
+        return None
+    if existing.collect is False and UpdateType(existing.update_type) in (UpdateType.DAILY, UpdateType.STREAM):
+        return None
+    return existing.id
+
+
+async def lock_stored_collect(db: AsyncSession, entry: asset_dataset_store.AssetDatasetStoreCreate) -> bool | None:
+    """Lock the entry this identity names and return its stored collect; None when it has no row or is STATIC.
+
+    The POST /store path reads it before the upsert so it can tell a collect flip from a write that left it alone
+    (collect_change). The row is locked until the caller's transaction ends, so the value read is the one the upsert
+    replaces.
+
+    Args:
+        db: The session, inside the caller's transaction.
+        entry: The entry the fetch's ack resolved, whole identity (the tape included).
+
+    Returns:
+        bool | None: The stored collect, or None when no row exists or the dataset is STATIC.
+    """
+    values = StoreDatasetEntry.get_fields(entry, exclude_none=True)
+    conditions = [
+        getattr(StoreDatasetEntry, column) == values[column]
+        for column in (*_IDENTITY_EQUALITY_COLUMNS, *_RANGE_COLUMNS)
+    ]
+    result = await db.execute(select(StoreDatasetEntry.collect).where(*conditions).with_for_update())
+    return result.scalar_one_or_none()
+
+
+def collect_change(before: bool | None, explicit: bool | None) -> bool | None:
+    """The collect value a write flipped an entry to, or None when it flipped nothing.
+
+    Args:
+        before: The stored collect before the write; None for a new row or a STATIC dataset (no intent to flip).
+        explicit: The collect the write carried; None when omitted, which leaves the stored value alone.
+
+    Returns:
+        bool | None: The new value (True resumed, False retired) when it differs from a stored one, else None.
+    """
+    if before is None or explicit is None or before == explicit:
+        return None
+    return explicit
+
+
+def _resolved_collect(update_type: UpdateType, collect: bool | None) -> bool | None:
+    """The collect value an entry is written with: the intent for a subscription (omitted means true), NULL for STATIC.
+
+    The column's CHECK demands exactly this shape (ck_store_dataset_entry_collect_by_type), so a DAILY or STREAM row
+    is never written without one. The schema refuses a collect on a STATIC request before it gets here.
+    """
+    if update_type is UpdateType.STATIC:
+        return None
+    return True if collect is None else collect
+
+
 async def upsert_entry_in_transaction(
-    db: AsyncSession, entry: asset_dataset_store.AssetDatasetStoreCreate
+    db: AsyncSession,
+    entry: asset_dataset_store.AssetDatasetStoreCreate,
+    *,
+    preserve_lifecycle: bool = False,
+    collect: bool | None = None,
 ) -> uuid.UUID:
     """Create a dataset entry, or resolve an exact repeat, INSIDE A TRANSACTION THE CALLER OWNS.
 
@@ -440,17 +540,33 @@ async def upsert_entry_in_transaction(
     Args:
         db: The session, already inside the caller's transaction.
         entry: The dataset to create or match.
+        preserve_lifecycle: True for a SYSTEM caller (the scheduled DAILY refresh, tj-grna9p.22): an exact repeat
+            then refreshes updated_at and NOTHING ELSE, so the stored expiry is left exactly as the operator set it.
+            False, which every request path sends, is the interactive behaviour: a repeat sets expiry from the
+            body, so omitting it clears a stored one.
+        collect: The operator's collect intent from the request body; None when it was omitted. Written as true for a
+            DAILY or STREAM entry then, and as NULL for STATIC whatever is passed. An exact repeat sets it from the
+            body only when it is explicit: omitting it on a repeat leaves the stored intent unchanged, so a retried body
+            cannot resume a stopped subscription. The system caller (preserve_lifecycle) never changes it.
 
     Returns:
         uuid.UUID: The id of the created entry, or of the one an exact repeat matched.
     """
     log.debug(f'Upserting entry: {entry}')
     field_values = StoreDatasetEntry.get_fields(entry, exclude_none=True)
+    resolved_collect = _resolved_collect(UpdateType(entry.update_type), collect)
 
-    stmt = postgresql.insert(StoreDatasetEntry).values(**field_values, created_at=func.now(), updated_at=func.now())
-    stmt = stmt.on_conflict_do_update(
-        constraint=StoreDatasetEntry.NATURAL_KEY_CONSTRAINT,
-        set_={
+    # collect is written explicitly, NULL included: the column's CHECK refuses a DAILY or STREAM row without one.
+    stmt = postgresql.insert(StoreDatasetEntry).values(
+        **field_values, collect=resolved_collect, created_at=func.now(), updated_at=func.now()
+    )
+    if preserve_lifecycle:
+        # THE SYSTEM CALLER LEAVES EVERY LIFECYCLE FIELD ALONE (tj-grna9p.22). The scheduled refresh sends the
+        # expiry it read at the start of its pass, which an operator's retire may have replaced since; writing it
+        # back would undo the retire with no override-log row. Identity columns are never in set_.
+        conflict_values = {'updated_at': func.now()}
+    else:
+        conflict_values = {
             # An exact repeat refreshes expiry and updated_at and nothing else (tj-vhboky.1
             # section 3(a) / Amendment 1 item P) -- still a no-op in the sense idempotency
             # requires: the entry id does not change and no bar moves.
@@ -463,14 +579,21 @@ async def upsert_entry_in_transaction(
             # scope here (common/ is builder-shared's) -- worked around, not fixed.
             'expiry': field_values['expiry'],
             'updated_at': func.now(),
-        },
-    )
+        }
+        if collect is not None and resolved_collect is not None:
+            # Only an EXPLICIT collect changes the stored intent (tj-hhy3dk addendum): an omitted one leaves it as the
+            # operator set it, so an SDK retry of its original body cannot undo a Stop. Unlike expiry, which a repeat
+            # sets from the body. STATIC has no intent and its schema refuses an explicit one.
+            conflict_values['collect'] = resolved_collect
+    stmt = stmt.on_conflict_do_update(constraint=StoreDatasetEntry.NATURAL_KEY_CONSTRAINT, set_=conflict_values)
     stmt = stmt.returning(StoreDatasetEntry.id)
     result = await db.execute(stmt)
     return result.scalar_one()
 
 
-async def upsert_entry(db: AsyncSession, entry: asset_dataset_store.AssetDatasetStoreCreate) -> uuid.UUID:
+async def upsert_entry(
+    db: AsyncSession, entry: asset_dataset_store.AssetDatasetStoreCreate, *, collect: bool | None = None
+) -> uuid.UUID:
     """Create a dataset entry, or resolve an exact repeat to the entry it already matches.
 
     IDENTITY REPLACES MERGING (tj-vhboky.1 section 2): every field, the range AND the resolved
@@ -501,7 +624,7 @@ async def upsert_entry(db: AsyncSession, entry: asset_dataset_store.AssetDataset
         # building one -- the dataset path, which has no entry until the ack, builds the key first
         # and extends it afterwards (tj-xn3qa6 D3).
         await check_own_overlap(db, OverlapKey.of(entry))
-        return await upsert_entry_in_transaction(db, entry)
+        return await upsert_entry_in_transaction(db, entry, collect=collect)
 
 
 async def update_entry(db: AsyncSession, entry: asset_dataset_store.AssetDatasetStoreUpdate) -> None:
@@ -629,21 +752,256 @@ async def search_entries(
     ]
 
 
-async def delete_entry_by_id(db: AsyncSession, id: uuid.UUID, owner: str) -> None:
-    """Delete an entry by its ID.
+async def _delete_entry_row(db: AsyncSession, id: uuid.UUID) -> None:
+    """Delete the entry row, and with it its bars, inside the caller's transaction.
 
     Cascades to its bars via ON DELETE CASCADE on the bar's dataset_id foreign key (T3: every bar
     belongs to exactly one entry now), so the database removes exactly this entry's bars and
     nothing else. There is no membership sweep, no RETURNING capture and no IN-list here anymore
     -- that removes the ~65,000-bar IN-list ceiling (D1) structurally rather than by code.
+
+    Raises:
+        EntryNotFound: If the row is gone by the time the statement runs.
     """
+    stmt = delete(StoreDatasetEntry).where(StoreDatasetEntry.id == id)
+    result = await db.execute(stmt)
+    if result.rowcount == 0:
+        # Raced with a concurrent delete between the SELECT before and this statement. The
+        # rollback for this path comes from write_transaction, the same as every other error
+        # path here (tj-ck5spw).
+        raise EntryNotFound(id)
+
+
+async def _delete_and_record(db: AsyncSession, existing: StoreDatasetEntry, *, cause: str, actor: str) -> None:
+    """Count the dataset's bars, delete it (its bars cascade) and write the deletion record, in the caller's transaction.
+
+    ONE BODY FOR BOTH CAUSES: the operator's delete and the reaper's write the same record shape, differing only in
+    `cause` and `actor`. The caller owns the transaction and, for the reaper, the row lock that makes the count and
+    the delete describe the same rows.
+
+    Raises:
+        EntryNotFound: If the row is gone by the time the delete runs.
+    """
+    count = select(func.count(StockMarketActivity.id)).where(StockMarketActivity.dataset_id == existing.id)
+    bars = (await db.execute(count)).scalar_one()
+    await _delete_entry_row(db, existing.id)
+    await append_deletion(
+        db,
+        dataset_id=existing.id,
+        owner=existing.owner,
+        asset_symbol=existing.asset_symbol,
+        source=existing.source.name,
+        granularity=existing.granularity.name,
+        update_type=UpdateType(existing.update_type).name,
+        range_start=existing.start,
+        range_end=None if existing.end == NullableDateTime.EPOCH else existing.end,
+        bars_deleted=bars,
+        cause=cause,
+        actor=actor,
+    )
+
+
+async def delete_entry_by_id(db: AsyncSession, id: uuid.UUID, owner: str) -> None:
+    """Delete an entry by its ID, as its declared owner. Its bars go with it (see _delete_entry_row)."""
     async with write_transaction(db, f'delete entry {id}'):
         existing = await _get_entry_or_raise(db, id)
         _check_owner(existing, owner)
-        stmt = delete(StoreDatasetEntry).where(StoreDatasetEntry.id == id)
+        await _delete_entry_row(db, id)
+
+
+# THE OPERATOR PATH (tj-grna9p.86). The two functions below are the /ui/v1 writes. They do NOT go through
+# _check_owner and so cannot be reached by an owner-scoped caller by accident: the operator may act on any
+# dataset, but on another owner's only with a confirmed override carrying a reason, which is recorded in the
+# same transaction as the write (overriding_reason decides; the override log holds the row).
+
+
+async def operator_set_expiry(
+    db: AsyncSession, id: uuid.UUID, expiry: 'datetime | None', override: OperatorOverrideInput | None
+) -> None:
+    """Set or clear a dataset's expiry as the operator, recording an override when the dataset is another owner's.
+
+    The expiry is the DELETION date only, for every update type: setting it retires nothing and clearing it
+    resumes nothing (collecting is the collect intent, operator_set_collecting). The expiry TYPE is never touched. The write and its override-log row are one transaction. The caller publishes the change
+    event after this returns.
+
+    Args:
+        db: The session.
+        id: The dataset's id.
+        expiry: The new expiry, aware; None clears it.
+        override: The override the request carried, if any.
+
+    Raises:
+        EntryNotFound: NOT_FOUND, no such dataset, or it was deleted while the UPDATE waited. Checked before the
+            override, and again on the UPDATE's row count before the override row is written.
+        OverrideRequired: OVERRIDE_REQUIRED, another owner's dataset without a valid override.
+        AuditUnavailable: DATABASE_UNAVAILABLE, the audit tables are missing. Checked after the override and
+            before any write.
+    """
+    recording = await audit_tables_exist(db)
+    async with write_transaction(db, f'operator set expiry {id}'):
+        existing = await _get_entry_or_raise(db, id)
+        reason = overriding_reason(existing.owner, OPERATOR_PRINCIPAL, override)
+        if reason is not None and not recording:
+            raise AuditUnavailable
+        stmt = update(StoreDatasetEntry).where(StoreDatasetEntry.id == id).values(expiry=expiry, updated_at=func.now())
         result = await db.execute(stmt)
         if result.rowcount == 0:
-            # Raced with a concurrent delete between the SELECT above and this statement. The
-            # rollback for this path comes from write_transaction, the same as every other error
-            # path here (tj-ck5spw).
+            # The row went between the read and this UPDATE (the reaper's delete committed while this waited on
+            # its lock). Raised before the override row is written, so the transaction rolls back with no
+            # append-only log row for a dataset that no longer exists, and the route answers 404 before it
+            # publishes. The same guard as _delete_entry_row.
             raise EntryNotFound(id)
+        if reason is not None:
+            await append_override(
+                db,
+                actor=OPERATOR_PRINCIPAL,
+                dataset_id=id,
+                owner=existing.owner,
+                action=OverrideAction.SET_EXPIRY,
+                reason=reason,
+            )
+
+
+async def operator_set_collecting(
+    db: AsyncSession, id: uuid.UUID, collect: bool, override: OperatorOverrideInput | None
+) -> bool | None:
+    """Set a DAILY or STREAM subscription's collect intent as the operator, recording an override on another owner's.
+
+    The write and its override-log row are one transaction. Nothing else on the entry changes, the expiry included.
+    The caller publishes the change event after this returns, RETIRED or RESUMED when the value flipped.
+
+    Args:
+        db: The session.
+        id: The dataset's id.
+        collect: True to collect the subscription, False to stop it (it reads RETIRED).
+        override: The override the request carried, if any.
+
+    Returns:
+        bool | None: The new collect when it differs from the stored one (False retired, True resumed), else None.
+
+    Raises:
+        EntryNotFound: NOT_FOUND, no such dataset, or it was deleted while the UPDATE waited. Checked first, and
+            again on the UPDATE's row count before the override row is written.
+        InvalidRequestError: INVALID_REQUEST (422), the dataset is STATIC: it has no collect intent. Checked after
+            the 404 and before the override.
+        OverrideRequired: OVERRIDE_REQUIRED, another owner's dataset without a valid override.
+        AuditUnavailable: DATABASE_UNAVAILABLE, the audit tables are missing. Checked after the override and
+            before any write.
+    """
+    recording = await audit_tables_exist(db)
+    async with write_transaction(db, f'operator set collecting {id}'):
+        existing = await _get_entry_or_raise(db, id)
+        if UpdateType(existing.update_type) is UpdateType.STATIC:
+            raise InvalidRequestError(
+                Reason.INVALID_REQUEST, 'A STATIC dataset has no collect intent: collect applies to subscriptions only.'
+            )
+        reason = overriding_reason(existing.owner, OPERATOR_PRINCIPAL, override)
+        if reason is not None and not recording:
+            raise AuditUnavailable
+        # Read the stored value under the row lock BEFORE the UPDATE: the session writes the new value onto the loaded
+        # object, so reading existing.collect afterwards would always equal `collect` and never report a flip.
+        locked = await db.execute(select(StoreDatasetEntry.collect).where(StoreDatasetEntry.id == id).with_for_update())
+        collect_before = locked.scalar_one_or_none()
+        if collect_before is None:
+            # A subscription's collect is never NULL (ck_store_dataset_entry_collect_by_type), so None means the row
+            # went between the read and this lock: the same guard as operator_set_expiry.
+            raise EntryNotFound(id)
+        stmt = (
+            update(StoreDatasetEntry).where(StoreDatasetEntry.id == id).values(collect=collect, updated_at=func.now())
+        )
+        result = await db.execute(stmt)
+        if result.rowcount == 0:
+            # The row went between the read and this UPDATE: the same guard as operator_set_expiry.
+            raise EntryNotFound(id)
+        if reason is not None:
+            await append_override(
+                db,
+                actor=OPERATOR_PRINCIPAL,
+                dataset_id=id,
+                owner=existing.owner,
+                action=OverrideAction.SET_COLLECTING,
+                reason=reason,
+            )
+        return collect_change(collect_before, collect)
+
+
+async def operator_delete_entry(db: AsyncSession, id: uuid.UUID, override: OperatorOverrideInput | None) -> None:
+    """Delete a dataset and its bars as the operator, writing the deletion record and any override row with it.
+
+    One transaction: the delete, the deletion record, and, on another owner's dataset, the override-log row.
+    The caller publishes the change event after this returns.
+
+    Args:
+        db: The session.
+        id: The dataset's id.
+        override: The override the request carried, if any.
+
+    Raises:
+        EntryNotFound: NOT_FOUND, no such dataset. Checked before the override.
+        OverrideRequired: OVERRIDE_REQUIRED, another owner's dataset without a valid override.
+        AuditUnavailable: DATABASE_UNAVAILABLE, the audit tables are missing. Checked after the override and
+            before any write.
+    """
+    recording = await audit_tables_exist(db)
+    async with write_transaction(db, f'operator delete entry {id}'):
+        existing = await _get_entry_or_raise(db, id)
+        reason = overriding_reason(existing.owner, OPERATOR_PRINCIPAL, override)
+        if not recording:
+            raise AuditUnavailable
+        await _delete_and_record(db, existing, cause=DatasetDeletion.CAUSE_OPERATOR, actor=OPERATOR_PRINCIPAL)
+        if reason is not None:
+            await append_override(
+                db,
+                actor=OPERATOR_PRINCIPAL,
+                dataset_id=id,
+                owner=existing.owner,
+                action=OverrideAction.DELETE,
+                reason=reason,
+            )
+
+
+# The actor the deletion record names for the expiry reaper's deletions (a system action, not the operator).
+REAPER_ACTOR = 'reaper'
+
+
+async def reaper_delete_entry(db: AsyncSession, id: uuid.UUID, now: 'datetime') -> bool:
+    """Delete a dataset whose expiry has passed, as the expiry reaper, recording it in the deletion record.
+
+    One transaction: the delete and its deletion row (cause REAPER, actor 'reaper'). NO override-log row: this is
+    a system action, not an operator override. The caller checks audit_tables_exist first and publishes the
+    change event after this returns. The row is read FOR UPDATE and its expiry and running-ingest state
+    checked again under that lock, so a dataset whose expiry was moved out of the past since the pass listed it, or
+    that has an ingest running, is left alone.
+
+    Args:
+        db: A session of its own; this function commits.
+        id: The dataset's id.
+        now: The instant expiry is judged at; aware.
+
+    Returns:
+        bool: True when the dataset was deleted, False when its expiry no longer lies in the past or an ingest is
+            running for it.
+
+    Raises:
+        EntryNotFound: NOT_FOUND, the dataset is already gone.
+    """
+    async with write_transaction(db, f'reaper delete entry {id}'):
+        # THE ROW LOCK IS THE FIRST STATEMENT. A PATCH that extends the expiry either commits before this read (the
+        # re-check below then sees the new expiry) or blocks on this lock until the reaper's transaction ends and
+        # then finds the row gone (404). An unlocked read, or a conditional DELETE, would let it commit between.
+        result = await db.execute(
+            select(StoreDatasetEntry)
+            .where(StoreDatasetEntry.id == id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        existing = result.scalar_one_or_none()
+        if existing is None:
+            raise EntryNotFound(id)
+        if existing.expiry is None or existing.expiry > now:
+            return False
+        # Re-checked under the lock; the pass checked once before. A fetch not yet acknowledged is not visible here.
+        if await dataset_has_running_run(db, id):
+            return False
+        await _delete_and_record(db, existing, cause=DatasetDeletion.CAUSE_REAPER, actor=REAPER_ACTOR)
+    return True

@@ -183,8 +183,9 @@ init: $(VENV_MARKER)  ## Initialize the project, including the security tooling
 # WHO GENERATES, AND WHEN. The host, through this target, which every target that needs the tree
 # takes as a prerequisite: the five pytest targets, `security` (bandit reads gen/proto/python) and
 # the three image builds (the Dockerfile COPYs it out of the build context). It costs ~0.15s and is
-# unconditional -- no stamp file, because a stamp keyed on the .proto mtimes would not notice a
-# grpcio-tools bump, and a guard that can be stale is the hollow kind this repo keeps finding. The
+# unconditional -- no stamp file gates it, because a stamp keyed on the .proto mtimes would not notice a
+# grpcio-tools bump, and a guard that can be stale is the hollow kind this repo keeps finding. (The
+# content stamp written at the end of this target gates nothing here: it is for readers, below.) The
 # targets that only RUN an image already built -- test-system, system-launch, migrate-check,
 # seed-dump -- deliberately keep no prerequisite: they have no $(VENV_MARKER) either, because the
 # host they run on may be a server with no usable uv, and they cannot be reached before a build.
@@ -242,8 +243,21 @@ PROTO_SRC := proto
 PROTO_GEN := gen/proto/python
 PROTO_PKG := $(PROTO_GEN)/trader_joe/proto
 
+# THE CONTENT STAMP (bead tj-grna9p.164). The last step of this target writes the digest of its inputs,
+# as tools/proto_digest.sh prints it, to $(PROTO_GEN).digest -- gen/proto/python.digest, a SIBLING of
+# the tree and not inside it, so neither the clearing step below nor protoc can remove it. A reader
+# asks "do the inputs now equal the inputs the last generation that wrote this stamp was run from" by
+# recomputing the digest and comparing: by content, never by mtime. That is all the stamp records: the
+# INPUTS of that generation, not proof of what is in the tree (a generation run outside make, or an
+# edit of the tree itself, does not touch it). The old stamp is deleted FIRST, so a generation that
+# fails or is interrupted leaves no stamp and reads as stale. Not written for a scratch PROTO_SRC: the script
+# digests the repository's proto/, so a stamp beside a tree built from elsewhere would be a lie.
+# Nothing under gen/ is committed.
+PROTO_STAMP = $(PROTO_GEN).digest
+
 .PHONY: proto
 proto: $(VENV_MARKER)  ## Generate gen/proto/python/ from proto/ (never committed; every target that needs it runs this first)
+	@rm -f "$(PROTO_STAMP)"
 	@! [ -e "$(PROTO_PKG)" ] || [ -f "$(PROTO_PKG)/__init__.py" ] || { echo "make proto: $(PROTO_PKG) exists but $(PROTO_PKG)/__init__.py is missing; refusing to clear a directory that is not the generated package." >&2; exit 1; }
 	@outside="$$(find "$(PROTO_SRC)" -name '*.proto' ! -path "$(patsubst %/,%,$(PROTO_SRC))/trader_joe/proto/*" | LC_ALL=C sort)"; \
 	[ -z "$$outside" ] || { \
@@ -255,6 +269,7 @@ proto: $(VENV_MARKER)  ## Generate gen/proto/python/ from proto/ (never committe
 	find "$(PROTO_PKG)" -mindepth 1 -maxdepth 1 ! -name __init__.py -exec rm -rf {} +
 	uv run python -m grpc_tools.protoc -I$(PROTO_SRC) --python_out=$(PROTO_GEN) --grpc_python_out=$(PROTO_GEN) --pyi_out=$(PROTO_GEN) \
 		$$(find $(PROTO_SRC) -name '*.proto' | LC_ALL=C sort)
+	@[ "$(PROTO_SRC)" != proto ] || { digest="$$(tools/proto_digest.sh python)" && printf '%s\n' "$$digest" > "$(PROTO_STAMP)"; }
 
 # THE ERROR CATALOGUE (ADR tj-fa1rpu, the Q-URI addendum of 2026-10-02; tj-3mk3u5.37.10). docs/errors.md
 # is generated from the ONE Reason table in server/common/errors, and is committed like gen/proto/ above and for
@@ -303,40 +318,52 @@ errors-doc: $(VENV_MARKER)  ## Regenerate docs/errors.md from server/common/erro
 # docker-compose.web.dev.yaml, which turns the same service into the Vite dev server with hot reload
 # from the bind-mounted ./web/src. Both publish the one loopback port WEB_PORT (default 8088): only one
 # stack runs at a time, and a dev session never runs beside prod on the same machine anyway. The
-# agent stack never loads either file, and the base file never gains the service. The overlay's
+# MCP's own project never loads either file, and the base file never gains the service. The overlay's
 # INSTANCE_WRITE_SECRET carries a ":?" guard like POSTGRES_PASS, so every command through PROD_COMPOSE
 # needs it in the root .env or the shell; prod-down passes a placeholder the way dev-down does for
-# pgAdmin, for the same reason. DEV_COMPOSE and TOOLS_COMPOSE do not need it (tj-grna9p.104): compose
-# interpolates every file before merging, so the guard fires on the prod web file even though the dev
-# overlay blanks the value afterwards, and a DEV .env that leaves the secret empty (its shipped state)
-# would fail dev-build, dev-deps, dev-tools and dev-launch before anything started. DEV_COMPOSE
-# therefore carries a placeholder that is only a fallback: the shell-default form keeps a value the
-# shell already holds. The placeholder reaches nothing but interpolation -- the dev web service blanks
-# the variable and a browser must never hold it, and data_store reads the real secret from its
-# env_file, which compose does not take from the shell. A value that lives only in the root .env is
-# not visible to the shell, so the placeholder outranks it in interpolation, which changes nothing a
-# container receives. PROD_COMPOSE never carries a placeholder: the prod proxy injects the real secret.
+# pgAdmin, for the same reason. DEV_COMPOSE and TOOLS_COMPOSE are not required to have it set
+# (tj-grna9p.104, .133): compose interpolates every file before merging, so the guard fires on the
+# prod web file, and a DEV .env that leaves the secret empty (its shipped state) would otherwise fail
+# dev-build, dev-deps, dev-tools and dev-launch before anything started. DEV_COMPOSE therefore sets
+# INSTANCE_WRITE_SECRET itself, from tools/dev_instance_secret.sh, in the recipe's shell: the shell's
+# value if non-empty, else the last INSTANCE_WRITE_SECRET= line of the root .env, else the placeholder
+# "unused". A shell value outranks the root .env in compose interpolation, so a bare shell default
+# would hide a configured .env value, the dev web container would get "unused" and data_store (which
+# reads the real secret from its env_file) would refuse every dev write; reading .env here is what
+# makes dev writes work. With the shipped empty .env the placeholder reaches the dev web container:
+# reads work and writes are refused, which is the safe default. The command substitution is expanded
+# by the recipe's shell, never by make, so `make -n` and make's echoed commands show the call and
+# never the value. PROD_COMPOSE never carries a placeholder: the prod proxy injects the real secret.
+#
+# THE COMPOSE PROJECTS (ADR tj-4rr0la addendum 29; owner ruling on tj-oxxl8a, option A). Dev and test
+# carry an EXPLICIT project name, DEV_PROJECT, on every compose set below that is not prod's. PROD_COMPOSE
+# carries NO -p: prod keeps today's name (compose's default, the checkout directory's name) and today's
+# launch, untouched -- prod is THE trader joe, hence the default name. The effect is that no dev or test
+# target can reach prod's containers: every up, down, ps, run and logs those sets issue addresses
+# trader_joe_dev and nothing else. A down never needs to know what prod is called.
+#
+# THE HAZARD THAT REMAINS, and it fails safe. Prod and dev on ONE host still collide on what both sets
+# fix host-wide: container names (docker-compose.yaml container_name ${DATABASE_NAME} for postgres) and
+# published ports (docker-compose.web.yaml, 127.0.0.1:WEB_PORT). Both clash for certain. A third fixed
+# name is shared too: the network trader_joe_store_api (docker-compose.yaml, default of STORE_API_NETWORK)
+# is a SHARED fixed network name whose clash is UNPROVEN: compose may only warn and reuse it rather than
+# fail. Not clashes: devnet (dev only; the override declares it
+# external and prod never loads the override), pgAdmin (only TOOLS_COMPOSE, dev, loads its file) and the
+# DATA_DIR bind (two bind mounts of one directory are both allowed). Whichever launches second fails
+# LOUDLY on a real clash and changes nothing of the first. That failure is the intended outcome, not a
+# bug to route around: no target here tears down the other project to make room.
+# DEV_PROJECT is a FIXED constant, not a knob (owner ruling, tj-grna9p.192): dev and test are one compose
+# project, named here and nowhere else a user can reach. `override` makes a command-line value
+# (make dev-down DEV_PROJECT=other) change nothing, and the environment cannot change it either, so no
+# invocation retargets DEV_COMPOSE, TOOLS_COMPOSE, TEST_CLIENT_COMPOSE or SYSTEM_COMPOSE. Keep it equal to
+# the MCP's stack.DEV_PROJECT and run_migrations.sh's DEV_PROJECT, which are separate constants.
+override DEV_PROJECT := trader_joe_dev
 PROD_COMPOSE := docker compose -f docker-compose.yaml -f docker-compose.web.yaml
 # Dev gains devnet through the override, which attaches every stack service to it (tj-q9ae5u
 # addendum 1). PROD_COMPOSE never loads the override, so a prod launch never attaches devnet --
 # which is also what keeps a dev session off a prod stack on the same machine.
-DEV_COMPOSE := INSTANCE_WRITE_SECRET="$${INSTANCE_WRITE_SECRET:-unused}" docker compose -f docker-compose.yaml -f docker-compose.override.yaml -f docker-compose.web.yaml -f docker-compose.web.dev.yaml
+DEV_COMPOSE := INSTANCE_WRITE_SECRET="$$(sh tools/dev_instance_secret.sh)" docker compose -p $(DEV_PROJECT) -f docker-compose.yaml -f docker-compose.override.yaml -f docker-compose.web.yaml -f docker-compose.web.dev.yaml
 TOOLS_COMPOSE := $(DEV_COMPOSE) -f docker-compose.tools.yaml
-# THE AGENT STACK (ADR tj-4rr0la section 1 and addendum 1). The isolated stack the agent-stack MCP
-# drives from an agent's worktree, under its own compose project so it never shares a container,
-# network or volume with the stack prod-launch or the dev targets start (both use the default
-# project, the checkout's directory name). The base file, the test client, then
-# docker-compose.agent-stack.yaml so its names and image tags win over both, then the fake-mode
-# overlay docker-compose.fake.yaml AFTER it (tj-vhboky.61; ADR tj-4rr0la addendum 3 (3)), so the
-# agent stack's data_ingest always runs on FakeRead -- it has no egress and no broker key anyway,
-# and the fake overlay touches nothing the agent-stack overlay sets. The server passes its
-# generated env file as well, never the user's .env, and that env also points the services' env
-# files outside the repository (ROOT_ENV_FILE, STORE_ENV_FILE, INGEST_ENV_FILE; addendum 2). No
-# target here uses these: the MCP server is their only reader. And the mirror of the rule above:
-# PROD_COMPOSE, DEV_COMPOSE and TOOLS_COMPOSE never load the agent-stack overlay, and this set
-# never loads the dev override or the tools file -- no devnet, no publish.
-AGENT_STACK_PROJECT := trader_joe_agent_stack
-AGENT_STACK_COMPOSE := docker compose -p $(AGENT_STACK_PROJECT) -f docker-compose.yaml -f docker-compose.test-client.yaml -f docker-compose.agent-stack.yaml -f docker-compose.fake.yaml
 
 # The dev network: an ordinary bridge (NOT internal) owned by neither compose project, which the
 # dev stack, pgAdmin and the agent devcontainer all join, so either side can start first. Its
@@ -440,7 +467,7 @@ prod-down:  ## Stop the production stack
 # inherits data_store's networks; devnet is an ordinary bridge, so it can reach out there like any
 # dev service. On the production definition it has store_db only.
 .PHONY: migrate
-migrate:  ## Apply database migrations to the running stack (dev or prod; prints which)
+migrate:  ## Apply database migrations to the running stack (dev, test or prod; prints which)
 	./server/data/store/run_migrations.sh
 
 # READ-ONLY, and the approval for this target was conditional on staying that way: `current`
@@ -500,8 +527,8 @@ migrate-status:  ## Report the applied revision and the revision history (read-o
 # carries a source stamp equal to this checkout's digest, and prints both on EVERY outcome. The
 # guard lives in the script and not in this recipe because the script owns the stack selection
 # that decides which image the one-off container uses: on a dev stack the comparison image is
-# :dev and the FIX line names `make dev-build` (tj-yb1bxj addendum 4), otherwise :latest and
-# `make prod-build`. The reasoning is written out there. It is gated on the alembic command
+# :dev and the FIX line names `make dev-build` (tj-yb1bxj addendum 4); on a test stack (make system-launch) it is :test and
+# names `make test-build`; otherwise :latest and `make prod-build`. The reasoning is written out there. It is gated on the alembic command
 # being `check`, so `migrate` is untouched.
 #
 # THE HELP LINE NAMES THE REFUSAL, THE ORDINARY UNSTAMPED CASE AND THE ESCAPE HATCH, AND POINTS AT
@@ -516,7 +543,7 @@ migrate-status:  ## Report the applied revision and the revision history (read-o
 # already puzzled about why a check passed. That was R4's actual purpose, and a help row nobody
 # reads documents nothing.
 .PHONY: migrate-check
-migrate-check:  ## Compare the models with the live schema (writes alembic_version if absent). REFUSES unless the data_store image's source stamp matches this checkout's digest; an unstamped CI or system-launch image is the ordinary case, not a fault -- make prod-build (make dev-build on a dev stack) fixes it. What the stamp does and does not cover: see the comment above. Escape hatch: MIGRATE_CHECK_ALLOW_STALE_IMAGE=1
+migrate-check:  ## Compare the models with the live schema (writes alembic_version if absent). REFUSES unless the data_store image's source stamp matches this checkout's digest; an unstamped image (CI's, or one compose built implicitly) is the ordinary case, not a fault -- the stack's own build fixes it: make dev-build (dev), make test-build (test), make prod-build (prod). What the stamp does and does not cover: see the comment above. Escape hatch: MIGRATE_CHECK_ALLOW_STALE_IMAGE=1
 	./server/data/store/run_migrations.sh check
 
 .PHONY: dev-build
@@ -536,8 +563,28 @@ dev-network:  ## Create the shared dev network if it is missing (never removed)
 		|| docker network create --driver bridge $(DEV_NETWORK) > /dev/null \
 		|| docker network inspect $(DEV_NETWORK) > /dev/null
 
+# Launching dev tears down fake mode (ADR tj-4rr0la addendum 26 (4)). A fake-mode container (the
+# test mode: docker-compose.fake.yaml among its com.docker.compose.project.config_files) is
+# on ./volume_data/test; an `up` of the dev files would recreate postgres onto the owner's DATA_DIR
+# while that fake data_ingest kept running, and fake bars would reach the owner's database. So this
+# downs the dev/test project (DEV_PROJECT, trader_joe_dev: its ps and its down both come from the -p
+# on DEV_COMPOSE and TOOLS_COMPOSE, so the lookup and the teardown reach the same project and no
+# other), by dev-up's own line, ONLY when a running container of that project carries the fake file
+# by basename. Otherwise it does nothing, and in particular it never takes down a dev stack: a plain
+# dev-deps next to a running dev stack stays an in-place `up`. Prod's containers live in another
+# project, so neither the ps nor the down can see them, whatever files they carry.
+# dev-up downs unconditionally and needs no prerequisite.
+.PHONY: leave-fake-mode
+leave-fake-mode:
+	@ids="$$($(DEV_COMPOSE) ps -q 2>/dev/null)"; \
+	if [ -n "$$ids" ] && docker inspect --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}' $$ids 2>/dev/null \
+		| grep -Eq '(^|[,/])docker-compose\.fake\.yaml(,|$$)'; then \
+		echo "leave-fake-mode: a fake-mode container is up; taking the project down first."; \
+		PGADMIN_EMAIL=unused PGADMIN_PASS=unused $(TOOLS_COMPOSE) down; \
+	fi
+
 .PHONY: dev-deps
-dev-deps: $(VENV_MARKER) dev-network  ## Start the development dependencies (postgres)
+dev-deps: $(VENV_MARKER) dev-network leave-fake-mode  ## Start the development dependencies (postgres)
 	$(DEV_COMPOSE) up -d postgres
 
 # pgAdmin is a tool, not a dependency: it lives in docker-compose.tools.yaml, which dev-deps and
@@ -545,7 +592,7 @@ dev-deps: $(VENV_MARKER) dev-network  ## Start the development dependencies (pos
 # needs PGADMIN_EMAIL/PGADMIN_PASS set. compose brings postgres up first, because pgadmin
 # depends on it being healthy. Stop it with dev-down.
 .PHONY: dev-tools
-dev-tools: $(VENV_MARKER) dev-network  ## Start pgAdmin against the development database (needs PGADMIN_*)
+dev-tools: $(VENV_MARKER) dev-network leave-fake-mode  ## Start pgAdmin against the development database (needs PGADMIN_*)
 	$(TOOLS_COMPOSE) up -d pgadmin
 
 # Foreground on purpose, unlike prod-launch: --reload prints what it reloaded and why, and
@@ -553,6 +600,34 @@ dev-tools: $(VENV_MARKER) dev-network  ## Start pgAdmin against the development 
 .PHONY: dev-launch
 dev-launch: dev-deps  ## Start the development services in the foreground, with reload (web: Vite hot reload)
 	$(DEV_COMPOSE) up data_store data_ingest web
+
+# Detached, for a caller that must get its terminal back (tj-iee6sn.5, ADR tj-4rr0la addendum 23
+# (2), owner ruling R6). The agent-stack MCP's up verb runs this recipe's up with the same flags and
+# services, through its own prefix; its down matches this one in effect, not in spelling (below). It
+# brings the dev project DOWN first, so there is never more than one instance of it: compose allows
+# one container per service per project, and a make dev-launch still attached in a terminal would
+# otherwise be left watching containers this target replaced. The down DELIBERATELY ends that session.
+# The down goes through TOOLS_COMPOSE, the same compose set as dev-down and the same project as the
+# up below: both carry -p trader_joe_dev (DEV_PROJECT), in any checkout whatever its directory is
+# called, and neither can reach prod's project. The MCP's dev verbs address the same explicit
+# name (tj-iee6sn.31, landed), so its label-only down and this one target the same project. The
+# two downs remove the same containers unless the project holds an orphan: the label-only down
+# removes every container in the project, this one only the services its files define, pgAdmin
+# included. Neither -v nor --remove-orphans is spelled (D2). pgAdmin goes down with the rest, on
+# placeholder credentials that are safe on a down only (see dev-down). The database is a host bind
+# (DATA_DIR/postgres), not a volume, and survives.
+# Postgres is in the up list: the down removed it with the rest, and compose recreates it onto the
+# same data. --wait returns once every listed service is healthy (data_store's start_period is 60s).
+.PHONY: dev-up
+dev-up: dev-network  ## Stop the dev stack, then start postgres and the dev services detached, waiting for healthy (ends an attached dev-launch)
+	PGADMIN_EMAIL=unused PGADMIN_PASS=unused $(TOOLS_COMPOSE) down
+	$(DEV_COMPOSE) up -d --wait --wait-timeout 300 postgres data_store data_ingest web
+
+# The dev counterpart of prod-logs, there being none until now. Follows the three app services;
+# Ctrl-C stops the follow and leaves the containers running.
+.PHONY: dev-logs
+dev-logs:  ## Follow the development service logs
+	$(DEV_COMPOSE) logs -f data_store data_ingest web
 
 # Through TOOLS_COMPOSE, so a pgAdmin started by dev-tools goes down with the rest instead of
 # being left running as an orphan on the project network. Costs nothing when it is not running.
@@ -564,7 +639,7 @@ dev-launch: dev-deps  ## Start the development services in the foreground, with 
 # stack never requires pgAdmin credentials. They are safe here and ONLY here: `down` creates no
 # container, so no pgAdmin account can ever be initialised from them. Shell variables outrank
 # .env in compose interpolation, which is why they must never be copied onto an `up`. The
-# INSTANCE_WRITE_SECRET placeholder comes from DEV_COMPOSE (tj-grna9p.104), where it is a fallback.
+# INSTANCE_WRITE_SECRET comes from DEV_COMPOSE (tj-grna9p.104, .133), resolved from the shell or .env.
 .PHONY: dev-down
 dev-down:  ## Stop the development stack, pgAdmin included
 	PGADMIN_EMAIL=unused PGADMIN_PASS=unused $(TOOLS_COMPOSE) down --remove-orphans
@@ -705,10 +780,11 @@ AGENT_MCP_NETWORK := trader_joe_agent_mcp
 # and the MCP project's own --project-directory. Recursive (=), so git runs only when an MCP recipe
 # expands it, never on `make test`.
 AGENT_MCP_REPO_HOST_PATH = $(patsubst %/.git,%,$(shell git rev-parse --path-format=absolute --git-common-dir))
-# The agent stack's own directory, outside the repository, AGENT_HOME_PATH and the share directory
-# (agent-mcp-paths refuses otherwise): generated env files, data, snapshot, audit log.
+# The MCP's own directory, outside the repository, AGENT_HOME_PATH and the share directory
+# (agent-mcp-paths refuses otherwise): the snapshot, the audit log and the MCP's other state. Named
+# like the MCP's project and network (trader_joe_agent_mcp); an owner who set the variable is unaffected.
 # tools/agent_mcp/settings.py documents it.
-AGENT_MCP_STACK_DIR ?= $(or $(XDG_DATA_HOME),$(HOME)/.local/share)/trader_joe_agent_stack
+AGENT_MCP_STACK_DIR ?= $(or $(XDG_DATA_HOME),$(HOME)/.local/share)/trader_joe_agent_mcp
 AGENT_MCP_COMPOSE = AGENT_MCP_REPO_HOST_PATH="$(AGENT_MCP_REPO_HOST_PATH)" \
 	AGENT_MCP_STACK_DIR="$(AGENT_MCP_STACK_DIR)" AGENT_MCP_SHARE_PATH="$(AGENT_MCP_SHARE_PATH)" \
 	AGENT_MCP_UID="$$(id -u)" AGENT_MCP_GID="$$(id -g)" \
@@ -844,10 +920,9 @@ agent-mcp-rebuild: agent-mcp-network agent-mcp-paths  ## Rebuild and recreate th
 
 # STOPS the MCP and its proxy and KEEPS the containers (addendum 9 (a)), so the next plain start
 # re-reads no compose file. `docker stop` by label, like the start: no compose file read here either.
-# The agent STACK the MCP drives is a separate project: stop it first with the stack_down verb (or
-# leave it; it keeps its data). The external network stays.
+# The external network stays. The dev project the MCP drives is not touched.
 .PHONY: agent-mcp-down
-agent-mcp-down:  ## Stop (not remove) the agent-stack MCP and its socket proxy (the agent stack itself: stack_down verb)
+agent-mcp-down:  ## Stop (not remove) the agent-stack MCP and its socket proxy only
 	@ids="$$($(call AGENT_MCP_CONTAINER,agent_mcp)) $$($(call AGENT_MCP_CONTAINER,socket_proxy))"; \
 	[ -z "$$(echo $$ids)" ] || docker stop $$ids > /dev/null
 
@@ -1313,10 +1388,21 @@ web-install:  ## npm ci in web/ (exact lockfile install; the network step of the
 	$(NODE_PIN_CHECK)
 	$(WEB_NPM) ci
 
+# The TS twin of the Python content stamp above (tj-grna9p.164): gen/proto/ts.digest, written as the
+# LAST step of the generation, the old one deleted first, OUTSIDE gen/proto/ts because web/buf.gen.yaml
+# has clean: true on that folder. The stamp records the INPUTS of the last generation that wrote it
+# (protos, buf.yaml and web/buf.gen.yaml), not proof of what is in the tree. Every ts generation
+# stamps, make or npm, and there is ONE writer: web/scripts/gen-proto.sh (what `npm run gen:proto`
+# runs) deletes the stamp, runs buf generate, and writes the stamp last via tools/proto_digest.sh ts.
+# This recipe only calls it (tj-grna9p.188); the rm below just clears a stale stamp if npm never
+# reaches the script.
+TS_STAMP := gen/proto/ts.digest
+
 .PHONY: gen-proto-ts
 gen-proto-ts:  ## Generate gen/proto/ts from proto/ (never committed; typecheck, test and build run it first)
 	$(NODE_PIN_CHECK)
 	$(WEB_MODULES_CHECK)
+	@rm -f "$(TS_STAMP)"
 	$(WEB_NPM) run gen:proto
 
 .PHONY: web-lint
@@ -1548,18 +1634,18 @@ test-all: $(VENV_MARKER) proto  ## Run every test, external included: needs live
 # THE SUITE RUNS FROM A CLIENT CONTAINER, test_client in docker-compose.test-client.yaml, on the
 # stack's own networks -- store_api for data_store's API, store_db for Postgres -- never from the
 # host, which in prod reaches neither: prod publishes nothing. store_db (like every other unfixed
-# network) resolves as <compose project>_store_db, and the project name defaults to the checkout's
-# directory name, so this target joins the running stack only when run from a checkout whose
-# directory name matches the one that launched it; store_api is fixed-name and unaffected.
+# network) resolves as <compose project>_store_db, and this target's project is the explicit
+# trader_joe_dev (DEV_PROJECT), the one system-launch and dev-up start, so it joins that stack from any
+# checkout directory; store_api is fixed-name and unaffected.
 # SYSTEM_PATHS scopes it, relative to /code in the container, where only tests/system is mounted;
 # a path outside it fails the target with a non-zero pytest status -- 4 when the path does not
 # exist in the container, 5 when it exists but collects nothing.
 #
 # THE DISPOSABLE-DATABASE GUARD. The suite WRITES to whatever database it is pointed at. This target
-# is run on the HOST by its owner -- never by an agent, whose container has no Docker. prod-launch
-# lives in this same Makefile and this same compose project, so that host may be the one running
-# the production deployment, and the client would join that stack's networks and write to its
-# database. So the target refuses unless SYSTEM_TEST_DISPOSABLE_DB=1 is set -- as a make argument or
+# is run on the HOST by its owner -- never by an agent, whose container has no Docker. This target
+# addresses only the trader_joe_dev project (DEV_PROJECT), never prod's, but the stack that project
+# holds may still be one the owner cares about (a dev stack with real data), and the client would
+# write to its database. So the target refuses unless SYSTEM_TEST_DISPOSABLE_DB=1 is set -- as a make argument or
 # in the environment. It is an attestation by the person running it, not a detection: nothing here
 # can tell a stack you can wipe from the production one, which is why it has to be said out loud
 # each time.
@@ -1609,7 +1695,7 @@ test-all: $(VENV_MARKER) proto  ## Run every test, external included: needs live
 #
 # The client invocation: the base file for the networks, the client file, and nothing else -- not
 # the dev override, so the client needs no devnet and behaves the same against a dev stack and in CI.
-TEST_CLIENT_COMPOSE := docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml
+TEST_CLIENT_COMPOSE := docker compose -p $(DEV_PROJECT) -f docker-compose.yaml -f docker-compose.test-client.yaml
 SYSTEM_PATHS ?= tests/system
 
 # The disposable-database guard itself, ONE definition shared by test-system, system-launch and
@@ -1617,14 +1703,15 @@ SYSTEM_PATHS ?= tests/system
 # with one line per user saying how that target reaches the database.
 define SYSTEM_TEST_DISPOSABLE_GUARD
 @if [ "$(SYSTEM_TEST_DISPOSABLE_DB)" != "1" ]; then \
-	echo "make $@ REFUSED: this target WRITES to the database it is pointed at -- the one the default" >&2; \
-	echo "  compose project's stack holds -- and this host may also run the production deployment, in that" >&2; \
-	echo "  same compose project:" >&2; \
+	echo "make $@ REFUSED: this target WRITES to the database it is pointed at -- the one the dev/test" >&2; \
+	echo "  compose project's stack ($(DEV_PROJECT)) holds. It never addresses the production deployment's project," >&2; \
+	echo "  and still acts on that stack, which may hold data you care about:" >&2; \
 	echo "    test-system:   the suite's client joins its networks and writes to its database;" >&2; \
-	echo "    system-launch: replaces its data_ingest with the fake, which writes fake bars;" >&2; \
+	echo "    system-launch: takes that project DOWN, then starts the fake-mode stack on" >&2; \
+	echo "                   ./volume_data/test (fake bars go there, not into the project's own data);" >&2; \
 	echo "    seed-dump:     the producer POSTs its scenario into it." >&2; \
 	echo "  Run it only against a stack you can wipe: bring one up and migrate it" >&2; \
-	echo "  (make system-launch or make dev-launch, then make migrate), then run:" >&2; \
+	echo "  (make system-launch, then make migrate), then run:" >&2; \
 	echo "    make $@ SYSTEM_TEST_DISPOSABLE_DB=1" >&2; \
 	exit 1; \
 fi
@@ -1642,24 +1729,57 @@ test-system:  ## Run tests/system from the test_client container against an up, 
 # THE FAKE-MODE STACK (decision tj-j4wknb R4; tj-vhboky.61): the stack docker-compose.yaml defines,
 # from the PROD images, with docker-compose.fake.yaml on top -- data_ingest runs the test-only launcher
 # on FakeRead from a read-only mount of tests/fakes, one worker, broker keys blanked. Nothing else
-# differs from prod-launch. The system suite runs against it: make system-launch, make migrate, then
-# make test-system.
+# differs from prod-launch. The system suite runs against it: make test-build, make system-launch, make
+# migrate, then make test-system.
+#
+# The fake-mode stack runs in the trader_joe_dev project (SYSTEM_COMPOSE carries -p $(DEV_PROJECT)), the
+# same project as the dev stack, so launching either one tears the other down and neither can touch prod's.
 #
 # PROD_COMPOSE never loads the fake-mode overlay, just as it never loads the dev override: the prod
-# image holds no fakes, and the only way a fake reaches a running service is this file list (or the
-# agent stack's, AGENT_STACK_COMPOSE).
-SYSTEM_COMPOSE := docker compose -f docker-compose.yaml -f docker-compose.fake.yaml
+# image holds no fakes, and the only way a fake reaches a running service is a test-mode file list
+# (this one, run_migrations.sh's TEST definition, or the MCP's test-mode sets).
+#
+# THE TEST DATA DIR (ADR tj-4rr0la addendum 26 (3)). SYSTEM_COMPOSE sets DATA_DIR on the command line,
+# which outranks .env, so system-launch and seed-dump put postgres on ./volume_data/test and never
+# touch the owner's dev data (their DATA_DIR, default ./volume_data). The directory is inside the
+# ignored /volume_data/ and never overlaps ./volume_data/postgres or ./volume_data/pgadmin.
+TEST_DATA_DIR := ./volume_data/test
+SYSTEM_COMPOSE := DATA_DIR=$(TEST_DATA_DIR) docker compose -p $(DEV_PROJECT) -f docker-compose.yaml -f docker-compose.fake.yaml
+# The two refs docker-compose.fake.yaml names, which make test-build builds and system-launch requires.
+TEST_IMAGES := trader_joe_data_store:test trader_joe_data_ingest:test
 
-# Behind the SAME disposable-database guard as test-system: this runs in the default compose project,
-# the one prod-launch uses, so on a host that runs the production deployment it would recreate that
-# stack's data_ingest as the fake, and fake bars would reach its database. The same --wait as PROD_UP
-# (spelled out rather than shared, so PROD_UP stays as it is). No build: like prod-launch it starts the
-# images prod-build made, so build first after a change. No $(VENV_MARKER), for the reason test-system
-# has none. No stop target of its own: every service here is in docker-compose.yaml, so `make
-# prod-down` (or dev-down) stops and removes this stack cleanly.
+# THE TEST-MODE IMAGES (ADR tj-4rr0la addendum 27). The prod stage of the Dockerfile, built through the
+# test file set (base + fake), which names the images :test, so :latest -- possibly a real deployment's
+# -- is never built over or run by test mode. Stamped with the source digest like prod-build. No
+# gen-proto-ts and no web: test mode has no web service. Only data_store and data_ingest: test_client
+# has its own image.
+.PHONY: test-build
+test-build: $(VENV_MARKER) proto  ## Build the test-mode images (:test, prod target, stamped); never touches :latest
+	$(WITH_SOURCE_STAMP) $(SYSTEM_COMPOSE) build data_store data_ingest
+
+# Behind the SAME disposable-database guard as test-system: this runs in the dev/test compose project
+# (trader_joe_dev), never prod-launch's, so it cannot recreate a production stack's data_ingest as the
+# fake. It still replaces whatever the dev/test project held. The same --wait as PROD_UP
+# (spelled out rather than shared, so PROD_UP stays as it is). No build: it starts the :test
+# images make test-build made (docker-compose.fake.yaml names them), so build first after a change, and
+# REFUSES when either is missing, because compose would otherwise build the absent one itself,
+# unstamped. That refusal comes after the guard and BEFORE the down, so a refused run takes nothing
+# down. No $(VENV_MARKER), for the reason test-system has none. No stop target of its own: every
+# service here is in docker-compose.yaml, and the project is trader_joe_dev, so `make dev-down` stops
+# and removes this stack cleanly; `make prod-down` addresses prod's project and does not.
+#
+# IT DOWNS THE PROJECT FIRST (addendum 26 (4)), by dev-up's own line, so only one mode is ever up and
+# the stack it starts is on ./volume_data/test (TEST_DATA_DIR), never the owner's dev data. That down
+# reaches ONLY trader_joe_dev, so a production deployment on a shared host is not taken down; the
+# disposable-database attestation stays on this target for what that project holds. On a host that
+# runs prod, the up that follows meets prod's fixed host-wide names (ports, networks) and fails loudly:
+# the intended safe failure (see the project comment above PROD_COMPOSE). The down uses TOOLS_COMPOSE
+# (the same project as the up, in any checkout) and dev-down's placeholder credentials, safe on a down only.
 .PHONY: system-launch
 system-launch:  ## Start the stack from the prod images with data_ingest on the fake broker, waiting for healthy (SYSTEM_TEST_DISPOSABLE_DB=1)
 	$(SYSTEM_TEST_DISPOSABLE_GUARD)
+	@docker image inspect $(TEST_IMAGES) >/dev/null 2>&1 || { echo "make system-launch: the :test images do not exist; run make test-build first (compose would otherwise build them unstamped)" >&2; exit 1; }
+	PGADMIN_EMAIL=unused PGADMIN_PASS=unused $(TOOLS_COMPOSE) down
 	$(SYSTEM_COMPOSE) up -d --wait --wait-timeout 300
 
 # THE SEED DUMP (ADR tj-4rr0la addendum 10 (4); decision tj-vhboky.55 S9-S11). Against the stack
@@ -1683,7 +1803,7 @@ system-launch:  ## Start the stack from the prod images with data_ingest on the 
 # Not `set -o pipefail`, which reports the RIGHTMOST failure -- the writer's 'no bundle line' after a
 # failed producer. bash's PIPESTATUS (SHELL is /bin/bash) is read straight after the pipeline.
 # Behind the SAME disposable-database guard as test-system: the producer writes its scenario into
-# whatever database the default compose project's stack holds. $(VENV_MARKER), unlike test-system,
+# whatever database the trader_joe_dev project's stack holds. $(VENV_MARKER), unlike test-system,
 # because the writer runs in the host venv.
 #
 # ONLY THE WRITER GETS PYTHONPATH, and the asymmetry is the point (tj-iontkq.4). The producer runs

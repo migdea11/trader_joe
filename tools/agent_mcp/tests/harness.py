@@ -4,8 +4,9 @@ Kept free of test functions, and not a conftest.py, so every test module imports
 
 THE PR GATE RUNS NO DOCKER (tj-j4wknb R4: mock libraries are fine in-process). The server's two
 subprocess routes are replaced here:
-    stack.run_git        -> FakeGit: answers `worktree list --porcelain` and `cat-file blob HEAD:<path>`
-                            and FAILS the test on any other git command.
+    stack.run_git        -> FakeGit: answers `worktree list --porcelain` and FAILS the test on any
+                            other git command (the committed-defaults `cat-file` went with the agent
+                            stack's generated env files, tj-iee6sn.21).
     AgentStack(run=...)  -> FakeDocker: records every Step and answers from a table; nothing reaches a
                             daemon. forbid_real_subprocesses() additionally makes subprocess.run and
                             asyncio.create_subprocess_exec raise, so a code path that bypassed the
@@ -16,9 +17,11 @@ the host sitting's (tj-c4mosr.6 H1-H3), not this suite's.
 """
 
 import asyncio
+import functools
 import hashlib
 import json
 import os
+import shutil
 import stat
 import subprocess
 import time
@@ -35,10 +38,9 @@ from tools.agent_mcp.settings import Settings
 
 # THE TWO ROOTS, DERIVED LOCALLY AND DELIBERATELY NOT IMPORTED (tj-iontkq.2).
 #
-# committed_defaults() below reads three files that do NOT share a root: `.env.default` at the top of
-# the repository, and `data/store/.env.default` and `data/ingest/.env.default`, which travel with the
-# service trees. One counted parents[3] called REPO_ROOT served all three only because the two roots
-# are the same directory today.
+# The repository root and the server root are NOT the same directory: the service trees sit under
+# server/ while tools/, tests/ and the build files stay at the top. One counted parents[3] called
+# REPO_ROOT served both only while the two roots were the same directory.
 #
 # WHY THIS DOES NOT IMPORT common/tests/roots.py, which is the canonical definition of both
 # sentinels. Two reasons, and both are about the seam this module sits on:
@@ -101,17 +103,6 @@ REPO_ROOT = _repo_root()
 SERVER_ROOT = _server_root(REPO_ROOT)
 
 
-def env_default_path(source: str) -> Path:
-    """One ENV_DEFAULT_SOURCES name, resolved against the checkout.
-
-    Every name there is now repository-relative, the service templates included: they read
-    server/data/store/.env.default since the service trees moved (tj-iontkq.4). Before the move the
-    server-side names were bare and this had to pick a root per name; now the one root is correct
-    for all three, and SERVER_ROOT stays exported for the callers below that build server paths.
-    """
-    return REPO_ROOT / source
-
-
 WORKTREE_NAME = 'wt-one'
 
 # One file (or more) under every SNAPSHOT_SOURCES entry, so a snapshot of this tree is complete.
@@ -153,7 +144,7 @@ WORKTREE_FILES = {
     'tests/README.md': 'not a source\n',
 }
 EXECUTABLE_FILES = ('entrypoint.sh',)
-# A live env file's content: it must never reach a snapshot, a generated file or any output.
+# A live env file's content: it must never reach a snapshot, the audit log or any output.
 LIVE_ENV_SENTINEL = 'LIVE_ENV_SENTINEL_d41d8cd98f00'
 
 
@@ -187,18 +178,24 @@ def plant_live_env_files(worktree: Path) -> list[Path]:
 
 @dataclass
 class Layout:
-    """A repository with one agent worktree, the agent stack's directory and the share directory."""
+    """A repository with one agent worktree, the MCP's stack directory and the share directory."""
 
     root: Path
     repo: Path
     worktree: Path
     stack_dir: Path
     home: Path
+    # The root checkout at its HOST path (ADR tj-4rr0la addendum 23; tj-iee6sn.5): in agent_mcp the
+    # same tree bind-mounted read-only a second time. Here a symlink to repo/, so the string differs
+    # from repo_root (a verb that names the wrong one is visible in its argv) while every file under
+    # it is the same file.
+    repo_host_path: Path
 
     @property
     def settings(self) -> Settings:
         return Settings(
             repo_root=self.repo,
+            repo_host_path=self.repo_host_path,
             stack_dir=self.stack_dir,
             token_file=self.home / 'agent_mcp_token',
             bind='0.0.0.0',
@@ -211,27 +208,105 @@ class Layout:
         return self.stack_dir / stack.SOURCE_DIR_NAME
 
     @property
-    def data_dir(self) -> Path:
-        return self.stack_dir / stack.DATA_DIR_NAME
+    def trusted_dir(self) -> Path:
+        """The stand-in for /opt/agent_mcp/compose that make_rig points the S6 check at."""
+        return self.root / TRUSTED_DIR_NAME
+
+
+# build, up and test_build (tj-iee6sn.8, tj-iee6sn.33) refuse unless each generated tree's content
+# stamp, gen/proto/<kind>.digest, equals the digest the BAKED trusted proto_digest.sh computes over the
+# repository root. The ROOT checkout gets one generated TypeScript file, one .proto, the two ts inputs
+# (buf.yaml, web/buf.gen.yaml), the REAL tools/proto_digest.sh (so its trusted copy is the real script
+# too) and both stamps, written by that real script. The .proto is made an hour NEWER than every
+# generated file, so every rig call that passes the guard also shows that mtime no longer matters
+# (the mtime guard this replaces would refuse it). Only the root checkout: no worktree, and so no
+# snapshot, holds them.
+DEV_BUILD_ROOT_FILES = {
+    'gen/proto/ts/trader_joe/proto/ping/v1/ping_pb.ts': 'export {};\n',
+    'proto/trader_joe/proto/ping/v1/ping.proto': 'syntax = "proto3";\n',
+    'buf.yaml': 'version: v2\nmodules:\n  - path: proto\n',
+    'web/buf.gen.yaml': 'version: v2\nclean: true\nplugins:\n  - local: protoc-gen-es\n    out: ../gen/proto/ts\n',
+}
+DEV_BUILD_PROTO_FUTURE_SECONDS = 3600
+REAL_PROTO_DIGEST = REPO_ROOT / 'tools' / 'proto_digest.sh'
+TRUSTED_PROTO_DIGEST_SCRIPT = '/opt/agent_mcp/compose/tools/proto_digest.sh'
+# Taken at import, before any test patches subprocess.run: the one real process a rig may start.
+_REAL_SUBPROCESS_RUN = subprocess.run
+# The TRUSTED directory a rig's build compares the checkout with (S6), in place of the image's
+# /opt/agent_mcp/compose, which no test machine has. make_layout writes every stack.DEV_TRUSTED_COPIES
+# file into BOTH it and the root checkout, identical, so a sample call passes the stale-copy check.
+TRUSTED_DIR_NAME = 'trusted'
+# What a digest step prints in the rig: one 64-hex line per service, distinct and from literals.
+DEV_DIGESTS = {('data', 'store'): '1' * 64, ('data', 'ingest'): '2' * 64}
+TRUSTED_SOURCE_DIGEST_SCRIPT = '/opt/agent_mcp/compose/tools/source_digest.sh'
+
+
+def is_dev_digest(step: stack.Step) -> bool:
+    """The trusted source_digest.sh run by bash: build's only argv that is not docker."""
+    return list(step.argv[:2]) == ['/usr/bin/bash', TRUSTED_SOURCE_DIGEST_SCRIPT]
+
+
+def run_proto_digest(script: Path, repo: Path, kind: str) -> subprocess.CompletedProcess:
+    """Run SCRIPT as the guard does (bash, --context REPO, KIND), for real, whatever a test has patched."""
+    return _REAL_SUBPROCESS_RUN(  # nosec B603 -- the repository's own script, argument list, no shell
+        ['/usr/bin/bash', str(script), '--context', str(repo), kind],
+        cwd='/',
+        env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+
+
+def write_generation_stamps(repo: Path, script: Path = REAL_PROTO_DIGEST) -> None:
+    """Write gen/proto/<kind>.digest for both kinds, as make proto / gen-proto-ts do: the script's stdout."""
+    for relative in stack.DEV_GENERATED_DIRS:
+        done = run_proto_digest(script, repo, relative.rsplit('/', 1)[-1])
+        assert done.returncode == 0, done.stderr
+        (repo / f'{relative}.digest').write_bytes(done.stdout)
+
+
+def write_dev_build_fixtures(root: Path, repo: Path) -> Path:
+    """The generated-code files, their stamps and the identical trusted copies build needs; returns the trusted directory."""
+    for relative, text in DEV_BUILD_ROOT_FILES.items():
+        target = repo / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+    (repo / 'tools').mkdir(exist_ok=True)
+    shutil.copy2(REAL_PROTO_DIGEST, repo / 'tools' / 'proto_digest.sh')
+    write_generation_stamps(repo)
+    proto = repo / 'proto/trader_joe/proto/ping/v1/ping.proto'
+    newer = time.time() + DEV_BUILD_PROTO_FUTURE_SECONDS
+    os.utime(proto, (newer, newer))
+    trusted = root / TRUSTED_DIR_NAME
+    for checkout_name, baked_name in stack.DEV_TRUSTED_COPIES:
+        source = repo / checkout_name
+        if not source.exists():
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text(f'# fixture copy of {checkout_name}\n')
+        target = trusted / baked_name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(source.read_bytes())
+    return trusted
 
 
 def make_layout(tmp_path: Path) -> Layout:
-    """repo/ (the main checkout), repo/.claude/worktrees/wt-one, stack/ (0700) and share/, all real."""
+    """repo/ (the main checkout), repo/.claude/worktrees/wt-one, stack/ (0700), share/, and host/repo -> repo."""
     root = Path(os.path.realpath(tmp_path))
     repo = build_worktree(root / 'repo')
+    write_dev_build_fixtures(root, repo)
     worktree = build_worktree(repo / '.claude' / 'worktrees' / WORKTREE_NAME)
     stack_dir = root / 'stack'
     stack_dir.mkdir(mode=0o700)
     home = root / 'share'
     home.mkdir(mode=0o700)
-    return Layout(root=root, repo=repo, worktree=worktree, stack_dir=stack_dir, home=home)
-
-
-def committed_defaults() -> dict[str, str]:
-    """The three committed .env.default files, as git cat-file would return them at HEAD."""
-    return {
-        source: env_default_path(source).read_text(encoding='utf-8') for source in stack.ENV_DEFAULT_SOURCES.values()
-    }
+    host = root / 'host'
+    host.mkdir()
+    repo_host_path = host / 'repo'
+    repo_host_path.symlink_to(repo, target_is_directory=True)
+    return Layout(
+        root=root, repo=repo, worktree=worktree, stack_dir=stack_dir, home=home, repo_host_path=repo_host_path
+    )
 
 
 def porcelain(paths: Sequence[Path]) -> str:
@@ -242,10 +317,9 @@ def porcelain(paths: Sequence[Path]) -> str:
 
 @dataclass
 class FakeGit:
-    """stack.run_git's stand-in: the two plumbing commands the server may run, and nothing else."""
+    """stack.run_git's stand-in: the one plumbing command the server may run, and nothing else."""
 
     worktree_paths: list[Path]
-    defaults: dict[str, str] = field(default_factory=committed_defaults)
     delay: float = 0.0
     calls: list[tuple[str, ...]] = field(default_factory=list)
 
@@ -256,11 +330,7 @@ class FakeGit:
             time.sleep(self.delay)
         if list(args) == ['worktree', 'list', '--porcelain']:
             return porcelain(self.worktree_paths)
-        if len(args) == 3 and list(args[:2]) == ['cat-file', 'blob'] and args[2].startswith('HEAD:'):
-            source = args[2].removeprefix('HEAD:')
-            assert source in self.defaults, f'git cat-file of {source!r}, which is not a committed .env.default'
-            return self.defaults[source]
-        raise AssertionError(f'the server ran a git command outside its two plumbing calls: {list(args)}')
+        raise AssertionError(f'the server ran a git command outside its one plumbing call: {list(args)}')
 
     @property
     def list_calls(self) -> int:
@@ -283,16 +353,212 @@ def is_seed_producer(step: stack.Step) -> bool:
     return 'data.store.seeds' in step.argv
 
 
+# The dev exec family (ADR tj-4rr0la addendum 22): the label lookup is a plain `docker ps` whose
+# last two words are `--format {{.ID}}`, and it answers with exactly one running container, so a
+# sample db_tables call ends 'ok'. Spelled from literals, not from stack.dev_lookup_argv().
+DEV_CONTAINER_ID = 'c0ffee000001'
+DEV_DB_TABLES_STDOUT = (
+    b'dataset_read|t\ndataset_read_daily|t\ndataset_override_log|t\ndataset_deletion|t\n'
+    b'ingest_run|t\nstore_dataset_entry|t\nstock_market_activity|t\nalembic_version|t\n'
+    b'version_num|d7e2a9c35b18\n'
+)
+# The data_ingest container's id in the rig: distinct from DEV_CONTAINER_ID so that migrate's TEST-mode stamp
+# gate (tj-iee6sn.10), which reads each RUNNING data_store and data_ingest container by id, can be answered
+# per service. No other verb looks data_ingest up.
+DEV_INGEST_CONTAINER_ID = 'c0ffee000002'
+# What migrate_status' exec script prints (tj-iee6sn.13.5, folded into migrate_status by tj-iee6sn.10): a header per alembic subcommand, then
+# its redacted output. Told apart from db_tables' exec by its option set, `-w /code` (the table of
+# stack.DEV_EXEC_COMMANDS), spelled here from literals.
+DEV_MIGRATE_STATUS_STDOUT = (
+    b'== alembic current ==\nd7e2a9c35b18 (head)\n'
+    b'== alembic history ==\nb3d9e1a47c62 -> d7e2a9c35b18 (head), dataset override log and deletion\n'
+)
+# What the http_get script prints for /ping (tj-iee6sn.13.6): the status line, then the redacted
+# body. Told apart by its option set, which is NONE: the container id follows `exec` directly.
+DEV_HTTP_GET_STDOUT = b'== GET /ping -> HTTP 200 ==\n{"message":"pong"}\n'
+
+
+def is_dev_lookup(step: stack.Step) -> bool:
+    """A plain `docker ps ... --format {{.ID}}`: the dev exec target lookup."""
+    return list(step.argv[:2]) == ['/usr/local/bin/docker', 'ps'] and list(step.argv[-2:]) == ['--format', '{{.ID}}']
+
+
+def is_dev_exec(step: stack.Step) -> bool:
+    """A plain `docker exec`: the dev exec family's only other argv."""
+    return list(step.argv[:2]) == ['/usr/local/bin/docker', 'exec']
+
+
+def is_dev_stamp_read(step: stack.Step) -> bool:
+    """A `docker image inspect` printing one image's source-stamp label (test_up reads both :test images)."""
+    return (
+        list(step.argv[:4]) == ['/usr/local/bin/docker', 'image', 'inspect', '--format']
+        and 'trader_joe.source.digest' in step.argv[4]
+    )
+
+
+def is_container_stamp_read(step: stack.Step) -> bool:
+    """A `docker inspect --type container` printing a RUNNING container's source-stamp label (migrate's TEST gate)."""
+    return (
+        list(step.argv[:5]) == ['/usr/local/bin/docker', 'inspect', '--type', 'container', '--format']
+        and 'trader_joe.source.digest' in step.argv[5]
+    )
+
+
+def is_mode_guard(step: stack.Step) -> bool:
+    """The mode guard's `docker ps -a ... --format {{.Label "...config_files"}}`."""
+    return list(step.argv[:3]) == ['/usr/local/bin/docker', 'ps', '-a'] and 'config_files' in step.argv[-1]
+
+
+# The config_files label of a container `make dev-up` started: the override present, the fake file absent.
+# The rig's default project is in DEV mode, so a sample of every guarded verb is admitted, migrate and
+# migrate_status included (they refuse an empty project, tj-iee6sn.10). Spelled from literals.
+DEV_MODE_LINE = b'/r/docker-compose.yaml,/r/docker-compose.override.yaml,/r/docker-compose.web.yaml\n'
+
+
 def default_response(step: stack.Step) -> runner.ProcessResult:
     """Every docker step succeeds; `ps -q postgres` answers with one container id (postgres is running).
 
-    The seed producer's run answers with SEED_STDOUT, a valid bundle.
+    The seed producer's run answers with SEED_STDOUT, a valid bundle. The dev lookup answers with
+    one id (DEV_INGEST_CONTAINER_ID for data_ingest, else DEV_CONTAINER_ID) and a dev exec with
+    DEV_DB_TABLES_STDOUT, the shape the db_tables script prints, or, for the `-w /code` exec of
+    migrate_status, DEV_MIGRATE_STATUS_STDOUT, or, for the option-less exec of http_get,
+    DEV_HTTP_GET_STDOUT. The mode guard's `docker ps` answers with one DEV container (DEV_MODE_LINE),
+    which every guarded verb accepts, so a sample down/restart/migrate ends 'ok'. build's
+    digest steps answer with their service's DEV_DIGESTS line, so a sample build ends 'ok'. An
+    image stamp read answers with its own service's digest (a current image), and a container stamp
+    read with the digest of the service whose id the lookup gave (a current running container).
     """
     if list(step.argv[-3:]) == ['ps', '-q', 'postgres']:
         return runner.ProcessResult(0, b'0123456789ab\n', b'')
+    if is_mode_guard(step):
+        return runner.ProcessResult(0, DEV_MODE_LINE, b'')
+    if is_dev_digest(step):
+        return runner.ProcessResult(0, f'{DEV_DIGESTS[tuple(step.argv[-2:])]}\n'.encode(), b'')
+    if is_dev_stamp_read(step):
+        # Each image's stamp is its own service's digest (tj-iee6sn.24: test_up reads both :test images).
+        service = ('data', 'ingest') if step.argv[-1].startswith('trader_joe_data_ingest:') else ('data', 'store')
+        return runner.ProcessResult(0, f'{DEV_DIGESTS[service]}\n'.encode(), b'')
+    if is_container_stamp_read(step):
+        service = ('data', 'ingest') if step.argv[-1] == DEV_INGEST_CONTAINER_ID else ('data', 'store')
+        return runner.ProcessResult(0, f'{DEV_DIGESTS[service]}\n'.encode(), b'')
     if is_seed_producer(step):
         return runner.ProcessResult(0, SEED_STDOUT, b'')
+    if is_dev_lookup(step):
+        ingest = 'label=com.docker.compose.service=data_ingest' in step.argv
+        return runner.ProcessResult(0, f'{DEV_INGEST_CONTAINER_ID if ingest else DEV_CONTAINER_ID}\n'.encode(), b'')
+    if is_dev_exec(step) and list(step.argv[2:4]) == ['-w', '/code']:
+        return runner.ProcessResult(0, DEV_MIGRATE_STATUS_STDOUT, b'')
+    if is_dev_exec(step) and len(step.argv) > 2 and not step.argv[2].startswith('-'):
+        return runner.ProcessResult(0, DEV_HTTP_GET_STDOUT, b'')
+    if is_dev_exec(step):
+        return runner.ProcessResult(0, DEV_DB_TABLES_STDOUT, b'')
     return runner.ProcessResult(0, b'', b'')
+
+
+# THE SYSTEM-SUITE PAIR (tj-iee6sn.20; ADR tj-4rr0la addenda 26-27). run_system_tests and seed_dump act on
+# TEST mode ONLY, and only once the running postgres's data mount is the test directory, so the rig's DEV
+# default refuses them. system_suite_response(layout) is the answer under which a sample of either ends 'ok':
+# the mode guard sees one TEST container (base + fake, as make system-launch and test_up start it) and the
+# postgres mount read prints <repo host path>/volume_data/test/postgres. Every other step falls through to
+# BASE (default_response unless given), so the lookups and the stamps stay current. Spelled from literals.
+SYSTEM_SUITE_VERBS = frozenset({'run_system_tests', 'seed_dump'})
+TEST_MODE_LINE = b'/r/docker-compose.yaml,/r/docker-compose.fake.yaml\n'
+POSTGRES_DATA_TARGET = '/var/lib/postgresql/data'
+
+
+def is_postgres_mount_read(step: stack.Step) -> bool:
+    """The rail's `docker inspect --type container --format <the postgres data mount's Source>` of one id."""
+    return (
+        list(step.argv[:5]) == ['/usr/local/bin/docker', 'inspect', '--type', 'container', '--format']
+        and POSTGRES_DATA_TARGET in step.argv[5]
+    )
+
+
+def is_base_step(step: stack.Step) -> bool:
+    """One of the ensure-bases pair (ADR tj-4rr0la addendum 14 (3)): the inspect or the pull of a BASE_IMAGES ref."""
+    return any(
+        tuple(step.argv)
+        in (
+            ('/usr/local/bin/docker', 'image', 'inspect', '--format', '{{.Id}}', ref),
+            ('/usr/local/bin/docker', 'pull', ref),
+        )
+        for ref in stack.BASE_IMAGES
+    )
+
+
+def postgres_test_source(layout: Layout) -> str:
+    """The only data mount source test mode's postgres has: <repo host path>/volume_data/test/postgres."""
+    return f'{layout.repo_host_path}/volume_data/test/postgres'
+
+
+def system_suite_response(
+    layout: Layout, base: Callable[[stack.Step], runner.ProcessResult] = default_response
+) -> Callable[[stack.Step], runner.ProcessResult]:
+    """BASE, but the mode guard answers TEST_MODE_LINE and the mount read the test directory."""
+
+    def respond(step: stack.Step) -> runner.ProcessResult:
+        if is_mode_guard(step):
+            return runner.ProcessResult(0, TEST_MODE_LINE, b'')
+        if is_postgres_mount_read(step):
+            return runner.ProcessResult(0, f'{postgres_test_source(layout)}\n'.encode(), b'')
+        return base(step)
+
+    return respond
+
+
+def response_for(
+    verb: str, layout: Layout, base: Callable[[stack.Step], runner.ProcessResult] = default_response
+) -> Callable[[stack.Step], runner.ProcessResult]:
+    """The answer under which VERB's sample is admitted: system_suite_response for the system-suite pair, else BASE."""
+    return system_suite_response(layout, base) if verb in SYSTEM_SUITE_VERBS else base
+
+
+# The client's command (tj-iee6sn.20; no shell wrapper since 5a38b7f), spelled from literals:
+#   docker compose -p trader_joe_dev --project-directory <stack>/source --env-file <host>/.env
+#   -f <trusted>/docker-compose.yaml -f <trusted>/docker-compose.test-client.yaml -f <trusted>/docker-compose.agent-client.yaml
+CLIENT_FILES = ('docker-compose.yaml', 'docker-compose.test-client.yaml', 'docker-compose.agent-client.yaml')
+# The one project the client runs in: dev and test's explicit trader_joe_dev (ADR tj-4rr0la addendum 29,
+# tj-iee6sn.31), never prod's default. A literal, never stack.DEV_PROJECT, so the oracle is not the code.
+CLIENT_PROJECT = 'trader_joe_dev'
+
+
+def client_prefix_words_for(stack_dir: Path, repo_host_path: Path) -> list[str]:
+    """Every word of a client step before its tail, for STACK_DIR and REPO_HOST_PATH: compose's, unwrapped."""
+    return [
+        '/usr/local/bin/docker',
+        'compose',
+        '-p',
+        CLIENT_PROJECT,
+        '--project-directory',
+        f'{stack_dir}/source',
+        '--env-file',
+        f'{repo_host_path}/.env',
+        *(word for name in CLIENT_FILES for word in ('-f', f'/opt/agent_mcp/compose/{name}')),
+    ]
+
+
+def client_prefix_words(layout: Layout) -> list[str]:
+    """client_prefix_words_for the rig's stack directory and repository host path."""
+    return client_prefix_words_for(layout.stack_dir, layout.repo_host_path)
+
+
+def is_client_step(step: stack.Step) -> bool:
+    """A step under the client's prefix: `docker compose -p trader_joe_dev --project-directory D --env-file F`.
+
+    The --env-file right after the project directory is what tells it from every other file-based compose step.
+    """
+    return (
+        len(step.argv) > 7
+        and list(step.argv[:5]) == ['/usr/local/bin/docker', 'compose', '-p', CLIENT_PROJECT, '--project-directory']
+        and step.argv[6] == '--env-file'
+    )
+
+
+def client_tail(step: stack.Step, layout: Layout) -> list[str]:
+    """The words of a client step after its whole fixed prefix (asserted, word for word)."""
+    prefix = client_prefix_words(layout)
+    assert list(step.argv[: len(prefix)]) == prefix, step.argv
+    return list(step.argv[len(prefix) :])
 
 
 @dataclass
@@ -311,25 +577,23 @@ class FakeDocker:
                 await outcome
         return self.respond(step)
 
-    def subcommands(self) -> list[str]:
-        """The compose subcommand of every recorded step, after the fixed prefix."""
-        return [step.argv[step_prefix_length()] for step in self.steps]
-
-
-def step_prefix_length() -> int:
-    """How many argv words compose_prefix() spells before the subcommand."""
-    return len(stack.compose_prefix(Path('/stack'), Path('/stack/agent_stack.env')))
-
 
 def dev_step_prefix_length() -> int:
     """How many argv words dev_compose_prefix() spells before the subcommand (four: no -f, no env file)."""
     return len(stack.dev_compose_prefix())
 
 
-def forbid_real_subprocesses(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Any real subprocess from the server under test fails the test: the fakes must see everything."""
+def forbid_real_subprocesses(monkeypatch: pytest.MonkeyPatch, allowed: Sequence[Sequence[str]] = ()) -> None:
+    """Any real subprocess from the server under test fails the test: the fakes must see everything.
 
-    def refuse(*args: Any, **kwargs: Any) -> None:
+    ALLOWED names whole argv lists that may still run for real (subprocess.run only), word for word: a
+    rig allows the guard's two proto digests over its own trusted copy (tj-iee6sn.33) and nothing else.
+    """
+    permitted = {tuple(argv) for argv in allowed}
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        if args and tuple(args[0]) in permitted:
+            return _REAL_SUBPROCESS_RUN(*args, **kwargs)  # nosec B603 -- an exact allowed argv list
         raise AssertionError(f'a real subprocess was started: {args!r}')
 
     async def refuse_async(*args: Any, **kwargs: Any) -> None:
@@ -361,67 +625,123 @@ def make_rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, docker: FakeDocker
     layout = make_layout(tmp_path)
     git = FakeGit(worktree_paths=[layout.repo, layout.worktree])
     monkeypatch.setattr(stack, 'run_git', git)
-    forbid_real_subprocesses(monkeypatch)
+    # The REAL S6 check, comparing with the layout's trusted directory instead of the image's.
+    monkeypatch.setattr(
+        stack,
+        'check_trusted_copies_current',
+        functools.partial(stack.check_trusted_copies_current, trusted_dir=layout.trusted_dir),
+    )
+    # The REAL generated-code guard (tj-iee6sn.33), run with the layout's trusted proto_digest.sh in place
+    # of the image's; the two digest argvs over the root checkout are the only real processes allowed.
+    trusted_proto_digest = layout.trusted_dir / 'tools' / 'proto_digest.sh'
+    monkeypatch.setattr(
+        stack,
+        'check_generated_code_fresh',
+        functools.partial(stack.check_generated_code_fresh, trusted_script=trusted_proto_digest),
+    )
+    allowed = [
+        ('/usr/bin/bash', str(trusted_proto_digest), '--context', str(layout.repo), kind) for kind in ('python', 'ts')
+    ]
+    forbid_real_subprocesses(monkeypatch, allowed)
     fake_docker = docker or FakeDocker()
     return Rig(layout=layout, git=git, docker=fake_docker, agent=runner.AgentStack(layout.settings, run=fake_docker))
 
 
-def populate_data(layout: Layout) -> None:
-    """What a running agent stack leaves under data/: a file (and a dotfile) in each service mount."""
-    for service, _ in stack.DATA_MOUNTS:
-        directory = layout.data_dir / service
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / 'PG_VERSION').write_text('17\n')
-        (directory / '.hidden').write_text('state\n')
-
-
-def clearing_hook(layout: Layout) -> Callable[[stack.Step], None]:
-    """A FakeDocker hook doing what the in-container clear step does: empty the service's data mount.
-
-    It maps the step's container target back to the host directory through DATA_MOUNTS, as the
-    overlay's `${DATA_DIR}/<service>:<target>` bind does, and deletes that directory's entries.
-    """
-    by_target = {target: service for service, target in stack.DATA_MOUNTS}
-
-    def hook(step: stack.Step) -> None:
-        argv = list(step.argv)
-        if 'run' in argv and '--entrypoint' in argv and argv[-2] == 'clear':
-            host = layout.data_dir / by_target[argv[-1]]
-            for entry in list(host.iterdir()):
-                entry.unlink()
-
-    return hook
-
-
-def record_state(layout: Layout, name: str = WORKTREE_NAME) -> None:
-    """What a successful stack_up leaves: the recorded worktree name (migrate reads it)."""
-    (layout.stack_dir / stack.STATE_FILE_NAME).write_text(f'{name}\n')
+def budget_spent(rig: Rig) -> int:
+    """How many state-changing calls the rig's S10 budget holds in its window (read in place, never charged)."""
+    return len(rig.agent.dev_budget._calls)
 
 
 # A valid call of every verb. A verb added to AgentStack without an entry here fails
-# test_every_verb_has_a_sample, so parameterised tests cannot silently skip it.
+# test_every_verb_has_a_sample, so parameterised tests cannot silently skip it. Exactly the fifteen
+# verbs of ADR tj-4rr0la addenda 26 (5) and 27 (4), under today's names (the rename is tj-iee6sn.26).
 VERB_SAMPLES: Mapping[str, dict[str, Any]] = {
-    'stack_up': {'worktree': WORKTREE_NAME},
-    'stack_down': {},
-    'stack_wipe': {},
     'migrate': {},
     'migrate_status': {},
-    'migrate_check': {},
     'run_system_tests': {'worktree': WORKTREE_NAME, 'paths': ['tests/system/test_one.py']},
     'seed_dump': {'worktree': WORKTREE_NAME},
     'logs': {'service': 'postgres', 'tail': 50},
     'ps': {},
-    'dev_logs': {'service': 'postgres', 'tail': 50},
-    'dev_ps': {},
+    'db_tables': {},
+    'http_get': {'name': 'ping'},
+    'down': {},
+    'restart': {'service': 'data_store'},
+    'build': {},
+    'up': {},
+    'tools': {},
+    'test_build': {},
+    'test_up': {},
 }
 # Verbs that run no docker at all. None since tj-irhy0a.22 wired seed_dump; kept so a future verb
 # that runs no docker is classified here rather than tripping the docker sweeps.
 DOCKERLESS_VERBS: frozenset[str] = frozenset()
-# The verbs that reach the USER'S OWN dev compose project read-only (tj-kzy7w2; ADR tj-4rr0la
-# addendum 18). They run docker, but NOT through stack.compose_prefix(): no -f, no
-# --project-directory, no --env-file, so the agent-stack sweeps must exclude them rather than
-# mis-slice their four-word prefix. tj-tq2hn6 (B2) owns the containment tests that take their place.
-DEV_PROJECT_VERBS = frozenset({'dev_ps', 'dev_logs'})
+# The verbs that act on the one project WITHOUT the system-test client (tj-kzy7w2 on; ADR tj-4rr0la
+# addenda 18 and 26): every verb but SYSTEM_SUITE_VERBS, which run test_client under the snapshot
+# prefix (stack.testclient_prefix). With the agent stack gone (tj-iee6sn.21) the two sets partition
+# VERB_SAMPLES; test_commands.py pins that. tj-tq2hn6 (B2) owns the dev containment tests.
+DEV_PROJECT_VERBS = frozenset(
+    {
+        'ps',
+        'logs',
+        'db_tables',
+        'http_get',
+        'down',
+        'restart',
+        'build',
+        'up',
+        'tools',
+        'test_build',
+        'test_up',
+        # tj-iee6sn.10: the unified pair acts on the one project (DEV or TEST mode), not the agent stack.
+        'migrate',
+        'migrate_status',
+    }
+)
+# The subset that runs PLAIN docker -- a label lookup, then `docker exec` -- rather than the dev
+# compose prefix (ADR tj-4rr0la addendum 22). test_dev_exec.py owns their containment tests.
+# migrate_status runs the mode guard's `docker ps` first, then the same lookup and exec.
+DEV_EXEC_VERBS = frozenset({'db_tables', 'migrate_status', 'http_get'})
+# The STATE-CHANGING label-only pair (tj-iee6sn.7): the D7 guard's plain `docker ps`, then ONE step
+# under the four-word dev prefix. test_dev_label_verbs.py owns their order, argv and refusal tests.
+DEV_LABEL_LIFECYCLE_VERBS = frozenset({'down', 'restart'})
+# The FILE-BASED dev lifecycle verbs (tj-iee6sn.8 on): the trusted digest script under bash, the
+# ensure-bases pair, then compose under the file-based dev prefix (stack.dev_file_prefix), which names
+# the trusted dev files and the repository's host path. test_dev_build.py owns build's tests.
+DEV_FILE_LIFECYCLE_VERBS = frozenset({'build'})
+# up (tj-iee6sn.9) mixes all three: the D7 guard's `docker ps`, three `docker image inspect`s of the
+# :dev images, the trusted digests, the label-only down, the devnet `docker network` pair, the bases,
+# then the file-based up carried by the fixed `sh -c` secret wrapper. test_dev_up.py owns its tests.
+DEV_UP_VERBS = frozenset({'up'})
+# migrate (tj-iee6sn.10), STATE-CHANGING, file-based and not label-only: the mode guard's `docker ps`, the
+# postgres and data_store lookups (`docker ps`), the mode's data_store image inspect, in TEST mode the
+# data_ingest lookup, the two digests (bash) and a container stamp read per running service, the bases (the
+# one-off `run` of data_store is flagged as building), then the one-off alembic run: in DEV carried by
+# up's fixed `sh -c` secret wrapper, in TEST plain over base + fake. test_dev_migrate.py owns its tests.
+DEV_MIGRATE_VERBS = frozenset({'migrate'})
+# tools (tj-iee6sn.14), `make dev-tools`: the D7 guard's `docker ps`, the devnet `docker network` pair,
+# then ONE file-based up of pgAdmin (the dev files plus docker-compose.tools.yaml, stack.dev_tools_prefix)
+# carried by up's fixed `sh -c` secret wrapper. No image inspect, no digest, no base: pgadmin and
+# postgres are image-only. test_dev_tools.py owns its tests.
+DEV_TOOLS_VERBS = frozenset({'tools'})
+# TEST MODE (tj-iee6sn.24; ADR tj-4rr0la addenda 26-27), over the same project. test_build: the trusted
+# digests, the bases, then ONE file-based build over base + fake + the MCP-only test overlay. test_up: the
+# mode guard's `docker ps`, the two :test image inspects, the digests, the two stamp reads, the bases, the
+# label-only down, then ONE plain (unwrapped) file-based up over base + fake. test_test_mode.py owns both.
+TEST_MODE_VERBS = frozenset({'test_build', 'test_up'})
+# The wrapper's four constant leading words, spelled here from literals except the script, which is
+# pinned whole in test_dev_up.py; the helper and the env file follow them.
+DEV_UP_WRAPPER_LEAD = ('sh', '-c')
+
+
+def is_dev_up_wrapper(step: stack.Step) -> bool:
+    """The up step: `sh -c <script> sh <helper> <env file> <compose argv>`, the server's one shell."""
+    return tuple(step.argv[:2]) == DEV_UP_WRAPPER_LEAD and len(step.argv) > 6 and step.argv[3] == 'sh'
+
+
+def dev_up_compose_argv(step: stack.Step) -> tuple[str, ...]:
+    """The compose argv the wrapper execs: every word after its six fixed ones."""
+    assert is_dev_up_wrapper(step), step.argv
+    return tuple(step.argv[6:])
 
 
 def tree_digest(path: Path) -> dict[str, str]:

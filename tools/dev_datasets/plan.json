@@ -1,0 +1,228 @@
+[
+  {
+    "id": "r1",
+    "symbol": "SPY",
+    "granularity": "1min",
+    "start": "D-8",
+    "end": "D-5",
+    "update_type": "STATIC",
+    "expiry_type": "BULK",
+    "expiry": "D+2",
+    "owner": "dev-datasets",
+    "degrade": null,
+    "reads": [],
+    "purpose": "1min paging; Expiring Soon; the override on the card; the expiry is a deletion date (past at D+2, then the reaper deletes it when enabled)"
+  },
+  {
+    "id": "r2",
+    "symbol": "SPY",
+    "granularity": "5min",
+    "start": "D-40",
+    "end": "D-10",
+    "update_type": "STATIC",
+    "expiry_type": "BULK",
+    "expiry": null,
+    "owner": "dev-datasets",
+    "degrade": null,
+    "reads": [],
+    "purpose": "Never expires; intraday paging"
+  },
+  {
+    "id": "r3",
+    "symbol": "SPY",
+    "granularity": "30min",
+    "start": "D-100",
+    "end": "D-10",
+    "update_type": "STATIC",
+    "expiry_type": "BULK",
+    "expiry": "D+30",
+    "owner": "dev-datasets",
+    "degrade": null,
+    "reads": [],
+    "purpose": "A mid-range expiry"
+  },
+  {
+    "id": "r4",
+    "symbol": "SPY",
+    "granularity": "1hour",
+    "start": "D-370",
+    "end": "D-10",
+    "update_type": "STATIC",
+    "expiry_type": "BULK",
+    "expiry": null,
+    "owner": "dev-datasets",
+    "degrade": null,
+    "reads": [
+      "ui"
+    ],
+    "purpose": "A big intraday set; read once by the UI"
+  },
+  {
+    "id": "r5",
+    "symbol": "SPY",
+    "granularity": "1week",
+    "start": "2020-08-03",
+    "end": "D-1",
+    "update_type": "STATIC",
+    "expiry_type": "BULK",
+    "expiry": null,
+    "owner": "dev-datasets",
+    "degrade": null,
+    "reads": [],
+    "purpose": "Weekly bars (every week has its bar, so completeness reads COMPLETE)"
+  },
+  {
+    "id": "r6",
+    "symbol": "SPY",
+    "granularity": "1month",
+    "start": "2020-08-01",
+    "end": "D-1",
+    "update_type": "STATIC",
+    "expiry_type": "BULK",
+    "expiry": "D+365",
+    "owner": "dev-datasets",
+    "degrade": null,
+    "reads": [],
+    "purpose": "A far expiry; monthly bars"
+  },
+  {
+    "id": "r7",
+    "symbol": "DIA",
+    "granularity": "1day",
+    "start": "2020-08-03",
+    "end": null,
+    "update_type": "DAILY",
+    "expiry_type": "ROLLING",
+    "expiry": null,
+    "owner": "operator",
+    "degrade": null,
+    "reads": [
+      "ui"
+    ],
+    "purpose": "The DAILY refresh loop; FRESH or LATE; writes need no override; read once by the UI"
+  },
+  {
+    "id": "r8",
+    "symbol": "QQQ",
+    "granularity": "30min",
+    "start": "D-30",
+    "end": null,
+    "update_type": "DAILY",
+    "expiry_type": "ROLLING",
+    "expiry": null,
+    "owner": "operator",
+    "collect": false,
+    "degrade": null,
+    "reads": [],
+    "purpose": "A stopped subscription (collect=false, no expiry): the Stopped state; the refresh skips it and it is never deleted"
+  },
+  {
+    "id": "r9",
+    "symbol": "QQQ",
+    "granularity": "1hour",
+    "start": "D-24",
+    "end": "D-10",
+    "update_type": "STATIC",
+    "expiry_type": "BULK",
+    "expiry": "D-1",
+    "owner": "dev-datasets",
+    "degrade": null,
+    "reads": [],
+    "purpose": "Reaper pending: the deletion date has passed (the reaper is dry-run unless REAPER_DELETES_ENABLED=true)"
+  },
+  {
+    "id": "r10",
+    "symbol": "DIA",
+    "granularity": "1day",
+    "start": "2021-01-04",
+    "end": "2023-01-03",
+    "update_type": "STATIC",
+    "expiry_type": "BULK",
+    "expiry": null,
+    "owner": "dev-datasets",
+    "degrade": null,
+    "reads": [],
+    "purpose": "An old, ended range; a second owner on the series of r7"
+  },
+  {
+    "id": "r11",
+    "symbol": "QQQ",
+    "granularity": "1week",
+    "start": "2020-08-03",
+    "end": "D-1",
+    "update_type": "STATIC",
+    "expiry_type": "BUFFER_1K",
+    "expiry": null,
+    "owner": "dev-datasets",
+    "degrade": null,
+    "reads": [
+      "sdk"
+    ],
+    "purpose": "A non-BULK expiry type label; read once through the SDK route"
+  },
+  {
+    "id": "r12",
+    "symbol": "DIA",
+    "granularity": "30min",
+    "start": "D-60",
+    "end": "D-5",
+    "update_type": "STATIC",
+    "expiry_type": "BULK",
+    "expiry": null,
+    "owner": "dev-degraded",
+    "degrade": {
+      "drop_days": [
+        "D-33",
+        "D-27"
+      ],
+      "why": "INTENTIONAL DAMAGE: whole sessions from D-33 up to D-27 are deleted so the dataset reads GAPS; repair with --repair"
+    },
+    "reads": [],
+    "purpose": "GAPS and the gap strip; repair by an identical repeat request"
+  },
+  {
+    "id": "r13",
+    "symbol": "QQQ",
+    "granularity": "5min",
+    "start": "D-20",
+    "end": "D-5",
+    "update_type": "STATIC",
+    "expiry_type": "BULK",
+    "expiry": null,
+    "owner": "dev-degraded",
+    "degrade": {
+      "drop_days": [
+        "D-16",
+        "D-11"
+      ],
+      "why": "INTENTIONAL DAMAGE: whole sessions from D-16 up to D-11 are deleted so the dataset reads GAPS; repair with --repair (optionally while data_ingest is stopped, for a real FAILED run, then again)"
+    },
+    "reads": [],
+    "purpose": "GAPS; the optional genuinely FAILED repair run",
+    "test": {
+      "symbol": "FAILONCE_ZZDSQQQ",
+      "why": "FAILONCE_: the first fetch fails (a FAILED run in history) and the repeat succeeds; replaces stopping data_ingest in dev"
+    }
+  },
+  {
+    "id": "r14",
+    "symbol": "DIA",
+    "granularity": "1week",
+    "start": "2016-01-04",
+    "end": "2021-01-04",
+    "update_type": "STATIC",
+    "expiry_type": "BULK",
+    "expiry": null,
+    "owner": "dev-degraded",
+    "degrade": {
+      "drop_days": null,
+      "why": "starts before the vendor's history: shows leading GAPS on purpose"
+    },
+    "reads": [],
+    "purpose": "Leading GAPS on purpose: the range begins before the vendor's history (nothing is deleted, nothing to repair)",
+    "test": {
+      "symbol": "GAPS_ZZDSDIA",
+      "why": "GAPS_: the fake serves every other bar, so the dataset reads GAPS"
+    }
+  }
+]

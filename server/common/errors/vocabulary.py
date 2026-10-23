@@ -67,6 +67,7 @@ class Reason(StrEnum):
     VENDOR_REJECTED = 'VENDOR_REJECTED'
     NOT_FOUND = 'NOT_FOUND'
     OWNER_MISMATCH = 'OWNER_MISMATCH'
+    OVERRIDE_REQUIRED = 'OVERRIDE_REQUIRED'
     OWN_OVERLAP_CONFLICT = 'OWN_OVERLAP_CONFLICT'
     RANGE_COLLISION = 'RANGE_COLLISION'
     RANGE_SHRINK = 'RANGE_SHRINK'
@@ -590,6 +591,16 @@ REASONS: Final[Mapping[Reason, ReasonSpec]] = MappingProxyType(
             grpc_code='PERMISSION_DENIED',
             http_status=403,
             summary='The entity is not owned by the principal the request declares; act only on entities that principal owns.',
+        ),
+        # An operator write on another owner's dataset without a confirmed override (tj-grna9p.16).
+        # Carries no metadata: the owner value is never in an error body (the OWNER_MISMATCH rule).
+        Reason.OVERRIDE_REQUIRED: ReasonSpec(
+            branch=InvalidRequestError,
+            outcome=Outcome.REFUSED,
+            disposition=Disposition.CLIENT_FIX,
+            grpc_code='FAILED_PRECONDITION',
+            http_status=409,
+            summary='The dataset belongs to another owner: send override with a non-blank reason and confirmed true.',
         ),
         # OwnOverlapConflict, with colliding_ids (TE-6).
         Reason.OWN_OVERLAP_CONFLICT: ReasonSpec(

@@ -3,10 +3,11 @@
 tj-vhboky.61 (FB-4a). Design: decision tj-j4wknb R4 -- no test instrumentation in production; a
 test-only launcher in tests/fakes; a fake-mode compose overlay mounts the test tree read-only into
 data_ingest and swaps its command; the prod image holds no fakes -- with the architect's 01:55 UTC
-ruling on tj-irhy0a.8 (one worker, literal) and ADR tj-4rr0la addenda 3 (3) and 5 (the agent stack
-loads the overlay LAST; tests/fakes is snapshot-sourced and mounted :ro). The agent stack's file list
-and the MCP image's copy of the overlay are pinned beside the other MCP pins
-(test_agent_stack_compose.py, tools/agent_mcp/tests/test_commands.py).
+ruling on tj-irhy0a.8 (one worker, literal) and ADR tj-4rr0la addenda 3 (3) and 5 (no file loaded
+after the overlay undoes it; tests/fakes is mounted :ro). The separate agent stack is retired (addenda
+26-27; tj-iee6sn.27): EVERY file set allowed to load the overlay is enumerated, exactly, by
+test_agent_stack_files_retired.py, and the MCP image's copy of the overlay is pinned beside the other
+MCP pins (tools/agent_mcp/tests/test_dev_guards.py).
 
 Docker-free, like every build_infra pin: the compose files are read with yaml.safe_load and merged by
 compose_model, and make runs for real with `docker` stubbed first on PATH. What only a daemon can show
@@ -21,19 +22,11 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from common.tests.compose_model import (
-    BASE_FILE,
-    FAKE_FILE,
-    agent_stack_model,
-    interpolate,
-    load,
-    prod_model,
-    system_model,
-    volume,
-)
+from common.tests.compose_model import BASE_FILE, FAKE_FILE, interpolate, load, merge, prod_model, system_model, volume
 from common.tests.test_ci_invariants import (
     _ACCEPTED_GUARDS,
     _REFUSED_GUARDS,
+    DEV_PROJECT,
     MAKEFILE,
     REPO_ROOT,
     SERVER_ROOT,
@@ -47,6 +40,7 @@ from common.tests.test_ci_invariants import (
     _run_make,
     _subprocess_env,
 )
+from common.tests.test_service_pythonpath import _launch_sets
 
 
 pytestmark = pytest.mark.build_infra
@@ -73,10 +67,24 @@ FAKE_SHELL_WORDS = [
     '--workers',
     '1',
 ]
-# The only keys the overlay may set on data_ingest: the mount, the command, the blanked keys.
+# The only keys the overlay may set on data_ingest's behaviour: the mount, the command, the blanked keys.
 FAKE_KEYS = frozenset({'volumes', 'command', 'environment'})
+# The only key the overlay may set on data_store's behaviour (tj-grna9p.148 (3)): its environment, holding exactly
+# the test-mode label. Spelled out, not read from the overlay.
+FAKE_STORE_KEYS = frozenset({'environment'})
+FAKE_STORE_ENVIRONMENT = {'DEPLOYMENT_LABEL': 'test'}
+# tj-grna9p.194 (the database rail): the overlay may set postgres's command and nothing else, and the command is
+# exactly the image's default (postgres) plus the test-mode marker. Spelled out, not read from the overlay.
+FAKE_POSTGRES = {'command': ['postgres', '-c', 'cluster_name=test']}
+# The test-mode images (ADR tj-4rr0la addendum 27 (2)): the overlay names the test pair :test, so
+# every compose call through it builds and runs :test, never the :latest a deployment may run.
+# Spelled out, not read from the overlay: the oracle must not be the file under test.
+TEST_IMAGES = {'data_store': 'trader_joe_data_store:test', 'data_ingest': 'trader_joe_data_ingest:test'}
+PROD_IMAGES = {'data_store': 'trader_joe_data_store:latest', 'data_ingest': 'trader_joe_data_ingest:latest'}
+TEST_BUILD = 'test-build'
 # The sets that must never run a fake: the prod, dev and tools stacks, and everything else the
-# Makefile starts. SYSTEM_COMPOSE and AGENT_STACK_COMPOSE are the only two that load the overlay.
+# Makefile starts. SYSTEM_COMPOSE is the only Makefile assignment that names the overlay (SEED_DUMP_COMPOSE
+# reaches it through $(SYSTEM_COMPOSE)); the retired agent-stack set was the other (tj-iee6sn.27).
 NON_FAKE_VARIABLES = (
     'PROD_COMPOSE',
     'PROD_UP',
@@ -86,7 +94,7 @@ NON_FAKE_VARIABLES = (
     'AGENT_COMPOSE',
     'AGENT_MCP_COMPOSE',
 )
-FAKE_LOADING_VARIABLES = frozenset({'SYSTEM_COMPOSE', 'AGENT_STACK_COMPOSE'})
+FAKE_LOADING_VARIABLES = frozenset({'SYSTEM_COMPOSE'})
 
 DOCKER_STUB = """#!/bin/sh
 printf '%s\\n' "$*" >> "$STUB_LOG"
@@ -101,12 +109,33 @@ def _fake_ingest() -> dict:
     return load(FAKE_FILE)['services']['data_ingest']
 
 
-def test_the_overlay_touches_data_ingest_only_and_only_its_mount_command_and_environment():
-    """Item 1: 'for data_ingest ONLY ... Nothing else.' No network, port, image or other service."""
+def test_the_overlay_sets_the_test_images_and_only_data_ingest_mount_command_and_environment():
+    """Item 1: 'for data_ingest ONLY ... Nothing else.' No network, port or other service.
+
+    tj-iee6sn.19 re-pin (ADR tj-4rr0la addendum 27 (1)-(2)): the overlay is now the test-mode
+    overlay, so it also names the test pair's images -- data_store gains an entry holding `image`
+    and nothing else, and data_ingest's keys gain `image` -- each exactly its :test tag.
+
+    tj-grna9p.148 re-pin (design (3)): data_store also gains an `environment` holding exactly
+    DEPLOYMENT_LABEL=test, the test-mode label GET /ui/v1/config reports and tools/dev_datasets' rail reads.
+
+    tj-grna9p.194 re-pin (the database rail): postgres joins, holding exactly FAKE_POSTGRES -- its command,
+    the image's default plus -c cluster_name=test (the architect's option 3) -- and no other key.
+    """
     overlay = load(FAKE_FILE)
     assert set(overlay) == {'services'}, f'the fake overlay sets top-level {sorted(overlay)}'
-    assert set(overlay['services']) == {'data_ingest'}, f'the fake overlay touches {sorted(overlay["services"])}'
-    assert set(_fake_ingest()) == FAKE_KEYS, f'the fake overlay sets data_ingest keys {sorted(_fake_ingest())}'
+    services = overlay['services']
+    assert set(services) == {*TEST_IMAGES, 'postgres'}, f'the fake overlay touches {sorted(services)}'
+    assert services['postgres'] == FAKE_POSTGRES, services['postgres']
+    services = {name: spec for name, spec in services.items() if name != 'postgres'}
+    assert set(services['data_store']) == FAKE_STORE_KEYS | {'image'}, (
+        f'the fake overlay sets data_store keys {sorted(services["data_store"])}'
+    )
+    assert services['data_store']['environment'] == FAKE_STORE_ENVIRONMENT, services['data_store']['environment']
+    assert set(_fake_ingest()) == FAKE_KEYS | {'image'}, (
+        f'the fake overlay sets data_ingest keys {sorted(_fake_ingest())}'
+    )
+    assert {name: spec['image'] for name, spec in services.items()} == TEST_IMAGES, services
 
 
 def test_the_overlay_mounts_exactly_tests_fakes_read_only():
@@ -174,43 +203,88 @@ def test_the_overlay_blanks_exactly_the_broker_keys_production_reads():
 # --- the merged stacks: fake mode changes data_ingest and nothing else ------------------------------
 
 
-def test_the_system_stack_is_prod_but_for_data_ingest_mount_command_and_keys():
-    """Item 2: 'Nothing else differs from prod-launch' -- same images, networks, env files, healthcheck."""
+def test_the_system_stack_is_prod_but_for_the_test_tags_and_data_ingest_mount_command_and_keys():
+    """Item 2: 'Nothing else differs from prod-launch' -- same build, networks, env files, healthcheck.
+
+    tj-iee6sn.19 re-pin (ADR tj-4rr0la addendum 27 (2)): the one other difference is the tag. The
+    test pair is the prod build -- the same build: section, prod_image target -- tagged :test, while
+    prod keeps :latest. postgres is untouched.
+
+    tj-grna9p.148 re-pin (design (3)): and the label. data_store's environment differs from prod's in
+    DEPLOYMENT_LABEL alone, '' on prod and 'test' here; every other variable is prod's.
+
+    tj-grna9p.194 re-pin (the database rail): postgres differs from prod's in its command alone, which prod
+    leaves to the image (no command key) and test mode sets to FAKE_POSTGRES's.
+    """
     system, prod = system_model(), prod_model()
     assert system['networks'] == prod['networks']
     assert set(system['services']) == set(prod['services'])
     for name, spec in prod['services'].items():
-        if name != 'data_ingest':
+        if name == 'postgres':
+            assert 'command' not in spec, spec.get('command')
+            assert system['services'][name] == {**spec, **FAKE_POSTGRES}, f'fake mode changes {name}'
+        elif name not in TEST_IMAGES:
             assert system['services'][name] == spec, f'fake mode changes {name}'
-    ingest, prod_ingest = system['services']['data_ingest'], prod['services']['data_ingest']
-    changed = {key for key in set(ingest) | set(prod_ingest) if ingest.get(key) != prod_ingest.get(key)}
-    assert changed <= FAKE_KEYS, f'fake mode changes data_ingest {sorted(changed)}'
-    assert ingest['build']['target'] == 'prod_image' and ingest['image'] == prod_ingest['image']
+    store_env, prod_store_env = (
+        system['services']['data_store']['environment'],
+        prod['services']['data_store']['environment'],
+    )
+    differing = {key for key in set(store_env) | set(prod_store_env) if store_env.get(key) != prod_store_env.get(key)}
+    assert differing == {'DEPLOYMENT_LABEL'}, sorted(differing)
+    assert (store_env['DEPLOYMENT_LABEL'], prod_store_env['DEPLOYMENT_LABEL']) == ('test', '')
+    allowed = {'data_store': FAKE_STORE_KEYS | {'image'}, 'data_ingest': FAKE_KEYS | {'image'}}
+    for name, keys in allowed.items():
+        service, prod_service = system['services'][name], prod['services'][name]
+        changed = {key for key in set(service) | set(prod_service) if service.get(key) != prod_service.get(key)}
+        assert changed == keys, f'fake mode changes {name} {sorted(changed)}, not {sorted(keys)}'
+        assert service['build'] == prod_service['build'] and service['build']['target'] == 'prod_image', name
+        assert (service['image'], prod_service['image']) == (TEST_IMAGES[name], PROD_IMAGES[name]), name
 
 
-def test_the_agent_stack_runs_the_fake_because_the_overlay_is_last():
-    """Addendum 3 (3): no earlier file can undo the swap -- the merged agent model runs the launcher."""
-    ingest = agent_stack_model()['services']['data_ingest']
-    assert ingest['command'] == _fake_ingest()['command']
-    assert FAKE_MOUNT in [volume(entry) for entry in ingest['volumes']]
-    assert {name: ingest['environment'][name] for name in _credential_vars()} == dict.fromkeys(_credential_vars(), '')
+def _fake_loading_sets() -> dict[str, tuple[Path, ...]]:
+    """Every file set that loads the overlay, read from where each is spelled (test_service_pythonpath's reader)."""
+    return {label: files for label, files in _launch_sets().items() if FAKE_FILE in files}
+
+
+def test_every_set_that_loads_the_overlay_runs_the_fake():
+    """Addendum 3 (3), re-pointed by tj-iee6sn.27 from the retired agent-stack model to every fake-loading set.
+
+    No file in a set, before the overlay or after it (the test client, the MCP's build overlay), undoes the
+    swap: the merged data_ingest runs the launcher, mounts the fakes read-only and has the broker keys
+    blank, in make system-launch's, make seed-dump's, the MCP's test_up and test_build sets,
+    run_migrations.sh's TEST definition and CI's. Which sets those are is enumerated exactly by
+    test_agent_stack_files_retired.py; this asserts what each of them runs.
+    """
+    sets = _fake_loading_sets()
+    assert len(sets) >= 4, f'found only {sorted(sets)}; a parsing slip must not empty this check'
+    for label, files in sets.items():
+        ingest = merge([load(path) for path in files])['services']['data_ingest']
+        assert ingest['command'] == _fake_ingest()['command'], label
+        assert FAKE_MOUNT in [volume(entry) for entry in ingest['volumes']], label
+        keys = {name: ingest['environment'][name] for name in _credential_vars()}
+        assert keys == dict.fromkeys(_credential_vars(), ''), label
+        assert ingest['image'] == TEST_IMAGES['data_ingest'], label
+        # tj-grna9p.148 (3): no file loaded after the overlay undoes the test label either.
+        store = merge([load(path) for path in files])['services']['data_store']
+        assert store['environment'].get('DEPLOYMENT_LABEL') == 'test', label
 
 
 # --- who loads the overlay ------------------------------------------------------------------------
 
 
-def test_system_compose_is_the_base_file_then_the_overlay_in_the_default_project():
+def test_system_compose_is_the_base_file_then_the_overlay_in_the_dev_project():
     """Item 2: SYSTEM_COMPOSE is docker-compose.yaml plus the fake overlay, nothing else.
 
-    No -p: the default project, as TEST_CLIENT_COMPOSE has, so `make test-system` after `make
-    system-launch` joins the fake stack's networks. Never the dev override, the test client, the
-    agent-stack or MCP files, or the tools file.
+    The same project as TEST_CLIENT_COMPOSE, so `make test-system` after `make system-launch` joins
+    the fake stack's networks. Re-pinned for tj-grna9p.161 (ADR tj-4rr0la addendum 29): both carry
+    -p trader_joe_dev, never the default project prod keeps. Never the dev override, the test
+    client, the MCP's files, or the tools file.
     """
     env = _subprocess_env()
     expanded = _expanded_make_variable('SYSTEM_COMPOSE', REPO_ROOT, env)
     assert _compose_calls(expanded) == [([BASE_FILE.name, FAKE_FILE.name], [])], expanded
     client = _expanded_make_variable('TEST_CLIENT_COMPOSE', REPO_ROOT, env)
-    assert _compose_projects(expanded) == _compose_projects(client) == [None], (expanded, client)
+    assert _compose_projects(expanded) == _compose_projects(client) == [DEV_PROJECT], (expanded, client)
 
 
 @pytest.mark.parametrize('variable', NON_FAKE_VARIABLES)
@@ -225,8 +299,11 @@ def _makefile_code_lines() -> list[str]:
     return [line for line in text.splitlines() if not line.lstrip().startswith('#')]
 
 
-def test_only_system_compose_and_the_agent_stack_name_the_overlay_in_the_makefile():
-    """Every Makefile line that names the file is one of the two assignments; any new one goes red."""
+def test_only_system_compose_names_the_overlay_in_the_makefile():
+    """Every Makefile line that names the file is the one assignment; any new one goes red.
+
+    tj-iee6sn.27 re-pin: the second assignment, the retired agent-stack set, is gone.
+    """
     naming = {line.split(':=')[0].strip() for line in _makefile_code_lines() if FAKE_FILE.name in line}
     assert naming == FAKE_LOADING_VARIABLES, f'Makefile lines naming {FAKE_FILE.name}: {naming}'
 
@@ -235,20 +312,25 @@ SEED_DUMP = 'seed-dump'
 SEED_DUMP_COMPOSE = 'SEED_DUMP_COMPOSE'
 
 
-def test_only_system_launch_and_seed_dump_reach_system_compose():
+def test_only_system_launch_seed_dump_and_test_build_reach_system_compose():
     """No other recipe (prod-launch, dev-launch, test-system...) reaches the fake stack's file list.
 
     Re-pinned by tj-irhy0a.22 item 3: make seed-dump runs the producer 'against the stack
     system-launch started (base + fake overlay + test-client file)', so SYSTEM_COMPOSE has exactly
     two users -- system-launch's recipe and the one SEED_DUMP_COMPOSE assignment -- and
     SEED_DUMP_COMPOSE has exactly one, seed-dump's recipe. Both recipes open with the shared guard.
+
+    tj-iee6sn.19 re-pin (ADR tj-4rr0la addendum 27 (2)): a third user, test-build's one recipe line,
+    which builds the :test images through the same file set. It is not behind the guard: a build
+    starts nothing and writes no database (test_test_mode_images.py pins its recipe).
     """
     lines = [line.strip().lstrip('@-+') for line in _makefile_code_lines()]
     users = [line for line in lines if '$(SYSTEM_COMPOSE)' in line]
     launch = [line for line in _make_recipe(SYSTEM_LAUNCH) if '$(SYSTEM_COMPOSE)' in line]
+    build = [line for line in _make_recipe(TEST_BUILD) if '$(SYSTEM_COMPOSE)' in line]
     seed_assignment = [line for line in users if line.split(':=')[0].strip() == SEED_DUMP_COMPOSE]
-    assert len(launch) == 1 and len(seed_assignment) == 1, f'lines using $(SYSTEM_COMPOSE): {users}'
-    assert sorted(users) == sorted(launch + seed_assignment), f'lines using $(SYSTEM_COMPOSE): {users}'
+    assert len(launch) == len(build) == len(seed_assignment) == 1, f'lines using $(SYSTEM_COMPOSE): {users}'
+    assert sorted(users) == sorted(launch + build + seed_assignment), f'lines using $(SYSTEM_COMPOSE): {users}'
     seed_users = [line for line in lines if f'$({SEED_DUMP_COMPOSE})' in line]
     seed_recipe = [line for line in _make_recipe(SEED_DUMP) if f'$({SEED_DUMP_COMPOSE})' in line]
     assert len(seed_users) == 1 and seed_users == seed_recipe, f'lines using $({SEED_DUMP_COMPOSE}): {seed_users}'
@@ -307,15 +389,28 @@ def test_system_launch_refuses_without_the_attestation_and_never_reaches_docker(
 def test_system_launch_starts_exactly_the_fake_stack_and_never_builds(
     tmp_path: Path, arguments: list[str], environment: str | None
 ):
-    """Item 2: one docker call -- SYSTEM_COMPOSE up with PROD_UP's --wait -- from the prod images, no build."""
+    """Item 2, re-pinned by ADR tj-4rr0la addendum 26 (4) (tj-iee6sn.18) and tj-iee6sn.24: three docker calls.
+
+    First the presence check of the two :test images (tj-iee6sn.24: one `docker image inspect` of both
+    refs, so compose never builds an absent one unstamped). Then the project's down, by dev-up's own
+    line -- TOOLS_COMPOSE's file set, a bare `down`, never -v or --remove-orphans -- so only one mode is
+    ever up. Then the one up of the fake stack: SYSTEM_COMPOSE with PROD_UP's --wait, from the :test
+    images. Nothing builds or pulls, and the only call that starts anything loads the fake overlay.
+    """
     env, log = _stubbed(tmp_path, environment)
     result = _run_make(tmp_path, SYSTEM_LAUNCH, *arguments, env=env)
     assert result.returncode == 0 and 'REFUSED' not in result.stderr, f'{result.stdout}{result.stderr}'
     calls = _docker_calls(log)
-    assert len(calls) == 1, f'system-launch ran docker {len(calls)} times: {calls}'
-    words = calls[0].split()
-    assert words[0] == 'compose' and not {'build', '--build', 'pull'} & set(words), calls
-    [(files, rest)] = _compose_calls(f'docker {calls[0]}')
+    assert len(calls) == 3, f'system-launch ran docker {len(calls)} times: {calls}'
+    assert calls[0].split() == ['image', 'inspect', 'trader_joe_data_store:test', 'trader_joe_data_ingest:test'], calls
+    for call in calls[1:]:
+        words = call.split()
+        assert words[0] == 'compose' and not {'build', '--build', 'pull'} & set(words), calls
+    [(tools_files, _)] = _compose_calls(_expanded_make_variable('TOOLS_COMPOSE', REPO_ROOT, _subprocess_env()))
+    [(down_files, down)] = _compose_calls(f'docker {calls[1]}')
+    assert down_files == tools_files and down == ['down'], calls
+    assert FAKE_FILE.name not in down_files, calls
+    [(files, rest)] = _compose_calls(f'docker {calls[2]}')
     assert files == [BASE_FILE.name, FAKE_FILE.name], calls
     [(_, prod_up)] = _compose_calls(_expanded_make_variable('PROD_UP', REPO_ROOT, _subprocess_env()))
     assert rest == prod_up == ['up', '-d', '--wait', '--wait-timeout', '300'], (rest, prod_up)

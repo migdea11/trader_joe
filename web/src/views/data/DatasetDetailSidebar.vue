@@ -1,10 +1,9 @@
 <script setup lang="ts">
 // The Dataset detail sidebar (tj-grna9p.34), the `sidebar` view of the data-dataset-detail route:
-// a link up to All Datasets and the screen's sections. Overview, Coverage, History and Retention
-// scroll to their section; Usage is shown disabled (a later phase). The sidebar leads nowhere but up
-// (the catalog) and within the page: the Viewer is the parent, reached by the breadcrumb, so there is
-// no item that goes back to it (owner ruling 2026-10-13, tj-grna9p.116).
-import { NOT_BUILT_TOOLTIP } from '@/shell/navigation'
+// a link up to All Datasets and the screen's sections, each of which scrolls to it (Usage is live
+// from tj-grna9p.89). The sidebar leads nowhere but up (the catalog) and within the page: the Viewer
+// is the parent, reached by the breadcrumb, so there is no item that goes back to it (owner ruling
+// 2026-10-13, tj-grna9p.116).
 import { titleCase } from '@/theme/copy'
 
 const SECTIONS = [
@@ -12,6 +11,7 @@ const SECTIONS = [
   { key: 'coverage', label: titleCase('Coverage') },
   { key: 'history', label: titleCase('History') },
   { key: 'retention', label: titleCase('Retention') },
+  { key: 'usage', label: titleCase('Usage') },
 ] as const
 
 function jump(key: string): void {
@@ -47,15 +47,6 @@ function jump(key: string): void {
       @click="jump(section.key)"
     >
       {{ section.label }}
-    </button>
-    <button
-      type="button"
-      class="side-item"
-      disabled
-      :title="NOT_BUILT_TOOLTIP"
-      data-section="usage"
-    >
-      {{ titleCase('Usage') }}
     </button>
   </nav>
 </template>

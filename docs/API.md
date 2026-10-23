@@ -17,9 +17,22 @@ manifest is at `server/routers/tests/interface_manifest/`.
 **Updated for the collection record and live events (2026-10).** The tree then gained the dataset's
 run history and coverage strip (U6, U7), the live-event socket (U8), the Viewer's page index (U9), the
 `ingest_run` record behind S1, and two request-body fields that are accepted and ignored. The U5
-`limit` maximum went from 10,000 to 50,000. Those entries and the ones they changed say so. What is
-*not* built is named where it would be looked for: no request log, queue or scheduler, no write route
-under `/ui/v1`, and no ops or collection-statistics read.
+`limit` maximum went from 10,000 to 50,000. Those entries and the ones they changed say so. At that
+pass there was no request log, queue or scheduler, no write route under `/ui/v1`, and no ops or
+collection-statistics read; the next paragraph says what has changed since.
+
+**Updated for retention and usage (2026-10).** The tree then gained the operator writes, set or clear
+a dataset's expiry (W1) and delete a dataset (W2), with an append-only override log and deletion
+record; the expiry reaper and its pending read (U10); usage tracking, with usage fields and filters on
+the dataset list, facets and detail and five statistics routes (U11 to U15); and the `X-Client-Id`
+read label that SDK clients send ([the read label](#the-x-client-id-read-label)). `GET /internal/asset-data/...` (S5) and U5 now record a
+read. Still not built: a request log or queue (the store drives a fetch per `POST /store`), vendor
+quota counting, and any history of storage growth.
+
+**Updated for collect (2026-10, decision `tj-hhy3dk`).** An expiry is now the deletion date only: it no longer
+retires a `DAILY` or `STREAM` dataset. Whether such a subscription is collected is its own `collect` intent,
+set by an optional `collect` on S1 and by a new write, W3 (`PATCH /ui/v1/datasets/{dataset_id}/collecting`).
+`DatasetSummary` gained `collecting`; `RETIRED` keeps its name on the wire and now means collect is false.
 
 **Checked on real Postgres, with named gaps.** Every status code and behaviour below was checked in
 process, against the code and its tests. On 2026-09-29 the owner ran the system suite
@@ -140,7 +153,7 @@ Every implementing file on this surface moved at the monorepo split (`tj-iontkq`
 
 ## The surface at a glance
 
-**Seventeen** interfaces are visible to the manifest: three in `common.manifest` and fourteen in
+**Twenty-seven** interfaces are visible to the manifest: three in `common.manifest` and twenty-four in
 `data_store.manifest`. The count is taken from `routers/tests/interface_manifest/*.manifest`, not from
 the prose below. `data_ingest.manifest` holds a single `none` line,
 which is a declaration that the component exposes nothing this manifest can enumerate, not an
@@ -168,6 +181,15 @@ It was nine until the Kafka removal, when R1 left the table.
 | U7 | `GET /ui/v1/datasets/{dataset_id}/coverage` | data_store | http (protobuf JSON) | none | **Stable** |
 | U8 | `WS /ui/v1/events` | data_store | ws (protobuf JSON frames) | none | **Stable** |
 | U9 | `GET /ui/v1/datasets/{dataset_id}/bar-pages` | data_store | http (protobuf JSON) | none | **Stable** |
+| W1 | `PATCH /ui/v1/datasets/{dataset_id}/expiry` | data_store | http (protobuf JSON) | instance secret | **Stable** |
+| W2 | `DELETE /ui/v1/datasets/{dataset_id}` | data_store | http | instance secret | **Stable** |
+| W3 | `PATCH /ui/v1/datasets/{dataset_id}/collecting` | data_store | http (protobuf JSON) | instance secret | **Stable** |
+| U10 | `GET /ui/v1/reaper/pending` | data_store | http (protobuf JSON) | none | **Stable** |
+| U11 | `GET /ui/v1/stats/usage/summary` | data_store | http (protobuf JSON) | none | **Stable** |
+| U12 | `GET /ui/v1/stats/usage/last-read-buckets` | data_store | http (protobuf JSON) | none | **Stable** |
+| U13 | `GET /ui/v1/stats/usage/reads-per-day` | data_store | http (protobuf JSON) | none | **Stable** |
+| U14 | `GET /ui/v1/stats/usage/stale` | data_store | http (protobuf JSON) | none | **Stable** |
+| U15 | `GET /ui/v1/stats/storage/current` | data_store | http (protobuf JSON) | none | **Stable** |
 
 data_ingest has no row. Its interface is the gRPC `IngestService.FetchDataset`, declared in
 `proto/trader_joe/proto/internal/ingest/v1/ingest.proto`, handled by
@@ -350,11 +372,13 @@ and cannot rely on an error.
 
 | Status | Meaning | Routes |
 |---|---|---|
-| 401 | Instance secret missing, wrong, or not configured on the server. One fixed message for all three causes. | S1, S3, S4 |
+| 401 | Instance secret missing, wrong, or not configured on the server. One fixed message for all three causes. | S1, S3, S4, W1, W2, W3 |
 | 403 | The declared `owner` does not own the entry (a missing owner is treated as a wrong one) | S3 |
-| 404 | No entry or dataset with that id | S3, S6, U4, U5, U6, U7 |
+| 404 | No entry or dataset with that id | S3, S6, U4, U5, U6, U7, U9, W1, W2, W3 |
 | 409 | The create overlaps the same owner's existing dataset; the top-level `colliding_ids` member of the problem+json lists them | S1 |
 | 422 | Validation: a naive datetime, an unknown field or parameter, a missing required field, a bars query naming no selector or a blank symbol, a `validate_fields` rule on the create body, an `asset_type`/`data_type` pair other than `stock`/`market_activity` on the internal asset-data path, or a malformed single-bar body; a `STREAM` create or a naive `ready_by` on S1; a coverage read for a dataset no trading calendar covers (U7) | all |
+| 409 | `OVERRIDE_REQUIRED`: the dataset belongs to another owner and the operator override is missing, unconfirmed or blank. The body never names the owner | W1, W2, W3 |
+| 503 | `DATABASE_UNAVAILABLE`: the audit tables are missing and the write needs one (run `make migrate`) | W1, W2, W3 |
 | 500 | Anything unmapped: a database error, a non-stock `asset_type` on S1 (gap **G8**), a duplicate timestamp inside one ingested batch | all |
 
 ---
@@ -464,8 +488,15 @@ the same owner's dataset is a **409** carrying `colliding_ids`, anything else cr
 after the request; it now defaults to none, and a caller that relied on the old default now gets a
 dataset that never lapses. Send an explicit `expiry` to get a dataset that does. Expiry is not
 identity, so an exact repeat of a request reuses the entry and **sets its expiry from the new body**: a
-repeat POST that omits `expiry` clears a stored one, and a `DAILY` or `STREAM` dataset that had an
-expiry (and so read as retired) is active again. A repeat that carries an `expiry` sets it.
+repeat POST that omits `expiry` clears a stored one, and a repeat that carries an `expiry` sets it. An
+expiry is the deletion date only and retires nothing, on any update type.
+
+**`collect` (optional boolean) is the subscription's collecting intent, an additive field of the public
+contract** (decision `tj-hhy3dk`). It applies to `DAILY` and `STREAM` only; on a `STATIC` request it is a
+422 (*collect applies to subscriptions only*). On a create an omitted `collect` is `true`. On an exact
+repeat an **omitted `collect` leaves the stored value unchanged** and only an explicit one changes it, so
+a client retrying its original body cannot undo an operator's Stop. This deliberately differs from
+`expiry`: collect is the operator's intent, expiry is the requester's own deletion date.
 
 **Validation, all 422:** `update_type` must be `STATIC` when `end` is given, and must be `STATIC` when
 `expiry_type` is `BULK`; and a given `end` must be later than `start`, since ranges are half-open and
@@ -643,6 +674,11 @@ a page. See gap **G5**.
 An unsupported `asset_type`/`data_type` pair is a **422** here too, from the same `Path()`-bound
 `AssetDataPath` as S4.
 
+**Each call is recorded as one read of every dataset it returned bars of** (and a query by `dataset_id`
+that returns none records the dataset with 0 bars). The reader is the optional `X-Client-Id` header; see
+[the read label](#the-x-client-id-read-label). A read records no more than that and never changes the
+answer. `GET /store/...` returns dataset entries, not bars, and records nothing.
+
 ## S6 · `GET /store/{id}`
 
 | | |
@@ -660,10 +696,9 @@ path with S3 and answers a different method; the manifest records the two as sep
 
 ---
 
-# routers/data_store — the UI read routes
+# routers/data_store — the UI routes
 
-Seven read routes and one socket serve the web UI under `/ui/v1`. They are open like the other reads and write nothing;
-in a deployment the web container's proxy is what a browser reaches, and only these routes pass it.
+The web UI is served under `/ui/v1` by fourteen read routes, one socket and three writes (W1, W2, W3). The reads are open like the other reads. The three writes need the instance secret. In a deployment the web container's proxy is what a browser reaches: it forwards the reads and exactly those three writes, and adds the secret itself.
 See the README's *The web UI*.
 
 **Protobuf canonical JSON, not Pydantic.** The response of every `/ui/v1` route is the protobuf
@@ -675,7 +710,7 @@ and ignores a field it does not know, since proto changes are additive. The rend
 `routers/common/proto_json.py`: a handler returns `ProtoJSONResponse(message)`, a route declares its
 message with `proto_route`, and a body, when a route takes one, is parsed with `ProtoBody`, which
 refuses an unknown field or a non-object with a 422 that names the message type and never echoes the
-body. No `/ui/v1` route takes a body today.
+body. Only the writes (W1, W2, W3) take a body, and W2's is optional.
 
 **Common behaviour.**
 
@@ -686,7 +721,8 @@ body. No `/ui/v1` route takes a body today.
 | Unknown parameter | A 422 (`extra_forbidden`), not ignored. |
 | Enum filters | Take the member name, in any case, with or without the wire prefix: `source=ALPACA_API` and `source=DATA_SOURCE_ALPACA_API` are the same filter. |
 | Errors | problem+json as everywhere (see the conventions): 404 `NOT_FOUND` for an unknown dataset, 422 for a bad parameter. |
-| Credentials | None carried. `owner` is a free-text label, never a key. |
+| Credentials | The reads carry none. The two writes need the instance secret (`X-Instance-Secret`). `owner` and the read label `client_id` are free-text labels, never keys. |
+| The read label | A bar read (U5, S5) is recorded under the caller's `X-Client-Id` label. See [the read label](#the-x-client-id-read-label). |
 
 ### U1 · `GET /ui/v1/config`
 
@@ -698,10 +734,12 @@ package version, else `unknown`). Nothing secret is read or returned.
 ### U2 · `GET /ui/v1/datasets`
 
 One page of the catalog, a `DatasetPage` of `DatasetSummary` items: identity, range, `updateType`,
-`expiryType`, `expiry`, `state` (`ACTIVE` or `RETIRED`), the stored extent (`firstBar`, `lastBar`,
+`expiryType`, `expiry` (the deletion date only), `state` (`ACTIVE`, or `RETIRED`: a `DAILY` or `STREAM` dataset whose collect intent is false), `collecting` (derived for every update type: the intent for a subscription; for a `STATIC` dataset true only while a run is in flight), the stored extent (`firstBar`, `lastBar`,
 `barCount`), `freshness`, the `siblings` (the same series at other granularities) and `lastRun`: the
 dataset's newest collection run, whatever its state, unset when it has never run (an `IngestRun`, see
-U6).
+U6), `usage` (a `DatasetUsage`, always set, see [Usage on the list](#usage-on-the-list-the-facets-and-the-detail)) and
+`reaperPending`: true when the dataset's expiry has passed and the reaper would delete it (true in
+dry-run too, where nothing is deleted; see U10).
 
 **Running means a run is in flight and ingest has acknowledged it.** `lastRun.state` is `RUNNING`, and
 a run is attached to a dataset only from ingest's acknowledgement, so a first-time request is not
@@ -714,7 +752,11 @@ visible as Running while the vendor is still answering. Running is not a freshne
 | `status` | the UI group: `healthy`, `late`, `failed` or `retired` |
 | `needs_attention` | only late and failed datasets |
 | `running` | `true`: only datasets with a run in flight. Orthogonal to `status`: a dataset can be Late and Running at once |
-| `sort` | `symbol` (default), or `expires`: soonest first, no-expiry datasets last |
+| `sort` | `symbol` (default); `expires`: soonest first, no-expiry datasets last; or `last_read`: most recent read first, never-read last, by the selected clients |
+| `usage` | `READ_30D`, `STALE` or `NEVER_READ`, a **filter** over the selected clients (the `USAGE_FILTER_` prefix and any case are accepted) |
+| `stale_days` | a **threshold**, not a filter: how many days unread makes `STALE`; 1 to 3650, default 90 |
+| `expires_before` | a **filter**: the Expiring Soon view, the datasets whose expiry is before this timezone-aware instant, plus every dataset the reaper would delete |
+| `client_id`, `client_kind` | select **whose reads** the usage figures and the `usage` and `last_read` rules count; see the usage section below |
 | `cursor`, `limit` | page; `limit` 1 to 500, default 100 |
 
 **Freshness is computed on read, never stored**, over the source's trading calendar (a holiday or an
@@ -729,11 +771,13 @@ unspecified and it matches no `status` filter.
 | `STREAM` | `FRESH` / `OVERDUE` | in hours, last bar within a few bar-lengths of now (`FRESHNESS_STREAM_BAR_MULTIPLE`, default 3); outside hours, relative to the last close |
 | `STATIC` | `COMPLETE` | every session in `[start, end)` has at least one bar |
 | `STATIC` | `GAPS` | some do not; `gapCount` is the number of missing sessions |
-| `DAILY` or `STREAM`, with an expiry set | `RETIRED` | no freshness is computed |
+| `DAILY` or `STREAM`, with `collect` false | `RETIRED` | no freshness is computed; an expiry does not retire a dataset |
 
 The UI groups these as Healthy (`FRESH`, `COMPLETE`), Late (`LATE`), Failed (`OVERDUE`, `GAPS`) and
-Retired. Completeness is counted per session, so a weekly or monthly dataset, which has bars on fewer
-days than there are sessions, would read as full of gaps; none is stored yet.
+Retired (the UI says Stopped). Completeness counts sessions, and a session is covered when a bar covers its period: the session
+for 1min to 1day, the Monday-Sunday week for 1week, the calendar month for 1month, in the trading calendar's
+time zone. A weekly or monthly dataset therefore reads `COMPLETE` when every expected period has its bar, and
+`gapCount` stays a count of sessions. Only the sessions inside `[start, end)` are counted.
 
 ### U3 · `GET /ui/v1/datasets/facets`
 
@@ -744,9 +788,16 @@ and each source, update type and status count is the total with every filter exc
 `running` is the number of datasets with a run in flight, under every filter except `running` itself,
 so with `running=true` it equals the list's total.
 
+The facets add the usage counts, under the same client filter and `stale_days`: `stale`, `read30d` and
+`neverRead` (each equals the total of the list filtered by the matching `usage` value), `expiringSoon`,
+`clients` (every client that has read anything, with the datasets each read in the last 30 days; it
+ignores the client filter, so a picker never empties itself) and the echoes `clientIds`, `clientKinds`,
+`staleDays` and `expiresBefore`. `expiringSoon` is expiry-based and ignores the client filter. The
+facets route takes `expires_before` like the list; when it is absent the server uses now plus seven days.
+
 ### U4 · `GET /ui/v1/datasets/{dataset_id}`
 
-One `DatasetSummary`, as in U2, with `lastRun`. **404** for an unknown id.
+One `DatasetSummary`, as in U2, with `lastRun`. It takes the client filter (`client_id`, `client_kind`) and nothing else; its `usage` is counted under it. **404** for an unknown id.
 
 ### U5 · `GET /ui/v1/datasets/{dataset_id}/bars`
 
@@ -757,6 +808,11 @@ programmatic readers and the Viewer's CSV export, which reads 50,000 at a time).
 last bar's timestamp, unique within a dataset, so paging is exact while bars are inserted. An empty or
 inverted window is an empty page, not an error. **404** for an unknown dataset, 422 for a bad cursor.
 Bars are raw (unadjusted), as on S5.
+
+**A call without a `cursor` is recorded as one read** of the dataset, labelled by the `X-Client-Id`
+header (the web UI sends `operator`, which makes it a UI read; a missing or invalid header is
+`_unattributed`). A call **with** a cursor records nothing, so paging through or exporting a dataset is
+one read, not one per page. Recording is buffered in the server and never changes the answer.
 
 ### U9 · `GET /ui/v1/datasets/{dataset_id}/bar-pages`
 
@@ -847,12 +903,14 @@ The event is published after the commit it announces.
 | Event | Published when |
 |---|---|
 | `IngestRunChanged` (carries the `IngestRun`) | a run starts, is acknowledged by ingest, and finishes |
-| `DatasetChanged` `UPDATED` | after S1 commits |
-| `DatasetChanged` `DELETED` | after S3 commits |
+| `DatasetChanged` `UPDATED` | after S1 or W1 commits, unless S1 flipped the collect intent, and after a daily refresh fetch commits |
+| `DatasetChanged` `RETIRED` / `RESUMED` | after W3 commits a change of collect to false / true, or after S1 flips it the same way. A W3 that leaves the stored value as it was publishes nothing |
+| `DatasetChanged` `DELETED` | after S3, W2 or a reaper deletion commits |
+| `ReaperPendingChanged` | the reaper's pending set differs from the previous pass's, after any deletions of an enabled pass, and once on the first pass after start; in dry-run too. A notification: reload U10 or the affected lists |
 
-`DatasetChanged` is **never `CREATED`**, `RETIRED` or `RESUMED`: a new dataset arrives as `UPDATED`,
-because the upsert does not tell a create from a repeat. `RequestChanged` and `ReaperPendingChanged`
-are in the proto and typed, and **nothing publishes them**: they are reserved. An acknowledgement's
+`DatasetChanged` is **never `CREATED`**: a new dataset arrives as `UPDATED`,
+because the upsert does not tell a create from a repeat. `RequestChanged`
+is in the proto and typed, and **nothing publishes it**: it is reserved. An acknowledgement's
 `IngestRunChanged` can name a dataset whose entry is not committed yet, so a reload by id may 404
 briefly.
 
@@ -867,6 +925,185 @@ code **1013** (try again later) and is expected to reconnect and reload.
 **Through the web container's proxy** the upgrade is a `GET` under `/api/store/ui/v1/`, which is what
 Caddy forwards, so the socket passes with no change to the filter. The dev proxy forwards it with
 `ws: true`.
+
+## The operator writes
+
+The web UI's two writes. Both need the instance secret (`X-Instance-Secret`, a 401 otherwise); the web container's proxy adds it, so a browser never holds it. Bodies are
+protobuf canonical JSON. Neither route changes the owner-scoped `/store` writes (S1, S3), which are
+unchanged. As everywhere in this document the secret authenticates the deployment, not the caller.
+
+**The operator override.** A dataset belongs to an `owner`. When that owner is not `operator`, the
+write must carry `override: {reason, confirmed}` with a non-blank `reason` and `confirmed: true`; the
+reason is stored trimmed. An override sent for the operator's own dataset is ignored.
+
+### W1 · `PATCH /ui/v1/datasets/{dataset_id}/expiry`
+
+Body `SetExpiryRequest`: `expiry` (a timezone-aware timestamp; **unset clears it**) and `override`.
+The expiry type and update type are not writable, and an unknown field (`expiryType` included) is a 422.
+
+| Answer | When |
+|---|---|
+| **200**, the updated `DatasetSummary` | the write committed |
+| **422** | a malformed body, an unknown field, a naive timestamp |
+| **404** | no such dataset |
+| **409** `OVERRIDE_REQUIRED` | another owner's dataset and the override is missing, unconfirmed or blank. The body, detail and metadata never name the owner |
+| **503** `DATABASE_UNAVAILABLE` | the dataset needs an override and the audit tables are missing (`make migrate`). Refused before any write. An operator-owned PATCH needs no audit table and goes through |
+
+Rules run in that order: body, existence, override, audit tables, then the write. **The expiry is the
+deletion date only, for every update type: setting it retires nothing and clearing it resumes nothing.**
+It is stored as sent, so a past time makes the dataset pending for the reaper and nothing else. The write, and its override-log row when an override was used, commit in one transaction;
+`DatasetChanged` `UPDATED` is published after the commit.
+
+### W3 · `PATCH /ui/v1/datasets/{dataset_id}/collecting`
+
+Body `SetCollectingRequest`: `collect` (**required**: a body without it is a 422, never read as `false`) and
+`override`. `DAILY` and `STREAM` subscriptions only. `true` starts collecting, `false` stops it (the dataset
+reads `RETIRED`, shown as Stopped, and the daily refresh skips it).
+
+| Answer | When |
+|---|---|
+| **200**, the updated `DatasetSummary` | the write committed (a repeat of the stored value too) |
+| **422** | a malformed body, an unknown field, a body with no `collect`, or a `STATIC` dataset (it has no collect intent) |
+| **404** | no such dataset |
+| **409** `OVERRIDE_REQUIRED`, **503** `DATABASE_UNAVAILABLE` | as W1; the override-log row records the action `SET_COLLECTING` |
+
+Rules run in that order: body (a missing `collect` first), existence, `STATIC` refusal, override, audit
+tables, then the write, in one transaction with its override-log row. After the commit it publishes
+`DatasetChanged` `RETIRED` (collect went to false) or `RESUMED` (to true), and nothing when the stored value
+was already that. The reaper is unaffected: it deletes at the expiry whatever `collect` says.
+
+### W2 · `DELETE /ui/v1/datasets/{dataset_id}`
+
+Deletes the dataset and its bars. The body is optional: the operator's own dataset needs none, and a
+body that is sent is parsed strictly (`DeleteDatasetRequest`, `override` only).
+
+| Answer | When |
+|---|---|
+| **204**, no body | deleted |
+| **422**, **404**, **409** `OVERRIDE_REQUIRED` | as W1 |
+| **503** `DATABASE_UNAVAILABLE` | the audit tables are missing. **Every** delete is audited, so it is refused before any write |
+
+**The audit records are append-only tables, never updated or deleted from.** `dataset_deletion` gets
+one row for every deletion (the operator's, and the reaper's, whose cause and actor are `REAPER` and
+`reaper`); `dataset_override_log` gets one row for each write that used an override, so the reaper,
+a system action, writes none. Neither has a foreign key, so a record outlives its dataset. Runs and
+usage rows likewise outlive a deleted dataset but are no longer reachable through it.
+`DatasetChanged` `DELETED` is published after the commit.
+
+## The expiry reaper
+
+An expired dataset is deleted by a periodic pass of the store (`REAPER_INTERVAL_SECONDS`, default 3600).
+It keeps no job list: after a restart the next pass reads the database again. **It is dry-run unless
+`REAPER_DELETES_ENABLED` is the value `true`** (any letter case, surrounding whitespace ignored; unset, `1`,
+`yes` and anything else stay in dry-run). In dry-run it logs a count and deletes nothing. The
+default is dry-run because datasets created under the former default, which was an expiry one day after
+the request, are all past expiry: read U10 before enabling deletes. An enabled pass deletes each
+pending dataset in its own transaction, records a `dataset_deletion` row for it, skips a dataset with a
+fetch in flight until the next pass, and deletes nothing at all while the audit tables are missing.
+
+### U10 · `GET /ui/v1/reaper/pending`
+
+A `ReaperPendingPage`: the datasets the reaper would delete (or is deleting), as `DatasetSummary`
+items with `reaperPending` true, oldest expiry first (keyset on expiry and id, an opaque `next_cursor`,
+empty on the last page). `deletesEnabled` is false in dry-run. `cursor` and `limit` (1 to 500,
+default 100) are the only parameters; a cursor that does not decode is a 422. A stopped `DAILY` or
+`STREAM` dataset is pending only once its expiry has passed, like any other; the reaper ignores `collect`.
+
+## The `X-Client-Id` read label
+
+Usage is recorded per reader, and **a reader identifies itself with the `X-Client-Id` request header
+on a bar read** (S5, and U5 without a cursor). This is part of the public client contract.
+
+| Rule | Detail |
+|---|---|
+| What to send | Your **owner string**, the one you use on the dataset write routes. Send the same value on every read |
+| What it is | A **label** for usage statistics. It is self-asserted and **never authentication**: nothing is allowed or refused on it, and it is not a security boundary. Anyone can send any value |
+| Valid values | 1 to 128 characters, no control characters, not starting with `_`. Anything else is recorded as `_unattributed`, never truncated, and the read still succeeds |
+| Kind | `UI` if and only if the label equals the operator principal, `operator`, which is what the web UI sends. Every other label, `_unattributed` and `_overflow` included, is kind `SDK` |
+| Reserved | `_unattributed` (header missing, empty, too long or malformed) and `_overflow`. A caller cannot send either |
+| The cap | At most 32 distinct labels are kept per dataset per UTC day. Later labels that day are recorded as `_overflow`. `operator` and the reserved values are exempt |
+| Not on writes | A write route neither reads nor accepts it |
+| Not the `owner` filter | The `owner` query parameter on `GET /store/...` searches by owner and is unrelated to the label |
+
+The label is never logged and is kept out of reprs. It does appear in the responses of the usage
+routes, as `client_id`.
+
+## Usage on the list, the facets and the detail
+
+The usage fields come from the bar reads recorded under the label above. This section separates **what
+selects readers**, **what is a threshold**, **what is a filter** and **what is a window**.
+
+| Parameter | Role | Default |
+|---|---|---|
+| `client_id` | selects **whose reads count**: exact ids, repeatable; **wins** over `client_kind` | none; at most 32 ids |
+| `client_kind` | selects whose reads count: `UI`, `SDK` (the `CLIENT_KIND_` prefix and any case accepted), repeatable | `SDK` when neither is sent |
+| `stale_days` | a **threshold**: unread this long is stale | 90 (1 to 3650) |
+| `usage` | a **filter** on the list and facets: `READ_30D`, `STALE`, `NEVER_READ` | none |
+| `expires_before` | a **filter** (Expiring Soon) | none on the list; the facets use now plus seven days for their `expiringSoon` count |
+| `source`, `dataset_id` | **filters** on the statistics routes | none |
+| `days` | a **window** (reads per day) | 30 (1 to 365) |
+
+**The echo rule.** Every response that applies a client filter echoes what was applied, and exactly
+one of `clientIds` and `clientKinds` is non-empty: `clientIds` when `client_id` was sent, otherwise
+`clientKinds`, written out as `[SDK]` by default.
+
+`DatasetSummary.usage` is a `DatasetUsage`: `lastReadAt` (the latest read by the selected clients; unset
+means never), `reads30d` (their reads in the last 30 days), `readBy30d` and `readByClients30d` (who
+read it in the last 30 days, **regardless of the filter**, so a screen can say "UI only") and the echo.
+
+**The definitions are day-aligned** on the UTC date of the last read, and a stream session counts as a read:
+
+| Group | A dataset is in it when |
+|---|---|
+| `READ_30D` | the selected clients read it within the last 30 UTC days |
+| `STALE` | they did not read it within the last `stale_days` UTC days; **never-read is stale** |
+| `NEVER_READ` | they never read it |
+
+`READ_30D` and `STALE` are complements at `stale_days=30`. The list, facets and statistics decide through
+one rule, so for one filter a facet count equals the filtered list's total and the stale counts of the
+summary, the facets and the stale list agree. On a database that has not run the usage migration, usage
+reads as zero.
+
+## The usage statistics
+
+Five open GETs under `/ui/v1/stats`, each a protobuf message, none recording usage. Every usage route
+takes the client filter above (`client_id`, `client_kind`) and echoes it; the storage route takes none,
+because what the store holds does not depend on who read it. An unknown parameter is a 422.
+
+### U11 · `GET /ui/v1/stats/usage/summary`
+
+A `UsageSummary`: `stale`, `readLast30d`, `neverRead`, `total`, `readsToday`, `distinctClientsToday`
+(today is the UTC date), the echo and `staleDays`. Parameters: `stale_days` (threshold) and `source`
+(filter).
+
+### U12 · `GET /ui/v1/stats/usage/last-read-buckets`
+
+`LastReadBuckets`: datasets by whole UTC days since the last read, in the half-open buckets
+[0,1), [1,8), [8,31), [31,91) and [91, open), plus `neverRead`; the buckets and `neverRead` sum to the
+total. Parameter: `source` (filter).
+
+### U13 · `GET /ui/v1/stats/usage/reads-per-day`
+
+`ReadsPerDay`: one entry per UTC day, client id and kind with a read, ascending by day. Per-read rows
+and the older daily rollup are one series, so a day split across the rollup boundary is one entry.
+Parameters: `days` (the window, today included), `dataset_id` and `source` (filters).
+
+### U14 · `GET /ui/v1/stats/usage/stale`
+
+A `StaleDatasetPage`: the stale datasets, never-read first, then the oldest last read, then id. Each row
+carries the `DatasetSummary`, `estBytes` (an estimate) and the last read per client. Parameters:
+`stale_days` (threshold), `source` (filter), `cursor` and `limit` (1 to 500, default 100). The cursor is
+opaque and bound to `stale_days`, `source` and the client filter; one issued under another is a 422.
+
+### U15 · `GET /ui/v1/stats/storage/current`
+
+A `StorageCurrent`: what the bar table holds now, with no history. `bySource` splits it per source and
+feed as **estimates** (each share is the bars' count times the table's average row size). Without
+`source`, `totalBytes` is the table's measured size; with a `source` it is the sum of that source's
+shares, so the split sums to it. Parameter: `source` (filter) only.
+
+**Known limit:** a source with more than about 16,000 datasets exceeds the database's bound-parameter
+limit on the usage statistics. Request-quota use is not served.
 
 ---
 

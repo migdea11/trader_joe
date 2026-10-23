@@ -21,11 +21,12 @@ set -euo pipefail
 # disagree silently. Shipping the revisions inside the image is a build-infra change, not this
 # script's job — tj-y3sj8x.
 #
-# THAT SPLIT EXISTS ONLY ON THE PRODUCTION DEFINITION. On the dev definition the override
-# bind-mounts app/, common/, routers/, schemas/ and gen/proto/python over /code as well, so the
-# models, the enums the revisions import and the revisions themselves all come from this checkout:
-# there is no image/revision split in dev. Which definition runs is chosen from the running stack;
-# see WHICH STACK below.
+# THAT SPLIT EXISTS ON THE PRODUCTION AND TEST DEFINITIONS. TEST runs the :test image, built from
+# the production target, with only alembic.ini and migrations/ bind-mounted, so it has the split
+# too. On the dev definition the override bind-mounts app/, common/, routers/, schemas/ and
+# gen/proto/python over /code as well, so the models, the enums the revisions import and the
+# revisions themselves all come from this checkout: there is no image/revision split in dev.
+# Which definition runs is chosen from the running stack; see WHICH STACK below.
 #
 # "Run this from a checkout that matches the running image" is what this header used to say, and
 # saying it was all it did. On 2026-10-04 a careful operator did exactly what it warned against
@@ -130,14 +131,27 @@ cd "$REPO_ROOT"
 # -f docker-compose.yaml explicitly, matching `make build` and the CI migrate step. A bare
 # `docker compose` also auto-loads docker-compose.override.yaml, which swaps data_store to
 # the dev image. THE DEFAULT IS THE PRODUCTION DEFINITION: the dev definition (base + override)
-# is selected only when the running stack is unambiguously dev, by select_stack below, and
-# everything ambiguous stays on this line (tj-slxynv; tj-x3ig38 addendum 2026-10-12). Keep this
+# is selected only when the running stack is unambiguously dev, and the TEST definition (base +
+# fake) only when it is unambiguously test, both by select_stack below; everything ambiguous
+# in the default project stays on this line, and in trader_joe_dev it is refused (tj-slxynv;
+# tj-x3ig38 addendum 2026-10-12; tj-grna9p.173). Keep this
 # top-level line literal: test_network_model.py reads the first ^COMPOSE=(...) line.
 COMPOSE=(docker compose -f docker-compose.yaml)
 
 # WHICH make TARGET REBUILDS THE IMAGE THE SELECTED DEFINITION RUNS. Only the FIX: lines of the
-# `check` guard read it; select_stack sets it to dev-build when it selects the dev definition.
+# `check` guard read it; select_stack sets it to dev-build when it selects the dev definition and
+# to test-build when it selects the TEST definition.
 BUILD_TARGET=prod-build
+
+# THE COMPOSE PROJECT THE RUNNING POSTGRES LIVES IN (ADR tj-4rr0la addendum 29; owner ruling tj-oxxl8a
+# option A). Dev and test run as the compose project trader_joe_dev; production keeps the default
+# project name and its launch. The script only READS labels and execs alembic in the project it
+# picked, so it never touches the other project's containers. PROJECT_ARGS is empty for the default
+# (production) project and (-p trader_joe_dev) for the dev one; PROJECT_NAME is what the stderr line
+# names. Both are set where the probe runs, just before select_stack.
+DEV_PROJECT=trader_joe_dev
+PROJECT_ARGS=()
+PROJECT_NAME=default
 
 # =================================================================================================
 # WHICH STACK (decision tj-slxynv option (b); tj-x3ig38 addendum 2026-10-12; tj-yb1bxj addendum 4).
@@ -154,11 +168,22 @@ BUILD_TARGET=prod-build
 #   * DEV iff some entry's FILE NAME is exactly docker-compose.override.yaml. NEVER a full-path
 #     comparison: the label holds the paths as seen by whoever ran `up` (a host path, or a
 #     devcontainer's /workspace), so comparing against $REPO_ROOT would misread a correct dev stack.
-#   * A dev postgres is cross-checked against a running data_store, whose label must say dev too.
-#   * AMBIGUOUS MEANS PRODUCTION AND STILL RUNS ALEMBIC. No label, an empty or malformed label, a
-#     failed inspect or ps, more than one postgres or data_store container, a dev postgres with a
-#     non-dev data_store. Detection never exits by itself: `upgrade head` is the remedy and a
-#     selection problem must not refuse it (tj-yb1bxj addendum 3 item 6, addendum 4 item 4).
+#   * TEST iff some entry's file name is exactly docker-compose.fake.yaml and none is the override: the
+#     stack `make system-launch` runs (base + fake, on ./volume_data/test; ADR tj-4rr0la addendum 27).
+#     The fake file sets the :test image tags, so the one-off runs :test and a test stack never
+#     builds or runs :latest. DEV and TEST are told apart by basename alone, like the dev rule.
+#     BOTH files in one label is no launched stack and is UNKNOWN, so production.
+#   * A dev postgres is cross-checked against a running data_store, whose label must say dev too; a
+#     test postgres likewise against a test data_store.
+#   * IN THE DEFAULT PROJECT, AMBIGUOUS MEANS PRODUCTION AND STILL RUNS ALEMBIC. No label, an empty or
+#     malformed label, a failed inspect or ps, more than one postgres or data_store container, a dev
+#     postgres with a non-dev data_store (likewise a test postgres with a non-test one). Detection
+#     never exits by itself there: `upgrade head` is the remedy and a selection problem must not
+#     refuse it (tj-yb1bxj addendum 3 item 6, addendum 4 item 4).
+#   * IN trader_joe_dev THE SAME OUTCOMES REFUSE (exit 1, naming the cause): only a positively DEV or
+#     TEST stack is accepted there, and a production-labelled container is refused. Nothing in that
+#     project is production by construction, so refusing costs a dev restart (tj-grna9p.173,
+#     architect option B).
 #   * The dev list is -f docker-compose.yaml -f docker-compose.override.yaml and NOTHING else. The
 #     web file carries an INSTANCE_WRITE_SECRET:? guard that compose interpolates even for a run of
 #     another service, and a dev .env leaves it empty.
@@ -168,12 +193,16 @@ BUILD_TARGET=prod-build
 #
 # BEGIN classify_config_files: the whole label -> verdict decision, with no globals and no docker,
 # so a test can extract this block and drive it with a label string. Prints one line:
-#   DEV                  some entry's file name is exactly docker-compose.override.yaml
-#   PROD                 well formed, and no entry is the override
-#   UNKNOWN: <reason>    empty, or malformed (an empty or relative entry, or a newline)
+#   DEV                  some entry's file name is exactly docker-compose.override.yaml, and none is
+#                        docker-compose.fake.yaml
+#   TEST                 some entry's file name is exactly docker-compose.fake.yaml, and none is the
+#                        override (what `make system-launch` runs)
+#   PROD                 well formed, and neither file name is present
+#   UNKNOWN: <reason>    empty, or malformed (an empty or relative entry, or a newline), or BOTH the
+#                        override and the fake file (no target launches that pair)
 # A path that itself contains a comma lands in UNKNOWN as malformed: fail closed.
 classify_config_files() {
-    local label="$1" entry
+    local label="$1" entry has_override=0 has_fake=0
     local -a entries
 
     if [ -z "$label" ]; then
@@ -195,12 +224,20 @@ classify_config_files() {
         fi
     done
     for entry in "${entries[@]}"; do
-        if [ "${entry##*/}" = docker-compose.override.yaml ]; then
-            echo DEV
-            return 0
-        fi
+        case "${entry##*/}" in
+            docker-compose.override.yaml) has_override=1 ;;
+            docker-compose.fake.yaml) has_fake=1 ;;
+        esac
     done
-    echo PROD
+    if [ "$has_override" -eq 1 ] && [ "$has_fake" -eq 1 ]; then
+        echo "UNKNOWN: both docker-compose.override.yaml and docker-compose.fake.yaml are in the label; no target launches that pair"
+    elif [ "$has_override" -eq 1 ]; then
+        echo DEV
+    elif [ "$has_fake" -eq 1 ]; then
+        echo TEST
+    else
+        echo PROD
+    fi
 }
 # END classify_config_files
 
@@ -232,7 +269,7 @@ count_lines() {
 # already captured by the caller. Run AFTER the postgres-is-running check and BEFORE the `check`
 # guard, which asks the selected definition which image the one-off container will run.
 select_stack() {
-    local postgres_ids="$1" reason verdict data_store_ids count
+    local postgres_ids="$1" reason verdict data_store_ids count chosen="" name data_store_verdict
 
     reason="the running postgres was started without docker-compose.override.yaml"
     count="$(count_lines "$postgres_ids")"
@@ -241,36 +278,78 @@ select_stack() {
     else
         verdict="$(classify_container "$postgres_ids")"
         case "$verdict" in
-            DEV)
+            DEV | TEST)
+                # A dev postgres wants a dev data_store, a test postgres a test one; none running
+                # is fine. Anything else is a mixed stack, and mixed means production.
+                name=dev
+                if [ "$verdict" = TEST ]; then
+                    name="test"
+                fi
                 if ! data_store_ids="$("${COMPOSE[@]}" ps -q data_store 2> /dev/null)"; then
                     reason="could not list the data_store containers to cross-check the stack"
                 else
                     count="$(count_lines "$data_store_ids")"
                     if [ "$count" -eq 0 ]; then
                         reason=""
+                        chosen="$verdict"
                     elif [ "$count" -ne 1 ]; then
                         reason="$count data_store containers; cannot tell which stack"
                     else
-                        verdict="$(classify_container "$data_store_ids")"
-                        if [ "$verdict" = DEV ]; then
+                        data_store_verdict="$(classify_container "$data_store_ids")"
+                        if [ "$data_store_verdict" = "$verdict" ]; then
                             reason=""
+                            chosen="$verdict"
                         else
-                            reason="postgres was started by the dev definition but data_store by ${verdict}: mixed stack"
+                            reason="postgres was started by the $name definition but data_store by ${data_store_verdict}: mixed stack"
                         fi
                     fi
                 fi
                 ;;
-            PROD) ;;
+            PROD)
+                # Only DEV and TEST definitions belong in the dev project (ADR tj-4rr0la addendum 29
+                # (3)); a container started from the production files there is refused, as the MCP
+                # guard refuses it. The default project's production postgres is the normal case.
+                if [ ${#PROJECT_ARGS[@]} -gt 0 ]; then
+                    echo "project $PROJECT_NAME holds a container started from the production files: stop it (it belongs in the default project); make migrate will not guess" >&2
+                    exit 1
+                fi
+                ;;
             *) reason="${verdict#UNKNOWN: }" ;;
         esac
     fi
 
-    if [ -z "$reason" ]; then
-        COMPOSE=(docker compose -f docker-compose.yaml -f docker-compose.override.yaml)
-        BUILD_TARGET=dev-build
-        echo "run_migrations.sh: using the DEV definition (docker-compose.yaml + docker-compose.override.yaml): the running postgres was started with docker-compose.override.yaml" >&2
-    else
-        echo "run_migrations.sh: using the PRODUCTION definition (docker-compose.yaml): $reason" >&2
+    case "$chosen" in
+        DEV)
+            COMPOSE=(docker compose -f docker-compose.yaml -f docker-compose.override.yaml)
+            BUILD_TARGET=dev-build
+            echo "run_migrations.sh: using the DEV definition (docker-compose.yaml + docker-compose.override.yaml): the running postgres was started with docker-compose.override.yaml (project: $PROJECT_NAME)" >&2
+            ;;
+        TEST)
+            COMPOSE=(docker compose -f docker-compose.yaml -f docker-compose.fake.yaml)
+            BUILD_TARGET=test-build
+            echo "run_migrations.sh: using the TEST definition (docker-compose.yaml + docker-compose.fake.yaml): the running postgres was started with docker-compose.fake.yaml (project: $PROJECT_NAME)" >&2
+            ;;
+        *)
+            # Nothing in the dev project is production by construction, so an unclear outcome there
+            # is refused rather than run against the production definition (tj-grna9p.173, architect
+            # option B). Costs a dev restart at most. Only the default project falls through.
+            if [ ${#PROJECT_ARGS[@]} -gt 0 ]; then
+                echo "project $PROJECT_NAME: cannot tell that this is a dev or test stack ($reason): refusing; make migrate will not guess. Restart the stack with make dev-up or make system-launch, then re-run." >&2
+                exit 1
+            fi
+            # Literal like the other arms: the single project splice below then treats all three alike.
+            COMPOSE=(docker compose -f docker-compose.yaml)
+            echo "run_migrations.sh: using the PRODUCTION definition (docker-compose.yaml): $reason (project: $PROJECT_NAME)" >&2
+            ;;
+    esac
+
+    # The definition lines above stay literal; the project the postgres was found in is spliced in
+    # after `docker compose`, so every later call (cross-check, guard, one-off) addresses that
+    # project alone. Empty for the default (production) project.
+    if [ ${#PROJECT_ARGS[@]} -gt 0 ]; then
+        local -a definition=("${COMPOSE[@]:2}")
+        unset COMPOSE
+        COMPOSE+=(docker compose "${PROJECT_ARGS[@]}" "${definition[@]}")
     fi
 }
 # =================================================================================================
@@ -286,16 +365,18 @@ select_stack() {
 # that image/revision split does not arise. The guard below still runs there, and deliberately:
 # the stamp compares what is baked into the :dev image (the dependencies, which no bind mount
 # replaces), and a :dev image whose stamp does not match the checkout is refused (tj-yb1bxj
-# addendum 4 item 3; do not relax it). On 2026-10-04 the production case reported three drift
-# items that were all phantoms of a stale prod image, one of
+# addendum 4 item 3; do not relax it). On the TEST definition the image is :test, which bakes the
+# code like production's, so the split is the production one; the guard compares the :test image
+# (compose's answer, not a spelled tag) and its FIX line names make test-build. On 2026-10-04 the
+# production case reported three drift items that were all phantoms of a stale prod image, one of
 # them a bug the branch had already removed. A drift check whose comparison base is unverified is
 # not a weak check, it is an uninterpretable one, and an uninterpretable green is worse than none.
 #
 # WHY IT LIVES IN THIS SCRIPT RATHER THAN IN THE `migrate-check` TARGET, which is the other place
 # it could have gone. The guard has to name the image the one-off container will actually use, and
-# this script is the only thing that knows it: select_stack above decides whether the dev override
-# is loaded, so the image (:dev or :latest) is a consequence of THIS file's compose invocation, and
-# the guard follows that selection rather than assuming the production image.
+# this script is the only thing that knows it: select_stack above decides which definition is
+# loaded (base, base + override or base + fake), so the image (:dev, :test or :latest) is a
+# consequence of THIS file's compose invocation, and the guard follows that selection rather than assuming the production image.
 # Deriving it again in the Makefile would be a second spelling of the thing this script exists to
 # be the single spelling of (tj-4yvsb2), and the two would drift. Gating on the COMMAND rather than
 # on the caller also means a future caller that passes `check` — a deploy script, a human — gets
@@ -434,7 +515,7 @@ verify_comparison_image() {
     # STDERR IS SUPPRESSED HERE TOO, so in isolation a docker failure that is NOT absence — an
     # unreachable daemon, a permissions error — would also misread as "NO SUCH IMAGE", the same
     # fault one paragraph up. THAT IS UNREACHABLE TODAY, MEASURED rather than assumed: the postgres
-    # check below (`"${COMPOSE[@]}" ps -q postgres`) runs before this function is ever called, and
+    # check below (the two project probes `docker compose ... ps -q postgres`) runs before this function is ever called, and
     # with an unreachable daemon that assignment itself fails under `set -e`, exiting the script
     # there — the operator sees docker's own message instead of this one. The containment rides
     # entirely on CHECK ORDER: moving this guard's call above the postgres check reopens it.
@@ -468,10 +549,12 @@ CANNOT VERIFY: this image carries no usable source stamp, so what \`alembic chec
 compare cannot be established. Absent is not a match.
 $(describe_comparison "$image_ref" "${image_stamp:-<absent>}" "$checkout_digest")
 
-THIS IS THE ORDINARY CASE AND NOTHING IS WRONG WITH YOUR IMAGE. Only \`make prod-build\` and
-\`make dev-build\` stamp one. An image built by CI, by \`make system-launch\` (up -d --wait, no
---build) or by a bare \`docker compose build\` has no stamp — it may well be perfectly current;
-it simply cannot be SHOWN to be, and a check nobody can interpret is the thing being replaced.
+THIS IS THE ORDINARY CASE AND NOTHING IS WRONG WITH YOUR IMAGE. Only \`make prod-build\`,
+\`make dev-build\` and \`make test-build\` stamp one. An image built by CI, pulled, or built by a
+bare \`docker compose build\` has no stamp — it may well be perfectly current; it simply cannot
+be SHOWN to be, and a check nobody can interpret is the thing being replaced. \`make
+system-launch\` (up -d --wait, no --build) runs an image that is already there as it is (stamped
+only if one of the three targets above built it), and builds a missing one implicitly, unstamped.
 
 FIX: make $BUILD_TARGET
 EOF
@@ -529,7 +612,31 @@ fi
 # name-resolution failure from inside the container; this says the same thing in one line.
 # Bringing postgres up here instead was rejected: `up` recreates a container whose config
 # hash has changed, and applying migrations must never restart the database it migrates.
-postgres_container="$("${COMPOSE[@]}" ps -q postgres)"
+#
+# THE PROJECT IS FOUND FIRST. Postgres is looked for in trader_joe_dev, then in the default project.
+# Exactly one holds a running postgres: that project is used for every compose call from here on.
+# Both do: refuse, since there is no telling which one is meant and a guess could migrate the
+# production database. Neither: the not-running message, as before.
+# If COMPOSE_PROJECT_NAME is set (to trader_joe_dev) it renames the default probe's project, so both
+# probes resolve to the same project and return the SAME container id(s): that is one project, not
+# two, and it is used as the dev project (the explicit -p probe is the one that names it). Two
+# DIFFERENT ids are still ambiguous and refuse.
+dev_postgres="$(docker compose -p "$DEV_PROJECT" -f docker-compose.yaml ps -q postgres)"
+default_postgres="$(docker compose -f docker-compose.yaml ps -q postgres)"
+if [ "$dev_postgres" = "$default_postgres" ]; then
+    default_postgres=""
+fi
+if [ -n "$dev_postgres" ] && [ -n "$default_postgres" ]; then
+    echo "postgres runs in both $DEV_PROJECT and the default project: stop one, then re-run." >&2
+    exit 1
+fi
+postgres_container="$default_postgres"
+if [ -n "$dev_postgres" ]; then
+    postgres_container="$dev_postgres"
+    PROJECT_ARGS=(-p "$DEV_PROJECT")
+    PROJECT_NAME="$DEV_PROJECT"
+    COMPOSE=(docker compose -p "$DEV_PROJECT" -f docker-compose.yaml)
+fi
 if [ -z "$postgres_container" ]; then
     echo "postgres is not running — start it first (make launch-deps), then re-run." >&2
     exit 1
@@ -537,7 +644,9 @@ fi
 
 # AFTER the postgres check and BEFORE the guard below: the guard asks the selected definition which
 # image will run, and verify_comparison_image's containment comment depends on the postgres check
-# having run first. Never exits; ambiguous means the production definition.
+# having run first. In the default project an unclear outcome means the production definition and
+# never exits. In trader_joe_dev select_stack exits 1 on anything but a positively DEV or TEST stack
+# (a production-labelled container, an unreadable label, a mixed stack and the rest).
 select_stack "$postgres_container"
 
 # Last, because the two checks above are cheaper and because an operator with a stopped database

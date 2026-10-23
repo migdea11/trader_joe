@@ -112,6 +112,12 @@ ENVIRONMENTS: dict[str, tuple[frozenset[str], bool]] = {
     # tools/agent_mcp/*.py and nothing else (the Dockerfile test below pins that both ways), and the
     # service Dockerfile copies no tools tree at all. Not a test, so is_test is False.
     'tools/errors_doc.py': (TEST_VENV, False),
+    # The dev dataset generator (tj-grna9p.145). It runs only in the venv, as `uv run python -m
+    # tools.dev_datasets.request` from the repository root; no image copies it. Its one third-party
+    # import, psycopg2 (lazily, inside _connect), is declared by the data-store group, which the venv
+    # sync installs. Not a test, so is_test is False; its own tests are mapped beside it.
+    'tools/dev_datasets': (TEST_VENV, False),
+    'tools/dev_datasets/tests': (TEST_VENV, True),
     'tools/tests': (TEST_VENV, True),
     'common/tests': (TEST_VENV, True),
     'data/ingest/tests': (TEST_VENV, True),
@@ -129,7 +135,7 @@ NOT_IN_THE_TEST_VENV = {'mcp': 'mcp'}
 
 # Undeclared imports the survey found, keyed like IMPORTS, each a strict xfail until its fix lands.
 # Empty since tj-3mk3u5.58 declared protobuf, packaging and PyYAML, and since 3c53437 declared pandas for
-# data/store/app/freshness.py (found by the validator gating tj-grna9p.17).
+# data/store/app/freshness.py (found by the validator gating tj-grna9p.17; trading_calendar.py since tj-grna9p.170).
 FINDINGS: dict[str, str] = {}
 
 
@@ -251,9 +257,12 @@ def test_the_scan_reaches_the_importers_tj_3mk3u5_58_declared():
 
 
 def test_the_scan_reaches_the_trading_calendar_importer_tj_grna9p_17():
-    """The freshness rules import the calendar and pandas directly; both are keyed, so both are checked."""
-    assert 'data/store/app/freshness.py' in _importers('exchange_calendars')
-    assert 'data/store/app/freshness.py' in _importers('pandas')
+    """The trading calendar imports exchange_calendars and pandas directly; both are keyed, so both are checked.
+
+    freshness.py imported both until tj-grna9p.170 split it; trading_calendar.py is the importer now.
+    """
+    assert 'data/store/app/trading_calendar.py' in _importers('exchange_calendars')
+    assert 'data/store/app/trading_calendar.py' in _importers('pandas')
 
 
 def test_a_namespace_import_resolves_to_the_distribution_that_ships_its_subpackage():
@@ -312,10 +321,22 @@ def test_the_mcp_image_environment_is_the_one_its_dockerfile_installs():
 
 
 def test_the_files_mapped_to_the_mcp_image_are_the_ones_it_copies():
-    """The image takes tools/agent_mcp's server modules and not its tests. ENVIRONMENTS must agree, both ways."""
+    """The image takes tools/agent_mcp's server modules and not its tests. ENVIRONMENTS must agree, both ways.
+
+    Only PYTHON files are compared: since tj-iee6sn.5 the image also COPYs tools/ shell scripts (the
+    dev verbs' trusted dev_instance_secret.sh and source_digest.sh, and since tj-iee6sn.33 the
+    generated-code guard's proto_digest.sh), which import nothing and have no ENVIRONMENTS entry. Filtered on what each COPY really matches, not on how its source is spelled,
+    so a glob that picks up a .py file is still compared.
+    """
     lines = MCP_DOCKERFILE.read_text(encoding='utf-8').splitlines()
     sources = [source for line in lines if line.startswith('COPY tools/') for source in line.split()[1:-1]]
-    copied = {str(path.relative_to(REPO_ROOT)) for source in sources for path in REPO_ROOT.glob(source)}
+    matched = {path for source in sources for path in REPO_ROOT.glob(source)}
+    copied = {str(path.relative_to(REPO_ROOT)) for path in matched if path.suffix == '.py'}
+    assert {str(path.relative_to(REPO_ROOT)) for path in matched if path.suffix != '.py'} == {
+        'tools/dev_instance_secret.sh',
+        'tools/source_digest.sh',
+        'tools/proto_digest.sh',
+    }, sorted(matched)
     mapped = {path for path in _scanned_files() if _environment(path)[0] == MCP_IMAGE}
     assert 'tools/agent_mcp/server.py' in mapped, sorted(mapped)
     assert copied == mapped, (

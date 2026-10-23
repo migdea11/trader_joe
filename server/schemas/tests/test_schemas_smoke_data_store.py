@@ -917,8 +917,9 @@ def test_the_entry_records_the_resolved_feed_and_the_bar_requires_one():
 # OMITTED expiry IS None, meaning the dataset never expires (owner ruling 2026-10-10 on tj-sww0b1,
 # pulling tj-grna9p.71 forward; code 57b4406). It used to default to now + 1 day, which forced the
 # request skill to send an explicit far-future expiry that then rendered as 2098/12/31. One payload
-# per update type, since a non-null expiry means something different on each (on DAILY and STREAM it
-# retires the dataset), and a default that varied by update type would be a second contract.
+# per update type, because a default that varied by update type would be a second contract. (A
+# non-null expiry used to RETIRE a DAILY or STREAM dataset; decision tj-hhy3dk made it the deletion
+# date only, for every update type, and moved "collecting" to the separate collect intent.)
 _EXPIRY_BY_UPDATE_TYPE: dict[str, dict[str, Any]] = {
     'STATIC': {},
     'DAILY': {'update_type': UpdateType.DAILY, 'expiry_type': ExpiryType.ROLLING},
@@ -1031,11 +1032,13 @@ def test_no_entry_model_carries_the_request_only_fields(model: type[BaseModel]):
 
     So the fields class and every model that inherits it -- the write models and the read model behind
     GET /store -- declare neither, and refuse both as unknown fields rather than storing or echoing them.
+    tj-grna9p.174 adds collect to the same set: a request-only field, not identity, not on the entry model
+    (decision tj-hhy3dk; the stored intent is the store's column, tj-grna9p.176, not this schema).
 
     Args:
         model: The fields class or an entry model.
     """
-    assert not {'ready_by', 'best_effort'} & set(model.model_fields)
+    assert not {'ready_by', 'best_effort', 'collect'} & set(model.model_fields)
     assert not issubclass(model, StoreAssetDatasetBody), f'{model.__name__} inherits the request body again'
 
 
@@ -1073,6 +1076,230 @@ def test_a_stored_stream_entry_still_validates(model: type[BaseModel]):
 def test_the_search_query_still_accepts_stream():
     """StoreAssetDatasetQuery is a filter over stored entries, and STREAM entries exist (tj-grna9p.71)."""
     assert StoreAssetDatasetQuery(update_type=UpdateType.STREAM.name).update_type is UpdateType.STREAM
+
+
+# ---------------------------------------------------------------------------------------------
+# tj-grna9p.174 (decision tj-hhy3dk section 3): THE OPTIONAL collect INTENT ON THE POST /store BODY
+#
+# Omitted (None) means true for DAILY and STREAM, so every existing caller is unchanged. Any value on a
+# STATIC request, true included, is refused with one model-level value error, which install_error_handlers
+# renders as a 422 INVALID_REQUEST (pinned at the route in data/store/tests/test_store_dataset_entry_route.py).
+# An explicit null is "no value": the body's own dump carries "collect":null for STATIC, and a document the
+# model writes must validate back.
+
+_COLLECT_REFUSAL = 'collect applies to subscriptions only'
+_DAILY: dict[str, Any] = _EXPIRY_BY_UPDATE_TYPE['DAILY']
+_STREAM: dict[str, Any] = _EXPIRY_BY_UPDATE_TYPE['STREAM']
+# STATIC both as the default (no update_type key) and named explicitly, since the refusal keys on the
+# validated member and a check on the raw input would miss one of the two.
+_STATIC_FORMS: dict[str, dict[str, Any]] = {
+    'static-default': {},
+    'static-named': {'update_type': UpdateType.STATIC.name, 'expiry_type': ExpiryType.BULK.name},
+}
+
+
+def _build(payload: dict[str, Any], form: str) -> StoreAssetDatasetBody:
+    """Validate PAYLOAD through one of the three doors a caller can use.
+
+    Args:
+        payload: The body.
+        form: 'kwargs' (the constructor), 'dict' (model_validate) or 'json' (model_validate_json).
+
+    Returns:
+        StoreAssetDatasetBody: The validated body.
+    """
+    if form == 'kwargs':
+        return StoreAssetDatasetBody(**payload)
+    if form == 'dict':
+        return StoreAssetDatasetBody.model_validate(payload)
+    return StoreAssetDatasetBody.model_validate_json(_as_json(payload))
+
+
+_FORMS = ['kwargs', 'dict', 'json']
+
+
+def test_collect_is_an_optional_nullable_bool_defaulting_to_none():
+    """The declaration: bool | None, default None, not required, no default factory."""
+    field = StoreAssetDatasetBody.model_fields['collect']
+    assert not field.is_required()
+    assert field.default is None
+    assert field.default_factory is None
+    assert field.annotation == bool | None
+
+
+@pytest.mark.parametrize('update_type', ['STATIC', 'DAILY'])
+@pytest.mark.parametrize('form', _FORMS)
+def test_an_omitted_collect_is_none_and_unset(update_type: str, form: str):
+    """Omitted is None (read as true for a subscription by the store), and the default is the one exercised.
+
+    Args:
+        update_type: STATIC or DAILY; STREAM bodies are refused outright (tj-grna9p.9 item 2).
+        form: The validation door.
+    """
+    body = _build(_DATASET_BODY | _EXPIRY_BY_UPDATE_TYPE[update_type], form)
+
+    assert body.collect is None
+    assert 'collect' not in body.model_fields_set, 'the default was not the one exercised'
+
+
+@pytest.mark.parametrize('collect', [True, False])
+@pytest.mark.parametrize('form', _FORMS)
+def test_collect_true_and_false_are_accepted_on_daily_and_kept(collect: bool, form: str):
+    """Both values validate on a DAILY body and survive a JSON round trip as the same bool.
+
+    Args:
+        collect: The intent sent.
+        form: The validation door.
+    """
+    body = _build(_DATASET_BODY | _DAILY | {'collect': collect}, form)
+    again = StoreAssetDatasetBody.model_validate_json(body.model_dump_json())
+
+    for value in (body, again):
+        assert value.collect is collect
+        assert value.update_type is UpdateType.DAILY
+    assert json.loads(body.model_dump_json())['collect'] is collect
+
+
+@pytest.mark.parametrize('collect', [True, False])
+@pytest.mark.parametrize('form', _FORMS)
+def test_collect_on_stream_is_not_what_refuses_a_stream_body(collect: bool, form: str):
+    """STREAM is a subscription, so collect is allowed on it; the body is refused only as a deferred STREAM.
+
+    One error, the STREAM refusal's, and nothing about collect: a collect rule that counted STREAM as
+    STATIC would add (or replace it with) the subscriptions-only text.
+
+    Args:
+        collect: The intent sent.
+        form: The validation door.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        _build(_DATASET_BODY | _STREAM | {'collect': collect}, form)
+
+    errors = excinfo.value.errors()
+    assert [error['type'] for error in errors] == ['value_error']
+    assert 'STREAM' in errors[0]['msg']
+    assert _COLLECT_REFUSAL not in str(excinfo.value)
+
+
+@pytest.mark.parametrize('collect', [True, False])
+def test_collect_on_a_stored_stream_entry_is_not_declared_at_all(collect: bool):
+    """The fields class (a stored STREAM entry's validator) has no collect: it refuses it as unknown.
+
+    Args:
+        collect: The intent sent.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        StoreAssetDatasetFields(**_DATASET_BODY | _STREAM | {'collect': collect})
+    assert [(error['loc'], error['type']) for error in excinfo.value.errors()] == [(('collect',), 'extra_forbidden')]
+
+
+@pytest.mark.parametrize('static', sorted(_STATIC_FORMS))
+@pytest.mark.parametrize('collect', [True, False])
+@pytest.mark.parametrize('form', _FORMS)
+def test_any_collect_value_on_static_is_refused_with_the_subscriptions_only_text(static: str, collect: bool, form: str):
+    """True included: a bulk dataset has no intent. One model-level value error carrying the exact text.
+
+    Args:
+        static: STATIC by default or named.
+        collect: The intent sent.
+        form: The validation door.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        _build(_DATASET_BODY | _STATIC_FORMS[static] | {'collect': collect}, form)
+
+    errors = excinfo.value.errors()
+    assert [(error['loc'], error['type']) for error in errors] == [((), 'value_error')]
+    assert _COLLECT_REFUSAL in errors[0]['msg'], errors[0]['msg']
+    assert 'STATIC' in errors[0]['msg'], errors[0]['msg']
+
+
+@pytest.mark.parametrize('static', sorted(_STATIC_FORMS))
+@pytest.mark.parametrize('form', _FORMS)
+def test_an_explicit_null_collect_on_static_is_no_value_and_round_trips(static: str, form: str):
+    """Null is the absence of a value, so it is accepted, and the body's own STATIC dump validates back.
+
+    Args:
+        static: STATIC by default or named.
+        form: The validation door.
+    """
+    body = _build(_DATASET_BODY | _STATIC_FORMS[static] | {'collect': None}, form)
+
+    assert body.collect is None
+    dumped = body.model_dump_json()
+    assert '"collect":null' in dumped
+    assert StoreAssetDatasetBody.model_validate_json(dumped) == body
+
+
+@pytest.mark.parametrize('value', ['maybe', 2, [True]])
+def test_a_non_bool_collect_is_refused_at_its_own_field(value: Any):
+    """Typed as bool: a value that is not one is a field error at collect, not a silent truthiness.
+
+    Args:
+        value: A value pydantic's bool cannot read.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        StoreAssetDatasetBody(**_DATASET_BODY | _DAILY | {'collect': value})
+    assert {error['loc'] for error in excinfo.value.errors()} == {('collect',)}
+
+
+@pytest.mark.parametrize('name', ['collecting', 'Collect', 'collect_intent'])
+def test_a_near_miss_of_collect_is_still_an_unknown_field(name: str):
+    """extra='forbid' holds beside the new field: the proto's own name 'collecting' is not the body's.
+
+    Sent ALONE as well as beside collect: an alias that accepted the near-miss would pass the pair (the
+    real key wins and the other is still extra) and silently take the near-miss on its own, which is the
+    case a misspelling caller actually sends (measured: an AliasChoices('collect', 'collecting') mutation
+    survived the pair-only form).
+
+    Args:
+        name: A misspelling a caller could plausibly send.
+    """
+    for payload in ({name: False}, {'collect': False, name: False}):
+        with pytest.raises(ValidationError) as excinfo:
+            StoreAssetDatasetBody(**_DATASET_BODY | _DAILY | payload)
+        errors = excinfo.value.errors()
+        assert [(error['loc'], error['type']) for error in errors] == [((name,), 'extra_forbidden')], payload
+
+
+@pytest.mark.parametrize('update_type', ['STATIC', 'DAILY'])
+def test_a_body_from_before_collect_validates_and_serialises_as_before_plus_a_null(update_type: str):
+    """Backward compatibility of the public POST /store body: the additive change costs a caller nothing.
+
+    An old JSON body, with no collect key, validates; its dump equals the pre-change document with
+    "collect":null appended after best_effort and nothing else moved; and the required set is unchanged.
+
+    Args:
+        update_type: STATIC or DAILY.
+    """
+    old = _DATASET_BODY | _EXPIRY_BY_UPDATE_TYPE[update_type]
+    body = StoreAssetDatasetBody.model_validate_json(_as_json(old))
+    # The fields class is the pre-split document (pinned byte for byte above); the body is it plus the
+    # request-only fields at their defaults, in this order.
+    before = json.loads(StoreAssetDatasetFields.model_validate_json(_as_json(old)).model_dump_json())
+    expected = before | {'ready_by': None, 'best_effort': False, 'collect': None}
+
+    dumped = json.loads(body.model_dump_json())
+    assert dumped == expected
+    assert list(dumped) == list(expected)
+    schema = StoreAssetDatasetBody.model_json_schema()
+    assert set(schema['required']) == {'owner', 'source', 'granularity', 'start'}
+    assert 'collect' in schema['properties']
+
+
+def test_the_body_docstring_records_collect_as_an_additive_public_api_change():
+    """The contract note the bead asks for: additive, omitted means true, STATIC refused with that text."""
+    doc = ' '.join((StoreAssetDatasetBody.__doc__ or '').split())
+    assert 'collect IS AN ADDITIVE CHANGE TO THE PUBLIC /store API' in doc, doc
+    assert 'omitted means true for DAILY and STREAM' in doc
+    assert _COLLECT_REFUSAL in doc
+
+
+def test_the_expiry_comment_no_longer_says_an_expiry_retires():
+    """Decision tj-hhy3dk: expiry is the deletion date only. The fields class's comment says so, not 'retires'."""
+    source = inspect.getsource(StoreAssetDatasetFields)
+    flat = ' '.join(line.strip().removeprefix('#').strip() for line in source.splitlines())
+    assert 'The expiry is the DELETION DATE and nothing else, for every update type' in flat, flat
+    assert 'retire' not in flat.lower()
 
 
 # The three create-body fields bound for timestamptz columns, each with an OFFSET-LESS instant that
@@ -2103,12 +2330,14 @@ _EXACT_WIRE_CASES: list[tuple[type[BaseModel], dict[str, Any], str]] = [
     # tj-grna9p.71: the BODY now ends with the two request-only fields at their defaults -- null kept, not
     # dropped, and false -- while the fields class keeps the pre-split document byte for byte, and the
     # entry models below are unchanged, which is the acceptance "GET /store's JSON does not move".
+    # tj-grna9p.174 (decision tj-hhy3dk) appends the third request-only field, collect, AFTER best_effort
+    # (its declaration order), null when omitted; the fields class and the entry models do not move.
     (
         StoreAssetDatasetBody,
         _enum_wire_payload(StoreAssetDatasetBody, ExpiryType.BUFFER_10K, UpdateType.STATIC),
         '{"owner":"rebalancer","source":"ALPACA","feed":null,"granularity":"1day","start":"2026-01-01T00:00:00Z",'
         '"end":null,"expiry":"2026-01-01T00:00:00Z","expiry_type":"BUFFER_10K","update_type":"STATIC",'
-        '"ready_by":null,"best_effort":false}',
+        '"ready_by":null,"best_effort":false,"collect":null}',
     ),
     (
         StoreAssetDatasetFields,

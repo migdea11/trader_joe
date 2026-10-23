@@ -165,6 +165,29 @@ def test_agent_mcp_and_security_resolve_apart_and_pyjwt_has_its_floor():
     assert len(locked) == 1 and specifier.contains(Version(locked[0])), (locked, str(specifier))
 
 
+def test_agent_mcp_has_its_mcp_floor_and_stays_on_one_x():
+    """tj-grna9p.137: mcp>=1.30.0,<2 in agent-mcp, and the group's locked mcp meets it.
+
+    The floor is the fix for CVE-2026-59951, which pip-audit reports against 1.29.0 (fixed in 1.30.0
+    and 2.2.0). The cap keeps the group on 1.x: 2.x is a major bump left to the owner. The security
+    group's mcp, resolved apart, is semgrep's exact pin and is not this group's to raise.
+    """
+    requirements = [Requirement(item) for item in _pyproject()['dependency-groups'][GROUP] if isinstance(item, str)]
+    mcp = [requirement for requirement in requirements if requirement.name.lower() == 'mcp']
+    assert len(mcp) == 1, requirements
+    specifier = mcp[0].specifier
+    admitted = [version for version in ('1.29.0', '1.29.9', '2.0.0', '2.3.0') if specifier.contains(Version(version))]
+    assert not admitted, f'{mcp[0]} admits {admitted}: a vulnerable 1.29.x or an unruled 2.x'
+    assert specifier.contains(Version('1.30.0')), mcp
+    lock = tomllib.loads((REPO_ROOT / 'uv.lock').read_text(encoding='utf-8'))
+    project = next(package for package in lock['package'] if package['name'] == 'trader-joe')
+    entries = [dep for dep in project['dev-dependencies'][GROUP] if dep['name'] == 'mcp']
+    assert len(entries) == 1, entries
+    # uv writes the version on the edge only while the lock holds more than one mcp; with one, read it.
+    locked = entries[0].get('version') or next(p['version'] for p in lock['package'] if p['name'] == 'mcp')
+    assert specifier.contains(Version(locked)), (locked, str(specifier))
+
+
 def test_no_stage_of_the_service_dockerfile_installs_agent_mcp():
     text = SERVICE_DOCKERFILE.read_text(encoding='utf-8').replace('\\\n', ' ')
     syncs = [line for line in text.splitlines() if 'uv sync' in line and not line.lstrip().startswith('#')]

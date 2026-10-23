@@ -22,13 +22,14 @@ from common.tests.compose_model import (
     DEVCONTAINER_COMPOSE,
     DEVCONTAINER_JSON,
     REPO_ROOT,
+    InterpolationRefused,
     interpolate,
     load,
     service_networks,
     volume,
 )
 from common.tests.test_ci_invariants import SYSTEM_SECRET_KEYS, _every_compose_file
-from tools.agent_mcp import stack
+from common.tests.test_fake_overlay import _credential_vars
 
 
 pytestmark = pytest.mark.build_infra
@@ -64,12 +65,13 @@ def _mentions_socket(value: object) -> bool:
 def test_docker_sock_is_mounted_by_exactly_one_service_in_the_repository():
     """Body bullet 6 / addendum 1 (f): socket_proxy in docker-compose.agent-mcp.yaml, and nothing else anywhere.
 
-    Every compose file (base, override, tools, test-client, agent-stack, agent-mcp, devcontainer), every
-    service, every key -- volumes, environment (DOCKER_HOST=unix://...), devices, anything.
+    Every compose file (base, override, tools, test-client, the MCP-only overlays, agent-mcp, devcontainer),
+    every service, every key -- volumes, environment (DOCKER_HOST=unix://...), devices, anything. The floor
+    names an MCP-only overlay in place of the retired agent-stack one (tj-iee6sn.21).
     """
     files = _every_compose_file()
     names = {path.name for path in files}
-    assert {'docker-compose.agent-mcp.yaml', 'docker-compose.agent-stack.yaml', 'compose.yml'} <= names, names
+    assert {'docker-compose.agent-mcp.yaml', 'docker-compose.agent-dev.yaml', 'compose.yml'} <= names, names
     holders = [
         (path.relative_to(REPO_ROOT).as_posix(), name)
         for path in files
@@ -102,7 +104,8 @@ def _docstring_sections() -> tuple[set[str], set[str]]:
     needed_block, not_block = block.split('NOT needed, keep off:', 1)
     needed = set()
     for line in needed_block.splitlines()[1:]:
-        if not line.startswith('    ') or not line.strip():
+        # A row starts at exactly four spaces; a deeper indent continues the row above's description.
+        if not line.startswith('    ') or not line.strip() or line.startswith('     '):
             continue
         head = re.split(r'\s{2,}', line.strip())[0]
         needed |= {word.strip().removesuffix('=1') for word in head.split(',')}
@@ -111,23 +114,51 @@ def _docstring_sections() -> tuple[set[str], set[str]]:
     return needed, not_needed
 
 
+# The sections the verbs need, from literals. Every one but EXEC since addendum 1; EXEC since ADR
+# tj-4rr0la addendum 22 (owner ruling D9 on tj-iee6sn.13.1): creating an exec is POST
+# /containers/{id}/exec, under CONTAINERS, but STARTING it is /exec/{id}/start, which only this
+# section opens, so the read-only dev diagnostics (db_tables first) cannot run without it.
+EXPECTED_PROXY_NEEDED = {
+    'PING',
+    'VERSION',
+    'INFO',
+    'CONTAINERS',
+    'IMAGES',
+    'NETWORKS',
+    'VOLUMES',
+    'BUILD',
+    'SESSION',
+    'GRPC',
+    'EVENTS',
+    'EXEC',
+    'POST',
+}
+# The sections that stay off. Addendum 22 (2): "Nothing else in the list changes" -- EXEC moved out
+# of this set and nothing else did, so a second section turned on (or one dropped) is red here.
+EXPECTED_PROXY_KEPT_OFF = {
+    'AUTH',
+    'SECRETS',
+    'CONFIGS',
+    'PLUGINS',
+    'SYSTEM',
+    'SWARM',
+    'NODES',
+    'SERVICES',
+    'TASKS',
+    'DISTRIBUTION',
+    'COMMIT',
+}
+
+
 def test_the_proxy_allows_exactly_the_sections_the_verbs_need():
-    """P1: 1 for exactly the docstring's NEED list, 0 for every section it names NOT needed."""
+    """P1: 1 for exactly the docstring's NEED list, 0 for every section it names NOT needed.
+
+    Both lists are pinned from literals as well as against each other: the docstring and the compose
+    file agreeing is not enough, since one edit could widen both together.
+    """
     needed, not_needed = _docstring_sections()
-    assert needed == {
-        'PING',
-        'VERSION',
-        'INFO',
-        'CONTAINERS',
-        'IMAGES',
-        'NETWORKS',
-        'VOLUMES',
-        'BUILD',
-        'SESSION',
-        'GRPC',
-        'EVENTS',
-        'POST',
-    }
+    assert needed == EXPECTED_PROXY_NEEDED, sorted(needed ^ EXPECTED_PROXY_NEEDED)
+    assert not_needed == EXPECTED_PROXY_KEPT_OFF, sorted(not_needed ^ EXPECTED_PROXY_KEPT_OFF)
     environment = {str(key): value for key, value in _services()['socket_proxy']['environment'].items()}
     sections = {key: value for key, value in environment.items() if key not in PROXY_NON_SECTION_SETTINGS}
     assert {key for key, value in sections.items() if value == 1} == needed, f'sections allowed: {sections}'
@@ -135,6 +166,48 @@ def test_the_proxy_allows_exactly_the_sections_the_verbs_need():
     assert set(sections.values()) <= {0, 1}
     for key, value in PROXY_NON_SECTION_SETTINGS.items():
         assert environment.get(key) == value, (key, environment.get(key))
+
+
+def test_the_proxy_environment_is_exactly_the_section_list_with_exec_on_and_nothing_else_moved():
+    """Addendum 22 (2), whole: EXEC 1, every other section and switch exactly as before the slice.
+
+    Spelled as one literal mapping, so a variable added, removed or flipped anywhere in the block is
+    red here even where the docstring-driven test above would agree with a matching docstring edit.
+    """
+    environment = {str(key): value for key, value in _services()['socket_proxy']['environment'].items()}
+    assert environment == {
+        **dict.fromkeys(EXPECTED_PROXY_NEEDED, 1),
+        **dict.fromkeys(EXPECTED_PROXY_KEPT_OFF, 0),
+        **PROXY_NON_SECTION_SETTINGS,
+    }
+    assert environment['EXEC'] == 1
+
+
+def test_the_proxy_exec_comment_states_its_reach_and_its_control():
+    """Addendum 22 (3) asks for the reach 'stated without understatement', beside the switch itself.
+
+    The words pinned are the claims a reader needs: the ruling, that exec reaches ANY container on the
+    daemon (socket_proxy included), that CONTAINERS+POST was already that ceiling, and what the control
+    is. The comment block directly above `EXEC: 1` is read, not the whole file.
+    """
+    lines = AGENT_MCP_FILE.read_text(encoding='utf-8').splitlines()
+    index = next(number for number, line in enumerate(lines) if line.strip() == 'EXEC: 1')
+    block = []
+    for line in reversed(lines[:index]):
+        if not line.strip().startswith('#'):
+            break
+        block.insert(0, line.strip().lstrip('#').strip())
+    comment = ' '.join(block)
+    for claim in (
+        'addendum 22',
+        'ANY running container',
+        'socket_proxy itself',
+        'CONTAINERS with POST',
+        '/exec/{id}/start',
+        'stack.check_dev_exec_argv',
+        'make agent-mcp-rebuild',
+    ):
+        assert claim in comment, f'the EXEC comment no longer states {claim!r}: {comment}'
 
 
 def test_the_proxy_image_is_pinned_by_digest_and_joins_only_its_network():
@@ -166,6 +239,79 @@ def test_agent_mcp_is_hardened_and_healthchecked_on_the_token_gate():
     assert 'env_file' not in mcp and 'cap_add' not in mcp and 'privileged' not in mcp
     check = ' '.join(mcp['healthcheck']['test'])
     assert '401' in check and '127.0.0.1:8765/mcp' in check, check
+
+
+# --- tj-iee6sn.16: an init as PID 1, and agent_mcp's keys exactly -----------------------------------
+
+# agent_mcp's top-level keys, EXACTLY (tj-iee6sn.16 (ii)). Compared as a set: the order of a
+# service's keys changes nothing about the container, an added or removed key changes what it is.
+AGENT_MCP_KEYS = frozenset(
+    {
+        'build',
+        'image',
+        'init',
+        'depends_on',
+        'environment',
+        'volumes',
+        'security_opt',
+        'cap_drop',
+        'healthcheck',
+        'networks',
+    }
+)
+
+
+def _comment_above(key_line: str) -> str:
+    """The whole-line comment block directly above the line KEY_LINE (stripped), joined."""
+    lines = AGENT_MCP_FILE.read_text(encoding='utf-8').splitlines()
+    matches = [number for number, line in enumerate(lines) if line.strip() == key_line]
+    assert len(matches) == 1, f'{key_line!r} appears {len(matches)} times in {AGENT_MCP_FILE.name}'
+    block = []
+    for line in reversed(lines[: matches[0]]):
+        if not line.strip().startswith('#'):
+            break
+        block.insert(0, line.strip().lstrip('#').strip())
+    return ' '.join(block)
+
+
+def test_agent_mcp_runs_under_an_init():
+    """tj-iee6sn.16 (i): `init: true` on agent_mcp, the boolean itself.
+
+    Python as PID 1 reaps only the pids asyncio spawned, so the members of a timed-out step's killed
+    process group (tj-iee6sn.15) would stay zombies until the container is recreated. `is True`, not
+    truthiness: a quoted 'true' is a string that compose would reject or misread, and is red here.
+    """
+    mcp = _services()['agent_mcp']
+    assert 'init' in mcp, 'agent_mcp has no init: python is PID 1 and the killed step groups leave zombies'
+    assert mcp['init'] is True, (
+        f'agent_mcp init is {mcp["init"]!r} ({type(mcp["init"]).__name__}), not the boolean true'
+    )
+
+
+def test_the_init_comment_states_why():
+    """The reason sits beside the switch: reaping the zombies of killed step groups."""
+    comment = _comment_above('init: true')
+    assert re.search(r'zombie|reap', comment, re.IGNORECASE), f'the init comment does not say why: {comment!r}'
+
+
+def test_agent_mcp_has_exactly_todays_top_level_keys():
+    """tj-iee6sn.16 (ii): every key of the service is pinned, so a new one is a reviewed act.
+
+    The hardening test above names the keys that must stay OUT (ports, env_file, cap_add, privileged);
+    a key it does not name -- pid, userns_mode, devices, read_only, user -- reached the container green.
+    """
+    keys = set(_services()['agent_mcp'])
+    assert keys == AGENT_MCP_KEYS, (
+        f'agent_mcp keys changed: added {sorted(keys - AGENT_MCP_KEYS)}, removed {sorted(AGENT_MCP_KEYS - keys)}. '
+        'A new key needs an architect ruling: this container holds the Docker API through the proxy '
+        '(ADR tj-4rr0la addendum 1)'
+    )
+
+
+def test_the_proxy_has_no_init():
+    """tj-iee6sn.16 (iii): socket_proxy is left alone -- haproxy spawns no step children."""
+    proxy = _services()['socket_proxy']
+    assert 'init' not in proxy, f'socket_proxy gained init: {proxy["init"]!r}; the ruling scoped it to agent_mcp'
 
 
 # --- body bullet 7: agent_mcp's reach ------------------------------------------------------------
@@ -202,12 +348,19 @@ def _mcp_mounts() -> list[dict]:
     return [volume(entry) for entry in _services()['agent_mcp']['volumes']]
 
 
+REPO_HOST_PATH = '${AGENT_MCP_REPO_HOST_PATH:?set by make agent-mcp-up}'
+
+
 def test_agent_mcp_sees_the_repository_read_only_at_the_devcontainers_workspace():
-    """M1, addendum 11 R1: /workspace in four places that must agree."""
+    """M1, addendum 11 R1: /workspace in four places that must agree.
+
+    Since addendum 23 (tj-iee6sn.5) the checkout is mounted twice, both read-only: here at /workspace,
+    and at its own host path for the dev verbs (pinned below).
+    """
     mcp = _services()['agent_mcp']
-    repo_mounts = [mount for mount in _mcp_mounts() if 'AGENT_MCP_REPO_HOST_PATH' in mount['source']]
+    repo_mounts = [mount for mount in _mcp_mounts() if mount['target'] == WORKSPACE]
     assert len(repo_mounts) == 1, _mcp_mounts()
-    assert repo_mounts[0]['target'] == WORKSPACE and repo_mounts[0]['read_only'] is True, repo_mounts
+    assert repo_mounts[0]['source'] == REPO_HOST_PATH and repo_mounts[0]['read_only'] is True, repo_mounts
     assert mcp['environment']['AGENT_MCP_REPO_ROOT'] == WORKSPACE
     agent = load(DEVCONTAINER_COMPOSE)['services']['agent']
     project_mounts = [volume(entry) for entry in agent['volumes'] if volume(entry)['source'] == '..']
@@ -216,24 +369,58 @@ def test_agent_mcp_sees_the_repository_read_only_at_the_devcontainers_workspace(
     assert devcontainer_json()['workspaceFolder'] == WORKSPACE
 
 
-def test_agent_mcp_mounts_exactly_three_paths_and_never_the_claude_config():
-    """M2, addendum 11 R2: repo ro at /workspace, the stack dir at its own path, the share at /agent_mcp_share."""
+def test_agent_mcp_mounts_exactly_four_paths_and_never_the_claude_config():
+    """M2, addendum 11 R2, and addendum 23 (tj-iee6sn.5): exactly four mounts, every one a bind.
+
+    The repository read-only at /workspace and read-only again at its own HOST path (source ==
+    target, the way the stack dir is mounted), the stack dir at its own path, the share at
+    /agent_mcp_share. Compared as one exact list, so a fifth mount, a writable repository mount or a
+    host-path mount moved to another target are each red.
+    """
     mounts = _mcp_mounts()
-    shape = sorted((re.findall(r'\$\{(\w+)', mount['source']), mount['target'], mount['read_only']) for mount in mounts)
+    shape = sorted((mount['type'], mount['source'], mount['target'], mount['read_only']) for mount in mounts)
     assert shape == sorted(
         [
-            (['AGENT_MCP_REPO_HOST_PATH'], WORKSPACE, True),
-            (['AGENT_MCP_STACK_DIR'], '${AGENT_MCP_STACK_DIR:?set by make agent-mcp-up}', False),
-            (['AGENT_MCP_SHARE_PATH'], SHARE_TARGET, False),
+            ('bind', REPO_HOST_PATH, WORKSPACE, True),
+            ('bind', REPO_HOST_PATH, REPO_HOST_PATH, True),
+            (
+                'bind',
+                '${AGENT_MCP_STACK_DIR:?set by make agent-mcp-up}',
+                '${AGENT_MCP_STACK_DIR:?set by make agent-mcp-up}',
+                False,
+            ),
+            ('bind', '${AGENT_MCP_SHARE_PATH:?set by make agent-mcp-up}', SHARE_TARGET, False),
         ]
     ), mounts
     stack_mount = next(mount for mount in mounts if 'AGENT_MCP_STACK_DIR' in mount['source'])
     assert stack_mount['source'] == stack_mount['target'], 'the stack dir must be mounted at its own host path'
+    repository = [mount for mount in mounts if 'AGENT_MCP_REPO_HOST_PATH' in mount['source']]
+    assert len(repository) == 2 and all(mount['read_only'] is True for mount in repository), (
+        f'every mount of the checkout must be read-only: anything in agent_mcp holds the Docker API, so a '
+        f'writable checkout would let it rewrite the code the dev verbs build: {repository}'
+    )
     mcp = _services()['agent_mcp']
     for value in [mount['source'] for mount in mounts] + [str(value) for value in mcp['environment'].values()]:
         assert 'AGENT_HOME_PATH' not in value and '.claude' not in value, (
             f'agent_mcp reaches the Claude config: {value}'
         )
+
+
+def test_the_server_is_told_the_host_path_it_is_mounted_at_and_an_unset_one_refuses_to_render():
+    """Addendum 23 (tj-iee6sn.5): AGENT_MCP_REPO_HOST_PATH reaches the server as the same guarded string.
+
+    settings.load_settings requires it, and the dev verbs pass it as --project-directory, so it must be
+    the exact string the second mount targets. ':?', never ':-': an unset value refuses to render,
+    rather than mounting and naming some default directory the daemon would bind into dev containers.
+    """
+    environment = _services()['agent_mcp']['environment']
+    assert environment['AGENT_MCP_REPO_HOST_PATH'] == REPO_HOST_PATH, environment
+    host_mount = next(mount for mount in _mcp_mounts() if mount['target'] == REPO_HOST_PATH)
+    assert host_mount['source'] == host_mount['target'] == environment['AGENT_MCP_REPO_HOST_PATH']
+    for state in ({}, {'AGENT_MCP_REPO_HOST_PATH': ''}):
+        with pytest.raises(InterpolationRefused, match='AGENT_MCP_REPO_HOST_PATH: set by make agent-mcp-up'):
+            interpolate(REPO_HOST_PATH, state)
+    assert interpolate(REPO_HOST_PATH, {'AGENT_MCP_REPO_HOST_PATH': '/home/u/trader_joe'}) == '/home/u/trader_joe'
 
 
 # --- M3 / P4: the share directory agrees in every place --------------------------------------------
@@ -323,11 +510,13 @@ DEVCONTAINER_AGENT_ENVIRONMENT_KEYS = frozenset(
 # turns up in whatever authentication error a missing credential goes on to cause: it must stay
 # non-empty, and must stay unmistakable for a credential.
 AGENT_CREDENTIAL_SENTINEL = 'UNSET-start-with-make-agent-up-from-the-repo-root'
-# The broker family, from the one definition the repository already has (tools/agent_mcp/stack.py:231),
-# never respelled here -- so a third broker key added THERE is refused HERE automatically. The vendor
-# prefixes are derived from those same names, so ALPACA_ANYTHING is refused without naming 'ALPACA'.
-BROKER_FAMILY = frozenset(stack.BROKER_CREDENTIALS)
-BROKER_PREFIXES = tuple(sorted({f'{name.partition("_")[0]}_' for name in stack.BROKER_CREDENTIALS}))
+# The broker family, from the definition production reads its keys from (broker_api.py's
+# ALPACA_CREDENTIAL_VARS, by ast through test_fake_overlay's reader), never respelled here -- so a third
+# broker key added THERE is refused HERE automatically. Re-pointed from stack.BROKER_CREDENTIALS, which
+# went with the agent stack's generated env files (tj-iee6sn.21). The vendor prefixes are derived from
+# those same names, so ALPACA_ANYTHING is refused without naming 'ALPACA'.
+BROKER_FAMILY = frozenset(_credential_vars())
+BROKER_PREFIXES = tuple(sorted({f'{name.partition("_")[0]}_' for name in BROKER_FAMILY}))
 # A value that is nothing but an interpolation of ONE named variable with a literal default.
 _PURE_INTERPOLATION = re.compile(r'\$\{(\w+):-([^${}]+)\}')
 
@@ -456,8 +645,8 @@ def test_no_broker_family_key_reaches_the_agent_container():
     framework API to have ingest run queries." An agent reaches a real vendor fetch by driving
     data_ingest over devnet, never by holding a vendor key.
 
-    Keyed on the family, not on two spellings: the names come from tools/agent_mcp/stack.py's
-    BROKER_CREDENTIALS, and the vendor prefixes are derived from them, so a third broker key added
+    Keyed on the family, not on two spellings: the names come from broker_api.py's
+    ALPACA_CREDENTIAL_VARS, and the vendor prefixes are derived from them, so a third broker key added
     there is refused here with no edit. Scanned over the WHOLE service and not just the environment
     block -- a key smuggled in through command:, build.args or a volume is the same credential.
     """

@@ -420,26 +420,8 @@ jobs:
         # has a ":?" guard: it gets the same throwaway placeholder, safe for the same reason (`config`
         # creates nothing, and the placeholder never reaches a container).
         #
-        # The agent-stack set, spelled exactly as the Makefile's AGENT_STACK_COMPOSE: project
-        # trader_joe_agent_stack, then base, test-client, the agent-stack overlay and the
-        # fake-mode overlay LAST (ADR tj-4rr0la addendum 3 (3); decision tj-j4wknb R4). The
-        # agent-stack overlay reads six variables through ":?" guards with no default --
-        # DATABASE_NAME, STORE_API_NETWORK, DATA_DIR and the three *_ENV_FILE
-        # paths -- which the MCP server's generated env file supplies at run time, so this line
-        # sets throwaway placeholders for all six, safe for the same reason as PGADMIN_*:
-        # `config` creates no container, network, volume or directory. The names differ from the
-        # user's defaults (db, trader_joe_store_api) only so a placeholder can never be
-        # taken for a real resource. With --quiet this line proves that the set interpolates and
-        # merges, and nothing more; which names the merged agent-stack model carries is pinned
-        # in-process by the build_infra tests (tj-c4mosr.5). The three *_ENV_FILE placeholders
-        # are NOT arbitrary: `config` refuses an env_file that does not exist, so they name the
-        # root, server/data/store and server/data/ingest env files Build Images already staged
-        # above, as absolute paths the way the generated env file spells them (the step runs at the
-        # checkout root, so ${PWD} is it). Naming a path is not reading the file. Whoever
-        # changes AGENT_STACK_COMPOSE updates this line.
-        #
         # The fake-mode system set, spelled as the Makefile's SYSTEM_COMPOSE (what make
-        # system-launch starts; tj-vhboky.61): the default project, base then the fake-mode
+        # system-launch starts; tj-vhboky.61): the dev/test project (trader_joe_dev), base then the fake-mode
         # overlay. The overlay adds no variable, so it needs no env beyond the base file's.
         #
         # The agent-stack MCP's own project (docker-compose.agent-mcp.yaml; ADR tj-4rr0la addendum
@@ -459,15 +441,8 @@ jobs:
           -f docker-compose.yaml -f docker-compose.override.yaml -f docker-compose.web.yaml \
           -f docker-compose.web.dev.yaml -f docker-compose.tools.yaml config --quiet
         docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml config --quiet
-        DATABASE_NAME=agent_stack_render_db \
-          STORE_API_NETWORK=agent_stack_render_store_api DATA_DIR=/tmp/agent_stack_render_data \
-          ROOT_ENV_FILE="${PWD}/.env" STORE_ENV_FILE="${PWD}/server/data/store/.env" \
-          INGEST_ENV_FILE="${PWD}/server/data/ingest/.env" \
-          docker compose -p trader_joe_agent_stack -f docker-compose.yaml \
-          -f docker-compose.test-client.yaml -f docker-compose.agent-stack.yaml \
-          -f docker-compose.fake.yaml config --quiet
         docker compose -f docker-compose.yaml -f docker-compose.fake.yaml config --quiet
-        echo "Compose renders: prod, dev, tools, client, agent-stack, agent-mcp and fake-mode system sets all interpolate and merge."
+        echo "Compose renders: prod, dev, tools, client, agent-mcp and fake-mode system sets all interpolate and merge."
 
     - name: Push Image - Data Store
       id: push_store
@@ -526,6 +501,14 @@ jobs:
       packages: read  # pulls the images Image Build pushed
     needs:
       - build
+    # THE COMPOSE PROJECT (ADR tj-4rr0la addendum 29). make system-launch and make test-system pass
+    # -p trader_joe_dev (the Makefile's DEV_PROJECT); every direct `docker compose` call in this job
+    # (exec, logs, ps, run, up, down) has to address that same project or it would see an empty
+    # one, the checkout directory's default. Set at job level, not per call, so no call can be added
+    # that forgets it: compose reads COMPOSE_PROJECT_NAME from the environment, and the make
+    # recipes' explicit -p agrees with it. Pinned in server/common/tests.
+    env:
+      COMPOSE_PROJECT_NAME: trader_joe_dev
 
     steps:
       # The stack still runs from the images Image Build pushed and the configs it staged; the
@@ -625,13 +608,15 @@ jobs:
       # nothing on this runner can reach data_store from outside the stack: every HTTP request
       # this job makes to it goes from test_client, a container on store_api, by service name.
       # Three compose spellings, and only three, in this job:
-      #   the stack   docker compose -f docker-compose.yaml ...  -- run --no-deps, exec, logs,
-      #               ps, down. It never loads the client file, so migrating, blanking and
-      #               inspecting data_store cannot depend on it. None of these creates a service
-      #               container, so they keep the base file alone.
+      #   the stack   docker compose -f docker-compose.yaml ...  -- exec, logs, ps, down. It never
+      #               loads the client file, so blanking and inspecting data_store cannot depend
+      #               on it. None of these creates a container or resolves an image, so they keep
+      #               the base file alone.
       #   the fake stack
       #               docker compose -f docker-compose.yaml -f docker-compose.fake.yaml -- for
-      #               `up` and nothing else (FAKE MODE, decision tj-j4wknb R4): make
+      #               `up` and for `run --no-deps data_store` (the migrations): both resolve the
+      #               :test images that file names, so nothing in test mode resolves :latest
+      #               (ADR tj-4rr0la addendum 27). (FAKE MODE, decision tj-j4wknb R4): make
       #               system-launch starts the stack with it, so data_ingest runs the test-only
       #               launcher on FakeRead, and the lifecycle step's data_store recreate repeats
       #               it, so no container is ever created without the overlay -- or data_ingest
@@ -658,6 +643,11 @@ jobs:
 
           docker tag ${{ needs.build.outputs.IMAGE_STORE }} trader_joe_data_store
           docker tag ${{ needs.build.outputs.IMAGE_INGEST }} trader_joe_data_ingest
+          # The :test tags docker-compose.fake.yaml names (ADR tj-4rr0la addendum 27): the test-mode
+          # stack and every `run` below resolve these, never :latest. Same images, a second tag --
+          # the Image Build job above is untouched and still pushes :latest for deploy.
+          docker tag ${{ needs.build.outputs.IMAGE_STORE }} trader_joe_data_store:test
+          docker tag ${{ needs.build.outputs.IMAGE_INGEST }} trader_joe_data_ingest:test
           docker images  # Verify images are loaded
 
       # No "Add Runtime Configs" step: this job writes no ALPACA_* value at all, not
@@ -731,7 +721,7 @@ jobs:
           # data/store/tests/test_market_activity_idempotency.py, whose docstring concedes the
           # Postgres-only property that tests/system now checks against this database.
           set -euo pipefail
-          docker compose -f docker-compose.yaml run --rm --no-deps data_store \
+          docker compose -f docker-compose.yaml -f docker-compose.fake.yaml run --rm --no-deps data_store \
             /code/.venv/bin/alembic upgrade head
 
           # Then prove it landed where it was aimed: the revision the database records must be
@@ -749,7 +739,7 @@ jobs:
           # data, so it moved with the seed work to the fake-broker PR (epic tj-irhy0a,
           # tj-vhboky.62).
           revisions() {
-            docker compose -f docker-compose.yaml run --rm --no-deps -T --pull never data_store \
+            docker compose -f docker-compose.yaml -f docker-compose.fake.yaml run --rm --no-deps -T --pull never data_store \
               /code/.venv/bin/alembic "$1" | { grep -Eo '^[0-9a-f]{12}\b' || [ $? -eq 1 ]; }
           }
           heads="$(revisions heads)"
@@ -1330,10 +1320,13 @@ jobs:
           for route in \
               "POST /store/stock/market-activity/LIFECYCLE" \
               "DELETE /store/00000000-0000-0000-0000-000000000000?owner=ci-secret-lifecycle" \
-              "POST /internal/asset-data/stock/market-activity"; do
+              "POST /internal/asset-data/stock/market-activity" \
+              "PATCH /ui/v1/datasets/00000000-0000-0000-0000-000000000000/expiry" \
+              "PATCH /ui/v1/datasets/00000000-0000-0000-0000-000000000000/collecting" \
+              "DELETE /ui/v1/datasets/00000000-0000-0000-0000-000000000000"; do
             method="${route%% *}"; path="${route#* }"
             data=()
-            if [ "${method}" = "POST" ]; then data=(--data '{}'); fi
+            if [ "${method}" = "POST" ] || [ "${method}" = "PATCH" ]; then data=(--data '{}'); fi
             probe "${method}" "${path}" "no header" "${data[@]}"
             probe "${method}" "${path}" "empty header" -H 'X-Instance-Secret;' "${data[@]}"
             probe "${method}" "${path}" "arbitrary header" -H "X-Instance-Secret: ${arbitrary}" "${data[@]}"

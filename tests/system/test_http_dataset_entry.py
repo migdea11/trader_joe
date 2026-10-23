@@ -7,7 +7,7 @@ belongs to exactly one entry, so two overlapping fetches store two rows per inst
 Entries are seeded by SQL through conftest's insert_entry: the only HTTP route that creates one
 is the dataset POST, which reaches data_ingest and the broker (decision tj-vhboky.54, Sys-7
 tj-vhboky.63). The one exception is the last section, same-owner adjacent ranges (tj-lvbes5),
-whose subject IS that POST's overlap check; it relies on the agent stack's FakeRead, as
+whose subject IS that POST's overlap check; it relies on test mode's FakeRead, as
 test_ingest_e2e.py does. Bars are written over HTTP through the internal single-bar
 POST, and every delete, list and read goes over HTTP. Row counts are read by SQL, because the
 point of item 6 is what the DATABASE holds after the cascade, not what an endpoint reports.
@@ -271,7 +271,7 @@ def test_owner_delete_cascades_to_its_bars_and_leaves_the_other_entry_whole(
 # open end bound as the EPOCH sentinel) had run on real rows only in SQLite, every instant UTC
 # (server/data/store/tests/test_dataset_entry_identity.py). These drive it on Postgres through the one
 # route that creates an entry, the dataset POST -- which, UNLIKE the rest of this module, reaches
-# data_ingest. The agent stack runs data_ingest on FakeRead (ADR tj-4rr0la addendum 3), whose default
+# data_ingest. Test mode runs data_ingest on FakeRead (ADR tj-4rr0la addenda 3 and 27), whose default
 # scenario serves the range; test_ingest_e2e.py pins what it stores, so these assert only the entries.
 # Every entry a POST makes is adopted for cleanup whether or not the POST succeeded.
 

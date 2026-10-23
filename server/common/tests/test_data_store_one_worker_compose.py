@@ -33,11 +33,12 @@ VARIABLE: Final = 'SERVICE_WORKERS'
 ENTRYPOINT: Final = REPO_ROOT / 'entrypoint.sh'
 COMPOSE_FILES: Final = [*sorted(REPO_ROOT.glob('docker-compose*.yaml')), DEVCONTAINER_COMPOSE]
 # Every Makefile set whose files define data_store (AGENT_COMPOSE and AGENT_MCP_COMPOSE start other things).
+# tj-iee6sn.27: the retired agent-stack set is gone; the MCP's test mode is SYSTEM_COMPOSE's set
+# (stack.TEST_COMPOSE_FILES, held equal to it by test_agent_stack_files_retired.py), pinned below.
 LAUNCH_SETS: Final = (
     'PROD_COMPOSE',
     'DEV_COMPOSE',
     'TOOLS_COMPOSE',
-    'AGENT_STACK_COMPOSE',
     'TEST_CLIENT_COMPOSE',
     'SYSTEM_COMPOSE',
     'SEED_DUMP_COMPOSE',
