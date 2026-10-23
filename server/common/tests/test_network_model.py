@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from common.tests.compose_model import AGENT_MCP_FILE, interpolate
+from common.tests.compose_model import AGENT_MCP_FILE, FAKE_FILE, interpolate
 from common.tests.test_ci_invariants import (
     COMPOSE_FILE,
     ENV_DEFAULT_FILE,
@@ -407,13 +407,16 @@ def test_the_web_overlay_prod_loads_adds_the_web_service_alone_and_no_devnet():
     assert DEVNET_KEY not in (overlay.get('networks') or {}), overlay.get('networks')
 
 
-def test_run_migrations_defaults_to_the_base_file_and_knows_only_the_dev_list_besides():
+def test_run_migrations_defaults_to_the_base_file_and_knows_only_the_dev_and_test_lists_besides():
     """tj-slxynv (b); tj-x3ig38 addendum 2026-10-12: the DEFAULT is the production definition.
 
     The top-level COMPOSE=(...) -- the list every ambiguous case keeps -- names the base file alone.
-    The script's only other list is base + override, which it selects when the running stack is
-    unambiguously dev. No web, tools, test-client, fake or agent file may appear in either: the web
-    file's INSTANCE_WRITE_SECRET:? guard would refuse a dev .env, and the rest are not data_store's.
+    The script's only other lists are base + override, selected when the running stack is
+    unambiguously dev, and base + fake, selected when it is unambiguously the test mode `make
+    system-launch` runs (ADR tj-4rr0la addendum 27 (1)-(2), tj-iee6sn.25). No web, tools,
+    test-client or agent file may appear in any of them: the web file's INSTANCE_WRITE_SECRET:? guard
+    would refuse a dev .env, and the rest are not data_store's. Never the override and the fake
+    together: no target launches that pair, so it is production.
     The selection itself is behaviour, pinned in server/data/store/tests/test_run_migrations_stack_selection.py.
     """
     text = RUN_MIGRATIONS.read_text(encoding='utf-8')
@@ -428,15 +431,21 @@ def test_run_migrations_defaults_to_the_base_file_and_knows_only_the_dev_list_be
         tuple(_compose_files_named(shlex.split(match.group(1))))
         for match in re.finditer(r'^\s*COMPOSE=\((.*)\)\s*$', text, re.MULTILINE)
     }
-    assert every_list == {(COMPOSE_FILE.name,), (COMPOSE_FILE.name, OVERRIDE_FILE.name)}, (
+    assert every_list == {
+        (COMPOSE_FILE.name,),
+        (COMPOSE_FILE.name, OVERRIDE_FILE.name),
+        (COMPOSE_FILE.name, FAKE_FILE.name),
+    }, (
         f'{RUN_MIGRATIONS.name} assigns the compose file lists {sorted(every_list)}; the only lists it may '
-        f'name are the production default ({COMPOSE_FILE.name}) and the dev definition '
-        f'({COMPOSE_FILE.name} + {OVERRIDE_FILE.name}), and nothing else.'
+        f'name are the production default ({COMPOSE_FILE.name}), the dev definition '
+        f'({COMPOSE_FILE.name} + {OVERRIDE_FILE.name}) and the test definition '
+        f'({COMPOSE_FILE.name} + {FAKE_FILE.name}), and nothing else.'
     )
+    allowed = {COMPOSE_FILE.name, OVERRIDE_FILE.name, FAKE_FILE.name}
     named_files = set(re.findall(r'docker-compose[\w.-]*\.ya?ml', text))
-    assert named_files <= {COMPOSE_FILE.name, OVERRIDE_FILE.name}, (
-        f'{RUN_MIGRATIONS.name} names {sorted(named_files - {COMPOSE_FILE.name, OVERRIDE_FILE.name})}: '
-        'no compose file other than the base and the dev override belongs in the migration script.'
+    assert named_files <= allowed, (
+        f'{RUN_MIGRATIONS.name} names {sorted(named_files - allowed)}: no compose file other than the base, '
+        'the dev override and the test-mode overlay belongs in the migration script.'
     )
 
 
