@@ -22,6 +22,7 @@ from data.store.app.database.crud.dataset_override import (
     audit_tables_exist,
     overriding_reason,
 )
+from data.store.app.database.crud.ingest_run import dataset_has_running_run
 from data.store.app.database.models.dataset_deletion import DatasetDeletion
 from data.store.app.database.models.dataset_override_log import OverrideAction
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
@@ -660,6 +661,35 @@ async def _delete_entry_row(db: AsyncSession, id: uuid.UUID) -> None:
         raise EntryNotFound(id)
 
 
+async def _delete_and_record(db: AsyncSession, existing: StoreDatasetEntry, *, cause: str, actor: str) -> None:
+    """Count the dataset's bars, delete it (its bars cascade) and write the deletion record, in the caller's transaction.
+
+    ONE BODY FOR BOTH CAUSES: the operator's delete and the reaper's write the same record shape, differing only in
+    `cause` and `actor`. The caller owns the transaction and, for the reaper, the row lock that makes the count and
+    the delete describe the same rows.
+
+    Raises:
+        EntryNotFound: If the row is gone by the time the delete runs.
+    """
+    count = select(func.count(StockMarketActivity.id)).where(StockMarketActivity.dataset_id == existing.id)
+    bars = (await db.execute(count)).scalar_one()
+    await _delete_entry_row(db, existing.id)
+    await append_deletion(
+        db,
+        dataset_id=existing.id,
+        owner=existing.owner,
+        asset_symbol=existing.asset_symbol,
+        source=existing.source.name,
+        granularity=existing.granularity.name,
+        update_type=UpdateType(existing.update_type).name,
+        range_start=existing.start,
+        range_end=None if existing.end == NullableDateTime.EPOCH else existing.end,
+        bars_deleted=bars,
+        cause=cause,
+        actor=actor,
+    )
+
+
 async def delete_entry_by_id(db: AsyncSession, id: uuid.UUID, owner: str) -> None:
     """Delete an entry by its ID, as its declared owner. Its bars go with it (see _delete_entry_row)."""
     async with write_transaction(db, f'delete entry {id}'):
@@ -690,7 +720,8 @@ async def operator_set_expiry(
         override: The override the request carried, if any.
 
     Raises:
-        EntryNotFound: NOT_FOUND, no such dataset. Checked before the override.
+        EntryNotFound: NOT_FOUND, no such dataset, or it was deleted while the UPDATE waited. Checked before the
+            override, and again on the UPDATE's row count before the override row is written.
         OverrideRequired: OVERRIDE_REQUIRED, another owner's dataset without a valid override.
         AuditUnavailable: DATABASE_UNAVAILABLE, the audit tables are missing. Checked after the override and
             before any write.
@@ -702,7 +733,13 @@ async def operator_set_expiry(
         if reason is not None and not recording:
             raise AuditUnavailable
         stmt = update(StoreDatasetEntry).where(StoreDatasetEntry.id == id).values(expiry=expiry, updated_at=func.now())
-        await db.execute(stmt)
+        result = await db.execute(stmt)
+        if result.rowcount == 0:
+            # The row went between the read and this UPDATE (the reaper's delete committed while this waited on
+            # its lock). Raised before the override row is written, so the transaction rolls back with no
+            # append-only log row for a dataset that no longer exists, and the route answers 404 before it
+            # publishes. The same guard as _delete_entry_row.
+            raise EntryNotFound(id)
         if reason is not None:
             await append_override(
                 db,
@@ -737,23 +774,7 @@ async def operator_delete_entry(db: AsyncSession, id: uuid.UUID, override: Opera
         reason = overriding_reason(existing.owner, OPERATOR_PRINCIPAL, override)
         if not recording:
             raise AuditUnavailable
-        count = select(func.count(StockMarketActivity.id)).where(StockMarketActivity.dataset_id == id)
-        bars = (await db.execute(count)).scalar_one()
-        await _delete_entry_row(db, id)
-        await append_deletion(
-            db,
-            dataset_id=id,
-            owner=existing.owner,
-            asset_symbol=existing.asset_symbol,
-            source=existing.source.name,
-            granularity=existing.granularity.name,
-            update_type=UpdateType(existing.update_type).name,
-            range_start=existing.start,
-            range_end=None if existing.end == NullableDateTime.EPOCH else existing.end,
-            bars_deleted=bars,
-            cause=DatasetDeletion.CAUSE_OPERATOR,
-            actor=OPERATOR_PRINCIPAL,
-        )
+        await _delete_and_record(db, existing, cause=DatasetDeletion.CAUSE_OPERATOR, actor=OPERATOR_PRINCIPAL)
         if reason is not None:
             await append_override(
                 db,
@@ -763,3 +784,50 @@ async def operator_delete_entry(db: AsyncSession, id: uuid.UUID, override: Opera
                 action=OverrideAction.DELETE,
                 reason=reason,
             )
+
+
+# The actor the deletion record names for the expiry reaper's deletions (a system action, not the operator).
+REAPER_ACTOR = 'reaper'
+
+
+async def reaper_delete_entry(db: AsyncSession, id: uuid.UUID, now: 'datetime') -> bool:
+    """Delete a dataset whose expiry has passed, as the expiry reaper, recording it in the deletion record.
+
+    One transaction: the delete and its deletion row (cause REAPER, actor 'reaper'). NO override-log row: this is
+    a system action, not an operator override. The caller checks audit_tables_exist first and publishes the
+    change event after this returns. The row is read FOR UPDATE and its expiry and running-ingest state
+    checked again under that lock, so a dataset whose expiry was moved out of the past since the pass listed it, or
+    that has an ingest running, is left alone.
+
+    Args:
+        db: A session of its own; this function commits.
+        id: The dataset's id.
+        now: The instant expiry is judged at; aware.
+
+    Returns:
+        bool: True when the dataset was deleted, False when its expiry no longer lies in the past or an ingest is
+            running for it.
+
+    Raises:
+        EntryNotFound: NOT_FOUND, the dataset is already gone.
+    """
+    async with write_transaction(db, f'reaper delete entry {id}'):
+        # THE ROW LOCK IS THE FIRST STATEMENT. A PATCH that extends the expiry either commits before this read (the
+        # re-check below then sees the new expiry) or blocks on this lock until the reaper's transaction ends and
+        # then finds the row gone (404). An unlocked read, or a conditional DELETE, would let it commit between.
+        result = await db.execute(
+            select(StoreDatasetEntry)
+            .where(StoreDatasetEntry.id == id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        existing = result.scalar_one_or_none()
+        if existing is None:
+            raise EntryNotFound(id)
+        if existing.expiry is None or existing.expiry > now:
+            return False
+        # Re-checked under the lock; the pass checked once before. A fetch not yet acknowledged is not visible here.
+        if await dataset_has_running_run(db, id):
+            return False
+        await _delete_and_record(db, existing, cause=DatasetDeletion.CAUSE_REAPER, actor=REAPER_ACTOR)
+    return True

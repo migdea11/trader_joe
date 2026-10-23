@@ -13,6 +13,7 @@ from routers.data_store import (
     ui_dataset_writes,
     ui_datasets,
     ui_events,
+    ui_reaper,
 )
 
 
@@ -30,6 +31,7 @@ app.include_router(asset_dataset_store.router)
 app.include_router(ui_config.router)
 app.include_router(ui_datasets.router)
 app.include_router(ui_dataset_writes.router)
+app.include_router(ui_reaper.router)
 app.include_router(ui_events.router)
 
 _generate_openapi = app.openapi

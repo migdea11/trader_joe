@@ -10,6 +10,8 @@ for however many datasets it is asked about:
     bar_extents         first bar, last bar and count for a set of entries, in one statement
     covered_dates       the session dates holding a bar, for a set of STATIC entries, in one statement per time zone
     siblings            the other granularities of a set of entries' series, in one statement
+    list_pending        the datasets whose expiry has passed (the reaper's pending set), keyset paged, in one statement
+    pending_ids         the same set as ids, or those among a page's ids, in one statement
     read_bar_page       one dataset's bars in a window, in one statement
     read_bar_page_starts  the page index of a window (count and the start of every page), in one statement
 
@@ -23,6 +25,7 @@ scans. That is why this task adds no migration.
 """
 
 import uuid
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import date, datetime
 
@@ -197,6 +200,68 @@ async def get_catalog_row(db: AsyncSession, dataset_id: uuid.UUID) -> CatalogRow
     result = await db.execute(select(Entry, last_bar.label('last_bar')).where(Entry.id == dataset_id))
     found = result.first()
     return None if found is None else _row(found[0], found[1])
+
+
+def _past_expiry(now: datetime) -> ColumnElement[bool]:
+    """THE PENDING-SET PREDICATE, written once: an expiry is set and has passed (`expiry <= now`).
+
+    Whatever the update type: a retired DAILY or STREAM dataset is pending only once its expiry has passed, the same
+    as a STATIC one. Both pending reads below use it, so the reaper's pass, GET /ui/v1/reaper/pending and the
+    DatasetSummary.reaper_pending flag can never disagree about which datasets are pending.
+    """
+    return and_(Entry.expiry.is_not(None), Entry.expiry <= now)
+
+
+async def list_pending(
+    db: AsyncSession, now: datetime, *, after: tuple[datetime, uuid.UUID] | None = None, limit: int | None = None
+) -> list[CatalogRow]:
+    """The datasets whose expiry has passed, oldest expiry first, with their newest bar. One statement.
+
+    Reads record no usage. Keyset paged over (expiry, id): `after` is the last row's pair.
+
+    Args:
+        db: A session.
+        now: The instant expiry is judged at; aware.
+        after: Keep only rows strictly after this (expiry, id), or None for the first page.
+        limit: The most rows to return, or None for all of them.
+
+    Returns:
+        list[CatalogRow]: The pending datasets, ascending by (expiry, id).
+    """
+    last_bar = select(func.max(Bar.timestamp)).where(*_bar_matches_entry()).correlate(Entry).scalar_subquery()
+    stmt = select(Entry, last_bar.label('last_bar')).where(_past_expiry(now)).order_by(Entry.expiry, Entry.id)
+    if after is not None:
+        after_expiry, after_id = after
+        stmt = stmt.where(or_(Entry.expiry > after_expiry, and_(Entry.expiry == after_expiry, Entry.id > after_id)))
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    result = await db.execute(stmt)
+    return [_row(entry, newest) for entry, newest in result.all()]
+
+
+async def pending_ids(
+    db: AsyncSession, now: datetime, dataset_ids: Collection[uuid.UUID] | None = None
+) -> frozenset[uuid.UUID]:
+    """The ids of the pending datasets, or those among `dataset_ids` that are pending. One statement.
+
+    This is what DatasetSummary.reaper_pending reads on list and detail reads: pass the page's ids and test
+    membership. The predicate is the one list_pending uses.
+
+    Args:
+        db: A session.
+        now: The instant expiry is judged at; aware.
+        dataset_ids: Restrict the answer to these ids; None means every pending dataset. An empty collection
+            answers an empty set without a statement.
+
+    Returns:
+        frozenset[uuid.UUID]: The pending ids.
+    """
+    if dataset_ids is not None and not dataset_ids:
+        return frozenset()
+    stmt = select(Entry.id).where(_past_expiry(now))
+    if dataset_ids is not None:
+        stmt = stmt.where(Entry.id.in_(list(dataset_ids)))
+    return frozenset((await db.execute(stmt)).scalars())
 
 
 async def dataset_exists(db: AsyncSession, dataset_id: uuid.UUID) -> bool:

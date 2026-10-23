@@ -9,6 +9,7 @@ from common.rpc.clients.ingest_fetch import GrpcIngestFetchClient, IngestFetchCl
 from common.worker_pool import SharedWorkerPool
 from data.store.app.database import database
 from data.store.app.ingest.run_recording import sweep_interrupted_runs
+from data.store.app.reaper import start_reaper_loop, stop_reaper_loop
 from data.store.app.usage_recorder import start_usage_loops, stop_usage_loops
 from routers.common.latency import initialize_latency_client
 from routers.data_ingest.app_endpoints import APP_NAME as INGEST_APP_NAME
@@ -38,6 +39,8 @@ async def lifespan(app: FastAPI):
     await sweep_interrupted_runs()
     # The usage recorder's flush and rollup loops (tj-grna9p.46); stopped, and flushed once more, on teardown.
     usage_tasks = start_usage_loops()
+    # The expiry reaper's pass (tj-grna9p.23): dry-run unless REAPER_DELETES_ENABLED is true. One worker only.
+    reaper_task = start_reaper_loop()
 
     # THE DATASET PATH'S PEER. One channel to data_ingest's gRPC server, shared by every stub that
     # dials it, created inside the running loop and closed on teardown (ADR tj-q9ae5u addendum 5:
@@ -65,6 +68,7 @@ async def lifespan(app: FastAPI):
     SharedWorkerPool.worker_shutdown()
 
     # Before the database goes: the last flush needs it.
+    await stop_reaper_loop(reaper_task)
     await stop_usage_loops(usage_tasks)
     await database.shutdown()
 

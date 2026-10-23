@@ -24,6 +24,8 @@ class DatasetDeletion(AppBase.DATA_STORE_BASE, CustomTypeTable):
     DELETED_AT_INDEX = 'ix_dataset_deletion_deleted_at'
 
     CAUSE_OPERATOR = 'OPERATOR'
+    # The expiry reaper's deletions, actor 'reaper' (tj-grna9p.23).
+    CAUSE_REAPER = 'REAPER'
 
     id = Column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid(), nullable=False)
     dataset_id = Column(UUID(as_uuid=True), nullable=False)

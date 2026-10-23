@@ -53,6 +53,7 @@ DatasetFacetsMessage = data_pb2.DatasetFacets
 BarPageMessage = data_pb2.BarPage
 BarPageIndexMessage = data_pb2.BarPageIndex
 IngestRunPageMessage = data_pb2.IngestRunPage
+ReaperPendingPageMessage = data_pb2.ReaperPendingPage
 CoverageStripMessage = stats_pb2.CoverageStrip
 UiEventMessage = events_pb2.UiEvent
 UiConfigMessage = shell_pb2.UiConfig
@@ -85,6 +86,7 @@ def _summary(
     siblings: list[tuple[uuid.UUID, Granularity]],
     as_of: datetime,
     last_run: IngestRunRecord | None = None,
+    reaper_pending: bool = False,
 ) -> data_pb2.DatasetSummary:
     row = view.row
     message = data_pb2.DatasetSummary(
@@ -100,6 +102,7 @@ def _summary(
         owner=row.owner,
         state=data_pb2.DATASET_STATE_RETIRED if is_retired(row) else data_pb2.DATASET_STATE_ACTIVE,
         bar_count=extent.count,
+        reaper_pending=reaper_pending,
     )
     message.start.CopyFrom(to_timestamp(row.start))
     message.end.CopyFrom(to_timestamp(effective_end(row, as_of)))
@@ -132,6 +135,33 @@ def dataset_page_message(page: DatasetPage) -> data_pb2.DatasetPage:
     message.items.extend(
         _summary(
             view, page.extents[view.row.id], page.siblings[view.row.id], page.as_of, page.last_runs.get(view.row.id)
+        )
+        for view in page.views
+    )
+    return message
+
+
+def reaper_pending_page_message(page: DatasetPage, deletes_enabled: bool) -> data_pb2.ReaperPendingPage:
+    """The reaper's pending page as a ReaperPendingPage message.
+
+    Args:
+        page: The page the catalog produced from the pending set.
+        deletes_enabled: Whether the reaper deletes; False means dry-run.
+
+    Returns:
+        data_pb2.ReaperPendingPage: One summary per pending dataset, each with reaper_pending true, the next cursor
+        (empty on the last page), deletes_enabled and as_of.
+    """
+    message = data_pb2.ReaperPendingPage(next_cursor=page.next_cursor, deletes_enabled=deletes_enabled)
+    message.as_of.CopyFrom(to_timestamp(page.as_of))
+    message.items.extend(
+        _summary(
+            view,
+            page.extents[view.row.id],
+            page.siblings[view.row.id],
+            page.as_of,
+            page.last_runs.get(view.row.id),
+            reaper_pending=True,
         )
         for view in page.views
     )

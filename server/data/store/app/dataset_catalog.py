@@ -500,6 +500,62 @@ async def list_page(
     )
 
 
+def _pending_cursor_for(row: CatalogRow) -> str:
+    if row.expiry is None:
+        raise ValueError('a pending dataset always has an expiry')
+    return _encode_cursor({'o': 'reaper', 'k': [(row.expiry - _EPOCH) // _ONE_MICROSECOND, str(row.id)]})
+
+
+def _pending_key_from_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
+    payload = _decode_cursor(cursor)
+    key = payload.get('k')
+    if payload.get('o') != 'reaper' or not isinstance(key, list) or len(key) != 2:
+        raise invalid_cursor()
+    micros, dataset_id = key
+    if isinstance(micros, bool) or not isinstance(micros, int) or not isinstance(dataset_id, str):
+        raise invalid_cursor()
+    try:
+        return _EPOCH + timedelta(microseconds=micros), uuid.UUID(dataset_id)
+    except (ValueError, OverflowError):
+        raise invalid_cursor() from None
+
+
+async def reaper_pending_page(
+    db: AsyncSession, now: datetime, *, cursor: str | None, limit: int, config: FreshnessConfig | None = None
+) -> DatasetPage:
+    """One page of the datasets the reaper would delete: those whose expiry has passed, oldest expiry first.
+
+    Keyset paged over (expiry, id) with an opaque cursor bound to this read (one made by the catalog list is a
+    422). Records no usage. The page carries what DatasetPage carries, so the route maps its items like the
+    catalog's, with reaper_pending true.
+
+    Args:
+        db: The request's session.
+        now: The instant the pending set is computed at; aware.
+        cursor: The next_cursor of the previous page, or None for the first.
+        limit: The page size.
+        config: The freshness settings; the environment's when omitted.
+
+    Returns:
+        DatasetPage: The page; next_cursor is empty on the last.
+
+    Raises:
+        InvalidRequestError: If the cursor does not decode (422).
+    """
+    after = None if cursor is None else _pending_key_from_cursor(cursor)
+    rows = await repo.list_pending(db, now, after=after, limit=limit + 1)
+    has_more = len(rows) > limit
+    page_rows = rows[:limit]
+    return DatasetPage(
+        views=await evaluate_views(db, page_rows, now, config),
+        extents=await repo.bar_extents(db, page_rows),
+        siblings=await repo.siblings(db, page_rows),
+        next_cursor=_pending_cursor_for(page_rows[-1]) if has_more else '',
+        as_of=now,
+        last_runs=await latest_runs_for_datasets(db, [row.id for row in page_rows]),
+    )
+
+
 def _count_where(
     views: list[DatasetView], predicate: Callable[[DatasetView], bool], key: Callable[[DatasetView], Any]
 ) -> dict[Any, int]:

@@ -366,6 +366,16 @@ CASES: dict[str, Case] = {
         malformed_request={},
         malformed_field='dataset_id',
     ),
+    # tj-grna9p.23, the reaper's pending read: open and read-only, so over the empty fake table the well-formed call
+    # answers an empty page. The malformed half sends limit 0, below the floor of 1. Its real rows are
+    # test_reaper.py's, over SQLite, and tests/system/test_reaper_pass.py's.
+    'GET /ui/v1/reaper/pending': Case(
+        path_params={},
+        request={},
+        malformed_path_params={},
+        malformed_request={'params': {'limit': 0}},
+        malformed_field='limit',
+    ),
 }
 
 

@@ -340,3 +340,17 @@ async def running_dataset_ids(db: AsyncSession) -> frozenset[uuid.UUID]:
         .distinct()
     )
     return frozenset((await db.execute(stmt)).scalars())
+
+
+async def dataset_has_running_run(db: AsyncSession, dataset_id: uuid.UUID) -> bool:
+    """Whether this dataset has a run in state RUNNING right now (the per-dataset form of running_dataset_ids).
+
+    Args:
+        db: A session; a caller that needs the answer inside its transaction passes that transaction's session.
+        dataset_id: The dataset's id.
+
+    Returns:
+        bool: True when an acknowledged run is in flight for it.
+    """
+    stmt = select(exists().where(IngestRun.state == IngestRunState.RUNNING, IngestRun.dataset_id == dataset_id))
+    return bool((await db.execute(stmt)).scalar_one())

@@ -77,7 +77,7 @@ It is separate from the entry and its bars, and is not part of the fetch's trans
 - **The record is best effort.** A failure to write it is logged and the fetch carries on unrecorded; the cost is a missing or stuck row, which the startup sweep bounds. The exception of the fetch itself propagates unchanged.
 - **`dataset_id` is NULL until ingest acknowledges the fetch**: a new dataset's entry is written on the acknowledgement. So a dataset is `Running` only from the acknowledgement, and a first-time request is not visible as Running before it. A run that fails before its acknowledgement keeps a NULL dataset id.
 - **The actor** is the request body's `owner`. It is a `SensitiveString` and is never logged.
-- **Events are notifications, not data.** Publishers call `publish()` strictly after their own commit. Published today: `IngestRunChanged` (start, acknowledgement, finish) and `DatasetChanged` `UPDATED` (after `POST /store`) and `DELETED`. `CREATED` is never published: a new dataset arrives as `UPDATED`, because the upsert does not tell the two apart. `RequestChanged` and `ReaperPendingChanged` are typed in `app/events.py` and in `ui/v1/events.proto` and have no publisher.
+- **Events are notifications, not data.** Publishers call `publish()` strictly after their own commit. Published today: `IngestRunChanged` (start, acknowledgement, finish) and `DatasetChanged` `UPDATED` (after `POST /store`) and `DELETED`. `CREATED` is never published: a new dataset arrives as `UPDATED`, because the upsert does not tell the two apart. `ReaperPendingChanged` is published by the expiry reaper (below). `RequestChanged` is typed in `app/events.py` and in `ui/v1/events.proto` and has no publisher.
 - **An event can name a dataset whose entry is not committed yet**: the acknowledgement's `IngestRunChanged` is published before the fetch commits, so a reload by id may 404 briefly. REST is the truth.
 - **A slow client is dropped, never waited for.** Its queue is bounded (`EVENTS_CLIENT_QUEUE_SIZE`); when it fills the hub drops the client and the router closes the socket with 1013. The client reloads over REST on reconnect.
 
@@ -117,6 +117,24 @@ Every bar read is recorded as one `dataset_read` row by the usage recorder (`app
 - **An unmigrated database** refuses the audited writes: an overriding PATCH and every DELETE answer 503 `DATABASE_UNAVAILABLE` (detail names `make migrate`; no owner, no metadata) after the 404/409 checks and before any write; an operator-owned PATCH still goes through. One process-wide warning names `make migrate` (`audit_tables_exist`, `AuditUnavailable`).
 - **A DELETE may carry no body** (the operator's own dataset needs no override); a body that is sent is parsed strictly.
 
+## Expiry reaper (dry-run by default)
+
+A periodic pass (`app/reaper.py`, the shared `run_periodic` with `Every`, started and stopped in the lifespan beside the usage loops) over the datasets whose expiry has passed. It stores no jobs: catch-up after a restart is the next pass, which reads the database each time.
+
+| Concern | Where it lives |
+|---|---|
+| The pending-set query (`expiry <= now`), written once: `list_pending` (keyset over expiry, id) and `pending_ids` (all, or those among a page's ids: what `DatasetSummary.reaper_pending` reads) | `app/database/crud/stock/dataset_catalog.py` |
+| The pass, the env flags, the events, the loop | `app/reaper.py` |
+| The delete (`reaper_delete_entry`, its own transaction, the cascade and record of the operator delete) | `app/database/crud/stock/store_dataset_entry.py` |
+| `GET /ui/v1/reaper/pending` (open; `ReaperPendingPage`) | `routers/data_store/ui_reaper.py`, `reaper_pending_page` in `app/dataset_catalog.py` |
+
+- **DRY-RUN IS THE DEFAULT.** `REAPER_DELETES_ENABLED` must be exactly `true` to delete anything. The default exists because STATIC rows created under the former now+1-day expiry default are all past expiry: the operator reads `GET /ui/v1/reaper/pending` before anything goes. Dry-run logs a count only, never an owner or a symbol.
+- **A retired subscription is pending only once its expiry has passed**, like any other dataset.
+- **Enabled**: each pending dataset is deleted in its own transaction on its own session, recorded in `dataset_deletion` with cause `REAPER` and actor `reaper`, with NO override-log row (a system action). `DatasetChanged` `DELETED` is published after each commit. A failure on one dataset is logged by exception type only and the pass carries on. The row is read `FOR UPDATE` and its expiry and running-ingest state re-checked under that lock, so a PATCH that extends the expiry either commits first (the dataset is left alone) or waits and gets its own 404. A fetch not yet acknowledged has no dataset id (tj-jc635p) and is not seen: if its dataset is deleted the fetch recreates the entry.
+- **A missing audit table means an enabled pass deletes nothing** (one warning, `audit_tables_exist`): a deletion is never unrecorded. Dry-run is unaffected.
+- **A dataset with a `RUNNING` ingest is skipped** and retried on the next pass.
+- **`ReaperPendingChanged`** is published when the pending ids differ from the previous pass's, after enabled-mode deletions, and once on the first pass after start, in dry-run too. Whether deletions are on is `ReaperPendingPage.deletes_enabled`. The previous ids live in process memory (one worker).
+
 ## Environment variables
 
 | Variable | Purpose | Default |
@@ -131,6 +149,8 @@ Every bar read is recorded as one `dataset_read` row by the usage recorder (`app
 | USAGE_BUFFER_MAX | reads held in process before the oldest are dropped | 10000 |
 | USAGE_ROLLUP_AFTER_DAYS | per-read rows older than this are folded into daily summaries | 90 |
 | USAGE_ROLLUP_INTERVAL_SECONDS | how often the rollup runs | 3600 |
+| REAPER_INTERVAL_SECONDS | seconds between expiry-reaper passes; a non-positive or malformed value is the default (`app/reaper.py`) | 3600 |
+| REAPER_DELETES_ENABLED | the reaper deletes only when this is exactly `true` (any case); anything else is dry-run (`app/reaper.py`) | false |
 | SERVICE_WORKERS | uvicorn workers; must stay 1 (see Key invariants). `docker-compose.yaml` pins it as a literal, so the env file cannot change it there | 1 |
 
 ## Common pitfalls

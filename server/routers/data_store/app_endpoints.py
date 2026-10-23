@@ -47,6 +47,12 @@ class UiDatasetWritesInterface(StrEnum):
     DELETE_UI_DATASET = '/ui/v1/datasets/{dataset_id}'
 
 
+class UiReaperInterface(StrEnum):
+    """The expiry reaper's pending-deletions read (tj-grna9p.23). Open, like the other /ui/v1 GETs."""
+
+    GET_UI_REAPER_PENDING = '/ui/v1/reaper/pending'
+
+
 class UiConfigInterface(StrEnum):
     """The shell's configuration read (tj-grna9p.45). Served as protobuf canonical JSON."""
 

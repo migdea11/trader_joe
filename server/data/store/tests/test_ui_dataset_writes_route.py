@@ -514,6 +514,68 @@ async def test_delete_publishes_deleted_strictly_after_its_commit(client, world)
     assert world.events == [(DatasetChanged(world.foreign.id, DatasetChange.DELETED), 1)]
 
 
+# ------------------------------------------------------------------------------------------------- a 0-row UPDATE
+# tj-grna9p.23, the architect's round 2 gate (item B), fixed in 138c009: a PATCH whose dataset is deleted between its
+# read and its UPDATE (on Postgres: it waited on the reaper's row lock) must raise EntryNotFound on the UPDATE's row
+# count, BEFORE the override row, so the transaction rolls back, no append-only row is left for a dataset that no
+# longer exists, and the route answers 404 without publishing. Here the delete is committed by another session right
+# after operator_set_expiry's read; the two-session version on Postgres is tests/system/test_reaper_race.py.
+
+
+def _deleted_right_after_the_read(world: World, monkeypatch: pytest.MonkeyPatch, dataset_id: uuid.UUID) -> None:
+    real = repo._get_entry_or_raise
+
+    async def then_deleted(db, id):
+        existing = await real(db, id)
+        async with AsyncSession(world.engine) as other:
+            await other.execute(StoreDatasetEntry.__table__.delete().where(StoreDatasetEntry.id == dataset_id))
+            await other.commit()
+        return existing
+
+    monkeypatch.setattr(repo, '_get_entry_or_raise', then_deleted)
+
+
+@pytest.mark.asyncio
+async def test_an_update_that_matches_no_row_raises_not_found_and_writes_no_override_row(world, monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+    _deleted_right_after_the_read(world, monkeypatch, world.foreign.id)
+
+    async with AsyncSession(world.engine, expire_on_commit=False) as db:
+        with pytest.raises(repo.EntryNotFound):
+            await repo.operator_set_expiry(
+                db, world.foreign.id, z(FUTURE), OperatorOverrideInput(reason='keep', confirmed=True)
+            )
+
+    assert await world.entry(world.foreign.id) is None
+    assert await world.audit_rows() == ([], []), 'an override row was left for a dataset that no longer exists'
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR], [r.getMessage() for r in caplog.records]
+
+
+@pytest.mark.parametrize(
+    ('name', 'body'),
+    [
+        pytest.param('foreign', {'expiry': FUTURE, 'override': GOOD_OVERRIDE}, id='overriding'),
+        pytest.param('dataset', {'expiry': FUTURE}, id='operator-owned'),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_patch_whose_dataset_goes_before_its_update_is_404_with_no_override_row_and_no_event(
+    client, world, monkeypatch, caplog, name, body
+):
+    caplog.set_level(logging.DEBUG)
+    dataset_id = getattr(world, name).id
+    _deleted_right_after_the_read(world, monkeypatch, dataset_id)
+
+    response = await patch(client, dataset_id, body)
+
+    problem(response, status=404, reason='NOT_FOUND')
+    overrides, _ = await world.audit_rows()
+    assert (overrides, world.events) == ([], []), 'a PATCH that updated nothing left an override row or an event'
+    assert world.commits == 0, 'the PATCH committed'
+    assert FOREIGN_OWNER not in response.text
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR], [r.getMessage() for r in caplog.records]
+
+
 # ------------------------------------------------------------------------------------------------- rule 6 and semantics
 
 
