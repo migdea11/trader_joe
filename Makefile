@@ -183,8 +183,9 @@ init: $(VENV_MARKER)  ## Initialize the project, including the security tooling
 # WHO GENERATES, AND WHEN. The host, through this target, which every target that needs the tree
 # takes as a prerequisite: the five pytest targets, `security` (bandit reads gen/proto/python) and
 # the three image builds (the Dockerfile COPYs it out of the build context). It costs ~0.15s and is
-# unconditional -- no stamp file, because a stamp keyed on the .proto mtimes would not notice a
-# grpcio-tools bump, and a guard that can be stale is the hollow kind this repo keeps finding. The
+# unconditional -- no stamp file gates it, because a stamp keyed on the .proto mtimes would not notice a
+# grpcio-tools bump, and a guard that can be stale is the hollow kind this repo keeps finding. (The
+# content stamp written at the end of this target gates nothing here: it is for readers, below.) The
 # targets that only RUN an image already built -- test-system, system-launch, migrate-check,
 # seed-dump -- deliberately keep no prerequisite: they have no $(VENV_MARKER) either, because the
 # host they run on may be a server with no usable uv, and they cannot be reached before a build.
@@ -242,8 +243,21 @@ PROTO_SRC := proto
 PROTO_GEN := gen/proto/python
 PROTO_PKG := $(PROTO_GEN)/trader_joe/proto
 
+# THE CONTENT STAMP (bead tj-grna9p.164). The last step of this target writes the digest of its inputs,
+# as tools/proto_digest.sh prints it, to $(PROTO_GEN).digest -- gen/proto/python.digest, a SIBLING of
+# the tree and not inside it, so neither the clearing step below nor protoc can remove it. A reader
+# asks "do the inputs now equal the inputs the last generation that wrote this stamp was run from" by
+# recomputing the digest and comparing: by content, never by mtime. That is all the stamp records: the
+# INPUTS of that generation, not proof of what is in the tree (a generation run outside make, or an
+# edit of the tree itself, does not touch it). The old stamp is deleted FIRST, so a generation that
+# fails or is interrupted leaves no stamp and reads as stale. Not written for a scratch PROTO_SRC: the script
+# digests the repository's proto/, so a stamp beside a tree built from elsewhere would be a lie.
+# Nothing under gen/ is committed.
+PROTO_STAMP = $(PROTO_GEN).digest
+
 .PHONY: proto
 proto: $(VENV_MARKER)  ## Generate gen/proto/python/ from proto/ (never committed; every target that needs it runs this first)
+	@rm -f "$(PROTO_STAMP)"
 	@! [ -e "$(PROTO_PKG)" ] || [ -f "$(PROTO_PKG)/__init__.py" ] || { echo "make proto: $(PROTO_PKG) exists but $(PROTO_PKG)/__init__.py is missing; refusing to clear a directory that is not the generated package." >&2; exit 1; }
 	@outside="$$(find "$(PROTO_SRC)" -name '*.proto' ! -path "$(patsubst %/,%,$(PROTO_SRC))/trader_joe/proto/*" | LC_ALL=C sort)"; \
 	[ -z "$$outside" ] || { \
@@ -255,6 +269,7 @@ proto: $(VENV_MARKER)  ## Generate gen/proto/python/ from proto/ (never committe
 	find "$(PROTO_PKG)" -mindepth 1 -maxdepth 1 ! -name __init__.py -exec rm -rf {} +
 	uv run python -m grpc_tools.protoc -I$(PROTO_SRC) --python_out=$(PROTO_GEN) --grpc_python_out=$(PROTO_GEN) --pyi_out=$(PROTO_GEN) \
 		$$(find $(PROTO_SRC) -name '*.proto' | LC_ALL=C sort)
+	@[ "$(PROTO_SRC)" != proto ] || { digest="$$(tools/proto_digest.sh python)" && printf '%s\n' "$$digest" > "$(PROTO_STAMP)"; }
 
 # THE ERROR CATALOGUE (ADR tj-fa1rpu, the Q-URI addendum of 2026-10-02; tj-3mk3u5.37.10). docs/errors.md
 # is generated from the ONE Reason table in server/common/errors, and is committed like gen/proto/ above and for
@@ -327,11 +342,16 @@ errors-doc: $(VENV_MARKER)  ## Regenerate docs/errors.md from server/common/erro
 # target can reach prod's containers: every up, down, ps, run and logs those sets issue addresses
 # trader_joe_dev and nothing else. A down never needs to know what prod is called.
 #
-# THE HAZARD THAT REMAINS, and it fails safe. Prod and dev/test on ONE host still collide on the names
-# the compose files fix host-wide (published loopback ports, container_name, the fixed-name networks and
-# the DATA_DIR bind). Whichever launches second fails LOUDLY on that clash and changes nothing of the
-# first. That failure is the intended outcome, not a bug to route around: no target here tears down the
-# other project to make room.
+# THE HAZARD THAT REMAINS, and it fails safe. Prod and dev on ONE host still collide on what both sets
+# fix host-wide: container names (docker-compose.yaml container_name ${DATABASE_NAME} for postgres) and
+# published ports (docker-compose.web.yaml, 127.0.0.1:WEB_PORT). Both clash for certain. A third fixed
+# name is shared too: the network trader_joe_store_api (docker-compose.yaml, default of STORE_API_NETWORK)
+# is a SHARED fixed network name whose clash is UNPROVEN: compose may only warn and reuse it rather than
+# fail. Not clashes: devnet (dev only; the override declares it
+# external and prod never loads the override), pgAdmin (only TOOLS_COMPOSE, dev, loads its file) and the
+# DATA_DIR bind (two bind mounts of one directory are both allowed). Whichever launches second fails
+# LOUDLY on a real clash and changes nothing of the first. That failure is the intended outcome, not a
+# bug to route around: no target here tears down the other project to make room.
 DEV_PROJECT := trader_joe_dev
 PROD_COMPOSE := docker compose -f docker-compose.yaml -f docker-compose.web.yaml
 # Dev gains devnet through the override, which attaches every stack service to it (tj-q9ae5u
@@ -1363,10 +1383,21 @@ web-install:  ## npm ci in web/ (exact lockfile install; the network step of the
 	$(NODE_PIN_CHECK)
 	$(WEB_NPM) ci
 
+# The TS twin of the Python content stamp above (tj-grna9p.164): gen/proto/ts.digest, written as the
+# LAST step of the generation, the old one deleted first, OUTSIDE gen/proto/ts because web/buf.gen.yaml
+# has clean: true on that folder. The stamp records the INPUTS of the last generation that wrote it
+# (protos, buf.yaml and web/buf.gen.yaml), not proof of what is in the tree. Every ts generation
+# stamps, make or npm, and there is ONE writer: web/scripts/gen-proto.sh (what `npm run gen:proto`
+# runs) deletes the stamp, runs buf generate, and writes the stamp last via tools/proto_digest.sh ts.
+# This recipe only calls it (tj-grna9p.188); the rm below just clears a stale stamp if npm never
+# reaches the script.
+TS_STAMP := gen/proto/ts.digest
+
 .PHONY: gen-proto-ts
 gen-proto-ts:  ## Generate gen/proto/ts from proto/ (never committed; typecheck, test and build run it first)
 	$(NODE_PIN_CHECK)
 	$(WEB_MODULES_CHECK)
+	@rm -f "$(TS_STAMP)"
 	$(WEB_NPM) run gen:proto
 
 .PHONY: web-lint

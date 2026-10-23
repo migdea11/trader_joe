@@ -1400,8 +1400,8 @@ def test_every_compared_copy_is_read_where_the_mcp_dockerfile_puts_it():
         assert landed.get(checkout) == f'{EXPECTED_TRUSTED_DIR}/{baked}', (checkout, landed.get(checkout))
 
 
-def test_the_bake_list_is_the_dev_files_the_tools_file_the_test_overlay_and_the_two_scripts():
-    """Non-vacuity for the derived pin: the list still names what tj-iee6sn.5 and tj-iee6sn.24 baked."""
+def test_the_bake_list_is_the_dev_files_the_tools_file_the_test_overlay_and_the_three_scripts():
+    """Non-vacuity for the derived pin: the list still names what tj-iee6sn.5, .24 and .33 baked."""
     assert set(EXPECTED_DEV_BAKES) == {
         *EXPECTED_DEV_COMPOSE_FILES[1:],
         'docker-compose.tools.yaml',
@@ -1409,6 +1409,7 @@ def test_the_bake_list_is_the_dev_files_the_tools_file_the_test_overlay_and_the_
         'docker-compose.agent-client.yaml',
         'tools/dev_instance_secret.sh',
         'tools/source_digest.sh',
+        'tools/proto_digest.sh',
     }
 
 

@@ -151,11 +151,13 @@ SYSTEM_CLIENT_COMPOSE_FILES = (TEST_COMPOSE_FILES[0], SYSTEM_CLIENT_FILE, SYSTEM
 # The Makefile's TEST_DATA_DIR. Pinned in the step env of test_up and test_build ONLY (process env
 # outranks the project's .env), never of a dev verb: DEV keeps the owner's own DATA_DIR.
 TEST_DATA_DIR = './volume_data/test'
-# The trusted copies of the two scripts the dev verbs run, in a tools/ directory beside the trusted
+# The trusted copies of the scripts the dev verbs run, in a tools/ directory beside the trusted
 # Dockerfile (tools/agent_mcp/Dockerfile): dev_instance_secret.sh resolves the dev web container's
 # INSTANCE_WRITE_SECRET, source_digest.sh computes the source stamp.
 TRUSTED_DEV_INSTANCE_SECRET = TRUSTED_COMPOSE_DIR / 'tools' / 'dev_instance_secret.sh'
 TRUSTED_SOURCE_DIGEST = TRUSTED_COMPOSE_DIR / 'tools' / 'source_digest.sh'
+# The third baked script: the content stamp of the generated protobuf code (tj-iee6sn.33).
+TRUSTED_PROTO_DIGEST = TRUSTED_COMPOSE_DIR / 'tools' / 'proto_digest.sh'
 # The only compose subcommands a dev verb may spell. Both are read-only: `ps` lists the project's
 # containers, `logs` prints what they already wrote. Nothing is added here without the ADR addendum
 # that allowing it would need.
@@ -1382,7 +1384,7 @@ def check_mode_guard(
     return mode
 
 
-# S6. The compose files, the Dockerfile and the two scripts the file-based dev verbs use are run from
+# S6. The compose files, the Dockerfile and the three scripts the file-based dev verbs use are run from
 # copies baked into the MCP image; when the checkout's differ, the verb would create containers from
 # yesterday's files. Fail-safe: a difference can only refuse. docker-compose.tools.yaml is baked too
 # (tools and the down fallback load it), so it is compared with the rest, and so are the test
@@ -1397,6 +1399,7 @@ DEV_TRUSTED_COPIES = (
     ('Dockerfile', 'Dockerfile'),
     ('tools/dev_instance_secret.sh', 'tools/dev_instance_secret.sh'),
     ('tools/source_digest.sh', 'tools/source_digest.sh'),
+    ('tools/proto_digest.sh', 'tools/proto_digest.sh'),
 )
 _TRUSTED_COPY_MAX_BYTES = 1024 * 1024
 
@@ -1532,7 +1535,6 @@ def dev_restart_steps(stack_dir: Path, service: str) -> list[Step]:
 DEV_GENERATED_DIRS = ('gen/proto/python', 'gen/proto/ts')
 # make test-build runs `proto` and no gen-proto-ts: test mode has no web service, so only the Python half.
 TEST_GENERATED_DIRS = ('gen/proto/python',)
-DEV_PROTO_SOURCE_DIR = 'proto'
 DEV_DIGEST_SERVICES = (('data', 'store'), ('data', 'ingest'))
 DEV_DIGEST_VARIABLES = ('SOURCE_DIGEST_DATA_STORE', 'SOURCE_DIGEST_DATA_INGEST')
 # bash by absolute path: the step env's PATH is the runner's, and the script is `#! /bin/bash` anyway.
@@ -1542,42 +1544,66 @@ _GENERATE_HINT = 'run make proto gen-proto-ts in the root checkout'
 TEST_GENERATE_HINT = 'run make proto in the root checkout'
 
 
-def _newest_mtime(root: Path, suffix: str | None = None) -> float | None:
-    """The newest mtime of a regular file under ROOT (SUFFIX filters by name); None when there is none.
-
-    Walks without following a link; a symlinked file or directory is not counted, so a planted link
-    cannot make a stale tree look fresh by pointing at a new file.
-    """
-    newest: float | None = None
+def _has_regular_file(root: Path) -> bool:
+    """True when a regular file sits under ROOT, found without following a link (a planted link is not counted)."""
     for directory, _, names in os.walk(root, followlinks=False):
         for name in names:
-            if suffix is not None and not name.endswith(suffix):
-                continue
             try:
-                found = os.lstat(Path(directory) / name)
+                if stat.S_ISREG(os.lstat(Path(directory) / name).st_mode):
+                    return True
             except OSError:
                 continue
-            if stat.S_ISREG(found.st_mode) and (newest is None or found.st_mtime > newest):
-                newest = found.st_mtime
-    return newest
+    return False
+
+
+def proto_digest_argv(repo_root: Path, kind: str, trusted_script: Path = TRUSTED_PROTO_DIGEST) -> tuple[str, ...]:
+    """The TRUSTED proto_digest.sh over REPO_ROOT: bash <script> --context <root> <kind>."""
+    return (DEV_DIGEST_BASH, str(trusted_script), '--context', str(repo_root), kind)
+
+
+def _current_proto_digest(repo_root: Path, kind: str, trusted_script: Path, hint: str) -> bytes:
+    """The digest of REPO_ROOT's protos for KIND, computed by the baked script; refuses when it cannot be."""
+    try:
+        completed = subprocess.run(  # nosec B603 -- fixed argument list, no shell, the baked script
+            proto_digest_argv(repo_root, kind, trusted_script),
+            env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+            cwd='/',
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise Refused(f'the {kind} proto digest could not be computed ({type(error).__name__}): {hint}') from error
+    if completed.returncode != 0 or not _DIGEST_PATTERN.fullmatch(completed.stdout):
+        reason = completed.stderr.decode('utf-8', 'replace').strip().splitlines()[:1]
+        raise Refused(f'the {kind} proto digest could not be computed ({"".join(reason) or "bad output"}): {hint}')
+    return completed.stdout
 
 
 def check_generated_code_fresh(
-    repo_root: Path, generated_dirs: Sequence[str] = DEV_GENERATED_DIRS, hint: str = _GENERATE_HINT
+    repo_root: Path,
+    generated_dirs: Sequence[str] = DEV_GENERATED_DIRS,
+    hint: str = _GENERATE_HINT,
+    trusted_script: Path = TRUSTED_PROTO_DIGEST,
 ) -> None:
-    """Refuse unless GENERATED_DIRS (default gen/proto/python and gen/proto/ts) hold files no older than the newest proto/**/*.proto.
+    """Refuse unless each of GENERATED_DIRS (default gen/proto/python and gen/proto/ts) was generated from the current protos.
 
-    Read through the repository mount; nothing is generated here. make dev-build regenerates both
-    first, and the MCP cannot run the generators, so a missing or older tree is refused naming the
-    fix. A checkout with no .proto file at all has nothing to be older than.
+    Content, not time (tj-iee6sn.33, over tj-grna9p.164): <tree>.digest, beside the tree, is what make
+    proto / gen-proto-ts wrote, and it must equal the digest the BAKED trusted proto_digest.sh computes
+    over the repository now (never the checkout's own copy, which an agent can write). The stamp is read
+    without following a link, and a missing, linked, non-regular or unequal one refuses. Nothing is
+    generated here; the MCP cannot run the generators, so every refusal names the fix.
     """
-    newest_proto = _newest_mtime(repo_root / DEV_PROTO_SOURCE_DIR, '.proto')
     for relative in generated_dirs:
-        generated = _newest_mtime(repo_root / relative)
-        if generated is None:
+        if not _has_regular_file(repo_root / relative):
             raise Refused(f'{relative} is missing or empty: {hint}')
-        if newest_proto is not None and generated < newest_proto:
-            raise Refused(f'{relative} is older than the newest .proto file: {hint}')
+        stamp = _read_regular(repo_root / f'{relative}.digest')
+        if stamp is None:
+            raise Refused(
+                f'no generation stamp: {relative}.digest is missing, unreadable or not a regular file: {hint}'
+            )
+        if stamp != _current_proto_digest(repo_root, relative.rsplit('/', 1)[-1], trusted_script, hint):
+            raise Refused(f'generated code is not from the current protos: {relative}: {hint}')
 
 
 def dev_digest_argv(repo_host_path: Path, service_path: str, service_name: str) -> tuple[str, ...]:

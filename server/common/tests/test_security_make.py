@@ -32,6 +32,7 @@ from common.tests.test_ci_invariants import (
     _run_make,
     _subprocess_env,
 )
+from common.tests.test_make_lint import PROTO_DIGEST_STUB
 
 
 pytestmark = pytest.mark.build_infra
@@ -56,10 +57,22 @@ exit 0
 """
 
 
+def _work_tree(tmp_path: Path) -> Path:
+    """An otherwise empty working directory holding only a stand-in tools/proto_digest.sh.
+
+    `make security` takes `proto` as a prerequisite, whose last step runs tools/proto_digest.sh from
+    the working directory (tj-grna9p.164). This tree holds no proto/, so the real script would refuse.
+    """
+    work = tmp_path / 'work'
+    (work / 'tools').mkdir(parents=True)
+    (work / 'tools' / 'proto_digest.sh').write_text(PROTO_DIGEST_STUB)
+    (work / 'tools' / 'proto_digest.sh').chmod(0o755)
+    return work
+
+
 def _security(tmp_path: Path, **values: str) -> tuple[subprocess.CompletedProcess, Path, dict[str, Path]]:
     """Run the real security recipe from an empty directory with `uv` stubbed; returns (result, work, logs)."""
-    work = tmp_path / 'work'
-    work.mkdir()
+    work = _work_tree(tmp_path)
     stubs = tmp_path / 'stubs'
     stubs.mkdir()
     (stubs / 'uv').write_text(UV_STUB)
@@ -188,8 +201,7 @@ def _colour_forced_env(forcing: str, **values: str) -> dict[str, str]:
 @pytest.mark.parametrize('forcing', COLOUR_FORCING)
 def test_the_recipes_export_is_plain_text_when_the_caller_forces_colour(tmp_path: Path, forcing: str):
     """The file pip-audit reads is the real export of the lock, and not one escape byte is in it."""
-    work = tmp_path / 'work'
-    work.mkdir()
+    work = _work_tree(tmp_path)
     stubs = tmp_path / 'stubs'
     stubs.mkdir()
     (stubs / 'uv').write_text(REAL_EXPORT_STUB)

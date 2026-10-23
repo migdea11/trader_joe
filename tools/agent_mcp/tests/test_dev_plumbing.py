@@ -278,6 +278,13 @@ def test_the_image_bakes_both_dev_scripts_where_the_stack_constants_point():
     assert baked.get('Dockerfile') == f'{EXPECTED_TRUSTED_DIR}/Dockerfile', baked
 
 
+def test_the_image_bakes_the_proto_digest_where_the_guard_runs_it():
+    """tj-iee6sn.33: the generated-code guard runs the BAKED proto_digest.sh, beside the other two scripts."""
+    baked = _baked_into_trusted()
+    assert str(stack.TRUSTED_PROTO_DIGEST) == f'{EXPECTED_TRUSTED_DIR}/tools/proto_digest.sh'
+    assert baked.get('tools/proto_digest.sh') == str(stack.TRUSTED_PROTO_DIGEST), baked
+
+
 @pytest.mark.parametrize('source', sorted(EXPECTED_DEV_BAKES))
 def test_the_mcp_build_context_admits_each_dev_bake(source: str):
     """Dockerfile.dockerignore is an allow-list: a COPY source it does not re-include fails the image build."""

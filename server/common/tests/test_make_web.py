@@ -45,6 +45,7 @@ from common.tests.test_ci_invariants import (
 )
 from common.tests.test_make_lint import (
     CURL_WRAPPER,
+    PROTO_DIGEST_STUB,
     UNAME_STUB,
     WEB_LINT_CALLS,
     WEB_LINT_FIX_CALLS,
@@ -102,6 +103,13 @@ def scratch(tmp_path: Path) -> Path:
     root = tmp_path / 'scratch'
     (root / 'web' / 'node_modules').mkdir(parents=True)
     (root / 'Makefile').symlink_to(MAKEFILE)
+    # gen-proto-ts's last step writes gen/proto/ts.digest from tools/proto_digest.sh (tj-grna9p.164).
+    # The npm stand-in generates nothing, so this tree has no proto/ for the real script and no
+    # gen/proto/ that a real `buf generate` would have created: a stand-in printing a fixed digest, and
+    # the directory. The stamp itself is pinned in test_proto_digest_make.py.
+    (root / 'tools').mkdir()
+    _executable(root / 'tools' / 'proto_digest.sh', PROTO_DIGEST_STUB)
+    (root / 'gen' / 'proto').mkdir(parents=True)
     return root
 
 

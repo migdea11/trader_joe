@@ -48,4 +48,5 @@ tools/agent_mcp/__pycache__
 !docker-compose.tools.yaml
 !tools/dev_instance_secret.sh
 !tools/source_digest.sh
+!tools/proto_digest.sh
 !Dockerfile

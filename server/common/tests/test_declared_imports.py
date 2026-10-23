@@ -317,9 +317,9 @@ def test_the_mcp_image_environment_is_the_one_its_dockerfile_installs():
 def test_the_files_mapped_to_the_mcp_image_are_the_ones_it_copies():
     """The image takes tools/agent_mcp's server modules and not its tests. ENVIRONMENTS must agree, both ways.
 
-    Only PYTHON files are compared: since tj-iee6sn.5 the image also COPYs two tools/ shell scripts
-    (the dev verbs' trusted dev_instance_secret.sh and source_digest.sh), which import nothing and have
-    no ENVIRONMENTS entry. Filtered on what each COPY really matches, not on how its source is spelled,
+    Only PYTHON files are compared: since tj-iee6sn.5 the image also COPYs tools/ shell scripts (the
+    dev verbs' trusted dev_instance_secret.sh and source_digest.sh, and since tj-iee6sn.33 the
+    generated-code guard's proto_digest.sh), which import nothing and have no ENVIRONMENTS entry. Filtered on what each COPY really matches, not on how its source is spelled,
     so a glob that picks up a .py file is still compared.
     """
     lines = MCP_DOCKERFILE.read_text(encoding='utf-8').splitlines()
@@ -329,6 +329,7 @@ def test_the_files_mapped_to_the_mcp_image_are_the_ones_it_copies():
     assert {str(path.relative_to(REPO_ROOT)) for path in matched if path.suffix != '.py'} == {
         'tools/dev_instance_secret.sh',
         'tools/source_digest.sh',
+        'tools/proto_digest.sh',
     }, sorted(matched)
     mapped = {path for path in _scanned_files() if _environment(path)[0] == MCP_IMAGE}
     assert 'tools/agent_mcp/server.py' in mapped, sorted(mapped)

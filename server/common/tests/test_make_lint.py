@@ -121,6 +121,13 @@ printf '\n' >> "$NPM_STUB_LOG"
 if [ -n "${NPM_STUB_FAIL_CALL:-}" ] && [ "$*" = "$NPM_STUB_FAIL_CALL" ]; then exit 1; fi
 exit "${NPM_STUB_EXIT:-0}"
 """
+# A stand-in tools/proto_digest.sh for a scratch tree with no proto/ (tj-grna9p.164): `make proto`
+# and `make gen-proto-ts` end by running it from the working directory to write the content stamp,
+# and a test about another recipe should not depend on what the real script makes of an empty tree.
+# The stamp itself is pinned in test_proto_digest_make.py.
+PROTO_DIGEST_STUB = r"""#!/bin/sh
+printf '%s\n' 0000000000000000000000000000000000000000000000000000000000000000
+"""
 UNAME_STUB = r"""#!/bin/sh
 case "$*" in
   -s) printf '%s\n' "$UNAME_S" ;;

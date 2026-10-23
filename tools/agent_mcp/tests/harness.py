@@ -21,6 +21,7 @@ import functools
 import hashlib
 import json
 import os
+import shutil
 import stat
 import subprocess
 import time
@@ -212,15 +213,25 @@ class Layout:
         return self.root / TRUSTED_DIR_NAME
 
 
-# build (tj-iee6sn.8) refuses unless the generated code is no older than the newest .proto, read
-# through the repository root. The ROOT checkout gets one generated TypeScript file and one .proto an
-# hour older than everything else, so a sample build passes the precondition. Only the root
-# checkout: no worktree, and so no snapshot, holds them.
+# build, up and test_build (tj-iee6sn.8, tj-iee6sn.33) refuse unless each generated tree's content
+# stamp, gen/proto/<kind>.digest, equals the digest the BAKED trusted proto_digest.sh computes over the
+# repository root. The ROOT checkout gets one generated TypeScript file, one .proto, the two ts inputs
+# (buf.yaml, web/buf.gen.yaml), the REAL tools/proto_digest.sh (so its trusted copy is the real script
+# too) and both stamps, written by that real script. The .proto is made an hour NEWER than every
+# generated file, so every rig call that passes the guard also shows that mtime no longer matters
+# (the mtime guard this replaces would refuse it). Only the root checkout: no worktree, and so no
+# snapshot, holds them.
 DEV_BUILD_ROOT_FILES = {
     'gen/proto/ts/trader_joe/proto/ping/v1/ping_pb.ts': 'export {};\n',
     'proto/trader_joe/proto/ping/v1/ping.proto': 'syntax = "proto3";\n',
+    'buf.yaml': 'version: v2\nmodules:\n  - path: proto\n',
+    'web/buf.gen.yaml': 'version: v2\nclean: true\nplugins:\n  - local: protoc-gen-es\n    out: ../gen/proto/ts\n',
 }
-DEV_BUILD_PROTO_AGE_SECONDS = 3600
+DEV_BUILD_PROTO_FUTURE_SECONDS = 3600
+REAL_PROTO_DIGEST = REPO_ROOT / 'tools' / 'proto_digest.sh'
+TRUSTED_PROTO_DIGEST_SCRIPT = '/opt/agent_mcp/compose/tools/proto_digest.sh'
+# Taken at import, before any test patches subprocess.run: the one real process a rig may start.
+_REAL_SUBPROCESS_RUN = subprocess.run
 # The TRUSTED directory a rig's build compares the checkout with (S6), in place of the image's
 # /opt/agent_mcp/compose, which no test machine has. make_layout writes every stack.DEV_TRUSTED_COPIES
 # file into BOTH it and the root checkout, identical, so a sample call passes the stale-copy check.
@@ -235,15 +246,38 @@ def is_dev_digest(step: stack.Step) -> bool:
     return list(step.argv[:2]) == ['/usr/bin/bash', TRUSTED_SOURCE_DIGEST_SCRIPT]
 
 
+def run_proto_digest(script: Path, repo: Path, kind: str) -> subprocess.CompletedProcess:
+    """Run SCRIPT as the guard does (bash, --context REPO, KIND), for real, whatever a test has patched."""
+    return _REAL_SUBPROCESS_RUN(  # nosec B603 -- the repository's own script, argument list, no shell
+        ['/usr/bin/bash', str(script), '--context', str(repo), kind],
+        cwd='/',
+        env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'},
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+
+
+def write_generation_stamps(repo: Path, script: Path = REAL_PROTO_DIGEST) -> None:
+    """Write gen/proto/<kind>.digest for both kinds, as make proto / gen-proto-ts do: the script's stdout."""
+    for relative in stack.DEV_GENERATED_DIRS:
+        done = run_proto_digest(script, repo, relative.rsplit('/', 1)[-1])
+        assert done.returncode == 0, done.stderr
+        (repo / f'{relative}.digest').write_bytes(done.stdout)
+
+
 def write_dev_build_fixtures(root: Path, repo: Path) -> Path:
-    """The generated-code files and the identical trusted copies build needs; returns the trusted directory."""
+    """The generated-code files, their stamps and the identical trusted copies build needs; returns the trusted directory."""
     for relative, text in DEV_BUILD_ROOT_FILES.items():
         target = repo / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text)
+    (repo / 'tools').mkdir(exist_ok=True)
+    shutil.copy2(REAL_PROTO_DIGEST, repo / 'tools' / 'proto_digest.sh')
+    write_generation_stamps(repo)
     proto = repo / 'proto/trader_joe/proto/ping/v1/ping.proto'
-    old = time.time() - DEV_BUILD_PROTO_AGE_SECONDS
-    os.utime(proto, (old, old))
+    newer = time.time() + DEV_BUILD_PROTO_FUTURE_SECONDS
+    os.utime(proto, (newer, newer))
     trusted = root / TRUSTED_DIR_NAME
     for checkout_name, baked_name in stack.DEV_TRUSTED_COPIES:
         source = repo / checkout_name
@@ -549,10 +583,17 @@ def dev_step_prefix_length() -> int:
     return len(stack.dev_compose_prefix())
 
 
-def forbid_real_subprocesses(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Any real subprocess from the server under test fails the test: the fakes must see everything."""
+def forbid_real_subprocesses(monkeypatch: pytest.MonkeyPatch, allowed: Sequence[Sequence[str]] = ()) -> None:
+    """Any real subprocess from the server under test fails the test: the fakes must see everything.
 
-    def refuse(*args: Any, **kwargs: Any) -> None:
+    ALLOWED names whole argv lists that may still run for real (subprocess.run only), word for word: a
+    rig allows the guard's two proto digests over its own trusted copy (tj-iee6sn.33) and nothing else.
+    """
+    permitted = {tuple(argv) for argv in allowed}
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        if args and tuple(args[0]) in permitted:
+            return _REAL_SUBPROCESS_RUN(*args, **kwargs)  # nosec B603 -- an exact allowed argv list
         raise AssertionError(f'a real subprocess was started: {args!r}')
 
     async def refuse_async(*args: Any, **kwargs: Any) -> None:
@@ -590,7 +631,18 @@ def make_rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, docker: FakeDocker
         'check_trusted_copies_current',
         functools.partial(stack.check_trusted_copies_current, trusted_dir=layout.trusted_dir),
     )
-    forbid_real_subprocesses(monkeypatch)
+    # The REAL generated-code guard (tj-iee6sn.33), run with the layout's trusted proto_digest.sh in place
+    # of the image's; the two digest argvs over the root checkout are the only real processes allowed.
+    trusted_proto_digest = layout.trusted_dir / 'tools' / 'proto_digest.sh'
+    monkeypatch.setattr(
+        stack,
+        'check_generated_code_fresh',
+        functools.partial(stack.check_generated_code_fresh, trusted_script=trusted_proto_digest),
+    )
+    allowed = [
+        ('/usr/bin/bash', str(trusted_proto_digest), '--context', str(layout.repo), kind) for kind in ('python', 'ts')
+    ]
+    forbid_real_subprocesses(monkeypatch, allowed)
     fake_docker = docker or FakeDocker()
     return Rig(layout=layout, git=git, docker=fake_docker, agent=runner.AgentStack(layout.settings, run=fake_docker))
 

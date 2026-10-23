@@ -765,6 +765,8 @@ EXPECTED_DEV_BAKES = {
     'docker-compose.agent-client.yaml': f'{EXPECTED_TRUSTED_DIR}/docker-compose.agent-client.yaml',
     'tools/dev_instance_secret.sh': f'{EXPECTED_TRUSTED_DIR}/tools/dev_instance_secret.sh',
     'tools/source_digest.sh': f'{EXPECTED_TRUSTED_DIR}/tools/source_digest.sh',
+    # tj-iee6sn.33: the generated-code guard's content stamp, recomputed by the baked copy only.
+    'tools/proto_digest.sh': f'{EXPECTED_TRUSTED_DIR}/tools/proto_digest.sh',
 }
 
 

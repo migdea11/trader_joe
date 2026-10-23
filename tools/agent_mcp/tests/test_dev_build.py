@@ -499,6 +499,15 @@ def _python_a_file_not_a_dir(repo: Path) -> None:
     (repo / 'gen' / 'proto' / 'python').write_text('not a tree\n')
 
 
+# tj-iee6sn.33 (design tj-grna9p.164): the guard reads gen/proto/<kind>.digest and compares it with the
+# digest the BAKED trusted proto_digest.sh computes now. mtime is not consulted at all. The rig's stamps
+# were written by the real script (harness.write_generation_stamps), so every case below changes exactly
+# one thing. The unit pins of the guard itself are test_generated_code_stamp.py; these hold the verb.
+NO_STAMP = 'no generation stamp: {tree}.digest is missing, unreadable or not a regular file'
+NOT_CURRENT = 'generated code is not from the current protos: {tree}'
+PING_PROTO = 'proto/trader_joe/proto/ping/v1/ping.proto'
+
+
 def _python_older(repo: Path) -> None:
     _set_tree_mtime(repo / 'gen' / 'proto' / 'python', _now() - 7200)
 
@@ -507,15 +516,49 @@ def _ts_older(repo: Path) -> None:
     _set_tree_mtime(repo / 'gen' / 'proto' / 'ts', _now() - 7200)
 
 
-def _a_deep_proto_newer(repo: Path) -> None:
+def _no_python_stamp(repo: Path) -> None:
+    (repo / 'gen' / 'proto' / 'python.digest').unlink()
+
+
+def _no_ts_stamp(repo: Path) -> None:
+    (repo / 'gen' / 'proto' / 'ts.digest').unlink()
+
+
+def _ts_stamp_a_link_to_the_right_digest(repo: Path) -> None:
+    stamp = repo / 'gen' / 'proto' / 'ts.digest'
+    elsewhere = repo.parent / 'outside.digest'
+    elsewhere.write_bytes(stamp.read_bytes())
+    stamp.unlink()
+    stamp.symlink_to(elsewhere)
+
+
+def _a_proto_edited_mtime_kept(repo: Path) -> None:
+    """An edit that keeps the mtime: the case the mtime guard could not see."""
+    proto = repo / PING_PROTO
+    before = os.stat(proto)
+    proto.write_text('syntax = "proto3";\nmessage Edited {}\n')
+    os.utime(proto, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+
+def _a_nested_proto_added(repo: Path) -> None:
     deep = repo / 'proto' / 'trader_joe' / 'proto' / 'ui' / 'v1' / 'data.proto'
     deep.parent.mkdir(parents=True)
     deep.write_text('syntax = "proto3";\n')
-    os.utime(deep, (_now() + 3600, _now() + 3600))
+    os.utime(deep, (_now() - 86400, _now() - 86400))
 
 
-def _stale_ts_with_a_fresh_symlink(repo: Path, outside: Path) -> None:
-    _ts_older(repo)
+def _buf_gen_edited(repo: Path) -> None:
+    (repo / 'web' / 'buf.gen.yaml').write_text('version: v2\nplugins: []\n')
+
+
+def _a_buf_yaml_under_proto(repo: Path) -> None:
+    (repo / 'proto' / 'buf.yaml').write_text('version: v2\n')
+
+
+def _only_a_planted_link_in_ts(repo: Path) -> None:
+    shutil.rmtree(repo / 'gen' / 'proto' / 'ts')
+    (repo / 'gen' / 'proto' / 'ts').mkdir()
+    outside = repo.parent / 'outside.ts'
     outside.write_text('fresh\n')
     (repo / 'gen' / 'proto' / 'ts' / 'planted.ts').symlink_to(outside)
 
@@ -526,14 +569,18 @@ _STALE_GENERATED = {
     'gen/proto/python empty': (_empty_python, 'gen/proto/python is missing or empty'),
     'gen/proto/ts empty': (_empty_ts, 'gen/proto/ts is missing or empty'),
     'gen/proto/python a file': (_python_a_file_not_a_dir, 'gen/proto/python is missing or empty'),
-    'gen/proto/python older than the proto': (_python_older, 'gen/proto/python is older than the newest .proto file'),
-    'gen/proto/ts older than the proto': (_ts_older, 'gen/proto/ts is older than the newest .proto file'),
-    'a nested proto newer than both': (_a_deep_proto_newer, 'gen/proto/python is older than the newest .proto file'),
+    'gen/proto/ts only a planted link': (_only_a_planted_link_in_ts, 'gen/proto/ts is missing or empty'),
+    'python stamp missing': (_no_python_stamp, NO_STAMP.format(tree='gen/proto/python')),
+    'ts stamp missing': (_no_ts_stamp, NO_STAMP.format(tree='gen/proto/ts')),
+    'ts stamp a link to the right digest': (_ts_stamp_a_link_to_the_right_digest, NO_STAMP.format(tree='gen/proto/ts')),
+    'a proto edited, its mtime kept': (_a_proto_edited_mtime_kept, NOT_CURRENT.format(tree='gen/proto/python')),
+    'an older nested proto added': (_a_nested_proto_added, NOT_CURRENT.format(tree='gen/proto/python')),
+    'web/buf.gen.yaml edited (ts only)': (_buf_gen_edited, NOT_CURRENT.format(tree='gen/proto/ts')),
 }
 
 
 @pytest.mark.parametrize(('make_stale', 'reason'), list(_STALE_GENERATED.values()), ids=list(_STALE_GENERATED))
-def test_missing_or_old_generated_code_refuses_naming_the_fix_with_no_step_and_no_charge(
+def test_missing_or_unstamped_or_stale_generated_code_refuses_naming_the_fix_with_no_step_and_no_charge(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_stale, reason: str
 ):
     rig, _ = _rig(tmp_path, monkeypatch)
@@ -544,16 +591,15 @@ def test_missing_or_old_generated_code_refuses_naming_the_fix_with_no_step_and_n
     assert rig.docker.steps == [] and _charges_left(rig) == BUDGET
 
 
-def test_a_symlink_to_a_fresh_file_does_not_make_a_stale_tree_fresh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_a_digest_the_trusted_script_refuses_refuses_the_build(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A buf.yaml under proto/ makes the ts digest refuse (tj-grna9p.187); the verb refuses, naming the fix."""
     rig, _ = _rig(tmp_path, monkeypatch)
-    _stale_ts_with_a_fresh_symlink(rig.layout.repo, tmp_path / 'outside.ts')
+    _a_buf_yaml_under_proto(rig.layout.repo)
     result = _call(rig)
-    assert result['message'] == f'gen/proto/ts is older than the newest .proto file: {GENERATE_HINT}', result
-    assert rig.docker.steps == []
-
-
-def _no_proto_at_all(repo: Path) -> None:
-    shutil.rmtree(repo / 'proto')
+    assert result['status'] == 'refused', result
+    assert result['message'].startswith('the ts proto digest could not be computed (proto_digest.sh: refusing'), result
+    assert result['message'].endswith(f'): {GENERATE_HINT}'), result
+    assert rig.docker.steps == [] and _charges_left(rig) == BUDGET
 
 
 def _same_second(repo: Path) -> None:
@@ -562,9 +608,13 @@ def _same_second(repo: Path) -> None:
         _set_tree_mtime(repo / tree, when)
 
 
+def _a_proto_touched(repo: Path) -> None:
+    os.utime(repo / PING_PROTO, (_now() + 7200, _now() + 7200))
+
+
 def _a_newer_file_that_is_not_a_proto(repo: Path) -> None:
-    other = repo / 'proto' / 'buf.yaml'
-    other.write_text('version: v2\n')
+    other = repo / 'proto' / 'notes.md'
+    other.write_text('not an input\n')
     os.utime(other, (_now() + 3600, _now() + 3600))
 
 
@@ -575,21 +625,29 @@ def _only_a_nested_generated_file(repo: Path) -> None:
     nested.write_text('export {};\n')
 
 
-_FRESH_ENOUGH = {
-    'no proto at all': _no_proto_at_all,
+def _both_trees_older(repo: Path) -> None:
+    _python_older(repo)
+    _ts_older(repo)
+
+
+_CURRENT = {
+    'both trees older than the protos, content unchanged (the original bug)': _both_trees_older,
+    'gen/proto/python older': _python_older,
+    'gen/proto/ts older': _ts_older,
+    'a proto touched, content unchanged': _a_proto_touched,
     'generated in the same second': _same_second,
     'a newer non-proto file in proto/': _a_newer_file_that_is_not_a_proto,
     'one nested generated file': _only_a_nested_generated_file,
 }
 
 
-@pytest.mark.parametrize('make_fresh', list(_FRESH_ENOUGH.values()), ids=list(_FRESH_ENOUGH))
-def test_generated_code_no_older_than_the_protos_is_not_refused(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_fresh
+@pytest.mark.parametrize('make_current', list(_CURRENT.values()), ids=list(_CURRENT))
+def test_generated_code_whose_stamp_is_current_builds_whatever_the_mtimes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_current
 ):
-    """No false refusal in normal use: equal mtimes, no protos, unrelated files, a deep tree."""
+    """No false refusal: a stamp equal to the current digest passes, however old or new any file is."""
     rig, _ = _rig(tmp_path, monkeypatch)
-    make_fresh(rig.layout.repo)
+    make_current(rig.layout.repo)
     assert _call(rig)['status'] == 'ok'
 
 

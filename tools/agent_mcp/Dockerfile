@@ -119,7 +119,9 @@ COPY docker-compose.agent-client.yaml /opt/agent_mcp/compose/
 # from itself. They need sh, bash, awk, sed, sort, find, tr, mktemp, realpath and sha256sum, all of
 # which the Debian slim base provides (no package is installed for them). Same rebuild rule as the
 # compose files.
-COPY tools/dev_instance_secret.sh tools/source_digest.sh /opt/agent_mcp/compose/tools/
+# proto_digest.sh (tj-iee6sn.33) is the third: it recomputes the content stamp of gen/proto/<kind>, run
+# with --context over the repository mount, and needs only bash, find, sort, sha256sum and realpath.
+COPY tools/dev_instance_secret.sh tools/source_digest.sh tools/proto_digest.sh /opt/agent_mcp/compose/tools/
 
 ENV PATH="/opt/agent_mcp/.venv/bin:${PATH}" \
     PYTHONPATH=/opt/agent_mcp \
