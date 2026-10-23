@@ -13,6 +13,17 @@ from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, U
 from common.errors.vocabulary import InvalidRequestError, Reason
 from common.logging import get_logger
 from common.sensitive import REDACTED
+from data.store.app.client_label import OPERATOR_PRINCIPAL
+from data.store.app.database.crud.dataset_override import (
+    AuditUnavailable,
+    OperatorOverrideInput,
+    append_deletion,
+    append_override,
+    audit_tables_exist,
+    overriding_reason,
+)
+from data.store.app.database.models.dataset_deletion import DatasetDeletion
+from data.store.app.database.models.dataset_override_log import OverrideAction
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.database.transaction import write_transaction
@@ -629,21 +640,126 @@ async def search_entries(
     ]
 
 
-async def delete_entry_by_id(db: AsyncSession, id: uuid.UUID, owner: str) -> None:
-    """Delete an entry by its ID.
+async def _delete_entry_row(db: AsyncSession, id: uuid.UUID) -> None:
+    """Delete the entry row, and with it its bars, inside the caller's transaction.
 
     Cascades to its bars via ON DELETE CASCADE on the bar's dataset_id foreign key (T3: every bar
     belongs to exactly one entry now), so the database removes exactly this entry's bars and
     nothing else. There is no membership sweep, no RETURNING capture and no IN-list here anymore
     -- that removes the ~65,000-bar IN-list ceiling (D1) structurally rather than by code.
+
+    Raises:
+        EntryNotFound: If the row is gone by the time the statement runs.
     """
+    stmt = delete(StoreDatasetEntry).where(StoreDatasetEntry.id == id)
+    result = await db.execute(stmt)
+    if result.rowcount == 0:
+        # Raced with a concurrent delete between the SELECT before and this statement. The
+        # rollback for this path comes from write_transaction, the same as every other error
+        # path here (tj-ck5spw).
+        raise EntryNotFound(id)
+
+
+async def delete_entry_by_id(db: AsyncSession, id: uuid.UUID, owner: str) -> None:
+    """Delete an entry by its ID, as its declared owner. Its bars go with it (see _delete_entry_row)."""
     async with write_transaction(db, f'delete entry {id}'):
         existing = await _get_entry_or_raise(db, id)
         _check_owner(existing, owner)
-        stmt = delete(StoreDatasetEntry).where(StoreDatasetEntry.id == id)
-        result = await db.execute(stmt)
-        if result.rowcount == 0:
-            # Raced with a concurrent delete between the SELECT above and this statement. The
-            # rollback for this path comes from write_transaction, the same as every other error
-            # path here (tj-ck5spw).
-            raise EntryNotFound(id)
+        await _delete_entry_row(db, id)
+
+
+# THE OPERATOR PATH (tj-grna9p.86). The two functions below are the /ui/v1 writes. They do NOT go through
+# _check_owner and so cannot be reached by an owner-scoped caller by accident: the operator may act on any
+# dataset, but on another owner's only with a confirmed override carrying a reason, which is recorded in the
+# same transaction as the write (overriding_reason decides; the override log holds the row).
+
+
+async def operator_set_expiry(
+    db: AsyncSession, id: uuid.UUID, expiry: 'datetime | None', override: OperatorOverrideInput | None
+) -> None:
+    """Set or clear a dataset's expiry as the operator, recording an override when the dataset is another owner's.
+
+    On a DAILY or STREAM dataset a stored expiry retires it and clearing one resumes it; the expiry TYPE is
+    never touched. The write and its override-log row are one transaction. The caller publishes the change
+    event after this returns.
+
+    Args:
+        db: The session.
+        id: The dataset's id.
+        expiry: The new expiry, aware; None clears it.
+        override: The override the request carried, if any.
+
+    Raises:
+        EntryNotFound: NOT_FOUND, no such dataset. Checked before the override.
+        OverrideRequired: OVERRIDE_REQUIRED, another owner's dataset without a valid override.
+        AuditUnavailable: DATABASE_UNAVAILABLE, the audit tables are missing. Checked after the override and
+            before any write.
+    """
+    recording = await audit_tables_exist(db)
+    async with write_transaction(db, f'operator set expiry {id}'):
+        existing = await _get_entry_or_raise(db, id)
+        reason = overriding_reason(existing.owner, OPERATOR_PRINCIPAL, override)
+        if reason is not None and not recording:
+            raise AuditUnavailable
+        stmt = update(StoreDatasetEntry).where(StoreDatasetEntry.id == id).values(expiry=expiry, updated_at=func.now())
+        await db.execute(stmt)
+        if reason is not None:
+            await append_override(
+                db,
+                actor=OPERATOR_PRINCIPAL,
+                dataset_id=id,
+                owner=existing.owner,
+                action=OverrideAction.SET_EXPIRY,
+                reason=reason,
+            )
+
+
+async def operator_delete_entry(db: AsyncSession, id: uuid.UUID, override: OperatorOverrideInput | None) -> None:
+    """Delete a dataset and its bars as the operator, writing the deletion record and any override row with it.
+
+    One transaction: the delete, the deletion record, and, on another owner's dataset, the override-log row.
+    The caller publishes the change event after this returns.
+
+    Args:
+        db: The session.
+        id: The dataset's id.
+        override: The override the request carried, if any.
+
+    Raises:
+        EntryNotFound: NOT_FOUND, no such dataset. Checked before the override.
+        OverrideRequired: OVERRIDE_REQUIRED, another owner's dataset without a valid override.
+        AuditUnavailable: DATABASE_UNAVAILABLE, the audit tables are missing. Checked after the override and
+            before any write.
+    """
+    recording = await audit_tables_exist(db)
+    async with write_transaction(db, f'operator delete entry {id}'):
+        existing = await _get_entry_or_raise(db, id)
+        reason = overriding_reason(existing.owner, OPERATOR_PRINCIPAL, override)
+        if not recording:
+            raise AuditUnavailable
+        count = select(func.count(StockMarketActivity.id)).where(StockMarketActivity.dataset_id == id)
+        bars = (await db.execute(count)).scalar_one()
+        await _delete_entry_row(db, id)
+        await append_deletion(
+            db,
+            dataset_id=id,
+            owner=existing.owner,
+            asset_symbol=existing.asset_symbol,
+            source=existing.source.name,
+            granularity=existing.granularity.name,
+            update_type=UpdateType(existing.update_type).name,
+            range_start=existing.start,
+            range_end=None if existing.end == NullableDateTime.EPOCH else existing.end,
+            bars_deleted=bars,
+            cause=DatasetDeletion.CAUSE_OPERATOR,
+            actor=OPERATOR_PRINCIPAL,
+        )
+        if reason is not None:
+            await append_override(
+                db,
+                actor=OPERATOR_PRINCIPAL,
+                dataset_id=id,
+                owner=existing.owner,
+                action=OverrideAction.DELETE,
+                reason=reason,
+            )

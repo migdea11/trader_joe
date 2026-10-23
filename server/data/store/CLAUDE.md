@@ -1,6 +1,6 @@
 # Market data store
 
-Owner of all persisted market data. Requests data from data-ingest over gRPC (`FetchDataset`), writes it to Postgres, and serves it over `/store/...`, `/internal/asset-data/...` and, to the web UI, the read-only `/ui/v1/...` routes as protobuf canonical JSON. Tables: `store_dataset_entry`, `stock_market_activity`, `ingest_run`, `dataset_read`, `dataset_read_daily`.
+Owner of all persisted market data. Requests data from data-ingest over gRPC (`FetchDataset`), writes it to Postgres, and serves it over `/store/...`, `/internal/asset-data/...` and, to the web UI, the read-only `/ui/v1/...` routes as protobuf canonical JSON. Tables: `store_dataset_entry`, `stock_market_activity`, `ingest_run`, `dataset_read`, `dataset_read_daily`, `dataset_override_log`, `dataset_deletion`.
 
 ## Architecture reference
 
@@ -99,6 +99,23 @@ Every bar read is recorded as one `dataset_read` row by the usage recorder (`app
 - **Best effort.** A failed flush is logged by type and retried from the buffer; the buffer is bounded and drops its oldest past `USAGE_BUFFER_MAX`. On an unmigrated database one warning names `make migrate` and the rows are dropped.
 - **`client_id` is a `SensitiveString`**: never logged, never in a repr.
 - **`dataset_read_daily.last_read_at`** keeps the latest read of a folded day, so staleness stays exact after the rows are gone.
+
+## Operator writes (expiry and delete)
+
+`PATCH /ui/v1/datasets/{id}/expiry` (200, the updated `DatasetSummary`) and `DELETE /ui/v1/datasets/{id}` (204) are the UI's writes, in `routers/data_store/ui_dataset_writes.py`. Both need the instance secret; bodies are `SetExpiryRequest` / `DeleteDatasetRequest` parsed by `ProtoBody`, with no pydantic model.
+
+| Concern | Where it lives |
+|---|---|
+| The operator-path writes (`operator_set_expiry`, `operator_delete_entry`), beside the owner-scoped ones, which are unchanged | `app/database/crud/stock/store_dataset_entry.py` |
+| The override decision, `OverrideRequired`, the INSERTs of the two logs | `app/database/crud/dataset_override.py` |
+| Tables (no foreign key), migration `d7e2a9c35b18` | `app/database/models/dataset_override_log.py`, `dataset_deletion.py` |
+
+- **Rule order**: 422 bad body, 404 unknown id, 409 `OVERRIDE_REQUIRED` (owner is not `OPERATOR_PRINCIPAL` and the override is missing, unconfirmed or blank; no owner in the body), then the write. An override sent for the operator's own dataset is ignored.
+- **One transaction per write**: the write, its `dataset_deletion` row (every delete) and its `dataset_override_log` row (only an override, reason stored trimmed). The `DatasetChanged` event (`UPDATED` after a PATCH, `DELETED` after a DELETE) is published after the commit.
+- **Both tables are append-only**: never an UPDATE or DELETE. `dataset_deletion.cause` is a string so the reaper (tj-grna9p.23) reuses the table.
+- **Setting an expiry on a `DAILY`/`STREAM` dataset retires it, clearing it resumes it**; the expiry type is never writable. The expiry is stored as sent: a past time retires it as the freshness read already judges it.
+- **An unmigrated database** refuses the audited writes: an overriding PATCH and every DELETE answer 503 `DATABASE_UNAVAILABLE` (detail names `make migrate`; no owner, no metadata) after the 404/409 checks and before any write; an operator-owned PATCH still goes through. One process-wide warning names `make migrate` (`audit_tables_exist`, `AuditUnavailable`).
+- **A DELETE may carry no body** (the operator's own dataset needs no override); a body that is sent is parsed strictly.
 
 ## Environment variables
 

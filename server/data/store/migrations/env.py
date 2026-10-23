@@ -51,6 +51,8 @@ if config.config_file_name is not None:
 # carrying on would migrate/autogenerate against a partial schema.
 ALLOWED_MODELS = {
     'base_market_activity',
+    'dataset_deletion',
+    'dataset_override_log',
     'dataset_read',
     'dataset_read_daily',
     'ingest_run',

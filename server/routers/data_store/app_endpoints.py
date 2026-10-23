@@ -40,6 +40,13 @@ class UiDatasetsInterface(StrEnum):
     GET_UI_DATASET_COVERAGE = '/ui/v1/datasets/{dataset_id}/coverage'
 
 
+class UiDatasetWritesInterface(StrEnum):
+    """The /ui/v1 expiry and delete writes (tj-grna9p.86). They take the instance secret."""
+
+    PATCH_UI_DATASET_EXPIRY = '/ui/v1/datasets/{dataset_id}/expiry'
+    DELETE_UI_DATASET = '/ui/v1/datasets/{dataset_id}'
+
+
 class UiConfigInterface(StrEnum):
     """The shell's configuration read (tj-grna9p.45). Served as protobuf canonical JSON."""
 

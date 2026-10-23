@@ -9,6 +9,7 @@ from sqlalchemy.exc import InvalidRequestError
 from starlette.routing import NoMatchFound
 
 from common.database.postgres_tools import PostgresSessionFactory
+from common.enums.data_stock import DataSource, Granularity, UpdateType
 from data.store.app.app_depends import get_ingest_fetch_client
 from data.store.app.database.database import async_db
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
@@ -104,6 +105,9 @@ GUARDED_ADDRESSES = frozenset(
         'POST /internal/asset-data/{asset_type}/{data_type}',
         'POST /store/{asset_type}/{data_type}/{asset_symbol}',
         'DELETE /store/{id}',
+        # The UI's operator writes (tj-grna9p.86).
+        'PATCH /ui/v1/datasets/{dataset_id}/expiry',
+        'DELETE /ui/v1/datasets/{dataset_id}',
     }
 )
 
@@ -342,6 +346,26 @@ CASES: dict[str, Case] = {
         malformed_field='buckets',
         reads_one_row=True,
     ),
+    # tj-grna9p.86, the operator writes. The fake's one row belongs to DELETE_OWNER, not the operator, so the
+    # well-formed body carries a confirmed override. The PATCH writes, then re-reads the summary through
+    # dataset_detail, which over the empty fake table finds nothing: the handler's 404 NOT_FOUND, after the
+    # write. The malformed halves corrupt the path id and keep the body valid, so the 422 names one field.
+    # Their real rows are test_ui_dataset_writes_route.py's subject, over SQLite, and the system suite's.
+    'PATCH /ui/v1/datasets/{dataset_id}/expiry': Case(
+        path_params={'dataset_id': str(DELETE_ID)},
+        request={'json': {'expiry': '2027-01-01T00:00:00Z', 'override': {'reason': 'smoke', 'confirmed': True}}},
+        malformed_path_params={'dataset_id': 'not-a-uuid'},
+        malformed_request={'json': {}},
+        malformed_field='dataset_id',
+        reads_one_row=True,
+    ),
+    'DELETE /ui/v1/datasets/{dataset_id}': Case(
+        path_params={'dataset_id': str(DELETE_ID)},
+        request={'json': {'override': {'reason': 'smoke', 'confirmed': True}}},
+        malformed_path_params={'dataset_id': 'not-a-uuid'},
+        malformed_request={},
+        malformed_field='dataset_id',
+    ),
 }
 
 
@@ -380,11 +404,27 @@ class FakeResult:
     def first(self) -> None:
         return None
 
+    def one(self) -> tuple[bool, bool]:
+        # Its only reader is audit_tables_exist (tj-grna9p.86), asking whether both audit tables exist. THEY DO:
+        # this file's well-formed request is one a migrated database answers. An unmigrated database REFUSES both
+        # operator writes with 503 DATABASE_UNAVAILABLE (the architect's 2026-10-14 ruling), and a 503 here would
+        # read as "the handler failed", which is not what reachability means. The refusal is pinned in
+        # test_ui_dataset_writes_route.py; this file only proves the routes are mounted and their handlers run.
+        return (True, True)
+
     def scalar_one_or_none(self) -> StoreDatasetEntry:
-        # Only id and owner are set: those are the two attributes _check_owner and the DELETE
-        # statement read, and inventing values for the other eight identity columns would suggest
-        # this file asserts something about them. It does not -- content is tj-19qp1q's tier.
-        return StoreDatasetEntry(id=DELETE_ID, owner=DELETE_OWNER)
+        # id and owner are the two attributes _check_owner and the DELETE statement read. The operator
+        # DELETE (tj-grna9p.86) also copies the entry's descriptive columns into its deletion row, so
+        # source, granularity and update_type are set to ANY valid member: the insert goes to the fake
+        # session, and nothing here asserts what it held -- content is tj-19qp1q's tier, and the
+        # deletion row's is test_ui_dataset_writes_route.py's.
+        return StoreDatasetEntry(
+            id=DELETE_ID,
+            owner=DELETE_OWNER,
+            source=DataSource.ALPACA_API,
+            granularity=Granularity.ONE_DAY,
+            update_type=UpdateType.STATIC,
+        )
 
 
 class FakeSession:

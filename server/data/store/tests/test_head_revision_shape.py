@@ -79,6 +79,10 @@ INGEST_RUN_FILE = f'{INGEST_RUN_REVISION}_ingest_run.py'
 # test_dataset_read_revision.py.
 DATASET_READ_REVISION = 'b3d9e1a47c62'
 DATASET_READ_FILE = f'{DATASET_READ_REVISION}_dataset_read.py'
+# THE HEAD SINCE tj-grna9p.86: dataset_override_log and dataset_deletion, PURELY ADDITIVE and directly on the
+# dataset_read revision. Its own shape is pinned in test_override_log_revision.py.
+OVERRIDE_LOG_REVISION = 'd7e2a9c35b18'
+OVERRIDE_LOG_FILE = f'{OVERRIDE_LOG_REVISION}_dataset_override_log_and_deletion.py'
 # The parent the epic's design names for its one revision (tj-vhboky.12 item 1).
 PARENT_REVISION = '8f41c2d7a3b9'
 PARENT_FILE = f'{PARENT_REVISION}_bar_natural_key_and_upsert.py'
@@ -233,12 +237,20 @@ def test_each_revision_of_the_two_epics_sits_directly_on_the_one_before_it():
     # A THIRD ONE-REVISION PROMISE since tj-grna9p.18, and it went red the correct way when it landed:
     # the head is the ingest_run revision, directly on the feed revision, and the chain below is the
     # same as before. A fourth revision slipped in between would still re-point one of these hops.
-    # A FOURTH since tj-grna9p.46: the head is the dataset_read revision, directly on ingest_run.
-    assert head_revision.module.__file__.endswith(DATASET_READ_FILE), (
-        f'the head is not {DATASET_READ_FILE}: {head_revision.module.__file__}'
+    # A FOURTH since tj-grna9p.46: the dataset_read revision, directly on ingest_run.
+    # A FIFTH since tj-grna9p.86: the head is the override-log revision, directly on dataset_read.
+    assert head_revision.module.__file__.endswith(OVERRIDE_LOG_FILE), (
+        f'the head is not {OVERRIDE_LOG_FILE}: {head_revision.module.__file__}'
     )
-    assert head_revision.down_revision == INGEST_RUN_REVISION, (
-        f'the head does not sit directly on {INGEST_RUN_REVISION}: {head_revision.down_revision}'
+    assert head_revision.down_revision == DATASET_READ_REVISION, (
+        f'the head does not sit directly on {DATASET_READ_REVISION}: {head_revision.down_revision}'
+    )
+    dataset_read_revision = script.get_revision(DATASET_READ_REVISION)
+    assert dataset_read_revision.module.__file__.endswith(DATASET_READ_FILE), (
+        f'{DATASET_READ_REVISION} is not {DATASET_READ_FILE}'
+    )
+    assert dataset_read_revision.down_revision == INGEST_RUN_REVISION, (
+        f'{DATASET_READ_REVISION} does not sit directly on {INGEST_RUN_REVISION}: {dataset_read_revision.down_revision}'
     )
     ingest_run_revision = script.get_revision(INGEST_RUN_REVISION)
     assert ingest_run_revision.module.__file__.endswith(INGEST_RUN_FILE), (

@@ -202,9 +202,10 @@ def _daily(db: ScratchDb) -> dict[tuple[uuid.UUID, str, date], dict[str, Any]]:
 # The migration.
 
 
-def test_the_revision_is_the_head_and_sits_on_ingest_run():
+def test_the_revision_is_below_the_head_and_sits_on_ingest_run():
+    # Was "is the head" until tj-grna9p.86 put d7e2a9c35b18 on it; the head's own pin is test_head_revision_shape.py.
     script = ScriptDirectory(str(MIGRATIONS_DIR))
-    assert _head() == DATASET_READ_REVISION
+    assert DATASET_READ_REVISION in {revision.revision for revision in script.walk_revisions('base', _head())}
     assert script.get_revision(DATASET_READ_REVISION).down_revision == PARENT_REVISION
 
 

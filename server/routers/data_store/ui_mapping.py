@@ -14,12 +14,15 @@ carry (ExpiryType, DatasetState, FreshnessStatus) are looked up by their own pre
 """
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
+
+from fastapi import Request
 
 from common.enums.data_stock import ExpiryType, Granularity
 from common.rpc.mapping.fetch_dataset import bar_to_proto
 from common.rpc.mapping.values import ASSET_TYPE, DATA_SOURCE, DATA_TYPE, FEED, GRANULARITY, UPDATE_TYPE, to_timestamp
+from data.store.app.database.crud.dataset_override import OperatorOverrideInput
 from data.store.app.database.crud.ingest_run import IngestRunRecord
 from data.store.app.database.crud.stock.dataset_catalog import BarExtent
 from data.store.app.database.models.ingest_run import IngestRunState
@@ -37,6 +40,7 @@ from data.store.app.dataset_catalog import (
 )
 from data.store.app.events import DatasetChanged, DomainEvent, IngestRunChanged, ReaperPendingChanged, RequestChanged
 from data.store.app.ui_config import UiConfigView
+from routers.common.proto_json import ProtoBody
 from schemas.data_ingest import fetch_dataset as domain
 from trader_joe.proto.ui.v1 import data_pb2, events_pb2, shell_pb2, stats_pb2  # noqa: TID251
 
@@ -52,6 +56,9 @@ IngestRunPageMessage = data_pb2.IngestRunPage
 CoverageStripMessage = stats_pb2.CoverageStrip
 UiEventMessage = events_pb2.UiEvent
 UiConfigMessage = shell_pb2.UiConfig
+# The request bodies of the expiry and delete writes (tj-grna9p.86); parsed by ProtoBody, never by a pydantic model.
+SetExpiryRequestMessage = data_pb2.SetExpiryRequest
+DeleteDatasetRequestMessage = data_pb2.DeleteDatasetRequest
 
 
 def _enum_value(enum_type: Any, prefix: str, member: Any) -> int:
@@ -360,3 +367,55 @@ __all__ = [
     'ui_config_message',
     'ui_event_message',
 ]
+
+
+def _override_input(request: Any) -> OperatorOverrideInput | None:
+    """The override a write body carried, as plain values; None when the body has none."""
+    if not request.HasField('override'):
+        return None
+    return OperatorOverrideInput(reason=request.override.reason, confirmed=request.override.confirmed)
+
+
+def set_expiry_values(request: data_pb2.SetExpiryRequest) -> tuple[datetime | None, OperatorOverrideInput | None]:
+    """A SetExpiryRequest as plain values: the new expiry (None clears it) and the override, if sent.
+
+    Args:
+        request: The parsed body.
+
+    Returns:
+        tuple[datetime | None, OperatorOverrideInput | None]: The aware UTC expiry and the override.
+    """
+    expiry = request.expiry.ToDatetime(tzinfo=UTC) if request.HasField('expiry') else None
+    return expiry, _override_input(request)
+
+
+def delete_values(request: data_pb2.DeleteDatasetRequest) -> OperatorOverrideInput | None:
+    """A DeleteDatasetRequest's override as plain values; None when the body has none.
+
+    Args:
+        request: The parsed body.
+
+    Returns:
+        OperatorOverrideInput | None: The override.
+    """
+    return _override_input(request)
+
+
+_parse_delete_body = ProtoBody(DeleteDatasetRequestMessage)
+
+
+async def delete_request_body(request: Request) -> data_pb2.DeleteDatasetRequest:
+    """The body of a dataset delete: ProtoBody's parse, except that no body at all is an empty request.
+
+    A DELETE of the operator's own dataset needs no override, so a client may send no body. Anything sent is
+    parsed strictly: an unknown field or a body that is not a JSON object is still a 422.
+
+    Args:
+        request: The request.
+
+    Returns:
+        data_pb2.DeleteDatasetRequest: The parsed body, or an empty message.
+    """
+    if not (await request.body()).strip():
+        return DeleteDatasetRequestMessage()
+    return await _parse_delete_body(request)
