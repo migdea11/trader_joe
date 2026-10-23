@@ -1020,8 +1020,8 @@ async def dataset_coverage(
     try:
         calendar = calendar_for_source(row.source)
         covered = (await repo.covered_dates(db, [row], str(calendar.tz)))[row.id]
-        strip = compute_coverage_buckets(row.start, end, covered, calendar, now, buckets)
-        intervals = gap_intervals(row.start, end, covered, calendar, now)
+        strip = compute_coverage_buckets(row.start, end, covered, calendar, now, buckets, row.granularity)
+        intervals = gap_intervals(row.start, end, covered, calendar, now, row.granularity)
     except (UnknownCalendarError, CalendarRangeError):
         raise InvalidRequestError(
             Reason.INVALID_REQUEST, 'No trading calendar covers this dataset, so its coverage cannot be computed.'

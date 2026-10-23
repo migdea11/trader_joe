@@ -2167,3 +2167,135 @@ async def test_the_index_fetches_one_row_per_page_never_one_per_bar(client, engi
 
     assert fetched == [len(body['pages'])] == [pages], fetched
     assert pages == count // 1000 + (count % 1000 > 0)
+
+
+# ------------------------------------------------------------------------------------------------- 1week and 1month
+#
+# tj-grna9p.151 (decision tj-grna9p.8, addendum of 2026-10-20): a 1week or 1month dataset is judged BY PERIOD, and
+# the catalog callers pass row.granularity (dataset_catalog.py evaluate_views and dataset_coverage). The pure rules
+# are pinned in test_freshness_periods.py; this drives them end to end through the list, the detail and the coverage
+# strip. Under the per-session rule every case below reads otherwise (the weekly one as 35 missing sessions).
+#
+# NOW is Tue 6 Oct 2026 22:00Z: the week of 28 Sep has ended (Fri 2 Oct), the week of 5 Oct has not.
+
+WEEKLY_BARS = [date(2026, 8, day) for day in (3, 10, 17, 24, 31)] + [
+    # Labor Day week: the vendor stamps the first session, Tuesday 8 Sep.
+    date(2026, 9, 8),
+    date(2026, 9, 14),
+    date(2026, 9, 21),
+    date(2026, 9, 28),
+]
+
+
+def weekly_static(bars: list[date]) -> tuple[StoreDatasetEntry, list]:
+    dataset = entry('WKLY', granularity=Granularity.ONE_WEEK, start=midnight(date(2026, 8, 3)), end=ny_midnight(5))
+    return dataset, daily_bars(dataset, bars)
+
+
+@pytest.mark.asyncio
+async def test_a_complete_weekly_dataset_reads_complete_with_no_gap_windows(client, engine, covered_dates_as_dates):
+    dataset, bars = weekly_static(WEEKLY_BARS)
+    await store(engine, dataset, *bars)
+
+    detail = (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['freshness']
+    assert detail['status'] == 'FRESHNESS_STATUS_COMPLETE' and 'gapCount' not in detail, detail
+    listed = {item['id']: item for item in await list_all(client)}
+    assert status_of(listed[str(dataset.id)]) == 'FRESHNESS_STATUS_COMPLETE'
+    strip = await coverage(client, dataset)
+    assert (strip.gaps, strip.gap_count, strip.missing) == ([], 0, 0), strip
+    # Buckets still count SESSIONS: Mon 3 Aug to Fri 2 Oct, 44 of them (Labor Day is not one).
+    assert strip.expected == 44 == len(XNYS.sessions_overlapping(dataset.start, dataset.end))
+    assert_tiles(strip)
+
+
+@pytest.mark.asyncio
+async def test_a_weekly_dataset_missing_a_week_reads_its_five_sessions_in_one_window(
+    client, engine, covered_dates_as_dates
+):
+    dataset, bars = weekly_static([day for day in WEEKLY_BARS if day != date(2026, 8, 31)])
+    await store(engine, dataset, *bars)
+
+    detail = (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['freshness']
+    assert (detail['status'], detail['gapCount']) == ('FRESHNESS_STATUS_GAPS', 5)
+    strip = await coverage(client, dataset)
+    assert strip.gaps == [window(date(2026, 8, 31), date(2026, 9, 4))] and strip.gaps[0][2] == 5, strip.gaps
+    assert (strip.gap_count, strip.missing, strip.expected) == (1, 5, 44)
+
+
+@pytest.mark.asyncio
+async def test_a_complete_monthly_dataset_reads_complete(client, engine, covered_dates_as_dates):
+    """Bars on each 1st, Jan to Sep 2026, whatever the weekday (1 Jan is a holiday, 1 Feb and 1 Mar are Sundays)."""
+    dataset = entry('MNTH', granularity=Granularity.ONE_MONTH, start=ny_midnight(1, 1), end=ny_midnight(1, 10))
+    await store(engine, dataset, *daily_bars(dataset, [date(2026, month, 1) for month in range(1, 10)]))
+
+    detail = (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['freshness']
+    assert detail['status'] == 'FRESHNESS_STATUS_COMPLETE', detail
+    strip = await coverage(client, dataset)
+    assert (strip.gaps, strip.gap_count, strip.missing) == ([], 0, 0), strip
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('last', 'status'),
+    [(date(2026, 9, 28), 'FRESHNESS_STATUS_FRESH'), (date(2026, 9, 21), 'FRESHNESS_STATUS_OVERDUE')],
+    ids=['last ended week stored', 'a week behind'],
+)
+async def test_a_weekly_subscription_reads_by_its_last_ended_week(client, engine, last, status):
+    """The week of 28 Sep ended Fri 2 Oct; its deadline was Monday 5 Oct's open.
+
+    That week's local midnight (04:00Z, EDT) is the wire's expected_last_bar.
+    """
+    dataset = entry('WSUB', granularity=Granularity.ONE_WEEK, update_type=UpdateType.DAILY, start=ny_midnight(7, 9))
+    await store(engine, dataset, *daily_bars(dataset, [day for day in WEEKLY_BARS[5:] if day <= last]))
+
+    for freshness in (
+        (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['freshness'],
+        {item['id']: item for item in await list_all(client)}[str(dataset.id)]['freshness'],
+    ):
+        assert (freshness['status'], freshness['expectedLastBar']) == (status, '2026-09-28T04:00:00Z'), freshness
+
+
+# tj-grna9p.156 (the clarification on decision tj-grna9p.8 of 2026-10-20): over a range ending mid-period, the week that
+# straddles the end is expected, but only its sessions inside [start, end) are counted. The list, the detail and the
+# coverage strip read the same count. [Mon 3 Aug, Thu 1 Oct): the week of 28 Sep has three sessions in range (28, 29,
+# 30 Sep); 1 and 2 Oct are outside. Before the fix the list and the detail read 5 here and the strip's buckets 3.
+MID_WEEK_END = ny_midnight(1)
+MID_WEEK_CASES = {
+    'the straddling week missing': (date(2026, 9, 28), date(2026, 9, 28), date(2026, 9, 30), 3),
+    'an interior week missing': (date(2026, 8, 31), date(2026, 8, 31), date(2026, 9, 4), 5),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('dropped', 'first', 'last', 'count'), MID_WEEK_CASES.values(), ids=MID_WEEK_CASES)
+async def test_a_weekly_dataset_ending_mid_week_reads_one_count_on_list_detail_and_strip(
+    client, engine, covered_dates_as_dates, dropped, first, last, count
+):
+    dataset = entry('WKMD', granularity=Granularity.ONE_WEEK, start=midnight(date(2026, 8, 3)), end=MID_WEEK_END)
+    await store(engine, dataset, *daily_bars(dataset, [day for day in WEEKLY_BARS if day != dropped]))
+
+    detail = (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['freshness']
+    listed = {item['id']: item for item in await list_all(client)}[str(dataset.id)]['freshness']
+    for freshness in (detail, listed):
+        assert (freshness['status'], freshness['gapCount']) == ('FRESHNESS_STATUS_GAPS', count), freshness
+    strip = await coverage(client, dataset)
+    assert strip.gaps == [window(first, last)] and strip.gaps[0][2] == count, strip.gaps
+    assert (strip.gap_count, strip.missing) == (1, count), strip
+    # 44 sessions Mon 3 Aug..Fri 2 Oct, less Thu 1 and Fri 2 Oct.
+    assert strip.expected == 42 == len(XNYS.sessions_overlapping(dataset.start, dataset.end))
+    # No window reaches past the range end.
+    assert all(gap_end <= MID_WEEK_END for _, gap_end, _ in strip.gaps), strip.gaps
+    assert_tiles(strip)
+
+
+@pytest.mark.asyncio
+async def test_a_complete_weekly_dataset_ending_mid_week_reads_complete(client, engine, covered_dates_as_dates):
+    dataset = entry('WKMC', granularity=Granularity.ONE_WEEK, start=midnight(date(2026, 8, 3)), end=MID_WEEK_END)
+    await store(engine, dataset, *daily_bars(dataset, WEEKLY_BARS))
+
+    detail = (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()['freshness']
+    assert detail['status'] == 'FRESHNESS_STATUS_COMPLETE' and 'gapCount' not in detail, detail
+    listed = {item['id']: item for item in await list_all(client)}
+    assert status_of(listed[str(dataset.id)]) == 'FRESHNESS_STATUS_COMPLETE'
+    strip = await coverage(client, dataset)
+    assert (strip.gaps, strip.gap_count, strip.missing, strip.expected) == ([], 0, 0, 42), strip

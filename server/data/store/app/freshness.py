@@ -18,7 +18,8 @@ STATUSES AND THE RULING THEY COME FROM (tj-grna9p.8 addendum, final form; tj-grn
             OVERDUE  otherwise. A FAILURE. (STREAM has no source in PR 4; the rule is here so the
                      table is complete.)
     STATIC  COMPLETE every expected session in [start, end) has at least one bar.
-            GAPS     some do; `gap_count` is the number of missing SESSIONS (not runs).
+            GAPS     some do; `gap_count` counts the SESSIONS inside [start, end) of missing periods
+                     (not runs).
     RETIRED expiry is set on a DAILY or STREAM dataset: no freshness is computed.
 
 Any status other than FRESH, COMPLETE and RETIRED is unhealthy, and LATE is the only unhealthy one
@@ -27,9 +28,14 @@ that is not yet a failure; `is_failure` says which.
 A BAR BELONGS TO THE SESSION WHOSE LOCAL DATE (in the calendar's time zone) ITS TIMESTAMP FALLS ON.
 That holds for a daily bar stamped at local midnight and for every intraday bar of the session.
 
-KNOWN LIMIT: completeness is per session ("at least one bar"), which is right for 1min..1day
-granularities. A 1week or 1month dataset has bars on fewer days than there are sessions, so it
-would read as full of gaps; nothing in PR 4 stores one, and it is a follow-up when it does.
+COVERAGE IS BY PERIOD, THE UNIT STAYS THE SESSION (tj-grna9p.8 addendum of 2026-10-20). Every granularity has
+a PERIOD: the session itself for 1min..1day; the calendar week Monday..Sunday for 1week; the calendar month
+for 1month, both in the calendar's time zone. A bar covers the WHOLE period holding its local date, so every
+session of that period counts as covered, whichever day of the period the vendor stamps. A period is EXPECTED
+when its first day's local midnight lies in [start, end), it has ended (its last session has closed) and it
+holds a session; the sessions of a partial first period are not expected, since its bar is stamped before the
+range. Gap counts, gap windows and coverage buckets stay in SESSIONS, only those inside [start, end): a missing
+week is its sessions inside [start, end), in one run. For 1min..1day the period is the session, so every result is the per-session one.
 """
 
 import os
@@ -234,9 +240,10 @@ class GapInterval:
 @dataclass(frozen=True)
 class DatasetHealth:
     status: FreshnessStatus
-    # DAILY: the session label that should be stored; STREAM: None.
+    # DAILY: the label of the period that should be stored (a session for 1min..1day; for 1week and 1month the
+    # period's first day, which may be no session); STREAM: None.
     expected_last_session: date | None = None
-    # DAILY: that session's local midnight; STREAM: the oldest last-bar that would still be FRESH.
+    # DAILY: that label's local midnight; STREAM: the oldest last-bar that would still be FRESH.
     expected_last_bar: datetime | None = None
     # STATIC: missing sessions in [start, end), 0 unless status is GAPS.
     gap_count: int = 0
@@ -265,26 +272,117 @@ def covered_sessions(timestamps: Iterable[datetime], calendar: TradingCalendar) 
     return frozenset(session_of(ts, calendar) for ts in timestamps)
 
 
+_DAY = timedelta(days=1)
+_PERIODIC = frozenset({Granularity.ONE_WEEK, Granularity.ONE_MONTH})
+
+
+def period_start(day: date, granularity: Granularity) -> date:
+    """The first calendar day of the period holding `day`.
+
+    The day itself for 1min..1day, its Monday for 1week, the 1st of its month for 1month.
+    """
+    if granularity is Granularity.ONE_WEEK:
+        return day - timedelta(days=day.weekday())
+    if granularity is Granularity.ONE_MONTH:
+        return day.replace(day=1)
+    return day
+
+
+def _next_period_start(day: date, granularity: Granularity) -> date:
+    """The first calendar day of the period after the one holding `day`."""
+    if granularity is Granularity.ONE_WEEK:
+        return period_start(day, granularity) + timedelta(days=7)
+    if granularity is Granularity.ONE_MONTH:
+        return (day.replace(day=1) + timedelta(days=32)).replace(day=1)
+    return day + timedelta(days=1)
+
+
+def _covered_periods(covered: Collection[date], granularity: Granularity) -> Collection[date]:
+    if granularity not in _PERIODIC:
+        return covered
+    return frozenset(period_start(day, granularity) for day in covered)
+
+
+def _judged(
+    start: datetime, end: datetime, calendar: TradingCalendar, now: datetime, granularity: Granularity
+) -> tuple[list[date], dict[date, date]]:
+    """The sessions to walk, and the EXPECTED sessions among them mapped to their period (see the module docstring).
+
+    For 1min..1day: the sessions overlapping [start, end), the completed ones expected, each its own period. For
+    1week and 1month: the sessions from `start` through the end of the last period starting before min(end, now), and
+    the sessions of the periods that start inside [start, end), have ended and hold a session.
+    """
+    if granularity not in _PERIODIC:
+        sessions = calendar.sessions_overlapping(start, end)
+        return sessions, {s: s for s in sessions if calendar.session_close(s) <= now}
+    # A period that starts before `end` and has ended started before now, so the range can stop at now.
+    bound = min(end, now)
+    # Refuse a start before the calendar's, as the per-session path does, before anything is derived from it.
+    calendar.sessions_overlapping(start, start + timedelta(microseconds=1))
+    if bound <= start:
+        return [], {}
+    window_end = local_midnight(_next_period_start(bound.astimezone(calendar.tz).date(), granularity), calendar)
+    sessions = calendar.sessions_overlapping(start, window_end)
+    by_period: dict[date, list[date]] = {}
+    for session in sessions:
+        by_period.setdefault(period_start(session, granularity), []).append(session)
+    expected: dict[date, date] = {}
+    for period, members in by_period.items():
+        if start <= local_midnight(period, calendar) < end and calendar.session_close(members[-1]) <= now:
+            expected.update((s, period) for s in members)
+    return sessions, expected
+
+
+def _in_range(
+    expected: dict[date, date], start: datetime, end: datetime, calendar: TradingCalendar, granularity: Granularity
+) -> dict[date, date]:
+    """The expected sessions inside [start, end): a 1week/1month period straddling `end` reports only those.
+
+    The period still decides covered or not; only the REPORTED sessions are clipped, the contract being the sessions in
+    [start, end) with no bar. 1min..1day sessions never straddle `end`, so they pass through unchanged.
+    """
+    if granularity not in _PERIODIC:
+        return expected
+    inside = frozenset(calendar.sessions_overlapping(start, end))
+    return {s: period for s, period in expected.items() if s in inside}
+
+
 def _missing_sessions(
-    start: datetime, end: datetime, covered: Collection[date], calendar: TradingCalendar, now: datetime
+    start: datetime,
+    end: datetime,
+    covered: Collection[date],
+    calendar: TradingCalendar,
+    now: datetime,
+    granularity: Granularity = Granularity.ONE_DAY,
 ) -> list[date]:
-    # A session still in progress, or not yet started, cannot be a gap: only completed ones count.
-    return [
-        s for s in calendar.sessions_overlapping(start, end) if calendar.session_close(s) <= now and s not in covered
-    ]
+    # Only completed sessions can be a gap; for 1week and 1month, only those of an ended, expected period.
+    _, expected = _judged(start, end, calendar, now, granularity)
+    expected = _in_range(expected, start, end, calendar, granularity)
+    held = _covered_periods(covered, granularity)
+    return [s for s, period in expected.items() if period not in held]
 
 
 def gap_intervals(
-    start: datetime, end: datetime, covered: Collection[date], calendar: TradingCalendar, now: datetime
+    start: datetime,
+    end: datetime,
+    covered: Collection[date],
+    calendar: TradingCalendar,
+    now: datetime,
+    granularity: Granularity = Granularity.ONE_DAY,
 ) -> list[GapInterval]:
-    """Maximal runs of completed expected sessions in [start, end) with no bar, ascending.
+    """Maximal runs of expected sessions in [start, end) with no bar, ascending.
 
     Runs are consecutive in the CALENDAR's session sequence, so a weekend or holiday between two
-    missing sessions does not split them. The coverage strip (tj-grna9p.63) reuses this.
+    missing sessions does not split them. For 1week and 1month a session is missing when its whole period
+    holds no bar, so a missing week is one run of its sessions, clipped to those inside [start, end). The coverage strip
+    (tj-grna9p.63) reuses this.
     """
     _require_aware(start=start, end=end, now=now)
-    sessions = calendar.sessions_overlapping(start, end)
-    missing = set(_missing_sessions(start, end, covered, calendar, now))
+    sessions, expected = _judged(start, end, calendar, now, granularity)
+    # The one clip: gap windows hold only sessions inside [start, end); the walk below only meets missing ones.
+    expected = _in_range(expected, start, end, calendar, granularity)
+    held = _covered_periods(covered, granularity)
+    missing = {s for s, period in expected.items() if period not in held}
     runs: list[GapInterval] = []
     run: list[date] = []
     for session in sessions:
@@ -323,14 +421,22 @@ def local_midnight(session: date, calendar: TradingCalendar) -> datetime:
 
 
 def coverage_buckets(
-    start: datetime, end: datetime, covered: Collection[date], calendar: TradingCalendar, now: datetime, buckets: int
+    start: datetime,
+    end: datetime,
+    covered: Collection[date],
+    calendar: TradingCalendar,
+    now: datetime,
+    buckets: int,
+    granularity: Granularity = Granularity.ONE_DAY,
 ) -> list[CoverageBucket]:
     """Partition the sessions of [start, end) into at most `buckets` contiguous, near-equal groups (tj-grna9p.63).
 
     Every session overlapping the range is partitioned, expected or not, into min(buckets, sessions) groups whose
     sizes differ by at most one (the earlier groups take the remainder). The buckets tile [start, end) with no hole
-    or overlap. A session counts as EXPECTED only when completed, exactly as gap_intervals does, so an in-progress or
-    future session is counted in no bucket's expected_sessions. No sessions give no buckets.
+    or overlap. A session counts as EXPECTED exactly as gap_intervals judges it (completed; for 1week and 1month, of
+    an ended period starting inside the range), so an in-progress or future session is counted in no bucket's
+    expected_sessions, and a session holds a bar when its whole period does. Buckets count sessions whatever the
+    granularity. No sessions give no buckets.
 
     Raises:
         ValueError: If `buckets` is below 1.
@@ -338,9 +444,11 @@ def coverage_buckets(
     _require_aware(start=start, end=end, now=now)
     if buckets < 1:
         raise ValueError('buckets must be >= 1')
-    sessions = calendar.sessions_overlapping(start, end)
+    window, judged = _judged(start, end, calendar, now, granularity)
+    sessions = window if granularity not in _PERIODIC else calendar.sessions_overlapping(start, end)
     if not sessions:
         return []
+    held = _covered_periods(covered, granularity)
     groups = min(buckets, len(sessions))
     size, remainder = divmod(len(sessions), groups)
     out: list[CoverageBucket] = []
@@ -348,10 +456,10 @@ def coverage_buckets(
     for index in range(groups):
         last = first + size + (1 if index < remainder else 0)
         members = sessions[first:last]
-        expected = [s for s in members if calendar.session_close(s) <= now]
+        expected = [s for s in members if s in judged]
         bucket_start = start if index == 0 else local_midnight(members[0], calendar)
         bucket_end = end if index == groups - 1 else local_midnight(sessions[last], calendar)
-        out.append(CoverageBucket(bucket_start, bucket_end, len(expected), sum(s in covered for s in expected)))
+        out.append(CoverageBucket(bucket_start, bucket_end, len(expected), sum(judged[s] in held for s in expected)))
         first = last
     return out
 
@@ -384,36 +492,45 @@ def evaluate_dataset(
     if expiry is not None and update_type in (UpdateType.DAILY, UpdateType.STREAM):
         return DatasetHealth(FreshnessStatus.RETIRED, retired_on=expiry)
     if update_type == UpdateType.STATIC:
-        missing = _missing_sessions(start, end, covered or frozenset(), calendar, now)
+        missing = _missing_sessions(start, end, covered or frozenset(), calendar, now, granularity)
         if missing:
             return DatasetHealth(FreshnessStatus.GAPS, gap_count=len(missing))
         return DatasetHealth(FreshnessStatus.COMPLETE)
     if update_type == UpdateType.DAILY:
-        return _daily(start, end, last_bar, calendar, now)
+        return _daily(start, end, last_bar, calendar, now, granularity)
     return _stream(last_bar, granularity, calendar, now, config)
 
 
 def _daily(
-    start: datetime, end: datetime, last_bar: datetime | None, calendar: TradingCalendar, now: datetime
+    start: datetime,
+    end: datetime,
+    last_bar: datetime | None,
+    calendar: TradingCalendar,
+    now: datetime,
+    granularity: Granularity = Granularity.ONE_DAY,
 ) -> DatasetHealth:
-    # A DAILY dataset owes only the completed sessions inside [start, end). Capping the range at `now` loses
-    # nothing (a session that has closed opened before now) and keeps the calendar query short for a far end.
-    owed = [s for s in calendar.sessions_overlapping(start, min(end, now)) if calendar.session_close(s) <= now]
-    if not owed:
+    # A DAILY dataset owes only the completed periods inside [start, end) (a period is a session for 1min..1day).
+    # Capping the range at `now` loses nothing (a session that has closed opened before now) and keeps the calendar
+    # query short for a far end.
+    _, owed_sessions = _judged(start, min(end, now), calendar, now, granularity)
+    if not owed_sessions:
         # Nothing in range has closed yet (created today, or before its first session): nothing is owed.
         return DatasetHealth(FreshnessStatus.FRESH)
+    owed = list(dict.fromkeys(owed_sessions.values()))
     expected = owed[-1]
-    expected_bar = datetime.combine(expected, datetime.min.time(), tzinfo=calendar.tz)
-    if last_bar is not None and session_of(last_bar, calendar) >= expected:
+    expected_bar = local_midnight(expected, calendar)
+    last_period = None if last_bar is None else period_start(session_of(last_bar, calendar), granularity)
+    if last_period is not None and last_period >= expected:
         return DatasetHealth(FreshnessStatus.FRESH, expected, expected_bar)
-    # Stored late is fine until the NEXT session opens; after that it is a failure. The deadline that counts is
-    # the one of the FIRST session not stored: a dataset that missed an earlier session already failed at that
-    # session's deadline, and must not read LATE again once a later session closes. With no bars that is the
-    # first session in range.
+    # Stored late is fine until the first session AFTER the missed period opens; after that it is a failure. The
+    # deadline that counts is the one of the FIRST period not stored: a dataset that missed an earlier period already
+    # failed at that deadline, and must not read LATE again once a later period ends. With no bars that is the
+    # first period in range.
     missed = owed[0]
-    if last_bar is not None:
-        missed = min(expected, calendar.next_session(session_of(last_bar, calendar)))
-    deadline = calendar.session_open(calendar.next_session(missed))
+    if last_period is not None:
+        after_last = calendar.next_session(_next_period_start(last_period, granularity) - _DAY)
+        missed = min(expected, period_start(after_last, granularity))
+    deadline = calendar.session_open(calendar.next_session(_next_period_start(missed, granularity) - _DAY))
     status = FreshnessStatus.LATE if now < deadline else FreshnessStatus.OVERDUE
     return DatasetHealth(status, expected, expected_bar)
 
@@ -458,5 +575,6 @@ __all__ = [
     'evaluate_dataset',
     'gap_intervals',
     'local_midnight',
+    'period_start',
     'session_of',
 ]
