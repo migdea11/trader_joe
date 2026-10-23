@@ -108,6 +108,8 @@ GUARDED_ADDRESSES = frozenset(
         # The UI's operator writes (tj-grna9p.86).
         'PATCH /ui/v1/datasets/{dataset_id}/expiry',
         'DELETE /ui/v1/datasets/{dataset_id}',
+        # The collecting write (tj-grna9p.175).
+        'PATCH /ui/v1/datasets/{dataset_id}/collecting',
     }
 )
 
@@ -359,6 +361,16 @@ CASES: dict[str, Case] = {
         malformed_field='dataset_id',
         reads_one_row=True,
     ),
+    # tj-grna9p.175, the collecting write: the same fake row and override as the expiry PATCH. Its rules, in order,
+    # are test_ui_dataset_collecting_route.py's over SQLite, and the system suite's on Postgres.
+    'PATCH /ui/v1/datasets/{dataset_id}/collecting': Case(
+        path_params={'dataset_id': str(DELETE_ID)},
+        request={'json': {'collect': False, 'override': {'reason': 'smoke', 'confirmed': True}}},
+        malformed_path_params={'dataset_id': 'not-a-uuid'},
+        malformed_request={'json': {'collect': False}},
+        malformed_field='dataset_id',
+        reads_one_row=True,
+    ),
     'DELETE /ui/v1/datasets/{dataset_id}': Case(
         path_params={'dataset_id': str(DELETE_ID)},
         request={'json': {'override': {'reason': 'smoke', 'confirmed': True}}},
@@ -469,13 +481,15 @@ class FakeResult:
         # DELETE (tj-grna9p.86) also copies the entry's descriptive columns into its deletion row, so
         # source, granularity and update_type are set to ANY valid member: the insert goes to the fake
         # session, and nothing here asserts what it held -- content is tj-19qp1q's tier, and the
-        # deletion row's is test_ui_dataset_writes_route.py's.
+        # deletion row's is test_ui_dataset_writes_route.py's. DAILY since tj-grna9p.175: the collecting PATCH
+        # refuses a STATIC dataset before its write, so only a subscription lets that well-formed call run on to
+        # the handler's own 404 like the expiry PATCH; no other driven path reads the update type's value.
         return StoreDatasetEntry(
             id=DELETE_ID,
             owner=DELETE_OWNER,
             source=DataSource.ALPACA_API,
             granularity=Granularity.ONE_DAY,
-            update_type=UpdateType.STATIC,
+            update_type=UpdateType.DAILY,
         )
 
 

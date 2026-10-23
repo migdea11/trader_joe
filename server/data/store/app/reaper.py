@@ -1,7 +1,7 @@
 """THE EXPIRY REAPER: a periodic pass over the datasets whose expiry has passed (tj-grna9p.23).
 
 THE PENDING SET is `expiry <= now`, whatever the update type, read from the database on every pass by ONE query
-(crud list_pending / pending_ids). A retired DAILY or STREAM dataset is pending only once its expiry has passed.
+(crud list_pending / pending_ids). A dataset is pending once its expiry has passed, whatever its update type and whatever its collect intent says.
 Catch-up after a restart is simply the next pass: nothing is stored and nothing is replayed (common/scheduling.py).
 
 DRY-RUN BY DEFAULT. Deletions need REAPER_DELETES_ENABLED to be exactly `true`; anything else, unset included, is

@@ -128,15 +128,20 @@ class FakeResult:
     ``all()`` is what ``_find_own_overlap`` reads, as a list of one-column rows
     (``[row[0] for row in result.all()]``). ``scalar_one()`` is what the upsert reads back from its
     RETURNING clause. Nothing here evaluates the statement it is answering -- see the module header
-    for what that means this file does and does not prove.
+    for what that means this file does and does not prove. ``scalar_one_or_none()`` is what the
+    pre-upsert collect lock reads (tj-grna9p.189): the stored collect, None when there is no row yet.
     """
 
-    def __init__(self, *, rows: list[tuple] | None = None, scalar: uuid.UUID | None = None):
+    def __init__(self, *, rows: list[tuple] | None = None, scalar: uuid.UUID | None = None, stored: bool | None = None):
         self._rows = rows if rows is not None else []
         self._scalar = scalar
+        self._stored = stored
 
     def all(self) -> list[tuple]:
         return self._rows
+
+    def scalar_one_or_none(self) -> bool | None:
+        return self._stored
 
     def scalar_one(self) -> uuid.UUID:
         assert self._scalar is not None, 'the create path read an id back from a result that was not given one'
@@ -392,7 +397,7 @@ def test_a_request_overlapping_nothing_is_written_and_answers_200(post_dataset):
     narrower-than-requested case lives in test_dataset_fetch_transaction.py, where it is the subject.
     """
     new_entry_id = uuid.uuid4()
-    session = FakeSession(FakeResult(rows=[]), FakeResult(scalar=new_entry_id))
+    session = FakeSession(FakeResult(rows=[]), FakeResult(stored=None), FakeResult(scalar=new_entry_id))
     fetch_client = RecordingFetchClient()
 
     response = post_dataset(session, fetch_client)
@@ -500,7 +505,7 @@ def test_a_create_whose_end_is_not_after_its_start_answers_422_on_the_body_and_w
 
 def test_a_create_one_microsecond_long_reaches_the_handler(post_dataset):
     """The positive that keeps the refusal above honest: [s, s + 1us) is the smallest non-empty range, and is written."""
-    session = FakeSession(FakeResult(rows=[]), FakeResult(scalar=uuid.uuid4()))
+    session = FakeSession(FakeResult(rows=[]), FakeResult(stored=None), FakeResult(scalar=uuid.uuid4()))
     fetch_client = RecordingFetchClient()
 
     response = post_dataset(session, fetch_client, REQUEST_BODY | {'end': '2026-01-01T00:00:00.000001Z'})
@@ -625,11 +630,12 @@ async def test_the_worker_writes_and_fetches_under_the_principal_the_caller_decl
 
     # A FakeSession rather than a bare AsyncMock: the worker runs the hoisted own-overlap SELECT
     # itself (tj-hywf7w), ahead of the collaborator this case replaces, and an AsyncMock answers it
-    # with a coroutine that `_find_own_overlap` cannot iterate. The empty row set is "no overlap".
+    # with a coroutine that `_find_own_overlap` cannot iterate. The empty row set is "no overlap"; the
+    # second answer is the pre-upsert collect lock's (tj-grna9p.189), no row yet.
     await data_action_request.store_market_activity_worker(
         StoreAssetDatasetPath(asset_type=AssetType.STOCK, data_type=DataType.MARKET_ACTIVITY, asset_symbol='AAPL'),
         StoreAssetDatasetBody(**REQUEST_BODY),
-        FakeSession(FakeResult(rows=[])),
+        FakeSession(FakeResult(rows=[]), FakeResult(stored=None)),
         fetch_client,
     )
 
@@ -711,7 +717,10 @@ async def test_the_entry_and_the_fetch_agree_on_every_identity_field_the_caller_
     )
     # See the case above for why this is a FakeSession and not a bare AsyncMock (tj-hywf7w).
     await data_action_request.store_market_activity_worker(
-        request_path, StoreAssetDatasetBody(**REQUEST_BODY), FakeSession(FakeResult(rows=[])), fetch_client
+        request_path,
+        StoreAssetDatasetBody(**REQUEST_BODY),
+        FakeSession(FakeResult(rows=[]), FakeResult(stored=None)),
+        fetch_client,
     )
 
     created = _only_instance(upsert.await_args, AssetDatasetStoreCreate)
@@ -1008,7 +1017,7 @@ def test_a_stored_dataset_is_announced_updated_once_after_its_commit(post_datase
     has committed -- an event for a write that then rolled back would be a lie the UI acts on.
     """
     new_entry_id = uuid.uuid4()
-    session = FakeSession(FakeResult(rows=[]), FakeResult(scalar=new_entry_id))
+    session = FakeSession(FakeResult(rows=[]), FakeResult(stored=None), FakeResult(scalar=new_entry_id))
     commits_at_publish: list[int] = []
 
     def record(event) -> None:
@@ -1029,7 +1038,7 @@ def test_a_refused_or_failed_store_announces_nothing(post_dataset, announced):
     overlap = FakeSession(FakeResult(rows=[(uuid.uuid4(),)]))
     assert post_dataset(overlap, RecordingFetchClient()).status_code == 409
 
-    broken = FakeSession(FakeResult(rows=[]), FakeResult(scalar=uuid.uuid4()))
+    broken = FakeSession(FakeResult(rows=[]), FakeResult(stored=None), FakeResult(scalar=uuid.uuid4()))
     script = FetchScript(
         events=accepted_stream()[:-1], raises=ExogenousError(Reason.PEER_INTERNAL, 'broke after the ack')
     )
@@ -1057,7 +1066,7 @@ def test_a_stream_create_answers_422_invalid_request_and_never_reaches_ingest(po
 @pytest.mark.parametrize('update_type', ['STATIC', 'DAILY'])
 def test_a_non_stream_create_without_the_new_fields_still_reaches_the_handler(post_dataset, announced, update_type):
     """ready_by and best_effort are optional: a body from before them is accepted unchanged."""
-    session = FakeSession(FakeResult(rows=[]), FakeResult(scalar=uuid.uuid4()))
+    session = FakeSession(FakeResult(rows=[]), FakeResult(stored=None), FakeResult(scalar=uuid.uuid4()))
     extra = {} if update_type == 'STATIC' else {'update_type': 'DAILY', 'expiry_type': 'ROLLING'}
 
     response = post_dataset(session, RecordingFetchClient(), REQUEST_BODY | extra)
@@ -1094,9 +1103,82 @@ def test_collect_on_a_static_create_answers_422_invalid_request_and_never_reache
 @pytest.mark.parametrize('collect', [True, False, None])
 def test_collect_on_a_daily_create_is_accepted_at_the_edge(post_dataset, announced, collect):
     """true, false and an explicit null all reach the handler on DAILY (what false then does is tj-grna9p.175)."""
-    session = FakeSession(FakeResult(rows=[]), FakeResult(scalar=uuid.uuid4()))
+    session = FakeSession(FakeResult(rows=[]), FakeResult(stored=None), FakeResult(scalar=uuid.uuid4()))
     body = REQUEST_BODY | {'update_type': 'DAILY', 'expiry_type': 'ROLLING', 'collect': collect}
 
     response = post_dataset(session, RecordingFetchClient(), body)
 
     assert response.status_code == 200, response.text
+
+
+# ---------------------------------------------------------------------------------------------
+# tj-grna9p.189 (the tj-hhy3dk addendum): a POST that FLIPS collect publishes RETIRED or RESUMED
+#
+# The stored collect is what the pre-upsert lock reads (the second planned answer). A flip is an
+# EXPLICIT collect that differs from a stored one; an omitted collect flips nothing, and a create has
+# no stored value to flip. Every non-flip stays UPDATED, as it was.
+# ---------------------------------------------------------------------------------------------
+
+DAILY_BODY = REQUEST_BODY | {'update_type': 'DAILY', 'expiry_type': 'ROLLING'}
+
+
+@pytest.mark.parametrize(
+    ('stored', 'sent', 'change'),
+    [
+        pytest.param(False, {'collect': True}, DatasetChange.RESUMED, id='stopped-explicit-true-resumes'),
+        pytest.param(True, {'collect': False}, DatasetChange.RETIRED, id='collecting-explicit-false-retires'),
+        pytest.param(False, {}, DatasetChange.UPDATED, id='stopped-omitted-stays-stopped-updated'),
+        pytest.param(False, {'collect': None}, DatasetChange.UPDATED, id='stopped-explicit-null-is-omitted'),
+        pytest.param(True, {}, DatasetChange.UPDATED, id='collecting-omitted-updated'),
+        pytest.param(True, {'collect': True}, DatasetChange.UPDATED, id='collecting-explicit-true-no-flip'),
+        pytest.param(False, {'collect': False}, DatasetChange.UPDATED, id='stopped-explicit-false-no-flip'),
+        pytest.param(None, {'collect': False}, DatasetChange.UPDATED, id='create-stopped-is-updated'),
+        pytest.param(None, {}, DatasetChange.UPDATED, id='create-omitted-is-updated'),
+    ],
+)
+def test_a_post_publishes_retired_or_resumed_on_a_collect_flip_and_updated_otherwise(
+    post_dataset, announced, monkeypatch, stored, sent, change
+):
+    """Exactly one DatasetChanged, naming the dataset the upsert returned, published after the commit."""
+    entry_id = uuid.uuid4()
+    session = FakeSession(FakeResult(rows=[]), FakeResult(stored=stored), FakeResult(scalar=entry_id))
+    commits_at_publish: list[int] = []
+
+    def record(event) -> None:
+        announced.append(event)
+        commits_at_publish.append(session.commits)
+
+    monkeypatch.setattr(asset_dataset_store, 'publish', record)
+
+    response = post_dataset(session, RecordingFetchClient(), DAILY_BODY | sent)
+
+    assert response.status_code == 200, response.text
+    assert announced == [DatasetChanged(entry_id, change)], f'stored {stored}, sent {sent}: published {announced}'
+    assert commits_at_publish == [1], 'the change was announced before the fetch transaction committed'
+
+
+def test_a_flipping_post_that_rolls_back_announces_nothing(post_dataset, announced):
+    """A flip whose fetch breaks after the ack never committed, so neither RETIRED nor anything else is published."""
+    broken = FakeSession(FakeResult(rows=[]), FakeResult(stored=True), FakeResult(scalar=uuid.uuid4()))
+    script = FetchScript(
+        events=accepted_stream()[:-1], raises=ExogenousError(Reason.PEER_INTERNAL, 'broke after the ack')
+    )
+
+    response = post_dataset(broken, RecordingFetchClient(script), DAILY_BODY | {'collect': False})
+
+    assert response.status_code == 502, response.text
+    assert broken.commits == 0
+    assert announced == [], 'a flip that never committed was announced'
+
+
+@pytest.mark.parametrize('stored', [True, False], ids=['collecting', 'stopped'])
+def test_a_repeat_post_without_collect_writes_no_collect_on_conflict(post_dataset, announced, stored):
+    """The route end of the chain: an SDK retry's body (no collect) reaches the upsert as omitted, not as a default."""
+    session = FakeSession(FakeResult(rows=[]), FakeResult(stored=stored), FakeResult(scalar=uuid.uuid4()))
+
+    response = post_dataset(session, RecordingFetchClient(), DAILY_BODY)
+
+    assert response.status_code == 200, response.text
+    (insert,) = _sent_inserts(session)
+    set_clause = str(insert.compile()).split('DO UPDATE SET', 1)[1].split('RETURNING', 1)[0]
+    assert 'collect' not in set_clause, f'a repeat without collect SETs it: {set_clause}'

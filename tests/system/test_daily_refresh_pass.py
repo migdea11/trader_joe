@@ -116,7 +116,8 @@ def _seed(engine: sa.Engine, entry_values, bar_values, run_identity) -> dict[str
     plan = {
         'behind': {**daily},
         'refused': {**daily, 'feed': UNSERVABLE_FEED},
-        'retired': {**daily, 'expiry': NOW + timedelta(days=1)},
+        # Stopped by its collect intent (decision tj-hhy3dk): an expiry would retire nothing.
+        'retired': {**daily, 'collect': False},
     }
     ids: dict[str, uuid.UUID] = {}
     with engine.begin() as conn:
@@ -252,12 +253,21 @@ async def test_a_refresh_extends_the_same_entry_with_only_the_missing_tail_on_po
 
 # ---------------------------------------------------------------------------------------------
 # Round 2 (fix 0b6d9d8): an operator retire racing the scheduled write. The refresh locks the entry FOR UPDATE on
-# the ack and re-checks it; its upsert never writes expiry. Only Postgres has the row lock, so only here does the
+# the ack and re-checks it; its upsert never writes expiry or collect. Since tj-grna9p.175 the retire is
+# PATCH .../collecting {collect: false}; an expiry PATCH is the deletion date only and drops nothing. Only Postgres has the row lock, so only here does the
 # second case (a PATCH after the ack waits for the refresh's commit) mean anything. The PATCH is the real operator
 # route (test_reaper_race's in-process app on the scratch database); the dataset is the operator's own, so the PATCH
 # writes no override row and any override row would be the system actor's.
 
 RETIRE_AT = datetime(2026, 10, 10, tzinfo=UTC)
+STOP = {'collect': False}
+
+
+def _stop(client: Any, dataset_id: uuid.UUID) -> Any:
+    """The operator's retire: PATCH .../collecting with collect false (the dataset is the operator's own)."""
+    return client.patch(
+        f'/ui/v1/datasets/{dataset_id}/collecting', json=STOP, headers={race.INSTANCE_SECRET_HEADER: race.SECRET}
+    )
 
 
 def _operator_daily(engine: sa.Engine, entry_values, bar_values, run_identity) -> uuid.UUID:
@@ -300,7 +310,7 @@ async def test_a_retire_that_commits_during_the_vendor_call_drops_the_answer_on_
 
         async def retire_then_serve(query, *args, **kwargs):
             # The operator's PATCH commits while the vendor call is in flight, before ingest's ack.
-            responses.append(await race._patch(store, dataset_id, {'expiry': RETIRE_AT.isoformat()}))
+            responses.append(await _stop(store, dataset_id))
             return await served(query, *args, **kwargs)
 
         reader.get_bars = retire_then_serve
@@ -310,7 +320,7 @@ async def test_a_retire_that_commits_during_the_vendor_call_drops_the_answer_on_
     assert response.status_code == 200, response.text
     assert result == PassResult(behind=1, discarded=1)
     entry = _entries(scratch_db.engine)[dataset_id]
-    assert entry.expiry == RETIRE_AT, 'the system actor undid the operator retire'
+    assert entry.collect is False, 'the system actor undid the operator retire'
     assert _bar_times(scratch_db.engine, dataset_id) == SEEDED, 'bars were written for a retired dataset'
     (run,) = _runs(scratch_db.engine)
     assert (run.state, run.bars_written, run.error_reason) == (IngestRunState.EMPTY, 0, None)
@@ -337,7 +347,7 @@ async def test_a_retire_after_the_ack_waits_for_the_refresh_and_is_kept_on_postg
         patch = None
         try:
             await asyncio.wait_for(upserted.wait(), race.WAIT_SECONDS)
-            patch = asyncio.create_task(race._patch(store, dataset_id, {'expiry': RETIRE_AT.isoformat()}))
+            patch = asyncio.create_task(_stop(store, dataset_id))
             assert await race._a_backend_waits_on_a_lock(scratch_db), 'the PATCH did not wait on the refresh lock'
             assert not patch.done(), 'the PATCH completed while the refresh held the entry'
         finally:
@@ -348,9 +358,36 @@ async def test_a_retire_after_the_ack_waits_for_the_refresh_and_is_kept_on_postg
     assert response is not None and response.status_code == 200, response
     assert result == PassResult(behind=1, refreshed=1)
     entry = _entries(scratch_db.engine)[dataset_id]
-    assert entry.expiry == RETIRE_AT, 'the PATCH that waited for the refresh lost its expiry'
+    assert entry.collect is False, 'the stop that waited for the refresh was lost'
     assert _bar_times(scratch_db.engine, dataset_id) == SEEDED + [SEEDED[-1] + DAY * k for k in range(1, 5)]
     assert _override_rows(scratch_db.engine) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_deletion_date_set_during_the_vendor_call_drops_nothing_on_postgres(
+    store, scratch_db, point_refresh, entry_values, bar_values, run_identity
+):
+    """Decision tj-hhy3dk: an expiry PATCH in flight is the deletion date only; the answer is stored, collect stays."""
+    dataset_id = _operator_daily(scratch_db.engine, entry_values, bar_values, run_identity)
+    clock = Clock(NOW)
+    responses: list[Any] = []
+
+    async with _ingest(clock) as (client, reader):
+        served = reader.get_bars
+
+        async def date_then_serve(query, *args, **kwargs):
+            responses.append(await race._patch(store, dataset_id, {'expiry': RETIRE_AT.isoformat()}))
+            return await served(query, *args, **kwargs)
+
+        reader.get_bars = date_then_serve
+        result = await DailyRefresher(client, clock=clock).run_pass(DataSource.ALPACA_API)
+
+    (response,) = responses
+    assert response.status_code == 200, response.text
+    assert result == PassResult(behind=1, refreshed=1)
+    entry = _entries(scratch_db.engine)[dataset_id]
+    assert (entry.expiry, entry.collect) == (RETIRE_AT, True), 'the refresh undid the expiry or an expiry stopped it'
+    assert _bar_times(scratch_db.engine, dataset_id) == SEEDED + [SEEDED[-1] + DAY * k for k in range(1, 5)]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -383,7 +420,7 @@ async def _health(scratch_async: AsyncEngine, dataset_id: uuid.UUID, now: dateti
     health = evaluate_dataset(
         update_type=row.update_type,
         granularity=row.granularity,
-        expiry=row.expiry,
+        collect=row.collect,
         start=row.start,
         end=row.end or datetime(2100, 1, 1, tzinfo=UTC),
         last_bar=row.last_bar,

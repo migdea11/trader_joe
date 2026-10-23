@@ -44,6 +44,7 @@ from data.store.app.dataset_catalog import (
     StorageCurrent,
     UsageSummary,
     effective_end,
+    is_collecting,
     is_retired,
 )
 from data.store.app.events import DatasetChanged, DomainEvent, IngestRunChanged, ReaperPendingChanged, RequestChanged
@@ -73,6 +74,7 @@ UiConfigMessage = shell_pb2.UiConfig
 # The request bodies of the expiry and delete writes (tj-grna9p.86); parsed by ProtoBody, never by a pydantic model.
 SetExpiryRequestMessage = data_pb2.SetExpiryRequest
 DeleteDatasetRequestMessage = data_pb2.DeleteDatasetRequest
+SetCollectingRequestMessage = data_pb2.SetCollectingRequest
 
 
 def _enum_value(enum_type: Any, prefix: str, member: Any) -> int:
@@ -142,6 +144,8 @@ def _summary(
         state=data_pb2.DATASET_STATE_RETIRED if is_retired(row) else data_pb2.DATASET_STATE_ACTIVE,
         bar_count=extent.count,
         reaper_pending=reaper_pending,
+        # Derived: a subscription's collect intent; for STATIC, whether its latest run is RUNNING (no extra read).
+        collecting=is_collecting(row, last_run is not None and last_run.state is IngestRunState.RUNNING),
     )
     message.start.CopyFrom(to_timestamp(row.start))
     message.end.CopyFrom(to_timestamp(effective_end(row, as_of)))
@@ -580,6 +584,20 @@ def set_expiry_values(request: data_pb2.SetExpiryRequest) -> tuple[datetime | No
     """
     expiry = request.expiry.ToDatetime(tzinfo=UTC) if request.HasField('expiry') else None
     return expiry, _override_input(request)
+
+
+def set_collecting_values(request: data_pb2.SetCollectingRequest) -> tuple[bool | None, OperatorOverrideInput | None]:
+    """A SetCollectingRequest as plain values: the collect intent and the override, if sent.
+
+    Args:
+        request: The parsed body.
+
+    Returns:
+        tuple[bool | None, OperatorOverrideInput | None]: collect, or None when the body did not carry it
+        (presence: a missing key is never read as false), and the override.
+    """
+    collect = request.collect if request.HasField('collect') else None
+    return collect, _override_input(request)
 
 
 def delete_values(request: data_pb2.DeleteDatasetRequest) -> OperatorOverrideInput | None:

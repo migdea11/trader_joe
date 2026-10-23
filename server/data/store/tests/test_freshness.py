@@ -22,6 +22,8 @@ when the last completed session is stored, LATE (pending, not a failure) from th
 SESSION'S OPEN, and OVERDUE (the ruling's STALE, renamed 2026-10-06) from that open. There is no close + grace.
 """
 
+import dataclasses
+import inspect
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -34,6 +36,7 @@ from data.store.app.completeness import GapInterval, covered_sessions, gap_inter
 from data.store.app.health import (
     DEFAULT_STREAM_BAR_MULTIPLE,
     STREAM_BAR_MULTIPLE_ENV,
+    DatasetHealth,
     FreshnessConfig,
     FreshnessStatus,
     evaluate_dataset,
@@ -70,7 +73,7 @@ def daily(now: datetime, last_bar: datetime | None):
     return evaluate_dataset(
         update_type=UpdateType.DAILY,
         granularity=Granularity.ONE_DAY,
-        expiry=None,
+        collect=True,
         start=z('2026-01-02T00:00:00Z'),
         end=now,
         last_bar=last_bar,
@@ -198,7 +201,7 @@ def daily_in(start: datetime, end: datetime, now: datetime, last_bar: datetime |
     return evaluate_dataset(
         update_type=UpdateType.DAILY,
         granularity=Granularity.ONE_DAY,
-        expiry=None,
+        collect=True,
         start=start,
         end=end,
         last_bar=last_bar,
@@ -330,7 +333,7 @@ def stream(now: datetime, last_bar: datetime | None, multiple: int | None = None
     return evaluate_dataset(
         update_type=UpdateType.STREAM,
         granularity=granularity,
-        expiry=None,
+        collect=True,
         start=z('2026-01-02T00:00:00Z'),
         end=now,
         last_bar=last_bar,
@@ -473,7 +476,7 @@ def static(start: datetime, end: datetime, covered, now: datetime = YEAR_END):
     return evaluate_dataset(
         update_type=UpdateType.STATIC,
         granularity=Granularity.ONE_DAY,
-        expiry=None,
+        collect=None,
         start=start,
         end=end,
         last_bar=None,
@@ -584,13 +587,16 @@ def test_covered_sessions_reads_each_bar_on_its_new_york_date():
 # ------------------------------------------------------------------------------------------------- RETIRED
 
 
-@pytest.mark.parametrize('update_type', [UpdateType.DAILY, UpdateType.STREAM])
-def test_an_expiry_on_a_subscription_retires_it_and_computes_nothing(update_type):
-    expiry = z('2027-01-01T00:00:00Z')
-    health = evaluate_dataset(
+#
+# Decision tj-hhy3dk: RETIRED is the collect intent (false on a DAILY or STREAM subscription), never the expiry, which
+# is the deletion date only. evaluate_dataset takes no expiry at all, so it cannot read one.
+
+
+def _subscription(update_type: UpdateType, collect: bool | None):
+    return evaluate_dataset(
         update_type=update_type,
         granularity=Granularity.ONE_MINUTE,
-        expiry=expiry,
+        collect=collect,
         start=WEEK_START,
         end=WEEK_END,
         last_bar=None,  # would be OVERDUE if judged
@@ -598,18 +604,39 @@ def test_an_expiry_on_a_subscription_retires_it_and_computes_nothing(update_type
         calendar=XNYS,
         now=z('2026-12-01T15:00:00Z'),
     )
-    assert health.status is FreshnessStatus.RETIRED
-    assert health.retired_on == expiry
+
+
+@pytest.mark.parametrize('update_type', [UpdateType.DAILY, UpdateType.STREAM])
+def test_collect_false_on_a_subscription_retires_it_and_computes_nothing(update_type):
+    health = _subscription(update_type, False)
+    assert health == DatasetHealth(FreshnessStatus.RETIRED)
     assert health.expected_last_bar is None
     assert not health.is_failure
 
 
-def test_an_expiry_on_a_static_dataset_does_not_retire_it():
-    """A STATIC dataset with an expiry is still judged for completeness: retirement is a subscription's state."""
+@pytest.mark.parametrize('collect', [True, None], ids=['collect true', 'collect null'])
+@pytest.mark.parametrize('update_type', [UpdateType.DAILY, UpdateType.STREAM])
+def test_a_collecting_subscription_is_judged_not_retired(update_type, collect):
+    """Only an explicit false retires: true, and a NULL that the CHECK never lets a subscription hold, are judged."""
+    health = _subscription(update_type, collect)
+    assert health.status is FreshnessStatus.OVERDUE
+    assert health.is_failure
+
+
+def test_the_evaluation_takes_no_expiry_and_no_retired_on():
+    """An expiry cannot retire anything here: it is no argument, and the health no longer carries a retire date."""
+    assert 'expiry' not in inspect.signature(evaluate_dataset).parameters
+    assert 'collect' in inspect.signature(evaluate_dataset).parameters
+    assert 'retired_on' not in {field.name for field in dataclasses.fields(DatasetHealth)}
+
+
+@pytest.mark.parametrize('collect', [None, False, True], ids=['collect null', 'collect false', 'collect true'])
+def test_a_static_dataset_is_never_retired_whatever_collect_says(collect):
+    """A STATIC dataset is judged for completeness: retirement is a subscription's state, and STATIC has no intent."""
     health = evaluate_dataset(
         update_type=UpdateType.STATIC,
         granularity=Granularity.ONE_DAY,
-        expiry=z('2027-01-01T00:00:00Z'),
+        collect=collect,
         start=WEEK_START,
         end=WEEK_END,
         last_bar=None,
@@ -626,11 +653,12 @@ def test_an_expiry_on_a_static_dataset_does_not_retire_it():
 NAIVE = datetime(2026, 10, 5, 15, 0)
 
 
-@pytest.mark.parametrize('argument', ['expiry', 'start', 'end', 'last_bar', 'now'])
+@pytest.mark.parametrize('argument', ['start', 'end', 'last_bar', 'now', 'last_bar_written_at'])
 def test_a_naive_datetime_is_refused_by_name(argument):
     """Every instant argument is checked, and the refusal names which one was naive."""
     arguments = {
-        'expiry': None,
+        'collect': True,
+        'last_bar_written_at': None,
         'start': WEEK_START,
         'end': WEEK_END,
         'last_bar': z('2026-10-05T14:00:00Z'),
@@ -767,7 +795,7 @@ def test_a_dataset_starting_before_the_calendar_start_fails_loudly(update_type):
         evaluate_dataset(
             update_type=update_type,
             granularity=Granularity.ONE_DAY,
-            expiry=None,
+            collect=None if update_type is UpdateType.STATIC else True,
             start=NEW_YEAR_1990_UTC,
             end=daily_bar(date(1990, 2, 1)),
             last_bar=None,

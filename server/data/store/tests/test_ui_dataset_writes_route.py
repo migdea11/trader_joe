@@ -11,7 +11,9 @@ THE DESIGN is the bead's 2026-10-14 architect ruling, which wins over its body. 
   6. PATCH 200 with the updated DatasetSummary; DELETE 204 with no body.
 Unmigrated (no audit tables): after rules 1-3, an overriding PATCH and every DELETE are 503 DATABASE_UNAVAILABLE and
 change nothing; an operator-owned PATCH still goes through.
-Retire/resume: an expiry on DAILY/STREAM retires at once, clearing it resumes; the expiry TYPE never changes.
+Retire/resume (decision tj-hhy3dk, tj-grna9p.175): the expiry is the DELETION date only. Setting or clearing it retires
+and resumes nothing and never touches collect; collecting is PATCH .../collecting (test_ui_dataset_collecting_route.py).
+The expiry TYPE never changes.
 
 WHAT TIER THIS IS. The real app, handlers, repository SQL and mapping over real tables in an in-memory SQLite
 database, as test_ui_datasets_route.py (whose fixtures and row builders are reused). Foreign keys are switched on
@@ -608,26 +610,41 @@ async def test_a_patch_whose_dataset_goes_before_its_update_is_404_with_no_overr
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('collect', [True, False], ids=['collecting', 'stopped'])
 @pytest.mark.parametrize('name', ['dataset', 'foreign', 'stream'])
-async def test_setting_an_expiry_retires_a_subscription_at_once_and_clearing_it_resumes(client, world, name):
+async def test_setting_or_clearing_an_expiry_never_retires_or_resumes_a_subscription(client, world, name, collect):
+    """The expiry is the deletion date only: the state, the collect intent and collecting follow collect, not it."""
     row = getattr(world, name)
+    await set_collect(world, row.id, collect)
     override = {} if row.owner == OPERATOR_PRINCIPAL else {'override': GOOD_OVERRIDE}
+    state = 'DATASET_STATE_ACTIVE' if collect else 'DATASET_STATE_RETIRED'
 
-    retired = await patch(client, row.id, {'expiry': FUTURE, **override})
-    assert retired.status_code == 200, retired.text
-    summary = retired.json()
-    assert (summary['id'], summary['expiry'], summary['state']) == (str(row.id), FUTURE, 'DATASET_STATE_RETIRED')
-    assert summary['freshness']['status'] == 'FRESHNESS_STATUS_RETIRED'
+    dated = await patch(client, row.id, {'expiry': FUTURE, **override})
+    assert dated.status_code == 200, dated.text
+    summary = dated.json()
+    assert (summary['id'], summary['expiry'], summary['state']) == (str(row.id), FUTURE, state)
+    assert summary.get('collecting', False) is collect, summary
+    assert (summary['freshness']['status'] == 'FRESHNESS_STATUS_RETIRED') is not collect, summary['freshness']
+    assert (await world.entry(row.id)).collect is collect, 'setting an expiry changed collect'
 
-    resumed = await patch(client, row.id, override)
-    assert resumed.status_code == 200, resumed.text
-    assert 'expiry' not in resumed.json()
-    assert resumed.json()['state'] == 'DATASET_STATE_ACTIVE'
+    cleared = await patch(client, row.id, override)
+    assert cleared.status_code == 200, cleared.text
+    assert 'expiry' not in cleared.json()
+    assert cleared.json()['state'] == state, 'clearing an expiry changed the state'
+    assert cleared.json().get('collecting', False) is collect
     stored = await world.entry(row.id)
-    assert stored.expiry is None
+    assert (stored.expiry, stored.collect) == (None, collect), 'clearing an expiry changed collect'
     assert (stored.expiry_type, stored.update_type) == (ExpiryType.ROLLING.value, row.update_type.value), (
         'the expiry write changed the expiry type or the update type'
     )
+
+
+async def set_collect(world: World, dataset_id: uuid.UUID, collect: bool | None) -> None:
+    async with AsyncSession(world.engine) as db:
+        await db.execute(
+            StoreDatasetEntry.__table__.update().where(StoreDatasetEntry.id == dataset_id).values(collect=collect)
+        )
+        await db.commit()
 
 
 @pytest.mark.asyncio
@@ -657,7 +674,9 @@ async def test_a_past_expiry_can_be_cleared_and_a_past_one_set(client, world):
     response = await patch(client, world.dataset.id, {'expiry': past.isoformat().replace('+00:00', 'Z')})
     assert response.status_code == 200
     assert (await world.entry(world.dataset.id)).expiry == past
-    assert response.json()['state'] == 'DATASET_STATE_RETIRED'
+    # A past deletion date retires nothing (decision tj-hhy3dk): the reaper deletes it, the state stays ACTIVE.
+    assert (response.json()['state'], response.json()['collecting']) == ('DATASET_STATE_ACTIVE', True)
+    assert (await world.entry(world.dataset.id)).collect is True
 
 
 @pytest.mark.asyncio
@@ -774,13 +793,13 @@ async def test_an_unmigrated_database_lets_an_operator_owned_patch_through_unrec
     """No audit row is needed for the operator's own dataset, so its expiry write proceeds, set and clear alike."""
     world.migrated = False
 
-    retired = await patch(client, world.dataset.id, {'expiry': FUTURE})
-    assert retired.status_code == 200, retired.text
-    assert retired.json()['state'] == 'DATASET_STATE_RETIRED'
+    dated = await patch(client, world.dataset.id, {'expiry': FUTURE})
+    assert dated.status_code == 200, dated.text
+    assert dated.json()['state'] == 'DATASET_STATE_ACTIVE', 'an expiry retired the subscription'
     assert (await world.entry(world.dataset.id)).expiry == z(FUTURE)
 
-    resumed = await patch(client, world.dataset.id, {'override': GOOD_OVERRIDE})
-    assert resumed.status_code == 200, resumed.text
+    cleared = await patch(client, world.dataset.id, {'override': GOOD_OVERRIDE})
+    assert cleared.status_code == 200, cleared.text
     assert (await world.entry(world.dataset.id)).expiry is None
 
     assert await world.audit_rows() == ([], [])

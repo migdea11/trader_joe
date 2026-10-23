@@ -10,8 +10,8 @@ CLOSE, settle): a session's close plus DAILY_REFRESH_SETTLE_MINUTES, from the st
 The calendar is an argument to the schedule; common imports none. A pass also runs once at start (catch-up).
 
 WHAT. Every pass derives its work from the DATABASE; nothing is stored and nothing is replayed (common/scheduling.py).
-It reads the DAILY entries of its source, drops the retired ones (an expiry on a DAILY dataset retires it at once,
-the same rule the UI judges by: is_retired), drops those with a RUNNING ingest, and keeps the ones the freshness rule
+It reads the DAILY entries of its source, drops the retired ones (collect is false: the operator stopped it, the
+same rule the UI judges by: is_retired; an expiry alone retires nothing), drops those with a RUNNING ingest, and keeps the ones the freshness rule
 reads LATE or OVERDUE: the last stored bar is before the last completed session. For each, oldest first, it asks
 ingest for ONLY the missing range: from the last stored bar plus one bar (the declared start when there are no
 bars; from the last bar ITSELF when it was written before its period closed, so the vendor's part-way bar is
@@ -468,7 +468,7 @@ class DailyRefresher:
                 health = evaluate_dataset(
                     update_type=row.update_type,
                     granularity=row.granularity,
-                    expiry=row.expiry,
+                    collect=row.collect,
                     start=row.start,
                     end=effective_end(row, now),
                     last_bar=row.last_bar,

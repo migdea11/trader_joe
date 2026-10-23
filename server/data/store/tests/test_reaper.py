@@ -150,17 +150,22 @@ def _seed() -> tuple[dict[str, StoreDatasetEntry], list[StockMarketActivity]]:
             f'{SYMBOL_PREFIX}A', start=ny_midnight(1), end=ny_midnight(6), expiry=NOW - timedelta(days=1)
         ),
         'exact-static': entry(f'{SYMBOL_PREFIX}B', start=ny_midnight(1), end=ny_midnight(6), expiry=NOW),
-        'retired-daily': entry(f'{SYMBOL_PREFIX}C', update_type=UpdateType.DAILY, expiry=NOW - timedelta(hours=1)),
+        'retired-daily': entry(
+            f'{SYMBOL_PREFIX}C', update_type=UpdateType.DAILY, expiry=NOW - timedelta(hours=1), collect=False
+        ),
         'retired-stream': entry(
             f'{SYMBOL_PREFIX}D',
             granularity=Granularity.ONE_MINUTE,
             update_type=UpdateType.STREAM,
             expiry=NOW - timedelta(days=2),
+            collect=False,
         ),
         'future-static': entry(
             f'{SYMBOL_PREFIX}E', start=ny_midnight(1), end=ny_midnight(6), expiry=NOW + timedelta(days=1)
         ),
-        'retiring-daily': entry(f'{SYMBOL_PREFIX}F', update_type=UpdateType.DAILY, expiry=NOW + timedelta(hours=1)),
+        'retiring-daily': entry(
+            f'{SYMBOL_PREFIX}F', update_type=UpdateType.DAILY, expiry=NOW + timedelta(hours=1), collect=False
+        ),
         'live-stream': entry(f'{SYMBOL_PREFIX}G', granularity=Granularity.ONE_MINUTE, update_type=UpdateType.STREAM),
         'forever-static': entry(f'{SYMBOL_PREFIX}H', start=ny_midnight(1), end=ny_midnight(6)),
     }
@@ -292,6 +297,73 @@ async def test_a_retired_subscription_is_pending_only_once_its_expiry_has_passed
     async with AsyncSession(world.engine) as db:
         assert retiring not in await catalog_repo.pending_ids(db, NOW)
         assert retiring in await catalog_repo.pending_ids(db, NOW + timedelta(hours=1))
+
+
+COLLECT_CASES = [
+    pytest.param(UpdateType.DAILY, True, id='daily-collecting'),
+    pytest.param(UpdateType.DAILY, False, id='daily-stopped'),
+    pytest.param(UpdateType.STREAM, True, id='stream-collecting'),
+    pytest.param(UpdateType.STREAM, False, id='stream-stopped'),
+    pytest.param(UpdateType.STATIC, None, id='static-null'),
+]
+
+
+def _collect_entry(symbol: str, update_type: UpdateType, collect: bool | None, expiry: datetime) -> StoreDatasetEntry:
+    span = {} if update_type is not UpdateType.STATIC else {'start': ny_midnight(1), 'end': ny_midnight(6)}
+    granularity = Granularity.ONE_MINUTE if update_type is UpdateType.STREAM else Granularity.ONE_DAY
+    return entry(symbol, update_type=update_type, granularity=granularity, expiry=expiry, collect=collect, **span)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('update_type', 'collect'), COLLECT_CASES)
+async def test_an_expired_dataset_is_pending_and_deleted_whatever_collect_says(
+    world: World, enabled, update_type, collect
+):
+    """Decision tj-hhy3dk: the reaper deletes at the expiry; collect (true, false or NULL) is never read."""
+    expired = _collect_entry(f'{SYMBOL_PREFIX}X', update_type, collect, NOW - timedelta(minutes=1))
+    await world.add(expired)
+    async with AsyncSession(world.engine) as db:
+        assert expired.id in await catalog_repo.pending_ids(db, NOW)
+        assert expired.id in {row.id for row in await catalog_repo.list_pending(db, NOW)}
+
+    deleted = await Reaper().run_pass(NOW)
+
+    assert deleted == len(PENDING) + 1
+    assert expired.id not in await world.entry_ids(), f'an expired {update_type} with collect {collect} was kept'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('update_type', 'collect'), COLLECT_CASES)
+async def test_an_unexpired_dataset_is_never_pending_or_deleted_whatever_collect_says(
+    world: World, enabled, update_type, collect
+):
+    """A stopped subscription is not deleted early: only its expiry, set and passed, makes it pending."""
+    future = _collect_entry(f'{SYMBOL_PREFIX}Y', update_type, collect, NOW + timedelta(minutes=1))
+    if update_type is UpdateType.STATIC:
+        forever = entry(f'{SYMBOL_PREFIX}Z', start=ny_midnight(1), end=ny_midnight(6))
+    else:
+        forever = entry(f'{SYMBOL_PREFIX}Z', update_type=update_type, collect=collect)
+    await world.add(future, forever)
+    async with AsyncSession(world.engine) as db:
+        assert not {future.id, forever.id} & set(await catalog_repo.pending_ids(db, NOW))
+
+    assert await Reaper().run_pass(NOW) == len(PENDING)
+    assert {future.id, forever.id} <= await world.entry_ids()
+
+
+def test_the_reaper_and_its_crud_never_read_collect_or_retired():
+    """Static half of the rule: the pending predicate and the reaper module name neither (the docstrings excepted)."""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(reaper_module))
+    names = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+    names |= {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    assert not {'collect', 'is_retired', 'is_collecting'} & names, sorted(names & {'collect', 'is_retired'})
+    source = inspect.getsource(catalog_repo._past_expiry).split('"""')[-1]
+    assert 'collect' not in source and 'update_type' not in source, source
+    delete_source = inspect.getsource(entry_repo.reaper_delete_entry).split('"""')[-1]
+    assert 'collect' not in delete_source and 'is_retired' not in delete_source, delete_source
 
 
 @pytest.mark.asyncio

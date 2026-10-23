@@ -296,11 +296,13 @@ def entry_values(run_identity: RunIdentity) -> Callable[..., dict[str, Any]]:
         assert not unknown, f'not columns of {ENTRY_TABLE.name}: {sorted(unknown)}'
         values.update(overrides)
         # collect (tj-grna9p.176, migration e5c8b1d4f703): its CHECK wants NULL exactly for STATIC, which the
-        # column's NULL default already gives, so only a subscription gets a value: (expiry IS NULL), the
-        # migration's own backfill, so an expiry-retired fixture is not collecting either. Left out for STATIC on
-        # purpose, so a STATIC row still inserts into a scratch database migrated to a revision before the column.
+        # column's NULL default already gives, so only a subscription gets a value: TRUE, collecting, unless the
+        # test passes collect=False to stop it. Never derived from the expiry (decision tj-hhy3dk, tj-grna9p.175):
+        # the expiry is the deletion date only, and a fixture coupling the two would hide an expiry that retires
+        # again. Left out for STATIC on purpose, so a STATIC row still inserts into a scratch database migrated to
+        # a revision before the column.
         if 'collect' not in overrides and values['update_type'] != UpdateType.STATIC.value:
-            values['collect'] = values.get('expiry') is None
+            values['collect'] = True
         return {key: value for key, value in values.items() if key not in omit}
 
     return _values

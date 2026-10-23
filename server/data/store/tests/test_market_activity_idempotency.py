@@ -56,7 +56,8 @@ BAR_IDENTITY_REVISION = 'eec8f88a7443'
 # b3d9e1a47c62 since tj-grna9p.46: dataset_read and dataset_read_daily, again touching neither.
 # d7e2a9c35b18 since tj-grna9p.86: dataset_override_log and dataset_deletion, touching neither.
 # e5c8b1d4f703 since tj-grna9p.176: store_dataset_entry.collect, an entry column outside the bar entirely.
-CURRENT_HEAD = 'e5c8b1d4f703'
+# a6d3f8e1c205 since tj-grna9p.183: override_action gains SET_COLLECTING, an enum value on the audit log only.
+CURRENT_HEAD = 'a6d3f8e1c205'
 
 # The natural key as 8f41c2d7a3b9 itself declares it, written out as a HISTORIC LITERAL rather
 # than read off BaseMarketActivity. A past revision's job is to describe the schema as it was;

@@ -64,7 +64,7 @@ from data.store.app.dataset_catalog import (
     MAX_COVERAGE_GAPS,
     evaluate_views,
 )
-from data.store.app.health import FreshnessStatus
+from data.store.app.health import DatasetHealth, FreshnessStatus
 from data.store.app.main import app
 from data.store.app.trading_calendar import (
     NaiveDatetimeError,
@@ -186,7 +186,10 @@ def entry(
     expiry: datetime | None = None,
     source: DataSource = DataSource.ALPACA_API,
     feed: Feed = Feed.IEX,
+    collect: bool | None = None,
 ) -> StoreDatasetEntry:
+    if collect is None and update_type is not UpdateType.STATIC:
+        collect = True
     return StoreDatasetEntry(
         id=uuid.uuid4(),
         owner=OWNER,
@@ -204,10 +207,11 @@ def entry(
         # (GET /store/{id}) validates every row it reads back against that rule.
         expiry_type=ExpiryType.BULK if update_type is UpdateType.STATIC else ExpiryType.ROLLING,
         update_type=update_type,
-        # collect (tj-grna9p.176, decision tj-hhy3dk section 1): NULL exactly for STATIC, as the model's CHECK
-        # requires; for DAILY and STREAM the value migration e5c8b1d4f703 backfills, (expiry IS NULL), so a
-        # fixture that retires a subscription by expiry stays retired under both today's rule and the collect one.
-        collect=None if update_type is UpdateType.STATIC else expiry is None,
+        # collect (decision tj-hhy3dk): NULL for STATIC unless a test passes one to reach the CHECK; a subscription
+        # collects (true) unless the test stops it with collect=False. It is NEVER derived from the expiry: the
+        # expiry is the deletion date only (tj-grna9p.175), so a fixture that coupled the two would hide an expiry
+        # that retires again.
+        collect=collect,
         created_at=NOW,
         updated_at=NOW,
     )
@@ -302,7 +306,8 @@ class Catalog:
         self.bbb = entry('BBB', update_type=UpdateType.DAILY, end=None)
         self.ccc = entry('CCC', granularity=Granularity.ONE_MINUTE, update_type=UpdateType.STREAM)
         self.ddd = entry('DDD', start=ny_midnight(1), end=ny_midnight(6), expiry=z('2026-10-10T00:00:00Z'))
-        self.eee = entry('EEE', update_type=UpdateType.DAILY, expiry=z('2026-10-20T00:00:00Z'))
+        # Retired by its collect intent; its expiry is only the deletion date (decision tj-hhy3dk).
+        self.eee = entry('EEE', update_type=UpdateType.DAILY, expiry=z('2026-10-20T00:00:00Z'), collect=False)
         self.ggg = entry('GGG', update_type=UpdateType.DAILY, source=DataSource.IB_API)
         self.rows = [
             self.aaa_day,
@@ -965,9 +970,9 @@ class Early:
         minute = Granularity.ONE_MINUTE
         self.static = entry('OLDS', start=OLD_START, end=OLD_END)
         self.daily = entry('OLDD', update_type=UpdateType.DAILY, start=OLD_START)
-        self.daily_retired = entry('OLDR', update_type=UpdateType.DAILY, start=OLD_START, expiry=EXPIRY)
+        self.daily_retired = entry('OLDR', update_type=UpdateType.DAILY, start=OLD_START, expiry=EXPIRY, collect=False)
         self.stream_retired = entry(
-            'OLDX', granularity=minute, update_type=UpdateType.STREAM, start=OLD_START, expiry=EXPIRY
+            'OLDX', granularity=minute, update_type=UpdateType.STREAM, start=OLD_START, expiry=EXPIRY, collect=False
         )
         self.stream = entry('OLDT', granularity=minute, update_type=UpdateType.STREAM, start=OLD_START)
         # The two that cannot be judged: no health, in the list, the facets and the detail alike.
@@ -1025,8 +1030,16 @@ async def test_a_retired_pre_1990_subscription_still_reads_retired(engine, catal
     views = await views_by_id(engine, only=catalog.ids(early.daily_retired, early.stream_retired))
     assert len(views) == 2
     for row in (early.daily_retired, early.stream_retired):
-        assert views[str(row.id)].health.status is FreshnessStatus.RETIRED, row.asset_symbol
-        assert views[str(row.id)].health.retired_on == row.expiry
+        assert views[str(row.id)].health == DatasetHealth(FreshnessStatus.RETIRED), row.asset_symbol
+
+
+@pytest.mark.asyncio
+async def test_a_pre_1990_subscription_with_only_an_expiry_is_not_retired_and_stays_unjudged(engine, catalog, early):
+    """Decision tj-hhy3dk: an expiry is the deletion date, so it does not short-circuit the range read to RETIRED."""
+    dated = entry('OLDE', update_type=UpdateType.DAILY, start=OLD_START, expiry=EXPIRY)
+    await store(engine, dated)
+    views = await views_by_id(engine, only=catalog.ids(dated))
+    assert views[str(dated.id)].health is None
 
 
 @pytest.mark.asyncio

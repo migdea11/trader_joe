@@ -308,7 +308,7 @@ def test_the_static_branch_goes_through_assess_completeness(monkeypatch, verdict
     got = evaluate_dataset(
         update_type=UpdateType.STATIC,
         granularity=Granularity.ONE_DAY,
-        expiry=None,
+        collect=None,
         start=start,
         end=end,
         last_bar=None,
@@ -340,7 +340,7 @@ def test_assess_completeness_agrees_with_evaluate_dataset(covered, expected):
     health_of = evaluate_dataset(
         update_type=UpdateType.STATIC,
         granularity=Granularity.ONE_DAY,
-        expiry=None,
+        collect=None,
         start=start,
         end=end,
         last_bar=None,

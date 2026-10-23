@@ -98,7 +98,7 @@ def static(start, end, covered, granularity, now=NOW) -> DatasetHealth:
     return evaluate_dataset(
         update_type=UpdateType.STATIC,
         granularity=granularity,
-        expiry=None,
+        collect=None,
         start=start,
         end=end,
         last_bar=None,
@@ -112,7 +112,7 @@ def subscription(start, now, last_bar, granularity, end=OPEN_ENDED) -> DatasetHe
     return evaluate_dataset(
         update_type=UpdateType.DAILY,
         granularity=granularity,
-        expiry=None,
+        collect=True,
         start=start,
         end=end,
         last_bar=last_bar,

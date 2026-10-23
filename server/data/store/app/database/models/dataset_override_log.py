@@ -11,6 +11,7 @@ class OverrideAction(StrEnum):
     """What the operator did to a dataset another owner holds."""
 
     SET_EXPIRY = 'SET_EXPIRY'
+    SET_COLLECTING = 'SET_COLLECTING'
     DELETE = 'DELETE'
 
 

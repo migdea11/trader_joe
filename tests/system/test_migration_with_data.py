@@ -1130,3 +1130,133 @@ def test_a_repeat_upgrade_to_the_collect_revision_is_a_no_op(scratch: ScratchDb)
 
     assert scratch.snapshot() == before, 'a repeat upgrade changed the data'
     assert scratch.schema() == schema, 'a repeat upgrade changed the schema'
+
+
+# ---------------------------------------------------------------------------------------------
+# tj-grna9p.183: a6d3f8e1c205, override_action gains SET_COLLECTING. Purely additive (one enum label, appended),
+# no backfill; the downgrade REFUSES, changing nothing, while any dataset_override_log row holds SET_COLLECTING (the
+# table is append-only audit), and otherwise recreates the type without the label in its one transaction. The
+# offline half (the SQL text and order, the refusal before any change) is
+# data/store/tests/test_override_action_set_collecting_revision.py.
+
+ENUM_REVISION = 'a6d3f8e1c205'
+OVERRIDE_TABLE = 'dataset_override_log'
+LABELS_BEFORE = ['SET_EXPIRY', 'DELETE']
+LABELS_AFTER = ['SET_EXPIRY', 'DELETE', 'SET_COLLECTING']
+
+
+def _labels(db: ScratchDb) -> list[str]:
+    with db.engine.connect() as conn:
+        return list(
+            conn.execute(
+                sa.text(
+                    'SELECT e.enumlabel FROM pg_type t JOIN pg_enum e ON e.enumtypid = t.oid '
+                    "WHERE t.typname = 'override_action' ORDER BY e.enumsortorder"
+                )
+            ).scalars()
+        )
+
+
+def _log(db: ScratchDb, action: str) -> None:
+    """One override-log row with `action`, as the service writes it (id and at from the column defaults)."""
+    with db.engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                f'INSERT INTO public.{OVERRIDE_TABLE} (actor, dataset_id, owner, action, reason) '  # nosec B608
+                "VALUES ('operator', gen_random_uuid(), 'seed-owner-a', CAST(:action AS override_action), 'probe')"
+            ),
+            {'action': action},
+        )
+
+
+def _log_rows(db: ScratchDb) -> list[tuple]:
+    statement = (
+        f'SELECT id, actor, dataset_id, owner, action::text, reason, at FROM public.{OVERRIDE_TABLE} ORDER BY id'
+    )
+    with db.engine.connect() as conn:
+        return [tuple(row) for row in conn.execute(sa.text(statement))]  # nosec B608 -- module-constant table
+
+
+def test_the_enum_revision_sits_on_the_collect_revision_unmarked_with_its_seed() -> None:
+    assert GRAPH[ENUM_REVISION].down_revision == COLLECT_REVISION
+    assert not GRAPH[ENUM_REVISION].marked, 'the enum revision is designed additive; it must carry no marker'
+    assert COLLECT_REVISION in SEED_NAMES and ENUM_REVISION in SEED_NAMES
+
+
+def test_the_enum_revision_applies_from_empty_with_the_models_labels(scratch: ScratchDb) -> None:
+    from data.store.app.database.models.dataset_override_log import OverrideAction
+
+    assert scratch.revision() is None
+    scratch.must('upgrade', ENUM_REVISION)
+    assert _labels(scratch) == LABELS_AFTER
+    assert sorted(_labels(scratch)) == sorted(member.value for member in OverrideAction)
+
+
+def test_the_enum_revision_upgrades_the_collect_seed_with_its_data_unchanged(scratch: ScratchDb) -> None:
+    seed = read_seed(COLLECT_REVISION)
+    scratch.load(seed)
+    assert _labels(scratch) == LABELS_BEFORE
+    _log(scratch, 'SET_EXPIRY')
+    rows = _log_rows(scratch)
+
+    scratch.must('upgrade', ENUM_REVISION)
+
+    assert _labels(scratch) == LABELS_AFTER
+    assert_equals_manifest(scratch, seed)
+    assert _log_rows(scratch) == rows, 'the upgrade changed an override-log row'
+    _log(scratch, 'SET_COLLECTING')  # usable once the upgrade's transaction has committed
+    assert [row[4] for row in _log_rows(scratch)].count('SET_COLLECTING') == 1
+
+
+def test_a_repeat_of_the_enum_upgrade_and_of_its_statement_is_a_no_op(scratch: ScratchDb) -> None:
+    scratch.load(read_seed(COLLECT_REVISION))
+    scratch.must('upgrade', ENUM_REVISION)
+    before, schema = scratch.snapshot(), scratch.schema()
+
+    scratch.must('upgrade', ENUM_REVISION)
+    # IF NOT EXISTS: the statement itself, run again on a type that already has the label, is no error.
+    with scratch.engine.begin() as conn:
+        conn.execute(sa.text("ALTER TYPE override_action ADD VALUE IF NOT EXISTS 'SET_COLLECTING'"))
+
+    assert scratch.snapshot() == before, 'a repeat upgrade changed the data'
+    assert scratch.schema() == schema, 'a repeat upgrade changed the schema'
+    assert _labels(scratch) == LABELS_AFTER
+
+
+def test_the_enum_downgrade_without_a_set_collecting_row_round_trips_losslessly(scratch: ScratchDb) -> None:
+    seed = read_seed(COLLECT_REVISION)
+    scratch.load(seed)
+    parent_schema = scratch.schema()
+    scratch.must('upgrade', ENUM_REVISION)
+    _log(scratch, 'SET_EXPIRY')
+    _log(scratch, 'DELETE')
+    rows = _log_rows(scratch)
+
+    scratch.must('downgrade', COLLECT_REVISION)
+
+    assert _labels(scratch) == LABELS_BEFORE, 'the downgrade did not recreate the type without SET_COLLECTING'
+    assert not scratch.enum_exists('override_action_old'), 'the downgrade left the renamed type behind'
+    assert _log_rows(scratch) == rows, 'the downgrade changed an override-log row'
+    assert_equals_manifest(scratch, seed)
+    assert scratch.schema() == parent_schema, 'the downgrade is not the inverse of the upgrade'
+
+    scratch.must('upgrade', ENUM_REVISION)
+    assert _labels(scratch) == LABELS_AFTER
+
+
+def test_the_enum_downgrade_with_a_set_collecting_row_refuses_atomically_and_deletes_no_audit_row(
+    scratch: ScratchDb,
+) -> None:
+    scratch.load(read_seed(COLLECT_REVISION))
+    scratch.must('upgrade', ENUM_REVISION)
+    _log(scratch, 'SET_EXPIRY')
+    _log(scratch, 'SET_COLLECTING')
+    before, schema, rows = scratch.snapshot(), scratch.schema(), _log_rows(scratch)
+
+    run = scratch.migrate('downgrade', COLLECT_REVISION)
+
+    assert_refused(run, scratch, ENUM_REVISION, before, schema)
+    assert 'Cannot downgrade' in run.output and 'SET_COLLECTING' in run.output, run.output[-4000:]
+    assert _log_rows(scratch) == rows, 'the refused downgrade changed or deleted an audit row'
+    assert _labels(scratch) == LABELS_AFTER
+    assert not scratch.enum_exists('override_action_old'), 'the refused downgrade left a renamed type'

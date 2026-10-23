@@ -124,11 +124,11 @@ def _no_settle_env(monkeypatch):
     monkeypatch.delenv(SETTLE_ENV, raising=False)
 
 
-def daily(start, now, last_bar, granularity, written, end=OPEN_ENDED, expiry=None, config=None) -> DatasetHealth:
+def daily(start, now, last_bar, granularity, written, end=OPEN_ENDED, collect=True, config=None) -> DatasetHealth:
     return evaluate_dataset(
         update_type=UpdateType.DAILY,
         granularity=granularity,
-        expiry=expiry,
+        collect=collect,
         start=start,
         end=end,
         last_bar=last_bar,
@@ -689,12 +689,12 @@ def test_a_still_open_week_holding_a_provisional_bar_reads_as_before():
 
 @pytest.mark.parametrize('update_type', [UpdateType.DAILY, UpdateType.STREAM], ids=str)
 def test_a_retired_dataset_is_retired_whatever_its_last_bar_s_write_time(update_type):
-    expiry = z('2026-10-25T00:00:00Z')
+    """Retired is collect false (decision tj-hhy3dk); the write time never brings a stopped subscription back."""
     for written in (None, SEED_WRITTEN, OCT20_CLOSE):
         got = evaluate_dataset(
             update_type=update_type,
             granularity=DAY,
-            expiry=expiry,
+            collect=False,
             start=SUB_START,
             end=OPEN_ENDED,
             last_bar=SEED_BAR,
@@ -703,7 +703,7 @@ def test_a_retired_dataset_is_retired_whatever_its_last_bar_s_write_time(update_
             now=z('2026-10-20T20:30:00Z'),
             last_bar_written_at=written,
         )
-        assert got == DatasetHealth(FreshnessStatus.RETIRED, retired_on=expiry)
+        assert got == DatasetHealth(FreshnessStatus.RETIRED)
 
 
 @pytest.mark.parametrize('update_type', [UpdateType.STATIC, UpdateType.STREAM], ids=str)
@@ -716,7 +716,7 @@ def test_static_and_stream_ignore_the_write_time(update_type, granularity):
             evaluate_dataset(
                 update_type=update_type,
                 granularity=granularity,
-                expiry=None,
+                collect=None if update_type is UpdateType.STATIC else True,
                 start=SUB_START,
                 end=m(d('2026-10-21')),
                 last_bar=SEED_BAR,
@@ -802,6 +802,7 @@ def _row(
     granularity: Granularity = DAY,
     start: datetime = SUB_START,
     expiry: datetime | None = None,
+    collect: bool = True,
 ) -> CatalogRow:
     return CatalogRow(
         id=uuid.uuid4(),
@@ -819,6 +820,7 @@ def _row(
         owner='operator',
         last_bar=last_bar,
         last_bar_written_at=written,
+        collect=collect,
     )
 
 
@@ -901,9 +903,13 @@ def test_the_refresh_owes_a_provisional_seed_and_not_a_final_one():
     inside_margin = _row(SEED_BAR, z('2026-10-20T20:10:00Z'))
     final = _row(SEED_BAR, OCT20_SETTLED)
     unknown = _row(SEED_BAR, None)
-    retired = _row(SEED_BAR, SEED_WRITTEN, expiry=z('2026-10-25T00:00:00Z'))
-    owed = DailyRefresher._behind([provisional, inside_margin, final, unknown, retired], frozenset(), XNYS, now)
-    assert {row.id for row in owed} == {provisional.id, inside_margin.id}
+    # Decision tj-hhy3dk: a stopped subscription is skipped; a provisional one with only a deletion date is still owed.
+    retired = _row(SEED_BAR, SEED_WRITTEN, collect=False)
+    deletion_dated = _row(SEED_BAR, SEED_WRITTEN, expiry=z('2026-10-25T00:00:00Z'))
+    owed = DailyRefresher._behind(
+        [provisional, inside_margin, final, unknown, retired, deletion_dated], frozenset(), XNYS, now
+    )
+    assert {row.id for row in owed} == {provisional.id, inside_margin.id, deletion_dated.id}
 
 
 # ------------------------------------------------------------------------------------------------- the one setting

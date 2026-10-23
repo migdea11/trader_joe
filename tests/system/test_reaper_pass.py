@@ -74,8 +74,8 @@ class Seeded:
 
 
 # Judged at `now`: PENDING are an expired STATIC with 3 bars, a STATIC whose expiry is EXACTLY now in another
-# offset (+05:00, the same instant), a retired DAILY an hour past, and a retired DAILY with a RUNNING ingest. NOT
-# PENDING: a retired DAILY an hour ahead, a STATIC with no expiry holding 2 bars.
+# offset (+05:00, the same instant), a retired DAILY an hour past, and a collecting DAILY two hours past with a
+# RUNNING ingest. NOT PENDING: a retired DAILY an hour ahead, a STATIC with no expiry holding 2 bars.
 PENDING = ('expired-static', 'exact-static', 'retired-daily', 'running-daily')
 NOT_PENDING = ('retiring-daily', 'forever-static')
 
@@ -89,9 +89,11 @@ def _seed(engine: sa.Engine, entry_values, bar_values, run_identity) -> Seeded:
     plan: dict[str, tuple[dict[str, Any], int]] = {
         'expired-static': ({**static, 'expiry': now - timedelta(days=1)}, 3),
         'exact-static': ({**static, 'expiry': plus_five}, 0),
-        'retired-daily': ({**daily, 'expiry': now - timedelta(hours=1)}, 1),
-        'running-daily': ({**daily, 'expiry': now - timedelta(hours=2)}, 0),
-        'retiring-daily': ({**daily, 'expiry': now + timedelta(hours=1)}, 0),
+        # Decision tj-hhy3dk: retired is collect false; the reaper reads only the expiry, so a stopped and a
+        # collecting subscription past expiry are both pending (running-daily collects; its RUNNING ingest skips it).
+        'retired-daily': ({**daily, 'expiry': now - timedelta(hours=1), 'collect': False}, 1),
+        'running-daily': ({**daily, 'expiry': now - timedelta(hours=2), 'collect': True}, 0),
+        'retiring-daily': ({**daily, 'expiry': now + timedelta(hours=1), 'collect': False}, 0),
         'forever-static': ({**static, 'expiry': None}, 2),
     }
     with engine.begin() as conn:

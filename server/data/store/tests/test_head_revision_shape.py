@@ -88,6 +88,11 @@ OVERRIDE_LOG_FILE = f'{OVERRIDE_LOG_REVISION}_dataset_override_log_and_deletion.
 # agreement tests below still read FEED_REVISION; its own shape is pinned in test_dataset_entry_collect_revision.py.
 COLLECT_REVISION = 'e5c8b1d4f703'
 COLLECT_FILE = f'{COLLECT_REVISION}_dataset_entry_collect.py'
+# THE HEAD SINCE tj-grna9p.183: override_action gains SET_COLLECTING, PURELY ADDITIVE (one enum value) and directly
+# on the collect revision. It touches no table's columns or keys; its own shape is pinned in
+# test_override_action_set_collecting_revision.py.
+SET_COLLECTING_REVISION = 'a6d3f8e1c205'
+SET_COLLECTING_FILE = f'{SET_COLLECTING_REVISION}_override_action_set_collecting.py'
 # The parent the epic's design names for its one revision (tj-vhboky.12 item 1).
 PARENT_REVISION = '8f41c2d7a3b9'
 PARENT_FILE = f'{PARENT_REVISION}_bar_natural_key_and_upsert.py'
@@ -244,12 +249,18 @@ def test_each_revision_of_the_two_epics_sits_directly_on_the_one_before_it():
     # same as before. A fourth revision slipped in between would still re-point one of these hops.
     # A FOURTH since tj-grna9p.46: the dataset_read revision, directly on ingest_run.
     # A FIFTH since tj-grna9p.86: the override-log revision, directly on dataset_read.
-    # A SIXTH since tj-grna9p.176: the head is the collect revision, directly on the override-log revision.
-    assert head_revision.module.__file__.endswith(COLLECT_FILE), (
-        f'the head is not {COLLECT_FILE}: {head_revision.module.__file__}'
+    # A SIXTH since tj-grna9p.176: the collect revision, directly on the override-log revision.
+    # A SEVENTH since tj-grna9p.183: the head is the SET_COLLECTING enum revision, directly on the collect revision.
+    assert head_revision.module.__file__.endswith(SET_COLLECTING_FILE), (
+        f'the head is not {SET_COLLECTING_FILE}: {head_revision.module.__file__}'
     )
-    assert head_revision.down_revision == OVERRIDE_LOG_REVISION, (
-        f'the head does not sit directly on {OVERRIDE_LOG_REVISION}: {head_revision.down_revision}'
+    assert head_revision.down_revision == COLLECT_REVISION, (
+        f'the head does not sit directly on {COLLECT_REVISION}: {head_revision.down_revision}'
+    )
+    collect_revision = script.get_revision(COLLECT_REVISION)
+    assert collect_revision.module.__file__.endswith(COLLECT_FILE), f'{COLLECT_REVISION} is not {COLLECT_FILE}'
+    assert collect_revision.down_revision == OVERRIDE_LOG_REVISION, (
+        f'{COLLECT_REVISION} does not sit directly on {OVERRIDE_LOG_REVISION}: {collect_revision.down_revision}'
     )
     override_log_revision = script.get_revision(OVERRIDE_LOG_REVISION)
     assert override_log_revision.module.__file__.endswith(OVERRIDE_LOG_FILE), (

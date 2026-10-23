@@ -113,7 +113,10 @@ def _expiry(pg_engine: Engine, entry: sa.Row) -> Any:
     return stored.expiry
 
 
-def test_an_overriding_patch_retires_and_writes_one_trimmed_override_row(subscription, pg_engine, data_store):
+def test_an_overriding_patch_sets_the_deletion_date_only_and_writes_one_trimmed_override_row(
+    subscription, pg_engine, data_store
+):
+    """Decision tj-hhy3dk: the expiry is the deletion date; the subscription stays ACTIVE and collecting."""
     row = subscription()
 
     response = data_store.request(
@@ -122,7 +125,13 @@ def test_an_overriding_patch_retires_and_writes_one_trimmed_override_row(subscri
 
     assert response.status_code == 200, data_store.describe(response)
     body = response.json()
-    assert (body['id'], body['expiry'], body['state']) == (str(row.id), EXPIRY, 'DATASET_STATE_RETIRED')
+    assert (body['id'], body['expiry'], body['state'], body['collecting']) == (
+        str(row.id),
+        EXPIRY,
+        'DATASET_STATE_ACTIVE',
+        True,
+    )
+    assert _stored(pg_engine, row).collect is True, 'the expiry write changed collect'
     assert _expiry(pg_engine, row) == datetime(2031, 1, 2, tzinfo=UTC)
     (logged,) = _rows(pg_engine, OVERRIDE, row.id)
     assert (logged.actor, logged.owner, logged.action, logged.reason) == (
@@ -133,9 +142,9 @@ def test_an_overriding_patch_retires_and_writes_one_trimmed_override_row(subscri
     )
     assert logged.at is not None and logged.id is not None
 
-    resumed = data_store.request('PATCH', _expiry_path(row.id), json={'override': GOOD}, auth=WriteAuth.RIGHT)
-    assert resumed.status_code == 200, data_store.describe(resumed)
-    assert resumed.json()['state'] == 'DATASET_STATE_ACTIVE'
+    cleared = data_store.request('PATCH', _expiry_path(row.id), json={'override': GOOD}, auth=WriteAuth.RIGHT)
+    assert cleared.status_code == 200, data_store.describe(cleared)
+    assert cleared.json()['state'] == 'DATASET_STATE_ACTIVE'
     assert _expiry(pg_engine, row) is None
     assert len(_rows(pg_engine, OVERRIDE, row.id)) == 2
 
@@ -291,3 +300,77 @@ def test_both_writes_refuse_without_the_instance_secret(subscription, pg_engine,
     )
     assert data_store.request('DELETE', _path(row.id), json={'override': GOOD}, auth=auth).status_code == 401
     assert len(_rows(pg_engine, BAR_TABLE, row.id)) == 3 and _rows(pg_engine, OVERRIDE, row.id) == []
+
+
+# ---------------------------------------------------------------------------------------------
+# PATCH /ui/v1/datasets/{id}/collecting on Postgres (tj-grna9p.175, the native label tj-grna9p.183): the override-log
+# row's action is the NATIVE override_action label SET_COLLECTING, which no SQLite test can store or read back.
+
+
+def _collecting_path(dataset_id: UUID) -> str:
+    return f'/ui/v1/datasets/{dataset_id}/collecting'
+
+
+def test_an_overriding_stop_then_start_writes_two_set_collecting_rows_and_keeps_the_expiry(
+    subscription, pg_engine, data_store
+):
+    row = subscription()
+    dated = data_store.request(
+        'PATCH', _expiry_path(row.id), json={'expiry': EXPIRY, 'override': GOOD}, auth=WriteAuth.RIGHT
+    )
+    assert dated.status_code == 200, data_store.describe(dated)
+
+    stopped = data_store.request(
+        'PATCH', _collecting_path(row.id), json={'collect': False, 'override': GOOD}, auth=WriteAuth.RIGHT
+    )
+    assert stopped.status_code == 200, data_store.describe(stopped)
+    body = stopped.json()
+    assert (body['state'], body['collecting'], body['expiry']) == ('DATASET_STATE_RETIRED', False, EXPIRY)
+    assert body['freshness']['status'] == 'FRESHNESS_STATUS_RETIRED'
+    assert _stored(pg_engine, row).collect is False
+
+    started = data_store.request(
+        'PATCH', _collecting_path(row.id), json={'collect': True, 'override': GOOD}, auth=WriteAuth.RIGHT
+    )
+    assert started.status_code == 200, data_store.describe(started)
+    assert (started.json()['state'], started.json()['collecting']) == ('DATASET_STATE_ACTIVE', True)
+    assert (_stored(pg_engine, row).collect, _expiry(pg_engine, row)) == (True, datetime(2031, 1, 2, tzinfo=UTC))
+
+    logged_rows = _rows(pg_engine, OVERRIDE, row.id)
+    assert sorted(logged.action for logged in logged_rows) == ['SET_COLLECTING', 'SET_COLLECTING', 'SET_EXPIRY']
+    for logged in logged_rows:
+        assert (logged.actor, logged.owner, logged.reason) == (OPERATOR_PRINCIPAL, row.owner, 'system override')
+
+
+def test_the_collecting_refusals_on_postgres_write_nothing(
+    subscription, insert_entry, own_symbol, pg_engine, data_store, foreign_owner
+):
+    row = subscription()
+    static = insert_entry(asset_symbol=f'{own_symbol}ST', owner=foreign_owner)
+    unknown = UUID('00000000-0000-4000-8000-0000000175a1')
+    cases = [
+        (row.id, {}, 422, Reason.INVALID_REQUEST, 'Unprocessable Entity'),
+        (row.id, {'override': GOOD}, 422, Reason.INVALID_REQUEST, 'Unprocessable Entity'),
+        (unknown, {'collect': False, 'override': GOOD}, 404, Reason.NOT_FOUND, 'Not Found'),
+        (static.id, {'collect': False, 'override': GOOD}, 422, Reason.INVALID_REQUEST, 'Unprocessable Entity'),
+        (row.id, {'collect': False}, 409, Reason.OVERRIDE_REQUIRED, 'Conflict'),
+    ]
+    for dataset_id, body, status, reason, title in cases:
+        response = data_store.request('PATCH', _collecting_path(dataset_id), json=body, auth=WriteAuth.RIGHT)
+        assert_problem(response, status=status, reason=reason.value, title=title, describe=data_store.describe)
+        assert foreign_owner not in response.text
+    assert _stored(pg_engine, row).collect is True
+    assert _rows(pg_engine, OVERRIDE, row.id) == [] and _rows(pg_engine, OVERRIDE, static.id) == []
+
+
+def test_the_operators_own_stop_writes_no_override_row(subscription, pg_engine, data_store):
+    row = subscription('OC', owner=OPERATOR_PRINCIPAL)
+    response = data_store.request(
+        'PATCH',
+        _collecting_path(row.id),
+        json={'collect': False, 'override': {'reason': '', 'confirmed': False}},
+        auth=WriteAuth.RIGHT,
+    )
+    assert response.status_code == 200, data_store.describe(response)
+    assert _stored(pg_engine, row).collect is False
+    assert _rows(pg_engine, OVERRIDE, row.id) == []

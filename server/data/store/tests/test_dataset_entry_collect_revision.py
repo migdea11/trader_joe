@@ -148,10 +148,12 @@ def _satisfies(conn: sqlite3.Connection, condition: str, update_type: int, colle
 # --------------------------------------------------------------------------------------------- place in the chain
 
 
-def test_the_revision_is_the_head_directly_on_the_override_log_revision_and_is_additive():
+def test_the_revision_is_directly_on_the_override_log_revision_and_is_additive():
+    """No longer the head since tj-grna9p.183 (a6d3f8e1c205 sits on it); still exactly one child, the enum revision."""
     script = ScriptDirectory(str(MIGRATIONS_DIR))
-    assert script.get_heads() == [REVISION]
+    assert script.get_heads() == ['a6d3f8e1c205']
     assert script.get_revision(REVISION).down_revision == PARENT
+    assert [rev.revision for rev in script.walk_revisions() if rev.down_revision == REVISION] == ['a6d3f8e1c205']
     # Additive: no exception marker, so test_migration_with_data's GENERIC RULE holds it lossless both ways.
     assert not ADDITIVE_EXCEPTION_MARKER.search(REVISION_FILE.read_text(encoding='utf-8'))
 

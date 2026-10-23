@@ -455,8 +455,27 @@ def _decode_cursor(cursor: str) -> dict[str, Any]:
 
 
 def is_retired(row: CatalogRow) -> bool:
-    """Whether the dataset is retired: an expiry on a DAILY or STREAM subscription means it stopped collecting."""
-    return row.expiry is not None and row.update_type in (UpdateType.DAILY, UpdateType.STREAM)
+    """Whether the dataset is retired: a DAILY or STREAM subscription whose collect intent is false.
+
+    The expiry is the deletion date and is never read here (decision tj-hhy3dk): a subscription with an expiry
+    keeps collecting until the operator stops it.
+    """
+    return row.update_type in (UpdateType.DAILY, UpdateType.STREAM) and row.collect is False
+
+
+def is_collecting(row: CatalogRow, running: bool) -> bool:
+    """Whether the dataset is being collected: a subscription's collect intent; for STATIC, whether its latest run is RUNNING.
+
+    Args:
+        row: The entry.
+        running: Whether the dataset's latest run is RUNNING; read only for a STATIC dataset.
+
+    Returns:
+        bool: DatasetSummary.collecting.
+    """
+    if row.update_type is UpdateType.STATIC:
+        return running
+    return row.collect is not False
 
 
 def effective_end(row: CatalogRow, now: datetime) -> datetime:
@@ -506,13 +525,13 @@ async def evaluate_views(
     for row in rows:
         calendar = calendars[row.id]
         if calendar is None:
-            health = DatasetHealth(FreshnessStatus.RETIRED, retired_on=row.expiry) if is_retired(row) else None
+            health = DatasetHealth(FreshnessStatus.RETIRED) if is_retired(row) else None
         else:
             try:
                 health = evaluate_dataset(
                     update_type=row.update_type,
                     granularity=row.granularity,
-                    expiry=row.expiry,
+                    collect=row.collect,
                     start=row.start,
                     end=effective_end(row, now),
                     last_bar=row.last_bar,

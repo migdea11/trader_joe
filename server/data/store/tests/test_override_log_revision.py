@@ -136,8 +136,27 @@ def test_the_revision_builds_exactly_the_indexes_the_models_declare():
     assert len(declared) == 3
 
 
-def test_the_action_type_carries_the_models_members_in_order():
-    assert list(_load().ACTION_MEMBERS) == [member.value for member in OverrideAction]
+def test_the_action_type_carries_the_models_members_it_was_created_with_in_order():
+    """d7e2a9c35b18 created the type with the two actions of its day; history does not change (tj-grna9p.183)."""
+    assert list(_load().ACTION_MEMBERS) == ['SET_EXPIRY', 'DELETE']
+    assert set(_load().ACTION_MEMBERS) < {member.value for member in OverrideAction}
+
+
+def test_the_revision_chain_gives_the_native_type_every_model_member_exactly_once():
+    """The labels at the head: d7e2a9c35b18's, then each ADD VALUE after it, are exactly the model's values.
+
+    The native order is creation order (ADD VALUE appends): SET_EXPIRY, DELETE, SET_COLLECTING. The model declares
+    SET_COLLECTING between the two; nothing sorts or compares the action, so only membership is pinned here, and the
+    ordering difference is reported to the architect rather than made a contract.
+    """
+    path = MIGRATIONS_DIR / 'versions' / 'a6d3f8e1c205_override_action_set_collecting.py'
+    spec = importlib.util.spec_from_file_location('revision_a6d3f8e1c205', path)
+    later = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(later)
+    native = [*_load().ACTION_MEMBERS, later.NEW_MEMBER]
+    assert native == ['SET_EXPIRY', 'DELETE', 'SET_COLLECTING']
+    assert sorted(native) == sorted(member.value for member in OverrideAction)
+    assert len(set(native)) == len(native)
 
 
 def test_both_tables_are_in_allowed_models_so_autogenerate_sees_them():

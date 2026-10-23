@@ -6,7 +6,8 @@ until ingest's scheduler (tj-pd41mt Addendum 1) lands; one `run_periodic` per so
 `AfterTradingEvent(calendar, CLOSE, settle)`; every pass derives its work from the DATABASE (no job store, no replay);
 only the MISSING TAIL of each behind, non-retired DAILY dataset is requested, through the existing fetch path and the
 run recorder (trigger SCHEDULE, actor `scheduler`), one dataset at a time, capped per pass, with bounded backoff; a
-retired subscription is never refreshed (an expiry on DAILY retires it at once, clearing it resumes: the .86 rule); a
+retired subscription is never refreshed (since tj-grna9p.175, decision tj-hhy3dk: retired is collect false and the
+expiry is the deletion date only, so setting or clearing it stops or resumes nothing); a
 dataset with a RUNNING ingest is skipped; one worker only. The body's "Postgres advisory lock" does not apply under
 the single-worker invariant.
 
@@ -80,8 +81,8 @@ REMOVED_RETRY_ENV = 'DAILY_REFRESH_RETRY_MINUTES'
 # NOW is Tue 6 Oct 2026 22:00Z: the 6th's session closed at 20:00Z, so the last completed session is the 6th.
 # BEHIND, oldest newest-bar first: `older` (last bar Wed 30 Sep), `empty` (no bars, declared start Thu 1 Oct, so it
 # sorts on its start), `behind2` (last bar Fri 2 Oct), `behind` (last bar Mon 5 Oct, LATE). NOT BEHIND: `fresh`
-# (last bar the 6th), `retired` (an expiry a day AHEAD: an expiry retires a DAILY dataset at once), `running` (a
-# RUNNING ingest), `static` (a STATIC dataset with gaps: not a subscription).
+# (last bar the 6th), `retired` (collect false: the operator stopped it; decision tj-hhy3dk, an expiry retires
+# nothing), `running` (a RUNNING ingest), `static` (a STATIC dataset with gaps: not a subscription).
 BEHIND_ORDER = ('older', 'empty', 'behind2', 'behind')
 NOT_BEHIND = ('fresh', 'retired', 'running', 'static')
 LAST_BAR = {
@@ -102,7 +103,7 @@ def _seed() -> dict[str, StoreDatasetEntry]:
         'behind2': entry(f'{SYMBOL_PREFIX}C', feed=Feed.SIP, **daily),
         'behind': entry(f'{SYMBOL_PREFIX}D', **daily),
         'fresh': entry(f'{SYMBOL_PREFIX}E', **daily),
-        'retired': entry(f'{SYMBOL_PREFIX}F', expiry=NOW + timedelta(days=1), **daily),
+        'retired': entry(f'{SYMBOL_PREFIX}F', collect=False, **daily),
         'running': entry(f'{SYMBOL_PREFIX}G', **daily),
         'static': entry(f'{SYMBOL_PREFIX}H', start=ny_midnight(1, 9), end=ny_midnight(6)),
     }
@@ -136,6 +137,13 @@ class World:
         async with AsyncSession(self.engine) as db:
             await db.execute(
                 update(StoreDatasetEntry).where(StoreDatasetEntry.id == self.rows[name].id).values(expiry=expiry)
+            )
+            await db.commit()
+
+    async def set_collect(self, name: str, collect: bool) -> None:
+        async with AsyncSession(self.engine) as db:
+            await db.execute(
+                update(StoreDatasetEntry).where(StoreDatasetEntry.id == self.rows[name].id).values(collect=collect)
             )
             await db.commit()
 
@@ -298,23 +306,42 @@ async def test_nothing_is_behind_before_the_session_closes(world: World):
 
 
 @pytest.mark.asyncio
-async def test_a_retired_subscription_is_never_refreshed_and_a_cleared_one_resumes(world: World):
-    """The .86 rule: setting an expiry on DAILY retires it at once (past or future); clearing it resumes."""
-    for expiry in (NOW + timedelta(days=30), NOW - timedelta(hours=1)):
-        await world.set_expiry('behind', expiry)
+async def test_a_stopped_subscription_is_never_refreshed_and_a_started_one_resumes(world: World):
+    """Decision tj-hhy3dk: collect false stops the refresh, whatever the expiry says; collect true resumes it."""
+    for expiry in (None, NOW + timedelta(days=30), NOW - timedelta(hours=1)):
+        await world.set_expiry('retired', expiry)
         client = ScriptedClient()
         await world.refresher(client).run_pass(DataSource.ALPACA_API)
-        assert 'behind' not in world.requested(client), f'retired with expiry {expiry} was refreshed'
+        assert 'retired' not in world.requested(client), f'stopped with expiry {expiry} was refreshed'
 
-    await world.set_expiry('behind', None)
+    await world.set_collect('retired', True)
     client = ScriptedClient()
     await world.refresher(client).run_pass(DataSource.ALPACA_API)
-    assert 'behind' in world.requested(client)
+    assert 'retired' in world.requested(client), 'collect true did not resume the refresh'
 
+    await world.set_collect('behind', False)
+    client = ScriptedClient()
+    await world.refresher(client).run_pass(DataSource.ALPACA_API)
+    assert 'behind' not in world.requested(client), 'collect false did not stop the refresh'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('expiry', [NOW + timedelta(days=30), NOW - timedelta(hours=1)], ids=['future', 'past'])
+async def test_an_expiry_alone_never_stops_the_refresh(world: World, expiry):
+    """The expiry is the deletion date only: a collecting DAILY dataset with one, future or past, is still refreshed."""
+    await world.set_expiry('behind', expiry)
+    client = ScriptedClient()
+    await world.refresher(client).run_pass(DataSource.ALPACA_API)
+    assert 'behind' in world.requested(client), f'an expiry {expiry} stopped a collecting subscription'
+
+
+@pytest.mark.asyncio
+async def test_clearing_an_expiry_never_resumes_a_stopped_subscription(world: World):
+    await world.set_expiry('retired', NOW + timedelta(days=3))
     await world.set_expiry('retired', None)
     client = ScriptedClient()
     await world.refresher(client).run_pass(DataSource.ALPACA_API)
-    assert 'retired' in world.requested(client)
+    assert 'retired' not in world.requested(client), 'clearing an expiry resumed a stopped subscription'
 
 
 @pytest.mark.asyncio
@@ -1219,7 +1246,7 @@ class _RetireDuringFetch(ScriptedClient):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('values', [{'expiry': NOW + timedelta(days=3)}, None], ids=['retired', 'deleted'])
+@pytest.mark.parametrize('values', [{'collect': False}, None], ids=['retired', 'deleted'])
 async def test_a_retire_or_delete_during_the_fetch_drops_the_answer(world: World, values):
     client = _RetireDuringFetch(world.engine, _symbol(world, 'behind'), values)
 
@@ -1242,10 +1269,23 @@ async def test_a_retire_or_delete_during_the_fetch_drops_the_answer(world: World
     if values is None:
         assert stored is None, 'the refresh recreated a deleted entry'
     else:
-        assert stored.expiry == values['expiry'], 'the system actor undid the operator retire'
+        assert stored.collect is False, 'the system actor undid the operator stop'
     assert (run.state, run.bars_written, run.error_reason) == (IngestRunState.EMPTY, 0, None)
     changed = [event_.id for event_ in world.events if isinstance(event_, DatasetChanged)]
     assert world.rows['behind'].id not in changed
+
+
+@pytest.mark.asyncio
+async def test_a_deletion_date_set_during_the_fetch_does_not_drop_the_answer(world: World):
+    """Decision tj-hhy3dk: an expiry written while the vendor call is in flight stops nothing; the answer is stored."""
+    expiry = NOW + timedelta(days=3)
+    client = _RetireDuringFetch(world.engine, _symbol(world, 'behind'), {'expiry': expiry})
+
+    result = await world.refresher(client).run_pass(DataSource.ALPACA_API)
+
+    assert result == PassResult(behind=4, refreshed=4, discarded=0)
+    assert 'behind' in [world.name_of(created.asset_symbol) for created in world.upserts], 'the answer was dropped'
+    assert world.rows['behind'].id in {batch.dataset_id for batch in world.bar_batches}, 'no bars written'
 
 
 @pytest.mark.asyncio
@@ -1266,7 +1306,15 @@ async def test_the_refresh_upserts_with_preserve_lifecycle_and_post_store_does_n
     path = StoreAssetDatasetPath(asset_type=row.asset_type, data_type=row.data_type, asset_symbol=row.asset_symbol)
     async with AsyncSession(world.engine) as db:
         await data_action_request.store_market_activity_worker(path, body, db, ScriptedClient())
-    assert world.upsert_kwargs == [{}], 'POST /store no longer calls the upsert exactly as before'
+    # POST /store passes the body's collect (None when omitted: the upsert writes true for a subscription) and never
+    # preserve_lifecycle; the refresh above never passes a collect, so it cannot change the operator's intent.
+    assert world.upsert_kwargs == [{'collect': None}], 'POST /store no longer calls the upsert with the body collect'
+
+    world.upsert_kwargs.clear()
+    stopped = body.model_copy(update={'collect': False})
+    async with AsyncSession(world.engine) as db:
+        await data_action_request.store_market_activity_worker(path, stopped, db, ScriptedClient())
+    assert world.upsert_kwargs == [{'collect': False}], 'POST /store dropped an explicit collect false'
 
 
 # ------------------------------------------------------------------------------------------------- the lifespan

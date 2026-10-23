@@ -85,7 +85,8 @@ async def store_data(
     # AFTER the fetch's commit, never inside it. The upsert's xmax is not read, so CREATED cannot be told
     # from a repeat without changing the upsert's contract; the client reloads either way.
     if run.dataset_id is not None:
-        publish(DatasetChanged(run.dataset_id, DatasetChange.UPDATED))
+        # A collect flip is RETIRED or RESUMED, the vocabulary's own meaning; every other write is UPDATED.
+        publish(DatasetChanged(run.dataset_id, _change_kind(stored.collect_changed_to)))
     return StoreAssetDatasetResponse(
         message='Data stored',
         data_points=stored.data_points,
@@ -94,6 +95,13 @@ async def store_data(
         # ServedRange cannot silently publish it.
         served_range=ServedRange(start=stored.served_range.start, end=stored.served_range.end),
     )
+
+
+def _change_kind(collect_changed_to: bool | None) -> DatasetChange:
+    """The change a write publishes: RETIRED when collect went false, RESUMED when it went true, else UPDATED."""
+    if collect_changed_to is None:
+        return DatasetChange.UPDATED
+    return DatasetChange.RESUMED if collect_changed_to else DatasetChange.RETIRED
 
 
 @router.get(AssetDatasetStoreInterface.GET_STORE_ASSET_DATASET)

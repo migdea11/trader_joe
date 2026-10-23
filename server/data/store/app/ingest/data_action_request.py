@@ -62,7 +62,9 @@ from data.store.app.database.crud.stock.asset_market_activity import write_marke
 from data.store.app.database.crud.stock.store_dataset_entry import (
     OverlapKey,
     check_own_overlap,
+    collect_change,
     lock_active_entry,
+    lock_stored_collect,
     upsert_entry_in_transaction,
 )
 from data.store.app.database.transaction import write_transaction
@@ -108,10 +110,13 @@ class StoredDataset:
     Attributes:
         data_points: How many bars were written.
         served_range: The window the fetch's FetchDone named, exactly as it arrived.
+        collect_changed_to: The collect the request flipped the entry to (False retired it, True resumed it), or None
+            when it flipped nothing: a new entry, an omitted collect, or the same value. Decides the change event.
     """
 
     data_points: int
     served_range: fetch_dataset.ServedRange
+    collect_changed_to: bool | None = None
 
 
 def _fetch_request(
@@ -328,6 +333,8 @@ async def store_market_activity_worker(
     item_count = 0
     # The stream's terminator, kept so its served_range leaves the transaction with the row count.
     done: fetch_dataset.FetchDone | None = None
+    # The collect value the upsert flipped the entry to, when it flipped one.
+    collect_flip: bool | None = None
 
     async with write_transaction(db, 'fetch and store dataset'):
         # Step 0, INSIDE the transaction but BEFORE the stream: inside, so the refusal rolls back
@@ -360,7 +367,7 @@ async def store_market_activity_worker(
                     entry = _entry_on_ack(overlap_key, request_body.expiry, event)
                     if preserve_lifecycle:
                         # THE SCHEDULED REFRESH. Lock the entry and re-check, right before any bar is written,
-                        # that it still exists and is not retired: an operator's retire may have committed
+                        # that it still exists and is not retired (collect false): an operator's stop may have committed
                         # while the vendor call was in flight. Retired or gone means the answer is dropped and
                         # nothing is written. The lock is held to the commit below, so a retire that comes
                         # later waits for it. The refresh never creates an entry and never writes a
@@ -369,7 +376,10 @@ async def store_market_activity_worker(
                             raise DatasetRetiredDuringFetch
                         dataset_id = await upsert_entry_in_transaction(db, entry, preserve_lifecycle=True)
                     else:
-                        dataset_id = await upsert_entry_in_transaction(db, entry)
+                        # Read under lock before the upsert replaces it: whether collect flipped decides the event.
+                        collect_before = await lock_stored_collect(db, entry)
+                        collect_flip = collect_change(collect_before, request_body.collect)
+                        dataset_id = await upsert_entry_in_transaction(db, entry, collect=request_body.collect)
                     if on_ack is not None:
                         await on_ack(dataset_id, feed)
                 case fetch_dataset.BarPage():
@@ -394,4 +404,4 @@ async def store_market_activity_worker(
 
     # done is set: the seam raises rather than ending a stream without a FetchDone (tj-tkm4tn D4),
     # so reaching here with None would be a defect in the seam and surfaces as the bug it is.
-    return StoredDataset(data_points=item_count, served_range=done.served_range)
+    return StoredDataset(data_points=item_count, served_range=done.served_range, collect_changed_to=collect_flip)

@@ -22,7 +22,7 @@ STATUSES AND THE RULING THEY COME FROM (tj-grna9p.8 addendum, final form; tj-grn
             GAPS     some do; `gap_count` counts the SESSIONS inside [start, end) of missing periods
                      (not runs). Decided by completeness.assess_completeness; the status is mapped from its
                      CompletenessStatus, not redefined here.
-    RETIRED expiry is set on a DAILY or STREAM dataset: no freshness is computed.
+    RETIRED collect is false on a DAILY or STREAM dataset (the expiry is irrelevant): no freshness is computed.
 
 A DAILY bar counts only once FINAL: written at or after the close of its period (the session for 1min..1day, the
 last session of the week or month for 1week and 1month) PLUS the settle margin (`FreshnessConfig.settle_margin`,
@@ -121,8 +121,6 @@ class DatasetHealth:
     expected_last_bar: datetime | None = None
     # STATIC: missing sessions in [start, end), 0 unless status is GAPS.
     gap_count: int = 0
-    # RETIRED: the expiry instant ("Retired - deleted on <date>").
-    retired_on: datetime | None = None
 
     @property
     def is_failure(self) -> bool:
@@ -133,7 +131,7 @@ def evaluate_dataset(
     *,
     update_type: UpdateType,
     granularity: Granularity,
-    expiry: datetime | None,
+    collect: bool | None,
     start: datetime,
     end: datetime,
     last_bar: datetime | None,
@@ -144,6 +142,9 @@ def evaluate_dataset(
     last_bar_written_at: datetime | None = None,
 ) -> DatasetHealth:
     """Health of one dataset at `now`.
+
+    `collect` is the subscription's collect intent (None for a STATIC dataset, which has none): False on a DAILY or
+    STREAM dataset reads RETIRED, whatever its expiry.
 
     `last_bar` is the newest bar timestamp (None when there are none). `covered` is the set of
     sessions holding a bar (see completeness.covered_sessions); it is only read for STATIC, where None means
@@ -156,13 +157,12 @@ def evaluate_dataset(
     it: a newest bar of the expected period written before that period closed plus `config.settle_margin` is
     provisional, and the dataset reads LATE (see last_bar_is_provisional).
     """
-    require_aware(
-        expiry=expiry, start=start, end=end, last_bar=last_bar, now=now, last_bar_written_at=last_bar_written_at
-    )
+    require_aware(start=start, end=end, last_bar=last_bar, now=now, last_bar_written_at=last_bar_written_at)
     config = config or FreshnessConfig()
 
-    if expiry is not None and update_type in (UpdateType.DAILY, UpdateType.STREAM):
-        return DatasetHealth(FreshnessStatus.RETIRED, retired_on=expiry)
+    # RETIRED is the collect intent, never the expiry (decision tj-hhy3dk): the expiry is the deletion date only.
+    if collect is False and update_type in (UpdateType.DAILY, UpdateType.STREAM):
+        return DatasetHealth(FreshnessStatus.RETIRED)
     if update_type == UpdateType.STATIC:
         result = assess_completeness(start, end, covered or frozenset(), granularity, calendar, now)
         return DatasetHealth(_FROM_COMPLETENESS[result.status], gap_count=result.gap_count)

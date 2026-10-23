@@ -80,6 +80,7 @@ class CatalogRow:
         expiry_type: How the dataset's rows expire.
         expiry: When the dataset is deleted, or None when nothing is scheduled.
         owner: The free-text label of who asked for it.
+        collect: The operator's collect intent: True or False for a DAILY or STREAM subscription, None for STATIC.
         last_bar: The newest stored bar's timestamp, or None when there are no bars.
         last_bar_written_at: When that newest bar was last written (its updated_at), or None when there are no bars.
     """
@@ -99,6 +100,7 @@ class CatalogRow:
     owner: str
     last_bar: datetime | None
     last_bar_written_at: datetime | None = None
+    collect: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -173,6 +175,7 @@ def _row(entry: Entry, last_bar: datetime | None, last_bar_written_at: datetime 
         owner=entry.owner,
         last_bar=last_bar,
         last_bar_written_at=last_bar_written_at,
+        collect=entry.collect,
     )
 
 
@@ -226,8 +229,8 @@ async def get_catalog_row(db: AsyncSession, dataset_id: uuid.UUID) -> CatalogRow
 def _past_expiry(now: datetime) -> ColumnElement[bool]:
     """THE PENDING-SET PREDICATE, written once: an expiry is set and has passed (`expiry <= now`).
 
-    Whatever the update type: a retired DAILY or STREAM dataset is pending only once its expiry has passed, the same
-    as a STATIC one. Both pending reads below use it, so the reaper's pass, GET /ui/v1/reaper/pending and the
+    Whatever the update type and whatever collect says (decision tj-hhy3dk): a collecting or a stopped subscription is
+    pending once its expiry has passed, the same as a STATIC one. Both pending reads below use it, so the reaper's pass, GET /ui/v1/reaper/pending and the
     DatasetSummary.reaper_pending flag can never disagree about which datasets are pending.
     """
     return and_(Entry.expiry.is_not(None), Entry.expiry <= now)

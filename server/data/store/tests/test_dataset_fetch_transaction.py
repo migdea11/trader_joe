@@ -51,7 +51,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import Insert as PostgresInsert
 
 from common.enums.data_select import AssetType, DataType
-from common.enums.data_stock import DataSource, Feed, Granularity
+from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from common.errors.vocabulary import ExogenousError, InvalidRequestError, Reason, TraderJoeError
 from data.store.app import app_depends
 from data.store.app.database.crud.stock import store_dataset_entry as crud
@@ -89,14 +89,17 @@ class JournalingSession:
     fooled by a formatting change. The overlap probe is the Select, the entry upsert and every bar
     chunk are Inserts.
 
-    It answers the two results the entry upsert reads -- an empty overlap row set, then the id from
-    the RETURNING clause -- and an empty result for everything after. A bar chunk's result is never
-    read, so there is nothing to make faithful there.
+    It answers the three results the entry write reads -- an empty overlap row set, the stored collect
+    the pre-upsert lock reads (tj-grna9p.189; None by default: no row yet), then the id from the
+    RETURNING clause -- and an empty result for everything after. A bar chunk's result is never read,
+    so there is nothing to make faithful there. The lock is told from the overlap probe by its FOR
+    UPDATE, and journaled as its own kind of statement, so its position is asserted, not assumed.
     """
 
-    def __init__(self, journal: list[str], *, entry_id: uuid.UUID):
+    def __init__(self, journal: list[str], *, entry_id: uuid.UUID, stored_collect: bool | None = None):
         self.journal = journal
         self.entry_id = entry_id
+        self.stored_collect = stored_collect
         self.statements: list = []
         self.commits = 0
         self.rollbacks = 0
@@ -111,6 +114,9 @@ class JournalingSession:
             _Result: The canned answer.
         """
         self.statements.append(statement)
+        if isinstance(statement, Select) and statement._for_update_arg is not None:
+            self.journal.append('execute Select FOR UPDATE')
+            return _Result(stored=self.stored_collect)
         if isinstance(statement, Select):
             self.journal.append('execute Select')
             return _Result(rows=[])
@@ -132,14 +138,18 @@ class JournalingSession:
 
 
 class _Result:
-    """One canned answer, with the two accessors the entry upsert uses."""
+    """One canned answer, with the three accessors the entry write uses."""
 
-    def __init__(self, *, rows: list | None = None, scalar: uuid.UUID | None = None):
+    def __init__(self, *, rows: list | None = None, scalar: uuid.UUID | None = None, stored: bool | None = None):
         self._rows = rows or []
         self._scalar = scalar
+        self._stored = stored
 
     def all(self) -> list:
         return self._rows
+
+    def scalar_one_or_none(self) -> bool | None:
+        return self._stored
 
     def scalar_one(self) -> uuid.UUID:
         assert self._scalar is not None, 'the create path read an id back from a result that was not given one'
@@ -234,9 +244,12 @@ async def test_the_whole_fetch_is_one_transaction_committed_only_after_the_done(
     assert written.served_range == served_range_of(fetch_client.script), (
         'the StoredDataset does not carry the served range out of the transaction'
     )
+    # 'execute Select FOR UPDATE' is the stored-collect lock (tj-grna9p.189): on the ack, right before the
+    # upsert, inside the same transaction, so the value read is the one the upsert replaces.
     assert journal == [
         'execute Select',
         'yield FetchAccepted',
+        'execute Select FOR UPDATE',
         'execute Insert',
         'yield BarPage',
         'execute Insert',
@@ -380,6 +393,7 @@ async def test_a_stream_that_breaks_after_a_page_commits_nothing_and_rolls_back(
     assert journal == [
         'execute Select',
         'yield FetchAccepted',
+        'execute Select FOR UPDATE',
         'execute Insert',
         'yield BarPage',
         'execute Insert',
@@ -409,9 +423,14 @@ async def test_an_accepted_but_empty_window_still_writes_its_entry_and_commits()
         'a served-but-empty window must still carry the range the vendor answered for: it is the '
         'only thing distinguishing it from a window nobody fetched (tj-lldllr)'
     )
-    assert journal == ['execute Select', 'yield FetchAccepted', 'execute Insert', 'yield FetchDone', 'commit'], (
-        f'an empty but accepted fetch did not write and commit its entry: {journal}'
-    )
+    assert journal == [
+        'execute Select',
+        'yield FetchAccepted',
+        'execute Select FOR UPDATE',
+        'execute Insert',
+        'yield FetchDone',
+        'commit',
+    ], f'an empty but accepted fetch did not write and commit its entry: {journal}'
 
 
 # ---------------------------------------------------------------------------------------------
@@ -648,6 +667,184 @@ def test_the_overlap_key_the_worker_builds_carries_no_tape():
     assert 'start' in key_fields and 'end' in key_fields, (
         f'the overlap key has lost the range, so the assertion above is about some other type: {sorted(key_fields)}'
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# THE COLLECT FLIP, through the worker (tj-grna9p.189, the tj-hhy3dk addendum)
+#
+# On the ack, before the upsert, the worker locks the entry and reads its stored collect; whether the
+# body's EXPLICIT collect differs from it decides the event the route publishes (RETIRED, RESUMED or
+# UPDATED). An OMITTED collect is not false and not true: it flips nothing and the upsert leaves the
+# stored intent alone. The real upsert runs, so the chain body -> worker -> upsert SET is what is pinned.
+# ---------------------------------------------------------------------------------------------
+
+
+def _daily_body(collect: bool | None) -> StoreAssetDatasetBody:
+    """A DAILY subscription body (open-ended, ROLLING); collect None means the body omits it."""
+    fields = {} if collect is None else {'collect': collect}
+    return StoreAssetDatasetBody(
+        owner='strategy-that-asked',
+        source=DataSource.ALPACA_API,
+        granularity=Granularity.ONE_DAY,
+        start=datetime(2026, 1, 1, tzinfo=UTC),
+        expiry_type=ExpiryType.ROLLING,
+        update_type=UpdateType.DAILY,
+        **fields,
+    )
+
+
+def _conflict_set(session: JournalingSession) -> str:
+    """The entry upsert's ON CONFLICT DO UPDATE SET clause, as SQL."""
+    inserts = [statement for statement in session.statements if isinstance(statement, PostgresInsert)]
+    sql = str(inserts[0].compile(dialect=postgresql.dialect()))
+    return sql.split('DO UPDATE SET', 1)[1].split('RETURNING', 1)[0].strip()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('stored', 'sent', 'flipped_to'),
+    [
+        pytest.param(False, True, True, id='stopped-resumed-by-explicit-true'),
+        pytest.param(True, False, False, id='collecting-stopped-by-explicit-false'),
+        pytest.param(False, None, None, id='stopped-repeat-without-collect-flips-nothing'),
+        pytest.param(True, None, None, id='collecting-repeat-without-collect-flips-nothing'),
+        pytest.param(True, True, None, id='collecting-explicit-true-is-no-flip'),
+        pytest.param(False, False, None, id='stopped-explicit-false-is-no-flip'),
+        pytest.param(None, False, None, id='create-stopped-is-no-flip'),
+        pytest.param(None, True, None, id='create-explicit-true-is-no-flip'),
+        pytest.param(None, None, None, id='create-omitted-is-no-flip'),
+    ],
+)
+async def test_the_worker_reports_a_collect_flip_only_for_an_explicit_value_that_differs(stored, sent, flipped_to):
+    """StoredDataset.collect_changed_to: the new value on a flip, None otherwise (a create never flips)."""
+    journal: list[str] = []
+    session = JournalingSession(journal, entry_id=uuid.uuid4(), stored_collect=stored)
+    fetch_client = RecordingFetchClient(FetchScript(events=accepted_stream()), journal=journal)
+
+    stored_dataset = await data_action_request.store_market_activity_worker(
+        REQUEST_PATH, _daily_body(sent), session, fetch_client
+    )
+
+    assert stored_dataset.collect_changed_to is flipped_to, (
+        f'stored {stored}, sent {sent}: the worker reported {stored_dataset.collect_changed_to!r}, '
+        f'not {flipped_to!r}, so the route would publish the wrong DatasetChange'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('stored', [True, False], ids=['collecting', 'stopped'])
+async def test_a_repeat_post_without_collect_leaves_the_stored_intent_through_the_whole_path(stored):
+    """THE ADDENDUM's REASON: an SDK retry of its original body (no collect) cannot undo an operator's Stop.
+
+    Omitted must reach the upsert as omitted, not as the create default true and not as false: the SET of the exact
+    repeat names no collect at all, while the INSERT (taken only on a create) still writes the default true.
+    """
+    journal: list[str] = []
+    session = JournalingSession(journal, entry_id=uuid.uuid4(), stored_collect=stored)
+    fetch_client = RecordingFetchClient(FetchScript(events=accepted_stream()), journal=journal)
+
+    await data_action_request.store_market_activity_worker(REQUEST_PATH, _daily_body(None), session, fetch_client)
+
+    assert 'collect' not in _conflict_set(session), (
+        f'a repeat POST without collect writes collect on conflict: {_conflict_set(session)}'
+    )
+    assert _entry_insert_params(session)['collect'] is True, 'an omitted collect no longer creates a collecting one'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('sent', [True, False], ids=['explicit-true', 'explicit-false'])
+async def test_an_explicit_collect_reaches_the_upserts_set_as_sent(sent):
+    """Explicit false is not omitted: it reaches the repeat's SET (and the create's INSERT) as false, true as true."""
+    journal: list[str] = []
+    session = JournalingSession(journal, entry_id=uuid.uuid4(), stored_collect=not sent)
+    fetch_client = RecordingFetchClient(FetchScript(events=accepted_stream()), journal=journal)
+
+    await data_action_request.store_market_activity_worker(REQUEST_PATH, _daily_body(sent), session, fetch_client)
+
+    inserts = [statement for statement in session.statements if isinstance(statement, PostgresInsert)]
+    compiled = inserts[0].compile(dialect=postgresql.dialect())
+    set_clause = _conflict_set(session)
+    assert 'collect = %(' in set_clause, f'an explicit collect did not reach the repeat SET: {set_clause}'
+    bind = set_clause.split('collect = %(', 1)[1].split(')s', 1)[0]
+    assert compiled.params[bind] is sent, f'the repeat SET binds collect {compiled.params[bind]!r}, not {sent!r}'
+    assert compiled.params['collect'] is sent, 'the create INSERT does not carry the explicit collect'
+
+
+@pytest.mark.asyncio
+async def test_the_collect_lock_reads_only_collect_for_update_on_the_whole_identity_the_ack_resolved():
+    """The pre-upsert read is FOR UPDATE (so the value is the one the upsert replaces) and keyed on IDENTITY.
+
+    Identity includes the tape the ACK resolved, not the body's preference (the same hazard as the entry insert): a
+    lock keyed on the preference would read another tape's dataset and report its flip.
+    """
+    journal: list[str] = []
+    session = JournalingSession(journal, entry_id=uuid.uuid4(), stored_collect=True)
+    fetch_client = RecordingFetchClient(FetchScript(events=accepted_stream(feed=RESOLVED_FEED)), journal=journal)
+    body = _daily_body(False).model_copy(update={'feed': PREFERRED_FEED})
+
+    await data_action_request.store_market_activity_worker(REQUEST_PATH, body, session, fetch_client)
+
+    (lock,) = [s for s in session.statements if isinstance(s, Select) and s._for_update_arg is not None]
+    compiled = lock.compile(dialect=postgresql.dialect())
+    sql = str(compiled)
+    assert sql.startswith('SELECT store_dataset_entry.collect \nFROM'), f'the lock reads more than collect: {sql}'
+    assert sql.rstrip().endswith('FOR UPDATE'), f'the stored-collect read is not FOR UPDATE: {sql}'
+    where = sql.split('WHERE', 1)[1].replace('"', '')  # "end" is a reserved word, quoted
+    for column in (*crud._IDENTITY_EQUALITY_COLUMNS, *crud._RANGE_COLUMNS):
+        assert f'store_dataset_entry.{column} = ' in where, f'the lock does not key on {column}: {where}'
+    assert RESOLVED_FEED in compiled.params.values(), 'the lock is not keyed on the ack resolved tape'
+    assert PREFERRED_FEED not in compiled.params.values(), 'the lock is keyed on the body preference'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('sent', [None, True, False], ids=['omitted', 'explicit-true', 'explicit-false'])
+async def test_a_post_sends_exactly_three_statements_before_its_bars(sent):
+    """The statement count per POST, pinned: the overlap probe, the collect lock, the upsert. Nothing more.
+
+    The collect lock is the one statement tj-grna9p.189 added; an accidental fourth (a second read of the entry, a
+    lock per page) reds here. It runs whether or not the body carries collect (see the verdict note on the bead).
+    """
+    journal: list[str] = []
+    session = JournalingSession(journal, entry_id=uuid.uuid4(), stored_collect=True)
+    fetch_client = RecordingFetchClient(FetchScript(events=accepted_stream()), journal=journal)
+
+    await data_action_request.store_market_activity_worker(REQUEST_PATH, _daily_body(sent), session, fetch_client)
+
+    executed = [entry for entry in journal if entry.startswith('execute')]
+    assert executed == ['execute Select', 'execute Select FOR UPDATE', 'execute Insert'], executed
+
+
+@pytest.mark.asyncio
+async def test_a_static_post_locks_reads_no_intent_and_flips_nothing():
+    """STATIC has no collect intent: its stored collect is NULL, so the lock reads None and nothing flips."""
+    session, fetch_client, _ = _drive(FetchScript(events=accepted_stream()))
+    assert REQUEST_BODY.update_type is UpdateType.STATIC and REQUEST_BODY.collect is None
+
+    stored_dataset = await _store(session, fetch_client)
+
+    assert stored_dataset.collect_changed_to is None
+    assert 'collect' not in _conflict_set(session), _conflict_set(session)
+    assert _entry_insert_params(session)['collect'] is None, 'a STATIC entry was written with a collect intent'
+
+
+@pytest.mark.asyncio
+async def test_the_refresh_never_reads_the_collect_lock_and_never_flips(monkeypatch: pytest.MonkeyPatch):
+    """preserve_lifecycle (the DAILY refresh): lock_active_entry is its lock; it never reports a flip or SETs collect."""
+    entry_id = uuid.uuid4()
+    monkeypatch.setattr(data_action_request, 'lock_active_entry', AsyncMock(return_value=entry_id))
+    stored_lock = AsyncMock(side_effect=AssertionError('the refresh read the POST path collect lock'))
+    monkeypatch.setattr(data_action_request, 'lock_stored_collect', stored_lock)
+    journal: list[str] = []
+    session = JournalingSession(journal, entry_id=entry_id, stored_collect=False)
+    fetch_client = RecordingFetchClient(FetchScript(events=accepted_stream()), journal=journal)
+
+    stored_dataset = await data_action_request.store_market_activity_worker(
+        REQUEST_PATH, _daily_body(True), session, fetch_client, preserve_lifecycle=True
+    )
+
+    assert stored_dataset.collect_changed_to is None
+    assert _conflict_set(session) == 'updated_at = now()', _conflict_set(session)
+    stored_lock.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------------------------

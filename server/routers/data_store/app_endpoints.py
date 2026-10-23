@@ -54,6 +54,7 @@ class UiDatasetWritesInterface(StrEnum):
     """The /ui/v1 expiry and delete writes (tj-grna9p.86). They take the instance secret."""
 
     PATCH_UI_DATASET_EXPIRY = '/ui/v1/datasets/{dataset_id}/expiry'
+    PATCH_UI_DATASET_COLLECTING = '/ui/v1/datasets/{dataset_id}/collecting'
     DELETE_UI_DATASET = '/ui/v1/datasets/{dataset_id}'
 
 
