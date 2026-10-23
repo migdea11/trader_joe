@@ -283,15 +283,57 @@ def is_seed_producer(step: stack.Step) -> bool:
     return 'data.store.seeds' in step.argv
 
 
+# The dev exec family (ADR tj-4rr0la addendum 22): the label lookup is a plain `docker ps` whose
+# last two words are `--format {{.ID}}`, and it answers with exactly one running container, so a
+# sample dev_db_tables call ends 'ok'. Spelled from literals, not from stack.dev_lookup_argv().
+DEV_CONTAINER_ID = 'c0ffee000001'
+DEV_DB_TABLES_STDOUT = (
+    b'dataset_read|t\ndataset_read_daily|t\ndataset_override_log|t\ndataset_deletion|t\n'
+    b'ingest_run|t\nstore_dataset_entry|t\nstock_market_activity|t\nalembic_version|t\n'
+    b'version_num|d7e2a9c35b18\n'
+)
+# What the dev_migrate_status script prints (tj-iee6sn.13.5): a header per alembic subcommand, then
+# its redacted output. Told apart from dev_db_tables' exec by its option set, `-w /code` (the table of
+# stack.DEV_EXEC_COMMANDS), spelled here from literals.
+DEV_MIGRATE_STATUS_STDOUT = (
+    b'== alembic current ==\nd7e2a9c35b18 (head)\n'
+    b'== alembic history ==\nb3d9e1a47c62 -> d7e2a9c35b18 (head), dataset override log and deletion\n'
+)
+# What the dev_http_get script prints for /ping (tj-iee6sn.13.6): the status line, then the redacted
+# body. Told apart by its option set, which is NONE: the container id follows `exec` directly.
+DEV_HTTP_GET_STDOUT = b'== GET /ping -> HTTP 200 ==\n{"message":"pong"}\n'
+
+
+def is_dev_lookup(step: stack.Step) -> bool:
+    """A plain `docker ps ... --format {{.ID}}`: the dev exec target lookup."""
+    return list(step.argv[:2]) == ['/usr/local/bin/docker', 'ps'] and list(step.argv[-2:]) == ['--format', '{{.ID}}']
+
+
+def is_dev_exec(step: stack.Step) -> bool:
+    """A plain `docker exec`: the dev exec family's only other argv."""
+    return list(step.argv[:2]) == ['/usr/local/bin/docker', 'exec']
+
+
 def default_response(step: stack.Step) -> runner.ProcessResult:
     """Every docker step succeeds; `ps -q postgres` answers with one container id (postgres is running).
 
-    The seed producer's run answers with SEED_STDOUT, a valid bundle.
+    The seed producer's run answers with SEED_STDOUT, a valid bundle. The dev lookup answers with
+    one id and a dev exec with DEV_DB_TABLES_STDOUT, the shape the dev_db_tables script prints, or,
+    for the `-w /code` exec of dev_migrate_status, DEV_MIGRATE_STATUS_STDOUT, or, for the option-less
+    exec of dev_http_get, DEV_HTTP_GET_STDOUT.
     """
     if list(step.argv[-3:]) == ['ps', '-q', 'postgres']:
         return runner.ProcessResult(0, b'0123456789ab\n', b'')
     if is_seed_producer(step):
         return runner.ProcessResult(0, SEED_STDOUT, b'')
+    if is_dev_lookup(step):
+        return runner.ProcessResult(0, f'{DEV_CONTAINER_ID}\n'.encode(), b'')
+    if is_dev_exec(step) and list(step.argv[2:4]) == ['-w', '/code']:
+        return runner.ProcessResult(0, DEV_MIGRATE_STATUS_STDOUT, b'')
+    if is_dev_exec(step) and len(step.argv) > 2 and not step.argv[2].startswith('-'):
+        return runner.ProcessResult(0, DEV_HTTP_GET_STDOUT, b'')
+    if is_dev_exec(step):
+        return runner.ProcessResult(0, DEV_DB_TABLES_STDOUT, b'')
     return runner.ProcessResult(0, b'', b'')
 
 
@@ -413,6 +455,9 @@ VERB_SAMPLES: Mapping[str, dict[str, Any]] = {
     'ps': {},
     'dev_logs': {'service': 'postgres', 'tail': 50},
     'dev_ps': {},
+    'dev_db_tables': {},
+    'dev_migrate_status': {},
+    'dev_http_get': {'name': 'ping'},
 }
 # Verbs that run no docker at all. None since tj-irhy0a.22 wired seed_dump; kept so a future verb
 # that runs no docker is classified here rather than tripping the docker sweeps.
@@ -421,7 +466,10 @@ DOCKERLESS_VERBS: frozenset[str] = frozenset()
 # addendum 18). They run docker, but NOT through stack.compose_prefix(): no -f, no
 # --project-directory, no --env-file, so the agent-stack sweeps must exclude them rather than
 # mis-slice their four-word prefix. tj-tq2hn6 (B2) owns the containment tests that take their place.
-DEV_PROJECT_VERBS = frozenset({'dev_ps', 'dev_logs'})
+DEV_PROJECT_VERBS = frozenset({'dev_ps', 'dev_logs', 'dev_db_tables', 'dev_migrate_status', 'dev_http_get'})
+# The subset that runs PLAIN docker -- a label lookup, then `docker exec` -- rather than the dev
+# compose prefix (ADR tj-4rr0la addendum 22). test_dev_exec.py owns their containment tests.
+DEV_EXEC_VERBS = frozenset({'dev_db_tables', 'dev_migrate_status', 'dev_http_get'})
 
 
 def tree_digest(path: Path) -> dict[str, str]:

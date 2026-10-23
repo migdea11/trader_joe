@@ -462,7 +462,20 @@ def test_a_worktree_swapped_for_a_symlink_mid_verb_never_reaches_the_daemon(
 # claim was unpinned. migrate_check, added after this list was written, does NOT belong: it BUILDS
 # data_store before it compares (stack.alembic_check_steps), so it is a BUILDING_VERB in test_bases
 # and reads the snapshot like every other alembic verb. Everything here is in BASE_FREE_VERBS.
-@pytest.mark.parametrize('verb', ['stack_down', 'stack_wipe', 'logs', 'ps', 'dev_ps', 'dev_logs'])
+@pytest.mark.parametrize(
+    'verb',
+    [
+        'stack_down',
+        'stack_wipe',
+        'logs',
+        'ps',
+        'dev_ps',
+        'dev_logs',
+        'dev_db_tables',
+        'dev_migrate_status',
+        'dev_http_get',
+    ],
+)
 def test_verbs_that_build_nothing_read_no_worktree_and_need_no_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str
 ):

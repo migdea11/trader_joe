@@ -64,9 +64,17 @@ services:
       GRPC: 1
       EVENTS: 1
       POST: 1
-      # Off, stated rather than left to the image's defaults. EXEC off also stops `exec`: creating
-      # one is POST /containers/{id}/exec (under CONTAINERS), but starting it is /exec/{id}/start.
-      EXEC: 0
+      # ON, for the read-only dev diagnostics (ADR tj-4rr0la addendum 22; owner ruling D9 on
+      # tj-iee6sn.1). Creating an exec is POST /containers/{id}/exec (CONTAINERS, already on);
+      # starting and inspecting it is /exec/{id}/start and /exec/{id}/json, which is this section.
+      # WHAT IT REACHES: the proxy has no notion of a compose project, so agent_mcp can exec any
+      # command in ANY running container on the host daemon -- dev, the agent stack, a prod-mode
+      # stack, and socket_proxy itself. That is no new ceiling: CONTAINERS with POST already lets it
+      # create any container with any mount, the socket included. The control is the same as ever
+      # (addendum 1 (b)): the server execs only fixed argv built from module constants into a
+      # container found by label, and re-checks each (stack.check_dev_exec_argv).
+      # Applied only by `make agent-mcp-rebuild`, like every edit to this file.
+      EXEC: 1
       AUTH: 0
       SECRETS: 0
       CONFIGS: 0

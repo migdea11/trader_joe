@@ -102,7 +102,8 @@ def _docstring_sections() -> tuple[set[str], set[str]]:
     needed_block, not_block = block.split('NOT needed, keep off:', 1)
     needed = set()
     for line in needed_block.splitlines()[1:]:
-        if not line.startswith('    ') or not line.strip():
+        # A row starts at exactly four spaces; a deeper indent continues the row above's description.
+        if not line.startswith('    ') or not line.strip() or line.startswith('     '):
             continue
         head = re.split(r'\s{2,}', line.strip())[0]
         needed |= {word.strip().removesuffix('=1') for word in head.split(',')}
@@ -111,23 +112,51 @@ def _docstring_sections() -> tuple[set[str], set[str]]:
     return needed, not_needed
 
 
+# The sections the verbs need, from literals. Every one but EXEC since addendum 1; EXEC since ADR
+# tj-4rr0la addendum 22 (owner ruling D9 on tj-iee6sn.13.1): creating an exec is POST
+# /containers/{id}/exec, under CONTAINERS, but STARTING it is /exec/{id}/start, which only this
+# section opens, so the read-only dev diagnostics (dev_db_tables first) cannot run without it.
+EXPECTED_PROXY_NEEDED = {
+    'PING',
+    'VERSION',
+    'INFO',
+    'CONTAINERS',
+    'IMAGES',
+    'NETWORKS',
+    'VOLUMES',
+    'BUILD',
+    'SESSION',
+    'GRPC',
+    'EVENTS',
+    'EXEC',
+    'POST',
+}
+# The sections that stay off. Addendum 22 (2): "Nothing else in the list changes" -- EXEC moved out
+# of this set and nothing else did, so a second section turned on (or one dropped) is red here.
+EXPECTED_PROXY_KEPT_OFF = {
+    'AUTH',
+    'SECRETS',
+    'CONFIGS',
+    'PLUGINS',
+    'SYSTEM',
+    'SWARM',
+    'NODES',
+    'SERVICES',
+    'TASKS',
+    'DISTRIBUTION',
+    'COMMIT',
+}
+
+
 def test_the_proxy_allows_exactly_the_sections_the_verbs_need():
-    """P1: 1 for exactly the docstring's NEED list, 0 for every section it names NOT needed."""
+    """P1: 1 for exactly the docstring's NEED list, 0 for every section it names NOT needed.
+
+    Both lists are pinned from literals as well as against each other: the docstring and the compose
+    file agreeing is not enough, since one edit could widen both together.
+    """
     needed, not_needed = _docstring_sections()
-    assert needed == {
-        'PING',
-        'VERSION',
-        'INFO',
-        'CONTAINERS',
-        'IMAGES',
-        'NETWORKS',
-        'VOLUMES',
-        'BUILD',
-        'SESSION',
-        'GRPC',
-        'EVENTS',
-        'POST',
-    }
+    assert needed == EXPECTED_PROXY_NEEDED, sorted(needed ^ EXPECTED_PROXY_NEEDED)
+    assert not_needed == EXPECTED_PROXY_KEPT_OFF, sorted(not_needed ^ EXPECTED_PROXY_KEPT_OFF)
     environment = {str(key): value for key, value in _services()['socket_proxy']['environment'].items()}
     sections = {key: value for key, value in environment.items() if key not in PROXY_NON_SECTION_SETTINGS}
     assert {key for key, value in sections.items() if value == 1} == needed, f'sections allowed: {sections}'
@@ -135,6 +164,48 @@ def test_the_proxy_allows_exactly_the_sections_the_verbs_need():
     assert set(sections.values()) <= {0, 1}
     for key, value in PROXY_NON_SECTION_SETTINGS.items():
         assert environment.get(key) == value, (key, environment.get(key))
+
+
+def test_the_proxy_environment_is_exactly_the_section_list_with_exec_on_and_nothing_else_moved():
+    """Addendum 22 (2), whole: EXEC 1, every other section and switch exactly as before the slice.
+
+    Spelled as one literal mapping, so a variable added, removed or flipped anywhere in the block is
+    red here even where the docstring-driven test above would agree with a matching docstring edit.
+    """
+    environment = {str(key): value for key, value in _services()['socket_proxy']['environment'].items()}
+    assert environment == {
+        **dict.fromkeys(EXPECTED_PROXY_NEEDED, 1),
+        **dict.fromkeys(EXPECTED_PROXY_KEPT_OFF, 0),
+        **PROXY_NON_SECTION_SETTINGS,
+    }
+    assert environment['EXEC'] == 1
+
+
+def test_the_proxy_exec_comment_states_its_reach_and_its_control():
+    """Addendum 22 (3) asks for the reach 'stated without understatement', beside the switch itself.
+
+    The words pinned are the claims a reader needs: the ruling, that exec reaches ANY container on the
+    daemon (socket_proxy included), that CONTAINERS+POST was already that ceiling, and what the control
+    is. The comment block directly above `EXEC: 1` is read, not the whole file.
+    """
+    lines = AGENT_MCP_FILE.read_text(encoding='utf-8').splitlines()
+    index = next(number for number, line in enumerate(lines) if line.strip() == 'EXEC: 1')
+    block = []
+    for line in reversed(lines[:index]):
+        if not line.strip().startswith('#'):
+            break
+        block.insert(0, line.strip().lstrip('#').strip())
+    comment = ' '.join(block)
+    for claim in (
+        'addendum 22',
+        'ANY running container',
+        'socket_proxy itself',
+        'CONTAINERS with POST',
+        '/exec/{id}/start',
+        'stack.check_dev_exec_argv',
+        'make agent-mcp-rebuild',
+    ):
+        assert claim in comment, f'the EXEC comment no longer states {claim!r}: {comment}'
 
 
 def test_the_proxy_image_is_pinned_by_digest_and_joins_only_its_network():

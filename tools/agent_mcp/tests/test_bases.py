@@ -60,7 +60,21 @@ LITERAL_BUILT_SERVICES = {'data_store', 'data_ingest', 'test_client'}
 BUILDING_VERBS = {'stack_up', 'run_system_tests', 'migrate', 'migrate_status', 'migrate_check', 'seed_dump'}
 # dev_ps and dev_logs are base-free by construction, not by choice: they hand compose no file, so
 # there is no service definition to build from (ADR tj-4rr0la addendum 18).
-BASE_FREE_VERBS = {'stack_down', 'stack_wipe', 'logs', 'ps', 'dev_ps', 'dev_logs'}
+# dev_db_tables likewise (addendum 22): a plain `docker ps` lookup and a `docker exec` into a running
+# container, neither of which can build or pull anything. dev_migrate_status the same (tj-iee6sn.13.5):
+# it execs into the RUNNING data_store, unlike migrate_status, whose one-off `run` can build.
+# dev_http_get too (tj-iee6sn.13.6): the same lookup and one exec into the running data_store.
+BASE_FREE_VERBS = {
+    'dev_http_get',
+    'stack_down',
+    'stack_wipe',
+    'logs',
+    'ps',
+    'dev_ps',
+    'dev_logs',
+    'dev_db_tables',
+    'dev_migrate_status',
+}
 
 
 # --- the Dockerfile's external refs ----------------------------------------------------------------
@@ -194,6 +208,14 @@ _BUILDER_SAMPLES = {
 # The dev-project builders take no env file (they pass none), so they are swept separately below
 # rather than given a misleading second parameter. tj-tq2hn6 (B2) owns their containment tests.
 _DEV_BUILDER_SAMPLES = {'dev_ps_steps': (), 'dev_logs_steps': ('data_store', 50)}
+# The dev EXEC builders (addendum 22) take a container id, not a compose tail: plain `docker exec`,
+# which runs in an existing container and can never build. Swept on their own for the same reason.
+_DEV_EXEC_BUILDER_SAMPLES = {
+    'dev_exec_steps': ('c0ffee000001', stack.DEV_DB_TABLES_TAIL),
+    'dev_db_tables_steps': ('c0ffee000001',),
+    'dev_migrate_status_steps': ('c0ffee000001',),
+    'dev_http_get_steps': ('c0ffee000001', 'ping'),
+}
 
 
 def _builders() -> dict[str, object]:
@@ -216,9 +238,9 @@ def _can_build(tail: list[str]) -> bool:
 def test_every_steps_builder_flags_each_step_that_can_build():
     """Pin (3), builder half: every *_steps builder sets Step.builds by the addendum-15 rule on every step."""
     builders = _builders()
-    assert set(builders) == set(_BUILDER_SAMPLES) | set(_DEV_BUILDER_SAMPLES), (
-        f'builders {sorted(builders)} vs samples {sorted(set(_BUILDER_SAMPLES) | set(_DEV_BUILDER_SAMPLES))}: '
-        'add the new builder here'
+    samples = set(_BUILDER_SAMPLES) | set(_DEV_BUILDER_SAMPLES) | set(_DEV_EXEC_BUILDER_SAMPLES)
+    assert set(builders) == samples, (
+        f'builders {sorted(builders)} vs samples {sorted(samples)}: add the new builder here'
     )
     stack_dir, env_file = Path('/stack'), Path('/stack/agent_stack.env')
     flagged = 0
@@ -232,6 +254,11 @@ def test_every_steps_builder_flags_each_step_that_can_build():
         for step in builders[name](stack_dir, *sample):
             tail = list(step.argv[dev_step_prefix_length() :])
             assert _can_build(tail) is False and step.builds is False, f'{name}: {tail} can build'
+    for name, sample in _DEV_EXEC_BUILDER_SAMPLES.items():
+        steps = builders[name](stack_dir, *sample)
+        assert steps, f'{name} built no step'
+        for step in steps:
+            assert step.argv[:2] == (EXPECTED_DOCKER, 'exec') and step.builds is False, f'{name}: {step.argv[:2]}'
 
 
 # --- every verb ensures the bases before it can build -----------------------------------------------

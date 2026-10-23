@@ -12,6 +12,19 @@ tj-kzy7w2, approved on tj-wpnr7o (b)):
 
     dev_ps()  dev_logs(service, tail)
 
+and THREE READ-ONLY EXEC VERBS into that project (ADR tj-4rr0la addendum 22; the proxy's EXEC section):
+
+    dev_db_tables()  dev_migrate_status()  dev_http_get(name)
+
+It finds the dev postgres container by label (exactly one running, else it refuses) and execs one
+fixed psql script in it as user postgres in a read-only transaction: which of the store's tables
+exist, and the alembic revision. No agent argument reaches the argv; stack.check_dev_exec_argv()
+re-checks it as built, against a table that binds each whole command to its one option set. The script
+redacts the container's own secret variables in-container. dev_migrate_status() does the same in the
+running data_store, running alembic current and history, and refuses when data_store is not running.
+dev_http_get(name) does one GET of one of three fixed paths (name is a closed enum; no URL, path or
+header) in the running data_store, reads at most 64 KB of the body and redacts it in-container.
+
 An agent passes a worktree NAME, test paths, a service from a closed set and a line count -- never a
 compose argument, an image, a container id, a command line or a host path.
 
@@ -121,8 +134,10 @@ docker-socket-proxy's variables, everything else off:
     NETWORKS, VOLUMES      the project's networks; compose inspects volumes on up and down.
     BUILD, SESSION, GRPC   image builds through BuildKit (compose build, run --build).
     EVENTS                 compose up --wait and run follow container events.
+    EXEC                   start and inspect an exec: the read-only dev diagnostics (dev_db_tables,
+                           dev_migrate_status; ADR tj-4rr0la addendum 22). Creating one is POST under CONTAINERS.
     POST=1                 every one of the above that writes.
-NOT needed, keep off: EXEC, AUTH, SECRETS, CONFIGS, PLUGINS, SYSTEM, SWARM, NODES, SERVICES, TASKS,
+NOT needed, keep off: AUTH, SECRETS, CONFIGS, PLUGINS, SYSTEM, SWARM, NODES, SERVICES, TASKS,
 DISTRIBUTION, COMMIT. The list is read from what compose calls for these verbs and is confirmed at
 the host sitting (tj-c4mosr.6); a verb failing with 403 from the proxy names the missing section.
 THE DEV VERBS WIDEN NOTHING (tj-kzy7w2 asked this be checked rather than assumed): `compose ps` of a

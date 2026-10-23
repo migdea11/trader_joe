@@ -1291,3 +1291,391 @@ def dev_ps_steps(stack_dir: Path) -> list[Step]:
 def dev_logs_steps(stack_dir: Path, service: str, tail: int) -> list[Step]:
     """The last `tail` lines of one dev service's log. Never --follow: a verb returns."""
     return _dev_steps(stack_dir, ['logs', '--no-color', '--tail', str(tail), service])
+
+
+# ---------------------------------------------------------------------------------------------
+# THE DEV PROJECT'S EXEC FAMILY (ADR tj-4rr0la addenda 22-23; owner ruling D9 on tj-iee6sn.1). A
+# SECOND argv family beside the compose one above, held by check_dev_exec_argv() instead of
+# check_dev_argv(): plain `docker exec`, never compose, so it reads no compose file and no env file.
+#
+# WHAT HOLDS IT. The agent names nothing: no container, no command, no SQL, no URL, no header. Every
+# exec argv is built from the module constants below and re-checked as built. The target container
+# comes from a label lookup (dev_lookup_argv), which must find exactly ONE RUNNING container.
+#
+# The labels compose puts on every container it creates. oneoff=False keeps `run` containers out.
+DEV_LABEL_PROJECT = 'com.docker.compose.project'
+DEV_LABEL_SERVICE = 'com.docker.compose.service'
+DEV_LABEL_ONEOFF = 'com.docker.compose.oneoff'
+# `docker ps --format` prints the short container id, 12 lowercase hex digits; the id is checked
+# before it is handed to exec, so nothing but an id can take its place in the argv.
+_CONTAINER_ID = re.compile(r'^[0-9a-f]{12,64}$')
+
+# Read-only for every statement of the session, whatever the SQL: psql reads PGOPTIONS (libpq).
+DEV_EXEC_PGOPTIONS = 'PGOPTIONS=-c default_transaction_read_only=on'
+# The option sets an exec may carry, each whole. Which one goes with which command is DEV_EXEC_COMMANDS
+# below: the options are bound to the command, never chosen separately, so the database script cannot
+# run as root or without the read-only option, nor the alembic wrapper as user postgres. -i, -t,
+# --privileged, --env-file, --env, any other -e and the attached spellings (-ePATH=x, -uroot) have no
+# set and so are refused.
+_DEV_EXEC_OPTIONS_POSTGRES = ('-u', 'postgres', '-e', DEV_EXEC_PGOPTIONS)
+_DEV_EXEC_OPTIONS_CODE = ('-w', '/code')
+
+# dev_db_tables: the tables whose presence it reports (to_regclass, so a missing one is false, not an
+# error), in the order of the models under server/data/store/app/database/models. The schema is the
+# default, public: no model names another. alembic_version is alembic's own bookkeeping table.
+DEV_DB_TABLES = (
+    'dataset_read',
+    'dataset_read_daily',
+    'dataset_override_log',
+    'dataset_deletion',
+    'ingest_run',
+    'store_dataset_entry',
+    'stock_market_activity',
+    'alembic_version',
+)
+DEV_DB_VERSION_TABLE = 'alembic_version'
+_DEV_DB_TABLES_QUERY = ' UNION ALL '.join(
+    f"SELECT '{name}', to_regclass('public.{name}') IS NOT NULL" for name in DEV_DB_TABLES
+)
+# The second statement runs only when the first reported alembic_version present.
+_DEV_DB_VERSION_QUERY = "SELECT 'version_num', version_num FROM public.alembic_version ORDER BY version_num"
+# Run INSIDE the postgres container by `sh -c`, as user postgres, in a read-only session (PGOPTIONS).
+# POSTGRES_USER and POSTGRES_DB expand in the container and are never printed. Every byte printed
+# goes through redact: the values of the container's own secret variables, and of any variable
+# holding a database URL, become <redacted> before they leave the container. The scrub contract
+# (tj-4kyqk9), shared by every exec wrapper that pipes through redact: the secrets are the non-empty
+# values, plus each non-empty line of a multi-line value as its own secret, de-duplicated and redacted
+# over the whole output (awk reads it all, so a value spanning lines still matches); an empty value
+# is never a secret. The SQL is a constant with no placeholder: nothing is interpolated.
+_DEV_REDACT_NAMES = 'INSTANCE_WRITE_SECRET POSTGRES_PASS POSTGRES_PASSWORD ALPACA_API_KEY ALPACA_API_SECRET'
+# The scrub is the UNION of every match span: every occurrence of every secret is found over the
+# ORIGINAL text (stepping one character past each match start, so self-overlapping occurrences are
+# all found), overlapping and abutting spans merge, and each merged span becomes ONE <redacted>.
+# Order of secrets is irrelevant; over-redacting is acceptable, under-redacting is not. The input is
+# held as lines joined pairwise (O(n log n), no per-line growth of one string) and scanned in
+# windows so the cost stays near-linear; output is written piece by piece. When the caller sets
+# REDACT_TRUNCATED=1 (a constant signal, never a value) the input was cut by a byte bound, so the
+# longest trailing suffix that is a proper prefix of any secret is redacted too. Off by default.
+_DEV_REDACT_FUNCTION = r"""redact() { awk 'function put(s) { if (s != "" && !(s in seen)) { seen[s] = 1; secrets[++m] = s } }
+function add(v,  c, parts, q) { if (v == "") return; put(v); c = split(v, parts, "\n"); if (c > 1) for (q = 1; q <= c; q++) put(parts[q]) }
+function emit() { printf "%s<redacted>", substr(buf, pos, cs - pos); pos = ce + 1 }
+BEGIN { n = split("@NAMES@", names, " "); m = 0; maxl = 0
+  for (i = 1; i <= n; i++) add(ENVIRON[names[i]])
+  for (k in ENVIRON) if (ENVIRON[k] ~ /^postgres(ql)?(\+[a-z0-9]+)?:\/\//) add(ENVIRON[k])
+  for (a = 1; a <= m; a++) if (length(secrets[a]) > maxl) maxl = length(secrets[a])
+  trunc = (ENVIRON["REDACT_TRUNCATED"] == "1") }
+{ L[NR] = $0 }
+END { if (NR == 0) exit
+  for (c = NR; c > 1; c = int((c + 1) / 2)) { h = int(c / 2)
+    for (i = 1; i <= h; i++) L[i] = L[2 * i - 1] "\n" L[2 * i]
+    if (c % 2) L[h + 1] = L[c] }
+  buf = L[1]; N = length(buf); open = 0; pos = 1; B = (maxl > 4096 ? maxl : 4096)
+  for (base = 0; base < N && m > 0; base += B) {
+    win = substr(buf, base + 1, B + maxl - 1); cnt = 0; split("", mark)
+    for (j = 1; j <= m; j++) { v = secrets[j]; lv = length(v); rest = win; off = 0
+      while ((p = index(rest, v)) > 0) { off += p; if (off > B) break
+        s = base + off; e = s + lv - 1; if (!(s in mark) || mark[s] < e) mark[s] = e; cnt++
+        rest = substr(rest, p + 1) } }
+    if (cnt) for (i = base + 1; i <= base + B; i++) if (i in mark) { e = mark[i]
+      if (open && i <= ce + 1) { if (e > ce) ce = e } else { if (open) emit(); open = 1; cs = i; ce = e } } }
+  if (trunc) { kmax = 0
+    for (j = 1; j <= m; j++) { v = secrets[j]; k = length(v) - 1; if (k > N) k = N
+      for (; k > kmax; k--) if (substr(buf, N - k + 1) == substr(v, 1, k)) { kmax = k; break } }
+    if (kmax > 0) { i = N - kmax + 1
+      if (open && i <= ce + 1) ce = N; else { if (open) emit(); open = 1; cs = i; ce = N } } }
+  if (open) emit()
+  printf "%s\n", substr(buf, pos) }'; }""".replace('@NAMES@', _DEV_REDACT_NAMES)
+_DEV_DB_TABLES_TEMPLATE = (
+    _DEV_REDACT_FUNCTION
+    + r"""
+query() { psql -X -At -F '|' -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "$1" 2>&1; }
+tables=$(query "@TABLES@") || { printf '%s\n' "$tables" | redact; exit 1; }
+printf '%s\n' "$tables" | redact
+case "
+$tables
+" in *"
+@VERSION_TABLE@|t
+"*) version=$(query "@VERSION@") || { printf '%s\n' "$version" | redact; exit 1; }
+printf '%s\n' "$version" | redact;; esac"""
+)
+DEV_DB_TABLES_SCRIPT = (
+    _DEV_DB_TABLES_TEMPLATE.replace('@TABLES@', _DEV_DB_TABLES_QUERY)
+    .replace('@VERSION_TABLE@', DEV_DB_VERSION_TABLE)
+    .replace('@VERSION@', _DEV_DB_VERSION_QUERY)
+)
+DEV_DB_TABLES_TAIL = ('sh', '-c', DEV_DB_TABLES_SCRIPT)
+
+# dev_migrate_status: alembic's `current`, then `history`, run in the RUNNING data_store container by
+# its own interpreter environment (PATH, DATABASE_URI) and its mounted alembic.ini and migrations/;
+# no env file and no compose file is read. Read-only against the database: `current` reads
+# alembic_version (dont_mutate) and `history` reads the revision files. Nothing is interpolated: the
+# two subcommands are literals, so no upgrade, stamp or check is constructible. alembic's output can
+# echo an environment value on error, so every printed line, errors included, goes through redact; the
+# first non-zero exit status is the script's. A header names each section.
+DEV_MIGRATE_STATUS_SCRIPT = (
+    _DEV_REDACT_FUNCTION
+    + r"""
+for sub in current history; do
+printf '== alembic %s ==\n' "$sub"
+out=$(/code/.venv/bin/alembic "$sub" 2>&1); rc=$?
+printf '%s\n' "$out" | redact
+[ "$rc" -eq 0 ] || exit "$rc"
+done"""
+)
+DEV_MIGRATE_STATUS_TAIL = ('sh', '-c', DEV_MIGRATE_STATUS_SCRIPT)
+
+# dev_http_get: ONE GET of one of three fixed paths, by exec in the RUNNING data_store container
+# against http://127.0.0.1:$APP_INTERNAL_PORT, the way that service's own healthcheck probes /ping (the
+# image has python, no curl). The only caller input is NAME, a key of DEV_HTTP_GET_PATHS; the path is a
+# literal baked into that name's script, so no caller string reaches the argv or the script. The paths
+# are the app_endpoints constants (routers/common PING; routers/data_store GET_UI_CONFIG,
+# GET_UI_USAGE_SUMMARY), restated here because this server cannot import them.
+DEV_HTTP_GET_PATHS: dict[str, str] = {
+    'ping': '/ping',
+    'ui_config': '/ui/v1/config',
+    'usage_summary': '/ui/v1/stats/usage/summary',
+}
+# At most this many body bytes are handed on; one more is read to learn the body was longer. The bound
+# is the memory, time and scrub-cost bound (the redact awk is super-linear in merged spans).
+DEV_HTTP_GET_BODY_LIMIT = 65536
+# GET only (http.client, no redirects followed). Accept is the only header the script sets; http.client
+# adds Host and Accept-Encoding: identity itself; nothing else is sent, no X-Instance-Secret, nothing
+# from the caller. 10 s per socket operation, 20 s overall (a SIGALRM handler raises TimeoutError, so a
+# body trickled one byte at a time ends in the transport-failure path). Prints `@@<status>@@<cut>` then
+# up to LIMIT body bytes; the cut flag is the result of a length test on the bytes read (more than
+# LIMIT), never read from the body. A transport failure prints `@@000@@0` and the error text; the
+# except clears the alarm first, so a socket timeout just before the deadline cannot let SIGALRM fire
+# inside the handler. Exit: 0 for 2xx, 1 for any other status, 2 for a transport failure. The sh runs it
+# as `python -I` with its stderr discarded. No single quote may appear: it is embedded in single
+# quotes in the sh below.
+_DEV_HTTP_GET_PYTHON = r"""import http.client, os, signal, sys
+LIMIT = @LIMIT@
+def deadline(signum, frame):
+    raise TimeoutError("overall deadline of 20 s exceeded")
+signal.signal(signal.SIGALRM, deadline)
+signal.alarm(20)
+try:
+    conn = http.client.HTTPConnection("127.0.0.1", int(os.environ["APP_INTERNAL_PORT"]), timeout=10)
+    conn.request("GET", sys.argv[1], headers={"Accept": "application/json"})
+    resp = conn.getresponse()
+    body = resp.read(LIMIT + 1)
+    status = resp.status
+    signal.alarm(0)
+except Exception as exc:
+    signal.alarm(0)
+    sys.stdout.write("@@000@@0\n" + type(exc).__name__ + ": " + str(exc) + "\n")
+    sys.exit(2)
+cut = len(body) > LIMIT
+sys.stdout.write("@@%03d@@%d\n" % (status, 1 if cut else 0))
+sys.stdout.flush()
+sys.stdout.buffer.write(body[:LIMIT])
+sys.exit(0 if 200 <= status < 300 else 1)""".replace('@LIMIT@', str(DEV_HTTP_GET_BODY_LIMIT))
+# The sh around it. The header is validated against a fixed pattern before it is believed; the body
+# and any error text are printed only through redact (embedded verbatim), with REDACT_TRUNCATED=1 (the
+# literal, a signal) exported exactly when the python reported the cut. The container's own copy of
+# that variable is unset first. python runs with -I (the container's PYTHONPATH holds an agent-writable
+# directory, so a planted package could shadow the standard library) and its stderr goes to /dev/null:
+# only its stdout, which the except fills before any body, reaches redact. The script never reads
+# INSTANCE_WRITE_SECRET itself: only redact does. Two rules read the exit status rc alone, never the
+# body. (1) No valid header: a python that exits 0 or 1 did not report an HTTP status (1 is a
+# traceback, e.g. the alarm landing inside the except), so both report rc 2; rc above 2 keeps its value
+# and a `python exited <rc>` line. (2) A valid header and rc other than 0 or 1: python was killed
+# mid-write, so the body may end inside a secret; REDACT_TRUNCATED=1 is set for redact and `python
+# exited <rc>, body incomplete` follows the body (after the cut line, when that printed too).
+_DEV_HTTP_GET_TEMPLATE = (
+    _DEV_REDACT_FUNCTION
+    + r"""
+GET_PATH=@PATH@
+unset REDACT_TRUNCATED
+cut=
+res=$(/code/.venv/bin/python -I -c '@PYTHON@' "$GET_PATH" 2>/dev/null); rc=$?
+hdr=${res%%
+*}
+body=${res#*
+}
+[ "$res" = "$hdr" ] && body=
+status=
+case "$hdr" in
+@@000@@0) ;;
+@@[0-9][0-9][0-9]@@0) status=${hdr#@@}; status=${status%@@0};;
+@@[0-9][0-9][0-9]@@1) status=${hdr#@@}; status=${status%@@1}; cut=1; export REDACT_TRUNCATED=1;;
+esac
+if [ -z "$status" ]; then
+[ "$hdr" != '@@000@@0' ] || res=$body
+printf '== GET %s: no HTTP response ==\n' "$GET_PATH"
+printf '%s\n' "$res" | redact
+case "$rc" in 0|1|2) ;; *) printf 'python exited %s\n' "$rc";; esac
+[ "$rc" -gt 1 ] || rc=2
+exit "$rc"
+fi
+printf '== GET %s -> HTTP %s ==\n' "$GET_PATH" "$status"
+case "$rc" in 0|1) ;; *) export REDACT_TRUNCATED=1;; esac
+printf '%s\n' "$body" | redact
+[ -z "$cut" ] || printf '== body cut at @LIMIT@ bytes ==\n'
+case "$rc" in 0|1) ;; *) printf 'python exited %s, body incomplete\n' "$rc";; esac
+exit $rc"""
+)
+
+
+def _dev_http_get_script(path: str) -> str:
+    return (
+        _DEV_HTTP_GET_TEMPLATE.replace('@PYTHON@', _DEV_HTTP_GET_PYTHON)
+        .replace('@PATH@', path)
+        .replace('@LIMIT@', str(DEV_HTTP_GET_BODY_LIMIT))
+    )
+
+
+# name -> its whole tail. Each is a literal row of DEV_EXEC_COMMANDS below.
+DEV_HTTP_GET_TAILS: dict[str, tuple[str, ...]] = {
+    name: ('sh', '-c', _dev_http_get_script(path)) for name, path in DEV_HTTP_GET_PATHS.items()
+}
+
+# THE TABLE. Each whole tail an exec may run (program, flag and script) maps to the ONE option set it
+# runs with. A tail not listed is refused even when its program is `sh`; a listed tail with any other
+# option set is refused.
+DEV_EXEC_COMMANDS: dict[tuple[str, ...], tuple[str, ...]] = {
+    DEV_DB_TABLES_TAIL: _DEV_EXEC_OPTIONS_POSTGRES,
+    DEV_MIGRATE_STATUS_TAIL: _DEV_EXEC_OPTIONS_CODE,
+    **dict.fromkeys(DEV_HTTP_GET_TAILS.values(), ()),
+}
+
+
+def dev_lookup_argv(service: str) -> tuple[str, ...]:
+    """`docker ps` for the running, non-one-off containers of DEV_PROJECT's SERVICE; prints ids only."""
+    return (
+        DOCKER,
+        'ps',
+        '--filter',
+        'status=running',
+        '--filter',
+        f'label={DEV_LABEL_PROJECT}={DEV_PROJECT}',
+        '--filter',
+        f'label={DEV_LABEL_SERVICE}={service}',
+        '--filter',
+        f'label={DEV_LABEL_ONEOFF}=False',
+        '--format',
+        '{{.ID}}',
+    )
+
+
+def check_dev_lookup_argv(argv: Sequence[str]) -> None:
+    """Refuse any lookup argv but dev_lookup_argv() of one DEV_SERVICES member, word for word."""
+    words = tuple(argv)
+    if not any(words == dev_lookup_argv(service) for service in DEV_SERVICES):
+        raise Refused('a dev lookup is `docker ps` filtered to one dev service of the project, printing ids only')
+
+
+def dev_lookup_step(stack_dir: Path, service: str) -> Step:
+    """The label lookup of one dev service's running container(s), checked as built."""
+    argv = dev_lookup_argv(validate_dev_service(service))
+    check_dev_lookup_argv(argv)
+    return Step(argv, stack_dir)
+
+
+def check_container_id(value: object) -> str:
+    """A container id as `docker ps --format {{.ID}}` prints it: lowercase hex, 12 to 64 digits."""
+    if not isinstance(value, str) or not _CONTAINER_ID.fullmatch(value):
+        raise Refused('the container lookup returned something that is not a container id')
+    return value
+
+
+def pick_dev_target(service: str, lookup_stdout: bytes) -> str:
+    """The one running container the lookup found; Refused on none or several, naming the count.
+
+    Refusing on several is deliberate: guessing between two containers of one service would exec into
+    one the user did not mean. The ids are never listed.
+    """
+    ids = [line.strip() for line in lookup_stdout.decode('utf-8', errors='replace').splitlines() if line.strip()]
+    if not ids:
+        raise Refused(f'no running {service} container in the {DEV_PROJECT} project: start the dev stack first')
+    if len(ids) > 1:
+        raise Refused(
+            f'{len(ids)} running {service} containers in the {DEV_PROJECT} project; '
+            'refusing to guess which one to exec into'
+        )
+    return check_container_id(ids[0])
+
+
+def check_dev_exec_argv(argv: Sequence[str]) -> None:
+    """Refuse any argv but `docker exec <options> <id> <tail>` for one row of DEV_EXEC_COMMANDS, whole.
+
+    Checked on the words that go to the daemon, not on the builders' intent. The tail must be wholly a
+    key of the table and the words between `exec` and the container id must be exactly that key's one
+    option set, in order: no other option, no other value, no other combination, no attached spelling.
+    The id is a container id as the lookup prints it.
+    """
+    words = tuple(argv)
+    if words[:2] != (DOCKER, 'exec'):
+        raise Refused('a dev exec runs only `docker exec`')
+    for tail, options in DEV_EXEC_COMMANDS.items():
+        head = (DOCKER, 'exec', *options)
+        if words[: len(head)] == head and len(words) == len(head) + 1 + len(tail) and words[len(head) + 1 :] == tail:
+            check_container_id(words[len(head)])
+            return
+    raise Refused('a dev exec runs only its fixed programs with their fixed arguments and options')
+
+
+def dev_exec_steps(stack_dir: Path, container_id: str, tail: Sequence[str]) -> list[Step]:
+    """One `docker exec` Step: the checked id, a tail from DEV_EXEC_COMMANDS and that tail's own options.
+
+    The options come from the table and are not arguments: a caller cannot choose a user, a working
+    directory or the read-only variable. Checked as built.
+    """
+    options = DEV_EXEC_COMMANDS.get(tuple(tail))
+    if options is None:
+        raise Refused('a dev exec runs only its fixed programs with their fixed arguments and options')
+    argv = (DOCKER, 'exec', *options, check_container_id(container_id), *tail)
+    check_dev_exec_argv(argv)
+    return [Step(argv, stack_dir)]
+
+
+def dev_db_tables_steps(stack_dir: Path, container_id: str) -> list[Step]:
+    """dev_db_tables' one exec: the fixed psql script, as user postgres, in a read-only session."""
+    return dev_exec_steps(stack_dir, container_id, DEV_DB_TABLES_TAIL)
+
+
+def dev_migrate_status_steps(stack_dir: Path, container_id: str) -> list[Step]:
+    """dev_migrate_status' one exec: alembic current and history in the running data_store, in /code."""
+    return dev_exec_steps(stack_dir, container_id, DEV_MIGRATE_STATUS_TAIL)
+
+
+def validate_dev_http_get_name(name: object) -> str:
+    """NAME must be a key of the closed DEV_HTTP_GET_PATHS; anything else (a path, a URL, empty) is Refused."""
+    if not isinstance(name, str) or name not in DEV_HTTP_GET_PATHS:
+        raise Refused(f'name must be one of: {", ".join(DEV_HTTP_GET_PATHS)}')
+    return name
+
+
+def dev_http_get_steps(stack_dir: Path, container_id: str, name: str) -> list[Step]:
+    """dev_http_get's one exec: the fixed GET script of NAME's path, in the running data_store."""
+    return dev_exec_steps(stack_dir, container_id, DEV_HTTP_GET_TAILS[validate_dev_http_get_name(name)])
+
+
+# The status the script reports on its FIRST line (never a later one: the body follows it and is not
+# trusted): `== GET <path> -> HTTP <status> ==`.
+_HTTP_GET_STATUS = re.compile(r'== GET \S+ -> HTTP (\d{3}) ==(?:\n|\Z)')
+
+
+def parse_http_get_status(stdout: bytes) -> int | None:
+    """The HTTP status the script printed, or None when it reported no HTTP response."""
+    match = _HTTP_GET_STATUS.match(stdout.decode('utf-8', errors='replace'))
+    return int(match.group(1)) if match else None
+
+
+# dev_db_tables' output, parsed. A line is `<table>|t` or `<table>|f` for a DEV_DB_TABLES name, or
+# `version_num|<revision>`; anything else is not reported as data (the raw, redacted output stays in
+# the step). A revision is alembic's: letters, digits and underscores.
+_REVISION = re.compile(r'^[A-Za-z0-9_]{1,64}$')
+
+
+def parse_db_tables(stdout: bytes) -> tuple[dict[str, bool], str | None]:
+    """({table: present}, revision or None) from the script's stdout; unknown lines are ignored."""
+    tables: dict[str, bool] = {}
+    version: str | None = None
+    for line in stdout.decode('utf-8', errors='replace').splitlines():
+        name, _, value = line.partition('|')
+        if name in DEV_DB_TABLES and value in ('t', 'f'):
+            tables[name] = value == 't'
+        elif name == 'version_num' and _REVISION.fullmatch(value):
+            version = value
+    return tables, version

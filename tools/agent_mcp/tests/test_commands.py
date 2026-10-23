@@ -29,6 +29,8 @@ from common.tests.test_ci_invariants import (
 )
 from tools.agent_mcp import runner, stack
 from tools.agent_mcp.tests.harness import (
+    DEV_CONTAINER_ID,
+    DEV_EXEC_VERBS,
     DEV_PROJECT_VERBS,
     DOCKERLESS_VERBS,
     REPO_ROOT,
@@ -122,7 +124,10 @@ def test_every_verb_runs_only_the_fixed_compose_prefix_over_the_snapshot(
         # prefix that spells no file, no project directory and no env file. The pin that matters
         # for them -- that no other project and no mutating command is reachable -- is tj-tq2hn6's.
         assert rig.docker.steps, f'{verb} ran no docker step, so there is nothing to pin'
-        assert all(list(step.argv[:2]) == [EXPECTED_DOCKER, 'compose'] for step in rig.docker.steps)
+        # The exec verbs run plain docker: a label lookup (`ps`), then `exec` (ADR tj-4rr0la
+        # addendum 22). Their whole argv is pinned in _EXPECTED_TAILS_DEV and test_dev_exec.py.
+        heads = [['compose']] if verb not in DEV_EXEC_VERBS else [['ps'], ['exec']]
+        assert all(list(step.argv[1:2]) in heads and step.argv[0] == EXPECTED_DOCKER for step in rig.docker.steps)
         assert EXPECTED_PROJECT not in {word for step in rig.docker.steps for word in step.argv}
         return
     if verb in DOCKERLESS_VERBS:
@@ -212,6 +217,76 @@ _EXPECTED_TAILS_DEV = {
     'dev_ps': [[EXPECTED_DOCKER, 'compose', '-p', EXPECTED_DEV_PROJECT, 'ps', '--all']],
     'dev_logs': [
         [EXPECTED_DOCKER, 'compose', '-p', EXPECTED_DEV_PROJECT, 'logs', '--no-color', '--tail', '50', 'postgres']
+    ],
+    # ADR tj-4rr0la addendum 22 (4): the label lookup, then ONE exec into the id it found. The
+    # script word is the module constant: its content is pinned word by word in test_dev_exec.py.
+    'dev_db_tables': [
+        [
+            EXPECTED_DOCKER,
+            'ps',
+            '--filter',
+            'status=running',
+            '--filter',
+            f'label=com.docker.compose.project={EXPECTED_DEV_PROJECT}',
+            '--filter',
+            'label=com.docker.compose.service=postgres',
+            '--filter',
+            'label=com.docker.compose.oneoff=False',
+            '--format',
+            '{{.ID}}',
+        ],
+        [
+            EXPECTED_DOCKER,
+            'exec',
+            '-u',
+            'postgres',
+            '-e',
+            'PGOPTIONS=-c default_transaction_read_only=on',
+            DEV_CONTAINER_ID,
+            'sh',
+            '-c',
+            stack.DEV_DB_TABLES_SCRIPT,
+        ],
+    ],
+    # tj-iee6sn.13.5: the lookup of data_store, then ONE exec in /code and nothing else -- no user,
+    # no environment variable. The script word is pinned by its parts and by running it in
+    # test_dev_exec.py.
+    'dev_migrate_status': [
+        [
+            EXPECTED_DOCKER,
+            'ps',
+            '--filter',
+            'status=running',
+            '--filter',
+            f'label=com.docker.compose.project={EXPECTED_DEV_PROJECT}',
+            '--filter',
+            'label=com.docker.compose.service=data_store',
+            '--filter',
+            'label=com.docker.compose.oneoff=False',
+            '--format',
+            '{{.ID}}',
+        ],
+        [EXPECTED_DOCKER, 'exec', '-w', '/code', DEV_CONTAINER_ID, 'sh', '-c', stack.DEV_MIGRATE_STATUS_SCRIPT],
+    ],
+    # tj-iee6sn.13.6: the lookup of data_store, then ONE exec with NO option at all -- no user, no
+    # workdir, no variable -- running the fixed GET script of the sampled name (ping). The script word
+    # is pinned by its parts and by running it against a stub server in test_dev_exec.py.
+    'dev_http_get': [
+        [
+            EXPECTED_DOCKER,
+            'ps',
+            '--filter',
+            'status=running',
+            '--filter',
+            f'label=com.docker.compose.project={EXPECTED_DEV_PROJECT}',
+            '--filter',
+            'label=com.docker.compose.service=data_store',
+            '--filter',
+            'label=com.docker.compose.oneoff=False',
+            '--format',
+            '{{.ID}}',
+        ],
+        [EXPECTED_DOCKER, 'exec', DEV_CONTAINER_ID, 'sh', '-c', stack.DEV_HTTP_GET_TAILS['ping'][2]],
     ],
 }
 

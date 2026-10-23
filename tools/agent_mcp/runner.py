@@ -54,6 +54,13 @@ VERB_TIMEOUT_SECONDS = {
     # project this server never starts or waits for.
     'dev_logs': 60,
     'dev_ps': 60,
+    # One `docker ps` lookup and one psql exec, each seconds.
+    'dev_db_tables': 60,
+    # Two alembic starts (current, history) in the running container, each seconds; far below the
+    # .mcp.json timeout, which outlasts the longest verb (the 1800 s builders).
+    'dev_migrate_status': 60,
+    # One `docker ps` lookup and one GET with a 10 s HTTP timeout; far below the .mcp.json timeout.
+    'dev_http_get': 60,
 }
 
 # The docker CLI's whole environment. Fixed, never inherited: compose reads variables from its own
@@ -128,6 +135,21 @@ VERB_SCHEMAS: dict[str, dict[str, Any]] = {
         'required': ['service'],
     },
     'dev_ps': {'properties': {}, 'required': []},
+    # Takes nothing, like dev_ps: the container, the program and the SQL are constants in stack.py.
+    'dev_db_tables': {'properties': {}, 'required': []},
+    'dev_migrate_status': {'properties': {}, 'required': []},
+    # The one agent input is NAME from the closed stack.DEV_HTTP_GET_PATHS: no URL, path or header.
+    'dev_http_get': {
+        'properties': {
+            'name': {
+                'type': 'string',
+                'enum': list(stack.DEV_HTTP_GET_PATHS),
+                'description': 'which fixed GET: '
+                + ', '.join(f'{n} ({p})' for n, p in stack.DEV_HTTP_GET_PATHS.items()),
+            }
+        },
+        'required': ['name'],
+    },
 }
 for _schema in VERB_SCHEMAS.values():
     _schema.update(type='object', additionalProperties=False)
@@ -270,7 +292,8 @@ class AgentStack:
     """The verbs, serialised: a second caller is told 'busy'.
 
     Ten over the one agent stack, plus the two READ-ONLY dev verbs of ADR tj-4rr0la addendum 18,
-    which reach the user's own compose project and can only read it.
+    which reach the user's own compose project and can only read it, and the READ-ONLY exec verbs
+    dev_db_tables and dev_migrate_status of addendum 22.
     """
 
     def __init__(
@@ -296,6 +319,9 @@ class AgentStack:
             'ps': self._ps,
             'dev_logs': self._dev_logs,
             'dev_ps': self._dev_ps,
+            'dev_db_tables': self._dev_db_tables,
+            'dev_migrate_status': self._dev_migrate_status,
+            'dev_http_get': self._dev_http_get,
         }
 
     @property
@@ -693,6 +719,67 @@ class AgentStack:
         if not await call.steps_until_failure(steps):
             return 'failed', f'compose logs failed for the {stack.DEV_PROJECT} project'
         return 'ok', f'last {lines} lines of {checked_service} in the {stack.DEV_PROJECT} project'
+
+    # THE EXEC VERBS (ADR tj-4rr0la addendum 22). Like the two above they take no snapshot, no git
+    # and no env file; unlike them they run `docker exec`, held by stack.check_dev_exec_argv(). The
+    # target is never an argument: a label lookup must find exactly one running container, and a
+    # refusal there runs no exec.
+    async def _dev_exec_target(self, call: _Call, service: str) -> str:
+        """The id of the one running container of SERVICE in the dev project; Refused on none or several."""
+        lookup = await call.step(stack.dev_lookup_step(self.settings.stack_dir, service))
+        if lookup.exit_status != 0:
+            raise stack.Refused(f'the container lookup failed (exit {lookup.exit_status}); see the steps')
+        return stack.pick_dev_target(service, lookup.stdout)
+
+    async def _dev_db_tables(self, call: _Call) -> tuple[str, str]:
+        """READ-ONLY: which of the store's tables exist in the USER'S OWN dev database (dataset_read, dataset_read_daily, dataset_override_log, dataset_deletion, ingest_run, store_dataset_entry, stock_market_activity, alembic_version), and its alembic revision. Works while data_store is down. Runs one fixed psql script by exec in the running dev postgres container as user postgres, in a read-only transaction; takes no argument and prints no credential."""
+        call.validated = {}
+        target = await self._dev_exec_target(call, 'postgres')
+        step = stack.dev_db_tables_steps(self.settings.stack_dir, target)[0]
+        result = await call.step(step)
+        if result.exit_status != 0:
+            return 'failed', 'the table query failed in the dev postgres container; see the steps'
+        tables, revision = stack.parse_db_tables(result.stdout)
+        call.details = {'tables': tables, 'alembic_revision': revision}
+        present = sum(tables.values())
+        version = revision or 'none (no alembic_version row)'
+        return 'ok', f'{present} of {len(stack.DEV_DB_TABLES)} tables present; alembic revision: {version}'
+
+    async def _dev_migrate_status(self, call: _Call) -> tuple[str, str]:
+        """READ-ONLY: `alembic current` then `alembic history`, run by exec in the RUNNING dev data_store container with that container's own environment and its mounted migrations. Not make migrate-status's spelling (no one-off container, no env file, no compose file): it reports the revisions the running container sees. Refused when data_store is not running; use dev_db_tables then. Takes no argument and writes nothing to the database (Python may write bytecode caches into the bind-mounted checkout, as make migrate-status does); every printed line, errors included, is redacted."""
+        call.validated = {}
+        try:
+            target = await self._dev_exec_target(call, 'data_store')
+        except stack.Refused as refusal:
+            if str(refusal).startswith('no running data_store container'):
+                raise stack.Refused(f'{refusal}; use dev_db_tables, which works while data_store is down') from None
+            raise
+        step = stack.dev_migrate_status_steps(self.settings.stack_dir, target)[0]
+        result = await call.step(step)
+        if result.exit_status != 0:
+            return 'failed', f'alembic exited {result.exit_status} in the running dev data_store; see the steps'
+        return 'ok', 'alembic current and history from the running dev data_store container'
+
+    async def _dev_http_get(self, call: _Call, name: object) -> tuple[str, str]:
+        """READ-ONLY: ONE GET of a fixed path, by exec in the RUNNING dev data_store container against its own loopback port, the way its healthcheck probes it. NAME is one of ping (/ping), ui_config (/ui/v1/config), usage_summary (/ui/v1/stats/usage/summary); nothing else is accepted, no URL, path or header. GET only; Accept is the only header the script sets (http.client adds Host and Accept-Encoding: identity itself), nothing else is sent, no X-Instance-Secret; 10 s per socket operation, 20 s overall; at most the first 64 KB of the body is read and the cut is stated. Reports the HTTP status; the body and any error are redacted in the container. Refused when data_store is not running; use dev_db_tables then."""
+        checked = stack.validate_dev_http_get_name(name)
+        call.validated = {'name': checked}
+        path = stack.DEV_HTTP_GET_PATHS[checked]
+        try:
+            target = await self._dev_exec_target(call, 'data_store')
+        except stack.Refused as refusal:
+            if str(refusal).startswith('no running data_store container'):
+                raise stack.Refused(f'{refusal}; use dev_db_tables, which works while data_store is down') from None
+            raise
+        step = stack.dev_http_get_steps(self.settings.stack_dir, target, checked)[0]
+        result = await call.step(step)
+        status = stack.parse_http_get_status(result.stdout)
+        call.details = {'name': checked, 'path': path, 'http_status': status}
+        if result.exit_status != 0:
+            if status is None:
+                return 'failed', f'GET {path} got no HTTP response from the running dev data_store; see the steps'
+            return 'failed', f'GET {path} returned HTTP {status} from the running dev data_store; see the steps'
+        return 'ok', f'GET {path} returned HTTP {status} from the running dev data_store'
 
     @property
     def verbs(self) -> tuple[str, ...]:
