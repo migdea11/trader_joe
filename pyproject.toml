@@ -151,7 +151,9 @@ data-store = [
 # dev, testing and security ones. It resolves apart from security (the conflicts entry under
 # the uv table explains why), so semgrep's own mcp and pyjwt pins do not hold this group back.
 agent-mcp = [
-    "mcp>=1.29.0",
+    # The floor is the fix for CVE-2026-59951, which pip-audit reports against 1.29.0; fixed in
+    # 1.30.0 (and 2.2.0). The <2 cap keeps the resolver on 1.x: 2.x is a major bump left to the owner.
+    "mcp>=1.30.0,<2",
     # Imported directly by tools/agent_mcp/server.py, which builds the Starlette app and runs uvicorn
     # itself. Base declares both too, but the MCP image installs this group alone. Plain uvicorn, not
     # [standard]: the server needs no extra, and the extra would add packages to the MCP image.
