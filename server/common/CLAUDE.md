@@ -10,6 +10,12 @@ Shared library imported by both services: the gRPC channel, server and client la
 
 `grpc.aio` and protobuf (contracts in `proto/`, generated code built into `gen/` and never committed), Postgres session factory, custom SQLAlchemy types, shared error vocabulary, env/logging/worker pool
 
+## Shared helpers
+
+| Helper | Use |
+|---|---|
+| `scheduling.py`: `run_periodic` with `Once`, `AfterTradingEvent`, `Every` | All periodic and timed work in both services. No stored jobs and no replay of missed runs: catch-up is the caller's, from database state. The calendar is passed in (`SessionCalendar`), never imported. A schedule whose `next_fire` raises is retried every `retry_delay` (default 5 min), never ends the task. |
+
 ## Key invariants
 
 Changing anything here affects both services. The `.proto` files under `proto/` are the inter-service
