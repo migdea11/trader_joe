@@ -12,6 +12,8 @@ package trader_joe.proto.ui.v1;
 
 import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
+import "trader_joe/proto/market/v1/enums.proto";
+import "trader_joe/proto/ui/v1/data.proto";
 
 // A stretch of sessions, with how many of them hold bars.
 message CoverageBucket {
@@ -78,4 +80,117 @@ message RunOutcomesEntry {
 
 message RunOutcomesPerDay {
   repeated RunOutcomesEntry days = 1;
+}
+
+// PHASE 3 (tj-grna9p.84): usage and storage. Additive to everything above.
+//
+// The usage messages follow the client filter documented in data.proto (query parameters client_id,
+// repeatable and exact, winning over client_kind, repeatable; with neither, kind SDK). client_id is
+// a free-text LABEL, never a credential. Each response echoes the filter applied.
+
+// The usage page's headline figures.
+message UsageSummary {
+  // Datasets with no read by the selected clients in the last stale_days; never-read datasets are
+  // INCLUDED.
+  int64 stale = 1;
+  // Datasets read at least once in the last 30 days by the selected clients. The same figure as
+  // DatasetFacets.read_30d in data.proto, under a different name.
+  int64 read_last_30d = 2;
+  int64 total = 3;
+  // Datasets never read by the selected clients.
+  int64 never_read = 4;
+  // Reads today (UTC day) by the selected clients.
+  int64 reads_today = 5;
+  // Distinct client ids that read anything today, over the selected clients.
+  int64 distinct_clients_today = 6;
+  // The echo of the client filter applied: see the ECHO RULE in data.proto (exactly one of
+  // client_ids and client_kinds is non-empty).
+  repeated string client_ids = 7;
+  repeated ClientKind client_kinds = 8;
+  // The staleness threshold the figures used, in days.
+  int32 stale_days = 9;
+}
+
+// Datasets by how long ago they were last read.
+message LastReadBucket {
+  // Half-open [min_days, max_days) since the last read; max_days is unset for the open last bucket.
+  // Days are whole UTC calendar days between the UTC date of the last read and today's UTC date, so
+  // 0 = today: the same day basis as reads_today and ReadsPerDay.
+  int32 min_days = 1;
+  optional int32 max_days = 2;
+  int64 datasets = 3;
+}
+
+message LastReadBuckets {
+  repeated LastReadBucket buckets = 1;
+  // Datasets never read by the selected clients.
+  int64 never_read = 2;
+  // The echo of the client filter applied: see the ECHO RULE in data.proto.
+  repeated string client_ids = 3;
+  repeated ClientKind client_kinds = 4;
+}
+
+message ReadsPerDayEntry {
+  // A UTC calendar day, 'YYYY-MM-DD'.
+  string day = 1;
+  // One entry per client per day: the client's id label and its kind.
+  string client_id = 2;
+  ClientKind client_kind = 3;
+  int64 reads = 4;
+}
+
+message ReadsPerDay {
+  repeated ReadsPerDayEntry days = 1;
+  // The echo of the client filter applied: see the ECHO RULE in data.proto (exactly one of
+  // client_ids and client_kinds is non-empty).
+  repeated string client_ids = 2;
+  repeated ClientKind client_kinds = 3;
+}
+
+// When one client last read a dataset.
+message ClientLastRead {
+  string client_id = 1;
+  ClientKind client_kind = 2;
+  // Unset when never read by this client.
+  optional google.protobuf.Timestamp last_read_at = 3;
+}
+
+// A stale dataset, with what it costs to keep.
+message StaleDatasetRow {
+  // The dataset; dataset.usage carries the figures under the applied filter.
+  DatasetSummary dataset = 1;
+  // The estimated stored size, in bytes (an estimate, not a measurement).
+  int64 est_bytes = 2;
+  // The last read per client, besides the filtered dataset.usage.last_read_at.
+  repeated ClientLastRead last_read_by_client = 3;
+}
+
+// One page of stale datasets. Keyset paging; the cursor is opaque.
+message StaleDatasetPage {
+  repeated StaleDatasetRow items = 1;
+  // Pass back to fetch the next page; empty on the last page.
+  string next_cursor = 2;
+  // The echo of the client filter applied: see the ECHO RULE in data.proto.
+  repeated string client_ids = 3;
+  repeated ClientKind client_kinds = 4;
+  int32 stale_days = 5;
+}
+
+// Storage held by one source and feed.
+message StorageBySource {
+  trader_joe.proto.market.v1.DataSource source = 1;
+  trader_joe.proto.market.v1.Feed feed = 2;
+  // An estimate, not a measurement.
+  int64 est_bytes = 3;
+}
+
+// What the store holds now. No history: growth over time is not served.
+message StorageCurrent {
+  // With a `source` on GET /ui/v1/stats/storage/current, the SUM of that
+  // source's estimated shares (by_source), so the split sums to the total
+  // within one byte per part; without one, the MEASURED size of the bar table
+  // (pg_total_relation_size). The by_source shares are estimates.
+  int64 total_bytes = 1;
+  google.protobuf.Timestamp as_of = 2;
+  repeated StorageBySource by_source = 3;
 }

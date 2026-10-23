@@ -27,8 +27,8 @@ enum ExpiryType {
   EXPIRY_TYPE_ROLLING = 5;
 }
 
-// Whether the dataset is being kept. A dataset whose expiry has been set on a DAILY or STREAM
-// subscription is RETIRED: it no longer collects, and is deleted on its expiry.
+// Whether the dataset is being kept. RETIRED is a DAILY or STREAM subscription whose collect intent
+// is false: it is not being scheduled; deletion is its expiry, separately.
 enum DatasetState {
   DATASET_STATE_UNSPECIFIED = 0;
   DATASET_STATE_ACTIVE = 1;
@@ -50,7 +50,8 @@ enum FreshnessStatus {
   FRESHNESS_STATUS_COMPLETE = 4;
   // STATIC: some sessions in [start, end) have no bar; see gap_count.
   FRESHNESS_STATUS_GAPS = 5;
-  // The dataset is retired: it has no freshness.
+  // A DAILY or STREAM subscription whose collect intent is false: it is not being scheduled, so it
+  // owes no freshness; deletion is its expiry, separately.
   FRESHNESS_STATUS_RETIRED = 6;
 }
 
@@ -58,8 +59,10 @@ enum FreshnessStatus {
 message Freshness {
   FreshnessStatus status = 1;
   // DAILY and STREAM only, and not a session close. DAILY: the local midnight (calendar time zone)
-  // of the session that should be stored, i.e. the timestamp its daily bar carries. STREAM: the
-  // oldest last-bar instant that still reads FRESH.
+  // of the expected period's first day, i.e. the timestamp its bar carries. For 1day that day is
+  // the session that should be stored; for 1week and 1month it is the first calendar day of the
+  // period (Monday, or the 1st), which may not be a session. STREAM: the oldest last-bar instant
+  // that still reads FRESH.
   google.protobuf.Timestamp expected_last_bar = 2;
   // STATIC only (status GAPS): how many sessions in [start, end) have no bar. Zero otherwise.
   int32 gap_count = 3;
@@ -112,6 +115,20 @@ message DatasetSummary {
   // The dataset's most recent collection run, whatever its state. Unset when it has never run
   // (tj-grna9p.70, phase 2).
   IngestRun last_run = 20;
+
+  // How the dataset has been read, over the clients selected by the request's client filter
+  // (tj-grna9p.84, phase 3). Always set on a list or detail read.
+  DatasetUsage usage = 21;
+
+  // The reaper would delete this dataset: its expiry has passed. True in dry-run too, where nothing
+  // is deleted until deletes are enabled. Set on list and detail reads; drives the Expiring Soon
+  // flag and the detail banner.
+  bool reaper_pending = 22;
+
+  // Whether the dataset is being collected. Derived, for every update type: for a DAILY or STREAM
+  // subscription it is the operator's collect intent (false = RETIRED); for STATIC it means a fetch
+  // is in progress. Presence is meaningful, hence optional.
+  optional bool collecting = 23;
 }
 
 // One page of the catalog. Keyset paging over (asset_symbol, id); the cursor is opaque.
@@ -149,6 +166,35 @@ message DatasetFacets {
   repeated StatusFacet statuses = 5;
   // Datasets with a run in state RUNNING right now (tj-grna9p.70, phase 2).
   int64 running = 6;
+  // The clients that have read any dataset, for the usage client picker (phase 3). Counts datasets
+  // each client read in the last 30 days; ignores the client filter so the picker never empties itself.
+  repeated ClientCount clients = 7;
+
+  // The usage counts (stale, read_30d, never_read) honour the client filter and stale_days;
+  // expiring_soon ignores the client filter (it is expiry-based). Like every count here, each counts
+  // over the datasets matching the other active filters. The facets route takes expires_before like
+  // the list; when absent the server uses now + 7 days (one named server constant, echoed in
+  // expires_before).
+
+  // Echo of the client filter applied, per the ECHO RULE in the CLIENT FILTER comment: exactly one
+  // of client_ids and client_kinds is non-empty.
+  repeated string client_ids = 8;
+  repeated ClientKind client_kinds = 9;
+  // The Stale view and the Usage group's Stale option: same rule as USAGE_FILTER_STALE (no read by
+  // the selected clients in the last stale_days, never-read included).
+  int64 stale = 10;
+  // Usage group: read by the selected clients in the last 30 days. The same figure as
+  // UsageSummary.read_last_30d in stats.proto, under a different name.
+  int64 read_30d = 11;
+  // Usage group: never read by the selected clients.
+  int64 never_read = 12;
+  // The Expiring Soon view: datasets whose expiry is before expires_before, PLUS every dataset in
+  // the reaper's pending set (reaper_pending).
+  int64 expiring_soon = 13;
+  // Echo: the staleness threshold used, in days.
+  int32 stale_days = 14;
+  // Echo: the expires_before bound used.
+  google.protobuf.Timestamp expires_before = 15;
 }
 
 // One page of a dataset's bars, ascending by bar_start, within the requested half-open [start, end).
@@ -318,4 +364,124 @@ message RequestEstimateResponse {
   string quota_key = 3;
   // The share of the scope's current window the calls would use, 0 to 100 (may exceed 100).
   double percent_of_window = 4;
+}
+
+// PHASE 3 (tj-grna9p.84): usage by reader, and the expiry and delete writes. Additive to everything
+// above.
+
+// What kind of client a read came from. The server derives it from the reader's client id:
+// UI iff the id is 'operator', everything else (and anything unattributed) is SDK. UNSPECIFIED is a
+// proto3 zero value only and is never stored, filtered on or returned as a figure's kind.
+enum ClientKind {
+  CLIENT_KIND_UNSPECIFIED = 0;
+  CLIENT_KIND_UI = 1;
+  CLIENT_KIND_SDK = 2;
+}
+
+// CLIENT FILTER, shared by the dataset list, the facets and the usage-stats routes. These are query
+// parameters, not message fields:
+//   client_id   repeatable, exact match on the reader's client id.
+//   client_kind repeatable, a ClientKind member name with or without the CLIENT_KIND_ prefix, any
+//               case, per the existing enum-filter rule.
+// client_id wins over client_kind when both are sent. With neither, the kind is SDK. Responses echo
+// what was applied in client_ids and client_kinds.
+//
+// ECHO RULE, at every echo site (this file and stats.proto): exactly ONE of client_ids and
+// client_kinds is non-empty. If client_id was sent, client_ids holds the ids applied and
+// client_kinds is EMPTY. Otherwise client_ids is EMPTY and client_kinds holds the kinds applied,
+// which is [CLIENT_KIND_SDK] by default (written out, never left empty).
+//
+// client_id is the reader's OWNER string: a free-text LABEL, never a credential and never used to
+// authorise anything. A reader declares it in the X-Client-Id request header (not in these messages
+// and never on a write route); it is unauthenticated, so a filter by it is bookkeeping. The reserved
+// values '_unattributed' (header missing, empty or malformed) and '_overflow' (past the per-dataset,
+// per-day cap of distinct ids) are SDK and can appear wherever a client_id does.
+
+// How a dataset has been read.
+message DatasetUsage {
+  // The latest read by the selected clients. Unset means never read by them.
+  google.protobuf.Timestamp last_read_at = 1;
+  // Reads in the last 30 days by the selected clients.
+  int64 reads_30d = 2;
+  // The kinds that read it in the last 30 days, regardless of the filter, so the UI can say 'UI
+  // only'.
+  repeated ClientKind read_by_30d = 3;
+  // The client ids that read it in the last 30 days, regardless of the filter. Free-text labels.
+  repeated string read_by_clients_30d = 4;
+  // Echo of the filter the figures cover, per the ECHO RULE above: client_ids is the ids applied,
+  // empty when the kind filter applied.
+  repeated string client_ids = 5;
+  // Per the ECHO RULE: the kinds applied (SDK by default), EMPTY when client_id was sent.
+  repeated ClientKind client_kinds = 6;
+}
+
+// The list's usage query filter, over the clients selected by the CLIENT FILTER.
+enum UsageFilter {
+  USAGE_FILTER_UNSPECIFIED = 0;
+  // Read by the selected clients in the last 30 days.
+  USAGE_FILTER_READ_30D = 1;
+  // No read by them in the last stale_days, never-read INCLUDED.
+  USAGE_FILTER_STALE = 2;
+  // Never read by them.
+  USAGE_FILTER_NEVER_READ = 3;
+}
+
+// One page of the datasets the reaper would delete: GET /ui/v1/reaper/pending (tj-grna9p.23). Keyset
+// paging over (expiry, id); the cursor is opaque.
+message ReaperPendingPage {
+  // Each item carries expiry, bar_count, owner, and reaper_pending = true.
+  repeated DatasetSummary items = 1;
+  // Pass back to fetch the next page; empty on the last page.
+  string next_cursor = 2;
+  // False means dry-run: the datasets are listed, nothing is deleted.
+  bool deletes_enabled = 3;
+  // The server time the pending set was computed at.
+  google.protobuf.Timestamp as_of = 4;
+}
+
+// One client seen reading, for the picker.
+message ClientCount {
+  // The reader's owner string: a free-text label, never a credential.
+  string client_id = 1;
+  ClientKind client_kind = 2;
+  // Datasets this client read in the last 30 days.
+  int64 datasets = 3;
+}
+
+// The operator's acknowledgement when acting on a dataset another owner holds. Required by the
+// route when the dataset's owner is not 'operator' (tj-grna9p.6); the server appends it to the
+// operator override log.
+message OperatorOverride {
+  // Why the operator is acting on a dataset another owner holds. Free text, not empty.
+  string reason = 1;
+  // The operator confirmed the override. The route refuses when false.
+  bool confirmed = 2;
+}
+
+// The body of the expiry write for one dataset.
+message SetExpiryRequest {
+  // The new expiry time, which is the deletion date and nothing else. Unset clears the deletion date
+  // only and resumes nothing: whether the dataset is collecting is the collect intent, set by
+  // SetCollectingRequest. Presence is meaningful, hence optional.
+  optional google.protobuf.Timestamp expiry = 1;
+  // Required when the dataset's owner is not 'operator'.
+  OperatorOverride override = 2;
+}
+
+// The body of the collect write for one dataset. DAILY and STREAM subscriptions only; a STATIC
+// dataset has no collect intent and the route refuses it.
+message SetCollectingRequest {
+  // The operator's intent: true schedules the subscription, false stops it (RETIRED). Stopping does
+  // not delete anything or touch the expiry. Required in practice: presence is meaningful, hence
+  // optional, and an absent value means 'refuse' (the route returns 422), never 'stop'. An empty or
+  // forgotten body must not read as collect=false.
+  optional bool collect = 1;
+  // Required when the dataset's owner is not 'operator'.
+  OperatorOverride override = 2;
+}
+
+// The body of a dataset delete.
+message DeleteDatasetRequest {
+  // Required when the dataset's owner is not 'operator'.
+  OperatorOverride override = 1;
 }

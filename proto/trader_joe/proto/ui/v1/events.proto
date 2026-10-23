@@ -13,7 +13,9 @@ enum DatasetChange {
   DATASET_CHANGE_UNSPECIFIED = 0;
   DATASET_CHANGE_CREATED = 1;
   DATASET_CHANGE_UPDATED = 2;
+  // The dataset stopped collecting (its collect intent became false).
   DATASET_CHANGE_RETIRED = 3;
+  // The dataset is collecting again (its collect intent became true).
   DATASET_CHANGE_RESUMED = 4;
   DATASET_CHANGE_DELETED = 5;
 }
@@ -32,7 +34,9 @@ message RequestChanged {
   RequestLogEntry entry = 1;
 }
 
-// The expiry reaper has deletions waiting for confirmation, or it no longer does.
+// The reaper's pending set changed: a dataset's expiry passed, or a pending dataset was deleted,
+// retired or resumed. A notification, not data: reload GET /ui/v1/reaper/pending or the affected
+// lists. Sent in dry-run too; whether deletions are enabled is ReaperPendingPage.deletes_enabled.
 message ReaperPendingChanged {}
 
 message UiEvent {
