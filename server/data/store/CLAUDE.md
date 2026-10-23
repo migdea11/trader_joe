@@ -1,6 +1,6 @@
 # Market data store
 
-Owner of all persisted market data. Requests data from data-ingest over gRPC (`FetchDataset`), writes it to Postgres, and serves it over `/store/...`, `/internal/asset-data/...` and, to the web UI, the read-only `/ui/v1/...` routes as protobuf canonical JSON. Tables: `store_dataset_entry`, `stock_market_activity`, `ingest_run`, `dataset_read`, `dataset_read_daily`, `dataset_override_log`, `dataset_deletion`.
+Owner of all persisted market data. Requests data from data-ingest over gRPC (`FetchDataset`), writes it to Postgres, and serves it over `/store/...`, `/internal/asset-data/...` and, to the web UI, the read-only `/ui/v1/...` routes as protobuf canonical JSON. Tables: `store_dataset_entry` (its nullable `collect` column is the collecting intent, below), `stock_market_activity`, `ingest_run`, `dataset_read`, `dataset_read_daily`, `dataset_override_log`, `dataset_deletion`.
 
 ## Architecture reference
 
@@ -12,37 +12,59 @@ Python 3.12, FastAPI, SQLAlchemy 2.0 async, asyncpg, Alembic, Postgres, `grpc.ai
 
 ## Key invariants
 
-Sole owner of persisted market data. Every write goes through a repository; no raw SQL in routers. Migrations are additive.
+Sole owner of persisted market data. Every write goes through a repository; no raw SQL in routers. Migrations are additive, and nothing applies them on start: run `make migrate` after every deploy (it follows the running stack, dev, test or prod). The `collect` column (`e5c8b1d4f703`) is read by the catalog, the refresh and the writes, so a database one revision behind is not a state to run in.
 
-**data_store runs ONE process: one uvicorn worker.** Three things are correct only because of it:
+**data_store runs ONE process: one uvicorn worker.** Six things are correct only because of it:
 
 - the startup sweep of `RUNNING` ingest runs (`sweep_interrupted_runs` in `app/ingest/run_recording.py`, `fail_interrupted_runs` in `app/database/crud/ingest_run.py`) marks every `RUNNING` row `FAILED` / `INTERRUPTED`; a second worker starting would fail the run the first is executing;
 - the events hub (`app/events.py`) lives in process memory, so an event reaches only the clients connected to the worker that published it;
-- the DAILY refresh loop (below) and the scheduler's store side (decision `tj-pd41mt`, proposed, not built) assume the same.
+- the usage buffer and the per-dataset-per-day id cap (`app/usage_recorder.py`): reads wait in this process's memory until a flush, and the 32-id cap is applied at flush against the stored ids, so two workers would each hold part of a day's reads and could together exceed the cap;
+- the DAILY refresh loop (below): each worker would run its own pass and request the same missing tails. No cross-process lock exists; a Postgres advisory lock was considered for the scheduler and is not used: it is redundant while there is one worker, and it would be needed with two;
+- the expiry reaper pass and its `ReaperPendingChanged` change detection (below): the previous pass's pending ids live in process memory, so a second worker would compare against its own copy and could announce a change that did not happen;
+- the scheduler's store side (decision `tj-pd41mt`, proposed, not built) assumes the same.
 
-`docker-compose.yaml` pins `SERVICE_WORKERS=1` as a literal in `environment:`, which outranks the operator's env file. Running more than one needs two changes first: Postgres `LISTEN`/`NOTIFY` so each worker republishes into its own hub, and a sweep keyed by process rather than by "every `RUNNING` row".
+`docker-compose.yaml` pins `SERVICE_WORKERS=1` as a literal in `environment:`, which outranks the operator's env file. A second worker would need all of these first:
+
+- Postgres `LISTEN`/`NOTIFY`, so each worker republishes into its own events hub;
+- a startup sweep keyed by process rather than by "every `RUNNING` row";
+- a lock or leader election for the DAILY refresh and for the reaper, so two workers do not both run them;
+- the reaper's change detection moved out of process memory;
+- the usage buffer and the per-dataset-per-day id cap made safe across workers.
 
 ## Data freshness and completeness
 
-Freshness and completeness are **computed on read and never stored**, by `app/freshness.py` (pure: the
-clock and the calendar are arguments) and composed with the queries in `app/dataset_catalog.py`. They
-serve the `/ui/v1` routes. There is still no coverage ledger: no `missing_ranges` query, no `range_agg`
+Freshness and completeness are **computed on read and never stored**, by three pure modules (the clock and
+the calendar are arguments) and composed with the queries in `app/dataset_catalog.py`. They
+serve the `/ui/v1` routes. The modules depend one way, `app/trading_calendar.py` to `app/completeness.py` to
+`app/health.py` to callers. The combined status enum is `FreshnessStatus` in `app/health.py`, and the proto message keeps the name `Freshness`; the module that judges is `health`. There is still no coverage ledger: no `missing_ranges` query, no `range_agg`
 subtraction, and the older read routes (`/store/...`, `/internal/asset-data/...`) say nothing about
 completeness, so a short answer from them is not distinguishable from a complete one.
 
 | Concern | Where it lives |
 |---|---|
-| Status per dataset (`FRESH`, `LATE`, `OVERDUE`, `COMPLETE`, `GAPS`, `RETIRED`) | `evaluate_dataset` in `app/freshness.py` |
-| Trading calendar | one per data source (`SOURCE_CALENDARS`, offline `exchange_calendars`); a source with none has no computed freshness |
+| Status per dataset (`FRESH`, `LATE`, `OVERDUE`, `COMPLETE`, `GAPS`, `RETIRED`; `RETIRED` means a DAILY or STREAM dataset with `collect` false, shown as Stopped) | `evaluate_dataset` in `app/health.py` returns a `DatasetHealth`; its `FreshnessStatus` is the combined status the proto and UI see. The DAILY and STREAM recency rules and `RETIRED` live there, with `FreshnessConfig`; a STATIC dataset's status is mapped from `assess_completeness` in `app/completeness.py` (`COMPLETE`, `GAPS`) |
+| Trading calendar | `app/trading_calendar.py`: one per data source (`SOURCE_CALENDARS`, offline `exchange_calendars`, via `calendar_for_source`; the `TradingCalendar` protocol and `ExchangeCalendarAdapter`), with `session_of`, `local_midnight` and `require_aware`; a source with none has no computed freshness |
 | Status vocabulary the UI filters by | `StatusGroup` in `app/dataset_catalog.py`: healthy, late, failed, retired |
 | Catalog listing, facets, bar paging | `app/dataset_catalog.py` over `app/database/crud/stock/dataset_catalog.py`; keyset cursors, opaque, bound to their sort |
 | Bar page index (`GET /ui/v1/datasets/{id}/bar-pages`, the Viewer's paging) | `bar_page_index` in `app/dataset_catalog.py`, `read_bar_page_starts` in `app/database/crud/stock/dataset_catalog.py` |
-| Coverage strip (`GET /ui/v1/datasets/{id}/coverage`): buckets and gap windows | `coverage_buckets` and `local_midnight` in `app/freshness.py`, composed by `dataset_coverage` in `app/dataset_catalog.py` |
+| Coverage strip (`GET /ui/v1/datasets/{id}/coverage`): buckets and gap windows | `coverage_buckets` and `gap_intervals` in `app/completeness.py` and `local_midnight` in `app/trading_calendar.py`, composed by `dataset_coverage` in `app/dataset_catalog.py` |
 
 Things that bite:
 
-- **Completeness is per session**: a session counts as covered if it has at least one bar. That is right
-  for 1-minute to 1-day granularities; a weekly or monthly dataset would read as full of gaps.
+- **Completeness counts sessions; coverage is by period.** A session is covered when a bar covers its
+  period: the session itself for 1-minute to 1-day, the Monday-Sunday week for 1-week, the calendar month
+  for 1-month, in the trading calendar's time zone, whichever day of the period the vendor stamps. A period
+  is expected when its first day's local midnight is in `[start, end)`, it has ended (its last session has
+  closed) and it holds a session (`judged` in `app/completeness.py`), so the sessions of a partial first period
+  are not expected. Gap counts and gap windows count only the expected sessions inside `[start, end)`: `_in_range`
+  clips them, so a week or month whose only sessions fall past the range end owes nothing.
+  A DAILY 1-week or 1-month dataset is FRESH when its last bar's period is at least the last ended period.
+- **A bar is FINAL only if it was written at or after its period closed** (tj-grna9p.167). A vendor's bar fetched during an
+  open period is part-way, so a DAILY dataset whose newest bar is of the expected period and was written before that
+  period closed and settled is provisional: while it stays so, the dataset reads LATE, not FRESH, until the next session after the expected period opens, then OVERDUE (a failure). The refresh re-fetches FROM THAT BAR INCLUSIVELY; the bar upsert sets
+  `updated_at` explicitly (`ON CONFLICT` skips `onupdate`), so the rewrite after the close makes it final and the dataset FRESH. The rule is `last_bar_is_provisional` in `app/health.py`. The close is
+  the calendar's SESSION close plus the settle margin (`bar_period_close` in `app/health.py`), for every granularity up to 1day (an intraday bar is final only when written at or after its SESSION's close plus the margin, not its own period end); for 1week and 1month it is the close of the period's last session plus the margin. The margin is `DAILY_REFRESH_SETTLE_MINUTES` (`settle_margin_from_env`, default 30), the same value that paces the refresh. A STATIC dataset is unchanged. The write time is
+  Postgres `now()`, the transaction start.
 - **A bar belongs to the session whose local date, in the calendar's time zone, its timestamp falls on.**
 - **Ranges are half-open `[start, end)`** in the store, the bar reads and the overlap check: a bar at
   `end` is in the next range, and ranges that only touch do not collide. A declared `end` not after
@@ -54,8 +76,9 @@ Things that bite:
 - **A gap window is whole sessions**: from the local midnight of its first session to the local midnight after its last, so it can start before or end after the dataset's range by the part of a session. Buckets and gaps both count only the sessions inside the range: a 1week or 1month period straddling the range end still decides covered or not, but only its in-range sessions are reported missing, so `Freshness.gap_count` equals the buckets' expected sessions without a bar. A coverage read costs two statements and records no usage. With no trading calendar covering the dataset it is a 422, never an empty strip, which would read as no gaps.
 - **The page index is fixed blocks counted back from the newest bar**, so the earliest page, not the newest, takes the remainder and overlaps its neighbour. Offsets are `[0 if r > 0], r, r + size, ..., N - size` with r = N mod size; `overlap` is the client's look-ahead and never moves one. It is two statements (the entry, then one read that scans the window twice: a count and the ranks), about 0.7 s at 2.4M bars, and it is a snapshot of the window it was read for.
 - **Two maximums, kept apart.** `MAX_BAR_LIMIT` (the UI bars read) is 50,000 and `MAX_PAGE_INDEX_SIZE` (the page index `size`) is 1,000. Raising the first does not raise the second.
-- **Expiry is optional.** None means the dataset never expires; setting one on a `DAILY` or `STREAM`
-  dataset retires it, and a repeat request sets expiry from its body, so omitting it clears a stored one.
+- **Expiry is a DELETION date only** (decision `tj-hhy3dk`). None means the dataset is never deleted by the reaper. Setting or clearing one retires and resumes nothing, for every update type, and a past expiry does not change health. A repeat `POST /store` still sets expiry from its body, so omitting it clears a stored one.
+- **Collect is the collecting intent** (`store_dataset_entry.collect`, nullable bool, migration `e5c8b1d4f703`). A `DAILY` or `STREAM` row holds true (collecting) or false (Stopped, read as `RETIRED` on the wire: the enum names are kept); a `STATIC` row holds NULL, enforced by a CHECK, and has no intent. The migration backfilled `collect = (expiry IS NULL)` for subscriptions, leaving the expiry as it was. `DatasetSummary.collecting` is `is_collecting` in `app/dataset_catalog.py`: the intent for a subscription (NULL reads as true), and for a STATIC dataset whether its latest run is `RUNNING` (derived, never stored). `is_retired` (same module) is collect false on a subscription, and health, the status group, the refresh and `lock_active_entry` all judge by it.
+- **`POST /store` carries an optional `collect`** (`StoreAssetDatasetBody`; a 422 on a `STATIC` request). On create an omitted `collect` is true for a subscription. On a repeat an omitted `collect` LEAVES THE STORED VALUE UNCHANGED and only an explicit one changes it, so an SDK retry of its original body cannot undo an operator's Stop. This differs from expiry on purpose: collect is the operator's intent, expiry the requester's own deletion date.
 
 ## Collection record and live events
 
@@ -77,7 +100,7 @@ It is separate from the entry and its bars, and is not part of the fetch's trans
 - **The record is best effort.** A failure to write it is logged and the fetch carries on unrecorded; the cost is a missing or stuck row, which the startup sweep bounds. The exception of the fetch itself propagates unchanged.
 - **`dataset_id` is NULL until ingest acknowledges the fetch**: a new dataset's entry is written on the acknowledgement. So a dataset is `Running` only from the acknowledgement, and a first-time request is not visible as Running before it. A run that fails before its acknowledgement keeps a NULL dataset id.
 - **The actor** is the request body's `owner`. It is a `SensitiveString` and is never logged.
-- **Events are notifications, not data.** Publishers call `publish()` strictly after their own commit. Published today: `IngestRunChanged` (start, acknowledgement, finish) and `DatasetChanged` `UPDATED` (after `POST /store`) and `DELETED`. `CREATED` is never published: a new dataset arrives as `UPDATED`, because the upsert does not tell the two apart. `ReaperPendingChanged` is published by the expiry reaper (below). `RequestChanged` is typed in `app/events.py` and in `ui/v1/events.proto` and has no publisher.
+- **Events are notifications, not data.** Publishers call `publish()` strictly after their own commit. Published today: `IngestRunChanged` (start, acknowledgement, finish) and `DatasetChanged`: `UPDATED` (after `POST /store` that does not flip collect, after `PATCH .../expiry`, and after a DAILY refresh), `RETIRED` / `RESUMED` (a collect flip to false / true, from `PATCH .../collecting` or from a `POST /store` that flips it; a collecting PATCH that leaves the stored value as it was publishes nothing, and a `POST /store` that does is `UPDATED`) and `DELETED`. `CREATED` is never published: a new dataset arrives as `UPDATED`, because the upsert does not tell the two apart. `ReaperPendingChanged` is published by the expiry reaper (below). `RequestChanged` is typed in `app/events.py` and in `ui/v1/events.proto` and has no publisher.
 - **An event can name a dataset whose entry is not committed yet**: the acknowledgement's `IngestRunChanged` is published before the fetch commits, so a reload by id may 404 briefly. REST is the truth.
 - **A slow client is dropped, never waited for.** Its queue is bounded (`EVENTS_CLIENT_QUEUE_SIZE`); when it fills the hub drops the client and the router closes the socket with 1013. The client reloads over REST on reconnect.
 
@@ -119,20 +142,21 @@ Five open GETs in `routers/data_store/ui_stats.py`, composed in `app/dataset_cat
 - **Estimates**: a share is `bar_count * total_bytes // total_bars` (`estimate_bytes`); with a `source` the storage total is the sum of that source's shares, so the split always sums to it. Quota burn is not served (tj-lenn8u).
 - **The stale cursor** is bound to stale_days, source and the client filter by a digest, so it carries no client id.
 
-## Operator writes (expiry and delete)
+## Operator writes (expiry, collecting and delete)
 
-`PATCH /ui/v1/datasets/{id}/expiry` (200, the updated `DatasetSummary`) and `DELETE /ui/v1/datasets/{id}` (204) are the UI's writes, in `routers/data_store/ui_dataset_writes.py`. Both need the instance secret; bodies are `SetExpiryRequest` / `DeleteDatasetRequest` parsed by `ProtoBody`, with no pydantic model.
+`PATCH /ui/v1/datasets/{id}/expiry`, `PATCH /ui/v1/datasets/{id}/collecting` (both 200, the updated `DatasetSummary`) and `DELETE /ui/v1/datasets/{id}` (204) are the UI's writes, in `routers/data_store/ui_dataset_writes.py`. All three need the instance secret; bodies are `SetExpiryRequest` / `SetCollectingRequest` / `DeleteDatasetRequest` parsed by `ProtoBody`, with no pydantic model.
 
 | Concern | Where it lives |
 |---|---|
-| The operator-path writes (`operator_set_expiry`, `operator_delete_entry`), beside the owner-scoped ones, which are unchanged | `app/database/crud/stock/store_dataset_entry.py` |
+| The operator-path writes (`operator_set_expiry`, `operator_set_collecting`, `operator_delete_entry`), beside the owner-scoped ones, which are unchanged | `app/database/crud/stock/store_dataset_entry.py` |
 | The override decision, `OverrideRequired`, the INSERTs of the two logs | `app/database/crud/dataset_override.py` |
 | Tables (no foreign key), migration `d7e2a9c35b18` | `app/database/models/dataset_override_log.py`, `dataset_deletion.py` |
 
-- **Rule order**: 422 bad body, 404 unknown id, 409 `OVERRIDE_REQUIRED` (owner is not `OPERATOR_PRINCIPAL` and the override is missing, unconfirmed or blank; no owner in the body), then the write. An override sent for the operator's own dataset is ignored.
-- **One transaction per write**: the write, its `dataset_deletion` row (every delete) and its `dataset_override_log` row (only an override, reason stored trimmed). The `DatasetChanged` event (`UPDATED` after a PATCH, `DELETED` after a DELETE) is published after the commit.
+- **Rule order** (expiry and delete): 422 bad body, 404 unknown id, 409 `OVERRIDE_REQUIRED` (owner is not `OPERATOR_PRINCIPAL` and the override is missing, unconfirmed or blank; no owner in the body), then the write. An override sent for the operator's own dataset is ignored.
+- **One transaction per write**: the write, its `dataset_deletion` row (every delete) and its `dataset_override_log` row (only an override, reason stored trimmed; the log's action is `SET_EXPIRY`, `SET_COLLECTING` or `DELETE`). The `DatasetChanged` event is published after the commit: `UPDATED` after an expiry PATCH, `RETIRED` / `RESUMED` after a collecting PATCH that flipped the stored value, `DELETED` after a DELETE.
 - **Both tables are append-only**: never an UPDATE or DELETE. `dataset_deletion.cause` is a string so the reaper (tj-grna9p.23) reuses the table.
-- **Setting an expiry on a `DAILY`/`STREAM` dataset retires it, clearing it resumes it**; the expiry type is never writable. The expiry is stored as sent: a past time retires it as the freshness read already judges it.
+- **Setting or clearing an expiry changes only the deletion date**; the expiry type is never writable. The expiry is stored as sent, and a past time makes the dataset reaper-pending, nothing else.
+- **`PATCH .../collecting`** takes `{collect, override}`. Rule order: the instance secret; 422 when the body has no `collect` (presence: a missing key is never read as false), before anything else; 404 unknown id; 422 for a `STATIC` dataset (no intent); 409 `OVERRIDE_REQUIRED` for another owner's dataset without a confirmed override; then the write. It publishes `RETIRED` (to false) or `RESUMED` (to true) only when the stored value changed; a repeat of the stored value publishes nothing. The row is locked `FOR UPDATE` to tell a flip from a repeat.
 - **An unmigrated database** refuses the audited writes: an overriding PATCH and every DELETE answer 503 `DATABASE_UNAVAILABLE` (detail names `make migrate`; no owner, no metadata) after the 404/409 checks and before any write; an operator-owned PATCH still goes through. One process-wide warning names `make migrate` (`audit_tables_exist`, `AuditUnavailable`).
 - **A DELETE may carry no body** (the operator's own dataset needs no override); a body that is sent is parsed strictly.
 
@@ -147,8 +171,8 @@ A periodic pass (`app/reaper.py`, the shared `run_periodic` with `Every`, starte
 | The delete (`reaper_delete_entry`, its own transaction, the cascade and record of the operator delete) | `app/database/crud/stock/store_dataset_entry.py` |
 | `GET /ui/v1/reaper/pending` (open; `ReaperPendingPage`) | `routers/data_store/ui_reaper.py`, `reaper_pending_page` in `app/dataset_catalog.py` |
 
-- **DRY-RUN IS THE DEFAULT.** `REAPER_DELETES_ENABLED` must be exactly `true` to delete anything. The default exists because STATIC rows created under the former now+1-day expiry default are all past expiry: the operator reads `GET /ui/v1/reaper/pending` before anything goes. Dry-run logs a count only, never an owner or a symbol.
-- **A retired subscription is pending only once its expiry has passed**, like any other dataset.
+- **DRY-RUN IS THE DEFAULT.** `REAPER_DELETES_ENABLED` must be the value `true` (any letter case, surrounding whitespace ignored) to delete anything; anything else, including unset, `1` and `yes`, is dry-run, and the flag is unset in every committed file (pinned by `server/common/tests/test_reaper_deletes_never_committed.py`). The default exists because STATIC rows created under the former now+1-day expiry default are all past expiry: the operator reads `GET /ui/v1/reaper/pending` before anything goes. Dry-run logs a count only, never an owner or a symbol.
+- **The reaper deletes at expiry whatever `collect` says.** A Stopped subscription with a passed expiry is pending like any other dataset, and one with no expiry is never reaped.
 - **Enabled**: each pending dataset is deleted in its own transaction on its own session, recorded in `dataset_deletion` with cause `REAPER` and actor `reaper`, with NO override-log row (a system action). `DatasetChanged` `DELETED` is published after each commit. A failure on one dataset is logged by exception type only and the pass carries on. The row is read `FOR UPDATE` and its expiry and running-ingest state re-checked under that lock, so a PATCH that extends the expiry either commits first (the dataset is left alone) or waits and gets its own 404. A fetch not yet acknowledged has no dataset id (tj-jc635p) and is not seen: if its dataset is deleted the fetch recreates the entry.
 - **A missing audit table means an enabled pass deletes nothing** (one warning, `audit_tables_exist`): a deletion is never unrecorded. Dry-run is unaffected.
 - **A dataset with a `RUNNING` ingest is skipped** and retried on the next pass.
@@ -163,23 +187,23 @@ An INTERIM store loop (`app/daily_refresh.py`, tj-grna9p.22) that keeps DAILY da
 | The pass, the env, the loops | `app/daily_refresh.py` |
 | The fetch it drives: the same worker and run recorder as `POST /store`, trigger `SCHEDULE`, actor `scheduler` | `store_market_activity_worker(..., fetch_start=)` in `app/ingest/data_action_request.py`, `recorded_run(..., actor=, requested_start=)` in `app/ingest/run_recording.py` |
 
-- **The work is read from the database on every pass**, never stored or replayed: DAILY entries that are not retired (`is_retired`: an expiry retires at once, clearing it resumes), have no `RUNNING` ingest, and read LATE or OVERDUE under the freshness rule (last bar before the last completed session). A pass also runs once at start, so datasets requested earlier are backfilled.
-- **Only the missing tail is requested**: from the last bar plus one bar (the declared start when there are no bars). The entry keeps its declared range as identity, so the refresh extends the existing entry; `fetch_start` replaces only the start of the ingest request. The stored feed is named as the preference, so a tape ingest can no longer serve is a refused ack, never a second entry.
+- **The work is read from the database on every pass**, never stored or replayed: DAILY entries that are not retired (`is_retired`: `collect` is false; an expiry alone retires nothing), have no `RUNNING` ingest, and read LATE or OVERDUE under the freshness rule (last bar before the last completed session). A pass also runs once at start, so datasets requested earlier are backfilled.
+- **Only the missing tail is requested**: from the last bar itself, inclusive, when that bar is provisional (written before its period closed, `last_bar_is_provisional` in `app/health.py`), so the upsert overwrites it with the final bar and the dataset reads FRESH; otherwise from the last bar plus one bar; the declared start when there are no bars (`_fetch_start` in `app/daily_refresh.py`). The entry keeps its declared range as identity, so the refresh extends the existing entry; `fetch_start` replaces only the start of the ingest request. The stored feed is named as the preference, so a tape ingest can no longer serve is a refused ack, never a second entry.
 - **Bounded**: one dataset at a time, at most `DAILY_REFRESH_MAX_PER_PASS` REQUESTED per pass (skipped datasets do not count). A TRANSIENT failure is logged by exception type only, backs off (doubling, capped at 600 s), and the pass stops after 3 in a row or at once on an error that names `reset_at` (a rate limit). The rest is the next pass's. **No automatic retry** (decision tj-grna9p.55; Retry Now is manual): a dataset that failed transiently waits for the next session close or the catch-up at start; the backoff only paces the next dataset.
 - **Permanent versus transient** is the error vocabulary's own outcome (`REASONS[reason].outcome`, `is_permanent`): REFUSED (a tape ingest cannot serve, an invalid request, a vendor 4xx, own overlap, a constraint violation) cannot succeed on retry; NOT_READY (peer or vendor unavailable, deadline, rate limit, rate budget, vendor auth, 5xx, database unavailable) and an error nobody typed are transient. A permanent refusal neither counts toward the stop nor backs off; it is counted in `PassResult.refused`. A stored row that no longer validates as a request is never sent (`skipped`).
 - **Fair, from the database**: the order and the "tried already" state are the `ingest_run` history of trigger `SCHEDULE` (`finished_scheduled_runs`, last 7 days), with no job store. Never-attempted datasets go first (oldest newest-bar first), then least recently attempted. A dataset whose last scheduled attempt asked for the same tail and finished EMPTY or as a permanent FAILED since the last session close is not requested again until the next close; once due again it shares the pass with the rest, at most half the cap while others wait. A run that failed before the ack has no dataset id and is matched on symbol, asset type, data type, granularity and requested start; two owners of one symbol with the same tail therefore share that outcome.
-- **The refresh never writes a lifecycle field.** `store_market_activity_worker(..., preserve_lifecycle=True)` locks the entry `FOR UPDATE` on the ack (`lock_active_entry`) and upserts with `preserve_lifecycle=True`, whose `ON CONFLICT` sets `updated_at` only, so an operator's expiry is never overwritten. A dataset retired or deleted while the vendor call was in flight has the answer DROPPED (nothing stored, counted in `PassResult.discarded`, the run recorded EMPTY with no bars). POST /store is unchanged: a repeat sets expiry from its body.
+- **The refresh never writes a lifecycle field.** `store_market_activity_worker(..., preserve_lifecycle=True)` locks the entry `FOR UPDATE` on the ack (`lock_active_entry`) and upserts with `preserve_lifecycle=True`, whose `ON CONFLICT` sets `updated_at` only, so an operator's expiry is never overwritten. A dataset stopped (`collect` set false) or deleted while the vendor call was in flight has the answer DROPPED (nothing stored, counted in `PassResult.discarded`, the run recorded EMPTY with no bars). POST /store is unchanged: a repeat sets expiry from its body, and leaves collect alone unless it carries one.
 - **An unmigrated database** logs one warning naming `make migrate` per process and the pass does nothing.
 - **Nothing counts vendor quota here** (ingest's counting, tj-grna9p.24, is not built). What bounds the spend is the cap, the serialisation, ingest's per-vendor rate budget (`<SOURCE>_RATE_LIMIT_PER_SEC`; unset means unthrottled) and the missing-tail-only request. Ingest treats a DAILY request as INTERACTIVE priority, the same as a UI request.
 - **A fetch not yet acknowledged has no dataset id** (tj-jc635p), so the running-ingest check cannot see a request that is in flight; its bars write idempotently, so the cost is a duplicate vendor call, never duplicate bars.
-- **`DAILY_REFRESH_ENABLED=false` is the kill switch**, read at start: a change needs a restart.
+- **`DAILY_REFRESH_ENABLED=false` is the kill switch** (also `0`, `no`, `off`), read at start: a change needs a restart. The default, and the cap that must exist before a penalising broker is enabled, are in the environment table below.
 
 ## Environment variables
 
 | Variable | Purpose | Default |
 |---|---|---|
 | DATABASE_URI | primary DSN | fails closed |
-| FRESHNESS_STREAM_BAR_MULTIPLE | STREAM freshness: a last bar within this many bar-lengths of now is FRESH in hours (`app/freshness.py`, read by `FreshnessConfig.from_env`) | 3 |
+| FRESHNESS_STREAM_BAR_MULTIPLE | STREAM freshness: a last bar within this many bar-lengths of now is FRESH in hours (`app/health.py`, read by `FreshnessConfig.from_env`) | 3 |
 | DEPLOYMENT_LABEL | display-only label in GET /ui/v1/config; nothing may branch on it (`app/ui_config.py`) | empty |
 | SERVER_VERSION | server_version in GET /ui/v1/config; else the installed distribution version, else `unknown` | unset |
 | EVENTS_CLIENT_QUEUE_SIZE | events a `/ui/v1/events` client may hold undelivered before the hub drops it and the socket closes 1013 (`app/events.py`, `QUEUE_SIZE_ENV`) | 256 |
@@ -189,12 +213,29 @@ An INTERIM store loop (`app/daily_refresh.py`, tj-grna9p.22) that keeps DAILY da
 | USAGE_ROLLUP_AFTER_DAYS | per-read rows older than this are folded into daily summaries | 90 |
 | USAGE_ROLLUP_INTERVAL_SECONDS | how often the rollup runs | 3600 |
 | REAPER_INTERVAL_SECONDS | seconds between expiry-reaper passes; a non-positive or malformed value is the default (`app/reaper.py`) | 3600 |
-| REAPER_DELETES_ENABLED | the reaper deletes only when this is exactly `true` (any case); anything else is dry-run (`app/reaper.py`) | false |
-| DAILY_REFRESH_ENABLED | the interim DAILY refresh loop runs unless this is `false`, `0`, `no` or `off`; read at start (`app/daily_refresh.py`) | true |
-| DAILY_REFRESH_SETTLE_MINUTES | minutes after a session's close before the refresh pass; negative or malformed is the default | 30 |
+| REAPER_DELETES_ENABLED | the reaper deletes only when this is `true` in any letter case, surrounding whitespace ignored (`strip().lower()`); anything else, unset, `1` and `yes` included, is dry-run (`app/reaper.py`) | false |
+| DAILY_REFRESH_ENABLED | the interim DAILY refresh loop runs unless this is `false`, `0`, `no` or `off`; read at start (`app/daily_refresh.py`). ON BY DEFAULT, by the owner's ruling, accepted for the CURRENT broker only: its vendor errors when a limit is exceeded and does not penalise it. A robust cumulative cap (a quota counter that survives restarts, and admission control in the scheduler) must exist BEFORE any broker that penalises exceeding limits (IBKR) is enabled; no cumulative vendor-usage counter exists yet (tj-lenn8u). This row is the one place the default is written down | true |
+| DAILY_REFRESH_SETTLE_MINUTES | minutes after a session's close before the refresh pass, and the settle margin that decides when a written bar is final (`health.settle_margin_from_env`, read by `FreshnessConfig.from_env` and the refresh); negative or malformed is the default | 30 |
 | DAILY_REFRESH_MAX_PER_PASS | datasets one pass refreshes at most; non-positive or malformed is the default | 10 |
 | DAILY_REFRESH_BACKOFF_SECONDS | wait after a first failed fetch, doubled per further failure in a row, capped at 600 | 30 |
 | SERVICE_WORKERS | uvicorn workers; must stay 1 (see Key invariants). `docker-compose.yaml` pins it as a literal, so the env file cannot change it there | 1 |
+
+## Known limits
+
+Accepted and recorded, not bugs to fix in passing. Each names what bounds it.
+
+| Limit | Detail |
+|---|---|
+| One usage batch can be counted twice at shutdown | A cancel that lands after the batch INSERT commits but before `flush` returns puts the batch back, so the final flush writes it again. It overcounts usage telemetry by at most one batch, only at shutdown (`app/usage_recorder.py`). |
+| About 16,000 datasets per source on the stats routes | The usage and stale queries bind the dataset ids as parameters, and asyncpg allows 32,767 per statement, so a source with more than about 16,000 datasets exceeds it (`tj-ck7blk` replaces the id list with a subquery). |
+| The DAILY refresh's skip is shared across owners | The "already tried this tail" rule keys on the identity label (symbol, asset type, data type, granularity and requested start) until `tj-jc635p` gives a fetch its dataset id at request time. Two owners of one symbol with the same tail share a refusal's skip for one session. |
+| A dataset resumed after a mid-fetch stop waits | A stop (collect set false) during a fetch drops the answer and is never undone; if the dataset is resumed afterwards, it is refreshed at the next session close, not at once. |
+| No automatic retry of a failed refresh | A transient failure waits for the next close or the catch-up at start (decision `tj-grna9p.55`). |
+| An unacknowledged fetch has no dataset id | The running-ingest check and the reaper cannot see a fetch before ingest acknowledges it (`tj-jc635p`); a duplicate vendor call is the cost, never duplicate bars. |
+| The trading calendars end about a year after the process starts | The store builds each calendar with the library's default end date, so a data_store process that runs longer than about a year without a restart hits an out-of-range error. The DAILY refresh then retries every few minutes without refreshing anything until the process restarts. A follow-up sets an explicit far-future end. |
+| The owner string appears in access log lines | The web server logs the raw request path, so `DELETE /store/{id}?owner=...` and `GET /store?owner=...` log the owner from the query string. A follow-up adds a redacting log filter; authenticated per-client keys will move owner off the query string later. |
+| The agent-mcp group's `mcp` is capped below 2 | `mcp>=1.30.0,<2` in `pyproject.toml`. Moving to 2.x is the owner's decision. |
+| The security tooling group's own advisories are excluded from the audit | That group (semgrep) pins `mcp` 1.29.0 and `pyjwt` 2.13.0, which carry advisories. It is tooling only and in no image, so `make security` does not audit it by design; the findings clear when semgrep raises its pins. |
 
 ## Common pitfalls
 

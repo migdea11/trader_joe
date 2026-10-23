@@ -1,7 +1,8 @@
 """The expiry reaper on real Postgres: what the SQLite tier (data/store/tests/test_reaper.py) cannot prove (tj-grna9p.23).
 
 The design is the architect's 2026-10-14 consolidated brief on tj-grna9p.23: the pending set is `expiry <= now`
-whatever the update type; dry-run unless REAPER_DELETES_ENABLED is exactly `true`; enabled, each dataset is deleted
+whatever the update type; dry-run unless REAPER_DELETES_ENABLED is `true` (any letter case, surrounding whitespace
+ignored); enabled, each dataset is deleted
 in its own transaction with a dataset_deletion row (cause REAPER, actor `reaper`, bars counted) and no override-log
 row; a missing audit table means an enabled pass deletes nothing; a dataset with a RUNNING ingest is skipped.
 

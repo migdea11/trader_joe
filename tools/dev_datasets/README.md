@@ -47,7 +47,9 @@ and nothing ever deletes it. On the test backend r8's `ZZDS` mapping carries the
 
 **The reaper trial.** r9 is the past-expiry row (a STATIC row whose deletion date was D-1). r1's expiry, D+2, is
 also only a deletion date: it is not past at seed time, becomes past-expiry at D+2, and is then reaped like r9 when
-`REAPER_DELETES_ENABLED=true` (the reaper is dry-run otherwise). No `dev-degraded` row has an expiry, and every
+`REAPER_DELETES_ENABLED=true` (the reaper is dry-run otherwise). To try it on dev, set the flag (and optionally `REAPER_INTERVAL_SECONDS`) only in a compose file outside the
+repository, never in a committed file or the shared data_store settings file; see the main README's "Trying the reaper
+on a dev stack". `make dev-up` ends the trial. No `dev-degraded` row has an expiry, and every
 past-expiry row belongs to `dev-datasets` or `operator`.
 
 ## These rows are intentionally damaged
@@ -168,6 +170,19 @@ For a genuine FAILED run in run history on dev: after `degrade`, stop `data_inge
 
 ## Safety
 
+- **The database must carry the same marker.** The label proves only the store that answered, not the database the
+  tool writes to, so every database connection first reads `cluster_name` from `pg_settings` (the first statement,
+  on that same connection, before any count, reset or degrade). It proceeds only when exactly one row came back whose
+  source is `command line`, whose value is `dev` or `test`, and which equals the store's label. Postgres gets that
+  option from `docker-compose.override.yaml` (`cluster_name=dev`) and `docker-compose.fake.yaml`
+  (`cluster_name=test`); prod never sets it. A value set by the client, a session or `ALTER ROLE`/`ALTER DATABASE`
+  has another source and is refused, as is no row or an empty value. A refusal changes nothing, exits 1 and reads:
+
+      refused: the database is not this dev or test stack (cluster_name 'none' from source 'none', the store says 'dev'); nothing was changed
+
+  The value and source shown are what it found. The usual cause is a stack started before the marker existed: the first
+  `make dev-up` (or `make system-launch`) after pulling the change recreates the postgres container with it, and the
+  data folder survives. It does not stop someone with superuser rights or access to the server's command line.
 - **Every writing mode (seed, reset, reads, degrade, repair) refuses unless `GET /ui/v1/config` reports `deploymentLabel`
   `dev` or `test`.** A prod stack answers an empty label and is refused before any SQL or request is sent.
 - **Credentials come only from the environment**: `INSTANCE_WRITE_SECRET` (sent only in the `X-Instance-Secret`

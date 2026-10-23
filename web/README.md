@@ -16,7 +16,7 @@ Strategy-specific metrics are add-ons, and only the add-ons are private.
 
 ## What it consumes
 
-- **REST carrying JSON**, same-origin, GET only today. No gRPC on the browser wire: browsers cannot
+- **REST carrying JSON**, same-origin: GET, plus the two operator writes (set or clear a dataset's expiry, delete a dataset). No gRPC on the browser wire: browsers cannot
   read HTTP/2 trailers, which is how gRPC signals status.
 - **One WebSocket**, `/api/store/ui/v1/events`, which pushes notifications that something changed. It
   carries no data: an event is a hint to refetch over REST. See [Live events](#live-events).
@@ -26,12 +26,13 @@ Strategy-specific metrics are add-ons, and only the add-ons are private.
   methods are described by the server's OpenAPI document; only message shapes are shared.
 - **The browser calls `/api/store/...`.** data_store serves the same route without the prefix, so
   `/api/store/ui/v1/datasets` reaches `/ui/v1/datasets`. In production Caddy strips the prefix,
-  forwards only GET and HEAD under `/api/store/ui/v1/`, and adds the instance secret; the browser never
-  holds it. The dev proxy (`vite.config.ts`) is not that filter: it forwards everything under
-  `/api/store`, any method and any path, strips the prefix and never adds the secret, so a write from
-  the dev server reaches the store without it and is refused.
+  forwards only GET and HEAD under `/api/store/ui/v1/` plus exactly `PATCH .../datasets/{uuid}/expiry`,
+  `PATCH .../datasets/{uuid}/collecting` and `DELETE .../datasets/{uuid}`, and adds the instance secret to the proxied request; the browser
+  never holds it. The dev server (`vite.config.ts`) mirrors those four rules and adds the secret from
+  its own process environment (`INSTANCE_WRITE_SECRET`, never a `VITE_` name), so a write works in dev
+  and a request the production proxy would refuse is refused here too.
 
-The routes in use are listed in [`docs/API.md`](../docs/API.md) under *The UI read routes*. Every
+The routes in use are listed in [`docs/API.md`](../docs/API.md) under *The UI routes*. Every
 range is half-open, `[start, end)`.
 
 The UI does not place or amend orders. It reads, and asks the server to act.
@@ -121,7 +122,7 @@ reconnects the same way.
 
 | Screen | Route | Holds |
 |---|---|---|
-| Datasets | `/data/datasets` | the catalog grid. The **Status** column reads Running while the dataset's latest run is in flight and otherwise Healthy, Late, Failed or Retired; the **Coverage** column is a strip fetched lazily for the rows in view, with the details icon after its numbers. The sidebar's Status group has Running as its own toggle (`?running=true`), combinable with one status choice. The whole row opens the Viewer; the symbol is a real link (keyboard, new tab) styled as plain text, and the details icon opens the detail |
+| Datasets | `/data/datasets` | the catalog grid. The **Status** column reads Running while the dataset's latest run is in flight and otherwise Healthy, Late, Failed or Stopped; the **Coverage** column is a strip fetched lazily for the rows in view, with the details icon after its numbers. The sidebar's Status group has Running as its own toggle (`?running=true`), combinable with one status choice. The whole row opens the Viewer; the symbol is a real link (keyboard, new tab) styled as plain text, and the details icon opens the detail |
 | Dataset detail | `/data/datasets/:id` | **Overview** (owner, range, bars, last bar), **Coverage** (a strip of at most 20 blocks, fewer for a short dataset, and the exact gap list), **History** (the dataset's runs, newest first, Load More by cursor) and **Retention**, which is read-only: the expiry type and time, with no control. The sidebar holds these sections, All Datasets and a disabled Usage; it has no Rows item, since the breadcrumb's symbol crumb is the link to the Viewer (the Overview has none) |
 | Viewer | `/data/datasets/:id/viewer` | candles, volume, a paged bar table and Export CSV; see [The Viewer](#the-viewer) |
 

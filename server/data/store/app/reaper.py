@@ -4,10 +4,10 @@ THE PENDING SET is `expiry <= now`, whatever the update type, read from the data
 (crud list_pending / pending_ids). A dataset is pending once its expiry has passed, whatever its update type and whatever its collect intent says.
 Catch-up after a restart is simply the next pass: nothing is stored and nothing is replayed (common/scheduling.py).
 
-DRY-RUN BY DEFAULT. Deletions need REAPER_DELETES_ENABLED to be exactly `true`; anything else, unset included, is
-dry-run. Dry-run logs a COUNT and deletes nothing. The default exists because STATIC rows made before the expiry
-default was changed carry an expiry that has long passed, and the operator is to see that list
-(GET /ui/v1/reaper/pending) before anything is deleted.
+DRY-RUN BY DEFAULT. Deletions need REAPER_DELETES_ENABLED to be `true` in any letter case, surrounding whitespace
+ignored; anything else, unset, `1` and `yes` included, is dry-run. Dry-run logs a COUNT and deletes nothing. The
+default exists because STATIC rows made before the expiry default was changed carry an expiry that has long passed,
+and the operator is to see that list (GET /ui/v1/reaper/pending) before anything is deleted.
 
 ENABLED, each pending dataset is deleted in its OWN transaction on its own session, through the same cascade as the
 operator's delete, with a deletion-record row (cause REAPER, actor 'reaper') and NO override-log row: a system

@@ -1,7 +1,7 @@
 """build_infra pin: no committed file turns the expiry reaper's deletions on (tj-grna9p.165).
 
-The reaper is dry-run unless REAPER_DELETES_ENABLED is exactly `true` (server/data/store/app/reaper.py,
-deletes_enabled). The UNSET half -- an absent variable reads as dry-run -- is already pinned by
+The reaper is dry-run unless REAPER_DELETES_ENABLED is `true` in any letter case, surrounding whitespace ignored
+(server/data/store/app/reaper.py, deletes_enabled); anything else, unset included, is dry-run. The UNSET half -- an absent variable reads as dry-run -- is already pinned by
 server/data/store/tests/test_reaper.py::test_dry_run_deletes_nothing_and_logs_only_a_count, whose `flag`
 parametrisation includes None; it is not repeated here. This module pins the other half: since unset is
 dry-run, PROD stays dry-run only while nothing the repository ships sets the variable. A deployment turns
