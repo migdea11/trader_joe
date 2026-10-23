@@ -947,3 +947,186 @@ def test_alembic_check_writes_nothing_to_an_already_migrated_database(scratch: S
         after_version = sorted(conn.execute(sa.text('SELECT version_num FROM alembic_version')).scalars())
     assert after_version == before_version, f'check changed alembic_version from {before_version} to {after_version}'
     assert scratch.row_counts() == before_counts, 'check changed a row count'
+
+
+# ---------------------------------------------------------------------------------------------
+# THE COLLECT REVISION, e5c8b1d4f703 (tj-grna9p.176; design decision tj-hhy3dk section 1), and its
+# MIGRATION-SAFETY CHECKLIST: additive; applies from EMPTY and on the PREVIOUS revision WITH DATA; the
+# CHECK holds on every backfilled row; the downgrade round-trips on data; a repeat upgrade is a no-op.
+#
+# The generic rule above already holds it LOSSLESS on every seed at d7e2a9c35b18 (it carries no marker),
+# and test_seed_loads_equal_to_its_manifest loads the new canonical seed at e5c8b1d4f703. What follows
+# asserts what lossless cannot: the VALUES the backfill writes, per row kind, and the constraint's teeth.
+# The collect-mix variant at the parent holds one row of each kind, all synthetic (ZZSEED, seed-owner-a);
+# the canonical parent seed holds STATIC rows only.
+
+COLLECT_REVISION = 'e5c8b1d4f703'
+COLLECT_CHECK = 'ck_store_dataset_entry_collect_by_type'
+COLLECT_MIX_SEED = 'd7e2a9c35b18.collect-mix'
+PARENT_SEEDS_FOR_COLLECT = ['d7e2a9c35b18', COLLECT_MIX_SEED]
+STATIC_UPDATE_TYPE = 1  # UpdateType.STATIC's stored value; DAILY is 2 and STREAM 3
+
+# The design's table for the variant seed, by symbol: a subscription collects exactly when it has no
+# expiry; a STATIC dataset is NULL whether or not it has one.
+COLLECT_MIX_EXPECTED = {
+    'ZZSEEDDE': False,  # DAILY with an expiry: retired today, so not collecting
+    'ZZSEEDDN': True,  # DAILY without one
+    'ZZSEEDTE': False,  # STREAM with an expiry
+    'ZZSEEDTN': True,  # STREAM without one
+    'ZZSEEDSE': None,  # STATIC with an expiry
+    'ZZSEEDSN': None,  # STATIC without one
+}
+
+
+def _by_symbol(db: ScratchDb, column: str) -> dict[str, Any]:
+    """A column of the collect-mix seed keyed by symbol, which that seed holds once each."""
+    symbols = db.values(ENTRY_TABLE, 'asset_symbol')
+    assert len(set(symbols.values())) == len(symbols), 'the collect-mix rows are keyed by symbol; one repeats'
+    return {symbols[row_id]: value for row_id, value in db.values(ENTRY_TABLE, column).items()}
+
+
+def _expected_collect(update_types: dict[Any, int], expiries: dict[Any, Any]) -> dict[Any, bool | None]:
+    return {
+        row_id: None if update_type == STATIC_UPDATE_TYPE else expiries[row_id] is None
+        for row_id, update_type in update_types.items()
+    }
+
+
+def _collect_check_def(db: ScratchDb) -> str | None:
+    with db.engine.connect() as conn:
+        return conn.execute(
+            sa.text(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = :name AND contype = 'c' "
+                "AND conrelid = 'public.store_dataset_entry'::regclass"
+            ),
+            {'name': COLLECT_CHECK},
+        ).scalar_one_or_none()
+
+
+def test_the_collect_revision_sits_on_the_parent_the_collect_seeds_are_at() -> None:
+    assert GRAPH[COLLECT_REVISION].down_revision == 'd7e2a9c35b18'
+    assert not GRAPH[COLLECT_REVISION].marked, 'the collect revision is designed additive; it must carry no marker'
+    for name in PARENT_SEEDS_FOR_COLLECT:
+        assert name in SEED_NAMES, f'seed {name} is missing from {SEEDS_DIR}'
+
+
+@pytest.mark.parametrize('name', PARENT_SEEDS_FOR_COLLECT)
+def test_the_collect_backfill_on_the_parent_seed_sets_collect_per_row_kind_and_keeps_every_expiry(
+    scratch: ScratchDb, name: str
+) -> None:
+    seed = read_seed(name)
+    scratch.load(seed)
+    update_types, expiries = scratch.values(ENTRY_TABLE, 'update_type'), scratch.values(ENTRY_TABLE, 'expiry')
+
+    scratch.must('upgrade', COLLECT_REVISION)
+
+    collect = scratch.values(ENTRY_TABLE, 'collect')
+    assert collect == _expected_collect(update_types, expiries), f'seed {name}: the backfill is not (expiry IS NULL)'
+    if name == COLLECT_MIX_SEED:
+        assert _by_symbol(scratch, 'collect') == COLLECT_MIX_EXPECTED, 'the variant seed does not read as the design'
+    assert scratch.values(ENTRY_TABLE, 'expiry') == expiries, f'seed {name}: an expiry changed'
+    assert_equals_manifest(scratch, seed)  # every parent column of every row, expiry included, byte for byte
+    assert _collect_check_def(scratch) is not None, f'{COLLECT_CHECK} is missing after the upgrade'
+
+
+def test_the_collect_revision_round_trips_upgrade_downgrade_upgrade_on_data(scratch: ScratchDb) -> None:
+    seed = read_seed(COLLECT_MIX_SEED)
+    scratch.load(seed)
+
+    scratch.must('upgrade', COLLECT_REVISION)
+    assert _by_symbol(scratch, 'collect') == COLLECT_MIX_EXPECTED
+
+    scratch.must('downgrade', seed.revision)
+    assert 'collect' not in scratch.columns(ENTRY_TABLE), 'the downgrade left the collect column'
+    assert _collect_check_def(scratch) is None, 'the downgrade left the CHECK'
+    assert scratch.columns(ENTRY_TABLE) == sorted(seed.digests[ENTRY_TABLE])
+    assert_equals_manifest(scratch, seed)
+
+    scratch.must('upgrade', COLLECT_REVISION)
+    assert _by_symbol(scratch, 'collect') == COLLECT_MIX_EXPECTED, 'the second upgrade backfilled differently'
+    assert_equals_manifest(scratch, seed)
+
+
+@pytest.mark.parametrize(
+    ('symbol', 'value', 'allowed'),
+    [
+        pytest.param('ZZSEEDSN', True, False, id='static-true-refused'),
+        pytest.param('ZZSEEDSE', False, False, id='static-false-refused'),
+        pytest.param('ZZSEEDDN', None, False, id='daily-null-refused'),
+        pytest.param('ZZSEEDTN', None, False, id='stream-null-refused'),
+        pytest.param('ZZSEEDDE', True, True, id='daily-true-allowed'),
+        pytest.param('ZZSEEDTN', False, True, id='stream-false-allowed'),
+    ],
+)
+def test_the_collect_check_refuses_static_with_a_value_and_a_subscription_with_null(
+    scratch: ScratchDb, symbol: str, value: bool | None, allowed: bool
+) -> None:
+    scratch.load(read_seed(COLLECT_MIX_SEED))
+    scratch.must('upgrade', COLLECT_REVISION)
+    before = scratch.snapshot()
+    statement = sa.text(f'UPDATE public.{ENTRY_TABLE} SET collect = :value WHERE asset_symbol = :symbol')  # nosec B608
+
+    if allowed:
+        with scratch.engine.begin() as conn:
+            assert conn.execute(statement, {'value': value, 'symbol': symbol}).rowcount == 1
+        assert _by_symbol(scratch, 'collect')[symbol] is value
+        return
+    with pytest.raises(sa.exc.IntegrityError, match=COLLECT_CHECK), scratch.engine.begin() as conn:
+        conn.execute(statement, {'value': value, 'symbol': symbol})
+    assert scratch.snapshot() == before, 'a refused write changed the data'
+
+
+@pytest.mark.parametrize('unknown', [0, 4])
+def test_an_unknown_update_type_at_the_parent_makes_the_collect_upgrade_refuse_atomically(
+    scratch: ScratchDb, unknown: int
+) -> None:
+    """An unknown update_type row refuses the upgrade, and the refusal leaves nothing behind.
+
+    The backfill names DAILY and STREAM (IN (2, 3), the architect's ruling), so a row of any other update_type
+    keeps collect NULL, ADD CONSTRAINT fails, and the one-transaction upgrade rolls back whole.
+    """
+    seed = read_seed(COLLECT_MIX_SEED)
+    scratch.load(seed)
+    with scratch.engine.begin() as conn:
+        changed = conn.execute(
+            sa.text(f'UPDATE public.{ENTRY_TABLE} SET update_type = :unknown WHERE asset_symbol = :symbol'),  # nosec B608
+            {'unknown': unknown, 'symbol': 'ZZSEEDDN'},
+        ).rowcount
+    assert changed == 1
+    before, schema = scratch.snapshot(), scratch.schema()
+
+    run = scratch.migrate('upgrade', COLLECT_REVISION)
+
+    assert_refused(run, scratch, seed.revision, before, schema)
+    assert COLLECT_CHECK in run.output, f'the upgrade refused, but not on {COLLECT_CHECK}:\n{run.output[-4000:]}'
+
+
+def test_the_collect_revision_applies_from_empty_with_the_models_column(scratch: ScratchDb) -> None:
+    """From an EMPTY database to the collect revision: the column as the model declares it, and the CHECK."""
+    assert scratch.revision() is None
+    scratch.must('upgrade', COLLECT_REVISION)
+    with scratch.engine.connect() as conn:
+        column = conn.execute(
+            sa.text(
+                'SELECT data_type, is_nullable, column_default FROM information_schema.columns '
+                "WHERE table_schema = 'public' AND table_name = :table AND column_name = 'collect'"
+            ),
+            {'table': ENTRY_TABLE},
+        ).one()
+    assert tuple(column) == ('boolean', 'YES', None), f'collect at {COLLECT_REVISION}: {tuple(column)}'
+    definition = _collect_check_def(scratch)
+    assert definition is not None and 'collect IS NULL' in definition and 'collect IS NOT NULL' in definition, (
+        f'{COLLECT_CHECK}: {definition}'
+    )
+
+
+def test_a_repeat_upgrade_to_the_collect_revision_is_a_no_op(scratch: ScratchDb) -> None:
+    """Idempotence as this repo defines it: alembic's version table makes a second upgrade change nothing."""
+    scratch.load(read_seed(COLLECT_MIX_SEED))
+    scratch.must('upgrade', COLLECT_REVISION)
+    before, schema = scratch.snapshot(), scratch.schema()
+
+    scratch.must('upgrade', COLLECT_REVISION)
+
+    assert scratch.snapshot() == before, 'a repeat upgrade changed the data'
+    assert scratch.schema() == schema, 'a repeat upgrade changed the schema'

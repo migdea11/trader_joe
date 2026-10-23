@@ -68,7 +68,21 @@ scratch_async = test_usage_record.scratch_async
 _head = test_usage_record._head
 READ_TABLE = test_usage_record.READ_TABLE
 DAILY_TABLE = test_usage_record.DAILY_TABLE
-PRE_USAGE_REVISION = test_usage_record.PARENT_REVISION
+
+
+def hide_usage_tables(engine: sa.Engine) -> None:
+    """Rename both usage tables away, so usage_tables_exist's to_regclass answers as on a database without them.
+
+    WHY NOT MIGRATE ONLY TO THE REVISION BEFORE THEM (tj-grna9p.176). The unmigrated tests used to stop at
+    test_usage_record.PARENT_REVISION, which worked while no later revision touched store_dataset_entry.
+    e5c8b1d4f703 adds store_dataset_entry.collect and the catalog selects the whole entry, so the head's code no
+    longer runs on a database below that revision. Migrated to head with the two tables renamed, the probe sees
+    exactly the absence it saw before, on an entry table the head's code matches.
+    """
+    with engine.begin() as conn:
+        for table in (READ_TABLE.name, DAILY_TABLE.name):
+            conn.execute(sa.text(f'ALTER TABLE public.{table} RENAME TO {table}_hidden_by_test'))  # nosec B608
+
 
 LIST = UiDatasetsInterface.GET_UI_DATASETS.value
 FACETS = UiDatasetsInterface.GET_UI_DATASET_FACETS.value
@@ -706,7 +720,8 @@ async def test_a_request_runs_a_constant_number_of_statements_with_usage_read(
 async def test_an_unmigrated_database_reads_as_zero_usage_with_one_warning(
     scratch_db, client, entry_values, monkeypatch, caplog
 ):
-    scratch_db.must('upgrade', PRE_USAGE_REVISION)
+    scratch_db.must('upgrade', _head())
+    hide_usage_tables(scratch_db.engine)
     with scratch_db.engine.begin() as conn:
         conn.execute(sa.insert(ENTRY_TABLE).values(entry_values(asset_symbol='UNREAD')))
     monkeypatch.setattr(catalog_module, '_warned_usage_missing', False)

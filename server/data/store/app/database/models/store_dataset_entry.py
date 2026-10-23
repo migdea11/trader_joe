@@ -1,4 +1,4 @@
-from sqlalchemy import UUID, Column, DateTime, Enum, String, UniqueConstraint, func
+from sqlalchemy import UUID, Boolean, CheckConstraint, Column, DateTime, Enum, String, UniqueConstraint, func
 
 from common.database.sql_alchemy_nullable_datetime import NullableDateTime as SqlNullableDateTime
 from common.database.sql_alchemy_ordered_enum import OrderedEnum as SqlIntEnum
@@ -135,11 +135,25 @@ class StoreDatasetEntry(AppBase.DATA_STORE_BASE, CustomTypeTable):
     expiry_type = CustomColumn(SqlIntEnum(ExpiryType), nullable=False, server_default=str(ExpiryType.BULK.value))
     update_type = CustomColumn(SqlIntEnum(UpdateType), nullable=False, server_default=str(UpdateType.STATIC.value))
 
+    # Whether the operator wants this dataset collected (tj-hhy3dk section 1): expiry means deletion only. NULL
+    # exactly for a STATIC dataset, which is never collected on a schedule; a DAILY or STREAM dataset is True or
+    # False. Not identity and in no unique key. The CHECK below mirrors migration e5c8b1d4f703; the stored
+    # integers of update_type are STATIC = 1, DAILY = 2, STREAM = 3.
+    collect = Column(Boolean, nullable=True)
+
     # Dates used to manage split and dividends adjustments
     created_at = Column(DateTime(timezone=True), default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), default=func.now(), onupdate=func.now(), nullable=False)
 
-    __table_args__ = (UniqueConstraint(*NATURAL_KEY, name=NATURAL_KEY_CONSTRAINT),)
+    COLLECT_BY_TYPE_CONSTRAINT = 'ck_store_dataset_entry_collect_by_type'
+
+    __table_args__ = (
+        UniqueConstraint(*NATURAL_KEY, name=NATURAL_KEY_CONSTRAINT),
+        CheckConstraint(
+            '(update_type = 1 AND collect IS NULL) OR (update_type IN (2, 3) AND collect IS NOT NULL)',
+            name=COLLECT_BY_TYPE_CONSTRAINT,
+        ),
+    )
 
     def __repr__(self):
         # owner is sensitive (tj-vhboky.41 Addendum 1, D3, M3): the marker, never the value.

@@ -204,6 +204,10 @@ def entry(
         # (GET /store/{id}) validates every row it reads back against that rule.
         expiry_type=ExpiryType.BULK if update_type is UpdateType.STATIC else ExpiryType.ROLLING,
         update_type=update_type,
+        # collect (tj-grna9p.176, decision tj-hhy3dk section 1): NULL exactly for STATIC, as the model's CHECK
+        # requires; for DAILY and STREAM the value migration e5c8b1d4f703 backfills, (expiry IS NULL), so a
+        # fixture that retires a subscription by expiry stays retired under both today's rule and the collect one.
+        collect=None if update_type is UpdateType.STATIC else expiry is None,
         created_at=NOW,
         updated_at=NOW,
     )

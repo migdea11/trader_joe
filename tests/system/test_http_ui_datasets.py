@@ -155,7 +155,12 @@ def catalog(
     values = []
     for index in range(CATALOG_SIZE):
         update_type = UpdateType.STATIC if index % 2 == 0 else UpdateType.DAILY
-        values.append(entry_values(asset_symbol=f'{prefix}{index:04d}', update_type=update_type.value, **SPAN))
+        # collect named on EVERY row, NULL for STATIC (tj-grna9p.176): a multi-row INSERT takes its column list
+        # from the first row, which is STATIC, so a key only the DAILY rows carried would be dropped from theirs.
+        collect = None if update_type is UpdateType.STATIC else True
+        values.append(
+            entry_values(asset_symbol=f'{prefix}{index:04d}', update_type=update_type.value, collect=collect, **SPAN)
+        )
     with pg_engine.begin() as conn:
         entries = conn.execute(sa.insert(ENTRY_TABLE).returning(*ENTRY_TABLE.c), values).all()
     for entry in entries:

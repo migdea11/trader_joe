@@ -55,9 +55,6 @@ scratch_db = test_usage_record.scratch_db
 scratch_async = test_usage_record.scratch_async
 _head = test_usage_record._head
 
-AUDIT_REVISION = 'd7e2a9c35b18'
-PRE_AUDIT_REVISION = 'b3d9e1a47c62'
-
 DELETION = DatasetDeletion.__table__
 OVERRIDE = DatasetOverrideLog.__table__
 RUN = IngestRun.__table__
@@ -218,10 +215,19 @@ async def test_enabled_on_postgres_deletes_and_records_each_pending_dataset_and_
 async def test_enabled_on_postgres_before_the_audit_revision_deletes_nothing(
     scratch_db, point_reaper, entry_values, bar_values, run_identity, monkeypatch
 ):
-    """The REAL to_regclass probe answers False on a database at b3d9e1a47c62, so nothing is deleted unrecorded."""
-    scratch_db.must('upgrade', PRE_AUDIT_REVISION)
+    """The REAL to_regclass probe answers False when the audit tables are absent, so nothing is deleted unrecorded.
+
+    THE ABSENCE IS MADE AT HEAD, NOT BY STOPPING AT b3d9e1a47c62 (tj-grna9p.176). This test used to migrate only to
+    PRE_AUDIT_REVISION, which worked while every revision after it left store_dataset_entry alone. e5c8b1d4f703 adds
+    store_dataset_entry.collect, and the head's reaper reads the whole entry row (and the seed's RETURNING names
+    every model column), so a database below that revision is no longer one the head's code can run on at all. The
+    audit tables are renamed away and back instead: to_regclass sees exactly what it saw below d7e2a9c35b18, on an
+    entry table the head's code matches.
+    """
+    scratch_db.must('upgrade', _head())
     seeded = _seed(scratch_db.engine, entry_values, bar_values, run_identity)
     monkeypatch.setenv(reaper_module.DELETES_ENABLED_ENV, 'true')
+    _rename_audit_tables(scratch_db.engine, hidden=True)
     bars_before = _bar_counts(scratch_db.engine)
 
     assert await Reaper().run_pass(seeded.now) == 0
@@ -231,8 +237,19 @@ async def test_enabled_on_postgres_before_the_audit_revision_deletes_nothing(
     assert not [e for e in point_reaper if isinstance(e, DatasetChanged)]
 
     # Migrated, the next pass deletes.
-    scratch_db.must('upgrade', AUDIT_REVISION)
+    _rename_audit_tables(scratch_db.engine, hidden=False)
     assert await Reaper().run_pass(seeded.now) == len(PENDING) - 1
+
+
+HIDDEN_SUFFIX = '_hidden_by_test'
+
+
+def _rename_audit_tables(engine: sa.Engine, *, hidden: bool) -> None:
+    """Rename both audit tables away (hidden) or back, so the probe answers as on a database without them."""
+    with engine.begin() as conn:
+        for table in (DELETION.name, OVERRIDE.name):
+            old, new = (table, f'{table}{HIDDEN_SUFFIX}') if hidden else (f'{table}{HIDDEN_SUFFIX}', table)
+            conn.execute(sa.text(f'ALTER TABLE public.{old} RENAME TO {new}'))  # nosec B608 -- model table names
 
 
 @pytest.fixture

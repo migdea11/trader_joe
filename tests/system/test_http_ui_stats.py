@@ -52,7 +52,6 @@ Statements = usage_tests.Statements
 _head = test_usage_record._head
 READ_TABLE = test_usage_record.READ_TABLE
 DAILY_TABLE = test_usage_record.DAILY_TABLE
-PRE_USAGE_REVISION = test_usage_record.PARENT_REVISION
 NOW = usage_tests.NOW  # 2026-10-06T22:00Z
 TODAY = NOW.date()
 
@@ -631,7 +630,8 @@ async def test_each_stats_request_runs_a_constant_number_of_statements(
 async def test_an_unmigrated_database_reads_as_zeros_with_one_warning(
     scratch_db, client, entry_values, monkeypatch, caplog
 ):
-    scratch_db.must('upgrade', PRE_USAGE_REVISION)
+    scratch_db.must('upgrade', _head())
+    usage_tests.hide_usage_tables(scratch_db.engine)  # why not the revision before them: its docstring
     with scratch_db.engine.begin() as conn:
         conn.execute(sa.insert(ENTRY_TABLE).values(entry_values(asset_symbol='UNREAD')))
     monkeypatch.setattr(catalog_module, '_warned_usage_missing', False)
