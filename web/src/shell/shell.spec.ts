@@ -44,6 +44,12 @@ const mocks = vi.hoisted(() => ({
   getUiConfig: vi.fn(),
   getDatasetFacets: vi.fn(),
   listDatasets: vi.fn(),
+  // The Usage tab (tj-grna9p.62) loads these on mount; they stay pending here.
+  getUsageSummary: vi.fn(),
+  getLastReadBuckets: vi.fn(),
+  getReadsPerDay: vi.fn(),
+  getStaleDatasets: vi.fn(),
+  getStorageCurrent: vi.fn(),
 }))
 // The shell opens the shared events socket on mount (tj-grna9p.76): replaced so no real WebSocket opens.
 vi.mock('@/api/events', async (importOriginal) =>
@@ -86,7 +92,11 @@ beforeEach(() => {
   pinia = createPinia()
   setActivePinia(pinia)
   config([AccountGroup.SIMULATION])
-  mocks.getDatasetFacets.mockResolvedValue({ all: 0n, needsAttention: 0n, sources: [], updateTypes: [], statuses: [] })
+  // `clients` is always present on a decoded DatasetFacets (a repeated field); the Usage sidebar reads it.
+  mocks.getDatasetFacets.mockResolvedValue({ all: 0n, needsAttention: 0n, sources: [], updateTypes: [], statuses: [], clients: [] })
+  for (const usage of [mocks.getUsageSummary, mocks.getLastReadBuckets, mocks.getReadsPerDay, mocks.getStaleDatasets, mocks.getStorageCurrent]) {
+    usage.mockReturnValue(new Promise(() => undefined))
+  }
   mocks.listDatasets.mockResolvedValue({ items: [], nextCursor: '' })
 })
 
@@ -220,6 +230,19 @@ describe('settings store', () => {
     mountWith(SettingsPanel)
     await flushPromises()
     expect(document.body.querySelector('[data-testid="storage-hint"]')!.textContent!.trim()).toBe('Saved in this browser')
+  })
+
+  // tj-grna9p.93 (owner rulings tj-utqd77 Q3 and the Read By scope): the stale threshold is a fixed
+  // constant and Read By is a screen filter, so the Settings panel offers neither.
+  it('the panel has no stale threshold control and no Read By control: the time zone is its only setting', async () => {
+    useShellModals().openSettings()
+    mountWith(SettingsPanel)
+    await flushPromises()
+    const panel = document.body.querySelector('.settings')!
+    expect(panel.textContent).toContain('Time Zone')
+    expect(panel.textContent).not.toMatch(/stale|read by|\bSDK\b/i)
+    expect(panel.querySelectorAll('input[type="number"]')).toHaveLength(0)
+    expect([...panel.querySelectorAll('input[type="checkbox"]')]).toHaveLength(0)
   })
 })
 
@@ -472,23 +495,45 @@ describe('sections and sub-tabs not built yet', () => {
     expect(router.currentRoute.value.path).toBe('/data/datasets')
   })
 
-  it('Requests, Health and Usage are disabled in place; Datasets links and stays active under the Viewer', async () => {
+  // tj-grna9p.62 built the Usage tab: it links now; Requests and Health stay disabled in place.
+  it('Requests and Health are disabled in place; Usage links; Datasets links and stays active under the Viewer', async () => {
     await router.push('/data/datasets/abc/viewer')
     const tabs = mountWith(DataSubTabs)
     const all = tabs.findAll('.sub-tabs__tab')
     expect(all.map((t) => t.text())).toEqual(['Datasets', 'Requests', 'Health', 'Usage'])
-    expect(all.slice(1).map((t) => [t.attributes('aria-disabled'), t.attributes('title')])).toEqual([
-      ['true', 'Not built yet'],
+    expect(all.slice(1, 3).map((t) => [t.attributes('aria-disabled'), t.attributes('title')])).toEqual([
       ['true', 'Not built yet'],
       ['true', 'Not built yet'],
     ])
+    const usage = all[3]!
+    expect(usage.attributes('aria-disabled')).toBeUndefined()
+    expect(usage.attributes('title')).toBeUndefined()
+    expect(usage.attributes('href')).toBe('/data/usage')
+    expect(usage.attributes('aria-current')).toBeUndefined()
     expect(all[0]!.attributes('aria-current')).toBe('page')
+  })
+
+  it('the Usage tab is the current page on /data/usage, and following it from Datasets opens it', async () => {
+    await router.push('/data/datasets')
+    const tabs = mountWith(DataSubTabs)
+    await tabs.findAll('.sub-tabs__tab')[3]!.trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value.name).toBe('data-usage')
+    expect(tabs.findAll('.sub-tabs__tab')[3]!.attributes('aria-current')).toBe('page')
+  })
+
+  it('a typed URL /data/usage shows the Usage screen and its sidebar, not the placeholder', async () => {
+    await router.push('/data/usage')
+    const shell = mountWith(AppShell)
+    await flushPromises()
+    expect(shell.find('main h1').text()).toBe('Usage')
+    expect(shell.find('main').text()).not.toContain('Not built yet')
+    expect(shell.findAll('aside.app-shell__sidebar').at(-1)!.find('[data-testid="read-by"]').exists()).toBe(true)
   })
 
   it.each([
     ['/data/requests', 'Requests'],
     ['/data/health', 'Health'],
-    ['/data/usage', 'Usage'],
   ])('a typed URL %s shows the placeholder titled %s', async (path, title) => {
     await router.push(path)
     const shell = mountWith(AppShell)

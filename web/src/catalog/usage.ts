@@ -5,7 +5,7 @@ import type { DatasetSummary } from '@generated/trader_joe/proto/ui/v1/data_pb'
 
 import { STALE_DAYS } from '@/api'
 import { daysSinceUtc } from '@/format/days'
-import { formatDays, timestampToInstant } from '@/format/formatters'
+import { formatDays, formatDaysAgo, timestampToInstant } from '@/format/formatters'
 import { titleCase } from '@/theme/copy'
 
 import { effectiveClientKinds } from './filters'
@@ -63,6 +63,12 @@ export function usageCell(row: DatasetSummary, now: number = Date.now()): UsageC
   const lastRead = row.usage?.lastReadAt
   if (lastRead === undefined) return { kind: 'never' }
   return { kind: 'age', days: daysSinceUtc(timestampToInstant(lastRead), now) }
+}
+
+/** A cell's words: "Never read", "today" or "3 d ago". Never "Stale": that is the server's call. */
+export function usageCellText(cell: UsageCellState): string {
+  if (cell.kind === 'never') return 'Never read'
+  return cell.days === 0 ? 'today' : formatDaysAgo(cell.days, 'short')
 }
 
 /**

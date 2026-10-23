@@ -1,6 +1,7 @@
 export { API_BASE, getMessage } from './client'
 export type { GetOptions } from './client'
 export {
+  clientQuery,
   getDataset,
   getDatasetCoverage,
   getDatasetBarPages,
@@ -44,6 +45,8 @@ export type {
   UiEventMessage,
   WebSocketFactory,
 } from './events'
+export { getLastReadBuckets, getStaleDatasets, getStorageCurrent, getUsageSummary } from './usageStats'
+export type { GetStaleParams, UsageStatsParams } from './usageStats'
 export { ApiError,apiErrorFromResponse } from './errors'
 export { int64ToNumber } from './int64'
 export { buildQuery } from './query'

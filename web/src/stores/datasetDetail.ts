@@ -49,7 +49,8 @@ export type WriteOutcome =
   | { kind: 'invalid'; error: CatalogError }
   | { kind: 'error'; error: CatalogError }
 
-function writeOutcome(caught: unknown): WriteOutcome {
+/** A write's caught error as its outcome (the Usage tab's Set Expiry reads refusals the same way). */
+export function writeOutcome(caught: unknown): WriteOutcome {
   if (caught instanceof ApiError) {
     if (caught.status === 404) return { kind: 'not-found' }
     if (caught.status === 409 && caught.reason === 'OVERRIDE_REQUIRED') return { kind: 'override-required' }

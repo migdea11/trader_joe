@@ -15,15 +15,17 @@ import { ExpiryType, DatasetState } from '@generated/trader_joe/proto/ui/v1/data
 import type { DatasetSummary } from '@generated/trader_joe/proto/ui/v1/data_pb'
 import { UpdateType } from '@generated/trader_joe/proto/market/v1/enums_pb'
 
-import { OPERATOR_CLIENT_ID } from '@/api'
+import { OPERATOR_CLIENT_ID, int64ToNumber } from '@/api'
 import type { OperatorOverride } from '@/api'
 import { granularityLabel } from '@/catalog/labels'
-import { MISSING, formatDate, formatNumber, timestampToInstant } from '@/format/formatters'
+import { MISSING, formatNumber, timestampToInstant } from '@/format/formatters'
 import { useFormatters } from '@/format/useFormatters'
 import { useDatasetDetailStore } from '@/stores/datasetDetail'
 import type { WriteOutcome } from '@/stores/datasetDetail'
 import { titleCase } from '@/theme/copy'
-import { displayDay, parseDay, zonedDayStart } from '@/viewer/range'
+import { parseDay, zonedDayStart } from '@/viewer/range'
+
+import { refusalNotice, tomorrowText } from './expiryWrite'
 
 const props = defineProps<{ dataset: DatasetSummary }>()
 const emit = defineEmits<{
@@ -61,15 +63,8 @@ const day = computed(() => (expiryText.value.trim() === '' ? undefined : (parseD
 const keepForever = computed(() => day.value === undefined)
 const dayProblem = computed(() => day.value === null)
 
-function tomorrow(): string {
-  // Today's calendar day in the display zone, plus one: day arithmetic on the date, never on hours.
-  const [y, m, d] = formatDate(Date.now(), timeZone.value).split('/').map(Number)
-  const next = new Date(Date.UTC(y ?? 1970, (m ?? 1) - 1, (d ?? 1) + 1))
-  return displayDay(next.toISOString().slice(0, 10))
-}
-
 function setTomorrow(): void {
-  expiryText.value = tomorrow()
+  expiryText.value = tomorrowText(timeZone.value)
 }
 
 function clearField(): void {
@@ -115,42 +110,21 @@ function settle(outcome: WriteOutcome): boolean {
     case 'ok':
       notice.value = null
       return true
-    case 'override-required':
-      // The prompt is on screen for another owner's dataset; a dataset that has changed hands since the
-      // last read is refetched so the prompt appears with the owner it now has.
-      notice.value = {
-        tone: 'error',
-        text: 'This dataset is held by another owner. Give a reason and confirm to continue.',
-      }
-      void store.refresh()
-      return false
     case 'stale':
       // The screen moved to another dataset: this answer is not for what is shown.
       return false
     case 'not-found':
       emit('gone')
       return false
-    case 'unavailable':
-      notice.value = {
-        tone: 'error',
-        text: 'The database is not ready for this change, so nothing was changed. Run make migrate, then try again.',
-        errorId: outcome.error.errorId,
-      }
+    default: {
+      // A refusal: the fixed words (components/retention/expiryWrite.ts), shown in place.
+      const refusal = refusalNotice(outcome)
+      notice.value = refusal === null ? null : { tone: 'error', ...refusal }
+      // The prompt is on screen for another owner's dataset; a dataset that has changed hands since the
+      // last read is refetched so the prompt appears with the owner it now has.
+      if (outcome.kind === 'override-required') void store.refresh()
       return false
-    case 'invalid':
-      notice.value = {
-        tone: 'error',
-        text: 'The server refused the request as invalid. This is a bug in the UI; nothing was changed.',
-        errorId: outcome.error.errorId,
-      }
-      return false
-    default:
-      notice.value = {
-        tone: 'error',
-        text: `Could not complete the change. ${outcome.error.message} Nothing was changed.`,
-        errorId: outcome.error.errorId,
-      }
-      return false
+    }
   }
 }
 
@@ -365,7 +339,7 @@ watch(
       data-testid="delete-confirm"
     >
       <p class="confirm__text">
-        This deletes {{ confirmName }} and its {{ formatNumber(Number(dataset.barCount)) }} bars at once.
+        This deletes {{ confirmName }} and its {{ formatNumber(int64ToNumber(dataset.barCount)) }} bars at once.
         It cannot be undone. Type <code>{{ confirmName }}</code> to confirm.
       </p>
       <input

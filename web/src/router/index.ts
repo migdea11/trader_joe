@@ -10,6 +10,8 @@ import DatasetsView from '@/views/data/DatasetsView.vue'
 import DatasetViewerSidebar from '@/views/data/DatasetViewerSidebar.vue'
 import DatasetViewerView from '@/views/data/DatasetViewerView.vue'
 import NotBuiltView from '@/views/data/NotBuiltView.vue'
+import UsageSidebar from '@/views/data/UsageSidebar.vue'
+import UsageView from '@/views/data/UsageView.vue'
 import NotFoundView from '@/views/NotFoundView.vue'
 
 declare module 'vue-router' {
@@ -41,10 +43,15 @@ const shellChildren: RouteRecordRaw[] = [
     name: 'data-dataset-viewer',
     components: { default: DatasetViewerView, sidebar: DatasetViewerSidebar },
   },
+  // The Usage tab (tj-grna9p.62).
   // Later phases: the sub-tab is disabled in place and the route shows the placeholder.
   { path: 'data/requests', name: 'data-requests', component: NotBuiltView, meta: { title: 'Requests' } },
   { path: 'data/health', name: 'data-health', component: NotBuiltView, meta: { title: 'Health' } },
-  { path: 'data/usage', name: 'data-usage', component: NotBuiltView, meta: { title: 'Usage' } },
+  {
+    path: 'data/usage',
+    name: 'data-usage',
+    components: { default: UsageView, sidebar: UsageSidebar },
+  },
   { path: ':pathMatch(.*)*', name: 'not-found', component: NotFoundView },
 ]
 

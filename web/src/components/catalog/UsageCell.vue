@@ -6,9 +6,8 @@
 import type { DatasetSummary } from '@generated/trader_joe/proto/ui/v1/data_pb'
 import type { ICellRendererParams } from 'ag-grid-community'
 
-import { isUiOnly, usageCell } from '@/catalog/usage'
+import { isUiOnly, usageCell, usageCellText } from '@/catalog/usage'
 import type { CatalogFilters } from '@/catalog/filters'
-import { formatDaysAgo } from '@/format/formatters'
 
 const props = defineProps<{
   params: ICellRendererParams<DatasetSummary> & {
@@ -18,9 +17,7 @@ const props = defineProps<{
 }>()
 
 function text(row: DatasetSummary): string {
-  const cell = usageCell(row)
-  if (cell.kind === 'never') return 'Never read'
-  return cell.days === 0 ? 'today' : formatDaysAgo(cell.days, 'short')
+  return usageCellText(usageCell(row))
 }
 </script>
 

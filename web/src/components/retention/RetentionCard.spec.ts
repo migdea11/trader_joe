@@ -11,6 +11,14 @@ import type { WriteOutcome } from '@/stores/datasetDetail'
 
 import RetentionCard from './RetentionCard.vue'
 
+// A pass-through spy on the one int64 conversion (src/api/int64.ts throws past 2^53 rather than
+// rounding; pinned in api.spec.ts), so the delete text's bar count can be seen to go through it.
+const int64 = vi.hoisted(() => ({ int64ToNumber: vi.fn() }))
+vi.mock('@/api', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/api')>()),
+  ...int64,
+}))
+
 // tj-grna9p.89: the card alone, with the store's two writes replaced, for the one outcome the page
 // cannot show: 'stale' (the page left the dataset while the write was in flight, so the card that
 // sent it is usually gone). The card ignores it: no notice, no navigation event, nothing reset.
@@ -23,8 +31,11 @@ const DATASET = create(DatasetSummarySchema, {
   barCount: 10n,
 })
 
-beforeEach(() => {
+beforeEach(async () => {
   setActivePinia(createPinia())
+  const real = await vi.importActual<typeof import('@/api/int64')>('@/api/int64')
+  int64.int64ToNumber.mockReset()
+  int64.int64ToNumber.mockImplementation(real.int64ToNumber)
 })
 
 function mountWith(outcome: WriteOutcome) {
@@ -59,6 +70,13 @@ describe('RetentionCard and the stale outcome', () => {
     expect(deleteNow).toHaveBeenCalledTimes(1)
     expect(card.emitted()).not.toHaveProperty('deleted')
     expect(card.find('[data-testid="retention-notice"]').exists()).toBe(false)
+  })
+
+  it('the delete text bar count goes through the one int64 conversion, never Number()', async () => {
+    const card = mount(RetentionCard, { props: { dataset: create(DatasetSummarySchema, { ...DATASET, barCount: 7_654_321n }) } })
+    await card.find('[data-testid="delete-open"]').trigger('click')
+    expect(int64.int64ToNumber).toHaveBeenCalledWith(7_654_321n)
+    expect(card.find('[data-testid="delete-confirm"]').text()).toContain('This deletes VFV 1d and its 7,654,321 bars at once.')
   })
 
   it('by contrast, an ok Delete Now emits deleted (the screen leaves)', async () => {

@@ -383,6 +383,14 @@ describe('counts', () => {
     expect(count('[data-update="STREAM"]')).toBe('0')
   })
 
+  // tj-grna9p.93 (owner ruling tj-utqd77 Q2): the tile row is exactly these four; no Quota and no
+  // Last Hour tile exists (quota telemetry is deferred, tj-lenn8u).
+  it('the tiles are Datasets, Failed, Late and Stale, and nothing about quota or the last hour', async () => {
+    const shell = await screenAt('/data/datasets')
+    expect(shell.findAll('[data-tile]').map((t) => t.attributes('data-tile'))).toEqual(['datasets', 'failed', 'late', 'stale'])
+    expect(shell.find('main').text()).not.toMatch(/quota|last hour/i)
+  })
+
   it('the tiles count the whole catalog and do not follow a filter', async () => {
     mocks.getDatasetFacets.mockImplementation(async (filters: Record<string, unknown>) =>
       filters.status === undefined ? FACETS : { ...FACETS, all: 1n, statuses: [], updateTypes: [] },

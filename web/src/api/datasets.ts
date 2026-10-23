@@ -75,7 +75,7 @@ export interface GetBarsParams {
 }
 
 // The server reads an enum filter from the member name, with or without the wire prefix.
-function enumName(names: Record<number, string>, value: number | undefined): string | undefined {
+export function enumName(names: Record<number, string>, value: number | undefined): string | undefined {
   return value === undefined ? undefined : names[value]
 }
 
@@ -252,13 +252,20 @@ export interface GetReadsPerDayParams extends ClientSelection {
   days?: number
   /** Only this dataset's reads: a filter. */
   datasetId?: string
+  /** Only this source's datasets: a filter, sent only when chosen. */
+  source?: DataSource
   signal?: AbortSignal
 }
 
 /** GET /ui/v1/stats/usage/reads-per-day: reads per UTC day and client, from the selected clients. */
 export function getReadsPerDay(params: GetReadsPerDayParams = {}): Promise<ReadsPerDay> {
   return getMessage(ReadsPerDaySchema, '/ui/v1/stats/usage/reads-per-day', {
-    query: { days: params.days, dataset_id: params.datasetId, ...clientQuery(params) },
+    query: {
+      days: params.days,
+      dataset_id: params.datasetId,
+      source: enumName(DataSource, params.source),
+      ...clientQuery(params),
+    },
     signal: params.signal,
   })
 }

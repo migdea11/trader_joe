@@ -20,8 +20,14 @@ import {
 import { AccountGroup } from '@generated/trader_joe/proto/ui/v1/shell_pb'
 import { CoverageStripSchema } from '@generated/trader_joe/proto/ui/v1/stats_pb'
 
+import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { join, relative } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
 import { deleteRequest, patchMessage } from './client'
+import * as datasetsModule from './datasets'
 import { clientQuery } from './datasets'
+import * as usageStatsModule from './usageStats'
 import {
   API_BASE,
   ApiError,
@@ -31,7 +37,11 @@ import {
   OPERATOR_CLIENT_ID,
   STALE_DAYS,
   deleteDataset,
+  getLastReadBuckets,
   getReadsPerDay,
+  getStaleDatasets,
+  getStorageCurrent,
+  getUsageSummary,
   setDatasetExpiry,
   getDataset,
   getDatasetBarPages,
@@ -291,6 +301,40 @@ describe('request shape', () => {
     for (const [, init] of fetchMock.mock.calls) {
       expect((init!.headers as Record<string, string>)['X-Client-Id']).toBe(OPERATOR_CLIENT_ID)
     }
+  })
+
+  // tj-grna9p.93: the list above predates .89's and .62's calls. This one is built from the modules'
+  // exports, so a call added later is covered without editing the spec.
+  it('EVERY exported network function of datasets.ts and usageStats.ts sends X-Client-Id: operator', async () => {
+    fetchMock.mockImplementation(async () => jsonResponse({}))
+    const PURE = new Set(['enumName', 'clientQuery'])
+    const callers = Object.entries({ ...datasetsModule, ...usageStatsModule }).filter(
+      ([name, value]) => typeof value === 'function' && !PURE.has(name) && !name.endsWith('Request'),
+    )
+    expect(callers.map(([name]) => name).sort()).toEqual(
+      expect.arrayContaining(['deleteDataset', 'getReadsPerDay', 'getStorageCurrent', 'getUsageSummary', 'setDatasetExpiry']),
+    )
+    for (const [name, call] of callers) {
+      fetchMock.mockClear()
+      await (call as (...args: unknown[]) => Promise<unknown>)('ds-1', {})
+      expect(fetchMock, name).toHaveBeenCalledTimes(1)
+      const headers = fetchMock.mock.calls[0]![1]!.headers as Record<string, string>
+      expect(headers['X-Client-Id'], name).toBe(OPERATOR_CLIENT_ID)
+    }
+  })
+
+  it('the client is the ONE place web/src talks HTTP; the events socket is the one WebSocket', () => {
+    const SRC = fileURLToPath(new URL('..', import.meta.url))
+    const files = (dir: string): string[] =>
+      readdirSync(dir).flatMap((name) => {
+        const path = join(dir, name)
+        return statSync(path).isDirectory() ? files(path) : [path]
+      })
+    const sources = files(SRC).filter((p) => /\.(ts|vue)$/.test(p) && !p.endsWith('.spec.ts') && !p.includes('__tests__'))
+    const using = (pattern: RegExp) => sources.filter((p) => pattern.test(readFileSync(p, 'utf8'))).map((p) => relative(SRC, p))
+    expect(using(/\bfetch\(/)).toEqual([join('api', 'client.ts')])
+    expect(using(/new WebSocket\b/)).toEqual([join('api', 'events.ts')])
+    expect(using(/XMLHttpRequest|EventSource|sendBeacon/)).toEqual([])
   })
 
   it('listDatasets sends the usage parameters: client_kind repeated by member name, usage, stale_days, sort=last_read, expires_before', async () => {
@@ -809,9 +853,107 @@ describe('client selection and reads per day (tj-grna9p.89)', () => {
     expect(reads.days[0]!.clientKind).toBe(ClientKind.SDK)
   })
 
+  it('getReadsPerDay sends source by enum name only when given (tj-grna9p.62)', async () => {
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse({})))
+    await getReadsPerDay({ days: 30, clientKinds: [ClientKind.SDK], source: DataSource.ALPACA_API })
+    expect(calledUrl()).toBe(`${API_BASE}/ui/v1/stats/usage/reads-per-day?days=30&source=ALPACA_API&client_kind=SDK`)
+    await getReadsPerDay({ days: 30, clientKinds: [ClientKind.SDK] })
+    expect(calledUrl(1)).toBe(`${API_BASE}/ui/v1/stats/usage/reads-per-day?days=30&client_kind=SDK`)
+  })
+
   it('getReadsPerDay with client ids sends client_id and no client_kind', async () => {
     fetchMock.mockResolvedValue(jsonResponse({}))
     await getReadsPerDay({ clientIds: ['a', 'b'], clientKinds: [ClientKind.UI] })
     expect(calledUrl()).toBe(`${API_BASE}/ui/v1/stats/usage/reads-per-day?client_id=a&client_id=b`)
+  })
+})
+
+// tj-grna9p.62: the Usage tab's stats routes (server/routers/data_store/ui_stats.py). Presence matters:
+// the client selection always goes, stale_days is the threshold, source only when picked, storage
+// takes no client parameter (a 422), and no stats route ever gets expires_before or dataset_id.
+describe('usage stats routes (tj-grna9p.62)', () => {
+  const params = (index = 0) => {
+    const url = new URL(calledUrl(index), 'http://x')
+    return { path: url.pathname, query: [...url.searchParams.entries()] }
+  }
+  const headers = (index = 0) => fetchMock.mock.calls[index]![1]!.headers as Record<string, string>
+  beforeEach(() => {
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse({})))
+  })
+
+  it('getUsageSummary: stale_days and the kinds; source only when picked; X-Client-Id operator', async () => {
+    await getUsageSummary({ clientKinds: [ClientKind.SDK], staleDays: 90 })
+    await getUsageSummary({ clientKinds: [ClientKind.SDK, ClientKind.UI], staleDays: 90, source: DataSource.ALPACA_API })
+    await getUsageSummary({ clientIds: ['bot-1'], clientKinds: [ClientKind.SDK], staleDays: 90 })
+    expect(params(0)).toEqual({
+      path: `${API_BASE}/ui/v1/stats/usage/summary`,
+      query: [['stale_days', '90'], ['client_kind', 'SDK']],
+    })
+    expect(params(1).query).toEqual([['stale_days', '90'], ['source', 'ALPACA_API'], ['client_kind', 'SDK'], ['client_kind', 'UI']])
+    expect(params(2).query).toEqual([['stale_days', '90'], ['client_id', 'bot-1']])
+    expect(headers()['X-Client-Id']).toBe(OPERATOR_CLIENT_ID)
+  })
+
+  it('getLastReadBuckets: the client selection and source only when picked; no stale_days', async () => {
+    await getLastReadBuckets({ clientKinds: [ClientKind.UI] })
+    await getLastReadBuckets({ clientIds: ['a', 'b'], source: DataSource.ALPACA_API })
+    expect(params(0)).toEqual({ path: `${API_BASE}/ui/v1/stats/usage/last-read-buckets`, query: [['client_kind', 'UI']] })
+    expect(params(1).query).toEqual([['source', 'ALPACA_API'], ['client_id', 'a'], ['client_id', 'b']])
+  })
+
+  it('getStaleDatasets: stale_days, cursor, limit and the selection; source only when picked', async () => {
+    await getStaleDatasets({ clientKinds: [ClientKind.SDK], staleDays: 90, limit: 100 })
+    await getStaleDatasets({ clientKinds: [ClientKind.SDK], staleDays: 90, cursor: 'k1', limit: 100, source: DataSource.ALPACA_API })
+    expect(params(0)).toEqual({
+      path: `${API_BASE}/ui/v1/stats/usage/stale`,
+      query: [['stale_days', '90'], ['limit', '100'], ['client_kind', 'SDK']],
+    })
+    expect(params(1).query).toEqual([
+      ['stale_days', '90'],
+      ['source', 'ALPACA_API'],
+      ['cursor', 'k1'],
+      ['limit', '100'],
+      ['client_kind', 'SDK'],
+    ])
+  })
+
+  it('getStorageCurrent: source only when picked, and never a client parameter', async () => {
+    await getStorageCurrent()
+    await getStorageCurrent({ source: DataSource.ALPACA_API })
+    expect(params(0)).toEqual({ path: `${API_BASE}/ui/v1/stats/storage/current`, query: [] })
+    expect(params(1).query).toEqual([['source', 'ALPACA_API']])
+    // Even a caller holding a selection cannot pass one through: the function takes none.
+    await getStorageCurrent({ clientKinds: [ClientKind.SDK], clientIds: ['x'] } as Parameters<typeof getStorageCurrent>[0])
+    expect(params(2).query).toEqual([])
+  })
+
+  it('no stats route ever carries expires_before or dataset_id', async () => {
+    await getUsageSummary({ clientKinds: [ClientKind.SDK], staleDays: 90 })
+    await getLastReadBuckets({ clientKinds: [ClientKind.SDK] })
+    await getStaleDatasets({ clientKinds: [ClientKind.SDK], staleDays: 90 })
+    await getStorageCurrent()
+    for (let i = 0; i < 4; i += 1) {
+      const keys = params(i).query.map(([key]) => key)
+      expect(keys).not.toContain('expires_before')
+      expect(keys).not.toContain('dataset_id')
+    }
+  })
+
+  it('decodes the server messages: summary counts, buckets with an open last bucket, a stale page, storage', async () => {
+    fetchMock.mockReset()
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ stale: '4', readLast30d: '2', total: '9', staleDays: 90, clientKinds: ['CLIENT_KIND_SDK'] }))
+      .mockResolvedValueOnce(jsonResponse({ buckets: [{ minDays: 0, maxDays: 1, datasets: '3' }, { minDays: 91, datasets: '1' }], neverRead: '2' }))
+      .mockResolvedValueOnce(jsonResponse({ items: [{ dataset: { id: 'ds-1', assetSymbol: 'VFV' }, estBytes: '1000' }], nextCursor: 'k2', staleDays: 90 }))
+      .mockResolvedValueOnce(jsonResponse({ totalBytes: '5000', bySource: [{ source: 'DATA_SOURCE_ALPACA_API', feed: 'FEED_IEX', estBytes: '5000' }] }))
+    const summary = await getUsageSummary()
+    const buckets = await getLastReadBuckets()
+    const stale = await getStaleDatasets()
+    const storage = await getStorageCurrent()
+    expect([summary.stale, summary.total, summary.staleDays]).toEqual([4n, 9n, 90])
+    expect(buckets.buckets[1]!.maxDays).toBeUndefined()
+    expect(buckets.neverRead).toBe(2n)
+    expect([stale.items[0]!.dataset?.id, stale.items[0]!.estBytes, stale.nextCursor]).toEqual(['ds-1', 1000n, 'k2'])
+    expect([storage.totalBytes, storage.bySource[0]!.source]).toEqual([5000n, DataSource.ALPACA_API])
   })
 })

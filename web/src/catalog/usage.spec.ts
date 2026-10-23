@@ -28,6 +28,7 @@ import {
   staleLabel,
   staleNote,
   usageCell,
+  usageCellText,
   usageOptionLabel,
 } from './usage'
 
@@ -285,5 +286,18 @@ describe('isUiOnly', () => {
     expect(isUiOnly(row({ readBy30d: [ClientKind.SDK] }), {})).toBe(false)
     expect(isUiOnly(row({ readBy30d: [] }), {})).toBe(false)
     expect(isUiOnly(row(), {})).toBe(false)
+  })
+})
+
+// tj-grna9p.62: the cell's words, shared by the grid's Usage cell and the Usage tab's Stale Datasets.
+describe('usageCellText', () => {
+  it.each([
+    [{ kind: 'never' }, 'Never read'],
+    [{ kind: 'age', days: 0 }, 'today'],
+    [{ kind: 'age', days: 1 }, '1 d ago'],
+    [{ kind: 'age', days: 200 }, '200 d ago'],
+  ] as const)('%o reads %s, and never the word Stale', (cell, text) => {
+    expect(usageCellText(cell)).toBe(text)
+    expect(usageCellText(cell)).not.toMatch(/stale/i)
   })
 })
