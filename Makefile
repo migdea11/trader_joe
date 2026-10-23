@@ -352,7 +352,12 @@ errors-doc: $(VENV_MARKER)  ## Regenerate docs/errors.md from server/common/erro
 # DATA_DIR bind (two bind mounts of one directory are both allowed). Whichever launches second fails
 # LOUDLY on a real clash and changes nothing of the first. That failure is the intended outcome, not a
 # bug to route around: no target here tears down the other project to make room.
-DEV_PROJECT := trader_joe_dev
+# DEV_PROJECT is a FIXED constant, not a knob (owner ruling, tj-grna9p.192): dev and test are one compose
+# project, named here and nowhere else a user can reach. `override` makes a command-line value
+# (make dev-down DEV_PROJECT=other) change nothing, and the environment cannot change it either, so no
+# invocation retargets DEV_COMPOSE, TOOLS_COMPOSE, TEST_CLIENT_COMPOSE or SYSTEM_COMPOSE. Keep it equal to
+# the MCP's stack.DEV_PROJECT and run_migrations.sh's DEV_PROJECT, which are separate constants.
+override DEV_PROJECT := trader_joe_dev
 PROD_COMPOSE := docker compose -f docker-compose.yaml -f docker-compose.web.yaml
 # Dev gains devnet through the override, which attaches every stack service to it (tj-q9ae5u
 # addendum 1). PROD_COMPOSE never loads the override, so a prod launch never attaches devnet --

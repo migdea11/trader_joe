@@ -33,7 +33,7 @@ from typing import Any
 
 import pytest
 
-from common.tests.test_ci_invariants import _make_variable
+from common.tests.test_ci_invariants import _made_variable, _make_variable
 from tools.agent_mcp import runner, stack
 from tools.agent_mcp.tests.harness import (
     REPO_ROOT,
@@ -978,7 +978,8 @@ def test_both_downs_remove_no_volume_image_or_orphan_and_name_the_ups_project(
         assert not project_options & set(words), words
     assert [word for word in dev_compose if word.partition('=')[0] in project_options] == ['-p'], dev_compose
     assert dev_compose[dev_compose.index('-p') + 1] == '$(DEV_PROJECT)', dev_compose
-    assert _make_variable('DEV_PROJECT') == MAKEFILE_DEV_PROJECT
+    made_project = _made_variable('DEV_PROJECT')  # read before the rig forbids real subprocesses
+    assert made_project == MAKEFILE_DEV_PROJECT
     rig, _ = _rig(tmp_path, monkeypatch)
     assert _call(rig)['status'] == 'ok'
     compose_down = [argv for argv in _argvs(rig) if argv[:2] == (DOCKER, 'compose')]
@@ -988,7 +989,7 @@ def test_both_downs_remove_no_volume_image_or_orphan_and_name_the_ups_project(
         assert argv[2:4] == ('-p', PROJECT) and argv.count('-p') == 1, argv
         assert not destructive & set(argv), argv
     # One project on both sides (tj-iee6sn.31): the MCP's argv word equals make's own DEV_PROJECT.
-    assert PROJECT == MAKEFILE_DEV_PROJECT == _make_variable('DEV_PROJECT')
+    assert PROJECT == MAKEFILE_DEV_PROJECT == made_project
 
 
 def test_the_network_steps_mirror_make_dev_network():

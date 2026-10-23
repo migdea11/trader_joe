@@ -2201,6 +2201,15 @@ def _expanded_make_variable(name: str, cwd: Path, env: dict[str, str]) -> str:
     return result.stdout.rstrip('\n')
 
 
+def _made_variable(name: str) -> str:
+    """The value make gives `name` from the repo root under this process's environment.
+
+    For a pin on a variable's VALUE, where _make_variable's source-text regex is the wrong oracle: it
+    misses an `override NAME := ...` assignment (tj-grna9p.192) and cannot see what make makes of it.
+    """
+    return _expanded_make_variable(name, REPO_ROOT, _subprocess_env())
+
+
 def _run_make(cwd: Path, *arguments: str, env: dict[str, str]) -> subprocess.CompletedProcess:
     """Run the repository Makefile from `cwd`, never remaking the venv marker.
 

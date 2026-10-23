@@ -26,7 +26,13 @@ from pathlib import Path
 import pytest
 
 from common.tests import compose_model
-from common.tests.test_ci_invariants import _dockerignore_rules, _is_excluded_from_context, _make_recipe, _make_variable
+from common.tests.test_ci_invariants import (
+    _dockerignore_rules,
+    _is_excluded_from_context,
+    _made_variable,
+    _make_recipe,
+    _make_variable,
+)
 from common.tests.test_grpc_bind_network import _set_files
 from tools.agent_mcp import stack
 from tools.agent_mcp.tests.harness import REPO_ROOT
@@ -191,7 +197,7 @@ def test_dev_up_downs_and_ups_the_same_compose_project_in_any_checkout():
         *(path.name for path in _set_files('DEV_COMPOSE')),
         'docker-compose.tools.yaml',
     ]
-    assert _make_variable('DEV_PROJECT') == MAKEFILE_DEV_PROJECT
+    assert _made_variable('DEV_PROJECT') == MAKEFILE_DEV_PROJECT
     dev_words = shlex.split(_make_variable('DEV_COMPOSE'))
     assert [word for word in dev_words if word.partition('=')[0] in PROJECT_OPTIONS] == ['-p'], dev_words
     assert dev_words[dev_words.index('-p') + 1] == '$(DEV_PROJECT)', dev_words
@@ -203,7 +209,7 @@ def test_dev_up_downs_and_ups_the_same_compose_project_in_any_checkout():
     # THE MCP AND MAKE NAME ONE PROJECT (tj-iee6sn.31): the MCP's label-only down and make dev-up's
     # down address the same project, read here from the Makefile as make itself defines it, so the
     # two can never drift apart again without this line going red.
-    assert stack.DEV_PROJECT == EXPECTED_DEV_PROJECT == MAKEFILE_DEV_PROJECT == _make_variable('DEV_PROJECT')
+    assert stack.DEV_PROJECT == EXPECTED_DEV_PROJECT == MAKEFILE_DEV_PROJECT == _made_variable('DEV_PROJECT')
 
 
 def test_the_dev_up_down_sets_pgadmin_placeholders_and_the_up_sets_none():

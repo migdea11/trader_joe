@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from common.tests.test_ci_invariants import _make_variable
+from common.tests.test_ci_invariants import _made_variable, _make_variable
 from tools.agent_mcp import runner, stack
 from tools.agent_mcp.tests.harness import (
     DEV_CONTAINER_ID,
@@ -333,7 +333,11 @@ def test_a_test_container_in_the_prod_project_does_not_make_the_dev_project_mixe
 
 def test_the_mcp_and_the_makefile_name_the_same_dev_project():
     """Read from the Makefile as make defines it: the two can never drift apart without this going red."""
-    assert _make_variable('DEV_PROJECT') == DEV_PROJECT == stack.DEV_PROJECT
+    assert _made_variable('DEV_PROJECT') == DEV_PROJECT == stack.DEV_PROJECT
+    # The third copy (tj-grna9p.192): run_migrations.sh keeps its own constant, assigned once, as a literal.
+    script = (REPO_ROOT / 'server' / 'data' / 'store' / 'run_migrations.sh').read_text(encoding='utf-8')
+    assigned = re.findall(r'^\s*(?:export\s+|readonly\s+|declare\s+\S+\s+)?DEV_PROJECT=(.*)$', script, re.MULTILINE)
+    assert assigned == [DEV_PROJECT], assigned
     assert stack.dev_compose_prefix() == [DOCKER, 'compose', '-p', DEV_PROJECT]
     # Prod keeps compose's default: its compose set passes no project, so it can never be trader_joe_dev.
     prod_words = _make_variable('PROD_COMPOSE').split()

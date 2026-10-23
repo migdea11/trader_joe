@@ -13,6 +13,8 @@ pins elsewhere stay green.
 """
 
 import re
+import subprocess
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
@@ -30,6 +32,7 @@ from common.tests.test_ci_invariants import (
     _compose_projects,
     _expanded_make_variable,
     _load_yaml,
+    _make_variable,
     _run_make,
     _step_lines,
     _subprocess_env,
@@ -74,15 +77,18 @@ _TARGET_HEADER = re.compile(r'^([A-Za-z0-9_.-]+)\s*:(?![=:])')
 _SET_ASSIGNMENT = re.compile(r'^(\w+_COMPOSE|PROD_UP)\s*:?=', re.MULTILINE)
 
 
-def _make_n(tmp_path: Path, target: str) -> str:
+def _make_n(tmp_path: Path, target: str, *arguments: str, **env_overrides: str | None) -> str:
     """`make -n TARGET` with the attestation given, run from an empty directory, continuations folded.
 
     proto and gen-proto-ts are treated as up to date, so nothing but the target's compose lines and
     their prerequisites' print; COMPOSE_PROJECT_NAME is removed so the caller's shell cannot lend a
-    project to a line that names none.
+    project to a line that names none. DEV_PROJECT is removed too unless `env_overrides` sets it;
+    `arguments` are extra command-line words (`DEV_PROJECT=other`).
     """
-    env = _subprocess_env(**{SYSTEM_GUARD: None, 'COMPOSE_PROJECT_NAME': None})
-    result = _run_make(tmp_path, '-n', '-o', 'proto', '-o', 'gen-proto-ts', target, f'{SYSTEM_GUARD}=1', env=env)
+    env = _subprocess_env(**{SYSTEM_GUARD: None, 'COMPOSE_PROJECT_NAME': None, 'DEV_PROJECT': None, **env_overrides})
+    result = _run_make(
+        tmp_path, '-n', '-o', 'proto', '-o', 'gen-proto-ts', target, f'{SYSTEM_GUARD}=1', *arguments, env=env
+    )
     assert result.returncode == 0, f'make -n {target} failed: {result.stderr}'
     return re.sub(r'\\\n\t?', ' ', result.stdout)
 
@@ -111,6 +117,90 @@ def _recipes() -> dict[str, list[str]]:
 
 def test_dev_project_is_trader_joe_dev():
     assert _expanded_make_variable('DEV_PROJECT', REPO_ROOT, _subprocess_env()) == DEV_PROJECT
+
+
+# --- a fixed constant, not a knob (tj-grna9p.192) ----------------------------------------------------
+
+# A value that must change nothing, given on the command line or in the environment.
+FOREIGN_PROJECT = 'other_project'
+# Every way a caller could hand make a project: the command line, the environment, and both with -e
+# (environment overrides), which outranks an ordinary Makefile assignment but never an override.
+KNOB_SOURCES = {
+    'command-line': ((f'DEV_PROJECT={FOREIGN_PROJECT}',), {}),
+    'environment': ((), {'DEV_PROJECT': FOREIGN_PROJECT}),
+    'environment-with-e': (('-e',), {'DEV_PROJECT': FOREIGN_PROJECT}),
+}
+# The dev/test targets the ruling names, and the migrate verbs, whose script keeps its own constant.
+KNOB_TARGETS = (*DEV_TARGETS, 'migrate', 'migrate-status')
+_DEV_PROJECT_ASSIGNMENT = re.compile(
+    r'^[ \t]*(?:(?:override|export)\s+)*DEV_PROJECT\s*(?:::|:|\?|\+|!)?=.*$', re.MULTILINE
+)
+
+
+def _without_project(arguments: tuple[str, ...]) -> tuple[str, ...]:
+    """The same make words with the caller's DEV_PROJECT taken out: the baseline a knob is compared with."""
+    return tuple(word for word in arguments if not word.startswith('DEV_PROJECT='))
+
+
+def _make_eval(expression: str, *arguments: str, **env_overrides: str | None) -> str:
+    """What make prints for `expression` once the whole Makefile is parsed, with extra words and env."""
+    env = _subprocess_env(**{'DEV_PROJECT': None, **env_overrides})
+    command = ['make', '-s', '--no-print-directory', '-C', str(REPO_ROOT), '-f', str(MAKEFILE), *arguments]
+    command += ['--eval', f'print-expression: ; @: $(info {expression})', 'print-expression']
+    result = subprocess.run(command, capture_output=True, text=True, env=env, check=False)
+    assert result.returncode == 0, f'make could not evaluate {expression}: {result.stderr}'
+    return result.stdout.rstrip('\n')
+
+
+def test_dev_project_is_assigned_once_as_an_override_of_the_literal():
+    """One assignment, `override`, of the literal: no `?=` default, no value read from another variable."""
+    assignments = _DEV_PROJECT_ASSIGNMENT.findall(MAKEFILE.read_text(encoding='utf-8'))
+    assert assignments == [f'override DEV_PROJECT := {DEV_PROJECT}'], assignments
+
+
+@pytest.mark.parametrize('source', sorted(KNOB_SOURCES))
+def test_no_caller_value_changes_the_dev_project_or_its_origin(source: str):
+    arguments, env = KNOB_SOURCES[source]
+    assert _make_eval('$(DEV_PROJECT)|$(origin DEV_PROJECT)', *arguments, **env) == f'{DEV_PROJECT}|override'
+
+
+@pytest.mark.parametrize('source', sorted(KNOB_SOURCES))
+@pytest.mark.parametrize('variable', sorted(DEV_SETS))
+def test_no_caller_value_changes_a_dev_or_test_set(variable: str, source: str):
+    """The expanded set is byte-identical to the one no caller value reached, and names only trader_joe_dev."""
+    arguments, env = KNOB_SOURCES[source]
+    expanded = _make_eval(f'$({variable})', *arguments, **env)
+    assert expanded == _make_eval(f'$({variable})', *_without_project(arguments)), (source, expanded)
+    assert _compose_projects(expanded) == [DEV_PROJECT], expanded
+    assert FOREIGN_PROJECT not in expanded, expanded
+
+
+@pytest.mark.parametrize('source', sorted(KNOB_SOURCES))
+@pytest.mark.parametrize('target', KNOB_TARGETS)
+def test_no_caller_value_changes_what_a_dev_or_test_target_runs(tmp_path: Path, target: str, source: str):
+    """`make -n` prints the same recipe with and without the caller's value, and never the value itself."""
+    arguments, env = KNOB_SOURCES[source]
+    text = _make_n(tmp_path, target, *arguments, **env)
+    assert text == _make_n(tmp_path, target, *_without_project(arguments)), (target, source)
+    assert FOREIGN_PROJECT not in text, text
+    if target in DEV_TARGETS:
+        assert set(_projects(text)) == {DEV_PROJECT}, (target, source, _projects(text))
+
+
+@pytest.mark.parametrize('variable', sorted(DEV_SETS))
+def test_every_dev_set_takes_its_project_from_dev_project_alone(variable: str):
+    """In source: `-p $(DEV_PROJECT)` once, or no project option and built on another dev set.
+
+    So no set can name its project through a second variable a caller could set, which the expanded pins
+    above would not see under a name they do not try.
+    """
+    words = _make_variable(variable).split()
+    options = [pair for pair in pairwise([*words, None]) if pair[0].partition('=')[0] in PROJECT_OPTIONS]
+    if options:
+        assert options == [('-p', '$(DEV_PROJECT)')], (variable, options)
+    else:
+        base = re.fullmatch(r'\$\((\w+)\)', words[0])
+        assert base is not None and base.group(1) in DEV_SETS - {variable}, (variable, words)
 
 
 def test_every_makefile_compose_set_is_classified():
@@ -190,7 +280,9 @@ def test_the_hazard_comment_sits_above_prod_compose():
             break
         block.append(line)
     text = ' '.join(line.lstrip('# ') for line in reversed(block))
-    assert 'DEV_PROJECT := trader_joe_dev' in text, text
+    # tj-grna9p.192: the assignment in the block is the override, and the block says it is not a knob.
+    assert 'override DEV_PROJECT := trader_joe_dev' in text, text
+    assert 'FIXED constant, not a knob' in text and 'tj-grna9p.192' in text, text
     for phrase in ('addendum 29', 'tj-oxxl8a', 'PROD_COMPOSE carries NO -p', 'THE HAZARD THAT REMAINS', 'fails LOUDLY'):
         assert phrase in text, (phrase, text)
     assert 'no target here tears down the other project' in text, text

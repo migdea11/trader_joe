@@ -43,6 +43,7 @@ from typing import Any
 import pytest
 import yaml
 
+from common.tests.test_ci_invariants import _made_variable
 from tools.agent_mcp import runner, stack
 from tools.agent_mcp.tests.harness import (
     REPO_ROOT,
@@ -1384,7 +1385,8 @@ def test_the_test_data_dir_is_the_makefiles():
         'SYSTEM_COMPOSE := DATA_DIR=$(TEST_DATA_DIR) docker compose -p $(DEV_PROJECT) -f docker-compose.yaml '
         '-f docker-compose.fake.yaml'
     ) in text
-    assert re.search(r'^DEV_PROJECT\s*:=\s*trader_joe_dev\s*$', text, re.MULTILINE), 'DEV_PROJECT is not trader_joe_dev'
+    # Read as make expands it, not by a regex on the line: the assignment is `override` since tj-grna9p.192.
+    assert _made_variable('DEV_PROJECT') == 'trader_joe_dev', 'DEV_PROJECT is not trader_joe_dev'
 
 
 def _services(name: str) -> dict[str, Any]:
