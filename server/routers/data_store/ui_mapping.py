@@ -25,13 +25,16 @@ from common.rpc.mapping.values import ASSET_TYPE, DATA_SOURCE, DATA_TYPE, FEED, 
 from data.store.app.database.crud.dataset_override import OperatorOverrideInput
 from data.store.app.database.crud.ingest_run import IngestRunRecord
 from data.store.app.database.crud.stock.dataset_catalog import BarExtent
+from data.store.app.database.models.dataset_read import ReadClientKind
 from data.store.app.database.models.ingest_run import IngestRunState
 from data.store.app.dataset_catalog import (
     BarPageIndexResult,
     BarPageResult,
+    ClientFilter,
     CoverageResult,
     DatasetDetail,
     DatasetPage,
+    DatasetUsageView,
     DatasetView,
     Facets,
     RunPageResult,
@@ -80,6 +83,30 @@ def _freshness(view: DatasetView, as_of: datetime) -> data_pb2.Freshness:
     return message
 
 
+def _client_kind(kind: ReadClientKind) -> int:
+    return _enum_value(data_pb2.ClientKind, 'CLIENT_KIND_', kind)
+
+
+def _echo(client_filter: ClientFilter) -> tuple[list[str], list[int]]:
+    """The client filter's echo: exactly one of the two lists is non-empty (the ECHO RULE in data.proto)."""
+    ids = list(client_filter.applied_ids)
+    return ids, [] if ids else [_client_kind(kind) for kind in client_filter.applied_kinds]
+
+
+def _usage(usage: DatasetUsageView, client_filter: ClientFilter) -> data_pb2.DatasetUsage:
+    client_ids, client_kinds = _echo(client_filter)
+    message = data_pb2.DatasetUsage(
+        reads_30d=usage.reads_30d,
+        read_by_30d=[_client_kind(kind) for kind in usage.read_by_30d],
+        read_by_clients_30d=usage.read_by_clients_30d,
+        client_ids=client_ids,
+        client_kinds=client_kinds,
+    )
+    if usage.last_read_at is not None:
+        message.last_read_at.CopyFrom(to_timestamp(usage.last_read_at))
+    return message
+
+
 def _summary(
     view: DatasetView,
     extent: BarExtent,
@@ -87,6 +114,8 @@ def _summary(
     as_of: datetime,
     last_run: IngestRunRecord | None = None,
     reaper_pending: bool = False,
+    usage: DatasetUsageView | None = None,
+    client_filter: ClientFilter | None = None,
 ) -> data_pb2.DatasetSummary:
     row = view.row
     message = data_pb2.DatasetSummary(
@@ -119,6 +148,8 @@ def _summary(
     )
     if last_run is not None:
         message.last_run.CopyFrom(ingest_run_message(last_run))
+    # Always set on a list or detail read, an unread dataset included (the zero view).
+    message.usage.CopyFrom(_usage(usage or DatasetUsageView(), client_filter or ClientFilter()))
     return message
 
 
@@ -134,7 +165,14 @@ def dataset_page_message(page: DatasetPage) -> data_pb2.DatasetPage:
     message = data_pb2.DatasetPage(next_cursor=page.next_cursor)
     message.items.extend(
         _summary(
-            view, page.extents[view.row.id], page.siblings[view.row.id], page.as_of, page.last_runs.get(view.row.id)
+            view,
+            page.extents[view.row.id],
+            page.siblings[view.row.id],
+            page.as_of,
+            page.last_runs.get(view.row.id),
+            reaper_pending=view.row.id in page.reaper_pending,
+            usage=page.usage.get(view.row.id),
+            client_filter=page.client_filter,
         )
         for view in page.views
     )
@@ -162,6 +200,8 @@ def reaper_pending_page_message(page: DatasetPage, deletes_enabled: bool) -> dat
             page.as_of,
             page.last_runs.get(view.row.id),
             reaper_pending=True,
+            usage=page.usage.get(view.row.id),
+            client_filter=page.client_filter,
         )
         for view in page.views
     )
@@ -177,7 +217,16 @@ def dataset_summary_message(detail: DatasetDetail) -> data_pb2.DatasetSummary:
     Returns:
         data_pb2.DatasetSummary: The dataset with its freshness, extent and siblings.
     """
-    return _summary(detail.view, detail.extent, detail.siblings, detail.as_of, detail.last_run)
+    return _summary(
+        detail.view,
+        detail.extent,
+        detail.siblings,
+        detail.as_of,
+        detail.last_run,
+        reaper_pending=detail.reaper_pending,
+        usage=detail.usage,
+        client_filter=detail.client_filter,
+    )
 
 
 def facets_message(facets: Facets) -> data_pb2.DatasetFacets:
@@ -187,9 +236,30 @@ def facets_message(facets: Facets) -> data_pb2.DatasetFacets:
         facets: The counts the catalog produced.
 
     Returns:
-        data_pb2.DatasetFacets: The two view totals and a count for every source, update type and status.
+        data_pb2.DatasetFacets: The two view totals and a count for every source, update type and status, the
+        usage and expiry counts with the filter echo, and the clients seen reading.
     """
-    message = data_pb2.DatasetFacets(all=facets.all, needs_attention=facets.needs_attention, running=facets.running)
+    client_ids, client_kinds = _echo(facets.client_filter)
+    message = data_pb2.DatasetFacets(
+        all=facets.all,
+        needs_attention=facets.needs_attention,
+        running=facets.running,
+        client_ids=client_ids,
+        client_kinds=client_kinds,
+        stale=facets.stale,
+        read_30d=facets.read_30d,
+        never_read=facets.never_read,
+        expiring_soon=facets.expiring_soon,
+        stale_days=facets.stale_days,
+    )
+    if facets.expires_before is not None:
+        message.expires_before.CopyFrom(to_timestamp(facets.expires_before))
+    message.clients.extend(
+        data_pb2.ClientCount(
+            client_id=item.client_id, client_kind=_client_kind(item.client_kind), datasets=item.datasets
+        )
+        for item in facets.clients
+    )
     message.sources.extend(
         data_pb2.SourceFacet(source=DATA_SOURCE.to_proto(source), count=count)
         for source, count in facets.sources.items()

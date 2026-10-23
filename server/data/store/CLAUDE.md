@@ -99,6 +99,8 @@ Every bar read is recorded as one `dataset_read` row by the usage recorder (`app
 - **Best effort.** A failed flush is logged by type and retried from the buffer; the buffer is bounded and drops its oldest past `USAGE_BUFFER_MAX`. On an unmigrated database one warning names `make migrate` and the rows are dropped.
 - **`client_id` is a `SensitiveString`**: never logged, never in a repr.
 - **`dataset_read_daily.last_read_at`** keeps the latest read of a folded day, so staleness stays exact after the rows are gone.
+- **`GET /ui/v1/datasets/{id}/bars` records one read per call WITHOUT a cursor** (the `X-Client-Id` label; `operator` is kind UI, no header is `_unattributed`); a call with a cursor, and every other `/ui/v1` route, records nothing.
+- **Usage on the catalog** (`app/dataset_catalog.py`): `DatasetSummary.usage` on list and detail, the `client_id` (wins, repeatable) / `client_kind` (default SDK) filter, `usage` = `READ_30D` / `STALE` / `NEVER_READ` with `stale_days` (1..3650, default 90, never-read is stale; day-aligned on the UTC date of the last read, stream sessions count, so READ_30D and STALE are complements at 30; the detail route takes the same client filter), `sort=last_read`, and `expires_before` (Expiring Soon: expiry before it, plus the reaper's pending set; ignores the client filter; the facets default it to now + `EXPIRING_SOON_DAYS`). The `owner` query filter is never the reader. Each facet count equals the filtered list's total. The window functions refuse a naive `now`. An unmigrated database reads as zero usage with one warning (`make migrate`).
 
 ## Operator writes (expiry and delete)
 

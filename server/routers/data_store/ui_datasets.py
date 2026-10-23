@@ -6,8 +6,8 @@ and the .proto is the schema. Request parameters are ordinary query and path par
 of this service validates them: a bad one is a 422 problem+json, an unknown dataset is a 404 problem+json.
 
 READ-ONLY, AND OPEN. Like the GETs under /store, these take no instance secret; the edge auth (tj-grna9p.6)
-protects them in production. Phase 1 records nothing about who read what (usage is phase 3), and it runs no
-ingest, so nothing here writes.
+protects them in production. The one record is a bar read (GET .../bars), buffered by the usage recorder and
+labelled by the X-Client-Id header; every other route here records nothing, and nothing here writes the database.
 
 THE QUERY IS BOUND WITH Query() (the rule internal_asset_data.py documents): the models forbid extra fields, so an
 unknown parameter is a 422 rather than silently dropped.
@@ -20,14 +20,16 @@ from datetime import UTC, datetime
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Path, Query
+from fastapi import APIRouter, Depends, Header, Path, Query
 from pydantic import AwareDatetime, BeforeValidator, Field, WithJsonSchema
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.enums.data_stock import DataSource, UpdateType
 from common.errors.vocabulary import InvalidRequestError, Reason
+from data.store.app.client_label import CLIENT_ID_HEADER, MAX_CLIENT_ID_LENGTH, classify_client_label
 from data.store.app.database.crud.stock.dataset_catalog import CatalogFilter
 from data.store.app.database.database import async_db
+from data.store.app.database.models.dataset_read import ReadClientKind
 from data.store.app.dataset_catalog import (
     DEFAULT_BAR_LIMIT,
     DEFAULT_COVERAGE_BUCKETS,
@@ -35,14 +37,18 @@ from data.store.app.dataset_catalog import (
     DEFAULT_PAGE_INDEX_SIZE,
     DEFAULT_PAGE_LIMIT,
     DEFAULT_RUN_LIMIT,
+    DEFAULT_STALE_DAYS,
     MAX_BAR_LIMIT,
     MAX_COVERAGE_BUCKETS,
     MAX_PAGE_INDEX_SIZE,
     MAX_PAGE_LIMIT,
     MAX_RUN_LIMIT,
+    MAX_STALE_DAYS,
     CatalogQuery,
+    ClientFilter,
     DatasetSort,
     StatusGroup,
+    UsageFilter,
     bar_page,
     bar_page_index,
     dataset_coverage,
@@ -51,6 +57,7 @@ from data.store.app.dataset_catalog import (
     list_page,
     run_page,
 )
+from data.store.app.usage_recorder import usage_recorder
 from routers.common.proto_json import ProtoJSONResponse, proto_route
 from routers.data_store.app_endpoints import UiDatasetsInterface
 from routers.data_store.ui_mapping import (
@@ -73,6 +80,9 @@ from schemas.inbound_contract import InboundContract
 
 
 router = APIRouter()
+
+# The most client ids one request may filter by.
+MAX_CLIENT_IDS = 32
 
 
 def _member_by_name(enum_type: Any, prefix: str) -> tuple[BeforeValidator, WithJsonSchema]:
@@ -103,8 +113,26 @@ async def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-class UiDatasetFiltersQuery(InboundContract):
-    """The filters shared by the dataset list and its facets.
+class UiClientFilterQuery(InboundContract):
+    """The client filter, shared by the dataset list, its facets and the dataset detail.
+
+    Attributes:
+        client_id: Whose reads the usage figures and the usage filter count: exact client ids, repeatable. Wins
+            over client_kind. It is the reader's label; the /store owner filter is unrelated.
+        client_kind: The client kinds (UI, SDK; the CLIENT_KIND_ prefix and any case accepted), repeatable. With
+            neither client_id nor client_kind the kind is SDK.
+    """
+
+    client_id: Annotated[
+        list[Annotated[str, Field(min_length=1, max_length=MAX_CLIENT_ID_LENGTH)]], Field(max_length=MAX_CLIENT_IDS)
+    ] = Field(default_factory=list)
+    client_kind: Annotated[
+        list[Annotated[ReadClientKind, *_member_by_name(ReadClientKind, 'CLIENT_KIND_')]], Field(max_length=8)
+    ] = Field(default_factory=list)
+
+
+class UiDatasetFiltersQuery(UiClientFilterQuery):
+    """The filters shared by the dataset list and its facets (the client filter is inherited).
 
     Attributes:
         asset_symbol: Keep datasets whose symbol starts with this, case-insensitively (the Viewer's symbol picker).
@@ -113,6 +141,10 @@ class UiDatasetFiltersQuery(InboundContract):
         status: Keep datasets whose freshness is in this UI group: healthy, late, failed or retired.
         needs_attention: Keep only late and failed datasets.
         running: Keep only datasets with a run in flight. Orthogonal to status.
+        usage: Keep datasets in this usage group under the client filter: READ_30D, STALE or NEVER_READ.
+        stale_days: The staleness threshold of the STALE group in days, 1 to 3650.
+        expires_before: The Expiring Soon view: keep datasets expiring before this instant plus every dataset the
+            reaper would delete; the facets read uses now + 7 days for its expiring_soon count when it is absent.
     """
 
     asset_symbol: Annotated[str | None, Field(min_length=1, max_length=32)] = None
@@ -121,13 +153,17 @@ class UiDatasetFiltersQuery(InboundContract):
     status: Annotated[StatusGroup | None, BeforeValidator(_lowered)] = None
     needs_attention: bool = False
     running: bool = False
+    usage: Annotated[UsageFilter | None, *_member_by_name(UsageFilter, 'USAGE_FILTER_')] = None
+    stale_days: Annotated[int, Field(ge=1, le=MAX_STALE_DAYS)] = DEFAULT_STALE_DAYS
+    expires_before: AwareDatetime | None = None
 
 
 class UiDatasetsQuery(UiDatasetFiltersQuery):
     """The dataset list's query: the shared filters, the order, and the page.
 
     Attributes:
-        sort: symbol (default) or expires, soonest first with no-expiry datasets last.
+        sort: symbol (default), expires (soonest first, no-expiry last) or last_read (most recent first, never-read
+            last, by the selected clients).
         cursor: The next_cursor of the previous page. Opaque.
         limit: The page size.
     """
@@ -196,6 +232,10 @@ def _catalog_filter(query: UiDatasetFiltersQuery) -> CatalogFilter:
     return CatalogFilter(asset_symbol_prefix=query.asset_symbol, source=query.source, update_type=query.update_type)
 
 
+def _client_filter(query: UiClientFilterQuery) -> ClientFilter:
+    return ClientFilter(client_ids=tuple(query.client_id), client_kinds=tuple(query.client_kind))
+
+
 def _not_found(dataset_id: UUID) -> InvalidRequestError:
     return InvalidRequestError(Reason.NOT_FOUND, f'No dataset found with ID {dataset_id}')
 
@@ -225,6 +265,10 @@ async def list_datasets(
         status=request_query.status,
         needs_attention=request_query.needs_attention,
         running=request_query.running,
+        client_filter=_client_filter(request_query),
+        usage=request_query.usage,
+        stale_days=request_query.stale_days,
+        expires_before=request_query.expires_before,
         sort=request_query.sort,
         cursor=request_query.cursor,
         limit=request_query.limit,
@@ -242,6 +286,8 @@ async def get_dataset_facets(
     """The sidebar's counts, as a DatasetFacets, under the same filters the list takes.
 
     Each count equals the total of the list it describes; the definitions are in data/store/app/dataset_catalog.py.
+    The usage counts follow the client filter and stale_days; expiring_soon and the clients list ignore the client
+    filter.
 
     Args:
         db: The request's session.
@@ -256,6 +302,10 @@ async def get_dataset_facets(
         status=request_query.status,
         needs_attention=request_query.needs_attention,
         running=request_query.running,
+        client_filter=_client_filter(request_query),
+        usage=request_query.usage,
+        stale_days=request_query.stale_days,
+        expires_before=request_query.expires_before,
     )
     return ProtoJSONResponse(facets_message(await facets(db, query, now)))
 
@@ -264,6 +314,7 @@ async def get_dataset_facets(
 async def get_dataset(
     db: Annotated[AsyncSession, Depends(async_db)],
     dataset_id: Annotated[UUID, Path()],
+    request_query: Annotated[UiClientFilterQuery, Query()],
     now: Annotated[datetime, Depends(utc_now)],
 ) -> ProtoJSONResponse:
     """One dataset, as a DatasetSummary with its siblings and freshness.
@@ -271,6 +322,7 @@ async def get_dataset(
     Args:
         db: The request's session.
         dataset_id: The dataset's id.
+        request_query: The client filter: whose reads the usage counts, echoed on the usage.
         now: The instant freshness is computed at.
 
     Returns:
@@ -279,7 +331,7 @@ async def get_dataset(
     Raises:
         InvalidRequestError: NOT_FOUND, a 404 problem+json, when there is no such dataset.
     """
-    detail = await dataset_detail(db, dataset_id, now)
+    detail = await dataset_detail(db, dataset_id, now, client_filter=_client_filter(request_query))
     if detail is None:
         raise _not_found(dataset_id)
     return ProtoJSONResponse(dataset_summary_message(detail))
@@ -290,6 +342,9 @@ async def get_dataset_bars(
     db: Annotated[AsyncSession, Depends(async_db)],
     dataset_id: Annotated[UUID, Path()],
     request_query: Annotated[UiBarsQuery, Query()],
+    # The reader's label (tj-grna9p.131 OPTION R); the web sends 'operator'. Absent or malformed is recorded as
+    # '_unattributed'. A label for telemetry, never an authority.
+    client_id_header: Annotated[str | None, Header(alias=CLIENT_ID_HEADER)] = None,
 ) -> ProtoJSONResponse:
     """One page of a dataset's bars in the half-open window [start, end), ascending by bar_start, as a BarPage.
 
@@ -297,10 +352,15 @@ async def get_dataset_bars(
     pages are never shown twice and never make it skip one that was ahead of it. The limit defaults to 1000 and
     is at most 50000. An empty or inverted window is not an error: it is an empty page.
 
+    A CALL WITHOUT A CURSOR IS RECORDED AS ONE READ of the dataset, labelled by X-Client-Id; a call WITH a cursor
+    (an export or a chart continuing) records nothing, so a session is one read. Buffered and best effort: no
+    statement, never changes the answer (tj-grna9p.85).
+
     Args:
         db: The request's session.
         dataset_id: The dataset's id.
         request_query: The window, cursor and page size.
+        client_id_header: The reader's label.
 
     Returns:
         ProtoJSONResponse: A BarPage.
@@ -318,6 +378,13 @@ async def get_dataset_bars(
     )
     if page is None:
         raise _not_found(dataset_id)
+    if request_query.cursor is None:
+        usage_recorder.record_read(
+            dataset_id,
+            classify_client_label(client_id_header),
+            UiDatasetsInterface.GET_UI_DATASET_BARS.value,
+            len(page.bars),
+        )
     return ProtoJSONResponse(bar_page_message(page))
 
 

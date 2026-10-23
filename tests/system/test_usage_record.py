@@ -598,9 +598,9 @@ def _usage_rows(pg_engine: Engine, dataset_id: uuid.UUID) -> list[sa.Row]:
 
 
 def test_bar_reads_on_the_running_store_are_recorded_one_per_call_and_listing_reads_are_not(
-    pg_engine: Engine, insert_entry, bar_values, data_store_url: str, run_identity
+    pg_engine: Engine, insert_entry, bar_values, data_store_url: str, run_identity, own_symbol: str
 ):
-    entry = insert_entry()
+    entry = insert_entry(asset_symbol=own_symbol)
     bars = [bar_values(entry, timestamp=entry.start + timedelta(minutes=minute)) for minute in range(3)]
     try:
         with pg_engine.begin() as conn:

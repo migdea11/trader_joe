@@ -348,9 +348,20 @@ def insert_entry(
     """Insert one entry in its own committed transaction; return the full row it produced.
 
     The row is registered for cleanup before the caller sees it. Arguments are entry_values'.
+
+    asset_symbol IS REQUIRED HERE (tj-7qfzdf). This fixture is session-scoped and its rows stay
+    until the session ends, so two tests that each took entry_values' default symbol inserted the
+    SAME natural key, and the second died on uq_store_dataset_entry_identity. That happened only
+    when both ran in one pytest session: make test-system, which CI runs, and never the per-file
+    chunks the suite had been checked in. Pass own_symbol from a test, or run_identity.alt_symbol
+    from a fixture whose scope is wider than a test.
     """
 
     def _insert(omit: tuple[str, ...] = (), **overrides: Any) -> sa.Row:
+        assert 'asset_symbol' in overrides, (
+            'insert_entry needs an explicit asset_symbol (own_symbol, or run_identity.alt_symbol): '
+            "the run's default symbol is shared by every test in the session (tj-7qfzdf)"
+        )
         with pg_engine.begin() as conn:
             row = conn.execute(
                 sa.insert(ENTRY_TABLE).values(entry_values(omit, **overrides)).returning(*ENTRY_TABLE.c)

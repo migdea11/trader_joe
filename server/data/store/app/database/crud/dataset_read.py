@@ -15,9 +15,9 @@ client_id IS A SensitiveString: no statement binding it renders the value, and n
 import uuid
 from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
-from sqlalchemy import BigInteger, Date, cast, delete, func, select, union_all, update
+from sqlalchemy import BigInteger, Date, cast, delete, func, select, union, union_all, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,6 +28,16 @@ from data.store.app.database.transaction import write_transaction
 
 _READ = DatasetRead.__table__
 _DAILY = DatasetReadDaily.__table__
+
+
+def _window_start_day(now: datetime, days: int) -> date:
+    """The first UTC day of a window of `days` ending at `now`; a naive `now` is refused.
+
+    The rollup keys its days in UTC, so the window's day is taken in UTC whatever zone `now` carries.
+    """
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError('now must be timezone-aware')
+    return (now.astimezone(UTC) - timedelta(days=days)).date()
 
 
 def _utc_day(column):
@@ -281,7 +291,7 @@ async def read_dataset_usage(
     Args:
         db: A session; the read is one statement.
         dataset_ids: The datasets to report, or None for every dataset with a read.
-        now: The instant the window ends at (aware).
+        now: The instant the window ends at; aware, else ValueError. Converted to UTC for the window's start day.
         window_days: The window's length in days.
         client_kinds: Count only these kinds. Default {SDK}. Ignored when client_ids is given.
         client_ids: Count only these client ids instead of filtering by kind.
@@ -289,7 +299,7 @@ async def read_dataset_usage(
     Returns:
         dict[uuid.UUID, DatasetUsage]: Keyed by dataset id.
     """
-    since_day = (now - timedelta(days=window_days)).date()
+    since_day = _window_start_day(now, window_days)
     usage = _per_day(dataset_ids, client_kinds, client_ids)
     stmt = select(
         usage.c.dataset_id,
@@ -316,7 +326,7 @@ async def read_daily_reads(
     Args:
         db: A session; the read is one statement.
         dataset_ids: The datasets to report, or None for every dataset with a read.
-        now: The instant the window ends at (aware).
+        now: The instant the window ends at; aware, else ValueError. Converted to UTC for the window's start day.
         days: The window's length in days.
         client_kinds: Report only these kinds. Default {SDK}. Ignored when client_ids is given.
         client_ids: Report only these client ids instead of filtering by kind.
@@ -324,7 +334,7 @@ async def read_daily_reads(
     Returns:
         list[DailyReads]: Ordered by day, then dataset id, then kind.
     """
-    since_day = (now - timedelta(days=days)).date()
+    since_day = _window_start_day(now, days)
     usage = _per_day(dataset_ids, client_kinds, client_ids)
     stmt = (
         select(usage.c.dataset_id, usage.c.day, usage.c.client_kind, cast(func.sum(usage.c.reads), BigInteger))
@@ -335,4 +345,85 @@ async def read_daily_reads(
     return [
         DailyReads(dataset_id, day, ReadClientKind(kind), int(reads))
         for dataset_id, day, kind, reads in (await db.execute(stmt)).all()
+    ]
+
+
+async def read_readers(
+    db: AsyncSession, dataset_ids: Collection[uuid.UUID], *, now: datetime, window_days: int
+) -> dict[uuid.UUID, tuple[frozenset[ReadClientKind], frozenset[str]]]:
+    """Which client kinds and which client ids read each dataset in the last `window_days`, whatever the filter.
+
+    Only reads count, as in read_dataset_usage. The window is whole UTC days. A dataset nobody read is absent.
+
+    Args:
+        db: A session; the read is one statement, and none for an empty `dataset_ids`.
+        dataset_ids: The datasets to report.
+        now: The instant the window ends at (aware, else ValueError).
+        window_days: The window's length in days.
+
+    Returns:
+        dict: (kinds, client ids) per dataset id.
+    """
+    if not dataset_ids:
+        return {}
+    since_day = _window_start_day(now, window_days)
+    ids = list(dataset_ids)
+    per_read = select(_READ.c.dataset_id, _READ.c.client_id, _READ.c.client_kind).where(
+        _READ.c.dataset_id.in_(ids), _READ.c.kind == DatasetReadKind.READ, _utc_day(_READ.c.read_at) >= since_day
+    )
+    daily = select(_DAILY.c.dataset_id, _DAILY.c.client_id, _DAILY.c.client_kind).where(
+        _DAILY.c.dataset_id.in_(ids), _DAILY.c.reads > 0, _DAILY.c.day >= since_day
+    )
+    held: dict[uuid.UUID, tuple[set[ReadClientKind], set[str]]] = {}
+    for dataset_id, client_id, kind in (await db.execute(union(per_read, daily))).all():
+        kinds, clients = held.setdefault(dataset_id, (set(), set()))
+        kinds.add(ReadClientKind(kind))
+        clients.add(client_id)
+    return {dataset_id: (frozenset(kinds), frozenset(clients)) for dataset_id, (kinds, clients) in held.items()}
+
+
+@dataclass(frozen=True)
+class ClientDatasets:
+    """One client seen reading and how many datasets it read in the window. client_id is repr=False."""
+
+    client_id: str = field(repr=False)
+    client_kind: ReadClientKind
+    datasets: int
+
+
+async def read_client_datasets(
+    db: AsyncSession, dataset_ids: Collection[uuid.UUID], *, now: datetime, window_days: int
+) -> list[ClientDatasets]:
+    """Each client that read any of `dataset_ids` in the last `window_days`, with the datasets it read.
+
+    Not filtered by client: it feeds the client picker. Only reads count.
+
+    Args:
+        db: A session; the read is one statement, and none for an empty `dataset_ids`.
+        dataset_ids: The datasets to count over.
+        now: The instant the window ends at (aware, else ValueError).
+        window_days: The window's length in days.
+
+    Returns:
+        list[ClientDatasets]: Most datasets first, then by client id.
+    """
+    if not dataset_ids:
+        return []
+    since_day = _window_start_day(now, window_days)
+    ids = list(dataset_ids)
+    per_read = select(_READ.c.dataset_id, _READ.c.client_id, _READ.c.client_kind).where(
+        _READ.c.dataset_id.in_(ids), _READ.c.kind == DatasetReadKind.READ, _utc_day(_READ.c.read_at) >= since_day
+    )
+    daily = select(_DAILY.c.dataset_id, _DAILY.c.client_id, _DAILY.c.client_kind).where(
+        _DAILY.c.dataset_id.in_(ids), _DAILY.c.reads > 0, _DAILY.c.day >= since_day
+    )
+    seen = union(per_read, daily).subquery('readers')
+    stmt = (
+        select(seen.c.client_id, seen.c.client_kind, func.count(seen.c.dataset_id.distinct()))
+        .group_by(seen.c.client_id, seen.c.client_kind)
+        .order_by(func.count(seen.c.dataset_id.distinct()).desc(), seen.c.client_id)
+    )
+    return [
+        ClientDatasets(client_id, ReadClientKind(kind), int(count))
+        for client_id, kind, count in (await db.execute(stmt)).all()
     ]

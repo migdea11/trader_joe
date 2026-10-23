@@ -119,9 +119,15 @@ def _offsets(body: dict[str, Any]) -> list[int]:
 
 
 @pytest.fixture(scope='module')
-def series(insert_entry: Callable[..., sa.Row], bar_values: Callable[..., dict[str, Any]], pg_engine: Engine) -> sa.Row:
-    """One entry of this run with SEEDED one-minute bars from FIRST_BAR. insert_entry registers it for cleanup."""
-    entry = insert_entry(start=FIRST_BAR, end=minute(SEEDED))
+def series(
+    insert_entry: Callable[..., sa.Row], bar_values: Callable[..., dict[str, Any]], pg_engine: Engine, run_identity
+) -> sa.Row:
+    """One entry of this run with SEEDED one-minute bars from FIRST_BAR. insert_entry registers it for cleanup.
+
+    A symbol of its own (tj-7qfzdf), not the run's default: module scope rules out own_symbol, and
+    'X' is not a hex digit, so no own_symbol digest can equal it or start with it.
+    """
+    entry = insert_entry(asset_symbol=run_identity.alt_symbol('XBP'), start=FIRST_BAR, end=minute(SEEDED))
     rows = [bar_values(entry, timestamp=minute(index), close=float(index)) for index in range(SEEDED)]
     with pg_engine.begin() as conn:
         conn.execute(sa.insert(BAR_TABLE), rows)

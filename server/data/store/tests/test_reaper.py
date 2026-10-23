@@ -904,11 +904,16 @@ async def test_the_route_records_no_usage_and_writes_nothing(world: World, clien
 
 
 @pytest.mark.asyncio
-async def test_the_catalog_list_does_not_claim_reaper_pending_yet(world: World, client):
-    """reaper_pending on list and detail reads is .85's; until then _summary's default leaves it unset there."""
+async def test_the_catalog_list_and_detail_flag_exactly_the_reaper_pending_datasets(world: World, client):
+    """tj-grna9p.85 flipped this pin: list and detail carry reaper_pending, true for the pending set and unset elsewhere."""
     body = (await client.get('/ui/v1/datasets', params={'limit': 100})).json()
-    assert body['items']
-    assert all('reaperPending' not in item for item in body['items'])
+    flagged = {item['id'] for item in body['items'] if item.get('reaperPending')}
+    assert flagged == {str(world.id(name)) for name in PENDING}
+    assert all(item.get('reaperPending', False) is False for item in body['items'] if item['id'] not in flagged)
+    for name in PENDING:
+        assert (await client.get(f'/ui/v1/datasets/{world.id(name)}')).json()['reaperPending'] is True, name
+    not_pending = next(item['id'] for item in body['items'] if item['id'] not in flagged)
+    assert 'reaperPending' not in (await client.get(f'/ui/v1/datasets/{not_pending}')).json()
 
 
 # ------------------------------------------------------------------------------------------------- env

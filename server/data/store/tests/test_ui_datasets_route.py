@@ -759,8 +759,20 @@ LIMIT_CASES = {
     'list unknown status': ('/ui/v1/datasets', {'status': 'stale'}, 'status'),
     'list unknown source': ('/ui/v1/datasets', {'source': 'NYSE'}, 'source'),
     'list empty symbol prefix': ('/ui/v1/datasets', {'asset_symbol': ''}, 'asset_symbol'),
-    'list unknown parameter': ('/ui/v1/datasets', {'stale_days': 3}, 'stale_days'),
+    # Was stale_days until tj-grna9p.85 made it a parameter. owner is the /store search filter and never the reader
+    # (tj-grna9p.131), so the catalog must refuse it rather than take it for a client filter.
+    'list unknown parameter': ('/ui/v1/datasets', {'owner': 'operator'}, 'owner'),
     'facets ignores no unknown parameter': ('/ui/v1/datasets/facets', {'limit': 5}, 'limit'),
+    'facets unknown owner parameter': ('/ui/v1/datasets/facets', {'owner': 'operator'}, 'owner'),
+    'list stale_days 0': ('/ui/v1/datasets', {'stale_days': 0}, 'stale_days'),
+    'list stale_days 3651': ('/ui/v1/datasets', {'stale_days': 3651}, 'stale_days'),
+    'facets stale_days 0': ('/ui/v1/datasets/facets', {'stale_days': 0}, 'stale_days'),
+    'facets stale_days 3651': ('/ui/v1/datasets/facets', {'stale_days': 3651}, 'stale_days'),
+    'list unknown usage': ('/ui/v1/datasets', {'usage': 'cold'}, 'usage'),
+    'facets unknown client kind': ('/ui/v1/datasets/facets', {'client_kind': 'BOT'}, 'client_kind'),
+    'list empty client id': ('/ui/v1/datasets', {'client_id': ''}, 'client_id'),
+    'list naive expires_before': ('/ui/v1/datasets', {'expires_before': '2026-10-10T00:00:00'}, 'expires_before'),
+    'list unknown sort last_used': ('/ui/v1/datasets', {'sort': 'last_used'}, 'sort'),
     'bars limit 0': ('/ui/v1/datasets/{id}/bars', {'limit': 0}, 'limit'),
     'bars limit 50001': ('/ui/v1/datasets/{id}/bars', {'limit': 50_001}, 'limit'),
     'bars naive start': ('/ui/v1/datasets/{id}/bars', {'start': '2026-10-05T14:00:00'}, 'start'),
@@ -772,7 +784,8 @@ LIMIT_CASES = {
 @pytest.mark.parametrize(('path', 'params', 'field'), LIMIT_CASES.values(), ids=LIMIT_CASES)
 async def test_a_bad_parameter_is_a_422_naming_it(client, bars, path, params, field):
     response = await client.get(path.replace('{id}', str(bars.dataset.id)), params=params)
-    assert field in [error['loc'][-1] for error in validation_errors(response)]
+    # A repeatable parameter's error ends with the item's index (['query', 'client_kind', 0]), so match any part.
+    assert any(field in error['loc'] for error in validation_errors(response))
 
 
 @pytest.mark.asyncio
@@ -860,6 +873,11 @@ async def test_a_request_runs_a_constant_number_of_statements_not_one_per_datase
     running filter. So the budget is pinned per route, exactly, rather than as one ceiling: list and detail 5
     (was 4), facets 3, and the large set below gives MANY datasets runs, so a per-dataset last_run read would
     show as growth.
+
+    tj-grna9p.85 adds TWO to the list, the detail and the facets HERE: the usage tables' to_regclass probe (once
+    per request) and the reaper's pending set. On SQLite the probe itself fails (no to_regclass), so usage reads
+    as the zero view and the usage, readers and clients reads never run. Their budget, with the tables present,
+    is pinned on Postgres: tests/system/test_http_ui_dataset_usage.py.
     """
     statements: list[str] = []
     event.listen(engine.sync_engine, 'before_cursor_execute', lambda *args: statements.append(args[2]))
@@ -895,11 +913,11 @@ async def test_a_request_runs_a_constant_number_of_statements_not_one_per_datase
     assert small == large, f'the statement count grew with the number of datasets: {small} -> {large}'
     # The running filter reads the RUNNING set once more, and only when asked for.
     assert large == {
-        'list': 5,
-        'list filtered by status': 5,
-        'list filtered by running': 6,
-        'facets': 3,
-        'detail': 5,
+        'list': 7,
+        'list filtered by status': 7,
+        'list filtered by running': 8,
+        'facets': 5,
+        'detail': 7,
         'coverage': 2,
         'bar pages': 2,
     }, large
