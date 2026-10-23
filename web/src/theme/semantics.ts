@@ -30,7 +30,7 @@ export type FreshnessStatusName = (typeof FRESHNESS_STATUS_VALUES)[number]
 const HEALTHY: BadgeSpec = { label: 'Healthy', color: colors.status.ok }
 const LATE: BadgeSpec = { label: 'Late', color: colors.status.warn }
 const FAILED: BadgeSpec = { label: 'Failed', color: colors.status.fail }
-const RETIRED: BadgeSpec = { label: 'Retired', color: colors.status.retired }
+const RETIRED: BadgeSpec = { label: 'Stopped', color: colors.status.retired }
 // A dataset can have no health at all (e.g. a source without a calendar): the server leaves
 // freshness, or its status, unset. That is shown as its own state, never as Healthy. The spec
 // gives no word or colour for it; "Unknown" in the neutral text3 token is the provisional choice
@@ -38,7 +38,7 @@ const RETIRED: BadgeSpec = { label: 'Retired', color: colors.status.retired }
 const UNKNOWN: BadgeSpec = { label: 'Unknown', color: colors.text3 }
 
 // Freshness to UI label (architect choice, tj-grna9p.60): FRESH and COMPLETE are Healthy, LATE is
-// Late, OVERDUE and GAPS are Failed, RETIRED is Retired, unset is Unknown.
+// Late, OVERDUE and GAPS are Failed, RETIRED is Stopped (collect off), unset is Unknown.
 export const FRESHNESS_BADGES: Readonly<Record<FreshnessStatusName, BadgeSpec>> = {
   FRESHNESS_STATUS_UNSPECIFIED: UNKNOWN,
   FRESHNESS_STATUS_FRESH: HEALTHY,

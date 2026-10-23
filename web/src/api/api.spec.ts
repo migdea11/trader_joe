@@ -42,6 +42,7 @@ import {
   getStaleDatasets,
   getStorageCurrent,
   getUsageSummary,
+  setDatasetCollecting,
   setDatasetExpiry,
   getDataset,
   getDatasetBarPages,
@@ -312,7 +313,14 @@ describe('request shape', () => {
       ([name, value]) => typeof value === 'function' && !PURE.has(name) && !name.endsWith('Request'),
     )
     expect(callers.map(([name]) => name).sort()).toEqual(
-      expect.arrayContaining(['deleteDataset', 'getReadsPerDay', 'getStorageCurrent', 'getUsageSummary', 'setDatasetExpiry']),
+      expect.arrayContaining([
+        'deleteDataset',
+        'getReadsPerDay',
+        'getStorageCurrent',
+        'getUsageSummary',
+        'setDatasetCollecting',
+        'setDatasetExpiry',
+      ]),
     )
     for (const [name, call] of callers) {
       fetchMock.mockClear()
@@ -808,6 +816,73 @@ describe('writes (tj-grna9p.89)', () => {
     expect(calledUrl(1)).toBe(`${API_BASE}/ui/v1/datasets/ds-1`)
     expect(init(1).method).toBe('DELETE')
     expect(body(1)).toEqual({ override: { reason: 'cleanup', confirmed: true } })
+  })
+
+  // tj-grna9p.177 (the F1 ruling on tj-grna9p.174): the collecting PATCH body ALWAYS carries collect, true
+  // or false; the route answers a body without it with 422. The override is the expiry write's.
+  it.each([
+    ['collect true', true],
+    ['collect false', false],
+  ])('setDatasetCollecting (%s): PATCH .../{id}/collecting, the id encoded, the body exactly {collect}', async (_name, collect) => {
+    fetchMock.mockResolvedValue(jsonResponse({ ...SUMMARY_JSON, collecting: collect }))
+    const result = await setDatasetCollecting('a/b c', { collect })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(calledUrl()).toBe(`${API_BASE}/ui/v1/datasets/a%2Fb%20c/collecting`)
+    expect(init().method).toBe('PATCH')
+    expect(headers()).toEqual({ Accept: 'application/json', 'X-Client-Id': OPERATOR_CLIENT_ID, 'Content-Type': 'application/json' })
+    // The raw text, not only the parsed object: the key is present, never dropped as a default.
+    expect(init().body).toBe(JSON.stringify({ collect }))
+    expect(body()).toEqual({ collect })
+    expect(Object.keys(body() as object)).toEqual(['collect'])
+    expect(result.id).toBe(SUMMARY_JSON.id)
+    expect(result.collecting).toBe(collect)
+  })
+
+  it('setDatasetCollecting carries the override beside collect, and still never omits collect', async () => {
+    fetchMock.mockImplementation(async () => jsonResponse(SUMMARY_JSON))
+    const override = { reason: 'cleanup', confirmed: true as const }
+    await setDatasetCollecting('ds-1', { collect: false, override })
+    await setDatasetCollecting('ds-1', { collect: true, override })
+    expect(body(0)).toEqual({ collect: false, override: { reason: 'cleanup', confirmed: true } })
+    expect(body(1)).toEqual({ collect: true, override: { reason: 'cleanup', confirmed: true } })
+    expect(calledUrl(1)).toBe(`${API_BASE}/ui/v1/datasets/ds-1/collecting`)
+  })
+
+  it('setDatasetCollecting with override undefined sends no override key at all', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(SUMMARY_JSON))
+    await setDatasetCollecting('ds-1', { collect: false, override: undefined })
+    expect(init().body).toBe('{"collect":false}')
+  })
+
+  it('setDatasetCollecting passes the caller signal', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(SUMMARY_JSON))
+    const controller = new AbortController()
+    await setDatasetCollecting('ds-1', { collect: true, signal: controller.signal })
+    expect(init().signal).toBe(controller.signal)
+  })
+
+  it.each([
+    ['409 OVERRIDE_REQUIRED', 409, 'OVERRIDE_REQUIRED'],
+    ['422 INVALID_REQUEST', 422, 'INVALID_REQUEST'],
+  ])('setDatasetCollecting refused with %s is an ApiError with that status and reason', async (_name, status, reason) => {
+    fetchMock.mockResolvedValue(jsonResponse({ reason, error_id: 'c-1', detail: 'held by bot-7' }, status, 'application/problem+json'))
+    const error = (await rejection(setDatasetCollecting('ds-1', { collect: false }))) as ApiError
+    expect(error).toBeInstanceOf(ApiError)
+    expect([error.status, error.reason, error.errorId]).toEqual([status, reason, 'c-1'])
+    expect(String(error)).not.toContain('bot-7')
+  })
+
+  it('setDatasetExpiry never sends collect: the expiry write is the deletion date only', async () => {
+    fetchMock.mockImplementation(async () => jsonResponse(SUMMARY_JSON))
+    await setDatasetExpiry('ds-1', { expiry: new Date(Date.UTC(2026, 9, 15, 4)) })
+    await setDatasetExpiry('ds-1', {})
+    expect(Object.keys(body(0) as object)).toEqual(['expiry'])
+    expect(body(1)).toEqual({})
+    expect(calledUrl(0)).toBe(`${API_BASE}/ui/v1/datasets/ds-1/expiry`)
+  })
+
+  it('setDatasetCollecting is exported from the api index', () => {
+    expect(datasetsModule.setDatasetCollecting).toBe(setDatasetCollecting)
   })
 
   it('deleteDataset with no override sends no body at all (the store reads none as an empty request)', async () => {

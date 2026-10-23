@@ -179,7 +179,8 @@ describe('freshness status map', () => {
     ['FRESHNESS_STATUS_LATE', 'Late', colors.status.warn],
     ['FRESHNESS_STATUS_OVERDUE', 'Failed', colors.status.fail],
     ['FRESHNESS_STATUS_GAPS', 'Failed', colors.status.fail],
-    ['FRESHNESS_STATUS_RETIRED', 'Retired', colors.status.retired],
+    // tj-grna9p.177: the enum name and the colour token stay; the word is Stopped (collect off).
+    ['FRESHNESS_STATUS_RETIRED', 'Stopped', colors.status.retired],
     ['FRESHNESS_STATUS_UNSPECIFIED', 'Unknown', colors.text3],
   ])('%s is %s', (status, label, color) => {
     expect(freshnessBadge(status)).toEqual({ label, color })

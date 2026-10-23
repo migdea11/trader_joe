@@ -1,9 +1,10 @@
 <script setup lang="ts">
 // The Dataset detail's Retention card (tj-grna9p.89): the expiry type (locked: fixed when the dataset
-// is created), the Expiry Time (empty is Never) with Tomorrow and Never, and the two writes,
-// Retire Subscription or Set Expiry (PATCH expiry) and Delete Now (DELETE, behind a typed
-// confirmation). A dataset another owner holds shows its owner and a warning, and both writes then
-// need a non-blank reason and a confirmation before they send `override`; the operator's own dataset
+// is created), the deletion date (Deleted On; empty is Never) with Tomorrow and Never, and the writes:
+// Set Expiry (PATCH expiry, the deletion date for every update type), Start or Stop Collecting
+// (PATCH collecting, a subscription's on/off, DAILY and STREAM only) and Delete Now (DELETE, behind a
+// typed confirmation). A dataset another owner holds shows its owner and a warning, and every write then
+// needs a non-blank reason and a confirmation before it sends `override`; the operator's own dataset
 // never sends one. The server decides what a write does and whether it is allowed: the card sends
 // what the operator chose and renders what comes back.
 //
@@ -50,9 +51,15 @@ const expiryType = computed(() => EXPIRY_TYPE_LABELS[props.dataset.expiryType] ?
 const currentExpiry = computed(() =>
   props.dataset.expiry === undefined ? 'Never' : dateTime(timestampToInstant(props.dataset.expiry)),
 )
-const retired = computed(() => props.dataset.state === DatasetState.RETIRED)
-// A DAILY or STREAM dataset is a subscription: an expiry retires it. A bulk (STATIC) one just has a date.
+// A DAILY or STREAM dataset is a subscription: the operator turns its collection on and off. A bulk
+// (STATIC) dataset has no such switch; it is collecting only while a fetch is running.
 const subscription = computed(() => props.dataset.updateType !== UpdateType.STATIC)
+// The server sends RETIRED (collect off) and `collecting`; either says the subscription is stopped.
+const stopped = computed(() => props.dataset.collecting === false || props.dataset.state === DatasetState.RETIRED)
+const collectingFact = computed(() => {
+  if (subscription.value) return stopped.value ? 'Stopped: not collecting' : 'Collecting'
+  return props.dataset.collecting === true ? 'A fetch is running' : null
+})
 const heldElsewhere = computed(() => props.dataset.owner !== OPERATOR_CLIENT_ID)
 const owner = computed(() => (props.dataset.owner === '' ? MISSING : props.dataset.owner))
 
@@ -97,10 +104,20 @@ const busy = computed(() => store.writing)
 const hasExpiry = computed(() => props.dataset.expiry !== undefined)
 
 // What the primary button does with the field as it stands.
-const applyLabel = computed(() => {
-  if (keepForever.value && hasExpiry.value) return titleCase(subscription.value ? 'Resume Subscription' : 'Set to Never')
-  return titleCase(subscription.value ? 'Retire Subscription' : 'Set Expiry')
-})
+const applyLabel = computed(() =>
+  titleCase(keepForever.value && hasExpiry.value ? 'Set to Never' : 'Set Expiry'),
+)
+// Expiry is the deletion date only; a subscription is stopped with Stop Collecting, not by an expiry.
+const expiryHint = computed(() =>
+  [
+    `The day starts at midnight in ${timeZone.value}.`,
+    'The dataset is deleted on that date.',
+    'Choosing Never keeps it.',
+    ...(subscription.value ? ['An expiry does not stop collection.'] : []),
+  ].join(' '),
+)
+const collectLabel = computed(() => titleCase(stopped.value ? 'Start Collecting' : 'Stop Collecting'))
+const canCollect = computed(() => !busy.value && overrideReady.value)
 const canApply = computed(
   () => !busy.value && !dayProblem.value && (keepForever.value ? hasExpiry.value : true) && overrideReady.value,
 )
@@ -134,6 +151,14 @@ async function apply(): Promise<void> {
   const expiry = typeof chosen === 'string' ? zonedDayStart(chosen, timeZone.value) : undefined
   if (settle(await store.setExpiry(expiry, override()))) {
     expiryText.value = ''
+    reason.value = ''
+    confirmed.value = false
+  }
+}
+
+async function toggleCollecting(): Promise<void> {
+  if (!canCollect.value) return
+  if (settle(await store.setCollecting(stopped.value, override()))) {
     reason.value = ''
     confirmed.value = false
   }
@@ -198,15 +223,15 @@ watch(
         </dd>
       </div>
       <div>
-        <dt>{{ titleCase('Expiry') }}</dt>
+        <dt>{{ titleCase('Deleted on') }}</dt>
         <dd data-fact="expiry">
           {{ currentExpiry }}
         </dd>
       </div>
-      <div v-if="retired">
-        <dt>{{ titleCase('State') }}</dt>
-        <dd data-fact="state">
-          Retired: no longer collecting
+      <div v-if="collectingFact !== null">
+        <dt>{{ titleCase('Collecting') }}</dt>
+        <dd data-fact="collecting">
+          {{ collectingFact }}
         </dd>
       </div>
     </dl>
@@ -229,7 +254,7 @@ watch(
       <label
         class="field__label"
         for="retention-expiry"
-      >{{ titleCase('Expiry Time') }}</label>
+      >{{ titleCase('Deleted on') }}</label>
       <div class="field__row">
         <input
           id="retention-expiry"
@@ -268,15 +293,11 @@ watch(
       >
         Type the day as YYYY/MM/DD, or choose Never to keep the dataset forever.
       </p>
-      <p class="hint">
-        The day starts at midnight in {{ timeZone }}.
-        <template v-if="subscription">
-          Setting an expiry retires this subscription at once: it stops updating, stays readable, and is
-          deleted on that date. Choosing Never before then resumes it.
-        </template>
-        <template v-else>
-          The dataset is deleted on that date. Choosing Never keeps it.
-        </template>
+      <p
+        class="hint"
+        data-testid="expiry-hint"
+      >
+        {{ expiryHint }}
       </p>
     </div>
 
@@ -317,6 +338,16 @@ watch(
         @click="apply"
       >
         {{ applyLabel }}
+      </button>
+      <button
+        v-if="subscription"
+        type="button"
+        class="btn"
+        :disabled="!canCollect"
+        data-testid="collecting-toggle"
+        @click="toggleCollecting"
+      >
+        {{ collectLabel }}
       </button>
       <button
         v-if="!deleting"

@@ -409,14 +409,27 @@ describe('Set Expiry dialog', () => {
   it.each([
     ['DAILY', UpdateType.DAILY],
     ['STREAM', UpdateType.STREAM],
-  ])('%s is a subscription: the explanation says it retires at once and Never on its page resumes it', async (_name, updateType) => {
+  ])('%s is a subscription: the explanation is the same deletion wording, with no retire or resume', async (_name, updateType) => {
+    // tj-grna9p.177 (decision tj-hhy3dk): expiry is the deletion date only, for every update type.
     mocks.getStaleDatasets.mockResolvedValue(stalePage([row('ds-s', 'XEQT', { updateType })]))
     const shell = await evening()
     await open(shell, 'ds-s')
     expect(explanation(shell)).toBe(
-      'Set an expiry for XEQT 1d. This retires the subscription at once: it stops updating, stays readable, and is deleted on that date. ' +
-        "Choosing Never on the dataset's page before then resumes it.",
+      "Set an expiry for XEQT 1d. The dataset is deleted on that date. Choosing Never on the dataset's page keeps it.",
     )
+    expect(dialog(shell).text()).not.toMatch(/retire|resume/i)
+  })
+
+  // The architect's .144 nit: no double space anywhere in the rendered explanation, raw, before any collapsing.
+  it.each([
+    ['STATIC', UpdateType.STATIC],
+    ['DAILY', UpdateType.DAILY],
+  ])('%s: the raw explanation has no run of two spaces and no line break left in it', async (_name, updateType) => {
+    mocks.getStaleDatasets.mockResolvedValue(stalePage([row('ds-s', 'XEQT', { updateType })]))
+    const shell = await evening()
+    await open(shell, 'ds-s')
+    const raw = (dialog(shell).find('p.text').element.textContent ?? '').trim()
+    expect(raw).toBe("Set an expiry for XEQT 1d. The dataset is deleted on that date. Choosing Never on the dataset's page keeps it.")
   })
 
   it('Set Expiry waits for a real day, saying so by aria-describedby', async () => {

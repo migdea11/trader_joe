@@ -332,6 +332,22 @@ describe('filters', () => {
     expect(Object.keys(router.currentRoute.value.query).filter((k) => k !== 'group')).toEqual(['running'])
   })
 
+  // tj-grna9p.177 (decision tj-hhy3dk): the RETIRED group reads Stopped (collect off). The query value,
+  // the data-status hook and the API status stay 'retired'.
+  it('the retired filter option reads Stopped, its count beside it; the query value stays retired', async () => {
+    const shell = await screenAt('/data/datasets')
+    const option = shell.find('[data-status="retired"]')
+    expect(option.find('.side-count').text()).toBe('0')
+    expect(option.text().replace(option.find('.side-count').text(), '').trim()).toBe('Stopped')
+    const group = shell.findAll('fieldset').find((f) => f.find('legend').text() === titleCase('Status'))!
+    expect(group.text()).not.toMatch(/Retire/)
+    await option.find('input').trigger('change')
+    await flushPromises()
+    expect(router.currentRoute.value.query.status).toBe('retired')
+    await getRows(latest(), 0)
+    expect(listArgs()).toMatchObject({ status: 'retired' })
+  })
+
   it('ticking Running writes ?running=true, keeps the status, and sends running to the list and the counts', async () => {
     const shell = await screenAt('/data/datasets?status=late')
     const before = grid.datasources.length
@@ -535,6 +551,17 @@ describe('rows', () => {
     expect(cell({ freshness: { status: FreshnessStatus.GAPS }, lastRun: { state: IngestRunState.RUNNING } })).toBe('Running')
     expect(cell({ freshness: { status: FreshnessStatus.LATE }, lastRun: { state: IngestRunState.SUCCEEDED } })).toBe('Late')
     expect(cell({ freshness: { status: FreshnessStatus.FRESH } })).toBe('Healthy')
+    // tj-grna9p.177: a subscription with collect off (RETIRED) reads Stopped in the grid.
+    expect(cell({ freshness: { status: FreshnessStatus.RETIRED } })).toBe('Stopped')
+  })
+
+  it('a stopped row with an expiry: the Status cell reads Stopped and the Expires cell its date', () => {
+    const data = row('st', 'ST', { freshness: { status: FreshnessStatus.RETIRED }, expiry: timestampFromMs(EXPIRY) })
+    expect(mount(StatusCell, { props: { params: { data } as never } }).text()).toBe('Stopped')
+    const pinia = createPinia()
+    setActivePinia(pinia)
+    useSettingsStore().setTimeZoneOverride('America/Toronto')
+    expect(mount(ExpiresCell, { props: { params: { data } as never }, global: { plugins: [pinia] } }).text()).toBe('2026/12/31')
   })
 
   it('the Status cell shows Unknown for a row with no health, and nothing for a row still loading', () => {
@@ -1391,6 +1418,23 @@ describe('live refresh', () => {
     await flushPromises()
     expect(grid.refreshes).toBe(2)
     expect(mocks.getDatasetFacets.mock.calls.length - facetCalls).toBe(2 * oneReload)
+  })
+
+  // tj-grna9p.189: a Stop or Start publishes RETIRED or RESUMED instead of UPDATED (the tj-hhy3dk addendum). Each
+  // must reload the counts, the rows and that dataset's strip as UPDATED does, or the row's State goes stale.
+  it.each([
+    ['UPDATED', DatasetChange.UPDATED],
+    ['RETIRED', DatasetChange.RETIRED],
+    ['RESUMED', DatasetChange.RESUMED],
+  ])('a %s DatasetChanged reloads the counts, the rows and that strip once', async (_name, change) => {
+    const { facetCalls } = await liveScreen()
+    fakeEvents.emit({ event: { case: 'datasetChanged', value: { id: 'a', change } } })
+    vi.advanceTimersByTime(COALESCE_MS)
+    await flushPromises()
+    expect(grid.refreshes).toBe(1)
+    expect(mocks.getDatasetFacets.mock.calls.length).toBeGreaterThan(facetCalls)
+    await getRows(latest(), 0)
+    expect(coverageIds()).toEqual(['a'])
   })
 
   it('a steady trickle cannot postpone the reload: the window closes COALESCE_MS after its FIRST event', async () => {

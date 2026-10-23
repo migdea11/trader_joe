@@ -56,6 +56,7 @@ const mocks = vi.hoisted(() => ({
   getDatasetBars: vi.fn(),
   getReadsPerDay: vi.fn(),
   setDatasetExpiry: vi.fn(),
+  setDatasetCollecting: vi.fn(),
   deleteDataset: vi.fn(),
 }))
 vi.mock('@/api', async (importOriginal) => ({
@@ -170,6 +171,16 @@ beforeEach(() => {
   mocks.getReadsPerDay.mockResolvedValue(create(ReadsPerDaySchema, {}))
   mocks.setDatasetExpiry.mockImplementation((_id: string, params: { expiry?: Date }) =>
     Promise.resolve(dataset({ expiry: params.expiry === undefined ? undefined : timestampFromMs(params.expiry.getTime()) })),
+  )
+  // The collecting PATCH answers the dataset with the collect intent it was sent (RETIRED when off).
+  mocks.setDatasetCollecting.mockImplementation((_id: string, params: { collect: boolean }) =>
+    Promise.resolve(
+      dataset({
+        updateType: UpdateType.DAILY,
+        collecting: params.collect,
+        state: params.collect ? DatasetState.ACTIVE : DatasetState.RETIRED,
+      }),
+    ),
   )
   mocks.deleteDataset.mockResolvedValue(undefined)
 })
@@ -587,12 +598,14 @@ describe('retention: the card', () => {
   })
 
   // tj-grna9p.142: an unset expiry is the explicit Never (the server stores null), never 'None'.
-  it('no expiry reads Never; a retired dataset says it no longer collects', async () => {
-    mocks.getDataset.mockResolvedValue(dataset({ expiry: undefined, state: DatasetState.RETIRED }))
+  // tj-grna9p.177 (decision tj-hhy3dk): RETIRED is collect off, shown as the Collecting fact, Stopped.
+  it('no expiry reads Never; a stopped (RETIRED) subscription says it is not collecting', async () => {
+    mocks.getDataset.mockResolvedValue(dataset({ updateType: UpdateType.DAILY, expiry: undefined, state: DatasetState.RETIRED }))
     const shell = await detailAt()
     expect(shell.find('[data-fact="expiry"]').text()).toBe('Never')
     expect(shell.find('[data-fact="expiry-type"]').text()).toBe('Rolling')
-    expect(shell.find('#detail-retention').text()).toContain('Retired: no longer collecting')
+    expect(shell.find('#detail-retention [data-fact="collecting"]').text()).toBe('Stopped: not collecting')
+    expect(shell.find('#detail-retention').text()).not.toMatch(/retire|resume/i)
   })
 
   it.each([
@@ -605,12 +618,14 @@ describe('retention: the card', () => {
     expect(shell.find('[data-fact="expiry"]').text()).toBe('Never')
   })
 
-  it('the Expiry Time field is empty for Never, labelled, with Tomorrow and Never', async () => {
+  it('the Deleted On field is empty for Never, labelled, with Tomorrow and Never; the meta row says Deleted On too', async () => {
     const shell = await detailAt()
     const input = shell.find('[data-testid="expiry-input"]')
     expect((input.element as HTMLInputElement).value).toBe('')
     expect(input.attributes('placeholder')).toBe('Never')
-    expect(shell.find(`label[for="${input.attributes('id')}"]`).text()).toBe('Expiry Time')
+    expect(shell.find(`label[for="${input.attributes('id')}"]`).text()).toBe('Deleted On')
+    expect(shell.find('[data-fact="expiry"]').element.parentElement!.querySelector('dt')!.textContent!.trim()).toBe('Deleted On')
+    expect(shell.find('#detail-retention').text()).not.toContain('Expiry Time')
     expect(shell.find('[data-testid="expiry-tomorrow"]').text()).toBe('Tomorrow')
     expect(shell.find('[data-testid="expiry-clear"]').text()).toBe('Never')
   })
@@ -629,15 +644,39 @@ describe('retention: the card', () => {
   it.each([
     ['DAILY', UpdateType.DAILY],
     ['STREAM', UpdateType.STREAM],
-  ])('%s is a subscription: Retire Subscription, and the retire and resume explanation', async (_name, updateType) => {
-    mocks.getDataset.mockResolvedValue(dataset({ updateType }))
+  ])('%s is a subscription: Set Expiry, Stop Collecting, and the deletion-only explanation', async (_name, updateType) => {
+    // tj-grna9p.177 (decision tj-hhy3dk): expiry deletes; collection is the Start/Stop Collecting switch.
+    mocks.getDataset.mockResolvedValue(dataset({ updateType, collecting: true }))
     const shell = await detailAt()
-    expect(shell.find('[data-testid="expiry-apply"]').text()).toBe('Retire Subscription')
-    expect(shell.find('#detail-retention').text()).toContain(
-      'Setting an expiry retires this subscription at once: it stops updating, stays readable, and is deleted on that date. Choosing Never before then resumes it.',
+    expect(shell.find('[data-testid="expiry-apply"]').text()).toBe('Set Expiry')
+    expect(shell.find('[data-testid="collecting-toggle"]').text()).toBe('Stop Collecting')
+    expect(shell.find('[data-fact="collecting"]').text()).toBe('Collecting')
+    // The display zone is America/Toronto (the beforeEach).
+    expect(shell.find('[data-testid="expiry-hint"]').text()).toBe(
+      'The day starts at midnight in America/Toronto. The dataset is deleted on that date. Choosing Never keeps it. An expiry does not stop collection.',
     )
     expect(shell.find('#detail-retention').text()).not.toContain('Clearing the expiry')
-    expect(shell.find('#detail-retention').text()).not.toContain('Choosing Never keeps it.')
+    expect(shell.find('#detail-retention').text()).not.toMatch(/retire|resume/i)
+  })
+
+  it('STATIC: no collect control; the fact shows only while a fetch is running', async () => {
+    mocks.getDataset.mockResolvedValue(dataset({ collecting: true }))
+    const shell = await detailAt()
+    expect(shell.find('[data-testid="collecting-toggle"]').exists()).toBe(false)
+    expect(shell.find('[data-fact="collecting"]').text()).toBe('A fetch is running')
+    expect(shell.find('[data-testid="expiry-hint"]').text()).toBe(
+      'The day starts at midnight in America/Toronto. The dataset is deleted on that date. Choosing Never keeps it.',
+    )
+  })
+
+  it('a stopped subscription with an expiry shows both: Stopped, and Deleted On with its date', async () => {
+    mocks.getDataset.mockResolvedValue(
+      dataset({ updateType: UpdateType.STREAM, state: DatasetState.RETIRED, collecting: false, expiry: timestampFromMs(Date.UTC(2027, 0, 1, 17)) }),
+    )
+    const shell = await detailAt()
+    expect(shell.find('[data-fact="collecting"]').text()).toBe('Stopped: not collecting')
+    expect(shell.find('[data-fact="expiry"]').text()).toBe('2027/01/01 12:00')
+    expect(shell.find('[data-testid="collecting-toggle"]').text()).toBe('Start Collecting')
   })
 })
 
@@ -728,18 +767,102 @@ describe('retention: writes', () => {
   it.each([
     ['DAILY', UpdateType.DAILY],
     ['STREAM', UpdateType.STREAM],
-  ])('%s with a stored expiry: Never then the apply reads Resume Subscription, not Set to Never', async (_name, updateType) => {
+  // tj-grna9p.177 (decision tj-hhy3dk): the apply is Set Expiry / Set to Never for every update type.
+  ])('%s with a stored expiry: Never then the apply reads Set to Never, never Resume Subscription', async (_name, updateType) => {
     const shell = await at(EVENING, dataset({ updateType, state: DatasetState.RETIRED, expiry: timestampFromMs(OCT_16_TORONTO) }))
     await input(shell).setValue('2027/03/04')
+    expect(apply(shell).text()).toBe('Set Expiry')
     await click(shell, 'expiry-clear')
-    expect(apply(shell).text()).toBe('Resume Subscription')
+    expect(apply(shell).text()).toBe('Set to Never')
   })
 
-  it('a retired subscription with an expiry: the empty field reads Resume Subscription and sends the clear', async () => {
+  it('a stopped subscription with an expiry: the empty field reads Set to Never and sends only the clear', async () => {
     const shell = await at(EVENING, dataset({ updateType: UpdateType.DAILY, state: DatasetState.RETIRED, expiry: timestampFromMs(OCT_16_TORONTO) }))
-    expect(apply(shell).text()).toBe('Resume Subscription')
+    expect(apply(shell).text()).toBe('Set to Never')
     await click(shell, 'expiry-apply')
     expect(mocks.setDatasetExpiry.mock.calls[0]![1]).toEqual({ expiry: undefined, override: undefined })
+    // Clearing the deletion date resumes nothing: no collecting write is sent.
+    expect(mocks.setDatasetCollecting).not.toHaveBeenCalled()
+  })
+
+  describe('Start and Stop Collecting', () => {
+    const sub = (extra: MessageInitShape<typeof DatasetSummarySchema> = {}) =>
+      dataset({ updateType: UpdateType.DAILY, collecting: true, state: DatasetState.ACTIVE, ...extra })
+    const toggle = (shell: VueWrapper) => shell.find('[data-testid="collecting-toggle"]')
+
+    it('Stop Collecting sends collect false and no override; the card re-renders Stopped from the answer', async () => {
+      const shell = await at(EVENING, sub({ expiry: timestampFromMs(OCT_16_TORONTO) }))
+      await click(shell, 'collecting-toggle')
+      expect(mocks.setDatasetCollecting).toHaveBeenCalledTimes(1)
+      expect(mocks.setDatasetCollecting).toHaveBeenCalledWith('ds-1', { collect: false, override: undefined })
+      expect(mocks.setDatasetExpiry).not.toHaveBeenCalled()
+      expect(shell.find('[data-fact="collecting"]').text()).toBe('Stopped: not collecting')
+      expect(toggle(shell).text()).toBe('Start Collecting')
+      expect(notice(shell).exists()).toBe(false)
+    })
+
+    it('Start Collecting sends collect true; the card re-renders Collecting', async () => {
+      const shell = await at(EVENING, sub({ collecting: false, state: DatasetState.RETIRED }))
+      expect(toggle(shell).text()).toBe('Start Collecting')
+      await click(shell, 'collecting-toggle')
+      expect(mocks.setDatasetCollecting).toHaveBeenCalledWith('ds-1', { collect: true, override: undefined })
+      expect(shell.find('[data-fact="collecting"]').text()).toBe('Collecting')
+      expect(toggle(shell).text()).toBe('Stop Collecting')
+    })
+
+    it('another owner: disabled until reason and confirmation, then the trimmed override is sent', async () => {
+      mocks.setDatasetCollecting.mockResolvedValueOnce(sub({ owner: 'bot-7', collecting: false, state: DatasetState.RETIRED }))
+      const shell = await at(EVENING, sub({ owner: 'bot-7' }))
+      expect(toggle(shell).attributes('disabled')).toBeDefined()
+      await click(shell, 'collecting-toggle')
+      expect(mocks.setDatasetCollecting).not.toHaveBeenCalled()
+      await shell.find('[data-testid="override-reason"]').setValue('  owner asked  ')
+      await shell.find('[data-testid="override-confirm"]').setValue(true)
+      await click(shell, 'collecting-toggle')
+      expect(mocks.setDatasetCollecting).toHaveBeenCalledWith('ds-1', { collect: false, override: { reason: 'owner asked', confirmed: true } })
+      expect((shell.find('[data-testid="override-reason"]').element as HTMLTextAreaElement).value).toBe('')
+    })
+
+    it('409 OVERRIDE_REQUIRED on the operator own dataset: the refetch brings the owner, then a confirmed override goes through', async () => {
+      const shell = await at(EVENING, sub())
+      mocks.setDatasetCollecting.mockRejectedValueOnce(new ApiError({ status: 409, reason: 'OVERRIDE_REQUIRED' }))
+      mocks.getDataset.mockResolvedValue(sub({ owner: 'bot-7' }))
+      const before = mocks.getDataset.mock.calls.length
+      await click(shell, 'collecting-toggle')
+      expect(notice(shell).text()).toBe('This dataset is held by another owner. Give a reason and confirm to continue.')
+      expect(mocks.getDataset.mock.calls.length).toBe(before + 1)
+      expect(shell.find('[data-testid="override-warning"]').text()).toContain('Held by bot-7.')
+      expect(toggle(shell).attributes('disabled')).toBeDefined()
+      expect(shell.find('[data-fact="collecting"]').text()).toBe('Collecting')
+      // The confirmed retry carries the override; the first attempt carried none.
+      mocks.setDatasetCollecting.mockResolvedValueOnce(sub({ owner: 'bot-7', collecting: false, state: DatasetState.RETIRED }))
+      await shell.find('[data-testid="override-reason"]').setValue('handover')
+      await shell.find('[data-testid="override-confirm"]').setValue(true)
+      await click(shell, 'collecting-toggle')
+      expect(mocks.setDatasetCollecting.mock.calls.map((c) => c[1])).toEqual([
+        { collect: false, override: undefined },
+        { collect: false, override: { reason: 'handover', confirmed: true } },
+      ])
+      expect(shell.find('[data-fact="collecting"]').text()).toBe('Stopped: not collecting')
+      expect(notice(shell).exists()).toBe(false)
+    })
+
+    it('a 422 surfaces as a bug with its error id, and nothing changes', async () => {
+      const shell = await at(EVENING, sub())
+      mocks.setDatasetCollecting.mockRejectedValueOnce(new ApiError({ status: 422, reason: 'INVALID_REQUEST', errorId: 'e-422' }))
+      await click(shell, 'collecting-toggle')
+      expect(notice(shell).text()).toContain('This is a bug in the UI; nothing was changed.')
+      expect(notice(shell).text()).toContain('Error ID: e-422')
+      expect(shell.find('[data-fact="collecting"]').text()).toBe('Collecting')
+      expect(toggle(shell).text()).toBe('Stop Collecting')
+    })
+
+    it('404 on the collecting write: the screen shows the deleted state', async () => {
+      const shell = await at(EVENING, sub())
+      mocks.setDatasetCollecting.mockRejectedValueOnce(new ApiError({ status: 404, reason: 'NOT_FOUND' }))
+      await click(shell, 'collecting-toggle')
+      expect(shell.find('[data-testid="detail-deleted"]').text()).toContain('This dataset was deleted.')
+    })
   })
 
   it('a typed day that is not a real YYYY/MM/DD says so, marks the field invalid and sends nothing', async () => {
@@ -1381,6 +1504,22 @@ describe('live updates', () => {
     vi.advanceTimersByTime(COALESCE_MS * 10)
     await flushPromises()
     expect(mocks.getDataset).toHaveBeenCalledTimes(1)
+  })
+
+  // tj-grna9p.189: a Stop or Start publishes RETIRED or RESUMED instead of UPDATED (the tj-hhy3dk addendum). Each
+  // must reload the overview and the strip as UPDATED does, or the State and Collecting shown go stale.
+  it.each([
+    ['UPDATED', DatasetChange.UPDATED],
+    ['RETIRED', DatasetChange.RETIRED],
+    ['RESUMED', DatasetChange.RESUMED],
+  ])('a %s DatasetChanged for this id refetches the overview and the coverage once', async (_name, change) => {
+    const shell = await liveDetail()
+    datasetEvent('ds-1', change)
+    vi.advanceTimersByTime(COALESCE_MS)
+    await flushPromises()
+    expect(mocks.getDataset).toHaveBeenCalledTimes(1)
+    expect(mocks.getDatasetCoverage).toHaveBeenCalledTimes(1)
+    expect(shell.find('[data-testid="detail-deleted"]').exists()).toBe(false)
   })
 
   it('the refetch is soft: the overview and the strip stay on screen while it is in flight', async () => {

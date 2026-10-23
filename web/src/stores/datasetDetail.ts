@@ -20,6 +20,7 @@ import {
   getDataset,
   getDatasetRuns,
   getReadsPerDay,
+  setDatasetCollecting,
   setDatasetExpiry,
 } from '@/api'
 import type { OperatorOverride } from '@/api'
@@ -201,39 +202,51 @@ export const useDatasetDetailStore = defineStore('datasetDetail', () => {
     await Promise.all([fetchDataset(currentId, true), fetchReads(currentId)])
   }
 
-  /**
-   * Set the expiry (clear it when `expiry` is undefined). On 200 the card re-renders from the
-   * dataset the server answers with. `override` is sent only for another owner's dataset, and never
-   * for the operator's own.
-   */
-  async function setExpiry(expiry: Date | undefined, override?: OperatorOverride): Promise<WriteOutcome> {
+  /** The answer of a write replaces the dataset; under another Read By choice the held usage stays. */
+  function adopt(result: DatasetSummary): void {
+    // The answer's usage is counted for the default (SDK) filter. Under another Read By choice the
+    // answer's retention facts are kept and the usage held for that choice stays.
+    const kinds = clientKinds.value
+    const isDefault = kinds.length === DEFAULT_CLIENT_KINDS.length && kinds.every((k) => DEFAULT_CLIENT_KINDS.includes(k))
+    if (isDefault || dataset.value === null) {
+      dataset.value = result
+    } else {
+      const merged = clone(DatasetSummarySchema, result)
+      merged.usage = dataset.value.usage
+      dataset.value = merged
+    }
+  }
+
+  /** One dataset write: the guards, the stale-answer drop and the busy flag, shared by the two PATCHes. */
+  async function patchDataset(send: (id: string, override: OperatorOverride | undefined) => Promise<DatasetSummary>, override?: OperatorOverride): Promise<WriteOutcome> {
     if (currentId === '' || dataset.value === null || writing.value) return { kind: 'error', error: describeError(null) }
     const id = currentId
     const started = generation
     writing.value = true
     try {
-      const result = await setDatasetExpiry(id, {
-        expiry,
-        override: dataset.value.owner === OPERATOR_CLIENT_ID ? undefined : override,
-      })
+      const result = await send(id, dataset.value.owner === OPERATOR_CLIENT_ID ? undefined : override)
       if (generation !== started || currentId !== id) return { kind: 'stale' }
-      // The answer's usage is counted for the default (SDK) filter. Under another Read By choice the
-      // answer's retention facts are kept and the usage held for that choice stays.
-      const kinds = clientKinds.value
-      const isDefault = kinds.length === DEFAULT_CLIENT_KINDS.length && kinds.every((k) => DEFAULT_CLIENT_KINDS.includes(k))
-      if (isDefault || dataset.value === null) {
-        dataset.value = result
-      } else {
-        const merged = clone(DatasetSummarySchema, result)
-        merged.usage = dataset.value.usage
-        dataset.value = merged
-      }
+      adopt(result)
       return { kind: 'ok' }
     } catch (caught) {
       return generation !== started || currentId !== id ? { kind: 'stale' } : writeOutcome(caught)
     } finally {
       writing.value = false
     }
+  }
+
+  /**
+   * Set the expiry, the deletion date (clear it when `expiry` is undefined). On 200 the card re-renders
+   * from the dataset the server answers with. `override` is sent only for another owner's dataset, and
+   * never for the operator's own.
+   */
+  function setExpiry(expiry: Date | undefined, override?: OperatorOverride): Promise<WriteOutcome> {
+    return patchDataset((id, held) => setDatasetExpiry(id, { expiry, override: held }), override)
+  }
+
+  /** Start or stop collecting a subscription. The override rule is the expiry write's. */
+  function setCollecting(collect: boolean, override?: OperatorOverride): Promise<WriteOutcome> {
+    return patchDataset((id, held) => setDatasetCollecting(id, { collect, override: held }), override)
   }
 
   /** Delete the dataset. On 204 the caller leaves the screen; a refusal leaves everything as it was. */
@@ -388,6 +401,7 @@ export const useDatasetDetailStore = defineStore('datasetDetail', () => {
     load,
     setClientKinds,
     setExpiry,
+    setCollecting,
     deleteNow,
     reload,
     refresh,

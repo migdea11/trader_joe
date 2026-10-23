@@ -169,6 +169,24 @@ export function setDatasetExpiry(
   })
 }
 
+/**
+ * PATCH /ui/v1/datasets/{id}/collecting: turn a subscription's (DAILY or STREAM) collection on or off.
+ * Answers the updated dataset. `collect` is always sent, true or false: the server refuses a body without
+ * the key, and a false must not be dropped. `override` as for the expiry write.
+ */
+export function setDatasetCollecting(
+  id: string,
+  params: { collect: boolean; override?: OperatorOverride; signal?: AbortSignal },
+): Promise<DatasetSummary> {
+  return patchMessage(DatasetSummarySchema, `/ui/v1/datasets/${encodeURIComponent(id)}/collecting`, {
+    body: {
+      collect: params.collect,
+      ...(params.override === undefined ? {} : { override: params.override }),
+    },
+    signal: params.signal,
+  })
+}
+
 /** DELETE /ui/v1/datasets/{id}: delete the dataset and its bars. `override` as for the expiry write. */
 export function deleteDataset(id: string, params: { override?: OperatorOverride; signal?: AbortSignal } = {}): Promise<void> {
   return deleteRequest(`/ui/v1/datasets/${encodeURIComponent(id)}`, {

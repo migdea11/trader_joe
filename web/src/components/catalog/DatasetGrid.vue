@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // The catalog grid (tj-grna9p.32, ADR tj-grna9p.2): AG Grid Community, infinite row model over the
 // keyset-paged /ui/v1/datasets (catalog/cursorDatasource.ts). Columns: Symbol, Source and Feed,
-// Gran., Update, Status (Running, Healthy, Late, Failed, Retired), Coverage (a lazily fetched
+// Gran., Update, Status (Running, Healthy, Late, Failed, Stopped), Coverage (a lazily fetched
 // strip, CoverageCell.vue), Usage (UsageCell.vue), Expires (ExpiresCell.vue, with the reaper flag). A new datasource (so an empty block cache and no cursor) is made
 // when the filters change or the store's refreshKey is bumped; the old one aborts its requests. A
 // live event bumps liveKey instead: the same datasource forgets its pages and the grid reloads the

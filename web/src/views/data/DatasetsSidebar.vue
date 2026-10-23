@@ -56,7 +56,7 @@ const STATUS_LABELS: Record<StatusGroup, string> = {
   healthy: 'Healthy',
   late: 'Late',
   failed: 'Failed',
-  retired: 'Retired',
+  retired: 'Stopped',
 }
 
 function viewCount(view: ViewEntry['view']): number | null {

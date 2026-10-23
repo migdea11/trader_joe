@@ -264,7 +264,8 @@ describe('row labels and badge', () => {
     [FreshnessStatus.LATE, 'Late'],
     [FreshnessStatus.OVERDUE, 'Failed'],
     [FreshnessStatus.GAPS, 'Failed'],
-    [FreshnessStatus.RETIRED, 'Retired'],
+    // tj-grna9p.177 (decision tj-hhy3dk): RETIRED is collect off, and the UI reads it Stopped.
+    [FreshnessStatus.RETIRED, 'Stopped'],
     [FreshnessStatus.UNSPECIFIED, 'Unknown'],
   ])('freshness %s renders %s', (status, label) => {
     expect(rowBadge(create(DatasetSummarySchema, { freshness: { status } })).label).toBe(label)

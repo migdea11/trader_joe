@@ -26,6 +26,7 @@ const mocks = vi.hoisted(() => ({
   getDatasetRuns: vi.fn(),
   getReadsPerDay: vi.fn(),
   setDatasetExpiry: vi.fn(),
+  setDatasetCollecting: vi.fn(),
   deleteDataset: vi.fn(),
 }))
 vi.mock('@/api', async (importOriginal) => ({
@@ -48,6 +49,7 @@ function run(id: string, minutes: number, extra: MessageInitShape<typeof IngestR
 const DATASET = create(DatasetSummarySchema, { id: 'ds-1', assetSymbol: 'VFV', owner: 'operator' })
 const HELD = create(DatasetSummarySchema, { id: 'ds-1', assetSymbol: 'VFV', owner: 'bot-7' })
 const UPDATED = create(DatasetSummarySchema, { id: 'ds-1', assetSymbol: 'VFV', owner: 'operator', expiry: timestampFromMs(T0) })
+const STOPPED = create(DatasetSummarySchema, { id: 'ds-1', assetSymbol: 'VFV', owner: 'operator', collecting: false })
 const READS = create(ReadsPerDaySchema, { days: [{ day: '2026-10-12', clientId: 'bot-1', reads: 3n }] })
 const OVERRIDE = { reason: 'cleanup', confirmed: true } as const
 const page = (items: IngestRun[], nextCursor = '') => create(IngestRunPageSchema, { items, nextCursor })
@@ -60,6 +62,7 @@ beforeEach(() => {
   mocks.getDatasetRuns.mockResolvedValue(page([run('r2', 2), run('r1', 1)]))
   mocks.getReadsPerDay.mockResolvedValue(READS)
   mocks.setDatasetExpiry.mockResolvedValue(UPDATED)
+  mocks.setDatasetCollecting.mockResolvedValue(STOPPED)
   mocks.deleteDataset.mockResolvedValue(undefined)
 })
 
@@ -565,5 +568,110 @@ describe('setExpiry and deleteNow', () => {
     expect((await store.deleteNow()).kind).toBe('error')
     expect(mocks.setDatasetExpiry).not.toHaveBeenCalled()
     expect(mocks.deleteDataset).not.toHaveBeenCalled()
+  })
+})
+
+// tj-grna9p.177: setCollecting shares setExpiry's one patchDataset guard: the override rule, the one-write
+// lock, the stale drop and the adoption of the 200 answer.
+describe('setCollecting', () => {
+  async function loaded(dataset = DATASET) {
+    mocks.getDataset.mockResolvedValue(dataset)
+    const store = useDatasetDetailStore()
+    await store.load('ds-1')
+    return store
+  }
+
+  it.each([
+    ['stop', false],
+    ['start', true],
+  ])('%s: sends collect %s and re-renders from the dataset the 200 answers', async (_name, collect) => {
+    const store = await loaded()
+    const answer = create(DatasetSummarySchema, { id: 'ds-1', assetSymbol: 'VFV', owner: 'operator', collecting: collect })
+    mocks.setDatasetCollecting.mockResolvedValueOnce(answer)
+    expect(await store.setCollecting(collect)).toEqual({ kind: 'ok' })
+    expect(mocks.setDatasetCollecting).toHaveBeenCalledWith('ds-1', { collect, override: undefined })
+    expect(store.dataset).toBe(answer)
+    expect(store.dataset?.collecting).toBe(collect)
+    expect(mocks.setDatasetExpiry).not.toHaveBeenCalled()
+    expect(store.writing).toBe(false)
+  })
+
+  it('NEVER sends an override for the operator own dataset; sends it for another owner', async () => {
+    const own = await loaded()
+    await own.setCollecting(false, OVERRIDE)
+    expect(mocks.setDatasetCollecting.mock.calls[0]![1]).toEqual({ collect: false, override: undefined })
+    setActivePinia(createPinia())
+    const held = await loaded(HELD)
+    mocks.setDatasetCollecting.mockResolvedValueOnce(HELD)
+    await held.setCollecting(true, OVERRIDE)
+    expect(mocks.setDatasetCollecting.mock.calls[1]![1]).toEqual({ collect: true, override: OVERRIDE })
+  })
+
+  it.each([
+    ['409 OVERRIDE_REQUIRED', new ApiError({ status: 409, reason: 'OVERRIDE_REQUIRED' }), 'override-required'],
+    ['422', new ApiError({ status: 422, reason: 'INVALID_REQUEST', errorId: 'e-422' }), 'invalid'],
+    ['404', new ApiError({ status: 404, reason: 'NOT_FOUND' }), 'not-found'],
+    ['503 DATABASE_UNAVAILABLE', new ApiError({ status: 503, reason: 'DATABASE_UNAVAILABLE' }), 'unavailable'],
+  ])('a refusal (%s) is its outcome, and the dataset stays as it was', async (_name, error, kind) => {
+    const store = await loaded()
+    mocks.setDatasetCollecting.mockRejectedValueOnce(error)
+    expect((await store.setCollecting(false)).kind).toBe(kind)
+    expect(store.dataset).toBe(DATASET)
+    expect(store.writing).toBe(false)
+  })
+
+  it('a 422 carries the error id to quote', async () => {
+    const store = await loaded()
+    mocks.setDatasetCollecting.mockRejectedValueOnce(new ApiError({ status: 422, reason: 'INVALID_REQUEST', errorId: 'e-422' }))
+    expect(await store.setCollecting(true)).toEqual({ kind: 'invalid', error: { message: 'Request failed (HTTP 422)', errorId: 'e-422' } })
+  })
+
+  it('one write at a time, across both PATCHes: a collect write in flight refuses an expiry write and itself', async () => {
+    const store = await loaded()
+    let answer: (value: unknown) => void = () => undefined
+    mocks.setDatasetCollecting.mockImplementationOnce(() => new Promise((resolve) => (answer = resolve)))
+    const first = store.setCollecting(false)
+    expect(store.writing).toBe(true)
+    expect((await store.setExpiry(undefined)).kind).toBe('error')
+    expect((await store.setCollecting(true)).kind).toBe('error')
+    expect(mocks.setDatasetExpiry).not.toHaveBeenCalled()
+    expect(mocks.setDatasetCollecting).toHaveBeenCalledTimes(1)
+    answer(STOPPED)
+    expect(await first).toEqual({ kind: 'ok' })
+    expect(store.dataset).toBe(STOPPED)
+  })
+
+  it('an answer for a dataset the page has left is stale and dropped', async () => {
+    const store = await loaded()
+    let answer: (value: unknown) => void = () => undefined
+    mocks.setDatasetCollecting.mockImplementationOnce(() => new Promise((resolve) => (answer = resolve)))
+    const pending = store.setCollecting(false)
+    const DS2 = create(DatasetSummarySchema, { id: 'ds-2', assetSymbol: 'XIU', owner: 'operator' })
+    mocks.getDataset.mockResolvedValue(DS2)
+    await store.load('ds-2')
+    answer(STOPPED)
+    expect(await pending).toEqual({ kind: 'stale' })
+    expect(store.dataset).toBe(DS2)
+  })
+
+  it('under a non-default Read By the held usage stays; collecting comes from the answer', async () => {
+    const HELD_USAGE = { lastReadAt: timestampFromMs(T0 - 86_400_000), readByClients30d: ['operator'] }
+    mocks.getDataset.mockResolvedValue(create(DatasetSummarySchema, { id: 'ds-1', owner: 'operator', usage: HELD_USAGE }))
+    const store = useDatasetDetailStore()
+    await store.load('ds-1')
+    await store.setClientKinds([ClientKind.UI])
+    const heldUsage = store.dataset!.usage
+    mocks.setDatasetCollecting.mockResolvedValueOnce(
+      create(DatasetSummarySchema, { id: 'ds-1', owner: 'operator', collecting: false, usage: { readByClients30d: ['bot-sdk'] } }),
+    )
+    await store.setCollecting(false)
+    expect(store.dataset!.usage).toBe(heldUsage)
+    expect(store.dataset!.collecting).toBe(false)
+  })
+
+  it('nothing loaded: refused and nothing is sent', async () => {
+    const store = useDatasetDetailStore()
+    expect((await store.setCollecting(false)).kind).toBe('error')
+    expect(mocks.setDatasetCollecting).not.toHaveBeenCalled()
   })
 })

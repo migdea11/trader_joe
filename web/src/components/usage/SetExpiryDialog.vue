@@ -12,7 +12,6 @@
 // Focus goes into the dialog on open; Escape and Cancel close it and the screen puts focus back on
 // the row's button. Tab stays inside while it is open.
 import { computed, nextTick, onMounted, ref } from 'vue'
-import { UpdateType } from '@generated/trader_joe/proto/market/v1/enums_pb'
 import type { DatasetSummary } from '@generated/trader_joe/proto/ui/v1/data_pb'
 
 import { OPERATOR_CLIENT_ID } from '@/api'
@@ -40,8 +39,6 @@ const { timeZone } = useFormatters()
 const name = computed(() => `${props.dataset.assetSymbol} ${granularityLabel(props.dataset.granularity)}`)
 const heldElsewhere = computed(() => props.dataset.owner !== OPERATOR_CLIENT_ID)
 const owner = computed(() => (props.dataset.owner === '' ? MISSING : props.dataset.owner))
-// A DAILY or STREAM dataset is a subscription: an expiry retires it. A bulk (STATIC) one just has a date.
-const subscription = computed(() => props.dataset.updateType !== UpdateType.STATIC)
 
 const dayText = ref('')
 // undefined: empty; null: not a day; string: the day (YYYY-MM-DD).
@@ -141,14 +138,8 @@ function onKeydown(event: KeyboardEvent): void {
         {{ titleCase('Set Expiry') }}: {{ name }}
       </h2>
       <p class="text">
-        Set an expiry for {{ name }}.
-        <template v-if="subscription">
-          This retires the subscription at once: it stops updating, stays readable, and is deleted on that
-          date. Choosing Never on the dataset's page before then resumes it.
-        </template>
-        <template v-else>
-          The dataset is deleted on that date. Choosing Never on the dataset's page keeps it.
-        </template>
+        Set an expiry for {{ name }}. The dataset is deleted on that date. Choosing Never on the dataset's page
+        keeps it.
       </p>
 
       <div

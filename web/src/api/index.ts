@@ -15,6 +15,7 @@ export {
   deleteDataset,
   listDatasets,
   listDatasetsRequest,
+  setDatasetCollecting,
   setDatasetExpiry,
 } from './datasets'
 export type {
