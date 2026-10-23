@@ -47,15 +47,14 @@ from data.store.app.database.crud.stock.dataset_catalog import (
 )
 from data.store.app.database.models.ingest_run import IngestRunState
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
-from data.store.app.freshness import (
+from data.store.app.health import (
     DatasetHealth,
     FreshnessStatus,
-    NaiveDatetimeError,
     bar_period_close,
     evaluate_dataset,
     last_bar_is_provisional,
-    session_of,
 )
+from data.store.app.trading_calendar import NaiveDatetimeError, session_of
 from data.store.tests import test_daily_refresh, test_ui_datasets_route
 from data.store.tests.test_daily_refresh import LAST_BAR, LAST_CLOSE, ScriptedClient, World, _add, _scheduled_run
 from data.store.tests.test_freshness_periods import (

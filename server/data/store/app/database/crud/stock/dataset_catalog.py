@@ -335,8 +335,8 @@ async def bar_extents(db: AsyncSession, rows: list[CatalogRow]) -> dict[uuid.UUI
 async def covered_dates(db: AsyncSession, rows: list[CatalogRow], tz_name: str) -> dict[uuid.UUID, frozenset[date]]:
     """For each entry, the set of calendar dates (in tz_name) on which it holds at least one bar.
 
-    This is the `covered` input of freshness.evaluate_dataset: a bar belongs to the session whose local date its
-    timestamp falls on (freshness.session_of), and Postgres computes that date in the calendar's own zone, so the
+    This is the `covered` input of health.evaluate_dataset: a bar belongs to the session whose local date its
+    timestamp falls on (trading_calendar.session_of), and Postgres computes that date in the calendar's own zone, so the
     two agree without shipping every timestamp to Python. One statement for however many entries.
 
     Args:

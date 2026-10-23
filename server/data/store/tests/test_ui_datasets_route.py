@@ -51,6 +51,7 @@ from common.database.sql_alchemy_nullable_datetime import NullableDateTime
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from data.store.app import dataset_catalog as dataset_catalog_module
+from data.store.app.completeness import gap_intervals
 from data.store.app.database.crud.stock import dataset_catalog as catalog_repo
 from data.store.app.database.crud.stock.dataset_catalog import CatalogFilter
 from data.store.app.database.database import async_db
@@ -63,17 +64,16 @@ from data.store.app.dataset_catalog import (
     MAX_COVERAGE_GAPS,
     evaluate_views,
 )
-from data.store.app.freshness import (
-    FreshnessStatus,
+from data.store.app.health import FreshnessStatus
+from data.store.app.main import app
+from data.store.app.trading_calendar import (
     NaiveDatetimeError,
     TradingCalendar,
     UnknownCalendarError,
     calendar_for_source,
-    gap_intervals,
     local_midnight,
     session_of,
 )
-from data.store.app.main import app
 from data.store.tests.problem_body import problem, validation_errors
 from data.store.tests.test_coverage_buckets import XTKS
 from routers.data_store.ui_datasets import utc_now

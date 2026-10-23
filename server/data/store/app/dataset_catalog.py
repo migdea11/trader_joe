@@ -1,7 +1,7 @@
 """The dataset catalog the /ui/v1 routes serve: filtering, keyset paging, facets and freshness (tj-grna9p.20).
 
-This module composes the read repository (database/crud/stock/dataset_catalog.py) with the pure freshness rules
-(freshness.py). The routes call it and map its results to messages; it knows no HTTP and no protobuf.
+This module composes the read repository (database/crud/stock/dataset_catalog.py) with the pure health and
+completeness rules (health.py, completeness.py). The routes call it and map its results to messages; it knows no HTTP and no protobuf.
 
 THE QUERY BUDGET. A request runs a constant number of statements, never one per dataset (tj-grna9p.8 item 2):
 the matching entries with their newest bar in one, and then, for the datasets the answer needs, one each for
@@ -58,6 +58,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from common.enums.data_stock import DataSource, Feed, Granularity, UpdateType
 from common.errors.vocabulary import InvalidRequestError, Reason
 from common.logging import get_logger
+from data.store.app.completeness import CoverageBucket, gap_intervals
+from data.store.app.completeness import coverage_buckets as compute_coverage_buckets
 from data.store.app.database.crud.dataset_read import (
     ClientDatasets,
     ClientDayReads,
@@ -85,20 +87,14 @@ from data.store.app.database.crud.stock.dataset_catalog import (
 )
 from data.store.app.database.models.dataset_read import ReadClientKind
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
-from data.store.app.freshness import (
+from data.store.app.health import DatasetHealth, FreshnessConfig, FreshnessStatus, evaluate_dataset
+from data.store.app.trading_calendar import (
     CalendarRangeError,
-    CoverageBucket,
-    DatasetHealth,
-    FreshnessConfig,
-    FreshnessStatus,
     TradingCalendar,
     UnknownCalendarError,
     calendar_for_source,
-    evaluate_dataset,
-    gap_intervals,
     local_midnight,
 )
-from data.store.app.freshness import coverage_buckets as compute_coverage_buckets
 
 
 log = get_logger(__name__)
@@ -995,7 +991,7 @@ async def dataset_coverage(
     """A dataset's coverage strip over the trading calendar, or None when no such dataset exists (tj-grna9p.63).
 
     Two statements, whatever the range: the entry, and the dates its bars fall on. The calendar logic is
-    freshness.py's, unchanged: the same completed-session rule and the same maximal runs as the GAPS status.
+    completeness.py's, unchanged: the same completed-session rule and the same maximal runs as the GAPS status.
     The range is the one DatasetSummary shows (start, effective_end). It applies to every update type, and a
     retired DAILY or STREAM dataset is computed over the same range (when its retirement began is not recorded).
     A bar belongs to the session whose local date it falls on, so a gap's window runs from the local midnight of

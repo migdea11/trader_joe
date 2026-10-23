@@ -52,9 +52,9 @@ from data.store.app.database.models.ingest_run import IngestRun, IngestRunState,
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.events import DatasetChange, DatasetChanged, IngestRunChanged
-from data.store.app.freshness import calendar_for_source
 from data.store.app.ingest import data_action_request, run_recording
 from data.store.app.main import app
+from data.store.app.trading_calendar import calendar_for_source
 from data.store.tests.fetch_double import FetchScript, RecordingFetchClient, accepted_stream
 from data.store.tests.test_ui_datasets_route import (  # noqa: F401 (aware_sqlite_datetimes is a fixture)
     NOW,

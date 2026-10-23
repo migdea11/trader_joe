@@ -24,14 +24,12 @@ import pandas
 import pytest
 
 from common.enums.data_stock import DataSource
-from data.store.app.freshness import (
-    CoverageBucket,
+from data.store.app.completeness import CoverageBucket, coverage_buckets, gap_intervals
+from data.store.app.trading_calendar import (
     ExchangeCalendarAdapter,
     NaiveDatetimeError,
     TradingCalendar,
     calendar_for_source,
-    coverage_buckets,
-    gap_intervals,
     local_midnight,
     session_of,
 )

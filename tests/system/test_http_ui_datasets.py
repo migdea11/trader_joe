@@ -1,7 +1,7 @@
 """The /ui/v1 dataset reads on real Postgres: what the SQLite real-row suite cannot prove (tj-grna9p.99).
 
 Design: decision tj-grna9p.8 item 4 (the listing computes freshness over ALL rows, with "a measured ceiling
-(1000 datasets) in the task's acceptance"), tj-grna9p.20 (the routes, and that acceptance), freshness.py and
+(1000 datasets) in the task's acceptance"), tj-grna9p.20 (the routes, and that acceptance), health.py and
 crud/stock/dataset_catalog.py (covered_dates), half-open ranges (tj-86g751). The unit tier is
 server/data/store/tests/test_ui_datasets_route.py, which runs every route over SQLite real rows; three properties
 need the real database, one section each below:
@@ -30,7 +30,7 @@ nothing that a test asserts: STATIC is judged on those two sessions alone and a 
 Tuesday is OVERDUE at any instant after the next session opened.
 
 NOT conftest's BASE_START / BASE_END (2001), on purpose: those entries belong to other suites and are judged in
-the same listing. The calendar is built from freshness.CALENDAR_START (1990-01-01, tj-grna9p.102), so a 2001 range
+the same listing. The calendar is built from trading_calendar.CALENDAR_START (1990-01-01, tj-grna9p.102), so a 2001 range
 holds its real sessions and reads GAPS without bars, and a range or instant before 1990 raises CalendarRangeError
 rather than reading COMPLETE or FRESH over no sessions. The unit tier pins both, in
 server/data/store/tests/test_freshness.py. These tests use 2026 dates and do not depend on that bound.
@@ -54,7 +54,7 @@ from common.enums.data_stock import DataSource, UpdateType
 from common.errors.vocabulary import Reason
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
-from data.store.app.freshness import calendar_for_source, local_midnight
+from data.store.app.trading_calendar import calendar_for_source, local_midnight
 from routers.data_store.app_endpoints import UiDatasetsInterface
 from tests.system.problem_json import assert_problem
 
@@ -404,7 +404,7 @@ def test_static_listing_status_filters_and_facets_agree_with_the_detail(static_s
 # here covered_dates' real date() decides. A STATIC dataset over February 2026 misses three consecutive sessions
 # straddling a weekend, and the session before them holds ONE bar, at 20:00 New York, whose UTC date is the first
 # missing session: a UTC-date rule would read that session covered and the one before it missing. Every expected
-# value comes from the calendar (freshness.calendar_for_source, local_midnight), never written out.
+# value comes from the calendar (trading_calendar.calendar_for_source, local_midnight), never written out.
 
 XNYS = calendar_for_source(DataSource.ALPACA_API)
 COVERAGE_FIRST, COVERAGE_AFTER = date(2026, 2, 2), date(2026, 3, 2)

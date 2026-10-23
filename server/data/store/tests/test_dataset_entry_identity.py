@@ -53,7 +53,8 @@ from common.errors.vocabulary import ExogenousError, Reason
 from data.store.app.database.crud.stock import store_dataset_entry as crud
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
-from data.store.app.freshness import FreshnessStatus, calendar_for_source, evaluate_dataset
+from data.store.app.health import FreshnessStatus, evaluate_dataset
+from data.store.app.trading_calendar import calendar_for_source
 from schemas.data_store.asset_dataset_store import (
     AssetDatasetStore,
     AssetDatasetStoreCreate,
@@ -415,7 +416,7 @@ async def test_a_static_repeat_without_expiry_writes_null_over_the_stored_expiry
 async def test_a_daily_repeat_without_expiry_clears_the_expiry_and_brings_a_retired_dataset_back():
     """DAILY: a retired subscription re-POSTed without an expiry is NOT retired any more. Documented, not accidental.
 
-    An expiry on a DAILY or STREAM dataset means it is RETIRED (freshness.evaluate_dataset: RETIRED
+    An expiry on a DAILY or STREAM dataset means it is RETIRED (health.evaluate_dataset: RETIRED
     requires expiry is not None). The repeat without an expiry writes NULL over it, so the dataset
     reads as a live subscription again. The architect flagged exactly this when ruling on
     tj-grna9p.105 and ACCEPTED it: re-POSTing a dataset with no expiry declares it never expires, and

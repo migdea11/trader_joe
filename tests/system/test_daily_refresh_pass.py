@@ -54,8 +54,9 @@ from data.store.app.database.crud.stock.dataset_catalog import get_catalog_row
 from data.store.app.database.models.dataset_override_log import DatasetOverrideLog
 from data.store.app.database.models.ingest_run import IngestRun, IngestRunState, IngestRunTrigger
 from data.store.app.events import DatasetChange, DatasetChanged
-from data.store.app.freshness import FreshnessStatus, calendar_for_source, evaluate_dataset
+from data.store.app.health import FreshnessStatus, evaluate_dataset
 from data.store.app.ingest import data_action_request, run_recording
+from data.store.app.trading_calendar import calendar_for_source
 from tests.fakes.market_data import FEED as FAKE_FEED
 from tests.fakes.market_data import FakeRead, fake_bar
 from tests.system import test_reaper_race as race

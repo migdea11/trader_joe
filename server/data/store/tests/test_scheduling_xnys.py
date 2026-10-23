@@ -17,7 +17,7 @@ import pytest
 
 from common.enums.data_stock import DataSource
 from common.scheduling import AfterTradingEvent, SessionCalendar, TradingEvent
-from data.store.app.freshness import ExchangeCalendarAdapter, calendar_for_source
+from data.store.app.trading_calendar import ExchangeCalendarAdapter, calendar_for_source
 
 
 pytestmark = pytest.mark.data_store

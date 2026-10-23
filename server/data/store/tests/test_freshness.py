@@ -30,21 +30,21 @@ import pandas
 import pytest
 
 from common.enums.data_stock import DataSource, Granularity, UpdateType
-from data.store.app.freshness import (
-    CALENDAR_START,
+from data.store.app.completeness import GapInterval, covered_sessions, gap_intervals
+from data.store.app.health import (
     DEFAULT_STREAM_BAR_MULTIPLE,
     STREAM_BAR_MULTIPLE_ENV,
-    CalendarRangeError,
-    ExchangeCalendarAdapter,
     FreshnessConfig,
     FreshnessStatus,
-    GapInterval,
+    evaluate_dataset,
+)
+from data.store.app.trading_calendar import (
+    CALENDAR_START,
+    CalendarRangeError,
+    ExchangeCalendarAdapter,
     NaiveDatetimeError,
     UnknownCalendarError,
     calendar_for_source,
-    covered_sessions,
-    evaluate_dataset,
-    gap_intervals,
     session_of,
 )
 
