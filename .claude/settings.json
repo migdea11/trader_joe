@@ -1,6 +1,7 @@
 {
   "env": {
-    "BD_DISABLE_METRICS": "1"
+    "BD_DISABLE_METRICS": "1",
+    "BEADS_DIR": "/workspace/.beads"
   },
   "permissions": {
     "allow": [
