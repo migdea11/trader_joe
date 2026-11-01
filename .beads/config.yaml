@@ -73,4 +73,5 @@
 
 # sync.remote: "git+ssh://git@github.com/migdea11/trader_joe.git"
 
+dolt.auto-commit: "on"
 no-push: true

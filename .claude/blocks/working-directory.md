@@ -48,7 +48,7 @@ Rules:
 - **Refused fast-forward at integration.** Another agent landed first. The orchestrator asks that agent to catch up again.
 - **Rebase conflict.** Two scopes overlapped. Stop and report it; don't resolve it.
 - **Separate environment.** A new worktree builds its own `.venv` on the first `make test`.
-- **Task store.** `bd` finds the shared task store from inside a worktree. Never copy or initialise one.
+- **Task store.** `bd` reaches the task store on the home server from inside a worktree, through the main checkout's `.beads/` and this machine's untracked connection settings. Never copy or initialise one, never run `bd dolt set host`, and never commit an address.
 - **Shared stash.** The stash is shared across worktrees. To set work aside, make a temporary commit on your own branch instead of stashing.
 - **Repo-wide scans.** ruff, semgrep, git and the Docker build context all skip `.claude/worktrees`, so a scan from the root never reads another agent's live copy.
 

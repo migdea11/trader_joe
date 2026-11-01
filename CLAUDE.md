@@ -94,7 +94,7 @@ agent image provides it once rebuilt, and `make buf-install` until then.
 
 ## Task store
 
-Mode: `embedded`, `bd` pinned at `1.3.0`.
+Mode: `server` (Dolt sql-server on the home server, home LAN only; connection settings are per machine and never tracked), `bd` pinned at `1.3.0`, `dolt.auto-commit` on.
 
 Types: `epic`, `feature`, `task`, `bug`, `chore`, `decision`, `arch_index`, `living_doc`, `risk`.
 Labels: `area:*` routes to a component, `assignee:<agent>` to an owner, `feature:<slug>` groups a

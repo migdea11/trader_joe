@@ -32,9 +32,8 @@ commands:
   format: "make lint-fix PATHS={path}"
 
 beads:
-  # Embedded on the laptop for now. The Dolt server on the home server, the Meshnet overlay and the
-  # split client/server containers land together before data collection (ADRs tj-l7kxo5, tj-q193d3).
-  mode: embedded
+  # Dolt sql-server on the home server (decision records tj-l7kxo5 and tj-q2yx6b).
+  mode: server
   telemetry: false
 
 toolchain:
