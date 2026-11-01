@@ -48,7 +48,7 @@ Rules:
 - **Refused fast-forward at integration.** Another agent landed first. The orchestrator asks that agent to catch up again.
 - **Rebase conflict.** Two scopes overlapped. Stop and report it; don't resolve it.
 - **Separate environment.** A new worktree builds its own `.venv` on the first `make test`.
-- **Task store.** `bd` reaches the task store on the home server from inside a worktree because `BEADS_DIR=/workspace/.beads` (set in `.claude/settings.json`) points it at the main checkout's `.beads/`, which holds this machine's untracked connection settings. Never copy or initialise one, never run `bd dolt set host`, and never commit an address. In a scratch repo, run `BEADS_DIR= bd ...` (or unset it first), or `bd` writes to the real store.
+- **Task store.** `bd` reaches the task store on the home server from inside a worktree because `BEADS_DIR=/workspace/.beads` (set in `.claude/settings.json`) points it at the main checkout's `.beads/`, which holds this machine's untracked connection settings. Never copy or initialise one, never run `bd dolt set host`, and never commit an address. In a scratch repo, run `BEADS_DIR= bd ...` (or unset it first), or `bd` writes to the real store; a project hook blocks `bd init` and `bd dolt set host` unless the same command clears `BEADS_DIR` first.
 - **Shared stash.** The stash is shared across worktrees. To set work aside, make a temporary commit on your own branch instead of stashing.
 - **Repo-wide scans.** ruff, semgrep, git and the Docker build context all skip `.claude/worktrees`, so a scan from the root never reads another agent's live copy.
 
