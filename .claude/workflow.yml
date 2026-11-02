@@ -32,9 +32,8 @@ commands:
   format: "make lint-fix PATHS={path}"
 
 beads:
-  # Embedded on the laptop for now. The Dolt server on the home server, the Meshnet overlay and the
-  # split client/server containers land together before data collection (ADRs tj-l7kxo5, tj-q193d3).
-  mode: embedded
+  # Dolt sql-server on the home server (decision records tj-l7kxo5 and tj-q2yx6b).
+  mode: server
   telemetry: false
 
 toolchain:
@@ -108,10 +107,10 @@ agents:
 
   - name: builder-shared
     role: builder
-    scope: [server/common, server/schemas, server/routers/common, tools, proto, buf.yaml, deploy/web/Caddyfile, pyproject.toml, uv.lock, Dockerfile, entrypoint.sh, docker-compose*.yaml, Makefile, .github, .gitignore, pytest.ini, .dockerignore, .env.default, .devcontainer]
+    scope: [server/common, server/schemas, server/routers/common, tools, proto, buf.yaml, deploy/web/Caddyfile, pyproject.toml, uv.lock, Dockerfile, entrypoint.sh, docker-compose*.yaml, Makefile, .github, .gitignore, pytest.ini, .dockerignore, .env.default, .devcontainer, .beads/metadata.json, .beads/config.yaml, CLAUDE.md, .claude/workflow.yml, .claude/blocks/working-directory.md, .claude/agents]
     model: sonnet
     slots:
-      do_not: "Do not refactor inside another builder's scope (server/data/ingest, server/data/store, server/routers/data_ingest, server/routers/data_store, web) without filing the follow-up task for that builder. server/common/tests, server/routers/tests and server/schemas/tests are the validator's; pytest.ini and the Makefile are yours. Do not add a dependency without proposing it first. Do not weaken a security control to make a build pass."
+      do_not: "Do not refactor inside another builder's scope (server/data/ingest, server/data/store, server/routers/data_ingest, server/routers/data_store, web) without filing the follow-up task for that builder. server/common/tests, server/routers/tests and server/schemas/tests are the validator's; pytest.ini and the Makefile are yours. Do not add a dependency without proposing it first. Do not weaken a security control to make a build pass. In CLAUDE.md, .claude/ and .beads/ change only the task-store settings and the scope text; every other line there is not yours."
 
   - name: validator
     role: validator
