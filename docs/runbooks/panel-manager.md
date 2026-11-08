@@ -37,8 +37,23 @@ time (none arrived)`. With no active snapshot at all it logs once `Panel <id> wa
 minutes: `CREATED` rows against `ramp_datasets_per_hour`, and every request the `panel` owner wrote against
 `request_cap_per_hour`. A creation costs **two** requests (`REQUESTS_PER_CREATION`): the name-change clamp query and
 the bars request. The ramp is checked first, and once a window is full the rest of the members in that pass share its
-cause. This limits creation only: the daily bars of members are the DAILY refresh's, bounded by
+cause. A rate that is empty (no limit) skips its check. This limits creation only: the daily bars of members are the DAILY refresh's, bounded by
 `DAILY_REFRESH_MAX_PER_PASS`, so a large panel needs that cap raised to about the number of assets its filters select.
+
+**Warning: a first pass with no rates and no filter is very long.** With both rates empty and no filter, a panel
+selects the whole asset snapshot (about 33,500 rows in dev) and creates every member in one pass. There is no big
+transaction: each member gets its own small commits, so the database is safe at that size. Time is what bounds it.
+Ingest allows at most 200 market-data requests a minute (`ALPACA_RATE_LIMIT_PER_MINUTE`, which configuration can only
+lower), and the clamp and the bars request of each creation both draw from that one bucket. A clamp query whose answer
+spans several pages costs one token per page (a panel's 1day bars request, about 9,200 sessions from 1990, fits one
+10,000-bar page). So roughly 100 creations a minute, about 5 to 6 hours, is **the shortest** the pass could take, not a
+typical time: expect at least that. Manager runs never overlap, so for those hours no other panel on any source gets a
+pass. Ingest keeps one queue per broker, shared by both of its quota scopes (market data and trading): requests with a
+ready-by go first, and undated work follows in arrival order. The panel manager's requests and the asset-list snapshot
+carry no ready-by, so the snapshot queues behind the burst in arrival order; the daily refresh carries a ready-by and
+is served ahead of it. The asset list draws its tokens from the trading scope, so it waits because it is queued, not
+because tokens run out (`docs/scheduler.md`). A clamp that waits past 300 s becomes a deferral (`clamp_unavailable`) that a later pass picks up.
+Set the rates, or a filter, if that matters.
 
 **A member's dataset** starts at `panel_dataset_start`: the source calendar's local midnight of 1990-01-01
 (`CALENDAR_START`), never UTC midnight, which would fall on the previous local date before the calendar's first day.
@@ -71,28 +86,33 @@ as `actor`, and an optional `reason`: a blank one means none, is stored as NULL 
 |---|---|---|
 | Create a panel | `POST /ui/v1/panels` | Writes the panel and its settings version 1 in one transaction, answers the panel detail with `effective_pass` unset ("first pass pending"). It runs no pass: the next tick does, once the panel is enabled |
 | Change a panel | `POST /ui/v1/panels/{panel_id}/settings-versions` | A new version replaces the settings as sent: an absent optional filter clears it. **Enable and disable are this same write with `enabled` changed** |
-| Change a source's rates | `POST /ui/v1/panel-sources/{source}/settings-versions` | The per-source `ramp_datasets_per_hour`, `request_cap_per_hour` and the corporate-action window days. They apply to every panel on the source |
+| Change a source's rates | `POST /ui/v1/panel-sources/{source}/settings-versions` | The per-source `ramp_datasets_per_hour` (1 or more), `request_cap_per_hour` (2 or more) and the corporate-action window days (required, 0 or more). Both rates are optional: empty means no limit. They apply to every panel on the source |
 
 Rules that decide a create (all refusals are `INVALID_REQUEST`, 422, with the store's message, and write nothing):
 
 - `enabled` is required (an absent value is never read as `false`); `cadence` unnamed takes
   `MONTHLY`; `name` is required, trimmed and unique; `source` is required and fixed for the panel's life; `reason` is
   optional. A body that carries `size` is refused with a 422: the field was removed and an unknown field is refused.
-- **The two hourly rates have no default.** A source with no source settings version cannot run a panel: give the
-  first source settings in the create (both `ramp_datasets_per_hour` and `request_cap_per_hour` required; the window
-  days default to 90), or the create is refused. Giving source settings for a source that already has a version is also
-  refused: change them only through the source's own write. A ramp of 0 pauses creation. If the manager meets a
-  panel whose source has no settings it logs once `Panel <id> is not runnable: source <source> has no settings` and
-  skips it.
-- **Pausing a panel is `enabled` false** (a new version). It stops that panel's passes only: its members stay as
+- **The two hourly rates are optional; empty means no limit.** A set ramp is a whole number from 1 to 2147483647 and a
+  set cap from 2 to 2147483647 (each new panel dataset costs two requests, so a cap of 1 could never create one); zero
+  is refused, and so is anything outside that range. An empty rate is stored as NULL and read as unset. A create on a
+  source with **no settings version** always writes that source's version 1 from whatever source settings fields it
+  carries: an empty rate is no limit and empty window days are 90, so a create carrying none writes no limits and
+  90/90. A create on a source that **already has a version** refuses any source settings field (422, nothing written):
+  change them only through the source's own write. That includes the case where another create wrote the source's
+  version 1 first while this one saw no version: save the settings through the source's own write instead. If the
+  manager ever meets a panel whose source has no settings (a guard; a create always writes them) it logs once
+  `Panel <id> is not runnable: source <source> has no settings` and skips it.
+- **Pausing a panel is `enabled` false** (a new version). It stops that panel's passes only (no new creations, no exits, no releases): its members stay as
   recorded and their datasets keep collecting through the daily refresh. Stopping the datasets too is a backlog item
   ("Panel: disabling a panel should pause its members' datasets"), not built. To empty a panel, change its filters so
   they select nothing: every member then exits and its dataset is stopped, unless another enabled panel on the source
   still selects it.
 - **The web create form** validates on click: nothing is marked until Create Panel has been pressed once, then every
-  empty or invalid field is marked at once and the marks follow the fields. A name and a source are required, and ramp
-  and cap are required while the source has no settings version (the window days are optional); the reason is
-  optional.
+  empty or invalid field is marked at once and the marks follow the fields. A name and a source are the only required
+  fields. Ramp and cap are shown only while the source has no settings version and are both optional, with the
+  hints "Leave empty for no limit." and, for the cap, "Minimum 2: each new panel dataset costs 2 requests." (the window
+  days are optional too and default to 90); the reason is optional.
 - Creates are serialised by name (a transaction-scoped advisory lock), so the loser of two concurrent creates of one
   name is refused as a duplicate; source settings are judged under a lock on the source.
 - Effective-from has no column: a version takes effect at the `started_at` of the first non-dry-run pass of that panel

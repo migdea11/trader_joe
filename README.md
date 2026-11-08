@@ -394,8 +394,9 @@ the `/ui/v1` panel routes (`docs/API.md`, *The panel routes*), and there is no S
 restart resets nothing. A membership pass runs at the panel's creation, on the newest snapshot, then an interval
 after the last *finished* pass (a pass that crashed holds the next off for an hour). It records every decision
 (entered, created, deferred, refused, exited, draining, drained) in an append-only ledger, and creates a dataset
-for a new member within two hourly limits that are set per source: new datasets per hour and requests per hour
-(a creation costs two). A member that exits has its dataset stopped, never deleted. The members' daily bars are
+for a new member within two hourly limits that are set per source: new datasets per hour (1 or more) and requests
+per hour (2 or more, since a creation costs two). Both are optional: empty means no limit, and zero is refused. Pausing
+a panel is turning its Enabled off, which stops its passes. A member that exits has its dataset stopped, never deleted. The members' daily bars are
 the daily refresh's, so raise `DAILY_REFRESH_MAX_PER_PASS` for a large panel. With `PANEL_MANAGER_DRY_RUN=true`
 it records what it would do and applies nothing. The mechanics are in
 [`server/data/store/CLAUDE.md`](server/data/store/CLAUDE.md#panels-and-the-panel-manager), and the
@@ -469,6 +470,8 @@ revisions before it were deleted, and the repository supports no schema from bef
   `make migrate` with "Can't locate revision" instead of being taken for the baseline. Datasets exported from the
   dev stack before the baseline (`output/dev_seed/<old revision>/`) cannot be loaded into it: request them again
   after the reset.
+- **The baseline was edited in place on 2026-11-07 and kept its id** (the panel source rates became optional). A
+  database already at it is not upgraded by `make migrate`: drop it and migrate again, on every stack, dev included.
 - **There is no downgrade.** The baseline's `downgrade()` raises. Recovery is a restore of the pre-migrate dump that
   `make migrate` takes (below).
 - **After the alpha, migrations are additive-only again**, held by `make lint-migrations` (below). Whether
