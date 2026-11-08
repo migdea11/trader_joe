@@ -84,6 +84,7 @@ class Reason(StrEnum):
     PEER_PROTOCOL_ERROR = 'PEER_PROTOCOL_ERROR'
     DATABASE_UNAVAILABLE = 'DATABASE_UNAVAILABLE'
     DATABASE_CONFLICT = 'DATABASE_CONFLICT'
+    RANGE_TOO_RECENT = 'RANGE_TOO_RECENT'
 
 
 # Names that records have already fixed for later PRs. They are NOT members, so nothing can raise them
@@ -739,6 +740,16 @@ REASONS: Final[Mapping[Reason, ReasonSpec]] = MappingProxyType(
             grpc_code=None,
             http_status=503,
             summary='The write collided with a concurrent transaction and was rolled back; retry it.',
+        ),
+        # Raised by the Alpaca read's SIP edge pre-check, before any vendor call or token (tj-7zjov1.306 addendum 1, tj-7zjov1.308).
+        Reason.RANGE_TOO_RECENT: ReasonSpec(
+            branch=ExogenousError,
+            outcome=Outcome.NOT_READY,
+            disposition=Disposition.RECORD,
+            grpc_code='FAILED_PRECONDITION',
+            http_status=503,
+            summary="The range reaches into data too recent for this deployment's market-data entitlement; retry once reset_at has passed, or end the range earlier.",
+            requires_reset_at=True,
         ),
     }
 )

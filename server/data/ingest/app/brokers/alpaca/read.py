@@ -53,6 +53,13 @@ ALPACA_CURRENCY = 'USD'
 # Sent on every asset-list call: without it the vendor adds its crypto rows, which are not stock listings.
 ASSET_CLASS_US_EQUITY = 'us_equity'
 
+# The newest data a SIP request may reach on this plan (decision tj-7zjov1.306 addendum 1, spike s8b tj-0g1bf6): Alpaca
+# answers a SIP request that reaches the latest 15 minutes with a 403. The window and the margin are two constants, never
+# a fused 16, so the boundary probe of s8b can shrink the margin alone. This rule lives here and nowhere else (C1).
+SIP_RECENT_WINDOW = timedelta(minutes=15)
+# Absorbs our clock running ahead of the vendor's and the vendor's unknown boundary rounding.
+SIP_EDGE_MARGIN = timedelta(minutes=1)
+
 # The fixed start of the detail of a refused asset list; the check and a count follow, never a vendor value.
 ASSET_LIST_REFUSED = 'asset list refused as malformed'
 
@@ -170,7 +177,8 @@ class AlpacaRead:
                 bars and the range they answer for, or the failure: UNSUPPORTED_ASSET_TYPE or
                 UNSUPPORTED_INSTRUMENT (BrokerUnsupportedError) for an instrument or adjustment
                 Alpaca cannot serve, FEED_NOT_AVAILABLE for a feed this account cannot,
-                RANGE_IN_FUTURE for a start at or after the clock, VENDOR_AUTH for a missing
+                RANGE_IN_FUTURE for a start at or after the clock, RANGE_TOO_RECENT (with its reset_at) for a range
+                that reaches into data too recent for the account's feed, VENDOR_AUTH for a missing
                 or malformed credential or a 401 or 403, VENDOR_INVALID_REQUEST for a 400, VENDOR_REJECTED for
                 another 4xx, VENDOR_RATE_LIMITED for a 429, VENDOR_UNAVAILABLE for a 5xx, a
                 connection error or timeout, or a connection cut while the body was read, and
@@ -230,6 +238,30 @@ class AlpacaRead:
                 )
             )
 
+        # Decision tj-7zjov1.306 addendum 1 (spike s8b, tj-0g1bf6): a SIP request must not reach the newest
+        # SIP_RECENT_WINDOW of data. Never clamped silently: an explicit end past the edge is refused, typed, with the
+        # instant the same request becomes servable, before any credential lookup, rate token or vendor call. An open end
+        # means 'up to what is current', which for this feed is the edge: it is sent as the edge, and served_range
+        # reports that edge (C2), never the requested (absent) end. IEX is never checked.
+        sent_end = query.end
+        if feed is Feed.SIP:
+            edge = now - SIP_RECENT_WINDOW - SIP_EDGE_MARGIN
+            reaches = query.end if query.end is not None else query.start
+            if (query.end is not None and query.end > edge) or (query.end is None and query.start >= edge):
+                bound = 'range_end' if query.end is not None else 'range_start'
+                return BarsFailure(
+                    ExogenousError(
+                        Reason.RANGE_TOO_RECENT,
+                        f'The range reaches into data too recent for this feed: {bound}={reaches.isoformat()}, '
+                        f'edge={edge.isoformat()}',
+                        metadata={'feed': feed.value, bound: reaches.isoformat()},
+                        reset_at=reaches + SIP_RECENT_WINDOW + SIP_EDGE_MARGIN,
+                        clock=self.__clock,
+                    )
+                )
+            if query.end is None:
+                sent_end = edge
+
         # Resolved once, before any task is spawned, so a missing or malformed credential fails here with a
         # named variable rather than inside a gathered task.
         try:
@@ -240,7 +272,7 @@ class AlpacaRead:
             'symbol_or_symbols': instrument.symbol,
             'timeframe': AlpacaGranularity.from_granularity(query.granularity).broker_code,
             'start': query.start.isoformat(),
-            'end': query.end.isoformat() if query.end is not None else None,
+            'end': sent_end.isoformat() if sent_end is not None else None,
             # Sent to the vendor so the entitled tape is the one actually requested, rather than
             # whatever Alpaca defaults to in feed's absence.
             'feed': DataFeed(feed.value.lower()),
@@ -280,12 +312,13 @@ class AlpacaRead:
             return BarsFailure(error)
 
         # A 200 answered, so this range is SERVED, whether or not it holds a bar. The vendor cannot have
-        # answered for time after it answered, so an open end, or one past now, is clamped to as_of.
+        # answered for time after it answered, so an open end, or one past now, is clamped to as_of. The end SENT is the
+        # one served: on SIP an open end was sent as the edge, and that edge is what the client is told (C2).
         as_of = self.__clock().astimezone(UTC)
-        served_end = as_of if query.end is None else min(query.end, as_of)
+        served_end = as_of if sent_end is None else min(sent_end, as_of)
         return BarsResponse(
             feed=feed,
-            bars=self.__iterate(self.__convert(bar_set, instrument.symbol, query.end)),
+            bars=self.__iterate(self.__convert(bar_set, instrument.symbol, sent_end)),
             served_range=ServedRange(query.start, served_end),
             as_of=as_of,
         )

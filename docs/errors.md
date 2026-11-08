@@ -53,6 +53,7 @@ carries a delay that went stale on the way.
 | PEER_PROTOCOL_ERROR | NOT_READY | PAGE | 502 | not rendered as a status | Another service sent a reply this one could not interpret, usually a version mismatch between them; retry once both run the same release. |
 | DATABASE_UNAVAILABLE | NOT_READY | PAGE | 503 | not rendered as a status | The database could not be reached or dropped the connection; retry later. |
 | DATABASE_CONFLICT | NOT_READY | RECORD | 503 | not rendered as a status | The write collided with a concurrent transaction and was rolled back; retry it. |
+| RANGE_TOO_RECENT | NOT_READY | RECORD | 503 | FAILED_PRECONDITION | The range reaches into data too recent for this deployment's market-data entitlement; retry once reset_at has passed, or end the range earlier. |
 
 ## Extension members
 

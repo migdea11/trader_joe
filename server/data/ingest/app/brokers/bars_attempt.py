@@ -10,14 +10,15 @@ drained pages are discarded and the result carries no parts. It never retries an
 belong to the executor. It holds no vendor knowledge: Alpaca-shaped facts stay behind BrokerRead.
 
 THE ERROR CLASS COMES FROM REASONS (ADR tj-fa1rpu D3, D6), never a second table. A REFUSED reason is PERMANENT.
-A NOT_READY reason is RATE_LIMITED when it is one of the two rate reasons, which carry a reset_at to wait for,
-and TRANSIENT otherwise.
+A NOT_READY reason is RATE_LIMITED when its REASONS row requires a reset_at (the two rate reasons, and any reason
+that always names the instant it clears, such as RANGE_TOO_RECENT, decision tj-7zjov1.306 addendum 1), so the executor
+waits until that reset_at rather than backing off; any other NOT_READY reason is TRANSIENT.
 """
 
 from dataclasses import dataclass
 
 from common.enums.data_stock import Feed
-from common.errors.vocabulary import REASONS, Outcome, Reason, TraderJoeError
+from common.errors.vocabulary import REASONS, Outcome, TraderJoeError
 from common.rpc.mapping.delivery import MAX_PAGE_BARS
 from data.ingest.app.brokers.interface import (
     AssetLookupFailure,
@@ -42,9 +43,6 @@ from schemas.data_ingest.delivery import (
     VendorCallStats,
 )
 from schemas.data_ingest.submit import BarsRequest
-
-
-_RATE_REASONS = frozenset({Reason.VENDOR_RATE_LIMITED, Reason.RATE_BUDGET})
 
 
 @dataclass(frozen=True)
@@ -92,11 +90,12 @@ def error_class(error: TraderJoeError) -> DeliveryErrorClass:
         error (TraderJoeError): The typed failure a reader returned.
 
     Returns:
-        DeliveryErrorClass: PERMANENT for a REFUSED reason, RATE_LIMITED for a rate reason, else TRANSIENT.
+        DeliveryErrorClass: PERMANENT for a REFUSED reason, RATE_LIMITED for a reason whose row requires a reset_at, else TRANSIENT.
     """
-    if REASONS[error.reason].outcome is Outcome.REFUSED:
+    spec = REASONS[error.reason]
+    if spec.outcome is Outcome.REFUSED:
         return DeliveryErrorClass.PERMANENT
-    if error.reason in _RATE_REASONS:
+    if spec.requires_reset_at:
         return DeliveryErrorClass.RATE_LIMITED
     return DeliveryErrorClass.TRANSIENT
 

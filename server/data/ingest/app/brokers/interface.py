@@ -197,7 +197,8 @@ class ServedRange(NamedTuple):
 
     Attributes:
         start (datetime): Inclusive start, timezone aware.
-        end (datetime): Exclusive end, timezone aware. Never open: an open request end is served as as_of.
+        end (datetime): Exclusive end, timezone aware. The end actually sent, never open: an open request end is served up to
+            the reader's servable edge for the resolved feed (as_of when the feed has none), never past as_of.
     """
 
     start: datetime
@@ -216,8 +217,9 @@ class BarsResponse:
         bars (AsyncIterator[Bar]): The bars, ascending by timestamp, unique, within [start, end):
             a bar stamped exactly at end is never included, for every broker.
         served_range (ServedRange): The range the vendor ANSWERED for. Its end is the query's end
-            clamped to as_of, because a vendor cannot have answered for time after it answered, and
-            an open end is as_of.
+            clamped to as_of, because a vendor cannot have answered for time after it answered. It is the
+            end actually sent: an open end is the reader's servable edge for the resolved feed
+            (as_of when the feed has none).
         as_of (datetime): When the vendor answered, timezone aware, UTC.
     """
 

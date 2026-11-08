@@ -39,7 +39,7 @@ REFUSED, NOT_READY = Outcome.REFUSED, Outcome.NOT_READY
 PAGE, RECORD, CLIENT_FIX = Disposition.PAGE, Disposition.RECORD, Disposition.CLIENT_FIX
 
 # reason: (branch, outcome, disposition, grpc_code, http_status), from the bead as amended 2026-10-02 by the
-# Q-URI and Q-EMPTY rulings, plus OVERRIDE_REQUIRED (tj-grna9p.16). 25 members.
+# Q-URI and Q-EMPTY rulings, plus OVERRIDE_REQUIRED (tj-grna9p.16) and RANGE_TOO_RECENT (tj-7zjov1.315). 26 members.
 PLANNED = {
     'INVALID_REQUEST': (INV, REFUSED, CLIENT_FIX, 'INVALID_ARGUMENT', 422),
     'UNSUPPORTED_ASSET_TYPE': (INV, REFUSED, CLIENT_FIX, 'INVALID_ARGUMENT', 422),
@@ -64,6 +64,9 @@ PLANNED = {
     'VENDOR_UNAVAILABLE': (EXO, NOT_READY, RECORD, 'FAILED_PRECONDITION', 503),
     'VENDOR_AUTH': (EXO, NOT_READY, PAGE, 'FAILED_PRECONDITION', 503),
     'DEADLINE': (EXO, NOT_READY, RECORD, 'FAILED_PRECONDITION', 504),
+    # tj-7zjov1.315 (decision tj-7zjov1.306 addendum 1 R2): a range reaching into data too recent for the
+    # deployment's entitlement. NOT_READY because the same answer exists later, unchanged; never REFUSED.
+    'RANGE_TOO_RECENT': (EXO, NOT_READY, RECORD, 'FAILED_PRECONDITION', 503),
     'PEER_UNAVAILABLE': (EXO, NOT_READY, PAGE, None, 503),
     'PEER_INTERNAL': (EXO, NOT_READY, PAGE, None, 502),
     'PEER_PROTOCOL_ERROR': (EXO, NOT_READY, PAGE, None, 502),
@@ -96,7 +99,7 @@ def _row(spec: ReasonSpec) -> tuple:
 
 
 def test_reason_is_the_planned_closed_set():
-    """D4: exactly the 25 planned members. Adding one is a reviewed change; renaming or removing one breaks clients."""
+    """D4: exactly the 26 planned members. Adding one is a reviewed change; renaming or removing one breaks clients."""
     actual = {reason.value for reason in Reason}
     assert actual == set(PLANNED), (
         f'not in the plan: {sorted(actual - set(PLANNED))}; planned but missing: {sorted(set(PLANNED) - actual)}'
@@ -106,6 +109,18 @@ def test_reason_is_the_planned_closed_set():
 def test_every_row_says_what_the_plan_says():
     """D4: a reason's branch, outcome, disposition, gRPC code and HTTP status are its published meaning."""
     assert {reason.value: _row(REASONS[reason]) for reason in Reason} == PLANNED
+
+
+def test_range_too_recent_requires_reset_at_and_says_the_ruled_summary():
+    """tj-7zjov1.315's ROW (exact): requires_reset_at, and the summary as ruled, generic (no vendor or plan name)."""
+    spec = REASONS[Reason.RANGE_TOO_RECENT]
+    assert spec.requires_reset_at is True
+    assert spec.summary == (
+        "The range reaches into data too recent for this deployment's market-data entitlement; "
+        'retry once reset_at has passed, or end the range earlier.'
+    )
+    for vendor_word in ('alpaca', 'sip', 'iex', 'basic', 'plan', 'minute'):
+        assert vendor_word not in spec.summary.lower()
 
 
 def test_reason_is_a_str_enum():

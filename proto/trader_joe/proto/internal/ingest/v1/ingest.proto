@@ -77,9 +77,9 @@ message FetchDatasetRequest {
   // The window asked for. start is required and inclusive.
   google.protobuf.Timestamp start = 7;
 
-  // UNSET MEANS AN OPEN END, "up to whatever is current", which the reader serves as its as_of. A
-  // message field has explicit presence in proto3, so unset and "the epoch" are distinguishable here
-  // without an extra flag.
+  // UNSET MEANS AN OPEN END: it is served up to the reader's servable edge for the resolved feed,
+  // which served_range names. A message field has explicit presence in proto3, so unset and "the
+  // epoch" are distinguishable here without an extra flag.
   google.protobuf.Timestamp end = 8;
 
   // Becomes the rate budget's priority: STREAM -> LIVE, STATIC -> BACKFILL, anything else ->
@@ -166,7 +166,8 @@ message BarsRequest {
   // Inclusive and required.
   google.protobuf.Timestamp start = 6;
 
-  // Unset means an open end, as on FetchDatasetRequest.
+  // Unset means an open end, served up to the reader's servable edge for the resolved feed, which
+  // served_range names.
   google.protobuf.Timestamp end = 7;
   trader_joe.proto.market.v1.UpdateType update_type = 8;
 

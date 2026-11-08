@@ -49,7 +49,7 @@ class BarsRequest(InboundContract):
     granularity: Granularity
     # Inclusive.
     start: AwareDatetime
-    # None is an OPEN END, served up to the reader's as_of.
+    # None is an OPEN END, served up to the reader's servable edge for the resolved feed, which served_range names.
     end: AwareDatetime | None = None
     update_type: UpdateType
     # None means the deployment decides (FEED_UNSPECIFIED on the wire); a value is checked, never selected.
