@@ -970,7 +970,7 @@ async def test_in_the_lifespan_with_the_watcher_off_there_is_no_ingest_start_tri
     assert all(task.cancelled() for task in loops.tasks)
 
 
-async def test_in_the_lifespan_the_late_store_start_catch_up_requests_at_once(harness, monkeypatch):
+async def test_in_the_lifespan_the_late_store_start_catch_up_requests_at_once(harness, monkeypatch, caplog):
     order: list[str] = []
     await harness.register(INSTANCE_A)
     client = FakeSubmit(INSTANCE_A)
@@ -979,8 +979,15 @@ async def test_in_the_lifespan_the_late_store_start_catch_up_requests_at_once(ha
     # The newest active snapshot predates the last due time: the store was down when it was due.
     await _snapshot(harness, datetime.now(UTC) - timedelta(days=5))
 
-    async with app_depends.lifespan(object()):
-        await _until(lambda: len(client.sent) >= 2)
+    # WAIT FOR THE PASS TO FINISH WRITING, NOT FOR THE SECOND SEND (tj-7zjov1.227). submit_record still writes after
+    # client.submit returns (note_instance_seen, mark_queued) on the harness's ONE StaticPool connection. Leaving the
+    # lifespan as soon as the second request was sent cancelled the loop inside one of those statements; SQLAlchemy
+    # then invalidated the connection, the pool opened a new, empty in-memory database, and the read below failed
+    # 'no such table: ingest_request' (about 1 run in 70 in isolation). The 'requested' line is logged only after
+    # submit_record returns, so after two of them the pass has nothing left in flight.
+    with caplog.at_level(logging.INFO, logger=asset_snapshot_schedule.__name__):
+        async with app_depends.lifespan(object()):
+            await _until(lambda: sum(m.startswith(REQUESTED) for m in _messages(caplog)) >= 2)
 
     assert await _lists(harness) == [(ALPACA, ACTIVE), (ALPACA, INACTIVE)]
     assert {row.trigger for row in await _asset_rows(harness)} == {IngestRunTrigger.SCHEDULE}

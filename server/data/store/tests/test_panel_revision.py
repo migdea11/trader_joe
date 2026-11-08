@@ -587,6 +587,15 @@ PANEL_MODEL_IMPORTERS = frozenset(
         # One line per module, each naming the bead that added it and the bead that pins its statements.
         'data/store/app/database/crud/panel_settings.py',  # P20b tj-7zjov1.176, pinned by P20bv tj-7zjov1.178
         'data/store/app/database/crud/panel_ledger.py',  # P20c tj-7zjov1.177, pinned by P20cv tj-7zjov1.179
+        # P22 tj-7zjov1.34, judged by P20d-v tj-7zjov1.217 at 4cb30ec: THE production writer of the ledger, as this
+        # pin anticipated. It imports the model's enums only (PanelCadence, PanelPassKind, PanelTransition), builds no
+        # statement of its own, and writes the panel tables solely through crud/panel_ledger.py (open_pass,
+        # append_transitions, finish_pass). P22v tj-7zjov1.180 pins the pass's rows.
+        'data/store/app/panel_manager.py',
+        # P22 tj-7zjov1.34, judged by P20d-v tj-7zjov1.217 at 4cb30ec: the manager's reads. It only SELECTs from
+        # panel_pass and panel_member_transition; its one write, stop_collecting, is an UPDATE of store_dataset_entry,
+        # not a panel table (the guarded-update pin below still finds finish_pass alone). P22v pins its statements.
+        'data/store/app/database/crud/panel_manager_reads.py',
     }
 )
 
@@ -597,8 +606,10 @@ def test_no_production_module_writes_the_panel_tables_yet():
     P20 added no crud. P20b (tj-7zjov1.176) added crud/panel_settings.py, whose own statements are pinned SELECT or
     INSERT only by test_panel_settings.py. P20c (tj-7zjov1.177) added crud/panel_ledger.py, whose statements are pinned
     SELECT or INSERT plus THE ONE RULED EXCEPTION by test_panel_ledger.py: finish_pass's UPDATE of panel_pass, which
-    sets finished_at and counts only, guarded by finished_at IS NULL (pinned below as well). The seed tooling and the
-    migrations are excluded. The router of P20b does not import the model (it imports PANEL_OWNER).
+    sets finished_at and counts only, guarded by finished_at IS NULL (pinned below as well). P22 (tj-7zjov1.34) added
+    the manager, which writes only through that ledger module, and its reads module, which only reads the panel tables.
+    The seed tooling and the migrations are excluded. The router of P20b does not import the model (it imports
+    PANEL_OWNER).
     """
     raw = re.compile(r'\b(UPDATE|DELETE\s+FROM|TRUNCATE)\s+(TABLE\s+)?"?panel(_[a-z_]+)?\b', re.I)
     importing_the_model = set()

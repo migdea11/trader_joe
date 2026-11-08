@@ -14,6 +14,7 @@ from data.store.app.database import database
 from data.store.app.grpc_host import build_grpc_host
 from data.store.app.ingest.instance_watch import start_instance_watch_loop, stop_instance_watch_loop
 from data.store.app.ingest.run_recording import sweep_interrupted_runs
+from data.store.app.panel_manager import start_panel_manager_loop, stop_panel_manager_loop
 from data.store.app.reaper import start_reaper_loop, stop_reaper_loop
 from data.store.app.usage_recorder import start_usage_loops, stop_usage_loops
 from routers.common.latency import initialize_latency_client
@@ -83,6 +84,9 @@ async def lifespan(app: FastAPI):
     watch_task = start_instance_watch_loop(
         __INGEST_SUBMIT_CLIENT, on_instance=snapshot_loops.schedule.on_instance_seen if snapshot_loops else None
     )
+    # The panel manager (tj-7zjov1.34): one 5 minute tick; what is due is derived from the rows. Needs the Submit client and
+    # the database. Every panel is off until a settings version enables it.
+    panel_task = await start_panel_manager_loop(__INGEST_SUBMIT_CLIENT)
 
     # StoreService (DeliverAttempt, RegisterInstance) serves from here to teardown. It is entered last, so every
     # dependency of a delivery (the database above all) is up before ingest can reach it, and it exits FIRST on
@@ -94,6 +98,7 @@ async def lifespan(app: FastAPI):
 
     # cleanup tasks
     # Before the channel it fetches through closes.
+    await stop_panel_manager_loop(panel_task)
     await stop_instance_watch_loop(watch_task)
     await stop_asset_snapshot_loops(snapshot_loops)
     await stop_daily_refresh_loops(refresh_tasks)

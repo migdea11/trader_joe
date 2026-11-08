@@ -19,7 +19,10 @@ then pass_id, then seq (the per-pass append ordinal), never by the random id.
   R4 boundary_read: every settings version of the panel with its effective pass (first non-dry-run pass of either kind,
      None when none), actor, reason, saved_at; every source settings version of the panel's source, effective by THIS
      panel's passes; the SET_COLLECTING override rows, with new_value, on datasets the non-dry-run ledger names; empty
-     for an unknown panel.
+     for an unknown panel. Since P20d (tj-7zjov1.216; ruling of 2026-10-31 on tj-7zjov1.34, option D, ADR tj-26jt9w
+     addendum 21) a CREATED row names its request only, so "the ledger names" is the union of the datasets non-dry-run
+     transitions name directly and the non-NULL ingest_request.dataset_id of the requests non-dry-run CREATED rows
+     name; a NULL dataset, a missing request, a dry-run CREATED and a non-CREATED row's request contribute nothing.
 """
 
 import random
@@ -47,6 +50,7 @@ from data.store.tests.test_panel_ledger import (  # noqa: F401 (aware_sqlite_dat
     OTHER_SOURCE,
     OVERRIDES,
     PASSES,
+    REQUESTS,
     SOURCE,
     T0,
     TRANSITIONS,
@@ -251,13 +255,13 @@ async def test_latest_state_reads_one_panel_only(world):
 
 async def test_latest_state_returns_the_whole_row(world):
     seeded = await world.panel()
-    dataset_id = uuid.uuid4()
-    pass_id = await world.open(seeded, started_at=T0 + HOUR, rows=(created('a', T0, dataset_id=dataset_id),))
+    request_id = uuid.uuid4()
+    pass_id = await world.open(seeded, started_at=T0 + HOUR, rows=(created('a', T0, request_id=request_id),))
     async with world.session() as db:
         row = (await latest_state(db, seeded.panel_id))['a']
     assert (row.pass_id, row.pass_kind, row.pass_started_at) == (pass_id, PanelPassKind.MEMBERSHIP, T0 + HOUR)
-    assert (row.vendor_asset_id, row.symbol, row.transition, row.dataset_id) == ('a', 'A', C, dataset_id)
-    assert row.request_id is not None and row.as_of == T0 and row.recorded_at is not None and row.cause is None
+    assert (row.vendor_asset_id, row.symbol, row.transition, row.dataset_id) == ('a', 'A', C, None)
+    assert row.request_id == request_id and row.as_of == T0 and row.recorded_at is not None and row.cause is None
 
 
 # --------------------------------------------------------------------------------------------- R2 members_at
@@ -516,10 +520,11 @@ async def test_boundary_read_lists_the_collect_stops_on_datasets_the_ledger_name
     seeded = await world.panel()
     theirs = await world.panel()
     named, released, only_dry, foreign, unnamed = (uuid.uuid4() for _ in range(5))
-    await world.open(seeded, rows=(entered('a'), created('a', dataset_id=named)))
-    await world.open(seeded, kind=PanelPassKind.RELEASE, rows=(created('b', dataset_id=released),))
-    await world.open(seeded, dry_run=True, rows=(created('c', dataset_id=only_dry),))
-    await world.open(theirs, rows=(created('d', dataset_id=foreign),))
+    # CREATED names its request only (P20d): each dataset is reached through the request row.
+    await world.open(seeded, rows=(entered('a'), created('a', request_id=await world.request(named))))
+    await world.open(seeded, kind=PanelPassKind.RELEASE, rows=(created('b', request_id=await world.request(released)),))
+    await world.open(seeded, dry_run=True, rows=(created('c', request_id=await world.request(only_dry)),))
+    await world.open(theirs, rows=(created('d', request_id=await world.request(foreign)),))
 
     await _override(world, named, OverrideAction.SET_COLLECTING, 'false', T0 + DAY)
     await _override(world, named, OverrideAction.SET_COLLECTING, 'true', T0 + 2 * DAY)
@@ -539,6 +544,105 @@ async def test_boundary_read_lists_the_collect_stops_on_datasets_the_ledger_name
         CollectStop(released, 'false', 'operator', 'SET_COLLECTING false', T0),
         CollectStop(named, 'false', 'operator', 'SET_COLLECTING false', T0 + DAY),
         CollectStop(named, 'true', 'operator', 'SET_COLLECTING true', T0 + 2 * DAY),
+    )
+
+
+async def _stopped(world: World, *datasets: uuid.UUID) -> None:
+    for dataset in datasets:
+        await _override(world, dataset, OverrideAction.SET_COLLECTING, 'false', T0)
+
+
+async def _stop_ids(world: World, panel_id: uuid.UUID) -> set[uuid.UUID]:
+    async with world.session() as db:
+        return {stop.dataset_id for stop in (await boundary_read(db, panel_id)).collect_stops}
+
+
+async def test_boundary_read_reaches_a_dataset_only_through_a_created_rows_request(world):
+    """P20d: no transition names the dataset; the CREATED row's request does (set by the intake's first delivery)."""
+    seeded = await world.panel()
+    dataset = uuid.uuid4()
+    request_id = await world.request(dataset)
+    await world.open(seeded, rows=(entered('a'), created('a', request_id=request_id)))
+    await _stopped(world, dataset)
+    assert {r.dataset_id for r in await world.rows(TRANSITIONS)} == {None}, 'the ledger names no dataset itself'
+
+    async with world.session() as db:
+        read = await boundary_read(db, seeded.panel_id)
+    assert read.collect_stops == (CollectStop(dataset, 'false', 'operator', 'SET_COLLECTING false', T0),)
+
+
+async def test_boundary_read_takes_nothing_from_a_request_whose_dataset_is_still_null(world):
+    """A POST-shaped request before its first delivered attempt has no dataset: the CREATED row contributes nothing."""
+    seeded = await world.panel()
+    pending = await world.request(None)
+    await world.open(seeded, rows=(entered('a'), created('a', request_id=pending)))
+    other = uuid.uuid4()  # a stopped dataset nothing in this panel names, so an unfiltered read would show it
+    await _stopped(world, other)
+    assert await _stop_ids(world, seeded.panel_id) == set()
+
+
+async def test_boundary_read_takes_nothing_from_a_created_row_whose_request_is_missing(world):
+    seeded = await world.panel()
+    await world.request(uuid.uuid4())  # a request some other row could name; this panel names another id
+    await world.open(seeded, rows=(entered('a'), created('a', request_id=uuid.uuid4())))
+    (stray,) = [r.dataset_id for r in await world.rows(REQUESTS)]
+    await _stopped(world, stray)
+    assert await _stop_ids(world, seeded.panel_id) == set()
+
+
+async def test_boundary_read_ignores_a_dry_run_created_rows_request(world):
+    """Dry-run passes are ignored by every read (Q10), through the request as for a directly named dataset."""
+    seeded = await world.panel()
+    dry, real = uuid.uuid4(), uuid.uuid4()
+    await world.open(seeded, dry_run=True, rows=(created('a', request_id=await world.request(dry)),))
+    await world.open(seeded, rows=(created('b', request_id=await world.request(real)),))
+    await _stopped(world, dry, real)
+    assert await _stop_ids(world, seeded.panel_id) == {real}
+
+
+async def test_boundary_read_reaches_through_the_request_of_a_created_row_only(world):
+    """The request join is CREATED's: another kind that happens to carry a request id does not name its dataset."""
+    seeded = await world.panel()
+    via_deferred, via_created = uuid.uuid4(), uuid.uuid4()
+    deferred_request = await world.request(via_deferred)
+    await world.open(
+        seeded,
+        rows=(
+            NewTransition('a', 'A', D, T0, request_id=deferred_request, cause='ramp_rate'),
+            created('b', request_id=await world.request(via_created)),
+        ),
+    )
+    await _stopped(world, via_deferred, via_created)
+    assert await _stop_ids(world, seeded.panel_id) == {via_created}
+
+
+async def test_boundary_read_reads_another_panels_created_requests_never(world):
+    mine, theirs = await world.panel(), await world.panel()
+    foreign = uuid.uuid4()
+    await world.open(theirs, rows=(created('a', request_id=await world.request(foreign)),))
+    await _stopped(world, foreign)
+    assert await _stop_ids(world, mine.panel_id) == set()
+
+
+async def test_boundary_read_still_takes_a_dataset_another_kind_names_directly(world):
+    """EXITED, DRAINING and DRAINED still name the dataset (P20d leaves them), unioned with the requests' datasets."""
+    seeded = await world.panel()
+    exited, drained, via_request, both = (uuid.uuid4() for _ in range(4))
+    await world.open(
+        seeded,
+        rows=(
+            created('a', request_id=await world.request(via_request)),
+            created('b', request_id=await world.request(both)),
+            NewTransition('b', 'B', X, T0, dataset_id=both),
+            NewTransition('c', 'C', X, T0, dataset_id=exited),
+            NewTransition('d', 'D', DRAINED, T0, dataset_id=drained),
+        ),
+    )
+    await _stopped(world, exited, drained, via_request, both)
+    async with world.session() as db:
+        stops = (await boundary_read(db, seeded.panel_id)).collect_stops
+    assert sorted(stop.dataset_id for stop in stops) == sorted((exited, drained, via_request, both)), (
+        'each stop once, a dataset named both ways included'
     )
 
 

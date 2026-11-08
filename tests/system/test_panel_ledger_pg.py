@@ -17,7 +17,12 @@ timestamp and IN-subquery semantics:
       then seq; STRICT within one pass: ENTERED then CREATED (or DEFERRED) reads the later for EVERY member;
   PL3 created_in_window reads recorded_at, the DATABASE's clock: since at or before the write's now() counts it, since
       after it does not;
-  PL4 boundary_read runs (the DISTINCT IN-subquery, the per-version first pass) with real override-log rows;
+  PL4 boundary_read runs (the DISTINCT IN-subquery, the per-version first pass) with real override-log rows, its
+      named set the UNION of the datasets transitions name directly and the non-NULL ingest_request.dataset_id of
+      the requests the panel's non-dry-run CREATED rows name, joined on real Postgres (P20d tj-7zjov1.216, ruling
+      of 2026-10-31 on tj-7zjov1.34, option D, ADR tj-26jt9w addendum 21; these pins tj-7zjov1.221);
+  PL8 a CREATED row names its request only: one naming a dataset is refused before any write, and the CREATED row
+      written on asyncpg stores the request id it named and a NULL dataset id;
   PL5 two concurrent finish_pass calls on one pass: exactly one returns True (the guard re-checked under the row lock);
   PL6 seq on asyncpg: 1..n in list order across real ROW_CHUNK statements and across calls; a finished pass refuses
       rows; finish_pass on an unknown pass raises;
@@ -29,6 +34,12 @@ timestamp and IN-subquery semantics:
 ISOLATION. Panel names carry the run id; the source is MANUAL_ENTRY, which nothing else in the suite gives panels to
 except test_panel_settings_pg.py, and counts read on it are taken RELATIVE to a reading at the test's start. Each test
 deletes exactly the rows it wrote, failed or not (a test-only delete: the module itself is append-only).
+
+REQUESTS. A CREATED row names its bars request and no dataset. The ledger has no foreign key to ingest_request
+(test_migration_with_data.py pins that), so a CREATED row that only needs SOME request id names a fresh uuid with no
+row behind it. Where the dataset matters (PL4) the test writes the ingest_request row itself, BARS on SOURCE, in a
+FINISHED state only (SUCCEEDED once the intake set its dataset, FAILED while it is NULL), so the instance watcher,
+which re-sends open requests, never picks one up; the test deletes it at its end.
 """
 
 import asyncio
@@ -63,6 +74,7 @@ from data.store.app.database.crud.panel_settings import (
     create_panel,
 )
 from data.store.app.database.models.dataset_override_log import DatasetOverrideLog, OverrideAction
+from data.store.app.database.models.ingest_request import IngestRequest, IngestRequestKind, IngestRequestState
 from data.store.app.database.models.panel import (
     Panel,
     PanelCadence,
@@ -83,6 +95,7 @@ SOURCE_SETTINGS = PanelSourceSettingsVersion.__table__
 PASSES = PanelPass.__table__
 TRANSITIONS = PanelMemberTransition.__table__
 OVERRIDES = DatasetOverrideLog.__table__
+REQUESTS = IngestRequest.__table__
 SOURCE = DataSource.MANUAL_ENTRY
 T0 = datetime(2026, 10, 5, 20, tzinfo=UTC)
 DAY = timedelta(days=1)
@@ -95,6 +108,7 @@ class Written:
         self.panels: list[uuid.UUID] = []
         self.source_versions: list[uuid.UUID] = []
         self.datasets: list[uuid.UUID] = []
+        self.requests: list[uuid.UUID] = []
 
 
 @pytest.fixture
@@ -102,6 +116,8 @@ def written(pg_engine: Engine) -> Iterator[Written]:
     ids = Written()
     yield ids
     with pg_engine.begin() as conn:
+        if ids.requests:
+            conn.execute(sa.delete(REQUESTS).where(REQUESTS.c.id.in_(ids.requests)))
         if ids.datasets:
             conn.execute(sa.delete(OVERRIDES).where(OVERRIDES.c.dataset_id.in_(ids.datasets)))
         if ids.panels:
@@ -157,14 +173,63 @@ async def _open(db: AsyncSession, panel, *, kind=PanelPassKind.MEMBERSHIP, dry_r
     )
 
 
-def _row(vendor: str, kind: PanelTransition, as_of: datetime = T0, dataset_id: uuid.UUID | None = None):
-    ids = (
-        {'dataset_id': dataset_id or uuid.uuid4(), 'request_id': uuid.uuid4()}
-        if kind is PanelTransition.CREATED
-        else {}
-    )
+def _row(
+    vendor: str,
+    kind: PanelTransition,
+    as_of: datetime = T0,
+    *,
+    request_id: uuid.UUID | None = None,
+    dataset_id: uuid.UUID | None = None,
+):
+    """A transition of kind. CREATED names a request (a fresh id unless given) and never a dataset (P20d).
+
+    dataset_id is for the kinds that still name one directly (EXITED, DRAINING, DRAINED); it is refused on CREATED.
+    """
+    if kind is PanelTransition.CREATED:
+        request_id = request_id or uuid.uuid4()
     return NewTransition(
-        vendor, vendor.upper(), kind, as_of, cause='c' if kind is PanelTransition.DEFERRED else None, **ids
+        vendor,
+        vendor.upper(),
+        kind,
+        as_of,
+        dataset_id=dataset_id,
+        request_id=request_id,
+        cause='c' if kind is PanelTransition.DEFERRED else None,
+    )
+
+
+async def _request(
+    db: AsyncSession, written: Written, dataset_id: uuid.UUID | None, state: IngestRequestState
+) -> uuid.UUID:
+    """One BARS request row on SOURCE, POST-shaped, in a finished state; deleted by written at the test's end.
+
+    dataset_id is what the intake set on the first delivered attempt, or None for a request that never had one.
+    """
+    request_id = (
+        await db.execute(
+            sa.insert(REQUESTS)
+            .values(
+                kind=IngestRequestKind.BARS,
+                source=SOURCE,
+                dataset_id=dataset_id,
+                client_label='panel-ledger-system-test',
+                state=state,
+            )
+            .returning(REQUESTS.c.id)
+        )
+    ).scalar_one()
+    written.requests.append(request_id)
+    return request_id
+
+
+def _stop(dataset_id: uuid.UUID, reason: str):
+    return sa.insert(OVERRIDES).values(
+        actor='operator',
+        dataset_id=dataset_id,
+        owner='someone-else',
+        action=OverrideAction.SET_COLLECTING,
+        reason=reason,
+        new_value='false',
     )
 
 
@@ -311,34 +376,123 @@ async def test_created_in_window_reads_the_database_clock(pg_async_engine, panel
 
 
 async def test_boundary_read_runs_with_real_override_rows(pg_async_engine, panel, written):
+    """The CREATED row names a real ingest_request row; the dataset is reached only through that request (P20d)."""
     panel_id, settings_id, source_settings_id = panel
     named = uuid.uuid4()
     written.datasets.append(named)
     async with AsyncSession(pg_async_engine) as db:
         dry = await _open(db, panel, dry_run=True)
         pass_id = await _open(db, panel)
-        await append_transitions(db, pass_id, (_row('a', PanelTransition.CREATED, dataset_id=named),))
-        await db.execute(
-            sa.insert(OVERRIDES).values(
-                actor='operator',
-                dataset_id=named,
-                owner='someone-else',
-                action=OverrideAction.SET_COLLECTING,
-                reason='stop it',
-                new_value='false',
-            )
-        )
+        request_id = await _request(db, written, named, IngestRequestState.SUCCEEDED)
+        await append_transitions(db, pass_id, (_row('a', PanelTransition.CREATED, request_id=request_id),))
+        await db.execute(_stop(named, 'stop it'))
         await db.commit()
     await _set_started_at(pg_async_engine, dry, T0 - DAY)
     await _set_started_at(pg_async_engine, pass_id, T0)
 
     async with AsyncSession(pg_async_engine) as db:
+        stored = (await db.execute(sa.select(TRANSITIONS.c.dataset_id).where(TRANSITIONS.c.pass_id == pass_id))).all()
         read = await boundary_read(db, panel_id)
+    assert [r.dataset_id for r in stored] == [None], 'the ledger itself names no dataset'
     (version,) = read.settings_versions
     assert (version.version_id, version.effective_pass_id, version.effective_from) == (settings_id, pass_id, T0)
     mine = {b.version_id: b for b in read.source_settings_versions}
     assert (mine[source_settings_id].effective_pass_id, mine[source_settings_id].effective_from) == (pass_id, T0)
     assert [(s.dataset_id, s.new_value, s.reason) for s in read.collect_stops] == [(named, 'false', 'stop it')]
+
+
+async def test_boundary_read_unions_direct_and_request_datasets_on_postgres(
+    pg_async_engine, panel, written, run_identity
+):
+    """The named set on real Postgres: the UNION of the direct branch and the request join, each with its filters.
+
+    Seven stopped datasets, three reached: by a CREATED row's request, by an EXITED row directly, and by both (the
+    UNION keeps it once). Four are not: a dry-run pass's CREATED request's, a non-CREATED row's request's (the join is
+    CREATED's), another panel's CREATED request's, and one no row names while a request of this panel has a NULL
+    dataset (a request before its first delivered attempt contributes nothing, NULL in the IN set matching no row).
+    """
+    panel_id = panel[0]
+    via_request, direct, both, dry_ds, via_deferred, foreign, unnamed = (uuid.uuid4() for _ in range(7))
+    written.datasets.extend((via_request, direct, both, dry_ds, via_deferred, foreign, unnamed))
+    other_panel = await _other_panel(pg_async_engine, panel, written, run_identity.run_id)
+    async with AsyncSession(pg_async_engine) as db:
+        dry = await _open(db, panel, dry_run=True)
+        real = await _open(db, panel)
+        theirs = await _open(db, other_panel)
+        done = IngestRequestState.SUCCEEDED
+        await append_transitions(
+            db,
+            real,
+            (
+                _row('a', PanelTransition.CREATED, request_id=await _request(db, written, via_request, done)),
+                _row('b', PanelTransition.EXITED, dataset_id=direct),
+                _row('c', PanelTransition.CREATED, request_id=await _request(db, written, both, done)),
+                _row('c', PanelTransition.DRAINING, dataset_id=both),
+                _row(
+                    'd',
+                    PanelTransition.CREATED,
+                    request_id=await _request(db, written, None, IngestRequestState.FAILED),
+                ),
+                _row('e', PanelTransition.DEFERRED, request_id=await _request(db, written, via_deferred, done)),
+            ),
+        )
+        await append_transitions(
+            db, dry, (_row('f', PanelTransition.CREATED, request_id=await _request(db, written, dry_ds, done)),)
+        )
+        await append_transitions(
+            db, theirs, (_row('g', PanelTransition.CREATED, request_id=await _request(db, written, foreign, done)),)
+        )
+        for dataset in (via_request, direct, both, dry_ds, via_deferred, foreign, unnamed):
+            await db.execute(_stop(dataset, 'stop it'))
+        await db.commit()
+
+    async with AsyncSession(pg_async_engine) as db:
+        stops = (await boundary_read(db, panel_id)).collect_stops
+    assert sorted(str(s.dataset_id) for s in stops) == sorted(str(d) for d in (via_request, direct, both))
+
+
+async def _other_panel(engine: AsyncEngine, panel, written: Written, run_id: str):
+    """A second panel on SOURCE sharing our source settings version: its ledger must never reach our read."""
+    _, _, source_settings_id = panel
+    async with AsyncSession(engine, expire_on_commit=False) as db:
+        record, version = await create_panel(
+            db,
+            name=f'system-test-{run_id}-ledger-other-{uuid.uuid4().hex[:8]}',
+            source=SOURCE,
+            settings=PanelSettings(enabled=True, size=10, cadence=PanelCadence.DAILY),
+            actor='operator',
+            reason='ledger system test other panel',
+        )
+    written.panels.append(record.id)
+    return record.id, version.id, source_settings_id
+
+
+# --------------------------------------------------------------------------------------------- PL8 CREATED's shape
+
+
+async def test_a_created_row_names_its_request_only_on_postgres(pg_async_engine, panel):
+    """P20d: CREATED naming a dataset is refused before anything is written; the written one stores no dataset."""
+    with pytest.raises(ValueError, match='must not name a dataset_id'):
+        NewTransition('a', 'A', PanelTransition.CREATED, T0, dataset_id=uuid.uuid4(), request_id=uuid.uuid4())
+    with pytest.raises(ValueError, match='must name its request_id'):
+        NewTransition('a', 'A', PanelTransition.CREATED, T0)
+
+    request_id = uuid.uuid4()
+    async with AsyncSession(pg_async_engine) as db:
+        pass_id = await _open(db, panel)
+        await append_transitions(db, pass_id, (_row('a', PanelTransition.CREATED, request_id=request_id),))
+        await db.commit()
+    async with AsyncSession(pg_async_engine) as db:
+        stored = (
+            await db.execute(
+                sa.select(TRANSITIONS.c.transition, TRANSITIONS.c.dataset_id, TRANSITIONS.c.request_id).where(
+                    TRANSITIONS.c.pass_id == pass_id
+                )
+            )
+        ).all()
+        state = await latest_state(db, panel[0])
+    assert [tuple(r) for r in stored] == [(PanelTransition.CREATED, None, request_id)]
+    assert (state['a'].dataset_id, state['a'].request_id) == (None, request_id)
 
 
 # --------------------------------------------------------------------------------------------- PL5 concurrent finish

@@ -2477,13 +2477,18 @@ def test_a_transition_outlives_its_dataset_and_its_request(scratch: ScratchDb) -
     Since tj-7zjov1.197 the head seed carries the panel cast (seeds/panel_records.py), whose CREATED rows name a seed
     entry and a seed request, so the row deleted under is the seed's own (a plain-SQL cast beside it would collide with
     the seed panel's unique name and the source's version 1).
+
+    Since P20d (tj-7zjov1.216) a CREATED row names its request only and its dataset is the request's dataset_id, so
+    the dataset deleted is reached THROUGH the request (tj-7zjov1.221). The row's own dataset_id is read as stored and
+    must be unchanged: NULL in a head seed dumped after P20d, the cast's dataset id in one dumped before it.
     """
     scratch.load(read_seed(PANEL_REVISION))
     with scratch.engine.connect() as conn:
-        transition, dataset, request = conn.execute(
+        transition, stored_dataset, dataset, request = conn.execute(
             sa.text(
-                f"SELECT id, dataset_id, request_id FROM public.{PANEL_TRANSITION_TABLE} WHERE transition = 'CREATED' "  # nosec B608 -- module constant
-                'AND dataset_id IS NOT NULL AND request_id IS NOT NULL ORDER BY id LIMIT 1'
+                f'SELECT t.id, t.dataset_id, r.dataset_id, t.request_id FROM public.{PANEL_TRANSITION_TABLE} t '  # nosec B608 -- module constants
+                f'JOIN public.{REQUEST_TABLE} r ON r.id = t.request_id '
+                "WHERE t.transition = 'CREATED' AND r.dataset_id IS NOT NULL ORDER BY t.id LIMIT 1"
             )
         ).one()
         named = conn.execute(
@@ -2493,7 +2498,7 @@ def test_a_transition_outlives_its_dataset_and_its_request(scratch: ScratchDb) -
             ),
             {'dataset': dataset, 'request': request},
         ).one()
-    assert tuple(named) == (1, 1), 'the seed CREATED row does not name a seed entry and a seed request'
+    assert tuple(named) == (1, 1), "the seed CREATED row's request does not name a seed entry"
 
     with scratch.engine.begin() as conn:
         conn.execute(sa.text(f'DELETE FROM public.{ENTRY_TABLE} WHERE id = :id'), {'id': dataset})  # nosec B608 -- module constant
@@ -2512,7 +2517,7 @@ def test_a_transition_outlives_its_dataset_and_its_request(scratch: ScratchDb) -
                 "'public.panel_member_transition'::regclass)"
             )
         ).scalar_one()
-    assert tuple(row) == (dataset, request), 'the ledger row was changed or removed with its dataset'
+    assert tuple(row) == (stored_dataset, request), 'the ledger row was changed or removed with its dataset'
     assert foreign == 0
 
 

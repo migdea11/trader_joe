@@ -6,7 +6,7 @@ delete in this module.
 """
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Final
@@ -337,3 +337,102 @@ async def insert_events(
         )
         written += result.rowcount
     return written
+
+
+@dataclass(frozen=True)
+class SnapshotRow:
+    """One asset as a snapshot served it; active and tradable are None when the vendor said nothing."""
+
+    vendor_asset_id: str
+    symbol: str
+    exchange: str
+    active: bool | None
+    tradable: bool | None
+
+
+_SNAPSHOT_T = AssetListSnapshot.__table__
+_ROW_T = AssetListRow.__table__
+
+
+def _record_of(row) -> SnapshotRecord:
+    return SnapshotRecord(
+        id=row.id,
+        source=row.source,
+        asset_type=row.asset_type,
+        asset_list=AssetListStatus(row.asset_list),
+        request_id=row.request_id,
+        attempt_no=row.attempt_no,
+        as_of=row.as_of,
+        row_count=row.row_count,
+    )
+
+
+def _row_of(row) -> SnapshotRow:
+    return SnapshotRow(
+        vendor_asset_id=row.vendor_asset_id,
+        symbol=row.symbol,
+        exchange=row.exchange,
+        active=row.active,
+        tradable=row.tradable,
+    )
+
+
+async def snapshot_by_id(db: AsyncSession, snapshot_id: uuid.UUID) -> SnapshotRecord | None:
+    """One asset-list snapshot header by id."""
+    row = (await db.execute(select(_SNAPSHOT_T).where(_SNAPSHOT_T.c.id == snapshot_id))).one_or_none()
+    return None if row is None else _record_of(row)
+
+
+async def snapshots_between(
+    db: AsyncSession, source: DataSource, status: AssetListStatus, after: datetime, upto: datetime
+) -> list[SnapshotRecord]:
+    """The non-empty snapshots of a list with as_of after one instant and at or before another, oldest first."""
+    rows = await db.execute(
+        select(_SNAPSHOT_T)
+        .where(
+            _SNAPSHOT_T.c.source == source,
+            _SNAPSHOT_T.c.asset_list == status,
+            _SNAPSHOT_T.c.row_count > 0,
+            _SNAPSHOT_T.c.as_of > after,
+            _SNAPSHOT_T.c.as_of <= upto,
+        )
+        .order_by(_SNAPSHOT_T.c.as_of, _SNAPSHOT_T.c.received_at, _SNAPSHOT_T.c.id)
+    )
+    return [_record_of(row) for row in rows]
+
+
+async def snapshot_rows(db: AsyncSession, snapshot_id: uuid.UUID) -> list[SnapshotRow]:
+    """Every row of a snapshot."""
+    rows = await db.execute(
+        select(_ROW_T.c.vendor_asset_id, _ROW_T.c.symbol, _ROW_T.c.exchange, _ROW_T.c.active, _ROW_T.c.tradable).where(
+            _ROW_T.c.snapshot_id == snapshot_id
+        )
+    )
+    return [_row_of(row) for row in rows]
+
+
+async def rows_of_ids(
+    db: AsyncSession, snapshot_ids: Sequence[uuid.UUID], vendor_asset_ids: Collection[str]
+) -> dict[tuple[uuid.UUID, str], SnapshotRow]:
+    """The rows of these vendor assets in these snapshots, keyed by (snapshot id, vendor asset id); absent is absent."""
+    found: dict[tuple[uuid.UUID, str], SnapshotRow] = {}
+    ids = sorted(set(vendor_asset_ids))
+    if not snapshot_ids:
+        return found
+    for start in range(0, len(ids), ID_CHUNK):
+        rows = await db.execute(
+            select(
+                _ROW_T.c.snapshot_id,
+                _ROW_T.c.vendor_asset_id,
+                _ROW_T.c.symbol,
+                _ROW_T.c.exchange,
+                _ROW_T.c.active,
+                _ROW_T.c.tradable,
+            ).where(
+                _ROW_T.c.snapshot_id.in_(list(snapshot_ids)),
+                _ROW_T.c.vendor_asset_id.in_(ids[start : start + ID_CHUNK]),
+            )
+        )
+        for row in rows:
+            found[(row.snapshot_id, row.vendor_asset_id)] = _row_of(row)
+    return found

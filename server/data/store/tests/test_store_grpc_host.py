@@ -138,6 +138,23 @@ class _Order:
         monkeypatch.setattr(app_depends, 'start_instance_watch_loop', watch_start)
         monkeypatch.setattr(app_depends, 'stop_instance_watch_loop', async_step('watch.stop'))
 
+        # The panel manager (tj-7zjov1.34): conftest's inert_panel_manager_loop keeps the real loop out of every
+        # lifespan test; these recorders replace that stub here so the wiring itself is seen.
+        self.panel_task = object()
+        self.stopped_panel_tasks: list[object] = []
+
+        async def panel_start(client):
+            order.append('panel.start')
+            self.handed['panel'] = client
+            return self.panel_task
+
+        async def panel_stop(task):
+            order.append('panel.stop')
+            self.stopped_panel_tasks.append(task)
+
+        monkeypatch.setattr(app_depends, 'start_panel_manager_loop', panel_start)
+        monkeypatch.setattr(app_depends, 'stop_panel_manager_loop', panel_stop)
+
 
 class _FakeHost:
     def __init__(self, order: list[str]):
@@ -215,8 +232,33 @@ async def test_the_host_is_entered_last_and_exited_first(monkeypatch):
         'snapshot': order.submit_client,
         'watch': order.submit_client,
         'on_instance': order.snapshot_loops.schedule.on_instance_seen,
+        'panel': order.submit_client,
     }
     assert app_depends.get_ingest_submit_client() is order.submit_client
+
+
+async def test_the_lifespan_starts_the_panel_loop_on_the_submit_client_and_stops_the_task_it_started(monkeypatch):
+    """The panel manager's lifespan wiring, run (tj-7zjov1.227; test_panel_manager_loop L4 reads only the source).
+
+    Started once, on the Submit client, after the instance watcher and before the host is entered; the task the start
+    returned is the one stopped, once, after the host exits, before the watcher stops and the channel closes, and the
+    database is still up for it.
+    """
+    order = _Order(monkeypatch)
+    monkeypatch.setattr(app_depends, 'build_grpc_host', lambda: _FakeHost(order.steps))
+
+    async with app_depends.lifespan(object()):
+        order.steps.append('serving')
+        assert order.stopped_panel_tasks == [], 'the loop was stopped while serving'
+
+    steps = order.steps
+    assert steps.count('panel.start') == 1 and steps.count('panel.stop') == 1
+    assert order.handed['panel'] is order.submit_client
+    assert order.stopped_panel_tasks == [order.panel_task], 'the task the start returned is the one stopped'
+    assert steps.index('submit_client') < steps.index('watch.start') < steps.index('panel.start')
+    assert steps.index('panel.start') < steps.index('grpc.enter')
+    assert steps.index('grpc.exit') < steps.index('panel.stop') < steps.index('watch.stop')
+    assert steps.index('panel.stop') < steps.index('channel.close') < steps.index('database.shutdown')
 
 
 async def test_with_the_snapshot_schedule_off_the_watcher_gets_no_hook(monkeypatch):

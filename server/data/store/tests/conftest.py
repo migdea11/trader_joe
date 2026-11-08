@@ -102,3 +102,29 @@ def restore_lifespan_globals() -> Iterator[None]:
     finally:
         for name, value in saved.items():
             setattr(app_depends, name, value)
+
+
+@pytest.fixture(autouse=True)
+def inert_panel_manager_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No lifespan test starts the REAL panel manager loop (tj-7zjov1.227, finding (e) of the P22v verdict).
+
+    Since b03edd4 app_depends.lifespan starts the panel manager (tj-7zjov1.34). Every lifespan test fakes the
+    database's initialize, so the real loop's first tick, which runs at once, opened own_session on a session handle
+    that was never initialised and failed RuntimeError ('periodic job failed: name=panel-manager error=RuntimeError'),
+    alongside whatever the test was about, after building every trading calendar off the event loop. Autouse, like
+    restore_lifespan_globals, so every lifespan test present and future is covered without remembering. Only the names
+    the LIFESPAN calls are replaced (app_depends'); panel_manager's own start and stop, which test_panel_manager_loop
+    drives, are untouched. The start answers None, what the real one answers when the loop is off, and the stop is a
+    no-op. A test about the lifespan's wiring of the loop patches these two again with recorders
+    (test_store_grpc_host.py).
+    """
+    from data.store.app import app_depends
+
+    async def start(_client):
+        return None
+
+    async def stop(_task) -> None:
+        return None
+
+    monkeypatch.setattr(app_depends, 'start_panel_manager_loop', start)
+    monkeypatch.setattr(app_depends, 'stop_panel_manager_loop', stop)

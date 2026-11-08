@@ -15,6 +15,11 @@ A transition driven by snapshot evidence is backdated to the first snapshot show
 (the previous snapshot's as_of, as_of]. Every read that picks "the latest" therefore orders by as_of, then the pass's
 started_at, then the pass, then the append order (seq), never by pass alone.
 
+A CREATED ROW NAMES ITS REQUEST ONLY (tj-7zjov1.216, P20d). It names the bars request it wrote and no dataset: the dataset
+is ingest_request.dataset_id of that request, NULL until the delivery intake's first delivered attempt sets it, since the
+intake mints the dataset entry with the resolved feed. Other kinds (EXITED, DRAINING, DRAINED) still name the dataset
+when they have one.
+
 KIND RULE. A RELEASE pass only creates members the last MEMBERSHIP pass deferred and decides no membership. The member
 state reads (latest_state, members_at) take transitions of EITHER kind, since a release writes CREATED rows that
 supersede a DEFERRED one. The effective-from of a settings version is the first non-dry-run pass of EITHER kind naming
@@ -32,6 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.enums.data_stock import DataSource
 from data.store.app.database.models.dataset_override_log import DatasetOverrideLog, OverrideAction
+from data.store.app.database.models.ingest_request import IngestRequest
 from data.store.app.database.models.panel import (
     Panel,
     PanelCadence,
@@ -50,6 +56,7 @@ _SOURCE_SETTINGS = PanelSourceSettingsVersion.__table__
 _PASS = PanelPass.__table__
 _TRANSITION = PanelMemberTransition.__table__
 _OVERRIDE = DatasetOverrideLog.__table__
+_REQUEST = IngestRequest.__table__
 
 # asyncpg allows 32,767 bind parameters per statement; a transition binds 10 (pass_id, panel_id, vendor_asset_id, symbol,
 # transition, dataset_id, request_id, cause, as_of, seq), so 2,000 rows x 10 = 20,000 < 32,767 stays well inside.
@@ -78,7 +85,8 @@ class NewTransition:
     """One member change, as it is written.
 
     as_of is the snapshot instant the pass decided on (see the module docstring), timezone-aware. CREATED must name the
-    dataset and the request it created: that pair is the row's reason to exist.
+    bars request it wrote and must NOT name a dataset: the dataset is ingest_request.dataset_id of that request, NULL
+    until the delivery intake's first delivered attempt sets it.
     """
 
     vendor_asset_id: str
@@ -91,8 +99,11 @@ class NewTransition:
 
     def __post_init__(self) -> None:
         _require_aware(self.as_of, 'as_of')
-        if self.transition is PanelTransition.CREATED and (self.dataset_id is None or self.request_id is None):
-            raise ValueError('a CREATED transition must name its dataset_id and request_id')
+        if self.transition is PanelTransition.CREATED:
+            if self.request_id is None:
+                raise ValueError('a CREATED transition must name its request_id')
+            if self.dataset_id is not None:
+                raise ValueError('a CREATED transition must not name a dataset_id; its request names the dataset')
 
 
 @dataclass(frozen=True)
@@ -505,12 +516,24 @@ async def boundary_read(db: AsyncSession, panel_id: uuid.UUID) -> BoundaryRead:
             select(_SOURCE_SETTINGS).where(_SOURCE_SETTINGS.c.source == source).order_by(_SOURCE_SETTINGS.c.version_no)
         )
     ).all()
-    named = (
-        select(_TRANSITION.c.dataset_id)
+    named_directly = (
+        select(_TRANSITION.c.dataset_id.label('dataset_id'))
         .join(_PASS, _PASS.c.id == _TRANSITION.c.pass_id)
         .where(_TRANSITION.c.panel_id == panel_id, _TRANSITION.c.dataset_id.is_not(None), _PASS.c.dry_run.is_(False))
-        .distinct()
     )
+    # A CREATED row names its request only; the dataset is the request's own, NULL until the first delivered attempt.
+    named_by_request = (
+        select(_REQUEST.c.dataset_id.label('dataset_id'))
+        .join(_TRANSITION, _TRANSITION.c.request_id == _REQUEST.c.id)
+        .join(_PASS, _PASS.c.id == _TRANSITION.c.pass_id)
+        .where(
+            _TRANSITION.c.panel_id == panel_id,
+            _TRANSITION.c.transition == PanelTransition.CREATED,
+            _REQUEST.c.dataset_id.is_not(None),
+            _PASS.c.dry_run.is_(False),
+        )
+    )
+    named = named_directly.union(named_by_request)
     stops = (
         await db.execute(
             select(_OVERRIDE.c.dataset_id, _OVERRIDE.c.new_value, _OVERRIDE.c.actor, _OVERRIDE.c.reason, _OVERRIDE.c.at)

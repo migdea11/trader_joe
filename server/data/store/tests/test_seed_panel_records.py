@@ -8,8 +8,8 @@ replaced by recorders and pins the calls: one panel, its versions, five passes a
 are the EXPECTED constants, every label present, the one same-pass ENTERED + CREATED tie, synthetic names only.
 
 WHAT TIER THIS IS. No Postgres. The crud functions and the session are fakes that record their arguments; NewTransition,
-PanelSettings and SourceSettings are the real dataclasses, so their own validation (a CREATED row must name a dataset
-and a request) still runs. NOT PROVED HERE: that the real crud accepts this cast, which the orchestrator's seed_dump run
+PanelSettings and SourceSettings are the real dataclasses, so their own validation (a CREATED row must name a request
+and no dataset, P20d tj-7zjov1.216) still runs. NOT PROVED HERE: that the real crud accepts this cast, which the orchestrator's seed_dump run
 on the stack proves (tj-7zjov1.197 phase 2), and what Postgres stamps (dump.NORMALISE_SQL, test_seed_dump.py).
 """
 
@@ -354,16 +354,34 @@ def test_every_symbol_a_settings_version_lists_is_synthetic(recorder):
     assert all(SYMBOL_PATTERN.fullmatch(symbol) for symbol in listed)
 
 
-def test_the_created_rows_name_the_casts_dataset_and_requests_and_the_drained_one_an_absent_dataset(recorder):
+def test_the_created_rows_name_the_casts_requests_only_and_the_drained_one_an_absent_dataset(recorder):
+    """P20d (tj-7zjov1.216): a CREATED row names its request, never a dataset.
+
+    The boundary read reaches the dataset through that request, so the only dataset any transition names directly is
+    the DRAINED row's absent one.
+    """
     _run(recorder)
     rows = [row for _, row in recorder.rows()]
     created = [row for row in rows if row.transition is PanelTransition.CREATED]
-    assert {row.dataset_id for row in created} == {DATASET_ID}
-    assert {row.request_id for row in created} == {REQUEST_IDS['SUCCEEDED'], REQUEST_IDS['EMPTY']}
+    assert [row.dataset_id for row in created] == [None, None]
+    assert [(row.vendor_asset_id, row.request_id) for row in created] == [
+        ('seed-asset-a1', REQUEST_IDS['SUCCEEDED']),
+        ('seed-asset-a4', REQUEST_IDS['EMPTY']),
+    ]
     (drained,) = [row for row in rows if row.transition is PanelTransition.DRAINED]
     assert drained.dataset_id == ABSENT_DATASET_ID
     named = {row.dataset_id for row in rows if row.dataset_id is not None}
-    assert named == {DATASET_ID, ABSENT_DATASET_ID}
+    assert named == {ABSENT_DATASET_ID}
+
+
+def test_the_requests_the_created_rows_name_are_written_with_the_casts_dataset():
+    """The SUCCEEDED and EMPTY cast requests are created naming the dataset the ingest cast was handed.
+
+    That is how the boundary read reaches it (P20d). seed_ingest_records needs Postgres, so this is pinned by source.
+    """
+    source = inspect.getsource(ingest_records.seed_ingest_records)
+    for name in ('SUCCEEDED', 'EMPTY'):
+        assert source.count(f"await create('{name}', dataset=dataset_id)") == 1, name
 
 
 def test_a_deferred_or_refused_row_carries_its_cause(recorder):

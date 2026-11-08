@@ -11,19 +11,19 @@ The assets are the asset-list cast's (vendor ids seed-asset-a1 to a4, symbols ZZ
 
   settings v1 (via create_panel; no cadence named, so the default MONTHLY applies), source v1 (via create_panel)
   P1 MEMBERSHIP v1/s1, finished, snapshots AL_ACTIVE_1 and AL_INACTIVE_1, as_of day 0:
-       a1 ENTERED + CREATED (dataset and request of the ingest cast: the same-pass tie that seq orders)
+       a1 ENTERED + CREATED (names a request of the ingest cast, no dataset: the same-pass tie that seq orders)
        a2 ENTERED + DEFERRED (ramp_rate)       a3 ENTERED + REFUSED (a refusal cause)
   source v2, settings v2 (the panel is DISABLED by it: a disable is a version too)
   P2 MEMBERSHIP v2/s2, finished, AL_ACTIVE_2 and AL_INACTIVE_2:
        a4 ENTERED + DEFERRED (request_rate), day 1     a3 EXITED, a2 EXITED, day 1     a2 DRAINING, day 2
   P3 MEMBERSHIP v2/s2, finished, AL_ACTIVE_EMPTY, no inactive snapshot (inactive_snapshot_id NULL):
        a2 DRAINED, day 3, naming a dataset that is absent (deleted: no foreign key keeps it)
-  P4 RELEASE v2/s2, UNFINISHED (finished_at and counts NULL): a4 CREATED, day 3 (the dataset and request of the cast)
+  P4 RELEASE v2/s2, UNFINISHED (finished_at and counts NULL): a4 CREATED, day 3 (names a request of the cast, no dataset)
   P5 MEMBERSHIP v2/s2, DRY RUN, finished: a1 ENTERED, day 3 (a flagged row every read ignores)
 
-Fourteen transitions in all, every PanelTransition at least once; the dataset and request ids of the CREATED rows are
-the ones the ingest cast wrote (dataset_id is the entry the cast's bars go under, the request is a cast request that names
-it). dump.NORMALISE_SQL maps those ids onto the normalised entry ids, which is why the entry id is passed in.
+Fourteen transitions in all, every PanelTransition at least once; a CREATED row names only a request of the
+ingest cast (SUCCEEDED, EMPTY); its dataset is that request's dataset_id, the entry the cast's bars go under, which the
+boundary read reaches through the request. dump.NORMALISE_SQL maps those ids onto the normalised entry ids, which is why the entry id is passed in.
 
 NOTHING HERE READS A CLOCK OR DRAWS A RANDOM ID. Every instant is a literal (the asset-list cast's days). The instants and
 ids Postgres stamps (saved_at, created_at, started_at, finished_at, recorded_at, gen_random_uuid ids) are rewritten by
@@ -80,7 +80,8 @@ async def seed_panel_records(url: URL, dataset_id: uuid.UUID) -> None:
 
     Args:
         url (URL): The asyncpg URL of the scratch database.
-        dataset_id (uuid.UUID): The entry the ingest cast's bars go under; the CREATED rows name it.
+        dataset_id (uuid.UUID): The entry the ingest cast's bars go under. Unused since P20d: the CREATED rows reach
+            it through their requests; kept so the caller's signature stays.
 
     Raises:
         Exception: Whatever the store's code raises for a write it refuses; nothing is caught, a seed is not produced
@@ -174,7 +175,7 @@ async def seed_panel_records(url: URL, dataset_id: uuid.UUID) -> None:
                 'AL_INACTIVE_1',
                 [
                     row('AL_A1', entered, 0),
-                    row('AL_A1', created, 0, dataset_id=dataset_id, request_id=REQUEST_IDS['SUCCEEDED']),
+                    row('AL_A1', created, 0, request_id=REQUEST_IDS['SUCCEEDED']),
                     row('AL_A2', entered, 0),
                     row('AL_A2', deferred, 0, cause='ramp_rate'),
                     row('AL_A3', entered, 0),
@@ -238,7 +239,7 @@ async def seed_panel_records(url: URL, dataset_id: uuid.UUID) -> None:
                 source_2.id,
                 'AL_ACTIVE_EMPTY',
                 'AL_INACTIVE_2',
-                [row('AL_A4', created, 3, dataset_id=dataset_id, request_id=REQUEST_IDS['EMPTY'])],
+                [row('AL_A4', created, 3, request_id=REQUEST_IDS['EMPTY'])],
                 finish=False,
             )
             await run_pass(

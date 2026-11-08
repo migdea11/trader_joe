@@ -207,6 +207,112 @@ async def create_request(db: AsyncSession, request: NewIngestRequest) -> IngestR
         return IngestRequestRecord.from_row(row)
 
 
+async def requests_in_window(db: AsyncSession, source: DataSource, client_label: str, since: datetime) -> int:
+    """How many requests a client label wrote for a source at or after an instant, of every kind and in every state.
+
+    The panel manager's request-rate window (request_cap_per_hour): the caller passes the reserved panel owner and now
+    minus 60 minutes. Counted from the rows, so a restart resets nothing. created_at is database time; the read is
+    served by ix_ingest_request_source_created_at. A request the DAILY refresh wrote carries another label and is not
+    counted.
+
+    Args:
+        db: A session.
+        source: The data source.
+        client_label: The label the requests carry (the panel owner).
+        since: The window start, timezone-aware, inclusive.
+
+    Returns:
+        int: The count.
+
+    Raises:
+        ValueError: since is naive.
+    """
+    if since.tzinfo is None or since.utcoffset() is None:
+        raise ValueError('since must be timezone-aware')
+    table = IngestRequest.__table__
+    return (
+        await db.execute(
+            select(func.count())
+            .select_from(table)
+            .where(table.c.source == source, table.c.created_at >= since, table.c.client_label == client_label)
+        )
+    ).scalar_one()
+
+
+async def symbols_with_open_requests(db: AsyncSession, source: DataSource, client_label: str) -> set[str]:
+    """The symbols a client label has an open request for: a BARS request with no dataset yet, or corporate actions.
+
+    The panel manager's in-flight check: a symbol whose creation (its clamp or its first bars request) is still on its
+    way must not be asked for again. A BARS request that already names a dataset is a refresh and is not counted.
+
+    Args:
+        db: A session.
+        source: The data source.
+        client_label: The label the requests carry (the panel owner).
+
+    Returns:
+        set[str]: The symbols.
+    """
+    table = IngestRequest.__table__
+    rows = await db.execute(
+        select(table.c.asset_symbol)
+        .where(
+            table.c.source == source,
+            table.c.client_label == client_label,
+            table.c.state.in_(list(OPEN_STATES)),
+            table.c.asset_symbol.is_not(None),
+            or_(
+                table.c.kind == IngestRequestKind.CORPORATE_ACTIONS,
+                (table.c.kind == IngestRequestKind.BARS) & table.c.dataset_id.is_(None),
+            ),
+        )
+        .distinct()
+    )
+    return set(rows.scalars())
+
+
+async def requests_by_ids(db: AsyncSession, request_ids: Collection[uuid.UUID]) -> dict[uuid.UUID, IngestRequestRecord]:
+    """The requests with these ids, by id; an id with no row is absent from the result."""
+    found: dict[uuid.UUID, IngestRequestRecord] = {}
+    ids = list(request_ids)
+    for start in range(0, len(ids), 5000):
+        stmt = select(IngestRequest).where(IngestRequest.id.in_(ids[start : start + 5000]))
+        for row in (await db.execute(stmt)).scalars():
+            found[row.id] = IngestRequestRecord.from_row(row)
+    return found
+
+
+async def fetch_finished_since(db: AsyncSession, dataset_id: uuid.UUID, since: datetime) -> bool:
+    """Whether a bars request for the dataset, written at or after an instant, finished with an answer.
+
+    SUCCEEDED (bars written) or EMPTY (the vendor held none) both count: the drain rule (ADR tj-26jt9w, L1) ends when a
+    fetch made after the delisting was seen covers the last session, or comes back empty. A request written after the
+    instant asks up to the moment it was made.
+
+    Args:
+        db: A session.
+        dataset_id: The dataset.
+        since: Aware; only requests created at or after it count.
+
+    Returns:
+        bool: True when such a request finished SUCCEEDED or EMPTY.
+    """
+    table = IngestRequest.__table__
+    found = (
+        await db.execute(
+            select(table.c.id)
+            .where(
+                table.c.kind == IngestRequestKind.BARS,
+                table.c.dataset_id == dataset_id,
+                table.c.created_at >= since,
+                table.c.state.in_([IngestRequestState.SUCCEEDED, IngestRequestState.EMPTY]),
+            )
+            .limit(1)
+        )
+    ).first()
+    return found is not None
+
+
 async def get_request(db: AsyncSession, request_id: uuid.UUID) -> IngestRequestRecord | None:
     """One request by id.
 

@@ -18,7 +18,8 @@ as_of, the pass's started_at, pass_id, seq; a finished pass takes no transitions
      the one UPDATE, which sets only finished_at and counts, guarded by finished_at IS NULL;
   W4 append_transitions takes the panel from the pass row, sends no recorded_at (database time), writes in ROW_CHUNK
      statements, refuses an unknown pass and a FINISHED pass (writing nothing); a CREATED NewTransition must name
-     dataset_id AND request_id; as_of is aware;
+     its request_id and must NOT name a dataset_id (P20d tj-7zjov1.216: the dataset is the request's own), with
+     value-free messages; every other kind is unchanged; as_of is aware;
   W4s seq is 1..n in list order within a pass, continuing across ROW_CHUNK statements and across calls in one pass
      (the pass's max plus one), restarting at 1 in another pass; it is read back on MemberTransition;
   W5 no function commits: the caller's rollback leaves nothing;
@@ -75,6 +76,7 @@ from data.store.app.database.crud.panel_ledger import (
     open_pass,
 )
 from data.store.app.database.models.dataset_override_log import DatasetOverrideLog, OverrideAction
+from data.store.app.database.models.ingest_request import IngestRequest, IngestRequestKind
 from data.store.app.database.models.panel import (
     Panel,
     PanelCadence,
@@ -96,7 +98,9 @@ SOURCE_SETTINGS = PanelSourceSettingsVersion.__table__
 PASSES = PanelPass.__table__
 TRANSITIONS = PanelMemberTransition.__table__
 OVERRIDES = DatasetOverrideLog.__table__
-TABLES = (PANELS, SETTINGS, SOURCE_SETTINGS, PASSES, TRANSITIONS, OVERRIDES)
+# The bars requests a CREATED row names (P20d tj-7zjov1.216): boundary_read reaches a member's dataset through them.
+REQUESTS = IngestRequest.__table__
+TABLES = (PANELS, SETTINGS, SOURCE_SETTINGS, PASSES, TRANSITIONS, OVERRIDES, REQUESTS)
 LEDGER_TABLES = (PASSES, TRANSITIONS)
 
 SOURCE = DataSource.ALPACA_API
@@ -201,6 +205,15 @@ class World:
         result = await self.put(SETTINGS.insert().values(**values).returning(SETTINGS.c.id))
         return result.scalar_one()
 
+    async def request(
+        self, dataset_id: uuid.UUID | None = None, source: DataSource = SOURCE, request_id: uuid.UUID | None = None
+    ) -> uuid.UUID:
+        """A bars request row, POST-shaped: dataset_id NULL until the intake's first delivered attempt sets it."""
+        values = {'kind': IngestRequestKind.BARS, 'source': source, 'dataset_id': dataset_id, 'client_label': 'panel'}
+        if request_id is not None:
+            values['id'] = request_id
+        return (await self.put(REQUESTS.insert().values(**values).returning(REQUESTS.c.id))).scalar_one()
+
     async def panel(self, source: DataSource = SOURCE, name: str | None = None) -> Seeded:
         result = await self.put(
             PANELS.insert().values(name=name or f'panel-{uuid.uuid4().hex[:8]}', source=source).returning(PANELS.c.id)
@@ -249,6 +262,7 @@ async def world(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch)
     copies = {table.name: table.to_metadata(metadata) for table in TABLES}
     for name in ('allow_symbols', 'deny_symbols'):
         copies[SETTINGS.name].c[name].server_default = sa.DefaultClause(sa.text("'[]'"))
+    copies[REQUESTS.name].c.data_types.type = sa.JSON()  # a Postgres ARRAY; only the copy changes (request_tables.py)
     # SQLite gives a column declared UUID NUMERIC affinity, so a random hex id that reads as a number (all digits, or
     # digits around one 'e') would be stored as an integer or a float and fail to read back. CHAR(32) is TEXT affinity.
     for copy in copies.values():
@@ -279,15 +293,9 @@ def entered(vendor: str, as_of: datetime = T0, symbol: str | None = None) -> New
     return NewTransition(vendor, symbol or vendor.upper(), PanelTransition.ENTERED, as_of)
 
 
-def created(vendor: str, as_of: datetime = T0, dataset_id: uuid.UUID | None = None) -> NewTransition:
-    return NewTransition(
-        vendor,
-        vendor.upper(),
-        PanelTransition.CREATED,
-        as_of,
-        dataset_id=dataset_id or uuid.uuid4(),
-        request_id=uuid.uuid4(),
-    )
+def created(vendor: str, as_of: datetime = T0, request_id: uuid.UUID | None = None) -> NewTransition:
+    """A CREATED row as P20d shapes it: it names its bars request only, never a dataset."""
+    return NewTransition(vendor, vendor.upper(), PanelTransition.CREATED, as_of, request_id=request_id or uuid.uuid4())
 
 
 def transition(vendor: str, kind: PanelTransition, as_of: datetime = T0, cause: str | None = None) -> NewTransition:
@@ -568,8 +576,9 @@ async def test_append_transitions_takes_the_panel_from_the_pass_and_writes_every
     dataset_id, request_id = uuid.uuid4(), uuid.uuid4()
     rows = (
         entered('v1', T0, symbol='AAA'),
-        NewTransition('v1', 'AAA', PanelTransition.CREATED, T0, dataset_id=dataset_id, request_id=request_id),
+        NewTransition('v1', 'AAA', PanelTransition.CREATED, T0, request_id=request_id),
         transition('v2', PanelTransition.DEFERRED, T0 - timedelta(days=1), cause='ramp_rate'),
+        NewTransition('v3', 'CCC', PanelTransition.EXITED, T0, dataset_id=dataset_id),
     )
     async with world.session() as db:
         pass_id = await open_pass(
@@ -585,15 +594,16 @@ async def test_append_transitions_takes_the_panel_from_the_pass_and_writes_every
         written = await append_transitions(db, pass_id, rows)
         await db.commit()
 
-    assert written == 3
+    assert written == 4
     stored = sorted(await world.rows(TRANSITIONS), key=lambda r: (r.vendor_asset_id, r.transition.value))
     assert {(r.pass_id, r.panel_id) for r in stored} == {(pass_id, seeded.panel_id)}
     assert [
         (r.vendor_asset_id, r.symbol, r.transition, r.dataset_id, r.request_id, r.cause, r.as_of) for r in stored
     ] == [
-        ('v1', 'AAA', PanelTransition.CREATED, dataset_id, request_id, None, T0),
+        ('v1', 'AAA', PanelTransition.CREATED, None, request_id, None, T0),
         ('v1', 'AAA', PanelTransition.ENTERED, None, None, None, T0),
         ('v2', 'V2', PanelTransition.DEFERRED, None, None, 'ramp_rate', T0 - timedelta(days=1)),
+        ('v3', 'CCC', PanelTransition.EXITED, dataset_id, None, None, T0),
     ]
     assert all(r.recorded_at is not None for r in stored)
 
@@ -819,21 +829,46 @@ async def test_row_chunk_stays_inside_the_asyncpg_bind_limit():
     assert ROW_CHUNK * columns_bound < 32_767
 
 
-@pytest.mark.parametrize('missing', ['dataset_id', 'request_id', 'both'])
-async def test_a_created_transition_must_name_its_dataset_and_request(missing):
-    ids = {'dataset_id': uuid.uuid4(), 'request_id': uuid.uuid4()}
-    if missing == 'both':
-        ids = {}
-    else:
-        ids.pop(missing)
-    with pytest.raises(ValueError, match='CREATED'):
-        NewTransition('v', 'V', PanelTransition.CREATED, T0, **ids)
+async def test_a_created_transition_names_its_request_only():
+    """P20d (tj-7zjov1.216): CREATED names the bars request it wrote; its dataset is that request's, not the row's."""
+    request_id = uuid.uuid4()
+    row = NewTransition('v', 'V', PanelTransition.CREATED, T0, request_id=request_id)
+    assert (row.dataset_id, row.request_id) == (None, request_id)
+
+
+@pytest.mark.parametrize('with_dataset', [False, True], ids=['no-ids', 'dataset-only'])
+async def test_a_created_transition_without_a_request_is_refused_with_a_value_free_message(with_dataset):
+    dataset_id = uuid.uuid4()
+    ids = {'dataset_id': dataset_id} if with_dataset else {}
+    with pytest.raises(ValueError, match=r'^a CREATED transition must name its request_id$') as refused:
+        NewTransition('vendor-x', 'SYMX', PanelTransition.CREATED, T0, **ids)
+    message = str(refused.value)
+    for value in ('vendor-x', 'SYMX', str(dataset_id), dataset_id.hex):
+        assert value not in message
+
+
+async def test_a_created_transition_naming_a_dataset_is_refused_with_a_value_free_message():
+    """The ruling's option D: a dataset id on CREATED would be a guess (the intake mints the entry on delivery)."""
+    dataset_id, request_id = uuid.uuid4(), uuid.uuid4()
+    with pytest.raises(ValueError, match=r'^a CREATED transition must not name a dataset_id') as refused:
+        NewTransition('vendor-x', 'SYMX', PanelTransition.CREATED, T0, dataset_id=dataset_id, request_id=request_id)
+    message = str(refused.value)
+    for value in ('vendor-x', 'SYMX', str(dataset_id), dataset_id.hex, str(request_id), request_id.hex):
+        assert value not in message
 
 
 @pytest.mark.parametrize('kind', [t for t in PanelTransition if t is not PanelTransition.CREATED])
 async def test_every_other_transition_may_name_no_ids(kind):
     row = NewTransition('v', 'V', kind, T0)
     assert (row.dataset_id, row.request_id) == (None, None)
+
+
+@pytest.mark.parametrize('kind', [t for t in PanelTransition if t is not PanelTransition.CREATED])
+async def test_every_other_transition_may_still_name_a_dataset_and_a_request(kind):
+    """Other kinds unchanged by P20d: EXITED, DRAINING and DRAINED name the dataset when they have one."""
+    dataset_id, request_id = uuid.uuid4(), uuid.uuid4()
+    row = NewTransition('v', 'V', kind, T0, dataset_id=dataset_id, request_id=request_id)
+    assert (row.dataset_id, row.request_id) == (dataset_id, request_id)
 
 
 async def test_a_transition_refuses_a_naive_as_of():
@@ -847,7 +882,15 @@ async def test_a_transition_whose_dataset_was_deleted_stays_readable(world):
         assert not column.foreign_keys, column
     seeded = await world.panel()
     gone = uuid.uuid4()  # names no dataset anywhere: as after a delete
-    await world.open(seeded, rows=(entered('a'), created('a', dataset_id=gone)))
+    request_id = await world.request(dataset_id=gone)
+    await world.open(
+        seeded,
+        rows=(
+            entered('a'),
+            created('a', request_id=request_id),
+            NewTransition('a', 'A', PanelTransition.EXITED, T0, dataset_id=gone),
+        ),
+    )
     async with world.session() as db:
         state = await latest_state(db, seeded.panel_id)
         stops = await boundary_read(db, seeded.panel_id)
@@ -855,14 +898,42 @@ async def test_a_transition_whose_dataset_was_deleted_stays_readable(world):
     assert 'a' in state and stops.collect_stops == ()
 
 
+async def test_a_created_row_whose_request_is_missing_stays_readable(world):
+    """No foreign key to requests either: a CREATED naming a request with no row reads back and names no dataset."""
+    seeded = await world.panel()
+    missing = uuid.uuid4()
+    await world.open(seeded, rows=(entered('a'), created('a', request_id=missing)))
+    async with world.session() as db:
+        state = await latest_state(db, seeded.panel_id)
+        stops = await boundary_read(db, seeded.panel_id)
+    assert (state['a'].transition, state['a'].request_id, state['a'].dataset_id) == (
+        PanelTransition.CREATED,
+        missing,
+        None,
+    )
+    assert stops.collect_stops == ()
+
+
 @pytest.mark.parametrize('hex_id', ['1' * 32, '1234567890123456789012345e789012'], ids=['integer-like', 'real-like'])
 async def test_an_id_that_reads_as_a_number_round_trips(world, hex_id):
-    """The tier's own guard: ids are stored as text, so a random id never fails a read now and then."""
+    """The tier's own guard: ids are stored as text, so a random id never fails a read now and then.
+
+    The request id is the one a CREATED row carries (P20d), and the join to the request row matches on it too.
+    """
     seeded = await world.panel()
-    dataset_id = uuid.UUID(hex_id)
-    await world.open(seeded, rows=(created('a', dataset_id=dataset_id),))
+    number_like = uuid.UUID(hex_id)
+    dataset_id = uuid.uuid4()
+    await world.request(dataset_id=dataset_id, request_id=number_like)
+    await world.open(seeded, rows=(created('a', request_id=number_like),))
+    await world.put(
+        OVERRIDES.insert().values(
+            actor='operator', dataset_id=dataset_id, owner='o', action=OverrideAction.SET_COLLECTING, reason='r', at=T0
+        )
+    )
     async with world.session() as db:
-        assert (await latest_state(db, seeded.panel_id))['a'].dataset_id == dataset_id
+        assert (await latest_state(db, seeded.panel_id))['a'].request_id == number_like
+        stops = (await boundary_read(db, seeded.panel_id)).collect_stops
+    assert [stop.dataset_id for stop in stops] == [dataset_id]
 
 
 # --------------------------------------------------------------------------------------------- W5 no commits
