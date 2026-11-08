@@ -98,6 +98,13 @@ from common.tests.roots import REPO_ROOT, SERVER_ROOT
 CHECKOUT_CODE_ROOT = REPO_ROOT
 CHECKOUT_SERVER_DIR = SERVER_ROOT.relative_to(REPO_ROOT)
 
+# Every child this module starts is bounded by this (tj-grna9p.155). One full run stalled here for
+# about 25 minutes with no failure and no name: a child blocked on a lock, a prompt or a slow
+# filesystem hangs pytest silently. With the bound, the stuck call raises subprocess.TimeoutExpired,
+# whose message names the command, and only that test fails. Each child here finishes in seconds;
+# the margin is for a loaded machine, not for any child that is meant to run long.
+SUBPROCESS_TIMEOUT_SECONDS = 120
+
 WORKFLOW_DIR = REPO_ROOT / '.github' / 'workflows'
 COMPOSE_FILE = REPO_ROOT / 'docker-compose.yaml'
 OVERRIDE_FILE = REPO_ROOT / 'docker-compose.override.yaml'
@@ -1647,7 +1654,9 @@ RUFF_UNLINTED_SOURCE_PREFIXES = ('server/data/store/migrations/versions/', 'gen/
 
 def _run(*command: str) -> list[str]:
     """Run a command at the repository root and return its non-empty output lines."""
-    result = subprocess.run(command, cwd=REPO_ROOT, capture_output=True, text=True, check=True)
+    result = subprocess.run(
+        command, cwd=REPO_ROOT, capture_output=True, text=True, check=True, timeout=SUBPROCESS_TIMEOUT_SECONDS
+    )
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
@@ -2196,7 +2205,9 @@ def _expanded_make_variable(name: str, cwd: Path, env: dict[str, str]) -> str:
     assert shutil.which('make'), 'make is not on PATH, so the Makefile cannot be exercised'
     command = ['make', '-s', '--no-print-directory', '-C', str(cwd), '-f', str(MAKEFILE)]
     command += ['--eval', 'print-value-%: ; @: $(info $($*))', f'print-value-{name}']
-    result = subprocess.run(command, capture_output=True, text=True, env=env, check=False)
+    result = subprocess.run(
+        command, capture_output=True, text=True, env=env, check=False, timeout=SUBPROCESS_TIMEOUT_SECONDS
+    )
     assert result.returncode == 0, f'make could not evaluate {name}: {result.stderr}'
     return result.stdout.rstrip('\n')
 
@@ -2221,7 +2232,9 @@ def _run_make(cwd: Path, *arguments: str, env: dict[str, str]) -> subprocess.Com
     assert shutil.which('make'), 'make is not on PATH, so the Makefile target cannot be exercised'
     marker = _expanded_make_variable('VENV_MARKER', cwd, env)
     command = ['make', '--no-print-directory', '-C', str(cwd), '-f', str(MAKEFILE), '-o', marker]
-    return subprocess.run([*command, *arguments], capture_output=True, text=True, env=env, check=False)
+    return subprocess.run(
+        [*command, *arguments], capture_output=True, text=True, env=env, check=False, timeout=SUBPROCESS_TIMEOUT_SECONDS
+    )
 
 
 def _system_recipe_lines(cwd: Path, *arguments: str) -> list[str]:
@@ -2375,6 +2388,7 @@ def test_the_gate_does_not_collect_a_test_under_tests_system(
         text=True,
         env=_subprocess_env(),
         check=False,
+        timeout=SUBPROCESS_TIMEOUT_SECONDS,
     )
     output = result.stdout + result.stderr
     assert result.returncode == 0, f'collection in the copy failed (exit {result.returncode}):\n{output}'
@@ -2670,6 +2684,7 @@ def test_the_client_entrypoint_checks_tz_then_execs_pytest_with_its_arguments():
             text=True,
             env={**_subprocess_env(), 'TZ': zone},
             check=False,
+            timeout=SUBPROCESS_TIMEOUT_SECONDS,
         )
         if reaches:
             assert result.returncode == 0 and 'REACHED-EXEC -m pytest tests/system' in result.stdout, (
@@ -3482,7 +3497,14 @@ def _grep_letters(flags: list[str]) -> str:
 def _grep(flags: list[str], pattern: str, text: str) -> str:
     """Run the real grep with a workflow's own options and pattern; exit 1 (no match) is an answer."""
     assert shutil.which('grep'), 'grep is not on PATH, so the workflow regex cannot be exercised'
-    result = subprocess.run(['grep', *flags, '--', pattern], input=text, capture_output=True, text=True, check=False)
+    result = subprocess.run(
+        ['grep', *flags, '--', pattern],
+        input=text,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=SUBPROCESS_TIMEOUT_SECONDS,
+    )
     assert result.returncode in (0, 1), f'grep {flags} {pattern!r} failed: {result.stderr}'
     return result.stdout
 
@@ -6003,6 +6025,7 @@ def test_every_staged_env_read_takes_the_last_line_and_the_full_value(tmp_path: 
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=SUBPROCESS_TIMEOUT_SECONDS,
             )
             if result.returncode != 0 or result.stdout.rstrip('\n') != want:
                 wrong.append(f'{where} {function}(), {case}: got {result.stdout!r} (exit {result.returncode})')
@@ -6789,6 +6812,7 @@ def _ruff_codes_by_line(filename: str, source: str) -> dict[int, set[str]]:
         input=source,
         capture_output=True,
         text=True,
+        timeout=SUBPROCESS_TIMEOUT_SECONDS,
     )
     assert result.returncode in (0, 1), f'ruff did not run: exit {result.returncode}\n{result.stderr}'
     found: dict[int, set[str]] = {}
@@ -7203,7 +7227,9 @@ def _digest_services() -> list[tuple[str, str]]:
 
 def _run_source_digest(script: Path, *arguments: str) -> subprocess.CompletedProcess:
     """Run a source_digest.sh without checking its status; the status is what most tests assert."""
-    return subprocess.run([str(script), *arguments], capture_output=True, text=True, check=False)
+    return subprocess.run(
+        [str(script), *arguments], capture_output=True, text=True, check=False, timeout=SUBPROCESS_TIMEOUT_SECONDS
+    )
 
 
 def _source_digest(*arguments: str) -> list[str]:
@@ -7599,3 +7625,36 @@ def test_the_digest_moves_for_what_the_image_sees_and_only_for_that(digest_sandb
         assert after.stdout != before.stdout, 'the image would change, but the digest held still'
     else:
         assert after.stdout == before.stdout, 'the image would not change, but the digest moved'
+
+
+_SUBPROCESS_STARTERS = {'run', 'call', 'check_call', 'check_output', 'Popen'}
+
+
+def test_every_subprocess_call_in_this_module_carries_the_timeout():
+    """tj-grna9p.155: a child started here without a bound can hang the whole suite unattributed.
+
+    Read from this module's own syntax tree, so a new call added without the bound fails here by line
+    number instead of waiting for the next hang to find it. Popen is refused outright: it takes no
+    timeout, so the bound would rest on whoever remembers to pass one to wait().
+    """
+    tree = ast.parse(Path(__file__).read_text(encoding='utf-8'))
+    starts, unbounded = [], []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == 'subprocess':
+            unbounded.append(f'line {node.lineno}: `from subprocess import` hides calls from this check')
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == 'subprocess'
+            and node.func.attr in _SUBPROCESS_STARTERS
+        ):
+            continue
+        starts.append(node.lineno)
+        bound = {keyword.arg: keyword.value for keyword in node.keywords}.get('timeout')
+        if node.func.attr == 'Popen':
+            unbounded.append(f'line {node.lineno}: subprocess.Popen takes no timeout')
+        elif not (isinstance(bound, ast.Name) and bound.id == 'SUBPROCESS_TIMEOUT_SECONDS'):
+            unbounded.append(f'line {node.lineno}: subprocess.{node.func.attr} without the module timeout')
+    assert starts, 'found no subprocess call in this module, so the check above read nothing'
+    assert not unbounded, f'unbounded children in {Path(__file__).name}: {unbounded}'
