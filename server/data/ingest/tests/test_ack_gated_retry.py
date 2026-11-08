@@ -1145,6 +1145,9 @@ async def test_a_request_with_no_body_for_its_kind_is_still_refused_invalid_requ
         await handler.submit(bodiless)
 
     assert raised.value.reason is Reason.INVALID_REQUEST
+    # With every body missing, SubmitRequest.kind falls through to corporate_actions. Pinned by tj-7zjov1.170: the
+    # detail says the request is invalid, not that its kind is unserved (every kind is served).
+    assert raised.value.detail == 'invalid corporate_actions request: no body for its kind'
     assert all(handle.submitted == [] for handle in handles.values())
 
 

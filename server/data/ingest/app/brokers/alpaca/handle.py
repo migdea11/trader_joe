@@ -37,7 +37,7 @@ from data.ingest.app.brokers.alpaca.asset_attempt import AssetListAttemptRunner,
 from data.ingest.app.brokers.alpaca.corporate_actions_attempt import CorporateActionsAttemptRunner, CorporateActionsWork
 from data.ingest.app.brokers.alpaca.read import AlpacaRead
 from data.ingest.app.brokers.bars_attempt import BarsAttemptRunner, BarsWork
-from data.ingest.app.brokers.handle import BrokerHandle, Intake
+from data.ingest.app.brokers.handle import BrokerHandle, Intake, no_body
 from data.ingest.app.brokers.interface import BrokerRead
 from data.ingest.app.brokers.rate_budget import RequestPriority
 from data.ingest.app.scheduler.credentials import Credential, StaticCredentialProvider
@@ -266,7 +266,7 @@ class AlpacaHandle(BrokerHandle):
         """
         listing = request.asset_list
         if listing is None:
-            raise InvalidRequestError(Reason.INVALID_REQUEST, f'{request.kind.value} requests are not served yet')
+            raise no_body(request.kind)
         if listing.asset_type is not AssetType.STOCK:
             raise InvalidRequestError(
                 Reason.UNSUPPORTED_ASSET_TYPE, f'Alpaca lists stocks only: asset_type={listing.asset_type!r}'
@@ -294,7 +294,7 @@ class AlpacaHandle(BrokerHandle):
         """
         actions = request.corporate_actions
         if actions is None:
-            raise InvalidRequestError(Reason.INVALID_REQUEST, f'{request.kind.value} requests are not served yet')
+            raise no_body(request.kind)
         return Intake(
             scope=ALPACA_DATA_SCOPE, payload=CorporateActionsWork(request=actions, priority=RequestPriority.BACKFILL)
         )

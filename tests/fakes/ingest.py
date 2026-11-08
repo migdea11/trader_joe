@@ -46,7 +46,7 @@ from data.ingest.app.brokers.alpaca.handle import (
     estimate_request_calls,
 )
 from data.ingest.app.brokers.bars_attempt import BarsAttemptRunner
-from data.ingest.app.brokers.handle import BrokerHandle, Intake
+from data.ingest.app.brokers.handle import BrokerHandle, Intake, no_body
 from data.ingest.app.brokers.rate_budget import RequestPriority
 from data.ingest.app.instance import InstanceIdentity, mint_instance
 from data.ingest.app.scheduler import (
@@ -96,7 +96,7 @@ def _asset_list_intake(request: SubmitRequest) -> Intake:
     """AlpacaHandle's asset-list intake: stocks only, the trading scope, BACKFILL, no tape."""
     listing = request.asset_list
     if listing is None:
-        raise InvalidRequestError(Reason.INVALID_REQUEST, f'{request.kind.value} requests are not served yet')
+        raise no_body(request.kind)
     if listing.asset_type is not AssetType.STOCK:
         raise InvalidRequestError(
             Reason.UNSUPPORTED_ASSET_TYPE, f'The fake lists stocks only: asset_type={listing.asset_type!r}'
@@ -108,7 +108,7 @@ def _corporate_actions_intake(request: SubmitRequest) -> Intake:
     """AlpacaHandle's corporate-actions intake: the data scope, BACKFILL, no tape."""
     actions = request.corporate_actions
     if actions is None:
-        raise InvalidRequestError(Reason.INVALID_REQUEST, f'{request.kind.value} requests are not served yet')
+        raise no_body(request.kind)
     return Intake(
         scope=ALPACA_DATA_SCOPE, payload=CorporateActionsWork(request=actions, priority=RequestPriority.BACKFILL)
     )

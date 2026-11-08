@@ -532,7 +532,7 @@ async def test_a_request_naming_corporate_actions_with_no_body_raises_invalid_re
         await handle.submit(bodiless)
 
     assert raised.value.reason is Reason.INVALID_REQUEST
-    assert raised.value.detail == 'corporate_actions requests are not served yet'
+    assert raised.value.detail == 'invalid corporate_actions request: no body for its kind'
     assert handle.scheduler.queued == 0
     assert handle.active == 0
 

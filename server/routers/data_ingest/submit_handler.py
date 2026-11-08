@@ -63,7 +63,9 @@ class IngestSubmitHandler:
         elif request.kind is RequestKind.ASSET_LIST and request.asset_list is not None:
             source = request.asset_list.source
         else:
-            raise InvalidRequestError(Reason.INVALID_REQUEST, f'{request.kind.value} requests are not served yet')
+            raise InvalidRequestError(
+                Reason.INVALID_REQUEST, f'invalid {request.kind.value} request: no body for its kind'
+            )
         handle = self._handles.get(source)
         if handle is None:
             raise NotImplementedError(f'data source not implemented: source={source!r}')

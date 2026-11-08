@@ -456,12 +456,17 @@ def bodiless(kind: RequestKind) -> SimpleNamespace:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('kind', list(RequestKind), ids=lambda kind: kind.value)
-async def test_a_kind_with_its_body_missing_raises_invalid_request_with_the_old_detail(alpaca, kind):
+async def test_a_kind_with_its_body_missing_raises_invalid_request_saying_it_has_no_body(alpaca, kind):
+    """RE-WORDED by tj-7zjov1.171: every kind is served, so a missing body is invalid, not 'not served yet'.
+
+    The text matches the submit handler's own no-body refusal. The literal is pinned here, not imported, so a change
+    to the production wording goes red.
+    """
     with pytest.raises(InvalidRequestError) as raised:
         await alpaca.handle.submit(bodiless(kind))
 
     assert raised.value.reason is Reason.INVALID_REQUEST
-    assert raised.value.detail == f'{kind.value} requests are not served yet'
+    assert raised.value.detail == f'invalid {kind.value} request: no body for its kind'
     assert alpaca.order == []
     assert alpaca.handle.active == 0
 

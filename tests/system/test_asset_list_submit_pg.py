@@ -50,9 +50,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from common.enums.data_select import AssetType
 from common.enums.data_stock import DataSource, Feed
-from common.errors.vocabulary import InvalidRequestError, Reason, TraderJoeError
+from common.errors.vocabulary import InvalidRequestError, TraderJoeError
 from data.ingest.app.brokers.alpaca.asset_attempt import AssetListAttemptRunner, AssetListWork
-from data.ingest.app.brokers.handle import BrokerHandle, Intake
+from data.ingest.app.brokers.handle import BrokerHandle, Intake, no_body
 from data.ingest.app.brokers.rate_budget import RequestPriority
 from data.ingest.app.scheduler import (
     AckGatedExecutor,
@@ -220,7 +220,7 @@ def _asset_list_intake(request: SubmitRequest) -> Intake:
     """AlpacaHandle's asset-list intake, as tests/fakes/ingest.py restates it: trading scope, BACKFILL, no tape."""
     listing = request.asset_list
     if listing is None:
-        raise InvalidRequestError(Reason.INVALID_REQUEST, f'{request.kind.value} requests are not served yet')
+        raise no_body(request.kind)
     return Intake(scope=TRADING_SCOPE, payload=AssetListWork(request=listing, priority=RequestPriority.BACKFILL))
 
 

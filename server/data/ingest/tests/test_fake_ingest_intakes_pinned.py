@@ -227,6 +227,8 @@ def test_both_intakes_refuse_a_request_without_their_kinds_body_alike(alpaca_int
 
     assert refusal_view(fake_refusal.value) == refusal_view(alpaca_refusal.value)
     assert fake_refusal.value.detail == alpaca_refusal.value.detail
+    # Equal alone would pass if both drifted together; the literal pins the wording on both sides (tj-7zjov1.171).
+    assert alpaca_refusal.value.detail == f'invalid {request.kind.value} request: no body for its kind'
 
 
 @pytest.mark.asyncio

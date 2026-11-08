@@ -56,8 +56,13 @@ class Intake:
 
 
 def _not_served(kind: RequestKind) -> InvalidRequestError:
-    """Build INVALID_REQUEST for a kind (or a kind's missing body) this handle does not serve yet."""
+    """Build INVALID_REQUEST for a kind this handle has no intake for."""
     return InvalidRequestError(Reason.INVALID_REQUEST, f'{kind.value} requests are not served yet')
+
+
+def no_body(kind: RequestKind) -> InvalidRequestError:
+    """Build INVALID_REQUEST for a request that carries no body for its kind."""
+    return InvalidRequestError(Reason.INVALID_REQUEST, f'invalid {kind.value} request: no body for its kind')
 
 
 class BrokerHandle:
@@ -229,7 +234,7 @@ class BrokerHandle:
         request goes out without one, and a feed is never guessed for one that did.
         """
         if request.bars is None:
-            raise _not_served(request.kind)
+            raise no_body(request.kind)
         bars = request.bars
         feed = self.__feed
         if bars.feed is not None and bars.feed != feed:

@@ -47,7 +47,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from common.enums.data_stock import DataSource, Feed
 from common.errors.vocabulary import InvalidRequestError, Reason, TraderJoeError
 from data.ingest.app.brokers.alpaca.corporate_actions_attempt import CorporateActionsAttemptRunner, CorporateActionsWork
-from data.ingest.app.brokers.handle import BrokerHandle, Intake
+from data.ingest.app.brokers.handle import BrokerHandle, Intake, no_body
 from data.ingest.app.brokers.rate_budget import RequestPriority
 from data.ingest.app.scheduler import (
     AckGatedExecutor,
@@ -209,7 +209,7 @@ def _corporate_actions_intake(request: SubmitRequest) -> Intake:
     """AlpacaHandle's corporate-actions intake, as tests/fakes/ingest.py restates it: data scope, BACKFILL, no tape."""
     actions = request.corporate_actions
     if actions is None:
-        raise InvalidRequestError(Reason.INVALID_REQUEST, f'{request.kind.value} requests are not served yet')
+        raise no_body(request.kind)
     return Intake(scope=DATA_SCOPE, payload=CorporateActionsWork(request=actions, priority=RequestPriority.BACKFILL))
 
 
