@@ -93,6 +93,11 @@ COLLECT_FILE = f'{COLLECT_REVISION}_dataset_entry_collect.py'
 # test_override_action_set_collecting_revision.py.
 SET_COLLECTING_REVISION = 'a6d3f8e1c205'
 SET_COLLECTING_FILE = f'{SET_COLLECTING_REVISION}_override_action_set_collecting.py'
+# THE HEAD SINCE tj-7zjov1.25: ingest_request, ingest_instance and the attempt columns on ingest_run, PURELY
+# ADDITIVE and directly on the SET_COLLECTING revision. It touches no entry or bar key; its own shape is pinned in
+# test_request_record_revision.py.
+REQUEST_RECORD_REVISION = 'f2b7d4a91c36'
+REQUEST_RECORD_FILE = f'{REQUEST_RECORD_REVISION}_request_record_and_instance_marker.py'
 # The parent the epic's design names for its one revision (tj-vhboky.12 item 1).
 PARENT_REVISION = '8f41c2d7a3b9'
 PARENT_FILE = f'{PARENT_REVISION}_bar_natural_key_and_upsert.py'
@@ -250,12 +255,21 @@ def test_each_revision_of_the_two_epics_sits_directly_on_the_one_before_it():
     # A FOURTH since tj-grna9p.46: the dataset_read revision, directly on ingest_run.
     # A FIFTH since tj-grna9p.86: the override-log revision, directly on dataset_read.
     # A SIXTH since tj-grna9p.176: the collect revision, directly on the override-log revision.
-    # A SEVENTH since tj-grna9p.183: the head is the SET_COLLECTING enum revision, directly on the collect revision.
-    assert head_revision.module.__file__.endswith(SET_COLLECTING_FILE), (
-        f'the head is not {SET_COLLECTING_FILE}: {head_revision.module.__file__}'
+    # A SEVENTH since tj-grna9p.183: the SET_COLLECTING enum revision, directly on the collect revision.
+    # AN EIGHTH since tj-7zjov1.25: the head is the request-record revision, directly on SET_COLLECTING.
+    assert head_revision.module.__file__.endswith(REQUEST_RECORD_FILE), (
+        f'the head is not {REQUEST_RECORD_FILE}: {head_revision.module.__file__}'
     )
-    assert head_revision.down_revision == COLLECT_REVISION, (
-        f'the head does not sit directly on {COLLECT_REVISION}: {head_revision.down_revision}'
+    assert head_revision.down_revision == SET_COLLECTING_REVISION, (
+        f'the head does not sit directly on {SET_COLLECTING_REVISION}: {head_revision.down_revision}'
+    )
+    set_collecting_revision = script.get_revision(SET_COLLECTING_REVISION)
+    assert set_collecting_revision.module.__file__.endswith(SET_COLLECTING_FILE), (
+        f'{SET_COLLECTING_REVISION} is not {SET_COLLECTING_FILE}'
+    )
+    assert set_collecting_revision.down_revision == COLLECT_REVISION, (
+        f'{SET_COLLECTING_REVISION} does not sit directly on {COLLECT_REVISION}: '
+        f'{set_collecting_revision.down_revision}'
     )
     collect_revision = script.get_revision(COLLECT_REVISION)
     assert collect_revision.module.__file__.endswith(COLLECT_FILE), f'{COLLECT_REVISION} is not {COLLECT_FILE}'

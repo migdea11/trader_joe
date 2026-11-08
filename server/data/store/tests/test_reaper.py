@@ -32,7 +32,7 @@ import logging
 import re
 import uuid
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -1144,6 +1144,8 @@ async def test_the_lifespan_starts_the_reaper_and_stops_it_before_the_database(m
     monkeypatch.setattr(app_depends, 'target_from_env', lambda _name: 'ingest:1')
     monkeypatch.setattr(app_depends, 'create_channel', lambda _target: FakeChannel())
     monkeypatch.setattr(app_depends, 'GrpcIngestFetchClient', lambda _channel: object())
+    # The lifespan builds the StoreService host from the bind env first (tj-7zjov1.27); none is bound here.
+    monkeypatch.setattr(app_depends, 'build_grpc_host', nullcontext)
 
     async with app_depends.lifespan(app):
         for _ in range(50):

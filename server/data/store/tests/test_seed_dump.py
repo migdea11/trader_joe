@@ -20,8 +20,12 @@ import itertools
 import re
 
 import pytest
+from sqlalchemy.sql.functions import now as sql_now
 
 from data.store.app.database.models.base_market_activity import BaseMarketActivity
+from data.store.app.database.models.ingest_instance import IngestInstance
+from data.store.app.database.models.ingest_request import IngestRequest
+from data.store.app.database.models.ingest_run import IngestRun
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.seeds import dump
@@ -29,13 +33,20 @@ from data.store.seeds.dump import (
     BAR_SEQUENCE,
     BAR_TABLE,
     ENTRY_TABLE,
+    INSTANCE_TABLE,
     NORMALISE_SQL,
+    REQUEST_TABLE,
+    RUN_TABLE,
     SEED_TABLES,
     DumpRefused,
     check_no_meta_commands,
+    order_column,
     render_table_sql,
     with_sequence_position,
 )
+
+
+SEED_MODELS = (StoreDatasetEntry, StockMarketActivity, IngestInstance, IngestRequest, IngestRun)
 
 
 pytestmark = pytest.mark.data_store
@@ -72,7 +83,7 @@ def _pg_quote_nullable(value: object) -> str:
 
 
 def _split(sql: str, table: str) -> str:
-    prefix, suffix = 'SELECT ', f' FROM public.{table} ORDER BY id;'
+    prefix, suffix = 'SELECT ', f' FROM public.{table} ORDER BY {order_column(table)};'
     assert sql.startswith(prefix) and sql.endswith(suffix), sql
     return sql[len(prefix) : -len(suffix)]
 
@@ -125,14 +136,38 @@ def test_the_query_renders_the_documented_line():
     assert line == "INSERT INTO public.t (a, b, id) VALUES ('x', NULL, '7');"
 
 
-def test_every_seed_table_renders_its_own_rows_ordered_by_id():
+def test_every_seed_table_renders_its_own_rows_ordered_by_its_order_column():
     for table in SEED_TABLES:
         sql = render_table_sql(table, ['id', 'owner'])
         assert sql.startswith(f"SELECT 'INSERT INTO public.{table} (' || ")
-        assert sql.endswith(f' FROM public.{table} ORDER BY id;')
+        assert sql.endswith(f' FROM public.{table} ORDER BY {order_column(table)};')
         assert render_line(sql, table, {'id': 1, 'owner': 'seed-owner-a'}) == (
             f"INSERT INTO public.{table} (id, owner) VALUES ('1', 'seed-owner-a');"
         )
+
+
+def test_the_instance_marker_renders_ordered_by_instance_id():
+    """ingest_instance has no id column: ORDER BY id would fail the render on Postgres."""
+    sql = render_table_sql(INSTANCE_TABLE, ['instance_id', 'superseded_at'])
+    assert sql.endswith(f' FROM public.{INSTANCE_TABLE} ORDER BY instance_id;')
+
+
+# ---------------------------------------------------------------------------------------------
+# order_column
+# ---------------------------------------------------------------------------------------------
+
+
+def test_order_column_is_instance_id_for_the_instance_marker_and_id_elsewhere():
+    assert order_column(INSTANCE_TABLE) == 'instance_id'
+    assert [order_column(table) for table in (ENTRY_TABLE, BAR_TABLE, REQUEST_TABLE, RUN_TABLE)] == ['id'] * 4
+    assert order_column('some_other_table') == 'id'
+
+
+@pytest.mark.parametrize('model', SEED_MODELS, ids=lambda model: model.__tablename__)
+def test_order_column_is_each_seed_tables_one_primary_key_column(model):
+    """A total, database-independent order needs a unique key: the primary key, whatever it is called."""
+    (key,) = model.__table__.primary_key.columns
+    assert order_column(model.__tablename__) == key.name
 
 
 def test_a_hostile_column_name_stays_a_quoted_name_on_both_sides():
@@ -244,9 +279,10 @@ def test_the_pg_dump_era_names_are_gone():
 # ---------------------------------------------------------------------------------------------
 
 
-def test_the_seed_tables_are_the_two_market_tables_parents_first():
-    assert (StoreDatasetEntry.__tablename__, StockMarketActivity.__tablename__) == SEED_TABLES
-    assert (ENTRY_TABLE, BAR_TABLE) == SEED_TABLES
+def test_the_seed_tables_are_the_market_tables_then_the_ingest_tables():
+    """Bead tj-7zjov1.100: entries, bars, instances, requests, runs, as the models name them."""
+    assert tuple(model.__tablename__ for model in SEED_MODELS) == SEED_TABLES
+    assert (ENTRY_TABLE, BAR_TABLE, INSTANCE_TABLE, REQUEST_TABLE, RUN_TABLE) == SEED_TABLES
     assert not any('archive' in table for table in SEED_TABLES)
 
 
@@ -271,7 +307,8 @@ def test_the_rewrite_is_one_transaction_at_utc_over_both_tables():
     assert statements[0] == 'BEGIN'
     assert statements[-1] == 'COMMIT'
     assert statements[1] == "SET LOCAL TIME ZONE 'UTC'"
-    assert f'TRUNCATE {ENTRY_TABLE}, {BAR_TABLE}' in statements
+    assert f'TRUNCATE {", ".join(SEED_TABLES)}' in statements
+    assert sum(1 for statement in statements if statement.startswith('TRUNCATE')) == 1
 
 
 def test_both_timestamps_of_both_tables_become_the_constant():
@@ -287,3 +324,52 @@ def test_rows_are_reinserted_in_id_order_and_the_sequence_follows():
     assert f'INSERT INTO {ENTRY_TABLE} SELECT * FROM seed_entry ORDER BY id;' in NORMALISE_SQL
     assert f'INSERT INTO {BAR_TABLE} SELECT * FROM seed_bar ORDER BY id;' in NORMALISE_SQL
     assert f"setval(pg_get_serial_sequence('{BAR_TABLE}', 'id'), max(id), true)" in NORMALISE_SQL
+
+
+@pytest.mark.parametrize(
+    ('table', 'temp'), [(INSTANCE_TABLE, 'seed_instance'), (REQUEST_TABLE, 'seed_request'), (RUN_TABLE, 'seed_run')]
+)
+def test_each_ingest_table_is_copied_and_reinserted_in_its_order(table, temp):
+    assert f'CREATE TEMP TABLE {temp} ON COMMIT DROP AS SELECT * FROM {table};' in NORMALISE_SQL
+    assert f'INSERT INTO {table} SELECT * FROM {temp} ORDER BY {order_column(table)};' in NORMALISE_SQL
+
+
+def _is_now(column) -> bool:
+    default = column.server_default
+    return default is not None and isinstance(getattr(default, 'arg', None), sql_now)
+
+
+@pytest.mark.parametrize(
+    ('model', 'temp'), [(IngestInstance, 'seed_instance'), (IngestRequest, 'seed_request'), (IngestRun, 'seed_run')]
+)
+def test_every_column_postgres_stamps_with_now_is_rewritten(model, temp):
+    """A now() default left as stamped differs between two runs, and the seed is no longer deterministic."""
+    stamped = [column.name for column in model.__table__.columns if _is_now(column)]
+    assert stamped, 'the model has a now() default this test reads'
+    for name in stamped:
+        # Inside one UPDATE of the temp copy (no ';' between), the column is assigned.
+        assert re.search(rf'UPDATE {temp}( \w+)? SET [^;]*?\b{name} = ', NORMALISE_SQL), name
+
+
+def test_the_finished_and_superseded_instants_are_rewritten_too():
+    """Stamped with now() by the code, not by a default: the request's finish, the instance's supersession."""
+    assert re.search(r"UPDATE seed_request SET finished_at = TIMESTAMPTZ '[^']+' \+ interval '1 hour'", NORMALISE_SQL)
+    assert re.search(r'superseded_at = CASE WHEN superseded_at IS NULL THEN NULL ELSE ', NORMALISE_SQL)
+    assert re.search(r"UPDATE seed_run SET started_at = TIMESTAMPTZ '[^']+', finished_at = ", NORMALISE_SQL)
+
+
+def test_the_random_run_ids_become_the_md5_of_a_rank_over_the_rows_content():
+    """gen_random_uuid() ids differ every run; the rank orders by the request and attempt first, then the labels."""
+    assert f"UPDATE seed_run r SET id = md5('{RUN_TABLE}|' || k.rank::text)::uuid" in NORMALISE_SQL
+    order = re.search(
+        r'UPDATE seed_run r SET id .*?row_number\(\) OVER \(\s*ORDER BY (.*?)\) AS rank', NORMALISE_SQL, re.S
+    )
+    assert order is not None
+    columns = [part.strip() for part in order.group(1).split(',')]
+    assert columns[:2] == ['request_id NULLS FIRST', 'attempt_no NULLS FIRST']
+    assert {name.split()[0] for name in columns} <= {column.name for column in IngestRun.__table__.columns}
+
+
+@pytest.mark.parametrize('temp', ['seed_request', 'seed_run'])
+def test_an_ingest_rows_dataset_id_follows_the_entry_map(temp):
+    assert f'UPDATE {temp} r SET dataset_id = m.new_id FROM seed_map m WHERE r.dataset_id = m.old_id;' in NORMALISE_SQL

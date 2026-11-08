@@ -62,6 +62,8 @@ class IngestRunRecord:
     error_id: str | None
     started_at: datetime
     finished_at: datetime | None
+    # The vendor asset id of a delivered bars attempt, as received; NULL otherwise.
+    vendor_asset_id: str | None = None
 
     @classmethod
     def from_row(cls, row: IngestRun | Row) -> 'IngestRunRecord':
@@ -92,6 +94,7 @@ class IngestRunRecord:
             error_id=row.error_id,
             started_at=row.started_at,
             finished_at=row.finished_at,
+            vendor_asset_id=row.vendor_asset_id,
         )
 
 

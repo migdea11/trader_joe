@@ -55,6 +55,8 @@ ALLOWED_MODELS = {
     'dataset_override_log',
     'dataset_read',
     'dataset_read_daily',
+    'ingest_instance',
+    'ingest_request',
     'ingest_run',
     'stock_market_activity',
     'store_dataset_entry',

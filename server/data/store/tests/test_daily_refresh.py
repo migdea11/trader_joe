@@ -1500,6 +1500,10 @@ async def test_the_lifespan_starts_the_refresh_after_the_fetch_client_and_stops_
     monkeypatch.setattr(DailyRefresher, 'run_pass', run_pass)
     monkeypatch.setattr(app_depends, 'start_daily_refresh_loops', start)
     monkeypatch.setattr(app_depends, 'stop_daily_refresh_loops', stop)
+    # The lifespan builds the StoreService host from the bind env first (tj-7zjov1.27); none is bound here.
+    from contextlib import nullcontext
+
+    monkeypatch.setattr(app_depends, 'build_grpc_host', nullcontext)
 
     async with app_depends.lifespan(app):
         await _turns(50, until=lambda: bool(passes))
@@ -1520,6 +1524,10 @@ async def test_the_lifespan_starts_no_refresh_when_it_is_off(monkeypatch):
     _lifespan_fakes(monkeypatch, order, object())
     monkeypatch.setenv(refresh_module.ENABLED_ENV, 'off')
     monkeypatch.setattr(refresh_module, 'run_periodic', started)
+    # The lifespan builds the StoreService host from the bind env first (tj-7zjov1.27); none is bound here.
+    from contextlib import nullcontext
+
+    monkeypatch.setattr(app_depends, 'build_grpc_host', nullcontext)
 
     async with app_depends.lifespan(app):
         pass

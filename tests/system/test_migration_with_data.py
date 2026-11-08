@@ -43,9 +43,17 @@ tj-vhboky.47), never passes.
 
 THE DIGESTS ARE RECOMPUTED, NOT TRUSTED. data_digests() below is an independent implementation of
 manifest.py's documented algorithm: Postgres renders each item (`'n'`, or `'v' || column::text`) in a
-session at TimeZone UTC and extra_float_digits 1, rows ordered by id; Python joins the items with a
-newline and hashes them with SHA-256. It does not call column_digest_sql, so the producer's query is
-checked against it, not with it (decision tj-vhboky.55 S7/S9 (5)).
+session at TimeZone UTC and extra_float_digits 1, rows ordered by dump.order_column(table) (id, except
+ingest_instance's instance_id); Python joins the items with a newline and hashes them with SHA-256. It
+does not call column_digest_sql, so the producer's query is checked against it, not with it (decision
+tj-vhboky.55 S7/S9 (5)).
+
+THE TABLES A SEED COVERS (bead tj-7zjov1.100). A seed covers the two market tables, store_dataset_entry and
+stock_market_activity, and, from the canonical seed at f2b7d4a91c36 on, the three ingest tables
+ingest_instance, ingest_request and ingest_run as well. A manifest is compared on exactly the tables it
+names: the older seeds predate the ingest tables (ingest_request and ingest_instance do not exist below
+f2b7d4a91c36) and are read as they are, never failed for it. The ingest tables come all three or none, and
+the canonical seed at the head must carry all five, each non-empty.
 
 THE GENERIC RULE (test_generic_rule) is parametrised over every seed present whose revision has a
 next revision in the graph read from data/store/migrations (never a literal list):
@@ -88,6 +96,10 @@ from sqlalchemy.engine import URL, Engine
 from common.tests.image_path import image_pythonpath
 from common.tests.migration_gate import canonical_seed_revisions, read_line, seeds_upgraded_to_head
 from common.tests.roots import SERVER_ROOT
+from data.store.app.database.models.ingest_run import IngestRun
+from data.store.seeds import dump
+from data.store.seeds.dump import order_column
+from data.store.seeds.ingest_records import INSTANCES
 from data.store.seeds.scenario import is_synthetic
 
 
@@ -104,7 +116,16 @@ SEEDS_DIR = Path(__file__).resolve().parent / 'seeds'
 
 ENTRY_TABLE = 'store_dataset_entry'
 BAR_TABLE = 'stock_market_activity'
-SEED_TABLES = (ENTRY_TABLE, BAR_TABLE)
+INSTANCE_TABLE = 'ingest_instance'
+REQUEST_TABLE = 'ingest_request'
+RUN_TABLE = 'ingest_run'
+MARKET_TABLES = (ENTRY_TABLE, BAR_TABLE)
+INGEST_TABLES = (INSTANCE_TABLE, REQUEST_TABLE, RUN_TABLE)
+# Every table a seed may cover, parents first (bead tj-7zjov1.100); a seed covers the ones its manifest names.
+SEED_TABLES = MARKET_TABLES + INGEST_TABLES
+# The column a seed table's rows are checked as synthetic by, beside asset_symbol: the owner, by its name per
+# table. ingest_instance has no label; its ids are checked against the cast instead.
+LABEL_COLUMN = {ENTRY_TABLE: 'owner', BAR_TABLE: None, REQUEST_TABLE: 'client_label', RUN_TABLE: 'actor'}
 MANIFEST_KEYS = {'date', 'digests', 'producer', 'revision', 'row_counts'}
 
 ADDITIVE_EXCEPTION_MARKER = re.compile(r'^# additive-exception: \S+', re.MULTILINE)
@@ -155,6 +176,11 @@ class Seed:
     manifest: dict[str, Any]
 
     @property
+    def tables(self) -> tuple[str, ...]:
+        """The seed tables this seed's manifest covers, in SEED_TABLES order."""
+        return tuple(table for table in SEED_TABLES if table in self.manifest['row_counts'])
+
+    @property
     def row_counts(self) -> dict[str, int]:
         return self.manifest['row_counts']
 
@@ -185,8 +211,19 @@ def read_seed(name: str) -> Seed:
         pytest.fail(f'seed {name}: manifest revision {manifest["revision"]} differs from its name', pytrace=False)
     if revision not in GRAPH:
         pytest.fail(f'seed {name}: revision {revision} is not in {MIGRATIONS_DIR}', pytrace=False)
-    if set(manifest['row_counts']) != set(SEED_TABLES) or set(manifest['digests']) != set(SEED_TABLES):
-        pytest.fail(f'seed {name}: manifest must cover exactly {SEED_TABLES}', pytrace=False)
+    tables = set(manifest['row_counts'])
+    ingest = tables & set(INGEST_TABLES)
+    if (
+        set(manifest['digests']) != tables
+        or not set(MARKET_TABLES) <= tables
+        or not tables <= set(SEED_TABLES)
+        or ingest not in (set(), set(INGEST_TABLES))
+    ):
+        pytest.fail(
+            f'seed {name}: manifest must cover {MARKET_TABLES}, plus all of {INGEST_TABLES} or none of them, '
+            f'with row counts and digests for the same tables; it covers {sorted(tables)}',
+            pytrace=False,
+        )
     if sum(manifest['row_counts'].values()) == 0:
         pytest.fail(f'seed {name}: EMPTY (every row count is zero); an empty seed is a failure', pytrace=False)
     return Seed(name=name, revision=revision, sql_path=sql_path, manifest=manifest)
@@ -291,32 +328,46 @@ class ScratchDb:
         finally:
             raw.close()
 
-    def row_counts(self) -> dict[str, int]:
+    def present_tables(self) -> tuple[str, ...]:
+        """The seed tables that exist in this database at its revision (the ingest ones arrive late in the line)."""
+        with self.engine.connect() as conn:
+            return tuple(
+                table
+                for table in SEED_TABLES
+                if conn.execute(
+                    sa.text('SELECT to_regclass(:name) IS NOT NULL'), {'name': f'public.{table}'}
+                ).scalar_one()
+            )
+
+    def row_counts(self, tables: tuple[str, ...] | None = None) -> dict[str, int]:
+        """Rows per table: the tables named, or every seed table this database has."""
         with self.engine.connect() as conn:
             return {
                 table: conn.execute(sa.text(f'SELECT count(*) FROM public.{table}')).scalar_one()  # nosec B608 -- module-constant table
-                for table in SEED_TABLES
+                for table in (self.present_tables() if tables is None else tables)
             }
 
     def data_digests(self, table: str, columns: list[str]) -> dict[str, str]:
-        """Per column: SHA-256 of the items ('n', or 'v' plus the value's text) joined by newlines, rows by id."""
+        """Per column: SHA-256 of the items ('n', or 'v' plus the value's text) joined by newlines, rows in order_column order."""
         live = set(self.columns(table))
         missing = sorted(set(columns) - live)
         assert not missing, f'{table} lost column(s) {missing}'
         quoted = [_quote(column) for column in sorted(columns)]
         items = ', '.join(f"CASE WHEN {q} IS NULL THEN 'n' ELSE 'v' || {q}::text END" for q in quoted)
+        order = _quote(order_column(table))
         with self.engine.connect() as conn:
-            rows = conn.execute(sa.text(f'SELECT {items} FROM public.{table} ORDER BY id')).all()  # nosec B608 -- module-constant table, quoted schema names
+            rows = conn.execute(sa.text(f'SELECT {items} FROM public.{table} ORDER BY {order}')).all()  # nosec B608 -- module-constant table, quoted schema names
         return {
             column: hashlib.sha256('\n'.join(row[index] for row in rows).encode('utf-8')).hexdigest()
             for index, column in enumerate(sorted(columns))
         }
 
     def snapshot(self) -> dict[str, Any]:
-        """Everything a data assertion compares: row counts and every column's digest, per table."""
+        """Everything a data assertion compares: row counts and every column's digest, per seed table present."""
+        tables = self.present_tables()
         return {
-            'row_counts': self.row_counts(),
-            'digests': {table: self.data_digests(table, self.columns(table)) for table in SEED_TABLES},
+            'row_counts': self.row_counts(tables),
+            'digests': {table: self.data_digests(table, self.columns(table)) for table in tables},
         }
 
     def schema(self) -> dict[str, Any]:
@@ -400,10 +451,11 @@ def scratch(
 
 
 def assert_equals_manifest(db: ScratchDb, seed: Seed, *, skip: dict[str, set[str]] | None = None) -> None:
-    """Row counts equal the manifest, and every manifest column not in `skip` digests to its manifest value."""
+    """On the tables the manifest covers: row counts equal it, and every column not in `skip` digests to its value."""
     skip = skip or {}
-    assert db.row_counts() == seed.row_counts, f'seed {seed.name}: row counts {db.row_counts()} != {seed.row_counts}'
-    for table in SEED_TABLES:
+    counts = db.row_counts(seed.tables)
+    assert counts == seed.row_counts, f'seed {seed.name}: row counts {counts} != {seed.row_counts}'
+    for table in seed.tables:
         wanted = {c: d for c, d in seed.digests[table].items() if c not in skip.get(table, set())}
         got = db.data_digests(table, list(wanted))
         differ = sorted(column for column in wanted if got[column] != wanted[column])
@@ -529,7 +581,9 @@ def expect_e5_feed_wipes_both_tables(db: ScratchDb, seed: Seed) -> None:
     # The wipe, stated as both halves: the seed HAD rows (or the emptiness proves nothing), and
     # every one of them is gone.
     assert sum(before.values()) > 0, f'E5 needs a seed with rows; {seed.name} loaded empty'
-    assert db.row_counts() == {ENTRY_TABLE: 0, BAR_TABLE: 0}, (
+    # The market tables only: the ingest tables do not exist yet at either end of this step (6f5a798746a1 and
+    # f2b7d4a91c36 come later in the line), and the seeds at eec8f88a7443 cover the market tables alone.
+    assert db.row_counts(MARKET_TABLES) == {ENTRY_TABLE: 0, BAR_TABLE: 0}, (
         f'the feed revision left rows behind: {db.row_counts()} (seed {seed.name} had {before})'
     )
 
@@ -546,7 +600,7 @@ def expect_e5_feed_wipes_both_tables(db: ScratchDb, seed: Seed) -> None:
     assert set(db.columns(ENTRY_TABLE)) == entry_columns_before, (
         'the downgrade did not restore the entry columns the seed revision had'
     )
-    assert db.row_counts() == {ENTRY_TABLE: 0, BAR_TABLE: 0}, (
+    assert db.row_counts(MARKET_TABLES) == {ENTRY_TABLE: 0, BAR_TABLE: 0}, (
         'the downgrade restored rows, which it cannot do -- the upgrade deleted them and nothing stages them'
     )
 
@@ -572,7 +626,7 @@ def check_lossless(db: ScratchDb, seed: Seed, target: str) -> None:
     assert_equals_manifest(db, seed)
     db.must('downgrade', seed.revision)
     assert_equals_manifest(db, seed)
-    for table in SEED_TABLES:
+    for table in seed.tables:
         assert db.columns(table) == sorted(seed.digests[table]), f'{table} columns differ after the round trip'
 
 
@@ -605,6 +659,60 @@ def test_every_expectation_is_for_a_marked_revision_and_a_present_seed() -> None
             )
 
 
+def test_the_seed_tables_are_the_producers() -> None:
+    """Bead tj-7zjov1.100: this file's five tables, in order, are the ones the producer writes."""
+    assert SEED_TABLES == dump.SEED_TABLES
+    assert set(LABEL_COLUMN) | {INSTANCE_TABLE} == set(SEED_TABLES)
+
+
+def test_the_canonical_seed_at_the_head_covers_every_seed_table_with_rows() -> None:
+    """The producer always writes all five; a head seed without the ingest tables would make them go unchecked."""
+    head = _head_revision()
+    assert head in SEED_NAMES, f'no canonical seed at the head {head}'
+    seed = read_seed(head)
+    assert seed.tables == SEED_TABLES, f'the head seed covers {seed.tables}'
+    empty = sorted(table for table in SEED_TABLES if seed.row_counts[table] == 0)
+    assert not empty, f'the head seed holds no rows in {empty}'
+
+
+def test_an_older_seed_that_predates_the_ingest_tables_is_read_on_its_market_tables() -> None:
+    """The tolerance is real and used: the seeds below the head carry the market tables alone."""
+    older = [name for name in SEED_NAMES if read_seed(name).tables == MARKET_TABLES]
+    assert older, 'no seed predates the ingest tables, so the tolerance in read_seed is untested'
+    assert 'a6d3f8e1c205' in older
+
+
+def test_the_head_seed_holds_the_cast_the_bead_names(scratch: ScratchDb) -> None:
+    """Bead tj-7zjov1.100 ACCEPTANCE, on Postgres: the head seed holds the cast the bead names.
+
+    An ingest_run row with and without request_id and attempt_no, a request in an open and in a terminal state,
+    a superseded and a current instance.
+    """
+    seed = read_seed(_head_revision())
+    scratch.load(seed)
+    with scratch.engine.connect() as conn:
+        runs = dict(
+            conn.execute(
+                sa.text(
+                    'SELECT request_id IS NOT NULL AND attempt_no IS NOT NULL, count(*) FROM public.ingest_run GROUP BY 1'
+                )
+            ).all()
+        )
+        half = conn.execute(
+            sa.text('SELECT count(*) FROM public.ingest_run WHERE (request_id IS NULL) <> (attempt_no IS NULL)')
+        ).scalar_one()
+        states = set(conn.execute(sa.text('SELECT DISTINCT state::text FROM public.ingest_request')).scalars())
+        instances = dict(
+            conn.execute(
+                sa.text('SELECT superseded_at IS NOT NULL, count(*) FROM public.ingest_instance GROUP BY 1')
+            ).all()
+        )
+    assert runs.get(True, 0) > 0 and runs.get(False, 0) > 0, f'runs with and without an attempt: {runs}'
+    assert half == 0, 'a run carries a request id without an attempt number or the reverse'
+    assert states & {'PENDING', 'QUEUED'} and states & {'SUCCEEDED', 'EMPTY', 'FAILED'}, f'request states: {states}'
+    assert instances == {True: 1, False: 1}, f'instances by superseded: {instances}'
+
+
 @pytest.mark.parametrize('name', SEED_NAMES)
 def test_seed_loads_equal_to_its_manifest(scratch: ScratchDb, name: str) -> None:
     """S9's equal-loading proof: at its own revision, every committed seed recomputes to its manifest.
@@ -615,17 +723,25 @@ def test_seed_loads_equal_to_its_manifest(scratch: ScratchDb, name: str) -> None
     seed = read_seed(name)
     scratch.load(seed)
     assert scratch.revision() == seed.revision
-    for table in SEED_TABLES:
+    for table in seed.tables:
         assert sorted(seed.digests[table]) == scratch.columns(table), (
             f"seed {name}: the manifest's {table} columns are not the live columns at {seed.revision}"
         )
     assert_equals_manifest(scratch, seed)
-    for table in SEED_TABLES:
-        has_owner = 'owner' in scratch.columns(table)
-        owner = 'owner' if has_owner else 'NULL'
+    for table in seed.tables:
+        if table == INSTANCE_TABLE:
+            with scratch.engine.connect() as conn:
+                ids = set(conn.execute(sa.text(f'SELECT instance_id FROM public.{table}')).scalars())  # nosec B608 -- module-constant table
+            assert ids <= set(INSTANCES), f'seed {name}: {len(ids - set(INSTANCES))} instance id(s) not in the cast'
+            continue
+        # The bar table's label is none; an old entry table may predate owner (8f41c2d7a3b9 seeds).
+        label = LABEL_COLUMN[table] if LABEL_COLUMN[table] in scratch.columns(table) else None
+        selected = _quote(label) if label else 'NULL'
         with scratch.engine.connect() as conn:
-            rows = conn.execute(sa.text(f'SELECT DISTINCT asset_symbol, {owner} FROM public.{table}')).all()  # nosec B608 -- module-constant table
-        foreign = [row for row in rows if not is_synthetic(row[0], row[1] if has_owner else None)]
+            rows = conn.execute(
+                sa.text(f"SELECT DISTINCT coalesce(asset_symbol, ''), {selected} FROM public.{table}")  # nosec B608 -- module-constant table, quoted name
+            ).all()
+        foreign = [row for row in rows if not is_synthetic(row[0], row[1] if label else None)]
         assert not foreign, f'seed {name}: {len(foreign)} non-synthetic (symbol, owner) pair(s) in {table}'
 
 
@@ -1347,3 +1463,37 @@ def test_a_seed_below_the_head_upgrades_to_the_head_in_one_invocation_with_its_d
     assert_equals_manifest(scratch, seed)  # every manifest column of every row, byte for byte
     _repeat_upgrade_changes_nothing(scratch, 'head')
     assert_equals_manifest(scratch, seed)
+
+
+# ---------------------------------------------------------------------------------------------
+# THE REQUEST RECORD REVISION'S ATTEMPT INDEX, AS THE REVISION BUILDS IT (tj-7zjov1.25, P33).
+#
+# test_request_record_schema.py reads the predicate from the STACK's database, which the stack's own data_store
+# image migrated: a revision edited in a checkout never reaches that catalogue, so a mutated revision cannot red it.
+# alembic check does not compare index predicates either. This test applies the revision file itself, the one
+# mounted into test_client, to a scratch database and reads the predicate there, so a revision whose unique index
+# lost its postgresql_where is red here. The expected form is the one Postgres prints for the stack's database.
+
+REQUEST_RECORD_REVISION = 'f2b7d4a91c36'
+ATTEMPT_UNIQUE_INDEX = IngestRun.ATTEMPT_UNIQUE_INDEX
+ATTEMPT_PREDICATE = '((request_id IS NOT NULL) AND (attempt_no IS NOT NULL))'
+
+
+def test_the_request_record_revision_builds_the_attempt_index_unique_and_partial(scratch: ScratchDb) -> None:
+    assert REQUEST_RECORD_REVISION in GRAPH, f'{REQUEST_RECORD_REVISION} is not in {MIGRATIONS_DIR}'
+    scratch.must('upgrade', REQUEST_RECORD_REVISION)
+
+    with scratch.engine.connect() as conn:
+        row = conn.execute(
+            sa.text(
+                'SELECT i.indisunique, i.indnatts, pg_get_expr(i.indpred, i.indrelid) AS predicate, '
+                'pg_get_indexdef(i.indexrelid, 1, true) AS first, pg_get_indexdef(i.indexrelid, 2, true) AS second '
+                'FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = :name'
+            ),
+            {'name': ATTEMPT_UNIQUE_INDEX},
+        ).one_or_none()
+
+    assert row is not None, f'{REQUEST_RECORD_REVISION} built no index {ATTEMPT_UNIQUE_INDEX}'
+    assert row.indisunique, f'{ATTEMPT_UNIQUE_INDEX} is not unique'
+    assert (row.indnatts, row.first, row.second) == (2, 'request_id', 'attempt_no'), tuple(row)
+    assert row.predicate == ATTEMPT_PREDICATE, f'{ATTEMPT_UNIQUE_INDEX} predicate is {row.predicate!r}'

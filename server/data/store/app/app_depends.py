@@ -9,6 +9,7 @@ from common.rpc.clients.ingest_fetch import GrpcIngestFetchClient, IngestFetchCl
 from common.worker_pool import SharedWorkerPool
 from data.store.app.daily_refresh import start_daily_refresh_loops, stop_daily_refresh_loops
 from data.store.app.database import database
+from data.store.app.grpc_host import build_grpc_host
 from data.store.app.ingest.run_recording import sweep_interrupted_runs
 from data.store.app.reaper import start_reaper_loop, stop_reaper_loop
 from data.store.app.usage_recorder import start_usage_loops, stop_usage_loops
@@ -25,6 +26,11 @@ __INGEST_FETCH_CLIENT = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # THE RESULT PATH'S SERVER (tj-7zjov1.27), BUILT FIRST and entered last. Building binds nothing; it reads
+    # APP_INTERNAL_GRPC_HOST and APP_INTERNAL_GRPC_PORT, so a missing one fails startup naming the variable before
+    # anything else has started.
+    grpc_host = build_grpc_host()
+
     # Init Common Endpoints
     # Using different app for REST latency, ensuring test isn't affected by client and server are on the same thread.
     initialize_latency_client(app, INGEST_APP_NAME, INGEST_APP_PORT)
@@ -62,8 +68,13 @@ async def lifespan(app: FastAPI):
     # The interim DAILY refresh (tj-grna9p.22): needs the client, so it starts after it. One worker only.
     refresh_tasks = await start_daily_refresh_loops(__INGEST_FETCH_CLIENT)
 
-    log.info('Data Store App Ready!!!')
-    yield
+    # StoreService (DeliverAttempt, RegisterInstance) serves from here to teardown. It is entered last, so every
+    # dependency of a delivery (the database above all) is up before ingest can reach it, and it exits FIRST on
+    # teardown, so an in-flight delivery commits or rolls back whole against a live database: the host lets calls
+    # finish within its grace and then cancels them.
+    async with grpc_host:
+        log.info('Data Store App Ready!!!')
+        yield
 
     # cleanup tasks
     # Before the channel it fetches through closes.

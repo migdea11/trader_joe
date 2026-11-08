@@ -25,10 +25,22 @@ A COUNT THAT IS NOT A NON-NEGATIVE INT (supersedes tj-rptmtg's non-ASCII-digit t
 driver returns ints, so psql's text framing is gone; what stays is the refusal semantics: in the
 synthetic check a row whose count is not a non-negative int is ONE foreign row (exit 3, count-only
 message); in a count query it is a StackError (exit 1) that never echoes the result.
+
+THE INGEST RECORDS (bead tj-7zjov1.100). The seed carries five tables. produce() empties the three ingest tables
+after the first synthetic check and before the first POST, then, after the collision check, hands
+seed_records (default: ingest_records.seed_ingest_records, the store's own code over asyncpg) the scratch
+database's async URL, the scenario's first dataset and its symbol, and runs it with asyncio.run. That function
+needs a real Postgres, so EVERY test here runs produce() with a stub seeder (the autouse fixture below swaps the
+default argument, so the entry point's own call gets it too); test_the_default_seeder_is_the_store_code pins
+the real default. What the cast writes is proved against Postgres only: the orchestrator's two seed_dump runs
+at f2b7d4a91c36 (byte-identical) and the committed seed tests/system/seeds/f2b7d4a91c36.*, which the
+system suite loads.
 """
 
+import inspect
 import json
 import re
+import uuid
 from collections import Counter
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -39,10 +51,28 @@ import psycopg2
 import pytest
 
 from common.enums.data_stock import Granularity
+from common.tests.roots import REPO_ROOT
 from data.store.seeds import __main__ as entry
 from data.store.seeds import producer as producer_module
 from data.store.seeds.bundle import BUNDLE_TAG, MAX_BUNDLE_BYTES, parse_bundle
-from data.store.seeds.dump import BAR_TABLE, ENTRY_TABLE, NORMALISE_SQL, DumpRefused, render_table_sql
+from data.store.seeds.dump import (
+    BAR_TABLE,
+    ENTRY_TABLE,
+    INSTANCE_TABLE,
+    NORMALISE_SQL,
+    REQUEST_TABLE,
+    RUN_TABLE,
+    SEED_TABLES,
+    DumpRefused,
+    render_table_sql,
+)
+from data.store.seeds.ingest_records import (
+    EXPECTED_ATTEMPT_ROWS,
+    EXPECTED_INSTANCES,
+    EXPECTED_REQUEST_STATES,
+    REQUEST_IDS,
+    seed_ingest_records,
+)
 from data.store.seeds.manifest import head_revision
 from data.store.seeds.producer import VERSIONS_DIR, SeedRefused, produce
 from data.store.seeds.scenario import SEED_REQUESTS
@@ -54,17 +84,90 @@ from tests.fakes.market_data import EMPTY_PREFIX, Scenario, grid_index, grid_tim
 pytestmark = pytest.mark.data_store
 
 HEAD = head_revision(VERSIONS_DIR)
-SYNTHETIC_ROWS = [('e', 'ZZSEEDAA', 'seed-owner-a', 2), ('b', 'ZZSEEDAA', '', 40), ('b', 'GAPS_ZZSEEDGG', '', 15)]
+# produce()'s defaults as imported, before the autouse fixture swaps the seeder.
+REAL_DEFAULTS = produce.__defaults__
+SYNTHETIC_ROWS = [
+    ('e', 'ZZSEEDAA', 'seed-owner-a', 2),
+    ('b', 'ZZSEEDAA', '', 40),
+    ('b', 'GAPS_ZZSEEDGG', '', 15),
+    ('q', 'ZZSEEDAA', 'seed-owner-a', 9),
+    ('r', 'ZZSEEDAA', 'seed-owner-b', 18),
+]
 ENTRY_LINES = [
     "INSERT INTO public.store_dataset_entry (id, owner) VALUES ('0a', 'seed-owner-a');",
     "INSERT INTO public.store_dataset_entry (id, owner) VALUES ('0b', 'seed-owner-b');",
 ]
 BAR_LINES = ["INSERT INTO public.stock_market_activity (close, id) VALUES ('10.5', '1');"]
+RENDERED = {
+    ENTRY_TABLE: ENTRY_LINES,
+    BAR_TABLE: BAR_LINES,
+    INSTANCE_TABLE: [
+        "INSERT INTO public.ingest_instance (instance_id, superseded_at) VALUES ('seed-instance-a', NULL);"
+    ],
+    REQUEST_TABLE: ["INSERT INTO public.ingest_request (id, state) VALUES ('5eed', 'PENDING');"],
+    RUN_TABLE: ["INSERT INTO public.ingest_run (id, request_id) VALUES ('0r', NULL);"],
+}
 SETVAL_7 = "SELECT pg_catalog.setval('public.stock_market_activity_id_seq', 7, true);\n"
-EXPECTED_SQL = ''.join(f'{line}\n' for line in ENTRY_LINES + BAR_LINES) + SETVAL_7
-COLUMNS = {ENTRY_TABLE: ['owner', 'id'], BAR_TABLE: ['id', 'close']}
+EXPECTED_SQL = ''.join(f'{line}\n' for table in SEED_TABLES for line in RENDERED[table]) + SETVAL_7
+COLUMNS = {
+    ENTRY_TABLE: ['owner', 'id'],
+    BAR_TABLE: ['id', 'close'],
+    INSTANCE_TABLE: ['superseded_at', 'instance_id'],
+    REQUEST_TABLE: ['state', 'id'],
+    RUN_TABLE: ['request_id', 'id'],
+}
+COUNTS = {ENTRY_TABLE: 3, BAR_TABLE: 7, INSTANCE_TABLE: 2, REQUEST_TABLE: 9, RUN_TABLE: 18}
+DIGESTS = {
+    ENTRY_TABLE: {'id': 'i1', 'owner': 'o1'},
+    BAR_TABLE: {'close': 'c0', 'id': 'i0'},
+    INSTANCE_TABLE: {'instance_id': 'n0', 'superseded_at': 'n1'},
+    REQUEST_TABLE: {'id': 'q0', 'state': 'q1'},
+    RUN_TABLE: {'id': 'r0', 'request_id': 'r1'},
+}
 # The one query that asks for old four-column bar key collisions.
 COLLISION_MARK = 'HAVING count(*) > 1'
+# The reset of the three ingest tables, the one script besides NORMALISE_SQL.
+RESET_SQL = f'DELETE FROM {RUN_TABLE}; DELETE FROM {REQUEST_TABLE}; DELETE FROM {INSTANCE_TABLE};'
+DATASET_ID = uuid.UUID('7ceff30a-af80-1760-5057-d346cc334f4d')
+# The steps of the ingest-record phase, in order, between the collision check and the rewrite.
+RECORD_STEPS = [
+    'seed dataset lookup',
+    'seed',
+    'request states',
+    'attempt rows',
+    'half-attempt rows',
+    'instance count',
+    'superseded count',
+    'synthetic check',
+]
+# Every async URL a stub seeder was handed by the REAL Stack (the end-to-end tier), per test.
+SEEDED_URLS: list = []
+
+
+class FakeUrl:
+    """What FakeStack.async_url() hands the seeder: a handle back onto the fake, never a real URL."""
+
+    def __init__(self, fake):
+        self.fake = fake
+
+
+async def stub_seed_records(url, dataset_id, symbol):
+    """The seeder every test runs: records its call on the fake (or the real URL), writes nothing."""
+    fake = getattr(url, 'fake', None)
+    if fake is None:
+        SEEDED_URLS.append((url, dataset_id, symbol))
+        return
+    fake.calls.append(('seed', 'seed records'))
+    fake.seeded_with.append((dataset_id, symbol))
+    if fake.seed_error is not None:
+        raise fake.seed_error
+
+
+@pytest.fixture(autouse=True)
+def stub_seeder(monkeypatch):
+    """produce()'s seeder default is the store's real code (needs Postgres); every call here gets the stub."""
+    SEEDED_URLS.clear()
+    monkeypatch.setattr(producer_module.produce, '__defaults__', (None, stub_seed_records))
 
 
 def stored_bar_keys(path: str, body: dict[str, str]) -> list[tuple]:
@@ -88,17 +191,24 @@ def stored_bar_keys(path: str, body: dict[str, str]) -> list[tuple]:
 
 
 def _table_of(sql: str) -> str:
-    return BAR_TABLE if BAR_TABLE in sql else ENTRY_TABLE
+    """The one seed table a per-table query names (the synthetic check, naming them all, is answered first)."""
+    for table in (INSTANCE_TABLE, REQUEST_TABLE, RUN_TABLE, BAR_TABLE, ENTRY_TABLE):
+        if table in sql:
+            return table
+    raise AssertionError(f'no seed table in: {sql[:80]}')
 
 
 class FakeStack:
-    """Answers produce()'s SQL by its shape, as rows; records ('query'|'script', what) and ('post', path).
+    """Answers produce()'s SQL by its shape, as rows; records ('query'|'script', what), ('post', path), ('seed', ..).
 
     bodies overrides the reply body of the POST at that index (None: a reply with no body at all);
     statuses overrides the reply status of the POST at that index; collisions overrides the collision
     count, which is otherwise computed from the bars stored; raw_collisions and raw_counts (table ->
     rows) replace the whole result of the collision query and the row-count queries; render, columns
-    and digests (table -> rows) replace those results.
+    and digests (table -> rows) replace those results. The ingest-record phase: foreign_records are
+    rows the synthetic check sees only after the seeder ran; dataset_rows, state_rows, attempt_rows,
+    stray_rows and superseded_rows replace the answers of the queries of that phase; seed_error is
+    raised by the stub seeder.
     """
 
     def __init__(
@@ -115,28 +225,45 @@ class FakeStack:
         render=None,
         columns=None,
         digests=None,
+        foreign_records=(),
+        dataset_rows=None,
+        state_rows=None,
+        attempt_rows=None,
+        stray_rows=None,
+        superseded_rows=None,
+        seed_error=None,
     ):
         self.revision_rows = [(HEAD,)] if revision_rows is None else revision_rows
         self.rows_before = SYNTHETIC_ROWS + list(foreign_before)
         self.rows_after = SYNTHETIC_ROWS + list(foreign_after)
+        self.rows_after_records = self.rows_after + list(foreign_records)
         self.post_status = post_status
         self.bodies = bodies or {}
         self.collisions = collisions
         self.statuses = statuses or {}
         self.raw_collisions = raw_collisions
         self.raw_counts = raw_counts or {}
-        self.render = {ENTRY_TABLE: [(line,) for line in ENTRY_LINES], BAR_TABLE: [(line,) for line in BAR_LINES]}
+        self.render = {table: [(line,) for line in lines] for table, lines in RENDERED.items()}
         self.render.update(render or {})
         self.columns = {table: [(name,) for name in names] for table, names in COLUMNS.items()}
         self.columns.update(columns or {})
-        self.digests = {ENTRY_TABLE: [('id', 'i1'), ('owner', 'o1')], BAR_TABLE: [('close', 'c0'), ('id', 'i0')]}
+        self.digests = {table: sorted(pairs.items()) for table, pairs in DIGESTS.items()}
         self.digests.update(digests or {})
+        self.dataset_rows = [(str(DATASET_ID),)] if dataset_rows is None else dataset_rows
+        self.state_rows = list(EXPECTED_REQUEST_STATES.items()) if state_rows is None else state_rows
+        self.attempt_rows = [(EXPECTED_ATTEMPT_ROWS,)] if attempt_rows is None else attempt_rows
+        self.stray_rows = [(0,)] if stray_rows is None else stray_rows
+        self.superseded_rows = [(EXPECTED_INSTANCES - 1,)] if superseded_rows is None else superseded_rows
+        self.seed_error = seed_error
+        self.seeded_with: list[tuple] = []
         self.calls: list[tuple] = []
         self.sql: list[str] = []
         self.posted: list[tuple] = []
         self.stored: list[tuple] = []
         self.replies: list[dict] = []
         self.collision_sql: list[str] = []
+        self.synthetic_sql: list[str] = []
+        self.dataset_sql: list[str] = []
         self.render_sql: dict[str, str] = {}
         self.closed = False
 
@@ -146,6 +273,9 @@ class FakeStack:
         if 'alembic_version' in sql:
             return self.revision_rows
         if 'GROUP BY asset_symbol, owner' in sql:
+            self.synthetic_sql.append(sql)
+            if self.seeded_with:
+                return self.rows_after_records
             posted = any(call[0] == 'post' for call in self.calls)
             return self.rows_after if posted else self.rows_before
         if COLLISION_MARK in sql:
@@ -155,9 +285,20 @@ class FakeStack:
             if self.collisions is not None:
                 return [(self.collisions,)]
             return [(sum(1 for rows in Counter(self.stored).values() if rows > 1),)]
+        if sql.startswith(f'SELECT id::text FROM {ENTRY_TABLE} '):
+            self.dataset_sql.append(sql)
+            return self.dataset_rows
+        if sql.startswith('SELECT state::text, count(*)'):
+            return self.state_rows
+        if 'WHERE request_id IS NOT NULL AND attempt_no IS NOT NULL' in sql:
+            return self.attempt_rows
+        if 'WHERE (request_id IS NULL) <> (attempt_no IS NULL)' in sql:
+            return self.stray_rows
+        if 'WHERE superseded_at IS NOT NULL' in sql:
+            return self.superseded_rows
         if sql.startswith('SELECT count(*) FROM'):
             table = _table_of(sql)
-            return self.raw_counts.get(table, [(3,)] if table == ENTRY_TABLE else [(7,)])
+            return self.raw_counts.get(table, [(COUNTS[table],)])
         if 'information_schema.columns' in sql:
             return self.columns[_table_of(sql)]
         if 'quote_nullable' in sql:
@@ -196,10 +337,13 @@ class FakeStack:
     def script(self, sql, what):
         self.calls.append(('script', what))
         self.sql.append(sql)
-        assert sql == NORMALISE_SQL, 'only NORMALISE_SQL runs as a script'
+        assert (sql, what) in {(RESET_SQL, 'ingest reset'), (NORMALISE_SQL, 'normalise')}, 'an unexpected script'
 
     def post(self, path, body, secret_header):
         return self.reply(path, body, secret_header)
+
+    def async_url(self):
+        return FakeUrl(self)
 
     def __enter__(self):
         return self
@@ -242,15 +386,16 @@ def test_a_run_returns_the_bundle_and_writes_nothing(no_writes):
     stack = FakeStack()
     result = produce(stack, date='2026-09-30')
     assert result.bundle.revision == HEAD
-    assert result.row_counts == {ENTRY_TABLE: 3, BAR_TABLE: 7}
+    assert result.row_counts == COUNTS
+    assert list(result.row_counts) == list(SEED_TABLES)
     assert result.bundle.sql == EXPECTED_SQL
     manifest = json.loads(result.bundle.manifest)
     assert manifest == {
         'revision': HEAD,
         'producer': 'data.store.seeds',
         'date': '2026-09-30',
-        'row_counts': {ENTRY_TABLE: 3, BAR_TABLE: 7},
-        'digests': {ENTRY_TABLE: {'id': 'i1', 'owner': 'o1'}, BAR_TABLE: {'close': 'c0', 'id': 'i0'}},
+        'row_counts': COUNTS,
+        'digests': DIGESTS,
     }
     assert result.bundle.manifest.endswith('}\n')
 
@@ -262,31 +407,79 @@ def test_the_steps_run_in_the_designed_order():
     posts = [i for i, kind in enumerate(kinds) if kind == 'post']
     checks = [i for i, kind in enumerate(kinds) if kind == 'synthetic check']
     assert kinds[0] == 'alembic_version read'
-    assert len(checks) == 2
-    assert checks[0] < posts[0], 'the refusal must run before the first POST'
+    assert len(checks) == 3
+    assert checks[0] < kinds.index('ingest reset') < posts[0], 'refusal, then the ingest reset, then the POSTs'
+    assert kinds.index('ingest reset') == checks[0] + 1 and kinds.count('ingest reset') == 1
     assert posts[-1] < checks[1] < kinds.index('normalise'), 'and again after the POSTs, before the rewrite'
     assert checks[1] < kinds.index('bar collision check') < kinds.index('normalise'), 'collisions: after, before'
     assert kinds.count('bar collision check') == 1
-    normalise = kinds.index('normalise')
+    collision, normalise = kinds.index('bar collision check'), kinds.index('normalise')
+    assert kinds[collision + 1 : normalise] == RECORD_STEPS, 'the cast, its count refusal, a third check'
     assert kinds[normalise:] == [
         'normalise',
-        f'{ENTRY_TABLE} count',
-        f'{BAR_TABLE} count',
-        f'{ENTRY_TABLE} columns',
-        f'{ENTRY_TABLE} render',
-        f'{BAR_TABLE} columns',
-        f'{BAR_TABLE} render',
-        f'{ENTRY_TABLE} columns',
-        f'{ENTRY_TABLE} digests',
-        f'{BAR_TABLE} columns',
-        f'{BAR_TABLE} digests',
+        *(f'{table} count' for table in SEED_TABLES),
+        *(step for table in SEED_TABLES for step in (f'{table} columns', f'{table} render')),
+        *(step for table in SEED_TABLES for step in (f'{table} columns', f'{table} digests')),
     ]
 
 
-def test_normalise_runs_as_one_script_and_nothing_else_does():
+def test_normalise_and_the_ingest_reset_are_the_only_scripts():
     stack = FakeStack()
     produce(stack, date='2026-09-30')
-    assert [call for call in stack.calls if call[0] == 'script'] == [('script', 'normalise')]
+    assert [call for call in stack.calls if call[0] == 'script'] == [
+        ('script', 'ingest reset'),
+        ('script', 'normalise'),
+    ]
+
+
+def test_the_ingest_reset_empties_exactly_the_three_ingest_tables_children_first():
+    """Runs, then requests, then instances: never the entry or bar table, which the scenario rebuilds itself."""
+    stack = FakeStack()
+    produce(stack, date='2026-09-30')
+    (reset,) = [sql for sql in stack.sql if sql.startswith('DELETE')]
+    assert reset == RESET_SQL
+    assert ENTRY_TABLE not in reset and BAR_TABLE not in reset and 'TRUNCATE' not in reset
+
+
+def test_the_default_seeder_is_the_store_code():
+    """The stub is this file's; the producer's own default is ingest_records.seed_ingest_records."""
+    assert (None, seed_ingest_records) == REAL_DEFAULTS
+    assert list(inspect.signature(producer_module.produce).parameters) == ['stack', 'date', 'seed_records']
+
+
+def test_the_seeder_gets_the_stacks_async_url_and_the_first_scenario_dataset():
+    stack = FakeStack()
+    produce(stack, date='2026-09-30')
+    assert stack.seeded_with == [(DATASET_ID, SEED_REQUESTS[0].symbol)]
+    assert isinstance(stack.seeded_with[0][0], uuid.UUID)
+
+
+def test_the_dataset_lookup_names_the_first_scenario_requests_identity():
+    stack = FakeStack()
+    produce(stack, date='2026-09-30')
+    (sql,) = stack.dataset_sql
+    first = SEED_REQUESTS[0]
+    assert f"asset_symbol = '{first.symbol}'" in sql and f"owner = '{first.owner}'" in sql
+    assert f"start = TIMESTAMPTZ '{first.start.isoformat()}'" in sql
+    assert f'"end" = TIMESTAMPTZ \'{first.end.isoformat()}\'' in sql
+
+
+@pytest.mark.parametrize('rows', [[], [('a',), ('b',)]], ids=['none', 'two'])
+def test_a_first_dataset_that_is_not_one_entry_refuses_before_the_seeder(no_writes, rows):
+    stack = FakeStack(dataset_rows=rows)
+    with pytest.raises(SeedRefused) as raised:
+        produce(stack)
+    assert str(raised.value) == f"the scenario's first dataset is {len(rows)} entries; expected exactly one"
+    assert 'seed' not in stack.kinds() and 'normalise' not in stack.kinds()
+
+
+def test_a_failing_seeder_propagates_and_nothing_is_rewritten(no_writes):
+    """Nothing is caught: a seed is never produced from a half-written cast (ingest_records.py, Raises)."""
+    stack = FakeStack(seed_error=RuntimeError('half a cast'))
+    with pytest.raises(RuntimeError, match='half a cast'):
+        produce(stack)
+    assert stack.kinds()[-1] == 'seed'
+    assert 'normalise' not in stack.kinds() and 'request states' not in stack.kinds()
 
 
 def test_each_table_is_rendered_from_its_information_schema_columns():
@@ -361,6 +554,11 @@ def test_an_alembic_version_row_that_is_not_one_text_value_fails(rows):
         ('e', 'ZZSEEDAA', 'miguel', 3),  # a real owner on a synthetic symbol
         ('b', 'AAPL', '', 3),  # a bar alone
         ('e', 'ZZSEEDAA', 'unassigned', 3),  # a migrated pre-owner row
+        ('q', 'AAPL', 'seed-owner-a', 3),  # a request for a real symbol
+        ('q', 'ZZSEEDAA', 'miguel', 3),  # a request under a real client label
+        ('q', '', 'seed-owner-a', 3),  # a request naming no symbol (an asset-list request): coalesced, foreign
+        ('r', 'SPY', 'seed-owner-a', 3),  # a run of a real symbol
+        ('r', 'ZZSEEDAA', 'scheduler', 3),  # a run under a non-synthetic actor
     ],
 )
 def test_a_foreign_row_before_the_scenario_refuses_before_any_post(no_writes, foreign):
@@ -369,7 +567,36 @@ def test_a_foreign_row_before_the_scenario_refuses_before_any_post(no_writes, fo
         produce(stack)
     assert str(raised.value) == '3 row(s) hold a symbol or owner outside the synthetic patterns; no seed written'
     assert 'post' not in stack.kinds()
+    assert 'ingest reset' not in stack.kinds(), 'a database holding a real row is not touched, not even reset'
     assert 'normalise' not in stack.kinds()
+
+
+def test_the_synthetic_check_covers_the_request_and_run_labels():
+    """A request's client_label and a run's actor are the owner; a NULL request symbol reads as foreign."""
+    stack = FakeStack()
+    produce(stack, date='2026-09-30')
+    assert len(stack.synthetic_sql) == 3 and len(set(stack.synthetic_sql)) == 1
+    sql = stack.synthetic_sql[0]
+    assert f"SELECT 'q', coalesce(asset_symbol, ''), client_label, count(*) FROM {REQUEST_TABLE} " in sql
+    assert 'GROUP BY asset_symbol, client_label' in sql
+    assert f"SELECT 'r', asset_symbol, actor, count(*) FROM {RUN_TABLE} GROUP BY asset_symbol, actor" in sql
+    assert INSTANCE_TABLE not in sql, 'the instance marker carries no label'
+
+
+@pytest.mark.parametrize(
+    'foreign',
+    [('q', 'AAPL', 'seed-owner-a', 4), ('r', 'ZZSEEDAA', 'miguel', 4), ('e', 'SPY', 'seed-owner-a', 4)],
+    ids=['request', 'run', 'entry'],
+)
+def test_a_foreign_row_the_seeder_wrote_refuses_before_the_rewrite(no_writes, foreign):
+    """The third check: whatever the cast wrote is checked before anything is rewritten or rendered."""
+    stack = FakeStack(foreign_records=[foreign])
+    with pytest.raises(SeedRefused) as raised:
+        produce(stack)
+    assert str(raised.value) == '4 row(s) hold a symbol or owner outside the synthetic patterns; no seed written'
+    assert stack.kinds()[-1] == 'synthetic check' and stack.kinds().count('synthetic check') == 3
+    assert 'normalise' not in stack.kinds()
+    assert foreign[1] not in str(raised.value) and foreign[2] not in str(raised.value)
 
 
 def test_a_foreign_row_after_the_scenario_refuses_before_the_rewrite(no_writes):
@@ -378,7 +605,120 @@ def test_a_foreign_row_after_the_scenario_refuses_before_the_rewrite(no_writes):
         produce(stack)
     assert stack.kinds().count('post') == len(SEED_REQUESTS)
     assert 'normalise' not in stack.kinds() and f'{BAR_TABLE} render' not in stack.kinds()
+    assert 'seed' not in stack.kinds(), 'the cast is never written after a foreign row'
     assert 'SPY' not in str(raised.value)
+
+
+# ---------------------------------------------------------------------------------------------
+# The cast refusal (bead tj-7zjov1.100): counts only, before the rewrite
+# ---------------------------------------------------------------------------------------------
+
+
+def _states(**changes):
+    states = dict(EXPECTED_REQUEST_STATES)
+    for state, count in changes.items():
+        if count is None:
+            del states[state]
+        else:
+            states[state] = count
+    return list(states.items())
+
+
+CAST_MESSAGE = 'the seeded ingest requests are not the expected cast (counts per state differ); no seed written'
+CAST_REFUSALS = [
+    pytest.param({'state_rows': _states(EMPTY=None)}, CAST_MESSAGE, id='a-state-missing'),
+    pytest.param({'state_rows': _states(FAILED=3)}, CAST_MESSAGE, id='a-count-short'),
+    pytest.param({'state_rows': _states(PENDING=2)}, CAST_MESSAGE, id='a-count-over'),
+    pytest.param({'state_rows': _states(RUNNING=1)}, CAST_MESSAGE, id='an-extra-state'),
+    pytest.param({'state_rows': []}, CAST_MESSAGE, id='no-requests'),
+    pytest.param({'state_rows': [(s, str(n)) for s, n in _states()]}, CAST_MESSAGE, id='text-counts'),
+    pytest.param({'attempt_rows': [(7,)]}, '7 attempt rows were written; expected 8; no seed written', id='attempts-7'),
+    pytest.param({'attempt_rows': [(9,)]}, '9 attempt rows were written; expected 8; no seed written', id='attempts-9'),
+    pytest.param(
+        {'stray_rows': [(1,)]},
+        'a run has a request id without an attempt number or the reverse; no seed written',
+        id='half-attempt',
+    ),
+    pytest.param(
+        {'raw_counts': {INSTANCE_TABLE: [(1,)]}}, '1 ingest instances are held; expected 2; no seed written', id='one'
+    ),
+    pytest.param(
+        {'raw_counts': {INSTANCE_TABLE: [(3,)]}}, '3 ingest instances are held; expected 2; no seed written', id='three'
+    ),
+    pytest.param(
+        {'superseded_rows': [(0,)]},
+        'the instance marker did not supersede exactly the older instance; no seed written',
+        id='none-superseded',
+    ),
+    pytest.param(
+        {'superseded_rows': [(2,)]},
+        'the instance marker did not supersede exactly the older instance; no seed written',
+        id='both-superseded',
+    ),
+]
+
+
+@pytest.mark.parametrize(('override', 'message'), CAST_REFUSALS)
+def test_a_cast_that_differs_is_refused_before_the_rewrite(no_writes, override, message):
+    stack = FakeStack(**override)
+    with pytest.raises(SeedRefused) as raised:
+        produce(stack)
+    assert str(raised.value) == message
+    assert 'seed' in stack.kinds()
+    assert 'normalise' not in stack.kinds() and stack.kinds().count('synthetic check') == 2
+
+
+@pytest.mark.parametrize(('override', 'message'), CAST_REFUSALS[:1] + CAST_REFUSALS[6:7])
+def test_a_cast_refusal_exits_3_through_the_entry_point(monkeypatch, capsys, override, message):
+    monkeypatch.setattr(entry, 'Stack', lambda: FakeStack(**override))
+    assert entry.main([]) == entry.EXIT_REFUSED
+    captured = capsys.readouterr()
+    assert captured.err == f'seed refused: {message}\n'
+    assert captured.out == ''
+
+
+@pytest.mark.parametrize(
+    ('override', 'what'),
+    [
+        ({'attempt_rows': [('8',)]}, 'attempt rows'),
+        ({'stray_rows': []}, 'half-attempt rows'),
+        ({'raw_counts': {INSTANCE_TABLE: [(None,)]}}, 'instance count'),
+        ({'superseded_rows': [(True,)]}, 'superseded count'),
+    ],
+    ids=['attempts', 'half-attempts', 'instances', 'superseded'],
+)
+def test_a_cast_count_that_is_not_one_integer_fails_without_echoing_it(no_writes, override, what):
+    with pytest.raises(StackError) as raised:
+        produce(FakeStack(**override))
+    assert str(raised.value) == COUNT_MESSAGE.format(what=what)
+
+
+def test_the_cast_queries_count_what_the_refusal_names():
+    stack = FakeStack()
+    produce(stack, date='2026-09-30')
+    assert f'SELECT state::text, count(*) FROM {REQUEST_TABLE} GROUP BY state;' in stack.sql
+    assert f'SELECT count(*) FROM {RUN_TABLE} WHERE request_id IS NOT NULL AND attempt_no IS NOT NULL;' in stack.sql
+    assert f'SELECT count(*) FROM {RUN_TABLE} WHERE (request_id IS NULL) <> (attempt_no IS NULL);' in stack.sql
+    assert f'SELECT count(*) FROM {INSTANCE_TABLE} WHERE superseded_at IS NOT NULL;' in stack.sql
+
+
+def test_the_expected_cast_is_the_cast_ingest_records_names():
+    """Nine named requests, one per state but four FAILED; eight attempt rows; two instances, one superseded."""
+    assert sum(EXPECTED_REQUEST_STATES.values()) == len(REQUEST_IDS) == 9
+    assert len(set(REQUEST_IDS.values())) == len(REQUEST_IDS)
+    assert EXPECTED_REQUEST_STATES['FAILED'] == sum(1 for name in REQUEST_IDS if name.startswith('FAILED_'))
+    assert EXPECTED_ATTEMPT_ROWS == 8 and EXPECTED_INSTANCES == 2
+
+
+def test_the_committed_head_seed_holds_the_cast():
+    """A relationship with the seed the producer wrote at the head: the POSTed runs plus the attempt rows."""
+    manifest = json.loads((REPO_ROOT / 'tests' / 'system' / 'seeds' / f'{HEAD}.json').read_text(encoding='utf-8'))
+    assert manifest['row_counts'][REQUEST_TABLE] == sum(EXPECTED_REQUEST_STATES.values())
+    assert manifest['row_counts'][INSTANCE_TABLE] == EXPECTED_INSTANCES
+    assert manifest['row_counts'][RUN_TABLE] == len(SEED_REQUESTS) + EXPECTED_ATTEMPT_ROWS
+    sql = (REPO_ROOT / 'tests' / 'system' / 'seeds' / f'{HEAD}.sql').read_text(encoding='utf-8')
+    for request_id in REQUEST_IDS.values():
+        assert f"'{request_id}'" in sql, request_id
 
 
 # Rows the check cannot read. Each counts as ONE foreign row, never parsed for its size, and because
@@ -491,7 +831,7 @@ def test_a_stack_failure_propagates_and_prints_nothing(monkeypatch, capsys):
     assert captured.out == ''
 
 
-@pytest.mark.parametrize('table', [ENTRY_TABLE, BAR_TABLE])
+@pytest.mark.parametrize('table', SEED_TABLES)
 def test_a_backslash_line_in_the_render_fails_and_prints_nothing(monkeypatch, capsys, table):
     render = {table: [("INSERT INTO t (a) VALUES (E'x\n\\connect other');",)]}
     stack = FakeStack(render=render)
@@ -766,7 +1106,10 @@ def test_a_revision_that_is_not_twelve_hex_is_refused(monkeypatch):
 
 def test_no_rows_at_all_is_refused_as_an_empty_seed():
     """Unreachable past the collision check today; an empty .sql still cannot become a bundle."""
-    stack = FakeStack(render={ENTRY_TABLE: [], BAR_TABLE: []}, raw_counts={ENTRY_TABLE: [(0,)], BAR_TABLE: [(0,)]})
+    stack = FakeStack(
+        render={table: [] for table in SEED_TABLES},
+        raw_counts={table: [(0,)] for table in SEED_TABLES if table != INSTANCE_TABLE},
+    )
     with pytest.raises(SeedRefused, match='exactly one newline'):
         produce(stack)
 
@@ -785,7 +1128,8 @@ def test_success_prints_exactly_one_stdout_line_the_bundle(monkeypatch, capsys):
     line = json.loads(captured.out)
     assert set(line) == {'bundle', 'revision', 'sql', 'manifest'} and line['bundle'] == BUNDLE_TAG
     assert parse_bundle(captured.out) == produce(FakeStack(), date='2026-09-30').bundle
-    assert captured.err == f'seed produced for revision {HEAD} ({ENTRY_TABLE}=3, {BAR_TABLE}=7)\n'
+    counts = ', '.join(f'{table}={COUNTS[table]}' for table in SEED_TABLES)
+    assert captured.err == f'seed produced for revision {HEAD} ({counts})\n'
     assert stack.closed, 'the connection is closed on the way out'
 
 
@@ -941,7 +1285,7 @@ class _Cursor:
         self.driver.fake.sql.append(sql)
         if self.driver.fail_on and self.driver.fail_on in sql:
             raise self.driver.fail_with
-        self.rows = [] if sql == NORMALISE_SQL else self.driver.fake.answer(sql)
+        self.rows = [] if sql in (NORMALISE_SQL, RESET_SQL) else self.driver.fake.answer(sql)
 
     def fetchall(self):
         return self.rows
@@ -1031,6 +1375,22 @@ def test_end_to_end_the_bundle_is_printed_and_nothing_secret_leaves(monkeypatch,
     assert len(http.calls) == len(SEED_REQUESTS)
     assert database.kwargs[0]['password'] == PASSWORD and len(database.kwargs) == 1
     assert database.closed
+    _assert_never_leaked(captured, fake, http)
+
+
+def test_end_to_end_the_seeder_gets_the_real_async_url_and_it_never_prints_the_password(monkeypatch, capsys):
+    status, captured, fake, _, http = _run(monkeypatch, capsys)
+    assert status == 0
+    ((url, dataset_id, symbol),) = SEEDED_URLS
+    assert (url.drivername, url.host, url.port, url.database) == (
+        'postgresql+asyncpg',
+        'store-db-host',
+        5432,
+        'seed-db',
+    )
+    assert (url.username, url.password) == ('seed-user', PASSWORD)
+    assert (dataset_id, symbol) == (DATASET_ID, SEED_REQUESTS[0].symbol)
+    assert PASSWORD not in repr(url) and PASSWORD not in str(url)
     _assert_never_leaked(captured, fake, http)
 
 

@@ -1,6 +1,6 @@
 from enum import StrEnum
 
-from sqlalchemy import UUID, BigInteger, Column, DateTime, Enum, Index, Integer, String, func
+from sqlalchemy import UUID, BigInteger, Column, DateTime, Enum, Index, Integer, String, func, text
 
 from common.database.sql_alchemy_sensitive_string import SensitiveString
 from common.database.sql_alchemy_table import AppBase, CustomTypeTable
@@ -55,6 +55,8 @@ class IngestRun(AppBase.DATA_STORE_BASE, CustomTypeTable):
     DATASET_STARTED_INDEX = 'ix_ingest_run_dataset_id_started_at_id'
     RUNNING_INDEX = 'ix_ingest_run_running_dataset_id'
     FINISHED_INDEX = 'ix_ingest_run_finished_at'
+    # One attempt row per (request, attempt number): a redelivered report finds its row and writes nothing.
+    ATTEMPT_UNIQUE_INDEX = 'uq_ingest_run_request_id_attempt_no'
 
     # No unique=True: primary_key=True already provides it (see StoreDatasetEntry.id).
     id = Column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid(), nullable=False)
@@ -63,9 +65,34 @@ class IngestRun(AppBase.DATA_STORE_BASE, CustomTypeTable):
     # id does not exist before then. A run that fails before its ack keeps NULL and is identified by
     # its label. No foreign key, because the run must survive the dataset's deletion.
     dataset_id = Column(UUID(as_uuid=True), nullable=True)
-    # The request-log entry that caused the run. This is the link the scheduler's request log will use
-    # (tj-pd41mt); no request log exists yet, so it stays NULL and carries no foreign key.
+    # The ingest_request that caused the run (ingest_request.id). NULL for a store-driven fetch that has no
+    # request record. No foreign key: a run outlives its request.
     request_id = Column(UUID(as_uuid=True), nullable=True)
+    # Set only on the attempt row of a reported attempt (PR 5): the attempt's number within its request,
+    # starting at 1, the instance that made it and the quota scope it was charged to. All NULL on a run the
+    # store drove itself.
+    attempt_no = Column(Integer, nullable=True)
+    instance_id = Column(String, nullable=True)
+    # A non-secret configured label, never key material.
+    quota_key = Column(String, nullable=True)
+    # What the store told ingest for this attempt (CONTINUE or FINAL), kept so a redelivered report is answered
+    # from the stored row. NULL where there is no reported attempt.
+    verdict = Column(String, nullable=True)
+
+    # What the attempt cost at the vendor (the wire's VendorCallStats), failed attempts included. All NULL on
+    # a run with no reported stats; vendor_reported_* is the vendor's own header count, corroboration only.
+    vendor_calls = Column(BigInteger, nullable=True)
+    vendor_pages = Column(BigInteger, nullable=True)
+    vendor_throttled_429 = Column(BigInteger, nullable=True)
+    vendor_retries = Column(BigInteger, nullable=True)
+    vendor_first_call_at = Column(DateTime(timezone=True), nullable=True)
+    vendor_last_call_at = Column(DateTime(timezone=True), nullable=True)
+    vendor_reported_limit = Column(BigInteger, nullable=True)
+    vendor_reported_remaining = Column(BigInteger, nullable=True)
+    vendor_reported_reset_at = Column(DateTime(timezone=True), nullable=True)
+    # The vendor's public instrument key the bars header carried, opaque and stored as received. NULL when the header
+    # named none (an empty string is never stored) and on every run that is not a delivered bars attempt.
+    vendor_asset_id = Column(String, nullable=True)
 
     trigger = Column(Enum(IngestRunTrigger, name='ingest_run_trigger', values_callable=_values), nullable=False)
     # Who caused the run: the request body's owner for POST /store. A SensitiveString exactly like
@@ -116,6 +143,15 @@ class IngestRun(AppBase.DATA_STORE_BASE, CustomTypeTable):
         Index(RUNNING_INDEX, 'dataset_id', postgresql_where=(state == IngestRunState.RUNNING)),
         # Retention and the collection stats window by finish time (tj-grna9p.65).
         Index(FINISHED_INDEX, 'finished_at'),
+        # Redelivery of an attempt is idempotent on this key. Partial, so the many runs with no request or no
+        # attempt number never collide.
+        Index(
+            ATTEMPT_UNIQUE_INDEX,
+            'request_id',
+            'attempt_no',
+            unique=True,
+            postgresql_where=text('request_id IS NOT NULL AND attempt_no IS NOT NULL'),
+        ),
     )
 
     def __repr__(self):

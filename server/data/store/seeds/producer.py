@@ -15,7 +15,11 @@ over the network (stack.py); writes nothing to disk. In order:
      symbol or owner. Then the COLLISION REFUSAL: at least one
      (asset_symbol, source, granularity, timestamp) group must hold more than one bar row, the old
      four-column bar key collision the head seed exists to carry (decision tj-vhboky.55, E4).
-  4. Normalise the two tables (dump.py: why) and render them (dump.py: the format).
+  3b. Rebuild the three ingest tables (bead tj-7zjov1.100): they are emptied before the POSTs (the POSTs write
+     ten attempt-less ingest_run rows) and the cast of ingest_records.py is written after them through the
+     store's own code (create_request, mark_queued, DeliveryIntake), then counted: a seed whose request states,
+     attempt rows or instance marker differ from the cast is refused.
+  4. Normalise the five tables (dump.py: why) and render them (dump.py: the format).
   5. Build the manifest and return the bundle (bundle.py: the contract), last, and only when every
      earlier step passed. __main__ prints it as the one stdout line.
 
@@ -26,22 +30,36 @@ Where the files go is not the producer's business: `python -m data.store.seeds.b
 seed-dump) and the MCP's own reader write them from the bundle.
 """
 
+import asyncio
 import json
+import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from sqlalchemy.engine import URL
 
 from common.tests.roots import SERVER_ROOT
 from data.store.seeds.bundle import Bundle, BundleRefused, render_bundle
 from data.store.seeds.dump import (
     BAR_TABLE,
     ENTRY_TABLE,
+    INSTANCE_TABLE,
     NORMALISE_SQL,
+    REQUEST_TABLE,
+    RUN_TABLE,
     SEED_TABLES,
     check_no_meta_commands,
     render_table_sql,
     with_sequence_position,
+)
+from data.store.seeds.ingest_records import (
+    EXPECTED_ATTEMPT_ROWS,
+    EXPECTED_INSTANCES,
+    EXPECTED_REQUEST_STATES,
+    seed_ingest_records,
 )
 from data.store.seeds.manifest import build_manifest, column_digest_sql, head_revision, render_manifest
 from data.store.seeds.scenario import SEED_REQUESTS, SeedRequest, is_synthetic
@@ -62,6 +80,9 @@ from tests.fakes.market_data import EMPTY_PREFIX
 # constraint that forced bundle.py's own marker search does not apply here, and importing the one
 # sentinel shared by every other site keeps this module from drifting out of step with it.
 VERSIONS_DIR: Path = SERVER_ROOT / 'data' / 'store' / 'migrations' / 'versions'
+
+
+SeedRecords = Callable[[URL, uuid.UUID, str], Awaitable[None]]
 
 
 class SeedRefused(Exception):
@@ -113,9 +134,14 @@ def _count_foreign_rows(stack: Stack) -> tuple[int, bool]:
         tuple[int, bool]: The count, and whether an unreadable group was counted as ONE row (so the
             count is a lower bound).
     """
+    # The ingest tables carry the same labels: a request's client_label and a run's actor are the owner. A NULL
+    # symbol (an asset-list request) is no synthetic symbol, so it reads as foreign. ingest_instance has no label.
     sql = (
         f"SELECT 'e', asset_symbol, owner, count(*) FROM {ENTRY_TABLE} GROUP BY asset_symbol, owner "  # nosec B608 -- module constants only
-        f"UNION ALL SELECT 'b', asset_symbol, '', count(*) FROM {BAR_TABLE} GROUP BY asset_symbol;"
+        f"UNION ALL SELECT 'b', asset_symbol, '', count(*) FROM {BAR_TABLE} GROUP BY asset_symbol "
+        f"UNION ALL SELECT 'q', coalesce(asset_symbol, ''), client_label, count(*) FROM {REQUEST_TABLE} "
+        'GROUP BY asset_symbol, client_label '
+        f"UNION ALL SELECT 'r', asset_symbol, actor, count(*) FROM {RUN_TABLE} GROUP BY asset_symbol, actor;"
     )
     foreign = 0
     unreadable = False
@@ -127,7 +153,7 @@ def _count_foreign_rows(stack: Stack) -> tuple[int, bool]:
             unreadable = True
             continue
         kind, symbol, owner, count = row
-        if not is_synthetic(symbol, owner if kind == 'e' else None):
+        if not is_synthetic(symbol, owner if kind != 'b' else None):
             foreign += count
     return foreign, unreadable
 
@@ -185,6 +211,63 @@ def _refuse_no_bar_collision(stack: Stack) -> None:
         )
 
 
+def _dataset_to_write_under(stack: Stack) -> tuple[uuid.UUID, str]:
+    """The entry the seeded requests write bars under: the first scenario request's dataset, and its symbol.
+
+    Raises:
+        SeedRefused: If the scenario's first dataset is not exactly one entry.
+    """
+    first = SEED_REQUESTS[0]
+    sql = (
+        f'SELECT id::text FROM {ENTRY_TABLE} '  # nosec B608 -- module constant, scenario literals
+        f"WHERE asset_symbol = '{first.symbol}' AND owner = '{first.owner}' "
+        f"AND start = TIMESTAMPTZ '{first.start.isoformat()}' AND \"end\" = TIMESTAMPTZ '{first.end.isoformat()}';"
+    )
+    rows = stack.query(sql, 'seed dataset lookup')
+    if len(rows) != 1 or len(rows[0]) != 1 or not isinstance(rows[0][0], str):
+        raise SeedRefused(f"the scenario's first dataset is {len(rows)} entries; expected exactly one")
+    return uuid.UUID(rows[0][0]), first.symbol
+
+
+def _refuse_wrong_ingest_records(stack: Stack) -> None:
+    """Refuse unless the three ingest tables hold exactly the cast ingest_records.py writes, plus the POSTed runs.
+
+    Counts only, never a value.
+    """
+    states = {
+        str(row[0]): row[1]
+        for row in stack.query(
+            f'SELECT state::text, count(*) FROM {REQUEST_TABLE} GROUP BY state;',  # nosec B608 -- module constant
+            'request states',
+        )
+    }
+    if states != EXPECTED_REQUEST_STATES:
+        raise SeedRefused(
+            'the seeded ingest requests are not the expected cast (counts per state differ); no seed written'
+        )
+    attempts = _query_count(
+        stack,
+        f'SELECT count(*) FROM {RUN_TABLE} WHERE request_id IS NOT NULL AND attempt_no IS NOT NULL;',  # nosec B608
+        'attempt rows',
+    )
+    if attempts != EXPECTED_ATTEMPT_ROWS:
+        raise SeedRefused(f'{attempts} attempt rows were written; expected {EXPECTED_ATTEMPT_ROWS}; no seed written')
+    stray = _query_count(
+        stack,
+        f'SELECT count(*) FROM {RUN_TABLE} WHERE (request_id IS NULL) <> (attempt_no IS NULL);',  # nosec B608
+        'half-attempt rows',
+    )
+    if stray:
+        raise SeedRefused('a run has a request id without an attempt number or the reverse; no seed written')
+    instances = _query_count(stack, f'SELECT count(*) FROM {INSTANCE_TABLE};', 'instance count')  # nosec B608
+    if instances != EXPECTED_INSTANCES:
+        raise SeedRefused(f'{instances} ingest instances are held; expected {EXPECTED_INSTANCES}; no seed written')
+    superseded_sql = f'SELECT count(*) FROM {INSTANCE_TABLE} WHERE superseded_at IS NOT NULL;'  # nosec B608
+    superseded = _query_count(stack, superseded_sql, 'superseded count')
+    if superseded != EXPECTED_INSTANCES - 1:
+        raise SeedRefused('the instance marker did not supersede exactly the older instance; no seed written')
+
+
 def _column_names(stack: Stack, table: str) -> list[str]:
     sql = (
         'SELECT column_name FROM information_schema.columns '  # nosec B608 -- table is a module constant
@@ -224,12 +307,13 @@ def _column_digests(stack: Stack, table: str) -> dict[str, str]:
     return digests
 
 
-def produce(stack: Stack, date: str | None = None) -> SeedResult:
+def produce(stack: Stack, date: str | None = None, seed_records: SeedRecords = seed_ingest_records) -> SeedResult:
     """Run the whole producer against a stack and return the seed as a bundle.
 
     Args:
         stack (Stack): The scratch stack.
         date (str | None): The manifest's UTC date, YYYY-MM-DD; today's when None.
+        seed_records (SeedRecords): Writes the ingest records through the store's own code; a test injects its own.
 
     Returns:
         SeedResult: The bundle and the row counts. Nothing is written.
@@ -251,6 +335,10 @@ def produce(stack: Stack, date: str | None = None) -> SeedResult:
     # Before the first POST as well as before the rewrite: a database that already holds a real symbol or owner
     # is not touched at all, not even by the synthetic requests.
     _refuse_foreign_rows(stack)
+    # The three ingest tables are rebuilt from nothing, so a run on a scratch database that was seeded before
+    # gives the same rows (every row left is synthetic: the refusal above passed). The instance marker has no
+    # label to check; a scratch stack's own ingest instance is dropped here and re-announces itself.
+    stack.script(f'DELETE FROM {RUN_TABLE}; DELETE FROM {REQUEST_TABLE}; DELETE FROM {INSTANCE_TABLE};', 'ingest reset')  # nosec B608
     for index, request in enumerate(SEED_REQUESTS):
         reply = stack.post(request.path, request.body(), INSTANCE_SECRET_HEADER)
         if reply.get('status') != 200:
@@ -259,6 +347,11 @@ def produce(stack: Stack, date: str | None = None) -> SeedResult:
 
     _refuse_foreign_rows(stack)
     _refuse_no_bar_collision(stack)
+    # The ingest records, through the store's own code (ingest_records.py), before anything is rewritten.
+    dataset_id, symbol = _dataset_to_write_under(stack)
+    asyncio.run(seed_records(stack.async_url(), dataset_id, symbol))
+    _refuse_wrong_ingest_records(stack)
+    _refuse_foreign_rows(stack)
     stack.script(NORMALISE_SQL, 'normalise')
     row_counts = {
         table: _query_count(stack, f'SELECT count(*) FROM {table};', f'{table} count')  # nosec B608 -- table is a module constant

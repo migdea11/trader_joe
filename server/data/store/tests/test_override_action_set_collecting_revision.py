@@ -77,9 +77,11 @@ def _run(direction: str, used: int = 0) -> tuple[list[Any], MagicMock]:
 # --------------------------------------------------------------------------------------------- the chain
 
 
-def test_the_revision_is_the_head_directly_on_the_collect_revision_and_is_additive():
+def test_the_revision_is_directly_on_the_collect_revision_has_one_child_and_is_additive():
+    """No longer the head since tj-7zjov1.25: f2b7d4a91c36 is its one child and the head."""
     script = ScriptDirectory(str(MIGRATIONS_DIR))
-    assert script.get_heads() == [REVISION]
+    assert script.get_heads() == ['f2b7d4a91c36']
+    assert [rev.revision for rev in script.walk_revisions() if rev.down_revision == REVISION] == ['f2b7d4a91c36']
     module = _load()
     assert (module.revision, module.down_revision) == (REVISION, PARENT)
     assert not ADDITIVE_EXCEPTION_MARKER.search(REVISION_FILE.read_text(encoding='utf-8'))

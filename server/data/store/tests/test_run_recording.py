@@ -24,7 +24,7 @@ import asyncio
 import logging
 import uuid
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from datetime import UTC, datetime
 
 import pytest
@@ -570,6 +570,8 @@ async def test_the_lifespan_sweeps_after_the_database_is_initialised(monkeypatch
     for name in ('initialize_latency_client', 'init_debugger', 'startup_logs'):
         monkeypatch.setattr(app_depends, name, lambda *args, **kwargs: None)
     monkeypatch.setattr(app_depends.SharedWorkerPool, 'worker_startup', lambda *args, **kwargs: None)
+    # The lifespan builds the StoreService host from the bind env first (tj-7zjov1.27); none is bound here.
+    monkeypatch.setattr(app_depends, 'build_grpc_host', nullcontext)
     # Never reached (the sweep stops the lifespan first), but if it were, no real DAILY refresh pass (tj-grna9p.92).
     monkeypatch.setenv('DAILY_REFRESH_ENABLED', 'false')
 

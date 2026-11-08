@@ -10,9 +10,10 @@ file's module-level `revision` and `down_revision`). A mismatch, or more than on
 THE DIGEST ALGORITHM (recompute it with column_digest_sql, or the same query by hand). For one
 table and one column, with the session at TIME ZONE 'UTC' and extra_float_digits 1:
 
-    rows = the table's rows ordered by id ascending (both tables have an id primary key; an entry id
-           is a hash of its natural key, a bar id is its rank, so the order is the same in any
-           database holding the same seed);
+    rows = the table's rows ordered by dump.order_column(table) ascending: id for every table but
+           ingest_instance, which is keyed by instance_id (an entry id is a hash of its natural key,
+           a bar id is its rank, an attempt row's id is the hash of its rank, a request id and an
+           instance id are literals, so the order is the same in any database holding the same seed);
     item = 'n' when the column is NULL, else 'v' followed by the column cast to text;
     digest = lower-case hex SHA-256 of the UTF-8 bytes of the items joined by a single newline
              (the empty string for a table with no rows).
@@ -25,6 +26,8 @@ could in principle collide with two items; a synthetic seed has none.
 import ast
 import json
 from pathlib import Path
+
+from data.store.seeds.dump import order_column
 
 
 PRODUCER = 'data.store.seeds'
@@ -104,7 +107,7 @@ def column_digest_sql(table: str, columns: list[str]) -> str:
     selects = [
         f"SELECT '{column.replace(chr(39), chr(39) * 2)}' AS name, "  # nosec B608 -- table and column names come from information_schema, quoted
         f'encode(sha256(convert_to(coalesce(string_agg('
-        f"CASE WHEN {_quote(column)} IS NULL THEN 'n' ELSE 'v' || {_quote(column)}::text END, E'\\n' ORDER BY id"
+        f"CASE WHEN {_quote(column)} IS NULL THEN 'n' ELSE 'v' || {_quote(column)}::text END, E'\\n' ORDER BY {order_column(table)}"
         f"), ''), 'UTF8')), 'hex') AS digest FROM {_quote(table)}"
         for column in sorted(columns)
     ]

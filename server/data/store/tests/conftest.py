@@ -75,3 +75,30 @@ def restore_logging_state() -> Iterator[None]:
     """Run the test against a clean broker sink; fail if any logging state survives the restore."""
     with guarded_isolated_logging():
         yield
+
+
+# The module globals app_depends.lifespan assigns and never clears (tj-7zjov1.130). Module scope, so no name mangling:
+# the attribute names are literally these.
+LIFESPAN_GLOBALS = ('__INGEST_CHANNEL', '__INGEST_FETCH_CLIENT')
+
+
+@pytest.fixture(autouse=True)
+def restore_lifespan_globals() -> Iterator[None]:
+    """Put back the gRPC channel and fetch client globals a lifespan test may have left set.
+
+    app_depends.lifespan assigns both and does not reset them on exit (in production one lifespan runs per process,
+    so nothing needs to). A test that enters the lifespan without patching them leaves its fake client in the module
+    for the rest of the session: test_reaper's lifespan test did, and in random order the two tests that assert no
+    lifespan has run (test_http_smoke test_the_routes_are_driven_without_a_lifespan and test_dataset_fetch_transaction
+    test_get_ingest_fetch_client_hands_out_the_client_the_lifespan_built) then failed their own guard. Restoring here
+    covers every lifespan test, present and future, so none has to remember to patch them. The import is inside the
+    fixture so that collecting a test module never imports the app.
+    """
+    from data.store.app import app_depends
+
+    saved = {name: getattr(app_depends, name) for name in LIFESPAN_GLOBALS}
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            setattr(app_depends, name, value)

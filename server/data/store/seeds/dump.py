@@ -3,12 +3,13 @@ r"""The dump: what normalises the tables, and how Postgres renders them into the
 THIS DOCSTRING IS THE SEED FORMAT'S DEFINITION (decision tj-vhboky.55 SEED FORMAT and addendum S9).
 Hand-written bootstrap seeds (tj-vhboky.62) follow it.
 
-The .sql is a DATA-ONLY rendering of store_dataset_entry and stock_market_activity (never the
-8f41c2d7a3b9 archive table). It is rendered BY POSTGRES through the driver, in a session at
+The .sql is a DATA-ONLY rendering of store_dataset_entry, stock_market_activity, ingest_instance, ingest_request and
+ingest_run (never the 8f41c2d7a3b9 archive table; the last three since bead tj-7zjov1.100, written by
+ingest_records.py through the store's own code). It is rendered BY POSTGRES through the driver, in a session at
 TimeZone UTC and extra_float_digits 1 (the digests' settings), and holds exactly:
 
-  1. For each table in SEED_TABLES order (entries, then bars), one line per row, rows ordered by id
-     ascending, each
+  1. For each table in SEED_TABLES order (entries, bars, instances, requests, runs), one line per row, rows
+     ordered by id ascending (ingest_instance: by instance_id, see order_column), each
 
          INSERT INTO public.<table> (<columns>) VALUES (<values>);
 
@@ -53,7 +54,19 @@ SEED_TIMESTAMP = '2000-01-01 00:00:00+00'
 # The tables the seed carries, parents first. Fixed: never the archive table.
 ENTRY_TABLE = 'store_dataset_entry'
 BAR_TABLE = 'stock_market_activity'
-SEED_TABLES = (ENTRY_TABLE, BAR_TABLE)
+INSTANCE_TABLE = 'ingest_instance'
+REQUEST_TABLE = 'ingest_request'
+RUN_TABLE = 'ingest_run'
+SEED_TABLES = (ENTRY_TABLE, BAR_TABLE, INSTANCE_TABLE, REQUEST_TABLE, RUN_TABLE)
+# The column a table's rows are ordered by, in the dump and in the manifest digests. Every table has an id
+# primary key except the instance marker, which is keyed by the opaque instance id.
+ORDER_COLUMN = {INSTANCE_TABLE: 'instance_id'}
+
+
+def order_column(table: str) -> str:
+    """The column the table's rows are ordered by: id, unless ORDER_COLUMN says otherwise."""
+    return ORDER_COLUMN.get(table, 'id')
+
 
 # The entry's natural key, for the deterministic id. Mirrors StoreDatasetEntry.NATURAL_KEY, IN ITS
 # ORDER; "end" is quoted because it is a keyword.
@@ -78,13 +91,38 @@ UPDATE seed_bar b SET dataset_id = m.new_id FROM seed_map m WHERE b.dataset_id =
 UPDATE seed_entry e SET id = m.new_id FROM seed_map m WHERE e.id = m.old_id;
 UPDATE seed_entry SET created_at = TIMESTAMPTZ '{SEED_TIMESTAMP}', updated_at = TIMESTAMPTZ '{SEED_TIMESTAMP}';
 UPDATE seed_bar SET created_at = TIMESTAMPTZ '{SEED_TIMESTAMP}', updated_at = TIMESTAMPTZ '{SEED_TIMESTAMP}';
+-- The ingest records (ingest_records.py). Request ids are literals already; attempt-row ids are random and become
+-- the md5 of their rank, dataset ids follow the entry map, and every instant Postgres stamped with now() is fixed.
+CREATE TEMP TABLE seed_instance ON COMMIT DROP AS SELECT * FROM {INSTANCE_TABLE};
+CREATE TEMP TABLE seed_request ON COMMIT DROP AS SELECT * FROM {REQUEST_TABLE};
+CREATE TEMP TABLE seed_run ON COMMIT DROP AS SELECT * FROM {RUN_TABLE};
+UPDATE seed_request r SET dataset_id = m.new_id FROM seed_map m WHERE r.dataset_id = m.old_id;
+UPDATE seed_run r SET dataset_id = m.new_id FROM seed_map m WHERE r.dataset_id = m.old_id;
+UPDATE seed_run r SET id = md5('{RUN_TABLE}|' || k.rank::text)::uuid FROM (
+    SELECT id, row_number() OVER (
+        ORDER BY request_id NULLS FIRST, attempt_no NULLS FIRST, asset_symbol, actor, granularity, requested_start,
+                 requested_end, source, trigger, state, bars_written
+    ) AS rank
+    FROM seed_run
+) k WHERE r.id = k.id;
+UPDATE seed_run SET started_at = TIMESTAMPTZ '{SEED_TIMESTAMP}', finished_at = TIMESTAMPTZ '{SEED_TIMESTAMP}'
+    WHERE request_id IS NULL;
+UPDATE seed_run SET started_at = finished_at WHERE request_id IS NOT NULL AND vendor_first_call_at IS NULL;
+UPDATE seed_request SET created_at = TIMESTAMPTZ '{SEED_TIMESTAMP}';
+UPDATE seed_request SET finished_at = TIMESTAMPTZ '{SEED_TIMESTAMP}' + interval '1 hour' WHERE finished_at IS NOT NULL;
+UPDATE seed_instance SET first_seen_at = TIMESTAMPTZ '{SEED_TIMESTAMP}',
+    last_seen_at = TIMESTAMPTZ '{SEED_TIMESTAMP}' + interval '2 hours',
+    superseded_at = CASE WHEN superseded_at IS NULL THEN NULL ELSE TIMESTAMPTZ '{SEED_TIMESTAMP}' + interval '1 hour' END;
 UPDATE seed_bar b SET id = r.rank FROM (
     SELECT id, row_number() OVER (ORDER BY dataset_id, asset_symbol, source, feed, granularity, timestamp) AS rank
     FROM seed_bar
 ) r WHERE b.id = r.id;
-TRUNCATE {ENTRY_TABLE}, {BAR_TABLE};
+TRUNCATE {ENTRY_TABLE}, {BAR_TABLE}, {INSTANCE_TABLE}, {REQUEST_TABLE}, {RUN_TABLE};
 INSERT INTO {ENTRY_TABLE} SELECT * FROM seed_entry ORDER BY id;
 INSERT INTO {BAR_TABLE} SELECT * FROM seed_bar ORDER BY id;
+INSERT INTO {INSTANCE_TABLE} SELECT * FROM seed_instance ORDER BY instance_id;
+INSERT INTO {REQUEST_TABLE} SELECT * FROM seed_request ORDER BY id;
+INSERT INTO {RUN_TABLE} SELECT * FROM seed_run ORDER BY id;
 SELECT setval(pg_get_serial_sequence('{BAR_TABLE}', 'id'), max(id), true) FROM {BAR_TABLE} HAVING count(*) > 0;
 COMMIT;
 """  # nosec B608 -- interpolates module constants only, never input
@@ -119,7 +157,7 @@ def render_table_sql(table: str, columns: list[str]) -> str:
     values = " || ', ' || ".join(f'quote_nullable({_quote(column)})' for column in ordered)
     return (
         f"SELECT 'INSERT INTO public.{table} (' || {names} || ') VALUES (' || {values} || ');' "  # nosec B608 -- module-constant table, quoted schema names
-        f'FROM public.{table} ORDER BY id;'
+        f'FROM public.{table} ORDER BY {order_column(table)};'
     )
 
 

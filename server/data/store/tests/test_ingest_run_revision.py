@@ -23,7 +23,7 @@ import pytest
 import sqlalchemy as sa
 from alembic.operations.schemaobj import SchemaObjects
 from sqlalchemy.dialects import postgresql
-from sqlalchemy.schema import CreateIndex, CreateTable
+from sqlalchemy.schema import CreateColumn, CreateIndex
 
 from data.store.app.database.models.ingest_run import IngestRun, IngestRunState, IngestRunTrigger
 
@@ -32,6 +32,8 @@ pytestmark = pytest.mark.data_store
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / 'migrations'
 REVISION_FILE = MIGRATIONS_DIR / 'versions' / '6f5a798746a1_ingest_run.py'
+# The one later revision that changes ingest_run (tj-7zjov1.25): the model is what the HEAD leaves.
+REQUEST_RECORD_FILE = MIGRATIONS_DIR / 'versions' / 'f2b7d4a91c36_request_record_and_instance_marker.py'
 DIALECT = postgresql.dialect()
 NEW_TYPES = ['ingest_run_trigger', 'ingest_run_state']
 
@@ -62,10 +64,6 @@ def _run(direction: str) -> tuple[MagicMock, list[str], list[str]]:
 
 def _schema_calls(op: MagicMock) -> list[str]:
     return [name for name, _, _ in op.method_calls if name != 'get_bind']
-
-
-def _ddl_of(table: sa.Table) -> str:
-    return ' '.join(str(CreateTable(table).compile(dialect=DIALECT)).split())
 
 
 def _revision_table(op: MagicMock) -> sa.Table:
@@ -115,20 +113,65 @@ def test_downgrade_drops_exactly_what_upgrade_created_in_reverse():
     assert dropped == list(reversed(created)), 'assettype, feed and the rest belong to other tables'
 
 
-def test_the_revision_builds_exactly_the_table_the_model_declares():
-    """Every column, type, nullability and server default, compared as Postgres DDL, model against revision."""
+def _later_ingest_run_changes() -> tuple[list[sa.Column], set[str]]:
+    """The columns and indexes LATER revisions add to ingest_run: today only f2b7d4a91c36 (tj-7zjov1.25).
+
+    The model describes ingest_run as the HEAD leaves it, so the model comparisons below compose this revision's
+    table with what came after it, read from the later revision's own upgrade() rather than restated here.
+    """
+    spec = importlib.util.spec_from_file_location('revision_f2b7d4a91c36', REQUEST_RECORD_FILE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    op = MagicMock(name='op')
+    with (
+        patch.object(module, 'op', op),
+        patch.object(postgresql.ENUM, 'create', autospec=True),
+        patch.object(postgresql.ENUM, 'drop', autospec=True),
+    ):
+        module.upgrade()
+    objects = SchemaObjects()
+    columns = [args[1] for name, args, _ in op.method_calls if name == 'add_column' and args[0] == IngestRun.TABLE_NAME]
+    indexes = {
+        str(CreateIndex(objects.index(args[0], args[1], args[2], **kwargs)).compile(dialect=DIALECT))
+        for name, args, kwargs in op.method_calls
+        if name == 'create_index' and args[1] == IngestRun.TABLE_NAME
+    }
+    return columns, indexes
+
+
+def _column_ddl(table: sa.Table) -> dict[str, str]:
+    return {column.name: str(CreateColumn(column).compile(dialect=DIALECT)) for column in table.columns}
+
+
+def test_the_revision_and_the_later_ones_build_exactly_the_table_the_model_declares():
+    """Every column, type, nullability and server default, compared as Postgres DDL, model against the HEAD's table.
+
+    THE MODEL MOVED ON (tj-7zjov1.25): f2b7d4a91c36 adds fourteen nullable columns to ingest_run, so the model is
+    compared with this revision's table plus those columns. Per column rather than as one CREATE TABLE, because
+    ADD COLUMN appends where the model declares the attempt columns beside request_id; column order is not schema
+    that any statement here depends on. This revision's own columns are still compared, as a strict subset.
+    """
     op, _, _ = _run('upgrade')
+    table = _revision_table(op)
+    own = _column_ddl(table)
+    later_columns, _ = _later_ingest_run_changes()
+    later = {column.name: str(CreateColumn(column).compile(dialect=DIALECT)) for column in later_columns}
 
-    assert _ddl_of(_revision_table(op)) == _ddl_of(IngestRun.__table__)
+    assert not own.keys() & later.keys(), 'a later revision re-adds a column this one created'
+    assert {**own, **later} == _column_ddl(IngestRun.__table__)
+    # The primary key is not a column property, so it is compared on its own.
+    assert [c.name for c in table.primary_key] == [c.name for c in IngestRun.__table__.primary_key]
 
 
-def test_the_revision_builds_exactly_the_indexes_the_model_declares():
-    """The keyset index, the partial RUNNING index and the finished_at index, as Postgres DDL."""
+def test_the_revision_and_the_later_ones_build_exactly_the_indexes_the_model_declares():
+    """The keyset index, the partial RUNNING index, the finished_at index, and since f2b7d4a91c36 the attempt index."""
     op, _, _ = _run('upgrade')
     declared = {str(CreateIndex(index).compile(dialect=DIALECT)) for index in IngestRun.__table__.indexes}
+    _, later = _later_ingest_run_changes()
 
-    assert _revision_indexes(op) == declared
-    assert len(declared) == 3
+    assert len(_revision_indexes(op)) == 3
+    assert len(later) == 1
+    assert _revision_indexes(op) | later == declared
 
 
 def test_the_two_new_types_carry_the_models_members_in_order():
