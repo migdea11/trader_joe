@@ -40,7 +40,7 @@ architect plans → (user approves) → builder → validator → architect (tes
 | builder-store | builder | `server/data/store`, `server/routers/data_store` |
 | builder-ui | builder | `web` |
 | builder-shared | builder | `server/common`, `server/schemas`, `server/routers/common`, `tools`, `proto`, `buf.yaml`, `deploy/web/Caddyfile`, build + CI files, task-store client config (the `.beads/` config files and the store lines of `CLAUDE.md` and `.claude/`) |
-| validator | quality gate, default test author, closes work that skips the architect gate | all test directories: `tests`, `server/*/tests`, `server/data/*/tests`, `web/src/**/*.spec.ts` |
+| validator | quality gate, default test author, closes work that skips the architect gate | all test directories: `tests`, `server/*/tests`, `server/data/*/tests`, `tools/agent_mcp/tests`, `web/src/**/*.spec.ts` |
 | scribe | docs, at feature completion | all doc tiers |
 | researcher-broker | read-only research | broker and market-data APIs |
 

@@ -12,7 +12,8 @@ deletions on in its OWN env file, which is never committed.
      file among them that is not a test or a Markdown document -- holds no mention of the variable at all, with
      any value, including an interpolation such as ${REAPER_DELETES_ENABLED:-...}. tools/dev_datasets/plan.json
      is read with its `purpose` prose removed: two rows' purposes explain when the reaper deletes, and that is
-     text shown to a person, not a setting.
+     text shown to a person, not a setting. tools/agent_mcp/stack.py's one entry on the agent MCP's NEVER list
+     (ADR tj-4rr0la addendum 32 (2)) is exempt: it names the flag only so test_env can refuse it.
   2. NOWHERE ELSE ASSIGNS IT TRUE. Every other tracked text file -- the only ones exempt are reaper.py (which
      defines the name), Markdown documents and tests -- holds no assignment of `true` to it in any spelling:
      NAME=true, NAME: true, 'NAME': 'true', ENV NAME true, a ${NAME:-true} default.
@@ -21,6 +22,7 @@ The file list is `git ls-files`, read from the working tree, so an untracked ope
 edited tracked file does.
 """
 
+import ast
 import fnmatch
 import json
 import re
@@ -125,17 +127,69 @@ def _config_files() -> list[str]:
     return [name for name in _tracked_files() if _is_config(name) and not _is_test(name) and not _is_doc(name)]
 
 
+# THE ONE REFUSAL-LIST EXEMPTION (tj-7zjov1.270). ADR tj-4rr0la addendum 32 (2) puts REAPER_DELETES_ENABLED on the
+# agent MCP's NEVER list: test_env refuses it by name. That mention can never turn deletions on -- it is the reason
+# test_env cannot -- so it is not what this module guards against (a committed file SETTING the flag). Spelling it
+# without the literal instead would hide the refusal from exactly this kind of scan. The exemption is narrow: the
+# line must be the bare string entry, inside the ENV_NEVER_NAMES assignment of that one file, found by AST. STALE
+# RULE: test_the_never_list_exemption_is_live_and_is_the_only_mention goes red when the entry moves or goes, and
+# then this exemption is deleted with it, not widened.
+NEVER_LIST_FILE = 'tools/agent_mcp/stack.py'
+NEVER_LIST_NAME = 'ENV_NEVER_NAMES'
+NEVER_LIST_ENTRY = f"'{VARIABLE}',"
+
+
+def _never_list_lines() -> set[int]:
+    """The line numbers of NEVER_LIST_FILE's ENV_NEVER_NAMES assignment whose whole text is the refusal entry."""
+    text = Path(REPO_ROOT, NEVER_LIST_FILE).read_text(encoding='utf-8')
+    lines = text.splitlines()
+    spans = [
+        (node.lineno, node.end_lineno or node.lineno)
+        for node in ast.walk(ast.parse(text))
+        if isinstance(node, ast.Assign)
+        and [getattr(target, 'id', None) for target in node.targets] == [NEVER_LIST_NAME]
+    ]
+    return {
+        number
+        for start, end in spans
+        for number in range(start, end + 1)
+        if lines[number - 1].strip() == NEVER_LIST_ENTRY
+    }
+
+
 def test_the_config_set_is_listed_and_holds_every_anchor():
     assert set(_config_files()) >= CONFIG_ANCHORS
 
 
+def test_the_never_list_exemption_is_live_and_is_the_only_mention():
+    """The exemption names a line that exists, holds the bare entry, and is the file's only mention of the flag."""
+    exempt = _never_list_lines()
+    assert len(exempt) == 1, f'{NEVER_LIST_FILE}: no single {NEVER_LIST_ENTRY} entry in {NEVER_LIST_NAME}: {exempt}'
+    text = Path(REPO_ROOT, NEVER_LIST_FILE).read_text(encoding='utf-8')
+    mentions = {number for number, line in enumerate(text.splitlines(), 1) if MENTION.search(line)}
+    assert mentions == exempt, f'{NEVER_LIST_FILE} names {VARIABLE} outside its refusal entry: {sorted(mentions)}'
+
+
+def test_the_never_list_entry_is_a_refusal_not_an_allowance():
+    """The exempted entry is what test_env refuses; the flag is on no service's allow-list."""
+    from tools.agent_mcp import stack
+
+    assert VARIABLE in stack.ENV_NEVER_NAMES and stack.env_name_never_allowed(VARIABLE)
+    assert not [service for service, names in stack.AGENT_ENV_ALLOW.items() if VARIABLE in names]
+
+
 def test_no_committed_config_file_names_the_reaper_deletes_flag():
     offenders = {}
+    exempt = _never_list_lines()
     for name in _config_files():
         text = _text(name)
         if text is None:
             continue
-        lines = [number for number, line in enumerate(text.splitlines(), 1) if MENTION.search(line)]
+        lines = [
+            number
+            for number, line in enumerate(text.splitlines(), 1)
+            if MENTION.search(line) and not (name == NEVER_LIST_FILE and number in exempt)
+        ]
         if lines:
             offenders[name] = lines
     assert offenders == {}, (

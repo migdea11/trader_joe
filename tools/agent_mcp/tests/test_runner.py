@@ -38,6 +38,7 @@ from tools.agent_mcp.tests.harness import (
     is_client_step,
     is_seed_producer,
     make_rig,
+    response_for,
     system_suite_response,
     tree_digest,
 )
@@ -506,6 +507,7 @@ def test_verbs_that_build_nothing_read_no_worktree_and_need_no_snapshot(
 ):
     """S6: never a copy from any worktree, no git call, and no snapshot directory made at all."""
     rig = make_rig(tmp_path, monkeypatch)
+    rig.docker.respond = response_for(verb, rig.layout)
 
     def no_copy(*args: Any, **kwargs: Any) -> None:
         raise AssertionError(f'{verb} copied a worktree')

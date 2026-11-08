@@ -8,7 +8,7 @@ WHAT IS PINNED, in the addendum's order:
     the exact argv     the label lookup and the exec, word for word, from literals
     the guards         check_dev_lookup_argv and check_dev_exec_argv refuse every forbidden shape
     the target         pick_dev_target refuses none, several and a non-id -- and then NO exec runs
-    the SQL            a module constant, built from the eight names, that no argument reaches
+    the SQL            a module constant, built from the nineteen names, that no argument reaches
     the script         psql -X -At -v ON_ERROR_STOP=1, the five redaction names, and its BEHAVIOUR:
                        run under sh with a fake psql, no fake secret value survives to the output
     the verb           closed empty schema, 60 s budget, the {table: present} map and the revision
@@ -57,8 +57,19 @@ EXPECTED_TABLES = (
     'dataset_override_log',
     'dataset_deletion',
     'ingest_run',
+    'ingest_request',
+    'ingest_instance',
     'store_dataset_entry',
     'stock_market_activity',
+    'asset_list_snapshot',
+    'asset_list_row',
+    'asset_list_event',
+    'corporate_action',
+    'panel',
+    'panel_settings_version',
+    'panel_source_settings_version',
+    'panel_pass',
+    'panel_member_transition',
     'alembic_version',
 )
 EXPECTED_TABLES_QUERY = ' UNION ALL '.join(
@@ -418,11 +429,13 @@ def test_the_exec_command_table_holds_exactly_these_rows():
     assert {
         ('sh', '-c', stack.DEV_DB_TABLES_SCRIPT): ('-u', 'postgres', '-e', EXPECTED_PGOPTIONS),
         ('sh', '-c', stack.DEV_MIGRATE_STATUS_SCRIPT): ('-w', '/code'),
+        # tj-w0rddi: test_reset, the one row that writes: user postgres and NO read-only option.
+        ('sh', '-c', stack.TEST_RESET_SCRIPT): ('-u', 'postgres'),
         ('sh', '-c', stack.DEV_HTTP_GET_TAILS['ping'][2]): (),
         ('sh', '-c', stack.DEV_HTTP_GET_TAILS['ui_config'][2]): (),
         ('sh', '-c', stack.DEV_HTTP_GET_TAILS['usage_summary'][2]): (),
     } == stack.DEV_EXEC_COMMANDS
-    assert len(stack.DEV_EXEC_COMMANDS) == 5, 'two http_get names share one script'
+    assert len(stack.DEV_EXEC_COMMANDS) == 6, 'two http_get names share one script'
     assert 'reaper_pending' not in stack.DEV_HTTP_GET_TAILS
     assert stack.DEV_EXEC_PGOPTIONS == EXPECTED_PGOPTIONS
     assert stack.DEV_DB_TABLES_TAIL == ('sh', '-c', SCRIPT)
@@ -586,7 +599,7 @@ def test_dev_db_tables_reports_the_table_map_and_the_revision(tmp_path: Path, mo
     result = rig.call('db_tables', {})
     assert result['status'] == 'ok', result
     assert result['details'] == {'tables': dict.fromkeys(EXPECTED_TABLES, True), 'alembic_revision': 'd7e2a9c35b18'}
-    assert result['message'] == '8 of 8 tables present; alembic revision: d7e2a9c35b18'
+    assert result['message'] == '19 of 19 tables present; alembic revision: d7e2a9c35b18'
     audit = json.loads(rig.audit_lines()[-1])
     assert audit['status'] == 'ok' and audit['arguments'] == {}, audit
 
@@ -608,7 +621,7 @@ def test_dev_db_tables_reports_absent_tables_and_no_revision(tmp_path: Path, mon
         'alembic_version': False
     }
     assert result['details']['alembic_revision'] is None
-    assert result['message'] == '3 of 8 tables present; alembic revision: none (no alembic_version row)'
+    assert result['message'] == '9 of 19 tables present; alembic revision: none (no alembic_version row)'
 
 
 def test_a_failed_exec_is_failed_and_reports_no_details(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -624,7 +637,7 @@ def test_a_failed_exec_is_failed_and_reports_no_details(tmp_path: Path, monkeypa
 
 
 # ===============================================================================================
-# parse_db_tables: only the eight names with t/f, and a well-formed revision; everything else ignored.
+# parse_db_tables: only the nineteen names with t/f, and a well-formed revision; everything else ignored.
 # ===============================================================================================
 
 
@@ -674,7 +687,7 @@ def test_parse_db_tables_tolerates_bytes_that_are_not_utf8():
 # ===============================================================================================
 
 
-def test_the_table_set_and_the_sql_are_module_constants_built_from_the_eight_names():
+def test_the_table_set_and_the_sql_are_module_constants_built_from_the_nineteen_names():
     """Addendum 22 (4): ONE constant query; the second statement only reads alembic_version."""
     assert stack.DEV_DB_TABLES == EXPECTED_TABLES
     assert stack.DEV_DB_VERSION_TABLE == 'alembic_version'
@@ -683,14 +696,27 @@ def test_the_table_set_and_the_sql_are_module_constants_built_from_the_eight_nam
 
 
 def test_the_tables_are_the_store_models_tables():
-    """The eight are the seven store models' TABLE_NAME values plus alembic's own version table."""
+    """The nineteen are the eighteen store models' TABLE_NAME values plus alembic's own version table.
+
+    Each model file's tables keep that file's declaration order in the list, and alembic_version is last.
+    """
     models = Path(__file__).resolve().parents[3] / 'server' / 'data' / 'store' / 'app' / 'database' / 'models'
     declared = set()
     for path in models.glob('*.py'):
+        in_file = []
         for line in path.read_text(encoding='utf-8').splitlines():
             if line.strip().startswith('TABLE_NAME = '):
-                declared.add(line.split('=', 1)[1].strip().strip('\'"'))
+                in_file.append(line.split('=', 1)[1].strip().strip('\'"'))
+        declared.update(in_file)
+        assert [name for name in EXPECTED_TABLES if name in in_file] == in_file, path.name
     assert declared == set(EXPECTED_TABLES) - {'alembic_version'}, sorted(declared)
+    assert len(EXPECTED_TABLES) == len(set(EXPECTED_TABLES)) and EXPECTED_TABLES[-1] == 'alembic_version'
+
+
+def test_the_description_lists_the_nineteen_tables_in_order():
+    """The tool description an agent reads is the handler's docstring: it names every reported table, in order."""
+    description = runner.AgentStack(settings=None).describe('db_tables')  # type: ignore[arg-type]
+    assert f'({", ".join(EXPECTED_TABLES)})' in description, description
 
 
 def test_the_script_carries_both_queries_verbatim_and_no_placeholder():

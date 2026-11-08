@@ -6,12 +6,13 @@ ONE compose project, the owner's own (stack.DEV_PROJECT, trader_joe_dev), in its
 is no second, isolated stack: the separate agent stack (its own compose project, generated env files
 and data directory, and its own verbs stack_up, stack_down and stack_wipe, plus its separate
 logs and ps, which the one-project logs and ps below replace) was retired in favour of modes of
-the one project (addenda 26-28). The fifteen verbs:
+the one project (addenda 26-28). The nineteen verbs:
 
     ps()  logs(service, tail)  db_tables()  http_get(name)  migrate_status()
     down()  restart(service)  build()  up()  tools()
     migrate()  test_build()  test_up()
-    run_system_tests(worktree, paths)  seed_dump(worktree, date)
+    run_system_tests(worktree, paths)  seed_dump(worktree, date)  test_reset()
+    test_stop(service)  test_start(service)  test_env(service, overrides)
 
 TWO READ-ONLY VERBS (ADR tj-4rr0la addendum 18; tj-kzy7w2, approved on tj-wpnr7o (b)):
 
@@ -114,6 +115,36 @@ fake files with DATA_DIR pinned to ./volume_data/test in the step environment (n
 data), data_ingest on the fake broker. It never builds: both :test images must exist and carry a source
 stamp equal to the checkout's digest (stack.check_dev_image_stamp), else it is refused naming test_build.
 
+and THREE TEST-MODE SERVICE VERBS, in test_reset's lineage (ADR tj-4rr0la addendum 32; tj-7zjov1.268):
+
+    test_stop(service)  test_start(service)  test_env(service, overrides)
+
+SERVICE is data_store or data_ingest and nothing else (postgres, test_client and web are refused).
+test_stop is `compose stop <service>`: the container is kept, with its environment. test_start is
+`up -d --wait --wait-timeout 300 --no-deps --no-recreate <service>`: a stopped container comes back
+as it was. test_env replaces that service's WHOLE override set ({} clears it), writes it, and recreates
+only that service (`up ... --no-deps --force-recreate <service>`). Overrides survive restart,
+test_stop/test_start and a test_env on the other service; a plain test_up deletes them.
+THE ALLOW-LIST (stack.AGENT_ENV_ALLOW, a literal) is the security property: per service, each name
+has a full-match value grammar (decimal digits only) checked BEFORE its range, and values only lower a
+default; at most stack.AGENT_ENV_MAX_NAMES names per call; the never-allowed names and patterns
+(stack.env_name_never_allowed: KEY, SECRET, PASS, TOKEN, CREDENTIAL, DATABASE_*, POSTGRES_*, ...) are
+refused first and the literal is checked against them at import. A refusal names the variable, never the
+value. HOW IT REACHES COMPOSE: this server renders ONE overlay, stack.AGENT_ENV_FILE
+(docker-compose.agent-env.yaml), in its own stack directory (never the repository, never an env file)
+from a dict by yaml.safe_dump with a fixed argument set (pyyaml, in the agent-mcp group; read back byte-identical),
+mode 0600, written to a temporary name and renamed; it carries services.<service>.environment and the
+labels trader_joe.agent.env_generation and trader_joe.agent.env_names. It is LAST in the TEST file set
+(stack.testmode_prefix with a stack directory) only when it exists, stack.check_dev_lifecycle_argv
+accepts exactly that one path there, and the dev file sets never name it. The rails run in test_reset's
+spirit and all BEFORE the budget charge: steering files and trusted copies current, only TEST mode,
+the postgres mount exactly <repo>/volume_data/test/postgres, every data_store and data_ingest
+container's source stamp (running or stopped) equal to the checkout's digest, and exactly one
+container of the named service in the state the verb needs. Each call then charges one of the 12 an
+hour. ps reports the active overrides: the names from the containers' labels, the generation and the
+values from this server's own file, and 'pending' when they differ; it never reads a container's
+environment. The permission for all three stays 'ask' (the owner's client setting).
+
 THE MODE GUARD. Every state-changing verb that acts on the project first lists its non-one-off containers
 and classifies each by the basename of its compose files (stack.classify_mode, run_migrations.sh's
 classifier): DEV (override, no fake), TEST (fake, no override), PROD (anything else, both together
@@ -152,6 +183,7 @@ prefix and a fixed tail, built in stack.py and re-checked as built:
     system-test client (run_system_tests, seed_dump): stack.testclient_prefix(), the snapshot as the
         project directory and the root env file as --env-file.
     exec (db_tables, http_get, migrate_status): `docker exec` into a container found by label.
+    exec (test_reset): the same `docker exec`, the one row as user postgres without the read-only option.
 No argv ever carries a repository path an agent chose.
 Subprocesses take argument lists, never a shell, with a fixed environment (runner.DOCKER_ENV).
 Before the first step of a verb that can build (stack.builds: `build`, any `--build`, `up`, or a `run`
@@ -179,8 +211,8 @@ compose command is stack.check_testclient_argv's. The client reads the instance 
 root env file through compose (--env-file), exactly as data_store does; this server never opens that
 file, and the secret is on no command line.
 
-THE STACK DIRECTORY (settings.stack_dir, AGENT_MCP_STACK_DIR) holds the snapshot and the audit log and
-nothing else: there are no generated env files and no data directory. The project's data is the
+THE STACK DIRECTORY (settings.stack_dir, AGENT_MCP_STACK_DIR) holds the snapshot, the audit log and the
+one generated overrides overlay (test_env) and nothing else: there are no env files and no data directory. The project's data is the
 checkout's ./volume_data (dev) and ./volume_data/test (test mode).
 
 WHAT ELSE HOLDS

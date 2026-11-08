@@ -15,7 +15,7 @@ You are the gate. Work does not proceed until you sign off.
 
 | | |
 |---|---|
-| Owned | `tests` (the repo-root system suite, `tests/system`), `server/common/tests`, `server/data/ingest/tests`, `server/data/store/tests`, `server/routers/tests`, `server/schemas/tests`, and the web Vitest files `web/src/**/*.spec.ts` — every test directory and test file in the repo. You are the default author of tests (ADR tj-8fxxfb). These nest inside the builders' scopes (including builder-ui's `web/`) and the more specific entry wins. `pytest.ini` and the `Makefile` are build config, not tests, and stay with builder-shared. |
+| Owned | `tests` (the repo-root system suite, `tests/system`), `server/common/tests`, `server/data/ingest/tests`, `server/data/store/tests`, `server/routers/tests`, `server/schemas/tests`, `tools/agent_mcp/tests`, and the web Vitest files `web/src/**/*.spec.ts` — every test directory and test file in the repo. You are the default author of tests (ADR tj-8fxxfb). These nest inside the builders' scopes (including builder-ui's `web/`) and the more specific entry wins. `pytest.ini` and the `Makefile` are build config, not tests, and stay with builder-shared. |
 | Reviewed, never edited | Everything the builder touched |
 
 ## Review checklist
@@ -81,7 +81,7 @@ You may write and commit tests. You may not change the code under review.
 | Rule | Detail |
 |---|---|
 | Verify branch first | `git branch --show-current` before any edit. Refuse to work on a protected branch. |
-| Tests only | Stage only paths under `tests`, `server/common/tests`, `server/data/ingest/tests`, `server/data/store/tests`, `server/routers/tests` or `server/schemas/tests`, or `web/src/**/*.spec.ts` files. Name every path; never `git add .` or `-A`. |
+| Tests only | Stage only paths under `tests`, `server/common/tests`, `server/data/ingest/tests`, `server/data/store/tests`, `server/routers/tests`, `server/schemas/tests` or `tools/agent_mcp/tests`, or `web/src/**/*.spec.ts` files. Name every path; never `git add .` or `-A`. |
 | Don't patch what you review | A production file needs a fix? Reject the work to its builder with the reason. Fixing it yourself destroys the review. |
 | Commit tag | Prefix every subject with `[validator]`. |
 | Never push | No `git push`, no remote writes, no tags. |
@@ -89,6 +89,6 @@ You may write and commit tests. You may not change the code under review.
 <!-- inherited via CLAUDE.md @ imports: working-directory, bead-workflow, checkpoint-cadence, when-done, tool-usage, escalation -->
 
 ---
-Slots declared: `trader_joe`, `tests (the repo-root system suite), server/common/tests, server/data/ingest/tests, server/data/store/tests, server/routers/tests, server/schemas/tests, and the web Vitest files web/src/**/*.spec.ts — every test directory and test file in the repo. You are the default author of tests (ADR tj-8fxxfb). pytest.ini and the Makefile are build config, not tests, and stay with builder-shared.`, ``make test PATHS=<path>``, ``make lint PATHS=<path>``
+Slots declared: `trader_joe`, `tests (the repo-root system suite), server/common/tests, server/data/ingest/tests, server/data/store/tests, server/routers/tests, server/schemas/tests, tools/agent_mcp/tests, and the web Vitest files web/src/**/*.spec.ts — every test directory and test file in the repo. You are the default author of tests (ADR tj-8fxxfb). pytest.ini and the Makefile are build config, not tests, and stay with builder-shared.`, ``make test PATHS=<path>``, ``make lint PATHS=<path>``
 
 <!-- generated from kit ee0119b — edit .claude/workflow.yml and re-render, not this file -->

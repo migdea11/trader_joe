@@ -1633,7 +1633,12 @@ def test_a_steps_env_appears_in_no_recorded_command_and_no_audit_line(tmp_path: 
     monkeypatch.setattr(stack, 'dev_ps_steps', with_env)
     result = rig.call('ps', {})
     assert result['status'] == 'ok', result
-    assert rig.docker.steps and all(dict(step.env) == {'INSTANCE_WRITE_SECRET': SENTINEL} for step in rig.docker.steps)
+    # ps's steps: the patched compose ps, which carries the env, then (ADR tj-4rr0la addendum 32 (6)) the env-label
+    # read, a plain `docker ps` that dev_ps_steps does not build and that carries no env of its own.
+    patched = [step for step in rig.docker.steps if step.argv[1:2] == ('compose',)]
+    others = [step for step in rig.docker.steps if step.argv[1:2] != ('compose',)]
+    assert patched and all(dict(step.env) == {'INSTANCE_WRITE_SECRET': SENTINEL} for step in patched)
+    assert len(others) == 1 and others[0].env == () and others[0].argv[1:3] == ('ps', '-a'), others
     assert SENTINEL not in json.dumps(result), result
     assert all(SENTINEL not in step['command'] for step in result['steps'])
     assert rig.audit_lines() and not [line for line in rig.audit_lines() if SENTINEL in line]

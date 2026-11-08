@@ -805,7 +805,7 @@ environment's interpreter is missing, so a rebuilt environment always gets a ful
 Agents reach Docker only through the agent-stack MCP (`docker-compose.agent-mcp.yaml`), a server in
 its own container that starts with the devcontainer by default: `make agent-up`, or the IDE's
 host-side `initializeCommand`, runs `make agent-mcp-up` on the host. Set `AGENT_MCP=off` to skip it;
-a failed start only warns. It offers **15 fixed verbs over one compose project, your own** (project
+a failed start only warns. It offers **16 fixed verbs over one compose project, your own** (project
 `trader_joe_dev`), in its dev or test mode. No verb ever names prod's project, so the MCP never touches a
 production stack. There is no second, isolated agent stack: the separate project,
 its generated env files and data directory, and the verbs `stack_up`, `stack_down` and `stack_wipe`
@@ -817,8 +817,8 @@ set, or a line count, never a compose argument, a container id or a host path. O
 (`docker-compose.override.yaml` means dev, `docker-compose.fake.yaml` means test, anything else, or both,
 means prod, which should never be found in `trader_joe_dev`; one-off containers such as alembic runs and
 `test_client` are not counted). The verbs that act on a mode refuse a prod-classified container there:
-`down`, `restart`, `up`, `tools`, `migrate`, `migrate_status`, `test_up`, `run_system_tests` and
-`seed_dump`. `ps`, `logs`, `db_tables`, `http_get`, `build` and `test_build` check no mode. See
+`down`, `restart`, `up`, `tools`, `migrate`, `migrate_status`, `test_up`, `run_system_tests`,
+`seed_dump`, `test_reset`, `test_stop`, `test_start` and `test_env`. `ps`, `logs`, `db_tables`, `http_get`, `build` and `test_build` check no mode. See
 [Getting Started](#getting-started) for what each mode runs and where its data lives.
 
 | Mode | Launch verb | Build verb | Data |
@@ -836,7 +836,7 @@ dev only; `migrate` and `migrate_status` need a mode up and refuse an empty proj
 
 | Verb | What it does |
 |---|---|
-| `ps` | The project's containers, stopped ones included, and their health. |
+| `ps` | The project's containers, stopped ones included, and their health, then one line per `data_store` and `data_ingest` with the environment overrides `test_env` set: the names on the running container (read from its labels, never its environment), the generation and values in the MCP's own overrides file, and `pending` when the two differ. |
 | `logs(service, tail?)` | The last lines of one service (`postgres`, `data_store`, `data_ingest` or `web`); `tail` defaults to 200 and is clamped to 2000. |
 | `db_tables` | Which of the store's tables exist and the alembic revision, by one fixed `psql` script run by exec in the running postgres container, in a read-only transaction. It works while data_store is down. |
 | `http_get(name)` | One GET of `ping`, `ui_config` or `usage_summary`, run inside the running data_store; reads at most 64 KB of the body and redacts it in the container. No URL, path or header is accepted. |
@@ -851,6 +851,17 @@ dev only; `migrate` and `migrate_status` need a mode up and refuse an empty proj
 | `test_up` | `make system-launch`: stops the project, then starts postgres, data_store and data_ingest on the `:test` images with data_ingest on the fake broker and postgres on `./volume_data/test`. Never builds. |
 | `run_system_tests(worktree, paths)` | Runs `tests/system` (or up to 50 `paths` under it) from `test_client`, built from a fresh snapshot of `worktree` (`root` or a worktree's name), so a validator's new tests reach the client without being integrated. The services run the root checkout's `:test` images. |
 | `seed_dump(worktree, date?)` | Runs the seed producer against the up, migrated test stack and writes `<revision>.sql` and `.json` under `agent_mcp_seeds/<worktree>/` in the share directory. |
+| `test_reset` | **Erases the test database** (`./volume_data/test`, never your dev data) in place: one fixed `docker exec` as user `postgres` in the running test postgres drops and recreates the `public` schema, so every table and `alembic_version` are gone and the next `migrate` applies every revision from empty. No file is deleted, no host path is touched, the stack stays up, and no secret passes through the MCP. It takes no argument, has the rails of `run_system_tests`, and answers with the database name and the revision afterwards (`none`), never a row. It replaces the host-side `sudo rm -rf volume_data/test/postgres`. |
+| `test_stop(service)` | Test mode only. Stops one container, `data_store` or `data_ingest` (postgres, `test_client` and web are refused), and keeps it, with its environment. Nothing else is touched. |
+| `test_start(service)` | Test mode only. Starts that stopped container again (`up -d --wait --no-deps --no-recreate`) with the environment it had, overrides included, and waits up to 300 s for healthy. |
+| `test_env(service, overrides)` | Test mode only. Sets environment overrides for `data_store` or `data_ingest` and recreates that one service now (`up -d --wait --no-deps --force-recreate`); nothing else is touched. `overrides` is `{NAME: value}` and **replaces the service's whole set**; `{}` clears it. Only an allow-list is accepted, with values that only lower a default: `data_store` `PANEL_MANAGER_ENABLED` and `PANEL_MANAGER_DRY_RUN` (exactly `true` or `false`), `INSTANCE_WATCH_INTERVAL_SECONDS` (1-15), `INSTANCE_WATCH_RESUBMIT_MARGIN_SECONDS` (0-15); `data_ingest` `ALPACA_OUTGOING_BUFFER_SIZE` (1-64), `ALPACA_STALL_TIMEOUT_S` (1-300), `ALPACA_MAX_ATTEMPTS` (1-5); at most 8 names per call. Anything else is refused, naming the variable and never the value. The overrides survive `restart`, `test_stop`, `test_start` and a `test_env` on the other service; a plain `test_up` deletes them. They are written, by the MCP only, to `docker-compose.agent-env.yaml` in its own stack directory (not the repository, not your env file). |
+
+`test_stop`, `test_start` and `test_env` have the rails of `test_reset`: the MCP image current, only test mode up,
+postgres on `./volume_data/test/postgres`, every data_store and data_ingest container's source stamp (running or
+stopped) equal to the checkout's digest, and exactly one container of the named service in the state the verb
+needs (running for `test_stop`, stopped for `test_start`, any for `test_env`); all before the budget is charged.
+Each call costs one of the 12. `run_system_tests` still needs both services running, so a scenario that needs a
+stopped service runs in phases around the verb.
 
 The five read-only verbs (`ps`, `logs`, `db_tables`, `http_get` and `migrate_status`) cost nothing
 against the budget below. The first four check no mode, and all five reach `trader_joe_dev` only;
@@ -867,7 +878,7 @@ against the budget below. The first four check no mode, and all five reach `trad
   stale: <file> differs from the checkout (or is missing)" and tells you to run `make agent-mcp-rebuild` on
   the host, then reconnect the MCP (below).
 - **A symlinked or non-regular env file** (`.env` and the two service env files) for `up`, `tools`,
-  `migrate`, `test_up`, `run_system_tests` and `seed_dump`, and **a repository bind source that is a
+  `migrate`, `test_up`, `run_system_tests`, `seed_dump` and `test_reset`, and **a repository bind source that is a
   symlink** for `restart`, `up`, `tools`, `migrate` and `test_up`. The files are checked with `lstat` and
   never opened; compose reads them itself.
 - **A compose file or `.env` in the MCP's stack directory or any parent up to `/`**, for `down`, `restart`,
@@ -884,10 +895,10 @@ against the budget below. The first four check no mode, and all five reach `trad
   `test_up`, a test-mode `migrate`, `run_system_tests` and `seed_dump`: the source-digest walk each runs
   refuses it.
 - **A stale test stack.** `test_up` refuses until both `:test` images exist and carry a source stamp equal
-  to the checkout's digest ("call `test_build`"). `run_system_tests`, `seed_dump` and a test-mode
+  to the checkout's digest ("call `test_build`"). `run_system_tests`, `seed_dump`, `test_reset` and a test-mode
   `migrate` re-check the running data_store and data_ingest containers' stamps and refuse a stale stack:
   `test_build`, then `test_up`.
-- **`run_system_tests` and `seed_dump` outside test mode.** They refuse unless only test mode is up and
+- **`run_system_tests`, `seed_dump` and `test_reset` outside test mode.** They refuse unless only test mode is up and
   postgres's data mount is exactly `<repo>/volume_data/test/postgres`, which stands in for the
   `SYSTEM_TEST_DISPOSABLE_DB=1` attestation the make targets carry.
 - **The budget.** At most 12 state-changing verbs in a rolling hour, counted in memory and reset when the
@@ -895,7 +906,7 @@ against the budget below. The first four check no mode, and all five reach `trad
   runs answers `busy`.
 
 **Time limits.** `build`, `test_build`, `run_system_tests` and `seed_dump` run up to 30 minutes, `up`,
-`test_up` and `migrate` up to 10, `tools`, `down`, `restart` and `migrate_status` up to 5, and the other
+`test_up` and `migrate` up to 10, `tools`, `down`, `restart`, `migrate_status`, `test_reset` and `test_stop` up to 5, `test_start` and `test_env` up to 10, and the other
 read-only verbs 1. These are plain calls, not background jobs. `.mcp.json` sets the client's timeout for
 this server to 1,860,000 ms (31 minutes) so it outlasts the longest verb; calls that ran past about a
 minute were reported to return nothing before it was set. A verb that hits its own limit is reported as a timeout and its process is
@@ -908,7 +919,9 @@ env file at all.
 
 **The permission to set.** `migrate` writes a real database, so keep it on `ask` in your client's
 permission settings; that is your setting, not the server's. The same goes for `test_up`,
-`run_system_tests` and `seed_dump`.
+`run_system_tests` and `seed_dump`, and above all for `test_reset`, which erases the test database with no
+undo and no dry run: leave `mcp__agent-stack__test_reset` on `ask`, never `allow`. `test_stop`, `test_start`
+and `test_env` stay on `ask` too; no allow entry exists for them in this repository, and adding one is your setting.
 
 **Known limits and accepted exposures.**
 

@@ -79,6 +79,10 @@ BUILDING_VERBS = {
     # (compose builds a missing image on up, so the bases come first although both images were found).
     'test_build',
     'test_up',
+    # tj-7zjov1.268 (addendum 32): test_start's and test_env's `up --no-deps` of one built service over the test
+    # set can build a missing image, so the bases come first. test_stop's label-only `stop` is base-free below.
+    'test_start',
+    'test_env',
 }
 # ps and logs are base-free by construction, not by choice: they hand compose no file, so
 # there is no service definition to build from (ADR tj-4rr0la addendum 18).
@@ -96,6 +100,10 @@ BASE_FREE_VERBS = {
     'logs',
     'db_tables',
     'migrate_status',
+    # test_reset (tj-w0rddi): the rails' plain reads and ONE `docker exec` into the postgres container.
+    'test_reset',
+    # test_stop (tj-7zjov1.268): the same rails and ONE label-only `compose stop <service>`, which loads no file.
+    'test_stop',
     # tools (tj-iee6sn.14): its `up` names pgadmin alone, and neither pgadmin nor postgres (its one
     # depends_on) has a build: key in any file tools loads, so the up has nothing to build from. Its
     # tail is the one `up` exempted from the literal rule below, and only after the files are checked.
@@ -305,6 +313,7 @@ _DEV_EXEC_BUILDER_SAMPLES = {
     'dev_db_tables_steps': ('c0ffee000001',),
     'dev_migrate_status_steps': ('c0ffee000001',),
     'dev_http_get_steps': ('c0ffee000001', 'ping'),
+    'test_reset_steps': ('c0ffee000001',),
 }
 # build's digest builder (tj-iee6sn.8) runs the TRUSTED source_digest.sh under bash, not docker: it
 # hashes files and can build nothing. Its build step comes from dev_build_step (singular), pinned in
@@ -434,8 +443,10 @@ def test_every_step_that_can_build_is_preceded_by_the_ensure_bases_steps(
 
     dev_tools_prefix = tuple(stack.dev_tools_prefix(rig.layout.repo_host_path))
     # tj-iee6sn.24: the two TEST sets, the build set first (the up set is a word-prefix of it).
+    # tj-7zjov1.268: the test set with the generated overlay last (test_env), longer than the up set, so before it.
     test_prefixes = (
         tuple(stack.testmode_build_prefix(rig.layout.repo_host_path)),
+        tuple(stack.testmode_env_prefix(rig.layout.repo_host_path, rig.layout.stack_dir)),
         tuple(stack.testmode_prefix(rig.layout.repo_host_path)),
     )
     # tj-iee6sn.20: the system-test client's compose prefix (unwrapped since 5a38b7f).

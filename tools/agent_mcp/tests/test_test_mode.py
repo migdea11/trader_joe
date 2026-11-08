@@ -914,7 +914,21 @@ def test_the_mode_table_covers_every_state_changing_verb():
     The names carry no dev_ prefix to select by any more (tj-iee6sn.26), so the exclusions are spelled out.
     migrate_status is read-only but guarded (it acts on the mode that is up, tj-iee6sn.10), so it is here.
     """
-    state_changing = set(VERB_SAMPLES) - {'ps', 'logs', 'db_tables', 'http_get', 'run_system_tests', 'seed_dump'}
+    # test_reset (tj-w0rddi) is left out with the suite pair: it has their rails (TEST mode only, the test
+    # directory's mount, the stamps), tested in test_test_reset.py, not this table's guard-only responder.
+    state_changing = set(VERB_SAMPLES) - {
+        'ps',
+        'logs',
+        'db_tables',
+        'http_get',
+        'run_system_tests',
+        'seed_dump',
+        'test_reset',
+        # tj-7zjov1.268: the same, test_reset's rails and more; tested in test_test_service_verbs.py.
+        'test_stop',
+        'test_start',
+        'test_env',
+    }
     assert state_changing == {
         'up',
         'build',

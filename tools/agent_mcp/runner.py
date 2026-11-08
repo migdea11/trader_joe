@@ -47,6 +47,15 @@ VERB_TIMEOUT_SECONDS = {
     # then the producer's scenario POSTs, the fake ingest behind them and the dump. Under the .mcp.json
     # timeout (1860 s). 30 s was the not_available answer's.
     'seed_dump': 1800,
+    # test_reset: the rails (as run_system_tests', minus the snapshot) and ONE exec of two psql calls, the
+    # first bounded by a 15 s lock_timeout. Far below the .mcp.json timeout.
+    'test_reset': 300,
+    # test_stop, test_start and test_env (addendum 32): the rails (steering and copies, the mode guard, the
+    # postgres mount, two digests, two lookups and up to four stamp reads), then one compose stop (docker's
+    # own 10 s grace) or one up of a single service with its own 300 s --wait-timeout. Under the .mcp.json timeout.
+    'test_stop': 300,
+    'test_start': 600,
+    'test_env': 600,
     # The read-only pair: one compose ps or logs call each, against the project as it stands.
     'logs': 60,
     'ps': 60,
@@ -116,6 +125,36 @@ VERB_SCHEMAS: dict[str, dict[str, Any]] = {
             },
         },
         'required': ['worktree'],
+    },
+    # Takes nothing: the container, the user and the SQL are constants in stack.py.
+    'test_reset': {'properties': {}, 'required': []},
+    # test_stop, test_start and test_env (addendum 32): the service is the closed stack.AGENT_ENV_SERVICES enum;
+    # test_env's overrides are checked name by name against stack.AGENT_ENV_ALLOW, never passed on as given.
+    'test_stop': {
+        'properties': {'service': {'type': 'string', 'enum': list(stack.AGENT_ENV_SERVICES)}},
+        'required': ['service'],
+    },
+    'test_start': {
+        'properties': {'service': {'type': 'string', 'enum': list(stack.AGENT_ENV_SERVICES)}},
+        'required': ['service'],
+    },
+    'test_env': {
+        'properties': {
+            'service': {'type': 'string', 'enum': list(stack.AGENT_ENV_SERVICES)},
+            'overrides': {
+                'type': 'object',
+                'additionalProperties': {'type': 'string'},
+                'maxProperties': stack.AGENT_ENV_MAX_NAMES,
+                'description': (
+                    "NAME: value pairs that REPLACE the service's whole override set ({} clears it); only the "
+                    'allow-listed names, values that only lower a default: data_store PANEL_MANAGER_ENABLED and '
+                    'PANEL_MANAGER_DRY_RUN (true or false), INSTANCE_WATCH_INTERVAL_SECONDS (1-15), '
+                    'INSTANCE_WATCH_RESUBMIT_MARGIN_SECONDS (0-15); data_ingest ALPACA_OUTGOING_BUFFER_SIZE (1-64), '
+                    'ALPACA_STALL_TIMEOUT_S (1-300), ALPACA_MAX_ATTEMPTS (1-5)'
+                ),
+            },
+        },
+        'required': ['service', 'overrides'],
     },
     # THE USER'S DEV PROJECT, READ-ONLY (tj-kzy7w2). Neither schema has -- and neither verb could use
     # -- a project, a compose file or a command argument: the target is stack.DEV_PROJECT, a
@@ -295,6 +334,8 @@ class _Call:
     bases_present: bool = False
     # A verb's structured result beyond its status and message (seed_dump's files); never content.
     details: dict[str, Any] | None = None
+    # The id of the running postgres container the test-mode rails read the data mount of (test_reset execs into it).
+    postgres_target: str | None = None
 
     async def ensure_bases(self, cwd: Path) -> None:
         """Per stack.BASE_IMAGES ref: `docker image inspect`, and `docker pull` only when that fails.
@@ -334,7 +375,7 @@ class AgentStack:
     """The verbs, serialised: a second caller is told 'busy'.
 
     Every verb acts on the ONE compose project of the owner's checkout (stack.DEV_PROJECT), in its
-    DEV or TEST mode (ADR tj-4rr0la addenda 26-27); there is no second stack. Fifteen verbs:
+    DEV or TEST mode (ADR tj-4rr0la addenda 26-27); there is no second stack. Nineteen verbs:
       read-only: ps and logs (addendum 18), db_tables and http_get (addendum 22),
         migrate_status (the mode that is up);
       state-changing, label-only: down and restart (tj-iee6sn.7), held by the D6/D7 guards, the
@@ -342,7 +383,11 @@ class AgentStack:
       state-changing, file-based, from the image's baked compose files: build, up, tools,
         migrate, and test_build and test_up for TEST mode;
       run_system_tests and seed_dump, which run test_client against TEST mode from a snapshot of a
-        named worktree.
+        named worktree;
+      test_reset, which clears the TEST database in place by one exec into the postgres container, under
+        the same rails;
+      test_stop, test_start and test_env (addendum 32), which stop, start and recreate ONE of data_store
+        and data_ingest in TEST mode, test_env with an allow-listed set of environment overrides.
     """
 
     def __init__(
@@ -360,6 +405,10 @@ class AgentStack:
             'migrate_status': self._migrate_status,
             'run_system_tests': self._run_system_tests,
             'seed_dump': self._seed_dump,
+            'test_reset': self._test_reset,
+            'test_stop': self._test_stop,
+            'test_start': self._test_start,
+            'test_env': self._test_env,
             'logs': self._dev_logs,
             'ps': self._dev_ps,
             'db_tables': self._dev_db_tables,
@@ -498,6 +547,7 @@ class AgentStack:
         await asyncio.to_thread(stack.check_trusted_copies_current, settings.repo_root)
         await asyncio.to_thread(stack.env_file_preflight, settings.repo_root)
         postgres = await self._dev_exec_target(call, 'postgres')
+        call.postgres_target = postgres
         mount = await call.step(stack.postgres_mount_step(settings.stack_dir, postgres))
         stack.check_test_postgres_mount(mount.exit_status, mount.stdout, settings.repo_host_path)
         lookup = await call.step(stack.dev_lookup_step(settings.stack_dir, 'data_store'))
@@ -565,6 +615,122 @@ class AgentStack:
         }
         return 'ok', f'seed for revision {bundle.revision} written under {seeds.SEEDS_DIR_NAME}/{name}/'
 
+    async def _test_reset(self, call: _Call) -> tuple[str, str]:
+        """STATE-CHANGING, and it ERASES THE TEST DATABASE (./volume_data/test), never your dev data: drops and recreates the public schema of the running TEST postgres IN PLACE, so every table and alembic_version are gone and the next migrate applies every revision from empty. It runs fixed SQL by exec in the postgres container as user postgres; no file is deleted, no host path or bind mount is touched, the stack stays up (data_store keeps its connections; call migrate next), and the database itself is not dropped. Takes no argument. Runs nothing unless the same rails as run_system_tests hold, in order: only test mode up (dev mode, prod and nothing running are refused), the postgres data mount exactly <repo>/volume_data/test/postgres, every running data_store and data_ingest source stamp equal to the root checkout's digest. Charged to the state-changing budget once per call (12 an hour). No secret passes through this server; every printed line is redacted in the container and no row is ever printed. The response names the database and states the revision afterwards (none) and that the public schema holds no relation. Refused also when the MCP image is stale (run make agent-mcp-rebuild). A failed reset (for instance a lock held for over 15 s) is 'failed' and rolled back whole. There is no undo; the permission for this verb is the owner's client setting. Returns ok or failed itself."""
+        call.validated = {}
+        rails = await self._test_mode_rails(call)
+        if rails is not None:
+            return rails
+        target = call.postgres_target
+        if target is None:
+            raise stack.Refused('the postgres container is unknown, so nothing was reset: call test_up')
+        self.dev_budget.charge()
+        result = await call.step(stack.test_reset_steps(self.settings.stack_dir, target)[0])
+        if result.exit_status != 0:
+            return (
+                'failed',
+                'the test database reset failed in the postgres container and was rolled back; see the steps',
+            )
+        state = stack.parse_test_reset(result.stdout)
+        if state is None or not state.clean:
+            return 'failed', 'the reset ran but its verification did not show an empty public schema; see the steps'
+        call.details = {
+            'database': state.database,
+            'alembic_revision': None,
+            'public_relations': state.public_relations,
+        }
+        return (
+            'ok',
+            f'test database {state.database} reset in place: the public schema is recreated and empty, '
+            'alembic revision: none; the stack is still up: call migrate',
+        )
+
+    # test_stop, test_start and test_env (ADR tj-4rr0la addendum 32; tj-7zjov1.268) act on ONE of data_store and
+    # data_ingest in TEST mode. The rails, in this order, a refusal at any point running nothing after it and
+    # charging nothing: the steering guard, the S6 stale-copy check, the D6 symlink check (tests/fakes), the D5
+    # env-file preflight, the mode guard (TEST only), the postgres data mount, the two source digests, the lookup
+    # of both services' containers in ANY state with every container's source stamp equal to its digest, and
+    # exactly one container of the named service in the state the verb needs. Then (test_env only) the read of
+    # the current overlay, then the budget (once), then the act.
+    async def _agent_env_rails(self, call: _Call, service: str, expected: str | None) -> tuple[str, str] | None:
+        """The preconditions of the three verbs; Refused at the first that fails, or a failed result when a digest could not be computed."""
+        settings = self.settings
+        await asyncio.to_thread(stack.check_dev_steering_files, settings.stack_dir)
+        await asyncio.to_thread(stack.check_trusted_copies_current, settings.repo_root)
+        await asyncio.to_thread(stack.check_dev_bind_sources, settings.repo_root, stack.TEST_BIND_SOURCES)
+        await asyncio.to_thread(stack.env_file_preflight, settings.repo_root)
+        await self._mode_guard(call, stack.MODES_TEST, stack.TEST_SERVICE_MODE_HINT)
+        postgres = await self._dev_exec_target(call, 'postgres')
+        mount = await call.step(stack.postgres_mount_step(settings.stack_dir, postgres))
+        stack.check_test_postgres_mount(mount.exit_status, mount.stdout, settings.repo_host_path)
+        digests, failed = await self._source_digests(call)
+        if failed is not None:
+            return 'failed', f'the source digest failed ({failed}); nothing was changed'
+        found: dict[str, list[tuple[str, str]]] = {}
+        # AGENT_ENV_SERVICES is in the digests' order (data_store, data_ingest).
+        for name, digest in zip(stack.AGENT_ENV_SERVICES, digests, strict=True):
+            lookup = await call.step(stack.service_containers_step(settings.stack_dir, name))
+            if lookup.exit_status != 0:
+                raise stack.Refused(f'the container lookup failed (exit {lookup.exit_status}); see the steps')
+            found[name] = stack.parse_service_containers(lookup.stdout)
+            for container_id, _ in found[name]:
+                stamp = await call.step(stack.container_stamp_step(settings.stack_dir, container_id))
+                stack.check_container_stamp(stamp.exit_status, stamp.stdout, digest, name)
+        stack.pick_service_container(service, found[service], expected)
+        return None
+
+    async def _test_stop(self, call: _Call, service: object) -> tuple[str, str]:
+        """STATE-CHANGING, TEST MODE ONLY: `docker compose -p trader_joe_dev stop <service>` for SERVICE one of data_store, data_ingest (postgres, test_client and web are refused). The container is KEPT, with its environment, so test_start brings it back as it was; nothing else is touched and no data is removed. Runs nothing unless, in order: the MCP image is fresh (else run make agent-mcp-rebuild), only test mode is up (dev, prod and mixed are refused), the postgres data mount is exactly <repo>/volume_data/test/postgres, the source stamp of every data_store and data_ingest container, running or stopped, equals the root checkout's digest, and SERVICE has exactly one container and it is running. Charged to the state-changing budget once per call (12 an hour). Returns ok or failed itself."""
+        checked = stack.validate_agent_env_service(service)
+        call.validated = {'service': checked}
+        rails = await self._agent_env_rails(call, checked, stack.CONTAINER_RUNNING)
+        if rails is not None:
+            return rails
+        self.dev_budget.charge()
+        if not await call.steps_until_failure([stack.test_stop_step(self.settings.stack_dir, checked)]):
+            return 'failed', f'compose stop of {checked} failed for the {stack.DEV_PROJECT} project; see the steps'
+        return 'ok', f'{checked} is stopped; its container is kept: call test_start to bring it back as it was'
+
+    async def _test_start(self, call: _Call, service: object) -> tuple[str, str]:
+        """STATE-CHANGING, TEST MODE ONLY: `up -d --wait --no-deps --no-recreate <service>` over the test set, for SERVICE one of data_store, data_ingest. A stopped container comes back with the SAME environment (the overrides test_env set included) and nothing else is touched: no dependency is started and nothing is recreated. Waits up to 300 s for healthy. Runs nothing unless the same rails as test_stop hold, except that SERVICE must have exactly one container and it must be stopped. Charged to the state-changing budget once per call (12 an hour). Returns ok or failed itself."""
+        checked = stack.validate_agent_env_service(service)
+        call.validated = {'service': checked}
+        rails = await self._agent_env_rails(call, checked, 'stopped')
+        if rails is not None:
+            return rails
+        self.dev_budget.charge()
+        step = stack.test_start_step(self.settings.stack_dir, self.settings.repo_host_path, checked)
+        if not await call.steps_until_failure([step]):
+            return (
+                'failed',
+                f'compose up of {checked} failed for the {stack.DEV_PROJECT} project; see the steps and call logs',
+            )
+        return 'ok', f'{checked} is running again with the environment it had'
+
+    async def _test_env(self, call: _Call, service: object, overrides: object) -> tuple[str, str]:
+        """STATE-CHANGING, TEST MODE ONLY: sets the environment OVERRIDES of SERVICE (data_store or data_ingest) and recreates that one service now (`up -d --wait --no-deps --force-recreate <service>`); setting is applying. OVERRIDES REPLACES the service's whole override set ({} clears it). Only these names, and values that only lower a default, are accepted; anything else is refused, naming the variable and never the value, at most 8 names per call. data_store: PANEL_MANAGER_ENABLED and PANEL_MANAGER_DRY_RUN (exactly true or false), INSTANCE_WATCH_INTERVAL_SECONDS (integer 1-15), INSTANCE_WATCH_RESUBMIT_MARGIN_SECONDS (integer 0-15). data_ingest: ALPACA_OUTGOING_BUFFER_SIZE (integer 1-64), ALPACA_STALL_TIMEOUT_S (decimal 1-300, at most 3 fraction digits), ALPACA_MAX_ATTEMPTS (integer 1-5). The values go into one overlay file this server generates in its own stack directory (never the repository or the root env file) and are not secrets. The overrides SURVIVE restart, test_stop and test_start, and a test_env on the other service; a plain test_up DELETES them (so does test_env with {}). ps reports the active overrides and says 'pending' when the file and the running container differ. Runs nothing unless the same rails as test_stop hold, except that SERVICE must have exactly one container in any state. Charged to the state-changing budget once per call (12 an hour). Returns ok or failed itself."""
+        checked = stack.validate_agent_env_service(service)
+        values = stack.validate_agent_env(checked, overrides)
+        call.validated = {'service': checked, 'names': list(values)}
+        rails = await self._agent_env_rails(call, checked, None)
+        if rails is not None:
+            return rails
+        settings = self.settings
+        current = await asyncio.to_thread(stack.read_agent_env, settings.stack_dir)
+        entries = stack.replace_agent_env(current, checked, values)
+        self.dev_budget.charge()
+        await asyncio.to_thread(stack.write_agent_env, settings.stack_dir, entries)
+        step = stack.test_env_step(settings.stack_dir, settings.repo_host_path, checked)
+        if not await call.steps_until_failure([step]):
+            return (
+                'failed',
+                f'compose up of {checked} failed after the overrides file was written; ps shows whether the running '
+                'container is pending; call test_env again or test_up',
+            )
+        if not values:
+            return 'ok', f'the overrides of {checked} are cleared and {checked} was recreated'
+        return 'ok', f'{checked} was recreated with the overrides: {", ".join(values)}'
+
     # -----------------------------------------------------------------------------------------
     # THE USER'S OWN DEV PROJECT, READ-ONLY (stack.DEV_PROJECT; ADR tj-4rr0la addendum 18).
     #
@@ -575,11 +741,19 @@ class AgentStack:
     # one of two read-only subcommands. An unrelated fault elsewhere cannot refuse the one diagnostic
     # the user reaches for when their own stack is broken, which is the case these verbs were added for.
     async def _dev_ps(self, call: _Call) -> tuple[str, str]:
-        """READ-ONLY: the containers of the USER'S OWN dev compose project, stopped ones included, and their health. It starts, stops and changes nothing, and reaches no other project."""
+        """READ-ONLY: the containers of the USER'S OWN dev compose project, stopped ones included, and their health, then one line per data_store and data_ingest with the environment overrides test_env set: the names on the running container (from its labels, never its environment) and the generation and values in this server's own overrides file, marked 'pending' when they differ. It starts, stops and changes nothing, and reaches no other project."""
         call.validated = {}
         if not await call.steps_until_failure(stack.dev_ps_steps(self.settings.stack_dir)):
             return 'failed', f'compose ps failed for the {stack.DEV_PROJECT} project'
-        return 'ok', f'containers of the {stack.DEV_PROJECT} compose project'
+        file_entries: dict[str, stack.AgentEnvEntry] | None
+        try:
+            file_entries = await asyncio.to_thread(stack.read_agent_env, self.settings.stack_dir)
+        except stack.Refused:
+            file_entries = None
+        read = await call.step(stack.agent_env_labels_step(self.settings.stack_dir))
+        labels = stack.parse_agent_env_labels(read.stdout) if read.exit_status == 0 else None
+        lines, _ = stack.describe_agent_env(file_entries, labels)
+        return 'ok', '\n'.join([f'containers of the {stack.DEV_PROJECT} compose project', *lines])
 
     async def _dev_logs(self, call: _Call, service: object, tail: object) -> tuple[str, str]:
         """READ-ONLY: the last TAIL lines (clamped) of one service's log in the USER'S OWN dev compose project. It starts, stops and changes nothing, and reaches no other project."""
@@ -603,7 +777,7 @@ class AgentStack:
         return stack.pick_dev_target(service, lookup.stdout)
 
     async def _dev_db_tables(self, call: _Call) -> tuple[str, str]:
-        """READ-ONLY: which of the store's tables exist in the USER'S OWN dev database (dataset_read, dataset_read_daily, dataset_override_log, dataset_deletion, ingest_run, store_dataset_entry, stock_market_activity, alembic_version), and its alembic revision. Works while data_store is down. Runs one fixed psql script by exec in the running dev postgres container as user postgres, in a read-only transaction; takes no argument and prints no credential."""
+        """READ-ONLY: which of the store's tables exist in the USER'S OWN dev database (dataset_read, dataset_read_daily, dataset_override_log, dataset_deletion, ingest_run, ingest_request, ingest_instance, store_dataset_entry, stock_market_activity, asset_list_snapshot, asset_list_row, asset_list_event, corporate_action, panel, panel_settings_version, panel_source_settings_version, panel_pass, panel_member_transition, alembic_version), and its alembic revision. Works while data_store is down. Runs one fixed psql script by exec in the running dev postgres container as user postgres, in a read-only transaction; takes no argument and prints no credential."""
         call.validated = {}
         target = await self._dev_exec_target(call, 'postgres')
         step = stack.dev_db_tables_steps(self.settings.stack_dir, target)[0]
@@ -937,7 +1111,7 @@ class AgentStack:
     # (each must equal its digest), then the budget, the bases (a failed pull stops before the down), the
     # label-only down and the up. No wrapper and no network step: the base and fake files need neither.
     async def _test_up(self, call: _Call) -> tuple[str, str]:
-        """STATE-CHANGING: `make system-launch` on the USER'S OWN compose project, in TEST mode. Stops the project first (docker compose -p trader_joe_dev down: it never removes a volume or an image), dev mode included, so only one mode is ever up; then starts postgres, data_store and data_ingest from the MCP image's baked base file and docker-compose.fake.yaml, waiting up to 300 s for healthy: the :test prod images, data_ingest on the fake broker (no vendor, no key; its log starts 'FAKE BROKER:'), postgres on ./volume_data/test, never your dev data and never :latest. Takes no argument and never builds: both :test images must exist and carry a source stamp equal to this checkout's digest, else it is refused and says to call test_build (STALE: call test_build when the checkout moved on). Calling up returns to dev mode. Compose reads the root env file itself. Refused when the project holds a container started from neither the dev nor the test files (a prod launch) or dev and test containers together, when the MCP image is stale (run make agent-mcp-rebuild), when a repository bind source (tests/fakes) or an env file is a symlink or not a regular file, when a compose file or dotenv file sits in the stack directory or a parent, and after 12 state-changing dev calls in an hour. Up to 10 minutes; returns ok or failed itself and is not a background job."""
+        """STATE-CHANGING: `make system-launch` on the USER'S OWN compose project, in TEST mode. Stops the project first (docker compose -p trader_joe_dev down: it never removes a volume or an image), dev mode included, so only one mode is ever up; then starts postgres, data_store and data_ingest from the MCP image's baked base file and docker-compose.fake.yaml, waiting up to 300 s for healthy: the :test prod images, data_ingest on the fake broker (no vendor, no key; its log starts 'FAKE BROKER:'), postgres on ./volume_data/test, never your dev data and never :latest. Takes no argument and never builds: both :test images must exist and carry a source stamp equal to this checkout's digest, else it is refused and says to call test_build (STALE: call test_build when the checkout moved on). Calling up returns to dev mode. It also CLEARS any environment overrides test_env set (their file is deleted before the down). Compose reads the root env file itself. Refused when the project holds a container started from neither the dev nor the test files (a prod launch) or dev and test containers together, when the MCP image is stale (run make agent-mcp-rebuild), when a repository bind source (tests/fakes) or an env file is a symlink or not a regular file, when a compose file or dotenv file sits in the stack directory or a parent, and after 12 state-changing dev calls in an hour. Up to 10 minutes; returns ok or failed itself and is not a background job."""
         call.validated = {}
         settings = self.settings
         await self._mode_guard(call)
@@ -956,6 +1130,9 @@ class AgentStack:
             stack.check_dev_image_stamp(stamp.exit_status, stamp.stdout, digest, image)
         self.dev_budget.charge()
         await call.ensure_bases(settings.stack_dir)
+        # A plain test_up CLEARS the environment overrides (addendum 32 (1)): the generated overlay goes before
+        # the down and the up, whose file set (testmode_up_step) never names it.
+        await asyncio.to_thread(stack.delete_agent_env, settings.stack_dir)
         if not await call.steps_until_failure(stack.dev_down_steps(settings.stack_dir)):
             return 'failed', f'compose down failed for the {stack.DEV_PROJECT} project; nothing was started'
         up = stack.testmode_up_step(settings.stack_dir, settings.repo_host_path)

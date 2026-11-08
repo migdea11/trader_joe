@@ -6,9 +6,10 @@ prefix (the architect's 12:55 UTC release note of 2026-10-19).
 Every literal here is spelled out, never read from the module under test: a pin that took its expectation
 from runner.py would agree with any change to it.
 
-  * THE VERB SET is exactly the fifteen final names -- dev launchers up, build, tools; test launchers test_up,
+  * THE VERB SET is exactly the nineteen final names -- dev launchers up, build, tools; test launchers test_up,
     test_build; either mode down, restart, ps, logs, db_tables, http_get, migrate, migrate_status,
-    run_system_tests, seed_dump -- in the handler table, the input schemas, the timeouts, and so the MCP tool
+    run_system_tests, seed_dump, test_reset; and addendum 32's test_stop, test_start, test_env (tj-7zjov1.268)
+    -- in the handler table, the input schemas, the timeouts, and so the MCP tool
     list (server.py lists AgentStack.verbs with VERB_SCHEMAS, pinned in test_dev_migrate.py). No retired verb
     and no old dev_ name is in any of them: there are no aliases.
   * NO OLD TOOL NAME IN ANY TEXT. No description, refusal, hint, fix or docs string in the MCP's modules (nor
@@ -56,6 +57,11 @@ EXPECTED_VERBS = frozenset(
         'migrate_status',
         'run_system_tests',
         'seed_dump',
+        'test_reset',
+        # ADR tj-4rr0la addendum 32 (tj-7zjov1.268): the three test-mode service verbs.
+        'test_stop',
+        'test_start',
+        'test_env',
     }
 )
 # The nine tool names tj-iee6sn.26 replaced, old -> new (ADR tj-4rr0la addendum 27 (4)).
@@ -183,11 +189,11 @@ REMOVED_RUNNER_NAMES = (
 )
 
 
-def test_the_verb_set_is_exactly_the_fifteen_in_every_table():
-    """Addenda 26 (5) / 27 (4): the handlers (so the tool list), the schemas and the timeouts agree."""
+def test_the_verb_set_is_exactly_the_nineteen_in_every_table():
+    """Addenda 26 (5) / 27 (4) / 32 (1): the handlers (so the tool list), the schemas and the timeouts agree."""
     agent = runner.AgentStack(settings=None)  # type: ignore[arg-type] -- only the verb table is read
     assert set(agent.verbs) == EXPECTED_VERBS, set(agent.verbs) ^ EXPECTED_VERBS
-    assert len(agent.verbs) == len(EXPECTED_VERBS) == 15
+    assert len(agent.verbs) == len(EXPECTED_VERBS) == 19
     assert set(runner.VERB_SCHEMAS) == EXPECTED_VERBS, set(runner.VERB_SCHEMAS) ^ EXPECTED_VERBS
     assert set(runner.VERB_TIMEOUT_SECONDS) == EXPECTED_VERBS, set(runner.VERB_TIMEOUT_SECONDS) ^ EXPECTED_VERBS
     assert set(VERB_SAMPLES) == EXPECTED_VERBS

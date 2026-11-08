@@ -359,7 +359,10 @@ def is_seed_producer(step: stack.Step) -> bool:
 DEV_CONTAINER_ID = 'c0ffee000001'
 DEV_DB_TABLES_STDOUT = (
     b'dataset_read|t\ndataset_read_daily|t\ndataset_override_log|t\ndataset_deletion|t\n'
-    b'ingest_run|t\nstore_dataset_entry|t\nstock_market_activity|t\nalembic_version|t\n'
+    b'ingest_run|t\ningest_request|t\ningest_instance|t\nstore_dataset_entry|t\nstock_market_activity|t\n'
+    b'asset_list_snapshot|t\nasset_list_row|t\nasset_list_event|t\ncorporate_action|t\npanel|t\n'
+    b'panel_settings_version|t\npanel_source_settings_version|t\npanel_pass|t\npanel_member_transition|t\n'
+    b'alembic_version|t\n'
     b'version_num|d7e2a9c35b18\n'
 )
 # The data_ingest container's id in the rig: distinct from DEV_CONTAINER_ID so that migrate's TEST-mode stamp
@@ -376,6 +379,9 @@ DEV_MIGRATE_STATUS_STDOUT = (
 # What the http_get script prints for /ping (tj-iee6sn.13.6): the status line, then the redacted
 # body. Told apart by its option set, which is NONE: the container id follows `exec` directly.
 DEV_HTTP_GET_STDOUT = b'== GET /ping -> HTTP 200 ==\n{"message":"pong"}\n'
+# What test_reset's exec script prints (tj-w0rddi): the verification of the recreated schema, names and counts
+# only. Told apart from db_tables' exec by its option set, `-u postgres` with NO `-e` after it.
+TEST_RESET_STDOUT = b'database|postgres\nschema_owner|pg_database_owner\nalembic_version|absent\npublic_relations|0\n'
 
 
 def is_dev_lookup(step: stack.Step) -> bool:
@@ -448,6 +454,8 @@ def default_response(step: stack.Step) -> runner.ProcessResult:
         return runner.ProcessResult(0, f'{DEV_INGEST_CONTAINER_ID if ingest else DEV_CONTAINER_ID}\n'.encode(), b'')
     if is_dev_exec(step) and list(step.argv[2:4]) == ['-w', '/code']:
         return runner.ProcessResult(0, DEV_MIGRATE_STATUS_STDOUT, b'')
+    if is_dev_exec(step) and len(step.argv) > 4 and list(step.argv[2:4]) == ['-u', 'postgres'] and step.argv[4] != '-e':
+        return runner.ProcessResult(0, TEST_RESET_STDOUT, b'')
     if is_dev_exec(step) and len(step.argv) > 2 and not step.argv[2].startswith('-'):
         return runner.ProcessResult(0, DEV_HTTP_GET_STDOUT, b'')
     if is_dev_exec(step):
@@ -462,6 +470,9 @@ def default_response(step: stack.Step) -> runner.ProcessResult:
 # postgres mount read prints <repo host path>/volume_data/test/postgres. Every other step falls through to
 # BASE (default_response unless given), so the lookups and the stamps stay current. Spelled from literals.
 SYSTEM_SUITE_VERBS = frozenset({'run_system_tests', 'seed_dump'})
+# test_reset (tj-w0rddi) has the same rails (TEST mode only, the test directory's mount) but runs no client:
+# one exec into the postgres container. test_reset_response is the rig's answer under which its sample ends 'ok'.
+TEST_RESET_VERBS = frozenset({'test_reset'})
 TEST_MODE_LINE = b'/r/docker-compose.yaml,/r/docker-compose.fake.yaml\n'
 POSTGRES_DATA_TARGET = '/var/lib/postgresql/data'
 
@@ -506,11 +517,56 @@ def system_suite_response(
     return respond
 
 
+# test_stop, test_start and test_env (ADR tj-4rr0la addendum 32; tj-7zjov1.268): test_reset's rails, then a
+# lookup of BOTH services' containers in ANY state (`docker ps -a ... --format '{{.ID}} {{.State}}'`), a stamp
+# read of each container found, and one compose step on the named service. service_verb_response answers the
+# lookup with ONE container per service in STATE (running, or exited for test_start's sample).
+TEST_SERVICE_VERBS = frozenset({'test_stop', 'test_start', 'test_env'})
+SERVICE_LOOKUP_FORMAT = '{{.ID}} {{.State}}'
+# ps's one extra read (addendum 32 (6)): `docker ps -a` printing service|env_generation|env_names from labels.
+AGENT_ENV_LABELS_FORMAT = (
+    '{{.Label "com.docker.compose.service"}}|{{.Label "trader_joe.agent.env_generation"}}|'
+    '{{.Label "trader_joe.agent.env_names"}}'
+)
+
+
+def is_service_lookup(step: stack.Step) -> bool:
+    """The three verbs' lookup of one service's containers in any state, printing id and state."""
+    return list(step.argv[:3]) == ['/usr/local/bin/docker', 'ps', '-a'] and step.argv[-1] == SERVICE_LOOKUP_FORMAT
+
+
+def service_of(step: stack.Step) -> str:
+    """The service a label-filtered `docker ps` names."""
+    return next(w for w in step.argv if w.startswith('label=com.docker.compose.service=')).split('=', 2)[2]
+
+
+def is_agent_env_label_read(step: stack.Step) -> bool:
+    """The read by ps of the two env labels (and the service label) of the project's containers."""
+    return list(step.argv[:3]) == ['/usr/local/bin/docker', 'ps', '-a'] and step.argv[-1] == AGENT_ENV_LABELS_FORMAT
+
+
+def service_verb_response(
+    layout: Layout, state: str = 'running', base: Callable[[stack.Step], runner.ProcessResult] = default_response
+) -> Callable[[stack.Step], runner.ProcessResult]:
+    """system_suite_response, with each service lookup answering its one container (the lookup's ids) in STATE."""
+    suite = system_suite_response(layout, base)
+
+    def respond(step: stack.Step) -> runner.ProcessResult:
+        if is_service_lookup(step):
+            container = DEV_INGEST_CONTAINER_ID if service_of(step) == 'data_ingest' else DEV_CONTAINER_ID
+            return runner.ProcessResult(0, f'{container} {state}\n'.encode(), b'')
+        return suite(step)
+
+    return respond
+
+
 def response_for(
     verb: str, layout: Layout, base: Callable[[stack.Step], runner.ProcessResult] = default_response
 ) -> Callable[[stack.Step], runner.ProcessResult]:
-    """The answer under which VERB's sample is admitted: system_suite_response for the system-suite pair, else BASE."""
-    return system_suite_response(layout, base) if verb in SYSTEM_SUITE_VERBS else base
+    """The answer under which VERB's sample is admitted: system_suite_response for the test-mode verbs, else BASE."""
+    if verb in TEST_SERVICE_VERBS:
+        return service_verb_response(layout, 'exited' if verb == 'test_start' else 'running', base)
+    return system_suite_response(layout, base) if verb in SYSTEM_SUITE_VERBS | TEST_RESET_VERBS else base
 
 
 # The client's command (tj-iee6sn.20; no shell wrapper since 5a38b7f), spelled from literals:
@@ -653,13 +709,18 @@ def budget_spent(rig: Rig) -> int:
 
 
 # A valid call of every verb. A verb added to AgentStack without an entry here fails
-# test_every_verb_has_a_sample, so parameterised tests cannot silently skip it. Exactly the fifteen
-# verbs of ADR tj-4rr0la addenda 26 (5) and 27 (4), under today's names (the rename is tj-iee6sn.26).
+# test_every_verb_has_a_sample, so parameterised tests cannot silently skip it. Exactly the sixteen
+# verbs of ADR tj-4rr0la addenda 26 (5) and 27 (4), under today's names (the rename is tj-iee6sn.26), and
+# the three of addendum 32 (tj-7zjov1.268): nineteen.
 VERB_SAMPLES: Mapping[str, dict[str, Any]] = {
     'migrate': {},
     'migrate_status': {},
     'run_system_tests': {'worktree': WORKTREE_NAME, 'paths': ['tests/system/test_one.py']},
     'seed_dump': {'worktree': WORKTREE_NAME},
+    'test_reset': {},
+    'test_stop': {'service': 'data_store'},
+    'test_start': {'service': 'data_store'},
+    'test_env': {'service': 'data_store', 'overrides': {'PANEL_MANAGER_ENABLED': 'false'}},
     'logs': {'service': 'postgres', 'tail': 50},
     'ps': {},
     'db_tables': {},
@@ -695,6 +756,10 @@ DEV_PROJECT_VERBS = frozenset(
         # tj-iee6sn.10: the unified pair acts on the one project (DEV or TEST mode), not the agent stack.
         'migrate',
         'migrate_status',
+        # tj-w0rddi: the test-mode rails, then one exec into the postgres container, on the one project.
+        'test_reset',
+        # tj-7zjov1.268: test_reset's rails plus the any-state service lookups, then ONE compose step.
+        *TEST_SERVICE_VERBS,
     }
 )
 # The subset that runs PLAIN docker -- a label lookup, then `docker exec` -- rather than the dev

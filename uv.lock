@@ -1709,6 +1709,7 @@ source = { virtual = "." }
 agent-mcp = [
     { name = "mcp", version = "1.30.0", source = { registry = "https://pypi.org/simple" } },
     { name = "pyjwt", version = "2.15.0", source = { registry = "https://pypi.org/simple" } },
+    { name = "pyyaml" },
     { name = "starlette" },
     { name = "uvicorn" },
 ]
@@ -1765,6 +1766,7 @@ testing = [
 agent-mcp = [
     { name = "mcp", specifier = ">=1.30.0,<2" },
     { name = "pyjwt", specifier = ">=2.15.0" },
+    { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "starlette", specifier = ">=1.6.0" },
     { name = "uvicorn", specifier = ">=0.53.0" },
 ]
