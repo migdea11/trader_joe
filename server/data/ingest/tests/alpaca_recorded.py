@@ -30,6 +30,7 @@ provenance says 'constructed'. So every such test also exercises the private att
 """
 
 import asyncio
+import hashlib
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -45,6 +46,7 @@ from urllib.parse import parse_qs, urlsplit
 import requests
 from alpaca.common import rest as alpaca_rest
 from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.historical.corporate_actions import CorporateActionsClient
 from alpaca.trading.client import TradingClient
 from requests.adapters import BaseAdapter
 from requests.structures import CaseInsensitiveDict
@@ -455,6 +457,64 @@ def raw_answer(body: bytes, status: int = 200, headers: Mapping[str, str] | None
         provenance={'kind': 'constructed'},
         headers=dict(headers or {}),
     )
+
+
+def load_raw(name: str) -> RecordedResponse:
+    """Load a fixture recorded byte for byte: fixtures/alpaca/<name>.json whose body_text is the body as served.
+
+    For an endpoint whose records are sliced from the body (the corporate actions, tj-7zjov1.23), a fixture whose
+    body were re-encoded by json.dumps would serve bytes the vendor never sent. The text is checked against the
+    recording's own length and sha256 before it is served, so an edited fixture fails here and not downstream.
+
+    Args:
+        name (str): File stem.
+
+    Returns:
+        RecordedResponse: The fixture, its body the served bytes.
+
+    Raises:
+        AssertionError: If the body text is not the bytes the recording measured.
+    """
+    raw = json.loads((FIXTURES_DIR / f'{name}.json').read_text())
+    body = raw['body_text'].encode('utf-8')
+    provenance = raw.get('provenance', {})
+    if len(body) != provenance['byte_length'] or hashlib.sha256(body).hexdigest() != provenance['sha256']:
+        raise AssertionError(f'{name}: body_text is not the bytes recorded')
+    return RecordedResponse(name=name, status=raw['status'], body=body, provenance=provenance)
+
+
+@dataclass
+class StubDataVendor:
+    """A real alpaca-py CorporateActionsClient over a scripted RecordedTransport, and what reached it.
+
+    Attributes:
+        client (CorporateActionsClient): The client to inject.
+        transport (RecordedTransport): Its transport.
+    """
+
+    client: CorporateActionsClient
+    transport: RecordedTransport
+
+    @property
+    def sent(self) -> list[SentRequest]:
+        """Every HTTP request that reached the vendor, in order."""
+        return self.transport.sent
+
+
+def stub_corporate_actions_vendor(*answers: Answer, request_cap: int = DEFAULT_REQUEST_CAP) -> StubDataVendor:
+    """A real CorporateActionsClient on Alpaca's data host, answering each request in turn with `answers`.
+
+    Built exactly as broker_api.get_corporate_actions_client builds one (the SDK's own data host, v1), with the
+    placeholder pair. The transport refuses any other host, so a read sent to the trading host fails the test.
+    """
+    client = CorporateActionsClient(PLACEHOLDER_KEY_ID, PLACEHOLDER_SECRET)
+    transport = RecordedTransport(scripted(*answers), request_cap)
+    session = client._session
+    session.mount('https://', transport)
+    session.mount('http://', transport)
+    if set(session.adapters) != {'https://', 'http://'} or any(a is not transport for a in session.adapters.values()):
+        raise AssertionError(f'a real adapter is still mounted: {dict(session.adapters)}')
+    return StubDataVendor(client, transport)
 
 
 def asset_answer(symbol: str, vendor_asset_id: str) -> RecordedResponse:

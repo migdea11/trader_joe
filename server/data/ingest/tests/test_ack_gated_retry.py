@@ -28,6 +28,7 @@ from common.enums.data_stock import DataSource, Feed, Granularity, UpdateType
 from common.errors.vocabulary import ExogenousError, InvalidRequestError, Reason
 from data.ingest.app.brokers.alpaca import broker_api
 from data.ingest.app.brokers.alpaca.classify import RATE_LIMIT_RESET_HEADER, RETRY_AFTER_HEADER
+from data.ingest.app.brokers.alpaca.corporate_actions_attempt import CorporateActionsWork
 from data.ingest.app.brokers.alpaca.handle import (
     ALPACA_BARS_PAGE_SIZE,
     ALPACA_CALLS_PER_MINUTE_CEILING,
@@ -80,6 +81,8 @@ from schemas.data_ingest.submit import (
     AssetListStatus,
     BarsRequest,
     CorporateActionsRequest,
+    SubmitAccepted,
+    SubmitAck,
     SubmitRequest,
 )
 
@@ -1076,35 +1079,208 @@ NON_BARS = [
     ),
 ]
 
-# What the Alpaca HANDLE itself still refuses. P12 (tj-7zjov1.22) taught AlpacaHandle.submit the asset list, so
-# only corporate actions are left (P13). The Submit HANDLER above still refuses both until P12s and P13s open it;
-# the handle's acceptance of an asset list is pinned in test_alpaca_asset_handle.py.
-NOT_SERVED_BY_THE_HANDLE = [param for param in NON_BARS if param.id == 'corporate-actions']
+# The scope each non-bars kind is charged to on the Alpaca HANDLE. P12 (tj-7zjov1.22) taught AlpacaHandle.submit
+# the asset list (trading API) and P13 (tj-7zjov1.23) corporate actions (data API), so the handle itself refuses
+# neither now. The Submit HANDLER serves corporate actions from P13s (tj-7zjov1.124) and still refuses the asset
+# list until P12s opens it. Each kind's own acceptance is pinned in test_alpaca_asset_handle.py and
+# test_alpaca_corporate_actions_attempt.py; the handler's routing of corporate actions just below.
+NON_BARS_SCOPE = {'asset-list': ALPACA_TRADING_SCOPE, 'corporate-actions': ALPACA_DATA_SCOPE}
+[ASSET_LIST_KIND, CORPORATE_ACTIONS_KIND] = [param.values[0] for param in NON_BARS]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('kind', NON_BARS)
-async def test_the_submit_handler_refuses_a_kind_not_served_yet_as_invalid_request(kind):
+async def test_the_submit_handler_refuses_the_asset_list_not_served_yet_as_invalid_request_with_nothing_queued():
+    """FLIPPED by tj-7zjov1.124 (P13s): it was parametrized over both non-bars kinds; corporate actions are served now."""
     handle = alpaca_handle()
     handler = IngestSubmitHandler({DataSource.ALPACA_API: handle}, INSTANCE)
 
     with pytest.raises(InvalidRequestError) as raised:
-        await handler.submit(submit_request(**kind))
+        await handler.submit(submit_request(**ASSET_LIST_KIND))
 
     assert raised.value.reason is Reason.INVALID_REQUEST
     assert handle.scheduler.queued == 0
+    assert handle.active == 0, 'a refused asset-list request was held by the handle'
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('kind', NOT_SERVED_BY_THE_HANDLE)
-async def test_the_handle_itself_refuses_a_kind_not_served_yet(kind):
+async def test_the_submit_handler_accepts_corporate_actions_and_queues_them_on_the_handle_with_no_tape():
+    """tj-7zjov1.124 (P13s) acceptance: accepted, queued once, as the runner's work, on the data scope, no tape."""
+    handle = alpaca_handle()
+    handler = IngestSubmitHandler({DataSource.ALPACA_API: handle}, INSTANCE)
+    request = submit_request('ca-1', **CORPORATE_ACTIONS_KIND)
+
+    response = await handler.submit(request)
+
+    assert response.instance_id == INSTANCE
+    assert response.ack.refused is None
+    assert (response.ack.accepted.feed, response.ack.accepted.quota_key) == (None, ALPACA_DATA_SCOPE)
+    assert handle.scheduler.queued == 1
+    queued = await asyncio.wait_for(handle.scheduler.take(), GUARD_S)
+    assert queued.request_id == 'ca-1'
+    assert queued.payload == CorporateActionsWork(request=request.corporate_actions, priority=RequestPriority.BACKFILL)
+    assert queued.feed is None
+
+
+class SpyHandle:
+    """A broker handle by shape: records each request it is handed and accepts it on its own name."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.submitted: list[SubmitRequest] = []
+
+    async def submit(self, request: SubmitRequest) -> SubmitAck:
+        self.submitted.append(request)
+        return SubmitAck(accepted=SubmitAccepted(feed=None, quota_key=self.name))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('source', [DataSource.ALPACA_API, DataSource.IB_API])
+async def test_the_submit_handler_routes_corporate_actions_to_the_handle_of_their_own_source(source):
+    """The source is read from the corporate-actions body: never the bars body, never another source's handle."""
+    handles = {named: SpyHandle(named.value) for named in (DataSource.IB_API, DataSource.ALPACA_API)}
+    handler = IngestSubmitHandler(handles, INSTANCE)
+    actions = CorporateActionsRequest(source=source, asset_symbol='VFV', start=START, end=END)
+
+    response = await handler.submit(submit_request('ca-1', bars=None, corporate_actions=actions))
+
+    assert response.ack.accepted.quota_key == source.value
+    assert [request.request_id for request in handles[source].submitted] == ['ca-1']
+    others = [handle for named, handle in handles.items() if named is not source]
+    assert all(handle.submitted == [] for handle in others), 'another source handle was handed the request'
+
+
+@pytest.mark.asyncio
+async def test_corporate_actions_for_a_source_with_no_handle_are_not_implemented_and_reach_no_handle():
+    alpaca = SpyHandle(DataSource.ALPACA_API.value)
+    handler = IngestSubmitHandler({DataSource.ALPACA_API: alpaca}, INSTANCE)
+    actions = CorporateActionsRequest(source=DataSource.IB_API, asset_symbol='VFV', start=START, end=END)
+
+    with pytest.raises(NotImplementedError, match='IB'):
+        await handler.submit(submit_request('ca-1', bars=None, corporate_actions=actions))
+
+    assert alpaca.submitted == []
+
+
+@pytest.mark.asyncio
+async def test_the_submit_handler_routes_bars_to_the_handle_of_their_own_source_unchanged():
+    """Bars unchanged by tj-7zjov1.124: still validated, still routed by the bars body's source."""
+    handles = {named: SpyHandle(named.value) for named in (DataSource.IB_API, DataSource.ALPACA_API)}
+    handler = IngestSubmitHandler(handles, INSTANCE)
+
+    response = await handler.submit(submit_request('bars-1'))
+
+    assert response.ack.accepted.quota_key == DataSource.ALPACA_API.value
+    assert [request.request_id for request in handles[DataSource.ALPACA_API].submitted] == ['bars-1']
+    assert handles[DataSource.IB_API].submitted == []
+
+
+# tj-7zjov1.167: the recovered flag and the durable count through the Submit HANDLER for bars and corporate actions, as
+# the asset-list tests above pin them for the asset list. A recovered bars Submit is what the instance watcher sends for
+# every abandoned bars request; a handler that dropped the flag would charge it as a fresh request (no restart charge)
+# and one that dropped the count would reset its attempt budget. Each kind: (submit builder, tape of its ack, its work).
+def corporate_actions_submit(request_id: str = 'ca-1', **overrides) -> SubmitRequest:
+    return submit_request(request_id, **{**CORPORATE_ACTIONS_KIND, **overrides})
+
+
+RECOVERABLE_KINDS = [
+    pytest.param(submit_request, Feed.IEX, BarsWork, id='bars'),
+    pytest.param(corporate_actions_submit, None, CorporateActionsWork, id='corporate-actions'),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('recovered', [True, False], ids=['recovered', 'not-recovered'])
+@pytest.mark.parametrize(('build', 'tape', 'work'), RECOVERABLE_KINDS)
+async def test_the_submit_handler_hands_bars_and_corporate_actions_on_with_recovered_and_count_unchanged(
+    build, tape, work, recovered
+):
+    handles = {DataSource.ALPACA_API: SpyHandle(DataSource.ALPACA_API.value)}
+    handler = IngestSubmitHandler(handles, INSTANCE)
+    request = build(attempt_count=2, recovered=recovered)
+
+    await handler.submit(request)
+
+    [handed] = handles[DataSource.ALPACA_API].submitted
+    assert (handed.recovered, handed.attempt_count) == (recovered, 2), 'the flag or the durable count was not kept'
+    assert handed == request
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('build', 'tape', 'work'), RECOVERABLE_KINDS)
+async def test_a_recovered_bars_or_corporate_actions_submit_is_charged_one_data_call_then_queued_keeping_its_count(
+    monkeypatch, build, tape, work
+):
+    """Through the handler into the real Alpaca handle: the restart charge lands BEFORE the queue, the count is kept."""
+    handle = alpaca_handle()
+    spy = RestartSpy(handle, monkeypatch)
+    handler = IngestSubmitHandler({DataSource.ALPACA_API: handle}, INSTANCE)
+
+    response = await handler.submit(build(attempt_count=2, recovered=True))
+
+    assert (response.ack.accepted.feed, response.ack.accepted.quota_key) == (tape, ALPACA_DATA_SCOPE)
+    # One call each: the bars request is one hour of thirty-minute bars, one page.
+    assert spy.log == [('charge_restart', ALPACA_DATA_SCOPE, 1), ('submit', ALPACA_DATA_SCOPE, None)]
+    queued = await asyncio.wait_for(handle.scheduler.take(), GUARD_S)
+    assert queued.attempt_count == 2, 'the durable count was not carried to the queue'
+    assert isinstance(queued.payload, work)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('build', 'tape', 'work'), RECOVERABLE_KINDS)
+async def test_a_bars_or_corporate_actions_submit_not_recovered_is_queued_with_no_restart_charge(
+    monkeypatch, build, tape, work
+):
+    """The other side of the flag: a fresh request is never charged a restart cost."""
+    handle = alpaca_handle()
+    spy = RestartSpy(handle, monkeypatch)
+    handler = IngestSubmitHandler({DataSource.ALPACA_API: handle}, INSTANCE)
+
+    await handler.submit(build(attempt_count=2, recovered=False))
+
+    assert spy.log == [('submit', ALPACA_DATA_SCOPE, None)], 'a request not recovered was charged a restart'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('build', 'tape', 'work'), RECOVERABLE_KINDS)
+async def test_a_recovered_bars_or_corporate_actions_submit_past_the_budget_is_charged_reported_and_never_queued(
+    monkeypatch, build, tape, work
+):
+    """The exhausted check runs before the queue: charged (it is recovered), reported EXHAUSTED at count + 1."""
+    handle = alpaca_handle()
+    spy = RestartSpy(handle, monkeypatch)
+    handler = IngestSubmitHandler({DataSource.ALPACA_API: handle}, INSTANCE)
+    store = DoubleStore()
+    handle.start(store, INSTANCE)
+    try:
+        response = await handler.submit(build(attempt_count=5, recovered=True))
+        delivered = await store.next()
+        assert handle.scheduler.queued == 0, 'the exhausted request was queued'
+        answer(delivered, DeliveryVerdict.FINAL)
+        await settle()
+    finally:
+        await asyncio.wait_for(handle.stop(), GUARD_S)
+
+    assert response.ack.accepted.quota_key == ALPACA_DATA_SCOPE
+    assert spy.log == [('charge_restart', ALPACA_DATA_SCOPE, 1)], 'not one charge, or queued'
+    assert delivered.attempt.trailer.outcome is DeliveryOutcome.EXHAUSTED
+    assert delivered.attempt.header.attempt_no == 6
+    assert delivered.attempt.header.feed is tape
+    assert delivered.attempt.header.quota_key == ''
+    assert handle.active == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', NON_BARS)
+async def test_the_handle_itself_accepts_every_non_bars_kind_with_no_tape_on_its_own_scope(request, kind):
+    """FLIPPED by tj-7zjov1.23: it pinned the handle refusing corporate actions, which P13 now serves."""
     handle = alpaca_handle()
 
-    with pytest.raises(InvalidRequestError) as raised:
-        await handle.submit(submit_request(**kind))
+    ack = await handle.submit(submit_request(**kind))
 
-    assert raised.value.reason is Reason.INVALID_REQUEST
-    assert handle.scheduler.queued == 0
+    scope = NON_BARS_SCOPE[request.node.callspec.id]
+    assert ack.refused is None
+    assert (ack.accepted.feed, ack.accepted.quota_key) == (None, scope)
+    assert handle.scheduler.queued == 1
 
 
 @pytest.mark.asyncio

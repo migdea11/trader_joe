@@ -193,8 +193,9 @@ def test_fake_read_has_every_member_of_the_broker_read_protocol_with_the_same_si
     # conformance is checked member by member: same names, coroutine where the Protocol has one,
     # same parameters.
     members = [name for name, _ in inspect.getmembers(BrokerRead, inspect.isfunction) if not name.startswith('_')]
-    # tj-7zjov1.22 added the two asset reads; a member added later must be added to FakeRead and pinned here.
-    assert members == ['get_asset', 'get_assets', 'get_bars']
+    # tj-7zjov1.22 added the two asset reads and tj-7zjov1.23 the corporate-actions read; a member added later must
+    # be added to FakeRead and pinned here.
+    assert members == ['get_asset', 'get_assets', 'get_bars', 'get_corporate_actions']
     for name in members:
         protocol_member, fake_member = getattr(BrokerRead, name), getattr(FakeRead, name)
         assert inspect.iscoroutinefunction(fake_member)

@@ -29,6 +29,7 @@ from common.environment import get_env_var
 from common.errors.vocabulary import InvalidRequestError, Reason
 from data.ingest.app.brokers.alpaca import broker_api
 from data.ingest.app.brokers.alpaca.asset_attempt import AssetListAttemptRunner, AssetListWork
+from data.ingest.app.brokers.alpaca.corporate_actions_attempt import CorporateActionsAttemptRunner, CorporateActionsWork
 from data.ingest.app.brokers.alpaca.read import AlpacaRead
 from data.ingest.app.brokers.bars_attempt import BarsAttemptRunner, BarsWork
 from data.ingest.app.brokers.handle import BrokerHandle, Intake
@@ -77,10 +78,13 @@ class _EnvCredentials:
 
 
 def estimate_request_calls(request: ScheduledRequest, page_size: int) -> int:
-    """Estimate the vendor calls any request of this handle costs: one for an asset list, else its bars pages.
+    """Estimate the vendor calls any request of this handle costs.
+
+    One for an asset list or a corporate-actions read, else a bars request's pages. A corporate-actions read is one call per 1000 records of one symbol's window, and a symbol rarely has so many in
+    any window, so its estimate is the one page it nearly always is; the real count is the tally of the attempt.
 
     Args:
-        request (ScheduledRequest): A request whose payload is BarsWork or AssetListWork.
+        request (ScheduledRequest): A request whose payload is BarsWork, AssetListWork or CorporateActionsWork.
         page_size (int): Rows per vendor page.
 
     Returns:
@@ -88,6 +92,8 @@ def estimate_request_calls(request: ScheduledRequest, page_size: int) -> int:
     """
     if isinstance(request.payload, AssetListWork):
         # The whole list is one HTTP request, no pagination (P27a s1).
+        return 1
+    if isinstance(request.payload, CorporateActionsWork):
         return 1
     return estimate_bars_calls(request, page_size)
 
@@ -128,21 +134,27 @@ def executor_settings_from_env() -> ExecutorSettings:
 class _KindRunner:
     """The handle's AttemptRunner: hands each request to the runner of its kind, by its payload."""
 
-    def __init__(self, bars: AttemptRunner, assets: AttemptRunner) -> None:
+    def __init__(self, bars: AttemptRunner, assets: AttemptRunner, actions: AttemptRunner) -> None:
         self.__bars = bars
         self.__assets = assets
+        self.__actions = actions
 
     async def __call__(self, request: ScheduledRequest, attempt_no: int) -> AttemptResult:
         """Run one attempt with the runner of the request's kind.
 
         Args:
-            request (ScheduledRequest): A request whose payload is BarsWork or AssetListWork.
+            request (ScheduledRequest): A request whose payload is BarsWork, AssetListWork or CorporateActionsWork.
             attempt_no (int): The attempt's number.
 
         Returns:
             AttemptResult: What that runner reports.
         """
-        runner = self.__assets if isinstance(request.payload, AssetListWork) else self.__bars
+        if isinstance(request.payload, AssetListWork):
+            runner = self.__assets
+        elif isinstance(request.payload, CorporateActionsWork):
+            runner = self.__actions
+        else:
+            runner = self.__bars
         return await runner(request, attempt_no)
 
 
@@ -180,7 +192,9 @@ class AlpacaHandle(BrokerHandle):
         executor = AckGatedExecutor(
             name=ALPACA_DATA_SCOPE,
             scheduler=scheduler,
-            run_attempt=_KindRunner(BarsAttemptRunner(reader), AssetListAttemptRunner(reader)),
+            run_attempt=_KindRunner(
+                BarsAttemptRunner(reader), AssetListAttemptRunner(reader), CorporateActionsAttemptRunner(reader)
+            ),
             settings=settings if settings is not None else executor_settings_from_env(),
             on_finished=self.finished,
         )
@@ -193,6 +207,7 @@ class AlpacaHandle(BrokerHandle):
             resolve_feed=broker_api.resolve_feed,
         )
         self.register_intake(RequestKind.ASSET_LIST, self.__asset_list_intake)
+        self.register_intake(RequestKind.CORPORATE_ACTIONS, self.__corporate_actions_intake)
 
     @staticmethod
     def __asset_list_intake(request: SubmitRequest) -> Intake:
@@ -220,4 +235,28 @@ class AlpacaHandle(BrokerHandle):
             )
         return Intake(
             scope=ALPACA_TRADING_SCOPE, payload=AssetListWork(request=listing, priority=RequestPriority.BACKFILL)
+        )
+
+    @staticmethod
+    def __corporate_actions_intake(request: SubmitRequest) -> Intake:
+        """The corporate_actions kind's intake: on the DATA scope at BACKFILL priority, with no tape.
+
+        The endpoint is on the market-data host, so its pages are paced on the data scope the bars use. The request has
+        no asset type and Alpaca's endpoint is stocks: nothing here to refuse by type. SubmitAccepted.feed is None and
+        the ScheduledRequest.feed stays None, so an EXPIRED or EXHAUSTED report of it is FEED_UNSPECIFIED.
+
+        Args:
+            request (SubmitRequest): A corporate-actions request.
+
+        Returns:
+            Intake: The data scope, the CorporateActionsWork, no feed.
+
+        Raises:
+            InvalidRequestError: INVALID_REQUEST if the request carries no corporate-actions body.
+        """
+        actions = request.corporate_actions
+        if actions is None:
+            raise InvalidRequestError(Reason.INVALID_REQUEST, f'{request.kind.value} requests are not served yet')
+        return Intake(
+            scope=ALPACA_DATA_SCOPE, payload=CorporateActionsWork(request=actions, priority=RequestPriority.BACKFILL)
         )

@@ -372,8 +372,102 @@ class AssetLookupFailure:
     error: TraderJoeError
 
 
+@dataclass(frozen=True)
+class CorporateActionsQuery:
+    """One request for a broker's corporate actions for one symbol over an explicit window.
+
+    Attributes:
+        symbol (str): The ticker to read, as the caller holds it. The broker may match it on either side of an action
+            (a name change is found by its old and its new symbol).
+        start (datetime): Inclusive start of the window, timezone aware.
+        end (datetime): Exclusive end of the window, timezone aware.
+        priority (RequestPriority): The platform's priority class for the vendor calls.
+        deadline (datetime | None): When the caller stops waiting, timezone aware, or None for no bound.
+        tally (CallTally | None): Counts the vendor calls this query makes, for the attempt's report.
+    """
+
+    symbol: str
+    start: datetime
+    end: datetime
+    priority: RequestPriority = field(kw_only=True)
+    deadline: datetime | None = field(default=None, kw_only=True)
+    tally: CallTally | None = field(default=None, kw_only=True)
+
+
+@dataclass(frozen=True)
+class CorporateAction:
+    """One broker corporate action, carried RAW: a few neutral fields beside the broker's own record, untouched.
+
+    Nothing here is a judgement and no type is filtered: the store decides what an action is worth. A date the broker
+    did not give is None.
+
+    Attributes:
+        vendor_action_id (str): The broker's id for the action, OPAQUE.
+        action_type (str): The broker's own wording of the type (its group name), uninterpreted.
+        raw_payload (bytes): The broker's record as served, byte for byte.
+        ex_date (datetime | None): The broker's ex date, midnight UTC of the day it gave.
+        record_date (datetime | None): The broker's record date, likewise.
+        payable_date (datetime | None): The broker's payable date, likewise.
+        process_date (datetime | None): The broker's process date, likewise.
+        effective_date (datetime | None): The broker's effective date, likewise.
+        identifiers (Mapping[str, str]): Every instrument identifier the broker gave (symbols, CUSIPs, ISINs, role-named
+            ones included), keyed by the broker's own field name.
+    """
+
+    vendor_action_id: str
+    action_type: str
+    raw_payload: bytes
+    ex_date: datetime | None = None
+    record_date: datetime | None = None
+    payable_date: datetime | None = None
+    process_date: datetime | None = None
+    effective_date: datetime | None = None
+    identifiers: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CorporateActionsResponse:
+    """The SERVED outcome of a corporate-actions read: every action the broker returned for the window, maybe none.
+
+    Attributes:
+        actions (Sequence[CorporateAction]): The actions in the order the broker served them, every page followed.
+        as_of (datetime): When the last page was answered, timezone aware, UTC.
+    """
+
+    actions: Sequence[CorporateAction]
+    as_of: datetime
+
+
+@dataclass(frozen=True)
+class CorporateActionsFailure:
+    """A failure get_corporate_actions RETURNS rather than raises.
+
+    Attributes:
+        error (TraderJoeError): The typed error; the caught vendor exception, where there is one, is its __cause__.
+    """
+
+    error: TraderJoeError
+
+
 class BrokerRead(Protocol):
     """What data_ingest reads from a broker."""
+
+    async def get_corporate_actions(
+        self, query: CorporateActionsQuery
+    ) -> CorporateActionsResponse | CorporateActionsFailure:
+        """Fetch a broker's corporate actions for one symbol over a window, every page, nothing filtered.
+
+        Returns a CorporateActionsFailure, and never raises, for a failure that is expected: a missing credential or
+        configuration, a rate budget that cannot admit a call before query.deadline, and a vendor that refuses or
+        cannot answer. A failure on any page fails the whole read: never a partial list. A bug still raises.
+
+        Args:
+            query (CorporateActionsQuery): The symbol and the window.
+
+        Returns:
+            CorporateActionsResponse | CorporateActionsFailure: Every action served, or the typed failure.
+        """
+        ...
 
     async def get_assets(self, query: AssetListQuery) -> AssetListResponse | AssetListFailure:
         """Fetch one of the broker's asset lists, whole.

@@ -443,8 +443,7 @@ async def test_an_asset_list_of_a_kind_other_than_stock_is_refused_and_never_hel
     assert handle.active == 0
 
 
-# Corporate actions still falling through to BrokerHandle.submit's refusal is pinned by
-# test_ack_gated_retry.test_the_handle_itself_refuses_a_kind_not_served_yet.
+# Corporate actions are served by the handle since tj-7zjov1.23: test_alpaca_corporate_actions_attempt.py.
 
 
 class ChargeSpy:

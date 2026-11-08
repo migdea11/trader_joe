@@ -13,8 +13,9 @@ bare BrokerHandle, and pass-through spies on the handle's own scheduler and exec
 the queue and report_exhausted in the order they are called, so "charged before it is queued" is observed, not
 inferred. No vendor key is read and no vendor is reached.
 
-The tail tests are parametrised over BOTH of AlpacaHandle's kinds (bars and asset_list), so a change to the
-shared tail reds a test of each kind, which is what the bead's acceptance asks of the validator's mutants.
+The tail tests are parametrised over EVERY one of AlpacaHandle's kinds (bars and asset_list, and corporate_actions
+since tj-7zjov1.23), so a change to the shared tail reds a test of each kind, which is what the bead's acceptance
+asks of the validator's mutants.
 """
 
 import asyncio
@@ -30,6 +31,7 @@ from common.enums.data_stock import DataSource, Feed, Granularity, UpdateType
 from common.errors.vocabulary import ERROR_DOMAIN, InvalidRequestError, Reason
 from data.ingest.app.brokers.alpaca import broker_api
 from data.ingest.app.brokers.alpaca.asset_attempt import AssetListWork
+from data.ingest.app.brokers.alpaca.corporate_actions_attempt import CorporateActionsWork
 from data.ingest.app.brokers.alpaca.handle import ALPACA_DATA_SCOPE, ALPACA_TRADING_SCOPE, AlpacaHandle
 from data.ingest.app.brokers.bars_attempt import BarsWork
 from data.ingest.app.brokers.handle import BrokerHandle, Intake
@@ -103,7 +105,7 @@ def actions_submit(request_id: str = 'req-1', **overrides) -> SubmitRequest:
 
 @dataclass(frozen=True)
 class Kind:
-    """One of AlpacaHandle's two kinds: how to build its request and what its ack and queued request carry."""
+    """One of AlpacaHandle's kinds: how to build its request and what its ack and queued request carry."""
 
     name: str
     build: object
@@ -117,7 +119,9 @@ class Kind:
 
 BARS = Kind('bars', bars_submit, ALPACA_DATA_SCOPE, Feed.IEX, BarsWork)
 ASSET_LIST = Kind('asset_list', asset_list_submit, ALPACA_TRADING_SCOPE, None, AssetListWork)
-BOTH_KINDS = pytest.mark.parametrize('kind', [BARS, ASSET_LIST], ids=lambda kind: kind.name)
+CORPORATE_ACTIONS = Kind('corporate_actions', actions_submit, ALPACA_DATA_SCOPE, None, CorporateActionsWork)
+# Every kind AlpacaHandle registers (bars and asset_list from P12r, corporate_actions from P13, tj-7zjov1.23).
+EVERY_KIND = pytest.mark.parametrize('kind', [BARS, ASSET_LIST, CORPORATE_ACTIONS], ids=lambda kind: kind.name)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -412,14 +416,18 @@ async def test_an_unregistered_kind_raises_invalid_request_with_the_old_detail_o
 
 
 @pytest.mark.asyncio
-async def test_an_unregistered_kind_raises_invalid_request_with_the_old_detail_on_the_alpaca_handle(alpaca):
-    with pytest.raises(InvalidRequestError) as raised:
-        await alpaca.handle.submit(actions_submit('ca-1'))
+async def test_the_alpaca_handle_has_every_kind_registered_so_corporate_actions_are_queued_not_refused(alpaca, tape):
+    """FLIPPED by tj-7zjov1.23: it pinned corporate_actions as the Alpaca handle's unregistered kind.
 
-    assert raised.value.reason is Reason.INVALID_REQUEST
-    assert raised.value.detail == 'corporate_actions requests are not served yet'
-    assert alpaca.order == []
-    assert alpaca.handle.active == 0
+    P13 registers it, so no kind is left unregistered on AlpacaHandle; the unregistered-kind refusal stays pinned
+    on the bare handle above. The registered intake is queued through the shared tail with no tape.
+    """
+    ack = await alpaca.handle.submit(actions_submit('ca-1'))
+
+    assert ack == SubmitAck(accepted=SubmitAccepted(feed=None, quota_key=ALPACA_DATA_SCOPE))
+    assert alpaca.order == [('queue', 'ca-1')]
+    assert alpaca.handle.active == 1
+    assert tape.calls == 0, 'the tape was resolved for a kind that has none'
 
 
 def bodiless(kind: RequestKind) -> SimpleNamespace:
@@ -442,7 +450,7 @@ def bodiless(kind: RequestKind) -> SimpleNamespace:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('kind', [RequestKind.BARS, RequestKind.ASSET_LIST], ids=lambda kind: kind.value)
+@pytest.mark.parametrize('kind', list(RequestKind), ids=lambda kind: kind.value)
 async def test_a_kind_with_its_body_missing_raises_invalid_request_with_the_old_detail(alpaca, kind):
     with pytest.raises(InvalidRequestError) as raised:
         await alpaca.handle.submit(bodiless(kind))
@@ -459,7 +467,7 @@ async def test_a_kind_with_its_body_missing_raises_invalid_request_with_the_old_
 
 
 @pytest.mark.asyncio
-@BOTH_KINDS
+@EVERY_KIND
 async def test_the_tape_comes_from_the_kinds_intake_alone_and_is_resolved_at_most_once(alpaca, tape, kind):
     ack = await alpaca.handle.submit(kind.submit('r-1'))
 
@@ -473,7 +481,7 @@ async def test_the_tape_comes_from_the_kinds_intake_alone_and_is_resolved_at_mos
 
 
 @pytest.mark.asyncio
-@BOTH_KINDS
+@EVERY_KIND
 @pytest.mark.parametrize('recovered', [False, True])
 async def test_a_duplicate_id_is_answered_with_the_same_accept_ack_and_is_neither_queued_nor_charged_again(
     alpaca, kind, recovered
@@ -490,7 +498,7 @@ async def test_a_duplicate_id_is_answered_with_the_same_accept_ack_and_is_neithe
 
 
 @pytest.mark.asyncio
-@BOTH_KINDS
+@EVERY_KIND
 async def test_a_recovered_request_is_charged_before_it_is_queued(alpaca, kind):
     await alpaca.handle.submit(kind.submit('r-1', recovered=True, attempt_count=2))
 
@@ -499,7 +507,7 @@ async def test_a_recovered_request_is_charged_before_it_is_queued(alpaca, kind):
 
 
 @pytest.mark.asyncio
-@BOTH_KINDS
+@EVERY_KIND
 async def test_a_request_not_flagged_recovered_is_queued_and_never_charged(alpaca, kind):
     await alpaca.handle.submit(kind.submit('r-1', attempt_count=2))
 
@@ -507,7 +515,7 @@ async def test_a_request_not_flagged_recovered_is_queued_and_never_charged(alpac
 
 
 @pytest.mark.asyncio
-@BOTH_KINDS
+@EVERY_KIND
 @pytest.mark.parametrize('recovered', [False, True])
 async def test_an_exhausted_request_is_reported_and_never_queued_and_charged_first_only_if_recovered(
     alpaca, kind, recovered
@@ -535,7 +543,7 @@ async def test_an_exhausted_request_is_reported_and_never_queued_and_charged_fir
 
 
 @pytest.mark.asyncio
-@BOTH_KINDS
+@EVERY_KIND
 async def test_finished_frees_the_id_so_the_same_id_is_queued_afresh(alpaca, kind):
     handle = alpaca.handle
 

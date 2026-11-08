@@ -1,0 +1,20 @@
+{
+  "provenance": {
+    "kind": "recorded",
+    "recorded_at": "2026-10-24T19:43:00.821760+00:00",
+    "endpoint": "GET https://data.alpaca.markets/v1/corporate-actions",
+    "params": {
+      "symbols": "META,FB,SQ,XYZ",
+      "types": "name_change",
+      "start": "2015-01-01",
+      "end": "2026-10-24",
+      "limit": "1000",
+      "sort": "asc"
+    },
+    "byte_length": 544,
+    "sha256": "01c5694de41ee3ffa578f311d49dc0e49301189f3bc6f9977881aa529a69a995",
+    "note": "Captured through the dev vendor probe (P27a s10/s10x, tj-7zjov1.7). body_text is the body as served, byte for byte: its length and sha256 are the capture's own."
+  },
+  "status": 200,
+  "body_text": "{\"corporate_actions\":{\"name_changes\":[{\"id\":\"ed6f16b1-fc46-443e-8dba-898ed9007a7a\",\"new_cusip\":\"30303M102\",\"new_symbol\":\"META\",\"old_cusip\":\"30303M102\",\"old_symbol\":\"FB\",\"process_date\":\"2022-06-09\"},{\"id\":\"19a51822-eda9-40e2-9301-b8958c74a003\",\"new_cusip\":\"53656F417\",\"new_symbol\":\"METV\",\"old_cusip\":\"53656F417\",\"old_symbol\":\"META\",\"process_date\":\"2022-01-31\"},{\"id\":\"959d6941-3cb9-4b2d-a282-543a0a3f05d1\",\"new_cusip\":\"852234103\",\"new_symbol\":\"XYZ\",\"old_cusip\":\"852234103\",\"old_symbol\":\"SQ\",\"process_date\":\"2025-01-21\"}]},\"next_page_token\":null}"
+}

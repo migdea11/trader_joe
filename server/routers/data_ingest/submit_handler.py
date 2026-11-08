@@ -9,8 +9,8 @@ reports to the store happen behind the queue (data/ingest/app/brokers/handle.py)
 routed by the request's source. What is knowable before the vendor is checked here, before the ack, as FetchDataset
 does (routers/data_ingest/bars_validation.py).
 
-Only bars requests are served in this release. The asset list and corporate actions are request kinds the Alpaca
-handle gains with P12 and P13 (tj-7zjov1.22, .23); until then they are refused as INVALID_REQUEST.
+Bars and corporate-actions requests are served in this release. The asset list is served from P12s (tj-7zjov1.125),
+once the store can write it; until then it is refused as INVALID_REQUEST, with nothing queued.
 """
 
 from collections.abc import Mapping
@@ -47,14 +47,19 @@ class IngestSubmitHandler:
 
         Raises:
             InvalidRequestError: UNSUPPORTED_ASSET_TYPE or INVALID_REQUEST for a bars request this service cannot
-                serve, and INVALID_REQUEST for a kind not served yet. All are known before any vendor call.
+                serve, and INVALID_REQUEST for a kind not served yet (the asset list). All are known before any
+                vendor call.
             NotImplementedError: If no handle serves the request's source.
         """
-        if request.kind is not RequestKind.BARS or request.bars is None:
+        if request.kind is RequestKind.BARS and request.bars is not None:
+            bars = request.bars
+            validate_bars_request(bars.data_types, bars.asset_type)
+            source = bars.source
+        elif request.kind is RequestKind.CORPORATE_ACTIONS and request.corporate_actions is not None:
+            source = request.corporate_actions.source
+        else:
             raise InvalidRequestError(Reason.INVALID_REQUEST, f'{request.kind.value} requests are not served yet')
-        bars = request.bars
-        validate_bars_request(bars.data_types, bars.asset_type)
-        handle = self._handles.get(bars.source)
+        handle = self._handles.get(source)
         if handle is None:
-            raise NotImplementedError(f'data source not implemented: source={bars.source!r}')
+            raise NotImplementedError(f'data source not implemented: source={source!r}')
         return SubmitResponse(ack=await handle.submit(request), instance_id=self._instance_id)

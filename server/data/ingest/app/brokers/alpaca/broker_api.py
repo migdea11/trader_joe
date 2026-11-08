@@ -8,6 +8,7 @@ from http import HTTPStatus
 from alpaca.common.constants import DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_WAIT_SECONDS
 from alpaca.common.exceptions import APIError
 from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.historical.corporate_actions import CorporateActionsClient
 from alpaca.data.models.bars import BarSet
 from alpaca.data.models.quotes import Quote
 from alpaca.data.requests import (
@@ -28,8 +29,9 @@ from common.errors.vocabulary import InvalidRequestError, Reason
 from common.logging import get_logger, register_secret
 from common.sensitive import OpaqueStr
 from data.ingest.app.brokers.alpaca.classify import reset_from_rate_limit_header
+from data.ingest.app.brokers.alpaca.corporate_actions import parse_corporate_actions_page
 from data.ingest.app.brokers.broker_errors import MalformedCredentialsError, MissingCredentialsError
-from data.ingest.app.brokers.interface import BarsQuery, CallTally
+from data.ingest.app.brokers.interface import BarsQuery, CallTally, CorporateAction
 from data.ingest.app.brokers.rate_budget import RequestPriority
 from data.ingest.app.brokers.request_key import VendorRequestKey
 from data.ingest.app.brokers.single_flight import SingleFlight
@@ -53,10 +55,16 @@ ALPACA_TRADING_HOST_VAR = 'ALPACA_TRADING_BASE_URL'
 
 BARS_PATH = '/stocks/bars'
 ASSETS_PATH = '/assets'
+CORPORATE_ACTIONS_PATH = '/corporate-actions'
 
 # The most rows one page of a bars call returns. The SDK's own bars call asks for the same (get_stock_bars,
 # page_size=10_000), so a read costs the pages it cost before.
 BARS_PAGE_SIZE = 10_000
+
+# The most records one page of a corporate-actions call returns (the vendor's limit parameter caps at 1000), and the page
+# count past which a read is refused as a vendor that never ends: a million records for one symbol is not a window.
+CORPORATE_ACTIONS_PAGE_SIZE = 1000
+CORPORATE_ACTIONS_MAX_PAGES = 1000
 
 # How many times one page that answered 504 is asked again, and how long to wait before each, taken from the
 # SDK's own defaults so a 504 is retried as it always was. Only now every retry acquires from the scheduler.
@@ -67,6 +75,7 @@ _RETRIED_STATUS = 504
 
 __CLIENT: StockHistoricalDataClient | None = None
 __TRADING_CLIENT: TradingClient | None = None
+__CORPORATE_ACTIONS_CLIENT: CorporateActionsClient | None = None
 __SINGLE_FLIGHT = SingleFlight()
 # The instant the vendor's rate-limit window resets, per quota scope, read from the headers of the last response of
 # that scope that named one. Touched only on the event loop.
@@ -280,6 +289,37 @@ def set_trading_client(client: TradingClient | None) -> None:
     __TRADING_CLIENT = client
 
 
+def get_corporate_actions_client() -> CorporateActionsClient:
+    """Get this process's Alpaca corporate-actions client, building it on first use.
+
+    The corporate-actions endpoint is on the market-data host under /v1 (the stock bars client is /v2 on the same
+    host), so it takes its own SDK client. Built lazily like get_client, from the same checked credentials, wrapped the
+    same way. The host is the SDK's data host: nothing here is configuration.
+
+    Returns:
+        CorporateActionsClient: Shared client for every corporate-actions call this process makes.
+
+    Raises:
+        MissingCredentialsError: If either credential variable is unset or empty.
+        MalformedCredentialsError: If either credential value is not non-empty visible ASCII.
+    """
+    global __CORPORATE_ACTIONS_CLIENT
+    if __CORPORATE_ACTIONS_CLIENT is None:
+        key_id, secret = _checked_credentials()
+        __CORPORATE_ACTIONS_CLIENT = CorporateActionsClient(OpaqueStr(key_id), OpaqueStr(secret))
+    return __CORPORATE_ACTIONS_CLIENT
+
+
+def set_corporate_actions_client(client: CorporateActionsClient | None) -> None:
+    """Install a corporate-actions client for this process, or clear the one already built. The injection seam.
+
+    Args:
+        client (CorporateActionsClient | None): Client to use, or None to clear.
+    """
+    global __CORPORATE_ACTIONS_CLIENT
+    __CORPORATE_ACTIONS_CLIENT = client
+
+
 def create_stock_quote(data: Quote, symbol: str, granularity: Granularity, source: DataSource) -> None:
     return None
 
@@ -368,15 +408,17 @@ class RawPage:
     headers: Mapping[str, str]
 
 
-def request_raw(client: TradingClient, path: str, params: dict | None = None) -> RawPage:
-    """Make exactly one HTTP GET to the trading API, with no retry and no sleep, and keep the body as served.
+def request_raw(client: TradingClient | CorporateActionsClient, path: str, params: dict | None = None) -> RawPage:
+    """Make exactly one HTTP GET, with no retry and no sleep, and keep the body as served.
 
-    The sibling of request_page for a body that is not a JSON object (the asset list is an array) and that the
-    caller slices byte for byte. Same URL construction, same headers (the client's own, from the checked credential),
+    Serves the trading API and the data API's v1 corporate-actions endpoint. The sibling of request_page for a body that is not a JSON object (the asset list is an array) or that the
+    caller slices byte for byte (the corporate-actions page). It charges and classifies nothing: read_raw does, on the
+    scope its caller names. Same URL construction, same headers (the client's own, from the checked credential),
     same allow_redirects=False, same APIError for an error status. Blocking; run it on the worker pool.
 
     Args:
-        client (TradingClient): The client whose session, base URL and auth headers are used.
+        client (TradingClient | CorporateActionsClient): The client whose session, base URL, API version and auth
+            headers are used.
         path (str): The endpoint path, such as ASSETS_PATH.
         params (dict | None): The query parameters.
 
@@ -398,9 +440,9 @@ def request_raw(client: TradingClient, path: str, params: dict | None = None) ->
     return RawPage(content=response.content, headers=response.headers)
 
 
-async def read_trading(
+async def read_raw(
     executor: ThreadPoolExecutor,
-    client: TradingClient,
+    client: TradingClient | CorporateActionsClient,
     path: str,
     params: dict | None,
     *,
@@ -410,18 +452,19 @@ async def read_trading(
     deadline: datetime | None,
     tally: CallTally | None = None,
 ) -> RawPage:
-    """Make one paced trading-API read: one scheduler token on the trading scope, one HTTP request.
+    """Make one paced raw read: one scheduler token on the scope given, one HTTP request.
 
-    Never retries (the executor retries the whole attempt) and never charges the data scope. The reset the response
-    names, good or bad, is remembered for the trading scope.
+    Serves the trading API and the data API's v1 corporate-actions endpoint alike. Never retries (the executor
+    retries the whole attempt). Charges only the scope the caller names, and the reset the response names, good or
+    bad, is remembered on that same scope.
 
     Args:
         executor (ThreadPoolExecutor): Pool the blocking request runs on.
-        client (TradingClient): The checked trading client.
+        client (TradingClient | CorporateActionsClient): The checked client.
         path (str): The endpoint path.
         params (dict | None): The query parameters.
         scheduler (Scheduler): The handle's scheduler.
-        scope (str): The trading-API quota scope.
+        scope (str): The quota scope to charge: the trading API's or the market-data API's, as the caller's endpoint.
         priority (RequestPriority): The priority class of the acquire.
         deadline (datetime | None): When the caller stops waiting, or None.
         tally (CallTally | None): Counts the call, a good page and a 429, or None when nobody reads them.
@@ -449,6 +492,74 @@ async def read_trading(
     if tally is not None:
         tally.record_page()
     return page
+
+
+async def read_corporate_action_pages(
+    executor: ThreadPoolExecutor,
+    client: CorporateActionsClient,
+    params: dict,
+    *,
+    scheduler: Scheduler,
+    scope: str,
+    priority: RequestPriority,
+    deadline: datetime | None,
+    tally: CallTally | None,
+) -> list[CorporateAction]:
+    """Read every page of a corporate-actions window, one scheduler token per HTTP request, bodies kept as served.
+
+    Follows next_page_token until the vendor gives none. Every page acquires first, under the same deadline, and is
+    counted on the tally. Never retries a page (the executor retries the whole attempt), so a failure on any page
+    drops the pages already read with it: a partial list is never a served window.
+
+    PROGRESS GUARD. A token the vendor already gave in this read, or a read past CORPORATE_ACTIONS_MAX_PAGES pages,
+    is a vendor that does not end; it raises rather than looping on the quota.
+
+    Args:
+        executor (ThreadPoolExecutor): Pool the blocking request runs on.
+        client (CorporateActionsClient): The checked client.
+        params (dict): The request fields without paging parameters.
+        scheduler (Scheduler): The handle's scheduler.
+        scope (str): The quota scope charged: the market-data API's.
+        priority (RequestPriority): The priority class of every acquire.
+        deadline (datetime | None): When the caller stops waiting, or None.
+        tally (CallTally | None): Counts calls, pages and 429s, or None when nobody reads them.
+
+    Returns:
+        list[CorporateAction]: Every record of every page, in the order served.
+
+    Raises:
+        ExogenousError: With the reason RATE_BUDGET, when any acquire cannot be admitted before the deadline.
+        alpaca.common.exceptions.APIError: If the vendor answers an error status.
+        requests.exceptions.RequestException: If the vendor cannot be reached or the connection is cut.
+        ValueError: If a page is not a corporate-actions page, or the vendor repeats a token or never ends.
+    """
+    actions: list[CorporateAction] = []
+    seen_tokens: set[str] = set()
+    page_token: str | None = None
+    for _ in range(CORPORATE_ACTIONS_MAX_PAGES):
+        page_params = {**params, 'limit': CORPORATE_ACTIONS_PAGE_SIZE}
+        if page_token is not None:
+            page_params['page_token'] = page_token
+        page = await read_raw(
+            executor,
+            client,
+            CORPORATE_ACTIONS_PATH,
+            page_params,
+            scheduler=scheduler,
+            scope=scope,
+            priority=priority,
+            deadline=deadline,
+            tally=tally,
+        )
+        parsed = parse_corporate_actions_page(page.content)
+        actions.extend(parsed.actions)
+        page_token = parsed.next_page_token
+        if page_token is None:
+            return actions
+        if page_token in seen_tokens:
+            raise ValueError('The vendor repeated a corporate-actions page token, so the read does not end')
+        seen_tokens.add(page_token)
+    raise ValueError(f'The vendor served more than {CORPORATE_ACTIONS_MAX_PAGES} corporate-actions pages')
 
 
 async def read_bars_pages(

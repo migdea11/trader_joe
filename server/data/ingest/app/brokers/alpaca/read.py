@@ -1,12 +1,13 @@
 from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time, timedelta
 from http import HTTPStatus
 from urllib.parse import quote
 
 from alpaca.common.exceptions import APIError
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.historical.corporate_actions import CorporateActionsClient
 from alpaca.data.models.bars import BarSet
 from alpaca.trading.client import TradingClient
 
@@ -33,6 +34,9 @@ from data.ingest.app.brokers.interface import (
     BarsResponse,
     BrokerUnsupportedError,
     CallTally,
+    CorporateActionsFailure,
+    CorporateActionsQuery,
+    CorporateActionsResponse,
     ServedRange,
 )
 from data.ingest.app.brokers.rate_budget import RequestPriority
@@ -51,6 +55,13 @@ ASSET_CLASS_US_EQUITY = 'us_equity'
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _utc_day_rounded_up(moment: datetime) -> date:
+    """Give the UTC day of moment, or the next day unless moment is exactly midnight UTC."""
+    utc = moment.astimezone(UTC)
+    day = utc.date()
+    return day if utc.time() == time.min else day + timedelta(days=1)
 
 
 class AlpacaRead:
@@ -75,6 +86,8 @@ class AlpacaRead:
         scope (str): The quota scope those calls are charged to.
         trading_client (TradingClient | None): Client for the asset reads, or None to use this process's own
             (broker_api.get_trading_client()), resolved on each call so it stays lazy.
+        corporate_actions_client (CorporateActionsClient | None): Client for the corporate-actions read, or None to use
+            this process's own (broker_api.get_corporate_actions_client()), resolved on each call so it stays lazy.
         trading_scope (str | None): The trading-API quota scope the asset reads are charged to, apart from `scope`
             so they never count against the data API. None for a reader built without asset reads; calling one then
             is a bug and raises.
@@ -89,11 +102,13 @@ class AlpacaRead:
         scheduler: Scheduler,
         scope: str,
         trading_client: TradingClient | None = None,
+        corporate_actions_client: CorporateActionsClient | None = None,
         trading_scope: str | None = None,
     ) -> None:
         self.__scheduler = scheduler
         self.__scope = scope
         self.__trading_client = trading_client
+        self.__corporate_actions_client = corporate_actions_client
         self.__trading_scope = trading_scope
         self.__client = client
         self.__executor_provider = executor_provider if executor_provider is not None else SharedWorkerPool.get_instance
@@ -267,7 +282,7 @@ class AlpacaRead:
                 )
             )
         try:
-            page = await self.__read_trading(
+            page = await self.__read_raw(
                 broker_api.ASSETS_PATH,
                 {'status': query.status.value, 'asset_class': ASSET_CLASS_US_EQUITY},
                 query.priority,
@@ -277,7 +292,7 @@ class AlpacaRead:
         except TraderJoeError as e:
             return AssetListFailure(e)
         except VENDOR_FAILURES as e:
-            return AssetListFailure(self.__classify_trading(e))
+            return AssetListFailure(self.__classify(e, self.__trading_scope or self.__scope))
         as_of = self.__clock().astimezone(UTC)
         return AssetListResponse(assets=parse_asset_list(page.content), as_of=as_of)
 
@@ -302,7 +317,7 @@ class AlpacaRead:
         if not query.symbol.strip():
             return AssetLookupFailure(InvalidRequestError(Reason.INVALID_REQUEST, 'An asset lookup needs a symbol'))
         try:
-            page = await self.__read_trading(
+            page = await self.__read_raw(
                 f'{broker_api.ASSETS_PATH}/{quote(query.symbol, safe="")}', None, query.priority, query.deadline, None
             )
         except TraderJoeError as e:
@@ -310,11 +325,78 @@ class AlpacaRead:
         except VENDOR_FAILURES as e:
             if isinstance(e, APIError) and e.status_code == HTTPStatus.NOT_FOUND:
                 return AssetNotFound(symbol=query.symbol, as_of=self.__clock().astimezone(UTC))
-            return AssetLookupFailure(self.__classify_trading(e))
+            return AssetLookupFailure(self.__classify(e, self.__trading_scope or self.__scope))
         as_of = self.__clock().astimezone(UTC)
         return AssetResponse(asset=parse_asset(page.content), as_of=as_of)
 
-    async def __read_trading(
+    async def get_corporate_actions(
+        self, query: CorporateActionsQuery
+    ) -> CorporateActionsResponse | CorporateActionsFailure:
+        """Fetch Alpaca's corporate actions for one symbol over a window, every page, nothing filtered.
+
+        Sends the symbol and the window's days (sorted ascending, no type filter: the store decides which types it
+        wants) and follows the page token to the end, one scheduler token per page on the DATA scope. The vendor
+        matches the symbol on either side of an action. The window is sent as UTC days: the start's own day (rounded
+        down) and the end's day rounded up, the next day unless the end is exactly midnight UTC. The vendor's
+        treatment of its end day is unconfirmed, so the read is a superset whether it counts that day inclusively or
+        not: a record beyond the window may be returned (the store keeps every record and recognises repeats by
+        vendor id and payload), and none inside it is missed. Nothing is filtered afterwards. The bodies are read as
+        served, not through the SDK model (see corporate_actions.py). A failure on any page fails the whole read.
+
+        Args:
+            query (CorporateActionsQuery): The symbol and the window.
+
+        Returns:
+            CorporateActionsResponse | CorporateActionsFailure: Every action served, or the failure: INVALID_REQUEST
+                for an empty symbol or a window that ends at or before its start (before any vendor call), VENDOR_AUTH
+                for a missing or malformed credential or a 401 or 403 (the entitlement too), VENDOR_RATE_LIMITED with
+                its reset_at for a 429, VENDOR_UNAVAILABLE for a 5xx, a connection error or a timeout, another vendor
+                status as the bars read classifies it, and RATE_BUDGET for the rate budget's own refusal.
+
+        Raises:
+            ValueError: If a page is not a corporate-actions page, or the vendor repeats a page token or never ends.
+                Vendor corruption, loud.
+        """
+        if not query.symbol.strip():
+            return CorporateActionsFailure(
+                InvalidRequestError(Reason.INVALID_REQUEST, 'A corporate-actions read needs a symbol')
+            )
+        if query.end <= query.start:
+            return CorporateActionsFailure(
+                InvalidRequestError(Reason.INVALID_REQUEST, 'A corporate-actions window must end after it starts')
+            )
+        try:
+            client = (
+                self.__corporate_actions_client
+                if self.__corporate_actions_client is not None
+                else broker_api.get_corporate_actions_client()
+            )
+        except (MissingCredentialsError, MalformedCredentialsError) as e:
+            return CorporateActionsFailure(e)
+        params = {
+            'symbols': query.symbol,
+            'start': query.start.astimezone(UTC).date().isoformat(),
+            'end': _utc_day_rounded_up(query.end).isoformat(),
+            'sort': 'asc',
+        }
+        try:
+            actions = await broker_api.read_corporate_action_pages(
+                self.__executor_provider(),
+                client,
+                params,
+                scheduler=self.__scheduler,
+                scope=self.__scope,
+                priority=query.priority,
+                deadline=query.deadline,
+                tally=query.tally,
+            )
+        except TraderJoeError as e:
+            return CorporateActionsFailure(e)
+        except VENDOR_FAILURES as e:
+            return CorporateActionsFailure(self.__classify(e, self.__scope))
+        return CorporateActionsResponse(actions=actions, as_of=self.__clock().astimezone(UTC))
+
+    async def __read_raw(
         self,
         path: str,
         params: dict | None,
@@ -326,7 +408,7 @@ class AlpacaRead:
         if self.__trading_scope is None:
             raise RuntimeError('AlpacaRead was built without a trading scope, so it cannot read assets')
         client = self.__trading_client if self.__trading_client is not None else broker_api.get_trading_client()
-        return await broker_api.read_trading(
+        return await broker_api.read_raw(
             self.__executor_provider(),
             client,
             path,
@@ -338,9 +420,8 @@ class AlpacaRead:
             tally=tally,
         )
 
-    def __classify_trading(self, error: BaseException) -> TraderJoeError:
-        """Classify a failure of a trading-API read by the same table as the bars read, on the trading scope."""
-        scope = self.__trading_scope or self.__scope
+    def __classify(self, error: BaseException, scope: str) -> TraderJoeError:
+        """Classify a failure of a raw read by the same table as the bars read, on the scope the read was charged to."""
         classified = classify_vendor_error(
             error,
             rate_budget=self.__scheduler.window(scope),

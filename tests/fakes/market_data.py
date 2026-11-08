@@ -76,6 +76,12 @@ THE ASSET READS (tj-7zjov1.22, BrokerRead.get_assets and get_asset). Determinist
   up after the bars (P12h) always finds one. An empty symbol is INVALID_REQUEST, as AlpacaRead answers it. The
   fake has no not-found symbol: a test that needs AssetNotFound uses a double of its own.
 * fake_asset is a pure function of the symbol: its vendor id is a UUID5 of it, so two reads agree.
+
+THE CORPORATE-ACTIONS READ (tj-7zjov1.23, BrokerRead.get_corporate_actions). Every query, whatever its symbol and
+window, is SERVED with no actions, stamped with the fake's clock: never a failure, and no prefix scenario applies.
+Empty because the fake stands for the interface: a window with no action is the commonest real answer, and an
+invented action would be delivered and judged as if a vendor had published it. Fake corporate-action scenarios are
+P14's (tj-7zjov1.24) to design; a test that needs actions uses a double of its own.
 """
 
 import asyncio
@@ -104,6 +110,9 @@ from data.ingest.app.brokers.interface import (
     BarsQuery,
     BarsResponse,
     BrokerUnsupportedError,
+    CorporateActionsFailure,
+    CorporateActionsQuery,
+    CorporateActionsResponse,
     ServedRange,
 )
 from schemas.data_ingest.submit import AssetListStatus
@@ -454,6 +463,20 @@ class FakeRead:
         if not query.symbol.strip():
             return AssetLookupFailure(InvalidRequestError(Reason.INVALID_REQUEST, 'An asset lookup needs a symbol'))
         return AssetResponse(asset=fake_asset(query.symbol), as_of=self.__clock().astimezone(UTC))
+
+    async def get_corporate_actions(
+        self, query: CorporateActionsQuery
+    ) -> CorporateActionsResponse | CorporateActionsFailure:
+        """Serve no corporate actions for any symbol and window: the fake has none to publish.
+
+        Args:
+            query (CorporateActionsQuery): The symbol and the window, read for nothing.
+
+        Returns:
+            CorporateActionsResponse | CorporateActionsFailure: Always a response with no actions, stamped with the
+                fake's clock. Never a failure.
+        """
+        return CorporateActionsResponse(actions=[], as_of=self.__clock().astimezone(UTC))
 
     def __refusal(self, query: BarsQuery) -> BrokerUnsupportedError | InvalidRequestError | None:
         """The refusal a query earns before any "vendor" work, or None to go on to the scenario."""
