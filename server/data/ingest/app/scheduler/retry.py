@@ -10,6 +10,10 @@ from dataclasses import dataclass
 from datetime import datetime
 
 
+# The attempts one request gets, the first included, unless a handle's deployment setting lowers or raises it.
+DEFAULT_MAX_ATTEMPTS = 5
+
+
 @dataclass(frozen=True)
 class RetryPolicy:
     """How many attempts a request gets and how long to wait between them.
@@ -24,7 +28,7 @@ class RetryPolicy:
             reset further off than this is waited for in part and the next attempt finds the limit still on.
     """
 
-    max_attempts: int = 5
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS
     base_delay_s: float = 1.0
     max_delay_s: float = 60.0
     factor: float = 2.0

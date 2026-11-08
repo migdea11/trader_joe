@@ -53,8 +53,8 @@ from sqlalchemy.engine import Engine
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Granularity, UpdateType
 from common.errors.vocabulary import Reason
-from data.ingest.app.brokers.alpaca.handle import DEFAULT_MAX_ATTEMPTS
 from data.ingest.app.scheduler.executor import ExecutorSettings
+from data.ingest.app.scheduler.retry import DEFAULT_MAX_ATTEMPTS
 from data.store.app.database.models.ingest_request import (
     OPEN_STATES,
     IngestRequest,

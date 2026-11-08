@@ -10,9 +10,11 @@ THE SCOPE NAME starts with the vendor's DataSource value (ALPACA), because the d
 carries the scope under the metadata key vendor and that key must still name the vendor wherever it is rendered
 (ADR tj-fa1rpu D8). It never carries an account identifier or a credential.
 
-CONFIGURATION may only LOWER what is hard-coded here (limits.py): ALPACA_RATE_LIMIT_PER_MINUTE under the ceiling;
-ALPACA_OUTGOING_BUFFER_SIZE, ALPACA_STALL_TIMEOUT_S and ALPACA_MAX_ATTEMPTS set the executor's buffer, its alarm and
-its retry budget. Each is read when the handle is built and falls back to the default below.
+CONFIGURATION may only LOWER the one thing limits.py hard-codes: ALPACA_RATE_LIMIT_PER_MINUTE, under the ceiling.
+ALPACA_OUTGOING_BUFFER_SIZE, ALPACA_STALL_TIMEOUT_S and ALPACA_MAX_ATTEMPTS are plain overrides of their defaults, with
+no ceiling: they set the executor's buffer, its alarm and its retry budget, and each may be set lower or higher. Each is
+read when the handle is built and falls back to the default below (the attempt default, DEFAULT_MAX_ATTEMPTS, lives in
+scheduler/retry.py so a caller needing it imports no vendor SDK).
 
 THE FEED. The handle decides the default feed, per broker and per account (owner rulings, tj-7zjov1.91). One Alpaca
 account per deployment today, so the handle reads ALPACA_SIP_ENABLED once, when it is built, as that account's setting
@@ -44,7 +46,7 @@ from data.ingest.app.scheduler.credentials import Credential, StaticCredentialPr
 from data.ingest.app.scheduler.executor import AckGatedExecutor, AttemptResult, AttemptRunner, ExecutorSettings
 from data.ingest.app.scheduler.limits import Limit
 from data.ingest.app.scheduler.queue import ScheduledRequest
-from data.ingest.app.scheduler.retry import RetryPolicy
+from data.ingest.app.scheduler.retry import DEFAULT_MAX_ATTEMPTS, RetryPolicy
 from data.ingest.app.scheduler.scheduler import Scheduler, SchedulerBuilder
 from schemas.data_ingest.submit import RequestKind, SubmitRequest
 
@@ -65,7 +67,6 @@ ALPACA_BARS_PAGE_SIZE = broker_api.BARS_PAGE_SIZE
 
 DEFAULT_OUTGOING_BUFFER_SIZE = 64
 DEFAULT_STALL_TIMEOUT_S = 300.0
-DEFAULT_MAX_ATTEMPTS = 5
 
 
 class ReaderFactory(Protocol):
