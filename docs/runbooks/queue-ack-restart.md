@@ -77,8 +77,9 @@ Ingest keeps its queue and its outgoing buffer, so nothing is lost.
   `Handle <handle>: delivery of request <request id> attempt <n> failed (<ErrorType>); redelivering the same attempt in <s>s (redelivery <k>)`
   A redelivery is not a broker retry and makes no vendor call.
   The delivery call has a 60 s deadline and waits for the store to be ready (`wait_for_ready`,
-  `server/common/rpc/clients/store_delivery.py`), so a store outage shorter than about a minute logs **no** redelivery
-  WARNING: the call simply waits and succeeds. Do not read the absence of the line as a failure to redeliver.
+  `server/common/rpc/clients/store_delivery.py`), so a store outage shorter than about a minute normally logs **no**
+  redelivery WARNING: the call simply waits and succeeds. A store crash while a delivery is in flight can still log one,
+  because that call fails instead of waiting. Do not read the absence of the line as a failure to redeliver.
 - The store is idempotent on `(request_id, attempt_no)`: a duplicate is answered from the stored row and writes nothing,
   so **nothing is duplicated**.
 - **Check:** every request that was in flight reaches a terminal state, with one `ingest_run` row per `attempt_no`.

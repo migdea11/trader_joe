@@ -40,8 +40,9 @@ process, against the code and its tests. On 2026-09-29 the owner ran the system 
 wiped, freshly migrated stack, twice, and it passed both times. The host verification record is
 `tj-vhboky.14`. That suite covers, on real Postgres:
 
-- revision `eec8f88a7443` as it stands, applied by `make migrate`, with the recorded revision equal
-  to the single head;
+- the migrations applied by `make migrate` from empty, with the recorded revision equal to the single
+  head (that run was of the revision chain the alpha baseline has since replaced; the baseline is
+  covered by CI's Migration Gate and the catalogue test `tests/system/test_alpha_baseline_schema_pg.py`);
 - both unique constraints rejecting exact duplicates, and `owner` refusing an explicit NULL;
 - the bar upsert keeping one row on a repeat and refreshing it;
 - the delete cascade removing one entry's bars and leaving another entry's whole;
@@ -1190,17 +1191,21 @@ Open, read-only, and none records usage. Paged reads take `cursor` and `limit` (
 
 ### The writes (PW1 to PW3)
 
-POST only: each appends a row and a repeat appends another, so none is PUT or PATCH. Each needs the instance secret (`X-Instance-Secret`, a 401 otherwise) and takes a body parsed strictly (an unknown field or a missing required one is a 422). Each answers **201** with the new row. The actor is the operator principal and the `reason` is required (not blank after trimming).
+POST only: each appends a row and a repeat appends another, so none is PUT or PATCH. Each needs the instance secret (`X-Instance-Secret`, a 401 otherwise) and takes a body parsed strictly (an unknown field or a missing required one is a 422). Each answers **201** with the new row. The actor is the operator principal. The `reason` is **optional**: a blank one (after trimming) means none, is stored as NULL and reads back as an empty string, so a client that has no reason sends none or an empty string.
 
 **The version row is the audit** (ADR `tj-26jt9w` addendum 20): it is append-only and carries who, why and when, so a panel write adds no `dataset_override_log` row and needs no override. Nothing is published on the events socket, since there is no panel event type; the web UI re-reads over REST. A create does not start a pass: the panel manager's next tick runs the first.
 
 | Id | Route | Body | 201 answer | Refusals |
 |---|---|---|---|---|
-| PW1 | `POST /ui/v1/panels` | `CreatePanelRequest`: `name` (required, trimmed, unique), `source` (required, fixed for the panel's life), the first settings as flat fields (`enabled` and `size` required; `cadence`, unspecified means the default MONTHLY; `allowSymbols`, `denySymbols`, `assetClass`, `exchange`, `active`, `tradable`), `reason`, and optionally the source's first settings (`rampDatasetsPerHour`, `requestCapPerHour`, `corporateActionWindowPreDays`, `corporateActionWindowPostDays`) | `PanelDetail`, version 1, `effectivePass` unset and zero counts | 422: a bad body; a blank name or reason; a name already used (creates of one name are serialised, so the loser of two concurrent creates is refused); a negative number; a source with no settings when none is given (the rates have no default); source settings given for a source that **already has a version** (they change only through PW3). Nothing is written |
-| PW2 | `POST /ui/v1/panels/{panel_id}/settings-versions` | `SavePanelSettingsRequest`: the complete new settings (replaced as sent, an absent optional filter clears it; `enabled`, `cadence` and `size` required) and `reason`. Enable and disable are this write with `enabled` changed | `PanelSettingsVersion`, `effectivePass` unset | 422 for a bad body or a store refusal; 404 for an unknown panel |
-| PW3 | `POST /ui/v1/panel-sources/{source}/settings-versions` | `SaveSourceSettingsRequest`: the four numbers (all required, not negative; `rampDatasetsPerHour` 0 pauses creation) and `reason` | `PanelSourceSettingsVersion`, `effectivePass` unset. It applies to every panel on the source | 422 for a bad source, body or store refusal |
+| PW1 | `POST /ui/v1/panels` | `CreatePanelRequest`: `name` (required, trimmed, unique), `source` (required, fixed for the panel's life), the first settings as flat fields (`enabled` required; `cadence`, unspecified means the default MONTHLY; `allowSymbols`, `denySymbols`, `assetClass`, `exchange`, `active`, `tradable`), an optional `reason`, and optionally the source's first settings (`rampDatasetsPerHour`, `requestCapPerHour`, `corporateActionWindowPreDays`, `corporateActionWindowPostDays`) | `PanelDetail`, version 1, `effectivePass` unset and zero counts | 422: a bad body, **a body carrying `size`** (the field is gone: an unknown field is refused, see below); a blank name; a name already used (creates of one name are serialised, so the loser of two concurrent creates is refused); a negative number; a source with no settings when none is given (the rates have no default); source settings given for a source that **already has a version** (they change only through PW3). Nothing is written |
+| PW2 | `POST /ui/v1/panels/{panel_id}/settings-versions` | `SavePanelSettingsRequest`: the complete new settings (replaced as sent, an absent optional filter clears it; `enabled` and `cadence` required) and an optional `reason`. Enable and disable are this write with `enabled` changed | `PanelSettingsVersion`, `effectivePass` unset | 422 for a bad body (one carrying `size` included) or a store refusal; 404 for an unknown panel |
+| PW3 | `POST /ui/v1/panel-sources/{source}/settings-versions` | `SaveSourceSettingsRequest`: the four numbers (all required, not negative; `rampDatasetsPerHour` 0 pauses creation) and an optional `reason` | `PanelSourceSettingsVersion`, `effectivePass` unset. It applies to every panel on the source | 422 for a bad source, body or store refusal |
 
 Rules run in order: the secret (401), the body (422), existence (404, PW2 only), the store's refusals (422), then the write. Every store refusal is `INVALID_REQUEST` with the store's message.
+
+**A panel has no size.** It selects **every** asset of its source's newest active list that passes its filters, ordered by symbol then vendor asset id (the order members are created in under the ramp). There is no cap and no per-panel count: the field was removed from the three messages (field 3 is reserved), so a body that still carries `size` is a 422 like any unknown field. To limit what a panel holds, use its filters (allow and deny lists, asset class, exchange, active, tradable). To **pause** a panel, save a version with `enabled` false: that stops its passes only. Its members stay as recorded and their datasets keep collecting through the daily refresh; stopping them as well is a backlog item ("Panel: disabling a panel should pause its members' datasets"), not built. A filter that matches nothing makes every member exit, which stops those datasets unless another enabled panel selects them.
+
+**The reason is optional end to end.** Every `reason` field on the wire is still a plain string: empty means none. The store trims it and stores a blank one as NULL (the one spelling of none), and every read answers an empty string for it. A version or marker with no reason shows no reason text in the web UI (the history strip reads "By <actor>" alone), never a placeholder. The actor stays required. The override reason on a dataset write (the `override` object on the dataset writes) is a different field and is still required.
 
 ---
 

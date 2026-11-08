@@ -387,7 +387,7 @@ restarts, and the only bounds are the per-pass cap, the one-at-a-time serialisat
 budget and the missing-tail-only request.
 
 **The panel manager** decides which assets a *panel* holds and creates their datasets. A panel is a named
-selection of one source's assets (filters on the daily asset-list snapshot, a size and a cadence of daily,
+selection of one source's assets (filters on the daily asset-list snapshot and a cadence of daily,
 weekly or monthly; monthly unless told otherwise), owned by the reserved owner `panel`, which `POST /store`
 refuses. Panels are UI-only: they are created and edited in the web UI's Panels tab (`/data/panels`) through
 the `/ui/v1` panel routes (`docs/API.md`, *The panel routes*), and there is no SDK panel API. Every 5 minutes it works out from the stored rows what is due, so a
@@ -457,8 +457,23 @@ make migrate
 **Run this after every deploy**, and after any pull that brings new revisions. Migrations are a
 deploy step, not part of starting the stack (decision record `tj-x3ig38`). `make migrate` is the
 only supported spelling of that step: run it by hand today, and the server deploy script will call
-the same target once it exists. This version adds the `collect` column to `store_dataset_entry`, so a
-database one revision behind needs it before the store runs.
+the same target once it exists. A database that is not at head is not a state to run the store in.
+
+### The alpha starts from one baseline
+
+The alpha is the first release whose data persists, so it starts from a single schema. The store's
+`migrations/versions` holds **one revision, `5d9a3c7e1b84`**, which creates the whole schema from empty; the
+revisions before it were deleted, and the repository supports no schema from before the baseline.
+
+- **To start, drop the database and run `make migrate`.** A database stamped with any earlier revision id fails at
+  `make migrate` with "Can't locate revision" instead of being taken for the baseline. Datasets exported from the
+  dev stack before the baseline (`output/dev_seed/<old revision>/`) cannot be loaded into it: request them again
+  after the reset.
+- **There is no downgrade.** The baseline's `downgrade()` raises. Recovery is a restore of the pre-migrate dump that
+  `make migrate` takes (below).
+- **After the alpha, migrations are additive-only again**, held by `make lint-migrations` (below). Whether
+  data-carrying upgrade checks and release seeds return is decided when the first revision after the alpha is
+  designed; until then no test loads an old schema and no seed is committed per revision.
 
 Start the database first — `make dev-deps` (or `make dev-launch`) on a dev stack, `make prod-deps`
 (or `make prod-launch`) on prod — then `make migrate`. The target requires postgres to already be running and exits non-zero with a pointer if it is not. It
@@ -543,7 +558,7 @@ first takes a dump, and `current`, `history`, `heads` and `check` take none.
   itself, not through `run_migrations.sh`, and only on the dev or test stack; for a dump before a dev
   migration, run `make migrate` instead.
 
-Reviewing a migration: the checklist is in `server/data/store/CLAUDE.md`, section "Migration review checklist (m7)".
+Reviewing a migration: the baseline gate (B1 to B9) is in `server/data/store/CLAUDE.md`, section "The alpha baseline".
 
 ### Restore and rehearsal drill
 
@@ -601,9 +616,9 @@ column meant. When one cannot be, it says so on a line of its own in its docstri
 
 The marker means *this revision destroys schema, and the repository owner agreed to that*. The
 exception is granted by the owner, not by whoever writes the migration, and the id names the record
-where it was granted. Two revisions carry it today, `8f41c2d7a3b9` and `eec8f88a7443`, and in
-current practice both also state, in the same docstring, what is destroyed and what `downgrade()`
-does and does not restore. No record makes that a rule yet; it is the pattern to follow.
+where it was granted. No revision carries it today: the baseline only creates, and passes unmarked. In
+current practice a marked revision also states, in the same docstring, what is destroyed. No record makes
+that a rule yet; it is the pattern to follow.
 
 **`make lint-migrations` enforces this** (it is part of `make lint`). It reads every store revision with
 Python's `ast` module, with no database, and refuses, outside `downgrade()`: dropping a table, column,
@@ -621,30 +636,19 @@ one) is refused, because dollar-quoted text is not read, and a delimiter inside 
 an `E'...'` string's backslash escapes are not understood and block comments are not nested, and either can fail
 open. A revision needing one of these is either rewritten or marked.
 
-**`eec8f88a7443` expects empty tables.** It rebuilds both market-data tables for the per-dataset
-model and adds the bar's `feed` column `NOT NULL` with no default, so on a bar table that still holds
-rows it **fails with a constraint error** by design. Wipe `stock_market_activity` and
-`store_dataset_entry` before applying it; the revision's docstring has the procedure, including why
-`docker compose down -v` does not do it here. Its `downgrade()` restores the old schema and nothing
-else — feed, owner and expiry values written under it are not recoverable.
+**What is checked on the baseline.** A unit test pins it offline (one file, no parent, no marker, downgrade
+raises, it builds what the models declare). On Postgres, the system suite compares the catalogue of
+`alembic upgrade head` from an empty database with the catalogue of `metadata.create_all` on a second scratch
+database, which covers the CHECK constraints, enum labels and server defaults that `alembic check` cannot see
+(`tests/system/test_alpha_baseline_schema_pg.py`). CI's Migration Gate applies the revisions from empty and checks
+that the recorded revision is the single head and that a second upgrade changes nothing.
 
-**What has been checked on real Postgres.** On 2026-09-29 the revision as it stands was applied by
-`make migrate` to a wiped database on the owner's host, and the system suite then passed against
-it twice (the host verification record is `tj-vhboky.14`). Its downgrade and its refusal on a
-non-empty bar table are now checked by the system suite, `tests/system/test_migration_with_data.py`:
-each test creates a scratch database on the same server, loads a committed seed at that seed's
-revision, then upgrades or downgrades it and compares the rows with the seed's manifest.
+### Seeds: the producer
 
-### Seeds: every revision ships one
-
-`tests/system/seeds/` holds a seed for each database revision: `<revision>.sql` (the data) and
-`<revision>.json` (its manifest: revision, row counts, digests). A file named
-`<revision>.<variant>.sql` is an extra, hand-written seed for a specific case and never stands in
-for the canonical one. **A revision without its canonical seed fails the PR gate**
-(`server/data/store/tests/test_seed_guard.py`, which runs in `make test`); only the initial revision,
-`2b88043cd13c`, is exempt.
-
-So a PR that adds a revision also needs a seed produced at the new head, by either route:
+The seed producer (`python -m data.store.seeds`, in `server/data/store/seeds`) writes a deterministic, synthetic-only
+scenario through the real push path and the panel code, and dumps it as `<revision>.sql` and `<revision>.json`, the
+data and its manifest (row counts and digests). It is an end-to-end exercise and a way to inspect what the store
+writes. **No seed is committed per revision**: there is no seed gate and nothing loads one. Three routes run it:
 
 ```
 # Host: a test-mode stack you can wipe (see the system suite below)
@@ -656,9 +660,8 @@ make seed-dump SYSTEM_TEST_DISPOSABLE_DB=1     # DATE=YYYY-MM-DD optional; write
 
 or, from an agent, the agent-stack MCP's `seed_dump` verb (test mode only; see
 [The agent-stack MCP](#the-agent-stack-mcp)), which writes the pair under
-`agent_mcp_seeds/<worktree>/` in the MCP's share directory. CI's System Testing job also uploads one
-for every branch (below). Whichever route, the output is reviewed, then copied into
-`tests/system/seeds/` and committed. `make seed-dump` writes only to `SEED_OUT`
+`agent_mcp_seeds/<worktree>/` in the MCP's share directory. CI's System Testing job also dumps one for every
+branch and uploads it (below) for a person to inspect. `make seed-dump` writes only to `SEED_OUT`
 (default `output/seeds`, git-ignored) and refuses to write under `tests/`.
 
 ### Checking what is applied
@@ -733,7 +736,7 @@ documented way in.
 
 `tests/system` checks the behaviours a unit test cannot: the migrated schema's constraints, the
 store over real HTTP, the batch write under the driver's argument limit, the connection pool, a
-dataset request through the real ingest service end to end, and each migration against seeded data.
+dataset request through the real ingest service end to end, and the baseline schema against what `create_all` builds.
 It runs **from a client container**, `test_client` in `docker-compose.test-client.yaml`, which joins
 `store_api` and `store_db` and dials data_store and postgres by service name. It never runs from the
 host, which reaches neither in prod.
@@ -791,7 +794,7 @@ same project as the make targets, after
 checks that the compose sets still render, that data_ingest is on the fake broker, and that the
 running stack enforces the network model (the test client cannot resolve data_ingest;
 postgres and data_store have no egress). It then dumps a seed at the head revision and uploads it as
-the `head-seed-<branch>` artifact, kept seven days, for a person to review and commit.
+the `head-seed-<branch>` artifact, kept seven days, for a person to inspect; none is committed.
 
 ## Agent devcontainer
 

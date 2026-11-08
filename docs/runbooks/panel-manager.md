@@ -20,7 +20,7 @@ For each enabled panel of each source that has a trading calendar, a failure end
 A tick runs, for each enabled panel, either:
 
 - a **membership pass**, when one is due (below). It reads the newest active asset-list snapshot, applies the panel's
-  filters, cuts the selection to `size` in symbol order, and records what happened to each member as ledger
+  filters, keeps every asset that passes (a panel has no size and no cut; the order is symbol, then vendor asset id), and records what happened to each member as ledger
   transitions: `ENTERED`, `EXITED`, `DRAINING`, `DRAINED`, `REFUSED`, and for a member it creates, `CREATED` (or
   `DEFERRED` when a rate window is full); or
 - a **release pass**, between membership passes: it creates the members whose latest transition is `DEFERRED` while
@@ -38,7 +38,7 @@ minutes: `CREATED` rows against `ramp_datasets_per_hour`, and every request the 
 `request_cap_per_hour`. A creation costs **two** requests (`REQUESTS_PER_CREATION`): the name-change clamp query and
 the bars request. The ramp is checked first, and once a window is full the rest of the members in that pass share its
 cause. This limits creation only: the daily bars of members are the DAILY refresh's, bounded by
-`DAILY_REFRESH_MAX_PER_PASS`, so a large panel needs that cap raised to about the panel size.
+`DAILY_REFRESH_MAX_PER_PASS`, so a large panel needs that cap raised to about the number of assets its filters select.
 
 **A member's dataset** starts at `panel_dataset_start`: the source calendar's local midnight of 1990-01-01
 (`CALENDAR_START`), never UTC midnight, which would fall on the previous local date before the calendar's first day.
@@ -65,7 +65,7 @@ only recorded decision is `ENTERED` (`tests/system/phased/phase_s6b_panel_dry_ru
 ## Creating a panel and changing it
 
 Every write appends a version row; nothing is edited in place. Each version carries `saved_at`, the operator principal
-as `actor`, and a required non-blank `reason`.
+as `actor`, and an optional `reason`: a blank one means none, is stored as NULL and reads back as an empty string.
 
 | Write | Route | Notes |
 |---|---|---|
@@ -75,15 +75,24 @@ as `actor`, and a required non-blank `reason`.
 
 Rules that decide a create (all refusals are `INVALID_REQUEST`, 422, with the store's message, and write nothing):
 
-- `enabled` and `size` are required (an absent value is never read as `false` or zero); `cadence` unnamed takes
+- `enabled` is required (an absent value is never read as `false`); `cadence` unnamed takes
   `MONTHLY`; `name` is required, trimmed and unique; `source` is required and fixed for the panel's life; `reason` is
-  required.
+  optional. A body that carries `size` is refused with a 422: the field was removed and an unknown field is refused.
 - **The two hourly rates have no default.** A source with no source settings version cannot run a panel: give the
   first source settings in the create (both `ramp_datasets_per_hour` and `request_cap_per_hour` required; the window
   days default to 90), or the create is refused. Giving source settings for a source that already has a version is also
   refused: change them only through the source's own write. A ramp of 0 pauses creation. If the manager meets a
   panel whose source has no settings it logs once `Panel <id> is not runnable: source <source> has no settings` and
   skips it.
+- **Pausing a panel is `enabled` false** (a new version). It stops that panel's passes only: its members stay as
+  recorded and their datasets keep collecting through the daily refresh. Stopping the datasets too is a backlog item
+  ("Panel: disabling a panel should pause its members' datasets"), not built. To empty a panel, change its filters so
+  they select nothing: every member then exits and its dataset is stopped, unless another enabled panel on the source
+  still selects it.
+- **The web create form** validates on click: nothing is marked until Create Panel has been pressed once, then every
+  empty or invalid field is marked at once and the marks follow the fields. A name and a source are required, and ramp
+  and cap are required while the source has no settings version (the window days are optional); the reason is
+  optional.
 - Creates are serialised by name (a transaction-scoped advisory lock), so the loser of two concurrent creates of one
   name is refused as a duplicate; source settings are judged under a lock on the source.
 - Effective-from has no column: a version takes effect at the `started_at` of the first non-dry-run pass of that panel
@@ -130,7 +139,7 @@ beside it.
 | Table | Read it as |
 |---|---|
 | `panel` | One row per panel: `name` (unique), `source`, `created_at` |
-| `panel_settings_version` | A panel's versions, `version_no` ascending, with `enabled`, `cadence`, `size`, the filters, `actor`, `reason`, `saved_at` |
+| `panel_settings_version` | A panel's versions, `version_no` ascending, with `enabled`, `cadence`, the filters, `actor`, `reason` (NULL when none), `saved_at` |
 | `panel_source_settings_version` | A source's rates and window days by `version_no`, shared by its panels |
 | `panel_pass` | One row per pass: `kind` (`MEMBERSHIP` or `RELEASE`), the settings versions and the snapshots it ran under, `dry_run`, `started_at`, `finished_at` (null until it finishes) and `counts` |
 | `panel_member_transition` | The membership ledger: `transition`, `symbol`, `vendor_asset_id`, `dataset_id` or `request_id` where one applies, `cause`, `as_of`, `recorded_at` |
@@ -169,8 +178,8 @@ repository.
 2. Validate the Caddyfile and probe the seven edge rules and the off-list POST (above), **before any panel settings are
    saved**.
 3. Create the panel with the `MONTHLY` cadence and, if the source has none, its source settings version 1, each with
-   an actor and a reason.
-4. Raise `DAILY_REFRESH_MAX_PER_PASS` to about the panel size.
+   an actor (a reason is optional).
+4. Raise `DAILY_REFRESH_MAX_PER_PASS` to about the number of assets the panel's filters select.
 5. Confirm: an active and an inactive asset-list snapshot written within minutes; the first `panel_pass` row, naming
    settings version 1; and the first close-time pass showing in dataset Health.
 
