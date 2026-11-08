@@ -813,7 +813,7 @@ environment's interpreter is missing, so a rebuilt environment always gets a ful
 Agents reach Docker only through the agent-stack MCP (`docker-compose.agent-mcp.yaml`), a server in
 its own container that starts with the devcontainer by default: `make agent-up`, or the IDE's
 host-side `initializeCommand`, runs `make agent-mcp-up` on the host. Set `AGENT_MCP=off` to skip it;
-a failed start only warns. It offers **16 fixed verbs over one compose project, your own** (project
+a failed start only warns. It offers **22 fixed verbs over one compose project, your own** (project
 `trader_joe_dev`), in its dev or test mode. No verb ever names prod's project, so the MCP never touches a
 production stack. There is no second, isolated agent stack: the separate project,
 its generated env files and data directory, and the verbs `stack_up`, `stack_down` and `stack_wipe`
@@ -867,13 +867,44 @@ dev only; `migrate` and `migrate_status` need a mode up and refuse an empty proj
 `test_stop`, `test_start` and `test_env` have the rails of `test_reset`: the MCP image current, only test mode up,
 postgres on `./volume_data/test/postgres`, every data_store and data_ingest container's source stamp (running or
 stopped) equal to the checkout's digest, and exactly one container of the named service in the state the verb
-needs (running for `test_stop`, stopped for `test_start`, any for `test_env`); all before the budget is charged.
-Each call costs one of the 12. `run_system_tests` still needs both services running, so a scenario that needs a
-stopped service runs in phases around the verb.
+needs (running for `test_stop`, stopped for `test_start`, any for `test_env`). `run_system_tests` still needs both
+services running, so a scenario that needs a stopped service runs in phases around the verb.
 
-The five read-only verbs (`ps`, `logs`, `db_tables`, `http_get` and `migrate_status`) cost nothing
-against the budget below. The first four check no mode, and all five reach `trader_joe_dev` only;
+The five read-only verbs (`ps`, `logs`, `db_tables`, `http_get` and `migrate_status`) need no session grant
+(below). The first four check no mode, and all five reach `trader_joe_dev` only;
 `migrate_status` refuses a container there that is neither dev nor test.
+
+**The session grant.** Every state-changing verb (fourteen: `build`, `up`, `tools`, `down`, `restart`,
+`migrate`, `test_build`, `test_up`, `run_system_tests`, `seed_dump`, `test_reset`, `test_stop`, `test_start`
+and `test_env`) needs an open, unexpired grant that names it. The grant is how you approve a testing scope once
+instead of every call. Three more verbs, the session verbs, manage it, and none of them needs a grant:
+
+| Verb | What it does |
+|---|---|
+| `stack_session_open_test(bead, verbs, purpose, minutes?)` | Opens a grant for test mode. `verbs` is a list from `test_build`, `test_up`, `test_stop`, `test_start`, `test_env`, `test_reset`, `run_system_tests`, `seed_dump`, `migrate`, `restart` and `down`, or the string `test-campaign`: every one of those except `down`, which has to be named in a list. `minutes` defaults to 240 and is at most 480. |
+| `stack_session_open_dev(bead, verbs, purpose, minutes?)` | Opens a grant for dev mode. `verbs` is a list from `build`, `up`, `down`, `restart`, `migrate` and `tools`; there is no preset, so each is named. `minutes` defaults to 60 and is at most 120. |
+| `stack_session_close` | Ends the open grant. It takes no argument. |
+
+- **The arguments.** `bead` is the id of whatever is under test (a collection of tests, a feature or bug, or an
+  epic); it must look like a task id, and the MCP cannot read the task store, so it checks neither that it exists
+  nor its status. `purpose` is one printable line of at most 200 characters saying what is tested and what it will
+  touch. Both are recorded and shown, not enforced.
+- **What is enforced** is the mode, the verb list and the expiry. A verb of the other mode, or one outside the
+  list, is refused; a `minutes` over the maximum refuses the open instead of being trimmed, so the grant that
+  exists is the one you approved. `migrate`, `restart` and `down` take the mode the mode guard finds (an empty
+  project counts as dev), so a dev grant covers them there and a test grant in test mode.
+- **Admission only.** The grant is checked when a call arrives, after the unknown-verb and `busy` checks and
+  before any of the verb's own rails; it adds a condition and never skips or relaxes one. A verb already running
+  finishes whatever happens to the grant. Opening a grant replaces the open one, so a wider scope needs a new
+  open; closing is always safe.
+- **In memory only.** There is no file. A client reconnect does not close the grant; an MCP restart does (`make
+  agent-mcp-rebuild`, `make agent-mcp-down` then `-up`, a container restart, a host reboot). It is shared by every
+  session connected to the MCP, subagents included.
+- **No counter and no rate limit.** Nothing in the MCP counts calls or refuses on how many there are; the
+  per-vendor limiter in data_ingest guards the paper quota, and the verb lock below keeps verbs one at a time.
+- **Reading it.** `ps` ends with `session: <bead> <MODE> [verbs] expires <UTC> - <purpose>` or `session: none`,
+  and every audit line carries the grant that admitted the call (or null).
+- **A refusal** names the open grant, or says none is open, and which opener to ask you to approve.
 
 **What each verb refuses.** A refusal says what was found, and most name the fix.
 
@@ -909,9 +940,9 @@ against the budget below. The first four check no mode, and all five reach `trad
 - **`run_system_tests`, `seed_dump` and `test_reset` outside test mode.** They refuse unless only test mode is up and
   postgres's data mount is exactly `<repo>/volume_data/test/postgres`, which stands in for the
   `SYSTEM_TEST_DISPOSABLE_DB=1` attestation the make targets carry.
-- **The budget.** At most 12 state-changing verbs in a rolling hour, counted in memory and reset when the
-  MCP restarts; a refused call is not counted. Verbs also run one at a time: a second call while one
-  runs answers `busy`.
+- **No session grant.** A state-changing verb with no open, unexpired grant naming it, in the right mode, is
+  refused before the verb's own checks (after the unknown-verb and `busy` answers), and the message says which
+  opener to ask you to approve. Verbs run one at a time: a second call while one runs answers `busy`.
 
 **Time limits.** `build`, `test_build`, `run_system_tests` and `seed_dump` run up to 30 minutes, `up`,
 `test_up` and `migrate` up to 10, `tools`, `down`, `restart`, `migrate_status`, `test_reset` and `test_stop` up to 5, `test_start` and `test_env` up to 10, and the other
@@ -925,11 +956,16 @@ same helper `make` uses (`tools/dev_instance_secret.sh`), for `up`, `tools` and 
 `unused`, as `make dev-up` does, so reads work and writes are refused. `build` and `test_build` read no
 env file at all.
 
-**The permission to set.** `migrate` writes a real database, so keep it on `ask` in your client's
-permission settings; that is your setting, not the server's. The same goes for `test_up`,
-`run_system_tests` and `seed_dump`, and above all for `test_reset`, which erases the test database with no
-undo and no dry run: leave `mcp__agent-stack__test_reset` on `ask`, never `allow`. `test_stop`, `test_start`
-and `test_env` stay on `ask` too; no allow entry exists for them in this repository, and adding one is your setting.
+**The permission to set.** The approval a human gives is the one for the grant, so put the two openers on `ask`
+in your client's permission settings and approve each once per testing scope, reading the bead, the verbs, the
+minutes and the purpose in the prompt. That is your setting, not the server's, and no agent can change it. The
+other rules are `allow`: `mcp__agent-stack__stack_session_close`, the five read verbs and the fourteen
+state-changing verbs, because the grant now gates those. **Add the allow rules only after a rebuilt MCP has been seen
+refusing a state-changing call that has no grant**; allow rules in front of an MCP without the grant would let every
+state-changing verb run unprompted. The MCP cannot tell a human yes from an automatic one: in a session that
+approves automatically the opener's prompt may never appear, and then the grant is a record with an enforced
+scope, not a human gate. `test_reset` erases the test database with no undo and no dry run, so name it in a grant
+only when the scope needs it; `test-campaign` includes it.
 
 **Known limits and accepted exposures.**
 
@@ -984,6 +1020,7 @@ client's permission entries by this map:
 | `dev_migrate_status` | `migrate_status` |
 | `stack_up`, `stack_down`, `stack_wipe`, `migrate_check`, `dev_migrate`, `dev_migrate_check` | removed: delete their entries (`make migrate-check` covers `migrate_check`) |
 | (new) | `test_up`, `test_build` |
+| (new, later) | `stack_session_open_test`, `stack_session_open_dev`, `stack_session_close`: see [the session grant](#the-agent-stack-mcp) |
 
 `migrate`, `migrate_status`, `run_system_tests` and `seed_dump` keep their names but now act on the one
 project. The repository's own `.claude/settings*.json` holds no per-tool entries.
