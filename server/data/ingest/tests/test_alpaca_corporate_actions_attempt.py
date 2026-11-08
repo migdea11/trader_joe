@@ -254,6 +254,7 @@ async def test_served_actions_succeed_with_every_action_carried_raw_in_one_recor
     assert result.trailer.outcome is DeliveryOutcome.SUCCEEDED
     assert result.trailer.as_of == NOW
     assert result.trailer.error_class is None
+    assert result.trailer.reason is None, 'a SUCCEEDED trailer carries no reason (tj-7zjov1.346)'
     # tj-7zjov1.124, architect option A: the served range is the requested window exactly as given (was None).
     assert result.trailer.served_range == ServedRange(start=ACTIONS.start, end=ACTIONS.end)
     assert result.parts == [
@@ -415,6 +416,8 @@ async def test_a_failed_read_reports_its_class_its_detail_the_data_scope_and_no_
 
     assert result.trailer.outcome is DeliveryOutcome.FAILED
     assert result.trailer.error_class is klass
+    # tj-7zjov1.346: the typed error's Reason rides on the trailer, the store's error_reason.
+    assert result.trailer.reason is error.reason
     assert result.trailer.detail == error.detail
     assert result.trailer.served_range is None, 'a FAILED report names a served range (store rule d refuses it)'
     assert result.reset_at == reset_at
@@ -590,6 +593,7 @@ def assert_shaped_as_a_no_call_report(attempt: AttemptDelivery) -> None:
     assert attempt.trailer.served_range is None
     assert attempt.trailer.as_of is None
     assert attempt.trailer.error_class is None
+    assert attempt.trailer.reason is None
     assert attempt.trailer.last_attempt is False
     assert attempt.header.quota_key == ''
     assert attempt.header.vendor_asset_id == ''

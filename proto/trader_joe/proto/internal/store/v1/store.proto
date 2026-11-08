@@ -162,6 +162,12 @@ message DeliveryTrailer {
   // it queued for ever. Meaningful only on FAILED. A PERMANENT error class is final regardless of this
   // flag. Failures are reported, never inferred.
   bool last_attempt = 7;
+
+  // The vocabulary Reason value of a FAILED attempt (common/errors; the domain is always the
+  // vocabulary's ERROR_DOMAIN, so it is not carried). Empty on any other outcome, and empty when ingest
+  // has no typed reason. Additive. A receiver that does not recognise the value treats it as empty and
+  // never refuses the delivery: a refused delivery is redelivered and lost at an ingest restart.
+  string reason = 8;
 }
 
 // What the store tells ingest to do next.

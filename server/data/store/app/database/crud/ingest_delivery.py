@@ -90,8 +90,10 @@ class NewAttempt:
     # The window a SUCCEEDED attempt answered for (the trailer's served range); None on any other attempt.
     served_start: datetime | None = None
     served_end: datetime | None = None
-    # A run-record marker for a FAILED attempt the store itself refused (VENDOR_ASSET_CHANGED_REASON); error_domain
-    # stays NULL. None for every other attempt.
+    # The typed (domain, reason) of a FAILED attempt: the vocabulary's ERROR_DOMAIN and the Reason the trailer carried.
+    # Or, for a FAILED attempt the store itself refused, the run-record marker VENDOR_ASSET_CHANGED_REASON with
+    # error_domain NULL. None for every other attempt, and for a FAILED one whose trailer named no reason.
+    error_domain: str | None = None
     error_reason: str | None = None
 
 
@@ -233,6 +235,7 @@ async def insert_attempt(db: AsyncSession, attempt: NewAttempt) -> IngestRunReco
         'requested_end': request.requested_end,
         'state': attempt.state,
         'bars_written': attempt.bars_written,
+        'error_domain': attempt.error_domain,
         'error_reason': attempt.error_reason,
         'error_message': attempt.error_message,
         'started_at': attempt.started_at if attempt.started_at is not None else func.now(),

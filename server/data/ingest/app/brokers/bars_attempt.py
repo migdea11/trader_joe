@@ -198,7 +198,11 @@ class BarsAttemptRunner:
         klass = error_class(error)
         return AttemptResult(
             trailer=DeliveryTrailer(
-                outcome=DeliveryOutcome.FAILED, error_class=klass, detail=error.detail, vendor_stats=self.__stats(tally)
+                outcome=DeliveryOutcome.FAILED,
+                error_class=klass,
+                reason=error.reason,
+                detail=error.detail,
+                vendor_stats=self.__stats(tally),
             ),
             quota_key=request.quota_scope,
             feed=work.feed,

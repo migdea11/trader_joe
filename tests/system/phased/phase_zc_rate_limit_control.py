@@ -6,7 +6,10 @@ and counts no calls. So Z1 (the orchestrator's log read) and Z2 (phase_z2_no_rat
 nothing unless a known rate limit is shown to reach both. This file makes exactly one.
 
 WHAT IT DOES. It POSTs ONE bars request for RATELIMIT_<this test's symbol> under the run's owner, with a ready_by
-READY_BY_S ahead, and waits until the request's attempt row with a rate-limit cause (phase_z2's attempt_causes) exists.
+READY_BY_S ahead, waits until the request's attempt row exists, and requires it to carry the typed reason: FAILED,
+verdict CONTINUE, error_domain ERROR_DOMAIN and error_reason VENDOR_RATE_LIMITED (tj-7zjov1.316; the P26 gate's F3 on
+tj-7zjov1.38 found it written with both NULL), so that Z2's REASON branch (attempt_reason_cause), not only its text
+pattern, names it.
 The path, by reading: the POST's name_change clamp query is served (FakeRead's corporate actions carry no scenario);
 attempt 1 of the bars request fails VENDOR_RATE_LIMITED, class RATE_LIMITED, with a reset_at 60 s ahead
 (RATELIMIT_RESET_SECONDS), and the store writes its FAILED attempt row; ingest holds the retry until the reset, and
@@ -34,8 +37,10 @@ test_reset removes the rows.
 
 NEVER IN A WHOLE-TIER RUN, and never twice in one session: a phase_*.py file, collected only when named.
 
-Reds on: none; it is the control. It fails when the rate limit never reaches the store's record, which is itself a
-finding (the fake, the classification or the delivery of a rate-limited attempt is broken).
+Reds on: none in the limiter; it is the control. It fails when the rate limit never reaches the store's record, which
+is itself a finding (the fake, the classification or the delivery of a rate-limited attempt is broken), and when the
+attempt row lacks its typed reason (ingest left DeliveryTrailer.reason unset, the mapping dropped it, or the intake did
+not write error_domain and error_reason).
 """
 
 import time
@@ -49,11 +54,12 @@ from sqlalchemy.engine import Engine
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Granularity
+from common.errors.vocabulary import ERROR_DOMAIN, Reason
 from data.store.app.database.models.ingest_request import IngestRequest, IngestRequestKind
-from data.store.app.database.models.ingest_run import IngestRun
+from data.store.app.database.models.ingest_run import IngestRun, IngestRunState
 from routers.data_store.app_endpoints import AssetDatasetStoreInterface
 from tests.fakes.market_data import RATELIMIT_PREFIX
-from tests.system.phased.phase_z2_no_rate_limit import attempt_causes
+from tests.system.phased.phase_z2_no_rate_limit import attempt_causes, attempt_reason_cause
 
 
 pytestmark = pytest.mark.data_store
@@ -117,17 +123,17 @@ def test_zc_one_rate_limited_request_reaches_the_stores_record(
     if response is not None:
         assert not response.is_success, f'the rate-limited POST succeeded: {data_store.describe(response)}'
 
+    # Wait for the control's FIRST attempt row, whatever it says, then judge it: a row written without its typed reason
+    # (the P26 gate's F3) fails here naming its columns, never as a timeout.
     deadline = time.monotonic() + CONTROL_WAIT_S
     while True:
         requests, runs = _bars_attempts(pg_engine, symbol)
-        limited = [run for run in runs if attempt_causes(run)]
-        if limited:
+        if runs:
             break
         if time.monotonic() >= deadline:
             pytest.fail(
-                f'no attempt row with a rate-limit cause for {symbol} within {CONTROL_WAIT_S:.0f} s: requests '
-                f'{[(row.id, row.state.value, row.failure_cause) for row in requests]}, attempt rows '
-                f'{[(row.attempt_no, row.state.value, row.error_reason) for row in runs]}',
+                f'no attempt row for {symbol} within {CONTROL_WAIT_S:.0f} s: requests '
+                f'{[(row.id, row.state.value, row.failure_cause) for row in requests]}',
                 pytrace=False,
             )
         time.sleep(POLL_S)
@@ -135,3 +141,15 @@ def test_zc_one_rate_limited_request_reaches_the_stores_record(
     assert len(requests) == 1, f'{len(requests)} bars requests for {symbol}, not the one POST'
     (request,) = requests
     assert request.client_label == run_identity.owner, 'the control request does not carry the run owner'
+
+    # THE TYPED REASON (tj-7zjov1.316, pinned for the stack by tj-7zjov1.347): attempt 1 is FAILED, verdict CONTINUE
+    # (the retry is held to the reset), and carries FakeRead's VENDOR_RATE_LIMITED in the vocabulary's domain.
+    first = runs[0]
+    row = dict(first._mapping)
+    assert (first.attempt_no, first.state, first.verdict) == (1, IngestRunState.FAILED, 'CONTINUE'), row
+    assert (first.error_domain, first.error_reason) == (ERROR_DOMAIN, Reason.VENDOR_RATE_LIMITED.value), (
+        f'the control attempt row does not carry its typed reason: {row}'
+    )
+    # ... so Z2's REASON branch, not only its text pattern, names it at the gate's step (5).
+    assert attempt_reason_cause(first) == f'error_reason {Reason.VENDOR_RATE_LIMITED.value}', row
+    assert attempt_reason_cause(first) in attempt_causes(first), row

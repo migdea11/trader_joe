@@ -542,6 +542,7 @@ async def test_a_request_entering_at_or_past_the_budget_gets_no_vendor_attempt_t
     assert only.attempt.header.quota_key == '', 'an exhausted report named a quota it never spent'
     assert only.attempt.trailer.outcome is DeliveryOutcome.EXHAUSTED
     assert only.attempt.trailer.error_class is None
+    assert only.attempt.trailer.reason is None
     assert only.attempt.trailer.last_attempt is False
     assert only.attempt.trailer.vendor_stats is None
     # The request names no feed: SIP, the default (tj-7zjov1.343).
@@ -579,6 +580,7 @@ async def test_the_alpaca_handle_does_not_queue_a_request_already_past_the_budge
     assert delivered.attempt.header.quota_key == ''
     assert delivered.attempt.trailer.outcome is DeliveryOutcome.EXHAUSTED
     assert delivered.attempt.trailer.error_class is None
+    assert delivered.attempt.trailer.reason is None
     assert delivered.attempt.trailer.last_attempt is False
     # The request names no feed: SIP, the default (tj-7zjov1.343).
     assert delivered.attempt.header.feed is ack.accepted.feed is Feed.SIP
@@ -752,6 +754,7 @@ def assert_shaped_as_a_no_call_report(attempt: AttemptDelivery) -> None:
     assert attempt.trailer.served_range is None
     assert attempt.trailer.as_of is None
     assert attempt.trailer.error_class is None
+    assert attempt.trailer.reason is None
     assert attempt.trailer.last_attempt is False
     assert attempt.header.quota_key == ''
     assert attempt.header.vendor_asset_id == ''
@@ -945,6 +948,8 @@ async def test_a_runner_exception_is_reported_failed_permanent_and_the_worker_su
     assert bug.attempt.header.request_id == 'r1'
     assert bug.attempt.trailer.outcome is DeliveryOutcome.FAILED
     assert bug.attempt.trailer.error_class is DeliveryErrorClass.PERMANENT
+    # An untyped exception has no Reason, and none is guessed (tj-7zjov1.346).
+    assert bug.attempt.trailer.reason is None
     assert bug.attempt.header.quota_key == SCOPE
     assert 'a bug in the runner' not in bug.attempt.trailer.detail
     # The worker lived on to run the next request; the permanent failure was not retried.
@@ -1816,21 +1821,30 @@ async def test_a_served_attempt_reports_its_vendor_call_count_and_times():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ('raised', 'klass', 'calls', 'throttled'),
+    ('raised', 'klass', 'calls', 'throttled', 'reason'),
     [
-        pytest.param(status_answer(500), DeliveryErrorClass.TRANSIENT, 1, 0, id='500'),
-        pytest.param(status_answer(403), DeliveryErrorClass.TRANSIENT, 1, 0, id='403-vendor-auth-is-not-ready'),
-        pytest.param(status_answer(404), DeliveryErrorClass.PERMANENT, 1, 0, id='404'),
-        pytest.param(status_answer(429), DeliveryErrorClass.RATE_LIMITED, 1, 1, id='429'),
+        pytest.param(status_answer(500), DeliveryErrorClass.TRANSIENT, 1, 0, Reason.VENDOR_UNAVAILABLE, id='500'),
+        pytest.param(
+            status_answer(403),
+            DeliveryErrorClass.TRANSIENT,
+            1,
+            0,
+            Reason.VENDOR_AUTH,
+            id='403-vendor-auth-is-not-ready',
+        ),
+        pytest.param(status_answer(404), DeliveryErrorClass.PERMANENT, 1, 0, Reason.VENDOR_REJECTED, id='404'),
+        pytest.param(status_answer(429), DeliveryErrorClass.RATE_LIMITED, 1, 1, Reason.VENDOR_RATE_LIMITED, id='429'),
     ],
 )
-async def test_a_failed_attempt_reports_its_class_and_what_it_spent(raised, klass, calls, throttled):
+async def test_a_failed_attempt_reports_its_class_and_what_it_spent(raised, klass, calls, throttled, reason):
     runner = BarsAttemptRunner(alpaca_reader(stub_vendor(raised).client, scheduler=RecordingScheduler()))
 
     result = await runner(bars_scheduled(), 1)
 
     assert result.trailer.outcome is DeliveryOutcome.FAILED
     assert result.trailer.error_class is klass
+    # tj-7zjov1.346: the Reason the real AlpacaRead classified the status as, carried to the store's error_reason.
+    assert result.trailer.reason is reason
     assert result.trailer.vendor_stats.calls == calls
     assert result.trailer.vendor_stats.throttled_429 == throttled
     # None of these is a retried status, and none answered a good page.
@@ -1853,6 +1867,7 @@ async def test_a_refusal_before_the_vendor_spends_nothing_and_is_permanent():
     result = await runner(bars_scheduled(payload=work), 1)
 
     assert result.trailer.error_class is DeliveryErrorClass.PERMANENT
+    assert result.trailer.reason is Reason.RANGE_IN_FUTURE
     assert result.trailer.vendor_stats.calls == 0
     assert result.trailer.vendor_stats.first_call_at is None
     assert pacing.acquires == []

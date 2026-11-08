@@ -77,7 +77,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from common.enums.data_select import DataType
 from common.enums.data_stock import Feed
 from common.environment import get_env_var
-from common.errors.vocabulary import InvalidRequestError, Reason
+from common.errors.vocabulary import ERROR_DOMAIN, InvalidRequestError, Reason
 from common.logging import get_logger
 from data.store.app.corporate_actions import observations_of
 from data.store.app.database.crud.corporate_action import insert_observations
@@ -842,6 +842,9 @@ class DeliveryIntake:
                 if bars_written > 0 or (_carries_records(attempt.parts) and not dropped)
                 else IngestRunState.EMPTY
             )
+        # The typed reason ingest reported for a FAILED attempt, in the vocabulary's one domain. The store's own marker
+        # outranks it (domain NULL); no reason, or any other outcome, leaves both NULL: never derived from error_class.
+        typed = trailer.reason if stop is None and trailer.outcome is DeliveryOutcome.FAILED else None
         return NewAttempt(
             request=request,
             attempt_no=header.attempt_no,
@@ -864,7 +867,10 @@ class DeliveryIntake:
                 if state is IngestRunState.FAILED
                 else None
             ),
-            error_reason=VENDOR_ASSET_CHANGED_REASON if stop is not None else None,
+            error_domain=ERROR_DOMAIN if typed is not None else None,
+            error_reason=VENDOR_ASSET_CHANGED_REASON
+            if stop is not None
+            else (str(typed) if typed is not None else None),
             label=_label_for(request),
             # Stored for a bars attempt that was judged only: the id is the bars stop rule's detector (ADR tj-26jt9w
             # addendum 12). A DROPPED delivery was never checked by the stop rule, so its id is not stored (addendum 16)

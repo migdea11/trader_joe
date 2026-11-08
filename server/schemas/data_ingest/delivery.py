@@ -30,6 +30,7 @@ from typing import Self
 from pydantic import AwareDatetime, Field, NonNegativeInt, model_validator
 
 from common.enums.data_stock import Feed
+from common.errors.vocabulary import Reason
 from schemas.data_ingest.fetch_dataset import BarPage, ServedRange
 from schemas.inbound_contract import InboundContract
 
@@ -122,6 +123,8 @@ class DeliveryTrailer(InboundContract):
     as_of: AwareDatetime | None = None
     # Set by ingest when its attempt budget is spent with this attempt. Meaningful only on FAILED.
     last_attempt: bool = False
+    # The vocabulary Reason of a FAILED attempt; None on any other outcome, or when ingest has no typed one.
+    reason: Reason | None = None
 
 
 class AssetRecord(InboundContract):

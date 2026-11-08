@@ -78,7 +78,7 @@ from sqlalchemy.engine import Engine
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity
-from common.errors.vocabulary import Reason
+from common.errors.vocabulary import ERROR_DOMAIN, Reason
 from data.store.app.database.crud.stock.asset_market_activity import POSTGRES_MAX_BIND_PARAMETERS
 from data.store.app.database.models.ingest_request import IngestRequest, IngestRequestKind, IngestRequestState
 from data.store.app.database.models.ingest_run import IngestRun, IngestRunState, IngestRunTrigger
@@ -505,6 +505,9 @@ def _attempt_rows(pg_engine: Engine, request_id: UUID) -> list[sa.Row]:
                     RUN_TABLE.c.dataset_id,
                     RUN_TABLE.c.bars_written,
                     RUN_TABLE.c.error_message,
+                    RUN_TABLE.c.error_domain,
+                    RUN_TABLE.c.error_reason,
+                    RUN_TABLE.c.verdict,
                     RUN_TABLE.c.served_start,
                     RUN_TABLE.c.served_end,
                 )
@@ -537,9 +540,12 @@ def test_failonce_scenario_is_retried_inside_the_post_and_fills_one_entry(
     the retry and none lost. The bars arm writes the entry on the FIRST DELIVERED attempt, which is
     why attempt 2, not attempt 1, carries the dataset id.
 
-    NOT ASSERTED, ON PURPOSE: error_domain and error_reason on the FAILED attempt row, either way.
-    Whether a failed attempt row carries the typed (domain, reason) is an open owner question
-    (tj-7zjov1.236); pinning NULL would pin the as-built against an unruled design.
+    THE TYPED REASON, across the whole stack (tj-7zjov1.236 ruled option C; tj-7zjov1.345, .346,
+    .316; pinned by tj-7zjov1.347). The FAILED attempt 1, a non-last attempt answered CONTINUE,
+    carries FakeRead's VENDOR_UNAVAILABLE in the vocabulary's domain: ingest put it on the trailer,
+    the wire carried it as DeliveryTrailer.reason, the intake wrote it. The served attempt 2 carries
+    none. (This paragraph replaces the earlier "not asserted, on purpose", which held while the
+    owner question was open.)
 
     The regression this catches: an intake answering FINAL on a transient FAILED attempt. The
     request would finish FAILED after attempt 1 and the POST would answer 503.
@@ -579,6 +585,10 @@ def test_failonce_scenario_is_retried_inside_the_post_and_fills_one_entry(
     assert failed.dataset_id is None, f'the failed attempt names dataset {failed.dataset_id}: an entry before delivery'
     assert failed.bars_written == 0, f'the failed attempt wrote {failed.bars_written} bars'
     assert failed.error_message, 'the failed attempt row carries no error message'
+    assert failed.verdict == 'CONTINUE', f'attempt 1 was answered {failed.verdict}, not CONTINUE'
+    assert (failed.error_domain, failed.error_reason) == (ERROR_DOMAIN, Reason.VENDOR_UNAVAILABLE.value), (
+        f'attempt 1 carries ({failed.error_domain!r}, {failed.error_reason!r}), not its typed reason'
+    )
 
     assert served.state == IngestRunState.SUCCEEDED, f'attempt 2 is {served.state}'
     assert served.trigger == IngestRunTrigger.RETRY, f'attempt 2 has trigger {served.trigger}'
@@ -587,6 +597,7 @@ def test_failonce_scenario_is_retried_inside_the_post_and_fills_one_entry(
     assert served.served_start is not None and served.served_end is not None, (
         f'attempt 2 has served range [{served.served_start}, {served.served_end})'
     )
+    assert (served.error_domain, served.error_reason) == (None, None), 'the served attempt carries a reason'
 
 
 # ---------------------------------------------------------------------------------------------

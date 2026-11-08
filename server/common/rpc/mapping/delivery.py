@@ -37,12 +37,17 @@ from typing import Final
 from google.protobuf.message import Message
 from pydantic import BaseModel, ValidationError
 
+from common.errors.vocabulary import Reason
+from common.logging import get_logger
 from common.rpc.config import MAX_MESSAGE_BYTES
 from common.rpc.mapping.fetch_dataset import bar_to_domain, bar_to_proto
 from common.rpc.mapping.values import FEED, ProtoMappingError, enum_mapping, timestamp_field, to_timestamp
 from schemas.data_ingest import delivery as domain
 from schemas.data_ingest.fetch_dataset import BarPage, ServedRange
 from trader_joe.proto.internal.store.v1 import store_pb2
+
+
+log = get_logger(__name__)
 
 
 # THE PAGE SIZE, which the wire cannot express and the server must honour (store.proto, BarPage). The number
@@ -265,6 +270,18 @@ def vendor_stats_to_domain(message: store_pb2.VendorCallStats) -> domain.VendorC
     )
 
 
+def _trailer_reason(value: str) -> Reason | None:
+    # Empty is no reason. A value this build does not know is version skew: None and one warning, never a
+    # refusal, because a delivery the store refuses is redelivered and lost at an ingest restart.
+    if not value:
+        return None
+    try:
+        return Reason(value)
+    except ValueError:
+        log.warning(f'delivery trailer carries an unknown reason {value[:64]!r}; treated as empty')
+        return None
+
+
 def trailer_to_proto(trailer: domain.DeliveryTrailer) -> store_pb2.DeliveryTrailer:
     """Encode the trailer, last_attempt included.
 
@@ -283,6 +300,8 @@ def trailer_to_proto(trailer: domain.DeliveryTrailer) -> store_pb2.DeliveryTrail
     )
     if trailer.error_class is not None:
         message.error_class = DELIVERY_ERROR_CLASS.to_proto(trailer.error_class)
+    if trailer.reason is not None:
+        message.reason = str(trailer.reason)
     if trailer.vendor_stats is not None:
         message.vendor_stats.CopyFrom(vendor_stats_to_proto(trailer.vendor_stats))
     if trailer.served_range is not None:
@@ -301,7 +320,8 @@ def trailer_to_domain(message: store_pb2.DeliveryTrailer) -> domain.DeliveryTrai
         domain.DeliveryTrailer: The domain trailer. The UNSPECIFIED error class is None.
 
     Raises:
-        ProtoMappingError: If the outcome is unspecified or a nested message cannot be read.
+        ProtoMappingError: If the outcome is unspecified or a nested message cannot be read. An unknown
+        reason is NOT an error: it becomes None with one warning, so version skew never refuses a delivery.
     """
     return _built(
         domain.DeliveryTrailer,
@@ -312,6 +332,7 @@ def trailer_to_domain(message: store_pb2.DeliveryTrailer) -> domain.DeliveryTrai
         served_range=served_range_to_domain(message.served_range) if message.HasField('served_range') else None,
         as_of=_optional_instant(message, 'as_of'),
         last_attempt=message.last_attempt,
+        reason=_trailer_reason(message.reason),
     )
 
 

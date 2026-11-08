@@ -40,6 +40,7 @@ from google.protobuf.message import Message
 from pydantic import BaseModel
 
 from common.enums.data_stock import Feed
+from common.errors.vocabulary import Reason
 from common.rpc.mapping import (
     CONTRACT_FILES,
     CONTRACT_MESSAGES,
@@ -97,6 +98,16 @@ DEFERRED_FIELDS: Mapping[tuple[str, str], str] = {
 # to that.
 DEFERRAL_LIFTED_UNDER: Mapping[str, frozenset[tuple[str, str]]] = {
     f'{INGEST}.SubmitResponse': frozenset({(f'{INGEST}.FetchAccepted', 'quota_key')})
+}
+
+
+# STRING FIELDS WHOSE VALUE IS A CLOSED VOCABULARY ON THE DOMAIN SIDE. The builder's generic 'name-N' string is
+# not a member, and DeliveryTrailer.reason maps an unknown value to None by design (version skew never refuses a
+# delivery, tj-7zjov1.345), so the generic value would be dropped and the round trip would prove nothing about
+# the field. These fields get a real member instead, rotated by the counter so the value is still distinct.
+# test_each_vocabulary_string_is_a_declared_string_field keeps this table from naming a field that is gone.
+VOCABULARY_STRINGS: Mapping[tuple[str, str], tuple[str, ...]] = {
+    ('trader_joe.proto.internal.store.v1.DeliveryTrailer', 'reason'): tuple(str(reason) for reason in Reason)
 }
 
 
@@ -158,6 +169,9 @@ def _is_well_known(descriptor: Descriptor) -> bool:
 
 def _scalar(field: FieldDescriptor, values: _Values) -> object:
     issued = values.next()
+    vocabulary = VOCABULARY_STRINGS.get((field.containing_type.full_name, field.name))
+    if vocabulary is not None:
+        return vocabulary[issued % len(vocabulary)]
     if field.type == FieldDescriptor.TYPE_STRING:
         return f'{field.name}-{issued}'
     if field.type == FieldDescriptor.TYPE_BYTES:
@@ -812,3 +826,103 @@ def test_the_exported_page_size_is_the_number_the_contract_states():
 
     assert stated is not None, 'store.proto does not state its page size, which a .proto comment is the only place for'
     assert int(stated.group(1)) == MAX_PAGE_BARS
+
+
+# ---------------------------------------------------------------------------------------------
+# THE TRAILER'S TYPED REASON (tj-7zjov1.345): a closed vocabulary carried as a plain string
+
+TRAILER = 'trader_joe.proto.internal.store.v1.DeliveryTrailer'
+DELIVERY_LOGGER = 'common.rpc.mapping.delivery'
+
+
+@pytest.mark.parametrize(
+    ('message_name', 'field'), sorted(VOCABULARY_STRINGS), ids=lambda part: part.rsplit('.', 1)[-1]
+)
+def test_each_vocabulary_string_is_a_declared_string_field(message_name: str, field: str):
+    """The vocabulary table's own tripwire: an entry must name a string field the contract still declares.
+
+    Without it a renamed field would fall back to the generic 'name-N' value, the mapper would drop it as an
+    unknown member, and the round trip would go red for the wrong reason -- or, for a field that moved, the
+    table would silently stop applying.
+
+    Args:
+        message_name: The proto message carrying the field.
+        field: The string field whose domain twin is a closed vocabulary.
+    """
+    descriptor = MESSAGE_MAPPERS[message_name].proto_type.DESCRIPTOR
+    assert field in descriptor.fields_by_name, f'{message_name}.{field} is no longer declared'
+    assert descriptor.fields_by_name[field].type == FieldDescriptor.TYPE_STRING
+
+
+def _trailer(**update: object) -> delivery_domain.DeliveryTrailer:
+    # A fully populated domain trailer (every field set, by reflection), with UPDATE applied.
+    mapper = MESSAGE_MAPPERS[TRAILER]
+    return mapper.to_domain(_built(mapper, {})).model_copy(update=update)
+
+
+@pytest.mark.parametrize('reason', list(Reason), ids=str)
+def test_every_vocabulary_reason_survives_the_trailer_both_ways(reason: Reason):
+    """Each member travels as its own string and comes back as the same member, not a lookalike string.
+
+    The reflective round trip rotates through members by its counter and so reaches only one per run; this
+    is the whole vocabulary, so a member the mapper cannot read back (a renamed value, a lower-cased one) is red.
+
+    Args:
+        reason: One vocabulary Reason.
+    """
+    mapper = MESSAGE_MAPPERS[TRAILER]
+
+    message = mapper.to_proto(_trailer(reason=reason))
+    assert message.reason == reason.value
+
+    decoded = mapper.to_domain(message)
+    assert decoded.reason is reason
+
+
+def test_no_reason_is_the_empty_string_on_the_wire_and_none_back():
+    """Empty is "no reason", in both directions: None never becomes a string, and '' never becomes a member."""
+    mapper = MESSAGE_MAPPERS[TRAILER]
+
+    message = mapper.to_proto(_trailer(reason=None))
+    assert message.reason == ''
+    assert 'reason' not in {field.name for field, _ in message.ListFields()}
+    assert mapper.to_domain(message).reason is None
+
+
+def test_an_unknown_reason_from_the_wire_is_none_with_one_warning_and_the_trailer_still_maps(caplog):
+    """Version skew: a newer ingest names a Reason this store does not know.
+
+    The trailer must still decode, every other field intact, with the reason None and exactly ONE warning.
+    Refusing it would refuse the delivery, which is redelivered and lost at an ingest restart (store.proto,
+    DeliveryTrailer.reason). A second warning for one value would be log noise on every redelivery.
+
+    Args:
+        caplog: Captures the mapping's warning.
+    """
+    mapper = MESSAGE_MAPPERS[TRAILER]
+    message = mapper.to_proto(_trailer(reason=Reason.VENDOR_RATE_LIMITED))
+    message.reason = 'A_REASON_FROM_A_NEWER_BUILD'
+    expected = _trailer(reason=None)
+
+    with caplog.at_level('WARNING', logger=DELIVERY_LOGGER):
+        decoded = mapper.to_domain(message)
+
+    assert decoded == expected
+    warnings = [record for record in caplog.records if record.name == DELIVERY_LOGGER]
+    assert [record.levelname for record in warnings] == ['WARNING']
+    assert 'A_REASON_FROM_A_NEWER_BUILD' in warnings[0].getMessage()
+
+
+def test_a_known_or_empty_reason_logs_nothing(caplog):
+    """The warning is for skew only: a member or an empty reason decodes silently.
+
+    Args:
+        caplog: Captures anything the mapping logs.
+    """
+    mapper = MESSAGE_MAPPERS[TRAILER]
+
+    with caplog.at_level('DEBUG', logger=DELIVERY_LOGGER):
+        mapper.to_domain(mapper.to_proto(_trailer(reason=Reason.RANGE_TOO_RECENT)))
+        mapper.to_domain(mapper.to_proto(_trailer(reason=None)))
+
+    assert [record for record in caplog.records if record.name == DELIVERY_LOGGER] == []

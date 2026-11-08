@@ -73,11 +73,23 @@ def _text_causes(row, columns: Iterable[str]) -> list[str]:
     return causes
 
 
+def attempt_reason_cause(row) -> str | None:
+    """THE REASON BRANCH on an attempt row: the cause naming its rate reason, or None.
+
+    Since tj-7zjov1.316 a push-path FAILED attempt row carries the typed reason ingest put on the delivery trailer
+    (error_domain ERROR_DOMAIN, error_reason the Reason); before it the row held only the sentence, so only the text
+    branch could fire (P26 gate F3 on tj-7zjov1.38). phase_zc_rate_limit_control.py pins that THIS branch, not only
+    the text one, names the control's attempt row.
+    """
+    return f'error_reason {row.error_reason}' if row.error_reason in RATE_REASONS else None
+
+
 def attempt_causes(row) -> list[str]:
     """Why a FAILED ingest_run row is a rate-limit hit; empty when it is not one."""
     causes = []
-    if row.error_reason in RATE_REASONS:
-        causes.append(f'error_reason {row.error_reason}')
+    reason = attempt_reason_cause(row)
+    if reason is not None:
+        causes.append(reason)
     causes += _text_causes(row, ATTEMPT_TEXT_COLUMNS)
     throttled = row.vendor_throttled_429 or 0
     if throttled:

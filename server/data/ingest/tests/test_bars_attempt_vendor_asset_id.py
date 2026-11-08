@@ -21,7 +21,7 @@ import pytest
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Feed, Granularity, UpdateType
-from common.errors.vocabulary import ExogenousError, Reason
+from common.errors.vocabulary import ExogenousError, InvalidRequestError, Reason
 from common.rpc.mapping.delivery import header_to_proto
 from data.ingest.app.brokers.alpaca import broker_api
 from data.ingest.app.brokers.alpaca.classify import RATE_LIMIT_RESET_HEADER
@@ -317,6 +317,65 @@ async def test_nothing_about_the_asset_is_judged_an_inactive_untradable_venue_le
     assert result.trailer.outcome is DeliveryOutcome.SUCCEEDED
     assert result.vendor_asset_id == ODD_ID
     assert len(result.parts) == 1
+
+
+# ---------------------------------------------------------------------------------------------
+# The typed reason on the trailer (tj-7zjov1.346, design tj-7zjov1.236 option C): a FAILED trailer built from a
+# TraderJoeError carries that error's Reason; a trailer with no typed error behind it carries none.
+# ---------------------------------------------------------------------------------------------
+
+
+TYPED_BARS_FAILURES = [
+    pytest.param(ExogenousError(Reason.RANGE_TOO_RECENT, 'the SIP edge', reset_at=RESET_AT), id='range-too-recent'),
+    pytest.param(ExogenousError(Reason.VENDOR_RATE_LIMITED, 'slow', reset_at=RESET_AT), id='vendor-rate-limited'),
+    pytest.param(ExogenousError(Reason.RATE_BUDGET, 'no token in time', reset_at=RESET_AT), id='rate-budget'),
+    pytest.param(ExogenousError(Reason.VENDOR_UNAVAILABLE, 'down'), id='vendor-unavailable'),
+    pytest.param(InvalidRequestError(Reason.FEED_NOT_AVAILABLE, 'no such tape'), id='feed-not-available'),
+    pytest.param(InvalidRequestError(Reason.RANGE_IN_FUTURE, 'starts after now'), id='range-in-future'),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('error', TYPED_BARS_FAILURES)
+async def test_a_failed_bars_call_carries_the_reason_of_its_typed_error(error):
+    result = await BarsAttemptRunner(ScriptedRead(found(), bars=BarsFailure(error)))(scheduled(), 1)
+
+    assert result.trailer.outcome is DeliveryOutcome.FAILED
+    assert result.trailer.reason is error.reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'error',
+    [
+        pytest.param(ExogenousError(Reason.VENDOR_UNAVAILABLE, 'down'), id='vendor-unavailable'),
+        pytest.param(ExogenousError(Reason.VENDOR_RATE_LIMITED, 'slow', reset_at=RESET_AT), id='vendor-rate-limited'),
+    ],
+)
+async def test_a_failed_lookup_carries_the_reason_of_its_typed_error(error):
+    result = await BarsAttemptRunner(ScriptedRead(AssetLookupFailure(error)))(scheduled(), 1)
+
+    assert result.trailer.outcome is DeliveryOutcome.FAILED
+    assert result.trailer.reason is error.reason
+
+
+@pytest.mark.asyncio
+async def test_the_asset_not_found_failure_carries_no_reason():
+    # AssetNotFound is an answer, not a TraderJoeError, and ASSET_NOT_FOUND is deferred (tj-7zjov1.324): no reason is
+    # guessed for it.
+    result = await BarsAttemptRunner(ScriptedRead(AssetNotFound(symbol=SYMBOL, as_of=AS_OF)))(scheduled(), 1)
+
+    assert result.trailer.outcome is DeliveryOutcome.FAILED
+    assert result.trailer.reason is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('bars', [pytest.param(BARS, id='bars'), pytest.param([], id='no-bars')])
+async def test_a_succeeded_bars_attempt_carries_no_reason(bars):
+    result = await BarsAttemptRunner(ScriptedRead(found(), bars=bars))(scheduled(), 1)
+
+    assert result.trailer.outcome is DeliveryOutcome.SUCCEEDED
+    assert result.trailer.reason is None
 
 
 # ---------------------------------------------------------------------------------------------

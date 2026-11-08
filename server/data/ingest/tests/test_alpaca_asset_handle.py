@@ -288,6 +288,7 @@ async def test_a_succeeded_list_names_no_tape_no_instrument_and_the_trading_scop
     assert result.vendor_asset_id == ''
     assert result.quota_key == ALPACA_TRADING_SCOPE
     assert result.reset_at is None
+    assert result.trailer.reason is None, 'a SUCCEEDED trailer carries no reason'
     stats = result.trailer.vendor_stats
     assert (stats.calls, stats.pages, stats.retries, stats.throttled_429) == (1, 1, 0, 0)
     assert stats.first_call_at == stats.last_call_at == NOW
@@ -343,6 +344,8 @@ async def test_a_failed_list_reports_its_class_its_detail_and_no_part(error, kla
 
     assert result.trailer.outcome is DeliveryOutcome.FAILED
     assert result.trailer.error_class is klass
+    # tj-7zjov1.346: the typed error's Reason rides on the trailer, the store's error_reason.
+    assert result.trailer.reason is error.reason
     assert result.trailer.detail == error.detail
     assert result.reset_at == reset_at
     assert result.parts == []
@@ -510,6 +513,7 @@ def assert_shaped_as_a_no_call_report(attempt: AttemptDelivery) -> None:
     assert attempt.trailer.served_range is None
     assert attempt.trailer.as_of is None
     assert attempt.trailer.error_class is None
+    assert attempt.trailer.reason is None
     assert attempt.trailer.last_attempt is False
     assert attempt.header.quota_key == ''
     assert attempt.header.vendor_asset_id == ''
@@ -693,6 +697,8 @@ async def test_a_refused_list_is_retried_as_transient_up_to_the_budget_and_never
     for report in store.received:
         assert report.trailer.outcome is DeliveryOutcome.FAILED
         assert report.trailer.error_class is DeliveryErrorClass.TRANSIENT, 'a refused list must be retried (D2)'
+        # Every attempt, the non-last ones included, names the refusal's typed reason (tj-7zjov1.346).
+        assert report.trailer.reason is Reason.VENDOR_UNAVAILABLE
         assert report.trailer.detail == REFUSED + detail
         assert report.parts == [], 'a refused list delivered records'
         assert report.trailer.vendor_stats is not None and report.trailer.vendor_stats.calls == 1

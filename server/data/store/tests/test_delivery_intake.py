@@ -106,6 +106,7 @@ from data.store.tests.delivery_reports import (
     with_header,
     with_trailer,
 )
+from routers.data_store.ui_mapping import ingest_run_message
 from schemas.data_ingest.delivery import (
     AttemptDelivery,
     CorporateActionRecord,
@@ -2737,3 +2738,166 @@ async def test_p50_the_refresh_permanence_read_tolerates_the_marker(store):
     run = dataclasses.replace(IngestRunRecord.from_row(row), request_failure_cause=MARKER)
     assert (run.error_domain, run.error_reason) == (None, MARKER)
     assert daily_refresh._unproductive(run, row.requested_start) is False
+
+
+# --------------------------------------------------------------------------------------------- TR3: the typed reason
+#
+# tj-7zjov1.316 (TR3), tests tj-7zjov1.347 (TR4v); design tj-7zjov1.236 option C and its ruling note, ADR tj-fa1rpu D3
+# and D8. A FAILED attempt whose trailer carries a reason stores error_domain = the vocabulary's ERROR_DOMAIN and
+# error_reason = that Reason on its attempt row, beside the detail in error_message; a FAILED trailer with no reason
+# leaves both NULL (never derived from error_class); a non-FAILED trailer never writes them, whatever it carries; the
+# stop rule's VENDOR_ASSET_CHANGED marker keeps its NULL domain. Every attempt, not only the last (the P26 gate, F3).
+
+DOMAIN = 'trader-joe'
+
+
+async def _failed_with(store: Store, reason: Reason | None, *, kind=IngestRequestKind.BARS, **report_args):
+    """One FAILED delivery on a new request of KIND carrying REASON. Returns (request id, answer, its attempt row)."""
+    request_id = await store.request(kind)
+    attempt = with_trailer(report(request_id, DeliveryOutcome.FAILED, kind=kind, **report_args), reason=reason)
+    answer = await store.deliver(attempt)
+    (run,) = await store.runs(request_id)
+    return request_id, answer, run
+
+
+async def test_tr_the_domain_is_the_vocabularys_one_domain():
+    # The literal is pinned, not only the constant: the UI and problem+json read this string.
+    assert DOMAIN == delivery_intake.ERROR_DOMAIN
+
+
+@pytest.mark.parametrize(
+    ('reason', 'error_class'),
+    [
+        pytest.param(Reason.VENDOR_RATE_LIMITED, DeliveryErrorClass.RATE_LIMITED, id='vendor-rate-limited'),
+        pytest.param(Reason.RANGE_TOO_RECENT, DeliveryErrorClass.RATE_LIMITED, id='range-too-recent'),
+        pytest.param(Reason.RATE_BUDGET, DeliveryErrorClass.RATE_LIMITED, id='rate-budget'),
+        pytest.param(Reason.VENDOR_UNAVAILABLE, DeliveryErrorClass.TRANSIENT, id='vendor-unavailable'),
+        pytest.param(Reason.VENDOR_REJECTED, DeliveryErrorClass.PERMANENT, id='vendor-rejected'),
+        pytest.param(Reason.FEED_NOT_AVAILABLE, DeliveryErrorClass.PERMANENT, id='feed-not-available'),
+    ],
+)
+async def test_tr_a_failed_attempt_with_a_reason_stores_the_domain_and_the_reason_beside_the_detail(
+    store, reason, error_class
+):
+    _, _, run = await _failed_with(store, reason, error_class=error_class, detail='the vendor said so')
+
+    assert run.state == IngestRunState.FAILED
+    assert (run.error_domain, run.error_reason) == (DOMAIN, reason.value)
+    assert run.error_message == 'the vendor said so', 'the detail is still the message, unchanged'
+
+
+@pytest.mark.parametrize('error_class', list(DeliveryErrorClass), ids=lambda klass: klass.name.lower())
+async def test_tr_a_failed_attempt_with_no_reason_stores_null_for_both_whatever_its_class(store, error_class):
+    _, _, run = await _failed_with(store, None, error_class=error_class)
+
+    assert run.state == IngestRunState.FAILED
+    assert (run.error_domain, run.error_reason) == (None, None), 'a reason was derived from the error class'
+    assert run.error_message == 'the vendor answered 503'
+
+
+@pytest.mark.parametrize('kind', NON_BARS, ids=lambda kind: kind.lower())
+async def test_tr_a_failed_attempt_of_every_kind_stores_its_reason(store, kind):
+    _, _, run = await _failed_with(store, Reason.VENDOR_UNAVAILABLE, kind=kind)
+
+    assert (run.state, run.error_domain, run.error_reason) == (IngestRunState.FAILED, DOMAIN, 'VENDOR_UNAVAILABLE')
+
+
+async def test_tr_a_non_last_failed_attempt_stores_its_reason_and_so_does_the_last(store):
+    """The P26 gate's F3: the Zc control's CONTINUE attempt was written with NULLs. Every attempt carries its own."""
+    request_id = await store.request()
+    first = with_trailer(
+        report(request_id, DeliveryOutcome.FAILED, error_class=DeliveryErrorClass.RATE_LIMITED),
+        reason=Reason.VENDOR_RATE_LIMITED,
+    )
+    last = with_trailer(
+        report(request_id, DeliveryOutcome.FAILED, attempt_no=2, last_attempt=True), reason=Reason.VENDOR_UNAVAILABLE
+    )
+
+    assert (await store.deliver(first)).verdict is CONTINUE
+    assert (await store.deliver(last)).verdict is FINAL
+
+    runs = await store.runs(request_id)
+    assert [(run.attempt_no, run.verdict, run.error_domain, run.error_reason) for run in runs] == [
+        (1, 'CONTINUE', DOMAIN, 'VENDOR_RATE_LIMITED'),
+        (2, 'FINAL', DOMAIN, 'VENDOR_UNAVAILABLE'),
+    ]
+
+
+async def test_tr_the_published_attempt_record_carries_the_reason(store):
+    """IngestRunChanged is what the UI's run history hears; it reads the same row."""
+    request_id, _, _ = await _failed_with(
+        store, Reason.VENDOR_RATE_LIMITED, error_class=DeliveryErrorClass.RATE_LIMITED
+    )
+
+    events = [event for event in store.published if isinstance(event, IngestRunChanged)]
+    assert [(event.run.request_id, event.run.error_domain, event.run.error_reason) for event in events] == [
+        (request_id, DOMAIN, 'VENDOR_RATE_LIMITED')
+    ]
+    # ... and the UI's run message (ui_mapping.ingest_run_message, the run-history route's and the socket's) shows it.
+    error = ingest_run_message(events[0].run).error
+    assert (error.domain, error.reason, error.message) == (DOMAIN, 'VENDOR_RATE_LIMITED', 'the vendor answered 503')
+
+
+@pytest.mark.parametrize(
+    ('kind', 'parts', 'state'),
+    [
+        pytest.param(IngestRequestKind.BARS, None, IngestRunState.SUCCEEDED, id='bars-succeeded'),
+        pytest.param(IngestRequestKind.BARS, [], IngestRunState.EMPTY, id='bars-empty'),
+        pytest.param(IngestRequestKind.CORPORATE_ACTIONS, None, IngestRunState.EMPTY, id='corporate-actions-empty'),
+        pytest.param(IngestRequestKind.ASSET_LIST, None, IngestRunState.EMPTY, id='asset-list-empty'),
+    ],
+)
+async def test_tr_a_non_failed_trailer_carrying_a_reason_never_writes_it(store, kind, parts, state):
+    """A crafted SUCCEEDED trailer with a reason (ingest never sends one): the row stays untyped."""
+    request_id = await store.request(kind)
+    attempt = with_trailer(report(request_id, kind=kind, parts=parts), reason=Reason.VENDOR_RATE_LIMITED)
+
+    await store.deliver(attempt)
+
+    (run,) = await store.runs(request_id)
+    assert run.state == state
+    assert (run.error_domain, run.error_reason) == (None, None)
+
+
+@pytest.mark.parametrize('outcome', NO_CALL, ids=lambda outcome: outcome.lower())
+async def test_tr_an_expired_or_exhausted_trailer_carrying_a_reason_is_accepted_and_writes_no_attempt_row(
+    store, outcome
+):
+    request_id = await store.request()
+
+    answer = await store.deliver(with_trailer(report(request_id, outcome), reason=Reason.VENDOR_RATE_LIMITED))
+
+    assert answer.verdict is FINAL
+    assert await store.runs(request_id) == []
+
+
+async def test_tr_the_vendor_asset_changed_marker_keeps_its_null_domain_when_the_trailer_carries_a_reason(store):
+    series = await _series(store)
+    await series.deliver(ID_A)
+    request_id = await store.request(dataset=False, dataset_id=series.entry_id)
+    attempt = with_header(report(request_id), vendor_asset_id=ID_B)
+    attempt = with_trailer(attempt, as_of=AS_OF + timedelta(days=30), reason=Reason.VENDOR_REJECTED)
+
+    assert (await store.deliver(attempt)).verdict is FINAL
+
+    (run,) = await store.runs(request_id)
+    assert (run.state, run.error_domain, run.error_reason) == (IngestRunState.FAILED, None, MARKER)
+
+
+@pytest.mark.parametrize(
+    ('reason', 'error_class', 'unproductive'),
+    [
+        pytest.param(Reason.VENDOR_REJECTED, DeliveryErrorClass.PERMANENT, True, id='refused-reason'),
+        pytest.param(Reason.FEED_NOT_AVAILABLE, DeliveryErrorClass.PERMANENT, True, id='refused-feed'),
+        pytest.param(Reason.VENDOR_RATE_LIMITED, DeliveryErrorClass.RATE_LIMITED, False, id='not-ready-reason'),
+        pytest.param(None, DeliveryErrorClass.PERMANENT, False, id='no-reason'),
+    ],
+)
+async def test_tr_the_daily_refresh_reads_a_refused_reason_on_an_attempt_row_as_unproductive(
+    store, reason, error_class, unproductive
+):
+    """daily_refresh._unproductive on the stored row alone (no request failure cause): the reason now decides it."""
+    _, _, row = await _failed_with(store, reason, error_class=error_class)
+    run = dataclasses.replace(IngestRunRecord.from_row(row), request_failure_cause=None)
+
+    assert daily_refresh._unproductive(run, row.requested_start) is unproductive

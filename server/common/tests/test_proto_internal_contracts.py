@@ -135,6 +135,9 @@ STORE_MESSAGES = {
         ('served_range', 5, f'{_STORE}.ServedRange', False),
         ('as_of', 6, _TS, False),
         ('last_attempt', 7, 'TYPE_BOOL', False),
+        # tj-7zjov1.345: the vocabulary Reason of a FAILED attempt, a plain string (the domain is always
+        # ERROR_DOMAIN, so it is not carried).
+        ('reason', 8, 'TYPE_STRING', False),
     ],
     'DeliverAttemptResponse': [
         ('verdict', 1, f'{_STORE}.DeliveryVerdict', False),

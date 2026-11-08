@@ -429,8 +429,9 @@ def _unproductive(run: IngestRunRecord, fetch_start: datetime) -> bool:
         return True
     if run.state is not IngestRunState.FAILED:
         return False
-    # A typed refusal of the legacy run record, or a request the vendor refused for good (its failure cause, read
-    # with the run: an attempt row carries only the sentence, not a typed reason).
+    # A typed refusal (the legacy run record's, or an attempt row's reason from the delivery trailer; an attempt whose
+    # trailer named none has no typed reason), or a request the vendor refused for good (its failure cause, read with
+    # the run).
     return (run.error_domain == ERROR_DOMAIN and run.error_reason in PERMANENT_REASONS) or (
         run.request_failure_cause == IngestRequestFailureCause.PERMANENT
     )
