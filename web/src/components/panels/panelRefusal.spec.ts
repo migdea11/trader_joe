@@ -66,7 +66,7 @@ function detailJson() {
     source: 'DATA_SOURCE_ALPACA_API',
     currentVersion: {
       versionNo: fake.panelVersion,
-      settings: { enabled: true, cadence: 'PANEL_CADENCE_MONTHLY', size: 50 },
+      settings: { enabled: true, cadence: 'PANEL_CADENCE_MONTHLY' },
       actor: 'operator',
       reason: 'first',
     },
@@ -154,7 +154,6 @@ describe('PanelCreateForm: the name is checked against the loaded list before an
     await byId(form, 'create-name').setValue(name)
     await byId(form, 'create-source').findAll('option')[1]!.setValue()
     await flushPromises()
-    await byId(form, 'create-size').setValue('10')
     await byId(form, 'create-reason').setValue('a reason')
   }
 
@@ -201,7 +200,6 @@ describe('PanelCreateForm: a 422 is re-read', () => {
     await byId(form, 'create-name').setValue(name)
     await byId(form, 'create-source').findAll('option')[1]!.setValue()
     await flushPromises()
-    await byId(form, 'create-size').setValue('10')
     await byId(form, 'create-reason').setValue('a reason')
     if (byId(form, 'create-ramp').exists()) {
       await byId(form, 'create-ramp').setValue('0')
@@ -267,7 +265,6 @@ describe('PanelCreateForm: a 422 is re-read', () => {
     await fill(form)
     expect(await submit(form)).toBe('The store refused the panel, so nothing was created. Check the fields. Error ID: e-race')
     expect(valueOf(form, 'create-name')).toBe('  Gamma  ')
-    expect(valueOf(form, 'create-size')).toBe('10')
     expect(valueOf(form, 'create-reason')).toBe('a reason')
   })
 
@@ -351,10 +348,10 @@ describe('PanelSettingsForm: a 422 re-reads the panel', () => {
 
   it('nothing moved: the fixed settings copy with the error id, the input kept', async () => {
     const form = mountOverStore(PanelSettingsForm)
-    await byId(form, 'settings-size').setValue('7')
+    await byId(form, 'settings-deny').setValue('GME')
     expect(await disable(form)).toBe('The store refused these settings, so nothing was saved. Check the fields. Error ID: e-race')
     expect(valueOf(form, 'settings-reason')).toBe('why')
-    expect(valueOf(form, 'settings-size')).toBe('7')
+    expect(valueOf(form, 'settings-deny')).toBe('GME')
   })
 
   it('a source settings move is not a panel settings move: the fixed copy', async () => {

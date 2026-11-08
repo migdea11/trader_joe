@@ -16,7 +16,7 @@
 // half-open [start, end) range iff D's local midnight in the source calendar's timezone falls in
 // [start, end). No credential material crosses here; actor is the operator principal, a label.
 //
-// PANEL CREATE is RULED (owner, 2026-10-27): a UI write with a recorded reason, CreatePanelRequest, whose
+// PANEL CREATE is RULED (owner, 2026-10-27): a UI write with an optional recorded reason, CreatePanelRequest, whose
 // response is the existing PanelDetail. There is still no client-facing panel API.
 syntax = "proto3";
 
@@ -108,12 +108,14 @@ message PanelList {
   repeated PanelListItem items = 1;
 }
 
-// A panel's own settings: one settings version's content. enabled, cadence and size have no default.
+// A panel's own settings: one settings version's content. enabled and cadence have no default. There is
+// no size: a panel's size property is removed (owner ruling, 2026-11-06).
 message PanelSettings {
+  // Field 3 was size, removed (owner ruling, 2026-11-06). Never reuse the number or the name.
+  reserved 3;
+  reserved "size";
   bool enabled = 1;
   PanelCadence cadence = 2;
-  // Members the panel selects at most; not negative.
-  int32 size = 3;
   // Empty restricts nothing.
   repeated string allow_symbols = 4;
   // Removes symbols from the selection.
@@ -153,7 +155,7 @@ message PanelSettingsVersion {
   google.protobuf.Timestamp saved_at = 3;
   // The operator principal: a label, never a credential.
   string actor = 4;
-  // Why it was saved; trimmed, never blank.
+  // Why it was saved; trimmed. Optional: empty means none was given.
   string reason = 5;
   // Unset when no pass has run under this version yet.
   EffectivePass effective_pass = 6;
@@ -167,6 +169,7 @@ message PanelSourceSettingsVersion {
   PanelSourceSettings settings = 3;
   google.protobuf.Timestamp saved_at = 4;
   string actor = 5;
+  // Why it was saved; trimmed. Optional: empty means none was given.
   string reason = 6;
   // Unset when no pass has run under this version yet.
   EffectivePass effective_pass = 7;
@@ -220,7 +223,7 @@ message PanelMarker {
   int32 version_no = 3;
   // The operator principal: a label.
   string actor = 4;
-  // The reason given; trimmed.
+  // The reason given; trimmed. Optional: empty means none was given.
   string reason = 5;
   // The dataset's UUID, as text, for a collect marker; empty otherwise.
   string dataset_id = 6;
@@ -318,19 +321,20 @@ message CorporateActionEventPage {
 // (an absent optional filter clears it). Enable and disable is the same write with enabled changed. The
 // server stamps saved_at and actor.
 message SavePanelSettingsRequest {
+  // Field 3 was size, removed (owner ruling, 2026-11-06). Never reuse the number or the name.
+  reserved 3;
+  reserved "size";
   // Presence is meaningful: an absent value is refused (422), never read as false.
   optional bool enabled = 1;
   // UNSPECIFIED is refused (422).
   PanelCadence cadence = 2;
-  // Not negative; absent is refused (422).
-  optional int32 size = 3;
   repeated string allow_symbols = 4;
   repeated string deny_symbols = 5;
   optional trader_joe.proto.market.v1.AssetType asset_class = 6;
   optional string exchange = 7;
   optional bool active = 8;
   optional bool tradable = 9;
-  // Required, not blank after trimming; refused (422) otherwise.
+  // Optional: trimmed; blank or absent means none was given (never refused).
   string reason = 10;
 }
 
@@ -342,13 +346,13 @@ message SaveSourceSettingsRequest {
   optional int32 request_cap_per_hour = 2;
   optional int32 corporate_action_window_pre_days = 3;
   optional int32 corporate_action_window_post_days = 4;
-  // Required, not blank after trimming; refused (422) otherwise.
+  // Optional: trimmed; blank or absent means none was given (never refused).
   string reason = 5;
 }
 
 // The body of a panel create: the new panel's first settings version (1) and, optionally, the first
-// settings of its source. FLAT, because a nested PanelSettings cannot carry presence. Fields 1-9 are
-// identical in name, number, type and presence to SavePanelSettingsRequest 1-9. The server stamps
+// settings of its source. FLAT, because a nested PanelSettings cannot carry presence. Fields 1-9 (3 is
+// reserved) are identical in name, number, type and presence to SavePanelSettingsRequest 1-9. The server stamps
 // created_at, saved_at and actor; version 1 is written with the panel in one transaction. The RESPONSE is
 // the created PanelDetail: current_version is version 1 with effective_pass unset, counts all zero. The
 // FIRST PASS is not run by this write and is never in its response: the store's panel manager (one
@@ -357,19 +361,20 @@ message SaveSourceSettingsRequest {
 // enabled. The UI shows 'first pass pending' from the unset effective_pass and re-reads the detail. Every
 // refusal is INVALID_REQUEST, 422, with the store's message.
 message CreatePanelRequest {
+  // Field 3 was size, removed (owner ruling, 2026-11-06). Never reuse the number or the name.
+  reserved 3;
+  reserved "size";
   // Presence is meaningful: an absent value is refused (422), never read as false; there is no default.
   optional bool enabled = 1;
   // UNSPECIFIED means not named: the store applies its default, MONTHLY (DEFAULT_PANEL_CADENCE).
   PanelCadence cadence = 2;
-  // Not negative; absent is refused (422).
-  optional int32 size = 3;
   repeated string allow_symbols = 4;
   repeated string deny_symbols = 5;
   optional trader_joe.proto.market.v1.AssetType asset_class = 6;
   optional string exchange = 7;
   optional bool active = 8;
   optional bool tradable = 9;
-  // Required, not blank after trimming; refused (422) otherwise.
+  // Optional: trimmed; blank or absent means none was given (never refused).
   string reason = 10;
   // Required, trimmed, unique; blank or already used is refused (422).
   string name = 11;

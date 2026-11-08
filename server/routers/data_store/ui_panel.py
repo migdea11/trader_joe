@@ -13,7 +13,7 @@ and is 1 to 500; a cursor is opaque and bound to its route and parent (a foreign
 
 THE WRITES (W1 to W3) are POST only: each appends a row and a repeat appends another, so none is PUT or PATCH. Each is
 behind the instance secret, takes a body parsed strictly by ProtoBody, and answers 201 with the new row. The actor is the
-operator principal and the reason is required (the store refuses a blank one, 422). THE VERSION ROW IS THE AUDIT: it is
+operator principal and the reason is optional (blank or absent is stored as none). THE VERSION ROW IS THE AUDIT: it is
 append-only and carries who, why and when, so a panel write adds NO dataset_override_log row (addendum 20). Every store
 refusal is INVALID_REQUEST, 422, with the store's message. Nothing is published on the events socket: there is no panel
 event type. A create does not start a pass: the panel manager's tick runs the first one.
@@ -327,7 +327,7 @@ async def post_panel(
 ) -> ProtoJSONResponse:
     """W1. Create a panel: its version 1 and, when given, its source's first settings, in one transaction.
 
-    Does not start a pass; the detail has effective_pass unset and zero counts. The reason is required.
+    Does not start a pass; the detail has effective_pass unset and zero counts. The reason is optional.
 
     Args:
         db: The request's session.
@@ -338,7 +338,7 @@ async def post_panel(
         ProtoJSONResponse: 201 with the created PanelDetail.
 
     Raises:
-        InvalidRequestError: INVALID_REQUEST (422) for a bad body or any store refusal (a blank name or reason, a name
+        InvalidRequestError: INVALID_REQUEST (422) for a bad body or any store refusal (a blank name, a name
             already used, a negative number, a source with no settings and none given, settings given for a source that
             has some). Nothing is written.
     """
@@ -376,7 +376,7 @@ async def post_panel_settings_version(
     Args:
         db: The request's session.
         panel_id: The panel.
-        body: The complete new settings and the reason.
+        body: The complete new settings and the optional reason.
 
     Returns:
         ProtoJSONResponse: 201 with the new PanelSettingsVersion, effective_pass unset.

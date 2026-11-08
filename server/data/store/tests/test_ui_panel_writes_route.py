@@ -14,8 +14,11 @@ ADR tj-26jt9w addendum 20 and panels.proto. Pinned:
   * W3 POST /ui/v1/panel-sources/{source}/settings-versions -> 201 PanelSourceSettingsVersion. Order: secret, 422 source
     or body, 422 store refusal, write.
   * Every write: actor OPERATOR_PRINCIPAL (never the reserved dataset owner 'panel', and no body names an owner: an
-    'owner' field is an unknown field, 422); the reason required, stored trimmed; NO dataset_override_log row (the
-    version row is the audit); nothing published on the events hub; every store refusal INVALID_REQUEST 422.
+    'owner' field is an unknown field, 422); the reason OPTIONAL (ADR tj-46jkey, owner ruling 2026-11-06): stored
+    trimmed, absent or blank stored NULL and served as '' (absent from the canonical JSON); NO dataset_override_log row
+    (the version row is the audit); nothing published on the events hub; every store refusal INVALID_REQUEST 422.
+  * No size (ADR tj-46jkey): field 3 is reserved in all three messages, so a body still carrying 'size' names a field
+    the message does not have and is refused 422 like any unknown field, with nothing written.
   * No raw SQL in the routers: the route module builds no statement and imports nothing from sqlalchemy but the session
     type; the mapping imports no sqlalchemy at all.
 
@@ -65,8 +68,8 @@ HEADERS = {INSTANCE_SECRET_HEADER: SECRET}
 CREATE = '/ui/v1/panels'
 SOURCE_PATH = '/ui/v1/panel-sources/DATA_SOURCE_ALPACA_API/settings-versions'
 RATES = {'rampDatasetsPerHour': 2, 'requestCapPerHour': 10}
-PANEL_BODY = {'name': 'etfs', 'source': 'DATA_SOURCE_ALPACA_API', 'enabled': True, 'size': 25, 'reason': '  first  '}
-SETTINGS_BODY = {'enabled': False, 'cadence': 'PANEL_CADENCE_WEEKLY', 'size': 30, 'reason': ' paused for review '}
+PANEL_BODY = {'name': 'etfs', 'source': 'DATA_SOURCE_ALPACA_API', 'enabled': True, 'reason': '  first  '}
+SETTINGS_BODY = {'enabled': False, 'cadence': 'PANEL_CADENCE_WEEKLY', 'reason': ' paused for review '}
 SOURCE_BODY = RATES | {'corporateActionWindowPreDays': 30, 'corporateActionWindowPostDays': 7, 'reason': ' slower '}
 
 
@@ -204,7 +207,7 @@ async def test_w1_creates_the_panel_its_version_1_and_its_sources_first_settings
     version = body['currentVersion']
     assert version['versionNo'] == 1 and 'effectivePass' not in version
     assert version['actor'] == OPERATOR_PRINCIPAL != PANEL_OWNER and version['reason'] == 'first'
-    assert version['settings'] == {'enabled': True, 'cadence': 'PANEL_CADENCE_MONTHLY', 'size': 25}
+    assert version['settings'] == {'enabled': True, 'cadence': 'PANEL_CADENCE_MONTHLY'}
     source = body['currentSourceVersion']
     assert source['versionNo'] == 1 and source['actor'] == OPERATOR_PRINCIPAL and 'effectivePass' not in source
     assert source['settings'] == {
@@ -236,7 +239,6 @@ async def test_w1_keeps_a_named_cadence_and_a_given_window_day_count_and_ramp_ze
     assert body['currentVersion']['settings'] == {
         'enabled': True,
         'cadence': 'PANEL_CADENCE_WEEKLY',
-        'size': 25,
         'allowSymbols': ['SPY'],
         'denySymbols': ['QQQ'],
         'assetClass': 'ASSET_TYPE_STOCK',
@@ -269,12 +271,11 @@ async def test_w1_on_a_source_that_has_a_version_needs_no_source_settings(world,
         ({'requestCapPerHour': 1}, 'the cap alone'),
         ({}, 'no source settings for a source with no version'),
         (RATES | {'name': '   '}, 'a blank name'),
-        (RATES | {'reason': ' '}, 'a blank reason'),
-        (RATES | {'size': -1}, 'a negative size'),
+        (RATES | {'size': 25}, 'a size field (removed: field 3 is reserved)'),
+        (RATES | {'size': 0}, 'a zero size field (presence, not value)'),
         (RATES | {'rampDatasetsPerHour': -1}, 'a negative rate'),
         (RATES | {'source': 'DATA_SOURCE_UNSPECIFIED'}, 'no source'),
         ({key: value for key, value in (PANEL_BODY | RATES).items() if key != 'enabled'}, 'no enabled'),
-        ({key: value for key, value in (PANEL_BODY | RATES).items() if key != 'size'}, 'no size'),
         (RATES | {'owner': 'panel'}, 'an owner field (unknown)'),
         (RATES | {'cadence': 'PANEL_CADENCE_HOURLY'}, 'an unknown cadence name'),
     ],
@@ -283,8 +284,6 @@ async def test_w1_refusals_are_422_and_write_nothing(world, client, change, why)
     body = PANEL_BODY | change
     if 'enabled' not in change and why == 'no enabled':
         body.pop('enabled')
-    if why == 'no size':
-        body.pop('size')
     before = await world.counts()
     problem(await post(client, CREATE, body), status=422, reason='INVALID_REQUEST')
     await nothing_written(world, before)
@@ -336,7 +335,7 @@ async def test_w2_appends_the_next_version_as_sent_and_disabling_shows_in_the_li
 
     assert body['versionNo'] == 2 and 'effectivePass' not in body and body['savedAt']
     assert body['actor'] == OPERATOR_PRINCIPAL and body['reason'] == 'paused for review'
-    assert body['settings'] == {'cadence': 'PANEL_CADENCE_WEEKLY', 'size': 30, 'exchange': 'NYSE'}
+    assert body['settings'] == {'cadence': 'PANEL_CADENCE_WEEKLY', 'exchange': 'NYSE'}
     (listed,) = (await client.get('/ui/v1/panels')).json()['items']
     assert not listed.get('enabled', False)
     assert len(await world.rows(SETTINGS)) == 2
@@ -355,15 +354,15 @@ async def test_w2_order_secret_then_body_then_panel_then_store_refusal(world, cl
     problem(await post(client, unknown, 'not json', headers=None), status=401)
     problem(await post(client, settings_path('not-a-uuid'), 'not json', headers=None), status=401)
     problem(await post(client, unknown, 'not json'), status=422, reason='INVALID_REQUEST')
-    problem(await post(client, unknown, {'size': 1, 'reason': 'x'}), status=422, reason='INVALID_REQUEST')
+    problem(await post(client, unknown, {'reason': 'x'}), status=422, reason='INVALID_REQUEST')
+    problem(await post(client, unknown, SETTINGS_BODY | {'size': 30}), status=422, reason='INVALID_REQUEST')
     problem(await post(client, unknown, SETTINGS_BODY | {'reason': ' '}), status=404, reason='NOT_FOUND')
     problem(await post(client, unknown, SETTINGS_BODY), status=404, reason='NOT_FOUND')
     problem(await post(client, settings_path('not-a-uuid'), SETTINGS_BODY), status=422, reason='INVALID_REQUEST')
-    for refused in ({'reason': ' '}, {'size': -2}, {'cadence': 'PANEL_CADENCE_UNSPECIFIED'}):
+    for refused in ({'size': 30}, {'cadence': 'PANEL_CADENCE_UNSPECIFIED'}):
         problem(await post(client, known, SETTINGS_BODY | refused), status=422, reason='INVALID_REQUEST')
-    for missing in ('enabled', 'size'):
-        body = {key: value for key, value in SETTINGS_BODY.items() if key != missing}
-        problem(await post(client, known, body), status=422, reason='INVALID_REQUEST')
+    body = {key: value for key, value in SETTINGS_BODY.items() if key != 'enabled'}
+    problem(await post(client, known, body), status=422, reason='INVALID_REQUEST')
     problem(await post(client, known, SETTINGS_BODY | {'owner': 'panel'}), status=422, reason='INVALID_REQUEST')
     await nothing_written(world, before)
 
@@ -399,6 +398,42 @@ async def test_w3_order_secret_then_source_or_body_then_store_refusal(world, cli
     for missing in ('rampDatasetsPerHour', 'requestCapPerHour', 'corporateActionWindowPreDays'):
         body = {key: value for key, value in SOURCE_BODY.items() if key != missing}
         problem(await post(client, SOURCE_PATH, body), status=422, reason='INVALID_REQUEST')
-    for refused in ({'reason': '  '}, {'requestCapPerHour': -1}, {'source': 'DATA_SOURCE_IB_API'}):
+    for refused in ({'requestCapPerHour': -1}, {'source': 'DATA_SOURCE_IB_API'}):
         problem(await post(client, SOURCE_PATH, SOURCE_BODY | refused), status=422, reason='INVALID_REQUEST')
     await nothing_written(world, before)
+
+
+# --------------------------------------------------------------------------------------------- no reason (tj-46jkey)
+
+
+def _without_reason(body: dict[str, Any], reason: str | None) -> dict[str, Any]:
+    trimmed = {key: value for key, value in body.items() if key != 'reason'}
+    return trimmed if reason is None else trimmed | {'reason': reason}
+
+
+@pytest.mark.parametrize('reason', [None, '', '   '], ids=['absent', 'empty', 'blank'])
+async def test_w1_with_no_reason_is_a_201_storing_null_for_both_versions(world, client, reason):
+    body = await created(await post(client, CREATE, _without_reason(PANEL_BODY, reason) | RATES))
+
+    assert 'reason' not in body['currentVersion'] and 'reason' not in body['currentSourceVersion']
+    assert body['currentVersion']['actor'] == OPERATOR_PRINCIPAL
+    ((version,), (source,)) = (await world.rows(SETTINGS), await world.rows(SOURCE_SETTINGS))
+    assert version.reason is None and source.reason is None, 'a blank reason is stored NULL, never an empty string'
+
+
+@pytest.mark.parametrize('reason', [None, '', '   '], ids=['absent', 'empty', 'blank'])
+async def test_w2_with_no_reason_is_a_201_storing_null(world, client, reason):
+    seeded = await world.panel('etfs')
+    body = await created(await post(client, settings_path(seeded.panel_id), _without_reason(SETTINGS_BODY, reason)))
+    assert body['versionNo'] == 2 and 'reason' not in body and body['actor'] == OPERATOR_PRINCIPAL
+    (stored,) = [row for row in await world.rows(SETTINGS) if row.version_no == 2]
+    assert stored.reason is None
+
+
+@pytest.mark.parametrize('reason', [None, '', '   '], ids=['absent', 'empty', 'blank'])
+async def test_w3_with_no_reason_is_a_201_storing_null(world, client, reason):
+    await world.source_version(SOURCE)
+    body = await created(await post(client, SOURCE_PATH, _without_reason(SOURCE_BODY, reason)))
+    assert body['versionNo'] == 2 and 'reason' not in body and body['actor'] == OPERATOR_PRINCIPAL
+    (stored,) = [row for row in await world.rows(SOURCE_SETTINGS) if row.version_no == 2]
+    assert stored.reason is None

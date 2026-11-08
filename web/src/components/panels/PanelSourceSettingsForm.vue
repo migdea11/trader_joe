@@ -2,7 +2,7 @@
 // The source's settings for the selected panel (tj-7zjov1.37): shared by every panel on that source, so a
 // change is worded as the source's, not the panel's. A write appends a new source settings version (POST
 // panel-sources/{source}/settings-versions); all four numbers are sent, none may be negative, and the
-// reason is required. Ramp 0 pauses creation of new panel datasets. The server decides what is allowed.
+// reason is optional. Ramp 0 pauses creation of new panel datasets. The server decides what is allowed.
 import { computed, ref, watch } from 'vue'
 import type { PanelDetail } from '@generated/trader_joe/proto/ui/v1/panels_pb'
 
@@ -49,7 +49,6 @@ watch(() => `${props.detail.id}:${version.value?.versionNo ?? 0}`, reset)
 const problem = computed(() => {
   const counts = [fields.value.ramp, fields.value.cap, fields.value.pre, fields.value.post]
   if (counts.some((text) => parseCount(text) === null)) return 'Give each number as a whole number, 0 or more.'
-  if (reason.value.trim() === '') return 'Give a reason for the change.'
   return ''
 })
 
@@ -168,14 +167,14 @@ async function save(): Promise<void> {
         <label
           class="pn-label"
           for="source-reason"
-        >{{ titleCase('Reason') }}</label>
+        >{{ titleCase('Reason') }} (optional)</label>
         <textarea
           id="source-reason"
           v-model="reason"
           class="pn-input"
           rows="2"
           :disabled="busy"
-          placeholder="Why the source settings change; recorded with the new version"
+          placeholder="Optional: why the source settings change"
           data-testid="source-reason"
         />
       </div>

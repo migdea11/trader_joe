@@ -12,7 +12,8 @@ tj-7zjov1.180 (its description (1) to (9), the 14:02, 14:16, 18:31 and 03:30 not
 creation ruling).
 
   P1  one MEMBERSHIP pass per due panel, naming its settings version, the source's current settings version and both
-      snapshots, finished with counts; ENTERED then CREATED per member in symbol order up to the size;
+      snapshots, finished with counts; ENTERED then CREATED per member in symbol order, every filtered match (a panel
+      has no size since ADR tj-46jkey, owner ruling 2026-11-06);
   P2  CREATED names its POST-shaped bars request (dataset_id NULL on both); every panel request carries client_label
       'panel' and ready_by NULL; trigger REQUEST; the declared start, end None, DAILY 1day, collect true;
   P3  the clamp runs on a session that is NOT the pass session, after P committed; its start is the bars request's and
@@ -34,7 +35,8 @@ creation ruling).
       rule stopped is never requested or set collecting; the late mint stops collecting;
   P10 the as_of rule: an exit is dated by the first snapshot showing it under the same settings version, by this pass's
       snapshot under a new one; a row-attribute flip is dated from the rows; ENTERED likewise, an in-flight-skipped
-      one included (16c), except a size-cut entrant, dated by this pass's snapshot (16a); CREATED keeps the pass's;
+      one included (16c), except an entrant the previous pass's own snapshot already selected, dated by this pass's
+      snapshot (16a); CREATED keeps the pass's;
   P11 due and gate: one pass per due time, a restart before due runs none, MONTHLY waits for its month, an older
       snapshot is waited for until the next close plus settle; no source settings, a disabled panel: no pass;
   P12 dry run: the pass row flagged, nothing requested or stopped, and the real first pass still due after it;
@@ -154,10 +156,10 @@ async def due_again(world, seeded, by: timedelta = 2 * DAY) -> None:
         await world.put(PASSES.update().where(PASSES.c.id == row.id).values(started_at=row.started_at - by))
 
 
-async def basic(world, *, size: int = 10, ramp: int = 10, cap: int = 100, assets=None, **settings):
+async def basic(world, *, ramp: int = 10, cap: int = 100, assets=None, **settings):
     """One source settings version, one panel created two days ago, and one active snapshot an hour ago."""
     source_settings_id = await world.source_settings(ramp=ramp, cap=cap)
-    seeded = await world.panel(now() - 2 * DAY, size=size, **settings)
+    seeded = await world.panel(now() - 2 * DAY, **settings)
     assets = assets if assets is not None else [('v1', 'AAA'), ('v2', 'BBB'), ('v3', 'CCC')]
     snapshot_id = await world.snapshot(now() - HOUR, assets)
     return seeded, source_settings_id, snapshot_id
@@ -171,9 +173,10 @@ async def snapshot_as_of(world, snapshot_id):
 # ===================================================================================== P1 / P2 the first pass
 
 
-async def test_the_first_pass_names_both_versions_and_snapshots_and_creates_in_symbol_order_to_size(world, clock):
+async def test_the_first_pass_names_both_versions_and_snapshots_and_creates_every_match_in_symbol_order(world, clock):
+    """No size, so no cut (ADR tj-46jkey): every active row the filters pass is entered and created, in symbol order."""
     source_settings_id = await world.source_settings()
-    seeded = await world.panel(now() - 2 * DAY, size=2)
+    seeded = await world.panel(now() - 2 * DAY)
     inactive = await world.snapshot(now() - 3 * HOUR, [('x1', 'OLD')], status=AssetListStatus.INACTIVE)
     active = await world.snapshot(now() - HOUR, [('v3', 'CCC'), ('v1', 'AAA'), ('v2', 'BBB')])
 
@@ -184,13 +187,16 @@ async def test_the_first_pass_names_both_versions_and_snapshots_and_creates_in_s
     assert (row.settings_version_id, row.source_settings_version_id) == (seeded.settings_id, source_settings_id)
     assert (row.active_snapshot_id, row.inactive_snapshot_id) == (active, inactive)
     assert row.finished_at is not None
-    assert row.counts['entered'] == 2 and row.counts['created'] == 2 and row.counts['deferred'] == 0
+    assert row.counts['entered'] == 3 and row.counts['created'] == 3 and row.counts['deferred'] == 0
     assert kinds(await world.transitions(seeded)) == [
         ('v1', 'ENTERED'),
         ('v1', 'CREATED'),
         ('v2', 'ENTERED'),
         ('v2', 'CREATED'),
+        ('v3', 'ENTERED'),
+        ('v3', 'CREATED'),
     ]
+    assert [t.seq for t in await world.transitions(seeded)] == [1, 2, 3, 4, 5, 6], 'seq follows the symbol order'
 
 
 async def test_created_names_its_post_shaped_bars_request_owned_by_panel(world, clock):
@@ -599,7 +605,7 @@ async def test_a_release_names_the_deciding_pass_and_the_current_source_settings
 async def test_no_release_under_another_settings_version(world, clock):
     seeded, _, _ = await basic(world, ramp=1, assets=[('v1', 'AAA'), ('v2', 'BBB')])
     await manager(clock).tick()
-    await world.settings(seeded.panel_id, size=10)
+    await world.settings(seeded.panel_id)
     await world.age_window()
     await manager(clock).tick()
     assert [row.kind for row in await world.passes(seeded)] == [PanelPassKind.MEMBERSHIP]
@@ -1082,10 +1088,17 @@ async def test_pin_16c_an_in_flight_skipped_new_member_is_entered_backdated_with
     assert len(await world.requests()) == before and 'AAA' not in [c.symbol for c in world.clamps]
 
 
-async def test_pin_16a_a_size_cut_entrant_is_entered_as_of_this_pass_snapshot(world, clock):
-    """v2 passed the filters at the previous pass's snapshot and was cut by size; it enters only because v1 left."""
+async def test_pin_16a_an_entrant_the_previous_snapshot_already_selected_is_entered_as_of_this_pass_snapshot(
+    world, clock
+):
+    """v2 passed the filters at the previous pass's snapshot yet that pass recorded only v1: the evidence is no change.
+
+    The size cut that once made this case ordinary is gone (ADR tj-46jkey); the rule it pinned (evidence_as_of's
+    baseline: an outcome the previous pass's own snapshot already showed was not changed by a later snapshot) stays,
+    so a member the previous pass left unrecorded is dated by this pass's snapshot, never backdated.
+    """
     await world.source_settings()
-    seeded = await world.panel(now() - 6 * DAY, size=1)
+    seeded = await world.panel(now() - 6 * DAY)
     s0 = await world.snapshot(now() - 5 * DAY, [('v1', 'AAA'), ('v2', 'BBB')])
     await world.snapshot(now() - 4 * DAY, [('v1', 'AAA'), ('v2', 'BBB')])
     s2 = await world.snapshot(now() - 3 * DAY, [('v2', 'BBB')])
@@ -1104,7 +1117,9 @@ async def test_pin_16a_a_size_cut_entrant_is_entered_as_of_this_pass_snapshot(wo
 
     rows = {(r.vendor_asset_id, r.transition): r for r in await world.transitions(seeded)}
     assert rows[('v1', EXITED)].as_of == await snapshot_as_of(world, s2), 'the exit is still backdated'
-    assert rows[('v2', ENTERED)].as_of == await snapshot_as_of(world, s3), 'a size-cut entrant is not backdated'
+    assert rows[('v2', ENTERED)].as_of == await snapshot_as_of(world, s3), (
+        'an already-selected entrant is not backdated'
+    )
 
 
 async def test_under_a_new_settings_version_an_appeared_member_is_entered_as_of_this_pass_snapshot(world, clock):

@@ -158,7 +158,7 @@ async def world(monkeypatch):
 @pytest.mark.asyncio
 async def test_an_unclamped_panel_creation_sends_and_keys_on_new_york_midnight(world, monkeypatch):
     await world.source_settings()
-    await world.panel(datetime.now(UTC) - timedelta(days=2), size=1)
+    await world.panel(datetime.now(UTC) - timedelta(days=2))
     await world.snapshot(datetime.now(UTC) - timedelta(hours=1), [('v1', 'AAA')])
     keys = []
     real = panel_manager.check_own_overlap

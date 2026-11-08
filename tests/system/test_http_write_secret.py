@@ -126,8 +126,8 @@ PANEL_PASS_TABLE = PanelPass.__table__
 PANEL_SOURCE = DataSource.MANUAL_ENTRY
 # The {source} segment as the UI and the edge spell it: the proto enum name.
 PANEL_SOURCE_NAME = f'DATA_SOURCE_{PANEL_SOURCE.name}'
-# Complete settings: enabled and size have no default and the cadence is required on a new version.
-PANEL_SETTINGS_BODY = {'enabled': False, 'cadence': 'PANEL_CADENCE_MONTHLY', 'size': 5}
+# Complete settings: enabled has no default and the cadence is required on a new version (a panel has no size).
+PANEL_SETTINGS_BODY = {'enabled': False, 'cadence': 'PANEL_CADENCE_MONTHLY'}
 SOURCE_SETTINGS_BODY = {
     'ramp_datasets_per_hour': 1,
     'request_cap_per_hour': 2,
@@ -321,7 +321,6 @@ def seeded_panel(pg_engine: Engine, run_identity) -> Iterator[SeededPanel]:
                     version_no=1,
                     enabled=False,
                     cadence=PanelCadence.MONTHLY,
-                    size=5,
                     actor='operator',
                     reason=reason,
                 )
@@ -387,7 +386,7 @@ def send_write(
                 return data_store.post(UiPanelWritesInterface.POST_UI_PANELS, json=body, auth=auth)
             case WriteRoute.UI_PANEL_SETTINGS_POST:
                 path = UiPanelWritesInterface.POST_UI_PANEL_SETTINGS_VERSIONS.format(panel_id=seeded_panel.id)
-                body = {**PANEL_SETTINGS_BODY, 'size': 6, 'reason': seeded_panel.reason}
+                body = {**PANEL_SETTINGS_BODY, 'reason': seeded_panel.reason}
                 return data_store.post(path, json=body, auth=auth)
             case WriteRoute.UI_SOURCE_SETTINGS_POST:
                 path = UiPanelWritesInterface.POST_UI_PANEL_SOURCE_SETTINGS_VERSIONS.format(source=PANEL_SOURCE_NAME)

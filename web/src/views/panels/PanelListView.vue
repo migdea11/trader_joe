@@ -2,9 +2,9 @@
 // The Panels page (tj-7zjov1.37, ADR tj-26jt9w addendum 20; the design canvas Main board): a panel is a
 // named selection of one source's assets whose datasets the panel manager keeps. A selector picks the
 // panel; the page shows its status (membership counts, with First Pass Pending until a pass has run), the
-// settings panel (edit, enable or disable, each with a required reason), the source settings, the
+// settings panel (edit, enable or disable, each with an optional reason), the source settings, the
 // aggregate asset-list history strip with its settings-change markers, and the member list with each
-// member's corporate-action events. New Panel is a UI action with a recorded reason.
+// member's corporate-action events. New Panel is a UI action (the reason is optional).
 //
 // The server decides every count, state and health; the page words them. No polling: a load happens on
 // mount, on a selection change, after a write, on Refresh and once per reconnect of the events socket.

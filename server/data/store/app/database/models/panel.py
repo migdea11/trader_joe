@@ -25,7 +25,7 @@ from common.enums.data_stock import DataSource
 
 
 # Safe defaults, named here and applied where a row is CREATED (never by the schema). Only the ruled one is named: the
-# corporate-action window is 90 days on both sides (ADR tj-26jt9w, 2026-10-23 C1). The two hourly rates, size and
+# corporate-action window is 90 days on both sides (ADR tj-26jt9w, 2026-10-23 C1). The two hourly rates and the
 # cadence have no ruled default, so they have no constant and no server default.
 DEFAULT_CORPORATE_ACTION_WINDOW_DAYS = 90
 
@@ -101,11 +101,12 @@ class Panel(AppBase.DATA_STORE_BASE, CustomTypeTable):
 
 
 class PanelSettingsVersion(AppBase.DATA_STORE_BASE, CustomTypeTable):
-    """One version of a panel's own settings: enabled, cadence, size and filters (ADR tj-26jt9w addendum 20 (4)).
+    """One version of a panel's own settings: enabled, cadence and filters (ADR tj-26jt9w addendum 20 (4)).
 
     APPEND-ONLY: a change is a new version row, numbered per panel. Enable and disable are versions too. Every row is a
-    marker: saved_at (database time), actor (the operator principal) and reason (trimmed, never blank). EFFECTIVE-FROM
-    IS DERIVED, no column: the first panel_pass naming the version. NO default for cadence, size or enabled.
+    marker: saved_at (database time), actor (the operator principal) and reason (optional: NULL, or trimmed and never
+    blank). EFFECTIVE-FROM IS DERIVED, no column: the first panel_pass naming the version. NO default for cadence or
+    enabled. A panel has no size: it selects every asset its filters match (ADR tj-46jkey, owner ruling 2026-11-06).
 
     Filters: an empty allow_symbols list restricts nothing; deny_symbols removes; asset_class, exchange, active and
     tradable are NULL when they do not filter.
@@ -116,7 +117,6 @@ class PanelSettingsVersion(AppBase.DATA_STORE_BASE, CustomTypeTable):
 
     VERSION_UNIQUE = 'uq_panel_settings_version_panel_id_version_no'
     VERSION_POSITIVE = 'ck_panel_settings_version_version_no_positive'
-    SIZE_NON_NEGATIVE = 'ck_panel_settings_version_size_non_negative'
     ACTOR_NOT_BLANK = 'ck_panel_settings_version_actor_not_blank'
     REASON_NOT_BLANK = 'ck_panel_settings_version_reason_not_blank'
 
@@ -125,7 +125,6 @@ class PanelSettingsVersion(AppBase.DATA_STORE_BASE, CustomTypeTable):
     version_no = Column(Integer, nullable=False)
     enabled = Column(Boolean, nullable=False)
     cadence = Column(Enum(PanelCadence, name='panel_cadence', values_callable=_values), nullable=False)
-    size = Column(Integer, nullable=False)
     allow_symbols = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
     deny_symbols = Column(ARRAY(String), nullable=False, server_default=text("'{}'::varchar[]"))
     asset_class = Column(Enum(AssetType), nullable=True)
@@ -135,13 +134,12 @@ class PanelSettingsVersion(AppBase.DATA_STORE_BASE, CustomTypeTable):
     saved_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     # The operator principal (app/client_label.py OPERATOR_PRINCIPAL).
     actor = Column(String, nullable=False)
-    # Stored trimmed; never blank.
-    reason = Column(Text, nullable=False)
+    # Optional: NULL when none was given, else stored trimmed and never blank (the CHECK passes a NULL).
+    reason = Column(Text, nullable=True)
 
     __table_args__ = (
         UniqueConstraint('panel_id', 'version_no', name=VERSION_UNIQUE),
         CheckConstraint('version_no >= 1', name=VERSION_POSITIVE),
-        CheckConstraint('size >= 0', name=SIZE_NON_NEGATIVE),
         CheckConstraint("btrim(actor) <> ''", name=ACTOR_NOT_BLANK),
         CheckConstraint("btrim(reason) <> ''", name=REASON_NOT_BLANK),
     )
@@ -182,7 +180,8 @@ class PanelSourceSettingsVersion(AppBase.DATA_STORE_BASE, CustomTypeTable):
     corporate_action_window_post_days = Column(Integer, nullable=False)
     saved_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     actor = Column(String, nullable=False)
-    reason = Column(Text, nullable=False)
+    # Optional, as on a panel version.
+    reason = Column(Text, nullable=True)
 
     __table_args__ = (
         UniqueConstraint('source', 'version_no', name=VERSION_UNIQUE),

@@ -233,7 +233,6 @@ class World:
             'version_no': number,
             'enabled': True,
             'cadence': PanelCadence.DAILY,
-            'size': 10,
             'allow_symbols': [],
             'deny_symbols': [],
             'actor': 'operator',

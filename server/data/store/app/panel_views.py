@@ -153,6 +153,7 @@ class MarkerView:
     at: datetime
     version_no: int = 0
     actor: str = ''
+    # Empty when none was given (a settings version's reason is optional).
     reason: str = ''
     dataset_id: uuid.UUID | None = None
     label: str = ''
@@ -429,7 +430,7 @@ async def boundaries(db: AsyncSession, panel_id: uuid.UUID, start: datetime, end
             at=version.saved_at,
             version_no=version.version_no,
             actor=version.actor,
-            reason=version.reason,
+            reason=version.reason or '',
         )
         for version in read.settings_versions
         if start <= version.saved_at < end
@@ -440,7 +441,7 @@ async def boundaries(db: AsyncSession, panel_id: uuid.UUID, start: datetime, end
             at=version.saved_at,
             version_no=version.version_no,
             actor=version.actor,
-            reason=version.reason,
+            reason=version.reason or '',
         )
         for version in read.source_settings_versions
         if start <= version.saved_at < end

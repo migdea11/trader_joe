@@ -126,7 +126,6 @@ def test_the_running_panel_loop_writes_one_finished_membership_pass_for_a_new_en
         'name': f'system-test-{run_identity.run_id}-loop-smoke',
         'source': SOURCE,
         'enabled': True,
-        'size': 1,
         # A symbol of this run: no asset list holds it, so the pass selects nothing.
         'allowSymbols': [own_symbol],
         'reason': 'system test: the running loop writes a pass',

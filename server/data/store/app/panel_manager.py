@@ -277,7 +277,7 @@ def snapshot_gate(
 def row_selected(
     row: SnapshotRow, settings: PanelSettings, asset_type: AssetType, list_status: AssetListStatus
 ) -> bool:
-    """Whether a snapshot row passes the panel's filters (before the size cut).
+    """Whether a snapshot row passes the panel's filters (a panel has no size, so a selected row is a member).
 
     An empty allow list restricts nothing, a non-empty one restricts to those symbols; the deny list removes; the asset
     class, exchange, active and tradable filters do not filter at None. A row whose active flag the vendor did not say is
@@ -304,13 +304,13 @@ def row_selected(
 def select_members(
     rows: Sequence[SnapshotRow], settings: PanelSettings, asset_type: AssetType, list_status: AssetListStatus
 ) -> list[SnapshotRow]:
-    """The panel's members in a snapshot: the rows that pass the filters, in symbol order, cut to the panel's size.
+    """The panel's members in a snapshot: EVERY row that passes the filters, in symbol order (no size, no cut).
 
     Deterministic: ordered by symbol then vendor asset id, so equal inputs give equal members.
     """
     chosen = [row for row in rows if row_selected(row, settings, asset_type, list_status)]
     chosen.sort(key=lambda row: (row.symbol, row.vendor_asset_id))
-    return chosen[: settings.size]
+    return chosen
 
 
 def evidence_as_of(
@@ -327,8 +327,8 @@ def evidence_as_of(
     """The as_of of a transition driven by snapshot evidence: the first snapshot showing the new outcome.
 
     `snapshots` are the active snapshots after the previous pass's, oldest first, the current one last. The outcome in a
-    snapshot is the row's presence and its filters (the size cut is not judged). The BASELINE is the previous pass's own
-    snapshot: when the outcome there already equals the new one, the filters did not change it (the size cut did), and
+    snapshot is the row's presence and its filters. The BASELINE is the previous pass's own
+    snapshot: when the outcome there already equals the new one, nothing changed it between the two snapshots, and
     the answer is `default`, the current snapshot's as_of. Otherwise the change lies in (the baseline's as_of, the
     returned as_of].
     """

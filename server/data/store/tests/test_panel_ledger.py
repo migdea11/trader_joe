@@ -198,7 +198,6 @@ class World:
             'version_no': number,
             'enabled': True,
             'cadence': PanelCadence.DAILY,
-            'size': 10,
             'actor': 'operator',
             'reason': f'settings {number}',
         } | kw

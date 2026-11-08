@@ -1,7 +1,7 @@
 <script setup lang="ts">
-// Create a panel (tj-7zjov1.37; owner ruling 2026-10-27: a UI action with a recorded reason). Name, source,
-// enabled, size, cadence (shown as Monthly (default) and sent UNSPECIFIED unless the operator picks one),
-// the filters and a required reason. The source's four settings fields show only while the source has no
+// Create a panel (tj-7zjov1.37; owner ruling 2026-10-27: a UI action; the reason is optional since the ruling of 2026-11-06). Name, source,
+// enabled, cadence (shown as Monthly (default) and sent UNSPECIFIED unless the operator picks one),
+// the filters and an optional reason. The source's four settings fields show only while the source has no
 // settings version (its versions page is empty): ramp and cap are required then, the window days optional
 // (the store defaults them). The write does not run the first pass: the page shows the new panel as first
 // pass pending and re-reads it. Panels are UI-only; nothing here is a client or SDK surface.
@@ -70,8 +70,6 @@ const errors = computed(() =>
     source: source.value,
     sourceProblem: sourceProblem.value,
     sourceNeedsSettings: sourceNeedsSettings.value,
-    draft: draft.value,
-    reason: reason.value,
     ramp: ramp.value,
     cap: cap.value,
     pre: pre.value,
@@ -232,8 +230,6 @@ async function submit(): Promise<void> {
         id-prefix="create"
         :disabled="busy"
         :cadence-optional="true"
-        mark-required
-        :size-error="shown.size"
       />
 
       <template v-if="sourceNeedsSettings">
@@ -360,31 +356,16 @@ async function submit(): Promise<void> {
         <label
           class="pn-label"
           for="create-reason"
-        >{{ titleCase('Reason') }}<span
-          class="pn-required"
-          :class="{ 'pn-required--marked': shown.reason }"
-          aria-hidden="true"
-        > *</span></label>
+        >{{ titleCase('Reason') }} (optional)</label>
         <textarea
           id="create-reason"
           v-model="reason"
           class="pn-input"
           rows="2"
-          aria-required="true"
-          :aria-invalid="shown.reason ? 'true' : undefined"
-          :aria-describedby="shown.reason ? 'create-reason-error' : undefined"
           :disabled="busy"
-          placeholder="Why the panel is created; recorded with its first settings"
+          placeholder="Optional: why the panel is created"
           data-testid="create-reason"
         />
-        <p
-          v-if="shown.reason"
-          id="create-reason-error"
-          class="pn-field-error"
-          data-testid="create-reason-error"
-        >
-          {{ shown.reason }}
-        </p>
       </div>
       <p
         v-if="problem"

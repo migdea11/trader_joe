@@ -16,7 +16,8 @@ reachable, so a dry run that applies, or a kill switch that does not hold, write
 
 WHAT A BROKEN SWITCH NOW LEAVES, AND THE CLEANUP. A live pass on this panel (a failed kill switch, a dry run that
 applies) writes one clamp request and one bars request under PANEL_OWNER for SYMBOL, and the delivery intake mints a
-panel-owned DAILY dataset for SYMBOL. The size of 1 and the ramp of 1 bound that to one dataset an hour; nothing else
+panel-owned DAILY dataset for SYMBOL. The one-symbol allow list (a panel has no size since ADR tj-46jkey) and the
+ramp of 1 bound that to one dataset an hour; nothing else
 of the database is touched. delete_s6_rows removes it with the panel: it waits for those requests to finish (ingest
 may still deliver them, and a report for a deleted request is refused and redelivered), then deletes their attempt
 rows, the requests and the dataset (its bars cascade). On a clean stack there is none.
@@ -76,7 +77,7 @@ SOURCE = DataSource.ALPACA_API
 SYMBOL = FAKE_LISTED_SYMBOLS[0]
 NAME_PREFIX = 'p26-phase-s6-'
 REASON_PREFIX = 'p26-phase-s6 rates'
-SETTINGS_V1 = PanelSettings(enabled=True, size=1, cadence=PanelCadence.DAILY, allow_symbols=(SYMBOL,))
+SETTINGS_V1 = PanelSettings(enabled=True, cadence=PanelCadence.DAILY, allow_symbols=(SYMBOL,))
 LIVE_RATES = SourceSettings(ramp_datasets_per_hour=1, request_cap_per_hour=2)
 OPEN_STATES = (IngestRequestState.PENDING, IngestRequestState.QUEUED, IngestRequestState.NOT_DELIVERED)
 # A broken switch's two requests are served by FakeRead at once; this bounds the wait before their rows are deleted.

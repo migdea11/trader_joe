@@ -701,10 +701,7 @@ def _refuse(detail: str) -> InvalidRequestError:
 
 def _panel_settings_message(settings: PanelSettings) -> panels_pb2.PanelSettings:
     message = panels_pb2.PanelSettings(
-        enabled=settings.enabled,
-        size=settings.size,
-        allow_symbols=list(settings.allow_symbols),
-        deny_symbols=list(settings.deny_symbols),
+        enabled=settings.enabled, allow_symbols=list(settings.allow_symbols), deny_symbols=list(settings.deny_symbols)
     )
     if settings.cadence is not None:
         message.cadence = _CADENCE.to_proto(settings.cadence)
@@ -728,7 +725,9 @@ def _effective_pass_message(effective: PassRef) -> panels_pb2.EffectivePass:
 def panel_settings_version_message(row: SettingsVersionRow) -> panels_pb2.PanelSettingsVersion:
     """One panel settings version as a PanelSettingsVersion: the full settings, the marker, the effective pass if any."""
     record = row.record
-    message = panels_pb2.PanelSettingsVersion(version_no=record.version_no, actor=record.actor, reason=record.reason)
+    message = panels_pb2.PanelSettingsVersion(
+        version_no=record.version_no, actor=record.actor, reason=record.reason or ''
+    )
     message.settings.CopyFrom(_panel_settings_message(record.settings))
     message.saved_at.CopyFrom(to_timestamp(record.saved_at))
     if row.effective is not None:
@@ -743,7 +742,7 @@ def panel_source_settings_version_message(row: SourceVersionRow) -> panels_pb2.P
         source=DATA_SOURCE.to_proto(record.source),
         version_no=record.version_no,
         actor=record.actor,
-        reason=record.reason,
+        reason=record.reason or '',
         settings=panels_pb2.PanelSourceSettings(
             ramp_datasets_per_hour=record.settings.ramp_datasets_per_hour,
             request_cap_per_hour=record.settings.request_cap_per_hour,
@@ -888,11 +887,9 @@ def corporate_action_page_message(page: ActionPageView) -> panels_pb2.CorporateA
 
 
 def _panel_settings_of(request: Any) -> PanelSettings:
-    """The panel settings fields 1 to 9 shared by the save and create bodies; absent enabled or size is a 422."""
+    """The panel settings fields 1 to 9 shared by the save and create bodies; an absent enabled is a 422."""
     if not request.HasField('enabled'):
         raise _refuse('enabled is required.')
-    if not request.HasField('size'):
-        raise _refuse('size is required.')
     try:
         asset_class = ASSET_TYPE.to_domain(request.asset_class) if request.HasField('asset_class') else None
         cadence = (
@@ -902,7 +899,6 @@ def _panel_settings_of(request: Any) -> PanelSettings:
         raise _refuse('asset_class and cadence must name a value this release knows.') from None
     return PanelSettings(
         enabled=request.enabled,
-        size=request.size,
         cadence=cadence,
         allow_symbols=tuple(request.allow_symbols),
         deny_symbols=tuple(request.deny_symbols),
@@ -914,7 +910,7 @@ def _panel_settings_of(request: Any) -> PanelSettings:
 
 
 def save_panel_settings_values(request: panels_pb2.SavePanelSettingsRequest) -> tuple[PanelSettings, str]:
-    """A SavePanelSettingsRequest as plain values: the settings and the reason.
+    """A SavePanelSettingsRequest as plain values: the settings and the optional reason (empty means none).
 
     A new version states its cadence in full, so an UNSPECIFIED one is refused here (422).
 
@@ -922,10 +918,11 @@ def save_panel_settings_values(request: panels_pb2.SavePanelSettingsRequest) -> 
         request: The parsed body.
 
     Returns:
-        tuple[PanelSettings, str]: The settings and the reason as sent (the store trims and checks it).
+        tuple[PanelSettings, str]: The settings and the reason as sent, possibly empty (the store trims it and
+            keeps NULL for a blank one).
 
     Raises:
-        InvalidRequestError: INVALID_REQUEST (422) for an absent enabled or size, an UNSPECIFIED cadence, or a value
+        InvalidRequestError: INVALID_REQUEST (422) for an absent enabled, an UNSPECIFIED cadence, or a value
             this release does not know.
     """
     settings = _panel_settings_of(request)
@@ -994,7 +991,7 @@ def create_panel_values(request: panels_pb2.CreatePanelRequest) -> CreatePanelVa
         CreatePanelValues: The name, source, settings, optional source settings and reason.
 
     Raises:
-        InvalidRequestError: INVALID_REQUEST (422) for an absent enabled or size, an UNSPECIFIED or unknown source, a
+        InvalidRequestError: INVALID_REQUEST (422) for an absent enabled, an UNSPECIFIED or unknown source, a
             window without both rates, or a value this release does not know.
     """
     settings = _panel_settings_of(request)

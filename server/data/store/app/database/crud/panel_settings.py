@@ -4,8 +4,8 @@ Design: ADR tj-26jt9w addendum 20, owner rulings 2026-10-27. EVERY TABLE HERE IS
 there is no update and no delete function, and none may be added. A change is a new version row. Enable and disable are
 versions too.
 
-A VERSION ROW IS A MARKER: saved_at (database time), actor and reason. The reason is stored trimmed and a blank one is
-refused. EFFECTIVE-FROM IS DERIVED and has no column, and has ONE definition, the boundary read's (crud/panel_ledger.py
+A VERSION ROW IS A MARKER: saved_at (database time), actor and reason. The reason is OPTIONAL: stored trimmed, and a blank
+or missing one is stored as NULL (ADR tj-46jkey, owner ruling 2026-11-06). The actor is still required. EFFECTIVE-FROM IS DERIVED and has no column, and has ONE definition, the boundary read's (crud/panel_ledger.py
 boundary_read): the started_at of the first non-dry-run pass OF THIS PANEL that names the version.
 
 A PANEL'S SOURCE NEVER CHANGES: no function takes a source for an existing panel (another source is another panel).
@@ -13,7 +13,7 @@ A PANEL'S SOURCE NEVER CHANGES: no function takes a source for an existing panel
 NO FALLBACK NUMBERS. The two hourly rates have no ruled default, so current_source_settings answers None for a source
 with no version, and create_panel refuses a source without settings unless the call carries them. The only defaults named
 are the ruled ones: DEFAULT_PANEL_CADENCE (MONTHLY, applied by create_panel when the caller names no cadence) and the
-90-day corporate-action window on both sides. The size has no default either.
+90-day corporate-action window on both sides. A panel has no size: it selects every asset its filters match.
 
 Each write commits on its own, through write_transaction, on the session the caller hands in.
 """
@@ -50,7 +50,7 @@ _SOURCE_SETTINGS = PanelSourceSettingsVersion.__table__
 
 @dataclass(frozen=True)
 class PanelSettings:
-    """A panel's own settings, as sent: enabled, cadence, size and the filters. The size has no default.
+    """A panel's own settings, as sent: enabled, cadence and the filters.
 
     cadence None means 'not named': create_panel applies DEFAULT_PANEL_CADENCE, append_settings_version refuses it
     (a new version states its cadence in full). The filters restrict nothing at their neutral value: an empty
@@ -58,7 +58,6 @@ class PanelSettings:
     """
 
     enabled: bool
-    size: int
     cadence: PanelCadence | None = None
     allow_symbols: Sequence[str] = ()
     deny_symbols: Sequence[str] = ()
@@ -103,7 +102,7 @@ class PanelSettingsRecord:
     settings: PanelSettings
     saved_at: datetime
     actor: str
-    reason: str
+    reason: str | None
 
 
 @dataclass(frozen=True)
@@ -116,7 +115,7 @@ class SourceSettingsRecord:
     settings: SourceSettings
     saved_at: datetime
     actor: str
-    reason: str
+    reason: str | None
 
 
 @dataclass(frozen=True)
@@ -131,22 +130,18 @@ def _refuse(detail: str) -> InvalidRequestError:
     return InvalidRequestError(Reason.INVALID_REQUEST, detail)
 
 
-def _marker(actor: str, reason: str) -> tuple[str, str]:
-    """Return the trimmed actor and reason, refusing either when blank."""
+def _marker(actor: str, reason: str | None) -> tuple[str, str | None]:
+    """Return the trimmed actor, refusing a blank one, and the trimmed reason, None when missing or blank."""
     trimmed_actor = actor.strip()
-    trimmed_reason = reason.strip()
     if not trimmed_actor:
         raise _refuse('A settings version needs an actor.')
-    if not trimmed_reason:
-        raise _refuse('A settings version needs a non-blank reason.')
-    return trimmed_actor, trimmed_reason
+    trimmed_reason = reason.strip() if reason is not None else ''
+    return trimmed_actor, trimmed_reason or None
 
 
 def _check_panel_settings(settings: PanelSettings, cadence: PanelCadence | None) -> PanelCadence:
     if cadence is None:
         raise _refuse('A settings version needs a cadence.')
-    if settings.size < 0:
-        raise _refuse('The panel size cannot be negative.')
     return cadence
 
 
@@ -162,14 +157,13 @@ def _check_source_settings(settings: SourceSettings) -> None:
 
 
 def _panel_settings_values(
-    panel_id: uuid.UUID, version_no: int, settings: PanelSettings, cadence: PanelCadence, actor: str, reason: str
+    panel_id: uuid.UUID, version_no: int, settings: PanelSettings, cadence: PanelCadence, actor: str, reason: str | None
 ) -> dict:
     return {
         'panel_id': panel_id,
         'version_no': version_no,
         'enabled': settings.enabled,
         'cadence': cadence,
-        'size': settings.size,
         'allow_symbols': list(settings.allow_symbols),
         'deny_symbols': list(settings.deny_symbols),
         'asset_class': settings.asset_class,
@@ -182,7 +176,7 @@ def _panel_settings_values(
 
 
 def _source_settings_values(
-    source: DataSource, version_no: int, settings: SourceSettings, actor: str, reason: str
+    source: DataSource, version_no: int, settings: SourceSettings, actor: str, reason: str | None
 ) -> dict:
     return {
         'source': source,
@@ -207,7 +201,6 @@ def _settings_record(row) -> PanelSettingsRecord:
         version_no=row.version_no,
         settings=PanelSettings(
             enabled=row.enabled,
-            size=row.size,
             cadence=row.cadence,
             allow_symbols=tuple(row.allow_symbols),
             deny_symbols=tuple(row.deny_symbols),
@@ -262,7 +255,7 @@ async def _next_source_version_no(db: AsyncSession, source: DataSource) -> int:
 
 
 async def _insert_source_settings(
-    db: AsyncSession, source: DataSource, settings: SourceSettings, actor: str, reason: str
+    db: AsyncSession, source: DataSource, settings: SourceSettings, actor: str, reason: str | None
 ) -> SourceSettingsRecord:
     version_no = await _next_source_version_no(db, source)
     result = await db.execute(
@@ -291,7 +284,7 @@ async def create_panel(
     source: DataSource,
     settings: PanelSettings,
     actor: str,
-    reason: str,
+    reason: str | None,
     source_settings: SourceSettings | None = None,
 ) -> tuple[PanelRecord, PanelSettingsRecord]:
     """Create a panel and its settings version 1 in one transaction.
@@ -310,14 +303,14 @@ async def create_panel(
         source: The panel's source, fixed for the panel's life.
         settings: The first settings version.
         actor: The operator principal.
-        reason: Why the panel was created; stored trimmed, never blank.
+        reason: Why the panel was created, optional; stored trimmed, NULL when None or blank.
         source_settings: The source's settings; accepted only when the source has no settings version yet.
 
     Returns:
         tuple[PanelRecord, PanelSettingsRecord]: The panel and its version 1.
 
     Raises:
-        InvalidRequestError: INVALID_REQUEST, a blank name, actor or reason, a negative number, a name already used, or
+        InvalidRequestError: INVALID_REQUEST, a blank name or actor, a negative number, a name already used, or
             a source with no settings and none given (the rates have no ruled default), or source settings given for a
             source that already has a version. Nothing is written.
     """
@@ -370,7 +363,7 @@ async def create_panel(
 
 
 async def append_settings_version(
-    db: AsyncSession, *, panel_id: uuid.UUID, settings: PanelSettings, actor: str, reason: str
+    db: AsyncSession, *, panel_id: uuid.UUID, settings: PanelSettings, actor: str, reason: str | None
 ) -> PanelSettingsRecord:
     """Append a panel's next settings version: a full new row, version_no plus one, saved_at by the database.
 
@@ -381,14 +374,13 @@ async def append_settings_version(
         panel_id: The panel.
         settings: The complete new settings; its cadence must be named.
         actor: The operator principal.
-        reason: Why; stored trimmed, never blank.
+        reason: Why, optional; stored trimmed, NULL when None or blank.
 
     Returns:
         PanelSettingsRecord: The new version.
 
     Raises:
-        InvalidRequestError: NOT_FOUND, no such panel; INVALID_REQUEST, a blank actor or reason, a missing cadence or a
-            negative size. Nothing is written.
+        InvalidRequestError: NOT_FOUND, no such panel; INVALID_REQUEST, a blank actor or a missing cadence. Nothing is written.
     """
     trimmed_actor, trimmed_reason = _marker(actor, reason)
     cadence = _check_panel_settings(settings, settings.cadence)
@@ -412,7 +404,7 @@ async def append_settings_version(
 
 
 async def append_source_settings_version(
-    db: AsyncSession, *, source: DataSource, settings: SourceSettings, actor: str, reason: str
+    db: AsyncSession, *, source: DataSource, settings: SourceSettings, actor: str, reason: str | None
 ) -> SourceSettingsRecord:
     """Append a source's next settings version: a full new row, version_no plus one, saved_at by the database.
 
@@ -421,13 +413,13 @@ async def append_source_settings_version(
         source: The source the rates and the window apply to.
         settings: The complete new settings.
         actor: The operator principal.
-        reason: Why; stored trimmed, never blank.
+        reason: Why, optional; stored trimmed, NULL when None or blank.
 
     Returns:
         SourceSettingsRecord: The new version.
 
     Raises:
-        InvalidRequestError: INVALID_REQUEST, a blank actor or reason or a negative number. Nothing is written.
+        InvalidRequestError: INVALID_REQUEST, a blank actor or a negative number. Nothing is written.
     """
     trimmed_actor, trimmed_reason = _marker(actor, reason)
     _check_source_settings(settings)

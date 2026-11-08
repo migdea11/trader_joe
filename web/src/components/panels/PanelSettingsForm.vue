@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // The selected panel's settings panel (tj-7zjov1.37): the current settings version, an edit form and
-// Enable or Disable, each a settings write (POST settings-versions) that needs a reason. A write appends a
+// Enable or Disable, each a settings write (POST settings-versions) with an optional reason. A write appends a
 // new version and replaces the settings as sent, so Enable or Disable sends the SAVED settings with only
 // `enabled` flipped (unsaved edits in the form are not smuggled in), and Save Settings sends the form.
 // The server stamps the actor and the time and decides whether the values are allowed; a refusal leaves
@@ -49,8 +49,7 @@ function reset(): void {
 // A different panel, or a newer saved version, starts the form over from what is saved.
 watch(() => `${props.detail.id}:${current.value?.versionNo ?? 0}`, reset)
 
-const problem = computed(() => draftProblem(draft.value, reason.value, { cadenceRequired: true }))
-const reasonProblem = computed(() => (reason.value.trim() === '' ? 'Give a reason for the change.' : ''))
+const problem = computed(() => draftProblem(draft.value, { cadenceRequired: true }))
 
 const versionText = computed(() => {
   const version = current.value
@@ -77,7 +76,7 @@ async function saveEdits(): Promise<void> {
 
 async function toggleEnabled(): Promise<void> {
   const saved = settings.value
-  if (busy.value || reasonProblem.value !== '' || saved === undefined) return
+  if (busy.value || saved === undefined) return
   await save(settingsInitWithEnabled(saved, !saved.enabled))
 }
 </script>
@@ -108,12 +107,6 @@ async function toggleEnabled(): Promise<void> {
         <dt>{{ titleCase('Cadence') }}</dt>
         <dd data-fact="cadence">
           {{ cadenceLabel(settings.cadence) }}
-        </dd>
-      </div>
-      <div>
-        <dt>{{ titleCase('Size') }}</dt>
-        <dd data-fact="size">
-          {{ settings.size }}
         </dd>
       </div>
       <div>
@@ -151,14 +144,14 @@ async function toggleEnabled(): Promise<void> {
         <label
           class="pn-label"
           for="settings-reason"
-        >{{ titleCase('Reason') }}</label>
+        >{{ titleCase('Reason') }} (optional)</label>
         <textarea
           id="settings-reason"
           v-model="reason"
           class="pn-input"
           rows="2"
           :disabled="busy"
-          placeholder="Why the settings change; recorded with the new version"
+          placeholder="Optional: why the settings change"
           data-testid="settings-reason"
         />
       </div>
@@ -181,7 +174,7 @@ async function toggleEnabled(): Promise<void> {
         <button
           type="button"
           class="pn-btn"
-          :disabled="busy || reasonProblem !== ''"
+          :disabled="busy"
           data-testid="settings-toggle"
           @click="toggleEnabled"
         >
@@ -189,7 +182,7 @@ async function toggleEnabled(): Promise<void> {
         </button>
       </div>
       <p class="pn-hint">
-        Each change is a new settings version, recorded with the reason. It takes effect from the next pass.
+        Each change is a new settings version, recorded with the reason, if one is given. It takes effect from the next pass.
       </p>
     </form>
 

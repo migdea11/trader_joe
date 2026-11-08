@@ -136,7 +136,7 @@ export function getCorporateActions(datasetId: string, params: PageParams = {}):
   )
 }
 
-/** POST /ui/v1/panels (W1): create a panel with a recorded reason. Answers 201 with the PanelDetail. */
+/** POST /ui/v1/panels (W1): create a panel, with an optional reason (blank means none). Answers 201 with the PanelDetail. */
 export function createPanel(params: CreatePanelParams, signal?: AbortSignal): Promise<PanelDetail> {
   return postMessage(PanelDetailSchema, '/ui/v1/panels', {
     body: bodyOf(CreatePanelRequestSchema, params),

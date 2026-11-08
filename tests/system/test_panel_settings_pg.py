@@ -1,7 +1,8 @@
 """The panel settings repository and the reserved panel owner (tj-7zjov1.176, P20b) on the real, migrated Postgres.
 
 WRITTEN, NOT YET RUN where it was written (validator tj-7zjov1.178): it runs with the rest of the suite (make
-test-system, or the agent-stack run_system_tests after test_up) on a stack migrated to the head (b6d1f93a7c42 or later).
+test-system, or the agent-stack run_system_tests after test_up) on a stack migrated to the alpha baseline (ADR
+tj-kg521d).
 
 THE DESIGN: ADR tj-26jt9w addendum 20 and the P20b architect note of 03:25 UTC 2026-10-28. WHAT THIS PROVES that
 server/data/store/tests/test_panel_settings.py cannot, because SQLite has one writer, no row locks, no advisory locks,
@@ -11,7 +12,9 @@ no arrays and no Postgres enums:
   PS2 version numbering of ONE SOURCE is serialised by the transaction advisory lock: concurrent
       append_source_settings_version calls all succeed with consecutive numbers;
   PS3 the rows round-trip on asyncpg: the varchar[] filters, the panel_cadence and assettype enums, NULL filters,
-      saved_at the DATABASE's clock (inside the transaction window read from now()), the window defaulted to 90;
+      saved_at the DATABASE's clock (inside the transaction window read from now()), the window defaulted to 90; and a
+      version with NO reason (ADR tj-46jkey) on both version tables: stored NULL, which the kept not-blank CHECKs pass
+      on Postgres, and read back as None;
   PS4 (retired by tj-7zjov1.209/.210: effective-from has ONE definition, crud/panel_ledger.py boundary_read's, per
       panel and non-dry-run, pinned on Postgres in test_panel_ledger_pg.py; the two P20b functions are deleted);
   PS7 create_panel REFUSES source settings for a source that already has a version (INVALID_REQUEST) and writes
@@ -80,7 +83,7 @@ REQUESTS = IngestRequest.__table__
 SOURCE = DataSource.MANUAL_ENTRY
 CONCURRENT = 8
 RATES = SourceSettings(ramp_datasets_per_hour=5, request_cap_per_hour=60)
-SETTINGS_V1 = PanelSettings(enabled=True, size=10, cadence=PanelCadence.DAILY)
+SETTINGS_V1 = PanelSettings(enabled=True, cadence=PanelCadence.DAILY)
 REFUSAL = "The owner 'panel' is reserved for the panel manager: use another owner."
 
 
@@ -144,7 +147,7 @@ async def test_concurrent_versions_of_one_panel_are_numbered_without_a_gap_or_a_
             return await append_settings_version(
                 db,
                 panel_id=record.id,
-                settings=PanelSettings(enabled=True, size=index, cadence=PanelCadence.WEEKLY),
+                settings=PanelSettings(enabled=True, cadence=PanelCadence.WEEKLY, allow_symbols=(f'ZZPNL{index}',)),
                 actor='operator',
                 reason=f'concurrent {index}',
             )
@@ -191,7 +194,6 @@ async def test_a_full_version_round_trips_on_asyncpg_with_the_database_clock(pg_
     record, version_1, source_version = panel
     settings = PanelSettings(
         enabled=False,
-        size=0,
         cadence=PanelCadence.MONTHLY,
         allow_symbols=('ZZPNLA', 'ZZPNLB'),
         deny_symbols=('ZZPNLC',),
@@ -218,6 +220,39 @@ async def test_a_full_version_round_trips_on_asyncpg_with_the_database_clock(pg_
     window = source_version.settings
     assert (window.corporate_action_window_pre_days, window.corporate_action_window_post_days) == (90, 90)
     assert (window.ramp_datasets_per_hour, window.request_cap_per_hour) == (5, 60)
+
+
+@pytest.mark.asyncio
+async def test_a_version_with_no_reason_is_stored_null_on_postgres_and_a_blank_one_too(
+    pg_async_engine, pg_engine, panel, written
+):
+    """ADR tj-46jkey on the real schema: the reason columns are NULLABLE and the not-blank CHECKs pass a NULL.
+
+    The CHECKs are kept ('NULL or non-blank'), so a raw '' or '  ' is still refused by Postgres itself: the store's
+    trim-to-NULL is the only way a blank reaches the table, and NULL is the one spelling of 'none'.
+    """
+    record, _, _ = panel
+    async with AsyncSession(pg_async_engine, expire_on_commit=False) as db:
+        version = await append_settings_version(
+            db, panel_id=record.id, settings=SETTINGS_V1, actor='operator', reason=None
+        )
+    async with AsyncSession(pg_async_engine, expire_on_commit=False) as db:
+        source_version = await append_source_settings_version(
+            db, source=SOURCE, settings=RATES, actor='operator', reason='   '
+        )
+    written.source_versions.append(source_version.id)
+    async with AsyncSession(pg_async_engine) as db:
+        assert (await current_settings(db, record.id)).reason is None
+    with pg_engine.connect() as conn:
+        assert conn.execute(sa.select(SETTINGS.c.reason).where(SETTINGS.c.id == version.id)).scalar_one() is None
+        assert (
+            conn.execute(sa.select(SOURCE_SETTINGS.c.reason).where(SOURCE_SETTINGS.c.id == source_version.id))
+        ).scalar_one() is None
+    for blank in ('', '  '):
+        with pg_engine.connect() as conn, pytest.raises(sa.exc.IntegrityError):
+            conn.execute(
+                sa.update(SETTINGS).where(SETTINGS.c.id == version.id).values(reason=blank)
+            )  # a test-only write: the CHECK, not the module, refuses it
 
 
 # --------------------------------------------------------------------------------------------- PS7 the source guard
@@ -415,7 +450,7 @@ async def test_enabled_panels_on_source_compiles_and_reads_the_latest_version_on
         off = await append_settings_version(
             db,
             panel_id=record.id,
-            settings=PanelSettings(enabled=False, size=10, cadence=PanelCadence.DAILY),
+            settings=PanelSettings(enabled=False, cadence=PanelCadence.DAILY),
             actor='operator',
             reason='pause',
         )

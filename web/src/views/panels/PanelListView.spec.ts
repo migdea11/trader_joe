@@ -77,7 +77,7 @@ function detailOf(id: string, effective = true) {
     source: DataSource.ALPACA_API,
     currentVersion: create(PanelSettingsVersionSchema, {
       versionNo: 2,
-      settings: create(PanelSettingsSchema, { enabled: true, cadence: PanelCadence.MONTHLY, size: 50 }),
+      settings: create(PanelSettingsSchema, { enabled: true, cadence: PanelCadence.MONTHLY }),
       actor: 'operator',
       reason: 'first',
       effectivePass: effective ? pass : undefined,
@@ -243,9 +243,10 @@ describe('PanelListView', () => {
     expect(byId(view, 'panel-create').exists()).toBe(false)
   })
 
+  // tj-7zjov1.362.4: name and source are enough; no reason typed reaches the client as ''.
   it('a create posts once, closes the form and shows the new panel', async () => {
     const C = '9b2f7d4e-1c3a-4e5f-8a6b-7c8d9e0f1a2b'
-    const created = create(PanelDetailSchema, { id: C, name: 'Mid caps', source: DataSource.ALPACA_API, currentVersion: { versionNo: 1, settings: { size: 5 } } })
+    const created = create(PanelDetailSchema, { id: C, name: 'Mid caps', source: DataSource.ALPACA_API, currentVersion: { versionNo: 1, settings: { enabled: true } } })
     api.createPanel.mockResolvedValue(created)
     const view = await page()
     api.listPanels.mockResolvedValue(create(PanelListSchema, { items: [create(PanelListItemSchema, { id: C, name: 'Mid caps', source: DataSource.ALPACA_API })] }))
@@ -255,12 +256,11 @@ describe('PanelListView', () => {
     await byId(view, 'create-name').setValue('Mid caps')
     await byId(view, 'create-source').findAll('option')[1]!.setValue()
     await flushPromises()
-    await byId(view, 'create-size').setValue('5')
-    await byId(view, 'create-reason').setValue('mid')
     await view.find('[data-testid="panel-create"] form').trigger('submit')
     await flushPromises()
     expect(api.createPanel).toHaveBeenCalledTimes(1)
-    expect(api.createPanel.mock.calls[0]![0]).toMatchObject({ name: 'Mid caps', source: DataSource.ALPACA_API, size: 5, reason: 'mid' })
+    expect(api.createPanel.mock.calls[0]![0]).toMatchObject({ name: 'Mid caps', source: DataSource.ALPACA_API, reason: '' })
+    expect(Object.hasOwn(api.createPanel.mock.calls[0]![0] as object, 'size')).toBe(false)
     expect(byId(view, 'panel-create').exists()).toBe(false)
     expect(view.find('.panels__name').text()).toContain('Mid caps')
     expect(byId(view, 'first-pass-pending').exists()).toBe(true)
@@ -276,7 +276,6 @@ describe('PanelListView', () => {
     expect(api.savePanelSettings).toHaveBeenCalledWith(A, {
       enabled: false,
       cadence: PanelCadence.MONTHLY,
-      size: 50,
       allowSymbols: [],
       denySymbols: [],
       assetClass: undefined,

@@ -141,7 +141,6 @@ def _settings_record(row) -> PanelSettingsRecord:
         version_no=row.version_no,
         settings=PanelSettings(
             enabled=row.enabled,
-            size=row.size,
             cadence=row.cadence,
             allow_symbols=tuple(row.allow_symbols),
             deny_symbols=tuple(row.deny_symbols),

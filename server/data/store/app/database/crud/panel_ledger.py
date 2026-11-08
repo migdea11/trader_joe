@@ -139,17 +139,16 @@ class SettingsBoundary:
     """One panel settings version and when it took effect.
 
     effective_from is the started_at of the first non-dry-run pass (either kind) of the panel naming the version, None
-    while none has. actor, reason and saved_at are the version's own marker: who changed the settings, why, when.
+    while none has. actor, reason and saved_at are the version's own marker: who changed the settings, why (None when no reason was given), when.
     """
 
     version_id: uuid.UUID
     version_no: int
     enabled: bool
     cadence: PanelCadence
-    size: int
     saved_at: datetime
     actor: str
-    reason: str
+    reason: str | None
     effective_pass_id: uuid.UUID | None
     effective_from: datetime | None
 
@@ -169,7 +168,7 @@ class SourceSettingsBoundary:
     corporate_action_window_post_days: int
     saved_at: datetime
     actor: str
-    reason: str
+    reason: str | None
     effective_pass_id: uuid.UUID | None
     effective_from: datetime | None
 
@@ -548,7 +547,6 @@ async def boundary_read(db: AsyncSession, panel_id: uuid.UUID) -> BoundaryRead:
                 version_no=row.version_no,
                 enabled=row.enabled,
                 cadence=row.cadence,
-                size=row.size,
                 saved_at=row.saved_at,
                 actor=row.actor,
                 reason=row.reason,

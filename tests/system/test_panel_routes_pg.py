@@ -1,8 +1,9 @@
 """The /ui/v1 panel routes (tj-7zjov1.36, P24) on the running data_store and the real, migrated Postgres.
 
 WRITTEN, NOT YET RUN where it was written (validator P24v tj-7zjov1.241, 2026-11-01: no stack budget). It runs with the
-rest of the suite (make test-system, or the agent-stack run_system_tests after test_up) on a stack migrated to the head
-(b6d1f93a7c42 or later) whose data_store image was built from a SHA at or after c7388f4.
+rest of the suite (make test-system, or the agent-stack run_system_tests after test_up) on a stack migrated to the
+alpha baseline (ADR tj-kg521d). PR1 also round-trips a settings version with NO reason (ADR tj-46jkey): stored NULL on
+Postgres, absent from R2, R3 and R5.
 
 THE DESIGN: the ROUTE CONTRACT and READ RULES on tj-7zjov1.36 and ADR tj-26jt9w addenda 20 to 22. WHAT THIS PROVES that
 server/data/store/tests/test_panel_ui_reads.py and test_ui_panel_writes_route.py cannot, because SQLite has no Postgres
@@ -98,7 +99,7 @@ def _override_rows(pg_engine: Engine) -> int:
 def _create(data_store, pg_engine: Engine, written: Written, name: str, source: str = MANUAL) -> httpx.Response:
     """W1 for a DISABLED panel, giving the source's first settings only when the source has none yet."""
     has_version = data_store.get(f'/ui/v1/panel-sources/{source}/settings-versions').json().get('items')
-    body = {'name': name, 'source': source, 'enabled': False, 'size': 3, 'reason': 'system test panel'}
+    body = {'name': name, 'source': source, 'enabled': False, 'reason': 'system test panel'}
     response = data_store.post('/ui/v1/panels', json=body | ({} if has_version else RATES), auth='right')
     if response.status_code == 201:
         written.panels.append(uuid.UUID(response.json()['id']))
@@ -128,22 +129,31 @@ def test_every_panel_route_round_trips_on_postgres(data_store, pg_engine, writte
         json={
             'enabled': False,
             'cadence': 'PANEL_CADENCE_WEEKLY',
-            'size': 4,
             'allowSymbols': ['ZZA', 'ZZB'],
             'denySymbols': ['ZZC'],
             'assetClass': 'ASSET_TYPE_STOCK',
-            'reason': 'system test v2',
+            # No reason: optional since ADR tj-46jkey. Stored NULL (the not-blank CHECK passes a NULL on Postgres),
+            # served as '' (absent from canonical JSON) by R2, R3 and R5 below.
+            'reason': '  ',
         },
         auth='right',
     )
     assert saved.status_code == 201 and saved.json()['versionNo'] == 2, data_store.describe(saved)
+    assert 'reason' not in saved.json() and 'size' not in saved.json()['settings']
+    with pg_engine.connect() as conn:
+        stored = conn.execute(
+            sa.select(SETTINGS.c.reason).where(SETTINGS.c.panel_id == uuid.UUID(panel), SETTINGS.c.version_no == 2)
+        ).scalar_one()
+    assert stored is None, f'a blank reason was stored as {stored!r}, not NULL'
     assert _override_rows(pg_engine) == overrides, 'a panel write added an override-log row'
 
     listed = [item for item in data_store.get('/ui/v1/panels').json()['items'] if item['id'] == panel]
     assert len(listed) == 1 and not listed[0].get('enabled', False)
-    assert data_store.get(f'/ui/v1/panels/{panel}').json()['currentVersion']['versionNo'] == 2
+    current = data_store.get(f'/ui/v1/panels/{panel}').json()['currentVersion']
+    assert current['versionNo'] == 2 and 'reason' not in current
     versions = data_store.get(f'/ui/v1/panels/{panel}/settings-versions', params={'limit': 1}).json()
     assert versions['items'][0]['settings']['allowSymbols'] == ['ZZA', 'ZZB'] and versions['nextCursor']
+    assert 'reason' not in versions['items'][0]
     rest = data_store.get(
         f'/ui/v1/panels/{panel}/settings-versions', params={'limit': 1, 'cursor': versions['nextCursor']}
     ).json()
@@ -152,7 +162,9 @@ def test_every_panel_route_round_trips_on_postgres(data_store, pg_engine, writte
     now = datetime.now(UTC)
     window = {'start': (now - timedelta(days=1)).isoformat(), 'end': (now + timedelta(days=1)).isoformat()}
     markers = data_store.get(f'/ui/v1/panels/{panel}/boundaries', params=window).json()['markers']
-    assert [m['versionNo'] for m in markers if m['kind'] == 'PANEL_MARKER_KIND_PANEL_SETTINGS'] == [1, 2]
+    panel_markers = [m for m in markers if m['kind'] == 'PANEL_MARKER_KIND_PANEL_SETTINGS']
+    assert [m['versionNo'] for m in panel_markers] == [1, 2]
+    assert panel_markers[0]['reason'] == 'system test panel' and 'reason' not in panel_markers[1]
     assert data_store.get(f'/ui/v1/panels/{panel}/members').json() == {}
     history = data_store.get(f'/ui/v1/panels/{panel}/asset-list-history', params=window)
     assert_problem(history, status=422, reason='INVALID_REQUEST', title='Unprocessable Entity')  # no calendar
@@ -171,7 +183,7 @@ async def test_concurrent_creates_of_one_name_leave_one_panel_and_answer_422_oth
     # Make sure MANUAL_ENTRY has a version first, so no create carries source settings (that race is PS8's).
     first = _create(data_store, pg_engine, written, f'{name}-seed')
     assert first.status_code == 201, data_store.describe(first)
-    body = {'name': name, 'source': MANUAL, 'enabled': False, 'size': 1, 'reason': 'race'}
+    body = {'name': name, 'source': MANUAL, 'enabled': False, 'reason': 'race'}
     headers = data_store._headers('right')
 
     async with httpx.AsyncClient(base_url=data_store_url, timeout=30.0) as client:

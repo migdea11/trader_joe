@@ -270,7 +270,13 @@ def test_the_second_versions_disable_the_panel_and_change_the_source(recorder):
     (source,) = recorder.named('append_source_settings_version')
     (version,) = recorder.named('append_settings_version')
     assert source['source'] is DataSource.ALPACA_API and source['actor'] == PANEL_ACTOR and source['reason'].strip()
-    assert version['panel_id'] == PANEL_ID and version['actor'] == PANEL_ACTOR and version['reason'].strip()
+    assert version['panel_id'] == PANEL_ID and version['actor'] == PANEL_ACTOR
+    # The one blank reason of the cast (ADR tj-46jkey: the reason is optional): the store stores it NULL, so the seed
+    # holds a version with no reason and the reads and markers that cope with it are exercised end to end.
+    assert version['reason'] == '', 'the disabling version is the cast version with no reason'
+    (create,) = recorder.named('create_panel')
+    assert create['reason'].strip(), 'version 1 keeps a reason, so the seed holds both shapes'
+    assert not hasattr(version['settings'], 'size') and not hasattr(create['settings'], 'size')
     assert version['settings'].enabled is False, 'a disable is a version too'
     assert version['settings'].cadence is PanelCadence.WEEKLY
     # Version 1 comes with create_panel, version 2 is this one; the source likewise.

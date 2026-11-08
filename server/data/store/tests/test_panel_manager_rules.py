@@ -23,6 +23,7 @@ ExchangeCalendarAdapter, (13) the cause constants, the creation ruling's re-crea
 
 import ast
 import inspect
+from dataclasses import fields
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -210,7 +211,7 @@ def row(vendor: str = 'v1', symbol: str = 'AAA', exchange: str = 'NYSE', active=
 
 
 def settings(**kw) -> PanelSettings:
-    return PanelSettings(enabled=True, size=kw.pop('size', 10), cadence=PanelCadence.DAILY, **kw)
+    return PanelSettings(enabled=True, cadence=PanelCadence.DAILY, **kw)
 
 
 ACTIVE = AssetListStatus.ACTIVE
@@ -266,7 +267,12 @@ def test_an_unsaid_tradable_flag_never_matches_a_tradable_filter(flag, wanted, s
     assert row_selected(row(tradable=flag), settings(tradable=None), STOCK, ACTIVE)
 
 
-def test_the_members_are_cut_to_size_in_symbol_order_then_vendor_id_after_the_filters():
+def test_every_filtered_match_is_a_member_in_symbol_order_then_vendor_id_with_no_cut():
+    """A panel has no size (ADR tj-46jkey, owner ruling 2026-11-06): select_members keeps EVERY row the filters pass.
+
+    The order stays (symbol, vendor asset id) whatever order the snapshot arrives in, because it is the order members
+    are created in under the ramp and of the ledger's per-pass seq.
+    """
     rows = [
         row('v5', 'EEE'),
         row('v2', 'BBB', tradable=False),
@@ -275,13 +281,30 @@ def test_the_members_are_cut_to_size_in_symbol_order_then_vendor_id_after_the_fi
         row('v3', 'CCC'),
         row('v4', 'DDD'),
     ]
-    chosen = select_members(rows, settings(size=3, tradable=True), STOCK, ACTIVE)
+    chosen = select_members(rows, settings(tradable=True), STOCK, ACTIVE)
     assert [(member.symbol, member.vendor_asset_id) for member in chosen] == [
         ('AAA', 'v1'),
         ('AAA', 'v9'),
         ('CCC', 'v3'),
+        ('DDD', 'v4'),
+        ('EEE', 'v5'),
     ]
-    assert select_members(list(reversed(rows)), settings(size=3, tradable=True), STOCK, ACTIVE) == chosen
+    assert select_members(list(reversed(rows)), settings(tradable=True), STOCK, ACTIVE) == chosen
+
+
+def test_a_large_snapshot_is_never_cut():
+    """No arbitrary cap: ten thousand matching rows are ten thousand members (the old default size was 10)."""
+    rows = [row(f'v{index:05d}', f'S{index:05d}') for index in range(10_000)]
+    chosen = select_members(list(reversed(rows)), settings(), STOCK, ACTIVE)
+    assert len(chosen) == 10_000
+    assert [member.vendor_asset_id for member in chosen] == [r.vendor_asset_id for r in rows]
+
+
+def test_panel_settings_carry_no_size():
+    """Removed outright, not defaulted: neither a field nor a keyword."""
+    assert 'size' not in {field.name for field in fields(PanelSettings)}
+    with pytest.raises(TypeError):
+        PanelSettings(enabled=True, size=10)  # type: ignore[call-arg]
 
 
 # ----------------------------------------------------------------------------------------------- R4 evidence
@@ -325,7 +348,7 @@ def test_no_snapshot_showing_the_outcome_falls_back_to_the_default():
 
 
 def test_pin_16a_a_baseline_already_showing_the_outcome_gives_the_default():
-    """The size-cut rule: the filters selected it at the previous pass's snapshot too, so they did not change it."""
+    """The baseline rule: the filters selected it at the previous pass's snapshot too, so they did not change it."""
     s0, s1 = snapshot(1), snapshot(2)
     default = utc(2026, 10, 9)
     rows = {(s0.id, 'v1'): row(), (s1.id, 'v1'): row()}

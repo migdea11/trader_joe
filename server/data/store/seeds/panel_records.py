@@ -158,7 +158,7 @@ async def seed_panel_records(url: URL, dataset_id: uuid.UUID) -> None:
                 db,
                 name=PANEL_NAME,
                 source=DataSource.ALPACA_API,
-                settings=panel_settings.PanelSettings(enabled=True, size=3, allow_symbols=('ZZSEEDXA', 'ZZSEEDXB')),
+                settings=panel_settings.PanelSettings(enabled=True, allow_symbols=('ZZSEEDXA', 'ZZSEEDXB')),
                 actor=PANEL_ACTOR,
                 reason='seed: create the panel',
                 source_settings=panel_settings.SourceSettings(ramp_datasets_per_hour=5, request_cap_per_hour=50),
@@ -200,7 +200,6 @@ async def seed_panel_records(url: URL, dataset_id: uuid.UUID) -> None:
                 panel_id=panel.id,
                 settings=panel_settings.PanelSettings(
                     enabled=False,
-                    size=2,
                     cadence=PanelCadence.WEEKLY,
                     deny_symbols=('ZZSEEDXC',),
                     exchange='SEEDX',
@@ -208,7 +207,8 @@ async def seed_panel_records(url: URL, dataset_id: uuid.UUID) -> None:
                     tradable=True,
                 ),
                 actor=PANEL_ACTOR,
-                reason='seed: disable the panel',
+                # Blank on purpose: the reason is optional, so the seed holds one version with none (stored NULL).
+                reason='',
             )
 
             await run_pass(

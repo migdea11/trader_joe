@@ -187,7 +187,7 @@ SYMBOL_PATH = {**ASSET_PATH, 'asset_symbol': 'AAPL'}
 # A complete StockDataMarketActivityCreate. Written out rather than minimised: the point of the
 # well-formed half is that nothing about the PAYLOAD can be blamed when a route misbehaves.
 #
-# SHAPE AS OF eec8f88a7443, and both halves of that change are visible here (tj-1njw7c). feed is a
+# SHAPE SINCE THE PER-DATASET IDENTITY (tj-1njw7c), and both halves of that change are visible here. feed is a
 # TOP-LEVEL key, a sibling of source, because it is declared on AssetDataCreate rather than on the
 # per-bar data model -- putting it inside `data` gets an extra_forbidden on the way in and a
 # missing-field error at the same time, which reads like two problems and is one. And expiry,
@@ -516,7 +516,6 @@ CASES: dict[str, Case] = {
                 'name': 'smoke',
                 'source': 'DATA_SOURCE_ALPACA_API',
                 'enabled': False,
-                'size': 1,
                 'reason': 'smoke',
                 'rampDatasetsPerHour': 1,
                 'requestCapPerHour': 2,
@@ -530,9 +529,9 @@ CASES: dict[str, Case] = {
     ),
     'POST /ui/v1/panels/{panel_id}/settings-versions': Case(
         path_params={'panel_id': str(DELETE_ID)},
-        request={'json': {'enabled': True, 'cadence': 'PANEL_CADENCE_DAILY', 'size': 1, 'reason': 'smoke'}},
+        request={'json': {'enabled': True, 'cadence': 'PANEL_CADENCE_DAILY', 'reason': 'smoke'}},
         malformed_path_params={'panel_id': 'not-a-uuid'},
-        malformed_request={'json': {'enabled': True, 'cadence': 'PANEL_CADENCE_DAILY', 'size': 1, 'reason': 'smoke'}},
+        malformed_request={'json': {'enabled': True, 'cadence': 'PANEL_CADENCE_DAILY', 'reason': 'smoke'}},
         malformed_field='panel_id',
         reads_one_row=True,
     ),

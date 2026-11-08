@@ -737,7 +737,6 @@ class World:
     async def panel(self, name: str, members: list[Asset], **filters: Any) -> PanelUnderTest:
         settings = PanelSettings(
             enabled=True,
-            size=10,
             cadence=PanelCadence.MONTHLY,
             allow_symbols=tuple(asset.symbol for asset in members),
             **filters,

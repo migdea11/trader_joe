@@ -8,19 +8,23 @@ The design is the bead's acceptance and the architect's notes on it (13:50 UTC 2
 * the enums mirror the store's PanelCadence (DAILY, WEEKLY, MONTHLY), PanelTransition and PanelPassKind by member
   NAME, after an UNSPECIFIED zero; the store-side half of the mirror is server/data/store/tests/
   test_panel_enums_mirror_ui_proto.py, since this suite cannot import the store;
-* settings split panel (enabled, cadence, size, filters) / source (ramp_datasets_per_hour, request_cap_per_hour,
+* settings split panel (enabled, cadence, filters) / source (ramp_datasets_per_hour, request_cap_per_hour,
   corporate_action_window_pre_days, corporate_action_window_post_days), the per-hour unit KEPT IN THE FIELD NAME
   because it is a reversible assumption;
 * settings versions carry version_no, saved_at, actor, reason and the derived effective pass (unset when none);
 * enable and disable are a settings version: the same write, no separate body;
-* every write carries a reason the route requires non-blank; what a proto can pin of that is a plain string field
-  (no presence, so absent and blank are the same value the route refuses) and the comment that says so;
+* every write carries a reason field, and the reason is OPTIONAL (owner ruling 2026-11-06, decision tj-46jkey section
+  2): a plain string field (no presence, so absent and blank are the same value, meaning none) whose comment says it
+  is optional and never refused; the version and marker reads say an empty reason means none was given;
+* a panel has NO SIZE (owner ruling 2026-11-06, decision tj-46jkey section 1): PanelSettings,
+  SavePanelSettingsRequest and CreatePanelRequest reserve field 3 and the name size, so neither can be reused and an
+  old sender's field 3 never parses as a value;
 * panel create is RULED (owner, 2026-10-27; the orchestrator correction of 2026-10-28 on tj-7zjov1.35): a UI write
-  with a reason, and still no client-facing panel API. P23b (tj-7zjov1.199) adds it ADDITIVELY as one flat body,
-  CreatePanelRequest: fields 1-9 identical to SavePanelSettingsRequest 1-9 (cadence UNSPECIFIED excepted: the store
-  applies MONTHLY), reason 10, name 11, source 12 and the optional first source settings 13-16; the response is the
-  existing PanelDetail, so no response message is added. The same bead fixes the changed_count (F3) and day-to-instant
-  (F7) comments of the P23 architect gate.
+  with an optional reason, and still no client-facing panel API. P23b (tj-7zjov1.199) adds it ADDITIVELY as one flat
+  body, CreatePanelRequest: fields 1-9 (3 reserved) identical to SavePanelSettingsRequest 1-9 (cadence UNSPECIFIED
+  excepted: the store applies MONTHLY), reason 10, name 11, source 12 and the optional first source settings 13-16;
+  the response is the existing PanelDetail, so no response message is added. The same bead fixes the changed_count
+  (F3) and day-to-instant (F7) comments of the P23 architect gate.
 
 Every message is pinned as its full field list (name, number, type, cardinality, presence), and the file's message
 and enum inventory as an exact set, because the file is new: an extra is a design change, not an append. Descriptors
@@ -171,7 +175,7 @@ def test_each_enum_opens_with_its_unspecified_zero(enum: str):
 PANEL_SETTINGS = [
     _f('enabled', 1, B),
     _f('cadence', 2, f'{UI}PanelCadence'),
-    _f('size', 3, I32),
+    # 3 was size: reserved by number and name (owner ruling 2026-11-06).
     _r('allow_symbols', 4, S),
     _r('deny_symbols', 5, S),
     # The four below filter only when present: absent is no filter, so presence is the point.
@@ -281,7 +285,7 @@ MESSAGES = {
     'SavePanelSettingsRequest': [
         _o('enabled', 1, B),
         _f('cadence', 2, f'{UI}PanelCadence'),
-        _o('size', 3, I32),
+        # 3 was size: reserved.
         _r('allow_symbols', 4, S),
         _r('deny_symbols', 5, S),
         _o('asset_class', 6, f'{M}AssetType'),
@@ -301,7 +305,7 @@ MESSAGES = {
     'CreatePanelRequest': [
         _o('enabled', 1, B),
         _f('cadence', 2, f'{UI}PanelCadence'),
-        _o('size', 3, I32),
+        # 3 was size: reserved.
         _r('allow_symbols', 4, S),
         _r('deny_symbols', 5, S),
         _o('asset_class', 6, f'{M}AssetType'),
@@ -340,6 +344,74 @@ def test_no_message_nests_a_type():
         m.name: [n.name for n in m.nested_type] + [e.name for e in m.enum_type] for m in file_named(PANELS).message_type
     }
     assert not {name: inner for name, inner in nested.items() if inner}, nested
+
+
+# ---------------------------------------------------------------------------------------------------
+# NO SIZE: FIELD 3 AND THE NAME RESERVED (owner ruling 2026-11-06, decision tj-46jkey section 1)
+
+SIZED_ONCE = ['CreatePanelRequest', 'PanelSettings', 'SavePanelSettingsRequest']
+
+
+def test_no_message_declares_a_size_field():
+    """A panel has no size: no message of the file, not only the three that had one, declares it again."""
+    found = {name: [f.name for f in message.field] for name, message in messages(file_named(PANELS)).items()}
+    assert 'enabled' in found['PanelSettings'], 'guard the guard: the sweep must see the settings fields'
+    assert not {name: fields for name, fields in found.items() if 'size' in fields}, found
+
+
+@pytest.mark.parametrize('message', SIZED_ONCE)
+def test_each_once_sized_message_reserves_field_3_and_the_name_size(message: str):
+    """Exactly 3 and exactly 'size': a field list that merely omits size would let a later edit reuse either.
+
+    Args:
+        message: A message that carried size before the owner ruling of 2026-11-06.
+    """
+    compiled = messages(file_named(PANELS))[message]
+    assert [(r.start, r.end) for r in compiled.reserved_range] == [(3, 4)], compiled.reserved_range
+    assert list(compiled.reserved_name) == ['size']
+    assert 3 not in {field.number for field in compiled.field}
+
+
+def _compile_with(message: str, line: str) -> subprocess.CompletedProcess:
+    """Compile panels.proto with LINE added as the first field of MESSAGE, from a copy shadowing the real file."""
+    source = (PROTO_ROOT / PANELS).read_text(encoding='utf-8')
+    opener = f'message {message} {{\n'
+    assert source.count(opener) == 1, f'{opener!r} must open exactly one message'
+    with tempfile.TemporaryDirectory() as tmp:
+        shadow = Path(tmp) / PANELS
+        shadow.parent.mkdir(parents=True)
+        shadow.write_text(source.replace(opener, f'{opener}  {line}\n'), encoding='utf-8')
+        out = Path(tmp) / 'out.bin'
+        return subprocess.run(
+            [
+                sys.executable,
+                '-m',
+                'grpc_tools.protoc',
+                f'-I{tmp}',
+                f'-I{PROTO_ROOT}',
+                f'--descriptor_set_out={out}',
+                PANELS,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=PROTOC_TIMEOUT_S,
+            check=False,
+        )
+
+
+@pytest.mark.parametrize('message', SIZED_ONCE)
+def test_neither_field_3_nor_the_name_size_can_be_reused(message: str):
+    """The compiler refuses both reuses; a field that is neither compiles, so the refusal is the reservation's.
+
+    Args:
+        message: A message that carried size before the owner ruling of 2026-11-06.
+    """
+    control = _compile_with(message, 'int32 reservation_probe = 99;')
+    assert control.returncode == 0, _ran(control)
+    by_number = _compile_with(message, 'int32 reservation_probe = 3;')
+    assert by_number.returncode != 0 and 'reserved' in by_number.stderr, _ran(by_number)
+    by_name = _compile_with(message, 'int32 size = 99;')
+    assert by_name.returncode != 0 and 'reserved' in by_name.stderr, _ran(by_name)
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -418,13 +490,13 @@ UNIT_SUFFIXES = ('_per_hour', '_days')
 def test_every_source_number_carries_its_unit_in_its_name(message: str):
     """The per-hour unit is a reversible assumption; a unit-free name would let a switch change meaning silently.
 
-    The create body's size is a panel number (a member count), not a source one, so it is left out by name.
+    With size removed (owner ruling 2026-11-06) the create body carries no panel number, so every int32 is a source one.
 
     Args:
         message: The source settings read or write, or the create body that carries the first source settings.
     """
     fields = messages(file_named(PANELS))[message].field
-    numbers = [field.name for field in fields if field.type == FIELD.TYPE_INT32 and field.name != 'size']
+    numbers = [field.name for field in fields if field.type == FIELD.TYPE_INT32]
     assert numbers == [
         'ramp_datasets_per_hour',
         'request_cap_per_hour',
@@ -441,6 +513,9 @@ def test_every_source_number_carries_its_unit_in_its_name(message: str):
 def test_the_write_body_is_the_read_settings_plus_a_reason(read: str, write: str):
     """Same names, numbers and types as the read, then reason; only presence may differ (absent is refused).
 
+    The reason takes the number after the read's last, NOT the read's field count plus one: PanelSettings skips the
+    reserved 3, so its eight fields end at 9 and the reason is 10.
+
     Args:
         read: The settings message a version carries.
         write: The body that saves a new version.
@@ -448,37 +523,39 @@ def test_the_write_body_is_the_read_settings_plus_a_reason(read: str, write: str
     read_fields = [_shape(field)[:4] for field in messages(file_named(PANELS))[read].field]
     write_fields = [_shape(field)[:4] for field in messages(file_named(PANELS))[write].field]
     assert write_fields[:-1] == read_fields
-    assert write_fields[-1] == ('reason', len(read_fields) + 1, S, False)
+    assert write_fields[-1] == ('reason', read_fields[-1][1] + 1, S, False)
 
 
 def test_the_create_body_1_to_9_are_the_settings_write_1_to_9_with_presence():
     """P23b (A): fields 1-9 IDENTICAL in name, number, type and presence to SavePanelSettingsRequest 1-9.
 
-    Read from the descriptors, not from MESSAGES, so a change to either body that the other does not follow is red.
+    3 is reserved in both (owner ruling 2026-11-06), so 1-9 is eight fields: 1, 2 and 4-9. Read from the descriptors,
+    not from MESSAGES, so a change to either body that the other does not follow is red.
     """
-    save = [_shape(field) for field in messages(file_named(PANELS))['SavePanelSettingsRequest'].field]
-    create = [_shape(field) for field in messages(file_named(PANELS))['CreatePanelRequest'].field]
-    assert [shape[1] for shape in save[:9]] == list(range(1, 10)), save
-    assert create[:9] == save[:9]
+    save = [_shape(f) for f in messages(file_named(PANELS))['SavePanelSettingsRequest'].field if f.number < 10]
+    create = [_shape(f) for f in messages(file_named(PANELS))['CreatePanelRequest'].field if f.number < 10]
+    assert [shape[1] for shape in save] == [1, 2, 4, 5, 6, 7, 8, 9], save
+    assert create == save
 
 
 def test_the_create_body_is_the_read_settings_plus_reason_name_source_and_the_first_source_settings():
     """Exactly the difference from the settings write: name and source, then the source settings, all four optional.
 
-    1-9 are PanelSettings' names, numbers and types; 10 is the same plain reason; 11 name and 12 source are plain
-    (presence-free, so blank and UNSPECIFIED are what the route refuses); 13-16 are PanelSourceSettings 1-4 shifted by
-    12, each `optional`, because all four absent means 'not given'.
+    1-9 are PanelSettings' names, numbers and types (eight fields: 3 is reserved in both); 10 is the same plain reason;
+    11 name and 12 source are plain (presence-free, so blank and UNSPECIFIED are what the route refuses); 13-16 are
+    PanelSourceSettings 1-4 shifted by 12, each `optional`, because all four absent means 'not given'.
     """
     panel = [_shape(field)[:4] for field in messages(file_named(PANELS))['PanelSettings'].field]
     source = [_shape(field) for field in messages(file_named(PANELS))['PanelSourceSettings'].field]
     create = [_shape(field) for field in messages(file_named(PANELS))['CreatePanelRequest'].field]
-    assert [shape[:4] for shape in create[:9]] == panel
-    assert create[9:12] == [
+    assert len(panel) == 8, panel
+    assert [shape[:4] for shape in create[:8]] == panel
+    assert create[8:11] == [
         ('reason', 10, S, False, False),
         ('name', 11, S, False, False),
         ('source', 12, f'{M}DataSource', False, False),
     ]
-    assert create[12:] == [(name, number + 12, kind, False, True) for name, number, kind, _, _ in source]
+    assert create[11:] == [(name, number + 12, kind, False, True) for name, number, kind, _, _ in source]
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -533,29 +610,49 @@ def _enum_path(enum: str) -> list[int]:
     return [ENUM_TYPE_PATH, [e.name for e in _with_source_info().enum_type].index(enum)]
 
 
-@pytest.mark.parametrize('message', ['SavePanelSettingsRequest', 'SaveSourceSettingsRequest', 'CreatePanelRequest'])
-def test_each_write_documents_its_reason_as_required_and_never_blank(message: str):
-    """As far as a proto can pin it: a plain string (above), and the comment the route is built from.
+WRITE_REASON = 'Optional: trimmed; blank or absent means none was given (never refused).'
+READ_REASON = 'Optional: empty means none was given.'
+REASONS = {
+    'SavePanelSettingsRequest': WRITE_REASON,
+    'SaveSourceSettingsRequest': WRITE_REASON,
+    'CreatePanelRequest': WRITE_REASON,
+    'PanelSettingsVersion': READ_REASON,
+    'PanelSourceSettingsVersion': READ_REASON,
+    'PanelMarker': READ_REASON,
+}
+
+
+def test_the_reason_sweep_reaches_every_message_with_a_reason():
+    """Guard the guard: REASONS names every message of the file that has a reason field, no more and no fewer."""
+    with_reason = [name for name, message in messages(file_named(PANELS)).items() if 'reason' in _fields(name)]
+    assert sorted(with_reason) == sorted(REASONS)
+
+
+@pytest.mark.parametrize('message', sorted(REASONS))
+def test_each_reason_is_documented_optional_and_never_required(message: str):
+    """Owner ruling 2026-11-06 (decision tj-46jkey section 2): a reason is optional on every write, empty means none.
+
+    The type is unchanged, a plain string with no presence, so absent and blank are one value; the comment says
+    optional and never says the old required, never-blank or refused-otherwise wording.
 
     Args:
-        message: A write body.
+        message: A write body, or a version or marker read that echoes the reason given.
     """
     field = _fields(message)['reason']
     assert field.type == FIELD.TYPE_STRING and not field.proto3_optional and field.label != FIELD.LABEL_REPEATED
     text = _comments(_path(message, 'reason'))
-    assert 'Required, not blank after trimming; refused (422) otherwise.' in text, text
+    assert REASONS[message] in text, text
+    assert not re.search(r'required|never blank|not blank|refused \(422\) otherwise', text, re.IGNORECASE), text
 
 
 @pytest.mark.parametrize(
     ('message', 'field', 'words'),
     [
         ('SavePanelSettingsRequest', 'enabled', 'an absent value is refused (422), never read as false'),
-        ('SavePanelSettingsRequest', 'size', 'absent is refused (422)'),
         ('SavePanelSettingsRequest', 'cadence', 'UNSPECIFIED is refused (422)'),
         ('SaveSourceSettingsRequest', 'ramp_datasets_per_hour', 'an absent one is refused (422), never read as zero'),
-        # P23b: the create body. enabled and size have no default on create either.
+        # P23b: the create body. enabled has no default on create either (size is removed, 2026-11-06).
         ('CreatePanelRequest', 'enabled', 'an absent value is refused (422), never read as false; there is no default'),
-        ('CreatePanelRequest', 'size', 'absent is refused (422)'),
         ('CreatePanelRequest', 'name', 'Required, trimmed, unique; blank or already used is refused (422).'),
         ('CreatePanelRequest', 'source', "Required; UNSPECIFIED is refused (422). Fixed for the panel's life."),
         (
@@ -633,7 +730,7 @@ def test_the_first_source_settings_no_longer_say_a_create_writes_the_next_versio
     'words',
     [
         'FLAT, because a nested PanelSettings cannot carry presence.',
-        'Fields 1-9 are identical in name, number, type and presence to SavePanelSettingsRequest 1-9.',
+        'Fields 1-9 (3 is reserved) are identical in name, number, type and presence to SavePanelSettingsRequest 1-9.',
         'The server stamps created_at, saved_at and actor; version 1 is written with the panel in one transaction.',
         'The RESPONSE is the created PanelDetail: current_version is version 1 with effective_pass unset, counts all zero.',
         'The FIRST PASS is not run by this write and is never in its response',
@@ -653,11 +750,14 @@ def test_the_create_body_documents_its_response_its_first_pass_and_its_refusals(
 
 
 def test_the_header_keeps_the_unit_states_ui_only_and_says_create_is_ruled():
-    """P23b (B): create is a ruled UI write with a reason; there is still no client-facing panel API."""
+    """P23b (B): create is a ruled UI write; its reason is optional (2026-11-06); still no client-facing panel API."""
     header = _comments([SYNTAX_PATH])
     assert 'UNITS ARE KEPT IN THE FIELD NAME' in header and 'reversible assumption' in header, header
     assert 'UI-ONLY' in header, header
-    assert 'PANEL CREATE is RULED (owner, 2026-10-27): a UI write with a recorded reason, CreatePanelRequest' in header
+    assert (
+        'PANEL CREATE is RULED (owner, 2026-10-27): a UI write with an optional recorded reason, CreatePanelRequest'
+        in header
+    ), header
     assert 'whose response is the existing PanelDetail' in header, header
     assert 'There is still no client-facing panel API.' in header, header
     assert 'deliberately absent' not in header and 'Q7' not in header, header
@@ -762,7 +862,6 @@ effective.started_at.FromJsonString('2026-10-28T20:15:00Z')
 settings = panels_pb2.PanelSettings(
     enabled=True,
     cadence=panels_pb2.PANEL_CADENCE_MONTHLY,
-    size=500,
     deny_symbols=['XYZ'],
     tradable=False,
 )
@@ -805,7 +904,7 @@ marker = panels_pb2.PanelMarker(
 )
 listing = panels_pb2.PanelList(items=[panels_pb2.PanelListItem(id='panel-1', name='us', enabled=False)])
 disable = panels_pb2.SavePanelSettingsRequest(
-    enabled=False, cadence=panels_pb2.PANEL_CADENCE_DAILY, size=0, reason='pause for the sitting'
+    enabled=False, cadence=panels_pb2.PANEL_CADENCE_DAILY, reason='pause for the sitting'
 )
 pause = panels_pb2.SaveSourceSettingsRequest(
     ramp_datasets_per_hour=0,
@@ -817,12 +916,11 @@ pause = panels_pb2.SaveSourceSettingsRequest(
 empty_panel = json_format.Parse('{}', panels_pb2.SavePanelSettingsRequest())
 empty_source = json_format.Parse('{}', panels_pb2.SaveSourceSettingsRequest())
 create = panels_pb2.CreatePanelRequest(
-    enabled=False, size=0, reason='new panel', name='us', source=enums_pb2.DATA_SOURCE_ALPACA_API
+    enabled=False, reason='new panel', name='us', source=enums_pb2.DATA_SOURCE_ALPACA_API
 )
 create_first = panels_pb2.CreatePanelRequest(
     enabled=True,
     cadence=panels_pb2.PANEL_CADENCE_WEEKLY,
-    size=500,
     tradable=True,
     reason='first panel',
     name='us',
@@ -831,6 +929,26 @@ create_first = panels_pb2.CreatePanelRequest(
     request_cap_per_hour=200,
 )
 empty_create = json_format.Parse('{}', panels_pb2.CreatePanelRequest())
+# An old sender's size: field 3, varint 500 (tag 0x18). It must never parse as a value.
+OLD_SIZE = bytes([0x18, 0xF4, 0x03])
+
+
+def old_size(cls):
+    message = cls()
+    message.ParseFromString(OLD_SIZE)
+    try:
+        json_format.Parse('{"size": 500}', cls())
+        json_size = 'parsed'
+    except json_format.ParseError:
+        json_size = 'refused'
+    return {
+        'declares_size': 'size' in cls.DESCRIPTOR.fields_by_name,
+        'number_3': cls.DESCRIPTOR.fields_by_number.get(3) is not None,
+        'set_fields': [field.name for field, _ in message.ListFields()],
+        'kept_unknown': message.SerializeToString() == OLD_SIZE,
+        'json': json_format.MessageToDict(message),
+        'json_size': json_size,
+    }
 
 
 def round_trip(message):
@@ -851,7 +969,7 @@ json.dump(
         'disable': json_format.MessageToDict(disable),
         'pause': json_format.MessageToDict(pause),
         'empty_has': {
-            name: empty_panel.HasField(name) for name in ('enabled', 'size', 'asset_class', 'exchange', 'active', 'tradable')
+            name: empty_panel.HasField(name) for name in ('enabled', 'asset_class', 'exchange', 'active', 'tradable')
         }
         | {
             name: empty_source.HasField(name)
@@ -869,7 +987,6 @@ json.dump(
             name: empty_create.HasField(name)
             for name in (
                 'enabled',
-                'size',
                 'asset_class',
                 'exchange',
                 'active',
@@ -882,6 +999,10 @@ json.dump(
         },
         'empty_create_plain': [empty_create.reason, empty_create.name, empty_create.source, empty_create.cadence],
         'round_trips': [round_trip(m) for m in every],
+        'old_size': {
+            cls.__name__: old_size(cls)
+            for cls in (panels_pb2.PanelSettings, panels_pb2.SavePanelSettingsRequest, panels_pb2.CreatePanelRequest)
+        },
     },
     sys.stdout,
 )
@@ -927,7 +1048,6 @@ def test_a_panel_detail_renders_as_the_canonical_json_the_ui_reads():
             'settings': {
                 'enabled': True,
                 'cadence': 'PANEL_CADENCE_MONTHLY',
-                'size': 500,
                 'denySymbols': ['XYZ'],
                 'tradable': False,
             },
@@ -980,14 +1100,9 @@ def test_a_member_a_history_day_a_marker_and_the_list_render_as_canonical_json()
 
 
 def test_a_disable_and_a_paused_source_write_their_false_and_zero_values():
-    """Presence: enabled false, size 0 and every rate 0 reach the route as values, so 'pause' is not 'absent'."""
+    """Presence: enabled false and every rate 0 reach the route as values, so 'pause' is not 'absent'."""
     seen = _probe()
-    assert seen['disable'] == {
-        'enabled': False,
-        'cadence': 'PANEL_CADENCE_DAILY',
-        'size': 0,
-        'reason': 'pause for the sitting',
-    }
+    assert seen['disable'] == {'enabled': False, 'cadence': 'PANEL_CADENCE_DAILY', 'reason': 'pause for the sitting'}
     assert seen['pause'] == {
         'rampDatasetsPerHour': 0,
         'requestCapPerHour': 0,
@@ -998,26 +1113,23 @@ def test_a_disable_and_a_paused_source_write_their_false_and_zero_values():
 
 
 def test_an_empty_write_body_has_no_value_present_and_a_blank_reason():
-    """'{}' parses to every presence field absent and reason '': exactly what the route must refuse with 422."""
+    """'{}' parses to every presence field absent and reason '': the presence fields are refused, the reason is none.
+
+    The reason is optional (owner ruling 2026-11-06), so '' here is the 'none given' value, not a refusal.
+    """
     seen = _probe()
     assert seen['empty_has'] == dict.fromkeys(seen['empty_has'], False)
-    assert len(seen['empty_has']) == 10
+    assert len(seen['empty_has']) == 9
     assert seen['empty_reason'] == ['', '']
 
 
 def test_a_create_body_without_source_settings_renders_as_the_canonical_json_the_ui_sends():
     """No cadence named (the MONTHLY default applies) and no source settings: neither key is sent.
 
-    enabled false and size 0 are present values, as in the disable write.
+    enabled false is a present value, as in the disable write; there is no size key (removed, 2026-11-06).
     """
     seen = _probe()
-    assert seen['create'] == {
-        'enabled': False,
-        'size': 0,
-        'reason': 'new panel',
-        'name': 'us',
-        'source': 'DATA_SOURCE_ALPACA_API',
-    }
+    assert seen['create'] == {'enabled': False, 'reason': 'new panel', 'name': 'us', 'source': 'DATA_SOURCE_ALPACA_API'}
 
 
 def test_a_create_body_with_the_first_source_settings_renders_as_the_canonical_json_the_ui_sends():
@@ -1026,7 +1138,6 @@ def test_a_create_body_with_the_first_source_settings_renders_as_the_canonical_j
     assert seen['create_first'] == {
         'enabled': True,
         'cadence': 'PANEL_CADENCE_WEEKLY',
-        'size': 500,
         'tradable': True,
         'reason': 'first panel',
         'name': 'us',
@@ -1040,5 +1151,25 @@ def test_an_empty_create_body_has_no_value_present_and_blank_plain_fields():
     """'{}' parses to every presence field absent, reason and name '', source and cadence 0: refused, bar cadence."""
     seen = _probe()
     assert seen['empty_create_has'] == dict.fromkeys(seen['empty_create_has'], False)
-    assert len(seen['empty_create_has']) == 10
+    assert len(seen['empty_create_has']) == 9
     assert seen['empty_create_plain'] == ['', '', 0, 0]
+
+
+@pytest.mark.parametrize('message', SIZED_ONCE)
+def test_an_old_senders_field_3_never_parses_as_a_size(message: str):
+    """Field 3 on the wire from a pre-ruling sender is an unknown field: kept byte for byte, never a value.
+
+    The generated class has no size and no field 3; the bytes parse to no set field and render as '{}'; and a JSON body
+    that still sends size is a parse error, not a silently dropped key.
+
+    Args:
+        message: A message that carried size before the owner ruling of 2026-11-06.
+    """
+    assert _probe()['old_size'][message] == {
+        'declares_size': False,
+        'number_3': False,
+        'set_fields': [],
+        'kept_unknown': True,
+        'json': {},
+        'json_size': 'refused',
+    }

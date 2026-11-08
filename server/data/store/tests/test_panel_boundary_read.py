@@ -317,7 +317,7 @@ async def test_members_at_orders_by_as_of_not_by_pass(world):
 async def test_members_at_across_a_settings_change(world):
     """A new settings version narrows the panel at a pass: members before it are the old set, after it the new one."""
     seeded = await world.panel()
-    v2 = await world.settings_version(seeded.panel_id, size=1)
+    v2 = await world.settings_version(seeded.panel_id, allow_symbols=['a'])
     await world.open(seeded, started_at=T0, rows=(entered('a', T0), entered('b', T0)))
     await world.open(seeded, started_at=T0 + 5 * DAY, settings_id=v2, rows=(transition('b', X, T0 + 5 * DAY),))
     assert await _members(world, seeded.panel_id, T0 + 4 * DAY) == ['a', 'b']
@@ -461,7 +461,8 @@ async def test_boundary_read_derives_each_settings_versions_effective_pass(world
     assert (versions[2].effective_pass_id, versions[2].effective_from) == (None, None), 'a dry run never'
     assert (versions[1].enabled, versions[1].actor, versions[1].reason) == (False, 'operator', 'pause it')
     assert all(b.saved_at is not None for b in versions)
-    assert (versions[0].cadence, versions[0].size) == (PanelCadence.DAILY, 10)
+    assert versions[0].cadence == PanelCadence.DAILY
+    assert not hasattr(versions[0], 'size'), 'a panel has no size (ADR tj-46jkey)'
 
 
 async def test_boundary_read_reads_another_panels_versions_never(world):

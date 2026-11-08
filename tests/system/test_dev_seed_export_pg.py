@@ -230,7 +230,6 @@ def _seed_ledger(
         version_no=1,
         enabled=False,  # never a pass of the stack's own panel loop
         cadence=PanelCadence.DAILY,
-        size=10,
         actor='operator',
         reason='dev seed export system test panel',
     )

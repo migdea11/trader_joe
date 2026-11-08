@@ -1,12 +1,14 @@
 // The Panels page's components (tj-7zjov1.37), each mounted alone over a real Pinia with the store's writes
 // replaced and the typed client mocked at @/api:
 // - PanelSettingsForm: Save Settings sends the form, Enable or Disable sends the SAVED settings with only
-//   `enabled` flipped (unsaved edits are not smuggled in); both need a non-blank reason.
+//   `enabled` flipped (unsaved edits are not smuggled in); the reason is optional (tj-7zjov1.362.4).
 // - PanelCreateForm: cadence Monthly (default) sent UNSPECIFIED unless picked; the four source settings
 //   fields only while the chosen source's versions page is empty (ramp and cap then required, window days
-//   optional); a required reason. Validated on click (tj-7zjov1.362.2): nothing marked on open, a press with
-//   gaps marks every one, focuses the first and sends nothing; the marks then follow the fields live.
-// - PanelSourceSettingsForm: all four numbers sent, 0 included; a required reason.
+//   optional); an optional reason, no size. Validated on click (tj-7zjov1.362.2): nothing marked on open, a
+//   press with gaps marks every one, focuses the first and sends nothing; the marks then follow the fields.
+// - PanelSourceSettingsForm: all four numbers sent, 0 included; an optional reason.
+// tj-7zjov1.362.4 (ADR tj-46jkey sections 1 and 2): no form and no fact shows a size; a blank reason is sent
+// as '' and a typed one trimmed, on all three writes.
 // - PanelHistoryStrip: one block per expected day, the change bar, markers with version, pass, actor and
 //   reason; a version no pass has run under is Pending (dimmed), not a boundary.
 // - PanelMemberList and PanelCorporateActions: Unknown health for a member without a dataset, the events
@@ -71,7 +73,6 @@ const T0 = Date.UTC(2026, 7, 3)
 const SAVED = create(PanelSettingsSchema, {
   enabled: true,
   cadence: PanelCadence.WEEKLY,
-  size: 40,
   allowSymbols: ['AAPL', 'MSFT'],
   denySymbols: ['TSLA'],
   assetClass: AssetType.STOCK,
@@ -82,7 +83,6 @@ const SAVED = create(PanelSettingsSchema, {
 const SAVED_INIT = {
   enabled: true,
   cadence: PanelCadence.WEEKLY,
-  size: 40,
   allowSymbols: ['AAPL', 'MSFT'],
   denySymbols: ['TSLA'],
   assetClass: AssetType.STOCK,
@@ -91,7 +91,9 @@ const SAVED_INIT = {
   tradable: false,
 }
 
-function detail(overrides: { settings?: typeof SAVED; versionNo?: number; effective?: boolean; source?: boolean } = {}): PanelDetail {
+function detail(
+  overrides: { settings?: typeof SAVED; versionNo?: number; effective?: boolean; source?: boolean; reason?: string } = {},
+): PanelDetail {
   return create(PanelDetailSchema, {
     id: PANEL_ID,
     name: 'Large caps',
@@ -100,7 +102,7 @@ function detail(overrides: { settings?: typeof SAVED; versionNo?: number; effect
       versionNo: overrides.versionNo ?? 3,
       settings: overrides.settings ?? SAVED,
       actor: 'operator',
-      reason: 'widen',
+      reason: overrides.reason ?? 'widen',
       savedAt: timestampFromMs(T0),
       effectivePass:
         overrides.effective === false ? undefined : create(EffectivePassSchema, { kind: PanelPassKind.MEMBERSHIP, startedAt: timestampFromMs(T0 + DAY) }),
@@ -161,11 +163,38 @@ describe('PanelSettingsForm', () => {
     const form = mount(PanelSettingsForm, { props: { detail: detail() } })
     expect(form.find('[data-fact="enabled"]').text()).toBe('Enabled')
     expect(form.find('[data-fact="cadence"]').text()).toBe('Weekly')
-    expect(form.find('[data-fact="size"]').text()).toBe('40')
     expect(form.find('[data-fact="version"]').text()).toMatch(/^Version 3 saved .+ by operator$/)
     expect(form.find('[data-fact="effective"]').text()).toMatch(/^membership pass, /)
     expect(byId(form, 'current-reason').text()).toBe('Reason: widen')
     expect(byId(form, 'settings-toggle').text()).toBe('Disable Panel')
+  })
+
+  // tj-7zjov1.362.4: no size anywhere, neither as a saved fact nor as a field.
+  it('shows no size: no Size fact, no size field, no Size label', () => {
+    stubWrites()
+    const form = mount(PanelSettingsForm, { props: { detail: detail() } })
+    expect(form.find('[data-fact="size"]').exists()).toBe(false)
+    expect(byId(form, 'settings-size').exists()).toBe(false)
+    expect(form.find('#settings-size').exists()).toBe(false)
+    expect(form.findAll('dt').map((dt) => dt.text())).not.toContain('Size')
+    expect(form.findAll('label').map((label) => label.text())).not.toContain('Size')
+  })
+
+  it('a saved version with an empty reason shows no Reason line', () => {
+    stubWrites()
+    const form = mount(PanelSettingsForm, { props: { detail: detail({ reason: '' }) } })
+    expect(byId(form, 'current-reason').exists()).toBe(false)
+    expect(form.text()).not.toContain('Reason:')
+  })
+
+  it('the reason field reads optional: no asterisk, no aria-required, no error, the optional placeholder', () => {
+    stubWrites()
+    const form = mount(PanelSettingsForm, { props: { detail: detail() } })
+    expect(form.find('label[for="settings-reason"]').text()).toBe('Reason (optional)')
+    expect(form.find('label[for="settings-reason"] .pn-required').exists()).toBe(false)
+    expect(byId(form, 'settings-reason').attributes('aria-required')).toBeUndefined()
+    expect(byId(form, 'settings-reason').attributes('placeholder')).toBe('Optional: why the settings change')
+    expect(byId(form, 'settings-problem').exists()).toBe(false)
   })
 
   it('a version no pass has run under reads Pending', () => {
@@ -177,29 +206,63 @@ describe('PanelSettingsForm', () => {
   it('the form starts from the saved settings', () => {
     stubWrites()
     const form = mount(PanelSettingsForm, { props: { detail: detail() } })
-    expect((byId(form, 'settings-size').element as HTMLInputElement).value).toBe('40')
     expect((byId(form, 'settings-allow').element as HTMLInputElement).value).toBe('AAPL, MSFT')
     expect((byId(form, 'settings-exchange').element as HTMLInputElement).value).toBe('NASDAQ')
   })
 
-  it('without a reason neither Save Settings nor Disable is allowed, and a click sends nothing', async () => {
+  // tj-7zjov1.362.4: the reason no longer gates either write. Untouched, or blank after typing, both
+  // buttons are on and each sends once with reason ''.
+  it.each([
+    ['never typed', null],
+    ['typed blank', '   '],
+    ['typed whitespace only', '\n\t'],
+  ])('with no reason (%s) Save Settings sends, with reason \'\'', async (_label, typed) => {
     const { saveSettings } = stubWrites()
     const form = mount(PanelSettingsForm, { props: { detail: detail() } })
-    expect(byId(form, 'settings-problem').text()).toBe('Give a reason for the change.')
-    expect(byId(form, 'settings-save').attributes('disabled')).toBeDefined()
-    expect(byId(form, 'settings-toggle').attributes('disabled')).toBeDefined()
-    await form.find('form').trigger('submit')
-    await byId(form, 'settings-toggle').trigger('click')
-    await byId(form, 'settings-reason').setValue('   ')
+    if (typed !== null) await byId(form, 'settings-reason').setValue(typed)
+    expect(byId(form, 'settings-save').attributes('disabled')).toBeUndefined()
+    expect(byId(form, 'settings-toggle').attributes('disabled')).toBeUndefined()
+    expect(byId(form, 'settings-problem').exists()).toBe(false)
     await form.find('form').trigger('submit')
     await flushPromises()
-    expect(saveSettings).not.toHaveBeenCalled()
+    expect(saveSettings).toHaveBeenCalledTimes(1)
+    expect(saveSettings).toHaveBeenCalledWith({ ...SAVED_INIT, reason: '' })
+  })
+
+  it.each([
+    ['never typed', null],
+    ['typed blank', '   '],
+  ])('with no reason (%s) Disable sends the saved settings, with reason \'\'', async (_label, typed) => {
+    const { saveSettings } = stubWrites()
+    const form = mount(PanelSettingsForm, { props: { detail: detail() } })
+    if (typed !== null) await byId(form, 'settings-reason').setValue(typed)
+    await byId(form, 'settings-toggle').trigger('click')
+    await flushPromises()
+    expect(saveSettings).toHaveBeenCalledTimes(1)
+    expect(saveSettings).toHaveBeenCalledWith({ ...SAVED_INIT, enabled: false, reason: '' })
+  })
+
+  it('with no reason Enable on a disabled panel sends, with reason \'\'', async () => {
+    const { saveSettings } = stubWrites()
+    const disabled = create(PanelSettingsSchema, { ...SAVED, enabled: false })
+    const form = mount(PanelSettingsForm, { props: { detail: detail({ settings: disabled }) } })
+    await byId(form, 'settings-toggle').trigger('click')
+    await flushPromises()
+    expect(saveSettings).toHaveBeenCalledWith({ ...SAVED_INIT, enabled: true, reason: '' })
+  })
+
+  it('Save Settings sends a typed reason trimmed', async () => {
+    const { saveSettings } = stubWrites()
+    const form = mount(PanelSettingsForm, { props: { detail: detail() } })
+    await byId(form, 'settings-reason').setValue('  \tnarrow it\n ')
+    await form.find('form').trigger('submit')
+    await flushPromises()
+    expect(saveSettings).toHaveBeenCalledWith({ ...SAVED_INIT, reason: 'narrow it' })
   })
 
   it('Disable sends the SAVED settings with only enabled flipped, ignoring unsaved edits, and the trimmed reason', async () => {
     const { saveSettings } = stubWrites()
     const form = mount(PanelSettingsForm, { props: { detail: detail() } })
-    await byId(form, 'settings-size').setValue('7')
     await byId(form, 'settings-deny').setValue('GME')
     await byId(form, 'settings-reason').setValue('  pause it  ')
     await byId(form, 'settings-toggle').trigger('click')
@@ -223,7 +286,6 @@ describe('PanelSettingsForm', () => {
   it('Save Settings sends the edited form, absent filters left out', async () => {
     const { saveSettings } = stubWrites()
     const form = mount(PanelSettingsForm, { props: { detail: detail() } })
-    await byId(form, 'settings-size').setValue('12')
     await byId(form, 'settings-allow').setValue('')
     await byId(form, 'settings-exchange').setValue('')
     await byId(form, 'settings-active').findAll('option')[0]!.setValue()
@@ -235,7 +297,6 @@ describe('PanelSettingsForm', () => {
     expect(saveSettings).toHaveBeenCalledWith({
       enabled: true,
       cadence: PanelCadence.DAILY,
-      size: 12,
       allowSymbols: [],
       denySymbols: ['TSLA'],
       assetClass: undefined,
@@ -246,12 +307,11 @@ describe('PanelSettingsForm', () => {
     })
   })
 
-  it('a bad size stops Save Settings but not Disable', async () => {
+  it('no cadence stops Save Settings but not Disable', async () => {
     const { saveSettings } = stubWrites()
     const form = mount(PanelSettingsForm, { props: { detail: detail() } })
-    await byId(form, 'settings-size').setValue('-3')
-    await byId(form, 'settings-reason').setValue('r')
-    expect(byId(form, 'settings-problem').text()).toBe('Give the size as a whole number, 0 or more.')
+    await byId(form, 'settings-cadence').findAll('option')[0]!.setValue()
+    expect(byId(form, 'settings-problem').text()).toBe('Choose a cadence.')
     expect(byId(form, 'settings-save').attributes('disabled')).toBeDefined()
     expect(byId(form, 'settings-toggle').attributes('disabled')).toBeUndefined()
     await form.find('form').trigger('submit')
@@ -262,25 +322,23 @@ describe('PanelSettingsForm', () => {
   it('the settings form keeps its one-line problem: no required marker and no per-field mark (tj-crl7pm)', async () => {
     stubWrites()
     const form = mount(PanelSettingsForm, { props: { detail: detail() } })
-    await byId(form, 'settings-size').setValue('')
     await byId(form, 'settings-cadence').findAll('option')[0]!.setValue()
-    expect(byId(form, 'settings-problem').text()).toBe('Give the size as a whole number, 0 or more.')
+    expect(byId(form, 'settings-problem').text()).toBe('Choose a cadence.')
     expect(form.find('.pn-required').exists()).toBe(false)
     expect(form.find('.pn-field-error').exists()).toBe(false)
     expect(form.find('[aria-required]').exists()).toBe(false)
     expect(form.find('[aria-invalid]').exists()).toBe(false)
-    expect(byId(form, 'settings-size').attributes('aria-describedby')).toBeUndefined()
-    await byId(form, 'settings-size').setValue('3')
-    expect(byId(form, 'settings-problem').text()).toBe('Choose a cadence.')
+    await byId(form, 'settings-cadence').findAll('option')[1]!.setValue()
+    expect(byId(form, 'settings-problem').exists()).toBe(false)
   })
 
   it('validate-on-click is the create form only: Save Settings stays off while blocked and a submit marks nothing (tj-7zjov1.362.2)', async () => {
     const { saveSettings } = stubWrites()
     const form = mount(PanelSettingsForm, { props: { detail: detail() }, attachTo: document.body })
-    await byId(form, 'settings-size').setValue('x')
+    await byId(form, 'settings-cadence').findAll('option')[0]!.setValue()
     await byId(form, 'settings-reason').setValue('r')
     expect(byId(form, 'settings-save').attributes('disabled')).toBeDefined()
-    expect(byId(form, 'settings-problem').text()).toBe('Give the size as a whole number, 0 or more.')
+    expect(byId(form, 'settings-problem').text()).toBe('Choose a cadence.')
     await form.find('form').trigger('submit')
     await flushPromises()
     expect(saveSettings).not.toHaveBeenCalled()
@@ -288,7 +346,7 @@ describe('PanelSettingsForm', () => {
     expect(form.find('.pn-required').exists()).toBe(false)
     expect(form.find('.pn-field-error').exists()).toBe(false)
     expect(document.activeElement).toBe(document.body)
-    expect(byId(form, 'settings-problem').text()).toBe('Give the size as a whole number, 0 or more.')
+    expect(byId(form, 'settings-problem').text()).toBe('Choose a cadence.')
   })
 
   it('a refusal is worded in place with its error id, the form kept', async () => {
@@ -305,15 +363,15 @@ describe('PanelSettingsForm', () => {
   it('an ok write clears the reason; a newer saved version starts the form over', async () => {
     stubWrites()
     const form = mount(PanelSettingsForm, { props: { detail: detail() } })
-    await byId(form, 'settings-size').setValue('9')
+    await byId(form, 'settings-deny').setValue('GME')
     await byId(form, 'settings-reason').setValue('why')
     await form.find('form').trigger('submit')
     await flushPromises()
     expect((byId(form, 'settings-reason').element as HTMLTextAreaElement).value).toBe('')
     expect(byId(form, 'settings-notice').exists()).toBe(false)
-    await byId(form, 'settings-size').setValue('9')
+    await byId(form, 'settings-deny').setValue('GME')
     await form.setProps({ detail: detail({ versionNo: 4 }) })
-    expect((byId(form, 'settings-size').element as HTMLInputElement).value).toBe('40')
+    expect((byId(form, 'settings-deny').element as HTMLInputElement).value).toBe('TSLA')
   })
 
   it('a stale answer shows nothing', async () => {
@@ -336,11 +394,11 @@ describe('PanelSettingsForm', () => {
 })
 
 // tj-7zjov1.248: the toggle body is the saved PanelSettings as read with only `enabled` flipped. The
-// form's text round trip turned a 10-digit size into 0, trimmed the exchange, and dropped an empty-but-
-// present exchange and a present UNSPECIFIED asset class: each a new settings version that changes
-// membership on the next pass. Bodies are compared with toStrictEqual, so key presence counts.
+// form's text round trip trimmed the exchange and dropped an empty-but-present exchange and a present
+// UNSPECIFIED asset class: each a new settings version that changes membership on the next pass. Bodies
+// are compared with toStrictEqual, so key presence counts (a size key coming back reds every row).
 describe('PanelSettingsForm: Enable or Disable sends the saved settings exactly', () => {
-  const BARE = { cadence: PanelCadence.MONTHLY, size: 25, allowSymbols: ['VFV'], denySymbols: [] as string[] }
+  const BARE = { cadence: PanelCadence.MONTHLY, allowSymbols: ['VFV'], denySymbols: [] as string[] }
 
   async function toggleBody(fields: Record<string, unknown>): Promise<Record<string, unknown>> {
     const { saveSettings } = stubWrites()
@@ -356,8 +414,6 @@ describe('PanelSettingsForm: Enable or Disable sends the saved settings exactly'
   const base = (enabled: boolean) => ({ enabled, ...BARE, reason: 'flip' })
 
   it.each([
-    ['size 2147483647 (int32 max)', { size: 2_147_483_647 }, { size: 2_147_483_647 }],
-    ['size 1000000000', { size: 1_000_000_000 }, { size: 1_000_000_000 }],
     ["exchange ' X ' (not trimmed)", { exchange: ' X ' }, { exchange: ' X ' }],
     ['an empty-but-present exchange', { exchange: '' }, { exchange: '' }],
     ['asset class absent', {}, {}],
@@ -377,7 +433,6 @@ describe('PanelSettingsForm: Enable or Disable sends the saved settings exactly'
     const saved = create(PanelSettingsSchema, {
       enabled: false,
       ...BARE,
-      size: 2_147_483_647,
       exchange: '',
       assetClass: AssetType.UNSPECIFIED,
       active: false,
@@ -388,28 +443,11 @@ describe('PanelSettingsForm: Enable or Disable sends the saved settings exactly'
     await flushPromises()
     expect(saveSettings.mock.calls[0]![0]).toStrictEqual({
       ...base(true),
-      size: 2_147_483_647,
       exchange: '',
       assetClass: AssetType.UNSPECIFIED,
       active: false,
       reason: 'resume',
     })
-  })
-
-  it('a saved 10-digit size: Save Settings is refused in words and sends nothing; Disable still sends it as saved', async () => {
-    const { saveSettings } = stubWrites()
-    const saved = create(PanelSettingsSchema, { enabled: true, ...BARE, size: 2_147_483_647 })
-    const form = mount(PanelSettingsForm, { props: { detail: detail({ settings: saved }) } })
-    await byId(form, 'settings-reason').setValue('why')
-    expect(byId(form, 'settings-problem').text()).toBe('Give the size as a whole number, 0 or more.')
-    expect(byId(form, 'settings-save').attributes('disabled')).toBeDefined()
-    await form.find('form').trigger('submit')
-    await flushPromises()
-    expect(saveSettings).not.toHaveBeenCalled()
-    await byId(form, 'settings-toggle').trigger('click')
-    await flushPromises()
-    expect(saveSettings).toHaveBeenCalledTimes(1)
-    expect(saveSettings.mock.calls[0]![0]).toMatchObject({ enabled: false, size: 2_147_483_647 })
   })
 
   it('Save Settings still goes through the form: the exchange is trimmed, a blank one and UNSPECIFIED left out', async () => {
@@ -420,7 +458,8 @@ describe('PanelSettingsForm: Enable or Disable sends the saved settings exactly'
     await form.find('form').trigger('submit')
     await flushPromises()
     expect(saveSettings).toHaveBeenCalledTimes(1)
-    expect(saveSettings.mock.calls[0]![0]).toMatchObject({ exchange: 'X', assetClass: undefined, size: 25 })
+    expect(saveSettings.mock.calls[0]![0]).toMatchObject({ exchange: 'X', assetClass: undefined })
+    expect(Object.hasOwn(saveSettings.mock.calls[0]![0] as object, 'size')).toBe(false)
 
     saveSettings.mockClear()
     await byId(form, 'settings-exchange').setValue('   ')
@@ -441,9 +480,55 @@ describe('PanelCreateForm', () => {
     await byId(form, 'create-name').setValue('  Large caps  ')
     await byId(form, 'create-source').findAll('option')[sourceIndex]!.setValue()
     await flushPromises()
-    await byId(form, 'create-size').setValue('50')
     await byId(form, 'create-reason').setValue('  first panel  ')
   }
+
+  // tj-7zjov1.362.4: no size on the create form, and the reason reads optional and is never required.
+  it('has no size: no size field, no Size label, no size error', async () => {
+    api.getSourceSettingsVersions.mockResolvedValue(EMPTY_PAGE)
+    stubWrites()
+    const form = mountCreate()
+    await byId(form, 'create-source').findAll('option')[1]!.setValue()
+    await flushPromises()
+    await press(form)
+    expect(byId(form, 'create-size').exists()).toBe(false)
+    expect(form.find('#create-size').exists()).toBe(false)
+    expect(byId(form, 'create-size-error').exists()).toBe(false)
+    expect(form.findAll('label').map((label) => label.text().replace(/\s*\*$/, ''))).not.toContain('Size')
+  })
+
+  it('the reason reads optional: no asterisk, no aria-required, and a press on an empty form leaves it unmarked', async () => {
+    stubWrites()
+    const form = mountCreate()
+    const label = form.find('label[for="create-reason"]')
+    expect(label.text()).toBe('Reason (optional)')
+    expect(label.find('.pn-required').exists()).toBe(false)
+    expect(byId(form, 'create-reason').attributes('aria-required')).toBeUndefined()
+    expect(byId(form, 'create-reason').attributes('placeholder')).toBe('Optional: why the panel is created')
+    await press(form)
+    expect(byId(form, 'create-reason').attributes('aria-invalid')).toBeUndefined()
+    expect(byId(form, 'create-reason').attributes('aria-describedby')).toBeUndefined()
+    expect(byId(form, 'create-reason-error').exists()).toBe(false)
+    expect(form.find('#create-reason-error').exists()).toBe(false)
+  })
+
+  it.each([
+    ['never typed', null],
+    ['typed blank', '  \n '],
+  ])('the create form with only name and source (reason %s) sends once, with reason \'\'', async (_label, typed) => {
+    api.getSourceSettingsVersions.mockResolvedValue(HELD_PAGE)
+    const { create: createPanel } = stubWrites({ kind: 'created', detail: detail() })
+    const form = mountCreate()
+    await byId(form, 'create-name').setValue('n')
+    await byId(form, 'create-source').findAll('option')[1]!.setValue()
+    await flushPromises()
+    if (typed !== null) await byId(form, 'create-reason').setValue(typed)
+    await press(form)
+    expect(createPanel).toHaveBeenCalledTimes(1)
+    expect(createPanel.mock.calls[0]![0]).toMatchObject({ name: 'n', source: DataSource.ALPACA_API, reason: '' })
+    expect(Object.hasOwn(createPanel.mock.calls[0]![0] as object, 'size')).toBe(false)
+    expect(form.findAll('[aria-invalid]')).toHaveLength(0)
+  })
 
   it('the cadence offers Monthly (default) first, selected', () => {
     stubWrites()
@@ -474,7 +559,6 @@ describe('PanelCreateForm', () => {
     expect(createPanel).toHaveBeenCalledWith({
       enabled: true,
       cadence: PanelCadence.UNSPECIFIED,
-      size: 50,
       allowSymbols: [],
       denySymbols: [],
       assetClass: undefined,
@@ -565,8 +649,6 @@ describe('PanelCreateForm', () => {
   it.each([
     ['name', 'Give the panel a name.'],
     ['source', 'Choose a source.'],
-    ['reason', 'Give a reason for the change.'],
-    ['size', 'Give the size as a whole number, 0 or more.'],
   ])('without a %s the create is refused in words once pressed and nothing is sent', async (missing, words) => {
     api.getSourceSettingsVersions.mockResolvedValue(HELD_PAGE)
     const { create: createPanel } = stubWrites()
@@ -574,8 +656,6 @@ describe('PanelCreateForm', () => {
     if (missing !== 'name') await byId(form, 'create-name').setValue('n')
     if (missing !== 'source') await byId(form, 'create-source').findAll('option')[1]!.setValue()
     await flushPromises()
-    if (missing !== 'size') await byId(form, 'create-size').setValue('1')
-    if (missing !== 'reason') await byId(form, 'create-reason').setValue('r')
     expect(form.findAll('[data-testid$="-error"]')).toHaveLength(0)
     expect(byId(form, 'create-submit').attributes('disabled')).toBeUndefined()
     await press(form)
@@ -656,12 +736,12 @@ describe('PanelCreateForm', () => {
 describe('PanelCreateForm: validated on click, every missing field marked at once', () => {
   const EMPTY_PAGE = create(PanelSourceSettingsVersionPageSchema)
   const HELD_PAGE = create(PanelSourceSettingsVersionPageSchema, { items: [create(PanelSourceSettingsVersionSchema, { versionNo: 1 })] })
-  const MANDATORY = ['name', 'source', 'size', 'reason'] as const
+  // tj-7zjov1.362.4 (architect note 22:22 UTC): name and source always; ramp and cap only while the source
+  // has no settings. Size is gone and the reason is optional, so neither is mandatory nor ever marked.
+  const MANDATORY = ['name', 'source'] as const
   const OPENED = {
     name: 'Give the panel a name.',
     source: 'Choose a source.',
-    size: 'Give the size as a whole number, 0 or more.',
-    reason: 'Give a reason for the change.',
   }
   const COUNT = 'Give a whole number, 0 or more.'
 
@@ -763,7 +843,7 @@ describe('PanelCreateForm: validated on click, every missing field marked at onc
     expect(rule('.pn-required--marked')).toMatch(/color:\s*var\(--tj-status-fail\)/)
   })
 
-  it('a click on an empty form marks the four at once, focuses the name and sends nothing', async () => {
+  it('a click on an empty form marks the two at once, focuses the name and sends nothing', async () => {
     const { create: createPanel } = stubWrites()
     const form = mountCreate()
     await press(form)
@@ -772,7 +852,43 @@ describe('PanelCreateForm: validated on click, every missing field marked at onc
       expectRequired(form, field)
       expectMarked(form, field, OPENED[field])
     }
-    expectSummary(form, 4)
+    expectSummary(form, 2)
+    expect(byId(form, 'create-problem').text()).toBe('2 marked fields need a value before the panel can be created.')
+    focused(form, 'create-name')
+  })
+
+  it('the asterisks are exactly name and source on a source with settings, plus ramp and cap on one without', async () => {
+    const starred = (form: VueWrapper) =>
+      form.findAll('label .pn-required').map((star) => star.element.closest('label')!.getAttribute('for'))
+    const ariaRequired = (form: VueWrapper) => form.findAll('[aria-required="true"]').map((el) => el.attributes('id'))
+    api.getSourceSettingsVersions.mockResolvedValue(HELD_PAGE)
+    stubWrites()
+    const held = mountCreate()
+    expect(starred(held)).toEqual(['create-name', 'create-source'])
+    expect(ariaRequired(held)).toEqual(['create-name', 'create-source'])
+    await byId(held, 'create-source').findAll('option')[1]!.setValue()
+    await flushPromises()
+    expect(starred(held)).toEqual(['create-name', 'create-source'])
+    held.unmount()
+
+    api.getSourceSettingsVersions.mockResolvedValue(EMPTY_PAGE)
+    const empty = mountCreate()
+    await byId(empty, 'create-source').findAll('option')[1]!.setValue()
+    await flushPromises()
+    expect(starred(empty)).toEqual(['create-name', 'create-source', 'create-ramp', 'create-cap'])
+    expect(ariaRequired(empty)).toEqual(['create-name', 'create-source', 'create-ramp', 'create-cap'])
+  })
+
+  it('a source without settings: a click with only a source chosen marks name, ramp and cap, focus on the name', async () => {
+    api.getSourceSettingsVersions.mockResolvedValue(EMPTY_PAGE)
+    const { create: createPanel } = stubWrites()
+    const form = mountCreate()
+    await byId(form, 'create-source').findAll('option')[1]!.setValue()
+    await flushPromises()
+    await press(form)
+    expect(createPanel).not.toHaveBeenCalled()
+    expect(form.findAll('[aria-invalid="true"]').map((el) => el.attributes('id'))).toEqual(['create-name', 'create-ramp', 'create-cap'])
+    expectSummary(form, 3)
     focused(form, 'create-name')
   })
 
@@ -784,16 +900,17 @@ describe('PanelCreateForm: validated on click, every missing field marked at onc
     await form.find('form').trigger('submit')
     await flushPromises()
     expect(createPanel).not.toHaveBeenCalled()
-    expectSummary(form, 3)
+    expectSummary(form, 1)
+    expect(byId(form, 'create-problem').text()).toBe('1 marked field needs a value before the panel can be created.')
     focused(form, 'create-source')
   })
 
-  it('cadence and the optional filters carry no marker and are never marked, pressed or not', async () => {
+  it('cadence, the optional filters and the reason carry no marker and are never marked, pressed or not', async () => {
     stubWrites()
     const form = mountCreate()
     for (const pressed of [false, true]) {
       if (pressed) await press(form)
-      for (const field of ['cadence', 'allow', 'deny', 'exchange']) {
+      for (const field of ['cadence', 'allow', 'deny', 'exchange', 'reason']) {
         expect(marker(form, field).exists()).toBe(false)
         expect(byId(form, `create-${field}`).attributes('aria-required')).toBeUndefined()
         expectUnmarked(form, field)
@@ -806,38 +923,24 @@ describe('PanelCreateForm: validated on click, every missing field marked at onc
     const { create: createPanel } = stubWrites({ kind: 'created', detail: detail() })
     const form = mountCreate()
     await press(form)
-    expectSummary(form, 4)
+    expectSummary(form, 2)
     await byId(form, 'create-name').setValue('n')
     expectUnmarked(form, 'name')
-    for (const field of ['source', 'size', 'reason'] as const) expectMarked(form, field, OPENED[field])
-    expectSummary(form, 3)
+    expectMarked(form, 'source', OPENED.source)
+    expectSummary(form, 1)
     await byId(form, 'create-source').findAll('option')[1]!.setValue()
     await flushPromises()
-    expectUnmarked(form, 'source')
-    expectMarked(form, 'size', OPENED.size)
-    expectMarked(form, 'reason', OPENED.reason)
-    expectSummary(form, 2)
-    await byId(form, 'create-size').setValue('1')
-    expectUnmarked(form, 'size')
-    expectSummary(form, 1)
-    expectMarked(form, 'reason', OPENED.reason)
-    await byId(form, 'create-reason').setValue('r')
     for (const field of MANDATORY) {
       expectUnmarked(form, field)
       expectRequired(form, field)
     }
     expectSummary(form, 0)
     // Still live with no second press: a field broken again is marked again at once.
-    await byId(form, 'create-size').setValue('x')
-    expectMarked(form, 'size', OPENED.size)
-    expectUnmarked(form, 'name')
-    expectSummary(form, 1)
-    await byId(form, 'create-name').setValue('')
+    await byId(form, 'create-name').setValue('  ')
     expectMarked(form, 'name', OPENED.name)
-    expectSummary(form, 2)
+    expectSummary(form, 1)
     expect(createPanel).not.toHaveBeenCalled()
     await byId(form, 'create-name').setValue('n')
-    await byId(form, 'create-size').setValue('2')
     expectSummary(form, 0)
     await press(form)
     expect(createPanel).toHaveBeenCalledTimes(1)
@@ -850,8 +953,6 @@ describe('PanelCreateForm: validated on click, every missing field marked at onc
     await byId(form, 'create-name').setValue('n')
     await byId(form, 'create-source').findAll('option')[1]!.setValue()
     await flushPromises()
-    await byId(form, 'create-size').setValue('1')
-    await byId(form, 'create-reason').setValue('r')
     await press(form)
     expect(createPanel).toHaveBeenCalledTimes(1)
     expectSummary(form, 0)
@@ -870,8 +971,6 @@ describe('PanelCreateForm: validated on click, every missing field marked at onc
     await byId(form, 'create-name').setValue('n')
     await byId(form, 'create-source').findAll('option')[1]!.setValue()
     await flushPromises()
-    await byId(form, 'create-size').setValue('1')
-    await byId(form, 'create-reason').setValue('r')
     await press(form)
     expect(createPanel).toHaveBeenCalledTimes(1)
     expect(byId(form, 'create-submit').attributes('disabled')).toBeDefined()
@@ -886,15 +985,15 @@ describe('PanelCreateForm: validated on click, every missing field marked at onc
   it.each([
     ['nothing filled', {}, 'create-name'],
     ['a name only', { name: 'n' }, 'create-source'],
-    ['name and source', { name: 'n', source: 'held' }, 'create-size'],
-    ['all but the reason', { name: 'n', source: 'held', size: '1' }, 'create-reason'],
-    ['a bad size and no reason', { name: 'n', source: 'held', size: 'x' }, 'create-size'],
-    ['no name, the rest filled', { source: 'held', size: '1', reason: 'r' }, 'create-name'],
-    ['no ramp, no cap, no reason', { name: 'n', source: 'empty', size: '1' }, 'create-ramp'],
-    ['no cap and no reason', { name: 'n', source: 'empty', size: '1', ramp: '0' }, 'create-cap'],
-    ['a bad pre day and no reason', { name: 'n', source: 'empty', size: '1', ramp: '0', cap: '1', pre: 'x' }, 'create-pre'],
-    ['a bad post day only', { name: 'n', source: 'empty', size: '1', ramp: '0', cap: '1', post: '-1', reason: 'r' }, 'create-post'],
-    ['no size and a bad cap', { name: 'n', source: 'empty', ramp: '0', cap: 'x', reason: 'r' }, 'create-size'],
+    ['a name only, a reason typed', { name: 'n', reason: 'r' }, 'create-source'],
+    ['no name, the source held', { source: 'held' }, 'create-name'],
+    ['no name, the source empty and nothing else', { source: 'empty' }, 'create-name'],
+    ['no name, the rest filled', { source: 'empty', ramp: '0', cap: '1', reason: 'r' }, 'create-name'],
+    ['no ramp, no cap', { name: 'n', source: 'empty' }, 'create-ramp'],
+    ['no ramp, no cap, no reason, bad window days', { name: 'n', source: 'empty', pre: 'x', post: 'x' }, 'create-ramp'],
+    ['no cap', { name: 'n', source: 'empty', ramp: '0' }, 'create-cap'],
+    ['a bad pre day and no reason', { name: 'n', source: 'empty', ramp: '0', cap: '1', pre: 'x' }, 'create-pre'],
+    ['a bad post day only', { name: 'n', source: 'empty', ramp: '0', cap: '1', post: '-1', reason: 'r' }, 'create-post'],
   ] as const)('focus goes to the first invalid field in screen order: %s', async (_case, given: Record<string, string>, first) => {
     api.getSourceSettingsVersions.mockResolvedValue(given.source === 'empty' ? EMPTY_PAGE : HELD_PAGE)
     const { create: createPanel } = stubWrites()
@@ -904,7 +1003,7 @@ describe('PanelCreateForm: validated on click, every missing field marked at onc
       await byId(form, 'create-source').findAll('option')[1]!.setValue()
       await flushPromises()
     }
-    for (const field of ['size', 'ramp', 'cap', 'pre', 'post', 'reason']) {
+    for (const field of ['ramp', 'cap', 'pre', 'post', 'reason']) {
       if (given[field] !== undefined) await byId(form, `create-${field}`).setValue(given[field])
     }
     expect(document.activeElement).not.toBe(byId(form, first).element)
@@ -931,8 +1030,6 @@ describe('PanelCreateForm: validated on click, every missing field marked at onc
     await byId(form, 'create-name').setValue('n')
     await byId(form, 'create-source').findAll('option')[1]!.setValue()
     await flushPromises()
-    await byId(form, 'create-size').setValue('1')
-    await byId(form, 'create-reason').setValue('r')
     for (const field of ['ramp', 'cap']) expectUnmarked(form, field)
     expectSummary(form, 0)
     await press(form)
@@ -977,7 +1074,10 @@ describe('PanelCreateForm: validated on click, every missing field marked at onc
       expect(byId(form, `create-${field}`).exists()).toBe(false)
       expect(byId(form, `create-${field}-error`).exists()).toBe(false)
     }
-    expectSummary(form, 3)
+    // Only the name is left: no size and no reason to mark.
+    expectSummary(form, 1)
+    expectMarked(form, 'name', OPENED.name)
+    focused(form, 'create-name')
   })
 
   it('a source-settings read still out, then failed, is shown on the Source field once pressed', async () => {
@@ -986,8 +1086,6 @@ describe('PanelCreateForm: validated on click, every missing field marked at onc
     const { create: createPanel } = stubWrites()
     const form = mountCreate()
     await byId(form, 'create-name').setValue('n')
-    await byId(form, 'create-size').setValue('1')
-    await byId(form, 'create-reason').setValue('r')
     await byId(form, 'create-source').findAll('option')[1]!.setValue()
     expectUnmarked(form, 'source')
     expectSummary(form, 0)
@@ -1016,8 +1114,6 @@ describe('PanelCreateForm: validated on click, every missing field marked at onc
     await byId(form, 'create-name').setValue(' Large caps ')
     await byId(form, 'create-source').findAll('option')[1]!.setValue()
     await flushPromises()
-    await byId(form, 'create-size').setValue('1')
-    await byId(form, 'create-reason').setValue('r')
     expectUnmarked(form, 'name')
     expectSummary(form, 0)
     await press(form)
@@ -1063,12 +1159,40 @@ describe('PanelSourceSettingsForm', () => {
     })
   })
 
-  it('a blank reason or a bad number stops the save', async () => {
+  // tj-7zjov1.362.4: the reason is optional on a source settings save too.
+  it.each([
+    ['never typed', null],
+    ['typed blank', ' \t '],
+  ])('with no reason (%s) Save sends once, with reason \'\'', async (_label, typed) => {
     const { saveSource } = stubWrites()
     const form = mount(PanelSourceSettingsForm, { props: { detail: detail() } })
-    expect(byId(form, 'source-problem').text()).toBe('Give a reason for the change.')
+    if (typed !== null) await byId(form, 'source-reason').setValue(typed)
+    expect(byId(form, 'source-problem').exists()).toBe(false)
+    expect(byId(form, 'source-save').attributes('disabled')).toBeUndefined()
     await form.find('form').trigger('submit')
-    await byId(form, 'source-reason').setValue('r')
+    await flushPromises()
+    expect(saveSource).toHaveBeenCalledTimes(1)
+    expect(saveSource).toHaveBeenCalledWith(DataSource.ALPACA_API, {
+      rampDatasetsPerHour: 5,
+      requestCapPerHour: 200,
+      corporateActionWindowPreDays: 90,
+      corporateActionWindowPostDays: 30,
+      reason: '',
+    })
+  })
+
+  it('the reason field reads optional: no asterisk, no aria-required, the optional placeholder', () => {
+    stubWrites()
+    const form = mount(PanelSourceSettingsForm, { props: { detail: detail() } })
+    expect(form.find('label[for="source-reason"]').text()).toBe('Reason (optional)')
+    expect(form.find('.pn-required').exists()).toBe(false)
+    expect(byId(form, 'source-reason').attributes('aria-required')).toBeUndefined()
+    expect(byId(form, 'source-reason').attributes('placeholder')).toBe('Optional: why the source settings change')
+  })
+
+  it('a bad number stops the save', async () => {
+    const { saveSource } = stubWrites()
+    const form = mount(PanelSourceSettingsForm, { props: { detail: detail() } })
     await byId(form, 'source-cap').setValue('-1')
     expect(byId(form, 'source-problem').text()).toBe('Give each number as a whole number, 0 or more.')
     expect(byId(form, 'source-save').attributes('disabled')).toBeDefined()
@@ -1166,6 +1290,17 @@ describe('PanelHistoryStrip', () => {
     expect(rows[2]!.text()).toContain('Panel settings version 2')
     expect(rows[2]!.text()).toMatch(/In effect from the release pass, /)
     expect(rows[2]!.text()).toContain('By operator: widen')
+  })
+
+  // tj-7zjov1.362.4: a version saved with no reason reads 'By <actor>' alone, no colon and no empty reason.
+  it('a marker with an empty reason shows the actor alone', () => {
+    const bare = create(PanelBoundariesSchema, {
+      markers: [create(PanelMarkerSchema, { kind: PanelMarkerKind.PANEL_SETTINGS, versionNo: 2, at: timestampFromMs(T0 + 25 * DAY), actor: 'operator', reason: '' })],
+    })
+    const wrapper = mount(PanelHistoryStrip, { props: { history: history([]), boundaries: bare, panelVersions, sourceVersions: [] } })
+    const row = byId(wrapper, 'history-markers').find('[data-testid="history-marker-row"]')
+    expect(row.find('.marker__who').text()).toBe('By operator')
+    expect(row.text()).not.toContain('By operator:')
   })
 
   it('no markers in the window: no lane, and the empty line', () => {

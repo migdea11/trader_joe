@@ -13,7 +13,8 @@ no effective-from function any more.
      leaves nothing; source settings for a source that already has a version are REFUSED and nothing is written (the
      source's rates change only through append_source_settings_version);
   S2 a version append is a new row, version_no plus one, saved_at from the database, actor and reason stored trimmed,
-     a blank or whitespace reason (or actor) refused, earlier rows unchanged;
+     a blank or whitespace actor refused, a missing, blank or whitespace reason stored NULL (the reason is optional,
+     ADR tj-46jkey, owner ruling 2026-11-06), earlier rows unchanged; a panel has no size;
   S3 the source cannot change: no write takes one for an existing panel;
   S4 enable and disable are versions;
   S5 current_settings and enabled_panels_on_source read the LATEST version;
@@ -96,7 +97,7 @@ SOURCE = DataSource.ALPACA_API
 OTHER_SOURCE = DataSource.IB_API
 ACTOR = 'operator'
 RATES = SourceSettings(ramp_datasets_per_hour=7, request_cap_per_hour=41)
-SETTINGS_V1 = PanelSettings(enabled=True, size=25, cadence=PanelCadence.WEEKLY)
+SETTINGS_V1 = PanelSettings(enabled=True, cadence=PanelCadence.WEEKLY)
 
 PUBLIC_FUNCTIONS = {
     'create_panel',
@@ -240,7 +241,8 @@ async def test_create_panel_writes_the_panel_and_version_1_in_one_commit(world):
     assert panel_row.created_at is not None
     assert (version_row.panel_id, version_row.version_no) == (panel.id, 1)
     assert (version_row.actor, version_row.reason) == ('operator', 'split per country')
-    assert (version_row.enabled, version_row.size, version_row.cadence) == (True, 25, PanelCadence.WEEKLY)
+    assert (version_row.enabled, version_row.cadence) == (True, PanelCadence.WEEKLY)
+    assert 'size' not in version_row._fields, 'a panel has no size (ADR tj-46jkey)'
     assert version_row.saved_at is not None
     assert version == PanelSettingsRecord(
         id=version_row.id,
@@ -261,7 +263,7 @@ async def test_default_panel_cadence_is_monthly():
 async def test_create_panel_with_no_cadence_applies_the_default_and_stores_it(world):
     await _source(world)
 
-    _, version = await _panel(world, settings=PanelSettings(enabled=True, size=10))
+    _, version = await _panel(world, settings=PanelSettings(enabled=True))
 
     (row,) = await world.rows(SETTINGS)
     assert row.cadence is PanelCadence.MONTHLY
@@ -272,7 +274,7 @@ async def test_create_panel_with_no_cadence_applies_the_default_and_stores_it(wo
 async def test_create_panel_keeps_a_named_cadence(world, cadence):
     await _source(world)
 
-    await _panel(world, settings=PanelSettings(enabled=False, size=3, cadence=cadence))
+    await _panel(world, settings=PanelSettings(enabled=False, cadence=cadence))
 
     (row,) = await world.rows(SETTINGS)
     assert row.cadence is cadence
@@ -392,9 +394,9 @@ async def test_a_second_panel_with_the_same_trimmed_name_is_refused(world):
     assert len(await world.rows(PANELS)) == len(await world.rows(SETTINGS)) == 1
 
 
-@pytest.mark.parametrize('field', ['name', 'actor', 'reason'])
+@pytest.mark.parametrize('field', ['name', 'actor'])
 @pytest.mark.parametrize('blank', ['', '   ', '\t\n '])
-async def test_create_panel_refuses_a_blank_name_actor_or_reason(world, field, blank):
+async def test_create_panel_refuses_a_blank_name_or_actor(world, field, blank):
     await _source(world)
     before = await world.counts()
 
@@ -405,12 +407,25 @@ async def test_create_panel_refuses_a_blank_name_actor_or_reason(world, field, b
     assert await world.counts() == before
 
 
-async def test_create_panel_refuses_a_negative_size_and_negative_source_settings(world):
+@pytest.mark.parametrize('reason', [None, '', '   ', '\t\n '], ids=['none', 'empty', 'spaces', 'whitespace'])
+async def test_create_panel_with_no_reason_stores_null_for_both_new_versions(world, reason):
+    """The reason is optional (ADR tj-46jkey): missing or blank after trimming is stored NULL, never ''.
+
+    Both rows a create can write, the panel's version 1 and the source's first version, take the same rule.
+    """
+    panel, version = await _panel(world, reason=reason, source_settings=RATES)
+
+    (version_row,) = await world.rows(SETTINGS)
+    (source_row,) = await world.rows(SOURCE_SETTINGS)
+    assert version_row.reason is None and source_row.reason is None
+    assert version.reason is None and version_row.actor == ACTOR
+    assert version.panel_id == panel.id
+
+
+async def test_create_panel_refuses_negative_source_settings(world):
     await _source(world)
     before = await world.counts()
 
-    with pytest.raises(InvalidRequestError) as size:
-        await _panel(world, settings=PanelSettings(enabled=True, size=-1))
     with pytest.raises(InvalidRequestError) as rates:
         # OTHER_SOURCE has no version, so only the negative number can refuse this one (not the existing-version guard).
         await _panel(
@@ -420,7 +435,6 @@ async def test_create_panel_refuses_a_negative_size_and_negative_source_settings
             source_settings=SourceSettings(ramp_datasets_per_hour=-1, request_cap_per_hour=1),
         )
 
-    _refused(size)
     _refused(rates)
     assert await world.counts() == before
 
@@ -434,7 +448,6 @@ async def test_an_append_is_a_new_row_numbered_plus_one_and_leaves_earlier_rows_
     before = await world.rows(SETTINGS)
     second = PanelSettings(
         enabled=True,
-        size=40,
         cadence=PanelCadence.DAILY,
         allow_symbols=('AAA', 'BBB'),
         deny_symbols=('CCC',),
@@ -475,36 +488,58 @@ async def test_saved_at_is_the_databases_never_a_value_the_module_sends(world):
     assert all(row.saved_at is not None for row in await world.rows(SOURCE_SETTINGS))
 
 
-@pytest.mark.parametrize('field', ['actor', 'reason'])
 @pytest.mark.parametrize('blank', ['', '   ', '\t\n '])
-async def test_an_append_refuses_a_blank_actor_or_reason_and_writes_nothing(world, field, blank):
+async def test_an_append_refuses_a_blank_actor_and_writes_nothing(world, blank):
+    """The actor stays required everywhere (ADR tj-46jkey): only the reason became optional."""
     await _source(world)
     panel, _ = await _panel(world)
     before = await world.counts()
 
     with pytest.raises(InvalidRequestError) as panel_refusal:
-        await _append(world, panel.id, **{field: blank})
+        await _append(world, panel.id, actor=blank)
     with pytest.raises(InvalidRequestError) as source_refusal:
-        await _source(world, **{field: blank})
+        await _source(world, actor=blank)
 
     _refused(panel_refusal)
     _refused(source_refusal)
+    assert 'actor' in str(panel_refusal.value) and 'actor' in str(source_refusal.value)
     assert await world.counts() == before
 
 
-async def test_an_append_refuses_a_missing_cadence_and_a_negative_size(world):
+@pytest.mark.parametrize('reason', [None, '', '   ', '\t\n '], ids=['none', 'empty', 'spaces', 'whitespace'])
+async def test_an_append_with_no_reason_stores_null_and_reads_back_none(world, reason):
+    """Missing or blank after trimming is NULL on both version tables, the one spelling of 'none' (never '')."""
+    await _source(world)
+    panel, _ = await _panel(world)
+
+    version = await _append(world, panel.id, reason=reason)
+    source_version = await _source(world, reason=reason)
+
+    assert version.reason is None and source_version.reason is None
+    (stored,) = [row for row in await world.rows(SETTINGS) if row.version_no == 2]
+    (stored_source,) = [row for row in await world.rows(SOURCE_SETTINGS) if row.version_no == 2]
+    assert stored.reason is None and stored_source.reason is None
+    async with world.session() as db:
+        assert (await current_settings(db, panel.id)).reason is None
+
+
+async def test_a_reason_is_still_stored_trimmed_when_one_is_given(world):
+    await _source(world)
+    panel, _ = await _panel(world)
+    version = await _append(world, panel.id, reason='  widen  ')
+    assert version.reason == 'widen'
+
+
+async def test_an_append_refuses_a_missing_cadence(world):
     """A new version states its cadence in full: the default is create_panel's alone."""
     await _source(world)
     panel, _ = await _panel(world)
     before = await world.counts()
 
     with pytest.raises(InvalidRequestError) as no_cadence:
-        await _append(world, panel.id, PanelSettings(enabled=True, size=1))
-    with pytest.raises(InvalidRequestError) as negative:
-        await _append(world, panel.id, PanelSettings(enabled=True, size=-1, cadence=PanelCadence.DAILY))
+        await _append(world, panel.id, PanelSettings(enabled=True))
 
     _refused(no_cadence)
-    _refused(negative)
     assert await world.counts() == before
 
 
@@ -594,14 +629,14 @@ async def test_current_settings_is_the_latest_version_and_none_for_an_unknown_pa
 
     assert await _current(world, uuid.uuid4()) is None
     assert await _current(world, panel.id) == v1
-    v2 = await _append(world, panel.id, dataclasses.replace(SETTINGS_V1, size=99))
+    v2 = await _append(world, panel.id, dataclasses.replace(SETTINGS_V1, exchange='NYSE'))
     assert await _current(world, panel.id) == v2
 
 
 async def test_enabled_panels_on_source_reads_each_panels_latest_version_on_that_source_only(world):
     await _source(world)
     await _source(world, source=OTHER_SOURCE)
-    disabled = PanelSettings(enabled=False, size=1, cadence=PanelCadence.DAILY)
+    disabled = PanelSettings(enabled=False, cadence=PanelCadence.DAILY)
     stays_on, _ = await _panel(world, name='stays-on')
     turned_off, _ = await _panel(world, name='turned-off')
     turned_on, _ = await _panel(world, name='turned-on', settings=disabled)
@@ -654,7 +689,10 @@ async def test_source_versions_are_numbered_per_source(world):
 
 
 async def test_no_constant_names_a_rate_and_the_only_defaults_are_the_ruled_ones():
-    """The 03:25 UTC ruling: DEFAULT_PANEL_CADENCE and the 90-day window, nothing else; the rates and size have none."""
+    """The 03:25 UTC ruling: DEFAULT_PANEL_CADENCE and the 90-day window, nothing else; the rates have none.
+
+    And a panel has no size at all (ADR tj-46jkey): not a field with no default, no field.
+    """
     constants = {name for name in vars(panel_settings) if name.isupper() and not name.startswith('_')}
     assert constants == {'DEFAULT_PANEL_CADENCE', 'DEFAULT_CORPORATE_ACTION_WINDOW_DAYS'}
     assert DEFAULT_CORPORATE_ACTION_WINDOW_DAYS == 90
@@ -667,7 +705,7 @@ async def test_no_constant_names_a_rate_and_the_only_defaults_are_the_ruled_ones
     }
     panel_defaults = {f.name: f.default for f in dataclasses.fields(PanelSettings)}
     assert panel_defaults['enabled'] is dataclasses.MISSING
-    assert panel_defaults['size'] is dataclasses.MISSING
+    assert 'size' not in panel_defaults
     assert panel_defaults['cadence'] is None, 'the default cadence is applied by create_panel, not the dataclass'
     assert panel_defaults['allow_symbols'] == panel_defaults['deny_symbols'] == ()
     assert all(panel_defaults[name] is None for name in ('asset_class', 'exchange', 'active', 'tradable'))
@@ -919,7 +957,7 @@ async def test_every_statement_the_module_sends_is_a_select_or_an_insert(world):
     await _current(world, panel.id)
     await _current_source(world)
     await _enabled(world)
-    for refused in (_append(world, uuid.uuid4()), _panel(world, name='alpha'), _source(world, reason=' ')):
+    for refused in (_append(world, uuid.uuid4()), _panel(world, name='alpha'), _source(world, actor=' ')):
         with pytest.raises(InvalidRequestError):
             await refused
 

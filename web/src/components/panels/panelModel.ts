@@ -109,7 +109,6 @@ export interface PanelDraft {
   enabled: boolean
   /** UNSPECIFIED: not named (a create then takes the store's default). */
   cadence: PanelCadence
-  size: string
   allowSymbols: string
   denySymbols: string
   assetClass: AssetType
@@ -122,7 +121,6 @@ export function emptyDraft(): PanelDraft {
   return {
     enabled: true,
     cadence: PanelCadence.UNSPECIFIED,
-    size: '',
     allowSymbols: '',
     denySymbols: '',
     assetClass: AssetType.UNSPECIFIED,
@@ -138,7 +136,6 @@ export function draftFromSettings(settings: PanelSettings): PanelDraft {
   return {
     enabled: settings.enabled,
     cadence: settings.cadence,
-    size: String(settings.size),
     allowSymbols: settings.allowSymbols.join(', '),
     denySymbols: settings.denySymbols.join(', '),
     assetClass: settings.assetClass ?? AssetType.UNSPECIFIED,
@@ -153,7 +150,7 @@ export function parseSymbols(text: string): string[] {
   return text.split(/[\s,]+/).filter((symbol) => symbol !== '')
 }
 
-/** The size as a non-negative whole number, or null when the field is not one (blank included). */
+/** A count (ramp, cap, window days) as a non-negative whole number, or null when the field is not one (blank included). */
 export function parseCount(text: string): number | null {
   const trimmed = text.trim()
   if (!/^\d{1,9}$/.test(trimmed)) return null
@@ -174,7 +171,6 @@ export function settingsInitWithEnabled(saved: PanelSettings, enabled: boolean):
   const init: SettingsInit = {
     enabled,
     cadence: saved.cadence,
-    size: saved.size,
     allowSymbols: [...saved.allowSymbols],
     denySymbols: [...saved.denySymbols],
   }
@@ -186,7 +182,7 @@ export function settingsInitWithEnabled(saved: PanelSettings, enabled: boolean):
 }
 
 /**
- * The settings fields of a request from the form. The caller has checked the size parses; an absent
+ * The settings fields of a request from the form. An absent
  * optional filter is left out, which the server reads as no filter (a save replaces the settings as sent).
  */
 export function draftToSettingsInit(draft: PanelDraft): SettingsInit {
@@ -194,7 +190,6 @@ export function draftToSettingsInit(draft: PanelDraft): SettingsInit {
   return {
     enabled: draft.enabled,
     cadence: draft.cadence,
-    size: parseCount(draft.size) ?? 0,
     allowSymbols: parseSymbols(draft.allowSymbols),
     denySymbols: parseSymbols(draft.denySymbols),
     assetClass: draft.assetClass === AssetType.UNSPECIFIED ? undefined : draft.assetClass,
@@ -205,25 +200,21 @@ export function draftToSettingsInit(draft: PanelDraft): SettingsInit {
 }
 
 /** The settings fields that can block a save or create. */
-export type DraftField = 'size' | 'cadence' | 'reason'
+export type DraftField = 'cadence'
 
 /** The settings form's own problems per field, in words. Empty when it can be sent. */
 export function draftFieldErrors(
   draft: PanelDraft,
-  reason: string,
   options: { cadenceRequired: boolean },
 ): Partial<Record<DraftField, string>> {
   const errors: Partial<Record<DraftField, string>> = {}
-  if (parseCount(draft.size) === null) errors.size = 'Give the size as a whole number, 0 or more.'
   if (options.cadenceRequired && draft.cadence === PanelCadence.UNSPECIFIED) errors.cadence = 'Choose a cadence.'
-  if (reason.trim() === '') errors.reason = 'Give a reason for the change.'
   return errors
 }
 
 /** The settings form's own problems, in words: what stops Save. Empty when it can be sent. */
-export function draftProblem(draft: PanelDraft, reason: string, options: { cadenceRequired: boolean }): string {
-  const errors = draftFieldErrors(draft, reason, options)
-  return errors.size ?? errors.cadence ?? errors.reason ?? ''
+export function draftProblem(draft: PanelDraft, options: { cadenceRequired: boolean }): string {
+  return draftFieldErrors(draft, options).cadence ?? ''
 }
 
 /** What the create form knows when it decides whether Create Panel can be pressed. */
@@ -235,8 +226,6 @@ export interface CreateInput {
   sourceProblem: boolean
   /** null: not known yet (no source chosen, or the read is out); true: the source has no settings version. */
   sourceNeedsSettings: boolean | null
-  draft: PanelDraft
-  reason: string
   ramp: string
   cap: string
   pre: string
@@ -244,7 +233,7 @@ export interface CreateInput {
 }
 
 /** A create form field that can carry an error. */
-export type CreateField = 'name' | 'source' | 'size' | 'reason' | 'ramp' | 'cap' | 'pre' | 'post'
+export type CreateField = 'name' | 'source' | 'ramp' | 'cap' | 'pre' | 'post'
 
 const COUNT_ERROR = 'Give a whole number, 0 or more.'
 
@@ -260,9 +249,6 @@ export function createFieldErrors(input: CreateInput): Partial<Record<CreateFiel
   if (input.source === DataSource.UNSPECIFIED) errors.source = 'Choose a source.'
   else if (input.sourceProblem) errors.source = 'The source settings could not be read. Choose the source again.'
   else if (input.sourceNeedsSettings === null) errors.source = 'Reading the source settings.'
-  const base = draftFieldErrors(input.draft, input.reason, { cadenceRequired: false })
-  if (base.size !== undefined) errors.size = base.size
-  if (base.reason !== undefined) errors.reason = base.reason
   if (input.sourceNeedsSettings) {
     if (parseCount(input.ramp) === null) errors.ramp = COUNT_ERROR
     if (parseCount(input.cap) === null) errors.cap = COUNT_ERROR

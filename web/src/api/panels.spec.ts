@@ -68,13 +68,13 @@ const DETAIL_JSON = {
   source: 'DATA_SOURCE_ALPACA_API',
   currentVersion: {
     versionNo: 1,
-    settings: { enabled: true, cadence: 'PANEL_CADENCE_MONTHLY', size: 50 },
+    settings: { enabled: true, cadence: 'PANEL_CADENCE_MONTHLY' },
     actor: 'operator',
     reason: 'first',
   },
   counts: { members: '3', collecting: '2', draining: '0', lagging: '1' },
 }
-const VERSION_JSON = { versionNo: 2, settings: { enabled: false, size: 50 }, actor: 'operator', reason: 'pause' }
+const VERSION_JSON = { versionNo: 2, settings: { enabled: false }, actor: 'operator', reason: 'pause' }
 const SOURCE_VERSION_JSON = {
   source: 'DATA_SOURCE_ALPACA_API',
   versionNo: 1,
@@ -214,7 +214,6 @@ describe('the three writes: POST on their ruled path with a canonical JSON body'
       source: DataSource.ALPACA_API,
       enabled: false,
       cadence: PanelCadence.UNSPECIFIED,
-      size: 0,
       allowSymbols: ['AAPL'],
       denySymbols: [],
       reason: 'first panel',
@@ -229,7 +228,6 @@ describe('the three writes: POST on their ruled path with a canonical JSON body'
       name: 'Large caps',
       source: 'DATA_SOURCE_ALPACA_API',
       enabled: false,
-      size: 0,
       allowSymbols: ['AAPL'],
       reason: 'first panel',
       rampDatasetsPerHour: 0,
@@ -268,12 +266,11 @@ describe('the three writes: POST on their ruled path with a canonical JSON body'
     expect(sentBody()).not.toHaveProperty('corporateActionWindowPostDays')
   })
 
-  it('W2 savePanelSettings: POST /panels/{id}/settings-versions; enabled false and size 0 are present', async () => {
+  it('W2 savePanelSettings: POST /panels/{id}/settings-versions; enabled false is present, no size', async () => {
     fetchMock.mockResolvedValue(jsonResponse(VERSION_JSON, 201))
     const version = await savePanelSettings(PANEL_ID, {
       enabled: false,
       cadence: PanelCadence.MONTHLY,
-      size: 0,
       allowSymbols: [],
       denySymbols: ['TSLA'],
       reason: 'pause',
@@ -281,8 +278,24 @@ describe('the three writes: POST on their ruled path with a canonical JSON body'
     const { url, init } = call()
     expect(init.method).toBe('POST')
     expect(url.pathname).toBe(`/api/store/ui/v1/panels/${PANEL_ID}/settings-versions`)
-    expect(sentBody()).toEqual({ enabled: false, cadence: 'PANEL_CADENCE_MONTHLY', size: 0, denySymbols: ['TSLA'], reason: 'pause' })
+    expect(sentBody()).toEqual({ enabled: false, cadence: 'PANEL_CADENCE_MONTHLY', denySymbols: ['TSLA'], reason: 'pause' })
     expect(version.versionNo).toBe(2)
+  })
+
+  // tj-7zjov1.362.4 (ADR tj-46jkey section 2): reason is an implicit-presence proto3 string, so the blank
+  // reason the forms pass ('') is the field's default and canonical JSON leaves it out; the store reads an
+  // absent reason as none given. Each write still posts.
+  it('W1, W2, W3 with a blank reason: each posts, and the body carries no reason key', async () => {
+    fetchMock.mockImplementation(async () => jsonResponse(DETAIL_JSON, 201))
+    await createPanel({ name: 'n', source: DataSource.IB_API, reason: '' })
+    expect(sentBody()).toEqual({ name: 'n', source: 'DATA_SOURCE_IB_API' })
+    fetchMock.mockImplementation(async () => jsonResponse(VERSION_JSON, 201))
+    await savePanelSettings(PANEL_ID, { enabled: true, cadence: PanelCadence.DAILY, reason: '' })
+    expect(sentBody(1)).toEqual({ enabled: true, cadence: 'PANEL_CADENCE_DAILY' })
+    fetchMock.mockImplementation(async () => jsonResponse(SOURCE_VERSION_JSON, 201))
+    await saveSourceSettings(DataSource.ALPACA_API, { rampDatasetsPerHour: 1, requestCapPerHour: 2, reason: '' })
+    expect(sentBody(2)).toEqual({ rampDatasetsPerHour: 1, requestCapPerHour: 2 })
+    expect(fetchMock).toHaveBeenCalledTimes(3)
   })
 
   it('W3 saveSourceSettings: POST /panel-sources/{NAME}/settings-versions; every number present, 0 included', async () => {

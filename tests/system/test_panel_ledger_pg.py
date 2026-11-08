@@ -1,13 +1,13 @@
 """The panel ledger repository (tj-7zjov1.177, P20c) on the real, migrated Postgres, through asyncpg.
 
 WRITTEN, NOT YET RUN where it was written (validator tj-7zjov1.179): it runs with the rest of the suite (make
-test-system, or the agent-stack run_system_tests after test_up) on a stack migrated to the head (b6d1f93a7c42 or later).
+test-system, or the agent-stack run_system_tests after test_up) on a stack migrated to the alpha baseline (ADR
+tj-kg521d).
 
 THE DESIGN: the P20c bead and its architect notes (14:02 and 14:16 UTC 2026-10-27, 03:26 UTC 2026-10-28), ADR
 tj-26jt9w addendum 20, and the RULING of 01:26 UTC 2026-10-30 on tj-7zjov1.177 (P20c-fix tj-7zjov1.207, these pins
 tj-7zjov1.208): seq, the per-pass append ordinal, unique (pass_id, seq); newest by as_of, started_at, pass_id, seq; a
-finished pass takes no rows; finish_pass raises on an unknown pass. The stack's test database must be RESET and MIGRATED
-AGAIN for these: b6d1f93a7c42 was edited in place, so a database upgraded before it has no seq column. WHAT THIS PROVES that server/data/store/tests/test_panel_ledger.py and
+finished pass takes no rows; finish_pass raises on an unknown pass. WHAT THIS PROVES that server/data/store/tests/test_panel_ledger.py and
 test_panel_boundary_read.py cannot, because SQLite has no JSONB, no Postgres enums, no row locks and other window,
 timestamp and IN-subquery semantics:
   PL1 a full round runs on asyncpg: open_pass of both kinds (panel_pass_kind cast), append_transitions of all seven
@@ -36,7 +36,7 @@ except test_panel_settings_pg.py, and counts read on it are taken RELATIVE to a 
 deletes exactly the rows it wrote, failed or not (a test-only delete: the module itself is append-only).
 
 REQUESTS. A CREATED row names its bars request and no dataset. The ledger has no foreign key to ingest_request
-(test_migration_with_data.py pins that), so a CREATED row that only needs SOME request id names a fresh uuid with no
+(test_store_model_invariants.py and the baseline catalogue test pin that), so a CREATED row that only needs SOME request id names a fresh uuid with no
 row behind it. Where the dataset matters (PL4) the test writes the ingest_request row itself, BARS on SOURCE, in a
 FINISHED state only (SUCCEEDED once the intake set its dataset, FAILED while it is NULL), so the instance watcher,
 which re-sends open requests, never picks one up; the test deletes it at its end.
@@ -151,7 +151,7 @@ async def panel(pg_async_engine: AsyncEngine, written: Written, run_identity):
             db,
             name=f'system-test-{run_identity.run_id}-ledger-{uuid.uuid4().hex[:8]}',
             source=SOURCE,
-            settings=PanelSettings(enabled=True, size=10, cadence=PanelCadence.DAILY),
+            settings=PanelSettings(enabled=True, cadence=PanelCadence.DAILY),
             actor='operator',
             reason='ledger system test panel',
         )
@@ -459,7 +459,7 @@ async def _other_panel(engine: AsyncEngine, panel, written: Written, run_id: str
             db,
             name=f'system-test-{run_id}-ledger-other-{uuid.uuid4().hex[:8]}',
             source=SOURCE,
-            settings=PanelSettings(enabled=True, size=10, cadence=PanelCadence.DAILY),
+            settings=PanelSettings(enabled=True, cadence=PanelCadence.DAILY),
             actor='operator',
             reason='ledger system test other panel',
         )

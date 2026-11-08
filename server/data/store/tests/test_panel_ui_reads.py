@@ -255,7 +255,7 @@ async def test_r2_carries_the_current_versions_and_takes_the_source_versions_pas
     seeded = await world.panel('mine')
     other = await world.panel('other', new_source_version=False)
     newest_source = await world.source_version(SOURCE, reason='rates raised')
-    v2 = await world.settings_version(seeded.panel_id, reason='bigger', size=40)
+    v2 = await world.settings_version(seeded.panel_id, reason='narrower', allow_symbols=['ZZZ'])
     mine = await world.open(seeded, kind=PanelPassKind.RELEASE, settings_id=v2, started_at=T0)
     # Another panel ran under the newest source version: that is ITS effective-from, not this panel's.
     await world.open(other, source_settings_id=newest_source, started_at=T0 - DAY)
@@ -264,7 +264,8 @@ async def test_r2_carries_the_current_versions_and_takes_the_source_versions_pas
 
     assert body['id'] == str(seeded.panel_id) and body['name'] == 'mine' and body['source'] == 'DATA_SOURCE_ALPACA_API'
     current = body['currentVersion']
-    assert current['versionNo'] == 2 and current['reason'] == 'bigger' and current['settings']['size'] == 40
+    assert current['versionNo'] == 2 and current['reason'] == 'narrower'
+    assert current['settings']['allowSymbols'] == ['ZZZ'] and 'size' not in current['settings']
     assert current['effectivePass'] == {'passId': str(mine), 'kind': 'PANEL_PASS_KIND_RELEASE', 'startedAt': stamp(T0)}
     source = body['currentSourceVersion']
     assert source['versionNo'] == 2 and source['reason'] == 'rates raised'
@@ -293,7 +294,6 @@ async def test_r3_pages_newest_first_with_the_full_settings_and_the_kind_of_the_
     v2 = await world.settings_version(
         seeded.panel_id,
         cadence=PanelCadence.WEEKLY,
-        size=7,
         allow_symbols=['AAA', 'BBB'],
         deny_symbols=['CCC'],
         asset_class=AssetType.STOCK,
@@ -319,7 +319,6 @@ async def test_r3_pages_newest_first_with_the_full_settings_and_the_kind_of_the_
     assert filtered['settings'] == {
         'enabled': True,
         'cadence': 'PANEL_CADENCE_WEEKLY',
-        'size': 7,
         'allowSymbols': ['AAA', 'BBB'],
         'denySymbols': ['CCC'],
         'assetClass': 'ASSET_TYPE_STOCK',
@@ -335,8 +334,8 @@ async def test_r3_pages_newest_first_with_the_full_settings_and_the_kind_of_the_
         'kind': 'PANEL_PASS_KIND_RELEASE',
         'startedAt': stamp(T0 - DAY),
     }
-    # An absent optional filter is absent on the wire, never false.
-    assert set(original['settings']) == {'enabled', 'cadence', 'size'}
+    # An absent optional filter is absent on the wire, never false; and a panel has no size (ADR tj-46jkey).
+    assert set(original['settings']) == {'enabled', 'cadence'}
 
 
 async def test_r3_a_full_last_page_has_no_cursor_and_the_default_limit_is_100(world, client):
@@ -447,6 +446,31 @@ async def test_r5_serves_every_marker_in_the_half_open_window_oldest_first(world
     stop = body['markers'][2]
     assert stop['datasetId'] == str(ds['a']) and stop['actor'] == 'operator' and stop['at'] == stamp(start + 3 * DAY)
     assert 'datasetId' not in body['markers'][0]
+
+
+async def test_a_version_with_no_reason_reads_as_none_on_every_route_that_serves_it(world, client):
+    """A NULL reason (stored when none was given, ADR tj-46jkey) reads as '' on the wire: R2, R3, R4 and R5 alike.
+
+    Proto3 canonical JSON omits an empty string, so the field is ABSENT, never null and never a placeholder text; the
+    actor is still served. A NULL also passes the reason's not-blank CHECK, which the version rows here go through.
+    """
+    seeded = await world.panel('reasonless')
+    source_version = await world.source_version(SOURCE, reason=None, saved_at=T0)
+    version = await world.settings_version(seeded.panel_id, reason=None, saved_at=T0 + timedelta(hours=1))
+    for table, row_id in ((SETTINGS, version), (SOURCE_SETTINGS, source_version)):
+        (stored,) = await world.rows(table, table.c.id == row_id)
+        assert stored.reason is None
+
+    current = (await get(client, path(seeded)))['currentVersion']
+    assert current['versionNo'] == 2 and 'reason' not in current and current['actor'] == 'operator'
+    (newest, *_) = (await get(client, path(seeded, '/settings-versions')))['items']
+    assert newest['versionNo'] == 2 and 'reason' not in newest
+    (top, *_) = (await get(client, '/ui/v1/panel-sources/DATA_SOURCE_ALPACA_API/settings-versions'))['items']
+    assert top['versionNo'] == 2 and 'reason' not in top and top['actor'] == 'operator'
+    body = await get(client, path(seeded, '/boundaries'), start=iso(T0 - DAY), end=iso(T0 + DAY))
+    reasonless = [m for m in body['markers'] if m.get('versionNo') == 2]
+    assert {m['kind'] for m in reasonless} == {'PANEL_MARKER_KIND_PANEL_SETTINGS', 'PANEL_MARKER_KIND_SOURCE_SETTINGS'}
+    assert all('reason' not in m and m['actor'] == 'operator' for m in reasonless), reasonless
 
 
 async def test_r5_labels_a_stop_on_a_deleted_dataset_with_nothing(world, client):

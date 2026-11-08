@@ -164,7 +164,6 @@ describe('parseSymbols and parseCount', () => {
 const SAVED = create(PanelSettingsSchema, {
   enabled: true,
   cadence: PanelCadence.WEEKLY,
-  size: 40,
   allowSymbols: ['AAPL', 'MSFT'],
   denySymbols: ['TSLA'],
   assetClass: AssetType.STOCK,
@@ -174,11 +173,12 @@ const SAVED = create(PanelSettingsSchema, {
 })
 
 describe('the settings draft', () => {
-  it('emptyDraft: enabled, no cadence named, every filter absent', () => {
+  // tj-7zjov1.362.4 (ADR tj-46jkey section 1): a panel has no size, so the draft has none (toEqual is exact
+  // on keys, so a size coming back reds this).
+  it('emptyDraft: enabled, no cadence named, every filter absent, no size', () => {
     expect(emptyDraft()).toEqual({
       enabled: true,
       cadence: PanelCadence.UNSPECIFIED,
-      size: '',
       allowSymbols: '',
       denySymbols: '',
       assetClass: AssetType.UNSPECIFIED,
@@ -193,7 +193,6 @@ describe('the settings draft', () => {
     expect(draftFromSettings(SAVED)).toEqual({
       enabled: true,
       cadence: PanelCadence.WEEKLY,
-      size: '40',
       allowSymbols: 'AAPL, MSFT',
       denySymbols: 'TSLA',
       assetClass: AssetType.STOCK,
@@ -204,15 +203,15 @@ describe('the settings draft', () => {
   })
 
   it('draftFromSettings: absent filters are absent in the draft', () => {
-    const bare = create(PanelSettingsSchema, { enabled: false, cadence: PanelCadence.DAILY, size: 0 })
-    expect(draftFromSettings(bare)).toMatchObject({ enabled: false, size: '0', assetClass: AssetType.UNSPECIFIED, exchange: '', active: '', tradable: '' })
+    const bare = create(PanelSettingsSchema, { enabled: false, cadence: PanelCadence.DAILY })
+    expect(draftFromSettings(bare)).toMatchObject({ enabled: false, assetClass: AssetType.UNSPECIFIED, exchange: '', active: '', tradable: '' })
+    expect(Object.hasOwn(draftFromSettings(bare), 'size')).toBe(false)
   })
 
-  it('draftToSettingsInit: the filters set are sent, the absent ones left out, the size parsed', () => {
+  it('draftToSettingsInit: the filters set are sent, the absent ones left out, no size', () => {
     expect(draftToSettingsInit(draftFromSettings(SAVED))).toEqual({
       enabled: true,
       cadence: PanelCadence.WEEKLY,
-      size: 40,
       allowSymbols: ['AAPL', 'MSFT'],
       denySymbols: ['TSLA'],
       assetClass: AssetType.STOCK,
@@ -223,11 +222,10 @@ describe('the settings draft', () => {
   })
 
   it('draftToSettingsInit: an empty draft sends no filter, a blank exchange is absent, the cadence as drafted', () => {
-    const init = draftToSettingsInit({ ...emptyDraft(), size: '5', exchange: '   ' })
+    const init = draftToSettingsInit({ ...emptyDraft(), exchange: '   ' })
     expect(init).toEqual({
       enabled: true,
       cadence: PanelCadence.UNSPECIFIED,
-      size: 5,
       allowSymbols: [],
       denySymbols: [],
       assetClass: undefined,
@@ -238,7 +236,7 @@ describe('the settings draft', () => {
   })
 
   it('draftToSettingsInit trims the exchange and keeps a false enabled and a false filter', () => {
-    const init = draftToSettingsInit({ ...emptyDraft(), enabled: false, size: '1', exchange: ' NYSE ', active: 'false', tradable: 'true' })
+    const init = draftToSettingsInit({ ...emptyDraft(), enabled: false, exchange: ' NYSE ', active: 'false', tradable: 'true' })
     expect(init).toMatchObject({ enabled: false, exchange: 'NYSE', active: false, tradable: true })
   })
 
@@ -250,7 +248,6 @@ describe('the settings draft', () => {
   // The draft is the operator's text, so it is lossy for some saved values: Enable or Disable must not
   // go through it (tj-7zjov1.248). These pin the losses the toggle avoids, so the reason stays visible.
   it.each([
-    ['a size of 10 digits parses to 0', { size: 2_147_483_647 }, { size: 0 }],
     ['an exchange is trimmed', { exchange: ' X ' }, { exchange: 'X' }],
     ['an empty-but-present exchange is dropped', { exchange: '' }, { exchange: undefined }],
     ['a present UNSPECIFIED asset class is dropped', { assetClass: AssetType.UNSPECIFIED }, { assetClass: undefined }],
@@ -259,77 +256,46 @@ describe('the settings draft', () => {
     expect(init).toMatchObject(sent)
   })
 
-  const ok: PanelDraft = { ...emptyDraft(), cadence: PanelCadence.MONTHLY, size: '10' }
+  const ok: PanelDraft = { ...emptyDraft(), cadence: PanelCadence.MONTHLY }
 
   it('draftProblem: nothing in the way', () => {
-    expect(draftProblem(ok, 'because', { cadenceRequired: true })).toBe('')
-  })
-
-  it.each(['', ' ', '-1', 'ten', '1.5'])('draftProblem: a size of %j stops the save', (size) => {
-    expect(draftProblem({ ...ok, size }, 'because', { cadenceRequired: true })).toBe('Give the size as a whole number, 0 or more.')
+    expect(draftProblem(ok, { cadenceRequired: true })).toBe('')
   })
 
   it('draftProblem: a save needs a cadence; a create does not (the store defaults it)', () => {
     const none = { ...ok, cadence: PanelCadence.UNSPECIFIED }
-    expect(draftProblem(none, 'because', { cadenceRequired: true })).toBe('Choose a cadence.')
-    expect(draftProblem(none, 'because', { cadenceRequired: false })).toBe('')
+    expect(draftProblem(none, { cadenceRequired: true })).toBe('Choose a cadence.')
+    expect(draftProblem(none, { cadenceRequired: false })).toBe('')
   })
 
-  it.each(['', '   ', '\n\t'])('draftProblem: a blank reason (%j) stops it', (reason) => {
-    expect(draftProblem(ok, reason, { cadenceRequired: true })).toBe('Give a reason for the change.')
-    expect(draftProblem(ok, reason, { cadenceRequired: false })).toBe('Give a reason for the change.')
-  })
-
-  it('draftProblem: the edit form refuses a 10-digit size in words (it does not rewrite it)', () => {
-    expect(draftProblem(draftFromSettings(create(PanelSettingsSchema, { ...SAVED, size: 2_147_483_647 })), 'r', { cadenceRequired: true })).toBe(
-      'Give the size as a whole number, 0 or more.',
-    )
-    expect(draftProblem({ ...ok, size: '999999999' }, 'r', { cadenceRequired: true })).toBe('')
-  })
-
-  it('draftProblem: with every problem at once it names size, then cadence, then reason (unchanged order)', () => {
-    const none = { ...ok, cadence: PanelCadence.UNSPECIFIED }
-    expect(draftProblem({ ...none, size: '' }, '', { cadenceRequired: true })).toBe('Give the size as a whole number, 0 or more.')
-    expect(draftProblem(none, '', { cadenceRequired: true })).toBe('Choose a cadence.')
-    expect(draftProblem({ ...none, size: 'x' }, '', { cadenceRequired: false })).toBe('Give the size as a whole number, 0 or more.')
-    expect(draftProblem(none, '', { cadenceRequired: false })).toBe('Give a reason for the change.')
+  // tj-7zjov1.362.4 (ADR tj-46jkey section 2): the reason is optional, so it is not an input to the draft's
+  // rules at all; the empty draft (nothing typed in any filter) blocks nothing but a missing cadence.
+  it('draftProblem: an empty draft with a cadence blocks nothing (no size, no reason to give)', () => {
+    expect(draftProblem(emptyDraft(), { cadenceRequired: false })).toBe('')
+    expect(draftProblem({ ...emptyDraft(), cadence: PanelCadence.DAILY }, { cadenceRequired: true })).toBe('')
   })
 })
 
 // tj-crl7pm: every problem at once, per field. The settings form still reads draftProblem (the first one);
 // the create form reads createFieldErrors, which drives both its field marks and its button.
 describe('draftFieldErrors: the settings draft problems per field', () => {
-  const ok: PanelDraft = { ...emptyDraft(), cadence: PanelCadence.MONTHLY, size: '10' }
-  const SIZE = 'Give the size as a whole number, 0 or more.'
+  const ok: PanelDraft = { ...emptyDraft(), cadence: PanelCadence.MONTHLY }
   const CADENCE = 'Choose a cadence.'
-  const REASON = 'Give a reason for the change.'
 
   it('nothing in the way: no field', () => {
-    expect(draftFieldErrors(ok, 'because', { cadenceRequired: true })).toEqual({})
-    expect(draftFieldErrors(ok, 'because', { cadenceRequired: false })).toEqual({})
-  })
-
-  it.each(['', ' ', '-1', 'ten', '1.5', '2147483648'])('a size of %j marks size only', (size) => {
-    expect(draftFieldErrors({ ...ok, size }, 'because', { cadenceRequired: true })).toStrictEqual({ size: SIZE })
+    expect(draftFieldErrors(ok, { cadenceRequired: true })).toEqual({})
+    expect(draftFieldErrors(ok, { cadenceRequired: false })).toEqual({})
   })
 
   it('cadence is marked only when required', () => {
     const none = { ...ok, cadence: PanelCadence.UNSPECIFIED }
-    expect(draftFieldErrors(none, 'because', { cadenceRequired: true })).toStrictEqual({ cadence: CADENCE })
-    expect(draftFieldErrors(none, 'because', { cadenceRequired: false })).toStrictEqual({})
+    expect(draftFieldErrors(none, { cadenceRequired: true })).toStrictEqual({ cadence: CADENCE })
+    expect(draftFieldErrors(none, { cadenceRequired: false })).toStrictEqual({})
   })
 
-  it.each(['', '   ', '\n\t'])('a blank reason (%j) marks reason only', (reason) => {
-    expect(draftFieldErrors(ok, reason, { cadenceRequired: true })).toStrictEqual({ reason: REASON })
-  })
-
-  it('every problem at once: all three, in the order size, cadence, reason', () => {
-    const errors = draftFieldErrors({ ...ok, size: '', cadence: PanelCadence.UNSPECIFIED }, ' ', { cadenceRequired: true })
-    expect(Object.entries(errors)).toEqual([
-      ['size', SIZE],
-      ['cadence', CADENCE],
-      ['reason', REASON],
-    ])
+  it('every problem at once is the cadence alone: no size and no reason field exist', () => {
+    const errors = draftFieldErrors({ ...emptyDraft(), cadence: PanelCadence.UNSPECIFIED }, { cadenceRequired: true })
+    expect(Object.entries(errors)).toEqual([['cadence', CADENCE]])
   })
 })
 
@@ -341,8 +307,6 @@ describe('createFieldErrors: every empty or invalid create field at once', () =>
     source: DataSource.ALPACA_API,
     sourceProblem: false,
     sourceNeedsSettings: false,
-    draft: { ...emptyDraft(), size: '10' },
-    reason: 'because',
     ramp: '',
     cap: '',
     pre: '',
@@ -355,36 +319,45 @@ describe('createFieldErrors: every empty or invalid create field at once', () =>
     expect(createFieldErrors(NEEDS)).toEqual({})
   })
 
-  it('the form as opened: name, source, size and reason, in that order, with their words', () => {
+  // tj-7zjov1.362.4 (architect note 22:22 UTC; ADR tj-46jkey sections 1 and 2): the required create fields
+  // are name and source, plus ramp and cap only while the source has no settings. Size is gone; reason is
+  // optional and is no input to the rules at all.
+  it('the form as opened: name and source only, in that order, with their words', () => {
     const opened: CreateInput = {
       ...READY,
       name: '',
       source: DataSource.UNSPECIFIED,
       sourceNeedsSettings: null,
-      draft: emptyDraft(),
-      reason: '',
     }
     expect(Object.entries(createFieldErrors(opened))).toEqual([
       ['name', 'Give the panel a name.'],
       ['source', 'Choose a source.'],
-      ['size', 'Give the size as a whole number, 0 or more.'],
-      ['reason', 'Give a reason for the change.'],
     ])
   })
 
-  it('every field at once on a source with no settings: all eight, in form order', () => {
+  it('the required set on a source WITH settings: name and source, nothing else even with every other field blank', () => {
+    const blank: CreateInput = { ...READY, name: '', source: DataSource.UNSPECIFIED, sourceNeedsSettings: null }
+    expect(Object.keys(createFieldErrors(blank))).toEqual(['name', 'source'])
+    expect(createFieldErrors({ ...READY, ramp: '', cap: '', pre: '', post: '' })).toEqual({})
+  })
+
+  it('the required set on a source WITHOUT settings: name, source, ramp and cap, in that order; the window days are not required', () => {
+    const blank: CreateInput = { ...NEEDS, name: '', sourceProblem: true, ramp: '', cap: '', pre: '', post: '' }
+    expect(Object.keys(createFieldErrors(blank))).toEqual(['name', 'source', 'ramp', 'cap'])
+    expect(Object.keys(createFieldErrors({ ...NEEDS, ramp: '', cap: '' }))).toEqual(['ramp', 'cap'])
+  })
+
+  it('every field at once on a source with no settings: all six, in form order', () => {
     const all: CreateInput = {
       ...NEEDS,
       name: ' ',
       sourceProblem: true,
-      draft: { ...emptyDraft(), size: 'x' },
-      reason: '',
       ramp: '',
       cap: '-1',
       pre: 'x',
       post: '1.5',
     }
-    expect(Object.keys(createFieldErrors(all))).toEqual(['name', 'source', 'size', 'reason', 'ramp', 'cap', 'pre', 'post'])
+    expect(Object.keys(createFieldErrors(all))).toEqual(['name', 'source', 'ramp', 'cap', 'pre', 'post'])
   })
 
   it.each(['', '   '])('a blank name (%j) is asked for, taken or not', (name) => {
@@ -408,20 +381,6 @@ describe('createFieldErrors: every empty or invalid create field at once', () =>
       source: 'The source settings could not be read. Choose the source again.',
     })
     expect(createFieldErrors({ ...READY, sourceNeedsSettings: null })).toStrictEqual({ source: 'Reading the source settings.' })
-  })
-
-  it.each(['', ' ', '-1', 'ten', '1.5'])('a size of %j marks size only', (size) => {
-    expect(createFieldErrors({ ...READY, draft: { ...READY.draft, size } })).toStrictEqual({
-      size: 'Give the size as a whole number, 0 or more.',
-    })
-  })
-
-  it.each(['', '  ', '\n'])('a blank reason (%j) marks reason only', (reason) => {
-    expect(createFieldErrors({ ...READY, reason })).toStrictEqual({ reason: 'Give a reason for the change.' })
-  })
-
-  it('cadence is never marked: the store defaults it', () => {
-    expect(createFieldErrors({ ...READY, draft: { ...READY.draft, cadence: PanelCadence.UNSPECIFIED } })).toEqual({})
   })
 
   it.each(['', ' ', '-1', 'x', '1.5'])('a source with no settings: a ramp or cap of %j is marked on that field', (bad) => {
@@ -454,18 +413,15 @@ describe('createFieldErrors: every empty or invalid create field at once', () =>
 // parse. Each row is checked twice: as the init object (key presence included, toStrictEqual), and on the
 // wire, where the request's canonical JSON must equal the saved message's with `enabled` flipped.
 describe('settingsInitWithEnabled: the saved settings with only enabled flipped', () => {
-  const BASE = { enabled: true, cadence: PanelCadence.WEEKLY, size: 40, allowSymbols: ['AAPL'], denySymbols: [] as string[] }
+  const BASE = { enabled: true, cadence: PanelCadence.WEEKLY, allowSymbols: ['AAPL'], denySymbols: [] as string[] }
 
   const ROWS: [string, Record<string, unknown>, Record<string, unknown>][] = [
     ['every optional field absent', {}, {}],
     [
       'every field set',
-      { size: 40, allowSymbols: ['AAPL', 'MSFT'], denySymbols: ['TSLA'], assetClass: AssetType.STOCK, exchange: 'NASDAQ', active: true, tradable: false },
+      { allowSymbols: ['AAPL', 'MSFT'], denySymbols: ['TSLA'], assetClass: AssetType.STOCK, exchange: 'NASDAQ', active: true, tradable: false },
       { assetClass: AssetType.STOCK, exchange: 'NASDAQ', active: true, tradable: false },
     ],
-    ['the int32 maximum size', { size: 2_147_483_647 }, {}],
-    ['a size of 1,000,000,000 (10 digits)', { size: 1_000_000_000 }, {}],
-    ['a size of 0', { size: 0 }, {}],
     ['an exchange with spaces round it', { exchange: ' X ' }, { exchange: ' X ' }],
     ['an empty-but-present exchange', { exchange: '' }, { exchange: '' }],
     ['a present UNSPECIFIED asset class', { assetClass: AssetType.UNSPECIFIED }, { assetClass: AssetType.UNSPECIFIED }],
@@ -485,7 +441,6 @@ describe('settingsInitWithEnabled: the saved settings with only enabled flipped'
     expect(init).toStrictEqual({
       enabled: !saved.enabled,
       cadence: saved.cadence,
-      size: saved.size,
       allowSymbols: saved.allowSymbols,
       denySymbols: saved.denySymbols,
       ...optionals,
