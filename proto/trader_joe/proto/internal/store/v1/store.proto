@@ -20,8 +20,9 @@
 //
 // INTERNAL: both ends ship from this repository in one release, and buf's breaking checks ignore
 // trader_joe.proto.internal. A contract may import market/v1 and never another contract, which is why
-// BarPage, VendorCallStats, VendorReported and ServedRange are restated below rather than imported from ingest.proto: the two
-// shapes are the same on purpose and the mappers (tj-7zjov1.15, tj-7zjov1.16) keep them so.
+// BarPage, VendorCallStats, VendorReported and ServedRange are restated below rather than imported from ingest.proto
+// (which no longer carries them: the shapes are defined here, and the mappers tj-7zjov1.15 and
+// tj-7zjov1.16 build the ingest-side domain models from them).
 //
 // NO CREDENTIAL MATERIAL crosses here. quota_key is a non-secret configured label, never key material
 // and never a hash of it. The vendor asset id is the vendor's public instrument key, not a credential.
@@ -183,8 +184,18 @@ message DeliverAttemptResponse {
   uint32 attempt_count = 2;
 }
 
-// A bounded page of bars, the same shape as ingest.proto's BarPage (restated: a contract never imports
-// another contract). No dataset_id: the store stamps its own rows, and the header names the request.
+// A BOUNDED PAGE OF BARS, the bars of one delivery. No dataset_id: the store stamps its own rows, and
+// the header names the request.
+//
+// THE PAGE SIZE IS 5000 BARS, and it is the server's to honour -- the wire cannot express it. The
+// figures are MEASURED on this contract, not estimated: a full page is 345000 bytes (337 KiB, 69.0
+// bytes a bar), and 385000 bytes (376 KiB, 77.0 a bar) with every optional field populated, the
+// nanosecond field non-zero and the varints at their widest. That is about a third of the ~1 MiB ADR
+// tj-8konfu D6.3 targets for a bulk chunk, and 9.2 % of the 4 MiB ceiling in common/rpc/config.py --
+// which is a bug guard rather than a working limit, so a message that approaches it is a defect to
+// surface. In the other direction 5000 bars is about 12.8 trading days of one-minute bars (390 to a
+// regular session) or some twenty years of daily ones, so an ordinary fetch is one or two pages and
+// the per-page overhead stays irrelevant.
 message BarPage {
   repeated trader_joe.proto.market.v1.Bar bars = 1;
 }
@@ -243,8 +254,8 @@ message CorporateActionRecord {
   google.protobuf.Timestamp effective_date = 9;
 }
 
-// The vendor calls one attempt made. Counted by ingest. The same shape as ingest.proto's VendorCallStats,
-// restated because a contract never imports another contract.
+// The vendor calls one attempt made. Counted by ingest. The shape is defined here,
+// because a contract never imports another contract.
 message VendorCallStats {
   uint64 calls = 1;
   uint64 pages = 2;
@@ -264,7 +275,7 @@ message VendorReported {
   google.protobuf.Timestamp reset_at = 3;
 }
 
-// The served window; the same shape as ingest.proto's ServedRange.
+// The served window; the shape is defined here, as a contract never imports another contract.
 message ServedRange {
   // Inclusive.
   google.protobuf.Timestamp start = 1;

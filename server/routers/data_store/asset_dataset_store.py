@@ -51,7 +51,7 @@ async def store_data(
 
     THE REQUEST IS WRITTEN, SUBMITTED TO INGEST, AND AWAITED (tj-7zjov1.28): ingest pushes the result to the store's
     own service, which writes the dataset entry and the bars in the delivery transaction; this handler waits for the
-    request to finish, up to the fetch deadline, and answers from the request's rows. One that outlives the deadline
+    request to finish, up to the verdict deadline, and answers from the request's rows. One that outlives the deadline
     answers the deadline error and keeps running.
 
     THIS HANDLER CATCHES NOTHING (ADR tj-fa1rpu D6). Every failure below it is a TraderJoeError
@@ -64,11 +64,11 @@ async def store_data(
     case, which is why D6 forbids it rather than leaving it to taste.
 
     THE RETURN TYPE IS DECLARED, and that is what puts served_range into OpenAPI and therefore into
-    a generated client (user ruling, 2026-10-02). It is copied out of the fetch's FetchDone exactly
+    a generated client (user ruling, 2026-10-02). It is copied from the finishing attempt's served range exactly
     as it arrived -- never rebuilt from the request, never clamped a second time here -- so a
     served-but-empty answer, a misspelled symbol among them, tells the caller which window the
     vendor actually answered for. A PUBLIC model of its own rather than a re-export of the internal
-    FetchDone, so an internal change cannot move this contract silently.
+    delivery type, so an internal change cannot move this contract silently.
 
     THE RESERVED OWNER IS REFUSED HERE, AT THE ROUTE EDGE (owner ruling 2026-10-27, Q4): a body whose owner is
     PANEL_OWNER is INVALID_REQUEST (422), before the request row is written. The panel manager creates its datasets on

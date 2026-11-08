@@ -214,7 +214,9 @@ def test_sip_feed_is_read_at_call_time_not_at_import():
 # without the edge in the way. The other two were the BATCH's: that the vendor's bars arrive in it
 # in order, and that it carries the request's dataset_id for the store to correlate on. Both belong
 # to a schema tj-3mk3u5.11 deletes; their successors are the gRPC bar pages and the ack, pinned in
-# test_fetch_dataset_handler.py and common/tests/rpc/test_rpc_fetch_mapping.py.
+# test_fetch_dataset_handler.py and common/tests/rpc/test_rpc_fetch_mapping.py until tj-7zjov1.275
+# retired FetchDataset, and now on the Submit path: the bar pages in test_bars_attempt_pages.py and
+# common/tests/rpc/test_rpc_delivery_mapping.py, the ack in test_ack_gated_retry.py.
 
 
 @pytest.mark.asyncio
@@ -252,8 +254,10 @@ async def test_the_feed_the_handle_resolves_reaches_the_vendor_call(
     BarsResponse.feed onto the batch, and without it bars from whichever tape served them were
     stored carrying no tape at all, with ``feed`` inside the bar's identity. The gRPC ack carries
     the resolved feed instead -- test_fetch_dataset_handler.py's
-    test_the_ack_comes_first_carrying_the_feed_the_adapter_resolved_not_the_one_the_request_named --
-    and tj-3mk3u5.31 writes it to the entry. Nothing here was its last pin.
+    test_the_ack_comes_first_carrying_the_feed_the_adapter_resolved_not_the_one_the_request_named
+    until tj-7zjov1.275 retired FetchDataset; on Submit, test_ack_gated_retry.py's
+    test_submit_queues_the_request_and_answers_at_once_with_the_feed_and_the_scope -- and
+    tj-3mk3u5.31 writes it to the entry. Nothing here was its last pin.
 
     THE HALF THAT STAYS is the one this file is for, and it fails on its own. Before tj-vhboky.9
     ``resolve_feed()`` fed the local single-flight key and nothing else: the vendor call carried no
@@ -295,8 +299,10 @@ async def test_the_feed_the_handle_resolves_reaches_the_vendor_call(
 # On the gRPC path the named feed DOES reach the adapter, which serves it or refuses it with
 # FEED_NOT_AVAILABLE before any vendor call (TE-4, tj-3mk3u5.37.5). Re-pointing the assertion would
 # have meant inverting it, and the inverted form already exists: test_fetch_dataset_handler.py's
-# test_the_ack_comes_first_carrying_the_feed_the_adapter_resolved_not_the_one_the_request_named,
-# with the refusal in test_typed_outcomes.py. So this is deleted rather than moved.
+# test_the_ack_comes_first_carrying_the_feed_the_adapter_resolved_not_the_one_the_request_named
+# (deleted with FetchDataset by tj-7zjov1.275; on Submit the ack's feed is pinned in
+# test_ack_gated_retry.py and test_handle_feed.py), with the refusal in test_typed_outcomes.py. So
+# this is deleted rather than moved.
 
 
 class KeyRecordingSingleFlight:

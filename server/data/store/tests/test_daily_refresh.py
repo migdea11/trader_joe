@@ -1834,7 +1834,6 @@ def _lifespan_fakes(monkeypatch, order: list[str], client: object) -> None:
 
     # The lifespan assigns these module globals; patched so they are restored and no later test sees this client.
     monkeypatch.setattr(app_depends, '__INGEST_CHANNEL', None)
-    monkeypatch.setattr(app_depends, '__INGEST_FETCH_CLIENT', None)
     monkeypatch.setattr(app_depends, '__INGEST_SUBMIT_CLIENT', None)
     monkeypatch.setattr(app_depends, 'database', FakeDatabase())
     monkeypatch.setattr(app_depends, 'sweep_interrupted_runs', nothing)
@@ -1849,9 +1848,8 @@ def _lifespan_fakes(monkeypatch, order: list[str], client: object) -> None:
     monkeypatch.setattr(app_depends, 'SharedWorkerPool', FakePool)
     monkeypatch.setattr(app_depends, 'target_from_env', lambda _name: 'ingest:1')
     monkeypatch.setattr(app_depends, 'create_channel', lambda _target: FakeChannel())
-    # The FetchDataset client is still built (P37 retires it) but nothing on the refresh's path uses it since the
-    # push path (tj-7zjov1.28): the refresh is handed the SUBMIT client.
-    monkeypatch.setattr(app_depends, 'GrpcIngestFetchClient', lambda _channel: object())
+    # The refresh is handed the SUBMIT client, the one client the lifespan builds since the FetchDataset client was
+    # removed (tj-7zjov1.272).
     monkeypatch.setattr(app_depends, 'GrpcIngestSubmitClient', build_client)
     # The instance watcher shares the client and is not this test's subject: it would run a real pass.
     monkeypatch.setenv('INSTANCE_WATCH_ENABLED', 'false')

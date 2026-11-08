@@ -12,6 +12,7 @@ THE CLOCK AND THE SLEEP ARE INJECTED, so nothing here waits: the fake sleep adva
 where a test plays ingest delivering a report (nothing interleaves on the one SQLite connection).
 """
 
+import inspect
 import math
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -24,10 +25,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from common.errors.vocabulary import REASONS, ExogenousError, InvalidRequestError, Reason
-from common.rpc.clients.ingest_fetch import DEFAULT_FETCH_DEADLINE_S
 from data.store.app.database.crud import ingest_request as request_crud
 from data.store.app.database.models.ingest_request import IngestRequestKind, IngestRequestState
+from data.store.app.ingest import data_action_request
 from data.store.app.ingest.data_action_request import (
+    DEFAULT_VERDICT_DEADLINE_S,
     DEFAULT_VERDICT_POLL_S,
     VERDICT_DEADLINE_ENV,
     VERDICT_POLL_ENV,
@@ -153,16 +155,26 @@ async def test_a_request_already_finished_is_answered_without_sleeping(harness):
     assert clock.slept == []
 
 
-async def test_the_deadline_defaults_to_the_300_second_fetch_deadline(monkeypatch):
+async def test_the_deadline_defaults_to_the_300_second_verdict_deadline(monkeypatch):
+    # The value is unchanged from the FetchDataset client's DEFAULT_FETCH_DEADLINE_S, which this default was until that
+    # client went (tj-7zjov1.272): the store owns its own constant now, and both it and the read are pinned to 300.
     monkeypatch.delenv(VERDICT_DEADLINE_ENV, raising=False)
-    assert DEFAULT_FETCH_DEADLINE_S == 300
-    assert verdict_deadline_seconds() == 300
+    assert DEFAULT_VERDICT_DEADLINE_S == 300.0
+    assert verdict_deadline_seconds() == 300.0
 
 
 @pytest.mark.parametrize('value', ['0', '-5', 'nan', 'inf', 'soon'])
 async def test_a_non_positive_or_malformed_deadline_is_the_default(monkeypatch, value):
     monkeypatch.setenv(VERDICT_DEADLINE_ENV, value)
-    assert verdict_deadline_seconds() == DEFAULT_FETCH_DEADLINE_S
+    assert verdict_deadline_seconds() == DEFAULT_VERDICT_DEADLINE_S == 300.0
+
+
+async def test_the_store_request_path_no_longer_takes_its_deadline_from_the_fetch_client():
+    # The FetchDataset client module is removed in a later step (tj-7zjov1.280); the request path must not import it,
+    # or that removal would break the store at import time.
+    assert not hasattr(data_action_request, 'DEFAULT_FETCH_DEADLINE_S')
+    source = inspect.getsource(data_action_request)
+    assert 'common.rpc.clients.ingest_fetch' not in source
 
 
 async def test_a_set_deadline_is_read(monkeypatch):

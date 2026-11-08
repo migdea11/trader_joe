@@ -2,12 +2,11 @@
 
 ADR tj-8konfu D1 keeps the .proto and the Pydantic models as two source-of-truth artefacts with a
 hand-written mapping between them; D3 says no caller ever touches a generated stub. This package is that
-mapping for the internal contracts -- ingest's (FetchDataset, Quote, Submit and Instance) and the store's
+mapping for the internal contracts -- ingest's (Quote, Submit and Instance) and the store's
 result path (DeliverAttempt and RegisterInstance) -- and this module is its front door.
 
     values.py          enums by member name, Timestamps as aware UTC, and ProtoMappingError
     fetch_dataset.py   one to_domain/to_proto pair per message
-    fetch_stream.py    the SERVER-side encoder, which stamps a stream's bars with its resolved feed
     delivery.py        the store's result path: one pair per message, the attempt splitter and the assembler
 
 WHY THE DESCRIPTORS ARE PART OF THE PUBLIC API. TID251 bans trader_joe.proto everywhere but common/rpc,
@@ -37,6 +36,7 @@ from common.rpc.mapping.delivery import (
     DELIVERY_ERROR_CLASS,
     DELIVERY_OUTCOME,
     DELIVERY_VERDICT,
+    MAX_PAGE_BARS,
     MAX_PART_BYTES,
     MAX_RECORDS_PER_MESSAGE,
     AttemptAssembler,
@@ -75,18 +75,11 @@ from common.rpc.mapping.fetch_dataset import (
     ack_to_proto,
     bar_to_domain,
     bar_to_proto,
-    done_to_domain,
-    done_to_proto,
-    page_to_domain,
-    page_to_proto,
     refused_to_domain,
     refused_to_proto,
     request_to_domain,
     request_to_proto,
-    served_range_to_domain,
-    served_range_to_proto,
 )
-from common.rpc.mapping.fetch_stream import MAX_PAGE_BARS, FetchStreamEncoder, refused_response
 from common.rpc.mapping.quote import (
     quote_request_to_proto,
     quote_to_domain,
@@ -153,7 +146,7 @@ class MessageMapper[P: Message, D: BaseModel]:
 
 # Every file of the contract, as the FileDescriptors a caller can walk without importing trader_joe.proto.
 # market/v1 is shared vocabulary that the internal contract imports; both are here because a round trip
-# over FetchDataset reaches Bar and the enums too.
+# over a request reaches Bar and the enums too.
 CONTRACT_FILES: Final[tuple[FileDescriptor, ...]] = (
     ingest_pb2.DESCRIPTOR,
     store_pb2.DESCRIPTOR,
@@ -175,9 +168,6 @@ _MAPPERS: Final[tuple[MessageMapper, ...]] = (
     MessageMapper(ingest_pb2.FetchAck, domain.FetchAck, ack_to_domain, ack_to_proto),
     MessageMapper(ingest_pb2.FetchAccepted, domain.FetchAccepted, accepted_to_domain, accepted_to_proto),
     MessageMapper(ingest_pb2.FetchRefused, domain.FetchRefused, refused_to_domain, refused_to_proto),
-    MessageMapper(ingest_pb2.BarPage, domain.BarPage, page_to_domain, page_to_proto),
-    MessageMapper(ingest_pb2.FetchDone, domain.FetchDone, done_to_domain, done_to_proto),
-    MessageMapper(ingest_pb2.ServedRange, domain.ServedRange, served_range_to_domain, served_range_to_proto),
     MessageMapper(bar_pb2.Bar, domain.Bar, bar_to_domain, bar_to_proto),
     MessageMapper(ingest_pb2.QuoteResponse, quote_domain.QuoteResult, quote_to_domain, quote_to_proto),
     MessageMapper(
@@ -275,23 +265,9 @@ CONTRACT_MESSAGES: Final[Mapping[str, type[Message]]] = MappingProxyType(
 # an answer.
 ENVELOPE_MESSAGES: Final[Mapping[str, str]] = MappingProxyType(
     {
-        'trader_joe.proto.internal.ingest.v1.FetchDatasetResponse': (
-            "the stream's envelope is pure transport. Its oneof arm is dispatched by the client seam and "
-            'set by the server-side encoder, and no domain model restates it (schemas/data_ingest/'
-            'fetch_dataset.py, WHAT IS DELIBERATELY ABSENT)'
-        ),
         'trader_joe.proto.internal.ingest.v1.QuoteRequest': (
             'a wrapper around the one FetchDatasetRequest, which already has its domain twin; it is built '
             'from that request by quote_request_to_proto and carries nothing else (tj-grna9p.44)'
-        ),
-        # Mapped by the follow-up that carries quota_key and vendor_stats into the domain models and the
-        # encoder (tj-grna9p.44 architect note, FOLLOW-UP, needed before tj-grna9p.48 and .24). Named here
-        # so the import-time totality check holds in the meantime; REMOVE these two when it lands.
-        'trader_joe.proto.internal.ingest.v1.VendorCallStats': (
-            'no domain twin yet: FetchDone.vendor_stats is not mapped until the tj-grna9p.48 follow-up'
-        ),
-        'trader_joe.proto.internal.ingest.v1.VendorReported': (
-            'no domain twin yet: it is a member of VendorCallStats, mapped with it by the same follow-up'
         ),
         'trader_joe.proto.internal.store.v1.DeliverAttemptRequest': (
             "the stream's envelope is pure transport: a oneof of header, payload and trailer messages. "
@@ -358,7 +334,6 @@ __all__ = [
     'UPDATE_TYPE',
     'AttemptAssembler',
     'EnumMapping',
-    'FetchStreamEncoder',
     'MessageMapper',
     'ProtoMappingError',
     'accepted_to_domain',
@@ -386,20 +361,15 @@ __all__ = [
     'corporate_actions_request_to_proto',
     'delivery_served_range_to_domain',
     'delivery_served_range_to_proto',
-    'done_to_domain',
-    'done_to_proto',
     'header_to_domain',
     'header_to_proto',
     'instance_request_to_domain',
     'instance_request_to_proto',
     'instance_response_to_domain',
     'instance_response_to_proto',
-    'page_to_domain',
-    'page_to_proto',
     'quote_request_to_proto',
     'quote_to_domain',
     'quote_to_proto',
-    'refused_response',
     'refused_to_domain',
     'refused_to_proto',
     'register_instance_request_to_domain',
@@ -412,8 +382,6 @@ __all__ = [
     'response_to_proto',
     'scope_capacity_to_domain',
     'scope_capacity_to_proto',
-    'served_range_to_domain',
-    'served_range_to_proto',
     'submit_request_to_domain',
     'submit_request_to_proto',
     'submit_response_to_domain',

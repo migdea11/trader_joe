@@ -20,7 +20,7 @@ hide the very failures that alarm exists for.
 
 THE CALL IS BOUNDED, though it is a stream: one finite deadline per attempt call together with
 wait_for_ready (ADR tj-8konfu D6.1 and D6.5), so a store that is starting or restarting is waited for, but
-never past the deadline. The call options are spelled out here, as ingest_fetch.py spells its own, rather
+never past the deadline. The call options are spelled out here, rather
 than taken from common.rpc.channel.unary_call_options, whose options are the unary ones.
 
 THE ANSWER MUST MAP. An acknowledgement with no verdict, or one this release cannot read, is

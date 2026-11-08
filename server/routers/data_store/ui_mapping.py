@@ -444,8 +444,8 @@ def bar_page_index_message(index: BarPageIndexResult) -> data_pb2.BarPageIndex:
 def bar_page_message(page: BarPageResult) -> data_pb2.BarPage:
     """A page of bars as a BarPage message.
 
-    Each bar crosses through the seam's own mapper (common.rpc.mapping.bar_to_proto), the same one the internal
-    FetchDataset contract uses. The store keeps no vwap, so none is set.
+    Each bar crosses through the seam's own mapper (common.rpc.mapping.bar_to_proto), the same one the Submit and delivery
+    contract uses. The store keeps no vwap, so none is set.
 
     Args:
         page: The bar rows the catalog produced.

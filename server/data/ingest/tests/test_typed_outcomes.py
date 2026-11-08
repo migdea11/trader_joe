@@ -617,10 +617,12 @@ def test_broker_read_get_bars_returns_the_typed_result():
 # stubs; there is no such caller left to satisfy.
 #
 # The UNSUPPORTED_ASSET_TYPE half survives on the gRPC path, where the refusal is the handler's
-# rather than a dispatch stub's: test_fetch_dataset_handler.py's crypto and option cases of
-# test_an_unservable_request_is_refused_before_the_ack_and_before_the_vendor_is_called, with
-# test_a_non_stock_asset_type_is_refused_even_by_a_reader_that_would_have_served_it proving the
-# refusal comes from the handler and not from whichever reader happens to be installed.
+# rather than a dispatch stub's. It was pinned through the FetchDataset handler in
+# test_fetch_dataset_handler.py until tj-7zjov1.275 deleted that handler (owner ruling 2026-11-02);
+# on the Submit path it is test_ack_gated_retry.py's
+# test_the_submit_handler_refuses_an_unservable_bars_request_before_queueing_it and
+# test_submit_refusals.py, and at the reader, test_read_seam.py's crypto and option cases of
+# test_alpaca_refuses_what_it_cannot_serve_before_any_vendor_call.
 
 
 # Every triple match_client_request maps, and what it maps each to: the six stock endpoints alpaca-py has.
@@ -685,7 +687,9 @@ def test_each_stock_triple_still_maps_to_its_sdk_method_and_request(
 
 
 def test_create_app_installs_the_problem_handlers_and_declares_their_responses():
-    app = main.create_app({DataSource.ALPACA_API: Mock()})
+    # No handles: the problem handlers are create_app's own, with or without Submit. It passed a readers mapping
+    # until tj-7zjov1.275 removed that parameter; handing the Mock on would now make it a handle.
+    app = main.create_app()
 
     async def refuse() -> None:
         raise InvalidRequestError(Reason.RANGE_IN_FUTURE, 'starts after now')

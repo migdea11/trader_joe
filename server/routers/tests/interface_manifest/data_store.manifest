@@ -3,8 +3,9 @@
 # Keep sorted. Adding an interface is meant to cost a line here, in the same diff.
 #
 # Every route here touches an AsyncSession, so every one of them is an integration-tier test when
-# it gets one; POST /store/... also reaches data_ingest, over the FetchDataset gRPC stream since
-# tj-3mk3u5.10 and over Kafka RPC before it. That is what the touches field is for.
+# it gets one; POST /store/... also reaches data_ingest, over the unary Submit gRPC call since P35
+# (the FetchDataset stream of tj-3mk3u5.10 before it, removed by P37, and Kafka RPC before that).
+# That is what the touches field is for.
 #
 # kind | address | file | symbol | request | response | touches
 http | DELETE /store/{id} | routers/data_store/asset_dataset_store.py | delete_data | schemas.data_store.asset_dataset_store.AssetDatasetStoreDelete | - | sqlalchemy.ext.asyncio.session.AsyncSession

@@ -1146,7 +1146,6 @@ async def test_the_lifespan_starts_the_reaper_and_stops_it_before_the_database(m
     monkeypatch.setattr(app_depends, 'SharedWorkerPool', FakePool)
     monkeypatch.setattr(app_depends, 'target_from_env', lambda _name: 'ingest:1')
     monkeypatch.setattr(app_depends, 'create_channel', lambda _target: FakeChannel())
-    monkeypatch.setattr(app_depends, 'GrpcIngestFetchClient', lambda _channel: object())
     # The push path's Submit client and its instance watcher (tj-7zjov1.28) are not this test's subject either: the
     # watcher would run a real pass against the uninitialised database module and the fake channel.
     monkeypatch.setattr(app_depends, 'GrpcIngestSubmitClient', lambda _channel: object())

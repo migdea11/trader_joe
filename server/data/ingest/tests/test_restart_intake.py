@@ -457,7 +457,7 @@ class RunningApp:
         self.store = store
         self.handle = lifespan_handle()
         self.mints: list[InstanceIdentity] = []
-        self.app = main.create_app({DataSource.ALPACA_API: self.handle.reader}, {DataSource.ALPACA_API: self.handle})
+        self.app = main.create_app({DataSource.ALPACA_API: self.handle})
         self.port: int | None = None
 
     def __mint(self, *args, **kwargs) -> InstanceIdentity:

@@ -190,7 +190,7 @@ async def test_a_non_bars_acceptance_with_no_feed_decodes_because_the_client_pas
 
 @pytest.mark.asyncio
 async def test_a_bars_refusal_is_returned_as_an_answer_and_not_raised():
-    """Turning a refusal into an error is the caller's decision, as ingest_fetch.py leaves it."""
+    """Turning a refusal into an error is the caller's decision (the store's Submit caller), not the client's."""
     async with ingest_server(submit=answering(raw_refused())) as channel:
         result = await GrpcIngestSubmitClient(channel, deadline_s=GUARD_S).submit(a_submit())
 

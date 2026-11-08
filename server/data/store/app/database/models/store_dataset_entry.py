@@ -47,7 +47,7 @@ class StoreDatasetEntry(AppBase.DATA_STORE_BASE, CustomTypeTable):
     # the entry was upserted from the request body BEFORE ingest was called, so nothing had
     # resolved a tape at the moment the row was written, and feed is identity -- a placeholder
     # written then and corrected later would MUTATE identity and silently merge two datasets that
-    # asked for different tapes. The FetchDataset cutover (tj-3mk3u5.10) reversed that order: the
+    # asked for different tapes. The fetch-stream cutover (tj-3mk3u5.10, since replaced by Submit and delivery) reversed that order: the
     # acknowledgement arrives FIRST and carries the resolved feed, so
     # data/store/app/ingest/data_action_request.py now upserts the entry ON THE ACK with a tape
     # that is already decided. An IEX request and a SIP request over the same window are two

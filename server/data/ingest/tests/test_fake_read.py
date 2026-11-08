@@ -898,23 +898,34 @@ async def test_the_launcher_apps_lifespan_serves_alpaca_through_its_fake_read(mo
     fetching a batch, and prove teardown by fetching again and expecting NotImplementedError.
     tj-3mk3u5.11 deletes install_readers, clear_readers and store_retrieve_stock together: the
     handler is CONSTRUCTED with its readers, so there is no install step to observe and no cleared
-    state to catch. What matters, and is what this asserts, is that the mapping reaching the
-    registration is the launcher's own fake and nothing else -- fake mode serving a real AlpacaRead
-    is the failure this guards, and it would be a live broker call in a test deployment.
+    state to catch. What matters, and is what this asserts, is that what reaches the Submit handler
+    is the launcher's own handle around its fake and nothing else -- fake mode serving a real
+    AlpacaRead is the failure this guards, and it would be a live broker call in a test deployment.
+
+    RE-POINTED AGAIN ON tj-7zjov1.276: it recorded the readers mapping handed to registered_services,
+    for the FetchDataset handler. tj-7zjov1.275 deleted that handler and the mapping, so the one read
+    path is Submit, and the recording moves to the handles the lifespan builds IngestSubmitHandler from.
+    The registration itself is still recorded, to pin that it gets the Submit handler by keyword and
+    no positional readers.
 
     The fake's own bars and feed are not re-asserted through the lifespan: they are pinned directly
     above and through test_broker_read_contract.py, and routing them through a lifespan only to read
     them back proves the fake twice and the wiring once.
     """
     handed: list[dict[DataSource, Any]] = []
-    submits: list[Any] = []
+    registrations: list[tuple[tuple, dict[str, Any]]] = []
+    real_submit_handler = app_depends.IngestSubmitHandler
     real_registered_services = grpc_host.registered_services
 
-    def recording_registration(readers, **kwargs):
-        handed.append(dict(readers))
-        submits.append(kwargs.get('submit'))
-        return real_registered_services(readers, **kwargs)
+    def recording_submit_handler(handles, instance_id):
+        handed.append(dict(handles))
+        return real_submit_handler(handles, instance_id)
 
+    def recording_registration(*args, **kwargs):
+        registrations.append((args, kwargs))
+        return real_registered_services(*args, **kwargs)
+
+    monkeypatch.setattr(app_depends, 'IngestSubmitHandler', recording_submit_handler)
     monkeypatch.setattr(grpc_host, 'registered_services', recording_registration)
     launcher = importlib.reload(importlib.import_module(LAUNCHER_MODULE))
     assert isinstance(launcher.app, FastAPI)
@@ -922,13 +933,15 @@ async def test_the_launcher_apps_lifespan_serves_alpaca_through_its_fake_read(mo
     async with running_launcher(monkeypatch, launcher, LauncherStore()):
         pass
 
-    assert [set(readers) for readers in handed] == [{DataSource.ALPACA_API}]
-    assert handed[0][DataSource.ALPACA_API] is launcher.reader
-    assert isinstance(launcher.reader, FakeRead), 'fake mode wired something other than its fake reader'
-    # P53v (tj-7zjov1.159): fake mode registers Submit, served by the launcher's handle around that same FakeRead.
-    assert submits[0] is not None, 'the launcher passed no handles, so fake mode serves no Submit'
+    assert [set(handles) for handles in handed] == [{DataSource.ALPACA_API}]
+    assert handed[0][DataSource.ALPACA_API] is launcher.handle
     assert isinstance(launcher.handle, AlpacaHandle)
     assert launcher.handle.reader is launcher.reader
+    assert isinstance(launcher.reader, FakeRead), 'fake mode wired something other than its fake reader'
+    # P53v (tj-7zjov1.159): fake mode registers Submit, served by the launcher's handle around that same FakeRead.
+    [(args, kwargs)] = registrations
+    assert args == (), 'registered_services was handed a positional argument; the readers mapping is gone'
+    assert kwargs['submit'] is not None, 'the launcher passed no handles, so fake mode serves no Submit'
 
 
 class LauncherStore:

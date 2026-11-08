@@ -39,12 +39,19 @@ from pydantic import BaseModel, ValidationError
 
 from common.rpc.config import MAX_MESSAGE_BYTES
 from common.rpc.mapping.fetch_dataset import bar_to_domain, bar_to_proto
-from common.rpc.mapping.fetch_stream import MAX_PAGE_BARS
 from common.rpc.mapping.values import FEED, ProtoMappingError, enum_mapping, timestamp_field, to_timestamp
 from schemas.data_ingest import delivery as domain
 from schemas.data_ingest.fetch_dataset import BarPage, ServedRange
 from trader_joe.proto.internal.store.v1 import store_pb2
 
+
+# THE PAGE SIZE, which the wire cannot express and the server must honour (store.proto, BarPage). The number
+# lives in a .proto comment, where no Python caller can reach it, so whoever chunks bars reads it from here
+# rather than writing 5000 again. MEASURED: a full page is 345000 bytes, 337 KiB, and 385000 bytes with every
+# optional field populated -- about a third of the ~1 MiB ADR tj-8konfu D6.3 targets for a bulk chunk and
+# 9.2 % of the 4 MiB ceiling in common/rpc/config.py. Moved here from fetch_stream.py (tj-7zjov1.274) when the
+# FetchDataset stream was deleted (P37).
+MAX_PAGE_BARS: Final = 5000
 
 DELIVERY_OUTCOME: Final = enum_mapping(store_pb2.DeliveryOutcome.DESCRIPTOR, domain.DeliveryOutcome)
 DELIVERY_ERROR_CLASS: Final = enum_mapping(store_pb2.DeliveryErrorClass.DESCRIPTOR, domain.DeliveryErrorClass)
@@ -746,6 +753,7 @@ __all__ = [
     'DELIVERY_ERROR_CLASS',
     'DELIVERY_OUTCOME',
     'DELIVERY_VERDICT',
+    'MAX_PAGE_BARS',
     'MAX_PART_BYTES',
     'MAX_RECORDS_PER_MESSAGE',
     'AttemptAssembler',

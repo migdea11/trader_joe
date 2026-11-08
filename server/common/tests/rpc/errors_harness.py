@@ -83,8 +83,9 @@ SERVICE: str = 'trader_joe.test.boundary.v1.BoundaryService'
 LOOPBACK: str = '127.0.0.1'
 GUARD_S: float = 10.0
 
-# One method per (request_streaming, response_streaming) pair, named for the pair. UNARY_STREAM is the
-# shape data_ingest's FetchDataset uses; the other three are here so the boundary cannot be proved on the
+# One method per (request_streaming, response_streaming) pair, named for the pair. UNARY_UNARY is the
+# shape Submit, Instance and Quote use and STREAM_UNARY the store's DeliverAttempt (data_ingest's
+# FetchDataset, the one UNARY_STREAM, is gone: P37); all four are here so the boundary cannot be proved on the
 # cardinalities we happen to serve and left unproved on the ones a later service adds.
 UNARY_UNARY: str = 'UnaryUnary'
 UNARY_STREAM: str = 'UnaryStream'

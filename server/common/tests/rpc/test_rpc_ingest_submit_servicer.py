@@ -12,10 +12,12 @@ servicer's one non-obvious duty visible:
 * A handler answer that breaks the feed rule is OUR bug, raised as ProtoMappingError; the error boundary
   answers INTERNAL carrying an error_id and nothing else. Never a silent encode.
 * A request with no kind cannot be decoded; it is answered the same way and never reaches the handler.
-* A TraderJoeError the handler raises is rendered by the boundary as its own status, as for FetchDataset.
+* A TraderJoeError the handler raises is rendered by the boundary as its own status.
+* FetchDataset, the PR 4 pull stream, is NOT a method (P37, tj-7zjov1.280): the servicer has no such attribute,
+  and a call to its path is answered UNIMPLEMENTED by gRPC itself, never INTERNAL.
 
 EVERYTHING HERE RUNS OVER A REAL grpc.aio SERVER WITH THE ERROR BOUNDARY, registered through the production
-``ingest_service()`` / ``fetch_dataset_service()``, because GrpcServerHost installs the boundary in every server
+``ingest_service()``, because GrpcServerHost installs the boundary in every server
 (tj-19r2z5) and every claim below is about what reaches the wire. The doubles are plain classes and inherit
 nothing (decision tj-tkm4tn D1): builder-ingest's handlers will conform by shape, so a double that subclassed
 the Protocol would prove the opposite of the rule.
@@ -34,23 +36,14 @@ from google.protobuf.message import Message
 
 from common.enums.data_stock import Feed
 from common.errors.vocabulary import Reason, TraderJoeError
-from common.rpc.clients.ingest_fetch import GrpcIngestFetchClient
 from common.rpc.clients.ingest_submit import GrpcIngestSubmitClient
 from common.rpc.errors import ErrorBoundaryInterceptor
-from common.rpc.ingest import (
-    SERVICE_NAME,
-    IngestServicer,
-    InstanceHandler,
-    SubmitHandler,
-    fetch_dataset_service,
-    ingest_service,
-)
+from common.rpc.ingest import SERVICE_NAME, IngestServicer, InstanceHandler, SubmitHandler, ingest_service
 from common.rpc.mapping import submit_request_to_proto
 from common.rpc.server import ServiceRegistration
 from common.tests.rpc.errors_harness import error_for
-from common.tests.rpc.fetch_contract import ACK_FEED, GUARD_S, LOOPBACK, a_done, a_request, collected, message_class
+from common.tests.rpc.fetch_contract import GUARD_S, LOOPBACK, message_class
 from common.tests.rpc.submit_contract import KINDS, NON_BARS, SubmitResponseMessage, a_submit, accepted, refused
-from schemas.data_ingest import fetch_dataset
 from schemas.data_ingest.submit import InstanceResponse, RequestKind, SubmitRequest, SubmitResponse
 
 
@@ -73,30 +66,7 @@ RAW = {
 
 
 # ---------------------------------------------------------------------------------------------
-# THE DOUBLES. Plain classes, no base: a SubmitHandler, an InstanceHandler and a FetchDatasetHandler by shape.
-
-
-class _Fetch:
-    """A FetchDatasetHandler by shape: accepts, serves nothing, finishes."""
-
-    def __init__(self) -> None:
-        self.calls = 0
-
-    async def fetch(
-        self, request: fetch_dataset.FetchDatasetRequest, *, deadline: datetime | None = None
-    ) -> AsyncIterator[object]:
-        """Yield an ack and an empty done.
-
-        Args:
-            request: Unused.
-            deadline: Unused.
-
-        Yields:
-            object: The two events.
-        """
-        self.calls += 1
-        yield fetch_dataset.FetchAccepted(feed=ACK_FEED)
-        yield a_done(bar_count=0)
+# THE DOUBLES. Plain classes, no base: a SubmitHandler and an InstanceHandler by shape.
 
 
 class _Submit:
@@ -172,7 +142,7 @@ async def served(registration: ServiceRegistration) -> AsyncIterator[grpc.aio.Ch
     """Run a real server holding REGISTRATION behind the error boundary, and yield a channel to it.
 
     Args:
-        registration: Built by the production ingest_service() or fetch_dataset_service().
+        registration: Built by the production ingest_service().
 
     Yields:
         grpc.aio.Channel: A channel to the server. Both are torn down on the way out.
@@ -233,15 +203,11 @@ def assert_internal_with_an_error_id(error: grpc.aio.AioRpcError) -> None:
 @pytest.mark.parametrize('method', ['Submit', 'Instance'])
 @pytest.mark.parametrize(
     'build',
-    [
-        lambda fetch: fetch_dataset_service(fetch),
-        lambda fetch: ingest_service(fetch),
-        lambda fetch: ingest_service(fetch, submit=None, instance=None),
-    ],
-    ids=['fetch_dataset_service', 'ingest_service', 'ingest_service-explicit-none'],
+    [lambda: ingest_service(), lambda: ingest_service(submit=None, instance=None)],
+    ids=['ingest_service', 'ingest_service-explicit-none'],
 )
 async def test_a_servicer_built_without_the_handler_answers_unimplemented(method: str, build):
-    """Existing construction is unchanged: main.py builds fetch_dataset_service(handler) and must see no change.
+    """A method whose handler is not bound is unserved, not broken.
 
     Over a real server WITH the boundary, because the boundary turns any escaping exception into INTERNAL;
     UNIMPLEMENTED reaching the caller is the claim that the method is unserved rather than broken. This is
@@ -253,7 +219,7 @@ async def test_a_servicer_built_without_the_handler_answers_unimplemented(method
         method: Submit or Instance.
         build: How the registration is made.
     """
-    async with served(build(_Fetch())) as channel:
+    async with served(build()) as channel:
         with pytest.raises(grpc.aio.AioRpcError) as excinfo:
             await raw_call(channel, method)
 
@@ -263,14 +229,14 @@ async def test_a_servicer_built_without_the_handler_answers_unimplemented(method
 @pytest.mark.asyncio
 @pytest.mark.parametrize('method', ['submit', 'instance'])
 async def test_the_store_client_reads_a_missing_handler_as_unimplemented_not_as_the_peers_bug(method: str):
-    """What the store sees through GrpcIngestSubmitClient against today's production construction.
+    """What the store sees through GrpcIngestSubmitClient against a servicer with no handler bound.
 
     PEER_PROTOCOL_ERROR with the UNIMPLEMENTED status as cause, never PEER_INTERNAL carrying an error_id.
 
     Args:
         method: Which client call.
     """
-    async with served(fetch_dataset_service(_Fetch())) as channel:
+    async with served(ingest_service()) as channel:
         client = GrpcIngestSubmitClient(channel, deadline_s=GUARD_S)
         with pytest.raises(TraderJoeError) as excinfo:
             await (client.submit(a_submit()) if method == 'submit' else client.instance())
@@ -291,7 +257,7 @@ async def test_a_servicer_without_the_handler_never_answers_ok(method: str):
     Args:
         method: Submit or Instance.
     """
-    async with served(fetch_dataset_service(_Fetch())) as channel:
+    async with served(ingest_service()) as channel:
         with pytest.raises(grpc.aio.AioRpcError) as excinfo:
             await raw_call(channel, method)
 
@@ -310,12 +276,99 @@ async def test_binding_one_handler_leaves_the_other_method_unimplemented(bound: 
     instance = _Instance(an_instance()) if bound == 'instance' else None
     other = 'Instance' if bound == 'submit' else 'Submit'
 
-    async with served(ingest_service(_Fetch(), submit=submit, instance=instance)) as channel:
+    async with served(ingest_service(submit=submit, instance=instance)) as channel:
         await raw_call(channel, 'Submit' if bound == 'submit' else 'Instance')
         with pytest.raises(grpc.aio.AioRpcError) as excinfo:
             await raw_call(channel, other)
 
     assert excinfo.value.code() is grpc.StatusCode.UNIMPLEMENTED
+
+
+# ---------------------------------------------------------------------------------------------
+# FETCHDATASET IS NOT A METHOD (P37, tj-7zjov1.280): the pull stream is gone; Submit and Instance are untouched
+
+
+async def raw_fetch(channel: grpc.aio.Channel) -> list[bytes]:
+    """Call the old FetchDataset path with an empty body and read the stream to its end, no client seam in the way.
+
+    The path is spelled out, not read off the descriptor: the descriptor no longer declares the method, which is
+    the point. A server that still registered a handler under it would answer something other than UNIMPLEMENTED.
+
+    Args:
+        channel: The channel to the servicer.
+
+    Returns:
+        list[bytes]: Every message, raw.
+
+    Raises:
+        grpc.aio.AioRpcError: The status, when the call failed.
+    """
+    call = channel.unary_stream(
+        f'/{SERVICE_NAME}/FetchDataset', request_serializer=lambda body: body, response_deserializer=lambda body: body
+    )
+    return [message async for message in call(b'', timeout=GUARD_S)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'build',
+    [
+        lambda: ingest_service(),
+        lambda: ingest_service(submit=_Submit(accepted(Feed.IEX)), instance=_Instance(an_instance())),
+    ],
+    ids=['ingest_service', 'ingest_service-submit-and-instance'],
+)
+async def test_the_old_fetch_dataset_path_is_answered_unimplemented_by_every_servicer(build):
+    """UNIMPLEMENTED reaching the caller through the boundary, never INTERNAL and never an empty OK stream.
+
+    With the method gone the servicer registers no handler under the path, so gRPC itself answers it: a peer still
+    built against the PR 4 contract fails loudly and typed, not as the store's bug.
+
+    Args:
+        build: How the registration is made.
+    """
+    async with served(build()) as channel:
+        with pytest.raises(grpc.aio.AioRpcError) as excinfo:
+            await raw_fetch(channel)
+
+    assert excinfo.value.code() is grpc.StatusCode.UNIMPLEMENTED, excinfo.value.details()
+    assert not (excinfo.value.details() or '').startswith(INTERNAL_PREFIX)
+
+
+def test_fetch_dataset_is_not_a_method_of_the_servicer_nor_of_its_generated_base():
+    """The servicer and the generated base it inherits declare Submit, Instance and Quote, and no FetchDataset.
+
+    hasattr walks the MRO, so a method left on IngestServicer, or a FetchDataset regenerated into the base from a
+    .proto that still declared the rpc, reds this. The descriptor pin is in test_proto_internal_contracts.py.
+    """
+    assert not hasattr(IngestServicer, 'FetchDataset')
+    for method in ('Submit', 'Instance', 'Quote'):
+        assert hasattr(IngestServicer, method), method
+
+
+@pytest.mark.asyncio
+async def test_submit_and_instance_are_served_with_both_handlers_bound():
+    """The servicer ingest registers since tj-7zjov1.275, both handlers bound: both methods must work."""
+    submit = _Submit(accepted(Feed.IEX))
+    instance = _Instance(an_instance())
+
+    async with served(ingest_service(submit=submit, instance=instance)) as channel:
+        client = GrpcIngestSubmitClient(channel, deadline_s=GUARD_S)
+        answer = await client.submit(a_submit())
+        identity = await client.instance()
+
+    assert answer == accepted(Feed.IEX)
+    assert submit.seen == [a_submit()]
+    assert identity == an_instance()
+    assert instance.calls == 1
+
+
+def test_an_ingest_servicer_constructs_with_no_handler_at_all():
+    """IngestServicer() is legal: both handlers are optional, and neither is required to build the service."""
+    servicer = IngestServicer()
+
+    assert isinstance(servicer, IngestServicer)
+    assert ingest_service().name == SERVICE_NAME
 
 
 # ---------------------------------------------------------------------------------------------
@@ -338,7 +391,7 @@ async def test_a_submit_of_each_kind_reaches_the_handler_decoded_and_its_answer_
     answer = an_answer_for(kind)
     handler = _Submit(answer)
 
-    async with served(ingest_service(_Fetch(), submit=handler)) as channel:
+    async with served(ingest_service(submit=handler)) as channel:
         result = await GrpcIngestSubmitClient(channel, deadline_s=GUARD_S).submit(request)
 
     assert result == answer
@@ -358,7 +411,7 @@ async def test_a_non_bars_acceptance_goes_on_the_wire_with_the_zero_feed(kind: R
     """
     handler = _Submit(accepted(None))
 
-    async with served(ingest_service(_Fetch(), submit=handler)) as channel:
+    async with served(ingest_service(submit=handler)) as channel:
         answer = await raw_call(channel, 'Submit', submit_request_to_proto(a_submit(**KINDS[kind])))
 
     assert answer.ack.WhichOneof('outcome') == 'accepted'
@@ -372,7 +425,7 @@ async def test_a_bars_refusal_crosses_as_an_answer_and_not_as_a_status():
     """A refused ack is a legal bars answer; the call ends OK and the client returns it."""
     handler = _Submit(refused())
 
-    async with served(ingest_service(_Fetch(), submit=handler)) as channel:
+    async with served(ingest_service(submit=handler)) as channel:
         result = await GrpcIngestSubmitClient(channel, deadline_s=GUARD_S).submit(a_submit())
 
     assert result == refused()
@@ -408,7 +461,7 @@ async def test_a_handler_answer_that_breaks_the_feed_rule_is_internal_with_an_er
     handler = _Submit(answer)
     request = a_submit(**KINDS[kind])
 
-    async with served(ingest_service(_Fetch(), submit=handler)) as channel:
+    async with served(ingest_service(submit=handler)) as channel:
         with pytest.raises(grpc.aio.AioRpcError) as excinfo:
             await raw_call(channel, 'Submit', submit_request_to_proto(request))
         with pytest.raises(TraderJoeError) as through_client:
@@ -428,7 +481,7 @@ async def test_a_request_with_no_kind_is_refused_and_never_reaches_the_handler()
     assert message.WhichOneof('kind') is None
     handler = _Submit(accepted(Feed.IEX))
 
-    async with served(ingest_service(_Fetch(), submit=handler)) as channel:
+    async with served(ingest_service(submit=handler)) as channel:
         with pytest.raises(grpc.aio.AioRpcError) as excinfo:
             await raw_call(channel, 'Submit', message)
 
@@ -454,7 +507,7 @@ async def test_a_trader_joe_error_from_a_handler_reaches_the_caller_as_the_same_
     submit = _Submit(raising=raised)
     instance = _Instance(raising=raised)
 
-    async with served(ingest_service(_Fetch(), submit=submit, instance=instance)) as channel:
+    async with served(ingest_service(submit=submit, instance=instance)) as channel:
         client = GrpcIngestSubmitClient(channel, deadline_s=GUARD_S)
         with pytest.raises(TraderJoeError) as excinfo:
             await (client.submit(a_submit()) if method == 'submit' else client.instance())
@@ -474,7 +527,7 @@ async def test_any_other_exception_from_a_handler_is_internal_with_an_error_id(m
     submit = _Submit(raising=RuntimeError('boom'))
     instance = _Instance(raising=RuntimeError('boom'))
 
-    async with served(ingest_service(_Fetch(), submit=submit, instance=instance)) as channel:
+    async with served(ingest_service(submit=submit, instance=instance)) as channel:
         with pytest.raises(grpc.aio.AioRpcError) as excinfo:
             await raw_call(channel, method)
 
@@ -490,7 +543,7 @@ async def test_the_instance_probe_round_trips_the_instance_id_and_started_at():
     """End to end through the real client: the handler's answer arrives equal, aware UTC."""
     handler = _Instance(an_instance())
 
-    async with served(ingest_service(_Fetch(), instance=handler)) as channel:
+    async with served(ingest_service(instance=handler)) as channel:
         result = await GrpcIngestSubmitClient(channel, deadline_s=GUARD_S).instance()
 
     assert result == an_instance()
@@ -501,7 +554,7 @@ async def test_the_instance_probe_round_trips_the_instance_id_and_started_at():
 @pytest.mark.asyncio
 async def test_the_instance_answer_is_on_the_wire_as_the_handler_gave_it():
     """Read raw, so a client that papered over a wrong field could not hide it."""
-    async with served(ingest_service(_Fetch(), instance=_Instance(an_instance()))) as channel:
+    async with served(ingest_service(instance=_Instance(an_instance()))) as channel:
         answer = await raw_call(channel, 'Instance')
 
     assert answer.instance_id == 'ingest-7'
@@ -509,59 +562,30 @@ async def test_the_instance_answer_is_on_the_wire_as_the_handler_gave_it():
 
 
 # ---------------------------------------------------------------------------------------------
-# FETCH IS UNDISTURBED, and the registration helper
+# THE REGISTRATION HELPER
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize('build', ['fetch_dataset_service', 'ingest_service-all-three'])
-async def test_fetch_still_crosses_the_wire_through_either_registration(build: str):
-    """fetch_dataset_service delegates to ingest_service; with all three handlers bound, one servicer serves all.
-
-    Args:
-        build: Which registration.
-    """
-    fetch = _Fetch()
-    if build == 'fetch_dataset_service':
-        registration = fetch_dataset_service(fetch)
-    else:
-        registration = ingest_service(fetch, submit=_Submit(accepted(Feed.IEX)), instance=_Instance(an_instance()))
-
-    async with served(registration) as channel:
-        received, error = await collected(GrpcIngestFetchClient(channel, deadline_s=GUARD_S).fetch(a_request()))
-        if build != 'fetch_dataset_service':
-            client = GrpcIngestSubmitClient(channel, deadline_s=GUARD_S)
-            assert await client.submit(a_submit()) == accepted(Feed.IEX)
-            assert await client.instance() == an_instance()
-
-    assert error is None
-    assert received == [fetch_dataset.FetchAccepted(feed=ACK_FEED), a_done(bar_count=0)]
-    assert fetch.calls == 1
-
-
-@pytest.mark.parametrize('build', [fetch_dataset_service, ingest_service], ids=lambda f: f.__name__)
-def test_both_registrations_name_the_ingest_service(build):
-    """The health service reports under SERVICE_NAME, whichever helper built the registration.
-
-    Args:
-        build: The helper.
-    """
-    registration = build(_Fetch())
+def test_the_registration_names_the_ingest_service():
+    """The health service reports under SERVICE_NAME, which is the descriptor's own IngestService name."""
+    registration = ingest_service()
 
     assert isinstance(registration, ServiceRegistration)
     assert registration.name == SERVICE_NAME
+    assert SERVICE_NAME == 'trader_joe.proto.internal.ingest.v1.IngestService'
 
 
 @pytest.mark.parametrize('target', [IngestServicer.__init__, ingest_service], ids=['IngestServicer', 'ingest_service'])
-def test_the_two_handlers_are_optional_keyword_only_arguments(target):
-    """Construction stays compatible: the fetch handler is the one positional argument, the others keyword-only.
+def test_the_two_handlers_are_the_only_arguments_and_are_optional_keyword_only(target):
+    """Submit and Instance are the only handlers: the positional fetch handler is gone with FetchDataset (P37).
+
+    A positional parameter left behind would let a caller still hand in a fetch handler that nothing serves.
 
     Args:
         target: The constructor or the helper.
     """
     parameters = inspect.signature(target).parameters
 
-    assert parameters['handler'].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
-    assert parameters['handler'].default is inspect.Parameter.empty
+    assert [name for name in parameters if name != 'self'] == ['submit', 'instance']
     for name in ('submit', 'instance'):
         assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY, name
         assert parameters[name].default is None, name

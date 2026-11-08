@@ -6,13 +6,13 @@ crosses the seam is domain objects and TraderJoeErrors.
 SUBMIT ANSWERS AT ONCE AND CARRIES NO DATA. The result comes back on the store's own service, pushed by
 ingest (tj-26jt9w, 2026-10-24); this call only settles whether the request is held. It returns the domain
 SubmitResponse: accepted (resolved feed for bars, quota key) or, for bars, refused for its feed. Turning a
-refusal into an error is the caller's decision, as ingest_fetch.py does for FetchDataset.
+refusal into an error is the caller's decision, as the store's Submit caller does.
 
 BOTH CALLS ARE UNARY AND TAKE THE EXISTING DEADLINE RULE: common.rpc.channel.unary_call_options, a finite
 deadline with wait_for_ready bounded by it. Submit is idempotent on request_id, so a caller may retry it.
 
 THE ANSWER IS MAPPED KNOWING THE REQUEST'S KIND (the feed rule in mapping/submit.py), and an answer that
-breaks the rule, or will not map, is PEER_PROTOCOL_ERROR. As in ingest_fetch.py, a servicer that calls this
+breaks the rule, or will not map, is PEER_PROTOCOL_ERROR. As with every client seam here, a servicer that calls this
 converts the peer's error deliberately rather than letting it escape into the error boundary.
 """
 

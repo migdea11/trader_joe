@@ -581,7 +581,7 @@ def spent_request() -> SubmitRequest:
 @asynccontextmanager
 async def production_app(handle: AlpacaHandle, store: HeldStore) -> AsyncIterator[health_pb2_grpc.HealthStub]:
     """The production lifespan on a loopback port, the store a double; yields a health stub on its gRPC port."""
-    app = main.create_app({DataSource.ALPACA_API: handle.reader}, {DataSource.ALPACA_API: handle})
+    app = main.create_app({DataSource.ALPACA_API: handle})
     channel_to_store = Mock(close=AsyncMock())
     with ExitStack() as stubs:
         stubs.enter_context(patch.object(app_depends, 'initialize_latency_server', Mock()))

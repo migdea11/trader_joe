@@ -1,7 +1,7 @@
-"""What is knowable about a bars request before any vendor call, shared by FetchDataset and Submit.
+"""What is knowable about a bars request before any vendor call, the Submit path's.
 
 An ack is a promise the request is viable, so nothing after the ack may fail for a reason that was already
-decidable here (tj-3mk3u5.9). Both paths call this before they resolve a feed or touch a reader.
+decidable here (tj-3mk3u5.9). Submit calls this before it resolves a feed or touches a reader.
 """
 
 from collections.abc import Sequence

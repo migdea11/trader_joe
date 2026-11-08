@@ -6,8 +6,7 @@ conforms STRUCTURALLY to common.rpc.ingest.SubmitHandler, by shape, so it does n
 THE SUBMIT ENQUEUES AND ANSWERS AT ONCE. Nothing here calls a vendor or waits for the store: the broker handle puts
 the request on its scheduler's queue and the ack goes back with the instance id. The attempt, its retries and its
 reports to the store happen behind the queue (data/ingest/app/brokers/handle.py). One handle serves each broker,
-routed by the request's source. What is knowable before the vendor is checked here, before the ack, as FetchDataset
-does (routers/data_ingest/bars_validation.py).
+routed by the request's source. What is knowable before the vendor is checked here, before the ack (routers/data_ingest/bars_validation.py).
 
 Bars, corporate-actions and asset-list requests are served in this release. The asset list is served now that the store
 arm writes it (P17, tj-7zjov1.125): a delivery the store refused would live only in ingest's memory, and an asset list

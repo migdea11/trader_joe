@@ -51,7 +51,6 @@ from schemas.data_ingest.fetch_dataset import (
     BarPage,
     FetchAccepted,
     FetchDatasetRequest,
-    FetchDone,
     FetchRefused,
     ServedRange,
 )
@@ -185,7 +184,6 @@ CONSTRUCT_CASES: list[tuple[type[BaseModel], dict[str, Any]]] = [
     (FetchAccepted, {'feed': Feed.IEX}),
     (FetchRefused, {'reason': 'FEED_NOT_AVAILABLE', 'domain': 'trader-joe', 'detail': 'no SIP entitlement'}),
     (ServedRange, _SERVED_RANGE_PAYLOAD),
-    (FetchDone, {'bar_count': 0, 'served_range': ServedRange(**_SERVED_RANGE_PAYLOAD), 'as_of': WHEN}),
     # reset_at is optional (None when the scope has no known reset), so it is not in the minimal set.
     (ScopeCapacity, _SCOPE_PAYLOAD),
     (QuoteResult, {'estimated_vendor_calls': 0, 'quota_key': 'alpaca-a', 'scopes': [ScopeCapacity(**_SCOPE_PAYLOAD)]}),

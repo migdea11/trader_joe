@@ -2,7 +2,7 @@
 
 Decision tj-j4wknb R4. The fake-mode compose overlay (tj-vhboky.61) runs
 `tests.fakes.ingest_launcher:app` in place of `data.ingest.app.main:app`. Production code keeps
-its single composition (main.py: one AlpacaHandle, its reader and itself handed to create_app) and
+its single composition (main.py: one AlpacaHandle handed to create_app) and
 knows nothing of this module: the swap is which module uvicorn is pointed at, never a flag.
 
 The app is built by production's own create_app, so the lifespan, the RPC servers and every
@@ -10,8 +10,10 @@ router are the real ones. The handle in the ALPACA_API slot is the production Al
 (P53, tj-7zjov1.158): its scheduler, executor, runners and intakes are production's, and only its
 reader differs. The handle builds that reader through its reader_factory seam, once, with its own
 scheduler, its two quota scopes and the feed it resolved, so the FakeRead is PACED on the handle's
-scheduler as AlpacaRead is and serves the account's feed. The same FakeRead is the FetchDataset
-reader, so both paths read through one fake and fake mode serves Submit as well as FetchDataset.
+scheduler as AlpacaRead is and serves the account's feed. Submit is the one read path: the
+FetchDataset pull stream that used to read through a second readers mapping is gone (tj-7zjov1.275,
+owner ruling 2026-11-02), and `reader` below is kept only as the handle's reader, for the banner and
+for tests that inspect it.
 
 SLOW_ DELAY: read from FAKE_READ_SLOW_SECONDS here, in the test tree, never in production code.
 Unset or empty means DEFAULT_SLOW_DELAY_SECONDS. A value that is not a number, or that FakeRead
@@ -97,4 +99,4 @@ handle = AlpacaHandle(reader_factory=FakeReaderFactory(slow_delay_from_env()))
 reader = handle.reader
 log.warning(f'{BANNER} SLOW_ delay: {reader.slow_delay_seconds} s.')
 
-app = create_app({DataSource.ALPACA_API: reader}, {DataSource.ALPACA_API: handle})
+app = create_app({DataSource.ALPACA_API: handle})

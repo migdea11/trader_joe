@@ -46,7 +46,7 @@ class OverlapKey:
     a whole create model and key on a subset of it, which is the shape
     data/store/app/database/asset_data_interface.py:101 warns about -- a contract that accepts a
     field and ignores it only looks validating. Worse, it made the check structurally impossible to
-    run where it has to run: tj-hywf7w hoisted it AHEAD of the FetchDataset stream so a 409 stops
+    run where it has to run: tj-hywf7w hoisted it AHEAD of the (since removed) FetchDataset stream so a 409 stops
     costing a live vendor call, but AssetDatasetStoreCreate.feed is required and RESOLVED, and the
     resolved feed does not exist until FetchAccepted. Three things could not all hold -- the check
     runs before the stream, the check keys on a create model, feed arrives on the ack -- and this
@@ -334,8 +334,9 @@ async def check_own_overlap(db: AsyncSession, key: OverlapKey) -> None:
     """Refuse a create that overlaps one of the SAME owner's datasets, BEFORE the caller spends anything on it.
 
     SPLIT OUT OF upsert_entry_in_transaction BY tj-hywf7w, and the cutover's order is the reason.
-    The dataset path opens the FetchDataset stream FIRST and upserts the entry on the ack, because
-    only the ack carries the resolved feed (tj-3mk3u5.10). With the overlap check still buried in
+    The dataset path once opened the since-removed FetchDataset stream FIRST and upserted the entry on the ack,
+    because only the ack carried the resolved feed (tj-3mk3u5.10). Today the entry is upserted by the delivery
+    intake, from the first delivered attempt's header, which carries the feed. With the overlap check still buried in
     that upsert, a request the store already knew it would refuse had, by the time it was refused,
     cost a rate-budget slot and a live vendor call -- ingest performs the fetch before it yields the
     ack. This check depends on nothing the ack carries: it is one local SELECT over this store's own
@@ -343,9 +344,10 @@ async def check_own_overlap(db: AsyncSession, key: OverlapKey) -> None:
     which is nothing.
 
     THE CHECK IS THE CALLER'S TO MAKE NOW. upsert_entry_in_transaction no longer runs it, so a
-    caller that writes an entry calls this first: data/store/app/ingest/data_action_request.py does
-    it before opening the stream, and upsert_entry below does it inside its own transaction. Those
-    are the two write paths, and there are no others.
+    caller that writes an entry calls this first. Three callers do: data/store/app/ingest/data_action_request.py
+    before it writes the ingest request of a POST, data/store/app/panel_manager.py before it creates a panel
+    member's request, and upsert_entry below inside its own transaction. The delivery intake does not
+    repeat it (a refusal inside the delivery transaction would be redelivered for ever).
 
     IT NEITHER COMMITS NOR ROLLS BACK: it only reads, inside whatever transaction the caller owns.
 
@@ -522,14 +524,14 @@ async def upsert_entry_in_transaction(
 
     THIS FUNCTION NEVER COMMITS AND NEVER ROLLS BACK (tj-vz1eta s2, carried onto tj-3mk3u5.10).
     The caller opens one write_transaction and decides when the work is done. That is what lets
-    data/store/app/ingest/data_action_request.py put the entry upsert and every page of bars from
-    one fetch into a SINGLE transaction committed only after the stream's FetchDone: a fetch that
-    breaks, times out or is cancelled then leaves neither a new entry nor partial bars. Burying
-    the commit here would make that impossible, and the ledger work (tj-3mk3u5.34) moves the
-    commit again, to once per page, against this same function.
+    data/store/app/ingest/delivery_intake.py put the entry upsert and the bars of one delivered
+    attempt into a SINGLE delivery transaction (one per attempt): a delivery that fails or is
+    rolled back then leaves neither a new entry nor partial bars (DeliveryIntake.deliver opens that one
+    write_transaction; write_bars calls this function inside it). Burying the commit here would make
+    that impossible.
 
     THE OWN-OVERLAP CHECK IS NOT RUN HERE ANY MORE (tj-hywf7w). It is check_own_overlap above, and
-    the caller runs it before this -- the dataset path before it opens the fetch stream, upsert_entry
+    the caller runs it before this -- the dataset path before it submits to ingest, upsert_entry
     inside its transaction. It was moved rather than copied because a check the caller already made
     is a second identical SELECT on every successful write, and because the ONLY reason it lived in
     here was that this used to be the first thing the create path did. An exact repeat is still

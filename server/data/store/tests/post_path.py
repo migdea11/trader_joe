@@ -66,6 +66,57 @@ from schemas.data_ingest.submit import SubmitAccepted, SubmitAck, SubmitRequest,
 SERVED_START = datetime(2026, 1, 2, tzinfo=UTC)
 SERVED_END = SERVED_START + timedelta(minutes=3)
 
+# The instant the first scripted bar opens. Fixed rather than "now" so a failure message reads the same on every run.
+# bar() and assert_body_served_range() lived in fetch_double.py with the FetchDataset client double; the double went
+# with the client (tj-7zjov1.272) and these two, which build and read types the delivery path still carries, moved here.
+FIRST_BAR_START = datetime(2026, 1, 2, tzinfo=UTC)
+
+
+def bar(minute: int, *, feed: Feed = Feed.IEX) -> fetch_dataset.Bar:
+    """One bar, opening ``minute`` minutes after FIRST_BAR_START, with OHLC values derived from the minute.
+
+    Args:
+        minute: Minutes after FIRST_BAR_START at which this bar opens; also its identity.
+        feed: The tape to stamp. IEX by default, not SIP, so a test that the header's feed reached the bars cannot
+            pass against a hard-coded SIP default.
+
+    Returns:
+        fetch_dataset.Bar: The bar.
+    """
+    return fetch_dataset.Bar(
+        bar_start=FIRST_BAR_START + timedelta(minutes=minute),
+        open=100.0 + minute,
+        high=101.0 + minute,
+        low=99.0 + minute,
+        close=100.5 + minute,
+        volume=1000.0 + minute,
+        trade_count=10 + minute,
+        feed=feed,
+    )
+
+
+def assert_body_served_range(body: dict, expected: fetch_dataset.ServedRange) -> None:
+    """The response body's served_range is the given window, compared as instants, not as text.
+
+    The body carries RFC 3339 strings and the domain object datetimes; '...+00:00' and '...Z' are the same instant, and
+    which one the service emits is pinned where that is the subject.
+
+    Args:
+        body: The parsed 200 body.
+        expected: The window the request was answered for.
+
+    Raises:
+        AssertionError: If served_range is absent or names a different window.
+    """
+    served = body.get('served_range')
+    assert served is not None, f'the 200 body carries no served_range: {body}'
+    actual = (datetime.fromisoformat(served['start']), datetime.fromisoformat(served['end']))
+    assert actual == (expected.start, expected.end), (
+        f'the response served_range is {actual}, not the window the request was answered for '
+        f'({expected.start}, {expected.end}). It is COPIED from the finishing attempt, never rebuilt from the '
+        f'request and never clamped again at the store.'
+    )
+
 
 @dataclass
 class Delivery:

@@ -198,7 +198,7 @@ def test_the_instance_probe_and_its_answer_survive_both_directions():
 
 
 def test_bars_accepted_with_the_zero_feed_is_refused():
-    """Case 1. A feed nobody resolved is an error, not a value (tj-vhboky.1), on Submit as on FetchDataset."""
+    """Case 1. A feed nobody resolved is an error, not a value (tj-vhboky.1), on a Submit of kind bars."""
     with pytest.raises(ProtoMappingError, match='UNSPECIFIED'):
         submit_response_to_domain(raw_accepted(0), kind=RequestKind.BARS)
 

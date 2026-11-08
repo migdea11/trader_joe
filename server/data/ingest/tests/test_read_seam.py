@@ -4,8 +4,9 @@ HANDLES-2 (tj-irhy0a.7) against HANDLES-1 (tj-irhy0a.6, 539ec64 + 16dce3b). The 
 tj-j4wknb: addendum 2 B (BarsQuery / BarsResponse / get_bars), addendum 3 U7 (the Protocol is the
 enforcement, no inheritance required), addendum 4 items 3 and 5 (Instrument; no capability flags,
 an unsupported request raises BrokerUnsupportedError), addendum 5 (the half-open bar range) and
-the body's INJECTION section (create_app hands the composition root's readers to the thing that
-serves requests).
+the body's INJECTION section (create_app hands the composition root's handles, and through them their
+readers, to the thing that serves requests; a separate readers mapping fed FetchDataset until
+tj-7zjov1.275 retired it).
 
 Zero network beyond loopback. The vendor is a stub client handed to AlpacaRead through its
 constructor, and the lifespan's latency collaborator is replaced with a mock of its public entry
@@ -490,6 +491,18 @@ async def test_an_end_with_a_non_utc_offset_truncates_at_the_same_instant(execut
 #     the batch. The adapter half is directly above, in
 #     test_a_bar_stamped_exactly_at_end_is_excluded_whatever_the_offset, and the contract suite
 #     applies it to every reader. Only the BATCH's view of it goes.
+#
+# MOVED AGAIN ON tj-7zjov1.276. tj-7zjov1.275 deleted IngestFetchHandler and test_fetch_dataset_handler.py
+# with it (owner ruling 2026-11-02 on tj-7zjov1.18: the FetchDataset pull stream is retired). Submit is the
+# one path that builds a BarsQuery from a request now, so the successors above are its:
+#   source dispatch and the unmapped source -> test_submit_refusals.py's
+#     test_a_servable_bars_request_reaches_the_handle_and_its_ack_is_answered_with_the_instance and
+#     test_a_source_with_no_handle_raises_before_any_handle_is_asked
+#   empty / quote / trade / bars-and-quote -> test_ack_gated_retry.py's
+#     test_the_submit_handler_refuses_an_unservable_bars_request_before_queueing_it (empty, quote, crypto) and
+#     test_submit_refusals.py (trade, bars-and-quote, bars-and-trade, option)
+#   the request mapped onto the BarsQuery -> BarsAttemptRunner's, driven by test_ack_gated_retry.py and
+#     test_bars_attempt_vendor_asset_id.py; the page size it chunks at -> test_bars_attempt_pages.py
 
 
 def test_a_bars_query_without_a_priority_is_a_type_error():
@@ -514,15 +527,17 @@ class LifespanProbe:
     address and stops it whatever happens.
 
     REGISTERED_SERVICES IS WRAPPED, NOT REPLACED: the real one still runs and its services are still
-    the ones served, so the lifespan is not hollowed out by being observed. What is recorded is the
-    readers mapping it was handed, which since tj-3mk3u5.10 is HOW A READER REACHES A REQUEST --
-    constructor injection into IngestFetchHandler. Until tj-3mk3u5.32 this class recorded the Kafka
-    RPC servers starting and stopping instead, and read the readers back out of ingest_control's
-    module global; tj-3mk3u5.11 deletes both of those.
+    the ones served, so the lifespan is not hollowed out by being observed. What is recorded is every
+    argument it was handed. From tj-3mk3u5.10 that was the readers mapping, constructor-injected into
+    IngestFetchHandler; tj-7zjov1.275 deleted that handler and the mapping, so a reader now reaches a
+    request only through its handle, and the Submit handler built from the handles is what is read
+    back. Until tj-3mk3u5.32 this class recorded the Kafka RPC servers starting and stopping instead,
+    and read the readers back out of ingest_control's module global; tj-3mk3u5.11 deletes both.
     """
 
     def __init__(self):
-        self.handed: list[dict] = []
+        # (positional args, keyword args) of each registration, as handed.
+        self.calls: list[tuple[tuple, dict]] = []
         # The Submit handler each registration was handed (P11, tj-7zjov1.20), None where it was given none.
         self.submits: list = []
         self.__real = grpc_host.registered_services
@@ -538,49 +553,38 @@ class LifespanProbe:
     def __exit__(self, *exc_info) -> None:
         self.__stack.close()
 
-    def __registered_services(self, readers, **kwargs):
+    def __registered_services(self, *args, **kwargs):
         # The real one, captured before the patch: it still builds the services the host serves. Since P11 the
         # lifespan may also hand it the Submit handler, by keyword; that is passed through untouched.
-        self.handed.append(dict(readers))
+        self.calls.append((args, dict(kwargs)))
         self.submits.append(kwargs.get('submit'))
-        return self.__real(readers, **kwargs)
+        return self.__real(*args, **kwargs)
 
 
 @pytest.mark.asyncio
-async def test_the_lifespan_hands_the_readers_create_app_received_to_the_grpc_registration():
-    """Decision tj-j4wknb INJECTION, re-pointed on tj-3mk3u5.32 to the injection that survives.
+async def test_an_app_built_without_handles_hands_the_grpc_registration_nothing():
+    """Decision tj-j4wknb INJECTION, re-pointed again on tj-7zjov1.276, to the injection that survives.
 
-    It used to assert that the readers were installed into ingest_control BEFORE the Kafka RPC
-    servers started and cleared at teardown, so that a request arriving the instant the servers came
-    up could not find an empty registry. tj-3mk3u5.11 deletes install_readers, clear_readers and the
-    RPC servers together: there is no window left to get wrong, because the handler is CONSTRUCTED
-    with its readers and cannot exist without them.
-
-    What still has to be true, and is what this now asserts, is that the READER create_app was given
-    is the reader the registration is handed: the composition root decides which handle serves each
-    source, and nothing in between may substitute its own. The `is` check is against the reader
-    rather than against the mapping, and that is deliberate rather than sloppy -- a rebuilt-but-equal
-    MAPPING is caught next door, by test_grpc_host.py's
-    test_what_registered_services_returns_is_what_the_lifespan_serves_and_it_gets_the_injected_readers,
-    which compares the mapping itself and reds on exactly that. Measured, not assumed: handing
-    registered_services a dict(readers) copy reds that test and not this one.
+    It used to assert that the readers create_app was given were the readers the registration was handed,
+    for the FetchDataset handler (and before tj-3mk3u5.32, that they were installed into ingest_control
+    around the Kafka RPC servers). tj-7zjov1.275 deleted that handler and the readers parameter: a reader now
+    reaches a request only inside its BrokerHandle, through the Submit handler, which the production test
+    below reads back. What an app with no handles must do is register the ingest service with NOTHING --
+    no positional readers, no Submit handler (Submit then answers UNIMPLEMENTED) -- which is this.
     """
-    reader = RecordingRead()
-    app = main.create_app({DataSource.ALPACA_API: reader})
+    app = main.create_app()
 
     with LifespanProbe() as probe:
         async with LoopbackGrpc(), app.router.lifespan_context(app):
             pass
 
-    assert probe.handed == [{DataSource.ALPACA_API: reader}]
-    assert probe.handed[0][DataSource.ALPACA_API] is reader
-    # Built with readers only, the app registers no Submit handler (it answers UNIMPLEMENTED).
+    assert probe.calls == [((), {})]
     assert probe.submits == [None]
 
 
 @pytest.mark.asyncio
 async def test_the_production_app_serves_alpaca_through_alpaca_read_and_nothing_else():
-    """data.ingest.app.main.app is create_app({ALPACA_API: AlpacaRead()}) -- exactly that mapping.
+    """data.ingest.app.main.app is create_app({ALPACA_API: alpaca}) over one AlpacaHandle reading through AlpacaRead.
 
     Read from what the lifespan HANDS THE REGISTRATION, not from main.py's source: that is what a
     request is actually dispatched through. No fake, no second source, no flag (decision tj-j4wknb
@@ -588,15 +592,16 @@ async def test_the_production_app_serves_alpaca_through_alpaca_read_and_nothing_
     through the registry tj-3mk3u5.11 deletes.
 
     THIS IS THE ONLY TEST THAT LOOKS AT main.app's OWN MAPPING. Every other lifespan and
-    registration test, here and in test_grpc_host.py, builds an app with create_app(<test readers>),
+    registration test, here and in test_grpc_host.py, builds an app with create_app(<test handles>),
     so a production composition root that wired the wrong reader -- or a second one -- would pass
     all of them.
 
-    P11 (tj-7zjov1.20): main.app is now create_app({ALPACA_API: alpaca.reader}, {ALPACA_API: alpaca}) over one
-    AlpacaHandle. The reader FetchDataset serves through must be THAT handle's reader, so FetchDataset and Submit
-    are paced by the one scheduler, and the Submit handler must route ALPACA_API to that same handle. The
-    production lifespan opens the channel to the store, so DATA_STORE_GRPC_TARGET is set to a loopback target;
-    nothing is delivered on it, as no request is submitted.
+    P11 (tj-7zjov1.20) made it create_app({ALPACA_API: alpaca.reader}, {ALPACA_API: alpaca}), the reader for
+    FetchDataset and the handle for Submit. tj-7zjov1.275 retired FetchDataset and the readers mapping with it,
+    so the registration must be handed NO positional argument, and the one path to a reader is the Submit
+    handler routing ALPACA_API to that handle, whose reader is AlpacaRead. The production lifespan opens the
+    channel to the store, so DATA_STORE_GRPC_TARGET is set to a loopback target; nothing is delivered on it, as
+    no request is submitted.
 
     BOUNDED (tj-7zjov1.55, the P36 validator's follow-up): that loopback target answers nothing, so a startup that
     waited on the store -- the instance announcement awaited before the yield -- would block here forever. The
@@ -607,14 +612,14 @@ async def test_the_production_app_serves_alpaca_through_alpaca_read_and_nothing_
         async with LoopbackGrpc(), asyncio.timeout(GUARD_S), main.app.router.lifespan_context(main.app):
             pass
 
-    [readers] = probe.handed
-    assert set(readers) == {DataSource.ALPACA_API}
-    assert type(readers[DataSource.ALPACA_API]) is AlpacaRead
-    assert readers[DataSource.ALPACA_API] is main.alpaca.reader
+    [(args, kwargs)] = probe.calls
+    assert args == (), 'the registration was handed a positional argument; the readers mapping is gone'
+    assert set(kwargs) == {'submit', 'instance'}
     [submit] = probe.submits
     assert type(submit) is IngestSubmitHandler
     assert dict(submit._handles) == {DataSource.ALPACA_API: main.alpaca}
     assert type(main.alpaca) is AlpacaHandle
+    assert type(main.alpaca.reader) is AlpacaRead
 
 
 @pytest.mark.asyncio

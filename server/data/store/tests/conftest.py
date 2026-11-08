@@ -79,18 +79,18 @@ def restore_logging_state() -> Iterator[None]:
 
 # The module globals app_depends.lifespan assigns and never clears (tj-7zjov1.130). Module scope, so no name mangling:
 # the attribute names are literally these.
-LIFESPAN_GLOBALS = ('__INGEST_CHANNEL', '__INGEST_FETCH_CLIENT', '__INGEST_SUBMIT_CLIENT')
+LIFESPAN_GLOBALS = ('__INGEST_CHANNEL', '__INGEST_SUBMIT_CLIENT')
 
 
 @pytest.fixture(autouse=True)
 def restore_lifespan_globals() -> Iterator[None]:
-    """Put back the gRPC channel, fetch client and submit client globals a lifespan test may have left set.
+    """Put back the gRPC channel and submit client globals a lifespan test may have left set.
 
     app_depends.lifespan assigns both and does not reset them on exit (in production one lifespan runs per process,
     so nothing needs to). A test that enters the lifespan without patching them leaves its fake client in the module
-    for the rest of the session: test_reaper's lifespan test did, and in random order the two tests that assert no
-    lifespan has run (test_http_smoke test_the_routes_are_driven_without_a_lifespan and test_dataset_fetch_transaction
-    test_get_ingest_fetch_client_hands_out_the_client_the_lifespan_built) then failed their own guard. Restoring here
+    for the rest of the session: test_reaper's lifespan test did, and in random order the tests that assert no
+    lifespan has run (test_http_smoke test_the_routes_are_driven_without_a_lifespan, and then a FetchDataset client
+    test since removed with that client, tj-7zjov1.272) failed their own guard. Restoring here
     covers every lifespan test, present and future, so none has to remember to patch them. The import is inside the
     fixture so that collecting a test module never imports the app.
     """

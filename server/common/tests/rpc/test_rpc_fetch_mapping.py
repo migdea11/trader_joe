@@ -24,9 +24,9 @@ one per-file-ignore, and ``common/tests/test_ci_invariants.py`` pins that by run
 spelling of the import -- absolute, relative and namespace-relative -- and asserting TID251 fires, plus a
 guard that it fires because of the BAN and not because ruff flags every import.
 
-WHAT IS NOT HERE. The feed-equality invariant is a CROSS-MESSAGE STREAM rule that no per-message round
-trip can express, and the stream's grammar is the client seam's: both live beside this file, in
-``test_rpc_fetch_feed_equality.py`` and ``test_rpc_fetch_seam.py``.
+WHAT IS NOT HERE. The feed-equality invariant is a CROSS-MESSAGE rule that no per-message round trip can
+express. With the PR 4 FetchDataset stream gone (P37, tj-7zjov1.280) it lives on the result path: the store
+refuses a delivered bar whose tape is not the header's (server/data/store/tests/test_delivery_intake.py).
 """
 
 import itertools
@@ -65,7 +65,7 @@ from schemas.data_ingest import submit as submit_domain
 
 pytestmark = pytest.mark.common
 
-CONTRACT = 'trader_joe/proto/internal/ingest/v1/ingest.proto'
+STORE_CONTRACT = 'trader_joe/proto/internal/store/v1/store.proto'
 
 # The instant every generated Timestamp is offset from. Aware UTC, and far from the epoch so a mapper
 # that silently produced a default would not land on it.
@@ -80,19 +80,18 @@ GOOGLE = 'google.protobuf'
 INGEST = 'trader_joe.proto.internal.ingest.v1'
 
 # THE ONLY FIELDS A ROUND TRIP MAY LOSE, each a ruled deferral and not an oversight. tj-grna9p.44's
-# re-baseline (architect, 2026-10-11, item 8 FOLLOW-UP) put quota_key on the ack and vendor_stats on the
-# done into the .proto now and left mapping them into the domain models and the encoder to a follow-up
-# needed before tj-grna9p.48, .24 and .49. Until it lands, they are dropped on the way in. Every other
-# field still has to survive, and test_each_deferred_field_is_declared_and_still_dropped goes red the
-# moment one of these IS mapped, so this table cannot outlive the deferral it names.
+# re-baseline (architect, 2026-10-11, item 8 FOLLOW-UP) put quota_key on the ack into the .proto and left
+# mapping it into the domain model to a follow-up. Until it lands it is dropped on the way in by the
+# FetchAck mapper. Every other field still has to survive, and test_each_deferred_field_is_declared_and_still_dropped
+# goes red the moment it IS mapped, so this table cannot outlive the deferral it names. (FetchDone.vendor_stats
+# was the second entry; it left with the FetchDataset stream, P37.)
 DEFERRED_FIELDS: Mapping[tuple[str, str], str] = {
-    (f'{INGEST}.FetchAccepted', 'quota_key'): 'tj-grna9p.44 FOLLOW-UP: the ack quota_key is not mapped yet',
-    (f'{INGEST}.FetchDone', 'vendor_stats'): 'tj-grna9p.44 FOLLOW-UP: the done vendor_stats are not mapped yet',
+    (f'{INGEST}.FetchAccepted', 'quota_key'): 'tj-grna9p.44 FOLLOW-UP: the ack quota_key is not mapped yet'
 }
 
 
 # A DEFERRAL IS A FACT ABOUT ONE MAPPER, NOT ABOUT A MESSAGE TYPE. FetchAccepted.quota_key is still dropped
-# on the FetchDataset path, but SubmitResponse reaches the same FetchAccepted through its own mapper, which
+# by the FetchAck mapper, but SubmitResponse reaches the same FetchAccepted through its own mapper, which
 # maps quota_key into SubmitAccepted (tj-7zjov1.15). Under these roots the deferral does not apply, so the
 # round trip must keep the field -- and test_a_lifted_deferral_is_one_its_root_actually_maps holds the entry
 # to that.
@@ -596,8 +595,8 @@ def _twins_at(when: datetime) -> dict[type[BaseModel], BaseModel]:
             ready_by=when + timedelta(hours=2),
         ),
         domain.Bar: domain.Bar(bar_start=when, open=1.0, high=2.0, low=0.5, close=1.5, volume=10.0, feed=Feed.IEX),
+        # Mapped by the result path's restated store.proto ServedRange since ingest.proto's left with FetchDataset.
         domain.ServedRange: served,
-        domain.FetchDone: domain.FetchDone(bar_count=3, served_range=served, as_of=when),
         quote_domain.ScopeCapacity: quote_domain.ScopeCapacity(
             quota_key='alpaca-a', cap=200, remaining=150, window_seconds=60, reset_at=when
         ),
@@ -785,10 +784,11 @@ def test_a_sub_microsecond_timestamp_is_refused_rather_than_rounded():
 def test_an_unset_required_timestamp_is_refused_rather_than_read_as_the_epoch():
     """1970-01-01 is a real instant, and an unset field is not it.
 
-    Every Timestamp on this contract but ``FetchDatasetRequest.end`` is required, so the absence is a
-    message this release cannot read rather than a default worth decoding.
+    A served window is never open, so an unset bound is a message this release cannot read rather than a
+    default worth decoding. Read on the result path's ServedRange (store.proto), the one the KEPT domain
+    ServedRange maps to since ingest.proto's copy left with FetchDataset (P37).
     """
-    mapper = MESSAGE_MAPPERS['trader_joe.proto.internal.ingest.v1.ServedRange']
+    mapper = MESSAGE_MAPPERS['trader_joe.proto.internal.store.v1.ServedRange']
     message = _built(mapper, {})
     message.ClearField('start')
 
@@ -799,11 +799,16 @@ def test_an_unset_required_timestamp_is_refused_rather_than_read_as_the_epoch():
 def test_the_exported_page_size_is_the_number_the_contract_states():
     """MAX_PAGE_BARS exists because the page size is the SERVER's to honour and the wire cannot express it.
 
-    The number lives in a .proto comment, where no Python caller can reach it, so the servicer that
-    chunks a fetch (tj-3mk3u5.9) reads it from ``common.rpc.mapping`` instead. Two copies of a number
-    that must agree is exactly the drift this reads the .proto to prevent.
-    """
-    stated = re.search(r'THE PAGE SIZE IS (\d+) BARS', (PROTO_ROOT / CONTRACT).read_text(encoding='utf-8'))
+    The number lives in a .proto comment, where no Python caller can reach it, so whoever chunks bars
+    (ingest's attempt runners, the delivery splitter) reads it from ``common.rpc.mapping`` instead. Two
+    copies of a number that must agree is exactly the drift this reads the .proto to prevent.
 
-    assert stated is not None, 'ingest.proto no longer states its page size, which is the only place it is written'
+    The contract that carries a BarPage is store.proto's DeliverAttempt since FetchDataset and
+    ingest.proto's BarPage were removed (P37, tj-7zjov1.280), so the statement belongs on store.proto's
+    BarPage. RED at a3727e1: the removal deleted the only statement with ingest.proto's BarPage
+    (CHANGES NEEDED on tj-7zjov1.280).
+    """
+    stated = re.search(r'THE PAGE SIZE IS (\d+) BARS', (PROTO_ROOT / STORE_CONTRACT).read_text(encoding='utf-8'))
+
+    assert stated is not None, 'store.proto does not state its page size, which a .proto comment is the only place for'
     assert int(stated.group(1)) == MAX_PAGE_BARS

@@ -88,7 +88,7 @@ class BrokerHandle:
             scope (str): The quota scope its requests are charged to. Starts with the source's value.
             scheduler (Scheduler): The handle's scheduler.
             executor (AckGatedExecutor): The handle's executor, over the same scheduler.
-            reader (BrokerRead): What FetchDataset reads through, and what the executor's runner reads.
+            reader (BrokerRead): What the executor's runner reads.
             feed (Feed): The default tape of the account this handle is built for, a value of the account passed at
                 construction (owner rulings, tj-7zjov1.91). The handle is the one place a feed is resolved: every
                 bars request is served on this feed and a request naming another is refused. One handle, one account,
@@ -116,7 +116,7 @@ class BrokerHandle:
 
     @property
     def reader(self) -> BrokerRead:
-        """BrokerRead: The handle's reader, for the FetchDataset path."""
+        """BrokerRead: The handle's reader, the one its runners read through."""
         return self.__reader
 
     @property

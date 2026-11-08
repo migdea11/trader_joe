@@ -315,13 +315,13 @@ async def test_a_servicer_that_aborts_on_purpose_is_not_recaught_as_a_bug():
 
 
 # -----------------------------------------------------------------------------------------------------
-# MID-STREAM, TYPED (the shape FetchDataset uses)
+# MID-STREAM, TYPED (no served method streams its response since FetchDataset went, P37; kept for the next one)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('method', [UNARY_STREAM, STREAM_STREAM], ids=['unary-stream', 'stream-stream'])
 async def test_a_typed_error_mid_stream_arrives_whole_after_the_messages_already_sent(method: str):
-    """The pages a FetchDataset already delivered are kept; the reason explains why the rest never came."""
+    """The messages a stream already delivered are kept; the reason explains why the rest never came."""
     sent = error_for(Reason.RATE_BUDGET, 'the budget could not admit the rest in time')
     async with boundary_server(raising(sent), before=4) as channel:
         replied = await invoke(channel, method)

@@ -20,10 +20,11 @@ test that stops below the edge:
      reason names the condition, and the second is a 200 carrying the window the vendor answered
      for. The pair of cases below is what makes that a tested claim rather than a design intention.
 
-THE FETCH DOUBLE IS AN IMPLEMENTATION OF THE INTERFACE, not a patched stub, which the bead requires
-in those words. data/store/tests/fetch_double.py's RecordingFetchClient is an ordinary
-IngestFetchClient (ADR tj-8konfu D3), scripted per case; nothing here monkeypatches a method onto
-production code, so a change to the seam's shape reds these cases instead of sliding past them.
+THE INGEST DOUBLE IS AN IMPLEMENTATION OF THE INTERFACE, not a patched stub, which the bead requires
+in those words. It was the FetchDataset client double until the push path; it is now post_path.py's
+SubmitDouble, an ordinary IngestSubmitClient (ADR tj-8konfu D3), scripted per case; nothing here
+monkeypatches a method onto production code, so a change to the seam's shape reds these cases
+instead of sliding past them.
 
 REPAIRED FOR THE PUSH PATH (validator, tj-7zjov1.28, P35). The POST now writes a request row, SUBMITS it and waits
 while ingest pushes the result to the delivery intake. The canary half (section 1) is unchanged: the database fails
@@ -56,8 +57,7 @@ from data.store.app.database.database import async_db
 from data.store.app.database.models.ingest_request import IngestRequestState
 from data.store.app.ingest import data_action_request
 from data.store.app.main import app
-from data.store.tests.fetch_double import bar
-from data.store.tests.post_path import Delivery, PostStore, SubmitDouble, post
+from data.store.tests.post_path import Delivery, PostStore, SubmitDouble, bar, post
 from data.store.tests.post_path import post_store as _post_store  # noqa: F401 (a fixture)
 from data.store.tests.problem_body import PROBLEM_MEDIA_TYPE, problem
 from data.store.tests.test_ui_datasets_route import aware_sqlite_datetimes  # noqa: F401 (a fixture)
@@ -94,21 +94,6 @@ REQUEST_BODY = {
 # nothing, which is the same trap as a non-lazy stream double on the paging tests.
 SERVED_START = REQUESTED_START
 SERVED_END = REQUESTED_START + timedelta(minutes=3)
-AS_OF = SERVED_END
-
-
-def served_done(bar_count: int) -> fetch_dataset.FetchDone:
-    """A FetchDone whose served window stops well short of the requested one.
-
-    Args:
-        bar_count: How many bars the stream served.
-
-    Returns:
-        fetch_dataset.FetchDone: The terminator.
-    """
-    return fetch_dataset.FetchDone(
-        bar_count=bar_count, served_range=fetch_dataset.ServedRange(start=SERVED_START, end=SERVED_END), as_of=AS_OF
-    )
 
 
 class FakeResult:

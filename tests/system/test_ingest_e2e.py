@@ -11,8 +11,9 @@ THE STACK MUST BE IN FAKE MODE: data_ingest's log carries the 'FAKE BROKER:' ban
 real broker these symbols are not tickers and every test here fails -- never skips.
 
 EVERY ENTRY HERE IS CREATED BY THE DATASET POST, the one route that reaches data_ingest: data_store
-upserts the entry, asks data_ingest over the FetchDataset gRPC stream, and writes the bars it gets
-back -- the Kafka RPC it used to ask over went on tj-3mk3u5.11 and .12. Entry ids
+writes the request, Submits it to data_ingest, and writes the entry and the bars from the attempt
+ingest delivers back (P35; the FetchDataset pull stream that replaced the Kafka RPC of tj-3mk3u5.11
+and .12 is gone too, P37). Entry ids
 are read by SQL (the POST answers with a count, not an id) and adopted for cleanup whether or not
 the POST succeeded. Bars are read back over HTTP, FILTERED BY dataset_id: the store's read is
 half-open [start, end) like the broker range since tj-86g751.3 (tj-j4wknb addendum 5), but two
@@ -123,8 +124,9 @@ UNSERVABLE_FEED = Feed.SIP
 
 # SLOW_MARGIN_SECONDS IS GONE (tj-xhcoyc). It padded a second read taken after FakeRead's SLOW_
 # delay, to catch a late RPC answer arriving once data_store had already given up on it. There is
-# no giving up to observe any more: the Kafka RPC's 5 s deadline became
-# DEFAULT_FETCH_DEADLINE_S = 300 s under tj-3mk3u5.10, so an 8 s vendor is served rather than
+# no giving up to observe any more: the Kafka RPC's 5 s deadline became a 300 s fetch deadline under
+# tj-3mk3u5.10 (today the POST's verdict deadline, STORE_VERDICT_DEADLINE_SECONDS, default 300 s since
+# P37a), so an 8 s vendor is served rather than
 # abandoned, and the SLOW case now asserts it completes. See that test for what is no longer
 # provable at this tier and where it is pinned instead.
 
@@ -263,11 +265,11 @@ def test_an_unservable_feed_is_refused_and_leaves_no_entry_and_no_bar(
 ) -> None:
     """A POST naming a tape this deployment cannot serve is refused, and writes nothing.
 
-    THE ONE IN-BAND FAILURE OF THE FETCH STREAM, which is why it earns a system test rather than
+    THE ONE IN-BAND FAILURE OF THE HOP, which is why it earns a system test rather than
     a unit one. FEED_NOT_AVAILABLE never travels as a gRPC status: data_ingest answers it on the
-    FetchDataset ack's refused arm and that ack is the stream's only event (tj-3mk3u5.22 Q5;
-    common/rpc/ingest.py, schemas/data_ingest/fetch_dataset.py::FetchRefused). So this is the one
-    failure that reaches data_store as a successful stream carrying a refusal, and the only place
+    Submit ack's refused arm (tj-3mk3u5.22 Q5; common/rpc/ingest.py,
+    schemas/data_ingest/fetch_dataset.py::FetchRefused). So this is the one
+    failure that reaches data_store as a successful call carrying a refusal, and the only place
     the store has to turn one into a 4xx. Every other failure arrives as an error already.
 
     NOTHING WRITTEN IS THE SECOND HALF AND IS NOT A RESTATEMENT OF THE FAIL SCENARIO. Both end
@@ -342,10 +344,10 @@ def test_fail_scenario_is_not_2xx_and_stores_no_bars(
 
     RE-PINNED TO THE RULED ORDER (tj-xhcoyc, item 2). This case used to assert the opposite --
     "the entry is upserted before the fetch, so a failed fetch leaves exactly one entry" -- and it
-    was CORRECT when d1e363b wrote it. tj-3mk3u5.10 then reversed the order: the store opens the
-    FetchDataset stream FIRST and upserts the entry on the ACK, because only the ack carries the
-    resolved feed, and the entry, every page and the commit live in ONE transaction that commits
-    after FetchDone. A fetch that fails before the ack therefore writes nothing at all. The
+    was CORRECT when d1e363b wrote it. tj-3mk3u5.10 then reversed the order: the store opened the
+    (since removed, P37) FetchDataset stream FIRST and upserted the entry on the ACK, because only the
+    ack carries the resolved feed; since P35 the entry and its bars are written in ONE delivery
+    transaction from the delivered attempt. A fetch that fails therefore writes nothing at all. The
     assertion was never re-pinned because nothing ran this suite between the cutover and
     tj-3mk3u5.12's gate.
 
@@ -384,8 +386,9 @@ def test_slow_scenario_is_served_rather_than_abandoned(
     than a concession (tj-xhcoyc, item 2). It was written against data_store's Kafka RPC deadline
     of 5 s, which is why FakeRead's delay is 8 s -- tests/fakes/market_data.py still says, in the
     comment on DEFAULT_SLOW_DELAY_SECONDS, "longer than data_store's 5 s Kafka RPC deadline, so
-    SLOW_ outlives the caller by default". tj-3mk3u5.10 replaced that transport, and
-    common/rpc/clients/ingest_fetch.py sets DEFAULT_FETCH_DEADLINE_S to 300 s DELIBERATELY: the
+    SLOW_ outlives the caller by default". tj-3mk3u5.10 replaced that transport with a 300 s fetch
+    deadline, which the store's verdict deadline keeps (STORE_VERDICT_DEADLINE_SECONDS) now that
+    the fetch client is gone (P37), DELIBERATELY: the
     5 s deadline "abandoned requests the vendor was still serving", since one rate-limited Alpaca
     call alone can cost 10 s or more of SDK sleep (tj-6znw1h). An 8 s vendor no longer outlives
     anything.

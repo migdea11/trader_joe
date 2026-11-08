@@ -270,7 +270,8 @@ def entry_values(run_identity: RunIdentity) -> Callable[..., dict[str, Any]]:
     c4a1f7b2e905, and this dict did not gain it, so every test that inserts an entry through here
     died on a NotNullViolation -- two whole files and most of a third. It went unnoticed at that
     migration's gate because the only end-to-end check run there drove the HTTP route, which takes
-    its tape from the FetchDataset ack; nothing that reaches THIS fixture was run. A column added
+    its tape from the ack (the FetchDataset one then, the Submit ack since P35; the stream is gone, P37);
+    nothing that reaches THIS fixture was run. A column added
     to store_dataset_entry without a default has to be added here in the same change.
     """
 

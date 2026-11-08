@@ -31,7 +31,7 @@ carries a delay that went stale on the way.
 | INVALID_REQUEST | REFUSED | CLIENT_FIX | 422 | INVALID_ARGUMENT | The request did not match its declared schema; correct the fields the error lists and send it again. |
 | UNSUPPORTED_ASSET_TYPE | REFUSED | CLIENT_FIX | 422 | INVALID_ARGUMENT | The asset type or data type asked for is not supported; ask for a supported one instead. |
 | UNSUPPORTED_INSTRUMENT | REFUSED | CLIENT_FIX | 422 | INVALID_ARGUMENT | The broker cannot serve the instrument as specified, such as its currency or exchange; change the instrument and ask again. |
-| FEED_NOT_AVAILABLE | REFUSED | CLIENT_FIX | 422 | in-band on the FetchDataset ack, never a status | This deployment cannot serve the market-data feed asked for; ask for a feed it serves, or leave the feed unset. |
+| FEED_NOT_AVAILABLE | REFUSED | CLIENT_FIX | 422 | in-band on the Submit ack, never a status | This deployment cannot serve the market-data feed asked for; ask for a feed it serves, or leave the feed unset. |
 | VENDOR_INVALID_REQUEST | REFUSED | CLIENT_FIX | 422 | INVALID_ARGUMENT | The market-data vendor refused the request as invalid, such as an end before its start; correct the request and send it again. |
 | RANGE_IN_FUTURE | REFUSED | CLIENT_FIX | 422 | INVALID_ARGUMENT | The range asked for starts at or after the current time, so there is no history to fetch; check the dates and their time zone. |
 | VENDOR_REJECTED | REFUSED | PAGE | 422 | INVALID_ARGUMENT | The market-data vendor refused the request for a reason it does not document; do not retry it unchanged until an operator has looked. |

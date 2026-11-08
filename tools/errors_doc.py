@@ -39,8 +39,8 @@ REPO_ROOT: Final = Path(__file__).resolve().parent.parent
 DOC_PATH: Final = REPO_ROOT / 'docs' / 'errors.md'
 
 # The two fixed texts for a row whose grpc_code is None (tj-3mk3u5.37.10). FEED_NOT_AVAILABLE travels
-# in-band on the FetchDataset ack (tj-3mk3u5.22 Q5); every other None is simply never a status.
-FEED_NOT_AVAILABLE_GRPC_TEXT: Final = 'in-band on the FetchDataset ack, never a status'
+# in-band on the Submit ack (tj-3mk3u5.22 Q5); every other None is simply never a status.
+FEED_NOT_AVAILABLE_GRPC_TEXT: Final = 'in-band on the Submit ack, never a status'
 NO_GRPC_STATUS_TEXT: Final = 'not rendered as a status'
 
 _TABLE_COLUMNS: Final = ('Reason', 'Outcome', 'Disposition', 'HTTP status', 'gRPC code', 'Summary')

@@ -96,8 +96,7 @@ from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.events import DatasetChange, DatasetChanged
 from data.store.app.ingest import data_action_request, delivery_intake
 from data.store.app.main import app
-from data.store.tests.fetch_double import assert_body_served_range, bar
-from data.store.tests.post_path import Delivery, PostStore, SubmitDouble, post
+from data.store.tests.post_path import Delivery, PostStore, SubmitDouble, assert_body_served_range, bar, post
 from data.store.tests.post_path import post_store as _post_store  # noqa: F401 (a fixture)
 from data.store.tests.problem_body import problem, validation_errors
 from data.store.tests.test_ui_datasets_route import aware_sqlite_datetimes  # noqa: F401 (a fixture)

@@ -43,7 +43,7 @@ accepted as a starting point (tj-3mk3u5.42 F1, rule 8):
 | Package | Holds |
 |---|---|
 | `trader_joe.proto.market.v1` | The shared vocabulary: `Bar` and the market-data enums. Imports `google/protobuf` only. |
-| `trader_joe.proto.internal.ingest.v1` | `FetchDataset`, the data_store to data_ingest contract. `Quote` is declared here too and is **reserved**: no server and no caller. |
+| `trader_joe.proto.internal.ingest.v1` | `Submit`, `Instance` and `Quote`, the data_store to data_ingest contract. `Quote` is **reserved**: no server and no caller. |
 | `trader_joe.proto.internal.store.v1` | `StoreService.DeliverAttempt` (client-streaming; ingest reports each attempt, success or failure, and the answer is the acknowledgement) and `StoreService.RegisterInstance` (ingest announces its instance id at start), data_ingest to data_store. `Bootstrap` is removed. Internal: buf's breaking checks ignore the package. |
 | `trader_joe.proto.internal.latency.v1` | The latency harness probe, `LatencyService.Probe`. Internal: both ends deploy together. |
 | `trader_joe.proto.data.v1` | The external streaming contract. The name is provisional. |

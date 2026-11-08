@@ -12,7 +12,7 @@ channel, bounded by the call's own deadline. Until data_ingest serves Quote (tj-
 answered UNIMPLEMENTED with no google.rpc.Status, which from_rpc_error reports as PEER_PROTOCOL_ERROR: a typed
 TraderJoeError, never a raw grpc error. That is the expected behaviour until then.
 
-THE SAME OBLIGATION AS ingest_fetch.py applies: a servicer that calls this converts the peer's error
+THE SAME OBLIGATION AS ingest_submit.py applies: a servicer that calls this converts the peer's error
 deliberately rather than letting it escape into the error boundary.
 """
 
@@ -59,7 +59,7 @@ class IngestQuoteClient(Protocol):
 class GrpcIngestQuoteClient:
     """IngestQuoteClient over grpc.aio, against data_ingest's IngestService.
 
-    It takes a channel from its caller and reads no environment variable, like GrpcIngestFetchClient.
+    It takes a channel from its caller and reads no environment variable, as the other gRPC clients here do.
     """
 
     def __init__(self, channel: grpc.aio.Channel, *, deadline_s: float = DEFAULT_QUOTE_DEADLINE_S) -> None:

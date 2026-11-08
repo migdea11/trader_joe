@@ -51,7 +51,7 @@ SERVICE_NAME = store_pb2.DESCRIPTOR.services_by_name['StoreService'].full_name
 class DeliveryHandler(Protocol):
     """The store's side of the result path, in domain terms: the interface data_store implements.
 
-    Structural, like FetchDatasetHandler: an implementation conforms by shape and never imports this module.
+    Structural, like BrokerRead: an implementation conforms by shape and never imports this module.
     """
 
     async def deliver(self, attempt: AttemptDelivery) -> DeliverAttemptResponse:

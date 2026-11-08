@@ -15,16 +15,15 @@ have a deadline. What D6.1 forbids is an UNBOUNDED wait, and a finite deadline i
 that removes it, so the two stream shapes part company on where that bound comes from:
 
   * A stream of BOUNDED WORK -- one backfill, which ends -- carries a finite deadline together with
-    wait_for_ready, which is D6.5 = O1 again. common/rpc/clients/ingest_fetch.py is that case: it
-    passes timeout=deadline_s and wait_for_ready=True, with DEFAULT_FETCH_DEADLINE_S derived from
-    the vendor call and the size of a backfill. It spells those two options out itself rather than
-    calling this helper, which is all the prohibition means here -- the helper's options are the
-    unary ones, not a stream's. A call that fails with UNAVAILABLE raises PEER_UNAVAILABLE at that
+    wait_for_ready, which is D6.5 = O1 again. A client of such a stream spells those two options
+    out itself rather than calling this helper, which is all the prohibition means here -- the
+    helper's options are the unary ones, not a stream's (common/rpc/clients/store_delivery.py is
+    that case). A call that fails with UNAVAILABLE raises PEER_UNAVAILABLE at that
     seam; whether to retry is the caller's decision, not the client's.
   * An INDEFINITELY-OPEN SUBSCRIBE stream is the case a deadline would wrongly kill -- a scheduled
     failure on a healthy stream. It takes no deadline, so it takes no wait_for_ready either, and it
-    answers UNAVAILABLE by resubscribing with backoff. This release has no such stream; FetchDataset
-    is the only server-streaming call, and it is the bounded shape.
+    answers UNAVAILABLE by resubscribing with backoff. This release has no such stream; the
+    only streaming call left is the delivery stream, and it is the bounded shape.
 
 WHERE A CLIENT FINDS ITS PEER -- ADR tj-q9ae5u addendum 5. One environment variable holds the peer's
 host:port, set by one entry in the client service's environment: in the base docker-compose.yaml, and

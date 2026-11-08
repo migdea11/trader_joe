@@ -1,7 +1,7 @@
 """THE DAILY REFRESH: the store's INTERIM scheduler for DAILY subscriptions (tj-grna9p.22).
 
 INTERIM, BY RULING (tj-utqd77 Q1, "interim store loop"). The scheduler that belongs to ingest (tj-pd41mt Addendum 1)
-is not built. Until it lands the STORE triggers the refresh, and ingest sees an ORDINARY FetchDataset request like any
+is not built. Until it lands the STORE triggers the refresh, and ingest sees an ORDINARY Submit request like any
 other: no new message type, no request queue (tj-grna9p.47 is deferred, tj-grna9p.21 is not built). When ingest's
 scheduler lands this module is removed, not extended.
 

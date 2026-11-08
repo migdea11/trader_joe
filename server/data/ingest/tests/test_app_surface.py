@@ -11,7 +11,9 @@ handler one layer inside the transport -- it reached into KafkaRpcFactory._rpc_s
 callable the decorator had registered, and asserted the handler was wired and answered in its
 declared response schema. tj-3mk3u5.11 deletes that handler, its registration and ingest_control
 with them, so those three tests went: they pinned a transport, not a behaviour, and the behaviour
-they stood in front of is pinned on the gRPC path by test_fetch_dataset_handler.py.
+they stood in front of was pinned on the gRPC path by test_fetch_dataset_handler.py, and since
+tj-7zjov1.275 retired FetchDataset (owner ruling 2026-11-02), on the Submit path by
+test_ack_gated_retry.py and test_submit_refusals.py.
 
 The RPC half also depended on the manifest declaring an rpc line. Decision tj-3wgh03 replaced that
 line with a `none` declaration, so RPC_ENTRIES would now be empty and the smoke tests would assert
@@ -26,7 +28,8 @@ automatically.
 data_ingest's own gRPC surface is NOT checked here and must not be. It is registered outside
 routers/ (ADR tj-8konfu D3, decision tj-tkm4tn D1) and is pinned where it lives, by
 data/ingest/tests/test_grpc_host.py, which asserts in a fresh interpreter that registered_services()
-returns exactly the ingest service. Each surface is pinned where it lives (tj-3wgh03 D4).
+returns exactly the ingest service, with no fetch handler. Each surface is pinned where it lives
+(tj-3wgh03 D4).
 """
 
 import importlib

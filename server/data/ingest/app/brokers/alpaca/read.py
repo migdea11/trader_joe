@@ -116,7 +116,7 @@ class AlpacaRead:
             served_range is clamped to, and the reset a rate-limited answer is measured from.
             Injectable so tests need not sleep or patch datetime.
         scheduler (Scheduler): The Alpaca handle's scheduler. Its quota limits pace every vendor call this
-            reader makes, the FetchDataset path's included; nothing else does.
+            reader makes; nothing else does.
         scope (str): The quota scope those calls are charged to.
         trading_client (TradingClient | None): Client for the asset reads, or None to use this process's own
             (broker_api.get_trading_client()), resolved on each call so it stays lazy.

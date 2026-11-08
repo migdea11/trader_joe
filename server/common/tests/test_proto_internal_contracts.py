@@ -42,6 +42,7 @@ kept apart so that a broken mapping table, which fails at import, cannot take th
 down with it.
 """
 
+import importlib
 import re
 import subprocess
 import sys
@@ -249,25 +250,33 @@ def test_corporate_action_identifiers_is_a_string_to_string_map():
     ]
 
 
-@pytest.mark.parametrize('name', ['BarPage', 'VendorCallStats', 'VendorReported', 'ServedRange'])
-def test_restated_shapes_match_ingest_proto_field_for_field(name: str):
-    """The store restates these rather than import a contract; the header says the shapes are the same on purpose.
+# THE PR 4 FetchDataset STREAM IS GONE (P37, tj-7zjov1.280; owner ruling 2026-11-02 on tj-7zjov1.18). Its
+# response envelope, its done event and the four shapes store.proto used to restate left ingest.proto with it.
+REMOVED_INGEST_MESSAGES = (
+    'FetchDatasetResponse',
+    'FetchDone',
+    'BarPage',
+    'VendorCallStats',
+    'VendorReported',
+    'ServedRange',
+)
 
-    Type names are compared within their own package, so a store-local VendorReported matches ingest's.
+
+@pytest.mark.parametrize('name', REMOVED_INGEST_MESSAGES)
+def test_ingest_proto_no_longer_declares_the_fetch_stream_messages(name: str):
+    """None of the stream's messages is declared on ingest.proto; the four the store restated live on there alone.
+
+    store.proto's copies were restatements of ingest.proto's (a contract never imports another). They are now the
+    only copies, and their shapes are pinned field for field by STORE_MESSAGES above, which is what used to be
+    compared against ingest.proto here.
 
     Args:
-        name: One message both contracts declare.
+        name: One message the removal took out of ingest.proto.
     """
-
-    def local(field: descriptor_pb2.FieldDescriptorProto) -> tuple:
-        name_, number, kind, repeated = _shape(field)
-        kind = kind.replace(f'.{INGEST_PACKAGE}.', '.').replace(f'{_STORE}.', '.')
-        return (name_, number, kind, repeated, field.proto3_optional)
-
-    store = messages(file_named(STORE))[name]
-    ingest = messages(file_named(INGEST))[name]
-
-    assert [local(field) for field in store.field] == [local(field) for field in ingest.field]
+    assert name not in messages(file_named(INGEST)), f'ingest.proto still declares {name}'
+    if name in ('BarPage', 'VendorCallStats', 'VendorReported', 'ServedRange'):
+        assert name in messages(file_named(STORE)), f'store.proto lost its own {name}'
+        assert name in STORE_MESSAGES, name
 
 
 def _store_message_comment(message: str, field: str | None = None) -> str:
@@ -650,34 +659,59 @@ SUBMIT_SHAPES = {
     'SubmitResponse': [('ack', 1, f'.{INGEST_PACKAGE}.FetchAck', False), ('instance_id', 2, 'TYPE_STRING', False)],
     'InstanceRequest': [],
     'InstanceResponse': [('instance_id', 1, 'TYPE_STRING', False), ('started_at', 2, TIMESTAMP, False)],
-    # Unchanged by P07: Submit reuses it, so its meaning must not drift under the old stream.
+    # Unchanged by P07: Submit reuses it, so its meaning must not drift now the old stream is gone (P37).
     'FetchAccepted': [('feed', 1, f'{MARKET}.Feed', False), ('quota_key', 2, 'TYPE_STRING', False)],
 }
 
 
-def _ingest_method(name: str) -> descriptor_pb2.MethodDescriptorProto:
-    (service,) = file_named(INGEST).service
-    found = [method for method in service.method if method.name == name]
-    assert found, f'IngestService has no {name}: {[method.name for method in service.method]}'
-    return found[0]
+def test_ingest_service_has_exactly_unary_submit_instance_and_quote():
+    """THE DESCRIPTOR PIN (P37): IngestService is exactly Submit, Instance and Quote, all three unary.
 
-
-def test_ingest_service_adds_unary_submit_and_instance_and_keeps_fetch_dataset_and_quote():
-    """Submit and Instance are unary; FetchDataset stays (until P37) server-streaming, and Quote stays."""
+    FetchDataset, the server-streaming pull stream of PR 4, is gone (owner ruling 2026-11-02 on tj-7zjov1.18).
+    Exact equality, not a subset: an rpc re-added under any name, streaming or not, reds this.
+    """
     (service,) = file_named(INGEST).service
     assert service.name == 'IngestService'
-    assert {'Submit', 'Instance', 'FetchDataset', 'Quote'} <= {method.name for method in service.method}
-
-    expected = {
-        'Submit': ('SubmitRequest', 'SubmitResponse', False),
-        'Instance': ('InstanceRequest', 'InstanceResponse', False),
-        'FetchDataset': ('FetchDatasetRequest', 'FetchDatasetResponse', True),
+    shapes = {
+        method.name: (method.input_type, method.output_type, method.client_streaming, method.server_streaming)
+        for method in service.method
     }
-    for name, (request, response, streams) in expected.items():
-        method = _ingest_method(name)
-        assert method.input_type == f'.{INGEST_PACKAGE}.{request}', name
-        assert method.output_type == f'.{INGEST_PACKAGE}.{response}', name
-        assert (method.client_streaming, method.server_streaming) == (False, streams), name
+
+    assert shapes == {
+        'Submit': (f'.{INGEST_PACKAGE}.SubmitRequest', f'.{INGEST_PACKAGE}.SubmitResponse', False, False),
+        'Instance': (f'.{INGEST_PACKAGE}.InstanceRequest', f'.{INGEST_PACKAGE}.InstanceResponse', False, False),
+        'Quote': (f'.{INGEST_PACKAGE}.QuoteRequest', f'.{INGEST_PACKAGE}.QuoteResponse', False, False),
+    }
+
+
+def test_fetch_dataset_request_survives_as_quote_requests_fetch_and_the_ack_as_submits():
+    """The KEEP half of the removal: the two shapes still in use stay under their names (no rename churn).
+
+    FetchDatasetRequest is QuoteRequest.fetch's type, and FetchAck (with FetchAccepted and FetchRefused) is
+    SubmitResponse.ack's.
+    """
+    declared = messages(file_named(INGEST))
+    (fetch,) = [field for field in declared['QuoteRequest'].field if field.name == 'fetch']
+    (ack,) = [field for field in declared['SubmitResponse'].field if field.name == 'ack']
+
+    assert fetch.type_name == f'.{INGEST_PACKAGE}.FetchDatasetRequest'
+    assert ack.type_name == f'.{INGEST_PACKAGE}.FetchAck'
+    assert {'FetchDatasetRequest', 'FetchAck', 'FetchAccepted', 'FetchRefused'} <= set(declared)
+
+
+@pytest.mark.parametrize(
+    'module',
+    ['common.rpc.clients.ingest_fetch', 'common.rpc.mapping.fetch_stream'],
+    ids=['the-fetch-client', 'the-stream-encoder'],
+)
+def test_the_stream_client_and_encoder_modules_are_gone(module: str):
+    """The client seam and the server-side encoder of the stream were deleted with it, not left orphaned.
+
+    Args:
+        module: The deleted module.
+    """
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module(module)
 
 
 @pytest.mark.parametrize('name', sorted(SUBMIT_SHAPES))
@@ -834,7 +868,9 @@ def test_fetch_accepted_feed_comment_scopes_the_never_unspecified_rule_to_bars()
 
     assert 'Never FEED_UNSPECIFIED for bars' in comment, comment
     assert 'so the mapper refuses the zero for bars only' in comment, comment
-    assert 'That covers FetchDataset and a Submit of kind bars' in comment, comment
+    # Reworded by P37 (a3727e1): FetchDataset no longer exists, so the rule covers a bars Submit alone.
+    assert 'That covers a Submit of kind bars.' in comment, comment
+    assert 'FetchDataset' not in comment, comment
     assert (
         'A Submit of kind asset_list or corporate_actions has no tape, so its accepted ack always carries '
         'FEED_UNSPECIFIED, and the mapper accepts the zero there.'

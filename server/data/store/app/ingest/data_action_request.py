@@ -1,6 +1,6 @@
 """THE REQUEST PATH: write the request, submit it to ingest, and (for a POST) wait for the verdict (tj-7zjov1.28, P35).
 
-THE RESULT IS PUSHED, NOT STREAMED. The old path held one FetchDataset stream open, wrote the entry on the ack and the
+THE RESULT IS PUSHED, NOT STREAMED. The old path held one fetch stream open, wrote the entry on the ack and the
 bars page by page, and committed at its end. That stream is gone from this path. Ingest now answers the Submit at once
 (held or refused) and reports every attempt, with its data, to the store's own StoreService (app/ingest/
 delivery_intake.py), which writes it in one transaction before it acknowledges. What is left here is the front half and
@@ -44,7 +44,6 @@ from common.enums.data_stock import DataSource
 from common.environment import get_env_var
 from common.errors.vocabulary import ERROR_DOMAIN, REASONS, ExogenousError, InvalidRequestError, Reason, TraderJoeError
 from common.logging import get_logger
-from common.rpc.clients.ingest_fetch import DEFAULT_FETCH_DEADLINE_S
 from common.rpc.clients.ingest_submit import IngestSubmitClient
 from data.store.app.corporate_actions import name_change_clamp
 from data.store.app.database.crud.corporate_action import name_changes_naming
@@ -85,6 +84,8 @@ log = get_logger(__name__)
 VERDICT_DEADLINE_ENV: Final = 'STORE_VERDICT_DEADLINE_SECONDS'
 VERDICT_POLL_ENV: Final = 'STORE_VERDICT_POLL_SECONDS'
 DEFAULT_VERDICT_POLL_S: Final = 0.25
+# How long a POST waits for its verdict when STORE_VERDICT_DEADLINE_SECONDS is unset or unusable (tj-7zjov1.272).
+DEFAULT_VERDICT_DEADLINE_S: Final = 300.0
 
 # Fixed sentences for the failures a finished request maps to. The vendor's own sentence rides along (it carries no
 # secret: ingest guarantees that) but is never the whole message.
@@ -130,9 +131,9 @@ class StoredDataset:
 
 
 def verdict_deadline_seconds() -> float:
-    """How long a POST waits for its request to finish; a non-positive or malformed value is the fetch deadline."""
-    value = get_env_var(VERDICT_DEADLINE_ENV, default=DEFAULT_FETCH_DEADLINE_S, cast_type=float)
-    return value if math.isfinite(value) and value > 0 else DEFAULT_FETCH_DEADLINE_S
+    """How long a POST waits for its request to finish; a non-positive or malformed value is the default."""
+    value = get_env_var(VERDICT_DEADLINE_ENV, default=DEFAULT_VERDICT_DEADLINE_S, cast_type=float)
+    return value if math.isfinite(value) and value > 0 else DEFAULT_VERDICT_DEADLINE_S
 
 
 def verdict_poll_seconds() -> float:
@@ -346,7 +347,7 @@ def submit_request_of(record: IngestRequestRecord, *, recovered: bool = False) -
 
 
 def _refusal_error(refused: fetch_dataset.FetchRefused) -> TraderJoeError:
-    """The error a refused Submit stands for, rebuilt as the FetchDataset seam rebuilt its refusal."""
+    """The error a refused Submit stands for, rebuilt as the old fetch seam rebuilt its refusal."""
     if refused.domain != ERROR_DOMAIN or refused.reason not in Reason.__members__:
         return ExogenousError(
             Reason.PEER_PROTOCOL_ERROR, 'the Submit was refused for a reason this release cannot read'

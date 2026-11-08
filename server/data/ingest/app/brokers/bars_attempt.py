@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 from common.enums.data_stock import Feed
 from common.errors.vocabulary import REASONS, Outcome, Reason, TraderJoeError
-from common.rpc.mapping.fetch_stream import MAX_PAGE_BARS
+from common.rpc.mapping.delivery import MAX_PAGE_BARS
 from data.ingest.app.brokers.interface import (
     AssetLookupFailure,
     AssetLookupQuery,

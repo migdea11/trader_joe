@@ -13,7 +13,6 @@ from common.rpc.channel import DATA_STORE_GRPC_TARGET_ENV, create_channel, targe
 from common.rpc.clients.store_delivery import GrpcStoreDeliveryClient
 from common.worker_pool import SharedWorkerPool
 from data.ingest.app.brokers.handle import BrokerHandle
-from data.ingest.app.brokers.interface import BrokerRead
 from data.ingest.app.grpc_host import NamedHealthReporter, build_grpc_host
 from data.ingest.app.instance import announce_until_acknowledged, log_announcement_death, mint_instance
 from routers.common.latency import initialize_latency_server
@@ -26,16 +25,15 @@ from routers.data_store.app_endpoints import APP_PORT_INTERNAL as STORE_APP_PORT
 log = get_logger(__name__)
 
 
-def make_lifespan(readers: Mapping[DataSource, BrokerRead], handles: Mapping[DataSource, BrokerHandle] | None = None):
+def make_lifespan(handles: Mapping[DataSource, BrokerHandle] | None = None):
     """Build the app lifespan that serves requests through the given broker handles.
 
     A factory rather than a module-level lifespan, so the composition root (main.create_app)
     decides which handle serves each data source and this module knows nothing of which.
 
     Args:
-        readers (Mapping[DataSource, BrokerRead]): Handle serving each data source.
         handles (Mapping[DataSource, BrokerHandle] | None): The broker handles that queue, attempt and report
-            Submit requests, or None for an app that serves FetchDataset only (Submit then answers
+            Submit requests, or None for an app that serves no Submit (Submit then answers
             UNIMPLEMENTED). With handles, the lifespan mints this process's instance id, opens the channel to the
             store (DATA_STORE_GRPC_TARGET, which must be set), starts every handle's workers, and stops them
             before it closes the channel.
@@ -55,9 +53,9 @@ def make_lifespan(readers: Mapping[DataSource, BrokerRead], handles: Mapping[Dat
         submit = IngestSubmitHandler(handles, instance_id) if handles else None
         # Without handles the call keeps its original shape: Submit and the probe are simply not registered.
         if submit is not None:
-            grpc_host = build_grpc_host(readers, submit=submit, instance=IngestInstanceHandler(identity))
+            grpc_host = build_grpc_host(submit=submit, instance=IngestInstanceHandler(identity))
         else:
-            grpc_host = build_grpc_host(readers)
+            grpc_host = build_grpc_host()
 
         # Init Common Endpoints
         # Using different app for REST latency, ensuring test isn't affected by client and server are on the same thread.

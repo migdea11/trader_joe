@@ -865,7 +865,7 @@ def _lifespan_fakes(monkeypatch: pytest.MonkeyPatch, order: list[str], client: F
         await real_stop(loops)
         order.append('snapshot.stopped' if loops is None or all(t.done() for t in loops.tasks) else 'snapshot.running')
 
-    for name in ('__INGEST_CHANNEL', '__INGEST_FETCH_CLIENT', '__INGEST_SUBMIT_CLIENT'):
+    for name in ('__INGEST_CHANNEL', '__INGEST_SUBMIT_CLIENT'):
         monkeypatch.setattr(app_depends, name, None)
     monkeypatch.setattr(app_depends, 'database', FakeDatabase())
     monkeypatch.setattr(app_depends, 'sweep_interrupted_runs', nothing)
@@ -880,7 +880,6 @@ def _lifespan_fakes(monkeypatch: pytest.MonkeyPatch, order: list[str], client: F
     monkeypatch.setattr(app_depends, 'SharedWorkerPool', FakePool)
     monkeypatch.setattr(app_depends, 'target_from_env', lambda _name: 'ingest:1')
     monkeypatch.setattr(app_depends, 'create_channel', lambda _target: FakeChannel())
-    monkeypatch.setattr(app_depends, 'GrpcIngestFetchClient', lambda _channel: object())
     monkeypatch.setattr(app_depends, 'GrpcIngestSubmitClient', lambda _channel: client)
     monkeypatch.setattr(app_depends, 'stop_asset_snapshot_loops', stop)
     monkeypatch.setattr(app_depends, 'build_grpc_host', nullcontext)

@@ -1,4 +1,4 @@
-"""The domain side of the internal FetchDataset contract: request, ack, page and done (tj-3mk3u5.27).
+"""The domain side of the internal ingest contract: request, ack, bar, page and served range (tj-3mk3u5.27).
 
 THESE ARE NOT GENERATED, AND THEY GENERATE NOTHING. ADR tj-8konfu D1 keeps the .proto the source of
 truth for what crosses the wire and Pydantic the internal domain representation, with NEITHER generated
@@ -12,9 +12,8 @@ to read better in Python costs an entry in that table, so the names stay in step
 proto/trader_joe/proto/internal/ingest/v1/ingest.proto and .../market/v1/bar.proto.
 
 WHAT IS DELIBERATELY ABSENT:
-    FetchDatasetResponse  the stream's envelope is pure transport. The oneof arm is dispatched by the
-                          client seam, which yields the ack, the pages and the done; no domain model
-                          restates the envelope.
+    FetchDatasetResponse  the PR 4 pull stream is gone (P37); BarPage and ServedRange stay because the
+                          store's result path (delivery.py) uses them.
     dataset_id            a data_store row id that must not cross this wire. Correlation belongs to the
                           transport and the store stamps its own rows (ADR tj-8konfu D7.2; tj-rh4b7f).
     expiry, expiry_type   retention policy. Nothing under data/ingest reads either one.
@@ -32,7 +31,7 @@ that leaves a required enum at zero cannot produce a valid model and is refused 
 
 from typing import Self
 
-from pydantic import AwareDatetime, Field, NonNegativeInt, model_validator
+from pydantic import AwareDatetime, Field, model_validator
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Feed, Granularity, UpdateType
@@ -51,8 +50,7 @@ class FetchDatasetRequest(InboundContract):
     # invent one downstream. Nothing under data/ingest/app reads it today. Sensitive (tj-vhboky.45): kept
     # out of repr and str, still carried by model_dump -- see common/sensitive.py.
     owner: SensitiveStr
-    # Selects the reader; routers/data_ingest/fetch_dataset_handler.py picks it out of the handler's
-    # injected readers mapping.
+    # Selects the reader.
     source: DataSource
     asset_symbol: str
     # Selects the asset path. The stock reader then hard-codes AssetType.STOCK onto the instrument it
@@ -94,7 +92,7 @@ class Bar(InboundContract):
     # When the bar OPENS: the data time, never a server's response time. Named for ADR tj-r6vcgv B1,
     # which forbids a field called bare "timestamp" anywhere in a contract because an unqualified name
     # invites the data time and the response time to collapse into one. The response time on this
-    # contract is the single FetchDone.as_of.
+    # contract is the attempt's as_of on the delivery trailer.
     bar_start: AwareDatetime
     open: float
     high: float
@@ -131,7 +129,7 @@ class FetchAccepted(InboundContract):
 
 
 class FetchRefused(InboundContract):
-    """The fetch is refused for its feed, and this is the stream's only event.
+    """The fetch is refused for its feed, and this is the ack's only content.
 
     An ADR tj-fa1rpu REFUSED outcome: permanent for the request as asked, so it carries no reset_at and no
     retry hint, because no wait cures it. The fields mirror google.rpc.ErrorInfo so the client seam builds
@@ -152,7 +150,7 @@ class FetchRefused(InboundContract):
 
 
 class FetchAck(InboundContract):
-    """ALWAYS the first event of the stream: either the fetch is accepted or its feed is refused.
+    """The Submit ack: either the request is accepted or its feed is refused.
 
     The domain twin of a proto oneof, so exactly one arm is set. Both arms are declared rather than a
     union of the two models, because the descriptor-driven control compares field names against the
@@ -184,33 +182,3 @@ class ServedRange(InboundContract):
     start: AwareDatetime
     # EXCLUSIVE, and never open: a request with no end is served up to as_of, and that instant lands here.
     end: AwareDatetime
-
-
-class FetchDone(InboundContract):
-    """Terminates an accepted stream, so a stream that merely stops is distinguishable from one that finished.
-
-    It carries the SERVED provenance of ADR tj-fa1rpu D2. "No data" is a success carrying provenance rather
-    than an error, so a genuinely served but empty window ends here with bar_count 0, never with a failure.
-    """
-
-    bar_count: NonNegativeInt
-    served_range: ServedRange
-    # When the vendor answered. UTC.
-    as_of: AwareDatetime
-
-
-type FetchEvent = FetchAccepted | BarPage | FetchDone
-"""What a fetch yields, in order: the accepted ack, then zero or more pages, then the done.
-
-ONE HOME, AND IT IS HERE BECAUSE THIS IS A DOMAIN FACT (tj-47tzic). The union says what a fetch
-produces, not how it travels, so it belongs beside the three models it unions and not in either
-transport seam. Both common/rpc/ingest.py's FetchDatasetHandler and
-common/rpc/clients/ingest_fetch.py's IngestFetchClient import this one alias, which is what makes
-decision tj-tkm4tn D1's "one test double serves both ends" structural rather than coincidental.
-
-IT USED TO BE DECLARED TWICE, once per seam, with identical text (ADDENDUM 2 to tj-tkm4tn). Being
-PEP 695 aliases the two were distinct TypeAliasType objects that compare UNEQUAL, so the mirror
-rested on nobody editing one side alone; a fourth arm on either would have left every double still
-type-checking against the end it was written for. Re-declaring a local copy in a seam, or
-re-exporting this name from common/rpc as a convenience, brings that back in a new shape.
-"""

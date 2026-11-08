@@ -5,7 +5,6 @@ from fastapi import FastAPI
 from common.app_lifecycle import init_debugger, startup_logs, teardown_logs
 from common.logging import get_logger
 from common.rpc.channel import DATA_INGEST_GRPC_TARGET_ENV, create_channel, target_from_env
-from common.rpc.clients.ingest_fetch import GrpcIngestFetchClient, IngestFetchClient
 from common.rpc.clients.ingest_submit import GrpcIngestSubmitClient, IngestSubmitClient
 from common.worker_pool import SharedWorkerPool
 from data.store.app.asset_snapshot_schedule import start_asset_snapshot_loops, stop_asset_snapshot_loops
@@ -25,9 +24,6 @@ from routers.data_ingest.app_endpoints import APP_PORT_INTERNAL as INGEST_APP_PO
 log = get_logger(__name__)
 
 __INGEST_CHANNEL = None
-# The FetchDataset client has no caller on the dataset path since the push path (tj-7zjov1.28); it stays, built and
-# handed out, until the result-bearing FetchDataset stream is retired (P37, tj-7zjov1.18).
-__INGEST_FETCH_CLIENT = None
 __INGEST_SUBMIT_CLIENT = None
 
 
@@ -64,16 +60,15 @@ async def lifespan(app: FastAPI):
     # of its own).
     #
     # NO START GATE, and none is wanted (ADR tj-8konfu D6.5 = O1, ruled on tj-3mk3u5.22 Q1).
-    # create_channel connects nothing: the first fetch connects, waiting for the peer through
+    # create_channel connects nothing: the first Submit connects, waiting for the peer through
     # wait_for_ready bounded by that call's own deadline, which covers a cold start and a restart
     # alike. There is nothing here to wait for the peer to come up.
     #
     # UNCONDITIONAL, unlike the latency harness's target: a missing DATA_INGEST_GRPC_TARGET fails
     # startup naming the variable, rather than surfacing later as DEADLINE_EXCEEDED against a peer
     # that is perfectly healthy.
-    global __INGEST_CHANNEL, __INGEST_FETCH_CLIENT, __INGEST_SUBMIT_CLIENT
+    global __INGEST_CHANNEL, __INGEST_SUBMIT_CLIENT
     __INGEST_CHANNEL = create_channel(target_from_env(DATA_INGEST_GRPC_TARGET_ENV))
-    __INGEST_FETCH_CLIENT = GrpcIngestFetchClient(__INGEST_CHANNEL)
     __INGEST_SUBMIT_CLIENT = GrpcIngestSubmitClient(__INGEST_CHANNEL)
     # The interim DAILY refresh (tj-grna9p.22): needs the client, so it starts after it. One worker only.
     refresh_tasks = await start_daily_refresh_loops(__INGEST_SUBMIT_CLIENT)
@@ -125,12 +120,3 @@ def get_ingest_submit_client() -> IngestSubmitClient:
         client to hand out before startup has run.
     """
     return __INGEST_SUBMIT_CLIENT
-
-
-def get_ingest_fetch_client() -> IngestFetchClient:
-    """FastAPI dependency: the FetchDataset client. No route uses it since the push path; P37 removes it.
-
-    Returns:
-        IngestFetchClient: The client built by the lifespan, or None outside one.
-    """
-    return __INGEST_FETCH_CLIENT

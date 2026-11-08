@@ -132,7 +132,7 @@ default; at most stack.AGENT_ENV_MAX_NAMES names per call; the never-allowed nam
 refused first and the literal is checked against them at import. A refusal names the variable, never the
 value. HOW IT REACHES COMPOSE: this server renders ONE overlay, stack.AGENT_ENV_FILE
 (docker-compose.agent-env.yaml), in its own stack directory (never the repository, never an env file)
-from a dict by yaml.safe_dump with a fixed argument set (pyyaml, in the agent-mcp group; read back byte-identical),
+from a dict by yaml.dump with a SafeDumper subclass and a fixed argument set (pyyaml, in the agent-mcp group; read back byte-identical),
 mode 0600, written to a temporary name and renamed; it carries services.<service>.environment and the
 labels trader_joe.agent.env_generation and trader_joe.agent.env_names. It is LAST in the TEST file set
 (stack.testmode_prefix with a stack directory) only when it exists, stack.check_dev_lifecycle_argv

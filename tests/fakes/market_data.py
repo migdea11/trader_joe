@@ -182,8 +182,9 @@ GRID_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 OPEN_ENDED_STEPS = 100
 
 # A vendor that is SLOW BUT STILL SERVED. This was chosen to be longer than data_store's 5 s Kafka
-# RPC deadline, so that SLOW_ outlived its caller; tj-3mk3u5.10 replaced that transport and set
-# DEFAULT_FETCH_DEADLINE_S to 300 s deliberately, because 5 s abandoned requests the vendor was
+# RPC deadline, so that SLOW_ outlived its caller; tj-3mk3u5.10 replaced that transport and set a
+# 300 s fetch deadline deliberately (the store's verdict deadline keeps it since the fetch client went,
+# P37), because 5 s abandoned requests the vendor was
 # still serving. So 8 s outlives nothing now, and nothing permitted here would: the ceiling below
 # is 60 s. tests/system/test_ingest_e2e.py asserts the served outcome and reversed its own
 # expectation on tj-xhcoyc item 2 for this reason.

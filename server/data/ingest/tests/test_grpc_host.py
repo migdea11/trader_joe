@@ -3,19 +3,23 @@
 The design is bead tj-3mk3u5.24 with its architect notes -- N3, binding: the host is entered only as
 'async with' around the lifespan's yield, so it stops on every exit path; the bind variables have no
 default -- ADR tj-8konfu D2 (grpc.aio) and D6.5 (the standard health service), and decision tj-j4wknb
-INJECTION (a servicer is handed the readers create_app received, never a broker class).
+INJECTION (a servicer is handed what create_app received, never a broker class).
 
 Pinned here, through the production lifespan (main.create_app -> app_depends.make_lifespan):
 
 * health answers SERVING on the configured port while the app is up, and nothing answers after;
 * grpc_host.registered_services() is the one registration point: what it returns is what the
-  lifespan's host serves, and it is handed the readers create_app received;
-* FetchDataset is registered ALWAYS (tj-3mk3u5.9), and the latency arm joins it -- beside it, never
-  instead of it -- only when LATENCY_TEST_ENABLED is on, with common.rpc.latency left unimported when
-  it is off (tj-3mk3u5.60). That last clause replaces this file's older pin that NO generated module
-  was loaded with the harness off: FetchDataset has no flag and grpc_host imports common.rpc.ingest at
-  module level, so the broad version is dead and the narrow one it was protecting is what remains. The
-  reasoning is written out above HARNESS_OFF_PROBE;
+  lifespan's host serves. It used to be handed the readers create_app received, for the FetchDataset
+  handler; tj-7zjov1.275 (owner ruling 2026-11-02 on tj-7zjov1.18) deleted that handler and the readers
+  parameter with it, so the lifespan now hands it the Submit and Instance handlers by keyword and nothing
+  else, and create_app, make_lifespan, build_grpc_host and registered_services have no readers parameter;
+* the ingest service is registered ALWAYS, with NO FetchDataset handler: Submit and Instance through the
+  handlers given, FetchDataset answered UNIMPLEMENTED by the built host (not INTERNAL, not served). The
+  latency arm joins it -- beside it, never instead of it -- only when LATENCY_TEST_ENABLED is on, with
+  common.rpc.latency left unimported when it is off (tj-3mk3u5.60). That last clause replaces this file's
+  older pin that NO generated module was loaded with the harness off: the ingest service has no flag and
+  grpc_host imports common.rpc.ingest at module level, so the broad version is dead and the narrow one it
+  was protecting is what remains. The reasoning is written out above HARNESS_OFF_PROBE;
 * the bind address is read when the host is built, never once at import;
 * an unset variable stops startup before the worker pool or the latency server are touched;
 * a gRPC start that fails (port taken, wildcard host) still runs the teardown, and the process then
@@ -38,12 +42,14 @@ re-pointed lifespan tests of test_read_seam.py and test_fake_read.py) instead of
 """
 
 import asyncio
+import inspect
 import logging
 import socket
 import subprocess
 import sys
 from collections.abc import AsyncIterator
 from contextlib import ExitStack, asynccontextmanager
+from datetime import UTC, datetime
 from typing import Final
 from unittest.mock import Mock, patch
 
@@ -51,19 +57,21 @@ import grpc
 import pytest
 from grpc_health.v1 import health_pb2, health_pb2_grpc
 
-from common.enums.data_stock import DataSource
+from common.enums.data_stock import Feed
 from common.rpc.channel import create_channel
+from common.rpc.clients.ingest_submit import GrpcIngestSubmitClient
 from common.rpc.latency import LatencyProbeClient
 from common.rpc.ping import SERVICE_NAME as PING_SERVICE_NAME
 from common.rpc.ping import ping, ping_service
 from common.rpc.server import GRPC_HOST_ENV, GRPC_PORT_ENV
 from common.tests.image_path import image_pythonpath
 from common.tests.roots import SERVER_ROOT
+from common.tests.rpc.submit_contract import a_submit, accepted
 from common.worker_pool import SharedWorkerPool
 from data.ingest.app import app_depends, grpc_host, main
-from data.ingest.app.brokers.interface import BarsQuery, BarsResponse
 from data.ingest.tests.grpc_bind import GUARD_S, LOOPBACK, LoopbackGrpc, accepts_connections, free_loopback_port
 from routers.common import latency as latency_harness
+from schemas.data_ingest.submit import InstanceResponse, SubmitRequest, SubmitResponse
 
 
 pytestmark = pytest.mark.data_ingest
@@ -72,13 +80,6 @@ pytestmark = pytest.mark.data_ingest
 # that import the ingest app, so this is the IMPORT root. SERVER_ROOT, never REPO_ROOT.
 SERVING = health_pb2.HealthCheckResponse.SERVING
 READY_LOG: Final = 'Data Ingest App Ready!!!'
-
-
-class UnusedRead:
-    """A BrokerRead that no test here reads through: the lifespan only installs and clears it."""
-
-    async def get_bars(self, query: BarsQuery) -> BarsResponse:
-        raise AssertionError(f'nothing in this file fetches bars, yet get_bars was called with {query!r}')
 
 
 async def health_status(port: int, service: str = '', timeout_s: float = 5.0) -> int:
@@ -122,8 +123,9 @@ class StubbedLifespan:
 
     def __init__(self, grpc_bind: LoopbackGrpc):
         self.grpc_bind = grpc_bind
-        self.readers = {DataSource.ALPACA_API: UnusedRead()}
-        self.app = main.create_app(self.readers)
+        # No handles: the app serves health and the ingest service with no Submit handler, which is what every
+        # property here is about. It was create_app(readers) until tj-7zjov1.275 removed the readers mapping.
+        self.app = main.create_app()
         self.latency_server = Mock()
 
     @asynccontextmanager
@@ -165,19 +167,20 @@ async def test_health_answers_serving_on_the_configured_port_while_up_and_nothin
 
 
 @pytest.mark.asyncio
-async def test_what_registered_services_returns_is_what_the_lifespan_serves_and_it_gets_the_injected_readers(
+async def test_what_registered_services_returns_is_what_the_lifespan_serves_and_it_is_handed_no_readers(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """A later servicer (.8, .9) is added by appending to registered_services(), never by editing the lifespan.
 
-    Ping stands in for that servicer. It must answer through the lifespan's own server, health must
-    report it by name, and registered_services() must have been handed the very mapping create_app
-    received (decision tj-j4wknb: the servicer reads the injected readers, not a broker class).
+    Ping stands in for that servicer. It must answer through the lifespan's own server, and health must
+    report it by name. Until tj-7zjov1.275 registered_services() was also handed the very readers mapping
+    create_app received, for the FetchDataset handler; with that handler deleted, an app built with no handles
+    calls it with NO argument at all -- no positional mapping, no keyword -- which is what is pinned now.
     """
     received = []
 
-    def ping_only(readers):
-        received.append(readers)
+    def ping_only(*args, **kwargs):
+        received.append((args, kwargs))
         return [ping_service()]
 
     monkeypatch.setattr(grpc_host, 'registered_services', ping_only)
@@ -193,8 +196,7 @@ async def test_what_registered_services_returns_is_what_the_lifespan_serves_and_
 
     assert answer == 'through data_ingest'
     assert status == SERVING
-    assert len(received) == 1
-    assert received[0] is probe.readers
+    assert received == [((), {})]
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -216,7 +218,7 @@ async def test_the_bind_address_is_read_each_time_the_host_is_built_never_once_a
     for port in (first, second):
         monkeypatch.setenv(GRPC_HOST_ENV, LOOPBACK)
         monkeypatch.setenv(GRPC_PORT_ENV, str(port))
-        host = grpc_host.build_grpc_host({})
+        host = grpc_host.build_grpc_host()
         try:
             await asyncio.wait_for(host.start(), GUARD_S)
             bound.append(host.port)
@@ -345,7 +347,7 @@ if sys.argv[1] == 'clean':
 os.environ[GRPC_HOST_ENV] = '127.0.0.1'
 os.environ[GRPC_PORT_ENV] = str(port)
 
-app = main.create_app({})
+app = main.create_app()
 
 
 async def run():
@@ -457,8 +459,10 @@ INGEST_SERVICE_NAME: Final = 'trader_joe.proto.internal.ingest.v1.IngestService'
 # generated module was loaded anywhere on the path from grpc_host to registered_services(). BOTH HALVES
 # ARE NOW FALSE, and only one of them is replaceable.
 #
-#   services  FetchDataset is served ALWAYS -- it is production, not a dev harness, and has no flag to
-#             be off. So the pin becomes "exactly the ingest service, and nothing of the harness".
+#   services  The ingest service is registered ALWAYS -- it is production, not a dev harness, and has no
+#             flag to be off. So the pin becomes "exactly the ingest service, and nothing of the harness".
+#             (It was FetchDataset that made it unconditional, tj-3mk3u5.9; since tj-7zjov1.275 the
+#             registration carries no fetch handler, and Submit and Instance are what it serves.)
 #   generated THE GUARANTEE IS GONE, deliberately and irreversibly. grpc_host.py imports
 #             common.rpc.ingest at module top level, which loads trader_joe.proto.internal.ingest.v1;
 #             nothing could make that lazy and still register the service unconditionally. Weakening
@@ -481,14 +485,14 @@ import sys
 
 from data.ingest.app.grpc_host import registered_services
 
-names = [service.name for service in registered_services({})]
+names = [service.name for service in registered_services()]
 print('services=' + repr(names), flush=True)
 print('latency_loaded=' + repr('common.rpc.latency' in sys.modules), flush=True)
 """
 
 
-def test_with_the_latency_harness_off_only_fetch_dataset_is_registered_and_the_latency_module_is_unloaded():
-    """The production default: FetchDataset served, the dev-only arm neither served nor even imported.
+def test_with_the_latency_harness_off_only_the_ingest_service_is_registered_and_the_latency_module_is_unloaded():
+    """The production default: the ingest service registered, the dev-only arm neither served nor even imported.
 
     The second half is the one that protects production. get_latency_services() imports
     common.rpc.latency inside the flag check for exactly this reason, so a top-level import added
@@ -511,12 +515,12 @@ def test_with_the_latency_harness_off_only_fetch_dataset_is_registered_and_the_l
     assert done.stdout.splitlines() == [f'services={[INGEST_SERVICE_NAME]!r}', 'latency_loaded=False'], done.stderr
 
 
-def test_with_the_latency_harness_on_the_latency_servicer_joins_fetch_dataset_rather_than_replacing_it(
+def test_with_the_latency_harness_on_the_latency_servicer_joins_the_ingest_service_rather_than_replacing_it(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """Flag on: two registrations, so tj-3mk3u5.26 has a server to dial and FetchDataset still answers.
+    """Flag on: two registrations, so tj-3mk3u5.26 has a server to dial and the ingest service still answers.
 
-    The ORDER is pinned with them. registered_services() builds the list as [fetch, *harness], and a
+    The ORDER is pinned with them. registered_services() builds the list as [ingest, *harness], and a
     dev-only arm that could displace production's own service -- rather than be appended beside it --
     is the failure this spells out rather than leaves to a set comparison.
 
@@ -526,27 +530,158 @@ def test_with_the_latency_harness_on_the_latency_servicer_joins_fetch_dataset_ra
     """
     monkeypatch.setattr(latency_harness, 'LATENCY_TEST_ENABLED', True)
 
-    services = grpc_host.registered_services({})
+    services = grpc_host.registered_services()
 
     assert [service.name for service in services] == [INGEST_SERVICE_NAME, LATENCY_SERVICE_NAME]
 
 
-def test_registered_services_builds_the_fetch_handler_from_the_readers_it_was_handed(monkeypatch: pytest.MonkeyPatch):
-    """Decision tj-j4wknb: the servicer reads through the INJECTED readers, never a broker class.
+# ---------------------------------------------------------------------------------------------------
+# NO FETCHDATASET HANDLER (tj-7zjov1.275; owner ruling 2026-11-02 on tj-7zjov1.18)
+#
+# This replaces test_registered_services_builds_the_fetch_handler_from_the_readers_it_was_handed, which pinned
+# that the readers mapping reached IngestFetchHandler. The handler and the mapping are gone; what has to be
+# true now is the inverse: the registration carries the Submit and Instance handlers it was given and no fetch
+# handler at all, the built host refuses FetchDataset with UNIMPLEMENTED, and no entry point takes readers.
 
-    The lifespan test above proves the mapping reaches registered_services(); this proves
-    registered_services() puts it into the handler it builds, which is the half that would otherwise be
-    covered only by a function that was monkeypatched away. A handler built from a fresh {} instead
-    would serve every FetchDataset call a NotImplementedError and pass every other test in this file.
+
+class _Submit:
+    """A SubmitHandler by shape that accepts every request on IEX."""
+
+    def __init__(self) -> None:
+        self.seen: list[SubmitRequest] = []
+
+    async def submit(self, request: SubmitRequest) -> SubmitResponse:
+        """Record and accept.
+
+        Args:
+            request: The decoded request.
+
+        Returns:
+            SubmitResponse: An IEX acceptance.
+        """
+        self.seen.append(request)
+        return accepted(Feed.IEX)
+
+
+class _Instance:
+    """An InstanceHandler by shape with a fixed identity."""
+
+    async def instance(self) -> InstanceResponse:
+        """Returns: InstanceResponse: ingest-9, started at INSTANCE_STARTED."""
+        return InstanceResponse(instance_id='ingest-9', started_at=INSTANCE_STARTED)
+
+
+INSTANCE_STARTED: Final = datetime(2026, 11, 2, 3, 0, tzinfo=UTC)
+
+# The wire path of the retired method, spelled out for the same reason as the service names above. Called with
+# an empty body and no generated class: an empty message decodes as a default FetchDatasetRequest today, and
+# once tj-7zjov1.280 deletes the method the server answers UNIMPLEMENTED for the unknown path just the same, so
+# this pin outlives that step unchanged.
+FETCH_DATASET_PATH: Final = f'/{INGEST_SERVICE_NAME}/FetchDataset'
+
+
+def test_registered_services_hands_the_ingest_service_submit_and_instance_and_no_fetch_handler(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The registration point builds the ingest service from exactly the two handlers it was given.
+
+    No positional argument reaches ingest_service: the fetch handler was its one positional parameter, so an
+    IngestFetchHandler (or anything else) re-registered there is red here even if every wire test still passed.
     """
-    built = []
-    monkeypatch.setattr(grpc_host, 'IngestFetchHandler', lambda readers: built.append(readers) or Mock())
-    readers = {DataSource.ALPACA_API: UnusedRead()}
+    calls = []
+    real = grpc_host.ingest_service
 
-    grpc_host.registered_services(readers)
+    def recording(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real(*args, **kwargs)
 
-    assert built == [readers]
-    assert built[0] is readers
+    monkeypatch.setattr(grpc_host, 'ingest_service', recording)
+    submit, instance = _Submit(), _Instance()
+
+    services = grpc_host.registered_services(submit=submit, instance=instance)
+
+    assert calls == [((), {'submit': submit, 'instance': instance})]
+    assert [service.name for service in services] == [INGEST_SERVICE_NAME]
+
+
+@pytest.mark.parametrize(
+    ('target', 'expected'),
+    [
+        (main.create_app, ['handles']),
+        (app_depends.make_lifespan, ['handles']),
+        (grpc_host.build_grpc_host, ['submit', 'instance']),
+        (grpc_host.registered_services, ['submit', 'instance']),
+    ],
+    ids=['create_app', 'make_lifespan', 'build_grpc_host', 'registered_services'],
+)
+def test_no_entry_point_takes_a_readers_mapping_any_more(target, expected: list[str]):
+    """tj-7zjov1.275 removed the readers argument, which only ever fed the fetch handler.
+
+    The parameters are pinned whole, so a readers parameter restored under any name, positional or keyword, is
+    red. build_grpc_host and registered_services take their two handlers keyword-only, each defaulting to None.
+
+    Args:
+        target: The entry point.
+        expected: Its parameter names, in order.
+    """
+    parameters = inspect.signature(target).parameters
+
+    assert list(parameters) == expected
+    assert 'readers' not in parameters
+    for name in parameters:
+        assert parameters[name].default is None, name
+        if expected != ['handles']:
+            assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY, name
+
+
+@pytest.mark.asyncio
+async def test_the_built_host_answers_fetch_dataset_unimplemented_and_still_serves_submit_and_instance(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Through build_grpc_host on a real loopback port, as production builds it with both handlers.
+
+    UNIMPLEMENTED, not INTERNAL: the method is unserved, not broken -- the servicer aborts rather than falling
+    to the generated base method, whose NotImplementedError the error boundary would render INTERNAL. Submit and
+    Instance on the same host answer through the handlers given, so removing the fetch handler took nothing else.
+    """
+    monkeypatch.setenv(GRPC_HOST_ENV, LOOPBACK)
+    monkeypatch.setenv(GRPC_PORT_ENV, str(free_loopback_port()))
+    submit = _Submit()
+
+    host = grpc_host.build_grpc_host(submit=submit, instance=_Instance())
+    try:
+        await asyncio.wait_for(host.start(), GUARD_S)
+        channel = create_channel(f'{LOOPBACK}:{host.port}')
+        try:
+            fetch = channel.unary_stream(
+                FETCH_DATASET_PATH, request_serializer=lambda body: body, response_deserializer=lambda body: body
+            )
+            with pytest.raises(grpc.aio.AioRpcError) as refused:
+                await asyncio.wait_for(_drain(fetch(b'', timeout=5)), GUARD_S)
+            client = GrpcIngestSubmitClient(channel, deadline_s=5)
+            answer = await asyncio.wait_for(client.submit(a_submit()), GUARD_S)
+            identity = await asyncio.wait_for(client.instance(), GUARD_S)
+        finally:
+            await channel.close()
+    finally:
+        await asyncio.wait_for(host.stop(), GUARD_S)
+
+    assert refused.value.code() is grpc.StatusCode.UNIMPLEMENTED, refused.value.details()
+    assert answer == accepted(Feed.IEX)
+    assert submit.seen == [a_submit()]
+    assert identity == InstanceResponse(instance_id='ingest-9', started_at=INSTANCE_STARTED)
+
+
+async def _drain(stream) -> list[bytes]:
+    """Read a server stream to its end.
+
+    Args:
+        stream: The call.
+
+    Returns:
+        list[bytes]: Every message, raw.
+    """
+    return [message async for message in stream]
 
 
 @pytest.mark.asyncio
@@ -563,7 +698,7 @@ async def test_with_the_latency_harness_on_the_host_built_here_actually_serves_t
     monkeypatch.setenv(GRPC_HOST_ENV, LOOPBACK)
     monkeypatch.setenv(GRPC_PORT_ENV, str(free_loopback_port()))
 
-    host = grpc_host.build_grpc_host({})
+    host = grpc_host.build_grpc_host()
     try:
         await asyncio.wait_for(host.start(), GUARD_S)
         status = await health_status(host.port, LATENCY_SERVICE_NAME)

@@ -503,7 +503,7 @@ def _checked_reset_at(reason: Reason, spec: ReasonSpec, reset_at: datetime | Non
 
 # THE ONE TABLE (D4): one row per Reason, reviewable in a diff. The comment above each row names what
 # raises it and the task that wires the raise. A grpc_code of None is never rendered as a gRPC status:
-# FEED_NOT_AVAILABLE travels in-band on the FetchDataset ack (tj-3mk3u5.22 Q5), the PEER_* reasons and
+# FEED_NOT_AVAILABLE travels in-band on the Submit ack (tj-3mk3u5.22 Q5), the PEER_* reasons and
 # DEADLINE are produced on the client side of a hop, and the DATABASE_* reasons arise in data_store, which
 # answers over HTTP. No row is UNAVAILABLE (tj-8konfu D6.4).
 REASONS: Final[Mapping[Reason, ReasonSpec]] = MappingProxyType(
@@ -536,7 +536,7 @@ REASONS: Final[Mapping[Reason, ReasonSpec]] = MappingProxyType(
             http_status=422,
             summary='The broker cannot serve the instrument as specified, such as its currency or exchange; change the instrument and ask again.',
         ),
-        # The reader refusing a named feed (TE-4). In-band on the FetchDataset ack, never a status (tj-3mk3u5.22 Q5).
+        # The reader refusing a named feed (TE-4). In-band on the Submit ack, never a status (tj-3mk3u5.22 Q5).
         Reason.FEED_NOT_AVAILABLE: ReasonSpec(
             branch=InvalidRequestError,
             outcome=Outcome.REFUSED,

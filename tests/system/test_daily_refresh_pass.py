@@ -7,7 +7,7 @@ ready_by the next market open) and SUBMITS it without waiting; ingest pushes the
 intake, which writes the bars under the named entry in one transaction.
 
 REPAIRED FOR THE PUSH PATH (validator, tj-7zjov1.28). Until P35 this file hosted ingest's FetchDataset servicer around
-FakeRead and the refresh fetched through GrpcIngestFetchClient; that stream is gone from the refresh. The Submit and
+FakeRead and the refresh fetched through GrpcIngestFetchClient; that stream and client are gone (P37). The Submit and
 the delivery have their own gRPC tier (test_delivery_intake.py, test_delivery_intake_pg.py); what only THIS file shows
 is the refresh's own end on Postgres, so ingest is now a double that answers each Submit as ingest does (a tape it
 cannot serve is a refused answer) and then DELIVERS, through the real DeliveryIntake on the scratch database, exactly

@@ -13,7 +13,7 @@ from starlette.routing import NoMatchFound
 from common.database.postgres_tools import PostgresSessionFactory
 from common.enums.data_stock import DataSource, Granularity, UpdateType
 from common.errors.vocabulary import ExogenousError, Reason
-from data.store.app.app_depends import get_ingest_fetch_client, get_ingest_submit_client
+from data.store.app.app_depends import get_ingest_submit_client
 from data.store.app.database.database import async_db
 from data.store.app.database.models.ingest_request import IngestRequest
 from data.store.app.database.models.panel import Panel, PanelSettingsVersion, PanelSourceSettingsVersion
@@ -53,7 +53,7 @@ from routers.tests.test_interface_surface import SEPARATOR, load_manifest
 #      the client without `with` dispatches requests without ever running it. If you add a `with`
 #      here to make something work, you have just made this file need a database.
 #   2. Both injected dependencies are replaced through app.dependency_overrides -- async_db and
-#      get_ingest_submit_client (get_ingest_fetch_client until the push path, tj-7zjov1.28) --
+#      get_ingest_submit_client (the FetchDataset client's getter until the push path, tj-7zjov1.28) --
 #      rather than by monkeypatching module globals, because the handlers take them as Depends()
 #      and that is the seam FastAPI gives you.
 # test_the_routes_are_driven_without_a_lifespan asserts both halves instead of trusting them.
@@ -1260,18 +1260,12 @@ def test_the_routes_are_driven_without_a_lifespan(client: TestClient):
         'driving a route opened a Postgres engine, so the database dependency override is not '
         'taking effect or the lifespan ran'
     )
-    # THE gRPC GLOBAL, and it is the right one to ask. This pinned both globals between tj-3mk3u5.10
-    # and tj-3mk3u5.32: the Kafka one, get_rpc_clients(), and this one. The Kafka half went with the
-    # client tj-3mk3u5.12 unwires, and nothing is lost by its going -- the lifespan builds the gRPC
-    # channel to data_ingest and the IngestFetchClient over it, and that is the half the POST route
-    # actually depends on, so an override that stopped taking effect is caught here rather than by a
-    # confusing AttributeError inside the handler. It was the Kafka global that could have gone on
-    # passing against a half-run lifespan, not this one.
-    assert get_ingest_fetch_client() is None, (
-        'the store app lifespan ran in this process: it is the only thing that sets the module '
-        'global get_ingest_fetch_client() reads, and it opens a channel to data_ingest'
-    )
-    # The POST route's seam since the push path (tj-7zjov1.28): set by the same lifespan, over the same channel.
+    # THE gRPC GLOBAL, and it is the right one to ask. The lifespan builds the gRPC channel to
+    # data_ingest and the IngestSubmitClient over it, the POST route's seam since the push path
+    # (tj-7zjov1.28), so an override that stopped taking effect is caught here rather than by a
+    # confusing AttributeError inside the handler. Until tj-7zjov1.272 this also asked the
+    # FetchDataset client's global; that client is no longer built, so the Submit one is the whole
+    # of what the lifespan sets.
     assert get_ingest_submit_client() is None, (
         'the store app lifespan ran in this process: it is the only thing that sets the module '
         'global get_ingest_submit_client() reads, and it opens a channel to data_ingest'

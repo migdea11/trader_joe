@@ -42,7 +42,7 @@ the log under the same id. Because the id is then the only machine-readable thin
 is a FIXED TEMPLATE both halves of this module share (_INTERNAL_MESSAGE_PREFIX), and from_rpc_error() reads
 the id back out of it. That is not parsing a human detail (D8): it is reading our own one-line format.
 
-WHAT NEVER COMES THROUGH HERE. FEED_NOT_AVAILABLE is refused in-band on the FetchDataset ack, never as a
+WHAT NEVER COMES THROUGH HERE. FEED_NOT_AVAILABLE is refused in-band on the Submit ack, never as a
 status (user ruling tj-3mk3u5.22 Q5; tj-3mk3u5.27). It is one of the reasons whose REASONS row has no
 grpc_code, and render() refuses every one of them.
 
@@ -183,7 +183,7 @@ def render(error: TraderJoeError, *, error_id: str | None = None) -> status_pb2.
     if spec.grpc_code is None:
         raise ValueError(
             f'{error.reason} is never rendered as a gRPC status: REASONS[{error.reason}].grpc_code is None. '
-            'FEED_NOT_AVAILABLE travels in the FetchDataset ack (tj-3mk3u5.22 Q5), the PEER_* reasons and '
+            'FEED_NOT_AVAILABLE travels in the Submit ack (tj-3mk3u5.22 Q5), the PEER_* reasons and '
             'DEADLINE are made on the client side of a hop, and the DATABASE_* reasons answer over HTTP'
         )
     code = grpc.StatusCode[spec.grpc_code]
@@ -230,7 +230,7 @@ async def abort_with_error(
         context: The servicer context for the call being answered.
         error: The error to send. Its reason must be one that renders as a status.
         method: The RPC path for the log line, e.g. '/trader_joe.proto.internal.ingest.v1.IngestService/
-            FetchDataset'. The boundary passes it; a servicer calling this directly may.
+            Submit'. The boundary passes it; a servicer calling this directly may.
 
     Raises:
         BaseException: Always. context.abort raises to terminate the call, which is how the status is sent.

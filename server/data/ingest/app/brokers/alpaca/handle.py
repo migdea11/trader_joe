@@ -2,7 +2,7 @@
 
 PACING IS HERE AND NOWHERE ELSE (tj-26jt9w addendum 1 item 1; the P10 gate note of 07:41 UTC 2026-10-24). The
 handle declares one quota scope for Alpaca's market-data API with the vendor's hard-coded ceiling, and sets the
-limit under it. Every vendor call, from the Submit queue and from FetchDataset alike, acquires from this scope.
+limit under it. Every vendor call, from the Submit queue, acquires from this scope.
 The environment-built RateBudget that broker_api used to hold is gone, so no vendor call is paced twice or by a
 second formula.
 

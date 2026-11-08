@@ -83,7 +83,6 @@ class _Order:
             return record
 
         monkeypatch.setattr(app_depends, '__INGEST_CHANNEL', None)
-        monkeypatch.setattr(app_depends, '__INGEST_FETCH_CLIENT', None)
         monkeypatch.setattr(app_depends, '__INGEST_SUBMIT_CLIENT', None)
         monkeypatch.setattr(app_depends, 'database', FakeDatabase())
         monkeypatch.setattr(app_depends, 'SharedWorkerPool', FakePool)
@@ -100,7 +99,6 @@ class _Order:
         monkeypatch.setattr(
             app_depends, 'create_channel', lambda _target: (order.append('channel.open'), FakeChannel())[1]
         )
-        monkeypatch.setattr(app_depends, 'GrpcIngestFetchClient', step('fetch_client', object()))
         # The push path's seam (tj-7zjov1.28): the refresh and the instance watcher are handed this client.
         self.submit_client = object()
         self.handed: dict[str, object] = {}
@@ -235,6 +233,28 @@ async def test_the_host_is_entered_last_and_exited_first(monkeypatch):
         'panel': order.submit_client,
     }
     assert app_depends.get_ingest_submit_client() is order.submit_client
+
+
+async def test_the_store_builds_no_fetch_dataset_client(monkeypatch):
+    """The store's lifespan builds the Submit client and nothing else; the module hands out no fetch client.
+
+    The FetchDataset pull stream is retired (owner ruling 2026-11-02, tj-7zjov1.18; removed from the store by
+    tj-7zjov1.272): no getter, no global, no imported client class.
+    """
+    for name in ('get_ingest_fetch_client', '__INGEST_FETCH_CLIENT', 'GrpcIngestFetchClient', 'IngestFetchClient'):
+        assert not hasattr(app_depends, name), f'app_depends still exposes {name}'
+
+    order = _Order(monkeypatch)
+    monkeypatch.setattr(app_depends, 'build_grpc_host', lambda: _FakeHost(order.steps))
+    globals_before = {name for name in vars(app_depends) if name.startswith('__INGEST')}
+
+    async with app_depends.lifespan(object()):
+        # latency_client is the HTTP latency harness's, not a client over the ingest channel.
+        built_on_channel = [step for step in order.steps if step.endswith('_client') and step != 'latency_client']
+        globals_during = {name for name in vars(app_depends) if name.startswith('__INGEST')}
+
+    assert built_on_channel == ['submit_client'], 'the lifespan builds exactly one ingest client, the Submit one'
+    assert globals_during == globals_before == {'__INGEST_CHANNEL', '__INGEST_SUBMIT_CLIENT'}
 
 
 async def test_the_lifespan_starts_the_panel_loop_on_the_submit_client_and_stops_the_task_it_started(monkeypatch):
