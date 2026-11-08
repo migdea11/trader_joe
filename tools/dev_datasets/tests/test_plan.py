@@ -288,10 +288,53 @@ def _readme_text() -> str:
         'Every healthy row therefore starts after 2020-07-27 (r6 on 2020-08-01).',
         # (5): the quiet-stack guarantee.
         '**Reset a quiet stack** (no Viewer open, no request running).',
-        'while any `ingest_run` row is `RUNNING` (it counts them in the same transaction, before the TRUNCATE, and '
-        'names the count)',
-        'After the commit it waits two usage flush intervals (10 s; the store flushes every 5 s) and recounts '
-        '`ingest_run` and `dataset_read`; a non-zero count prints `NOT CLEAN` with the counts and exits 1.',
+        # tj-grna9p.160: the lock comes first, and the recount reads all eighteen (tj-7zjov1.51 (3), tj-3kplhf).
+        'The reset first locks the eighteen tables, then refuses, changing nothing and exiting 1,',
+        # tj-7zjov1.51 (2) and (4): the open-request guard beside the RUNNING one, and what does not block; as amended
+        # by the terminal-only seed (tj-7zjov1.291 addendum 2026-11-04, tj-7zjov1.333): NOT_DELIVERED is not reloaded,
+        # and on dev the finished requests of the window are.
+        'while any `ingest_run` row is `RUNNING` or any `ingest_request` row is `PENDING` or `QUEUED` (it counts both '
+        'in the same transaction, after the lock and before the TRUNCATE, and names the counts; `NOT_DELIVERED` does '
+        'not block and is not reloaded; on dev the finished requests of the last 90 days are reloaded from the seed).',
+        'To clear a stuck request, restart `data_ingest`, which marks its queued work `NOT_DELIVERED`.',
+        # tj-7zjov1.297, corrected by tj-7zjov1.320 (folded into .333): NOT CLEAN is any count that is not the expected
+        # one, zero on a test stack and the manifest's on dev, so a dev count that differs either way is NOT CLEAN.
+        'After the commit it waits two usage flush intervals (10 s; the store flushes every 5 s) and recounts all '
+        'eighteen tables; a count that is not the expected one in any of them prints `NOT CLEAN` with the counts and '
+        "exits 1 (on a test stack the expected count is zero; on dev it is the manifest's, so any count that differs "
+        "from the manifest's is `NOT CLEAN`).",
+        # tj-7zjov1.333, the Export section: the terminal-only rule and the two drops.
+        'Ingest requests of the last 90 days that are in a terminal state (`SUCCEEDED`, `EMPTY` or `FAILED`; a request '
+        'still `PENDING`, `QUEUED` or `NOT_DELIVERED` is neither exported nor reloaded).',
+        "Ingest runs of the last 90 days, plus each kept dataset's latest accepted run (the base of the vendor-asset stop "
+        'rule); a run that names an open request (an attempt row) is dropped, and so is a panel `CREATED` transition '
+        "that names one (dropped, not nulled, so the next pass creates that member's dataset again).",
+        # tj-7zjov1.51 (1) and tj-3kplhf: the eighteen, written out in the design's order.
+        '`reset` empties **exactly these eighteen tables, in one transaction**,',
+        '`stock_market_activity`, `store_dataset_entry`, `ingest_run`, `ingest_request`, `ingest_instance`, '
+        '`dataset_read`, `dataset_read_daily`, `dataset_override_log`, `dataset_deletion`, `asset_list_snapshot`, '
+        '`asset_list_row`, `asset_list_event`, `corporate_action`, `panel`, `panel_settings_version`, '
+        '`panel_source_settings_version`, `panel_pass`, `panel_member_transition`.',
+        # tj-3kplhf: no CASCADE, because every foreign key has both ends inside the statement; and no dev guard (owner
+        # ruling 2026-11-03).
+        'with one `TRUNCATE ... RESTART IDENTITY` (no `CASCADE`: every foreign key among them has both ends in the '
+        'statement, so none needs ordering)',
+        'There is no dev guard: a reset never refuses because the asset-list, corporate-action or panel tables hold '
+        'rows.',
+        # tj-7zjov1.297 (decision tj-7zjov1.291 D1, D3): the preserving dev reset, the plain test wipe, load's stale rule.
+        '**On a dev stack the reset keeps a seed.**',
+        'runs the one `TRUNCATE ... RESTART IDENTITY`, `COPY`s the files back in (parents first, so every foreign key has '
+        'both ends before the commit)',
+        'A count that differs, or any failure, rolls everything back and leaves the data as it was; the export stays on '
+        'disk.',
+        'The transaction is `READ COMMITTED`: the lock is taken before the first read',
+        '**On the test label the reset is the plain wipe**: no export, nothing reloaded, every table 0.',
+        "It refuses unless the **seed's revision, the database's `alembic_version` and the checkout's migration head "
+        'are the same**',
+        'A refusal changes nothing, exits **3** and names the three revisions (never a value)',
+        '**verifies the size and sha256 of every file before the first write**',
+        "- **`--dry-run`** reads only the files: it verifies them and prints the seed's and the checkout's revision and "
+        'the per-table counts. No rail, no database.',
         'The guarantee is exactly that: clean at commit, verified after one flush interval.',
         # (4) and (3): r13's fail-once memory, and which 503 is the designed one.
         'That memory lives in the `data_ingest` process',
@@ -307,6 +350,23 @@ def test_the_readme_states_the_tj_grna9p_150_guarantees(sentence):
     assert sentence in _readme_text()
 
 
+def test_the_readme_no_longer_claims_open_requests_are_emptied_or_that_dev_counts_are_non_zero_checks():
+    # The sentences tj-7zjov1.320 called wrong, gone (folded into tj-7zjov1.333).
+    text = _readme_text()
+    assert 'finished requests do not block, they are emptied' not in text
+    assert 'a non-zero count in any of them prints `NOT CLEAN`' not in text
+    assert "(on dev, against the manifest's)" not in text
+    assert 'Ingest requests and runs of the last 90 days' not in text
+
+
+def test_the_revision_refused_docstring_covers_the_export_the_dev_reset_and_the_load():
+    # tj-7zjov1.320 (folded into .333): the exception names every refusal that raises it and the exit code.
+    doc = ' '.join((tool.RevisionRefused.__doc__ or '').split())
+    assert 'EXIT_REFUSED (3)' in doc
+    for words in ('an export', 'a dev reset', 'a load', "the seed's stack is not the target's"):
+        assert words in doc, words
+
+
 def test_the_readme_no_longer_claims_the_old_depth_or_the_narrow_dry_run_exception():
     text = _readme_text()
     assert (
@@ -315,6 +375,20 @@ def test_the_readme_no_longer_claims_the_old_depth_or_the_narrow_dry_run_excepti
     )
     assert '`reads/degrade/repair --dry-run`' not in text
     assert '2019-01-01' not in text
+
+
+def test_the_readme_and_the_docstring_no_longer_say_seven_and_name_the_request_guard():
+    # tj-7zjov1.51 (4): every seven became nine; tj-3kplhf: every nine became eighteen. The docstring says the reset
+    # refuses on an in-flight request. ('nine' alone stays legitimate: the README's nine claude-seed rows.)
+    doc = ' '.join((tool.__doc__ or '').split())
+    readme = _readme_text().lower()
+    assert 'seven' not in readme
+    assert 'seven' not in doc.lower()
+    for stale in ('nine tables', 'nine store tables', 'the nine,'):
+        assert stale not in readme, stale
+        assert stale not in doc.lower(), stale
+    assert 'The reset empties exactly eighteen store tables in ONE transaction (RESET_TABLES)' in doc
+    assert 'It also refuses while a RUNNING ingest run or a PENDING or QUEUED ingest request is in flight.' in doc
 
 
 def test_the_tool_docstring_says_every_dry_run_skips_the_credential_check():

@@ -1117,7 +1117,16 @@ def test_snapshot_sources_are_exactly_what_the_trusted_files_read_from_the_proje
     for name in CLIENT_FILES:
         expected |= _relative_bind_sources(REPO_ROOT / name)
     # The service trees moved under server/ (tj-iontkq.4); tests/ and pytest.ini did not.
-    floor = {'server/data/store/migrations', 'tests/system', 'tests/fakes', 'server/data/ingest/app', 'pytest.ini'}
+    # tj-7zjov1.313: the client mounts the dev seed tool, the package marker and the one subpackage only.
+    floor = {
+        'server/data/store/migrations',
+        'tests/system',
+        'tests/fakes',
+        'server/data/ingest/app',
+        'pytest.ini',
+        'tools/__init__.py',
+        'tools/dev_datasets',
+    }
     assert floor <= expected, expected
     assert set(stack.SNAPSHOT_SOURCES) == expected, (
         f'SNAPSHOT_SOURCES {sorted(stack.SNAPSHOT_SOURCES)} vs what the trusted files read {sorted(expected)}'

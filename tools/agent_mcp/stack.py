@@ -218,6 +218,9 @@ SNAPSHOT_SOURCES = (
     'tests/system',
     'tests/fakes',
     'pytest.ini',
+    # The test client mounts these two (the dev seed export round trip, tj-7zjov1.313).
+    'tools/__init__.py',
+    'tools/dev_datasets',
 )
 # The copy's caps: generous (the sources are a few MB today), there to stop a worktree that grew a
 # dataset or a runaway generator from filling the host disk.

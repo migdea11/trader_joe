@@ -137,11 +137,18 @@ WORKTREE_FILES = {
     'tests/fakes/__init__.py': '',
     'tests/fakes/ingest_launcher.py': 'app = None\n',
     'pytest.ini': '[pytest]\n',
+    # The dev seed tool, test_client's read-only mounts (tj-7zjov1.313): the package marker and the one
+    # subpackage, never the rest of tools/.
+    'tools/__init__.py': '',
+    'tools/dev_datasets/__init__.py': '',
+    'tools/dev_datasets/dev_seed.py': 'SEED = 1\n',
     # Outside every SNAPSHOT_SOURCES entry: never copied. tests/ is allow-listed per subdirectory,
     # never whole, so a sibling of tests/system and tests/fakes stays out.
     'Dockerfile': 'FROM scratch\n',
     'README.md': 'not a source\n',
     'tests/README.md': 'not a source\n',
+    # tools/ is allow-listed per entry too: a sibling of tools/dev_datasets stays out.
+    'tools/agent_mcp/server.py': 'not a source\n',
 }
 EXECUTABLE_FILES = ('entrypoint.sh',)
 # A live env file's content: it must never reach a snapshot, the audit log or any output.

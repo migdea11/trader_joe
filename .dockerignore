@@ -21,6 +21,11 @@ Dockerfile
 volumes/
 volume_data/
 
+# Generated output (tj-7zjov1.294). output/ is gitignored but sits inside the build context; the dev seed export writes
+# real tickers, vendor bars and owner names under output/dev_seed/ and must never be uploaded to the daemon or reach an
+# image. Nothing in an image reads output/.
+output/
+
 # Agent git worktrees (tj-aov3ip): whole extra copies of the repo, and half-edited ones
 .claude/worktrees/
 

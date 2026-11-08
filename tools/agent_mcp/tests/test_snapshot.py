@@ -51,6 +51,9 @@ def test_the_snapshot_holds_exactly_the_allow_listed_sources(tree: tuple[Path, P
     for relative in files:
         assert (snapshot / relative).read_bytes() == (worktree / relative).read_bytes()
     assert not (snapshot / 'Dockerfile').exists() and not (snapshot / 'README.md').exists()
+    # tj-7zjov1.313: the dev seed tool is carried, the rest of tools/ is not.
+    assert (snapshot / 'tools/__init__.py').is_file() and (snapshot / 'tools/dev_datasets/dev_seed.py').is_file()
+    assert not (snapshot / 'tools/agent_mcp').exists()
 
 
 def test_live_env_files_and_pycache_are_skipped_but_the_template_is_copied(tree: tuple[Path, Path]):

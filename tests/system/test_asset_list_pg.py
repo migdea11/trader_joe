@@ -32,10 +32,14 @@ P17f (tj-7zjov1.164, ADR tj-26jt9w addendum 18), on the same real tables:
 
 ISOLATION. Snapshots are append-only for the service and the diff base is the newest non-empty snapshot of a (source,
 list), shared by every writer, and open_asset_list_request_exists reads every open request of a (source, list). These
-tests use the source IB_API, which no service and no other system test writes asset lists for (MANUAL_ENTRY is
-test_asset_list_submit_pg.py's), delete exactly what they wrote at the end of each test, failed or not, and first
-clear any IB_API asset-list state a killed earlier run of this file left behind, so a leftover can never be a base or
-an open request here.
+tests use the source IB_API, which no service writes asset lists for (MANUAL_ENTRY is test_asset_list_submit_pg.py's).
+Two other system tests write IB_API asset-list rows, and neither runs at the same time as this file in the
+sequential tier: test_asset_snapshot_schedule_pg.py (its own requests and snapshots) and test_dev_seed_export_pg.py
+(snapshots, rows and events of the INACTIVE list dated 1996, with no ingest_request row; it deletes them at its end,
+and checks before its export that no foreign IB_API snapshot sits before its own cutoff). These tests delete exactly
+what they wrote at the end of each test, failed or not, and first clear ALL IB_API asset-list state, a killed earlier
+run's leftovers of any of the three files included, so a leftover can never be a base or an open request here.
+Clearing the export test's 1996 rows only ever removes rows its own run has finished with or abandoned.
 """
 
 import asyncio
@@ -117,7 +121,8 @@ class Created:
 @pytest.fixture
 def created(pg_engine: Engine) -> Iterator[Created]:
     with pg_engine.begin() as conn:
-        # Leftovers of a killed earlier run of this file: SOURCE's asset-list state belongs to this file alone.
+        # Leftovers of a killed earlier run (of this file, test_asset_snapshot_schedule_pg.py or
+        # test_dev_seed_export_pg.py, the other two IB_API writers; see ISOLATION): all of SOURCE's asset-list state.
         mine = sa.select(SNAPSHOTS.c.id).where(SNAPSHOTS.c.source == SOURCE)
         conn.execute(sa.delete(EVENTS).where(EVENTS.c.snapshot_id.in_(mine)))
         conn.execute(sa.delete(ROWS).where(ROWS.c.snapshot_id.in_(mine)))

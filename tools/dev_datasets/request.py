@@ -3,16 +3,31 @@
 Run from the repo root, in the agent container, against a DEV or TEST stack only (the venv synced through make,
 for example .venv-devcontainer/bin/python):
 
-    .venv-devcontainer/bin/python -m tools.dev_datasets.request [seed|reset|reads|degrade|repair|check]
-        [--yes-reset|--no-reset] [--dry-run] [--date YYYY-MM-DD]
+    .venv-devcontainer/bin/python -m tools.dev_datasets.request [seed|reset|reads|degrade|repair|export|load|check]
+        [--yes-reset|--no-reset] [--dry-run] [--date YYYY-MM-DD] [--seed DIR]
 
 SEEDING ALWAYS STARTS CLEAN (owner ruling 2026-10-20). seed is a reset, then the plan. The reset empties exactly
-seven store tables in ONE transaction (RESET_TABLES) and nothing else: never alembic_version, no other table, no DDL.
+eighteen store tables in ONE transaction (RESET_TABLES) and nothing else: never alembic_version, no other table, no DDL.
+It also refuses while a RUNNING ingest run or a PENDING or QUEUED ingest request is in flight.
+ON THE DEV LABEL THE RESET KEEPS A SEED (decision tj-7zjov1.291 D1): in that same transaction, under the lock, it exports
+the trimmed rows (dev_seed.py), TRUNCATEs the eighteen, reloads the files, resets the serial sequence and recounts against
+the manifest; any failure rolls back and leaves the export on disk. On the test label it is the plain wipe, no export.
 --yes-reset is REQUIRED to reset; without it seed and reset print the counts they would remove, change nothing and
 exit 1. --no-reset skips the reset (incremental use). The two audit tables are append-only by CONVENTION only; the
 reset is a deliberate environment reset and is not recorded anywhere.
 
-THE RAIL. Every mode that writes (seed, reset, reads, degrade, repair) first asks GET /ui/v1/config and refuses
+EXPORT writes no table. It reads the trimmed, non-reproducible state into output/dev_seed/<revision>/<UTC stamp>/ (see
+dev_seed.py: one read-only transaction, 0600 files outside version control, a manifest keyed to the migration
+revision). It needs no --yes-reset; --dry-run prints the per-table row counts and byte estimates and writes nothing.
+An export refused because the database is not at the checkout's migration head exits 3; any other failure exits 1.
+
+LOAD --seed DIR puts a seed back into a database whose eighteen tables are empty, in one transaction (see dev_seed.load_seed).
+DIR is a stamp directory, or a revision directory for its newest complete stamp. It refuses, naming the seed, database and
+checkout revisions and exiting 3, unless all three are the same and every column fingerprint matches (a stale seed: migrate
+first, then reset, which exports a fresh one); it verifies every file's sha256 before the first write. It needs no
+--yes-reset (it removes nothing); --dry-run verifies the files and prints the counts, with no rail and no database.
+
+THE RAIL. Every mode that writes or exports (seed, reset, reads, degrade, repair, export, load) first asks GET /ui/v1/config and refuses
 unless deploymentLabel is 'dev' or 'test'. A prod stack answers an empty label and is refused before any SQL or
 request. The label also picks the backend, from the one plan: dev is real Alpaca bars under SPY, QQQ and DIA; test is
 the fake broker under ZZDS-prefixed synthetic symbols, so the public repo never shows fake prices under a real ticker.
@@ -58,6 +73,8 @@ from pathlib import Path
 from time import sleep as real_sleep
 from typing import Any, Final
 from zoneinfo import ZoneInfo
+
+from tools.dev_datasets import dev_seed
 
 
 PLAN_PATH: Final = Path(__file__).with_name('plan.json')
@@ -141,47 +158,98 @@ DELETE_SQL: Final = (
 )
 
 
-# THE RESET. Exactly these seven tables, in this order, and no others. The order is documentation, not a need:
-# one TRUNCATE names them all, and the only foreign key among them (stock_market_activity.dataset_id ->
-# store_dataset_entry.id) has both ends in the statement, so no CASCADE is used and nothing outside the list can be
-# reached. alembic_version is never in it. Written out in full, never assembled from the names.
+# THE RESET. Exactly these eighteen tables, in this order, and no others. The order is documentation, not a need:
+# one TRUNCATE names them all, and the seven foreign keys among them have both ends in the statement, so no CASCADE is
+# used and nothing outside the list can be reached. The seven: stock_market_activity.dataset_id ->
+# store_dataset_entry.id (ON DELETE CASCADE), and six panel keys with no ON DELETE rule: panel_settings_version ->
+# panel, panel_pass -> panel, panel_pass -> panel_settings_version, panel_pass -> panel_source_settings_version,
+# panel_member_transition -> panel, panel_member_transition -> panel_pass. alembic_version is never in it. Written out
+# in full, never assembled from the names.
 RESET_TABLES: Final = (
     'stock_market_activity',
     'store_dataset_entry',
     'ingest_run',
+    'ingest_request',
+    'ingest_instance',
     'dataset_read',
     'dataset_read_daily',
     'dataset_override_log',
     'dataset_deletion',
+    'asset_list_snapshot',
+    'asset_list_row',
+    'asset_list_event',
+    'corporate_action',
+    'panel',
+    'panel_settings_version',
+    'panel_source_settings_version',
+    'panel_pass',
+    'panel_member_transition',
 )
 COUNT_SQL: Final = {
     'stock_market_activity': 'SELECT count(*) FROM stock_market_activity',
     'store_dataset_entry': 'SELECT count(*) FROM store_dataset_entry',
     'ingest_run': 'SELECT count(*) FROM ingest_run',
+    'ingest_request': 'SELECT count(*) FROM ingest_request',
+    'ingest_instance': 'SELECT count(*) FROM ingest_instance',
     'dataset_read': 'SELECT count(*) FROM dataset_read',
     'dataset_read_daily': 'SELECT count(*) FROM dataset_read_daily',
     'dataset_override_log': 'SELECT count(*) FROM dataset_override_log',
     'dataset_deletion': 'SELECT count(*) FROM dataset_deletion',
+    'asset_list_snapshot': 'SELECT count(*) FROM asset_list_snapshot',
+    'asset_list_row': 'SELECT count(*) FROM asset_list_row',
+    'asset_list_event': 'SELECT count(*) FROM asset_list_event',
+    'corporate_action': 'SELECT count(*) FROM corporate_action',
+    'panel': 'SELECT count(*) FROM panel',
+    'panel_settings_version': 'SELECT count(*) FROM panel_settings_version',
+    'panel_source_settings_version': 'SELECT count(*) FROM panel_source_settings_version',
+    # (B105 is bandit reading the key 'panel_pass' as a password; it is a table name.)
+    'panel_pass': 'SELECT count(*) FROM panel_pass',  # nosec B105
+    'panel_member_transition': 'SELECT count(*) FROM panel_member_transition',
 }
 RESET_SQL: Final = (
-    'TRUNCATE TABLE stock_market_activity, store_dataset_entry, ingest_run, dataset_read, dataset_read_daily, '
-    'dataset_override_log, dataset_deletion RESTART IDENTITY'
+    'TRUNCATE TABLE stock_market_activity, store_dataset_entry, ingest_run, ingest_request, '
+    'ingest_instance, dataset_read, dataset_read_daily, dataset_override_log, dataset_deletion, '
+    'asset_list_snapshot, asset_list_row, asset_list_event, corporate_action, panel, '
+    'panel_settings_version, panel_source_settings_version, panel_pass, '
+    'panel_member_transition RESTART IDENTITY'
 )
 # A TRUNCATE waits for every lock on the tables; fail fast instead of hanging behind a long reader.
 LOCK_TIMEOUT_SQL: Final = "SET LOCAL lock_timeout = '10s'"
+# Taken BEFORE the RUNNING count, so no fetch can start between the count and the TRUNCATE: a run needs a lock on
+# these tables to begin, and waits behind this one until the transaction ends.
+LOCK_SQL: Final = (
+    'LOCK TABLE stock_market_activity, store_dataset_entry, ingest_run, ingest_request, ingest_instance, '
+    'dataset_read, dataset_read_daily, dataset_override_log, dataset_deletion, asset_list_snapshot, '
+    'asset_list_row, asset_list_event, corporate_action, panel, panel_settings_version, '
+    'panel_source_settings_version, panel_pass, panel_member_transition IN ACCESS EXCLUSIVE MODE'
+)
 RUNNING_RUNS_SQL: Final = "SELECT count(*) FROM ingest_run WHERE state = 'RUNNING'"
+# The requests ingest may still answer (PENDING) or deliver (QUEUED). NOT_DELIVERED and every finished state do not
+# block the reset: they are emptied with the table.
+OPEN_REQUESTS_SQL: Final = "SELECT count(*) FROM ingest_request WHERE state IN ('PENDING', 'QUEUED')"
 # The store flushes buffered dataset reads every USAGE_FLUSH_INTERVAL_SECONDS (default 5; server/data/store/app/
 # usage_recorder.py). After the reset commits, wait two intervals so a read buffered before it has been flushed (and
 # so would show), then recount. A named constant: the stack's own setting is not visible from the generator.
-# THIS MIRRORS DEFAULT_FLUSH_INTERVAL_SECONDS in server/data/store/app/usage_recorder.py (line 62) and MUST BE KEPT
-# IN STEP with it by hand: nothing checks it, and a stack run with USAGE_FLUSH_INTERVAL_SECONDS set differs.
+# THIS MIRRORS DEFAULT_FLUSH_INTERVAL_SECONDS in server/data/store/app/usage_recorder.py and is kept in step by
+# hand: test_reset checks the constant against that file, but a stack run with USAGE_FLUSH_INTERVAL_SECONDS set
+# differs and nothing detects it.
 USAGE_FLUSH_INTERVAL_SECONDS: Final = 5
 QUIESCE_WAIT_SECONDS: Final = 2 * USAGE_FLUSH_INTERVAL_SECONDS
+# The exit status of an export refused for its revision, as the seed producer's EXIT_REFUSED (decision tj-7zjov1.291 D3).
+EXIT_REFUSED: Final = 3
 NOT_CLEAN_MESSAGE: Final = 'NOT CLEAN: work in flight wrote after the reset; rerun reset on a quiet stack'
 
 
 class DevDatasetsError(Exception):
     """A refusal or a stop. The message is written for the operator and never holds a secret."""
+
+
+class RevisionRefused(DevDatasetsError):
+    """A refusal that changed nothing: run() exits EXIT_REFUSED (3).
+
+    Raised by an export or a dev reset when the database revision is not the checkout head, and by a load when the seed,
+    the database and the checkout are not at one revision, or the seed's stack is not the target's.
+    """
 
 
 class Secret:
@@ -368,6 +436,8 @@ def _parse_row(raw: Mapping[str, Any]) -> PlanRow:
     else:
         _require(raw['end'] is not None, row_id, 'a STATIC row needs an end')
     if 'collect' in raw:
+        # STREAM is refused by the plan and at create by the store, so DAILY is today's whole of 'DAILY or STREAM'.
+        # Widen this check if the plan ever admits STREAM.
         _require(isinstance(raw['collect'], bool), row_id, 'collect is a boolean when present')
         _require(raw['update_type'] == 'DAILY', row_id, 'collect is for a subscription: the store refuses it on STATIC')
     degrade = None
@@ -841,7 +911,7 @@ def _show_counts(out: Reporter, heading: str, counts: Mapping[str, int]) -> None
 
 
 def count_reset_rows(connect: Callable[[], Any]) -> dict[str, int]:
-    """Row counts of the seven reset tables, read only. Writes nothing.
+    """Row counts of the eighteen reset tables, read only. Writes nothing.
 
     Raises:
         DevDatasetsError: On a database failure (reported by type name only).
@@ -857,13 +927,13 @@ def count_reset_rows(connect: Callable[[], Any]) -> dict[str, int]:
         connection.close()
 
 
-def _recount_after(connect: Callable[[], Any]) -> tuple[int, int]:
-    """(ingest_run rows, dataset_read rows) now, read only, on a fresh connection."""
+def _recount_after(connect: Callable[[], Any]) -> dict[str, int]:
+    """Row counts of all eighteen reset tables now, read only, on a fresh connection, under the lock timeout."""
     connection = _open(connect)
     try:
         with connection.cursor() as cursor:
-            counts = _count_rows(cursor)
-        return counts['ingest_run'], counts['dataset_read']
+            cursor.execute(LOCK_TIMEOUT_SQL)
+            return _count_rows(cursor)
     except Exception as exc:
         raise DevDatasetsError(f'the post-reset recount failed ({type(exc).__name__})') from None
     finally:
@@ -871,57 +941,267 @@ def _recount_after(connect: Callable[[], Any]) -> tuple[int, int]:
         connection.close()
 
 
-def run_reset(connect: Callable[[], Any], out: Reporter, sleep: Callable[[float], object] = real_sleep) -> None:
-    """Empty exactly the seven RESET_TABLES in ONE transaction. The caller has checked the rail and --yes-reset.
+def _seed_failure(exc: dev_seed.DevSeedError) -> DevDatasetsError:
+    """The tool's error for the seed module's: a revision or layout refusal keeps its exit status (3)."""
+    return RevisionRefused(str(exc)) if isinstance(exc, dev_seed.DevSeedRefused) else DevDatasetsError(str(exc))
 
-    Refuses, changing nothing, while any ingest_run row is RUNNING (counted in the same transaction, before the
-    TRUNCATE). The counts before are printed first; the counts after are read inside the same transaction and printed
-    once it has committed. Then it waits QUIESCE_WAIT_SECONDS (two usage flush intervals) and recounts ingest_run and
-    dataset_read: any row means work in flight wrote after the reset (NOT CLEAN). The guarantee is clean at commit,
-    verified after one flush interval. Any failure rolls the whole transaction back, so nothing is half-removed.
-    alembic_version, every other table and the schema are not touched. This is a deliberate environment reset and is
-    not recorded anywhere (the audit tables are append-only by convention only; nothing in the database stops this).
+
+def _wipe_and_reload(cursor: Any, label: str, moment: datetime, seed_root: Path, out: Reporter) -> dict[str, int]:
+    """The dev reset's middle, inside the locked transaction (decision tj-7zjov1.291 D1): export, verify, wipe, reload.
+
+    The trimmed seed is written to disk first, from the locked tables, and its files are verified against the manifest
+    before the TRUNCATE; the files stay on disk whatever happens after. Then ONE TRUNCATE ... RESTART IDENTITY, the COPY
+    of each file back in (parents first) and the serial sequence reset to max(id).
+
+    Returns:
+        dict[str, int]: The row count of each table the manifest says the reload must leave.
 
     Raises:
-        DevDatasetsError: On a database failure (reported by type name only), a RUNNING run, or NOT CLEAN.
+        dev_seed.DevSeedRefused: When the database is not at the checkout head. Nothing was written.
+        dev_seed.DevSeedError: When a file fails verification or a COPY.
     """
+    head = dev_seed.head_revision()
+    dev_seed.session_settings(cursor)
+    directory, _, tables = dev_seed.write_seed(cursor, label, dev_seed.cutoffs_for(moment), head, seed_root, out.line)
+    dev_seed.verify_files(directory, tables)
+    dev_seed.prune_quietly(directory.parent, dev_seed.KEEP_SEEDS, out.line)
+    out.line(f'reset: the seed is on disk ({directory}); wiping and reloading it in this transaction')
+    cursor.execute(RESET_SQL)
+    dev_seed.reload_seed(cursor, directory, tables, out.line)
+    return {table: int(tables[table]['rows']) for table in RESET_TABLES}
+
+
+def run_reset(
+    connect: Callable[[], Any],
+    out: Reporter,
+    sleep: Callable[[float], object] = real_sleep,
+    *,
+    label: str | None = None,
+    moment: datetime | None = None,
+    seed_root: Path = dev_seed.SEED_ROOT,
+) -> None:
+    """Empty the eighteen RESET_TABLES in ONE transaction, keeping the dev seed. The caller has checked the rail and --yes-reset.
+
+    Locks the eighteen tables first (ACCESS EXCLUSIVE), then refuses, changing nothing, while any ingest_run row is
+    RUNNING or any ingest_request row is PENDING or QUEUED (both counted in the same transaction, before the TRUNCATE;
+    the lock means no run can start in between; NOT_DELIVERED and finished requests do not block). The
+    counts before are printed first; the counts after are read inside the same transaction and printed once it has
+    committed.
+
+    On the dev label (decision tj-7zjov1.291 D1) the same transaction exports the trimmed seed under the lock, verifies
+    the files, TRUNCATEs, reloads the files, resets the serial sequence and recounts against the manifest; a count that
+    differs, or any failure, rolls everything back and leaves the export on disk. The transaction stays READ COMMITTED:
+    the lock is taken before the first read, so every statement sees every committed row and no writer can intervene,
+    whereas a REPEATABLE READ snapshot could predate the lock. On any other label (test) the reset is the plain wipe
+    and writes no seed.
+
+    Then it waits QUIESCE_WAIT_SECONDS (two usage flush intervals) and recounts all eighteen tables: any count other
+    than the one the reset left (0, or the manifest's) means work in flight wrote after the reset (NOT CLEAN). The
+    guarantee is clean at commit, verified after one flush interval. Any failure rolls the whole transaction back, so
+    nothing is half-removed. alembic_version, every other table and the schema are not touched. This is a deliberate
+    environment reset and is not recorded anywhere (the audit tables are append-only by convention only).
+
+    Args:
+        connect: Opens the database; every connection it returns has passed the database rail.
+        out: Where output goes.
+        sleep: The wait after the commit.
+        label: The rail label; DEV_LABEL keeps the seed, anything else is the plain wipe.
+        moment: The export instant (aware) on dev; now when None.
+        seed_root: Where the dev export is written.
+
+    Raises:
+        DevDatasetsError: On a database failure (reported by type name only), a RUNNING run or an open request, or NOT CLEAN.
+        RevisionRefused: On dev, when the database is not at the checkout head (migrate first); nothing was changed.
+    """
+    keep_seed = label == DEV_LABEL
+    expected = dict.fromkeys(RESET_TABLES, 0)
     connection = _open(connect)
     running = 0
+    open_requests = 0
     try:
         with connection.cursor() as cursor:
             cursor.execute(LOCK_TIMEOUT_SQL)
+            cursor.execute(LOCK_SQL)
             cursor.execute(RUNNING_RUNS_SQL)
             running = int(cursor.fetchone()[0])
-            if running:
+            cursor.execute(OPEN_REQUESTS_SQL)
+            open_requests = int(cursor.fetchone()[0])
+            if running or open_requests:
                 connection.rollback()
             else:
                 before = _count_rows(cursor)
                 _show_counts(out, 'reset: rows before', before)
-                cursor.execute(RESET_SQL)
+                if keep_seed:
+                    expected = _wipe_and_reload(cursor, label, moment or datetime.now(UTC), seed_root, out)
+                else:
+                    cursor.execute(RESET_SQL)
                 after = _count_rows(cursor)
-        if not running:
+                if keep_seed and after != expected:
+                    detail = ', '.join(
+                        f'{table} {after[table]} expected {expected[table]}'
+                        for table in RESET_TABLES
+                        if after[table] != expected[table]
+                    )
+                    raise DevDatasetsError(
+                        f'the reload did not restore the manifest counts ({detail}); rolled back, the export is on disk'
+                    )
+        if not (running or open_requests):
             connection.commit()
+    except DevDatasetsError:
+        connection.rollback()
+        raise
+    except dev_seed.DevSeedError as exc:
+        connection.rollback()
+        raise _seed_failure(exc) from None
     except Exception as exc:
         connection.rollback()
         raise DevDatasetsError(f'the reset transaction failed and was rolled back ({type(exc).__name__})') from None
     finally:
         connection.close()
-    if running:
+    if running or open_requests:
         raise DevDatasetsError(
-            f'refused: {running} ingest run(s) are RUNNING; nothing was changed. Wait for them, then reset a quiet stack'
+            f'refused: {running} ingest run(s) are RUNNING and {open_requests} ingest request(s) are PENDING or QUEUED; '
+            'nothing was changed. Wait for them, or restart data_ingest so its queued work is marked NOT_DELIVERED, '
+            'then reset a quiet stack'
         )
     _show_counts(out, 'reset: rows after', after)
     out.line(f'reset: waiting {QUIESCE_WAIT_SECONDS}s (two usage flush intervals) to verify the stack stayed quiet')
     sleep(QUIESCE_WAIT_SECONDS)
-    runs, reads = _recount_after(connect)
-    if runs or reads:
-        raise DevDatasetsError(f'{NOT_CLEAN_MESSAGE} (ingest_run {runs}, dataset_read {reads})')
-    out.line('reset: verified clean (ingest_run 0, dataset_read 0)')
+    recount = _recount_after(connect)
+    dirty = {table: count for table, count in recount.items() if count != expected[table]}
+    if dirty:
+        detail = ', '.join(
+            f'{table} {count}' + (f' expected {expected[table]}' if keep_seed else '') for table, count in dirty.items()
+        )
+        raise DevDatasetsError(f'{NOT_CLEAN_MESSAGE} ({detail})')
+    if keep_seed:
+        out.line(f'reset: verified clean (all eighteen tables as loaded, {sum(expected.values())} rows in all)')
+    else:
+        out.line('reset: verified clean (all eighteen tables 0)')
 
 
-def explain_reset(counts: Mapping[str, int], out: Reporter) -> None:
-    """What a reset would remove: the counts, the tables, and what stays."""
+def run_export(
+    env: Environment,
+    client: HttpClient,
+    connect: Callable[[], Any] | None,
+    moment: datetime,
+    *,
+    dry: bool,
+    seed_root: Path,
+    out: Reporter,
+) -> None:
+    """Export mode, after the credential check: the rail, then the read-only export (or its dry run).
+
+    A dry run with no usable database password says so and stops after the rail, as the reset's dry run does.
+
+    Raises:
+        DevDatasetsError: On a refused rail, a revision that is not the checkout head, or a failure of the export.
+    """
+    label = check_rail(client, out)
+    if dry and credential_state(env.db_password) != 'set':
+        out.line('export counts unavailable: the database password is not set')
+        return
+    connection = _open(checked_connect(connect or (lambda: _connect(env)), label))
+    try:
+        if dry:
+            dev_seed.estimate_seed(connection, moment, out.line)
+        else:
+            dev_seed.export_seed(connection, label, moment, out.line, root=seed_root)
+    except dev_seed.DevSeedRefused as exc:
+        raise RevisionRefused(str(exc)) from None
+    except dev_seed.DevSeedError as exc:
+        raise DevDatasetsError(str(exc)) from None
+    finally:
+        connection.close()
+
+
+def _read_seed(seed: Path) -> tuple[Path, dict[str, Any]]:
+    """The stamp directory and manifest a load reads. The seed path is a stamp, or a revision directory (newest complete)."""
+    try:
+        directory = dev_seed.resolve_seed(seed)
+        return directory, dev_seed.read_manifest(directory)
+    except dev_seed.DevSeedError as exc:
+        raise DevDatasetsError(str(exc)) from None
+
+
+def run_load(
+    env: Environment, client: HttpClient, connect: Callable[[], Any] | None, seed: Path, *, dry: bool, out: Reporter
+) -> None:
+    """Load mode: put a dev seed into EMPTY tables in one transaction (decision tj-7zjov1.291 D1 and D3).
+
+    After the rail, one transaction locks the eighteen tables and loads (dev_seed.load_seed: all three revisions equal,
+    every column fingerprint equal, the tables empty, every file verified by sha256 before the first COPY), recounts
+    against the manifest and commits. Any failure rolls back. It needs no --yes-reset: it fills empty tables and removes
+    nothing. A dry run reads only the files (no rail, no database): it verifies them and prints the revisions and counts.
+
+    Raises:
+        RevisionRefused: When the seed is stale, the column layout moved, or the seed was exported from the other
+            stack than the target (exit 3); nothing was written, and the stack check runs before any lock.
+        DevDatasetsError: On a refused rail, a seed that cannot be read or fails its checks, tables that hold rows, a
+            recount that differs from the manifest, or a database failure (type name only).
+    """
+    if dry:
+        directory, manifest = _read_seed(seed)
+        try:
+            dev_seed.verify_files(directory, manifest['tables'])
+            head = dev_seed.head_revision()
+        except dev_seed.DevSeedError as exc:
+            raise DevDatasetsError(str(exc)) from None
+        out.line(f'load dry run: nothing is written; seed {directory.name} files verified')
+        out.line(f'  seed revision {manifest["revision"]}, checkout head {head}')
+        out.line(f'  seed stack {manifest["stack"]}')
+        for table in RESET_TABLES:
+            out.line(f'  {table}: {manifest["tables"][table]["rows"]}')
+        if manifest['revision'] != head:
+            out.line('this seed is stale: a load would be refused (exit 3). Migrate, then reset to export a fresh one')
+        return
+    label = check_rail(client, out)
+    directory, manifest = _read_seed(seed)
+    expected = {table: int(manifest['tables'][table]['rows']) for table in RESET_TABLES}
+    connection = _open(checked_connect(connect or (lambda: _connect(env)), label))
+    try:
+        if manifest['stack'] != label:
+            raise RevisionRefused(
+                f"refused: this seed was exported from the '{manifest['stack']}' stack and the target is the "
+                f"'{label}' stack; nothing was written"
+            )
+        with connection.cursor() as cursor:
+            cursor.execute(LOCK_TIMEOUT_SQL)
+            cursor.execute(LOCK_SQL)
+            dev_seed.session_settings(cursor)
+            dev_seed.load_seed(cursor, directory, manifest, dev_seed.head_revision(), _count_rows, out.line)
+            after = _count_rows(cursor)
+            if after != expected:
+                detail = ', '.join(
+                    f'{table} {after[table]} expected {expected[table]}'
+                    for table in RESET_TABLES
+                    if after[table] != expected[table]
+                )
+                raise DevDatasetsError(f'the load did not restore the manifest counts ({detail}); rolled back')
+        connection.commit()
+    except DevDatasetsError:
+        connection.rollback()
+        raise
+    except dev_seed.DevSeedError as exc:
+        connection.rollback()
+        raise _seed_failure(exc) from None
+    except Exception as exc:
+        connection.rollback()
+        raise DevDatasetsError(f'the load transaction failed and was rolled back ({type(exc).__name__})') from None
+    finally:
+        connection.close()
+    _show_counts(out, 'load: rows after', after)
+    out.line(f'load: committed from {directory}')
+
+
+def explain_reset(counts: Mapping[str, int], out: Reporter, *, keeps_seed: bool = False) -> None:
+    """What a reset would remove: the counts, the tables, and what stays (on dev, the trimmed seed that is reloaded)."""
     _show_counts(out, 'a reset would remove these rows', counts)
+    if keeps_seed:
+        out.line(
+            f'kept: the trimmed seed (the last {dev_seed.CUTOFF_DAYS} days, see export --dry-run for its size) is exported '
+            'and reloaded in the same transaction'
+        )
     out.line('kept: alembic_version, the schema and every other table')
 
 
@@ -954,11 +1234,12 @@ def _dry_run_reset(
     today: date,
     open_db: Callable[[], Any],
     out: Reporter,
+    label: str,
 ) -> int:
     """A dry run of seed or reset, after the rail: the counts a reset would remove (read only) and the bodies."""
     out.line(f'dry run: {mode} would reset first; nothing is changed')
     if credential_state(env.db_password) == 'set':
-        explain_reset(count_reset_rows(open_db), out)
+        explain_reset(count_reset_rows(open_db), out, keeps_seed=label == DEV_LABEL)
     else:
         out.line('reset counts unavailable: the database password is not set')
     if mode == 'seed':
@@ -982,15 +1263,19 @@ def run_check(env: Environment, http: HttpClient | None, out: Reporter) -> None:
 def parse_arguments(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog='python -m tools.dev_datasets.request', description=__doc__.split('\n\n')[0])
     parser.add_argument(
-        'mode', nargs='?', choices=['seed', 'reset', 'reads', 'degrade', 'repair', 'check'], default=None
+        'mode',
+        nargs='?',
+        choices=['seed', 'reset', 'reads', 'degrade', 'repair', 'export', 'load', 'check'],
+        default=None,
     )
-    for name in ('reset', 'reads', 'degrade', 'repair', 'check'):
+    for name in ('reset', 'reads', 'degrade', 'repair', 'export', 'load', 'check'):
         parser.add_argument(f'--{name}', dest='flag_mode', action='append_const', const=name, help=f'same as {name}')
     parser.add_argument('--yes-reset', action='store_true', help='REQUIRED to reset: without it nothing is changed')
     parser.add_argument('--no-reset', action='store_true', help='seed without the reset (incremental use)')
     parser.add_argument('--dry-run', action='store_true', help='print what would be sent or deleted; change nothing')
     parser.add_argument('--date', help='D, the run date (YYYY-MM-DD); default today in UTC')
     parser.add_argument('--row', action='append', default=[], help='limit to a plan row id; repeatable')
+    parser.add_argument('--seed', help='load only: the seed directory (a stamp, or a revision directory)')
     return parser.parse_args(argv)
 
 
@@ -1009,6 +1294,12 @@ def _usage_error(arguments: argparse.Namespace, mode: str) -> str | None:
         return '--no-reset only means something for seed'
     if arguments.yes_reset and mode not in ('seed', 'reset'):
         return '--yes-reset only means something for seed and reset'
+    if arguments.row and mode in ('export', 'load'):
+        return f'--row does not limit {"an" if mode == "export" else "a"} {mode}'
+    if mode == 'load' and not arguments.seed:
+        return 'load needs --seed DIR (a stamp directory, or a revision directory for its newest complete stamp)'
+    if arguments.seed and mode != 'load':
+        return '--seed only means something for load'
     return None
 
 
@@ -1021,7 +1312,7 @@ def _check_credentials(env: Environment, mode: str, resets: bool) -> None:
         )
     if mode in ('seed', 'repair') and not env.secret:
         raise DevDatasetsError(f'{SECRET_VAR} is empty')
-    if (mode in ('degrade', 'reset') or resets) and not env.db_password:
+    if (mode in ('degrade', 'reset', 'export', 'load') or resets) and not env.db_password:
         raise DevDatasetsError(f'{DB_PASSWORD_VAR} is empty')
 
 
@@ -1035,11 +1326,16 @@ def run(
     now: datetime | None = None,
     sleep: Callable[[float], object] = real_sleep,
     plan_path: Path = PLAN_PATH,
+    seed_root: Path = dev_seed.SEED_ROOT,
 ) -> int:
-    """Run one mode. Returns the exit status: 0 done, 1 refused or stopped, 2 a usage error.
+    """Run one mode. Returns the exit status: 0 done, 1 refused or stopped, 2 a usage error, 3 a revision refusal.
 
-    seed resets first (RESET_TABLES, one transaction) and then loads the plan, unless --no-reset. A reset needs
-    --yes-reset: without it the counts that would go are printed, nothing changes and the status is 1.
+    Status 3 is an export, a dev reset or a load refused because the database revision is not the checkout head (or, for
+    a load, because the seed's revision or a column layout differs).
+
+    seed resets first (RESET_TABLES, one transaction; on dev it keeps the trimmed seed) and then loads the plan, unless
+    --no-reset. A reset needs --yes-reset: without it the counts that would go are printed, nothing changes and the
+    status is 1. load --seed DIR puts a seed into empty tables.
 
     Args:
         argv: The command line after the program name.
@@ -1051,6 +1347,7 @@ def run(
         now: The clock; the real one when None.
         sleep: The wait after a reset (QUIESCE_WAIT_SECONDS); the real one by default.
         plan_path: The plan file.
+        seed_root: Where an export writes (output/dev_seed by default).
 
     Returns:
         int: The exit status.
@@ -1072,6 +1369,26 @@ def run(
         except ValueError:
             out.line('--date must be YYYY-MM-DD')
             return 2
+        if mode == 'export':
+            if not arguments.dry_run:
+                _check_credentials(env, mode, False)
+            run_export(
+                env,
+                http or HttpClient(env.store_url),
+                connect,
+                moment,
+                dry=arguments.dry_run,
+                seed_root=seed_root,
+                out=out,
+            )
+            return 0
+        if mode == 'load':
+            if not arguments.dry_run:
+                _check_credentials(env, mode, False)
+            run_load(
+                env, http or HttpClient(env.store_url), connect, Path(arguments.seed), dry=arguments.dry_run, out=out
+            )
+            return 0
         rows = select_rows(load_plan(plan_path), arguments.row)
         if mode == 'check':
             run_check(env, None if arguments.dry_run else http or HttpClient(env.store_url), out)
@@ -1091,13 +1408,13 @@ def run(
         open_db = checked_connect(connect or (lambda: _connect(env)), label)
         if resets:
             if arguments.dry_run:
-                return _dry_run_reset(env, mode, rows, bodies, today, open_db, out)
+                return _dry_run_reset(env, mode, rows, bodies, today, open_db, out, label)
             if not arguments.yes_reset:
-                explain_reset(count_reset_rows(open_db), out)
+                explain_reset(count_reset_rows(open_db), out, keeps_seed=label == DEV_LABEL)
                 hint = ' or --no-reset to keep the data' if mode == 'seed' else ''
                 out.line(f'refused: nothing was changed. {mode} resets first; pass --yes-reset to confirm{hint}')
                 return 1
-            run_reset(open_db, out, sleep)
+            run_reset(open_db, out, sleep, label=label, moment=moment, seed_root=seed_root)
         if mode == 'seed':
             run_seed(client, env, rows, bodies, out)
         elif mode == 'repair':
@@ -1107,6 +1424,9 @@ def run(
         elif mode == 'degrade':
             run_degrade(open_db, rows, today, out)
         return 0
+    except RevisionRefused as exc:
+        out.line(str(exc))
+        return EXIT_REFUSED
     except DevDatasetsError as exc:
         out.line(str(exc))
         return 1
