@@ -3364,6 +3364,12 @@ STACK_ALONE_SUBCOMMANDS = frozenset({'exec', 'logs', 'ps', 'down'})
 # The steps that may, and must, carry SYSTEM_TEST_DISPOSABLE_DB=1: each runs a make target behind the
 # disposable-database guard (test-system, system-launch, seed-dump), and nothing else may inherit it.
 ATTESTING_STEPS = frozenset({SYSTEM_TESTS_STEP, START_STEP, SEED_DUMP_STEP})
+# THE MIGRATION GATE (bead tj-7zjov1.10): its own job, on its own test stack, with the same rule. Start
+# System runs make system-launch and the seed upgrade runs make test-system, both behind the guard, so
+# those two steps carry it; the from-empty step runs make migrate, which is not behind the guard and
+# must not inherit it.
+MIGRATION_JOB_NAME = 'Migration Gate'
+MIGRATION_ATTESTING_STEPS = frozenset({START_STEP, 'Upgrade The Previous Release Seed'})
 # Steps that must reach the stack, so an empty compose-invocation list cannot pass the file check.
 SYSTEM_JOB_COMPOSE_STEPS = (
     START_STEP,
@@ -4083,11 +4089,27 @@ def test_only_the_guarded_target_steps_attest_a_disposable_database():
     test_seed_dump_make.py), so Start System and Seed Dump carry it too. The property is unchanged:
     STEP-level only, on exactly the steps that run a guarded target -- ATTESTING_STEPS -- and never
     on the job, the workflow, another step, a run line or a `with:`.
+
+    tj-7zjov1.10: the Migration Gate job runs two guarded targets of its own (make system-launch and
+    make test-system), so MIGRATION_ATTESTING_STEPS is the same rule applied to that job.
     """
     for name in sorted(ATTESTING_STEPS):
         step = _system_step(name)
         assert str((step.get('env') or {}).get(SYSTEM_GUARD)) == '1', (
             f'{name} does not set {SYSTEM_GUARD}=1 in its env: {step.get("env")}'
+        )
+    # bead tj-7zjov1.10: the Migration Gate's two guarded-target steps, each exactly once.
+    migration_jobs = [
+        job
+        for job in ((_load_yaml(TESTING_WORKFLOW) or {}).get('jobs') or {}).values()
+        if (job or {}).get('name') == MIGRATION_JOB_NAME
+    ]
+    assert len(migration_jobs) == 1, f'expected one {MIGRATION_JOB_NAME!r} job, found {len(migration_jobs)}'
+    for name in sorted(MIGRATION_ATTESTING_STEPS):
+        matches = [step for step in migration_jobs[0].get('steps') or [] if step.get('name') == name]
+        assert len(matches) == 1, f'expected one {name!r} step in {MIGRATION_JOB_NAME}, found {len(matches)}'
+        assert str((matches[0].get('env') or {}).get(SYSTEM_GUARD)) == '1', (
+            f'{MIGRATION_JOB_NAME} / {name} does not set {SYSTEM_GUARD}=1 in its env: {matches[0].get("env")}'
         )
     elsewhere = []
     for path in _workflow_files():
@@ -4099,10 +4121,10 @@ def test_only_the_guarded_target_steps_attest_a_disposable_database():
                 elsewhere.append(f'{path.name} {job_id} env')
             for other in (job or {}).get('steps') or []:
                 where = f'{path.name} {job_id} / {other.get("name")}'
-                is_attesting_step = (
-                    path == TESTING_WORKFLOW
-                    and (job or {}).get('name') == SYSTEM_JOB_NAME
-                    and other.get('name') in ATTESTING_STEPS
+                job_name = (job or {}).get('name')
+                is_attesting_step = path == TESTING_WORKFLOW and (
+                    (job_name == SYSTEM_JOB_NAME and other.get('name') in ATTESTING_STEPS)
+                    or (job_name == MIGRATION_JOB_NAME and other.get('name') in MIGRATION_ATTESTING_STEPS)
                 )
                 if not is_attesting_step and SYSTEM_GUARD in (other.get('env') or {}):
                     elsewhere.append(f'{where} env')

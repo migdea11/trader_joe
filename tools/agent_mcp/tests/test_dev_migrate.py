@@ -106,16 +106,21 @@ MODES = ('DEV', 'TEST')
 LINES = {'DEV': DEV_LINE, 'TEST': TEST_LINE}
 
 # The selection line each result starts with (owner ruling: 'prints which one it used', as make migrate does).
+# Re-pinned for bead tj-7zjov1.10: the revisions ship in the data_store image of the mode, so the line names
+# the image, never the root checkout (no compose file mounts them any more).
 SELECTION = {
     'DEV': (
         'using the DEV definition (docker-compose.yaml + docker-compose.override.yaml) of project trader_joe_dev '
-        'in DEV mode (revisions from the root checkout)'
+        'in DEV mode (revisions from the :dev image)'
     ),
     'TEST': (
         'using the TEST definition (docker-compose.yaml + docker-compose.fake.yaml) of project trader_joe_dev '
-        'in TEST mode (the :test image; alembic.ini and revisions from the root checkout)'
+        'in TEST mode (the :test image; alembic.ini and revisions from that image)'
     ),
 }
+# D6's bind source of each mode, one the mode's files really mount (bead tj-7zjov1.10 dropped data_store's
+# alembic.ini and migrations from both lists): the store's code for DEV, the fakes for TEST.
+D6_SOURCE = {'DEV': 'server/data/store/app', 'TEST': 'tests/fakes'}
 NOTHING_UP = 'nothing is up: call up (your dev data) or test_up first'
 EMPTY_VERSIONS = f'no revision files in {VERSIONS}: wrong checkout?'
 # 183f296: the hint is mode-neutral (it used to say 'start the dev stack first', wrong under TEST).
@@ -207,6 +212,7 @@ class Responder:
     """The fake daemon of a migrate call: each step's answer is a field the test can change."""
 
     def __init__(self, mode: str = 'DEV') -> None:
+        self.mode = mode
         self.guard: tuple[int, bytes] = (0, LINES[mode])
         self.lookups: dict[str, tuple[int, bytes]] = {
             'postgres': (0, f'{POSTGRES_ID}\n'.encode()),
@@ -426,11 +432,14 @@ def _stale_fake_copy(rig: Rig, responder: Responder) -> None:
     path.write_bytes(path.read_bytes() + b'# drift\n')
 
 
-def _symlinked_migrations(rig: Rig, responder: Responder) -> None:
-    """The one-off mounts migrations/ itself: a symlink there is the D6 case that matters most, in both modes."""
-    repo = rig.layout.repo
-    shutil.move(str(repo / 'server' / 'data' / 'store' / 'migrations'), str(rig.layout.root / 'moved-migrations'))
-    (repo / 'server' / 'data' / 'store' / 'migrations').symlink_to(rig.layout.root / 'moved-migrations')
+def _symlinked_bind_source(rig: Rig, responder: Responder) -> None:
+    """A link planted at a bind source the mode's files mount (D6_SOURCE): refused before any container starts.
+
+    Retargeted for bead tj-7zjov1.10 from data_store's migrations, which no compose file mounts now.
+    """
+    source = rig.layout.repo / D6_SOURCE[responder.mode]
+    shutil.move(str(source), str(rig.layout.root / 'moved-source'))
+    source.symlink_to(rig.layout.root / 'moved-source', target_is_directory=True)
 
 
 def _env_file_a_symlink(rig: Rig, responder: Responder) -> None:
@@ -490,11 +499,7 @@ REFUSALS = {
     'dev and test together': (_mixed, MIXED_REFUSAL, 1),
     'the guard could not list': (_guard_failed, GUARD_FAILED, 1),
     'S6: a stale baked copy': (_stale_copy, None, 1),
-    'D6: a symlinked migrations bind source': (
-        _symlinked_migrations,
-        symlink_refusal('server/data/store/migrations', 'server/data/store/migrations'),
-        1,
-    ),
+    'D6: a symlinked bind source of the mode': (_symlinked_bind_source, None, 1),
     'D5: an env file that is a symlink': (_env_file_a_symlink, symlink_refusal('.env', '.env'), 1),
     'D5: an env file that is a directory': (
         _env_file_a_directory,
@@ -532,6 +537,8 @@ def test_each_refusal_runs_only_the_steps_before_it_no_alembic_and_charges_nothi
         assert result['message'].startswith('2 running postgres containers in the trader_joe_dev project'), result
     elif breaks is _missing_image:
         assert result['message'] == IMAGE_REFUSAL[mode], result
+    elif breaks is _symlinked_bind_source:
+        assert result['message'] == symlink_refusal(D6_SOURCE[mode], D6_SOURCE[mode]), result
     else:
         assert result['message'] == message, result
     host = rig.layout.repo_host_path
@@ -577,8 +584,8 @@ def test_d6_checks_the_bind_sources_of_the_mode_that_is_up(
 PAIRS = {
     'the guard before S6': (_prod, _stale_copy, 'project trader_joe_dev holds a container not started'),
     'empty before S6': (_empty, _stale_copy, NOTHING_UP),
-    'S6 before D6': (_stale_copy, _symlinked_migrations, STALE_PREFIX),
-    'D6 before D5': (_symlinked_migrations, _env_file_a_directory, 'a symlink at server/data/store/migrations'),
+    'S6 before D6': (_stale_copy, _symlinked_bind_source, STALE_PREFIX),
+    'D6 before D5': (_symlinked_bind_source, _env_file_a_directory, 'a symlink at '),
     'D5 before the versions guard': (_env_file_a_directory, _no_revision_files, 'is not a regular file'),
     'the versions guard before the lookups': (_no_revision_files, _no_postgres, 'no revision files'),
     'postgres before data_store': (_no_postgres, _two_data_store, 'no running postgres'),
@@ -1402,11 +1409,15 @@ def test_base_and_fake_carry_no_instance_secret_guard_and_the_web_files_do():
     assert '${INSTANCE_WRITE_SECRET:?' in (REPO_ROOT / 'docker-compose.web.yaml').read_text(encoding='utf-8')
 
 
-def test_the_fake_file_runs_data_store_on_the_test_image_and_the_base_binds_the_revisions():
+def test_the_fake_file_runs_data_store_on_the_test_image_and_nothing_binds_the_revisions():
+    """Re-pinned for bead tj-7zjov1.10: the revisions migrate's one-off applies are the :test image's own.
+
+    The base file bound ./server/data/store/{alembic.ini,migrations} over /code; now neither the base nor
+    the fake file gives data_store any volume, so nothing from the checkout can stand in for them.
+    """
     assert _services('docker-compose.fake.yaml')['data_store']['image'] == TEST_STORE_IMAGE
-    volumes = _services('docker-compose.yaml')['data_store']['volumes']
-    assert './server/data/store/migrations:/code/migrations' in volumes
-    assert './server/data/store/alembic.ini:/code/alembic.ini' in volumes
+    for name in TEST_FILES:
+        assert 'volumes' not in (_services(name).get('data_store') or {}), f'{name} gives data_store volumes'
 
 
 def test_the_extra_dev_files_change_nothing_the_data_store_one_off_runs():

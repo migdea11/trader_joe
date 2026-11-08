@@ -602,9 +602,10 @@ def _parsed_bind_sources(files: tuple[str, ...]) -> tuple[set[str], set[str]]:
     return relative, other
 
 
-# The in-repo binds of base + fake: data_store's two alembic binds (docker-compose.yaml l.86-87) and the
-# fakes (docker-compose.fake.yaml). The data dir is the residual D6 cannot see, as for dev.
-EXPECTED_TEST_BIND_SOURCES = {'server/data/store/alembic.ini', 'server/data/store/migrations', 'tests/fakes'}
+# The in-repo binds of base + fake: the fakes (docker-compose.fake.yaml) alone. data_store's two alembic
+# binds left docker-compose.yaml with bead tj-7zjov1.10, which COPYs the revisions into the image. The
+# data dir is the residual D6 cannot see, as for dev.
+EXPECTED_TEST_BIND_SOURCES = {'tests/fakes'}
 # Every compose file the dev and tools sets load (the D6 pin for DEV_BIND_SOURCES lives in test_dev_guards.py).
 DEV_AND_TOOLS_FILES = (
     'docker-compose.yaml',
@@ -642,16 +643,21 @@ def test_every_in_repo_bind_of_every_compose_file_the_lifecycle_loads_is_checked
     assert test_relative <= set(stack.TEST_BIND_SOURCES), sorted(test_relative - set(stack.TEST_BIND_SOURCES))
 
 
-@pytest.mark.parametrize('source', ['server/data/store/migrations', 'server/data/store/alembic.ini'])
-def test_a_symlinked_alembic_bind_source_refuses_test_up(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str):
-    """The daemon resolves data_store's alembic binds at every start: a link planted there must refuse, as up's does."""
+def test_a_symlink_above_the_fakes_bind_source_refuses_test_up(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The daemon resolves the fakes bind through every parent: a link planted at tests/ must refuse too.
+
+    Retargeted for bead tj-7zjov1.10: this pinned data_store's alembic.ini and migrations binds, which left
+    docker-compose.yaml when the revisions moved into the image. tests/fakes is the one test bind left; the
+    link at the leaf is UP_REFUSALS' case, so this one covers the parent component on the way to it.
+    """
     rig, _ = _rig(tmp_path, monkeypatch)
-    path = rig.layout.repo / source
-    moved = rig.layout.root / 'moved'
+    path = rig.layout.repo / 'tests'
+    moved = rig.layout.root / 'moved-tests'
     shutil.move(str(path), str(moved))
-    path.symlink_to(moved, target_is_directory=moved.is_dir())
+    path.symlink_to(moved, target_is_directory=True)
     result = rig.call('test_up', {})
-    assert result['status'] == 'refused' and result['message'] == symlink_refusal(source, source), result
+    assert result['status'] == 'refused', result
+    assert result['message'] == symlink_refusal('tests', 'tests/fakes'), result
     assert _argvs(rig) == [GUARD] and _charges_left(rig) == BUDGET
 
 

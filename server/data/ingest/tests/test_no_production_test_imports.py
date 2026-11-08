@@ -11,7 +11,7 @@ THE SCAN IS STATIC, over the source, not over sys.modules: an import that only r
 misses, and parsing finds it wherever it sits. Besides import statements, the scan reads a module
 name passed to importlib.import_module or __import__ as a string literal, or as the literal head of
 an f-string (scanned_imports). A name built from variables alone cannot be read statically and is
-not reported -- the limit of a static scan. The data_store guard and its bind-mounted migrations
+not reported -- the limit of a static scan. The data_store guard and its shipped-migrations
 scan read through the same helper, so R4 is enforced at one strength in every scan.
 
 SCOPE: every module under PRODUCTION_ROOTS, which mirror the source COPY lines of the Dockerfile's
@@ -42,7 +42,8 @@ image it guards -- the roots scanned are what the data_ingest image is built fro
 """
 
 import ast
-from pathlib import Path
+import re
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -248,14 +249,147 @@ def copy_source(instruction: str, build_args: dict[str, str]) -> str:
     return source
 
 
+# THE REVISION STAGE (bead tj-7zjov1.10; selected through a FROM since tj-7zjov1.95). service_build_image
+# pulls one stage whole into /code with a FIXED name: `COPY --from=migrations_selected / /code/`, because
+# Docker refuses a build arg in --from ("variable expansion is not supported for --from"). That stage is a
+# SELECTOR, `FROM migrations_${SERVICE_PATH}_${SERVICE_NAME} AS migrations_selected`, which a FROM may
+# expand only from ARGs declared before the first FROM; it is whichever per-service scratch stage the
+# build args name. What that stage holds ships in the image as surely as a plain COPY does, so it is read
+# here, not skipped: stage_copy recognises exactly the one whole-stage form and refuses an expanded --from
+# (anything else with --from still fails in copy_source), selected_stage follows the selector to the stage
+# it names, and scratch_stage_copies reads that stage, which must be `FROM scratch` with plain COPYs only.
+WHOLE_STAGE_COPY = re.compile(r'COPY --from=(?P<stage>\S+) / /code/')
+IMAGE_ROOT = PurePosixPath('/code')
+ARG_REFERENCE = re.compile(r'\$\{(\w+)\}|\$(\w+)')
+
+
+def stage_copy(instruction: str) -> str | None:
+    """The stage a `COPY --from=<stage> / /code/` copies whole into /code.
+
+    A --from that names a build arg fails: Docker does not expand one there, so the build would stop.
+
+    Args:
+        instruction (str): One logical instruction from the source stage.
+
+    Returns:
+        str | None: The stage name, or None when the instruction is not that exact form.
+    """
+    match = WHOLE_STAGE_COPY.fullmatch(instruction)
+    if match is None:
+        return None
+    stage = match.group('stage')
+    assert '$' not in stage, f'COPY --from cannot expand a build arg, select the stage with a FROM: {instruction}'
+    return stage
+
+
+def global_args(instructions: list[str]) -> dict[str, str]:
+    """The ARGs declared before the first FROM, {name: default}: the only ones a FROM line may expand."""
+    declared: dict[str, str] = {}
+    for instruction in instructions:
+        words = instruction.split()
+        if words[0].upper() == 'FROM':
+            break
+        if words[0].upper() == 'ARG':
+            name, _, default = words[1].partition('=')
+            declared[name] = default
+    return declared
+
+
+def selected_stage(instructions: list[str], stage: str, build_args: dict[str, str]) -> str:
+    """The scratch stage a whole-stage COPY ends up copying: `stage` itself, or the one its selector names.
+
+    A selector is `FROM <name built from build args> AS <stage>` with no instruction of its own, so it is
+    exactly the stage it expands to. Every arg it names must be declared before the first FROM (no other
+    reaches a FROM line) and given in build_args, and the expansion must be a stage defined BEFORE the
+    selector. A selector that adds an instruction would ship more than the stage it picks, so it fails, as
+    does any parent that is neither scratch nor a build-arg selection.
+
+    Args:
+        instructions (list[str]): The Dockerfile's logical instructions.
+        stage (str): The stage a COPY --from names.
+        build_args (dict[str, str]): The image's build args.
+
+    Returns:
+        str: The name of the scratch stage whose contents the image receives.
+    """
+    headers = [
+        index
+        for index, instruction in enumerate(instructions)
+        if instruction.startswith('FROM ') and instruction.split()[-1] == stage
+    ]
+    assert len(headers) == 1, f'expected one stage named {stage}, found {len(headers)}'
+    index = headers[0]
+    words = instructions[index].split()
+    assert len(words) == 4 and words[2].upper() == 'AS', f'unrecognised FROM form: {instructions[index]}'
+    parent = words[1]
+    if parent == 'scratch':
+        return stage
+    assert not stage_instructions(instructions, stage), f'{stage} selects {parent} and adds instructions of its own'
+    names = [braced or bare for braced, bare in ARG_REFERENCE.findall(parent)]
+    assert names, f'{stage} is FROM {parent}: neither scratch nor a stage selected by build arg'
+    declared = global_args(instructions)
+    for name in names:
+        assert name in declared, f'{stage} expands {name}, which is not declared before the first FROM'
+        assert name in build_args, f'{stage} expands {name}, which the image is not built with'
+        parent = parent.replace(f'${{{name}}}', build_args[name]).replace(f'${name}', build_args[name])
+    earlier = {line.split()[-1] for line in instructions[:index] if line.startswith('FROM ') and ' AS ' in line}
+    assert parent in earlier, f'{stage} selects {parent}, which is not a stage defined before it'
+    return selected_stage(instructions[:index], parent, build_args)
+
+
+def scratch_stage_copies(instructions: list[str], stage: str) -> dict[str, str]:
+    """What a scratch stage puts in the image when copied whole into /code: {source: container path}.
+
+    The stage must be `FROM scratch AS <stage>` (nothing but what it copies) and hold plain one-source
+    COPYs only, read with copy_source, so a new form fails here exactly as it would in the source stage.
+
+    Args:
+        instructions (list[str]): The Dockerfile's logical instructions.
+        stage (str): The stage name.
+
+    Returns:
+        dict[str, str]: Build-context source mapped to its path under /code; empty for an empty stage.
+    """
+    header = [
+        instruction
+        for instruction in instructions
+        if instruction.split()[-1] == stage and instruction.startswith('FROM ')
+    ]
+    assert header == [f'FROM scratch AS {stage}'], f'{stage} is not one scratch stage: {header}'
+    copies: dict[str, str] = {}
+    for instruction in stage_instructions(instructions, stage):
+        source = copy_source(instruction, {})
+        target = instruction.split()[2]
+        assert target.startswith('/') and '..' not in target, f'{stage} copies to {target}: {instruction}'
+        copies[source] = str(IMAGE_ROOT / target.lstrip('/')).rstrip('/')
+    return copies
+
+
+def source_stage_copies(build_args: dict[str, str]) -> tuple[list[str], dict[str, str]]:
+    """(plain COPY sources, the revision stage's copies) of the source stage, for one image's build args.
+
+    Every COPY or ADD of the stage is one or the other; any other form fails. Exactly one whole-stage
+    COPY is expected: two would be a second way into the image this guard does not model. The stage it
+    names is followed through its selector (selected_stage) under these build args.
+    """
+    instructions = dockerfile_instructions(DOCKERFILE.read_text(encoding='utf-8'))
+    sources: list[str] = []
+    stages: list[str] = []
+    for instruction in stage_instructions(instructions, SOURCE_STAGE):
+        if instruction.split()[0].upper() not in ('COPY', 'ADD'):
+            continue
+        stage = stage_copy(instruction)
+        if stage is None:
+            sources.append(copy_source(instruction, build_args))
+        else:
+            stages.append(stage)
+    assert len(stages) == 1, f'{SOURCE_STAGE} copies {len(stages)} whole stages, expected one: {stages}'
+    return sources, scratch_stage_copies(instructions, selected_stage(instructions, stages[0], build_args))
+
+
 def dockerfile_copy_directories() -> set[str]:
     """The directory sources of the source stage's COPY lines, resolved for the data_ingest image."""
-    body = stage_instructions(dockerfile_instructions(DOCKERFILE.read_text(encoding='utf-8')), SOURCE_STAGE)
-    sources = [
-        copy_source(instruction, INGEST_BUILD_ARGS)
-        for instruction in body
-        if instruction.split()[0].upper() in ('COPY', 'ADD')
-    ]
+    sources, _ = source_stage_copies(INGEST_BUILD_ARGS)
     # Non-vacuous: a stage renamed or emptied of COPY lines must not pin against nothing.
     assert sources, f'{SOURCE_STAGE} has no COPY lines'
     directories: set[str] = set()
@@ -284,6 +418,105 @@ def test_the_dockerfile_parser_rejects_copy_forms_it_does_not_know():
     ):
         with pytest.raises(AssertionError):
             copy_source(unknown, args)
+
+
+def test_the_whole_stage_copy_parser_reads_one_form_only():
+    # The one --from form the source stage may use is read; every near miss is not that form (None, so it
+    # falls to copy_source and fails there), and a --from naming a build arg fails outright, because
+    # Docker stops the build on it ("variable expansion is not supported for --from", tj-7zjov1.95).
+    assert stage_copy('COPY --from=migrations_selected / /code/') == 'migrations_selected'
+    assert stage_copy('COPY ./server/common /code/common') is None
+    for near_miss in (
+        'COPY --from=other /code /code',
+        'COPY --from=other / /code',
+        'COPY --from=other /migrations /code/migrations',
+        'COPY --from=other --chown=appuser / /code/',
+    ):
+        assert stage_copy(near_miss) is None, near_miss
+    for expanded in (
+        'COPY --from=migrations_${SERVICE_PATH}_${SERVICE_NAME} / /code/',
+        'COPY --from=migrations_$SERVICE_PATH / /code/',
+        'COPY --from=migrations_${OTHER} / /code/',
+    ):
+        with pytest.raises(AssertionError):
+            stage_copy(expanded)
+
+
+SELECTOR = 'FROM migrations_${SERVICE_PATH}_${SERVICE_NAME} AS migrations_selected'
+SELECTOR_DOCKERFILE = [
+    'ARG SERVICE_PATH=none',
+    'ARG SERVICE_NAME=none',
+    'FROM debian AS base',
+    'FROM scratch AS migrations_data_store',
+    'COPY ./a.ini /a.ini',
+    'FROM scratch AS migrations_data_ingest',
+    SELECTOR,
+    'FROM base AS service_build_image',
+]
+STORE_ARGS = {'SERVICE_PATH': 'data', 'SERVICE_NAME': 'store'}
+
+
+def test_the_selector_reader_follows_a_global_arg_from_to_the_earlier_scratch_stage():
+    # The good shape resolves per service, and a stage that is scratch already is itself.
+    assert selected_stage(SELECTOR_DOCKERFILE, 'migrations_selected', STORE_ARGS) == 'migrations_data_store'
+    assert selected_stage(SELECTOR_DOCKERFILE, 'migrations_selected', INGEST_BUILD_ARGS) == 'migrations_data_ingest'
+    assert selected_stage(SELECTOR_DOCKERFILE, 'migrations_data_store', STORE_ARGS) == 'migrations_data_store'
+    assert global_args(SELECTOR_DOCKERFILE) == {'SERVICE_PATH': 'none', 'SERVICE_NAME': 'none'}
+
+    selector_at = SELECTOR_DOCKERFILE.index(SELECTOR)
+    without_global_name = [line for line in SELECTOR_DOCKERFILE if line != 'ARG SERVICE_NAME=none']
+    # The ARG only inside a stage: a FROM cannot see it.
+    in_stage_only = [*without_global_name[:2], 'ARG SERVICE_NAME=none', *without_global_name[2:]]
+    selector_first = [
+        *SELECTOR_DOCKERFILE[:3],
+        SELECTOR,
+        *[line for line in SELECTOR_DOCKERFILE[3:] if line != SELECTOR],
+    ]
+    with_body = [
+        *SELECTOR_DOCKERFILE[: selector_at + 1],
+        'COPY ./extra /extra',
+        *SELECTOR_DOCKERFILE[selector_at + 1 :],
+    ]
+    for bad, args in (
+        (without_global_name, STORE_ARGS),
+        (in_stage_only, STORE_ARGS),
+        (selector_first, STORE_ARGS),
+        (with_body, STORE_ARGS),
+        (SELECTOR_DOCKERFILE, {'SERVICE_PATH': 'data'}),
+        (SELECTOR_DOCKERFILE, {'SERVICE_PATH': 'data', 'SERVICE_NAME': 'web'}),
+        ([*SELECTOR_DOCKERFILE[:3], 'FROM debian AS migrations_selected'], STORE_ARGS),
+    ):
+        with pytest.raises(AssertionError):
+            selected_stage(bad, 'migrations_selected', args)
+
+
+def test_the_ingest_image_selects_its_own_revision_stage():
+    # The real Dockerfile, under this image's build args: the selector names the empty ingest stage.
+    instructions = dockerfile_instructions(DOCKERFILE.read_text(encoding='utf-8'))
+    copied = [stage_copy(line) for line in stage_instructions(instructions, SOURCE_STAGE)]
+    assert [stage for stage in copied if stage is not None] == ['migrations_selected'], copied
+    assert selected_stage(instructions, 'migrations_selected', INGEST_BUILD_ARGS) == 'migrations_data_ingest'
+
+
+def test_the_scratch_stage_reader_refuses_a_stage_that_is_not_plain_scratch_copies():
+    good = ['FROM scratch AS revisions', 'COPY ./a.ini /a.ini', 'COPY ./tree /tree', 'FROM base AS next']
+    assert scratch_stage_copies(good, 'revisions') == {'a.ini': '/code/a.ini', 'tree': '/code/tree'}
+    assert scratch_stage_copies(['FROM scratch AS empty', 'FROM base AS next'], 'empty') == {}
+    for bad in (
+        ['FROM debian AS revisions', 'COPY ./a /a'],
+        ['FROM scratch AS revisions', 'COPY --from=elsewhere /a /a'],
+        ['FROM scratch AS revisions', 'ADD ./a /a'],
+        ['FROM scratch AS revisions', 'COPY ./a relative/a'],
+    ):
+        with pytest.raises(AssertionError):
+            scratch_stage_copies(bad, 'revisions')
+
+
+def test_the_ingest_image_takes_nothing_from_its_revision_stage():
+    # migrations_data_ingest is empty by design (bead tj-7zjov1.10): anything put there would ship in
+    # the data_ingest image outside PRODUCTION_ROOTS, unscanned.
+    _, revisions = source_stage_copies(INGEST_BUILD_ARGS)
+    assert revisions == {}, f'the data_ingest image takes {revisions} from its revision stage'
 
 
 def test_the_roots_are_the_dockerfile_copy_sources():

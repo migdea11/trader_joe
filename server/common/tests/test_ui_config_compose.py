@@ -5,9 +5,12 @@ either is unset or empty (test_ui_config_route.py pins the fallbacks). docker-co
 data_store as BARE keys: compose passes the shell's or the project .env's value and omits the variable when
 neither sets it. Pinned here: the base file spells them bare, so a removal or a ':-' default that would mask the
 fallback fails; and no overlay of any launch set gives either one a value, but for the two labels: the dev
-override's 'dev' and (tj-grna9p.148) the test-mode overlay's 'test'.
+override's 'dev' and (tj-grna9p.148) the test-mode overlay's 'test'. And (tj-7zjov1.11, m6) the production-label
+pin: no file a production definition loads, compose file, env-file template or Dockerfile, gives the label a value.
 """
 
+import re
+from pathlib import Path
 from typing import Final
 
 import pytest
@@ -16,6 +19,7 @@ from common.tests.compose_model import (
     BASE_FILE,
     FAKE_FILE,
     client_model,
+    interpolate,
     load,
     merge,
     prod_model,
@@ -97,6 +101,114 @@ def test_neither_the_base_nor_the_web_file_gives_the_label_a_value(path):
         for key, value in values:
             if key == LABEL:
                 assert value in ('', None), f'{path.name} gives {name} {LABEL}={value!r}'
+
+
+# THE PRODUCTION-LABEL PIN (m6 of the migration-safety gate; bead tj-7zjov1.11, PR5-PLAN N1 row P05). Production's
+# DEPLOYMENT_LABEL is EMPTY, and run_migrations.sh refuses a migrate on the PRODUCTION definition when the
+# data_store container would see anything else (tj-7zjov1.9, P03). That refusal is a run-time backstop; this is
+# the committed-file half: NO FILE A PRODUCTION DEFINITION LOADS GIVES THE LABEL A VALUE. "A production
+# definition" is read from the two places that define one, never restated: the Makefile's PROD_COMPOSE (how prod
+# is launched) and run_migrations.sh's production lines (how prod is migrated). For every compose file either
+# loads: no service's environment: sets the label, and every env_file: it names has a committed .default
+# template that sets it to nothing. The Dockerfile is in it too: an ENV or ARG there would reach the container
+# from under every compose file.
+RUN_MIGRATIONS: Final = REPO_ROOT / 'server' / 'data' / 'store' / 'run_migrations.sh'
+DOCKERFILE: Final = REPO_ROOT / 'Dockerfile'
+_SCRIPT_DEFINITION = re.compile(r'^\s*COMPOSE=\(docker compose((?:\s+-f\s+[^\s)]+)+)\)\s*$')
+_PRODUCTION_ECHO = 'using the PRODUCTION definition'
+
+
+def _definition_files(line: str) -> tuple[Path, ...]:
+    match = _SCRIPT_DEFINITION.match(line)
+    assert match is not None, f'not a literal compose definition: {line!r}'
+    return tuple(REPO_ROOT / name for name in re.findall(r'-f\s+(\S+)', match.group(1)))
+
+
+def _script_production_definitions() -> list[tuple[Path, ...]]:
+    """The files of run_migrations.sh's production definition: its top-level default and its production arm.
+
+    The top-level COMPOSE=( line is the default (the script says so), and the production arm is the literal
+    definition line nearest above the echo that announces the PRODUCTION definition.
+    """
+    lines = RUN_MIGRATIONS.read_text(encoding='utf-8').splitlines()
+    top_level = [line for line in lines if line.startswith('COMPOSE=(')]
+    assert len(top_level) == 1, top_level
+    echoes = [index for index, line in enumerate(lines) if _PRODUCTION_ECHO in line]
+    assert len(echoes) == 1, f'expected one echo naming the {_PRODUCTION_ECHO}, found {len(echoes)}'
+    arm = next(line for line in reversed(lines[: echoes[0]]) if _SCRIPT_DEFINITION.match(line))
+    return [_definition_files(top_level[0]), _definition_files(arm)]
+
+
+def _production_files() -> list[Path]:
+    files = set(_set_files('PROD_COMPOSE'))
+    for definition in _script_production_definitions():
+        files.update(definition)
+    return sorted(files)
+
+
+def _environment_entries(service: dict) -> list[tuple[str, str | None]]:
+    entries = service.get('environment') or []
+    if isinstance(entries, dict):
+        return [(str(key), None if value is None else str(value)) for key, value in entries.items()]
+    return [(key, value if separator else None) for key, separator, value in (str(e).partition('=') for e in entries)]
+
+
+def _env_file_templates(document: dict) -> set[Path]:
+    """The committed template of every env_file: entry, the entry's own default path plus '.default'."""
+    templates = set()
+    for service in (document.get('services') or {}).values():
+        env_files = service.get('env_file') or []
+        for entry in [env_files] if isinstance(env_files, str) else env_files:
+            path = entry if isinstance(entry, str) else entry['path']
+            resolved = interpolate(path, {}).removeprefix('./')
+            assert resolved, f'env_file {path!r} resolves to nothing without the environment'
+            templates.add(REPO_ROOT / f'{resolved}.default')
+    return templates
+
+
+def _env_file_value(path: Path, key: str) -> list[str]:
+    return [
+        line.partition('=')[2].strip()
+        for line in path.read_text(encoding='utf-8').splitlines()
+        if line.strip().removeprefix('export ').partition('=')[0].strip() == key
+    ]
+
+
+def test_the_production_definitions_are_read_and_name_the_base_file():
+    """Non-vacuous: both readers find their definition, and both contain the base file."""
+    assert BASE_FILE in _set_files('PROD_COMPOSE')
+    definitions = _script_production_definitions()
+    assert definitions and all(BASE_FILE in files for files in definitions), definitions
+    assert OVERRIDE_FILE not in _production_files() and FAKE_FILE not in _production_files()
+
+
+@pytest.mark.parametrize('path', _production_files(), ids=lambda path: path.name)
+def test_no_file_a_production_definition_loads_gives_the_label_a_value(path: Path):
+    """No service in the file sets DEPLOYMENT_LABEL to anything; a bare pass-through key is allowed."""
+    document = load(path)
+    assert document.get('services'), f'{path.name} defines no services'
+    for name, service in document['services'].items():
+        for key, value in _environment_entries(service or {}):
+            if key == LABEL:
+                assert value in (None, ''), f'{path.name} gives {name} {LABEL}={value!r}; production is empty'
+
+
+def test_every_production_env_file_template_leaves_the_label_empty():
+    """The env files prod loads are operator copies of committed templates; no template may set the label."""
+    templates = set().union(*(_env_file_templates(load(path)) for path in _production_files()))
+    assert REPO_ROOT / '.env.default' in templates, sorted(map(str, templates))
+    for template in sorted(templates):
+        assert template.is_file(), f'{template} is named by a production env_file and is not committed'
+        values = _env_file_value(template, LABEL)
+        assert all(value == '' for value in values), f'{template.name} sets {LABEL} to {values}'
+    # The root template names the label, so the operator's copy shows it, empty.
+    assert _env_file_value(REPO_ROOT / '.env.default', LABEL) == [''], 'the root template no longer names the label'
+
+
+def test_the_image_never_sets_the_label():
+    """An ENV or ARG in the Dockerfile would reach the prod container beneath every compose file."""
+    lines = [line for line in DOCKERFILE.read_text(encoding='utf-8').splitlines() if not line.lstrip().startswith('#')]
+    assert not [line for line in lines if LABEL in line], [line for line in lines if LABEL in line]
 
 
 @pytest.mark.parametrize('variable', ['PROD_COMPOSE'])

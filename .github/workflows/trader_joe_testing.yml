@@ -471,18 +471,9 @@ jobs:
         cp server/data/ingest/.env.default artifact/data/ingest/.env.default
         cp server/data/store/.env.default artifact/data/store/.env.default
 
-        # The migration scripts travel with the configs because System Testing has no
-        # checkout and the schema has to exist before anything can query it. The prod
-        # image ships alembic and psycopg2 (the data-store dependency group) but not
-        # these files -- the Dockerfile copies server/data/store/app only -- so compose
-        # bind-mounts them over /code/alembic.ini and /code/migrations. Without them
-        # staged, those two mounts point at paths that do not exist on that runner and
-        # docker silently materialises empty directories.
-        cp server/data/store/alembic.ini artifact/data/store/alembic.ini
-        cp -r server/data/store/migrations artifact/data/store/migrations
-        # Bytecode from this runner's interpreter is not useful to the container and
-        # only makes the artifact bigger.
-        find artifact/data/store/migrations -name __pycache__ -type d -prune -exec rm -rf {} +
+        # No alembic.ini or migrations here any more (bead tj-7zjov1.10): the Dockerfile COPYs
+        # them into the data_store image, so the image System Testing pulls carries the revisions
+        # it applies, and compose bind-mounts nothing for them.
         ls -lahR artifact/
 
     - name: Push Pipeline Configs
@@ -492,6 +483,128 @@ jobs:
         path: artifact/
         include-hidden-files: true
         overwrite: true
+
+  # THE MIGRATION GATE (bead tj-7zjov1.10, epic tj-7zjov1). Both migration paths against the images Image
+  # Build pushed, whose revisions are inside the data_store image (Dockerfile), not mounted from the
+  # checkout:
+  #   1. EVERY REVISION FROM EMPTY: make migrate on a fresh database, then the recorded revision must be
+  #      the head, then make migrate again (an upgrade at head is a no-op that still takes its dump).
+  #   2. THE PREVIOUS RELEASE'S SEED UPGRADED: tests/system/test_migration_with_data.py loads each
+  #      committed seed (tests/system/seeds) at its own revision on a scratch database and upgrades it.
+  # The System Testing job runs both too, as a side effect of its own work; this job is the one place
+  # that fails on them alone. It stages its configuration from the checkout, which is the commit the
+  # images were built from, so it does not need the pipeline-configs artifact.
+  migration:
+    name: Migration Gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read  # checkout
+      packages: read  # pulls the images Image Build pushed
+    needs:
+      - build
+    env:
+      COMPOSE_PROJECT_NAME: trader_joe_dev
+      # make migrate takes a verified dump first; the runner's disk is thrown away with the job.
+      MIGRATE_BACKUP_DIR: ${{ github.workspace }}/output/migrate-backups
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install UV
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
+        with:
+          version: "${{ env.UV_VERSION }}"
+
+      - name: Install dependencies
+        run: |
+          uv sync --all-groups --no-group security --no-group agent-mcp --locked
+
+      - name: Generate gRPC Code
+        run: |
+          make proto
+
+      - name: Registry Login
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Stage Configs
+        run: |
+          set -euo pipefail
+          cp .env.default .env
+          db_pass="$(openssl rand -hex 24)"
+          echo "::add-mask::${db_pass}"
+          printf '\nPOSTGRES_PASS=%s\n' "${db_pass}" >> .env
+          write_secret="$(openssl rand -hex 32)"
+          echo "::add-mask::${write_secret}"
+          sed -i '/^INSTANCE_WRITE_SECRET=/d' .env
+          printf 'INSTANCE_WRITE_SECRET=%s\n' "${write_secret}" >> .env
+          cp server/data/ingest/.env.default server/data/ingest/.env
+          cp server/data/store/.env.default server/data/store/.env
+
+      - name: Pull Docker Images
+        run: |
+          set -euo pipefail
+          docker pull ${{ needs.build.outputs.IMAGE_STORE }}
+          docker pull ${{ needs.build.outputs.IMAGE_INGEST }}
+          docker tag ${{ needs.build.outputs.IMAGE_STORE }} trader_joe_data_store
+          docker tag ${{ needs.build.outputs.IMAGE_INGEST }} trader_joe_data_ingest
+          docker tag ${{ needs.build.outputs.IMAGE_STORE }} trader_joe_data_store:test
+          docker tag ${{ needs.build.outputs.IMAGE_INGEST }} trader_joe_data_ingest:test
+
+      - name: Start System
+        env:
+          SYSTEM_TEST_DISPOSABLE_DB: "1"
+        run: |
+          set -euo pipefail
+          make system-launch
+
+      - name: Apply Every Revision From Empty
+        run: |
+          set -euo pipefail
+          # The database is empty: nothing else has migrated it in this job. make migrate follows the
+          # running stack (the test definition) and applies the revisions inside the image.
+          make migrate
+          current="$(./server/data/store/run_migrations.sh current)"
+          heads="$(./server/data/store/run_migrations.sh heads)"
+          printf 'current: %s\nheads: %s\n' "${current}" "${heads}"
+          case "${current}" in
+            *"(head)"*) ;;
+            *) echo "::error::the database is not at the head after make migrate"; exit 1 ;;
+          esac
+          if [ "$(printf '%s\n' "${heads}" | grep -cE '^[0-9a-f]{12}')" -ne 1 ]; then
+            echo "::error::expected exactly one migration head"
+            exit 1
+          fi
+          # At head already: the second run must succeed and change nothing.
+          make migrate
+
+      - name: Upgrade The Previous Release Seed
+        env:
+          SYSTEM_TEST_DISPOSABLE_DB: "1"
+        run: |
+          set -euo pipefail
+          make test-system SYSTEM_PATHS=tests/system/test_migration_with_data.py
+
+      - name: Dump Container Logs
+        if: failure()
+        run: |
+          docker compose -f docker-compose.yaml ps --all
+          docker compose -f docker-compose.yaml logs --tail 200 --no-color
+
+      - name: Stop System
+        if: always()
+        run: docker compose -f docker-compose.yaml down -v
+
+      - name: Clean Runtime Configs
+        if: always()
+        run: |
+          shred -u .env || rm -f .env
+          shred -u server/data/ingest/.env || rm -f server/data/ingest/.env
+          shred -u server/data/store/.env || rm -f server/data/store/.env
 
   system:
     name: System Testing
@@ -589,20 +702,9 @@ jobs:
           cp artifact/data/ingest/.env.default server/data/ingest/.env
           mkdir -p server/data/store
           cp artifact/data/store/.env.default server/data/store/.env
-          # Restored to the exact paths docker-compose.yaml bind-mounts into data_store:
-          # ./server/data/store/alembic.ini -> /code/alembic.ini and
-          # ./server/data/store/migrations -> /code/migrations. The artifact keeps its own flat
-          # data/... layout, which is this workflow's invention and not a checkout path; only the
-          # destinations here have to match compose. alembic resolves
-          # script_location=migrations against the container's WORKDIR (/code), so both have to
-          # land here, not anywhere else.
-          # The checkout already holds a migrations directory at that path, and cp -r into an
-          # existing directory nests the copy one level down (migrations/migrations), which
-          # would leave the mounted tree as the checkout's rather than the artifact's. Remove
-          # it first, so what is mounted is exactly what Image Build staged beside the images.
-          cp artifact/data/store/alembic.ini server/data/store/alembic.ini
-          rm -rf server/data/store/migrations
-          cp -r artifact/data/store/migrations server/data/store/migrations
+          # The revisions are in the data_store image (Dockerfile), not bind-mounted, so nothing of
+          # them is restored here (bead tj-7zjov1.10); the checkout's own migrations directory is
+          # what test_client mounts, and it is the same commit the image was built from.
 
       # THE CLIENT (decision record tj-q9ae5u, addendum 1). Prod publishes no host port, so
       # nothing on this runner can reach data_store from outside the stack: every HTTP request

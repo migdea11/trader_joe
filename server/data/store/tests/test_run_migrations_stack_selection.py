@@ -61,21 +61,38 @@ The classifier itself is also driven directly, from the block run_migrations.sh 
 
 import os
 import re
-import shutil
 import subprocess
-from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 import yaml
 
-from common.tests.roots import REPO_ROOT, SERVER_ROOT
+from common.tests.roots import REPO_ROOT
+from data.store.tests.compose_double import (
+    ALEMBIC,
+    ALEMBIC_RUN,
+    ALEMBIC_STDOUT,
+    BASH,
+    DUMP_LINE,
+    IMAGE_MIGRATION_DIR,
+    LABEL_READ,
+    PG_DUMP,
+    PG_RESTORE_LIST,
+    PROJECTS,
+    REVISIONS_PROBE,
+    RUN_MIGRATIONS,
+    Harness,
+    Outcome,
+    Stack,
+)
 
 
 pytestmark = pytest.mark.data_store
 
-SCRIPT = SERVER_ROOT / 'data' / 'store' / 'run_migrations.sh'
-MIGRATION_DIR = SERVER_ROOT / 'data' / 'store' / 'migrations' / 'versions'
+SCRIPT = RUN_MIGRATIONS
+# The revisions ship in the data_store image (tj-7zjov1.45): the Running line names the image's directory, never a
+# path in the host checkout.
+RUNNING_REVISIONS = f'against the revisions in the data_store image ({IMAGE_MIGRATION_DIR})'
 
 BASE = 'docker-compose.yaml'
 OVERRIDE = 'docker-compose.override.yaml'
@@ -83,9 +100,6 @@ FAKE = 'docker-compose.fake.yaml'
 PROD_FILES = (BASE,)
 DEV_FILES = (BASE, OVERRIDE)
 TEST_FILES = (BASE, FAKE)
-ALEMBIC = '/code/.venv/bin/alembic'
-# What the stub's `compose run` prints, standing in for alembic's own stdout.
-ALEMBIC_STDOUT = 'deadbeef0001 (head)'
 
 DEV_LINE = (
     'run_migrations.sh: using the DEV definition (docker-compose.yaml + docker-compose.override.yaml): '
@@ -102,7 +116,6 @@ PROD_PREFIX = 'run_migrations.sh: using the PRODUCTION definition (docker-compos
 # then the default project; the project it finds postgres in is the one every later compose call addresses:
 # -p trader_joe_dev for the dev project, NO -p at all for the default one, so prod's calls are the old ones.
 DEV_PROJECT = 'trader_joe_dev'
-PROJECTS = ('default', 'dev')
 PROJECT_ARGS = {'default': (), 'dev': ('-p', DEV_PROJECT)}
 PROJECT_NAME = {'default': 'default', 'dev': DEV_PROJECT}
 PROBE_DEV = ('compose', '-p', DEV_PROJECT, '-f', BASE, 'ps', '-q', 'postgres')
@@ -149,196 +162,42 @@ def _malformed(label: str) -> str:
 
 
 # ------------------------------------------------------------------------------------------------- the stub
+# The stub, Stack, Call, Outcome and Harness live in compose_double.py, shared with the restore and rehearsal tests.
 
 
-STUB = r"""#! /bin/bash
-# Stub docker for test_run_migrations_stack_selection.py. Answers from files in $STUB_DIR; journals argv.
-set -u
-{
-    for word in "$@"; do printf '%s\x1f' "$word"; done
-    printf '\n'
-} >> "$STUB_DIR/calls.log"
-
-answer() {  # print $STUB_DIR/$1 if present; exit with $STUB_DIR/$1.rc if present, else 0
-    if [ -f "$STUB_DIR/$1" ]; then cat "$STUB_DIR/$1"; fi
-    if [ -f "$STUB_DIR/$1.rc" ]; then exit "$(cat "$STUB_DIR/$1.rc")"; fi
-    exit 0
-}
-
-if [ "$1" = compose ]; then
-    shift
-    # -p and -f, in any order, before the subcommand. The only project the script may name is trader_joe_dev;
-    # with none, the call is the default project's. Each project's ps answers come from their own files.
-    files=()
-    project=default
-    # compose's own rule: COMPOSE_PROJECT_NAME names the project when no -p does; an explicit -p wins below.
-    if [ "${COMPOSE_PROJECT_NAME:-}" = trader_joe_dev ]; then project=dev; fi
-    while [ "${1:-}" = -f ] || [ "${1:-}" = -p ]; do
-        if [ "$1" = -f ]; then
-            files+=("$2")
-        elif [ "$2" = trader_joe_dev ]; then
-            project=dev
-        else
-            exit 96
-        fi
-        shift 2
-    done
-    case "$1" in
-        ps) answer "ps.$project.$3" ;;
-        config)
-            # The image each list resolves to by design: the override sets :dev, the test-mode overlay :test
-            # (addendum 27 (2), landing in tj-iee6sn.19), the base file alone :latest.
-            for file in "${files[@]}"; do
-                if [ "$file" = docker-compose.override.yaml ]; then echo trader_joe_data_store:dev; exit 0; fi
-                if [ "$file" = docker-compose.fake.yaml ]; then echo trader_joe_data_store:test; exit 0; fi
-            done
-            echo trader_joe_data_store:latest
-            exit 0
-            ;;
-        run) answer run ;;
-    esac
-    exit 97
-fi
-
-if [ "$1" = inspect ]; then
-    id="${!#}"
-    if [ -f "$STUB_DIR/inspect.$id.rc" ]; then exit "$(cat "$STUB_DIR/inspect.$id.rc")"; fi
-    if [ -f "$STUB_DIR/label.$id" ]; then cat "$STUB_DIR/label.$id"; fi
-    printf '\n'
-    exit 0
-fi
-
-if [ "$1" = image ] && [ "$2" = inspect ]; then
-    mode="$(cat "$STUB_DIR/image_mode")"
-    if [ "$mode" = missing ]; then exit 1; fi
-    if [ "$3" != --format ]; then exit 0; fi
-    case "$mode" in
-        unstamped) printf '\n' ;;
-        stale) printf '%064d\n' 0 ;;
-        match) cat "$STUB_DIR/digest" ;;
-    esac
-    exit 0
-fi
-exit 98
-"""
+def _head(project: str, files: tuple[str, ...]) -> tuple[str, ...]:
+    """`compose`, the found project's -p, then the definition's -f list: how every later call begins."""
+    return ('compose', *PROJECT_ARGS[project], *[w for f in files for w in ('-f', f)])
 
 
-@dataclass(frozen=True)
-class Stack:
-    """What the stub reports. labels maps a container id to its label; None means `docker inspect` fails."""
+def _split_dump_line(outcome: Outcome, invocation: tuple[str, ...]) -> list[str]:
+    """Stderr's lines less the dump line, which a schema-moving command prints last and a read-only one never.
 
-    postgres: tuple[str, ...]
-    labels: dict[str, str | None] = field(default_factory=dict)
-    data_store: tuple[str, ...] = ()
-    data_store_ps_fails: bool = False
-
-
-@dataclass(frozen=True)
-class Call:
-    argv: tuple[str, ...]
-
-    @property
-    def is_compose(self) -> bool:
-        return self.argv[:1] == ('compose',)
-
-    def _options(self) -> list[tuple[str, str]]:
-        """The leading (-f|-p, value) pairs after `compose`, in the order given."""
-        options, words = [], list(self.argv[1:])
-        while words[:1] in (['-f'], ['-p']):
-            options.append((words[0], words[1]))
-            words = words[2:]
-        return options
-
-    @property
-    def files(self) -> tuple[str, ...]:
-        return tuple(value for flag, value in self._options() if flag == '-f')
-
-    @property
-    def project_args(self) -> tuple[str, ...]:
-        """Every -p word pair, in order: () for the default project, ('-p', 'trader_joe_dev') for the dev one."""
-        return tuple(word for flag, value in self._options() if flag == '-p' for word in (flag, value))
-
-    @property
-    def rest(self) -> tuple[str, ...]:
-        return self.argv[1 + 2 * len(self._options()) :]
+    The migration-safety gate (P03) adds exactly that one stderr line; everything these older tests pin about stderr
+    is the rest, unchanged.
+    """
+    lines = outcome.result.stderr.splitlines()
+    dumps = [line for line in lines if DUMP_LINE.fullmatch(line)]
+    if _is_mutating(invocation):
+        assert len(dumps) == 1 and DUMP_LINE.fullmatch(lines[-1]), outcome.explain()
+        return lines[:-1]
+    assert not dumps, outcome.explain()
+    return lines
 
 
-@dataclass
-class Outcome:
-    result: subprocess.CompletedProcess
-    calls: list[Call]
-
-    def compose(self, *subcommand: str) -> list[Call]:
-        return [c for c in self.calls if c.is_compose and c.rest[: len(subcommand)] == subcommand]
-
-    def only(self, *subcommand: str) -> Call:
-        found = self.compose(*subcommand)
-        assert len(found) == 1, f'expected one compose {subcommand} call, got {found}\n{self.explain()}'
-        return found[0]
-
-    def explain(self) -> str:
-        return (
-            f'exit {self.result.returncode}\nstdout:\n{self.result.stdout}\nstderr:\n{self.result.stderr}\n'
-            f'docker calls:\n' + '\n'.join(' '.join(c.argv) for c in self.calls)
-        )
+def _is_mutating(invocation: tuple[str, ...]) -> bool:
+    return bool({'upgrade', 'downgrade', 'stamp'} & set(_alembic_args(invocation)))
 
 
-class Harness:
-    def __init__(self, tmp_path: Path, digest: str | None):
-        self.dir = tmp_path / 'stub'
-        (self.dir / 'bin').mkdir(parents=True)
-        docker = self.dir / 'bin' / 'docker'
-        docker.write_text(STUB, encoding='utf-8')
-        docker.chmod(0o755)
-        self.digest = digest
-        self.image_mode('match')
+def _gate(files: tuple[str, ...], invocation: tuple[str, ...]) -> list[tuple[str, ...]]:
+    """The gate calls' words after -p/-f, in order.
 
-    def write(self, name: str, text: str) -> None:
-        (self.dir / name).write_text(text, encoding='utf-8')
-
-    def image_mode(self, mode: str) -> None:
-        self.write('image_mode', mode)
-
-    def stack(self, stack: Stack, project: str = 'default', other: Stack | None = None) -> None:
-        """Put STACK in PROJECT ('dev' is trader_joe_dev, 'default' is prod's); OTHER, if given, in the other one.
-
-        With no OTHER the other project holds nothing: its ps answers are empty.
-        """
-        assert project in PROJECTS, project
-        other_project = 'default' if project == 'dev' else 'dev'
-        self._place(stack, project)
-        self._place(other or Stack(()), other_project)
-
-    def _place(self, stack: Stack, project: str) -> None:
-        self.write(f'ps.{project}.postgres', ''.join(f'{i}\n' for i in stack.postgres))
-        self.write(f'ps.{project}.data_store', ''.join(f'{i}\n' for i in stack.data_store))
-        if stack.data_store_ps_fails:
-            self.write(f'ps.{project}.data_store.rc', '1')
-        for container, label in stack.labels.items():
-            if label is None:
-                self.write(f'inspect.{container}.rc', '1')
-            else:
-                self.write(f'label.{container}', label)
-
-    def run(self, *args: str, run_status: int = 0, extra_env: dict[str, str] | None = None) -> Outcome:
-        self.write('run', ALEMBIC_STDOUT + '\n')
-        self.write('run.rc', str(run_status))
-        if self.digest is not None:
-            self.write('digest', self.digest + '\n')
-        log = self.dir / 'calls.log'
-        log.write_text('', encoding='utf-8')
-        stripped = ('MIGRATE_CHECK_ALLOW_STALE_IMAGE', 'COMPOSE_PROJECT_NAME')
-        env = {k: v for k, v in os.environ.items() if k not in stripped}
-        env |= {'PATH': f'{self.dir / "bin"}{os.pathsep}{os.environ["PATH"]}', 'STUB_DIR': str(self.dir)}
-        env |= extra_env or {}
-        result = subprocess.run(
-            [BASH, str(SCRIPT), *args], capture_output=True, text=True, check=False, env=env, timeout=120
-        )
-        calls = [Call(tuple(line.split('\x1f')[:-1])) for line in log.read_text(encoding='utf-8').splitlines()]
-        return Outcome(result, calls)
-
-
-BASH = shutil.which('bash')
+    The look into the image for revision files, on every command (tj-7zjov1.45); then, for a schema-moving one, the
+    label read (production definition only), the dump and its read-back.
+    """
+    if not _is_mutating(invocation):
+        return [REVISIONS_PROBE]
+    return [REVISIONS_PROBE, *([LABEL_READ] if files == PROD_FILES else []), PG_DUMP, PG_RESTORE_LIST]
 
 
 @pytest.fixture(scope='module')
@@ -633,9 +492,16 @@ def test_the_running_stack_selects_the_definition_and_alembic_always_runs(
 
     # The command itself is unchanged; only the -f list and the project vary. In the default project it is
     # byte-identical to the old spelling: no -p at all.
-    run = outcome.only('run')
+    run = outcome.alembic()
     assert run.argv == ('compose', *PROJECT_ARGS[project], *[w for f in files for w in ('-f', f)], 'run', '--rm',
                         '--no-deps', 'data_store', ALEMBIC, *args), outcome.explain()  # fmt: skip
+    # The migration-safety gate's calls (P03), on the same definition and project as the one-off: a schema-moving
+    # command dumps and reads the dump back, after a label read on the production definition only; a read-only one
+    # makes none of them.
+    assert outcome.gate_calls() == _gate(files, invocation), outcome.explain()
+    for call in outcome.calls:
+        if call.is_compose and call.rest in (REVISIONS_PROBE, LABEL_READ, PG_DUMP, PG_RESTORE_LIST):
+            assert call.argv[: len(_head(project, files))] == _head(project, files), outcome.explain()
 
     # The postgres probes come first, trader_joe_dev before the default project, each on the base file alone.
     _assert_probed_in_order(outcome)
@@ -652,16 +518,15 @@ def test_the_running_stack_selects_the_definition_and_alembic_always_runs(
         outcome.explain()
     )
 
-    # Exactly one line on stderr, naming the definition, why, and the project.
-    assert outcome.result.stderr.splitlines() == _named(line, project).splitlines(), outcome.explain()
+    # Exactly one selection line on stderr, naming the definition, why, and the project (and, after it, the dump
+    # line of a schema-moving command).
+    assert _split_dump_line(outcome, invocation) == _named(line, project).splitlines(), outcome.explain()
     assert outcome.result.stderr.count('run_migrations.sh: using the') == 1, outcome.explain()
 
     # Nothing added to stdout: the existing Running line, then alembic's own output (and, for check, the guard's
     # verified block, which predates this change).
     stdout = outcome.result.stdout.splitlines()
-    assert stdout[0] == f"Running 'alembic {' '.join(args)}' against the revisions in {MIGRATION_DIR}", (
-        outcome.explain()
-    )
+    assert stdout[0] == f"Running 'alembic {' '.join(args)}' {RUNNING_REVISIONS}", outcome.explain()
     assert stdout[-1] == ALEMBIC_STDOUT, outcome.explain()
     if 'check' in invocation:
         assert stdout[1].startswith('Comparison image verified'), outcome.explain()
@@ -753,10 +618,13 @@ def test_the_same_unclear_stacks_in_the_default_project_still_run_production(
 
     assert outcome.result.returncode == 0, outcome.explain()
     assert 'cannot tell that this is a dev or test stack' not in outcome.result.stderr, outcome.explain()
-    assert outcome.only('run').argv == ('compose', '-f', BASE, 'run', '--rm', '--no-deps', 'data_store', ALEMBIC,
-                                        *_alembic_args(invocation)), outcome.explain()  # fmt: skip
+    assert outcome.alembic().argv == ('compose', '-f', BASE, 'run', '--rm', '--no-deps', 'data_store', ALEMBIC,
+                                      *_alembic_args(invocation)), outcome.explain()  # fmt: skip
     assert not [c for c in outcome.calls[1:] if c.is_compose and c.project_args], outcome.explain()
-    assert outcome.result.stderr == _named(line, 'default') + '\n', outcome.explain()
+    assert _split_dump_line(outcome, invocation) == _named(line, 'default').splitlines(), outcome.explain()
+    # THE BEHAVIOUR CHANGE P03 MADE HERE: an unclear stack in the default project is the production definition, so a
+    # schema-moving command now also reads the deployment label (and would refuse a non-empty one) before its dump.
+    assert outcome.gate_calls() == _gate(PROD_FILES, invocation), outcome.explain()
 
 
 def test_the_prod_verdict_rows_are_the_ones_expected():
@@ -810,11 +678,13 @@ def test_the_same_labels_in_the_default_project_run_production_with_no_project(
 
     assert outcome.result.returncode == 0, outcome.explain()
     assert PROD_IN_DEV.strip() not in outcome.result.stderr, outcome.explain()
-    run = outcome.only('run')
+    run = outcome.alembic()
     assert run.argv == ('compose', '-f', BASE, 'run', '--rm', '--no-deps', 'data_store', ALEMBIC,
                         *_alembic_args(invocation)), outcome.explain()  # fmt: skip
     assert not [c for c in outcome.calls[1:] if c.is_compose and c.project_args], outcome.explain()
-    assert outcome.result.stderr == _named(PROD_PREFIX + REASON_PROD, 'default') + '\n', outcome.explain()
+    assert _split_dump_line(outcome, invocation) == _named(PROD_PREFIX + REASON_PROD, 'default').splitlines(), (
+        outcome.explain()
+    )
 
 
 @pytest.mark.parametrize('label', [DEV_LABEL, BARE_UP_LABEL, SYSTEM_LABEL], ids=['dev', 'bare up', 'test'])
@@ -828,7 +698,7 @@ def test_dev_and_test_labels_in_the_dev_project_still_run_there(
 
     assert outcome.result.returncode == 0, outcome.explain()
     assert PROD_IN_DEV.strip() not in outcome.result.stderr, outcome.explain()
-    assert outcome.only('run').project_args == ('-p', DEV_PROJECT), outcome.explain()
+    assert outcome.alembic().project_args == ('-p', DEV_PROJECT), outcome.explain()
     _assert_every_later_call_addresses(outcome, 'dev')
 
 
@@ -844,11 +714,11 @@ SAME_ID_RUNS = [
 
 def _assert_one_dev_project(outcome: Outcome, files: tuple[str, ...], line: str, invocation: tuple[str, ...]) -> None:
     assert outcome.result.returncode == 0, outcome.explain()
-    assert outcome.result.stderr == _named(line, 'dev') + '\n', outcome.explain()
+    assert _split_dump_line(outcome, invocation) == _named(line, 'dev').splitlines(), outcome.explain()
     assert 'runs in both' not in outcome.result.stderr, outcome.explain()
     _assert_probed_in_order(outcome)
     _assert_every_later_call_addresses(outcome, 'dev')
-    run = outcome.only('run')
+    run = outcome.alembic()
     assert run.argv == ('compose', '-p', DEV_PROJECT, *[w for f in files for w in ('-f', f)], 'run', '--rm',
                         '--no-deps', 'data_store', ALEMBIC, *_alembic_args(invocation)), outcome.explain()  # fmt: skip
 
@@ -936,10 +806,21 @@ def test_the_test_one_off_is_the_literal_base_plus_fake_run(harness: Harness, in
     outcome = harness.run(*invocation)
 
     assert outcome.result.returncode == 0, outcome.explain()
-    assert outcome.only('run').argv == (
-        'compose', '-p', 'trader_joe_dev', '-f', 'docker-compose.yaml', '-f', 'docker-compose.fake.yaml', 'run',
-        '--rm', '--no-deps', 'data_store', '/code/.venv/bin/alembic', *_alembic_args(invocation),
+    head = ('compose', '-p', 'trader_joe_dev', '-f', 'docker-compose.yaml', '-f', 'docker-compose.fake.yaml')
+    assert outcome.alembic().argv == (
+        *head, 'run', '--rm', '--no-deps', 'data_store', '/code/.venv/bin/alembic', *_alembic_args(invocation),
     ), outcome.explain()  # fmt: skip
+    # The look into the image, on every command, then the dump and its read-back, spelled out in full once: -T, in
+    # postgres, on the same project and definition. No label read: the test definition is supposed to carry a label.
+    gate = [c.argv for c in outcome.calls if c.is_compose and (c.rest[:1] == ('exec',) or '--entrypoint' in c.rest)]
+    probe = (*head, 'run', '--rm', '--no-deps', '-T', '--entrypoint', '/bin/sh', 'data_store', '-c',
+             'set -- /code/migrations/versions/*.py; [ -e "$1" ] || exit 3')  # fmt: skip
+    expected = [probe, *([
+        (*head, 'exec', '-T', 'postgres', 'sh', '-c',
+         'exec pg_dump --format=custom --user "$POSTGRES_USER" --dbname "$POSTGRES_DB"'),
+        (*head, 'exec', '-T', 'postgres', 'pg_restore', '--list'),
+    ] if _is_mutating(invocation) else [])]  # fmt: skip
+    assert gate == expected, outcome.explain()
     assert outcome.result.stderr.splitlines()[0] == TEST_LINE + ' (project: trader_joe_dev)', outcome.explain()
 
 
@@ -971,17 +852,31 @@ def test_the_one_off_is_spelled_out_per_definition_and_project(
     run = (*head, 'run', '--rm', '--no-deps', 'data_store', '/code/.venv/bin/alembic', 'upgrade', 'head')
     # DEV and TEST cross-check data_store before the selection, on the base file, in the found project.
     cross_check = [('compose', *PROJECT_ARGS[project], '-f', 'docker-compose.yaml', 'ps', '-q', 'data_store')]
-    expected = [PROBE_DEV, PROBE_DEFAULT, *(cross_check if line in (DEV_LINE, TEST_LINE) else []), run]
+    # Then the look into the image for revision files (tj-7zjov1.45), on the selected definition; then the
+    # migration-safety gate (P03): the production definition reads the deployment label first; every definition
+    # dumps and reads the dump back; then alembic.
+    probe = (*head, 'run', '--rm', '--no-deps', '-T', '--entrypoint', '/bin/sh', 'data_store', '-c',
+             'set -- /code/migrations/versions/*.py; [ -e "$1" ] || exit 3')  # fmt: skip
+    label_read =(*head, 'run', '--rm', '--no-deps', '-T', '--entrypoint', '/bin/sh', 'data_store', '-c',
+                  'printf %s "${DEPLOYMENT_LABEL-}"')  # fmt: skip
+    dump = (*head, 'exec', '-T', 'postgres', 'sh', '-c',
+            'exec pg_dump --format=custom --user "$POSTGRES_USER" --dbname "$POSTGRES_DB"')  # fmt: skip
+    read_back = (*head, 'exec', '-T', 'postgres', 'pg_restore', '--list')
+    dev_or_test = line in (DEV_LINE, TEST_LINE)
+    expected = [PROBE_DEV, PROBE_DEFAULT, *(cross_check if dev_or_test else []), probe,
+                *([] if dev_or_test else [label_read]), dump, read_back, run]  # fmt: skip
 
     assert outcome.result.returncode == 0, outcome.explain()
     assert [c.argv for c in outcome.calls if c.is_compose] == expected, outcome.explain()
-    assert outcome.result.stderr == f'{line} (project: {PROJECT_NAME[project]})\n', outcome.explain()
+    assert _split_dump_line(outcome, ()) == [f'{line} (project: {PROJECT_NAME[project]})'], outcome.explain()
 
 
 def test_the_default_projects_calls_are_the_pre_change_commands_exactly(harness: Harness):
-    """Prod's path, every docker call in order: the old postgres check, the label read, the old one-off.
+    """Prod's path, every docker call in order: the old postgres check, the label read, the gate, the old one-off.
 
-    The only addition before them is the trader_joe_dev probe, which finds nothing; nothing else names a project.
+    The only additions are the trader_joe_dev probe, which finds nothing, the look into the image for revision files
+    (tj-7zjov1.45), and the migration-safety gate (P03): the DEPLOYMENT_LABEL read, the dump and its read-back.
+    Nothing names a project.
     """
     harness.stack(Stack(('pg',), {'pg': PROD_LABEL}), 'default')
     outcome = harness.run()
@@ -992,6 +887,13 @@ def test_the_default_projects_calls_are_the_pre_change_commands_exactly(harness:
         ('compose', '-f', 'docker-compose.yaml', 'ps', '-q', 'postgres'),
         ('inspect', '--format',
          '{{ with .Config.Labels }}{{ index . "com.docker.compose.project.config_files" }}{{ end }}', 'pg'),
+        ('compose', '-f', 'docker-compose.yaml', 'run', '--rm', '--no-deps', '-T', '--entrypoint', '/bin/sh',
+         'data_store', '-c', 'set -- /code/migrations/versions/*.py; [ -e "$1" ] || exit 3'),
+        ('compose', '-f', 'docker-compose.yaml', 'run', '--rm', '--no-deps', '-T', '--entrypoint', '/bin/sh',
+         'data_store', '-c', 'printf %s "${DEPLOYMENT_LABEL-}"'),
+        ('compose', '-f', 'docker-compose.yaml', 'exec', '-T', 'postgres', 'sh', '-c',
+         'exec pg_dump --format=custom --user "$POSTGRES_USER" --dbname "$POSTGRES_DB"'),
+        ('compose', '-f', 'docker-compose.yaml', 'exec', '-T', 'postgres', 'pg_restore', '--list'),
         ('compose', '-f', 'docker-compose.yaml', 'run', '--rm', '--no-deps', 'data_store', '/code/.venv/bin/alembic',
          'upgrade', 'head'),
     ], outcome.explain()  # fmt: skip
@@ -1043,7 +945,7 @@ def test_both_files_select_production_with_a_reason_that_says_so(harness: Harnes
         return
 
     assert outcome.result.returncode == 0, outcome.explain()
-    run = outcome.only('run')
+    run = outcome.alembic()
     assert run.files == PROD_FILES and run.project_args == PROJECT_ARGS[project], outcome.explain()
     assert outcome.result.stderr == _named(PROD_PREFIX + REASON_BOTH, project) + '\n', outcome.explain()
     assert 'started without' not in outcome.result.stderr, outcome.explain()
@@ -1066,7 +968,7 @@ def test_a_newline_in_the_label_is_malformed_and_the_stack_stays_production(harn
         return
 
     assert outcome.result.returncode == 0, outcome.explain()
-    run = outcome.only('run')
+    run = outcome.alembic()
     assert run.files == PROD_FILES and run.project_args == PROJECT_ARGS[project], outcome.explain()
     assert outcome.result.stderr == _named(PROD_PREFIX + _malformed(label), project) + '\n', outcome.explain()
     assert 'definition' not in outcome.result.stdout
@@ -1111,7 +1013,9 @@ def test_the_exit_status_is_alembics_on_every_path(
     harness.stack(stack, project)
     outcome = harness.run('upgrade', 'head', run_status=status)
     assert outcome.result.returncode == status, outcome.explain()
-    assert outcome.only('run').project_args == PROJECT_ARGS[project], outcome.explain()
+    assert outcome.alembic().project_args == PROJECT_ARGS[project], outcome.explain()
+    # The gate ran first and passed: the status is alembic's, not the dump's or the label read's.
+    assert outcome.gate_calls()[-2:] == [PG_DUMP, PG_RESTORE_LIST], outcome.explain()
 
 
 @pytest.mark.parametrize('invocation', INVOCATIONS, ids=lambda i: ' '.join(i) or 'no-args')
@@ -1176,7 +1080,7 @@ def test_the_check_guard_names_the_selected_image_and_its_build(
         return
 
     assert outcome.result.returncode == 1, outcome.explain()
-    assert not outcome.compose('run'), 'a refused check must never reach alembic'
+    assert not outcome.compose(*ALEMBIC_RUN), 'a refused check must never reach alembic'
     config = outcome.only('config', '--images', 'data_store')
     assert config.files == files and config.project_args == PROJECT_ARGS[project], outcome.explain()
     stderr = outcome.result.stderr
@@ -1253,6 +1157,203 @@ def test_the_definition_lines_stay_literal_and_the_project_is_spliced_in():
         'COMPOSE=(docker compose -p "$DEV_PROJECT" -f docker-compose.yaml)',
     ]), assignments  # fmt: skip
     assert 'DEV_PROJECT=trader_joe_dev' in lines
+
+
+# ------------------------------------------------------------------------------------------------- the empty-versions guard
+# THE GUARD READS THE IMAGE (tj-7zjov1.45; design tj-26jt9w addendum 5 on tj-yb1bxj). An empty versions/ makes
+# `alembic upgrade head` a successful no-op, so the script looks for revision files in the image the one-off will run,
+# in a one-off of its own on the selected definition and project, before the dump and before alembic, for every
+# command. Exit 3 from that look is "none there"; any other failure is "could not look". Both refuse, with exit 1,
+# and nothing is dumped or migrated. The host checkout's migrations/ is not consulted at all.
+
+NO_REVISIONS = f'No revision files in the data_store image ({IMAGE_MIGRATION_DIR}) — a broken or wrong image. Nothing was migrated.'
+COULD_NOT_LOOK = (
+    f'REFUSED: could not look for revision files in the data_store image ({IMAGE_MIGRATION_DIR}). Nothing was migrated.'
+)
+
+# Each definition in the project it runs in, plus the production definition chosen for an unclear default-project
+# stack, which is where a mislabelled host would land.
+GUARD_STACKS = [
+    pytest.param(Stack(('pg',), {'pg': PROD_LABEL}), 'default', PROD_FILES, id='prod'),
+    pytest.param(Stack(('pg',), {'pg': DEV_LABEL}), 'dev', DEV_FILES, id='dev'),
+    pytest.param(Stack(('pg',), {'pg': SYSTEM_LABEL}), 'dev', TEST_FILES, id='test'),
+    pytest.param(Stack(('pg',), {'pg': ''}), 'default', PROD_FILES, id='unclear, default project'),
+]
+GUARD_INVOCATIONS = [
+    (), ('upgrade', 'head'), ('downgrade', '-1'), ('stamp', 'head'), ('current',), ('history',), ('heads',), ('check',),
+]  # fmt: skip
+READ_ONLY = [('current',), ('history',), ('heads',), ('check',)]
+MUTATING = [(), ('upgrade', 'head'), ('downgrade', '-1'), ('stamp', 'head')]
+
+
+def _invocation_id(invocation: tuple[str, ...]) -> str:
+    return ' '.join(invocation) or 'no-args'
+
+
+def _assert_refused_by_the_guard(
+    outcome: Outcome, harness: Harness, project: str, files: tuple[str, ...], message: str
+):
+    """Exit 1, MESSAGE last on stderr, the look the only gate call, and nothing dumped, read back or migrated."""
+    assert outcome.result.returncode == 1, outcome.explain()
+    assert outcome.result.stderr.splitlines()[-1] == message, outcome.explain()
+    assert outcome.gate_calls() == [REVISIONS_PROBE], outcome.explain()
+    assert outcome.only(*REVISIONS_PROBE).argv[: len(_head(project, files))] == _head(project, files), outcome.explain()
+    assert not outcome.compose(*ALEMBIC_RUN), outcome.explain()
+    assert not [c for c in outcome.calls if c.is_compose and c.rest[:1] == ('exec',)], outcome.explain()
+    assert harness.backup_files() == [] and not harness.backups.exists(), outcome.explain()
+    # stdout is the Running line alone (and, for check, the guard's verified block, which may precede the look).
+    assert outcome.result.stdout.splitlines()[0].startswith("Running 'alembic "), outcome.explain()
+    assert ALEMBIC_STDOUT not in outcome.result.stdout, outcome.explain()
+
+
+def test_the_host_checkout_holds_revisions_so_the_empty_image_case_is_not_vacuous():
+    """The refusals below run from this checkout, whose migrations/versions is NOT empty: the image alone decides."""
+    assert list((REPO_ROOT / 'server' / 'data' / 'store' / 'migrations' / 'versions').glob('*.py'))
+
+
+@pytest.mark.parametrize('invocation', GUARD_INVOCATIONS, ids=_invocation_id)
+@pytest.mark.parametrize(('stack', 'project', 'files'), GUARD_STACKS)
+def test_an_image_with_no_revision_files_refuses_before_the_dump_and_alembic(
+    harness: Harness, stack: Stack, project: str, files: tuple[str, ...], invocation: tuple[str, ...]
+):
+    """The look exits 3: exit 1, the no-revisions message, no dump, no alembic, read-only commands included.
+
+    run_status=3 too, so that reaching alembic would show as 3, never as the refusal's 1.
+    """
+    harness.stack(stack, project)
+    harness.revisions(3)
+    outcome = harness.run(*invocation, run_status=3)
+    _assert_refused_by_the_guard(outcome, harness, project, files, NO_REVISIONS)
+
+
+@pytest.mark.parametrize('status', [1, 2, 125, 127])
+@pytest.mark.parametrize('invocation', [(), ('current',)], ids=_invocation_id)
+@pytest.mark.parametrize(('stack', 'project', 'files'), GUARD_STACKS)
+def test_a_look_that_fails_refuses_as_could_not_look(
+    harness: Harness, stack: Stack, project: str, files: tuple[str, ...], invocation: tuple[str, ...], status: int
+):
+    """Any other status from the look is a failure to look, never a pass: refused with could not look."""
+    harness.stack(stack, project)
+    harness.revisions(status)
+    outcome = harness.run(*invocation, run_status=3)
+    _assert_refused_by_the_guard(outcome, harness, project, files, COULD_NOT_LOOK)
+    assert NO_REVISIONS not in outcome.result.stderr, outcome.explain()
+
+
+@pytest.mark.parametrize('invocation', READ_ONLY, ids=_invocation_id)
+@pytest.mark.parametrize(('stack', 'project', 'files'), GUARD_STACKS)
+def test_the_read_only_commands_look_too(
+    harness: Harness, stack: Stack, project: str, files: tuple[str, ...], invocation: tuple[str, ...]
+):
+    """current, history, heads and check over an empty versions/ would print nothing and read as success: they look.
+
+    Spelled in full: the selected definition and project, --no-deps, -T, /bin/sh, the image path. It is the only
+    --entrypoint one-off a read-only command makes (no label read), and alembic runs after it.
+    """
+    harness.stack(stack, project)
+    outcome = harness.run(*invocation)
+
+    assert outcome.result.returncode == 0, outcome.explain()
+    probe = outcome.only(*REVISIONS_PROBE)
+    assert probe.argv == (*_head(project, files), 'run', '--rm', '--no-deps', '-T', '--entrypoint', '/bin/sh',
+                          'data_store', '-c', 'set -- /code/migrations/versions/*.py; [ -e "$1" ] || exit 3'), (
+        outcome.explain()
+    )  # fmt: skip
+    assert [c for c in outcome.calls if '--entrypoint' in c.argv] == [probe], outcome.explain()
+    assert outcome.calls.index(probe) < outcome.calls.index(outcome.alembic()), outcome.explain()
+
+
+@pytest.mark.parametrize('invocation', MUTATING, ids=_invocation_id)
+@pytest.mark.parametrize(('stack', 'project', 'files'), GUARD_STACKS)
+def test_the_look_comes_before_the_label_read_the_dump_and_alembic(
+    harness: Harness, stack: Stack, project: str, files: tuple[str, ...], invocation: tuple[str, ...]
+):
+    """A schema-moving command looks first, once: then the label read (production), the dump, the read-back, alembic."""
+    harness.stack(stack, project)
+    outcome = harness.run(*invocation)
+
+    assert outcome.result.returncode == 0, outcome.explain()
+    rests = [c.rest for c in outcome.calls if c.is_compose]
+    after = [LABEL_READ] if files == PROD_FILES else []
+    order = [REVISIONS_PROBE, *after, PG_DUMP, PG_RESTORE_LIST, outcome.alembic().rest]
+    assert [r for r in rests if r in order] == order, outcome.explain()
+
+
+# A REFUSED `check` MUST START NO CONTAINER BEFORE THE IMAGE GUARD HAS SPOKEN. data_store has a build: section
+# (docker-compose.yaml), so a `compose run` against a missing image builds it implicitly and unstamped; the guard's
+# own NO SUCH IMAGE text says exactly that ("Left to proceed, compose would build this image implicitly as part of
+# `run`"). The look is a `compose run`, so where it precedes verify_comparison_image a missing image is built, without
+# its stamp, before the guard can refuse it, and the next check reads CANNOT VERIFY instead. The look therefore runs
+# after the check guard and before the label read and the dump (tj-7zjov1.45, fixed at 84fc53e); this pins that order.
+@pytest.mark.parametrize('image_mode', ['missing', 'unstamped', 'stale', 'match'])
+@pytest.mark.parametrize(('stack', 'project', 'files'), GUARD_STACKS)
+def test_check_starts_no_container_before_the_image_guard(
+    harness: Harness, stack: Stack, project: str, files: tuple[str, ...], image_mode: str
+):
+    """Refused: no `compose run` at all. Verified: the look and alembic only after the last image inspect."""
+    harness.stack(stack, project)
+    harness.image_mode(image_mode)
+    outcome = harness.run('check')
+
+    if image_mode != 'match':
+        assert outcome.result.returncode == 1, outcome.explain()
+        assert not outcome.compose('run'), outcome.explain()
+        return
+    assert outcome.result.returncode == 0, outcome.explain()
+    inspects = [i for i, c in enumerate(outcome.calls) if c.argv[:2] == ('image', 'inspect')]
+    runs = [i for i, c in enumerate(outcome.calls) if c.is_compose and c.rest[:1] == ('run',)]
+    assert inspects and runs and max(inspects) < min(runs), outcome.explain()
+
+
+def _checkout_without_migrations(root: Path) -> Path:
+    """The least of a checkout run_migrations.sh needs: pytest.ini, the server tree, the script.
+
+    No migrations/ and no alembic.ini anywhere: the revisions are the image's.
+    """
+    root.mkdir()
+    (root / 'pytest.ini').write_text('', encoding='utf-8')
+    for name in ('common', 'routers', 'schemas'):
+        (root / 'server' / name).mkdir(parents=True)
+    script = root / 'server' / 'data' / 'store' / 'run_migrations.sh'
+    script.parent.mkdir(parents=True)
+    script.write_bytes(RUN_MIGRATIONS.read_bytes())
+    script.chmod(0o755)
+    return script
+
+
+@pytest.mark.parametrize('invocation', [(), ('current',), ('history',)], ids=_invocation_id)
+@pytest.mark.parametrize(('stack', 'project', 'files'), GUARD_STACKS)
+def test_a_checkout_with_no_migrations_directory_still_migrates(
+    harness: Harness, tmp_path: Path, stack: Stack, project: str, files: tuple[str, ...], invocation: tuple[str, ...]
+):
+    """P04's acceptance from this side: make migrate works with no host copy of the revisions (tj-7zjov1.45)."""
+    script = _checkout_without_migrations(tmp_path / 'checkout')
+    checkout = tmp_path / 'checkout'
+    assert not list(checkout.rglob('migrations')) and not list(checkout.rglob('alembic.ini'))
+    harness.stack(stack, project)
+    outcome = harness.run(*invocation, script=script)
+
+    assert outcome.result.returncode == 0, outcome.explain()
+    assert outcome.gate_calls() == _gate(files, invocation), outcome.explain()
+    assert outcome.alembic().argv == (*_head(project, files), *ALEMBIC_RUN, ALEMBIC, *_alembic_args(invocation)), (
+        outcome.explain()
+    )
+    stdout = outcome.result.stdout.splitlines()
+    assert stdout[0] == f"Running 'alembic {' '.join(_alembic_args(invocation))}' {RUNNING_REVISIONS}", (
+        outcome.explain()
+    )
+    assert str(tmp_path / 'checkout') not in outcome.result.stdout, outcome.explain()
+
+
+def test_the_running_line_names_the_image_not_the_checkout(harness: Harness):
+    """The banner: the image's directory, in so many words, and no path of this checkout."""
+    harness.stack(Stack(('pg',), {'pg': PROD_LABEL}), 'default')
+    outcome = harness.run('current')
+
+    assert outcome.result.stdout.splitlines()[0] == (
+        "Running 'alembic current' against the revisions in the data_store image (/code/migrations/versions)"
+    ), outcome.explain()
+    assert str(REPO_ROOT) not in outcome.result.stdout, outcome.explain()
 
 
 # ------------------------------------------------------------------------------------------------- the classifier

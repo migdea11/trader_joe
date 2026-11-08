@@ -25,17 +25,20 @@ two images are held to one parser. That module's own tests pin the parser's reje
 it does not know. Only what is specific to this image -- its roots, its build args, the forbidden
 seed package -- is defined here.
 
-MOUNTED ROOTS (tj-r8ed1a): the image is not all data_store runs in prod. The base
-docker-compose.yaml -- the only file PROD_COMPOSE loads -- bind-mounts ./data/store/alembic.ini and
-./data/store/migrations into /code in every deployment, and alembic runs migrations/env.py and
-versions/*.py there. They are production code on the prod path, so the same two families are
-forbidden in them. They are a SEPARATE tuple, MOUNTED_ROOTS, because their oracle is a different
-file: PRODUCTION_ROOTS mirror the Dockerfile's COPY sources and must stay exactly that mirror,
-while MOUNTED_ROOTS (with ALEMBIC_INI) mirror the data_store service's ./ bind sources in
-docker-compose.yaml. Each list is hard-coded and pinned to its own file both ways, so a new COPY
-or a new mount goes red rather than unscanned, and neither pin can absorb the other's drift.
-alembic.ini carries no imports, but it decides which scripts alembic loads; its script_location
-and version_locations are pinned to resolve inside a scanned mounted root.
+THE SHIPPED REVISIONS (tj-r8ed1a; bead tj-7zjov1.10): the image's app is not all data_store runs in
+prod. alembic runs migrations/env.py and versions/*.py from /code, and alembic.ini decides which scripts
+it loads. They used to be bind-mounted from the checkout; since tj-7zjov1.10 they are COPYed into the
+image through the scratch stage migrations_data_store, which service_build_image copies whole into /code
+through the selector stage migrations_selected (`COPY --from=migrations_selected / /code/`, the selector
+being `FROM migrations_${SERVICE_PATH}_${SERVICE_NAME}`; tj-7zjov1.95). The ingest guard's
+source_stage_copies follows the selector under this image's build args. They are production code on the
+prod path, so the same two families are forbidden in them. They are a SEPARATE tuple, REVISION_ROOTS
+(with ALEMBIC_INI), because their oracle is a different part of the Dockerfile: PRODUCTION_ROOTS mirror
+the source stage's plain COPY sources, REVISION_ROOTS mirror the revision stage's. Each list is
+hard-coded and pinned to its own COPY lines both ways, so a new COPY in either goes red rather than
+unscanned, and neither pin can absorb the other's drift. alembic.ini carries no imports; its
+script_location and version_locations are pinned to resolve inside a scanned revision root. The base
+compose file is pinned to bind-mount nothing into data_store, so no checkout copy can shadow them.
 
 RELATIVE IMPORTS IN MIGRATIONS: inside the container the directory is /code/migrations, not the
 package data.store.migrations, and alembic does not import it as a package at all. It loads
@@ -46,7 +49,7 @@ it does for the image: `from ..seeds import x` in data/store/migrations/env.py i
 `from .. import tests` is data.store.tests. That is the module the author named, and both are
 caught; an absolute import of tests.* or data.store.seeds is caught as written.
 
-DYNAMIC IMPORTS (tj-ovig5s): every scan here -- the image scan and the mounted scan -- reads a
+DYNAMIC IMPORTS (tj-ovig5s): every scan here -- the image scan and the revision scan -- reads a
 module through the ingest guard's scanned_imports, so besides import statements it reads a module
 name passed to import_module or __import__ as a literal, or as the literal head of an f-string
 (env.py already loads models that way). One helper, so the image and the mounts are held to R4 at
@@ -66,20 +69,18 @@ from data.ingest.tests.test_no_production_test_imports import (
     GENERATED_ROOT,
     SOURCE_STAGE,
     TEST_PACKAGE,
-    copy_source,
-    dockerfile_instructions,
     imported_modules,
     is_test_tree,
     module_file,
     scanned_imports,
-    stage_instructions,
+    source_stage_copies,
 )
 
 
 pytestmark = pytest.mark.data_store
 
 # BOTH ROOTS (tj-iontkq.2), as in the ingest module this one borrows from. Everything named as a
-# repository-relative TREE -- PRODUCTION_ROOTS, MOUNTED_ROOTS, ALEMBIC_INI, the seed package and the
+# repository-relative TREE -- PRODUCTION_ROOTS, REVISION_ROOTS, ALEMBIC_INI, the seed package and the
 # compose mount sources -- goes through resolve_tree(), because those names span the server root
 # (data/store/*, routers, common, schemas) and the repository root (gen/proto/python). The two files
 # read by name below, Dockerfile and docker-compose.yaml, stay at the top of the repository and so
@@ -138,13 +139,8 @@ def test_the_scan_reads_every_production_root():
 
 
 def dockerfile_copy_directories() -> set[str]:
-    """The directory sources of the source stage's COPY lines, resolved for the data_store image."""
-    body = stage_instructions(dockerfile_instructions(DOCKERFILE.read_text(encoding='utf-8')), SOURCE_STAGE)
-    sources = [
-        copy_source(instruction, STORE_BUILD_ARGS)
-        for instruction in body
-        if instruction.split()[0].upper() in ('COPY', 'ADD')
-    ]
+    """The directory sources of the source stage's plain COPY lines, resolved for the data_store image."""
+    sources, _ = source_stage_copies(STORE_BUILD_ARGS)
     # Non-vacuous: a stage renamed or emptied of COPY lines must not pin against nothing.
     assert sources, f'{SOURCE_STAGE} has no COPY lines'
     directories: set[str] = set()
@@ -154,6 +150,14 @@ def dockerfile_copy_directories() -> set[str]:
         if path.is_dir():
             directories.add(source)
     return directories
+
+
+def revision_copies() -> dict[str, str]:
+    """What the data_store image takes from its revision stage: {build-context source: path under /code}."""
+    _, copies = source_stage_copies(STORE_BUILD_ARGS)
+    for source in copies:
+        assert resolve_tree(source).exists(), f'the revision stage copies {source}, which does not exist'
+    return copies
 
 
 def test_the_roots_are_the_dockerfile_copy_sources():
@@ -172,9 +176,9 @@ def test_the_image_does_not_copy_the_seed_producer():
     # The premise of forbidding the import: seeds is not shipped. If a COPY ever brought it in, the
     # rule here would be the wrong one, and that must be decided, not discovered in prod.
     assert resolve_tree(SEED_DIRECTORY).is_dir(), f'{SEED_DIRECTORY} is gone; revisit this guard'
-    copied = dockerfile_copy_directories()
+    copied = dockerfile_copy_directories() | set(revision_copies())
     assert not any(source == SEED_DIRECTORY or SEED_DIRECTORY.startswith(f'{source}/') for source in copied), (
-        f'{SOURCE_STAGE} copies {SEED_DIRECTORY} into the data_store image'
+        f'{SOURCE_STAGE} or its revision stage copies {SEED_DIRECTORY} into the data_store image'
     )
 
 
@@ -262,14 +266,14 @@ def test_no_shipped_module_imports_the_test_tree_or_the_seed_producer():
     )
 
 
-# --- The bind-mounted migrations (tj-r8ed1a) -------------------------------------------------------
+# --- The shipped revisions (tj-r8ed1a, bead tj-7zjov1.10) -------------------------------------------
 
 COMPOSE_FILE = REPO_ROOT / 'docker-compose.yaml'
 COMPOSE_SERVICE = 'data_store'
-# Build-context spellings, as PRODUCTION_ROOTS above: these are compared with compose's ./ bind
-# sources, which now read ./server/data/store/... (tj-iontkq.4).
+# Build-context spellings, as PRODUCTION_ROOTS above: these are compared with the revision stage's COPY
+# sources, which read ./server/data/store/... (tj-iontkq.4).
 MIGRATIONS_ROOT = 'server/data/store/migrations'
-MOUNTED_ROOTS = (MIGRATIONS_ROOT,)
+REVISION_ROOTS = (MIGRATIONS_ROOT,)
 ALEMBIC_INI = 'server/data/store/alembic.ini'
 # A named volume: a bare identifier, which carries no source from the checkout.
 NAMED_VOLUME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*')
@@ -315,6 +319,10 @@ def compose_bind_mounts(text: str, service: str) -> dict[str, str]:
     """
     services = _block(_significant(text.splitlines()), 'services', at=0)
     ours = _block(services, service, at=services[0][0])
+    if (ours[0][0], 'volumes:') not in ours:
+        # No volumes key of its own: the service mounts nothing (docker-compose.yaml's data_store since
+        # bead tj-7zjov1.10). A `volumes:` nested deeper, under another key, is not the service's.
+        return {}
     volumes = _block(ours, 'volumes', at=ours[0][0])
 
     mounts: dict[str, str] = {}
@@ -340,28 +348,33 @@ def data_store_bind_mounts() -> dict[str, str]:
     return mounts
 
 
-def mounted_modules() -> list[Path]:
-    """Every Python source file under the mounted roots, test directories excluded."""
+def revision_modules() -> list[Path]:
+    """Every Python source file under the revision roots, test directories excluded."""
     return sorted(
         path
-        for root in MOUNTED_ROOTS
+        for root in REVISION_ROOTS
         for path in resolve_tree(root).rglob('*.py')
         if TEST_PACKAGE not in repo_relative(path).parts
     )
 
 
-def test_the_mounted_roots_are_the_compose_bind_mounts():
-    # A new checkout directory mounted into data_store would run in prod unscanned; a mounted root
-    # compose no longer mounts is a mirror gone stale.
-    mounted = set(data_store_bind_mounts())
-    ours = {*MOUNTED_ROOTS, ALEMBIC_INI}
+def test_the_revision_roots_are_the_revision_stage_copies():
+    # A new source copied into the revision stage would ship in data_store unscanned; a revision root
+    # the stage no longer copies is a mirror gone stale. The targets are where alembic and env.py look.
+    copies = revision_copies()
+    ours = {*REVISION_ROOTS, ALEMBIC_INI}
 
-    unscanned = sorted(mounted - ours)
-    assert not unscanned, (
-        f'{COMPOSE_FILE.name} mounts sources into {COMPOSE_SERVICE} the scan does not read: {unscanned}'
-    )
-    stale = sorted(ours - mounted)
-    assert not stale, f'MOUNTED_ROOTS/ALEMBIC_INI name sources {COMPOSE_FILE.name} does not mount: {stale}'
+    unscanned = sorted(set(copies) - ours)
+    assert not unscanned, f'the data_store revision stage copies sources the scan does not read: {unscanned}'
+    stale = sorted(ours - set(copies))
+    assert not stale, f'REVISION_ROOTS/ALEMBIC_INI name sources the revision stage does not copy: {stale}'
+    assert copies == {ALEMBIC_INI: '/code/alembic.ini', MIGRATIONS_ROOT: '/code/migrations'}, copies
+
+
+def test_the_base_compose_file_mounts_nothing_from_the_checkout_into_data_store():
+    # Since tj-7zjov1.10 the revisions are in the image. A checkout bind mount on data_store, in the
+    # file every deployment loads, would shadow them with whatever the host holds, and run unscanned.
+    assert data_store_bind_mounts() == {}, f'{COMPOSE_FILE.name} bind-mounts into {COMPOSE_SERVICE}'
 
 
 def test_the_compose_parser_reads_only_forms_it_knows():
@@ -386,6 +399,11 @@ def test_the_compose_parser_reads_only_forms_it_knows():
         'data/store/alembic.ini': '/code/alembic.ini',
         'data/store/migrations': '/code/migrations',
     }
+    # No volumes key is no mounts; a volumes: elsewhere (the top-level one) is not the service's own.
+    assert (
+        compose_bind_mounts('services:\n  data_store:\n    image: x\n    env_file:\n      - .env\n', 'data_store') == {}
+    )
+    assert compose_bind_mounts('services:\n  data_store:\n    image: x\nvolumes:\n  cache:\n', 'data_store') == {}
     for unknown in (
         '      - ${SRC}:/code/x\n',
         '      - /abs/path:/code/x\n',
@@ -396,11 +414,11 @@ def test_the_compose_parser_reads_only_forms_it_knows():
             compose_bind_mounts(f'services:\n  data_store:\n    volumes:\n{unknown}', 'data_store')
 
 
-def test_the_scan_reads_every_mounted_root():
+def test_the_scan_reads_every_revision_root():
     # Non-vacuous: env.py and at least one revision -- a moved or emptied versions/ must not pass
     # having scanned nothing alembic runs.
-    modules = mounted_modules()
-    for root in MOUNTED_ROOTS:
+    modules = revision_modules()
+    for root in REVISION_ROOTS:
         assert any(path.is_relative_to(resolve_tree(root)) for path in modules), f'{root} has no modules'
     assert resolve_tree(MIGRATIONS_ROOT) / 'env.py' in modules, 'the scan does not read migrations/env.py'
     revisions = [path for path in modules if path.parent == resolve_tree(MIGRATIONS_ROOT) / 'versions']
@@ -408,19 +426,20 @@ def test_the_scan_reads_every_mounted_root():
 
 
 def _container_to_source(container_path: PurePosixPath, mounts: dict[str, str]) -> str | None:
-    """The repo source behind a container path, through the bind mounts, or None when none covers it."""
+    """The repo source behind a container path, through the revision copies, or None when none covers it."""
     for source, target in mounts.items():
         if container_path.is_relative_to(target):
             return str(PurePosixPath(source) / container_path.relative_to(target))
     return None
 
 
-def test_alembic_loads_scripts_only_from_a_scanned_mounted_root():
+def test_alembic_loads_scripts_only_from_a_scanned_revision_root():
     # alembic.ini has no imports of its own, but it chooses the scripts alembic runs: a
     # script_location or version_locations pointed at tests/ or seeds/ would run unscanned code.
     # Relative locations resolve against the working directory, which is the image's WORKDIR
-    # /code (run_migrations.sh runs /code/.venv/bin/alembic there); %(here)s is the ini's directory.
-    mounts = data_store_bind_mounts()
+    # /code (run_migrations.sh runs /code/.venv/bin/alembic there); %(here)s is the ini's directory,
+    # /code, where the revision stage puts it.
+    mounts = revision_copies()
     ini_target = PurePosixPath(mounts[ALEMBIC_INI])
     config = configparser.ConfigParser(interpolation=None)
     config.read_string(resolve_tree(ALEMBIC_INI).read_text(encoding='utf-8'))
@@ -439,17 +458,17 @@ def test_alembic_loads_scripts_only_from_a_scanned_mounted_root():
 
     for location in [script_location, *version_locations]:
         source = _container_to_source(location, mounts)
-        assert source is not None, f'{ALEMBIC_INI} points alembic at {location}, which no bind mount provides'
-        assert any(PurePosixPath(source).is_relative_to(root) for root in MOUNTED_ROOTS), (
-            f'{ALEMBIC_INI} points alembic at {location} ({source}), outside MOUNTED_ROOTS'
+        assert source is not None, f'{ALEMBIC_INI} points alembic at {location}, which the image does not hold'
+        assert any(PurePosixPath(source).is_relative_to(root) for root in REVISION_ROOTS), (
+            f'{ALEMBIC_INI} points alembic at {location} ({source}), outside REVISION_ROOTS'
         )
 
 
-def test_the_mounted_scan_reaches_every_module_the_migrations_import():
-    # What env.py and the revisions import must be scanned too: the image roots, or the mounts. A
+def test_the_revision_scan_reaches_every_module_the_migrations_import():
+    # What env.py and the revisions import must be scanned too: the image roots, or the revisions. A
     # first-party module outside both would run in prod unscanned (and crash, as it is not shipped).
-    scanned = set(production_modules()) | set(mounted_modules())
-    pending = list(mounted_modules())
+    scanned = set(production_modules()) | set(revision_modules())
+    pending = list(revision_modules())
     reached: set[Path] = set()
     while pending:
         path = pending.pop()
@@ -504,15 +523,15 @@ def test_the_resolver_names_each_import_form_from_inside_the_migrations(
     assert any(is_forbidden(module) for module in modules)
 
 
-def test_no_mounted_migration_imports_the_test_tree_or_the_seed_producer():
+def test_no_shipped_migration_imports_the_test_tree_or_the_seed_producer():
     offenders = [
         f'{repo_relative(path)}:{line} imports {module}'
-        for path in mounted_modules()
+        for path in revision_modules()
         for line, module in scanned_imports(path)
         if is_forbidden(module)
     ]
 
     assert not offenders, (
-        'a migration bind-mounted into data_store imports the test tree or data.store.seeds '
+        'a migration shipped in the data_store image imports the test tree or data.store.seeds '
         '(decision tj-j4wknb R4):\n' + '\n'.join(offenders)
     )

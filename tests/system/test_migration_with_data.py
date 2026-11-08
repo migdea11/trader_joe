@@ -62,6 +62,9 @@ the data identical to what it was, and the SCHEMA identical too (columns, constr
 types) -- eec8f88a7443 changes the entry table before the bar step fails, so a run that committed per
 statement would leave an owner column behind.
 
+THE MIGRATION GATE'S TWO PATHS (tj-7zjov1.11) are the last section: every revision from empty with a repeat
+upgrade that changes nothing, and every selectable seed below the head upgraded to the head in one invocation.
+
 Run by make test-system and the agent-stack MCP's run_system_tests; pytest.ini keeps tests/system out
 of the PR gate (norecursedirs). FAIL, NEVER SKIP.
 """
@@ -83,6 +86,7 @@ from alembic.script import ScriptDirectory
 from sqlalchemy.engine import URL, Engine
 
 from common.tests.image_path import image_pythonpath
+from common.tests.migration_gate import canonical_seed_revisions, read_line, seeds_upgraded_to_head
 from common.tests.roots import SERVER_ROOT
 from data.store.seeds.scenario import is_synthetic
 
@@ -1260,3 +1264,86 @@ def test_the_enum_downgrade_with_a_set_collecting_row_refuses_atomically_and_del
     assert _log_rows(scratch) == rows, 'the refused downgrade changed or deleted an audit row'
     assert _labels(scratch) == LABELS_AFTER
     assert not scratch.enum_exists('override_action_old'), 'the refused downgrade left a renamed type'
+
+
+# ---------------------------------------------------------------------------------------------
+# THE MIGRATION GATE'S TWO PATHS (bead tj-7zjov1.11, PR5-PLAN N1 row P05, items m2 and m3 on epic tj-7zjov1).
+#
+# FROM EMPTY, EVERY REVISION, AND A REPEAT UPGRADE CHANGES NOTHING. Each revision in the line, base to head, is
+# applied to an empty database in ONE invocation (a deploy can land on any of them), then upgraded to again.
+# Idempotence is defined as the repo defines it elsewhere in this file: alembic's version table makes the second
+# upgrade a no-op, and the data and the schema are asserted unchanged rather than assumed. Where the revision has
+# a canonical seed it is loaded first, so the repeat runs over rows, not an empty schema. The head is also
+# upgraded with the literal `upgrade head` twice, the spelling make migrate runs.
+#
+# THE PREVIOUS RELEASE'S SEED, TO THE HEAD IN ONE INVOCATION. The generic rule above upgrades each seed one step.
+# A deploy runs `upgrade head` once across every revision a release adds, so each canonical seed below the head
+# whose path crosses no marked revision (common/tests/migration_gate.py states the rule; the PR gate's
+# test_migration_gate_seeds.py pins that the list is never empty and holds the newest seed below the head) is
+# upgraded to the head in one run and must arrive with every manifest column intact, then upgraded again to no
+# effect.
+
+
+LINE = [step.revision for step in read_line(MIGRATIONS_DIR)]
+TO_HEAD_SEEDS = seeds_upgraded_to_head(read_line(MIGRATIONS_DIR), canonical_seed_revisions(SEEDS_DIR))
+
+
+def test_the_line_is_the_graph_and_the_to_head_seeds_are_present() -> None:
+    """The two parametrisations below read what the rest of this file reads, and neither is empty."""
+    assert sorted(LINE) == sorted(GRAPH), 'migration_gate.read_line and this file disagree on the revisions'
+    assert LINE[-1] == _head_revision() and GRAPH[LINE[0]].down_revision is None
+    assert TO_HEAD_SEEDS, 'no seed below the head is upgraded to it, so the seed leg migrates no data'
+    assert all(name in SEED_NAMES for name in TO_HEAD_SEEDS), TO_HEAD_SEEDS
+
+
+def _repeat_upgrade_changes_nothing(db: ScratchDb, target: str) -> None:
+    before, schema, revision = db.snapshot(), db.schema(), db.revision()
+    run = db.migrate('upgrade', target)
+    assert run.returncode == 0, f'the repeat upgrade {target} failed:\n{run.output[-4000:]}'
+    assert db.revision() == revision, f'the repeat upgrade moved the revision from {revision} to {db.revision()}'
+    assert db.snapshot() == before, f'a repeat upgrade {target} changed the data'
+    assert db.schema() == schema, f'a repeat upgrade {target} changed the schema'
+
+
+@pytest.mark.parametrize('revision', LINE)
+def test_every_revision_applies_from_empty_and_a_repeat_upgrade_changes_nothing(
+    scratch: ScratchDb, revision: str
+) -> None:
+    assert scratch.revision() is None, 'the scratch database is not empty'
+    seed = read_seed(revision) if revision in SEED_NAMES else None
+    if seed is None:
+        scratch.must('upgrade', revision)
+    else:
+        scratch.load(seed)  # from empty to exactly this revision in one invocation, then the rows
+    assert scratch.revision() == revision
+
+    _repeat_upgrade_changes_nothing(scratch, revision)
+    if seed is not None:
+        assert_equals_manifest(scratch, seed)
+
+
+def test_upgrade_head_twice_at_the_head_changes_nothing(scratch: ScratchDb) -> None:
+    head = _head_revision()
+    run = scratch.migrate('upgrade', 'head')
+    assert run.returncode == 0, run.output[-4000:]
+    assert scratch.revision() == head
+    _repeat_upgrade_changes_nothing(scratch, 'head')
+
+
+@pytest.mark.parametrize('name', TO_HEAD_SEEDS)
+def test_a_seed_below_the_head_upgrades_to_the_head_in_one_invocation_with_its_data_intact(
+    scratch: ScratchDb, name: str
+) -> None:
+    seed = read_seed(name)
+    head = _head_revision()
+    assert seed.revision != head, f'seed {name} is at the head and upgrades nothing'
+    scratch.load(seed)
+    assert_equals_manifest(scratch, seed)
+
+    run = scratch.migrate('upgrade', 'head')
+
+    assert run.returncode == 0, f'seed {name}: upgrade head failed:\n{run.output[-6000:]}'
+    assert scratch.revision() == head, f'seed {name}: upgrade head left {scratch.revision()}'
+    assert_equals_manifest(scratch, seed)  # every manifest column of every row, byte for byte
+    _repeat_upgrade_changes_nothing(scratch, 'head')
+    assert_equals_manifest(scratch, seed)

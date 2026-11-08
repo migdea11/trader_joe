@@ -118,6 +118,11 @@ ENVIRONMENTS: dict[str, tuple[frozenset[str], bool]] = {
     # sync installs. Not a test, so is_test is False; its own tests are mapped beside it.
     'tools/dev_datasets': (TEST_VENV, False),
     'tools/dev_datasets/tests': (TEST_VENV, True),
+    # The migration additivity gate (tj-7zjov1.8). It runs only in the venv, as `uv run python -m
+    # tools.migration_lint` under `make lint` and so CI's Run Linters step; no image copies it, and it
+    # imports the standard library only. Not a test; its own tests are mapped beside it.
+    'tools/migration_lint': (TEST_VENV, False),
+    'tools/migration_lint/tests': (TEST_VENV, True),
     'tools/tests': (TEST_VENV, True),
     'common/tests': (TEST_VENV, True),
     'data/ingest/tests': (TEST_VENV, True),

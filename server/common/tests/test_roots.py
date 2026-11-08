@@ -152,22 +152,32 @@ def test_the_shared_packages_import_from_under_the_server_root():
 # How each site names the pair. A site that derives only one of the two roots reports None for the
 # other rather than having a name invented for it.
 SHELL_SITE = 'server/data/store/run_migrations.sh'
-MIGRATIONS_UNDER_SERVER_ROOT = ('data', 'store', 'migrations', 'versions')
-# What run_migrations.sh prints before it reaches docker, and the only line that names a root.
-MIGRATION_DIR_LINE = re.compile(r'^Running .* against the revisions in (?P<dir>.+)$', re.MULTILINE)
+# What run_migrations.sh prints before it reaches docker. Since a471ff5 (builder-store, bead tj-7zjov1.10's
+# companion) it names the revisions INSIDE THE IMAGE, a fixed container path, and no host root at all.
+IMAGE_MIGRATION_DIR = '/code/migrations/versions'
+MIGRATION_DIR_LINE = re.compile(
+    r'^Running .* against the revisions in the data_store image \((?P<dir>[^)]+)\)$', re.MULTILINE
+)
 
 
-def _roots_from_the_shell_helper(tmp_path: Path) -> tuple[Path, Path]:
-    """(REPO_ROOT, SERVER_ROOT) as run_migrations.sh derives them, read off a real invocation.
+def _roots_from_the_shell_helper(tmp_path: Path) -> tuple[Path, None]:
+    """(REPO_ROOT, None) as run_migrations.sh derives them, read off a real invocation.
 
     A SUBPROCESS WITH `docker` STUBBED is how this suite already reaches shell helpers
     (test_service_pythonpath.py, test_grpc_peer_reach.py), and it is what lets the shell spelling
     join the inventory without editing a file outside the validator's scope. `upgrade head` and not
-    `check`: check runs the comparison-image guard, which wants a real image. The script prints
-    MIGRATION_DIR -- SERVER_ROOT plus a fixed tail -- then `cd`s to REPO_ROOT and calls
-    `docker compose ps -q postgres`, so the stub's own $PWD IS the repository root it derived. The
-    stub prints nothing, so the script then exits 1 on "postgres is not running", which is after
-    both roots have been observed and is therefore the expected status.
+    `check`: check runs the comparison-image guard, which wants a real image. The script `cd`s to
+    REPO_ROOT and calls `docker compose ps -q postgres`, so the stub's own $PWD IS the repository root
+    it derived. The stub prints nothing, so the script then exits 1 on "postgres is not running",
+    which is after the root has been observed and is therefore the expected status.
+
+    THE SERVER ROOT IS NO LONGER DERIVED THERE, and so it reports None, as record_alpaca.py does for
+    the repository root. Since a471ff5 the script runs find_server_root as a layout check only, its
+    output discarded ("layout check only; nothing below needs the path", run_migrations.sh line 116),
+    and the line it prints names IMAGE_MIGRATION_DIR, the container path the Dockerfile COPYs the
+    revisions to (bead tj-7zjov1.10), not a directory under the checkout's server root. Walking that
+    line up four parents, as this helper used to, yields '.', which is a derivation of nothing. What
+    the line now says is pinned instead: the revisions applied are the image's.
     """
     bash = shutil.which('bash')
     assert bash, 'bash is not on PATH, so the shell derivation cannot be exercised'
@@ -190,11 +200,8 @@ def _roots_from_the_shell_helper(tmp_path: Path) -> tuple[Path, Path]:
         f'{SHELL_SITE} never reached docker, so it named no repository root.\nstderr:\n{result.stderr}'
     )
 
-    migration_dir = Path(printed.group('dir'))
-    server_root = migration_dir
-    for _ in MIGRATIONS_UNDER_SERVER_ROOT:
-        server_root = server_root.parent
-    return Path(log.read_text(encoding='utf-8').splitlines()[0]), server_root
+    assert printed.group('dir') == IMAGE_MIGRATION_DIR, printed.group(0)
+    return Path(log.read_text(encoding='utf-8').splitlines()[0]), None
 
 
 def test_every_derivation_of_the_two_roots_agrees(tmp_path: Path):
@@ -217,9 +224,13 @@ def test_every_derivation_of_the_two_roots_agrees(tmp_path: Path):
     disagreed = [
         f'{site}: derived ({repo}, {server}), this module derives ({REPO_ROOT}, {SERVER_ROOT})'
         for site, repo, server in inventory
-        if (repo not in (None, REPO_ROOT)) or server != SERVER_ROOT
+        if (repo not in (None, REPO_ROOT)) or (server not in (None, SERVER_ROOT))
     ]
     assert not disagreed, 'derivations of the two roots disagree:\n' + '\n'.join(disagreed)
+    # Non-vacuous: every site derives at least one root, and each root is derived by more than this module.
+    assert all(repo is not None or server is not None for _, repo, server in inventory), inventory
+    assert sum(repo is not None for _, repo, _ in inventory) >= 2, inventory
+    assert sum(server is not None for _, _, server in inventory) >= 2, inventory
     assert len(inventory) == 4, 'the inventory must name every derivation in the repository'
 
 

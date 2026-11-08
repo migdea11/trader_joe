@@ -70,7 +70,16 @@ GIT_ISOLATION = {
 # Everything the lint-proto, lint-fix-proto and buf-install recipes run, besides buf itself.
 RECIPE_TOOLS = ('git', 'tar', 'mktemp', 'rm', 'cp', 'mkdir', 'mv', 'chmod', 'curl', 'sha256sum', 'cut', 'uname')
 
-NEW_TARGETS = ('lint', 'lint-python', 'lint-proto', 'lint-fix', 'lint-fix-python', 'lint-fix-proto', 'buf-install')
+NEW_TARGETS = (
+    'lint',
+    'lint-python',
+    'lint-migrations',
+    'lint-proto',
+    'lint-fix',
+    'lint-fix-python',
+    'lint-fix-proto',
+    'buf-install',
+)
 
 # A stand-in buf. Each call is one line of the log, its arguments separated by US, so a word split or
 # glued by the shell shows as a different list. --version answers BUF_STUB_VERSION; each check exits as
@@ -718,6 +727,11 @@ WEB_LINT_CALLS = [['--prefix', 'web', 'run', 'lint'], ['--prefix', 'web', 'run',
 WEB_LINT_FIX_CALLS = 'one npm call under --prefix web carrying --fix'
 
 
+# The migration additivity gate (tj-7zjov1.8): `lint` runs it after ruff, over the store's whole revision chain
+# whatever PATHS says; `lint-fix` never runs it, because there is nothing it could fix.
+MIGRATION_LINT_CALL = ['run', 'python', '-m', 'tools.migration_lint']
+
+
 def web_calls_match(calls: list[list[str]], expected: list[list[str]] | str) -> bool:
     if expected == WEB_LINT_FIX_CALLS:
         return len(calls) == 1 and calls[0][:2] == ['--prefix', 'web'] and '--fix' in calls[0]
@@ -729,13 +743,13 @@ def web_calls_match(calls: list[list[str]], expected: list[list[str]] | str) -> 
     [
         (
             ['lint', 'PATHS=.'],
-            [['run', 'ruff', 'check', '.'], ['run', 'ruff', 'format', '--check', '.']],
+            [['run', 'ruff', 'check', '.'], ['run', 'ruff', 'format', '--check', '.'], MIGRATION_LINT_CALL],
             'lint',
             WEB_LINT_CALLS,
         ),
         (
             ['lint', 'PATHS=common'],
-            [['run', 'ruff', 'check', 'common'], ['run', 'ruff', 'format', '--check', 'common']],
+            [['run', 'ruff', 'check', 'common'], ['run', 'ruff', 'format', '--check', 'common'], MIGRATION_LINT_CALL],
             None,
             [],
         ),
@@ -772,7 +786,8 @@ def test_lint_and_lint_fix_run_ruff_as_before_and_the_proto_leg_when_selected(
 
     Since tj-grna9p.27 the entry point has a web leg too: PATHS=. selects it, as it selects proto, so
     the whole-tree run reaches npm's lint and typecheck (or eslint --fix); a component scope never
-    looks for node at all.
+    looks for node at all. Since tj-7zjov1.8 `lint`, whatever its scope, also runs the migration gate
+    once after ruff, and `lint-fix` never does.
     """
     stubs.install_buf().install_uv().install_node()
     (module_repo / 'web' / 'node_modules').mkdir(parents=True)

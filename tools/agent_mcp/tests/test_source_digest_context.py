@@ -327,7 +327,21 @@ def _real_copy_sources(service: tuple[str, str]) -> list[str]:
 REAL_SOURCES = {service: _real_copy_sources(service) for service in SERVICES}
 # Which REAL COPY sources are single files; every other one is a directory. Spelled here, not read off
 # the checkout: gen/proto/python is a directory the checkout only has once generated.
-REAL_FILE_SOURCES = frozenset({'entrypoint.sh', 'pyproject.toml', 'uv.lock'})
+# server/data/store/alembic.ini joined with bead tj-7zjov1.10 (the revision stage COPYs it).
+REAL_FILE_SOURCES = frozenset({'entrypoint.sh', 'pyproject.toml', 'uv.lock', 'server/data/store/alembic.ini'})
+
+
+REVISION_SOURCES = ('server/data/store/alembic.ini', 'server/data/store/migrations')
+
+
+@pytest.mark.parametrize('service', SERVICES, ids='/'.join)
+def test_both_service_digests_cover_the_store_revisions(service: tuple[str, str]):
+    """Bead tj-7zjov1.10, as designed (the Dockerfile's revision-stage comment): the revisions are plain COPYs.
+
+    The script reads every COPY of the file, not one stage's, so the data_ingest digest moves with a store
+    revision too; that is the stated cost, and the stamp migrate-check compares is thereby a revision stamp.
+    """
+    assert set(REVISION_SOURCES) <= set(REAL_SOURCES[service]), REAL_SOURCES[service]
 
 
 def _prefixes(source: str) -> list[str]:

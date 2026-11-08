@@ -1235,8 +1235,6 @@ DEV_BIND_SOURCES = (
     'server/routers',
     'server/schemas',
     'gen/proto/python',
-    'server/data/store/alembic.ini',
-    'server/data/store/migrations',
     'web/src',
     'gen/proto',
 )
@@ -1252,11 +1250,11 @@ def check_dev_bind_sources(repo_root: Path, sources: Sequence[str] = DEV_BIND_SO
         _lstat_below(repo_root, relative)
 
 
-# D6 for test mode: every in-repo bind source of the test set (docker-compose.yaml binds data_store's
-# alembic.ini and migrations; docker-compose.fake.yaml mounts tests/fakes read-only into data_ingest;
-# docker-compose.agent-test.yaml mounts nothing). The only other bind is postgres' data directory,
-# under ./volume_data/test, the residual DEV_BIND_SOURCES' comment records.
-TEST_BIND_SOURCES = ('server/data/store/alembic.ini', 'server/data/store/migrations', 'tests/fakes')
+# D6 for test mode: every in-repo bind source of the test set (docker-compose.fake.yaml mounts
+# tests/fakes read-only into data_ingest; docker-compose.yaml mounts no revisions, they ship in the
+# data_store image; docker-compose.agent-test.yaml mounts nothing). The only other bind is postgres'
+# data directory, under ./volume_data/test, the residual DEV_BIND_SOURCES' comment records.
+TEST_BIND_SOURCES = ('tests/fakes',)
 
 
 # D7 GENERALISED INTO THE MODE GUARD (ADR tj-4rr0la addenda 26-27, 29; tj-iee6sn.24, .31). Dev and test
@@ -1891,11 +1889,11 @@ def migrate_selection(mode: str) -> str:
     if mode == MODE_TEST:
         return (
             f'using the TEST definition (docker-compose.yaml + docker-compose.fake.yaml) of project {DEV_PROJECT} '
-            'in TEST mode (the :test image; alembic.ini and revisions from the root checkout)'
+            'in TEST mode (the :test image; alembic.ini and revisions from that image)'
         )
     return (
         f'using the DEV definition (docker-compose.yaml + docker-compose.override.yaml) of project {DEV_PROJECT} '
-        'in DEV mode (revisions from the root checkout)'
+        'in DEV mode (revisions from the :dev image)'
     )
 
 

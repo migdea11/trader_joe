@@ -119,6 +119,31 @@ DEV_TOOLS_STARTABLE = ('pgadmin', 'postgres')
 # --- the Dockerfile's external refs ----------------------------------------------------------------
 
 
+# `FROM scratch` is Docker's reserved empty base: nothing is pulled, so nothing can be pinned or ensured.
+SCRATCH = 'scratch'
+# The build args the services are built with (docker-compose.yaml's build.args), spelled out. A FROM or
+# `COPY --from=` operand that names a build arg is a stage only if it resolves to one for EVERY service
+# (bead tj-7zjov1.10's `migrations_${SERVICE_PATH}_${SERVICE_NAME}`, a FROM since tj-7zjov1.95); otherwise
+# it stays in the external list, where the digest pin below reds it rather than letting an unpinned image through as a stage.
+SERVICE_BUILD_ARGS = (
+    {'SERVICE_PATH': 'data', 'SERVICE_NAME': 'store'},
+    {'SERVICE_PATH': 'data', 'SERVICE_NAME': 'ingest'},
+)
+
+
+def _expansions(ref: str) -> list[str]:
+    """REF under each service's build args; REF alone when it names none."""
+    if '$' not in ref:
+        return [ref]
+    expanded = []
+    for args in SERVICE_BUILD_ARGS:
+        value = ref
+        for name, arg in args.items():
+            value = value.replace(f'${{{name}}}', arg).replace(f'${name}', arg)
+        expanded.append(value)
+    return expanded
+
+
 def _dockerfile_external_refs() -> list[str]:
     """Every FROM image and COPY --from image of the root Dockerfile that is not one of its own stages."""
     lines = ROOT_DOCKERFILE.read_text(encoding='utf-8').replace('\\\n', ' ').splitlines()
@@ -132,7 +157,33 @@ def _dockerfile_external_refs() -> list[str]:
             named.append(operands[0])
         elif words[:1] == ['COPY']:
             named += [word.split('=', 1)[1] for word in words[1:] if word.startswith('--from=')]
-    return [ref for ref in named if ref not in stages and not ref.isdigit()]
+    return [
+        ref
+        for ref in named
+        if ref != SCRATCH and not ref.isdigit() and not all(value in stages for value in _expansions(ref))
+    ]
+
+
+def test_the_external_ref_parser_reads_scratch_and_a_build_arg_stage_as_internal():
+    """Bead tj-7zjov1.10's two new forms: neither is a registry image, and the parser says so for the right reason."""
+    refs = _dockerfile_external_refs()
+    text = ROOT_DOCKERFILE.read_text(encoding='utf-8')
+    # Non-vacuous: the Dockerfile does use both forms, so their absence below is the parser's doing. The
+    # build-arg form is a FROM since tj-7zjov1.95 (Docker refuses a build arg in COPY --from), and the COPY
+    # names the fixed selector stage it defines.
+    assert re.search(r'^FROM scratch AS ', text, re.MULTILINE), 'no scratch stage left to exclude'
+    assert re.search(
+        r'^FROM migrations_\$\{SERVICE_PATH\}_\$\{SERVICE_NAME\} AS migrations_selected$', text, re.MULTILINE
+    ), 'no build-arg FROM left'
+    assert re.search(r'^COPY --from=migrations_selected ', text, re.MULTILINE), 'no COPY of the selector stage left'
+    assert SCRATCH not in refs and not [ref for ref in refs if '$' in ref], refs
+    assert 'migrations_selected' not in refs, refs
+    # The rule, not the spelling: a build-arg operand one service cannot resolve to a stage stays external.
+    assert _expansions('migrations_${SERVICE_PATH}_${SERVICE_NAME}') == [
+        'migrations_data_store',
+        'migrations_data_ingest',
+    ]
+    assert _expansions('ghcr.io/x/y:1') == ['ghcr.io/x/y:1']
 
 
 def test_every_external_ref_in_the_root_dockerfile_is_digest_pinned():

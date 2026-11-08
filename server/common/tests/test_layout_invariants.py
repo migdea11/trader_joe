@@ -25,7 +25,7 @@ tj-iontkq.12 and no agent may claim them from here.
 
 import re
 import tomllib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -255,6 +255,13 @@ def _resolved(text: str) -> str:
 # RAW source before interpolation, so it names the variable rather than today's default directory.
 RUNTIME_BIND_PREFIX = '${DATA_DIR'
 
+# The compose files that bind-mount NOTHING out of the checkout. docker-compose.yaml became one with bead
+# tj-7zjov1.10: its last checkout binds were data_store's alembic.ini and migrations, which the image now
+# carries. For these the existence check below has nothing to check, so it asserts the emptiness instead
+# of passing vacuously; data_store's revision paths are pinned target-side too, just below.
+CHECKOUT_BIND_FREE_FILES = frozenset({'docker-compose.yaml'})
+REVISION_TARGETS = ('/code/alembic.ini', '/code/migrations')
+
 
 def _host_binds(path: Path) -> list[tuple[str, str]]:
     """(service, host path) for every bind mount out of the CHECKOUT the compose file declares.
@@ -297,6 +304,10 @@ def test_every_compose_bind_mount_names_a_host_path_that_exists(name: str):
     """
     path = REPO_ROOT / name
     binds = _host_binds(path)
+    if name in CHECKOUT_BIND_FREE_FILES:
+        # Not vacuous, inverted: this file's whole claim is that it mounts nothing from the checkout.
+        assert binds == [], f'{name} bind-mounts from the checkout, which it must not: {binds}'
+        return
     assert binds, f'{name} declares no bind mounts; this test would be vacuous'
     missing = [
         f'{name}: service {service} mounts {source}, which does not exist'
@@ -304,6 +315,23 @@ def test_every_compose_bind_mount_names_a_host_path_that_exists(name: str):
         if not (REPO_ROOT / source).exists()
     ]
     assert not missing, 'compose bind mounts with no host path:\n' + '\n'.join(missing)
+
+
+@pytest.mark.parametrize('name', sorted(path.name for path in REPO_ROOT.glob('docker-compose*.yaml')))
+def test_no_compose_file_mounts_anything_over_data_stores_revisions(name: str):
+    """Bead tj-7zjov1.10: data_store's alembic.ini and migrations come from its image, never a mount.
+
+    Any volume at all -- bind, named or anonymous -- at /code/alembic.ini or under /code/migrations would
+    shadow the revisions the image was built with, so the target is checked, whatever the source. Every
+    repo-root compose file, overlays included: the dev and test definitions load them over the base.
+    """
+    services = compose_model.load(REPO_ROOT / name).get('services') or {}
+    shadowing = [
+        f'{name}: data_store mounts {volume["source"]} at {volume["target"]}'
+        for volume in map(compose_model.volume, (services.get('data_store') or {}).get('volumes') or [])
+        if any(PurePosixPath(volume['target']).is_relative_to(target) for target in REVISION_TARGETS)
+    ]
+    assert not shadowing, '\n'.join(shadowing)
 
 
 @pytest.mark.parametrize('name', COMPOSE_FILES)
