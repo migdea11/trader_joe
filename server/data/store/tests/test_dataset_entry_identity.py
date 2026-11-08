@@ -397,12 +397,23 @@ async def _bound_conflict(
     statement = _only(db.statements, 'INSERT')
     sql = _sql(statement)
     clause = _do_update_clause(sql)
-    bound = re.fullmatch(r'expiry = %\((\w+)\)s(?:, collect = %\((\w+)\)s)?, updated_at = now\(\)', clause)
+    bound = re.fullmatch(
+        r'expiry = %\((\w+)\)s(?:, collect = %\((\w+)\)s(?:, stopped_cause = %\((\w+)\)s)?)?, updated_at = now\(\)',
+        clause,
+    )
     assert bound, (
         f'the exact-repeat branch no longer writes the body expiry (and an explicit collect) as plain binds, so a '
         f'repeat POST would not set them from the body (tj-grna9p.105, tj-grna9p.189): {clause}'
     )
     params = _params(statement)
+    # THE RESUME CLEAR (P50, tj-7zjov1.144; ADR tj-26jt9w addendum 13): an explicit collect TRUE on a repeat sets
+    # stopped_cause NULL in the same SET, and nothing else ever names stopped_cause here. Explicit false and an omitted
+    # collect leave the stored cause. Checked on every call, so every case above and below pins it.
+    if bound.group(2) is not None and params[bound.group(2)] is True:
+        assert bound.group(3) is not None, f'an explicit collect true did not clear stopped_cause in its SET: {clause}'
+        assert params[bound.group(3)] is None, f'the Resume wrote a stop cause instead of NULL: {clause}'
+    else:
+        assert bound.group(3) is None, f'a repeat that does not resume touched stopped_cause: {clause}'
     inserted = re.search(r'VALUES \((.*?)\) ON CONFLICT', sql)
     assert inserted, sql
     columns = re.search(r'INSERT INTO store_dataset_entry \((.*?)\) VALUES', sql)

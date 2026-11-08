@@ -345,6 +345,81 @@ async def test_the_crud_touches_only_collect_and_updated_at(world):
     assert sorted(part.split('=')[0].strip() for part in set_clause.split(',')) == ['collect', 'updated_at']
 
 
+# ------------------------------------------------------------------------------------------------- the store's stop
+# P50 (tj-7zjov1.144, ADR tj-26jt9w addendum 13; tests tj-7zjov1.145): stopped_cause says the STORE stopped the
+# dataset. A Resume (collect true) clears it in the SAME UPDATE (the CHECK refuses a cause on a collecting row); an
+# operator Stop never sets one, and leaves a stored one as it is.
+
+STORE_STOP = 'VENDOR_ASSET_CHANGED'
+
+
+async def _store_stop(world: World, dataset_id: uuid.UUID) -> None:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
+
+    async with AsyncSession(world.engine) as db:
+        await db.execute(
+            StoreDatasetEntry.__table__.update()
+            .where(StoreDatasetEntry.id == dataset_id)
+            .values(collect=False, stopped_cause=STORE_STOP)
+        )
+        await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_the_crud_resume_sets_collect_the_cause_and_updated_at_in_one_update(world):
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    await _store_stop(world, world.foreign.id)
+    statements: list[tuple[str, Any]] = []
+    event.listen(world.engine.sync_engine, 'before_cursor_execute', lambda *a: statements.append((a[2], a[3])))
+    async with AsyncSession(world.engine, expire_on_commit=False) as db:
+        assert (
+            await repo.operator_set_collecting(db, world.foreign.id, True, OperatorOverrideInput('why', True)) is True
+        )
+    (update,) = [(s, p) for s, p in statements if s.lstrip().upper().startswith('UPDATE')]
+    set_clause = update[0].split(' SET ', 1)[1].split(' WHERE ', 1)[0]
+    assert sorted(part.split('=')[0].strip() for part in set_clause.split(',')) == [
+        'collect',
+        'stopped_cause',
+        'updated_at',
+    ], set_clause
+    stored = await world.entry(world.foreign.id)
+    assert (stored.collect, stored.stopped_cause) == (True, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('name', ['dataset', 'foreign', 'stream'])
+async def test_resuming_a_store_stopped_subscription_clears_its_cause_and_publishes_resumed(client, world, name):
+    row = getattr(world, name)
+    await _store_stop(world, row.id)
+    override = {} if row.owner == OPERATOR_PRINCIPAL else {'override': GOOD_OVERRIDE}
+
+    response = await patch(client, row.id, {'collect': True, **override})
+
+    assert response.status_code == 200, response.text
+    assert (response.json()['state'], response.json()['collecting']) == ('DATASET_STATE_ACTIVE', True)
+    stored = await world.entry(row.id)
+    assert (stored.collect, stored.stopped_cause) == (True, None)
+    assert world.events == [(DatasetChanged(row.id, DatasetChange.RESUMED), 1)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('store_stopped', 'cause'), [(False, None), (True, STORE_STOP)], ids=['collecting', 'store-stopped']
+)
+async def test_an_operator_stop_never_sets_a_cause_and_leaves_a_stored_one(client, world, store_stopped, cause):
+    if store_stopped:
+        await _store_stop(world, world.dataset.id)
+
+    response = await patch(client, world.dataset.id, {'collect': False})
+
+    assert response.status_code == 200, response.text
+    stored = await world.entry(world.dataset.id)
+    assert (stored.collect, stored.stopped_cause) == (False, cause)
+
+
 # ------------------------------------------------------------------------------------------------- events
 
 

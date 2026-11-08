@@ -1,3 +1,5 @@
+from enum import StrEnum
+
 from sqlalchemy import UUID, Boolean, CheckConstraint, Column, DateTime, Enum, String, UniqueConstraint, func
 
 from common.database.sql_alchemy_nullable_datetime import NullableDateTime as SqlNullableDateTime
@@ -8,6 +10,16 @@ from common.database.sql_alchemy_types import CustomColumn
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from common.sensitive import REDACTED
+
+
+class DatasetStopCause(StrEnum):
+    """Why the STORE stopped a dataset (store_dataset_entry.stopped_cause, a plain string column).
+
+    An operator's Stop never sets one. A Resume (collect set true) clears it.
+    """
+
+    # A bars delivery named another vendor asset id than the dataset's last accepted delivery (P50).
+    VENDOR_ASSET_CHANGED = 'VENDOR_ASSET_CHANGED'
 
 
 class StoreDatasetEntry(AppBase.DATA_STORE_BASE, CustomTypeTable):
@@ -142,7 +154,7 @@ class StoreDatasetEntry(AppBase.DATA_STORE_BASE, CustomTypeTable):
     collect = Column(Boolean, nullable=True)
     # Why the STORE stopped this dataset (collect set false by a store rule, not by the operator). NULL means the store
     # did not stop it, whatever collect says. Only a stopped subscription can hold one (the CHECK below). Added by
-    # b8e4c1f7a923; nothing writes it yet, the stop rule (tj-7zjov1.144) is its one writer. Not identity.
+    # b8e4c1f7a923; the stop rule (tj-7zjov1.144, DatasetStopCause) is its one writer, and a Resume clears it. Not identity.
     stopped_cause = Column(String, nullable=True)
 
     # Dates used to manage split and dividends adjustments

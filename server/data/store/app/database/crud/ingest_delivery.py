@@ -29,7 +29,7 @@ from data.store.app.database.crud.ingest_run import IngestRunRecord
 from data.store.app.database.models.ingest_instance import IngestInstance
 from data.store.app.database.models.ingest_request import IngestRequest, IngestRequestFailureCause, IngestRequestState
 from data.store.app.database.models.ingest_run import IngestRun, IngestRunState, IngestRunTrigger
-from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
+from data.store.app.database.models.store_dataset_entry import DatasetStopCause, StoreDatasetEntry
 from schemas.data_ingest.delivery import VendorCallStats
 
 
@@ -90,6 +90,9 @@ class NewAttempt:
     # The window a SUCCEEDED attempt answered for (the trailer's served range); None on any other attempt.
     served_start: datetime | None = None
     served_end: datetime | None = None
+    # A run-record marker for a FAILED attempt the store itself refused (VENDOR_ASSET_CHANGED_REASON); error_domain
+    # stays NULL. None for every other attempt.
+    error_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -230,6 +233,7 @@ async def insert_attempt(db: AsyncSession, attempt: NewAttempt) -> IngestRunReco
         'requested_end': request.requested_end,
         'state': attempt.state,
         'bars_written': attempt.bars_written,
+        'error_reason': attempt.error_reason,
         'error_message': attempt.error_message,
         'started_at': attempt.started_at if attempt.started_at is not None else func.now(),
         'finished_at': attempt.finished_at if attempt.finished_at is not None else func.now(),
@@ -345,3 +349,27 @@ async def touch_entry(db: AsyncSession, dataset_id: uuid.UUID) -> None:
     """
     table = StoreDatasetEntry.__table__
     await db.execute(update(table).where(table.c.id == dataset_id).values(updated_at=func.now()))
+
+
+async def stop_entry(db: AsyncSession, dataset_id: uuid.UUID, cause: DatasetStopCause) -> bool:
+    """Stop a subscription: collect false, the store's cause and updated_at, in one UPDATE (the stop rule, P50).
+
+    Runs in the delivery transaction under the entry lock the bars arm already holds. Health, the status group, the
+    refresh and the drop rule then treat the entry as Stopped through is_retired. A STATIC entry has no collect intent
+    (collect is NULL by CHECK, and a cause needs collect false), so it is left as it is and False is returned.
+
+    Args:
+        db: The caller's session, inside its transaction, with the entry locked.
+        dataset_id: The entry.
+        cause: Why the store stopped it.
+
+    Returns:
+        bool: True when the entry was stopped, False when it is STATIC (or gone).
+    """
+    table = StoreDatasetEntry.__table__
+    result = await db.execute(
+        update(table)
+        .where(table.c.id == dataset_id, table.c.collect.is_not(None))
+        .values(collect=False, stopped_cause=cause.value, updated_at=func.now())
+    )
+    return result.rowcount > 0

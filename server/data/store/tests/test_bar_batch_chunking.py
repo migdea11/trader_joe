@@ -939,6 +939,10 @@ async def test_the_intake_hands_the_configured_batch_size_to_the_write_path(monk
     async def own_session():
         yield AsyncMock()
 
+    # The stop rule's comparison base (P50) is read on the session: a mocked session answers with a mock, which the
+    # rule would compare as an earlier vendor asset id. This dataset has none earlier, so the bars are accepted.
+    monkeypatch.setattr(delivery_intake, 'last_accepted_vendor_asset_id', AsyncMock(return_value=None))
+
     @asynccontextmanager
     async def no_transaction(_db, _name):
         yield

@@ -45,6 +45,7 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
@@ -59,11 +60,12 @@ from common.database.sql_alchemy_nullable_datetime import NullableDateTime
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from common.errors.vocabulary import InvalidRequestError, Reason
+from data.store.app import daily_refresh
 from data.store.app.corporate_actions import observations_of
 from data.store.app.database.crud import corporate_action as corporate_action_crud
 from data.store.app.database.crud import ingest_delivery
 from data.store.app.database.crud import ingest_request as request_crud
-from data.store.app.database.crud.ingest_run import IngestRunRecord
+from data.store.app.database.crud.ingest_run import IngestRunRecord, last_accepted_vendor_asset_id
 from data.store.app.database.models.corporate_action import CorporateAction
 from data.store.app.database.models.ingest_instance import IngestInstance
 from data.store.app.database.models.ingest_request import (
@@ -72,8 +74,14 @@ from data.store.app.database.models.ingest_request import (
     IngestRequestKind,
     IngestRequestState,
 )
-from data.store.app.database.models.ingest_run import IngestRun, IngestRunState, IngestRunTrigger
-from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
+from data.store.app.database.models.ingest_run import (
+    VENDOR_ASSET_CHANGED_REASON,
+    IngestRun,
+    IngestRunState,
+    IngestRunTrigger,
+)
+from data.store.app.database.models.store_dataset_entry import DatasetStopCause, StoreDatasetEntry
+from data.store.app.dataset_catalog import is_retired
 from data.store.app.events import DatasetChange, DatasetChanged, IngestRunChanged
 from data.store.app.ingest import delivery_intake
 from data.store.app.ingest.delivery_intake import DeliveryIntake
@@ -237,6 +245,10 @@ class Store:
             on_repeat: dict = {'expiry': values.get('expiry'), 'updated_at': sa.func.now()}
             if collect is not None and resolved is not None:
                 on_repeat['collect'] = resolved
+                if resolved is True:
+                    # The Resume clear (P50), as the real one does (pinned by test_dataset_entry_identity.py's
+                    # _bound_conflict and on Postgres): without it the model's CHECK refuses the repeat.
+                    on_repeat['stopped_cause'] = None
             statement = (
                 sqlite_insert(ENTRIES)
                 .values(id=uuid.uuid4(), **values, collect=resolved, created_at=sa.func.now(), updated_at=sa.func.now())
@@ -2121,3 +2133,573 @@ async def test_a_redelivery_from_the_same_instance_logs_no_error(store, caplog):
     await store.deliver(report(request_id, DeliveryOutcome.FAILED))
     await store.deliver(report(request_id, DeliveryOutcome.FAILED))
     assert [r for r in _app_records(caplog) if r.levelno >= logging.ERROR] == []
+
+
+# --------------------------------------------------------------------------------------------- P50: the stop rule
+#
+# tj-7zjov1.144 (P50), tests tj-7zjov1.145 (P50v); ADR tj-26jt9w addenda 12 and 13; the architect's P18 gate note on
+# P50 (the comparison base reads only bars attempts of the same dataset). A SUCCEEDED bars delivery whose vendor asset
+# id differs from the dataset's LAST ACCEPTED one (SUCCEEDED or EMPTY, a bars attempt of this dataset, with an id), or
+# is empty after a set one, writes no bar; the same transaction stops the entry (collect false, stopped_cause
+# VENDOR_ASSET_CHANGED), fails the attempt row (marker, error_domain NULL, the delivered id) and the request (cause and
+# sentence), answers FINAL, logs one WARNING, and publishes RETIRED after the commit. A refused attempt is never a base.
+
+ID_A = 'vendor-asset-A-1f0'
+ID_B = 'vendor-asset-B-7c4'
+MARKER = 'VENDOR_ASSET_CHANGED'
+
+
+class Series:
+    """Deliveries to one dataset entry, each on its own refresh request, each finishing later than the one before.
+
+    The trailer's as_of is the attempt row's finished_at, which orders the comparison base; the shared builder gives
+    every report the same instant, so each delivery here is given its own, one hour after the previous one.
+    """
+
+    clock = 0
+
+    def __init__(self, store: Store, entry_id: uuid.UUID) -> None:
+        self.store, self.entry_id = store, entry_id
+
+    async def deliver(
+        self,
+        vendor_asset_id: str,
+        *,
+        parts: list | None = None,
+        outcome: DeliveryOutcome = DeliveryOutcome.SUCCEEDED,
+        hours: int | None = None,
+    ) -> tuple[uuid.UUID, DeliverAttemptResponse]:
+        Series.clock += 1
+        request_id = await self.store.request(dataset=False, dataset_id=self.entry_id)
+        attempt = with_header(report(request_id, outcome, parts=parts), vendor_asset_id=vendor_asset_id)
+        attempt = with_trailer(attempt, as_of=AS_OF + timedelta(hours=Series.clock if hours is None else hours))
+        return request_id, await self.store.deliver(attempt)
+
+
+async def _series(store: Store, **entry) -> Series:
+    return Series(store, await store.entry(**entry))
+
+
+async def _bar_count(store: Store, entry_id: uuid.UUID) -> int:
+    return len([row for row in await store.bars() if row.dataset_id == entry_id])
+
+
+async def _resume(store: Store, entry_id: uuid.UUID) -> None:
+    """A Resume as the operator's crud writes it (collect true and stopped_cause NULL in one UPDATE).
+
+    The crud itself is pinned in test_ui_dataset_collecting_route.py and on Postgres; here only its effect is needed.
+    """
+    async with AsyncSession(store.engine) as db:
+        await db.execute(sa.update(ENTRIES).where(ENTRIES.c.id == entry_id).values(collect=True, stopped_cause=None))
+        await db.commit()
+
+
+async def _operator_stop(store: Store, entry_id: uuid.UUID) -> None:
+    async with AsyncSession(store.engine) as db:
+        await db.execute(sa.update(ENTRIES).where(ENTRIES.c.id == entry_id).values(collect=False))
+        await db.commit()
+
+
+async def _move_run(store: Store, request_id: uuid.UUID, **values) -> None:
+    async with AsyncSession(store.engine) as db:
+        await db.execute(sa.update(RUNS).where(RUNS.c.request_id == request_id).values(**values))
+        await db.commit()
+
+
+async def _assert_refused_and_stopped(
+    store: Store, series: Series, request_id: uuid.UUID, answer, earlier: str, delivered: str | None
+) -> str:
+    """Every field of the stop, as ruled (addendum 13 (i) to (v)). Returns the sentence for the log check."""
+    assert answer == DeliverAttemptResponse(verdict=FINAL, attempt_count=1)
+    entry = await store.entry_row(series.entry_id)
+    assert (entry.collect, entry.stopped_cause) == (False, MARKER), 'the entry is not stopped by the store'
+    assert entry.updated_at != START, 'the stop did not move updated_at'
+    (run,) = await store.runs(request_id)
+    assert (run.state, run.bars_written, run.verdict) == (IngestRunState.FAILED, 0, 'FINAL')
+    assert (run.error_domain, run.error_reason) == (None, MARKER), 'the marker, never a typed (domain, reason)'
+    assert run.vendor_asset_id == delivered, 'the delivered id, as received (NULL when empty)'
+    assert run.dataset_id == series.entry_id
+    sentence = run.error_message
+    assert sentence and 'VFV' in sentence and f"'{earlier}'" in sentence, sentence
+    if delivered is None:
+        assert 'no vendor asset id' in sentence, sentence
+    else:
+        assert f"'{delivered}'" in sentence, sentence
+    row = await store.request_row(request_id)
+    assert (row.state, row.failure_cause) == (IngestRequestState.FAILED, MARKER)
+    assert row.failure_detail == sentence, 'the request carries the same sentence as the attempt row'
+    assert row.finished_at is not None
+    events = [event for event in store.published if not isinstance(event, IngestRunChanged)]
+    assert events[-1] == DatasetChanged(series.entry_id, DatasetChange.RETIRED), 'RETIRED, never UPDATED'
+    return sentence
+
+
+async def test_p50_the_fb_case_an_id_then_a_different_id_stops_the_dataset_and_writes_no_bar(store, caplog):
+    """The FB case from the spikes: one symbol, an id, then another id. Every field of the stop is pinned."""
+    caplog.set_level(logging.DEBUG, logger='data.store')
+    series = await _series(store)
+    first, answer = await series.deliver(ID_A)
+    assert answer.verdict is FINAL and (await store.request_row(first)).state is IngestRequestState.SUCCEEDED
+    assert await _bar_count(store, series.entry_id) == 2
+    batches = len(store.batches)
+    store.published.clear()
+
+    second, answer = await series.deliver(ID_B)
+
+    sentence = await _assert_refused_and_stopped(store, series, second, answer, ID_A, ID_B)
+    assert len(store.batches) == batches, 'a bar of the refused attempt reached the writer'
+    assert await _bar_count(store, series.entry_id) == 2, 'a bar of the refused attempt was stored'
+    run_event, dataset_event = store.published
+    assert isinstance(run_event, IngestRunChanged) and run_event.run.error_reason == MARKER
+    assert dataset_event == DatasetChanged(series.entry_id, DatasetChange.RETIRED)
+    # The earlier attempt is left exactly as it was: nothing relabels or moves a bar.
+    (earlier,) = await store.runs(first)
+    assert (earlier.state, earlier.vendor_asset_id, earlier.bars_written) == (IngestRunState.SUCCEEDED, ID_A, 2)
+    # ONE WARNING with the sentence, the request id and the dataset id; never the label or the quota key.
+    warnings = [r.getMessage() for r in _app_records(caplog, logging.WARNING) if sentence in r.getMessage()]
+    assert len(warnings) == 1, warnings
+    assert str(second) in warnings[0] and str(series.entry_id) in warnings[0]
+    for record in _app_records(caplog):
+        assert LABEL not in record.getMessage() and QUOTA_KEY not in record.getMessage()
+
+
+async def test_p50_a_same_id_series_runs_on(store):
+    series = await _series(store)
+    for _ in range(3):
+        request_id, answer = await series.deliver(ID_A)
+        assert answer.verdict is FINAL
+        assert (await store.request_row(request_id)).state is IngestRequestState.SUCCEEDED
+    assert await _bar_count(store, series.entry_id) == 6
+    entry = await store.entry_row(series.entry_id)
+    assert (entry.collect, entry.stopped_cause) == (True, None)
+    assert DatasetChanged(series.entry_id, DatasetChange.RETIRED) not in store.published
+
+
+@pytest.mark.parametrize('history', ['none', 'empty-id', 'failed-only'])
+async def test_p50_with_no_earlier_accepted_id_the_delivery_is_accepted_and_its_id_becomes_the_base(store, history):
+    """No earlier id: accept and record (P49). An empty-id success and a FAILED attempt with an id set no base."""
+    series = await _series(store)
+    if history == 'empty-id':
+        await series.deliver('')
+    elif history == 'failed-only':
+        await series.deliver(ID_B, outcome=DeliveryOutcome.FAILED)
+
+    request_id, _ = await series.deliver(ID_A)
+
+    assert (await store.request_row(request_id)).state is IngestRequestState.SUCCEEDED
+    assert (await store.entry_row(series.entry_id)).stopped_cause is None
+    # ... and that id is now the base: another one stops.
+    request_id, answer = await series.deliver(ID_B)
+    await _assert_refused_and_stopped(store, series, request_id, answer, ID_A, ID_B)
+
+
+async def test_p50_an_empty_id_after_a_set_one_stops_and_stores_null(store):
+    series = await _series(store)
+    await series.deliver(ID_A)
+
+    request_id, answer = await series.deliver('')
+
+    await _assert_refused_and_stopped(store, series, request_id, answer, ID_A, None)
+    assert await _bar_count(store, series.entry_id) == 2
+
+
+@pytest.mark.parametrize(
+    ('delivered', 'stops'), [(ID_B, True), ('', True), (ID_A, False)], ids=['other', 'empty', 'same']
+)
+async def test_p50_a_zero_bar_success_is_judged_too(store, delivered, stops):
+    """The check sits before the arm's early return for no bars: a zero-bar success with another id stops."""
+    series = await _series(store)
+    await series.deliver(ID_A)
+
+    request_id, answer = await series.deliver(delivered, parts=[BarPage(bars=[])])
+
+    if stops:
+        await _assert_refused_and_stopped(store, series, request_id, answer, ID_A, delivered or None)
+    else:
+        (run,) = await store.runs(request_id)
+        assert (run.state, run.error_reason) == (IngestRunState.EMPTY, None)
+        assert (await store.entry_row(series.entry_id)).collect is True
+
+
+async def test_p50_resume_is_a_recheck_a_new_id_stops_again_and_the_earlier_id_is_accepted(store):
+    """A refused attempt is never a base: after a Resume the base is still the last ACCEPTED id."""
+    series = await _series(store)
+    await series.deliver(ID_A)
+    await series.deliver(ID_B)  # refused: the dataset stops
+    await _resume(store, series.entry_id)
+
+    again, answer = await series.deliver(ID_B)
+    await _assert_refused_and_stopped(store, series, again, answer, ID_A, ID_B)
+    assert await _bar_count(store, series.entry_id) == 2
+
+    await _resume(store, series.entry_id)
+    back, answer = await series.deliver(ID_A)
+    assert answer.verdict is FINAL
+    (run,) = await store.runs(back)
+    assert (run.state, run.bars_written, run.error_reason) == (IngestRunState.SUCCEEDED, 2, None)
+    entry = await store.entry_row(series.entry_id)
+    assert (entry.collect, entry.stopped_cause) == (True, None)
+    assert await _bar_count(store, series.entry_id) == 4
+
+
+async def test_p50_a_failed_vendor_attempt_with_another_id_never_becomes_the_base(store):
+    """A FAILED attempt (the vendor's transient failure here), newer or not, is not accepted: the base excludes FAILED."""
+    series = await _series(store)
+    await series.deliver(ID_A)
+    await series.deliver(ID_B, outcome=DeliveryOutcome.FAILED)
+
+    request_id, _ = await series.deliver(ID_A)
+
+    (run,) = await store.runs(request_id)
+    assert (run.state, run.error_reason) == (IngestRunState.SUCCEEDED, None)
+    assert (await store.entry_row(series.entry_id)).stopped_cause is None
+
+
+async def test_p50_a_corporate_actions_or_other_non_bars_row_in_the_datasets_history_is_never_the_base(store):
+    """The architect's P18 gate note: the base reads bars attempts of this dataset only (granularity set).
+
+    Two rows newer than the accepted A, both naming this dataset: a real corporate-actions attempt (its id NULL by
+    kind) moved onto the dataset, and a crafted non-bars row (granularity NULL) that DOES carry another id. Neither is
+    a base, so A delivered again is accepted; read as a base, the second would stop the dataset.
+    """
+    series = await _series(store)
+    await series.deliver(ID_A, hours=1)
+    ca = await ca_request(store)
+    await store.deliver(with_header(ca_report(ca, actions(action())), vendor_asset_id=ID_B))
+    await _move_run(store, ca, dataset_id=series.entry_id, finished_at=AS_OF + timedelta(hours=50))
+    other = await _series(store, asset_symbol='ZZOTHER')
+    crafted, _ = await other.deliver(ID_B)
+    await _move_run(
+        store, crafted, dataset_id=series.entry_id, granularity=None, finished_at=AS_OF + timedelta(hours=60)
+    )
+    (ca_run,) = await store.runs(ca)
+    assert (ca_run.vendor_asset_id, ca_run.granularity) == (None, None), 'the corporate-actions row, as P18 writes it'
+
+    request_id, _ = await series.deliver(ID_A, hours=100)
+
+    (run,) = await store.runs(request_id)
+    assert (run.state, run.error_reason) == (IngestRunState.SUCCEEDED, None)
+    assert (await store.entry_row(series.entry_id)).collect is True
+
+
+async def test_p50_another_datasets_attempts_never_count(store):
+    """Same symbol, two datasets, two ids: each dataset is judged against its own history only."""
+    mine = await _series(store)
+    theirs = await _series(store, granularity=Granularity.ONE_HOUR)
+    await mine.deliver(ID_A)
+    await theirs.deliver(ID_B)
+
+    mine_request, _ = await mine.deliver(ID_A)
+    theirs_request, _ = await theirs.deliver(ID_B)
+
+    for request_id in (mine_request, theirs_request):
+        assert (await store.request_row(request_id)).state is IngestRequestState.SUCCEEDED
+    for series in (mine, theirs):
+        assert (await store.entry_row(series.entry_id)).collect is True
+
+
+async def test_p50_the_base_is_the_newest_accepted_attempt_by_finished_at_not_by_insertion(store):
+    """Ordered by finished_at descending: a row inserted later but finished earlier is not the base."""
+    series = await _series(store)
+    await series.deliver(ID_A, hours=10)
+    other = await _series(store, asset_symbol='ZZOTHER')
+    late_insert, _ = await other.deliver(ID_B, hours=1)
+    await _move_run(store, late_insert, dataset_id=series.entry_id)
+
+    request_id, _ = await series.deliver(ID_A, hours=20)
+
+    assert (await store.request_row(request_id)).state is IngestRequestState.SUCCEEDED
+
+
+RECEIVED = '  Vendor-Asset/ÄBC 01  '
+
+
+@pytest.mark.parametrize(
+    ('delivered', 'stops'),
+    [(RECEIVED, False), (RECEIVED.strip(), True), (RECEIVED.lower(), True), (RECEIVED.upper(), True)],
+    ids=['as-received', 'trimmed', 'lower', 'upper'],
+)
+async def test_p50_the_id_is_stored_and_compared_as_received_never_normalised(store, delivered, stops):
+    """The P49 gate note: a mixed-case id with surrounding characters is stored and compared unchanged."""
+    series = await _series(store)
+    first, _ = await series.deliver(RECEIVED)
+    assert (await store.runs(first))[0].vendor_asset_id == RECEIVED
+
+    request_id, answer = await series.deliver(delivered)
+
+    if stops:
+        await _assert_refused_and_stopped(store, series, request_id, answer, RECEIVED, delivered)
+    else:
+        assert (await store.request_row(request_id)).state is IngestRequestState.SUCCEEDED
+    assert (await store.runs(request_id))[0].vendor_asset_id == delivered
+
+
+async def test_p50_the_entry_is_stopped_in_the_transaction_and_retired_is_published_only_after_the_commit(
+    store, monkeypatch
+):
+    series = await _series(store)
+    await series.deliver(ID_A)
+    order: list[object] = []
+    real_transaction, real_stop = delivery_intake.write_transaction, delivery_intake.stop_entry
+
+    @asynccontextmanager
+    async def tracking(db, name):
+        async with real_transaction(db, name):
+            yield
+        order.append('commit')
+
+    async def stop(db, dataset_id, cause):
+        order.append('stop')
+        return await real_stop(db, dataset_id, cause)
+
+    monkeypatch.setattr(delivery_intake, 'write_transaction', tracking)
+    monkeypatch.setattr(delivery_intake, 'stop_entry', stop)
+    monkeypatch.setattr(delivery_intake, 'publish', order.append)
+
+    await series.deliver(ID_B)
+
+    assert order[:2] == ['stop', 'commit'], order
+    assert [type(event) for event in order[2:]] == [IngestRunChanged, DatasetChanged], order
+    assert order[3] == DatasetChanged(series.entry_id, DatasetChange.RETIRED)
+
+
+async def test_p50_the_drop_rule_runs_first_a_stopped_entry_is_dropped_not_compared(store, monkeypatch):
+    """After the entry lock and the drop rule: a store-stopped entry's next delivery is DISCARDED, cause unchanged."""
+    series = await _series(store)
+    await series.deliver(ID_A)
+    await series.deliver(ID_B)
+    order: list[str] = []
+    real_lock, real_base = delivery_intake.lock_active_dataset_entry, delivery_intake.last_accepted_vendor_asset_id
+
+    async def lock(db, dataset_id):
+        order.append('lock')
+        return await real_lock(db, dataset_id)
+
+    async def base(db, dataset_id):
+        order.append('base')
+        return await real_base(db, dataset_id)
+
+    monkeypatch.setattr(delivery_intake, 'lock_active_dataset_entry', lock)
+    monkeypatch.setattr(delivery_intake, 'last_accepted_vendor_asset_id', base)
+    store.published.clear()
+
+    request_id, answer = await series.deliver('vendor-asset-C')
+
+    assert order == ['lock'], 'a dropped delivery is never compared'
+    assert answer.verdict is FINAL
+    row = await store.request_row(request_id)
+    assert (row.state, row.failure_cause) == (IngestRequestState.EMPTY, IngestRequestFailureCause.DISCARDED.value)
+    entry = await store.entry_row(series.entry_id)
+    assert (entry.collect, entry.stopped_cause) == (False, MARKER)
+    assert [type(event) for event in store.published] == [IngestRunChanged], 'a drop announces no dataset change'
+
+    await _resume(store, series.entry_id)
+    order.clear()
+    await series.deliver(ID_A)
+    assert order == ['lock', 'base'], 'on a live entry the base is read after the lock'
+
+
+async def _base(store: Store, entry_id: uuid.UUID) -> str | None:
+    """The stop rule's base as the production query reads it."""
+    async with AsyncSession(store.engine) as db:
+        return await last_accepted_vendor_asset_id(db, entry_id)
+
+
+@pytest.mark.parametrize('stopped_by', ['operator', 'store'])
+async def test_p50_a_delivery_dropped_while_stopped_never_becomes_the_base(store, stopped_by):
+    """P50f (tj-7zjov1.163), ADR tj-26jt9w addendum 16: a dropped bars attempt row stores NULL vendor_asset_id.
+
+    The drop rule runs before the stop rule, so a refresh in flight when the entry is stopped is dropped unjudged. Its
+    row keeps state EMPTY, its dataset id and its verdict, but never its id, so after a Resume the base is still the
+    last ACCEPTED id: a delivery with the new id stops again naming the earlier one, and the earlier id is accepted.
+    """
+    series = await _series(store)
+    await series.deliver(ID_A)
+    if stopped_by == 'operator':
+        await _operator_stop(store, series.entry_id)
+    else:
+        await series.deliver(ID_B)  # the store's stop
+    dropped, answer = await series.deliver(ID_B)  # a refresh already in flight: dropped, nothing compared
+
+    assert answer.verdict is FINAL
+    (row,) = await store.runs(dropped)
+    assert row.state is IngestRunState.EMPTY, 'a dropped delivery is still written EMPTY'
+    assert row.vendor_asset_id is None, 'a dropped (unjudged) delivery stored its vendor asset id'
+    assert row.dataset_id == series.entry_id, 'a dropped attempt row keeps its dataset id'
+    assert (row.bars_written, row.error_reason, row.verdict) == (0, None, 'FINAL')
+    request = await store.request_row(dropped)
+    assert (request.state, request.failure_cause) == (
+        IngestRequestState.EMPTY,
+        IngestRequestFailureCause.DISCARDED.value,
+    )
+    assert await _base(store, series.entry_id) == ID_A, 'the base is the last accepted id, never the dropped one'
+    await _resume(store, series.entry_id)
+
+    request_id, answer = await series.deliver(ID_B)
+
+    await _assert_refused_and_stopped(store, series, request_id, answer, ID_A, ID_B)
+    assert await _bar_count(store, series.entry_id) == 2, 'the new holder reached the old series'
+
+    await _resume(store, series.entry_id)
+    back, answer = await series.deliver(ID_A)
+
+    assert answer.verdict is FINAL
+    (run,) = await store.runs(back)
+    assert (run.state, run.bars_written, run.error_reason, run.vendor_asset_id) == (
+        IngestRunState.SUCCEEDED,
+        2,
+        None,
+        ID_A,
+    ), 'the earlier id is judged against the last accepted id and accepted'
+    entry = await store.entry_row(series.entry_id)
+    assert (entry.collect, entry.stopped_cause) == (True, None)
+    assert await _bar_count(store, series.entry_id) == 4
+
+
+async def test_p50_a_judged_empty_delivery_still_stores_its_id_and_is_the_base(store):
+    """The other side of P50f: only a DROPPED attempt loses its id.
+
+    A judged zero-bar success (EMPTY) keeps it as received and is an accepted base, so a later different id stops
+    naming it.
+    """
+    series = await _series(store)
+    first, _ = await series.deliver(ID_A, parts=[BarPage(bars=[])])
+    (row,) = await store.runs(first)
+    assert (row.state, row.vendor_asset_id, row.dataset_id) == (IngestRunState.EMPTY, ID_A, series.entry_id)
+    assert await _base(store, series.entry_id) == ID_A
+
+    request_id, answer = await series.deliver(ID_B)
+
+    await _assert_refused_and_stopped(store, series, request_id, answer, ID_A, ID_B)
+
+
+async def test_p50_a_static_entry_refuses_the_bars_and_fails_the_attempt_but_is_left_as_it_is(store):
+    """AS BUILT, for the architect's ruling: STATIC (collect NULL, so it cannot carry a cause by CHECK).
+
+    The bars are refused and the attempt row and request fail exactly as for a subscription; the entry keeps collect
+    NULL and no cause; the event is UPDATED, not RETIRED. stop_entry returns False for it.
+    """
+    series = await _series(store, update_type=UpdateType.STATIC, collect=None)
+    await series.deliver(ID_A)
+    store.published.clear()
+
+    request_id, answer = await series.deliver(ID_B)
+
+    assert answer == DeliverAttemptResponse(verdict=FINAL, attempt_count=1)
+    assert await _bar_count(store, series.entry_id) == 2
+    (run,) = await store.runs(request_id)
+    assert (run.state, run.error_reason, run.error_domain, run.bars_written) == (IngestRunState.FAILED, MARKER, None, 0)
+    row = await store.request_row(request_id)
+    assert (row.state, row.failure_cause) == (IngestRequestState.FAILED, MARKER)
+    entry = await store.entry_row(series.entry_id)
+    assert (entry.collect, entry.stopped_cause) == (None, None), 'the STATIC entry was stopped (only updated_at moves)'
+    assert store.published[-1] == DatasetChanged(series.entry_id, DatasetChange.UPDATED)
+    async with AsyncSession(store.engine) as db:
+        assert await ingest_delivery.stop_entry(db, series.entry_id, DatasetStopCause.VENDOR_ASSET_CHANGED) is False
+
+
+async def test_p50_stop_entry_sets_collect_false_the_cause_and_updated_at_in_one_update(store):
+    entry_id = await store.entry()
+    async with AsyncSession(store.engine) as db:
+        assert await ingest_delivery.stop_entry(db, entry_id, DatasetStopCause.VENDOR_ASSET_CHANGED) is True
+        await db.commit()
+    entry = await store.entry_row(entry_id)
+    assert (entry.collect, entry.stopped_cause) == (False, 'VENDOR_ASSET_CHANGED')
+    assert entry.updated_at != START
+    async with AsyncSession(store.engine) as db:
+        assert await ingest_delivery.stop_entry(db, uuid.uuid4(), DatasetStopCause.VENDOR_ASSET_CHANGED) is False
+
+
+async def test_p50_the_check_still_refuses_a_cause_on_a_collecting_row(store):
+    """ck_store_dataset_entry_stopped_cause_needs_stop holds: a Resume that forgot the cause is refused."""
+    series = await _series(store)
+    await series.deliver(ID_A)
+    await series.deliver(ID_B)
+    async with AsyncSession(store.engine) as db:
+        with pytest.raises(sa.exc.IntegrityError):
+            await db.execute(sa.update(ENTRIES).where(ENTRIES.c.id == series.entry_id).values(collect=True))
+            await db.commit()
+
+
+@pytest.mark.parametrize(
+    ('sent', 'collect', 'cause', 'change'),
+    [(True, True, None, DatasetChange.RESUMED), (False, False, MARKER, DatasetChange.UPDATED)],
+    ids=['explicit-true-resumes', 'explicit-false-leaves-it'],
+)
+async def test_p50_a_post_repeat_with_explicit_collect_decides_the_cause_and_the_earlier_id_is_accepted(
+    store, sent, collect, cause, change
+):
+    """A POST /store repeat (no dataset on the request: the upsert path) on a store-stopped entry, with the earlier id.
+
+    Explicit true clears stopped_cause with the collect it sets (the CHECK refuses otherwise); explicit false leaves
+    the stored cause. The delivery carries the last accepted id, so it is accepted and its bars are written.
+    """
+    entry_id = await store.entry(end=None, expiry_type=ExpiryType.ROLLING)
+    series = Series(store, entry_id)
+    await series.deliver(ID_A)
+    await series.deliver(ID_B)
+    store.published.clear()
+    request_id = await _post_request(store, collect=sent)
+
+    await store.deliver(with_trailer(with_header(report(request_id), vendor_asset_id=ID_A), as_of=LATER_AS_OF))
+
+    assert (await store.request_row(request_id)).dataset_id == entry_id
+    assert (await store.request_row(request_id)).state is IngestRequestState.SUCCEEDED
+    entry = await store.entry_row(entry_id)
+    assert (entry.collect, entry.stopped_cause) == (collect, cause)
+    assert store.published[-1] == DatasetChanged(entry_id, change)
+
+
+@pytest.mark.parametrize('sent', [True, None], ids=['explicit-true', 'omitted'])
+async def test_p50_a_post_repeat_with_a_new_id_is_judged_and_stops_again(store, sent):
+    """The POST path has no drop rule, so the compare runs: a new holder stops the dataset again, RETIRED."""
+    entry_id = await store.entry(end=None, expiry_type=ExpiryType.ROLLING)
+    series = Series(store, entry_id)
+    await series.deliver(ID_A)
+    await series.deliver(ID_B)
+    store.published.clear()
+    request_id = await _post_request(store, collect=sent)
+
+    answer = await store.deliver(with_header(report(request_id), vendor_asset_id=ID_B))
+
+    assert answer.verdict is FINAL
+    entry = await store.entry_row(entry_id)
+    assert (entry.collect, entry.stopped_cause) == (False, MARKER)
+    (run,) = await store.runs(request_id)
+    assert (run.state, run.error_reason) == (IngestRunState.FAILED, MARKER)
+    assert await _bar_count(store, entry_id) == 2
+    assert store.published[-1] == DatasetChanged(entry_id, DatasetChange.RETIRED)
+
+
+async def test_p50_the_stopped_entry_reads_stopped_to_the_catalog_the_status_group_and_the_daily_loop(store):
+    """Nothing new reads collect: is_retired (health, the status group, the refresh's owed set) sees the store's stop."""
+    series = await _series(store)
+    await series.deliver(ID_A)
+    await series.deliver(ID_B)
+    entry = await store.entry_row(series.entry_id)
+    assert is_retired(SimpleNamespace(update_type=UpdateType(entry.update_type), collect=entry.collect)) is True
+    async with AsyncSession(store.engine) as db:
+        assert await ingest_delivery.lock_active_dataset_entry(db, series.entry_id) is False, 'the drop rule sees it'
+
+
+async def test_p50_decide_answers_final_failed_with_the_cause_and_the_sentence():
+    stop = delivery_intake.VendorAssetStop('VFV', ID_A, ID_B)
+    decision = delivery_intake.decide(
+        report(uuid.uuid4()), bars_written=0, has_records=True, superseded=False, vendor_asset_stop=stop
+    )
+    assert decision == delivery_intake.Decision(
+        FINAL, IngestRequestState.FAILED, IngestRequestFailureCause.VENDOR_ASSET_CHANGED, stop.sentence
+    )
+    assert IngestRequestFailureCause.VENDOR_ASSET_CHANGED.value == MARKER
+    assert VENDOR_ASSET_CHANGED_REASON == MARKER and DatasetStopCause.VENDOR_ASSET_CHANGED.value == MARKER
+
+
+async def test_p50_the_refresh_permanence_read_tolerates_the_marker(store):
+    """The refresh's permanence read needs the vendor error domain: the marker (domain NULL) is no permanent refusal."""
+    series = await _series(store)
+    await series.deliver(ID_A)
+    request_id, _ = await series.deliver(ID_B)
+    (row,) = await store.runs(request_id)
+    run = dataclasses.replace(IngestRunRecord.from_row(row), request_failure_cause=MARKER)
+    assert (run.error_domain, run.error_reason) == (None, MARKER)
+    assert daily_refresh._unproductive(run, row.requested_start) is False

@@ -467,6 +467,37 @@ async def finishing_attempt(db: AsyncSession, request_id: uuid.UUID) -> IngestRu
     return IngestRunRecord.from_row(row) if row is not None else None
 
 
+async def last_accepted_vendor_asset_id(db: AsyncSession, dataset_id: uuid.UUID) -> str | None:
+    """The vendor asset id of the dataset's most recent accepted bars attempt that has one: the stop rule's base (P50).
+
+    Accepted means SUCCEEDED or EMPTY. A refused attempt is FAILED with the VENDOR_ASSET_CHANGED marker and is never a
+    base, or a Resume would accept the new holder at the next delivery. A DROPPED delivery (entry gone or stopped) is
+    EMPTY but stores no vendor asset id, because the stop rule never judged it, so it is never a base either. Only bars attempts count (a label granularity
+    is set), so a corporate-actions attempt row, which carries no vendor asset id, can never be read as one. Ordered by
+    finished_at then id, newest first. Read under the dataset entry's lock, which the delivery already holds.
+
+    Args:
+        db: The caller's session, inside the delivery transaction.
+        dataset_id: The dataset.
+
+    Returns:
+        str | None: The id as it was stored (as received), or None when no accepted attempt has one.
+    """
+    table = IngestRun.__table__
+    stmt = (
+        select(table.c.vendor_asset_id)
+        .where(
+            table.c.dataset_id == dataset_id,
+            table.c.vendor_asset_id.is_not(None),
+            table.c.granularity.is_not(None),
+            table.c.state.in_([IngestRunState.SUCCEEDED, IngestRunState.EMPTY]),
+        )
+        .order_by(table.c.finished_at.desc().nulls_last(), table.c.id.desc())
+        .limit(1)
+    )
+    return (await db.execute(stmt)).scalar_one_or_none()
+
+
 async def running_dataset_ids(db: AsyncSession) -> frozenset[uuid.UUID]:
     """The datasets that are collecting right now: an open request names them, or a legacy run is RUNNING.
 

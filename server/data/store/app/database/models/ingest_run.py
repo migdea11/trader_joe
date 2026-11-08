@@ -33,6 +33,12 @@ class IngestRunState(StrEnum):
 # so the run history can say "this run was cut off" rather than "this run failed for a reason".
 INTERRUPTED_REASON = 'INTERRUPTED'
 
+# error_reason written on the attempt row of a bars delivery the store refused because its vendor asset id differs from
+# the dataset's last accepted one (P50). Same kind of marker as INTERRUPTED_REASON: not a Reason member, never on
+# problem+json, error_domain stays NULL. The refresh's permanence read ignores it because it requires the vendor
+# error domain.
+VENDOR_ASSET_CHANGED_REASON = 'VENDOR_ASSET_CHANGED'
+
 
 def _values(enum_cls: type[StrEnum]) -> list[str]:
     return [member.value for member in enum_cls]
@@ -131,7 +137,7 @@ class IngestRun(AppBase.DATA_STORE_BASE, CustomTypeTable):
 
     # error_domain and error_reason are the typed vocabulary's (domain, reason); error_message is
     # TraderJoeError.detail and NEVER str() of an exception (D8). error_reason also takes
-    # INTERRUPTED_REASON, a run-record marker that is not a Reason member and never reaches
+    # INTERRUPTED_REASON or VENDOR_ASSET_CHANGED_REASON, run-record markers that are not Reason members and never reach
     # problem+json. All four are NULL unless state is FAILED.
     error_domain = Column(String, nullable=True)
     error_reason = Column(String, nullable=True)

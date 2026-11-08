@@ -48,9 +48,21 @@ asset-list kind is recorded yet. A corporate-actions attempt is recorded with it
 columns (revision c7e19a4d5b28 made them nullable).
 
 THE VENDOR ASSET ID. The header's vendor_asset_id is stored as received, opaque, in ingest_run.vendor_asset_id on the
-attempt row of every bars attempt. An empty id is stored NULL, never an empty string; the attempt row of another kind
-stores NULL whatever the header carries. Nothing here compares it, looks anything up or names a listing: the store only stores
-it (the stop rule that reads it is a later bead). It is reproducible by an asset lookup, so the wire rule is not engaged.
+attempt row of every bars attempt that was judged. An empty id is stored NULL, never an empty string; the attempt row of
+another kind stores NULL whatever the header carries, and so does that of a DROPPED delivery (the entry was gone or
+stopped): the drop rule runs before the stop rule, so its id was never judged and must not become the base (addendum
+16). Its row keeps state EMPTY and its dataset id. The only comparison is the stop rule below: it looks nothing up and names no
+listing. It is reproducible by an asset lookup, so the wire rule is not engaged.
+
+THE STOP RULE (P50, ADR tj-26jt9w addenda 12 and 13). The bars arm compares the header's vendor asset id with the one on
+the dataset's last accepted bars attempt (SUCCEEDED or EMPTY, a bars attempt only), after the entry lock and the drop
+rule, on every SUCCEEDED bars report, a zero-bar one included. No earlier id, or an equal one: accepted. A different,
+or an empty one after a set one: NO BAR IS WRITTEN, the same transaction stops the entry (collect false, stopped_cause
+VENDOR_ASSET_CHANGED), the attempt row is FAILED with the VENDOR_ASSET_CHANGED marker and a sentence naming the symbol
+and both ids, the request is FAILED with the same cause and sentence, the answer is FINAL, one WARNING is logged, and
+DatasetChanged RETIRED follows the commit. A refused attempt is never a comparison base, and neither is a dropped one (it stores no id). Nothing relabels or moves a bar.
+A STATIC entry has no collect intent to stop (collect is NULL by CHECK): the bars are refused all the same and the
+attempt and request fail the same way, but the entry is left as it is.
 
 THE LABEL (client_label) AND THE QUOTA KEY ARE NEVER LOGGED beyond what a log line below names: ids, numbers, enums.
 """
@@ -80,11 +92,12 @@ from data.store.app.database.crud.ingest_delivery import (
     lock_active_dataset_entry,
     lock_request,
     set_request_dataset,
+    stop_entry,
     touch_entry,
 )
 from data.store.app.database.crud.ingest_instance import note_instance_seen
 from data.store.app.database.crud.ingest_request import IngestRequestRecord
-from data.store.app.database.crud.ingest_run import IngestRunRecord
+from data.store.app.database.crud.ingest_run import IngestRunRecord, last_accepted_vendor_asset_id
 from data.store.app.database.crud.stock.asset_market_activity import write_market_activity_in_transaction
 from data.store.app.database.crud.stock.store_dataset_entry import (
     OverlapKey,
@@ -98,7 +111,8 @@ from data.store.app.database.models.ingest_request import (
     IngestRequestKind,
     IngestRequestState,
 )
-from data.store.app.database.models.ingest_run import IngestRunState, IngestRunTrigger
+from data.store.app.database.models.ingest_run import VENDOR_ASSET_CHANGED_REASON, IngestRunState, IngestRunTrigger
+from data.store.app.database.models.store_dataset_entry import DatasetStopCause
 from data.store.app.database.transaction import write_transaction
 from data.store.app.events import DatasetChange, DatasetChanged, IngestRunChanged, publish
 from schemas.data_ingest.delivery import (
@@ -243,6 +257,26 @@ class ArmEffects:
     dataset_id: uuid.UUID | None = None
     # The collect value the entry was flipped to by a POST that carried one (False retired, True resumed), else None.
     collect_flip: bool | None = None
+    # Set by the bars arm when the stop rule refused the delivery: no bar was written and the dataset is to be stopped.
+    vendor_asset_stop: 'VendorAssetStop | None' = None
+
+
+@dataclass(frozen=True)
+class VendorAssetStop:
+    """What the stop rule found: the dataset's symbol, its last accepted vendor asset id and the one just delivered."""
+
+    symbol: str | None
+    earlier_id: str
+    delivered_id: str | None
+
+    @property
+    def sentence(self) -> str:
+        """The one sentence the attempt row, the request and the log carry. Ids are public vendor keys, as received."""
+        delivered = f"the delivered id '{self.delivered_id}'" if self.delivered_id else 'no vendor asset id'
+        return (
+            f"The vendor asset id of {self.symbol or 'the dataset'} changed from '{self.earlier_id}' to "
+            f'{delivered}: no bars were written and the dataset was stopped.'
+        )
 
 
 class DatasetDropped(Exception):
@@ -300,6 +334,10 @@ async def write_bars(context: ArmContext) -> int:
     field. The own-overlap refusal is the POST's, made before the request is sent; it is not repeated here, because a
     refusal in this transaction would be redelivered for ever.
 
+    THE STOP RULE (P50) runs here, once the entry is resolved: a delivery whose vendor asset id differs from the
+    dataset's last accepted one writes no bar and records the finding in context.effects.vendor_asset_stop (module
+    docstring); the transaction then stops the entry.
+
     P16 adds the write-time clip against the listing and the dataset_coverage write HERE, at this seam.
 
     Args:
@@ -334,6 +372,12 @@ async def write_bars(context: ArmContext) -> int:
         dataset_id = request.dataset_id
         await touch_entry(context.db, dataset_id)
     context.effects.dataset_id = dataset_id
+    # THE STOP RULE, before the early return so a zero-bar success is judged too, and after the drop rule above.
+    delivered_id = header.vendor_asset_id or None
+    earlier_id = await last_accepted_vendor_asset_id(context.db, dataset_id)
+    if earlier_id is not None and delivered_id != earlier_id:
+        context.effects.vendor_asset_stop = VendorAssetStop(request.asset_symbol, earlier_id, delivered_id)
+        return 0
     if not any(page.bars for page in pages):
         return 0
     if request.asset_symbol is None or request.granularity is None:
@@ -466,7 +510,13 @@ DISCARDED_DETAIL = 'The dataset was deleted or stopped before this delivery land
 
 
 def decide(
-    attempt: AttemptDelivery, *, bars_written: int, has_records: bool, superseded: bool, dropped: bool = False
+    attempt: AttemptDelivery,
+    *,
+    bars_written: int,
+    has_records: bool,
+    superseded: bool,
+    dropped: bool = False,
+    vendor_asset_stop: VendorAssetStop | None = None,
 ) -> Decision:
     """The verdict rule: FINAL on a permanent refusal, the last attempt, a superseded request or instance; else CONTINUE.
 
@@ -480,6 +530,8 @@ def decide(
         superseded: Whether the reporting instance has been superseded by a newer one.
         dropped: Whether the bars arm dropped the delivery (its dataset was deleted or stopped): FINAL, the request
             EMPTY with the DISCARDED cause.
+        vendor_asset_stop: The stop rule's finding, when the bars arm refused the delivery: FINAL, the request FAILED
+            with the VENDOR_ASSET_CHANGED cause and the finding's sentence.
 
     Returns:
         Decision: The verdict and the state change for an open request.
@@ -488,6 +540,13 @@ def decide(
     if dropped:
         return Decision(
             DeliveryVerdict.FINAL, IngestRequestState.EMPTY, IngestRequestFailureCause.DISCARDED, DISCARDED_DETAIL
+        )
+    if vendor_asset_stop is not None:
+        return Decision(
+            DeliveryVerdict.FINAL,
+            IngestRequestState.FAILED,
+            IngestRequestFailureCause.VENDOR_ASSET_CHANGED,
+            vendor_asset_stop.sentence,
         )
     match trailer.outcome:
         case DeliveryOutcome.EXPIRED:
@@ -664,15 +723,27 @@ class DeliveryIntake:
             # The first delivered attempt created or matched the entry: the attempt row names it too.
             request = replace(request, dataset_id=dataset_id)
 
+        stop = context.effects.vendor_asset_stop
+        stopped = False
+        if stop is not None:
+            # The entry lock the arm took is still held: stop the dataset in this transaction (module docstring).
+            stopped = await stop_entry(db, dataset_id, DatasetStopCause.VENDOR_ASSET_CHANGED)
+            log.warning(f'{stop.sentence} (request {request_id}, dataset {dataset_id})')
+
         decision = decide(
-            attempt, bars_written=bars_written, has_records=has_records, superseded=superseded, dropped=dropped
+            attempt,
+            bars_written=bars_written,
+            has_records=has_records,
+            superseded=superseded,
+            dropped=dropped,
+            vendor_asset_stop=stop,
         )
         counted = trailer.outcome not in _NO_CALL
 
         # 5. The attempt row, for an attempt that made a vendor call.
         run: IngestRunRecord | None = None
         if counted:
-            run = await insert_attempt(db, self._attempt_row(request, attempt, decision, bars_written, dropped))
+            run = await insert_attempt(db, self._attempt_row(request, attempt, decision, bars_written, dropped, stop))
             if run is None:
                 # The arbiter index held the attempt although the lookup above did not: not reachable under the lock.
                 # Roll everything back rather than count an attempt twice; the redelivery is answered as a duplicate.
@@ -709,7 +780,7 @@ class DeliveryIntake:
             run=run,
             # A dropped delivery touched no dataset; any other resolved one is announced (a zero-bar success included).
             dataset_id=None if dropped else dataset_id,
-            change=_change_kind(context.effects.collect_flip),
+            change=DatasetChange.RETIRED if stopped else _change_kind(context.effects.collect_flip),
         )
 
     @staticmethod
@@ -735,6 +806,7 @@ class DeliveryIntake:
         decision: Decision,
         bars_written: int,
         dropped: bool = False,
+        stop: VendorAssetStop | None = None,
     ) -> NewAttempt:
         """The attempt row for a SUCCEEDED or FAILED report.
 
@@ -743,7 +815,7 @@ class DeliveryIntake:
         header, trailer = attempt.header, attempt.trailer
         stats = trailer.vendor_stats
         verdict = decision.verdict if request.state.is_open else DeliveryVerdict.FINAL
-        if trailer.outcome is DeliveryOutcome.FAILED:
+        if trailer.outcome is DeliveryOutcome.FAILED or stop is not None:
             state = IngestRunState.FAILED
         else:
             state = (
@@ -766,11 +838,21 @@ class DeliveryIntake:
             started_at=stats.first_call_at if stats else None,
             finished_at=trailer.as_of,
             # The human sentence of a failure, as the report gave it; ingest guarantees it carries no secret.
-            error_message=(trailer.detail or None) if state is IngestRunState.FAILED else None,
+            error_message=(
+                stop.sentence
+                if stop is not None
+                else (trailer.detail or None)
+                if state is IngestRunState.FAILED
+                else None
+            ),
+            error_reason=VENDOR_ASSET_CHANGED_REASON if stop is not None else None,
             label=_label_for(request),
-            # Stored for a bars attempt only: the id is the bars stop rule's detector (ADR tj-26jt9w addendum 12). Another
-            # kind's attempt row keeps NULL whatever the header carries.
-            vendor_asset_id=(header.vendor_asset_id or None) if request.kind is IngestRequestKind.BARS else None,
+            # Stored for a bars attempt that was judged only: the id is the bars stop rule's detector (ADR tj-26jt9w
+            # addendum 12). A DROPPED delivery was never checked by the stop rule, so its id is not stored (addendum 16)
+            # and it can never be the comparison base. Another kind's attempt row keeps NULL whatever the header carries.
+            vendor_asset_id=(
+                (header.vendor_asset_id or None) if request.kind is IngestRequestKind.BARS and not dropped else None
+            ),
             # Rule (d) already limits a served range to a SUCCEEDED report; it is stored on that attempt row only.
             served_start=trailer.served_range.start if trailer.served_range is not None else None,
             served_end=trailer.served_range.end if trailer.served_range is not None else None,
@@ -794,6 +876,7 @@ __all__ = [
     'DatasetDropped',
     'Decision',
     'DeliveryIntake',
+    'VendorAssetStop',
     'decide',
     'validate_report',
 ]

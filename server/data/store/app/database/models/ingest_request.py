@@ -58,6 +58,9 @@ class IngestRequestFailureCause(StrEnum):
     # Not a failure: the request finished EMPTY because the dataset it wrote to was deleted or stopped before its
     # delivery landed (the bars arm's drop rule, P35). Nothing was stored. Written on an EMPTY request, as the cause.
     DISCARDED = 'DISCARDED'
+    # The store's stop rule (P50): a bars delivery named another vendor asset id than the dataset's last accepted
+    # delivery, so no bar was written and the dataset was stopped. Written on a FAILED request.
+    VENDOR_ASSET_CHANGED = 'VENDOR_ASSET_CHANGED'
 
 
 def _values(enum_cls: type[StrEnum]) -> list[str]:

@@ -585,6 +585,10 @@ async def upsert_entry_in_transaction(
             # operator set it, so an SDK retry of its original body cannot undo a Stop. Unlike expiry, which a repeat
             # sets from the body. STATIC has no intent and its schema refuses an explicit one.
             conflict_values['collect'] = resolved_collect
+            if resolved_collect is True:
+                # A Resume: the store's stop cause goes with the stop it explained (the CHECK refuses a cause on a
+                # collecting row). An explicit collect false leaves the stored cause as it is.
+                conflict_values['stopped_cause'] = None
     stmt = stmt.on_conflict_do_update(constraint=StoreDatasetEntry.NATURAL_KEY_CONSTRAINT, set_=conflict_values)
     stmt = stmt.returning(StoreDatasetEntry.id)
     result = await db.execute(stmt)
@@ -906,9 +910,12 @@ async def operator_set_collecting(
             # A subscription's collect is never NULL (ck_store_dataset_entry_collect_by_type), so None means the row
             # went between the read and this lock: the same guard as operator_set_expiry.
             raise EntryNotFound(id)
-        stmt = (
-            update(StoreDatasetEntry).where(StoreDatasetEntry.id == id).values(collect=collect, updated_at=func.now())
-        )
+        values: dict = {'collect': collect, 'updated_at': func.now()}
+        if collect:
+            # A Resume clears the store's stop cause in the same UPDATE (the CHECK refuses a cause on a collecting
+            # row). A Stop leaves it as stored: an operator stop never sets one.
+            values['stopped_cause'] = None
+        stmt = update(StoreDatasetEntry).where(StoreDatasetEntry.id == id).values(**values)
         result = await db.execute(stmt)
         if result.rowcount == 0:
             # The row went between the read and this UPDATE: the same guard as operator_set_expiry.
