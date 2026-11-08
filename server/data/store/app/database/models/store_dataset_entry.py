@@ -151,12 +151,12 @@ class StoreDatasetEntry(AppBase.DATA_STORE_BASE, CustomTypeTable):
 
     # Whether the operator wants this dataset collected (tj-hhy3dk section 1): expiry means deletion only. NULL
     # exactly for a STATIC dataset, which is never collected on a schedule; a DAILY or STREAM dataset is True or
-    # False. Not identity and in no unique key. The CHECK below mirrors migration e5c8b1d4f703; the stored
+    # False. Not identity and in no unique key. The CHECK below ties it to update_type; the stored
     # integers of update_type are STATIC = 1, DAILY = 2, STREAM = 3.
     collect = Column(Boolean, nullable=True)
     # Why the STORE stopped this dataset (collect set false by a store rule, not by the operator). NULL means the store
-    # did not stop it, whatever collect says. Only a stopped subscription can hold one (the CHECK below). Added by
-    # b8e4c1f7a923; the stop rule (tj-7zjov1.144, DatasetStopCause) is its one writer, and a Resume clears it. Not identity.
+    # did not stop it, whatever collect says. Only a stopped subscription can hold one (the CHECK below).
+    # The stop rule (tj-7zjov1.144, DatasetStopCause) is its one writer, and a Resume clears it. Not identity.
     stopped_cause = Column(String, nullable=True)
 
     # Dates used to manage split and dividends adjustments

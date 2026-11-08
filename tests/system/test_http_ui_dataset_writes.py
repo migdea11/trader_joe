@@ -40,9 +40,6 @@ from tests.system.problem_json import assert_problem
 # Its scratch database fixture, reused rather than copied: a database this test creates, migrates and drops.
 scratch_db = test_usage_record.scratch_db
 
-REVISION = 'd7e2a9c35b18'
-PARENT_REVISION = 'b3d9e1a47c62'
-
 
 OVERRIDE = DatasetOverrideLog.__table__
 DELETION = DatasetDeletion.__table__
@@ -251,38 +248,33 @@ def test_unknown_id_is_404_and_a_type_change_is_422_and_neither_writes(subscript
 
 
 # ---------------------------------------------------------------------------------------------
-# The revision and the probe, on a scratch database (the tj-vhboky.62 exception, as test_usage_record.py).
+# The probe, on a scratch database (the tj-vhboky.62 exception, as test_usage_record.py). The tables' shape is the
+# alpha baseline catalogue test's (test_alpha_baseline_schema_pg.py); the per-revision round trip went with the old
+# chain (ADR tj-kg521d: no downgrade).
 
 
-def test_upgrade_downgrade_upgrade_adds_then_drops_exactly_the_two_tables_and_the_type(scratch_db):
-    scratch_db.must('upgrade', PARENT_REVISION)
-    parent_schema = scratch_db.schema()
-    assert not scratch_db.enum_exists('override_action')
-
-    scratch_db.must('upgrade', REVISION)
-    head_schema = scratch_db.schema()
-    assert {row[0] for row in head_schema['columns']} >= {OVERRIDE.name, DELETION.name}
-    assert scratch_db.enum_exists('override_action')
-    for kind in ('columns', 'constraints', 'indexes', 'enums'):
-        assert set(parent_schema[kind]) <= set(head_schema[kind]), f'{kind} of the parent changed'
-
-    scratch_db.must('downgrade', PARENT_REVISION)
-    assert scratch_db.schema() == parent_schema
-    assert not scratch_db.enum_exists('override_action')
-
-    scratch_db.must('upgrade', REVISION)
-    assert scratch_db.schema() == head_schema
+def _rename_audit_tables(engine: Engine, *, hidden: bool) -> None:
+    """Rename both audit tables away (or back), so to_regclass answers as on a database without them."""
+    with engine.begin() as conn:
+        for table in (OVERRIDE.name, DELETION.name):
+            old, new = (table, f'{table}_hidden_by_test') if hidden else (f'{table}_hidden_by_test', table)
+            conn.execute(sa.text(f'ALTER TABLE public.{old} RENAME TO {new}'))  # nosec B608 -- module-constant names
 
 
 @pytest.mark.asyncio
-async def test_the_probe_is_false_before_the_revision_and_true_after_it(scratch_db):
-    """audit_tables_exist's to_regclass on Postgres, through asyncpg: the unmigrated path's switch, both ways."""
+async def test_the_probe_is_false_without_the_audit_tables_and_true_with_them(scratch_db):
+    """audit_tables_exist's to_regclass on Postgres, through asyncpg: the unmigrated path's switch, both ways.
+
+    The absence is made at head (no revision below the audit tables exists any more): migrated, then the two tables
+    renamed away and back.
+    """
     engine = create_async_engine(scratch_db.url.set(drivername='postgresql+asyncpg'), poolclass=NullPool)
     try:
-        scratch_db.must('upgrade', PARENT_REVISION)
+        scratch_db.must('upgrade', test_usage_record._head())
+        _rename_audit_tables(scratch_db.engine, hidden=True)
         async with AsyncSession(engine) as db:
             assert await audit_tables_exist(db) is False
-        scratch_db.must('upgrade', REVISION)
+        _rename_audit_tables(scratch_db.engine, hidden=False)
         async with AsyncSession(engine) as db:
             assert await audit_tables_exist(db) is True
     finally:

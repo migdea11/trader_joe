@@ -266,8 +266,8 @@ def entry_values(run_identity: RunIdentity) -> Callable[..., dict[str, Any]]:
     INSERT entirely, so its server default applies.
 
     "COMPLETE" IS A CLAIM THIS FIXTURE HAS TO KEEP EARNING, and it stopped being true once
-    (tj-xhcoyc). feed joined the entry as NOT NULL with no server default in migration
-    c4a1f7b2e905, and this dict did not gain it, so every test that inserts an entry through here
+    (tj-xhcoyc). feed joined the entry as NOT NULL with no server default (tj-3mk3u5.31, a
+    revision since folded into the alpha baseline), and this dict did not gain it, so every test that inserts an entry through here
     died on a NotNullViolation -- two whole files and most of a third. It went unnoticed at that
     migration's gate because the only end-to-end check run there drove the HTTP route, which takes
     its tape from the ack (the FetchDataset one then, the Submit ack since P35; the stream is gone, P37);
@@ -297,7 +297,7 @@ def entry_values(run_identity: RunIdentity) -> Callable[..., dict[str, Any]]:
         unknown = (set(overrides) | set(omit)) - set(ENTRY_TABLE.c.keys())
         assert not unknown, f'not columns of {ENTRY_TABLE.name}: {sorted(unknown)}'
         values.update(overrides)
-        # collect (tj-grna9p.176, migration e5c8b1d4f703): its CHECK wants NULL exactly for STATIC, which the
+        # collect (tj-grna9p.176): its CHECK wants NULL exactly for STATIC, which the
         # column's NULL default already gives, so only a subscription gets a value: TRUE, collecting, unless the
         # test passes collect=False to stop it. Never derived from the expiry (decision tj-hhy3dk, tj-grna9p.175):
         # the expiry is the deletion date only, and a fixture coupling the two would hide an expiry that retires
@@ -321,7 +321,7 @@ def bar_values() -> Callable[..., dict[str, Any]]:
 
     feed IS NOW COPIED FROM THE ENTRY TOO, and it is the sentence above that required the change
     (tj-xhcoyc). feed is a natural-key column of the bar, so "copied from the entry row" always
-    covered it in intent -- but until c4a1f7b2e905 the entry HAD no feed to copy, so it was
+    covered it in intent -- but until tj-3mk3u5.31 the entry HAD no feed to copy, so it was
     hardcoded to IEX and the docstring was true only by coincidence. Now that the entry records
     its resolved tape, hardcoding would let a SIP entry own IEX bars, which is exactly the
     coverage lie tj-f2qz44 was filed about, one table over. The IEX default lives on the entry

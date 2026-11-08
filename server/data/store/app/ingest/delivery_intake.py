@@ -44,7 +44,7 @@ so a bead that fills one in adds to a function and never to the shape of the tra
 appends the records raw as observations. The asset-list arm (P17) files the delivery as a dated snapshot of the list the
 REQUEST names and derives appeared, vanished and status_flip events (app/world_snapshot.py); an asset list cannot be
 fetched again, so it is written here, at receipt, before the answer. A corporate-actions attempt is recorded with its
-symbol and NULL for the other label columns (revision c7e19a4d5b28 made them nullable); an asset-list attempt with every
+symbol and NULL for the other label columns (those columns are nullable); an asset-list attempt with every
 label column NULL and no served range (an asset list has no window).
 
 THE VENDOR ASSET ID. The header's vendor_asset_id is stored as received, opaque, in ingest_run.vendor_asset_id on the

@@ -1,9 +1,9 @@
 """The seed producer: a deterministic, synthetic-only seed of the market tables at the head revision.
 
 Decision tj-vhboky.55 (SEED FORMAT, SEED PRODUCTION) and ruling tj-vhboky.56: a seed is
-<revision>.sql plus <revision>.json, kept as committed files under tests/system/seeds/ and loaded
-by the downgrade-with-data check. It runs in test_client, over the network, and prints one bundle
-line on stdout:
+<revision>.sql plus <revision>.json. The producer, `make seed-dump` and the MCP seed_dump verb remain;
+committed per-revision seeds do not (tests/system/seeds is gone). It runs in test_client, over the
+network, and prints one bundle line on stdout:
     python -m data.store.seeds [--date YYYY-MM-DD] | python -m data.store.seeds.bundle --out DIR
 See producer.py for the run, stack.py for the transport, scenario.py for what is seeded, dump.py for
 the rendering (the seed format), bundle.py for the bundle contract, and manifest.py for the digests.

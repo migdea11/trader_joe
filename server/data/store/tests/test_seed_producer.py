@@ -32,9 +32,9 @@ seed_records (default: ingest_records.seed_ingest_records, the store's own code 
 database's async URL, the scenario's first dataset and its symbol, and runs it with asyncio.run. That function
 needs a real Postgres, so EVERY test here runs produce() with a stub seeder (the autouse fixture below swaps the
 default argument, so the entry point's own call gets it too); test_the_default_seeder_is_the_store_code pins
-the real default. What the cast writes is proved against Postgres only: the orchestrator's two seed_dump runs
-at f2b7d4a91c36 (byte-identical) and the committed seed tests/system/seeds/f2b7d4a91c36.*, which the
-system suite loads.
+the real default. What the cast writes is proved against Postgres only: CI's Seed Dump step and the agent-stack
+seed_dump verb on a migrated stack. There are no committed seeds since the alpha baseline (ADR tj-kg521d), so nothing
+here reads one back.
 
 THE STORE'S OWN LOOPS (bead tj-7zjov1.166). The live store's instance watcher can rewrite the cast between the checks
 and the dump. FakeStack models it: a drift is a write landing just before a named statement of a named attempt, and a
@@ -59,7 +59,6 @@ import psycopg2
 import pytest
 
 from common.enums.data_stock import Granularity
-from common.tests.roots import REPO_ROOT
 from data.store.app.daily_refresh import SCHEDULER_ACTOR
 from data.store.seeds import __main__ as entry
 from data.store.seeds import producer as producer_module
@@ -917,6 +916,7 @@ def test_produce_takes_no_output_directory():
 
 
 def test_a_revision_other_than_the_head_is_refused_before_any_post(no_writes):
+    # An id of the old chain (ADR tj-kg521d): a database still stamped with one is exactly what must be refused.
     stack = FakeStack(revision_rows=[('8f41c2d7a3b9',)])
     with pytest.raises(SeedRefused, match='migrate first'):
         produce(stack)
@@ -1696,24 +1696,13 @@ def test_the_expected_asset_list_cast_is_the_one_the_seeder_names():
     assert all(vendor_id.startswith('seed-asset-') for vendor_id, _ in _AL_ASSETS.values())
 
 
-def test_the_committed_head_seed_holds_the_cast():
-    """A relationship with the seed the producer wrote at the head: the cast alone (tj-7zjov1.31).
+def test_the_head_the_producer_stamps_is_the_alpha_baseline():
+    """One revision since ADR tj-kg521d: the bundle's revision, and the one the database must be at, is the baseline.
 
-    The ingest tables are emptied after the POSTs, so the POSTs' own runs are not in it: the attempt rows and the
-    cast's four legacy-shaped runs (e5d950e).
+    The committed per-revision seeds this file once read back are gone (owner ruling 2026-11-06: no per-revision seeds);
+    what the cast writes is proved against Postgres by the CI Seed Dump step and the agent-stack seed_dump verb.
     """
-    manifest = json.loads((REPO_ROOT / 'tests' / 'system' / 'seeds' / f'{HEAD}.json').read_text(encoding='utf-8'))
-    assert manifest['row_counts'][REQUEST_TABLE] == sum(EXPECTED_REQUEST_STATES.values())
-    assert manifest['row_counts'][INSTANCE_TABLE] == EXPECTED_INSTANCES
-    assert manifest['row_counts'][RUN_TABLE] == EXPECTED_RUN_ROWS
-    assert manifest['row_counts'][CORPORATE_ACTION_TABLE] == EXPECTED_OBSERVATIONS
-    # tj-7zjov1.196: the panel cast, as the producer's refusal counts it.
-    assert {table: manifest['row_counts'][table] for table in PANEL_RESET_ORDER} == {
-        table: COUNTS[table] for table in PANEL_RESET_ORDER
-    }
-    sql = (REPO_ROOT / 'tests' / 'system' / 'seeds' / f'{HEAD}.sql').read_text(encoding='utf-8')
-    for request_id in REQUEST_IDS.values():
-        assert f"'{request_id}'" in sql, request_id
+    assert HEAD == '5d9a3c7e1b84'
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2192,34 +2181,6 @@ def test_expected_request_states_are_the_counts_of_the_per_request_table():
     assert EXPECTED_REQUESTS[PENDING_ID] == ('PENDING', None)
     assert EXPECTED_REQUESTS[QUEUED_ID] == ('QUEUED', INSTANCE_B)
     assert EXPECTED_REQUESTS[NOT_DELIVERED_ID] == ('NOT_DELIVERED', INSTANCE_A)
-
-
-_SQL_VALUE = re.compile(r"NULL|'(?:[^']|'')*'")
-
-
-def _seed_rows(sql: str, table: str) -> list[dict]:
-    """The committed seed's rows of one table, column name to value (None for NULL), from its INSERT lines."""
-    rows = []
-    for line in sql.splitlines():
-        match = re.fullmatch(rf'INSERT INTO public\.{table} \(([^)]*)\) VALUES \((.*)\);', line)
-        if match is None:
-            continue
-        names = match.group(1).split(', ')
-        values = [
-            None if token == 'NULL' else token[1:-1].replace("''", "'") for token in _SQL_VALUE.findall(match.group(2))
-        ]
-        assert len(values) == len(names), line[:80]
-        rows.append(dict(zip(names, values, strict=True)))
-    return rows
-
-
-def test_the_committed_head_seed_holds_each_request_and_instance_as_the_tables_expect():
-    """The per-request table against the seed the producer wrote on the real stack: the same states and instances."""
-    sql = (REPO_ROOT / 'tests' / 'system' / 'seeds' / f'{HEAD}.sql').read_text(encoding='utf-8')
-    requests = {row['id']: (row['state'], row['instance_id']) for row in _seed_rows(sql, REQUEST_TABLE)}
-    assert requests == EXPECTED_REQUESTS
-    instances = {row['instance_id']: row['superseded_at'] is not None for row in _seed_rows(sql, INSTANCE_TABLE)}
-    assert instances == EXPECTED_INSTANCE_SUPERSEDED
 
 
 # Rows the check cannot read. Each counts as ONE foreign row, never parsed for its size, and because

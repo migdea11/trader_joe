@@ -2,7 +2,8 @@
 
 WRITTEN, NOT YET RUN: there was no Postgres where it was written (the run needs the dev take-down the owner
 approves). It runs with the rest of the suite (make test-system, or agent-stack run_system_tests after test_up) on a
-stack migrated to the head (f2b7d4a91c36 or later). The architect does not close P34 on these until they have run.
+stack migrated to the alpha baseline (ADR tj-kg521d), the one revision. The architect does not close P34 on these
+until they have run.
 
 THE DESIGN: the architect's validator case list on tj-7zjov1.27 (20:17 UTC, 2026-10-25), ADR tj-26jt9w addenda (4)
 (5) (6) (9), and the store CLAUDE.md delivery section. WHAT THIS PROVES that server/data/store/tests cannot, because
@@ -34,6 +35,10 @@ SQLite has no partial index, no FOR UPDATE, one writer and no Postgres enum or A
   PG11 a delivery for a Stopped subscription (collect false) is dropped like a gone one.
   PG12 P18 (tj-7zjov1.31): the corporate-actions arm on the real table (bytea, JSONB, the unique index as the dedupe
       arbiter, a revision as a new row), the attempt row's NULL labels and NULL vendor asset id, and the rollback.
+  PG13 bug tj-1ov1p2: a bar volume and a trade count of 2**31 round-trip through deliver() and the store's bar read
+      on asyncpg. Both columns are BIGINT (int8) in the alpha baseline, which creates them so from empty (ADR
+      tj-kg521d; the type-change revision of ADR tj-id4ngr went with the old chain). WRITTEN, NOT YET RUN when added
+      (tj-1ov1p2.2): it needs a test stack built and migrated from the baseline (tj-kg521d B8).
 
 HOW. DeliveryIntake and crud/ingest_delivery.py are driven directly on the test stack's Postgres over asyncpg
 (pg_async_engine), with the intake's own_session pointed at that engine and its publish journalled. The ingest_request
@@ -63,6 +68,7 @@ from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, U
 from common.errors.vocabulary import InvalidRequestError, Reason
 from data.store.app.database.crud import ingest_delivery
 from data.store.app.database.crud import ingest_request as request_crud
+from data.store.app.database.crud.stock import dataset_catalog
 from data.store.app.database.models.corporate_action import CorporateAction
 from data.store.app.database.models.ingest_instance import IngestInstance
 from data.store.app.database.models.ingest_request import (
@@ -1017,3 +1023,66 @@ async def test_pg12_a_refused_corporate_actions_delivery_leaves_no_observation(
 
     assert await _observations(intake.engine, request_id) == []
     assert await _runs(intake.engine, request_id) == []
+
+
+# --------------------------------------------------------------------------------------------- PG13
+
+# Bug tj-1ov1p2: volume and trade_count were int4, asyncpg's int4 codec refused a Python int above 2147483647
+# CLIENT-SIDE, the delivery rolled back and ingest redelivered it for ever. The alpha baseline creates both as int8
+# (ADR tj-kg521d). Only asyncpg on Postgres shows this: the sqlite unit tier encodes any int, so a test there was green
+# before the fix. Validator task tj-1ov1p2.2, part A; run on the baseline is tj-kg521d B8 (tj-7zjov1.362.5).
+ABOVE_INT32 = 2**31
+
+
+def big_bar(offset_days: int, *, volume: float = 1000.0, trade_count: int = 42) -> Bar:
+    return bar(offset_days).model_copy(update={'volume': volume, 'trade_count': trade_count})
+
+
+async def test_pg13_a_bar_count_above_int32_round_trips_through_deliver_and_the_store_read_path(
+    intake, created, run_identity, bars_entry, instance_id
+):
+    """Volume 2**31 on one bar and trade_count 2**31 on another: delivered, committed, read back exact."""
+    holder = instance_id('pg13')
+    await intake.register(holder)
+    request_id = await _request(
+        intake.engine, created, run_identity, bars_entry.asset_symbol, holder=holder, dataset_id=bars_entry.id
+    )
+    page = BarPage(bars=[big_bar(0, volume=float(ABOVE_INT32)), big_bar(1, trade_count=ABOVE_INT32), big_bar(2)])
+
+    answer = await intake.deliver(report(request_id, parts=[page], instance_id=holder))
+
+    assert answer == DeliverAttemptResponse(verdict=FINAL, attempt_count=1), answer
+    (run,) = await _runs(intake.engine, request_id)
+    assert (run.state, run.bars_written) == (IngestRunState.SUCCEEDED, 3)
+    # Read back through the store's own read path (the /ui/v1 bars read), on asyncpg.
+    async with AsyncSession(intake.engine, expire_on_commit=False) as db:
+        row = await dataset_catalog.get_catalog_row(db, bars_entry.id)
+        assert row is not None
+        bars = await dataset_catalog.read_bar_page(db, row, start=None, end=None, after=None, limit=10)
+    assert [(b.timestamp, b.volume, b.trade_count) for b in bars] == [
+        (BAR_START, ABOVE_INT32, 42),
+        (BAR_START + timedelta(days=1), 1000, ABOVE_INT32),
+        (BAR_START + timedelta(days=2), 1000, 42),
+    ]
+    assert all(type(b.volume) is int and type(b.trade_count) is int for b in bars)
+    # And as Postgres stores them: int8 columns holding the exact value.
+    async with intake.engine.connect() as conn:
+        types = dict(
+            (
+                await conn.execute(
+                    sa.text(
+                        'SELECT column_name, udt_name FROM information_schema.columns WHERE table_schema = '
+                        "current_schema() AND table_name = 'stock_market_activity' "
+                        "AND column_name IN ('volume', 'trade_count')"
+                    )
+                )
+            ).all()
+        )
+        stored = (
+            await conn.execute(
+                sa.text('SELECT max(volume), max(trade_count) FROM stock_market_activity WHERE dataset_id = :id'),
+                {'id': bars_entry.id},
+            )
+        ).one()
+    assert types == {'volume': 'int8', 'trade_count': 'int8'}, types
+    assert tuple(stored) == (ABOVE_INT32, ABOVE_INT32)

@@ -1,6 +1,6 @@
 from typing import Any
 
-from sqlalchemy import Column, Float, Index, Integer, UniqueConstraint
+from sqlalchemy import BigInteger, Column, Float, Index, UniqueConstraint
 from sqlalchemy.ext.hybrid import hybrid_property
 
 from common.enums.data_select import AssetType, DataType
@@ -18,9 +18,7 @@ class StockMarketActivity(BaseMarketActivity):
     __tablename__ = TABLE_NAME
 
     # Named so the ON CONFLICT clause in the repository can target it by name rather than by
-    # column list; the name is the contract between this model and migration 8f41c2d7a3b9,
-    # kept unchanged by this revision's widening of the column list underneath it so the ON
-    # CONFLICT clause does not change shape across the upgrade.
+    # column list; the name is the contract between this model, the alpha baseline migration and that clause.
     NATURAL_KEY_CONSTRAINT = 'uq_stock_market_activity_natural_key'
 
     # Reads asset_symbol, granularity and a timestamp range and NEVER source or feed
@@ -41,8 +39,9 @@ class StockMarketActivity(BaseMarketActivity):
     high = Column(Float, nullable=False)
     low = Column(Float, nullable=False)
     close = Column(Float, nullable=False)
-    volume = Column(Integer, nullable=False)
-    trade_count = Column(Integer, nullable=False)
+    # BigInteger: a liquid symbol's monthly volume passes int32 (tj-1ov1p2; BIGINT in the alpha baseline).
+    volume = Column(BigInteger, nullable=False)
+    trade_count = Column(BigInteger, nullable=False)
 
     __table_args__ = (
         *BaseMarketActivity.__table_args__,

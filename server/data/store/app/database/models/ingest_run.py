@@ -112,9 +112,8 @@ class IngestRun(AppBase.DATA_STORE_BASE, CustomTypeTable):
     actor = Column(SensitiveString, nullable=False)
 
     # The label: what the dataset's identity said when the run started. Same enum types as the entry. The label columns
-    # other than source are NULL on the attempt row of a request that is not about one bar series (revision
-    # c7e19a4d5b28): a corporate-actions attempt keeps the symbol it asked for and nothing else, an asset-list attempt
-    # nothing. Never a sentinel; every reader handles NULL.
+    # other than source are NULL on the attempt row of a request that is not about one bar series: a corporate-actions
+    # attempt keeps the symbol it asked for and nothing else, an asset-list attempt nothing. Never a sentinel; every reader handles NULL.
     asset_symbol = Column(String, nullable=True)
     asset_type = Column(Enum(AssetType), nullable=True)
     data_type = Column(Enum(DataType), nullable=True)

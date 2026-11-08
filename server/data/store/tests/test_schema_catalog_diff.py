@@ -3,8 +3,11 @@
 Design checked against: bead tj-7zjov1.99 (P33c) and the P33 architect gate on tj-7zjov1.25 -- an empty downgrade
 passed the generic rule, because it compared only the two seeded tables' rows -- and store CLAUDE.md m7 item 17.
 
-PR-GATE TIER: no database. tests/system/test_migration_downgrade.py compares, on Postgres, a revision downgraded one
-step with its parent built from empty, through server/common/tests/schema_catalog.py. The system suite cannot run in
+PR-GATE TIER: no database. tests/system/test_alpha_baseline_schema_pg.py compares, on Postgres, the schema the alpha
+baseline builds from empty with the one metadata.create_all builds (ADR tj-kg521d B5), through
+server/common/tests/schema_catalog.py; the downgrade leg these tests were written for went with the old migration chain,
+and the shapes below (a dropped column, a changed predicate, a missing label) are the same drift either comparison
+must see. The system suite cannot run in
 the PR gate, so the diff's teeth are pinned here on synthetic snapshots built through the same catalogue_from_rows the
 live read uses: a dropped column, a changed index predicate, a missing enum label, a changed default, and the shape an
 empty downgrade() leaves (the new table, its columns, its indexes and its enum types still there). And the allowlisted
@@ -151,7 +154,7 @@ def test_a_changed_sequence_or_constraint_is_reported():
 
 
 def test_an_empty_downgrade_leaves_the_new_table_its_indexes_columns_and_enum_types_behind():
-    """What f2b7d4a91c36 with `return` for a downgrade body leaves: everything its upgrade created."""
+    """What a revision with `return` for a downgrade body leaves: everything its upgrade created."""
     downgraded = copy.deepcopy(PARENT)
     downgraded['tables'].append(('ingest_instance', 'r'))
     downgraded['columns'] += [
@@ -187,8 +190,9 @@ def test_an_empty_downgrade_leaves_the_new_table_its_indexes_columns_and_enum_ty
 
 
 # ---------------------------------------------------------------------------------------------
-# An allowlisted downgrade differs by EXACTLY its listed facts (architect gate on tj-7zjov1.99, ruling (c)): the shape
-# of the eec8f88a7443 entry, a NOT NULL column restored nullable, here on ingest_run.state.
+# An allowlisted comparison differs by EXACTLY its listed facts (architect gate on tj-7zjov1.99, ruling (c)): a NOT
+# NULL column on one side and nullable on the other, here on ingest_run.state (the shape of the alpha baseline's two
+# relaxed reason columns against the old chain, ADR tj-kg521d section 4).
 
 STATE = ('ingest_run', 'state')
 STATE_NULLABLE = AllowedDifference('columns', STATE, 'not_null', expected=True, actual=False)

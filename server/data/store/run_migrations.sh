@@ -394,14 +394,12 @@ select_stack() {
 # phantom-drift failure this guard exists to stop — a stale image's models reported as live-schema
 # drift — cannot happen on the upgrade path.
 #
-# What upgrade DOES do, and this is a real exposure rather than an absent one: it applies the
-# image's revision scripts, and a revision script may import image code and derive the DDL it
-# emits from it. Today exactly one statement does — FEED_TYPE.create() in
-# migrations/versions/eec8f88a7443_per_dataset_identity_and_feed.py, whose CREATE TYPE label list
-# is read off the IMAGE's common.enums.data_stock.Feed on the PRODUCTION definition (on the dev
-# definition common/ is bind-mounted, so it is read off this checkout). A stale image there emits
-# a different CREATE TYPE, with no ImportError, and alembic check cannot see it — enum labels are
-# one of the two blind spots this file's header already names.
+# What upgrade DOES do: it applies the image's revision scripts, and a revision script may import
+# image code and derive the DDL it emits from it. Today none does: the alpha baseline writes its
+# enum label lists as literals (ADR tj-kg521d), so a stale image cannot emit a different CREATE
+# TYPE. A later revision that reads labels off imported code would reopen that exposure, with no
+# ImportError and nothing in alembic check to see it — enum labels are one of the two blind spots
+# this file's header already names.
 #
 # IT IS STILL NOT GUARDED, and the reason is the COST OF REFUSING, not the absence of exposure.
 # migrate-check is advisory and re-runnable, so refusing it costs an operator one build.

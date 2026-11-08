@@ -1144,8 +1144,10 @@ lint-python: $(VENV_MARKER)  ## Lint and format-check Python with ruff (scope wi
 
 # THE MIGRATION GATE (tj-aw0tuk, tj-7zjov1.8). Rollback moves code back and never schema, so every store
 # revision must be additive unless it carries the '# additive-exception: <bead-id>' line (tools/
-# migration_lint). It reads the whole revisions directory whatever PATHS says: a revision is a property of
-# the chain, not of a path selection, and the check is a few milliseconds of ast parsing with no database.
+# migration_lint). The alpha baseline only creates, so it passes unmarked and the tree holds no marker
+# (ADR tj-kg521d); the rule binds the revisions after it. It reads the whole revisions directory whatever
+# PATHS says: a revision is a property of the chain, not of a path selection, and the check is a few
+# milliseconds of ast parsing with no database.
 # Part of `lint`, so CI's Run Linters step runs it with no workflow change.
 .PHONY: lint-migrations
 lint-migrations: $(VENV_MARKER)  ## Refuse a store revision that drops, renames, narrows, adds NOT NULL without a default or runs raw SQL outside the additive forms (judged per ALTER TABLE clause; CREATE OR REPLACE refused), removes a NOT NULL column's server default, unless marked
@@ -1825,8 +1827,8 @@ system-launch:  ## Start the stack from the prod images with data_ingest on the 
 # THE HOST WRITER is data.store.seeds.bundle in the host venv, the ONE host-side no-follow writer
 # (S11): stdout is piped to `python -m data.store.seeds.bundle --out $(SEED_OUT)`, which writes
 # <revision>.sql and <revision>.json there. SEED_OUT defaults to output/seeds, git-ignored, inside
-# the repository and never under tests/ (the writer refuses tests/ itself); a person copies a
-# reviewed seed into tests/system/seeds/ (tj-vhboky.56). A SEED_OUT OUTSIDE the repository reached
+# the repository and never under tests/ (the writer refuses tests/ itself); no seed is committed
+# per revision (ADR tj-kg521d), so the dump is an end-to-end exercise of the push path. A SEED_OUT OUTSIDE the repository reached
 # through a symlinked parent (macOS /tmp, a symlinked checkout path) is refused, exit 3, by design:
 # the writer's no-follow walk starts at / for such a path (S11.2). DATE, when given, is forwarded as
 # --date; the producer refuses one that is not a real YYYY-MM-DD date.

@@ -23,11 +23,13 @@ destructive denylist still searches the original text, comments included, which 
 reading; dollar-quoted strings are not read, so any raw SQL containing a dollar-quote delimiter is
 refused; E-string backslash escapes and nested block comments are not understood either and can fail open.
 
-THE MARKER is a line starting `# additive-exception: <bead-id>`, the one the seed check
-(tj-vhboky.55) keys on. A revision carrying it is exempt; the exception stays visible in the diff.
+THE MARKER is a line starting `# additive-exception: <bead-id>`. A revision carrying it is exempt; the
+exception stays visible in the diff. The alpha baseline (ADR tj-kg521d) only creates, so it passes
+unmarked and no marker exists in the tree; the machinery is for revisions after the alpha.
 
-downgrade() is exempt: down-migrations are a documented non-goal (forward-only, recovery by restore), and
-the inverse of an additive step is a drop by construction.
+downgrade() is exempt: down-migrations are a non-goal (forward-only, recovery by restoring make migrate's
+pre-migrate dump; the baseline's downgrade() raises, ADR tj-kg521d), and the inverse of an additive step is
+a drop by construction.
 
 RAW SQL: a statement the lint cannot read (a name it cannot resolve to a string) is refused, because a
 gate that passes what it cannot see is the hole tj-aw0tuk was filed to close. An f-string with any part it
@@ -102,9 +104,8 @@ class Finding:
 def marker_of(source: str) -> str | None:
     """Return the bead id of an additive-exception line, or None.
 
-    The same line shape the seed check keys on (tests/system/test_migration_with_data.py): a line that
-    starts with the marker, wherever it sits, because the existing revisions carry it inside the module
-    docstring and not as a comment token.
+    A line that starts with the marker, wherever it sits, so a marker inside the module docstring counts
+    as much as one written as a comment token.
     """
     found = MARKER_RE.search(source)
     return found.group(1) if found else None

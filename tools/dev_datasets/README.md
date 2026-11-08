@@ -222,6 +222,10 @@ the newest **complete** stamp (one with a `manifest.json`) is used; a symbolic l
   `refused: the seed is at revision A, the database at B and the checkout head is C; ...`. To recover: migrate the dev
   database to the head, then run a dev `reset`, which exports a seed of the current revision and reloads it. (An older
   seed cannot be upgraded here; that would need a database at its revision.)
+- **After the alpha reset.** The first alpha replaced every earlier store migration with one baseline revision
+  (ADR tj-kg521d), and the bar and panel tables changed shape. An export under `output/dev_seed/<old revision>/` names a
+  revision that no longer exists, so it cannot be loaded; drop the dev database, `make migrate`, and re-request the
+  datasets (the `request-datasets` skill). Exports taken after the reset load as before.
 - **The stack rule.** The manifest records the stack the seed was exported from (`dev` or `test`). A load refuses, exits
   **3** and writes nothing when that differs from the target's `deploymentLabel`:
   `refused: this seed was exported from the 'A' stack and the target is the 'B' stack; nothing was written`. The check runs

@@ -1,17 +1,19 @@
 """The schema of a Postgres database as its catalogue reports it, and a diff of two such snapshots (bead tj-7zjov1.99).
 
-No test functions here. Read by the system suite's downgrade leg (tests/system/test_migration_downgrade.py, on
-Postgres: a revision downgraded one step must leave exactly the schema its parent builds from empty, or differ from
-it by exactly its documented AllowedDifference set) and by the PR-gate unit test of the diff
-(server/data/store/tests/test_schema_catalog_diff.py, on synthetic snapshots). It
-sits in common/tests, not data/store/tests, for the reason migration_gate.py does: the test client container mounts
-server/common and not server/data/store/tests (docker-compose.test-client.yaml).
+No test functions here. Read by the system suite's alpha baseline check (tests/system/test_alpha_baseline_schema_pg.py,
+on Postgres: the schema `alembic upgrade head` builds on an empty database must equal the one metadata.create_all
+builds, ADR tj-kg521d B5), by the one-time old-chain versus baseline equivalence proof (ADR tj-kg521d section 4, run
+by hand from a scratch script, never committed), and by the PR-gate unit test of the diff
+(server/data/store/tests/test_schema_catalog_diff.py, on synthetic snapshots). It sits in common/tests, not
+data/store/tests, because the test client container mounts server/common and not server/data/store/tests
+(docker-compose.test-client.yaml). It was written for the downgrade leg of the old migration chain, which went with
+that chain; the AllowedDifference machinery stays for a later comparison that has documented differences.
 
 THE CATALOGUE, NOT THE MODELS. Every fact is read from pg_catalog with Postgres's own renderers (format_type,
 pg_get_expr, pg_get_constraintdef, pg_get_indexdef, pg_get_triggerdef), never by reflecting the SQLAlchemy models of
 the code under test: the question is what the revisions BUILD, and a model-based comparison would compare the code
-with itself. alembic check is no substitute either -- it ignores index predicates, enum labels and server defaults,
-which are exactly what a careless downgrade leaves wrong.
+with itself. alembic check is no substitute either -- it ignores index predicates, enum labels, CHECKs and server
+defaults, which are exactly what a hand-written revision gets wrong.
 
 WHAT IS COMPARED, per category (CATEGORIES), each a mapping from an object's identity to its facts:
   tables       (name) -> relkind, for tables, partitioned tables, views, materialised views, foreign tables

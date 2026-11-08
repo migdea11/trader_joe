@@ -5,7 +5,6 @@ handed to main; nothing here re-states the rules. A rule is pinned on both sides
 upgrade(), and what it lets through (downgrade(), a server default, a nullable column, additive SQL).
 """
 
-import ast
 import re
 from pathlib import Path
 
@@ -14,9 +13,9 @@ import pytest
 from tools.migration_lint import FIX_HINT, VERSIONS_DIR, Finding, lint_source, main, marker_of, revision_files
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-SEED_CHECK = REPO_ROOT / 'tests' / 'system' / 'test_migration_with_data.py'
 HEADER = 'from alembic import op\nimport sqlalchemy as sa\n\n'
+# The one revision in the tree since the alpha baseline (ADR tj-kg521d): create-only, unmarked.
+BASELINE_FILE = '5d9a3c7e1b84_alpha_baseline.py'
 
 
 def _revision(upgrade: str = 'pass', downgrade: str = 'pass', *, prelude: str = '') -> str:
@@ -28,19 +27,8 @@ def _messages(source: str) -> list[str]:
     return [finding.message for finding in lint_source(Path('rev.py'), source)]
 
 
-def _seed_check_marker() -> re.Pattern[str]:
-    """The seed check's own marker pattern, read from its source rather than copied, so the two cannot drift."""
-    tree = ast.parse(SEED_CHECK.read_text(encoding='utf-8'))
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id == 'ADDITIVE_EXCEPTION_MARKER' for t in node.targets
-        ):
-            call = node.value
-            assert isinstance(call, ast.Call)
-            pattern, *flags = (ast.literal_eval(arg) if isinstance(arg, ast.Constant) else arg for arg in call.args)
-            multiline = any(isinstance(f, ast.Attribute) and f.attr == 'MULTILINE' for f in flags)
-            return re.compile(pattern, re.MULTILINE if multiline else 0)
-    raise AssertionError(f'{SEED_CHECK} no longer defines ADDITIVE_EXCEPTION_MARKER')
+def _strip_marker(source: str) -> str:
+    return re.sub(r'^# additive-exception: .*$', '', source, flags=re.MULTILINE)
 
 
 # --- the always-refused operations -----------------------------------------------------------------
@@ -114,12 +102,17 @@ def test_drop_index_in_upgrade_of_a_marked_revision_passes(statement: str):
     assert lint_source(Path('rev.py'), source) == []
 
 
-def test_the_marked_revision_that_drops_indexes_is_refused_for_them_without_its_marker():
-    """eec8f88a7443 drops three indexes in upgrade(); with the marker stripped the gate must name each."""
-    path = VERSIONS_DIR / 'eec8f88a7443_per_dataset_identity_and_feed.py'
-    stripped = re.sub(r'^# additive-exception: .*$', '', path.read_text(encoding='utf-8'), flags=re.MULTILINE)
-    drops = [f for f in lint_source(path, stripped) if f.message.startswith('drop_index')]
-    assert len(drops) == 3, drops
+def test_a_marked_revision_that_drops_indexes_is_refused_for_each_without_its_marker():
+    """Three drop_index calls in a marked upgrade(): passed marked, and with the marker stripped the gate names each.
+
+    Synthetic since the alpha baseline (ADR tj-kg521d): the marked revision that once dropped three indexes is gone
+    with the old chain, and the shape it had is written out here instead.
+    """
+    drops = '\n    '.join(f"op.drop_index('ix_bar_{name}', table_name='bar')" for name in ('a', 'b', 'c'))
+    source = _revision(upgrade=drops, prelude='# additive-exception: tj-abc123')
+    assert lint_source(Path('rev.py'), source) == []
+    found = [f for f in lint_source(Path('rev.py'), _strip_marker(source)) if f.message.startswith('drop_index')]
+    assert len(found) == 3, found
 
 
 # --- alter_column ----------------------------------------------------------------------------------
@@ -785,40 +778,64 @@ def test_a_marker_not_at_the_start_of_a_line_or_without_an_id_is_no_marker(prelu
     assert len(_messages(source)) == 3
 
 
-def test_the_marker_is_matched_exactly_as_the_seed_check_matches_it():
-    """tj-aw0tuk 2026-09-28: whatever marker this gate adopts, keep it the one tj-vhboky.55 keys on."""
-    seed_marker = _seed_check_marker()
-    samples = [
-        '# additive-exception: tj-x',
-        'x\n# additive-exception: tj-x\n',
-        '    # additive-exception: tj-x',
-        '# additive-exception:',
-        '#additive-exception: tj-x',
-        'x # additive-exception: tj-x',
-    ]
-    revisions = [path.read_text(encoding='utf-8') for path in sorted(VERSIONS_DIR.glob('*.py'))]
-    for source in [*samples, *revisions]:
-        assert (marker_of(source) is not None) == (seed_marker.search(source) is not None), source
+@pytest.mark.parametrize(
+    'sample', ['#additive-exception: tj-x', 'x # additive-exception: tj-x'], ids=['no-space-after-hash', 'after-code']
+)
+def test_a_marker_needs_hash_space_at_the_line_start(sample: str):
+    """Two near-misses the marker regex refuses, kept when its old counterpart (the seed check's copy) went.
+
+    The seed check that keyed on the same marker (tj-vhboky.55) was deleted with the old chain (ADR tj-kg521d), so
+    there is no second pattern left to agree with; the samples it compared stay pinned against marker_of alone.
+    """
+    assert marker_of(sample) is None
+    assert marker_of('x\n# additive-exception: tj-x\n') == 'tj-x'  # the well-formed marker, mid-file
 
 
-# --- files, the real chain and the exit status -----------------------------------------------------
+# --- files, the real tree and the exit status ------------------------------------------------------
 
 
-def test_every_existing_revision_passes_unmarked_or_marked():
-    """Acceptance: every existing revision passes."""
+def test_the_alpha_baseline_is_the_one_revision_and_passes_unmarked():
+    """ADR tj-kg521d B3: the baseline is create-only, so it passes the gate with no marker, and no marker is in the tree."""
     files = revision_files([VERSIONS_DIR])
-    assert len(files) >= 9
-    findings = [f for path in files for f in lint_source(path, path.read_text(encoding='utf-8'))]
-    assert findings == []
+    assert [path.name for path in files] == [BASELINE_FILE]
+    (baseline,) = files
+    source = baseline.read_text(encoding='utf-8')
+    assert marker_of(source) is None, 'the alpha baseline carries an additive-exception marker'
+    assert lint_source(baseline, source) == []
 
 
-def test_the_existing_marked_revisions_would_fail_without_their_marker():
-    """The marked revisions are real fixtures: strip the marker line and the gate must find their drops."""
-    marked = [path for path in sorted(VERSIONS_DIR.glob('*.py')) if marker_of(path.read_text(encoding='utf-8'))]
-    assert marked, 'no marked revision left to exercise the gate against'
-    for path in marked:
-        stripped = re.sub(r'^# additive-exception: .*$', '', path.read_text(encoding='utf-8'), flags=re.MULTILINE)
-        assert lint_source(path, stripped), f'{path.name} is marked yet carries nothing the gate refuses'
+def test_the_baseline_upgrade_would_be_refused_if_it_ever_dropped_something():
+    """Non-vacuity of the pass above: the same file with one drop appended to upgrade() is refused, unmarked."""
+    path = VERSIONS_DIR / BASELINE_FILE
+    source = path.read_text(encoding='utf-8')
+    # upgrade() is the body right above downgrade(): one more statement at its end.
+    hostile = source.replace(
+        '\n\n\ndef downgrade() -> None:', "\n    op.drop_table('panel')\n\n\ndef downgrade() -> None:", 1
+    )
+    assert hostile != source, 'the baseline no longer ends upgrade() right above downgrade()'
+    messages = [finding.message for finding in lint_source(path, hostile)]
+    assert len(messages) == 1 and messages[0].startswith('drop_table'), messages
+
+
+@pytest.mark.parametrize(
+    'upgrade',
+    [DESTRUCTIVE_OPS['drop_column'], "op.alter_column('bar', 'volume', type_=sa.BigInteger())"],
+    ids=['drop-column', 'retype'],
+)
+def test_a_marked_revision_file_passes_main_and_fails_it_once_the_marker_is_stripped(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], upgrade: str
+):
+    """Marked revisions are synthetic fixtures since the alpha baseline: none is left in the tree (ADR tj-kg521d).
+
+    The marker machinery stays for later revisions, so it is exercised end to end through main on files on disk.
+    """
+    marked = tmp_path / 'marked.py'
+    marked.write_text(_revision(upgrade=upgrade, prelude='# additive-exception: tj-abc123'), encoding='utf-8')
+    assert main([str(marked)]) == 0
+    marked.write_text(_strip_marker(marked.read_text(encoding='utf-8')), encoding='utf-8')
+    capsys.readouterr()
+    assert main([str(marked)]) == 1
+    assert '1 revision(s), 1 finding(s)' in capsys.readouterr().out
 
 
 def test_revision_files_reads_directories_and_files_and_skips_package_init(tmp_path: Path):

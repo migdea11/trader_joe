@@ -3396,11 +3396,11 @@ STACK_ALONE_SUBCOMMANDS = frozenset({'exec', 'logs', 'ps', 'down'})
 # disposable-database guard (test-system, system-launch, seed-dump), and nothing else may inherit it.
 ATTESTING_STEPS = frozenset({SYSTEM_TESTS_STEP, START_STEP, SEED_DUMP_STEP})
 # THE MIGRATION GATE (bead tj-7zjov1.10): its own job, on its own test stack, with the same rule. Start
-# System runs make system-launch and the seed upgrade runs make test-system, both behind the guard, so
-# those two steps carry it; the from-empty step runs make migrate, which is not behind the guard and
-# must not inherit it.
+# System runs make system-launch behind the guard, so it carries it; the from-empty step runs make
+# migrate, which is not behind the guard and must not inherit it. The seed-upgrade step that also ran
+# make test-system went with the old migration chain (ADR tj-kg521d, tj-7zjov1.362.7).
 MIGRATION_JOB_NAME = 'Migration Gate'
-MIGRATION_ATTESTING_STEPS = frozenset({START_STEP, 'Upgrade The Previous Release Seed'})
+MIGRATION_ATTESTING_STEPS = frozenset({START_STEP})
 # Steps that must reach the stack, so an empty compose-invocation list cannot pass the file check.
 SYSTEM_JOB_COMPOSE_STEPS = (
     START_STEP,
@@ -3507,8 +3507,14 @@ def _migration_revision_ids() -> list[str]:
                 continue
             if isinstance(target, ast.Name) and target.id == 'revision' and isinstance(node.value, ast.Constant):
                 ids.append(node.value.value)
-    assert len(ids) >= 2, f'found {ids} in {MIGRATION_VERSIONS_DIR}; the id checks below need at least two'
-    return ids
+    assert ids, f'found no revision in {MIGRATION_VERSIONS_DIR}; the id checks below need the real ids'
+    # The id checks need at least two ids ('every id' must count more than one). Since the alpha baseline (ADR
+    # tj-kg521d) the tree holds ONE revision, so a synthetic id of the same shape stands in for the next one.
+    return [*ids, *([SYNTHETIC_REVISION_ID] if len(ids) < 2 else [])]
+
+
+# Twelve hex digits, the shape alembic generates; never a real revision of the tree (asserted where it is used).
+SYNTHETIC_REVISION_ID = 'a0b1c2d3e4f5'
 
 
 def _grep_invocation(command: list[str]) -> tuple[list[str], str] | None:

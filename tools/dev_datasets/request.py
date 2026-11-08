@@ -115,7 +115,7 @@ FORBIDDEN_OWNER: Final = 'claude-seed'
 ALLOWED_SYMBOLS: Final = frozenset({'SPY', 'QQQ', 'DIA'})
 ALLOWED_OWNERS: Final = frozenset({'dev-datasets', 'operator', DEGRADED_OWNER})
 
-# Granularity on the wire -> the label the database stores (the member name; migration 2b88043cd13c).
+# Granularity on the wire -> the label the database stores (the member name, as the baseline migration creates the enum).
 GRANULARITY_DB_LABELS: Final = {
     '1min': 'ONE_MINUTE',
     '5min': 'FIVE_MINUTES',

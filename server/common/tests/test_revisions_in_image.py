@@ -406,8 +406,9 @@ MIGRATION_JOB_ID = 'migration'
 MIGRATION_JOB_NAME = 'Migration Gate'
 START_STEP = 'Start System'
 FROM_EMPTY_STEP = 'Apply Every Revision From Empty'
-SEED_STEP = 'Upgrade The Previous Release Seed'
-SEED_TEST = 'tests/system/test_migration_with_data.py'
+# The step that upgraded the previous release's committed seed went with the old chain (ADR tj-kg521d,
+# tj-7zjov1.362.7): one baseline, no per-revision seeds. Its name is kept here only to pin that it is gone.
+RETIRED_SEED_STEP = 'Upgrade The Previous Release Seed'
 
 
 def _jobs() -> dict:
@@ -427,8 +428,11 @@ def test_the_migration_job_runs_on_the_built_images_in_order():
     job = _jobs()[MIGRATION_JOB_ID]
     assert 'build' in (job.get('needs') or []), job.get('needs')
     names = [step.get('name') for step in job.get('steps') or []]
-    assert names.index(START_STEP) < names.index(FROM_EMPTY_STEP) < names.index(SEED_STEP), names
+    assert names.index(START_STEP) < names.index(FROM_EMPTY_STEP), names
     assert _run_lines(_migration_steps()[START_STEP]['run']) == ['set -euo pipefail', 'make system-launch']
+    # Nothing but teardown follows the from-empty step: no seed upgrade, no system suite, no second migrate step.
+    after = names[names.index(FROM_EMPTY_STEP) + 1 :]
+    assert after == ['Dump Container Logs', 'Stop System', 'Clean Runtime Configs'], after
 
 
 def test_the_from_empty_step_migrates_twice_around_the_head_and_single_head_checks():
@@ -447,10 +451,12 @@ def test_the_from_empty_step_migrates_twice_around_the_head_and_single_head_chec
     assert lines[0] == 'set -euo pipefail', lines
 
 
-def test_the_seed_step_runs_the_seed_upgrade_test():
-    lines = _run_lines(_migration_steps()[SEED_STEP]['run'])
-    assert f'make test-system SYSTEM_PATHS={SEED_TEST}' in lines, lines
-    assert (REPO_ROOT / SEED_TEST).is_file(), SEED_TEST
+def test_the_seed_upgrade_step_is_gone_and_the_job_runs_no_system_test():
+    """ADR tj-kg521d: no per-revision seeds, so the Migration Gate upgrades nothing but the empty database."""
+    steps = _migration_steps()
+    assert RETIRED_SEED_STEP not in steps, sorted(steps)
+    lines = [line for step in steps.values() for line in _run_lines(step.get('run') or '')]
+    assert not [line for line in lines if 'test-system' in line or 'seeds' in line], lines
 
 
 def test_no_step_of_the_workflow_stages_or_restores_the_revisions():

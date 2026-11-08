@@ -484,16 +484,18 @@ jobs:
         include-hidden-files: true
         overwrite: true
 
-  # THE MIGRATION GATE (bead tj-7zjov1.10, epic tj-7zjov1). Both migration paths against the images Image
-  # Build pushed, whose revisions are inside the data_store image (Dockerfile), not mounted from the
-  # checkout:
-  #   1. EVERY REVISION FROM EMPTY: make migrate on a fresh database, then the recorded revision must be
-  #      the head, then make migrate again (an upgrade at head is a no-op that still takes its dump).
-  #   2. THE PREVIOUS RELEASE'S SEED UPGRADED: tests/system/test_migration_with_data.py loads each
-  #      committed seed (tests/system/seeds) at its own revision on a scratch database and upgrades it.
-  # The System Testing job runs both too, as a side effect of its own work; this job is the one place
-  # that fails on them alone. It stages its configuration from the checkout, which is the commit the
-  # images were built from, so it does not need the pipeline-configs artifact.
+  # THE MIGRATION GATE (bead tj-7zjov1.10, epic tj-7zjov1). Against the images Image Build pushed, whose
+  # revisions are inside the data_store image (Dockerfile), not mounted from the checkout:
+  #   EVERY REVISION FROM EMPTY: make migrate on a fresh database, then the recorded revision must be
+  #   the head, then make migrate again (an upgrade at head is a no-op that still takes its dump).
+  # There is no upgrade-from-an-older-release step: the first alpha is one baseline revision and nothing
+  # before it is supported (ADR tj-kg521d). A data-carrying upgrade check is designed with the first
+  # post-alpha revision.
+  # The System Testing job runs this too, as a side effect of its own work; this job is the one place
+  # that fails on it alone. No uv environment and no generated tree here: make migrate and make
+  # system-launch run only docker, and the step that needed them went with the seed upgrade. It
+  # stages its configuration from the checkout, which is the commit the images were built from, so
+  # it does not need the pipeline-configs artifact.
   migration:
     name: Migration Gate
     runs-on: ubuntu-latest
@@ -510,19 +512,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           persist-credentials: false
-
-      - name: Install UV
-        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
-        with:
-          version: "${{ env.UV_VERSION }}"
-
-      - name: Install dependencies
-        run: |
-          uv sync --all-groups --no-group security --no-group agent-mcp --locked
-
-      - name: Generate gRPC Code
-        run: |
-          make proto
 
       - name: Registry Login
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
@@ -581,13 +570,6 @@ jobs:
           fi
           # At head already: the second run must succeed and change nothing.
           make migrate
-
-      - name: Upgrade The Previous Release Seed
-        env:
-          SYSTEM_TEST_DISPOSABLE_DB: "1"
-        run: |
-          set -euo pipefail
-          make test-system SYSTEM_PATHS=tests/system/test_migration_with_data.py
 
       - name: Dump Container Logs
         if: failure()
@@ -1425,9 +1407,8 @@ jobs:
           make seed-dump SEED_OUT=output/ci-seed
           ls -la output/ci-seed
 
-      # This only moves the seed off the runner, so a person can download, review and commit it.
-      # It is NOT where seeds are kept: storage is the committed files under tests/system/seeds
-      # (ruling on tj-vhboky.56). Hence the short retention. Before the lifecycle step like the
+      # This only moves the seed off the runner, so a person can download and inspect it. No seed
+      # is committed per revision (ADR tj-kg521d): nothing keeps it, hence the short retention. Before the lifecycle step like the
       # dump, and unconditional: every step up to that one is (no `if:`), so no check can be
       # skipped on the way. overwrite: a re-run attempt replaces the earlier attempt's artifact,
       # which is the newer head; without it the fixed name conflicts and the re-run fails here

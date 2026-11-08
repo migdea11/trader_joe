@@ -218,7 +218,7 @@ def test_reset_tables_are_the_store_models_table_names_read_independently_of_the
     assert tuple(tool.RESET_TABLES) == EIGHTEEN_TABLES
 
 
-# Every foreign key among the store tables, written out from the store's models and revision b6d1f93a7c42 (tj-3kplhf):
+# Every foreign key among the store tables, written out from the store's models and the alpha baseline (tj-3kplhf):
 # (child, parent, ON DELETE). The bar -> entry key, and the panel keys with no ON DELETE.
 STORE_FOREIGN_KEYS = [
     ['panel_member_transition', 'panel', None],
@@ -922,8 +922,7 @@ def test_the_running_count_reads_ingest_run_for_the_value_the_store_writes():
         r"state = Column\(\s*Enum\(IngestRunState, name='ingest_run_state', values_callable=_values\)", model
     )
     assert 'return [member.value for member in enum_cls]' in model
-    [migration] = MIGRATIONS.glob('6f5a798746a1_*.py')
-    assert "STATE_MEMBERS = ('RUNNING'," in migration.read_text(encoding='utf-8')
+    assert _baseline_enum_labels()['ingest_run_state'][0] == 'RUNNING'
 
 
 @pytest.mark.parametrize('running', [1, 3])
@@ -1150,7 +1149,7 @@ def test_the_open_request_count_is_the_designed_statement():
 
 
 def test_the_open_request_literals_are_the_values_the_store_writes():
-    # The store writes IngestRequestState's VALUE (values_callable); revision f2b7d4a91c36's enum type carries the same
+    # The store writes IngestRequestState's VALUE (values_callable); the alpha baseline's enum type carries the same
     # literals. Read from the source, so a renamed member or value turns this red.
     source = INGEST_REQUEST_MODEL.read_text(encoding='utf-8')
     tree = ast.parse(source)
@@ -1164,8 +1163,7 @@ def test_the_open_request_literals_are_the_values_the_store_writes():
         assert members[state] == state
     assert re.search(r"Enum\(IngestRequestState, name='ingest_request_state', values_callable=_values\)", source)
     assert 'return [member.value for member in enum_cls]' in source
-    [migration] = MIGRATIONS.glob('f2b7d4a91c36_*.py')
-    migration_states = _module_constants_any(migration)['STATE_MEMBERS']
+    migration_states = _baseline_enum_labels()['ingest_request_state']
     assert set(OPEN_REQUEST_STATES) <= set(migration_states)
     assert set(migration_states) == set(members.values())
     # NOT_DELIVERED is an open state to the store (OPEN_STATES: it is re-requested), but the design rules it does not
@@ -1185,11 +1183,24 @@ def _module_constants_any(path) -> dict[str, object]:
     constants = {}
     for node in ast.parse(path.read_text(encoding='utf-8')).body:
         if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
-            try:
-                constants[node.targets[0].id] = ast.literal_eval(node.value)
-            except ValueError:
-                continue
+            target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+            target, value = node.target, node.value
+        else:
+            continue
+        try:
+            constants[target.id] = ast.literal_eval(value)
+        except ValueError:
+            continue
     return constants
+
+
+def _baseline_enum_labels() -> dict[str, tuple[str, ...]]:
+    """The alpha baseline's literal enum label lists (ADR tj-kg521d), read without importing the revision."""
+    [migration] = MIGRATIONS.glob('5d9a3c7e1b84_*.py')
+    labels = _module_constants_any(migration)['ENUM_LABELS']
+    assert isinstance(labels, dict), labels
+    return labels
 
 
 @pytest.mark.parametrize(

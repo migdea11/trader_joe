@@ -2458,7 +2458,8 @@ def test_the_entry_expiry_column_is_timezone_aware():
     The bar's old expiry was a naive DateTime while every other timestamp here is timestamptz, and
     a naive column makes "when does this data die" depend on the session timezone. Nothing else
     reads this attribute, so without an explicit assertion a revert to DateTime() is invisible.
-    The compiled-DDL half is in test_head_revision_shape.py.
+    The compiled-DDL half is in test_store_model_invariants.py, and the baseline builds it as the model declares
+    (test_alpha_baseline_revision.py offline, test_alpha_baseline_schema_pg.py on Postgres).
 
     NOT COVERED, AND NOT COVERABLE WITHOUT A PRODUCTION CHANGE: a NAIVE expiry sent in the request
     body is accepted and bound unchanged into the insert today -- neither refused nor converted.

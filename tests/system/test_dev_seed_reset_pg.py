@@ -99,7 +99,7 @@ from data.store.app.database.models.stock_market_activity import StockMarketActi
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from schemas.data_ingest.submit import AssetListStatus
 from tests.system import test_usage_record
-from tests.system.test_migration_with_data import MIGRATIONS_DIR, ScratchDb
+from tests.system.scratch_db import MIGRATIONS_DIR, ScratchDb
 
 
 try:
@@ -488,7 +488,6 @@ def _seed(db: ScratchDb, entry_values: Callable[..., dict[str, Any]], bar_values
                 version_no=1,
                 enabled=False,
                 cadence=PanelCadence.DAILY,
-                size=10,
                 actor='operator',
                 reason='dev seed reset system test panel',
             ),

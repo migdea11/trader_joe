@@ -14,9 +14,10 @@ WHAT IT PROVES that server/data/store/tests cannot, because SQLite has neither p
     NOT_DELIVERED mark) leaves no new instance, no supersede and no mark;
   * the repositories run on asyncpg, the ARRAY column included;
   * the two new enum types hold the models' labels in order;
-  * ingest_request.expiry_type (39c28a39b290, tj-7zjov1.153) round-trips each ExpiryType and None on asyncpg.
-The DDL itself is compared offline in server/data/store/tests/test_request_record_revision.py; that the revision
-applies from empty and over the a6d3f8e1c205 seed, and a repeat writes nothing, is test_migration_with_data.py's.
+  * ingest_request.expiry_type (tj-7zjov1.153) round-trips each ExpiryType and None on asyncpg.
+The DDL itself is the alpha baseline's (ADR tj-kg521d): compared with the models offline in
+server/data/store/tests/test_alpha_baseline_revision.py and on Postgres in tests/system/test_alpha_baseline_schema_pg.py,
+which also upgrades from empty twice (the second a no-op).
 
 ISOLATION. Every row is keyed by this run (conftest.py): request and run rows by ids minted here, instance ids
 prefixed with the run id, and each is deleted at the end of its test. note_instance_seen is GLOBAL by design: a
@@ -276,7 +277,7 @@ async def _queued_request(db: AsyncSession, run_identity, created: Created, inst
             kind=IngestRequestKind.ASSET_LIST,
             source=DataSource.ALPACA_API,
             client_label=run_identity.owner,
-            # An asset-list row names its list (the CHECK of a3f8d2c6e914, tj-7zjov1.30).
+            # An asset-list row names its list (the CHECK ck_ingest_request_asset_list_status, tj-7zjov1.30).
             asset_type=AssetType.STOCK,
             asset_list_status=AssetListStatus.ACTIVE,
         ),

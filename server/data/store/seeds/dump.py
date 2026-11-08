@@ -5,8 +5,7 @@ Hand-written bootstrap seeds (tj-vhboky.62) follow it.
 
 The .sql is a DATA-ONLY rendering of store_dataset_entry, stock_market_activity, ingest_instance, ingest_request,
 ingest_run, corporate_action, asset_list_snapshot, asset_list_row, asset_list_event, panel, panel_settings_version,
-panel_source_settings_version, panel_pass and panel_member_transition (never the 8f41c2d7a3b9 archive
-table; all but the first two written by ingest_records.py through the store's own code: the ingest tables since bead
+panel_source_settings_version, panel_pass and panel_member_transition (all but the first two written by ingest_records.py through the store's own code: the ingest tables since bead
 tj-7zjov1.100, corporate_action since tj-7zjov1.31, the asset-list tables since tj-7zjov1.30, the panel tables since
 tj-7zjov1.196 by panel_records.py).
 It is rendered BY POSTGRES through the driver, in a session at TimeZone UTC and extra_float_digits 1 (the digests'
@@ -56,7 +55,7 @@ edited, and the producer fails loudly (the script errors) rather than write a se
 # Every seed row carries this in created_at and updated_at.
 SEED_TIMESTAMP = '2000-01-01 00:00:00+00'
 
-# The tables the seed carries, parents first. Fixed: never the archive table.
+# The tables the seed carries, parents first. Fixed.
 ENTRY_TABLE = 'store_dataset_entry'
 BAR_TABLE = 'stock_market_activity'
 INSTANCE_TABLE = 'ingest_instance'

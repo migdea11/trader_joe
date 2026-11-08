@@ -79,7 +79,8 @@ PRODUCER_CLOSURE_MOUNTS = {
     ('./server/data/ingest/app', '/code/data/ingest/app'),
 }
 # tj-7294qb: the repository's alembic ini, a FILE, beside the migrations mount as data_store lays them
-# out, so tests/system/test_migration_with_data.py runs the alembic CLI from cwd data/store with it.
+# out, so tests/system/scratch_db.py runs the alembic CLI from cwd data/store with it (the usage, reaper and
+# dev-seed scratch databases, and the alpha baseline's catalogue test, tests/system/test_alpha_baseline_schema_pg.py).
 ALEMBIC_INI_MOUNTS = {('./server/data/store/alembic.ini', '/code/data/store/alembic.ini')}
 # Decision tj-3mk3u5.42 F1: the committed generated gRPC code, beside ./common because common/rpc imports
 # it, and test_client's PYTHONPATH names it. The producer's closure includes data/ingest/app, which

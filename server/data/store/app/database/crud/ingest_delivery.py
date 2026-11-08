@@ -48,7 +48,7 @@ class StoredAttempt:
 
 @dataclass(frozen=True)
 class AttemptLabel:
-    """The label columns of an ingest_run row, None where the request has none (stored NULL, revision c7e19a4d5b28).
+    """The label columns of an ingest_run row, None where the request has none (stored NULL).
 
     A bars request supplies all five; a corporate-actions request only the symbol it asked for.
     """
