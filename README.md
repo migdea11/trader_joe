@@ -234,11 +234,12 @@ another machine is a host decision (a tunnel or an overlay network), not a setti
 
 **The proxy.** The browser talks to one origin. Caddy (`deploy/web/Caddyfile`) forwards
 `/api/store/ui/v1/*` to data_store with the `/api/store` prefix stripped, so
-`/api/store/ui/v1/datasets` becomes `/ui/v1/datasets`. Four rules pass: `GET` and `HEAD` under that
-prefix, `PATCH` on one dataset's `/expiry`, `PATCH` on one dataset's `/collecting`, and `DELETE` on one dataset. Nothing else does: not another
+`/api/store/ui/v1/datasets` becomes `/ui/v1/datasets`. Seven rules pass: `GET` and `HEAD` under that
+prefix, `PATCH` on one dataset's `/expiry`, `PATCH` on one dataset's `/collecting`, `DELETE` on one dataset, and `POST`
+on the three panel writes (`/panels`, one panel's `/settings-versions`, one source's `/settings-versions`). Nothing else does: not another
 method, and not `/store/*`, `/internal/*` or `/docs`, and there is no route to data_ingest. The
 instance secret is added to the proxied request inside the container, so the browser never holds it and
-can write only through those three write routes. The dev server (`vite.config.ts`) mirrors the same four rules
+can write only through those six write routes. The dev server (`vite.config.ts`) mirrors the same seven rules
 on the decoded, cleaned path (an escape, `//`, `./` or `..` is a 400) and adds the secret from its own
 process environment, so dev fails where prod does.
 The live socket, `GET /api/store/ui/v1/events`, is an upgraded `GET` and passes the same filter.
@@ -326,14 +327,15 @@ hygiene, not secrecy.
 
 ## Retention, usage and the scheduler
 
-data_store does four periodic jobs besides serving requests. All four run inside its one process (see
-[The web UI](#the-web-ui) for why that must stay one worker), and all four read the database on every
+data_store runs periodic jobs besides serving requests; these are the ones an operator tunes. All run inside its one process (see
+[The web UI](#the-web-ui) for why that must stay one worker), and all read the database on every
 pass: nothing is queued, so after a restart the next pass is the catch-up.
 
 | Job | What it does | Settings (defaults) |
 |---|---|---|
 | Expiry reaper | Deletes datasets whose expiry has passed, whether or not they are still collecting, and records each deletion | `REAPER_INTERVAL_SECONDS` (3600), `REAPER_DELETES_ENABLED` (off) |
 | Daily refresh | Keeps `DAILY` datasets that are collecting current: after a trading session closes, plus a settle delay, it requests each stale dataset's missing tail | `DAILY_REFRESH_ENABLED`, `DAILY_REFRESH_SETTLE_MINUTES` (30), `DAILY_REFRESH_MAX_PER_PASS` (10), `DAILY_REFRESH_BACKOFF_SECONDS` (30) |
+| Panel manager | Keeps a dataset for every asset a panel selects (below). Off for a panel until a settings version enables it | `PANEL_MANAGER_ENABLED` (on), `PANEL_MANAGER_DRY_RUN` (off) |
 | Usage recorder | Buffers bar reads and writes them in batches | `USAGE_FLUSH_INTERVAL_SECONDS` (5), `USAGE_FLUSH_BATCH_SIZE` (500), `USAGE_BUFFER_MAX` (10000) |
 | Usage rollup | Folds per-read rows older than the window into daily summaries | `USAGE_ROLLUP_AFTER_DAYS` (90), `USAGE_ROLLUP_INTERVAL_SECONDS` (3600) |
 
@@ -381,6 +383,20 @@ before any broker that penalises exceeding limits is enabled**: today nothing co
 restarts, and the only bounds are the per-pass cap, the one-at-a-time serialisation, the vendor rate
 budget and the missing-tail-only request.
 
+**The panel manager** decides which assets a *panel* holds and creates their datasets. A panel is a named
+selection of one source's assets (filters on the daily asset-list snapshot, a size and a cadence of daily,
+weekly or monthly; monthly unless told otherwise), owned by the reserved owner `panel`, which `POST /store`
+refuses. Panels are UI-only: they are created and edited in the web UI's Panels tab (`/data/panels`) through
+the `/ui/v1` panel routes (`docs/API.md`, *The panel routes*), and there is no SDK panel API. Every 5 minutes it works out from the stored rows what is due, so a
+restart resets nothing. A membership pass runs at the panel's creation, on the newest snapshot, then an interval
+after the last *finished* pass (a pass that crashed holds the next off for an hour). It records every decision
+(entered, created, deferred, refused, exited, draining, drained) in an append-only ledger, and creates a dataset
+for a new member within two hourly limits that are set per source: new datasets per hour and requests per hour
+(a creation costs two). A member that exits has its dataset stopped, never deleted. The members' daily bars are
+the daily refresh's, so raise `DAILY_REFRESH_MAX_PER_PASS` for a large panel. With `PANEL_MANAGER_DRY_RUN=true`
+it records what it would do and applies nothing. The mechanics are in
+[`server/data/store/CLAUDE.md`](server/data/store/CLAUDE.md#panels-and-the-panel-manager).
+
 **Usage tracking.** Each bar read is recorded as one row against a label the reader sends in the
 `X-Client-Id` header: send your owner string. It is a label for usage statistics, never a credential,
 and the web UI sends `operator`. Per-read rows are folded into daily summaries after
@@ -411,13 +427,13 @@ without matching it is refused with the colliding id.
 Every range is **half-open**, `[start, end)`: the start is included and the end is excluded. Two
 ranges that only touch (one ends where the next starts) do not overlap, a bar stamped exactly at
 `end` belongs to the next range, and a declared `end` that is not after `start` is refused with a 422.
-A dataset's freshness (healthy, late, failed or retired, where retired means a subscription whose `collect` is false, shown as Stopped) and completeness are not stored: the server
+A dataset's health (healthy, late, failed or retired, where retired means a subscription whose `collect` is false, shown as Stopped) and completeness are not stored: the server
 computes them on read, against a trading calendar for the dataset's source.
 
-What *is* stored about collection is a **run**: each store-driven fetch writes one `ingest_run` row,
-`RUNNING` while the vendor answers and then `SUCCEEDED`, `EMPTY` (the vendor held no bars) or `FAILED`
-with the typed error. A run left `RUNNING` by a process that stopped is marked `FAILED` with reason
-`INTERRUPTED` at the next start. Runs outlive their dataset's deletion but are read per dataset, so a
+What *is* stored about collection is a **request** and its **runs**: a store-driven fetch is first written as an
+`ingest_request` row, and each attempt ingest reports is one `ingest_run` row, written when the store receives it,
+`SUCCEEDED`, `EMPTY` (the vendor held no bars) or `FAILED`. A `RUNNING` row left by an earlier release is marked
+`FAILED` with reason `INTERRUPTED` at the next start. Runs outlive their dataset's deletion but are read per dataset, so a
 deleted dataset's runs are no longer reachable.
 
 Bars are stored **raw**. There are no split or dividend factors on a bar, and corporate-action
@@ -747,6 +763,12 @@ prod image holds no fakes, and no `prod-*` or `dev-*` target loads the overlay. 
 > Agents use the agent-stack MCP's `test_build` and `test_up` instead, which address `trader_joe_dev` only.
 > `test_up` refuses while that project holds a container started from neither the dev nor the test files;
 > `test_build` starts nothing and runs no such check.
+
+**A seed dump pollutes the test stack for the suite.** The seed producer empties and rewrites the ingest, asset-list
+and panel tables (see Seeds above), and the suite does not expect what it leaves. After any `seed_dump`, restart data_ingest,
+then `test_reset`, `migrate` and restart data_store, before `run_system_tests`; restart data_ingest right before the
+run too, because the fake broker's fail-once memory is per instance. Every path given to `run_system_tests` must lie
+under `tests/system/` (or leave it empty for the whole directory).
 
 The target does not start or migrate a stack; that choice stays with you. It **writes to the
 database it reaches**, the one the `trader_joe_dev` project's stack holds, which may be a dev stack with

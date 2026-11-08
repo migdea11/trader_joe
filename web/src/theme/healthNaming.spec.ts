@@ -34,12 +34,10 @@ const carrying = (paths: string[], pattern: RegExp) => paths.filter((p) => patte
 // FRESHNESS_STATUS_*, FRESHNESS_BADGES, freshnessBadge.
 const OLD_WORD = /freshness/i
 
-// Production files that may still say 'freshness', each with its reason. An entry may go stale
-// (the file renamed), which fails below; it may not grow without a reason.
-const PRODUCTION_FRESHNESS_ALLOWED: Readonly<Record<string, string>> = {
-  // Docs, not code: the scribe's H4 bead (tj-7zjov1.206) owns this line. Remove the entry when it lands.
-  'theme/README.md': 'documentation renamed by H4 tj-7zjov1.206',
-}
+// Production files that may still say 'freshness', each with its reason. Empty since H4
+// (tj-7zjov1.206) renamed theme/README.md. An entry that goes stale (the file gone, or no longer
+// saying the word) fails below, so an allowance cannot outlive its reason; it may not grow without one.
+const PRODUCTION_FRESHNESS_ALLOWED: Readonly<Record<string, string>> = {}
 
 // The bare word 'fresh' (not 'refresh', which is a different word) in production, each with its reason.
 const PRODUCTION_FRESH_ALLOWED: Readonly<Record<string, string>> = {
@@ -80,6 +78,14 @@ describe("dataset state is named health, never 'freshness' (tj-grna9p.168)", () 
         expect(ALL).toContain(path)
         expect(reason.length).toBeGreaterThan(10)
       }
+    }
+  })
+
+  it('every freshness allowance still says freshness, so a stale entry cannot linger', () => {
+    for (const table of [PRODUCTION_FRESHNESS_ALLOWED, TEST_FRESHNESS_ALLOWED]) {
+      const listed = Object.keys(table).sort()
+      expect(listed.filter((p) => !ALL.includes(p))).toEqual([])
+      expect(carrying(listed.filter((p) => ALL.includes(p)), OLD_WORD)).toEqual(listed)
     }
   })
 })

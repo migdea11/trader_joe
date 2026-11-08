@@ -190,6 +190,17 @@ It was nine until the Kafka removal, when R1 left the table.
 | U13 | `GET /ui/v1/stats/usage/reads-per-day` | data_store | http (protobuf JSON) | none | **Stable** |
 | U14 | `GET /ui/v1/stats/usage/stale` | data_store | http (protobuf JSON) | none | **Stable** |
 | U15 | `GET /ui/v1/stats/storage/current` | data_store | http (protobuf JSON) | none | **Stable** |
+| PR1 | `GET /ui/v1/panels` | data_store | http (protobuf JSON) | none | **Stable** |
+| PR2 | `GET /ui/v1/panels/{panel_id}` | data_store | http (protobuf JSON) | none | **Stable** |
+| PR3 | `GET /ui/v1/panels/{panel_id}/settings-versions` | data_store | http (protobuf JSON) | none | **Stable** |
+| PR4 | `GET /ui/v1/panel-sources/{source}/settings-versions` | data_store | http (protobuf JSON) | none | **Stable** |
+| PR5 | `GET /ui/v1/panels/{panel_id}/boundaries` | data_store | http (protobuf JSON) | none | **Stable** |
+| PR6 | `GET /ui/v1/panels/{panel_id}/members` | data_store | http (protobuf JSON) | none | **Stable** |
+| PR7 | `GET /ui/v1/panels/{panel_id}/asset-list-history` | data_store | http (protobuf JSON) | none | **Stable** |
+| PR8 | `GET /ui/v1/datasets/{dataset_id}/corporate-actions` | data_store | http (protobuf JSON) | none | **Stable** |
+| PW1 | `POST /ui/v1/panels` | data_store | http (protobuf JSON) | instance secret | **Stable** |
+| PW2 | `POST /ui/v1/panels/{panel_id}/settings-versions` | data_store | http (protobuf JSON) | instance secret | **Stable** |
+| PW3 | `POST /ui/v1/panel-sources/{source}/settings-versions` | data_store | http (protobuf JSON) | instance secret | **Stable** |
 
 data_ingest has no row. Its interface is the gRPC `IngestService.FetchDataset`, declared in
 `proto/trader_joe/proto/internal/ingest/v1/ingest.proto`, handled by
@@ -469,7 +480,7 @@ and is the only interface in the component that crosses two external boundaries.
 | **Implementation** | `routers/data_store/asset_dataset_store.py :: store_data` *(as of the dataset-model PR)* |
 | **Request** | `schemas.data_store.asset_dataset_store.StoreAssetDatasetPath` + `...StoreAssetDatasetBody` |
 | **Response** | `schemas.data_store.asset_dataset_store.StoreAssetDatasetResponse`: `message`, `data_points` (bars written) and `served_range` |
-| **Touches** | Postgres (`AsyncSession`) **and** gRPC (`common.rpc.clients.ingest_fetch.IngestFetchClient`) |
+| **Touches** | Postgres (`AsyncSession`) **and** gRPC (`common.rpc.clients.ingest_submit.IngestSubmitClient`) |
 
 This is the write path: it creates (or resolves) the dataset entry, triggers a fetch, forwards the
 request to data_ingest through `store_market_activity_worker`, and writes the returned bars against
@@ -513,14 +524,23 @@ stores or reads either, so they change nothing about the request, are not part o
 identity, and do not appear on S2 or S6. They are on the body so a client can send them ahead of the
 scheduler that will use them.
 
-**Every call is recorded as an ingest run.** S1 writes one `ingest_run` row around the fetch, in its
-own transactions: `RUNNING` before the stream opens, the dataset id at ingest's acknowledgement, and
-`SUCCEEDED` (bars written), `EMPTY` (the vendor held none) or `FAILED` (with the typed error) at the
-end. The record is best effort: a failure to write it is logged and the fetch goes ahead, and the
-error S1 answers with is the fetch's own. A run left `RUNNING` by a process that stopped is marked
-`FAILED` with reason `INTERRUPTED` at the next start. The runs are read through U6, and S1 also
-publishes to U8: an `IngestRunChanged` at each of the three points and a `DatasetChanged` `UPDATED`
-after the commit.
+**Every call is recorded as a request and its attempts.** S1 writes an `ingest_request` row before it
+sends anything (trigger `REQUEST`), submits it, and answers from that row. The result comes back on
+the push path: the delivery intake writes the bars, the dataset entry (on the first delivered
+attempt) and **one `ingest_run` row per reported attempt**, all in the delivery's transaction.
+**Every POST first sends its `name_change` clamp query**, a corporate-actions request for the symbol
+(see [What a create does](#what-a-create-does)), so the first attempt a POST records is that query's.
+The runs are read through U6. What S1 publishes to U8, each frame after the commit it announces:
+
+| Case | Frames, in order |
+|---|---|
+| Served | the clamp's attempt frame (`EMPTY` when the vendor holds no name change; labelled with the symbol alone, no dataset), then ONE bars frame, `SUCCEEDED`, naming the dataset and the request, then `DatasetChanged` `UPDATED` |
+| The vendor fails | the clamp's frame, then one `FAILED` bars frame per attempt (trigger `REQUEST`, then `RETRY` for each later one), no dataset; the POST answers the failure |
+| The feed is refused (`FEED_NOT_AVAILABLE`, a 422) | the clamp's frame only: the request is refused at Submit and fails `PERMANENT` with no attempt row, so there is no bars frame and no `DatasetChanged` |
+
+The legacy run recorder, which opened a `RUNNING` row before the call and announced three frames (start,
+acknowledgement, finish), is no longer on this path: S1 writes no `RUNNING` row. A `RUNNING` row an
+earlier release left is still marked `FAILED` with reason `INTERRUPTED` at the next start.
 
 **Two things a retry does not avoid.** An exact repeat reuses the entry and the bar upsert is
 idempotent on the bar's natural key, so the stored data does not duplicate — but the vendor fetch is
@@ -698,7 +718,7 @@ path with S3 and answers a different method; the manifest records the two as sep
 
 # routers/data_store — the UI routes
 
-The web UI is served under `/ui/v1` by fourteen read routes, one socket and three writes (W1, W2, W3). The reads are open like the other reads. The three writes need the instance secret. In a deployment the web container's proxy is what a browser reaches: it forwards the reads and exactly those three writes, and adds the secret itself.
+The web UI is served under `/ui/v1` by twenty-two read routes (fourteen dataset, usage and storage reads, then the eight panel reads PR1 to PR8), one socket and six writes (the dataset writes W1, W2, W3 and the panel writes PW1, PW2, PW3). The reads are open like the other reads. The six writes need the instance secret. In a deployment the web container's proxy is what a browser reaches: it forwards the reads and exactly those six writes, and adds the secret itself. The panel routes are in *The panel routes* below.
 See the README's *The web UI*.
 
 **Protobuf canonical JSON, not Pydantic.** The response of every `/ui/v1` route is the protobuf
@@ -710,7 +730,7 @@ and ignores a field it does not know, since proto changes are additive. The rend
 `routers/common/proto_json.py`: a handler returns `ProtoJSONResponse(message)`, a route declares its
 message with `proto_route`, and a body, when a route takes one, is parsed with `ProtoBody`, which
 refuses an unknown field or a non-object with a 422 that names the message type and never echoes the
-body. Only the writes (W1, W2, W3) take a body, and W2's is optional.
+body. Only the writes (W1, W2, W3, PW1, PW2, PW3) take a body, and W2's is optional.
 
 **Common behaviour.**
 
@@ -721,7 +741,7 @@ body. Only the writes (W1, W2, W3) take a body, and W2's is optional.
 | Unknown parameter | A 422 (`extra_forbidden`), not ignored. |
 | Enum filters | Take the member name, in any case, with or without the wire prefix: `source=ALPACA_API` and `source=DATA_SOURCE_ALPACA_API` are the same filter. |
 | Errors | problem+json as everywhere (see the conventions): 404 `NOT_FOUND` for an unknown dataset, 422 for a bad parameter. |
-| Credentials | The reads carry none. The two writes need the instance secret (`X-Instance-Secret`). `owner` and the read label `client_id` are free-text labels, never keys. |
+| Credentials | The reads carry none. The writes need the instance secret (`X-Instance-Secret`). `owner` and the read label `client_id` are free-text labels, never keys. |
 | The read label | A bar read (U5, S5) is recorded under the caller's `X-Client-Id` label. See [the read label](#the-x-client-id-read-label). |
 
 ### U1 · `GET /ui/v1/config`
@@ -735,7 +755,7 @@ package version, else `unknown`). Nothing secret is read or returned.
 
 One page of the catalog, a `DatasetPage` of `DatasetSummary` items: identity, range, `updateType`,
 `expiryType`, `expiry` (the deletion date only), `state` (`ACTIVE`, or `RETIRED`: a `DAILY` or `STREAM` dataset whose collect intent is false), `collecting` (derived for every update type: the intent for a subscription; for a `STATIC` dataset true only while a run is in flight), the stored extent (`firstBar`, `lastBar`,
-`barCount`), `freshness`, the `siblings` (the same series at other granularities) and `lastRun`: the
+`barCount`), `health`, the `siblings` (the same series at other granularities) and `lastRun`: the
 dataset's newest collection run, whatever its state, unset when it has never run (an `IngestRun`, see
 U6), `usage` (a `DatasetUsage`, always set, see [Usage on the list](#usage-on-the-list-the-facets-and-the-detail)) and
 `reaperPending`: true when the dataset's expiry has passed and the reaper would delete it (true in
@@ -743,7 +763,7 @@ dry-run too, where nothing is deleted; see U10).
 
 **Running means a run is in flight and ingest has acknowledged it.** `lastRun.state` is `RUNNING`, and
 a run is attached to a dataset only from ingest's acknowledgement, so a first-time request is not
-visible as Running while the vendor is still answering. Running is not a freshness status.
+visible as Running while the vendor is still answering. Running is not a health status.
 
 | Parameter | Meaning |
 |---|---|
@@ -759,8 +779,8 @@ visible as Running while the vendor is still answering. Running is not a freshne
 | `client_id`, `client_kind` | select **whose reads** the usage figures and the `usage` and `last_read` rules count; see the usage section below |
 | `cursor`, `limit` | page; `limit` 1 to 500, default 100 |
 
-**Freshness is computed on read, never stored**, over the source's trading calendar (a holiday or an
-early close moves what is expected). A source with no calendar has no computed freshness: its status is
+**Dataset health is computed on read, never stored**, over the source's trading calendar (a holiday or an
+early close moves what is expected). A source with no calendar has no computed health: its status is
 unspecified and it matches no `status` filter.
 
 | Update type | Status | Meaning |
@@ -768,10 +788,10 @@ unspecified and it matches no `status` filter.
 | `DAILY` | `FRESH` | the last completed session in range is stored |
 | `DAILY` | `LATE` | not stored yet and the next session has not opened; pending, not a failure |
 | `DAILY` | `OVERDUE` | not stored by the next session's open; a failure |
-| `STREAM` | `FRESH` / `OVERDUE` | in hours, last bar within a few bar-lengths of now (`FRESHNESS_STREAM_BAR_MULTIPLE`, default 3); outside hours, relative to the last close |
+| `STREAM` | `FRESH` / `OVERDUE` | in hours, last bar within a few bar-lengths of now (`HEALTH_STREAM_BAR_MULTIPLE`, default 3); outside hours, relative to the last close |
 | `STATIC` | `COMPLETE` | every session in `[start, end)` has at least one bar |
 | `STATIC` | `GAPS` | some do not; `gapCount` is the number of missing sessions |
-| `DAILY` or `STREAM`, with `collect` false | `RETIRED` | no freshness is computed; an expiry does not retire a dataset |
+| `DAILY` or `STREAM`, with `collect` false | `RETIRED` | no health is computed; an expiry does not retire a dataset |
 
 The UI groups these as Healthy (`FRESH`, `COMPLETE`), Late (`LATE`), Failed (`OVERDUE`, `GAPS`) and
 Retired (the UI says Stopped). Completeness counts sessions, and a session is covered when a bar covers its period: the session
@@ -861,19 +881,19 @@ with an opaque `next_cursor` (empty on the last page), so a run that starts whil
 shifts a page it has not read. `limit` is 1 to 500, default 50. **404** for an unknown dataset, 422
 for a cursor that does not decode.
 
-An `IngestRun` carries `id`, `datasetId` (empty until ingest's acknowledgement), `label` (symbol and
+An `IngestRun` carries `id`, `datasetId` (empty when the attempt names no dataset: a clamp query, or a POST's attempt that failed before any delivery created the entry), `label` (symbol and
 granularity), `trigger`, `actor` (the request body's `owner`, a label and never a credential), the
 requested `start` and `end`, `state` (`RUNNING`, `SUCCEEDED`, `EMPTY` or `FAILED`), `barsWritten`,
 `error` (set only when `FAILED`: `domain`, `reason`, `message`), `startedAt` and `finishedAt` (unset
-while `RUNNING`). Only `REQUEST` runs exist today: `SCHEDULE` and `RETRY` are in the vocabulary and
-nothing writes them. `requestId` and `quotaKey` are always empty. A run swept at startup reads
+while `RUNNING`). `trigger` is the request's own trigger on its first attempt (`REQUEST` for a POST, `SCHEDULE` for the daily
+refresh) and `RETRY` on each later attempt of either. `requestId` names the request the attempt belongs to (empty on a legacy run); `quotaKey` is always empty. A run swept at startup reads
 `FAILED` with `reason` `INTERRUPTED`, which is a marker of the run record and not a member of the
 error vocabulary in [`errors.md`](errors.md).
 
 ### U7 · `GET /ui/v1/datasets/{dataset_id}/coverage`
 
 A `CoverageStrip`: the dataset's range over its trading calendar, bucketed for a strip, and its gaps.
-Computed on read, never stored, from the same calendar and completed-session rule as the freshness
+Computed on read, never stored, from the same calendar and completed-session rule as the dataset health
 status (a session counts as covered when it has at least one bar). It records no usage.
 
 | Part | Rule |
@@ -883,7 +903,7 @@ status (a session counts as covered when it has at least one bar). It records no
 | `buckets` (field) | contiguous groups of near-equal session counts that tile `[start, end)`. `expectedSessions` counts completed sessions only, so a bucket with none is not yet due; `sessionsWithBars` is how many of those hold a bar |
 | `gaps` | at most the first 500, ascending. A gap is a maximal run of missing completed sessions; weekends and holidays never split or form one |
 | gap window | **whole sessions**: `start` is the local midnight of the first missing session, `end` the local midnight of the day after the last. It can begin before or end after the dataset's range when the range starts or ends mid-session; buckets are clipped to the range, gaps are not |
-| `gapCount` | the number of gap **intervals**, which may exceed `gaps`. `Freshness.gapCount` (U2) counts missing **sessions**; for a `STATIC` dataset the sessions of all gaps add up to it |
+| `gapCount` | the number of gap **intervals**, which may exceed `gaps`. `DatasetHealth.gapCount` (U2) counts missing **sessions**; for a `STATIC` dataset the sessions of all gaps add up to it |
 
 **404** for an unknown dataset. **422** (`INVALID_REQUEST`) when no trading calendar covers the dataset
 (its source has none, or its range starts before the calendar does): an error, never an empty strip,
@@ -902,17 +922,16 @@ The event is published after the commit it announces.
 
 | Event | Published when |
 |---|---|
-| `IngestRunChanged` (carries the `IngestRun`) | a run starts, is acknowledged by ingest, and finishes |
-| `DatasetChanged` `UPDATED` | after S1 or W1 commits, unless S1 flipped the collect intent, and after a daily refresh fetch commits |
-| `DatasetChanged` `RETIRED` / `RESUMED` | after W3 commits a change of collect to false / true, or after S1 flips it the same way. A W3 that leaves the stored value as it was publishes nothing |
+| `IngestRunChanged` (carries the `IngestRun`) | once per reported attempt, after the delivery that wrote its `ingest_run` row commits: `SUCCEEDED`, `EMPTY` or `FAILED`. A POST announces its `name_change` clamp's attempt and then its bars attempts (S1 lists the cases); a refused feed announces the clamp's frame only. No `RUNNING` frame is published |
+| `DatasetChanged` `UPDATED` | after the delivery that resolved the dataset commits (S1's bars attempt, a daily refresh's), unless it flipped the collect intent, and after W1 commits |
+| `DatasetChanged` `RETIRED` / `RESUMED` | after W3 commits a change of collect to false / true, after S1's delivery flips it the same way, or (`RETIRED`) when the store stops a dataset by its own rule or the panel manager stops an exited member. A W3 that leaves the stored value as it was publishes nothing |
 | `DatasetChanged` `DELETED` | after S3, W2 or a reaper deletion commits |
 | `ReaperPendingChanged` | the reaper's pending set differs from the previous pass's, after any deletions of an enabled pass, and once on the first pass after start; in dry-run too. A notification: reload U10 or the affected lists |
 
 `DatasetChanged` is **never `CREATED`**: a new dataset arrives as `UPDATED`,
 because the upsert does not tell a create from a repeat. `RequestChanged`
-is in the proto and typed, and **nothing publishes it**: it is reserved. An acknowledgement's
-`IngestRunChanged` can name a dataset whose entry is not committed yet, so a reload by id may 404
-briefly.
+is in the proto and typed, and **nothing publishes it**: it is reserved. An attempt frame is published
+after the commit that wrote the entry it names, so a reload by id finds it.
 
 **One process, one worker.** The hub that fans events out lives in data_store's memory, so the socket
 is correct only while data_store runs one worker; `docker-compose.yaml` pins `SERVICE_WORKERS=1`. With
@@ -1104,6 +1123,42 @@ shares, so the split sums to it. Parameter: `source` (filter) only.
 
 **Known limit:** a source with more than about 16,000 datasets exceeds the database's bound-parameter
 limit on the usage statistics. Request-quota use is not served.
+
+
+## The panel routes
+
+A **panel** is a named selection of one source's assets whose datasets the store's panel manager creates and keeps (see `data/store/CLAUDE.md`). Panels are UI-only (owner ruling 2026-10-27): these eleven routes are the whole panel surface, with no client or SDK panel API. Messages are declared in `proto/trader_joe/proto/ui/v1/panels.proto`; paths in `UiPanelsInterface` and `UiPanelWritesInterface` (`routers/data_store/app_endpoints.py`), handlers in `routers/data_store/ui_panel.py`. The ids PR1 to PR8 and PW1 to PW3 here are this document's; the ruling calls them R1 to R8 and W1 to W3.
+
+`{panel_id}` and `{dataset_id}` are UUIDs (a malformed one is a 422, an unknown one a 404). `{source}` is the `DataSource` member name, with or without the `DATA_SOURCE_` prefix; `UNSPECIFIED` is a 422. As on every `/ui/v1` route, an unknown query parameter is a 422.
+
+### The reads (PR1 to PR8)
+
+Open, read-only, and none records usage. Paged reads take `cursor` and `limit` (1 to 500, default 100); a cursor is opaque and bound to its route and parent, and a foreign or undecodable one is a 422.
+
+| Id | Route | Answer (200) | Notes |
+|---|---|---|---|
+| PR1 | `GET /ui/v1/panels` | `PanelList` | Every panel by name then id, with the enabled flag of its latest settings version. No parameters. |
+| PR2 | `GET /ui/v1/panels/{panel_id}` | `PanelDetail` | The panel with its current settings and source settings versions (each with its effective pass) and its counts. Member health is judged at the request time. 404 for an unknown panel. |
+| PR3 | `GET /ui/v1/panels/{panel_id}/settings-versions` | `PanelSettingsVersionPage` | Newest first, keyset on the version number, each with its effective pass. 404 for an unknown panel. |
+| PR4 | `GET /ui/v1/panel-sources/{source}/settings-versions` | `PanelSourceSettingsVersionPage` | Newest first. A source with no version is an empty page, never a 404: that is how the create form learns the rates must be given. |
+| PR5 | `GET /ui/v1/panels/{panel_id}/boundaries` | `PanelBoundaries` | Every marker in `[start, end)`, oldest first: settings versions and operator collect stops and resumes. `start` and `end` are both required, timezone-aware, `start` before `end` (a 422 otherwise). 404 for an unknown panel. |
+| PR6 | `GET /ui/v1/panels/{panel_id}/members` | `PanelMemberPage` | Keyset over (symbol, vendor asset id); each member with its dataset's last bar and health. 404 for an unknown panel. |
+| PR7 | `GET /ui/v1/panels/{panel_id}/asset-list-history` | `AssetListHistory` | One entry per session in `[start, end)`, ascending, never per asset, with whether a day is due or missing. `start` and `end` required, `start` before `end`, at most 366 days. A 422 for a bad window or a source with no trading calendar; 404 for an unknown panel. |
+| PR8 | `GET /ui/v1/datasets/{dataset_id}/corporate-actions` | `CorporateActionEventPage` | The dataset's corporate-action observations, newest `as_of` first; a vendor revision is its own item. Matched by the dataset's source and symbol, whichever request delivered them, and not filtered by any window. 404 for an unknown dataset. |
+
+### The writes (PW1 to PW3)
+
+POST only: each appends a row and a repeat appends another, so none is PUT or PATCH. Each needs the instance secret (`X-Instance-Secret`, a 401 otherwise) and takes a body parsed strictly (an unknown field or a missing required one is a 422). Each answers **201** with the new row. The actor is the operator principal and the `reason` is required (not blank after trimming).
+
+**The version row is the audit** (ADR `tj-26jt9w` addendum 20): it is append-only and carries who, why and when, so a panel write adds no `dataset_override_log` row and needs no override. Nothing is published on the events socket, since there is no panel event type; the web UI re-reads over REST. A create does not start a pass: the panel manager's next tick runs the first.
+
+| Id | Route | Body | 201 answer | Refusals |
+|---|---|---|---|---|
+| PW1 | `POST /ui/v1/panels` | `CreatePanelRequest`: `name` (required, trimmed, unique), `source` (required, fixed for the panel's life), the first settings as flat fields (`enabled` and `size` required; `cadence`, unspecified means the default MONTHLY; `allowSymbols`, `denySymbols`, `assetClass`, `exchange`, `active`, `tradable`), `reason`, and optionally the source's first settings (`rampDatasetsPerHour`, `requestCapPerHour`, `corporateActionWindowPreDays`, `corporateActionWindowPostDays`) | `PanelDetail`, version 1, `effectivePass` unset and zero counts | 422: a bad body; a blank name or reason; a name already used (creates of one name are serialised, so the loser of two concurrent creates is refused); a negative number; a source with no settings when none is given (the rates have no default); source settings given for a source that **already has a version** (they change only through PW3). Nothing is written |
+| PW2 | `POST /ui/v1/panels/{panel_id}/settings-versions` | `SavePanelSettingsRequest`: the complete new settings (replaced as sent, an absent optional filter clears it; `enabled`, `cadence` and `size` required) and `reason`. Enable and disable are this write with `enabled` changed | `PanelSettingsVersion`, `effectivePass` unset | 422 for a bad body or a store refusal; 404 for an unknown panel |
+| PW3 | `POST /ui/v1/panel-sources/{source}/settings-versions` | `SaveSourceSettingsRequest`: the four numbers (all required, not negative; `rampDatasetsPerHour` 0 pauses creation) and `reason` | `PanelSourceSettingsVersion`, `effectivePass` unset. It applies to every panel on the source | 422 for a bad source, body or store refusal |
+
+Rules run in order: the secret (401), the body (422), existence (404, PW2 only), the store's refusals (422), then the write. Every store refusal is `INVALID_REQUEST` with the store's message.
 
 ---
 

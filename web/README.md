@@ -27,8 +27,10 @@ Strategy-specific metrics are add-ons, and only the add-ons are private.
 - **The browser calls `/api/store/...`.** data_store serves the same route without the prefix, so
   `/api/store/ui/v1/datasets` reaches `/ui/v1/datasets`. In production Caddy strips the prefix,
   forwards only GET and HEAD under `/api/store/ui/v1/` plus exactly `PATCH .../datasets/{uuid}/expiry`,
-  `PATCH .../datasets/{uuid}/collecting` and `DELETE .../datasets/{uuid}`, and adds the instance secret to the proxied request; the browser
-  never holds it. The dev server (`vite.config.ts`) mirrors those four rules and adds the secret from
+  `PATCH .../datasets/{uuid}/collecting`, `DELETE .../datasets/{uuid}` and `POST` on `.../panels`,
+  `.../panels/{uuid}/settings-versions` and `.../panel-sources/DATA_SOURCE_*/settings-versions`, and adds the
+  instance secret to the proxied request; the browser never holds it. The dev server (`vite.config.ts`)
+  mirrors those seven rules and adds the secret from
   its own process environment (`INSTANCE_WRITE_SECRET`, never a `VITE_` name), so a write works in dev
   and a request the production proxy would refuse is refused here too.
 

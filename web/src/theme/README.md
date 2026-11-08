@@ -10,7 +10,7 @@ spacing values; everything else here is built from it.
 | `base.css` | page basics (ground colour, Plex Sans, `tabular-nums`, `color-scheme: dark`) |
 | `preset.ts` | the PrimeVue 5 preset: Aura restyled with the tokens |
 | `charts.ts` | the ECharts theme object and the Lightweight Charts options, from the same tokens |
-| `semantics.ts` | status, freshness and trading-group labels and colours, consumed by every badge |
+| `semantics.ts` | status, dataset health and trading-group labels and colours, consumed by every badge |
 | `copy.ts` | `titleCase()` and the Data tab names; the copy conventions are in its header |
 | `fonts/` | self-hosted IBM Plex (OFL), see `fonts/README.md` |
 
