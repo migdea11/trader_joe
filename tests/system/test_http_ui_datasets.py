@@ -1,13 +1,13 @@
 """The /ui/v1 dataset reads on real Postgres: what the SQLite real-row suite cannot prove (tj-grna9p.99).
 
-Design: decision tj-grna9p.8 item 4 (the listing computes freshness over ALL rows, with "a measured ceiling
+Design: decision tj-grna9p.8 item 4 (the listing computes health over ALL rows, with "a measured ceiling
 (1000 datasets) in the task's acceptance"), tj-grna9p.20 (the routes, and that acceptance), health.py and
 crud/stock/dataset_catalog.py (covered_dates), half-open ranges (tj-86g751). The unit tier is
 server/data/store/tests/test_ui_datasets_route.py, which runs every route over SQLite real rows; three properties
 need the real database, one section each below:
 
   1. THE 1000-DATASET CEILING. 1000 datasets of this run, with bars, and the wall-clock time of page 1 of
-     GET /ui/v1/datasets, of the facets, and of the two lists that judge EVERY row's freshness (a status filter
+     GET /ui/v1/datasets, of the facets, and of the two lists that judge EVERY row's health (a status filter
      and needs_attention). Measured over real HTTP through the prod image's uvicorn, warm, several times; the
      numbers are reported as a pytest warning so a green run still shows them, and the slowest warm sample is
      held under LATENCY_CEILING_SECONDS.
@@ -33,7 +33,7 @@ NOT conftest's BASE_START / BASE_END (2001), on purpose: those entries belong to
 the same listing. The calendar is built from trading_calendar.CALENDAR_START (1990-01-01, tj-grna9p.102), so a 2001 range
 holds its real sessions and reads GAPS without bars, and a range or instant before 1990 raises CalendarRangeError
 rather than reading COMPLETE or FRESH over no sessions. The unit tier pins both, in
-server/data/store/tests/test_freshness.py. These tests use 2026 dates and do not depend on that bound.
+server/data/store/tests/test_health.py. These tests use 2026 dates and do not depend on that bound.
 """
 
 import statistics
@@ -74,9 +74,9 @@ TUESDAY_OPEN = datetime.fromisoformat('2026-02-03T14:30:00+00:00')
 TUESDAY_CLOSE = datetime.fromisoformat('2026-02-03T21:00:00+00:00')
 SPAN = {'start': MONDAY_OPEN, 'end': TUESDAY_CLOSE}
 
-COMPLETE = 'FRESHNESS_STATUS_COMPLETE'
-GAPS = 'FRESHNESS_STATUS_GAPS'
-OVERDUE = 'FRESHNESS_STATUS_OVERDUE'
+COMPLETE = 'DATASET_HEALTH_STATUS_COMPLETE'
+GAPS = 'DATASET_HEALTH_STATUS_GAPS'
+OVERDUE = 'DATASET_HEALTH_STATUS_OVERDUE'
 
 
 def _dataset_path(dataset_id: UUID) -> str:
@@ -138,7 +138,7 @@ LATENCY_CEILING_SECONDS = 2.0
 class Catalog:
     prefix: str  # every symbol of the 1000 starts with this; nothing else in the database does
     ids: list[UUID]
-    expected: dict[str, int]  # freshness status -> how many of the 1000 should read it
+    expected: dict[str, int]  # health status -> how many of the 1000 should read it
     bars: int
 
 
@@ -251,7 +251,7 @@ def test_catalog_of_1000_reads_page_one_and_the_all_row_judgements_under_the_cei
     assert page_one['nextCursor'], report
     # The all-row judgements return their first page of the 'failed' set, which is every DAILY and GAPS dataset.
     for name in ('status=failed, the 1000', 'needs_attention, the 1000'):
-        statuses = {item['freshness']['status'] for item in bodies[name]['items']}
+        statuses = {item['health']['status'] for item in bodies[name]['items']}
         assert len(bodies[name]['items']) == 100 and statuses <= {GAPS, OVERDUE}, f'{name}: {statuses}; {report}'
 
     too_slow = {name: max(values[1:]) for name, values in samples.items() if max(values[1:]) >= LATENCY_CEILING_SECONDS}
@@ -376,13 +376,13 @@ def static_seed(
 def test_static_dataset_with_bars_reads_complete_or_gaps_by_new_york_session(
     case: str, static_seed: StaticSeed, data_store
 ) -> None:
-    """GET /ui/v1/datasets/{id}: freshness of a STATIC dataset from the session dates Postgres computes."""
+    """GET /ui/v1/datasets/{id}: health of a STATIC dataset from the session dates Postgres computes."""
     _, status, gap_count = STATIC_CASES[case]
 
     body = _ok(data_store, _dataset_path(static_seed.ids[case]))
 
-    freshness = body['freshness']
-    assert (freshness['status'], int(freshness.get('gapCount', 0))) == (status, gap_count), freshness
+    health = body['health']
+    assert (health['status'], int(health.get('gapCount', 0))) == (status, gap_count), health
 
 
 def test_static_listing_status_filters_and_facets_agree_with_the_detail(static_seed: StaticSeed, data_store) -> None:
@@ -459,7 +459,7 @@ def test_coverage_of_a_known_three_session_gap_on_postgres(
     assert sum(b.get('expectedSessions', 0) for b in buckets) == len(sessions)
     assert sum(b.get('expectedSessions', 0) - b.get('sessionsWithBars', 0) for b in buckets) == len(missing)
     assert (_instant(body['start']), _instant(body['end'])) == (start, end)
-    detail = _ok(data_store, _dataset_path(entry.id))['freshness']
+    detail = _ok(data_store, _dataset_path(entry.id))['health']
     assert int(detail['gapCount']) == len(missing), detail
 
     # A daily bar at each missing session's local midnight -- inside the window -- closes the gap.

@@ -120,7 +120,7 @@ data-ingest = [
 data-store = [
     "alembic>=1.20.0",
     "asyncpg>=0.31.0",
-    # The trading calendar the freshness and completeness rules read (decision tj-grna9p.8 item 3):
+    # The trading calendar the health rules read (decision tj-grna9p.8 item 3):
     # offline, Apache-2.0, XNYS and XTSE among others. data-store only; no other group installs it.
     "exchange-calendars>=4.13.2",
     # Imported directly by data/store/app/trading_calendar.py (calendar session and timestamp arithmetic);

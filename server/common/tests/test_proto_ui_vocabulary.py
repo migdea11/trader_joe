@@ -13,7 +13,7 @@ additively; buf breaking guards the numbering, so these check presence and type,
 * THE FIELD CHOICES. Ids are strings (a UUID as text); the market vocabulary and Bar are imported
   from market/v1, never restated (tj-grna9p.4 section 1); counts are int64.
 * OVERDUE, NOT STALE. The approved design uses Stale for unread datasets, so the missed-deadline
-  freshness value was renamed (tj-grna9p.14 amendment of 2026-10-06, item 5).
+  health value was renamed (tj-grna9p.14 amendment of 2026-10-06, item 5).
 * HALF-OPEN RANGES are documented on the range fields (tj-vhboky.1 addendum; tj-86g751), read from
   the compiler's own source info rather than from the text.
 * NO CREDENTIAL MATERIAL crosses ui/v1 (tj-grna9p.14 acceptance).
@@ -69,7 +69,7 @@ summary = data_pb2.DatasetSummary(
     id='1b4e28ba-2fa1-11d2-883f-0016d3cca427',
     granularity=enums_pb2.GRANULARITY_ONE_DAY,
     bar_count=2**40,
-    freshness=data_pb2.Freshness(status=data_pb2.FRESHNESS_STATUS_OVERDUE),
+    health=data_pb2.DatasetHealth(status=data_pb2.DATASET_HEALTH_STATUS_OVERDUE),
 )
 summary.start.FromJsonString('2026-01-02T00:00:00Z')
 summary.end.FromJsonString('2026-01-03T00:00:00Z')
@@ -137,7 +137,7 @@ def test_a_dataset_page_renders_as_the_canonical_json_the_ui_reads():
                 'start': '2026-01-02T00:00:00Z',
                 'end': '2026-01-03T00:00:00Z',
                 'barCount': '1099511627776',
-                'freshness': {'status': 'FRESHNESS_STATUS_OVERDUE'},
+                'health': {'status': 'DATASET_HEALTH_STATUS_OVERDUE'},
             }
         ],
         'nextCursor': 'after-1',
@@ -208,12 +208,12 @@ PHASE_ONE = {
         'first_bar': _message(TIMESTAMP),
         'last_bar': _message(TIMESTAMP),
         'bar_count': _scalar('TYPE_INT64'),
-        'freshness': _message(f'{UI}Freshness'),
+        'health': _message(f'{UI}DatasetHealth'),
         'siblings': _message(f'{UI}DatasetSibling', repeated=True),
     },
     (DATA, 'DatasetSibling'): {'id': _scalar('TYPE_STRING'), 'granularity': _enum(f'{MARKET}Granularity')},
-    (DATA, 'Freshness'): {
-        'status': _enum(f'{UI}FreshnessStatus'),
+    (DATA, 'DatasetHealth'): {
+        'status': _enum(f'{UI}DatasetHealthStatus'),
         'expected_last_bar': _message(TIMESTAMP),
         'gap_count': _scalar('TYPE_INT32'),
         'as_of': _message(TIMESTAMP),
@@ -268,19 +268,175 @@ def _values(file: str, enum: str) -> list[str]:
     return [value.name for value in {e.name: e for e in file_named(file).enum_type}[enum].value]
 
 
-def test_freshness_names_a_missed_deadline_overdue_and_nothing_stale():
-    """The 2026-10-06 rename: OVERDUE is the failure value; no freshness value is called STALE."""
-    assert _values(DATA, 'FreshnessStatus') == [
-        'FRESHNESS_STATUS_UNSPECIFIED',
-        'FRESHNESS_STATUS_FRESH',
-        'FRESHNESS_STATUS_LATE',
-        'FRESHNESS_STATUS_OVERDUE',
-        'FRESHNESS_STATUS_COMPLETE',
-        'FRESHNESS_STATUS_GAPS',
-        'FRESHNESS_STATUS_RETIRED',
+def test_dataset_health_names_a_missed_deadline_overdue_and_nothing_stale():
+    """The 2026-10-06 rename: OVERDUE is the failure value; no health value is called STALE."""
+    assert _values(DATA, 'DatasetHealthStatus') == [
+        'DATASET_HEALTH_STATUS_UNSPECIFIED',
+        'DATASET_HEALTH_STATUS_FRESH',
+        'DATASET_HEALTH_STATUS_LATE',
+        'DATASET_HEALTH_STATUS_OVERDUE',
+        'DATASET_HEALTH_STATUS_COMPLETE',
+        'DATASET_HEALTH_STATUS_GAPS',
+        'DATASET_HEALTH_STATUS_RETIRED',
     ]
-    stale = [value for value in _values(DATA, 'FreshnessStatus') if 'STALE' in value]
+    stale = [value for value in _values(DATA, 'DatasetHealthStatus') if 'STALE' in value]
     assert not stale, stale
+
+
+# ---------------------------------------------------------------------------------------------------
+# DATASET HEALTH, NEVER 'FRESHNESS' (tj-grna9p.168, owner rulings 2026-10-30 B and 2026-10-31 A)
+#
+# The owner's rule: the word 'freshness' is dropped for dataset state everywhere. In ui/v1 that means no
+# message, field, json name, enum, enum value, service, method or comment says it, case-insensitively.
+# The architect's name table allows it nowhere in ui/v1: its out-of-scope uses (generated-code and image
+# freshness in tools/, the word refresh) live outside proto/, and PanelSummary.lagging never said it. So
+# the allow-list is empty, and an entry needs a reason quoted from a ruling.
+FRESHNESS = re.compile('freshness', re.IGNORECASE)
+FRESHNESS_ALLOWED: dict[str, str] = {}
+UI_V1_DIR = 'trader_joe/proto/ui/v1'
+
+
+def _ui_v1_files() -> list[str]:
+    files = sorted(str(path.relative_to(PROTO_ROOT)) for path in (PROTO_ROOT / UI_V1_DIR).glob('*.proto'))
+    assert files, f'no .proto files under {PROTO_ROOT / UI_V1_DIR}'
+    return files
+
+
+def _named_things(file: descriptor_pb2.FileDescriptorProto) -> list[tuple[str, str]]:
+    """(where, name) for every identifier and json name in FILE, nested messages and enums included."""
+    found: list[tuple[str, str]] = []
+
+    def enum(prefix: str, declared: descriptor_pb2.EnumDescriptorProto) -> None:
+        found.append((f'{prefix}{declared.name}', declared.name))
+        found.extend((f'{prefix}{declared.name}.{value.name}', value.name) for value in declared.value)
+
+    def message(prefix: str, declared: descriptor_pb2.DescriptorProto) -> None:
+        here = f'{prefix}{declared.name}'
+        found.append((here, declared.name))
+        for field in declared.field:
+            found.append((f'{here}.{field.name}', field.name))
+            found.append((f'{here}.{field.name} (json)', field.json_name))
+        found.extend((f'{here}.{oneof.name} (oneof)', oneof.name) for oneof in declared.oneof_decl)
+        for nested in declared.nested_type:
+            message(f'{here}.', nested)
+        for nested in declared.enum_type:
+            enum(f'{here}.', nested)
+
+    for declared in file.message_type:
+        message('', declared)
+    for declared in file.enum_type:
+        enum('', declared)
+    for service in file.service:
+        found.append((service.name, service.name))
+        found.extend((f'{service.name}.{method.name}', method.name) for method in service.method)
+    return found
+
+
+def test_no_ui_v1_identifier_or_json_name_says_freshness():
+    """Every ui/v1 message, field, json name, enum, value, oneof, service and method, case-insensitively."""
+    files = _ui_v1_files()
+    said = [
+        f'{name}: {where}'
+        for name in files
+        for where, identifier in _named_things(file_named(name))
+        if FRESHNESS.search(identifier) and where not in FRESHNESS_ALLOWED
+    ]
+    assert not said, said
+    # The scan really read the renamed names, so an empty result is not an empty walk.
+    walked = {identifier for name in files for _, identifier in _named_things(file_named(name))}
+    assert {'DatasetHealth', 'DatasetHealthStatus', 'DATASET_HEALTH_STATUS_RETIRED', 'health'} <= walked
+
+
+@cache
+def _ui_v1_with_source_info() -> descriptor_pb2.FileDescriptorSet:
+    """Every ui/v1 file compiled with its comments."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / 'ui_v1.bin'
+        result = subprocess.run(
+            [
+                sys.executable,
+                '-m',
+                'grpc_tools.protoc',
+                f'-I{PROTO_ROOT}',
+                f'--descriptor_set_out={out}',
+                '--include_source_info',
+                *_ui_v1_files(),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=PROTOC_TIMEOUT_S,
+            check=False,
+        )
+        assert result.returncode == 0, _ran(result)
+        parsed = descriptor_pb2.FileDescriptorSet()
+        parsed.ParseFromString(out.read_bytes())
+    return parsed
+
+
+def test_no_ui_v1_comment_says_freshness():
+    """Detached, leading and trailing comments of every ui/v1 file, as the compiler attaches them."""
+    compiled = _ui_v1_with_source_info()
+    assert sorted(file.name for file in compiled.file) == _ui_v1_files()
+    said = [
+        f'{file.name} at {list(location.path)}: {text.strip()!r}'
+        for file in compiled.file
+        for location in file.source_code_info.location
+        for text in (*location.leading_detached_comments, location.leading_comments, location.trailing_comments)
+        if FRESHNESS.search(text) and f'{file.name}:{list(location.path)}' not in FRESHNESS_ALLOWED
+    ]
+    assert not said, said
+
+
+# (message, field) -> (number, type, json name), every one as it stood before the rename (main 0224d87 for
+# data.proto and ops.proto; 4a9b46d^ for panels.proto, which main does not yet hold), under its new name.
+# A pure rename keeps the binary wire: any number here moving is a wire break, not a rename.
+RENAMED_FIELDS = {
+    (DATA, 'DatasetHealth', 'status'): (1, f'{UI}DatasetHealthStatus', 'status'),
+    (DATA, 'DatasetHealth', 'expected_last_bar'): (2, TIMESTAMP, 'expectedLastBar'),
+    (DATA, 'DatasetHealth', 'gap_count'): (3, '', 'gapCount'),
+    (DATA, 'DatasetHealth', 'as_of'): (4, TIMESTAMP, 'asOf'),
+    (DATA, 'DatasetSummary', 'health'): (18, f'{UI}DatasetHealth', 'health'),
+    (DATA, 'StatusFacet', 'status'): (1, f'{UI}DatasetHealthStatus', 'status'),
+    ('trader_joe/proto/ui/v1/ops.proto', 'NeedsAttentionEntry', 'health'): (3, f'{UI}DatasetHealthStatus', 'health'),
+    ('trader_joe/proto/ui/v1/panels.proto', 'PanelMember', 'health'): (9, f'{UI}DatasetHealthStatus', 'health'),
+}
+
+
+@pytest.mark.parametrize(
+    ('file', 'message', 'field'), sorted(RENAMED_FIELDS), ids=[f'{m}.{f}' for _, m, f in sorted(RENAMED_FIELDS)]
+)
+def test_a_renamed_field_keeps_its_number_and_has_the_new_type_and_json_name(file: str, message: str, field: str):
+    """tj-grna9p.168: the number is unchanged, the type is the renamed one, and the json name is the new word.
+
+    Args:
+        file: The .proto declaring the message.
+        message: The message.
+        field: The field, by its name after the rename.
+    """
+    fields = _fields(file, message)
+    assert field in fields, f'{message} has no field {field}: {sorted(fields)}'
+    declared = fields[field]
+    assert (declared.number, declared.type_name, declared.json_name) == RENAMED_FIELDS[(file, message, field)]
+
+
+def test_dataset_health_is_exactly_its_four_fields():
+    """The message renamed, nothing added, dropped or reordered: status, expected_last_bar, gap_count, as_of."""
+    assert [(field.name, field.number) for field in messages(file_named(DATA))['DatasetHealth'].field] == [
+        ('status', 1),
+        ('expected_last_bar', 2),
+        ('gap_count', 3),
+        ('as_of', 4),
+    ]
+
+
+def test_dataset_health_status_values_keep_their_numbers():
+    """FRESHNESS_STATUS_<X> = n became DATASET_HEALTH_STATUS_<X> = n for every X; FRESH kept (2026-10-31 A)."""
+    values = [
+        (value.name, value.number)
+        for value in {e.name: e for e in file_named(DATA).enum_type}['DatasetHealthStatus'].value
+    ]
+    before = ['UNSPECIFIED', 'FRESH', 'LATE', 'OVERDUE', 'COMPLETE', 'GAPS', 'RETIRED']
+    assert values == [(f'DATASET_HEALTH_STATUS_{suffix}', number) for number, suffix in enumerate(before)]
 
 
 def test_expiry_type_mirrors_common_enums_by_name():

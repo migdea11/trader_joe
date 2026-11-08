@@ -1,9 +1,10 @@
-"""The freshness split: trading_calendar -> completeness -> health, with no back edge and no shim (validator).
+"""The split of the old freshness.py: trading_calendar -> completeness -> health, no back edge, no shim (validator).
 
 Design: tj-grna9p.170 (the symbol map) on the owner's ruling of 2026-10-21 and the pointer addendum on decision
 tj-grna9p.8. freshness.py was split into three modules by a PURE MOVE; the behaviour is pinned, unchanged, by the
-suites that used to import freshness (test_freshness.py, test_freshness_periods.py, test_coverage_buckets.py,
-test_provisional_bar.py and the route suites). This file pins the STRUCTURE the move created, which nothing else
+suites that used to import freshness (test_health.py, test_health_periods.py, test_coverage_buckets.py,
+test_provisional_bar.py and the route suites; the first two were test_freshness*.py until tj-7zjov1.203). The
+dataset-health rename (tj-grna9p.168 option B, tj-7zjov1.202) then renamed the symbols in the map below. This file pins the STRUCTURE the move created, which nothing else
 would notice drifting:
 
 * THE IMPORT GRAPH. trading_calendar imports only the standard library, exchange_calendars, pandas and common.enums;
@@ -11,12 +12,13 @@ would notice drifting:
   it, nothing anywhere imports data.store.app.freshness, and each module imports cleanly in a fresh interpreter
   whatever the order (a cycle shows up as an ImportError in some order, never in all).
 * NO SHIM. freshness.py does not exist, so an old import path fails loudly instead of working by accident.
-* OWNERSHIP. COMPLETE and GAPS are written once, in completeness.CompletenessStatus; health.FreshnessStatus maps
+* OWNERSHIP. COMPLETE and GAPS are written once, in completeness.CompletenessStatus; health.DatasetHealthStatus maps
   them (same string values) and the STATIC branch of evaluate_dataset goes through assess_completeness.
-  FreshnessStatus keeps the values the proto enum FreshnessStatus names (tj-grna9p.168 renames both together).
+  DatasetHealthStatus keeps the values the proto enum DatasetHealthStatus names (tj-grna9p.168 renamed both together).
 * THE SYMBOL MAP. Every public name of the old module is defined and exported by exactly one new module, the one the
-  map gives it; each module's __all__ is exactly its own names.
-* THE ENV NAME. FRESHNESS_STREAM_BAR_MULTIPLE is unchanged: renaming it would silently drop an operator's setting.
+  map gives it (under its name after the rename); each module's __all__ is exactly its own names.
+* THE ENV NAME. HEALTH_STREAM_BAR_MULTIPLE replaced FRESHNESS_STREAM_BAR_MULTIPLE; the fallback to the old name is
+  pinned in test_health_env_fallback.py.
 """
 
 import ast
@@ -37,7 +39,7 @@ from common.enums.data_stock import DataSource, Granularity, UpdateType
 from common.tests.roots import SERVER_ROOT
 from data.store.app import completeness, health, trading_calendar
 from data.store.app.completeness import CompletenessResult, CompletenessStatus, assess_completeness
-from data.store.app.health import FreshnessStatus, evaluate_dataset
+from data.store.app.health import DatasetHealthStatus, evaluate_dataset
 from data.store.app.trading_calendar import calendar_for_source
 
 
@@ -84,16 +86,17 @@ EXPECTED: dict[str, str] = {
     'DEFAULT_SETTLE_MARGIN': 'health',
     'settle_margin_from_env': 'health',
     'DatasetHealth': 'health',
-    'FreshnessConfig': 'health',
-    'FreshnessStatus': 'health',
+    'HealthConfig': 'health',
+    'DatasetHealthStatus': 'health',
     'bar_period_close': 'health',
     'evaluate_dataset': 'health',
     'last_bar_is_provisional': 'health',
-    # Decision tj-7zjov1.120 ruling 5: the one written-before-its-stamp comparison freshness and the refresh share.
+    # Decision tj-7zjov1.120 ruling 5: the one written-before-its-stamp comparison health and the refresh share.
     'written_before_its_stamp': 'health',
 }
 
-# freshness.__all__ at 9ecbf88, the tip before the split, written out: each must still be importable.
+# freshness.__all__ at 9ecbf88, the tip before the split, written out: each must still be importable, the two the
+# dataset-health rename changed under their new names (see RENAMED).
 OLD_ALL = (
     'CALENDAR_START',
     'DEFAULT_STREAM_BAR_MULTIPLE',
@@ -103,8 +106,8 @@ OLD_ALL = (
     'CoverageBucket',
     'DatasetHealth',
     'ExchangeCalendarAdapter',
-    'FreshnessConfig',
-    'FreshnessStatus',
+    'HealthConfig',
+    'DatasetHealthStatus',
     'GapInterval',
     'NaiveDatetimeError',
     'TradingCalendar',
@@ -120,6 +123,9 @@ OLD_ALL = (
     'period_start',
     'session_of',
 )
+# The public names the dataset-health rename changed (tj-grna9p.168 NAME TABLE, tj-7zjov1.202), old -> new. Renamed,
+# not aliased: test_the_renamed_names_left_no_alias.
+RENAMED = {'FreshnessConfig': 'HealthConfig', 'FreshnessStatus': 'DatasetHealthStatus'}
 # The private names the split made public, old -> new.
 MADE_PUBLIC = {
     '_require_aware': 'require_aware',
@@ -132,6 +138,7 @@ MADE_PUBLIC = {
 ALLOWED_FIRST_PARTY = {
     'trading_calendar': {'common.enums.data_stock'},
     'completeness': {'common.enums.data_stock', f'{PACKAGE}.trading_calendar'},
+    # No common.logging: the legacy env name's warning went with its fallback (tj-7zjov1.222), so health logs nothing.
     'health': {'common.enums.data_stock', f'{PACKAGE}.trading_calendar', f'{PACKAGE}.completeness'},
 }
 ALLOWED_THIRD_PARTY = {'trading_calendar': {'exchange_calendars', 'pandas'}, 'completeness': set(), 'health': set()}
@@ -278,21 +285,21 @@ def test_complete_and_gaps_are_written_once_in_completeness():
 
 
 def test_health_maps_complete_and_gaps_instead_of_redefining_them():
-    body = _class_body('health', 'FreshnessStatus')
+    body = _class_body('health', 'DatasetHealthStatus')
     for name in ('COMPLETE', 'GAPS'):
         assert ast.unparse(body[name]) == f'CompletenessStatus.{name}.value', (name, ast.unparse(body[name]))
     # Only the four statuses completeness does not own are literals in health.
     literals = {k for k, v in body.items() if isinstance(v, ast.Constant)}
     assert literals == {'FRESH', 'LATE', 'OVERDUE', 'RETIRED'}
     for member in CompletenessStatus:
-        assert FreshnessStatus[member.name].value == member.value
+        assert DatasetHealthStatus[member.name].value == member.value
 
 
 @pytest.mark.parametrize(
     ('verdict', 'gap_count', 'status'),
     [
-        (CompletenessResult(CompletenessStatus.GAPS, 7), 7, FreshnessStatus.GAPS),
-        (CompletenessResult(CompletenessStatus.COMPLETE), 0, FreshnessStatus.COMPLETE),
+        (CompletenessResult(CompletenessStatus.GAPS, 7), 7, DatasetHealthStatus.GAPS),
+        (CompletenessResult(CompletenessStatus.COMPLETE), 0, DatasetHealthStatus.COMPLETE),
     ],
 )
 def test_the_static_branch_goes_through_assess_completeness(monkeypatch, verdict, gap_count, status):
@@ -319,7 +326,7 @@ def test_the_static_branch_goes_through_assess_completeness(monkeypatch, verdict
         now=now,
     )
     assert (got.status, got.gap_count) == (status, gap_count)
-    assert type(got.status) is FreshnessStatus
+    assert type(got.status) is DatasetHealthStatus
     assert seen == [(start, end, covered, Granularity.ONE_DAY, XNYS, now)]
 
 
@@ -363,8 +370,8 @@ def test_completeness_result_is_a_frozen_two_field_record():
     assert hash(result) == hash(CompletenessResult(CompletenessStatus.COMPLETE, 0))
 
 
-def test_freshness_status_keeps_its_members_and_the_proto_names():
-    assert [(m.name, m.value) for m in FreshnessStatus] == [
+def test_dataset_health_status_keeps_its_members_and_the_proto_names():
+    assert [(m.name, m.value) for m in DatasetHealthStatus] == [
         ('FRESH', 'FRESH'),
         ('LATE', 'LATE'),
         ('OVERDUE', 'OVERDUE'),
@@ -374,10 +381,11 @@ def test_freshness_status_keeps_its_members_and_the_proto_names():
     ]
     # Read from the .proto source: a test may not import trader_joe.proto (TID251, ADR tj-8konfu D3).
     source = (SERVER_ROOT.parent / 'proto' / 'trader_joe' / 'proto' / 'ui' / 'v1' / 'data.proto').read_text()
-    (block,) = re.findall(r'enum FreshnessStatus \{(.*?)\}', source, flags=re.S)
-    proto = set(re.findall(r'^\s*(FRESHNESS_STATUS_[A-Z_]+)\s*=', block, flags=re.M)) - {'FRESHNESS_STATUS_UNSPECIFIED'}
+    (block,) = re.findall(r'enum DatasetHealthStatus \{(.*?)\}', source, flags=re.S)
+    proto = set(re.findall(r'^\s*(DATASET_HEALTH_STATUS_[A-Z_]+)\s*=', block, flags=re.M))
+    proto -= {'DATASET_HEALTH_STATUS_UNSPECIFIED'}
     assert len(proto) == 6, proto
-    assert {f'FRESHNESS_STATUS_{m.value}' for m in FreshnessStatus} == proto
+    assert {f'DATASET_HEALTH_STATUS_{m.value}' for m in DatasetHealthStatus} == proto
 
 
 # ------------------------------------------------------------------------------------------------- the symbol map
@@ -424,11 +432,21 @@ def test_every_old_public_name_is_importable_from_its_new_home():
         assert not any(hasattr(importlib.import_module(f'{PACKAGE}.{m}'), old) for m in MODULES), old
 
 
-def test_the_stream_bar_multiple_env_name_is_unchanged():
-    assert health.STREAM_BAR_MULTIPLE_ENV == 'FRESHNESS_STREAM_BAR_MULTIPLE'
-    config = health.FreshnessConfig.from_env({'FRESHNESS_STREAM_BAR_MULTIPLE': '5'})
+@pytest.mark.parametrize(('old', 'new'), sorted(RENAMED.items()))
+def test_the_renamed_names_left_no_alias(old, new):
+    """The old name is gone from every module and from every __all__; the new one is in health's."""
+    for m in MODULES:
+        mod = importlib.import_module(f'{PACKAGE}.{m}')
+        assert not hasattr(mod, old), (m, old)
+        assert old not in mod.__all__, (m, old)
+    assert new in health.__all__
+
+
+def test_the_stream_bar_multiple_env_name_is_the_health_one():
+    assert health.STREAM_BAR_MULTIPLE_ENV == 'HEALTH_STREAM_BAR_MULTIPLE'
+    config = health.HealthConfig.from_env({'HEALTH_STREAM_BAR_MULTIPLE': '5'})
     assert config.stream_bar_multiple == 5
-    assert health.FreshnessConfig.from_env({}).stream_bar_multiple == health.DEFAULT_STREAM_BAR_MULTIPLE == 3
+    assert health.HealthConfig.from_env({}).stream_bar_multiple == health.DEFAULT_STREAM_BAR_MULTIPLE == 3
 
 
 def test_the_modules_are_the_ones_under_test():

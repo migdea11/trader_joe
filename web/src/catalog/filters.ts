@@ -2,7 +2,7 @@
 // and to the /ui/v1/datasets query (tj-grna9p.32). Pure functions; the components own the router.
 //
 // The server takes ONE value per filter (status, source, update_type), so each sidebar group is a
-// single choice. A dataset with no health (freshness unset) matches no status value; it is only in
+// single choice. A dataset with no health (health unset) matches no status value; it is only in
 // the unfiltered list.
 import { DataSource, UpdateType } from '@generated/trader_joe/proto/market/v1/enums_pb'
 import { ClientKind, UsageFilter } from '@generated/trader_joe/proto/ui/v1/data_pb'

@@ -59,7 +59,7 @@ from data.store.app.database.models.dataset_override_log import DatasetOverrideL
 from data.store.app.database.models.ingest_request import IngestRequest, IngestRequestFailureCause, IngestRequestState
 from data.store.app.database.models.ingest_run import IngestRun, IngestRunState, IngestRunTrigger
 from data.store.app.events import DatasetChange, DatasetChanged
-from data.store.app.health import FreshnessStatus, evaluate_dataset
+from data.store.app.health import DatasetHealthStatus, evaluate_dataset
 from data.store.app.ingest import data_action_request, delivery_intake
 from data.store.app.trading_calendar import calendar_for_source
 from schemas.data_ingest.delivery import (
@@ -611,7 +611,7 @@ async def test_a_provisional_newest_bar_is_re_requested_and_rewritten_final_on_p
     # The real Postgres subquery reads the newest bar's write time, and the dataset is LATE, not FRESH.
     catalog_row, health = await _health(scratch_async, dataset_id, PROVISIONAL_NOW)
     assert (catalog_row.last_bar, catalog_row.last_bar_written_at) == (PROVISIONAL_BAR, MID_SESSION)
-    assert health.status is FreshnessStatus.LATE
+    assert health.status is DatasetHealthStatus.LATE
 
     clock = Clock(PROVISIONAL_NOW)
     ingest = _ingest(clock, vendor_stamps)
@@ -636,7 +636,7 @@ async def test_a_provisional_newest_bar_is_re_requested_and_rewritten_final_on_p
     # Final now: FRESH, and the next pass at the same clock asks for nothing.
     catalog_row, health = await _health(scratch_async, dataset_id, PROVISIONAL_NOW)
     assert catalog_row.last_bar_written_at == after.updated_at
-    assert health.status is FreshnessStatus.FRESH
+    assert health.status is DatasetHealthStatus.FRESH
     ingest.submitted.clear()
     second = await DailyRefresher(ingest, clock=clock).run_pass(DataSource.ALPACA_API)
 

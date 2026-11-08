@@ -1,4 +1,4 @@
-"""Freshness and completeness over the real XNYS calendar (tj-grna9p.19; decision tj-grna9p.8 item 2 as ruled).
+"""Dataset health (recency and completeness) over the real XNYS calendar (tj-grna9p.19; decision tj-grna9p.8 item 2 as ruled).
 
 WHY A TABLE OVER THE REAL CALENDAR, NOT A FAKE ONE (validator, gating tj-grna9p.19). The rules are only as
 right as the session arithmetic underneath them: which session is the last completed one, when the next one
@@ -15,7 +15,7 @@ THE DATES, all 2026, so they are worth reading once:
     Thu 24 Dec                        early close: 14:30Z to 18:00Z
     Fri 25 Dec, Sat 26, Sun 27        no session
     Mon 28 Dec                        open 14:30Z
-A daily bar is stamped at its session's local midnight, as freshness.session_of reads it.
+A daily bar is stamped at its session's local midnight, as trading_calendar.session_of reads it.
 
 WHAT THE RULING SAYS, as the acceptance on tj-grna9p.19 words it after the 2026-10-01 amendment: DAILY is FRESH
 when the last completed session is stored, LATE (pending, not a failure) from that session's close until the NEXT
@@ -37,8 +37,8 @@ from data.store.app.health import (
     DEFAULT_STREAM_BAR_MULTIPLE,
     STREAM_BAR_MULTIPLE_ENV,
     DatasetHealth,
-    FreshnessConfig,
-    FreshnessStatus,
+    DatasetHealthStatus,
+    HealthConfig,
     evaluate_dataset,
 )
 from data.store.app.trading_calendar import (
@@ -90,55 +90,60 @@ DEC_23, DEC_24 = date(2026, 12, 23), date(2026, 12, 24)
 # (now, last stored session or None, expected status, expected_last_session)
 DAILY_CASES = {
     # During Monday's session, the last COMPLETED session is Friday's.
-    'mon in session, fri stored': (z('2026-10-05T15:00:00Z'), OCT_2, FreshnessStatus.FRESH, OCT_2),
+    'mon in session, fri stored': (z('2026-10-05T15:00:00Z'), OCT_2, DatasetHealthStatus.FRESH, OCT_2),
     # ...and Friday's bar still missing at that point is already a failure: Monday has opened.
-    'mon in session, thu stored': (z('2026-10-05T15:00:00Z'), OCT_1, FreshnessStatus.OVERDUE, OCT_2),
+    'mon in session, thu stored': (z('2026-10-05T15:00:00Z'), OCT_1, DatasetHealthStatus.OVERDUE, OCT_2),
     # At the close the expectation moves to Monday; Friday's bar is no longer enough, but it is only LATE.
-    'mon one tick before close, fri stored': (z('2026-10-05T20:00:00Z') - TICK, OCT_2, FreshnessStatus.FRESH, OCT_2),
-    'mon at close, fri stored': (z('2026-10-05T20:00:00Z'), OCT_2, FreshnessStatus.LATE, OCT_5),
-    'mon at close, mon stored': (z('2026-10-05T20:00:00Z'), OCT_5, FreshnessStatus.FRESH, OCT_5),
+    'mon one tick before close, fri stored': (
+        z('2026-10-05T20:00:00Z') - TICK,
+        OCT_2,
+        DatasetHealthStatus.FRESH,
+        OCT_2,
+    ),
+    'mon at close, fri stored': (z('2026-10-05T20:00:00Z'), OCT_2, DatasetHealthStatus.LATE, OCT_5),
+    'mon at close, mon stored': (z('2026-10-05T20:00:00Z'), OCT_5, DatasetHealthStatus.FRESH, OCT_5),
     # The amendment's own case: incomplete at 23:59 the same day is LATE, not a failure. The old close+2h
     # rule would have failed it at 22:00Z.
-    'mon 23:59 ET, fri stored': (z('2026-10-06T03:59:00Z'), OCT_2, FreshnessStatus.LATE, OCT_5),
+    'mon 23:59 ET, fri stored': (z('2026-10-06T03:59:00Z'), OCT_2, DatasetHealthStatus.LATE, OCT_5),
     # The deadline is the NEXT SESSION'S OPEN, Tuesday 13:30Z, to the microsecond.
-    'tue one tick before open, fri stored': (z('2026-10-06T13:30:00Z') - TICK, OCT_2, FreshnessStatus.LATE, OCT_5),
-    'tue at open, fri stored': (z('2026-10-06T13:30:00Z'), OCT_2, FreshnessStatus.OVERDUE, OCT_5),
-    'tue at open, mon stored': (z('2026-10-06T13:30:00Z'), OCT_5, FreshnessStatus.FRESH, OCT_5),
-    'tue at open, nothing stored': (z('2026-10-06T13:30:00Z'), None, FreshnessStatus.OVERDUE, OCT_5),
+    'tue one tick before open, fri stored': (z('2026-10-06T13:30:00Z') - TICK, OCT_2, DatasetHealthStatus.LATE, OCT_5),
+    'tue at open, fri stored': (z('2026-10-06T13:30:00Z'), OCT_2, DatasetHealthStatus.OVERDUE, OCT_5),
+    'tue at open, mon stored': (z('2026-10-06T13:30:00Z'), OCT_5, DatasetHealthStatus.FRESH, OCT_5),
+    'tue at open, nothing stored': (z('2026-10-06T13:30:00Z'), None, DatasetHealthStatus.OVERDUE, OCT_5),
     # A WEEKEND: Friday's bar is pending all weekend and fails only at Monday's open.
-    'sat, thu stored': (z('2026-10-03T12:00:00Z'), OCT_1, FreshnessStatus.LATE, OCT_2),
-    'sun night, thu stored': (z('2026-10-05T03:00:00Z'), OCT_1, FreshnessStatus.LATE, OCT_2),
-    'mon one tick before open, thu stored': (z('2026-10-05T13:30:00Z') - TICK, OCT_1, FreshnessStatus.LATE, OCT_2),
-    'mon at open, thu stored': (z('2026-10-05T13:30:00Z'), OCT_1, FreshnessStatus.OVERDUE, OCT_2),
-    'sat, fri stored': (z('2026-10-03T12:00:00Z'), OCT_2, FreshnessStatus.FRESH, OCT_2),
+    'sat, thu stored': (z('2026-10-03T12:00:00Z'), OCT_1, DatasetHealthStatus.LATE, OCT_2),
+    'sun night, thu stored': (z('2026-10-05T03:00:00Z'), OCT_1, DatasetHealthStatus.LATE, OCT_2),
+    'mon one tick before open, thu stored': (z('2026-10-05T13:30:00Z') - TICK, OCT_1, DatasetHealthStatus.LATE, OCT_2),
+    'mon at open, thu stored': (z('2026-10-05T13:30:00Z'), OCT_1, DatasetHealthStatus.OVERDUE, OCT_2),
+    'sat, fri stored': (z('2026-10-03T12:00:00Z'), OCT_2, DatasetHealthStatus.FRESH, OCT_2),
     # A HOLIDAY: Wednesday's bar may land any time on Thanksgiving; the deadline is Friday's open.
-    'thanksgiving, tue stored': (z('2026-11-26T18:00:00Z'), date(2026, 11, 24), FreshnessStatus.LATE, NOV_25),
+    'thanksgiving, tue stored': (z('2026-11-26T18:00:00Z'), date(2026, 11, 24), DatasetHealthStatus.LATE, NOV_25),
     'fri one tick before open, tue stored': (
         z('2026-11-27T14:30:00Z') - TICK,
         date(2026, 11, 24),
-        FreshnessStatus.LATE,
+        DatasetHealthStatus.LATE,
         NOV_25,
     ),
-    'fri at open, tue stored': (z('2026-11-27T14:30:00Z'), date(2026, 11, 24), FreshnessStatus.OVERDUE, NOV_25),
-    'thanksgiving, wed stored': (z('2026-11-26T18:00:00Z'), NOV_25, FreshnessStatus.FRESH, NOV_25),
+    'fri at open, tue stored': (z('2026-11-27T14:30:00Z'), date(2026, 11, 24), DatasetHealthStatus.OVERDUE, NOV_25),
+    'thanksgiving, wed stored': (z('2026-11-26T18:00:00Z'), NOV_25, DatasetHealthStatus.FRESH, NOV_25),
     # AN EARLY CLOSE: the half-day's own close (18:00Z), not the usual 21:00Z, moves the expectation.
     'fri half-day one tick before its close, wed stored': (
         z('2026-11-27T18:00:00Z') - TICK,
         NOV_25,
-        FreshnessStatus.FRESH,
+        DatasetHealthStatus.FRESH,
         NOV_25,
     ),
-    'fri half-day at its close, wed stored': (z('2026-11-27T18:00:00Z'), NOV_25, FreshnessStatus.LATE, NOV_27),
+    'fri half-day at its close, wed stored': (z('2026-11-27T18:00:00Z'), NOV_25, DatasetHealthStatus.LATE, NOV_27),
     # A WEEKEND AND A HOLIDAY TOGETHER: Christmas Eve's bar is due by Monday 28 Dec's open, four days on.
-    'christmas day, wed stored': (z('2026-12-25T15:00:00Z'), DEC_23, FreshnessStatus.LATE, DEC_24),
-    'sun 27 dec, wed stored': (z('2026-12-27T15:00:00Z'), DEC_23, FreshnessStatus.LATE, DEC_24),
+    'christmas day, wed stored': (z('2026-12-25T15:00:00Z'), DEC_23, DatasetHealthStatus.LATE, DEC_24),
+    'sun 27 dec, wed stored': (z('2026-12-27T15:00:00Z'), DEC_23, DatasetHealthStatus.LATE, DEC_24),
     'mon 28 dec one tick before open, wed stored': (
         z('2026-12-28T14:30:00Z') - TICK,
         DEC_23,
-        FreshnessStatus.LATE,
+        DatasetHealthStatus.LATE,
         DEC_24,
     ),
-    'mon 28 dec at open, wed stored': (z('2026-12-28T14:30:00Z'), DEC_23, FreshnessStatus.OVERDUE, DEC_24),
+    'mon 28 dec at open, wed stored': (z('2026-12-28T14:30:00Z'), DEC_23, DatasetHealthStatus.OVERDUE, DEC_24),
 }
 
 
@@ -149,7 +154,7 @@ def test_daily_is_late_until_the_next_session_opens_and_overdue_from_it(now, sto
     assert health.expected_last_session == expected_session
     assert health.expected_last_bar == daily_bar(expected_session)
     assert health.gap_count == 0
-    assert health.is_failure is (status is FreshnessStatus.OVERDUE)
+    assert health.is_failure is (status is DatasetHealthStatus.OVERDUE)
 
 
 MISSED_SESSION_CASES = {
@@ -168,21 +173,21 @@ def test_a_missed_session_stays_overdue_after_the_following_close(now):
     session closed a dataset that had already missed a deadline read LATE again until the following open, flapping
     OVERDUE, LATE, OVERDUE. Fixed in 15b74aa (the deadline is the first unstored session's).
     """
-    assert daily(z('2026-10-06T13:30:00Z'), daily_bar(OCT_2)).status is FreshnessStatus.OVERDUE
-    assert daily(now, daily_bar(OCT_2)).status is FreshnessStatus.OVERDUE
+    assert daily(z('2026-10-06T13:30:00Z'), daily_bar(OCT_2)).status is DatasetHealthStatus.OVERDUE
+    assert daily(now, daily_bar(OCT_2)).status is DatasetHealthStatus.OVERDUE
 
 
 def test_a_bar_newer_than_the_expected_session_is_fresh():
     """An intraday-stamped bar of the session in progress is past the expectation, not short of it."""
-    assert daily(z('2026-10-05T15:00:00Z'), z('2026-10-05T14:00:00Z')).status is FreshnessStatus.FRESH
+    assert daily(z('2026-10-05T15:00:00Z'), z('2026-10-05T14:00:00Z')).status is DatasetHealthStatus.FRESH
 
 
 def test_late_is_unhealthy_but_not_a_failure():
     """The ruling's distinction: LATE is pending, OVERDUE is a failure, and only OVERDUE says so."""
     late = daily(z('2026-10-05T21:00:00Z'), daily_bar(OCT_2))
     overdue = daily(z('2026-10-06T13:30:00Z'), daily_bar(OCT_2))
-    assert (late.status, late.is_failure) == (FreshnessStatus.LATE, False)
-    assert (overdue.status, overdue.is_failure) == (FreshnessStatus.OVERDUE, True)
+    assert (late.status, late.is_failure) == (DatasetHealthStatus.LATE, False)
+    assert (overdue.status, overdue.is_failure) == (DatasetHealthStatus.OVERDUE, True)
 
 
 # ------------------------------------------------------------------------------------------- DAILY in [start, end)
@@ -212,17 +217,17 @@ def daily_in(start: datetime, end: datetime, now: datetime, last_bar: datetime |
 
 
 def assert_nothing_owed(health) -> None:
-    assert health.status is FreshnessStatus.FRESH
+    assert health.status is DatasetHealthStatus.FRESH
     assert health.expected_last_session is None
     assert health.expected_last_bar is None
     assert not health.is_failure
 
 
-def assert_owes(health, status: FreshnessStatus, session: date) -> None:
+def assert_owes(health, status: DatasetHealthStatus, session: date) -> None:
     assert health.status is status
     assert health.expected_last_session == session
     assert health.expected_last_bar == daily_bar(session)
-    assert health.is_failure is (status is FreshnessStatus.OVERDUE)
+    assert health.is_failure is (status is DatasetHealthStatus.OVERDUE)
 
 
 # Created on Monday 5 Oct before the open (local midnight), no bars. Friday 2 Oct closed before it began.
@@ -245,13 +250,13 @@ def test_daily_created_today_owes_nothing_before_its_first_session_closes(now):
     ids=['at the close', 'that night', 'one tick before the next open'],
 )
 def test_daily_created_today_is_late_from_its_first_close_until_the_next_open(now):
-    assert_owes(daily_in(CREATED_MONDAY, OPEN_ENDED, now), FreshnessStatus.LATE, OCT_5)
+    assert_owes(daily_in(CREATED_MONDAY, OPEN_ENDED, now), DatasetHealthStatus.LATE, OCT_5)
 
 
 def test_daily_created_today_is_overdue_from_the_next_open_and_stays_so():
     """Overdue at Tuesday's open, and Tuesday's close (a later session owed) must not flip it back to LATE."""
-    assert_owes(daily_in(CREATED_MONDAY, OPEN_ENDED, z('2026-10-06T13:30:00Z')), FreshnessStatus.OVERDUE, OCT_5)
-    assert_owes(daily_in(CREATED_MONDAY, OPEN_ENDED, z('2026-10-06T20:00:00Z')), FreshnessStatus.OVERDUE, OCT_6)
+    assert_owes(daily_in(CREATED_MONDAY, OPEN_ENDED, z('2026-10-06T13:30:00Z')), DatasetHealthStatus.OVERDUE, OCT_5)
+    assert_owes(daily_in(CREATED_MONDAY, OPEN_ENDED, z('2026-10-06T20:00:00Z')), DatasetHealthStatus.OVERDUE, OCT_6)
 
 
 def test_daily_no_bars_with_a_past_start_is_overdue_from_the_first_in_range_deadline():
@@ -261,19 +266,19 @@ def test_daily_no_bars_with_a_past_start_is_overdue_from_the_first_in_range_dead
     status never recovers to LATE after Monday's close (which, judged only against Monday, would be LATE).
     """
     start = daily_bar(OCT_1)
-    assert_owes(daily_in(start, OPEN_ENDED, z('2026-10-01T20:00:00Z')), FreshnessStatus.LATE, OCT_1)
-    assert_owes(daily_in(start, OPEN_ENDED, z('2026-10-02T13:30:00Z') - TICK), FreshnessStatus.LATE, OCT_1)
-    assert_owes(daily_in(start, OPEN_ENDED, z('2026-10-02T13:30:00Z')), FreshnessStatus.OVERDUE, OCT_1)
-    assert_owes(daily_in(start, OPEN_ENDED, z('2026-10-05T20:00:00Z')), FreshnessStatus.OVERDUE, OCT_5)
-    assert_owes(daily_in(start, OPEN_ENDED, z('2026-10-06T03:59:00Z')), FreshnessStatus.OVERDUE, OCT_5)
+    assert_owes(daily_in(start, OPEN_ENDED, z('2026-10-01T20:00:00Z')), DatasetHealthStatus.LATE, OCT_1)
+    assert_owes(daily_in(start, OPEN_ENDED, z('2026-10-02T13:30:00Z') - TICK), DatasetHealthStatus.LATE, OCT_1)
+    assert_owes(daily_in(start, OPEN_ENDED, z('2026-10-02T13:30:00Z')), DatasetHealthStatus.OVERDUE, OCT_1)
+    assert_owes(daily_in(start, OPEN_ENDED, z('2026-10-05T20:00:00Z')), DatasetHealthStatus.OVERDUE, OCT_5)
+    assert_owes(daily_in(start, OPEN_ENDED, z('2026-10-06T03:59:00Z')), DatasetHealthStatus.OVERDUE, OCT_5)
 
 
 def test_daily_starting_mid_session_owes_that_session_once_it_closes():
     """Start Monday 15:00Z: Monday overlaps [start, end), so it is owed at its close; Friday never is."""
     start = z('2026-10-05T15:00:00Z')
     assert_nothing_owed(daily_in(start, OPEN_ENDED, z('2026-10-05T20:00:00Z') - TICK))
-    assert_owes(daily_in(start, OPEN_ENDED, z('2026-10-05T20:00:00Z')), FreshnessStatus.LATE, OCT_5)
-    assert_owes(daily_in(start, OPEN_ENDED, z('2026-10-06T13:30:00Z')), FreshnessStatus.OVERDUE, OCT_5)
+    assert_owes(daily_in(start, OPEN_ENDED, z('2026-10-05T20:00:00Z')), DatasetHealthStatus.LATE, OCT_5)
+    assert_owes(daily_in(start, OPEN_ENDED, z('2026-10-06T13:30:00Z')), DatasetHealthStatus.OVERDUE, OCT_5)
 
 
 # [Thu 1 Oct 00:00 ET, Tue 6 Oct 00:00 ET): the last in-range session is Monday 5 Oct; judged on Thu 8 Oct, after
@@ -284,7 +289,7 @@ ENDED_START, ENDED_END = daily_bar(OCT_1), daily_bar(OCT_6)
 def test_daily_whose_end_has_passed_is_fresh_with_its_last_in_range_session_stored():
     """Nothing after end is owed: Monday stored is enough on Thursday, though Tue and Wed have closed since."""
     health = daily_in(ENDED_START, ENDED_END, z('2026-10-08T22:00:00Z'), daily_bar(OCT_5))
-    assert_owes(health, FreshnessStatus.FRESH, OCT_5)
+    assert_owes(health, DatasetHealthStatus.FRESH, OCT_5)
 
 
 def test_daily_whose_end_has_passed_is_judged_against_its_last_in_range_session():
@@ -293,10 +298,12 @@ def test_daily_whose_end_has_passed_is_judged_against_its_last_in_range_session(
     The expectation stays Monday rather than moving to a session past end.
     """
     last = daily_bar(OCT_2)
-    assert_owes(daily_in(ENDED_START, ENDED_END, z('2026-10-05T20:00:00Z'), last), FreshnessStatus.LATE, OCT_5)
-    assert_owes(daily_in(ENDED_START, ENDED_END, z('2026-10-06T13:30:00Z') - TICK, last), FreshnessStatus.LATE, OCT_5)
-    assert_owes(daily_in(ENDED_START, ENDED_END, z('2026-10-06T13:30:00Z'), last), FreshnessStatus.OVERDUE, OCT_5)
-    assert_owes(daily_in(ENDED_START, ENDED_END, z('2026-10-08T22:00:00Z'), last), FreshnessStatus.OVERDUE, OCT_5)
+    assert_owes(daily_in(ENDED_START, ENDED_END, z('2026-10-05T20:00:00Z'), last), DatasetHealthStatus.LATE, OCT_5)
+    assert_owes(
+        daily_in(ENDED_START, ENDED_END, z('2026-10-06T13:30:00Z') - TICK, last), DatasetHealthStatus.LATE, OCT_5
+    )
+    assert_owes(daily_in(ENDED_START, ENDED_END, z('2026-10-06T13:30:00Z'), last), DatasetHealthStatus.OVERDUE, OCT_5)
+    assert_owes(daily_in(ENDED_START, ENDED_END, z('2026-10-08T22:00:00Z'), last), DatasetHealthStatus.OVERDUE, OCT_5)
 
 
 def test_daily_starting_after_now_owes_nothing():
@@ -309,10 +316,10 @@ def test_daily_starting_on_a_non_session_day_expects_the_next_session():
     """Saturday 3 Oct owes Monday 5 Oct; Thanksgiving owes the Friday half-day, from its 18:00Z close."""
     saturday = daily_bar(date(2026, 10, 3))
     assert_nothing_owed(daily_in(saturday, OPEN_ENDED, z('2026-10-05T20:00:00Z') - TICK))
-    assert_owes(daily_in(saturday, OPEN_ENDED, z('2026-10-05T20:00:00Z')), FreshnessStatus.LATE, OCT_5)
+    assert_owes(daily_in(saturday, OPEN_ENDED, z('2026-10-05T20:00:00Z')), DatasetHealthStatus.LATE, OCT_5)
     thanksgiving = daily_bar(date(2026, 11, 26))
     assert_nothing_owed(daily_in(thanksgiving, OPEN_ENDED, z('2026-11-27T18:00:00Z') - TICK))
-    assert_owes(daily_in(thanksgiving, OPEN_ENDED, z('2026-11-27T18:00:00Z')), FreshnessStatus.LATE, NOV_27)
+    assert_owes(daily_in(thanksgiving, OPEN_ENDED, z('2026-11-27T18:00:00Z')), DatasetHealthStatus.LATE, NOV_27)
 
 
 @pytest.mark.parametrize(
@@ -320,9 +327,9 @@ def test_daily_starting_on_a_non_session_day_expects_the_next_session():
 )
 def test_daily_with_a_far_future_end_evaluates(end):
     """A declared end far past the calendar's last session (or at the largest datetime) does not break the read."""
-    assert_owes(daily_in(CREATED_MONDAY, end, z('2026-10-06T13:30:00Z')), FreshnessStatus.OVERDUE, OCT_5)
+    assert_owes(daily_in(CREATED_MONDAY, end, z('2026-10-06T13:30:00Z')), DatasetHealthStatus.OVERDUE, OCT_5)
     assert_owes(
-        daily_in(CREATED_MONDAY, end, z('2026-10-06T22:00:00Z'), daily_bar(OCT_6)), FreshnessStatus.FRESH, OCT_6
+        daily_in(CREATED_MONDAY, end, z('2026-10-06T22:00:00Z'), daily_bar(OCT_6)), DatasetHealthStatus.FRESH, OCT_6
     )
 
 
@@ -340,7 +347,7 @@ def stream(now: datetime, last_bar: datetime | None, multiple: int | None = None
         covered=None,
         calendar=XNYS,
         now=now,
-        config=None if multiple is None else FreshnessConfig(stream_bar_multiple=multiple),
+        config=None if multiple is None else HealthConfig(stream_bar_multiple=multiple),
     )
 
 
@@ -351,35 +358,35 @@ STREAM_CASES = {
         z('2026-10-05T15:00:00Z'),
         z('2026-10-05T14:57:00Z'),
         None,
-        FreshnessStatus.FRESH,
+        DatasetHealthStatus.FRESH,
         z('2026-10-05T14:57:00Z'),
     ),
     'in hours, 3 minutes and a tick old': (
         z('2026-10-05T15:00:00Z'),
         z('2026-10-05T14:57:00Z') - TICK,
         None,
-        FreshnessStatus.OVERDUE,
+        DatasetHealthStatus.OVERDUE,
         z('2026-10-05T14:57:00Z'),
     ),
     'in hours, multiple 5 widens the window': (
         z('2026-10-05T15:00:00Z'),
         z('2026-10-05T14:55:00Z'),
         5,
-        FreshnessStatus.FRESH,
+        DatasetHealthStatus.FRESH,
         z('2026-10-05T14:55:00Z'),
     ),
     'in hours, multiple 1 narrows it': (
         z('2026-10-05T15:00:00Z'),
         z('2026-10-05T14:58:00Z'),
         1,
-        FreshnessStatus.OVERDUE,
+        DatasetHealthStatus.OVERDUE,
         z('2026-10-05T14:59:00Z'),
     ),
     'in hours, nothing stored': (
         z('2026-10-05T15:00:00Z'),
         None,
         None,
-        FreshnessStatus.OVERDUE,
+        DatasetHealthStatus.OVERDUE,
         z('2026-10-05T14:57:00Z'),
     ),
     # The open is in hours: the instant the session opens, the 3-bar window applies.
@@ -387,7 +394,7 @@ STREAM_CASES = {
         z('2026-10-05T13:30:00Z'),
         z('2026-10-02T19:59:00Z'),
         None,
-        FreshnessStatus.OVERDUE,
+        DatasetHealthStatus.OVERDUE,
         z('2026-10-05T13:27:00Z'),
     ),
     # OUT OF HOURS: the last bar must reach the last close minus one bar-length.
@@ -395,14 +402,14 @@ STREAM_CASES = {
         z('2026-10-05T22:00:00Z'),
         z('2026-10-05T19:59:00Z'),
         None,
-        FreshnessStatus.FRESH,
+        DatasetHealthStatus.FRESH,
         z('2026-10-05T19:59:00Z'),
     ),
     'after close, one bar short': (
         z('2026-10-05T22:00:00Z'),
         z('2026-10-05T19:58:00Z'),
         None,
-        FreshnessStatus.OVERDUE,
+        DatasetHealthStatus.OVERDUE,
         z('2026-10-05T19:59:00Z'),
     ),
     # The close itself is out of hours (open <= now < close).
@@ -410,35 +417,35 @@ STREAM_CASES = {
         z('2026-10-05T20:00:00Z'),
         z('2026-10-05T19:59:00Z'),
         None,
-        FreshnessStatus.FRESH,
+        DatasetHealthStatus.FRESH,
         z('2026-10-05T19:59:00Z'),
     ),
     'before the open, friday close is the reference': (
         z('2026-10-05T12:00:00Z'),
         z('2026-10-02T19:59:00Z'),
         None,
-        FreshnessStatus.FRESH,
+        DatasetHealthStatus.FRESH,
         z('2026-10-02T19:59:00Z'),
     ),
     'saturday, friday close is the reference': (
         z('2026-10-03T12:00:00Z'),
         z('2026-10-02T19:58:00Z'),
         None,
-        FreshnessStatus.OVERDUE,
+        DatasetHealthStatus.OVERDUE,
         z('2026-10-02T19:59:00Z'),
     ),
     'thanksgiving, wednesday close is the reference': (
         z('2026-11-26T16:00:00Z'),
         z('2026-11-25T20:59:00Z'),
         None,
-        FreshnessStatus.FRESH,
+        DatasetHealthStatus.FRESH,
         z('2026-11-25T20:59:00Z'),
     ),
     'after a half-day, its 18:00Z close is the reference': (
         z('2026-11-27T19:00:00Z'),
         z('2026-11-27T17:59:00Z'),
         None,
-        FreshnessStatus.FRESH,
+        DatasetHealthStatus.FRESH,
         z('2026-11-27T17:59:00Z'),
     ),
 }
@@ -447,23 +454,25 @@ STREAM_CASES = {
 @pytest.mark.parametrize(
     ('now', 'last_bar', 'multiple', 'status', 'threshold'), STREAM_CASES.values(), ids=STREAM_CASES
 )
-def test_stream_freshness_in_and_out_of_hours(now, last_bar, multiple, status, threshold):
+def test_stream_health_in_and_out_of_hours(now, last_bar, multiple, status, threshold):
     health = stream(now, last_bar, multiple)
     assert health.status is status
     assert health.expected_last_bar == threshold
     assert health.expected_last_session is None
-    assert health.is_failure is (status is FreshnessStatus.OVERDUE)
+    assert health.is_failure is (status is DatasetHealthStatus.OVERDUE)
 
 
 def test_the_stream_window_is_measured_in_the_dataset_s_own_bar_length():
     """At 5min the default three bar-lengths are fifteen minutes in hours, and one bar-length is five after close."""
     now = z('2026-10-05T15:00:00Z')
-    assert stream(now, z('2026-10-05T14:45:00Z'), granularity=Granularity.FIVE_MINUTES).status is FreshnessStatus.FRESH
+    assert (
+        stream(now, z('2026-10-05T14:45:00Z'), granularity=Granularity.FIVE_MINUTES).status is DatasetHealthStatus.FRESH
+    )
     assert stream(now, z('2026-10-05T14:45:00Z') - TICK, granularity=Granularity.FIVE_MINUTES).status is (
-        FreshnessStatus.OVERDUE
+        DatasetHealthStatus.OVERDUE
     )
     after = stream(z('2026-10-05T22:00:00Z'), z('2026-10-05T19:55:00Z'), granularity=Granularity.FIVE_MINUTES)
-    assert (after.status, after.expected_last_bar) == (FreshnessStatus.FRESH, z('2026-10-05T19:55:00Z'))
+    assert (after.status, after.expected_last_bar) == (DatasetHealthStatus.FRESH, z('2026-10-05T19:55:00Z'))
 
 
 # ------------------------------------------------------------------------------------------------- STATIC
@@ -491,16 +500,16 @@ WEEK_START, WEEK_END = daily_bar(OCT_1), daily_bar(date(2026, 10, 6))
 
 # (start, end, covered sessions, status, gap count)
 STATIC_CASES = {
-    'every session covered': (WEEK_START, WEEK_END, {OCT_1, OCT_2, OCT_5}, FreshnessStatus.COMPLETE, 0),
-    'friday missing': (WEEK_START, WEEK_END, {OCT_1, OCT_5}, FreshnessStatus.GAPS, 1),
-    'nothing stored (None)': (WEEK_START, WEEK_END, None, FreshnessStatus.GAPS, 3),
-    'nothing stored (empty)': (WEEK_START, WEEK_END, frozenset(), FreshnessStatus.GAPS, 3),
+    'every session covered': (WEEK_START, WEEK_END, {OCT_1, OCT_2, OCT_5}, DatasetHealthStatus.COMPLETE, 0),
+    'friday missing': (WEEK_START, WEEK_END, {OCT_1, OCT_5}, DatasetHealthStatus.GAPS, 1),
+    'nothing stored (None)': (WEEK_START, WEEK_END, None, DatasetHealthStatus.GAPS, 3),
+    'nothing stored (empty)': (WEEK_START, WEEK_END, frozenset(), DatasetHealthStatus.GAPS, 3),
     # A weekend is not a gap: nothing is expected on Saturday or Sunday.
     'the weekend uncovered is not a gap': (
         daily_bar(OCT_2),
         daily_bar(date(2026, 10, 5)) + timedelta(hours=1),
         {OCT_2},
-        FreshnessStatus.COMPLETE,
+        DatasetHealthStatus.COMPLETE,
         0,
     ),
     # A holiday is not a gap: Thanksgiving holds no session.
@@ -508,7 +517,7 @@ STATIC_CASES = {
         daily_bar(NOV_25),
         daily_bar(date(2026, 11, 28)),
         {NOV_25, NOV_27},
-        FreshnessStatus.COMPLETE,
+        DatasetHealthStatus.COMPLETE,
         0,
     ),
     # HALF-OPEN AT THE END: a session that opens exactly at end is outside the range...
@@ -516,7 +525,7 @@ STATIC_CASES = {
         WEEK_START,
         z('2026-10-05T13:30:00Z'),
         {OCT_1, OCT_2},
-        FreshnessStatus.COMPLETE,
+        DatasetHealthStatus.COMPLETE,
         0,
     ),
     # ...and one microsecond later it is inside, and missing.
@@ -524,7 +533,7 @@ STATIC_CASES = {
         WEEK_START,
         z('2026-10-05T13:30:00Z') + TICK,
         {OCT_1, OCT_2},
-        FreshnessStatus.GAPS,
+        DatasetHealthStatus.GAPS,
         1,
     ),
     # HALF-OPEN AT THE START, mirrored: a range starting at friday's close holds no friday...
@@ -532,7 +541,7 @@ STATIC_CASES = {
         z('2026-10-02T20:00:00Z'),
         WEEK_END,
         {OCT_5},
-        FreshnessStatus.COMPLETE,
+        DatasetHealthStatus.COMPLETE,
         0,
     ),
     # ...and one starting a tick before it does.
@@ -540,7 +549,7 @@ STATIC_CASES = {
         z('2026-10-02T20:00:00Z') - TICK,
         WEEK_END,
         {OCT_5},
-        FreshnessStatus.GAPS,
+        DatasetHealthStatus.GAPS,
         1,
     ),
 }
@@ -551,14 +560,14 @@ def test_static_completeness_counts_missing_sessions_in_the_half_open_range(star
     health = static(start, end, covered)
     assert health.status is status
     assert health.gap_count == gaps
-    assert health.is_failure is (status is FreshnessStatus.GAPS)
+    assert health.is_failure is (status is DatasetHealthStatus.GAPS)
     assert health.expected_last_bar is None
 
 
 def test_a_session_still_in_progress_is_not_a_gap():
     """Monday is inside the range but has not closed at `now`, so it is not missing yet."""
     in_session = z('2026-10-05T15:00:00Z')
-    assert static(WEEK_START, WEEK_END, {OCT_1, OCT_2}, now=in_session).status is FreshnessStatus.COMPLETE
+    assert static(WEEK_START, WEEK_END, {OCT_1, OCT_2}, now=in_session).status is DatasetHealthStatus.COMPLETE
     after_close = z('2026-10-05T20:00:00Z')
     assert static(WEEK_START, WEEK_END, {OCT_1, OCT_2}, now=after_close).gap_count == 1
 
@@ -609,7 +618,7 @@ def _subscription(update_type: UpdateType, collect: bool | None):
 @pytest.mark.parametrize('update_type', [UpdateType.DAILY, UpdateType.STREAM])
 def test_collect_false_on_a_subscription_retires_it_and_computes_nothing(update_type):
     health = _subscription(update_type, False)
-    assert health == DatasetHealth(FreshnessStatus.RETIRED)
+    assert health == DatasetHealth(DatasetHealthStatus.RETIRED)
     assert health.expected_last_bar is None
     assert not health.is_failure
 
@@ -619,7 +628,7 @@ def test_collect_false_on_a_subscription_retires_it_and_computes_nothing(update_
 def test_a_collecting_subscription_is_judged_not_retired(update_type, collect):
     """Only an explicit false retires: true, and a NULL that the CHECK never lets a subscription hold, are judged."""
     health = _subscription(update_type, collect)
-    assert health.status is FreshnessStatus.OVERDUE
+    assert health.status is DatasetHealthStatus.OVERDUE
     assert health.is_failure
 
 
@@ -644,7 +653,7 @@ def test_a_static_dataset_is_never_retired_whatever_collect_says(collect):
         calendar=XNYS,
         now=z('2026-12-01T15:00:00Z'),
     )
-    assert (health.status, health.gap_count) == (FreshnessStatus.GAPS, 2)
+    assert (health.status, health.gap_count) == (DatasetHealthStatus.GAPS, 2)
 
 
 # ------------------------------------------------------------------------------------------------- refusals
@@ -681,14 +690,14 @@ def test_gap_intervals_and_session_of_refuse_naive_datetimes():
 @pytest.mark.parametrize('multiple', [0, -1])
 def test_a_stream_bar_multiple_below_one_is_refused(multiple):
     with pytest.raises(ValueError, match='stream_bar_multiple'):
-        FreshnessConfig(stream_bar_multiple=multiple)
+        HealthConfig(stream_bar_multiple=multiple)
     with pytest.raises(ValueError, match='stream_bar_multiple'):
-        FreshnessConfig.from_env({STREAM_BAR_MULTIPLE_ENV: str(multiple)})
+        HealthConfig.from_env({STREAM_BAR_MULTIPLE_ENV: str(multiple)})
 
 
 def test_the_stream_bar_multiple_comes_from_the_environment_with_the_ruled_default():
-    assert FreshnessConfig.from_env({}).stream_bar_multiple == DEFAULT_STREAM_BAR_MULTIPLE == 3
-    assert FreshnessConfig.from_env({STREAM_BAR_MULTIPLE_ENV: '7'}).stream_bar_multiple == 7
+    assert HealthConfig.from_env({}).stream_bar_multiple == DEFAULT_STREAM_BAR_MULTIPLE == 3
+    assert HealthConfig.from_env({STREAM_BAR_MULTIPLE_ENV: '7'}).stream_bar_multiple == 7
 
 
 @pytest.mark.parametrize('source', [source for source in DataSource if source is not DataSource.ALPACA_API])
@@ -731,22 +740,22 @@ EARLY_STATIC_RANGES = {
 @pytest.mark.parametrize(('start', 'end', 'sessions'), EARLY_STATIC_RANGES.values(), ids=EARLY_STATIC_RANGES)
 def test_a_2001_static_range_with_no_bars_has_a_gap_for_every_session(start, end, sessions):
     health = static(start, end, None)
-    assert (health.status, health.gap_count) == (FreshnessStatus.GAPS, sessions)
+    assert (health.status, health.gap_count) == (DatasetHealthStatus.GAPS, sessions)
     assert health.is_failure
 
 
 def test_a_2001_static_range_with_every_session_covered_is_complete():
     """The other side of the same range: GAPS above is the calendar's sessions, not a refusal to judge 2001."""
     feb_week = {date(2001, 2, day) for day in (5, 6, 7, 8, 9)}
-    assert static(daily_bar(FEB_5_2001), daily_bar(date(2001, 2, 12)), feb_week).status is FreshnessStatus.COMPLETE
+    assert static(daily_bar(FEB_5_2001), daily_bar(date(2001, 2, 12)), feb_week).status is DatasetHealthStatus.COMPLETE
 
 
 def test_a_2001_daily_dataset_with_old_bars_is_overdue():
     """[Mon 5 Feb, Wed 7 Feb 2001) owes Tuesday 6 Feb; Monday's bar alone failed at Wednesday's open, 25 years ago."""
     start, end, now = daily_bar(FEB_5_2001), daily_bar(date(2001, 2, 7)), z('2026-10-06T15:00:00Z')
-    assert_owes(daily_in(start, end, now, daily_bar(FEB_5_2001)), FreshnessStatus.OVERDUE, FEB_6_2001)
-    assert_owes(daily_in(start, end, now), FreshnessStatus.OVERDUE, FEB_6_2001)
-    assert_owes(daily_in(start, end, now, daily_bar(FEB_6_2001)), FreshnessStatus.FRESH, FEB_6_2001)
+    assert_owes(daily_in(start, end, now, daily_bar(FEB_5_2001)), DatasetHealthStatus.OVERDUE, FEB_6_2001)
+    assert_owes(daily_in(start, end, now), DatasetHealthStatus.OVERDUE, FEB_6_2001)
+    assert_owes(daily_in(start, end, now, daily_bar(FEB_6_2001)), DatasetHealthStatus.FRESH, FEB_6_2001)
 
 
 def test_the_calendar_starts_on_the_ruled_day():

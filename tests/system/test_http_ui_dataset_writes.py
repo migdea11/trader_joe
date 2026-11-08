@@ -326,7 +326,7 @@ def test_an_overriding_stop_then_start_writes_two_set_collecting_rows_and_keeps_
     assert stopped.status_code == 200, data_store.describe(stopped)
     body = stopped.json()
     assert (body['state'], body['collecting'], body['expiry']) == ('DATASET_STATE_RETIRED', False, EXPIRY)
-    assert body['freshness']['status'] == 'FRESHNESS_STATUS_RETIRED'
+    assert body['health']['status'] == 'DATASET_HEALTH_STATUS_RETIRED'
     assert _stored(pg_engine, row).collect is False
 
     started = data_store.request(

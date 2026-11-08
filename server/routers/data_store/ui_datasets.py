@@ -138,7 +138,7 @@ class UiDatasetFiltersQuery(UiClientFilterQuery):
         asset_symbol: Keep datasets whose symbol starts with this, case-insensitively (the Viewer's symbol picker).
         source: Keep datasets from this source.
         update_type: Keep datasets of this update type.
-        status: Keep datasets whose freshness is in this UI group: healthy, late, failed or retired.
+        status: Keep datasets whose health is in this UI group: healthy, late, failed or retired.
         needs_attention: Keep only late and failed datasets.
         running: Keep only datasets with a run in flight. Orthogonal to status.
         usage: Keep datasets in this usage group under the client filter: READ_30D, STALE or NEVER_READ.
@@ -255,7 +255,7 @@ async def list_datasets(
     Args:
         db: The request's session.
         request_query: The filters, sort, cursor and page size.
-        now: The instant freshness is computed at.
+        now: The instant health is computed at.
 
     Returns:
         ProtoJSONResponse: A DatasetPage. Empty items and an empty next_cursor for an empty store.
@@ -292,10 +292,10 @@ async def get_dataset_facets(
     Args:
         db: The request's session.
         request_query: The filters.
-        now: The instant freshness is computed at.
+        now: The instant health is computed at.
 
     Returns:
-        ProtoJSONResponse: A DatasetFacets, with a count for every source, update type and freshness status.
+        ProtoJSONResponse: A DatasetFacets, with a count for every source, update type and health status.
     """
     query = CatalogQuery(
         catalog_filter=_catalog_filter(request_query),
@@ -317,13 +317,13 @@ async def get_dataset(
     request_query: Annotated[UiClientFilterQuery, Query()],
     now: Annotated[datetime, Depends(utc_now)],
 ) -> ProtoJSONResponse:
-    """One dataset, as a DatasetSummary with its siblings and freshness.
+    """One dataset, as a DatasetSummary with its siblings and health.
 
     Args:
         db: The request's session.
         dataset_id: The dataset's id.
         request_query: The client filter: whose reads the usage counts, echoed on the usage.
-        now: The instant freshness is computed at.
+        now: The instant health is computed at.
 
     Returns:
         ProtoJSONResponse: A DatasetSummary.

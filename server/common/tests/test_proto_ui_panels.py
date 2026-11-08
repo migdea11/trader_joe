@@ -260,7 +260,7 @@ MESSAGES = {
         _f('appeared_on', 6, S),
         _f('vanished_on', 7, S),
         _f('last_bar', 8, T),
-        _f('health', 9, f'{UI}FreshnessStatus'),
+        _f('health', 9, f'{UI}DatasetHealthStatus'),
         _f('as_of', 10, T),
         _f('recorded_at', 11, T),
     ],
@@ -402,10 +402,10 @@ def test_the_file_imports_only_data_market_v1_and_the_timestamp():
     ]
 
 
-def test_freshness_status_is_reused_from_data_proto_never_restated():
-    """A member's health is data.proto's FreshnessStatus, so LATE and OVERDUE mean one thing in both views."""
-    assert _fields('PanelMember')['health'].type_name == f'{UI}FreshnessStatus'
-    assert 'FreshnessStatus' not in {enum.name for enum in file_named(PANELS).enum_type}
+def test_dataset_health_status_is_reused_from_data_proto_never_restated():
+    """A member's health is data.proto's DatasetHealthStatus, so LATE and OVERDUE mean one thing in both views."""
+    assert _fields('PanelMember')['health'].type_name == f'{UI}DatasetHealthStatus'
+    assert 'DatasetHealthStatus' not in {enum.name for enum in file_named(PANELS).enum_type}
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -704,7 +704,7 @@ def test_every_range_is_documented_half_open(message: str):
 
 
 def test_lagging_is_documented_as_late_or_overdue():
-    """The builder's derivation, which the notes left open: lagging is FreshnessStatus LATE or OVERDUE."""
+    """The builder's derivation, which the notes left open: lagging is DatasetHealthStatus LATE or OVERDUE."""
     text = _comments(_path('PanelMembershipCounts', 'lagging'))
     assert '(LATE or OVERDUE)' in text, text
 
@@ -797,7 +797,7 @@ member = panels_pb2.PanelMember(
     status=panels_pb2.PANEL_TRANSITION_DEFERRED,
     cause='ramp_rate',
     appeared_on='2026-10-01',
-    health=data_pb2.FRESHNESS_STATUS_LATE,
+    health=data_pb2.DATASET_HEALTH_STATUS_LATE,
 )
 day = panels_pb2.AssetListHistoryDay(day='2026-10-27', state=panels_pb2.ASSET_LIST_DAY_STATE_SAVED, changed_count=4)
 marker = panels_pb2.PanelMarker(
@@ -966,7 +966,7 @@ def test_a_member_a_history_day_a_marker_and_the_list_render_as_canonical_json()
         'status': 'PANEL_TRANSITION_DEFERRED',
         'cause': 'ramp_rate',
         'appearedOn': '2026-10-01',
-        'health': 'FRESHNESS_STATUS_LATE',
+        'health': 'DATASET_HEALTH_STATUS_LATE',
     }
     assert seen['day'] == {'day': '2026-10-27', 'state': 'ASSET_LIST_DAY_STATE_SAVED', 'changedCount': 4}
     assert seen['marker'] == {

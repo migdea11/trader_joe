@@ -1,4 +1,4 @@
-"""Completeness and freshness BY PERIOD for 1week and 1month (validator, gating tj-grna9p.151).
+"""Completeness and recency health BY PERIOD for 1week and 1month (validator, gating tj-grna9p.151).
 
 DESIGN: decision tj-grna9p.8, addendum of 2026-10-20 (COMPLETENESS AND FRESHNESS FOR 1week AND 1month):
     (1) each granularity has a PERIOD (the session for 1min..1day, Monday..Sunday for 1week, the calendar month for
@@ -11,7 +11,7 @@ DESIGN: decision tj-grna9p.8, addendum of 2026-10-20 (COMPLETENESS AND FRESHNESS
     (4) 1min..1day are IDENTICAL to the per-session rules, pinned at the bottom against an oracle of the pre-change
         code (8f3ce43^), written out here.
 
-Every case runs over the real XNYS calendar (calendar_for_source), as test_freshness.py does, so holidays, early closes
+Every case runs over the real XNYS calendar (calendar_for_source), as test_health.py does, so holidays, early closes
 and DST are the exchange's. THE COUNTS ARE WRITTEN BY HAND from the 2019..2026 NYSE calendar and are worth reading
 once, since a count derived from the code under test would pin nothing:
     Feb 2022  20 weekdays less Presidents' Day (21 Feb)        19 sessions
@@ -47,7 +47,7 @@ from data.store.app.completeness import (
 )
 from data.store.app.daily_refresh import DailyRefresher
 from data.store.app.database.crud.stock.dataset_catalog import CatalogRow
-from data.store.app.health import DatasetHealth, FreshnessStatus, evaluate_dataset
+from data.store.app.health import DatasetHealth, DatasetHealthStatus, evaluate_dataset
 from data.store.app.trading_calendar import TradingCalendar, calendar_for_source, session_of
 
 
@@ -124,9 +124,9 @@ def subscription(start, now, last_bar, granularity, end=OPEN_ENDED) -> DatasetHe
 
 def assert_gaps(health: DatasetHealth, count: int) -> None:
     if count == 0:
-        assert (health.status, health.gap_count) == (FreshnessStatus.COMPLETE, 0), health
+        assert (health.status, health.gap_count) == (DatasetHealthStatus.COMPLETE, 0), health
     else:
-        assert (health.status, health.gap_count) == (FreshnessStatus.GAPS, count), health
+        assert (health.status, health.gap_count) == (DatasetHealthStatus.GAPS, count), health
 
 
 # ------------------------------------------------------------------------------------------------- period_start
@@ -592,7 +592,7 @@ def test_gap_count_and_windows_count_only_the_sessions_inside_the_range(
     ('start', 'end', 'covered', 'granularity', 'now', 'count', 'windows'), CLIP_CASES.values(), ids=CLIP_CASES
 )
 def test_gap_count_equals_the_coverage_buckets_missing_count(start, end, covered, granularity, now, count, windows):
-    """The two sides of the strip and the freshness count agree, however the buckets are cut."""
+    """The two sides of the strip and the health gap count agree, however the buckets are cut."""
     gap_count = static(start, end, covered, granularity, now).gap_count
     for buckets in (1, 2, 3, 40):
         assert _bucket_missing(start, end, covered, granularity, now, buckets) == gap_count == count, buckets
@@ -748,7 +748,7 @@ DAILY_WEEK_CASES = {
 @pytest.mark.parametrize(('now', 'last_bar', 'status', 'period'), DAILY_WEEK_CASES.values(), ids=DAILY_WEEK_CASES)
 def test_a_weekly_subscription_owes_the_last_ended_week(now, last_bar, status, period):
     health = subscription(WEEKLY_SUB_START, now, last_bar, WEEK)
-    assert health.status is FreshnessStatus(status), health
+    assert health.status is DatasetHealthStatus(status), health
     assert health.is_failure is (status == 'OVERDUE')
     assert health.gap_count == 0
 
@@ -759,7 +759,7 @@ def test_a_weekly_subscription_expects_its_period_s_first_day_and_its_local_midn
 
     The expected 'session' is the period's FIRST CALENDAR DAY, which need not be a session (Labor Day), and the
     expected bar is that day's local midnight. Only expected_last_bar reaches the wire (routers/data_store/
-    ui_mapping.py _freshness).
+    ui_mapping.py _health).
     """
     health = subscription(WEEKLY_SUB_START, now, last_bar, WEEK)
     assert health.expected_last_session == d(period)
@@ -771,10 +771,10 @@ def test_a_weekly_subscription_does_not_care_which_day_of_the_week_is_stamped(of
     """The week of 12 Oct, stamped on any of its days, is FRESH at Monday 19 Oct's open; the week before is not."""
     now = z('2026-10-19T13:30:00Z')
     assert subscription(WEEKLY_SUB_START, now, m(d('2026-10-12') + timedelta(days=offset)), WEEK).status is (
-        FreshnessStatus.FRESH
+        DatasetHealthStatus.FRESH
     )
     assert subscription(WEEKLY_SUB_START, now, m(d('2026-10-05') + timedelta(days=offset)), WEEK).status is (
-        FreshnessStatus.OVERDUE
+        DatasetHealthStatus.OVERDUE
     )
 
 
@@ -783,21 +783,21 @@ def test_a_weekly_subscription_started_mid_week_owes_nothing_until_its_first_who
     start = m(d('2026-10-14'))
     nothing = subscription(start, z('2026-10-23T20:00:00Z') - TICK, None, WEEK)
     assert (nothing.status, nothing.expected_last_session, nothing.expected_last_bar) == (
-        FreshnessStatus.FRESH,
+        DatasetHealthStatus.FRESH,
         None,
         None,
     )
     owed = subscription(start, z('2026-10-23T20:00:00Z'), None, WEEK)
-    assert (owed.status, owed.expected_last_session) == (FreshnessStatus.LATE, d('2026-10-19'))
-    assert subscription(start, z('2026-10-26T13:30:00Z'), None, WEEK).status is FreshnessStatus.OVERDUE
+    assert (owed.status, owed.expected_last_session) == (DatasetHealthStatus.LATE, d('2026-10-19'))
+    assert subscription(start, z('2026-10-26T13:30:00Z'), None, WEEK).status is DatasetHealthStatus.OVERDUE
 
 
 def test_a_weekly_subscription_whose_end_has_passed_owes_its_last_week_in_range():
     """[3 Aug, Thu 1 Oct): the week of 28 Sep starts inside, so it is the last owed, even judged weeks later."""
     end = m(d('2026-10-01'))
-    assert subscription(WEEKLY_SUB_START, NOW, m(d('2026-09-28')), WEEK, end).status is FreshnessStatus.FRESH
+    assert subscription(WEEKLY_SUB_START, NOW, m(d('2026-09-28')), WEEK, end).status is DatasetHealthStatus.FRESH
     stale = subscription(WEEKLY_SUB_START, NOW, m(d('2026-09-21')), WEEK, end)
-    assert (stale.status, stale.expected_last_session) == (FreshnessStatus.OVERDUE, d('2026-09-28'))
+    assert (stale.status, stale.expected_last_session) == (DatasetHealthStatus.OVERDUE, d('2026-09-28'))
 
 
 # ------------------------------------------------------------------------------------------------- DAILY 1month
@@ -842,7 +842,7 @@ DAILY_MONTH_CASES = {
 @pytest.mark.parametrize(('now', 'last_bar', 'status', 'period'), DAILY_MONTH_CASES.values(), ids=DAILY_MONTH_CASES)
 def test_a_monthly_subscription_owes_the_last_ended_month(now, last_bar, status, period):
     health = subscription(MONTHLY_SUB_START, now, last_bar, MONTH)
-    assert health.status is FreshnessStatus(status), health
+    assert health.status is DatasetHealthStatus(status), health
     assert health.expected_last_session == d(period)
     assert health.expected_last_bar == m(d(period))
     assert health.is_failure is (status == 'OVERDUE')
@@ -851,10 +851,10 @@ def test_a_monthly_subscription_owes_the_last_ended_month(now, last_bar, status,
 @pytest.mark.parametrize('day', [1, 2, 15, 30], ids=lambda day: f'stamped on the {day}')
 def test_a_monthly_subscription_does_not_care_which_day_of_the_month_is_stamped(day):
     assert subscription(MONTHLY_SUB_START, NOW, m(d('2026-09-01').replace(day=day)), MONTH).status is (
-        FreshnessStatus.FRESH
+        DatasetHealthStatus.FRESH
     )
     assert subscription(MONTHLY_SUB_START, NOW, m(d('2026-08-01').replace(day=day)), MONTH).status is (
-        FreshnessStatus.OVERDUE
+        DatasetHealthStatus.OVERDUE
     )
 
 
@@ -862,12 +862,12 @@ def test_a_monthly_subscription_started_on_the_15th_owes_nothing_for_that_month(
     """Started 15 Sep: September is a partial first period, so nothing is owed until October's last close."""
     start = m(d('2026-09-15'))
     assert subscription(start, NOW, None, MONTH).expected_last_session is None
-    assert subscription(start, NOW, None, MONTH).status is FreshnessStatus.FRESH
+    assert subscription(start, NOW, None, MONTH).status is DatasetHealthStatus.FRESH
     late = subscription(start, z('2026-10-30T20:00:00Z'), None, MONTH)
-    assert (late.status, late.expected_last_session) == (FreshnessStatus.LATE, d('2026-10-01'))
+    assert (late.status, late.expected_last_session) == (DatasetHealthStatus.LATE, d('2026-10-01'))
     # The first session after October is Mon 2 Nov, opening 14:30Z (EST).
-    assert subscription(start, z('2026-11-02T14:30:00Z') - TICK, None, MONTH).status is FreshnessStatus.LATE
-    assert subscription(start, z('2026-11-02T14:30:00Z'), None, MONTH).status is FreshnessStatus.OVERDUE
+    assert subscription(start, z('2026-11-02T14:30:00Z') - TICK, None, MONTH).status is DatasetHealthStatus.LATE
+    assert subscription(start, z('2026-11-02T14:30:00Z'), None, MONTH).status is DatasetHealthStatus.OVERDUE
 
 
 # ------------------------------------------------------------------------------------------------- the refresh's due set
@@ -928,7 +928,7 @@ def test_the_granularity_parameter_defaults_to_one_day():
 # reads only the calendar's own answers. Every result of the changed functions for 1min, 5min, 30min, 1hour and 1day
 # must equal it over a grid of ranges, clocks, covered sets and last bars spanning a weekend, Thanksgiving, its
 # half-day, and the November DST change. This is equivalence, not a re-derivation: the rules themselves are pinned
-# against hand-written values in test_freshness.py and test_coverage_buckets.py, unchanged.
+# against hand-written values in test_health.py and test_coverage_buckets.py, unchanged.
 
 
 def _old_missing(start, end, covered, calendar: TradingCalendar, now):
@@ -974,25 +974,25 @@ def _old_buckets(start, end, covered, calendar: TradingCalendar, now, buckets):
 def _old_daily(start, end, last_bar, calendar: TradingCalendar, now):
     owed = [s for s in calendar.sessions_overlapping(start, min(end, now)) if calendar.session_close(s) <= now]
     if not owed:
-        return DatasetHealth(FreshnessStatus.FRESH)
+        return DatasetHealth(DatasetHealthStatus.FRESH)
     expected = owed[-1]
     expected_bar = m(expected)
     if last_bar is not None and session_of(last_bar, calendar) >= expected:
-        return DatasetHealth(FreshnessStatus.FRESH, expected, expected_bar)
+        return DatasetHealth(DatasetHealthStatus.FRESH, expected, expected_bar)
     missed = owed[0]
     if last_bar is not None:
         missed = min(expected, calendar.next_session(session_of(last_bar, calendar)))
     deadline = calendar.session_open(calendar.next_session(missed))
-    status = FreshnessStatus.LATE if now < deadline else FreshnessStatus.OVERDUE
+    status = DatasetHealthStatus.LATE if now < deadline else DatasetHealthStatus.OVERDUE
     return DatasetHealth(status, expected, expected_bar)
 
 
 def _old_static(start, end, covered, calendar, now):
     missing = _old_missing(start, end, covered or frozenset(), calendar, now)
     return (
-        DatasetHealth(FreshnessStatus.GAPS, gap_count=len(missing))
+        DatasetHealth(DatasetHealthStatus.GAPS, gap_count=len(missing))
         if missing
-        else DatasetHealth(FreshnessStatus.COMPLETE)
+        else DatasetHealth(DatasetHealthStatus.COMPLETE)
     )
 
 
@@ -1061,9 +1061,9 @@ def test_session_granularities_give_exactly_the_pre_change_results(granularity):
     assert not differ, differ[:5]
     # Guard the guard: the grid reaches every status the two rules can give.
     assert statuses == {
-        FreshnessStatus.FRESH,
-        FreshnessStatus.LATE,
-        FreshnessStatus.OVERDUE,
-        FreshnessStatus.COMPLETE,
-        FreshnessStatus.GAPS,
+        DatasetHealthStatus.FRESH,
+        DatasetHealthStatus.LATE,
+        DatasetHealthStatus.OVERDUE,
+        DatasetHealthStatus.COMPLETE,
+        DatasetHealthStatus.GAPS,
     }

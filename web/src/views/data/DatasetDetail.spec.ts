@@ -13,7 +13,7 @@ import {
   DatasetState,
   DatasetSummarySchema,
   ExpiryType,
-  FreshnessStatus,
+  DatasetHealthStatus,
   IngestRunPageSchema,
   IngestRunSchema,
   IngestRunState,
@@ -101,7 +101,7 @@ function dataset(extra: MessageInitShape<typeof DatasetSummarySchema> = {}) {
     end: timestampFromMs(MAR_2),
     lastBar: timestampFromMs(MAR_2 - 3 * DAY),
     barCount: 12345n,
-    freshness: { status: FreshnessStatus.COMPLETE },
+    health: { status: DatasetHealthStatus.COMPLETE },
     ...extra,
   } as MessageInitShape<typeof DatasetSummarySchema>)
 }
@@ -226,6 +226,15 @@ describe('load states', () => {
 describe('overview', () => {
   // tj-grna9p.113 (owner 2026-10-13) removed Open in Viewer: it made the workflow circular. The way
   // back to the Viewer is now the dataset crumb (the 'breadcrumbs' block below).
+  // tj-grna9p.168: the header badge reads DatasetSummary.health. GAPS is Failed; a dataset whose
+  // health is unset is Unknown, so the Healthy above and this Failed can only come from the health key.
+  it('the Status badge follows health: GAPS is Failed, unset is Unknown', async () => {
+    mocks.getDataset.mockResolvedValue(dataset({ health: { status: DatasetHealthStatus.GAPS } }))
+    expect((await detailAt()).find('[data-testid="detail-badge"]').text()).toBe('Failed')
+    mocks.getDataset.mockResolvedValue(dataset({ health: undefined }))
+    expect((await detailAt()).find('[data-testid="detail-badge"]').text()).toBe('Unknown')
+  })
+
   it('title is the dataset name, with its Status badge and no Open in Viewer', async () => {
     const shell = await detailAt()
     expect(shell.find('[data-testid="detail-title"]').text()).toBe('VFV · bars · 1d')

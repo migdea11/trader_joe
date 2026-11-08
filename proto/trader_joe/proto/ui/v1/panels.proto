@@ -279,7 +279,7 @@ message PanelMember {
   // The dataset's last bar_start. Unset when it has none.
   google.protobuf.Timestamp last_bar = 8;
   // The dataset's computed health. UNSPECIFIED when the member has no dataset.
-  FreshnessStatus health = 9;
+  DatasetHealthStatus health = 9;
   // The snapshot instant of the latest transition, and when the store wrote it.
   google.protobuf.Timestamp as_of = 10;
   google.protobuf.Timestamp recorded_at = 11;

@@ -50,7 +50,7 @@ Entry = StoreDatasetEntry
 
 @dataclass(frozen=True)
 class CatalogFilter:
-    """The filters the catalog can apply in SQL. Status filters need the computed freshness, so they are not here.
+    """The filters the catalog can apply in SQL. Status filters need the computed health, so they are not here.
 
     Attributes:
         asset_symbol_prefix: Keep entries whose symbol starts with this, case-insensitively. LIKE wildcards in it
@@ -145,7 +145,7 @@ def _bar_matches_entry() -> list[ColumnElement[bool]]:
 
 
 def _last_bar() -> ColumnElement[datetime]:
-    """The newest REAL bar's timestamp, a correlated scalar subquery: the value freshness reads.
+    """The newest REAL bar's timestamp, a correlated scalar subquery: the value health reads.
 
     A placeholder bar (Bar.is_placeholder_bar: volume 0 and trade count 0) is no trade, so it is never the newest
     bar here; the stored rows are untouched. bar_extents is the stored extent and still counts every row.

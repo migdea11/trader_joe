@@ -606,7 +606,7 @@ async def test_each_stats_request_runs_a_constant_number_of_statements(
     assert small == large, f'the statement count grew with the datasets: {small} -> {large}'
     # Pinned, so a new statement is a deliberate change. summary: catalog, probe, usage, reads today. buckets:
     # catalog, probe, usage. per day: probe and the union (plus the catalog with a source). stale: catalog, probe,
-    # usage, size, counts, extents, last read per client, freshness, siblings, readers, pending, last runs.
+    # usage, size, counts, extents, last read per client, health, siblings, readers, pending, last runs.
     # storage: size and counts.
     assert large == {
         'summary': 4,

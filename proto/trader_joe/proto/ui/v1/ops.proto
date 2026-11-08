@@ -139,7 +139,7 @@ message OpsHealth {
 message NeedsAttentionEntry {
   string dataset_id = 1;
   string label = 2;
-  FreshnessStatus health = 3;
+  DatasetHealthStatus health = 3;
   // Since when the dataset has been in this state.
   google.protobuf.Timestamp since = 4;
   string reason = 5;

@@ -1,7 +1,7 @@
-"""Dataset health: freshness of DAILY and STREAM datasets, completeness of STATIC ones (tj-grna9p.8 item 2, tj-grna9p.19, tj-grna9p.170).
+"""Dataset health: recency of DAILY and STREAM datasets, completeness of STATIC ones (tj-grna9p.8 item 2, tj-grna9p.19, tj-grna9p.170).
 
 PURE. Nothing in this module reads the wall clock, the database or the environment (apart from
-FreshnessConfig.from_env, which the caller invokes once and passes in). The clock (`now`) and the
+HealthConfig.from_env, which the caller invokes once and passes in). The clock (`now`) and the
 calendar are arguments, so a table of cases pins every status without patching anything. It sits on top of
 completeness and trading_calendar (trading_calendar -> completeness -> health).
 
@@ -23,10 +23,10 @@ STATUSES AND THE RULING THEY COME FROM (tj-grna9p.8 addendum, final form; tj-grn
             GAPS     some do; `gap_count` counts the SESSIONS inside [start, end) of missing periods
                      (not runs). Decided by completeness.assess_completeness; the status is mapped from its
                      CompletenessStatus, not redefined here.
-    RETIRED collect is false on a DAILY or STREAM dataset (the expiry is irrelevant): no freshness is computed.
+    RETIRED collect is false on a DAILY or STREAM dataset (the expiry is irrelevant): no recency judgement is computed.
 
 A DAILY bar counts only once FINAL: written at or after the close of its period (the session for 1min..1day, the
-last session of the week or month for 1week and 1month) PLUS the settle margin (`FreshnessConfig.settle_margin`,
+last session of the week or month for 1week and 1month) PLUS the settle margin (`HealthConfig.settle_margin`,
 DAILY_REFRESH_SETTLE_MINUTES, default 30), because a vendor's bar can still change after the close (closing auction,
 late corrections) and clocks skew. A newest bar of the expected period written earlier is provisional: the dataset
 reads LATE until the next session after the expected period opens, then OVERDUE, and the refresh re-fetches from that
@@ -35,7 +35,8 @@ bar inclusively. A STATIC dataset has no such rule.
 Any status other than FRESH, COMPLETE and RETIRED is unhealthy, and LATE is the only unhealthy one
 that is not yet a failure; `is_failure` says which.
 
-FreshnessStatus keeps its name and its string values: it mirrors the proto enum FreshnessStatus.
+DatasetHealthStatus mirrors the proto enum of the same name: its members cross the wire by name (the string values
+are the member names).
 """
 
 import os
@@ -49,7 +50,7 @@ from data.store.app.completeness import CompletenessStatus, assess_completeness,
 from data.store.app.trading_calendar import TradingCalendar, local_midnight, require_aware, session_of
 
 
-STREAM_BAR_MULTIPLE_ENV = 'FRESHNESS_STREAM_BAR_MULTIPLE'
+STREAM_BAR_MULTIPLE_ENV = 'HEALTH_STREAM_BAR_MULTIPLE'
 DEFAULT_STREAM_BAR_MULTIPLE = 3
 # The refresh's own setting, shared: it decides when the pass runs after a close and when a bar is final.
 SETTLE_ENV = 'DAILY_REFRESH_SETTLE_MINUTES'
@@ -59,7 +60,7 @@ DEFAULT_SETTLE_MARGIN = timedelta(minutes=DEFAULT_SETTLE_MINUTES)
 _DAY = timedelta(days=1)
 
 
-class FreshnessStatus(StrEnum):
+class DatasetHealthStatus(StrEnum):
     FRESH = 'FRESH'
     LATE = 'LATE'
     OVERDUE = 'OVERDUE'
@@ -69,19 +70,19 @@ class FreshnessStatus(StrEnum):
     RETIRED = 'RETIRED'
 
 
-_FAILURES = frozenset({FreshnessStatus.OVERDUE, FreshnessStatus.GAPS})
+_FAILURES = frozenset({DatasetHealthStatus.OVERDUE, DatasetHealthStatus.GAPS})
 
 # A completeness verdict as a health status.
-_FROM_COMPLETENESS: dict[CompletenessStatus, FreshnessStatus] = {
-    CompletenessStatus.COMPLETE: FreshnessStatus.COMPLETE,
-    CompletenessStatus.GAPS: FreshnessStatus.GAPS,
+_FROM_COMPLETENESS: dict[CompletenessStatus, DatasetHealthStatus] = {
+    CompletenessStatus.COMPLETE: DatasetHealthStatus.COMPLETE,
+    CompletenessStatus.GAPS: DatasetHealthStatus.GAPS,
 }
 
 
 def settle_margin_from_env(environ: Mapping[str, str] | None = None) -> timedelta:
     """The wait after a session's close before its bars count as final: DAILY_REFRESH_SETTLE_MINUTES.
 
-    The one setting the DAILY refresh (when its pass runs after a close) and the freshness rule (when a bar is final)
+    The one setting the DAILY refresh (when its pass runs after a close) and the health rule (when a bar is final)
     share. Zero is allowed; a negative or malformed value is the default.
     """
     env = os.environ if environ is None else environ
@@ -93,7 +94,7 @@ def settle_margin_from_env(environ: Mapping[str, str] | None = None) -> timedelt
 
 
 @dataclass(frozen=True)
-class FreshnessConfig:
+class HealthConfig:
     stream_bar_multiple: int = DEFAULT_STREAM_BAR_MULTIPLE
     # How long after its period's close a DAILY bar may still change; a bar written sooner is provisional.
     settle_margin: timedelta = DEFAULT_SETTLE_MARGIN
@@ -105,7 +106,7 @@ class FreshnessConfig:
             raise ValueError('settle_margin must be >= 0')
 
     @classmethod
-    def from_env(cls, environ: Mapping[str, str] | None = None) -> 'FreshnessConfig':
+    def from_env(cls, environ: Mapping[str, str] | None = None) -> 'HealthConfig':
         env = os.environ if environ is None else environ
         raw = env.get(STREAM_BAR_MULTIPLE_ENV)
         multiple = DEFAULT_STREAM_BAR_MULTIPLE if raw is None else int(raw)
@@ -114,7 +115,7 @@ class FreshnessConfig:
 
 @dataclass(frozen=True)
 class DatasetHealth:
-    status: FreshnessStatus
+    status: DatasetHealthStatus
     # DAILY: the label of the period that should be stored (a session for 1min..1day; for 1week and 1month the
     # period's first day, which may be no session); STREAM: None.
     expected_last_session: date | None = None
@@ -139,7 +140,7 @@ def evaluate_dataset(
     covered: Collection[date] | None,
     calendar: TradingCalendar,
     now: datetime,
-    config: FreshnessConfig | None = None,
+    config: HealthConfig | None = None,
     last_bar_written_at: datetime | None = None,
 ) -> DatasetHealth:
     """Health of one dataset at `now`.
@@ -160,11 +161,11 @@ def evaluate_dataset(
     provisional, and the dataset reads LATE (see last_bar_is_provisional).
     """
     require_aware(start=start, end=end, last_bar=last_bar, now=now, last_bar_written_at=last_bar_written_at)
-    config = config or FreshnessConfig()
+    config = config or HealthConfig()
 
     # RETIRED is the collect intent, never the expiry (decision tj-hhy3dk): the expiry is the deletion date only.
     if collect is False and update_type in (UpdateType.DAILY, UpdateType.STREAM):
-        return DatasetHealth(FreshnessStatus.RETIRED)
+        return DatasetHealth(DatasetHealthStatus.RETIRED)
     if update_type == UpdateType.STATIC:
         result = assess_completeness(start, end, covered or frozenset(), granularity, calendar, now)
         return DatasetHealth(_FROM_COMPLETENESS[result.status], gap_count=result.gap_count)
@@ -192,7 +193,7 @@ def bar_period_close(bar: datetime, calendar: TradingCalendar, granularity: Gran
 def written_before_its_stamp(bar: datetime | None, written_at: datetime | None) -> bool:
     """Whether a stored bar was written before its own stamp, so it was served early (a bar of a period not begun).
 
-    THE ONE COMPARISON freshness and the DAILY refresh share (tj-7zjov1.120): strict, so a bar written AT its stamp
+    THE ONE COMPARISON the health rule and the DAILY refresh share (tj-7zjov1.120): strict, so a bar written AT its stamp
     is not before it. The write time is the fetch transaction's start, which opens before the vendor request, so it is a
     lower bound on when the bar was served: written at or after the stamp means served after its period began. An
     unknown bar or write time is not before.
@@ -214,7 +215,7 @@ def last_bar_is_provisional(
 
     A bar is FINAL only if it was written at or after the close of its period (see bar_period_close) PLUS
     `settle_margin` (the closing auction and late corrections can still change it, and clocks skew), judged against
-    the calendar and never the wall clock. The caller passes the margin; the default is a FreshnessConfig's. Unknown (no bar, or no write time) is not provisional. A bar re-fetched
+    the calendar and never the wall clock. The caller passes the margin; the default is a HealthConfig's. Unknown (no bar, or no write time) is not provisional. A bar re-fetched
     after the close is rewritten by the upsert with a later write time and becomes final.
     """
     if last_bar is None or last_bar_written_at is None:
@@ -240,7 +241,7 @@ def _daily(
     _, owed_sessions = judged(start, min(end, now), calendar, now, granularity)
     if not owed_sessions:
         # Nothing in range has closed yet (created today, or before its first session): nothing is owed.
-        return DatasetHealth(FreshnessStatus.FRESH)
+        return DatasetHealth(DatasetHealthStatus.FRESH)
     owed = list(dict.fromkeys(owed_sessions.values()))
     expected = owed[-1]
     expected_bar = local_midnight(expected, calendar)
@@ -260,7 +261,7 @@ def _daily(
         judged_at, last_bar_written_at, calendar, granularity, settle_margin
     )
     if last_period is not None and last_period >= expected and not provisional:
-        return DatasetHealth(FreshnessStatus.FRESH, expected, expected_bar)
+        return DatasetHealth(DatasetHealthStatus.FRESH, expected, expected_bar)
     # Stored late is fine until the first session AFTER the missed period opens; after that it is a failure. The
     # deadline that counts is the one of the FIRST period not stored: a dataset that missed an earlier period already
     # failed at that deadline, and must not read LATE again once a later period ends. With no bars that is the
@@ -270,16 +271,12 @@ def _daily(
         after_last = calendar.next_session(next_period_start(last_period, granularity) - _DAY)
         missed = min(expected, period_start(after_last, granularity))
     deadline = calendar.session_open(calendar.next_session(next_period_start(missed, granularity) - _DAY))
-    status = FreshnessStatus.LATE if now < deadline else FreshnessStatus.OVERDUE
+    status = DatasetHealthStatus.LATE if now < deadline else DatasetHealthStatus.OVERDUE
     return DatasetHealth(status, expected, expected_bar)
 
 
 def _stream(
-    last_bar: datetime | None,
-    granularity: Granularity,
-    calendar: TradingCalendar,
-    now: datetime,
-    config: FreshnessConfig,
+    last_bar: datetime | None, granularity: Granularity, calendar: TradingCalendar, now: datetime, config: HealthConfig
 ) -> DatasetHealth:
     bar_length = granularity.offset
     if calendar.session_in_progress(now) is not None:
@@ -287,10 +284,12 @@ def _stream(
     else:
         previous = calendar.last_completed_session(now)
         if previous is None:
-            return DatasetHealth(FreshnessStatus.FRESH)
+            return DatasetHealth(DatasetHealthStatus.FRESH)
         threshold = calendar.session_close(previous) - bar_length
     fresh = last_bar is not None and last_bar >= threshold
-    return DatasetHealth(FreshnessStatus.FRESH if fresh else FreshnessStatus.OVERDUE, expected_last_bar=threshold)
+    return DatasetHealth(
+        DatasetHealthStatus.FRESH if fresh else DatasetHealthStatus.OVERDUE, expected_last_bar=threshold
+    )
 
 
 __all__ = [
@@ -300,8 +299,8 @@ __all__ = [
     'SETTLE_ENV',
     'STREAM_BAR_MULTIPLE_ENV',
     'DatasetHealth',
-    'FreshnessConfig',
-    'FreshnessStatus',
+    'DatasetHealthStatus',
+    'HealthConfig',
     'bar_period_close',
     'evaluate_dataset',
     'last_bar_is_provisional',

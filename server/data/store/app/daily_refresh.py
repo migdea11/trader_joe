@@ -11,7 +11,7 @@ The calendar is an argument to the schedule; common imports none. A pass also ru
 
 WHAT. Every pass derives its work from the DATABASE; nothing is stored and nothing is replayed (common/scheduling.py).
 It reads the DAILY entries of its source, drops the retired ones (collect is false: the operator stopped it, the
-same rule the UI judges by: is_retired; an expiry alone retires nothing), drops those with a RUNNING ingest, and keeps the ones the freshness rule
+same rule the UI judges by: is_retired; an expiry alone retires nothing), drops those with a RUNNING ingest, and keeps the ones the health rule
 reads LATE or OVERDUE: the last stored bar is before the last completed session. For each, oldest first, it asks
 ingest for ONLY the missing range: from the newest STORED bar plus one bar, a placeholder bar included (the declared
 start when there are no bars), reaching back to the newest real bar when it was written before its period closed
@@ -94,8 +94,8 @@ from data.store.app.health import (
 )
 from data.store.app.health import SETTLE_ENV as SETTLE_ENV
 from data.store.app.health import (
-    FreshnessConfig,
-    FreshnessStatus,
+    DatasetHealthStatus,
+    HealthConfig,
     bar_period_close,
     evaluate_dataset,
     last_bar_is_provisional,
@@ -278,7 +278,7 @@ def _fetch_start(
     The newest stored bar is the newest of the newest real bar (row.last_bar) and the stored placeholders that
     _can_be_real, so a placeholder tail the vendor keeps padding is not asked for again from the last real bar on every
     pass (tj-7zjov1.114). A stored bar that cannot be a real period (future, outside the range, in no session) never
-    counts. Freshness and the pass order still judge the real bar. The tail reaches BACK, never leaving a gap or a
+    counts. Health and the pass order still judge the real bar. The tail reaches BACK, never leaving a gap or a
     stale bar, to the oldest of:
       - the newest real bar, when it is provisional (written before its period closed and settled, see
         last_bar_is_provisional; for 1min..1hour the period is the whole session, not the bar's own);
@@ -787,7 +787,7 @@ class DailyRefresher:
         """The rows to refresh, oldest newest-bar first: DAILY, active, not running, and LATE or OVERDUE."""
         owed: list[CatalogRow] = []
         # Only the settle margin, from the refresh's own setting: the stream multiple means nothing to a DAILY dataset.
-        config = FreshnessConfig(settle_margin=settle_margin_from_env())
+        config = HealthConfig(settle_margin=settle_margin_from_env())
         for row in rows:
             if is_retired(row) or row.id in running:
                 continue
@@ -807,7 +807,7 @@ class DailyRefresher:
                 )
             except CalendarRangeError:
                 continue
-            if health.status in (FreshnessStatus.LATE, FreshnessStatus.OVERDUE):
+            if health.status in (DatasetHealthStatus.LATE, DatasetHealthStatus.OVERDUE):
                 owed.append(row)
         owed.sort(key=lambda row: (row.last_bar or row.start, str(row.id)))
         return owed

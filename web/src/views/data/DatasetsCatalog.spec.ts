@@ -15,7 +15,7 @@ import { DataSource, Feed, Granularity, UpdateType } from '@generated/trader_joe
 import {
   ClientKind,
   DatasetSummarySchema,
-  FreshnessStatus,
+  DatasetHealthStatus,
   IngestRunState,
   UsageFilter,
   type DatasetSummary,
@@ -120,7 +120,7 @@ function row(id: string, symbol: string, extra: MessageInitShape<typeof DatasetS
     feed: Feed.IEX,
     granularity: Granularity.ONE_DAY,
     updateType: UpdateType.DAILY,
-    freshness: { status: FreshnessStatus.FRESH },
+    health:{ status: DatasetHealthStatus.FRESH },
     ...extra,
   } as MessageInitShape<typeof DatasetSummarySchema>)
 }
@@ -138,12 +138,12 @@ const FACETS = {
     { updateType: UpdateType.STATIC, count: 4n },
   ],
   statuses: [
-    { status: FreshnessStatus.FRESH, count: 5n },
-    { status: FreshnessStatus.COMPLETE, count: 2n },
-    { status: FreshnessStatus.LATE, count: 1n },
-    { status: FreshnessStatus.OVERDUE, count: 1n },
-    { status: FreshnessStatus.GAPS, count: 1n },
-    { status: FreshnessStatus.UNSPECIFIED, count: 2n },
+    { status: DatasetHealthStatus.FRESH, count: 5n },
+    { status: DatasetHealthStatus.COMPLETE, count: 2n },
+    { status: DatasetHealthStatus.LATE, count: 1n },
+    { status: DatasetHealthStatus.OVERDUE, count: 1n },
+    { status: DatasetHealthStatus.GAPS, count: 1n },
+    { status: DatasetHealthStatus.UNSPECIFIED, count: 2n },
   ],
 }
 
@@ -301,13 +301,13 @@ describe('filters', () => {
     const shell = await screenAt('/data/datasets')
     const group = shell.find('[data-collection="running"]').element.closest('fieldset')!
     expect(group.querySelector('legend')!.textContent!.trim()).toBe(titleCase('Status'))
-    // Running is the group's first option, before the freshness words.
+    // Running is the group's first option, before the health words.
     expect(group.querySelector('label')!.getAttribute('data-collection')).toBe('running')
     expect(shell.find('[data-collection="running"]').text()).toContain('Running')
     expect(shell.find('[data-collection="running"] .side-count').text()).toBe('2')
   })
 
-  it('the Status group holds Running as its own toggle beside the freshness words, and ticking it writes ?running=true', async () => {
+  it('the Status group holds Running as its own toggle beside the health words, and ticking it writes ?running=true', async () => {
     const shell = await screenAt('/data/datasets')
     const legends = shell.findAll('fieldset legend').map((l) => l.text())
     expect(legends).toContain(titleCase('Status'))
@@ -495,7 +495,7 @@ describe('rows', () => {
     expect(router.currentRoute.value.name).toBe('data-datasets')
   })
 
-  // Phase 2 (tj-grna9p.77 items 1 and 2): the status column shows Running over the freshness word
+  // Phase 2 (tj-grna9p.77 items 1 and 2): the status column shows Running over the health word
   // and a Coverage column sits after it; tj-grna9p.117 (owner 2026-10-13) named its header Status
   // (it was Collection; colId 'collection' is an identifier and is kept). tj-grna9p.109: the Symbol
   // link follows the row to the Viewer. tj-grna9p.114: the details icon moved into the Coverage cell,
@@ -544,19 +544,19 @@ describe('rows', () => {
     expect(coverageParams.detailHref('a/b')).toBe('/data/datasets/a%2Fb')
   })
 
-  it('the Status cell reads Running while the last run is in flight, whatever the freshness', () => {
+  it('the Status cell reads Running while the last run is in flight, whatever the health', () => {
     const cell = (extra: MessageInitShape<typeof DatasetSummarySchema>) =>
       mount(StatusCell, { props: { params: { data: row('r', 'R', extra) } as never } }).text()
-    expect(cell({ freshness: { status: FreshnessStatus.LATE }, lastRun: { state: IngestRunState.RUNNING } })).toBe('Running')
-    expect(cell({ freshness: { status: FreshnessStatus.GAPS }, lastRun: { state: IngestRunState.RUNNING } })).toBe('Running')
-    expect(cell({ freshness: { status: FreshnessStatus.LATE }, lastRun: { state: IngestRunState.SUCCEEDED } })).toBe('Late')
-    expect(cell({ freshness: { status: FreshnessStatus.FRESH } })).toBe('Healthy')
+    expect(cell({ health:{ status: DatasetHealthStatus.LATE }, lastRun: { state: IngestRunState.RUNNING } })).toBe('Running')
+    expect(cell({ health:{ status: DatasetHealthStatus.GAPS }, lastRun: { state: IngestRunState.RUNNING } })).toBe('Running')
+    expect(cell({ health:{ status: DatasetHealthStatus.LATE }, lastRun: { state: IngestRunState.SUCCEEDED } })).toBe('Late')
+    expect(cell({ health:{ status: DatasetHealthStatus.FRESH } })).toBe('Healthy')
     // tj-grna9p.177: a subscription with collect off (RETIRED) reads Stopped in the grid.
-    expect(cell({ freshness: { status: FreshnessStatus.RETIRED } })).toBe('Stopped')
+    expect(cell({ health:{ status: DatasetHealthStatus.RETIRED } })).toBe('Stopped')
   })
 
   it('a stopped row with an expiry: the Status cell reads Stopped and the Expires cell its date', () => {
-    const data = row('st', 'ST', { freshness: { status: FreshnessStatus.RETIRED }, expiry: timestampFromMs(EXPIRY) })
+    const data = row('st', 'ST', { health:{ status: DatasetHealthStatus.RETIRED }, expiry: timestampFromMs(EXPIRY) })
     expect(mount(StatusCell, { props: { params: { data } as never } }).text()).toBe('Stopped')
     const pinia = createPinia()
     setActivePinia(pinia)
@@ -565,10 +565,10 @@ describe('rows', () => {
   })
 
   it('the Status cell shows Unknown for a row with no health, and nothing for a row still loading', () => {
-    const unknown = mount(StatusCell, { props: { params: { data: row('u', 'U', { freshness: undefined }) } as never } })
+    const unknown = mount(StatusCell, { props: { params: { data: row('u', 'U', { health:undefined }) } as never } })
     expect(unknown.text()).toBe('Unknown')
     const failed = mount(StatusCell, {
-      props: { params: { data: row('g', 'G', { freshness: { status: FreshnessStatus.GAPS } }) } as never },
+      props: { params: { data: row('g', 'G', { health:{ status: DatasetHealthStatus.GAPS } }) } as never },
     })
     expect(failed.text()).toBe('Failed')
     expect(mount(StatusCell, { props: { params: { data: undefined } as never } }).text()).toBe('')

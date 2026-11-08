@@ -207,9 +207,11 @@ def test_a_quota_scope_cap_has_presence_so_zero_is_not_unknown():
 # ADDITIVE ONLY: PHASE 1 AS IT MERGED
 
 # Every phase 1 message of data.proto with its full (name, number) list as merged on main (20756e3).
-# A phase 2 field may only be appended; this pins that nothing before it moved or was renamed.
+# A phase 2 field may only be appended; this pins that nothing before it moved or was renamed. The one
+# sanctioned rename since: tj-grna9p.168 (owner ruling 2026-10-31) renamed message Freshness to DatasetHealth
+# and DatasetSummary.freshness to health, every number unchanged.
 PHASE_ONE_NUMBERING = {
-    'Freshness': [('status', 1), ('expected_last_bar', 2), ('gap_count', 3), ('as_of', 4)],
+    'DatasetHealth': [('status', 1), ('expected_last_bar', 2), ('gap_count', 3), ('as_of', 4)],
     'DatasetSibling': [('id', 1), ('granularity', 2)],
     'DatasetSummary': [
         ('id', 1),
@@ -229,7 +231,7 @@ PHASE_ONE_NUMBERING = {
         ('first_bar', 15),
         ('last_bar', 16),
         ('bar_count', 17),
-        ('freshness', 18),
+        ('health', 18),
         ('siblings', 19),
     ],
     'DatasetPage': [('items', 1), ('next_cursor', 2)],

@@ -1,4 +1,4 @@
-"""The dataset catalog the /ui/v1 routes serve: filtering, keyset paging, facets and freshness (tj-grna9p.20).
+"""The dataset catalog the /ui/v1 routes serve: filtering, keyset paging, facets and health (tj-grna9p.20).
 
 This module composes the read repository (database/crud/stock/dataset_catalog.py) with the pure health and
 completeness rules (health.py, completeness.py). The routes call it and map its results to messages; it knows no HTTP and no protobuf.
@@ -7,21 +7,21 @@ THE QUERY BUDGET. A request runs a constant number of statements, never one per 
 the matching entries with their newest bar in one, and then, for the datasets the answer needs, one each for
 bar extents, covered session dates (STATIC datasets only, one per calendar time zone) and siblings.
 
-FILTERS THAT NEED THE COMPUTED FRESHNESS ARE APPLIED OVER ALL MATCHING ROWS, not over the page window (the .8
+FILTERS THAT NEED THE COMPUTED HEALTH ARE APPLIED OVER ALL MATCHING ROWS, not over the page window (the .8
 item 4 option "computed server-side over all rows", with the measured ceiling of 1000 datasets in the task's
 acceptance). That is what lets a facet count equal the filtered list's total. A request with no status filter
-evaluates freshness for the page only.
+evaluates health for the page only.
 
 THE STATUS VOCABULARY. The `status` filter speaks the UI's words (tj-grna9p.60): FRESH and COMPLETE are Healthy,
 LATE is Late, OVERDUE and GAPS are Failed, RETIRED is Retired. needs_attention is Late or Failed. A dataset whose
-source has no trading calendar has no computed freshness (status UNSPECIFIED on the wire) and matches no status.
+source has no trading calendar has no computed health (status UNSPECIFIED on the wire) and matches no status.
 
 THE COUNTS, defined so each equals a list total. Given the filters of a request:
     all              the total with every filter except needs_attention (the All Datasets view)
     needs_attention  the total with every filter, needs_attention forced on (the Needs Attention view)
     each source      the total with every filter except source, and that source
     each update type the total with every filter except update_type, and that update type
-    each status      the total with every filter except status, and that status (the raw freshness status)
+    each status      the total with every filter except status, and that status (the raw health status)
 
 THE USAGE FILTERS (tj-grna9p.85). The client filter picks whose reads count: client_id (repeatable, wins) else
 client_kind (repeatable), with neither the kind SDK. Under it:
@@ -87,7 +87,7 @@ from data.store.app.database.crud.stock.dataset_catalog import (
 )
 from data.store.app.database.models.dataset_read import ReadClientKind
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
-from data.store.app.health import DatasetHealth, FreshnessConfig, FreshnessStatus, evaluate_dataset
+from data.store.app.health import DatasetHealth, DatasetHealthStatus, HealthConfig, evaluate_dataset
 from data.store.app.trading_calendar import (
     CalendarRangeError,
     TradingCalendar,
@@ -152,13 +152,13 @@ class UsageFilter(StrEnum):
     NEVER_READ = 'never_read'
 
 
-_GROUP_OF: Final[dict[FreshnessStatus, StatusGroup]] = {
-    FreshnessStatus.FRESH: StatusGroup.HEALTHY,
-    FreshnessStatus.COMPLETE: StatusGroup.HEALTHY,
-    FreshnessStatus.LATE: StatusGroup.LATE,
-    FreshnessStatus.OVERDUE: StatusGroup.FAILED,
-    FreshnessStatus.GAPS: StatusGroup.FAILED,
-    FreshnessStatus.RETIRED: StatusGroup.RETIRED,
+_GROUP_OF: Final[dict[DatasetHealthStatus, StatusGroup]] = {
+    DatasetHealthStatus.FRESH: StatusGroup.HEALTHY,
+    DatasetHealthStatus.COMPLETE: StatusGroup.HEALTHY,
+    DatasetHealthStatus.LATE: StatusGroup.LATE,
+    DatasetHealthStatus.OVERDUE: StatusGroup.FAILED,
+    DatasetHealthStatus.GAPS: StatusGroup.FAILED,
+    DatasetHealthStatus.RETIRED: StatusGroup.RETIRED,
 }
 _ATTENTION: Final = frozenset({StatusGroup.LATE, StatusGroup.FAILED})
 
@@ -221,7 +221,7 @@ class CatalogQuery:
 
     Attributes:
         catalog_filter: The SQL-level filters (symbol prefix, source, update type).
-        status: Keep datasets whose computed freshness is in this group.
+        status: Keep datasets whose computed health is in this group.
         needs_attention: Keep only Late and Failed datasets.
         running: Keep only datasets with a run in state RUNNING. Orthogonal to status: a dataset can be Running
             and Late at once, and how the two rank in one column is the UI's choice.
@@ -250,11 +250,11 @@ class CatalogQuery:
 
 @dataclass(frozen=True)
 class DatasetView:
-    """One catalog entry with its computed freshness.
+    """One catalog entry with its computed health.
 
     Attributes:
         row: The entry.
-        health: The freshness judgement, or None when the source has no trading calendar.
+        health: The health judgement, or None when the source has no trading calendar.
     """
 
     row: CatalogRow
@@ -262,7 +262,7 @@ class DatasetView:
 
     @property
     def group(self) -> StatusGroup | None:
-        """The UI status group, or None when there is no computed freshness."""
+        """The UI status group, or None when there is no computed health."""
         return None if self.health is None else _GROUP_OF[self.health.status]
 
 
@@ -275,7 +275,7 @@ class DatasetPage:
         extents: The stored extent of each dataset on the page.
         siblings: The other granularities of each dataset on the page.
         next_cursor: The cursor for the next page; empty on the last.
-        as_of: The instant freshness was computed at.
+        as_of: The instant health was computed at.
         last_runs: The newest run of each dataset on the page that has one, whatever its state.
         usage: The usage of each dataset on the page (an unread one has the zero view).
         reaper_pending: The page's datasets the reaper would delete.
@@ -302,7 +302,7 @@ class Facets:
         needs_attention: The Needs Attention view's total.
         sources: A count for every source.
         update_types: A count for every update type.
-        statuses: A count for every computed freshness status.
+        statuses: A count for every computed health status.
         running: Datasets with a RUNNING run, under every filter except running itself.
         clients: Each client seen reading in the last 30 days; ignores the client filter.
         client_filter: The client filter applied.
@@ -318,7 +318,7 @@ class Facets:
     needs_attention: int
     sources: dict[DataSource, int]
     update_types: dict[UpdateType, int]
-    statuses: dict[FreshnessStatus, int]
+    statuses: dict[DatasetHealthStatus, int]
     running: int = 0
     clients: list[ClientCountView] = field(default_factory=list)
     client_filter: ClientFilter = field(default_factory=ClientFilter)
@@ -335,10 +335,10 @@ class DatasetDetail:
     """One dataset as the viewer opens it.
 
     Attributes:
-        view: The entry with its freshness.
+        view: The entry with its health.
         extent: What is stored.
         siblings: The other granularities of the series.
-        as_of: The instant freshness was computed at.
+        as_of: The instant health was computed at.
         last_run: The dataset's newest run, whatever its state, or None when it has never run.
         usage: How it was read, under the default client filter.
         reaper_pending: Whether the reaper would delete it.
@@ -490,22 +490,22 @@ def effective_end(row: CatalogRow, now: datetime) -> datetime:
 
 
 async def evaluate_views(
-    db: AsyncSession, rows: list[CatalogRow], now: datetime, config: FreshnessConfig | None = None
+    db: AsyncSession, rows: list[CatalogRow], now: datetime, config: HealthConfig | None = None
 ) -> list[DatasetView]:
-    """Compute freshness for each row, one query per calendar time zone for the STATIC ones, none otherwise.
+    """Compute health for each row, one query per calendar time zone for the STATIC ones, none otherwise.
 
     Args:
         db: The request's session.
         rows: The entries to judge.
         now: The instant to judge at; aware.
-        config: The freshness settings; the environment's when omitted.
+        config: The health settings; the environment's when omitted.
 
     Returns:
         list[DatasetView]: One view per row, in order. A row whose source has no calendar, or whose range starts
         before the calendar does (CalendarRangeError, logged at WARNING), has no health, unless it is retired,
         which needs none.
     """
-    config = config or FreshnessConfig.from_env()
+    config = config or HealthConfig.from_env()
     calendars: dict[uuid.UUID, TradingCalendar | None] = {}
     static_by_zone: dict[str, list[CatalogRow]] = {}
     for row in rows:
@@ -525,7 +525,7 @@ async def evaluate_views(
     for row in rows:
         calendar = calendars[row.id]
         if calendar is None:
-            health = DatasetHealth(FreshnessStatus.RETIRED) if is_retired(row) else None
+            health = DatasetHealth(DatasetHealthStatus.RETIRED) if is_retired(row) else None
         else:
             try:
                 health = evaluate_dataset(
@@ -750,15 +750,15 @@ async def _page_usage(
 
 
 async def list_page(
-    db: AsyncSession, query: CatalogQuery, now: datetime, config: FreshnessConfig | None = None
+    db: AsyncSession, query: CatalogQuery, now: datetime, config: HealthConfig | None = None
 ) -> DatasetPage:
     """One page of the catalog under the query's filters and order.
 
     Args:
         db: The request's session.
         query: The filters, order, cursor and page size.
-        now: The instant to judge freshness at; aware.
-        config: The freshness settings; the environment's when omitted.
+        now: The instant to judge health at; aware.
+        config: The health settings; the environment's when omitted.
 
     Returns:
         DatasetPage: The page, its extents and siblings, and the cursor for the next one (empty on the last).
@@ -782,7 +782,7 @@ async def list_page(
         rows = [row for row in rows if keep_usage(row)]
     rows = sorted(rows, key=lambda row: _sort_key(row, query.sort, usage_all))
     if query.running:
-        # One more statement, only for a request that asks for it; rows narrow before freshness is judged.
+        # One more statement, only for a request that asks for it; rows narrow before health is judged.
         in_flight = await running_dataset_ids(db)
         rows = [row for row in rows if row.id in in_flight]
     judged_everywhere = query.status is not None or query.needs_attention
@@ -844,7 +844,7 @@ def _pending_key_from_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
 
 
 async def reaper_pending_page(
-    db: AsyncSession, now: datetime, *, cursor: str | None, limit: int, config: FreshnessConfig | None = None
+    db: AsyncSession, now: datetime, *, cursor: str | None, limit: int, config: HealthConfig | None = None
 ) -> DatasetPage:
     """One page of the datasets the reaper would delete: those whose expiry has passed, oldest expiry first.
 
@@ -857,7 +857,7 @@ async def reaper_pending_page(
         now: The instant the pending set is computed at; aware.
         cursor: The next_cursor of the previous page, or None for the first.
         limit: The page size.
-        config: The freshness settings; the environment's when omitted.
+        config: The health settings; the environment's when omitted.
 
     Returns:
         DatasetPage: The page; next_cursor is empty on the last.
@@ -894,7 +894,7 @@ def _count_where(
     return counts
 
 
-async def facets(db: AsyncSession, query: CatalogQuery, now: datetime, config: FreshnessConfig | None = None) -> Facets:
+async def facets(db: AsyncSession, query: CatalogQuery, now: datetime, config: HealthConfig | None = None) -> Facets:
     """The sidebar counts under the query's filters; see the module docstring for what each equals.
 
     Only the symbol prefix is applied in SQL here: source and update type are facets themselves, so each count
@@ -903,8 +903,8 @@ async def facets(db: AsyncSession, query: CatalogQuery, now: datetime, config: F
     Args:
         db: The request's session.
         query: The filters.
-        now: The instant to judge freshness at; aware.
-        config: The freshness settings; the environment's when omitted.
+        now: The instant to judge health at; aware.
+        config: The health settings; the environment's when omitted.
 
     Returns:
         Facets: The counts. A source, update type or status nothing matches is present with a zero.
@@ -950,7 +950,7 @@ async def facets(db: AsyncSession, query: CatalogQuery, now: datetime, config: F
         needs_attention=sum(match(view, attention=True) for view in views),
         sources={member: source_counts.get(member, 0) for member in DataSource},
         update_types={member: update_counts.get(member, 0) for member in UpdateType},
-        statuses={member: status_counts.get(member, 0) for member in FreshnessStatus},
+        statuses={member: status_counts.get(member, 0) for member in DatasetHealthStatus},
         # Under every filter but running itself, so with running=true it equals the list's total.
         running=sum(match(view, omit=frozenset({'running'})) and view.row.id in in_flight for view in views),
         clients=[ClientCountView(item.client_id, item.client_kind, item.datasets) for item in clients],
@@ -968,16 +968,16 @@ async def dataset_detail(
     db: AsyncSession,
     dataset_id: uuid.UUID,
     now: datetime,
-    config: FreshnessConfig | None = None,
+    config: HealthConfig | None = None,
     client_filter: ClientFilter | None = None,
 ) -> DatasetDetail | None:
-    """One dataset with its freshness, extent, siblings and usage, or None when no such dataset exists.
+    """One dataset with its health, extent, siblings and usage, or None when no such dataset exists.
 
     Args:
         db: The request's session.
         dataset_id: The dataset's id.
-        now: The instant to judge freshness at; aware.
-        config: The freshness settings; the environment's when omitted.
+        now: The instant to judge health at; aware.
+        config: The health settings; the environment's when omitted.
         client_filter: Whose reads the usage counts; the default (kind SDK) when omitted.
 
     Returns:
@@ -1500,24 +1500,24 @@ async def stale_page(
     source: DataSource | None = None,
     cursor: str | None = None,
     limit: int = DEFAULT_PAGE_LIMIT,
-    config: FreshnessConfig | None = None,
+    config: HealthConfig | None = None,
 ) -> StaleDatasetPageResult:
     """One page of the stale group under the client filter, never-read first, then by last read, then id.
 
     The group is the STALE usage filter's: the Stale facet's count equals the total of this list. Keyset paged with
     an opaque cursor bound to stale_days, the source and the client filter (one made under another is a 422).
-    A constant number of statements: the entries, the usage of all of them, then for the page its freshness,
+    A constant number of statements: the entries, the usage of all of them, then for the page its health,
     extents, siblings, runs, reaper flag, readers, last read per client and the table's storage. Records no usage.
 
     Args:
         db: The request's session.
-        now: The instant staleness and freshness are judged at; aware, else ValueError.
+        now: The instant staleness and health are judged at; aware, else ValueError.
         client_filter: Whose reads count toward the usage under dataset.usage.
         stale_days: The staleness threshold, 1..MAX_STALE_DAYS.
         source: Only this source's datasets, or None.
         cursor: The next_cursor of the previous page, or None for the first.
         limit: The page size.
-        config: The freshness settings; the environment's when omitted.
+        config: The health settings; the environment's when omitted.
 
     Returns:
         StaleDatasetPageResult: The page; next_cursor is empty on the last.

@@ -4,7 +4,7 @@ import { createPinia } from 'pinia'
 import PrimeVue from 'primevue/config'
 
 import { UpdateType } from '@generated/trader_joe/proto/market/v1/enums_pb'
-import { FreshnessStatus } from '@generated/trader_joe/proto/ui/v1/data_pb'
+import { DatasetHealthStatus } from '@generated/trader_joe/proto/ui/v1/data_pb'
 import { AccountGroup } from '@generated/trader_joe/proto/ui/v1/shell_pb'
 
 import router from '@/router'
@@ -43,9 +43,9 @@ describe('datasets screen smoke', () => {
         { updateType: UpdateType.STATIC, count: 12n },
       ],
       statuses: [
-        { status: FreshnessStatus.FRESH, count: 30n },
-        { status: FreshnessStatus.LATE, count: 1n },
-        { status: FreshnessStatus.OVERDUE, count: 1n },
+        { status: DatasetHealthStatus.FRESH, count: 30n },
+        { status: DatasetHealthStatus.LATE, count: 1n },
+        { status: DatasetHealthStatus.OVERDUE, count: 1n },
       ],
     })
     mocks.listDatasets.mockResolvedValue({ items: [], nextCursor: '' })

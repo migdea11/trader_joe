@@ -53,7 +53,7 @@ from common.errors.vocabulary import ExogenousError, Reason
 from data.store.app.database.crud.stock import store_dataset_entry as crud
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
-from data.store.app.health import FreshnessStatus, evaluate_dataset
+from data.store.app.health import DatasetHealthStatus, evaluate_dataset
 from data.store.app.trading_calendar import calendar_for_source
 from schemas.data_store.asset_dataset_store import (
     AssetDatasetStore,
@@ -515,14 +515,14 @@ async def test_a_daily_repeat_without_expiry_clears_the_expiry_and_only_an_expli
     health. collect follows the tj-hhy3dk addendum (tj-grna9p.189): a repeat that omits it leaves the stored intent,
     so a stopped subscription stays RETIRED, and only an explicit value flips it.
 
-    The health is computed by the real freshness function from the value the row holds after each repeat, so the
+    The health is computed by the real health function from the value the row holds after each repeat, so the
     claim is the chain: what the POST writes (or leaves) is what the health reads.
     """
     request = _daily_request()
     now = datetime(2026, 3, 4, 21, tzinfo=UTC)  # a Wednesday after the close, well after start
     calendar = calendar_for_source(DataSource.ALPACA_API)
 
-    def health(collect: bool | None) -> FreshnessStatus:
+    def health(collect: bool | None) -> DatasetHealthStatus:
         return evaluate_dataset(
             update_type=UpdateType.DAILY,
             granularity=Granularity.ONE_DAY,
@@ -540,20 +540,24 @@ async def test_a_daily_repeat_without_expiry_clears_the_expiry_and_only_an_expli
 
     expiry, collect, _ = await _bound_conflict(request, collect=False)
     assert (expiry, collect) == (FEBRUARY, False)
-    assert health(after(True, collect)) is FreshnessStatus.RETIRED, 'the control: explicit false stops it'
+    assert health(after(True, collect)) is DatasetHealthStatus.RETIRED, 'the control: explicit false stops it'
 
     expiry, collect, _ = await _bound_conflict(_without_expiry(request))
     assert (expiry, collect) == (None, KEPT), 'a DAILY repeat without collect wrote one over the stored intent'
-    assert health(after(False, collect)) is FreshnessStatus.RETIRED, 'a repeat without collect resumed a stopped one'
-    assert health(after(True, collect)) is not FreshnessStatus.RETIRED, 'clearing the expiry stopped a collecting one'
+    assert health(after(False, collect)) is DatasetHealthStatus.RETIRED, (
+        'a repeat without collect resumed a stopped one'
+    )
+    assert health(after(True, collect)) is not DatasetHealthStatus.RETIRED, (
+        'clearing the expiry stopped a collecting one'
+    )
 
     expiry, collect, _ = await _bound_conflict(request)
     assert (expiry, collect) == (FEBRUARY, KEPT)
-    assert health(after(True, collect)) is not FreshnessStatus.RETIRED, 'an expiry on a collecting DAILY retired it'
+    assert health(after(True, collect)) is not DatasetHealthStatus.RETIRED, 'an expiry on a collecting DAILY retired it'
 
     expiry, collect, _ = await _bound_conflict(_without_expiry(request), collect=True)
     assert (expiry, collect) == (None, True)
-    assert health(after(False, collect)) is not FreshnessStatus.RETIRED, 'explicit true did not resume it'
+    assert health(after(False, collect)) is not DatasetHealthStatus.RETIRED, 'explicit true did not resume it'
 
 
 @pytest.mark.asyncio

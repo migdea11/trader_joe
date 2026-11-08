@@ -13,7 +13,7 @@ THE DESIGN is the bead and the architect's rulings in its notes, which win over 
   5. the write and, for an override, EXACTLY ONE override-log row (action SET_COLLECTING, reason trimmed) in one
      transaction; DatasetChanged strictly after the commit, RETIRED on a flip to false and RESUMED on a flip to
      true (tj-grna9p.189), none when collect was already the value sent, and none on a refused write;
-  6. 200 with the updated DatasetSummary: collecting, state and freshness follow collect; the expiry is untouched.
+  6. 200 with the updated DatasetSummary: collecting, state and health follow collect; the expiry is untouched.
 Unmigrated (no audit tables): an overriding PATCH is 503 DATABASE_UNAVAILABLE before any write; the operator's own
 goes through unrecorded.
 
@@ -563,7 +563,7 @@ async def test_the_flip_is_judged_from_the_stored_row_not_the_sessions_loaded_ob
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('name', ['dataset', 'foreign', 'stream'])
-async def test_stop_then_start_round_trips_state_collecting_and_freshness_and_keeps_the_expiry(client, world, name):
+async def test_stop_then_start_round_trips_state_collecting_and_health_and_keeps_the_expiry(client, world, name):
     row = getattr(world, name)
     override = {} if row.owner == OPERATOR_PRINCIPAL else {'override': GOOD_OVERRIDE}
     expiry = NOW + timedelta(days=9)
@@ -578,7 +578,7 @@ async def test_stop_then_start_round_trips_state_collecting_and_freshness_and_ke
         False,
     )
     assert 'collecting' in summary, 'collecting false is not set on the wire: the field has presence'
-    assert summary['freshness']['status'] == 'FRESHNESS_STATUS_RETIRED'
+    assert summary['health']['status'] == 'DATASET_HEALTH_STATUS_RETIRED'
     assert z(summary['expiry']) == expiry, 'stopping changed the deletion date'
     assert summary == (await client.get(dataset_path(row.id))).json(), 'the answer is not the detail read'
 
@@ -586,7 +586,7 @@ async def test_stop_then_start_round_trips_state_collecting_and_freshness_and_ke
     assert started.status_code == 200, started.text
     summary = started.json()
     assert (summary['state'], summary['collecting']) == ('DATASET_STATE_ACTIVE', True)
-    assert summary['freshness']['status'] != 'FRESHNESS_STATUS_RETIRED'
+    assert summary['health']['status'] != 'DATASET_HEALTH_STATUS_RETIRED'
     assert z(summary['expiry']) == expiry, 'starting changed the deletion date'
     stored = await world.entry(row.id)
     assert (stored.collect, stored.expiry, stored.update_type) == (True, expiry, row.update_type.value)

@@ -10,7 +10,7 @@ but ui/v1 are built from the generated module directly. When builder-shared take
 common/rpc, this module reduces to imports from there.
 
 ENUMS CROSS BY MEMBER NAME, as everywhere (common.rpc.mapping.values): the ui/v1 enums that market/v1 does not
-carry (ExpiryType, DatasetState, FreshnessStatus) are looked up by their own prefixed names.
+carry (ExpiryType, DatasetState, DatasetHealthStatus) are looked up by their own prefixed names.
 """
 
 import uuid
@@ -132,14 +132,14 @@ def _enum_value(enum_type: Any, prefix: str, member: Any) -> int:
     return enum_type.Value(f'{prefix}{member.name}')
 
 
-def _freshness(view: DatasetView, as_of: datetime) -> data_pb2.Freshness:
-    message = data_pb2.Freshness()
+def _health(view: DatasetView, as_of: datetime) -> data_pb2.DatasetHealth:
+    message = data_pb2.DatasetHealth()
     message.as_of.CopyFrom(to_timestamp(as_of))
     health = view.health
     if health is None:
         # No trading calendar for the source: nothing is computed, and UNSPECIFIED says so.
         return message
-    message.status = _enum_value(data_pb2.FreshnessStatus, 'FRESHNESS_STATUS_', health.status)
+    message.status = _enum_value(data_pb2.DatasetHealthStatus, 'DATASET_HEALTH_STATUS_', health.status)
     message.gap_count = health.gap_count
     if health.expected_last_bar is not None:
         message.expected_last_bar.CopyFrom(to_timestamp(health.expected_last_bar))
@@ -206,7 +206,7 @@ def _summary(
         message.first_bar.CopyFrom(to_timestamp(extent.first_bar))
     if extent.last_bar is not None:
         message.last_bar.CopyFrom(to_timestamp(extent.last_bar))
-    message.freshness.CopyFrom(_freshness(view, as_of))
+    message.health.CopyFrom(_health(view, as_of))
     message.siblings.extend(
         data_pb2.DatasetSibling(id=str(sibling_id), granularity=GRANULARITY.to_proto(granularity))
         for sibling_id, granularity in siblings
@@ -280,7 +280,7 @@ def dataset_summary_message(detail: DatasetDetail) -> data_pb2.DatasetSummary:
         detail: The dataset the catalog produced.
 
     Returns:
-        data_pb2.DatasetSummary: The dataset with its freshness, extent and siblings.
+        data_pb2.DatasetSummary: The dataset with its health, extent and siblings.
     """
     return _summary(
         detail.view,
@@ -334,7 +334,9 @@ def facets_message(facets: Facets) -> data_pb2.DatasetFacets:
         for update_type, count in facets.update_types.items()
     )
     message.statuses.extend(
-        data_pb2.StatusFacet(status=_enum_value(data_pb2.FreshnessStatus, 'FRESHNESS_STATUS_', status), count=count)
+        data_pb2.StatusFacet(
+            status=_enum_value(data_pb2.DatasetHealthStatus, 'DATASET_HEALTH_STATUS_', status), count=count
+        )
         for status, count in facets.statuses.items()
     )
     return message

@@ -1,4 +1,4 @@
-"""The DAILY refresh tail follows the newest STORED bar; freshness follows the newest REAL bar (validator, tj-7zjov1.115).
+"""The DAILY refresh tail follows the newest STORED bar; health follows the newest REAL bar (validator, tj-7zjov1.115).
 
 DESIGN: task tj-7zjov1.114 (its RULE paragraph and acceptance), built on P40 (tj-7zjov1.103, ADR tj-26jt9w addendum (7)
 item 7) and the DAILY refresh rules in server/data/store/CLAUDE.md (tj-grna9p.22, tj-grna9p.167). The rule as built in
@@ -14,7 +14,7 @@ item 7) and the DAILY refresh rules in server/data/store/CLAUDE.md (tj-grna9p.22
       are ignored by the tail (still stored); a real bar with trades always counts. A HOLE (a session period with no
       bar between two consecutive bars of the run: the newest real bar, then the pads after it) is reached back to.
       The placeholder read pages (5,000 a page, newest first) while the page just read ends in an unsettled pad;
-    - freshness, the LATE or OVERDUE selection and the pass order still judge the newest REAL bar;
+    - health, the LATE or OVERDUE selection and the pass order still judge the newest REAL bar;
     - DOCUMENTED RESIDUAL: placeholders are read from PLACEHOLDER_LOOKBACK (42 days) before the newest real bar, at
       most PLACEHOLDER_SCAN_LIMIT (5,000) per dataset; an unsettled placeholder outside that is not asked for again.
       A placeholder the vendor turns real only after it has settled is not asked for again either.
@@ -1341,7 +1341,7 @@ async def test_selection_and_order_still_judge_the_newest_real_bar(sim: Sim):
 
     `ahead` holds pads to 13 Oct but its real bar is 1 Oct: it is owed and goes FIRST (oldest real bar), before
     `real` (real bar 2 Oct). `fresh` holds the real bar of the last completed session (13 Oct) and is not requested.
-    A freshness that read the newest STORED bar would order `real` first and would not owe `ahead` at all.
+    A health rule that read the newest STORED bar would order `real` first and would not owe `ahead` at all.
     """
     ahead, real_only, fresh = daily('SOA'), daily('SOB'), daily('SOC')
     final = z('2026-10-20T12:00:00Z')
@@ -1366,7 +1366,7 @@ async def test_selection_and_order_still_judge_the_newest_real_bar(sim: Sim):
     assert sim.vendor.starts('SOA') == [z('2026-10-13T04:00:00Z')]
     assert sim.vendor.starts('SOB') == [z('2026-10-03T04:00:00Z')]
     assert result.behind == 2
-    assert (await sim.catalog(ahead)).last_bar == z('2026-10-01T04:00:00Z'), 'freshness moved off the real bar'
+    assert (await sim.catalog(ahead)).last_bar == z('2026-10-01T04:00:00Z'), 'health moved off the real bar'
 
 
 @pytest.mark.asyncio
@@ -1792,7 +1792,7 @@ async def test_a_dead_series_over_six_weeks_leaves_no_gap_and_no_pad_turned_real
     seen = await _simulate(sim, dataset, times)
 
     await _assert_integrity(sim, dataset, seen, times, [within], [beyond])
-    assert (await sim.catalog(dataset)).last_bar == within, 'freshness does not read the pad turned real'
+    assert (await sim.catalog(dataset)).last_bar == within, 'health does not read the pad turned real'
 
 
 @pytest.mark.asyncio

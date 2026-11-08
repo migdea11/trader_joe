@@ -115,7 +115,7 @@ THROUGH_PHASE_THREE = {
         _f('first_bar', 15, T),
         _f('last_bar', 16, T),
         _f('bar_count', 17, I64),
-        _f('freshness', 18, f'{UI}Freshness'),
+        _f('health', 18, f'{UI}DatasetHealth'),  # renamed from freshness, number kept (tj-grna9p.168)
         _r('siblings', 19, f'{UI}DatasetSibling'),
         # phase 2
         _f('last_run', 20, f'{UI}IngestRun'),

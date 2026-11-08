@@ -7,7 +7,7 @@ accepted default on tj-7zjov1.90. What is pinned:
         gap count and the coverage strip all see it missing; the same session with one real bar is covered;
     (2) volume 0 with a trade count above 0, and volume above 0 with trade count 0, are REAL bars (both halves of
         the AND are needed);
-    (3) freshness reads the newest REAL bar: the catalog's last_bar and last_bar_written_at name it when
+    (3) health reads the newest REAL bar: the catalog's last_bar and last_bar_written_at name it when
         placeholders trail it (list_catalog, get_catalog_row, list_pending), and a dataset holding only
         placeholders has last_bar None;
     (4) the rows are stored raw: bar_extents, the bar page, the UI bars route, the page index and the internal read
@@ -217,7 +217,7 @@ async def test_a_session_of_only_placeholders_is_a_gap_in_the_static_status_and_
     await store(engine, gappy, control, *shaped_week(gappy), *shaped_week(control, first_session_real=True))
 
     detail = (await client.get(f'/ui/v1/datasets/{gappy.id}')).json()
-    assert (detail['freshness']['status'], detail['freshness']['gapCount']) == ('FRESHNESS_STATUS_GAPS', 1)
+    assert (detail['health']['status'], detail['health']['gapCount']) == ('DATASET_HEALTH_STATUS_GAPS', 1)
     strip = await coverage(client, gappy)
     assert strip.gaps == [window(ONLY_PLACEHOLDERS, ONLY_PLACEHOLDERS)] and strip.gap_count == 1
     assert (strip.expected, strip.missing) == (len(WEEK), 1)
@@ -225,12 +225,12 @@ async def test_a_session_of_only_placeholders_is_a_gap_in_the_static_status_and_
     assert (detail['barCount'], detail['firstBar']) == ('7', stamp(at_hour(ONLY_PLACEHOLDERS, 14)))
 
     control_detail = (await client.get(f'/ui/v1/datasets/{control.id}')).json()
-    assert control_detail['freshness']['status'] == 'FRESHNESS_STATUS_COMPLETE'
+    assert control_detail['health']['status'] == 'DATASET_HEALTH_STATUS_COMPLETE'
     control_strip = await coverage(client, control)
     assert (control_strip.gaps, control_strip.gap_count, control_strip.missing) == ([], 0, 0)
 
 
-# ------------------------------------------------------------------------------------------------- freshness
+# ---------------------------------------------------------------------------------------------------- health
 
 REAL_WRITTEN = z('2026-10-05T21:00:00Z')
 PLACEHOLDER_WRITTEN = z('2026-10-06T21:30:00Z')
@@ -296,13 +296,13 @@ async def test_a_daily_dataset_whose_newest_bar_is_a_placeholder_is_judged_on_th
     statuses = {}
     for dataset in (trailing, healthy, odd):
         body = (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()
-        statuses[dataset.asset_symbol] = body['freshness']['status']
+        statuses[dataset.asset_symbol] = body['health']['status']
         # The extent is the stored one: the placeholder is still the newest stored bar.
         assert (body['barCount'], body['lastBar']) == ('2', stamp(ny_midnight(6))), body
     assert statuses == {
-        'TRL': 'FRESHNESS_STATUS_LATE',
-        'HLT': 'FRESHNESS_STATUS_FRESH',
-        'ODD': 'FRESHNESS_STATUS_FRESH',
+        'TRL': 'DATASET_HEALTH_STATUS_LATE',
+        'HLT': 'DATASET_HEALTH_STATUS_FRESH',
+        'ODD': 'DATASET_HEALTH_STATUS_FRESH',
     }
 
 
@@ -370,7 +370,7 @@ async def test_para_s_flat_placeholder_year_is_one_gap_of_every_session_in_it(cl
     assert len(flat) > 250 and all(row.close == PARA_CLOSE for row in rows if row.is_placeholder_bar)
 
     detail = (await client.get(f'/ui/v1/datasets/{dataset.id}')).json()
-    assert (detail['freshness']['status'], detail['freshness']['gapCount']) == ('FRESHNESS_STATUS_GAPS', len(flat))
+    assert (detail['health']['status'], detail['health']['gapCount']) == ('DATASET_HEALTH_STATUS_GAPS', len(flat))
     assert detail['barCount'] == str(len(rows))
     strip = await coverage(client, dataset)
     assert strip.gaps == [window(flat[0], flat[-1])] and strip.gap_count == 1
@@ -383,7 +383,7 @@ async def test_para_s_flat_placeholder_year_is_one_gap_of_every_session_in_it(cl
 
 @pytest.mark.asyncio
 async def test_a_para_subscription_whose_series_went_flat_reads_its_last_real_bar(engine):
-    """A DAILY PARA whose stored tail is the flat year: freshness reads the last real bar, 29 Nov 2019."""
+    """A DAILY PARA whose stored tail is the flat year: health reads the last real bar, 29 Nov 2019."""
     dataset = entry('PARA', update_type=UpdateType.DAILY, start=PARA_START)
     rows, _ = para_bars(dataset)
     rows = [row for row in rows if row.timestamp < PARA_FLAT_TO]

@@ -56,7 +56,7 @@ class StockMarketActivity(BaseMarketActivity):
 
         The vendor serves a bar for a session in which nothing traded (PARA: 809 of them, every day of 2019-12 to
         2020-12 at 0.206). The bar is stored raw, as served, and counts as NO TRADE: it covers no session in
-        completeness, it is not the newest bar freshness reads, and it is not a holder's first or last real bar in
+        completeness, it is not the newest bar health reads, and it is not a holder's first or last real bar in
         the lineage report. Volume 0 with a trade count above 0, or the reverse, is a real (odd) bar and not a
         placeholder.
 
