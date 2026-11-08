@@ -1,3 +1,5 @@
+from collections.abc import Sequence
+
 from common.errors.vocabulary import ExogenousError, Reason
 
 
@@ -22,3 +24,24 @@ class MissingCredentialsError(ExogenousError):
 
     def __init__(self, detail: str) -> None:
         super().__init__(Reason.VENDOR_AUTH, detail)
+
+
+class MalformedCredentialsError(ExogenousError):
+    """Raised when a configured credential is not non-empty visible ASCII, so it is refused before any request.
+
+    A sibling leaf of MissingCredentialsError, not a subclass: a leaf subclasses exactly one branch directly and
+    nothing subclasses a leaf (ADR tj-fa1rpu D5). Handlers that mean both name both classes.
+
+    The HTTP layer's own rejection of such a value quotes it, which is what this keeps out of the logs. It takes
+    the variable NAMES and builds the sentence itself, so no caller can pass a value in. The sentence always names
+    every variable, whichever failed, and never holds a value, a length, a position or a character.
+
+    Args:
+        variables (Sequence[str]): Names of the credential variables that were checked.
+    """
+
+    def __init__(self, variables: Sequence[str]) -> None:
+        super().__init__(
+            Reason.VENDOR_AUTH,
+            f'Vendor credentials are malformed: {" and ".join(variables)} must each be non-empty visible ASCII',
+        )

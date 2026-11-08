@@ -4,9 +4,10 @@ PR 5 builds the interface, a static provider over today's configured key and the
 account and credential mapping that makes several credentials real is later (tj-grna9p.24, tj-6sdc8j).
 """
 
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Final, Protocol
 
 from common.environment import get_env_var
 from data.ingest.app.scheduler.limits import SchedulerConfigError
@@ -23,6 +24,36 @@ class Credential:
 
     key_id: str
     secret: str = field(repr=False)
+
+
+# Printable ASCII 0x21 to 0x7e: no space, control character or non-ASCII. Matched with fullmatch, so a trailing
+# newline fails.
+_VISIBLE_ASCII: Final = re.compile(r'[\x21-\x7e]+')
+
+
+class CredentialShapeError(ValueError):
+    """A key id or secret is empty or not wholly visible ASCII. Carries no value, no length and no position."""
+
+
+def check_credential_shape(credential: Credential) -> None:
+    """Refuse a key id or secret that is empty or holds a character outside 0x21 to 0x7e.
+
+    A value with a stray CR, LF or space is rejected by the HTTP layer with an error whose text carries the value.
+    Refusing it first keeps the value out of every traceback and log line. Never strips or repairs the value.
+
+    Anything that sends a credential over HTTP calls this first. The scheduler's own provider does not, because the
+    credential it holds only picks a quota and is never sent; when the account mapping (tj-grna9p.24) starts sending
+    provider credentials, the sender must call this predicate.
+
+    Args:
+        credential (Credential): The key to check.
+
+    Raises:
+        CredentialShapeError: If either value is empty or holds a character outside 0x21 to 0x7e. The error has no
+            message and no chained cause.
+    """
+    if not (_VISIBLE_ASCII.fullmatch(credential.key_id) and _VISIBLE_ASCII.fullmatch(credential.secret)):
+        raise CredentialShapeError
 
 
 class CredentialProvider(Protocol):

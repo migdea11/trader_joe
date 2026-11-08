@@ -19,11 +19,12 @@ from common.enums.data_stock import DataSource, Feed, Granularity
 from common.environment import get_env_var
 from common.errors.vocabulary import InvalidRequestError, Reason
 from common.logging import get_logger
-from data.ingest.app.brokers.broker_errors import MissingCredentialsError
+from data.ingest.app.brokers.broker_errors import MalformedCredentialsError, MissingCredentialsError
 from data.ingest.app.brokers.interface import BarsQuery
 from data.ingest.app.brokers.request_key import VendorRequestKey
 from data.ingest.app.brokers.single_flight import SingleFlight
 from data.ingest.app.scheduler import Scheduler
+from data.ingest.app.scheduler.credentials import Credential, CredentialShapeError, check_credential_shape
 
 
 log = get_logger(__name__)
@@ -99,13 +100,20 @@ def get_client() -> StockHistoricalDataClient:
 
     Raises:
         MissingCredentialsError: If either credential variable is unset or empty.
+        MalformedCredentialsError: If either value is not non-empty visible ASCII (0x21 to 0x7e). Raised before the
+            client is built, with no chained cause and no value in the message.
     """
     global __CLIENT
     if __CLIENT is None:
         missing = [name for name in ALPACA_CREDENTIAL_VARS if not get_env_var(name)]
         if missing:
             raise MissingCredentialsError(f'Alpaca credentials are not configured: {", ".join(missing)} unset')
-        __CLIENT = StockHistoricalDataClient(*(get_env_var(name) for name in ALPACA_CREDENTIAL_VARS))
+        key_id, secret = (get_env_var(name) for name in ALPACA_CREDENTIAL_VARS)
+        try:
+            check_credential_shape(Credential(key_id=key_id, secret=secret))
+        except CredentialShapeError:
+            raise MalformedCredentialsError(ALPACA_CREDENTIAL_VARS) from None
+        __CLIENT = StockHistoricalDataClient(key_id, secret)
     return __CLIENT
 
 
@@ -197,6 +205,9 @@ async def fetch_data_type(
         The vendor's response, shared read-only with any caller that attached to this call.
 
     Raises:
+        MissingCredentialsError: If no client was passed and a credential variable is unset or empty.
+        MalformedCredentialsError: If no client was passed and a credential value is not non-empty visible
+            ASCII.
         ExogenousError: With the reason RATE_BUDGET, if query.deadline is set and the scope's limits
             cannot admit the call before it. The call that reaches the vendor is the leader's, so
             the leader's deadline is the one the budget holds it to, and an attached caller shares

@@ -13,7 +13,7 @@ from common.worker_pool import SharedWorkerPool
 from data.ingest.app.brokers.alpaca import broker_api
 from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
 from data.ingest.app.brokers.alpaca.classify import VENDOR_FAILURES, classify_vendor_error
-from data.ingest.app.brokers.broker_errors import MissingCredentialsError
+from data.ingest.app.brokers.broker_errors import MalformedCredentialsError, MissingCredentialsError
 from data.ingest.app.brokers.interface import (
     Bar,
     BarsFailure,
@@ -92,7 +92,7 @@ class AlpacaRead:
                 UNSUPPORTED_INSTRUMENT (BrokerUnsupportedError) for an instrument or adjustment
                 Alpaca cannot serve, FEED_NOT_AVAILABLE for a feed this deployment cannot,
                 RANGE_IN_FUTURE for a start at or after the clock, VENDOR_AUTH for a missing
-                credential or a 401 or 403, VENDOR_INVALID_REQUEST for a 400, VENDOR_REJECTED for
+                or malformed credential or a 401 or 403, VENDOR_INVALID_REQUEST for a 400, VENDOR_REJECTED for
                 another 4xx, VENDOR_RATE_LIMITED for a 429, VENDOR_UNAVAILABLE for a 5xx, a
                 connection error or timeout, or a connection cut while the body was read, and
                 RATE_BUDGET for the rate budget's own refusal.
@@ -153,11 +153,11 @@ class AlpacaRead:
                 )
             )
 
-        # Resolved once, before any task is spawned, so a missing credential fails here with a
+        # Resolved once, before any task is spawned, so a missing or malformed credential fails here with a
         # named variable rather than inside a gathered task.
         try:
             client = self.__client if self.__client is not None else broker_api.get_client()
-        except MissingCredentialsError as e:
+        except (MissingCredentialsError, MalformedCredentialsError) as e:
             return BarsFailure(e)
         params = {
             'symbol_or_symbols': instrument.symbol,
