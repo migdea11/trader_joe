@@ -159,9 +159,48 @@ services:
       # port at all; the dev-only loopback publish lives in docker-compose.override.yaml.
       # start_period is 60s because lifespan blocks on database.initialize() before
       # uvicorn serves a single request.
-      test: ["CMD", "/code/.venv/bin/python", "-c", "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ['APP_INTERNAL_PORT'] + '/ping', timeout=5).read()"]
+      #
+      # TWO HALVES, BOTH MUST PASS (tj-7zjov1.49), the same shape as data_ingest's below. HTTP /ping
+      # first, then the standard grpc.health.v1.Health service on the store's own gRPC server: Check
+      # for service '' (the host's overall status) and Check for StoreService by its full name must
+      # each answer SERVING. /ping alone reports healthy a container whose gRPC listener is dead, and
+      # ingest pushes every result through that listener. The host reports NOT_SERVING from the moment
+      # it begins to stop, and an unregistered name answers NOT_FOUND; both fail the check.
+      #
+      # The gRPC half dials APP_INTERNAL_GRPC_HOST:APP_INTERNAL_GRPC_PORT read from the CONTAINER
+      # environment by os.environ when the check runs, i.e. exactly what the server bound, and NEVER
+      # 127.0.0.1: the server listens on the data-store-grpc alias's ingest_store address only, so a
+      # loopback probe always fails, and the "fix" that makes it pass is a wildcard bind, the false
+      # green common.rpc's no-default, no-wildcard rule exists to stop. This proves the listener
+      # answers on its own interface; that data_ingest reaches it is CI System Testing's Check gRPC
+      # Peer Reach step. The service name is the proto's full name
+      # (trader_joe.proto.internal.store.v1.StoreService, common.rpc.store.SERVICE_NAME), literal here
+      # because the probe imports nothing of ours. grpcio and grpcio-health-checking are in the base
+      # dependency group, so this adds nothing to the image. The sync API, no wait_for_ready: a refused
+      # connection fails at once with UNAVAILABLE.
+      #
+      # TIMINGS. timeout 20s: the three 5s call timeouts plus the interpreter's start and the grpc
+      # import must fit inside it, so a slow failure reports its own error rather than being killed.
+      # start_period stays 60s: the gRPC server is entered at the end of the lifespan, before
+      # uvicorn answers /ping, so the second half adds no startup time.
+      test:
+        - CMD
+        - /code/.venv/bin/python
+        - -c
+        - |
+          import os, sys, urllib.request
+          import grpc
+          from grpc_health.v1 import health_pb2, health_pb2_grpc
+          urllib.request.urlopen('http://127.0.0.1:' + os.environ['APP_INTERNAL_PORT'] + '/ping', timeout=5).read()
+          target = os.environ['APP_INTERNAL_GRPC_HOST'].strip() + ':' + os.environ['APP_INTERNAL_GRPC_PORT'].strip()
+          with grpc.insecure_channel(target) as channel:
+              stub = health_pb2_grpc.HealthStub(channel)
+              for name in ('', 'trader_joe.proto.internal.store.v1.StoreService'):
+                  reply = stub.Check(health_pb2.HealthCheckRequest(service=name), timeout=5)
+                  if reply.status != health_pb2.HealthCheckResponse.SERVING:
+                      sys.exit(f'gRPC health for {name!r} at {target} reads {health_pb2.HealthCheckResponse.ServingStatus.Name(reply.status)}, not SERVING')
       interval: 10s
-      timeout: 10s
+      timeout: 20s
       retries: 6
       start_period: 60s
     depends_on:

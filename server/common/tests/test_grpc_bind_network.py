@@ -361,18 +361,43 @@ STORE_NET, EGRESS_NET, DEVNET = 'trader_joe_ingest_store', 'trader_joe_ingest_eg
 DOCKER_SHIM = '#!/bin/sh\nexec "$STUB_PYTHON" -I "$STUB_IMPL" "$@"\n'
 
 
+# data_store's side (tj-7zjov1.49): the step's second check_bind. data_store sits on ingest_store, where its
+# server binds the data-store-grpc alias, and on store_api and store_db, where it must not.
+STORE_HOST = 'data-store-grpc'
+STORE_PORT = '50052'
+STORE_CONTAINER_ID = '8b71e0'
+DS_INGEST_V4, DS_INGEST_V6 = '172.20.0.4', 'fd00:20::4'
+DS_API_V4, DS_API_V6 = '172.25.0.3', 'fd00:25::3'
+DS_DB_V4 = '172.26.0.2'
+API_NET, DB_NET = 'trader_joe_store_api', 'trader_joe_store_db'
+
+
 def _net(ipv4: str = '', ipv6: str = '') -> dict[str, str]:
     return {'IPAddress': ipv4, 'GlobalIPv6Address': ipv6}
 
 
+def _store_scenario(**changes: object) -> dict:
+    """data_store's facts in a healthy prod-shaped stack: its alias answers with its ingest_store address alone."""
+    scenario = {
+        'container_env': {GRPC_HOST_ENV: STORE_HOST, GRPC_PORT_ENV: STORE_PORT, 'PATH': '/usr/local/bin:/usr/bin:/bin'},
+        'resolves': {STORE_HOST: [DS_INGEST_V4]},
+        'ps_id': STORE_CONTAINER_ID,
+        'exec_fails': False,
+        'networks': {STORE_NET: _net(DS_INGEST_V4), API_NET: _net(DS_API_V4), DB_NET: _net(DS_DB_V4)},
+    }
+    scenario.update(changes)
+    return scenario
+
+
 def _scenario(**changes: object) -> dict:
-    """A healthy prod-shaped stack: the alias answers with data_ingest's ingest_store address alone."""
+    """A healthy prod-shaped stack: each alias answers with its own service's ingest_store address alone."""
     scenario = {
         'container_env': {GRPC_HOST_ENV: HOST, GRPC_PORT_ENV: PORT, 'PATH': '/usr/local/bin:/usr/bin:/bin'},
         'resolves': {HOST: [STORE_V4]},
         'ps_id': CONTAINER_ID,
         'exec_fails': False,
         'networks': {STORE_NET: _net(STORE_V4), EGRESS_NET: _net(EGRESS_V4)},
+        stub.DATA_STORE: _store_scenario(),
     }
     scenario.update(changes)
     return scenario
@@ -450,13 +475,31 @@ _PASSING = {
 
 @pytest.mark.parametrize('scenario', list(_PASSING.values()), ids=list(_PASSING))
 def test_the_bind_check_passes_when_the_name_resolves_to_the_ingest_store_address_alone(tmp_path: Path, scenario: dict):
+    """Re-pinned for tj-7zjov1.49: the same three execs and one inspect, now for each service in turn."""
     result, docker, _ = _run_step(tmp_path, scenario)
     assert result.returncode == 0, _report(result)
-    execs = [call for call in docker if call[:4] == ['compose', '-f', 'docker-compose.yaml', 'exec']]
-    assert len(execs) == 3, f'expected two env reads and one resolution inside {DATA_INGEST}, saw {docker}'
-    assert [docker[-1][0], docker[-1][-1]] == ['inspect', CONTAINER_ID], (
-        f'the last call must inspect {CONTAINER_ID}: {docker}'
+    _assert_checked_both_services(result, docker)
+
+
+def _execs_into(docker: list[list[str]], service: str) -> list[list[str]]:
+    return [call for call in docker if call[:6] == ['compose', '-f', 'docker-compose.yaml', 'exec', '-T', service]]
+
+
+def _assert_checked_both_services(result: subprocess.CompletedProcess, docker: list[list[str]]) -> None:
+    """data_ingest's bind proved first, then data_store's: three execs each, then each one's own inspect."""
+    for service in (DATA_INGEST, stub.DATA_STORE):
+        assert len(_execs_into(docker, service)) == 3, (
+            f'expected two env reads and one resolution inside {service}, saw {docker}'
+        )
+    inspected = [call[-1] for call in docker if call[:1] == ['inspect']]
+    assert inspected == [CONTAINER_ID, STORE_CONTAINER_ID], (
+        f'expected each container inspected once, in order: {docker}'
     )
+    assert [docker[-1][0], docker[-1][-1]] == ['inspect', STORE_CONTAINER_ID], (
+        f'the last call must inspect {STORE_CONTAINER_ID}: {docker}'
+    )
+    for service, host in ((DATA_INGEST, HOST), (stub.DATA_STORE, STORE_HOST)):
+        assert f'gRPC bind name holds: {host} resolves inside {service}' in result.stdout, _report(result)
 
 
 # Each must exit 1: the step's own refusal, never a stub that met a call it does not model (97).
@@ -511,28 +554,175 @@ def test_the_bind_check_fails_on_anything_else_and_prints_both_sides(
     tmp_path: Path, scenario: dict, printed: list[str]
 ):
     """Item 4: a mismatch, a missing variable or a missing fact fails the step; a mismatch prints both sets."""
-    result, _, _ = _run_step(tmp_path, scenario)
+    result, docker, _ = _run_step(tmp_path, scenario)
     assert result.returncode == 1, _report(result)
     assert 'not modelled' not in result.stderr, f'the step made a call the stub does not model:\n{_report(result)}'
     unprinted = [address for address in printed if address not in result.stdout]
     assert not unprinted, f'the step failed without printing {unprinted}:\n{_report(result)}'
+    # tj-7zjov1.49: data_ingest is checked first, and its failure ends the step before data_store's check.
+    assert not _execs_into(docker, stub.DATA_STORE), f'the step went on to data_store after failing: {docker}'
 
 
 def test_the_bind_check_resolves_with_the_call_refuse_wildcard_makes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """The step proves the name the way the server will use it: getaddrinfo with refuse_wildcard's arguments.
 
     Both calls go through the same recording stand-in, so a step that resolved differently (another
-    socktype, a family filter, a port) would compare one lookup's answer with another's.
+    socktype, a family filter, a port) would compare one lookup's answer with another's. Re-pinned for
+    tj-7zjov1.49: one resolution per service, data_ingest's alias then data_store's, each matching the
+    call refuse_wildcard makes for that host.
     """
     result, _, step_calls = _run_step(tmp_path, _scenario())
     assert result.returncode == 0, _report(result)
 
     server_log = tmp_path / 'server-getaddrinfo.log'
-    monkeypatch.setattr(socket, 'getaddrinfo', stub.recording_getaddrinfo({HOST: [STORE_V4]}, str(server_log)))
+    answers = {HOST: [STORE_V4], STORE_HOST: [DS_INGEST_V4]}
+    monkeypatch.setattr(socket, 'getaddrinfo', stub.recording_getaddrinfo(answers, str(server_log)))
     asyncio.run(refuse_wildcard(HOST))
+    asyncio.run(refuse_wildcard(STORE_HOST))
     server_calls = [json.loads(line) for line in server_log.read_text(encoding='utf-8').splitlines()]
-    assert server_calls, 'refuse_wildcard made no getaddrinfo call through the patched socket module'
+    assert [call['host'] for call in server_calls] == [HOST, STORE_HOST], (
+        f'refuse_wildcard made {server_calls} through the patched socket module, not one call per host'
+    )
     assert step_calls == server_calls, f'the step resolves with {step_calls}, refuse_wildcard with {server_calls}'
+
+
+# --- tj-7zjov1.49: the same check for data_store's bind ----------------------------------------------
+
+
+def _store_env_without(name: str) -> dict[str, str]:
+    return {key: value for key, value in _store_scenario()['container_env'].items() if key != name}
+
+
+def _store_env_with(name: str, value: str) -> dict[str, str]:
+    return {**_store_scenario()['container_env'], name: value}
+
+
+def _with_store(**changes: object) -> dict:
+    return _scenario(**{stub.DATA_STORE: _store_scenario(**changes)})
+
+
+_STORE_PASSING = {
+    'prod: the alias answers with the ingest_store address': _with_store(),
+    'dual-stack: both ingest_store families': _with_store(
+        resolves={STORE_HOST: [DS_INGEST_V4, DS_INGEST_V6]},
+        networks={
+            STORE_NET: _net(DS_INGEST_V4, DS_INGEST_V6),
+            API_NET: _net(DS_API_V4, DS_API_V6),
+            DB_NET: _net(DS_DB_V4),
+        },
+    ),
+    'another project prefix (not the checkout directory)': _with_store(
+        networks={
+            'trader_joe_dev_ingest_store': _net(DS_INGEST_V4),
+            'trader_joe_dev_store_api': _net(DS_API_V4),
+            'trader_joe_dev_store_db': _net(DS_DB_V4),
+        }
+    ),
+}
+
+
+@pytest.mark.parametrize('scenario', list(_STORE_PASSING.values()), ids=list(_STORE_PASSING))
+def test_the_store_bind_check_passes_when_its_name_resolves_to_its_ingest_store_address_alone(
+    tmp_path: Path, scenario: dict
+):
+    result, docker, _ = _run_step(tmp_path, scenario)
+    assert result.returncode == 0, _report(result)
+    assert 'not modelled' not in result.stderr, _report(result)
+    _assert_checked_both_services(result, docker)
+
+
+# Each: (scenario, fragments the step's one ::error:: line must carry). Every failure is data_store's,
+# after data_ingest's check has passed, and the error names data_store.
+_STORE_FAILING = {
+    # A mis-bind: the alias answering with an address on another of data_store's networks. The step names
+    # the address AND the network, so the failure reads as the alias on the wrong attachment.
+    'the alias resolves to the store_api address': (
+        _with_store(resolves={STORE_HOST: [DS_API_V4]}),
+        [DS_API_V4, API_NET],
+    ),
+    'the alias resolves to the store_db address': (_with_store(resolves={STORE_HOST: [DS_DB_V4]}), [DS_DB_V4, DB_NET]),
+    'the alias on store_api as well as ingest_store': (
+        _with_store(resolves={STORE_HOST: [DS_INGEST_V4, DS_API_V4]}),
+        [DS_API_V4, API_NET],
+    ),
+    'dual-stack, the alias answers the store_api IPv6 address': (
+        _with_store(
+            resolves={STORE_HOST: [DS_INGEST_V4, DS_INGEST_V6, DS_API_V6]},
+            networks={
+                STORE_NET: _net(DS_INGEST_V4, DS_INGEST_V6),
+                API_NET: _net(DS_API_V4, DS_API_V6),
+                DB_NET: _net(DS_DB_V4),
+            },
+        ),
+        [DS_API_V6, API_NET],
+    ),
+    # A host the server must never bind.
+    'the wildcard 0.0.0.0': (
+        _with_store(container_env=_store_env_with(GRPC_HOST_ENV, '0.0.0.0'), resolves={'0.0.0.0': ['0.0.0.0']}),
+        ['resolves inside data_store to [0.0.0.0]', f'[{DS_INGEST_V4}]'],
+    ),
+    'the IPv6 wildcard ::': (
+        _with_store(container_env=_store_env_with(GRPC_HOST_ENV, '::'), resolves={'::': ['::']}),
+        ['resolves inside data_store to [::]', f'[{DS_INGEST_V4}]'],
+    ),
+    'the name does not resolve': (_with_store(resolves={}), [STORE_HOST, 'does not resolve inside data_store']),
+    # The base file's environment: block not reaching the launch.
+    'host unset': (_with_store(container_env=_store_env_without(GRPC_HOST_ENV)), ["data_store's container"]),
+    'host blank': (_with_store(container_env=_store_env_with(GRPC_HOST_ENV, '   ')), ["data_store's container"]),
+    'port unset': (_with_store(container_env=_store_env_without(GRPC_PORT_ENV)), ["data_store's container"]),
+    'port empty': (_with_store(container_env=_store_env_with(GRPC_PORT_ENV, '')), ["data_store's container"]),
+    # Nothing to compare against, or nothing to read from.
+    'not on any *_ingest_store network': (
+        _with_store(networks={API_NET: _net(DS_API_V4), DB_NET: _net(DS_DB_V4)}),
+        ['data_store on exactly one network named *_ingest_store, found 0'],
+    ),
+    'two *_ingest_store networks': (
+        _with_store(
+            networks={STORE_NET: _net(DS_INGEST_V4), 'other_ingest_store': _net('172.22.0.9'), API_NET: _net(DS_API_V4)}
+        ),
+        ['data_store on exactly one network named *_ingest_store, found 2'],
+    ),
+    'inspect reports no ingest_store address': (
+        _with_store(networks={STORE_NET: _net(), API_NET: _net(DS_API_V4)}),
+        ['no address for data_store on ingest_store'],
+    ),
+    'no data_store container to inspect': (_with_store(ps_id=''), ['no data_store container']),
+}
+
+
+@pytest.mark.parametrize(('scenario', 'fragments'), list(_STORE_FAILING.values()), ids=list(_STORE_FAILING))
+def test_the_store_bind_check_fails_naming_data_store_and_what_it_saw(
+    tmp_path: Path, scenario: dict, fragments: list[str]
+):
+    """A mis-bound alias, a wildcard, an unresolvable name, a missing variable or fact: exit 1, after data_ingest held."""
+    result, docker, _ = _run_step(tmp_path, scenario)
+    assert result.returncode == 1, _report(result)
+    assert 'not modelled' not in result.stderr, f'the step made a call the stub does not model:\n{_report(result)}'
+    assert f'gRPC bind name holds: {HOST} resolves inside {DATA_INGEST}' in result.stdout, (
+        f'data_ingest must be checked, and hold, before data_store:\n{_report(result)}'
+    )
+    errors = [line for line in result.stdout.splitlines() if line.startswith('::error::')]
+    assert len(errors) == 1, _report(result)
+    missing = [fragment for fragment in [*fragments, 'data_store'] if fragment not in errors[0]]
+    assert not missing, f'the ::error:: line does not carry {missing}:\n{_report(result)}'
+    assert _execs_into(docker, stub.DATA_STORE), f'the step never looked inside data_store: {docker}'
+
+
+def test_the_store_bind_check_fails_when_data_store_is_not_running(tmp_path: Path):
+    """No exec into data_store: the step fails (bash -e on the failed read), and never reports the bind as held."""
+    result, _, _ = _run_step(tmp_path, _with_store(exec_fails=True))
+    assert result.returncode == 1, _report(result)
+    assert 'not modelled' not in result.stderr, _report(result)
+    assert f'resolves inside {stub.DATA_STORE}' not in result.stdout, _report(result)
+
+
+def test_the_stub_refuses_a_scenario_that_does_not_describe_data_store(tmp_path: Path):
+    """A scenario with no data_store facts meets UNMODELLED, so no store check passes on a canned answer."""
+    scenario = _scenario()
+    del scenario[stub.DATA_STORE]
+    result, _, _ = _run_step(tmp_path, scenario)
+    assert result.returncode == stub.UNMODELLED, _report(result)
+    assert 'not modelled: data_store, which the scenario does not describe' in result.stderr, _report(result)
 
 
 # The stand-in's own template renderer, checked against output Go's text/template gives for the

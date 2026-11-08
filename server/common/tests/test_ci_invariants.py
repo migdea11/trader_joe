@@ -3647,6 +3647,43 @@ def test_system_job_steps_run_in_order_with_teardown_last():
 
 
 @pytest.mark.build_infra
+@pytest.mark.parametrize('step_name', [GRPC_BIND_STEP, PEER_STEP, LOCKDOWN_STEP])
+def test_the_grpc_steps_keep_every_probe_on_one_logical_line(step_name: str):
+    """tj-7zjov1.49: each gRPC check's inline probe is one quoted word on one logical line.
+
+    Every per-line check in this module (compose spellings, stack-only files, client options) splits a
+    step's logical lines with shlex. A `python -c` probe whose quoted code spans physical lines leaves an
+    unbalanced quote on each of them, so those checks would either raise or judge fragments of code as
+    commands. Each line must split cleanly, each `-c` must be followed by its code on the same line, and
+    that code must carry no newline.
+    """
+    run = _system_step(step_name).get('run') or ''
+    unbalanced = []
+    for line in _step_lines(_system_step(step_name)):
+        try:
+            shlex.split(line, comments=True)
+        except ValueError as error:
+            unbalanced.append(f'{error}: {line[:120]}')
+    assert not unbalanced, f'{step_name} has logical lines shlex cannot split: {unbalanced}'
+    # Most probes sit inside "$(...)", where shlex sees one word, so the -c and its code are found in the
+    # text itself: each `-c` (or the probe variable's assignment) followed, on the same logical line, by
+    # one quoted word -- and bash's single quotes admit no escape, so the first closing quote ends it.
+    folded = run.replace('\\\n', ' ')
+    code_word = r"""('[^']*'|"[^"]*")"""
+    probes = re.findall(r'(?:^|\s)-c\s+' + code_word, folded, re.MULTILINE)
+    probes += re.findall(r'^\s*\w+_code=' + code_word, folded, re.MULTILINE)
+    dangling = [
+        match
+        for match in re.findall(r'(?:^|\s)-c(\s+\S{0,40})', folded, re.MULTILINE)
+        if not re.match(r"""\s+['"]""", match)
+    ]
+    multiline = [code[:120] for code in probes if '\n' in code]
+    assert not dangling, f'{step_name} has a -c whose code is not one quoted word on its line: {dangling}'
+    assert not multiline, f'{step_name} has a multi-line -c probe: {multiline}'
+    assert probes, f'{step_name} runs no -c probe, so this check proves nothing about it'
+
+
+@pytest.mark.build_infra
 @pytest.mark.parametrize('workflow', _workflow_files(), ids=lambda p: p.name)
 def test_no_workflow_runs_a_downgrade(workflow: Path):
     """tj-vhboky.53 (5), user ruling tj-vhboky.47: no workflow downgrades a database.

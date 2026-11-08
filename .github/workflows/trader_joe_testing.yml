@@ -958,58 +958,81 @@ jobs:
           # Both variables must be in the CONTAINER's environment: the base file's environment:
           # block has to reach this fake-overlay launch, as it must every launch. Read with the
           # image's own interpreter (no printenv-is-missing ambiguity); neither value is a secret.
+          #
+          # SECOND HALF (tj-7zjov1.49): the same check for data_store, whose gRPC server (StoreService,
+          # the result path ingest pushes to) binds APP_INTERNAL_GRPC_HOST, the data-store-grpc alias on
+          # its ingest_store attachment only. data_store is also on store_api and store_db, so a name
+          # answering with either address would let the server start cleanly, bound where data_ingest
+          # cannot reach it and where a client container could. The check is one function, run for both
+          # services, so neither can drift from the other.
           container_env() {
-            docker compose -f docker-compose.yaml exec -T data_ingest /code/.venv/bin/python -c \
-              'import os, sys; print(os.environ.get(sys.argv[1], "").strip())' "$1"
+            docker compose -f docker-compose.yaml exec -T "$1" /code/.venv/bin/python -c \
+              'import os, sys; print(os.environ.get(sys.argv[1], "").strip())' "$2"
           }
-          grpc_host="$(container_env APP_INTERNAL_GRPC_HOST)"
-          grpc_port="$(container_env APP_INTERNAL_GRPC_PORT)"
-          echo "data_ingest APP_INTERNAL_GRPC_HOST=${grpc_host:-<unset or empty>} APP_INTERNAL_GRPC_PORT=${grpc_port:-<unset or empty>}"
-          if [ -z "${grpc_host}" ] || [ -z "${grpc_port}" ]; then
-            echo "::error::data_ingest's container environment lacks APP_INTERNAL_GRPC_HOST or APP_INTERNAL_GRPC_PORT; docker-compose.yaml's environment: block did not reach this launch"
-            exit 1
-          fi
+          check_bind() {
+            service="$1"
+            grpc_host="$(container_env "${service}" APP_INTERNAL_GRPC_HOST)"
+            grpc_port="$(container_env "${service}" APP_INTERNAL_GRPC_PORT)"
+            echo "${service} APP_INTERNAL_GRPC_HOST=${grpc_host:-<unset or empty>} APP_INTERNAL_GRPC_PORT=${grpc_port:-<unset or empty>}"
+            if [ -z "${grpc_host}" ] || [ -z "${grpc_port}" ]; then
+              echo "::error::${service}'s container environment lacks APP_INTERNAL_GRPC_HOST or APP_INTERNAL_GRPC_PORT; docker-compose.yaml's environment: block did not reach this launch"
+              exit 1
+            fi
 
-          # The resolution, by the same call common.rpc's refuse_wildcard makes before the server
-          # binds: getaddrinfo(host, None, SOCK_STREAM). One address per line, any IPv6 %zone cut.
-          if ! resolved_raw="$(docker compose -f docker-compose.yaml exec -T data_ingest /code/.venv/bin/python -c \
-              'import socket, sys; print("\n".join(sorted({info[4][0].split("%")[0] for info in socket.getaddrinfo(sys.argv[1], None, type=socket.SOCK_STREAM)})))' \
-              "${grpc_host}")"; then
-            echo "::error::${grpc_host} does not resolve inside data_ingest"
-            exit 1
-          fi
+            # The resolution, by the same call common.rpc's refuse_wildcard makes before the server
+            # binds: getaddrinfo(host, None, SOCK_STREAM). One address per line, any IPv6 %zone cut.
+            if ! resolved_raw="$(docker compose -f docker-compose.yaml exec -T "${service}" /code/.venv/bin/python -c \
+                'import socket, sys; print("\n".join(sorted({info[4][0].split("%")[0] for info in socket.getaddrinfo(sys.argv[1], None, type=socket.SOCK_STREAM)})))' \
+                "${grpc_host}")"; then
+              echo "::error::${grpc_host} does not resolve inside ${service}"
+              exit 1
+            fi
 
-          # data_ingest's own addresses on every network, from the engine rather than from inside the
-          # container, so the expectation does not share the resolver it is checking. The network
-          # whose name ends _ingest_store (the project prefixes it) must be exactly one.
-          container="$(docker compose -f docker-compose.yaml ps -q data_ingest)"
-          if [ -z "${container}" ]; then
-            echo "::error::no data_ingest container to inspect"
-            exit 1
-          fi
-          networks="$(docker inspect --format '{{range $name, $net := .NetworkSettings.Networks}}{{$name}} {{$net.IPAddress}} {{$net.GlobalIPv6Address}}{{println}}{{end}}' "${container}")"
-          echo "data_ingest networks (name, IPv4, IPv6):"
-          printf '%s\n' "${networks}"
-          ingest_store="$(printf '%s\n' "${networks}" | awk '$1 ~ /_ingest_store$/')"
-          matches="$(printf '%s\n' "${ingest_store}" | awk 'NF { n++ } END { print n + 0 }')"
-          if [ "${matches}" -ne 1 ]; then
-            echo "::error::expected data_ingest on exactly one network named *_ingest_store, found ${matches}"
-            exit 1
-          fi
+            # The service's own addresses on every network, from the engine rather than from inside the
+            # container, so the expectation does not share the resolver it is checking. The network
+            # whose name ends _ingest_store (the project prefixes it) must be exactly one.
+            container="$(docker compose -f docker-compose.yaml ps -q "${service}")"
+            if [ -z "${container}" ]; then
+              echo "::error::no ${service} container to inspect"
+              exit 1
+            fi
+            networks="$(docker inspect --format '{{range $name, $net := .NetworkSettings.Networks}}{{$name}} {{$net.IPAddress}} {{$net.GlobalIPv6Address}}{{println}}{{end}}' "${container}")"
+            echo "${service} networks (name, IPv4, IPv6):"
+            printf '%s\n' "${networks}"
+            ingest_store="$(printf '%s\n' "${networks}" | awk '$1 ~ /_ingest_store$/')"
+            matches="$(printf '%s\n' "${ingest_store}" | awk 'NF { n++ } END { print n + 0 }')"
+            if [ "${matches}" -ne 1 ]; then
+              echo "::error::expected ${service} on exactly one network named *_ingest_store, found ${matches}"
+              exit 1
+            fi
 
-          resolved="$(printf '%s\n' "${resolved_raw}" | awk 'NF' | LC_ALL=C sort -u)"
-          expected="$(printf '%s\n' "${ingest_store}" | awk '{ for (i = 2; i <= NF; i++) print $i }' | LC_ALL=C sort -u)"
-          echo "${grpc_host} resolves inside data_ingest to: $(printf '%s' "${resolved}" | tr '\n' ' ')"
-          echo "data_ingest's ingest_store address(es): $(printf '%s' "${expected}" | tr '\n' ' ')"
-          if [ -z "${expected}" ]; then
-            echo "::error::docker inspect reports no address for data_ingest on ingest_store"
-            exit 1
-          fi
-          if [ "${resolved}" != "${expected}" ]; then
-            echo "::error::${grpc_host} resolves inside data_ingest to [$(printf '%s' "${resolved}" | tr '\n' ' ')], not to its ingest_store address(es) [$(printf '%s' "${expected}" | tr '\n' ' ')] alone; report to the architect (ADR tj-q9ae5u addendum 3), never fall back to a wildcard"
-            exit 1
-          fi
-          echo "gRPC bind name holds: ${grpc_host} resolves inside data_ingest to its ingest_store address only (port ${grpc_port})."
+            resolved="$(printf '%s\n' "${resolved_raw}" | awk 'NF' | LC_ALL=C sort -u)"
+            expected="$(printf '%s\n' "${ingest_store}" | awk '{ for (i = 2; i <= NF; i++) print $i }' | LC_ALL=C sort -u)"
+            echo "${grpc_host} resolves inside ${service} to: $(printf '%s' "${resolved}" | tr '\n' ' ')"
+            echo "${service}'s ingest_store address(es): $(printf '%s' "${expected}" | tr '\n' ' ')"
+            if [ -z "${expected}" ]; then
+              echo "::error::docker inspect reports no address for ${service} on ingest_store"
+              exit 1
+            fi
+            # Named first, so a mis-bind reads as what it is: the name answering with the address of
+            # a network that is not ingest_store (store_api or store_db for data_store, ingest_egress
+            # for data_ingest). The equality below would catch it too, with a less direct message.
+            others="$(printf '%s\n' "${networks}" | awk '$1 !~ /_ingest_store$/ { for (i = 2; i <= NF; i++) print $1, $i }')"
+            while read -r other_network other_address; do
+              [ -n "${other_address:-}" ] || continue
+              if grep -qxF -- "${other_address}" <<< "${resolved}"; then
+                echo "::error::${grpc_host} resolves inside ${service} to ${other_address}, its address on ${other_network}, which is not ingest_store; the alias is on the wrong attachment (ADR tj-q9ae5u addendum 3), never fall back to a wildcard"
+                exit 1
+              fi
+            done <<< "${others}"
+            if [ "${resolved}" != "${expected}" ]; then
+              echo "::error::${grpc_host} resolves inside ${service} to [$(printf '%s' "${resolved}" | tr '\n' ' ')], not to its ingest_store address(es) [$(printf '%s' "${expected}" | tr '\n' ' ')] alone; report to the architect (ADR tj-q9ae5u addendum 3), never fall back to a wildcard"
+              exit 1
+            fi
+            echo "gRPC bind name holds: ${grpc_host} resolves inside ${service} to its ingest_store address only (port ${grpc_port})."
+          }
+          check_bind data_ingest
+          check_bind data_store
 
       - name: Check gRPC Peer Reach
         run: |
@@ -1076,6 +1099,46 @@ jobs:
           echo "data_store -> ${out}"
           echo "gRPC peer reach holds: data_store's own DATA_INGEST_GRPC_TARGET is data_ingest's bind ${grpc_host}:${grpc_port} and gets SERVING from its gRPC health."
 
+          # THE REVERSE DIRECTION (tj-7zjov1.49), the result path: data_ingest pushes every attempt to
+          # data_store's StoreService, so the same two proofs run the other way. data_ingest's OWN
+          # DATA_STORE_GRPC_TARGET (what common.rpc.channel.target_from_env hands its delivery client; no
+          # default) must equal what data_store binds, read back from the data_store CONTAINER, and
+          # nothing is dialled on a mismatch. Then data_ingest, which shares only ingest_store with the
+          # store, calls grpc.health.v1 Health.Check for service '' and for StoreService by its full
+          # name (common.rpc.store.SERVICE_NAME) and needs SERVING from both. A call from inside
+          # data_store would succeed on whichever interface the server is bound to; only this one
+          # proves the listener sits on ingest_store. The names are checked with one dial per name, each
+          # with a 10 s deadline and no wait_for_ready; exit 0 only when both read SERVING.
+          # Whether a client on store_api can reach the port is the Check Network Lockdown step's.
+          ingest_env() {
+            docker compose -f docker-compose.yaml exec -T data_ingest /code/.venv/bin/python -c \
+              'import os, sys; print(os.environ.get(sys.argv[1], "").strip())' "$1"
+          }
+          store_grpc_host="$(store_env APP_INTERNAL_GRPC_HOST)"
+          store_grpc_port="$(store_env APP_INTERNAL_GRPC_PORT)"
+          if [ -z "${store_grpc_host}" ] || [ -z "${store_grpc_port}" ]; then
+            echo "::error::data_store's container environment lacks APP_INTERNAL_GRPC_HOST or APP_INTERNAL_GRPC_PORT, so there is nothing to check data_ingest's target against"
+            exit 1
+          fi
+          store_target="$(ingest_env DATA_STORE_GRPC_TARGET)"
+          echo "data_ingest DATA_STORE_GRPC_TARGET=${store_target:-<unset or empty>}; data_store binds ${store_grpc_host}:${store_grpc_port}"
+          if [ -z "${store_target}" ]; then
+            echo "::error::data_ingest's container environment lacks DATA_STORE_GRPC_TARGET; docker-compose.yaml's environment: block did not reach this launch, and data_ingest's delivery client would fail at startup (tj-7zjov1.16)"
+            exit 1
+          fi
+          if [ "${store_target}" != "${store_grpc_host}:${store_grpc_port}" ]; then
+            echo "::error::data_ingest dials DATA_STORE_GRPC_TARGET='${store_target}' but data_store binds '${store_grpc_host}:${store_grpc_port}'; the two must agree. Fix the compose entry or the env file that moved one end; never reconstruct the address here"
+            exit 1
+          fi
+          if ! out="$(docker compose -f docker-compose.yaml exec -T data_ingest /code/.venv/bin/python -c \
+              'import sys, grpc; from grpc_health.v1 import health_pb2 as h, health_pb2_grpc as g; t = sys.argv[1]; c = grpc.insecure_channel(t); rs = [(n, g.HealthStub(c).Check.future(h.HealthCheckRequest(service=n), timeout=10)) for n in sys.argv[2:]]; ss = [(n, f.exception(), f) for n, f in rs]; st = [(n, f"{e.code().name}: {e.details()}" if e else h.HealthCheckResponse.ServingStatus.Name(f.result().status)) for n, e, f in ss]; c.close(); [print(f"{t} service {n!r}: {s}") for n, s in st]; sys.exit(0 if all(s == "SERVING" for n, s in st) else 1)' \
+              "${store_target}" "" "trader_joe.proto.internal.store.v1.StoreService")"; then
+            echo "::error::data_ingest did not get SERVING for both '' and StoreService from data_store's gRPC health over ingest_store at its own DATA_STORE_GRPC_TARGET: ${out:-<no output>}"
+            exit 1
+          fi
+          echo "data_ingest -> ${out}"
+          echo "gRPC peer reach holds: data_ingest's own DATA_STORE_GRPC_TARGET is data_store's bind ${store_grpc_host}:${store_grpc_port} and gets SERVING from its gRPC health, StoreService included."
+
       - name: Check Network Lockdown
         run: |
           set -euo pipefail
@@ -1108,7 +1171,9 @@ jobs:
           fi
           # data-ingest-grpc is the alias data_ingest's gRPC server binds, scoped to ingest_store,
           # which test_client never joins.
-          for name in data_ingest data-ingest-grpc; do
+          # data-store-grpc is the alias data_store's gRPC server binds, scoped to ingest_store too: a
+          # client on store_api, data_store's own API network, must not resolve it (tj-7zjov1.49).
+          for name in data_ingest data-ingest-grpc data-store-grpc; do
             if found="$(lookup "${name}")"; then
               echo "::error::test_client resolved ${name} to ${found}; it must see data_store and Postgres only"
               failed=1
@@ -1201,10 +1266,60 @@ jobs:
             fi
           done
 
+          # data_store's gRPC port is out of test_client's reach too (tj-7zjov1.49), and here the
+          # check has teeth the ingest one lacks: test_client SHARES store_api with data_store, so a
+          # server mis-bound onto its store_api address would be reachable from it. Every address
+          # data_store holds, on every network, is therefore probed from test_client, and each must
+          # fail with the exit-3 convention above: the ingest_store and store_db addresses are on
+          # networks test_client never joins (unreachable), and the store_api address is one the
+          # server must not listen on (refused). First the positive control from data_ingest, which
+          # shares ingest_store: each ingest_store address and the port must accept a connection from
+          # there, or the refusals prove nothing about where the server sits. The port is read from
+          # the data_store container, the value the server bound.
+          store_grpc_port="$(docker compose -f docker-compose.yaml exec -T data_store /code/.venv/bin/python -c \
+            'import os; print(os.environ.get("APP_INTERNAL_GRPC_PORT", "").strip())')"
+          store_container="$(docker compose -f docker-compose.yaml ps -q data_store)"
+          if [ -z "${store_grpc_port}" ] || [ -z "${store_container}" ]; then
+            echo "::error::no data_store container or no APP_INTERNAL_GRPC_PORT in it (port '${store_grpc_port}'), so its gRPC port cannot be probed"
+            exit 1
+          fi
+          store_networks="$(docker inspect --format '{{range $name, $net := .NetworkSettings.Networks}}{{$name}} {{$net.IPAddress}} {{$net.GlobalIPv6Address}}{{println}}{{end}}' "${store_container}")"
+          store_ingest_addresses="$(printf '%s\n' "${store_networks}" | awk '$1 ~ /_ingest_store$/ { for (i = 2; i <= NF; i++) print $i }')"
+          store_all_addresses="$(printf '%s\n' "${store_networks}" | awk '{ for (i = 2; i <= NF; i++) print $i }')"
+          if [ -z "${store_ingest_addresses}" ]; then
+            echo "::error::docker inspect reports no ingest_store address for data_store, so its gRPC port cannot be probed"
+            exit 1
+          fi
+          for address in ${store_ingest_addresses}; do
+            if ! out="$(docker compose -f docker-compose.yaml exec -T data_ingest /code/.venv/bin/python \
+                -c "${connect_code}" "${address}" "${store_grpc_port}")"; then
+              echo "::error::data_ingest could not connect to data_store's gRPC port at ${address}:${store_grpc_port} (${out:-no output}), so a refusal from test_client would prove nothing"
+              failed=1
+            else
+              echo "data_ingest -> data_store gRPC ${address}:${store_grpc_port}: connects, as it must (${out})"
+            fi
+          done
+          for address in ${store_all_addresses}; do
+            if out="$(docker compose -f docker-compose.yaml -f docker-compose.test-client.yaml \
+                run --rm --no-deps -T --pull never --entrypoint /code/.venv/bin/python test_client \
+                -c "${connect_code}" "${address}" "${store_grpc_port}")"; then
+              echo "::error::test_client connected to data_store's gRPC port at ${address}:${store_grpc_port}; only data_ingest, over ingest_store, may reach it"
+              failed=1
+            else
+              status=$?
+              if [ "${status}" -eq 3 ]; then
+                echo "test_client -> data_store gRPC ${address}:${store_grpc_port}: blocked, as it must be (${out})"
+              else
+                echo "::error::test_client data_store gRPC reach probe failed with exit ${status}, not a refused connect (3): ${out}"
+                failed=1
+              fi
+            fi
+          done
+
           if [ "${failed}" -ne 0 ]; then
             exit 1
           fi
-          echo "Network lockdown holds: test_client does not see data_ingest and cannot reach data_ingest's gRPC port; postgres and data_store have no egress."
+          echo "Network lockdown holds: test_client does not see data_ingest and cannot reach either service's gRPC port; postgres and data_store have no egress."
 
       - name: Check Container Env
         run: |
