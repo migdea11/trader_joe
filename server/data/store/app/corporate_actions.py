@@ -7,10 +7,15 @@ is the identity of an observation.
 """
 
 import hashlib
+from datetime import datetime
 
-from data.store.app.database.crud.corporate_action import NewObservation
+from common.logging import get_logger
+from data.store.app.database.crud.corporate_action import NameChange, NewObservation
 from data.store.app.database.crud.ingest_request import IngestRequestRecord
 from schemas.data_ingest.delivery import AttemptDelivery, CorporateActionRecord, CorporateActionRecords
+
+
+log = get_logger(__name__)
 
 
 def payload_hash(raw_payload: bytes) -> str:
@@ -75,3 +80,32 @@ def observations_of(request: IngestRequestRecord, attempt: AttemptDelivery) -> l
         if isinstance(part, CorporateActionRecords)
         for record in part.records
     ]
+
+
+def name_change_clamp(changes: list[NameChange], symbol: str) -> datetime | None:
+    """The process date the first request for a symbol is clamped to, or None when it is not clamped (P51).
+
+    A candidate is a name_change whose old symbol is the symbol: the vendor served an earlier holder of the ticker up
+    to it. A candidate is dropped when a name_change making the symbol a NEW symbol has a STRICTLY later process date:
+    the symbol came back, so its current holder's history starts after the rename away, not at it (META: METV on
+    2022-01-31, then FB to META on 2022-06-09). A record with no process date cannot be placed in time and is ignored
+    on both sides, counted in one WARNING. The answer is the latest remaining candidate's process date.
+
+    Args:
+        changes: The stored name_change records naming the symbol, one per vendor action id.
+        symbol: The requested symbol.
+
+    Returns:
+        datetime | None: The latest remaining process date, or None when no candidate remains.
+    """
+    undated = sum(change.process_date is None for change in changes)
+    if undated:
+        log.warning(f'{undated} name_change record(s) naming a requested symbol carry no process date; ignored')
+    dated = [change for change in changes if change.process_date is not None]
+    arrivals = [change.process_date for change in dated if change.new_symbol == symbol]
+    remaining = [
+        change.process_date
+        for change in dated
+        if change.old_symbol == symbol and not any(arrived > change.process_date for arrived in arrivals)
+    ]
+    return max(remaining) if remaining else None

@@ -82,8 +82,16 @@ async def store_data(
     # THE RUN RECORD IS THE ATTEMPT ROWS the delivery transaction writes, and DatasetChanged (RETIRED or RESUMED on a
     # collect flip, else UPDATED) is published by the intake after that commit: nothing is recorded or published here.
     stored = await store_market_activity_worker(request_path, request_body, db, submit_client)
+    message = 'Data stored'
+    if stored.clamp is not None:
+        # The caller learns the start moved: served_range.start shows it and this names why (no schema change).
+        message = (
+            f'Data stored; the start was moved from {stored.clamp.requested_start.isoformat()} to '
+            f'{stored.clamp.clamped_start.isoformat()} because {stored.clamp.symbol} was renamed on '
+            f'{stored.clamp.process_date.date().isoformat()} and the data before that belongs to an earlier holder'
+        )
     return StoreAssetDatasetResponse(
-        message='Data stored',
+        message=message,
         data_points=stored.data_points,
         # The two instants, copied across the internal/public seam. Spelled out field by field
         # rather than revalidated from the internal model, so adding a member to the internal

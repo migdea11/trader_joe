@@ -923,10 +923,13 @@ def test_a_well_formed_request_reaches_the_handler(address: str, client: TestCli
         return
     if case.submits:
         # The handler ran to the Submit seam: exactly one Submit, for the symbol in the path, and the seam's own
-        # typed answer rendered at the edge. Nothing else produces both (see FakeSubmitClient).
+        # typed answer rendered at the edge. Nothing else produces both (see FakeSubmitClient). Since P51 a POST's
+        # first Submit is the name_change clamp's corporate-actions query, and it FAILS CLOSED: the seam's refusal
+        # fails the POST before any bars request is sent (ADR tj-26jt9w addendum 19 (5)), so the one Submit is it.
         problem(response, status=503, reason='PEER_UNAVAILABLE')
         (submitted,) = SUBMIT_CLIENT.submitted[submitted_before:]
-        assert submitted.bars is not None and submitted.bars.asset_symbol == 'AAPL'
+        assert submitted.bars is None, 'a bars request was sent after the name_change query failed'
+        assert submitted.corporate_actions is not None and submitted.corporate_actions.asset_symbol == 'AAPL'
         return
     assert response.status_code not in UNREACHABLE_STATUSES, (
         f'{method} {url} returned {response.status_code}: the manifest declares this route but the '

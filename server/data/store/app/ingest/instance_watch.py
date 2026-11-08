@@ -27,8 +27,9 @@ KILL SWITCH AND DRY RUN. INSTANCE_WATCH_ENABLED=false (also 0, no, off) stops th
 INSTANCE_WATCH_DRY_RUN=true (also 1, yes, on) probes nothing and re-sends nothing: a pass logs what it would have
 re-sent. Neither is set in any committed file.
 
-BARS AND ASSET-LIST ROWS are both re-sent and re-submitted (an asset-list row left open would keep
-open_asset_list_request_exists true for its list for good); a corporate-actions row is skipped.
+BARS, ASSET-LIST AND CORPORATE-ACTIONS ROWS are all re-sent and re-submitted (an asset-list row left open would keep
+open_asset_list_request_exists true for its list for good; a corporate-actions row is a POST's name_change clamp query,
+and its POST fails closed while it is open). A re-send sends the stored row as it is and never clamps.
 
 ONE PROCESS: like the reaper and the refresh, correct only while data_store runs one worker.
 
@@ -72,8 +73,10 @@ DEFAULT_RESUBMIT_MARGIN_S: Final = 15
 _FALSE: Final = ('false', '0', 'no', 'off')
 _TRUE: Final = ('true', '1', 'yes', 'on')
 
-# The kinds submit_request_of can build; a corporate-actions row is skipped (no store code writes one yet).
-_SENDABLE_KINDS: Final = frozenset({IngestRequestKind.BARS, IngestRequestKind.ASSET_LIST})
+# The kinds submit_request_of can build. A corporate-actions row is the POST's name_change clamp query (P51).
+_SENDABLE_KINDS: Final = frozenset(
+    {IngestRequestKind.BARS, IngestRequestKind.ASSET_LIST, IngestRequestKind.CORPORATE_ACTIONS}
+)
 
 
 def is_enabled() -> bool:
@@ -121,7 +124,7 @@ class WatchResult:
     resent: int = 0
     resubmitted: int = 0
     # Requests the pass found and could not send: a call that failed (left for the next pass), or a row this release
-    # cannot build a request from (a corporate-actions row, or a row missing a field).
+    # cannot build a request from (a row missing a field).
     failed: int = 0
     skipped: int = 0
 

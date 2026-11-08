@@ -7,13 +7,19 @@ count in one write_transaction. There is no update and no delete: a vendor revis
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Final
 
-from sqlalchemy import func
+from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.enums.data_stock import DataSource
 from data.store.app.database.models.corporate_action import CorporateAction
+
+
+NAME_CHANGE: Final = 'name_change'
+OLD_SYMBOL: Final = 'old_symbol'
+NEW_SYMBOL: Final = 'new_symbol'
 
 
 @dataclass(frozen=True)
@@ -83,3 +89,49 @@ async def insert_observations(db: AsyncSession, observations: list[NewObservatio
         )
         written += result.rowcount
     return written
+
+
+@dataclass(frozen=True)
+class NameChange:
+    """One name_change action as last observed: its vendor id, process date and the two symbols it names."""
+
+    vendor_action_id: str
+    process_date: datetime | None
+    old_symbol: str | None
+    new_symbol: str | None
+
+
+async def name_changes_naming(db: AsyncSession, source: DataSource, symbol: str) -> list[NameChange]:
+    """Every stored name_change naming the symbol as its old or its new symbol, from ANY request.
+
+    Reads the newest observation of each vendor action id (by the vendor's answer time, then the store's write time),
+    so a vendor revision replaces the observation it revises. The dedupe stores no new row for an observation already
+    seen, so an action another request delivered first is read here all the same: the request that asked is not a
+    filter. Nothing is written, and the session is left as it was.
+
+    Args:
+        db: The caller's session.
+        source: The data source the actions were delivered for.
+        symbol: The symbol, as the vendor spells it.
+
+    Returns:
+        list[NameChange]: One per vendor action id, in no particular order.
+    """
+    old = CorporateAction.identifiers[OLD_SYMBOL].astext
+    new = CorporateAction.identifiers[NEW_SYMBOL].astext
+    rows = await db.execute(
+        select(CorporateAction.vendor_action_id, CorporateAction.process_date, old, new)
+        .where(
+            CorporateAction.source == source,
+            CorporateAction.action_type == NAME_CHANGE,
+            or_(old == symbol, new == symbol),
+        )
+        .distinct(CorporateAction.vendor_action_id)
+        .order_by(
+            CorporateAction.vendor_action_id,
+            CorporateAction.as_of.desc(),
+            CorporateAction.received_at.desc(),
+            CorporateAction.id.desc(),
+        )
+    )
+    return [NameChange(row[0], row[1], row[2], row[3]) for row in rows.all()]

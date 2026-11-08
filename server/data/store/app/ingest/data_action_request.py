@@ -6,6 +6,8 @@ bars page by page, and committed at its end. That stream is gone from this path.
 delivery_intake.py), which writes it in one transaction before it acknowledges. What is left here is the front half and
 the wait:
 
+    0. (a POST only) the name_change clamp (P51): one corporate-actions request for the symbol, awaited, moves the
+       body's start to the latest rename away from the symbol. See store_market_activity_worker.
     1. refuse an own-overlap (a POST only), before anything is written or sent. One local SELECT.
     2. WRITE THE REQUEST ROW (PENDING) and commit it, BEFORE sending, so a store restart finds what was in flight. The
        row holds everything the first delivered attempt needs to write the dataset entry (owner, window, expiry,
@@ -31,8 +33,8 @@ import math
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from typing import Final
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -44,6 +46,8 @@ from common.errors.vocabulary import ERROR_DOMAIN, REASONS, ExogenousError, Inva
 from common.logging import get_logger
 from common.rpc.clients.ingest_fetch import DEFAULT_FETCH_DEADLINE_S
 from common.rpc.clients.ingest_submit import IngestSubmitClient
+from data.store.app.corporate_actions import name_change_clamp
+from data.store.app.database.crud.corporate_action import name_changes_naming
 from data.store.app.database.crud.ingest_instance import note_instance_seen
 from data.store.app.database.crud.ingest_request import (
     IngestRequestRecord,
@@ -63,8 +67,16 @@ from data.store.app.database.models.ingest_request import (
 )
 from data.store.app.database.models.ingest_run import IngestRunTrigger
 from data.store.app.database.transaction import write_transaction
+from data.store.app.trading_calendar import CALENDAR_START, UnknownCalendarError, calendar_for_source, local_midnight
 from schemas.data_ingest import fetch_dataset
-from schemas.data_ingest.submit import AssetListRequest, AssetListStatus, BarsRequest, SubmitRequest, SubmitResponse
+from schemas.data_ingest.submit import (
+    AssetListRequest,
+    AssetListStatus,
+    BarsRequest,
+    CorporateActionsRequest,
+    SubmitRequest,
+    SubmitResponse,
+)
 from schemas.data_store.asset_dataset_store import StoreAssetDatasetBody, StoreAssetDatasetPath
 
 
@@ -82,6 +94,23 @@ _EXHAUSTED_MESSAGE: Final = 'The request failed on every attempt ingest was allo
 
 
 @dataclass(frozen=True)
+class StartClamp:
+    """The first request's start, moved to the latest rename away from the symbol (P51, ADR tj-26jt9w addendum 19).
+
+    Attributes:
+        symbol: The requested symbol.
+        process_date: The process date of the name_change that gave the symbol up.
+        requested_start: The start the caller asked for.
+        clamped_start: The start the request, the overlap check and the entry carry.
+    """
+
+    symbol: str
+    process_date: datetime
+    requested_start: datetime
+    clamped_start: datetime
+
+
+@dataclass(frozen=True)
 class StoredDataset:
     """What one finished request wrote, and the window it was answered for.
 
@@ -96,6 +125,8 @@ class StoredDataset:
 
     data_points: int
     served_range: fetch_dataset.ServedRange
+    # Set when the POST's start was moved by the name_change clamp (P51); None when it was not.
+    clamp: 'StartClamp | None' = None
 
 
 def verdict_deadline_seconds() -> float:
@@ -199,8 +230,44 @@ def new_asset_list_request(
     )
 
 
+def new_corporate_actions_request(
+    source: DataSource,
+    symbol: str,
+    start: datetime,
+    end: datetime,
+    *,
+    trigger: IngestRunTrigger,
+    client_label: str,
+    ready_by: datetime | None = None,
+) -> NewIngestRequest:
+    """The request row a corporate-actions request is written as, before it is sent (P51).
+
+    Args:
+        source: The data source.
+        symbol: The symbol to ask for.
+        start: The window start, inclusive.
+        end: The window end, exclusive.
+        trigger: What started it (REQUEST for a POST's clamp query).
+        client_label: The row's label: the POST's owner.
+        ready_by: The caller's deadline, or None for none.
+
+    Returns:
+        NewIngestRequest: The row, with its id left for the insert to mint.
+    """
+    return NewIngestRequest(
+        kind=IngestRequestKind.CORPORATE_ACTIONS,
+        source=source,
+        client_label=client_label,
+        asset_symbol=symbol,
+        requested_start=start,
+        requested_end=end,
+        ready_by=ready_by,
+        trigger=trigger,
+    )
+
+
 def submit_request_of(record: IngestRequestRecord, *, recovered: bool = False) -> SubmitRequest:
-    """The Submit a stored request is sent as, with its durable attempt count (bars or an asset list).
+    """The Submit a stored request is sent as, with its durable attempt count (bars, an asset list or corporate actions).
 
     Used for the first send, for the watcher's re-send of a PENDING row and for the recovered re-submission of a
     superseded instance's request, which carries the count the old instance's reports left.
@@ -213,7 +280,7 @@ def submit_request_of(record: IngestRequestRecord, *, recovered: bool = False) -
         SubmitRequest: The domain request.
 
     Raises:
-        ValueError: If the request is neither a bars nor an asset-list request, or the row lacks a field the request needs.
+        ValueError: If the row lacks a field its kind needs.
     """
     if record.kind is IngestRequestKind.ASSET_LIST:
         if record.asset_type is None or record.asset_list_status is None:
@@ -227,6 +294,23 @@ def submit_request_of(record: IngestRequestRecord, *, recovered: bool = False) -
             attempt_count=record.attempts,
             asset_list=AssetListRequest(
                 source=record.source, asset_type=record.asset_type, status=record.asset_list_status
+            ),
+        )
+    if record.kind is IngestRequestKind.CORPORATE_ACTIONS:
+        if record.asset_symbol is None or record.requested_start is None or record.requested_end is None:
+            raise ValueError('the request row does not carry the fields a corporate-actions request needs')
+        return SubmitRequest(
+            request_id=str(record.id),
+            owner=record.client_label,
+            ready_by=record.ready_by,
+            best_effort=record.best_effort,
+            recovered=recovered,
+            attempt_count=record.attempts,
+            corporate_actions=CorporateActionsRequest(
+                source=record.source,
+                asset_symbol=record.asset_symbol,
+                start=record.requested_start,
+                end=record.requested_end,
             ),
         )
     if record.kind is not IngestRequestKind.BARS:
@@ -464,6 +548,63 @@ async def _outcome(db: AsyncSession, record: IngestRequestRecord) -> StoredDatas
     )
 
 
+async def first_request_clamp(
+    path: StoreAssetDatasetPath,
+    body: StoreAssetDatasetBody,
+    db: AsyncSession,
+    client: IngestSubmitClient,
+    *,
+    deadline_s: float,
+) -> tuple[StartClamp | None, uuid.UUID]:
+    """Ask the vendor for the symbol's name_change history, wait for it, and say where the start is clamped to (P51).
+
+    ONE corporate-actions request for the symbol over the widest window (CALENDAR_START to now), so the vendor's date
+    filter cannot exclude a record. It is written and submitted like any request and awaited. The clamp is then read
+    from EVERY stored name_change naming the symbol, whichever request delivered it (name_change_clamp), at the local
+    midnight of the process date in the source's trading calendar (UTC midnight when the source has none), and applies
+    only when it is after the body's start.
+
+    Args:
+        path: The asset and data type.
+        body: What the caller asked for.
+        db: The POST's session.
+        client: The Submit seam, as the interface.
+        deadline_s: How long to wait for the corporate-actions request.
+
+    Returns:
+        tuple[StartClamp | None, uuid.UUID]: The clamp, or None when the start stands, and the query's request id.
+
+    Raises:
+        TraderJoeError: The refusal, the failed call, the request's failure or the deadline: the POST fails closed.
+    """
+    record = await create_request(
+        db,
+        new_corporate_actions_request(
+            body.source,
+            path.asset_symbol,
+            datetime.combine(CALENDAR_START, datetime.min.time(), tzinfo=UTC),
+            datetime.now(UTC),
+            trigger=IngestRunTrigger.REQUEST,
+            client_label=body.owner,
+            ready_by=body.ready_by,
+        ),
+    )
+    await submit_record(record, client)
+    await await_verdict(record.id, deadline_s=deadline_s)
+    async with write_transaction(db, 'read name changes'):
+        changes = await name_changes_naming(db, body.source, path.asset_symbol)
+    process_date = name_change_clamp(changes, path.asset_symbol)
+    if process_date is None:
+        return None, record.id
+    try:
+        clamped = local_midnight(process_date.date(), calendar_for_source(body.source))
+    except UnknownCalendarError:
+        clamped = process_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    if clamped <= body.start:
+        return None, record.id
+    return StartClamp(path.asset_symbol, process_date, body.start, clamped), record.id
+
+
 async def store_market_activity_worker(
     path: StoreAssetDatasetPath,
     body: StoreAssetDatasetBody,
@@ -472,25 +613,61 @@ async def store_market_activity_worker(
     *,
     deadline_s: float | None = None,
 ) -> StoredDataset:
-    """POST /store: write the request, submit it, wait for its verdict.
+    """POST /store: clamp the start, write the bars request, submit it, wait for its verdict.
+
+    THE CLAMP RUNS ON EVERY POST (P51, ADR tj-26jt9w addendum 19), before the own-overlap check and before the bars
+    request row is written: the clamped start replaces the body's start for the overlap key, for requested_start and
+    so for the entry, every re-send and the DAILY refresh floor. A repeat of the same request clamps to the same start
+    and extends the existing entry. The DAILY loop and the watcher never clamp. FAIL CLOSED: a corporate-actions
+    request that fails, expires or misses the deadline fails the POST and no bars request is written. One deadline
+    covers both waits.
 
     Args:
         path: The asset and data type.
         body: What the caller asked for; also the entry's identity fields.
         db: The request's session.
         client: The Submit seam, as the interface.
-        deadline_s: How long to wait for the verdict; None reads the setting.
+        deadline_s: How long to wait in all; None reads the setting.
 
     Returns:
-        StoredDataset: The bars written and the served window of the finishing attempt.
+        StoredDataset: The bars written and the served window of the finishing attempt, and the clamp when one applied.
 
     Raises:
-        OwnOverlapConflict: The entry overlaps one of the same owner's datasets (409 at the edge); nothing is written
-            or sent.
+        InvalidRequestError: INVALID_REQUEST, the whole window belongs to an earlier holder of the symbol (the clamped
+            start is at or after the end); no bars request is written.
+        OwnOverlapConflict: The entry overlaps one of the same owner's datasets (409 at the edge); no bars request is
+            written or sent.
         TraderJoeError: A refused feed, a failed call, the request's failure, or the deadline. Deliberately not caught
             here or in the route (D6).
     """
+    total = verdict_deadline_seconds() if deadline_s is None else deadline_s
+    began = time.monotonic()
+    clamp, query_id = await first_request_clamp(path, body, db, client, deadline_s=total)
+    clamped_body = body
+    if clamp is not None:
+        if body.end is not None and clamp.clamped_start >= body.end:
+            raise InvalidRequestError(
+                Reason.INVALID_REQUEST,
+                f'The whole requested window belongs to an earlier holder of {path.asset_symbol}: '
+                f'it was renamed on {clamp.process_date.date().isoformat()}, so its own history starts then.',
+            )
+        clamped_body = body.model_copy(update={'start': clamp.clamped_start})
+    if total - (time.monotonic() - began) <= 0:
+        raise ExogenousError(Reason.DEADLINE, 'The request did not finish within the fetch deadline.')
     record = await submit_bars(
-        path, body, db, client, trigger=IngestRunTrigger.REQUEST, client_label=body.owner, ready_by=body.ready_by
+        path,
+        clamped_body,
+        db,
+        client,
+        trigger=IngestRunTrigger.REQUEST,
+        client_label=body.owner,
+        ready_by=body.ready_by,
     )
-    return await await_verdict(record.id, deadline_s=deadline_s)
+    if clamp is not None:
+        log.info(
+            f'The start of a first request for {clamp.symbol} was clamped from {clamp.requested_start.isoformat()} '
+            f'to {clamp.clamped_start.isoformat()} (renamed {clamp.process_date.date().isoformat()}); '
+            f'name_change request {query_id}, bars request {record.id}'
+        )
+    stored = await await_verdict(record.id, deadline_s=total - (time.monotonic() - began))
+    return replace(stored, clamp=clamp)

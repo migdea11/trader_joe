@@ -18,6 +18,11 @@ attempt row in one transaction. A fake session cannot answer that, so this harne
 
 The waiter polls every millisecond here (STORE_VERDICT_POLL_SECONDS); a script with no delivery shortens the
 deadline (STORE_VERDICT_DEADLINE_SECONDS) so the deadline answer is reached without waiting five minutes.
+
+SINCE P51 (tj-7zjov1.146, ADR tj-26jt9w addendum 19) every POST first writes, submits and awaits one corporate-actions
+request (the name_change clamp's query). The double answers it with an empty success unless told otherwise
+(QueryAnswer), records it apart from the bars (SubmitDouble.queries, journal 'submit corporate_actions'), and the
+clamp's Postgres-only read is answered from PostStore.book (name_change_doubles.py).
 """
 
 import asyncio
@@ -41,13 +46,14 @@ from sqlalchemy.pool import NullPool
 from common.enums.data_stock import Feed
 from data.store.app.app_depends import get_ingest_submit_client
 from data.store.app.database.database import async_db
-from data.store.app.database.models.ingest_request import IngestRequest
+from data.store.app.database.models.ingest_request import IngestRequest, IngestRequestKind
 from data.store.app.database.models.ingest_run import IngestRun
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.ingest import data_action_request, delivery_intake
 from data.store.app.main import app
 from data.store.tests.delivery_reports import INSTANCE_A, report, stats, with_trailer
+from data.store.tests.name_change_doubles import NameChangeBook, install_book
 from data.store.tests.request_tables import create_request_tables
 from data.store.tests.test_ui_datasets_route import _sqlite_timezone
 from routers.common.instance_secret import INSTANCE_SECRET_ENV_VAR, INSTANCE_SECRET_HEADER
@@ -100,10 +106,22 @@ class PostStore:
         self.entry_id = uuid.uuid4()
         self.stored_collect: bool | None = None
         self.intake = delivery_intake.DeliveryIntake(chunk_size=100)
+        # The stored name_change records the POST's clamp reads (P51); set by the fixture, empty by default.
+        self.book: NameChangeBook = NameChangeBook()
 
     async def requests(self) -> list[IngestRequest]:
+        """Every request row, of every kind (since P51 a POST writes a corporate-actions row before its bars row)."""
         async with AsyncSession(self.engine, expire_on_commit=False) as db:
             return list((await db.execute(select(IngestRequest))).scalars())
+
+    async def bars_requests(self) -> list[IngestRequest]:
+        return [row for row in await self.requests() if IngestRequestKind(row.kind) is IngestRequestKind.BARS]
+
+    async def query_requests(self) -> list[IngestRequest]:
+        """The corporate-actions rows: one per POST, the name_change clamp's query."""
+        return [
+            row for row in await self.requests() if IngestRequestKind(row.kind) is IngestRequestKind.CORPORATE_ACTIONS
+        ]
 
     async def runs(self) -> list[IngestRun]:
         async with AsyncSession(self.engine, expire_on_commit=False) as db:
@@ -120,15 +138,40 @@ class PostStore:
             yield db
 
 
+@dataclass
+class QueryAnswer:
+    """What ingest reports for the POST's corporate-actions query (P51): by default a success carrying no record.
+
+    The records themselves never travel here: the clamp reads the store (PostStore.book), because the dedupe stores no
+    new row for an observation already seen and the read is never limited to this POST's request.
+
+    Attributes:
+        outcome: SUCCEEDED, FAILED, EXPIRED or EXHAUSTED.
+        error_class: TRANSIENT or PERMANENT, for FAILED.
+        last_attempt: For FAILED: ingest will not try again.
+    """
+
+    outcome: DeliveryOutcome = DeliveryOutcome.SUCCEEDED
+    error_class: DeliveryErrorClass = DeliveryErrorClass.TRANSIENT
+    last_attempt: bool = False
+
+
 class SubmitDouble:
     """The Submit seam's double: records each Submit, answers it, then delivers the scripted attempt.
 
+    SINCE P51 A POST SENDS TWO REQUESTS: first the corporate-actions query of the name_change clamp, then the bars. The
+    two are kept apart so each pin reads the one it is about: `submitted` holds the BARS Submits (what every pin
+    before P51 read), `queries` the corporate-actions ones. delivery, raises and refused script the BARS request;
+    query, query_raises script the query, which by default is accepted and answered with an empty success.
+
     Args:
         store: The world the delivery is written into.
-        delivery: What ingest reports after accepting; None delivers nothing (the request stays open).
-        raises: The call fails with this instead of answering (nothing is delivered).
-        refused: Ingest answers with this refusal instead of accepting (nothing is delivered).
+        delivery: What ingest reports after accepting the bars; None delivers nothing (the request stays open).
+        raises: The bars call fails with this instead of answering (nothing is delivered).
+        refused: Ingest answers the bars with this refusal instead of accepting (nothing is delivered).
         instance_id: The answering instance.
+        query: What ingest reports for the corporate-actions query; None delivers nothing (the query stays open).
+        query_raises: The query's call fails with this instead of answering.
     """
 
     def __init__(
@@ -139,24 +182,31 @@ class SubmitDouble:
         raises: BaseException | None = None,
         refused: fetch_dataset.FetchRefused | None = None,
         instance_id: str = INSTANCE_A,
+        query: QueryAnswer | None = QueryAnswer(),  # noqa: B008 (frozen-by-convention default: never mutated)
+        query_raises: BaseException | None = None,
     ) -> None:
         self.store = store
         self.delivery = Delivery() if delivery is None and raises is None and refused is None else delivery
         self.raises = raises
         self.refused = refused
         self.instance_id = instance_id
+        self.query = query
+        self.query_raises = query_raises
         self.submitted: list[SubmitRequest] = []
+        self.queries: list[SubmitRequest] = []
         self.delivered: list[Any] = []
         self._tasks: list[asyncio.Task] = []
 
     @classmethod
     def silent(cls, store: PostStore) -> 'SubmitDouble':
-        """A double that accepts and never delivers: the request stays QUEUED."""
+        """A double that accepts the bars and never delivers them: the bars request stays QUEUED. The query is answered."""
         double = cls(store)
         double.delivery = None
         return double
 
     async def submit(self, request: SubmitRequest) -> SubmitResponse:
+        if request.corporate_actions is not None:
+            return await self._query(request)
         self.submitted.append(request)
         self.store.journal.append('submit')
         if self.raises is not None:
@@ -170,6 +220,35 @@ class SubmitDouble:
 
     async def instance(self) -> Any:
         raise AssertionError('the POST never probes the instance')
+
+    async def _query(self, request: SubmitRequest) -> SubmitResponse:
+        self.queries.append(request)
+        self.store.journal.append('submit corporate_actions')
+        if self.query_raises is not None:
+            raise self.query_raises
+        if self.query is not None:
+            self._tasks.append(asyncio.get_running_loop().create_task(self._answer(request, self.query)))
+        accepted = SubmitAccepted(feed=None, quota_key='quota-key')
+        return SubmitResponse(ack=SubmitAck(accepted=accepted), instance_id=self.instance_id)
+
+    async def _answer(self, request: SubmitRequest, answer: QueryAnswer) -> None:
+        await asyncio.sleep(0)
+        kind = IngestRequestKind.CORPORATE_ACTIONS
+        if answer.outcome is DeliveryOutcome.SUCCEEDED:
+            attempt = report(request.request_id, kind=kind, parts=[])
+            window = fetch_dataset.ServedRange(start=request.corporate_actions.start, end=request.corporate_actions.end)
+            attempt = with_trailer(attempt, served_range=window)
+        elif answer.outcome is DeliveryOutcome.FAILED:
+            attempt = report(
+                request.request_id,
+                DeliveryOutcome.FAILED,
+                kind=kind,
+                error_class=answer.error_class,
+                last_attempt=answer.last_attempt,
+            )
+        else:
+            attempt = report(request.request_id, answer.outcome, kind=kind)
+        self.delivered.append(await self.store.intake.deliver(attempt))
 
     async def _deliver(self, request: SubmitRequest, delivery: Delivery) -> None:
         await asyncio.sleep(0)
@@ -264,6 +343,8 @@ async def post_store(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(data_action_request, 'own_session', store.session)
     monkeypatch.setattr(delivery_intake, 'own_session', store.session)
+    # The clamp's read is Postgres-only (JSONB, DISTINCT ON): the book answers it (name_change_doubles.py).
+    store.book = install_book(monkeypatch)
 
     def publish(event_: Any) -> None:
         # On the journal too, so a test can read that an event followed the commit that wrote what it announces.

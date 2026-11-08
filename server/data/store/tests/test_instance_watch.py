@@ -7,7 +7,8 @@ from the supersession, and reads the attempt count UNDER THE REQUEST LOCK), note
 instance is treated exactly like NOT_DELIVERED), ADR tj-26jt9w addenda 5 and 9, and the store CLAUDE.md watcher line
 and environment table (INSTANCE_WATCH_ENABLED true, INSTANCE_WATCH_DRY_RUN false, interval 15, PENDING after 30,
 margin 15). Since P17f (tj-7zjov1.164, ADR tj-26jt9w addendum 18 g) ASSET_LIST rows are re-sent and re-submitted
-exactly as BARS rows are, and a CORPORATE_ACTIONS row is skipped before the sender is called.
+exactly as BARS rows are. Since P51 (tj-7zjov1.146, ADR tj-26jt9w addendum 19 (7)) CORPORATE_ACTIONS rows are too: a
+POST's name_change query is re-sent and re-submitted as stored, and a re-send never clamps and never queries.
 
 The clock is injected (InstanceWatcher(clock=)), so every age is set relative to NOW on the rows themselves. The two
 Postgres races (the old instance's late report against the new instance's count, and a request QUEUED under an
@@ -47,6 +48,7 @@ from data.store.app.ingest.instance_watch import (
     start_instance_watch_loop,
     stop_instance_watch_loop,
 )
+from data.store.tests.name_change_doubles import actions_answer, name_change, vendor_date
 from data.store.tests.request_path_harness import INSTANCE_A, INSTANCE_B, START, FakeSubmit, Harness, make_engine
 from schemas.data_ingest.delivery import (
     AssetRecord,
@@ -64,6 +66,9 @@ from schemas.data_ingest.submit import AssetListStatus
 pytestmark = [pytest.mark.data_store, pytest.mark.asyncio]
 
 NOW = datetime(2026, 3, 2, 15, tzinfo=UTC)
+# A name_change query's window as the POST writes it: the calendar's first day to the POST's now.
+QUERY_START = datetime(1990, 1, 1, tzinfo=UTC)
+QUERY_END = NOW - timedelta(minutes=2)
 WATCH_ENVS = (ENABLED_ENV, DRY_RUN_ENV, INTERVAL_ENV, PENDING_RESEND_AFTER_ENV, RESUBMIT_MARGIN_ENV)
 
 
@@ -105,7 +110,8 @@ async def _request(
         # An asset-list row names its list (the table's CHECK since tj-7zjov1.30), as new_asset_list_request writes it.
         else {'asset_type': AssetType.STOCK, 'asset_list_status': AssetListStatus.INACTIVE}
         if kind is IngestRequestKind.ASSET_LIST
-        else {}
+        # A corporate-actions row is a POST's name_change query (P51), as new_corporate_actions_request writes it.
+        else {'asset_symbol': 'FB', 'requested_start': QUERY_START, 'requested_end': QUERY_END}
     )
     async with AsyncSession(harness.engine, expire_on_commit=False) as db:
         record = await request_crud.create_request(
@@ -250,9 +256,13 @@ async def test_a_pending_re_send_that_fails_leaves_the_request_pending_for_the_n
     assert (await harness.request_row(request_id)).state is IngestRequestState.PENDING
 
 
-async def test_a_pending_request_of_another_kind_or_missing_a_field_is_skipped_never_sent(harness):
-    """Corporate actions are not sent by this path; an asset list is since P17 (the test below)."""
-    await _request(harness, IngestRequestState.PENDING, age_s=60, kind=IngestRequestKind.CORPORATE_ACTIONS)
+async def test_a_pending_request_missing_a_field_is_skipped_never_sent(harness):
+    """A bars row missing its granularity and a corporate-actions row missing its symbol: skipped, never sent.
+
+    Since P51 a corporate-actions row IS sent (the tests below); one that cannot be built is skipped like any other.
+    """
+    actions = await _request(harness, IngestRequestState.PENDING, age_s=60, kind=IngestRequestKind.CORPORATE_ACTIONS)
+    await harness.set_request(actions, asset_symbol=None)
     broken = await _request(harness, IngestRequestState.PENDING, age_s=60)
     await harness.set_request(broken, granularity=None)
     client = FakeSubmit(INSTANCE_B)
@@ -291,13 +301,12 @@ async def test_a_pending_asset_list_request_is_re_sent_with_its_own_list(harness
     assert (await harness.request_row(young)).state is IngestRequestState.PENDING, 'its own caller is still submitting'
 
 
-async def test_one_pending_pass_sends_bars_and_asset_lists_and_never_offers_corporate_actions_to_the_sender(
-    harness, monkeypatch
-):
-    """BARS and ASSET_LIST are sent; a CORPORATE_ACTIONS row is skipped BEFORE the sender is called (P17f (3)).
+async def test_one_pending_pass_sends_bars_asset_lists_and_corporate_actions(harness, monkeypatch):
+    """All three kinds are sent (P51, ADR tj-26jt9w addendum 19 (7): a POST's name_change query is re-sent too).
 
-    The sender would refuse it with ValueError too, so the counts alone cannot tell a skipped kind from a refused one:
-    the spy on submit_record is what pins the kind check.
+    Before P51 a CORPORATE_ACTIONS row was skipped before the sender; now it is offered, sent as stored (its window
+    unchanged, not recovered) and QUEUED under the answering instance, so a stuck query is delivered and stored raw
+    even after its POST failed closed.
     """
     bars = await _request(harness, IngestRequestState.PENDING, age_s=60)
     asset_list = await _request(harness, IngestRequestState.PENDING, age_s=60, kind=IngestRequestKind.ASSET_LIST)
@@ -314,10 +323,72 @@ async def test_one_pending_pass_sends_bars_and_asset_lists_and_never_offers_corp
 
     result = await _watcher(client).run_pass()
 
-    assert result == WatchResult(resent=2, skipped=1)
-    assert sorted(offered) == sorted([IngestRequestKind.BARS, IngestRequestKind.ASSET_LIST])
-    assert {sent.request_id for sent in client.sent} == {str(bars), str(asset_list)}
-    assert (await harness.request_row(actions)).state is IngestRequestState.PENDING
+    assert result == WatchResult(resent=3)
+    assert sorted(offered) == sorted(
+        [IngestRequestKind.BARS, IngestRequestKind.ASSET_LIST, IngestRequestKind.CORPORATE_ACTIONS]
+    )
+    assert {sent.request_id for sent in client.sent} == {str(bars), str(asset_list), str(actions)}
+    (query,) = [sent for sent in client.sent if sent.request_id == str(actions)]
+    assert (query.corporate_actions.asset_symbol, query.corporate_actions.start, query.corporate_actions.end) == (
+        'FB',
+        QUERY_START,
+        QUERY_END,
+    ), 'the query was not re-sent as stored'
+    assert (query.recovered, query.attempt_count) == (False, 0)
+    row = await harness.request_row(actions)
+    assert (row.state, row.instance_id) == (IngestRequestState.QUEUED, INSTANCE_B)
+
+
+async def test_a_watcher_re_send_never_clamps_and_never_queries(harness):
+    """Addendum 19 (1): every re-send sends the row as stored. The clamp ran once, at the POST, into requested_start.
+
+    A bars row for a symbol the store holds a name_change for (FB renamed away on 2022-06-09) is re-sent with its
+    stored start: the watcher reads no name_change and writes no corporate-actions request.
+    """
+    harness.book.changes = [name_change('fb-meta', 'FB', 'META', vendor_date(2022, 6, 9))]
+    early = datetime(2015, 1, 2, tzinfo=UTC)
+    request_id = await _request(harness, IngestRequestState.PENDING, age_s=60, asset_symbol='FB', requested_start=early)
+    client = FakeSubmit(INSTANCE_B)
+
+    result = await _watcher(client).run_pass()
+
+    assert result == WatchResult(resent=1)
+    (sent,) = client.sent
+    assert (sent.request_id, sent.bars.asset_symbol, sent.bars.start) == (str(request_id), 'FB', early)
+    assert harness.book.calls == [], 'the watcher read name_change records'
+    assert await harness.query_requests() == [], 'the watcher wrote a corporate-actions request'
+
+
+@pytest.mark.parametrize('stuck', ['pending', 'abandoned'])
+async def test_a_stuck_query_once_sent_again_and_delivered_is_finished(harness, stuck):
+    """The point of re-sending the query (addendum 19 (7)): its answer is delivered and stored, the row closes.
+
+    A query left PENDING (its POST's Submit failed) or abandoned on a superseded instance is sent again; ingest's
+    report then finishes it through the intake like any request. Before P51 such a row stayed open for good.
+    """
+    if stuck == 'pending':
+        request_id = await _request(
+            harness, IngestRequestState.PENDING, age_s=60, kind=IngestRequestKind.CORPORATE_ACTIONS
+        )
+    else:
+        await _superseded(harness, seconds_ago=90)
+        request_id = await _request(
+            harness, IngestRequestState.NOT_DELIVERED, holder=INSTANCE_A, kind=IngestRequestKind.CORPORATE_ACTIONS
+        )
+    client = FakeSubmit(INSTANCE_B)
+
+    await _watcher(client).run_pass()
+    (sent,) = client.sent
+    assert sent.recovered is (stuck == 'abandoned')
+    attempt_no = 1
+    answer = actions_answer(sent.request_id, instance_id=INSTANCE_B, attempt_no=attempt_no)
+    response = await harness.deliver(answer)
+
+    assert response.verdict is DeliveryVerdict.FINAL
+    row = await harness.request_row(request_id)
+    assert row.state is IngestRequestState.EMPTY, 'the re-sent query, answered with no record, did not finish'
+    (run,) = await harness.runs(request_id)
+    assert run.asset_symbol == 'FB'
 
 
 async def test_a_pending_asset_list_re_send_that_fails_leaves_it_pending_for_the_next_pass(harness):
@@ -447,11 +518,33 @@ async def test_a_re_submission_that_fails_leaves_the_request_not_delivered_for_t
     assert (await harness.request_row(request_id)).state is IngestRequestState.NOT_DELIVERED
 
 
-async def test_an_abandoned_request_of_another_kind_is_skipped(harness):
+@pytest.mark.parametrize('state', [IngestRequestState.NOT_DELIVERED, IngestRequestState.QUEUED])
+async def test_an_abandoned_corporate_actions_request_is_re_submitted_recovered_as_stored(harness, state):
+    """Addendum 19 (7): an abandoned name_change query is re-submitted RECOVERED with its count and its own window."""
     await _superseded(harness, seconds_ago=90)
-    await _request(
+    request_id = await _request(harness, state, holder=INSTANCE_A, kind=IngestRequestKind.CORPORATE_ACTIONS, attempts=2)
+    client = FakeSubmit(INSTANCE_B)
+
+    result = await _watcher(client).run_pass()
+
+    assert result == WatchResult(resubmitted=1)
+    (sent,) = client.sent
+    assert (sent.request_id, sent.recovered, sent.attempt_count) == (str(request_id), True, 2)
+    assert (sent.corporate_actions.asset_symbol, sent.corporate_actions.start, sent.corporate_actions.end) == (
+        'FB',
+        QUERY_START,
+        QUERY_END,
+    )
+    row = await harness.request_row(request_id)
+    assert (row.state, row.instance_id, row.attempts) == (IngestRequestState.QUEUED, INSTANCE_B, 2)
+
+
+async def test_an_abandoned_corporate_actions_request_missing_a_field_is_skipped(harness):
+    await _superseded(harness, seconds_ago=90)
+    request_id = await _request(
         harness, IngestRequestState.NOT_DELIVERED, holder=INSTANCE_A, kind=IngestRequestKind.CORPORATE_ACTIONS
     )
+    await harness.set_request(request_id, requested_end=None)
     client = FakeSubmit(INSTANCE_B)
 
     result = await _watcher(client).run_pass()
@@ -492,16 +585,18 @@ async def test_an_abandoned_asset_list_request_is_not_re_submitted_before_the_de
     assert (await harness.request_row(request_id)).state is state
 
 
-async def test_one_abandoned_pass_re_submits_bars_and_asset_lists_and_never_offers_corporate_actions(
-    harness, monkeypatch
-):
+async def test_one_abandoned_pass_re_submits_bars_asset_lists_and_corporate_actions(harness, monkeypatch):
     await _superseded(harness, seconds_ago=90)
     bars = await _request(harness, IngestRequestState.NOT_DELIVERED, holder=INSTANCE_A, attempts=1)
     asset_list = await _request(
         harness, IngestRequestState.NOT_DELIVERED, holder=INSTANCE_A, kind=IngestRequestKind.ASSET_LIST, attempts=2
     )
-    await _request(
-        harness, IngestRequestState.NOT_DELIVERED, holder=INSTANCE_A, kind=IngestRequestKind.CORPORATE_ACTIONS
+    actions = await _request(
+        harness,
+        IngestRequestState.NOT_DELIVERED,
+        holder=INSTANCE_A,
+        kind=IngestRequestKind.CORPORATE_ACTIONS,
+        attempts=3,
     )
     offered: list[tuple[IngestRequestKind, bool]] = []
     real_submit = instance_watch.submit_record
@@ -515,11 +610,18 @@ async def test_one_abandoned_pass_re_submits_bars_and_asset_lists_and_never_offe
 
     result = await _watcher(client).run_pass()
 
-    assert result == WatchResult(resubmitted=2, skipped=1)
-    assert sorted(offered) == sorted([(IngestRequestKind.BARS, True), (IngestRequestKind.ASSET_LIST, True)])
+    assert result == WatchResult(resubmitted=3)
+    assert sorted(offered) == sorted(
+        [
+            (IngestRequestKind.BARS, True),
+            (IngestRequestKind.ASSET_LIST, True),
+            (IngestRequestKind.CORPORATE_ACTIONS, True),
+        ]
+    )
     assert {(sent.request_id, sent.recovered, sent.attempt_count) for sent in client.sent} == {
         (str(bars), True, 1),
         (str(asset_list), True, 2),
+        (str(actions), True, 3),
     }
 
 

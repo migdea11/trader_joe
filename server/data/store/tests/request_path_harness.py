@@ -34,11 +34,12 @@ from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from common.errors.vocabulary import ERROR_DOMAIN
 from data.store.app.database.models.ingest_instance import IngestInstance
-from data.store.app.database.models.ingest_request import IngestRequest
+from data.store.app.database.models.ingest_request import IngestRequest, IngestRequestKind
 from data.store.app.database.models.ingest_run import IngestRun
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.ingest import data_action_request, delivery_intake, instance_watch
 from data.store.app.ingest.delivery_intake import DeliveryIntake
+from data.store.tests.name_change_doubles import install_book
 from schemas.data_ingest.delivery import DeliverAttemptResponse, RegisterInstanceRequest
 from schemas.data_ingest.fetch_dataset import FetchRefused
 from schemas.data_ingest.submit import InstanceResponse, SubmitAccepted, SubmitAck, SubmitRequest, SubmitResponse
@@ -65,8 +66,26 @@ INSTANCE_B = 'instance-b'
 
 
 def patch_aware_sqlite_datetimes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Read a timezone=True column back UTC-aware, as asyncpg reads timestamptz."""
+    """Store a timezone=True column as its UTC instant and read it back UTC-aware, as Postgres does timestamptz.
+
+    The bind half (added with P51): the name_change clamp writes requested_start at the local midnight of the source's
+    calendar (2022-06-09 00:00-04:00), and without it SQLite would store that wall clock and read it back four hours
+    early, an error Postgres cannot make. A UTC value is stored as before.
+    """
     original = DATETIME.result_processor
+    original_bind = DATETIME.bind_processor
+
+    def bind_processor(self, dialect):
+        process = original_bind(self, dialect)
+        if not self.timezone:
+            return process
+
+        def as_utc(value):
+            if isinstance(value, datetime) and value.utcoffset() is not None:
+                value = value.astimezone(UTC)
+            return process(value) if process else value
+
+        return as_utc
 
     def result_processor(self, dialect, coltype):
         process = original(self, dialect, coltype)
@@ -80,6 +99,7 @@ def patch_aware_sqlite_datetimes(monkeypatch: pytest.MonkeyPatch) -> None:
         return aware
 
     monkeypatch.setattr(DATETIME, 'result_processor', result_processor)
+    monkeypatch.setattr(DATETIME, 'bind_processor', bind_processor)
 
 
 async def make_engine(monkeypatch: pytest.MonkeyPatch) -> AsyncEngine:
@@ -177,6 +197,8 @@ class Harness:
         monkeypatch.setattr(delivery_intake, 'upsert_entry_in_transaction', upsert_entry)
         self.intake = DeliveryIntake(chunk_size=10)
         self.session = own_session
+        # The POST's name_change read (P51) is Postgres-only; the book answers it here (name_change_doubles.py).
+        self.book = install_book(monkeypatch)
 
     # ------------------------------------------------------------------ the intake
 
@@ -232,6 +254,13 @@ class Harness:
     async def requests(self) -> list[sa.Row]:
         async with AsyncSession(self.engine) as db:
             return list((await db.execute(sa.select(REQUESTS).order_by(REQUESTS.c.created_at))).all())
+
+    async def bars_requests(self) -> list[sa.Row]:
+        return [row for row in await self.requests() if row.kind is IngestRequestKind.BARS]
+
+    async def query_requests(self) -> list[sa.Row]:
+        """The corporate-actions rows: since P51 one per POST, the name_change clamp's query."""
+        return [row for row in await self.requests() if row.kind is IngestRequestKind.CORPORATE_ACTIONS]
 
     async def runs(self, request_id: uuid.UUID) -> list[sa.Row]:
         async with AsyncSession(self.engine) as db:

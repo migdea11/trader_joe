@@ -24,6 +24,7 @@ test_migration_with_data.py and tests/system/test_migration_downgrade.py, Postgr
 
 import ast
 import importlib.util
+import inspect
 import re
 import subprocess
 import sys
@@ -278,10 +279,14 @@ async def test_the_insert_names_the_dedupe_index_and_does_nothing_on_a_repeat_ne
 def test_the_repository_has_no_update_or_delete_path():
     """The model's docstring: never updated or deleted.
 
-    The repository's public surface is the one insert, and no statement in it is an update, a delete or raw text.
+    The repository's public surface is the one insert and, since P51 (tj-7zjov1.146), the one READ of the clamp
+    (name_changes_naming and the NameChange it returns); no statement in it is an update, a delete or raw text, and
+    the read builds a SELECT and nothing else (test_name_change_clamp.py compiles it in full).
     """
     public = {name for name, value in vars(crud).items() if callable(value) and value.__module__ == crud.__name__}
-    assert public == {'NewObservation', 'insert_observations'}
+    assert public == {'NewObservation', 'insert_observations', 'NameChange', 'name_changes_naming'}
+    read = inspect.getsource(crud.name_changes_naming)
+    assert 'select(' in read and 'insert(' not in read, 'the clamp read writes'
     tree = ast.parse(Path(crud.__file__).read_text(encoding='utf-8'))
     called = {
         node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, 'id', None)

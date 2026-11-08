@@ -14,7 +14,6 @@ the route tier's (test_store_dataset_entry_route.py, another validator's file).
 """
 
 import dataclasses
-import functools
 import uuid
 from collections.abc import AsyncIterator
 from datetime import timedelta
@@ -39,16 +38,18 @@ from data.store.app.ingest.data_action_request import (
     StoredDataset,
     new_asset_list_request,
     new_bars_request,
+    new_corporate_actions_request,
     store_market_activity_worker,
     submit_bars,
     submit_record,
     submit_request_of,
 )
 from data.store.tests.delivery_reports import report, with_trailer
+from data.store.tests.name_change_doubles import Plays, bars_of, queries_of
 from data.store.tests.request_path_harness import INSTANCE_A, INSTANCE_B, OWNER, START, FakeSubmit, Harness, make_engine
 from schemas.data_ingest.delivery import DeliveryOutcome
 from schemas.data_ingest.fetch_dataset import BarPage, ServedRange
-from schemas.data_ingest.submit import AssetListRequest, AssetListStatus
+from schemas.data_ingest.submit import AssetListRequest, AssetListStatus, CorporateActionsRequest
 from schemas.data_store.asset_dataset_store import StoreAssetDatasetBody, StoreAssetDatasetPath
 
 
@@ -208,17 +209,51 @@ async def test_submit_request_of_sends_the_durable_count_and_the_recovered_flag(
     assert (sent.recovered, sent.attempt_count) == (True, 4)
 
 
-async def test_submit_request_of_refuses_a_corporate_actions_request_or_a_bars_row_missing_a_field(harness):
-    """Since P17 (tj-7zjov1.30) an asset-list row IS sent (below); corporate actions still are not by this path."""
+async def test_submit_request_of_sends_a_corporate_actions_row_as_stored_and_refuses_one_missing_a_field(harness):
+    """Since P51 (tj-7zjov1.146, ADR tj-26jt9w addendum 19) a corporate-actions row IS sent: the clamp's query.
+
+    It goes out exactly as stored (the same builder serves the first send, the watcher's re-send and the recovered
+    re-submission), so a re-send never re-derives its window; a row missing the symbol or a window bound is refused,
+    as a bars row missing a field is (below).
+    """
+    window_end = START + timedelta(days=3, minutes=5)
     async with AsyncSession(harness.engine) as db:
-        actions = await request_crud.create_request(
+        stored = await request_crud.create_request(
             db,
-            request_crud.NewIngestRequest(
-                kind=IngestRequestKind.CORPORATE_ACTIONS, source=DataSource.ALPACA_API, client_label=OWNER
+            new_corporate_actions_request(
+                DataSource.ALPACA_API,
+                'FB',
+                START,
+                window_end,
+                trigger=IngestRunTrigger.REQUEST,
+                client_label=OWNER,
+                ready_by=READY_BY,
             ),
         )
-    with pytest.raises(ValueError, match='cannot be submitted'):
-        submit_request_of(actions)
+        stored = await request_crud.get_request(db, stored.id)
+    assert (stored.kind, stored.trigger, stored.asset_symbol) == (
+        IngestRequestKind.CORPORATE_ACTIONS,
+        IngestRunTrigger.REQUEST,
+        'FB',
+    )
+    assert (stored.dataset_id, stored.expiry, stored.collect, stored.granularity) == (None,) * 4
+
+    sent = submit_request_of(stored, recovered=True)
+
+    assert sent.corporate_actions == CorporateActionsRequest(
+        source=DataSource.ALPACA_API, asset_symbol='FB', start=START, end=window_end
+    )
+    assert sent.bars is None and sent.asset_list is None
+    assert (sent.request_id, sent.owner, sent.ready_by, sent.recovered, sent.attempt_count) == (
+        str(stored.id),
+        OWNER,
+        READY_BY,
+        True,
+        0,
+    )
+    for missing in ({'asset_symbol': None}, {'requested_start': None}, {'requested_end': None}):
+        with pytest.raises(ValueError, match='corporate-actions request needs'):
+            submit_request_of(dataclasses.replace(stored, **missing))
     record = await _post(harness, FakeSubmit())
     await harness.set_request(record.id, granularity=None)
     async with AsyncSession(harness.engine) as db:
@@ -384,31 +419,24 @@ async def test_an_own_overlap_is_refused_before_anything_is_written_or_sent(harn
 # --------------------------------------------------------------------------------------------- the whole POST
 
 
-class IngestPlays:
+class IngestPlays(Plays):
     """Ingest's reports, delivered inside the waiter's sleep.
 
     Ingest's reports, delivered INSIDE the waiter's sleep, so no two sessions interleave on the one SQLite
     connection (StaticPool shares it, and an interleaved session would end the other's transaction). Each submit
     queues the reports the test scripts for that request; the waiter's next sleep delivers them, in order.
+
+    Since P51 the POST's corporate-actions query (the name_change clamp) is answered first with an empty success
+    (name_change_doubles.Plays); `scripts` are the BARS request's reports, each built from the request id.
     """
 
     def __init__(self, harness: Harness, monkeypatch: pytest.MonkeyPatch, *scripts) -> None:
         self.harness = harness
-        self.queued: list = []
-        self.sleeps = 0
-        self.client = FakeSubmit()
-
-        async def on_submit(request):
-            self.queued.extend(script(request.request_id) for script in scripts)
-
-        async def sleep(_seconds: float) -> None:
-            self.sleeps += 1
-            while self.queued:
-                await harness.deliver(self.queued.pop(0))
-
-        self.client.on_submit = on_submit
-        monkeypatch.setattr(
-            data_action_request, 'await_verdict', functools.partial(data_action_request.await_verdict, sleep=sleep)
+        super().__init__(
+            harness.deliver,
+            monkeypatch,
+            FakeSubmit(),
+            bars=[lambda request, script=script: script(request.request_id) for script in scripts],
         )
 
     async def post(self, payload: StoreAssetDatasetBody) -> StoredDataset:
@@ -435,10 +463,11 @@ async def test_post_end_to_end_answers_from_the_finishing_attempt_row_and_the_en
     stored = await plays.post(body(collect=False))
 
     assert stored == StoredDataset(data_points=2, served_range=served)
-    (sent,) = plays.client.sent
+    (sent,) = bars_of(plays.client.sent)
     assert sent.ready_by == READY_BY, "POST passes the caller's ready_by"
+    assert len(queries_of(plays.client.sent)) == 1, 'the name_change query was not sent once before the bars'
     assert plays.sleeps >= 1, 'the POST waited for the reports'
-    (row,) = await harness.requests()
+    (row,) = await harness.bars_requests()
     assert (row.state, row.attempts, row.trigger) == (IngestRequestState.SUCCEEDED, 2, IngestRunTrigger.REQUEST)
     (entry,) = await harness.entries()
     assert row.dataset_id == entry.id
@@ -453,7 +482,7 @@ async def test_post_end_to_end_of_an_empty_answer_is_zero_points_and_the_attempt
 
     assert stored.data_points == 0
     assert stored.served_range == report(uuid.uuid4()).trailer.served_range
-    (row,) = await harness.requests()
+    (row,) = await harness.bars_requests()
     assert row.state is IngestRequestState.EMPTY
 
 
@@ -471,17 +500,23 @@ async def test_post_whose_request_expires_on_its_ready_by_returns_the_deadline_f
 async def test_post_that_outlives_its_deadline_answers_the_deadline_error_and_the_request_keeps_running(
     harness, monkeypatch
 ):
-    monkeypatch.setenv('STORE_VERDICT_POLL_SECONDS', '0.01')
+    plays = IngestPlays(harness, monkeypatch)  # the query is answered, the bars never are
     async with AsyncSession(harness.engine, expire_on_commit=False) as db:
         with pytest.raises(ExogenousError) as caught:
-            await store_market_activity_worker(PATH, body(), db, FakeSubmit(), deadline_s=0.05)
+            await store_market_activity_worker(PATH, body(), db, plays.client, deadline_s=0.3)
 
     assert caught.value.reason is Reason.DEADLINE
-    (row,) = await harness.requests()
+    (row,) = await harness.bars_requests()
     assert (row.state, row.finished_at) == (IngestRequestState.QUEUED, None), 'left running, never failed'
 
 
 async def test_the_post_path_reads_its_deadline_from_the_setting_when_given_none(harness, monkeypatch):
+    """None reads STORE_VERDICT_DEADLINE_SECONDS once, and that ONE deadline is shared by both waits (P51).
+
+    Since P51 the worker reads the setting itself (verdict_deadline_seconds, whose parsing test_await_verdict.py pins)
+    and hands each wait what is left of it: the clamp's query gets all of it, the bars what the query did not use.
+    """
+    monkeypatch.setenv(data_action_request.VERDICT_DEADLINE_ENV, '42')
     seen: list = []
 
     async def spy(request_id, *, deadline_s=None, **kwargs):
@@ -492,7 +527,9 @@ async def test_the_post_path_reads_its_deadline_from_the_setting_when_given_none
     async with AsyncSession(harness.engine, expire_on_commit=False) as db:
         await store_market_activity_worker(PATH, body(), db, FakeSubmit())
 
-    ((request_id, deadline),) = seen
-    assert deadline is None, 'None reads STORE_VERDICT_DEADLINE_SECONDS (test_await_verdict.py pins the reading)'
-    (row,) = await harness.requests()
-    assert request_id == row.id
+    ((query_id, query_deadline), (bars_id, bars_deadline)) = seen
+    (query_row,) = await harness.query_requests()
+    (bars_row,) = await harness.bars_requests()
+    assert (query_id, bars_id) == (query_row.id, bars_row.id), 'the query is awaited first, then the bars'
+    assert query_deadline == 42
+    assert 41 < bars_deadline <= 42, f'the bars wait was given {bars_deadline}, not what is left of the one 42 s'

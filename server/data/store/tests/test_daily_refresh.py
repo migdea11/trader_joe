@@ -72,6 +72,7 @@ from data.store.app.ingest import data_action_request, delivery_intake
 from data.store.app.main import app
 from data.store.app.trading_calendar import calendar_for_source
 from data.store.tests.delivery_reports import INSTANCE_A, bar_page, report, stats, with_trailer
+from data.store.tests.name_change_doubles import Plays, install_book
 from data.store.tests.request_tables import create_request_tables
 from data.store.tests.test_ui_datasets_route import (  # noqa: F401 (aware_sqlite_datetimes is a fixture)
     NOW,
@@ -245,8 +246,18 @@ class ScriptedClient:
         self.scripts = scripts or {}
         self.submitted: list[SubmitRequest] = []
         self.requests: list[BarsRequest] = []
+        # A POST's name_change query (P51) is recorded here, apart; the refresh never sends one. on_submit is the hook
+        # name_change_doubles.Plays takes over to answer it.
+        self.queries: list[SubmitRequest] = []
+        self.on_submit: Any = None
 
     async def submit(self, request: SubmitRequest) -> SubmitResponse:
+        if request.corporate_actions is not None:
+            self.queries.append(request)
+            if self.on_submit is not None:
+                await self.on_submit(request)
+            accepted = SubmitAccepted(feed=None, quota_key='quota-key')
+            return SubmitResponse(ack=SubmitAck(accepted=accepted), instance_id=INSTANCE_A)
         self.submitted.append(request)
         self.requests.append(request.bars)
         script = self.scripts.get(request.bars.asset_symbol)
@@ -596,12 +607,15 @@ async def _entries(world: World) -> dict[uuid.UUID, tuple]:
 
 
 @pytest.mark.asyncio
-async def test_the_narrowed_start_would_collide_if_it_reached_the_overlap_key(world: World):
+async def test_the_narrowed_start_would_collide_if_it_reached_the_overlap_key(world: World, monkeypatch):
     """The guard the refresh avoids is real: a POST body whose START is the tail collides with the entry.
 
-    Since the push path the POST refuses its own overlap BEFORE anything is written or sent: no request row, no
-    Submit. The refresh never reaches that check at all (it names its dataset).
+    Since the push path the POST refuses its own overlap BEFORE its bars request is written or sent: no bars row, no
+    bars Submit. Since P51 the POST's name_change query runs first (the overlap key is the clamped start), so that
+    query is written, sent and answered (no record: no clamp) and the collision is still the body's own. The refresh
+    never reaches either at all (it names its dataset).
     """
+    install_book(monkeypatch)
     row = world.rows['behind']
     narrowed = StoreAssetDatasetBody(
         owner=row.owner,
@@ -614,11 +628,13 @@ async def test_the_narrowed_start_would_collide_if_it_reached_the_overlap_key(wo
     )
     path = StoreAssetDatasetPath(asset_type=row.asset_type, data_type=row.data_type, asset_symbol=row.asset_symbol)
     client = ScriptedClient()
+    Plays(world.intake.deliver, monkeypatch, client, bars=())
     async with AsyncSession(world.engine) as db:
         with pytest.raises(OwnOverlapConflict):
-            await data_action_request.store_market_activity_worker(path, narrowed, db, client)
+            await data_action_request.store_market_activity_worker(path, narrowed, db, client, deadline_s=10)
     assert client.submitted == []
-    assert await world.requests() == []
+    assert len(client.queries) == 1
+    assert [IngestRequestKind(row.kind) for row in await world.requests()] == [IngestRequestKind.CORPORATE_ACTIONS]
 
 
 @pytest.mark.asyncio

@@ -419,8 +419,8 @@ async def test_a_failed_submit_renders_as_its_reasons_status_and_writes_nothing_
     assert 'served_range' not in body, (
         f'a FAILED request carries served_range: {body}. Only a 200 does -- a failure answered no window.'
     )
-    assert store.created == [] and await store.runs() == []
-    (request,) = await store.requests()
+    (request,) = await store.bars_requests()
+    assert store.created == [] and [run for run in await store.runs() if run.request_id == request.id] == []
     assert IngestRequestState(request.state) is IngestRequestState.PENDING
 
 
@@ -460,20 +460,23 @@ async def test_a_failed_request_renders_as_its_reasons_status_and_writes_no_entr
     body = problem(response, status=status, reason=reason)
     assert 'served_range' not in body
     assert store.created == [], 'a failed request wrote an entry'
-    (request,) = await store.requests()
+    (request,) = await store.bars_requests()
     assert IngestRequestState(request.state) is IngestRequestState.FAILED
 
 
 @pytest.mark.asyncio
 async def test_a_request_still_running_at_the_deadline_answers_504_and_keeps_running(store: PostStore, monkeypatch):
     """Owner ruling R4 (a): the POST's wait is bounded; the request is not abandoned, its outcome lands in the history."""
-    monkeypatch.setenv(data_action_request.VERDICT_DEADLINE_ENV, '0.05')
+    # Long enough for the clamp's answered query (P51: one deadline covers both waits); the silent bars outlive it.
+    monkeypatch.setenv(data_action_request.VERDICT_DEADLINE_ENV, '0.5')
 
     response = await post(store, SubmitDouble.silent(store), REQUEST_BODY, monkeypatch)
 
     problem(response, status=504, reason='DEADLINE')
-    (request,) = await store.requests()
+    (request,) = await store.bars_requests()
     assert IngestRequestState(request.state) is IngestRequestState.QUEUED
+    (query,) = await store.query_requests()
+    assert not IngestRequestState(query.state).is_open, 'the clamp query was answered; the BARS wait ran out'
 
 
 @pytest.mark.asyncio
@@ -591,8 +594,11 @@ async def test_a_served_post_keeps_the_range_as_of_feed_and_count_on_its_attempt
     response = await post(store, SubmitDouble(store, _served([0])), REQUEST_BODY, monkeypatch)
 
     assert response.status_code == 200, response.text
-    (attempt,) = sent
-    (run,) = await store.runs()
+    # Since P51 the clamp's corporate-actions query is delivered first, with an attempt row of its own; this pin is
+    # about the BARS request's.
+    (request,) = await store.bars_requests()
+    (attempt,) = [report for report in sent if report.header.request_id == str(request.id)]
+    (run,) = [run for run in await store.runs() if run.request_id == request.id]
     assert (run.served_start, run.served_end) == (SERVED_START, SERVED_END)
     assert run.served_end != REQUESTED_END, 'the attempt row echoes the requested end, not the served one'
     assert run.finished_at == attempt.trailer.as_of

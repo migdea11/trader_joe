@@ -318,18 +318,20 @@ async def test_a_static_post_records_its_bulk_expiry_type(store: PostStore):
 async def test_the_post_waits_for_the_verdict_up_to_its_deadline_and_the_request_continues(store: PostStore):
     """Owner ruling R4 (a): a POST that outlives its deadline answers DEADLINE and its request is left running.
 
-    The waiter's own cases are part B's; this is the POST's composition of the two halves, end to end.
+    The waiter's own cases are part B's; this is the POST's composition of the two halves, end to end. Since P51 the
+    one deadline covers the clamp's query too, so it is long enough for the (answered) query and runs out on the
+    silent bars request.
     """
     client = SubmitDouble.silent(store)
 
     with pytest.raises(ExogenousError) as raised:
         async with store.session() as db:
             await data_action_request.store_market_activity_worker(
-                REQUEST_PATH, REQUEST_BODY, db, client, deadline_s=0.01
+                REQUEST_PATH, REQUEST_BODY, db, client, deadline_s=0.5
             )
 
     assert raised.value.reason is Reason.DEADLINE
-    (stored,) = await store.requests()
+    (stored,) = await store.bars_requests()
     assert IngestRequestState(stored.state) is IngestRequestState.QUEUED, 'the request was abandoned at the deadline'
 
 
@@ -345,7 +347,7 @@ async def test_a_delivered_answer_is_what_the_post_returns(store: PostStore):
     assert stored.data_points == 0
     assert stored.served_range == client.delivery.served
     assert stored.served_range.end != REQUEST_BODY.end, 'the served window was echoed from the request'
-    (request,) = await store.requests()
+    (request,) = await store.bars_requests()
     assert request.dataset_id == store.entry_id, 'the first delivered attempt did not give the request its entry'
     assert timedelta(0) <= (request.finished_at - request.created_at) < timedelta(seconds=5)
     assert uuid.UUID(client.submitted[0].request_id) == request.id

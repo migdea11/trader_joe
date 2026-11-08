@@ -212,6 +212,34 @@ def store(_post_store: PostStore) -> PostStore:  # noqa: F811 (the imported fixt
     return _post_store
 
 
+@pytest.fixture
+def clamp_stubbed(monkeypatch: pytest.MonkeyPatch) -> list:
+    """The name_change clamp (P51) stubbed to "no clamp", for the cases on a FAKE request session.
+
+    Since P51 every POST first writes, submits and awaits a corporate-actions request (the clamp's query) on the
+    request's session, before the own-overlap check. A fake session that holds a canned overlap answer cannot also
+    hold that row, so these cases stand the clamp in, as they stand ingest in. What they pin is unchanged: the 409's
+    shape, and that no BARS request is written or sent. The clamp itself, its order before the overlap check and the
+    409 reached through the real query are test_name_change_clamp.py's.
+
+    Returns:
+        list: One (symbol, start) per POST that reached the clamp.
+    """
+    seen: list = []
+
+    async def no_clamp(path, body, _db, _client, *, deadline_s):
+        seen.append((path.asset_symbol, body.start))
+        return None, uuid.uuid4()
+
+    monkeypatch.setattr(data_action_request, 'first_request_clamp', no_clamp)
+    return seen
+
+
+def _bar_attempt_written(journal: list[str], published: int) -> int:
+    """The bars attempt row's INSERT: the last ingest_run insert before the publish (the query's attempt is earlier)."""
+    return max(index for index, step in enumerate(journal[:published]) if step == 'INSERT ingest_run')
+
+
 def _sent_inserts(session: FakeSession) -> list:
     """Every INSERT the session was handed.
 
@@ -278,7 +306,9 @@ def post_dataset(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.parametrize('collision_count', [1, 2], ids=['one-colliding-dataset', 'two-colliding-datasets'])
-def test_an_own_overlap_answers_409_carrying_the_ids_a_caller_can_extend(post_dataset, collision_count: int):
+def test_an_own_overlap_answers_409_carrying_the_ids_a_caller_can_extend(
+    post_dataset, clamp_stubbed, collision_count: int
+):
     """THE MAPPING tj-vhboky.8 CALLS THE ENTIRE POINT OF THE RULING, driven at the route for the first time.
 
     The status and the body are asserted as two separate claims because they fail separately, and all
@@ -337,6 +367,7 @@ def test_an_own_overlap_answers_409_carrying_the_ids_a_caller_can_extend(post_da
 
     Args:
         post_dataset: Drives the real POST route against a fake session.
+        clamp_stubbed: The name_change clamp stood in (P51), recording that it ran before the overlap check.
         collision_count: How many of the owner's own datasets the request is told it overlaps.
     """
     colliding_ids = [uuid.uuid4() for _ in range(collision_count)]
@@ -381,6 +412,10 @@ def test_an_own_overlap_answers_409_carrying_the_ids_a_caller_can_extend(post_da
         f'so it must run BEFORE the request is written and submitted (tj-hywf7w, kept by tj-7zjov1.28): a '
         f'Submit queues work ingest will spend a vendor call and a rate-budget slot on, entirely for a 409'
     )
+    # SINCE P51 (ADR tj-26jt9w addendum 19) the overlap key is the CLAMPED start, so the clamp's corporate-actions
+    # query runs first and is the one Submit a 409 still costs (accepted: one vendor call per POST, repeats included).
+    # It is stubbed here (clamp_stubbed); the pin above is now about the BARS request, and that the clamp ran first:
+    assert clamp_stubbed == [('AAPL', datetime(2026, 1, 1, tzinfo=UTC))], 'the overlap was checked before the clamp'
 
 
 @pytest.mark.asyncio
@@ -414,7 +449,8 @@ async def test_a_request_overlapping_nothing_is_written_and_answers_200(store: P
     assert_body_served_range(body, client.delivery.served)
     assert len(store.created) == 1, 'the delivered request did not write exactly one entry'
     assert len(client.submitted) == 1, 'the accepted request was not submitted exactly once'
-    (request,) = await store.requests()
+    assert len(client.queries) == 1, 'the POST did not send exactly one name_change query before its bars (P51)'
+    (request,) = await store.bars_requests()
     assert IngestRequestState(request.state) is IngestRequestState.EMPTY
     assert request.dataset_id == store.entry_id
 
@@ -582,8 +618,10 @@ async def test_the_post_writes_and_submits_under_the_principal_the_caller_declar
         f'the entry is being written under {created.owner!r} rather than under the principal the caller '
         f'declared ({DECLARED_PRINCIPAL!r}). owner is identity, so this is a different dataset.'
     )
-    (request,) = await store.requests()
+    (request,) = await store.bars_requests()
     assert request.client_label == DECLARED_PRINCIPAL
+    (query_row,) = await store.query_requests()
+    assert query_row.client_label == DECLARED_PRINCIPAL, 'the name_change query is not labelled with the caller'
     (submitted,) = client.submitted
     assert submitted.owner == DECLARED_PRINCIPAL, (
         f'ingest is being asked to act on behalf of {submitted.owner!r} rather than the principal the '
@@ -884,7 +922,7 @@ async def test_a_stored_dataset_is_announced_updated_once_after_its_commit(store
     assert _changed(store) == [DatasetChanged(store.entry_id, DatasetChange.UPDATED)]
     journal = store.journal
     published = journal.index('publish DatasetChanged')
-    written = journal.index('INSERT ingest_run')
+    written = _bar_attempt_written(journal, published)
     assert written < journal.index('COMMIT', written) < published, (
         f'the dataset was announced before the delivery transaction committed: {journal}'
     )
@@ -892,14 +930,38 @@ async def test_a_stored_dataset_is_announced_updated_once_after_its_commit(store
 
 @pytest.mark.asyncio
 async def test_a_refused_or_failed_store_announces_nothing(monkeypatch, store: PostStore):
-    """Nothing committed, nothing announced: an own-overlap 409, and a request ingest failed for good."""
-    overlap = FakeSession(FakeResult(rows=[(uuid.uuid4(),)]))
-    assert (await post(store, RefusalOnlyClient(), REQUEST_BODY, monkeypatch, session=overlap)).status_code == 409
+    """Nothing committed, nothing announced: an own-overlap 409, and a request ingest failed for good.
+
+    The 409 runs through the real chain since P51 (the clamp's query is written and answered first, so a fake
+    session can no longer stand in): an entry of the same owner already overlaps the body's window.
+    """
+    await store.add(
+        StoreDatasetEntry(
+            id=uuid.uuid4(),
+            created_at=datetime(2025, 12, 1, tzinfo=UTC),
+            updated_at=datetime(2025, 12, 1, tzinfo=UTC),
+            owner=DECLARED_PRINCIPAL,
+            source=DataSource.ALPACA_API,
+            feed=Feed.IEX,
+            asset_symbol='AAPL',
+            asset_type=AssetType.STOCK,
+            data_type=DataType.MARKET_ACTIVITY,
+            granularity=Granularity.ONE_DAY,
+            start=datetime(2025, 12, 1, tzinfo=UTC),
+            end=datetime(2026, 2, 1, tzinfo=UTC),
+            expiry_type=ExpiryType.BULK,
+            update_type=UpdateType.STATIC,
+        )
+    )
+    refused = SubmitDouble(store)
+    problem(await post(store, refused, REQUEST_BODY, monkeypatch), status=409, reason='OWN_OVERLAP_CONFLICT')
+    assert refused.submitted == [] and await store.bars_requests() == [], 'a 409 wrote or sent a bars request'
 
     failed = SubmitDouble(
         store, Delivery(outcome=DeliveryOutcome.FAILED, error_class=DeliveryErrorClass.PERMANENT, detail='no such')
     )
-    response = await post(store, failed, REQUEST_BODY, monkeypatch)
+    # Another owner, so the seeded entry above is not its own overlap.
+    response = await post(store, failed, REQUEST_BODY | {'owner': 'another-strategy'}, monkeypatch)
     problem(response, status=422, reason='VENDOR_REJECTED')
 
     assert _changed(store) == [], 'a write that never stored a dataset was announced'
@@ -951,8 +1013,12 @@ async def test_an_aware_ready_by_is_the_requests_deadline(store: PostStore, monk
     assert response.status_code == 200, response.text
     deadline = datetime(2026, 2, 1, 14, 30, tzinfo=UTC)
     assert client.submitted[0].ready_by == deadline
-    (request,) = await store.requests()
+    (request,) = await store.bars_requests()
     assert request.ready_by == deadline
+    # The clamp's query waits under the same deadline: it carries the caller's ready_by too.
+    assert client.queries[0].ready_by == deadline
+    (query_row,) = await store.query_requests()
+    assert query_row.ready_by == deadline
 
 
 # ---------------------------------------------------------------------------------------------
@@ -983,7 +1049,7 @@ async def test_collect_on_a_daily_create_is_accepted_at_the_edge(store: PostStor
     response = await post(store, SubmitDouble(store), body, monkeypatch)
 
     assert response.status_code == 200, response.text
-    (request,) = await store.requests()
+    (request,) = await store.bars_requests()
     assert request.collect is collect
     assert request.expiry_type == ExpiryType.ROLLING.value
     assert request.trigger is IngestRunTrigger.REQUEST
@@ -1026,7 +1092,7 @@ async def test_a_post_publishes_retired_or_resumed_on_a_collect_flip_and_updated
     assert response.status_code == 200, response.text
     assert _changed(store) == [DatasetChanged(store.entry_id, change)], f'stored {stored}, sent {sent}: {store.events}'
     published = store.journal.index('publish DatasetChanged')
-    assert 'COMMIT' in store.journal[store.journal.index('INSERT ingest_run') : published], (
+    assert 'COMMIT' in store.journal[_bar_attempt_written(store.journal, published) : published], (
         'the change was announced before the delivery transaction committed'
     )
 
@@ -1052,7 +1118,7 @@ async def test_a_flipping_post_whose_delivery_rolls_back_announces_nothing(store
 
     problem(response, status=504, reason='DEADLINE')
     assert _changed(store) == [], 'a flip that never committed was announced'
-    (request,) = await store.requests()
+    (request,) = await store.bars_requests()
     assert IngestRequestState(request.state).is_open, 'a rolled-back delivery finished the request'
     assert request.dataset_id is None, 'a rolled-back delivery left its entry id on the request'
 
