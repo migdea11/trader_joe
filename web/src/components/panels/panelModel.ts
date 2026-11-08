@@ -4,7 +4,7 @@
 //
 // Copy follows theme/copy.ts: Title Case for labels and buttons, sentence case for sentences. The word is
 // panel; nothing here names a market, a world or a universe.
-import { AssetType } from '@generated/trader_joe/proto/market/v1/enums_pb'
+import { AssetType, DataSource } from '@generated/trader_joe/proto/market/v1/enums_pb'
 import { DatasetHealthStatusSchema } from '@generated/trader_joe/proto/ui/v1/data_pb'
 import type { DatasetHealthStatus } from '@generated/trader_joe/proto/ui/v1/data_pb'
 import {
@@ -204,12 +204,72 @@ export function draftToSettingsInit(draft: PanelDraft): SettingsInit {
   }
 }
 
+/** The settings fields that can block a save or create. */
+export type DraftField = 'size' | 'cadence' | 'reason'
+
+/** The settings form's own problems per field, in words. Empty when it can be sent. */
+export function draftFieldErrors(
+  draft: PanelDraft,
+  reason: string,
+  options: { cadenceRequired: boolean },
+): Partial<Record<DraftField, string>> {
+  const errors: Partial<Record<DraftField, string>> = {}
+  if (parseCount(draft.size) === null) errors.size = 'Give the size as a whole number, 0 or more.'
+  if (options.cadenceRequired && draft.cadence === PanelCadence.UNSPECIFIED) errors.cadence = 'Choose a cadence.'
+  if (reason.trim() === '') errors.reason = 'Give a reason for the change.'
+  return errors
+}
+
 /** The settings form's own problems, in words: what stops Save. Empty when it can be sent. */
 export function draftProblem(draft: PanelDraft, reason: string, options: { cadenceRequired: boolean }): string {
-  if (parseCount(draft.size) === null) return 'Give the size as a whole number, 0 or more.'
-  if (options.cadenceRequired && draft.cadence === PanelCadence.UNSPECIFIED) return 'Choose a cadence.'
-  if (reason.trim() === '') return 'Give a reason for the change.'
-  return ''
+  const errors = draftFieldErrors(draft, reason, options)
+  return errors.size ?? errors.cadence ?? errors.reason ?? ''
+}
+
+/** What the create form knows when it decides whether Create Panel can be pressed. */
+export interface CreateInput {
+  name: string
+  nameTaken: boolean
+  source: DataSource
+  /** The source-settings read failed. */
+  sourceProblem: boolean
+  /** null: not known yet (no source chosen, or the read is out); true: the source has no settings version. */
+  sourceNeedsSettings: boolean | null
+  draft: PanelDraft
+  reason: string
+  ramp: string
+  cap: string
+  pre: string
+  post: string
+}
+
+/** A create form field that can carry an error. */
+export type CreateField = 'name' | 'source' | 'size' | 'reason' | 'ramp' | 'cap' | 'pre' | 'post'
+
+const COUNT_ERROR = 'Give a whole number, 0 or more.'
+
+/**
+ * Every field of the create form that is empty or invalid, with the words for it. The one place the create
+ * rules live: the button is disabled exactly when this is not empty, and each field's mark reads from it.
+ */
+export function createFieldErrors(input: CreateInput): Partial<Record<CreateField, string>> {
+  const errors: Partial<Record<CreateField, string>> = {}
+  const name = input.name.trim()
+  if (name === '') errors.name = 'Give the panel a name.'
+  else if (input.nameTaken) errors.name = PANEL_REFUSAL.nameTaken(name)
+  if (input.source === DataSource.UNSPECIFIED) errors.source = 'Choose a source.'
+  else if (input.sourceProblem) errors.source = 'The source settings could not be read. Choose the source again.'
+  else if (input.sourceNeedsSettings === null) errors.source = 'Reading the source settings.'
+  const base = draftFieldErrors(input.draft, input.reason, { cadenceRequired: false })
+  if (base.size !== undefined) errors.size = base.size
+  if (base.reason !== undefined) errors.reason = base.reason
+  if (input.sourceNeedsSettings) {
+    if (parseCount(input.ramp) === null) errors.ramp = COUNT_ERROR
+    if (parseCount(input.cap) === null) errors.cap = COUNT_ERROR
+    if (input.pre.trim() !== '' && parseCount(input.pre) === null) errors.pre = COUNT_ERROR
+    if (input.post.trim() !== '' && parseCount(input.post) === null) errors.post = COUNT_ERROR
+  }
+  return errors
 }
 
 // --- the strip --------------------------------------------------------------------------------------

@@ -17,6 +17,10 @@ defineProps<{
   disabled: boolean
   /** The create form may leave the cadence unnamed (the store defaults it); a save must name one. */
   cadenceOptional: boolean
+  /** The create form marks what it requires; the settings form leaves its labels as they are. */
+  markRequired?: boolean
+  /** The size's problem, shown under the field; it also marks the asterisk (the create form passes it once Create Panel was pressed). Empty: none. */
+  sizeError?: string
 }>()
 
 const ASSET_CLASS_CHOICES = [
@@ -72,16 +76,32 @@ const TRI_CHOICES = [
       <label
         class="pn-label"
         :for="`${idPrefix}-size`"
-      >{{ titleCase('Size') }}</label>
+      >{{ titleCase('Size') }}<span
+        v-if="markRequired"
+        class="pn-required"
+        :class="{ 'pn-required--marked': sizeError }"
+        aria-hidden="true"
+      > *</span></label>
       <input
         :id="`${idPrefix}-size`"
         v-model="draft.size"
         class="pn-input"
         type="text"
         inputmode="numeric"
+        :aria-required="markRequired ? 'true' : undefined"
+        :aria-invalid="sizeError ? 'true' : undefined"
+        :aria-describedby="sizeError ? `${idPrefix}-size-error` : undefined"
         :disabled="disabled"
         :data-testid="`${idPrefix}-size`"
       >
+      <p
+        v-if="sizeError"
+        :id="`${idPrefix}-size-error`"
+        class="pn-field-error"
+        :data-testid="`${idPrefix}-size-error`"
+      >
+        {{ sizeError }}
+      </p>
     </div>
     <div class="pn-field">
       <label

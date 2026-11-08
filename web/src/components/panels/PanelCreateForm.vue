@@ -5,16 +5,16 @@
 // settings version (its versions page is empty): ramp and cap are required then, the window days optional
 // (the store defaults them). The write does not run the first pass: the page shows the new panel as first
 // pass pending and re-reads it. Panels are UI-only; nothing here is a client or SDK surface.
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { DataSource } from '@generated/trader_joe/proto/market/v1/enums_pb'
 
 import { getSourceSettingsVersions } from '@/api'
 import { sourceLabel } from '@/catalog/labels'
 import { usePanelsStore } from '@/stores/panels'
-import { PANEL_REFUSAL, titleCase } from '@/theme/copy'
+import { titleCase } from '@/theme/copy'
 
 import PanelFilterFields from './PanelFilterFields.vue'
-import { draftProblem, draftToSettingsInit, emptyDraft, panelWriteNotice, parseCount } from './panelModel'
+import { createFieldErrors, draftToSettingsInit, emptyDraft, panelWriteNotice, parseCount } from './panelModel'
 import type { PanelWriteNotice } from './panelModel'
 
 const emit = defineEmits<{
@@ -55,29 +55,39 @@ watch(source, async (chosen) => {
   }
 })
 
-const windowText = (text: string): boolean => text.trim() === '' || parseCount(text) !== null
-
 // The store's unique check is on the trimmed name, exact case; the loaded panel list is what the page knows.
 const nameTaken = computed(() => {
   const proposed = name.value.trim()
   return proposed !== '' && store.panels.some((item) => item.name === proposed)
 })
 
+// Every empty or invalid field at once, from the one rule set in panelModel.ts: the click decides from this
+// and the marks on the fields show it, so they cannot disagree.
+const errors = computed(() =>
+  createFieldErrors({
+    name: name.value,
+    nameTaken: nameTaken.value,
+    source: source.value,
+    sourceProblem: sourceProblem.value,
+    sourceNeedsSettings: sourceNeedsSettings.value,
+    draft: draft.value,
+    reason: reason.value,
+    ramp: ramp.value,
+    cap: cap.value,
+    pre: pre.value,
+    post: post.value,
+  }),
+)
+const blocked = computed(() => Object.keys(errors.value).length > 0)
+// Validation runs on click (owner ruling 2026-11-06): nothing is marked until Create Panel is pressed once;
+// after that the marks follow the fields live and each stays until its field is valid. Never reset.
+const attempted = ref(false)
+const shown = computed(() => (attempted.value ? errors.value : {}))
+const formEl = ref<HTMLFormElement | null>(null)
 const problem = computed(() => {
-  if (name.value.trim() === '') return 'Give the panel a name.'
-  if (nameTaken.value) return PANEL_REFUSAL.nameTaken(name.value.trim())
-  if (source.value === DataSource.UNSPECIFIED) return 'Choose a source.'
-  if (sourceProblem.value) return 'The source settings could not be read. Choose the source again.'
-  if (sourceNeedsSettings.value === null) return 'Reading the source settings.'
-  const base = draftProblem(draft.value, reason.value, { cadenceRequired: false })
-  if (base !== '') return base
-  if (sourceNeedsSettings.value) {
-    if (parseCount(ramp.value) === null || parseCount(cap.value) === null) {
-      return 'This source has no settings yet: give the new datasets per hour and the requests per hour.'
-    }
-    if (!windowText(pre.value) || !windowText(post.value)) return 'Give each corporate action day count as a whole number.'
-  }
-  return ''
+  const count = Object.keys(shown.value).length
+  if (count === 0) return ''
+  return `${count === 1 ? '1 marked field needs' : `${count} marked fields need`} a value before the panel can be created.`
 })
 
 function optionalCount(text: string): number | undefined {
@@ -85,7 +95,14 @@ function optionalCount(text: string): number | undefined {
 }
 
 async function submit(): Promise<void> {
-  if (busy.value || problem.value !== '') return
+  if (busy.value) return
+  // Any press counts, so a name found taken after a sent create is marked too.
+  attempted.value = true
+  if (blocked.value) {
+    await nextTick()
+    formEl.value?.querySelector<HTMLElement>('[aria-invalid="true"]')?.focus()
+    return
+  }
   const sourceSettings = sourceNeedsSettings.value
     ? {
         rampDatasetsPerHour: parseCount(ramp.value) ?? 0,
@@ -121,33 +138,59 @@ async function submit(): Promise<void> {
       {{ titleCase('Create Panel') }}
     </h2>
     <form
+      ref="formEl"
       class="pn-form"
       @submit.prevent="submit"
     >
+      <p class="pn-hint">
+        Fields marked * are required.
+      </p>
       <div class="pn-grid">
         <div class="pn-field">
           <label
             class="pn-label"
             for="create-name"
-          >{{ titleCase('Name') }}</label>
+          >{{ titleCase('Name') }}<span
+            class="pn-required"
+            :class="{ 'pn-required--marked': shown.name }"
+            aria-hidden="true"
+          > *</span></label>
           <input
             id="create-name"
             v-model="name"
             class="pn-input"
             type="text"
+            aria-required="true"
+            :aria-invalid="shown.name ? 'true' : undefined"
+            :aria-describedby="shown.name ? 'create-name-error' : undefined"
             :disabled="busy"
             data-testid="create-name"
           >
+          <p
+            v-if="shown.name"
+            id="create-name-error"
+            class="pn-field-error"
+            data-testid="create-name-error"
+          >
+            {{ shown.name }}
+          </p>
         </div>
         <div class="pn-field">
           <label
             class="pn-label"
             for="create-source"
-          >{{ titleCase('Source') }}</label>
+          >{{ titleCase('Source') }}<span
+            class="pn-required"
+            :class="{ 'pn-required--marked': shown.source }"
+            aria-hidden="true"
+          > *</span></label>
           <select
             id="create-source"
             v-model="source"
             class="pn-input"
+            aria-required="true"
+            :aria-invalid="shown.source ? 'true' : undefined"
+            :aria-describedby="shown.source ? 'create-source-error' : undefined"
             :disabled="busy"
             data-testid="create-source"
           >
@@ -165,6 +208,14 @@ async function submit(): Promise<void> {
               {{ sourceLabel(choice) }}
             </option>
           </select>
+          <p
+            v-if="shown.source"
+            id="create-source-error"
+            class="pn-field-error"
+            data-testid="create-source-error"
+          >
+            {{ shown.source }}
+          </p>
         </div>
       </div>
       <label class="pn-check">
@@ -181,6 +232,8 @@ async function submit(): Promise<void> {
         id-prefix="create"
         :disabled="busy"
         :cadence-optional="true"
+        mark-required
+        :size-error="shown.size"
       />
 
       <template v-if="sourceNeedsSettings">
@@ -192,31 +245,61 @@ async function submit(): Promise<void> {
             <label
               class="pn-label"
               for="create-ramp"
-            >{{ titleCase('New Datasets per Hour') }}</label>
+            >{{ titleCase('New Datasets per Hour') }}<span
+              class="pn-required"
+              :class="{ 'pn-required--marked': shown.ramp }"
+              aria-hidden="true"
+            > *</span></label>
             <input
               id="create-ramp"
               v-model="ramp"
               class="pn-input"
               type="text"
               inputmode="numeric"
+              aria-required="true"
+              :aria-invalid="shown.ramp ? 'true' : undefined"
+              :aria-describedby="shown.ramp ? 'create-ramp-error' : undefined"
               :disabled="busy"
               data-testid="create-ramp"
             >
+            <p
+              v-if="shown.ramp"
+              id="create-ramp-error"
+              class="pn-field-error"
+              data-testid="create-ramp-error"
+            >
+              {{ shown.ramp }}
+            </p>
           </div>
           <div class="pn-field">
             <label
               class="pn-label"
               for="create-cap"
-            >{{ titleCase('Requests per Hour') }}</label>
+            >{{ titleCase('Requests per Hour') }}<span
+              class="pn-required"
+              :class="{ 'pn-required--marked': shown.cap }"
+              aria-hidden="true"
+            > *</span></label>
             <input
               id="create-cap"
               v-model="cap"
               class="pn-input"
               type="text"
               inputmode="numeric"
+              aria-required="true"
+              :aria-invalid="shown.cap ? 'true' : undefined"
+              :aria-describedby="shown.cap ? 'create-cap-error' : undefined"
               :disabled="busy"
               data-testid="create-cap"
             >
+            <p
+              v-if="shown.cap"
+              id="create-cap-error"
+              class="pn-field-error"
+              data-testid="create-cap-error"
+            >
+              {{ shown.cap }}
+            </p>
           </div>
           <div class="pn-field">
             <label
@@ -230,9 +313,19 @@ async function submit(): Promise<void> {
               type="text"
               inputmode="numeric"
               placeholder="Store default"
+              :aria-invalid="shown.pre ? 'true' : undefined"
+              :aria-describedby="shown.pre ? 'create-pre-error' : undefined"
               :disabled="busy"
               data-testid="create-pre"
             >
+            <p
+              v-if="shown.pre"
+              id="create-pre-error"
+              class="pn-field-error"
+              data-testid="create-pre-error"
+            >
+              {{ shown.pre }}
+            </p>
           </div>
           <div class="pn-field">
             <label
@@ -246,9 +339,19 @@ async function submit(): Promise<void> {
               type="text"
               inputmode="numeric"
               placeholder="Store default"
+              :aria-invalid="shown.post ? 'true' : undefined"
+              :aria-describedby="shown.post ? 'create-post-error' : undefined"
               :disabled="busy"
               data-testid="create-post"
             >
+            <p
+              v-if="shown.post"
+              id="create-post-error"
+              class="pn-field-error"
+              data-testid="create-post-error"
+            >
+              {{ shown.post }}
+            </p>
           </div>
         </div>
       </template>
@@ -257,19 +360,35 @@ async function submit(): Promise<void> {
         <label
           class="pn-label"
           for="create-reason"
-        >{{ titleCase('Reason') }}</label>
+        >{{ titleCase('Reason') }}<span
+          class="pn-required"
+          :class="{ 'pn-required--marked': shown.reason }"
+          aria-hidden="true"
+        > *</span></label>
         <textarea
           id="create-reason"
           v-model="reason"
           class="pn-input"
           rows="2"
+          aria-required="true"
+          :aria-invalid="shown.reason ? 'true' : undefined"
+          :aria-describedby="shown.reason ? 'create-reason-error' : undefined"
           :disabled="busy"
           placeholder="Why the panel is created; recorded with its first settings"
           data-testid="create-reason"
         />
+        <p
+          v-if="shown.reason"
+          id="create-reason-error"
+          class="pn-field-error"
+          data-testid="create-reason-error"
+        >
+          {{ shown.reason }}
+        </p>
       </div>
       <p
         v-if="problem"
+        id="create-problem"
         class="pn-hint"
         data-testid="create-problem"
       >
@@ -279,7 +398,8 @@ async function submit(): Promise<void> {
         <button
           type="submit"
           class="pn-btn pn-btn--primary"
-          :disabled="busy || problem !== ''"
+          :disabled="busy"
+          :aria-describedby="problem ? 'create-problem' : undefined"
           data-testid="create-submit"
         >
           {{ titleCase('Create Panel') }}

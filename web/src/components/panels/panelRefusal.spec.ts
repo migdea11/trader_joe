@@ -158,14 +158,22 @@ describe('PanelCreateForm: the name is checked against the loaded list before an
     await byId(form, 'create-reason').setValue('a reason')
   }
 
-  it.each(['Large caps', '  Large caps  '])('%j is refused in words, the button disabled, and no POST is made', async (typed) => {
+  // Validated on click (tj-7zjov1.362.2): the clash waits for the first press like every other mark, and the
+  // button stays on; the press marks the name, focuses it and sends nothing.
+  it.each(['Large caps', '  Large caps  '])('%j is refused in words once pressed, the button on, and no POST is made', async (typed) => {
     const form = mount(PanelCreateForm, { attachTo: document.body })
     await fill(form, typed)
-    expect(byId(form, 'create-problem').text()).toBe('A panel named "Large caps" already exists. Choose another name.')
-    expect(byId(form, 'create-submit').attributes('disabled')).toBeDefined()
-    await form.find('form').trigger('submit')
+    expect(byId(form, 'create-name-error').exists()).toBe(false)
+    expect(byId(form, 'create-name').attributes('aria-invalid')).toBeUndefined()
+    expect(byId(form, 'create-submit').attributes('disabled')).toBeUndefined()
+    await byId(form, 'create-submit').trigger('click')
     await flushPromises()
     expect(posts()).toEqual([])
+    expect(byId(form, 'create-name-error').text()).toBe('A panel named "Large caps" already exists. Choose another name.')
+    expect(byId(form, 'create-name').attributes('aria-invalid')).toBe('true')
+    expect(byId(form, 'create-name').attributes('aria-describedby')).toBe('create-name-error')
+    expect(document.activeElement).toBe(byId(form, 'create-name').element)
+    expect(byId(form, 'create-submit').attributes('disabled')).toBeUndefined()
     expect(byId(form, 'create-notice').exists()).toBe(false)
   })
 
@@ -214,12 +222,22 @@ describe('PanelCreateForm: a 422 is re-read', () => {
     fake.onWrite = () => fake.names.push('Gamma')
     const form = mount(PanelCreateForm, { attachTo: document.body })
     await fill(form)
+    expect(byId(form, 'create-name-error').exists()).toBe(false)
     expect(await submit(form)).toBe(
       'A panel named "Gamma" was created in the meantime, so nothing was created. Choose another name. Error ID: e-race',
     )
     expect(valueOf(form, 'create-name')).toBe('  Gamma  ')
     expect(valueOf(form, 'create-reason')).toBe('a reason')
-    expect(byId(form, 'create-problem').text()).toBe('A panel named "Gamma" already exists. Choose another name.')
+    // The sent press counted as the first attempt, so the re-read's clash is marked at once, with no second press.
+    expect(byId(form, 'create-name-error').text()).toBe('A panel named "Gamma" already exists. Choose another name.')
+    expect(byId(form, 'create-name').attributes('aria-invalid')).toBe('true')
+    expect(form.find('label[for="create-name"] .pn-required').classes()).toContain('pn-required--marked')
+    expect(byId(form, 'create-problem').text()).toBe('1 marked field needs a value before the panel can be created.')
+    expect(byId(form, 'create-submit').attributes('disabled')).toBeUndefined()
+    await byId(form, 'create-submit').trigger('click')
+    await flushPromises()
+    expect(posts()).toHaveLength(1)
+    expect(document.activeElement).toBe(byId(form, 'create-name').element)
   })
 
   it('a clash in another case is no race: the fixed copy shows', async () => {

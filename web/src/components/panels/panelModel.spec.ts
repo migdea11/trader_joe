@@ -6,7 +6,7 @@ import { create, toJson } from '@bufbuild/protobuf'
 import { timestampFromMs } from '@bufbuild/protobuf/wkt'
 import { describe, expect, it } from 'vitest'
 
-import { AssetType } from '@generated/trader_joe/proto/market/v1/enums_pb'
+import { AssetType, DataSource } from '@generated/trader_joe/proto/market/v1/enums_pb'
 import { DatasetHealthStatus } from '@generated/trader_joe/proto/ui/v1/data_pb'
 import {
   AssetListDayState,
@@ -31,6 +31,8 @@ import {
   DEFAULT_CADENCE_LABEL,
   cadenceLabel,
   dayStateLabel,
+  createFieldErrors,
+  draftFieldErrors,
   draftFromSettings,
   draftProblem,
   draftToSettingsInit,
@@ -46,7 +48,7 @@ import {
   stripMarkers,
   transitionLabel,
 } from './panelModel'
-import type { PanelDraft } from './panelModel'
+import type { CreateInput, PanelDraft } from './panelModel'
 
 const DAY = 86_400_000
 const START = Date.UTC(2026, 7, 3)
@@ -283,6 +285,166 @@ describe('the settings draft', () => {
       'Give the size as a whole number, 0 or more.',
     )
     expect(draftProblem({ ...ok, size: '999999999' }, 'r', { cadenceRequired: true })).toBe('')
+  })
+
+  it('draftProblem: with every problem at once it names size, then cadence, then reason (unchanged order)', () => {
+    const none = { ...ok, cadence: PanelCadence.UNSPECIFIED }
+    expect(draftProblem({ ...none, size: '' }, '', { cadenceRequired: true })).toBe('Give the size as a whole number, 0 or more.')
+    expect(draftProblem(none, '', { cadenceRequired: true })).toBe('Choose a cadence.')
+    expect(draftProblem({ ...none, size: 'x' }, '', { cadenceRequired: false })).toBe('Give the size as a whole number, 0 or more.')
+    expect(draftProblem(none, '', { cadenceRequired: false })).toBe('Give a reason for the change.')
+  })
+})
+
+// tj-crl7pm: every problem at once, per field. The settings form still reads draftProblem (the first one);
+// the create form reads createFieldErrors, which drives both its field marks and its button.
+describe('draftFieldErrors: the settings draft problems per field', () => {
+  const ok: PanelDraft = { ...emptyDraft(), cadence: PanelCadence.MONTHLY, size: '10' }
+  const SIZE = 'Give the size as a whole number, 0 or more.'
+  const CADENCE = 'Choose a cadence.'
+  const REASON = 'Give a reason for the change.'
+
+  it('nothing in the way: no field', () => {
+    expect(draftFieldErrors(ok, 'because', { cadenceRequired: true })).toEqual({})
+    expect(draftFieldErrors(ok, 'because', { cadenceRequired: false })).toEqual({})
+  })
+
+  it.each(['', ' ', '-1', 'ten', '1.5', '2147483648'])('a size of %j marks size only', (size) => {
+    expect(draftFieldErrors({ ...ok, size }, 'because', { cadenceRequired: true })).toStrictEqual({ size: SIZE })
+  })
+
+  it('cadence is marked only when required', () => {
+    const none = { ...ok, cadence: PanelCadence.UNSPECIFIED }
+    expect(draftFieldErrors(none, 'because', { cadenceRequired: true })).toStrictEqual({ cadence: CADENCE })
+    expect(draftFieldErrors(none, 'because', { cadenceRequired: false })).toStrictEqual({})
+  })
+
+  it.each(['', '   ', '\n\t'])('a blank reason (%j) marks reason only', (reason) => {
+    expect(draftFieldErrors(ok, reason, { cadenceRequired: true })).toStrictEqual({ reason: REASON })
+  })
+
+  it('every problem at once: all three, in the order size, cadence, reason', () => {
+    const errors = draftFieldErrors({ ...ok, size: '', cadence: PanelCadence.UNSPECIFIED }, ' ', { cadenceRequired: true })
+    expect(Object.entries(errors)).toEqual([
+      ['size', SIZE],
+      ['cadence', CADENCE],
+      ['reason', REASON],
+    ])
+  })
+})
+
+describe('createFieldErrors: every empty or invalid create field at once', () => {
+  const COUNT = 'Give a whole number, 0 or more.'
+  const READY: CreateInput = {
+    name: 'Large caps',
+    nameTaken: false,
+    source: DataSource.ALPACA_API,
+    sourceProblem: false,
+    sourceNeedsSettings: false,
+    draft: { ...emptyDraft(), size: '10' },
+    reason: 'because',
+    ramp: '',
+    cap: '',
+    pre: '',
+    post: '',
+  }
+  const NEEDS: CreateInput = { ...READY, sourceNeedsSettings: true, ramp: '5', cap: '200' }
+
+  it('a ready form: no field', () => {
+    expect(createFieldErrors(READY)).toEqual({})
+    expect(createFieldErrors(NEEDS)).toEqual({})
+  })
+
+  it('the form as opened: name, source, size and reason, in that order, with their words', () => {
+    const opened: CreateInput = {
+      ...READY,
+      name: '',
+      source: DataSource.UNSPECIFIED,
+      sourceNeedsSettings: null,
+      draft: emptyDraft(),
+      reason: '',
+    }
+    expect(Object.entries(createFieldErrors(opened))).toEqual([
+      ['name', 'Give the panel a name.'],
+      ['source', 'Choose a source.'],
+      ['size', 'Give the size as a whole number, 0 or more.'],
+      ['reason', 'Give a reason for the change.'],
+    ])
+  })
+
+  it('every field at once on a source with no settings: all eight, in form order', () => {
+    const all: CreateInput = {
+      ...NEEDS,
+      name: ' ',
+      sourceProblem: true,
+      draft: { ...emptyDraft(), size: 'x' },
+      reason: '',
+      ramp: '',
+      cap: '-1',
+      pre: 'x',
+      post: '1.5',
+    }
+    expect(Object.keys(createFieldErrors(all))).toEqual(['name', 'source', 'size', 'reason', 'ramp', 'cap', 'pre', 'post'])
+  })
+
+  it.each(['', '   '])('a blank name (%j) is asked for, taken or not', (name) => {
+    expect(createFieldErrors({ ...READY, name })).toStrictEqual({ name: 'Give the panel a name.' })
+    expect(createFieldErrors({ ...READY, name, nameTaken: true })).toStrictEqual({ name: 'Give the panel a name.' })
+  })
+
+  it('a taken name is refused on the name field, by its trimmed name', () => {
+    expect(createFieldErrors({ ...READY, name: '  Large caps ', nameTaken: true })).toStrictEqual({
+      name: PANEL_REFUSAL.nameTaken('Large caps'),
+    })
+  })
+
+  it('the source: unchosen, then a failed read, then a read still out, in that precedence', () => {
+    const unchosen = { ...READY, source: DataSource.UNSPECIFIED, sourceProblem: true, sourceNeedsSettings: null }
+    expect(createFieldErrors(unchosen)).toStrictEqual({ source: 'Choose a source.' })
+    expect(createFieldErrors({ ...READY, sourceProblem: true, sourceNeedsSettings: null })).toStrictEqual({
+      source: 'The source settings could not be read. Choose the source again.',
+    })
+    expect(createFieldErrors({ ...READY, sourceProblem: true })).toStrictEqual({
+      source: 'The source settings could not be read. Choose the source again.',
+    })
+    expect(createFieldErrors({ ...READY, sourceNeedsSettings: null })).toStrictEqual({ source: 'Reading the source settings.' })
+  })
+
+  it.each(['', ' ', '-1', 'ten', '1.5'])('a size of %j marks size only', (size) => {
+    expect(createFieldErrors({ ...READY, draft: { ...READY.draft, size } })).toStrictEqual({
+      size: 'Give the size as a whole number, 0 or more.',
+    })
+  })
+
+  it.each(['', '  ', '\n'])('a blank reason (%j) marks reason only', (reason) => {
+    expect(createFieldErrors({ ...READY, reason })).toStrictEqual({ reason: 'Give a reason for the change.' })
+  })
+
+  it('cadence is never marked: the store defaults it', () => {
+    expect(createFieldErrors({ ...READY, draft: { ...READY.draft, cadence: PanelCadence.UNSPECIFIED } })).toEqual({})
+  })
+
+  it.each(['', ' ', '-1', 'x', '1.5'])('a source with no settings: a ramp or cap of %j is marked on that field', (bad) => {
+    expect(createFieldErrors({ ...NEEDS, ramp: bad })).toStrictEqual({ ramp: COUNT })
+    expect(createFieldErrors({ ...NEEDS, cap: bad })).toStrictEqual({ cap: COUNT })
+  })
+
+  it('a ramp or cap of 0 is a count', () => {
+    expect(createFieldErrors({ ...NEEDS, ramp: '0', cap: '0' })).toEqual({})
+  })
+
+  it.each(['-1', 'x', '1.5'])('a source with no settings: a window day of %j is marked on that field', (bad) => {
+    expect(createFieldErrors({ ...NEEDS, pre: bad })).toStrictEqual({ pre: COUNT })
+    expect(createFieldErrors({ ...NEEDS, post: bad })).toStrictEqual({ post: COUNT })
+  })
+
+  it.each(['', '   ', '0', '30'])('a window day of %j is not marked: blank is the store default', (fine) => {
+    expect(createFieldErrors({ ...NEEDS, pre: fine, post: fine })).toEqual({})
+  })
+
+  it.each([false, null])('ramp, cap and window days are never marked unless the source has no settings (%s)', (needs) => {
+    const input = { ...READY, sourceNeedsSettings: needs, ramp: 'x', cap: '', pre: 'x', post: '-1' }
+    expect(Object.keys(createFieldErrors(input)).filter((k) => ['ramp', 'cap', 'pre', 'post'].includes(k))).toEqual([])
   })
 })
 

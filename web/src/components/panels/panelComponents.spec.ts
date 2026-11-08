@@ -4,14 +4,18 @@
 //   `enabled` flipped (unsaved edits are not smuggled in); both need a non-blank reason.
 // - PanelCreateForm: cadence Monthly (default) sent UNSPECIFIED unless picked; the four source settings
 //   fields only while the chosen source's versions page is empty (ramp and cap then required, window days
-//   optional); a required reason.
+//   optional); a required reason. Validated on click (tj-7zjov1.362.2): nothing marked on open, a press with
+//   gaps marks every one, focuses the first and sends nothing; the marks then follow the fields live.
 // - PanelSourceSettingsForm: all four numbers sent, 0 included; a required reason.
 // - PanelHistoryStrip: one block per expected day, the change bar, markers with version, pass, actor and
 //   reason; a version no pass has run under is Pending (dimmed), not a boundary.
 // - PanelMemberList and PanelCorporateActions: Unknown health for a member without a dataset, the events
 //   view per dataset.
-import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { flushPromises, mount, RouterLinkStub } from '@vue/test-utils'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { enableAutoUnmount, flushPromises, mount, RouterLinkStub } from '@vue/test-utils'
 import type { VueWrapper } from '@vue/test-utils'
 import { create } from '@bufbuild/protobuf'
 import { timestampFromMs } from '@bufbuild/protobuf/wkt'
@@ -28,6 +32,7 @@ import {
   PanelBoundariesSchema,
   PanelCadence,
   PanelDetailSchema,
+  PanelListItemSchema,
   PanelMarkerKind,
   PanelMarkerSchema,
   PanelMemberSchema,
@@ -129,6 +134,18 @@ function stubWrites(outcome: PanelWriteOutcome = { kind: 'ok' }) {
 }
 
 const byId = (wrapper: VueWrapper, id: string) => wrapper.find(`[data-testid="${id}"]`)
+
+// Create Panel pressed as the operator presses it: a click on the button. A disabled button sends nothing, and
+// jsdom submits only an attached form, so the create forms mount with attachTo (auto-unmounted below).
+async function press(form: VueWrapper): Promise<void> {
+  await byId(form, 'create-submit').trigger('click')
+  await flushPromises()
+}
+
+const mountCreate = () => mount(PanelCreateForm, { attachTo: document.body })
+const focused = (form: VueWrapper, id: string) => expect(document.activeElement).toBe(byId(form, id).element)
+
+enableAutoUnmount(afterEach)
 
 beforeEach(() => {
   window.localStorage.clear()
@@ -240,6 +257,38 @@ describe('PanelSettingsForm', () => {
     await form.find('form').trigger('submit')
     await flushPromises()
     expect(saveSettings).not.toHaveBeenCalled()
+  })
+
+  it('the settings form keeps its one-line problem: no required marker and no per-field mark (tj-crl7pm)', async () => {
+    stubWrites()
+    const form = mount(PanelSettingsForm, { props: { detail: detail() } })
+    await byId(form, 'settings-size').setValue('')
+    await byId(form, 'settings-cadence').findAll('option')[0]!.setValue()
+    expect(byId(form, 'settings-problem').text()).toBe('Give the size as a whole number, 0 or more.')
+    expect(form.find('.pn-required').exists()).toBe(false)
+    expect(form.find('.pn-field-error').exists()).toBe(false)
+    expect(form.find('[aria-required]').exists()).toBe(false)
+    expect(form.find('[aria-invalid]').exists()).toBe(false)
+    expect(byId(form, 'settings-size').attributes('aria-describedby')).toBeUndefined()
+    await byId(form, 'settings-size').setValue('3')
+    expect(byId(form, 'settings-problem').text()).toBe('Choose a cadence.')
+  })
+
+  it('validate-on-click is the create form only: Save Settings stays off while blocked and a submit marks nothing (tj-7zjov1.362.2)', async () => {
+    const { saveSettings } = stubWrites()
+    const form = mount(PanelSettingsForm, { props: { detail: detail() }, attachTo: document.body })
+    await byId(form, 'settings-size').setValue('x')
+    await byId(form, 'settings-reason').setValue('r')
+    expect(byId(form, 'settings-save').attributes('disabled')).toBeDefined()
+    expect(byId(form, 'settings-problem').text()).toBe('Give the size as a whole number, 0 or more.')
+    await form.find('form').trigger('submit')
+    await flushPromises()
+    expect(saveSettings).not.toHaveBeenCalled()
+    expect(form.find('[aria-invalid]').exists()).toBe(false)
+    expect(form.find('.pn-required').exists()).toBe(false)
+    expect(form.find('.pn-field-error').exists()).toBe(false)
+    expect(document.activeElement).toBe(document.body)
+    expect(byId(form, 'settings-problem').text()).toBe('Give the size as a whole number, 0 or more.')
   })
 
   it('a refusal is worded in place with its error id, the form kept', async () => {
@@ -442,19 +491,26 @@ describe('PanelCreateForm', () => {
   it('a source with no settings version: ramp and cap required, window days optional and absent when blank', async () => {
     api.getSourceSettingsVersions.mockResolvedValue(EMPTY_PAGE)
     const { create: createPanel } = stubWrites({ kind: 'created', detail: detail() })
-    const form = mount(PanelCreateForm)
+    const form = mountCreate()
     await fill(form, 1)
     expect(byId(form, 'create-ramp').exists()).toBe(true)
     expect(byId(form, 'create-pre').exists()).toBe(true)
-    expect(byId(form, 'create-problem').text()).toBe(
-      'This source has no settings yet: give the new datasets per hour and the requests per hour.',
-    )
+    expect(byId(form, 'create-ramp-error').exists()).toBe(false)
+    expect(byId(form, 'create-cap-error').exists()).toBe(false)
+    await press(form)
+    expect(createPanel).not.toHaveBeenCalled()
+    expect(byId(form, 'create-ramp-error').text()).toBe('Give a whole number, 0 or more.')
+    expect(byId(form, 'create-cap-error').text()).toBe('Give a whole number, 0 or more.')
+    focused(form, 'create-ramp')
+    expect(byId(form, 'create-submit').attributes('disabled')).toBeUndefined()
     await byId(form, 'create-ramp').setValue('0')
+    expect(byId(form, 'create-ramp-error').exists()).toBe(false)
+    expect(byId(form, 'create-cap-error').text()).toBe('Give a whole number, 0 or more.')
     expect(byId(form, 'create-problem').exists()).toBe(true)
     await byId(form, 'create-cap').setValue('200')
     expect(byId(form, 'create-problem').exists()).toBe(false)
-    await form.find('form').trigger('submit')
-    await flushPromises()
+    await press(form)
+    expect(createPanel).toHaveBeenCalledTimes(1)
     const sent = createPanel.mock.calls[0]![0]
     expect(sent).toMatchObject({ rampDatasetsPerHour: 0, requestCapPerHour: 200 })
     expect(sent.corporateActionWindowPreDays).toBeUndefined()
@@ -464,18 +520,21 @@ describe('PanelCreateForm', () => {
   it('window days, when given, are sent; a bad one stops the create', async () => {
     api.getSourceSettingsVersions.mockResolvedValue(EMPTY_PAGE)
     const { create: createPanel } = stubWrites({ kind: 'created', detail: detail() })
-    const form = mount(PanelCreateForm)
+    const form = mountCreate()
     await fill(form, 1)
     await byId(form, 'create-ramp').setValue('5')
     await byId(form, 'create-cap').setValue('100')
     await byId(form, 'create-pre').setValue('x')
-    expect(byId(form, 'create-problem').text()).toBe('Give each corporate action day count as a whole number.')
-    await form.find('form').trigger('submit')
+    expect(byId(form, 'create-pre-error').exists()).toBe(false)
+    await press(form)
     expect(createPanel).not.toHaveBeenCalled()
+    expect(byId(form, 'create-pre-error').text()).toBe('Give a whole number, 0 or more.')
+    expect(byId(form, 'create-post-error').exists()).toBe(false)
+    focused(form, 'create-pre')
     await byId(form, 'create-pre').setValue('30')
     await byId(form, 'create-post').setValue('0')
-    await form.find('form').trigger('submit')
-    await flushPromises()
+    await press(form)
+    expect(createPanel).toHaveBeenCalledTimes(1)
     expect(createPanel.mock.calls[0]![0]).toMatchObject({
       rampDatasetsPerHour: 5,
       requestCapPerHour: 100,
@@ -508,38 +567,47 @@ describe('PanelCreateForm', () => {
     ['source', 'Choose a source.'],
     ['reason', 'Give a reason for the change.'],
     ['size', 'Give the size as a whole number, 0 or more.'],
-  ])('without a %s the create is refused in words and nothing is sent', async (missing, words) => {
+  ])('without a %s the create is refused in words once pressed and nothing is sent', async (missing, words) => {
     api.getSourceSettingsVersions.mockResolvedValue(HELD_PAGE)
     const { create: createPanel } = stubWrites()
-    const form = mount(PanelCreateForm)
+    const form = mountCreate()
     if (missing !== 'name') await byId(form, 'create-name').setValue('n')
     if (missing !== 'source') await byId(form, 'create-source').findAll('option')[1]!.setValue()
     await flushPromises()
     if (missing !== 'size') await byId(form, 'create-size').setValue('1')
     if (missing !== 'reason') await byId(form, 'create-reason').setValue('r')
-    expect(byId(form, 'create-problem').text()).toBe(words)
-    expect(byId(form, 'create-submit').attributes('disabled')).toBeDefined()
-    await form.find('form').trigger('submit')
-    await flushPromises()
+    expect(form.findAll('[data-testid$="-error"]')).toHaveLength(0)
+    expect(byId(form, 'create-submit').attributes('disabled')).toBeUndefined()
+    await press(form)
+    expect(createPanel).not.toHaveBeenCalled()
+    expect(byId(form, `create-${missing}-error`).text()).toBe(words)
+    expect(form.findAll('[data-testid$="-error"]')).toHaveLength(1)
+    focused(form, `create-${missing}`)
+    expect(byId(form, 'create-submit').attributes('disabled')).toBeUndefined()
+    await press(form)
     expect(createPanel).not.toHaveBeenCalled()
   })
 
   it('while the source page is out the create waits; a failed read says so', async () => {
     let answer!: (value: unknown) => void
     api.getSourceSettingsVersions.mockImplementationOnce(() => new Promise((resolve) => (answer = resolve)))
-    stubWrites()
-    const form = mount(PanelCreateForm)
+    const { create: createPanel } = stubWrites()
+    const form = mountCreate()
     await byId(form, 'create-name').setValue('n')
     await byId(form, 'create-source').findAll('option')[1]!.setValue()
-    expect(byId(form, 'create-problem').text()).toBe('Reading the source settings.')
+    expect(byId(form, 'create-source-error').exists()).toBe(false)
+    await press(form)
+    expect(createPanel).not.toHaveBeenCalled()
+    expect(byId(form, 'create-source-error').text()).toBe('Reading the source settings.')
     answer(EMPTY_PAGE)
     await flushPromises()
     expect(byId(form, 'create-ramp').exists()).toBe(true)
+    expect(byId(form, 'create-source-error').exists()).toBe(false)
 
     api.getSourceSettingsVersions.mockRejectedValueOnce(new ApiError({ status: 500 }))
     await byId(form, 'create-source').findAll('option')[2]!.setValue()
     await flushPromises()
-    expect(byId(form, 'create-problem').text()).toBe('The source settings could not be read. Choose the source again.')
+    expect(byId(form, 'create-source-error').text()).toBe('The source settings could not be read. Choose the source again.')
     expect(byId(form, 'create-ramp').exists()).toBe(false)
   })
 
@@ -576,6 +644,390 @@ describe('PanelCreateForm', () => {
     await byId(form, 'create-cancel').trigger('click')
     expect(form.emitted('close')).toHaveLength(1)
     expect(createPanel).not.toHaveBeenCalled()
+  })
+})
+
+// tj-crl7pm, re-sequenced by tj-7zjov1.362.2 (owner ruling 2026-11-06: validate on click): every mandatory
+// field carries a required marker, neutral on open. Nothing is marked until Create Panel is pressed; a press
+// with gaps marks every empty or invalid field at once (aria-invalid, its own message linked by
+// aria-describedby, the marker turned pn-required--marked), focuses the first in screen order and sends
+// nothing. From then on the marks follow the fields live, each staying until its field is valid. The button
+// is off only while a write is out; the summary line counts the marks and never says the button is off.
+describe('PanelCreateForm: validated on click, every missing field marked at once', () => {
+  const EMPTY_PAGE = create(PanelSourceSettingsVersionPageSchema)
+  const HELD_PAGE = create(PanelSourceSettingsVersionPageSchema, { items: [create(PanelSourceSettingsVersionSchema, { versionNo: 1 })] })
+  const MANDATORY = ['name', 'source', 'size', 'reason'] as const
+  const OPENED = {
+    name: 'Give the panel a name.',
+    source: 'Choose a source.',
+    size: 'Give the size as a whole number, 0 or more.',
+    reason: 'Give a reason for the change.',
+  }
+  const COUNT = 'Give a whole number, 0 or more.'
+
+  const marker = (form: VueWrapper, field: string) => form.find(`label[for="create-${field}"] .pn-required`)
+
+  function expectMarked(form: VueWrapper, field: string, words: string): void {
+    const input = byId(form, `create-${field}`)
+    expect(input.attributes('aria-invalid')).toBe('true')
+    expect(input.attributes('aria-describedby')).toBe(`create-${field}-error`)
+    const message = form.find(`#create-${field}-error`)
+    expect(message.exists()).toBe(true)
+    expect(message.attributes('data-testid')).toBe(`create-${field}-error`)
+    expect(message.classes()).toContain('pn-field-error')
+    expect(message.text()).toBe(words)
+    // A required field's asterisk turns to the error colour with its mark (the window days carry none).
+    if (marker(form, field).exists()) expect(marker(form, field).classes()).toContain('pn-required--marked')
+  }
+
+  function expectUnmarked(form: VueWrapper, field: string): void {
+    const input = byId(form, `create-${field}`)
+    expect(input.attributes('aria-invalid')).toBeUndefined()
+    expect(input.attributes('aria-describedby')).toBeUndefined()
+    expect(byId(form, `create-${field}-error`).exists()).toBe(false)
+    if (marker(form, field).exists()) expect(marker(form, field).classes()).not.toContain('pn-required--marked')
+  }
+
+  function expectRequired(form: VueWrapper, field: string): void {
+    expect(marker(form, field).exists()).toBe(true)
+    expect(marker(form, field).text()).toBe('*')
+    expect(marker(form, field).attributes('aria-hidden')).toBe('true')
+    expect(byId(form, `create-${field}`).attributes('aria-required')).toBe('true')
+  }
+
+  /** The summary counts the marks; the button is never off for them, only while a write is out. */
+  function expectSummary(form: VueWrapper, count: number): void {
+    const summary = byId(form, 'create-problem')
+    const submit = byId(form, 'create-submit')
+    expect(submit.attributes('disabled')).toBeUndefined()
+    if (count === 0) {
+      expect(summary.exists()).toBe(false)
+      expect(submit.attributes('aria-describedby')).toBeUndefined()
+      expect(form.findAll('.pn-field-error')).toHaveLength(0)
+      expect(form.findAll('[aria-invalid]')).toHaveLength(0)
+      expect(form.findAll('.pn-required--marked')).toHaveLength(0)
+      return
+    }
+    expect(summary.text()).toBe(
+      count === 1
+        ? '1 marked field needs a value before the panel can be created.'
+        : `${count} marked fields need a value before the panel can be created.`,
+    )
+    expect(summary.attributes('id')).toBe('create-problem')
+    expect(submit.attributes('aria-describedby')).toBe('create-problem')
+    expect(form.findAll('.pn-field-error')).toHaveLength(count)
+    expect(form.findAll('[aria-invalid="true"]')).toHaveLength(count)
+  }
+
+  it('on open nothing is marked, every required label has its asterisk in the neutral state, no summary, the button on', async () => {
+    api.getSourceSettingsVersions.mockResolvedValue(EMPTY_PAGE)
+    const { create: createPanel } = stubWrites()
+    const form = mountCreate()
+    for (const field of MANDATORY) {
+      expectRequired(form, field)
+      expectUnmarked(form, field)
+      expect(marker(form, field).classes()).toEqual(['pn-required'])
+    }
+    expectSummary(form, 0)
+    expect(form.text()).toContain('Fields marked * are required.')
+    // A source with no settings: its two required fields appear with neutral asterisks, still unmarked.
+    await byId(form, 'create-source').findAll('option')[1]!.setValue()
+    await flushPromises()
+    for (const field of ['ramp', 'cap']) {
+      expectRequired(form, field)
+      expectUnmarked(form, field)
+      expect(marker(form, field).classes()).toEqual(['pn-required'])
+    }
+    await byId(form, 'create-pre').setValue('x')
+    expectUnmarked(form, 'pre')
+    expectSummary(form, 0)
+    expect(createPanel).not.toHaveBeenCalled()
+  })
+
+  it('the asterisk is a neutral text colour until marked, then the error colour (panels.css)', () => {
+    // Vitest stubs imported CSS, so the stylesheet is read as text, as CoverageStrip.spec.ts reads its styles.
+    const panelsCss = readFileSync(resolve(import.meta.dirname, 'panels.css'), 'utf8')
+    expect(panelsCss).toContain('.pn-required')
+    // The declarations of the one top-level rule whose selector list names exactly this selector.
+    const rule = (selector: string) => {
+      const blocks = panelsCss
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .split('}')
+        .map((block) => block.split('{'))
+        .filter((parts) => parts.length === 2 && parts[0]!.split(',').some((s) => s.trim() === selector))
+      expect(blocks.map((parts) => parts[0]!.trim()), selector).toHaveLength(1)
+      return blocks[0]![1]!
+    }
+    expect(rule('.pn-required')).toMatch(/color:\s*var\(--tj-text2\)/)
+    expect(rule('.pn-required')).not.toContain('--tj-status-fail')
+    expect(rule('.pn-required--marked')).toMatch(/color:\s*var\(--tj-status-fail\)/)
+  })
+
+  it('a click on an empty form marks the four at once, focuses the name and sends nothing', async () => {
+    const { create: createPanel } = stubWrites()
+    const form = mountCreate()
+    await press(form)
+    expect(createPanel).not.toHaveBeenCalled()
+    for (const field of MANDATORY) {
+      expectRequired(form, field)
+      expectMarked(form, field, OPENED[field])
+    }
+    expectSummary(form, 4)
+    focused(form, 'create-name')
+  })
+
+  it('Enter submits the same way: the form marks, focuses the first and sends nothing', async () => {
+    api.getSourceSettingsVersions.mockResolvedValue(HELD_PAGE)
+    const { create: createPanel } = stubWrites()
+    const form = mountCreate()
+    await byId(form, 'create-name').setValue('n')
+    await form.find('form').trigger('submit')
+    await flushPromises()
+    expect(createPanel).not.toHaveBeenCalled()
+    expectSummary(form, 3)
+    focused(form, 'create-source')
+  })
+
+  it('cadence and the optional filters carry no marker and are never marked, pressed or not', async () => {
+    stubWrites()
+    const form = mountCreate()
+    for (const pressed of [false, true]) {
+      if (pressed) await press(form)
+      for (const field of ['cadence', 'allow', 'deny', 'exchange']) {
+        expect(marker(form, field).exists()).toBe(false)
+        expect(byId(form, `create-${field}`).attributes('aria-required')).toBeUndefined()
+        expectUnmarked(form, field)
+      }
+    }
+  })
+
+  it('after a press the marks follow live: fixing a field clears only its mark and the count follows', async () => {
+    api.getSourceSettingsVersions.mockResolvedValue(HELD_PAGE)
+    const { create: createPanel } = stubWrites({ kind: 'created', detail: detail() })
+    const form = mountCreate()
+    await press(form)
+    expectSummary(form, 4)
+    await byId(form, 'create-name').setValue('n')
+    expectUnmarked(form, 'name')
+    for (const field of ['source', 'size', 'reason'] as const) expectMarked(form, field, OPENED[field])
+    expectSummary(form, 3)
+    await byId(form, 'create-source').findAll('option')[1]!.setValue()
+    await flushPromises()
+    expectUnmarked(form, 'source')
+    expectMarked(form, 'size', OPENED.size)
+    expectMarked(form, 'reason', OPENED.reason)
+    expectSummary(form, 2)
+    await byId(form, 'create-size').setValue('1')
+    expectUnmarked(form, 'size')
+    expectSummary(form, 1)
+    expectMarked(form, 'reason', OPENED.reason)
+    await byId(form, 'create-reason').setValue('r')
+    for (const field of MANDATORY) {
+      expectUnmarked(form, field)
+      expectRequired(form, field)
+    }
+    expectSummary(form, 0)
+    // Still live with no second press: a field broken again is marked again at once.
+    await byId(form, 'create-size').setValue('x')
+    expectMarked(form, 'size', OPENED.size)
+    expectUnmarked(form, 'name')
+    expectSummary(form, 1)
+    await byId(form, 'create-name').setValue('')
+    expectMarked(form, 'name', OPENED.name)
+    expectSummary(form, 2)
+    expect(createPanel).not.toHaveBeenCalled()
+    await byId(form, 'create-name').setValue('n')
+    await byId(form, 'create-size').setValue('2')
+    expectSummary(form, 0)
+    await press(form)
+    expect(createPanel).toHaveBeenCalledTimes(1)
+  })
+
+  it('a valid form sends exactly once on the first press, and nothing is marked', async () => {
+    api.getSourceSettingsVersions.mockResolvedValue(HELD_PAGE)
+    const { create: createPanel } = stubWrites({ kind: 'invalid', error: { message: 'x', errorId: 'e-1' } })
+    const form = mountCreate()
+    await byId(form, 'create-name').setValue('n')
+    await byId(form, 'create-source').findAll('option')[1]!.setValue()
+    await flushPromises()
+    await byId(form, 'create-size').setValue('1')
+    await byId(form, 'create-reason').setValue('r')
+    await press(form)
+    expect(createPanel).toHaveBeenCalledTimes(1)
+    expectSummary(form, 0)
+  })
+
+  it('while a write is out the button is off and a second submit sends nothing; it is back on after', async () => {
+    api.getSourceSettingsVersions.mockResolvedValue(HELD_PAGE)
+    const { store, create: createPanel } = stubWrites()
+    let finish!: (outcome: PanelWriteOutcome) => void
+    createPanel.mockImplementation(() => {
+      store.writing = true
+      return new Promise<PanelWriteOutcome>((resolve) => (finish = resolve)).finally(() => (store.writing = false))
+    })
+    const form = mountCreate()
+    expect(byId(form, 'create-submit').attributes('disabled')).toBeUndefined()
+    await byId(form, 'create-name').setValue('n')
+    await byId(form, 'create-source').findAll('option')[1]!.setValue()
+    await flushPromises()
+    await byId(form, 'create-size').setValue('1')
+    await byId(form, 'create-reason').setValue('r')
+    await press(form)
+    expect(createPanel).toHaveBeenCalledTimes(1)
+    expect(byId(form, 'create-submit').attributes('disabled')).toBeDefined()
+    await form.find('form').trigger('submit')
+    await flushPromises()
+    expect(createPanel).toHaveBeenCalledTimes(1)
+    finish({ kind: 'invalid', error: { message: 'x', errorId: 'e-2' } })
+    await flushPromises()
+    expect(byId(form, 'create-submit').attributes('disabled')).toBeUndefined()
+  })
+
+  it.each([
+    ['nothing filled', {}, 'create-name'],
+    ['a name only', { name: 'n' }, 'create-source'],
+    ['name and source', { name: 'n', source: 'held' }, 'create-size'],
+    ['all but the reason', { name: 'n', source: 'held', size: '1' }, 'create-reason'],
+    ['a bad size and no reason', { name: 'n', source: 'held', size: 'x' }, 'create-size'],
+    ['no name, the rest filled', { source: 'held', size: '1', reason: 'r' }, 'create-name'],
+    ['no ramp, no cap, no reason', { name: 'n', source: 'empty', size: '1' }, 'create-ramp'],
+    ['no cap and no reason', { name: 'n', source: 'empty', size: '1', ramp: '0' }, 'create-cap'],
+    ['a bad pre day and no reason', { name: 'n', source: 'empty', size: '1', ramp: '0', cap: '1', pre: 'x' }, 'create-pre'],
+    ['a bad post day only', { name: 'n', source: 'empty', size: '1', ramp: '0', cap: '1', post: '-1', reason: 'r' }, 'create-post'],
+    ['no size and a bad cap', { name: 'n', source: 'empty', ramp: '0', cap: 'x', reason: 'r' }, 'create-size'],
+  ] as const)('focus goes to the first invalid field in screen order: %s', async (_case, given: Record<string, string>, first) => {
+    api.getSourceSettingsVersions.mockResolvedValue(given.source === 'empty' ? EMPTY_PAGE : HELD_PAGE)
+    const { create: createPanel } = stubWrites()
+    const form = mountCreate()
+    if (given.name) await byId(form, 'create-name').setValue(given.name)
+    if (given.source) {
+      await byId(form, 'create-source').findAll('option')[1]!.setValue()
+      await flushPromises()
+    }
+    for (const field of ['size', 'ramp', 'cap', 'pre', 'post', 'reason']) {
+      if (given[field] !== undefined) await byId(form, `create-${field}`).setValue(given[field])
+    }
+    expect(document.activeElement).not.toBe(byId(form, first).element)
+    await press(form)
+    expect(createPanel).not.toHaveBeenCalled()
+    focused(form, first)
+    expect(form.find('[aria-invalid="true"]').element).toBe(byId(form, first).element)
+  })
+
+  it('a second press after a fix moves the focus to the next invalid field', async () => {
+    stubWrites()
+    const form = mountCreate()
+    await press(form)
+    focused(form, 'create-name')
+    await byId(form, 'create-name').setValue('n')
+    await press(form)
+    focused(form, 'create-source')
+  })
+
+  it('a source with no settings version: ramp and cap are required and marked; window days only when filled and bad', async () => {
+    api.getSourceSettingsVersions.mockResolvedValue(EMPTY_PAGE)
+    const { create: createPanel } = stubWrites()
+    const form = mountCreate()
+    await byId(form, 'create-name').setValue('n')
+    await byId(form, 'create-source').findAll('option')[1]!.setValue()
+    await flushPromises()
+    await byId(form, 'create-size').setValue('1')
+    await byId(form, 'create-reason').setValue('r')
+    for (const field of ['ramp', 'cap']) expectUnmarked(form, field)
+    expectSummary(form, 0)
+    await press(form)
+    expect(createPanel).not.toHaveBeenCalled()
+    focused(form, 'create-ramp')
+    for (const field of ['ramp', 'cap']) {
+      expectRequired(form, field)
+      expectMarked(form, field, COUNT)
+    }
+    for (const field of ['pre', 'post']) {
+      expect(marker(form, field).exists()).toBe(false)
+      expect(byId(form, `create-${field}`).attributes('aria-required')).toBeUndefined()
+      expectUnmarked(form, field)
+    }
+    expectSummary(form, 2)
+    await byId(form, 'create-ramp').setValue('0')
+    await byId(form, 'create-cap').setValue('-1')
+    expectUnmarked(form, 'ramp')
+    expectMarked(form, 'cap', COUNT)
+    expectSummary(form, 1)
+    await byId(form, 'create-cap').setValue('9')
+    await byId(form, 'create-pre').setValue('x')
+    await byId(form, 'create-post').setValue('1.5')
+    expectMarked(form, 'pre', COUNT)
+    expectMarked(form, 'post', COUNT)
+    expectSummary(form, 2)
+    await byId(form, 'create-pre').setValue('')
+    await byId(form, 'create-post').setValue('0')
+    expectUnmarked(form, 'pre')
+    expectUnmarked(form, 'post')
+    expectSummary(form, 0)
+  })
+
+  it('a source with a settings version: no ramp, cap or window day field and nothing marked for them', async () => {
+    api.getSourceSettingsVersions.mockResolvedValue(HELD_PAGE)
+    stubWrites()
+    const form = mountCreate()
+    await byId(form, 'create-source').findAll('option')[1]!.setValue()
+    await flushPromises()
+    await press(form)
+    for (const field of ['ramp', 'cap', 'pre', 'post']) {
+      expect(byId(form, `create-${field}`).exists()).toBe(false)
+      expect(byId(form, `create-${field}-error`).exists()).toBe(false)
+    }
+    expectSummary(form, 3)
+  })
+
+  it('a source-settings read still out, then failed, is shown on the Source field once pressed', async () => {
+    let answer!: (value: unknown) => void
+    api.getSourceSettingsVersions.mockImplementationOnce(() => new Promise((resolve) => (answer = resolve)))
+    const { create: createPanel } = stubWrites()
+    const form = mountCreate()
+    await byId(form, 'create-name').setValue('n')
+    await byId(form, 'create-size').setValue('1')
+    await byId(form, 'create-reason').setValue('r')
+    await byId(form, 'create-source').findAll('option')[1]!.setValue()
+    expectUnmarked(form, 'source')
+    expectSummary(form, 0)
+    await press(form)
+    expect(createPanel).not.toHaveBeenCalled()
+    expectMarked(form, 'source', 'Reading the source settings.')
+    expectSummary(form, 1)
+    focused(form, 'create-source')
+    answer(HELD_PAGE)
+    await flushPromises()
+    expectUnmarked(form, 'source')
+    expectSummary(form, 0)
+
+    api.getSourceSettingsVersions.mockRejectedValueOnce(new ApiError({ status: 500 }))
+    await byId(form, 'create-source').findAll('option')[2]!.setValue()
+    await flushPromises()
+    expectMarked(form, 'source', 'The source settings could not be read. Choose the source again.')
+    expectSummary(form, 1)
+  })
+
+  it('a name the loaded list holds is marked on the name field only once pressed, like every other mark', async () => {
+    api.getSourceSettingsVersions.mockResolvedValue(HELD_PAGE)
+    const { store, create: createPanel } = stubWrites()
+    store.panels = [create(PanelListItemSchema, { name: 'Large caps' })]
+    const form = mountCreate()
+    await byId(form, 'create-name').setValue(' Large caps ')
+    await byId(form, 'create-source').findAll('option')[1]!.setValue()
+    await flushPromises()
+    await byId(form, 'create-size').setValue('1')
+    await byId(form, 'create-reason').setValue('r')
+    expectUnmarked(form, 'name')
+    expectSummary(form, 0)
+    await press(form)
+    expect(createPanel).not.toHaveBeenCalled()
+    expectMarked(form, 'name', 'A panel named "Large caps" already exists. Choose another name.')
+    expectSummary(form, 1)
+    focused(form, 'create-name')
+    await byId(form, 'create-name').setValue('Small caps')
+    expectUnmarked(form, 'name')
+    expectSummary(form, 0)
   })
 })
 

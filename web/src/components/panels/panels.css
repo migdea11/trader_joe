@@ -54,6 +54,24 @@
   font-size: 13px;
 }
 
+.pn-input[aria-invalid='true'] {
+  border-color: var(--tj-status-fail);
+}
+
+.pn-required {
+  color: var(--tj-text2);
+}
+
+.pn-required--marked,
+.pn-field-error {
+  color: var(--tj-status-fail);
+}
+
+.pn-field-error {
+  margin: 0;
+  font-size: 12px;
+}
+
 textarea.pn-input {
   height: auto;
   padding: 8px 10px;
