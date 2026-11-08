@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.models.quotes import Quote
@@ -20,9 +21,9 @@ from common.errors.vocabulary import InvalidRequestError, Reason
 from common.logging import get_logger
 from data.ingest.app.brokers.broker_errors import MissingCredentialsError
 from data.ingest.app.brokers.interface import BarsQuery
-from data.ingest.app.brokers.rate_budget import RateBudget
 from data.ingest.app.brokers.request_key import VendorRequestKey
 from data.ingest.app.brokers.single_flight import SingleFlight
+from data.ingest.app.scheduler import Scheduler
 
 
 log = get_logger(__name__)
@@ -38,7 +39,6 @@ ALPACA_CREDENTIAL_VARS = ('ALPACA_API_KEY', 'ALPACA_API_SECRET')
 
 __CLIENT: StockHistoricalDataClient | None = None
 __SINGLE_FLIGHT = SingleFlight()
-__RATE_BUDGET: RateBudget | None = None
 
 
 def sip_enabled() -> bool:
@@ -123,20 +123,6 @@ def set_client(client: StockHistoricalDataClient | None) -> None:
     __CLIENT = client
 
 
-def get_rate_budget() -> RateBudget:
-    """Get this vendor's rate budget, building it on first use.
-
-    Built lazily so that importing the module does not read the environment.
-
-    Returns:
-        RateBudget: Shared budget for every Alpaca call this process makes.
-    """
-    global __RATE_BUDGET
-    if __RATE_BUDGET is None:
-        __RATE_BUDGET = RateBudget.from_env(DataSource.ALPACA_API)
-    return __RATE_BUDGET
-
-
 def create_stock_quote(data: Quote, symbol: str, granularity: Granularity, source: DataSource) -> None:
     return None
 
@@ -178,6 +164,9 @@ async def fetch_data_type(
     params: dict,
     feed: Feed,
     client: StockHistoricalDataClient | None = None,
+    *,
+    scheduler: Scheduler,
+    scope: str,
 ):
     """Fetch one data type from the vendor, collapsed and rate-limited.
 
@@ -200,12 +189,15 @@ async def fetch_data_type(
             AlpacaRead stamps from the same value.
         client (StockHistoricalDataClient | None): Client to call, or None for this
             process's own (see get_client()).
+        scheduler (Scheduler): The handle's scheduler, whose quota limits pace every vendor call. Nothing
+            else paces a call: the budget this module used to build from the environment is gone.
+        scope (str): The quota scope of the call.
 
     Returns:
         The vendor's response, shared read-only with any caller that attached to this call.
 
     Raises:
-        ExogenousError: With the reason RATE_BUDGET, if query.deadline is set and the rate budget
+        ExogenousError: With the reason RATE_BUDGET, if query.deadline is set and the scope's limits
             cannot admit the call before it. The call that reaches the vendor is the leader's, so
             the leader's deadline is the one the budget holds it to, and an attached caller shares
             that outcome whatever its own deadline.
@@ -242,7 +234,9 @@ async def fetch_data_type(
         # One token per call that actually reaches the vendor. Calls collapsed by the guard
         # cost nothing, which is the point of doing this inside it rather than outside. The
         # deadline makes a wait the caller cannot afford a refusal at once (ADR tj-fa1rpu U4).
-        await get_rate_budget().acquire(priority, deadline=deadline)
+        await scheduler.acquire(scope, priority, deadline=deadline)
+        if query.tally is not None:
+            query.tally.record(datetime.now(UTC))
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(executor, client_request, client_request_type(**params))
 

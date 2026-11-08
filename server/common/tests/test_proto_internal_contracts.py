@@ -184,6 +184,7 @@ STORE_ENUMS = {
         ('DELIVERY_OUTCOME_SUCCEEDED', 1),
         ('DELIVERY_OUTCOME_FAILED', 2),
         ('DELIVERY_OUTCOME_EXPIRED', 3),
+        ('DELIVERY_OUTCOME_EXHAUSTED', 4),
     ],
     'DeliveryErrorClass': [
         ('DELIVERY_ERROR_CLASS_UNSPECIFIED', 0),
@@ -291,7 +292,9 @@ def test_header_feed_comment_pins_the_submit_rule_bars_only_resolved_and_unspeci
     assert 'THE FEED FOLLOWS THE SUBMIT RULE' in comment, comment
     assert 'For a BARS attempt it is the resolved tape, and never FEED_UNSPECIFIED.' in comment, comment
     assert 'For an ASSET_LIST or CORPORATE_ACTIONS attempt it is always FEED_UNSPECIFIED' in comment, comment
-    assert "An EXPIRED report made no vendor call and carries the request's kind rule unchanged" in comment, comment
+    assert (
+        "An EXPIRED or EXHAUSTED report made no vendor call and carries the request's kind rule unchanged"
+    ) in comment, comment
 
 
 def test_header_vendor_asset_id_comment_says_opaque_data_never_parsed_and_never_an_argument():
@@ -346,12 +349,57 @@ def test_expired_outcome_comment_says_no_vendor_call_no_stats_and_final_with_no_
     assert 'answers FINAL and writes no attempt row' in comment, comment
 
 
+def test_exhausted_outcome_comment_says_never_sent_no_spend_failed_attempts_exhausted_no_row_and_final():
+    """Ruling 1 of tj-wisp-g9rmw0: a request whose budget was spent before it arrived is its own outcome.
+
+    Never sent to the vendor, shaped as EXPIRED, and not an attempt: the store writes it FAILED with cause
+    attempts exhausted, writes no attempt row, leaves the count, records no spend and answers FINAL.
+    """
+    comment = _store_enum_value_comment('DeliveryOutcome', 'DELIVERY_OUTCOME_EXHAUSTED')
+
+    assert 'attempt budget already spent' in comment, comment
+    assert 'NEVER SENT TO THE VENDOR' in comment, comment
+    assert 'Shaped exactly as EXPIRED' in comment, comment
+    assert 'no vendor_stats, no payload, no served_range, no as_of, empty quota_key, empty vendor_asset_id' in (
+        comment
+    ), comment
+    assert 'error_class UNSPECIFIED and last_attempt false' in comment, comment
+    assert "attempt_no is the request's attempt count plus one and is only the idempotency key" in comment, comment
+    assert 'the store writes the request FAILED with cause attempts exhausted' in comment, comment
+    assert 'writes no attempt row' in comment, comment
+    assert 'leaves the durable attempt count as it was' in comment, comment
+    assert 'records no spend' in comment, comment
+    assert 'answers FINAL' in comment, comment
+
+
+def test_header_vendor_asset_id_comment_says_empty_on_an_expired_or_exhausted_report():
+    """No call was made, so no vendor ever named the instrument."""
+    comment = _store_message_comment('DeliveryHeader', 'vendor_asset_id')
+
+    assert 'and on an expired or exhausted report' in comment, comment
+
+
+def test_trailer_as_of_comment_says_unset_on_expired_and_exhausted():
+    """No vendor answered, so there is no answer time."""
+    comment = _store_message_comment('DeliveryTrailer', 'as_of')
+
+    assert 'Unset on EXPIRED and EXHAUSTED.' in comment, comment
+
+
+def test_final_verdict_comment_lists_a_budget_already_spent():
+    """The FINAL list names every finished case, the exhausted one included."""
+    comment = _store_enum_value_comment('DeliveryVerdict', 'DELIVERY_VERDICT_FINAL')
+
+    assert 'a budget already spent' in comment, comment
+    assert 'ingest drops it and runs no retry' in comment, comment
+
+
 def test_trailer_vendor_stats_comment_includes_failed_attempts_and_excludes_expired():
     """Spend is reported for failures too; an expiry made no call and so carries none."""
     comment = _store_message_comment('DeliveryTrailer', 'vendor_stats')
 
     assert 'FAILED attempts included' in comment, comment
-    assert 'Unset on EXPIRED, which made no call' in comment, comment
+    assert 'Unset on EXPIRED and EXHAUSTED, which made no call' in comment, comment
 
 
 def test_register_instance_comment_names_it_the_restart_marker():
@@ -420,7 +468,7 @@ def test_header_quota_key_comment_says_empty_on_an_expired_report():
     """Architect gate D: an expired report made no vendor call and so charged no quota."""
     comment = _store_message_comment('DeliveryHeader', 'quota_key')
 
-    assert 'EMPTY ON AN EXPIRED REPORT' in comment, comment
+    assert 'EMPTY ON AN EXPIRED OR EXHAUSTED REPORT' in comment, comment
     assert 'nothing was charged to any quota' in comment, comment
 
 

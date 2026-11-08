@@ -55,8 +55,8 @@ from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Feed, Granularity
 from common.errors.vocabulary import REASONS, ExogenousError, InvalidRequestError, Outcome, Reason, TraderJoeError
 from data.ingest.app import main
-from data.ingest.app.brokers import rate_budget as rate_budget_module
 from data.ingest.app.brokers.alpaca import broker_api
+from data.ingest.app.brokers.alpaca.handle import ALPACA_DATA_SCOPE
 from data.ingest.app.brokers.alpaca.read import AlpacaRead
 from data.ingest.app.brokers.broker_errors import MissingCredentialsError
 from data.ingest.app.brokers.interface import (
@@ -68,7 +68,16 @@ from data.ingest.app.brokers.interface import (
     Instrument,
     ServedRange,
 )
-from data.ingest.app.brokers.rate_budget import RateBudget, RequestPriority
+from data.ingest.app.brokers.rate_budget import RequestPriority
+from data.ingest.app.scheduler import scheduler as scheduler_module
+from data.ingest.tests.scheduler_doubles import (
+    ONE_PER_MINUTE_OVER_AN_HOUR,
+    ONE_PER_SECOND,
+    Acquire,
+    RecordingScheduler,
+    alpaca_reader,
+    real_scheduler,
+)
 from routers.common.errors import PROBLEM_RESPONSES
 
 
@@ -119,18 +128,6 @@ def failing_client(error: BaseException) -> Mock:
     return client
 
 
-class CountingBudget:
-    """A rate budget that grants every token and records what each acquire was asked."""
-
-    full_refill_seconds = 1.0
-
-    def __init__(self) -> None:
-        self.acquires: list[tuple[RequestPriority, datetime | None]] = []
-
-    async def acquire(self, priority: RequestPriority = RequestPriority.INTERACTIVE, deadline=None) -> None:
-        self.acquires.append((priority, deadline))
-
-
 def api_error(status: int, message: str) -> APIError:
     """An APIError as alpaca-py builds one: a real response, raise_for_status, APIError(text, http_error)."""
     response = requests.Response()
@@ -153,12 +150,20 @@ def iex_deployment_and_no_cached_client(monkeypatch):
     broker_api.set_client(None)
 
 
-@pytest.fixture
-def budget(monkeypatch) -> CountingBudget:
-    """Stand in for Alpaca's rate budget, so a token taken (or not) is observable."""
-    counting = CountingBudget()
-    monkeypatch.setattr(broker_api, '__RATE_BUDGET', counting)
-    return counting
+# The scheduler the reader() below paces through unless a test hands it another. Set per test by `budget`.
+PACING: dict[str, RecordingScheduler] = {}
+
+
+@pytest.fixture(autouse=True)
+def budget(monkeypatch) -> RecordingScheduler:
+    """Stand in for the Alpaca handle's scheduler, so a token taken (or not), and its scope, are observable.
+
+    Until P11 (tj-7zjov1.20) this replaced broker_api's own RateBudget; that budget is gone and every vendor
+    call is paced by the scheduler AlpacaRead is built with, so the stand-in is handed to the reader instead.
+    """
+    recording = RecordingScheduler()
+    monkeypatch.setitem(PACING, 'scheduler', recording)
+    return recording
 
 
 @pytest.fixture
@@ -167,8 +172,8 @@ def executor() -> Iterator[ThreadPoolExecutor]:
         yield pool
 
 
-def reader(client: Mock | None, executor: ThreadPoolExecutor, clock=lambda: NOW) -> AlpacaRead:
-    return AlpacaRead(client=client, executor_provider=lambda: executor, clock=clock)
+def reader(client: Mock | None, executor: ThreadPoolExecutor, clock=lambda: NOW, scheduler=None) -> AlpacaRead:
+    return alpaca_reader(client, executor, clock, scheduler=scheduler if scheduler is not None else PACING['scheduler'])
 
 
 def query(**overrides) -> BarsQuery:
@@ -420,15 +425,25 @@ async def test_a_vendor_failure_is_returned_with_the_caught_exception_as_its_cau
 
 
 @pytest.mark.asyncio
-async def test_a_vendor_429_is_returned_rate_limited_with_reset_at_on_the_readers_clock(executor, monkeypatch):
-    monkeypatch.setattr(broker_api, '__RATE_BUDGET', RateBudget('ALPACA', rate_per_sec=2.0, burst=4.0))
+async def test_a_vendor_429_is_returned_rate_limited_with_reset_at_on_the_readers_clock(executor):
+    """No header on this response, so the fallback is the reader's OWN scope's declared window.
+
+    Since P11 the window is Scheduler.window(scope), not broker_api's budget; since 18ff3f5 the fallback is its
+    declared window (the longest limit interval), not the bucket's refill. The reader's scope declares a minute
+    and refills in a second; a decoy scope declares an hour. A reader that asked the wrong scope, or read the
+    refill, is caught.
+    """
+    scheduler = real_scheduler({ALPACA_DATA_SCOPE: ONE_PER_SECOND, 'DECOY': ONE_PER_MINUTE_OVER_AN_HOUR})
+    assert scheduler.window(ALPACA_DATA_SCOPE).declared_window_seconds == 60.0
+    assert scheduler.window(ALPACA_DATA_SCOPE).full_refill_seconds == 1.0
+    assert scheduler.window('DECOY').declared_window_seconds == 3600.0
     raised = api_error(429, 'rate limit exceeded')
 
-    error = failure_of(await reader(failing_client(raised), executor).get_bars(query()))
+    error = failure_of(await reader(failing_client(raised), executor, scheduler=scheduler).get_bars(query()))
 
     assert error.reason is Reason.VENDOR_RATE_LIMITED
-    # No header on this response, so the budget's refill from empty: 4 / 2 = 2 s after the reader's now.
-    assert error.reset_at == NOW + timedelta(seconds=2)
+    # The scope's declared window: a minute after the reader's now.
+    assert error.reset_at == NOW + timedelta(seconds=60)
     assert error.__cause__ is raised
 
 
@@ -483,19 +498,24 @@ async def test_the_rate_budgets_refusal_is_returned_with_no_cause_and_no_vendor_
         # moves, so the refusal is asserted by failing the sleep rather than by hanging the run.
         raise AssertionError(f'the rate budget slept {seconds}s instead of refusing at once')
 
-    monkeypatch.setattr(rate_budget_module, 'asyncio', SimpleNamespace(sleep=never_sleep))
-    rate_budget = RateBudget('ALPACA', rate_per_sec=1.0, burst=1.0, clock=Monotonic(), wall_clock=lambda: NOW)
-    assert rate_budget.try_acquire(RequestPriority.LIVE), 'the only token, spent before the query'
-    monkeypatch.setattr(broker_api, '__RATE_BUDGET', rate_budget)
+    # Since P11 the wait is the handle scheduler's (Scheduler.acquire sleeps through its own module).
+    monkeypatch.setattr(scheduler_module, 'asyncio', SimpleNamespace(sleep=never_sleep))
+    scheduler = real_scheduler({ALPACA_DATA_SCOPE: ONE_PER_SECOND}, clock=lambda: NOW, budget_clock=Monotonic())
+    await scheduler.acquire(ALPACA_DATA_SCOPE, RequestPriority.LIVE)  # the only token, spent before the query
     client = stub_client(START)
 
-    error = failure_of(await reader(client, executor).get_bars(query(deadline=NOW + timedelta(milliseconds=500))))
+    error = failure_of(
+        await reader(client, executor, scheduler=scheduler).get_bars(query(deadline=NOW + timedelta(milliseconds=500)))
+    )
 
     assert type(error) is ExogenousError
     assert error.reason is Reason.RATE_BUDGET
     assert REASONS[error.reason].outcome is Outcome.NOT_READY
     assert error.reset_at == NOW + timedelta(seconds=1)
     assert error.__cause__ is None
+    # The metadata key vendor carries the scope, which starts with the vendor's DataSource value (ADR tj-fa1rpu D8).
+    assert error.metadata['vendor'] == ALPACA_DATA_SCOPE
+    assert error.metadata['vendor'].startswith(DataSource.ALPACA_API.value)
     assert client.mock_calls == []
 
 
@@ -506,7 +526,7 @@ async def test_the_rate_budgets_refusal_is_returned_with_no_cause_and_no_vendor_
 async def test_the_querys_priority_and_deadline_reach_the_rate_budget(executor, budget, deadline):
     await reader(stub_client(START), executor).get_bars(query(priority=RequestPriority.BACKFILL, deadline=deadline))
 
-    assert budget.acquires == [(RequestPriority.BACKFILL, deadline)]
+    assert budget.acquires == [Acquire(ALPACA_DATA_SCOPE, RequestPriority.BACKFILL, deadline)]
 
 
 # ---------------------------------------------------------------------------------------------

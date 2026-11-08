@@ -26,6 +26,7 @@ successor for each; it is written out rather than left to the bead, because a re
 this ever covered?" should not have to find the bead to answer it.
 """
 
+import asyncio
 import inspect
 import os
 from collections.abc import AsyncIterator, Iterator
@@ -42,8 +43,10 @@ import pytest
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from common.errors.vocabulary import InvalidRequestError, Reason, TraderJoeError
+from common.rpc.channel import DATA_STORE_GRPC_TARGET_ENV
 from data.ingest.app import app_depends, grpc_host, main
 from data.ingest.app.brokers.alpaca import broker_api
+from data.ingest.app.brokers.alpaca.handle import AlpacaHandle
 from data.ingest.app.brokers.alpaca.read import AlpacaRead
 from data.ingest.app.brokers.interface import (
     Bar,
@@ -56,7 +59,9 @@ from data.ingest.app.brokers.interface import (
     ServedRange,
 )
 from data.ingest.app.brokers.rate_budget import RequestPriority
-from data.ingest.tests.grpc_bind import LoopbackGrpc
+from data.ingest.tests.grpc_bind import GUARD_S, LoopbackGrpc, free_loopback_port
+from data.ingest.tests.scheduler_doubles import RecordingScheduler, alpaca_reader
+from routers.data_ingest.submit_handler import IngestSubmitHandler
 from schemas.data_ingest.get_dataset_request import StockDatasetRequest
 
 
@@ -272,7 +277,7 @@ def test_alpaca_read_satisfies_the_broker_read_protocol():
     something else or stopped being a coroutine function fails here, in the PR gate, rather than
     at the first request. No capability flags are asserted: there are none (addendum 4 item 5).
     """
-    reader = AlpacaRead(client=Mock())
+    reader = alpaca_reader(Mock())
 
     assert isinstance(reader, RuntimeBrokerRead)
     assert inspect.iscoroutinefunction(AlpacaRead.get_bars)
@@ -346,7 +351,8 @@ async def test_alpaca_refuses_what_it_cannot_serve_before_any_vendor_call(
     vendor) is touched.
     """
     client = Mock()
-    reader = AlpacaRead(client=client, executor_provider=lambda: executor)
+    pacing = RecordingScheduler()
+    reader = alpaca_reader(client, executor, scheduler=pacing)
 
     outcome = await reader.get_bars(build_query(**overrides))
 
@@ -359,6 +365,7 @@ async def test_alpaca_refuses_what_it_cannot_serve_before_any_vendor_call(
     assert repr(value) in error.detail
     assert client.mock_calls == [], 'the vendor client was touched before the refusal'
     assert single_flight.keys == [], 'a vendor call was attempted before the refusal'
+    assert pacing.acquires == [], 'a rate token was asked of the scheduler before the refusal'
 
 
 @pytest.mark.asyncio
@@ -369,7 +376,7 @@ async def test_a_refusal_comes_before_the_credential_is_even_resolved(overrides:
     So the refusal comes before broker_api.get_client() as well as before the vendor call: a
     request Alpaca cannot serve is reported as unsupported, not as a missing credential (VENDOR_AUTH).
     """
-    reader = AlpacaRead()
+    reader = alpaca_reader()
 
     with patch.dict(os.environ, {}, clear=True):
         outcome = await reader.get_bars(build_query(**overrides))
@@ -387,7 +394,7 @@ async def test_alpaca_serves_its_own_listing_with_or_without_a_named_currency(
     # The other side of the refusals: None means 'the broker's own listing' and USD names it, so
     # both are served. Without this, a reader that refused everything would pass the tests above.
     client = stub_client([START])
-    reader = AlpacaRead(client=client, executor_provider=lambda: executor)
+    reader = alpaca_reader(client, executor)
 
     response = await reader.get_bars(build_query(instrument=Instrument('VFV', AssetType.STOCK, currency=currency)))
 
@@ -409,7 +416,7 @@ async def test_alpaca_read_keeps_the_bar_at_start_and_drops_the_bar_at_end(execu
     The stub answers with a bar at start, one strictly between, one EXACTLY at end and one after
     end -- the vendor's inclusive answer plus a stray. Only start and between may come out.
     """
-    reader = AlpacaRead(client=stub_client(VENDOR_ANSWER), executor_provider=lambda: executor)
+    reader = alpaca_reader(stub_client(VENDOR_ANSWER), executor)
 
     bars = await collect(await reader.get_bars(build_query(end=END)))
 
@@ -418,7 +425,7 @@ async def test_alpaca_read_keeps_the_bar_at_start_and_drops_the_bar_at_end(execu
 
 @pytest.mark.asyncio
 async def test_an_open_ended_query_truncates_nothing(executor: ThreadPoolExecutor):
-    reader = AlpacaRead(client=stub_client(VENDOR_ANSWER), executor_provider=lambda: executor)
+    reader = alpaca_reader(stub_client(VENDOR_ANSWER), executor)
 
     bars = await collect(await reader.get_bars(build_query(end=None)))
 
@@ -433,15 +440,9 @@ async def test_an_end_with_a_non_utc_offset_truncates_at_the_same_instant(execut
     assert end_at_minus_five.utcoffset() != timedelta(0), 'the bound really does carry another offset'
     assert end_at_minus_five == END
 
-    utc_bars = await collect(
-        await AlpacaRead(client=stub_client(VENDOR_ANSWER), executor_provider=lambda: executor).get_bars(
-            build_query(end=END)
-        )
-    )
+    utc_bars = await collect(await alpaca_reader(stub_client(VENDOR_ANSWER), executor).get_bars(build_query(end=END)))
     offset_bars = await collect(
-        await AlpacaRead(client=stub_client(VENDOR_ANSWER), executor_provider=lambda: executor).get_bars(
-            build_query(end=end_at_minus_five)
-        )
+        await alpaca_reader(stub_client(VENDOR_ANSWER), executor).get_bars(build_query(end=end_at_minus_five))
     )
 
     assert [bar.timestamp for bar in offset_bars] == [bar.timestamp for bar in utc_bars] == [START, BETWEEN]
@@ -535,6 +536,8 @@ class LifespanProbe:
 
     def __init__(self):
         self.handed: list[dict] = []
+        # The Submit handler each registration was handed (P11, tj-7zjov1.20), None where it was given none.
+        self.submits: list = []
         self.__real = grpc_host.registered_services
         self.__stack = ExitStack()
 
@@ -548,10 +551,12 @@ class LifespanProbe:
     def __exit__(self, *exc_info) -> None:
         self.__stack.close()
 
-    def __registered_services(self, readers):
-        # The real one, captured before the patch: it still builds the services the host serves.
+    def __registered_services(self, readers, **kwargs):
+        # The real one, captured before the patch: it still builds the services the host serves. Since P11 the
+        # lifespan may also hand it the Submit handler, by keyword; that is passed through untouched.
         self.handed.append(dict(readers))
-        return self.__real(readers)
+        self.submits.append(kwargs.get('submit'))
+        return self.__real(readers, **kwargs)
 
 
 @pytest.mark.asyncio
@@ -582,6 +587,8 @@ async def test_the_lifespan_hands_the_readers_create_app_received_to_the_grpc_re
 
     assert probe.handed == [{DataSource.ALPACA_API: reader}]
     assert probe.handed[0][DataSource.ALPACA_API] is reader
+    # Built with readers only, the app registers no Submit handler (it answers UNIMPLEMENTED).
+    assert probe.submits == [None]
 
 
 @pytest.mark.asyncio
@@ -597,11 +604,43 @@ async def test_the_production_app_serves_alpaca_through_alpaca_read_and_nothing_
     registration test, here and in test_grpc_host.py, builds an app with create_app(<test readers>),
     so a production composition root that wired the wrong reader -- or a second one -- would pass
     all of them.
+
+    P11 (tj-7zjov1.20): main.app is now create_app({ALPACA_API: alpaca.reader}, {ALPACA_API: alpaca}) over one
+    AlpacaHandle. The reader FetchDataset serves through must be THAT handle's reader, so FetchDataset and Submit
+    are paced by the one scheduler, and the Submit handler must route ALPACA_API to that same handle. The
+    production lifespan opens the channel to the store, so DATA_STORE_GRPC_TARGET is set to a loopback target;
+    nothing is delivered on it, as no request is submitted.
+
+    BOUNDED (tj-7zjov1.55, the P36 validator's follow-up): that loopback target answers nothing, so a startup that
+    waited on the store -- the instance announcement awaited before the yield -- would block here forever. The
+    lifespan is entered under GUARD_S, so such a regression fails this test instead of hanging the run.
     """
-    with LifespanProbe() as probe:
-        async with LoopbackGrpc(), main.app.router.lifespan_context(main.app):
+    store_target = f'127.0.0.1:{free_loopback_port()}'
+    with LifespanProbe() as probe, patch.dict(os.environ, {DATA_STORE_GRPC_TARGET_ENV: store_target}):
+        async with LoopbackGrpc(), asyncio.timeout(GUARD_S), main.app.router.lifespan_context(main.app):
             pass
 
     [readers] = probe.handed
     assert set(readers) == {DataSource.ALPACA_API}
     assert type(readers[DataSource.ALPACA_API]) is AlpacaRead
+    assert readers[DataSource.ALPACA_API] is main.alpaca.reader
+    [submit] = probe.submits
+    assert type(submit) is IngestSubmitHandler
+    assert dict(submit._handles) == {DataSource.ALPACA_API: main.alpaca}
+    assert type(main.alpaca) is AlpacaHandle
+
+
+@pytest.mark.asyncio
+async def test_the_production_lifespan_refuses_to_start_without_the_store_target():
+    """The handles report to the store, so an unset DATA_STORE_GRPC_TARGET stops startup, naming the variable.
+
+    Builder decision (f) on tj-7zjov1.20, pinned as built: the production app now needs the target. No gRPC host is
+    left serving (LoopbackGrpc fails the test if one is).
+    """
+    with (
+        LifespanProbe(),
+        patch.dict(os.environ, {DATA_STORE_GRPC_TARGET_ENV: ''}),
+        pytest.raises(ValueError, match=DATA_STORE_GRPC_TARGET_ENV),
+    ):
+        async with LoopbackGrpc(), main.app.router.lifespan_context(main.app):
+            pass

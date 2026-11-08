@@ -11,6 +11,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
+from common.enums.data_stock import Feed
 from data.ingest.app.scheduler.limits import SchedulerConfigError
 
 
@@ -31,6 +32,10 @@ class ScheduledRequest:
         ready_by (datetime | None): Timezone aware instant after which the request is not sent to the vendor,
             or None for no deadline: such a request sorts after every dated one and never expires.
         client_label (str | None): Who asked. Carried and unused in PR 5.
+        attempt_count (int): The attempts the store has durably counted for this request. The next attempt is
+            numbered attempt_count + 1; a retry re-enters with the count the store acknowledged.
+        feed (Feed | None): The tape resolved at intake for a bars request, None for a kind with no tape. Carried
+            and never read by the scheduler; an EXPIRED or EXHAUSTED report puts it on its header.
     """
 
     request_id: str
@@ -38,6 +43,8 @@ class ScheduledRequest:
     payload: Any
     ready_by: datetime | None = None
     client_label: str | None = None
+    attempt_count: int = 0
+    feed: Feed | None = None
 
     def __post_init__(self) -> None:
         if self.ready_by is not None and self.ready_by.tzinfo is None:

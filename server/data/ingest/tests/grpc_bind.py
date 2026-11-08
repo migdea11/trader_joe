@@ -122,8 +122,9 @@ class LoopbackGrpc:
             os.environ.pop(name, None)
         build = app_depends.build_grpc_host
 
-        def recording_build(readers):
-            built = build(readers)
+        def recording_build(readers, **kwargs):
+            # kwargs: the Submit handler, which the lifespan hands over by keyword since P11 (tj-7zjov1.20).
+            built = build(readers, **kwargs)
             self.hosts.append(built)
             return built
 

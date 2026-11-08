@@ -52,13 +52,13 @@ once either way, so no separate mechanism is needed on the servicer's side of th
 from collections.abc import AsyncIterator, Mapping
 from datetime import datetime
 
-from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource
-from common.errors.vocabulary import InvalidRequestError, Reason
 from common.logging import get_logger
 from common.rpc.mapping.fetch_stream import MAX_PAGE_BARS
+from data.ingest.app.brokers.bars_attempt import domain_bar
 from data.ingest.app.brokers.interface import BarsFailure, BarsQuery, BarsResponse, BrokerRead, Instrument
 from data.ingest.app.brokers.rate_budget import priority_for_update_type
+from routers.data_ingest.bars_validation import validate_bars_request
 from schemas.data_ingest import fetch_dataset as domain
 
 
@@ -111,27 +111,7 @@ class IngestFetchHandler:
         """
         # Validate everything knowable before the vendor is ever called: an ack is a promise the request is
         # viable, so nothing below this point may fail for a reason that was already decidable here.
-        if not request.data_types:
-            raise InvalidRequestError(Reason.INVALID_REQUEST, 'data_types must not be empty')
-        if DataType.QUOTE in request.data_types:
-            raise InvalidRequestError(Reason.UNSUPPORTED_ASSET_TYPE, 'Quotes are not supported yet: data_type=QUOTE')
-        if DataType.TRADE in request.data_types:
-            raise InvalidRequestError(Reason.UNSUPPORTED_ASSET_TYPE, 'Trades are not supported yet: data_type=TRADE')
-        if request.asset_type is not AssetType.STOCK:
-            # tj-msd6qo: the Kafka path refused crypto and option at METHOD DISPATCH
-            # (ingest_control.store_retrieve_crypto / store_retrieve_option), before any reader saw the
-            # request, so no reader on that path was ever handed a non-STOCK asset type. Collapsing three
-            # methods into this one handler with asset_type as a field deleted that dispatch; this restores
-            # it. Checked here rather than left to the reader: BrokerRead's contract does not require a
-            # reader to refuse an asset_type it does not serve (AlpacaRead happens to; FakeRead does not,
-            # deliberately -- it stands for the interface, not for Alpaca's limits), so leaving this to the
-            # reader would make the gRPC path's answer depend on which reader is installed. Wording matches
-            # ingest_control's refusal.
-            raise InvalidRequestError(
-                Reason.UNSUPPORTED_ASSET_TYPE,
-                f'{request.asset_type.name.capitalize()} datasets are not supported yet: '
-                f'asset_type={request.asset_type.name}',
-            )
+        validate_bars_request(request.data_types, request.asset_type)
 
         reader = self._readers.get(request.source)
         if reader is None:
@@ -163,23 +143,9 @@ class IngestFetchHandler:
             total = 0
             batch: list[domain.Bar] = []
             async for bar in bars:
-                batch.append(
-                    domain.Bar(
-                        bar_start=bar.timestamp,
-                        open=bar.open,
-                        high=bar.high,
-                        low=bar.low,
-                        close=bar.close,
-                        volume=bar.volume,
-                        trade_count=bar.trade_count,
-                        vwap=bar.vwap,
-                        # Stamped from the one feed resolved for this whole fetch, never decided per bar
-                        # (schemas/data_ingest/fetch_dataset.py, Bar.feed): the encoder raises instead of
-                        # overwriting a mismatch, and keeping this the only place a bar's feed is set is
-                        # what makes a mismatch impossible by construction.
-                        feed=response.feed,
-                    )
-                )
+                # Stamped from the one feed resolved for this whole fetch, never decided per bar: the encoder
+                # raises instead of overwriting a mismatch (schemas/data_ingest/fetch_dataset.py, Bar.feed).
+                batch.append(domain_bar(bar, response.feed))
                 total += 1
                 if len(batch) >= MAX_PAGE_BARS:
                     yield domain.BarPage(bars=batch)

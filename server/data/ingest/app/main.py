@@ -4,14 +4,17 @@ from fastapi import FastAPI
 
 from common.enums.data_stock import DataSource
 from data.ingest.app.app_depends import make_lifespan
-from data.ingest.app.brokers.alpaca.read import AlpacaRead
+from data.ingest.app.brokers.alpaca.handle import AlpacaHandle
+from data.ingest.app.brokers.handle import BrokerHandle
 from data.ingest.app.brokers.interface import BrokerRead
 from routers.common import ping
 from routers.common.errors import PROBLEM_RESPONSES, install_error_handlers
 from routers.data_ingest import get_dataset_request
 
 
-def create_app(readers: Mapping[DataSource, BrokerRead]) -> FastAPI:
+def create_app(
+    readers: Mapping[DataSource, BrokerRead], handles: Mapping[DataSource, BrokerHandle] | None = None
+) -> FastAPI:
     """Compose the ingest app around the broker handles it should serve requests through.
 
     The composition root: it decides which handle serves each data source, and the lifespan hands
@@ -21,15 +24,18 @@ def create_app(readers: Mapping[DataSource, BrokerRead]) -> FastAPI:
 
     Args:
         readers (Mapping[DataSource, BrokerRead]): Handle serving each data source.
+        handles (Mapping[DataSource, BrokerHandle] | None): The broker handles that queue, attempt and report
+            Submit requests. Without them Submit is not served.
 
     Returns:
         FastAPI: The ingest app.
     """
-    app = FastAPI(lifespan=make_lifespan(readers), responses=PROBLEM_RESPONSES)
+    app = FastAPI(lifespan=make_lifespan(readers, handles), responses=PROBLEM_RESPONSES)
     install_error_handlers(app)
     app.include_router(ping.router)
     app.include_router(get_dataset_request.router)
     return app
 
 
-app = create_app({DataSource.ALPACA_API: AlpacaRead()})
+alpaca = AlpacaHandle()
+app = create_app({DataSource.ALPACA_API: alpaca.reader}, {DataSource.ALPACA_API: alpaca})

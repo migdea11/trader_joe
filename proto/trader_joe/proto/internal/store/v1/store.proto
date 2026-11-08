@@ -84,20 +84,20 @@ message DeliveryHeader {
   uint32 attempt_no = 3;
 
   // The quota scope this attempt was charged to: a NON-SECRET CONFIGURED LABEL, never key material and
-  // never a hash of it. EMPTY ON AN EXPIRED REPORT: no vendor call was made, so nothing was charged to any
-  // quota.
+  // never a hash of it. EMPTY ON AN EXPIRED OR EXHAUSTED REPORT: no vendor call was made, so nothing was
+  // charged to any quota.
   string quota_key = 4;
 
   // THE FEED FOLLOWS THE SUBMIT RULE (architect ruling, tj-7zjov1.13 gate). For a BARS attempt it is the
   // resolved tape, and never FEED_UNSPECIFIED. For an ASSET_LIST or CORPORATE_ACTIONS attempt it is
-  // always FEED_UNSPECIFIED: those kinds have no tape. An EXPIRED report made no vendor call and carries
-  // the request's kind rule unchanged, so a bars request that expired still names the resolved tape.
+  // always FEED_UNSPECIFIED: those kinds have no tape. An EXPIRED or EXHAUSTED report made no vendor call and
+  // carries the request's kind rule unchanged, so a bars request that expired still names the resolved tape.
   trader_joe.proto.market.v1.Feed feed = 5;
 
   // The vendor's own key for the instrument, REPORTED BY THE BROKER HANDLE AS OPAQUE DATA: an opaque
   // string the store keys on and nothing here parses, compares or interprets. It is never an argument of
   // any call made to the handle. Empty when the attempt has no single instrument (asset_list), when the
-  // attempt failed before the vendor named one, and on an expired report.
+  // attempt failed before the vendor named one, and on an expired or exhausted report.
   string vendor_asset_id = 6;
 }
 
@@ -113,6 +113,16 @@ enum DeliveryOutcome {
   // and is not an attempt: the store writes the request FAILED with cause expired, answers FINAL and
   // writes no attempt row.
   DELIVERY_OUTCOME_EXPIRED = 3;
+  // The request arrived with its attempt budget already spent (its durable attempt count at or past
+  // ingest's max_attempts; architect ruling tj-wisp-g9rmw0), so it was NEVER SENT TO THE VENDOR. Ingest
+  // accepts it, does not queue it and reports it here. Shaped exactly as EXPIRED: no vendor_stats, no
+  // payload, no served_range, no as_of, empty quota_key, empty vendor_asset_id, error_class UNSPECIFIED and
+  // last_attempt false; the feed follows the request kind's rule unchanged. attempt_no is the request's
+  // attempt count plus one and is only the idempotency key. It spends nothing and is not an attempt: the
+  // store writes the request FAILED with cause attempts exhausted, writes no attempt row, leaves the
+  // durable attempt count as it was, records no spend and answers FINAL. FAILED is not used for this
+  // because it means a vendor call was made.
+  DELIVERY_OUTCOME_EXHAUSTED = 4;
 }
 
 // What kind of failure, so the store can tell a permanent refusal (FINAL) from one worth another attempt.
@@ -136,13 +146,13 @@ message DeliveryTrailer {
   // For a human, and never parsed. It carries no secret, no vendor body and no stack trace.
   string detail = 3;
 
-  // What this attempt cost at the vendor, FAILED attempts included. Unset on EXPIRED, which made no call.
+  // What this attempt cost at the vendor, FAILED attempts included. Unset on EXPIRED and EXHAUSTED, which made no call.
   VendorCallStats vendor_stats = 4;
 
   // The window actually served, on SUCCEEDED for bars and corporate actions. Unset otherwise.
   ServedRange served_range = 5;
 
-  // When the vendor answered. UTC. Unset on EXPIRED.
+  // When the vendor answered. UTC. Unset on EXPIRED and EXHAUSTED.
   google.protobuf.Timestamp as_of = 6;
 
   // Set by ingest when it will make no further attempt for this request because its attempt budget is
@@ -158,8 +168,8 @@ enum DeliveryVerdict {
   DELIVERY_VERDICT_UNSPECIFIED = 0;
   // The request is not finished: ingest may schedule its next attempt after the backoff.
   DELIVERY_VERDICT_CONTINUE = 1;
-  // The request is finished (success, a permanent refusal, the last attempt, an expiry, or it was
-  // superseded): ingest drops it and runs no retry.
+  // The request is finished (success, a permanent refusal, the last attempt, an expiry, a budget
+  // already spent, or it was superseded): ingest drops it and runs no retry.
   DELIVERY_VERDICT_FINAL = 2;
 }
 

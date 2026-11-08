@@ -39,10 +39,11 @@ from common.enums.data_stock import Granularity
 from common.errors.vocabulary import REASONS, ExogenousError, Outcome, Reason
 from data.ingest.app.brokers.alpaca import broker_api
 from data.ingest.app.brokers.alpaca.classify import classify_vendor_error
-from data.ingest.app.brokers.alpaca.read import AlpacaRead
+from data.ingest.app.brokers.alpaca.handle import ALPACA_DATA_SCOPE
 from data.ingest.app.brokers.interface import BarsFailure, BarsQuery, BarsResponse, Instrument
-from data.ingest.app.brokers.rate_budget import RateBudget, RequestPriority
+from data.ingest.app.brokers.rate_budget import RequestPriority
 from data.ingest.tests.alpaca_recorded import BARS_PATH, PLACEHOLDER_KEY_ID, PLACEHOLDER_SECRET, load, record_sdk_sleeps
+from data.ingest.tests.scheduler_doubles import FixedWindow, RecordingScheduler, alpaca_reader
 
 
 pytestmark = pytest.mark.data_ingest
@@ -140,18 +141,6 @@ def one_shot_server(answer: bytes) -> Iterator[OneShot]:
         raise AssertionError('the one-shot server itself failed') from seen.error
 
 
-class CountingBudget:
-    """A rate budget that grants every token and counts the acquires."""
-
-    full_refill_seconds = 1.0
-
-    def __init__(self) -> None:
-        self.acquires = 0
-
-    async def acquire(self, priority: RequestPriority = RequestPriority.INTERACTIVE, deadline=None) -> None:
-        self.acquires += 1
-
-
 @dataclass
 class SpiedClient:
     """A real alpaca-py client pointed at the one-shot server, and every exception its bars call raised."""
@@ -192,10 +181,10 @@ def iex_deployment_and_no_cached_client(monkeypatch):
 
 
 @pytest.fixture
-def budget(monkeypatch) -> CountingBudget:
-    counting = CountingBudget()
-    monkeypatch.setattr(broker_api, '__RATE_BUDGET', counting)
-    return counting
+def budget() -> RecordingScheduler:
+    # The Alpaca handle's scheduler, granting every call and recording each ask. Until P11 (tj-7zjov1.20) this
+    # replaced broker_api's own budget, which is gone: the scheduler AlpacaRead is built with paces every call.
+    return RecordingScheduler()
 
 
 @pytest.fixture
@@ -219,12 +208,12 @@ def query() -> BarsQuery:
     )
 
 
-async def get_bars_through(answer: bytes, executor: ThreadPoolExecutor) -> tuple[object, OneShot, SpiedClient]:
+async def get_bars_through(
+    answer: bytes, executor: ThreadPoolExecutor, scheduler: RecordingScheduler
+) -> tuple[object, OneShot, SpiedClient]:
     with one_shot_server(answer) as seen:
         spied = real_client(seen.port)
-        outcome = await AlpacaRead(client=spied.client, executor_provider=lambda: executor, clock=lambda: NOW).get_bars(
-            query()
-        )
+        outcome = await alpaca_reader(spied.client, executor, lambda: NOW, scheduler=scheduler).get_bars(query())
     return outcome, seen, spied
 
 
@@ -232,7 +221,7 @@ def connection_error_classified() -> ExogenousError:
     """What the classifier makes of a plain connection error: the shape a cut body must share."""
     return classify_vendor_error(
         requests.exceptions.ConnectionError('refused'),
-        rate_budget=RateBudget('ALPACA', rate_per_sec=3.0, burst=3.0),
+        rate_budget=FixedWindow(declared_window_seconds=60.0),
         clock=lambda: NOW,
     )
 
@@ -244,7 +233,7 @@ def connection_error_classified() -> ExogenousError:
 async def test_a_connection_cut_mid_body_is_vendor_unavailable_with_the_sdks_exception_as_its_cause(
     executor, budget, sdk_sleeps, answer
 ):
-    outcome, seen, spied = await get_bars_through(answer, executor)
+    outcome, seen, spied = await get_bars_through(answer, executor, budget)
 
     # The real SDK reached the server, for the bars endpoint, and its call raised exactly once.
     assert seen.request_head.startswith(f'GET {BARS_PATH}?'.encode()), seen.request_head[:80]
@@ -268,15 +257,15 @@ async def test_a_connection_cut_mid_body_is_vendor_unavailable_with_the_sdks_exc
     # D8: nothing of the partial body or of the exception text reaches the caller.
     assert WHOLE_BODY[:SENT_BEFORE_THE_CUT].decode() not in error.detail
     assert str(cut) not in error.detail
-    # One call reached the vendor and spent one token; the SDK did not retry the cut.
-    assert budget.acquires == 1
+    # One call reached the vendor and spent one token, from the Alpaca scope; the SDK did not retry the cut.
+    assert [acquire.scope for acquire in budget.acquires] == [ALPACA_DATA_SCOPE]
     assert sdk_sleeps == []
 
 
 @pytest.mark.asyncio
 async def test_the_same_server_sending_the_whole_body_is_served(executor, budget, sdk_sleeps):
     """The control: the harness answers a real SDK request, so a red above is the cut and nothing else."""
-    outcome, seen, spied = await get_bars_through(whole_answer(), executor)
+    outcome, seen, spied = await get_bars_through(whole_answer(), executor, budget)
 
     assert seen.request_head.startswith(f'GET {BARS_PATH}?'.encode())
     assert spied.raised == []
@@ -284,5 +273,5 @@ async def test_the_same_server_sending_the_whole_body_is_served(executor, budget
     closes = [bar.close async for bar in outcome.bars]
     assert closes == [bar['c'] for bar in RECORDED.bars]
     assert len(closes) == 3
-    assert budget.acquires == 1
+    assert [acquire.scope for acquire in budget.acquires] == [ALPACA_DATA_SCOPE]
     assert sdk_sleeps == []

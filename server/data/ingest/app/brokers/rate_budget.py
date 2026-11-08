@@ -186,7 +186,9 @@ class RateBudget:
 
         For spend that cannot be refused or waited for: after a restart, requests the old process may have
         sent are counted against the window before anything new is scheduled (tj-26jt9w addendum 5). A
-        balance below zero is the point: later calls wait until refill has paid the debt off.
+        balance below zero is the point: later calls wait until refill has paid the debt off. A charge of at
+        most the limit keeps a window at the limit; a larger one only delays new calls. Per process: calls the
+        old process made and nobody re-requested are not counted (tj-90z4dq).
 
         Args:
             cost (float): Tokens to take. Zero or less takes nothing.

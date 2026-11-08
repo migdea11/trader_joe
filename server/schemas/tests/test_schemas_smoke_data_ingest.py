@@ -699,3 +699,43 @@ def test_a_json_round_trip_keeps_every_offset(model: type[BaseModel], end: datet
             assert getattr(received, field) is None
         else:
             assert getattr(received, field).utcoffset() == value.utcoffset(), f'{field} lost its offset'
+
+
+def test_the_delivery_outcome_vocabulary_is_exactly_the_four_ruled_outcomes():
+    """EXHAUSTED joins as its own member (tj-wisp-g9rmw0 ruling 1), its value its name like the rest."""
+    assert {member.name: member.value for member in DeliveryOutcome} == {
+        'SUCCEEDED': 'SUCCEEDED',
+        'FAILED': 'FAILED',
+        'EXPIRED': 'EXPIRED',
+        'EXHAUSTED': 'EXHAUSTED',
+    }
+
+
+@pytest.mark.parametrize('name', ['EXPIRED', 'EXHAUSTED'])
+def test_a_no_call_trailer_carries_no_cross_field_rule_in_this_layer(name: str):
+    """The carrying model judges no combination: P34 (tj-7zjov1.27), the store, owns those rules.
+
+    Ruled at the P32 gate and restated on tj-7zjov1.64: EXHAUSTED is shaped as EXPIRED, but nothing here
+    refuses a no-call trailer that carries stats, so the descriptor-driven round trip can populate every
+    field. Its defaults are the no-call shape.
+
+    Args:
+        name: EXPIRED or EXHAUSTED, looked up here so a missing member reds this test and not the module.
+    """
+    outcome = DeliveryOutcome[name]
+    bare = DeliveryTrailer(outcome=outcome)
+    loaded = DeliveryTrailer(
+        outcome=outcome,
+        vendor_stats=VendorCallStats(calls=1, pages=1, throttled_429=0, retries=0),
+        as_of=WHEN,
+        last_attempt=True,
+    )
+
+    assert (bare.vendor_stats, bare.served_range, bare.as_of, bare.error_class, bare.last_attempt) == (
+        None,
+        None,
+        None,
+        None,
+        False,
+    )
+    assert loaded.outcome is outcome

@@ -54,9 +54,9 @@ from common.errors.vocabulary import (
     Reason,
     TraderJoeError,
 )
-from data.ingest.app.brokers.alpaca import broker_api
 from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
 from data.ingest.app.brokers.alpaca.classify import RATE_LIMIT_RESET_HEADER, RETRY_AFTER_HEADER
+from data.ingest.app.brokers.alpaca.handle import ALPACA_DATA_SCOPE
 from data.ingest.app.brokers.alpaca.read import AlpacaRead
 from data.ingest.app.brokers.interface import (
     Bar,
@@ -67,7 +67,8 @@ from data.ingest.app.brokers.interface import (
     Instrument,
     ServedRange,
 )
-from data.ingest.app.brokers.rate_budget import RateBudget, RequestPriority
+from data.ingest.app.brokers.rate_budget import RequestPriority
+from data.ingest.app.scheduler import Scheduler
 from data.ingest.tests.alpaca_recorded import (
     ALPACA_DATA_HOST,
     BARS_PATH,
@@ -81,6 +82,12 @@ from data.ingest.tests.alpaca_recorded import (
     record_sdk_sleeps,
     recorded_client,
     with_headers,
+)
+from data.ingest.tests.scheduler_doubles import (
+    ONE_PER_MINUTE_OVER_AN_HOUR,
+    ONE_PER_SECOND,
+    alpaca_reader,
+    real_scheduler,
 )
 
 
@@ -141,8 +148,10 @@ def build_query(
     )
 
 
-def build_reader(client, executor: ThreadPoolExecutor) -> AlpacaRead:
-    return AlpacaRead(client=client, executor_provider=lambda: executor, clock=lambda: NOW)
+def build_reader(client, executor: ThreadPoolExecutor, scheduler=None) -> AlpacaRead:
+    # Paced by the given scheduler, or one that grants every call (P11, tj-7zjov1.20: the handle's scheduler
+    # paces every Alpaca call; broker_api has no budget of its own any more).
+    return alpaca_reader(client, executor, lambda: NOW, scheduler=scheduler)
 
 
 async def drain(response: BarsResponse) -> list[Bar]:
@@ -524,11 +533,18 @@ async def test_a_retried_status_on_every_attempt_makes_four_attempts_then_return
 
 
 @pytest.fixture
-def deployed_budget(monkeypatch) -> RateBudget:
-    """Alpaca's budget at the deployed default (3/s, burst 3): it refills from empty in 1 s."""
-    budget = RateBudget('ALPACA', rate_per_sec=3.0, burst=3.0)
-    monkeypatch.setattr(broker_api, '__RATE_BUDGET', budget)
-    return budget
+def scope_scheduler() -> Scheduler:
+    """A real scheduler whose Alpaca scope declares a 60 s window (refilling in 1 s), beside a decoy declaring 3600 s.
+
+    Until P11 (tj-7zjov1.20) this was broker_api's own budget at its deployed default (3/s, burst 3, 1 s). That
+    budget is gone: the fallback is the reader's own scope window, Scheduler.window(scope), and since 18ff3f5 its
+    declared window rather than its refill. The decoy makes a reader that asked another scope's window red, and the
+    1 s refill one that read the refill. The fallback at the production limit is pinned in test_ack_gated_retry.py.
+    """
+    scheduler = real_scheduler({ALPACA_DATA_SCOPE: ONE_PER_SECOND, 'DECOY': ONE_PER_MINUTE_OVER_AN_HOUR})
+    assert scheduler.window(ALPACA_DATA_SCOPE).declared_window_seconds == 60.0
+    assert scheduler.window(ALPACA_DATA_SCOPE).full_refill_seconds == 1.0
+    return scheduler
 
 
 @pytest.mark.asyncio
@@ -541,20 +557,20 @@ def deployed_budget(monkeypatch) -> RateBudget:
             id='x-ratelimit-reset-wins',
         ),
         pytest.param({RETRY_AFTER_HEADER: '7'}, NOW + timedelta(seconds=7), id='retry-after-only'),
-        pytest.param({}, NOW + timedelta(seconds=1), id='no-header-the-budget-refill'),
+        pytest.param({}, NOW + timedelta(seconds=60), id='no-header-the-scopes-declared-window'),
     ],
 )
 async def test_a_429_after_one_plus_three_attempts_says_when_the_window_resets(
-    executor, monkeypatch, deployed_budget, headers, reset_at
+    executor, monkeypatch, scope_scheduler, headers, reset_at
 ):
-    """tj-vz1eta s3, TE-4 item 4: X-RateLimit-Reset, else Retry-After, else the budget's refill from empty.
+    """tj-vz1eta s3, TE-4 item 4: X-RateLimit-Reset, else Retry-After, else the scope's declared window.
 
     The headers are ATTACHED to the documented 429 body: no recording shows which a real 429 sends.
     """
     sleeps = record_sdk_sleeps(monkeypatch)
     client, transport = recorded_client(always(with_headers(load('error_429'), headers)))
 
-    error = failure_of(await build_reader(client, executor).get_bars(whole_day_query()))
+    error = failure_of(await build_reader(client, executor, scheduler=scope_scheduler).get_bars(whole_day_query()))
 
     assert type(error) is ExogenousError
     assert error.reason is Reason.VENDOR_RATE_LIMITED

@@ -15,7 +15,7 @@ consume.
 WHAT IS DELIBERATELY ABSENT:
     DeliverAttemptRequest  the stream's envelope is pure transport. A whole attempt is the AttemptDelivery
                            below; the mapper splits it across messages and the assembler puts it back.
-    cross-field verdict rules  that an EXPIRED trailer carries no stats, that error_class belongs to FAILED,
+    cross-field verdict rules  that an EXPIRED or EXHAUSTED trailer carries no stats, that error_class belongs to FAILED,
                            and what a given outcome means for the request are the STORE's judgement
                            (tj-7zjov1.27). A model here that refused a combination would make the
                            descriptor-driven round trip unable to populate it, and would put a verdict in
@@ -46,6 +46,8 @@ class DeliveryOutcome(StrEnum):
     FAILED = 'FAILED'
     # Taken off the queue after its ready_by: never sent to the vendor, so not an attempt.
     EXPIRED = 'EXPIRED'
+    # Arrived with its attempt budget already spent: never sent to the vendor, so not an attempt.
+    EXHAUSTED = 'EXHAUSTED'
 
 
 class DeliveryErrorClass(StrEnum):
@@ -73,12 +75,12 @@ class DeliveryHeader(InboundContract):
     # Numbered from the request's durable attempt count plus one, so at least 1 (store.proto). The second
     # half of the idempotency key: a redelivery sends the same number.
     attempt_no: int = Field(ge=1, le=MAX_UINT32)
-    # A NON-SECRET CONFIGURED LABEL, never key material and never a hash of it. Empty on an EXPIRED report.
+    # A NON-SECRET CONFIGURED LABEL, never key material and never a hash of it. Empty on an EXPIRED or EXHAUSTED report.
     quota_key: str = ''
     # The resolved tape for a bars attempt; None (FEED_UNSPECIFIED) for the other kinds. Never a nominal feed.
     feed: Feed | None = None
     # The vendor's key for the instrument, OPAQUE: nothing here parses, compares or interprets it. Empty
-    # when the attempt has no single instrument, failed before the vendor named one, or expired.
+    # when the attempt has no single instrument, failed before the vendor named one, expired or exhausted.
     vendor_asset_id: str = ''
 
 
@@ -112,11 +114,11 @@ class DeliveryTrailer(InboundContract):
     error_class: DeliveryErrorClass | None = None
     # For a human, never parsed.
     detail: str = ''
-    # What the attempt cost at the vendor, failed attempts included. None on EXPIRED.
+    # What the attempt cost at the vendor, failed attempts included. None on EXPIRED and EXHAUSTED.
     vendor_stats: VendorCallStats | None = None
     # The window actually served, on SUCCEEDED for bars and corporate actions.
     served_range: ServedRange | None = None
-    # When the vendor answered. None on EXPIRED.
+    # When the vendor answered. None on EXPIRED and EXHAUSTED.
     as_of: AwareDatetime | None = None
     # Set by ingest when its attempt budget is spent with this attempt. Meaningful only on FAILED.
     last_attempt: bool = False

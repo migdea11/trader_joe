@@ -22,6 +22,7 @@ from data.ingest.app.brokers.interface import (
     BrokerUnsupportedError,
     ServedRange,
 )
+from data.ingest.app.scheduler import Scheduler
 
 
 log = get_logger(__name__)
@@ -39,7 +40,7 @@ class AlpacaRead:
     """The Alpaca implementation of BrokerRead.
 
     Conforms structurally and inherits nothing (decision tj-j4wknb U7). The vendor machinery --
-    single-flight, the rate budget, the request key, the lazy client -- stays in broker_api and
+    single-flight, the quota scope, the request key, the lazy client -- stays in broker_api and
     is reached through it, so nothing vendor-shaped leaks into the interface.
 
     Args:
@@ -52,6 +53,9 @@ class AlpacaRead:
             reads: the future-range pre-check, the as_of a fetch is stamped with, the end its
             served_range is clamped to, and the reset a rate-limited answer is measured from.
             Injectable so tests need not sleep or patch datetime.
+        scheduler (Scheduler): The Alpaca handle's scheduler. Its quota limits pace every vendor call this
+            reader makes, the FetchDataset path's included; nothing else does.
+        scope (str): The quota scope those calls are charged to.
     """
 
     def __init__(
@@ -59,7 +63,12 @@ class AlpacaRead:
         client: StockHistoricalDataClient | None = None,
         executor_provider: Callable[[], ThreadPoolExecutor] | None = None,
         clock: Callable[[], datetime] = _utc_now,
+        *,
+        scheduler: Scheduler,
+        scope: str,
     ) -> None:
+        self.__scheduler = scheduler
+        self.__scope = scope
         self.__client = client
         self.__executor_provider = executor_provider if executor_provider is not None else SharedWorkerPool.get_instance
         self.__clock = clock
@@ -170,12 +179,20 @@ class AlpacaRead:
         # included, is a bug and propagates.
         try:
             bar_set = await broker_api.fetch_data_type(
-                self.__executor_provider(), query, DataType.MARKET_ACTIVITY, False, params, feed, client
+                self.__executor_provider(),
+                query,
+                DataType.MARKET_ACTIVITY,
+                False,
+                params,
+                feed,
+                client,
+                scheduler=self.__scheduler,
+                scope=self.__scope,
             )
         except TraderJoeError as e:
             return BarsFailure(e)
         except VENDOR_FAILURES as e:
-            error = classify_vendor_error(e, rate_budget=broker_api.get_rate_budget(), clock=self.__clock)
+            error = classify_vendor_error(e, rate_budget=self.__scheduler.window(self.__scope), clock=self.__clock)
             if error is None:
                 raise
             return BarsFailure(error)

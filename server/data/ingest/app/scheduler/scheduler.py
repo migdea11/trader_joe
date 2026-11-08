@@ -36,12 +36,43 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+class ScopeWindow:
+    """A quota scope's own model of its window, for turning a rate-limit answer that names no reset into a wait."""
+
+    def __init__(self, budgets: list[RateBudget], intervals: list[timedelta]) -> None:
+        self.__budgets = budgets
+        self.__intervals = intervals
+
+    @property
+    def declared_window_seconds(self) -> float:
+        """Report the vendor's declared window: the longest limit interval set on the scope.
+
+        This is the window the vendor itself counts a quota over (60 s for Alpaca data), NOT how fast the
+        scheduler's own token bucket refills: a rate-limit answer says the vendor's window is spent, so a
+        wait that names no reset must outlast that window, not the bucket.
+
+        Returns:
+            float: Seconds; 0.0 when the scope declares no interval.
+        """
+        return max((interval.total_seconds() for interval in self.__intervals), default=0.0)
+
+    @property
+    def full_refill_seconds(self) -> float:
+        """Report how long the scope takes to refill completely from empty: the longest of its limits.
+
+        Returns:
+            float: Seconds; 0.0 when no budget of the scope models a window.
+        """
+        return max((budget.full_refill_seconds for budget in self.__budgets), default=0.0)
+
+
 class Scheduler:
     """Built by SchedulerBuilder; not constructed directly."""
 
     def __init__(
         self,
         budgets: dict[str, list[RateBudget]],
+        intervals: dict[str, list[timedelta]],
         cost_function: CostFunction,
         page_size: int,
         credential_provider: CredentialProvider,
@@ -49,6 +80,7 @@ class Scheduler:
         clock: Clock,
     ) -> None:
         self.__budgets = budgets
+        self.__intervals = intervals
         self.__cost_function = cost_function
         self.__page_size = page_size
         self.__credential_provider = credential_provider
@@ -132,6 +164,20 @@ class Scheduler:
                         clock=self.__clock,
                     )
             await asyncio.sleep(wait)
+
+    def window(self, scope: str) -> ScopeWindow:
+        """Give a scope's window model, which an adapter's error classifier reads when a 429 names no reset.
+
+        Args:
+            scope (str): Quota scope of the call.
+
+        Returns:
+            ScopeWindow: The scope's window.
+
+        Raises:
+            SchedulerConfigError: If the scope is unknown.
+        """
+        return ScopeWindow(self.__scope(scope), self.__intervals[scope])
 
     def charge_restart(self, request: ScheduledRequest) -> int:
         """Charge a request's estimated cost to its scope's current window, as after a restart.
@@ -318,9 +364,12 @@ class SchedulerBuilder:
         for scope, limits in self.__limits.items():
             if not limits:
                 raise SchedulerConfigError(f'Quota scope {scope!r} has no limit set')
-            # Contract: for Limit(T, N), no half-open window [t, t+T) holds more than N spent tokens (calls plus
-            # charged restart cost), from any starting balance. A bucket of size B refilling at r spends at most
-            # B + r*T in a window, so B = max(1, min(N per second, N / 10)) and r = (N - B + 1) / T keep it at N.
+            # Contract, per process: for Limit(T, N), no half-open window [t, t+T) holds more than N spent tokens
+            # (calls plus charged restart cost) while a charge is at most N. A charge above N (re-requested queued
+            # work is charged too) is booked at one instant and only delays new calls: the bucket stays in debt and
+            # the first new call waits (c - B + 1) / r. Calls the old process made before a restart and that are not
+            # re-requested are not modelled (tj-90z4dq). A bucket of size B refilling at r spends at most B + r*T in
+            # a window, so B = max(1, min(N per second, N / 10)) and r = (N - B + 1) / T keep it at N.
             # Limit.burst and Limit.refill_per_sec hold the formula.
             budgets[scope] = [
                 RateBudget(
@@ -330,6 +379,7 @@ class SchedulerBuilder:
             ]
         return Scheduler(
             budgets,
+            {scope: list(limits) for scope, limits in self.__limits.items()},
             self.__cost_function,
             self.__page_size,
             self.__credential_provider,

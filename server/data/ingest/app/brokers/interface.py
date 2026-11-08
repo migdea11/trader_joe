@@ -84,6 +84,35 @@ class Instrument:
     currency: str | None = None
 
 
+@dataclass
+class CallTally:
+    """The vendor calls one attempt actually made, counted by the adapter as it spends its quota.
+
+    A call that was collapsed onto another caller's in flight, or refused before the vendor, is not counted: it
+    spent nothing. The attempt's report to the store carries these numbers.
+
+    Attributes:
+        calls (int): Calls that reached the vendor.
+        first_call_at (datetime | None): When the first was made, timezone aware.
+        last_call_at (datetime | None): When the last was made, timezone aware.
+    """
+
+    calls: int = 0
+    first_call_at: datetime | None = None
+    last_call_at: datetime | None = None
+
+    def record(self, at: datetime) -> None:
+        """Count one vendor call made at the given instant.
+
+        Args:
+            at (datetime): When the call was made, timezone aware.
+        """
+        self.calls += 1
+        if self.first_call_at is None:
+            self.first_call_at = at
+        self.last_call_at = at
+
+
 @dataclass(frozen=True)
 class BarsQuery:
     """One request for historical bars.
@@ -102,6 +131,7 @@ class BarsQuery:
         deadline (datetime | None): When the caller stops waiting, timezone aware, or None for no
             bound. A rate budget that cannot admit the call before it fails fast (RATE_BUDGET)
             instead of sleeping past it (ADR tj-fa1rpu U4).
+        tally (CallTally | None): Counts the vendor calls this query makes, for the attempt's report.
     """
 
     instrument: Instrument
@@ -114,6 +144,8 @@ class BarsQuery:
     # Keyword only: a feed or a deadline passed positionally would be a silent mistake.
     feed: Feed | None = field(default=None, kw_only=True)
     deadline: datetime | None = field(default=None, kw_only=True)
+    # Where the adapter counts the vendor calls this query makes, or None when nobody reads them.
+    tally: CallTally | None = field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True)

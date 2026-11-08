@@ -72,7 +72,6 @@ from common.enums.data_select import AssetType
 from common.enums.data_stock import Feed, Granularity
 from common.errors.vocabulary import REASONS, Disposition, Outcome, Reason, TraderJoeError
 from common.tests.roots import SERVER_ROOT, repo_relative, resolve_tree
-from data.ingest.app.brokers.alpaca import broker_api
 from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
 from data.ingest.app.brokers.alpaca.read import AlpacaRead
 from data.ingest.app.brokers.interface import (
@@ -94,6 +93,7 @@ from data.ingest.tests.alpaca_recorded import (
     record_sdk_sleeps,
     recorded_client,
 )
+from data.ingest.tests.scheduler_doubles import RecordingScheduler, alpaca_reader
 from tests.fakes.market_data import (
     EMPTY_PREFIX,
     FAIL_PREFIX,
@@ -183,19 +183,6 @@ def bars_query(symbol: str, granularity: Granularity, start: datetime, end: date
         end=end,
         priority=RequestPriority.BACKFILL,
     )
-
-
-class CountingBudget:
-    """Alpaca's rate budget, replaced by one that grants every token and counts what it was asked."""
-
-    # Read by the classifier only for a header-less 429.
-    full_refill_seconds = 1.0
-
-    def __init__(self) -> None:
-        self.acquires: list[tuple[RequestPriority, datetime | None]] = []
-
-    async def acquire(self, priority: RequestPriority = RequestPriority.INTERACTIVE, deadline=None) -> None:
-        self.acquires.append((priority, deadline))
 
 
 class Subject:
@@ -362,12 +349,14 @@ class AlpacaRecordedSubject(Subject):
 
     def __init__(self, executor: ThreadPoolExecutor, monkeypatch: pytest.MonkeyPatch) -> None:
         super().__init__(executor, monkeypatch)
-        self.budget = CountingBudget()
-        monkeypatch.setattr(broker_api, '__RATE_BUDGET', self.budget)
+        # The Alpaca handle's scheduler, replaced by one that grants every call and records each ask (P11,
+        # tj-7zjov1.20: it paces every vendor call; broker_api's own budget is gone). Its window declares Alpaca
+        # data's 60 s, read by the classifier only for a header-less 429.
+        self.budget = RecordingScheduler(declared_window_seconds=60.0)
 
     def arrangement(self, responder, query: BarsQuery) -> Arrangement:
         client, transport = recorded_client(responder)
-        reader = AlpacaRead(client=client, executor_provider=lambda: self.executor, clock=clock)
+        reader = alpaca_reader(client, self.executor, clock, scheduler=self.budget)
         return Arrangement(reader, query, lambda: len(transport.sent) + len(self.budget.acquires))
 
     def whole(self, recorded: RecordedResponse, granularity: Granularity) -> BarsQuery:

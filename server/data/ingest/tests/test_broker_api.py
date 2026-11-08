@@ -38,6 +38,7 @@ from data.ingest.app.brokers.alpaca.read import AlpacaRead
 from data.ingest.app.brokers.broker_errors import MissingCredentialsError
 from data.ingest.app.brokers.interface import BarsFailure, BarsQuery, Instrument
 from data.ingest.app.brokers.rate_budget import RequestPriority
+from data.ingest.tests.scheduler_doubles import alpaca_reader as paced_reader
 from schemas.data_ingest.get_dataset_request import StockDatasetRequest
 
 
@@ -72,10 +73,13 @@ def alpaca_reader(executor: ThreadPoolExecutor, client: Mock | None = None) -> A
         executor (ThreadPoolExecutor): Pool the vendor call runs on.
         client (Mock | None): Client to inject, or None for production's own (broker_api.get_client()).
 
+    Since P11 (tj-7zjov1.20) the reader is paced by the Alpaca handle's scheduler, a required keyword; a
+    scheduler that grants every call stands in for it, as nothing here is about pacing.
+
     Returns:
         AlpacaRead: The reader.
     """
-    return AlpacaRead(client=client, executor_provider=lambda: executor)
+    return paced_reader(client, executor)
 
 
 def build_query(request: StockDatasetRequest) -> BarsQuery:
@@ -223,7 +227,7 @@ async def test_an_injected_client_is_used_without_any_credentials(executor: Thre
     request = build_request()
     client = Mock()
     client.get_stock_bars.return_value = StubBarSet(request.asset_symbol, [build_bar(10.0)])
-    reader = AlpacaRead(client=client, executor_provider=lambda: executor)
+    reader = alpaca_reader(executor, client)
 
     with patch.dict(os.environ, {}, clear=True):
         response = await reader.get_bars(build_query(request))
@@ -336,7 +340,7 @@ async def test_the_resolved_feed_is_written_into_the_single_flight_key(
     client = Mock()
     client.get_stock_bars.return_value = StubBarSet(request.asset_symbol, [build_bar(10.0)])
     recorder = KeyRecordingSingleFlight(getattr(broker_api, '__SINGLE_FLIGHT'))
-    reader = AlpacaRead(client=client, executor_provider=lambda: executor)
+    reader = alpaca_reader(executor, client)
 
     with (
         patch.object(broker_api, '__SINGLE_FLIGHT', recorder),
@@ -365,7 +369,7 @@ async def test_two_tapes_do_not_share_one_single_flight_key(executor: ThreadPool
     client = Mock()
     client.get_stock_bars.return_value = StubBarSet(request.asset_symbol, [build_bar(10.0)])
     recorder = KeyRecordingSingleFlight(getattr(broker_api, '__SINGLE_FLIGHT'))
-    reader = AlpacaRead(client=client, executor_provider=lambda: executor)
+    reader = alpaca_reader(executor, client)
 
     with patch.object(broker_api, '__SINGLE_FLIGHT', recorder):
         for sip_enabled in ('false', 'true'):

@@ -8,7 +8,8 @@ store messages included, and its offsets sweep covers their aware fields. What i
 * PRESENCE. AssetRecord active and tradable, VendorReported limit and remaining, and the trailer's
   vendor_stats, served_range and as_of are absent-not-zero; False and 0 are values and survive as values.
   The header's feed and the trailer's error_class map None to the zero and the zero back to None. The zero
-  outcome and the zero verdict are refused: neither says anything.
+  outcome and the zero verdict are refused: neither says anything. The two no-call outcomes, EXPIRED and
+  EXHAUSTED (tj-wisp-g9rmw0), carry the outcome and nothing else, both ways.
 * THE SPLIT BOUND. Asset and corporate-action lists split at MAX_RECORDS_PER_MESSAGE records or
   MAX_PART_BYTES of serialized records, bars at MAX_PAGE_BARS; order kept, nothing lost; a record over the
   4 MiB guard refused; an empty part sends nothing.
@@ -23,6 +24,7 @@ from pydantic import ValidationError
 from common.enums.data_stock import Feed
 from common.rpc.config import MAX_MESSAGE_BYTES
 from common.rpc.mapping import (
+    DELIVERY_OUTCOME,
     ENVELOPE_MESSAGES,
     MAX_PAGE_BARS,
     MAX_PART_BYTES,
@@ -59,10 +61,13 @@ from common.rpc.mapping import (
     vendor_stats_to_proto,
 )
 from common.tests.rpc.delivery_contract import (
+    NO_CALL_OUTCOMES,
     Envelope,
     RegisterRequestMessage,
     ResponseMessage,
     a_header,
+    a_no_call_header,
+    a_no_call_trailer,
     a_registration,
     a_response,
     a_trailer,
@@ -303,6 +308,75 @@ def test_an_expired_trailer_with_nothing_set_round_trips():
     assert trailer_to_domain(message) == trailer
 
 
+def test_the_outcome_table_is_exactly_the_four_ruled_outcomes_by_wire_number():
+    """SUCCEEDED 1, FAILED 2, EXPIRED 3, EXHAUSTED 4 (tj-wisp-g9rmw0 ruling 1); the zero has no domain member."""
+    assert {outcome: DELIVERY_OUTCOME.to_proto(outcome) for outcome in domain.DeliveryOutcome} == {
+        domain.DeliveryOutcome.SUCCEEDED: 1,
+        domain.DeliveryOutcome.FAILED: 2,
+        domain.DeliveryOutcome.EXPIRED: 3,
+        domain.DeliveryOutcome.EXHAUSTED: 4,
+    }
+    assert DELIVERY_OUTCOME.to_domain(4) is domain.DeliveryOutcome.EXHAUSTED
+
+
+def test_the_domain_exhausted_outcome_is_its_own_member_named_exhausted():
+    """A distinct outcome, never an alias of FAILED or EXPIRED: the store keys its cause on it."""
+    assert domain.DeliveryOutcome.EXHAUSTED == 'EXHAUSTED'
+    assert domain.DeliveryOutcome.EXHAUSTED not in (domain.DeliveryOutcome.FAILED, domain.DeliveryOutcome.EXPIRED)
+
+
+@pytest.mark.parametrize('outcome', NO_CALL_OUTCOMES, ids=lambda member: member.name)
+def test_a_no_call_trailer_with_nothing_set_round_trips_both_ways(outcome: domain.DeliveryOutcome):
+    """EXHAUSTED is shaped as EXPIRED: an outcome and nothing else, and nothing else appears on the way back.
+
+    Args:
+        outcome: EXPIRED or EXHAUSTED.
+    """
+    trailer = a_no_call_trailer(outcome)
+
+    message = trailer_to_proto(trailer)
+    decoded = trailer_to_domain(message)
+
+    assert [field.name for field, _ in message.ListFields()] == ['outcome']
+    for member in ('vendor_stats', 'served_range', 'as_of'):
+        assert not message.HasField(member), member
+    assert message.error_class == 0
+    assert message.last_attempt is False
+    assert decoded == trailer
+    assert (decoded.vendor_stats, decoded.served_range, decoded.as_of, decoded.error_class) == (None, None, None, None)
+    assert decoded.last_attempt is False
+    assert trailer_to_proto(decoded) == message
+
+
+def test_an_exhausted_trailer_from_the_wire_decodes_to_exhausted():
+    """The other direction, from a wire trailer the production encoder did not build."""
+    message = TrailerMessage(outcome=4)
+
+    decoded = trailer_to_domain(message)
+
+    assert decoded == domain.DeliveryTrailer(outcome=domain.DeliveryOutcome.EXHAUSTED)
+    assert trailer_to_proto(decoded) == message
+
+
+@pytest.mark.parametrize('outcome', NO_CALL_OUTCOMES, ids=lambda member: member.name)
+def test_a_whole_no_call_attempt_survives_split_and_assembly(outcome: domain.DeliveryOutcome):
+    """Header and trailer alone; the header charges no quota and names no instrument but keeps the tape.
+
+    Args:
+        outcome: EXPIRED or EXHAUSTED.
+    """
+    attempt = an_attempt(header=a_no_call_header(), trailer=a_no_call_trailer(outcome))
+
+    messages = list(attempt_to_messages(attempt))
+    decoded = _decoded(messages)
+
+    assert _arms(messages) == ['header', 'trailer']
+    assert decoded == attempt
+    assert (decoded.header.quota_key, decoded.header.vendor_asset_id) == ('', '')
+    assert decoded.header.feed is Feed.IEX
+    assert decoded.trailer.outcome is outcome
+
+
 def test_a_header_with_no_feed_writes_the_zero_and_the_zero_reads_back_as_none():
     """asset_list and corporate_actions have no tape; FEED_UNSPECIFIED is how the wire says so."""
     message = header_to_proto(a_header(feed=None))
@@ -344,6 +418,12 @@ def test_a_trailer_with_the_zero_outcome_is_refused():
     """An attempt that does not say how it ended is not a report."""
     with pytest.raises(ProtoMappingError, match='UNSPECIFIED'):
         trailer_to_domain(TrailerMessage(outcome=0))
+
+
+def test_an_empty_trailer_is_refused_and_never_read_as_a_no_call_outcome():
+    """A bare EXPIRED or EXHAUSTED trailer sets only its outcome; with none set it is not either of them."""
+    with pytest.raises(ProtoMappingError, match='UNSPECIFIED'):
+        trailer_to_domain(TrailerMessage())
 
 
 def test_an_answer_with_the_zero_verdict_is_refused():

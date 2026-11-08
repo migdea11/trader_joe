@@ -96,6 +96,37 @@ def a_trailer(**overrides: object) -> domain.DeliveryTrailer:
     return domain.DeliveryTrailer(**fields)
 
 
+# The outcomes that made no vendor call (store.proto): EXPIRED at dequeue, EXHAUSTED on arrival with its
+# attempt budget already spent (architect ruling tj-wisp-g9rmw0). Both carry the same shape.
+NO_CALL_OUTCOMES = (domain.DeliveryOutcome.EXPIRED, domain.DeliveryOutcome.EXHAUSTED)
+
+
+def a_no_call_trailer(outcome: domain.DeliveryOutcome) -> domain.DeliveryTrailer:
+    """The trailer of a report that made no vendor call: the outcome and nothing else.
+
+    Args:
+        outcome: One of NO_CALL_OUTCOMES.
+
+    Returns:
+        domain.DeliveryTrailer: No stats, no served_range, no as_of, no error_class, last_attempt false.
+    """
+    return domain.DeliveryTrailer(outcome=outcome)
+
+
+def a_no_call_header(**overrides: object) -> domain.DeliveryHeader:
+    """The header of a report that made no vendor call: no quota charged, no instrument named.
+
+    The feed keeps the request kind's rule, so a bars request still names the resolved tape.
+
+    Args:
+        **overrides: Fields to replace.
+
+    Returns:
+        domain.DeliveryHeader: An empty quota_key and vendor_asset_id.
+    """
+    return a_header(**{'quota_key': '', 'vendor_asset_id': '', **overrides})
+
+
 def an_asset(index: int, *, payload_bytes: int = 0, **overrides: object) -> domain.AssetRecord:
     """One asset record, distinct per index.
 

@@ -22,14 +22,25 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from http import HTTPStatus
-from typing import Final
+from typing import Final, Protocol
 
 from alpaca.common.exceptions import APIError
 from requests import exceptions as requests_exceptions
 
 from common.enums.data_stock import DataSource
 from common.errors.vocabulary import ExogenousError, InvalidRequestError, Reason, TraderJoeError
-from data.ingest.app.brokers.rate_budget import RateBudget
+
+
+class RefillWindow(Protocol):
+    """A quota's declared window: what a 429 that names no reset is turned into.
+
+    The scheduler's ScopeWindow conforms.
+    """
+
+    @property
+    def declared_window_seconds(self) -> float:
+        """float: The vendor's declared window, the longest limit interval of the scope; 0.0 when none."""
+        ...
 
 
 # What the HTTP session raises, unwrapped by alpaca-py, when the vendor cannot be reached, does not answer in
@@ -56,7 +67,7 @@ _VENDOR: Final = {'vendor': DataSource.ALPACA_API.value}
 
 
 def classify_vendor_error(
-    error: BaseException, *, rate_budget: RateBudget, clock: Callable[[], datetime]
+    error: BaseException, *, rate_budget: RefillWindow, clock: Callable[[], datetime]
 ) -> TraderJoeError | None:
     """Turn a failure of the vendor's client into the typed error it stands for.
 
@@ -67,7 +78,7 @@ def classify_vendor_error(
 
     Args:
         error (BaseException): What the vendor's client raised.
-        rate_budget (RateBudget): This vendor's budget, whose refill time stands in for a 429's reset when
+        rate_budget (RefillWindow): This vendor's quota scope, whose declared window stands in for a 429's reset when
             the response names none.
         clock (Callable[[], datetime]): The reader's clock: now for a reset_at, and the clock the error
             derives retry_after from.
@@ -94,7 +105,9 @@ def classify_vendor_error(
     return classified
 
 
-def _classify_status(error: APIError, rate_budget: RateBudget, clock: Callable[[], datetime]) -> TraderJoeError | None:
+def _classify_status(
+    error: APIError, rate_budget: RefillWindow, clock: Callable[[], datetime]
+) -> TraderJoeError | None:
     status = error.status_code
     if status is None:
         return None
@@ -130,18 +143,18 @@ def _vendor_message(error: APIError, status: int) -> str:
     return f'Alpaca answered HTTP {status} without a readable message.'
 
 
-def _rate_limited(error: APIError, rate_budget: RateBudget, clock: Callable[[], datetime]) -> ExogenousError:
+def _rate_limited(error: APIError, rate_budget: RefillWindow, clock: Callable[[], datetime]) -> ExogenousError:
     """Build VENDOR_RATE_LIMITED, which always says when the window resets (the error refuses to build without).
 
     The reset comes from the first source that gives one: the response's X-RateLimit-Reset (Unix seconds),
-    else its Retry-After, else the time this vendor's own RateBudget needs to refill completely.
+    else its Retry-After, else the vendor's declared window (the longest limit interval of the scope).
     """
     now = clock()
     headers = getattr(getattr(error, 'response', None), 'headers', None) or {}
     reset_at = (
         _reset_from_header(headers.get(RATE_LIMIT_RESET_HEADER))
         or _reset_from_retry_after(headers.get(RETRY_AFTER_HEADER), now)
-        or now + timedelta(seconds=rate_budget.full_refill_seconds)
+        or now + timedelta(seconds=rate_budget.declared_window_seconds)
     )
     return ExogenousError(
         Reason.VENDOR_RATE_LIMITED,

@@ -168,6 +168,11 @@ async def refuse_wildcard(host: str) -> None:
         )
 
 
+def _status(serving: bool) -> health_pb2.HealthCheckResponse.ServingStatus.ValueType:
+    """Map a serving flag to the health status it reports."""
+    return health_pb2.HealthCheckResponse.SERVING if serving else health_pb2.HealthCheckResponse.NOT_SERVING
+
+
 class GrpcServerHost:
     """A grpc.aio server with the error boundary, the health service and a fixed set of servicers.
 
@@ -225,6 +230,33 @@ class GrpcServerHost:
         self._health: health.aio.HealthServicer | None = None
         self._port: int | None = None
         self._started = False
+        self._named_health: dict[str, bool] = {}
+
+    async def set_service_health(self, service: str, serving: bool) -> None:
+        """Set the serving status of a NAMED health service: SERVING when serving, else NOT_SERVING.
+
+        THE EMPTY NAME IS REFUSED. The overall status '' is what the container healthcheck probes, and
+        it stays owned by this host's own start and stop; a component must never be able to flip it.
+        A stalled delivery is the store's fault, not this container's, and a container marked
+        unhealthy invites a restart that loses the very buffer the stall is holding. A component
+        reports a degraded part on a named service and leaves '' alone.
+
+        Callable before and after start: a status set before start is applied once the server serves
+        and is then in force. A name no servicer was registered under is simply created, and a Check
+        for it answers the status set here. After stop() the status is remembered but not served.
+
+        Args:
+            service: The health service name, non-empty.
+            serving: True for SERVING, False for NOT_SERVING.
+
+        Raises:
+            ValueError: If service is the empty string.
+        """
+        if not service:
+            raise ValueError("the overall health status '' is owned by the gRPC host and cannot be set; name a service")
+        self._named_health[service] = serving
+        if self._health is not None:
+            await self._health.set(service, _status(serving))
 
     @property
     def port(self) -> int:
@@ -272,6 +304,9 @@ class GrpcServerHost:
 
         for service in self._services:
             await health_servicer.set(service.name, health_pb2.HealthCheckResponse.SERVING)
+        # Statuses set before start; looked up afresh so a value set meanwhile is not overwritten.
+        for name in list(self._named_health):
+            await health_servicer.set(name, _status(self._named_health[name]))
         names = ', '.join(service.name for service in self._services) or 'none'
         log.info(f'gRPC server listening on {self._bind.host}:{port}; services: {names}')
 
