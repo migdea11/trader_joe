@@ -398,10 +398,12 @@ class RawPage:
     Attributes:
         content (bytes): The response body exactly as served.
         headers (Mapping[str, str]): The response headers.
+        status_code (int): The HTTP status. raise_for_status passes any 2xx, so a caller wanting exactly 200 checks it.
     """
 
     content: bytes
     headers: Mapping[str, str]
+    status_code: int
 
 
 def request_raw(client: TradingClient | CorporateActionsClient, path: str, params: dict | None = None) -> RawPage:
@@ -434,7 +436,7 @@ def request_raw(client: TradingClient | CorporateActionsClient, path: str, param
         response.raise_for_status()
     except HTTPError as http_error:
         raise APIError(response.text, http_error) from http_error
-    return RawPage(content=response.content, headers=response.headers)
+    return RawPage(content=response.content, headers=response.headers, status_code=response.status_code)
 
 
 async def read_raw(

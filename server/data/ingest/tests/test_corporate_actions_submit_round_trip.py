@@ -1,5 +1,7 @@
 """A corporate-actions Submit end to end on the fake stack: the Submit handler, FakeIngest, FakeStore (P13s).
 
+Since P12s (tj-7zjov1.125) the asset-list case here is its acceptance on the same stack, no longer its refusal.
+
 Bead tj-7zjov1.124. Design: the architect's ruling of 22:05 UTC on the bead (option A: a SUCCEEDED corporate-actions
 report, an empty one included, names the requested window exactly as given as its served range, end exclusive, never
 the whole days the read sends; FAILED, EXPIRED and EXHAUSTED name none; tests/fakes/ingest.py needs no change) and ADR
@@ -21,9 +23,9 @@ import pytest
 
 from common.enums.data_select import AssetType
 from common.enums.data_stock import DataSource
-from common.errors.vocabulary import InvalidRequestError, Reason
 from routers.data_ingest.submit_handler import IngestSubmitHandler
 from schemas.data_ingest.delivery import (
+    AssetRecords,
     AttemptDelivery,
     CorporateActionRecords,
     DeliverAttemptResponse,
@@ -108,21 +110,43 @@ async def test_a_corporate_actions_submit_is_delivered_with_the_requested_window
 
 
 @pytest.mark.asyncio
-async def test_an_asset_list_submit_is_refused_on_the_fake_stack_and_reaches_no_reader():
-    store = FakeStore()
+@pytest.mark.parametrize('status', list(AssetListStatus), ids=lambda status: status.value)
+async def test_an_asset_list_submit_is_read_once_and_delivered_on_the_fake_stack_with_no_served_range(status):
+    """FLIPPED by tj-7zjov1.125 (P12s): it pinned the asset list refused at Submit and reaching no reader.
+
+    Now accepted, read ONCE as the list asked for, delivered SUCCEEDED with no tape, no served range and no vendor
+    asset id, on the trading quota key, and finished by the store. The real intake's half is
+    test_asset_list_submit_round_trip.py (SQLite) and tests/system/test_asset_list_submit_pg.py (Postgres).
+    """
+    store = SignallingStore()
     ingest = FakeIngest(store, world=WORLD)
     handler = IngestSubmitHandler({DataSource.ALPACA_API: ingest.handle}, ingest.identity.instance_id)
     listing = SubmitRequest(
         request_id='al-1',
         owner='world-manager',
-        asset_list=AssetListRequest(
-            source=DataSource.ALPACA_API, asset_type=AssetType.STOCK, status=AssetListStatus.ACTIVE
-        ),
+        ready_by=datetime.now(UTC) + timedelta(minutes=5),
+        asset_list=AssetListRequest(source=DataSource.ALPACA_API, asset_type=AssetType.STOCK, status=status),
     )
 
-    with pytest.raises(InvalidRequestError) as raised:
-        await handler.submit(listing)
+    async def submit(request: SubmitRequest) -> SubmitAck:
+        return (await handler.submit(request)).ack
 
-    assert raised.value.reason is Reason.INVALID_REQUEST
-    assert ingest.scheduler.queued == 0
-    assert ingest.reader.calls == ()
+    async with ingest:
+        await ingest.announce()
+        ack = await store.submit(submit, listing)
+        await asyncio.wait_for(store.answered.wait(), GUARD_S)
+
+    assert ack.refused is None and ack.accepted.feed is None
+    assert store.is_finished('al-1')
+    [written] = store.written
+    report = written.attempt
+    assert report.header.request_id == 'al-1'
+    assert report.trailer.outcome is DeliveryOutcome.SUCCEEDED, report.trailer.detail
+    assert report.trailer.served_range is None
+    assert report.header.feed is None and report.header.vendor_asset_id == ''
+    assert report.header.quota_key == ack.accepted.quota_key
+    assert written.answer.verdict is DeliveryVerdict.FINAL
+    assert ingest.reader.calls == (('assets', status.value),), 'not one read of the list asked for'
+    expected = [asset.symbol for asset in WORLD.assets(status, report.trailer.as_of)]
+    delivered = [record.symbol for part in report.parts if isinstance(part, AssetRecords) for record in part.records]
+    assert delivered == expected

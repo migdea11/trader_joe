@@ -27,6 +27,7 @@ from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Feed, Granularity, UpdateType
 from common.errors.vocabulary import ExogenousError, InvalidRequestError, Reason
 from data.ingest.app.brokers.alpaca import broker_api
+from data.ingest.app.brokers.alpaca.asset_attempt import AssetListWork
 from data.ingest.app.brokers.alpaca.classify import RATE_LIMIT_RESET_HEADER, RETRY_AFTER_HEADER
 from data.ingest.app.brokers.alpaca.corporate_actions_attempt import CorporateActionsWork
 from data.ingest.app.brokers.alpaca.handle import (
@@ -81,6 +82,7 @@ from schemas.data_ingest.submit import (
     AssetListStatus,
     BarsRequest,
     CorporateActionsRequest,
+    RequestKind,
     SubmitAccepted,
     SubmitAck,
     SubmitRequest,
@@ -1082,25 +1084,179 @@ NON_BARS = [
 
 # The scope each non-bars kind is charged to on the Alpaca HANDLE. P12 (tj-7zjov1.22) taught AlpacaHandle.submit
 # the asset list (trading API) and P13 (tj-7zjov1.23) corporate actions (data API), so the handle itself refuses
-# neither now. The Submit HANDLER serves corporate actions from P13s (tj-7zjov1.124) and still refuses the asset
-# list until P12s opens it. Each kind's own acceptance is pinned in test_alpaca_asset_handle.py and
-# test_alpaca_corporate_actions_attempt.py; the handler's routing of corporate actions just below.
+# neither now. The Submit HANDLER serves corporate actions from P13s (tj-7zjov1.124) and the asset list from P12s
+# (tj-7zjov1.125), so no kind of RequestKind is refused for its kind any more. Each kind's own acceptance is pinned in
+# test_alpaca_asset_handle.py and test_alpaca_corporate_actions_attempt.py; the handler's routing of both just below.
 NON_BARS_SCOPE = {'asset-list': ALPACA_TRADING_SCOPE, 'corporate-actions': ALPACA_DATA_SCOPE}
 [ASSET_LIST_KIND, CORPORATE_ACTIONS_KIND] = [param.values[0] for param in NON_BARS]
 
 
+def asset_list_submit(request_id: str = 'al-1', status: AssetListStatus = AssetListStatus.ACTIVE, **overrides):
+    listing = AssetListRequest(source=DataSource.ALPACA_API, asset_type=AssetType.STOCK, status=status)
+    return submit_request(request_id, **{'bars': None, 'asset_list': listing, **overrides})
+
+
 @pytest.mark.asyncio
-async def test_the_submit_handler_refuses_the_asset_list_not_served_yet_as_invalid_request_with_nothing_queued():
-    """FLIPPED by tj-7zjov1.124 (P13s): it was parametrized over both non-bars kinds; corporate actions are served now."""
+@pytest.mark.parametrize('status', list(AssetListStatus), ids=lambda status: status.value)
+async def test_the_submit_handler_accepts_the_asset_list_and_queues_it_on_the_trading_scope_with_no_tape(status):
+    """FLIPPED by tj-7zjov1.125 (P12s): it pinned the asset list refused INVALID_REQUEST with nothing queued.
+
+    Acceptance: accepted, queued once as the asset-list runner's work on the TRADING scope, no tape, and the list asked
+    for (active or inactive) is the one the queued work carries, so the runner reads that list and no other.
+    """
     handle = alpaca_handle()
     handler = IngestSubmitHandler({DataSource.ALPACA_API: handle}, INSTANCE)
+    request = asset_list_submit(status=status)
+
+    response = await handler.submit(request)
+
+    assert response.instance_id == INSTANCE
+    assert response.ack.refused is None
+    assert (response.ack.accepted.feed, response.ack.accepted.quota_key) == (None, ALPACA_TRADING_SCOPE)
+    assert handle.scheduler.queued == 1
+    assert handle.active == 1
+    queued = await asyncio.wait_for(handle.scheduler.take(), GUARD_S)
+    assert queued.request_id == 'al-1'
+    assert queued.quota_scope == ALPACA_TRADING_SCOPE
+    assert queued.feed is None
+    assert queued.payload == AssetListWork(request=request.asset_list, priority=RequestPriority.BACKFILL)
+    assert queued.payload.request.status is status
+
+
+def test_no_request_kind_is_left_unserved_by_the_submit_handler():
+    """P12s served the last kind: every member of RequestKind has a case here, so a new kind must be ruled on."""
+    assert {kind.value for kind in RequestKind} == {'bars', 'asset_list', 'corporate_actions'}
+
+
+@pytest.mark.asyncio
+async def test_a_request_with_no_body_for_its_kind_is_still_refused_invalid_request_and_reaches_no_handle():
+    """The one refusal left in the handler: no kind is unserved, but a request whose kind has no body is refused.
+
+    The domain model's validator makes this unreachable from the wire, so it is built past the validator; the handler
+    must still refuse it rather than route it to some handle.
+    """
+    handles = {named: SpyHandle(named.value) for named in (DataSource.IB_API, DataSource.ALPACA_API)}
+    handler = IngestSubmitHandler(handles, INSTANCE)
+    bodiless = SubmitRequest.model_construct(
+        request_id='none-1', owner='rebalancer', bars=None, asset_list=None, corporate_actions=None
+    )
 
     with pytest.raises(InvalidRequestError) as raised:
-        await handler.submit(submit_request(**ASSET_LIST_KIND))
+        await handler.submit(bodiless)
 
     assert raised.value.reason is Reason.INVALID_REQUEST
-    assert handle.scheduler.queued == 0
-    assert handle.active == 0, 'a refused asset-list request was held by the handle'
+    assert all(handle.submitted == [] for handle in handles.values())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('source', [DataSource.ALPACA_API, DataSource.IB_API])
+@pytest.mark.parametrize('status', list(AssetListStatus), ids=lambda status: status.value)
+async def test_the_submit_handler_routes_the_asset_list_to_the_handle_of_its_own_source(source, status):
+    """The source is read from the asset-list body: never a fixed source, never the first handle, never another's."""
+    handles = {named: SpyHandle(named.value) for named in (DataSource.IB_API, DataSource.ALPACA_API)}
+    handler = IngestSubmitHandler(handles, INSTANCE)
+    listing = AssetListRequest(source=source, asset_type=AssetType.STOCK, status=status)
+
+    response = await handler.submit(submit_request('al-1', bars=None, asset_list=listing))
+
+    assert response.ack.accepted.quota_key == source.value
+    [handed] = handles[source].submitted
+    assert handed.request_id == 'al-1'
+    assert handed.asset_list == listing, 'the list was not handed on as asked'
+    others = [handle for named, handle in handles.items() if named is not source]
+    assert all(handle.submitted == [] for handle in others), 'another source handle was handed the request'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('recovered', [True, False], ids=['recovered', 'not-recovered'])
+async def test_the_submit_handler_hands_the_asset_list_on_with_its_recovered_flag_and_count_unchanged(recovered):
+    handles = {DataSource.ALPACA_API: SpyHandle(DataSource.ALPACA_API.value)}
+    handler = IngestSubmitHandler(handles, INSTANCE)
+    request = asset_list_submit(attempt_count=2, recovered=recovered)
+
+    await handler.submit(request)
+
+    [handed] = handles[DataSource.ALPACA_API].submitted
+    assert handed == request
+
+
+@pytest.mark.asyncio
+async def test_an_asset_list_for_a_source_with_no_handle_is_not_implemented_and_reaches_no_handle():
+    alpaca = SpyHandle(DataSource.ALPACA_API.value)
+    handler = IngestSubmitHandler({DataSource.ALPACA_API: alpaca}, INSTANCE)
+    listing = AssetListRequest(source=DataSource.IB_API, asset_type=AssetType.STOCK, status=AssetListStatus.ACTIVE)
+
+    with pytest.raises(NotImplementedError, match='IB'):
+        await handler.submit(submit_request('al-1', bars=None, asset_list=listing))
+
+    assert alpaca.submitted == []
+
+
+class RestartSpy:
+    """Wraps a handle's real scheduler's charge_restart and submit, logging each in order with its scope."""
+
+    def __init__(self, handle: AlpacaHandle, monkeypatch) -> None:
+        self.log: list[tuple[str, str, int | None]] = []
+        charge, submit = handle.scheduler.charge_restart, handle.scheduler.submit
+
+        def charge_restart(request: ScheduledRequest) -> int:
+            charged = charge(request)
+            self.log.append(('charge_restart', request.quota_scope, charged))
+            return charged
+
+        async def logged_submit(request: ScheduledRequest) -> None:
+            self.log.append(('submit', request.quota_scope, None))
+            await submit(request)
+
+        monkeypatch.setattr(handle.scheduler, 'charge_restart', charge_restart)
+        monkeypatch.setattr(handle.scheduler, 'submit', logged_submit)
+
+
+@pytest.mark.asyncio
+async def test_a_recovered_asset_list_submit_is_accepted_charged_one_trading_call_then_queued(monkeypatch):
+    """P17 gate addition to the acceptance: a recovered asset_list Submit is accepted exactly as a recovered bars one.
+
+    The shared tail charges its restart cost (one call, on the trading scope) BEFORE it is queued, and keeps the count.
+    """
+    handle = alpaca_handle()
+    spy = RestartSpy(handle, monkeypatch)
+    handler = IngestSubmitHandler({DataSource.ALPACA_API: handle}, INSTANCE)
+
+    response = await handler.submit(asset_list_submit(attempt_count=2, recovered=True))
+
+    assert (response.ack.accepted.feed, response.ack.accepted.quota_key) == (None, ALPACA_TRADING_SCOPE)
+    assert spy.log == [('charge_restart', ALPACA_TRADING_SCOPE, 1), ('submit', ALPACA_TRADING_SCOPE, None)]
+    queued = await asyncio.wait_for(handle.scheduler.take(), GUARD_S)
+    assert queued.attempt_count == 2
+    assert isinstance(queued.payload, AssetListWork)
+
+
+@pytest.mark.asyncio
+async def test_a_recovered_asset_list_already_past_the_budget_is_charged_once_reported_exhausted_and_never_queued(
+    monkeypatch,
+):
+    """The exhausted check runs before the queue: charged (it is recovered), reported EXHAUSTED, never queued."""
+    handle = alpaca_handle()
+    spy = RestartSpy(handle, monkeypatch)
+    handler = IngestSubmitHandler({DataSource.ALPACA_API: handle}, INSTANCE)
+    store = DoubleStore()
+    handle.start(store, INSTANCE)
+    try:
+        response = await handler.submit(asset_list_submit(attempt_count=5, recovered=True))
+        delivered = await store.next()
+        assert handle.scheduler.queued == 0, 'the exhausted asset list was queued'
+        answer(delivered, DeliveryVerdict.FINAL)
+        await settle()
+    finally:
+        await asyncio.wait_for(handle.stop(), GUARD_S)
+
+    assert response.ack.accepted.quota_key == ALPACA_TRADING_SCOPE
+    assert spy.log == [('charge_restart', ALPACA_TRADING_SCOPE, 1)], 'not one charge, or queued'
+    assert delivered.attempt.trailer.outcome is DeliveryOutcome.EXHAUSTED
+    assert delivered.attempt.header.attempt_no == 6
+    assert delivered.attempt.header.feed is None
+    assert delivered.attempt.header.quota_key == ''
+    assert handle.active == 0
 
 
 @pytest.mark.asyncio

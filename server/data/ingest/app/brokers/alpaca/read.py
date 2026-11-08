@@ -1,4 +1,4 @@
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, time, timedelta
 from http import HTTPStatus
@@ -12,12 +12,12 @@ from alpaca.data.models.bars import BarSet
 from alpaca.trading.client import TradingClient
 
 from common.enums.data_select import AssetType, DataType
-from common.enums.data_stock import Feed
-from common.errors.vocabulary import InvalidRequestError, Reason, TraderJoeError
+from common.enums.data_stock import DataSource, Feed
+from common.errors.vocabulary import ExogenousError, InvalidRequestError, Reason, TraderJoeError
 from common.logging import get_logger
 from common.worker_pool import SharedWorkerPool
 from data.ingest.app.brokers.alpaca import broker_api
-from data.ingest.app.brokers.alpaca.assets import parse_asset, parse_asset_list
+from data.ingest.app.brokers.alpaca.assets import AssetListMalformed, parse_asset, parse_asset_list
 from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
 from data.ingest.app.brokers.alpaca.classify import VENDOR_FAILURES, classify_vendor_error
 from data.ingest.app.brokers.broker_errors import MalformedCredentialsError, MissingCredentialsError
@@ -52,6 +52,39 @@ ALPACA_CURRENCY = 'USD'
 
 # Sent on every asset-list call: without it the vendor adds its crypto rows, which are not stock listings.
 ASSET_CLASS_US_EQUITY = 'us_equity'
+
+# The fixed start of the detail of a refused asset list; the check and a count follow, never a vendor value.
+ASSET_LIST_REFUSED = 'asset list refused as malformed'
+
+CHECK_STATUS = 'G1 HTTP status is 200'
+CHECK_CONTENT_TYPE = 'G2 content type is application/json'
+CHECK_CONTENT_LENGTH = 'G3 content length matches the body'
+
+
+def _header(headers: Mapping[str, str], name: str) -> str | None:
+    """Give a header's value by case-insensitive name, or None when absent."""
+    wanted = name.lower()
+    return next((value for key, value in headers.items() if key.lower() == wanted), None)
+
+
+def _check_list_envelope(page: broker_api.RawPage) -> None:
+    """Check the asset list's response envelope (G1 to G3); the body's own checks are parse_asset_list's.
+
+    G1 the status is exactly 200. G2 the media type is application/json. G3 a Content-Length, when present and no
+    Content-Encoding is applied, equals the body length; an absent header is not checked.
+
+    Raises:
+        AssetListMalformed: On the first violated check, counting 1 (the response).
+    """
+    if page.status_code != HTTPStatus.OK:
+        raise AssetListMalformed(CHECK_STATUS, 1)
+    content_type = _header(page.headers, 'Content-Type')
+    if content_type is None or content_type.split(';', 1)[0].strip().lower() != 'application/json':
+        raise AssetListMalformed(CHECK_CONTENT_TYPE, 1)
+    length = _header(page.headers, 'Content-Length')
+    encoded = bool(_header(page.headers, 'Content-Encoding'))
+    if length is not None and not encoded and (not length.strip().isdigit() or int(length) != len(page.content)):
+        raise AssetListMalformed(CHECK_CONTENT_LENGTH, 1)
 
 
 def _utc_now() -> datetime:
@@ -272,10 +305,11 @@ class AlpacaRead:
                 (UNSUPPORTED_ASSET_TYPE) for a kind that is not a stock, VENDOR_AUTH for a missing or malformed
                 credential or an unset trading host or a 401 or 403, VENDOR_RATE_LIMITED with its reset_at for a 429,
                 VENDOR_UNAVAILABLE for a 5xx, a connection error or a timeout, another vendor status as the bars
-                read classifies it, and RATE_BUDGET for the rate budget's own refusal.
+                read classifies it, RATE_BUDGET for the rate budget's own refusal, and VENDOR_UNAVAILABLE with the
+                detail prefix ASSET_LIST_REFUSED for a list that fails an integrity check (G1 to G7,
+                tj-7zjov1.218): the whole list is refused and the attempt is retried.
 
         Raises:
-            ValueError: If the vendor's body is not a JSON array of asset records. Vendor corruption, loud.
             RuntimeError: If this reader was built without a trading scope.
         """
         if query.asset_type is not AssetType.STOCK:
@@ -297,7 +331,20 @@ class AlpacaRead:
         except VENDOR_FAILURES as e:
             return AssetListFailure(self.__classify(e, self.__trading_scope or self.__scope))
         as_of = self.__clock().astimezone(UTC)
-        return AssetListResponse(assets=parse_asset_list(page.content), as_of=as_of)
+        try:
+            _check_list_envelope(page)
+            assets = parse_asset_list(page.content, query.status.value, ASSET_CLASS_US_EQUITY)
+        except AssetListMalformed as malformed:
+            # A refused list is an ordinary transient failure the executor retries, never a raise (tj-7zjov1.218 D2).
+            refusal = ExogenousError(
+                Reason.VENDOR_UNAVAILABLE,
+                f'{ASSET_LIST_REFUSED}: {malformed}',
+                metadata={'vendor': DataSource.ALPACA_API.value},
+            )
+            refusal.__cause__ = malformed
+            log.warning('Alpaca asset list refused: %s', malformed)
+            return AssetListFailure(refusal)
+        return AssetListResponse(assets=assets, as_of=as_of)
 
     async def get_asset(self, query: AssetLookupQuery) -> AssetResponse | AssetNotFound | AssetLookupFailure:
         """Look up Alpaca's record for one symbol, in one vendor call.

@@ -138,6 +138,17 @@ class AnsweringStore:
         await asyncio.wait_for(self.__arrived.wait(), GUARD_S)
         return self.received[0]
 
+    async def at_least(self, count: int) -> None:
+        """Wait until `count` deliveries have arrived."""
+
+        async def arrived() -> None:
+            # No await between the check and the clear, so a delivery cannot set the event unseen.
+            while len(self.received) < count:
+                self.__arrived.clear()
+                await self.__arrived.wait()
+
+        await asyncio.wait_for(arrived(), GUARD_S)
+
 
 async def settle() -> None:
     """Let every task that can run, run."""
@@ -154,7 +165,8 @@ def scheduled_listing(ready_by: datetime | None = NOW + timedelta(minutes=5)) ->
     )
 
 
-def settings() -> ExecutorSettings:
+def settings(base_delay_s: float = 1.0) -> ExecutorSettings:
+    """The handle's settings; a zero base delay (and so no backoff at all) runs a whole retry budget at once."""
     return ExecutorSettings(
         buffer_size=8,
         workers=1,
@@ -162,7 +174,7 @@ def settings() -> ExecutorSettings:
         stall_check_interval_s=3600.0,
         redelivery_base_s=1.0,
         redelivery_max_s=1.5,
-        retry=RetryPolicy(max_attempts=MAX_ATTEMPTS, base_delay_s=1.0, max_delay_s=60.0, factor=2.0),
+        retry=RetryPolicy(max_attempts=MAX_ATTEMPTS, base_delay_s=base_delay_s, max_delay_s=60.0, factor=2.0),
     )
 
 
@@ -560,13 +572,26 @@ async def test_an_asset_list_expiring_in_the_queue_reports_feed_unspecified_with
 # Through the handle end to end: one paced call on the trading scope, the list on the wire
 # ---------------------------------------------------------------------------------------------
 
-LIST_BODY = b'[{"id":"id-aapl","symbol":"AAPL","status":"active","tradable":true,"exchange":"NASDAQ","name":"Apple"}]'
+AAPL_ID = 'b0b6dd9d-8b9b-48a9-ba46-b9d54906e415'
+
+
+def list_body(status: AssetListStatus) -> bytes:
+    """One record the integrity guard accepts (tj-7zjov1.218 G5) on the list the status names."""
+    return (
+        b'[{"id":"'
+        + AAPL_ID.encode()
+        + b'","class":"us_equity","symbol":"AAPL","status":"'
+        + status.value.encode()
+        + b'","tradable":true,"marginable":true,"shortable":true,"fractionable":true,"exchange":"NASDAQ",'
+        b'"name":"Apple"}]'
+    )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('status', list(AssetListStatus), ids=lambda status: status.value)
 async def test_a_submitted_asset_list_is_read_once_on_the_trading_scope_and_delivered_with_no_tape(monkeypatch, status):
-    vendor = stub_trading_vendor(raw_answer(LIST_BODY))
+    body = list_body(status)
+    vendor = stub_trading_vendor(raw_answer(body))
     broker_api.set_trading_client(vendor.client)
     handle = alpaca_handle()
     acquired: list[str] = []
@@ -596,4 +621,81 @@ async def test_a_submitted_asset_list_is_read_once_on_the_trading_scope_and_deli
     assert report.header.vendor_asset_id == ''
     assert report.trailer.vendor_stats.calls == 1
     [part] = report.parts
-    assert [(record.vendor_asset_id, record.raw_payload) for record in part.records] == [('id-aapl', LIST_BODY[1:-1])]
+    assert [(record.vendor_asset_id, record.raw_payload) for record in part.records] == [(AAPL_ID, body[1:-1])]
+
+
+# ---------------------------------------------------------------------------------------------
+# Through the handle end to end: a refused list is retried to the budget and delivers no records (tj-7zjov1.218)
+# ---------------------------------------------------------------------------------------------
+
+REFUSED = 'asset list refused as malformed: '
+
+# tj-7zjov1.225: the vendor id in any spelling but canonical (lowercase, hyphenated 8-4-4-4-12) is a G5 refusal. The
+# full set, with the reasoning, is test_alpaca_assets.NON_CANONICAL_SPELLINGS; these are its spellings at the
+# attempt level. Each is spliced into raw JSON bytes, so the newline and tab are written as their JSON escapes.
+NON_CANONICAL_IDS = {
+    'an-upper-case-uuid': AAPL_ID.upper(),
+    'a-mixed-case-uuid': AAPL_ID[:9] + AAPL_ID[9:].upper(),
+    'a-braced-uuid': '{' + AAPL_ID + '}',
+    'a-urn-uuid': 'urn:uuid:' + AAPL_ID,
+    'a-uuid-prefix': 'uuid:' + AAPL_ID,
+    'a-32-hex-no-hyphen-uuid': AAPL_ID.replace('-', ''),
+    'misplaced-hyphens': AAPL_ID.replace('-', '')[:4] + '-' + AAPL_ID.replace('-', '')[4:],
+    'a-leading-space': ' ' + AAPL_ID,
+    'a-trailing-newline': AAPL_ID + '\\n',
+    'whitespace-on-both-sides': '\\t' + AAPL_ID + ' ',
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('answer', 'detail'),
+    [
+        pytest.param(
+            raw_answer(list_body(AssetListStatus.ACTIVE), status=203), 'G1 HTTP status is 200 (1)', id='g1-status'
+        ),
+        pytest.param(
+            raw_answer(list_body(AssetListStatus.INACTIVE)), 'G5 record fields (1)', id='g5-another-lists-record'
+        ),
+        pytest.param(
+            raw_answer(b'{"message": "not a list"}'), 'G4 body is one UTF-8 JSON array (0)', id='g4-not-an-array'
+        ),
+        *[
+            pytest.param(
+                raw_answer(list_body(AssetListStatus.ACTIVE).replace(AAPL_ID.encode(), spelling.encode())),
+                'G5 record fields (1)',
+                id=f'g5-{label}',
+            )
+            for label, spelling in NON_CANONICAL_IDS.items()
+        ],
+    ],
+)
+async def test_a_refused_list_is_retried_as_transient_up_to_the_budget_and_never_delivers_a_record(answer, detail):
+    """D2: every attempt FAILED TRANSIENT with the guard's detail, then the budget is spent and nothing more is read.
+
+    Each report carries its vendor stats and no part. The store answers CONTINUE throughout, so only ingest's budget
+    stops the retries.
+    """
+    vendor = stub_trading_vendor(*[answer] * MAX_ATTEMPTS, request_cap=MAX_ATTEMPTS)
+    broker_api.set_trading_client(vendor.client)
+    handle = AlpacaHandle(settings=settings(base_delay_s=0.0), calls_per_minute=200)
+    store = AnsweringStore(DeliveryVerdict.CONTINUE)
+    handle.start(store, 'instance-under-test')
+    try:
+        await handle.submit(asset_list_submit(ready_by=datetime.now(UTC) + timedelta(minutes=5)))
+        await store.at_least(MAX_ATTEMPTS)
+        await settle()
+    finally:
+        await asyncio.wait_for(handle.stop(), GUARD_S)
+
+    assert len(vendor.sent) == MAX_ATTEMPTS, 'the refused list was not retried to the budget, or past it'
+    assert [report.header.attempt_no for report in store.received] == list(range(1, MAX_ATTEMPTS + 1))
+    for report in store.received:
+        assert report.trailer.outcome is DeliveryOutcome.FAILED
+        assert report.trailer.error_class is DeliveryErrorClass.TRANSIENT, 'a refused list must be retried (D2)'
+        assert report.trailer.detail == REFUSED + detail
+        assert report.parts == [], 'a refused list delivered records'
+        assert report.trailer.vendor_stats is not None and report.trailer.vendor_stats.calls == 1
+        assert report.header.quota_key == ALPACA_TRADING_SCOPE
+    assert [report.trailer.last_attempt for report in store.received] == [False] * (MAX_ATTEMPTS - 1) + [True]
+    assert handle.active == 0

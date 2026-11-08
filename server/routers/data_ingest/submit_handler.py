@@ -9,8 +9,10 @@ reports to the store happen behind the queue (data/ingest/app/brokers/handle.py)
 routed by the request's source. What is knowable before the vendor is checked here, before the ack, as FetchDataset
 does (routers/data_ingest/bars_validation.py).
 
-Bars and corporate-actions requests are served in this release. The asset list is served from P12s (tj-7zjov1.125),
-once the store can write it; until then it is refused as INVALID_REQUEST, with nothing queued.
+Bars, corporate-actions and asset-list requests are served in this release. The asset list is served now that the store
+arm writes it (P17, tj-7zjov1.125): a delivery the store refused would live only in ingest's memory, and an asset list
+cannot be fetched again. A recovered asset-list Submit is accepted exactly as a recovered bars one is. A request that
+carries no body for its kind is refused as INVALID_REQUEST, with nothing queued.
 """
 
 from collections.abc import Mapping
@@ -47,7 +49,8 @@ class IngestSubmitHandler:
 
         Raises:
             InvalidRequestError: UNSUPPORTED_ASSET_TYPE or INVALID_REQUEST for a bars request this service cannot
-                serve, and INVALID_REQUEST for a kind not served yet (the asset list). All are known before any
+                serve, and INVALID_REQUEST for a request whose body for its kind is missing. The handle's intake
+                raises UNSUPPORTED_ASSET_TYPE for an asset list that is not of stocks. All are known before any
                 vendor call.
             NotImplementedError: If no handle serves the request's source.
         """
@@ -57,6 +60,8 @@ class IngestSubmitHandler:
             source = bars.source
         elif request.kind is RequestKind.CORPORATE_ACTIONS and request.corporate_actions is not None:
             source = request.corporate_actions.source
+        elif request.kind is RequestKind.ASSET_LIST and request.asset_list is not None:
+            source = request.asset_list.source
         else:
             raise InvalidRequestError(Reason.INVALID_REQUEST, f'{request.kind.value} requests are not served yet')
         handle = self._handles.get(source)
