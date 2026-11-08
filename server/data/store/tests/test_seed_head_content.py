@@ -11,11 +11,15 @@ manifest's digests, is compared with the model's own columns; the vendor asset i
 constant. The checks are plain functions over the seed text, so each one can be run against an older seed to see it
 red.
 
+P34c (tj-7zjov1.123) moved the head to b8e4c1f7a923: push_path_problems reads its seven columns off the head seed.
+P35r (tj-7zjov1.153) moved it to 39c28a39b290: expiry_type_problems reads ingest_request.expiry_type off it.
+
 PR-GATE TIER: files only, no database. That the seed loads and upgrades is tests/system's.
 """
 
 import json
 import re
+from collections.abc import Iterable
 
 import pytest
 
@@ -23,7 +27,8 @@ from common.tests.roots import REPO_ROOT
 from data.store.app.database.models.ingest_instance import IngestInstance
 from data.store.app.database.models.ingest_request import IngestRequest
 from data.store.app.database.models.ingest_run import IngestRun
-from data.store.seeds.ingest_records import VENDOR_ASSET
+from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
+from data.store.seeds.ingest_records import REQUEST_IDS, VENDOR_ASSET
 from data.store.seeds.manifest import head_revision
 from data.store.seeds.producer import VERSIONS_DIR
 
@@ -54,12 +59,12 @@ def _values(text: str) -> list[str | None]:
     return values
 
 
-def seed_rows(sql: str) -> dict[str, list[dict[str, str | None]]]:
-    """The seed's rows of the ingest tables, as column to value, parsed from the dump's INSERT lines."""
-    rows: dict[str, list[dict[str, str | None]]] = {table: [] for table in MODELS}
+def seed_rows(sql: str, tables: Iterable[str] = MODELS) -> dict[str, list[dict[str, str | None]]]:
+    """The seed's rows of the named tables (the ingest tables by default), as column to value, from its INSERT lines."""
+    rows: dict[str, list[dict[str, str | None]]] = {table: [] for table in tables}
     for line in sql.splitlines():
         match = _INSERT.match(line)
-        if match and match[1] in MODELS:
+        if match and match[1] in rows:
             columns = match[2].split(', ')
             values = _values(match[3])
             assert len(columns) == len(values), line[:120]
@@ -103,6 +108,67 @@ def vendor_asset_problems(sql: str) -> list[str]:
     return problems
 
 
+# P34c (tj-7zjov1.123, revision b8e4c1f7a923). The seed producer writes through store code, and nothing in it sets the
+# request's trigger or lifecycle fields or the entry's stopped cause (ADR tj-26jt9w addendum 13: no seed value), so
+# each is NULL on every row. The cast's one counted FAILED report with no stats is the FAILED_NO_STATS request.
+NULL_AT_HEAD = {
+    IngestRequest.TABLE_NAME: ('trigger', 'expiry', 'collect'),
+    StoreDatasetEntry.TABLE_NAME: ('stopped_cause',),
+}
+SPEND_UNKNOWN_REQUEST = str(REQUEST_IDS['FAILED_NO_STATS'])
+# The attempt-row states of a SUCCEEDED report (bars, or none); every other row's served range is NULL.
+SERVED_STATES = ('SUCCEEDED', 'EMPTY')
+
+
+def push_path_problems(sql: str) -> list[str]:
+    """The b8e4c1f7a923 columns in the seed, each as the cast writes it.
+
+    Present on every row, NULL where nothing writes them; the unknown-spend counter and the served range where the
+    cast's deliveries write them.
+    """
+    rows = seed_rows(sql, (*MODELS, StoreDatasetEntry.TABLE_NAME))
+    problems = []
+    for table, columns in NULL_AT_HEAD.items():
+        if not rows[table]:
+            problems.append(f'{table}: no row in the seed')
+        for column in columns:
+            if any(column not in row for row in rows[table]):
+                problems.append(f'{table}: the seed has no {column} column')
+            elif held := sorted({row[column] for row in rows[table] if row[column] is not None}):
+                problems.append(f'{table}.{column}: values nothing writes yet: {held}')
+    requests = rows[IngestRequest.TABLE_NAME]
+    if any('spend_unknown_attempts' not in row for row in requests):
+        problems.append('ingest_request: the seed has no spend_unknown_attempts column')
+    else:
+        counted = {row['id']: row['spend_unknown_attempts'] for row in requests}
+        expected = {request_id: '1' if request_id == SPEND_UNKNOWN_REQUEST else '0' for request_id in counted}
+        if SPEND_UNKNOWN_REQUEST not in counted:
+            problems.append('ingest_request: the FAILED_NO_STATS request is not in the seed')
+        elif counted != expected:
+            wrong = {key: value for key, value in counted.items() if value != expected[key]}
+            problems.append(f'ingest_request.spend_unknown_attempts: {wrong}')
+    by_id = {row['id']: row for row in requests}
+    runs = rows[IngestRun.TABLE_NAME]
+    if any('served_start' not in row or 'served_end' not in row for row in runs):
+        problems.append('ingest_run: the seed has no served_start or served_end column')
+        return problems
+    served = 0
+    for row in runs:
+        span = (row['served_start'], row['served_end'])
+        if row['attempt_no'] is not None and row['state'] in SERVED_STATES:
+            served += 1
+            # The cast's success serves exactly the window its request asked for.
+            request = by_id.get(row['request_id'])
+            wanted = (request['requested_start'], request['requested_end']) if request else None
+            if span != wanted:
+                problems.append(f'ingest_run attempt {row["attempt_no"]} of {row["request_id"]}: served {span}')
+        elif span != (None, None):
+            problems.append(f'ingest_run {row["id"]} ({row["state"]}): a served range on a row that is no success')
+    if served == 0:
+        problems.append('ingest_run: no SUCCEEDED or EMPTY attempt row, so the served range is never seeded')
+    return problems
+
+
 def _read(revision: str) -> tuple[str, dict]:
     sql = (SEEDS_DIR / f'{revision}.sql').read_text(encoding='utf-8')
     manifest = json.loads((SEEDS_DIR / f'{revision}.json').read_text(encoding='utf-8'))
@@ -120,6 +186,112 @@ def test_the_head_seed_has_exactly_the_models_columns_in_every_ingest_table():
 def test_the_head_seed_holds_both_values_of_the_attempt_vendor_asset_id():
     sql, _ = _read(HEAD)
     assert vendor_asset_problems(sql) == []
+
+
+def test_the_head_seed_holds_the_push_path_columns_as_the_cast_writes_them():
+    """b8e4c1f7a923: trigger, expiry, collect and stopped_cause NULL on every row; one unknown spend; served ranges.
+
+    Red until the seed is regenerated at the new head (the head seed file does not exist before that).
+    """
+    sql, _ = _read(HEAD)
+    assert push_path_problems(sql) == []
+
+
+def test_the_push_path_check_is_red_on_the_parent_seed_and_on_wrong_values():
+    """Run against the committed f2b7d4a91c36 seed (no such columns), then against one row of each wrong value."""
+    parent_sql, _ = _read('f2b7d4a91c36')
+    assert set(push_path_problems(parent_sql)) == {
+        'ingest_request: the seed has no trigger column',
+        'ingest_request: the seed has no expiry column',
+        'ingest_request: the seed has no collect column',
+        'store_dataset_entry: the seed has no stopped_cause column',
+        'ingest_request: the seed has no spend_unknown_attempts column',
+        'ingest_run: the seed has no served_start or served_end column',
+    }
+
+    other = '5eed0000-0000-4000-8000-000000000099'
+
+    def insert(table: str, values: dict[str, str | None]) -> str:
+        rendered = ', '.join('NULL' if value is None else f"'{value}'" for value in values.values())
+        return f'INSERT INTO public.{table} ({", ".join(values)}) VALUES ({rendered});'
+
+    request = {'trigger': 'SCHEDULE', 'expiry': None, 'collect': None, 'requested_start': 'a', 'requested_end': 'b'}
+    sql = '\n'.join(
+        [
+            insert('store_dataset_entry', {'id': 'e1', 'stopped_cause': 'X'}),
+            insert('ingest_request', {'id': SPEND_UNKNOWN_REQUEST, 'spend_unknown_attempts': '0', **request}),
+            insert('ingest_request', {'id': other, 'spend_unknown_attempts': '1', **request}),
+            insert(
+                'ingest_run',
+                {
+                    'id': 'r1',
+                    'request_id': other,
+                    'attempt_no': '1',
+                    'state': 'SUCCEEDED',
+                    'served_start': 'a',
+                    'served_end': 'c',
+                },
+            ),
+            insert(
+                'ingest_run',
+                {
+                    'id': 'r2',
+                    'request_id': other,
+                    'attempt_no': '2',
+                    'state': 'FAILED',
+                    'served_start': 'a',
+                    'served_end': 'b',
+                },
+            ),
+        ]
+    )
+    assert push_path_problems(sql) == [
+        "ingest_request.trigger: values nothing writes yet: ['SCHEDULE']",
+        "store_dataset_entry.stopped_cause: values nothing writes yet: ['X']",
+        f"ingest_request.spend_unknown_attempts: {{'{SPEND_UNKNOWN_REQUEST}': '0', '{other}': '1'}}",
+        f"ingest_run attempt 1 of {other}: served ('a', 'c')",
+        'ingest_run r2 (FAILED): a served range on a row that is no success',
+    ]
+
+
+# P35r (tj-7zjov1.153, revision 39c28a39b290). The seed cast (seeds/ingest_records.py) is not changed by the bead and
+# nothing before P35 writes the column, so the head seed holds expiry_type NULL on every ingest_request row.
+EXPIRY_TYPE_COLUMN = 'expiry_type'
+
+
+def expiry_type_problems(sql: str) -> list[str]:
+    """ingest_request.expiry_type present on every request row of the seed and NULL on each."""
+    requests = seed_rows(sql)[IngestRequest.TABLE_NAME]
+    if not requests:
+        return ['ingest_request: no row in the seed']
+    if any(EXPIRY_TYPE_COLUMN not in row for row in requests):
+        return [f'ingest_request: the seed has no {EXPIRY_TYPE_COLUMN} column']
+    if held := sorted({row[EXPIRY_TYPE_COLUMN] for row in requests if row[EXPIRY_TYPE_COLUMN] is not None}):
+        return [f'ingest_request.{EXPIRY_TYPE_COLUMN}: values nothing writes yet: {held}']
+    return []
+
+
+def test_the_head_seed_holds_expiry_type_null_on_every_request_row():
+    """39c28a39b290 (tj-7zjov1.153): the column is in the head seed and NULL on every ingest_request row.
+
+    Red until the seed is regenerated at the new head (the head seed file does not exist before that).
+    """
+    sql, _ = _read(HEAD)
+    assert expiry_type_problems(sql) == []
+
+
+def test_the_expiry_type_check_is_red_on_the_parent_seed_and_on_a_value():
+    """Against the committed b8e4c1f7a923 seed (no such column), then one row holding a value and one with no rows."""
+    parent_sql, _ = _read('b8e4c1f7a923')
+    assert expiry_type_problems(parent_sql) == ['ingest_request: the seed has no expiry_type column']
+
+    rows = [
+        "INSERT INTO public.ingest_request (id, expiry_type) VALUES ('r1', NULL);",
+        "INSERT INTO public.ingest_request (id, expiry_type) VALUES ('r2', '2');",
+    ]
+    assert expiry_type_problems('\n'.join(rows)) == ["ingest_request.expiry_type: values nothing writes yet: ['2']"]
+    assert expiry_type_problems(rows[0]) == []
+    assert expiry_type_problems('') == ['ingest_request: no row in the seed']
 
 
 def test_the_value_parser_reads_null_quotes_and_escape_strings():

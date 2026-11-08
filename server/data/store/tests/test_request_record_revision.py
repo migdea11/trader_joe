@@ -67,6 +67,17 @@ MIGRATIONS_DIR = STORE_DIR / 'migrations'
 REVISION = 'f2b7d4a91c36'
 PARENT = 'a6d3f8e1c205'
 REVISION_FILE = MIGRATIONS_DIR / 'versions' / f'{REVISION}_request_record_and_instance_marker.py'
+# The one revision after this one (tj-7zjov1.123), which adds columns to ingest_request and ingest_run. The models
+# describe the tables as the HEAD leaves them, so the comparisons below take that revision's own additions off the
+# model (or put them on the revision's table), read from its upgrade() rather than restated here.
+CHILD = 'b8e4c1f7a923'
+CHILD_FILE = MIGRATIONS_DIR / 'versions' / f'{CHILD}_push_path_columns.py'
+# The head since tj-7zjov1.153 (P35r): directly on the child, it adds ingest_request.expiry_type. Its additions are
+# taken off the model exactly as the child's are, read from its own upgrade().
+HEAD = '39c28a39b290'
+HEAD_FILE = MIGRATIONS_DIR / 'versions' / f'{HEAD}_request_expiry_type.py'
+# Every revision after this one, in chain order: the model is what the last of them leaves.
+LATER_FILES = [CHILD_FILE, HEAD_FILE]
 DIALECT = postgresql.dialect()
 ADDITIVE_EXCEPTION_MARKER = re.compile(r'^\s*# additive-exception:', re.MULTILINE)
 
@@ -118,13 +129,44 @@ def _compiled(element: Any) -> str:
     return ' '.join(str(element.compile(dialect=DIALECT)).split())
 
 
+def _child_added_columns() -> dict[str, list[sa.Column]]:
+    """The columns the later revisions add, per table, in chain order, from their own upgrade() against a recorded op.
+
+    The child (tj-7zjov1.123) and, since tj-7zjov1.153, the head on it; each one's add_column calls, nothing restated.
+    """
+    added: dict[str, list[sa.Column]] = {}
+    for path in LATER_FILES:
+        spec = importlib.util.spec_from_file_location(f'revision_{path.stem}', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        op = MagicMock(name='op')
+        with patch.object(module, 'op', op), patch.object(postgresql.ENUM, 'create', autospec=True):
+            module.upgrade()
+        for name, args, _ in op.method_calls:
+            if name == 'add_column':
+                added.setdefault(args[0], []).append(args[1])
+    return added
+
+
+def _model_columns_in(table: sa.Table, names: list[str]) -> sa.Table:
+    """A copy of the model table holding exactly the named columns, in the order given (column order is not schema)."""
+    by_name = {column.name: column for column in table.columns}
+    return sa.Table(table.name, sa.MetaData(), *[by_name[name]._copy() for name in names])
+
+
 # --------------------------------------------------------------------------------------------- the chain
 
 
 def test_the_revision_is_the_single_head_directly_on_the_head_it_was_written_on_and_is_unmarked():
-    """Checklist items 1 to 3: one new revision, down_revision the previous head, one head, no exception marker."""
+    """Checklist items 1 to 3: one new revision, down_revision the previous head, one head, no exception marker.
+
+    No longer the head since tj-7zjov1.123: its one child is b8e4c1f7a923. The single head is 39c28a39b290 since
+    tj-7zjov1.153 (P35r), directly on that child.
+    """
     script = ScriptDirectory(str(MIGRATIONS_DIR))
-    assert script.get_heads() == [REVISION]
+    assert script.get_heads() == [HEAD]
+    assert script.get_revision(HEAD).down_revision == CHILD
+    assert [rev.revision for rev in script.walk_revisions() if rev.down_revision == REVISION] == [CHILD]
     module = _load()
     assert (module.revision, module.down_revision) == (REVISION, PARENT)
     assert not ADDITIVE_EXCEPTION_MARKER.search(REVISION_FILE.read_text(encoding='utf-8'))
@@ -217,10 +259,21 @@ def test_downgrade_drops_each_index_with_the_predicate_it_was_created_with():
 
 @pytest.mark.parametrize('model', [IngestRequest, IngestInstance], ids=lambda m: m.TABLE_NAME)
 def test_the_revision_builds_exactly_the_table_the_model_declares(model):
-    """Every column, type, nullability, server default and the primary key, as Postgres DDL, model against revision."""
-    op, _, _ = _run('upgrade')
+    """Every column, type, nullability, server default and the primary key, as Postgres DDL, model against revision.
 
-    assert _compiled(CreateTable(_created_tables(op)[model.TABLE_NAME])) == _compiled(CreateTable(model.__table__))
+    THE TABLE AT HEAD (tj-7zjov1.123): b8e4c1f7a923 adds four ingest_request columns and 39c28a39b290 (tj-7zjov1.153)
+    a fifth, so the revision's table plus the later additions is compared with the model, whole, in the order a
+    migrated database holds them.
+    """
+    op, _, _ = _run('upgrade')
+    created = _created_tables(op)[model.TABLE_NAME]
+    later = [column._copy() for column in _child_added_columns().get(model.TABLE_NAME, [])]
+    head = sa.Table(created.name, sa.MetaData(), *[column._copy() for column in created.columns], *later)
+    names = [column.name for column in head.columns]
+
+    assert len(names) == len(set(names)), 'the child re-adds a column this revision created'
+    assert sorted(names) == sorted(column.name for column in model.__table__.columns)
+    assert _compiled(CreateTable(head)) == _compiled(CreateTable(_model_columns_in(model.__table__, names)))
 
 
 def test_the_revision_adds_to_ingest_run_exactly_the_columns_the_model_has_that_6f5a798746a1_did_not():
@@ -358,12 +411,20 @@ def _bookkeeping(statements: list[str]) -> list[str]:
 
 
 def _model_upgrade_ddl() -> list[str]:
-    """What the MODELS say the revision must send, in the revision's order, compiled for Postgres."""
-    added = [column for column in RUN.columns if column.name not in _ingest_run_columns_before()]
+    """What the MODELS say the revision must send, in the revision's order, compiled for Postgres.
+
+    The later revisions' columns (tj-7zjov1.123, tj-7zjov1.153) are taken off the models: this revision's SQL never
+    held them.
+    """
+    child = {table: {column.name for column in columns} for table, columns in _child_added_columns().items()}
+    later_run = child.get(RUN.name, set())
+    added = [c for c in RUN.columns if c.name not in _ingest_run_columns_before() and c.name not in later_run]
+    later_request = child.get(REQUEST.name, set())
+    request = _model_columns_in(REQUEST, [c.name for c in REQUEST.columns if c.name not in later_request])
     return [
         _compiled(CreateEnumType(REQUEST.c.kind.type)),
         _compiled(CreateEnumType(REQUEST.c.state.type)),
-        _compiled(CreateTable(REQUEST)),
+        _compiled(CreateTable(request)),
         *sorted(_compiled(CreateIndex(index)) for index in REQUEST.indexes),
         _compiled(CreateTable(INSTANCE)),
         *[f'ALTER TABLE {RUN.name} ADD COLUMN {_compiled(CreateColumn(column))}' for column in added],

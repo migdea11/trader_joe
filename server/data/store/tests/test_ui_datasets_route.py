@@ -56,6 +56,7 @@ from data.store.app.completeness import gap_intervals
 from data.store.app.database.crud.stock import dataset_catalog as catalog_repo
 from data.store.app.database.crud.stock.dataset_catalog import CatalogFilter
 from data.store.app.database.database import async_db
+from data.store.app.database.models.ingest_request import IngestRequest, IngestRequestKind, IngestRequestState
 from data.store.app.database.models.ingest_run import IngestRun, IngestRunState, IngestRunTrigger
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
@@ -76,6 +77,7 @@ from data.store.app.trading_calendar import (
     session_of,
 )
 from data.store.tests.problem_body import problem, validation_errors
+from data.store.tests.request_tables import create_request_tables
 from data.store.tests.test_coverage_buckets import XTKS
 from routers.data_store.ui_datasets import utc_now
 from routers.data_store.ui_mapping import BarPageIndexMessage
@@ -171,6 +173,8 @@ async def engine(aware_sqlite_datetimes) -> AsyncIterator[AsyncEngine]:
                 tables=[StoreDatasetEntry.__table__, StockMarketActivity.__table__, IngestRun.__table__],
             )
         )
+        # And ingest_request since P35 (tj-7zjov1.28): the Running filter and facet read open requests as well.
+        await connection.run_sync(create_request_tables)
     try:
         yield engine
     finally:
@@ -1426,6 +1430,62 @@ async def test_with_running_true_the_other_facets_count_only_running_datasets(cl
 async def test_no_running_run_means_a_zero_facet_and_an_empty_running_list(client, catalog):
     assert 'running' not in (await client.get('/ui/v1/datasets/facets')).json()
     assert await list_all(client, running='true') == []
+
+
+async def _requests_naming(engine: AsyncEngine, *named: tuple[StoreDatasetEntry | None, IngestRequestState]) -> None:
+    """ingest_request rows, written directly: one per (dataset or None, state)."""
+    async with engine.begin() as connection:
+        for of, state in named:
+            await connection.execute(
+                insert(IngestRequest.__table__).values(
+                    id=uuid.uuid4(),
+                    kind=IngestRequestKind.BARS,
+                    source=DataSource.ALPACA_API,
+                    dataset_id=None if of is None else of.id,
+                    client_label=OWNER,
+                    state=state,
+                )
+            )
+
+
+@pytest.mark.asyncio
+async def test_the_running_filter_and_facet_read_open_requests(client, catalog, engine):
+    """The push path's Running (tj-7zjov1.28 acceptance: "the Running facet reads open requests").
+
+    Since P35 nothing writes a RUNNING ingest_run row: a dataset is collecting while a REQUEST naming it is open
+    (PENDING, QUEUED or NOT_DELIVERED). A finished request (SUCCEEDED, EMPTY, FAILED) is not Running, and an open
+    request with no dataset yet (a POST before its first delivered attempt) names none and is counted nowhere.
+    """
+    await _requests_naming(
+        engine,
+        (catalog.aaa_day, IngestRequestState.PENDING),
+        (catalog.bbb, IngestRequestState.QUEUED),
+        (catalog.bbb, IngestRequestState.QUEUED),
+        (catalog.ccc, IngestRequestState.NOT_DELIVERED),
+        (catalog.ddd, IngestRequestState.SUCCEEDED),
+        (catalog.ddd, IngestRequestState.FAILED),
+        (catalog.eee, IngestRequestState.EMPTY),
+        (None, IngestRequestState.QUEUED),
+    )
+    expected = catalog.ids(catalog.aaa_day, catalog.bbb, catalog.ccc)
+
+    assert {item['id'] for item in await list_all(client, running='true')} == expected
+    facets = (await client.get('/ui/v1/datasets/facets')).json()
+    assert int(facets.get('running', '0')) == len(expected)
+
+
+@pytest.mark.asyncio
+async def test_an_open_request_and_a_legacy_running_run_name_one_dataset_once(client, catalog, engine):
+    """The two records of Running are a UNION: a dataset named by both is counted once, a legacy run alone still counts."""
+    await store(
+        engine,
+        run_of(catalog.aaa_day, minutes_ago=1, state=IngestRunState.RUNNING),
+        run_of(catalog.bbb, minutes_ago=1, state=IngestRunState.RUNNING),
+    )
+    await _requests_naming(engine, (catalog.aaa_day, IngestRequestState.QUEUED))
+
+    assert {item['id'] for item in await list_all(client, running='true')} == catalog.ids(catalog.aaa_day, catalog.bbb)
+    assert (await client.get('/ui/v1/datasets/facets')).json()['running'] == '2'
 
 
 # ------------------------------------------------------------------------------------------------- coverage

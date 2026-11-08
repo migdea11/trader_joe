@@ -62,6 +62,7 @@ from data.store.app.events import DatasetChange, DatasetChanged, ReaperPendingCh
 from data.store.app.main import app
 from data.store.app.reaper import Reaper
 from data.store.tests.problem_body import problem
+from data.store.tests.request_tables import create_request_tables
 from data.store.tests.test_ui_dataset_writes_route import _ProbeSession
 from data.store.tests.test_ui_datasets_route import (  # noqa: F401 (aware_sqlite_datetimes is a fixture)
     NOW,
@@ -206,6 +207,8 @@ async def world(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch)
                 ],
             )
         )
+        # Running is read from open requests too since P35 (tj-7zjov1.28): the reaper's skip reads both tables.
+        await connection.run_sync(create_request_tables)
     state = World(engine)
     state.rows, bars = _seed()
     async with AsyncSession(engine, expire_on_commit=False) as db:
@@ -1144,6 +1147,10 @@ async def test_the_lifespan_starts_the_reaper_and_stops_it_before_the_database(m
     monkeypatch.setattr(app_depends, 'target_from_env', lambda _name: 'ingest:1')
     monkeypatch.setattr(app_depends, 'create_channel', lambda _target: FakeChannel())
     monkeypatch.setattr(app_depends, 'GrpcIngestFetchClient', lambda _channel: object())
+    # The push path's Submit client and its instance watcher (tj-7zjov1.28) are not this test's subject either: the
+    # watcher would run a real pass against the uninitialised database module and the fake channel.
+    monkeypatch.setattr(app_depends, 'GrpcIngestSubmitClient', lambda _channel: object())
+    monkeypatch.setenv('INSTANCE_WATCH_ENABLED', 'false')
     # The lifespan builds the StoreService host from the bind env first (tj-7zjov1.27); none is bound here.
     monkeypatch.setattr(app_depends, 'build_grpc_host', nullcontext)
 

@@ -151,10 +151,11 @@ def _satisfies(conn: sqlite3.Connection, condition: str, update_type: int, colle
 def test_the_revision_is_directly_on_the_override_log_revision_and_is_additive():
     """No longer the head since tj-grna9p.183 (a6d3f8e1c205 sits on it); still exactly one child, the enum revision.
 
-    The head moved again with tj-7zjov1.25 (f2b7d4a91c36, on a6d3f8e1c205); the one-child pin is what this file owns.
+    The head moved again with tj-7zjov1.25 (f2b7d4a91c36, on a6d3f8e1c205) and tj-7zjov1.123 (b8e4c1f7a923, on
+    f2b7d4a91c36), and tj-7zjov1.153 (39c28a39b290, on b8e4c1f7a923); the one-child pin is what this file owns.
     """
     script = ScriptDirectory(str(MIGRATIONS_DIR))
-    assert script.get_heads() == ['f2b7d4a91c36']
+    assert script.get_heads() == ['39c28a39b290']
     assert script.get_revision(REVISION).down_revision == PARENT
     assert [rev.revision for rev in script.walk_revisions() if rev.down_revision == REVISION] == ['a6d3f8e1c205']
     # Additive: no exception marker, so test_migration_with_data's GENERIC RULE holds it lossless both ways.
@@ -322,9 +323,10 @@ def _normalised(sql: str) -> str:
 
 
 def test_the_model_declares_the_same_named_check_the_revision_creates():
-    checks = [c for c in StoreDatasetEntry.__table__.constraints if isinstance(c, sa.CheckConstraint)]
-    (model_check,) = checks
+    """Selected by the revision's name: since b8e4c1f7a923 the model declares a second CHECK (the stopped cause)."""
     name, _table, condition = _recorded('upgrade').create_check_constraint.call_args.args
+    checks = [c for c in StoreDatasetEntry.__table__.constraints if isinstance(c, sa.CheckConstraint)]
+    (model_check,) = [c for c in checks if c.name == name]
     assert model_check.name == name == StoreDatasetEntry.COLLECT_BY_TYPE_CONSTRAINT
     assert _normalised(str(model_check.sqltext)) == _normalised(condition)
 

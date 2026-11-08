@@ -79,12 +79,12 @@ def restore_logging_state() -> Iterator[None]:
 
 # The module globals app_depends.lifespan assigns and never clears (tj-7zjov1.130). Module scope, so no name mangling:
 # the attribute names are literally these.
-LIFESPAN_GLOBALS = ('__INGEST_CHANNEL', '__INGEST_FETCH_CLIENT')
+LIFESPAN_GLOBALS = ('__INGEST_CHANNEL', '__INGEST_FETCH_CLIENT', '__INGEST_SUBMIT_CLIENT')
 
 
 @pytest.fixture(autouse=True)
 def restore_lifespan_globals() -> Iterator[None]:
-    """Put back the gRPC channel and fetch client globals a lifespan test may have left set.
+    """Put back the gRPC channel, fetch client and submit client globals a lifespan test may have left set.
 
     app_depends.lifespan assigns both and does not reset them on exit (in production one lifespan runs per process,
     so nothing needs to). A test that enters the lifespan without patching them leaves its fake client in the module

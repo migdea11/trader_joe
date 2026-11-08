@@ -1,7 +1,9 @@
 import importlib
 import uuid
+from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import Any, NamedTuple
+from types import MappingProxyType, SimpleNamespace
+from typing import Any, ClassVar, NamedTuple
 
 import pytest
 from fastapi.testclient import TestClient
@@ -10,11 +12,12 @@ from starlette.routing import NoMatchFound
 
 from common.database.postgres_tools import PostgresSessionFactory
 from common.enums.data_stock import DataSource, Granularity, UpdateType
-from data.store.app.app_depends import get_ingest_fetch_client
+from common.errors.vocabulary import ExogenousError, Reason
+from data.store.app.app_depends import get_ingest_fetch_client, get_ingest_submit_client
 from data.store.app.database.database import async_db
+from data.store.app.database.models.ingest_request import IngestRequest
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.main import app
-from data.store.tests.fetch_double import RecordingFetchClient
 from data.store.tests.problem_body import problem, validation_errors
 from routers.common.instance_secret import (
     INSTANCE_SECRET_ENV_VAR,
@@ -49,8 +52,9 @@ from routers.tests.test_interface_surface import SEPARATOR, load_manifest
 #      the client without `with` dispatches requests without ever running it. If you add a `with`
 #      here to make something work, you have just made this file need a database.
 #   2. Both injected dependencies are replaced through app.dependency_overrides -- async_db and
-#      get_ingest_fetch_client -- rather than by monkeypatching module globals, because the
-#      handlers take them as Depends() and that is the seam FastAPI gives you.
+#      get_ingest_submit_client (get_ingest_fetch_client until the push path, tj-7zjov1.28) --
+#      rather than by monkeypatching module globals, because the handlers take them as Depends()
+#      and that is the seam FastAPI gives you.
 # test_the_routes_are_driven_without_a_lifespan asserts both halves instead of trusting them.
 #
 # THE FAKES ARE DELIBERATELY FAITHFUL, NOT PERMISSIVE. FakeSession.add is SYNCHRONOUS because
@@ -155,6 +159,8 @@ class Case(NamedTuple):
             call could corrupt and the malformed half is skipped as a case that does not exist (pytest.ini rule).
         reads_one_row: The route reads one row by id, which the empty fake table does not hold, so a well-formed
             call reaches the handler and is answered 404 NOT_FOUND by it. See READ-BY-ID ROUTES below.
+        submits: The route submits a request to ingest (POST /store since tj-7zjov1.28): a well-formed call
+            reaches the Submit seam, whose double answers 503 PEER_UNAVAILABLE. See FakeSubmitClient.
     """
 
     path_params: dict[str, str]
@@ -164,6 +170,7 @@ class Case(NamedTuple):
     malformed_field: str
     reads_one_row: bool = False
     takes_no_input: bool = False
+    submits: bool = False
 
 
 ASSET_PATH = {'asset_type': 'stock', 'data_type': 'market-activity'}
@@ -256,6 +263,7 @@ CASES: dict[str, Case] = {
         malformed_path_params=SYMBOL_PATH,
         malformed_request={'json': {**DATASET_REQUEST, 'source': 'not-a-data-source'}},
         malformed_field='source',
+        submits=True,
     ),
     'DELETE /store/{id}': Case(
         path_params={'id': str(DELETE_ID)},
@@ -493,6 +501,40 @@ class FakeResult:
         )
 
 
+class InsertedRequest:
+    """The RETURNING row of the POST's request insert (tj-7zjov1.28): the values inserted plus the server defaults.
+
+    POST /store writes its ingest_request row on the request's own session BEFORE it submits, so the fake session
+    has to answer that one statement the way Postgres would: one row, every column, the defaults filled. Answering
+    it with FakeResult's audit-probe tuple made the handler die on an AttributeError, a failure no real deployment
+    can produce. The values are not asserted; the Submit the fake client receives is.
+    """
+
+    _DEFAULTS: ClassVar[Mapping[str, Any]] = MappingProxyType(
+        {
+            'instance_id': None,
+            'attempts': 0,
+            'spent_calls': 0,
+            'spent_pages': 0,
+            'spent_throttled_429': 0,
+            'spent_retries': 0,
+            'spend_unknown_attempts': 0,
+            'failure_cause': None,
+            'failure_detail': None,
+            'finished_at': None,
+        }
+    )
+
+    def __init__(self, statement: Any) -> None:
+        values = {column.name: None for column in IngestRequest.__table__.c}
+        values.update(self._DEFAULTS, created_at=datetime.now(UTC))
+        values.update(statement.compile().params)
+        self._row = SimpleNamespace(**values)
+
+    def one(self) -> SimpleNamespace:
+        return self._row
+
+
 class FakeSession:
     """Stands in for AsyncSession, matching its sync/async split exactly.
 
@@ -508,7 +550,9 @@ class FakeSession:
         # architect gate reviewing this file, not by a failure.
         self._added: list[int] = []
 
-    async def execute(self, statement: Any) -> FakeResult:
+    async def execute(self, statement: Any) -> 'FakeResult | InsertedRequest':
+        if getattr(statement, 'is_insert', False) and getattr(statement, 'table', None) is IngestRequest.__table__:
+            return InsertedRequest(statement)
         return FakeResult()
 
     async def commit(self) -> None:
@@ -548,29 +592,33 @@ class FakeSession:
                 setattr(instance, column, value)
 
 
-def fake_fetch_client() -> RecordingFetchClient:
-    """An IngestFetchClient double answering with an accepted, empty, completed stream.
+class FakeSubmitClient:
+    """An IngestSubmitClient double: records the Submit it is handed and answers that ingest is not there.
 
-    REPOINTED FROM THE KAFKA RPC FAKE (validator, gating tj-3mk3u5.10). POST /store now takes an
-    ``IngestFetchClient`` through ``get_ingest_fetch_client``, so the override below has to supply
-    one; the old ``FakeRpcClients`` answered a dependency the route no longer declares, and the
-    POST case failed with ``'NoneType' object has no attribute 'fetch'`` -- the real
-    ``get_ingest_fetch_client`` returning its un-initialised module global, which is itself
-    evidence that the lifespan never ran.
+    REPOINTED FROM THE FetchDataset DOUBLE (validator, tj-7zjov1.28, P35). POST /store no longer holds a stream: it
+    writes the request row, SUBMITS it, then waits for the delivery intake to finish it, reading the request row on
+    sessions of its own (own_session), which are not a dependency this file can override. A double that accepted
+    the Submit would send the handler on to those sessions, that is to Postgres, which this file must never need.
 
-    THE STREAM IS ACK-THEN-DONE WITH NO PAGES, which is the same decision the Kafka fake's empty
-    ``dataset`` made and for the same reason: the handler stores nothing and reports 0 data points,
-    because what a populated stream stores is tj-19qp1q's tier and would need a database to store
-    into. An empty window is a legitimate success here, not a degenerate one (ADR tj-fa1rpu D2).
-
-    The ack still carries a resolved feed, as the Kafka fake's batch did (tj-1njw7c): ingest is the
-    only party entitled to decide the tape, and a fake that omitted it would be more permissive
-    than the thing it stands in for.
-
-    Returns:
-        RecordingFetchClient: A fresh double per request, matching the old fake's per-call shape.
+    SO THE DOUBLE ANSWERS WHAT THIS ENVIRONMENT REALLY IS: no data_ingest. The seam raises PEER_UNAVAILABLE, the
+    typed error the real client raises for an unreachable peer, and the handler lets it through to the edge (D6).
+    The POST case therefore asserts MORE than "under 500": that exact problem+json (503, PEER_UNAVAILABLE) AND one
+    Submit for the requested symbol, which can only exist if the handler ran the overlap check, wrote the request
+    row and reached the seam. A route that never ran its handler produces neither.
     """
-    return RecordingFetchClient()
+
+    def __init__(self) -> None:
+        self.submitted: list[Any] = []
+
+    async def submit(self, request: Any) -> Any:
+        self.submitted.append(request)
+        raise ExogenousError(Reason.PEER_UNAVAILABLE, 'no data_ingest in the smoke tier')
+
+    async def instance(self) -> Any:
+        raise ExogenousError(Reason.PEER_UNAVAILABLE, 'no data_ingest in the smoke tier')
+
+
+SUBMIT_CLIENT = FakeSubmitClient()
 
 
 def manifest_entries(kind: str, *, allow_empty: bool = False) -> list[list[str]]:
@@ -758,7 +806,7 @@ def client():
     because `app` is a module-level singleton other test modules import.
     """
     app.dependency_overrides[async_db] = FakeSession
-    app.dependency_overrides[get_ingest_fetch_client] = fake_fetch_client
+    app.dependency_overrides[get_ingest_submit_client] = lambda: SUBMIT_CLIENT
     try:
         # raise_server_exceptions defaults to True and is left that way: an unhandled exception in
         # a handler reaches the test as its own traceback instead of an opaque 500, which is the
@@ -866,11 +914,19 @@ def test_a_well_formed_request_reaches_the_handler(address: str, client: TestCli
     method = address.split(' ', 1)[0]
     url = app_url_for(address, symbol_for(address), case.path_params)
 
+    submitted_before = len(SUBMIT_CLIENT.submitted)
     response = client.request(method, url, headers=secret_headers(address), **case.request)
 
     if case.reads_one_row:
         # The handler ran and looked the id up: only it names NOT_FOUND (see READ-BY-ID ROUTES above CASES).
         problem(response, status=404, reason='NOT_FOUND')
+        return
+    if case.submits:
+        # The handler ran to the Submit seam: exactly one Submit, for the symbol in the path, and the seam's own
+        # typed answer rendered at the edge. Nothing else produces both (see FakeSubmitClient).
+        problem(response, status=503, reason='PEER_UNAVAILABLE')
+        (submitted,) = SUBMIT_CLIENT.submitted[submitted_before:]
+        assert submitted.bars is not None and submitted.bars.asset_symbol == 'AAPL'
         return
     assert response.status_code not in UNREACHABLE_STATUSES, (
         f'{method} {url} returned {response.status_code}: the manifest declares this route but the '
@@ -1049,4 +1105,9 @@ def test_the_routes_are_driven_without_a_lifespan(client: TestClient):
     assert get_ingest_fetch_client() is None, (
         'the store app lifespan ran in this process: it is the only thing that sets the module '
         'global get_ingest_fetch_client() reads, and it opens a channel to data_ingest'
+    )
+    # The POST route's seam since the push path (tj-7zjov1.28): set by the same lifespan, over the same channel.
+    assert get_ingest_submit_client() is None, (
+        'the store app lifespan ran in this process: it is the only thing that sets the module '
+        'global get_ingest_submit_client() reads, and it opens a channel to data_ingest'
     )

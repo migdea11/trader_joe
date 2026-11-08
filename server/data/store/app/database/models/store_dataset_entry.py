@@ -140,12 +140,17 @@ class StoreDatasetEntry(AppBase.DATA_STORE_BASE, CustomTypeTable):
     # False. Not identity and in no unique key. The CHECK below mirrors migration e5c8b1d4f703; the stored
     # integers of update_type are STATIC = 1, DAILY = 2, STREAM = 3.
     collect = Column(Boolean, nullable=True)
+    # Why the STORE stopped this dataset (collect set false by a store rule, not by the operator). NULL means the store
+    # did not stop it, whatever collect says. Only a stopped subscription can hold one (the CHECK below). Added by
+    # b8e4c1f7a923; nothing writes it yet, the stop rule (tj-7zjov1.144) is its one writer. Not identity.
+    stopped_cause = Column(String, nullable=True)
 
     # Dates used to manage split and dividends adjustments
     created_at = Column(DateTime(timezone=True), default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), default=func.now(), onupdate=func.now(), nullable=False)
 
     COLLECT_BY_TYPE_CONSTRAINT = 'ck_store_dataset_entry_collect_by_type'
+    STOPPED_CAUSE_CONSTRAINT = 'ck_store_dataset_entry_stopped_cause_needs_stop'
 
     __table_args__ = (
         UniqueConstraint(*NATURAL_KEY, name=NATURAL_KEY_CONSTRAINT),
@@ -153,6 +158,8 @@ class StoreDatasetEntry(AppBase.DATA_STORE_BASE, CustomTypeTable):
             '(update_type = 1 AND collect IS NULL) OR (update_type IN (2, 3) AND collect IS NOT NULL)',
             name=COLLECT_BY_TYPE_CONSTRAINT,
         ),
+        # A cause only on a stopped subscription: collect true and a STATIC row (collect NULL) can never carry one.
+        CheckConstraint('stopped_cause IS NULL OR collect IS FALSE', name=STOPPED_CAUSE_CONSTRAINT),
     )
 
     def __repr__(self):

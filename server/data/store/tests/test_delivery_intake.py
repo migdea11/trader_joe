@@ -13,12 +13,24 @@ and the store CLAUDE.md delivery section:
     ids only; ruling 6: a FAILED report without stats is written with NULL spend columns and one WARNING;
   * RegisterInstance records the instance and supersedes the older ones;
   * P49 (tj-7zjov1.143): the bars header's vendor_asset_id is stored as received on the attempt row of every bars
-    attempt that writes one, an empty id as NULL; a repeat delivery changes nothing; served_range is stored nowhere.
+    attempt that writes one, an empty id as NULL; a repeat delivery changes nothing;
+  * P34c (tj-7zjov1.123): a SUCCEEDED report's served_range is stored on its attempt row (served_start, served_end)
+    and NULL on every other; the first attempt row takes the request's trigger (NULL reads as REQUEST) and every later
+    one is RETRY; a counted FAILED report with no vendor stats adds 1 to ingest_request.spend_unknown_attempts.
+  * P35 (tj-7zjov1.28, architect notes A, E, G and H, ADR tj-26jt9w addendum 14): THE ENTRY IS WRITTEN ON THE FIRST
+    DELIVERED ATTEMPT from the request row and the header feed (expiry, expiry type, collect from the row; a NULL
+    expiry type is refused INVALID_REQUEST, never BULK, nothing written); a request with a dataset_id writes only the
+    entry's updated_at; a delivery to a GONE or STOPPED entry is DROPPED (attempt row EMPTY, request EMPTY with cause
+    DISCARDED, FINAL, no bar, no dataset event); a SUCCEEDED bars report without a served range is refused (note G);
+    a duplicate whose stored verdict was CONTINUE is answered FINAL once the request is no longer open (note E).
 
 TIER, AND WHAT SQLITE CANNOT PROVE. The intake's own statements run on SQLite (aiosqlite) through the module's
 own_session, pointed at the test engine. The bar upsert is Postgres-only (ON CONFLICT ON CONSTRAINT), so the bars
 arm's writer is replaced by a stand-in that inserts into a scratch table ON THE SAME SESSION: what reaches it, and
-whether it is rolled back, is real; the upsert itself is tests/system/test_delivery_intake_pg.py's. SQLite cannot
+whether it is rolled back, is real; the upsert itself is tests/system/test_delivery_intake_pg.py's. The ENTRY upsert
+is Postgres-only for the same reason (ON CONFLICT ON CONSTRAINT), so it is replaced by SQLite's ON CONFLICT on the same
+eleven identity columns, on the same session, journalling what the arm handed it; the real one runs in
+test_delivery_intake_pg.py (PG10). SQLite cannot
 show: FOR UPDATE (it ignores it, and has one writer, so no two deliveries ever interleave here), the partial unique
 index (it builds a full one from the model, the predicate being postgresql_where), ON CONFLICT naming that partial
 index WITH its predicate, the enum and ARRAY types, or a dataset entry deleted concurrently. Those are PG1 to PG8
@@ -38,9 +50,11 @@ import pytest_asyncio
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.sqlite import DATETIME
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.pool import StaticPool
 
+from common.database.sql_alchemy_nullable_datetime import NullableDateTime
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from common.errors.vocabulary import InvalidRequestError, Reason
@@ -88,6 +102,7 @@ from schemas.data_ingest.delivery import (
     RegisterInstanceRequest,
 )
 from schemas.data_ingest.fetch_dataset import BarPage, ServedRange
+from schemas.data_store.asset_dataset_store import AssetDatasetStoreCreate
 
 
 pytestmark = [pytest.mark.data_store, pytest.mark.asyncio]
@@ -191,9 +206,35 @@ class Store:
                 )
             return len(rows)
 
+        # (entry, collect, preserve_lifecycle) as the bars arm handed each to the entry upsert.
+        self.upserts: list[tuple[AssetDatasetStoreCreate, bool | None, bool]] = []
+
+        async def upsert_entry(
+            db: AsyncSession, entry: AssetDatasetStoreCreate, *, preserve_lifecycle: bool = False, collect=None
+        ) -> uuid.UUID:
+            """The stand-in entry upsert: SQLite's ON CONFLICT on the eleven identity columns, on the same session.
+
+            A repeat sets expiry from the entry and collect only when explicit, as the real one does; the real one's
+            own behaviour is PG10's. The CHECK on collect is the model's, so a wrong collect shape still fails here.
+            """
+            self.upserts.append((entry, collect, preserve_lifecycle))
+            values = StoreDatasetEntry.get_fields(entry, exclude_none=True)
+            resolved = None if entry.update_type is UpdateType.STATIC else (True if collect is None else collect)
+            on_repeat: dict = {'expiry': values.get('expiry'), 'updated_at': sa.func.now()}
+            if collect is not None and resolved is not None:
+                on_repeat['collect'] = resolved
+            statement = (
+                sqlite_insert(ENTRIES)
+                .values(id=uuid.uuid4(), **values, collect=resolved, created_at=sa.func.now(), updated_at=sa.func.now())
+                .on_conflict_do_update(index_elements=list(StoreDatasetEntry.NATURAL_KEY), set_=on_repeat)
+                .returning(ENTRIES.c.id)
+            )
+            return (await db.execute(statement)).scalar_one()
+
         monkeypatch.setattr(delivery_intake, 'own_session', own_session)
         monkeypatch.setattr(delivery_intake, 'publish', self.published.append)
         monkeypatch.setattr(delivery_intake, 'write_market_activity_in_transaction', write_bars)
+        monkeypatch.setattr(delivery_intake, 'upsert_entry_in_transaction', upsert_entry)
         self.intake = DeliveryIntake(chunk_size=CHUNK)
 
     # ------------------------------------------------------------------ setup
@@ -232,30 +273,41 @@ class Store:
         await self.set_request(record.id, state=state, instance_id=INSTANCE_A)
         return record.id
 
-    async def entry(self) -> uuid.UUID:
+    async def entry(self, **overrides) -> uuid.UUID:
         entry_id = uuid.uuid4()
+        values = {
+            'id': entry_id,
+            'owner': LABEL,
+            'source': DataSource.ALPACA_API,
+            'feed': Feed.IEX,
+            'asset_symbol': 'VFV',
+            'asset_type': AssetType.STOCK,
+            'data_type': DataType.MARKET_ACTIVITY,
+            'granularity': Granularity.ONE_DAY,
+            'start': START,
+            'end': START + timedelta(days=30),
+            'expiry_type': ExpiryType.BULK,
+            'update_type': UpdateType.DAILY,
+            'collect': True,
+            'created_at': START,
+            'updated_at': START,
+        }
+        values.update(overrides)
+        if values['end'] is None:
+            # An open end is stored as the EPOCH sentinel; the ORM row takes the model value, not the schema's None.
+            values['end'] = NullableDateTime.EPOCH
         async with AsyncSession(self.engine) as db:
-            db.add(
-                StoreDatasetEntry(
-                    id=entry_id,
-                    owner=LABEL,
-                    source=DataSource.ALPACA_API,
-                    feed=Feed.IEX,
-                    asset_symbol='VFV',
-                    asset_type=AssetType.STOCK,
-                    data_type=DataType.MARKET_ACTIVITY,
-                    granularity=Granularity.ONE_DAY,
-                    start=START,
-                    end=START + timedelta(days=30),
-                    expiry_type=ExpiryType.BULK,
-                    update_type=UpdateType.DAILY,
-                    collect=True,
-                    created_at=START,
-                    updated_at=START,
-                )
-            )
+            db.add(StoreDatasetEntry(**values))
             await db.commit()
         return entry_id
+
+    async def entry_row(self, entry_id: uuid.UUID) -> sa.Row | None:
+        async with AsyncSession(self.engine) as db:
+            return (await db.execute(sa.select(ENTRIES).where(ENTRIES.c.id == entry_id))).one_or_none()
+
+    async def entries(self) -> list[sa.Row]:
+        async with AsyncSession(self.engine) as db:
+            return list((await db.execute(sa.select(ENTRIES))).all())
 
     async def set_request(self, request_id: uuid.UUID, **values) -> None:
         async with AsyncSession(self.engine) as db:
@@ -384,11 +436,12 @@ async def test_a_succeeded_bars_delivery_writes_bars_attempt_row_count_spend_and
     assert dataset_event == DatasetChanged(entry_id, DatasetChange.UPDATED)
 
 
-async def test_the_vendor_asset_id_is_stored_on_the_attempt_row_only_and_served_range_nowhere(store):
+async def test_the_vendor_asset_id_and_the_served_range_are_stored_on_the_attempt_row_only_in_their_own_columns(store):
     """P49 (tj-7zjov1.143): the header id lands in ingest_run.vendor_asset_id and in no other column of either row.
 
-    served_range is still persisted nowhere until P34c (ruling 2): no column of the attempt row or the request holds
-    either of its instants.
+    P34c (tj-7zjov1.123) REVERSED the served_range half of this test: it was stored nowhere, and now each instant is
+    stored in its own column of the attempt row (start in served_start, end in served_end, never swapped) and in no
+    other column of either row. The instants are chosen to equal no other value the report carries.
     """
     request_id = await store.request()
     served = ServedRange(start=BAR_START + timedelta(hours=1, minutes=7), end=AS_OF + timedelta(days=3, minutes=11))
@@ -396,16 +449,96 @@ async def test_the_vendor_asset_id_is_stored_on_the_attempt_row_only_and_served_
 
     (run,) = await store.runs(request_id)
     request_row = await store.request_row(request_id)
-    holding = [
-        (table, key)
-        for table, row in (('ingest_run', run), ('ingest_request', request_row))
-        for key, value in row._mapping.items()
-        if value == VENDOR_ASSET_ID
-    ]
-    assert holding == [('ingest_run', 'vendor_asset_id')]
-    for row in (run, request_row):
-        values = list(row._mapping.values())
-        assert served.start not in values and served.end not in values, 'served_range has no column until P34c'
+    rows = (('ingest_run', run), ('ingest_request', request_row))
+
+    def holding(wanted) -> list[tuple[str, str]]:
+        return [(table, key) for table, row in rows for key, value in row._mapping.items() if value == wanted]
+
+    assert holding(VENDOR_ASSET_ID) == [('ingest_run', 'vendor_asset_id')]
+    assert holding(served.start) == [('ingest_run', 'served_start')]
+    assert holding(served.end) == [('ingest_run', 'served_end')]
+
+
+@pytest.mark.parametrize('outcome', ['bars', 'empty'])
+async def test_a_succeeded_report_stores_its_served_range_on_its_attempt_row(store, outcome):
+    """With bars (row SUCCEEDED) or none (row EMPTY): the outcome on the wire is SUCCEEDED either way."""
+    request_id = await store.request()
+    served = ServedRange(start=BAR_START - timedelta(days=2), end=BAR_START + timedelta(days=9, hours=3))
+    attempt = report(request_id, parts=[BarPage(bars=[])]) if outcome == 'empty' else report(request_id)
+
+    await store.deliver(with_trailer(attempt, served_range=served))
+
+    (run,) = await store.runs(request_id)
+    assert run.state is (IngestRunState.EMPTY if outcome == 'empty' else IngestRunState.SUCCEEDED)
+    assert (run.served_start, run.served_end) == (served.start, served.end)
+
+
+@pytest.mark.parametrize('dataset', [True, False], ids=['refresh', 'first-attempt'])
+@pytest.mark.parametrize('parts', ['bars', 'empty'])
+async def test_g_a_succeeded_bars_report_without_a_served_range_is_refused_and_nothing_written(store, dataset, parts):
+    """A SUCCEEDED bars report without a served range is refused and writes nothing.
+
+    Note G (tj-7zjov1.28, replacing the P34c test that stored NULL): the waiter answers from the attempt row's
+    served range, so a SUCCEEDED bars report with none is a sender defect, refused INVALID_REQUEST naming the rule.
+
+    Nothing is written (no attempt row, no bar, no entry, the count unchanged), whether the request has its entry or
+    would have created it, and with bars or none.
+    """
+    request_id = await store.request(dataset=dataset, expiry_type=ExpiryType.ROLLING)
+    attempt = report(request_id, parts=[BarPage(bars=[])] if parts == 'empty' else None)
+
+    error = await store.refused(with_trailer(attempt, served_range=None))
+
+    assert 'served range' in error.detail and 'SUCCEEDED bars' in error.detail
+    assert store.batches == [] and store.upserts == []
+    row = await store.request_row(request_id)
+    assert (row.attempts, row.state, row.dataset_id is None) == (0, IngestRequestState.QUEUED, not dataset)
+
+
+@pytest.mark.parametrize('with_stats', [True, False], ids=['with-stats', 'no-stats'])
+async def test_a_failed_attempt_row_holds_no_served_range(store, with_stats):
+    """Rule (d) refuses a served range on FAILED, so the row of a failed attempt, then a later success, keep theirs apart."""
+    request_id = await store.request()
+    failed = report(request_id, DeliveryOutcome.FAILED)
+    await store.deliver(failed if with_stats else with_trailer(failed, vendor_stats=None))
+    served = ServedRange(start=BAR_START, end=BAR_START + timedelta(days=4))
+    await store.deliver(with_trailer(report(request_id, attempt_no=2), served_range=served))
+
+    first, second = await store.runs(request_id)
+    assert (first.state, first.served_start, first.served_end) == (IngestRunState.FAILED, None, None)
+    assert (second.served_start, second.served_end) == (served.start, served.end)
+
+
+async def test_the_published_record_and_from_row_read_the_served_range(store, monkeypatch):
+    """NewAttempt carries it to insert_attempt, and IngestRunRecord.from_row reads it back off the stored row."""
+    built: list[ingest_delivery.NewAttempt] = []
+    original = delivery_intake.insert_attempt
+
+    async def spy(db, attempt):
+        built.append(attempt)
+        return await original(db, attempt)
+
+    monkeypatch.setattr(delivery_intake, 'insert_attempt', spy)
+    request_id = await store.request()
+    served = ServedRange(start=BAR_START + timedelta(minutes=3), end=BAR_START + timedelta(days=6, minutes=5))
+
+    await store.deliver(with_trailer(report(request_id), served_range=served))
+
+    (attempt,) = built
+    assert (attempt.served_start, attempt.served_end) == (served.start, served.end)
+    run_event = store.published[0]
+    assert isinstance(run_event, IngestRunChanged)
+    assert (run_event.run.served_start, run_event.run.served_end) == (served.start, served.end)
+    (row,) = await store.runs(request_id)
+    record = IngestRunRecord.from_row(row)
+    assert (record.served_start, record.served_end) == (served.start, served.end)
+
+
+def test_new_attempt_and_the_run_record_default_the_served_range_to_none():
+    """A caller that names none (a non-bars attempt, once P18 records them) stores NULL."""
+    for cls in (ingest_delivery.NewAttempt, IngestRunRecord):
+        defaults = {f.name: f.default for f in dataclasses.fields(cls) if f.name in ('served_start', 'served_end')}
+        assert defaults == {'served_start': None, 'served_end': None}, cls
 
 
 @pytest.mark.parametrize(
@@ -413,7 +546,7 @@ async def test_the_vendor_asset_id_is_stored_on_the_attempt_row_only_and_served_
 )
 async def test_every_bars_attempt_row_stores_the_header_vendor_asset_id_as_received(store, outcome):
     """As received, on whatever outcome writes an attempt row: opaque, not trimmed, not case-folded."""
-    request_id = await store.request(dataset=outcome != 'empty')
+    request_id = await store.request()
     received = '  Vendor-Asset/ÄBC 01  '
     attempt = report(request_id, parts=[BarPage(bars=[])]) if outcome == 'empty' else report(request_id, outcome)
     await store.deliver(with_header(attempt, vendor_asset_id=received))
@@ -527,17 +660,19 @@ async def test_insert_attempt_stores_null_when_the_attempt_names_no_vendor_asset
     assert run.vendor_asset_id is None
 
 
-async def test_a_success_with_no_bars_is_empty_needs_no_dataset_and_writes_none(store):
-    request_id = await store.request(dataset=False)
+async def test_a_success_with_no_bars_is_empty_and_writes_no_bar(store):
+    """A request with its entry: the vendor answered and held none. The entry was touched, so it is announced."""
+    request_id = await store.request()
+    entry_id = (await store.request_row(request_id)).dataset_id
 
     answer = await store.deliver(report(request_id, parts=[BarPage(bars=[])]))
 
     assert answer == DeliverAttemptResponse(verdict=FINAL, attempt_count=1)
     assert store.batches == [] and await store.bars() == []
     (run,) = await store.runs(request_id)
-    assert (run.state, run.bars_written, run.verdict) == (IngestRunState.EMPTY, 0, 'FINAL')
+    assert (run.state, run.bars_written, run.verdict, run.dataset_id) == (IngestRunState.EMPTY, 0, 'FINAL', entry_id)
     assert (await store.request_row(request_id)).state is IngestRequestState.EMPTY
-    assert [type(event) for event in store.published] == [IngestRunChanged], 'no bars, no dataset change'
+    assert [type(event) for event in store.published] == [IngestRunChanged, DatasetChanged]
 
 
 async def test_the_first_attempt_row_is_request_and_a_later_one_retry(store):
@@ -547,7 +682,35 @@ async def test_the_first_attempt_row_is_request_and_a_later_one_retry(store):
     await store.deliver(report(request_id, attempt_no=2))
 
     assert [run.trigger for run in await store.runs(request_id)] == [IngestRunTrigger.REQUEST, IngestRunTrigger.RETRY]
-    assert (await store.request_row(request_id)).attempts == 2
+    row = await store.request_row(request_id)
+    assert row.attempts == 2
+    assert row.trigger is None, 'this request names no trigger: the REQUEST above is NULL read as REQUEST'
+
+
+@pytest.mark.parametrize('trigger', [IngestRunTrigger.SCHEDULE, IngestRunTrigger.REQUEST])
+async def test_the_first_attempt_row_takes_the_requests_trigger_and_every_later_one_is_retry(store, trigger):
+    """P34c: a SCHEDULE request (the DAILY loop) records its first attempt SCHEDULE, a POST one REQUEST; then RETRY."""
+    request_id = await store.request(trigger=trigger)
+    assert (await store.request_row(request_id)).trigger is trigger
+
+    await store.deliver(report(request_id, DeliveryOutcome.FAILED))
+    await store.deliver(report(request_id, DeliveryOutcome.FAILED, attempt_no=2))
+    await store.deliver(report(request_id, attempt_no=3))
+
+    runs = await store.runs(request_id)
+    assert [run.trigger for run in runs] == [trigger, IngestRunTrigger.RETRY, IngestRunTrigger.RETRY]
+    assert (await store.request_row(request_id)).trigger is trigger, 'the request keeps what started it'
+
+
+async def test_a_scheduled_requests_redelivered_first_attempt_keeps_its_trigger(store):
+    """The duplicate is answered from the stored row: a redelivery after the count moved writes no RETRY row."""
+    request_id = await store.request(trigger=IngestRunTrigger.SCHEDULE)
+    await store.deliver(report(request_id, DeliveryOutcome.FAILED))
+    await store.deliver(report(request_id, DeliveryOutcome.FAILED, attempt_no=2))
+
+    await store.deliver(report(request_id, DeliveryOutcome.FAILED))
+
+    assert [run.trigger for run in await store.runs(request_id)] == [IngestRunTrigger.SCHEDULE, IngestRunTrigger.RETRY]
 
 
 async def test_spend_sums_across_attempts(store):
@@ -769,30 +932,295 @@ async def test_a_bar_the_stored_shape_cannot_hold_is_refused_not_given_a_made_up
     await store.refused(report(request_id, parts=[bar_page(0), BarPage(bars=[bad_bar])]))
 
 
-async def test_bars_for_a_request_with_no_dataset_are_refused(store):
-    request_id = await store.request(dataset=False)
-    error = await store.refused(report(request_id))
-    assert error.detail == 'the request has no dataset to store these bars under'
+# --------------------------------------------------------------------------------------------- P35: the entry on the
+# first delivered attempt (architect ruling A, notes H, addendum 14)
+
+# A POST's request row: no dataset_id yet, and the body's lifecycle fields. DAILY needs a non-BULK expiry type and no
+# end (the entry model's own rules), which is what a valid POST body carries.
+POST_EXPIRY = START + timedelta(days=200, hours=3)
 
 
-async def test_c1_bars_for_a_dataset_entry_that_is_gone_are_refused_and_nothing_written(store):
-    """C1: bars carry no foreign key, so an entry deleted while the attempt was in flight refuses the bars."""
+async def _post_request(store: Store, **values) -> uuid.UUID:
+    fields = {
+        'dataset': False,
+        'requested_end': None,
+        'expiry_type': ExpiryType.ROLLING,
+        'expiry': POST_EXPIRY,
+        'trigger': IngestRunTrigger.REQUEST,
+        **values,
+    }
+    return await store.request(**fields)
+
+
+@pytest.mark.parametrize(
+    ('update_type', 'expiry_type', 'end', 'collect', 'stored_collect'),
+    [
+        (UpdateType.DAILY, ExpiryType.ROLLING, None, None, True),
+        (UpdateType.DAILY, ExpiryType.BUFFER_1K, None, False, False),
+        (UpdateType.DAILY, ExpiryType.BUFFER_10K, None, True, True),
+        (UpdateType.STATIC, ExpiryType.BUFFER_100K, START + timedelta(days=30), None, None),
+        (UpdateType.STATIC, ExpiryType.BULK, START + timedelta(days=30), None, None),
+    ],
+    ids=['daily-collect-omitted', 'daily-collect-false', 'daily-collect-true', 'static-non-bulk', 'static-bulk'],
+)
+async def test_h_the_first_delivered_attempt_creates_the_entry_from_the_request_row_and_the_header_feed(
+    store, update_type, expiry_type, end, collect, stored_collect
+):
+    """The first delivered attempt writes the entry from the request row and the header feed.
+
+    The entry is the request row's (owner = client_label, symbol, asset type, the one data type, source,
+    granularity, update type, window, expiry, expiry type, collect) plus the HEADER's resolved feed, written in the
+    delivery transaction; the request takes its id, and so do the attempt row and the bars.
+    """
+    request_id = await _post_request(
+        store, update_type=update_type, expiry_type=expiry_type, requested_end=end, collect=collect, feed=None
+    )
+    attempt = with_header(report(request_id, parts=[bar_page(0, 1, feed=Feed.SIP)]), feed=Feed.SIP)
+
+    answer = await store.deliver(attempt)
+
+    assert answer == DeliverAttemptResponse(verdict=FINAL, attempt_count=1)
+    ((entry, handed_collect, preserve),) = store.upserts
+    assert (handed_collect, preserve) == (collect, False), 'the request row collect, as given, and a POST upsert'
+    assert entry.owner == LABEL
+    assert (entry.asset_symbol, entry.asset_type, entry.data_type) == ('VFV', AssetType.STOCK, DataType.MARKET_ACTIVITY)
+    assert (entry.source, entry.granularity, entry.feed) == (DataSource.ALPACA_API, Granularity.ONE_DAY, Feed.SIP)
+    assert (entry.update_type, entry.expiry_type) == (update_type, expiry_type), 'the body value, never a guess'
+    assert (entry.start, entry.end, entry.expiry) == (START, end, POST_EXPIRY)
+    (stored,) = await store.entries()
+    assert (stored.feed, stored.expiry_type, stored.collect) == (Feed.SIP, expiry_type, stored_collect)
+    row = await store.request_row(request_id)
+    assert row.dataset_id == stored.id
+    (run,) = await store.runs(request_id)
+    assert run.dataset_id == stored.id
+    assert {batch.dataset_id for batch, _ in store.batches} == {stored.id}
+    assert {bar.dataset_id for bar in await store.bars()} == {stored.id}
+    assert store.published[-1] == DatasetChanged(stored.id, DatasetChange.UPDATED)
+
+
+async def test_h_the_entry_takes_the_headers_resolved_feed_never_the_requests_preference(store):
+    """The request row's feed is the caller's preference; the tape the attempt was served from is the header's."""
+    request_id = await _post_request(store, feed=Feed.IEX)
+    attempt = with_header(report(request_id, parts=[bar_page(0, feed=Feed.SIP)]), feed=Feed.SIP)
+
+    await store.deliver(attempt)
+
+    ((entry, _, _),) = store.upserts
+    assert entry.feed is Feed.SIP
+    (stored,) = await store.entries()
+    assert stored.feed is Feed.SIP
+
+
+async def test_h_a_zero_bar_success_creates_the_entry_too(store):
+    """Parity with the old POST: the vendor answered empty, the dataset exists (EMPTY), and it is announced."""
+    request_id = await _post_request(store)
+
+    answer = await store.deliver(report(request_id, parts=[BarPage(bars=[])]))
+
+    assert answer == DeliverAttemptResponse(verdict=FINAL, attempt_count=1)
+    (stored,) = await store.entries()
+    assert (await store.request_row(request_id)).dataset_id == stored.id
+    (run,) = await store.runs(request_id)
+    assert (run.state, run.dataset_id) == (IngestRunState.EMPTY, stored.id)
+    assert store.batches == []
+    assert store.published[-1] == DatasetChanged(stored.id, DatasetChange.UPDATED)
+
+
+async def test_h_a_failed_attempt_creates_no_entry_and_the_later_success_does(store):
+    """Only a SUCCEEDED attempt runs the arm: a failure leaves the request without a dataset."""
+    request_id = await _post_request(store)
+
+    await store.deliver(report(request_id, DeliveryOutcome.FAILED))
+
+    assert await store.entries() == [] and store.upserts == []
+    first = await store.request_row(request_id)
+    assert first.dataset_id is None
+    (failed_run,) = await store.runs(request_id)
+    assert failed_run.dataset_id is None
+
+    await store.deliver(report(request_id, attempt_no=2))
+
+    (stored,) = await store.entries()
+    assert (await store.request_row(request_id)).dataset_id == stored.id
+
+
+@pytest.mark.parametrize('parts', ['bars', 'empty'])
+async def test_h_a_request_with_no_dataset_and_no_expiry_type_is_refused_never_bulk_and_nothing_written(store, parts):
+    """A NULL expiry type on a request with no dataset is refused, never BULK.
+
+    Addendum 14: a NULL expiry_type on a request with no dataset is refused INVALID_REQUEST naming the rule; the
+    store never falls back to BULK. Nothing is written: no entry, no attempt row, no bar, the count unchanged.
+    """
+    request_id = await _post_request(
+        store, expiry_type=None, update_type=UpdateType.STATIC, requested_end=START + timedelta(days=3)
+    )
+    attempt = report(request_id, parts=[BarPage(bars=[])] if parts == 'empty' else None)
+
+    error = await store.refused(attempt)
+
+    assert 'expiry type' in error.detail
+    assert store.upserts == [] and await store.entries() == []
+    row = await store.request_row(request_id)
+    assert (row.attempts, row.dataset_id, row.state) == (0, None, IngestRequestState.QUEUED)
+
+
+async def test_h_a_request_with_a_dataset_and_no_expiry_type_is_a_refresh_and_is_not_refused(store):
+    """The DAILY loop's request carries no expiry type: its entry exists, so nothing is built from the row."""
+    request_id = await store.request(expiry_type=None, trigger=IngestRunTrigger.SCHEDULE)
+
+    answer = await store.deliver(report(request_id))
+
+    assert answer == DeliverAttemptResponse(verdict=FINAL, attempt_count=1)
+    assert store.upserts == []
+    assert len(await store.bars()) == 2
+
+
+@pytest.mark.parametrize(
+    ('stored', 'sent', 'change'),
+    [
+        (True, False, DatasetChange.RETIRED),
+        (False, True, DatasetChange.RESUMED),
+        (True, True, DatasetChange.UPDATED),
+        (False, None, DatasetChange.UPDATED),
+    ],
+)
+async def test_h_a_repeat_post_that_flips_collect_publishes_retired_or_resumed(store, stored, sent, change):
+    """A repeat POST sets collect only when explicit, and a flip is announced.
+
+    An exact repeat of an existing entry's identity: collect changes only when explicit, and a flip is announced as
+    RETIRED (to false) or RESUMED (to true); a repeat that leaves it as it was is UPDATED.
+    """
+    entry_id = await store.entry(end=None, expiry_type=ExpiryType.ROLLING, collect=stored)
+    request_id = await _post_request(store, collect=sent)
+
+    await store.deliver(report(request_id))
+
+    assert (await store.request_row(request_id)).dataset_id == entry_id, 'the repeat matched the existing entry'
+    after = await store.entry_row(entry_id)
+    assert after.collect is (stored if sent is None else sent)
+    assert after.expiry == POST_EXPIRY, 'a repeat sets expiry from the request, as POST /store always did'
+    assert store.published[-1] == DatasetChanged(entry_id, change)
+
+
+async def test_h_a_failure_after_the_entry_upsert_rolls_the_entry_and_the_request_dataset_back(store, monkeypatch):
+    """The entry, the request's dataset_id and the bars are one transaction with the attempt row."""
+    request_id = await _post_request(store)
+
+    async def failing(db, request_id, outcome):
+        raise RuntimeError('the count update failed')
+
+    monkeypatch.setattr(delivery_intake, 'apply_outcome', failing)
+    with pytest.raises(RuntimeError):
+        await store.deliver(report(request_id))
+
+    assert len(store.upserts) == 1, 'the entry was upserted inside the transaction'
+    assert await store.entries() == [] and await store.bars() == []
+    assert (await store.request_row(request_id)).dataset_id is None
+
+
+# --------------------------------------------------------------------------------------------- P35: the refresh and
+# the drop rule (ruling A, the store CLAUDE.md No orphan bars line)
+
+
+async def test_a_refresh_writes_only_the_entrys_updated_at(store):
+    """A refresh writes the entry's updated_at and nothing else.
+
+    A request with a dataset_id never writes a lifecycle field: expiry, collect and stopped_cause stay as they were,
+    even when the request row carries lifecycle values; only updated_at moves.
+    """
+    entry_id = await store.entry(expiry=POST_EXPIRY, end=None, expiry_type=ExpiryType.ROLLING)
+    request_id = await store.request(dataset=False, dataset_id=entry_id, expiry=START, collect=False)
+    before = await store.entry_row(entry_id)
+
+    await store.deliver(report(request_id))
+
+    after = await store.entry_row(entry_id)
+    assert store.upserts == [], 'the refresh never upserts the entry'
+    assert after.updated_at != before.updated_at
+    unchanged = {key: value for key, value in before._mapping.items() if key != 'updated_at'}
+    assert {key: after._mapping[key] for key in unchanged} == unchanged
+
+
+async def test_c1_a_delivery_for_a_gone_entry_is_dropped_nothing_stored_request_empty_discarded_final(store):
+    """The drop rule (P35, replacing P34's C1 refusal).
+
+    Bars DO carry a foreign key to their entry (ON DELETE CASCADE, models/base_market_activity.py), so the database
+    itself never keeps a bar whose entry is gone, and that key stays the backstop. The arm still locks the entry FOR
+    UPDATE and judges it first: so that a delivery for a deleted entry is dropped cleanly instead of surfacing a
+    foreign-key violation, so that it serialises with the operator's delete, the Stop and the reaper (they lock the
+    same row), and so that the drop rule has one place to judge.
+
+    Dropped, not refused: a refusal would be redelivered for ever. The attempt happened and is recorded (EMPTY, no
+    bars, its spend), the request finishes EMPTY with cause DISCARDED, the answer is FINAL, and no dataset event.
+    """
     request_id = await store.request()
     entry_id = (await store.request_row(request_id)).dataset_id
     async with AsyncSession(store.engine) as db:
         await db.execute(sa.delete(ENTRIES).where(ENTRIES.c.id == entry_id))
         await db.commit()
 
-    error = await store.refused(report(request_id))
+    answer = await store.deliver(report(request_id))
 
-    assert error.detail == 'the dataset this request writes to no longer exists'
-    assert store.batches == [], 'no bar reached the writer'
+    assert answer == DeliverAttemptResponse(verdict=FINAL, attempt_count=1)
+    assert store.batches == [] and await store.bars() == [], 'no bar reached the writer'
+    assert store.upserts == [] and await store.entries() == [], 'the entry is never recreated by a refresh'
+    (run,) = await store.runs(request_id)
+    assert (run.state, run.bars_written, run.verdict) == (IngestRunState.EMPTY, 0, 'FINAL')
+    row = await store.request_row(request_id)
+    assert (row.state, row.failure_cause) == (IngestRequestState.EMPTY, IngestRequestFailureCause.DISCARDED.value)
+    assert row.failure_detail == delivery_intake.DISCARDED_DETAIL and row.finished_at is not None
+    assert (row.attempts, row.spent_calls) == (1, 3), 'the attempt happened and cost what it cost'
+    assert [type(event) for event in store.published] == [IngestRunChanged], 'no dataset change for a drop'
 
 
-async def test_c1_the_entry_is_locked_before_the_first_bar_is_written(store, monkeypatch):
+@pytest.mark.parametrize('update_type', [UpdateType.DAILY, UpdateType.STREAM])
+async def test_a_delivery_for_a_stopped_subscription_is_dropped(store, update_type):
+    """A delivery for a Stopped subscription is dropped.
+
+    Stopped is collect false on a DAILY or STREAM entry (is_retired): the operator's Stop wins over a delivery
+    already in flight.
+    """
+    entry_id = await store.entry(update_type=update_type, collect=False)
+    request_id = await store.request(dataset=False, dataset_id=entry_id)
+
+    answer = await store.deliver(report(request_id))
+
+    assert answer == DeliverAttemptResponse(verdict=FINAL, attempt_count=1)
+    assert await store.bars() == []
+    row = await store.request_row(request_id)
+    assert (row.state, row.failure_cause) == (IngestRequestState.EMPTY, IngestRequestFailureCause.DISCARDED.value)
+    assert (await store.entry_row(entry_id)).updated_at == START, 'a dropped delivery does not touch the entry'
+
+
+async def test_a_static_entry_with_no_collect_intent_is_not_dropped(store):
+    """STATIC holds collect NULL (no intent), which is never Stopped: its delivery is stored."""
+    entry_id = await store.entry(update_type=UpdateType.STATIC, collect=None)
+    request_id = await store.request(dataset=False, dataset_id=entry_id)
+
+    await store.deliver(report(request_id))
+
+    assert len(await store.bars()) == 2
+    assert (await store.request_row(request_id)).state is IngestRequestState.SUCCEEDED
+
+
+async def test_a_failed_delivery_for_a_gone_entry_is_written_as_a_failure_not_dropped(store):
+    """The arm runs only on SUCCEEDED: a failed attempt for a gone entry is recorded as a failure and continues."""
+    request_id = await store.request()
+    entry_id = (await store.request_row(request_id)).dataset_id
+    async with AsyncSession(store.engine) as db:
+        await db.execute(sa.delete(ENTRIES).where(ENTRIES.c.id == entry_id))
+        await db.commit()
+
+    answer = await store.deliver(report(request_id, DeliveryOutcome.FAILED))
+
+    assert answer == DeliverAttemptResponse(verdict=CONTINUE, attempt_count=1)
+    assert (await store.request_row(request_id)).failure_cause is None
+
+
+async def test_c1_the_entry_is_locked_and_judged_before_the_first_bar_is_written(store, monkeypatch):
     request_id = await store.request()
     order: list[str] = []
-    real_lock = delivery_intake.lock_dataset_entry
+    real_lock = delivery_intake.lock_active_dataset_entry
     real_writer = delivery_intake.write_market_activity_in_transaction
 
     async def lock(db, dataset_id):
@@ -803,12 +1231,84 @@ async def test_c1_the_entry_is_locked_before_the_first_bar_is_written(store, mon
         order.append('write')
         return await real_writer(db, batch, requested_chunk_size)
 
-    monkeypatch.setattr(delivery_intake, 'lock_dataset_entry', lock)
+    monkeypatch.setattr(delivery_intake, 'lock_active_dataset_entry', lock)
     monkeypatch.setattr(delivery_intake, 'write_market_activity_in_transaction', writer)
 
     await store.deliver(report(request_id, parts=[bar_page(0), bar_page(1)]))
 
     assert order == ['lock', 'write', 'write']
+
+
+async def test_lock_active_dataset_entry_selects_collect_and_update_type_for_update():
+    class _ActiveRow:
+        collect = True
+        update_type = UpdateType.DAILY.value
+
+    class _Active(_Captured):
+        def first(self):
+            return _ActiveRow()
+
+    session = _Active()
+    assert await ingest_delivery.lock_active_dataset_entry(session, uuid.uuid4()) is True
+    (statement,) = session.statements
+    sql = _postgres_sql(statement)
+    assert sql.startswith(
+        'SELECT store_dataset_entry.collect, store_dataset_entry.update_type FROM store_dataset_entry WHERE'
+    )
+    assert sql.endswith('FOR UPDATE')
+
+
+# --------------------------------------------------------------------------------------------- note E: a stale
+# CONTINUE is answered FINAL once the request is closed
+
+
+@pytest.mark.parametrize(
+    'finisher', ['success', 'permanent', 'exhausted', 'drop'], ids=lambda name: f'finished-by-{name}'
+)
+async def test_e_a_redelivered_continue_is_answered_final_once_the_request_is_finished_and_nothing_changes(
+    store, finisher
+):
+    """A stale CONTINUE is answered FINAL once the request is finished.
+
+    A late redelivery of attempt 1 (stored CONTINUE) after attempt 2 finished the request: FINAL, with the durable
+    count, and the stored row is not changed.
+    """
+    request_id = await store.request()
+    first = await store.deliver(report(request_id, DeliveryOutcome.FAILED))
+    assert first.verdict is CONTINUE
+    if finisher == 'success':
+        await store.deliver(report(request_id, attempt_no=2))
+    elif finisher == 'permanent':
+        await store.deliver(
+            report(request_id, DeliveryOutcome.FAILED, attempt_no=2, error_class=DeliveryErrorClass.PERMANENT)
+        )
+    elif finisher == 'exhausted':
+        await store.deliver(report(request_id, DeliveryOutcome.EXHAUSTED, attempt_no=2))
+    else:
+        entry_id = (await store.request_row(request_id)).dataset_id
+        async with AsyncSession(store.engine) as db:
+            await db.execute(sa.update(ENTRIES).where(ENTRIES.c.id == entry_id).values(collect=False))
+            await db.commit()
+        await store.deliver(report(request_id, attempt_no=2))
+    count = (await store.request_row(request_id)).attempts
+    before = await store.snapshot()
+
+    again = await store.deliver(report(request_id, DeliveryOutcome.FAILED))
+
+    assert again == DeliverAttemptResponse(verdict=FINAL, attempt_count=count)
+    assert await store.snapshot() == before, 'the stored row and everything else unchanged'
+    assert (await store.runs(request_id))[0].verdict == 'CONTINUE', 'the stored verdict is kept as it was'
+
+
+@pytest.mark.parametrize('state', OPEN)
+async def test_e_a_redelivered_continue_is_still_continue_while_the_request_is_open(store, state):
+    request_id = await store.request()
+    await store.deliver(report(request_id, DeliveryOutcome.FAILED))
+    await store.set_request(request_id, state=state)
+
+    again = await store.deliver(report(request_id, DeliveryOutcome.FAILED))
+
+    assert again == DeliverAttemptResponse(verdict=CONTINUE, attempt_count=1)
 
 
 class _Captured:
@@ -1040,6 +1540,7 @@ async def test_a_failed_report_without_stats_is_written_with_null_vendor_columns
         0,
         0,
     )
+    assert row.spend_unknown_attempts == 1, 'P34c: the unknown spend is counted, so the sums read as a lower bound'
     warnings = _app_records(caplog, logging.WARNING)
     assert len(warnings) == 1, [record.getMessage() for record in warnings]
     message = warnings[0].getMessage()
@@ -1051,6 +1552,94 @@ def test_every_vendor_column_is_spend_or_the_vendor_asset_id():
     """A new vendor_* column must be classified here, or the NULL-spend check above silently stops covering it."""
     vendor = {column.name for column in RUNS.columns if column.name.startswith('vendor_')}
     assert vendor == {*SPEND_COLUMNS, 'vendor_asset_id'}
+
+
+def _no_stats(attempt):
+    return with_trailer(attempt, vendor_stats=None)
+
+
+async def test_a_new_request_counts_no_unknown_spend(store):
+    request_id = await store.request()
+    assert (await store.request_row(request_id)).spend_unknown_attempts == 0
+
+
+async def test_each_counted_failed_report_without_stats_adds_one_and_one_with_stats_adds_nothing(store):
+    """P34c: 1 per counted FAILED report with no vendor_stats; a report with stats adds 0 and its spend to the sums."""
+    request_id = await store.request()
+
+    await store.deliver(_no_stats(report(request_id, DeliveryOutcome.FAILED)))
+    assert (await store.request_row(request_id)).spend_unknown_attempts == 1
+    await store.deliver(report(request_id, DeliveryOutcome.FAILED, attempt_no=2, vendor_stats=stats(2, 1, 0, 0)))
+    assert (await store.request_row(request_id)).spend_unknown_attempts == 1
+    await store.deliver(_no_stats(report(request_id, DeliveryOutcome.FAILED, attempt_no=3)))
+
+    row = await store.request_row(request_id)
+    assert (row.attempts, row.spend_unknown_attempts, row.spent_calls, row.spent_pages) == (3, 2, 2, 1)
+    first, second, third = await store.runs(request_id)
+    assert (first.vendor_calls, second.vendor_calls, third.vendor_calls) == (None, 2, None)
+
+
+async def test_a_failed_report_with_stats_and_a_success_add_no_unknown_spend(store):
+    request_id = await store.request()
+
+    await store.deliver(report(request_id, DeliveryOutcome.FAILED))
+    await store.deliver(report(request_id, attempt_no=2))
+
+    row = await store.request_row(request_id)
+    assert (row.attempts, row.spend_unknown_attempts) == (2, 0)
+
+
+@pytest.mark.parametrize('outcome', NO_CALL, ids=lambda outcome: outcome.lower())
+async def test_an_expired_or_exhausted_report_adds_no_unknown_spend(store, outcome):
+    """It carries no stats but made no vendor call: it is not counted, so its spend is not unknown, it is none."""
+    request_id = await store.request()
+
+    await store.deliver(report(request_id, outcome))
+
+    row = await store.request_row(request_id)
+    assert (row.attempts, row.spend_unknown_attempts) == (0, 0)
+
+
+async def test_a_redelivered_failed_report_without_stats_adds_nothing(store):
+    """The duplicate is answered from the stored row: the counter, like the count, moves once per attempt."""
+    request_id = await store.request()
+    await store.deliver(_no_stats(report(request_id, DeliveryOutcome.FAILED)))
+    before = await store.snapshot()
+
+    await store.deliver(_no_stats(report(request_id, DeliveryOutcome.FAILED)))
+    await store.deliver(report(request_id, DeliveryOutcome.FAILED))
+
+    assert await store.snapshot() == before
+    assert (await store.request_row(request_id)).spend_unknown_attempts == 1
+
+
+async def test_a_late_failed_report_without_stats_on_a_finished_request_still_counts_unknown_spend(store):
+    """The attempt happened and its cost is unknown, whatever the request's state: the counter says so."""
+    request_id = await store.request()
+    await store.deliver(report(request_id))
+
+    await store.deliver(_no_stats(report(request_id, DeliveryOutcome.FAILED, attempt_no=2)))
+
+    row = await store.request_row(request_id)
+    assert (row.state, row.attempts, row.spend_unknown_attempts) == (IngestRequestState.SUCCEEDED, 2, 1)
+
+
+async def test_a_rolled_back_delivery_without_stats_counts_nothing(store, monkeypatch):
+    """The counter is in the delivery's one transaction: a failure after it leaves it where it was."""
+    request_id = await store.request()
+
+    async def broken(db, request_id, outcome):
+        await original(db, request_id, outcome)
+        raise RuntimeError('after the request update')
+
+    original = delivery_intake.apply_outcome
+    monkeypatch.setattr(delivery_intake, 'apply_outcome', broken)
+    with pytest.raises(Exception):  # noqa: B017 -- the delivery's own wrapping of the failure is not this test's
+        await store.deliver(_no_stats(report(request_id, DeliveryOutcome.FAILED)))
+
+    row = await store.request_row(request_id)
+    assert (row.attempts, row.spend_unknown_attempts) == (0, 0)
+    assert await store.runs(request_id) == []
 
 
 async def test_a_failed_report_with_stats_logs_no_warning(store, caplog):

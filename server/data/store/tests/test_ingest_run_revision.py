@@ -32,8 +32,12 @@ pytestmark = pytest.mark.data_store
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / 'migrations'
 REVISION_FILE = MIGRATIONS_DIR / 'versions' / '6f5a798746a1_ingest_run.py'
-# The one later revision that changes ingest_run (tj-7zjov1.25): the model is what the HEAD leaves.
-REQUEST_RECORD_FILE = MIGRATIONS_DIR / 'versions' / 'f2b7d4a91c36_request_record_and_instance_marker.py'
+# The later revisions that change ingest_run, in chain order: the model is what the HEAD leaves. f2b7d4a91c36
+# (tj-7zjov1.25) adds the attempt columns and index; b8e4c1f7a923 (tj-7zjov1.123) adds served_start and served_end.
+LATER_FILES = [
+    MIGRATIONS_DIR / 'versions' / 'f2b7d4a91c36_request_record_and_instance_marker.py',
+    MIGRATIONS_DIR / 'versions' / 'b8e4c1f7a923_push_path_columns.py',
+]
 DIALECT = postgresql.dialect()
 NEW_TYPES = ['ingest_run_trigger', 'ingest_run_state']
 
@@ -114,28 +118,33 @@ def test_downgrade_drops_exactly_what_upgrade_created_in_reverse():
 
 
 def _later_ingest_run_changes() -> tuple[list[sa.Column], set[str]]:
-    """The columns and indexes LATER revisions add to ingest_run: today only f2b7d4a91c36 (tj-7zjov1.25).
+    """The columns and indexes LATER revisions add to ingest_run: f2b7d4a91c36 (tj-7zjov1.25), b8e4c1f7a923 (.123).
 
     The model describes ingest_run as the HEAD leaves it, so the model comparisons below compose this revision's
-    table with what came after it, read from the later revision's own upgrade() rather than restated here.
+    table with what came after it, read from the later revisions' own upgrade() rather than restated here.
     """
-    spec = importlib.util.spec_from_file_location('revision_f2b7d4a91c36', REQUEST_RECORD_FILE)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    op = MagicMock(name='op')
-    with (
-        patch.object(module, 'op', op),
-        patch.object(postgresql.ENUM, 'create', autospec=True),
-        patch.object(postgresql.ENUM, 'drop', autospec=True),
-    ):
-        module.upgrade()
+    columns: list[sa.Column] = []
+    indexes: set[str] = set()
     objects = SchemaObjects()
-    columns = [args[1] for name, args, _ in op.method_calls if name == 'add_column' and args[0] == IngestRun.TABLE_NAME]
-    indexes = {
-        str(CreateIndex(objects.index(args[0], args[1], args[2], **kwargs)).compile(dialect=DIALECT))
-        for name, args, kwargs in op.method_calls
-        if name == 'create_index' and args[1] == IngestRun.TABLE_NAME
-    }
+    for path in LATER_FILES:
+        spec = importlib.util.spec_from_file_location(f'revision_{path.name.split("_", 1)[0]}', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        op = MagicMock(name='op')
+        with (
+            patch.object(module, 'op', op),
+            patch.object(postgresql.ENUM, 'create', autospec=True),
+            patch.object(postgresql.ENUM, 'drop', autospec=True),
+        ):
+            module.upgrade()
+        columns += [
+            args[1] for name, args, _ in op.method_calls if name == 'add_column' and args[0] == IngestRun.TABLE_NAME
+        ]
+        indexes |= {
+            str(CreateIndex(objects.index(args[0], args[1], args[2], **kwargs)).compile(dialect=DIALECT))
+            for name, args, kwargs in op.method_calls
+            if name == 'create_index' and args[1] == IngestRun.TABLE_NAME
+        }
     return columns, indexes
 
 
@@ -146,8 +155,8 @@ def _column_ddl(table: sa.Table) -> dict[str, str]:
 def test_the_revision_and_the_later_ones_build_exactly_the_table_the_model_declares():
     """Every column, type, nullability and server default, compared as Postgres DDL, model against the HEAD's table.
 
-    THE MODEL MOVED ON (tj-7zjov1.25): f2b7d4a91c36 adds fourteen nullable columns to ingest_run, so the model is
-    compared with this revision's table plus those columns. Per column rather than as one CREATE TABLE, because
+    THE MODEL MOVED ON (tj-7zjov1.25): f2b7d4a91c36 adds fourteen nullable columns to ingest_run, and b8e4c1f7a923
+    (tj-7zjov1.123) two more, so the model is compared with this revision's table plus those columns. Per column rather than as one CREATE TABLE, because
     ADD COLUMN appends where the model declares the attempt columns beside request_id; column order is not schema
     that any statement here depends on. This revision's own columns are still compared, as a strict subset.
     """
@@ -158,6 +167,7 @@ def test_the_revision_and_the_later_ones_build_exactly_the_table_the_model_decla
     later = {column.name: str(CreateColumn(column).compile(dialect=DIALECT)) for column in later_columns}
 
     assert not own.keys() & later.keys(), 'a later revision re-adds a column this one created'
+    assert len(later) == len(later_columns), 'two later revisions add the same column'
     assert {**own, **later} == _column_ddl(IngestRun.__table__)
     # The primary key is not a column property, so it is compared on its own.
     assert [c.name for c in table.primary_key] == [c.name for c in IngestRun.__table__.primary_key]

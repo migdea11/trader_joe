@@ -11,17 +11,23 @@ expired, and the hub carries a run to subscribers long after the session that wr
 """
 
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Final
 
-from sqlalchemy import Row, case, exists, func, select, update
+from sqlalchemy import Row, and_, case, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Feed, Granularity, UpdateType
 from common.logging import get_logger
+from data.store.app.database.models.ingest_request import (
+    OPEN_STATES,
+    IngestRequest,
+    IngestRequestKind,
+    IngestRequestState,
+)
 from data.store.app.database.models.ingest_run import INTERRUPTED_REASON, IngestRun, IngestRunState, IngestRunTrigger
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.database.transaction import write_transaction
@@ -64,6 +70,12 @@ class IngestRunRecord:
     finished_at: datetime | None
     # The vendor asset id of a delivered bars attempt, as received; NULL otherwise.
     vendor_asset_id: str | None = None
+    # The window a SUCCEEDED attempt answered for (start inclusive, end exclusive); NULL otherwise.
+    served_start: datetime | None = None
+    served_end: datetime | None = None
+    # The failure cause of the run's REQUEST (for example PERMANENT), set only by the reads that join the request
+    # table (finished_scheduled_runs); None everywhere else.
+    request_failure_cause: str | None = None
 
     @classmethod
     def from_row(cls, row: IngestRun | Row) -> 'IngestRunRecord':
@@ -95,6 +107,8 @@ class IngestRunRecord:
             started_at=row.started_at,
             finished_at=row.finished_at,
             vendor_asset_id=row.vendor_asset_id,
+            served_start=row.served_start,
+            served_end=row.served_end,
         )
 
 
@@ -332,32 +346,130 @@ async def finished_scheduled_runs(db: AsyncSession, source: DataSource, since: d
     ended, with no job store. A run that failed before its acknowledgement has no dataset id, which is why the
     caller matches those on the request's own fields and not on the id.
 
+    A RUN IS THE REFRESH'S BY ITS REQUEST'S TRIGGER, not by its own: a scheduled request's last attempt row can be a
+    RETRY (only the first takes the request's trigger), so the run is joined to its request and judged by the request's
+    trigger. A run with no request (a row written before the request record existed) is judged by its own. Each run
+    carries its request's failure cause, which is how a permanent refusal is told from a transient one.
+
+    A SUBMIT INGEST REFUSED FOR GOOD HAS NO ATTEMPT ROW (no vendor call was made), so the history also holds every
+    finished SCHEDULE bars request of the source that is FAILED, was created since, and has no attempt row. Each is
+    mapped to a FAILED record that starts at the request's creation and finishes at the request's finish, carrying the
+    request's failure cause, so the next pass skips the dataset instead of re-sending a refused tape. A request missing
+    a label field the record needs is left out, never given a sentinel.
+
     Args:
         db: A session.
         source: The vendor.
         since: The earliest start to read; aware.
 
     Returns:
-        list[IngestRunRecord]: Trigger SCHEDULE runs of the source that are not RUNNING, by started_at.
+        list[IngestRunRecord]: The scheduled runs of the source that are not RUNNING, and the finished scheduled
+            requests with no attempt row, by started_at then id.
     """
     stmt = (
-        select(IngestRun)
+        select(IngestRun, IngestRequest.failure_cause)
+        .outerjoin(IngestRequest, IngestRequest.id == IngestRun.request_id)
         .where(
-            IngestRun.trigger == IngestRunTrigger.SCHEDULE,
+            or_(
+                IngestRequest.trigger == IngestRunTrigger.SCHEDULE,
+                and_(IngestRequest.id.is_(None), IngestRun.trigger == IngestRunTrigger.SCHEDULE),
+            ),
             IngestRun.source == source,
             IngestRun.state != IngestRunState.RUNNING,
             IngestRun.started_at >= since,
         )
         .order_by(IngestRun.started_at, IngestRun.id)
     )
-    return [IngestRunRecord.from_row(row) for row in (await db.execute(stmt)).scalars()]
+    records = [
+        replace(IngestRunRecord.from_row(run), request_failure_cause=cause)
+        for run, cause in (await db.execute(stmt)).all()
+    ]
+    refused_stmt = select(IngestRequest).where(
+        IngestRequest.trigger == IngestRunTrigger.SCHEDULE,
+        IngestRequest.kind == IngestRequestKind.BARS,
+        IngestRequest.source == source,
+        IngestRequest.state == IngestRequestState.FAILED,
+        IngestRequest.created_at >= since,
+        ~exists().where(IngestRun.request_id == IngestRequest.id),
+    )
+    for request in (await db.execute(refused_stmt)).scalars():
+        record = _unattempted_record(request)
+        if record is not None:
+            records.append(record)
+    records.sort(key=lambda record: (record.started_at, record.id))
+    return records
+
+
+def _unattempted_record(request: IngestRequest) -> IngestRunRecord | None:
+    """A FAILED record for a finished request that made no attempt, or None when a label field is missing."""
+    data_types = request.data_types or []
+    if (
+        len(data_types) != 1
+        or request.asset_symbol is None
+        or request.asset_type is None
+        or request.granularity is None
+        or request.update_type is None
+    ):
+        return None
+    return IngestRunRecord(
+        id=request.id,
+        dataset_id=request.dataset_id,
+        request_id=request.id,
+        trigger=IngestRunTrigger.SCHEDULE,
+        actor=request.client_label,
+        asset_symbol=request.asset_symbol,
+        asset_type=request.asset_type,
+        data_type=DataType(data_types[0]),
+        source=request.source,
+        granularity=request.granularity,
+        update_type=UpdateType(request.update_type),
+        feed=request.feed,
+        requested_start=request.requested_start,
+        requested_end=request.requested_end,
+        state=IngestRunState.FAILED,
+        bars_written=0,
+        error_domain=None,
+        error_reason=None,
+        error_message=None,
+        error_id=None,
+        started_at=request.created_at,
+        finished_at=request.finished_at,
+        request_failure_cause=request.failure_cause,
+    )
+
+
+async def finishing_attempt(db: AsyncSession, request_id: uuid.UUID) -> IngestRunRecord | None:
+    """The attempt row that finished a request with data: its newest SUCCEEDED or EMPTY row.
+
+    What the verdict waiter answers from: the bars written and the served range are the attempt's, never rebuilt from
+    the request.
+
+    Args:
+        db: A session.
+        request_id: The request.
+
+    Returns:
+        IngestRunRecord | None: The row, or None when the request has no such attempt.
+    """
+    stmt = (
+        select(IngestRun)
+        .where(
+            IngestRun.request_id == request_id, IngestRun.state.in_([IngestRunState.SUCCEEDED, IngestRunState.EMPTY])
+        )
+        .order_by(IngestRun.attempt_no.desc().nulls_last(), IngestRun.started_at.desc())
+        .limit(1)
+    )
+    row = (await db.execute(stmt)).scalar_one_or_none()
+    return IngestRunRecord.from_row(row) if row is not None else None
 
 
 async def running_dataset_ids(db: AsyncSession) -> frozenset[uuid.UUID]:
-    """The datasets that have a run in state RUNNING right now, in one statement.
+    """The datasets that are collecting right now: an open request names them, or a legacy run is RUNNING.
 
-    Served by the partial index on RUNNING rows, so it reads only the runs in flight. A RUNNING run
-    that has not been acknowledged has no dataset yet and names none.
+    The Running facet reads OPEN REQUESTS (PENDING, QUEUED, NOT_DELIVERED), served by the partial index on the open
+    states and the dataset index; the RUNNING ingest_run rows are the legacy record (the startup sweep fails any left
+    behind) and are still read, so a row written by an earlier release is not invisible. A request with no dataset
+    yet (a POST before its first delivered attempt) names none.
 
     Args:
         db: A session.
@@ -365,23 +477,29 @@ async def running_dataset_ids(db: AsyncSession) -> frozenset[uuid.UUID]:
     Returns:
         frozenset[uuid.UUID]: The dataset ids.
     """
-    stmt = (
-        select(IngestRun.dataset_id)
-        .where(IngestRun.state == IngestRunState.RUNNING, IngestRun.dataset_id.is_not(None))
-        .distinct()
+    legacy = select(IngestRun.dataset_id).where(
+        IngestRun.state == IngestRunState.RUNNING, IngestRun.dataset_id.is_not(None)
     )
-    return frozenset((await db.execute(stmt)).scalars())
+    open_requests = select(IngestRequest.dataset_id).where(
+        IngestRequest.state.in_(list(OPEN_STATES)), IngestRequest.dataset_id.is_not(None)
+    )
+    return frozenset((await db.execute(legacy.union(open_requests))).scalars())
 
 
 async def dataset_has_running_run(db: AsyncSession, dataset_id: uuid.UUID) -> bool:
-    """Whether this dataset has a run in state RUNNING right now (the per-dataset form of running_dataset_ids).
+    """Whether this dataset is collecting right now (the per-dataset form of running_dataset_ids).
 
     Args:
         db: A session; a caller that needs the answer inside its transaction passes that transaction's session.
         dataset_id: The dataset's id.
 
     Returns:
-        bool: True when an acknowledged run is in flight for it.
+        bool: True when an open request names it, or a legacy run is RUNNING for it.
     """
-    stmt = select(exists().where(IngestRun.state == IngestRunState.RUNNING, IngestRun.dataset_id == dataset_id))
+    stmt = select(
+        or_(
+            exists().where(IngestRun.state == IngestRunState.RUNNING, IngestRun.dataset_id == dataset_id),
+            exists().where(IngestRequest.state.in_(list(OPEN_STATES)), IngestRequest.dataset_id == dataset_id),
+        )
+    )
     return bool((await db.execute(stmt)).scalar_one())

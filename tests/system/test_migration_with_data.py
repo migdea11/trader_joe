@@ -1497,3 +1497,231 @@ def test_the_request_record_revision_builds_the_attempt_index_unique_and_partial
     assert row.indisunique, f'{ATTEMPT_UNIQUE_INDEX} is not unique'
     assert (row.indnatts, row.first, row.second) == (2, 'request_id', 'attempt_no'), tuple(row)
     assert row.predicate == ATTEMPT_PREDICATE, f'{ATTEMPT_UNIQUE_INDEX} predicate is {row.predicate!r}'
+
+
+# ---------------------------------------------------------------------------------------------
+# tj-7zjov1.123 (P34c): b8e4c1f7a923, the push-path columns. PURELY ADDITIVE and UNMARKED, so it has NO EXPECTATIONS
+# entry (that table is for marked revisions only, test_every_expectation_is_for_a_marked_revision_and_a_present_seed):
+# the generic rule already upgrades the f2b7d4a91c36 seed one step and downgrades it losslessly. What this section adds
+# is the revision's own facts on Postgres: the new columns NULL (or 0) on every existing row, their types as the
+# models declare them, the CHECK on real rows, and a downgrade that restores the parent's schema exactly. The offline
+# half (op sequence, SQL text, model agreement) is data/store/tests/test_push_path_columns_revision.py.
+
+PUSH_PATH_REVISION = 'b8e4c1f7a923'
+STOPPED_CAUSE_CHECK = 'ck_store_dataset_entry_stopped_cause_needs_stop'
+# The design's columns (bead WORK items 1 to 5), per table: the value every pre-existing row takes on upgrade.
+PUSH_PATH_COLUMNS = {
+    RUN_TABLE: {'served_start': None, 'served_end': None},
+    REQUEST_TABLE: {'trigger': None, 'expiry': None, 'collect': None, 'spend_unknown_attempts': 0},
+    ENTRY_TABLE: {'stopped_cause': None},
+}
+
+
+def _column_facts(db: ScratchDb, table: str, column: str) -> tuple | None:
+    with db.engine.connect() as conn:
+        row = conn.execute(
+            sa.text(
+                'SELECT data_type, udt_name, is_nullable, column_default FROM information_schema.columns '
+                "WHERE table_schema = 'public' AND table_name = :table AND column_name = :column"
+            ),
+            {'table': table, 'column': column},
+        ).one_or_none()
+    return None if row is None else tuple(row)
+
+
+def _stopped_cause_check_def(db: ScratchDb) -> str | None:
+    with db.engine.connect() as conn:
+        return conn.execute(
+            sa.text(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = :name AND contype = 'c' "
+                "AND conrelid = 'public.store_dataset_entry'::regclass"
+            ),
+            {'name': STOPPED_CAUSE_CHECK},
+        ).scalar_one_or_none()
+
+
+def _distinct(db: ScratchDb, table: str, column: str) -> set[Any]:
+    with db.engine.connect() as conn:
+        return set(conn.execute(sa.text(f'SELECT DISTINCT {_quote(column)} FROM public.{table}')).scalars())  # nosec B608 -- module-constant table, quoted name
+
+
+def test_the_push_path_revision_sits_on_the_request_record_revision_unmarked_with_its_parent_seed() -> None:
+    assert GRAPH[PUSH_PATH_REVISION].down_revision == REQUEST_RECORD_REVISION
+    assert not GRAPH[PUSH_PATH_REVISION].marked, 'the push-path revision is designed additive; it carries no marker'
+    assert PUSH_PATH_REVISION not in EXPECTATIONS, (
+        'an unmarked revision is the generic rule, never an EXPECTATIONS entry'
+    )
+    assert REQUEST_RECORD_REVISION in SEED_NAMES, 'the parent seed the generic rule upgrades is missing'
+    # TRANSITIONS holds pytest ParameterSets: the seed name is the one value, the id names the step it takes.
+    transitions = {param.values: param.id for param in TRANSITIONS}
+    assert transitions.get((REQUEST_RECORD_REVISION,)) == f'{REQUEST_RECORD_REVISION}->{PUSH_PATH_REVISION}', (
+        f'the generic rule does not run the parent seed through this revision: {sorted(transitions.values())}'
+    )
+
+
+def test_the_push_path_revision_applies_from_empty_with_the_models_columns_and_check(scratch: ScratchDb) -> None:
+    """From an EMPTY database: each column's type, nullability and default as the model declares, and the CHECK."""
+    assert scratch.revision() is None
+    scratch.must('upgrade', PUSH_PATH_REVISION)
+
+    timestamptz = ('timestamp with time zone', 'timestamptz', 'YES', None)
+    assert _column_facts(scratch, RUN_TABLE, 'served_start') == timestamptz
+    assert _column_facts(scratch, RUN_TABLE, 'served_end') == timestamptz
+    assert _column_facts(scratch, REQUEST_TABLE, 'trigger') == ('USER-DEFINED', 'ingest_run_trigger', 'YES', None)
+    assert _column_facts(scratch, REQUEST_TABLE, 'expiry') == timestamptz
+    assert _column_facts(scratch, REQUEST_TABLE, 'collect') == ('boolean', 'bool', 'YES', None)
+    assert _column_facts(scratch, REQUEST_TABLE, 'spend_unknown_attempts') == ('integer', 'int4', 'NO', '0')
+    assert _column_facts(scratch, ENTRY_TABLE, 'stopped_cause') == ('character varying', 'varchar', 'YES', None)
+    assert _stopped_cause_check_def(scratch) == 'CHECK (((stopped_cause IS NULL) OR (collect IS FALSE)))'
+
+
+def test_the_push_path_revision_upgrades_the_parent_seed_with_every_row_kept_and_the_new_columns_empty(
+    scratch: ScratchDb,
+) -> None:
+    seed = read_seed(REQUEST_RECORD_REVISION)
+    scratch.load(seed)
+
+    scratch.must('upgrade', PUSH_PATH_REVISION)
+
+    assert_equals_manifest(scratch, seed)  # every parent column of every row, byte for byte
+    for table, columns in PUSH_PATH_COLUMNS.items():
+        assert seed.row_counts[table] > 0, f'the parent seed holds no {table} row, so this check is vacuous'
+        for column, value in columns.items():
+            assert _distinct(scratch, table, column) == {value}, f'{table}.{column} after the upgrade'
+    assert _stopped_cause_check_def(scratch) is not None, f'{STOPPED_CAUSE_CHECK} is missing after the upgrade'
+
+
+@pytest.mark.parametrize(
+    ('collect', 'cause', 'allowed'),
+    [
+        pytest.param(False, 'VENDOR_ASSET_CHANGED', True, id='stopped-with-cause-allowed'),
+        pytest.param(True, 'VENDOR_ASSET_CHANGED', False, id='collecting-with-cause-refused'),
+        pytest.param(True, None, True, id='collecting-without-cause-allowed'),
+    ],
+)
+def test_the_stopped_cause_check_on_a_subscription_row(scratch: ScratchDb, collect, cause, allowed) -> None:
+    """The canonical seed's entries are all STATIC, so one is first made a collecting DAILY subscription."""
+    scratch.load(read_seed(REQUEST_RECORD_REVISION))
+    scratch.must('upgrade', PUSH_PATH_REVISION)
+    with scratch.engine.begin() as conn:
+        row_id = conn.execute(sa.text(f'SELECT id FROM public.{ENTRY_TABLE} ORDER BY id LIMIT 1')).scalar_one()  # nosec B608
+        conn.execute(
+            sa.text(f'UPDATE public.{ENTRY_TABLE} SET update_type = 2, collect = true WHERE id = :id'),  # nosec B608
+            {'id': row_id},
+        )
+    before = scratch.snapshot()
+    statement = sa.text(
+        f'UPDATE public.{ENTRY_TABLE} SET collect = :collect, stopped_cause = :cause WHERE id = :id'  # nosec B608
+    )
+
+    if allowed:
+        with scratch.engine.begin() as conn:
+            assert conn.execute(statement, {'collect': collect, 'cause': cause, 'id': row_id}).rowcount == 1
+        assert scratch.values(ENTRY_TABLE, 'stopped_cause')[row_id] == cause
+        return
+    with pytest.raises(sa.exc.IntegrityError, match=STOPPED_CAUSE_CHECK), scratch.engine.begin() as conn:
+        conn.execute(statement, {'collect': collect, 'cause': cause, 'id': row_id})
+    assert scratch.snapshot() == before, 'a refused write changed the data'
+
+
+def test_the_stopped_cause_check_refuses_a_cause_on_a_static_row(scratch: ScratchDb) -> None:
+    """A STATIC row holds collect NULL (the collect CHECK), so it can never carry a cause."""
+    scratch.load(read_seed(REQUEST_RECORD_REVISION))
+    scratch.must('upgrade', PUSH_PATH_REVISION)
+    with scratch.engine.connect() as conn:
+        row_id = conn.execute(
+            sa.text(f'SELECT id FROM public.{ENTRY_TABLE} WHERE update_type = 1 ORDER BY id LIMIT 1')  # nosec B608
+        ).scalar_one_or_none()
+    assert row_id is not None, 'the parent seed holds no STATIC entry'
+    before = scratch.snapshot()
+
+    with pytest.raises(sa.exc.IntegrityError, match=STOPPED_CAUSE_CHECK), scratch.engine.begin() as conn:
+        conn.execute(
+            sa.text(f"UPDATE public.{ENTRY_TABLE} SET stopped_cause = 'VENDOR_ASSET_CHANGED' WHERE id = :id"),  # nosec B608
+            {'id': row_id},
+        )
+    assert scratch.snapshot() == before
+
+
+def test_the_push_path_downgrade_restores_the_parent_schema_and_data_and_re_upgrades(scratch: ScratchDb) -> None:
+    seed = read_seed(REQUEST_RECORD_REVISION)
+    scratch.load(seed)
+    parent_schema = scratch.schema()
+    scratch.must('upgrade', PUSH_PATH_REVISION)
+
+    scratch.must('downgrade', REQUEST_RECORD_REVISION)
+
+    assert scratch.schema() == parent_schema, 'the downgrade is not the inverse of the upgrade'
+    assert _stopped_cause_check_def(scratch) is None, 'the downgrade left the CHECK'
+    for table, columns in PUSH_PATH_COLUMNS.items():
+        assert not set(columns) & set(scratch.columns(table)), f'the downgrade left a {table} column'
+        assert scratch.columns(table) == sorted(seed.digests[table])
+    assert_equals_manifest(scratch, seed)
+    assert scratch.enum_exists('ingest_run_trigger'), 'the downgrade dropped a type the parent owns'
+
+    scratch.must('upgrade', PUSH_PATH_REVISION)
+    assert_equals_manifest(scratch, seed)
+
+
+# ---------------------------------------------------------------------------------------------
+# tj-7zjov1.153 (P35r): 39c28a39b290, ingest_request.expiry_type. PURELY ADDITIVE and UNMARKED, so, as for P34c, NO
+# EXPECTATIONS entry: the generic rule upgrades the b8e4c1f7a923 seed one step and downgrades it losslessly. This
+# section adds the revision's own facts on Postgres: the one column integer, nullable, with NO default (a default would
+# write a guessed entry identity on every existing row), NULL on every request row of the parent seed, and a downgrade
+# that restores the parent's schema and rows. The offline half is data/store/tests/test_request_expiry_type_revision.py;
+# what the revision builds, object by object, is test_migration_downgrade.py's.
+
+EXPIRY_TYPE_REVISION = '39c28a39b290'
+EXPIRY_TYPE_COLUMN = 'expiry_type'
+
+
+def test_the_expiry_type_revision_sits_on_the_push_path_revision_unmarked_with_its_parent_seed() -> None:
+    assert GRAPH[EXPIRY_TYPE_REVISION].down_revision == PUSH_PATH_REVISION
+    assert not GRAPH[EXPIRY_TYPE_REVISION].marked, 'the expiry-type revision is designed additive; it carries no marker'
+    assert EXPIRY_TYPE_REVISION not in EXPECTATIONS, (
+        'an unmarked revision is the generic rule, never an EXPECTATIONS entry'
+    )
+    assert PUSH_PATH_REVISION in SEED_NAMES, 'the parent seed the generic rule upgrades is missing'
+    transitions = {param.values: param.id for param in TRANSITIONS}
+    assert transitions.get((PUSH_PATH_REVISION,)) == f'{PUSH_PATH_REVISION}->{EXPIRY_TYPE_REVISION}', (
+        f'the generic rule does not run the parent seed through this revision: {sorted(transitions.values())}'
+    )
+
+
+def test_the_expiry_type_revision_applies_from_empty_with_the_models_column(scratch: ScratchDb) -> None:
+    """From an EMPTY database: integer, nullable, no default, as the model declares."""
+    assert scratch.revision() is None
+    scratch.must('upgrade', EXPIRY_TYPE_REVISION)
+
+    assert _column_facts(scratch, REQUEST_TABLE, EXPIRY_TYPE_COLUMN) == ('integer', 'int4', 'YES', None)
+
+
+def test_the_expiry_type_revision_upgrades_the_parent_seed_with_every_row_kept_and_the_column_null(
+    scratch: ScratchDb,
+) -> None:
+    seed = read_seed(PUSH_PATH_REVISION)
+    scratch.load(seed)
+    assert EXPIRY_TYPE_COLUMN not in scratch.columns(REQUEST_TABLE), 'the parent already has the column'
+
+    scratch.must('upgrade', EXPIRY_TYPE_REVISION)
+
+    assert_equals_manifest(scratch, seed)  # every parent column of every row, byte for byte
+    assert seed.row_counts[REQUEST_TABLE] > 0, f'the parent seed holds no {REQUEST_TABLE} row, so this is vacuous'
+    assert _distinct(scratch, REQUEST_TABLE, EXPIRY_TYPE_COLUMN) == {None}, 'a pre-existing request row got a value'
+
+
+def test_the_expiry_type_downgrade_restores_the_parent_schema_and_data_and_re_upgrades(scratch: ScratchDb) -> None:
+    seed = read_seed(PUSH_PATH_REVISION)
+    scratch.load(seed)
+    parent_schema = scratch.schema()
+    scratch.must('upgrade', EXPIRY_TYPE_REVISION)
+
+    scratch.must('downgrade', PUSH_PATH_REVISION)
+
+    assert scratch.schema() == parent_schema, 'the downgrade is not the inverse of the upgrade'
+    assert EXPIRY_TYPE_COLUMN not in scratch.columns(REQUEST_TABLE), 'the downgrade left the column'
+    assert scratch.columns(REQUEST_TABLE) == sorted(seed.digests[REQUEST_TABLE])
+    assert_equals_manifest(scratch, seed)
+
+    scratch.must('upgrade', EXPIRY_TYPE_REVISION)
+    assert_equals_manifest(scratch, seed)

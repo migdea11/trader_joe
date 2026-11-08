@@ -30,9 +30,10 @@ real, asserting no session is left uncovered, every pad turned real within the g
 never grows, and a repeated pass is idempotent.
 
 TIERS. The pure tail rule (_fetch_start) over CatalogRows with the real XNYS calendar. recent_placeholder_bars over
-SQLite. The real pass (catalog read, placeholder read, plan, worker, run recorder) over SQLite with an injected
-clock; the Postgres-only writes are replaced: the entry upsert answers the existing id, and the bar upsert is
-EMULATED (delete then insert on the natural key, updated_at set to the injected clock), which is what
+SQLite. The real pass (catalog read, placeholder read, plan, the submit path) and the real delivery intake that writes
+what ingest pushes (since the push path, tj-7zjov1.28: the pass submits and does not wait, so the Sim delivers each
+request right after its pass, at the pass's instant) over SQLite with an injected clock; the Postgres-only bar upsert
+is EMULATED (delete then insert on the natural key, updated_at set to the injected clock), which is what
 build_market_activity_upsert's ON CONFLICT DO UPDATE does (test_market_activity_idempotency.py pins that statement:
 every correctable column, volume and trade count included, and updated_at = now()). That Postgres runs it is
 tests/system/test_daily_refresh_pass.py's subject.
@@ -55,6 +56,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 import pytest_asyncio
+import sqlalchemy as sa
 from pydantic import ValidationError
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
@@ -74,11 +76,14 @@ from data.store.app.daily_refresh import (
 from data.store.app.database.crud.stock import dataset_catalog as catalog_repo
 from data.store.app.database.crud.stock.dataset_catalog import CatalogRow, PlaceholderBar
 from data.store.app.database.models.base_market_activity import BaseMarketActivity
+from data.store.app.database.models.ingest_request import IngestRequest
 from data.store.app.database.models.ingest_run import IngestRun
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
-from data.store.app.ingest import data_action_request, run_recording
+from data.store.app.ingest import data_action_request, delivery_intake
 from data.store.app.trading_calendar import calendar_for_source
+from data.store.tests.delivery_reports import INSTANCE_A, report, stats, with_trailer
+from data.store.tests.request_tables import create_request_tables
 from data.store.tests.test_daily_refresh import _engine
 from data.store.tests.test_ui_datasets_route import (  # noqa: F401 (aware_sqlite_datetimes is a fixture)
     aware_sqlite_datetimes,
@@ -86,6 +91,8 @@ from data.store.tests.test_ui_datasets_route import (  # noqa: F401 (aware_sqlit
     entry,
 )
 from schemas.data_ingest import fetch_dataset
+from schemas.data_ingest.delivery import DeliveryVerdict
+from schemas.data_ingest.submit import SubmitAccepted, SubmitAck, SubmitRequest, SubmitResponse
 
 
 pytestmark = pytest.mark.data_store
@@ -1081,24 +1088,41 @@ def test_property_the_window_covers_every_unsettled_bar_and_every_session_after_
 
 
 class Vendor:
-    """An IngestFetchClient double that serves a truth table: each bar real from an instant on, a placeholder before.
+    """Ingest and its vendor, as one double: it takes each Submit and, when the Sim says, DELIVERS the attempt.
 
-    It serves every bar of the requested symbol stamped in [start, now) (or [start, end)), as of the injected clock.
+    It serves a truth table: each bar real from an instant on, a placeholder before. A delivery carries every bar of
+    the requested symbol stamped in [start, now) (or [start, end)), as of the injected clock.
+
+    REPAIRED FOR THE PUSH PATH (validator, tj-7zjov1.28). Before it the pass held a FetchDataset stream, so this
+    double answered the stream and the bars were written inside the pass. Now the pass only SUBMITS (and does not
+    wait), and ingest pushes the result to the store's delivery intake. So `submit` accepts and queues the request,
+    and `deliver_all` reports each queued request's single attempt to the REAL DeliveryIntake, which writes the bars
+    (through the emulated upsert) and the attempt row; the Sim delivers right after each pass, at the pass's instant,
+    which is what a prompt ingest does. `requests` keeps each Submit's bars request, so what the tail asserts is
+    unchanged.
     """
 
-    def __init__(self, clock: list[datetime]) -> None:
+    def __init__(self, clock: list[datetime], intake: delivery_intake.DeliveryIntake) -> None:
         self.clock = clock
+        self.intake = intake
         self.requests: list[Any] = []
+        self.queued: list[SubmitRequest] = []
         # symbol -> stamp -> the instant the vendor serves it as a REAL bar from (None: always a placeholder)
         self.truth: dict[str, dict[datetime, datetime | None]] = {}
 
     def starts(self, symbol: str) -> list[datetime]:
         return [request.start for request in self.requests if request.asset_symbol == symbol]
 
-    async def fetch(self, request):
-        self.requests.append(request)
-        now = self.clock[0]
-        feed = request.feed or Feed.IEX
+    async def submit(self, request: SubmitRequest) -> SubmitResponse:
+        self.requests.append(request.bars)
+        self.queued.append(request)
+        accepted = SubmitAccepted(feed=request.bars.feed or Feed.IEX, quota_key='quota-key')
+        return SubmitResponse(ack=SubmitAck(accepted=accepted), instance_id=INSTANCE_A)
+
+    async def instance(self) -> Any:
+        raise AssertionError('the refresh never probes the instance')
+
+    def _served(self, request: Any, now: datetime, feed: Feed) -> list[fetch_dataset.Bar]:
         served = []
         for stamp, real_from in sorted(self.truth.get(request.asset_symbol, {}).items()):
             if stamp < request.start or stamp >= now or (request.end is not None and stamp >= request.end):
@@ -1116,19 +1140,31 @@ class Vendor:
                     feed=feed,
                 )
             )
-        yield fetch_dataset.FetchAccepted(feed=feed)
-        if served:
-            yield fetch_dataset.BarPage(bars=served)
-        yield fetch_dataset.FetchDone(
-            bar_count=len(served), served_range=fetch_dataset.ServedRange(start=request.start, end=now), as_of=now
-        )
+        return served
+
+    async def deliver_all(self) -> None:
+        """Report every queued request's one attempt to the intake: SUCCEEDED, the served bars (none is EMPTY)."""
+        now = self.clock[0]
+        queued, self.queued = self.queued, []
+        for submitted in queued:
+            # delivery_reports.header names IEX; the Sim's datasets are all IEX, so the header's tape is theirs.
+            served = self._served(submitted.bars, now, Feed.IEX)
+            called = stats().model_copy(update={'first_call_at': now, 'last_call_at': now})
+            attempt = report(
+                submitted.request_id, parts=[fetch_dataset.BarPage(bars=served)] if served else [], vendor_stats=called
+            )
+            attempt = with_trailer(
+                attempt, served_range=fetch_dataset.ServedRange(start=submitted.bars.start, end=now), as_of=now
+            )
+            answer = await self.intake.deliver(attempt)
+            assert answer.verdict is DeliveryVerdict.FINAL
 
 
 class Sim:
     def __init__(self, engine: AsyncEngine) -> None:
         self.engine = engine
         self.clock = [datetime(2026, 10, 6, 22, tzinfo=UTC)]
-        self.vendor = Vendor(self.clock)
+        self.vendor = Vendor(self.clock, delivery_intake.DeliveryIntake(chunk_size=1000))
         self.entries: list[StoreDatasetEntry] = []
 
     async def add(self, *rows: Any) -> None:
@@ -1140,12 +1176,15 @@ class Sim:
         self.entries.extend(row for row in rows if isinstance(row, StoreDatasetEntry))
 
     async def run(self, now: datetime) -> PassResult:
+        """One pass at `now`, then ingest delivers what it was submitted, at the same instant."""
         self.clock[0] = now
 
         async def sleep(_seconds: float) -> None:
             return None
 
-        return await DailyRefresher(self.vendor, clock=lambda: now, sleep=sleep).run_pass(DataSource.ALPACA_API, XNYS)
+        result = await DailyRefresher(self.vendor, clock=lambda: now, sleep=sleep).run_pass(DataSource.ALPACA_API, XNYS)
+        await self.vendor.deliver_all()
+        return result
 
     async def stored(self, dataset: StoreDatasetEntry) -> dict[datetime, tuple[bool, datetime]]:
         """Each stored bar of the dataset: stamp -> (is a placeholder, written at)."""
@@ -1160,14 +1199,23 @@ class Sim:
             return await catalog_repo.get_catalog_row(db, dataset.id)
 
     async def runs(self, dataset: StoreDatasetEntry) -> list[IngestRun]:
+        """The attempt rows the delivery intake wrote for the dataset's symbol."""
         async with AsyncSession(self.engine) as db:
             statement = select(IngestRun).where(IngestRun.asset_symbol == dataset.asset_symbol)
+            return list((await db.execute(statement)).scalars())
+
+    async def requests(self, dataset: StoreDatasetEntry) -> list[IngestRequest]:
+        """The request rows the pass wrote for the dataset."""
+        async with AsyncSession(self.engine) as db:
+            statement = select(IngestRequest).where(IngestRequest.dataset_id == dataset.id)
             return list((await db.execute(statement)).scalars())
 
 
 @pytest_asyncio.fixture
 async def sim(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Sim]:
     request.getfixturevalue('aware_sqlite_datetimes')
+    # SQLite has no ARRAY: ingest_request.data_types binds as JSON for this test (restored by monkeypatch).
+    monkeypatch.setattr(IngestRequest.__table__.c.data_types, 'type', sa.JSON())
     engine = _engine()
     async with engine.begin() as connection:
         await connection.run_sync(
@@ -1175,22 +1223,13 @@ async def sim(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -
                 sync, tables=[StoreDatasetEntry.__table__, StockMarketActivity.__table__, IngestRun.__table__]
             )
         )
+        await connection.run_sync(create_request_tables)
     state = Sim(engine)
 
     @asynccontextmanager
     async def own_session() -> AsyncIterator[AsyncSession]:
         async with AsyncSession(engine, expire_on_commit=False) as db:
             yield db
-
-    async def upsert(_db: AsyncSession, created: Any, **_kwargs: Any) -> uuid.UUID:
-        # The Postgres entry upsert cannot run on SQLite: answer the id an exact identity match resolves to.
-        (match,) = [
-            row
-            for row in state.entries
-            if (row.owner, row.asset_symbol, row.feed, row.granularity)
-            == (created.owner, created.asset_symbol, created.feed, created.granularity)
-        ]
-        return match.id
 
     async def write_bars(db: AsyncSession, batch: Any, requested_chunk_size: int | None = None) -> int:
         # The Postgres ON CONFLICT DO UPDATE, emulated: the row on the natural key is replaced, updated_at is now.
@@ -1205,11 +1244,10 @@ async def sim(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -
     for env in (refresh_module.ENABLED_ENV, refresh_module.MAX_PER_PASS_ENV, refresh_module.BACKOFF_ENV):
         monkeypatch.delenv(env, raising=False)
     monkeypatch.setattr(refresh_module, 'own_session', own_session)
-    monkeypatch.setattr(run_recording, 'own_session', own_session)
-    monkeypatch.setattr(refresh_module, 'publish', lambda _event: None)
-    monkeypatch.setattr(run_recording, 'publish', lambda _event: None)
-    monkeypatch.setattr(data_action_request, 'upsert_entry_in_transaction', upsert)
-    monkeypatch.setattr(data_action_request, 'write_market_activity_in_transaction', write_bars)
+    monkeypatch.setattr(data_action_request, 'own_session', own_session)
+    monkeypatch.setattr(delivery_intake, 'own_session', own_session)
+    monkeypatch.setattr(delivery_intake, 'publish', lambda _event: None)
+    monkeypatch.setattr(delivery_intake, 'write_market_activity_in_transaction', write_bars)
     try:
         yield state
     finally:
@@ -1420,12 +1458,14 @@ def test_f4_ruling_a_dataset_with_no_counted_bar_is_requested_from_its_declared_
 def test_f4_ruling_the_atomic_fetch_it_rests_on_is_pinned():
     """The invariant's second half: every fetch is ONE write transaction, so a broken stream writes nothing.
 
-    Pinned in test_dataset_fetch_transaction.py; this guards that the pin is still there, since ruling 1 is only
-    as good as it.
+    This guards that the pin is still there, since ruling 1 is only as good as it. REPOINTED (validator,
+    tj-7zjov1.28): since the push path the one transaction is the DELIVERY INTAKE's (one per delivered attempt: a
+    refusal on page two rolls back page one), pinned in test_delivery_intake.py; the FetchDataset worker's
+    test_a_stream_that_breaks_after_a_page_commits_nothing_and_rolls_back went with the stream.
     """
-    import data.store.tests.test_dataset_fetch_transaction as transaction_tests
+    import data.store.tests.test_delivery_intake as intake_tests
 
-    assert callable(transaction_tests.test_a_stream_that_breaks_after_a_page_commits_nothing_and_rolls_back)
+    assert callable(intake_tests.test_a_refused_second_page_rolls_back_the_first)
 
 
 def test_f4_ruling_a_real_dataset_whose_first_bar_is_after_its_declared_start_is_not_asked_for_again():

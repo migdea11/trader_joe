@@ -10,14 +10,15 @@ RESULTS ARE DETACHED SNAPSHOTS (IngestRequestRecord), never ORM rows.
 
 import uuid
 from collections.abc import Collection
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 
-from sqlalchemy import Row, func, select, update
+from sqlalchemy import Row, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.enums.data_select import AssetType
-from common.enums.data_stock import DataSource, Feed, Granularity, UpdateType
+from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
+from data.store.app.database.models.ingest_instance import IngestInstance
 from data.store.app.database.models.ingest_request import (
     OPEN_STATES,
     IngestRequest,
@@ -25,6 +26,7 @@ from data.store.app.database.models.ingest_request import (
     IngestRequestKind,
     IngestRequestState,
 )
+from data.store.app.database.models.ingest_run import IngestRunTrigger
 from data.store.app.database.transaction import write_transaction
 
 
@@ -61,6 +63,15 @@ class IngestRequestRecord:
     failure_detail: str | None
     created_at: datetime
     finished_at: datetime | None
+    # What started the request; None (a row written before the column) reads as REQUEST.
+    trigger: IngestRunTrigger | None = None
+    # The POST body's lifecycle fields, None where the request carries none.
+    expiry: datetime | None = None
+    collect: bool | None = None
+    # Counted attempts that reported no vendor stats: the spend sums above leave them out.
+    spend_unknown_attempts: int = 0
+    # The POST body's expiry type, None where the request carries none.
+    expiry_type: ExpiryType | None = None
 
     @classmethod
     def from_row(cls, row: IngestRequest | Row) -> 'IngestRequestRecord':
@@ -95,6 +106,11 @@ class IngestRequestRecord:
             failure_detail=row.failure_detail,
             created_at=row.created_at,
             finished_at=row.finished_at,
+            trigger=IngestRunTrigger(row.trigger) if row.trigger is not None else None,
+            expiry=row.expiry,
+            collect=row.collect,
+            spend_unknown_attempts=row.spend_unknown_attempts,
+            expiry_type=ExpiryType(row.expiry_type) if row.expiry_type is not None else None,
         )
 
 
@@ -121,6 +137,13 @@ class NewIngestRequest:
     requested_end: datetime | None = None
     ready_by: datetime | None = None
     best_effort: bool = False
+    # REQUEST for a POST, SCHEDULE for the DAILY loop; None is stored NULL and reads as REQUEST.
+    trigger: IngestRunTrigger | None = None
+    # The POST body's lifecycle fields, stored as given.
+    expiry: datetime | None = None
+    collect: bool | None = None
+    # The POST body's expiry type, stored as its integer value; None is stored NULL.
+    expiry_type: ExpiryType | None = None
 
 
 async def create_request(db: AsyncSession, request: NewIngestRequest) -> IngestRequestRecord:
@@ -153,6 +176,10 @@ async def create_request(db: AsyncSession, request: NewIngestRequest) -> IngestR
                     ready_by=request.ready_by,
                     best_effort=request.best_effort,
                     client_label=request.client_label,
+                    trigger=request.trigger,
+                    expiry=request.expiry,
+                    collect=request.collect,
+                    expiry_type=request.expiry_type.value if request.expiry_type is not None else None,
                     state=IngestRequestState.PENDING,
                 )
                 .returning(*IngestRequest.__table__.c)
@@ -202,7 +229,9 @@ async def mark_queued(db: AsyncSession, request_id: uuid.UUID, instance_id: str)
     """Record that ingest answered: PENDING or NOT_DELIVERED becomes QUEUED with the answering instance.
 
     A request already past those states is left alone, so a late or repeated answer cannot reopen a finished
-    request or undo a NOT_DELIVERED mark made for a newer instance.
+    request or undo a NOT_DELIVERED mark made for a newer instance. NEVER QUEUED UNDER A SUPERSEDED INSTANCE: when the
+    answering instance has already been superseded the request is left as it was, because nothing would ever work on
+    it (the instance sighting marks only the rows QUEUED in its own snapshot); the watcher re-submits it.
 
     Args:
         db: The caller's own session.
@@ -211,21 +240,118 @@ async def mark_queued(db: AsyncSession, request_id: uuid.UUID, instance_id: str)
 
     Returns:
         IngestRequestRecord | None: The row after the update, or None when the request was not PENDING or
-            NOT_DELIVERED (or does not exist).
+            NOT_DELIVERED (or does not exist), or the answering instance is superseded.
     """
     table = IngestRequest.__table__
+    instances = IngestInstance.__table__
     async with write_transaction(db, 'record ingest request queued'):
         stmt = (
             update(table)
             .where(
                 table.c.id == request_id,
                 table.c.state.in_([IngestRequestState.PENDING, IngestRequestState.NOT_DELIVERED]),
+                ~exists().where(instances.c.instance_id == instance_id, instances.c.superseded_at.is_not(None)),
             )
             .values(state=IngestRequestState.QUEUED, instance_id=instance_id)
             .returning(*table.c)
         )
         row = (await db.execute(stmt)).one_or_none()
         return IngestRequestRecord.from_row(row) if row is not None else None
+
+
+async def list_pending_before(db: AsyncSession, cutoff: datetime) -> list[IngestRequestRecord]:
+    """The PENDING requests written before an instant, oldest first: written, and not answered by ingest in time.
+
+    Args:
+        db: A session.
+        cutoff: Aware; requests created at or after it are still being submitted by their own caller.
+
+    Returns:
+        list[IngestRequestRecord]: The rows, by created_at then id.
+    """
+    stmt = (
+        select(IngestRequest)
+        .where(IngestRequest.state == IngestRequestState.PENDING, IngestRequest.created_at < cutoff)
+        .order_by(IngestRequest.created_at, IngestRequest.id)
+    )
+    return [IngestRequestRecord.from_row(row) for row in (await db.execute(stmt)).scalars()]
+
+
+async def list_abandoned(db: AsyncSession, superseded_before: datetime) -> list[uuid.UUID]:
+    """The ids of open requests that an instance superseded before an instant still holds, oldest first.
+
+    NOT_DELIVERED requests and QUEUED ones whose instance is superseded are the same thing for the watcher: nothing
+    works on them. A QUEUED row can be left under a superseded instance (the sighting marks only the rows QUEUED in
+    its snapshot), so both are read.
+
+    Args:
+        db: A session.
+        superseded_before: Aware; only instances superseded at or before it count, so the old process's last report
+            has landed or died.
+
+    Returns:
+        list[uuid.UUID]: The request ids.
+    """
+    requests = IngestRequest.__table__
+    instances = IngestInstance.__table__
+    old_instance = exists().where(
+        instances.c.instance_id == requests.c.instance_id, instances.c.superseded_at <= superseded_before
+    )
+    stmt = (
+        select(requests.c.id)
+        .where(
+            requests.c.state.in_([IngestRequestState.NOT_DELIVERED, IngestRequestState.QUEUED]),
+            or_(
+                old_instance,
+                (requests.c.instance_id.is_(None)) & (requests.c.state == IngestRequestState.NOT_DELIVERED),
+            ),
+        )
+        .order_by(requests.c.created_at, requests.c.id)
+    )
+    return list((await db.execute(stmt)).scalars())
+
+
+async def claim_abandoned(
+    db: AsyncSession, request_id: uuid.UUID, superseded_before: datetime
+) -> IngestRequestRecord | None:
+    """Lock an abandoned request and return it as NOT_DELIVERED with its durable attempt count, or None.
+
+    THE COUNT IS READ UNDER THE REQUEST LOCK (architect ruling (C), tj-7zjov1.28): the old instance's last in-flight
+    report has either committed (and is in the count) or is refused for ever, so the new instance is never handed a
+    count it will collide with. A QUEUED row under a superseded instance is moved to NOT_DELIVERED here, so the rest
+    of the re-submission treats both alike. A row that is no longer abandoned (finished, or already taken by a newer
+    instance) yields None.
+
+    Args:
+        db: The caller's own session.
+        request_id: The request.
+        superseded_before: Aware; the same cutoff list_abandoned used.
+
+    Returns:
+        IngestRequestRecord | None: The row after the claim, or None when it is not abandoned any more.
+    """
+    table = IngestRequest.__table__
+    instances = IngestInstance.__table__
+    async with write_transaction(db, 'claim abandoned ingest request'):
+        row = (
+            await db.execute(select(IngestRequest).where(IngestRequest.id == request_id).with_for_update())
+        ).scalar_one_or_none()
+        if row is None or row.state not in (IngestRequestState.NOT_DELIVERED, IngestRequestState.QUEUED):
+            return None
+        if row.instance_id is not None:
+            superseded_at = (
+                await db.execute(select(instances.c.superseded_at).where(instances.c.instance_id == row.instance_id))
+            ).scalar_one_or_none()
+            if superseded_at is None or superseded_at > superseded_before:
+                return None
+        elif row.state is not IngestRequestState.NOT_DELIVERED:
+            return None
+        record = IngestRequestRecord.from_row(row)
+        if record.state is IngestRequestState.QUEUED:
+            await db.execute(
+                update(table).where(table.c.id == request_id).values(state=IngestRequestState.NOT_DELIVERED)
+            )
+        return replace(record, state=IngestRequestState.NOT_DELIVERED)
 
 
 async def finish_request(

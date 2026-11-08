@@ -58,12 +58,13 @@ THE LABEL (client_label) AND THE QUOTA KEY ARE NEVER LOGGED beyond what a log li
 
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.enums.data_select import DataType
+from common.enums.data_stock import Feed
 from common.environment import get_env_var
 from common.errors.vocabulary import InvalidRequestError, Reason
 from common.logging import get_logger
@@ -75,13 +76,21 @@ from data.store.app.database.crud.ingest_delivery import (
     find_attempt,
     insert_attempt,
     instance_is_superseded,
-    lock_dataset_entry,
+    lock_active_dataset_entry,
     lock_request,
+    set_request_dataset,
+    touch_entry,
 )
 from data.store.app.database.crud.ingest_instance import note_instance_seen
 from data.store.app.database.crud.ingest_request import IngestRequestRecord
 from data.store.app.database.crud.ingest_run import IngestRunRecord
 from data.store.app.database.crud.stock.asset_market_activity import write_market_activity_in_transaction
+from data.store.app.database.crud.stock.store_dataset_entry import (
+    OverlapKey,
+    collect_change,
+    lock_stored_collect,
+    upsert_entry_in_transaction,
+)
 from data.store.app.database.database import own_session
 from data.store.app.database.models.ingest_request import (
     IngestRequestFailureCause,
@@ -103,6 +112,7 @@ from schemas.data_ingest.delivery import (
     RegisterInstanceRequest,
 )
 from schemas.data_ingest.fetch_dataset import BarPage
+from schemas.data_store.asset_dataset_store import AssetDatasetStoreCreate
 from schemas.data_store.stock.market_activity_data import (
     BatchStockDataMarketActivityCreate,
     StockDataMarketActivityData,
@@ -177,6 +187,11 @@ def validate_report(attempt: AttemptDelivery, kind: IngestRequestKind) -> None:
     # (d) A served range is the window a SUCCEEDED attempt answered for.
     if trailer.served_range is not None and outcome is not DeliveryOutcome.SUCCEEDED:
         raise _refuse(f'{outcome} report carries a served range, which belongs to SUCCEEDED only')
+    # (i) A SUCCEEDED bars report names the window it answered for (store.proto; ingest always sets it for bars), and
+    # the verdict waiter returns it from the attempt row. A missing one is a sender defect the store must not store as
+    # a success. The other kinds are not held to it here (an asset list carries none).
+    if kind is IngestRequestKind.BARS and outcome is DeliveryOutcome.SUCCEEDED and trailer.served_range is None:
+        raise _refuse('a SUCCEEDED bars report carries no served range')
     # (g) A counted attempt was charged to a quota, and the charge needs its name.
     if outcome not in _NO_CALL and not header.quota_key:
         raise _refuse('a counted attempt names no quota key')
@@ -211,13 +226,74 @@ class ArmContext:
     request: IngestRequestRecord
     attempt: AttemptDelivery
     chunk_size: int | None
+    # What the arm learned that is not a record count; filled by the arm, read by the transaction after it.
+    effects: 'ArmEffects' = field(default_factory=lambda: ArmEffects())
+
+
+@dataclass
+class ArmEffects:
+    """What an arm tells the delivery transaction besides its record count."""
+
+    # The entry the arm resolved or created (None when the request has none, or the delivery was dropped).
+    dataset_id: uuid.UUID | None = None
+    # The collect value the entry was flipped to by a POST that carried one (False retired, True resumed), else None.
+    collect_flip: bool | None = None
+
+
+class DatasetDropped(Exception):
+    """The dataset a delivery writes to was deleted, or stopped, before the delivery landed.
+
+    Not a TraderJoeError and never leaves the transaction: the delivery catches it, stores nothing, and finishes
+    the request EMPTY with the DISCARDED cause. The refresh's old rule, now the intake's.
+    """
 
 
 Arm = Callable[[ArmContext], Awaitable[int]]
 
 
+def _entry_of(request: IngestRequestRecord, label: AttemptLabel, feed: Feed) -> AssetDatasetStoreCreate:
+    """The dataset entry a request's first delivered attempt writes, built from the request row and the header's feed.
+
+    Owner is the request's client label, the data type its one data type, the range its requested window, expiry and
+    collect its POST fields. The expiry type is the POST body's own declared value; it is never guessed.
+
+    Raises:
+        InvalidRequestError: INVALID_REQUEST, if the request carries no expiry type (only a request with a dataset
+            already may omit it), or the row will not validate as an entry.
+    """
+    if request.expiry_type is None:
+        raise _refuse('a request with no dataset and no expiry type cannot create its dataset entry')
+    if request.requested_start is None:
+        raise _refuse('a request with no dataset and no start cannot create its dataset entry')
+    key = OverlapKey(
+        owner=request.client_label,
+        asset_type=label.asset_type,
+        asset_symbol=label.asset_symbol,
+        data_type=label.data_type,
+        source=request.source,
+        granularity=label.granularity,
+        expiry_type=request.expiry_type,
+        update_type=label.update_type,
+        start=request.requested_start,
+        end=request.requested_end,
+    )
+    try:
+        return key.extend(expiry=request.expiry, feed=feed)
+    except ValidationError as error:
+        raise _refuse('the request does not describe a dataset entry the store can write') from error
+
+
 async def write_bars(context: ArmContext) -> int:
-    """The bars arm: upsert every bar of every page under the request's dataset, through the existing bar writer.
+    """The bars arm: resolve the request's dataset, then upsert every bar of every page under it.
+
+    THE DATASET ENTRY IS WRITTEN HERE, ON THE FIRST DELIVERED ATTEMPT (P35, architect ruling A). A request with no
+    dataset_id (a POST) gets its entry upserted from the request row (owner, symbol, asset type, data type, source,
+    granularity, update type, range, expiry type, expiry and collect) and the header's resolved feed, and the request
+    is given the dataset id, all in this delivery transaction; a zero-bar success creates it too. A request that has
+    one (the DAILY loop sets it when it writes the request) is the refresh: the entry is locked and judged first, and
+    a gone or stopped entry DROPS the delivery (DatasetDropped, nothing stored). The refresh never writes a lifecycle
+    field. The own-overlap refusal is the POST's, made before the request is sent; it is not repeated here, because a
+    refusal in this transaction would be redelivered for ever.
 
     P16 adds the write-time clip against the listing and the dataset_coverage write HERE, at this seam.
 
@@ -228,32 +304,39 @@ async def write_bars(context: ArmContext) -> int:
         int: How many bars were written.
 
     Raises:
-        InvalidRequestError: INVALID_REQUEST, if the request has no dataset to write under, a bar names another
+        DatasetDropped: The request's dataset was deleted or stopped; nothing is written.
+        InvalidRequestError: INVALID_REQUEST, if the request has no dataset and cannot create one, a bar names another
             tape than the header's, or a bar cannot be stored; DUPLICATE_BAR_TIMESTAMP, if one page carries a
             timestamp twice. Nothing is kept: the transaction rolls back.
     """
     request, header = context.request, context.attempt.header
     pages = [part for part in context.attempt.parts if isinstance(part, BarPage)]
+    label = _label_for(request)
+    if request.dataset_id is None:
+        entry = _entry_of(request, label, header.feed)
+        before = await lock_stored_collect(context.db, entry)
+        dataset_id = await upsert_entry_in_transaction(context.db, entry, collect=request.collect)
+        await set_request_dataset(context.db, request.id, dataset_id)
+        context.effects.collect_flip = collect_change(before, request.collect)
+    else:
+        # NO ORPHAN BARS: bars carry a foreign key to their dataset (ON DELETE CASCADE), so the database itself never
+        # keeps a bar whose entry is gone, and that key stays the backstop. The entry is locked FOR UPDATE and judged
+        # first so that a delivery for a deleted or stopped entry is dropped cleanly instead of surfacing a
+        # foreign-key violation, so the delivery serialises with the operator's delete, Stop and the reaper (they lock
+        # the same row), and so the drop rule has one place to judge, under the lock.
+        if not await lock_active_dataset_entry(context.db, request.dataset_id):
+            raise DatasetDropped
+        dataset_id = request.dataset_id
+        await touch_entry(context.db, dataset_id)
+    context.effects.dataset_id = dataset_id
     if not any(page.bars for page in pages):
         return 0
-    if request.dataset_id is None:
-        # Bars are keyed on a dataset. Until the submit path (P35) gives a bars request its dataset, there is none,
-        # and acknowledging bars that were not stored would be a lie.
-        raise _refuse('the request has no dataset to store these bars under')
     if request.asset_symbol is None or request.granularity is None:
         raise _refuse('the request does not name the symbol and granularity these bars belong to')
-    # NO ORPHAN BARS: bars carry a foreign key to their dataset (ON DELETE CASCADE), so the database itself never keeps
-    # a bar whose entry is gone, and that key stays the backstop. The entry is locked FOR UPDATE anyway so that a
-    # delivery for a deleted entry is refused cleanly below instead of surfacing a foreign-key violation as a database
-    # error, so the delivery serialises with the operator's delete and the reaper (they lock the same row), and so
-    # P35's drop rule (gone or retired) has one place to judge under the lock. A dataset that is merely stopped is
-    # P35's rule, not this arm's.
-    if not await lock_dataset_entry(context.db, request.dataset_id):
-        raise _refuse('the dataset this request writes to no longer exists')
     written = 0
     for page in pages:
         batch = BatchStockDataMarketActivityCreate(
-            dataset_id=request.dataset_id,
+            dataset_id=dataset_id,
             asset_symbol=request.asset_symbol,
             source=request.source,
             granularity=request.granularity,
@@ -360,9 +443,16 @@ class Decision:
     # None leaves the request's state alone (a retry is still wanted, or the report is not conclusive).
     state: IngestRequestState | None
     cause: IngestRequestFailureCause | None
+    # The request's failure_detail when the store, not the report, is the one with something to say.
+    detail: str | None = None
 
 
-def decide(attempt: AttemptDelivery, *, bars_written: int, has_records: bool, superseded: bool) -> Decision:
+DISCARDED_DETAIL = 'The dataset was deleted or stopped before this delivery landed; nothing was stored.'
+
+
+def decide(
+    attempt: AttemptDelivery, *, bars_written: int, has_records: bool, superseded: bool, dropped: bool = False
+) -> Decision:
     """The verdict rule: FINAL on a permanent refusal, the last attempt, a superseded request or instance; else CONTINUE.
 
     An expired report is FINAL with cause EXPIRED, an exhausted one FINAL with cause ATTEMPTS_EXHAUSTED; neither is a
@@ -373,11 +463,17 @@ def decide(attempt: AttemptDelivery, *, bars_written: int, has_records: bool, su
         bars_written: Bars the bars arm wrote.
         has_records: Whether the success carried any record at all (a bar, an asset, an action).
         superseded: Whether the reporting instance has been superseded by a newer one.
+        dropped: Whether the bars arm dropped the delivery (its dataset was deleted or stopped): FINAL, the request
+            EMPTY with the DISCARDED cause.
 
     Returns:
         Decision: The verdict and the state change for an open request.
     """
     trailer = attempt.trailer
+    if dropped:
+        return Decision(
+            DeliveryVerdict.FINAL, IngestRequestState.EMPTY, IngestRequestFailureCause.DISCARDED, DISCARDED_DETAIL
+        )
     match trailer.outcome:
         case DeliveryOutcome.EXPIRED:
             return Decision(DeliveryVerdict.FINAL, IngestRequestState.FAILED, IngestRequestFailureCause.EXPIRED)
@@ -413,6 +509,15 @@ class _Delivered:
     response: DeliverAttemptResponse
     run: IngestRunRecord | None = None
     dataset_id: uuid.UUID | None = None
+    # RETIRED or RESUMED when a POST's delivery flipped the entry's collect, else UPDATED.
+    change: DatasetChange = DatasetChange.UPDATED
+
+
+def _change_kind(collect_flip: bool | None) -> DatasetChange:
+    """The change a delivery publishes: RETIRED when collect went false, RESUMED when it went true, else UPDATED."""
+    if collect_flip is None:
+        return DatasetChange.UPDATED
+    return DatasetChange.RESUMED if collect_flip else DatasetChange.RETIRED
 
 
 class DeliveryIntake:
@@ -478,7 +583,7 @@ class DeliveryIntake:
         if delivered.run is not None:
             publish(IngestRunChanged(delivered.run))
         if delivered.dataset_id is not None:
-            publish(DatasetChanged(delivered.dataset_id, DatasetChange.UPDATED))
+            publish(DatasetChanged(delivered.dataset_id, delivered.change))
         log.info(
             f'Delivery of attempt {attempt.header.attempt_no} of request {request_id} '
             f'({attempt.trailer.outcome}) answered {delivered.response.verdict} at count {delivered.response.attempt_count}'
@@ -519,7 +624,7 @@ class DeliveryIntake:
         validate_report(attempt, request.kind)
         if trailer.outcome is DeliveryOutcome.FAILED and trailer.vendor_stats is None:
             # Accepted (rule h), but the spend is unknown, never zero: the attempt row keeps its vendor columns NULL
-            # and the request's sums add 0. P34c adds the counter that says so.
+            # and the request's sums add 0. The request's spend_unknown_attempts counter (step 6) says so.
             log.warning(
                 f'Attempt {header.attempt_no} of request {request_id} failed with no vendor stats: spend unknown'
             )
@@ -527,17 +632,30 @@ class DeliveryIntake:
         # 4. The data, through the kind's arm. Only a success carries any.
         bars_written = 0
         has_records = False
+        dropped = False
+        context = ArmContext(db, request, attempt, self._chunk_size)
         if trailer.outcome is DeliveryOutcome.SUCCEEDED:
-            bars_written = await ARMS[request.kind](ArmContext(db, request, attempt, self._chunk_size))
-            has_records = _carries_records(attempt.parts)
+            try:
+                bars_written = await ARMS[request.kind](context)
+                has_records = _carries_records(attempt.parts)
+            except DatasetDropped:
+                # The dataset is gone or stopped: nothing was written (the arm judged it first, under the entry lock).
+                dropped = True
+                log.warning(f'Delivery for request {request_id} dropped: its dataset was deleted or stopped')
+        dataset_id = context.effects.dataset_id
+        if dataset_id is not None and request.dataset_id is None:
+            # The first delivered attempt created or matched the entry: the attempt row names it too.
+            request = replace(request, dataset_id=dataset_id)
 
-        decision = decide(attempt, bars_written=bars_written, has_records=has_records, superseded=superseded)
+        decision = decide(
+            attempt, bars_written=bars_written, has_records=has_records, superseded=superseded, dropped=dropped
+        )
         counted = trailer.outcome not in _NO_CALL
 
         # 5. The attempt row, for an attempt that made a vendor call.
         run: IngestRunRecord | None = None
         if counted:
-            run = await insert_attempt(db, self._attempt_row(request, attempt, decision, bars_written))
+            run = await insert_attempt(db, self._attempt_row(request, attempt, decision, bars_written, dropped))
             if run is None:
                 # The arbiter index held the attempt although the lookup above did not: not reachable under the lock.
                 # Roll everything back rather than count an attempt twice; the redelivery is answered as a duplicate.
@@ -553,9 +671,15 @@ class DeliveryIntake:
             pages=stats.pages if stats else 0,
             throttled_429=stats.throttled_429 if stats else 0,
             retries=stats.retries if stats else 0,
+            # A counted FAILED report with no stats (the only counted report that may carry none): spend unknown.
+            spend_unknown=1 if counted and stats is None else 0,
             state=decision.state if is_final_for_open else None,
             failure_cause=decision.cause if is_final_for_open else None,
-            failure_detail=(trailer.detail or None) if is_final_for_open and decision.cause is not None else None,
+            failure_detail=(
+                (decision.detail or trailer.detail or None)
+                if is_final_for_open and decision.cause is not None
+                else None
+            ),
             queued_by=(
                 header.instance_id if request.state.is_open and decision.state is None and not superseded else None
             ),
@@ -566,20 +690,34 @@ class DeliveryIntake:
         return _Delivered(
             DeliverAttemptResponse(verdict=verdict, attempt_count=updated.attempts),
             run=run,
-            dataset_id=request.dataset_id if bars_written > 0 else None,
+            # A dropped delivery touched no dataset; any other resolved one is announced (a zero-bar success included).
+            dataset_id=None if dropped else dataset_id,
+            change=_change_kind(context.effects.collect_flip),
         )
 
     @staticmethod
     def _stored_answer(verdict: str | None, request: IngestRequestRecord) -> DeliverAttemptResponse:
-        """Repeat the answer the stored attempt row recorded, with the request's durable count."""
+        """Repeat the answer the stored attempt row recorded, with the request's durable count.
+
+        A stored CONTINUE is answered FINAL once the request is no longer open (a later attempt, or another instance,
+        finished it): a late redelivery of an earlier attempt must not make ingest act on a stale CONTINUE. The stored
+        row is not changed.
+        """
         if verdict is None:
             # An attempt row without a verdict was not written by this intake. Never guess an acknowledgement.
             raise RuntimeError('the stored attempt carries no verdict')
-        return DeliverAttemptResponse(verdict=DeliveryVerdict(verdict), attempt_count=request.attempts)
+        answer = DeliveryVerdict(verdict)
+        if not request.state.is_open:
+            answer = DeliveryVerdict.FINAL
+        return DeliverAttemptResponse(verdict=answer, attempt_count=request.attempts)
 
     @staticmethod
     def _attempt_row(
-        request: IngestRequestRecord, attempt: AttemptDelivery, decision: Decision, bars_written: int
+        request: IngestRequestRecord,
+        attempt: AttemptDelivery,
+        decision: Decision,
+        bars_written: int,
+        dropped: bool = False,
     ) -> NewAttempt:
         """The attempt row for a SUCCEEDED or FAILED report.
 
@@ -593,7 +731,7 @@ class DeliveryIntake:
         else:
             state = (
                 IngestRunState.SUCCEEDED
-                if bars_written > 0 or _carries_records(attempt.parts)
+                if bars_written > 0 or (_carries_records(attempt.parts) and not dropped)
                 else IngestRunState.EMPTY
             )
         return NewAttempt(
@@ -603,7 +741,8 @@ class DeliveryIntake:
             quota_key=header.quota_key or None,
             verdict=verdict.value,
             state=state,
-            trigger=IngestRunTrigger.REQUEST if request.attempts == 0 else IngestRunTrigger.RETRY,
+            # The first attempt carries what started the request (NULL reads as REQUEST); every later one is a retry.
+            trigger=(request.trigger or IngestRunTrigger.REQUEST) if request.attempts == 0 else IngestRunTrigger.RETRY,
             bars_written=bars_written,
             feed=header.feed,
             stats=stats,
@@ -613,6 +752,9 @@ class DeliveryIntake:
             error_message=(trailer.detail or None) if state is IngestRunState.FAILED else None,
             label=_label_for(request),
             vendor_asset_id=header.vendor_asset_id or None,
+            # Rule (d) already limits a served range to a SUCCEEDED report; it is stored on that attempt row only.
+            served_start=trailer.served_range.start if trailer.served_range is not None else None,
+            served_end=trailer.served_range.end if trailer.served_range is not None else None,
         )
 
 
@@ -626,4 +768,13 @@ def _carries_records(parts: list[DeliveryPayload]) -> bool:
     return False
 
 
-__all__ = ['ARMS', 'ArmContext', 'Decision', 'DeliveryIntake', 'decide', 'validate_report']
+__all__ = [
+    'ARMS',
+    'ArmContext',
+    'ArmEffects',
+    'DatasetDropped',
+    'Decision',
+    'DeliveryIntake',
+    'decide',
+    'validate_report',
+]

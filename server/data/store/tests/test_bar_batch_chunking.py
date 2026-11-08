@@ -46,10 +46,11 @@ know it would reject, and that a partial failure cannot leave data behind.
 import importlib.metadata
 import importlib.util
 import logging
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy.dialects import postgresql
@@ -57,8 +58,9 @@ from sqlalchemy.dialects.postgresql import Insert
 from sqlalchemy.exc import OperationalError
 
 from common.enums.data_select import AssetType, DataType
-from common.enums.data_stock import DataSource, Feed, Granularity
+from common.enums.data_stock import DataSource, Feed, Granularity, UpdateType
 from common.errors.vocabulary import ExogenousError, Reason
+from data.store.app.database.crud.ingest_request import IngestRequestRecord
 from data.store.app.database.crud.stock.asset_market_activity import (
     ASYNCPG_LIMIT_VERIFIED_VERSION,
     ASYNCPG_MAX_QUERY_ARGUMENTS,
@@ -68,11 +70,12 @@ from data.store.app.database.crud.stock.asset_market_activity import (
     batch_create_market_activity_data,
     build_market_activity_upsert,
 )
+from data.store.app.database.models.ingest_request import IngestRequestKind, IngestRequestState
+from data.store.app.database.models.ingest_run import IngestRunTrigger
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.transaction import write_transaction
-from data.store.app.ingest import data_action_request
-from data.store.tests.fetch_double import FetchScript, RecordingFetchClient, accepted_stream
-from schemas.data_store.asset_dataset_store import StoreAssetDatasetBody, StoreAssetDatasetPath
+from data.store.app.ingest import delivery_intake
+from data.store.tests.delivery_reports import INSTANCE_A, bar_page, report
 from schemas.data_store.stock.market_activity_data import (
     BatchStockDataMarketActivityCreate,
     StockDataMarketActivityData,
@@ -863,90 +866,110 @@ async def test_an_empty_batch_touches_nothing(session, call_order: list[str], da
 # caller still passing nothing.
 
 
-def _overlap_free_session() -> AsyncMock:
-    """A session whose only answer is "this request overlaps nothing".
-
-    The worker opens its transaction and runs the hoisted own-overlap SELECT itself before it
-    reaches any collaborator (tj-hywf7w), so the case below cannot hand it a session that answers
-    nothing. It needs exactly one real answer and never reads a second: ``_find_own_overlap`` calls
-    ``result.all()`` and takes the first column of each row, so an empty list is no overlap. commit
-    and rollback are plain AsyncMocks because this file's subject is the chunk size, not the
-    transaction -- test_dataset_fetch_transaction.py owns what the worker commits and when.
-
-    Returns:
-        AsyncMock: The session, usable wherever the worker takes a ``db``.
-    """
-    db = AsyncMock()
-    db.execute = AsyncMock(return_value=MagicMock(all=MagicMock(return_value=[])))
-    return db
+def _refresh_request(request_id: UUID, dataset_id: UUID) -> IngestRequestRecord:
+    """An open bars request that already names its dataset: the shape the DAILY loop writes (tj-7zjov1.28)."""
+    return IngestRequestRecord(
+        id=request_id,
+        kind=IngestRequestKind.BARS,
+        source=DataSource.ALPACA_API,
+        dataset_id=dataset_id,
+        asset_symbol='AAPL',
+        asset_type=AssetType.STOCK,
+        data_types=(DataType.MARKET_ACTIVITY.value,),
+        granularity=Granularity.ONE_DAY,
+        update_type=UpdateType.DAILY,
+        feed=Feed.IEX,
+        requested_start=FIRST_TIMESTAMP,
+        requested_end=None,
+        ready_by=None,
+        best_effort=False,
+        client_label='scheduler',
+        state=IngestRequestState.QUEUED,
+        instance_id=INSTANCE_A,
+        attempts=0,
+        spent_calls=0,
+        spent_pages=0,
+        spent_throttled_429=0,
+        spent_retries=0,
+        failure_cause=None,
+        failure_detail=None,
+        created_at=FIRST_TIMESTAMP,
+        finished_at=None,
+        trigger=IngestRunTrigger.SCHEDULE,
+    )
 
 
 @pytest.mark.asyncio
-async def test_the_worker_hands_the_configured_batch_size_to_the_write_path(monkeypatch: pytest.MonkeyPatch):
-    """The defect as tj-rpyv5u actually words it: read at line 16 and then never applied.
+async def test_the_intake_hands_the_configured_batch_size_to_the_write_path(monkeypatch: pytest.MonkeyPatch):
+    """The defect as tj-rpyv5u actually words it: read and then never applied.
 
-    WHY THIS IS A SEPARATE TEST AND NOT COVERED BY THE ONES ABOVE. Delete
-    `requested_chunk_size=MARKET_ACTIVITY_BATCH_SIZE` from the call in data_action_request.py and
-    nothing else in this file moves: the crud layer keeps its parameter, keeps its resolver, keeps
-    its loop, and silently falls back to the derived ceiling on every write. The configured setting
-    would once again be read at import and thrown away -- the original bug, restored, with a full
-    green suite over it. The seam between the two files is the thing that was broken, so the seam
-    gets its own assertion.
+    WHY THIS IS A SEPARATE TEST AND NOT COVERED BY THE ONES ABOVE. Drop the chunk size anywhere between the setting
+    and the write path and nothing else in this file moves: the crud layer keeps its parameter, keeps its resolver,
+    keeps its loop, and silently falls back to the derived ceiling on every write. The configured setting would
+    once again be read and thrown away -- the original bug, restored, with a full green suite over it. The seam
+    between the files is the thing that was broken, so the seam gets its own assertion.
 
-    The batch size is monkeypatched to a distinctive in-range value rather than left at its real
-    one. The real one is None in a bare pytest run (nothing sets the environment variable and there
-    is no conftest), and None is also what the parameter defaults to -- so asserting against None
-    would pass against a call that omitted the argument entirely, which is precisely the defect.
+    REPOINTED AT THE DELIVERY INTAKE (validator, tj-7zjov1.28, P35), and the pin is unchanged. The push path moved
+    every bar write off the POST's FetchDataset worker (store_market_activity_worker no longer writes a bar) and into
+    the store's delivery intake: DeliveryIntake reads MARKET_ACTIVITY_BATCH_SIZE when it is built and the bars arm
+    hands it to write_market_activity_in_transaction once per page. The seam is now three links -- the environment
+    to DeliveryIntake, DeliveryIntake to the arm's context, the context to every page's write -- and this case
+    drives deliver() through all three, so cutting any one of them reds it. The setting is set in the ENVIRONMENT,
+    the way the deployment sets it, not on a module constant: the intake reads it, not the import.
 
-    REPOINTED AT THE FetchDataset SEAM (validator, gating tj-3mk3u5.10), and the pin is unchanged.
-    The worker's write collaborator is now ``write_market_activity_in_transaction`` -- the non-
-    committing core, because the worker owns the transaction -- and its data arrives as a stream of
-    pages rather than as one batch from an RPC reply. Neither of those is what this case asserts.
-    It still asserts the ONE seam that was broken in tj-rpyv5u: the configured setting reaching the
-    write path's ``requested_chunk_size``. Deleting that keyword argument from data_action_request
-    .py is still green across every other case in this file.
+    The batch size is a distinctive in-range value rather than the real one. The real one is unset in a bare pytest
+    run, and unset (None) is also what the parameter defaults to -- so asserting against None would pass against a
+    call that omitted the argument entirely, which is precisely the defect.
 
-    THE CHUNK SIZE IS NOW PER PAGE, which is a widening of the claim and not a narrowing: the
-    stream is scripted with TWO pages, so the assertion below reads every call rather than one, and
-    a worker that passed the configured size on the first page and defaulted on the rest would be
-    caught. That shape is reachable now in a way it was not when there was one call per fetch.
+    THE CHUNK SIZE IS PER PAGE: the report carries TWO pages and the assertion reads every call, so an arm that
+    passed the configured size on the first page and defaulted on the rest is caught.
 
-    THE SESSION IS NO LONGER A BARE AsyncMock (validator, gating tj-hywf7w), and the pin is again
-    unchanged. 12e1251 hoists the own-overlap check ahead of the stream, so the worker issues one
-    real statement of its OWN -- a SELECT -- before it reaches either collaborator this case
-    replaces. An ``AsyncMock()`` answers that with a coroutine, which ``_find_own_overlap`` cannot
-    iterate, so the case died on a TypeError rather than on anything it asserts. ``_overlap_free
-    _session()`` below answers the probe with an empty row set and records nothing this case reads.
+    The intake's own statements (the request lock, the duplicate lookup, the entry lock, the attempt row, the
+    request's outcome) are replaced at their crud seam: this file's subject is the chunk size; test_delivery_intake
+    .py owns what the intake writes and when.
 
     Args:
-        monkeypatch: Replaces the module-level setting, already read at import, and the write
-            collaborator on the far side of the call under test.
+        monkeypatch: Sets the environment and replaces the collaborators on the far side of the call under test.
     """
     configured_batch_size = 1234
-    monkeypatch.setattr(data_action_request, 'MARKET_ACTIVITY_BATCH_SIZE', configured_batch_size)
-    monkeypatch.setattr(data_action_request, 'upsert_entry_in_transaction', AsyncMock(return_value=uuid4()))
-    write_path = AsyncMock(return_value=7)
-    monkeypatch.setattr(data_action_request, 'write_market_activity_in_transaction', write_path)
+    monkeypatch.setenv('MARKET_ACTIVITY_BATCH_SIZE', str(configured_batch_size))
+    request_id, dataset_id = uuid4(), uuid4()
 
-    fetch_client = RecordingFetchClient(FetchScript(events=accepted_stream([[0, 1, 2], [3, 4]])))
+    @asynccontextmanager
+    async def own_session():
+        yield AsyncMock()
 
-    written = await data_action_request.store_market_activity_worker(
-        StoreAssetDatasetPath(asset_type=AssetType.STOCK, data_type=DataType.MARKET_ACTIVITY, asset_symbol='AAPL'),
-        StoreAssetDatasetBody(
-            owner='a-strategy', source=DataSource.ALPACA_API, granularity=Granularity.ONE_DAY, start=FIRST_TIMESTAMP
-        ),
-        _overlap_free_session(),
-        fetch_client,
+    @asynccontextmanager
+    async def no_transaction(_db, _name):
+        yield
+
+    monkeypatch.setattr(delivery_intake, 'own_session', own_session)
+    monkeypatch.setattr(delivery_intake, 'write_transaction', no_transaction)
+    monkeypatch.setattr(delivery_intake, 'publish', lambda _event: None)
+    monkeypatch.setattr(delivery_intake, 'note_instance_seen', AsyncMock())
+    monkeypatch.setattr(
+        delivery_intake, 'lock_request', AsyncMock(return_value=_refresh_request(request_id, dataset_id))
+    )
+    monkeypatch.setattr(delivery_intake, 'find_attempt', AsyncMock(return_value=None))
+    monkeypatch.setattr(delivery_intake, 'instance_is_superseded', AsyncMock(return_value=False))
+    monkeypatch.setattr(delivery_intake, 'lock_active_dataset_entry', AsyncMock(return_value=True))
+    monkeypatch.setattr(delivery_intake, 'touch_entry', AsyncMock())
+    monkeypatch.setattr(delivery_intake, 'insert_attempt', AsyncMock(return_value=MagicMock()))
+    monkeypatch.setattr(delivery_intake, 'apply_outcome', AsyncMock(return_value=MagicMock(attempts=1)))
+    write_path = AsyncMock(side_effect=[3, 2])
+    monkeypatch.setattr(delivery_intake, 'write_market_activity_in_transaction', write_path)
+
+    answer = await delivery_intake.DeliveryIntake().deliver(
+        report(request_id, parts=[bar_page(0, 1, 2), bar_page(3, 4)])
     )
 
-    # StoredDataset since TE-6 (tj-3mk3u5.37.8), not a bare int: the served range has to leave the
-    # transaction with the count. What this case asserts is unchanged -- the summed row count.
-    assert written.data_points == 14, 'the worker no longer reports the sum of what the write path stored per page'
-    assert write_path.await_count == 2, 'the two scripted pages did not reach the write path as two calls'
+    assert answer.attempt_count == 1
+    assert write_path.await_count == 2, 'the two delivered pages did not reach the write path as two calls'
     assert [call.kwargs['requested_chunk_size'] for call in write_path.await_args_list] == [
         configured_batch_size,
         configured_batch_size,
     ], (
-        'the worker is not passing MARKET_ACTIVITY_BATCH_SIZE to the write path on every page -- '
+        'the intake is not passing MARKET_ACTIVITY_BATCH_SIZE to the write path on every page -- '
         'the setting is read and discarded again'
     )
+    assert {call.args[1].dataset_id for call in write_path.await_args_list} == {dataset_id}

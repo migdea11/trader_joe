@@ -18,13 +18,20 @@ SQLite has no partial index, no FOR UPDATE, one writer and no Postgres enum or A
       everything: no bars, no attempt row, count, spend and state unchanged;
   PG6 EXPIRED and EXHAUSTED fail the request with their own cause, no attempt row, the count and spend unchanged,
       FINAL; a repeat is FINAL and writes nothing;
-  PG7 C1: a dataset_id naming no entry is refused with nothing written, and an entry deleted by a concurrent
-      transaction that holds its row lock is seen as gone once that transaction commits;
+  PG7 C1, as P35 (tj-7zjov1.28) changed it: a dataset_id naming no entry is DROPPED (nothing stored, the attempt
+      row EMPTY, the request EMPTY with cause DISCARDED, FINAL; a refusal would be redelivered for ever), and an
+      entry deleted by a concurrent transaction that holds its row lock is seen as gone once that transaction
+      commits, and dropped the same way;
   PG8 RegisterInstance A then B supersedes A and marks its QUEUED request NOT_DELIVERED; A's later transient
       FAILED is still written (row, count, spend), leaves the state and is answered FINAL; A's SUCCEEDED then
       finishes the request.
   PG9 P49 (tj-7zjov1.143): the bars header's vendor_asset_id is stored as received in ingest_run.vendor_asset_id
       (PG2 reads it back, PG3 shows a repeat leaves it), and an empty header id is stored NULL, never ''.
+  PG10 P35 ruling A and note H, through the REAL entry upsert (ON CONFLICT ON CONSTRAINT, which SQLite cannot run):
+      a request with no dataset_id creates its entry on the first delivered attempt from the request row (expiry,
+      expiry type, collect) and the header feed; a repeat of the identity matches it and a collect flip publishes
+      RETIRED; a NULL expiry type is refused with nothing written, never BULK.
+  PG11 a delivery for a Stopped subscription (collect false) is dropped like a gone one.
 
 HOW. DeliveryIntake and crud/ingest_delivery.py are driven directly on the test stack's Postgres over asyncpg
 (pg_async_engine), with the intake's own_session pointed at that engine and its publish journalled. The ingest_request
@@ -49,14 +56,20 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from common.enums.data_select import AssetType, DataType
-from common.enums.data_stock import DataSource, Feed, Granularity, UpdateType
+from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from common.errors.vocabulary import InvalidRequestError, Reason
 from data.store.app.database.crud import ingest_delivery
 from data.store.app.database.crud import ingest_request as request_crud
 from data.store.app.database.models.ingest_instance import IngestInstance
-from data.store.app.database.models.ingest_request import IngestRequest, IngestRequestKind, IngestRequestState
+from data.store.app.database.models.ingest_request import (
+    IngestRequest,
+    IngestRequestFailureCause,
+    IngestRequestKind,
+    IngestRequestState,
+)
 from data.store.app.database.models.ingest_run import IngestRun, IngestRunState, IngestRunTrigger
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
+from data.store.app.events import DatasetChange, DatasetChanged
 from data.store.app.ingest import delivery_intake
 from data.store.app.ingest.delivery_intake import DeliveryIntake
 from schemas.data_ingest.delivery import (
@@ -249,29 +262,29 @@ async def _request(
     holder: str,
     dataset_id: uuid.UUID | None,
     state: IngestRequestState = IngestRequestState.QUEUED,
+    **values,
 ) -> uuid.UUID:
-    """A bars request queued under `holder`, as the submit path leaves it."""
+    """A bars request queued under `holder`, as the submit path leaves it. `values` override its row fields."""
     request_id = uuid.uuid4()
     created.requests.append(request_id)
+    fields = {
+        'id': request_id,
+        'kind': IngestRequestKind.BARS,
+        'source': DataSource.ALPACA_API,
+        'client_label': run_identity.owner,
+        'dataset_id': dataset_id,
+        'asset_symbol': symbol,
+        'asset_type': AssetType.STOCK,
+        'data_types': (DataType.MARKET_ACTIVITY.value,),
+        'granularity': Granularity.ONE_DAY,
+        'update_type': UpdateType.DAILY,
+        'feed': Feed.IEX,
+        'requested_start': START,
+        'requested_end': START + timedelta(days=30),
+        **values,
+    }
     async with AsyncSession(engine, expire_on_commit=False) as db:
-        await request_crud.create_request(
-            db,
-            request_crud.NewIngestRequest(
-                id=request_id,
-                kind=IngestRequestKind.BARS,
-                source=DataSource.ALPACA_API,
-                client_label=run_identity.owner,
-                dataset_id=dataset_id,
-                asset_symbol=symbol,
-                asset_type=AssetType.STOCK,
-                data_types=(DataType.MARKET_ACTIVITY.value,),
-                granularity=Granularity.ONE_DAY,
-                update_type=UpdateType.DAILY,
-                feed=Feed.IEX,
-                requested_start=START,
-                requested_end=START + timedelta(days=30),
-            ),
-        )
+        await request_crud.create_request(db, request_crud.NewIngestRequest(**fields))
         await db.execute(sa.update(REQUESTS).where(REQUESTS.c.id == request_id).values(state=state, instance_id=holder))
         await db.commit()
     return request_id
@@ -558,49 +571,187 @@ async def test_pg6_expired_and_exhausted_fail_the_request_with_no_attempt_row_an
 # --------------------------------------------------------------------------------------------- PG7
 
 
-async def test_pg7_bars_for_a_dataset_id_naming_no_entry_are_refused_and_nothing_written(
+async def _assert_dropped(intake: Intake, request_id: uuid.UUID, dataset_id: uuid.UUID, answer) -> None:
+    """The drop rule (P35): FINAL, nothing stored, the attempt row EMPTY, the request EMPTY with cause DISCARDED."""
+    assert answer == DeliverAttemptResponse(verdict=FINAL, attempt_count=1)
+    assert await _bars(intake.engine, dataset_id) == [], 'no bar was written under the gone or stopped entry'
+    (run,) = await _runs(intake.engine, request_id)
+    assert (run.state, run.bars_written, run.verdict) == (IngestRunState.EMPTY, 0, 'FINAL')
+    row = await _request_row(intake.engine, request_id)
+    assert (row.state, row.failure_cause) == (IngestRequestState.EMPTY, IngestRequestFailureCause.DISCARDED.value)
+    assert row.finished_at is not None and row.attempts == 1
+    assert not [event for event in intake.published if isinstance(event, DatasetChanged)], 'a drop announces no dataset'
+
+
+async def test_pg7_bars_for_a_dataset_id_naming_no_entry_are_dropped_and_nothing_stored(
     intake, created, run_identity, own_symbol, instance_id
 ):
+    """P35 turned P34's C1 refusal into the drop: a refusal would be redelivered for ever."""
     holder = instance_id('pg7a')
     await intake.register(holder)
     missing = uuid.uuid4()
     request_id = await _request(intake.engine, created, run_identity, own_symbol, holder=holder, dataset_id=missing)
-    before = await _snapshot(intake.engine, request_id, missing)
 
-    with pytest.raises(InvalidRequestError) as caught:
-        await intake.deliver(report(request_id, instance_id=holder))
+    answer = await intake.deliver(report(request_id, instance_id=holder))
 
-    assert caught.value.reason is Reason.INVALID_REQUEST
-    assert caught.value.detail == 'the dataset this request writes to no longer exists'
-    assert await _snapshot(intake.engine, request_id, missing) == before
+    await _assert_dropped(intake, request_id, missing, answer)
 
 
-async def test_pg7_an_entry_deleted_by_a_concurrent_transaction_is_seen_as_gone_once_it_commits(
+async def test_pg7_an_entry_deleted_by_a_concurrent_transaction_is_seen_as_gone_once_it_commits_and_dropped(
     intake, created, run_identity, bars_entry, instance_id
 ):
+    """A concurrent delete holding the entry lock: the delivery waits, then drops cleanly.
+
+    Bars carry a foreign key to their entry (ON DELETE CASCADE), the backstop; the arm locks the entry FOR UPDATE
+    first, so the delivery waits for the delete, then sees the entry gone and drops cleanly, no FK violation.
+    """
     holder = instance_id('pg7b')
     await intake.register(holder)
     request_id = await _request(
         intake.engine, created, run_identity, bars_entry.asset_symbol, holder=holder, dataset_id=bars_entry.id
     )
-    before_request = tuple(await _request_row(intake.engine, request_id))
 
     # The operator's delete (or the reaper's) holds the entry's row lock, uncommitted, while the delivery arrives.
     async with AsyncSession(intake.engine) as deleter:
         deleter_pid = (await deleter.execute(sa.text('SELECT pg_backend_pid()'))).scalar_one()
         await deleter.execute(sa.text(f'DELETE FROM {ENTRIES_NAME} WHERE id = :id'), {'id': bars_entry.id})  # nosec B608
         delivering = asyncio.create_task(intake.deliver(report(request_id, instance_id=holder)))
-        # Blocked behind the delete, whichever statement it is (the entry lock, or a bar's foreign-key check).
+        # Blocked behind the delete: the entry lock.
         await _wait_until_blocked_by(intake.engine, deleter_pid)
         await deleter.commit()
 
-    with pytest.raises(InvalidRequestError) as caught:
-        await asyncio.wait_for(delivering, LOCK_WAIT_S)
+    answer = await asyncio.wait_for(delivering, LOCK_WAIT_S)
 
-    assert caught.value.detail == 'the dataset this request writes to no longer exists'
-    assert await _bars(intake.engine, bars_entry.id) == [], 'no bar was written under the deleted entry'
-    assert await _runs(intake.engine, request_id) == []
-    assert tuple(await _request_row(intake.engine, request_id)) == before_request
+    await _assert_dropped(intake, request_id, bars_entry.id, answer)
+
+
+async def test_pg11_a_delivery_for_a_stopped_subscription_is_dropped(
+    intake, created, run_identity, insert_entry, own_symbol, instance_id
+):
+    stopped = insert_entry(
+        asset_symbol=own_symbol,
+        granularity=Granularity.ONE_DAY,
+        feed=Feed.IEX,
+        update_type=UpdateType.DAILY.value,
+        expiry_type=ExpiryType.ROLLING.value,
+        collect=False,
+    )
+    holder = instance_id('pg11')
+    await intake.register(holder)
+    request_id = await _request(intake.engine, created, run_identity, own_symbol, holder=holder, dataset_id=stopped.id)
+
+    answer = await intake.deliver(report(request_id, instance_id=holder))
+
+    await _assert_dropped(intake, request_id, stopped.id, answer)
+
+
+# --------------------------------------------------------------------------------------------- PG10
+
+
+async def _entry_of_request(intake: Intake, request_id: uuid.UUID) -> sa.Row:
+    row = await _request_row(intake.engine, request_id)
+    assert row.dataset_id is not None, 'the first delivered attempt set the request dataset_id'
+    async with intake.engine.connect() as conn:
+        return (
+            await conn.execute(sa.text(f'SELECT * FROM {ENTRIES_NAME} WHERE id = :id'), {'id': row.dataset_id})  # nosec B608
+        ).one()
+
+
+async def test_pg10_the_first_delivered_attempt_creates_the_entry_through_the_real_upsert(
+    intake, created, run_identity, own_symbol, instance_id, entry_registry
+):
+    """The first delivered attempt creates the entry through the real upsert; a repeat matches it.
+
+    P35 ruling A and note H: the entry is upserted from the request row (expiry, expiry type, collect) and the
+    header's resolved feed, in the delivery transaction, and the bars land under it; a repeat POST of the same
+    identity matches it, sets expiry from the request and collect only when explicit, and a flip publishes RETIRED.
+    """
+    holder = instance_id('pg10')
+    await intake.register(holder)
+    expiry = START + timedelta(days=400)
+    first = await _request(
+        intake.engine,
+        created,
+        run_identity,
+        own_symbol,
+        holder=holder,
+        dataset_id=None,
+        requested_end=None,
+        expiry=expiry,
+        expiry_type=ExpiryType.ROLLING,
+        collect=None,
+        trigger=IngestRunTrigger.REQUEST,
+    )
+
+    answer = await intake.deliver(report(request_id=first, instance_id=holder))
+
+    assert answer == DeliverAttemptResponse(verdict=FINAL, attempt_count=1)
+    entry = await _entry_of_request(intake, first)
+    entry_registry.add(entry.id)
+    assert (entry.owner, entry.asset_symbol, entry.feed) == (run_identity.owner, own_symbol, Feed.IEX.value)
+    assert (entry.expiry_type, entry.update_type, entry.collect) == (
+        ExpiryType.ROLLING.value,
+        UpdateType.DAILY.value,
+        True,
+    ), 'collect omitted is true for a subscription'
+    assert entry.expiry == expiry
+    assert len(await _bars(intake.engine, entry.id)) == 2
+    (run,) = await _runs(intake.engine, first)
+    assert run.dataset_id == entry.id
+
+    # The same identity again, collect false: the entry is matched, stopped, and the flip is RETIRED.
+    later_expiry = expiry + timedelta(days=30)
+    again = await _request(
+        intake.engine,
+        created,
+        run_identity,
+        own_symbol,
+        holder=holder,
+        dataset_id=None,
+        requested_end=None,
+        expiry=later_expiry,
+        expiry_type=ExpiryType.ROLLING,
+        collect=False,
+        trigger=IngestRunTrigger.REQUEST,
+    )
+    await intake.deliver(report(request_id=again, instance_id=holder, parts=[BarPage(bars=[])]))
+
+    matched = await _entry_of_request(intake, again)
+    assert matched.id == entry.id
+    assert (matched.collect, matched.expiry) == (False, later_expiry)
+    assert DatasetChanged(entry.id, DatasetChange.RETIRED) in intake.published
+
+
+async def test_pg10_a_request_with_no_dataset_and_no_expiry_type_is_refused_and_nothing_written(
+    intake, created, run_identity, own_symbol, instance_id
+):
+    holder = instance_id('pg10b')
+    await intake.register(holder)
+    request_id = await _request(
+        intake.engine,
+        created,
+        run_identity,
+        own_symbol,
+        holder=holder,
+        dataset_id=None,
+        update_type=UpdateType.STATIC,
+        expiry_type=None,
+    )
+    before = await _snapshot(intake.engine, request_id, None)
+
+    with pytest.raises(InvalidRequestError) as caught:
+        await intake.deliver(report(request_id, instance_id=holder))
+
+    assert caught.value.reason is Reason.INVALID_REQUEST and 'expiry type' in caught.value.detail
+    assert await _snapshot(intake.engine, request_id, None) == before
+    async with intake.engine.connect() as conn:
+        count = (
+            await conn.execute(
+                sa.text(f'SELECT count(*) FROM {ENTRIES_NAME} WHERE asset_symbol = :symbol'),  # nosec B608
+                {'symbol': own_symbol},
+            )
+        ).scalar_one()
+    assert count == 0, 'no entry, BULK or otherwise'
 
 
 # --------------------------------------------------------------------------------------------- PG8

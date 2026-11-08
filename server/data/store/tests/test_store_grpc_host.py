@@ -83,6 +83,7 @@ class _Order:
 
         monkeypatch.setattr(app_depends, '__INGEST_CHANNEL', None)
         monkeypatch.setattr(app_depends, '__INGEST_FETCH_CLIENT', None)
+        monkeypatch.setattr(app_depends, '__INGEST_SUBMIT_CLIENT', None)
         monkeypatch.setattr(app_depends, 'database', FakeDatabase())
         monkeypatch.setattr(app_depends, 'SharedWorkerPool', FakePool)
         monkeypatch.setattr(app_depends, 'initialize_latency_client', step('latency_client'))
@@ -99,8 +100,24 @@ class _Order:
             app_depends, 'create_channel', lambda _target: (order.append('channel.open'), FakeChannel())[1]
         )
         monkeypatch.setattr(app_depends, 'GrpcIngestFetchClient', step('fetch_client', object()))
-        monkeypatch.setattr(app_depends, 'start_daily_refresh_loops', async_step('refresh.start', []))
+        # The push path's seam (tj-7zjov1.28): the refresh and the instance watcher are handed this client.
+        self.submit_client = object()
+        self.handed: dict[str, object] = {}
+        monkeypatch.setattr(app_depends, 'GrpcIngestSubmitClient', step('submit_client', self.submit_client))
+
+        async def refresh_start(client):
+            order.append('refresh.start')
+            self.handed['refresh'] = client
+            return []
+
+        def watch_start(client):
+            order.append('watch.start')
+            self.handed['watch'] = client
+
+        monkeypatch.setattr(app_depends, 'start_daily_refresh_loops', refresh_start)
         monkeypatch.setattr(app_depends, 'stop_daily_refresh_loops', async_step('refresh.stop'))
+        monkeypatch.setattr(app_depends, 'start_instance_watch_loop', watch_start)
+        monkeypatch.setattr(app_depends, 'stop_instance_watch_loop', async_step('watch.stop'))
 
 
 class _FakeHost:
@@ -141,10 +158,25 @@ async def test_the_host_is_entered_last_and_exited_first(monkeypatch):
     assert built == ['built']
     assert steps.index('grpc.enter') == steps.index('serving') - 1, 'the host is the last thing entered'
     assert steps.index('grpc.exit') == steps.index('serving') + 1, 'the host is the first thing exited'
-    for before in ('database.initialize', 'sweep', 'usage.start', 'reaper.start', 'channel.open', 'refresh.start'):
+    for before in (
+        'database.initialize',
+        'sweep',
+        'usage.start',
+        'reaper.start',
+        'channel.open',
+        'submit_client',
+        'refresh.start',
+        'watch.start',
+    ):
         assert steps.index(before) < steps.index('grpc.enter'), before
-    for after in ('refresh.stop', 'channel.close', 'reaper.stop', 'usage.stop', 'database.shutdown'):
+    for after in ('watch.stop', 'refresh.stop', 'channel.close', 'reaper.stop', 'usage.stop', 'database.shutdown'):
         assert steps.index('grpc.exit') < steps.index(after), after
+    # The loops that submit are built on the channel's client and stop before the channel closes.
+    assert steps.index('channel.open') < steps.index('submit_client') < steps.index('refresh.start')
+    assert steps.index('watch.stop') < steps.index('channel.close')
+    assert steps.index('refresh.stop') < steps.index('channel.close')
+    assert order.handed == {'refresh': order.submit_client, 'watch': order.submit_client}
+    assert app_depends.get_ingest_submit_client() is order.submit_client
 
 
 async def test_the_host_is_built_before_anything_starts(monkeypatch):

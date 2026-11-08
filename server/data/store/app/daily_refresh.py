@@ -71,7 +71,7 @@ from common.enums.data_stock import DataSource, Granularity, UpdateType
 from common.environment import get_env_var
 from common.errors.vocabulary import ERROR_DOMAIN, REASONS, Outcome, TraderJoeError
 from common.logging import get_logger
-from common.rpc.clients.ingest_fetch import IngestFetchClient
+from common.rpc.clients.ingest_submit import IngestSubmitClient
 from common.scheduling import AfterTradingEvent, TradingEvent, run_periodic
 from data.store.app.completeness import next_period_start, period_start
 from data.store.app.database.crud.ingest_run import IngestRunRecord, finished_scheduled_runs, running_dataset_ids
@@ -83,10 +83,10 @@ from data.store.app.database.crud.stock.dataset_catalog import (
     recent_placeholder_bars,
 )
 from data.store.app.database.database import own_session
+from data.store.app.database.models.ingest_request import IngestRequestFailureCause
 from data.store.app.database.models.ingest_run import IngestRun, IngestRunState, IngestRunTrigger
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.dataset_catalog import effective_end, is_retired
-from data.store.app.events import DatasetChange, DatasetChanged, publish
 from data.store.app.health import (
     DEFAULT_SETTLE_MINUTES as DEFAULT_SETTLE_MINUTES,  # the refresh's setting, defined once in health and re-exported
 )
@@ -100,8 +100,7 @@ from data.store.app.health import (
     settle_margin_from_env,
     written_before_its_stamp,
 )
-from data.store.app.ingest.data_action_request import DatasetRetiredDuringFetch, store_market_activity_worker
-from data.store.app.ingest.run_recording import recorded_run
+from data.store.app.ingest.data_action_request import submit_bars
 from data.store.app.trading_calendar import (
     SOURCE_CALENDARS,
     CalendarRangeError,
@@ -404,10 +403,12 @@ def _unproductive(run: IngestRunRecord, fetch_start: datetime) -> bool:
         return False
     if run.state is IngestRunState.EMPTY:
         return True
-    return (
-        run.state is IngestRunState.FAILED
-        and run.error_domain == ERROR_DOMAIN
-        and run.error_reason in PERMANENT_REASONS
+    if run.state is not IngestRunState.FAILED:
+        return False
+    # A typed refusal of the legacy run record, or a request the vendor refused for good (its failure cause, read
+    # with the run: an attempt row carries only the sentence, not a typed reason).
+    return (run.error_domain == ERROR_DOMAIN and run.error_reason in PERMANENT_REASONS) or (
+        run.request_failure_cause == IngestRequestFailureCause.PERMANENT
     )
 
 
@@ -537,7 +538,6 @@ class PassResult:
     deferred: int = 0  # behind and due, but not requested: over the cap, or the pass stopped early
     refused: int = 0  # requested and permanently refused this pass; not tried again before the next close
     skipped: int = 0  # not requested: empty or refused at their last attempt since the last close, or invalid
-    discarded: int = 0  # retired or deleted while the vendor call was in flight; the answer was dropped
 
 
 @dataclass(frozen=True)
@@ -567,22 +567,25 @@ class _Planned:
 
 
 class DailyRefresher:
-    """One source's refresh pass, over the fetch client the lifespan built.
+    """One source's refresh pass, over the Submit client the lifespan built.
+
+    The pass WRITES AND SUBMITS a request per owed dataset and does not wait for it: the result is pushed to the
+    store's delivery service, which writes the bars; a dataset with an open request is not owed again.
 
     Args:
-        fetch_client: The FetchDataset seam, as the interface.
+        client: The Submit seam, as the interface.
         clock: The current aware instant.
         sleep: Sleeps for seconds; injected so a test does not wait out a backoff.
     """
 
     def __init__(
         self,
-        fetch_client: IngestFetchClient,
+        client: IngestSubmitClient,
         *,
         clock: Callable[[], datetime] = _utc_now,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
-        self._client = fetch_client
+        self._client = client
         self._clock = clock
         self._sleep = sleep
 
@@ -610,12 +613,13 @@ class DailyRefresher:
         tails = await _read_placeholder_tails(owed, calendar)
         due, skipped = self._plan(owed, history, _last_close(calendar, now), calendar, tails, now)
         batch = self._take(due, max_per_pass())
-        refreshed = failed = refused = discarded = 0
+        refreshed = failed = refused = 0
         deferred = len(due[0]) + len(due[1]) - len(batch)
         consecutive = 0
+        ready_by = next_market_open(calendar, now)
         for position, planned in enumerate(batch):
             try:
-                kept = await self._refresh(planned)
+                await self._refresh(planned, ready_by)
             except Exception as error:
                 if is_permanent(error):
                     # Cannot succeed on retry, and the peer answered: no stop, no backoff.
@@ -635,27 +639,16 @@ class DailyRefresher:
                 await self._sleep(min(backoff_base_seconds() * 2 ** (consecutive - 1), BACKOFF_CAP_SECONDS))
                 continue
             consecutive = 0
-            if kept:
-                refreshed += 1
-            else:
-                discarded += 1
+            refreshed += 1
         if skipped:
             log.info(f'Daily refresh: {skipped} dataset(s) not requested: refused or empty since the last close')
-        if discarded:
-            log.warning(f'Daily refresh: {discarded} answer(s) dropped, the dataset was retired during the fetch')
         if owed:
             log.info(
-                f'Daily refresh: {len(owed)} dataset(s) behind, {refreshed} refreshed, {failed} failed, '
+                f'Daily refresh: {len(owed)} dataset(s) behind, {refreshed} requested, {failed} failed, '
                 f'{refused} refused, {deferred} left for the next pass'
             )
         return PassResult(
-            behind=len(owed),
-            refreshed=refreshed,
-            failed=failed,
-            deferred=deferred,
-            refused=refused,
-            skipped=skipped,
-            discarded=discarded,
+            behind=len(owed), refreshed=refreshed, failed=failed, deferred=deferred, refused=refused, skipped=skipped
         )
 
     @staticmethod
@@ -765,45 +758,64 @@ class DailyRefresher:
         owed.sort(key=lambda row: (row.last_bar or row.start, str(row.id)))
         return owed
 
-    async def _refresh(self, planned: _Planned) -> bool:
-        """Fetch one dataset's missing tail through the store's own fetch path, recorded as a SCHEDULE run.
+    async def _refresh(self, planned: _Planned, ready_by: datetime | None) -> None:
+        """Write and submit one dataset's missing-tail request, trigger SCHEDULE, and do not wait for it.
 
-        Returns:
-            bool: True when the answer was stored; False when the dataset was retired (or deleted) during the
-            fetch and the answer was dropped. That run is recorded EMPTY with no bars, never FAILED.
+        The request names the dataset (dataset_id), so the first delivered attempt refreshes that entry and never
+        writes a lifecycle field; a dataset stopped or deleted before the delivery lands has the answer DROPPED by
+        the intake (the request finishes EMPTY, cause DISCARDED). Its deadline is the next market open.
+
+        Args:
+            planned: The dataset, its request and its tail.
+            ready_by: The next market open, or None when the calendar has none to name.
+
+        Raises:
+            TraderJoeError: A refusal or a failed call; a permanent one is counted by the pass, a transient one backs
+                it off. A request whose call failed stays PENDING for the instance watcher.
         """
-        path, body = planned.path, planned.body
-        async with recorded_run(
-            path, body, trigger=IngestRunTrigger.SCHEDULE, actor=SCHEDULER_ACTOR, requested_start=planned.fetch_start
-        ) as run:
-            try:
-                async with own_session() as session:
-                    stored = await store_market_activity_worker(
-                        path,
-                        body,
-                        session,
-                        self._client,
-                        on_ack=run.acknowledge,
-                        fetch_start=planned.fetch_start,
-                        preserve_lifecycle=True,
-                    )
-            except DatasetRetiredDuringFetch:
-                await run.succeed(0)
-                return False
-            await run.succeed(stored.data_points)
-        # After the fetch's commit, never inside it.
-        if run.dataset_id is not None:
-            publish(DatasetChanged(run.dataset_id, DatasetChange.UPDATED))
-        return True
+        async with own_session() as session:
+            await submit_bars(
+                planned.path,
+                planned.body,
+                session,
+                self._client,
+                trigger=IngestRunTrigger.SCHEDULE,
+                client_label=SCHEDULER_ACTOR,
+                start=planned.fetch_start,
+                ready_by=ready_by,
+                dataset_id=planned.row.id,
+            )
 
 
-async def start_daily_refresh_loops(fetch_client: IngestFetchClient) -> list[asyncio.Task[None]]:
+def next_market_open(calendar: TradingCalendar, now: datetime) -> datetime | None:
+    """The open of the first session that starts after `now`: the DAILY loop's ready_by (ADR addendum 2026-10-24 (1) 3).
+
+    Args:
+        calendar: The source's trading calendar.
+        now: The current aware instant.
+
+    Returns:
+        datetime | None: The open, or None when the calendar cannot name one (a deadline-free request then).
+    """
+    try:
+        base = calendar.session_in_progress(now) or calendar.last_completed_session(now)
+        if base is None:
+            return None
+        session = calendar.next_session(base)
+        while calendar.session_open(session) <= now:
+            session = calendar.next_session(session)
+        return calendar.session_open(session)
+    except CalendarRangeError:
+        return None
+
+
+async def start_daily_refresh_loops(client: IngestSubmitClient) -> list[asyncio.Task[None]]:
     """Start one refresh loop per source that has a calendar. Call from the running loop, after the client exists.
 
     Each loop's first pass runs at once (the catch-up), then at every session close plus the settle delay.
 
     Args:
-        fetch_client: The seam the refresh fetches through.
+        client: The seam the refresh submits through.
 
     Returns:
         list[asyncio.Task[None]]: The tasks, for stop_daily_refresh_loops; empty when DAILY_REFRESH_ENABLED is off.
@@ -811,7 +823,7 @@ async def start_daily_refresh_loops(fetch_client: IngestFetchClient) -> list[asy
     if not is_enabled():
         log.info(f'Daily refresh is off ({ENABLED_ENV}); DAILY datasets are not refreshed by the store')
         return []
-    refresher = DailyRefresher(fetch_client)
+    refresher = DailyRefresher(client)
     tasks: list[asyncio.Task[None]] = []
     for source in SOURCE_CALENDARS:
         # Building a calendar is slow (cached after the first): off the event loop.

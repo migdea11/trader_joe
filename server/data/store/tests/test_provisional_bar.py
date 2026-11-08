@@ -1258,6 +1258,11 @@ async def test_a_pass_re_fetches_a_provisional_newest_bar_inclusively_and_once(w
     (request,) = [r for r in client.requests if world.name_of(r.asset_symbol) == 'fresh']
     assert request.start == LAST_BAR['fresh'], 'the provisional bar itself is not in the tail'
     assert result == PassResult(behind=5, refreshed=5)
+    # The REQUEST ROW is the refresh's record since the push path (tj-7zjov1.28): the pass writes it and submits, and
+    # an attempt row exists only once ingest delivers (world.deliver), carrying the request's window.
+    stored = await world.request_of('fresh')
+    assert stored.requested_start == LAST_BAR['fresh']
+    await world.deliver('fresh')
     (run,) = [run for run in await world.runs() if run.dataset_id == world.rows['fresh'].id]
     assert run.requested_start == LAST_BAR['fresh']
 

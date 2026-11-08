@@ -58,7 +58,9 @@ BAR_IDENTITY_REVISION = 'eec8f88a7443'
 # e5c8b1d4f703 since tj-grna9p.176: store_dataset_entry.collect, an entry column outside the bar entirely.
 # a6d3f8e1c205 since tj-grna9p.183: override_action gains SET_COLLECTING, an enum value on the audit log only.
 # f2b7d4a91c36 since tj-7zjov1.25: ingest_request and ingest_instance, and attempt columns on ingest_run only.
-CURRENT_HEAD = 'f2b7d4a91c36'
+# b8e4c1f7a923 since tj-7zjov1.123: push-path columns on ingest_run, ingest_request and the entry, none on the bar.
+# 39c28a39b290 since tj-7zjov1.153: ingest_request.expiry_type, a request column, none on the bar.
+CURRENT_HEAD = '39c28a39b290'
 
 # The natural key as 8f41c2d7a3b9 itself declares it, written out as a HISTORIC LITERAL rather
 # than read off BaseMarketActivity. A past revision's job is to describe the schema as it was;

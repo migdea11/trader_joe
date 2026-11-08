@@ -84,6 +84,9 @@ class NewAttempt:
     label: AttemptLabel
     # The header's vendor asset id, stored as received. None when the header named none (never an empty string).
     vendor_asset_id: str | None = None
+    # The window a SUCCEEDED attempt answered for (the trailer's served range); None on any other attempt.
+    served_start: datetime | None = None
+    served_end: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -100,6 +103,8 @@ class RequestOutcome:
     pages: int = 0
     throttled_429: int = 0
     retries: int = 0
+    # Counted attempts that carried no vendor stats (their cost is in none of the sums above).
+    spend_unknown: int = 0
     # A terminal state to move the request to, with its cause and detail for FAILED. None leaves the state alone.
     state: IngestRequestState | None = None
     failure_cause: IngestRequestFailureCause | None = None
@@ -226,6 +231,8 @@ async def insert_attempt(db: AsyncSession, attempt: NewAttempt) -> IngestRunReco
         'started_at': attempt.started_at if attempt.started_at is not None else func.now(),
         'finished_at': attempt.finished_at if attempt.finished_at is not None else func.now(),
         'vendor_asset_id': attempt.vendor_asset_id,
+        'served_start': attempt.served_start,
+        'served_end': attempt.served_end,
     }
     if stats is not None:
         values.update(
@@ -271,6 +278,7 @@ async def apply_outcome(db: AsyncSession, request_id: uuid.UUID, outcome: Reques
         'spent_pages': table.c.spent_pages + outcome.pages,
         'spent_throttled_429': table.c.spent_throttled_429 + outcome.throttled_429,
         'spent_retries': table.c.spent_retries + outcome.retries,
+        'spend_unknown_attempts': table.c.spend_unknown_attempts + outcome.spend_unknown,
     }
     if outcome.state is not None:
         values.update(
@@ -283,3 +291,54 @@ async def apply_outcome(db: AsyncSession, request_id: uuid.UUID, outcome: Reques
         values.update(state=IngestRequestState.QUEUED, instance_id=outcome.queued_by)
     row = (await db.execute(update(table).where(table.c.id == request_id).values(**values).returning(*table.c))).one()
     return IngestRequestRecord.from_row(row)
+
+
+async def lock_active_dataset_entry(db: AsyncSession, dataset_id: uuid.UUID) -> bool:
+    """Whether the entry exists AND is not stopped, holding its row FOR UPDATE until the caller's transaction ends.
+
+    The bars arm's drop rule (P35): a delivery for a deleted entry, or for a DAILY or STREAM entry whose collect is
+    false (the operator's Stop), is dropped, never stored. The retired rule is the one the UI judges by
+    (app/dataset_catalog.is_retired), spelled here because that module imports this layer: collect false on a
+    subscription; the expiry is never read, and a STATIC entry has no intent. The lock is the one the reaper and the
+    operator's delete take, so the judgement and the write that follows it are one step against them.
+
+    Args:
+        db: The caller's session, inside its transaction.
+        dataset_id: The dataset the request writes to.
+
+    Returns:
+        bool: True when the entry exists, is not stopped, and is now locked.
+    """
+    table = StoreDatasetEntry.__table__
+    found = (
+        await db.execute(select(table.c.collect, table.c.update_type).where(table.c.id == dataset_id).with_for_update())
+    ).first()
+    if found is None:
+        return False
+    return not (found.collect is False and UpdateType(found.update_type) in (UpdateType.DAILY, UpdateType.STREAM))
+
+
+async def set_request_dataset(db: AsyncSession, request_id: uuid.UUID, dataset_id: uuid.UUID) -> None:
+    """Record on the request the dataset its first delivered attempt created or matched.
+
+    Args:
+        db: The caller's session, inside its transaction, with the request row locked.
+        request_id: The request.
+        dataset_id: The entry the delivery transaction wrote.
+    """
+    table = IngestRequest.__table__
+    await db.execute(update(table).where(table.c.id == request_id).values(dataset_id=dataset_id))
+
+
+async def touch_entry(db: AsyncSession, dataset_id: uuid.UUID) -> None:
+    """Set the entry's updated_at to the transaction start and change nothing else: the refresh's only entry write.
+
+    The refresh never writes a lifecycle field (expiry, collect, stopped_cause), so an operator's choice is never
+    undone; updated_at is the dataset's last-written instant.
+
+    Args:
+        db: The caller's session, inside its transaction, with the entry locked.
+        dataset_id: The entry.
+    """
+    table = StoreDatasetEntry.__table__
+    await db.execute(update(table).where(table.c.id == dataset_id).values(updated_at=func.now()))

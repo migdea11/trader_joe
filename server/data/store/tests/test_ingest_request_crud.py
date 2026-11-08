@@ -9,6 +9,10 @@ THE DESIGN is the bead's acceptance criteria and tj-26jt9w addenda 4 and 5, as t
   * note_instance_seen: a first sighting inserts the instance, supersedes every older one and marks every QUEUED
     request of an older instance NOT_DELIVERED; a repeat only moves last_seen_at; an OLD id arriving late is a
     repeat, so it can never supersede the live one.
+  * P35 (tj-7zjov1.28, notes C and F): mark_queued never queues under an instance that is already superseded;
+    list_pending_before, list_abandoned and claim_abandoned are the instance watcher's reads (NOT_DELIVERED and
+    QUEUED under a superseded instance are one case, only once superseded at or before the cutoff, the count read
+    under the request lock).
 
 TIER. The repositories' real statements over SQLite (aiosqlite), the pattern test_run_recording.py uses. Two things
 SQLite cannot show and tests/system/test_request_record_schema.py shows on Postgres: that note_instance_seen's three
@@ -20,17 +24,19 @@ statements are the repositories' own, built on the model's table.
 import dataclasses
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.sqlite import DATETIME
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from common.enums.data_select import AssetType
-from common.enums.data_stock import DataSource, Feed, Granularity, UpdateType
+from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from data.store.app.database.crud import ingest_instance as instance_crud
 from data.store.app.database.crud import ingest_request as crud
 from data.store.app.database.models.ingest_instance import IngestInstance
@@ -41,6 +47,7 @@ from data.store.app.database.models.ingest_request import (
     IngestRequestKind,
     IngestRequestState,
 )
+from data.store.app.database.models.ingest_run import IngestRunTrigger
 
 
 pytestmark = [pytest.mark.data_store, pytest.mark.asyncio]
@@ -167,6 +174,76 @@ async def test_create_request_commits_a_pending_row_with_the_callers_id_and_ever
     assert committed.client_label == LABEL
 
 
+@pytest.mark.parametrize('trigger', [IngestRunTrigger.SCHEDULE, IngestRunTrigger.REQUEST])
+@pytest.mark.parametrize('collect', [True, False])
+async def test_create_request_stores_and_reads_the_trigger_and_the_lifecycle_fields(db, engine, trigger, collect):
+    """P34c (tj-7zjov1.123): NewIngestRequest maps trigger, expiry and collect, stored as given and read back."""
+    expiry = START + timedelta(days=90, hours=5)
+    record = await crud.create_request(db, _bars(trigger=trigger, expiry=expiry, collect=collect))
+
+    assert (record.trigger, record.expiry, record.collect) == (trigger, expiry, collect)
+    assert record.spend_unknown_attempts == 0
+    committed = await _row(engine, record.id)
+    assert (committed.trigger, committed.expiry, committed.collect) == (trigger, expiry, collect)
+    assert crud.IngestRequestRecord.from_row(committed) == record
+
+
+async def test_a_request_that_names_none_of_them_stores_null_and_counts_no_unknown_spend(db, engine):
+    """NULL trigger reads as REQUEST at the attempt row (the intake's rule), and the record keeps it None."""
+    record = await crud.create_request(db, _bars())
+
+    assert (record.trigger, record.expiry, record.collect, record.spend_unknown_attempts) == (None, None, None, 0)
+    committed = await _row(engine, record.id)
+    assert (committed.trigger, committed.expiry, committed.collect) == (None, None, None)
+    assert committed.spend_unknown_attempts == 0, 'the server default, written by no caller'
+
+
+async def test_from_row_reads_a_stored_trigger_as_the_enum_and_the_unknown_spend_count(db, engine):
+    record = await crud.create_request(db, _bars())
+    await _set(
+        engine, REQUESTS, REQUESTS.c.id == record.id, trigger=IngestRunTrigger.SCHEDULE, spend_unknown_attempts=3
+    )
+
+    read = crud.IngestRequestRecord.from_row(await _row(engine, record.id))
+
+    assert read.trigger is IngestRunTrigger.SCHEDULE
+    assert read.spend_unknown_attempts == 3
+
+
+@pytest.mark.parametrize('expiry_type', [*ExpiryType, None], ids=lambda value: getattr(value, 'name', 'none'))
+async def test_create_request_stores_the_expiry_type_as_its_value_and_get_request_reads_it_back(
+    db, engine, expiry_type
+):
+    """P35r (tj-7zjov1.153): each ExpiryType stored as its integer value, None as NULL; record and re-read equal."""
+    record = await crud.create_request(db, _bars(expiry_type=expiry_type))
+
+    assert record.expiry_type is expiry_type
+    committed = await _row(engine, record.id)
+    assert committed.expiry_type == (None if expiry_type is None else expiry_type.value)
+    assert (await crud.get_request(db, record.id)).expiry_type is expiry_type
+    assert crud.IngestRequestRecord.from_row(committed) == record
+
+
+async def test_a_request_that_names_no_expiry_type_stores_null(db, engine):
+    """The field defaults to None on both dataclasses, so every existing caller writes NULL."""
+    assert crud.NewIngestRequest.__dataclass_fields__['expiry_type'].default is None
+    assert crud.IngestRequestRecord.__dataclass_fields__['expiry_type'].default is None
+    record = await crud.create_request(db, _bars())
+
+    assert record.expiry_type is None
+    assert (await _row(engine, record.id)).expiry_type is None
+
+
+async def test_from_row_reads_a_stored_expiry_type_integer_as_the_enum(db, engine):
+    """Written behind the repository's back, so the mapping in from_row alone turns the integer into the member."""
+    record = await crud.create_request(db, _bars())
+    await _set(engine, REQUESTS, REQUESTS.c.id == record.id, expiry_type=ExpiryType.ROLLING.value)
+
+    read = await crud.get_request(db, record.id)
+
+    assert read.expiry_type is ExpiryType.ROLLING
+
+
 async def test_create_request_mints_an_id_when_the_caller_gives_none(db, engine):
     first = await crud.create_request(db, _bars())
     second = await crud.create_request(db, _bars())
@@ -239,6 +316,200 @@ async def test_mark_queued_leaves_a_queued_or_finished_request_alone(db, engine,
 
 async def test_mark_queued_of_an_unknown_request_is_none(db):
     assert await crud.mark_queued(db, uuid.uuid4(), 'instance-b') is None
+
+
+# P35 (tj-7zjov1.28, architect note F): NEVER QUEUED UNDER A SUPERSEDED INSTANCE. The sighting marks only the rows
+# QUEUED in its own snapshot, so a row queued under an instance that is already superseded would be held by nobody.
+
+
+@pytest.mark.parametrize('state', [IngestRequestState.PENDING, IngestRequestState.NOT_DELIVERED])
+async def test_f_mark_queued_refuses_an_instance_that_is_already_superseded_and_leaves_the_row(db, engine, state):
+    await instance_crud.note_instance_seen(db, 'instance-a')
+    await instance_crud.note_instance_seen(db, 'instance-b')
+    request_id = await _in_state(db, engine, state)
+    before = await _row(engine, request_id)
+
+    assert await crud.mark_queued(db, request_id, 'instance-a') is None
+
+    assert tuple(await _row(engine, request_id)) == tuple(before)
+
+
+@pytest.mark.parametrize('state', [IngestRequestState.PENDING, IngestRequestState.NOT_DELIVERED])
+async def test_f_mark_queued_still_queues_under_the_live_instance_after_a_supersession(db, engine, state):
+    await instance_crud.note_instance_seen(db, 'instance-a')
+    await instance_crud.note_instance_seen(db, 'instance-b')
+    request_id = await _in_state(db, engine, state)
+
+    record = await crud.mark_queued(db, request_id, 'instance-b')
+
+    assert (record.state, record.instance_id) == (IngestRequestState.QUEUED, 'instance-b')
+
+
+async def test_f_mark_queued_under_an_instance_the_marker_does_not_hold_queues(db, engine):
+    """An instance the marker does not hold is not superseded.
+
+    Only a SUPERSEDED instance is refused; an id never sighted is not superseded (the submit path notes it first, so
+    this is the guard's other edge, not a path the store takes).
+    """
+    request_id = await _in_state(db, engine, IngestRequestState.PENDING)
+
+    record = await crud.mark_queued(db, request_id, 'instance-never-seen')
+
+    assert (record.state, record.instance_id) == (IngestRequestState.QUEUED, 'instance-never-seen')
+
+
+# --------------------------------------------------------------------------------------------- the watcher's reads
+
+T0 = datetime(2026, 3, 1, 12, tzinfo=UTC)
+
+
+async def _created_at(engine: AsyncEngine, request_id: uuid.UUID, at: datetime) -> None:
+    await _set(engine, REQUESTS, REQUESTS.c.id == request_id, created_at=at)
+
+
+async def test_list_pending_before_reads_only_pending_rows_older_than_the_cutoff_oldest_first(db, engine):
+    old = await _in_state(db, engine, IngestRequestState.PENDING)
+    older = await _in_state(db, engine, IngestRequestState.PENDING)
+    at_cutoff = await _in_state(db, engine, IngestRequestState.PENDING)
+    young = await _in_state(db, engine, IngestRequestState.PENDING)
+    queued = await _in_state(db, engine, IngestRequestState.QUEUED)
+    not_delivered = await _in_state(db, engine, IngestRequestState.NOT_DELIVERED)
+    for request_id, at in (
+        (old, T0 - timedelta(seconds=40)),
+        (older, T0 - timedelta(minutes=5)),
+        (at_cutoff, T0),
+        (young, T0 + timedelta(seconds=1)),
+        (queued, T0 - timedelta(hours=1)),
+        (not_delivered, T0 - timedelta(hours=1)),
+    ):
+        await _created_at(engine, request_id, at)
+
+    listed = await crud.list_pending_before(db, T0)
+
+    assert [record.id for record in listed] == [older, old], 'strictly before the cutoff, PENDING only, oldest first'
+
+
+async def _held(
+    db: AsyncSession, engine: AsyncEngine, state: IngestRequestState, instance_id: str | None, **values
+) -> uuid.UUID:
+    request_id = await _in_state(db, engine, state)
+    await _set(engine, REQUESTS, REQUESTS.c.id == request_id, instance_id=instance_id, **values)
+    return request_id
+
+
+async def _instances(db: AsyncSession, engine: AsyncEngine, superseded: dict[str, datetime | None]) -> None:
+    for instance_id in superseded:
+        await instance_crud.note_instance_seen(db, instance_id)
+    for instance_id, at in superseded.items():
+        await _set(engine, INSTANCES, INSTANCES.c.instance_id == instance_id, superseded_at=at)
+
+
+async def test_f_list_abandoned_reads_not_delivered_and_queued_under_an_instance_superseded_by_the_cutoff(db, engine):
+    """Abandoned is NOT_DELIVERED or QUEUED under an instance superseded by the cutoff.
+
+    NOT_DELIVERED and QUEUED-under-a-superseded-instance are one case (note F), but only once the supersession is at
+    or before the cutoff (ruling C: the delivery deadline plus a margin).
+    """
+    await _instances(
+        db,
+        engine,
+        {'old': T0 - timedelta(minutes=5), 'recent': T0 + timedelta(seconds=1), 'at-cutoff': T0, 'live': None},
+    )
+    not_delivered = await _held(db, engine, IngestRequestState.NOT_DELIVERED, 'old', created_at=T0 - timedelta(hours=2))
+    queued_old = await _held(db, engine, IngestRequestState.QUEUED, 'old', created_at=T0 - timedelta(hours=1))
+    queued_at_cutoff = await _held(db, engine, IngestRequestState.QUEUED, 'at-cutoff', created_at=T0)
+    no_holder = await _held(db, engine, IngestRequestState.NOT_DELIVERED, None, created_at=T0 - timedelta(hours=3))
+    # Not abandoned: superseded too recently, held by the live instance, finished, pending, or queued with no holder.
+    await _held(db, engine, IngestRequestState.NOT_DELIVERED, 'recent')
+    await _held(db, engine, IngestRequestState.QUEUED, 'recent')
+    await _held(db, engine, IngestRequestState.QUEUED, 'live')
+    await _held(db, engine, IngestRequestState.SUCCEEDED, 'old')
+    await _held(db, engine, IngestRequestState.FAILED, 'old')
+    await _held(db, engine, IngestRequestState.PENDING, 'old')
+    await _held(db, engine, IngestRequestState.QUEUED, None)
+
+    listed = await crud.list_abandoned(db, T0)
+
+    assert listed == [no_holder, not_delivered, queued_old, queued_at_cutoff]
+
+
+async def test_f_claim_abandoned_moves_a_queued_row_under_a_superseded_instance_to_not_delivered_with_its_count(
+    db, engine
+):
+    await _instances(db, engine, {'old': T0 - timedelta(minutes=5)})
+    request_id = await _held(db, engine, IngestRequestState.QUEUED, 'old', attempts=3)
+
+    record = await crud.claim_abandoned(db, request_id, T0)
+
+    assert (record.state, record.attempts, record.instance_id) == (IngestRequestState.NOT_DELIVERED, 3, 'old')
+    committed = await _row(engine, request_id)
+    assert (committed.state, committed.attempts) == (IngestRequestState.NOT_DELIVERED, 3), 'the move is committed'
+
+
+@pytest.mark.parametrize('holder', ['old', None], ids=['superseded-holder', 'no-holder'])
+async def test_claim_abandoned_returns_a_not_delivered_row_with_its_durable_count(db, engine, holder):
+    await _instances(db, engine, {'old': T0 - timedelta(minutes=5)})
+    request_id = await _held(db, engine, IngestRequestState.NOT_DELIVERED, holder, attempts=2)
+
+    record = await crud.claim_abandoned(db, request_id, T0)
+
+    assert (record.id, record.state, record.attempts) == (request_id, IngestRequestState.NOT_DELIVERED, 2)
+
+
+@pytest.mark.parametrize(
+    ('state', 'holder'),
+    [
+        (IngestRequestState.QUEUED, 'live'),
+        (IngestRequestState.NOT_DELIVERED, 'recent'),
+        (IngestRequestState.QUEUED, 'recent'),
+        (IngestRequestState.QUEUED, None),
+        (IngestRequestState.QUEUED, 'never-seen'),
+        (IngestRequestState.SUCCEEDED, 'old'),
+        (IngestRequestState.PENDING, 'old'),
+    ],
+    ids=['live', 'nd-recent', 'queued-recent', 'queued-no-holder', 'queued-unknown', 'finished', 'pending'],
+)
+async def test_claim_abandoned_is_none_for_a_row_that_is_not_abandoned_and_leaves_it(db, engine, state, holder):
+    """Re-read under the lock: a row taken by a newer instance, finished, or superseded after the cutoff is left."""
+    await _instances(db, engine, {'old': T0 - timedelta(minutes=5), 'recent': T0 + timedelta(seconds=1), 'live': None})
+    request_id = await _held(db, engine, state, holder)
+    before = tuple(await _row(engine, request_id))
+
+    assert await crud.claim_abandoned(db, request_id, T0) is None
+
+    assert tuple(await _row(engine, request_id)) == before
+
+
+async def test_claim_abandoned_of_an_unknown_request_is_none(db):
+    assert await crud.claim_abandoned(db, uuid.uuid4(), T0) is None
+
+
+async def test_claim_abandoned_reads_the_row_for_update(monkeypatch):
+    """claim_abandoned reads the request row FOR UPDATE.
+
+    The count is read UNDER THE REQUEST LOCK (ruling C), so the old instance's last report has committed or is
+    refused for ever; the race itself is tests/system/test_resubmit_races_pg.py's.
+    """
+    statements: list = []
+
+    class _Session:
+        async def execute(self, statement):
+            statements.append(statement)
+            return self
+
+        def scalar_one_or_none(self):
+            return None
+
+    @asynccontextmanager
+    async def no_transaction(db, label):
+        yield
+
+    monkeypatch.setattr(crud, 'write_transaction', no_transaction)
+
+    assert await crud.claim_abandoned(_Session(), uuid.uuid4(), T0) is None
+
+    sql = ' '.join(str(statements[0].compile(dialect=postgresql.dialect())).split())
+    assert 'FROM ingest_request WHERE ingest_request.id =' in sql and sql.endswith('FOR UPDATE')
 
 
 # --------------------------------------------------------------------------------------------- finish_request

@@ -98,6 +98,15 @@ SET_COLLECTING_FILE = f'{SET_COLLECTING_REVISION}_override_action_set_collecting
 # test_request_record_revision.py.
 REQUEST_RECORD_REVISION = 'f2b7d4a91c36'
 REQUEST_RECORD_FILE = f'{REQUEST_RECORD_REVISION}_request_record_and_instance_marker.py'
+# THE HEAD FROM tj-7zjov1.123 TO tj-7zjov1.153: the push-path columns (ingest_run served range; ingest_request trigger, expiry, collect,
+# spend_unknown_attempts; store_dataset_entry.stopped_cause and its CHECK), PURELY ADDITIVE and directly on the
+# request-record revision. It touches no entry or bar key; its own shape is pinned in test_push_path_columns_revision.py.
+PUSH_PATH_REVISION = 'b8e4c1f7a923'
+PUSH_PATH_FILE = f'{PUSH_PATH_REVISION}_push_path_columns.py'
+# THE HEAD SINCE tj-7zjov1.153 (P35r): ingest_request.expiry_type, nullable integer, PURELY ADDITIVE and directly on the
+# push-path revision. It touches no entry or bar key; its own shape is pinned in test_request_expiry_type_revision.py.
+EXPIRY_TYPE_REVISION = '39c28a39b290'
+EXPIRY_TYPE_FILE = f'{EXPIRY_TYPE_REVISION}_request_expiry_type.py'
 # The parent the epic's design names for its one revision (tj-vhboky.12 item 1).
 PARENT_REVISION = '8f41c2d7a3b9'
 PARENT_FILE = f'{PARENT_REVISION}_bar_natural_key_and_upsert.py'
@@ -256,12 +265,27 @@ def test_each_revision_of_the_two_epics_sits_directly_on_the_one_before_it():
     # A FIFTH since tj-grna9p.86: the override-log revision, directly on dataset_read.
     # A SIXTH since tj-grna9p.176: the collect revision, directly on the override-log revision.
     # A SEVENTH since tj-grna9p.183: the SET_COLLECTING enum revision, directly on the collect revision.
-    # AN EIGHTH since tj-7zjov1.25: the head is the request-record revision, directly on SET_COLLECTING.
-    assert head_revision.module.__file__.endswith(REQUEST_RECORD_FILE), (
-        f'the head is not {REQUEST_RECORD_FILE}: {head_revision.module.__file__}'
+    # AN EIGHTH since tj-7zjov1.25: the request-record revision, directly on SET_COLLECTING.
+    # A NINTH since tj-7zjov1.123: the push-path revision, directly on the request-record revision.
+    # A TENTH since tj-7zjov1.153 (P35r): the head is the request expiry-type revision, directly on the push-path one.
+    assert head_revision.module.__file__.endswith(EXPIRY_TYPE_FILE), (
+        f'the head is not {EXPIRY_TYPE_FILE}: {head_revision.module.__file__}'
     )
-    assert head_revision.down_revision == SET_COLLECTING_REVISION, (
-        f'the head does not sit directly on {SET_COLLECTING_REVISION}: {head_revision.down_revision}'
+    assert head_revision.down_revision == PUSH_PATH_REVISION, (
+        f'the head does not sit directly on {PUSH_PATH_REVISION}: {head_revision.down_revision}'
+    )
+    push_path_revision = script.get_revision(PUSH_PATH_REVISION)
+    assert push_path_revision.module.__file__.endswith(PUSH_PATH_FILE), f'{PUSH_PATH_REVISION} is not {PUSH_PATH_FILE}'
+    assert push_path_revision.down_revision == REQUEST_RECORD_REVISION, (
+        f'{PUSH_PATH_REVISION} does not sit directly on {REQUEST_RECORD_REVISION}: {push_path_revision.down_revision}'
+    )
+    request_record_revision = script.get_revision(REQUEST_RECORD_REVISION)
+    assert request_record_revision.module.__file__.endswith(REQUEST_RECORD_FILE), (
+        f'{REQUEST_RECORD_REVISION} is not {REQUEST_RECORD_FILE}'
+    )
+    assert request_record_revision.down_revision == SET_COLLECTING_REVISION, (
+        f'{REQUEST_RECORD_REVISION} does not sit directly on {SET_COLLECTING_REVISION}: '
+        f'{request_record_revision.down_revision}'
     )
     set_collecting_revision = script.get_revision(SET_COLLECTING_REVISION)
     assert set_collecting_revision.module.__file__.endswith(SET_COLLECTING_FILE), (

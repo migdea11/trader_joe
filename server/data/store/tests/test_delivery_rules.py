@@ -6,7 +6,8 @@ so the store refuses every contradiction), the P36 gate note (EXHAUSTED keeps EX
 the escalation rulings (rule g: a counted attempt names a quota key; rule h: a SUCCEEDED report carries vendor
 stats, a FAILED one need not), and the verdict rule of the bead description (FINAL on a permanent refusal, the last
 attempt, a superseded request; else CONTINUE; EXPIRED FINAL with cause EXPIRED; EXHAUSTED FINAL with cause
-ATTEMPTS_EXHAUSTED).
+ATTEMPTS_EXHAUSTED). P35 (tj-7zjov1.28): note G's rule (i), a SUCCEEDED bars report must carry a served range (an
+asset list need not), and the drop rule's verdict (FINAL, EMPTY, cause DISCARDED).
 
 Each rule is red and green: every red case in delivery_reports.RED_CASES breaks one rule from a baseline that is
 asserted green here, so a case can only be red because of the field it changes. That the intake writes NOTHING on
@@ -107,6 +108,38 @@ def test_the_red_cases_cover_every_rule():
     assert {case[0] for case in RED_CASES} == set('abcdefgh')
 
 
+@pytest.mark.parametrize('parts', [None, []], ids=['bars', 'no-bars'])
+def test_i_a_succeeded_bars_report_without_a_served_range_is_refused_naming_the_rule(parts):
+    """Rule i: a SUCCEEDED bars report must carry a served range.
+
+    Note G (tj-7zjov1.28): the waiter answers from the attempt row's served range, so a SUCCEEDED bars report with
+    none is a sender defect, refused INVALID_REQUEST with a detail naming the rule. The baseline is green.
+    """
+    baseline = report(REQUEST_ID, parts=parts)
+    validate_report(baseline, IngestRequestKind.BARS)
+
+    error = _refused(with_trailer(baseline, served_range=None), IngestRequestKind.BARS)
+
+    assert error.reason is Reason.INVALID_REQUEST
+    assert error.detail == 'a SUCCEEDED bars report carries no served range'
+
+
+def test_i_an_asset_list_success_without_a_served_range_is_still_accepted():
+    """An asset list carries no served range (note G): rule i holds bars to it, never the other kinds."""
+    validate_report(
+        with_trailer(report(REQUEST_ID, kind=IngestRequestKind.ASSET_LIST), served_range=None),
+        IngestRequestKind.ASSET_LIST,
+    )
+
+
+@pytest.mark.parametrize('outcome', [DeliveryOutcome.FAILED, *NO_CALL])
+def test_i_a_bars_report_that_did_not_succeed_needs_no_served_range(outcome):
+    """Rule d already forbids one there; rule i adds nothing to the other outcomes."""
+    attempt = report(REQUEST_ID, outcome)
+    assert attempt.trailer.served_range is None
+    validate_report(attempt, IngestRequestKind.BARS)
+
+
 @pytest.mark.parametrize('outcome', list(DeliveryOutcome))
 def test_the_feed_rule_is_judged_against_the_request_kind_not_the_payload(outcome):
     """Rule e is judged against the stored kind: a FAILED or EXPIRED attempt has no payload to judge by.
@@ -181,6 +214,22 @@ def test_a_superseded_instances_retryable_failure_is_final_and_ends_nothing(erro
     attempt = report(REQUEST_ID, DeliveryOutcome.FAILED, error_class=error_class, last_attempt=last_attempt)
     decision = _decide(attempt, superseded=True)
     assert (decision.verdict, decision.state, decision.cause) == (DeliveryVerdict.FINAL, None, None)
+
+
+@pytest.mark.parametrize('superseded', [False, True])
+def test_a_dropped_success_is_final_empty_with_the_discarded_cause(superseded):
+    """A dropped delivery is FINAL, the request EMPTY with cause DISCARDED.
+
+    P35's drop rule: the dataset was deleted or stopped before the delivery landed. Not a failure: the request ends
+    EMPTY, its cause DISCARDED and a detail saying nothing was stored, whoever reported it.
+    """
+    decision = decide(report(REQUEST_ID), bars_written=0, has_records=True, superseded=superseded, dropped=True)
+    assert (decision.verdict, decision.state, decision.cause) == (
+        DeliveryVerdict.FINAL,
+        IngestRequestState.EMPTY,
+        IngestRequestFailureCause.DISCARDED,
+    )
+    assert decision.detail and 'nothing was stored' in decision.detail
 
 
 @pytest.mark.parametrize(

@@ -7,6 +7,7 @@ from common.database.sql_alchemy_table import AppBase, CustomTypeTable
 from common.enums.data_select import AssetType
 from common.enums.data_stock import DataSource, Feed, Granularity
 from common.sensitive import REDACTED
+from data.store.app.database.models.ingest_run import IngestRunTrigger
 
 
 class IngestRequestKind(StrEnum):
@@ -54,6 +55,9 @@ class IngestRequestFailureCause(StrEnum):
     PERMANENT = 'PERMANENT'
     # Ingest reported its attempt budget spent with a failed attempt (DeliveryTrailer.last_attempt).
     ATTEMPTS_EXHAUSTED = 'ATTEMPTS_EXHAUSTED'
+    # Not a failure: the request finished EMPTY because the dataset it wrote to was deleted or stopped before its
+    # delivery landed (the bars arm's drop rule, P35). Nothing was stored. Written on an EMPTY request, as the cause.
+    DISCARDED = 'DISCARDED'
 
 
 def _values(enum_cls: type[StrEnum]) -> list[str]:
@@ -109,6 +113,17 @@ class IngestRequest(AppBase.DATA_STORE_BASE, CustomTypeTable):
     ready_by = Column(DateTime(timezone=True), nullable=True)
     best_effort = Column(Boolean, nullable=False, server_default=text('false'))
     client_label = Column(SensitiveString, nullable=False)
+    # What started the request: REQUEST (a POST) or SCHEDULE (the DAILY loop). NULL reads as REQUEST. The attempt row of
+    # the first attempt takes it; every later attempt row is RETRY.
+    trigger = Column(Enum(IngestRunTrigger, name='ingest_run_trigger', values_callable=_values), nullable=True)
+    # The POST body's lifecycle fields, kept so the dataset entry can be written inside the delivery transaction. Both
+    # NULL where the request carries none (a scheduled refresh, a non-bars kind).
+    expiry = Column(DateTime(timezone=True), nullable=True)
+    collect = Column(Boolean, nullable=True)
+    # The POST body's expiry type (ExpiryType's integer value, as the entry's column stores it): identity of the entry
+    # written on the first delivered attempt. NULL where the request carries none (the DAILY loop, which sets
+    # dataset_id at request time; an asset list; corporate actions). No default: a guessed identity is a wrong one.
+    expiry_type = Column(Integer, nullable=True)
 
     state = Column(
         Enum(IngestRequestState, name='ingest_request_state', values_callable=_values),
@@ -124,6 +139,9 @@ class IngestRequest(AppBase.DATA_STORE_BASE, CustomTypeTable):
     spent_pages = Column(BigInteger, nullable=False, server_default='0')
     spent_throttled_429 = Column(BigInteger, nullable=False, server_default='0')
     spent_retries = Column(BigInteger, nullable=False, server_default='0')
+    # Counted attempts that reported no vendor stats (a FAILED report from the runner's crash path), whose cost is
+    # unknown and is NOT in the sums above. Non-zero means the sums are a lower bound.
+    spend_unknown_attempts = Column(Integer, nullable=False, server_default='0')
 
     # Set only when state is FAILED. failure_detail is the trailer's detail, never str() of an exception.
     failure_cause = Column(String, nullable=True)

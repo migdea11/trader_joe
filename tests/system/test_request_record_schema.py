@@ -13,7 +13,8 @@ WHAT IT PROVES that server/data/store/tests cannot, because SQLite has neither p
     sighting carry the same now() (Postgres's transaction start), and a failure in the last write (the
     NOT_DELIVERED mark) leaves no new instance, no supersede and no mark;
   * the repositories run on asyncpg, the ARRAY column included;
-  * the two new enum types hold the models' labels in order.
+  * the two new enum types hold the models' labels in order;
+  * ingest_request.expiry_type (39c28a39b290, tj-7zjov1.153) round-trips each ExpiryType and None on asyncpg.
 The DDL itself is compared offline in server/data/store/tests/test_request_record_revision.py; that the revision
 applies from empty and over the a6d3f8e1c205 seed, and a repeat writes nothing, is test_migration_with_data.py's.
 
@@ -36,7 +37,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from common.enums.data_select import AssetType, DataType
-from common.enums.data_stock import DataSource, Feed, Granularity, UpdateType
+from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from data.store.app.database.crud import ingest_instance as instance_crud
 from data.store.app.database.crud import ingest_request as crud
 from data.store.app.database.models.ingest_instance import IngestInstance
@@ -230,6 +231,34 @@ async def test_a_request_round_trips_through_the_repositories_on_asyncpg(db, run
     assert finished.state is IngestRequestState.SUCCEEDED and finished.finished_at is not None
     assert again is None, 'the first verdict stands'
     assert (await crud.get_request(db, request_id)).state is IngestRequestState.SUCCEEDED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('expiry_type', [*ExpiryType, None], ids=lambda value: getattr(value, 'name', 'none'))
+async def test_the_expiry_type_round_trips_through_create_and_get_request_on_asyncpg(
+    db, pg_engine, run_identity, created, expiry_type
+):
+    """tj-7zjov1.153 (P35r): each ExpiryType and None stored as its integer value (or NULL) and read back equal."""
+    request_id = uuid.uuid4()
+    created.requests.append(request_id)
+
+    record = await crud.create_request(
+        db,
+        crud.NewIngestRequest(
+            id=request_id,
+            kind=IngestRequestKind.BARS,
+            source=DataSource.ALPACA_API,
+            client_label=run_identity.owner,
+            asset_symbol=run_identity.symbol,
+            expiry_type=expiry_type,
+        ),
+    )
+
+    assert record.expiry_type is expiry_type
+    assert (await crud.get_request(db, request_id)).expiry_type is expiry_type
+    with pg_engine.connect() as conn:
+        stored = conn.execute(sa.select(REQUESTS.c.expiry_type).where(REQUESTS.c.id == request_id)).scalar_one()
+    assert stored == (None if expiry_type is None else expiry_type.value), 'stored as ExpiryType integer value'
 
 
 # --------------------------------------------------------------------------------------------- one transaction

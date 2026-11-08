@@ -306,3 +306,93 @@ def test_a_downgrade_leaves_exactly_the_parents_schema_and_a_re_upgrade_rebuilds
             f'the catalogue after downgrade and re-upgrade differs from {revision} built from empty ({len(again)})',
             again,
         )
+
+
+# ---------------------------------------------------------------------------------------------
+# tj-7zjov1.123 (P34c): what b8e4c1f7a923 adds, read off the catalogue. The generic test above proves the downgrade
+# restores the parent exactly; it does not say WHAT the revision built, so a revision that added an extra object (and
+# dropped it again) would pass it. The design's objects: seven columns and one CHECK, each with its facts, and nothing
+# else in any category, so the downgrade's inverse is exactly these eight objects.
+
+PUSH_PATH_REVISION = 'b8e4c1f7a923'
+PUSH_PATH_OBJECTS = {
+    # (category, identity): the catalogue's facts (type, NOT NULL, default, identity, generated) / (kind, definition).
+    ('columns', ('ingest_run', 'served_start')): ('timestamp with time zone', False, None, '', ''),
+    ('columns', ('ingest_run', 'served_end')): ('timestamp with time zone', False, None, '', ''),
+    ('columns', ('ingest_request', 'trigger')): ('ingest_run_trigger', False, None, '', ''),
+    ('columns', ('ingest_request', 'expiry')): ('timestamp with time zone', False, None, '', ''),
+    ('columns', ('ingest_request', 'collect')): ('boolean', False, None, '', ''),
+    ('columns', ('ingest_request', 'spend_unknown_attempts')): ('integer', True, '0', '', ''),
+    ('columns', ('store_dataset_entry', 'stopped_cause')): ('character varying', False, None, '', ''),
+    ('constraints', ('store_dataset_entry', 'ck_store_dataset_entry_stopped_cause_needs_stop')): (
+        'c',
+        'CHECK (((stopped_cause IS NULL) OR (collect IS FALSE)))',
+    ),
+}
+
+
+def test_the_push_path_revision_builds_exactly_its_designed_objects_and_its_downgrade_removes_them(
+    revision_db: ScratchDb, parent_db: ScratchDb
+) -> None:
+    parent = PARENT[PUSH_PATH_REVISION]
+    assert parent == 'f2b7d4a91c36', f'{PUSH_PATH_REVISION} sits on {parent}'
+    _migrate(parent_db, PUSH_PATH_REVISION, 'build-parent', 'upgrade', parent, parent)
+    _migrate(revision_db, PUSH_PATH_REVISION, 'build-revision', 'upgrade', PUSH_PATH_REVISION, PUSH_PATH_REVISION)
+    before, after = _catalogue(parent_db), _catalogue(revision_db)
+
+    added = {
+        (category, key): facts
+        for category, facts_by_key in after.items()
+        for key, facts in facts_by_key.items()
+        if key not in before.get(category, {})
+    }
+    removed = [(category, key) for category, facts in before.items() for key in facts if key not in after[category]]
+    changed = [
+        (category, key)
+        for category, facts in before.items()
+        for key in facts
+        if key in after[category] and after[category][key] != facts[key]
+    ]
+    assert added == PUSH_PATH_OBJECTS, sorted(set(added) ^ set(PUSH_PATH_OBJECTS), key=repr)
+    assert (removed, changed) == ([], []), 'an additive revision removed or changed an existing object'
+
+    _migrate(revision_db, PUSH_PATH_REVISION, 'downgrade', 'downgrade', parent, parent)
+    assert not diff_catalogues(before, _catalogue(revision_db)), 'the downgrade left or lost an object'
+
+
+# ---------------------------------------------------------------------------------------------
+# tj-7zjov1.153 (P35r): what 39c28a39b290 adds, read off the catalogue, as for P34c above: exactly one column,
+# ingest_request.expiry_type, integer, nullable, NO default (a default would write a guessed entry identity), and
+# nothing else in any category; its downgrade removes exactly that column.
+
+EXPIRY_TYPE_REVISION = '39c28a39b290'
+EXPIRY_TYPE_OBJECTS = {('columns', ('ingest_request', 'expiry_type')): ('integer', False, None, '', '')}
+
+
+def test_the_expiry_type_revision_builds_exactly_its_one_column_and_its_downgrade_removes_it(
+    revision_db: ScratchDb, parent_db: ScratchDb
+) -> None:
+    parent = PARENT[EXPIRY_TYPE_REVISION]
+    assert parent == PUSH_PATH_REVISION, f'{EXPIRY_TYPE_REVISION} sits on {parent}'
+    _migrate(parent_db, EXPIRY_TYPE_REVISION, 'build-parent', 'upgrade', parent, parent)
+    _migrate(revision_db, EXPIRY_TYPE_REVISION, 'build-revision', 'upgrade', EXPIRY_TYPE_REVISION, EXPIRY_TYPE_REVISION)
+    before, after = _catalogue(parent_db), _catalogue(revision_db)
+
+    added = {
+        (category, key): facts
+        for category, facts_by_key in after.items()
+        for key, facts in facts_by_key.items()
+        if key not in before.get(category, {})
+    }
+    removed = [(category, key) for category, facts in before.items() for key in facts if key not in after[category]]
+    changed = [
+        (category, key)
+        for category, facts in before.items()
+        for key in facts
+        if key in after[category] and after[category][key] != facts[key]
+    ]
+    assert added == EXPIRY_TYPE_OBJECTS, sorted(set(added) ^ set(EXPIRY_TYPE_OBJECTS), key=repr)
+    assert (removed, changed) == ([], []), 'an additive revision removed or changed an existing object'
+
+    _migrate(revision_db, EXPIRY_TYPE_REVISION, 'downgrade', 'downgrade', parent, parent)
+    assert not diff_catalogues(before, _catalogue(revision_db)), 'the downgrade left or lost an object'

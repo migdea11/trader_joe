@@ -4,13 +4,12 @@ from fastapi import APIRouter, Body, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.logging import get_logger
-from common.rpc.clients.ingest_fetch import IngestFetchClient
-from data.store.app.app_depends import get_ingest_fetch_client
+from common.rpc.clients.ingest_submit import IngestSubmitClient
+from data.store.app.app_depends import get_ingest_submit_client
 from data.store.app.database.crud.stock.store_dataset_entry import delete_entry_by_id, get_entry_by_id, search_entries
 from data.store.app.database.database import async_db
 from data.store.app.events import DatasetChange, DatasetChanged, publish
 from data.store.app.ingest.data_action_request import store_market_activity_worker
-from data.store.app.ingest.run_recording import recorded_run
 from routers.common.instance_secret import require_instance_secret
 from routers.data_store.app_endpoints import AssetDatasetStoreInterface
 from schemas.data_store.asset_dataset_store import (
@@ -42,11 +41,16 @@ async def store_data(
     # ruff's TID251 bans trader_joe.proto outside common/rpc, but the reason is that a backtest
     # replay backend (tj-r6vcgv) and a test double implement this same interface, and a route
     # holding the transport would make both of them fake a server.
-    fetch_client: Annotated[IngestFetchClient, Depends(get_ingest_fetch_client)],
+    submit_client: Annotated[IngestSubmitClient, Depends(get_ingest_submit_client)],
     request_path: Annotated[StoreAssetDatasetPath, Depends()],
     request_body: Annotated[StoreAssetDatasetBody, Body(...)],
 ) -> StoreAssetDatasetResponse:
-    """Fetch one dataset and store it, answering with what was written and the window it covers.
+    """Request one dataset and store it, answering with what was written and the window it covers.
+
+    THE REQUEST IS WRITTEN, SUBMITTED TO INGEST, AND AWAITED (tj-7zjov1.28): ingest pushes the result to the store's
+    own service, which writes the dataset entry and the bars in the delivery transaction; this handler waits for the
+    request to finish, up to the fetch deadline, and answers from the request's rows. One that outlives the deadline
+    answers the deadline error and keeps running.
 
     THIS HANDLER CATCHES NOTHING (ADR tj-fa1rpu D6). Every failure below it is a TraderJoeError
     carrying a reason, and the handler set installed in data/store/app/main.py renders each as
@@ -66,7 +70,7 @@ async def store_data(
 
     Args:
         db: The request's session.
-        fetch_client: The FetchDataset seam, as the interface.
+        submit_client: The Submit seam, as the interface.
         request_path: The asset and data type being stored.
         request_body: What the caller asked for; also the entry's identity fields.
 
@@ -75,18 +79,9 @@ async def store_data(
         including a served window with no bars, where data_points is 0.
     """
     log.debug(f'Storing data for {request_path.asset_type.value}, {request_path.asset_symbol}')
-    # THE RUN RECORD IS WRITTEN OUTSIDE THE FETCH'S TRANSACTION, on its own session (tj-grna9p.18),
-    # and an exception still passes through it unchanged: this handler still catches nothing (D6).
-    async with recorded_run(request_path, request_body) as run:
-        stored = await store_market_activity_worker(
-            request_path, request_body, db, fetch_client, on_ack=run.acknowledge
-        )
-        await run.succeed(stored.data_points)
-    # AFTER the fetch's commit, never inside it. The upsert's xmax is not read, so CREATED cannot be told
-    # from a repeat without changing the upsert's contract; the client reloads either way.
-    if run.dataset_id is not None:
-        # A collect flip is RETIRED or RESUMED, the vocabulary's own meaning; every other write is UPDATED.
-        publish(DatasetChanged(run.dataset_id, _change_kind(stored.collect_changed_to)))
+    # THE RUN RECORD IS THE ATTEMPT ROWS the delivery transaction writes, and DatasetChanged (RETIRED or RESUMED on a
+    # collect flip, else UPDATED) is published by the intake after that commit: nothing is recorded or published here.
+    stored = await store_market_activity_worker(request_path, request_body, db, submit_client)
     return StoreAssetDatasetResponse(
         message='Data stored',
         data_points=stored.data_points,
@@ -95,13 +90,6 @@ async def store_data(
         # ServedRange cannot silently publish it.
         served_range=ServedRange(start=stored.served_range.start, end=stored.served_range.end),
     )
-
-
-def _change_kind(collect_changed_to: bool | None) -> DatasetChange:
-    """The change a write publishes: RETIRED when collect went false, RESUMED when it went true, else UPDATED."""
-    if collect_changed_to is None:
-        return DatasetChange.UPDATED
-    return DatasetChange.RESUMED if collect_changed_to else DatasetChange.RETIRED
 
 
 @router.get(AssetDatasetStoreInterface.GET_STORE_ASSET_DATASET)

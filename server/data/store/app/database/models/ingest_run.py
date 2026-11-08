@@ -93,6 +93,10 @@ class IngestRun(AppBase.DATA_STORE_BASE, CustomTypeTable):
     # The vendor's public instrument key the bars header carried, opaque and stored as received. NULL when the header
     # named none (an empty string is never stored) and on every run that is not a delivered bars attempt.
     vendor_asset_id = Column(String, nullable=True)
+    # The window a SUCCEEDED attempt answered for (the trailer's served_range): start inclusive, end exclusive. NULL on
+    # every other row, a failed or empty-handed attempt included.
+    served_start = Column(DateTime(timezone=True), nullable=True)
+    served_end = Column(DateTime(timezone=True), nullable=True)
 
     trigger = Column(Enum(IngestRunTrigger, name='ingest_run_trigger', values_callable=_values), nullable=False)
     # Who caused the run: the request body's owner for POST /store. A SensitiveString exactly like
