@@ -61,6 +61,10 @@ CORPORATE_ACTIONS_PATH = '/corporate-actions'
 # page_size=10_000), so a read costs the pages it cost before.
 BARS_PAGE_SIZE = 10_000
 
+# The page count past which a bars read is refused as a vendor that never ends. The longest legitimate read is one
+# symbol at 1Min over the full SIP history (about a million rows, roughly 100 pages); this leaves tenfold headroom.
+BARS_MAX_PAGES = 1000
+
 # The most records one page of a corporate-actions call returns (the vendor's limit parameter caps at 1000), and the page
 # count past which a read is refused as a vendor that never ends: a million records for one symbol is not a window.
 CORPORATE_ACTIONS_PAGE_SIZE = 1000
@@ -411,8 +415,9 @@ class RawPage:
 def request_raw(client: TradingClient | CorporateActionsClient, path: str, params: dict | None = None) -> RawPage:
     """Make exactly one HTTP GET, with no retry and no sleep, and keep the body as served.
 
-    Serves the trading API and the data API's v1 corporate-actions endpoint. The sibling of request_page for a body that is not a JSON object (the asset list is an array) or that the
-    caller slices byte for byte (the corporate-actions page). It charges and classifies nothing: read_raw does, on the
+    Serves the trading API and the data API's v1 corporate-actions endpoint. The sibling of request_page for a body
+    that is not a JSON object (the asset list is an array) or that the caller slices byte for byte (the
+    corporate-actions page). It charges and classifies nothing: read_raw does, on the
     scope its caller names. Same URL construction, same headers (the client's own, from the checked credential),
     same allow_redirects=False, same APIError for an error status. Blocking; run it on the worker pool.
 
@@ -584,6 +589,10 @@ async def read_bars_pages(
     again up to BARS_PAGE_RETRIES times after BARS_PAGE_RETRY_WAIT_S, each time through the scheduler, and only
     while the wait still fits before the deadline. Any other failure surfaces at once.
 
+    PROGRESS GUARD. An empty token ends the read like a missing one. A token the vendor already gave in this read, or
+    a read past BARS_MAX_PAGES pages, is a vendor that does not end; it raises rather than looping on the quota. The
+    retry of one page resends that page's token and is not a repeat.
+
     Args:
         executor (ThreadPoolExecutor): Pool the blocking request runs on.
         client (StockHistoricalDataClient): The checked client; its credentials were refused or accepted before this.
@@ -603,12 +612,13 @@ async def read_bars_pages(
         alpaca.common.exceptions.APIError: If the vendor answers an error status (the 504 retries spent included).
         requests.exceptions.RequestException: If the vendor cannot be reached or the connection is cut.
         AttributeError: If a page answers a JSON null 'bars'. Deliberately not guarded, loud (ADR tj-fa1rpu).
-        ValueError: If a page is not a bars page.
+        ValueError: If a page is not a bars page, or the vendor repeats a token or never ends.
     """
     loop = asyncio.get_running_loop()
     merged: dict[str, list] = {}
+    seen_tokens: set[str] = set()
     page_token = None
-    while True:
+    for _ in range(BARS_MAX_PAGES):
         page_params = {**params, 'limit': BARS_PAGE_SIZE, 'page_token': page_token}
         retries_left = BARS_PAGE_RETRIES
         while True:
@@ -640,8 +650,12 @@ async def read_bars_pages(
         for symbol, bars in page.body['bars'].items():
             merged.setdefault(symbol, []).extend(bars)
         page_token = page.body.get('next_page_token')
-        if page_token is None:
+        if not page_token:
             return BarSet(merged)
+        if page_token in seen_tokens:
+            raise ValueError('The vendor repeated a bars page token, so the read does not end')
+        seen_tokens.add(page_token)
+    raise ValueError(f'The vendor served more than {BARS_MAX_PAGES} bars pages')
 
 
 def _wait_fits(deadline: datetime | None, wait_s: float) -> bool:
