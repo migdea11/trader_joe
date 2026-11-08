@@ -92,12 +92,18 @@ class CallTally:
     spent nothing. The attempt's report to the store carries these numbers.
 
     Attributes:
-        calls (int): Calls that reached the vendor.
+        calls (int): HTTP requests that reached the vendor: every page and every retry, whatever the answer.
+        pages (int): Good pages the vendor answered.
+        retries (int): Requests made again after a failed one inside the attempt.
+        throttled_429 (int): Requests the vendor answered 429.
         first_call_at (datetime | None): When the first was made, timezone aware.
         last_call_at (datetime | None): When the last was made, timezone aware.
     """
 
     calls: int = 0
+    pages: int = 0
+    retries: int = 0
+    throttled_429: int = 0
     first_call_at: datetime | None = None
     last_call_at: datetime | None = None
 
@@ -111,6 +117,18 @@ class CallTally:
         if self.first_call_at is None:
             self.first_call_at = at
         self.last_call_at = at
+
+    def record_page(self) -> None:
+        """Count one good page the vendor answered."""
+        self.pages += 1
+
+    def record_retry(self) -> None:
+        """Count one request made again after a failed one."""
+        self.retries += 1
+
+    def record_throttled(self) -> None:
+        """Count one request the vendor answered 429."""
+        self.throttled_429 += 1
 
 
 @dataclass(frozen=True)

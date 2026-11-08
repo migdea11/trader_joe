@@ -85,14 +85,7 @@ from data.ingest.app.brokers.interface import (
     ServedRange,
 )
 from data.ingest.app.brokers.rate_budget import RequestPriority
-from data.ingest.tests.alpaca_recorded import (
-    RecordedResponse,
-    always,
-    by_page_token,
-    load,
-    record_sdk_sleeps,
-    recorded_client,
-)
+from data.ingest.tests.alpaca_recorded import RecordedResponse, always, by_page_token, load, recorded_client
 from data.ingest.tests.scheduler_doubles import RecordingScheduler, alpaca_reader
 from tests.fakes.market_data import (
     EMPTY_PREFIX,
@@ -408,8 +401,8 @@ class AlpacaRecordedSubject(Subject):
         return self.arrangement(responder, query)
 
     def rate_limited(self) -> Arrangement:
-        # alpaca-py retries a 429 three times, 3 s apart; its clock is replaced so nothing really sleeps.
-        record_sdk_sleeps(self.monkeypatch)
+        # Since tj-7zjov1.56 a 429 is never retried: it surfaces on the first request, so nothing sleeps. The
+        # SDK clock this used to replace is no longer on the path (alpaca_recorded, record_sdk_sleeps retired).
         recorded = load('bars_1Day')
         return self.arrangement(always(load('error_429')), self.whole(recorded, Granularity.ONE_DAY))
 

@@ -19,13 +19,21 @@ RESPONSE HEADERS (TE-5 tj-3mk3u5.37.6). A response can carry headers beside its 
 429 can be answered with or without X-RateLimit-Reset or Retry-After. No fixture records any: the
 recorder writes no header (README, Re-recording), and which ones a real 429 sends is unknown. A
 test that needs one attaches it with with_headers(), and says so.
+
+STUB VENDORS (tj-7zjov1.56). Since the reader owns the bars page loop, it reads the client's private
+_session, _base_url, _api_version and _get_default_headers (broker_api.request_page), so a Mock client
+standing in for get_stock_bars no longer reaches anything. Tests that only need a few bars, or an
+exception from the HTTP session, use stub_vendor(): the REAL client over this same transport, answering
+scripted answers in turn, with constructed bodies (wire_bar, bars_answer, status_answer) whose
+provenance says 'constructed'. So every such test also exercises the private attributes for real.
 """
 
+import asyncio
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from http import HTTPStatus
 from itertools import pairwise
 from pathlib import Path
@@ -38,6 +46,8 @@ from alpaca.common import rest as alpaca_rest
 from alpaca.data.historical import StockHistoricalDataClient
 from requests.adapters import BaseAdapter
 from requests.structures import CaseInsensitiveDict
+
+from data.ingest.app.brokers.alpaca import broker_api
 
 
 FIXTURES_DIR = Path(__file__).parent / 'fixtures' / 'alpaca'
@@ -246,23 +256,147 @@ class RecordedTransport(BaseAdapter):
         pass
 
 
-def record_sdk_sleeps(monkeypatch) -> list[float]:
-    """Replace the clock alpaca-py's retry loop sleeps on with a recorder, for one test.
+# RETIRED ON tj-7zjov1.56: record_sdk_sleeps.
+#
+# It replaced the clock alpaca-py's own retry loop sleeps on (common/rest.py RESTClient._request). Since
+# tj-7zjov1.56 the reader owns the bars page loop and makes every request through broker_api.request_page,
+# which never enters that loop, so the clock it patched is dead: a test asserting its recorder stayed empty
+# asserted nothing. Its live successor is record_page_retry_sleeps below, the wait between the 504 retries the
+# reader now makes itself. A reader that slid back onto the SDK's loop is caught by request counts instead
+# (a 429 would reach the transport four times, not once), and by sdk_retry_is_never_entered.
 
-    alpaca-py cannot be built with a zero retry wait: RESTClient ignores retry_wait_seconds=0
-    ('if retry_wait_seconds and retry_wait_seconds > 0', common/rest.py:79) and keeps its 3 s
-    default. Patching the module's time reference instead keeps the production defaults, keeps
-    the gate fast, and makes each wait the SDK asked for assertable.
+
+def record_page_retry_sleeps(monkeypatch) -> list[float]:
+    """Replace the wait broker_api's bars page loop sleeps before a 504 retry with a recorder, for one test.
+
+    The loop waits with asyncio.sleep(BARS_PAGE_RETRY_WAIT_S), 3 s (tj-7zjov1.56). Only that module's asyncio
+    reference is replaced, and get_running_loop is the real one, so the scheduler's own waits and the worker pool
+    are untouched. The recorded sleep returns at once, so the gate stays fast and each wait is assertable.
 
     Args:
         monkeypatch (pytest.MonkeyPatch): The test's monkeypatch fixture, which undoes this.
 
     Returns:
-        list[float]: Every wait the SDK requested, in order.
+        list[float]: Every wait the page loop asked for, in order.
     """
     sleeps: list[float] = []
-    monkeypatch.setattr(alpaca_rest, 'time', SimpleNamespace(sleep=sleeps.append))
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(broker_api, 'asyncio', SimpleNamespace(sleep=sleep, get_running_loop=asyncio.get_running_loop))
     return sleeps
+
+
+def sdk_retry_is_never_entered(monkeypatch) -> list[str]:
+    """Make alpaca-py's own request loop record every entry, for one test.
+
+    RESTClient._request is where the SDK sleeps and retries a 429 or 504 by itself. Since tj-7zjov1.56 nothing on
+    the bars path may reach it (the bead's requirement 3: no HTTP request outside the scheduler). The real method
+    still runs, so a regression is observed and not masked.
+
+    Args:
+        monkeypatch (pytest.MonkeyPatch): The test's monkeypatch fixture, which undoes this.
+
+    Returns:
+        list[str]: The path of every request that went through the SDK's own loop.
+    """
+    entered: list[str] = []
+    sdk_request = alpaca_rest.RESTClient._request
+
+    def recording(self, method, path, *args, **kwargs):
+        entered.append(path)
+        return sdk_request(self, method, path, *args, **kwargs)
+
+    monkeypatch.setattr(alpaca_rest.RESTClient, '_request', recording)
+    return entered
+
+
+# Constructed bodies, for tests that need a bar set no fixture holds. Never written to fixtures/: these are
+# not recordings, and their provenance says so.
+
+
+def wire_bar(timestamp: datetime, close: float = 10.0) -> dict[str, Any]:
+    """One bar as the vendor's JSON carries it (tj-vhboky.57 item 1), at an aware instant."""
+    if timestamp.utcoffset() is None:
+        raise ValueError(f'a wire bar needs an aware instant: {timestamp!r}')
+    stamp = timestamp.astimezone(UTC).isoformat().replace('+00:00', 'Z')
+    return {'t': stamp, 'o': 1.0, 'h': 2.0, 'l': 0.5, 'c': close, 'v': 10, 'n': 3, 'vw': 1.5}
+
+
+def bars_answer(
+    bars_by_symbol: Mapping[str, Sequence[dict[str, Any]]],
+    next_page_token: str | None = None,
+    headers: Mapping[str, str] | None = None,
+) -> RecordedResponse:
+    """A constructed 200 bars page: its bars by symbol, its next_page_token, and any response headers."""
+    return RecordedResponse(
+        name=f'constructed_bars[{next_page_token}]',
+        status=200,
+        body={
+            'bars': {symbol: list(bars) for symbol, bars in bars_by_symbol.items()},
+            'next_page_token': next_page_token,
+        },
+        provenance={'kind': 'constructed'},
+        headers=dict(headers or {}),
+    )
+
+
+def status_answer(status: int, message: str = 'no', headers: Mapping[str, str] | None = None) -> RecordedResponse:
+    """A constructed error answer, shaped as Alpaca's: {"message": ...}, with no code field."""
+    return RecordedResponse(
+        name=f'constructed_{status}',
+        status=status,
+        body={'message': message},
+        provenance={'kind': 'constructed'},
+        headers=dict(headers or {}),
+    )
+
+
+Answer = RecordedResponse | BaseException
+
+
+def scripted(*answers: Answer) -> Responder:
+    """Answer the n-th request with the n-th answer, raising it when it is an exception.
+
+    An exception is raised by the transport, inside the HTTP session, which is where requests raises a
+    connection error, a timeout or a cut body. A request past the last answer fails the test.
+    """
+    remaining = list(answers)
+
+    def respond(sent: SentRequest) -> RecordedResponse:
+        if not remaining:
+            raise AssertionError(f'unscripted request past the last scripted answer: {sent.url}')
+        answer = remaining.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    return respond
+
+
+@dataclass
+class StubVendor:
+    """A real alpaca-py client over a scripted RecordedTransport, and what reached it.
+
+    Attributes:
+        client (StockHistoricalDataClient): The client to inject.
+        transport (RecordedTransport): Its transport.
+    """
+
+    client: StockHistoricalDataClient
+    transport: RecordedTransport
+
+    @property
+    def sent(self) -> list[SentRequest]:
+        """Every HTTP request that reached the vendor, in order."""
+        return self.transport.sent
+
+
+def stub_vendor(*answers: Answer, request_cap: int = DEFAULT_REQUEST_CAP) -> StubVendor:
+    """A real client answering each request in turn with `answers` (see scripted)."""
+    client, transport = recorded_client(scripted(*answers), request_cap)
+    return StubVendor(client, transport)
 
 
 def recorded_client(

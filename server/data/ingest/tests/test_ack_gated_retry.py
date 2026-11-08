@@ -19,12 +19,9 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
-import requests
-from alpaca.common.exceptions import APIError
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Feed, Granularity, UpdateType
@@ -55,6 +52,7 @@ from data.ingest.app.scheduler import (
     SchedulerConfigError,
     StaticCredentialProvider,
 )
+from data.ingest.tests.alpaca_recorded import StubVendor, bars_answer, status_answer, stub_vendor, wire_bar
 from data.ingest.tests.feed_rule import assert_a_bars_report_names_the_tape, assert_a_no_tape_report_is_unspecified
 from data.ingest.tests.scheduler_doubles import RecordingScheduler, alpaca_reader
 from routers.data_ingest.submit_handler import IngestSubmitHandler
@@ -945,8 +943,11 @@ def iex_deployment_and_no_cached_client(monkeypatch):
     monkeypatch.delenv('ALPACA_SIP_ENABLED', raising=False)
     monkeypatch.delenv('ALPACA_RATE_LIMIT_PER_MINUTE', raising=False)
     broker_api.set_client(None)
+    # The reader remembers the last rate-limit reset per scope (tj-7zjov1.56); no case may inherit another's.
+    broker_api.forget_resets()
     yield
     broker_api.set_client(None)
+    broker_api.forget_resets()
 
 
 def bars_request(**overrides) -> BarsRequest:
@@ -1123,37 +1124,15 @@ async def test_a_source_with_no_handle_is_not_implemented():
 # ---------------------------------------------------------------------------------------------
 
 
-class StubBarSet:
-    def __init__(self, symbol: str, bars: list[SimpleNamespace]) -> None:
-        self.data = {symbol: bars}
-
-    def __getitem__(self, symbol: str) -> list[SimpleNamespace]:
-        return self.data[symbol]
+# RE-PINNED ON tj-7zjov1.56. The vendor was a Mock whose get_stock_bars answered a StubBarSet or raised a built
+# APIError. The reader now owns the bars page loop and sends each request through the client's HTTP session
+# (broker_api.request_page), so the vendor is the REAL alpaca-py client over a scripted transport: one answer per
+# HTTP request, a status as the HTTP answer it is. "No vendor call" is "nothing reached the transport".
 
 
-def stub_client(*timestamps: datetime) -> Mock:
-    client = Mock()
-    client.get_stock_bars.return_value = StubBarSet(
-        'VFV',
-        [
-            SimpleNamespace(open=1.0, high=2.0, low=0.5, close=10.0, volume=10, trade_count=3, vwap=1.5, timestamp=t)
-            for t in timestamps
-        ],
-    )
-    return client
-
-
-def api_error(status: int, headers: dict[str, str] | None = None) -> APIError:
-    response = requests.Response()
-    response.status_code = status
-    response._content = b'{"message": "no"}'
-    response.encoding = 'utf-8'
-    response.headers.update(headers or {})
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as http_error:
-        return APIError(response.text, http_error)
-    raise AssertionError(f'{status} is not an error status')
+def stub_client(*timestamps: datetime, pages: int = 1) -> StubVendor:
+    """The real client answering `pages` requests in turn, each with one page of these bars."""
+    return stub_vendor(*(bars_answer({'VFV': [wire_bar(t) for t in timestamps]}) for _ in range(pages)))
 
 
 def bars_query(**overrides) -> BarsQuery:
@@ -1176,7 +1155,7 @@ def test_the_scope_name_starts_with_the_vendors_data_source_value():
 @pytest.mark.asyncio
 async def test_get_bars_acquires_one_call_from_the_handles_scheduler_scope():
     handle = alpaca_handle()
-    broker_api.set_client(stub_client(START))
+    broker_api.set_client(stub_client(START).client)
     deadline = datetime.now(UTC) + timedelta(minutes=5)
 
     with patch.object(handle.scheduler, 'acquire', wraps=handle.scheduler.acquire) as acquire:
@@ -1189,8 +1168,8 @@ async def test_get_bars_acquires_one_call_from_the_handles_scheduler_scope():
 @pytest.mark.asyncio
 async def test_a_deadline_the_handles_scope_cannot_meet_is_refused_naming_the_vendor():
     handle = alpaca_handle()  # 60 a minute: one token, refilled in a second
-    client = stub_client(START)
-    broker_api.set_client(client)
+    vendor = stub_client(START)
+    broker_api.set_client(vendor.client)
     await handle.scheduler.acquire(ALPACA_DATA_SCOPE)
 
     outcome = await handle.reader.get_bars(bars_query(deadline=datetime.now(UTC) + timedelta(milliseconds=100)))
@@ -1198,7 +1177,7 @@ async def test_a_deadline_the_handles_scope_cannot_meet_is_refused_naming_the_ve
     assert outcome.error.reason is Reason.RATE_BUDGET
     assert outcome.error.metadata['vendor'] == ALPACA_DATA_SCOPE
     assert outcome.error.metadata['vendor'].startswith(DataSource.ALPACA_API.value)
-    assert client.mock_calls == []
+    assert vendor.sent == []
 
 
 def test_alpaca_has_no_rate_budget_of_its_own():
@@ -1208,24 +1187,44 @@ def test_alpaca_has_no_rate_budget_of_its_own():
 
 @pytest.mark.asyncio
 async def test_the_retired_rate_variables_are_not_read(monkeypatch):
-    """ALPACA_RATE_LIMIT_PER_SEC, ALPACA_RATE_BURST and ALPACA_BACKFILL_RESERVE pace nothing now.
+    """ALPACA_RATE_LIMIT_PER_SEC, ALPACA_RATE_BURST and ALPACA_BACKFILL_RESERVE pace nothing now (tj-7zjov1.57).
 
-    Set to values that would refuse the second call at once, they change nothing: three calls, each with a
-    deadline of now, all reach the vendor through the handle's own scope at its ceiling.
+    The environment-built budget is gone (RateBudget.from_env was its only reader). Set to values that would
+    refuse the second call at once, the three change neither the handle's built limit nor what reaches the vendor:
+    the scope still refills like the ceiling, and three calls, each with a deadline of now, all go through. The one
+    live rate setting, ALPACA_RATE_LIMIT_PER_MINUTE, does change the built limit, and only downward.
     """
+    assert not hasattr(RateBudget, 'from_env')
+
+    monkeypatch.delenv('ALPACA_RATE_LIMIT_PER_MINUTE', raising=False)
+    for name in ('ALPACA_RATE_LIMIT_PER_SEC', 'ALPACA_RATE_BURST', 'ALPACA_BACKFILL_RESERVE'):
+        monkeypatch.delenv(name, raising=False)
+    unset = AlpacaHandle(settings=settings()).scheduler.window(ALPACA_DATA_SCOPE)
+
     monkeypatch.setenv('ALPACA_RATE_LIMIT_PER_SEC', '0.0001')
     monkeypatch.setenv('ALPACA_RATE_BURST', '1')
     monkeypatch.setenv('ALPACA_BACKFILL_RESERVE', '1000')
-    client = stub_client(START)
-    broker_api.set_client(client)
+    vendor = stub_client(START, pages=3)
+    broker_api.set_client(vendor.client)
+    handle = AlpacaHandle(settings=settings())
+    retired_set = handle.scheduler.window(ALPACA_DATA_SCOPE)
 
-    with patch.object(RateBudget, 'from_env', side_effect=AssertionError('RateBudget.from_env was called')):
-        handle = AlpacaHandle(settings=settings())
-        for _ in range(3):
-            outcome = await handle.reader.get_bars(bars_query(deadline=datetime.now(UTC) + timedelta(seconds=0.05)))
-            assert [bar async for bar in outcome.bars]
+    assert retired_set.full_refill_seconds == unset.full_refill_seconds
+    assert retired_set.full_refill_seconds == pytest.approx(ceiling_refill_seconds(ALPACA_CALLS_PER_MINUTE_CEILING))
+    for _ in range(3):
+        outcome = await handle.reader.get_bars(bars_query(deadline=datetime.now(UTC) + timedelta(seconds=0.05)))
+        assert [bar async for bar in outcome.bars]
+    assert len(vendor.sent) == 3
 
-    assert client.get_stock_bars.call_count == 3
+    # The live setting, with the retired three still set: lowering it changes the built limit ...
+    monkeypatch.setenv('ALPACA_RATE_LIMIT_PER_MINUTE', '60')
+    lowered = AlpacaHandle(settings=settings()).scheduler.window(ALPACA_DATA_SCOPE)
+    assert lowered.full_refill_seconds == pytest.approx(ceiling_refill_seconds(60))
+    assert lowered.full_refill_seconds != pytest.approx(unset.full_refill_seconds)
+    # ... and raising it past the hard-coded ceiling is refused, not honoured.
+    monkeypatch.setenv('ALPACA_RATE_LIMIT_PER_MINUTE', str(ALPACA_CALLS_PER_MINUTE_CEILING + 1))
+    with pytest.raises(SchedulerConfigError, match='ceiling'):
+        AlpacaHandle(settings=settings())
 
 
 def ceiling_refill_seconds(count: int) -> float:
@@ -1255,9 +1254,7 @@ async def test_a_header_less_429_waits_the_handles_declared_window_of_sixty_seco
     (one second at 60 a minute), which re-429ed inside the same vendor window.
     """
     handle = alpaca_handle()  # 60 a minute: a refill of one second, a declared window of sixty
-    client = Mock()
-    client.get_stock_bars.side_effect = api_error(429)
-    broker_api.set_client(client)
+    broker_api.set_client(stub_vendor(status_answer(429)).client)
 
     before = datetime.now(UTC)
     outcome = await handle.reader.get_bars(bars_query())
@@ -1293,8 +1290,7 @@ async def test_the_reset_is_x_ratelimit_reset_else_retry_after_else_the_declared
     now = datetime.now(UTC).replace(microsecond=0)
     reset = now + timedelta(seconds=42)
     headers = {name: str(reset.timestamp()) if value == 'RESET+42' else value for name, value in headers.items()}
-    client = Mock()
-    client.get_stock_bars.side_effect = api_error(429, headers)
+    client = stub_vendor(status_answer(429, headers=headers)).client
 
     outcome = await alpaca_reader(client, clock=lambda: now, scheduler=RecordingScheduler()).get_bars(bars_query())
 
@@ -1318,8 +1314,7 @@ async def test_a_scope_with_two_intervals_falls_back_to_the_longer():
     assert scheduler.window(ALPACA_DATA_SCOPE).declared_window_seconds == 60.0
 
     now = datetime.now(UTC)
-    client = Mock()
-    client.get_stock_bars.side_effect = api_error(429)
+    client = stub_vendor(status_answer(429)).client
     outcome = await alpaca_reader(client, clock=lambda: now, scheduler=scheduler).get_bars(bars_query())
 
     assert outcome.error.reset_at == now + timedelta(seconds=60)
@@ -1334,8 +1329,9 @@ async def test_a_header_less_429_retries_after_the_declared_window_capped_by_max
     max_reset_wait_s, expected_wait_s
 ):
     """End to end through the executor: the bars runner's 429, its reset, and RetryPolicy.reset_wait's cap."""
-    client = Mock()
-    client.get_stock_bars.side_effect = api_error(429)
+    # Two attempts, each one HTTP request answered 429: the second after the store answers CONTINUE.
+    vendor = stub_vendor(status_answer(429), status_answer(429))
+    client = vendor.client
     retry = RetryPolicy(max_attempts=5, max_reset_wait_s=max_reset_wait_s)
     placeholder = FakeRunner(succeeded())
     rig = Rig(placeholder, settings(retry=retry))
@@ -1360,6 +1356,7 @@ async def test_a_header_less_429_retries_after_the_declared_window_capped_by_max
 
     assert rig.sleep.slept == [expected_wait_s]
     assert retry.reset_wait(T0 + timedelta(seconds=60), T0) == expected_wait_s
+    assert len(vendor.sent) == 2
 
 
 def test_the_executor_settings_come_from_the_environment_with_defaults(monkeypatch):
@@ -1410,7 +1407,9 @@ def bars_scheduled(**overrides) -> ScheduledRequest:
 @pytest.mark.asyncio
 async def test_a_served_attempt_reports_its_vendor_call_count_and_times():
     pacing = RecordingScheduler()
-    runner = BarsAttemptRunner(alpaca_reader(stub_client(START, START + timedelta(minutes=30)), scheduler=pacing))
+    runner = BarsAttemptRunner(
+        alpaca_reader(stub_client(START, START + timedelta(minutes=30)).client, scheduler=pacing)
+    )
 
     before = datetime.now(UTC)
     result = await runner(bars_scheduled(), 1)
@@ -1418,7 +1417,7 @@ async def test_a_served_attempt_reports_its_vendor_call_count_and_times():
 
     stats = result.trailer.vendor_stats
     assert result.trailer.outcome is DeliveryOutcome.SUCCEEDED
-    assert (stats.calls, stats.pages, stats.throttled_429) == (1, 1, 0)
+    assert (stats.calls, stats.pages, stats.throttled_429, stats.retries) == (1, 1, 0, 0)
     assert before <= stats.first_call_at == stats.last_call_at <= after
     assert len(pacing.acquires) == 1
     assert result.quota_key == ALPACA_DATA_SCOPE
@@ -1433,16 +1432,14 @@ async def test_a_served_attempt_reports_its_vendor_call_count_and_times():
 @pytest.mark.parametrize(
     ('raised', 'klass', 'calls', 'throttled'),
     [
-        pytest.param(api_error(500), DeliveryErrorClass.TRANSIENT, 1, 0, id='500'),
-        pytest.param(api_error(403), DeliveryErrorClass.TRANSIENT, 1, 0, id='403-vendor-auth-is-not-ready'),
-        pytest.param(api_error(404), DeliveryErrorClass.PERMANENT, 1, 0, id='404'),
-        pytest.param(api_error(429), DeliveryErrorClass.RATE_LIMITED, 1, 1, id='429'),
+        pytest.param(status_answer(500), DeliveryErrorClass.TRANSIENT, 1, 0, id='500'),
+        pytest.param(status_answer(403), DeliveryErrorClass.TRANSIENT, 1, 0, id='403-vendor-auth-is-not-ready'),
+        pytest.param(status_answer(404), DeliveryErrorClass.PERMANENT, 1, 0, id='404'),
+        pytest.param(status_answer(429), DeliveryErrorClass.RATE_LIMITED, 1, 1, id='429'),
     ],
 )
 async def test_a_failed_attempt_reports_its_class_and_what_it_spent(raised, klass, calls, throttled):
-    client = Mock()
-    client.get_stock_bars.side_effect = raised
-    runner = BarsAttemptRunner(alpaca_reader(client, scheduler=RecordingScheduler()))
+    runner = BarsAttemptRunner(alpaca_reader(stub_vendor(raised).client, scheduler=RecordingScheduler()))
 
     result = await runner(bars_scheduled(), 1)
 
@@ -1450,6 +1447,8 @@ async def test_a_failed_attempt_reports_its_class_and_what_it_spent(raised, klas
     assert result.trailer.error_class is klass
     assert result.trailer.vendor_stats.calls == calls
     assert result.trailer.vendor_stats.throttled_429 == throttled
+    # None of these is a retried status, and none answered a good page.
+    assert (result.trailer.vendor_stats.pages, result.trailer.vendor_stats.retries) == (0, 0)
     assert result.feed is Feed.IEX
     assert result.parts == []
     if klass is DeliveryErrorClass.RATE_LIMITED:
@@ -1487,7 +1486,7 @@ def test_the_error_class_is_read_from_the_reasons_outcome():
 
 @pytest.mark.asyncio
 async def test_the_alpaca_handle_attempts_a_submitted_request_and_reports_it_to_the_store():
-    broker_api.set_client(stub_client(START))
+    broker_api.set_client(stub_client(START).client)
     handle = alpaca_handle()
     store = DoubleStore()
     handle.start(store, INSTANCE)

@@ -140,12 +140,17 @@ BROKER_SECRET_PREFIXES = ('ALPACA_', 'IBKR_', 'QUESTRADE_')
 NON_SECRET_BROKER_SETTINGS = frozenset(
     {
         'ALPACA_ADJUSTMENT',
-        'ALPACA_BACKFILL_RESERVE',
-        'ALPACA_RATE_BURST',
-        'ALPACA_RATE_LIMIT_PER_SEC',
+        'ALPACA_MAX_ATTEMPTS',
+        'ALPACA_OUTGOING_BUFFER_SIZE',
+        'ALPACA_RATE_LIMIT_PER_MINUTE',
         'ALPACA_SIP_ENABLED',
+        'ALPACA_STALL_TIMEOUT_S',
     }
 )
+
+# The ingest service's committed default env file. It travels with the service tree, so it is
+# resolved from SERVER_ROOT like the migration sites above, not from REPO_ROOT.
+INGEST_ENV_DEFAULT_FILE = SERVER_ROOT / 'data' / 'ingest' / '.env.default'
 
 # The right-hand sides that are a reference to a value held elsewhere, not the value itself:
 # one `${{ secrets.X }}` or `${{ env.X }}` expression, or a bare shell expansion `$X` / `${X}`.
@@ -550,7 +555,10 @@ _PASS_THROUGH = {
     'env-expression-in-echo': {'run': 'echo "ALPACA_API_SECRET=${{ env.ALPACA_API_SECRET }}" >> .env'},
     'docker-e-flag': {'run': 'docker run -e ALPACA_API_KEY="$ALPACA_API_KEY" image'},
     'env-mapping-secrets-expression': {'env': {'ALPACA_API_KEY': '${{ secrets.ALPACA_API_KEY }}'}},
-    'allowlisted-settings-as-literals': {'env': {'ALPACA_RATE_BURST': 5}, 'run': 'ALPACA_SIP_ENABLED=true ./x'},
+    'allowlisted-settings-as-literals': {
+        'env': {'ALPACA_RATE_LIMIT_PER_MINUTE': 60},
+        'run': 'ALPACA_SIP_ENABLED=true ./x',
+    },
 }
 _MUST_FAIL = {
     'literal-in-run': {'run': 'ALPACA_API_KEY=pk-literal ./x'},
@@ -577,6 +585,27 @@ def test_literal_credential_rule_accepts_references(step: dict):
 def test_literal_credential_rule_rejects_literals(step: dict):
     """Each of these commits a credential value, or a fallback to one, and must be caught."""
     assert _literal_broker_credentials({'jobs': {'j': {'steps': [step]}}}) != []
+
+
+def test_every_broker_setting_the_ingest_env_default_assigns_is_classified_non_secret():
+    """Every broker-prefixed name the ingest default env file assigns is on NON_SECRET_BROKER_SETTINGS.
+
+    The file is committed and public, so a broker name it assigns a value to is a plain setting by
+    construction: the credentials appear in it only as commented-out placeholders. A setting missing
+    from the allowlist is judged a credential, so a workflow setting it to a literal fails the check
+    above; a credential assigned here would be a leak in its own right. Either way the file and the
+    allowlist must agree, and this pins them together (tj-7zjov1.57).
+    """
+    assigned = [
+        name for name in _env_file_values(INGEST_ENV_DEFAULT_FILE) if name.upper().startswith(BROKER_SECRET_PREFIXES)
+    ]
+    assert assigned, f'{INGEST_ENV_DEFAULT_FILE} assigns no broker setting; this test has stopped looking'
+    unclassified = [name for name in assigned if _is_broker_credential(name)]
+    assert not unclassified, (
+        f'{INGEST_ENV_DEFAULT_FILE.name} assigns {unclassified}, which NON_SECRET_BROKER_SETTINGS does not '
+        f'classify. Add the name there if it is a plain setting; if it is a credential, remove its value '
+        f'from the committed file and rotate it.'
+    )
 
 
 @pytest.mark.parametrize('workflow', _workflow_files(), ids=lambda p: p.name)

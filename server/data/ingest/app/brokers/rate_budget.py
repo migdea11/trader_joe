@@ -4,8 +4,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from enum import IntEnum
 
-from common.enums.data_stock import DataSource, UpdateType
-from common.environment import get_env_var
+from common.enums.data_stock import UpdateType
 from common.errors.vocabulary import ExogenousError, Reason
 from common.logging import get_logger
 
@@ -92,30 +91,6 @@ class RateBudget:
         if rate_per_sec is None:
             log.warning(f'No rate budget configured for {vendor}; vendor calls are unthrottled')
 
-    @classmethod
-    def from_env(cls, source: DataSource, clock: Callable[[], float] = time.monotonic) -> 'RateBudget':
-        """Build a vendor's budget from its environment configuration.
-
-        The numbers are configured, never hard-coded: tj-wss8a2 documents Questrade REST at
-        30 req/s and IBKR at 10 req/s per username, while Alpaca's figure is still
-        unconfirmed (tj-3mk3u5.2). An unset rate leaves the vendor unthrottled rather than
-        throttled at a number nobody has verified.
-
-        Args:
-            source (DataSource): Vendor whose budget to build.
-            clock (Callable[[], float]): Monotonic clock, injectable for tests.
-
-        Returns:
-            RateBudget: Budget for that vendor.
-        """
-        return cls(
-            vendor=source.value,
-            rate_per_sec=get_env_var(f'{source.value}_RATE_LIMIT_PER_SEC', cast_type=float),
-            burst=get_env_var(f'{source.value}_RATE_BURST', cast_type=float),
-            backfill_reserve=get_env_var(f'{source.value}_BACKFILL_RESERVE', cast_type=float),
-            clock=clock,
-        )
-
     @property
     def tokens(self) -> float:
         """Report the tokens available right now.
@@ -138,7 +113,7 @@ class RateBudget:
         Returns:
             float: Burst divided by the refill rate, in seconds. 0.0 when no rate is configured:
                 an unthrottled budget models no window, and a number nobody has verified is not
-                invented for it (see from_env).
+                invented for it.
         """
         if self.__rate_per_sec is None:
             return 0.0

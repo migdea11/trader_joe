@@ -70,6 +70,7 @@ from data.ingest.app.brokers.interface import (
 )
 from data.ingest.app.brokers.rate_budget import RequestPriority
 from data.ingest.app.scheduler import scheduler as scheduler_module
+from data.ingest.tests.alpaca_recorded import Answer, StubVendor, bars_answer, status_answer, stub_vendor, wire_bar
 from data.ingest.tests.scheduler_doubles import (
     ONE_PER_MINUTE_OVER_AN_HOUR,
     ONE_PER_SECOND,
@@ -99,55 +100,40 @@ UNSUPPORTED_REASONS = {Reason.UNSUPPORTED_INSTRUMENT, Reason.UNSUPPORTED_ASSET_T
 # ---------------------------------------------------------------------------------------------
 
 
-def vendor_bar(timestamp: datetime) -> SimpleNamespace:
-    """One alpaca-py bar, with every attribute AlpacaRead reads."""
-    return SimpleNamespace(
-        open=1.0, high=2.0, low=0.5, close=10.0, volume=10, trade_count=3, vwap=1.5, timestamp=timestamp
-    )
+# RE-PINNED ON tj-7zjov1.56. The doubles were a Mock whose get_stock_bars answered a StubBarSet or raised. The
+# reader now owns the bars page loop and calls the client's HTTP session itself (broker_api.request_page), so
+# they are the REAL alpaca-py client over a scripted transport (alpaca_recorded.stub_vendor): a status is an
+# HTTP answer the reader turns into its own APIError, and a transport failure is raised inside the session,
+# where requests raises it. "The vendor was not called" is now "no HTTP request reached the transport".
 
 
-class StubBarSet:
-    """The slice of alpaca-py's BarSet that AlpacaRead's conversion touches."""
-
-    def __init__(self, bars_by_symbol: dict[str, list[SimpleNamespace]]):
-        self.data = bars_by_symbol
-
-    def __getitem__(self, symbol: str) -> list[SimpleNamespace]:
-        return self.data[symbol]
+def stub_client(*timestamps: datetime, symbol: str = 'VFV') -> StubVendor:
+    return stub_vendor(bars_answer({symbol: [wire_bar(t) for t in timestamps]}))
 
 
-def stub_client(*timestamps: datetime, symbol: str = 'VFV') -> Mock:
-    client = Mock()
-    client.get_stock_bars.return_value = StubBarSet({symbol: [vendor_bar(t) for t in timestamps]})
-    return client
+def failing_client(answer: Answer) -> StubVendor:
+    return stub_vendor(answer)
 
 
-def failing_client(error: BaseException) -> Mock:
-    client = Mock()
-    client.get_stock_bars.side_effect = error
-    return client
-
-
-def api_error(status: int, message: str) -> APIError:
-    """An APIError as alpaca-py builds one: a real response, raise_for_status, APIError(text, http_error)."""
-    response = requests.Response()
-    response.status_code = status
-    response._content = f'{{"message": "{message}"}}'.encode()
-    response.encoding = 'utf-8'
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as http_error:
-        return APIError(response.text, http_error)
-    raise AssertionError(f'{status} is not an error status')
+def assert_caused_by(error: TraderJoeError, answer: Answer) -> None:
+    """The caught exception is the cause: the very instance the session raised, or the APIError of the status."""
+    if isinstance(answer, BaseException):
+        assert error.__cause__ is answer
+    else:
+        assert isinstance(error.__cause__, APIError)
+        assert error.__cause__.status_code == answer.status
+        assert error.__cause__.response.status_code == answer.status
 
 
 @pytest.fixture(autouse=True)
 def iex_deployment_and_no_cached_client(monkeypatch):
-    """An IEX deployment unless a test says otherwise, and no client cached across tests."""
+    """An IEX deployment unless a test says otherwise, no client cached and no reset remembered across tests."""
     monkeypatch.delenv('ALPACA_SIP_ENABLED', raising=False)
     broker_api.set_client(None)
+    broker_api.forget_resets()
     yield
     broker_api.set_client(None)
+    broker_api.forget_resets()
 
 
 # The scheduler the reader() below paces through unless a test hands it another. Set per test by `budget`.
@@ -172,7 +158,8 @@ def executor() -> Iterator[ThreadPoolExecutor]:
         yield pool
 
 
-def reader(client: Mock | None, executor: ThreadPoolExecutor, clock=lambda: NOW, scheduler=None) -> AlpacaRead:
+def reader(vendor: StubVendor | None, executor: ThreadPoolExecutor, clock=lambda: NOW, scheduler=None) -> AlpacaRead:
+    client = vendor.client if vendor is not None else None
     return alpaca_reader(client, executor, clock, scheduler=scheduler if scheduler is not None else PACING['scheduler'])
 
 
@@ -221,7 +208,7 @@ async def test_a_named_feed_the_deployment_cannot_serve_is_refused_before_any_ca
     assert named.value in error.detail
     assert dict(error.metadata) == {'feed': named.value}
     assert error.__cause__ is None
-    assert client.mock_calls == [], 'the vendor was called before the feed refusal'
+    assert client.sent == [], 'the vendor was called before the feed refusal'
     assert budget.acquires == [], 'a rate token was spent before the feed refusal'
 
 
@@ -239,7 +226,8 @@ async def test_a_named_feed_the_deployment_serves_is_honoured_up_to_the_vendors_
 
     assert isinstance(response, BarsResponse)
     assert response.feed is named
-    assert client.get_stock_bars.call_args.args[0].feed == DataFeed(named.value.lower())
+    [sent] = client.sent
+    assert sent.params['feed'] == DataFeed(named.value.lower()).value
     assert len(budget.acquires) == 1
 
 
@@ -280,7 +268,7 @@ async def test_a_range_starting_at_or_after_the_readers_clock_is_refused_before_
     assert error.reset_at is None
     assert error.__cause__ is None
     assert dict(error.metadata) == {'range_start': start.isoformat()}
-    assert client.mock_calls == [], 'the vendor was called for a range in the future'
+    assert client.sent == [], 'the vendor was called for a range in the future'
     assert budget.acquires == [], 'a rate token was spent on a range in the future'
 
 
@@ -291,7 +279,7 @@ async def test_a_range_starting_just_before_the_clock_is_fetched_not_refused(exe
     response = await reader(client, executor).get_bars(query(start=NOW - MICROSECOND, end=None))
 
     assert isinstance(response, BarsResponse)
-    client.get_stock_bars.assert_called_once()
+    assert len(client.sent) == 1
 
 
 @pytest.mark.asyncio
@@ -362,7 +350,7 @@ async def test_a_range_that_starts_in_the_past_and_ends_in_the_future_is_served_
 
     assert isinstance(response, BarsResponse)
     assert response.served_range == ServedRange(START, NOW)
-    client.get_stock_bars.assert_called_once()
+    assert len(client.sent) == 1
 
 
 @pytest.mark.asyncio
@@ -403,10 +391,10 @@ async def test_as_of_is_read_after_the_vendor_answered(executor, budget):
 @pytest.mark.parametrize(
     ('raised', 'reason'),
     [
-        pytest.param(api_error(400, 'end should not be before start'), Reason.VENDOR_INVALID_REQUEST, id='400'),
-        pytest.param(api_error(403, 'forbidden'), Reason.VENDOR_AUTH, id='403'),
-        pytest.param(api_error(404, 'not found'), Reason.VENDOR_REJECTED, id='404'),
-        pytest.param(api_error(500, 'internal'), Reason.VENDOR_UNAVAILABLE, id='500'),
+        pytest.param(status_answer(400, 'end should not be before start'), Reason.VENDOR_INVALID_REQUEST, id='400'),
+        pytest.param(status_answer(403, 'forbidden'), Reason.VENDOR_AUTH, id='403'),
+        pytest.param(status_answer(404, 'not found'), Reason.VENDOR_REJECTED, id='404'),
+        pytest.param(status_answer(500, 'internal'), Reason.VENDOR_UNAVAILABLE, id='500'),
         pytest.param(requests.exceptions.ConnectionError('refused'), Reason.VENDOR_UNAVAILABLE, id='connection'),
         pytest.param(requests.exceptions.ReadTimeout('slow'), Reason.VENDOR_UNAVAILABLE, id='read-timeout'),
         # tj-3mk3u5.37.14: the connection cut while the body is read.
@@ -415,13 +403,15 @@ async def test_as_of_is_read_after_the_vendor_answered(executor, budget):
 )
 async def test_a_vendor_failure_is_returned_with_the_caught_exception_as_its_cause(executor, budget, raised, reason):
     """D8 via the 16:22 UTC addendum item 5: the returned form of 'raise ... from e'."""
-    response = await reader(failing_client(raised), executor).get_bars(query())
+    failing = failing_client(raised)
+    response = await reader(failing, executor).get_bars(query())
 
     error = failure_of(response)
     assert error.reason is reason
-    assert error.__cause__ is raised
-    # The call reached the vendor, so it spent its token.
+    assert_caused_by(error, raised)
+    # The call reached the vendor, once, so it spent one token: none of these is a retried status.
     assert len(budget.acquires) == 1
+    assert len(failing.sent) == 1
 
 
 @pytest.mark.asyncio
@@ -437,18 +427,20 @@ async def test_a_vendor_429_is_returned_rate_limited_with_reset_at_on_the_reader
     assert scheduler.window(ALPACA_DATA_SCOPE).declared_window_seconds == 60.0
     assert scheduler.window(ALPACA_DATA_SCOPE).full_refill_seconds == 1.0
     assert scheduler.window('DECOY').declared_window_seconds == 3600.0
-    raised = api_error(429, 'rate limit exceeded')
+    raised = status_answer(429, 'rate limit exceeded')
 
     error = failure_of(await reader(failing_client(raised), executor, scheduler=scheduler).get_bars(query()))
 
     assert error.reason is Reason.VENDOR_RATE_LIMITED
     # The scope's declared window: a minute after the reader's now.
     assert error.reset_at == NOW + timedelta(seconds=60)
-    assert error.__cause__ is raised
+    assert_caused_by(error, raised)
 
 
 @pytest.mark.asyncio
 async def test_an_api_error_with_no_status_is_re_raised_as_a_bug(executor, budget):
+    # Raised from inside the session: request_page never builds one without its HTTPError, so this is the
+    # only way left to put a status-less APIError in front of the classifier.
     raised = APIError('{"message": "no status"}')
 
     with pytest.raises(APIError) as caught:
@@ -516,7 +508,7 @@ async def test_the_rate_budgets_refusal_is_returned_with_no_cause_and_no_vendor_
     # The metadata key vendor carries the scope, which starts with the vendor's DataSource value (ADR tj-fa1rpu D8).
     assert error.metadata['vendor'] == ALPACA_DATA_SCOPE
     assert error.metadata['vendor'].startswith(DataSource.ALPACA_API.value)
-    assert client.mock_calls == []
+    assert client.sent == []
 
 
 @pytest.mark.asyncio

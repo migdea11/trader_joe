@@ -33,7 +33,6 @@ from collections.abc import AsyncIterator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta, timezone
-from types import SimpleNamespace
 from typing import Protocol, runtime_checkable
 from unittest.mock import Mock, patch
 from uuid import uuid4
@@ -59,6 +58,7 @@ from data.ingest.app.brokers.interface import (
     ServedRange,
 )
 from data.ingest.app.brokers.rate_budget import RequestPriority
+from data.ingest.tests.alpaca_recorded import StubVendor, bars_answer, stub_vendor, wire_bar
 from data.ingest.tests.grpc_bind import GUARD_S, LoopbackGrpc, free_loopback_port
 from data.ingest.tests.scheduler_doubles import RecordingScheduler, alpaca_reader
 from routers.data_ingest.submit_handler import IngestSubmitHandler
@@ -130,28 +130,13 @@ def build_query(**overrides) -> BarsQuery:
     return BarsQuery(**{**fields, **overrides})
 
 
-def vendor_bar(timestamp: datetime, close: float = 10.0) -> SimpleNamespace:
-    """One alpaca-py bar, with every attribute AlpacaRead reads (vwap included, as the SDK's is)."""
-    return SimpleNamespace(
-        open=1.0, high=2.0, low=0.5, close=close, volume=10, trade_count=3, vwap=1.5, timestamp=timestamp
-    )
+def stub_client(timestamps: list[datetime], symbol: str = 'VFV') -> StubVendor:
+    """The real alpaca-py client answering one page with one bar per timestamp.
 
-
-class StubBarSet:
-    """The slice of alpaca-py's BarSet that AlpacaRead's conversion touches."""
-
-    def __init__(self, symbol: str, bars: list[SimpleNamespace]):
-        self.data = {symbol: bars}
-
-    def __getitem__(self, symbol: str) -> list[SimpleNamespace]:
-        return self.data[symbol]
-
-
-def stub_client(timestamps: list[datetime], symbol: str = 'VFV') -> Mock:
-    """A stub Alpaca client answering get_stock_bars with one bar per timestamp."""
-    client = Mock()
-    client.get_stock_bars.return_value = StubBarSet(symbol, [vendor_bar(t) for t in timestamps])
-    return client
+    RE-PINNED ON tj-7zjov1.56 from a Mock whose get_stock_bars answered a StubBarSet: the reader now pages the
+    bars itself through the client's HTTP session (broker_api.request_page), which a Mock does not have.
+    """
+    return stub_vendor(bars_answer({symbol: [wire_bar(t) for t in timestamps]}))
 
 
 class RecordingRead:
@@ -393,13 +378,13 @@ async def test_alpaca_serves_its_own_listing_with_or_without_a_named_currency(
 ):
     # The other side of the refusals: None means 'the broker's own listing' and USD names it, so
     # both are served. Without this, a reader that refused everything would pass the tests above.
-    client = stub_client([START])
-    reader = alpaca_reader(client, executor)
+    vendor = stub_client([START])
+    reader = alpaca_reader(vendor.client, executor)
 
     response = await reader.get_bars(build_query(instrument=Instrument('VFV', AssetType.STOCK, currency=currency)))
 
     assert [bar.timestamp for bar in await collect(response)] == [START]
-    client.get_stock_bars.assert_called_once()
+    assert len(vendor.sent) == 1
 
 
 # ---------------------------------------------------------------------------------------------
@@ -416,7 +401,7 @@ async def test_alpaca_read_keeps_the_bar_at_start_and_drops_the_bar_at_end(execu
     The stub answers with a bar at start, one strictly between, one EXACTLY at end and one after
     end -- the vendor's inclusive answer plus a stray. Only start and between may come out.
     """
-    reader = alpaca_reader(stub_client(VENDOR_ANSWER), executor)
+    reader = alpaca_reader(stub_client(VENDOR_ANSWER).client, executor)
 
     bars = await collect(await reader.get_bars(build_query(end=END)))
 
@@ -425,7 +410,7 @@ async def test_alpaca_read_keeps_the_bar_at_start_and_drops_the_bar_at_end(execu
 
 @pytest.mark.asyncio
 async def test_an_open_ended_query_truncates_nothing(executor: ThreadPoolExecutor):
-    reader = alpaca_reader(stub_client(VENDOR_ANSWER), executor)
+    reader = alpaca_reader(stub_client(VENDOR_ANSWER).client, executor)
 
     bars = await collect(await reader.get_bars(build_query(end=None)))
 
@@ -440,9 +425,11 @@ async def test_an_end_with_a_non_utc_offset_truncates_at_the_same_instant(execut
     assert end_at_minus_five.utcoffset() != timedelta(0), 'the bound really does carry another offset'
     assert end_at_minus_five == END
 
-    utc_bars = await collect(await alpaca_reader(stub_client(VENDOR_ANSWER), executor).get_bars(build_query(end=END)))
+    utc_bars = await collect(
+        await alpaca_reader(stub_client(VENDOR_ANSWER).client, executor).get_bars(build_query(end=END))
+    )
     offset_bars = await collect(
-        await alpaca_reader(stub_client(VENDOR_ANSWER), executor).get_bars(build_query(end=end_at_minus_five))
+        await alpaca_reader(stub_client(VENDOR_ANSWER).client, executor).get_bars(build_query(end=end_at_minus_five))
     )
 
     assert [bar.timestamp for bar in offset_bars] == [bar.timestamp for bar in utc_bars] == [START, BETWEEN]

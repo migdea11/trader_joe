@@ -44,7 +44,7 @@ ALPACA_DATA_SCOPE = f'{DataSource.ALPACA_API.value}_DATA'
 ALPACA_CALLS_PER_MINUTE_CEILING = 200
 
 # The most rows one page of a bars call returns, and so the page size the cost estimate assumes.
-ALPACA_BARS_PAGE_SIZE = 10_000
+ALPACA_BARS_PAGE_SIZE = broker_api.BARS_PAGE_SIZE
 
 DEFAULT_OUTGOING_BUFFER_SIZE = 64
 DEFAULT_STALL_TIMEOUT_S = 300.0

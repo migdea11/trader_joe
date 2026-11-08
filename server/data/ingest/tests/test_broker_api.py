@@ -23,12 +23,12 @@ import os
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
-from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
 from alpaca.data.enums import DataFeed
+from alpaca.data.historical import StockHistoricalDataClient
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
@@ -38,6 +38,7 @@ from data.ingest.app.brokers.alpaca.read import AlpacaRead
 from data.ingest.app.brokers.broker_errors import MissingCredentialsError
 from data.ingest.app.brokers.interface import BarsFailure, BarsQuery, Instrument
 from data.ingest.app.brokers.rate_budget import RequestPriority
+from data.ingest.tests.alpaca_recorded import StubVendor, bars_answer, stub_vendor, wire_bar
 from data.ingest.tests.scheduler_doubles import alpaca_reader as paced_reader
 from schemas.data_ingest.get_dataset_request import StockDatasetRequest
 
@@ -61,7 +62,7 @@ def executor() -> Iterator[ThreadPoolExecutor]:
         yield pool
 
 
-def alpaca_reader(executor: ThreadPoolExecutor, client: Mock | None = None) -> AlpacaRead:
+def alpaca_reader(executor: ThreadPoolExecutor, client: StockHistoricalDataClient | None = None) -> AlpacaRead:
     """A real AlpacaRead over the given pool.
 
     Replaced install_alpaca() on tj-3mk3u5.32: the reader used to be installed in the ALPACA_API
@@ -71,7 +72,7 @@ def alpaca_reader(executor: ThreadPoolExecutor, client: Mock | None = None) -> A
 
     Args:
         executor (ThreadPoolExecutor): Pool the vendor call runs on.
-        client (Mock | None): Client to inject, or None for production's own (broker_api.get_client()).
+        client (StockHistoricalDataClient | None): Client to inject, or None for production's own (broker_api.get_client()).
 
     Since P11 (tj-7zjov1.20) the reader is paced by the Alpaca handle's scheduler, a required keyword; a
     scheduler that grants every call stands in for it, as nothing here is about pacing.
@@ -132,22 +133,14 @@ def build_request(**overrides) -> StockDatasetRequest:
     return StockDatasetRequest(**{**fields, **overrides})
 
 
-def build_bar(close: float) -> SimpleNamespace:
-    # vwap is carried because a real alpaca-py Bar always has it and AlpacaRead reads it: without
-    # it the conversion raises AttributeError, which store_retrieve_stock swallows into {}.
-    return SimpleNamespace(
-        open=1.0, high=2.0, low=0.5, close=close, volume=10, trade_count=3, vwap=1.5, timestamp=START
-    )
+def one_bar_vendor(symbol: str) -> StubVendor:
+    """The real alpaca-py client answering one page of one bar for the symbol.
 
-
-class StubBarSet:
-    """The slice of alpaca-py's BarSet that AlpacaRead's conversion actually touches."""
-
-    def __init__(self, symbol: str, bars: list[SimpleNamespace]):
-        self.data = {symbol: bars}
-
-    def __getitem__(self, symbol: str) -> list[SimpleNamespace]:
-        return self.data[symbol]
+    RE-PINNED ON tj-7zjov1.56 from a Mock whose get_stock_bars answered a StubBarSet: the reader now pages the
+    bars itself through the client's HTTP session (broker_api.request_page), which a Mock does not have.
+    What reached the vendor is read off the transport instead of off get_stock_bars' call arguments.
+    """
+    return stub_vendor(bars_answer({symbol: [wire_bar(START)]}))
 
 
 def test_module_body_runs_with_an_empty_environment(reimport_broker_api):
@@ -225,16 +218,15 @@ def test_sip_feed_is_read_at_call_time_not_at_import():
 async def test_an_injected_client_is_used_without_any_credentials(executor: ThreadPoolExecutor):
     # The injected client is the credential. Nothing reads the environment on this path.
     request = build_request()
-    client = Mock()
-    client.get_stock_bars.return_value = StubBarSet(request.asset_symbol, [build_bar(10.0)])
-    reader = alpaca_reader(executor, client)
+    vendor = one_bar_vendor(request.asset_symbol)
+    reader = alpaca_reader(executor, vendor.client)
 
     with patch.dict(os.environ, {}, clear=True):
         response = await reader.get_bars(build_query(request))
         bars = [bar async for bar in response.bars]
 
     assert len(bars) == 1
-    client.get_stock_bars.assert_called_once()
+    assert len(vendor.sent) == 1
 
 
 @pytest.mark.asyncio
@@ -271,17 +263,16 @@ async def test_the_feed_the_deployment_resolves_reaches_the_vendor_call(
         executor: Pool the vendor call runs on.
     """
     request = build_request()
-    client = Mock()
-    client.get_stock_bars.return_value = StubBarSet(request.asset_symbol, [build_bar(10.0)])
-    reader = alpaca_reader(executor, client)
+    vendor = one_bar_vendor(request.asset_symbol)
+    reader = alpaca_reader(executor, vendor.client)
 
     with patch.dict(os.environ, {'ALPACA_SIP_ENABLED': sip_enabled}):
         response = await reader.get_bars(build_query(request))
         assert [bar async for bar in response.bars], 'the vendor served nothing, so no call was made to inspect'
 
     assert response.feed is expected, 'the adapter resolved a tape the deployment did not configure'
-    sent = client.get_stock_bars.call_args.args[0]
-    assert sent.feed == DataFeed(expected.value.lower())
+    [sent] = vendor.sent
+    assert sent.params['feed'] == DataFeed(expected.value.lower()).value
 
 
 # RETIRED ON tj-3mk3u5.32, and this one is not a move -- the behaviour it pinned is GONE, replaced
@@ -337,10 +328,9 @@ async def test_the_resolved_feed_is_written_into_the_single_flight_key(
     a documented choice in fetch_data_type and normalising it here would stop testing it.
     """
     request = build_request()
-    client = Mock()
-    client.get_stock_bars.return_value = StubBarSet(request.asset_symbol, [build_bar(10.0)])
+    vendor = one_bar_vendor(request.asset_symbol)
     recorder = KeyRecordingSingleFlight(getattr(broker_api, '__SINGLE_FLIGHT'))
-    reader = alpaca_reader(executor, client)
+    reader = alpaca_reader(executor, vendor.client)
 
     with (
         patch.object(broker_api, '__SINGLE_FLIGHT', recorder),
@@ -366,10 +356,10 @@ async def test_two_tapes_do_not_share_one_single_flight_key(executor: ThreadPool
     adjustment. So if these keys are equal, feed is missing from the key.
     """
     request = build_request()
-    client = Mock()
-    client.get_stock_bars.return_value = StubBarSet(request.asset_symbol, [build_bar(10.0)])
+    # One answer per tape: each request below reaches the vendor once.
+    vendor = stub_vendor(*(bars_answer({request.asset_symbol: [wire_bar(START)]}) for _ in range(2)))
     recorder = KeyRecordingSingleFlight(getattr(broker_api, '__SINGLE_FLIGHT'))
-    reader = alpaca_reader(executor, client)
+    reader = alpaca_reader(executor, vendor.client)
 
     with patch.object(broker_api, '__SINGLE_FLIGHT', recorder):
         for sip_enabled in ('false', 'true'):

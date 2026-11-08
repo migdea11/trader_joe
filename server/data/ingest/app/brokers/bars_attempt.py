@@ -141,7 +141,7 @@ class BarsAttemptRunner:
         return AttemptResult(
             trailer=DeliveryTrailer(
                 outcome=DeliveryOutcome.SUCCEEDED,
-                vendor_stats=self.__stats(tally, None),
+                vendor_stats=self.__stats(tally),
                 served_range=domain.ServedRange(start=response.served_range.start, end=response.served_range.end),
                 as_of=response.as_of,
             ),
@@ -156,10 +156,7 @@ class BarsAttemptRunner:
         klass = error_class(error)
         return AttemptResult(
             trailer=DeliveryTrailer(
-                outcome=DeliveryOutcome.FAILED,
-                error_class=klass,
-                detail=error.detail,
-                vendor_stats=self.__stats(tally, error),
+                outcome=DeliveryOutcome.FAILED, error_class=klass, detail=error.detail, vendor_stats=self.__stats(tally)
             ),
             quota_key=request.quota_scope,
             feed=work.feed,
@@ -167,14 +164,13 @@ class BarsAttemptRunner:
         )
 
     @staticmethod
-    def __stats(tally: CallTally, error: TraderJoeError | None) -> VendorCallStats:
-        # alpaca-py pages inside one call and retries a 429 itself, and neither is visible from here: a page is
-        # counted per call, and the one 429 that survives the SDK's own retries is the only one seen.
+    def __stats(tally: CallTally) -> VendorCallStats:
+        # The true counts of the attempt: the reader acquires, and counts, once per HTTP request (tj-7zjov1.56).
         return VendorCallStats(
             calls=tally.calls,
-            pages=tally.calls,
-            throttled_429=1 if error is not None and error.reason is Reason.VENDOR_RATE_LIMITED else 0,
-            retries=0,
+            pages=tally.pages,
+            throttled_429=tally.throttled_429,
+            retries=tally.retries,
             first_call_at=tally.first_call_at,
             last_call_at=tally.last_call_at,
         )

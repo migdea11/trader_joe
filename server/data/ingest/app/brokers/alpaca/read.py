@@ -192,7 +192,12 @@ class AlpacaRead:
         except TraderJoeError as e:
             return BarsFailure(e)
         except VENDOR_FAILURES as e:
-            error = classify_vendor_error(e, rate_budget=self.__scheduler.window(self.__scope), clock=self.__clock)
+            error = classify_vendor_error(
+                e,
+                rate_budget=self.__scheduler.window(self.__scope),
+                clock=self.__clock,
+                last_reset=broker_api.last_reset(self.__scope, self.__clock()),
+            )
             if error is None:
                 raise
             return BarsFailure(error)

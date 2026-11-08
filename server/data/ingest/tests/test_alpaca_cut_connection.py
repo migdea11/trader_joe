@@ -15,8 +15,9 @@ body gets a SERVED answer, so a red here comes from the cut and never from the h
 
 DETERMINISTIC AND FAST. The server reads the whole request head before it answers, so hanging up
 sends a FIN and never a reset that could race the response head. It writes its answer in one go and
-closes, so the client never waits on it. The SDK's retry clock is recorded and must stay untouched,
-because a cut is not retried. The session ignores proxy variables, so the request reaches 127.0.0.1
+closes, so the client never waits on it. The reader's own 504 retry clock is recorded and must stay
+untouched, because a cut is not retried, and the SDK's own retry loop must never be entered (tj-7zjov1.56:
+the reader makes each request itself through broker_api.request_page). The session ignores proxy variables, so the request reaches 127.0.0.1
 whatever the environment says.
 """
 
@@ -42,7 +43,14 @@ from data.ingest.app.brokers.alpaca.classify import classify_vendor_error
 from data.ingest.app.brokers.alpaca.handle import ALPACA_DATA_SCOPE
 from data.ingest.app.brokers.interface import BarsFailure, BarsQuery, BarsResponse, Instrument
 from data.ingest.app.brokers.rate_budget import RequestPriority
-from data.ingest.tests.alpaca_recorded import BARS_PATH, PLACEHOLDER_KEY_ID, PLACEHOLDER_SECRET, load, record_sdk_sleeps
+from data.ingest.tests.alpaca_recorded import (
+    BARS_PATH,
+    PLACEHOLDER_KEY_ID,
+    PLACEHOLDER_SECRET,
+    load,
+    record_page_retry_sleeps,
+    sdk_retry_is_never_entered,
+)
 from data.ingest.tests.scheduler_doubles import FixedWindow, RecordingScheduler, alpaca_reader
 
 
@@ -143,32 +151,36 @@ def one_shot_server(answer: bytes) -> Iterator[OneShot]:
 
 @dataclass
 class SpiedClient:
-    """A real alpaca-py client pointed at the one-shot server, and every exception its bars call raised."""
+    """A real alpaca-py client pointed at the one-shot server, and every exception its HTTP session raised."""
 
     client: StockHistoricalDataClient
     raised: list[BaseException]
 
 
 def real_client(port: int) -> SpiedClient:
-    """Build the real SDK client against 127.0.0.1:<port>, recording what get_stock_bars raises.
+    """Build the real SDK client against 127.0.0.1:<port>, recording what its HTTP session raises.
 
-    The spy only records: it re-raises the very instance, so the reader sees exactly what the SDK
+    The spy only records: it re-raises the very instance, so the reader sees exactly what the session
     raised, and the test can then say which instance became the cause.
+
+    RE-PINNED ON tj-7zjov1.56: the spy wrapped get_stock_bars, which the reader no longer calls. It owns
+    the page loop and sends each request through the client's own session (broker_api.request_page), so
+    the session's request is where the cut is raised now and where the spy sits.
     """
     client = StockHistoricalDataClient(PLACEHOLDER_KEY_ID, PLACEHOLDER_SECRET, url_override=f'http://127.0.0.1:{port}')
     # No HTTP(S)_PROXY or NO_PROXY from the environment: the request goes to the one-shot server.
     client._session.trust_env = False
     raised: list[BaseException] = []
-    sdk_get_stock_bars = client.get_stock_bars
+    session_request = client._session.request
 
-    def get_stock_bars(request):
+    def request(*args, **kwargs):
         try:
-            return sdk_get_stock_bars(request)
+            return session_request(*args, **kwargs)
         except BaseException as error:
             raised.append(error)
             raise
 
-    client.get_stock_bars = get_stock_bars
+    client._session.request = request
     return SpiedClient(client, raised)
 
 
@@ -187,9 +199,20 @@ def budget() -> RecordingScheduler:
     return RecordingScheduler()
 
 
+@dataclass(frozen=True)
+class Retries:
+    """What would show a retry: the reader's waits before a 504 retry, and entries into the SDK's own loop."""
+
+    page_retry_sleeps: list[float]
+    sdk_loop: list[str]
+
+    def none(self) -> bool:
+        return self.page_retry_sleeps == [] and self.sdk_loop == []
+
+
 @pytest.fixture
-def sdk_sleeps(monkeypatch) -> list[float]:
-    return record_sdk_sleeps(monkeypatch)
+def retries(monkeypatch) -> Retries:
+    return Retries(record_page_retry_sleeps(monkeypatch), sdk_retry_is_never_entered(monkeypatch))
 
 
 @pytest.fixture
@@ -231,11 +254,11 @@ def connection_error_classified() -> ExogenousError:
     'answer', [pytest.param(content_length_cut(), id='content-length'), pytest.param(chunk_cut(), id='chunked')]
 )
 async def test_a_connection_cut_mid_body_is_vendor_unavailable_with_the_sdks_exception_as_its_cause(
-    executor, budget, sdk_sleeps, answer
+    executor, budget, retries, answer
 ):
     outcome, seen, spied = await get_bars_through(answer, executor, budget)
 
-    # The real SDK reached the server, for the bars endpoint, and its call raised exactly once.
+    # The real SDK session reached the server, for the bars endpoint, and its request raised exactly once.
     assert seen.request_head.startswith(f'GET {BARS_PATH}?'.encode()), seen.request_head[:80]
     assert len(spied.raised) == 1
     cut = spied.raised[0]
@@ -257,13 +280,13 @@ async def test_a_connection_cut_mid_body_is_vendor_unavailable_with_the_sdks_exc
     # D8: nothing of the partial body or of the exception text reaches the caller.
     assert WHOLE_BODY[:SENT_BEFORE_THE_CUT].decode() not in error.detail
     assert str(cut) not in error.detail
-    # One call reached the vendor and spent one token, from the Alpaca scope; the SDK did not retry the cut.
+    # One call reached the vendor and spent one token, from the Alpaca scope; nothing retried the cut.
     assert [acquire.scope for acquire in budget.acquires] == [ALPACA_DATA_SCOPE]
-    assert sdk_sleeps == []
+    assert retries.none()
 
 
 @pytest.mark.asyncio
-async def test_the_same_server_sending_the_whole_body_is_served(executor, budget, sdk_sleeps):
+async def test_the_same_server_sending_the_whole_body_is_served(executor, budget, retries):
     """The control: the harness answers a real SDK request, so a red above is the cut and nothing else."""
     outcome, seen, spied = await get_bars_through(whole_answer(), executor, budget)
 
@@ -274,4 +297,4 @@ async def test_the_same_server_sending_the_whole_body_is_served(executor, budget
     assert closes == [bar['c'] for bar in RECORDED.bars]
     assert len(closes) == 3
     assert [acquire.scope for acquire in budget.acquires] == [ALPACA_DATA_SCOPE]
-    assert sdk_sleeps == []
+    assert retries.none()
