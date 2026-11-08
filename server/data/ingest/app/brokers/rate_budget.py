@@ -164,6 +164,38 @@ class RateBudget:
             return True
         return False
 
+    def wait_seconds(self, priority: RequestPriority = RequestPriority.INTERACTIVE) -> float:
+        """Report how long until this priority class may spend a token, spending nothing.
+
+        Args:
+            priority (RequestPriority): Priority class of the call.
+
+        Returns:
+            float: Seconds to wait; 0.0 when a token is spendable now (the backfill reserve floor included)
+                or when no rate is configured.
+        """
+        if self.__rate_per_sec is None:
+            return 0.0
+        self.__refill()
+        if self.__tokens - self.__floor(priority) >= 1.0:
+            return 0.0
+        return self.__wait_for(priority)
+
+    def charge(self, cost: float) -> None:
+        """Take tokens the vendor has already been charged, even if that leaves the bucket in debt.
+
+        For spend that cannot be refused or waited for: after a restart, requests the old process may have
+        sent are counted against the window before anything new is scheduled (tj-26jt9w addendum 5). A
+        balance below zero is the point: later calls wait until refill has paid the debt off.
+
+        Args:
+            cost (float): Tokens to take. Zero or less takes nothing.
+        """
+        if self.__rate_per_sec is None or cost <= 0:
+            return
+        self.__refill()
+        self.__tokens -= cost
+
     async def acquire(
         self, priority: RequestPriority = RequestPriority.INTERACTIVE, deadline: datetime | None = None
     ) -> None:
