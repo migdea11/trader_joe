@@ -38,9 +38,11 @@ from common.rpc.clients.ingest_submit import GrpcIngestSubmitClient
 from common.rpc.mapping.values import ProtoMappingError
 from data.ingest.app import app_depends, main
 from data.ingest.app import instance as instance_module
+from data.ingest.app.brokers import handle as handle_module
 from data.ingest.app.brokers.alpaca import broker_api
 from data.ingest.app.brokers.alpaca.handle import AlpacaHandle
 from data.ingest.app.brokers.handle import BrokerHandle
+from data.ingest.app.brokers.handle import Intake as KindIntake
 from data.ingest.app.instance import (
     InstanceIdentity,
     announce_until_acknowledged,
@@ -69,7 +71,14 @@ from schemas.data_ingest.delivery import (
     DeliveryVerdict,
     RegisterInstanceRequest,
 )
-from schemas.data_ingest.submit import BarsRequest, SubmitRequest
+from schemas.data_ingest.submit import (
+    AssetListRequest,
+    AssetListStatus,
+    BarsRequest,
+    CorporateActionsRequest,
+    RequestKind,
+    SubmitRequest,
+)
 
 
 pytestmark = pytest.mark.data_ingest
@@ -802,6 +811,151 @@ async def test_an_exhausted_resubmit_while_its_report_is_pending_is_answered_aga
     assert intake.runner.calls == []
     assert len(intake.charges) == (1 if recovered else 0), 'the duplicate was charged'
     assert intake.order.count('report_exhausted') == 1, 'the duplicate was reported again'
+
+
+# ---------------------------------------------------------------------------------------------
+# The intake: the one INFO line a recovered request's charge leaves (tj-7zjov1.290)
+# ---------------------------------------------------------------------------------------------
+
+
+class HandleLines(logging.Handler):
+    """Every record the handle module's own logger emits, and a mark in an Intake's order log when one lands.
+
+    The mark is what pins the line AFTER the charge it reports: a line written before charge_restart returned
+    could not know the calls charged.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+        self.order: list[str] | None = None
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.name != handle_module.log.name:
+            return
+        self.records.append(record)
+        if self.order is not None:
+            self.order.append('log')
+
+    @property
+    def lines(self) -> list[tuple[int, str]]:
+        return [(record.levelno, record.getMessage()) for record in self.records]
+
+
+@pytest.fixture
+def handle_lines():
+    """The handle module's logger captured, with INFO enabled on it whatever the deployment's level."""
+    logger = logging.getLogger(handle_module.log.name)
+    handler = HandleLines()
+    previous = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        yield handler
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+
+
+def charge_line(request_id: str, kind: str = 'bars') -> tuple[int, str]:
+    """The exact INFO line the ruling's restart check reads (ADR tj-26jt9w, 2026-10-24; owner ruling 2026-11-03)."""
+    return (
+        logging.INFO,
+        f'Recovered request {request_id} ({kind}) charged its estimate of {ESTIMATE} calls to quota scope {SCOPE} '
+        'after an ingest restart',
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('attempt_count', [0, MAX_ATTEMPTS - 1], ids=['never-started', 'one-below-budget'])
+async def test_a_recovered_request_logs_its_charge_once_after_the_charge_and_before_it_is_queued(
+    attempt_count, handle_lines
+):
+    intake = Intake()
+    handle_lines.order = intake.order
+
+    await intake.handle.submit(submit_request('r1', attempt_count=attempt_count, recovered=True))
+
+    assert handle_lines.lines == [charge_line('r1')], 'not exactly one INFO line naming id, kind, estimate and scope'
+    assert intake.order == ['charge_restart', 'log', 'submit'], 'the line is not written after the charge'
+
+
+@pytest.mark.asyncio
+@EXHAUSTED
+async def test_a_recovered_exhausted_request_logs_its_charge_once_after_the_charge_and_before_its_report(
+    attempt_count, handle_lines
+):
+    async with Intake() as intake:
+        handle_lines.order = intake.order
+        await intake.handle.submit(submit_request('r1', attempt_count=attempt_count, recovered=True))
+        delivered = await intake.store.next()
+        answer(delivered, DeliveryVerdict.FINAL)
+        await settle()
+
+    assert delivered.attempt.trailer.outcome is DeliveryOutcome.EXHAUSTED
+    assert handle_lines.lines == [charge_line('r1')], 'not exactly one INFO line naming id, kind, estimate and scope'
+    assert intake.order == ['charge_restart', 'log', 'report_exhausted'], 'the line is not written after the charge'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'attempt_count', [0, 2, MAX_ATTEMPTS, MAX_ATTEMPTS + 2], ids=['fresh', 'retried', 'exactly-at-max', 'past-max']
+)
+async def test_a_request_not_flagged_recovered_logs_no_charge_line(attempt_count, handle_lines):
+    async with Intake() as intake:
+        await intake.handle.submit(submit_request('r1', attempt_count=attempt_count))
+        if attempt_count >= MAX_ATTEMPTS:
+            answer(await intake.store.next(), DeliveryVerdict.FINAL)
+        await settle()
+
+    assert handle_lines.lines == [], 'a request not flagged recovered left a line in the handle log'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('attempt_count', [1, MAX_ATTEMPTS], ids=['queued', 'exhausted'])
+@pytest.mark.parametrize('first_recovered', [True, False], ids=['held-as-recovered', 'held-as-new'])
+async def test_a_recovered_resubmit_of_an_id_already_held_logs_no_second_line(
+    attempt_count, first_recovered, handle_lines
+):
+    async with Intake() as intake:
+        await intake.handle.submit(submit_request('r1', attempt_count=attempt_count, recovered=first_recovered))
+        await intake.handle.submit(submit_request('r1', attempt_count=attempt_count, recovered=True))
+        if attempt_count >= MAX_ATTEMPTS:
+            answer(await intake.store.next(), DeliveryVerdict.FINAL)
+        await settle()
+
+    assert handle_lines.lines == ([charge_line('r1')] if first_recovered else []), 'the duplicate left a line'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', list(RequestKind), ids=[kind.value for kind in RequestKind])
+async def test_the_charge_line_names_the_kind_of_the_recovered_request(kind, handle_lines):
+    """Bars go through the handle's real intake; the no-tape kinds through a stub intake charging the same scope."""
+    intake = Intake()
+    if kind is not RequestKind.BARS:
+        intake.handle.register_intake(kind, lambda _request: KindIntake(scope=SCOPE, payload=None))
+    body = {
+        RequestKind.BARS: {'bars': bars_request()},
+        RequestKind.ASSET_LIST: {
+            'asset_list': AssetListRequest(
+                source=DataSource.ALPACA_API, asset_type=AssetType.STOCK, status=AssetListStatus.ACTIVE
+            )
+        },
+        RequestKind.CORPORATE_ACTIONS: {
+            'corporate_actions': CorporateActionsRequest(
+                source=DataSource.ALPACA_API, asset_symbol='VFV', start=START, end=END
+            )
+        },
+    }[kind]
+
+    await intake.handle.submit(
+        SubmitRequest(request_id='r-kind', owner='owner-zz-secret', client='client-zz', recovered=True, **body)
+    )
+
+    assert handle_lines.lines == [charge_line('r-kind', kind.value)]
+    message = handle_lines.lines[0][1]
+    assert 'owner-zz-secret' not in message and 'client-zz' not in message, 'the line carries the owner or client'
+    assert 'VFV' not in message, 'the line carries the request payload'
 
 
 @pytest.mark.asyncio

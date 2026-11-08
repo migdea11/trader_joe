@@ -14,12 +14,15 @@ WHAT IT PINS, from the database:
     attempt rows';
   * no duplicate dataset rows: one entry per symbol, exactly the generator's bars.
 
-THE CHARGE IS NOT OBSERVABLE HERE, said plainly. The ruling counts a re-requested request against quota with the
+THE CHARGE IS NOT ASSERTED HERE, said plainly. The ruling counts a re-requested request against quota with the
 conservative estimate: the new instance charges it to its scope's in-process rate window before queuing it
-(server/data/ingest/app/brokers/handle.py, Scheduler.charge_restart). That window lives only in ingest's memory, no
-log line names the charge, and test_client cannot reach ingest, so nothing at this tier can read it. What this tier
-does show is the store's side of the same rule: the charge is never written as spend, so a recovered request's
-spend is exactly its delivered attempt's. The charge itself is pinned in ingest's unit tier.
+(server/data/ingest/app/brokers/handle.py, Scheduler.charge_restart). That window lives only in ingest's memory and
+test_client cannot reach ingest, so this file cannot read it. Each charge leaves one INFO line in data_ingest's log
+('Recovered request <id> (<kind>) charged its estimate of <N> calls to quota scope <scope> after an ingest restart',
+tj-7zjov1.290); the orchestrator reads it with `logs data_ingest` between the restart and this phase (step 4b in
+phase_s2a_ingest_restart_before.py). What this tier does show is the store's side of the same rule: the charge is
+never written as spend, so a recovered request's spend is exactly its delivered attempt's. The charge and its line
+are pinned in ingest's unit tier (server/data/ingest/tests/test_restart_intake.py).
 """
 
 import pytest

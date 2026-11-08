@@ -30,6 +30,7 @@ from dataclasses import dataclass
 
 from common.enums.data_stock import DataSource, Feed
 from common.errors.vocabulary import ERROR_DOMAIN, InvalidRequestError, Reason
+from common.logging import get_logger
 from common.rpc.clients.store_delivery import StoreDeliveryClient
 from data.ingest.app.brokers.bars_attempt import BarsWork
 from data.ingest.app.brokers.interface import BrokerRead
@@ -40,6 +41,8 @@ from data.ingest.app.scheduler.scheduler import Scheduler
 from schemas.data_ingest.fetch_dataset import FetchRefused
 from schemas.data_ingest.submit import RequestKind, SubmitAccepted, SubmitAck, SubmitRequest
 
+
+log = get_logger(__name__)
 
 # The fixed prefix of a handle's gRPC health service name. A registered servicer is named by its protobuf package and
 # service (trader_joe.proto.internal.ingest.v1.IngestService), so a name under this prefix cannot collide with one.
@@ -216,14 +219,22 @@ class BrokerHandle:
             # The budget was spent before this instance: no vendor attempt, never queued. A recovered one is still
             # charged (the old instance may have had an attempt in flight), before it is reported.
             if request.recovered:
-                self.__scheduler.charge_restart(scheduled)
+                self.__charge_recovered(request, scheduled)
             self.__executor.report_exhausted(scheduled)
             return accepted
         if request.recovered:
             # Before the queue, so the window already holds this request's cost when a worker can take it.
-            self.__scheduler.charge_restart(scheduled)
+            self.__charge_recovered(request, scheduled)
         await self.__scheduler.submit(scheduled)
         return accepted
+
+    def __charge_recovered(self, request: SubmitRequest, scheduled: ScheduledRequest) -> None:
+        """Charge a recovered request its registered estimate and log it once (tj-26jt9w addendum 5)."""
+        estimate = self.__scheduler.charge_restart(scheduled)
+        log.info(
+            f'Recovered request {request.request_id} ({request.kind.value}) charged its estimate of {estimate} '
+            f'calls to quota scope {scheduled.quota_scope} after an ingest restart'
+        )
 
     def __bars_intake(self, request: SubmitRequest) -> Intake | SubmitAck:
         """The bars kind's intake: serve the account's feed, refuse a named one it cannot serve, charge the data scope.

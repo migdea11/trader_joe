@@ -19,6 +19,9 @@ ORCHESTRATOR STEPS (the hand-back of tj-7zjov1.286 has the whole list):
      and the 'FAKE BROKER:' banner again
   4. logs service data_store tail 400, after at least 90 s: expect INFO 'Instance watch: 0 pending re-sent, <n>
      recovered re-submitted, 0 failed, 0 skipped' with n >= 1
+  4b. logs service data_ingest tail 400, right after step 4: expect, after the restart's announcement, INFO lines of
+     the fixed text 'Recovered request <request_id> (bars) charged its estimate of <N> calls to quota scope <scope>
+     after an ingest restart', one per recovered request, count >= 1 (the charge itself, tj-7zjov1.290)
   5. run_system_tests paths ['tests/system/phased/phase_s2b_ingest_restart_after.py']  -> 1 passed (polls up to 600 s)
 """
 
