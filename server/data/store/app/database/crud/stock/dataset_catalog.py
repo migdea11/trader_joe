@@ -8,6 +8,7 @@ for however many datasets it is asked about:
 
     list_catalog        every matching entry with its newest bar, in one statement
     bar_extents         first bar, last bar and count for a set of entries, in one statement
+    newest_counted_real_bar  one dataset's newest counted real bar (the refresh's lost anchor), in one statement
     recent_placeholder_bars  one dataset's newest stored placeholder bars and their write times, in one statement
     covered_dates       the session dates holding a real (non-placeholder) bar, for a set of STATIC entries, in one statement per time zone
     siblings            the other granularities of a set of entries' series, in one statement
@@ -391,6 +392,44 @@ async def recent_placeholder_bars(
     )
     result = await db.execute(stmt)
     return [PlaceholderBar(timestamp=ts, written_at=written) for ts, written in result.all()]
+
+
+@dataclass(frozen=True)
+class CountedBar:
+    """A stored real bar that counts as fetched, as the refresh's lost-anchor rule reads it (tj-7zjov1.122).
+
+    Attributes:
+        timestamp: The bar's timestamp.
+        written_at: When it was last written (its updated_at).
+    """
+
+    timestamp: datetime
+    written_at: datetime
+
+
+async def newest_counted_real_bar(db: AsyncSession, row: CatalogRow) -> CountedBar | None:
+    """One dataset's newest COUNTED real bar, or None. One statement.
+
+    Counted is the refresh's rule for a real bar (daily_refresh._can_be_real, decision tj-7zjov1.120): not a
+    placeholder (Bar.is_placeholder_bar, the model's rule), inside the declared range [start, end), and written at
+    or after its own stamp (updated_at >= timestamp: written_before_its_stamp is the strict opposite, equality
+    counts). The write time is past, so such a bar is stamped before now without naming now.
+
+    Args:
+        db: A session.
+        row: The dataset to read.
+
+    Returns:
+        CountedBar | None: The newest such bar, None when there is none.
+    """
+    stmt = (
+        select(Bar.timestamp, Bar.updated_at)
+        .where(*_window_conditions(row, row.start, row.end), ~Bar.is_placeholder_bar, Bar.updated_at >= Bar.timestamp)
+        .order_by(Bar.timestamp.desc())
+        .limit(1)
+    )
+    found = (await db.execute(stmt)).first()
+    return None if found is None else CountedBar(timestamp=found[0], written_at=found[1])
 
 
 async def covered_dates(db: AsyncSession, rows: list[CatalogRow], tz_name: str) -> dict[uuid.UUID, frozenset[date]]:

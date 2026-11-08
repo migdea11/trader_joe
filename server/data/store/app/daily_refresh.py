@@ -17,8 +17,8 @@ ingest for ONLY the missing range: from the newest STORED bar plus one bar, a pl
 start when there are no bars), reaching back to the newest real bar when it was written before its period closed
 (the vendor's part-way bar is overwritten by the final one, tj-grna9p.167) and to the oldest placeholder not yet
 settled for PLACEHOLDER_GRACE (a pad the vendor may replace, tj-7zjov1.114); never before the declared start, and
-nothing is requested when that leaves no period to ask for; through the same fetch path POST /store uses (store_market_activity_worker, through the run recorder with
-trigger SCHEDULE and actor `scheduler`). The entry keeps its declared range as identity, so the refresh extends the
+nothing is requested when that leaves no period to ask for. The request is written and submitted by submit_bars
+(trigger SCHEDULE, actor `scheduler`) and not awaited. The entry keeps its declared range as identity, so the refresh extends the
 existing entry and never creates a second one. A dataset requested earlier is therefore picked up by the next pass.
 
 BOUNDED. One dataset at a time, never concurrently; at most DAILY_REFRESH_MAX_PER_PASS datasets REQUESTED per pass,
@@ -78,8 +78,10 @@ from data.store.app.database.crud.ingest_run import IngestRunRecord, finished_sc
 from data.store.app.database.crud.stock.dataset_catalog import (
     CatalogFilter,
     CatalogRow,
+    CountedBar,
     PlaceholderBar,
     list_catalog,
+    newest_counted_real_bar,
     recent_placeholder_bars,
 )
 from data.store.app.database.database import own_session
@@ -251,6 +253,17 @@ def _placeholder_unsettled(
     return closes is not None and _as_aware(bar.written_at) < closes + settle_margin + PLACEHOLDER_GRACE
 
 
+@dataclass(frozen=True)
+class LostAnchor:
+    """The newest COUNTED real bar of a dataset whose newest real bar does not count (tj-7zjov1.122).
+
+    Attributes:
+        bar: The newest counted real bar, or None when the dataset holds none (pads only).
+    """
+
+    bar: CountedBar | None
+
+
 def _fetch_start(
     row: CatalogRow,
     calendar: TradingCalendar,
@@ -258,6 +271,7 @@ def _fetch_start(
     now: datetime | None = None,
     *,
     truncated: bool = False,
+    lost_anchor: LostAnchor | None = None,
 ) -> datetime:
     """Where the refresh's tail starts: the declared start with no bars, else just after the newest STORED bar.
 
@@ -285,8 +299,12 @@ def _fetch_start(
         few seconds after the transaction start): it costs at most one extra session (about 960 bars) inside the call
         the pass makes anyway. No hole pairing and no provisional reach-back are needed, since every such candidate
         lies at or after that midnight.
-      - Any other case (outside the declared range, or no write time): the tail starts at the declared start, a full
-        re-fetch for as long as the bad bar lasts. Bounding it by reading the newest counted real bar is tj-7zjov1.122.
+      - Any other case (outside the declared range, or no write time): the newest COUNTED real bar was read for
+        this case (`lost_anchor`, one statement, tj-7zjov1.122) and takes the place of the newest real bar: it is the
+        anchor of the run and of the hole check, its own provisional test applies, and the tail starts after the
+        newest counted bar as for any dataset. No counted real bar at all (`LostAnchor(None)`) means the dataset
+        has pads only. Without a read (`lost_anchor` None: the caller did not read it) the tail starts at the
+        declared start, the full re-fetch the read removes.
 
     TRUNCATED READ. `truncated` says the placeholder read stopped on a full page of settled bars, so older pads exist
     that were not read. The newest real bar is then NOT paired with the oldest pad read: the unread pads between them
@@ -303,28 +321,31 @@ def _fetch_start(
         (p for p in placeholders if _can_be_real(p.timestamp, p.written_at, row, calendar, now, placeholder=True)),
         key=lambda p: _as_aware(p.timestamp),
     )
-    if row.last_bar is not None and not _can_be_real(
-        row.last_bar, row.last_bar_written_at, row, calendar, now, placeholder=False
-    ):
+    real, real_written_at = row.last_bar, row.last_bar_written_at
+    if real is not None and not _can_be_real(real, real_written_at, row, calendar, now, placeholder=False):
         if not _written_early_inside_range(row):
-            return row.start
-        margin = settle_margin_from_env()
-        floor = local_midnight(
-            period_start(session_of(_as_aware(row.last_bar_written_at), calendar), row.granularity), calendar
-        )
-        candidates = [
-            floor,
-            *(p.timestamp for p in pads if _placeholder_unsettled(p, calendar, row.granularity, margin)),
-        ]
-        earliest = min(candidates, key=_as_aware)
-        return row.start if _as_aware(earliest) < _as_aware(row.start) else earliest
-    real = row.last_bar
+            if lost_anchor is None:
+                return row.start
+            # The newest counted real bar stands in for the newest real bar; None means pads only.
+            counted = lost_anchor.bar
+            real, real_written_at = (None, None) if counted is None else (counted.timestamp, counted.written_at)
+        else:
+            margin = settle_margin_from_env()
+            floor = local_midnight(
+                period_start(session_of(_as_aware(real_written_at), calendar), row.granularity), calendar
+            )
+            candidates = [
+                floor,
+                *(p.timestamp for p in pads if _placeholder_unsettled(p, calendar, row.granularity, margin)),
+            ]
+            earliest = min(candidates, key=_as_aware)
+            return row.start if _as_aware(earliest) < _as_aware(row.start) else earliest
     stored = [bar for bar in (real, *(p.timestamp for p in pads)) if bar is not None]
     if not stored:
         return row.start
     margin = settle_margin_from_env()
     starts = [_after_bar(max(stored, key=_as_aware), row.granularity, calendar)]
-    if real is not None and last_bar_is_provisional(real, row.last_bar_written_at, calendar, row.granularity, margin):
+    if real is not None and last_bar_is_provisional(real, real_written_at, calendar, row.granularity, margin):
         starts.append(real)
     starts.extend(p.timestamp for p in pads if _placeholder_unsettled(p, calendar, row.granularity, margin))
     after_real = [p.timestamp for p in pads if real is None or _as_aware(p.timestamp) > _as_aware(real)]
@@ -363,13 +384,14 @@ def _request_for(
     now: datetime | None = None,
     *,
     truncated: bool = False,
+    lost_anchor: LostAnchor | None = None,
 ) -> tuple[StoreAssetDatasetPath, StoreAssetDatasetBody, datetime]:
     """The request a dataset's refresh sends: its path, its body and the start of the tail it asks ingest for.
 
     Raises:
         ValidationError: The stored row no longer validates as a request.
     """
-    fetch_start = _fetch_start(row, calendar, placeholders, now, truncated=truncated)
+    fetch_start = _fetch_start(row, calendar, placeholders, now, truncated=truncated, lost_anchor=lost_anchor)
     # The entry's own identity, so ingest's ack resolves to THIS entry. The stored tape is named as the
     # preference: a tape ingest can no longer serve is a refused ack, never a second entry.
     body = StoreAssetDatasetBody(
@@ -427,10 +449,22 @@ class PlaceholderTail:
     Attributes:
         bars: The placeholders read.
         truncated: True when the read stopped on a full page ending in a settled bar, so older placeholders may exist.
+        lost_anchor: The newest counted real bar, read only when the newest real bar does not count and the tail
+            cannot be bounded by its write time; None when it was not read.
     """
 
     bars: list[PlaceholderBar]
     truncated: bool = False
+    lost_anchor: LostAnchor | None = None
+
+
+def _needs_lost_anchor(row: CatalogRow, calendar: TradingCalendar) -> bool:
+    """Whether the newest real bar does not count and its write time cannot bound the tail (tj-7zjov1.122)."""
+    return (
+        row.last_bar is not None
+        and not _can_be_real(row.last_bar, row.last_bar_written_at, row, calendar, None, placeholder=False)
+        and not _written_early_inside_range(row)
+    )
 
 
 async def _read_placeholder_tails(
@@ -448,6 +482,12 @@ async def _read_placeholder_tails(
     GUARD raises when a full page does not end strictly older than where it started, so a defect (a repeated page)
     fails loudly instead of hanging the pass.
 
+    LOST ANCHOR (tj-7zjov1.122). When the newest real bar does not count and its write time cannot bound the tail
+    (`_needs_lost_anchor`, judged without `now`: a bar written at or after its stamp was stamped no later than its write
+    time, which is past, so the stamp-before-now test adds nothing), the newest counted real bar is read first, in ONE extra statement for that dataset only,
+    and the placeholder lookback hangs from it. Otherwise the lookback hangs from the earlier of the newest real
+    bar's stamp and its write time, so a stamp far in the future (a phantom bar) never leaves unsettled pads unread.
+
     Raises:
         RuntimeError: A full page did not end strictly older than the bar it was read before.
     """
@@ -457,7 +497,17 @@ async def _read_placeholder_tails(
     tails: dict[uuid.UUID, PlaceholderTail] = {}
     async with own_session() as session:
         for row in owed:
-            floor = None if row.last_bar is None else row.last_bar - PLACEHOLDER_LOOKBACK
+            anchor: LostAnchor | None = None
+            if _needs_lost_anchor(row, calendar):
+                anchor = LostAnchor(await newest_counted_real_bar(session, row))
+                reference = None if anchor.bar is None else anchor.bar.timestamp
+            elif row.last_bar is None:
+                reference = None
+            elif row.last_bar_written_at is None:
+                reference = row.last_bar
+            else:
+                reference = min(_as_aware(row.last_bar), _as_aware(row.last_bar_written_at))
+            floor = None if reference is None else reference - PLACEHOLDER_LOOKBACK
             found: list[PlaceholderBar] = []
             before: datetime | None = None
             truncated = False
@@ -477,7 +527,7 @@ async def _read_placeholder_tails(
                     truncated = True
                     break
                 before = page[-1].timestamp
-            tails[row.id] = PlaceholderTail(found, truncated)
+            tails[row.id] = PlaceholderTail(found, truncated, anchor)
     return tails
 
 
@@ -685,7 +735,9 @@ class DailyRefresher:
         for row in owed:
             try:
                 tail = (tails or {}).get(row.id, PlaceholderTail([]))
-                path, body, fetch_start = _request_for(row, calendar, tail.bars, now, truncated=tail.truncated)
+                path, body, fetch_start = _request_for(
+                    row, calendar, tail.bars, now, truncated=tail.truncated, lost_anchor=tail.lost_anchor
+                )
             except ValidationError:
                 # A stored row that no longer validates as a request: never sent, and nothing to record.
                 skipped += 1

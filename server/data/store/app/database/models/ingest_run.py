@@ -99,8 +99,10 @@ class IngestRun(AppBase.DATA_STORE_BASE, CustomTypeTable):
     # The vendor's public instrument key the bars header carried, opaque and stored as received. NULL when the header
     # named none (an empty string is never stored) and on every run that is not a delivered bars attempt.
     vendor_asset_id = Column(String, nullable=True)
-    # The window a SUCCEEDED attempt answered for (the trailer's served_range): start inclusive, end exclusive. NULL on
-    # every other row, a failed or empty-handed attempt included.
+    # The window a SUCCEEDED report answered for (the trailer's served_range): start inclusive, end exclusive. Stored
+    # exactly as the report carried it, whatever state the row ends in: a zero-bar SUCCEEDED report is an EMPTY row that
+    # carries it, and so is a dropped delivery. NULL where the report carried none: a FAILED report (rule (d) allows the
+    # range on SUCCEEDED only), an asset-list attempt, and a row with no reported attempt.
     served_start = Column(DateTime(timezone=True), nullable=True)
     served_end = Column(DateTime(timezone=True), nullable=True)
 
