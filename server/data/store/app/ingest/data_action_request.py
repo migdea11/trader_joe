@@ -37,7 +37,8 @@ from typing import Final
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from common.enums.data_select import DataType
+from common.enums.data_select import AssetType, DataType
+from common.enums.data_stock import DataSource
 from common.environment import get_env_var
 from common.errors.vocabulary import ERROR_DOMAIN, REASONS, ExogenousError, InvalidRequestError, Reason, TraderJoeError
 from common.logging import get_logger
@@ -63,7 +64,7 @@ from data.store.app.database.models.ingest_request import (
 from data.store.app.database.models.ingest_run import IngestRunTrigger
 from data.store.app.database.transaction import write_transaction
 from schemas.data_ingest import fetch_dataset
-from schemas.data_ingest.submit import BarsRequest, SubmitRequest, SubmitResponse
+from schemas.data_ingest.submit import AssetListRequest, AssetListStatus, BarsRequest, SubmitRequest, SubmitResponse
 from schemas.data_store.asset_dataset_store import StoreAssetDatasetBody, StoreAssetDatasetPath
 
 
@@ -161,8 +162,45 @@ def new_bars_request(
     )
 
 
+def new_asset_list_request(
+    source: DataSource,
+    asset_type: AssetType,
+    status: AssetListStatus,
+    *,
+    trigger: IngestRunTrigger,
+    client_label: str,
+    ready_by: datetime | None = None,
+) -> NewIngestRequest:
+    """The request row an asset-list request is written as, before it is sent (P17).
+
+    The row carries the list it asks for (asset_list_status): the delivery arm files the snapshot under that column and
+    nothing else, and submit_request_of sends the same value, so what the store asked for and what it files are one stored
+    fact (ADR tj-26jt9w addendum 17). An asset list has no symbol, window, dataset or lifecycle field.
+
+    Args:
+        source: The data source.
+        asset_type: The asset type of the list.
+        status: Which list: active or inactive.
+        trigger: What started it (SCHEDULE for the world manager).
+        client_label: The row's label: the requesting principal.
+        ready_by: The deadline, or None for none.
+
+    Returns:
+        NewIngestRequest: The row, with its id left for the insert to mint.
+    """
+    return NewIngestRequest(
+        kind=IngestRequestKind.ASSET_LIST,
+        source=source,
+        client_label=client_label,
+        asset_type=asset_type,
+        ready_by=ready_by,
+        trigger=trigger,
+        asset_list_status=status,
+    )
+
+
 def submit_request_of(record: IngestRequestRecord, *, recovered: bool = False) -> SubmitRequest:
-    """The Submit a stored bars request is sent as, with its durable attempt count.
+    """The Submit a stored request is sent as, with its durable attempt count (bars or an asset list).
 
     Used for the first send, for the watcher's re-send of a PENDING row and for the recovered re-submission of a
     superseded instance's request, which carries the count the old instance's reports left.
@@ -175,8 +213,22 @@ def submit_request_of(record: IngestRequestRecord, *, recovered: bool = False) -
         SubmitRequest: The domain request.
 
     Raises:
-        ValueError: If the request is not a bars request, or the row lacks a field the request needs.
+        ValueError: If the request is neither a bars nor an asset-list request, or the row lacks a field the request needs.
     """
+    if record.kind is IngestRequestKind.ASSET_LIST:
+        if record.asset_type is None or record.asset_list_status is None:
+            raise ValueError('the request row does not carry the fields an asset-list request needs')
+        return SubmitRequest(
+            request_id=str(record.id),
+            owner=record.client_label,
+            ready_by=record.ready_by,
+            best_effort=record.best_effort,
+            recovered=recovered,
+            attempt_count=record.attempts,
+            asset_list=AssetListRequest(
+                source=record.source, asset_type=record.asset_type, status=record.asset_list_status
+            ),
+        )
     if record.kind is not IngestRequestKind.BARS:
         raise ValueError(f'a {record.kind} request cannot be submitted by this release')
     if (

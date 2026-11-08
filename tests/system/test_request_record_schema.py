@@ -43,6 +43,7 @@ from data.store.app.database.crud import ingest_request as crud
 from data.store.app.database.models.ingest_instance import IngestInstance
 from data.store.app.database.models.ingest_request import IngestRequest, IngestRequestKind, IngestRequestState
 from data.store.app.database.models.ingest_run import IngestRun, IngestRunState, IngestRunTrigger
+from schemas.data_ingest.submit import AssetListStatus
 
 
 pytestmark = pytest.mark.data_store
@@ -274,6 +275,9 @@ async def _queued_request(db: AsyncSession, run_identity, created: Created, inst
             kind=IngestRequestKind.ASSET_LIST,
             source=DataSource.ALPACA_API,
             client_label=run_identity.owner,
+            # An asset-list row names its list (the CHECK of a3f8d2c6e914, tj-7zjov1.30).
+            asset_type=AssetType.STOCK,
+            asset_list_status=AssetListStatus.ACTIVE,
         ),
     )
     assert await crud.mark_queued(db, request_id, instance_id) is not None

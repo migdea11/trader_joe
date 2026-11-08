@@ -40,6 +40,7 @@ from data.store.app.database.models.ingest_run import IngestRunState, IngestRunT
 from data.store.tests.delivery_reports import report
 from data.store.tests.request_path_harness import INSTANCE_A, REQUESTS, RUNS, Harness, make_engine
 from schemas.data_ingest.delivery import DeliveryErrorClass, DeliveryOutcome
+from schemas.data_ingest.submit import AssetListStatus
 
 
 pytestmark = [pytest.mark.data_store, pytest.mark.asyncio]
@@ -182,7 +183,10 @@ async def test_an_open_ended_request_maps_its_null_end_and_feed(harness):
             for state in IngestRequestState
             if state is not IngestRequestState.FAILED
         ],
-        pytest.param({'kind': IngestRequestKind.ASSET_LIST}, id='kind-ASSET_LIST'),
+        # An asset-list row names its list (the table's CHECK since tj-7zjov1.30), so the kind case carries one.
+        pytest.param(
+            {'kind': IngestRequestKind.ASSET_LIST, 'asset_list_status': AssetListStatus.ACTIVE}, id='kind-ASSET_LIST'
+        ),
         pytest.param({'kind': IngestRequestKind.CORPORATE_ACTIONS}, id='kind-CORPORATE_ACTIONS'),
         pytest.param({'source': DataSource.IB_API}, id='another-source'),
         pytest.param({'created_at': SINCE - timedelta(microseconds=1)}, id='created-just-before-since'),

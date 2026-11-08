@@ -18,10 +18,12 @@ NORMALISE_SQL or the render query parses.
 
 import itertools
 import re
+import uuid
 
 import pytest
 from sqlalchemy.sql.functions import now as sql_now
 
+from data.store.app.database.models.asset_list import AssetListEvent, AssetListRow, AssetListSnapshot
 from data.store.app.database.models.base_market_activity import BaseMarketActivity
 from data.store.app.database.models.corporate_action import CorporateAction
 from data.store.app.database.models.ingest_instance import IngestInstance
@@ -40,6 +42,9 @@ from data.store.seeds.dump import (
     REQUEST_TABLE,
     RUN_TABLE,
     SEED_TABLES,
+    SNAPSHOT_EVENT_TABLE,
+    SNAPSHOT_ROW_TABLE,
+    SNAPSHOT_TABLE,
     DumpRefused,
     check_no_meta_commands,
     order_column,
@@ -48,7 +53,17 @@ from data.store.seeds.dump import (
 )
 
 
-SEED_MODELS = (StoreDatasetEntry, StockMarketActivity, IngestInstance, IngestRequest, IngestRun, CorporateAction)
+SEED_MODELS = (
+    StoreDatasetEntry,
+    StockMarketActivity,
+    IngestInstance,
+    IngestRequest,
+    IngestRun,
+    CorporateAction,
+    AssetListSnapshot,
+    AssetListRow,
+    AssetListEvent,
+)
 
 
 pytestmark = pytest.mark.data_store
@@ -282,9 +297,22 @@ def test_the_pg_dump_era_names_are_gone():
 
 
 def test_the_seed_tables_are_the_market_tables_then_the_ingest_tables():
-    """Bead tj-7zjov1.100: entries, bars, instances, requests, runs; since tj-7zjov1.31 corporate actions last."""
+    """Bead tj-7zjov1.100: entries, bars, instances, requests, runs; then corporate actions, then the asset lists.
+
+    Corporate actions since tj-7zjov1.31; the asset-list snapshots, their rows and their events since tj-7zjov1.30.
+    """
     assert tuple(model.__tablename__ for model in SEED_MODELS) == SEED_TABLES
-    assert (ENTRY_TABLE, BAR_TABLE, INSTANCE_TABLE, REQUEST_TABLE, RUN_TABLE, CORPORATE_ACTION_TABLE) == SEED_TABLES
+    assert (
+        ENTRY_TABLE,
+        BAR_TABLE,
+        INSTANCE_TABLE,
+        REQUEST_TABLE,
+        RUN_TABLE,
+        CORPORATE_ACTION_TABLE,
+        SNAPSHOT_TABLE,
+        SNAPSHOT_ROW_TABLE,
+        SNAPSHOT_EVENT_TABLE,
+    ) == SEED_TABLES
     assert not any('archive' in table for table in SEED_TABLES)
 
 
@@ -305,7 +333,8 @@ def test_the_bar_rank_orders_by_the_models_natural_key():
 
 def test_the_rewrite_is_one_transaction_at_utc_over_both_tables():
     """It carries its own BEGIN and COMMIT, which is why the connection autocommits (stack.py)."""
-    statements = [s.strip() for s in NORMALISE_SQL.split(';') if s.strip()]
+    # Whitespace-collapsed: the TRUNCATE spans two source lines since the asset-list tables joined it (tj-7zjov1.30).
+    statements = [' '.join(s.split()) for s in NORMALISE_SQL.split(';') if s.strip()]
     assert statements[0] == 'BEGIN'
     assert statements[-1] == 'COMMIT'
     assert statements[1] == "SET LOCAL TIME ZONE 'UTC'"
@@ -329,7 +358,15 @@ def test_rows_are_reinserted_in_id_order_and_the_sequence_follows():
 
 
 @pytest.mark.parametrize(
-    ('table', 'temp'), [(INSTANCE_TABLE, 'seed_instance'), (REQUEST_TABLE, 'seed_request'), (RUN_TABLE, 'seed_run')]
+    ('table', 'temp'),
+    [
+        (INSTANCE_TABLE, 'seed_instance'),
+        (REQUEST_TABLE, 'seed_request'),
+        (RUN_TABLE, 'seed_run'),
+        (SNAPSHOT_TABLE, 'seed_snapshot'),
+        (SNAPSHOT_ROW_TABLE, 'seed_snapshot_row'),
+        (SNAPSHOT_EVENT_TABLE, 'seed_snapshot_event'),
+    ],
 )
 def test_each_ingest_table_is_copied_and_reinserted_in_its_order(table, temp):
     assert f'CREATE TEMP TABLE {temp} ON COMMIT DROP AS SELECT * FROM {table};' in NORMALISE_SQL
@@ -342,7 +379,14 @@ def _is_now(column) -> bool:
 
 
 @pytest.mark.parametrize(
-    ('model', 'temp'), [(IngestInstance, 'seed_instance'), (IngestRequest, 'seed_request'), (IngestRun, 'seed_run')]
+    ('model', 'temp'),
+    [
+        (IngestInstance, 'seed_instance'),
+        (IngestRequest, 'seed_request'),
+        (IngestRun, 'seed_run'),
+        (AssetListSnapshot, 'seed_snapshot'),
+        (AssetListEvent, 'seed_snapshot_event'),
+    ],
 )
 def test_every_column_postgres_stamps_with_now_is_rewritten(model, temp):
     """A now() default left as stamped differs between two runs, and the seed is no longer deterministic."""
@@ -375,3 +419,72 @@ def test_the_random_run_ids_become_the_md5_of_a_rank_over_the_rows_content():
 @pytest.mark.parametrize('temp', ['seed_request', 'seed_run'])
 def test_an_ingest_rows_dataset_id_follows_the_entry_map(temp):
     assert f'UPDATE {temp} r SET dataset_id = m.new_id FROM seed_map m WHERE r.dataset_id = m.old_id;' in NORMALISE_SQL
+
+
+# ---------------------------------------------------------------------------------------------
+# The asset-list snapshots (tj-7zjov1.30): random ids replaced by keys of their own content, references following
+# ---------------------------------------------------------------------------------------------
+
+
+def test_the_asset_list_row_table_has_no_now_default_so_none_is_rewritten():
+    """The row table stamps nothing; if a now() default is added there, the parametrised test above must grow."""
+    assert not [column.name for column in AssetListRow.__table__.columns if _is_now(column)]
+
+
+def test_a_snapshot_id_becomes_the_md5_of_the_delivering_attempts_unique_key():
+    """(request_id, attempt_no) is the snapshot's unique index, so the new id is unique and the same every run."""
+    (unique,) = [index for index in AssetListSnapshot.__table__.indexes if index.unique]
+    assert tuple(column.name for column in unique.columns) == ('request_id', 'attempt_no')
+    assert (
+        f"SELECT id AS old_id, md5('{SNAPSHOT_TABLE}|' || request_id::text || '|' || attempt_no::text)::uuid AS new_id "
+        'FROM seed_snapshot;'
+    ) in ' '.join(NORMALISE_SQL.split())
+    assert 'UPDATE seed_snapshot s SET id = m.new_id' in NORMALISE_SQL
+
+
+@pytest.mark.parametrize(
+    ('temp', 'column'),
+    [
+        ('seed_snapshot_row', 'snapshot_id'),
+        ('seed_snapshot_event', 'snapshot_id'),
+        ('seed_snapshot_event', 'previous_snapshot_id'),
+    ],
+)
+def test_every_reference_to_a_snapshot_follows_the_snapshot_map(temp, column):
+    """A row or event left pointing at the random id would point at no snapshot after the rewrite."""
+    alias = temp.removeprefix('seed_snapshot_')[0]
+    assert (
+        f'UPDATE {temp} {alias} SET {column} = m.new_id FROM seed_snapshot_map m WHERE {alias}.{column} = m.old_id;'
+        in NORMALISE_SQL
+    )
+
+
+def test_every_uuid_column_of_the_asset_list_tables_is_a_snapshot_reference_or_a_rewritten_id():
+    """Derived from the models: a new uuid column that the rewrite does not map stays random and breaks determinism."""
+    handled = {
+        SNAPSHOT_TABLE: {'id', 'request_id'},
+        SNAPSHOT_ROW_TABLE: {'id', 'snapshot_id'},
+        SNAPSHOT_EVENT_TABLE: {'id', 'snapshot_id', 'previous_snapshot_id'},
+    }
+    for model in (AssetListSnapshot, AssetListRow, AssetListEvent):
+        uuids = {column.name for column in model.__table__.columns if column.type.python_type is uuid.UUID}
+        assert uuids == handled[model.__tablename__], model.__tablename__
+
+
+def test_the_row_and_event_ids_are_the_md5_of_their_content_after_the_snapshot_ids_moved():
+    """The row id hashes (snapshot, vendor id, symbol); the event id its unique key (snapshot, vendor id, kind)."""
+    (event_key,) = [index for index in AssetListEvent.__table__.indexes if index.unique]
+    assert tuple(column.name for column in event_key.columns) == ('snapshot_id', 'vendor_asset_id', 'kind')
+    row_id = (
+        f"UPDATE seed_snapshot_row SET id = md5('{SNAPSHOT_ROW_TABLE}|' || snapshot_id::text || '|' || vendor_asset_id "
+        "|| '|' || symbol)::uuid;"
+    )
+    event_id = (
+        f"UPDATE seed_snapshot_event SET id = md5('{SNAPSHOT_EVENT_TABLE}|' || snapshot_id::text || '|' || "
+        "vendor_asset_id || '|' || kind::text)::uuid,"
+    )
+    assert row_id in NORMALISE_SQL
+    assert event_id in NORMALISE_SQL
+    # After the map, so the hash is over the stable snapshot id, never the random one.
+    assert NORMALISE_SQL.index(row_id) > NORMALISE_SQL.index('UPDATE seed_snapshot_row r SET snapshot_id')
+    assert NORMALISE_SQL.index(event_id) > NORMALISE_SQL.index('UPDATE seed_snapshot_event e SET snapshot_id')

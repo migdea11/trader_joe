@@ -27,6 +27,7 @@ from collections.abc import Iterable
 import pytest
 
 from common.tests.roots import REPO_ROOT
+from data.store.app.database.models.asset_list import AssetListEvent, AssetListRow, AssetListSnapshot
 from data.store.app.database.models.corporate_action import CorporateAction
 from data.store.app.database.models.ingest_instance import IngestInstance
 from data.store.app.database.models.ingest_request import IngestRequest
@@ -144,15 +145,24 @@ def push_path_problems(sql: str) -> list[str]:
     """
     rows = seed_rows(sql, (*MODELS, StoreDatasetEntry.TABLE_NAME))
     problems = []
+    # tj-7zjov1.30: the asset-list cast is written through new_asset_list_request, which writes trigger SCHEDULE (the
+    # world manager's), so those rows carry it and every other request still holds NULL.
+    asset_lists = [row for row in rows[IngestRequest.TABLE_NAME] if row.get('kind') == 'ASSET_LIST']
+    if held := sorted({row.get('trigger') for row in asset_lists} - {'SCHEDULE'}, key=str):
+        problems.append(f'ingest_request.trigger on an asset-list row: {held}, expected SCHEDULE')
+    if any(row.get('expiry') is not None or row.get('collect') is not None for row in asset_lists):
+        problems.append('ingest_request: an asset-list row carries a lifecycle field')
     for table, columns in NULL_AT_HEAD.items():
-        if not rows[table]:
+        judged = [row for row in rows[table] if row.get('kind') != 'ASSET_LIST']
+        if not judged:
             problems.append(f'{table}: no row in the seed')
         for column in columns:
             if any(column not in row for row in rows[table]):
                 problems.append(f'{table}: the seed has no {column} column')
-            elif held := sorted({row[column] for row in rows[table] if row[column] is not None}):
+            elif held := sorted({row[column] for row in judged if row[column] is not None}):
                 problems.append(f'{table}.{column}: values nothing writes yet: {held}')
     requests = rows[IngestRequest.TABLE_NAME]
+    asset_list_ids = {row['id'] for row in asset_lists}
     if any('spend_unknown_attempts' not in row for row in requests):
         problems.append('ingest_request: the seed has no spend_unknown_attempts column')
     else:
@@ -171,6 +181,11 @@ def push_path_problems(sql: str) -> list[str]:
     served = 0
     for row in runs:
         span = (row['served_start'], row['served_end'])
+        if row['request_id'] in asset_list_ids:
+            # An asset list has no window (the 21:56 UTC ruling on tj-7zjov1.30): no served range on its attempt rows.
+            if span != (None, None):
+                problems.append(f'ingest_run {row["id"]}: a served range on an asset-list attempt')
+            continue
         if row['attempt_no'] is not None and row['state'] in SERVED_STATES:
             served += 1
             # The cast's success serves exactly the window its request asked for.
@@ -447,3 +462,118 @@ def test_the_corporate_action_check_is_red_on_the_parent_seed_and_on_a_wrong_has
     assert f'corporate_action {row["vendor_action_id"]}: payload_hash is not the SHA-256 of raw_payload' in (
         corporate_action_problems(tampered, manifest)
     )
+
+
+# --------------------------------------------------------------------------------------------- the asset-list cast
+#
+# tj-7zjov1.30 (P17, revision a3f8d2c6e914). The cast (seeds/ingest_records.py) writes five asset-list requests through
+# new_asset_list_request and delivers each with the report AssetListAttemptRunner builds: active 1 (a1 a2 a3), inactive
+# 1 (i1, sharing a1's symbol: the s1 shape), active 2 (a1 a4), inactive 2 (i1, a2 renamed, i2), and a served empty
+# active list. The events the design derives from that, by vendor id, are written out here from the DESIGN (not read off
+# the producer): appeared a4 on active 2 and i2 on inactive 2; vanished a2 and a3 on active 2; one status_flip of a2 on
+# inactive 2 carrying both symbols; nothing from a first snapshot of a list or from the empty one.
+ASSET_LIST_MODELS = {model.TABLE_NAME: model.__table__ for model in (AssetListSnapshot, AssetListRow, AssetListEvent)}
+EXPECTED_ASSET_LIST_EVENTS = {
+    # (request name of the snapshot, kind, vendor id, symbol, previous symbol, request name of the base)
+    ('AL_ACTIVE_2', 'appeared', 'seed-asset-a4', 'ZZSEEDXD', None, 'AL_ACTIVE_1'),
+    ('AL_ACTIVE_2', 'vanished', 'seed-asset-a2', 'ZZSEEDXB', None, 'AL_ACTIVE_1'),
+    ('AL_ACTIVE_2', 'vanished', 'seed-asset-a3', 'ZZSEEDXC', None, 'AL_ACTIVE_1'),
+    ('AL_INACTIVE_2', 'appeared', 'seed-asset-i2', 'ZZSEEDXF', None, 'AL_INACTIVE_1'),
+    ('AL_INACTIVE_2', 'status_flip', 'seed-asset-a2', 'ZZSEEDXE', 'ZZSEEDXB', 'AL_ACTIVE_1'),
+}
+EXPECTED_SNAPSHOT_SHAPE = {
+    # request name -> (list, row count)
+    'AL_ACTIVE_1': ('active', 3),
+    'AL_INACTIVE_1': ('inactive', 1),
+    'AL_ACTIVE_2': ('active', 2),
+    'AL_INACTIVE_2': ('inactive', 3),
+    'AL_ACTIVE_EMPTY': ('active', 0),
+}
+
+
+def asset_list_problems(sql: str, manifest: dict) -> list[str]:
+    """The asset-list requests, their attempt rows, snapshots, raw rows and events, as the design derives them."""
+    rows = seed_rows(sql, (*ASSET_LIST_MODELS, IngestRequest.TABLE_NAME, IngestRun.TABLE_NAME))
+    if not rows[AssetListSnapshot.TABLE_NAME]:
+        return [f'{AssetListSnapshot.TABLE_NAME}: no row in the seed']
+    problems = []
+    for table, model in ASSET_LIST_MODELS.items():
+        declared = {column.name for column in model.columns}
+        for seen in {frozenset(row) for row in rows[table]}:
+            if seen != declared:
+                problems.append(f'{table} INSERT: extra {sorted(seen - declared)}, missing {sorted(declared - seen)}')
+        if set(manifest['digests'].get(table, {})) != declared:
+            problems.append(f'{table} manifest: the digests are not the model columns')
+    name_of = {str(request_id): name for name, request_id in REQUEST_IDS.items()}
+    requests = {row['id']: row for row in rows[IngestRequest.TABLE_NAME] if row.get('kind') == 'ASSET_LIST'}
+    lists = {name_of.get(request_id): row.get('asset_list_status') for request_id, row in requests.items()}
+    wanted_lists = {name: shape[0] for name, shape in EXPECTED_SNAPSHOT_SHAPE.items()}
+    if lists != wanted_lists:
+        problems.append(f'ingest_request: the asset-list requests and their lists are {lists}')
+    if any(row['asset_symbol'] is not None or row['asset_type'] != 'STOCK' for row in requests.values()):
+        problems.append('ingest_request: an asset-list request with a symbol, or without the STOCK asset type')
+    if any(
+        row.get('asset_list_status') is not None for row in rows[IngestRequest.TABLE_NAME] if row['id'] not in requests
+    ):
+        problems.append('ingest_request: a list on a request of another kind')
+    for run in rows[IngestRun.TABLE_NAME]:
+        if run['request_id'] in requests:
+            labels = (run['asset_symbol'], run['asset_type'], run['data_type'], run['granularity'], run['update_type'])
+            if labels != (None,) * 5 or (run['served_start'], run['served_end'], run['vendor_asset_id']) != (None,) * 3:
+                problems.append(f'ingest_run {run["id"]}: an asset-list attempt row with a label, range or vendor id')
+    snapshots = {row['id']: row for row in rows[AssetListSnapshot.TABLE_NAME]}
+    by_name = {name_of.get(row['request_id']): row for row in snapshots.values()}
+    shapes = {name: (row['asset_list'], int(row['row_count'])) for name, row in by_name.items()}
+    if shapes != EXPECTED_SNAPSHOT_SHAPE:
+        problems.append(f'asset_list_snapshot: lists and row counts {shapes}')
+    held = Counter(row['snapshot_id'] for row in rows[AssetListRow.TABLE_NAME])
+    if any(held[snapshot_id] != int(row['row_count']) for snapshot_id, row in snapshots.items()):
+        problems.append('asset_list_row: a snapshot holds other than row_count rows, or a row names no snapshot')
+    for row in rows[AssetListRow.TABLE_NAME]:
+        payload = _bytes_of(row['raw_payload']) or b''
+        if row['vendor_asset_id'].encode() not in payload or row['symbol'].encode() not in payload:
+            problems.append(f'asset_list_row {row["vendor_asset_id"]}: the raw payload is not the served record')
+    named = {snapshot_id: name_of.get(row['request_id']) for snapshot_id, row in snapshots.items()}
+    events = set()
+    for event in rows[AssetListEvent.TABLE_NAME]:
+        snapshot = snapshots.get(event['snapshot_id'])
+        base = snapshots.get(event['previous_snapshot_id'])
+        if snapshot is None or base is None:
+            problems.append(f'asset_list_event {event["vendor_asset_id"]}: a snapshot id that names no snapshot')
+            continue
+        if (event['as_of'], event['previous_as_of'], event['asset_list']) != (
+            snapshot['as_of'],
+            base['as_of'],
+            snapshot['asset_list'],
+        ):
+            problems.append(f'asset_list_event {event["vendor_asset_id"]}: instants or list differ from its snapshots')
+        events.add(
+            (
+                named[event['snapshot_id']],
+                event['kind'],
+                event['vendor_asset_id'],
+                event['symbol'],
+                event['previous_symbol'],
+                named[event['previous_snapshot_id']],
+            )
+        )
+    if events != EXPECTED_ASSET_LIST_EVENTS:
+        problems.append(
+            f'asset_list_event: extra {sorted(events - EXPECTED_ASSET_LIST_EVENTS, key=str)}, '
+            f'missing {sorted(EXPECTED_ASSET_LIST_EVENTS - events, key=str)}'
+        )
+    return problems
+
+
+def test_the_head_seed_holds_the_asset_list_cast_and_exactly_the_events_the_design_derives():
+    sql, manifest = _read(HEAD)
+    assert asset_list_problems(sql, manifest) == []
+
+
+def test_the_asset_list_check_is_red_on_the_parent_seed_and_on_a_wrong_event():
+    parent_sql, parent_manifest = _read('c7e19a4d5b28')
+    assert asset_list_problems(parent_sql, parent_manifest) == ['asset_list_snapshot: no row in the seed']
+
+    sql, manifest = _read(HEAD)
+    tampered = sql.replace("'status_flip'", "'appeared'", 1)
+    assert any(problem.startswith('asset_list_event: extra') for problem in asset_list_problems(tampered, manifest))

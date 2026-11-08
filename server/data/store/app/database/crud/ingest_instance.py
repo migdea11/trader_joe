@@ -15,7 +15,7 @@ nothing: only a first sighting supersedes, so an old id arriving late can never 
 import uuid
 from dataclasses import dataclass
 
-from sqlalchemy import func, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -89,3 +89,23 @@ async def note_instance_seen(db: AsyncSession, instance_id: str) -> InstanceSigh
         return InstanceSighting(
             instance_id, is_new=True, superseded=superseded_ids, not_delivered=tuple(sorted(not_delivered))
         )
+
+
+async def live_instance_id(db: AsyncSession) -> str | None:
+    """The newest instance the store has seen (the one not superseded), or None when it has seen none.
+
+    Args:
+        db: A session.
+
+    Returns:
+        str | None: The instance id, newest first sighting when more than one is unsuperseded.
+    """
+    instances = IngestInstance.__table__
+    return (
+        await db.execute(
+            select(instances.c.instance_id)
+            .where(instances.c.superseded_at.is_(None))
+            .order_by(instances.c.first_seen_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()

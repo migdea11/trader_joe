@@ -99,8 +99,8 @@ from common.tests.roots import SERVER_ROOT
 from data.store.app.database.models.ingest_run import IngestRun
 from data.store.seeds import dump
 from data.store.seeds.dump import order_column
-from data.store.seeds.ingest_records import INSTANCES
-from data.store.seeds.scenario import is_synthetic
+from data.store.seeds.ingest_records import INSTANCES, REQUEST_IDS
+from data.store.seeds.scenario import OWNER_PATTERN, is_synthetic
 
 
 pytestmark = pytest.mark.data_store
@@ -120,16 +120,28 @@ INSTANCE_TABLE = 'ingest_instance'
 REQUEST_TABLE = 'ingest_request'
 RUN_TABLE = 'ingest_run'
 CORPORATE_ACTION_TABLE = 'corporate_action'
+SNAPSHOT_TABLE = 'asset_list_snapshot'
+SNAPSHOT_ROW_TABLE = 'asset_list_row'
+SNAPSHOT_EVENT_TABLE = 'asset_list_event'
+ASSET_LIST_TABLES = (SNAPSHOT_TABLE, SNAPSHOT_ROW_TABLE, SNAPSHOT_EVENT_TABLE)
 MARKET_TABLES = (ENTRY_TABLE, BAR_TABLE)
 INGEST_TABLES = (INSTANCE_TABLE, REQUEST_TABLE, RUN_TABLE)
 # Every table a seed may cover, parents first (bead tj-7zjov1.100); a seed covers the ones its manifest names.
-# corporate_action joins at c7e19a4d5b28 (tj-7zjov1.31), last, as the producer writes it.
-SEED_TABLES = MARKET_TABLES + INGEST_TABLES + (CORPORATE_ACTION_TABLE,)
+# corporate_action joins at c7e19a4d5b28 (tj-7zjov1.31), last, as the producer writes it; the three asset-list tables
+# at a3f8d2c6e914 (tj-7zjov1.30), after it.
+SEED_TABLES = MARKET_TABLES + INGEST_TABLES + (CORPORATE_ACTION_TABLE,) + ASSET_LIST_TABLES
 # The column a seed table's rows are checked as synthetic by, beside asset_symbol: the owner, by its name per
 # table. ingest_instance has no label; its ids are checked against the cast instead. corporate_action has no
-# asset_symbol and no owner: its requesting_symbol is checked alone (SYMBOL_COLUMN).
+# asset_symbol and no owner: its requesting_symbol is checked alone (SYMBOL_COLUMN), as are the vendor symbols of the
+# asset-list rows and events (an event's previous_symbol too). asset_list_snapshot carries no symbol and no owner: its
+# request ids are checked against the cast. An ASSET_LIST request and an attempt row with no symbol are judged by
+# their owner alone, as the producer judges them.
 LABEL_COLUMN = {ENTRY_TABLE: 'owner', BAR_TABLE: None, REQUEST_TABLE: 'client_label', RUN_TABLE: 'actor'}
-SYMBOL_COLUMN = {CORPORATE_ACTION_TABLE: 'requesting_symbol'}
+SYMBOL_COLUMN = {
+    CORPORATE_ACTION_TABLE: ('requesting_symbol',),
+    SNAPSHOT_ROW_TABLE: ('symbol',),
+    SNAPSHOT_EVENT_TABLE: ('symbol', 'previous_symbol'),
+}
 MANIFEST_KEYS = {'date', 'digests', 'producer', 'revision', 'row_counts'}
 
 ADDITIVE_EXCEPTION_MARKER = re.compile(r'^# additive-exception: \S+', re.MULTILINE)
@@ -664,9 +676,13 @@ def test_every_expectation_is_for_a_marked_revision_and_a_present_seed() -> None
 
 
 def test_the_seed_tables_are_the_producers() -> None:
-    """Bead tj-7zjov1.100: this file's tables, in order, are the ones the producer writes (six since tj-7zjov1.31)."""
+    """Bead tj-7zjov1.100: this file's tables, in order, are the ones the producer writes (nine since tj-7zjov1.30).
+
+    Each is judged by a label, by its symbols, or by ids against the cast (the instance marker; the snapshot table,
+    which carries no symbol and no owner, by its request ids).
+    """
     assert SEED_TABLES == dump.SEED_TABLES
-    assert set(LABEL_COLUMN) | set(SYMBOL_COLUMN) | {INSTANCE_TABLE} == set(SEED_TABLES)
+    assert set(LABEL_COLUMN) | set(SYMBOL_COLUMN) | {INSTANCE_TABLE, SNAPSHOT_TABLE} == set(SEED_TABLES)
 
 
 def test_the_canonical_seed_at_the_head_covers_every_seed_table_with_rows() -> None:
@@ -738,25 +754,58 @@ def test_seed_loads_equal_to_its_manifest(scratch: ScratchDb, name: str) -> None
                 ids = set(conn.execute(sa.text(f'SELECT instance_id FROM public.{table}')).scalars())  # nosec B608 -- module-constant table
             assert ids <= set(INSTANCES), f'seed {name}: {len(ids - set(INSTANCES))} instance id(s) not in the cast'
             continue
-        if table in SYMBOL_COLUMN:
+        if table == SNAPSHOT_TABLE:
             with scratch.engine.connect() as conn:
-                symbols = set(
-                    conn.execute(
-                        sa.text(f"SELECT DISTINCT coalesce({_quote(SYMBOL_COLUMN[table])}, '') FROM public.{table}")  # nosec B608 -- module-constant table, quoted name
-                    ).scalars()
-                )
+                requests = set(conn.execute(sa.text(f'SELECT request_id FROM public.{table}')).scalars())  # nosec B608 -- module-constant table
+            assert requests <= set(REQUEST_IDS.values()), f'seed {name}: a snapshot of a request not in the cast'
+            continue
+        if table in SYMBOL_COLUMN:
+            symbols = set()
+            with scratch.engine.connect() as conn:
+                for column in SYMBOL_COLUMN[table]:
+                    symbols |= set(
+                        conn.execute(
+                            sa.text(
+                                f'SELECT DISTINCT {_quote(column)} FROM public.{table} WHERE {_quote(column)} IS NOT NULL'
+                            )  # nosec B608 -- module-constant table, quoted name
+                        ).scalars()
+                    )
+                    if column == 'requesting_symbol':
+                        symbols |= set(
+                            conn.execute(
+                                sa.text(f"SELECT DISTINCT coalesce({_quote(column)}, '') FROM public.{table}")  # nosec B608 -- module-constant table, quoted name
+                            ).scalars()
+                        )
             foreign = [symbol for symbol in symbols if not is_synthetic(symbol, None)]
             assert not foreign, f'seed {name}: {len(foreign)} non-synthetic symbol(s) in {table}'
             continue
         # The bar table's label is none; an old entry table may predate owner (8f41c2d7a3b9 seeds).
         label = LABEL_COLUMN[table] if LABEL_COLUMN[table] in scratch.columns(table) else None
         selected = _quote(label) if label else 'NULL'
+        # Rows with no symbol to judge, judged by their owner alone (tj-7zjov1.30): an ASSET_LIST request, and an
+        # attempt row with no symbol (an asset-list attempt has every label column NULL).
+        owner_only = {REQUEST_TABLE: "kind::text = 'ASSET_LIST'", RUN_TABLE: 'asset_symbol IS NULL'}.get(table)
+        if owner_only and 'asset_list_status' not in scratch.columns(REQUEST_TABLE):
+            owner_only = None  # before a3f8d2c6e914 no seed holds an asset-list row; judge every row by both
+        judged = f' WHERE NOT ({owner_only})' if owner_only else ''
         with scratch.engine.connect() as conn:
             rows = conn.execute(
-                sa.text(f"SELECT DISTINCT coalesce(asset_symbol, ''), {selected} FROM public.{table}")  # nosec B608 -- module-constant table, quoted name
+                sa.text(f"SELECT DISTINCT coalesce(asset_symbol, ''), {selected} FROM public.{table}{judged}")  # nosec B608 -- module-constant table, quoted name
             ).all()
+            owners = (
+                set(
+                    conn.execute(
+                        sa.text(f'SELECT DISTINCT {selected} FROM public.{table} WHERE {owner_only}')
+                    ).scalars()
+                )  # nosec B608 -- module-constant table, quoted name
+                if owner_only
+                else set()
+            )
         foreign = [row for row in rows if not is_synthetic(row[0], row[1] if label else None)]
         assert not foreign, f'seed {name}: {len(foreign)} non-synthetic (symbol, owner) pair(s) in {table}'
+        assert all(OWNER_PATTERN.fullmatch(owner or '') for owner in owners), (
+            f'seed {name}: a non-synthetic owner on a row with no symbol in {table}'
+        )
 
 
 @pytest.mark.parametrize('name', TRANSITIONS)
@@ -1892,3 +1941,159 @@ def test_the_corporate_action_downgrade_refuses_changing_nothing_on_a_database_h
     with scratch.engine.connect() as conn:
         observations = conn.execute(sa.text(f'SELECT count(*) FROM public.{CORPORATE_ACTION_TABLE}')).scalar_one()  # nosec B608
     assert observations == 1, 'the refused downgrade lost the observation'
+
+
+# ---------------------------------------------------------------------------------------------
+# tj-7zjov1.30 (P17): a3f8d2c6e914, the asset-list snapshot tables and ingest_request.asset_list_status with the CHECK
+# ck_ingest_request_asset_list_status. PURELY ADDITIVE and UNMARKED (the architect's ruling of 23:31 UTC: no backfill),
+# so NO EXPECTATIONS entry: the generic rule upgrades the c7e19a4d5b28 seed one step and downgrades it losslessly. This
+# section adds the revision's own facts on Postgres: the tables, the shared enum type and the nullable column as the
+# models declare them, every row of the parent seed kept, the head seed's asset-list cast, and the downgrade on a
+# database HOLDING the revision's data (the head seed) dropping the tables, then the CHECK and the column, then the two
+# types, keeping every other row. The offline half is data/store/tests/test_asset_list_revision.py; the CHECK and the
+# arm on Postgres are test_asset_list_pg.py's.
+
+ASSET_LIST_REVISION = 'a3f8d2c6e914'
+ASSET_LIST_TYPES = ('asset_list_event_kind', 'asset_list_status')
+ASSET_LIST_CHECK = 'ck_ingest_request_asset_list_status'
+
+
+def _constraint_names(db: ScratchDb, table: str) -> set[str]:
+    with db.engine.connect() as conn:
+        return set(
+            conn.execute(
+                sa.text('SELECT conname FROM pg_constraint WHERE conrelid = to_regclass(:table)'),
+                {'table': f'public.{table}'},
+            ).scalars()
+        )
+
+
+def _count(db: ScratchDb, sql: str) -> int:
+    with db.engine.connect() as conn:
+        return conn.execute(sa.text(sql)).scalar_one()
+
+
+def _counts_by(db: ScratchDb, sql: str) -> dict:
+    with db.engine.connect() as conn:
+        return dict(conn.execute(sa.text(sql)).all())
+
+
+def test_the_asset_list_revision_sits_on_the_corporate_action_revision_unmarked_with_its_parent_seed() -> None:
+    assert GRAPH[ASSET_LIST_REVISION].down_revision == CORPORATE_ACTION_REVISION
+    assert not GRAPH[ASSET_LIST_REVISION].marked, 'the revision is designed additive; it carries no marker'
+    assert ASSET_LIST_REVISION not in EXPECTATIONS, (
+        'an unmarked revision is the generic rule, never an EXPECTATIONS entry'
+    )
+    assert CORPORATE_ACTION_REVISION in SEED_NAMES and ASSET_LIST_REVISION in SEED_NAMES
+    transitions = {param.values: param.id for param in TRANSITIONS}
+    assert transitions.get((CORPORATE_ACTION_REVISION,)) == f'{CORPORATE_ACTION_REVISION}->{ASSET_LIST_REVISION}', (
+        f'the generic rule does not run the parent seed through this revision: {sorted(transitions.values())}'
+    )
+
+
+def test_the_asset_list_revision_applies_from_empty_with_the_shared_type_and_the_check(scratch: ScratchDb) -> None:
+    assert scratch.revision() is None
+    scratch.must('upgrade', ASSET_LIST_REVISION)
+
+    shared = ('USER-DEFINED', 'asset_list_status')
+    assert _column_facts(scratch, REQUEST_TABLE, 'asset_list_status') == (*shared, 'YES', None), 'nullable, no default'
+    assert _column_facts(scratch, SNAPSHOT_TABLE, 'asset_list') == (*shared, 'NO', None)
+    assert _column_facts(scratch, SNAPSHOT_EVENT_TABLE, 'asset_list') == (*shared, 'NO', None)
+    assert _column_facts(scratch, SNAPSHOT_ROW_TABLE, 'raw_payload') == ('bytea', 'bytea', 'NO', None)
+    assert _column_facts(scratch, SNAPSHOT_ROW_TABLE, 'active') == ('boolean', 'bool', 'YES', None)
+    assert ASSET_LIST_CHECK in _constraint_names(scratch, REQUEST_TABLE)
+    assert _count(scratch, 'SELECT array_length(enum_range(NULL::asset_list_status), 1)') == 2
+    foreign = _count(
+        scratch,
+        "SELECT count(*) FROM pg_constraint WHERE contype = 'f' AND conrelid IN ('public.asset_list_snapshot'::regclass, "
+        "'public.asset_list_row'::regclass, 'public.asset_list_event'::regclass)",
+    )
+    assert foreign == 0, 'snapshots outlive their request: no foreign key'
+
+
+def test_the_asset_list_revision_upgrades_the_parent_seed_with_every_row_kept(scratch: ScratchDb) -> None:
+    seed = read_seed(CORPORATE_ACTION_REVISION)
+    scratch.load(seed)
+    assert seed.row_counts[REQUEST_TABLE] > 0, f'the parent seed holds no {REQUEST_TABLE} row, so this is vacuous'
+
+    scratch.must('upgrade', ASSET_LIST_REVISION)
+
+    assert_equals_manifest(scratch, seed)  # every parent column of every row, byte for byte
+    listed = _count(scratch, f'SELECT count(*) FROM public.{REQUEST_TABLE} WHERE asset_list_status IS NOT NULL')  # nosec B608
+    snapshots = _count(scratch, f'SELECT count(*) FROM public.{SNAPSHOT_TABLE}')  # nosec B608
+    assert (listed, snapshots) == (0, 0), 'the revision backfills nothing'
+
+
+def test_the_head_seed_holds_the_asset_list_cast_on_postgres(scratch: ScratchDb) -> None:
+    """The ruling's checklist item 15: ASSET_LIST rows of both lists, snapshots of each, an empty one, the events."""
+    scratch.load(read_seed(ASSET_LIST_REVISION))
+
+    requests = _counts_by(
+        scratch,
+        f"SELECT asset_list_status::text, count(*) FROM public.{REQUEST_TABLE} WHERE kind = 'ASSET_LIST' GROUP BY 1",  # nosec B608
+    )
+    snapshots = _counts_by(scratch, f'SELECT asset_list::text, count(*) FROM public.{SNAPSHOT_TABLE} GROUP BY 1')  # nosec B608
+    events = _counts_by(scratch, f'SELECT kind::text, count(*) FROM public.{SNAPSHOT_EVENT_TABLE} GROUP BY 1')  # nosec B608
+    empty = _count(scratch, f'SELECT count(*) FROM public.{SNAPSHOT_TABLE} WHERE row_count = 0')  # nosec B608
+    orphans = _count(
+        scratch,
+        f'SELECT count(*) FROM public.{SNAPSHOT_ROW_TABLE} r WHERE NOT EXISTS '  # nosec B608
+        f'(SELECT 1 FROM public.{SNAPSHOT_TABLE} s WHERE s.id = r.snapshot_id)',
+    )
+    with scratch.engine.connect() as conn:
+        flip = conn.execute(
+            sa.text(
+                f'SELECT vendor_asset_id, symbol, previous_symbol FROM public.{SNAPSHOT_EVENT_TABLE} '  # nosec B608
+                "WHERE kind = 'status_flip'"
+            )
+        ).one()
+    assert requests == {'active': 3, 'inactive': 2}
+    assert snapshots == {'active': 3, 'inactive': 2} and empty == 1
+    assert events == {'appeared': 2, 'status_flip': 1, 'vanished': 2}
+    assert orphans == 0, 'a row whose snapshot id the normalisation did not follow'
+    assert tuple(flip) == ('seed-asset-a2', 'ZZSEEDXE', 'ZZSEEDXB'), 'the flip carries both symbols'
+
+
+def test_the_asset_list_downgrade_on_a_database_holding_its_data_drops_tables_check_column_and_types(
+    scratch: ScratchDb,
+) -> None:
+    """Ruling item 17 on DATA: the head seed downgraded one step keeps every other row and column, byte for byte."""
+    head = read_seed(ASSET_LIST_REVISION)
+    scratch.load(head)
+    assert head.row_counts[SNAPSHOT_EVENT_TABLE] > 0, 'the head seed holds no event, so this is vacuous'
+
+    scratch.must('downgrade', CORPORATE_ACTION_REVISION)
+
+    for table in ASSET_LIST_TABLES:
+        assert scratch.columns(table) == [], f'the downgrade left {table}'
+    assert 'asset_list_status' not in scratch.columns(REQUEST_TABLE)
+    assert ASSET_LIST_CHECK not in _constraint_names(scratch, REQUEST_TABLE)
+    for name in ASSET_LIST_TYPES:
+        assert not scratch.enum_exists(name), f'the downgrade left the type {name}'
+    assert scratch.enum_exists('datasource') and scratch.enum_exists('ingest_request_kind')
+    kept = tuple(table for table in head.tables if table not in ASSET_LIST_TABLES)
+    assert scratch.row_counts(kept) == {table: head.row_counts[table] for table in kept}
+    for table in kept:
+        wanted = {
+            column: digest
+            for column, digest in head.digests[table].items()
+            if not (table == REQUEST_TABLE and column == 'asset_list_status')
+        }
+        assert scratch.data_digests(table, list(wanted)) == wanted, f'{table} changed in the downgrade'
+
+
+def test_a_re_upgrade_after_downgrading_asset_list_rows_refuses_atomically_on_the_check(scratch: ScratchDb) -> None:
+    """AS BUILT, for the architect: the downgrade keeps the ASSET_LIST requests and loses their list.
+
+    So the CHECK cannot be added again: the re-upgrade refuses with nothing changed. Downgrade is no recovery path
+    (store CLAUDE.md); recovery is a restore.
+    """
+    scratch.load(read_seed(ASSET_LIST_REVISION))
+    scratch.must('downgrade', CORPORATE_ACTION_REVISION)
+    before = scratch.snapshot()
+    schema = scratch.schema()
+
+    run = scratch.migrate('upgrade', ASSET_LIST_REVISION)
+
+    assert_refused(run, scratch, CORPORATE_ACTION_REVISION, before, schema)
+    assert ASSET_LIST_CHECK in run.output, f'not the CHECK refusal:\n{run.output[-4000:]}'

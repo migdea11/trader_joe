@@ -108,11 +108,16 @@ PUSH_PATH_FILE = f'{PUSH_PATH_REVISION}_push_path_columns.py'
 # test_request_expiry_type_revision.py.
 EXPIRY_TYPE_REVISION = '39c28a39b290'
 EXPIRY_TYPE_FILE = f'{EXPIRY_TYPE_REVISION}_request_expiry_type.py'
-# THE HEAD SINCE tj-7zjov1.31 (P18): the corporate_action table and nullable ingest_run label columns, PURELY ADDITIVE
-# and directly on the expiry-type revision. It touches no entry or bar key; its own shape is pinned in
+# THE HEAD FROM tj-7zjov1.31 (P18) TO tj-7zjov1.30: the corporate_action table and nullable ingest_run label columns,
+# PURELY ADDITIVE and directly on the expiry-type revision. It touches no entry or bar key; its own shape is pinned in
 # test_corporate_action_revision.py.
 CORPORATE_ACTION_REVISION = 'c7e19a4d5b28'
 CORPORATE_ACTION_FILE = f'{CORPORATE_ACTION_REVISION}_corporate_action_observations.py'
+# THE HEAD SINCE tj-7zjov1.30 (P17): the asset-list snapshot tables and ingest_request.asset_list_status with its CHECK,
+# PURELY ADDITIVE and directly on the corporate-action revision. It touches no entry or bar key; its own shape is pinned
+# in test_asset_list_revision.py.
+ASSET_LIST_REVISION = 'a3f8d2c6e914'
+ASSET_LIST_FILE = f'{ASSET_LIST_REVISION}_asset_list_snapshots.py'
 # The parent the epic's design names for its one revision (tj-vhboky.12 item 1).
 PARENT_REVISION = '8f41c2d7a3b9'
 PARENT_FILE = f'{PARENT_REVISION}_bar_natural_key_and_upsert.py'
@@ -274,12 +279,21 @@ def test_each_revision_of_the_two_epics_sits_directly_on_the_one_before_it():
     # AN EIGHTH since tj-7zjov1.25: the request-record revision, directly on SET_COLLECTING.
     # A NINTH since tj-7zjov1.123: the push-path revision, directly on the request-record revision.
     # A TENTH since tj-7zjov1.153 (P35r): the request expiry-type revision, directly on the push-path one.
-    # AN ELEVENTH since tj-7zjov1.31 (P18): the head is the corporate-action revision, directly on the expiry-type one.
-    assert head_revision.module.__file__.endswith(CORPORATE_ACTION_FILE), (
-        f'the head is not {CORPORATE_ACTION_FILE}: {head_revision.module.__file__}'
+    # AN ELEVENTH since tj-7zjov1.31 (P18): the corporate-action revision, directly on the expiry-type one.
+    # A TWELFTH since tj-7zjov1.30 (P17): the head is the asset-list revision, directly on the corporate-action one.
+    assert head_revision.module.__file__.endswith(ASSET_LIST_FILE), (
+        f'the head is not {ASSET_LIST_FILE}: {head_revision.module.__file__}'
     )
-    assert head_revision.down_revision == EXPIRY_TYPE_REVISION, (
-        f'the head does not sit directly on {EXPIRY_TYPE_REVISION}: {head_revision.down_revision}'
+    assert head_revision.down_revision == CORPORATE_ACTION_REVISION, (
+        f'the head does not sit directly on {CORPORATE_ACTION_REVISION}: {head_revision.down_revision}'
+    )
+    corporate_action_revision = script.get_revision(CORPORATE_ACTION_REVISION)
+    assert corporate_action_revision.module.__file__.endswith(CORPORATE_ACTION_FILE), (
+        f'{CORPORATE_ACTION_REVISION} is not {CORPORATE_ACTION_FILE}'
+    )
+    assert corporate_action_revision.down_revision == EXPIRY_TYPE_REVISION, (
+        f'{CORPORATE_ACTION_REVISION} does not sit directly on {EXPIRY_TYPE_REVISION}: '
+        f'{corporate_action_revision.down_revision}'
     )
     expiry_type_revision = script.get_revision(EXPIRY_TYPE_REVISION)
     assert expiry_type_revision.module.__file__.endswith(EXPIRY_TYPE_FILE), (

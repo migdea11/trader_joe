@@ -1,6 +1,20 @@
 from enum import StrEnum
 
-from sqlalchemy import ARRAY, UUID, BigInteger, Boolean, Column, DateTime, Enum, Index, Integer, String, func, text
+from sqlalchemy import (
+    ARRAY,
+    UUID,
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    Column,
+    DateTime,
+    Enum,
+    Index,
+    Integer,
+    String,
+    func,
+    text,
+)
 
 from common.database.sql_alchemy_sensitive_string import SensitiveString
 from common.database.sql_alchemy_table import AppBase, CustomTypeTable
@@ -8,6 +22,7 @@ from common.enums.data_select import AssetType
 from common.enums.data_stock import DataSource, Feed, Granularity
 from common.sensitive import REDACTED
 from data.store.app.database.models.ingest_run import IngestRunTrigger
+from schemas.data_ingest.submit import AssetListStatus
 
 
 class IngestRequestKind(StrEnum):
@@ -88,6 +103,7 @@ class IngestRequest(AppBase.DATA_STORE_BASE, CustomTypeTable):
     OPEN_INDEX = 'ix_ingest_request_open_state_created_at'
     QUEUED_INSTANCE_INDEX = 'ix_ingest_request_queued_instance_id'
     DATASET_INDEX = 'ix_ingest_request_dataset_id'
+    ASSET_LIST_STATUS_CONSTRAINT = 'ck_ingest_request_asset_list_status'
 
     id = Column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid(), nullable=False)
 
@@ -127,6 +143,11 @@ class IngestRequest(AppBase.DATA_STORE_BASE, CustomTypeTable):
     # written on the first delivered attempt. NULL where the request carries none (the DAILY loop, which sets
     # dataset_id at request time; an asset list; corporate actions). No default: a guessed identity is a wrong one.
     expiry_type = Column(Integer, nullable=True)
+    # Which of the vendor's two asset lists an ASSET_LIST request asks for (ADR tj-26jt9w addendum 17, P17). NULL for every
+    # other kind, enforced both ways by ASSET_LIST_STATUS_CONSTRAINT. A Postgres enum, not a free string: the column
+    # picks the snapshot's diff base, and a misspelt label must not start a third list. The type is shared with
+    # asset_list_snapshot.asset_list.
+    asset_list_status = Column(Enum(AssetListStatus, name='asset_list_status', values_callable=_values), nullable=True)
 
     state = Column(
         Enum(IngestRequestState, name='ingest_request_state', values_callable=_values),
@@ -169,6 +190,8 @@ class IngestRequest(AppBase.DATA_STORE_BASE, CustomTypeTable):
         Index(QUEUED_INSTANCE_INDEX, 'instance_id', postgresql_where=(state == IngestRequestState.QUEUED)),
         # A dataset's requests, for the Running facet and the dataset detail.
         Index(DATASET_INDEX, 'dataset_id', postgresql_where=dataset_id.is_not(None)),
+        # An asset-list request always names its list, and no other kind names one.
+        CheckConstraint("(kind = 'ASSET_LIST') = (asset_list_status IS NOT NULL)", name=ASSET_LIST_STATUS_CONSTRAINT),
     )
 
     def __repr__(self):

@@ -48,6 +48,7 @@ from data.store.app.database.models.ingest_request import (
     IngestRequestState,
 )
 from data.store.app.database.models.ingest_run import IngestRunTrigger
+from schemas.data_ingest.submit import AssetListStatus
 
 
 pytestmark = [pytest.mark.data_store, pytest.mark.asyncio]
@@ -252,14 +253,127 @@ async def test_create_request_mints_an_id_when_the_caller_gives_none(db, engine)
     assert (await _row(engine, first.id)).id == first.id
 
 
+def _asset_list(status: AssetListStatus | None = AssetListStatus.ACTIVE, **overrides) -> crud.NewIngestRequest:
+    """An asset-list row as new_asset_list_request writes it: the list named (ADR tj-26jt9w addendum 17)."""
+    values = {
+        'kind': IngestRequestKind.ASSET_LIST,
+        'source': DataSource.ALPACA_API,
+        'client_label': LABEL,
+        'asset_type': AssetType.STOCK,
+        'asset_list_status': status,
+    }
+    return crud.NewIngestRequest(**{**values, **overrides})
+
+
 async def test_an_asset_list_request_carries_no_bar_parameters_and_no_deadline(db):
-    record = await crud.create_request(
-        db, crud.NewIngestRequest(kind=IngestRequestKind.ASSET_LIST, source=DataSource.ALPACA_API, client_label=LABEL)
-    )
+    record = await crud.create_request(db, _asset_list())
 
     assert record.kind is IngestRequestKind.ASSET_LIST
     assert (record.asset_symbol, record.granularity, record.update_type, record.feed, record.data_types) == (None,) * 5
     assert (record.ready_by, record.best_effort) == (None, False)
+
+
+# --------------------------------------------------------------------------------------------- the asset list's list
+#
+# THE DESIGN: the architect's ruling of 23:31 UTC on tj-7zjov1.30 (P17) and ADR tj-26jt9w addendum 17. The request row
+# names its list (asset_list_status, the AssetListStatus domain enum); ASSET_LIST and a list go together, both ways, in
+# the table's CHECK and in NewIngestRequest.__post_init__; create_request writes it and get_request reads it back;
+# open_asset_list_request_exists answers for an ASSET_LIST row of that source and list in an open state.
+
+
+@pytest.mark.parametrize('status', list(AssetListStatus), ids=lambda status: status.value)
+async def test_create_then_get_round_trips_each_list(db, engine, status):
+    record = await crud.create_request(db, _asset_list(status))
+
+    assert record.asset_list_status is status
+    assert (await crud.get_request(db, record.id)).asset_list_status is status
+    committed = await _row(engine, record.id)
+    assert committed.asset_list_status == status
+    assert crud.IngestRequestRecord.from_row(committed) == record
+
+
+async def test_another_kinds_request_reads_no_list(db):
+    assert crud.NewIngestRequest.__dataclass_fields__['asset_list_status'].default is None
+    assert crud.IngestRequestRecord.__dataclass_fields__['asset_list_status'].default is None
+    record = await crud.create_request(db, _bars())
+    assert record.asset_list_status is None
+    assert (await crud.get_request(db, record.id)).asset_list_status is None
+
+
+def test_new_ingest_request_refuses_an_asset_list_naming_no_list():
+    """The Python mirror of the CHECK: refused before the insert, never defaulted to a list."""
+    with pytest.raises(ValueError, match='must name its list'):
+        _asset_list(None)
+
+
+@pytest.mark.parametrize('kind', [IngestRequestKind.BARS, IngestRequestKind.CORPORATE_ACTIONS])
+@pytest.mark.parametrize('status', list(AssetListStatus), ids=lambda status: status.value)
+def test_new_ingest_request_refuses_another_kind_naming_a_list(kind, status):
+    with pytest.raises(ValueError, match='cannot name an asset list'):
+        crud.NewIngestRequest(kind=kind, source=DataSource.ALPACA_API, client_label=LABEL, asset_list_status=status)
+
+
+@pytest.mark.parametrize(
+    ('kind', 'status'),
+    [(IngestRequestKind.ASSET_LIST, None), (IngestRequestKind.BARS, AssetListStatus.ACTIVE)],
+    ids=['asset-list-without-a-list', 'bars-with-a-list'],
+)
+async def test_the_tables_check_refuses_both_wrong_combinations_written_behind_the_repository(engine, kind, status):
+    """The model's CHECK (ck_ingest_request_asset_list_status) on SQLite.
+
+    Its Postgres twin is in tests/system/test_asset_list_pg.py. Written by a raw insert, so __post_init__ is not what
+    refuses.
+    """
+    async with AsyncSession(engine) as other:
+        with pytest.raises(sa.exc.IntegrityError, match=IngestRequest.ASSET_LIST_STATUS_CONSTRAINT):
+            await other.execute(
+                sa.insert(REQUESTS).values(
+                    id=uuid.uuid4(),
+                    kind=kind,
+                    source=DataSource.ALPACA_API,
+                    client_label=LABEL,
+                    asset_list_status=status,
+                    state=IngestRequestState.PENDING,
+                    attempts=0,
+                    created_at=START,
+                )
+            )
+
+
+def test_the_model_declares_the_check_both_ways_under_the_designs_name():
+    (check,) = [
+        constraint
+        for constraint in REQUESTS.constraints
+        if isinstance(constraint, sa.CheckConstraint) and constraint.name == IngestRequest.ASSET_LIST_STATUS_CONSTRAINT
+    ]
+    assert IngestRequest.ASSET_LIST_STATUS_CONSTRAINT == 'ck_ingest_request_asset_list_status'
+    assert ' '.join(str(check.sqltext).split()) == "(kind = 'ASSET_LIST') = (asset_list_status IS NOT NULL)"
+
+
+@pytest.mark.parametrize('state', list(IngestRequestState), ids=lambda state: state.value)
+async def test_open_asset_list_request_exists_is_true_for_an_open_row_of_that_list_only(db, engine, state):
+    """Open (PENDING, QUEUED, NOT_DELIVERED) of THAT list and source: True; terminal, or the other list: False."""
+    record = await crud.create_request(db, _asset_list(AssetListStatus.INACTIVE))
+    if state is not IngestRequestState.PENDING:
+        await _set(engine, REQUESTS, REQUESTS.c.id == record.id, state=state)
+
+    assert await crud.open_asset_list_request_exists(db, DataSource.ALPACA_API, AssetListStatus.INACTIVE) is (
+        state in OPEN_STATES
+    )
+    assert await crud.open_asset_list_request_exists(db, DataSource.ALPACA_API, AssetListStatus.ACTIVE) is False
+
+
+async def test_open_asset_list_request_exists_ignores_other_kinds_and_is_false_on_an_empty_table(db, engine):
+    assert await crud.open_asset_list_request_exists(db, DataSource.ALPACA_API, AssetListStatus.ACTIVE) is False
+    await _in_state(db, engine, IngestRequestState.PENDING)
+    assert await crud.open_asset_list_request_exists(db, DataSource.ALPACA_API, AssetListStatus.ACTIVE) is False
+
+
+async def test_open_asset_list_request_exists_answers_per_source(db):
+    await crud.create_request(db, _asset_list(AssetListStatus.ACTIVE, source=DataSource.IB_API))
+
+    assert await crud.open_asset_list_request_exists(db, DataSource.IB_API, AssetListStatus.ACTIVE) is True
+    assert await crud.open_asset_list_request_exists(db, DataSource.ALPACA_API, AssetListStatus.ACTIVE) is False
 
 
 async def test_the_client_label_is_in_no_repr():

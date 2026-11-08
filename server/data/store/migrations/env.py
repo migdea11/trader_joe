@@ -50,6 +50,7 @@ if config.config_file_name is not None:
 # An ImportError propagates: a model that fails to import leaves target_metadata incomplete, so
 # carrying on would migrate/autogenerate against a partial schema.
 ALLOWED_MODELS = {
+    'asset_list',
     'base_market_activity',
     'corporate_action',
     'dataset_deletion',

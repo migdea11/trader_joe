@@ -31,6 +31,12 @@ THE CAST, every id a literal so two runs agree. Instance A is announced first an
                  again with the SAME bytes (the dedupe, writes
                  nothing) and A with OTHER bytes (a vendor
                  revision, a new row)                         one attempt row, NULL labels but the symbol
+  SUCCEEDED x4   ASSET_LIST (tj-7zjov1.30), through new_asset_list_request: active 1 (a1 a2 a3), inactive 1 (i1, which
+                 shares a1's symbol: the s1 shape), active 2 (a1 a4), inactive 2 (i1, a2 listed under another symbol, i2).
+                 Four snapshots holding nine asset rows; events: appeared a4 and i2, vanished a2 and a3, status_flip
+                 a2. The first snapshot of a list derives nothing.
+  EMPTY          ASSET_LIST, active, a served empty list (no part): a snapshot of zero rows, no event.
+                 Each asset-list request has one attempt row with every label column NULL.
 
 THE LEGACY RUNS (bead tj-7zjov1.31). A database from before the push path holds ingest_run rows with no request id and no
 attempt number, and the upgrade tests must keep exercising that shape, so four are written through the legacy recorder's
@@ -54,7 +60,9 @@ package must stay importable without it.
 """
 
 import uuid
+from collections import Counter
 from collections.abc import Iterable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.engine import URL
@@ -86,14 +94,48 @@ REQUEST_IDS = {
             'FAILED_EXPIRED',
             'CA_FIRST',
             'CA_REVISED',
+            'AL_ACTIVE_1',
+            'AL_INACTIVE_1',
+            'AL_ACTIVE_2',
+            'AL_INACTIVE_2',
+            'AL_ACTIVE_EMPTY',
         ),
         start=1,
     )
 }
 
 # What the seeded rows must come to; the producer refuses a seed that does not match.
-EXPECTED_REQUEST_STATES = {'PENDING': 1, 'QUEUED': 1, 'NOT_DELIVERED': 1, 'SUCCEEDED': 3, 'EMPTY': 1, 'FAILED': 4}
-EXPECTED_ATTEMPT_ROWS = 10
+# Each cast request's own final (state, instance id), by request name. The instance is the one the row names: B for every
+# request that was answered by the live instance (finished ones keep it), A for the one A queued and B then superseded,
+# none for the one never answered. The producer judges every request by its id against this table, not by counts.
+_EXPECTED_REQUEST_BY_NAME: dict[str, tuple[str, str | None]] = {
+    'PENDING': ('PENDING', None),
+    'QUEUED': ('QUEUED', INSTANCE_B),
+    'NOT_DELIVERED': ('NOT_DELIVERED', INSTANCE_A),
+    'SUCCEEDED': ('SUCCEEDED', INSTANCE_B),
+    'EMPTY': ('EMPTY', INSTANCE_B),
+    'FAILED_PERMANENT': ('FAILED', INSTANCE_B),
+    'FAILED_NO_STATS': ('FAILED', INSTANCE_B),
+    'FAILED_EXHAUSTED': ('FAILED', INSTANCE_B),
+    'FAILED_EXPIRED': ('FAILED', INSTANCE_B),
+    'CA_FIRST': ('SUCCEEDED', INSTANCE_B),
+    'CA_REVISED': ('SUCCEEDED', INSTANCE_B),
+    'AL_ACTIVE_1': ('SUCCEEDED', INSTANCE_B),
+    'AL_INACTIVE_1': ('SUCCEEDED', INSTANCE_B),
+    'AL_ACTIVE_2': ('SUCCEEDED', INSTANCE_B),
+    'AL_INACTIVE_2': ('SUCCEEDED', INSTANCE_B),
+    'AL_ACTIVE_EMPTY': ('EMPTY', INSTANCE_B),
+}
+if set(_EXPECTED_REQUEST_BY_NAME) != set(REQUEST_IDS):
+    raise RuntimeError('the expected request table and REQUEST_IDS name different requests')
+# Keyed by the request id as Postgres renders it (id::text), the form the producer reads back.
+EXPECTED_REQUESTS: dict[str, tuple[str, str | None]] = {
+    str(REQUEST_IDS[name]): expected for name, expected in _EXPECTED_REQUEST_BY_NAME.items()
+}
+EXPECTED_REQUEST_STATES = dict(Counter(state for state, _ in EXPECTED_REQUESTS.values()))
+# Whether each cast instance ends superseded: A by B's arrival, B (the live one) not.
+EXPECTED_INSTANCE_SUPERSEDED = {INSTANCE_A: True, INSTANCE_B: False}
+EXPECTED_ATTEMPT_ROWS = 15
 # The legacy-shaped runs (no request id, no attempt number), per state; one of the FAILED is the swept INTERRUPTED one.
 EXPECTED_LEGACY_STATES = {'EMPTY': 1, 'FAILED': 2, 'SUCCEEDED': 1}
 EXPECTED_LEGACY_RUNS = sum(EXPECTED_LEGACY_STATES.values())
@@ -103,6 +145,14 @@ EXPECTED_RUN_ROWS = EXPECTED_ATTEMPT_ROWS + EXPECTED_LEGACY_RUNS
 EXPECTED_OBSERVATIONS = 3
 EXPECTED_REVISED_ACTIONS = 1
 EXPECTED_INSTANCES = len(INSTANCES)
+# The asset-list cast (tj-7zjov1.30): requests and snapshots per list (active: two non-empty and one empty; inactive: two),
+# the empty snapshots among them, the asset rows, and the events derived per kind. Counts only; the producer names found
+# and expected when one differs.
+EXPECTED_ASSET_LIST_REQUESTS = {'active': 3, 'inactive': 2}
+EXPECTED_SNAPSHOTS = {'active': 3, 'inactive': 2}
+EXPECTED_EMPTY_SNAPSHOTS = 1
+EXPECTED_SNAPSHOT_ROWS = 9
+EXPECTED_EVENTS = {'appeared': 2, 'status_flip': 1, 'vanished': 2}
 
 _WINDOW_START = datetime(2024, 1, 1, tzinfo=UTC)
 _WINDOW_END = datetime(2024, 2, 1, tzinfo=UTC)
@@ -112,6 +162,19 @@ _STARTED = datetime(2024, 4, 15, 9, 0, tzinfo=UTC)
 _READY_BY = datetime(2024, 4, 15, 12, 0, tzinfo=UTC)
 # Two days the scenario's ZZSEEDAA dataset already holds, on the daily grid.
 _BAR_DAYS = (datetime(2024, 1, 2, tzinfo=UTC), datetime(2024, 1, 3, tzinfo=UTC))
+# The asset-list cast. Vendor ids and symbols are synthetic (ZZSEEDX*). AL_A1 and AL_I1 are the s1 shape: one symbol held by
+# an active id and by an inactive id. AL_A2 leaves the active list for the inactive one, where it is listed under another
+# symbol (one status_flip); AL_A3 is in neither list afterwards (purged); AL_A4 and AL_I2 are new to their lists.
+_AL_DAY_0 = datetime(2024, 5, 1, 14, 0, tzinfo=UTC)
+_AL_ASSETS = {
+    'AL_A1': ('seed-asset-a1', 'ZZSEEDXA'),
+    'AL_A2': ('seed-asset-a2', 'ZZSEEDXB'),
+    'AL_A3': ('seed-asset-a3', 'ZZSEEDXC'),
+    'AL_A4': ('seed-asset-a4', 'ZZSEEDXD'),
+    'AL_I1': ('seed-asset-i1', 'ZZSEEDXA'),
+    'AL_A2_RENAMED': ('seed-asset-a2', 'ZZSEEDXE'),
+    'AL_I2': ('seed-asset-i2', 'ZZSEEDXF'),
+}
 # One symbol per legacy run, in the scenario's synthetic pattern: interrupted, succeeded, empty, failed.
 LEGACY_SYMBOLS = ('ZZSEEDLA', 'ZZSEEDLB', 'ZZSEEDLC', 'ZZSEEDLD')
 # The raw bytes of the synthetic vendor records: A in two versions (the revision), and B.
@@ -142,9 +205,13 @@ async def seed_ingest_records(url: URL, dataset_id: uuid.UUID, symbol: str) -> N
     from common.enums.data_stock import DataSource, Feed, Granularity, UpdateType
     from data.store.app.database.crud import ingest_request as request_crud
     from data.store.app.database.models.ingest_request import IngestRequestKind
+    from data.store.app.database.models.ingest_run import IngestRunTrigger
     from data.store.app.ingest import delivery_intake
+    from data.store.app.ingest.data_action_request import new_asset_list_request
     from data.store.app.ingest.delivery_intake import DeliveryIntake
     from schemas.data_ingest.delivery import (
+        AssetRecord,
+        AssetRecords,
         AttemptDelivery,
         CorporateActionRecord,
         CorporateActionRecords,
@@ -157,6 +224,7 @@ async def seed_ingest_records(url: URL, dataset_id: uuid.UUID, symbol: str) -> N
         VendorReported,
     )
     from schemas.data_ingest.fetch_dataset import Bar, BarPage, ServedRange
+    from schemas.data_ingest.submit import AssetListStatus
     from tests.fakes.market_data import fake_bar
 
     engine = create_async_engine(url, connect_args={'timeout': 10})
@@ -310,6 +378,51 @@ async def seed_ingest_records(url: URL, dataset_id: uuid.UUID, symbol: str) -> N
                 raw_payload=raw,
             )
 
+        async def create_asset_list(name: str, status: AssetListStatus) -> None:
+            # The store's own writer for the row, with the seed's literal id.
+            new = new_asset_list_request(
+                DataSource.ALPACA_API,
+                AssetType.STOCK,
+                status,
+                trigger=IngestRunTrigger.SCHEDULE,
+                client_label=CLIENT_LABEL,
+            )
+            async with AsyncSession(engine, expire_on_commit=False) as db:
+                await request_crud.create_request(db, replace(new, id=REQUEST_IDS[name]))
+
+        def asset(key: str, *, active: bool | None) -> AssetRecord:
+            vendor_id, symbol = _AL_ASSETS[key]
+            state = 'active' if active else 'inactive'
+            return AssetRecord(
+                vendor_asset_id=vendor_id,
+                symbol=symbol,
+                raw_payload=f'{{"id":"{vendor_id}","symbol":"{symbol}","status":"{state}"}}'.encode(),
+                active=active,
+                tradable=bool(active),
+                exchange='SEEDX',
+                name=f'Seed asset {symbol}',
+            )
+
+        def assets_report(name: str, records: list[AssetRecord], as_of: datetime) -> AttemptDelivery:
+            # Exactly what AssetListAttemptRunner builds: no feed, no served range, no vendor asset id, the trading
+            # quota key, vendor stats and as_of; an empty list carries no part at all.
+            return AttemptDelivery(
+                header=DeliveryHeader(
+                    request_id=str(REQUEST_IDS[name]), instance_id=INSTANCE_B, attempt_no=1, quota_key=QUOTA_KEY
+                ),
+                parts=[AssetRecords(records=records)] if records else [],
+                trailer=DeliveryTrailer(
+                    outcome=DeliveryOutcome.SUCCEEDED,
+                    vendor_stats=stats(calls=1, pages=1, throttled=0, retries=0),
+                    as_of=as_of,
+                ),
+            )
+
+        async def deliver_list(name: str, status: AssetListStatus, records: list[AssetRecord], as_of: datetime) -> None:
+            await create_asset_list(name, status)
+            await queue(name, INSTANCE_B)
+            await intake.deliver(assets_report(name, records, as_of))
+
         async def queue(name: str, instance: str) -> None:
             async with AsyncSession(engine, expire_on_commit=False) as db:
                 if await request_crud.mark_queued(db, REQUEST_IDS[name], instance) is None:
@@ -386,6 +499,30 @@ async def seed_ingest_records(url: URL, dataset_id: uuid.UUID, symbol: str) -> N
         await intake.deliver(
             actions_report('CA_REVISED', _CA_WINDOW_2, [action_a, revised], _AS_OF + timedelta(days=2))
         )
+        # Asset lists: a first snapshot of each list (the s1 shape; no base, no event), the next active one (a4 appears,
+        # a2 and a3 vanish), the next inactive one (a2 arrives renamed: a status_flip; i2 appears), then a served empty
+        # active list (a recorded snapshot of zero rows, no event).
+        active, inactive = AssetListStatus.ACTIVE, AssetListStatus.INACTIVE
+        await deliver_list(
+            'AL_ACTIVE_1',
+            active,
+            [asset('AL_A1', active=True), asset('AL_A2', active=True), asset('AL_A3', active=True)],
+            _AL_DAY_0,
+        )
+        await deliver_list('AL_INACTIVE_1', inactive, [asset('AL_I1', active=False)], _AL_DAY_0 + timedelta(hours=1))
+        await deliver_list(
+            'AL_ACTIVE_2',
+            active,
+            [asset('AL_A1', active=True), asset('AL_A4', active=True)],
+            _AL_DAY_0 + timedelta(days=1),
+        )
+        await deliver_list(
+            'AL_INACTIVE_2',
+            inactive,
+            [asset('AL_I1', active=False), asset('AL_A2_RENAMED', active=False), asset('AL_I2', active=False)],
+            _AL_DAY_0 + timedelta(days=2),
+        )
+        await deliver_list('AL_ACTIVE_EMPTY', active, [], _AL_DAY_0 + timedelta(days=3))
         await _seed_legacy_runs(engine)
     finally:
         delivery_intake.own_session, delivery_intake.publish = saved_session, saved_publish

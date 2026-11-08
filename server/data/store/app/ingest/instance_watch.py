@@ -27,6 +27,9 @@ KILL SWITCH AND DRY RUN. INSTANCE_WATCH_ENABLED=false (also 0, no, off) stops th
 INSTANCE_WATCH_DRY_RUN=true (also 1, yes, on) probes nothing and re-sends nothing: a pass logs what it would have
 re-sent. Neither is set in any committed file.
 
+BARS AND ASSET-LIST ROWS are both re-sent and re-submitted (an asset-list row left open would keep
+open_asset_list_request_exists true for its list for good); a corporate-actions row is skipped.
+
 ONE PROCESS: like the reaper and the refresh, correct only while data_store runs one worker.
 
 NOTHING IN A LOG NAMES AN OWNER OR A SYMBOL: counts, ids and exception types only (D8).
@@ -34,6 +37,7 @@ NOTHING IN A LOG NAMES AN OWNER OR A SYMBOL: counts, ids and exception types onl
 
 import asyncio
 import contextlib
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Final
@@ -67,6 +71,9 @@ DEFAULT_RESUBMIT_MARGIN_S: Final = 15
 
 _FALSE: Final = ('false', '0', 'no', 'off')
 _TRUE: Final = ('true', '1', 'yes', 'on')
+
+# The kinds submit_request_of can build; a corporate-actions row is skipped (no store code writes one yet).
+_SENDABLE_KINDS: Final = frozenset({IngestRequestKind.BARS, IngestRequestKind.ASSET_LIST})
 
 
 def is_enabled() -> bool:
@@ -113,8 +120,8 @@ class WatchResult:
     # PENDING requests re-sent, and ABANDONED ones re-submitted recovered.
     resent: int = 0
     resubmitted: int = 0
-    # Requests the pass found and could not send: a call that failed (left for the next pass), or a kind this release
-    # cannot build a request for.
+    # Requests the pass found and could not send: a call that failed (left for the next pass), or a row this release
+    # cannot build a request from (a corporate-actions row, or a row missing a field).
     failed: int = 0
     skipped: int = 0
 
@@ -125,11 +132,16 @@ class InstanceWatcher:
     Args:
         client: The Submit seam, as the interface.
         clock: The current aware instant; injected so a test does not wait out the delay.
+        on_instance: Called with the instance id after each probe noted it (the asset-list snapshot schedule's
+            ingest-started hook, P47); None for none.
     """
 
-    def __init__(self, client: IngestSubmitClient, *, clock=_utc_now) -> None:
+    def __init__(
+        self, client: IngestSubmitClient, *, clock=_utc_now, on_instance: Callable[[str], Awaitable[None]] | None = None
+    ) -> None:
         self._client = client
         self._clock = clock
+        self._on_instance = on_instance
 
     async def run_pass(self) -> WatchResult:
         """Probe the live instance, then re-send what is PENDING and re-submit what is abandoned.
@@ -152,7 +164,7 @@ class InstanceWatcher:
             return WatchResult(skipped=len(pending) + len(abandoned))
         resent = resubmitted = failed = skipped = 0
         for record in pending:
-            if record.kind is not IngestRequestKind.BARS:
+            if record.kind not in _SENDABLE_KINDS:
                 skipped += 1
                 continue
             try:
@@ -173,7 +185,7 @@ class InstanceWatcher:
                 record = await claim_abandoned(db, request_id, now - resubmit_delay())
             if record is None:
                 continue
-            if record.kind is not IngestRequestKind.BARS:
+            if record.kind not in _SENDABLE_KINDS:
                 skipped += 1
                 continue
             try:
@@ -199,15 +211,20 @@ class InstanceWatcher:
             answer = await self._client.instance()
             async with own_session() as db:
                 await note_instance_seen(db, answer.instance_id)
+            if self._on_instance is not None:
+                await self._on_instance(answer.instance_id)
         except TraderJoeError as error:
             log.warning(f'Instance watch could not probe ingest: {type(error).__name__} {error.reason}')
 
 
-def start_instance_watch_loop(client: IngestSubmitClient) -> asyncio.Task[None] | None:
+def start_instance_watch_loop(
+    client: IngestSubmitClient, *, on_instance: Callable[[str], Awaitable[None]] | None = None
+) -> asyncio.Task[None] | None:
     """Start the periodic pass. Call from the running loop, after the Submit client exists.
 
     Args:
         client: The Submit seam the watcher re-sends through.
+        on_instance: Called with each probed instance id, after it was noted; None for none.
 
     Returns:
         asyncio.Task[None] | None: The task, for stop_instance_watch_loop; None when INSTANCE_WATCH_ENABLED is off.
@@ -215,7 +232,7 @@ def start_instance_watch_loop(client: IngestSubmitClient) -> asyncio.Task[None] 
     if not is_enabled():
         log.info(f'Instance watch is off ({ENABLED_ENV}); abandoned and pending requests are not re-sent')
         return None
-    watcher = InstanceWatcher(client)
+    watcher = InstanceWatcher(client, on_instance=on_instance)
 
     async def job() -> None:
         await watcher.run_pass()

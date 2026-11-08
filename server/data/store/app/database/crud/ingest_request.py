@@ -28,6 +28,7 @@ from data.store.app.database.models.ingest_request import (
 )
 from data.store.app.database.models.ingest_run import IngestRunTrigger
 from data.store.app.database.transaction import write_transaction
+from schemas.data_ingest.submit import AssetListStatus
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,8 @@ class IngestRequestRecord:
     spend_unknown_attempts: int = 0
     # The POST body's expiry type, None where the request carries none.
     expiry_type: ExpiryType | None = None
+    # The list an ASSET_LIST request asks for; None for every other kind (the table's CHECK).
+    asset_list_status: AssetListStatus | None = None
 
     @classmethod
     def from_row(cls, row: IngestRequest | Row) -> 'IngestRequestRecord':
@@ -111,6 +114,7 @@ class IngestRequestRecord:
             collect=row.collect,
             spend_unknown_attempts=row.spend_unknown_attempts,
             expiry_type=ExpiryType(row.expiry_type) if row.expiry_type is not None else None,
+            asset_list_status=AssetListStatus(row.asset_list_status) if row.asset_list_status is not None else None,
         )
 
 
@@ -144,6 +148,20 @@ class NewIngestRequest:
     collect: bool | None = None
     # The POST body's expiry type, stored as its integer value; None is stored NULL.
     expiry_type: ExpiryType | None = None
+    # The list an ASSET_LIST request asks for: required for that kind, forbidden for the others (the table's CHECK).
+    asset_list_status: AssetListStatus | None = None
+
+    def __post_init__(self) -> None:
+        """Refuse the combinations the table's CHECK refuses, before the insert.
+
+        Raises:
+            ValueError: If an ASSET_LIST request names no list, or another kind names one.
+        """
+        is_asset_list = self.kind is IngestRequestKind.ASSET_LIST
+        if is_asset_list and self.asset_list_status is None:
+            raise ValueError('an ASSET_LIST request must name its list (asset_list_status)')
+        if not is_asset_list and self.asset_list_status is not None:
+            raise ValueError(f'a {self.kind} request cannot name an asset list')
 
 
 async def create_request(db: AsyncSession, request: NewIngestRequest) -> IngestRequestRecord:
@@ -180,6 +198,7 @@ async def create_request(db: AsyncSession, request: NewIngestRequest) -> IngestR
                     expiry=request.expiry,
                     collect=request.collect,
                     expiry_type=request.expiry_type.value if request.expiry_type is not None else None,
+                    asset_list_status=request.asset_list_status,
                     state=IngestRequestState.PENDING,
                 )
                 .returning(*IngestRequest.__table__.c)
@@ -223,6 +242,35 @@ async def list_requests_in_states(
         .order_by(IngestRequest.created_at, IngestRequest.id)
     )
     return [IngestRequestRecord.from_row(row) for row in (await db.execute(stmt)).scalars()]
+
+
+async def open_asset_list_request_exists(db: AsyncSession, source: DataSource, status: AssetListStatus) -> bool:
+    """Whether an ASSET_LIST request of this source and list is in an open state (PENDING, QUEUED or NOT_DELIVERED).
+
+    P47 asks it before writing another request for the list, so one list is never asked for twice at once.
+
+    Args:
+        db: A session.
+        source: The data source.
+        status: The list.
+
+    Returns:
+        bool: True when such a request is open.
+    """
+    table = IngestRequest.__table__
+    found = (
+        await db.execute(
+            select(table.c.id)
+            .where(
+                table.c.kind == IngestRequestKind.ASSET_LIST,
+                table.c.source == source,
+                table.c.asset_list_status == status,
+                table.c.state.in_(list(OPEN_STATES)),
+            )
+            .limit(1)
+        )
+    ).first()
+    return found is not None
 
 
 async def mark_queued(db: AsyncSession, request_id: uuid.UUID, instance_id: str) -> IngestRequestRecord | None:

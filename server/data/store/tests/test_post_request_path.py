@@ -13,6 +13,7 @@ DeliveryIntake (request_path_harness.py), so the POST answers from what the inta
 the route tier's (test_store_dataset_entry_route.py, another validator's file).
 """
 
+import dataclasses
 import functools
 import uuid
 from collections.abc import AsyncIterator
@@ -36,6 +37,7 @@ from data.store.app.database.models.ingest_run import IngestRunTrigger
 from data.store.app.ingest import data_action_request
 from data.store.app.ingest.data_action_request import (
     StoredDataset,
+    new_asset_list_request,
     new_bars_request,
     store_market_activity_worker,
     submit_bars,
@@ -46,6 +48,7 @@ from data.store.tests.delivery_reports import report, with_trailer
 from data.store.tests.request_path_harness import INSTANCE_A, INSTANCE_B, OWNER, START, FakeSubmit, Harness, make_engine
 from schemas.data_ingest.delivery import DeliveryOutcome
 from schemas.data_ingest.fetch_dataset import BarPage, ServedRange
+from schemas.data_ingest.submit import AssetListRequest, AssetListStatus
 from schemas.data_store.asset_dataset_store import StoreAssetDatasetBody, StoreAssetDatasetPath
 
 
@@ -205,22 +208,89 @@ async def test_submit_request_of_sends_the_durable_count_and_the_recovered_flag(
     assert (sent.recovered, sent.attempt_count) == (True, 4)
 
 
-async def test_submit_request_of_refuses_a_non_bars_request_or_a_row_missing_a_field(harness):
+async def test_submit_request_of_refuses_a_corporate_actions_request_or_a_bars_row_missing_a_field(harness):
+    """Since P17 (tj-7zjov1.30) an asset-list row IS sent (below); corporate actions still are not by this path."""
     async with AsyncSession(harness.engine) as db:
-        asset_list = await request_crud.create_request(
+        actions = await request_crud.create_request(
             db,
             request_crud.NewIngestRequest(
-                kind=IngestRequestKind.ASSET_LIST, source=DataSource.ALPACA_API, client_label=OWNER
+                kind=IngestRequestKind.CORPORATE_ACTIONS, source=DataSource.ALPACA_API, client_label=OWNER
             ),
         )
-    with pytest.raises(ValueError):
-        submit_request_of(asset_list)
+    with pytest.raises(ValueError, match='cannot be submitted'):
+        submit_request_of(actions)
     record = await _post(harness, FakeSubmit())
     await harness.set_request(record.id, granularity=None)
     async with AsyncSession(harness.engine) as db:
         broken = await request_crud.get_request(db, record.id)
     with pytest.raises(ValueError):
         submit_request_of(broken)
+
+
+# --------------------------------------------------------------------------------------------- the asset-list writer and sender
+#
+# THE DESIGN: the architect's ruling of 23:31 UTC on tj-7zjov1.30 (P17), item (4), and ADR tj-26jt9w addendum 17: what
+# the store asked for and the list it files a snapshot under are one stored fact. new_asset_list_request writes the
+# row with its list; the ASSET_LIST branch of submit_request_of sends AssetListRequest(source, asset_type, status from
+# the column) and raises on a row missing the asset type or the list; bars and corporate actions are unchanged.
+
+
+@pytest.mark.parametrize('status', list(AssetListStatus), ids=lambda status: status.value)
+async def test_an_asset_list_request_is_written_with_its_list_and_sent_with_the_same_list(harness, status):
+    new = new_asset_list_request(
+        DataSource.ALPACA_API,
+        AssetType.STOCK,
+        status,
+        trigger=IngestRunTrigger.SCHEDULE,
+        client_label=OWNER,
+        ready_by=READY_BY,
+    )
+    async with AsyncSession(harness.engine) as db:
+        stored = await request_crud.create_request(db, new)
+        stored = await request_crud.get_request(db, stored.id)
+
+    assert (stored.kind, stored.asset_list_status, stored.asset_type) == (
+        IngestRequestKind.ASSET_LIST,
+        status,
+        AssetType.STOCK,
+    )
+    assert (stored.trigger, stored.client_label, stored.ready_by) == (IngestRunTrigger.SCHEDULE, OWNER, READY_BY)
+    # An asset list has no symbol, window, dataset or lifecycle field.
+    assert (stored.asset_symbol, stored.requested_start, stored.requested_end, stored.dataset_id) == (None,) * 4
+    assert (stored.expiry, stored.collect, stored.expiry_type, stored.granularity, stored.feed) == (None,) * 5
+
+    sent = submit_request_of(stored, recovered=True)
+
+    assert sent.asset_list == AssetListRequest(source=DataSource.ALPACA_API, asset_type=AssetType.STOCK, status=status)
+    assert sent.bars is None and sent.corporate_actions is None
+    assert (sent.request_id, sent.owner, sent.ready_by, sent.recovered, sent.attempt_count) == (
+        str(stored.id),
+        OWNER,
+        READY_BY,
+        True,
+        0,
+    )
+
+
+@pytest.mark.parametrize(
+    'missing', [{'asset_list_status': None}, {'asset_type': None}], ids=['no-list', 'no-asset-type']
+)
+async def test_submit_request_of_raises_on_an_asset_list_row_missing_its_list_or_asset_type(harness, missing):
+    """A record built past the CHECK (a constructed one): refused, never sent under a guessed list."""
+    async with AsyncSession(harness.engine) as db:
+        stored = await request_crud.create_request(
+            db,
+            new_asset_list_request(
+                DataSource.ALPACA_API,
+                AssetType.STOCK,
+                AssetListStatus.INACTIVE,
+                trigger=IngestRunTrigger.SCHEDULE,
+                client_label=OWNER,
+            ),
+        )
+
+    with pytest.raises(ValueError, match='asset-list request needs'):
+        submit_request_of(dataclasses.replace(stored, **missing))
 
 
 async def test_an_accepted_submit_notes_the_instance_and_queues_the_request_under_it(harness):

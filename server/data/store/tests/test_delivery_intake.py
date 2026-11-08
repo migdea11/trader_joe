@@ -66,6 +66,7 @@ from data.store.app.database.crud import corporate_action as corporate_action_cr
 from data.store.app.database.crud import ingest_delivery
 from data.store.app.database.crud import ingest_request as request_crud
 from data.store.app.database.crud.ingest_run import IngestRunRecord, last_accepted_vendor_asset_id
+from data.store.app.database.models.asset_list import AssetListEvent, AssetListRow, AssetListSnapshot
 from data.store.app.database.models.corporate_action import CorporateAction
 from data.store.app.database.models.ingest_instance import IngestInstance
 from data.store.app.database.models.ingest_request import (
@@ -116,6 +117,7 @@ from schemas.data_ingest.delivery import (
     RegisterInstanceRequest,
 )
 from schemas.data_ingest.fetch_dataset import BarPage, ServedRange
+from schemas.data_ingest.submit import AssetListStatus
 from schemas.data_store.asset_dataset_store import AssetDatasetStoreCreate
 
 
@@ -129,6 +131,7 @@ ACTIONS = CorporateAction.__table__
 RUNS = IngestRun.__table__
 INSTANCES = IngestInstance.__table__
 ENTRIES = StoreDatasetEntry.__table__
+ASSET_LIST_TABLES = (AssetListSnapshot.__table__, AssetListRow.__table__, AssetListEvent.__table__)
 _SCRATCH = sa.MetaData()
 FAKE_BARS = sa.Table(
     'fake_bars',
@@ -193,6 +196,10 @@ async def engine(aware_sqlite_datetimes, monkeypatch: pytest.MonkeyPatch) -> Asy
     actions = ACTIONS.to_metadata(metadata)
     actions.c.identifiers.type = sa.JSON()
     actions.c.identifiers.server_default = None
+    # The asset-list tables (P17, tj-7zjov1.30), the models' own: every column type is SQLite-compatible. SQLite cannot
+    # call gen_random_uuid(), but the arm always writes the id, so the default is never evaluated.
+    for table in ASSET_LIST_TABLES:
+        table.to_metadata(metadata)
     async with engine.begin() as connection:
         await connection.run_sync(metadata.create_all)
         await connection.run_sync(_SCRATCH.create_all)
@@ -287,6 +294,10 @@ class Store:
                 'requested_end': START + timedelta(days=30),
                 'dataset_id': dataset_id,
             }
+        elif kind is IngestRequestKind.ASSET_LIST:
+            # An asset-list row names its list, as new_asset_list_request writes it (ADR tj-26jt9w addendum 17; the
+            # table's CHECK refuses one that does not). A test that cares which list passes asset_list_status.
+            fields = {'asset_type': AssetType.STOCK, 'asset_list_status': AssetListStatus.ACTIVE}
         else:
             fields = {}
         async with AsyncSession(self.engine, expire_on_commit=False) as db:
@@ -375,7 +386,17 @@ class Store:
             [tuple(row) for row in await self.bars()],
             [tuple(row) for row in entries],
             [tuple(row) for row in await self.actions()],
+            await self.asset_list_rows(),
         )
+
+    async def asset_list_rows(self) -> list[list[tuple]]:
+        """Every row of the three asset-list tables, per table, in insertion order (SQLite's rowid)."""
+        found = []
+        async with AsyncSession(self.engine) as db:
+            for table in ASSET_LIST_TABLES:
+                rows = (await db.execute(sa.select(table).order_by(sa.literal_column('rowid')))).all()
+                found.append([tuple(row) for row in rows])
+        return found
 
     async def actions(self) -> list[sa.Row]:
         """The corporate_action rows, in insertion order (SQLite's rowid)."""
@@ -623,10 +644,10 @@ async def test_each_attempt_keeps_the_vendor_asset_id_its_own_header_carried(sto
 @pytest.mark.parametrize('kind', NON_BARS, ids=lambda kind: kind.lower())
 @pytest.mark.parametrize('outcome', NO_CALL, ids=lambda outcome: outcome.lower())
 async def test_an_accepted_non_bars_report_stores_no_vendor_asset_id(store, kind, outcome):
-    """The only non-bars reports accepted today (EXPIRED, EXHAUSTED) write no attempt row, so nothing holds an id.
+    """EXPIRED and EXHAUSTED write no attempt row, so nothing holds an id.
 
-    A counted non-bars attempt is refused whole (test_a_counted_non_bars_attempt_is_refused_never_acknowledged_unwritten);
-    the NULL a non-bars attempt row will carry once P18 records them is NewAttempt's default, pinned below.
+    A counted non-bars attempt row keeps NULL whatever the header carries: corporate actions in the section below,
+    asset lists in test_asset_list_arm.py (P17).
     """
     request_id = await store.request(kind)
 
@@ -1443,15 +1464,28 @@ async def test_insert_attempt_names_the_partial_index_with_its_predicate():
     [(DeliveryOutcome.SUCCEEDED, [asset_records()]), (DeliveryOutcome.SUCCEEDED, []), (DeliveryOutcome.FAILED, [])],
     ids=['asset-list-records', 'asset-list-empty', 'asset-list-failed'],
 )
-async def test_a_counted_asset_list_attempt_is_refused_never_acknowledged_unwritten(store, outcome, parts):
-    """Decision 4 rule (2) and ruling 1: a counted asset-list attempt is refused with nothing written.
+async def test_a_counted_asset_list_attempt_is_written_with_its_attempt_row_never_refused(store, outcome, parts):
+    """Was a refusal until the arm landed (decision 4 rule (2)); since P17 (tj-7zjov1.30) it is WRITTEN.
 
-    An asset list cannot be fetched again, and its attempt row lands with its arm (P17). The corporate-actions arm is
-    built since P18 (tj-7zjov1.31) and is pinned in the section below.
+    A success as a snapshot (an empty one too, with zero rows, the 14:31 UTC rule), a failure as its attempt row and no
+    snapshot. The arm's own rules are pinned in test_asset_list_arm.py.
     """
     request_id = await store.request(IngestRequestKind.ASSET_LIST)
-    await store.refused(report(request_id, outcome, kind=IngestRequestKind.ASSET_LIST, parts=parts))
-    assert (await store.request_row(request_id)).state is IngestRequestState.QUEUED
+
+    answer = await store.deliver(report(request_id, outcome, kind=IngestRequestKind.ASSET_LIST, parts=parts))
+
+    assert answer.attempt_count == 1
+    (run,) = await store.runs(request_id)
+    snapshots, rows, events = await store.asset_list_rows()
+    if outcome is DeliveryOutcome.FAILED:
+        assert run.state is IngestRunState.FAILED
+        assert snapshots == rows == events == []
+        return
+    expected = IngestRunState.SUCCEEDED if parts else IngestRunState.EMPTY
+    assert (run.state, (await store.request_row(request_id)).state.value) == (expected, expected.value)
+    assert len(snapshots) == 1
+    assert len(rows) == sum(len(part.records) for part in parts)
+    assert events == []
 
 
 # --------------------------------------------------------------------------------------------- the corporate-actions arm

@@ -35,8 +35,16 @@ default argument, so the entry point's own call gets it too); test_the_default_s
 the real default. What the cast writes is proved against Postgres only: the orchestrator's two seed_dump runs
 at f2b7d4a91c36 (byte-identical) and the committed seed tests/system/seeds/f2b7d4a91c36.*, which the
 system suite loads.
+
+THE STORE'S OWN LOOPS (bead tj-7zjov1.166). The live store's instance watcher can rewrite the cast between the checks
+and the dump. FakeStack models it: a drift is a write landing just before a named statement of a named attempt, and a
+write made while the dump snapshot is open is held until it closes (REPEATABLE READ). The section of that name pins
+the per-request and per-instance refusals, the checks and the dump sharing one snapshot, the whole-cast retry and the
+rollback. Whether the snapshot really isolates on Postgres is proved on the stack only (the orchestrator's repeated
+producer runs right after a fresh test_up, byte-compared with the committed seed).
 """
 
+import copy
 import inspect
 import json
 import re
@@ -52,6 +60,7 @@ import pytest
 
 from common.enums.data_stock import Granularity
 from common.tests.roots import REPO_ROOT
+from data.store.app.daily_refresh import SCHEDULER_ACTOR
 from data.store.seeds import __main__ as entry
 from data.store.seeds import producer as producer_module
 from data.store.seeds.bundle import BUNDLE_TAG, MAX_BUNDLE_BYTES, parse_bundle
@@ -64,28 +73,50 @@ from data.store.seeds.dump import (
     REQUEST_TABLE,
     RUN_TABLE,
     SEED_TABLES,
+    SNAPSHOT_EVENT_TABLE,
+    SNAPSHOT_ROW_TABLE,
+    SNAPSHOT_TABLE,
     DumpRefused,
     render_table_sql,
 )
 from data.store.seeds.ingest_records import (
+    _AL_ASSETS,
+    EXPECTED_ASSET_LIST_REQUESTS,
     EXPECTED_ATTEMPT_ROWS,
+    EXPECTED_EMPTY_SNAPSHOTS,
+    EXPECTED_EVENTS,
+    EXPECTED_INSTANCE_SUPERSEDED,
     EXPECTED_INSTANCES,
     EXPECTED_INTERRUPTED_RUNS,
     EXPECTED_LEGACY_RUNS,
     EXPECTED_LEGACY_STATES,
     EXPECTED_OBSERVATIONS,
     EXPECTED_REQUEST_STATES,
+    EXPECTED_REQUESTS,
     EXPECTED_REVISED_ACTIONS,
     EXPECTED_RUN_ROWS,
+    EXPECTED_SNAPSHOT_ROWS,
+    EXPECTED_SNAPSHOTS,
+    INSTANCE_A,
+    INSTANCE_B,
+    INSTANCES,
     REQUEST_IDS,
     seed_ingest_records,
 )
 from data.store.seeds.manifest import head_revision
-from data.store.seeds.producer import VERSIONS_DIR, SeedRefused, produce
+from data.store.seeds.producer import SNAPSHOT_BEGIN, SNAPSHOT_END, VERSIONS_DIR, CastDrifted, SeedRefused, produce
 from data.store.seeds.scenario import SEED_REQUESTS
 from data.store.seeds.stack import Stack, StackError
 from routers.common.instance_secret import INSTANCE_SECRET_HEADER
-from tests.fakes.market_data import EMPTY_PREFIX, Scenario, grid_index, grid_timestamps, scenario_for
+from tests.fakes.market_data import (
+    EMPTY_PREFIX,
+    FAKE_DELISTED_SYMBOLS,
+    FAKE_LISTED_SYMBOLS,
+    Scenario,
+    grid_index,
+    grid_timestamps,
+    scenario_for,
+)
 
 
 pytestmark = pytest.mark.data_store
@@ -100,7 +131,15 @@ SYNTHETIC_ROWS = [
     ('q', 'ZZSEEDAA', 'seed-owner-a', 9),
     ('r', 'ZZSEEDAA', 'seed-owner-b', 18),
     ('c', 'ZZSEEDCA', '', 3),
+    # tj-7zjov1.30: asset-list requests and attempt rows judged by owner alone ('l'), the snapshot rows' symbols ('a'),
+    # the events' symbols ('v') and a flip's previous symbol ('p').
+    ('l', '', 'seed-owner-a', 10),
+    ('a', 'ZZSEEDXA', '', 4),
+    ('v', 'ZZSEEDXB', '', 1),
+    ('p', 'ZZSEEDXB', '', 1),
 ]
+# tj-7zjov1.195: the symbols the fake broker's asset lists serve, which the store's boot-time P47 snapshot files.
+FAKE_SNAPSHOT_SYMBOLS = (*FAKE_LISTED_SYMBOLS, *FAKE_DELISTED_SYMBOLS)
 ENTRY_LINES = [
     "INSERT INTO public.store_dataset_entry (id, owner) VALUES ('0a', 'seed-owner-a');",
     "INSERT INTO public.store_dataset_entry (id, owner) VALUES ('0b', 'seed-owner-b');",
@@ -117,6 +156,9 @@ RENDERED = {
     CORPORATE_ACTION_TABLE: [
         "INSERT INTO public.corporate_action (id, vendor_action_id) VALUES ('0c', 'seed-action-a');"
     ],
+    SNAPSHOT_TABLE: ["INSERT INTO public.asset_list_snapshot (asset_list, id) VALUES ('active', '0s');"],
+    SNAPSHOT_ROW_TABLE: ["INSERT INTO public.asset_list_row (id, symbol) VALUES ('0w', 'ZZSEEDXA');"],
+    SNAPSHOT_EVENT_TABLE: ["INSERT INTO public.asset_list_event (id, kind) VALUES ('0v', 'appeared');"],
 }
 SETVAL_7 = "SELECT pg_catalog.setval('public.stock_market_activity_id_seq', 7, true);\n"
 EXPECTED_SQL = ''.join(f'{line}\n' for table in SEED_TABLES for line in RENDERED[table]) + SETVAL_7
@@ -127,11 +169,25 @@ COLUMNS = {
     REQUEST_TABLE: ['state', 'id'],
     RUN_TABLE: ['request_id', 'id'],
     CORPORATE_ACTION_TABLE: ['vendor_action_id', 'id'],
+    SNAPSHOT_TABLE: ['id', 'asset_list'],
+    SNAPSHOT_ROW_TABLE: ['symbol', 'id'],
+    SNAPSHOT_EVENT_TABLE: ['kind', 'id'],
 }
 # corporate_action's count is also the observation count of the cast refusal (the same statement), so it is the
 # cast's EXPECTED_OBSERVATIONS, as ingest_instance's is EXPECTED_INSTANCES and ingest_run's is EXPECTED_RUN_ROWS (the
-# 'run rows' check, ten attempt rows and four legacy-shaped runs).
-COUNTS = {ENTRY_TABLE: 3, BAR_TABLE: 7, INSTANCE_TABLE: 2, REQUEST_TABLE: 11, RUN_TABLE: 14, CORPORATE_ACTION_TABLE: 3}
+# 'run rows' check, fifteen attempt rows and four legacy-shaped runs since tj-7zjov1.30), and asset_list_row's is the
+# 'snapshot rows' check's EXPECTED_SNAPSHOT_ROWS.
+COUNTS = {
+    ENTRY_TABLE: 3,
+    BAR_TABLE: 7,
+    INSTANCE_TABLE: 2,
+    REQUEST_TABLE: 16,
+    RUN_TABLE: 19,
+    CORPORATE_ACTION_TABLE: 3,
+    SNAPSHOT_TABLE: 5,
+    SNAPSHOT_ROW_TABLE: 9,
+    SNAPSHOT_EVENT_TABLE: 5,
+}
 DIGESTS = {
     ENTRY_TABLE: {'id': 'i1', 'owner': 'o1'},
     BAR_TABLE: {'close': 'c0', 'id': 'i0'},
@@ -139,22 +195,22 @@ DIGESTS = {
     REQUEST_TABLE: {'id': 'q0', 'state': 'q1'},
     RUN_TABLE: {'id': 'r0', 'request_id': 'r1'},
     CORPORATE_ACTION_TABLE: {'id': 'c0', 'vendor_action_id': 'c1'},
+    SNAPSHOT_TABLE: {'asset_list': 's1', 'id': 's0'},
+    SNAPSHOT_ROW_TABLE: {'id': 'w0', 'symbol': 'w1'},
+    SNAPSHOT_EVENT_TABLE: {'id': 'v0', 'kind': 'v1'},
 }
 # The one query that asks for old four-column bar key collisions.
 COLLISION_MARK = 'HAVING count(*) > 1'
 # The reset of the three ingest tables and corporate_action (tj-7zjov1.31), the one script besides NORMALISE_SQL.
 RESET_SQL = (
     f'DELETE FROM {RUN_TABLE}; DELETE FROM {REQUEST_TABLE}; DELETE FROM {INSTANCE_TABLE}; '
-    f'DELETE FROM {CORPORATE_ACTION_TABLE};'
+    f'DELETE FROM {CORPORATE_ACTION_TABLE}; DELETE FROM {SNAPSHOT_EVENT_TABLE}; DELETE FROM {SNAPSHOT_ROW_TABLE}; '
+    f'DELETE FROM {SNAPSHOT_TABLE};'
 )
 DATASET_ID = uuid.UUID('7ceff30a-af80-1760-5057-d346cc334f4d')
-# The steps of the ingest-record phase, in order, between the collision check and the rewrite.
-# Since tj-7zjov1.31 the ingest reset runs a second time, after the dataset lookup and right before the cast, so the
-# seed holds the cast alone and not the POSTs' own request and attempt rows.
-RECORD_STEPS = [
-    'seed dataset lookup',
-    'ingest reset',
-    'seed',
+# The cast refusal's queries, in order (_refuse_wrong_ingest_records): the counts, then since tj-7zjov1.166 every cast
+# request by its id and every instance by its id. They run twice per attempt: after the cast, and again in the snapshot.
+CAST_CHECKS = [
     'request states',
     'attempt rows',
     'legacy run states',
@@ -165,8 +221,51 @@ RECORD_STEPS = [
     'superseded count',
     'observation count',
     'revised action count',
-    'synthetic check',
+    # tj-7zjov1.30: the asset-list cast.
+    'asset-list requests',
+    'asset-list snapshots',
+    'empty snapshots',
+    'snapshot rows',
+    'snapshots whose row_count differs from their rows',
+    'asset-list events',
+    # tj-7zjov1.166: each cast request and each instance, by id.
+    'request rows',
+    'instance rows',
 ]
+# The steps of the ingest-record phase, in order, between the collision check and the rewrite.
+# Since tj-7zjov1.31 the ingest reset runs a second time, after the dataset lookup and right before the cast, so the
+# seed holds the cast alone and not the POSTs' own request and attempt rows.
+RECORD_STEPS = ['seed dataset lookup', 'ingest reset', 'seed', *CAST_CHECKS, 'synthetic check']
+# tj-7zjov1.166: after the normalise, ONE snapshot holds the repeated refusals, the counts, the render and the digests.
+DUMP_STEPS = [
+    'dump snapshot begin',
+    'synthetic check',
+    *CAST_CHECKS,
+    *(f'{table} count' for table in SEED_TABLES),
+    *(step for table in SEED_TABLES for step in (f'{table} columns', f'{table} render')),
+    *(step for table in SEED_TABLES for step in (f'{table} columns', f'{table} digests')),
+    'dump snapshot end',
+]
+# The cast as the fake's per-request and per-instance queries answer it by default: EXPECTED_REQUESTS' own rows.
+REQUEST_ROWS = [(request_id, state, instance) for request_id, (state, instance) in EXPECTED_REQUESTS.items()]
+INSTANCE_ROWS = list(EXPECTED_INSTANCE_SUPERSEDED.items())
+# What a drift may rewrite in the fake: the rows the cast writes (and the reset plus the next cast write again).
+# tj-7zjov1.195: the synthetic check's rows after the cast and the asset-list counts too, since the reset empties the
+# rows a P47 snapshot writes mid-cast.
+CAST_ATTRS = (
+    'state_rows',
+    'request_rows',
+    'instance_rows',
+    'superseded_rows',
+    'raw_counts',
+    'render',
+    'digests',
+    'rows_after_records',
+    'asset_request_rows',
+    'snapshot_list_rows',
+)
+# Merged into, not replaced, by FakeStack.write.
+MERGED_ATTRS = ('raw_counts', 'render', 'digests')
 # Every async URL a stub seeder was handed by the REAL Stack (the end-to-end tier), per test.
 SEEDED_URLS: list = []
 
@@ -186,6 +285,7 @@ async def stub_seed_records(url, dataset_id, symbol):
         return
     fake.calls.append(('seed', 'seed records'))
     fake.seeded_with.append((dataset_id, symbol))
+    fake.reseed()
     if fake.seed_error is not None:
         raise fake.seed_error
 
@@ -219,7 +319,17 @@ def stored_bar_keys(path: str, body: dict[str, str]) -> list[tuple]:
 
 def _table_of(sql: str) -> str:
     """The one seed table a per-table query names (the synthetic check, naming them all, is answered first)."""
-    for table in (CORPORATE_ACTION_TABLE, INSTANCE_TABLE, REQUEST_TABLE, RUN_TABLE, BAR_TABLE, ENTRY_TABLE):
+    for table in (
+        SNAPSHOT_EVENT_TABLE,
+        SNAPSHOT_ROW_TABLE,
+        SNAPSHOT_TABLE,
+        CORPORATE_ACTION_TABLE,
+        INSTANCE_TABLE,
+        REQUEST_TABLE,
+        RUN_TABLE,
+        BAR_TABLE,
+        ENTRY_TABLE,
+    ):
         if table in sql:
             return table
     raise AssertionError(f'no seed table in: {sql[:80]}')
@@ -237,6 +347,16 @@ class FakeStack:
     stray_rows, superseded_rows, revised_rows, legacy_rows and interrupted_rows replace the answers of the queries
     of that phase (the 'run rows' total is the ingest_run row count, raw_counts); seed_error is
     raised by the stub seeder.
+
+    THE STORE'S OWN LOOPS AND THE SNAPSHOT (tj-7zjov1.166). request_rows and instance_rows answer the per-request
+    and per-instance queries (default: EXPECTED_REQUESTS and EXPECTED_INSTANCE_SUPERSEDED, as rows). The cast attributes
+    (CAST_ATTRS, after the overrides) are what the seeder writes: every stub seeder call restores them, as the reset and
+    the cast do on a real stack. drifts maps (attempt, step) to a writer(fake) that lands ONCE, just before the first
+    statement named step of that attempt (attempt: the number of seeder calls so far), as the instance watcher's probe
+    lands between two of the producer's statements; a writer changes rows through write(). The fake models REPEATABLE
+    READ: a write while the snapshot is open (between SNAPSHOT_BEGIN and SNAPSHOT_END) is held and lands at the END,
+    so every read inside the snapshot sees the rows as they were when it opened. end_error is raised by the
+    SNAPSHOT_END script, after the snapshot is closed.
     """
 
     def __init__(
@@ -263,6 +383,15 @@ class FakeStack:
         legacy_rows=None,
         interrupted_rows=None,
         seed_error=None,
+        asset_request_rows=None,
+        snapshot_list_rows=None,
+        empty_snapshot_rows=None,
+        snapshot_stray_rows=None,
+        event_rows=None,
+        request_rows=None,
+        instance_rows=None,
+        drifts=None,
+        end_error=None,
     ):
         self.revision_rows = [(HEAD,)] if revision_rows is None else revision_rows
         self.rows_before = SYNTHETIC_ROWS + list(foreign_before)
@@ -289,6 +418,24 @@ class FakeStack:
         self.legacy_rows = list(EXPECTED_LEGACY_STATES.items()) if legacy_rows is None else legacy_rows
         self.interrupted_rows = [(EXPECTED_INTERRUPTED_RUNS,)] if interrupted_rows is None else interrupted_rows
         self.seed_error = seed_error
+        # tj-7zjov1.30: the asset-list cast's answers (the snapshot rows check is asset_list_row's count, raw_counts).
+        self.asset_request_rows = (
+            list(EXPECTED_ASSET_LIST_REQUESTS.items()) if asset_request_rows is None else asset_request_rows
+        )
+        self.snapshot_list_rows = list(EXPECTED_SNAPSHOTS.items()) if snapshot_list_rows is None else snapshot_list_rows
+        self.empty_snapshot_rows = [(EXPECTED_EMPTY_SNAPSHOTS,)] if empty_snapshot_rows is None else empty_snapshot_rows
+        self.snapshot_stray_rows = [(0,)] if snapshot_stray_rows is None else snapshot_stray_rows
+        self.event_rows = list(EXPECTED_EVENTS.items()) if event_rows is None else event_rows
+        # tj-7zjov1.166: the per-request and per-instance answers, the cast the seeder writes, the drifts, the snapshot.
+        self.request_rows = list(REQUEST_ROWS) if request_rows is None else request_rows
+        self.instance_rows = list(INSTANCE_ROWS) if instance_rows is None else instance_rows
+        self.cast = copy.deepcopy({name: getattr(self, name) for name in CAST_ATTRS})
+        self.drifts = dict(drifts or {})
+        self.end_error = end_error
+        self.attempts = 0
+        self.snapshot_open = False
+        self.held: list[dict] = []
+        self.snapshot_reads: list[str] = []
         self.seeded_with: list[tuple] = []
         self.calls: list[tuple] = []
         self.sql: list[str] = []
@@ -322,6 +469,11 @@ class FakeStack:
             if self.collisions is not None:
                 return [(self.collisions,)]
             return [(sum(1 for rows in Counter(self.stored).values() if rows > 1),)]
+        # tj-7zjov1.166: every cast request and every instance, by id.
+        if sql == f'SELECT id::text, state::text, instance_id FROM {REQUEST_TABLE};':
+            return self.request_rows
+        if sql == f'SELECT instance_id, superseded_at IS NOT NULL FROM {INSTANCE_TABLE};':
+            return self.instance_rows
         if sql.startswith(f'SELECT id::text FROM {ENTRY_TABLE} '):
             self.dataset_sql.append(sql)
             return self.dataset_rows
@@ -338,6 +490,17 @@ class FakeStack:
             return self.stray_rows
         if 'WHERE superseded_at IS NOT NULL' in sql:
             return self.superseded_rows
+        # The asset-list cast (tj-7zjov1.30), before the generic count shape two of them also start with.
+        if f"FROM {REQUEST_TABLE} WHERE kind = 'ASSET_LIST' GROUP BY asset_list_status" in sql:
+            return self.asset_request_rows
+        if sql == f'SELECT asset_list::text, count(*) FROM {SNAPSHOT_TABLE} GROUP BY asset_list;':
+            return self.snapshot_list_rows
+        if sql == f'SELECT count(*) FROM {SNAPSHOT_TABLE} WHERE row_count = 0;':
+            return self.empty_snapshot_rows
+        if f'FROM {SNAPSHOT_TABLE} s WHERE s.row_count <> (' in sql:
+            return self.snapshot_stray_rows
+        if sql == f'SELECT kind::text, count(*) FROM {SNAPSHOT_EVENT_TABLE} GROUP BY kind;':
+            return self.event_rows
         if sql.startswith('SELECT count(*) FROM'):
             table = _table_of(sql)
             return self.raw_counts.get(table, [(COUNTS[table],)])
@@ -372,14 +535,61 @@ class FakeStack:
     # -- Stack's seam --
 
     def query(self, sql, what):
+        self._land(what)
         self.calls.append(('query', what))
         self.sql.append(sql)
+        if self.snapshot_open:
+            self.snapshot_reads.append(what)
         return [tuple(row) for row in self.answer(sql)]
 
     def script(self, sql, what):
+        self._land(what)
         self.calls.append(('script', what))
         self.sql.append(sql)
-        assert (sql, what) in {(RESET_SQL, 'ingest reset'), (NORMALISE_SQL, 'normalise')}, 'an unexpected script'
+        assert (sql, what) in {
+            (RESET_SQL, 'ingest reset'),
+            (NORMALISE_SQL, 'normalise'),
+            (SNAPSHOT_BEGIN, 'dump snapshot begin'),
+            (SNAPSHOT_END, 'dump snapshot end'),
+        }, 'an unexpected script'
+        if sql == SNAPSHOT_BEGIN:
+            assert not self.snapshot_open, 'a snapshot opened inside another'
+            self.snapshot_open = True
+        elif sql == SNAPSHOT_END:
+            # The writes the loops committed while the snapshot was open become visible once it closes.
+            self.snapshot_open = False
+            held, self.held = self.held, []
+            for changes in held:
+                self._apply(changes)
+            if self.end_error is not None:
+                raise self.end_error
+
+    # -- the store's own loops: writes that land between two of the producer's statements --
+
+    def _land(self, what):
+        writer = self.drifts.pop((self.attempts, what), None)
+        if writer is not None:
+            writer(self)
+
+    def write(self, **changes):
+        """A write by the store's own loops: visible at once, or at the snapshot's end when one is open."""
+        if self.snapshot_open:
+            self.held.append(copy.deepcopy(changes))
+        else:
+            self._apply(changes)
+
+    def _apply(self, changes):
+        for name, value in changes.items():
+            if name in MERGED_ATTRS:
+                getattr(self, name).update(copy.deepcopy(value))
+            else:
+                setattr(self, name, copy.deepcopy(value))
+
+    def reseed(self):
+        """The reset and the cast write the cast again: whatever the loops changed in it is gone."""
+        self.attempts += 1
+        for name, value in copy.deepcopy(self.cast).items():
+            setattr(self, name, value)
 
     def post(self, path, body, secret_header):
         return self.reply(path, body, secret_header)
@@ -449,7 +659,8 @@ def test_the_steps_run_in_the_designed_order():
     posts = [i for i, kind in enumerate(kinds) if kind == 'post']
     checks = [i for i, kind in enumerate(kinds) if kind == 'synthetic check']
     assert kinds[0] == 'alembic_version read'
-    assert len(checks) == 3
+    # Four since tj-7zjov1.166: the fourth runs again inside the dump snapshot.
+    assert len(checks) == 4
     assert checks[0] < kinds.index('ingest reset') < posts[0], 'refusal, then the ingest reset, then the POSTs'
     # Twice: before the POSTs, and again in the record steps below, right before the cast.
     assert kinds.index('ingest reset') == checks[0] + 1 and kinds.count('ingest reset') == 2
@@ -458,22 +669,23 @@ def test_the_steps_run_in_the_designed_order():
     assert kinds.count('bar collision check') == 1
     collision, normalise = kinds.index('bar collision check'), kinds.index('normalise')
     assert kinds[collision + 1 : normalise] == RECORD_STEPS, 'the cast, its count refusal, a third check'
-    assert kinds[normalise:] == [
-        'normalise',
-        *(f'{table} count' for table in SEED_TABLES),
-        *(step for table in SEED_TABLES for step in (f'{table} columns', f'{table} render')),
-        *(step for table in SEED_TABLES for step in (f'{table} columns', f'{table} digests')),
-    ]
+    # tj-7zjov1.166: the refusals run AGAIN in the snapshot, with the counts, the render and the digests, and the
+    # snapshot closes only after the last digest: everything the seed is made of is read inside it.
+    assert kinds[normalise:] == ['normalise', *DUMP_STEPS]
 
 
-def test_normalise_and_the_ingest_reset_are_the_only_scripts():
+def test_normalise_the_ingest_reset_and_the_snapshot_are_the_only_scripts():
+    """tj-7zjov1.166 adds the snapshot's begin and end: one of each, after the normalise, the end last of all."""
     stack = FakeStack()
     produce(stack, date='2026-09-30')
     assert [call for call in stack.calls if call[0] == 'script'] == [
         ('script', 'ingest reset'),
         ('script', 'ingest reset'),
         ('script', 'normalise'),
+        ('script', 'dump snapshot begin'),
+        ('script', 'dump snapshot end'),
     ]
+    assert stack.calls[-1] == ('script', 'dump snapshot end')
 
 
 def test_the_ingest_reset_empties_exactly_the_three_ingest_tables_children_first():
@@ -623,12 +835,178 @@ def test_the_synthetic_check_covers_the_request_and_run_labels():
     """A request's client_label and a run's actor are the owner; a NULL request symbol reads as foreign."""
     stack = FakeStack()
     produce(stack, date='2026-09-30')
-    assert len(stack.synthetic_sql) == 3 and len(set(stack.synthetic_sql)) == 1
+    assert len(stack.synthetic_sql) == 4 and len(set(stack.synthetic_sql)) == 1
     sql = stack.synthetic_sql[0]
     assert f"SELECT 'q', coalesce(asset_symbol, ''), client_label, count(*) FROM {REQUEST_TABLE} " in sql
-    assert 'GROUP BY asset_symbol, client_label' in sql
-    assert f"SELECT 'r', asset_symbol, actor, count(*) FROM {RUN_TABLE} GROUP BY asset_symbol, actor" in sql
+    # Since tj-7zjov1.30 an ASSET_LIST request and a run with no symbol (its attempt row) are judged by owner alone
+    # ('l'); every other request and run is still judged by symbol and owner, a NULL request symbol still foreign.
+    assert "WHERE kind <> 'ASSET_LIST' GROUP BY asset_symbol, client_label" in sql
+    assert f"SELECT 'l', '', client_label, count(*) FROM {REQUEST_TABLE} WHERE kind = 'ASSET_LIST'" in sql
+    assert (
+        f"SELECT 'r', asset_symbol, actor, count(*) FROM {RUN_TABLE} WHERE asset_symbol IS NOT NULL "
+        'GROUP BY asset_symbol, actor'
+    ) in sql
+    assert f"SELECT 'l', '', actor, count(*) FROM {RUN_TABLE} WHERE asset_symbol IS NULL GROUP BY actor" in sql
+    # The asset-list tables carry the vendor's symbols and no owner: rows, events and a flip's previous symbol.
+    assert f"SELECT 'a', symbol, '', count(*) FROM {SNAPSHOT_ROW_TABLE} GROUP BY symbol" in sql
+    assert f"SELECT 'v', symbol, '', count(*) FROM {SNAPSHOT_EVENT_TABLE} GROUP BY symbol" in sql
+    assert (
+        f"SELECT 'p', previous_symbol, '', count(*) FROM {SNAPSHOT_EVENT_TABLE} WHERE previous_symbol IS NOT NULL "
+        'GROUP BY previous_symbol'
+    ) in sql
     assert INSTANCE_TABLE not in sql, 'the instance marker carries no label'
+
+
+@pytest.mark.parametrize(
+    'foreign',
+    [
+        ('l', '', 'miguel', 3),  # an asset-list request or attempt row under a real owner
+        ('a', 'MSFT', '', 3),  # a real symbol in a snapshot row (not one the fake broker lists: tj-7zjov1.195)
+        ('v', 'TSLA', '', 3),  # a real symbol on an event
+        ('p', 'TWTR', '', 3),  # a real previous symbol on a flip
+        ('a', 'ZZSEED', '', 3),  # the prefix alone is not the pattern
+    ],
+    ids=['asset-list-owner', 'row-symbol', 'event-symbol', 'flip-previous-symbol', 'bare-prefix'],
+)
+def test_a_foreign_asset_list_row_before_the_scenario_refuses_before_any_post(no_writes, foreign):
+    stack = FakeStack(foreign_before=[foreign])
+    with pytest.raises(SeedRefused) as raised:
+        produce(stack)
+    assert str(raised.value) == '3 row(s) hold a symbol or owner outside the synthetic patterns; no seed written'
+    assert 'post' not in stack.kinds()
+    assert foreign[1] not in str(raised.value) or not foreign[1]
+    assert foreign[1] not in FAKE_SNAPSHOT_SYMBOLS, 'a symbol the fake broker lists is exempt, not foreign'
+
+
+@pytest.mark.parametrize(
+    'synthetic',
+    [('l', '', 'seed-owner-b', 2), ('a', 'ZZSEEDXF', '', 1), ('v', 'ZZSEEDXE', '', 1), ('p', 'ZZSEEDXB', '', 1)],
+    ids=['asset-list-owner', 'row-symbol', 'event-symbol', 'flip-previous-symbol'],
+)
+def test_a_synthetic_asset_list_row_with_no_symbol_or_no_owner_is_not_foreign(synthetic):
+    """'l' has no symbol to judge (owner alone); 'a', 'v' and 'p' have no owner (symbol alone)."""
+    stack = FakeStack(foreign_before=[synthetic], foreign_records=[synthetic])
+    produce(stack, date='2026-09-30')
+
+
+# ---------------------------------------------------------------------------------------------
+# The store's own boot-time asset snapshot (bead tj-7zjov1.195): exempt by exact owner and exact symbol set
+# ---------------------------------------------------------------------------------------------
+
+# What one P47 boot writes on the fake broker: the ASSET_LIST request and its attempt row under SCHEDULER_ACTOR (two
+# 'l' groups, one per table), and a snapshot row per listed or delisted symbol.
+BOOT_SNAPSHOT_ROWS = [
+    ('l', '', SCHEDULER_ACTOR, 2),
+    ('l', '', SCHEDULER_ACTOR, 2),
+    *(('a', symbol, '', 1) for symbol in FAKE_SNAPSHOT_SYMBOLS),
+]
+EXEMPT_ROWS = [
+    pytest.param(('l', '', SCHEDULER_ACTOR, 2), id='scheduler-asset-list'),
+    *(pytest.param((kind, symbol, '', 3), id=f'{kind}-{symbol}') for kind in 'avp' for symbol in FAKE_SNAPSHOT_SYMBOLS),
+]
+
+
+def test_the_boot_snapshot_alone_counts_no_foreign_row():
+    stack = FakeStack(foreign_before=BOOT_SNAPSHOT_ROWS)
+    assert producer_module._count_foreign_rows(stack) == (0, False)
+
+
+@pytest.mark.parametrize('exempt', EXEMPT_ROWS)
+def test_a_boot_snapshot_row_counts_zero_and_the_seed_is_made(no_writes, exempt):
+    """Seen by every synthetic check: before the POSTs, after them, after the cast and in the snapshot."""
+    assert producer_module._count_foreign_rows(FakeStack(foreign_before=[exempt])) == (0, False)
+    stack = FakeStack(foreign_before=[exempt], foreign_after=[exempt])
+    assert produce(stack, date='2026-09-30').bundle == _clean_bundle()
+    assert stack.kinds().count('synthetic check') == 4
+
+
+@pytest.mark.parametrize(
+    'foreign',
+    [
+        # A scheduler BARS or corporate-actions request or run is judged by its symbol, never exempt by its owner.
+        pytest.param(('q', 'AAPL', SCHEDULER_ACTOR, 3), id='scheduler-request-fake-listed-symbol'),
+        pytest.param(('q', 'MSFT', SCHEDULER_ACTOR, 3), id='scheduler-request-real-symbol'),
+        pytest.param(('r', 'AAPL', SCHEDULER_ACTOR, 3), id='scheduler-run-fake-listed-symbol'),
+        pytest.param(('r', 'MSFT', SCHEDULER_ACTOR, 3), id='scheduler-run-real-symbol'),
+        # The fake lists exempt only the asset-list tables: a corporate action or an entry naming one still counts.
+        pytest.param(('c', 'AAPL', '', 3), id='corporate-action-fake-listed-symbol'),
+        pytest.param(('e', 'VFV', 'seed-owner-a', 3), id='entry-fake-listed-symbol'),
+        # A real symbol outside the fake lists, and near misses of a listed one: the set is matched exactly.
+        pytest.param(('a', 'MSFT', '', 3), id='row-real-symbol'),
+        pytest.param(('v', 'MSFT', '', 3), id='event-real-symbol'),
+        pytest.param(('p', 'MSFT', '', 3), id='flip-real-symbol'),
+        pytest.param(('a', 'AAPLX', '', 3), id='row-listed-prefix'),
+        pytest.param(('a', 'AAP', '', 3), id='row-listed-truncated'),
+        pytest.param(('a', 'aapl', '', 3), id='row-listed-lower-case'),
+        # An ASSET_LIST row under any owner but exactly SCHEDULER_ACTOR.
+        pytest.param(('l', '', f'{SCHEDULER_ACTOR}-x', 3), id='asset-list-owner-scheduler-prefix'),
+        pytest.param(('l', '', f'x{SCHEDULER_ACTOR}', 3), id='asset-list-owner-scheduler-suffix'),
+        pytest.param(('l', '', SCHEDULER_ACTOR.upper(), 3), id='asset-list-owner-scheduler-upper-case'),
+        pytest.param(('l', '', 'operator', 3), id='asset-list-owner-operator'),
+    ],
+)
+def test_beside_the_boot_snapshot_a_foreign_row_still_counts_and_refuses(no_writes, foreign):
+    stack = FakeStack(foreign_before=[*BOOT_SNAPSHOT_ROWS, foreign])
+    assert producer_module._count_foreign_rows(stack) == (3, False)
+    with pytest.raises(SeedRefused) as raised:
+        produce(stack)
+    assert str(raised.value) == '3 row(s) hold a symbol or owner outside the synthetic patterns; no seed written'
+    assert 'post' not in stack.kinds() and 'ingest reset' not in stack.kinds()
+
+
+def test_the_scheduler_actor_is_the_one_the_snapshot_schedule_writes():
+    """The exemption names the schedule's own label: tests above build rows from the same constant."""
+    from data.store.app import asset_snapshot_schedule
+
+    assert asset_snapshot_schedule.SCHEDULER_ACTOR is SCHEDULER_ACTOR == 'scheduler'
+
+
+def boot_snapshot_residue(fake):
+    """The P47 schedule firing mid-cast (an ingest restart), as rows.
+
+    One active-list request and its attempt row under SCHEDULER_ACTOR, and one snapshot of the fake broker's listed
+    symbols. Exempt from the synthetic check, it still moves the cast's counts.
+    """
+    listed = len(FAKE_LISTED_SYMBOLS)
+    fake.write(
+        rows_after_records=[
+            *fake.rows_after_records,
+            ('l', '', SCHEDULER_ACTOR, 1),
+            ('l', '', SCHEDULER_ACTOR, 1),
+            *(('a', symbol, '', 1) for symbol in FAKE_LISTED_SYMBOLS),
+        ],
+        asset_request_rows=[(name, n + (name == 'active')) for name, n in fake.asset_request_rows],
+        snapshot_list_rows=[(name, n + (name == 'active')) for name, n in fake.snapshot_list_rows],
+        raw_counts={
+            RUN_TABLE: [(COUNTS[RUN_TABLE] + 1,)],
+            REQUEST_TABLE: [(COUNTS[REQUEST_TABLE] + 1,)],
+            SNAPSHOT_TABLE: [(COUNTS[SNAPSHOT_TABLE] + 1,)],
+            SNAPSHOT_ROW_TABLE: [(COUNTS[SNAPSHOT_ROW_TABLE] + listed,)],
+        },
+    )
+
+
+@pytest.mark.parametrize('step', ['normalise', 'dump snapshot begin'])
+def test_boot_snapshot_residue_mid_cast_is_a_drift_and_the_cast_runs_again(no_writes, step):
+    """The snapshot's synthetic check runs before its cast check: the residue must pass the first to reach the second."""
+    stack = FakeStack(drifts={(1, step): boot_snapshot_residue})
+    assert produce(stack, date='2026-09-30').bundle == _clean_bundle()
+    assert not stack.drifts, 'the residue landed'
+    first, second = _attempts(stack)
+    snapshot = first[first.index('dump snapshot begin') :]
+    assert snapshot[1] == 'synthetic check' and 'request states' in snapshot, 'passed the synthetic check'
+    assert first[-1] == 'dump snapshot end'
+    assert second == ['seed dataset lookup', *RECORD_STEPS[1:], 'normalise', *DUMP_STEPS]
+
+
+def test_boot_snapshot_residue_that_never_settles_raises_cast_drifted_not_a_foreign_refusal(no_writes):
+    attempts = producer_module.CAST_ATTEMPTS
+    stack = FakeStack(drifts={(n, 'normalise'): boot_snapshot_residue for n in range(1, attempts + 1)})
+    with pytest.raises(CastDrifted) as raised:
+        produce(stack)
+    assert type(raised.value) is CastDrifted
+    assert 'outside the synthetic patterns' not in str(raised.value)
+    assert stack.kinds().count('seed') == attempts
 
 
 @pytest.mark.parametrize(
@@ -673,7 +1051,8 @@ def _states(**changes):
 
 
 # The refusal names the counts per state found and expected (enum names and counts, never a value), in name order.
-EXPECTED_STATES_TEXT = 'EMPTY=1, FAILED=4, NOT_DELIVERED=1, PENDING=1, QUEUED=1, SUCCEEDED=3'
+# Since tj-7zjov1.30 the cast adds four SUCCEEDED and one EMPTY asset-list request.
+EXPECTED_STATES_TEXT = 'EMPTY=2, FAILED=4, NOT_DELIVERED=1, PENDING=1, QUEUED=1, SUCCEEDED=7'
 
 
 def _cast_message(found: str) -> str:
@@ -683,37 +1062,49 @@ def _cast_message(found: str) -> str:
     )
 
 
+def _asset_list_message(what: str, per: str, found: str, expected: str) -> str:
+    return (
+        f'the seeded asset-list {what} are not the expected cast (counts per {per} differ); '
+        f'found {found}, expected {expected}; no seed written'
+    )
+
+
 CAST_REFUSALS = [
     pytest.param(
         {'state_rows': _states(EMPTY=None)},
-        _cast_message('FAILED=4, NOT_DELIVERED=1, PENDING=1, QUEUED=1, SUCCEEDED=3'),
+        _cast_message('FAILED=4, NOT_DELIVERED=1, PENDING=1, QUEUED=1, SUCCEEDED=7'),
         id='a-state-missing',
     ),
     pytest.param(
         {'state_rows': _states(FAILED=3)},
-        _cast_message('EMPTY=1, FAILED=3, NOT_DELIVERED=1, PENDING=1, QUEUED=1, SUCCEEDED=3'),
+        _cast_message('EMPTY=2, FAILED=3, NOT_DELIVERED=1, PENDING=1, QUEUED=1, SUCCEEDED=7'),
         id='a-count-short',
     ),
     pytest.param(
         {'state_rows': _states(PENDING=2)},
-        _cast_message('EMPTY=1, FAILED=4, NOT_DELIVERED=1, PENDING=2, QUEUED=1, SUCCEEDED=3'),
+        _cast_message('EMPTY=2, FAILED=4, NOT_DELIVERED=1, PENDING=2, QUEUED=1, SUCCEEDED=7'),
         id='a-count-over',
     ),
     pytest.param(
         {'state_rows': _states(RUNNING=1)},
-        _cast_message('EMPTY=1, FAILED=4, NOT_DELIVERED=1, PENDING=1, QUEUED=1, RUNNING=1, SUCCEEDED=3'),
+        _cast_message('EMPTY=2, FAILED=4, NOT_DELIVERED=1, PENDING=1, QUEUED=1, RUNNING=1, SUCCEEDED=7'),
         id='an-extra-state',
     ),
     pytest.param({'state_rows': []}, _cast_message('none'), id='no-requests'),
-    # Text counts render as the same digits: still refused (the comparison is typed); the message cannot show why.
+    # Text counts: still refused (the comparison is typed), and since the builder's change on tj-7zjov1.30 the found
+    # side shows WHY, each text count with its type (the P18p tj-7zjov1.162 behaviour, built here).
     pytest.param(
-        {'state_rows': [(s, str(n)) for s, n in _states()]}, _cast_message(EXPECTED_STATES_TEXT), id='text-counts'
+        {'state_rows': [(s, str(n)) for s, n in _states()]},
+        _cast_message(
+            "EMPTY=str '2', FAILED=str '4', NOT_DELIVERED=str '1', PENDING=str '1', QUEUED=str '1', SUCCEEDED=str '7'"
+        ),
+        id='text-counts',
     ),
     pytest.param(
-        {'attempt_rows': [(9,)]}, '9 attempt rows were written; expected 10; no seed written', id='attempts-9'
+        {'attempt_rows': [(14,)]}, '14 attempt rows were written; expected 15; no seed written', id='attempts-14'
     ),
     pytest.param(
-        {'attempt_rows': [(11,)]}, '11 attempt rows were written; expected 10; no seed written', id='attempts-11'
+        {'attempt_rows': [(16,)]}, '16 attempt rows were written; expected 15; no seed written', id='attempts-16'
     ),
     pytest.param(
         {'stray_rows': [(1,)]},
@@ -766,14 +1157,14 @@ CAST_REFUSALS = [
         id='two-interrupted',
     ),
     pytest.param(
-        {'raw_counts': {RUN_TABLE: [(13,)]}},
-        '13 ingest_run rows were written; expected 14; no seed written',
-        id='runs-13',
+        {'raw_counts': {RUN_TABLE: [(18,)]}},
+        '18 ingest_run rows were written; expected 19; no seed written',
+        id='runs-18',
     ),
     pytest.param(
-        {'raw_counts': {RUN_TABLE: [(15,)]}},
-        '15 ingest_run rows were written; expected 14; no seed written',
-        id='runs-15',
+        {'raw_counts': {RUN_TABLE: [(20,)]}},
+        '20 ingest_run rows were written; expected 19; no seed written',
+        id='runs-20',
     ),
     # tj-7zjov1.31: the observations of the cast (A, B, A revised) and the one revised action.
     pytest.param(
@@ -796,6 +1187,64 @@ CAST_REFUSALS = [
         '2 corporate actions hold more than one payload; expected 1; no seed written',
         id='two-revisions',
     ),
+    # tj-7zjov1.30: the asset-list cast. Each refusal names what was FOUND and what was EXPECTED, counts only.
+    pytest.param(
+        {'asset_request_rows': [('active', 3), ('inactive', 1)]},
+        _asset_list_message('requests', 'list', 'active=3, inactive=1', 'active=3, inactive=2'),
+        id='asset-list-requests-short',
+    ),
+    pytest.param(
+        {'asset_request_rows': [('active', 3)]},
+        _asset_list_message('requests', 'list', 'active=3', 'active=3, inactive=2'),
+        id='asset-list-requests-a-list-missing',
+    ),
+    pytest.param(
+        {'asset_request_rows': [('active', '3'), ('inactive', 2)]},
+        _asset_list_message('requests', 'list', "active=str '3', inactive=2", 'active=3, inactive=2'),
+        id='asset-list-requests-text-count',
+    ),
+    pytest.param(
+        {'snapshot_list_rows': [('active', 2), ('inactive', 2)]},
+        _asset_list_message('snapshots', 'list', 'active=2, inactive=2', 'active=3, inactive=2'),
+        id='snapshots-short',
+    ),
+    pytest.param(
+        {'snapshot_list_rows': []},
+        _asset_list_message('snapshots', 'list', 'none', 'active=3, inactive=2'),
+        id='no-snapshots',
+    ),
+    pytest.param(
+        {'empty_snapshot_rows': [(0,)]},
+        'found 0 empty asset-list snapshots, expected 1; no seed written',
+        id='no-empty-snapshot',
+    ),
+    pytest.param(
+        {'empty_snapshot_rows': [(2,)]},
+        'found 2 empty asset-list snapshots, expected 1; no seed written',
+        id='two-empty-snapshots',
+    ),
+    pytest.param(
+        {'raw_counts': {SNAPSHOT_ROW_TABLE: [(8,)]}},
+        'found 8 asset-list rows, expected 9; no seed written',
+        id='snapshot-rows-8',
+    ),
+    pytest.param(
+        {'snapshot_stray_rows': [(1,)]},
+        'found 1 snapshot(s) whose row_count differs from the rows they hold, expected 0; no seed written',
+        id='row-count-differs',
+    ),
+    pytest.param(
+        {'event_rows': [('appeared', 2), ('vanished', 2)]},
+        _asset_list_message('events', 'kind', 'appeared=2, vanished=2', 'appeared=2, status_flip=1, vanished=2'),
+        id='no-flip',
+    ),
+    pytest.param(
+        {'event_rows': [('appeared', 2), ('status_flip', 1), ('vanished', 3)]},
+        _asset_list_message(
+            'events', 'kind', 'appeared=2, status_flip=1, vanished=3', 'appeared=2, status_flip=1, vanished=2'
+        ),
+        id='a-vanished-too-many',
+    ),
 ]
 
 
@@ -805,7 +1254,10 @@ def test_a_cast_that_differs_is_refused_before_the_rewrite(no_writes, override, 
     with pytest.raises(SeedRefused) as raised:
         produce(stack)
     assert str(raised.value) == message
-    assert 'seed' in stack.kinds()
+    # tj-7zjov1.166: every cast refusal is a CastDrifted, so the whole cast is run CAST_ATTEMPTS times; a cast that
+    # differs the same way every time is refused with that one message, unchanged.
+    assert isinstance(raised.value, CastDrifted)
+    assert stack.kinds().count('seed') == producer_module.CAST_ATTEMPTS
     assert 'normalise' not in stack.kinds() and stack.kinds().count('synthetic check') == 2
 
 
@@ -829,10 +1281,30 @@ def test_a_cast_refusal_exits_3_through_the_entry_point(monkeypatch, capsys, ove
         ({'revised_rows': [(None,)]}, 'revised action count'),
         ({'interrupted_rows': [('1',)]}, 'interrupted runs'),
         ({'raw_counts': {RUN_TABLE: [(None,)]}}, 'run rows'),
+        ({'empty_snapshot_rows': [('1',)]}, 'empty snapshots'),
+        ({'raw_counts': {SNAPSHOT_ROW_TABLE: [(None,)]}}, 'snapshot rows'),
+        ({'snapshot_stray_rows': []}, 'snapshots whose row_count differs from their rows'),
     ],
-    ids=['attempts', 'half-attempts', 'instances', 'superseded', 'observations', 'revised', 'interrupted', 'runs'],
+    ids=[
+        'attempts',
+        'half-attempts',
+        'instances',
+        'superseded',
+        'observations',
+        'revised',
+        'interrupted',
+        'runs',
+        'empty-snapshots',
+        'snapshot-rows',
+        'snapshot-stray',
+    ],
 )
 def test_a_cast_count_that_is_not_one_integer_fails_without_echoing_it(no_writes, override, what):
+    """S9 (5): a count query answering anything but one non-negative integer fails without echoing the result.
+
+    Red at e80bbd1, where _query_count appended 'found <type> <value>' (validator finding on tj-7zjov1.30); green
+    since 2e6ac02 removed it.
+    """
     with pytest.raises(StackError) as raised:
         produce(FakeStack(**override))
     assert str(raised.value) == COUNT_MESSAGE.format(what=what)
@@ -855,24 +1327,58 @@ def test_the_cast_queries_count_what_the_refusal_names():
         f'SELECT count(*) FROM (SELECT 1 FROM {CORPORATE_ACTION_TABLE} GROUP BY source, vendor_action_id '
         'HAVING count(*) > 1) AS revised;'
     ) in stack.sql
+    # tj-7zjov1.30: the asset-list cast's queries.
+    assert (
+        f"SELECT asset_list_status::text, count(*) FROM {REQUEST_TABLE} WHERE kind = 'ASSET_LIST' "
+        'GROUP BY asset_list_status;'
+    ) in stack.sql
+    assert f'SELECT asset_list::text, count(*) FROM {SNAPSHOT_TABLE} GROUP BY asset_list;' in stack.sql
+    assert f'SELECT count(*) FROM {SNAPSHOT_TABLE} WHERE row_count = 0;' in stack.sql
+    assert f'SELECT count(*) FROM {SNAPSHOT_ROW_TABLE};' in stack.sql
+    assert (
+        f'SELECT count(*) FROM {SNAPSHOT_TABLE} s WHERE s.row_count <> '
+        f'(SELECT count(*) FROM {SNAPSHOT_ROW_TABLE} r WHERE r.snapshot_id = s.id);'
+    ) in stack.sql
+    assert f'SELECT kind::text, count(*) FROM {SNAPSHOT_EVENT_TABLE} GROUP BY kind;' in stack.sql
+    # tj-7zjov1.166: every request and every instance, by id, unfiltered (a row outside the cast must be seen).
+    assert f'SELECT id::text, state::text, instance_id FROM {REQUEST_TABLE};' in stack.sql
+    assert f'SELECT instance_id, superseded_at IS NOT NULL FROM {INSTANCE_TABLE};' in stack.sql
 
 
 def test_the_expected_cast_is_the_cast_ingest_records_names():
-    """Eleven named requests (two corporate-actions since tj-7zjov1.31); ten attempt rows; two instances.
+    """Sixteen named requests, fifteen attempt rows, two instances.
 
-    One per state but four FAILED and three SUCCEEDED (the bars success and the two corporate-actions requests);
-    three observations (A, B, A revised), one action holding two payloads.
+    Two corporate-actions requests since tj-7zjov1.31, five asset lists since tj-7zjov1.30. One per state but four FAILED, seven SUCCEEDED (the bars success, the two corporate-actions requests and the four
+    non-empty asset lists) and two EMPTY (the bars one and the empty asset list); three observations (A, B, A revised),
+    one action holding two payloads.
     """
-    assert sum(EXPECTED_REQUEST_STATES.values()) == len(REQUEST_IDS) == 11
+    assert sum(EXPECTED_REQUEST_STATES.values()) == len(REQUEST_IDS) == 16
     assert len(set(REQUEST_IDS.values())) == len(REQUEST_IDS)
+    asset_lists = [name for name in REQUEST_IDS if name.startswith('AL_')]
     assert EXPECTED_REQUEST_STATES['FAILED'] == sum(1 for name in REQUEST_IDS if name.startswith('FAILED_'))
-    assert EXPECTED_REQUEST_STATES['SUCCEEDED'] == 1 + sum(1 for name in REQUEST_IDS if name.startswith('CA_'))
-    assert EXPECTED_ATTEMPT_ROWS == 10 and EXPECTED_INSTANCES == 2
+    assert EXPECTED_REQUEST_STATES['SUCCEEDED'] == 1 + sum(1 for name in REQUEST_IDS if name.startswith('CA_')) + sum(
+        1 for name in asset_lists if not name.endswith('_EMPTY')
+    )
+    assert EXPECTED_REQUEST_STATES['EMPTY'] == 1 + sum(1 for name in asset_lists if name.endswith('_EMPTY'))
+    assert EXPECTED_ATTEMPT_ROWS == 15 and EXPECTED_INSTANCES == 2
     assert (EXPECTED_OBSERVATIONS, EXPECTED_REVISED_ACTIONS) == (3, 1)
-    # e5d950e: four legacy-shaped runs (one swept INTERRUPTED), so fourteen ingest_run rows in all.
+    # e5d950e: four legacy-shaped runs (one swept INTERRUPTED), so nineteen ingest_run rows in all.
     assert sum(EXPECTED_LEGACY_STATES.values()) == EXPECTED_LEGACY_RUNS == 4
     assert EXPECTED_LEGACY_STATES == {'EMPTY': 1, 'FAILED': 2, 'SUCCEEDED': 1} and EXPECTED_INTERRUPTED_RUNS == 1
-    assert EXPECTED_RUN_ROWS == EXPECTED_ATTEMPT_ROWS + EXPECTED_LEGACY_RUNS == 14
+    assert EXPECTED_RUN_ROWS == EXPECTED_ATTEMPT_ROWS + EXPECTED_LEGACY_RUNS == 19
+
+
+def test_the_expected_asset_list_cast_is_the_one_the_seeder_names():
+    """One request and one snapshot per AL_ name, split by list; the empty one among them; the bead's counts."""
+    asset_lists = [name for name in REQUEST_IDS if name.startswith('AL_')]
+    per_list = Counter('inactive' if '_INACTIVE_' in name else 'active' for name in asset_lists)
+    assert EXPECTED_ASSET_LIST_REQUESTS == EXPECTED_SNAPSHOTS == dict(per_list) == {'active': 3, 'inactive': 2}
+    assert EXPECTED_EMPTY_SNAPSHOTS == sum(1 for name in asset_lists if name.endswith('_EMPTY')) == 1
+    assert EXPECTED_SNAPSHOT_ROWS == 9
+    assert EXPECTED_EVENTS == {'appeared': 2, 'status_flip': 1, 'vanished': 2}
+    # Synthetic: every symbol of the cast is ZZSEED plus letters, every vendor id is a seed id.
+    assert all(symbol.startswith('ZZSEEDX') for _, symbol in _AL_ASSETS.values())
+    assert all(vendor_id.startswith('seed-asset-') for vendor_id, _ in _AL_ASSETS.values())
 
 
 def test_the_committed_head_seed_holds_the_cast():
@@ -889,6 +1395,447 @@ def test_the_committed_head_seed_holds_the_cast():
     sql = (REPO_ROOT / 'tests' / 'system' / 'seeds' / f'{HEAD}.sql').read_text(encoding='utf-8')
     for request_id in REQUEST_IDS.values():
         assert f"'{request_id}'" in sql, request_id
+
+
+# ---------------------------------------------------------------------------------------------
+# The store's own loops during the cast (tj-7zjov1.166): each request by id, one snapshot, the retry
+# ---------------------------------------------------------------------------------------------
+#
+# The instance watcher probes the live ingest every pass; the reset made its id a first sighting, so the probe adds that
+# instance, supersedes seed-instance-b and moves the QUEUED request to NOT_DELIVERED. Before the fix the checks ran
+# before the normalise and the dump was read afterwards, so a probe landing between them was dumped unchecked. The
+# drifts below land at a named statement of a named attempt; the fake holds a write made while the snapshot is open
+# until it closes, as REPEATABLE READ does.
+
+PENDING_ID = str(REQUEST_IDS['PENDING'])
+QUEUED_ID = str(REQUEST_IDS['QUEUED'])
+NOT_DELIVERED_ID = str(REQUEST_IDS['NOT_DELIVERED'])
+SUCCEEDED_ID = str(REQUEST_IDS['SUCCEEDED'])
+# Values of the stack's own, never the cast's: no refusal may carry them.
+LIVE_INSTANCE = 'ingest-live-INSTSENTINEL'
+OUTSIDE_REQUEST = 'OUTSIDE-REQUEST-SENTINEL'
+PROBED_REQUEST_LINE = "INSERT INTO public.ingest_request (id, state) VALUES ('5eed', 'NOT_DELIVERED');"
+PROBED_INSTANCE_LINE = (
+    f"INSERT INTO public.ingest_instance (instance_id, superseded_at) VALUES ('{LIVE_INSTANCE}', NULL);"
+)
+
+
+def _with_request(rows, request_id, state, instance):
+    return [(rid, state, instance) if rid == request_id else (rid, s, i) for rid, s, i in rows]
+
+
+def watcher_probe(fake):
+    """The instance watcher's first sighting of the live ingest (crud/ingest_instance.py steps 2 and 3), as rows."""
+    fake.write(
+        request_rows=_with_request(fake.request_rows, QUEUED_ID, 'NOT_DELIVERED', INSTANCE_B),
+        state_rows=_states(QUEUED=None, NOT_DELIVERED=2),
+        instance_rows=[(INSTANCE_A, True), (INSTANCE_B, True), (LIVE_INSTANCE, False)],
+        superseded_rows=[(2,)],
+        raw_counts={INSTANCE_TABLE: [(3,)]},
+        render={REQUEST_TABLE: [(PROBED_REQUEST_LINE,)], INSTANCE_TABLE: [(PROBED_INSTANCE_LINE,)]},
+        digests={
+            REQUEST_TABLE: [('id', 'q0'), ('state', 'probed')],
+            INSTANCE_TABLE: [('instance_id', 'probed'), ('superseded_at', 'probed')],
+        },
+    )
+
+
+def count_neutral_flip(fake):
+    """A drift no count can see: the QUEUED and the NOT_DELIVERED request trade states, each keeping its instance."""
+    rows = _with_request(fake.request_rows, QUEUED_ID, 'NOT_DELIVERED', INSTANCE_B)
+    fake.write(
+        request_rows=_with_request(rows, NOT_DELIVERED_ID, 'QUEUED', INSTANCE_A),
+        render={REQUEST_TABLE: [(PROBED_REQUEST_LINE,)]},
+        digests={REQUEST_TABLE: [('id', 'q0'), ('state', 'probed')]},
+    )
+
+
+DRIFTS = [pytest.param(watcher_probe, id='watcher-probe'), pytest.param(count_neutral_flip, id='count-neutral-flip')]
+
+
+def _clean_bundle():
+    return produce(FakeStack(), date='2026-09-30').bundle
+
+
+def _attempts(stack: FakeStack) -> list[list[str]]:
+    """The calls of each cast attempt, from its dataset lookup to the next one (the last runs to the end)."""
+    kinds = stack.kinds()
+    starts = [i for i, kind in enumerate(kinds) if kind == 'seed dataset lookup']
+    return [kinds[start:end] for start, end in zip(starts, [*starts[1:], len(kinds)], strict=True)]
+
+
+def test_the_snapshot_is_one_repeatable_read_read_only_transaction_closed_by_a_rollback():
+    """The design's isolation level (bead tj-7zjov1.166 REQUIRED (1)): a weaker one gives each statement its own view."""
+    assert SNAPSHOT_BEGIN == 'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;'
+    assert SNAPSHOT_END == 'ROLLBACK;'
+
+
+def test_the_cast_is_run_at_most_five_times():
+    assert producer_module.CAST_ATTEMPTS == 5
+
+
+def test_every_read_the_seed_is_made_of_is_inside_the_snapshot():
+    stack = FakeStack()
+    produce(stack, date='2026-09-30')
+    assert stack.snapshot_reads == DUMP_STEPS[1:-1]
+    assert not stack.snapshot_open
+
+
+@pytest.mark.parametrize('drift', DRIFTS)
+@pytest.mark.parametrize('step', ['normalise', 'dump snapshot begin'])
+def test_a_drift_after_the_checks_and_before_the_dump_is_refused_and_the_cast_run_again(no_writes, step, drift):
+    """The P17 race: the post-cast checks pass, the probe lands, and the snapshot's own checks refuse what it sees."""
+    stack = FakeStack(drifts={(1, step): drift})
+    result = produce(stack, date='2026-09-30')
+    assert result.bundle == _clean_bundle()
+    assert PROBED_REQUEST_LINE not in result.bundle.sql
+    first, second = _attempts(stack)
+    assert 'normalise' in first, 'the first attempt passed the checks after the cast'
+    assert f'{ENTRY_TABLE} count' not in first and f'{ENTRY_TABLE} render' not in first, 'refused before any read'
+    assert first[-1] == 'dump snapshot end', 'and the snapshot was rolled back before the cast ran again'
+    assert first.count('dump snapshot begin') == 1
+    assert second == ['seed dataset lookup', *RECORD_STEPS[1:], 'normalise', *DUMP_STEPS]
+
+
+@pytest.mark.parametrize('drift', DRIFTS)
+def test_a_drift_right_after_the_cast_is_refused_before_the_normalise_and_the_cast_run_again(no_writes, drift):
+    stack = FakeStack(drifts={(1, 'request states'): drift})
+    assert produce(stack, date='2026-09-30').bundle == _clean_bundle()
+    first, second = _attempts(stack)
+    assert 'normalise' not in first and 'dump snapshot begin' not in first
+    assert 'normalise' in second
+
+
+@pytest.mark.parametrize('drift', DRIFTS)
+@pytest.mark.parametrize('step', [f'{ENTRY_TABLE} count', f'{ENTRY_TABLE} render', f'{ENTRY_TABLE} digests'])
+def test_a_drift_inside_the_snapshot_is_in_neither_the_checks_nor_the_dump(no_writes, step, drift):
+    """The write lands (the rows did change) but after the snapshot opened: the seed is the cast, in one attempt."""
+    stack = FakeStack(drifts={(1, step): drift})
+    assert produce(stack, date='2026-09-30').bundle == _clean_bundle()
+    assert stack.kinds().count('seed') == 1
+    assert not stack.drifts, 'the drift ran'
+    assert stack.request_rows != REQUEST_ROWS, 'and is visible once the snapshot closed'
+
+
+@pytest.mark.parametrize('drift', DRIFTS)
+def test_a_drift_that_settles_on_the_last_attempt_yields_the_normal_seed(no_writes, drift):
+    attempts = producer_module.CAST_ATTEMPTS
+    stack = FakeStack(drifts={(n, 'normalise'): drift for n in range(1, attempts)})
+    assert produce(stack, date='2026-09-30').bundle == _clean_bundle()
+    assert stack.kinds().count('seed') == attempts
+    assert stack.kinds().count('dump snapshot begin') == stack.kinds().count('dump snapshot end') == attempts
+
+
+def _instances_held(count):
+    def writer(fake):
+        fake.write(raw_counts={INSTANCE_TABLE: [(count,)]})
+
+    return writer
+
+
+def _never_settling(attempts: int) -> dict:
+    """A different drift on every attempt (3, 4, ... instances), so the LAST refusal is told from the others."""
+    return {(n, 'normalise'): _instances_held(2 + n) for n in range(1, attempts + 1)}
+
+
+def test_a_drift_that_never_settles_re_raises_the_last_refusal_unchanged(no_writes):
+    attempts = producer_module.CAST_ATTEMPTS
+    stack = FakeStack(drifts=_never_settling(attempts))
+    with pytest.raises(CastDrifted) as raised:
+        produce(stack)
+    assert str(raised.value) == f'{2 + attempts} ingest instances are held; expected 2; no seed written'
+    assert stack.kinds().count('seed') == attempts
+    assert stack.kinds().count('dump snapshot begin') == stack.kinds().count('dump snapshot end') == attempts
+    assert f'{ENTRY_TABLE} render' not in stack.kinds()
+
+
+def test_a_cast_that_never_settles_exits_3_through_the_entry_point(monkeypatch, capsys):
+    attempts = producer_module.CAST_ATTEMPTS
+    monkeypatch.setattr(entry, 'Stack', lambda: FakeStack(drifts=_never_settling(attempts)))
+    assert entry.main([]) == entry.EXIT_REFUSED
+    captured = capsys.readouterr()
+    assert captured.err == f'seed refused: {2 + attempts} ingest instances are held; expected 2; no seed written\n'
+    assert captured.out == ''
+
+
+def _request_message(differ: int, outside: int, wrong: str) -> str:
+    return (
+        f'the seeded ingest requests are not the expected cast ({differ} cast request(s) differ, '
+        f'{outside} outside the cast): {wrong}; no seed written'
+    )
+
+
+def _mismatch(*changes, drop=None, add=()):
+    rows = list(REQUEST_ROWS)
+    for request_id, state, instance in changes:
+        rows = _with_request(rows, request_id, state, instance)
+    return [row for row in rows if row[0] != drop] + list(add)
+
+
+# Every case but the last keeps the per-state totals of the cast (asserted in the test), so only the per-request check
+# can refuse it; the second trades a missing cast request for one outside the cast in the same state.
+REQUEST_MISMATCHES = [
+    pytest.param(
+        _mismatch((QUEUED_ID, 'NOT_DELIVERED', INSTANCE_B), (NOT_DELIVERED_ID, 'QUEUED', INSTANCE_A)),
+        _request_message(
+            2,
+            0,
+            f'{QUEUED_ID} holds NOT_DELIVERED under {INSTANCE_B}, expected QUEUED under {INSTANCE_B}; '
+            f'{NOT_DELIVERED_ID} holds QUEUED under {INSTANCE_A}, expected NOT_DELIVERED under {INSTANCE_A}',
+        ),
+        id='queued-and-not-delivered-trade-states',
+    ),
+    pytest.param(
+        _mismatch(
+            (QUEUED_ID, 'NOT_DELIVERED', LIVE_INSTANCE),
+            (NOT_DELIVERED_ID, 'QUEUED', INSTANCE_A),
+            drop=PENDING_ID,
+            add=[(OUTSIDE_REQUEST, 'PENDING', LIVE_INSTANCE)],
+        ),
+        _request_message(
+            3,
+            1,
+            f'{PENDING_ID} is missing; '
+            f'{QUEUED_ID} holds NOT_DELIVERED under another instance, expected QUEUED under {INSTANCE_B}; '
+            f'{NOT_DELIVERED_ID} holds QUEUED under {INSTANCE_A}, expected NOT_DELIVERED under {INSTANCE_A}',
+        ),
+        id='a-stack-instance-and-a-request-outside-the-cast',
+    ),
+    pytest.param(
+        _mismatch((SUCCEEDED_ID, 'SUCCEEDED', INSTANCE_A)),
+        _request_message(
+            1, 0, f'{SUCCEEDED_ID} holds SUCCEEDED under {INSTANCE_A}, expected SUCCEEDED under {INSTANCE_B}'
+        ),
+        id='the-instance-alone-differs',
+    ),
+    pytest.param(
+        _mismatch((PENDING_ID, 'PENDING', INSTANCE_B)),
+        _request_message(1, 0, f'{PENDING_ID} holds PENDING under {INSTANCE_B}, expected PENDING under none'),
+        id='an-instance-where-none-is-expected',
+    ),
+    pytest.param(
+        _mismatch((QUEUED_ID, 'QUEUED', None)),
+        _request_message(1, 0, f'{QUEUED_ID} holds QUEUED under none, expected QUEUED under {INSTANCE_B}'),
+        id='no-instance-where-one-is-expected',
+    ),
+    pytest.param(
+        [*REQUEST_ROWS, (OUTSIDE_REQUEST, 'SUCCEEDED', INSTANCE_B)],
+        _request_message(0, 1, 'none'),
+        id='only-a-request-outside-the-cast',
+    ),
+]
+
+
+@pytest.mark.parametrize(('rows', 'message'), REQUEST_MISMATCHES)
+def test_a_request_that_differs_by_id_is_refused_though_the_counts_per_state_agree(no_writes, rows, message):
+    """REQUIRED (2): each cast request against its own state and instance; the message names cast ids only."""
+    stack = FakeStack(request_rows=rows)
+    if len(rows) == len(REQUEST_ROWS):
+        assert dict(Counter(state for _, state, _ in rows)) == EXPECTED_REQUEST_STATES, 'the totals per state agree'
+    with pytest.raises(CastDrifted) as raised:
+        produce(stack)
+    assert str(raised.value) == message
+    assert stack.kinds().count('seed') == producer_module.CAST_ATTEMPTS
+    assert 'normalise' not in stack.kinds()
+    for value in (LIVE_INSTANCE, OUTSIDE_REQUEST, 'seed-owner', 'ZZSEED'):
+        assert value not in str(raised.value), value
+
+
+def _instance_message(outside: int, wrong: str) -> str:
+    return f'the instance marker is not the expected cast ({outside} instance(s) outside the cast): {wrong}; no seed written'
+
+
+INSTANCE_MISMATCHES = [
+    pytest.param(
+        [(INSTANCE_A, True), (INSTANCE_B, False), (LIVE_INSTANCE, False)],
+        _instance_message(1, 'none'),
+        id='three-instances',
+    ),
+    pytest.param(
+        [(INSTANCE_A, True), (INSTANCE_B, True), (LIVE_INSTANCE, False)],
+        _instance_message(1, f'{INSTANCE_B} is superseded, expected live'),
+        id='three-instances-the-live-one-superseded',
+    ),
+    pytest.param(
+        [(INSTANCE_A, False), (INSTANCE_B, True)],
+        _instance_message(0, f'{INSTANCE_A} is live, expected superseded; {INSTANCE_B} is superseded, expected live'),
+        id='swapped',
+    ),
+    pytest.param(
+        [(INSTANCE_A, True), (LIVE_INSTANCE, False)],
+        _instance_message(1, f'{INSTANCE_B} is missing, expected live'),
+        id='the-live-one-replaced',
+    ),
+]
+
+
+@pytest.mark.parametrize(('rows', 'message'), INSTANCE_MISMATCHES)
+def test_an_instance_that_differs_by_id_is_refused_though_the_counts_agree(no_writes, rows, message):
+    """The counts (two instances, one superseded) are left as the cast's: only the per-instance check refuses."""
+    stack = FakeStack(instance_rows=rows)
+    with pytest.raises(CastDrifted) as raised:
+        produce(stack)
+    assert str(raised.value) == message
+    assert LIVE_INSTANCE not in str(raised.value)
+    assert stack.kinds().count('seed') == producer_module.CAST_ATTEMPTS
+
+
+@pytest.mark.parametrize(
+    ('override', 'message'),
+    [
+        ({'request_rows': [(QUEUED_ID, 'QUEUED')]}, 'request rows: a row is not (id, state, instance)'),
+        ({'request_rows': [(QUEUED_ID, None, INSTANCE_B)]}, 'request rows: a row is not (id, state, instance)'),
+        (
+            {'request_rows': [(REQUEST_IDS['QUEUED'], 'QUEUED', INSTANCE_B)]},
+            'request rows: a row is not (id, state, instance)',
+        ),
+        ({'request_rows': [(QUEUED_ID, 'QUEUED', 7)]}, 'request rows: a row is not (id, state, instance)'),
+        ({'instance_rows': [(INSTANCE_A, 1)]}, 'instance rows: a row is not (instance, superseded)'),
+        ({'instance_rows': [(None, True)]}, 'instance rows: a row is not (instance, superseded)'),
+        ({'instance_rows': [(INSTANCE_A, True, 'x')]}, 'instance rows: a row is not (instance, superseded)'),
+    ],
+    ids=[
+        'request-two-values',
+        'request-null-state',
+        'request-uuid-id',
+        'request-int-instance',
+        'instance-int-flag',
+        'instance-null-id',
+        'instance-three-values',
+    ],
+)
+def test_a_request_or_instance_row_of_the_wrong_shape_fails_once_without_a_retry(no_writes, override, message):
+    """A malformed answer is a StackError (exit 1): never a drift, so the cast is not run again."""
+    stack = FakeStack(**override)
+    with pytest.raises(StackError) as raised:
+        produce(stack)
+    assert str(raised.value) == message
+    assert stack.kinds().count('seed') == 1
+
+
+def _foreign_row_appears(fake):
+    fake.write(rows_after_records=[*fake.rows_after_records, ('q', 'AAPL', 'miguel', 2)])
+
+
+class _Interrupted(FakeStack):
+    def query(self, sql, what):
+        if what == f'{RUN_TABLE} render':
+            raise KeyboardInterrupt
+        return super().query(sql, what)
+
+
+SNAPSHOT_FAILURES = [
+    pytest.param(
+        lambda: FakeStack(render={ENTRY_TABLE: [(None,)]}),
+        StackError,
+        f'{ENTRY_TABLE} render: a row is not one text value',
+        id='render-shape',
+    ),
+    pytest.param(
+        lambda: FakeStack(raw_counts={BAR_TABLE: [(None,)]}),
+        StackError,
+        f'{BAR_TABLE} count: the query did not return a single non-negative integer',
+        id='row-count',
+    ),
+    pytest.param(
+        lambda: FakeStack(digests={RUN_TABLE: [('id', None)]}),
+        StackError,
+        f'{RUN_TABLE} digests: a row is not a (column, digest) pair',
+        id='digest-shape',
+    ),
+    pytest.param(
+        lambda: FakeStack(render={BAR_TABLE: [("INSERT INTO t (a) VALUES (E'x\n\\connect other');",)]}),
+        DumpRefused,
+        '1 line(s) starting with a backslash in the dump',
+        id='backslash-line',
+    ),
+    pytest.param(
+        lambda: FakeStack(drifts={(1, 'normalise'): _foreign_row_appears}),
+        SeedRefused,
+        '2 row(s) hold a symbol or owner outside the synthetic patterns; no seed written',
+        id='foreign-row-in-the-snapshot',
+    ),
+    pytest.param(_Interrupted, KeyboardInterrupt, '', id='interrupt'),
+]
+
+
+@pytest.mark.parametrize(('build', 'error', 'message'), SNAPSHOT_FAILURES)
+def test_any_failure_inside_the_snapshot_rolls_it_back_and_is_not_retried(no_writes, build, error, message):
+    """Not a drift, so no second cast; the snapshot is closed before the failure leaves produce()."""
+    stack = build()
+    with pytest.raises(error) as raised:
+        produce(stack)
+    assert type(raised.value) is error, 'a failure that is not a drift is never turned into one'
+    assert str(raised.value) == message
+    assert stack.kinds().count('seed') == 1
+    assert stack.kinds().count('dump snapshot begin') == stack.kinds().count('dump snapshot end') == 1
+    assert stack.calls[-1] == ('script', 'dump snapshot end')
+    assert not stack.snapshot_open
+
+
+def test_a_rollback_that_fails_after_a_failure_does_not_replace_it(no_writes):
+    stack = FakeStack(
+        render={ENTRY_TABLE: [(None,)]}, end_error=StackError('dump snapshot end failed (SQLSTATE 08006)')
+    )
+    with pytest.raises(StackError) as raised:
+        produce(stack)
+    assert str(raised.value) == f'{ENTRY_TABLE} render: a row is not one text value'
+    assert stack.calls[-1] == ('script', 'dump snapshot end')
+
+
+def test_a_rollback_that_fails_after_a_clean_dump_is_not_swallowed(no_writes):
+    """The close is the last step of the dump: a seed is returned only once the snapshot closed."""
+    stack = FakeStack(end_error=StackError('dump snapshot end failed (SQLSTATE 08006)'))
+    with pytest.raises(StackError, match=r'^dump snapshot end failed \(SQLSTATE 08006\)$'):
+        produce(stack)
+
+
+def test_expected_request_states_are_the_counts_of_the_per_request_table():
+    """EXPECTED_REQUEST_STATES is derived from EXPECTED_REQUESTS, so the two refusals can never disagree."""
+    assert dict(Counter(state for state, _ in EXPECTED_REQUESTS.values())) == EXPECTED_REQUEST_STATES
+    assert EXPECTED_REQUEST_STATES == {
+        'PENDING': 1,
+        'QUEUED': 1,
+        'NOT_DELIVERED': 1,
+        'SUCCEEDED': 7,
+        'EMPTY': 2,
+        'FAILED': 4,
+    }
+    assert set(EXPECTED_REQUESTS) == {str(request_id) for request_id in REQUEST_IDS.values()}
+    assert {instance for _, instance in EXPECTED_REQUESTS.values()} <= {*INSTANCES, None}
+    assert EXPECTED_INSTANCE_SUPERSEDED == {INSTANCE_A: True, INSTANCE_B: False}
+    # The three named in the bead: the one never answered, the one live B holds, the one A queued and B superseded.
+    assert EXPECTED_REQUESTS[PENDING_ID] == ('PENDING', None)
+    assert EXPECTED_REQUESTS[QUEUED_ID] == ('QUEUED', INSTANCE_B)
+    assert EXPECTED_REQUESTS[NOT_DELIVERED_ID] == ('NOT_DELIVERED', INSTANCE_A)
+
+
+_SQL_VALUE = re.compile(r"NULL|'(?:[^']|'')*'")
+
+
+def _seed_rows(sql: str, table: str) -> list[dict]:
+    """The committed seed's rows of one table, column name to value (None for NULL), from its INSERT lines."""
+    rows = []
+    for line in sql.splitlines():
+        match = re.fullmatch(rf'INSERT INTO public\.{table} \(([^)]*)\) VALUES \((.*)\);', line)
+        if match is None:
+            continue
+        names = match.group(1).split(', ')
+        values = [
+            None if token == 'NULL' else token[1:-1].replace("''", "'") for token in _SQL_VALUE.findall(match.group(2))
+        ]
+        assert len(values) == len(names), line[:80]
+        rows.append(dict(zip(names, values, strict=True)))
+    return rows
+
+
+def test_the_committed_head_seed_holds_each_request_and_instance_as_the_tables_expect():
+    """The per-request table against the seed the producer wrote on the real stack: the same states and instances."""
+    sql = (REPO_ROOT / 'tests' / 'system' / 'seeds' / f'{HEAD}.sql').read_text(encoding='utf-8')
+    requests = {row['id']: (row['state'], row['instance_id']) for row in _seed_rows(sql, REQUEST_TABLE)}
+    assert requests == EXPECTED_REQUESTS
+    instances = {row['instance_id']: row['superseded_at'] is not None for row in _seed_rows(sql, INSTANCE_TABLE)}
+    assert instances == EXPECTED_INSTANCE_SUPERSEDED
 
 
 # Rows the check cannot read. Each counts as ONE foreign row, never parsed for its size, and because
@@ -1278,9 +2225,12 @@ def test_no_rows_at_all_is_refused_as_an_empty_seed():
     """Unreachable past the collision check today; an empty .sql still cannot become a bundle."""
     stack = FakeStack(
         render={table: [] for table in SEED_TABLES},
-        # The instance, run and observation counts are also the cast refusal's (the same statements), so they stay.
+        # The instance, run, observation and asset-list row counts are also the cast refusal's (the same statements),
+        # so they stay.
         raw_counts={
-            table: [(0,)] for table in SEED_TABLES if table not in (INSTANCE_TABLE, RUN_TABLE, CORPORATE_ACTION_TABLE)
+            table: [(0,)]
+            for table in SEED_TABLES
+            if table not in (INSTANCE_TABLE, RUN_TABLE, CORPORATE_ACTION_TABLE, SNAPSHOT_ROW_TABLE)
         },
     )
     with pytest.raises(SeedRefused, match='exactly one newline'):
@@ -1458,7 +2408,8 @@ class _Cursor:
         self.driver.fake.sql.append(sql)
         if self.driver.fail_on and self.driver.fail_on in sql:
             raise self.driver.fail_with
-        self.rows = [] if sql in (NORMALISE_SQL, RESET_SQL) else self.driver.fake.answer(sql)
+        scripts = (NORMALISE_SQL, RESET_SQL, SNAPSHOT_BEGIN, SNAPSHOT_END)
+        self.rows = [] if sql in scripts else self.driver.fake.answer(sql)
 
     def fetchall(self):
         return self.rows
@@ -1549,6 +2500,23 @@ def test_end_to_end_the_bundle_is_printed_and_nothing_secret_leaves(monkeypatch,
     assert database.kwargs[0]['password'] == PASSWORD and len(database.kwargs) == 1
     assert database.closed
     _assert_never_leaked(captured, fake, http)
+
+
+def test_end_to_end_the_snapshot_runs_on_the_one_connection_after_the_normalise_and_closes_last(monkeypatch, capsys):
+    """tj-7zjov1.166 through the real Stack: BEGIN and ROLLBACK are executed on the same (only) connection."""
+    status, _, fake, database, _ = _run(monkeypatch, capsys)
+    assert status == 0
+    assert len(database.kwargs) == 1
+    assert fake.sql.count(SNAPSHOT_BEGIN) == fake.sql.count(SNAPSHOT_END) == 1
+    assert fake.sql.index(NORMALISE_SQL) < fake.sql.index(SNAPSHOT_BEGIN)
+    assert fake.sql[-1] == SNAPSHOT_END
+
+
+def test_end_to_end_a_failure_inside_the_snapshot_still_rolls_it_back(monkeypatch, capsys):
+    status, captured, fake, _, _ = _run(monkeypatch, capsys, fail_on='quote_nullable', fail_with=SqlStateError('x'))
+    assert status == entry.EXIT_FAILED
+    assert captured.err == f'seed failed: {ENTRY_TABLE} render failed (SQLSTATE 42501)\n'
+    assert fake.sql[-1] == SNAPSHOT_END
 
 
 def test_end_to_end_the_seeder_gets_the_real_async_url_and_it_never_prints_the_password(monkeypatch, capsys):

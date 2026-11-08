@@ -40,12 +40,12 @@ as it was, for the live instance to carry on, and a last_attempt flag on it is i
 budget and reads the durable count we return).
 
 THE ARMS (bars, asset list, corporate actions) ARE SEPARATE FUNCTIONS, called inside the one transaction at step 4,
-so the beads that fill them in add to a function and never to the shape of the transaction: P17 adds the asset-list
-snapshot. The corporate-actions arm (P18) appends the records raw as observations. UNTIL AN ARM LANDS, ITS PAYLOAD IS
-REFUSED (INVALID_REQUEST), NEVER ACKNOWLEDGED UNWRITTEN: an asset list cannot be fetched again, so an acknowledgement
-that wrote nothing would lose it for good (CLAUDE.md, what may cross the wire). For the same reason no attempt of the
-asset-list kind is recorded yet. A corporate-actions attempt is recorded with its symbol and NULL for the other label
-columns (revision c7e19a4d5b28 made them nullable).
+so a bead that fills one in adds to a function and never to the shape of the transaction. The corporate-actions arm (P18)
+appends the records raw as observations. The asset-list arm (P17) files the delivery as a dated snapshot of the list the
+REQUEST names and derives appeared, vanished and status_flip events (app/world_snapshot.py); an asset list cannot be
+fetched again, so it is written here, at receipt, before the answer. A corporate-actions attempt is recorded with its
+symbol and NULL for the other label columns (revision c7e19a4d5b28 made them nullable); an asset-list attempt with every
+label column NULL and no served range (an asset list has no window).
 
 THE VENDOR ASSET ID. The header's vendor_asset_id is stored as received, opaque, in ingest_run.vendor_asset_id on the
 attempt row of every bars attempt that was judged. An empty id is stored NULL, never an empty string; the attempt row of
@@ -115,6 +115,7 @@ from data.store.app.database.models.ingest_run import VENDOR_ASSET_CHANGED_REASO
 from data.store.app.database.models.store_dataset_entry import DatasetStopCause
 from data.store.app.database.transaction import write_transaction
 from data.store.app.events import DatasetChange, DatasetChanged, IngestRunChanged, publish
+from data.store.app.world_snapshot import record_snapshot
 from schemas.data_ingest.delivery import (
     AssetRecords,
     AttemptDelivery,
@@ -418,12 +419,30 @@ async def write_bars(context: ArmContext) -> int:
 
 
 async def write_asset_list(context: ArmContext) -> int:
-    """The asset-list arm. NOT BUILT (P17): refuses, because an asset list cannot be fetched again.
+    """The asset-list arm: file the delivery as a dated snapshot of the request's list and derive its events (P17).
+
+    THE LIST IS THE REQUEST'S (ingest_request.asset_list_status), for every delivery, empty or not; the records' own flags
+    never choose it (ADR tj-26jt9w addendum 17). An empty list is recorded as a zero-row snapshot and derives no event. A
+    record that contradicts the list is stored raw and logged as a count, never refused: a refused asset list is
+    redelivered for ever and lost at an ingest restart. The asset list has no window, so no served range is required or
+    stored. See app/world_snapshot.py.
+
+    Args:
+        context: The delivery in progress.
+
+    Returns:
+        int: How many asset rows were written. Zero for an empty list.
 
     Raises:
-        InvalidRequestError: INVALID_REQUEST, always.
+        InvalidRequestError: INVALID_REQUEST, if the request names no list or no asset type. Unreachable for a request the
+            store wrote (the table's CHECK and new_asset_list_request), and never defaulted to a list.
     """
-    raise _refuse('asset-list intake is not built yet; refused rather than acknowledged unwritten')
+    request = context.request
+    if request.asset_list_status is None:
+        raise _refuse('an asset-list request names no list; the delivery is refused, never filed under a guessed list')
+    if request.asset_type is None:
+        raise _refuse('an asset-list request names no asset type')
+    return await record_snapshot(context.db, request, context.attempt, request.asset_list_status)
 
 
 async def write_corporate_actions(context: ArmContext) -> int:
@@ -457,18 +476,18 @@ def _label_for(request: IngestRequestRecord) -> AttemptLabel:
     """The label columns of the attempt row, from the request, by kind.
 
     A bars request supplies all five. A corporate-actions request supplies the symbol it asked for (None when it named
-    none) and NULL for the rest. No sentinel stands in for a value the store does not know.
+    none) and NULL for the rest. An asset-list request has no symbol, data type, granularity or update type: every label
+    column is NULL. No sentinel stands in for a value the store does not know.
 
     Raises:
-        InvalidRequestError: INVALID_REQUEST, for a bars request missing a label field, or for an asset-list request
-            (its attempt row lands with the asset-list arm).
+        InvalidRequestError: INVALID_REQUEST, for a bars request missing a label field.
     """
+    if request.kind is IngestRequestKind.ASSET_LIST:
+        return AttemptLabel(asset_symbol=None, asset_type=None, data_type=None, granularity=None, update_type=None)
     if request.kind is IngestRequestKind.CORPORATE_ACTIONS:
         return AttemptLabel(
             asset_symbol=request.asset_symbol, asset_type=None, data_type=None, granularity=None, update_type=None
         )
-    if request.kind is not IngestRequestKind.BARS:
-        raise _refuse(f'an attempt of a {request.kind} request cannot be recorded yet')
     if (
         request.asset_symbol is None
         or request.asset_type is None

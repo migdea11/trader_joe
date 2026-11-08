@@ -76,12 +76,17 @@ CHILD_FILE = MIGRATIONS_DIR / 'versions' / f'{CHILD}_push_path_columns.py'
 # additions are taken off the model exactly as the child's are, read from its own upgrade().
 GRANDCHILD = '39c28a39b290'
 GRANDCHILD_FILE = MIGRATIONS_DIR / 'versions' / f'{GRANDCHILD}_request_expiry_type.py'
-# The head since tj-7zjov1.31 (P18): directly on the grandchild, it creates corporate_action and relaxes five
-# ingest_run label columns; it adds no column to either table this revision created.
-HEAD = 'c7e19a4d5b28'
-HEAD_FILE = MIGRATIONS_DIR / 'versions' / f'{HEAD}_corporate_action_observations.py'
+# The head from tj-7zjov1.31 (P18) to tj-7zjov1.30: directly on the grandchild, it creates corporate_action and relaxes
+# five ingest_run label columns; it adds no column to either table this revision created.
+GREAT_GRANDCHILD = 'c7e19a4d5b28'
+GREAT_GRANDCHILD_FILE = MIGRATIONS_DIR / 'versions' / f'{GREAT_GRANDCHILD}_corporate_action_observations.py'
+# The head since tj-7zjov1.30 (P17): directly on the great-grandchild, it creates the asset-list snapshot tables and adds
+# ingest_request.asset_list_status (with its CHECK); its column is taken off the model like the others, read from its
+# own upgrade().
+HEAD = 'a3f8d2c6e914'
+HEAD_FILE = MIGRATIONS_DIR / 'versions' / f'{HEAD}_asset_list_snapshots.py'
 # Every revision after this one, in chain order: the model is what the last of them leaves.
-LATER_FILES = [CHILD_FILE, GRANDCHILD_FILE, HEAD_FILE]
+LATER_FILES = [CHILD_FILE, GRANDCHILD_FILE, GREAT_GRANDCHILD_FILE, HEAD_FILE]
 DIALECT = postgresql.dialect()
 ADDITIVE_EXCEPTION_MARKER = re.compile(r'^\s*# additive-exception:', re.MULTILINE)
 
@@ -165,11 +170,13 @@ def test_the_revision_is_the_single_head_directly_on_the_head_it_was_written_on_
     """Checklist items 1 to 3: one new revision, down_revision the previous head, one head, no exception marker.
 
     No longer the head since tj-7zjov1.123: its one child is b8e4c1f7a923. 39c28a39b290 (tj-7zjov1.153, P35r) sits
-    directly on that child, and the single head is c7e19a4d5b28 since tj-7zjov1.31 (P18), directly on 39c28a39b290.
+    directly on that child, c7e19a4d5b28 (tj-7zjov1.31, P18) directly on 39c28a39b290, and the single head is
+    a3f8d2c6e914 since tj-7zjov1.30 (P17), directly on c7e19a4d5b28.
     """
     script = ScriptDirectory(str(MIGRATIONS_DIR))
     assert script.get_heads() == [HEAD]
-    assert script.get_revision(HEAD).down_revision == GRANDCHILD
+    assert script.get_revision(HEAD).down_revision == GREAT_GRANDCHILD
+    assert script.get_revision(GREAT_GRANDCHILD).down_revision == GRANDCHILD
     assert script.get_revision(GRANDCHILD).down_revision == CHILD
     assert [rev.revision for rev in script.walk_revisions() if rev.down_revision == REVISION] == [CHILD]
     module = _load()

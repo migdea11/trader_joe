@@ -461,3 +461,73 @@ def test_the_corporate_action_revision_builds_one_table_relaxes_five_columns_and
 
     _migrate(revision_db, CORPORATE_ACTION_REVISION, 'downgrade', 'downgrade', parent, parent)
     assert not diff_catalogues(before, _catalogue(revision_db)), 'the downgrade left or lost an object'
+
+
+# ---------------------------------------------------------------------------------------------
+# tj-7zjov1.30 (P17): what a3f8d2c6e914 builds, read off the catalogue. The design (the architect's ruling of 23:31
+# UTC): three new tables (asset_list_snapshot, asset_list_row, asset_list_event) with their primary keys and five
+# indexes, ONE new column on ingest_request (asset_list_status, nullable, no default) and ONE check constraint on it,
+# and two new enum types (asset_list_status with the AssetListStatus values, asset_list_event_kind). No foreign key, no
+# existing object changed. The downgrade restores the parent exactly (on an empty database; on a database holding the
+# revision's data it is test_migration_with_data.py's).
+
+ASSET_LIST_REVISION = 'a3f8d2c6e914'
+ASSET_LIST_TABLES = {'asset_list_snapshot', 'asset_list_row', 'asset_list_event'}
+ASSET_LIST_INDEXES = {
+    'asset_list_snapshot_pkey',
+    'uq_asset_list_snapshot_request_id_attempt_no',
+    'ix_asset_list_snapshot_source_asset_list_as_of',
+    'asset_list_row_pkey',
+    'ix_asset_list_row_snapshot_id',
+    'ix_asset_list_row_vendor_asset_id',
+    'asset_list_event_pkey',
+    'uq_asset_list_event_snapshot_id_vendor_asset_id_kind',
+}
+
+
+def test_the_asset_list_revision_builds_three_tables_a_column_a_check_two_types_and_its_downgrade_removes_them(
+    revision_db: ScratchDb, parent_db: ScratchDb
+) -> None:
+    parent = PARENT[ASSET_LIST_REVISION]
+    assert parent == CORPORATE_ACTION_REVISION, f'{ASSET_LIST_REVISION} sits on {parent}'
+    _migrate(parent_db, ASSET_LIST_REVISION, 'build-parent', 'upgrade', parent, parent)
+    _migrate(revision_db, ASSET_LIST_REVISION, 'build-revision', 'upgrade', ASSET_LIST_REVISION, ASSET_LIST_REVISION)
+    before, after = _catalogue(parent_db), _catalogue(revision_db)
+
+    added = {
+        (category, key): facts
+        for category, facts_by_key in after.items()
+        for key, facts in facts_by_key.items()
+        if key not in before.get(category, {})
+    }
+    removed = [(category, key) for category, facts in before.items() for key in facts if key not in after[category]]
+    changed = [
+        (category, key)
+        for category, facts in before.items()
+        for key in facts
+        if key in after[category] and after[category][key] != facts[key]
+    ]
+
+    assert (removed, changed) == ([], []), 'an additive revision removed or changed an existing object'
+    assert {category for category, _ in added} == {'tables', 'columns', 'constraints', 'indexes', 'enums'}
+    assert {key[0] for category, key in added if category == 'tables'} == ASSET_LIST_TABLES
+    outside = sorted(key for category, key in added if category == 'columns' and key[0] not in ASSET_LIST_TABLES)
+    assert outside == [('ingest_request', 'asset_list_status')], outside
+    column = after['columns'][('ingest_request', 'asset_list_status')]
+    assert (column[0], column[1], column[2]) == ('asset_list_status', False, None), 'nullable, no default'
+    assert {key[1] for category, key in added if category == 'indexes'} == ASSET_LIST_INDEXES
+    constraints = {key: facts for (category, key), facts in added.items() if category == 'constraints'}
+    assert {key: facts[0] for key, facts in constraints.items() if facts[0] != 'p'} == {
+        ('ingest_request', 'ck_ingest_request_asset_list_status'): 'c'
+    }, 'one CHECK, no foreign key'
+    assert constraints[('ingest_request', 'ck_ingest_request_asset_list_status')][1] == (
+        "CHECK (((kind = 'ASSET_LIST'::ingest_request_kind) = (asset_list_status IS NOT NULL)))"
+    )
+    enums = {key[0]: list(facts[0]) for (category, key), facts in added.items() if category == 'enums'}
+    assert enums == {
+        'asset_list_status': ['active', 'inactive'],
+        'asset_list_event_kind': ['appeared', 'vanished', 'status_flip'],
+    }
+
+    _migrate(revision_db, ASSET_LIST_REVISION, 'downgrade', 'downgrade', parent, parent)
+    assert not diff_catalogues(before, _catalogue(revision_db)), 'the downgrade left or lost an object'

@@ -1839,6 +1839,10 @@ def _lifespan_fakes(monkeypatch, order: list[str], client: object) -> None:
     monkeypatch.setattr(app_depends, 'GrpcIngestSubmitClient', build_client)
     # The instance watcher shares the client and is not this test's subject: it would run a real pass.
     monkeypatch.setenv('INSTANCE_WATCH_ENABLED', 'false')
+    # The asset-list snapshot schedule (tj-7zjov1.138) shares it too and is not this test's subject: it would seed from
+    # the uninitialised database module. Its own lifespan place is test_store_grpc_host.py's and
+    # test_asset_snapshot_schedule.py's.
+    monkeypatch.setenv('ASSET_SNAPSHOT_ENABLED', 'false')
 
 
 @pytest.mark.asyncio

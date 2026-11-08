@@ -54,6 +54,7 @@ UNREACHABLE_DATABASE_URI = 'postgresql://joe:fixture-pass@127.0.0.1:1/unreachabl
 # restatement once omitted ingest_run (tj-s6r3rt.3), so the propagation test silently skipped it;
 # test_the_restated_models_match_env_py below reads the literal from env.py's source to stop that recurring.
 ALLOWED_MODELS = (
+    'asset_list',
     'base_market_activity',
     'corporate_action',
     'dataset_deletion',

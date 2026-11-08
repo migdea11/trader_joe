@@ -1151,6 +1151,9 @@ async def test_the_lifespan_starts_the_reaper_and_stops_it_before_the_database(m
     # watcher would run a real pass against the uninitialised database module and the fake channel.
     monkeypatch.setattr(app_depends, 'GrpcIngestSubmitClient', lambda _channel: object())
     monkeypatch.setenv('INSTANCE_WATCH_ENABLED', 'false')
+    # The asset-list snapshot schedule (tj-7zjov1.138) is not this test's subject either: it would seed from the
+    # uninitialised database module.
+    monkeypatch.setenv('ASSET_SNAPSHOT_ENABLED', 'false')
     # The lifespan builds the StoreService host from the bind env first (tj-7zjov1.27); none is bound here.
     monkeypatch.setattr(app_depends, 'build_grpc_host', nullcontext)
 

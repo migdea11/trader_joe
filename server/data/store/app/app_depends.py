@@ -8,6 +8,7 @@ from common.rpc.channel import DATA_INGEST_GRPC_TARGET_ENV, create_channel, targ
 from common.rpc.clients.ingest_fetch import GrpcIngestFetchClient, IngestFetchClient
 from common.rpc.clients.ingest_submit import GrpcIngestSubmitClient, IngestSubmitClient
 from common.worker_pool import SharedWorkerPool
+from data.store.app.asset_snapshot_schedule import start_asset_snapshot_loops, stop_asset_snapshot_loops
 from data.store.app.daily_refresh import start_daily_refresh_loops, stop_daily_refresh_loops
 from data.store.app.database import database
 from data.store.app.grpc_host import build_grpc_host
@@ -76,7 +77,12 @@ async def lifespan(app: FastAPI):
     # The interim DAILY refresh (tj-grna9p.22): needs the client, so it starts after it. One worker only.
     refresh_tasks = await start_daily_refresh_loops(__INGEST_SUBMIT_CLIENT)
     # The instance watcher (tj-7zjov1.28): re-sends PENDING requests and re-submits the ones a superseded instance held.
-    watch_task = start_instance_watch_loop(__INGEST_SUBMIT_CLIENT)
+    # The asset-list snapshot schedule (tj-7zjov1.138): its own daily loops, and the hook the watcher calls when its probe
+    # names a new ingest instance. Started first, so the hook exists when the watcher's first probe runs.
+    snapshot_loops = await start_asset_snapshot_loops(__INGEST_SUBMIT_CLIENT)
+    watch_task = start_instance_watch_loop(
+        __INGEST_SUBMIT_CLIENT, on_instance=snapshot_loops.schedule.on_instance_seen if snapshot_loops else None
+    )
 
     # StoreService (DeliverAttempt, RegisterInstance) serves from here to teardown. It is entered last, so every
     # dependency of a delivery (the database above all) is up before ingest can reach it, and it exits FIRST on
@@ -89,6 +95,7 @@ async def lifespan(app: FastAPI):
     # cleanup tasks
     # Before the channel it fetches through closes.
     await stop_instance_watch_loop(watch_task)
+    await stop_asset_snapshot_loops(snapshot_loops)
     await stop_daily_refresh_loops(refresh_tasks)
     teardown_logs(app)
     await __INGEST_CHANNEL.close()

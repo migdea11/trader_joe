@@ -51,7 +51,8 @@ STORE_DIR = SERVER_ROOT / 'data' / 'store'
 MIGRATIONS_DIR = STORE_DIR / 'migrations'
 REVISION = '39c28a39b290'
 PARENT = 'b8e4c1f7a923'
-CHILD = 'c7e19a4d5b28'  # the head since tj-7zjov1.31 (P18): corporate_action, on this revision
+CHILD = 'c7e19a4d5b28'  # its one child since tj-7zjov1.31 (P18): corporate_action, on this revision
+HEAD = 'a3f8d2c6e914'  # the head since tj-7zjov1.30 (P17): the asset-list snapshots, on CHILD
 REVISION_FILE = MIGRATIONS_DIR / 'versions' / f'{REVISION}_request_expiry_type.py'
 DIALECT = postgresql.dialect()
 ADDITIVE_EXCEPTION_MARKER = re.compile(r'^\s*# additive-exception:', re.MULTILINE)
@@ -103,10 +104,11 @@ def _compiled(element: Any) -> str:
 def test_the_revision_is_the_single_head_directly_on_the_head_it_was_written_on_and_is_unmarked():
     """Checklist items 1 to 3: one new revision, down_revision the previous head, one head, no exception marker.
 
-    No longer the head since tj-7zjov1.31 (P18): its one child is c7e19a4d5b28, which is the single head.
+    No longer the head since tj-7zjov1.31 (P18): its one child is c7e19a4d5b28; the single head is a3f8d2c6e914 since
+    tj-7zjov1.30 (P17).
     """
     script = ScriptDirectory(str(MIGRATIONS_DIR))
-    assert script.get_heads() == [CHILD]
+    assert script.get_heads() == [HEAD]
     assert [rev.revision for rev in script.walk_revisions() if rev.down_revision == REVISION] == [CHILD]
     module = _load()
     assert (module.revision, module.down_revision) == (REVISION, PARENT)

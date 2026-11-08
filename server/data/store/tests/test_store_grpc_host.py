@@ -14,6 +14,7 @@ since what the intake writes is test_delivery_intake.py's.
 """
 
 import asyncio
+import types
 from datetime import UTC, datetime
 
 import pytest
@@ -110,12 +111,30 @@ class _Order:
             self.handed['refresh'] = client
             return []
 
-        def watch_start(client):
+        # The asset-list snapshot schedule (tj-7zjov1.138, P47): started before the watcher, whose probe calls its hook.
+        self.snapshot_loops = types.SimpleNamespace(
+            schedule=types.SimpleNamespace(on_instance_seen=lambda _instance_id: None), tasks=[]
+        )
+        self.stopped_snapshot_loops: list[object] = []
+
+        async def snapshot_start(client):
+            order.append('snapshot.start')
+            self.handed['snapshot'] = client
+            return self.snapshot_loops
+
+        async def snapshot_stop(loops):
+            order.append('snapshot.stop')
+            self.stopped_snapshot_loops.append(loops)
+
+        def watch_start(client, *, on_instance=None):
             order.append('watch.start')
             self.handed['watch'] = client
+            self.handed['on_instance'] = on_instance
 
         monkeypatch.setattr(app_depends, 'start_daily_refresh_loops', refresh_start)
         monkeypatch.setattr(app_depends, 'stop_daily_refresh_loops', async_step('refresh.stop'))
+        monkeypatch.setattr(app_depends, 'start_asset_snapshot_loops', snapshot_start)
+        monkeypatch.setattr(app_depends, 'stop_asset_snapshot_loops', snapshot_stop)
         monkeypatch.setattr(app_depends, 'start_instance_watch_loop', watch_start)
         monkeypatch.setattr(app_depends, 'stop_instance_watch_loop', async_step('watch.stop'))
 
@@ -166,17 +185,51 @@ async def test_the_host_is_entered_last_and_exited_first(monkeypatch):
         'channel.open',
         'submit_client',
         'refresh.start',
+        'snapshot.start',
         'watch.start',
     ):
         assert steps.index(before) < steps.index('grpc.enter'), before
-    for after in ('watch.stop', 'refresh.stop', 'channel.close', 'reaper.stop', 'usage.stop', 'database.shutdown'):
+    for after in (
+        'watch.stop',
+        'snapshot.stop',
+        'refresh.stop',
+        'channel.close',
+        'reaper.stop',
+        'usage.stop',
+        'database.shutdown',
+    ):
         assert steps.index('grpc.exit') < steps.index(after), after
     # The loops that submit are built on the channel's client and stop before the channel closes.
     assert steps.index('channel.open') < steps.index('submit_client') < steps.index('refresh.start')
+    assert steps.index('submit_client') < steps.index('snapshot.start')
     assert steps.index('watch.stop') < steps.index('channel.close')
     assert steps.index('refresh.stop') < steps.index('channel.close')
-    assert order.handed == {'refresh': order.submit_client, 'watch': order.submit_client}
+    # The snapshot schedule (P47): started before the watcher, so its hook exists at the first probe; stopped after the
+    # watcher (which calls the hook) and before the channel and the database it requests through.
+    assert steps.index('database.initialize') < steps.index('snapshot.start') < steps.index('watch.start')
+    assert steps.index('watch.stop') < steps.index('snapshot.stop') < steps.index('channel.close')
+    assert steps.index('snapshot.stop') < steps.index('database.shutdown')
+    assert order.stopped_snapshot_loops == [order.snapshot_loops], 'the loops the start returned are the ones stopped'
+    assert order.handed == {
+        'refresh': order.submit_client,
+        'snapshot': order.submit_client,
+        'watch': order.submit_client,
+        'on_instance': order.snapshot_loops.schedule.on_instance_seen,
+    }
     assert app_depends.get_ingest_submit_client() is order.submit_client
+
+
+async def test_with_the_snapshot_schedule_off_the_watcher_gets_no_hook(monkeypatch):
+    order = _Order(monkeypatch)
+    order.snapshot_loops = None
+    monkeypatch.setattr(app_depends, 'build_grpc_host', lambda: _FakeHost(order.steps))
+
+    async with app_depends.lifespan(object()):
+        pass
+
+    assert order.handed['on_instance'] is None
+    assert 'watch.start' in order.steps
+    assert order.stopped_snapshot_loops == [None]
 
 
 async def test_the_host_is_built_before_anything_starts(monkeypatch):
