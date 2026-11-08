@@ -2,11 +2,13 @@
 
 ADR tj-8konfu D1 keeps the .proto and the Pydantic models as two source-of-truth artefacts with a
 hand-written mapping between them; D3 says no caller ever touches a generated stub. This package is that
-mapping for the internal FetchDataset contract, and this module is its front door.
+mapping for the internal contracts -- ingest's (FetchDataset, Quote, Submit and Instance) and the store's
+result path (DeliverAttempt and RegisterInstance) -- and this module is its front door.
 
     values.py          enums by member name, Timestamps as aware UTC, and ProtoMappingError
     fetch_dataset.py   one to_domain/to_proto pair per message
     fetch_stream.py    the SERVER-side encoder, which stamps a stream's bars with its resolved feed
+    delivery.py        the store's result path: one pair per message, the attempt splitter and the assembler
 
 WHY THE DESCRIPTORS ARE PART OF THE PUBLIC API. TID251 bans trader_joe.proto everywhere but common/rpc,
 and a test is not the seam (architect, 05:11 UTC 2026-10-02). The descriptor-driven round-trip control
@@ -31,6 +33,41 @@ from google.protobuf.descriptor import FileDescriptor
 from google.protobuf.message import Message
 from pydantic import BaseModel
 
+from common.rpc.mapping.delivery import (
+    DELIVERY_ERROR_CLASS,
+    DELIVERY_OUTCOME,
+    DELIVERY_VERDICT,
+    MAX_PART_BYTES,
+    MAX_RECORDS_PER_MESSAGE,
+    AttemptAssembler,
+    asset_record_to_domain,
+    asset_record_to_proto,
+    asset_records_to_domain,
+    asset_records_to_proto,
+    attempt_to_messages,
+    bar_page_to_domain,
+    bar_page_to_proto,
+    corporate_action_record_to_domain,
+    corporate_action_record_to_proto,
+    corporate_action_records_to_domain,
+    corporate_action_records_to_proto,
+    header_to_domain,
+    header_to_proto,
+    register_instance_request_to_domain,
+    register_instance_request_to_proto,
+    register_instance_response_to_domain,
+    register_instance_response_to_proto,
+    response_to_domain,
+    response_to_proto,
+    trailer_to_domain,
+    trailer_to_proto,
+    vendor_reported_to_domain,
+    vendor_reported_to_proto,
+    vendor_stats_to_domain,
+    vendor_stats_to_proto,
+)
+from common.rpc.mapping.delivery import served_range_to_domain as delivery_served_range_to_domain
+from common.rpc.mapping.delivery import served_range_to_proto as delivery_served_range_to_proto
 from common.rpc.mapping.fetch_dataset import (
     accepted_to_domain,
     accepted_to_proto,
@@ -57,11 +94,26 @@ from common.rpc.mapping.quote import (
     scope_capacity_to_domain,
     scope_capacity_to_proto,
 )
+from common.rpc.mapping.submit import (
+    asset_list_request_to_domain,
+    asset_list_request_to_proto,
+    bars_request_to_domain,
+    bars_request_to_proto,
+    corporate_actions_request_to_domain,
+    corporate_actions_request_to_proto,
+    instance_request_to_domain,
+    instance_request_to_proto,
+    instance_response_to_domain,
+    instance_response_to_proto,
+    submit_request_to_domain,
+    submit_request_to_proto,
+    submit_response_to_domain,
+    submit_response_to_proto,
+)
 from common.rpc.mapping.values import (
     ASSET_TYPE,
     DATA_SOURCE,
     DATA_TYPE,
-    ENUM_MAPPINGS,
     FEED,
     GRANULARITY,
     UPDATE_TYPE,
@@ -71,9 +123,13 @@ from common.rpc.mapping.values import (
     to_datetime,
     to_timestamp,
 )
+from common.rpc.mapping.values import ENUM_MAPPINGS as MARKET_ENUM_MAPPINGS
+from schemas.data_ingest import delivery as delivery_domain
 from schemas.data_ingest import fetch_dataset as domain
 from schemas.data_ingest import quote as quote_domain
+from schemas.data_ingest import submit as submit_domain
 from trader_joe.proto.internal.ingest.v1 import ingest_pb2
+from trader_joe.proto.internal.store.v1 import store_pb2
 from trader_joe.proto.market.v1 import bar_pb2, enums_pb2
 
 
@@ -97,7 +153,20 @@ class MessageMapper[P: Message, D: BaseModel]:
 # Every file of the contract, as the FileDescriptors a caller can walk without importing trader_joe.proto.
 # market/v1 is shared vocabulary that the internal contract imports; both are here because a round trip
 # over FetchDataset reaches Bar and the enums too.
-CONTRACT_FILES: Final[tuple[FileDescriptor, ...]] = (ingest_pb2.DESCRIPTOR, bar_pb2.DESCRIPTOR, enums_pb2.DESCRIPTOR)
+CONTRACT_FILES: Final[tuple[FileDescriptor, ...]] = (
+    ingest_pb2.DESCRIPTOR,
+    store_pb2.DESCRIPTOR,
+    bar_pb2.DESCRIPTOR,
+    enums_pb2.DESCRIPTOR,
+)
+
+# Every enum the contract files declare: market/v1's, then the store's delivery enums.
+ENUM_MAPPINGS: Final[tuple[EnumMapping, ...]] = (
+    *MARKET_ENUM_MAPPINGS,
+    DELIVERY_OUTCOME,
+    DELIVERY_ERROR_CLASS,
+    DELIVERY_VERDICT,
+)
 
 _MAPPERS: Final[tuple[MessageMapper, ...]] = (
     MessageMapper(ingest_pb2.FetchDatasetRequest, domain.FetchDatasetRequest, request_to_domain, request_to_proto),
@@ -111,6 +180,80 @@ _MAPPERS: Final[tuple[MessageMapper, ...]] = (
     MessageMapper(ingest_pb2.QuoteResponse, quote_domain.QuoteResult, quote_to_domain, quote_to_proto),
     MessageMapper(
         ingest_pb2.ScopeCapacity, quote_domain.ScopeCapacity, scope_capacity_to_domain, scope_capacity_to_proto
+    ),
+    MessageMapper(
+        ingest_pb2.SubmitRequest, submit_domain.SubmitRequest, submit_request_to_domain, submit_request_to_proto
+    ),
+    MessageMapper(ingest_pb2.BarsRequest, submit_domain.BarsRequest, bars_request_to_domain, bars_request_to_proto),
+    MessageMapper(
+        ingest_pb2.AssetListRequest,
+        submit_domain.AssetListRequest,
+        asset_list_request_to_domain,
+        asset_list_request_to_proto,
+    ),
+    MessageMapper(
+        ingest_pb2.CorporateActionsRequest,
+        submit_domain.CorporateActionsRequest,
+        corporate_actions_request_to_domain,
+        corporate_actions_request_to_proto,
+    ),
+    # submit_response_to_* take the request's kind as a keyword defaulting to bars; see mapping/submit.py.
+    MessageMapper(
+        ingest_pb2.SubmitResponse, submit_domain.SubmitResponse, submit_response_to_domain, submit_response_to_proto
+    ),
+    MessageMapper(
+        ingest_pb2.InstanceRequest, submit_domain.InstanceRequest, instance_request_to_domain, instance_request_to_proto
+    ),
+    MessageMapper(
+        ingest_pb2.InstanceResponse,
+        submit_domain.InstanceResponse,
+        instance_response_to_domain,
+        instance_response_to_proto,
+    ),
+    # THE STORE'S RESULT PATH (tj-7zjov1.16). Its BarPage and ServedRange are restated in store.proto (a
+    # contract never imports another), and map to the SAME domain models as ingest's.
+    MessageMapper(store_pb2.DeliveryHeader, delivery_domain.DeliveryHeader, header_to_domain, header_to_proto),
+    MessageMapper(store_pb2.DeliveryTrailer, delivery_domain.DeliveryTrailer, trailer_to_domain, trailer_to_proto),
+    MessageMapper(
+        store_pb2.DeliverAttemptResponse, delivery_domain.DeliverAttemptResponse, response_to_domain, response_to_proto
+    ),
+    MessageMapper(store_pb2.BarPage, domain.BarPage, bar_page_to_domain, bar_page_to_proto),
+    MessageMapper(
+        store_pb2.AssetRecords, delivery_domain.AssetRecords, asset_records_to_domain, asset_records_to_proto
+    ),
+    MessageMapper(store_pb2.AssetRecord, delivery_domain.AssetRecord, asset_record_to_domain, asset_record_to_proto),
+    MessageMapper(
+        store_pb2.CorporateActionRecords,
+        delivery_domain.CorporateActionRecords,
+        corporate_action_records_to_domain,
+        corporate_action_records_to_proto,
+    ),
+    MessageMapper(
+        store_pb2.CorporateActionRecord,
+        delivery_domain.CorporateActionRecord,
+        corporate_action_record_to_domain,
+        corporate_action_record_to_proto,
+    ),
+    MessageMapper(
+        store_pb2.VendorCallStats, delivery_domain.VendorCallStats, vendor_stats_to_domain, vendor_stats_to_proto
+    ),
+    MessageMapper(
+        store_pb2.VendorReported, delivery_domain.VendorReported, vendor_reported_to_domain, vendor_reported_to_proto
+    ),
+    MessageMapper(
+        store_pb2.ServedRange, domain.ServedRange, delivery_served_range_to_domain, delivery_served_range_to_proto
+    ),
+    MessageMapper(
+        store_pb2.RegisterInstanceRequest,
+        delivery_domain.RegisterInstanceRequest,
+        register_instance_request_to_domain,
+        register_instance_request_to_proto,
+    ),
+    MessageMapper(
+        store_pb2.RegisterInstanceResponse,
+        delivery_domain.RegisterInstanceResponse,
+        register_instance_response_to_domain,
+        register_instance_response_to_proto,
     ),
 )
 
@@ -147,6 +290,12 @@ ENVELOPE_MESSAGES: Final[Mapping[str, str]] = MappingProxyType(
         ),
         'trader_joe.proto.internal.ingest.v1.VendorReported': (
             'no domain twin yet: it is a member of VendorCallStats, mapped with it by the same follow-up'
+        ),
+        'trader_joe.proto.internal.store.v1.DeliverAttemptRequest': (
+            "the stream's envelope is pure transport: a oneof of header, payload and trailer messages. "
+            'No domain model restates it; a whole attempt is schemas/data_ingest/delivery.py AttemptDelivery, '
+            'which attempt_to_messages splits across the envelope (bounded messages) and AttemptAssembler '
+            'reads back, enforcing the header-payload-trailer grammar (mapping/delivery.py)'
         ),
     }
 )
@@ -192,13 +341,19 @@ __all__ = [
     'CONTRACT_MESSAGES',
     'DATA_SOURCE',
     'DATA_TYPE',
+    'DELIVERY_ERROR_CLASS',
+    'DELIVERY_OUTCOME',
+    'DELIVERY_VERDICT',
     'ENUM_MAPPINGS',
     'ENVELOPE_MESSAGES',
     'FEED',
     'GRANULARITY',
     'MAX_PAGE_BARS',
+    'MAX_PART_BYTES',
+    'MAX_RECORDS_PER_MESSAGE',
     'MESSAGE_MAPPERS',
     'UPDATE_TYPE',
+    'AttemptAssembler',
     'EnumMapping',
     'FetchStreamEncoder',
     'MessageMapper',
@@ -207,10 +362,35 @@ __all__ = [
     'accepted_to_proto',
     'ack_to_domain',
     'ack_to_proto',
+    'asset_list_request_to_domain',
+    'asset_list_request_to_proto',
+    'asset_record_to_domain',
+    'asset_record_to_proto',
+    'asset_records_to_domain',
+    'asset_records_to_proto',
+    'attempt_to_messages',
+    'bar_page_to_domain',
+    'bar_page_to_proto',
     'bar_to_domain',
     'bar_to_proto',
+    'bars_request_to_domain',
+    'bars_request_to_proto',
+    'corporate_action_record_to_domain',
+    'corporate_action_record_to_proto',
+    'corporate_action_records_to_domain',
+    'corporate_action_records_to_proto',
+    'corporate_actions_request_to_domain',
+    'corporate_actions_request_to_proto',
+    'delivery_served_range_to_domain',
+    'delivery_served_range_to_proto',
     'done_to_domain',
     'done_to_proto',
+    'header_to_domain',
+    'header_to_proto',
+    'instance_request_to_domain',
+    'instance_request_to_proto',
+    'instance_response_to_domain',
+    'instance_response_to_proto',
     'page_to_domain',
     'page_to_proto',
     'quote_request_to_proto',
@@ -219,13 +399,29 @@ __all__ = [
     'refused_response',
     'refused_to_domain',
     'refused_to_proto',
+    'register_instance_request_to_domain',
+    'register_instance_request_to_proto',
+    'register_instance_response_to_domain',
+    'register_instance_response_to_proto',
     'request_to_domain',
     'request_to_proto',
+    'response_to_domain',
+    'response_to_proto',
     'scope_capacity_to_domain',
     'scope_capacity_to_proto',
     'served_range_to_domain',
     'served_range_to_proto',
+    'submit_request_to_domain',
+    'submit_request_to_proto',
+    'submit_response_to_domain',
+    'submit_response_to_proto',
     'timestamp_field',
     'to_datetime',
     'to_timestamp',
+    'trailer_to_domain',
+    'trailer_to_proto',
+    'vendor_reported_to_domain',
+    'vendor_reported_to_proto',
+    'vendor_stats_to_domain',
+    'vendor_stats_to_proto',
 ]

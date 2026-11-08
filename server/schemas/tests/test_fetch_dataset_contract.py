@@ -44,7 +44,7 @@ from pydantic import BaseModel, ValidationError
 from common.enums.data_stock import Feed, UpdateType
 from common.tests.domain_fields import aware_datetime_fields
 from common.tests.proto_descriptors import field_names, file_named, messages, real_oneofs
-from schemas.data_ingest import fetch_dataset, quote
+from schemas.data_ingest import fetch_dataset, quote, submit
 from schemas.data_ingest.fetch_dataset import (
     Bar,
     BarPage,
@@ -56,6 +56,15 @@ from schemas.data_ingest.fetch_dataset import (
     ServedRange,
 )
 from schemas.data_ingest.quote import QuoteResult, ScopeCapacity
+from schemas.data_ingest.submit import (
+    AssetListRequest,
+    BarsRequest,
+    CorporateActionsRequest,
+    InstanceRequest,
+    InstanceResponse,
+    SubmitRequest,
+    SubmitResponse,
+)
 
 
 pytestmark = pytest.mark.data_ingest
@@ -88,8 +97,20 @@ def test_fetch_dataset_is_one_server_stream_at_the_wire_path_the_design_names():
 
     methods = {method.name: method for method in file.service[0].method}
     # Quote is tj-grna9p.44's second method (re-baseline item 2): data_ingest serves it on the same
-    # service, so the list is exactly these two, in declaration order.
-    assert list(methods) == ['FetchDataset', 'Quote']
+    # service. Submit and Instance are P07's (tj-7zjov1.13), declared ahead of the two older methods.
+    # P37 (tj-7zjov1.18) retires FetchDataset later and owns that edit to this list and this test.
+    assert list(methods) == ['Submit', 'Instance', 'FetchDataset', 'Quote']
+
+    # Submit answers at once with an ack and nothing that is data, and Instance is a probe: both unary.
+    for name in ('Submit', 'Instance'):
+        method = methods[name]
+        assert (method.client_streaming, method.server_streaming) == (False, False), f'{name} is unary'
+        assert method.input_type == f'{INGEST}.{name}Request'
+        assert method.output_type == f'{INGEST}.{name}Response'
+        assert f'/{file.package}.{file.service[0].name}/{method.name}' == (
+            f'/trader_joe.proto.internal.ingest.v1.IngestService/{name}'
+        )
+
     fetch = methods['FetchDataset']
     assert fetch.server_streaming is True, 'bar pages need a stream; a unary call cannot carry them'
     assert fetch.client_streaming is False
@@ -426,6 +447,18 @@ TWINS: list[tuple[str, str, type[BaseModel]]] = [
     # named QuoteResult on the domain side; its fields still match QuoteResponse name for name.
     (CONTRACT, 'QuoteResponse', QuoteResult),
     (CONTRACT, 'ScopeCapacity', ScopeCapacity),
+    # P07 (tj-7zjov1.13), domain side P08 (tj-7zjov1.15): the Submit and Instance contract, in
+    # schemas/data_ingest/submit.py. All seven are TWINS, none transport (architect ruling on tj-7zjov1.53):
+    # each has a domain model whose fields match its proto name for name, oneof arms included, which is
+    # what this list pins. SubmitResponse.ack is a FetchAck on the wire and a SubmitAck on the domain side;
+    # the field NAMES still match, and the refinement is excused below in NOT_A_TWIN.
+    (CONTRACT, 'SubmitRequest', SubmitRequest),
+    (CONTRACT, 'BarsRequest', BarsRequest),
+    (CONTRACT, 'AssetListRequest', AssetListRequest),
+    (CONTRACT, 'CorporateActionsRequest', CorporateActionsRequest),
+    (CONTRACT, 'SubmitResponse', SubmitResponse),
+    (CONTRACT, 'InstanceRequest', InstanceRequest),
+    (CONTRACT, 'InstanceResponse', InstanceResponse),
 ]
 
 # The contract messages with no domain twin, and why. Listed rather than merely absent, so "we forgot
@@ -440,6 +473,20 @@ NOT_MODELLED: dict[str, str] = {
     # before tj-grna9p.48. common/rpc/mapping names the same two in ENVELOPE_MESSAGES until then.
     'VendorCallStats': 'deferred: tj-grna9p.44 follow-up',
     'VendorReported': 'deferred: tj-grna9p.44 follow-up',
+}
+
+# The other direction's excuses: public classes of a twin module that twin no proto message, and why.
+# Listed rather than merely tolerated, in the NOT_MODELLED style, so a forgotten model cannot pass as a
+# deliberate one (architect ruling on tj-7zjov1.53, item 3).
+NOT_A_TWIN: dict[type, str] = {
+    # The Submit ack is the wire's FetchAck, refined: its accepted arm is a SubmitAccepted, not a
+    # FetchAccepted. Same two arms, same oneof, same names.
+    submit.SubmitAck: 'domain refinement of FetchAck',
+    # The resolved feed is a fact about bars only, so SubmitAccepted.feed is None for asset_list and
+    # corporate_actions (submit.py docstring); FetchAccepted.feed is required.
+    submit.SubmitAccepted: 'domain refinement of FetchAccepted: feed is None for non-bars kinds',
+    # Not a message: the arm of SubmitRequest.kind a request sets, which the oneof implies.
+    submit.RequestKind: 'enum the SubmitRequest.kind oneof implies',
 }
 
 # Proto fields whose twin field is DEFERRED by the same follow-up, and only these. Removing an entry is
@@ -495,14 +542,17 @@ def test_every_model_in_the_module_is_a_twin_of_something():
     contract; a model here that nothing on the wire corresponds to is either dead or is a field the
     mapper will have to invent a value for.
     """
-    for module in (fetch_dataset, quote):
+    for module in (fetch_dataset, quote, submit):
         declared = {
             name
             for name, obj in vars(module).items()
             if not name.startswith('_') and inspect.isclass(obj) and obj.__module__ == module.__name__
         }
+        twinned = {model.__name__ for _, _, model in TWINS if model.__module__ == module.__name__}
+        excused = {cls.__name__ for cls in NOT_A_TWIN if cls.__module__ == module.__name__}
 
-        assert declared == {model.__name__ for _, _, model in TWINS if model.__module__ == module.__name__}
+        assert not twinned & excused, f'{module.__name__}: a class is both a twin and excused: {twinned & excused}'
+        assert declared == twinned | excused, module.__name__
 
 
 # ---------------------------------------------------------------------------------------------
@@ -543,6 +593,15 @@ _A_REQUEST: dict[str, Any] = {
     'update_type': UpdateType.STATIC,
 }
 
+_A_BARS_REQUEST: dict[str, Any] = {key: value for key, value in _A_REQUEST.items() if key in BarsRequest.model_fields}
+_A_CORPORATE_ACTIONS_REQUEST: dict[str, Any] = {'source': 'ALPACA', 'asset_symbol': 'VFV', 'start': WHEN, 'end': WHEN}
+# The asset_list arm is set because exactly one kind must be; it carries no time of its own.
+_A_SUBMIT: dict[str, Any] = {
+    'request_id': 'request-1',
+    'owner': 'rebalancer',
+    'asset_list': AssetListRequest(source='ALPACA', asset_type='stock'),
+}
+
 _NAIVE_CASES: list[tuple[type[BaseModel], str, dict[str, Any]]] = [
     (FetchDatasetRequest, 'start', _A_REQUEST),
     # `end` is OPTIONAL, and that is exactly why it was the one this sweep had missed (architect,
@@ -560,6 +619,14 @@ _NAIVE_CASES: list[tuple[type[BaseModel], str, dict[str, Any]]] = [
     (ServedRange, 'start', {'start': WHEN, 'end': WHEN}),
     (ServedRange, 'end', {'start': WHEN, 'end': WHEN}),
     (FetchDone, 'as_of', {'bar_count': 0, 'served_range': ServedRange(start=WHEN, end=WHEN), 'as_of': WHEN}),
+    # The Submit and Instance twins (tj-7zjov1.15). ready_by and BarsRequest.end are optional, and refused
+    # naive all the same.
+    (SubmitRequest, 'ready_by', _A_SUBMIT),
+    (BarsRequest, 'start', _A_BARS_REQUEST),
+    (BarsRequest, 'end', _A_BARS_REQUEST),
+    (CorporateActionsRequest, 'start', _A_CORPORATE_ACTIONS_REQUEST),
+    (CorporateActionsRequest, 'end', _A_CORPORATE_ACTIONS_REQUEST),
+    (InstanceResponse, 'started_at', {'instance_id': 'ingest-1', 'started_at': WHEN}),
 ]
 
 

@@ -1,6 +1,16 @@
-// THE data_store -> data_ingest FETCH CONTRACT (tj-3mk3u5.27; ADR tj-8konfu addendum A1 item 2).
-// One server-streaming call: an ACKNOWLEDGEMENT first, carrying the resolved feed, then bounded bar
-// pages, then a done. Correlation belongs to the transport, so nothing here carries a dataset_id.
+// THE data_store -> data_ingest CONTRACT (tj-3mk3u5.27; ADR tj-8konfu addendum A1 item 2; tj-7zjov1.13).
+// Four calls, all data_store -> data_ingest:
+//   Submit        unary. Hands ingest one request of any kind (bars, asset list, corporate actions) and is
+//                 answered AT ONCE: for bars, accepted with the resolved feed or refused for its feed;
+//                 for asset list and corporate actions, accepted with FEED_UNSPECIFIED (no tape), never
+//                 refused in the ack. The data
+//                 does not come back on this call; ingest pushes each attempt's result to the store
+//                 (tj-26jt9w, 2026-10-24 rulings; the store's side of that is store.proto).
+//   Instance      unary. Which ingest process is answering, and when it started (the restart marker).
+//   Quote         unary. What a fetch would cost, without making it.
+//   FetchDataset  server-streaming. The result-bearing stream of PR 4. It stays until nothing calls it
+//                 (P37, tj-7zjov1) and is described below as it is.
+// Correlation on FetchDataset belongs to the transport, so nothing on it carries a dataset_id.
 //
 // INTERNAL means both ends always deploy together: data_store and data_ingest ship from this
 // repository in one release. Nothing outside it calls this, buf's breaking checks ignore
@@ -43,7 +53,17 @@ import "trader_joe/proto/market/v1/enums.proto";
 // Asks data_ingest for one dataset. A contract may import market/v1; it never imports another
 // contract, so the vocabulary below is the shared one and nothing here restates it.
 service IngestService {
-  // Server-streaming. The wire path is
+  // Unary. Submits one request of any kind and answers at once; see SubmitRequest. Idempotent on
+  // request_id: a request id ingest already holds is answered again, not queued twice. The wire path is
+  // /trader_joe.proto.internal.ingest.v1.IngestService/Submit.
+  rpc Submit(SubmitRequest) returns (SubmitResponse);
+
+  // Unary. The restart marker: the id this ingest process minted at start and when it started. The
+  // store probes it to notice a restart nobody announced. The wire path is
+  // /trader_joe.proto.internal.ingest.v1.IngestService/Instance.
+  rpc Instance(InstanceRequest) returns (InstanceResponse);
+
+  // Server-streaming. Superseded by Submit and removed by P37 (tj-7zjov1); kept until nothing calls it. The wire path is
   // /trader_joe.proto.internal.ingest.v1.IngestService/FetchDataset.
   rpc FetchDataset(FetchDatasetRequest) returns (stream FetchDatasetResponse);
 
@@ -103,12 +123,121 @@ message FetchDatasetRequest {
   // request-log entry (a scheduled pass). It is NOT a page correlation key: pages still carry none.
   string request_id = 11;
 
-  // When the requester wants the data by. Unset means none. Carried and unused: PR 4's queue is
-  // plain FIFO.
+  // When the requester wants the data by. Unset means no deadline and the request never expires (owner
+  // ruling O3, tj-26jt9w 2026-10-24). On this stream it is carried and unused; the queue and the expiry
+  // at dequeue are on Submit, where SubmitRequest.ready_by states them.
   google.protobuf.Timestamp ready_by = 12;
 
   // The requester accepts a partial or late answer. Carried and unused, like ready_by.
   bool best_effort = 13;
+}
+
+// ONE REQUEST, OF ANY KIND. The envelope is what every kind shares; the kind itself is the oneof.
+// Every kind rides the one queue and the one gate, which is why they are request kinds and not three
+// RPCs. Vendor-neutral throughout: a field is named for what it means, never for one vendor's wording,
+// and vendor payloads are carried raw by the result path and not restated here.
+message SubmitRequest {
+  // The store's durable handle for this request, written before it is sent. REQUIRED and the
+  // idempotency key: Submit with an id ingest already holds is answered again and queued once.
+  string request_id = 1;
+
+  // The principal the request acts for. Carried, not yet read, like FetchDatasetRequest.owner.
+  string owner = 2;
+
+  // RESERVED. A short label for the client that asked, so a later scheduler can account per client.
+  // Carried and unused; ingest does not read it and nothing may branch on it.
+  string client = 3;
+
+  // WHEN THE REQUESTER WANTS THE DATA BY, and present on every request. UNSET MEANS NO DEADLINE AND THE
+  // REQUEST NEVER EXPIRES (owner ruling O3, 2026-10-24): it runs when there is slack and sorts after
+  // every request that has a ready_by. SET: a request taken off the queue after this instant has passed
+  // is FAILED with cause expired and is never sent to the vendor (owner ruling on R4, 2026-10-24); the
+  // check is made at dequeue, so a request that is already being attempted is not cut short. A message
+  // field has explicit presence in proto3, so unset and "the epoch" are distinguishable.
+  google.protobuf.Timestamp ready_by = 4;
+
+  // The requester accepts a partial or late answer. Carried and unused.
+  bool best_effort = 5;
+
+  // TRUE when the store is re-submitting a request that an earlier ingest instance held and whose
+  // result never arrived (restart ruling, tj-26jt9w addendum 5). Such a request was NOT DELIVERED: the
+  // lost attempt is not counted, is not a broker failure and is not shown as failed. Ingest charges the
+  // request's registered cost estimate to its current rate window before scheduling it, so a fresh
+  // instance starts with the right count.
+  bool recovered = 6;
+
+  // The attempts the store has already counted for this request (the durable count). Zero on a first
+  // submission. Ingest numbers its next attempt attempt_count + 1, so a restart never resets the
+  // attempt budget. Meaningful whether or not recovered is set.
+  uint32 attempt_count = 7;
+
+  oneof kind {
+    BarsRequest bars = 10;
+    AssetListRequest asset_list = 11;
+    CorporateActionsRequest corporate_actions = 12;
+  }
+}
+
+// Bars for one instrument: what FetchDatasetRequest asked for, minus the envelope fields above.
+message BarsRequest {
+  trader_joe.proto.market.v1.DataSource source = 1;
+  string asset_symbol = 2;
+  trader_joe.proto.market.v1.AssetType asset_type = 3;
+
+  // At least one. An empty list is a refusal, not an empty fetch.
+  repeated trader_joe.proto.market.v1.DataType data_types = 4;
+  trader_joe.proto.market.v1.Granularity granularity = 5;
+
+  // Inclusive and required.
+  google.protobuf.Timestamp start = 6;
+
+  // Unset means an open end, as on FetchDatasetRequest.
+  google.protobuf.Timestamp end = 7;
+  trader_joe.proto.market.v1.UpdateType update_type = 8;
+
+  // FEED_UNSPECIFIED means the deployment decides; see FetchDatasetRequest.feed.
+  trader_joe.proto.market.v1.Feed feed = 9;
+}
+
+// The vendor's asset list for one source, as it stands now. The one non-reproducible past state on this
+// hop, so its result is written by the store before it is acknowledged.
+message AssetListRequest {
+  trader_joe.proto.market.v1.DataSource source = 1;
+  trader_joe.proto.market.v1.AssetType asset_type = 2;
+}
+
+// Corporate actions for one instrument over an EXPLICIT window. The default window (90 days each side
+// of today) is the store's to compute; ingest never defaults it, so both ends are required here.
+message CorporateActionsRequest {
+  trader_joe.proto.market.v1.DataSource source = 1;
+  string asset_symbol = 2;
+
+  // Inclusive and required.
+  google.protobuf.Timestamp start = 3;
+
+  // Exclusive and required.
+  google.protobuf.Timestamp end = 4;
+}
+
+// Answers a Submit at once; nothing in it is data. The ack is the old FetchAck, unchanged, so the same
+// two outcomes mean the same things: accepted carries the resolved feed for bars and FEED_UNSPECIFIED
+// for asset_list and corporate_actions, plus the quota key. Refused (an unservable feed) arises only
+// for bars; the other two kinds are refused only by a gRPC status, if at all. Every other failure is a
+// gRPC status too. The vendor asset id is not here: it rides the result path's delivery header.
+message SubmitResponse {
+  FetchAck ack = 1;
+
+  // The id of the ingest process that answered, on accepted and refused alike. The store learns of a
+  // restart from an id it has not seen (tj-26jt9w addendum 5).
+  string instance_id = 2;
+}
+
+message InstanceRequest {}
+
+message InstanceResponse {
+  // Minted once, when the process starts. A different id is a different process.
+  string instance_id = 1;
+  google.protobuf.Timestamp started_at = 2;
 }
 
 // One message of the stream. The oneof is declared from day one, as ADR tj-8konfu D7.1 requires:
@@ -134,8 +263,10 @@ message FetchAck {
 // The fetch is viable. The store writes its dataset entry, feed included, on this.
 message FetchAccepted {
   // THE RESOLVED FEED: the tape this deployment is entitled to, decided once per fetch and the one
-  // value only ingest may decide. Never FEED_UNSPECIFIED -- a feed nobody resolved is an error, not a
-  // value (tj-vhboky.1), so the mapper refuses the zero here.
+  // value only ingest may decide. Never FEED_UNSPECIFIED for bars -- a feed nobody resolved is an
+  // error, not a value (tj-vhboky.1), so the mapper refuses the zero for bars only. That covers
+  // FetchDataset and a Submit of kind bars. A Submit of kind asset_list or corporate_actions has no
+  // tape, so its accepted ack always carries FEED_UNSPECIFIED, and the mapper accepts the zero there.
   trader_joe.proto.market.v1.Feed feed = 1;
 
   // The quota scope this fetch is charged to. A NON-SECRET CONFIGURED LABEL: never key material and

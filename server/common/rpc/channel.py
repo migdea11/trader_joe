@@ -47,6 +47,11 @@ from common.rpc.config import channel_options
 # ingest_store, and the server's own port expression (docker-compose.yaml, data_store environment:).
 DATA_INGEST_GRPC_TARGET_ENV: Final = 'DATA_INGEST_GRPC_TARGET'
 
+# data_ingest's target for data_store's gRPC server (the result path, tj-7zjov1.16): data-store-grpc, the
+# alias data_store binds on ingest_store, and the server's own port expression (docker-compose.yaml,
+# data_ingest environment:). The same reader, the same no-default rule.
+DATA_STORE_GRPC_TARGET_ENV: Final = 'DATA_STORE_GRPC_TARGET'
+
 _MAX_PORT: Final = 65535
 
 

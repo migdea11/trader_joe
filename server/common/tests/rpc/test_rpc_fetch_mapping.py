@@ -57,8 +57,10 @@ from common.rpc.mapping import (
 )
 from common.tests.domain_fields import aware_datetime_fields
 from common.tests.proto_descriptors import PROTO_ROOT
+from schemas.data_ingest import delivery as delivery_domain
 from schemas.data_ingest import fetch_dataset as domain
 from schemas.data_ingest import quote as quote_domain
+from schemas.data_ingest import submit as submit_domain
 
 
 pytestmark = pytest.mark.common
@@ -89,27 +91,42 @@ DEFERRED_FIELDS: Mapping[tuple[str, str], str] = {
 }
 
 
-def _deferred_on(descriptor: Descriptor) -> set[str]:
-    return {field for (message, field) in DEFERRED_FIELDS if message == descriptor.full_name}
+# A DEFERRAL IS A FACT ABOUT ONE MAPPER, NOT ABOUT A MESSAGE TYPE. FetchAccepted.quota_key is still dropped
+# on the FetchDataset path, but SubmitResponse reaches the same FetchAccepted through its own mapper, which
+# maps quota_key into SubmitAccepted (tj-7zjov1.15). Under these roots the deferral does not apply, so the
+# round trip must keep the field -- and test_a_lifted_deferral_is_one_its_root_actually_maps holds the entry
+# to that.
+DEFERRAL_LIFTED_UNDER: Mapping[str, frozenset[tuple[str, str]]] = {
+    f'{INGEST}.SubmitResponse': frozenset({(f'{INGEST}.FetchAccepted', 'quota_key')})
+}
+
+
+def _deferred_on(descriptor: Descriptor, lifted: frozenset[tuple[str, str]] = frozenset()) -> set[str]:
+    return {
+        field
+        for (message, field) in DEFERRED_FIELDS
+        if message == descriptor.full_name and (message, field) not in lifted
+    }
 
 
 def _without_deferred(message: Message) -> Message:
     # A copy with every deferred field cleared, at whatever depth its message type appears: FetchAck
-    # carries FetchAccepted under its `accepted` arm, so the ack's quota_key is reached through it.
+    # carries FetchAccepted under its `accepted` arm, so the ack's quota_key is reached through it --
+    # unless the ROOT's mapper is one that maps the field (DEFERRAL_LIFTED_UNDER).
     stripped = type(message)()
     stripped.CopyFrom(message)
-    _clear_deferred(stripped)
+    _clear_deferred(stripped, DEFERRAL_LIFTED_UNDER.get(message.DESCRIPTOR.full_name, frozenset()))
     return stripped
 
 
-def _clear_deferred(message: Message) -> None:
-    for field in _deferred_on(message.DESCRIPTOR):
+def _clear_deferred(message: Message, lifted: frozenset[tuple[str, str]]) -> None:
+    for field in _deferred_on(message.DESCRIPTOR, lifted):
         message.ClearField(field)
     for field, value in message.ListFields():
         if field.message_type is None or _is_map(field) or _is_well_known(field.message_type):
             continue
         for sub in value if field.is_repeated else [value]:
-            _clear_deferred(sub)
+            _clear_deferred(sub, lifted)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -341,6 +358,47 @@ def test_each_deferred_field_is_declared_and_still_dropped(message_name: str, fi
     )
 
 
+def _values_of(message: Message, message_name: str, field: str) -> list[object]:
+    # Every value FIELD holds on a MESSAGE_NAME message anywhere inside MESSAGE, at any depth.
+    found = []
+    # ListFields and not HasField: quota_key is a plain proto3 scalar, which has no presence to ask about.
+    if message.DESCRIPTOR.full_name == message_name and field in {f.name for f, _ in message.ListFields()}:
+        found.append(getattr(message, field))
+    for set_field, value in message.ListFields():
+        if set_field.message_type is None or _is_map(set_field) or _is_well_known(set_field.message_type):
+            continue
+        for sub in value if set_field.is_repeated else [value]:
+            found.extend(_values_of(sub, message_name, field))
+    return found
+
+
+@pytest.mark.parametrize(
+    ('root', 'deferred'),
+    [(root, entry) for root, entries in sorted(DEFERRAL_LIFTED_UNDER.items()) for entry in sorted(entries)],
+    ids=lambda part: part.rsplit('.', 1)[-1] if isinstance(part, str) else part[1],
+)
+def test_a_lifted_deferral_is_one_its_root_actually_maps(root: str, deferred: tuple[str, str]):
+    """The lift's own tripwire: an entry is valid only while the deferral exists AND the root keeps the field.
+
+    Without this, a lift could silently outlive a regression in which SubmitResponse stopped mapping
+    quota_key -- the round trip would still compare, but only because the builder never reached the field.
+
+    Args:
+        root: The mapper under which the deferral does not apply.
+        deferred: The (message, field) pair that stays deferred elsewhere.
+    """
+    assert deferred in DEFERRED_FIELDS, f'{deferred} is lifted under {root} but is not deferred anywhere'
+    mapper = MESSAGE_MAPPERS[root]
+    for choices in _cases(mapper.proto_type.DESCRIPTOR):
+        message = _built(mapper, choices)
+        sent = _values_of(message, *deferred)
+        if not sent:
+            continue
+        assert _values_of(mapper.to_proto(mapper.to_domain(message)), *deferred) == sent
+        return
+    pytest.fail(f'no case of {root} sets {deferred}, so the lift names a field the root does not carry')
+
+
 @pytest.mark.parametrize(('name', 'mapper', 'choices'), CASES, ids=CASE_IDS)
 def test_the_domain_side_receives_a_value_for_every_field_the_case_sets(name: str, mapper: MessageMapper, choices):
     """THE REVERSE SET CHECK, on the domain side: every twin field actually got the wire's value.
@@ -500,6 +558,27 @@ def _twins_at(when: datetime) -> dict[type[BaseModel], BaseModel]:
     # One instance of every twin that HAS an aware field, with all of them at `when`. The tripwire below
     # asserts this covers exactly those twins and exactly those fields.
     served = domain.ServedRange(start=when, end=when + timedelta(hours=1))
+    bars = submit_domain.BarsRequest(
+        source='ALPACA',
+        asset_symbol='VFV',
+        asset_type='stock',
+        data_types=['market-activity'],
+        granularity='1day',
+        start=when,
+        end=when + timedelta(hours=1),
+        update_type=2,
+        feed=Feed.IEX,
+    )
+    reported = delivery_domain.VendorReported(limit=200, remaining=150, reset_at=when + timedelta(minutes=1))
+    stats = delivery_domain.VendorCallStats(
+        calls=3,
+        pages=2,
+        throttled_429=1,
+        retries=1,
+        first_call_at=when,
+        last_call_at=when + timedelta(seconds=5),
+        vendor_reported=reported,
+    )
     return {
         domain.FetchDatasetRequest: domain.FetchDatasetRequest(
             owner='rebalancer',
@@ -519,6 +598,32 @@ def _twins_at(when: datetime) -> dict[type[BaseModel], BaseModel]:
         domain.FetchDone: domain.FetchDone(bar_count=3, served_range=served, as_of=when),
         quote_domain.ScopeCapacity: quote_domain.ScopeCapacity(
             quota_key='alpaca-a', cap=200, remaining=150, window_seconds=60, reset_at=when
+        ),
+        # The Submit and Instance contract (tj-7zjov1.15).
+        submit_domain.BarsRequest: bars,
+        submit_domain.SubmitRequest: submit_domain.SubmitRequest(
+            request_id='req-1', owner='rebalancer', ready_by=when + timedelta(hours=2), bars=bars
+        ),
+        submit_domain.CorporateActionsRequest: submit_domain.CorporateActionsRequest(
+            source='ALPACA', asset_symbol='VFV', start=when, end=when + timedelta(days=1)
+        ),
+        submit_domain.InstanceResponse: submit_domain.InstanceResponse(instance_id='ingest-1', started_at=when),
+        # The store's result path (tj-7zjov1.16).
+        delivery_domain.VendorReported: reported,
+        delivery_domain.VendorCallStats: stats,
+        delivery_domain.DeliveryTrailer: delivery_domain.DeliveryTrailer(
+            outcome=delivery_domain.DeliveryOutcome.SUCCEEDED, vendor_stats=stats, served_range=served, as_of=when
+        ),
+        delivery_domain.CorporateActionRecord: delivery_domain.CorporateActionRecord(
+            vendor_action_id='ca-1',
+            action_type='cash_dividend',
+            ex_date=when,
+            record_date=when + timedelta(days=1),
+            payable_date=when + timedelta(days=2),
+            raw_payload=b'{}',
+        ),
+        delivery_domain.RegisterInstanceRequest: delivery_domain.RegisterInstanceRequest(
+            instance_id='ingest-1', started_at=when
         ),
     }
 

@@ -76,9 +76,18 @@ services:
       # No host port in prod: host-side inspection is `compose exec` or a client container
       # on store_api. The dev-only loopback publish for /docs and curl lives in
       # docker-compose.override.yaml, with devnet.
-      - store_db
-      - ingest_store
-      - store_api
+      #
+      # data-store-grpc is the name the store's gRPC server binds (APP_INTERNAL_GRPC_HOST below), an
+      # alias on the ingest_store attachment ONLY, for the same reasons as data-ingest-grpc on
+      # data_ingest (ADR tj-q9ae5u addendum 3): Docker answers a network-scoped alias with this
+      # container's address on THAT network, so the listener lands on ingest_store, where data_ingest
+      # reaches it, and not on store_api or store_db. The result path is pushed by ingest (owner ruling
+      # on tj-26jt9w, 2026-10-24), which is why the store listens at all. No host port.
+      store_db: {}
+      ingest_store:
+        aliases:
+          - data-store-grpc
+      store_api: {}
     # No volumes: alembic.ini and migrations/ are COPYed into the image (Dockerfile, bead tj-7zjov1.10),
     # so make migrate runs the revisions the image was built with and needs no host copy of them. A
     # new revision reaches a running stack with a rebuild (make dev-build, make prod-build).
@@ -111,6 +120,12 @@ services:
       # and :-50051 is the real in-network port. environment: outranks env_file:, so no env file
       # can strand the client.
       - DATA_INGEST_GRPC_TARGET=data-ingest-grpc:${DATA_INGEST_GRPC_PORT:-50051}
+      # Where the store's own gRPC server listens (common.rpc BindAddress.from_env, which has no default):
+      # the alias above, never an env-file value, and the port expression ingest dials byte for byte
+      # (DATA_STORE_GRPC_TARGET on data_ingest), so any env file moves both ends together. 50052 is the
+      # real in-network port and differs from data_ingest's 50051 so a stack never confuses the two.
+      - APP_INTERNAL_GRPC_HOST=data-store-grpc
+      - APP_INTERNAL_GRPC_PORT=${DATA_STORE_GRPC_PORT:-50052}
       # Read by GET /ui/v1/config (server/data/store/app/ui_config.py). Bare keys: compose passes
       # the value from the shell or the project .env, and omits the variable when neither sets it,
       # so the route's own fallbacks stay in force. No ":-" default here, on purpose -- a default
@@ -204,6 +219,11 @@ services:
       # reach it. The host is literal: the alias above, never an env-file value.
       APP_INTERNAL_GRPC_HOST: data-ingest-grpc
       APP_INTERNAL_GRPC_PORT: ${DATA_INGEST_GRPC_PORT:-50051}
+      # Where data_ingest dials the store's gRPC server to push attempt results (tj-7zjov1.16), read by
+      # common.rpc.channel.target_from_env with NO default. The host is LITERAL: data-store-grpc, the
+      # alias data_store binds on ingest_store; the port is the store's APP_INTERNAL_GRPC_PORT expression
+      # byte for byte. environment: outranks env_file:, so no env file can strand the client.
+      DATA_STORE_GRPC_TARGET: data-store-grpc:${DATA_STORE_GRPC_PORT:-50052}
       # The import path (decision tj-3mk3u5.42 F1 rule 3, addendum F1-A), here for the same reason as
       # the gRPC host above. environment: outranks env_file:, which outranks the image's ENV. The root
       # env file ships a legacy PYTHONPATH=./ (.env.default, host-side only), so without this entry it
