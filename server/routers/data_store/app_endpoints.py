@@ -58,6 +58,30 @@ class UiDatasetWritesInterface(StrEnum):
     DELETE_UI_DATASET = '/ui/v1/datasets/{dataset_id}'
 
 
+class UiPanelsInterface(StrEnum):
+    """The /ui/v1 panel reads (tj-7zjov1.36, ruled R1 to R8). Open, like the other /ui/v1 GETs; none records usage."""
+
+    GET_UI_PANELS = '/ui/v1/panels'
+    GET_UI_PANEL = '/ui/v1/panels/{panel_id}'
+    GET_UI_PANEL_SETTINGS_VERSIONS = '/ui/v1/panels/{panel_id}/settings-versions'
+    GET_UI_PANEL_SOURCE_SETTINGS_VERSIONS = '/ui/v1/panel-sources/{source}/settings-versions'
+    GET_UI_PANEL_BOUNDARIES = '/ui/v1/panels/{panel_id}/boundaries'
+    GET_UI_PANEL_MEMBERS = '/ui/v1/panels/{panel_id}/members'
+    GET_UI_PANEL_ASSET_LIST_HISTORY = '/ui/v1/panels/{panel_id}/asset-list-history'
+    GET_UI_DATASET_CORPORATE_ACTIONS = '/ui/v1/datasets/{dataset_id}/corporate-actions'
+
+
+class UiPanelWritesInterface(StrEnum):
+    """The /ui/v1 panel writes (tj-7zjov1.36, ruled W1 to W3). POST only, each behind the instance secret.
+
+    Each appends a row and a repeat appends another, so none is PUT (idempotent) or PATCH (edits a row in place).
+    """
+
+    POST_UI_PANELS = '/ui/v1/panels'
+    POST_UI_PANEL_SETTINGS_VERSIONS = '/ui/v1/panels/{panel_id}/settings-versions'
+    POST_UI_PANEL_SOURCE_SETTINGS_VERSIONS = '/ui/v1/panel-sources/{source}/settings-versions'
+
+
 class UiReaperInterface(StrEnum):
     """The expiry reaper's pending-deletions read (tj-grna9p.23). Open, like the other /ui/v1 GETs."""
 

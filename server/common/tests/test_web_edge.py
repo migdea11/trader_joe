@@ -3,11 +3,15 @@
 Bead tj-grna9p.26; decisions tj-grna9p.5, .6 and .7 as ruled. The ruled shape, each line of which is a
 silent failure if lost:
 
-* THE PROXY (tj-grna9p.5 addendum, .26 phase-1 note, .133, .184). Four forwarding rules, to data_store
-  only, each stripping the /api/store prefix: the UI's read routes, /api/store/ui/v1/*, GET and HEAD;
-  and exactly three UI writes, PATCH .../datasets/<uuid>/expiry, PATCH .../datasets/<uuid>/collecting
-  (the expiry rule's twin, tj-grna9p.184) and DELETE .../datasets/<uuid>, each an anchored regex. No PUT or POST anywhere. Nothing reaches data_ingest. Every other /api path is a 404
-  answered by Caddy, never the SPA's index.html.
+* THE PROXY (tj-grna9p.5 addendum, .26 phase-1 note, .133, .184; tj-7zjov1.169, ADR tj-26jt9w addendum
+  22). Seven forwarding rules, to data_store only, each stripping the /api/store prefix: the UI's read
+  routes, /api/store/ui/v1/*, GET and HEAD (the eight panel reads included); and exactly six UI writes,
+  each one method on one anchored regex: PATCH .../datasets/<uuid>/expiry, PATCH
+  .../datasets/<uuid>/collecting (the expiry rule's twin, tj-grna9p.184), DELETE .../datasets/<uuid>,
+  POST .../panels, POST .../panels/<uuid>/settings-versions and POST
+  .../panel-sources/DATA_SOURCE_<NAME>/settings-versions. POST only on the three panel routes; no PUT
+  anywhere. Nothing reaches data_ingest. Every other /api path is a 404 answered by Caddy, never the
+  SPA's index.html.
 * THE SECRET (tj-grna9p.6). The proxy sets X-Instance-Secret from the container environment; the
   browser never holds it, so the Caddyfile carries a placeholder and never a value, and the access log
   drops the header.
@@ -30,7 +34,8 @@ silent failure if lost:
 Not provable here, and NOT RUN: the image build, `docker compose config` and a container smoke test
 (the agent container has no Docker), and Caddy's own parse of the file (no caddy binary here; the
 builder validated it with caddy 2.11.7 outside the repository; the two write rules of tj-grna9p.133
-and the collecting rule of tj-grna9p.184 have had no Caddy parse at all, tj-mx97hu). The ORDER in which Caddy evaluates the `handle` blocks is Caddy's; the
+and the collecting rule of tj-grna9p.184 have had no Caddy parse at all, tj-mx97hu; nor have the three
+panel write rules of tj-7zjov1.169). The ORDER in which Caddy evaluates the `handle` blocks is Caddy's; the
 one part of it that rests on this file's order (the write rules before the /api/* 404) is pinned, and
 which request is forwarded is evaluated from the file's own matchers, not by a running Caddy.
 """
@@ -164,25 +169,53 @@ def test_the_parse_reads_the_whole_file(caddy: Block):
     assert nodes == len(lines) - closes, (nodes, len(lines), closes)
 
 
-# THE FOUR FORWARDING RULES (tj-grna9p.133 and .184, on tj-grna9p.6). The UI's reads, GET and HEAD on
-# /api/store/ui/v1/*, unchanged; and exactly three writes, each one method on one anchored regex: PATCH
-# .../datasets/<uuid>/expiry, PATCH .../datasets/<uuid>/collecting and DELETE .../datasets/<uuid>. The
-# regexes are compiled by Caddy with Go's RE2 against the cleaned, decoded path (caddyhttp MatchPathRE);
-# no placeholder is expanded in them.
+# THE SEVEN FORWARDING RULES (tj-grna9p.133 and .184, on tj-grna9p.6; tj-7zjov1.169). The UI's reads, GET
+# and HEAD on /api/store/ui/v1/*, unchanged; and exactly six writes, each one method on one anchored
+# regex: PATCH .../datasets/<uuid>/expiry, PATCH .../datasets/<uuid>/collecting, DELETE
+# .../datasets/<uuid>, POST .../panels, POST .../panels/<uuid>/settings-versions and POST
+# .../panel-sources/DATA_SOURCE_<NAME>/settings-versions (the route itself refuses UNSPECIFIED and an
+# unknown name). The regexes are compiled by Caddy with Go's RE2 against the cleaned, decoded path
+# (caddyhttp MatchPathRE); no placeholder is expanded in them.
 UUID_CLASS = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
 EXPIRY_REGEX = f'^/api/store/ui/v1/datasets/{UUID_CLASS}/expiry$'
 COLLECTING_REGEX = f'^/api/store/ui/v1/datasets/{UUID_CLASS}/collecting$'
 DELETE_REGEX = f'^/api/store/ui/v1/datasets/{UUID_CLASS}$'
-# Each write matcher also carries a plain `path` (round 2, architect ruling on this bead): it gives the
+PANEL_CREATE_REGEX = '^/api/store/ui/v1/panels$'
+PANEL_SETTINGS_REGEX = f'^/api/store/ui/v1/panels/{UUID_CLASS}/settings-versions$'
+SOURCE_SETTINGS_REGEX = '^/api/store/ui/v1/panel-sources/DATA_SOURCE_[A-Z0-9_]+/settings-versions$'
+# Each write matcher also carries a plain `path` (round 2, architect ruling on tj-grna9p.133): it gives the
 # rule a path length, so Caddy ranks it above `handle /api/*` by specificity and not by file position.
-# ANDed with the regex, it widens nothing.
+# ANDed with the regex, it widens nothing. The create rule's is exact (no *), since its regex is one path.
 WRITE_ORDER_PATH = '/api/store/ui/v1/datasets/*'
+PANEL_CREATE_PATH = '/api/store/ui/v1/panels'
+PANEL_ORDER_PATH = '/api/store/ui/v1/panels/*'
+SOURCE_ORDER_PATH = '/api/store/ui/v1/panel-sources/*'
 PROXY_RULES = {
     '@store_ui': [['method', 'GET', 'HEAD'], ['path', STORE_UI_PATH]],
     '@store_ui_expiry': [['method', 'PATCH'], ['path', WRITE_ORDER_PATH], ['path_regexp', EXPIRY_REGEX]],
     '@store_ui_collecting': [['method', 'PATCH'], ['path', WRITE_ORDER_PATH], ['path_regexp', COLLECTING_REGEX]],
     '@store_ui_delete': [['method', 'DELETE'], ['path', WRITE_ORDER_PATH], ['path_regexp', DELETE_REGEX]],
+    '@store_ui_panel_create': [['method', 'POST'], ['path', PANEL_CREATE_PATH], ['path_regexp', PANEL_CREATE_REGEX]],
+    '@store_ui_panel_settings': [['method', 'POST'], ['path', PANEL_ORDER_PATH], ['path_regexp', PANEL_SETTINGS_REGEX]],
+    '@store_ui_source_settings': [
+        ['method', 'POST'],
+        ['path', SOURCE_ORDER_PATH],
+        ['path_regexp', SOURCE_SETTINGS_REGEX],
+    ],
 }
+# The one method each rule forwards, and the whole set the edge names: GET, HEAD, PATCH, DELETE, POST.
+RULE_METHODS = {
+    '@store_ui': ['GET', 'HEAD'],
+    '@store_ui_expiry': ['PATCH'],
+    '@store_ui_collecting': ['PATCH'],
+    '@store_ui_delete': ['DELETE'],
+    '@store_ui_panel_create': ['POST'],
+    '@store_ui_panel_settings': ['POST'],
+    '@store_ui_source_settings': ['POST'],
+}
+EDGE_METHODS = {'GET', 'HEAD', 'PATCH', 'DELETE', 'POST'}
+# Every method a test below sends: the edge's five and the four it must never name.
+ALL_METHODS = ['GET', 'HEAD', 'PATCH', 'DELETE', 'POST', 'PUT', 'OPTIONS', 'CONNECT', 'TRACE']
 # The read rule as it stood before the writes were added (1e681eb), comment lines aside: byte for byte.
 READ_RULE_TEXT = """\
 @store_ui {
@@ -198,24 +231,31 @@ header_down Cache-Control "no-store"
 }"""
 
 
-def test_there_are_exactly_four_reverse_proxies_and_each_upstream_is_data_store_from_the_environment(caddy: Block):
+def test_there_are_exactly_seven_reverse_proxies_and_each_upstream_is_data_store_from_the_environment(caddy: Block):
     """The only upstream is DATA_STORE_UPSTREAM, which the overlay sets to data_store on store_api."""
     proxies = [block for block in caddy.walk() if block.words[:1] == ['reverse_proxy']]
-    assert [block.words for block in proxies] == [['reverse_proxy', UPSTREAM_PLACEHOLDER]] * 4, [
+    assert [block.words for block in proxies] == [['reverse_proxy', UPSTREAM_PLACEHOLDER]] * 7, [
         block.words for block in proxies
     ]
 
 
-def test_the_proxied_routes_are_the_read_rule_and_exactly_the_three_writes(site: Block):
-    """Each reverse_proxy sits in a handle guarded by one named matcher, and the four are these, in this order."""
+def test_the_proxied_routes_are_the_read_rule_and_exactly_the_six_writes(site: Block):
+    """Each reverse_proxy sits in a handle guarded by one named matcher, and the seven are these, in this order."""
     rules = {handle.words[1]: _matcher_conditions(site, handle) for handle, _ in _the_proxies(site)}
+    assert len(_the_proxies(site)) == len(rules) == 7, [handle.words for handle, _ in _the_proxies(site)]
     assert list(rules) == list(PROXY_RULES), list(rules)
     assert rules == PROXY_RULES, rules
 
 
+def test_every_matcher_in_the_site_guards_exactly_one_proxy_and_nothing_else_is_named(site: Block):
+    """No spare named matcher (a disused or a duplicate write rule) at site level, besides @traversal."""
+    named = [child.words[0] for child in site.children if child.words[:1] and child.words[0].startswith('@')]
+    assert named == ['@traversal', *PROXY_RULES], named
+
+
 @pytest.mark.parametrize('matcher', list(PROXY_RULES))
 def test_every_forwarding_block_strips_the_prefix_sets_the_secret_and_forbids_caching(site: Block, matcher: str):
-    """The same block in all three: data_store sees /ui/v1/..., the proxy's secret replaces any browser value."""
+    """The same block in all seven: data_store sees /ui/v1/..., the proxy's secret replaces any browser value."""
     ((handle, proxy),) = [(handle, proxy) for handle, proxy in _the_proxies(site) if handle.words[1] == matcher]
     assert [child.words for child in handle.children] == [
         ['uri', 'strip_prefix', '/api/store'],
@@ -234,14 +274,29 @@ def test_the_read_rule_is_unchanged_byte_for_byte():
     assert '\n'.join(lines[start : start + len(READ_RULE_TEXT.splitlines())]) == READ_RULE_TEXT
 
 
-def test_no_rule_names_a_method_beyond_get_head_patch_and_delete(caddy: Block):
-    """No PUT, no POST, no other write anywhere: PATCH only on the expiry and collecting rules, DELETE only on delete."""
+def test_no_rule_names_a_method_beyond_get_head_patch_delete_and_post(caddy: Block, site: Block):
+    """No PUT, no other write anywhere: PATCH only on expiry and collecting, DELETE only on delete, POST only on panels."""
     methods = [block.words for block in caddy.walk() if block.words[:1] == ['method']]
-    assert methods == [['method', 'GET', 'HEAD'], ['method', 'PATCH'], ['method', 'PATCH'], ['method', 'DELETE']], (
-        methods
-    )
+    assert methods == [['method', *RULE_METHODS[matcher]] for matcher in PROXY_RULES], methods
+    assert {word for words in methods for word in words[1:]} == EDGE_METHODS, methods
+    for matcher, wanted in RULE_METHODS.items():
+        (block,) = site.named(matcher)
+        assert [child.words[1:] for child in block.children if child.words[0] == 'method'] == [wanted], matcher
     code = '\n'.join(_caddy_lines(CADDYFILE.read_text(encoding='utf-8')))
-    assert not re.search(r'\b(PUT|POST|OPTIONS|CONNECT|TRACE)\b', code), code
+    assert not re.search(r'\b(PUT|OPTIONS|CONNECT|TRACE)\b', code), code
+    assert len(re.findall(r'\bPOST\b', code)) == 3, re.findall(r'.*\bPOST\b.*', code)
+
+
+def test_post_is_named_only_by_the_three_panel_write_rules(site: Block):
+    """The secret's write path for POST is the panel routes: no POST on a dataset, on the read rule or anywhere else."""
+    posting = [
+        child.words[0]
+        for child in site.children
+        if child.words[:1] and child.words[0].startswith('@')
+        for leaf in child.walk()
+        if leaf.words[:1] == ['method'] and 'POST' in leaf.words
+    ]
+    assert posting == ['@store_ui_panel_create', '@store_ui_panel_settings', '@store_ui_source_settings'], posting
 
 
 def test_the_write_rules_outrank_the_api_404_by_path_and_by_position(site: Block):
@@ -267,11 +322,9 @@ def test_the_secret_is_set_from_the_environment_and_never_written_down(caddy: Bl
     mentions = [block.words for block in caddy.walk() if any(SECRET_HEADER in word for word in block.words)]
     assert mentions == [
         [f'request>headers>{SECRET_HEADER}', 'delete'],
-        ['header_up', SECRET_HEADER, SECRET_PLACEHOLDER],
-        ['header_up', SECRET_HEADER, SECRET_PLACEHOLDER],
-        ['header_up', SECRET_HEADER, SECRET_PLACEHOLDER],
-        ['header_up', SECRET_HEADER, SECRET_PLACEHOLDER],
+        *[['header_up', SECRET_HEADER, SECRET_PLACEHOLDER]] * 7,
     ], mentions
+    assert len(mentions) == 8, mentions
     code = '\n'.join(_caddy_lines(CADDYFILE.read_text(encoding='utf-8')))
     assert 'INSTANCE_WRITE_SECRET' not in code.replace(SECRET_PLACEHOLDER, ''), (
         'the secret is named outside its placeholder'
@@ -285,6 +338,11 @@ def test_the_secret_is_set_from_the_environment_and_never_written_down(caddy: Bl
 LOWER_UUID = '0f8fad5b-d9cb-469f-a165-70867728950e'
 UPPER_UUID = '0F8FAD5B-D9CB-469F-A165-70867728950E'
 DATASETS = '/api/store/ui/v1/datasets'
+PANELS = '/api/store/ui/v1/panels'
+PANEL_SOURCES = '/api/store/ui/v1/panel-sources'
+SOURCE = 'DATA_SOURCE_ALPACA_API'
+PANEL_SETTINGS_PATH = f'{PANELS}/{LOWER_UUID}/settings-versions'
+SOURCE_SETTINGS_PATH = f'{PANEL_SOURCES}/{SOURCE}/settings-versions'
 _RE2_UNSUPPORTED = re.compile(r'\(\?[=!<]|\\[1-9]|\(\?P=')
 
 
@@ -300,9 +358,13 @@ def _forwarded_by(site: Block, method: str, path: str) -> list[str]:
         results = [method in conditions['method']]
         if 'path' in conditions:
             (pattern,) = conditions['path']
-            assert pattern.endswith('*') and '*' not in pattern[:-1], pattern
+            # A trailing * is a prefix match and no * an exact one; a * elsewhere is not modelled here.
+            assert '*' not in pattern.removesuffix('*'), pattern
             # MatchPath is case-insensitive: it lowercases both sides.
-            results.append(path.lower().startswith(pattern[:-1].lower()))
+            if pattern.endswith('*'):
+                results.append(path.lower().startswith(pattern[:-1].lower()))
+            else:
+                results.append(path.lower() == pattern.lower())
         if 'path_regexp' in conditions:
             (pattern,) = conditions['path_regexp']
             assert not _RE2_UNSUPPORTED.search(pattern), f'not RE2: {pattern}'
@@ -322,8 +384,17 @@ def _forwarded_by(site: Block, method: str, path: str) -> list[str]:
         ('PATCH', f'{DATASETS}/{UPPER_UUID}/collecting', '@store_ui_collecting'),
         ('DELETE', f'{DATASETS}/{LOWER_UUID}', '@store_ui_delete'),
         ('DELETE', f'{DATASETS}/{UPPER_UUID}', '@store_ui_delete'),
+        ('POST', PANELS, '@store_ui_panel_create'),
+        ('POST', PANEL_SETTINGS_PATH, '@store_ui_panel_settings'),
+        ('POST', f'{PANELS}/{UPPER_UUID}/settings-versions', '@store_ui_panel_settings'),
+        ('POST', SOURCE_SETTINGS_PATH, '@store_ui_source_settings'),
+        ('POST', f'{PANEL_SOURCES}/DATA_SOURCE_IB_API/settings-versions', '@store_ui_source_settings'),
         ('GET', f'{DATASETS}/{LOWER_UUID}/bars', '@store_ui'),
         ('HEAD', '/api/store/ui/v1/config', '@store_ui'),
+        ('GET', PANELS, '@store_ui'),
+        ('GET', PANEL_SETTINGS_PATH, '@store_ui'),
+        ('GET', SOURCE_SETTINGS_PATH, '@store_ui'),
+        ('HEAD', PANEL_SETTINGS_PATH, '@store_ui'),
     ],
     ids=[
         'patch-lower',
@@ -332,8 +403,17 @@ def _forwarded_by(site: Block, method: str, path: str) -> list[str]:
         'collecting-upper',
         'delete-lower',
         'delete-upper',
+        'panel-create',
+        'panel-settings-lower',
+        'panel-settings-upper',
+        'source-settings-alpaca',
+        'source-settings-ib',
         'get-read',
         'head-read',
+        'get-panels',
+        'get-panel-settings',
+        'get-source-settings',
+        'head-panel-settings',
     ],
 )
 def test_the_ui_requests_are_forwarded_by_exactly_their_rule(site: Block, method: str, path: str, rule: str):
@@ -366,13 +446,73 @@ _REFUSED_WRITE_PATHS = {
     'unprefixed': f'/ui/v1/datasets/{LOWER_UUID}',
     'prefix-in-front': f'/x{DATASETS}/{LOWER_UUID}',
     'other-version': f'/api/store/ui/v2/datasets/{LOWER_UUID}',
+    # The panel look-alikes (tj-7zjov1.169): near each of the three POST shapes, and none of them.
+    'panels-slash': f'{PANELS}/',
+    'panels-uppercase': '/api/store/ui/v1/PANELS',
+    'panels-title': '/api/store/ui/v1/Panels',
+    'panels-singular': '/api/store/ui/v1/panel',
+    'panels-longer': f'{PANELS}x',
+    'panels-trailing-newline': f'{PANELS}\n',
+    'panels-sub-path': f'{PANELS}/x',
+    'panels-the-panel': f'{PANELS}/{LOWER_UUID}',
+    'panels-the-panel-slash': f'{PANELS}/{LOWER_UUID}/',
+    'panels-members': f'{PANELS}/{LOWER_UUID}/members',
+    'panels-unprefixed': '/ui/v1/panels',
+    'panels-other-version': '/api/store/ui/v2/panels',
+    'panels-prefix-in-front': f'/x{PANELS}',
+    'panels-store-route': '/api/store/store/panels',
+    'panel-settings-not-a-uuid': f'{PANELS}/not-a-uuid/settings-versions',
+    'panel-settings-uuid-no-dashes': f'{PANELS}/{LOWER_UUID.replace("-", "")}/settings-versions',
+    'panel-settings-uuid-short': f'{PANELS}/{LOWER_UUID[:-1]}/settings-versions',
+    'panel-settings-uuid-long': f'{PANELS}/{LOWER_UUID}0/settings-versions',
+    'panel-settings-uuid-non-hex': f'{PANELS}/{LOWER_UUID[:-1]}g/settings-versions',
+    'panel-settings-a-source': f'{PANELS}/{SOURCE}/settings-versions',
+    'panel-settings-no-panel': f'{PANELS}//settings-versions',
+    'panel-settings-bare': f'{PANELS}/settings-versions',
+    'panel-settings-trailing-slash': f'{PANEL_SETTINGS_PATH}/',
+    'panel-settings-extra-segment': f'{PANEL_SETTINGS_PATH}/x',
+    'panel-settings-a-version': f'{PANEL_SETTINGS_PATH}/1',
+    'panel-settings-uppercase': f'{PANELS}/{LOWER_UUID}/SETTINGS-VERSIONS',
+    'panel-settings-underscore': f'{PANELS}/{LOWER_UUID}/settings_versions',
+    'panel-settings-singular': f'{PANELS}/{LOWER_UUID}/settings-version',
+    'panel-settings-encoded-slash': f'{PANELS}/{LOWER_UUID}%2Fsettings-versions',
+    'panel-settings-trailing-newline': f'{PANEL_SETTINGS_PATH}\n',
+    'panel-settings-prefix-in-front': f'/x{PANEL_SETTINGS_PATH}',
+    'panel-settings-unprefixed': f'/ui/v1/panels/{LOWER_UUID}/settings-versions',
+    'panel-settings-under-sources': f'{PANEL_SOURCES}/{LOWER_UUID}/settings-versions',
+    'source-settings-not-a-source': f'{PANEL_SOURCES}/NOT_A_SOURCE/settings-versions',
+    'source-settings-lowercase': f'{PANEL_SOURCES}/{SOURCE.lower()}/settings-versions',
+    'source-settings-mixed-case': f'{PANEL_SOURCES}/DATA_SOURCE_Alpaca_API/settings-versions',
+    'source-settings-prefix-only': f'{PANEL_SOURCES}/DATA_SOURCE_/settings-versions',
+    'source-settings-no-prefix': f'{PANEL_SOURCES}/ALPACA_API/settings-versions',
+    'source-settings-prefix-in-name': f'{PANEL_SOURCES}/X_{SOURCE}/settings-versions',
+    'source-settings-dash': f'{PANEL_SOURCES}/DATA_SOURCE_ALPACA-API/settings-versions',
+    'source-settings-dot': f'{PANEL_SOURCES}/DATA_SOURCE_ALPACA.API/settings-versions',
+    'source-settings-space': f'{PANEL_SOURCES}/DATA_SOURCE_ALPACA API/settings-versions',
+    'source-settings-two-segments': f'{PANEL_SOURCES}/{SOURCE}/{SOURCE}/settings-versions',
+    'source-settings-no-source': f'{PANEL_SOURCES}//settings-versions',
+    'source-settings-bare': f'{PANEL_SOURCES}/settings-versions',
+    'source-settings-the-source': f'{PANEL_SOURCES}/{SOURCE}',
+    'source-settings-the-list': PANEL_SOURCES,
+    'source-settings-the-list-slash': f'{PANEL_SOURCES}/',
+    'source-settings-trailing-slash': f'{SOURCE_SETTINGS_PATH}/',
+    'source-settings-extra-segment': f'{SOURCE_SETTINGS_PATH}/x',
+    'source-settings-uppercase': f'{PANEL_SOURCES}/{SOURCE}/SETTINGS-VERSIONS',
+    'source-settings-encoded-slash': f'{PANEL_SOURCES}/{SOURCE}%2Fsettings-versions',
+    'source-settings-trailing-newline': f'{SOURCE_SETTINGS_PATH}\n',
+    'source-settings-a-uuid': f'{PANEL_SOURCES}/{LOWER_UUID}/settings-versions',
+    'source-settings-singular-root': f'/api/store/ui/v1/panel-source/{SOURCE}/settings-versions',
+    'source-settings-under-panels': f'{PANELS}/sources/{SOURCE}/settings-versions',
+    'source-settings-prefix-in-front': f'/x{SOURCE_SETTINGS_PATH}',
+    'source-settings-unprefixed': f'/ui/v1/panel-sources/{SOURCE}/settings-versions',
+    'source-settings-other-version': f'/api/store/ui/v2/panel-sources/{SOURCE}/settings-versions',
 }
 
 
-@pytest.mark.parametrize('method', ['PATCH', 'DELETE'])
+@pytest.mark.parametrize('method', ['PATCH', 'DELETE', 'POST'])
 @pytest.mark.parametrize('path', list(_REFUSED_WRITE_PATHS.values()), ids=list(_REFUSED_WRITE_PATHS))
 def test_a_write_on_any_other_path_is_not_forwarded(site: Block, method: str, path: str):
-    """Caddy's 404 answers it: the three regexes accept one path shape each and nothing near it."""
+    """Caddy's 404 answers it: the six regexes accept one path shape each and nothing near it, for any write method."""
     assert _forwarded_by(site, method, path) == [], (method, path)
 
 
@@ -388,6 +528,24 @@ def test_a_write_on_any_other_path_is_not_forwarded(site: Block, method: str, pa
         ('OPTIONS', f'{DATASETS}/{LOWER_UUID}'),
         ('GET', f'/api/store/store/datasets/{LOWER_UUID}'),
         ('GET', '/api/store/internal/asset-data'),
+        ('POST', f'{DATASETS}/{LOWER_UUID}'),
+        ('POST', f'{DATASETS}/{LOWER_UUID}/collecting'),
+        ('PUT', PANELS),
+        ('PATCH', PANELS),
+        ('DELETE', PANELS),
+        ('PUT', PANEL_SETTINGS_PATH),
+        ('PATCH', PANEL_SETTINGS_PATH),
+        ('DELETE', PANEL_SETTINGS_PATH),
+        ('PUT', SOURCE_SETTINGS_PATH),
+        ('PATCH', SOURCE_SETTINGS_PATH),
+        ('DELETE', SOURCE_SETTINGS_PATH),
+        ('PATCH', f'{PANELS}/{LOWER_UUID}'),
+        ('DELETE', f'{PANELS}/{LOWER_UUID}'),
+        ('PUT', f'{PANELS}/{LOWER_UUID}'),
+        ('OPTIONS', PANELS),
+        ('post', PANELS),
+        ('Post', PANEL_SETTINGS_PATH),
+        ('post', SOURCE_SETTINGS_PATH),
     ],
     ids=[
         'delete-on-expiry',
@@ -399,10 +557,60 @@ def test_a_write_on_any_other_path_is_not_forwarded(site: Block, method: str, pa
         'options',
         'get-store',
         'get-internal',
+        'post-dataset',
+        'post-collecting',
+        'put-panels',
+        'patch-panels',
+        'delete-panels',
+        'put-panel-settings',
+        'patch-panel-settings',
+        'delete-panel-settings',
+        'put-source-settings',
+        'patch-source-settings',
+        'delete-source-settings',
+        'patch-the-panel',
+        'delete-the-panel',
+        'put-the-panel',
+        'options-panels',
+        'lower-case-post-panels',
+        'title-case-post-panel-settings',
+        'lower-case-post-source-settings',
     ],
 )
 def test_the_wrong_method_or_a_non_ui_route_is_not_forwarded(site: Block, method: str, path: str):
+    """A method is compared as sent (Caddy's MatchMethod is an exact string match; NOT RUN against Caddy)."""
     assert _forwarded_by(site, method, path) == [], (method, path)
+
+
+# A route template's parameters filled in with a value its rule accepts.
+_PATH_PARAMETERS = {'dataset_id': LOWER_UUID, 'panel_id': LOWER_UUID, 'source': SOURCE}
+
+# One accepted path per write rule: every other method on it misses every write rule.
+WRITE_PATHS = {
+    '@store_ui_expiry': f'{DATASETS}/{LOWER_UUID}/expiry',
+    '@store_ui_collecting': f'{DATASETS}/{LOWER_UUID}/collecting',
+    '@store_ui_delete': f'{DATASETS}/{LOWER_UUID}',
+    '@store_ui_panel_create': PANELS,
+    '@store_ui_panel_settings': PANEL_SETTINGS_PATH,
+    '@store_ui_source_settings': SOURCE_SETTINGS_PATH,
+}
+
+
+def test_the_write_paths_cover_every_write_rule():
+    assert list(WRITE_PATHS) == [matcher for matcher in PROXY_RULES if matcher != '@store_ui'], list(WRITE_PATHS)
+
+
+@pytest.mark.parametrize('method', ALL_METHODS)
+@pytest.mark.parametrize('matcher', list(WRITE_PATHS))
+def test_on_each_write_path_only_its_method_reaches_a_write_rule(site: Block, matcher: str, method: str):
+    """Its one method reaches its rule alone; GET and HEAD are the read rule's; every other method is the 404."""
+    hits = _forwarded_by(site, method, WRITE_PATHS[matcher])
+    if method in RULE_METHODS[matcher]:
+        assert hits == [matcher], (method, hits)
+    elif method in ('GET', 'HEAD'):
+        assert hits == ['@store_ui'], (method, hits)
+    else:
+        assert hits == [], (method, hits)
 
 
 # THE COLLECTING RULE (tj-grna9p.184). The expiry rule's twin: the same method, matchers and forwarding
@@ -509,6 +717,102 @@ def test_a_patch_the_collecting_regex_accepts_is_forwarded_by_that_rule_alone(si
             assert _forwarded_by(site, 'PATCH', path) == ['@store_ui_collecting'], path
 
 
+# THE PANEL WRITE RULES (tj-7zjov1.169), each regex as the file spells it. Not run through Caddy either.
+_PANEL_CREATE_TABLE = {
+    'exact': (PANELS, True),
+    'trailing-slash': (f'{PANELS}/', False),
+    'uppercase': ('/api/store/ui/v1/PANELS', False),
+    'longer': (f'{PANELS}x', False),
+    'sub-path': (f'{PANELS}/{LOWER_UUID}', False),
+    'trailing-newline': (f'{PANELS}\n', False),
+    'prefix-in-front': (f'/x{PANELS}', False),
+    'unprefixed': ('/ui/v1/panels', False),
+}
+_PANEL_SETTINGS_TABLE = {
+    'lower': (PANEL_SETTINGS_PATH, True),
+    'upper-uuid': (f'{PANELS}/{UPPER_UUID}/settings-versions', True),
+    'mixed-uuid': (f'{PANELS}/{MIXED_UUID}/settings-versions', True),
+    'upper-suffix': (f'{PANELS}/{LOWER_UUID}/SETTINGS-VERSIONS', False),
+    'title-suffix': (f'{PANELS}/{LOWER_UUID}/Settings-versions', False),
+    'trailing-slash': (f'{PANEL_SETTINGS_PATH}/', False),
+    'extra-segment': (f'{PANEL_SETTINGS_PATH}/x', False),
+    'suffix-longer': (f'{PANEL_SETTINGS_PATH}x', False),
+    'suffix-shorter': (f'{PANELS}/{LOWER_UUID}/settings-version', False),
+    'double-slash': (f'{PANELS}/{LOWER_UUID}//settings-versions', False),
+    'segment-before': (f'{PANELS}/x/{LOWER_UUID}/settings-versions', False),
+    'not-a-uuid': (f'{PANELS}/not-a-uuid/settings-versions', False),
+    'uuid-no-dashes': (f'{PANELS}/{LOWER_UUID.replace("-", "")}/settings-versions', False),
+    'uuid-short': (f'{PANELS}/{LOWER_UUID[:-1]}/settings-versions', False),
+    'uuid-long': (f'{PANELS}/{LOWER_UUID}0/settings-versions', False),
+    'uuid-non-hex': (f'{PANELS}/{LOWER_UUID[:-1]}g/settings-versions', False),
+    'encoded-slash': (f'{PANELS}/{LOWER_UUID}%2Fsettings-versions', False),
+    'trailing-newline': (f'{PANEL_SETTINGS_PATH}\n', False),
+    'prefix-in-front': (f'/x{PANEL_SETTINGS_PATH}', False),
+    'under-sources': (f'{PANEL_SOURCES}/{LOWER_UUID}/settings-versions', False),
+    'the-panel': (f'{PANELS}/{LOWER_UUID}', False),
+}
+_SOURCE_SETTINGS_TABLE = {
+    'alpaca': (SOURCE_SETTINGS_PATH, True),
+    'ib': (f'{PANEL_SOURCES}/DATA_SOURCE_IB_API/settings-versions', True),
+    'manual': (f'{PANEL_SOURCES}/DATA_SOURCE_MANUAL_ENTRY/settings-versions', True),
+    # Accepted at the edge by the ruled shape; the route itself answers 422 (tj-7zjov1.36 W3).
+    'unspecified': (f'{PANEL_SOURCES}/DATA_SOURCE_UNSPECIFIED/settings-versions', True),
+    'digits': (f'{PANEL_SOURCES}/DATA_SOURCE_V2/settings-versions', True),
+    'not-a-source': (f'{PANEL_SOURCES}/NOT_A_SOURCE/settings-versions', False),
+    'prefix-only': (f'{PANEL_SOURCES}/DATA_SOURCE_/settings-versions', False),
+    'lowercase': (f'{PANEL_SOURCES}/{SOURCE.lower()}/settings-versions', False),
+    'mixed-case': (f'{PANEL_SOURCES}/DATA_SOURCE_Alpaca_API/settings-versions', False),
+    'dash': (f'{PANEL_SOURCES}/DATA_SOURCE_ALPACA-API/settings-versions', False),
+    'dot': (f'{PANEL_SOURCES}/DATA_SOURCE_ALPACA.API/settings-versions', False),
+    'slash-inside': (f'{PANEL_SOURCES}/DATA_SOURCE_ALPACA/API/settings-versions', False),
+    'encoded-slash-inside': (f'{PANEL_SOURCES}/DATA_SOURCE_ALPACA%2FAPI/settings-versions', False),
+    'prefix-in-name': (f'{PANEL_SOURCES}/X_{SOURCE}/settings-versions', False),
+    'upper-suffix': (f'{PANEL_SOURCES}/{SOURCE}/SETTINGS-VERSIONS', False),
+    'trailing-slash': (f'{SOURCE_SETTINGS_PATH}/', False),
+    'extra-segment': (f'{SOURCE_SETTINGS_PATH}/x', False),
+    'trailing-newline': (f'{SOURCE_SETTINGS_PATH}\n', False),
+    'newline-in-name': (f'{PANEL_SOURCES}/{SOURCE}\n/settings-versions', False),
+    'a-uuid': (f'{PANEL_SOURCES}/{LOWER_UUID}/settings-versions', False),
+    'prefix-in-front': (f'/x{SOURCE_SETTINGS_PATH}', False),
+    'the-source': (f'{PANEL_SOURCES}/{SOURCE}', False),
+}
+_PANEL_TABLES = {
+    '@store_ui_panel_create': _PANEL_CREATE_TABLE,
+    '@store_ui_panel_settings': _PANEL_SETTINGS_TABLE,
+    '@store_ui_source_settings': _SOURCE_SETTINGS_TABLE,
+}
+
+
+@pytest.mark.parametrize(
+    ('matcher', 'path', 'accepted'),
+    [(matcher, path, accepted) for matcher, table in _PANEL_TABLES.items() for path, accepted in table.values()],
+    ids=[f'{matcher[1:]}-{case}' for matcher, table in _PANEL_TABLES.items() for case in table],
+)
+def test_each_panel_write_regex_accepts_exactly_its_one_path_shape(
+    site: Block, matcher: str, path: str, accepted: bool
+):
+    """The regex as written in the file, not this module's copy."""
+    assert (_file_regex(site, matcher).search(path) is not None) is accepted, (matcher, path)
+
+
+@pytest.mark.parametrize('matcher', list(_PANEL_TABLES))
+def test_a_post_a_panel_regex_accepts_is_forwarded_by_that_rule_alone(site: Block, matcher: str):
+    """No two write rules accept the same request; and one the regex refuses is forwarded by no rule."""
+    for path, accepted in _PANEL_TABLES[matcher].values():
+        assert _forwarded_by(site, 'POST', path) == ([matcher] if accepted else []), path
+
+
+def test_every_data_source_name_reaches_the_source_settings_rule(site: Block):
+    """Derived from the domain enum (the route reads DATA_SOURCE_<member name>), so no new source is refused here."""
+    from common.enums.data_stock import DataSource
+
+    names = [f'DATA_SOURCE_{member.name}' for member in DataSource]
+    assert len(names) > 1 and SOURCE in names, names
+    for name in names:
+        path = f'{PANEL_SOURCES}/{name}/settings-versions'
+        assert _forwarded_by(site, 'POST', path) == ['@store_ui_source_settings'], name
+
+
 def test_every_guarded_ui_write_has_exactly_one_edge_rule_and_every_write_rule_one_route(site: Block):
     """Derived from data_store's app (test_ci_invariants): the edge forwards exactly the secret-guarded UI writes.
 
@@ -518,15 +822,50 @@ def test_every_guarded_ui_write_has_exactly_one_edge_rule_and_every_write_rule_o
     from common.tests.test_ci_invariants import _data_store_app, _guarded_routes
 
     guarded = sorted((method, path) for method, path in _guarded_routes(_data_store_app()) if path.startswith('/ui/'))
-    assert guarded, 'data_store guards no /ui/ route, so this comparison is vacuous'
+    assert len(guarded) == len(WRITE_RULES) == 6, guarded
     reached = {}
     for method, template in guarded:
-        concrete = '/api/store' + re.sub(r'\{[^}]+\}', LOWER_UUID, template)
+        parameters = re.findall(r'\{([^}]+)\}', template)
+        # A parameter this map does not know fails loudly rather than being filled with a value its rule refuses.
+        assert set(parameters) <= set(_PATH_PARAMETERS), (template, parameters)
+        concrete = '/api/store' + re.sub(r'\{([^}]+)\}', lambda found: _PATH_PARAMETERS[found.group(1)], template)
         hits = [hit for hit in _forwarded_by(site, method, concrete) if hit in WRITE_RULES]
         assert len(hits) == 1, (method, template, hits)
+        assert hits[0] not in reached, (hits[0], reached[hits[0]], (method, template))
         reached[hits[0]] = (method, template)
     assert sorted(reached) == sorted(WRITE_RULES), reached
-    assert reached['@store_ui_collecting'] == ('PATCH', '/ui/v1/datasets/{dataset_id}/collecting'), reached
+    assert reached == {
+        '@store_ui_expiry': ('PATCH', '/ui/v1/datasets/{dataset_id}/expiry'),
+        '@store_ui_collecting': ('PATCH', '/ui/v1/datasets/{dataset_id}/collecting'),
+        '@store_ui_delete': ('DELETE', '/ui/v1/datasets/{dataset_id}'),
+        '@store_ui_panel_create': ('POST', '/ui/v1/panels'),
+        '@store_ui_panel_settings': ('POST', '/ui/v1/panels/{panel_id}/settings-versions'),
+        '@store_ui_source_settings': ('POST', '/ui/v1/panel-sources/{source}/settings-versions'),
+    }, reached
+
+
+def test_every_write_rule_path_reaches_a_guarded_route_by_the_apps_own_matching():
+    """The reverse direction, matched by data_store's router: each rule's accepted path, stripped, is a guarded route."""
+    from common.tests.test_ci_invariants import _data_store_app, _guarded_routes, _route_templates
+
+    app = _data_store_app()
+    guarded = _guarded_routes(app)
+    for matcher, path in WRITE_PATHS.items():
+        (method,) = RULE_METHODS[matcher]
+        templates = _route_templates(app, method, path.removeprefix('/api/store'))
+        assert len(templates) == 1 and (method, templates[0]) in guarded, (matcher, method, templates)
+
+
+def test_the_panel_reads_are_forwarded_by_the_read_rule_alone(site: Block):
+    """The eight panel reads (R1 to R8, tj-7zjov1.36) need no rule of their own: GET and HEAD reach @store_ui only."""
+    from routers.data_store.app_endpoints import UiPanelsInterface
+
+    templates = [member.value for member in UiPanelsInterface]
+    assert len(templates) == 8, templates
+    for template in templates:
+        concrete = '/api/store' + re.sub(r'\{([^}]+)\}', lambda found: _PATH_PARAMETERS[found.group(1)], template)
+        for method in ('GET', 'HEAD'):
+            assert _forwarded_by(site, method, concrete) == ['@store_ui'], (method, template)
 
 
 def test_the_access_log_deletes_the_secret_header(site: Block):

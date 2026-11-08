@@ -3465,11 +3465,12 @@ TEARDOWN_CONDITIONS = frozenset({'failure()', 'always()'})
 # this module never spells a path that holds real credentials.
 STAGED_ENV_FILE = ENV_DEFAULT_FILE.stem
 # The write routes the lifecycle step must refuse with the secret blank, and how it probes each.
-# Six since tj-grna9p.184: the /store POST and DELETE, the /internal/asset-data POST, and the
-# /ui/v1 expiry PATCH, collecting PATCH and dataset DELETE. WHICH six is
-# test_every_secret_guarded_route_is_proven_to_refuse's job, derived from the app; this count only
-# pins the loop's length, so it must move with that set.
-LIFECYCLE_ROUTE_COUNT = 6
+# Nine since tj-7zjov1.242: the /store POST and DELETE, the /internal/asset-data POST, the
+# /ui/v1 expiry PATCH, collecting PATCH and dataset DELETE (six since tj-grna9p.184), and the three
+# /ui/v1 panel POSTs: the create, a panel's settings version and a source's settings version. WHICH
+# nine is test_every_secret_guarded_route_is_proven_to_refuse's job, derived from the app; this
+# count only pins the loop's length, so it must move with that set.
+LIFECYCLE_ROUTE_COUNT = 9
 LIFECYCLE_ROUTE_METHODS = frozenset({'POST', 'PATCH', 'DELETE'})
 LIFECYCLE_HEADER_VARIANTS = 4
 # docker compose global options that take a value, so the subcommand can be told from a value.

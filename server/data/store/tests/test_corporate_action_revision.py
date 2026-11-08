@@ -313,7 +313,12 @@ def test_no_production_module_writes_corporate_action_other_than_by_the_reposito
         assert not raw.search(text), f'{path} updates or deletes corporate_action in raw SQL'
         if re.search(r'store\.app\.database\.models(\.corporate_action\b| import .*\bcorporate_action\b)', text):
             importing_the_model.add(path.relative_to(SERVER_ROOT).as_posix())
-    assert importing_the_model == {'data/store/app/database/crud/corporate_action.py'}
+    assert importing_the_model == {
+        'data/store/app/database/crud/corporate_action.py',
+        # P24 tj-7zjov1.36 (c716268), judged by P24v tj-7zjov1.241: the per-dataset event read (ADR tj-26jt9w addendum
+        # 22). It only select()s corporate_action, never raw_payload; pinned by test_panel_ui_reads.py.
+        'data/store/app/database/crud/panel_reads.py',
+    }
 
 
 # --------------------------------------------------------------------------------------------- alembic's own offline SQL

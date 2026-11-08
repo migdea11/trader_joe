@@ -603,19 +603,30 @@ def test_the_create_cadence_unspecified_means_the_monthly_default_and_the_save_s
         "an absent window day count takes the store's ruled 90 (DEFAULT_CORPORATE_ACTION_WINDOW_DAYS)",
         'All four absent means not given; a window without both rates is refused (422).',
         'When the source has no version and none is given, the create is refused (422): the rates have no default.',
-        "When given for a source that already has a version, it is written as that source's NEXT version with this "
-        "create's actor and reason (a SOURCE_SETTINGS marker), in the same transaction.",
+        'When given for a source that already has a version, the create is refused (422) and nothing is written:',
+        "a source's settings apply to every panel on that source, so they change only through their own write, "
+        'POST /panel-sources/{source}/settings-versions',
         'Each number is not negative.',
     ],
 )
 def test_the_first_source_settings_document_the_given_rule(words: str):
-    """P23b (A) 13-16 and P20b's no-fallback-rates ruling (03:25 UTC on tj-7zjov1.176), on the first of the four.
+    """P23b (A) 13-16, P20b's no-fallback-rates ruling (03:25 UTC on tj-7zjov1.176) and the refusal of tj-7zjov1.209.
+
+    Settings given for a source that already has a version are refused (422), nothing written, and change only through
+    the source's own write (tj-7zjov1.245); pinned on the first of the four.
 
     Args:
         words: One sentence of the rule.
     """
     text = _comments(_path('CreatePanelRequest', 'ramp_datasets_per_hour'))
     assert words in text, text
+
+
+def test_the_first_source_settings_no_longer_say_a_create_writes_the_next_version():
+    """tj-7zjov1.209: create_panel never writes a source's next version, so the comment must not say it does."""
+    text = _comments(_path('CreatePanelRequest', 'ramp_datasets_per_hour'))
+    assert 'NEXT version' not in text, text
+    assert 'in the same transaction' not in text, text
 
 
 @pytest.mark.parametrize(

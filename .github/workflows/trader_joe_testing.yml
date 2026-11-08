@@ -1425,7 +1425,10 @@ jobs:
               "POST /internal/asset-data/stock/market-activity" \
               "PATCH /ui/v1/datasets/00000000-0000-0000-0000-000000000000/expiry" \
               "PATCH /ui/v1/datasets/00000000-0000-0000-0000-000000000000/collecting" \
-              "DELETE /ui/v1/datasets/00000000-0000-0000-0000-000000000000"; do
+              "DELETE /ui/v1/datasets/00000000-0000-0000-0000-000000000000" \
+              "POST /ui/v1/panels" \
+              "POST /ui/v1/panels/00000000-0000-0000-0000-000000000000/settings-versions" \
+              "POST /ui/v1/panel-sources/DATA_SOURCE_ALPACA_API/settings-versions"; do
             method="${route%% *}"; path="${route#* }"
             data=()
             if [ "${method}" = "POST" ] || [ "${method}" = "PATCH" ]; then data=(--data '{}'); fi

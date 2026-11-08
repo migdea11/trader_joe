@@ -380,9 +380,11 @@ message CreatePanelRequest {
   // creation) and an absent window day count takes the store's ruled 90
   // (DEFAULT_CORPORATE_ACTION_WINDOW_DAYS). All four absent means not given; a window without both rates
   // is refused (422). When the source has no version and none is given, the create is refused (422): the
-  // rates have no default. When given for a source that already has a version, it is written as that
-  // source's NEXT version with this create's actor and reason (a SOURCE_SETTINGS marker), in the same
-  // transaction. Each number is not negative.
+  // rates have no default. When given for a source that already has a version, the create is refused
+  // (422) and nothing is written: a source's settings apply to every panel on that source, so they change
+  // only through their own write, POST /panel-sources/{source}/settings-versions (the UI reads
+  // GET /panel-sources/{source}/settings-versions first to see whether a version exists). Each number is
+  // not negative.
   optional int32 ramp_datasets_per_hour = 13;
   optional int32 request_cap_per_hour = 14;
   optional int32 corporate_action_window_pre_days = 15;

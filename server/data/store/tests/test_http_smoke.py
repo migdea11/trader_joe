@@ -16,6 +16,7 @@ from common.errors.vocabulary import ExogenousError, Reason
 from data.store.app.app_depends import get_ingest_fetch_client, get_ingest_submit_client
 from data.store.app.database.database import async_db
 from data.store.app.database.models.ingest_request import IngestRequest
+from data.store.app.database.models.panel import Panel, PanelSettingsVersion, PanelSourceSettingsVersion
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.main import app
 from data.store.tests.problem_body import problem, validation_errors
@@ -114,6 +115,10 @@ GUARDED_ADDRESSES = frozenset(
         'DELETE /ui/v1/datasets/{dataset_id}',
         # The collecting write (tj-grna9p.175).
         'PATCH /ui/v1/datasets/{dataset_id}/collecting',
+        # The panel writes (tj-7zjov1.36, W1 to W3); the eight panel reads beside them are open.
+        'POST /ui/v1/panels',
+        'POST /ui/v1/panels/{panel_id}/settings-versions',
+        'POST /ui/v1/panel-sources/{source}/settings-versions',
     }
 )
 
@@ -161,6 +166,8 @@ class Case(NamedTuple):
             call reaches the handler and is answered 404 NOT_FOUND by it. See READ-BY-ID ROUTES below.
         submits: The route submits a request to ingest (POST /store since tj-7zjov1.28): a well-formed call
             reaches the Submit seam, whose double answers 503 PEER_UNAVAILABLE. See FakeSubmitClient.
+        body_only: The route's only input is a ProtoBody (POST /ui/v1/panels), whose refusal names the message
+            type, never a field: the malformed half sends a body that is not the message and asserts that refusal.
     """
 
     path_params: dict[str, str]
@@ -171,6 +178,7 @@ class Case(NamedTuple):
     reads_one_row: bool = False
     takes_no_input: bool = False
     submits: bool = False
+    body_only: bool = False
 
 
 ASSET_PATH = {'asset_type': 'stock', 'data_type': 'market-activity'}
@@ -434,6 +442,115 @@ CASES: dict[str, Case] = {
         malformed_request={'params': {'client_id': 'storage-takes-no-client'}},
         malformed_field='client_id',
     ),
+    # The panel routes (tj-7zjov1.36, P24; P24v tj-7zjov1.241). Over the empty fake table every read of one panel or
+    # dataset is the handler's 404 NOT_FOUND; the list and a source's versions are empty pages. W1 writes (the fake
+    # session answers the inserts, see InsertedPanelRow) and then re-reads its detail, which the empty table does not
+    # hold: the handler's 404 after the write, as the PATCH above. W3 writes and answers 201. Their real rows are
+    # test_panel_ui_reads.py's and test_ui_panel_writes_route.py's, over SQLite, and tests/system/test_panel_routes_pg.py's.
+    'GET /ui/v1/panels': Case(
+        path_params={},
+        request={},
+        malformed_path_params={},
+        malformed_request={'params': {'limit': 5}},  # R1 takes no parameter: a stray one is refused by name
+        malformed_field='limit',
+    ),
+    'GET /ui/v1/panels/{panel_id}': Case(
+        path_params={'panel_id': str(DELETE_ID)},
+        request={},
+        malformed_path_params={'panel_id': 'not-a-uuid'},
+        malformed_request={},
+        malformed_field='panel_id',
+        reads_one_row=True,
+    ),
+    'GET /ui/v1/panels/{panel_id}/settings-versions': Case(
+        path_params={'panel_id': str(DELETE_ID)},
+        request={},
+        malformed_path_params={'panel_id': str(DELETE_ID)},
+        malformed_request={'params': {'limit': 0}},
+        malformed_field='limit',
+        reads_one_row=True,
+    ),
+    'GET /ui/v1/panel-sources/{source}/settings-versions': Case(
+        path_params={'source': 'DATA_SOURCE_ALPACA_API'},
+        request={},
+        malformed_path_params={'source': 'not-a-source'},
+        malformed_request={},
+        malformed_field='source',
+    ),
+    'GET /ui/v1/panels/{panel_id}/boundaries': Case(
+        path_params={'panel_id': str(DELETE_ID)},
+        request={'params': {'start': '2026-01-02T00:00:00Z', 'end': '2026-01-03T00:00:00Z'}},
+        malformed_path_params={'panel_id': str(DELETE_ID)},
+        malformed_request={'params': {'start': '2026-01-02T00:00:00', 'end': '2026-01-03T00:00:00Z'}},
+        malformed_field='start',
+        reads_one_row=True,
+    ),
+    'GET /ui/v1/panels/{panel_id}/members': Case(
+        path_params={'panel_id': str(DELETE_ID)},
+        request={},
+        malformed_path_params={'panel_id': str(DELETE_ID)},
+        malformed_request={'params': {'limit': 501}},
+        malformed_field='limit',
+        reads_one_row=True,
+    ),
+    'GET /ui/v1/panels/{panel_id}/asset-list-history': Case(
+        path_params={'panel_id': str(DELETE_ID)},
+        request={'params': {'start': '2026-01-02T00:00:00Z', 'end': '2026-01-03T00:00:00Z'}},
+        malformed_path_params={'panel_id': str(DELETE_ID)},
+        malformed_request={'params': {'start': '2026-01-02T00:00:00Z', 'end': '2026-01-03T00:00:00'}},
+        malformed_field='end',
+        reads_one_row=True,
+    ),
+    'GET /ui/v1/datasets/{dataset_id}/corporate-actions': Case(
+        path_params={'dataset_id': str(DELETE_ID)},
+        request={},
+        malformed_path_params={'dataset_id': str(DELETE_ID)},
+        malformed_request={'params': {'limit': 0}},
+        malformed_field='limit',
+        reads_one_row=True,
+    ),
+    'POST /ui/v1/panels': Case(
+        path_params={},
+        request={
+            'json': {
+                'name': 'smoke',
+                'source': 'DATA_SOURCE_ALPACA_API',
+                'enabled': False,
+                'size': 1,
+                'reason': 'smoke',
+                'rampDatasetsPerHour': 1,
+                'requestCapPerHour': 2,
+            }
+        },
+        malformed_path_params={},
+        malformed_request={'json': {'name': 'smoke', 'source': 'not-a-source'}},
+        malformed_field='',
+        reads_one_row=True,
+        body_only=True,
+    ),
+    'POST /ui/v1/panels/{panel_id}/settings-versions': Case(
+        path_params={'panel_id': str(DELETE_ID)},
+        request={'json': {'enabled': True, 'cadence': 'PANEL_CADENCE_DAILY', 'size': 1, 'reason': 'smoke'}},
+        malformed_path_params={'panel_id': 'not-a-uuid'},
+        malformed_request={'json': {'enabled': True, 'cadence': 'PANEL_CADENCE_DAILY', 'size': 1, 'reason': 'smoke'}},
+        malformed_field='panel_id',
+        reads_one_row=True,
+    ),
+    'POST /ui/v1/panel-sources/{source}/settings-versions': Case(
+        path_params={'source': 'DATA_SOURCE_ALPACA_API'},
+        request={
+            'json': {
+                'rampDatasetsPerHour': 1,
+                'requestCapPerHour': 2,
+                'corporateActionWindowPreDays': 3,
+                'corporateActionWindowPostDays': 4,
+                'reason': 'smoke',
+            }
+        },
+        malformed_path_params={'source': 'not-a-source'},
+        malformed_request={'json': {'rampDatasetsPerHour': 1, 'reason': 'smoke'}},
+        malformed_field='source',
+    ),
 }
 
 
@@ -535,6 +652,42 @@ class InsertedRequest:
         return self._row
 
 
+PANEL_TABLES = frozenset({Panel.__table__, PanelSettingsVersion.__table__, PanelSourceSettingsVersion.__table__})
+
+
+class InsertedPanelRow:
+    """The RETURNING row of a panel, settings or source settings insert (tj-7zjov1.36): the values plus the defaults.
+
+    The panel writes INSERT ... RETURNING every column and map the row to a record, so the fake answers with the values
+    the statement bound and the columns the database fills (id, created_at, saved_at), as InsertedRequest does.
+    """
+
+    def __init__(self, statement: Any) -> None:
+        values = {column.name: None for column in statement.table.c}
+        values.update(statement.compile().params)
+        now = datetime.now(UTC)
+        values['id'] = values['id'] or uuid.uuid4()
+        for column in ('created_at', 'saved_at'):
+            if column in values and values[column] is None:
+                values[column] = now
+        self._row = SimpleNamespace(**values)
+
+    def one(self) -> SimpleNamespace:
+        return self._row
+
+
+class VersionMax:
+    """The numbering read of a version write (COALESCE(MAX(version_no), 0)) over the empty table: 0."""
+
+    def scalar_one(self) -> int:
+        return 0
+
+
+def _is_version_max(statement: Any) -> bool:
+    columns = list(statement.selected_columns)
+    return len(columns) == 1 and 'version_no' in str(columns[0]) and 'max' in str(columns[0]).lower()
+
+
 class FakeSession:
     """Stands in for AsyncSession, matching its sync/async split exactly.
 
@@ -550,9 +703,13 @@ class FakeSession:
         # architect gate reviewing this file, not by a failure.
         self._added: list[int] = []
 
-    async def execute(self, statement: Any) -> 'FakeResult | InsertedRequest':
+    async def execute(self, statement: Any) -> 'FakeResult | InsertedRequest | InsertedPanelRow | VersionMax':
         if getattr(statement, 'is_insert', False) and getattr(statement, 'table', None) is IngestRequest.__table__:
             return InsertedRequest(statement)
+        if getattr(statement, 'is_insert', False) and getattr(statement, 'table', None) in PANEL_TABLES:
+            return InsertedPanelRow(statement)
+        if getattr(statement, 'is_select', False) and _is_version_max(statement):
+            return VersionMax()
         return FakeResult()
 
     async def commit(self) -> None:
@@ -963,6 +1120,11 @@ def test_a_malformed_request_is_rejected_with_422(address: str, client: TestClie
     # assertion to "401 or 422" instead would have made it pin neither.
     response = client.request(method, url, headers=secret_headers(address), **case.malformed_request)
 
+    if case.body_only:
+        # ProtoBody's refusal names the message type, never a field, and never the body (D8).
+        body = problem(response, status=422, reason='INVALID_REQUEST')
+        assert 'not valid protobuf JSON for trader_joe.proto.ui.v1.' in body['detail'], body
+        return
     # problem+json since TE-6 (tj-3mk3u5.37.8): the per-field list is `errors`, not `detail`.
     complained_about = [error['loc'][-1] for error in validation_errors(response)]
     assert case.malformed_field in complained_about, (

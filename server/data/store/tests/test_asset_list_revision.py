@@ -335,7 +335,13 @@ def test_no_production_module_writes_the_asset_list_tables_other_than_by_the_rep
         assert not raw.search(text), f'{path} updates or deletes an asset-list table in raw SQL'
         if re.search(r'store\.app\.database\.models(\.asset_list\b| import .*\basset_list\b)', text):
             importing_the_model.add(path.relative_to(SERVER_ROOT).as_posix())
-    assert importing_the_model == {'data/store/app/database/crud/asset_list.py', 'data/store/app/world_snapshot.py'}
+    assert importing_the_model == {
+        'data/store/app/database/crud/asset_list.py',
+        'data/store/app/world_snapshot.py',
+        # P24 tj-7zjov1.36 (c716268), judged by P24v tj-7zjov1.241: the panel UI reads. It only select()s
+        # asset_list_snapshot and asset_list_event (member days, the history); pinned by test_panel_ui_reads.py.
+        'data/store/app/database/crud/panel_reads.py',
+    }
 
 
 # --------------------------------------------------------------------------------------------- alembic's own offline SQL

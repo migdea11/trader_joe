@@ -596,6 +596,16 @@ PANEL_MODEL_IMPORTERS = frozenset(
         # panel_pass and panel_member_transition; its one write, stop_collecting, is an UPDATE of store_dataset_entry,
         # not a panel table (the guarded-update pin below still finds finish_pass alone). P22v pins its statements.
         'data/store/app/database/crud/panel_manager_reads.py',
+        # P24 tj-7zjov1.36 (c716268), judged by P24v tj-7zjov1.241: the /ui/v1 reads. Every statement is a select()
+        # (no insert, update, delete, text() or commit anywhere in the module); pinned SELECT-only by
+        # test_panel_ui_reads.py, which also counts its statements per request.
+        'data/store/app/database/crud/panel_reads.py',
+        # P24 (c716268): composition only. It imports PanelTransition (an enum) and calls panel_reads and the ledger's
+        # own reads (latest_state, boundary_read); it builds no statement and never commits.
+        'data/store/app/panel_views.py',
+        # P24 (c7388f4): record-to-message mapping. It imports the enums PanelCadence, PanelPassKind and PanelTransition
+        # for the proto mirrors and touches no session; the routes write only through crud/panel_settings.py.
+        'routers/data_store/ui_mapping.py',
     }
 )
 

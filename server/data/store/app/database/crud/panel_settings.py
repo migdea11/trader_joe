@@ -297,9 +297,10 @@ async def create_panel(
     """Create a panel and its settings version 1 in one transaction.
 
     The cadence is DEFAULT_PANEL_CADENCE when settings names none. The panel's source must have a source settings
-    version: either one already exists, or source_settings is passed and is written (as that source's next version,
+    version: either one already exists, or source_settings is passed and is written (as that source's first version,
     with the same actor and reason) in the same transaction, before version 1. source_settings is accepted only for a
-    source with no version yet, judged under the source lock (so a concurrent create is refused): a source's rates
+    source with no version yet and is refused (422) for one that already has a version, judged under the source lock
+    (so a concurrent create is refused): a source's rates
     change for every panel on it, so they change only through append_source_settings_version, with its own actor and
     reason.
 
