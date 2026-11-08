@@ -107,7 +107,8 @@ from tests.system.test_delivery_intake_pg import (
 )
 
 
-pytestmark = [pytest.mark.data_store, pytest.mark.asyncio]
+# A first sighting supersedes the stack's live ingest too; the fixture makes it live again (tj-7zjov1.233).
+pytestmark = [pytest.mark.data_store, pytest.mark.asyncio, pytest.mark.usefixtures('live_instances_kept')]
 
 # The cleanup fixture of the sibling file, reused: it deletes exactly the requests, their attempt rows and the
 # instances one test wrote.

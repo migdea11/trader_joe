@@ -75,6 +75,8 @@ from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity
 from common.errors.vocabulary import Reason
 from data.store.app.database.crud.stock.asset_market_activity import POSTGRES_MAX_BIND_PARAMETERS
+from data.store.app.database.models.ingest_request import IngestRequest, IngestRequestKind, IngestRequestState
+from data.store.app.database.models.ingest_run import IngestRun, IngestRunState, IngestRunTrigger
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from routers.data_store.app_endpoints import AssetDataInterface, AssetDatasetStoreInterface, UiDatasetsInterface
@@ -104,6 +106,8 @@ READ_PATH = AssetDataInterface.GET_ASSET_DATA.format(
     asset_type=AssetType.STOCK.value, data_type=DataType.MARKET_ACTIVITY.value
 )
 ENTRY_TABLE = StoreDatasetEntry.__table__
+REQUEST_TABLE = IngestRequest.__table__
+RUN_TABLE = IngestRun.__table__
 
 # What a stored bar is compared on: (timestamp, open, high, low, close, volume, trade_count).
 BarTuple = tuple[datetime, float, float, float, float, int, int]
@@ -418,38 +422,112 @@ def test_slow_scenario_is_served_rather_than_abandoned(
     assert stored == expected, _diff(stored, expected)
 
 
-def test_failonce_scenario_fails_then_the_identical_post_creates_the_entry_and_fills_it(
-    own_symbol: str, run_identity, data_store, scenario_entries: Callable[[str], list[UUID]]
+def _bars_requests(pg_engine: Engine, symbol: str) -> list[sa.Row]:
+    """The BARS ingest_request rows for the symbol, oldest first. The POST's name_change clamp query is not one."""
+    with pg_engine.connect() as connection:
+        return list(
+            connection.execute(
+                sa.select(REQUEST_TABLE.c.id, REQUEST_TABLE.c.state, REQUEST_TABLE.c.dataset_id)
+                .where(REQUEST_TABLE.c.asset_symbol == symbol, REQUEST_TABLE.c.kind == IngestRequestKind.BARS)
+                .order_by(REQUEST_TABLE.c.created_at, REQUEST_TABLE.c.id)
+            )
+        )
+
+
+def _attempt_rows(pg_engine: Engine, request_id: UUID) -> list[sa.Row]:
+    """The attempt rows (ingest_run) of one request, by attempt number."""
+    with pg_engine.connect() as connection:
+        return list(
+            connection.execute(
+                sa.select(
+                    RUN_TABLE.c.attempt_no,
+                    RUN_TABLE.c.state,
+                    RUN_TABLE.c.trigger,
+                    RUN_TABLE.c.dataset_id,
+                    RUN_TABLE.c.bars_written,
+                    RUN_TABLE.c.error_message,
+                    RUN_TABLE.c.served_start,
+                    RUN_TABLE.c.served_end,
+                )
+                .where(RUN_TABLE.c.request_id == request_id)
+                .order_by(RUN_TABLE.c.attempt_no)
+            )
+        )
+
+
+def test_failonce_scenario_is_retried_inside_the_post_and_fills_one_entry(
+    own_symbol: str, run_identity, data_store, scenario_entries: Callable[[str], list[UUID]], pg_engine: Engine
 ) -> None:
-    """A failed POST leaves nothing; the identical retry then creates the entry and fills it.
+    """A transient vendor failure is retried INSIDE the one POST: a 200, one entry, every bar once.
 
-    RE-PINNED TO THE RULED ORDER (tj-xhcoyc, item 2). The old version asserted the failed POST
-    left one entry and the retry resolved to THAT id -- true before tj-3mk3u5.10, when the entry
-    was written before the fetch. Under the ruled order the first POST rolls back entirely, so the
-    retry CREATES the entry rather than filling one.
+    THE OLD SHAPE IS GONE. This test was "the first POST fails, the identical retry creates the
+    entry and fills it" (tj-xhcoyc, item 2), true while a POST was one fetch. Since the push path
+    (P35, tj-7zjov1.28; server/data/store/CLAUDE.md "Delivery intake") the retry moved inside the
+    request: ingest reports attempt 1 FAILED, the intake answers CONTINUE on a non-final failure,
+    ingest runs attempt 2, which is delivered and answered FINAL, and the POST's await_verdict --
+    polling the REQUEST ROW until it is not open -- answers 200 from the request's state and its
+    finishing attempt row. FakeRead's FAILONCE_ fails only the first call per (symbol,
+    granularity, start, end) on its instance (tests/fakes/market_data.py), so the second attempt
+    is served. A second POST is not made here: the exact repeat is
+    test_identity_repeat_resolves_and_policy_or_owner_change_makes_a_new_entry's claim.
 
-    THE RETRY CLAIM IS STRONGER AFTER THE CHANGE, NOT WEAKER, which is why this is a re-pin and
-    not a deletion. The old assertion could be satisfied by a store that never cleaned up after a
-    failure; this one requires that a failure leaves the database exactly as it was AND that the
-    identical request then succeeds in full -- one entry, every bar. That is the real idempotency
-    claim a retried POST rests on, and FAILONCE is the only scenario that can make it.
+    THE IDEMPOTENCY CLAIM THE OLD SHAPE CARRIED IS NOW THE ENTRY AND THE ATTEMPT ROWS, and tj-
+    xhcoyc item 2's order still holds: nothing is written for a failed attempt but its own attempt
+    row. So attempt 1 has no dataset id and wrote 0 bars -- no entry and no bar existed before the
+    delivered attempt -- and the one entry holds exactly the generator's bars, none duplicated by
+    the retry and none lost. The bars arm writes the entry on the FIRST DELIVERED attempt, which is
+    why attempt 2, not attempt 1, carries the dataset id.
+
+    NOT ASSERTED, ON PURPOSE: error_domain and error_reason on the FAILED attempt row, either way.
+    Whether a failed attempt row carries the typed (domain, reason) is an open owner question
+    (tj-7zjov1.236); pinning NULL would pin the as-built against an unruled design.
+
+    The regression this catches: an intake answering FINAL on a transient FAILED attempt. The
+    request would finish FAILED after attempt 1 and the POST would answer 503.
     """
     symbol = f'{FAILONCE_PREFIX}{own_symbol}'
-    body = _body(run_identity.owner)
     expected = _expected(symbol)
+    assert expected, 'the range holds no bar; the test proves nothing'
 
-    first, first_ids = _post(data_store, scenario_entries, symbol, body)
+    response, ids = _post(data_store, scenario_entries, symbol, _body(run_identity.owner))
 
-    assert not _is_2xx(first), data_store.describe(first)
-    assert first_ids == [], f'the failed first POST left {len(first_ids)} entry/entries for {symbol}: {first_ids}'
+    # (1) One POST, answered from the delivered attempt.
+    assert response.status_code == 200, data_store.describe(response)
+    assert response.json()['data_points'] == len(expected), data_store.describe(response)
 
-    second, second_ids = _post(data_store, scenario_entries, symbol, body)
-
-    assert second.status_code == 200, data_store.describe(second)
-    assert len(second_ids) == 1, f'the retry left {len(second_ids)} entries for {symbol}, not one: {second_ids}'
-    assert second.json()['data_points'] == len(expected), data_store.describe(second)
-    stored = _stored(data_store, second_ids[0])
+    # (2) Exactly one entry, holding exactly the generator's bars.
+    assert len(ids) == 1, f'the retried request left {len(ids)} entries for {symbol}, not one: {ids}'
+    entry_id = ids[0]
+    stored = _stored(data_store, entry_id)
     assert stored == expected, _diff(stored, expected)
+
+    # (3) Exactly one BARS request, finished SUCCEEDED and naming the entry.
+    requests = _bars_requests(pg_engine, symbol)
+    assert len(requests) == 1, f'expected one BARS request for {symbol}, found {len(requests)}'
+    request = requests[0]
+    assert request.state == IngestRequestState.SUCCEEDED, f'the request finished {request.state}'
+    assert request.dataset_id == entry_id, f'the request names dataset {request.dataset_id}, not {entry_id}'
+
+    # (4) Exactly two attempt rows: the failure that wrote nothing, then the retry that wrote everything.
+    attempts = _attempt_rows(pg_engine, request.id)
+    assert [row.attempt_no for row in attempts] == [1, 2], (
+        f'attempt numbers {[row.attempt_no for row in attempts]}, not [1, 2]'
+    )
+    failed, served = attempts
+
+    assert failed.state == IngestRunState.FAILED, f'attempt 1 is {failed.state}'
+    assert failed.trigger == IngestRunTrigger.REQUEST, f'attempt 1 has trigger {failed.trigger}'
+    assert failed.dataset_id is None, f'the failed attempt names dataset {failed.dataset_id}: an entry before delivery'
+    assert failed.bars_written == 0, f'the failed attempt wrote {failed.bars_written} bars'
+    assert failed.error_message, 'the failed attempt row carries no error message'
+
+    assert served.state == IngestRunState.SUCCEEDED, f'attempt 2 is {served.state}'
+    assert served.trigger == IngestRunTrigger.RETRY, f'attempt 2 has trigger {served.trigger}'
+    assert served.dataset_id == entry_id, f'attempt 2 names dataset {served.dataset_id}, not {entry_id}'
+    assert served.bars_written == len(expected), f'attempt 2 wrote {served.bars_written} bars, not {len(expected)}'
+    assert served.served_start is not None and served.served_end is not None, (
+        f'attempt 2 has served range [{served.served_start}, {served.served_end})'
+    )
 
 
 # ---------------------------------------------------------------------------------------------

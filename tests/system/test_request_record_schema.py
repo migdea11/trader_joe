@@ -46,7 +46,8 @@ from data.store.app.database.models.ingest_run import IngestRun, IngestRunState,
 from schemas.data_ingest.submit import AssetListStatus
 
 
-pytestmark = pytest.mark.data_store
+# A first sighting supersedes the stack's live ingest too; the fixture makes it live again (tj-7zjov1.233).
+pytestmark = [pytest.mark.data_store, pytest.mark.usefixtures('live_instances_kept')]
 
 RUN = IngestRun.__table__
 REQUESTS = IngestRequest.__table__

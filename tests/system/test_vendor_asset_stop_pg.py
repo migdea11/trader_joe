@@ -55,7 +55,8 @@ from tests.system.test_delivery_intake_pg import (
 )
 
 
-pytestmark = [pytest.mark.data_store, pytest.mark.asyncio]
+# A first sighting supersedes the stack's live ingest too; the fixture makes it live again (tj-7zjov1.233).
+pytestmark = [pytest.mark.data_store, pytest.mark.asyncio, pytest.mark.usefixtures('live_instances_kept')]
 
 # The sibling file's fixtures, reused by name.
 created = pg.created

@@ -78,7 +78,8 @@ from schemas.data_ingest.submit import CorporateActionsRequest, RequestKind, Sub
 from tests.fakes.market_data import WORLD_DAYS, WORLD_LINEAGES, FakeRead, FakeWorld, world_action
 
 
-pytestmark = [pytest.mark.data_store, pytest.mark.asyncio]
+# A first sighting supersedes the stack's live ingest too; the fixture makes it live again (tj-7zjov1.233).
+pytestmark = [pytest.mark.data_store, pytest.mark.asyncio, pytest.mark.usefixtures('live_instances_kept')]
 
 RUNS = IngestRun.__table__
 REQUESTS = IngestRequest.__table__

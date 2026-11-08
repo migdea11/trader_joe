@@ -68,7 +68,8 @@ from schemas.data_ingest.fetch_dataset import Bar, BarPage, ServedRange
 from schemas.data_ingest.submit import InstanceResponse, SubmitAccepted, SubmitAck, SubmitRequest, SubmitResponse
 
 
-pytestmark = [pytest.mark.data_store, pytest.mark.asyncio]
+# A first sighting supersedes the stack's live ingest too; the fixture makes it live again (tj-7zjov1.233).
+pytestmark = [pytest.mark.data_store, pytest.mark.asyncio, pytest.mark.usefixtures('live_instances_kept')]
 
 RUNS = IngestRun.__table__
 REQUESTS = IngestRequest.__table__

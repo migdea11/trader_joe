@@ -63,6 +63,7 @@ from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from routers.common.app_endpoints import InterfaceRest
 from routers.common.instance_secret import INSTANCE_SECRET_HEADER
 from tests.fakes.market_data import SCENARIO_PREFIXES
+from tests.system.live_instances import note_live_instances, restore_live_instances
 
 
 # ---------------------------------------------------------------------------------------------
@@ -405,6 +406,27 @@ def pg_conn(pg_engine: Engine) -> Iterator[Connection]:
     """A read connection for catalogue queries and read-backs."""
     with pg_engine.connect() as conn:
         yield conn
+
+
+@pytest.fixture
+def live_instances_kept(pg_engine: Engine, run_identity: RunIdentity) -> Iterator[None]:
+    """The running ingest instance is live again after a test that sights a minted instance id (tj-7zjov1.233).
+
+    A first sighting supersedes every other instance, the stack's real ingest included, and nothing restores it, so a
+    later POST in the session would run against a superseded instance (tests/system/live_instances.py says how). Every
+    module that can sight an instance applies this to all its tests through
+    `pytestmark = [..., pytest.mark.usefixtures('live_instances_kept')]`; server/data/store/tests/
+    test_system_live_instances.py fails when one does not. A usefixtures fixture is set up before the test's own
+    fixtures, so it is torn down after their cleanups, once the minted ids are deleted; the restore does not rely on
+    that order (a minted id carries the run id, and the restore never reads one as a real ingest).
+    """
+    with pg_engine.connect() as conn:
+        before = note_live_instances(conn)
+    try:
+        yield
+    finally:
+        with pg_engine.begin() as conn:
+            restore_live_instances(conn, before, minted_marker=run_identity.run_id)
 
 
 @pytest_asyncio.fixture
