@@ -33,12 +33,13 @@ import subprocess
 import sys
 import tomllib
 from collections.abc import Iterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta, timezone
 from importlib.metadata import packages_distributions
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import pytest
@@ -47,10 +48,13 @@ from fastapi import FastAPI
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from common.errors.vocabulary import REASONS, ExogenousError, InvalidRequestError, Outcome, Reason, TraderJoeError
+from common.rpc.channel import create_channel
+from common.rpc.clients.ingest_submit import GrpcIngestSubmitClient
 from common.tests.image_path import image_pythonpath
 from common.tests.roots import REPO_ROOT, SERVER_ROOT, repo_relative
 from data.ingest.app import app_depends, grpc_host
 from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
+from data.ingest.app.brokers.alpaca.handle import ALPACA_DATA_SCOPE, ALPACA_TRADING_SCOPE, AlpacaHandle
 from data.ingest.app.brokers.interface import (
     Bar,
     BarsFailure,
@@ -62,8 +66,16 @@ from data.ingest.app.brokers.interface import (
     ServedRange,
 )
 from data.ingest.app.brokers.rate_budget import RequestPriority
-from data.ingest.tests.grpc_bind import LoopbackGrpc
+from data.ingest.tests.grpc_bind import LOOPBACK, LoopbackGrpc
+from schemas.data_ingest.delivery import AttemptDelivery, DeliverAttemptResponse, DeliveryOutcome, DeliveryVerdict
 from schemas.data_ingest.get_dataset_request import StockDatasetRequest
+from schemas.data_ingest.submit import (
+    AssetListRequest,
+    AssetListStatus,
+    BarsRequest,
+    CorporateActionsRequest,
+    SubmitRequest,
+)
 from tests.fakes.market_data import (
     DEFAULT_SLOW_DELAY_SECONDS,
     EMPTY_PREFIX,
@@ -799,6 +811,8 @@ import tests.fakes.ingest_launcher as launcher
 
 print('app-type=' + type(launcher.app).__name__)
 print('reader-type=' + type(launcher.reader).__name__)
+print('handle-type=' + type(launcher.handle).__name__)
+print('reader-is-handle-reader=' + repr(launcher.reader is launcher.handle.reader))
 print('slow-delay=' + repr(launcher.reader.slow_delay_seconds))
 print('test-modules=' + ','.join(sorted(n for n in sys.modules if n.split('.')[0] in {'pytest', '_pytest', 'mock'} or n == 'unittest.mock')))
 """
@@ -837,6 +851,9 @@ def test_the_launcher_imports_in_a_fresh_interpreter_as_a_fastapi_app_around_a_f
     assert launcher_probe.returncode == 0, launcher_probe.stderr
     assert 'app-type=FastAPI' in launcher_probe.stdout
     assert 'reader-type=FakeRead' in launcher_probe.stdout
+    # P53v (tj-7zjov1.159): the production AlpacaHandle, its reader the FakeRead its factory built.
+    assert 'handle-type=AlpacaHandle' in launcher_probe.stdout
+    assert 'reader-is-handle-reader=True' in launcher_probe.stdout
     assert f'slow-delay={DEFAULT_SLOW_DELAY_SECONDS!r}' in launcher_probe.stdout
 
 
@@ -890,24 +907,141 @@ async def test_the_launcher_apps_lifespan_serves_alpaca_through_its_fake_read(mo
     them back proves the fake twice and the wiring once.
     """
     handed: list[dict[DataSource, Any]] = []
+    submits: list[Any] = []
     real_registered_services = grpc_host.registered_services
 
-    def recording_registration(readers):
+    def recording_registration(readers, **kwargs):
         handed.append(dict(readers))
-        return real_registered_services(readers)
+        submits.append(kwargs.get('submit'))
+        return real_registered_services(readers, **kwargs)
 
-    monkeypatch.setattr(app_depends, 'initialize_latency_server', Mock())
-    monkeypatch.setattr(app_depends, 'init_debugger', Mock())
     monkeypatch.setattr(grpc_host, 'registered_services', recording_registration)
-    launcher = importlib.import_module(LAUNCHER_MODULE)
+    launcher = importlib.reload(importlib.import_module(LAUNCHER_MODULE))
     assert isinstance(launcher.app, FastAPI)
 
-    async with LoopbackGrpc(), launcher.app.router.lifespan_context(launcher.app):
+    async with running_launcher(monkeypatch, launcher, LauncherStore()):
         pass
 
     assert [set(readers) for readers in handed] == [{DataSource.ALPACA_API}]
     assert handed[0][DataSource.ALPACA_API] is launcher.reader
     assert isinstance(launcher.reader, FakeRead), 'fake mode wired something other than its fake reader'
+    # P53v (tj-7zjov1.159): fake mode registers Submit, served by the launcher's handle around that same FakeRead.
+    assert submits[0] is not None, 'the launcher passed no handles, so fake mode serves no Submit'
+    assert isinstance(launcher.handle, AlpacaHandle)
+    assert launcher.handle.reader is launcher.reader
+
+
+class LauncherStore:
+    """The store as the launcher's lifespan sees it: the announcement acknowledged, every delivery answered FINAL."""
+
+    def __init__(self) -> None:
+        self.received: list[AttemptDelivery] = []
+
+    async def register_instance(self, request):
+        return None
+
+    async def deliver(self, attempt: AttemptDelivery) -> DeliverAttemptResponse:
+        self.received.append(attempt)
+        return DeliverAttemptResponse(verdict=DeliveryVerdict.FINAL, attempt_count=attempt.header.attempt_no)
+
+    async def report_for(self, request_id: str) -> AttemptDelivery:
+        """The first report of the given request, waiting for it within the guard."""
+
+        async def wait() -> AttemptDelivery:
+            while True:
+                for attempt in self.received:
+                    if attempt.header.request_id == request_id:
+                        return attempt
+                await asyncio.sleep(0.01)
+
+        return await asyncio.wait_for(wait(), LAUNCHER_GUARD_S)
+
+
+LAUNCHER_GUARD_S = 5.0
+
+
+@asynccontextmanager
+async def running_launcher(monkeypatch, launcher, store: LauncherStore):
+    """Run the launcher's own app through its lifespan on a loopback gRPC port, its store edge a double.
+
+    Only what cannot run here is stubbed: the latency server, the debugger and the store's channel and client. The
+    lifespan, create_app, the gRPC host, the Submit servicer and the launcher's handle are the real ones.
+
+    Yields:
+        int: The loopback port the app's gRPC host serves on.
+    """
+    channel = Mock(close=AsyncMock())
+    monkeypatch.setattr(app_depends, 'initialize_latency_server', Mock())
+    monkeypatch.setattr(app_depends, 'init_debugger', Mock())
+    monkeypatch.setattr(app_depends, 'target_from_env', lambda _name: 'store-double:1')
+    monkeypatch.setattr(app_depends, 'create_channel', lambda _target: channel)
+    monkeypatch.setattr(app_depends, 'GrpcStoreDeliveryClient', lambda _channel: store)
+    async with LoopbackGrpc() as grpc_bind:
+        async with asyncio.timeout(LAUNCHER_GUARD_S):
+            async with launcher.app.router.lifespan_context(launcher.app):
+                yield grpc_bind.port
+
+
+@pytest.mark.asyncio
+async def test_the_launchers_app_accepts_and_serves_a_submit_of_each_kind_through_its_fake_read(monkeypatch):
+    """P53v (tj-7zjov1.159): the fake-mode stack serves Submit for bars, asset list and corporate actions.
+
+    Each request is accepted with its kind's quota scope and tape, and is then attempted by the launcher's handle while
+    the app runs: the report reaches the store SUCCEEDED and the FakeRead's call log holds its "vendor" call. A launcher
+    that composed a real AlpacaRead would fail every attempt here, with no vendor client configured.
+
+    Bars go through gRPC, the app's own Submit servicer. The asset list and corporate actions go to the launcher's
+    handle directly, the one the app's servicer routes to: the servicer refuses both kinds as INVALID_REQUEST until
+    P12s and P13s (tj-7zjov1.125, tj-7zjov1.124) open them, and once they do these two belong on the wire too.
+    """
+    launcher = importlib.reload(importlib.import_module(LAUNCHER_MODULE))
+    store = LauncherStore()
+    bars = BarsRequest(
+        source=DataSource.ALPACA_API,
+        asset_symbol='VFV',
+        asset_type=AssetType.STOCK,
+        data_types=[DataType.MARKET_ACTIVITY],
+        granularity=Granularity.ONE_HOUR,
+        start=ON_GRID,
+        end=ON_GRID + 3 * HOUR,
+        update_type=UpdateType.STATIC,
+    )
+    listing = AssetListRequest(
+        source=DataSource.ALPACA_API, asset_type=AssetType.STOCK, status=AssetListStatus.INACTIVE
+    )
+    actions = CorporateActionsRequest(
+        source=DataSource.ALPACA_API, asset_symbol='VFV', start=ON_GRID - 30 * 24 * HOUR, end=ON_GRID
+    )
+    # request id, body, the quota key and tape the ack must name, the "vendor" call the attempt must make.
+    each_kind = (
+        ('launcher-bars', {'bars': bars}, ALPACA_DATA_SCOPE, launcher.handle.feed, ('bars', 'VFV')),
+        ('launcher-assets', {'asset_list': listing}, ALPACA_TRADING_SCOPE, None, ('assets', 'inactive')),
+        ('launcher-actions', {'corporate_actions': actions}, ALPACA_DATA_SCOPE, None, ('corporate_actions', 'VFV')),
+    )
+    requests = {
+        request_id: SubmitRequest(request_id=request_id, owner='o', **body) for request_id, body, *_ in each_kind
+    }
+
+    async with running_launcher(monkeypatch, launcher, store) as port:
+        channel = create_channel(f'{LOOPBACK}:{port}')
+        try:
+            on_the_wire = await GrpcIngestSubmitClient(channel).submit(requests['launcher-bars'])
+        finally:
+            await channel.close()
+        acks = {
+            'launcher-bars': on_the_wire.ack,
+            'launcher-assets': await launcher.handle.submit(requests['launcher-assets']),
+            'launcher-actions': await launcher.handle.submit(requests['launcher-actions']),
+        }
+        reports = {request_id: await store.report_for(request_id) for request_id, *_ in each_kind}
+
+    for request_id, _body, quota_key, feed, call in each_kind:
+        ack = acks[request_id]
+        assert ack.accepted is not None, f'{request_id} was not accepted through the launcher: {ack!r}'
+        assert ack.accepted.quota_key == quota_key
+        assert ack.accepted.feed == feed
+        assert reports[request_id].trailer.outcome is DeliveryOutcome.SUCCEEDED, reports[request_id].trailer
+        assert call in launcher.reader.calls, f'{request_id} never reached the FakeRead: {launcher.reader.calls}'
 
 
 # ---------------------------------------------------------------------------------------------

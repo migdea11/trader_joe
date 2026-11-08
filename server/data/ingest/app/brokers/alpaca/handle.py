@@ -26,9 +26,10 @@ broker_api.get_client(); the provider is the seam the account mapping replaces.
 import math
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from typing import Protocol
 
 from common.enums.data_select import AssetType
-from common.enums.data_stock import DataSource
+from common.enums.data_stock import DataSource, Feed
 from common.environment import get_env_var
 from common.errors.vocabulary import InvalidRequestError, Reason
 from data.ingest.app.brokers.alpaca import broker_api
@@ -37,13 +38,14 @@ from data.ingest.app.brokers.alpaca.corporate_actions_attempt import CorporateAc
 from data.ingest.app.brokers.alpaca.read import AlpacaRead
 from data.ingest.app.brokers.bars_attempt import BarsAttemptRunner, BarsWork
 from data.ingest.app.brokers.handle import BrokerHandle, Intake
+from data.ingest.app.brokers.interface import BrokerRead
 from data.ingest.app.brokers.rate_budget import RequestPriority
 from data.ingest.app.scheduler.credentials import Credential, StaticCredentialProvider
 from data.ingest.app.scheduler.executor import AckGatedExecutor, AttemptResult, AttemptRunner, ExecutorSettings
 from data.ingest.app.scheduler.limits import Limit
 from data.ingest.app.scheduler.queue import ScheduledRequest
 from data.ingest.app.scheduler.retry import RetryPolicy
-from data.ingest.app.scheduler.scheduler import SchedulerBuilder
+from data.ingest.app.scheduler.scheduler import Scheduler, SchedulerBuilder
 from schemas.data_ingest.submit import RequestKind, SubmitRequest
 
 
@@ -64,6 +66,24 @@ ALPACA_BARS_PAGE_SIZE = broker_api.BARS_PAGE_SIZE
 DEFAULT_OUTGOING_BUFFER_SIZE = 64
 DEFAULT_STALL_TIMEOUT_S = 300.0
 DEFAULT_MAX_ATTEMPTS = 5
+
+
+class ReaderFactory(Protocol):
+    """Builds the handle's reader from what the handle has resolved at build."""
+
+    def __call__(self, *, scheduler: Scheduler, scope: str, trading_scope: str, feed: Feed) -> BrokerRead:
+        """Build the reader.
+
+        Args:
+            scheduler (Scheduler): The handle's scheduler.
+            scope (str): The data scope (ALPACA_DATA_SCOPE).
+            trading_scope (str): The trading scope (ALPACA_TRADING_SCOPE).
+            feed (Feed): The feed the handle resolved, once, at build.
+
+        Returns:
+            BrokerRead: The reader every runner and the handle use.
+        """
+        ...
 
 
 class _EnvCredentials:
@@ -165,7 +185,13 @@ class _KindRunner:
 class AlpacaHandle(BrokerHandle):
     """The handle for DataSource.ALPACA_API: its scheduler, its reader and its executor."""
 
-    def __init__(self, settings: ExecutorSettings | None = None, calls_per_minute: int | None = None) -> None:
+    def __init__(
+        self,
+        settings: ExecutorSettings | None = None,
+        calls_per_minute: int | None = None,
+        *,
+        reader_factory: ReaderFactory | None = None,
+    ) -> None:
         """Build the handle. Nothing runs and nothing reads a credential until start().
 
         Two quota scopes: the market-data API's and the trading API's, which serves the asset reads. Both take the
@@ -174,6 +200,9 @@ class AlpacaHandle(BrokerHandle):
         Args:
             settings (ExecutorSettings | None): The executor's settings, or those the environment sets.
             calls_per_minute (int | None): The per-minute limit, or ALPACA_RATE_LIMIT_PER_MINUTE, or the ceiling.
+            reader_factory (ReaderFactory | None): Called once, with the scheduler, the data scope, the trading scope and
+                the resolved feed (all keywords), for the reader the runners and the handle use. Omitted, the handle
+                builds AlpacaRead with those same arguments.
 
         Raises:
             SchedulerConfigError: If the limit is above Alpaca's ceiling.
@@ -194,7 +223,10 @@ class AlpacaHandle(BrokerHandle):
         )
         # Read once, here: the account's setting, and the only read of it.
         feed = broker_api.resolve_feed()
-        reader = AlpacaRead(scheduler=scheduler, scope=ALPACA_DATA_SCOPE, trading_scope=ALPACA_TRADING_SCOPE, feed=feed)
+        build_reader = reader_factory if reader_factory is not None else AlpacaRead
+        reader = build_reader(
+            scheduler=scheduler, scope=ALPACA_DATA_SCOPE, trading_scope=ALPACA_TRADING_SCOPE, feed=feed
+        )
         executor = AckGatedExecutor(
             name=ALPACA_DATA_SCOPE,
             scheduler=scheduler,

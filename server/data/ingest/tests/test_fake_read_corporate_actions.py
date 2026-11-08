@@ -2,7 +2,8 @@
 
 FakeRead (tests/fakes/market_data.py) stands for BrokerRead in tests and the fake-mode stack. Its corporate-actions
 read serves NO action for any query and never fails: no prefix scenario applies, and the fake invents no action the
-store would judge as published. Fake corporate-action scenarios are P14's (tj-7zjov1.24).
+store would judge as published. Actions are served only by a fake built with a world (P14, tj-7zjov1.24), which
+test_fake_read_world.py covers.
 """
 
 from datetime import UTC, datetime, timedelta, timezone
