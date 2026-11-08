@@ -12,7 +12,7 @@ Python 3.12, FastAPI, SQLAlchemy 2.0 async, asyncpg, Alembic, Postgres, `grpc.ai
 
 ## Key invariants
 
-Sole owner of persisted market data. Every write goes through a repository; no raw SQL in routers. Migrations are additive, and nothing applies them on start: run `make migrate` after every deploy (it follows the running stack, dev, test or prod). The `collect` column (`e5c8b1d4f703`) is read by the catalog, the refresh and the writes, so a database one revision behind is not a state to run in.
+Sole owner of persisted market data. Every write goes through a repository; no raw SQL in routers. Migrations are additive and forward-only: `downgrade()` is not a recovery path (recovery is a restore; see Migration safety below), but every new revision still needs a working `downgrade()`, because the CI seed check downgrades each unmarked revision on a scratch database (checklist item 17), and nothing applies them on start: run `make migrate` after every deploy (it follows the running stack, dev, test or prod). The `collect` column (`e5c8b1d4f703`) is read by the catalog, the refresh and the writes, so a database one revision behind is not a state to run in.
 
 **data_store runs ONE process: one uvicorn worker.** Six things are correct only because of it:
 
@@ -30,6 +30,62 @@ Sole owner of persisted market data. Every write goes through a repository; no r
 - a lock or leader election for the DAILY refresh and for the reaper, so two workers do not both run them;
 - the reaper's change detection moved out of process memory;
 - the usage buffer and the per-dataset-per-day id cap made safe across workers.
+
+## Migration safety
+
+The procedure is in the root README (Database migrations); the facts a store agent needs:
+
+| Concern | Fact |
+|---|---|
+| Where the revisions live | In the data_store image (`/code/migrations`), not mounted from the checkout. An edited or new revision reaches a stack only after `make dev-build`, `make test-build` or `make prod-build`; `make migrate` against an older image runs that image's set and refuses an image with none. Both service source digests cover the revisions, so ingest's image goes stale too |
+| Pre-migrate dump | `run_migrations.sh` dumps before any schema-moving command (`upgrade`, `downgrade`, `stamp`): `pg_dump` custom format, `.partial` then read back with `pg_restore --list` then renamed, mode 600, into `MIGRATE_BACKUP_DIR` (default: the backups folder beside the database's data directory, that is the parent of the host directory bind-mounted at the running postgres's `/var/lib/postgresql/data` plus `/backups`, read with `docker inspect`, so it follows whatever `DATA_DIR` the stack was started with; if there is not exactly one bind mount there with an absolute source, or the inspect fails, and `MIGRATE_BACKUP_DIR` is unset, the migrate is refused before alembic, so a postgres on a named volume needs `MIGRATE_BACKUP_DIR`; the mount source is a path on the Docker daemon's host, so run `make migrate` on that host), on the database's host, path printed on the dump line, never pruned. A failed dump refuses the migrate; there is no override |
+| Production label | On the production definition a non-empty `DEPLOYMENT_LABEL` refuses the migrate. Dev and test are not asserted |
+| Restore and rehearse | `make migrate-restore DUMP=<file>` and `make migrate-rehearse DUMP=<file>` (`restore_dump.sh`, `rehearse_migration.sh`) set `SYSTEM_TEST_DISPOSABLE_DB=1` in the recipe and refuse unless the running postgres is the `trader_joe_dev` test stack (`make system-launch`). Rehearsal prints `REHEARSAL OK` only at `(head)` and with data_store not unhealthy; the health line is the container's last status, with no restart, and the revisions applied are the running test image's (the checkout's only after `make test-build`) |
+| Production recovery | A manual `pg_restore` of the pre-migrate dump; no script restores into production |
+| No backup target | There is no standalone backup make target; `make migrate` takes the dump. Scheduled backups are `tj-oxwlda`; CI's `make migrate` takes the dump too, the agent-stack migrate tool (dev and test only) takes none |
+| Lint gate | `make lint-migrations` (in `make lint`; `tools/migration_lint`) refuses non-additive store revisions outside `downgrade()` unless a line `# additive-exception: <bead-id>` marks them. It is a text-level check against honest non-additive changes, not a SQL parser: it refuses any raw SQL containing a dollar-quote delimiter (`$$` or `$tag$`; a positional parameter such as `$1` is not one), since it does not read dollar quoting; it does not understand `E'...'` backslash escapes or nested block comments, and can fail open on either; and it refuses an unterminated comment or quote and raw SQL it cannot resolve |
+
+### Migration review checklist (m7)
+
+A procedure, not a fact table. The architect applies it at the gate of every bead that adds a store revision (P15, P17, P18, P19, P20, P33 and any later one), against the revision file, its seeds and CI on the gated SHA. A "no" on any item is CHANGES NEEDED: to the builder for the revision, to the validator for a missing or wrong test. Items 22 to 25 are the deploy procedure, checked from the operator's transcript at the production sitting (P28), not from the diff.
+
+Two points are flagged on purpose. NOT NULL on an existing column is a contract step that the lint refuses unless the revision is marked, so it can only appear in P19's marked revision (item 7). And whether an empty `downgrade()` passes the seed check's generic rule is untested (item 17): do not assume it does.
+
+**Every revision (items 1 to 18)**
+
+1. One new revision per bead; its down_revision is the head it was written on, and the chain still has a single head.
+2. The revision passes make lint-migrations unmarked (CI Run Linters green); only P19 may carry the marker.
+3. The marker, a line starting # additive-exception: <bead-id>, appears in PR 5 only on P19 and names tj-7zjov1.32; a marker anywhere else is a second exception the design does not have.
+4. Nothing is dropped or renamed in upgrade(): no drop_table, drop_column, drop_constraint, drop_index, rename_table or alter_column new_column_name, and no raw DROP, DELETE, TRUNCATE or RENAME.
+5. Nothing is retyped: no alter_column type_ and no raw ALTER COLUMN ... TYPE; an enum gains labels only by ALTER TYPE ... ADD VALUE.
+6. Indexes and unique constraints are added, never dropped or replaced, and a unique index an ON CONFLICT upsert names is untouched.
+7. A new NOT NULL column has a real server_default (an explicit None is no default); setting NOT NULL on an existing column, even after a backfill, is a contract step the lint refuses, so it appears only in the marked revision.
+8. No alter_column removes a server default from a NOT NULL column outside the marked revision.
+9. Every backfill is idempotent and re-runnable: each UPDATE or INSERT is guarded (for example WHERE col IS NULL, ON CONFLICT DO NOTHING) so a second run changes nothing, and the repeat-upgrade check (P05) is green.
+10. A constraint added through op.create_unique_constraint, create_check_constraint or create_foreign_key passes the lint by ruling, so the reviewer confirms existing rows and every write the previous release makes still satisfy it.
+11. Every op.execute and exec_driver_sql text is read by eye: the lint is a text-level check against honest non-additive changes, not a SQL parser. It refuses any raw SQL containing a dollar-quote delimiter ($$ or $tag$), so a revision that needs a function or DO body carries the additive-exception marker, and then every statement in that text, including each one after the body, is read by eye and must itself be additive (the destructive denylist does not name every DROP). It can still fail open on E-string backslash escapes and on nested block comments.
+12. The revision runs in the one migration transaction: no autocommit_block, no transaction_per_migration, no CREATE INDEX CONCURRENTLY; any of them needs its own decision record before it is written.
+13. A table created outside the models is added by exact name to OUT_OF_MODEL_TABLES in server/data/store/migrations/env.py in the same commit.
+14. alembic check is clean at head (the system test pinning it is green); it says nothing about enum labels or server defaults, so those are compared by hand with the Python enums and the model defaults.
+15. The canonical seed tests/system/seeds/<rev>.sql and <rev>.json is committed, made by the seed producer (agent-stack seed_dump or make seed-dump), synthetic and non-empty, and the seed guard (server/data/store/tests/test_seed_guard.py) is green.
+16. CI's Migration Gate and System Testing are green on the gated SHA: every revision applies from empty, and every committed seed, the previous release's included, upgrades with every row kept (tj-vhboky.55 generic rule, P05).
+17. downgrade() is exempt from the lint and is no recovery path, but the CI generic rule still downgrades each unmarked revision on a scratch database and expects the rows back, so the revision keeps a downgrade() that passes it.
+18. CI built the data_store image from the gated SHA and applied the revision from it; no compose file mounts revisions, so the docs and the bead say a stack needs make dev-build, test-build or prod-build to see it.
+
+**P19 only (items 19 to 21)**
+
+19. P19 only: upgrade() checks first that every dataset has a listing and raises before any DDL or write when one does not, so a refusal changes nothing; it deletes no row and drops no data-bearing table.
+20. P19 only: test_migration_with_data.py has an EXPECTATIONS entry for the revision, with a seed where every dataset has a listing (upgrade succeeds) and one with an unlisted dataset (upgrade refuses, revision unchanged, every column identical), and dev and test data are regenerated.
+21. P19 only: spikes s4 and s5 (P27a) are answered before the gate, as O7 ruled.
+
+**Deploy procedure (items 22 to 25)**
+
+22. Before a production migrate: make prod-build from the reviewed SHA, and the production definition's DEPLOYMENT_LABEL is empty (non-empty refuses).
+23. Before a production migrate: a production dump restored and rehearsed on the test stack after make test-build (make migrate-restore and make migrate-rehearse DUMP=<file>) printed REHEARSAL OK, then the stack was restarted and its health read.
+24. The production make migrate printed its verified dump line (a failed dump refuses, with no override), and the operator copied the dump off the host.
+25. Rollback story: code rollback across a migration boundary does not work, downgrade is not supported, and recovery is a manual pg_restore of that pre-migrate dump.
+
+Sources: epic tj-7zjov1 m1 to m7; PR5-PLAN N1 STEP 2 and the P15 to P19 rows; REV1 N1 P33 row; tj-7zjov1.2 section 3 steps 5 and 10; tj-26jt9w section 6 and W3; gate rulings on tj-7zjov1.8, .9, .10, .45, .42, .44; ADR tj-yb1bxj addenda 3 and 5; ADR tj-x3ig38; tj-aw0tuk; tj-vhboky.55; tj-rk0w5i.
 
 ## Data freshness and completeness
 
@@ -188,7 +244,7 @@ An INTERIM store loop (`app/daily_refresh.py`, tj-grna9p.22) that keeps DAILY da
 | The fetch it drives: the same worker and run recorder as `POST /store`, trigger `SCHEDULE`, actor `scheduler` | `store_market_activity_worker(..., fetch_start=)` in `app/ingest/data_action_request.py`, `recorded_run(..., actor=, requested_start=)` in `app/ingest/run_recording.py` |
 
 - **The work is read from the database on every pass**, never stored or replayed: DAILY entries that are not retired (`is_retired`: `collect` is false; an expiry alone retires nothing), have no `RUNNING` ingest, and read LATE or OVERDUE under the freshness rule (last bar before the last completed session). A pass also runs once at start, so datasets requested earlier are backfilled.
-- **Only the missing tail is requested**: from the last bar itself, inclusive, when that bar is provisional (written before its period closed, `last_bar_is_provisional` in `app/health.py`), so the upsert overwrites it with the final bar and the dataset reads FRESH; otherwise from the last bar plus one bar; the declared start when there are no bars (`_fetch_start` in `app/daily_refresh.py`). The entry keeps its declared range as identity, so the refresh extends the existing entry; `fetch_start` replaces only the start of the ingest request. The stored feed is named as the preference, so a tape ingest can no longer serve is a refused ack, never a second entry.
+- **Only the missing tail is requested**: from the last bar itself, inclusive, when that bar is provisional (written before its period closed, `last_bar_is_provisional` in `app/health.py`), so the upsert overwrites it with the final bar and the dataset reads FRESH; otherwise from the first instant after the bar's period (`_after_bar`): for 1day the next local midnight of the calendar, for 1week the next Monday's local midnight (the week is taken from its Monday, whichever day the vendor stamped), and for 1hour and 1month the fixed step of one bar, because a local-midnight stamp moves an hour between winter and summer and a fixed offset could land past the next bar's stamp; the declared start when there are no bars (`_fetch_start` in `app/daily_refresh.py`). The entry keeps its declared range as identity, so the refresh extends the existing entry; `fetch_start` replaces only the start of the ingest request. The stored feed is named as the preference, so a tape ingest can no longer serve is a refused ack, never a second entry.
 - **Bounded**: one dataset at a time, at most `DAILY_REFRESH_MAX_PER_PASS` REQUESTED per pass (skipped datasets do not count). A TRANSIENT failure is logged by exception type only, backs off (doubling, capped at 600 s), and the pass stops after 3 in a row or at once on an error that names `reset_at` (a rate limit). The rest is the next pass's. **No automatic retry** (decision tj-grna9p.55; Retry Now is manual): a dataset that failed transiently waits for the next session close or the catch-up at start; the backoff only paces the next dataset.
 - **Permanent versus transient** is the error vocabulary's own outcome (`REASONS[reason].outcome`, `is_permanent`): REFUSED (a tape ingest cannot serve, an invalid request, a vendor 4xx, own overlap, a constraint violation) cannot succeed on retry; NOT_READY (peer or vendor unavailable, deadline, rate limit, rate budget, vendor auth, 5xx, database unavailable) and an error nobody typed are transient. A permanent refusal neither counts toward the stop nor backs off; it is counted in `PassResult.refused`. A stored row that no longer validates as a request is never sent (`skipped`).
 - **Fair, from the database**: the order and the "tried already" state are the `ingest_run` history of trigger `SCHEDULE` (`finished_scheduled_runs`, last 7 days), with no job store. Never-attempted datasets go first (oldest newest-bar first), then least recently attempted. A dataset whose last scheduled attempt asked for the same tail and finished EMPTY or as a permanent FAILED since the last session close is not requested again until the next close; once due again it shares the pass with the rest, at most half the cap while others wait. A run that failed before the ack has no dataset id and is matched on symbol, asset type, data type, granularity and requested start; two owners of one symbol with the same tail therefore share that outcome.
@@ -213,7 +269,7 @@ An INTERIM store loop (`app/daily_refresh.py`, tj-grna9p.22) that keeps DAILY da
 | USAGE_ROLLUP_AFTER_DAYS | per-read rows older than this are folded into daily summaries | 90 |
 | USAGE_ROLLUP_INTERVAL_SECONDS | how often the rollup runs | 3600 |
 | REAPER_INTERVAL_SECONDS | seconds between expiry-reaper passes; a non-positive or malformed value is the default (`app/reaper.py`) | 3600 |
-| REAPER_DELETES_ENABLED | the reaper deletes only when this is `true` in any letter case, surrounding whitespace ignored (`strip().lower()`); anything else, unset, `1` and `yes` included, is dry-run (`app/reaper.py`) | false |
+| REAPER_DELETES_ENABLED | the reaper deletes only when this is `true` in any letter case, surrounding whitespace ignored (`strip().lower()`); anything else, unset, `1` and `yes` included, is dry-run (`app/reaper.py`) | unset (reads as dry-run) |
 | DAILY_REFRESH_ENABLED | the interim DAILY refresh loop runs unless this is `false`, `0`, `no` or `off`; read at start (`app/daily_refresh.py`). ON BY DEFAULT, by the owner's ruling, accepted for the CURRENT broker only: its vendor errors when a limit is exceeded and does not penalise it. A robust cumulative cap (a quota counter that survives restarts, and admission control in the scheduler) must exist BEFORE any broker that penalises exceeding limits (IBKR) is enabled; no cumulative vendor-usage counter exists yet (tj-lenn8u). This row is the one place the default is written down | true |
 | DAILY_REFRESH_SETTLE_MINUTES | minutes after a session's close before the refresh pass, and the settle margin that decides when a written bar is final (`health.settle_margin_from_env`, read by `FreshnessConfig.from_env` and the refresh); negative or malformed is the default | 30 |
 | DAILY_REFRESH_MAX_PER_PASS | datasets one pass refreshes at most; non-positive or malformed is the default | 10 |

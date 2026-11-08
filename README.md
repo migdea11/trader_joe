@@ -468,25 +468,106 @@ falls back to production and still runs the migration; it never refuses over the
 anything else, a production-labelled container included, naming the cause; restart with `make dev-up` or
 `make system-launch`, then re-run.
 
-The revisions applied are the ones in **this checkout**, not the ones baked into the image —
-`alembic.ini` and `server/data/store/migrations/` reach the container as bind mounts. Where the
+The revisions applied are the ones in **the `data_store` image** the chosen definition runs. The
+Dockerfile copies `alembic.ini` and `server/data/store/migrations/` into the image and no compose file
+mounts them from the checkout, so the code and the revisions that run together are one image's and
+cannot disagree. The consequence is that **an edited or new revision reaches a stack only after its
+image is rebuilt**: `make dev-build` (dev), `make test-build` (test) or `make prod-build` (prod). `make
+migrate` against an older image runs that image's revision set, and refuses an image with none. Where the
 rest of the code comes from depends on the definition:
 
-- **Test definition.** The `:test` image bakes the code in, as the production one does, with only
-  `alembic.ini` and `migrations/` from the checkout; rebuild with `make test-build` after a model change.
-- **Production definition.** The app code, including the models, comes from the `:latest` image,
-  while `alembic.ini` and `migrations/` come from the checkout. After a model change, rebuild with
-  `make prod-build` so the two agree.
+- **Test and production definitions.** The image bakes the code in, models included; rebuild after a
+  model or revision change.
 - **Dev definition.** `docker-compose.override.yaml` bind-mounts the app, `common`, routers,
-  schemas and generated code over `/code`, so the models, the enums and the revisions all come from
-  your checkout; only the baked-in dependencies come from the `:dev` image. A `make dev-build` after
-  a model change matters for `make migrate-check`'s image stamp check and for dependencies, not for
-  what `make migrate` runs.
+  schemas and generated code over `/code`, so the models and the enums come from your checkout; the
+  revisions still come from the `:dev` image, so a new revision needs `make dev-build`.
 
-Run it from a checkout that matches the stack you brought up.
+Both service source digests cover the store revisions, so a revision edit also marks the ingest image
+stale and needs its rebuild.
 
 On a database that has never been migrated, `data_store` still starts. It logs one startup warning
 naming the missing `ingest_run` table and skips the interrupted-run sweep, until `make migrate` is run.
+
+### Before a migration: the verified dump and the production label
+
+Migrations are forward-only; there is no down-migration to recover with (recovery is a restore). So any
+`make migrate` that moves the schema (`upgrade`, `downgrade`, `stamp`; the default is `upgrade head`)
+first takes a dump, and `current`, `history`, `heads` and `check` take none.
+
+- **The dump** is `pg_dump` in custom format, run inside the postgres container and written under a
+  `.partial` name, checked non-empty and read back with `pg_restore --list`, then renamed. A name without
+  `.partial` is a dump that was verified readable (not a verified restore). The file is mode 600, named
+  `store-<UTC time>-<compose project>-pre-migrate.dump`.
+- **Where it lands:** `MIGRATE_BACKUP_DIR` if set; otherwise the backups folder beside the database's own data
+  directory, the parent of the host directory bind-mounted at the running postgres container's
+  `/var/lib/postgresql/data` plus `/backups` (with the shipped defaults, `<repo>/volumes/trader_joe/backups`). The
+  script reads that mount from the container with `docker inspect`, so the dump follows whatever `DATA_DIR` the
+  stack was started with, whether from the root env file or the command line. If the mount cannot be found (no bind
+  mount there, several, a named volume, or the inspect fails) and `MIGRATE_BACKUP_DIR` is unset, the migration is
+  refused before alembic starts, with a message naming `MIGRATE_BACKUP_DIR`; a deployment whose postgres data is a
+  named volume sets it. The mount's source is a path on the Docker daemon's host while the dump is written by the
+  machine running `make migrate`, so run it on that host: against a remote `DOCKER_HOST` or context, or from a
+  container sharing the daemon socket, the dump would land at that path on the wrong machine. `make migrate` prints
+  the path on its dump line, copying the dump off the host is the operator's step, and dumps are never pruned, so
+  retention is the operator's too.
+- **There is no override.** If the dump cannot be made, is empty or does not read back, the migration is
+  refused before alembic starts and nothing is written. A first run against an empty database dumps an
+  empty database and passes.
+- **The production label.** On the production definition only, a non-empty `DEPLOYMENT_LABEL` in the
+  `data_store` container refuses the migration: production's label is empty, so a value means a dev or
+  test environment mislabelled as production. Dev and test are not asserted.
+- **No standalone backup target exists** in this release. `make migrate` takes the dump itself; scheduled
+  backups are tracked separately. CI takes a dump on every `make migrate` (it sets `MIGRATE_BACKUP_DIR`).
+  The agent-stack migrate tool takes none: it runs `alembic upgrade head` in a one-off data_store container
+  itself, not through `run_migrations.sh`, and only on the dev or test stack; for a dump before a dev
+  migration, run `make migrate` instead.
+
+Reviewing a migration: the checklist is in `server/data/store/CLAUDE.md`, section "Migration review checklist (m7)".
+
+### Restore and rehearsal drill
+
+```
+make migrate-restore DUMP=<file>     # replace the test stack's database with the dump
+make migrate-rehearse DUMP=<file>    # restore, migrate to head, report health
+```
+
+Both **destroy the test stack's database** and so set `SYSTEM_TEST_DISPOSABLE_DB=1` in their own recipes:
+invoking the target is the attestation (unlike `make test-system`, where it is a make argument). The scripts
+(`server/data/store/restore_dump.sh`, `rehearse_migration.sh`) still refuse unless the running postgres is
+in the `trader_joe_dev` project and carries `docker-compose.fake.yaml` and not the override in its compose
+label, i.e. the stack `make system-launch` starts, and unless the dump reads back. Neither can reach dev or
+production data. Typically the dump is production's, copied to this machine.
+
+The rehearsal restores, runs `upgrade head` (taking its own pre-migration dump like any migrate), then
+requires `alembic current` to say `(head)` and the running `data_store` container's health not to be
+`unhealthy`; it ends with `REHEARSAL OK` and exits non-zero without it. Two limits:
+
+- It applies the revisions inside the **running test `data_store` image**, which match your checkout only
+  after `make test-build`.
+- The health line is the container's **last recorded health status**; the rehearsal does not restart it on
+  the rehearsed schema. To see the service run against the new schema, restart the test stack and read
+  Health afterwards.
+
+**Recovering production itself is a manual restore** of the pre-migrate dump; no script restores into
+production, and downgrade is not a recovery path. Follow `restore_dump.sh`, which the drill exercises, not
+`pg_restore --clean`: `--clean` drops and recreates only the objects the dump holds, so every table, type or
+index the failed revision created would survive, and the next upgrade from the restored revision would fail on
+already exists. On the production host, from the repository root:
+
+1. Stop the stack: `make prod-down`. Then start the database alone: `make prod-deps`.
+2. If the failed state should be kept for diagnosis, dump it first (the same `pg_dump --format=custom` inside
+   the postgres container that `run_migrations.sh` uses, to a new file); the next step destroys it.
+3. Replace the public schema: `docker compose -f docker-compose.yaml exec -T postgres sh -c 'exec psql --user "$POSTGRES_USER" --dbname "$POSTGRES_DB" -v ON_ERROR_STOP=1 -c "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;"'`
+4. Load the dump: `docker compose -f docker-compose.yaml exec -T postgres sh -c 'exec pg_restore --user "$POSTGRES_USER" --dbname "$POSTGRES_DB" --no-owner --exit-on-error --single-transaction' < <dump file>`.
+   One transaction: on any error nothing is loaded, and the empty schema from step 3 remains, so repeat step 3
+   and 4 after fixing the cause.
+5. Confirm with `make migrate-status` that the database is back at the revision before the failed migration
+   (the dump carries `alembic_version`).
+6. Start the release that matches that schema: `make prod-build` from the commit deployed before the
+   migration, then `make prod-launch`. Do not run `make migrate` again until the failing revision is fixed and
+   rehearsed.
+
+<!-- TODO: verify — the production recovery commands (stop and start targets, the schema drop, the restore flags) have not been rehearsed against production; confirm at the production sitting; also confirm at that sitting that the pre-migrate dump line names the production data directory's backups folder -->
 
 ### Revisions that are not additive
 
@@ -503,9 +584,21 @@ where it was granted. Two revisions carry it today, `8f41c2d7a3b9` and `eec8f88a
 current practice both also state, in the same docstring, what is destroyed and what `downgrade()`
 does and does not restore. No record makes that a rule yet; it is the pattern to follow.
 
-**Nothing enforces this mechanically yet.** The CI gate that would reject an unmarked non-additive
-revision (`tj-aw0tuk`) has not been built. Today the marker is read by reviewers, and by one test,
-which checks only that the current head revision still carries its marker.
+**`make lint-migrations` enforces this** (it is part of `make lint`). It reads every store revision with
+Python's `ast` module, with no database, and refuses, outside `downgrade()`: dropping a table, column,
+constraint or index; renaming a table or column; changing a column's type or setting `nullable=False`;
+adding a NOT NULL column without a server default; removing the server default of a NOT NULL column; and raw
+SQL that is not one of the additive forms (`UPDATE`, `INSERT INTO`, `CREATE`, `ALTER TYPE ... ADD VALUE`,
+`ALTER TABLE ... ADD COLUMN`, judged per clause, with `CREATE OR REPLACE` refused). A revision carrying the
+marker line above is exempt and the exception stays visible in the diff. It cannot read raw SQL built from a
+name it cannot resolve, and refuses it.
+
+It is a **text-level check against honest non-additive changes, not a SQL parser**, and does not stop a
+determined author. Known edges: comments and quotes are stripped before statements are split, and an
+unterminated comment or quote is refused; any raw SQL containing a dollar-quote delimiter (`$$` or `$tag$`; a positional parameter such as `$1` is not
+one) is refused, because dollar-quoted text is not read, and a delimiter inside a quote or a comment is refused too;
+an `E'...'` string's backslash escapes are not understood and block comments are not nested, and either can fail
+open. A revision needing one of these is either rewritten or marked.
 
 **`eec8f88a7443` expects empty tables.** It rebuilds both market-data tables for the per-dataset
 model and adds the bar's `feed` column `NOT NULL` with no default, so on a bar table that still holds

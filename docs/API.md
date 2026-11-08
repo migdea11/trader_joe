@@ -1177,9 +1177,15 @@ Kafka edge that turned a failure into a bare `{}`, so every typed failure reache
 and is rendered there as a `google.rpc.Status` with `ErrorInfo`. **No sentinel survives.** An empty
 result now means an empty interval, and nothing else.
 
-**Declared, and served by nothing yet.** `ingest.proto` also declares `IngestService.Quote`, and
-`internal/store/v1/store.proto` declares `StoreService.Bootstrap`. Neither has a server and neither
-has a caller: they are reserved for the scheduler work and `Bootstrap` is due to be rewritten.
+**Declared, and served by nothing yet.** `ingest.proto` also declares `IngestService.Quote`, which has no
+server and no caller. `internal/store/v1/store.proto` now declares `StoreService.DeliverAttempt` (client
+streaming: one header, the payload messages, one trailer, answered with an acknowledgement; idempotent on
+`request_id` and `attempt_no`) and `StoreService.RegisterInstance` (unary: ingest announces the instance id it
+minted at start). `Bootstrap` and its messages are removed. The package is internal, so buf's breaking
+checks ignore the change. The contract is the data_ingest to data_store result path: the store writes
+an attempt durably before it answers, and ingest does not retry or call the vendor again for a request
+until the attempt is acknowledged.
+
 `FetchDatasetRequest` gained `request_id`, `ready_by` and `best_effort`, which are carried and unused,
 and `FetchAccepted.quota_key` and `FetchDone.vendor_stats` are on the wire but not yet mapped into
 the domain.
