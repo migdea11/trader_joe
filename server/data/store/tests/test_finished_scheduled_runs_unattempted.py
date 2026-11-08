@@ -348,3 +348,49 @@ async def test_the_attempt_rows_are_still_read_beside_the_unattempted_requests(h
     records = await _read(harness, since=SINCE - timedelta(days=365))
 
     assert [record.request_id for record in records] == [attempted]
+
+
+# --------------------------------------------------------------------------------------------- non-bars attempt rows
+
+
+@pytest.mark.parametrize(
+    'attempt',
+    [
+        pytest.param(
+            {'outcome': DeliveryOutcome.FAILED, 'error_class': DeliveryErrorClass.PERMANENT, 'last_attempt': True},
+            id='failed',
+        ),
+        pytest.param({'outcome': DeliveryOutcome.SUCCEEDED, 'parts': []}, id='succeeded-empty'),
+    ],
+)
+async def test_a_scheduled_corporate_actions_attempt_row_never_enters_the_bars_history(harness, attempt):
+    """tj-7zjov1.31: the refresh's history is bars attempts; a corporate-actions attempt row has no granularity.
+
+    The corporate-actions request is SCHEDULE-triggered and its attempt row is written by the real intake (the symbol,
+    and NULL for the other four labels), so every other filter of the attempt-row read holds for it. A bars attempt row
+    beside it is the control that proves the read ran.
+    """
+    bars_request = await _finished_with_an_attempt(harness)
+    actions_request = _row(
+        kind=IngestRequestKind.CORPORATE_ACTIONS,
+        dataset_id=None,
+        asset_type=None,
+        data_types=None,
+        granularity=None,
+        update_type=None,
+        feed=None,
+        state=IngestRequestState.QUEUED,
+        failure_cause=None,
+        failure_detail=None,
+        finished_at=None,
+    )
+    await _insert(harness, actions_request)
+    outcome = attempt.pop('outcome')
+    await harness.deliver(report(actions_request['id'], outcome, kind=IngestRequestKind.CORPORATE_ACTIONS, **attempt))
+    (run,) = await harness.runs(actions_request['id'])
+    assert (run.trigger, run.granularity, run.asset_symbol) == (IngestRunTrigger.SCHEDULE, None, 'VFV')
+    assert run.state is not IngestRunState.RUNNING
+
+    records = await _read(harness, since=SINCE - timedelta(days=365))
+
+    assert [record.request_id for record in records] == [bars_request]

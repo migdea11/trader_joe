@@ -459,7 +459,8 @@ def ui_config_message(config: UiConfigView) -> shell_pb2.UiConfig:
 def ingest_run_message(run: IngestRunRecord) -> data_pb2.IngestRun:
     """One run as an IngestRun message.
 
-    The dataset id is empty until the run's ack, the label is the symbol and bar width, and the error is
+    The dataset id is empty until the run's ack, the label is the symbol and bar width (either may be absent: a
+    corporate-actions attempt has a symbol and no width, an asset-list attempt neither, so its label is empty), and the error is
     set only for a FAILED run (an untyped failure carries an empty domain and reason).
 
     Args:
@@ -471,7 +472,7 @@ def ingest_run_message(run: IngestRunRecord) -> data_pb2.IngestRun:
     message = data_pb2.IngestRun(
         id=str(run.id),
         dataset_id=str(run.dataset_id) if run.dataset_id is not None else '',
-        label=f'{run.asset_symbol} {run.granularity.value}',
+        label=' '.join(part for part in (run.asset_symbol, run.granularity.value if run.granularity else None) if part),
         trigger=_enum_value(data_pb2.RunTrigger, 'RUN_TRIGGER_', run.trigger),
         actor=run.actor,
         state=_enum_value(data_pb2.IngestRunState, 'INGEST_RUN_STATE_', run.state),

@@ -396,3 +396,68 @@ def test_the_expiry_type_revision_builds_exactly_its_one_column_and_its_downgrad
 
     _migrate(revision_db, EXPIRY_TYPE_REVISION, 'downgrade', 'downgrade', parent, parent)
     assert not diff_catalogues(before, _catalogue(revision_db)), 'the downgrade left or lost an object'
+
+
+# ---------------------------------------------------------------------------------------------
+# tj-7zjov1.31 (P18): what c7e19a4d5b28 builds, read off the catalogue. The design (the bead's 20:17 UTC note): one new
+# table, corporate_action, with its primary key, the dedupe unique index and the request index, and NOT NULL dropped
+# on exactly five ingest_run columns, every other fact of those columns unchanged. Nothing else in any category: no
+# enum type (datasource is referenced), no foreign key. The downgrade restores the parent exactly (on an empty
+# database; the refusal over a NULL label is test_migration_with_data.py's).
+
+CORPORATE_ACTION_REVISION = 'c7e19a4d5b28'
+CORPORATE_ACTION_TABLE = 'corporate_action'
+RELAXED_RUN_COLUMNS = {
+    ('ingest_run', column) for column in ('asset_symbol', 'asset_type', 'data_type', 'granularity', 'update_type')
+}
+CORPORATE_ACTION_INDEXES = {
+    'corporate_action_pkey',
+    'uq_corporate_action_source_vendor_action_id_payload_hash',
+    'ix_corporate_action_request_id',
+}
+
+
+def test_the_corporate_action_revision_builds_one_table_relaxes_five_columns_and_its_downgrade_removes_them(
+    revision_db: ScratchDb, parent_db: ScratchDb
+) -> None:
+    parent = PARENT[CORPORATE_ACTION_REVISION]
+    assert parent == EXPIRY_TYPE_REVISION, f'{CORPORATE_ACTION_REVISION} sits on {parent}'
+    _migrate(parent_db, CORPORATE_ACTION_REVISION, 'build-parent', 'upgrade', parent, parent)
+    _migrate(
+        revision_db,
+        CORPORATE_ACTION_REVISION,
+        'build-revision',
+        'upgrade',
+        CORPORATE_ACTION_REVISION,
+        CORPORATE_ACTION_REVISION,
+    )
+    before, after = _catalogue(parent_db), _catalogue(revision_db)
+
+    added = {
+        (category, key): facts
+        for category, facts_by_key in after.items()
+        for key, facts in facts_by_key.items()
+        if key not in before.get(category, {})
+    }
+    removed = [(category, key) for category, facts in before.items() for key in facts if key not in after[category]]
+    changed = {
+        key: (facts[key], after[category][key])
+        for category, facts in before.items()
+        for key in facts
+        if key in after[category] and after[category][key] != facts[key]
+    }
+
+    assert removed == [], 'an additive revision removed an existing object'
+    assert {category for category, _ in added} == {'tables', 'columns', 'constraints', 'indexes'}, sorted(added)
+    assert all(key[0] == CORPORATE_ACTION_TABLE for _, key in added), 'an object was added outside the new table'
+    assert {key[1] for category, key in added if category == 'indexes'} == CORPORATE_ACTION_INDEXES
+    assert [facts[0] for (category, _), facts in added.items() if category == 'constraints'] == ['p'], (
+        'only the primary key: no foreign key, no check'
+    )
+    assert set(changed) == RELAXED_RUN_COLUMNS, sorted(changed)
+    for key, (was, now) in changed.items():
+        assert (was[1], now[1]) == (True, False), f'{key}: NOT NULL {was[1]} -> {now[1]}'
+        assert (was[0], *was[2:]) == (now[0], *now[2:]), f'{key}: a fact other than NOT NULL changed'
+
+    _migrate(revision_db, CORPORATE_ACTION_REVISION, 'downgrade', 'downgrade', parent, parent)
+    assert not diff_catalogues(before, _catalogue(revision_db)), 'the downgrade left or lost an object'

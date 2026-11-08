@@ -9,7 +9,8 @@ fills them the way production does, not with raw SQL, so the seed proves the cod
   * ingest_run attempt rows, the request's count, spend and state: DeliveryIntake.deliver, the whole delivery
     transaction, bars written through the real bar writer.
 
-(The ten ingest_run rows of the POSTed scenario are written by data_store itself, with no request id.)
+(The scenario's own POSTs also write request and attempt rows since the push path, with random ids; the producer
+empties the ingest tables and corporate_action AFTER the POSTs and before this cast, so the seed holds the cast alone.)
 
 THE CAST, every id a literal so two runs agree. Instance A is announced first and is superseded when B arrives.
   PENDING        written, never answered                     no attempt
@@ -24,6 +25,24 @@ THE CAST, every id a literal so two runs agree. Instance A is announced first an
   FAILED         PERMANENT refusal with NO stats              one attempt row, vendor columns NULL
   FAILED         a transient failure, then the last attempt   two attempt rows, ATTEMPTS_EXHAUSTED
   FAILED         EXPIRED                                      no attempt row
+  SUCCEEDED      CORPORATE_ACTIONS (ZZSEEDCA), two records:
+                 action A and action B                        one attempt row, NULL labels but the symbol
+  SUCCEEDED      CORPORATE_ACTIONS over an overlapping window: A
+                 again with the SAME bytes (the dedupe, writes
+                 nothing) and A with OTHER bytes (a vendor
+                 revision, a new row)                         one attempt row, NULL labels but the symbol
+
+THE LEGACY RUNS (bead tj-7zjov1.31). A database from before the push path holds ingest_run rows with no request id and no
+attempt number, and the upgrade tests must keep exercising that shape, so four are written through the legacy recorder's
+own crud (start_run, finish_run, fail_interrupted_runs), one symbol each (ZZSEEDLA..LD), in the states worth keeping:
+  RUNNING swept to FAILED / INTERRUPTED   (ZZSEEDLA)
+  SUCCEEDED with two bars                 (ZZSEEDLB)
+  EMPTY                                   (ZZSEEDLC)
+  FAILED with a typed reason              (ZZSEEDLD, VENDOR_UNAVAILABLE)
+Their symbols differ, which keeps dump.NORMALISE_SQL's rank (request_id NULLS FIRST, then asset_symbol) stable and apart
+from the attempt rows' ranks; their instants are fixed by the same statement (request_id IS NULL).
+
+Three corporate_action rows result (A, B, A revised); the same-bytes repeat of A is the dedupe, so it leaves no row.
 The dataset_id of a request that names none stays NULL. Every counted attempt carries the vendor asset id except the
 FAILED one with no stats, whose header names none, so the seed holds both values of ingest_run.vendor_asset_id.
 
@@ -39,6 +58,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.engine import URL
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 
 INSTANCE_A = 'seed-instance-a'
@@ -47,6 +67,8 @@ INSTANCES = (INSTANCE_A, INSTANCE_B)
 QUOTA_KEY = 'seed-quota-key'
 VENDOR_ASSET = 'seed-vendor-asset'
 CLIENT_LABEL = 'seed-owner-a'
+# A synthetic symbol that passes scenario.SYMBOL_PATTERN, as the requests' asset_symbol must.
+CORPORATE_ACTION_SYMBOL = 'ZZSEEDCA'
 
 # The request ids: literal, so the seed names them identically on every run.
 REQUEST_IDS = {
@@ -62,14 +84,24 @@ REQUEST_IDS = {
             'FAILED_NO_STATS',
             'FAILED_EXHAUSTED',
             'FAILED_EXPIRED',
+            'CA_FIRST',
+            'CA_REVISED',
         ),
         start=1,
     )
 }
 
 # What the seeded rows must come to; the producer refuses a seed that does not match.
-EXPECTED_REQUEST_STATES = {'PENDING': 1, 'QUEUED': 1, 'NOT_DELIVERED': 1, 'SUCCEEDED': 1, 'EMPTY': 1, 'FAILED': 4}
-EXPECTED_ATTEMPT_ROWS = 8
+EXPECTED_REQUEST_STATES = {'PENDING': 1, 'QUEUED': 1, 'NOT_DELIVERED': 1, 'SUCCEEDED': 3, 'EMPTY': 1, 'FAILED': 4}
+EXPECTED_ATTEMPT_ROWS = 10
+# The legacy-shaped runs (no request id, no attempt number), per state; one of the FAILED is the swept INTERRUPTED one.
+EXPECTED_LEGACY_STATES = {'EMPTY': 1, 'FAILED': 2, 'SUCCEEDED': 1}
+EXPECTED_LEGACY_RUNS = sum(EXPECTED_LEGACY_STATES.values())
+EXPECTED_INTERRUPTED_RUNS = 1
+EXPECTED_RUN_ROWS = EXPECTED_ATTEMPT_ROWS + EXPECTED_LEGACY_RUNS
+# Observations: action A, action B and A's revision. EXPECTED_REVISED_ACTIONS: vendor ids held under more than one payload.
+EXPECTED_OBSERVATIONS = 3
+EXPECTED_REVISED_ACTIONS = 1
 EXPECTED_INSTANCES = len(INSTANCES)
 
 _WINDOW_START = datetime(2024, 1, 1, tzinfo=UTC)
@@ -80,6 +112,14 @@ _STARTED = datetime(2024, 4, 15, 9, 0, tzinfo=UTC)
 _READY_BY = datetime(2024, 4, 15, 12, 0, tzinfo=UTC)
 # Two days the scenario's ZZSEEDAA dataset already holds, on the daily grid.
 _BAR_DAYS = (datetime(2024, 1, 2, tzinfo=UTC), datetime(2024, 1, 3, tzinfo=UTC))
+# One symbol per legacy run, in the scenario's synthetic pattern: interrupted, succeeded, empty, failed.
+LEGACY_SYMBOLS = ('ZZSEEDLA', 'ZZSEEDLB', 'ZZSEEDLC', 'ZZSEEDLD')
+# The raw bytes of the synthetic vendor records: A in two versions (the revision), and B.
+_ACTION_A_V1 = b'{"id":"seed-action-a","type":"forward_split","symbol":"ZZSEEDCA","ratio":2,"ex":"2024-01-10"}'
+_ACTION_A_V2 = b'{"id":"seed-action-a","type":"forward_split","symbol":"ZZSEEDCA","ratio":2,"ex":"2024-01-12"}'
+_ACTION_B_V1 = b'{"id":"seed-action-b","type":"name_change","symbol":"ZZSEEDCA","new":"ZZSEEDCB"}'
+_CA_WINDOW_1 = (datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 31, tzinfo=UTC))
+_CA_WINDOW_2 = (datetime(2024, 1, 11, tzinfo=UTC), datetime(2024, 2, 11, tzinfo=UTC))
 
 
 async def seed_ingest_records(url: URL, dataset_id: uuid.UUID, symbol: str) -> None:
@@ -106,6 +146,8 @@ async def seed_ingest_records(url: URL, dataset_id: uuid.UUID, symbol: str) -> N
     from data.store.app.ingest.delivery_intake import DeliveryIntake
     from schemas.data_ingest.delivery import (
         AttemptDelivery,
+        CorporateActionRecord,
+        CorporateActionRecords,
         DeliveryErrorClass,
         DeliveryHeader,
         DeliveryOutcome,
@@ -227,6 +269,47 @@ async def seed_ingest_records(url: URL, dataset_id: uuid.UUID, symbol: str) -> N
                     ),
                 )
 
+        async def create_actions(name: str, window: tuple[datetime, datetime]) -> None:
+            async with AsyncSession(engine, expire_on_commit=False) as db:
+                await request_crud.create_request(
+                    db,
+                    request_crud.NewIngestRequest(
+                        id=REQUEST_IDS[name],
+                        kind=IngestRequestKind.CORPORATE_ACTIONS,
+                        source=DataSource.ALPACA_API,
+                        client_label=CLIENT_LABEL,
+                        asset_symbol=CORPORATE_ACTION_SYMBOL,
+                        requested_start=window[0],
+                        requested_end=window[1],
+                    ),
+                )
+
+        def actions_report(
+            name: str, window: tuple[datetime, datetime], records: list[CorporateActionRecord], as_of: datetime
+        ):
+            # No feed and no vendor asset id: neither belongs to this kind. The trailer carries the served range.
+            return AttemptDelivery(
+                header=DeliveryHeader(
+                    request_id=str(REQUEST_IDS[name]), instance_id=INSTANCE_B, attempt_no=1, quota_key=QUOTA_KEY
+                ),
+                parts=[CorporateActionRecords(records=records)],
+                trailer=DeliveryTrailer(
+                    outcome=DeliveryOutcome.SUCCEEDED,
+                    vendor_stats=stats(calls=1, pages=1, throttled=0, retries=0),
+                    served_range=ServedRange(start=window[0], end=window[1]),
+                    as_of=as_of,
+                ),
+            )
+
+        def action(vendor_id: str, kind: str, raw: bytes, ex_day: int) -> CorporateActionRecord:
+            return CorporateActionRecord(
+                vendor_action_id=vendor_id,
+                action_type=kind,
+                ex_date=datetime(2024, 1, ex_day, tzinfo=UTC),
+                identifiers={'symbol': CORPORATE_ACTION_SYMBOL},
+                raw_payload=raw,
+            )
+
         async def queue(name: str, instance: str) -> None:
             async with AsyncSession(engine, expire_on_commit=False) as db:
                 if await request_crud.mark_queued(db, REQUEST_IDS[name], instance) is None:
@@ -289,6 +372,69 @@ async def seed_ingest_records(url: URL, dataset_id: uuid.UUID, symbol: str) -> N
         await create('FAILED_EXPIRED', ready_by=_READY_BY)
         await queue('FAILED_EXPIRED', INSTANCE_B)
         await intake.deliver(report('FAILED_EXPIRED', INSTANCE_B, 1, DeliveryOutcome.EXPIRED))
+
+        # Corporate actions: A and B, then an overlapping fetch that repeats A byte for byte (the dedupe) and brings A
+        # again with other bytes (a vendor revision).
+        action_a = action('seed-action-a', 'forward_split', _ACTION_A_V1, 10)
+        action_b = action('seed-action-b', 'name_change', _ACTION_B_V1, 11)
+        await create_actions('CA_FIRST', _CA_WINDOW_1)
+        await queue('CA_FIRST', INSTANCE_B)
+        await intake.deliver(actions_report('CA_FIRST', _CA_WINDOW_1, [action_a, action_b], _AS_OF))
+        revised = action('seed-action-a', 'forward_split', _ACTION_A_V2, 12)
+        await create_actions('CA_REVISED', _CA_WINDOW_2)
+        await queue('CA_REVISED', INSTANCE_B)
+        await intake.deliver(
+            actions_report('CA_REVISED', _CA_WINDOW_2, [action_a, revised], _AS_OF + timedelta(days=2))
+        )
+        await _seed_legacy_runs(engine)
     finally:
         delivery_intake.own_session, delivery_intake.publish = saved_session, saved_publish
         await engine.dispose()
+
+
+async def _seed_legacy_runs(engine: AsyncEngine) -> None:
+    """Write the four legacy-shaped runs through the legacy recorder's crud (no request id, no attempt number).
+
+    The RUNNING row is started and swept FIRST: the sweep fails every RUNNING row, so no other run may be open then.
+    """
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from common.enums.data_select import AssetType, DataType
+    from common.enums.data_stock import DataSource, Granularity, UpdateType
+    from common.errors.vocabulary import ERROR_DOMAIN, Reason
+    from data.store.app.database.crud import ingest_run as run_crud
+    from data.store.app.database.models.ingest_run import IngestRunState, IngestRunTrigger
+
+    def new_run(symbol: str) -> run_crud.NewRun:
+        return run_crud.NewRun(
+            trigger=IngestRunTrigger.REQUEST,
+            actor=CLIENT_LABEL,
+            asset_symbol=symbol,
+            asset_type=AssetType.STOCK,
+            data_type=DataType.MARKET_ACTIVITY,
+            source=DataSource.ALPACA_API,
+            granularity=Granularity.ONE_DAY,
+            update_type=UpdateType.STATIC,
+            requested_start=_WINDOW_START,
+            requested_end=_WINDOW_END,
+        )
+
+    interrupted, succeeded, empty, failed = LEGACY_SYMBOLS
+    async with AsyncSession(engine, expire_on_commit=False) as db:
+        await run_crud.start_run(db, new_run(interrupted))
+        if await run_crud.fail_interrupted_runs(db) != 1:
+            raise RuntimeError('the legacy sweep did not fail exactly the one seeded RUNNING run')
+        done = await run_crud.start_run(db, new_run(succeeded))
+        await run_crud.finish_run(db, done.id, state=IngestRunState.SUCCEEDED, bars_written=len(_BAR_DAYS))
+        done = await run_crud.start_run(db, new_run(empty))
+        await run_crud.finish_run(db, done.id, state=IngestRunState.EMPTY, bars_written=0)
+        done = await run_crud.start_run(db, new_run(failed))
+        await run_crud.finish_run(
+            db,
+            done.id,
+            state=IngestRunState.FAILED,
+            bars_written=0,
+            failure=run_crud.RunFailure(
+                domain=ERROR_DOMAIN, reason=str(Reason.VENDOR_UNAVAILABLE), message='the vendor answered 503'
+            ),
+        )

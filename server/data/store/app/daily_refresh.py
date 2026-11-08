@@ -387,7 +387,9 @@ def _request_for(
     return path, body, fetch_start
 
 
-def _request_key(asset_symbol: str, asset_type: object, data_type: object, granularity: object, start: datetime | None):
+def _request_key(
+    asset_symbol: str | None, asset_type: object, data_type: object, granularity: object, start: datetime | None
+):
     """What identifies a request in the history when its run never learned a dataset id (it failed before the ack)."""
     return (asset_symbol, asset_type, data_type, granularity, start)
 

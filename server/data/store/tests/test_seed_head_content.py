@@ -13,22 +13,38 @@ red.
 
 P34c (tj-7zjov1.123) moved the head to b8e4c1f7a923: push_path_problems reads its seven columns off the head seed.
 P35r (tj-7zjov1.153) moved it to 39c28a39b290: expiry_type_problems reads ingest_request.expiry_type off it.
+P18 (tj-7zjov1.31) moved it to c7e19a4d5b28: corporate_action_problems reads the observations and their attempt rows.
 
 PR-GATE TIER: files only, no database. That the seed loads and upgrades is tests/system's.
 """
 
+import hashlib
 import json
 import re
+from collections import Counter
 from collections.abc import Iterable
 
 import pytest
 
 from common.tests.roots import REPO_ROOT
+from data.store.app.database.models.corporate_action import CorporateAction
 from data.store.app.database.models.ingest_instance import IngestInstance
 from data.store.app.database.models.ingest_request import IngestRequest
 from data.store.app.database.models.ingest_run import IngestRun
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
-from data.store.seeds.ingest_records import REQUEST_IDS, VENDOR_ASSET
+from data.store.seeds.ingest_records import (
+    CORPORATE_ACTION_SYMBOL,
+    EXPECTED_ATTEMPT_ROWS,
+    EXPECTED_INTERRUPTED_RUNS,
+    EXPECTED_LEGACY_RUNS,
+    EXPECTED_LEGACY_STATES,
+    EXPECTED_OBSERVATIONS,
+    EXPECTED_REQUEST_STATES,
+    EXPECTED_REVISED_ACTIONS,
+    EXPECTED_RUN_ROWS,
+    REQUEST_IDS,
+    VENDOR_ASSET,
+)
 from data.store.seeds.manifest import head_revision
 from data.store.seeds.producer import VERSIONS_DIR
 
@@ -332,3 +348,102 @@ def test_the_checks_are_red_on_a_seed_from_before_the_amend():
         "ingest_run manifest: extra [], missing ['vendor_asset_id']",
     ]
     assert vendor_asset_problems(sql) == ['ingest_run: the seed has no vendor_asset_id column']
+
+
+# tj-7zjov1.31 (P18, revision c7e19a4d5b28). The cast (seeds/ingest_records.py) adds two corporate-actions requests on
+# ZZSEEDCA: the first delivers action A and action B, the second (an overlapping window) A again with the SAME bytes
+# (the dedupe: no row) and A with OTHER bytes (a vendor revision: a new row). So the head seed holds three observations,
+# one vendor id under two payloads, and two corporate-actions attempt rows with the symbol and NULL for the rest.
+ACTION_MODEL = CorporateAction.__table__
+ACTION_LABELS_NULL = ('asset_type', 'data_type', 'granularity', 'update_type', 'vendor_asset_id', 'feed')
+
+
+def _bytes_of(text: str | None) -> bytes | None:
+    """A bytea value as dump.py renders it (an escape string of backslashes, x, then hex), as _values reads it."""
+    if text is None:
+        return None
+    return bytes.fromhex(text.lstrip('\\').removeprefix('x'))
+
+
+def corporate_action_problems(sql: str, manifest: dict) -> list[str]:
+    """The observations and the corporate-actions attempt rows in the seed, as the cast writes them."""
+    table = ACTION_MODEL.name
+    rows = seed_rows(sql, (table, IngestRun.TABLE_NAME, IngestRequest.TABLE_NAME))
+    observations = rows[table]
+    if not observations:
+        return [f'{table}: no row in the seed']
+    problems = []
+    declared = {column.name for column in ACTION_MODEL.columns}
+    for seen in {frozenset(row) for row in observations}:
+        if seen != declared:
+            problems.append(f'{table} INSERT: extra {sorted(seen - declared)}, missing {sorted(declared - seen)}')
+    digested = set(manifest['digests'].get(table, {}))
+    if digested != declared:
+        problems.append(f'{table} manifest: extra {sorted(digested - declared)}, missing {sorted(declared - digested)}')
+    if problems:
+        return problems
+    if manifest['row_counts'].get(table) != EXPECTED_OBSERVATIONS or len(observations) != EXPECTED_OBSERVATIONS:
+        problems.append(f'{table}: {len(observations)} rows; expected {EXPECTED_OBSERVATIONS}')
+    for row in observations:
+        raw = _bytes_of(row['raw_payload'])
+        if raw is None or hashlib.sha256(raw).hexdigest() != row['payload_hash']:
+            problems.append(f'{table} {row["vendor_action_id"]}: payload_hash is not the SHA-256 of raw_payload')
+        if row['requesting_symbol'] != CORPORATE_ACTION_SYMBOL:
+            problems.append(f'{table} {row["vendor_action_id"]}: requesting_symbol {row["requesting_symbol"]!r}')
+    keys = [(row['source'], row['vendor_action_id'], row['payload_hash']) for row in observations]
+    if len(set(keys)) != len(keys):
+        problems.append(f'{table}: an observation is held twice (the dedupe key repeats)')
+    per_id = Counter((row['source'], row['vendor_action_id']) for row in observations)
+    if sum(1 for count in per_id.values() if count > 1) != EXPECTED_REVISED_ACTIONS:
+        problems.append(f'{table}: payloads per vendor id {sorted(per_id.values())}; expected one revised action')
+    actions_requests = {row['id'] for row in rows[IngestRequest.TABLE_NAME] if row['kind'] == 'CORPORATE_ACTIONS'}
+    attempts = [row for row in rows[IngestRun.TABLE_NAME] if row['request_id'] in actions_requests]
+    if not attempts or len(attempts) != len(actions_requests):
+        problems.append(f'ingest_run: {len(attempts)} corporate-actions attempt rows for {len(actions_requests)}')
+    for row in attempts:
+        if row['asset_symbol'] != CORPORATE_ACTION_SYMBOL:
+            problems.append(f'ingest_run {row["id"]}: asset_symbol {row["asset_symbol"]!r}')
+        if held := [column for column in ACTION_LABELS_NULL if row[column] is not None]:
+            problems.append(f'ingest_run {row["id"]}: not NULL on a corporate-actions attempt: {held}')
+        if (row['state'], row['bars_written']) != ('SUCCEEDED', '0'):
+            problems.append(f'ingest_run {row["id"]}: {row["state"]} with {row["bars_written"]} bars')
+    return problems
+
+
+def test_the_head_seed_holds_the_corporate_action_cast():
+    """c7e19a4d5b28: three observations (A, B, A revised), hashes over the bytes, two attempt rows, NULL labels."""
+    sql, manifest = _read(HEAD)
+    assert corporate_action_problems(sql, manifest) == []
+
+
+def test_the_head_seed_holds_the_cast_alone_in_states_attempt_rows_and_legacy_runs():
+    """The producer empties the POSTs' own ingest rows before the cast, so the seed holds the cast's counts only.
+
+    Ten attempt rows and, since e5d950e, four legacy-shaped runs (no request id, no attempt number; ZZSEEDLA to
+    ZZSEEDLD): one swept to FAILED / INTERRUPTED, one SUCCEEDED, one EMPTY, one FAILED with a typed reason.
+    """
+    sql, manifest = _read(HEAD)
+    rows = seed_rows(sql)
+    assert dict(Counter(row['state'] for row in rows[IngestRequest.TABLE_NAME])) == EXPECTED_REQUEST_STATES
+    runs = rows[IngestRun.TABLE_NAME]
+    attempts = [row for row in runs if row['attempt_no'] is not None and row['request_id'] is not None]
+    legacy = [row for row in runs if row['attempt_no'] is None and row['request_id'] is None]
+    assert len(attempts) == EXPECTED_ATTEMPT_ROWS
+    assert dict(Counter(row['state'] for row in legacy)) == EXPECTED_LEGACY_STATES
+    assert len(legacy) == EXPECTED_LEGACY_RUNS
+    assert sum(1 for row in legacy if row['error_reason'] == 'INTERRUPTED') == EXPECTED_INTERRUPTED_RUNS
+    assert all(row['asset_symbol'].startswith('ZZSEEDL') for row in legacy)
+    assert len(runs) == manifest['row_counts'][IngestRun.TABLE_NAME] == EXPECTED_RUN_ROWS
+
+
+def test_the_corporate_action_check_is_red_on_the_parent_seed_and_on_a_wrong_hash():
+    parent_sql, parent_manifest = _read('39c28a39b290')
+    assert corporate_action_problems(parent_sql, parent_manifest) == ['corporate_action: no row in the seed']
+
+    sql, manifest = _read(HEAD)
+    first = next(line for line in sql.splitlines() if line.startswith('INSERT INTO public.corporate_action '))
+    (row,) = seed_rows(first, (ACTION_MODEL.name,))[ACTION_MODEL.name]
+    tampered = sql.replace(row['payload_hash'], '0' * 64, 1)
+    assert f'corporate_action {row["vendor_action_id"]}: payload_hash is not the SHA-256 of raw_payload' in (
+        corporate_action_problems(tampered, manifest)
+    )

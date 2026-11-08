@@ -40,17 +40,16 @@ as it was, for the live instance to carry on, and a last_attempt flag on it is i
 budget and reads the durable count we return).
 
 THE ARMS (bars, asset list, corporate actions) ARE SEPARATE FUNCTIONS, called inside the one transaction at step 4,
-so the beads that fill them in add to a function and never to the shape of the transaction: P16 adds the write-time
-clip and the coverage write to the bars arm, P17 the asset-list snapshot, P18 and P44 the corporate-action rows.
-UNTIL AN ARM LANDS, ITS PAYLOAD IS REFUSED (INVALID_REQUEST), NEVER ACKNOWLEDGED UNWRITTEN: an asset list cannot be
-fetched again, so an acknowledgement that wrote nothing would lose it for good (CLAUDE.md, what may cross the wire).
-For the same reason no attempt of those kinds is recorded yet: ingest_run's label columns are NOT NULL and a
-request of those kinds has no symbol, granularity or data type to supply them. Only EXPIRED and EXHAUSTED, which
-write no attempt row, are accepted for them.
+so the beads that fill them in add to a function and never to the shape of the transaction: P17 adds the asset-list
+snapshot. The corporate-actions arm (P18) appends the records raw as observations. UNTIL AN ARM LANDS, ITS PAYLOAD IS
+REFUSED (INVALID_REQUEST), NEVER ACKNOWLEDGED UNWRITTEN: an asset list cannot be fetched again, so an acknowledgement
+that wrote nothing would lose it for good (CLAUDE.md, what may cross the wire). For the same reason no attempt of the
+asset-list kind is recorded yet. A corporate-actions attempt is recorded with its symbol and NULL for the other label
+columns (revision c7e19a4d5b28 made them nullable).
 
 THE VENDOR ASSET ID. The header's vendor_asset_id is stored as received, opaque, in ingest_run.vendor_asset_id on the
-attempt row of every attempt that writes one. An empty id is stored NULL, never an empty string; a request of another
-kind writes no attempt row yet. Nothing here compares it, looks anything up or names a listing: the store only stores
+attempt row of every bars attempt. An empty id is stored NULL, never an empty string; the attempt row of another kind
+stores NULL whatever the header carries. Nothing here compares it, looks anything up or names a listing: the store only stores
 it (the stop rule that reads it is a later bead). It is reproducible by an asset lookup, so the wire rule is not engaged.
 
 THE LABEL (client_label) AND THE QUOTA KEY ARE NEVER LOGGED beyond what a log line below names: ids, numbers, enums.
@@ -68,6 +67,8 @@ from common.enums.data_stock import Feed
 from common.environment import get_env_var
 from common.errors.vocabulary import InvalidRequestError, Reason
 from common.logging import get_logger
+from data.store.app.corporate_actions import observations_of
+from data.store.app.database.crud.corporate_action import insert_observations
 from data.store.app.database.crud.ingest_delivery import (
     AttemptLabel,
     NewAttempt,
@@ -128,6 +129,9 @@ _PAYLOAD_KIND: dict[type, IngestRequestKind] = {
     CorporateActionRecords: IngestRequestKind.CORPORATE_ACTIONS,
 }
 
+# The kinds whose SUCCEEDED report must carry the window it answered for (rule i).
+_SERVED_RANGE_KINDS = {IngestRequestKind.BARS: 'bars', IngestRequestKind.CORPORATE_ACTIONS: 'corporate-actions'}
+
 # The outcomes that made no vendor call: no attempt row, no counted attempt, no spend.
 _NO_CALL = frozenset({DeliveryOutcome.EXPIRED, DeliveryOutcome.EXHAUSTED})
 
@@ -148,7 +152,8 @@ def validate_report(attempt: AttemptDelivery, kind: IngestRequestKind) -> None:
     asset id; (b) error_class is set on FAILED and only there, and a FAILED report has no payload; (c) last_attempt only
     on FAILED; (d) served_range only on SUCCEEDED; (g) a SUCCEEDED or FAILED report names a quota key; (h) a SUCCEEDED
     report carries vendor stats (a FAILED one may not: the spend is then unknown, see _deliver_in_transaction); (e) the
-    feed follows the request kind; (f) the payload is of the request's kind.
+    feed follows the request kind; (f) the payload is of the request's kind; (i) a SUCCEEDED bars or
+    corporate-actions report carries a served range.
 
     Args:
         attempt: The assembled report.
@@ -187,11 +192,11 @@ def validate_report(attempt: AttemptDelivery, kind: IngestRequestKind) -> None:
     # (d) A served range is the window a SUCCEEDED attempt answered for.
     if trailer.served_range is not None and outcome is not DeliveryOutcome.SUCCEEDED:
         raise _refuse(f'{outcome} report carries a served range, which belongs to SUCCEEDED only')
-    # (i) A SUCCEEDED bars report names the window it answered for (store.proto; ingest always sets it for bars), and
-    # the verdict waiter returns it from the attempt row. A missing one is a sender defect the store must not store as
-    # a success. The other kinds are not held to it here (an asset list carries none).
-    if kind is IngestRequestKind.BARS and outcome is DeliveryOutcome.SUCCEEDED and trailer.served_range is None:
-        raise _refuse('a SUCCEEDED bars report carries no served range')
+    # (i) A SUCCEEDED bars or corporate-actions report names the window it answered for (store.proto sets it on
+    # SUCCEEDED for both; ingest always sets it), and the verdict waiter returns it from the attempt row. A missing one
+    # is a sender defect the store must not store as a success. An asset list carries none and is not held to it.
+    if kind in _SERVED_RANGE_KINDS and outcome is DeliveryOutcome.SUCCEEDED and trailer.served_range is None:
+        raise _refuse(f'a SUCCEEDED {_SERVED_RANGE_KINDS[kind]} report carries no served range')
     # (g) A counted attempt was charged to a quota, and the charge needs its name.
     if outcome not in _NO_CALL and not header.quota_key:
         raise _refuse('a counted attempt names no quota key')
@@ -378,20 +383,23 @@ async def write_asset_list(context: ArmContext) -> int:
 
 
 async def write_corporate_actions(context: ArmContext) -> int:
-    """The corporate-actions arm. NOT BUILT (P18, P44): refuses any payload; a success with none writes nothing.
+    """The corporate-actions arm: append every delivered record as an observation, raw, in the delivery transaction.
+
+    THE WINDOW IS NOT A FILTER (architect, P13 gate): every record the delivery carries is stored, including one dated
+    past the request's end or naming other symbols only. A record already held (same vendor id and same payload bytes)
+    is the same observation and writes nothing; the same id with other bytes is a vendor revision and is a new row with
+    its own as_of. Nothing is tied to a listing or a dataset, and no identity is derived (ADR tj-26jt9w addendum 12).
 
     Args:
         context: The delivery in progress.
 
     Returns:
-        int: Zero, for a success that carries no records.
-
-    Raises:
-        InvalidRequestError: INVALID_REQUEST, if the report carries a payload message.
+        int: How many observations were new. Zero for a success that carries no records, or only ones already held.
     """
-    if context.attempt.parts:
-        raise _refuse('corporate-action intake is not built yet; refused rather than acknowledged unwritten')
-    return 0
+    observations = observations_of(context.request, context.attempt)
+    if not observations:
+        return 0
+    return await insert_observations(context.db, observations)
 
 
 ARMS: dict[IngestRequestKind, Arm] = {
@@ -402,12 +410,19 @@ ARMS: dict[IngestRequestKind, Arm] = {
 
 
 def _label_for(request: IngestRequestRecord) -> AttemptLabel:
-    """The NOT NULL label columns of the attempt row, from the request. Only a bars request has them.
+    """The label columns of the attempt row, from the request, by kind.
+
+    A bars request supplies all five. A corporate-actions request supplies the symbol it asked for (None when it named
+    none) and NULL for the rest. No sentinel stands in for a value the store does not know.
 
     Raises:
-        InvalidRequestError: INVALID_REQUEST, for a request of another kind or one missing a label field. No
-            sentinel stands in for a value the store does not know.
+        InvalidRequestError: INVALID_REQUEST, for a bars request missing a label field, or for an asset-list request
+            (its attempt row lands with the asset-list arm).
     """
+    if request.kind is IngestRequestKind.CORPORATE_ACTIONS:
+        return AttemptLabel(
+            asset_symbol=request.asset_symbol, asset_type=None, data_type=None, granularity=None, update_type=None
+        )
     if request.kind is not IngestRequestKind.BARS:
         raise _refuse(f'an attempt of a {request.kind} request cannot be recorded yet')
     if (
@@ -636,7 +651,9 @@ class DeliveryIntake:
         context = ArmContext(db, request, attempt, self._chunk_size)
         if trailer.outcome is DeliveryOutcome.SUCCEEDED:
             try:
-                bars_written = await ARMS[request.kind](context)
+                written = await ARMS[request.kind](context)
+                # bars_written is bars: another kind's record count is not a bar count.
+                bars_written = written if request.kind is IngestRequestKind.BARS else 0
                 has_records = _carries_records(attempt.parts)
             except DatasetDropped:
                 # The dataset is gone or stopped: nothing was written (the arm judged it first, under the entry lock).
@@ -751,7 +768,9 @@ class DeliveryIntake:
             # The human sentence of a failure, as the report gave it; ingest guarantees it carries no secret.
             error_message=(trailer.detail or None) if state is IngestRunState.FAILED else None,
             label=_label_for(request),
-            vendor_asset_id=header.vendor_asset_id or None,
+            # Stored for a bars attempt only: the id is the bars stop rule's detector (ADR tj-26jt9w addendum 12). Another
+            # kind's attempt row keeps NULL whatever the header carries.
+            vendor_asset_id=(header.vendor_asset_id or None) if request.kind is IngestRequestKind.BARS else None,
             # Rule (d) already limits a served range to a SUCCEEDED report; it is stored on that attempt row only.
             served_start=trailer.served_range.start if trailer.served_range is not None else None,
             served_end=trailer.served_range.end if trailer.served_range is not None else None,

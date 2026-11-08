@@ -103,15 +103,18 @@ class IngestRun(AppBase.DATA_STORE_BASE, CustomTypeTable):
     # StoreDatasetEntry.owner, so no statement binding it renders the value, and it is never logged (D8).
     actor = Column(SensitiveString, nullable=False)
 
-    # The label: what the dataset's identity said when the run started. Same enum types as the entry.
-    asset_symbol = Column(String, nullable=False)
-    asset_type = Column(Enum(AssetType), nullable=False)
-    data_type = Column(Enum(DataType), nullable=False)
+    # The label: what the dataset's identity said when the run started. Same enum types as the entry. The label columns
+    # other than source are NULL on the attempt row of a request that is not about one bar series (revision
+    # c7e19a4d5b28): a corporate-actions attempt keeps the symbol it asked for and nothing else, an asset-list attempt
+    # nothing. Never a sentinel; every reader handles NULL.
+    asset_symbol = Column(String, nullable=True)
+    asset_type = Column(Enum(AssetType), nullable=True)
+    data_type = Column(Enum(DataType), nullable=True)
     source = Column(Enum(DataSource), nullable=False)
-    granularity = Column(Enum(Granularity), nullable=False)
+    granularity = Column(Enum(Granularity), nullable=True)
     # UpdateType's integer value. A plain column rather than the entry's CustomColumn: this table is
     # read and written through the crud's own functions, never through get_fields.
-    update_type = Column(Integer, nullable=False)
+    update_type = Column(Integer, nullable=True)
     # The RESOLVED tape, known only at the ack. NULL for a run that never got one.
     feed = Column(Enum(Feed, name='feed', values_callable=lambda enum_cls: [m.value for m in enum_cls]), nullable=True)
 

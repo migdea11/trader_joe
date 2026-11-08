@@ -57,6 +57,7 @@ from data.store.seeds import producer as producer_module
 from data.store.seeds.bundle import BUNDLE_TAG, MAX_BUNDLE_BYTES, parse_bundle
 from data.store.seeds.dump import (
     BAR_TABLE,
+    CORPORATE_ACTION_TABLE,
     ENTRY_TABLE,
     INSTANCE_TABLE,
     NORMALISE_SQL,
@@ -69,7 +70,13 @@ from data.store.seeds.dump import (
 from data.store.seeds.ingest_records import (
     EXPECTED_ATTEMPT_ROWS,
     EXPECTED_INSTANCES,
+    EXPECTED_INTERRUPTED_RUNS,
+    EXPECTED_LEGACY_RUNS,
+    EXPECTED_LEGACY_STATES,
+    EXPECTED_OBSERVATIONS,
     EXPECTED_REQUEST_STATES,
+    EXPECTED_REVISED_ACTIONS,
+    EXPECTED_RUN_ROWS,
     REQUEST_IDS,
     seed_ingest_records,
 )
@@ -92,6 +99,7 @@ SYNTHETIC_ROWS = [
     ('b', 'GAPS_ZZSEEDGG', '', 15),
     ('q', 'ZZSEEDAA', 'seed-owner-a', 9),
     ('r', 'ZZSEEDAA', 'seed-owner-b', 18),
+    ('c', 'ZZSEEDCA', '', 3),
 ]
 ENTRY_LINES = [
     "INSERT INTO public.store_dataset_entry (id, owner) VALUES ('0a', 'seed-owner-a');",
@@ -106,6 +114,9 @@ RENDERED = {
     ],
     REQUEST_TABLE: ["INSERT INTO public.ingest_request (id, state) VALUES ('5eed', 'PENDING');"],
     RUN_TABLE: ["INSERT INTO public.ingest_run (id, request_id) VALUES ('0r', NULL);"],
+    CORPORATE_ACTION_TABLE: [
+        "INSERT INTO public.corporate_action (id, vendor_action_id) VALUES ('0c', 'seed-action-a');"
+    ],
 }
 SETVAL_7 = "SELECT pg_catalog.setval('public.stock_market_activity_id_seq', 7, true);\n"
 EXPECTED_SQL = ''.join(f'{line}\n' for table in SEED_TABLES for line in RENDERED[table]) + SETVAL_7
@@ -115,29 +126,45 @@ COLUMNS = {
     INSTANCE_TABLE: ['superseded_at', 'instance_id'],
     REQUEST_TABLE: ['state', 'id'],
     RUN_TABLE: ['request_id', 'id'],
+    CORPORATE_ACTION_TABLE: ['vendor_action_id', 'id'],
 }
-COUNTS = {ENTRY_TABLE: 3, BAR_TABLE: 7, INSTANCE_TABLE: 2, REQUEST_TABLE: 9, RUN_TABLE: 18}
+# corporate_action's count is also the observation count of the cast refusal (the same statement), so it is the
+# cast's EXPECTED_OBSERVATIONS, as ingest_instance's is EXPECTED_INSTANCES and ingest_run's is EXPECTED_RUN_ROWS (the
+# 'run rows' check, ten attempt rows and four legacy-shaped runs).
+COUNTS = {ENTRY_TABLE: 3, BAR_TABLE: 7, INSTANCE_TABLE: 2, REQUEST_TABLE: 11, RUN_TABLE: 14, CORPORATE_ACTION_TABLE: 3}
 DIGESTS = {
     ENTRY_TABLE: {'id': 'i1', 'owner': 'o1'},
     BAR_TABLE: {'close': 'c0', 'id': 'i0'},
     INSTANCE_TABLE: {'instance_id': 'n0', 'superseded_at': 'n1'},
     REQUEST_TABLE: {'id': 'q0', 'state': 'q1'},
     RUN_TABLE: {'id': 'r0', 'request_id': 'r1'},
+    CORPORATE_ACTION_TABLE: {'id': 'c0', 'vendor_action_id': 'c1'},
 }
 # The one query that asks for old four-column bar key collisions.
 COLLISION_MARK = 'HAVING count(*) > 1'
-# The reset of the three ingest tables, the one script besides NORMALISE_SQL.
-RESET_SQL = f'DELETE FROM {RUN_TABLE}; DELETE FROM {REQUEST_TABLE}; DELETE FROM {INSTANCE_TABLE};'
+# The reset of the three ingest tables and corporate_action (tj-7zjov1.31), the one script besides NORMALISE_SQL.
+RESET_SQL = (
+    f'DELETE FROM {RUN_TABLE}; DELETE FROM {REQUEST_TABLE}; DELETE FROM {INSTANCE_TABLE}; '
+    f'DELETE FROM {CORPORATE_ACTION_TABLE};'
+)
 DATASET_ID = uuid.UUID('7ceff30a-af80-1760-5057-d346cc334f4d')
 # The steps of the ingest-record phase, in order, between the collision check and the rewrite.
+# Since tj-7zjov1.31 the ingest reset runs a second time, after the dataset lookup and right before the cast, so the
+# seed holds the cast alone and not the POSTs' own request and attempt rows.
 RECORD_STEPS = [
     'seed dataset lookup',
+    'ingest reset',
     'seed',
     'request states',
     'attempt rows',
+    'legacy run states',
+    'interrupted runs',
+    'run rows',
     'half-attempt rows',
     'instance count',
     'superseded count',
+    'observation count',
+    'revised action count',
     'synthetic check',
 ]
 # Every async URL a stub seeder was handed by the REAL Stack (the end-to-end tier), per test.
@@ -192,7 +219,7 @@ def stored_bar_keys(path: str, body: dict[str, str]) -> list[tuple]:
 
 def _table_of(sql: str) -> str:
     """The one seed table a per-table query names (the synthetic check, naming them all, is answered first)."""
-    for table in (INSTANCE_TABLE, REQUEST_TABLE, RUN_TABLE, BAR_TABLE, ENTRY_TABLE):
+    for table in (CORPORATE_ACTION_TABLE, INSTANCE_TABLE, REQUEST_TABLE, RUN_TABLE, BAR_TABLE, ENTRY_TABLE):
         if table in sql:
             return table
     raise AssertionError(f'no seed table in: {sql[:80]}')
@@ -207,7 +234,8 @@ class FakeStack:
     rows) replace the whole result of the collision query and the row-count queries; render, columns
     and digests (table -> rows) replace those results. The ingest-record phase: foreign_records are
     rows the synthetic check sees only after the seeder ran; dataset_rows, state_rows, attempt_rows,
-    stray_rows and superseded_rows replace the answers of the queries of that phase; seed_error is
+    stray_rows, superseded_rows, revised_rows, legacy_rows and interrupted_rows replace the answers of the queries
+    of that phase (the 'run rows' total is the ingest_run row count, raw_counts); seed_error is
     raised by the stub seeder.
     """
 
@@ -231,6 +259,9 @@ class FakeStack:
         attempt_rows=None,
         stray_rows=None,
         superseded_rows=None,
+        revised_rows=None,
+        legacy_rows=None,
+        interrupted_rows=None,
         seed_error=None,
     ):
         self.revision_rows = [(HEAD,)] if revision_rows is None else revision_rows
@@ -254,6 +285,9 @@ class FakeStack:
         self.attempt_rows = [(EXPECTED_ATTEMPT_ROWS,)] if attempt_rows is None else attempt_rows
         self.stray_rows = [(0,)] if stray_rows is None else stray_rows
         self.superseded_rows = [(EXPECTED_INSTANCES - 1,)] if superseded_rows is None else superseded_rows
+        self.revised_rows = [(EXPECTED_REVISED_ACTIONS,)] if revised_rows is None else revised_rows
+        self.legacy_rows = list(EXPECTED_LEGACY_STATES.items()) if legacy_rows is None else legacy_rows
+        self.interrupted_rows = [(EXPECTED_INTERRUPTED_RUNS,)] if interrupted_rows is None else interrupted_rows
         self.seed_error = seed_error
         self.seeded_with: list[tuple] = []
         self.calls: list[tuple] = []
@@ -278,6 +312,9 @@ class FakeStack:
                 return self.rows_after_records
             posted = any(call[0] == 'post' for call in self.calls)
             return self.rows_after if posted else self.rows_before
+        # Before the collision mark, which the revised-action query also carries.
+        if f'{CORPORATE_ACTION_TABLE} GROUP BY source, vendor_action_id HAVING count(*) > 1' in sql:
+            return self.revised_rows
         if COLLISION_MARK in sql:
             self.collision_sql.append(sql)
             if self.raw_collisions is not None:
@@ -288,6 +325,11 @@ class FakeStack:
         if sql.startswith(f'SELECT id::text FROM {ENTRY_TABLE} '):
             self.dataset_sql.append(sql)
             return self.dataset_rows
+        # The legacy-run checks (e5d950e), before the request-state shape, which the first of them also starts with.
+        if 'WHERE request_id IS NULL AND attempt_no IS NULL GROUP BY state' in sql:
+            return self.legacy_rows
+        if "WHERE request_id IS NULL AND error_reason = 'INTERRUPTED'" in sql:
+            return self.interrupted_rows
         if sql.startswith('SELECT state::text, count(*)'):
             return self.state_rows
         if 'WHERE request_id IS NOT NULL AND attempt_no IS NOT NULL' in sql:
@@ -409,7 +451,8 @@ def test_the_steps_run_in_the_designed_order():
     assert kinds[0] == 'alembic_version read'
     assert len(checks) == 3
     assert checks[0] < kinds.index('ingest reset') < posts[0], 'refusal, then the ingest reset, then the POSTs'
-    assert kinds.index('ingest reset') == checks[0] + 1 and kinds.count('ingest reset') == 1
+    # Twice: before the POSTs, and again in the record steps below, right before the cast.
+    assert kinds.index('ingest reset') == checks[0] + 1 and kinds.count('ingest reset') == 2
     assert posts[-1] < checks[1] < kinds.index('normalise'), 'and again after the POSTs, before the rewrite'
     assert checks[1] < kinds.index('bar collision check') < kinds.index('normalise'), 'collisions: after, before'
     assert kinds.count('bar collision check') == 1
@@ -428,16 +471,21 @@ def test_normalise_and_the_ingest_reset_are_the_only_scripts():
     produce(stack, date='2026-09-30')
     assert [call for call in stack.calls if call[0] == 'script'] == [
         ('script', 'ingest reset'),
+        ('script', 'ingest reset'),
         ('script', 'normalise'),
     ]
 
 
 def test_the_ingest_reset_empties_exactly_the_three_ingest_tables_children_first():
-    """Runs, then requests, then instances: never the entry or bar table, which the scenario rebuilds itself."""
+    """Runs, then requests, then instances, then corporate_action (tj-7zjov1.31), both times.
+
+    Never the entry or bar table, which the scenario rebuilds itself.
+    """
     stack = FakeStack()
     produce(stack, date='2026-09-30')
-    (reset,) = [sql for sql in stack.sql if sql.startswith('DELETE')]
-    assert reset == RESET_SQL
+    resets = [sql for sql in stack.sql if sql.startswith('DELETE')]
+    assert resets == [RESET_SQL, RESET_SQL]
+    (reset,) = set(resets)
     assert ENTRY_TABLE not in reset and BAR_TABLE not in reset and 'TRUNCATE' not in reset
 
 
@@ -624,16 +672,49 @@ def _states(**changes):
     return list(states.items())
 
 
-CAST_MESSAGE = 'the seeded ingest requests are not the expected cast (counts per state differ); no seed written'
+# The refusal names the counts per state found and expected (enum names and counts, never a value), in name order.
+EXPECTED_STATES_TEXT = 'EMPTY=1, FAILED=4, NOT_DELIVERED=1, PENDING=1, QUEUED=1, SUCCEEDED=3'
+
+
+def _cast_message(found: str) -> str:
+    return (
+        'the seeded ingest requests are not the expected cast (counts per state differ); '
+        f'found {found}, expected {EXPECTED_STATES_TEXT}; no seed written'
+    )
+
+
 CAST_REFUSALS = [
-    pytest.param({'state_rows': _states(EMPTY=None)}, CAST_MESSAGE, id='a-state-missing'),
-    pytest.param({'state_rows': _states(FAILED=3)}, CAST_MESSAGE, id='a-count-short'),
-    pytest.param({'state_rows': _states(PENDING=2)}, CAST_MESSAGE, id='a-count-over'),
-    pytest.param({'state_rows': _states(RUNNING=1)}, CAST_MESSAGE, id='an-extra-state'),
-    pytest.param({'state_rows': []}, CAST_MESSAGE, id='no-requests'),
-    pytest.param({'state_rows': [(s, str(n)) for s, n in _states()]}, CAST_MESSAGE, id='text-counts'),
-    pytest.param({'attempt_rows': [(7,)]}, '7 attempt rows were written; expected 8; no seed written', id='attempts-7'),
-    pytest.param({'attempt_rows': [(9,)]}, '9 attempt rows were written; expected 8; no seed written', id='attempts-9'),
+    pytest.param(
+        {'state_rows': _states(EMPTY=None)},
+        _cast_message('FAILED=4, NOT_DELIVERED=1, PENDING=1, QUEUED=1, SUCCEEDED=3'),
+        id='a-state-missing',
+    ),
+    pytest.param(
+        {'state_rows': _states(FAILED=3)},
+        _cast_message('EMPTY=1, FAILED=3, NOT_DELIVERED=1, PENDING=1, QUEUED=1, SUCCEEDED=3'),
+        id='a-count-short',
+    ),
+    pytest.param(
+        {'state_rows': _states(PENDING=2)},
+        _cast_message('EMPTY=1, FAILED=4, NOT_DELIVERED=1, PENDING=2, QUEUED=1, SUCCEEDED=3'),
+        id='a-count-over',
+    ),
+    pytest.param(
+        {'state_rows': _states(RUNNING=1)},
+        _cast_message('EMPTY=1, FAILED=4, NOT_DELIVERED=1, PENDING=1, QUEUED=1, RUNNING=1, SUCCEEDED=3'),
+        id='an-extra-state',
+    ),
+    pytest.param({'state_rows': []}, _cast_message('none'), id='no-requests'),
+    # Text counts render as the same digits: still refused (the comparison is typed); the message cannot show why.
+    pytest.param(
+        {'state_rows': [(s, str(n)) for s, n in _states()]}, _cast_message(EXPECTED_STATES_TEXT), id='text-counts'
+    ),
+    pytest.param(
+        {'attempt_rows': [(9,)]}, '9 attempt rows were written; expected 10; no seed written', id='attempts-9'
+    ),
+    pytest.param(
+        {'attempt_rows': [(11,)]}, '11 attempt rows were written; expected 10; no seed written', id='attempts-11'
+    ),
     pytest.param(
         {'stray_rows': [(1,)]},
         'a run has a request id without an attempt number or the reverse; no seed written',
@@ -654,6 +735,66 @@ CAST_REFUSALS = [
         {'superseded_rows': [(2,)]},
         'the instance marker did not supersede exactly the older instance; no seed written',
         id='both-superseded',
+    ),
+    # e5d950e: the four legacy-shaped runs, by state, the one swept INTERRUPTED, and the run total.
+    pytest.param(
+        {'legacy_rows': [('EMPTY', 1), ('FAILED', 2)]},
+        'the seeded legacy runs are not the expected cast (3 found, 4 expected); counts per state: '
+        'found EMPTY=1, FAILED=2, expected EMPTY=1, FAILED=2, SUCCEEDED=1; no seed written',
+        id='legacy-state-missing',
+    ),
+    pytest.param(
+        {'legacy_rows': [('EMPTY', 1), ('FAILED', 2), ('SUCCEEDED', 1), ('RUNNING', 1)]},
+        'the seeded legacy runs are not the expected cast (5 found, 4 expected); counts per state: '
+        'found EMPTY=1, FAILED=2, RUNNING=1, SUCCEEDED=1, expected EMPTY=1, FAILED=2, SUCCEEDED=1; no seed written',
+        id='legacy-running-left',
+    ),
+    pytest.param(
+        {'legacy_rows': []},
+        'the seeded legacy runs are not the expected cast (0 found, 4 expected); counts per state: '
+        'found none, expected EMPTY=1, FAILED=2, SUCCEEDED=1; no seed written',
+        id='no-legacy-runs',
+    ),
+    pytest.param(
+        {'interrupted_rows': [(0,)]},
+        '0 interrupted legacy runs were written; expected 1; no seed written',
+        id='none-interrupted',
+    ),
+    pytest.param(
+        {'interrupted_rows': [(2,)]},
+        '2 interrupted legacy runs were written; expected 1; no seed written',
+        id='two-interrupted',
+    ),
+    pytest.param(
+        {'raw_counts': {RUN_TABLE: [(13,)]}},
+        '13 ingest_run rows were written; expected 14; no seed written',
+        id='runs-13',
+    ),
+    pytest.param(
+        {'raw_counts': {RUN_TABLE: [(15,)]}},
+        '15 ingest_run rows were written; expected 14; no seed written',
+        id='runs-15',
+    ),
+    # tj-7zjov1.31: the observations of the cast (A, B, A revised) and the one revised action.
+    pytest.param(
+        {'raw_counts': {CORPORATE_ACTION_TABLE: [(2,)]}},
+        '2 corporate-action observations were written; expected 3; no seed written',
+        id='observations-2',
+    ),
+    pytest.param(
+        {'raw_counts': {CORPORATE_ACTION_TABLE: [(4,)]}},
+        '4 corporate-action observations were written; expected 3; no seed written',
+        id='observations-4',
+    ),
+    pytest.param(
+        {'revised_rows': [(0,)]},
+        '0 corporate actions hold more than one payload; expected 1; no seed written',
+        id='no-revision',
+    ),
+    pytest.param(
+        {'revised_rows': [(2,)]},
+        '2 corporate actions hold more than one payload; expected 1; no seed written',
+        id='two-revisions',
     ),
 ]
 
@@ -684,8 +825,12 @@ def test_a_cast_refusal_exits_3_through_the_entry_point(monkeypatch, capsys, ove
         ({'stray_rows': []}, 'half-attempt rows'),
         ({'raw_counts': {INSTANCE_TABLE: [(None,)]}}, 'instance count'),
         ({'superseded_rows': [(True,)]}, 'superseded count'),
+        ({'raw_counts': {CORPORATE_ACTION_TABLE: [('3',)]}}, 'observation count'),
+        ({'revised_rows': [(None,)]}, 'revised action count'),
+        ({'interrupted_rows': [('1',)]}, 'interrupted runs'),
+        ({'raw_counts': {RUN_TABLE: [(None,)]}}, 'run rows'),
     ],
-    ids=['attempts', 'half-attempts', 'instances', 'superseded'],
+    ids=['attempts', 'half-attempts', 'instances', 'superseded', 'observations', 'revised', 'interrupted', 'runs'],
 )
 def test_a_cast_count_that_is_not_one_integer_fails_without_echoing_it(no_writes, override, what):
     with pytest.raises(StackError) as raised:
@@ -700,22 +845,47 @@ def test_the_cast_queries_count_what_the_refusal_names():
     assert f'SELECT count(*) FROM {RUN_TABLE} WHERE request_id IS NOT NULL AND attempt_no IS NOT NULL;' in stack.sql
     assert f'SELECT count(*) FROM {RUN_TABLE} WHERE (request_id IS NULL) <> (attempt_no IS NULL);' in stack.sql
     assert f'SELECT count(*) FROM {INSTANCE_TABLE} WHERE superseded_at IS NOT NULL;' in stack.sql
+    assert f'SELECT count(*) FROM {CORPORATE_ACTION_TABLE};' in stack.sql
+    assert (
+        f'SELECT state::text, count(*) FROM {RUN_TABLE} WHERE request_id IS NULL AND attempt_no IS NULL GROUP BY state;'
+    ) in stack.sql
+    assert f"SELECT count(*) FROM {RUN_TABLE} WHERE request_id IS NULL AND error_reason = 'INTERRUPTED';" in stack.sql
+    assert f'SELECT count(*) FROM {RUN_TABLE};' in stack.sql
+    assert (
+        f'SELECT count(*) FROM (SELECT 1 FROM {CORPORATE_ACTION_TABLE} GROUP BY source, vendor_action_id '
+        'HAVING count(*) > 1) AS revised;'
+    ) in stack.sql
 
 
 def test_the_expected_cast_is_the_cast_ingest_records_names():
-    """Nine named requests, one per state but four FAILED; eight attempt rows; two instances, one superseded."""
-    assert sum(EXPECTED_REQUEST_STATES.values()) == len(REQUEST_IDS) == 9
+    """Eleven named requests (two corporate-actions since tj-7zjov1.31); ten attempt rows; two instances.
+
+    One per state but four FAILED and three SUCCEEDED (the bars success and the two corporate-actions requests);
+    three observations (A, B, A revised), one action holding two payloads.
+    """
+    assert sum(EXPECTED_REQUEST_STATES.values()) == len(REQUEST_IDS) == 11
     assert len(set(REQUEST_IDS.values())) == len(REQUEST_IDS)
     assert EXPECTED_REQUEST_STATES['FAILED'] == sum(1 for name in REQUEST_IDS if name.startswith('FAILED_'))
-    assert EXPECTED_ATTEMPT_ROWS == 8 and EXPECTED_INSTANCES == 2
+    assert EXPECTED_REQUEST_STATES['SUCCEEDED'] == 1 + sum(1 for name in REQUEST_IDS if name.startswith('CA_'))
+    assert EXPECTED_ATTEMPT_ROWS == 10 and EXPECTED_INSTANCES == 2
+    assert (EXPECTED_OBSERVATIONS, EXPECTED_REVISED_ACTIONS) == (3, 1)
+    # e5d950e: four legacy-shaped runs (one swept INTERRUPTED), so fourteen ingest_run rows in all.
+    assert sum(EXPECTED_LEGACY_STATES.values()) == EXPECTED_LEGACY_RUNS == 4
+    assert EXPECTED_LEGACY_STATES == {'EMPTY': 1, 'FAILED': 2, 'SUCCEEDED': 1} and EXPECTED_INTERRUPTED_RUNS == 1
+    assert EXPECTED_RUN_ROWS == EXPECTED_ATTEMPT_ROWS + EXPECTED_LEGACY_RUNS == 14
 
 
 def test_the_committed_head_seed_holds_the_cast():
-    """A relationship with the seed the producer wrote at the head: the POSTed runs plus the attempt rows."""
+    """A relationship with the seed the producer wrote at the head: the cast alone (tj-7zjov1.31).
+
+    The ingest tables are emptied after the POSTs, so the POSTs' own runs are not in it: the attempt rows and the
+    cast's four legacy-shaped runs (e5d950e).
+    """
     manifest = json.loads((REPO_ROOT / 'tests' / 'system' / 'seeds' / f'{HEAD}.json').read_text(encoding='utf-8'))
     assert manifest['row_counts'][REQUEST_TABLE] == sum(EXPECTED_REQUEST_STATES.values())
     assert manifest['row_counts'][INSTANCE_TABLE] == EXPECTED_INSTANCES
-    assert manifest['row_counts'][RUN_TABLE] == len(SEED_REQUESTS) + EXPECTED_ATTEMPT_ROWS
+    assert manifest['row_counts'][RUN_TABLE] == EXPECTED_RUN_ROWS
+    assert manifest['row_counts'][CORPORATE_ACTION_TABLE] == EXPECTED_OBSERVATIONS
     sql = (REPO_ROOT / 'tests' / 'system' / 'seeds' / f'{HEAD}.sql').read_text(encoding='utf-8')
     for request_id in REQUEST_IDS.values():
         assert f"'{request_id}'" in sql, request_id
@@ -1108,7 +1278,10 @@ def test_no_rows_at_all_is_refused_as_an_empty_seed():
     """Unreachable past the collision check today; an empty .sql still cannot become a bundle."""
     stack = FakeStack(
         render={table: [] for table in SEED_TABLES},
-        raw_counts={table: [(0,)] for table in SEED_TABLES if table != INSTANCE_TABLE},
+        # The instance, run and observation counts are also the cast refusal's (the same statements), so they stay.
+        raw_counts={
+            table: [(0,)] for table in SEED_TABLES if table not in (INSTANCE_TABLE, RUN_TABLE, CORPORATE_ACTION_TABLE)
+        },
     )
     with pytest.raises(SeedRefused, match='exactly one newline'):
         produce(stack)

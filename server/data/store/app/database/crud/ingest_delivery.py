@@ -48,13 +48,16 @@ class StoredAttempt:
 
 @dataclass(frozen=True)
 class AttemptLabel:
-    """The NOT NULL label columns of an ingest_run row, which a request can supply only for a bars request."""
+    """The label columns of an ingest_run row, None where the request has none (stored NULL, revision c7e19a4d5b28).
 
-    asset_symbol: str
-    asset_type: AssetType
-    data_type: DataType
-    granularity: Granularity
-    update_type: UpdateType
+    A bars request supplies all five; a corporate-actions request only the symbol it asked for.
+    """
+
+    asset_symbol: str | None
+    asset_type: AssetType | None
+    data_type: DataType | None
+    granularity: Granularity | None
+    update_type: UpdateType | None
 
 
 @dataclass(frozen=True)
@@ -221,7 +224,7 @@ async def insert_attempt(db: AsyncSession, attempt: NewAttempt) -> IngestRunReco
         'data_type': attempt.label.data_type,
         'source': request.source,
         'granularity': attempt.label.granularity,
-        'update_type': attempt.label.update_type.value,
+        'update_type': attempt.label.update_type.value if attempt.label.update_type is not None else None,
         'feed': attempt.feed,
         'requested_start': request.requested_start,
         'requested_end': request.requested_end,

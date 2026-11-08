@@ -51,12 +51,14 @@ class IngestRunRecord:
     request_id: uuid.UUID | None
     trigger: IngestRunTrigger
     actor: str = field(repr=False)
-    asset_symbol: str
-    asset_type: AssetType
-    data_type: DataType
+    # The label columns are None on the attempt row of a request that is not about one bar series (a corporate-actions
+    # attempt keeps only its symbol; an asset-list attempt has none).
+    asset_symbol: str | None
+    asset_type: AssetType | None
+    data_type: DataType | None
     source: DataSource
-    granularity: Granularity
-    update_type: UpdateType
+    granularity: Granularity | None
+    update_type: UpdateType | None
     feed: Feed | None
     requested_start: datetime | None
     requested_end: datetime | None
@@ -94,7 +96,7 @@ class IngestRunRecord:
             data_type=row.data_type,
             source=row.source,
             granularity=row.granularity,
-            update_type=UpdateType(row.update_type),
+            update_type=UpdateType(row.update_type) if row.update_type is not None else None,
             feed=row.feed,
             requested_start=row.requested_start,
             requested_end=row.requested_end,
@@ -375,6 +377,8 @@ async def finished_scheduled_runs(db: AsyncSession, source: DataSource, since: d
                 and_(IngestRequest.id.is_(None), IngestRun.trigger == IngestRunTrigger.SCHEDULE),
             ),
             IngestRun.source == source,
+            # The refresh's history is bars attempts: a corporate-actions or asset-list attempt has no granularity.
+            IngestRun.granularity.is_not(None),
             IngestRun.state != IngestRunState.RUNNING,
             IngestRun.started_at >= since,
         )

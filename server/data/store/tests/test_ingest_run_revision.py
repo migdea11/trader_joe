@@ -33,10 +33,12 @@ pytestmark = pytest.mark.data_store
 MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / 'migrations'
 REVISION_FILE = MIGRATIONS_DIR / 'versions' / '6f5a798746a1_ingest_run.py'
 # The later revisions that change ingest_run, in chain order: the model is what the HEAD leaves. f2b7d4a91c36
-# (tj-7zjov1.25) adds the attempt columns and index; b8e4c1f7a923 (tj-7zjov1.123) adds served_start and served_end.
+# (tj-7zjov1.25) adds the attempt columns and index; b8e4c1f7a923 (tj-7zjov1.123) adds served_start and served_end;
+# c7e19a4d5b28 (tj-7zjov1.31, P18) relaxes five label columns to nullable with alter_column.
 LATER_FILES = [
     MIGRATIONS_DIR / 'versions' / 'f2b7d4a91c36_request_record_and_instance_marker.py',
     MIGRATIONS_DIR / 'versions' / 'b8e4c1f7a923_push_path_columns.py',
+    MIGRATIONS_DIR / 'versions' / 'c7e19a4d5b28_corporate_action_observations.py',
 ]
 DIALECT = postgresql.dialect()
 NEW_TYPES = ['ingest_run_trigger', 'ingest_run_state']
@@ -117,15 +119,9 @@ def test_downgrade_drops_exactly_what_upgrade_created_in_reverse():
     assert dropped == list(reversed(created)), 'assettype, feed and the rest belong to other tables'
 
 
-def _later_ingest_run_changes() -> tuple[list[sa.Column], set[str]]:
-    """The columns and indexes LATER revisions add to ingest_run: f2b7d4a91c36 (tj-7zjov1.25), b8e4c1f7a923 (.123).
-
-    The model describes ingest_run as the HEAD leaves it, so the model comparisons below compose this revision's
-    table with what came after it, read from the later revisions' own upgrade() rather than restated here.
-    """
-    columns: list[sa.Column] = []
-    indexes: set[str] = set()
-    objects = SchemaObjects()
+def _later_upgrade_ops() -> list[MagicMock]:
+    """Each LATER revision's upgrade() run against a recording op, in chain order."""
+    ops: list[MagicMock] = []
     for path in LATER_FILES:
         spec = importlib.util.spec_from_file_location(f'revision_{path.name.split("_", 1)[0]}', path)
         module = importlib.util.module_from_spec(spec)
@@ -137,6 +133,34 @@ def _later_ingest_run_changes() -> tuple[list[sa.Column], set[str]]:
             patch.object(postgresql.ENUM, 'drop', autospec=True),
         ):
             module.upgrade()
+        ops.append(op)
+    return ops
+
+
+def _later_ingest_run_alterations() -> list[tuple[str, dict[str, Any]]]:
+    """The alter_column calls LATER revisions make on ingest_run, in chain order: (column, keyword arguments).
+
+    c7e19a4d5b28 (tj-7zjov1.31) is the first: it relaxes five label columns. The earlier revisions declared them NOT
+    NULL on purpose and are not rewritten, so the head's table is this revision's with these alterations applied.
+    """
+    return [
+        (args[1], kwargs)
+        for op in _later_upgrade_ops()
+        for name, args, kwargs in op.method_calls
+        if name == 'alter_column' and args[0] == IngestRun.TABLE_NAME
+    ]
+
+
+def _later_ingest_run_changes() -> tuple[list[sa.Column], set[str]]:
+    """The columns and indexes LATER revisions add to ingest_run: f2b7d4a91c36 (tj-7zjov1.25), b8e4c1f7a923 (.123).
+
+    The model describes ingest_run as the HEAD leaves it, so the model comparisons below compose this revision's
+    table with what came after it, read from the later revisions' own upgrade() rather than restated here.
+    """
+    columns: list[sa.Column] = []
+    indexes: set[str] = set()
+    objects = SchemaObjects()
+    for op in _later_upgrade_ops():
         columns += [
             args[1] for name, args, _ in op.method_calls if name == 'add_column' and args[0] == IngestRun.TABLE_NAME
         ]
@@ -159,18 +183,46 @@ def test_the_revision_and_the_later_ones_build_exactly_the_table_the_model_decla
     (tj-7zjov1.123) two more, so the model is compared with this revision's table plus those columns. Per column rather than as one CREATE TABLE, because
     ADD COLUMN appends where the model declares the attempt columns beside request_id; column order is not schema
     that any statement here depends on. This revision's own columns are still compared, as a strict subset.
+
+    THE LABEL COLUMNS WERE RELAXED (tj-7zjov1.31): c7e19a4d5b28 alters five of this revision's columns to nullable.
+    This revision still declares them NOT NULL (history is not rewritten), so the alterations are applied to a copy of
+    this revision's table before the comparison, and only an alteration of nullability is accepted: a type or default
+    change there would be a retype the composition does not model, and fails here.
     """
     op, _, _ = _run('upgrade')
     table = _revision_table(op)
-    own = _column_ddl(table)
     later_columns, _ = _later_ingest_run_changes()
     later = {column.name: str(CreateColumn(column).compile(dialect=DIALECT)) for column in later_columns}
+    alterations = _later_ingest_run_alterations()
+    for column_name, kwargs in alterations:
+        assert set(kwargs) == {'nullable'}, f'{column_name} is altered by more than its nullability: {kwargs}'
+        assert column_name in table.c, f'{column_name} is altered but this revision did not create it'
+        table.c[column_name].nullable = kwargs['nullable']
+    own = _column_ddl(table)
 
     assert not own.keys() & later.keys(), 'a later revision re-adds a column this one created'
     assert len(later) == len(later_columns), 'two later revisions add the same column'
     assert {**own, **later} == _column_ddl(IngestRun.__table__)
     # The primary key is not a column property, so it is compared on its own.
     assert [c.name for c in table.primary_key] == [c.name for c in IngestRun.__table__.primary_key]
+
+
+def test_the_head_relaxes_exactly_the_five_label_columns_this_revision_declared_not_null():
+    """tj-7zjov1.31 (P34 escalation rulings, 20:17 UTC note): five label columns, nullable only; source stays NOT NULL.
+
+    The five names are the design's. This revision keeps them NOT NULL as written, and the model declares them
+    nullable, so a later revision is what relaxed them and nothing rewrote this one.
+    """
+    label_columns = {'asset_symbol', 'asset_type', 'data_type', 'granularity', 'update_type'}
+    alterations = _later_ingest_run_alterations()
+    table = _revision_table(_run('upgrade')[0])
+
+    assert [kwargs for _, kwargs in alterations] == [{'nullable': True}] * len(label_columns)
+    assert {column for column, _ in alterations} == label_columns
+    for column in label_columns:
+        assert not table.c[column].nullable, f'{REVISION_FILE.name} was rewritten: {column} is nullable there'
+        assert IngestRun.__table__.c[column].nullable, f'the model still declares {column} NOT NULL'
+    assert not IngestRun.__table__.c.source.nullable, 'source is not a label the design relaxes'
 
 
 def test_the_revision_and_the_later_ones_build_exactly_the_indexes_the_model_declares():

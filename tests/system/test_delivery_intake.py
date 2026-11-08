@@ -27,7 +27,8 @@ THE CASES:
        vendor asset id and the served range as sent), the request's count 1, spend and state, and is answered FINAL;
   (3)  the same delivery again is answered identically and changes no row (bars' updated_at included);
   (4)  a report a cross-field rule refuses reaches the client as the typed INVALID_REQUEST with nothing written; a
-       request the store does not hold reaches it as NOT_FOUND;
+       request the store does not hold reaches it as NOT_FOUND; rule f both ways (tj-7zjov1.31): corporate-action
+       records on a bars request and a bar page on a corporate-actions request;
   (5)  RegisterInstance with a new id supersedes the older instance and marks its QUEUED request NOT_DELIVERED, a
        repeat moves nothing, and the superseded instance's later reports are still written and answered FINAL;
   (6)  a transient FAILED from the live instance is answered CONTINUE and moves a PENDING or NOT_DELIVERED request to
@@ -80,6 +81,8 @@ from data.store.app.database.models.ingest_run import IngestRunState, IngestRunT
 from data.store.app.ingest import delivery_intake
 from schemas.data_ingest.delivery import (
     AttemptDelivery,
+    CorporateActionRecord,
+    CorporateActionRecords,
     DeliverAttemptResponse,
     DeliveryErrorClass,
     DeliveryOutcome,
@@ -447,6 +450,56 @@ async def test_4_a_request_the_store_does_not_hold_reaches_the_client_as_not_fou
     error = await store.refused(report(uuid.uuid4(), instance_id=holder))
 
     assert error.reason is Reason.NOT_FOUND, error.reason
+
+
+async def _observation_count(engine: AsyncEngine, request_id: uuid.UUID) -> int:
+    async with engine.connect() as conn:
+        return (
+            await conn.execute(
+                sa.select(sa.func.count()).select_from(pg.ACTIONS).where(pg.ACTIONS.c.request_id == request_id)
+            )
+        ).scalar_one()
+
+
+async def test_4f_a_corporate_actions_payload_on_a_bars_request_reaches_the_client_as_invalid_request(
+    store, created, run_identity, bars_entry, instance_id
+):
+    """Rule f through the wire (tj-7zjov1.31, the architect's 16:16 UTC note from the P34s gate), bars side."""
+    holder = instance_id('rule-f-bars')
+    await store.register(holder)
+    request_id = await _request(
+        store.engine, created, run_identity, bars_entry.asset_symbol, holder=holder, dataset_id=bars_entry.id
+    )
+    records = CorporateActionRecords(
+        records=[
+            CorporateActionRecord(vendor_action_id=f'ca-{uuid.uuid4().hex}', action_type='split', raw_payload=b'{}')
+        ]
+    )
+    attempt = _with(report(request_id, instance_id=holder), parts=[records])
+    before = await pg._snapshot(store.engine, request_id, bars_entry.id)
+
+    error = await store.refused(attempt)
+
+    assert isinstance(error, InvalidRequestError) and error.reason is Reason.INVALID_REQUEST, error
+    assert await pg._snapshot(store.engine, request_id, bars_entry.id) == before, 'a refused report wrote something'
+    assert await _observation_count(store.engine, request_id) == 0
+
+
+async def test_4f_a_bar_page_on_a_corporate_actions_request_reaches_the_client_as_invalid_request(
+    store, created, run_identity, instance_id
+):
+    """Rule f through the wire, corporate-actions side: a well-formed corporate-actions report carrying a BarPage."""
+    holder = instance_id('rule-f-actions')
+    await store.register(holder)
+    request_id = await pg._ca_request(store.engine, created, run_identity, holder=holder)
+    attempt = _with(pg.ca_report(request_id, [], instance_id=holder), parts=[bar_page(0, 1)])
+    before = await pg._snapshot(store.engine, request_id, None)
+
+    error = await store.refused(attempt)
+
+    assert isinstance(error, InvalidRequestError) and error.reason is Reason.INVALID_REQUEST, error
+    assert await pg._snapshot(store.engine, request_id, None) == before, 'a refused report wrote something'
+    assert await _observation_count(store.engine, request_id) == 0
 
 
 # --------------------------------------------------------------------------------------------- (5)

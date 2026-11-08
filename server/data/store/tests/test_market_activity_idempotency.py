@@ -60,7 +60,8 @@ BAR_IDENTITY_REVISION = 'eec8f88a7443'
 # f2b7d4a91c36 since tj-7zjov1.25: ingest_request and ingest_instance, and attempt columns on ingest_run only.
 # b8e4c1f7a923 since tj-7zjov1.123: push-path columns on ingest_run, ingest_request and the entry, none on the bar.
 # 39c28a39b290 since tj-7zjov1.153: ingest_request.expiry_type, a request column, none on the bar.
-CURRENT_HEAD = '39c28a39b290'
+# c7e19a4d5b28 since tj-7zjov1.31: the corporate_action table and nullable ingest_run labels, none on the bar.
+CURRENT_HEAD = 'c7e19a4d5b28'
 
 # The natural key as 8f41c2d7a3b9 itself declares it, written out as a HISTORIC LITERAL rather
 # than read off BaseMarketActivity. A past revision's job is to describe the schema as it was;

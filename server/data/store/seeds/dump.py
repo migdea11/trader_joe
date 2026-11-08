@@ -3,13 +3,14 @@ r"""The dump: what normalises the tables, and how Postgres renders them into the
 THIS DOCSTRING IS THE SEED FORMAT'S DEFINITION (decision tj-vhboky.55 SEED FORMAT and addendum S9).
 Hand-written bootstrap seeds (tj-vhboky.62) follow it.
 
-The .sql is a DATA-ONLY rendering of store_dataset_entry, stock_market_activity, ingest_instance, ingest_request and
-ingest_run (never the 8f41c2d7a3b9 archive table; the last three since bead tj-7zjov1.100, written by
-ingest_records.py through the store's own code). It is rendered BY POSTGRES through the driver, in a session at
-TimeZone UTC and extra_float_digits 1 (the digests' settings), and holds exactly:
+The .sql is a DATA-ONLY rendering of store_dataset_entry, stock_market_activity, ingest_instance, ingest_request,
+ingest_run and corporate_action (never the 8f41c2d7a3b9 archive table; the last four written by ingest_records.py
+through the store's own code: the ingest tables since bead tj-7zjov1.100, corporate_action since tj-7zjov1.31).
+It is rendered BY POSTGRES through the driver, in a session at TimeZone UTC and extra_float_digits 1 (the digests'
+settings), and holds exactly:
 
-  1. For each table in SEED_TABLES order (entries, bars, instances, requests, runs), one line per row, rows
-     ordered by id ascending (ingest_instance: by instance_id, see order_column), each
+  1. For each table in SEED_TABLES order (entries, bars, instances, requests, runs, corporate actions), one line per
+     row, rows ordered by id ascending (ingest_instance: by instance_id, see order_column), each
 
          INSERT INTO public.<table> (<columns>) VALUES (<values>);
 
@@ -57,7 +58,8 @@ BAR_TABLE = 'stock_market_activity'
 INSTANCE_TABLE = 'ingest_instance'
 REQUEST_TABLE = 'ingest_request'
 RUN_TABLE = 'ingest_run'
-SEED_TABLES = (ENTRY_TABLE, BAR_TABLE, INSTANCE_TABLE, REQUEST_TABLE, RUN_TABLE)
+CORPORATE_ACTION_TABLE = 'corporate_action'
+SEED_TABLES = (ENTRY_TABLE, BAR_TABLE, INSTANCE_TABLE, REQUEST_TABLE, RUN_TABLE, CORPORATE_ACTION_TABLE)
 # The column a table's rows are ordered by, in the dump and in the manifest digests. Every table has an id
 # primary key except the instance marker, which is keyed by the opaque instance id.
 ORDER_COLUMN = {INSTANCE_TABLE: 'instance_id'}
@@ -110,6 +112,11 @@ UPDATE seed_run SET started_at = TIMESTAMPTZ '{SEED_TIMESTAMP}', finished_at = T
 UPDATE seed_run SET started_at = finished_at WHERE request_id IS NOT NULL AND vendor_first_call_at IS NULL;
 UPDATE seed_request SET created_at = TIMESTAMPTZ '{SEED_TIMESTAMP}';
 UPDATE seed_request SET finished_at = TIMESTAMPTZ '{SEED_TIMESTAMP}' + interval '1 hour' WHERE finished_at IS NOT NULL;
+-- Observations: the id is random and becomes the md5 of the unique index's own key (source, vendor id, payload hash),
+-- so it is the same in any database holding the same cast; received_at is the transaction's now().
+CREATE TEMP TABLE seed_corporate ON COMMIT DROP AS SELECT * FROM {CORPORATE_ACTION_TABLE};
+UPDATE seed_corporate SET id = md5('{CORPORATE_ACTION_TABLE}|' || source::text || '|' || vendor_action_id || '|' || payload_hash)::uuid,
+    received_at = TIMESTAMPTZ '{SEED_TIMESTAMP}';
 UPDATE seed_instance SET first_seen_at = TIMESTAMPTZ '{SEED_TIMESTAMP}',
     last_seen_at = TIMESTAMPTZ '{SEED_TIMESTAMP}' + interval '2 hours',
     superseded_at = CASE WHEN superseded_at IS NULL THEN NULL ELSE TIMESTAMPTZ '{SEED_TIMESTAMP}' + interval '1 hour' END;
@@ -117,12 +124,13 @@ UPDATE seed_bar b SET id = r.rank FROM (
     SELECT id, row_number() OVER (ORDER BY dataset_id, asset_symbol, source, feed, granularity, timestamp) AS rank
     FROM seed_bar
 ) r WHERE b.id = r.id;
-TRUNCATE {ENTRY_TABLE}, {BAR_TABLE}, {INSTANCE_TABLE}, {REQUEST_TABLE}, {RUN_TABLE};
+TRUNCATE {ENTRY_TABLE}, {BAR_TABLE}, {INSTANCE_TABLE}, {REQUEST_TABLE}, {RUN_TABLE}, {CORPORATE_ACTION_TABLE};
 INSERT INTO {ENTRY_TABLE} SELECT * FROM seed_entry ORDER BY id;
 INSERT INTO {BAR_TABLE} SELECT * FROM seed_bar ORDER BY id;
 INSERT INTO {INSTANCE_TABLE} SELECT * FROM seed_instance ORDER BY instance_id;
 INSERT INTO {REQUEST_TABLE} SELECT * FROM seed_request ORDER BY id;
 INSERT INTO {RUN_TABLE} SELECT * FROM seed_run ORDER BY id;
+INSERT INTO {CORPORATE_ACTION_TABLE} SELECT * FROM seed_corporate ORDER BY id;
 SELECT setval(pg_get_serial_sequence('{BAR_TABLE}', 'id'), max(id), true) FROM {BAR_TABLE} HAVING count(*) > 0;
 COMMIT;
 """  # nosec B608 -- interpolates module constants only, never input

@@ -29,6 +29,8 @@ from data.store.tests.delivery_reports import (
     QUOTA_KEY,
     RED_CASES,
     VENDOR_ASSET_ID,
+    action_records,
+    asset_records,
     report,
     with_header,
     with_trailer,
@@ -105,7 +107,27 @@ def test_each_cross_field_rule_refuses_its_contradiction_as_invalid_request(rule
 
 
 def test_the_red_cases_cover_every_rule():
-    assert {case[0] for case in RED_CASES} == set('abcdefgh')
+    # (i) joined the table with its first non-bars case (tj-7zjov1.31); the bars cases of (i) are below.
+    assert {case[0] for case in RED_CASES} == set('abcdefghi')
+
+
+@pytest.mark.parametrize('parts', [[action_records()], []], ids=['records', 'no-records'])
+def test_i_a_succeeded_corporate_actions_report_without_a_served_range_is_refused_naming_the_rule(parts):
+    """Rule i extends to corporate actions (tj-7zjov1.31, the architect's 15:14 UTC note from the P34c gate)."""
+    kind = IngestRequestKind.CORPORATE_ACTIONS
+    baseline = report(REQUEST_ID, kind=kind, parts=parts)
+    validate_report(baseline, kind)
+
+    error = _refused(with_trailer(baseline, served_range=None), kind)
+
+    assert error.reason is Reason.INVALID_REQUEST
+    assert error.detail == 'a SUCCEEDED corporate-actions report carries no served range'
+
+
+def test_i_does_not_hold_an_asset_list_report_to_a_served_range():
+    """An asset list carries none (the rule's own comment): rule i is bars and corporate actions only."""
+    kind = IngestRequestKind.ASSET_LIST
+    validate_report(with_trailer(report(REQUEST_ID, kind=kind, parts=[asset_records()]), served_range=None), kind)
 
 
 @pytest.mark.parametrize('parts', [None, []], ids=['bars', 'no-bars'])

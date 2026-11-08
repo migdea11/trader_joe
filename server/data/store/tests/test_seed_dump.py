@@ -23,6 +23,7 @@ import pytest
 from sqlalchemy.sql.functions import now as sql_now
 
 from data.store.app.database.models.base_market_activity import BaseMarketActivity
+from data.store.app.database.models.corporate_action import CorporateAction
 from data.store.app.database.models.ingest_instance import IngestInstance
 from data.store.app.database.models.ingest_request import IngestRequest
 from data.store.app.database.models.ingest_run import IngestRun
@@ -32,6 +33,7 @@ from data.store.seeds import dump
 from data.store.seeds.dump import (
     BAR_SEQUENCE,
     BAR_TABLE,
+    CORPORATE_ACTION_TABLE,
     ENTRY_TABLE,
     INSTANCE_TABLE,
     NORMALISE_SQL,
@@ -46,7 +48,7 @@ from data.store.seeds.dump import (
 )
 
 
-SEED_MODELS = (StoreDatasetEntry, StockMarketActivity, IngestInstance, IngestRequest, IngestRun)
+SEED_MODELS = (StoreDatasetEntry, StockMarketActivity, IngestInstance, IngestRequest, IngestRun, CorporateAction)
 
 
 pytestmark = pytest.mark.data_store
@@ -280,9 +282,9 @@ def test_the_pg_dump_era_names_are_gone():
 
 
 def test_the_seed_tables_are_the_market_tables_then_the_ingest_tables():
-    """Bead tj-7zjov1.100: entries, bars, instances, requests, runs, as the models name them."""
+    """Bead tj-7zjov1.100: entries, bars, instances, requests, runs; since tj-7zjov1.31 corporate actions last."""
     assert tuple(model.__tablename__ for model in SEED_MODELS) == SEED_TABLES
-    assert (ENTRY_TABLE, BAR_TABLE, INSTANCE_TABLE, REQUEST_TABLE, RUN_TABLE) == SEED_TABLES
+    assert (ENTRY_TABLE, BAR_TABLE, INSTANCE_TABLE, REQUEST_TABLE, RUN_TABLE, CORPORATE_ACTION_TABLE) == SEED_TABLES
     assert not any('archive' in table for table in SEED_TABLES)
 
 

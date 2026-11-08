@@ -55,6 +55,7 @@ UNREACHABLE_DATABASE_URI = 'postgresql://joe:fixture-pass@127.0.0.1:1/unreachabl
 # test_the_restated_models_match_env_py below reads the literal from env.py's source to stop that recurring.
 ALLOWED_MODELS = (
     'base_market_activity',
+    'corporate_action',
     'dataset_deletion',
     'dataset_override_log',
     'dataset_read',

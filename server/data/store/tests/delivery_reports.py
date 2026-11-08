@@ -251,6 +251,27 @@ def _bars_cases() -> list[tuple]:
             lambda r: with_parts(r, [asset_records()]),
         )
     )
+    cases.append(
+        (
+            'f',
+            'corporate-actions-request-bar-payload',
+            IngestRequestKind.CORPORATE_ACTIONS,
+            ok,
+            lambda r: with_parts(r, [bar_page(0)]),
+        )
+    )
+    # (i) A SUCCEEDED corporate-actions report names its served range (tj-7zjov1.31, the 15:14 UTC note), as a bars
+    # one does; with records and without.
+    for name, parts in (('records', [action_records()]), ('empty', [])):
+        cases.append(
+            (
+                'i',
+                f'corporate-actions-succeeded-{name}-no-served-range',
+                IngestRequestKind.CORPORATE_ACTIONS,
+                ok,
+                lambda r, p=parts: with_trailer(with_parts(r, p), served_range=None),
+            )
+        )
     return cases
 
 

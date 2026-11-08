@@ -119,13 +119,17 @@ BAR_TABLE = 'stock_market_activity'
 INSTANCE_TABLE = 'ingest_instance'
 REQUEST_TABLE = 'ingest_request'
 RUN_TABLE = 'ingest_run'
+CORPORATE_ACTION_TABLE = 'corporate_action'
 MARKET_TABLES = (ENTRY_TABLE, BAR_TABLE)
 INGEST_TABLES = (INSTANCE_TABLE, REQUEST_TABLE, RUN_TABLE)
 # Every table a seed may cover, parents first (bead tj-7zjov1.100); a seed covers the ones its manifest names.
-SEED_TABLES = MARKET_TABLES + INGEST_TABLES
+# corporate_action joins at c7e19a4d5b28 (tj-7zjov1.31), last, as the producer writes it.
+SEED_TABLES = MARKET_TABLES + INGEST_TABLES + (CORPORATE_ACTION_TABLE,)
 # The column a seed table's rows are checked as synthetic by, beside asset_symbol: the owner, by its name per
-# table. ingest_instance has no label; its ids are checked against the cast instead.
+# table. ingest_instance has no label; its ids are checked against the cast instead. corporate_action has no
+# asset_symbol and no owner: its requesting_symbol is checked alone (SYMBOL_COLUMN).
 LABEL_COLUMN = {ENTRY_TABLE: 'owner', BAR_TABLE: None, REQUEST_TABLE: 'client_label', RUN_TABLE: 'actor'}
+SYMBOL_COLUMN = {CORPORATE_ACTION_TABLE: 'requesting_symbol'}
 MANIFEST_KEYS = {'date', 'digests', 'producer', 'revision', 'row_counts'}
 
 ADDITIVE_EXCEPTION_MARKER = re.compile(r'^# additive-exception: \S+', re.MULTILINE)
@@ -660,13 +664,13 @@ def test_every_expectation_is_for_a_marked_revision_and_a_present_seed() -> None
 
 
 def test_the_seed_tables_are_the_producers() -> None:
-    """Bead tj-7zjov1.100: this file's five tables, in order, are the ones the producer writes."""
+    """Bead tj-7zjov1.100: this file's tables, in order, are the ones the producer writes (six since tj-7zjov1.31)."""
     assert SEED_TABLES == dump.SEED_TABLES
-    assert set(LABEL_COLUMN) | {INSTANCE_TABLE} == set(SEED_TABLES)
+    assert set(LABEL_COLUMN) | set(SYMBOL_COLUMN) | {INSTANCE_TABLE} == set(SEED_TABLES)
 
 
 def test_the_canonical_seed_at_the_head_covers_every_seed_table_with_rows() -> None:
-    """The producer always writes all five; a head seed without the ingest tables would make them go unchecked."""
+    """The producer always writes all six; a head seed without the ingest tables would make them go unchecked."""
     head = _head_revision()
     assert head in SEED_NAMES, f'no canonical seed at the head {head}'
     seed = read_seed(head)
@@ -733,6 +737,16 @@ def test_seed_loads_equal_to_its_manifest(scratch: ScratchDb, name: str) -> None
             with scratch.engine.connect() as conn:
                 ids = set(conn.execute(sa.text(f'SELECT instance_id FROM public.{table}')).scalars())  # nosec B608 -- module-constant table
             assert ids <= set(INSTANCES), f'seed {name}: {len(ids - set(INSTANCES))} instance id(s) not in the cast'
+            continue
+        if table in SYMBOL_COLUMN:
+            with scratch.engine.connect() as conn:
+                symbols = set(
+                    conn.execute(
+                        sa.text(f"SELECT DISTINCT coalesce({_quote(SYMBOL_COLUMN[table])}, '') FROM public.{table}")  # nosec B608 -- module-constant table, quoted name
+                    ).scalars()
+                )
+            foreign = [symbol for symbol in symbols if not is_synthetic(symbol, None)]
+            assert not foreign, f'seed {name}: {len(foreign)} non-synthetic symbol(s) in {table}'
             continue
         # The bar table's label is none; an old entry table may predate owner (8f41c2d7a3b9 seeds).
         label = LABEL_COLUMN[table] if LABEL_COLUMN[table] in scratch.columns(table) else None
@@ -1725,3 +1739,156 @@ def test_the_expiry_type_downgrade_restores_the_parent_schema_and_data_and_re_up
 
     scratch.must('upgrade', EXPIRY_TYPE_REVISION)
     assert_equals_manifest(scratch, seed)
+
+
+# ---------------------------------------------------------------------------------------------
+# tj-7zjov1.31 (P18): c7e19a4d5b28, the corporate_action table and five nullable ingest_run label columns. PURELY
+# ADDITIVE and UNMARKED (the architect's 20:17 UTC note: alter_column nullable=True only, passes the lint unmarked), so
+# NO EXPECTATIONS entry: the generic rule upgrades the 39c28a39b290 seed one step and downgrades it losslessly. This
+# section adds the revision's own facts on Postgres: the table as the model declares it, the five columns nullable,
+# every row of the parent seed kept, a lossless downgrade with no NULL label, and THE DOWNGRADE REFUSING, changing
+# nothing, on a database that holds an attempt row with a NULL label (the revision's own docstring; checklist item 17
+# against seeds holding NULL labels). The offline half is data/store/tests/test_corporate_action_revision.py; what the
+# revision builds, object by object, is test_migration_downgrade.py's.
+
+CORPORATE_ACTION_REVISION = 'c7e19a4d5b28'
+RELAXED_RUN_COLUMNS = ('asset_symbol', 'asset_type', 'data_type', 'granularity', 'update_type')
+
+
+def _nullability(db: ScratchDb, table: str, columns: tuple[str, ...]) -> dict[str, str]:
+    return {column: _column_facts(db, table, column)[2] for column in columns}
+
+
+def _insert_null_label_attempt_row(db: ScratchDb) -> None:
+    """A corporate-actions attempt row as the intake writes it: a copy of a seed row, symbol kept, four labels NULL.
+
+    attempt_no NULL, so the partial unique attempt index cannot refuse the copy; a fresh id.
+    """
+    with db.engine.begin() as conn:
+        runs = sa.Table(RUN_TABLE, sa.MetaData(), autoload_with=conn)
+        row = dict(conn.execute(sa.select(runs).order_by(runs.c.id).limit(1)).one()._mapping)
+        row.update(
+            id=sa.func.gen_random_uuid(),
+            attempt_no=None,
+            asset_type=None,
+            data_type=None,
+            granularity=None,
+            update_type=None,
+        )
+        conn.execute(sa.insert(runs).values(**row))
+
+
+def _insert_observation(db: ScratchDb) -> None:
+    with db.engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                f'INSERT INTO public.{CORPORATE_ACTION_TABLE} (source, vendor_action_id, action_type, raw_payload, '  # nosec B608 -- module constant
+                'payload_hash, request_id, attempt_no, as_of) VALUES '
+                "('ALPACA_API', 'ca-1', 'name_change', '\\x7b7d'::bytea, repeat('0', 64), gen_random_uuid(), 1, now())"
+            )
+        )
+
+
+def test_the_corporate_action_revision_sits_on_the_expiry_type_revision_unmarked_with_its_parent_seed() -> None:
+    assert GRAPH[CORPORATE_ACTION_REVISION].down_revision == EXPIRY_TYPE_REVISION
+    assert not GRAPH[CORPORATE_ACTION_REVISION].marked, 'the revision is designed additive; it carries no marker'
+    assert CORPORATE_ACTION_REVISION not in EXPECTATIONS, (
+        'an unmarked revision is the generic rule, never an EXPECTATIONS entry'
+    )
+    assert EXPIRY_TYPE_REVISION in SEED_NAMES, 'the parent seed the generic rule upgrades is missing'
+    transitions = {param.values: param.id for param in TRANSITIONS}
+    assert transitions.get((EXPIRY_TYPE_REVISION,)) == f'{EXPIRY_TYPE_REVISION}->{CORPORATE_ACTION_REVISION}', (
+        f'the generic rule does not run the parent seed through this revision: {sorted(transitions.values())}'
+    )
+
+
+def test_the_corporate_action_revision_applies_from_empty_with_the_models_table_and_nullable_labels(
+    scratch: ScratchDb,
+) -> None:
+    """From an EMPTY database: the raw bytes, the JSONB identifiers, both new dates, the dedupe index, the labels."""
+    assert scratch.revision() is None
+    scratch.must('upgrade', CORPORATE_ACTION_REVISION)
+
+    timestamptz = ('timestamp with time zone', 'timestamptz', 'YES', None)
+    for column in ('ex_date', 'record_date', 'payable_date', 'process_date', 'effective_date'):
+        assert _column_facts(scratch, CORPORATE_ACTION_TABLE, column) == timestamptz, column
+    assert _column_facts(scratch, CORPORATE_ACTION_TABLE, 'raw_payload') == ('bytea', 'bytea', 'NO', None)
+    assert _column_facts(scratch, CORPORATE_ACTION_TABLE, 'identifiers') == ('jsonb', 'jsonb', 'NO', "'{}'::jsonb")
+    assert _column_facts(scratch, CORPORATE_ACTION_TABLE, 'source') == ('USER-DEFINED', 'datasource', 'NO', None)
+    with scratch.engine.connect() as conn:
+        unique = conn.execute(
+            sa.text(
+                "SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' AND tablename = :table "
+                'AND indexname = :name'
+            ),
+            {'table': CORPORATE_ACTION_TABLE, 'name': 'uq_corporate_action_source_vendor_action_id_payload_hash'},
+        ).scalar_one()
+        foreign = conn.execute(
+            sa.text(
+                "SELECT count(*) FROM pg_constraint WHERE contype = 'f' AND conrelid = 'public.corporate_action'::regclass"
+            )
+        ).scalar_one()
+    assert unique.startswith('CREATE UNIQUE INDEX') and unique.endswith('(source, vendor_action_id, payload_hash)')
+    assert foreign == 0, 'an observation is tied to nothing'
+    assert set(_nullability(scratch, RUN_TABLE, RELAXED_RUN_COLUMNS).values()) == {'YES'}
+    assert _column_facts(scratch, RUN_TABLE, 'source')[2] == 'NO', 'source is not a relaxed label'
+
+
+def test_the_corporate_action_revision_upgrades_the_parent_seed_with_every_row_kept(scratch: ScratchDb) -> None:
+    seed = read_seed(EXPIRY_TYPE_REVISION)
+    scratch.load(seed)
+    assert set(_nullability(scratch, RUN_TABLE, RELAXED_RUN_COLUMNS).values()) == {'NO'}, 'the parent relaxed them'
+    assert seed.row_counts[RUN_TABLE] > 0, f'the parent seed holds no {RUN_TABLE} row, so this is vacuous'
+
+    scratch.must('upgrade', CORPORATE_ACTION_REVISION)
+
+    assert_equals_manifest(scratch, seed)  # every parent column of every row, byte for byte
+    assert set(_nullability(scratch, RUN_TABLE, RELAXED_RUN_COLUMNS).values()) == {'YES'}
+    with scratch.engine.connect() as conn:
+        observations = conn.execute(sa.text(f'SELECT count(*) FROM public.{CORPORATE_ACTION_TABLE}')).scalar_one()  # nosec B608
+    assert observations == 0, 'the revision backfills nothing'
+
+
+def test_the_corporate_action_downgrade_without_a_null_label_restores_the_parent_and_re_upgrades(
+    scratch: ScratchDb,
+) -> None:
+    """With no NULL label, the downgrade restores the parent's schema exactly (the observations go with the table)."""
+    seed = read_seed(EXPIRY_TYPE_REVISION)
+    scratch.load(seed)
+    parent_schema = scratch.schema()
+    scratch.must('upgrade', CORPORATE_ACTION_REVISION)
+    _insert_observation(scratch)
+
+    scratch.must('downgrade', EXPIRY_TYPE_REVISION)
+
+    assert scratch.schema() == parent_schema, 'the downgrade is not the inverse of the upgrade'
+    assert scratch.columns(CORPORATE_ACTION_TABLE) == [], 'the downgrade left the table'
+    assert scratch.enum_exists('datasource'), 'the downgrade dropped a type the parent owns'
+    assert_equals_manifest(scratch, seed)
+
+    scratch.must('upgrade', CORPORATE_ACTION_REVISION)
+    assert_equals_manifest(scratch, seed)
+
+
+def test_the_corporate_action_downgrade_refuses_changing_nothing_on_a_database_holding_a_null_label(
+    scratch: ScratchDb,
+) -> None:
+    """The revision's docstring: downgrade refuses with Postgres's own error and nothing changed.
+
+    The NOT NULL restoration is refused, and the table and its observations are still there (one migration
+    transaction).
+    """
+    scratch.load(read_seed(EXPIRY_TYPE_REVISION))
+    scratch.must('upgrade', CORPORATE_ACTION_REVISION)
+    _insert_null_label_attempt_row(scratch)
+    _insert_observation(scratch)
+    before = scratch.snapshot()
+    schema = scratch.schema()
+
+    run = scratch.migrate('downgrade', EXPIRY_TYPE_REVISION)
+
+    assert_refused(run, scratch, CORPORATE_ACTION_REVISION, before, schema)
+    assert 'null' in run.output.lower(), f'not the NOT NULL refusal:\n{run.output[-4000:]}'
+    with scratch.engine.connect() as conn:
+        observations = conn.execute(sa.text(f'SELECT count(*) FROM public.{CORPORATE_ACTION_TABLE}')).scalar_one()  # nosec B608
+    assert observations == 1, 'the refused downgrade lost the observation'

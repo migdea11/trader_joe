@@ -39,6 +39,7 @@ for Postgres: lock_request and lock_dataset_entry carry FOR UPDATE, and the entr
 """
 
 import dataclasses
+import hashlib
 import logging
 import uuid
 from collections.abc import AsyncIterator
@@ -58,9 +59,12 @@ from common.database.sql_alchemy_nullable_datetime import NullableDateTime
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from common.errors.vocabulary import InvalidRequestError, Reason
+from data.store.app.corporate_actions import observations_of
+from data.store.app.database.crud import corporate_action as corporate_action_crud
 from data.store.app.database.crud import ingest_delivery
 from data.store.app.database.crud import ingest_request as request_crud
 from data.store.app.database.crud.ingest_run import IngestRunRecord
+from data.store.app.database.models.corporate_action import CorporateAction
 from data.store.app.database.models.ingest_instance import IngestInstance
 from data.store.app.database.models.ingest_request import (
     IngestRequest,
@@ -85,7 +89,6 @@ from data.store.tests.delivery_reports import (
     QUOTA_KEY,
     RED_CASES,
     VENDOR_ASSET_ID,
-    action_records,
     asset_records,
     bar,
     bar_page,
@@ -95,6 +98,9 @@ from data.store.tests.delivery_reports import (
     with_trailer,
 )
 from schemas.data_ingest.delivery import (
+    AttemptDelivery,
+    CorporateActionRecord,
+    CorporateActionRecords,
     DeliverAttemptResponse,
     DeliveryErrorClass,
     DeliveryOutcome,
@@ -111,6 +117,7 @@ LABEL = 'client-label-sentinel-0b7d'
 START = datetime(2026, 2, 2, tzinfo=UTC)
 CHUNK = 7
 REQUESTS = IngestRequest.__table__
+ACTIONS = CorporateAction.__table__
 RUNS = IngestRun.__table__
 INSTANCES = IngestInstance.__table__
 ENTRIES = StoreDatasetEntry.__table__
@@ -171,6 +178,13 @@ async def engine(aware_sqlite_datetimes, monkeypatch: pytest.MonkeyPatch) -> Asy
     REQUESTS.to_metadata(metadata)
     for table in (RUNS, INSTANCES, ENTRIES):
         table.to_metadata(metadata)
+    # corporate_action (P18): SQLite has no JSONB and cannot parse the '{}'::jsonb default, so the COPY created here
+    # holds identifiers as JSON with no server default (the arm always writes the column). The statements the arm runs
+    # are built on the model's table and bind by name, so they are the production statements; the unique index on
+    # (source, vendor_action_id, payload_hash) is the model's and is SQLite's ON CONFLICT arbiter too.
+    actions = ACTIONS.to_metadata(metadata)
+    actions.c.identifiers.type = sa.JSON()
+    actions.c.identifiers.server_default = None
     async with engine.begin() as connection:
         await connection.run_sync(metadata.create_all)
         await connection.run_sync(_SCRATCH.create_all)
@@ -348,7 +362,14 @@ class Store:
             [tuple(row) for row in await self.runs()],
             [tuple(row) for row in await self.bars()],
             [tuple(row) for row in entries],
+            [tuple(row) for row in await self.actions()],
         )
+
+    async def actions(self) -> list[sa.Row]:
+        """The corporate_action rows, in insertion order (SQLite's rowid)."""
+        statement = sa.select(ACTIONS).order_by(sa.literal_column('rowid'))
+        async with AsyncSession(self.engine) as db:
+            return list((await db.execute(statement)).all())
 
     async def deliver(self, attempt) -> DeliverAttemptResponse:
         return await self.intake.deliver(attempt)
@@ -1406,32 +1427,313 @@ async def test_insert_attempt_names_the_partial_index_with_its_predicate():
 
 
 @pytest.mark.parametrize(
-    ('kind', 'outcome', 'parts'),
-    [
-        (IngestRequestKind.ASSET_LIST, DeliveryOutcome.SUCCEEDED, [asset_records()]),
-        (IngestRequestKind.ASSET_LIST, DeliveryOutcome.SUCCEEDED, []),
-        (IngestRequestKind.ASSET_LIST, DeliveryOutcome.FAILED, []),
-        (IngestRequestKind.CORPORATE_ACTIONS, DeliveryOutcome.SUCCEEDED, [action_records()]),
-        (IngestRequestKind.CORPORATE_ACTIONS, DeliveryOutcome.SUCCEEDED, []),
-        (IngestRequestKind.CORPORATE_ACTIONS, DeliveryOutcome.FAILED, []),
-    ],
-    ids=[
-        'asset-list-records',
-        'asset-list-empty',
-        'asset-list-failed',
-        'actions-records',
-        'actions-empty',
-        'actions-failed',
-    ],
+    ('outcome', 'parts'),
+    [(DeliveryOutcome.SUCCEEDED, [asset_records()]), (DeliveryOutcome.SUCCEEDED, []), (DeliveryOutcome.FAILED, [])],
+    ids=['asset-list-records', 'asset-list-empty', 'asset-list-failed'],
 )
-async def test_a_counted_non_bars_attempt_is_refused_never_acknowledged_unwritten(store, kind, outcome, parts):
-    """Decision 4 rule (2) and ruling 1: a counted non-bars attempt is refused with nothing written.
+async def test_a_counted_asset_list_attempt_is_refused_never_acknowledged_unwritten(store, outcome, parts):
+    """Decision 4 rule (2) and ruling 1: a counted asset-list attempt is refused with nothing written.
 
-    An asset list cannot be fetched again, and no attempt row can be written for these kinds until P18.
+    An asset list cannot be fetched again, and its attempt row lands with its arm (P17). The corporate-actions arm is
+    built since P18 (tj-7zjov1.31) and is pinned in the section below.
     """
-    request_id = await store.request(kind)
-    await store.refused(report(request_id, outcome, kind=kind, parts=parts))
+    request_id = await store.request(IngestRequestKind.ASSET_LIST)
+    await store.refused(report(request_id, outcome, kind=IngestRequestKind.ASSET_LIST, parts=parts))
     assert (await store.request_row(request_id)).state is IngestRequestState.QUEUED
+
+
+# --------------------------------------------------------------------------------------------- the corporate-actions arm
+#
+# THE DESIGN (tj-7zjov1.31, P18): the owner ruling of 2026-10-26 (04:47 UTC note: raw as published, append-only, with
+# process and effective dates, every identifier, the attempt and the requesting symbol; nothing tied to a listing),
+# the 15:31 UTC note (WINDOW AND REPEATS: the window is a fetch parameter, never a filter; same id and same bytes is
+# one observation, same id and other bytes a new one with its own as_of, never an overwrite), the 20:17 UTC note (the
+# attempt row keeps the symbol and NULL for the other four labels), the 11:50 UTC note (vendor_asset_id NULL for a
+# non-bars attempt whatever the header carries) and the 15:14 UTC note (rule i covers a SUCCEEDED corporate-actions
+# report; the served range is stored on its attempt row).
+
+CA = IngestRequestKind.CORPORATE_ACTIONS
+CA_START = datetime(2026, 1, 5, tzinfo=UTC)
+CA_END = datetime(2026, 2, 5, tzinfo=UTC)
+LATER_AS_OF = AS_OF + timedelta(hours=6)
+
+
+def action(vendor_action_id: str = 'ca-1', raw: bytes | None = None, **fields) -> CorporateActionRecord:
+    """One vendor record; the raw bytes default to bytes naming the id, so two ids never share a hash."""
+    values = {'action_type': 'name_change', 'identifiers': {'old_symbol': 'XLNX', 'new_symbol': 'AMD'}}
+    payload = raw if raw is not None else b'{"id":"' + vendor_action_id.encode() + b'"}'
+    return CorporateActionRecord(vendor_action_id=vendor_action_id, raw_payload=payload, **{**values, **fields})
+
+
+def actions(*records: CorporateActionRecord) -> CorporateActionRecords:
+    return CorporateActionRecords(records=list(records))
+
+
+async def ca_request(store: Store, **values) -> uuid.UUID:
+    """A corporate-actions request as the submit path leaves it: the symbol asked about and the window, no labels."""
+    fields = {'asset_symbol': 'XLNX', 'requested_start': CA_START, 'requested_end': CA_END}
+    return await store.request(CA, **{**fields, **values})
+
+
+def ca_report(request_id: uuid.UUID, *parts, **kwargs) -> AttemptDelivery:
+    return report(request_id, kind=CA, parts=list(parts), **kwargs)
+
+
+async def test_a_corporate_actions_success_stores_every_record_raw_with_what_delivered_it(store):
+    """Every field of each record, as published, and the request, attempt, symbol and window that delivered it."""
+    request_id = await ca_request(store)
+    dated = action(
+        'ca-dated',
+        raw=b'\x00\xff{"id":"ca-dated","note":"not utf-8"}\n',
+        action_type='stock_merger',
+        ex_date=datetime(2026, 1, 10, tzinfo=UTC),
+        record_date=datetime(2026, 1, 11, tzinfo=UTC),
+        payable_date=datetime(2026, 1, 12, tzinfo=UTC),
+        process_date=datetime(2026, 1, 13, tzinfo=UTC),
+        effective_date=datetime(2026, 1, 14, tzinfo=UTC),
+        identifiers={'acquirer_symbol': 'AMD', 'target_symbol': 'XLNX', 'cusip': '983919101'},
+    )
+    bare = action('ca-bare', action_type='unknown_vendor_wording', identifiers={})
+
+    answer = await store.deliver(ca_report(request_id, actions(dated), actions(bare)))
+
+    assert answer == DeliverAttemptResponse(verdict=FINAL, attempt_count=1)
+    rows = await store.actions()
+    assert [row.vendor_action_id for row in rows] == ['ca-dated', 'ca-bare'], 'every record, in payload order'
+    for row, record in zip(rows, (dated, bare), strict=True):
+        assert row.source is DataSource.ALPACA_API
+        assert row.action_type == record.action_type
+        assert (row.ex_date, row.record_date, row.payable_date) == (
+            record.ex_date,
+            record.record_date,
+            record.payable_date,
+        )
+        assert (row.process_date, row.effective_date) == (record.process_date, record.effective_date)
+        assert row.identifiers == record.identifiers
+        # The bytes untouched, and the hash is the SHA-256 of exactly those bytes, hex.
+        assert isinstance(row.raw_payload, bytes) and row.raw_payload == record.raw_payload
+        assert row.payload_hash == hashlib.sha256(record.raw_payload).hexdigest()
+        # What delivered it.
+        assert (row.request_id, row.attempt_no, row.requesting_symbol) == (request_id, 1, 'XLNX')
+        assert (row.requested_start, row.requested_end) == (CA_START, CA_END)
+        assert row.as_of == AS_OF, "the trailer's as_of: when the vendor answered"
+        assert row.received_at is not None
+    assert len({row.id for row in rows}) == 2
+    # No bar, no entry, no dataset: nothing is tied to a listing or a dataset.
+    assert store.batches == [] and await store.bars() == [] and await store.entries() == []
+    assert not [event for event in store.published if isinstance(event, DatasetChanged)]
+    row = await store.request_row(request_id)
+    assert (row.state, row.attempts, row.dataset_id) == (IngestRequestState.SUCCEEDED, 1, None)
+
+
+async def test_a_corporate_actions_attempt_row_keeps_the_symbol_null_labels_no_bars_and_the_served_range(store):
+    """The 20:17 UTC note: symbol kept, the other four NULL; bars_written counts bars only; rule i's range stored."""
+    request_id = await ca_request(store)
+
+    await store.deliver(ca_report(request_id, actions(action('ca-1'), action('ca-2'))))
+
+    (run,) = await store.runs(request_id)
+    assert (run.state, run.verdict, run.trigger) == (IngestRunState.SUCCEEDED, 'FINAL', IngestRunTrigger.REQUEST)
+    assert run.bars_written == 0, 'two records were written, and none of them is a bar'
+    assert (run.asset_symbol, run.asset_type, run.data_type, run.granularity, run.update_type) == (
+        'XLNX',
+        None,
+        None,
+        None,
+        None,
+    )
+    assert (run.source, run.feed, run.dataset_id) == (DataSource.ALPACA_API, None, None)
+    assert (run.served_start, run.served_end) == (BAR_START, BAR_START + timedelta(days=5))
+    assert (run.requested_start, run.requested_end) == (CA_START, CA_END)
+    assert (run.quota_key, run.vendor_calls) == (QUOTA_KEY, 3)
+    # The record the intake publishes is read back through IngestRunRecord: the NULL labels stay None.
+    (changed,) = [event for event in store.published if isinstance(event, IngestRunChanged)]
+    assert isinstance(changed.run, IngestRunRecord)
+    assert (changed.run.asset_symbol, changed.run.granularity, changed.run.update_type) == ('XLNX', None, None)
+    assert (changed.run.asset_type, changed.run.data_type, changed.run.bars_written) == (None, None, 0)
+
+
+async def test_a_corporate_actions_request_with_no_symbol_writes_an_attempt_row_with_every_label_null(store):
+    request_id = await ca_request(store, asset_symbol=None)
+
+    await store.deliver(ca_report(request_id, actions(action())))
+
+    (run,) = await store.runs(request_id)
+    assert (run.asset_symbol, run.asset_type, run.data_type, run.granularity, run.update_type) == (None,) * 5
+    (row,) = await store.actions()
+    assert row.requesting_symbol is None
+
+
+@pytest.mark.parametrize('outcome', [DeliveryOutcome.SUCCEEDED, DeliveryOutcome.FAILED])
+async def test_a_corporate_actions_attempt_row_stores_no_vendor_asset_id_even_when_the_header_carries_one(
+    store, outcome
+):
+    """The 11:50 UTC note (P49 gate): the id is the bars stop rule's detector, so another kind stores NULL."""
+    request_id = await ca_request(store)
+    parts = [actions(action())] if outcome is DeliveryOutcome.SUCCEEDED else []
+
+    await store.deliver(with_header(ca_report(request_id, *parts, outcome=outcome), vendor_asset_id=VENDOR_ASSET_ID))
+
+    (run,) = await store.runs(request_id)
+    assert run.vendor_asset_id is None
+
+
+async def test_a_record_outside_the_window_or_naming_other_symbols_only_is_stored_all_the_same(store):
+    """The 15:31 UTC note: the requested window is a fetch parameter, never a filter."""
+    request_id = await ca_request(store)
+    before = action('ca-before', process_date=CA_START - timedelta(days=400), ex_date=CA_START - timedelta(days=1))
+    at_end = action('ca-at-end', process_date=CA_END, effective_date=CA_END)
+    after = action('ca-after', process_date=CA_END + timedelta(days=30))
+    elsewhere = action('ca-elsewhere', identifiers={'old_symbol': 'SIVB', 'new_symbol': 'SIVBQ'})
+    undated = action('ca-undated')
+
+    await store.deliver(ca_report(request_id, actions(before, at_end, after, elsewhere, undated)))
+
+    stored = {row.vendor_action_id: row for row in await store.actions()}
+    assert set(stored) == {'ca-before', 'ca-at-end', 'ca-after', 'ca-elsewhere', 'ca-undated'}
+    assert stored['ca-elsewhere'].identifiers == {'old_symbol': 'SIVB', 'new_symbol': 'SIVBQ'}
+    assert stored['ca-after'].process_date == CA_END + timedelta(days=30)
+
+
+async def test_a_repeat_is_kept_once_and_a_vendor_revision_is_a_new_observation_with_its_own_as_of(store):
+    """The 15:31 UTC note: same id and same bytes is one observation, kept first; other bytes are a new row."""
+    first = await ca_request(store)
+    overlapping = await ca_request(store, requested_start=CA_START + timedelta(days=10))
+    original = action('ca-1', raw=b'{"id":"ca-1","ratio":"1:2"}')
+    revised = action('ca-1', raw=b'{"id":"ca-1","ratio":"1:3"}')
+
+    await store.deliver(ca_report(first, actions(original)))
+    later = with_trailer(ca_report(overlapping, actions(original, revised, action('ca-2'))), as_of=LATER_AS_OF)
+    answer = await store.deliver(later)
+
+    assert answer == DeliverAttemptResponse(verdict=FINAL, attempt_count=1)
+    rows = await store.actions()
+    assert [(row.vendor_action_id, row.raw_payload) for row in rows] == [
+        ('ca-1', original.raw_payload),
+        ('ca-1', revised.raw_payload),
+        ('ca-2', b'{"id":"ca-2"}'),
+    ]
+    # The first observation is untouched: its request, symbol window and as_of are the first delivery's.
+    assert (rows[0].request_id, rows[0].requested_start, rows[0].as_of) == (first, CA_START, AS_OF)
+    # The revision is its own row, with its own hash and the later delivery's as_of.
+    assert (rows[1].request_id, rows[1].as_of) == (overlapping, LATER_AS_OF)
+    assert rows[1].payload_hash != rows[0].payload_hash
+    assert rows[1].id != rows[0].id
+
+
+async def test_the_same_record_repeated_within_one_delivery_is_kept_once(store):
+    """A record repeated inside one payload message and across two (overlapping vendor pages) is one observation."""
+    request_id = await ca_request(store)
+    record = action('ca-1')
+
+    await store.deliver(ca_report(request_id, actions(record, record), actions(record, action('ca-2'))))
+
+    assert [row.vendor_action_id for row in await store.actions()] == ['ca-1', 'ca-2']
+    (run,) = await store.runs(request_id)
+    assert run.state is IngestRunState.SUCCEEDED
+
+
+async def test_insert_observations_counts_only_what_is_new(store):
+    """The repository's count: a repeat of (source, id, bytes) writes nothing and counts nothing; a revision counts."""
+    request_id = await ca_request(store)
+    request = await _request_record(store, request_id)
+    attempt = ca_report(request_id, actions(action('ca-1'), action('ca-2')))
+    revision = ca_report(request_id, actions(action('ca-1', raw=b'{"id":"ca-1","v":2}')))
+
+    async with AsyncSession(store.engine) as db:
+        first = await corporate_action_crud.insert_observations(db, observations_of(request, attempt))
+        repeat = await corporate_action_crud.insert_observations(db, observations_of(request, attempt))
+        revised = await corporate_action_crud.insert_observations(db, observations_of(request, revision))
+        await db.commit()
+
+    assert (first, repeat, revised) == (2, 0, 1)
+    assert len(await store.actions()) == 3
+
+
+async def test_a_failed_corporate_actions_attempt_writes_its_attempt_row_and_no_observation(store):
+    request_id = await ca_request(store)
+
+    answer = await store.deliver(ca_report(request_id, outcome=DeliveryOutcome.FAILED, detail='503'))
+
+    assert answer == DeliverAttemptResponse(verdict=CONTINUE, attempt_count=1)
+    assert await store.actions() == []
+    (run,) = await store.runs(request_id)
+    assert (run.state, run.verdict, run.error_message, run.bars_written) == (
+        IngestRunState.FAILED,
+        'CONTINUE',
+        '503',
+        0,
+    )
+    assert (run.asset_symbol, run.granularity, run.served_start, run.served_end) == ('XLNX', None, None, None)
+    assert (await store.request_row(request_id)).state is IngestRequestState.QUEUED
+
+
+async def test_a_corporate_actions_success_with_no_record_is_empty_and_keeps_its_served_range(store):
+    request_id = await ca_request(store)
+
+    answer = await store.deliver(ca_report(request_id))
+
+    assert answer == DeliverAttemptResponse(verdict=FINAL, attempt_count=1)
+    assert await store.actions() == []
+    (run,) = await store.runs(request_id)
+    assert (run.state, run.bars_written) == (IngestRunState.EMPTY, 0)
+    assert (run.served_start, run.served_end) == (BAR_START, BAR_START + timedelta(days=5))
+    assert (await store.request_row(request_id)).state is IngestRequestState.EMPTY
+
+
+async def test_the_observations_roll_back_with_the_delivery_when_a_later_step_fails(store, monkeypatch):
+    """One transaction: the arm writes first, and a failure after it (the attempt row here) leaves no observation."""
+    request_id = await ca_request(store)
+
+    async def failing_insert_attempt(db, attempt):
+        assert await db.scalar(sa.select(sa.func.count()).select_from(ACTIONS)) == 1, 'the arm ran first'
+        raise InvalidRequestError(Reason.INVALID_REQUEST, 'the attempt row could not be written')
+
+    monkeypatch.setattr(delivery_intake, 'insert_attempt', failing_insert_attempt)
+
+    await store.refused(ca_report(request_id, actions(action())))
+    assert await store.actions() == []
+
+
+async def test_a_corporate_actions_delivery_of_records_all_already_held_is_succeeded_not_empty(store):
+    """tj-7zjov1.161, the architect's P18 gate ruling (b): the outcome describes the VENDOR'S ANSWER, not the writes.
+
+    A second request whose report carries only records already stored (same source, vendor id and bytes) writes no
+    observation, yet the vendor answered records: its attempt row and its request are SUCCEEDED, never EMPTY (EMPTY
+    means the vendor held none), with bars_written 0.
+    """
+    records = (action('ca-held-1'), action('ca-held-2'))
+    first = await ca_request(store)
+    await store.deliver(ca_report(first, actions(*records)))
+    held = await store.actions()
+    assert len(held) == 2
+    second = await ca_request(store, requested_start=CA_START + timedelta(days=3))
+
+    answer = await store.deliver(with_trailer(ca_report(second, actions(*records)), as_of=LATER_AS_OF))
+
+    assert answer == DeliverAttemptResponse(verdict=FINAL, attempt_count=1)
+    assert await store.actions() == held, 'a record already held was written again'
+    (run,) = await store.runs(second)
+    assert (run.state, run.bars_written, run.verdict) == (IngestRunState.SUCCEEDED, 0, 'FINAL')
+    row = await store.request_row(second)
+    assert (row.state, row.failure_cause) == (IngestRequestState.SUCCEEDED, None)
+
+
+async def test_a_redelivered_corporate_actions_attempt_writes_nothing_and_repeats_its_answer(store):
+    request_id = await ca_request(store)
+    attempt = ca_report(request_id, actions(action('ca-1')))
+    first = await store.deliver(attempt)
+    before = await store.snapshot()
+
+    again = await store.deliver(attempt)
+
+    assert again == first == DeliverAttemptResponse(verdict=FINAL, attempt_count=1)
+    assert await store.snapshot() == before
+
+
+async def _request_record(store: Store, request_id: uuid.UUID) -> request_crud.IngestRequestRecord:
+    async with AsyncSession(store.engine) as db:
+        return await ingest_delivery.lock_request(db, request_id)
 
 
 # --------------------------------------------------------------------------------------------- the verdict, live

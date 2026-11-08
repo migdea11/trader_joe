@@ -32,6 +32,8 @@ SQLite has no partial index, no FOR UPDATE, one writer and no Postgres enum or A
       expiry type, collect) and the header feed; a repeat of the identity matches it and a collect flip publishes
       RETIRED; a NULL expiry type is refused with nothing written, never BULK.
   PG11 a delivery for a Stopped subscription (collect false) is dropped like a gone one.
+  PG12 P18 (tj-7zjov1.31): the corporate-actions arm on the real table (bytea, JSONB, the unique index as the dedupe
+      arbiter, a revision as a new row), the attempt row's NULL labels and NULL vendor asset id, and the rollback.
 
 HOW. DeliveryIntake and crud/ingest_delivery.py are driven directly on the test stack's Postgres over asyncpg
 (pg_async_engine), with the intake's own_session pointed at that engine and its publish journalled. The ingest_request
@@ -44,6 +46,7 @@ and registers them before creating the requests that name them.
 
 import asyncio
 import contextlib
+import hashlib
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
@@ -60,6 +63,7 @@ from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, U
 from common.errors.vocabulary import InvalidRequestError, Reason
 from data.store.app.database.crud import ingest_delivery
 from data.store.app.database.crud import ingest_request as request_crud
+from data.store.app.database.models.corporate_action import CorporateAction
 from data.store.app.database.models.ingest_instance import IngestInstance
 from data.store.app.database.models.ingest_request import (
     IngestRequest,
@@ -74,6 +78,8 @@ from data.store.app.ingest import delivery_intake
 from data.store.app.ingest.delivery_intake import DeliveryIntake
 from schemas.data_ingest.delivery import (
     AttemptDelivery,
+    CorporateActionRecord,
+    CorporateActionRecords,
     DeliverAttemptResponse,
     DeliveryErrorClass,
     DeliveryHeader,
@@ -93,6 +99,7 @@ RUNS = IngestRun.__table__
 REQUESTS = IngestRequest.__table__
 INSTANCES = IngestInstance.__table__
 BARS = StockMarketActivity.__table__
+ACTIONS = CorporateAction.__table__
 ENTRIES_NAME = 'store_dataset_entry'
 START = datetime(2026, 2, 2, tzinfo=UTC)
 FINAL, CONTINUE = DeliveryVerdict.FINAL, DeliveryVerdict.CONTINUE
@@ -202,6 +209,8 @@ def created(pg_engine: Engine) -> Iterator[Created]:
     yield ids
     with pg_engine.begin() as conn:
         if ids.requests:
+            # corporate_action is append-only for the service; the test removes only the observations it delivered.
+            conn.execute(sa.delete(ACTIONS).where(ACTIONS.c.request_id.in_(ids.requests)))
             conn.execute(sa.delete(RUNS).where(RUNS.c.request_id.in_(ids.requests)))
             conn.execute(sa.delete(REQUESTS).where(REQUESTS.c.id.in_(ids.requests)))
         if ids.instances:
@@ -831,3 +840,179 @@ async def test_pg9_an_empty_header_vendor_asset_id_is_stored_null_never_an_empty
             )
         ).scalar_one()
     assert is_null is True
+
+
+# --------------------------------------------------------------------------------------------- PG12
+# tj-7zjov1.31 (P18), the corporate-actions arm on the real table: bytea and JSONB round trips, the real unique index
+# as the dedupe arbiter (ON CONFLICT DO NOTHING on it), a vendor revision as a new row, the attempt row's NULL labels
+# and NULL vendor asset id on Postgres (the architect's 11:50 UTC note asks for exactly this pin), and the observations
+# rolled back with a refused delivery. Vendor action ids carry this run's id: the index is global and the table
+# append-only, so a fixed id would meet an earlier run's row; the created fixture deletes this test's observations.
+
+
+def ca_report(
+    request_id: uuid.UUID,
+    records: list[CorporateActionRecord],
+    *,
+    instance_id: str,
+    attempt_no: int = 1,
+    as_of: datetime = AS_OF,
+    vendor_asset_id: str = '',
+) -> AttemptDelivery:
+    """A SUCCEEDED corporate-actions report: no feed, the served range, the records in one payload message."""
+    return AttemptDelivery(
+        header=DeliveryHeader(
+            request_id=str(request_id),
+            instance_id=instance_id,
+            attempt_no=attempt_no,
+            quota_key=QUOTA_KEY,
+            feed=None,
+            vendor_asset_id=vendor_asset_id,
+        ),
+        parts=[CorporateActionRecords(records=records)] if records else [],
+        trailer=DeliveryTrailer(
+            outcome=DeliveryOutcome.SUCCEEDED,
+            vendor_stats=stats(),
+            served_range=ServedRange(start=START, end=START + timedelta(days=30)),
+            as_of=as_of,
+        ),
+    )
+
+
+async def _ca_request(engine, created, run_identity, *, holder: str, symbol: str | None = 'XLNX') -> uuid.UUID:
+    return await _request(
+        engine,
+        created,
+        run_identity,
+        symbol,
+        holder=holder,
+        dataset_id=None,
+        kind=IngestRequestKind.CORPORATE_ACTIONS,
+        asset_type=None,
+        data_types=None,
+        granularity=None,
+        update_type=None,
+        feed=None,
+    )
+
+
+async def _observations(engine: AsyncEngine, *request_ids: uuid.UUID) -> list[sa.Row]:
+    async with engine.connect() as conn:
+        statement = (
+            sa.select(ACTIONS)
+            .where(ACTIONS.c.request_id.in_(request_ids))
+            .order_by(ACTIONS.c.received_at, ACTIONS.c.vendor_action_id, ACTIONS.c.as_of)
+        )
+        return list((await conn.execute(statement)).all())
+
+
+async def test_pg12_a_corporate_actions_delivery_stores_raw_bytes_and_identifiers_and_null_labels(
+    intake, created, run_identity, instance_id
+):
+    holder = instance_id('pg12')
+    await intake.register(holder)
+    request_id = await _ca_request(intake.engine, created, run_identity, holder=holder)
+    vendor_id = f'ca-{run_identity.run_id}-{uuid.uuid4().hex[:8]}'
+    raw = b'\x00\xff{"id":"' + vendor_id.encode() + b'","note":"bytes, not text"}'
+    record = CorporateActionRecord(
+        vendor_action_id=vendor_id,
+        action_type='stock_merger',
+        process_date=datetime(2022, 2, 14, tzinfo=UTC),
+        effective_date=datetime(2022, 2, 14, tzinfo=UTC),
+        identifiers={'acquirer_symbol': 'AMD', 'target_symbol': 'XLNX'},
+        raw_payload=raw,
+    )
+
+    # The header names a vendor asset id: a non-bars attempt row stores NULL whatever the header carries.
+    answer = await intake.deliver(ca_report(request_id, [record], instance_id=holder, vendor_asset_id=VENDOR_ASSET_ID))
+
+    assert answer == DeliverAttemptResponse(verdict=FINAL, attempt_count=1)
+    (row,) = await _observations(intake.engine, request_id)
+    assert (row.vendor_action_id, row.action_type, row.raw_payload) == (vendor_id, 'stock_merger', raw)
+    assert row.payload_hash == hashlib.sha256(raw).hexdigest()
+    assert row.identifiers == {'acquirer_symbol': 'AMD', 'target_symbol': 'XLNX'}
+    assert (row.process_date, row.effective_date, row.ex_date) == (record.process_date, record.effective_date, None)
+    assert (row.request_id, row.attempt_no, row.requesting_symbol, row.as_of) == (request_id, 1, 'XLNX', AS_OF)
+    assert row.source is DataSource.ALPACA_API
+    (run,) = await _runs(intake.engine, request_id)
+    assert (run.state, run.bars_written, run.feed) == (IngestRunState.SUCCEEDED, 0, None)
+    assert (run.asset_symbol, run.asset_type, run.data_type, run.granularity, run.update_type) == (
+        'XLNX',
+        None,
+        None,
+        None,
+        None,
+    )
+    assert run.served_start == START
+    async with intake.engine.connect() as conn:
+        raw_row = (
+            await conn.execute(
+                sa.text(
+                    'SELECT run.vendor_asset_id IS NULL AS no_vendor_id, run.granularity IS NULL AS no_width, '
+                    "ca.identifiers->>'acquirer_symbol' AS acquirer, octet_length(ca.raw_payload) AS size "
+                    'FROM ingest_run run JOIN corporate_action ca ON ca.request_id = run.request_id '
+                    'WHERE run.request_id = :id'
+                ),
+                {'id': request_id},
+            )
+        ).one()
+    assert (raw_row.no_vendor_id, raw_row.no_width, raw_row.acquirer, raw_row.size) == (True, True, 'AMD', len(raw))
+
+
+async def test_pg12_a_corporate_actions_request_with_no_symbol_writes_every_label_null(
+    intake, created, run_identity, instance_id
+):
+    holder = instance_id('pg12-nosym')
+    await intake.register(holder)
+    request_id = await _ca_request(intake.engine, created, run_identity, holder=holder, symbol=None)
+
+    await intake.deliver(ca_report(request_id, [], instance_id=holder))
+
+    (run,) = await _runs(intake.engine, request_id)
+    assert (run.asset_symbol, run.asset_type, run.data_type, run.granularity, run.update_type) == (None,) * 5
+    assert run.state is IngestRunState.EMPTY
+
+
+async def test_pg12_the_unique_index_keeps_a_repeat_once_and_a_revision_is_a_new_row(
+    intake, created, run_identity, instance_id
+):
+    holder = instance_id('pg12-dedupe')
+    await intake.register(holder)
+    first = await _ca_request(intake.engine, created, run_identity, holder=holder)
+    second = await _ca_request(intake.engine, created, run_identity, holder=holder)
+    vendor_id = f'ca-{run_identity.run_id}-{uuid.uuid4().hex[:8]}'
+    original = CorporateActionRecord(vendor_action_id=vendor_id, action_type='split', raw_payload=b'{"r":"1:2"}')
+    revised = CorporateActionRecord(vendor_action_id=vendor_id, action_type='split', raw_payload=b'{"r":"1:3"}')
+    later = AS_OF + timedelta(hours=6)
+
+    await intake.deliver(ca_report(first, [original, original], instance_id=holder))
+    await intake.deliver(ca_report(second, [original, revised], instance_id=holder, as_of=later))
+
+    rows = await _observations(intake.engine, first, second)
+    assert [(row.request_id, row.raw_payload, row.as_of) for row in rows] == [
+        (first, original.raw_payload, AS_OF),
+        (second, revised.raw_payload, later),
+    ]
+
+
+async def test_pg12_a_refused_corporate_actions_delivery_leaves_no_observation(
+    intake, created, run_identity, instance_id, monkeypatch
+):
+    """The arm writes inside the delivery transaction: a failure after it rolls the observations back."""
+    holder = instance_id('pg12-rollback')
+    await intake.register(holder)
+    request_id = await _ca_request(intake.engine, created, run_identity, holder=holder)
+    record = CorporateActionRecord(
+        vendor_action_id=f'ca-{run_identity.run_id}-{uuid.uuid4().hex[:8]}', action_type='split', raw_payload=b'{}'
+    )
+
+    async def failing_insert_attempt(db, attempt):
+        raise InvalidRequestError(Reason.INVALID_REQUEST, 'the attempt row could not be written')
+
+    monkeypatch.setattr(delivery_intake, 'insert_attempt', failing_insert_attempt)
+
+    with pytest.raises(InvalidRequestError):
+        await intake.deliver(ca_report(request_id, [record], instance_id=holder))
+
+    assert await _observations(intake.engine, request_id) == []
+    assert await _runs(intake.engine, request_id) == []
