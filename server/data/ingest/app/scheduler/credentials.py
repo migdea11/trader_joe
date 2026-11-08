@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Final, Protocol
 
 from common.environment import get_env_var
+from common.logging import register_secret
 from data.ingest.app.scheduler.limits import SchedulerConfigError
 
 
@@ -80,6 +81,9 @@ class StaticCredentialProvider:
     def from_env(cls, key_var: str, secret_var: str) -> 'StaticCredentialProvider':
         """Build a provider over the one key configured in the environment today.
 
+        Both values read are registered with the log scrub at read, whatever the variable names. The scrub covers
+        formatted log output only, see common.logging.
+
         Args:
             key_var (str): Name of the variable holding the key id.
             secret_var (str): Name of the variable holding the secret.
@@ -92,6 +96,12 @@ class StaticCredentialProvider:
         """
         key_id = get_env_var(key_var)
         secret = get_env_var(secret_var)
+        # Every value read is registered with the log scrub before any check or construction (tj-7zjov1.76).
+        # A blank or unset value registers nothing.
+        if key_id:
+            register_secret(key_id)
+        if secret:
+            register_secret(secret)
         if not key_id or not secret:
             raise SchedulerConfigError(f'Credentials are not configured: set {key_var} and {secret_var}')
         return cls(Credential(key_id=key_id, secret=secret))

@@ -2,7 +2,7 @@ from sqlalchemy import String
 from sqlalchemy.engine import Dialect
 from sqlalchemy.types import TypeDecorator
 
-from common.sensitive import RedactedStr
+from common.sensitive import OpaqueStr, RedactedStr
 
 
 class SensitiveString(TypeDecorator[str]):
@@ -26,6 +26,9 @@ class SensitiveString(TypeDecorator[str]):
     def process_bind_param(self, value: str | None, dialect: Dialect) -> str | None:
         if value is None:
             return None
+        if isinstance(value, OpaqueStr):
+            # RedactedStr(value) would take str() of it and store the marker, silently.
+            raise TypeError(f'SensitiveString cannot bind an {type(value).__name__}')
         return RedactedStr(value)
 
     def process_result_value(self, value: str | None, dialect: Dialect) -> str | None:

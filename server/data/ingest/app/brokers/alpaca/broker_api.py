@@ -24,7 +24,8 @@ from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Feed, Granularity
 from common.environment import get_env_var
 from common.errors.vocabulary import InvalidRequestError, Reason
-from common.logging import get_logger
+from common.logging import get_logger, register_secret
+from common.sensitive import OpaqueStr
 from data.ingest.app.brokers.alpaca.classify import reset_from_rate_limit_header
 from data.ingest.app.brokers.broker_errors import MalformedCredentialsError, MissingCredentialsError
 from data.ingest.app.brokers.interface import BarsQuery, CallTally
@@ -163,6 +164,17 @@ def get_client() -> StockHistoricalDataClient:
     client. Callers that want to supply their own client inject it instead; see
     set_client() and the client argument on AlpacaRead.
 
+    Each variable is read exactly once into a local; the log-scrub registration, the missing check, the shape check
+    and the wrap all use those locals. Each non-empty plain value is registered with the log scrub straight after the
+    read, before the missing and shape checks, so it is registered even when the other variable is unset or empty
+    (MissingCredentialsError) and even when it is malformed; a blank one registers nothing. The scrub covers
+    formatted log output only, see common.logging.
+
+    The values are checked, and only then wrapped in OpaqueStr for the client. The wrapper is defense
+    in depth behind the check, which it replaces nothing of: it keeps the key out of any repr, str or format of
+    the client. Header mode only, and it fails closed: a library change that formats the key into a string sends
+    the marker and gets a 401, never a leak.
+
     Returns:
         StockHistoricalDataClient: Shared client for every Alpaca call this process makes.
 
@@ -173,15 +185,27 @@ def get_client() -> StockHistoricalDataClient:
     """
     global __CLIENT
     if __CLIENT is None:
-        missing = [name for name in ALPACA_CREDENTIAL_VARS if not get_env_var(name)]
-        if missing:
-            raise MissingCredentialsError(f'Alpaca credentials are not configured: {", ".join(missing)} unset')
         key_id, secret = (get_env_var(name) for name in ALPACA_CREDENTIAL_VARS)
+        # Registered as the plain strings, straight after the read and BEFORE the missing check, the shape check and the
+        # wrap, so a value that reaches a log line is already scrubbed even when the other variable is unset or empty
+        # (tj-7zjov1.76). Guarded exactly as StaticCredentialProvider.from_env is. Registering an OpaqueStr would
+        # register only the marker word.
+        if key_id:
+            register_secret(key_id)
+        if secret:
+            register_secret(secret)
+        missing = [name for name, value in zip(ALPACA_CREDENTIAL_VARS, (key_id, secret), strict=True) if not value]
+        if missing or key_id is None or secret is None:
+            raise MissingCredentialsError(f'Alpaca credentials are not configured: {", ".join(missing)} unset')
         try:
             check_credential_shape(Credential(key_id=key_id, secret=secret))
         except CredentialShapeError:
             raise MalformedCredentialsError(ALPACA_CREDENTIAL_VARS) from None
-        __CLIENT = StockHistoricalDataClient(key_id, secret)
+        # Wrapped AFTER the check, from the same two checked values (never a second read), so any later rendering of
+        # the client's stored key shows the marker. Header mode only: never pass use_basic_auth, which formats the
+        # key into a string and would send the marker. No reveal() here: the header carries the object and requests
+        # encodes its raw characters (tj-7zjov1.72).
+        __CLIENT = StockHistoricalDataClient(OpaqueStr(key_id), OpaqueStr(secret))
     return __CLIENT
 
 

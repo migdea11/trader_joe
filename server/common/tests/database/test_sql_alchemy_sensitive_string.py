@@ -5,6 +5,8 @@ What the design asks of it, and what each group below pins:
   Pinned through the postgresql+asyncpg dialect's own bind processor -- the path an execute takes
   -- and not only by calling process_bind_param, so a type that overrode the method but was
   bypassed by the dialect would still go red.
+- BIND GUARD: an OpaqueStr is refused with a TypeError naming the type, never the value or the
+  marker (tj-7zjov1.70, ruling R3 A), directly, through the dialect and through a real execute.
 - READ: a plain str, type exactly str, so the wrapper never reaches an ORM attribute.
 - RENDERING: a DBAPIError/StatementError built from the processed parameters renders the marker
   and NOT the value, while a neighbouring non-sensitive parameter IS still rendered -- the user
@@ -29,7 +31,7 @@ from sqlalchemy.schema import CreateTable
 
 from common.database.sql_alchemy_sensitive_string import SensitiveString
 from common.database.sql_alchemy_types import BaseCustomSqlType
-from common.sensitive import REDACTED, RedactedStr
+from common.sensitive import REDACTED, OpaqueStr, RedactedStr
 
 
 pytestmark = pytest.mark.common
@@ -124,6 +126,67 @@ def test_every_statement_shape_binds_the_owner_as_a_redacted_str(build, dialect:
     assert owners, 'the statement must bind the owner'
     assert all(type(p) is RedactedStr for p in owners)
     assert [type(p) for p in parameters if isinstance(p, str) and str.__eq__(p, NEIGHBOUR)] == [str]
+
+
+# --- BIND: an OpaqueStr is refused (tj-7zjov1.70, ruling R3 A on tj-7zjov1.69) ---------------
+#
+# RedactedStr(opaque) takes str() of it, which is the marker, so without the guard the marker
+# would be stored in place of the value with no error. The refusal must name the type and carry
+# neither the value nor the marker.
+
+
+class _OpaqueChild(OpaqueStr):
+    __slots__ = ()
+
+
+@pytest.mark.parametrize('opaque_type', [OpaqueStr, _OpaqueChild], ids=['OpaqueStr', 'subclass'])
+def test_process_bind_param_refuses_an_opaque_str(opaque_type: type[OpaqueStr], dialect: Dialect) -> None:
+    with pytest.raises(TypeError) as raised:
+        SensitiveString().process_bind_param(opaque_type(SECRET), dialect)
+
+    message = str(raised.value)
+    assert opaque_type.__name__ in message
+    assert SECRET not in message
+    assert REDACTED not in message
+    assert all(SECRET not in repr(arg) and REDACTED not in repr(arg) for arg in raised.value.args)
+
+
+def test_the_asyncpg_bind_processor_refuses_an_opaque_str(dialect: Dialect) -> None:
+    """The dialect's own processor, the path an execute takes, reaches the guard too."""
+    processor = SensitiveString().dialect_impl(dialect).bind_processor(dialect)
+    assert processor is not None
+    with pytest.raises(TypeError, match='OpaqueStr'):
+        processor(OpaqueStr(SECRET))
+
+
+def test_a_plain_str_still_binds_as_a_redacted_str_carrying_the_value(dialect: Dialect) -> None:
+    """The guard is for OpaqueStr only: a plain str and a RedactedStr still wrap as before."""
+    for value in (SECRET, RedactedStr(SECRET)):
+        bound = SensitiveString().process_bind_param(value, dialect)
+        assert type(bound) is RedactedStr
+        assert str.__str__(bound) == SECRET
+    assert SensitiveString().process_bind_param(None, dialect) is None
+
+
+def test_a_real_execute_with_an_opaque_str_raises_and_stores_nothing(
+    sqlite_engine: sa.Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    metadata = sa.MetaData()
+    table = _table(metadata, SensitiveString(64))
+    metadata.create_all(sqlite_engine)
+
+    with sqlite_engine.connect() as conn, caplog.at_level(logging.DEBUG, logger='sqlalchemy.engine'):
+        with pytest.raises(sa.exc.StatementError) as raised:
+            conn.execute(sa.insert(table).values(id=1, owner=OpaqueStr(SECRET), feed=NEIGHBOUR))
+        conn.rollback()
+        stored = conn.execute(sa.select(sa.func.count()).select_from(table)).scalar_one()
+
+    assert isinstance(raised.value.orig, TypeError)
+    rendered = str(raised.value)
+    assert 'OpaqueStr' in rendered
+    assert SECRET not in rendered
+    assert SECRET not in caplog.text
+    assert stored == 0, 'nothing may be stored, the marker least of all'
 
 
 # --- READ -----------------------------------------------------------------------------------

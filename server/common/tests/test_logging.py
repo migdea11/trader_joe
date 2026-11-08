@@ -1,8 +1,8 @@
 """common/logging.py's cap on the grpc logger (tj-3mk3u5.45): grpc's per-call DEBUG goes, its WARNINGs stay.
 
 grpc.aio logs '[_cygrpc] Loaded running loop' at DEBUG from grpc._cython.cygrpc on every call, on the
-client and the server side (grpcio 1.81.1). get_logger() configures the root logger at DEBUG, so with
-no cap every call through common.rpc writes a log line in both services. That buries real output and
+client and the server side (grpcio 1.81.1). get_logger() configures the root logger at DEBUG when
+LOG_LEVEL=DEBUG (INFO by default, tj-7zjov1.86), so there, with no cap, every call through common.rpc writes a log line in both services. That buries real output and
 adds per-call formatting and I/O cost to the path the latency harness's gRPC arm measures
 (tj-3mk3u5.8). The cap must not hide grpc's WARNINGs: a GOAWAY or too_many_pings warning is exactly
 what ADR tj-8konfu D6.2 wants seen.
@@ -65,7 +65,7 @@ async def _ping_round_trips(calls: int = CALLS) -> None:
 
 @pytest.mark.asyncio
 async def test_a_ping_through_common_rpc_logs_nothing_below_warning_from_grpc(caplog: pytest.LogCaptureFixture):
-    """The cap: with the root at DEBUG, as get_logger() sets it, no grpc record below WARNING is emitted."""
+    """The cap: with the root at DEBUG, as get_logger() sets it under LOG_LEVEL=DEBUG, no grpc record below WARNING."""
     caplog.set_level(logging.DEBUG)
     await _ping_round_trips()
     assert _grpc_below_warning(caplog.records) == [], 'grpc logged below WARNING on a call through common.rpc'
@@ -115,19 +115,25 @@ class _Received(logging.Handler):
 logging.getLogger().addHandler(_Received())
 asyncio.run(_ping_round_trips())
 log.debug(sys.argv[1])
+log.info(sys.argv[1] + ' at info')
 logging.getLogger(sys.argv[3]).warning(sys.argv[2])
 json.dump(received, sys.stdout)
 """
 
 
-def test_the_service_logging_setup_drops_grpc_debug_and_keeps_its_own_debug_and_grpc_warnings():
+@pytest.mark.parametrize('log_level', [None, 'DEBUG'], ids=['default', 'LOG_LEVEL=DEBUG'])
+def test_the_service_logging_setup_drops_grpc_debug_and_keeps_its_own_debug_and_grpc_warnings(log_level: str | None):
     """Through get_logger()'s real basicConfig: the cap is grpc's alone, and the root level is not what silenced it.
 
-    The service's own DEBUG line still logs, so the root stays at DEBUG (tj-3mk3u5.45 acceptance).
-    If the root level is changed on purpose, change the own-DEBUG assertion with it.
+    The root was DEBUG when tj-3mk3u5.45 was accepted. The owner moved the default to INFO with
+    LOG_LEVEL=DEBUG as the override (rulings on tj-7zjov1.78, tj-7zjov1.86), so the claim this test
+    exists for -- the service's own DEBUG logs while grpc's does not -- now holds under the override,
+    and by default the service's own DEBUG goes too while its INFO stays.
     """
     own_debug, grpc_warning = 'service debug still logs', 'GOAWAY received: too_many_pings'
-    env = {name: value for name, value in os.environ.items() if name != 'PYTEST_ADDOPTS'}
+    env = {name: value for name, value in os.environ.items() if name not in ('PYTEST_ADDOPTS', 'LOG_LEVEL')}
+    if log_level is not None:
+        env['LOG_LEVEL'] = log_level
     # The image's path model: common.rpc.ping imports trader_joe.proto, which a fresh interpreter
     # finds only on the image's second PYTHONPATH entry (decision tj-3mk3u5.42 F1).
     env['PYTHONPATH'] = image_pythonpath(SERVER_ROOT)
@@ -142,7 +148,11 @@ def test_the_service_logging_setup_drops_grpc_debug_and_keeps_its_own_debug_and_
     )
     assert result.returncode == 0, result.stderr
     received = [tuple(record) for record in json.loads(result.stdout)]
-    assert ('tj45.service', logging.DEBUG, own_debug) in received, 'the service lost its own DEBUG output'
+    assert ('tj45.service', logging.INFO, f'{own_debug} at info') in received, 'the service lost its own INFO'
+    if log_level == 'DEBUG':
+        assert ('tj45.service', logging.DEBUG, own_debug) in received, 'the service lost its own DEBUG output'
+    else:
+        assert ('tj45.service', logging.DEBUG, own_debug) not in received, 'the default root level is not INFO'
     assert [r for r in received if _in_grpc(r[0]) and r[1] < logging.WARNING] == [], 'grpc logged below WARNING'
     assert (CYGRPC, logging.WARNING, grpc_warning) in received, 'a grpc WARNING did not reach the root'
     assert grpc_warning in result.stderr, "a grpc WARNING never reached basicConfig's own handler"

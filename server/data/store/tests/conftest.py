@@ -10,6 +10,17 @@ It is registered ONCE, here, for every SQLite connection any test opens: a liste
 event, autouse for the whole session, removed at the end. It answers like Postgres: the name when the table exists
 on that connection's database, else NULL. So a fixture that creates the usage tables gets "ready", and one that does
 not (most of the route tier) gets the zero view and the one-time warning exactly as an unmigrated Postgres would.
+
+LOGGING STATE IS PROCESS-WIDE (tj-7zjov1.92, finding F5 on tj-7zjov1.75). app_depends' lifespan calls
+common.app_lifecycle.startup_logs, which installs the broker sink once per process (propagate False on alpaca,
+requests, urllib3, httpx and httpcore, a handler on each) and wraps root's and uvicorn's handler formatters in
+ScrubFormatter; migrations/env.py wraps root's too. Unrestored, that outlives the test that did it: a later test
+capturing httpx on root passes vacuously, and test order decides what passes. restore_logging_state runs every
+test inside common.tests.logging_isolation.guarded_isolated_logging, imported and not copied: isolated_logging,
+then a CHECK that the restore held. A touched logger with another propagate flag, level or handler list, a new
+module sink, or a root handler with a different formatter fails the test's teardown, naming what leaked. Root's
+handler LIST is not compared: pytest swaps its own capture handlers there per phase.
+test_logging_state_restored.py proves the gap.
 """
 
 import sqlite3
@@ -18,6 +29,8 @@ from collections.abc import Callable, Iterator
 import pytest
 from sqlalchemy import event
 from sqlalchemy.engine import Engine
+
+from common.tests.logging_isolation import guarded_isolated_logging
 
 
 def _to_regclass_on(connection: sqlite3.Connection) -> Callable[[str | None], str | None]:
@@ -55,3 +68,10 @@ def sqlite_to_regclass() -> Iterator[None]:
         yield
     finally:
         event.remove(Engine, 'connect', register_to_regclass)
+
+
+@pytest.fixture(autouse=True)
+def restore_logging_state() -> Iterator[None]:
+    """Run the test against a clean broker sink; fail if any logging state survives the restore."""
+    with guarded_isolated_logging():
+        yield
