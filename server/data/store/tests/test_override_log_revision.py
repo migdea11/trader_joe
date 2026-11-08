@@ -34,6 +34,8 @@ pytestmark = pytest.mark.data_store
 STORE_DIR = Path(__file__).resolve().parents[1]
 MIGRATIONS_DIR = STORE_DIR / 'migrations'
 REVISION_FILE = MIGRATIONS_DIR / 'versions' / 'd7e2a9c35b18_dataset_override_log_and_deletion.py'
+# The later revisions that add a column to either table, in chain order: the model is what the last of them leaves.
+LATER_FILES = [MIGRATIONS_DIR / 'versions' / 'b6d1f93a7c42_panels.py']
 DIALECT = postgresql.dialect()
 NEW_TYPES = ['override_action']
 TABLES = {
@@ -112,13 +114,44 @@ def test_downgrade_drops_exactly_what_upgrade_created_in_reverse():
     assert {name for name, _, _ in down.method_calls} <= {'drop_index', 'drop_table', 'get_bind'}
 
 
+def _later_added_columns() -> dict[str, list[sa.Column]]:
+    """The columns later revisions add to these two tables, from their own upgrade() against a recording op.
+
+    b6d1f93a7c42 (tj-7zjov1.33, P20) adds the nullable dataset_override_log.new_value. Read off the revision rather
+    than restated, so the comparison below is 'this revision plus what the chain adds later equals the model'.
+    """
+    added: dict[str, list[sa.Column]] = {}
+    for path in LATER_FILES:
+        spec = importlib.util.spec_from_file_location(f'revision_{path.stem}', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        op = MagicMock(name='op')
+        with patch.object(module, 'op', op), patch.object(postgresql.ENUM, 'create', autospec=True):
+            module.upgrade()
+        for name, args, _ in op.method_calls:
+            if name == 'add_column' and args[0] in TABLES:
+                added.setdefault(args[0], []).append(args[1])
+    return added
+
+
 def test_the_revision_builds_exactly_the_tables_the_models_declare():
-    """Every column, type, nullability, server default and constraint, as Postgres DDL, model against revision."""
+    """Every column, type, nullability, server default and constraint, as Postgres DDL, model against revision.
+
+    THE TABLE AT HEAD: the model describes the override log as b6d1f93a7c42 leaves it (new_value appended), so the
+    later additions go on the revision's table before the comparison, whole and in the order a migrated database
+    holds them.
+    """
     op, _, _ = _run('upgrade')
-    tables = _revision_tables(op)
-    assert set(tables) == set(TABLES)
-    for name, model_table in TABLES.items():
-        assert _ddl_of(tables[name]) == _ddl_of(model_table), name
+    later = _later_added_columns()
+    assert {args[0] for name, args, _ in op.method_calls if name == 'create_table'} == set(TABLES)
+    assert [column.name for column in later.get(DatasetOverrideLog.TABLE_NAME, [])] == ['new_value']
+    metadata = sa.MetaData()
+    for name, args, _ in op.method_calls:
+        if name != 'create_table':
+            continue
+        table_name = args[0]
+        head = sa.Table(table_name, metadata, *args[1:], *later.get(table_name, []))
+        assert _ddl_of(head) == _ddl_of(TABLES[table_name]), table_name
 
 
 def test_the_revision_builds_exactly_the_indexes_the_models_declare():
@@ -174,10 +207,17 @@ def test_both_tables_are_in_allowed_models_so_autogenerate_sees_them():
 # The design shape
 
 
-def test_the_override_log_has_the_designed_columns_all_not_null_and_no_foreign_key():
+def test_the_override_log_has_the_designed_columns_all_not_null_but_new_value_and_no_foreign_key():
+    """tj-grna9p.86's six columns, all NOT NULL; plus new_value since b6d1f93a7c42 (ADR tj-26jt9w addendum 20).
+
+    new_value is Text and NULLABLE with no default: NULL for DELETE and for every row written before the column.
+    """
     table = DatasetOverrideLog.__table__
-    assert set(table.c.keys()) == {'id', 'actor', 'dataset_id', 'owner', 'action', 'reason', 'at'}
-    assert all(not column.nullable for column in table.columns), [c.name for c in table.columns if c.nullable]
+    assert set(table.c.keys()) == {'id', 'actor', 'dataset_id', 'owner', 'action', 'reason', 'at', 'new_value'}
+    assert [c.name for c in table.columns if c.nullable] == ['new_value']
+    new_value = table.c.new_value
+    assert isinstance(new_value.type, sa.Text)
+    assert new_value.server_default is None and new_value.default is None
     assert not table.foreign_keys
     assert isinstance(table.c.owner.type, SensitiveString)
 

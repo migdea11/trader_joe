@@ -4,13 +4,16 @@ THIS DOCSTRING IS THE SEED FORMAT'S DEFINITION (decision tj-vhboky.55 SEED FORMA
 Hand-written bootstrap seeds (tj-vhboky.62) follow it.
 
 The .sql is a DATA-ONLY rendering of store_dataset_entry, stock_market_activity, ingest_instance, ingest_request,
-ingest_run, corporate_action, asset_list_snapshot, asset_list_row and asset_list_event (never the 8f41c2d7a3b9 archive
+ingest_run, corporate_action, asset_list_snapshot, asset_list_row, asset_list_event, panel, panel_settings_version,
+panel_source_settings_version, panel_pass and panel_member_transition (never the 8f41c2d7a3b9 archive
 table; all but the first two written by ingest_records.py through the store's own code: the ingest tables since bead
-tj-7zjov1.100, corporate_action since tj-7zjov1.31, the asset-list tables since tj-7zjov1.30).
+tj-7zjov1.100, corporate_action since tj-7zjov1.31, the asset-list tables since tj-7zjov1.30, the panel tables since
+tj-7zjov1.196 by panel_records.py).
 It is rendered BY POSTGRES through the driver, in a session at TimeZone UTC and extra_float_digits 1 (the digests'
 settings), and holds exactly:
 
-  1. For each table in SEED_TABLES order (entries, bars, instances, requests, runs, corporate actions, snapshots, snapshot rows, snapshot events), one line per
+  1. For each table in SEED_TABLES order (entries, bars, instances, requests, runs, corporate actions, snapshots, snapshot rows, snapshot events, panels, panel settings versions, source settings versions,
+     passes, member transitions), one line per
      row, rows ordered by id ascending (ingest_instance: by instance_id, see order_column), each
 
          INSERT INTO public.<table> (<columns>) VALUES (<values>);
@@ -63,6 +66,11 @@ CORPORATE_ACTION_TABLE = 'corporate_action'
 SNAPSHOT_TABLE = 'asset_list_snapshot'
 SNAPSHOT_ROW_TABLE = 'asset_list_row'
 SNAPSHOT_EVENT_TABLE = 'asset_list_event'
+PANEL_TABLE = 'panel'
+PANEL_SETTINGS_TABLE = 'panel_settings_version'
+PANEL_SOURCE_SETTINGS_TABLE = 'panel_source_settings_version'
+PANEL_PASS_TABLE = 'panel_pass'  # nosec B105 -- a table name, not a password
+PANEL_TRANSITION_TABLE = 'panel_member_transition'
 SEED_TABLES = (
     ENTRY_TABLE,
     BAR_TABLE,
@@ -73,6 +81,11 @@ SEED_TABLES = (
     SNAPSHOT_TABLE,
     SNAPSHOT_ROW_TABLE,
     SNAPSHOT_EVENT_TABLE,
+    PANEL_TABLE,
+    PANEL_SETTINGS_TABLE,
+    PANEL_SOURCE_SETTINGS_TABLE,
+    PANEL_PASS_TABLE,
+    PANEL_TRANSITION_TABLE,
 )
 # The column a table's rows are ordered by, in the dump and in the manifest digests. Every table has an id
 # primary key except the instance marker, which is keyed by the opaque instance id.
@@ -146,6 +159,52 @@ UPDATE seed_snapshot s SET id = m.new_id, received_at = TIMESTAMPTZ '{SEED_TIMES
 UPDATE seed_snapshot_row SET id = md5('{SNAPSHOT_ROW_TABLE}|' || snapshot_id::text || '|' || vendor_asset_id || '|' || symbol)::uuid;
 UPDATE seed_snapshot_event SET id = md5('{SNAPSHOT_EVENT_TABLE}|' || snapshot_id::text || '|' || vendor_asset_id || '|' || kind::text)::uuid,
     received_at = TIMESTAMPTZ '{SEED_TIMESTAMP}';
+-- The panel cast (tj-7zjov1.196, panel_records.py). A panel id is the md5 of its name, a settings version's the md5 of
+-- (panel, version number), a source version's the md5 of (source, version number); instants are the seed timestamp plus the
+-- version number in hours. A pass has no natural key: its id is the md5 of its rank by started_at (the cast commits each pass
+-- on its own, so the order is the cast's), its start is the seed timestamp plus the rank in hours and its finish ten minutes
+-- later. A transition's id is the md5 of (pass, seq); its recorded_at is its pass's start plus seq seconds. The snapshot ids
+-- a pass names follow the snapshot map, a transition's dataset id follows the entry map (an absent dataset keeps its literal).
+CREATE TEMP TABLE seed_panel ON COMMIT DROP AS SELECT * FROM {PANEL_TABLE};
+CREATE TEMP TABLE seed_panel_settings ON COMMIT DROP AS SELECT * FROM {PANEL_SETTINGS_TABLE};
+CREATE TEMP TABLE seed_panel_source_settings ON COMMIT DROP AS SELECT * FROM {PANEL_SOURCE_SETTINGS_TABLE};
+CREATE TEMP TABLE seed_panel_pass ON COMMIT DROP AS SELECT * FROM {PANEL_PASS_TABLE};
+CREATE TEMP TABLE seed_panel_transition ON COMMIT DROP AS SELECT * FROM {PANEL_TRANSITION_TABLE};
+CREATE TEMP TABLE seed_panel_map ON COMMIT DROP AS
+    SELECT id AS old_id, md5('{PANEL_TABLE}|' || name)::uuid AS new_id FROM seed_panel;
+CREATE TEMP TABLE seed_settings_map ON COMMIT DROP AS
+    SELECT s.id AS old_id, md5('{PANEL_SETTINGS_TABLE}|' || m.new_id::text || '|' || s.version_no::text)::uuid AS new_id
+    FROM seed_panel_settings s JOIN seed_panel_map m ON m.old_id = s.panel_id;
+CREATE TEMP TABLE seed_source_settings_map ON COMMIT DROP AS
+    SELECT id AS old_id, md5('{PANEL_SOURCE_SETTINGS_TABLE}|' || source::text || '|' || version_no::text)::uuid AS new_id
+    FROM seed_panel_source_settings;
+CREATE TEMP TABLE seed_pass_map ON COMMIT DROP AS
+    SELECT id AS old_id, md5('{PANEL_PASS_TABLE}|' || rank::text)::uuid AS new_id, rank FROM (
+        SELECT id, row_number() OVER (
+            ORDER BY started_at, kind, dry_run, id
+        ) AS rank FROM seed_panel_pass
+    ) ranked;
+UPDATE seed_panel_transition t SET dataset_id = m.new_id FROM seed_map m WHERE t.dataset_id = m.old_id;
+UPDATE seed_panel_transition t SET panel_id = m.new_id FROM seed_panel_map m WHERE t.panel_id = m.old_id;
+UPDATE seed_panel_transition t SET pass_id = m.new_id FROM seed_pass_map m WHERE t.pass_id = m.old_id;
+UPDATE seed_panel_transition t SET recorded_at = TIMESTAMPTZ '{SEED_TIMESTAMP}' + p.rank * interval '1 hour' + t.seq * interval '1 second'
+    FROM seed_pass_map p WHERE p.new_id = t.pass_id;
+UPDATE seed_panel_transition SET id = md5('{PANEL_TRANSITION_TABLE}|' || pass_id::text || '|' || seq::text)::uuid;
+UPDATE seed_panel_pass p SET panel_id = m.new_id FROM seed_panel_map m WHERE p.panel_id = m.old_id;
+UPDATE seed_panel_pass p SET settings_version_id = m.new_id FROM seed_settings_map m WHERE p.settings_version_id = m.old_id;
+UPDATE seed_panel_pass p SET source_settings_version_id = m.new_id FROM seed_source_settings_map m WHERE p.source_settings_version_id = m.old_id;
+UPDATE seed_panel_pass p SET active_snapshot_id = m.new_id FROM seed_snapshot_map m WHERE p.active_snapshot_id = m.old_id;
+UPDATE seed_panel_pass p SET inactive_snapshot_id = m.new_id FROM seed_snapshot_map m WHERE p.inactive_snapshot_id = m.old_id;
+UPDATE seed_panel_pass p SET id = m.new_id,
+    started_at = TIMESTAMPTZ '{SEED_TIMESTAMP}' + m.rank * interval '1 hour',
+    finished_at = CASE WHEN p.finished_at IS NULL THEN NULL ELSE TIMESTAMPTZ '{SEED_TIMESTAMP}' + m.rank * interval '1 hour' + interval '10 minutes' END
+    FROM seed_pass_map m WHERE p.id = m.old_id;
+UPDATE seed_panel_settings s SET panel_id = m.new_id FROM seed_panel_map m WHERE s.panel_id = m.old_id;
+UPDATE seed_panel_settings s SET id = m.new_id, saved_at = TIMESTAMPTZ '{SEED_TIMESTAMP}' + s.version_no * interval '1 hour'
+    FROM seed_settings_map m WHERE s.id = m.old_id;
+UPDATE seed_panel_source_settings s SET id = m.new_id, saved_at = TIMESTAMPTZ '{SEED_TIMESTAMP}' + s.version_no * interval '1 hour'
+    FROM seed_source_settings_map m WHERE s.id = m.old_id;
+UPDATE seed_panel p SET id = m.new_id, created_at = TIMESTAMPTZ '{SEED_TIMESTAMP}' FROM seed_panel_map m WHERE p.id = m.old_id;
 UPDATE seed_instance SET first_seen_at = TIMESTAMPTZ '{SEED_TIMESTAMP}',
     last_seen_at = TIMESTAMPTZ '{SEED_TIMESTAMP}' + interval '2 hours',
     superseded_at = CASE WHEN superseded_at IS NULL THEN NULL ELSE TIMESTAMPTZ '{SEED_TIMESTAMP}' + interval '1 hour' END;
@@ -154,7 +213,8 @@ UPDATE seed_bar b SET id = r.rank FROM (
     FROM seed_bar
 ) r WHERE b.id = r.id;
 TRUNCATE {ENTRY_TABLE}, {BAR_TABLE}, {INSTANCE_TABLE}, {REQUEST_TABLE}, {RUN_TABLE}, {CORPORATE_ACTION_TABLE},
-    {SNAPSHOT_TABLE}, {SNAPSHOT_ROW_TABLE}, {SNAPSHOT_EVENT_TABLE};
+    {SNAPSHOT_TABLE}, {SNAPSHOT_ROW_TABLE}, {SNAPSHOT_EVENT_TABLE}, {PANEL_TABLE}, {PANEL_SETTINGS_TABLE},
+    {PANEL_SOURCE_SETTINGS_TABLE}, {PANEL_PASS_TABLE}, {PANEL_TRANSITION_TABLE};
 INSERT INTO {ENTRY_TABLE} SELECT * FROM seed_entry ORDER BY id;
 INSERT INTO {BAR_TABLE} SELECT * FROM seed_bar ORDER BY id;
 INSERT INTO {INSTANCE_TABLE} SELECT * FROM seed_instance ORDER BY instance_id;
@@ -164,6 +224,11 @@ INSERT INTO {CORPORATE_ACTION_TABLE} SELECT * FROM seed_corporate ORDER BY id;
 INSERT INTO {SNAPSHOT_TABLE} SELECT * FROM seed_snapshot ORDER BY id;
 INSERT INTO {SNAPSHOT_ROW_TABLE} SELECT * FROM seed_snapshot_row ORDER BY id;
 INSERT INTO {SNAPSHOT_EVENT_TABLE} SELECT * FROM seed_snapshot_event ORDER BY id;
+INSERT INTO {PANEL_TABLE} SELECT * FROM seed_panel ORDER BY id;
+INSERT INTO {PANEL_SETTINGS_TABLE} SELECT * FROM seed_panel_settings ORDER BY id;
+INSERT INTO {PANEL_SOURCE_SETTINGS_TABLE} SELECT * FROM seed_panel_source_settings ORDER BY id;
+INSERT INTO {PANEL_PASS_TABLE} SELECT * FROM seed_panel_pass ORDER BY id;
+INSERT INTO {PANEL_TRANSITION_TABLE} SELECT * FROM seed_panel_transition ORDER BY id;
 SELECT setval(pg_get_serial_sequence('{BAR_TABLE}', 'id'), max(id), true) FROM {BAR_TABLE} HAVING count(*) > 0;
 COMMIT;
 """  # nosec B608 -- interpolates module constants only, never input

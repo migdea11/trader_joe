@@ -100,6 +100,7 @@ from data.store.app.database.models.ingest_run import IngestRun
 from data.store.seeds import dump
 from data.store.seeds.dump import order_column
 from data.store.seeds.ingest_records import INSTANCES, REQUEST_IDS
+from data.store.seeds.panel_records import PANEL_NAME_PATTERN
 from data.store.seeds.scenario import OWNER_PATTERN, is_synthetic
 
 
@@ -123,13 +124,26 @@ CORPORATE_ACTION_TABLE = 'corporate_action'
 SNAPSHOT_TABLE = 'asset_list_snapshot'
 SNAPSHOT_ROW_TABLE = 'asset_list_row'
 SNAPSHOT_EVENT_TABLE = 'asset_list_event'
+PANEL_TABLE = 'panel'
+PANEL_SETTINGS_TABLE = 'panel_settings_version'
+PANEL_SOURCE_SETTINGS_TABLE = 'panel_source_settings_version'
+PANEL_PASS_TABLE = 'panel_pass'  # nosec B105 -- a table name, not a password
+PANEL_TRANSITION_TABLE = 'panel_member_transition'
 ASSET_LIST_TABLES = (SNAPSHOT_TABLE, SNAPSHOT_ROW_TABLE, SNAPSHOT_EVENT_TABLE)
 MARKET_TABLES = (ENTRY_TABLE, BAR_TABLE)
 INGEST_TABLES = (INSTANCE_TABLE, REQUEST_TABLE, RUN_TABLE)
+# Parents first, as the producer writes and dumps them (tj-7zjov1.196).
+PANEL_SEED_TABLES = (
+    PANEL_TABLE,
+    PANEL_SETTINGS_TABLE,
+    PANEL_SOURCE_SETTINGS_TABLE,
+    PANEL_PASS_TABLE,
+    PANEL_TRANSITION_TABLE,
+)
 # Every table a seed may cover, parents first (bead tj-7zjov1.100); a seed covers the ones its manifest names.
 # corporate_action joins at c7e19a4d5b28 (tj-7zjov1.31), last, as the producer writes it; the three asset-list tables
-# at a3f8d2c6e914 (tj-7zjov1.30), after it.
-SEED_TABLES = MARKET_TABLES + INGEST_TABLES + (CORPORATE_ACTION_TABLE,) + ASSET_LIST_TABLES
+# at a3f8d2c6e914 (tj-7zjov1.30), after it; the five panel tables in the b6d1f93a7c42 seed (tj-7zjov1.196), last.
+SEED_TABLES = MARKET_TABLES + INGEST_TABLES + (CORPORATE_ACTION_TABLE,) + ASSET_LIST_TABLES + PANEL_SEED_TABLES
 # The column a seed table's rows are checked as synthetic by, beside asset_symbol: the owner, by its name per
 # table. ingest_instance has no label; its ids are checked against the cast instead. corporate_action has no
 # asset_symbol and no owner: its requesting_symbol is checked alone (SYMBOL_COLUMN), as are the vendor symbols of the
@@ -141,7 +155,18 @@ SYMBOL_COLUMN = {
     CORPORATE_ACTION_TABLE: ('requesting_symbol',),
     SNAPSHOT_ROW_TABLE: ('symbol',),
     SNAPSHOT_EVENT_TABLE: ('symbol', 'previous_symbol'),
+    PANEL_TRANSITION_TABLE: ('symbol',),
 }
+# The panel tables (tj-7zjov1.196), judged as producer.py's foreign-row refusal judges them: a panel by its name
+# (PANEL_NAME_PATTERN), a settings version of either kind by its actor alone (OWNER_PATTERN), and the symbols a panel
+# settings version allows or denies by the symbol pattern (PANEL_LISTED_SYMBOLS). A transition's symbol is SYMBOL_COLUMN's.
+# panel_pass carries no symbol and no label: its panel id is checked against the seed's panels instead.
+PANEL_LABEL_COLUMN = {
+    PANEL_TABLE: ('name', PANEL_NAME_PATTERN),
+    PANEL_SETTINGS_TABLE: ('actor', OWNER_PATTERN),
+    PANEL_SOURCE_SETTINGS_TABLE: ('actor', OWNER_PATTERN),
+}
+PANEL_LISTED_SYMBOLS = {PANEL_SETTINGS_TABLE: ('allow_symbols', 'deny_symbols')}
 MANIFEST_KEYS = {'date', 'digests', 'producer', 'revision', 'row_counts'}
 
 ADDITIVE_EXCEPTION_MARKER = re.compile(r'^# additive-exception: \S+', re.MULTILINE)
@@ -676,17 +701,20 @@ def test_every_expectation_is_for_a_marked_revision_and_a_present_seed() -> None
 
 
 def test_the_seed_tables_are_the_producers() -> None:
-    """Bead tj-7zjov1.100: this file's tables, in order, are the ones the producer writes (nine since tj-7zjov1.30).
+    """Bead tj-7zjov1.100: this file's tables, in order, are the ones the producer writes.
 
-    Each is judged by a label, by its symbols, or by ids against the cast (the instance marker; the snapshot table,
-    which carries no symbol and no owner, by its request ids).
+    Nine since tj-7zjov1.30, fourteen since tj-7zjov1.196 (the panel tables). Each is judged by a label, by its
+    symbols, or by ids against the cast (the instance marker; the snapshot table, which carries no symbol and no
+    owner, by its request ids; a panel pass by its panel id).
     """
     assert SEED_TABLES == dump.SEED_TABLES
-    assert set(LABEL_COLUMN) | set(SYMBOL_COLUMN) | {INSTANCE_TABLE, SNAPSHOT_TABLE} == set(SEED_TABLES)
+    judged = set(LABEL_COLUMN) | set(SYMBOL_COLUMN) | set(PANEL_LABEL_COLUMN)
+    assert judged | {INSTANCE_TABLE, SNAPSHOT_TABLE, PANEL_PASS_TABLE} == set(SEED_TABLES)
+    assert set(PANEL_LISTED_SYMBOLS) <= set(PANEL_LABEL_COLUMN)
 
 
 def test_the_canonical_seed_at_the_head_covers_every_seed_table_with_rows() -> None:
-    """The producer always writes all six; a head seed without the ingest tables would make them go unchecked."""
+    """The producer always writes every seed table; a head seed without one would leave that table unchecked."""
     head = _head_revision()
     assert head in SEED_NAMES, f'no canonical seed at the head {head}'
     seed = read_seed(head)
@@ -758,6 +786,31 @@ def test_seed_loads_equal_to_its_manifest(scratch: ScratchDb, name: str) -> None
             with scratch.engine.connect() as conn:
                 requests = set(conn.execute(sa.text(f'SELECT request_id FROM public.{table}')).scalars())  # nosec B608 -- module-constant table
             assert requests <= set(REQUEST_IDS.values()), f'seed {name}: a snapshot of a request not in the cast'
+            continue
+        if table == PANEL_PASS_TABLE:
+            with scratch.engine.connect() as conn:
+                strays = conn.execute(
+                    sa.text(
+                        f'SELECT count(*) FROM public.{table} p WHERE NOT EXISTS '  # nosec B608 -- module-constant tables
+                        f'(SELECT 1 FROM public.{PANEL_TABLE} n WHERE n.id = p.panel_id)'
+                    )
+                ).scalar_one()
+            assert strays == 0, f'seed {name}: {strays} panel pass(es) of a panel not in the seed'
+            continue
+        if table in PANEL_LABEL_COLUMN:
+            column, pattern = PANEL_LABEL_COLUMN[table]
+            with scratch.engine.connect() as conn:
+                labels = set(conn.execute(sa.text(f'SELECT DISTINCT {_quote(column)} FROM public.{table}')).scalars())  # nosec B608 -- module-constant table, quoted name
+                listed = set()
+                for array in PANEL_LISTED_SYMBOLS.get(table, ()):
+                    listed |= set(
+                        conn.execute(sa.text(f'SELECT DISTINCT unnest({_quote(array)}) FROM public.{table}')).scalars()  # nosec B608 -- module-constant table, quoted name
+                    )
+            assert all(pattern.fullmatch(label) for label in labels), (
+                f'seed {name}: a non-synthetic {column} in {table}'
+            )
+            foreign = [symbol for symbol in listed if not is_synthetic(symbol, None)]
+            assert not foreign, f'seed {name}: {len(foreign)} non-synthetic listed symbol(s) in {table}'
             continue
         if table in SYMBOL_COLUMN:
             symbols = set()
@@ -2097,3 +2150,415 @@ def test_a_re_upgrade_after_downgrading_asset_list_rows_refuses_atomically_on_th
 
     assert_refused(run, scratch, CORPORATE_ACTION_REVISION, before, schema)
     assert ASSET_LIST_CHECK in run.output, f'not the CHECK refusal:\n{run.output[-4000:]}'
+
+
+# ---------------------------------------------------------------------------------------------
+# tj-7zjov1.33 (P20): b6d1f93a7c42, the five panel tables (panel, panel_settings_version, panel_source_settings_version,
+# panel_pass, panel_member_transition), dataset_override_log.new_value and ix_ingest_request_source_created_at, with
+# the three enum types panel_cadence, panel_transition and panel_pass_kind. PURELY ADDITIVE and UNMARKED (ADR tj-26jt9w
+# addendum 20; the rate design of 14:16 UTC 2026-10-27 on the bead), so NO EXPECTATIONS entry: the generic rule
+# upgrades the a3f8d2c6e914 seed one step and downgrades it losslessly. This section adds the revision's own facts on
+# Postgres: applied from empty with NO panel or settings row seeded and no policy default; the parent seed upgraded
+# with every row kept; an override-log row written before the revision keeps NULL new_value; the uniqueness, the
+# CHECKs, the absent defaults and the foreign keys refusing on real Postgres; a ledger row outliving its dataset and
+# request (no foreign key to either); and the downgrade on a database HOLDING panel data dropping every panel object,
+# the column, the index and the three types while every other row stays byte for byte. The offline half is
+# data/store/tests/test_panel_revision.py; what the revision builds, object by object, is test_migration_downgrade.py's.
+
+PANEL_REVISION = 'b6d1f93a7c42'
+PANEL_TABLES = (
+    'panel',
+    'panel_settings_version',
+    'panel_source_settings_version',
+    'panel_pass',
+    'panel_member_transition',
+)
+PANEL_TYPES = {
+    'panel_cadence': ['DAILY', 'WEEKLY', 'MONTHLY'],
+    'panel_transition': ['ENTERED', 'CREATED', 'DEFERRED', 'REFUSED', 'EXITED', 'DRAINING', 'DRAINED'],
+    'panel_pass_kind': ['MEMBERSHIP', 'RELEASE'],
+}
+REQUEST_RATE_INDEX = 'ix_ingest_request_source_created_at'
+# The policy columns: no default at all (owner ruling 2026-10-27).
+PANEL_POLICY_COLUMNS = {
+    'panel_settings_version': ('enabled', 'cadence', 'size'),
+    'panel_source_settings_version': (
+        'ramp_datasets_per_hour',
+        'request_cap_per_hour',
+        'corporate_action_window_pre_days',
+        'corporate_action_window_post_days',
+    ),
+    'panel_pass': ('kind', 'dry_run'),
+}
+# Any label of the existing datasource type: the cast names one, never assuming which spelling the type stores.
+SOME_SOURCE = '(enum_range(NULL::datasource))[1]'
+
+
+def _labels_of(db: ScratchDb, type_name: str) -> list[str]:
+    with db.engine.connect() as conn:
+        return list(conn.execute(sa.text(f'SELECT unnest(enum_range(NULL::{type_name}))::text')).scalars())  # nosec B608 -- module-constant type
+
+
+def _index_exists(db: ScratchDb, name: str) -> bool:
+    with db.engine.connect() as conn:
+        return conn.execute(
+            sa.text("SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = :name)"),
+            {'name': name},
+        ).scalar_one()
+
+
+def _write_panel_cast(db: ScratchDb, *, dataset_id: Any = None, request_id: Any = None) -> dict[str, Any]:
+    """One panel, one version of each settings kind, one pass and one CREATED transition, through plain SQL.
+
+    The ids are returned so a test can aim a refusal at them.
+    """
+    with db.engine.begin() as conn:
+        panel = conn.execute(
+            sa.text(
+                f"INSERT INTO public.panel (name, source) VALUES ('zz-seed-panel', {SOME_SOURCE}) RETURNING id, source"  # nosec B608 -- module constant
+            )
+        ).one()
+        settings = conn.execute(
+            sa.text(
+                'INSERT INTO public.panel_settings_version (panel_id, version_no, enabled, cadence, size, actor, reason) '
+                "VALUES (:panel, 1, true, 'DAILY', 10, 'operator', 'first version') RETURNING id"
+            ),
+            {'panel': panel.id},
+        ).scalar_one()
+        source_settings = conn.execute(
+            sa.text(
+                'INSERT INTO public.panel_source_settings_version (source, version_no, ramp_datasets_per_hour, '
+                'request_cap_per_hour, corporate_action_window_pre_days, corporate_action_window_post_days, actor, '
+                "reason) VALUES (:source, 1, 5, 50, 90, 90, 'operator', 'first version') RETURNING id"
+            ),
+            {'source': panel.source},
+        ).scalar_one()
+        pass_id = conn.execute(
+            sa.text(
+                'INSERT INTO public.panel_pass (panel_id, kind, settings_version_id, source_settings_version_id, '
+                "active_snapshot_id, dry_run) VALUES (:panel, 'MEMBERSHIP', :settings, :source_settings, "
+                'gen_random_uuid(), false) RETURNING id'
+            ),
+            {'panel': panel.id, 'settings': settings, 'source_settings': source_settings},
+        ).scalar_one()
+        transition = conn.execute(
+            sa.text(
+                'INSERT INTO public.panel_member_transition (pass_id, panel_id, vendor_asset_id, symbol, transition, '
+                "dataset_id, request_id, as_of, seq) VALUES (:pass, :panel, 'seed-asset-p1', 'ZZSEEDPA', 'CREATED', "
+                ':dataset, :request, now(), 1) RETURNING id'
+            ),
+            {'pass': pass_id, 'panel': panel.id, 'dataset': dataset_id, 'request': request_id},
+        ).scalar_one()
+    return {
+        'panel': panel.id,
+        'source': panel.source,
+        'settings': settings,
+        'source_settings': source_settings,
+        'pass': pass_id,
+        'transition': transition,
+    }
+
+
+def _refused(db: ScratchDb, statement: str, params: dict[str, Any]) -> str:
+    """Run one statement the database must REFUSE; return the error text (it names the constraint or column)."""
+    with db.engine.connect() as conn:
+        try:
+            conn.execute(sa.text(statement), params)
+        except sa.exc.IntegrityError as exc:
+            conn.rollback()
+            return str(exc.orig)
+    pytest.fail(f'the database admitted: {statement}', pytrace=False)
+
+
+def test_the_panel_revision_sits_on_the_asset_list_revision_unmarked_with_its_parent_seed() -> None:
+    assert GRAPH[PANEL_REVISION].down_revision == ASSET_LIST_REVISION
+    assert not GRAPH[PANEL_REVISION].marked, 'the panel revision is designed additive; it carries no marker'
+    assert PANEL_REVISION not in EXPECTATIONS, 'an unmarked revision is the generic rule, never an EXPECTATIONS entry'
+    assert ASSET_LIST_REVISION in SEED_NAMES and PANEL_REVISION in SEED_NAMES
+    transitions = {param.values: param.id for param in TRANSITIONS}
+    assert transitions.get((ASSET_LIST_REVISION,)) == f'{ASSET_LIST_REVISION}->{PANEL_REVISION}', (
+        f'the generic rule does not run the parent seed through this revision: {sorted(transitions.values())}'
+    )
+
+
+def test_the_panel_revision_applies_from_empty_seeding_nothing_with_no_policy_default(scratch: ScratchDb) -> None:
+    """From an EMPTY database: five empty tables, the three types with the design's labels, no policy default."""
+    assert scratch.revision() is None
+    scratch.must('upgrade', PANEL_REVISION)
+
+    assert scratch.row_counts(PANEL_TABLES) == dict.fromkeys(PANEL_TABLES, 0), 'the revision seeded a panel row'
+    for name, labels in PANEL_TYPES.items():
+        assert _labels_of(scratch, name) == labels, name
+    for table, columns in PANEL_POLICY_COLUMNS.items():
+        for column in columns:
+            facts = _column_facts(scratch, table, column)
+            assert facts is not None and facts[2:] == ('NO', None), f'{table}.{column}: {facts}'
+    assert _column_facts(scratch, 'panel_member_transition', 'recorded_at') == (
+        'timestamp with time zone',
+        'timestamptz',
+        'NO',
+        'now()',
+    )
+    assert _column_facts(scratch, 'panel_member_transition', 'seq') == ('integer', 'int4', 'NO', None)
+    assert _column_facts(scratch, 'panel_pass', 'kind')[:2] == ('USER-DEFINED', 'panel_pass_kind')
+    assert _column_facts(scratch, OVERRIDE_TABLE, 'new_value') == ('text', 'text', 'YES', None)
+    assert _index_exists(scratch, REQUEST_RATE_INDEX)
+
+
+def test_the_panel_revision_upgrades_the_parent_seed_with_every_row_kept_and_nothing_backfilled(
+    scratch: ScratchDb,
+) -> None:
+    seed = read_seed(ASSET_LIST_REVISION)
+    scratch.load(seed)
+    assert seed.row_counts[REQUEST_TABLE] > 0, f'the parent seed holds no {REQUEST_TABLE} row, so this is vacuous'
+
+    scratch.must('upgrade', PANEL_REVISION)
+
+    assert_equals_manifest(scratch, seed)  # every parent column of every row, byte for byte
+    assert scratch.row_counts(PANEL_TABLES) == dict.fromkeys(PANEL_TABLES, 0), 'the revision backfilled a panel row'
+
+
+def test_an_override_row_written_before_the_revision_keeps_a_null_new_value(scratch: ScratchDb) -> None:
+    """Addendum 20: new_value is NULL for every row written before the column existed; the downgrade keeps the row."""
+    scratch.must('upgrade', ASSET_LIST_REVISION)
+    with scratch.engine.begin() as conn:
+        written = conn.execute(
+            sa.text(
+                f'INSERT INTO public.{OVERRIDE_TABLE} (actor, dataset_id, owner, action, reason) '  # nosec B608 -- module constant
+                "VALUES ('operator', gen_random_uuid(), 'zz-seed-owner', 'SET_EXPIRY', 'before the revision') "
+                'RETURNING id'
+            )
+        ).scalar_one()
+
+    scratch.must('upgrade', PANEL_REVISION)
+    assert scratch.values(OVERRIDE_TABLE, 'new_value') == {written: None}
+
+    scratch.must('downgrade', ASSET_LIST_REVISION)
+    assert 'new_value' not in scratch.columns(OVERRIDE_TABLE)
+    assert list(scratch.values(OVERRIDE_TABLE, 'reason').values()) == ['before the revision']
+
+
+_SETTINGS_INSERT = (
+    'INSERT INTO public.panel_settings_version (panel_id, version_no, enabled, cadence, size, actor, reason) VALUES '
+)
+_SOURCE_SETTINGS_INSERT = (
+    'INSERT INTO public.panel_source_settings_version (source, version_no, ramp_datasets_per_hour, '
+    'request_cap_per_hour, corporate_action_window_pre_days, corporate_action_window_post_days, actor, reason) VALUES '
+)
+
+
+@pytest.mark.parametrize(
+    ('statement', 'names'),
+    [
+        pytest.param(
+            f"INSERT INTO public.panel (name, source) VALUES ('zz-seed-panel', {SOME_SOURCE})",
+            'uq_panel_name',
+            id='panel-name-unique',
+        ),
+        pytest.param(
+            _SETTINGS_INSERT + "(:panel, 1, true, 'WEEKLY', 5, 'operator', 'again')",
+            'uq_panel_settings_version_panel_id_version_no',
+            id='version-no-unique-per-panel',
+        ),
+        pytest.param(
+            _SOURCE_SETTINGS_INSERT + "(:source, 1, 1, 1, 1, 1, 'operator', 'again')",
+            'uq_panel_source_settings_version_source_version_no',
+            id='version-no-unique-per-source',
+        ),
+        pytest.param(
+            _SETTINGS_INSERT + "(:panel, 2, true, 'WEEKLY', 5, 'operator', '   ')",
+            'ck_panel_settings_version_reason_not_blank',
+            id='reason-blank',
+        ),
+        pytest.param(
+            _SETTINGS_INSERT + "(:panel, 2, true, 'WEEKLY', 5, ' ', 'a reason')",
+            'ck_panel_settings_version_actor_not_blank',
+            id='actor-blank',
+        ),
+        pytest.param(
+            _SETTINGS_INSERT + "(:panel, 0, true, 'WEEKLY', 5, 'operator', 'a reason')",
+            'ck_panel_settings_version_version_no_positive',
+            id='version-no-zero',
+        ),
+        pytest.param(
+            _SOURCE_SETTINGS_INSERT + "(:source, 2, 1, -1, 1, 1, 'operator', 'negative cap')",
+            'ck_panel_source_settings_version_numbers_non_negative',
+            id='request-cap-negative',
+        ),
+        pytest.param(
+            _SOURCE_SETTINGS_INSERT + "(:source, 2, -1, 1, 1, 1, 'operator', 'negative ramp')",
+            'ck_panel_source_settings_version_numbers_non_negative',
+            id='ramp-negative',
+        ),
+        pytest.param(
+            _SOURCE_SETTINGS_INSERT + "(:source, 2, 1, 1, 1, 1, 'operator', ' ')",
+            'ck_panel_source_settings_version_reason_not_blank',
+            id='source-reason-blank',
+        ),
+        pytest.param(
+            'INSERT INTO public.panel_settings_version (panel_id, version_no, enabled, size, actor, reason) '
+            "VALUES (:panel, 2, true, 5, 'operator', 'no cadence')",
+            'column "cadence"',
+            id='cadence-has-no-default',
+        ),
+        pytest.param(
+            'INSERT INTO public.panel_source_settings_version (source, version_no, request_cap_per_hour, '
+            'corporate_action_window_pre_days, corporate_action_window_post_days, actor, reason) '
+            "VALUES (:source, 2, 1, 1, 1, 'operator', 'no ramp')",
+            'column "ramp_datasets_per_hour"',
+            id='ramp-has-no-default',
+        ),
+        pytest.param(
+            'INSERT INTO public.panel_pass (panel_id, settings_version_id, source_settings_version_id, '
+            'active_snapshot_id, dry_run) VALUES (:panel, :settings, :source_settings, gen_random_uuid(), false)',
+            'column "kind"',
+            id='pass-kind-has-no-default',
+        ),
+        pytest.param(
+            'INSERT INTO public.panel_member_transition (pass_id, panel_id, vendor_asset_id, symbol, transition, as_of, '
+            "seq) VALUES (gen_random_uuid(), :panel, 'x', 'ZZSEEDPB', 'ENTERED', now(), 1)",
+            'panel_member_transition_pass_id_fkey',
+            id='transition-needs-its-pass',
+        ),
+        # seq, the per-pass append ordinal (ruling 2026-10-30 on tj-7zjov1.177): unique per pass, never defaulted.
+        pytest.param(
+            'INSERT INTO public.panel_member_transition (pass_id, panel_id, vendor_asset_id, symbol, transition, as_of, '
+            "seq) VALUES (:pass, :panel, 'x', 'ZZSEEDPB', 'ENTERED', now(), 1)",
+            'uq_panel_member_transition_pass_id_seq',
+            id='transition-seq-unique-per-pass',
+        ),
+        pytest.param(
+            'INSERT INTO public.panel_member_transition (pass_id, panel_id, vendor_asset_id, symbol, transition, as_of) '
+            "VALUES (:pass, :panel, 'x', 'ZZSEEDPB', 'ENTERED', now())",
+            'column "seq"',
+            id='transition-seq-has-no-default',
+        ),
+    ],
+)
+def test_the_panel_constraints_refuse_on_postgres(scratch: ScratchDb, statement: str, names: str) -> None:
+    """Uniqueness (name; version_no per panel and per source), the CHECKs, the absent defaults, the pass foreign key."""
+    scratch.must('upgrade', PANEL_REVISION)
+    cast = _write_panel_cast(scratch)
+
+    error = _refused(scratch, statement, cast)
+
+    assert names in error, error
+
+
+def test_the_panel_tables_admit_every_cadence_and_transition_label(scratch: ScratchDb) -> None:
+    scratch.must('upgrade', PANEL_REVISION)
+    cast = _write_panel_cast(scratch)
+    with scratch.engine.begin() as conn:
+        for number, cadence in enumerate(PANEL_TYPES['panel_cadence'], start=2):
+            conn.execute(
+                sa.text(
+                    _SETTINGS_INSERT + "(:panel, :no, false, CAST(:cadence AS panel_cadence), 0, 'operator', 'a label')"
+                ),
+                {'panel': cast['panel'], 'no': number, 'cadence': cadence},
+            )
+        for seq, transition in enumerate(PANEL_TYPES['panel_transition'], start=2):  # the cast's row is seq 1
+            conn.execute(
+                sa.text(
+                    'INSERT INTO public.panel_member_transition (pass_id, panel_id, vendor_asset_id, symbol, '
+                    "transition, cause, as_of, seq) VALUES (:pass, :panel, 'seed-asset-p2', 'ZZSEEDPB', "
+                    "CAST(:transition AS panel_transition), 'ramp_rate', now(), :seq)"
+                ),
+                {'pass': cast['pass'], 'panel': cast['panel'], 'transition': transition, 'seq': seq},
+            )
+    assert scratch.row_counts(('panel_settings_version', 'panel_member_transition')) == {
+        'panel_settings_version': 1 + len(PANEL_TYPES['panel_cadence']),
+        'panel_member_transition': 1 + len(PANEL_TYPES['panel_transition']),
+    }
+
+
+def test_a_transition_outlives_its_dataset_and_its_request(scratch: ScratchDb) -> None:
+    """No foreign key from the ledger to store_dataset_entry or ingest_request: deleting either leaves the row.
+
+    Since tj-7zjov1.197 the head seed carries the panel cast (seeds/panel_records.py), whose CREATED rows name a seed
+    entry and a seed request, so the row deleted under is the seed's own (a plain-SQL cast beside it would collide with
+    the seed panel's unique name and the source's version 1).
+    """
+    scratch.load(read_seed(PANEL_REVISION))
+    with scratch.engine.connect() as conn:
+        transition, dataset, request = conn.execute(
+            sa.text(
+                f"SELECT id, dataset_id, request_id FROM public.{PANEL_TRANSITION_TABLE} WHERE transition = 'CREATED' "  # nosec B608 -- module constant
+                'AND dataset_id IS NOT NULL AND request_id IS NOT NULL ORDER BY id LIMIT 1'
+            )
+        ).one()
+        named = conn.execute(
+            sa.text(
+                f'SELECT (SELECT count(*) FROM public.{ENTRY_TABLE} WHERE id = :dataset), '  # nosec B608 -- module constants
+                f'(SELECT count(*) FROM public.{REQUEST_TABLE} WHERE id = :request)'
+            ),
+            {'dataset': dataset, 'request': request},
+        ).one()
+    assert tuple(named) == (1, 1), 'the seed CREATED row does not name a seed entry and a seed request'
+
+    with scratch.engine.begin() as conn:
+        conn.execute(sa.text(f'DELETE FROM public.{ENTRY_TABLE} WHERE id = :id'), {'id': dataset})  # nosec B608 -- module constant
+        conn.execute(sa.text(f'DELETE FROM public.{REQUEST_TABLE} WHERE id = :id'), {'id': request})  # nosec B608 -- module constant
+
+    with scratch.engine.connect() as conn:
+        row = conn.execute(
+            sa.text('SELECT dataset_id, request_id FROM public.panel_member_transition WHERE id = :id'),
+            {'id': transition},
+        ).one()
+        foreign = conn.execute(
+            sa.text(
+                "SELECT count(*) FROM pg_constraint WHERE contype = 'f' AND confrelid IN "
+                "('public.store_dataset_entry'::regclass, 'public.ingest_request'::regclass, "
+                "'public.asset_list_snapshot'::regclass) AND conrelid IN ('public.panel_pass'::regclass, "
+                "'public.panel_member_transition'::regclass)"
+            )
+        ).scalar_one()
+    assert tuple(row) == (dataset, request), 'the ledger row was changed or removed with its dataset'
+    assert foreign == 0
+
+
+def test_the_panel_downgrade_on_a_database_holding_its_data_drops_every_panel_object_and_keeps_the_rest(
+    scratch: ScratchDb,
+) -> None:
+    """Checklist item 17 on DATA: the head seed, downgraded one step, drops the panel rows and keeps every other row.
+
+    Bead tj-7zjov1.197 PIN (5): since then the head seed itself holds the panel cast, so it is the data downgraded
+    (the plain-SQL cast this test wrote before would collide with the seed panel's unique name). Every table but the
+    five panel ones is compared with the head manifest, byte for byte, after the downgrade and after the re-upgrade.
+    """
+    head = read_seed(PANEL_REVISION)
+    scratch.load(head)
+    assert all(head.row_counts[table] > 0 for table in PANEL_TABLES), 'the head seed holds no panel row: vacuous'
+    assert scratch.row_counts(PANEL_TABLES) == {table: head.row_counts[table] for table in PANEL_TABLES}
+    kept = Seed(
+        name=f'{head.name} without the panel tables',
+        revision=head.revision,
+        sql_path=head.sql_path,
+        manifest={
+            **head.manifest,
+            'row_counts': {t: n for t, n in head.row_counts.items() if t not in PANEL_TABLES},
+            'digests': {t: d for t, d in head.digests.items() if t not in PANEL_TABLES},
+        },
+    )
+    with scratch.engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                f'INSERT INTO public.{OVERRIDE_TABLE} (actor, dataset_id, owner, action, reason, new_value) '  # nosec B608 -- module constant
+                "VALUES ('operator', gen_random_uuid(), 'zz-seed-owner', 'SET_EXPIRY', 'with a value', '2030-01-01')"
+            )
+        )
+
+    scratch.must('downgrade', ASSET_LIST_REVISION)
+
+    for table in PANEL_TABLES:
+        assert scratch.columns(table) == [], f'the downgrade left {table}'
+    for name in PANEL_TYPES:
+        assert not scratch.enum_exists(name), f'the downgrade left the type {name}'
+    assert 'new_value' not in scratch.columns(OVERRIDE_TABLE)
+    assert not _index_exists(scratch, REQUEST_RATE_INDEX)
+    assert scratch.enum_exists('datasource'), 'the downgrade dropped a type an earlier revision owns'
+    assert kept.tables == tuple(table for table in SEED_TABLES if table not in PANEL_TABLES)
+    assert_equals_manifest(scratch, kept)
+
+    scratch.must('upgrade', PANEL_REVISION)
+    assert scratch.row_counts(PANEL_TABLES) == dict.fromkeys(PANEL_TABLES, 0), 'a panel row came back with the tables'
+    assert_equals_manifest(scratch, kept)

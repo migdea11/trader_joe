@@ -62,7 +62,8 @@ BAR_IDENTITY_REVISION = 'eec8f88a7443'
 # 39c28a39b290 since tj-7zjov1.153: ingest_request.expiry_type, a request column, none on the bar.
 # c7e19a4d5b28 since tj-7zjov1.31: the corporate_action table and nullable ingest_run labels, none on the bar.
 # a3f8d2c6e914 since tj-7zjov1.30: the asset-list snapshot tables and a request column, none on the bar.
-CURRENT_HEAD = 'a3f8d2c6e914'
+# b6d1f93a7c42 since tj-7zjov1.33: the panel tables, an override-log column and a request index, none on the bar.
+CURRENT_HEAD = 'b6d1f93a7c42'
 
 # The natural key as 8f41c2d7a3b9 itself declares it, written out as a HISTORIC LITERAL rather
 # than read off BaseMarketActivity. A past revision's job is to describe the schema as it was;

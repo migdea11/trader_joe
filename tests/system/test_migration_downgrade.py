@@ -531,3 +531,171 @@ def test_the_asset_list_revision_builds_three_tables_a_column_a_check_two_types_
 
     _migrate(revision_db, ASSET_LIST_REVISION, 'downgrade', 'downgrade', parent, parent)
     assert not diff_catalogues(before, _catalogue(revision_db)), 'the downgrade left or lost an object'
+
+
+# ---------------------------------------------------------------------------------------------
+# tj-7zjov1.33 (P20): what b6d1f93a7c42 builds, read off the catalogue. The design (ADR tj-26jt9w addendum 20, the rate
+# design of 14:16 UTC 2026-10-27 on the bead): five new tables with their primary keys, two version uniques, the name
+# unique, the pass and ledger indexes, six foreign keys ALL inside the panel tables (none to store_dataset_entry,
+# ingest_request or asset_list_snapshot, none cascading), the CHECKs; ONE new column outside them
+# (dataset_override_log.new_value, text, nullable, no default) and ONE index outside them
+# (ix_ingest_request_source_created_at); three new enum types. No existing object changed. The downgrade restores the
+# parent exactly (on an empty database; on one holding panel data it is test_migration_with_data.py's).
+
+PANEL_REVISION = 'b6d1f93a7c42'
+PANEL_TABLES = {
+    'panel',
+    'panel_settings_version',
+    'panel_source_settings_version',
+    'panel_pass',
+    'panel_member_transition',
+}
+PANEL_INDEXES = {
+    *(f'{table}_pkey' for table in PANEL_TABLES),
+    'uq_panel_name',
+    'uq_panel_settings_version_panel_id_version_no',
+    'uq_panel_source_settings_version_source_version_no',
+    'uq_panel_member_transition_pass_id_seq',
+    'ix_panel_pass_panel_id_started_at',
+    'ix_panel_pass_settings_version_id',
+    'ix_panel_pass_source_settings_version_id',
+    'ix_panel_member_transition_panel_id_vendor_asset_id_as_of',
+    'ix_panel_member_transition_pass_id',
+    'ix_panel_member_transition_transition_recorded_at',
+    'ix_ingest_request_source_created_at',
+}
+PANEL_FOREIGN_KEYS = {
+    ('panel_settings_version', 'FOREIGN KEY (panel_id) REFERENCES panel(id)'),
+    ('panel_pass', 'FOREIGN KEY (panel_id) REFERENCES panel(id)'),
+    ('panel_pass', 'FOREIGN KEY (settings_version_id) REFERENCES panel_settings_version(id)'),
+    ('panel_pass', 'FOREIGN KEY (source_settings_version_id) REFERENCES panel_source_settings_version(id)'),
+    ('panel_member_transition', 'FOREIGN KEY (pass_id) REFERENCES panel_pass(id)'),
+    ('panel_member_transition', 'FOREIGN KEY (panel_id) REFERENCES panel(id)'),
+}
+PANEL_CHECKS = {
+    ('panel_settings_version', 'ck_panel_settings_version_version_no_positive'),
+    ('panel_settings_version', 'ck_panel_settings_version_size_non_negative'),
+    ('panel_settings_version', 'ck_panel_settings_version_actor_not_blank'),
+    ('panel_settings_version', 'ck_panel_settings_version_reason_not_blank'),
+    ('panel_source_settings_version', 'ck_panel_source_settings_version_version_no_positive'),
+    ('panel_source_settings_version', 'ck_panel_source_settings_version_numbers_non_negative'),
+    ('panel_source_settings_version', 'ck_panel_source_settings_version_actor_not_blank'),
+    ('panel_source_settings_version', 'ck_panel_source_settings_version_reason_not_blank'),
+}
+PANEL_ENUMS = {
+    'panel_cadence': ['DAILY', 'WEEKLY', 'MONTHLY'],
+    'panel_transition': ['ENTERED', 'CREATED', 'DEFERRED', 'REFUSED', 'EXITED', 'DRAINING', 'DRAINED'],
+    'panel_pass_kind': ['MEMBERSHIP', 'RELEASE'],
+}
+# No policy default (owner ruling 2026-10-27): these columns carry no default expression at all.
+PANEL_POLICY_COLUMNS = {
+    ('panel_settings_version', 'enabled'),
+    ('panel_settings_version', 'cadence'),
+    ('panel_settings_version', 'size'),
+    ('panel_source_settings_version', 'ramp_datasets_per_hour'),
+    ('panel_source_settings_version', 'request_cap_per_hour'),
+    ('panel_source_settings_version', 'corporate_action_window_pre_days'),
+    ('panel_source_settings_version', 'corporate_action_window_post_days'),
+    ('panel_pass', 'kind'),
+    ('panel_pass', 'dry_run'),
+}
+
+
+def _same_set(actual: set, expected: set, what: str) -> None:
+    """Equal sets, else a message naming what is extra in the catalogue and what it lacks."""
+    assert actual == expected, (
+        f'{what}: extra {sorted(actual - expected, key=repr)}, missing {sorted(expected - actual, key=repr)}'
+    )
+
+
+def test_the_panel_revision_builds_five_tables_a_column_an_index_three_types_and_its_downgrade_removes_them(
+    revision_db: ScratchDb, parent_db: ScratchDb
+) -> None:
+    parent = PARENT[PANEL_REVISION]
+    assert parent == ASSET_LIST_REVISION, f'{PANEL_REVISION} sits on {parent}'
+    _migrate(parent_db, PANEL_REVISION, 'build-parent', 'upgrade', parent, parent)
+    _migrate(revision_db, PANEL_REVISION, 'build-revision', 'upgrade', PANEL_REVISION, PANEL_REVISION)
+    before, after = _catalogue(parent_db), _catalogue(revision_db)
+
+    added = {
+        (category, key): facts
+        for category, facts_by_key in after.items()
+        for key, facts in facts_by_key.items()
+        if key not in before.get(category, {})
+    }
+    removed = [(category, key) for category, facts in before.items() for key in facts if key not in after[category]]
+    changed = [
+        (category, key)
+        for category, facts in before.items()
+        for key in facts
+        if key in after[category] and after[category][key] != facts[key]
+    ]
+
+    assert (removed, changed) == ([], []), (
+        'an additive revision removed or changed an existing object',
+        removed,
+        changed,
+    )
+    _same_set(
+        {category for category, _ in added}, {'tables', 'columns', 'constraints', 'indexes', 'enums'}, 'categories'
+    )
+    _same_set({key[0] for category, key in added if category == 'tables'}, PANEL_TABLES, 'tables')
+    outside = sorted(key for category, key in added if category == 'columns' and key[0] not in PANEL_TABLES)
+    assert outside == [('dataset_override_log', 'new_value')], outside
+    new_value = after['columns'][('dataset_override_log', 'new_value')]
+    assert new_value[:3] == ('text', False, None), ('nullable, no default', new_value)
+    _same_set({key[1] for category, key in added if category == 'indexes'}, PANEL_INDEXES, 'indexes')
+    # Filter on the category FIRST: tables and enums are keyed by 1-tuples, so key[1] on them is an IndexError (the
+    # P20v stack failure of this test).
+    (rate_index,) = [
+        facts
+        for (category, key), facts in added.items()
+        if category == 'indexes' and key[1] == 'ix_ingest_request_source_created_at'
+    ]
+    assert rate_index[0].endswith('ON public.ingest_request USING btree (source, created_at)'), rate_index
+    assert rate_index[1] is None, rate_index
+
+    constraints = {key: facts for (category, key), facts in added.items() if category == 'constraints'}
+    _same_set(
+        {key for key, facts in constraints.items() if facts[0] == 'p'},
+        {(t, f'{t}_pkey') for t in PANEL_TABLES},
+        'primary keys',
+    )
+    # Foreign keys only inside the panel tables, and none cascading (the definition text would carry ON DELETE).
+    _same_set(
+        {(key[0], facts[1]) for key, facts in constraints.items() if facts[0] == 'f'},
+        PANEL_FOREIGN_KEYS,
+        'foreign keys',
+    )
+    _same_set({key for key, facts in constraints.items() if facts[0] == 'c'}, PANEL_CHECKS, 'checks')
+    numbers = constraints[('panel_source_settings_version', 'ck_panel_source_settings_version_numbers_non_negative')]
+    for column in ('ramp_datasets_per_hour', 'request_cap_per_hour'):
+        assert column in numbers[1], numbers
+    _same_set(
+        {key for key, facts in constraints.items() if facts[0] == 'u'},
+        {
+            ('panel_settings_version', 'uq_panel_settings_version_panel_id_version_no'),
+            ('panel_source_settings_version', 'uq_panel_source_settings_version_source_version_no'),
+            ('panel_member_transition', 'uq_panel_member_transition_pass_id_seq'),
+        },
+        'unique constraints',
+    )
+    kinds = {facts[0] for facts in constraints.values()}
+    assert not kinds - {'p', 'f', 'c', 'u'}, sorted(kinds)
+
+    enums = {key[0]: list(facts[0]) for (category, key), facts in added.items() if category == 'enums'}
+    assert enums == PANEL_ENUMS, enums
+    for key in PANEL_POLICY_COLUMNS:
+        facts = after['columns'][key]
+        assert (facts[1], facts[2]) == (True, None), f'{key}: NOT NULL {facts[1]}, default {facts[2]}'
+    # seq, the per-pass append ordinal (ruling 2026-10-30 on tj-7zjov1.177): integer, NOT NULL, no default.
+    assert after['columns'][('panel_member_transition', 'seq')][:3] == ('integer', True, None)
+    assert after['columns'][('panel_member_transition', 'recorded_at')][:3] == (
+        'timestamp with time zone',
+        True,
+        'now()',
+    )
+
+    _migrate(revision_db, PANEL_REVISION, 'downgrade', 'downgrade', parent, parent)
+    left = diff_catalogues(before, _catalogue(revision_db))
+    assert not left, ('the downgrade left or lost an object', left[:DIFF_LINES_SHOWN])

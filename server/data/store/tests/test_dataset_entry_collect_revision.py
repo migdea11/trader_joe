@@ -153,10 +153,11 @@ def test_the_revision_is_directly_on_the_override_log_revision_and_is_additive()
 
     The head moved again with tj-7zjov1.25 (f2b7d4a91c36, on a6d3f8e1c205) and tj-7zjov1.123 (b8e4c1f7a923, on
     f2b7d4a91c36), tj-7zjov1.153 (39c28a39b290, on b8e4c1f7a923), tj-7zjov1.31 (c7e19a4d5b28, on 39c28a39b290) and
-    tj-7zjov1.30 (a3f8d2c6e914, on c7e19a4d5b28); the one-child pin is what this file owns.
+    tj-7zjov1.30 (a3f8d2c6e914, on c7e19a4d5b28) and tj-7zjov1.33 (b6d1f93a7c42, on a3f8d2c6e914); the one-child pin
+    is what this file owns.
     """
     script = ScriptDirectory(str(MIGRATIONS_DIR))
-    assert script.get_heads() == ['a3f8d2c6e914']
+    assert script.get_heads() == ['b6d1f93a7c42']
     assert script.get_revision(REVISION).down_revision == PARENT
     assert [rev.revision for rev in script.walk_revisions() if rev.down_revision == REVISION] == ['a6d3f8e1c205']
     # Additive: no exception marker, so test_migration_with_data's GENERIC RULE holds it lossless both ways.

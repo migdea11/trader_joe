@@ -21,6 +21,7 @@ import re
 import uuid
 
 import pytest
+from sqlalchemy import UniqueConstraint
 from sqlalchemy.sql.functions import now as sql_now
 
 from data.store.app.database.models.asset_list import AssetListEvent, AssetListRow, AssetListSnapshot
@@ -29,6 +30,13 @@ from data.store.app.database.models.corporate_action import CorporateAction
 from data.store.app.database.models.ingest_instance import IngestInstance
 from data.store.app.database.models.ingest_request import IngestRequest
 from data.store.app.database.models.ingest_run import IngestRun
+from data.store.app.database.models.panel import (
+    Panel,
+    PanelMemberTransition,
+    PanelPass,
+    PanelSettingsVersion,
+    PanelSourceSettingsVersion,
+)
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.seeds import dump
@@ -39,6 +47,11 @@ from data.store.seeds.dump import (
     ENTRY_TABLE,
     INSTANCE_TABLE,
     NORMALISE_SQL,
+    PANEL_PASS_TABLE,
+    PANEL_SETTINGS_TABLE,
+    PANEL_SOURCE_SETTINGS_TABLE,
+    PANEL_TABLE,
+    PANEL_TRANSITION_TABLE,
     REQUEST_TABLE,
     RUN_TABLE,
     SEED_TABLES,
@@ -63,7 +76,13 @@ SEED_MODELS = (
     AssetListSnapshot,
     AssetListRow,
     AssetListEvent,
+    Panel,
+    PanelSettingsVersion,
+    PanelSourceSettingsVersion,
+    PanelPass,
+    PanelMemberTransition,
 )
+PANEL_MODELS = SEED_MODELS[-5:]
 
 
 pytestmark = pytest.mark.data_store
@@ -299,7 +318,8 @@ def test_the_pg_dump_era_names_are_gone():
 def test_the_seed_tables_are_the_market_tables_then_the_ingest_tables():
     """Bead tj-7zjov1.100: entries, bars, instances, requests, runs; then corporate actions, then the asset lists.
 
-    Corporate actions since tj-7zjov1.31; the asset-list snapshots, their rows and their events since tj-7zjov1.30.
+    Corporate actions since tj-7zjov1.31; the asset-list snapshots, their rows and their events since tj-7zjov1.30; the
+    five panel tables, parents first, since tj-7zjov1.196.
     """
     assert tuple(model.__tablename__ for model in SEED_MODELS) == SEED_TABLES
     assert (
@@ -312,6 +332,11 @@ def test_the_seed_tables_are_the_market_tables_then_the_ingest_tables():
         SNAPSHOT_TABLE,
         SNAPSHOT_ROW_TABLE,
         SNAPSHOT_EVENT_TABLE,
+        PANEL_TABLE,
+        PANEL_SETTINGS_TABLE,
+        PANEL_SOURCE_SETTINGS_TABLE,
+        PANEL_PASS_TABLE,
+        PANEL_TRANSITION_TABLE,
     ) == SEED_TABLES
     assert not any('archive' in table for table in SEED_TABLES)
 
@@ -366,6 +391,11 @@ def test_rows_are_reinserted_in_id_order_and_the_sequence_follows():
         (SNAPSHOT_TABLE, 'seed_snapshot'),
         (SNAPSHOT_ROW_TABLE, 'seed_snapshot_row'),
         (SNAPSHOT_EVENT_TABLE, 'seed_snapshot_event'),
+        (PANEL_TABLE, 'seed_panel'),
+        (PANEL_SETTINGS_TABLE, 'seed_panel_settings'),
+        (PANEL_SOURCE_SETTINGS_TABLE, 'seed_panel_source_settings'),
+        (PANEL_PASS_TABLE, 'seed_panel_pass'),
+        (PANEL_TRANSITION_TABLE, 'seed_panel_transition'),
     ],
 )
 def test_each_ingest_table_is_copied_and_reinserted_in_its_order(table, temp):
@@ -386,6 +416,11 @@ def _is_now(column) -> bool:
         (IngestRun, 'seed_run'),
         (AssetListSnapshot, 'seed_snapshot'),
         (AssetListEvent, 'seed_snapshot_event'),
+        (Panel, 'seed_panel'),
+        (PanelSettingsVersion, 'seed_panel_settings'),
+        (PanelSourceSettingsVersion, 'seed_panel_source_settings'),
+        (PanelPass, 'seed_panel_pass'),
+        (PanelMemberTransition, 'seed_panel_transition'),
     ],
 )
 def test_every_column_postgres_stamps_with_now_is_rewritten(model, temp):
@@ -488,3 +523,237 @@ def test_the_row_and_event_ids_are_the_md5_of_their_content_after_the_snapshot_i
     # After the map, so the hash is over the stable snapshot id, never the random one.
     assert NORMALISE_SQL.index(row_id) > NORMALISE_SQL.index('UPDATE seed_snapshot_row r SET snapshot_id')
     assert NORMALISE_SQL.index(event_id) > NORMALISE_SQL.index('UPDATE seed_snapshot_event e SET snapshot_id')
+
+
+# ---------------------------------------------------------------------------------------------
+# The panel cast (tj-7zjov1.196): ids from unique keys or the pass rank, references following, parents first
+# ---------------------------------------------------------------------------------------------
+#
+# NOT RUN here: that the panel block parses and runs on Postgres. No SQL parser is in the environment, so what is
+# pinned is each statement's text against the models; the parse and the byte-identical second run are the stack's
+# (the orchestrator's seed_dump runs, tj-7zjov1.197 phase 2).
+
+PANEL_TEMPS = {
+    PANEL_TABLE: 'seed_panel',
+    PANEL_SETTINGS_TABLE: 'seed_panel_settings',
+    PANEL_SOURCE_SETTINGS_TABLE: 'seed_panel_source_settings',
+    PANEL_PASS_TABLE: 'seed_panel_pass',
+    PANEL_TRANSITION_TABLE: 'seed_panel_transition',
+}
+# The alias each panel temp table carries in its UPDATEs.
+PANEL_ALIASES = {
+    'seed_panel': 'p',
+    'seed_panel_settings': 's',
+    'seed_panel_source_settings': 's',
+    'seed_panel_pass': 'p',
+    'seed_panel_transition': 't',
+}
+# The map each panel table's random id is moved through.
+PANEL_MAPS = {
+    PANEL_TABLE: 'seed_panel_map',
+    PANEL_SETTINGS_TABLE: 'seed_settings_map',
+    PANEL_SOURCE_SETTINGS_TABLE: 'seed_source_settings_map',
+    PANEL_PASS_TABLE: 'seed_pass_map',
+}
+# Every uuid column of the panel tables but the table's own id: the map it follows, or None for a literal of the cast
+# (a request id: ingest_records.py writes request ids as literals).
+PANEL_REFERENCES = {
+    (PANEL_SETTINGS_TABLE, 'panel_id'): 'seed_panel_map',
+    (PANEL_PASS_TABLE, 'panel_id'): 'seed_panel_map',
+    (PANEL_PASS_TABLE, 'settings_version_id'): 'seed_settings_map',
+    (PANEL_PASS_TABLE, 'source_settings_version_id'): 'seed_source_settings_map',
+    (PANEL_PASS_TABLE, 'active_snapshot_id'): 'seed_snapshot_map',
+    (PANEL_PASS_TABLE, 'inactive_snapshot_id'): 'seed_snapshot_map',
+    (PANEL_TRANSITION_TABLE, 'pass_id'): 'seed_pass_map',
+    (PANEL_TRANSITION_TABLE, 'panel_id'): 'seed_panel_map',
+    (PANEL_TRANSITION_TABLE, 'dataset_id'): 'seed_map',
+    (PANEL_TRANSITION_TABLE, 'request_id'): None,
+}
+
+
+def _statements() -> list[str]:
+    """NORMALISE_SQL's statements, whitespace-collapsed."""
+    return [' '.join(statement.split()) for statement in NORMALISE_SQL.split(';') if statement.strip()]
+
+
+def _position(prefix: str) -> int:
+    """The index of the one statement starting with prefix."""
+    (found,) = [index for index, statement in enumerate(_statements()) if statement.startswith(prefix)]
+    return found
+
+
+def _statement(prefix: str) -> str:
+    return _statements()[_position(prefix)]
+
+
+def _reference_update(table: str, column: str) -> str:
+    temp = PANEL_TEMPS[table]
+    alias = PANEL_ALIASES[temp]
+    target = PANEL_REFERENCES[(table, column)]
+    return f'UPDATE {temp} {alias} SET {column} = m.new_id FROM {target} m WHERE {alias}.{column} = m.old_id'
+
+
+def _unique_key(model) -> tuple[str, ...]:
+    """The columns of the model's one unique constraint or unique index."""
+    keys = [
+        tuple(column.name for column in constraint.columns)
+        for constraint in model.__table__.constraints
+        if isinstance(constraint, UniqueConstraint)
+    ] + [tuple(column.name for column in index.columns) for index in model.__table__.indexes if index.unique]
+    (key,) = keys
+    return key
+
+
+def test_every_uuid_column_of_the_panel_tables_is_a_mapped_reference_a_literal_or_a_rewritten_id():
+    """Derived from the models: a new uuid column the rewrite does not handle stays random and breaks determinism."""
+    for model in PANEL_MODELS:
+        uuids = {column.name for column in model.__table__.columns if column.type.python_type is uuid.UUID}
+        handled = {'id'} | {column for table, column in PANEL_REFERENCES if table == model.__tablename__}
+        assert uuids == handled, model.__tablename__
+
+
+@pytest.mark.parametrize(
+    ('table', 'column'), [key for key, target in PANEL_REFERENCES.items() if target], ids=lambda value: str(value)
+)
+def test_every_panel_reference_follows_its_map(table, column):
+    """A reference left at the random id points at no row after the rewrite (and a foreign key refuses the insert)."""
+    assert _reference_update(table, column) in _statements()
+
+
+def test_every_foreign_key_of_the_panel_tables_follows_the_map_of_the_table_it_names():
+    """Derived from the models' foreign keys, so a new one is caught: the reference's map is its target table's map."""
+    keys = [
+        (model.__tablename__, key.parent.name, key.column.table.name)
+        for model in PANEL_MODELS
+        for key in model.__table__.foreign_keys
+    ]
+    assert len(keys) == 6, 'the panel models carry the foreign keys this test reads'
+    for table, column, target in keys:
+        assert PANEL_REFERENCES[(table, column)] == PANEL_MAPS[target], (table, column)
+
+
+def test_every_map_is_built_before_any_panel_row_is_rewritten():
+    """A map built after an UPDATE moved its key reads the moved value, and every reference misses."""
+    first_update = min(i for i, statement in enumerate(_statements()) if statement.startswith('UPDATE seed_panel'))
+    for name in [*PANEL_MAPS.values(), 'seed_snapshot_map', 'seed_map']:
+        assert _position(f'CREATE TEMP TABLE {name} ON COMMIT DROP AS') < first_update, name
+
+
+def test_every_panel_id_moves_after_every_reference_to_it_followed():
+    """An id moved first leaves the map's old_id matching nothing: the references follow, then the id moves."""
+    for table, name in PANEL_MAPS.items():
+        temp = PANEL_TEMPS[table]
+        moves = _position(f'UPDATE {temp} {PANEL_ALIASES[temp]} SET id = m.new_id')
+        for (source, column), target in PANEL_REFERENCES.items():
+            if target == name:
+                assert _position(_reference_update(source, column)) < moves, (source, column)
+
+
+def test_a_panel_id_is_the_md5_of_its_unique_name():
+    assert _unique_key(Panel) == ('name',)
+    assert _statement('CREATE TEMP TABLE seed_panel_map') == (
+        f"CREATE TEMP TABLE seed_panel_map ON COMMIT DROP AS SELECT id AS old_id, md5('{PANEL_TABLE}|' || name)::uuid "
+        'AS new_id FROM seed_panel'
+    )
+
+
+def test_a_settings_version_id_is_the_md5_of_its_unique_key_over_the_new_panel_id():
+    """(panel_id, version_no) is unique; the hash takes the panel's NEW id, so it is the same in every run."""
+    assert _unique_key(PanelSettingsVersion) == ('panel_id', 'version_no')
+    assert _statement('CREATE TEMP TABLE seed_settings_map') == (
+        'CREATE TEMP TABLE seed_settings_map ON COMMIT DROP AS SELECT s.id AS old_id, '
+        f"md5('{PANEL_SETTINGS_TABLE}|' || m.new_id::text || '|' || s.version_no::text)::uuid AS new_id "
+        'FROM seed_panel_settings s JOIN seed_panel_map m ON m.old_id = s.panel_id'
+    )
+
+
+def test_a_source_settings_version_id_is_the_md5_of_its_unique_key():
+    assert _unique_key(PanelSourceSettingsVersion) == ('source', 'version_no')
+    assert _statement('CREATE TEMP TABLE seed_source_settings_map') == (
+        'CREATE TEMP TABLE seed_source_settings_map ON COMMIT DROP AS SELECT id AS old_id, '
+        f"md5('{PANEL_SOURCE_SETTINGS_TABLE}|' || source::text || '|' || version_no::text)::uuid AS new_id "
+        'FROM seed_panel_source_settings'
+    )
+
+
+def test_the_pass_rank_is_a_total_order_over_not_null_columns_started_at_first():
+    """A pass has no natural key, so its rank must be a total order.
+
+    A rank whose columns can be NULL or tie leaves the order to the heap: the id breaks the last tie (the cast's passes
+    differ in started_at, one transaction each), and NULL placement never arises.
+    """
+    order = re.search(
+        r'CREATE TEMP TABLE seed_pass_map .*?row_number\(\) OVER \(\s*ORDER BY (.*?)\s*\) AS rank', NORMALISE_SQL, re.S
+    )
+    assert order is not None
+    columns = [part.strip() for part in order.group(1).split(',')]
+    assert columns[0] == 'started_at' and columns[-1] == 'id'
+    model_columns = {column.name: column for column in PanelPass.__table__.columns}
+    for name in columns:
+        assert not model_columns[name].nullable, f'{name} is nullable: its NULLs order by the default rule'
+    assert f"md5('{PANEL_PASS_TABLE}|' || rank::text)::uuid AS new_id, rank FROM" in _statement(
+        'CREATE TEMP TABLE seed_pass_map'
+    )
+
+
+def test_a_transition_id_is_the_md5_of_its_unique_key_after_the_pass_id_moved():
+    assert _unique_key(PanelMemberTransition) == ('pass_id', 'seq')
+    statement = (
+        f"UPDATE seed_panel_transition SET id = md5('{PANEL_TRANSITION_TABLE}|' || pass_id::text || '|' || "
+        'seq::text)::uuid'
+    )
+    assert _position(statement) > _position(_reference_update(PANEL_TRANSITION_TABLE, 'pass_id'))
+
+
+def test_the_instants_of_a_pass_and_its_transitions_follow_the_rank_and_the_seq():
+    """started_at, finished_at (kept NULL for the unfinished pass) and recorded_at, from the rank and seq."""
+    stamp = dump.SEED_TIMESTAMP
+    assert _statement('UPDATE seed_panel_pass p SET id = m.new_id') == (
+        f"UPDATE seed_panel_pass p SET id = m.new_id, started_at = TIMESTAMPTZ '{stamp}' + m.rank * interval '1 hour', "
+        f"finished_at = CASE WHEN p.finished_at IS NULL THEN NULL ELSE TIMESTAMPTZ '{stamp}' + m.rank * interval "
+        "'1 hour' + interval '10 minutes' END FROM seed_pass_map m WHERE p.id = m.old_id"
+    )
+    assert _statement('UPDATE seed_panel_transition t SET recorded_at') == (
+        f"UPDATE seed_panel_transition t SET recorded_at = TIMESTAMPTZ '{stamp}' + p.rank * interval '1 hour' + "
+        "t.seq * interval '1 second' FROM seed_pass_map p WHERE p.new_id = t.pass_id"
+    )
+    # Joined on the NEW pass id, so it runs after the transitions' pass_id moved.
+    assert _position('UPDATE seed_panel_transition t SET recorded_at') > _position(
+        _reference_update(PANEL_TRANSITION_TABLE, 'pass_id')
+    )
+
+
+@pytest.mark.parametrize(
+    ('temp', 'column'),
+    [('seed_panel_settings', 'saved_at'), ('seed_panel_source_settings', 'saved_at'), ('seed_panel', 'created_at')],
+)
+def test_a_version_instant_and_the_panel_instant_are_literals(temp, column):
+    alias = PANEL_ALIASES[temp]
+    stamp = dump.SEED_TIMESTAMP
+    statement = _statement(f'UPDATE {temp} {alias} SET id = m.new_id')
+    expected = (
+        f"{column} = TIMESTAMPTZ '{stamp}'"
+        if column == 'created_at'
+        else f"{column} = TIMESTAMPTZ '{stamp}' + {alias}.version_no * interval '1 hour'"
+    )
+    assert expected in statement
+
+
+def test_the_panel_rows_are_reinserted_parents_first():
+    """Derived from the foreign keys: a referenced table's INSERT precedes the referencing one's.
+
+    In NORMALISE_SQL and in SEED_TABLES (the dump and manifest order, which a loader replays).
+    """
+    for model in PANEL_MODELS:
+        for key in model.__table__.foreign_keys:
+            parent, child = key.column.table.name, model.__tablename__
+            assert _position(f'INSERT INTO {parent} SELECT') < _position(f'INSERT INTO {child} SELECT'), child
+            assert SEED_TABLES.index(parent) < SEED_TABLES.index(child), child
+
+
+def test_the_panel_block_has_no_subquery_inside_an_update():
+    """A correlated subquery in a SET re-reads per row; the block joins the maps built beforehand instead."""
+    updates = [statement for statement in _statements() if statement.startswith('UPDATE seed_panel')]
+    assert len(updates) == 15
+    for statement in updates:
+        assert '(SELECT' not in statement, statement[:80]

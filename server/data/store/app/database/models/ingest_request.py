@@ -103,6 +103,7 @@ class IngestRequest(AppBase.DATA_STORE_BASE, CustomTypeTable):
     OPEN_INDEX = 'ix_ingest_request_open_state_created_at'
     QUEUED_INSTANCE_INDEX = 'ix_ingest_request_queued_instance_id'
     DATASET_INDEX = 'ix_ingest_request_dataset_id'
+    SOURCE_CREATED_INDEX = 'ix_ingest_request_source_created_at'
     ASSET_LIST_STATUS_CONSTRAINT = 'ck_ingest_request_asset_list_status'
 
     id = Column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid(), nullable=False)
@@ -190,6 +191,8 @@ class IngestRequest(AppBase.DATA_STORE_BASE, CustomTypeTable):
         Index(QUEUED_INSTANCE_INDEX, 'instance_id', postgresql_where=(state == IngestRequestState.QUEUED)),
         # A dataset's requests, for the Running facet and the dataset detail.
         Index(DATASET_INDEX, 'dataset_id', postgresql_where=dataset_id.is_not(None)),
+        # The panel manager's request-rate window: a source's requests in the trailing 60 minutes.
+        Index(SOURCE_CREATED_INDEX, 'source', 'created_at'),
         # An asset-list request always names its list, and no other kind names one.
         CheckConstraint("(kind = 'ASSET_LIST') = (asset_list_status IS NOT NULL)", name=ASSET_LIST_STATUS_CONSTRAINT),
     )

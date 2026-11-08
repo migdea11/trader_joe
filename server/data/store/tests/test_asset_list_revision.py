@@ -54,6 +54,7 @@ STORE_DIR = SERVER_ROOT / 'data' / 'store'
 MIGRATIONS_DIR = STORE_DIR / 'migrations'
 REVISION = 'a3f8d2c6e914'
 PARENT = 'c7e19a4d5b28'  # the 00:45 UTC note: the one head the revision was written on
+CHILD = 'b6d1f93a7c42'  # its one child and the head since tj-7zjov1.33 (P20): the panel tables
 REVISION_FILE = MIGRATIONS_DIR / 'versions' / f'{REVISION}_asset_list_snapshots.py'
 DIALECT = postgresql.dialect()
 ADDITIVE_EXCEPTION_MARKER = re.compile(r'^\s*# additive-exception:', re.MULTILINE)
@@ -106,9 +107,13 @@ def _created_tables(op: MagicMock) -> dict[str, sa.Table]:
 
 
 def test_the_revision_is_the_single_head_directly_on_the_head_it_was_written_on_and_is_unmarked():
-    """Checklist items 1 to 3."""
+    """Checklist items 1 to 3.
+
+    No longer the head since tj-7zjov1.33 (P20): its one child is b6d1f93a7c42, which is the single head.
+    """
     script = ScriptDirectory(str(MIGRATIONS_DIR))
-    assert script.get_heads() == [REVISION]
+    assert script.get_heads() == [CHILD]
+    assert [rev.revision for rev in script.walk_revisions() if rev.down_revision == REVISION] == [CHILD]
     module = _load()
     assert (module.revision, module.down_revision) == (REVISION, PARENT)
     assert [rev.revision for rev in script.walk_revisions() if rev.down_revision == PARENT] == [REVISION]

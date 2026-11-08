@@ -123,7 +123,14 @@ async def audit_tables_exist(db: AsyncSession) -> bool:
 
 
 async def append_override(
-    db: AsyncSession, *, actor: str, dataset_id: uuid.UUID, owner: str, action: OverrideAction, reason: str
+    db: AsyncSession,
+    *,
+    actor: str,
+    dataset_id: uuid.UUID,
+    owner: str,
+    action: OverrideAction,
+    reason: str,
+    new_value: str | None,
 ) -> None:
     """Append one override-log row, inside the caller's transaction.
 
@@ -134,9 +141,13 @@ async def append_override(
         owner: The dataset's owner.
         action: What was done.
         reason: The reason, already trimmed.
+        new_value: What the action set, as text: 'true' or 'false' for SET_COLLECTING, the new expiry as ISO 8601 UTC for
+            SET_EXPIRY (None when the expiry was cleared), None for DELETE. No default, so a caller states it.
     """
     await db.execute(
-        _OVERRIDE.insert().values(actor=actor, dataset_id=dataset_id, owner=owner, action=action, reason=reason)
+        _OVERRIDE.insert().values(
+            actor=actor, dataset_id=dataset_id, owner=owner, action=action, reason=reason, new_value=new_value
+        )
     )
 
 

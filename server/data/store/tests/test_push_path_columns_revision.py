@@ -59,7 +59,7 @@ MIGRATIONS_DIR = STORE_DIR / 'migrations'
 REVISION = 'b8e4c1f7a923'
 PARENT = 'f2b7d4a91c36'
 CHILD = '39c28a39b290'  # its one child since tj-7zjov1.153 (P35r): ingest_request.expiry_type
-HEAD = 'a3f8d2c6e914'  # the head since tj-7zjov1.30 (P17): the asset-list snapshots, two hops above CHILD
+HEAD = 'b6d1f93a7c42'  # the head since tj-7zjov1.33 (P20): the panel tables, on a3f8d2c6e914, three hops above CHILD
 REVISION_FILE = MIGRATIONS_DIR / 'versions' / f'{REVISION}_push_path_columns.py'
 DIALECT = postgresql.dialect()
 ADDITIVE_EXCEPTION_MARKER = re.compile(r'^\s*# additive-exception:', re.MULTILINE)
@@ -131,8 +131,8 @@ def _model_check() -> sa.CheckConstraint:
 def test_the_revision_is_the_single_head_directly_on_the_head_it_was_written_on_and_is_unmarked():
     """Checklist items 1 to 3: one new revision, down_revision the previous head, one head, no exception marker.
 
-    No longer the head since tj-7zjov1.153 (P35r): its one child is 39c28a39b290; the single head is a3f8d2c6e914
-    since tj-7zjov1.30 (P17).
+    No longer the head since tj-7zjov1.153 (P35r): its one child is 39c28a39b290; the single head is b6d1f93a7c42
+    since tj-7zjov1.33 (P20).
     """
     script = ScriptDirectory(str(MIGRATIONS_DIR))
     assert script.get_heads() == [HEAD]

@@ -64,6 +64,7 @@ ALLOWED_MODELS = (
     'ingest_instance',
     'ingest_request',
     'ingest_run',
+    'panel',
     'stock_market_activity',
     'store_dataset_entry',
 )

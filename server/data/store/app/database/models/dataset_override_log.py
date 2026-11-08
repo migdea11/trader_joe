@@ -43,6 +43,9 @@ class DatasetOverrideLog(AppBase.DATA_STORE_BASE, CustomTypeTable):
     # Stored trimmed; never blank.
     reason = Column(Text, nullable=False)
     at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    # What the action set (ADR tj-26jt9w addendum 20): 'true' or 'false' for SET_COLLECTING, the new expiry for
+    # SET_EXPIRY. NULL for DELETE and for every row written before the column existed.
+    new_value = Column(Text, nullable=True)
 
     __table_args__ = (Index(DATASET_AT_INDEX, 'dataset_id', 'at'),)
 

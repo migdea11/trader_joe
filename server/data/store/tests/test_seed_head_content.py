@@ -14,6 +14,7 @@ red.
 P34c (tj-7zjov1.123) moved the head to b8e4c1f7a923: push_path_problems reads its seven columns off the head seed.
 P35r (tj-7zjov1.153) moved it to 39c28a39b290: expiry_type_problems reads ingest_request.expiry_type off it.
 P18 (tj-7zjov1.31) moved it to c7e19a4d5b28: corporate_action_problems reads the observations and their attempt rows.
+P20s2 (tj-7zjov1.196) put the panel cast into the b6d1f93a7c42 seed: panel_problems reads the five panel tables.
 
 PR-GATE TIER: files only, no database. That the seed loads and upgrades is tests/system's.
 """
@@ -21,8 +22,10 @@ PR-GATE TIER: files only, no database. That the seed loads and upgrades is tests
 import hashlib
 import json
 import re
+import uuid
 from collections import Counter
 from collections.abc import Iterable
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -32,7 +35,15 @@ from data.store.app.database.models.corporate_action import CorporateAction
 from data.store.app.database.models.ingest_instance import IngestInstance
 from data.store.app.database.models.ingest_request import IngestRequest
 from data.store.app.database.models.ingest_run import IngestRun
+from data.store.app.database.models.panel import (
+    Panel,
+    PanelMemberTransition,
+    PanelPass,
+    PanelSettingsVersion,
+    PanelSourceSettingsVersion,
+)
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
+from data.store.seeds.dump import SEED_TIMESTAMP
 from data.store.seeds.ingest_records import (
     CORPORATE_ACTION_SYMBOL,
     EXPECTED_ATTEMPT_ROWS,
@@ -47,7 +58,22 @@ from data.store.seeds.ingest_records import (
     VENDOR_ASSET,
 )
 from data.store.seeds.manifest import head_revision
+from data.store.seeds.panel_records import (
+    ABSENT_DATASET_ID,
+    EXPECTED_DRY_RUN_PASSES,
+    EXPECTED_PANELS,
+    EXPECTED_PASS_KINDS,
+    EXPECTED_PASSES,
+    EXPECTED_SETTINGS_VERSIONS,
+    EXPECTED_SOURCE_SETTINGS_VERSIONS,
+    EXPECTED_TIED_MEMBERS,
+    EXPECTED_TRANSITION_ROWS,
+    EXPECTED_TRANSITIONS,
+    EXPECTED_UNFINISHED_PASSES,
+    PANEL_NAME_PATTERN,
+)
 from data.store.seeds.producer import VERSIONS_DIR
+from data.store.seeds.scenario import OWNER_PATTERN, SYMBOL_PATTERN
 
 
 pytestmark = pytest.mark.data_store
@@ -577,3 +603,186 @@ def test_the_asset_list_check_is_red_on_the_parent_seed_and_on_a_wrong_event():
     sql, manifest = _read(HEAD)
     tampered = sql.replace("'status_flip'", "'appeared'", 1)
     assert any(problem.startswith('asset_list_event: extra') for problem in asset_list_problems(tampered, manifest))
+
+
+# ---------------------------------------------------------------------------------------------
+# The panel cast (P20s2 tj-7zjov1.196, validator tj-7zjov1.197): the five panel tables as Postgres rendered them
+# ---------------------------------------------------------------------------------------------
+#
+# The first seed holding them was produced on the real stack at a23fdad. Read here: the columns against the models,
+# the counts against panel_records.py's EXPECTED constants, every reference resolving to a seed row, the absent dataset
+# absent, and every id and instant exactly what dump.NORMALISE_SQL's comments say it derives -- so a builder change to
+# the derivation that the real run would contradict reds here, not only on the next re-dump.
+
+PANEL_MODELS = {
+    model.TABLE_NAME: model.__table__
+    for model in (Panel, PanelSettingsVersion, PanelSourceSettingsVersion, PanelPass, PanelMemberTransition)
+}
+_SEED_INSTANT = datetime.fromisoformat(SEED_TIMESTAMP)
+
+
+def _md5_uuid(text: str) -> str:
+    return str(uuid.UUID(hashlib.md5(text.encode(), usedforsecurity=False).hexdigest()))
+
+
+def _instant(text: str | None) -> datetime | None:
+    return None if text is None else datetime.fromisoformat(text)
+
+
+def panel_problems(sql: str, manifest: dict) -> list[str]:
+    """The panel tables of a seed against the models, the cast's counts and NORMALISE_SQL's derivations."""
+    rows = seed_rows(sql, (*PANEL_MODELS, StoreDatasetEntry.TABLE_NAME, AssetListSnapshot.TABLE_NAME))
+    if not rows[Panel.TABLE_NAME]:
+        return [f'{Panel.TABLE_NAME}: no row in the seed']
+    problems = []
+    for table, model in PANEL_MODELS.items():
+        declared = {column.name for column in model.columns}
+        for seen in {frozenset(row) for row in rows[table]}:
+            if seen != declared:
+                problems.append(f'{table} INSERT: extra {sorted(seen - declared)}, missing {sorted(declared - seen)}')
+        if set(manifest['digests'].get(table, {})) != declared:
+            problems.append(f'{table} manifest: the digests are not the model columns')
+    for table, expected in (
+        (Panel.TABLE_NAME, EXPECTED_PANELS),
+        (PanelSettingsVersion.TABLE_NAME, EXPECTED_SETTINGS_VERSIONS),
+        (PanelSourceSettingsVersion.TABLE_NAME, EXPECTED_SOURCE_SETTINGS_VERSIONS),
+        (PanelPass.TABLE_NAME, EXPECTED_PASSES),
+        (PanelMemberTransition.TABLE_NAME, EXPECTED_TRANSITION_ROWS),
+    ):
+        if len(rows[table]) != expected or manifest['row_counts'].get(table) != expected:
+            problems.append(
+                f'{table}: {len(rows[table])} rows, manifest {manifest["row_counts"].get(table)}, cast {expected}'
+            )
+
+    panels = {row['id']: row for row in rows[Panel.TABLE_NAME]}
+    versions = {row['id']: row for row in rows[PanelSettingsVersion.TABLE_NAME]}
+    sources = {row['id']: row for row in rows[PanelSourceSettingsVersion.TABLE_NAME]}
+    passes = {row['id']: row for row in rows[PanelPass.TABLE_NAME]}
+    transitions = rows[PanelMemberTransition.TABLE_NAME]
+    entries = {row['id'] for row in rows[StoreDatasetEntry.TABLE_NAME]}
+    snapshots = {row['id'] for row in rows[AssetListSnapshot.TABLE_NAME]}
+
+    # Synthetic names only.
+    if any(not PANEL_NAME_PATTERN.fullmatch(row['name']) for row in panels.values()):
+        problems.append('panel: a name outside PANEL_NAME_PATTERN')
+    if any(not OWNER_PATTERN.fullmatch(row['actor']) for row in (*versions.values(), *sources.values())):
+        problems.append('panel settings: an actor outside OWNER_PATTERN')
+    listed = [
+        s for row in versions.values() for s in (row['allow_symbols'] + row['deny_symbols']).strip('{}').split(',') if s
+    ]
+    if any(not SYMBOL_PATTERN.fullmatch(symbol) for symbol in [*listed, *(row['symbol'] for row in transitions)]):
+        problems.append('panel: a symbol outside SYMBOL_PATTERN')
+
+    # The ids NORMALISE_SQL derives: the panel from its name, a version from (panel, number) or (source, number).
+    for panel_id, row in panels.items():
+        if panel_id != _md5_uuid(f'{Panel.TABLE_NAME}|{row["name"]}'):
+            problems.append('panel: the id is not the md5 of its name')
+        if _instant(row['created_at']) != _SEED_INSTANT:
+            problems.append('panel: created_at is not the seed timestamp')
+    for table, held, key in (
+        (PanelSettingsVersion.TABLE_NAME, versions, 'panel_id'),
+        (PanelSourceSettingsVersion.TABLE_NAME, sources, 'source'),
+    ):
+        for version_id, row in held.items():
+            if version_id != _md5_uuid(f'{table}|{row[key]}|{row["version_no"]}'):
+                problems.append(f'{table} v{row["version_no"]}: the id is not the md5 of its unique key')
+            if _instant(row['saved_at']) != _SEED_INSTANT + timedelta(hours=int(row['version_no'])):
+                problems.append(f'{table} v{row["version_no"]}: saved_at is not the seed timestamp plus its number')
+        if sorted(int(row['version_no']) for row in held.values()) != list(range(1, len(held) + 1)):
+            problems.append(f'{table}: the version numbers are not 1..n')
+    if any(row['panel_id'] not in panels for row in versions.values()):
+        problems.append('panel_settings_version: a panel id that names no panel')
+
+    # A pass: the md5 of its rank, started at the seed timestamp plus the rank in hours, finished ten minutes later.
+    by_rank = {}
+    for pass_id, row in passes.items():
+        started = _instant(row['started_at'])
+        rank = round((started - _SEED_INSTANT) / timedelta(hours=1))
+        by_rank[rank] = row
+        if pass_id != _md5_uuid(f'{PanelPass.TABLE_NAME}|{rank}') or started != _SEED_INSTANT + timedelta(hours=rank):
+            problems.append(f'panel_pass rank {rank}: the id or the start is not derived from its rank')
+        finished = _instant(row['finished_at'])
+        if (finished is None) != (row['counts'] is None) or (
+            finished is not None and finished != started + timedelta(minutes=10)
+        ):
+            problems.append(f'panel_pass rank {rank}: finished_at and counts are not set together, ten minutes in')
+        if row['panel_id'] not in panels or row['settings_version_id'] not in versions:
+            problems.append(f'panel_pass rank {rank}: a panel or settings version that names no row')
+        if row['source_settings_version_id'] not in sources:
+            problems.append(f'panel_pass rank {rank}: a source settings version that names no row')
+        if row['active_snapshot_id'] not in snapshots or row['inactive_snapshot_id'] not in (*snapshots, None):
+            problems.append(f'panel_pass rank {rank}: a snapshot id that names no snapshot')
+    if sorted(by_rank) != list(range(1, len(passes) + 1)):
+        problems.append('panel_pass: the ranks are not 1..n')
+    if dict(Counter(row['kind'] for row in passes.values())) != EXPECTED_PASS_KINDS:
+        problems.append('panel_pass: the counts per kind are not the cast')
+    if sum(row['dry_run'] == 'true' for row in passes.values()) != EXPECTED_DRY_RUN_PASSES:
+        problems.append('panel_pass: the dry-run count is not the cast')
+    if sum(row['finished_at'] is None for row in passes.values()) != EXPECTED_UNFINISHED_PASSES:
+        problems.append('panel_pass: the unfinished count is not the cast')
+    if not any(row['inactive_snapshot_id'] is None for row in passes.values()):
+        problems.append('panel_pass: no pass without an inactive snapshot')
+
+    # A transition: the md5 of (pass, seq), recorded at its pass's start plus seq seconds; seq 1..n in every pass.
+    seqs: dict[str, list[int]] = {}
+    for row in transitions:
+        seq = int(row['seq'])
+        seqs.setdefault(row['pass_id'], []).append(seq)
+        owner = passes.get(row['pass_id'])
+        if owner is None or row['panel_id'] not in panels:
+            problems.append(f'panel_member_transition seq {seq}: a pass or panel that names no row')
+            continue
+        if row['id'] != _md5_uuid(f'{PanelMemberTransition.TABLE_NAME}|{row["pass_id"]}|{seq}'):
+            problems.append(f'panel_member_transition seq {seq}: the id is not the md5 of (pass, seq)')
+        if _instant(row['recorded_at']) != _instant(owner['started_at']) + timedelta(seconds=seq):
+            problems.append(f'panel_member_transition seq {seq}: recorded_at is not its pass start plus seq seconds')
+    if any(sorted(found) != list(range(1, len(found) + 1)) for found in seqs.values()):
+        problems.append('panel_member_transition: a pass whose seq is not 1..n')
+    if dict(Counter(row['transition'] for row in transitions)) != EXPECTED_TRANSITIONS:
+        problems.append('panel_member_transition: the counts per kind are not the cast')
+    kinds: dict[tuple, set] = {}
+    for row in transitions:
+        kinds.setdefault((row['pass_id'], row['vendor_asset_id'], row['as_of']), set()).add(row['transition'])
+    if sum({'ENTERED', 'CREATED'} <= found for found in kinds.values()) != EXPECTED_TIED_MEMBERS:
+        problems.append('panel_member_transition: the same-pass ENTERED and CREATED tie is not the cast')
+    # The datasets and requests a transition names: the cast's entry and requests, and the one absent dataset.
+    request_ids = {str(request_id) for request_id in REQUEST_IDS.values()}
+    for row in transitions:
+        if row['request_id'] is not None and row['request_id'] not in request_ids:
+            problems.append('panel_member_transition: a request id outside the cast')
+        if row['dataset_id'] is not None and row['dataset_id'] not in entries | {str(ABSENT_DATASET_ID)}:
+            problems.append('panel_member_transition: a dataset id that is neither a seed entry nor the absent one')
+        if (row['transition'] == 'CREATED') != (row['request_id'] is not None):
+            problems.append('panel_member_transition: a request id on other than a CREATED row, or a CREATED without')
+    if str(ABSENT_DATASET_ID) in entries or str(ABSENT_DATASET_ID) not in {row['dataset_id'] for row in transitions}:
+        problems.append('panel_member_transition: the absent dataset is in the seed, or no transition names it')
+    return problems
+
+
+def test_the_head_seed_holds_the_panel_cast_as_normalise_derives_it():
+    sql, manifest = _read(HEAD)
+    assert panel_problems(sql, manifest) == []
+
+
+def test_the_panel_check_is_red_on_the_parent_seed_and_on_tampered_rows():
+    parent_sql, parent_manifest = _read('a3f8d2c6e914')
+    assert panel_problems(parent_sql, parent_manifest) == [f'{Panel.TABLE_NAME}: no row in the seed']
+
+    sql, manifest = _read(HEAD)
+    # A transition label dropped from the cast (the bead's planted mutation, here on the seed itself).
+    draining = next(line for line in sql.splitlines() if "'DRAINING', 'seed-asset-" in line)
+    problems = panel_problems(sql.replace(draining + '\n', ''), manifest)
+    assert f'{PanelMemberTransition.TABLE_NAME}: 13 rows, manifest 14, cast 14' in problems
+    assert 'panel_member_transition: the counts per kind are not the cast' in problems
+    # recorded_at left as stamped (a NORMALISE_SQL that forgot it).
+    stamped = re.sub(r"'2000-01-01 01:00:01\+00'", "'2026-10-30 03:12:00.123456+00'", sql, count=1)
+    assert any('recorded_at is not its pass start' in problem for problem in panel_problems(stamped, manifest))
+    # A pass id left random.
+    first_pass = _md5_uuid(f'{PanelPass.TABLE_NAME}|1')
+    assert f"'{first_pass}'" in sql
+    random_id = str(uuid.UUID(int=7))
+    assert any('rank 1' in problem for problem in panel_problems(sql.replace(first_pass, random_id), manifest))
+    # A real panel name.
+    assert 'panel: a name outside PANEL_NAME_PATTERN' in panel_problems(
+        sql.replace("'zz-seed-panel'", "'momentum'"), manifest
+    )

@@ -1,5 +1,6 @@
 import uuid
 from dataclasses import dataclass, field, fields
+from datetime import UTC
 from typing import TYPE_CHECKING
 
 from sqlalchemy import and_, delete, func, not_, or_, select, update
@@ -863,6 +864,7 @@ async def operator_set_expiry(
                 owner=existing.owner,
                 action=OverrideAction.SET_EXPIRY,
                 reason=reason,
+                new_value=None if expiry is None else expiry.astimezone(UTC).isoformat(),
             )
 
 
@@ -928,6 +930,7 @@ async def operator_set_collecting(
                 owner=existing.owner,
                 action=OverrideAction.SET_COLLECTING,
                 reason=reason,
+                new_value='true' if collect else 'false',
             )
         return collect_change(collect_before, collect)
 
@@ -964,6 +967,7 @@ async def operator_delete_entry(db: AsyncSession, id: uuid.UUID, override: Opera
                 owner=existing.owner,
                 action=OverrideAction.DELETE,
                 reason=reason,
+                new_value=None,
             )
 
 

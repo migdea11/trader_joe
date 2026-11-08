@@ -48,6 +48,8 @@ own crud (start_run, finish_run, fail_interrupted_runs), one symbol each (ZZSEED
 Their symbols differ, which keeps dump.NORMALISE_SQL's rank (request_id NULLS FIRST, then asset_symbol) stable and apart
 from the attempt rows' ranks; their instants are fixed by the same statement (request_id IS NULL).
 
+The panel cast (panel_records.py, bead tj-7zjov1.196) is written last, through the panel crud.
+
 Three corporate_action rows result (A, B, A revised); the same-bytes repeat of A is the dedupe, so it leaves no row.
 The dataset_id of a request that names none stays NULL. Every counted attempt carries the vendor asset id except the
 FAILED one with no stats, whose header names none, so the seed holds both values of ingest_run.vendor_asset_id.
@@ -524,6 +526,10 @@ async def seed_ingest_records(url: URL, dataset_id: uuid.UUID, symbol: str) -> N
         )
         await deliver_list('AL_ACTIVE_EMPTY', active, [], _AL_DAY_0 + timedelta(days=3))
         await _seed_legacy_runs(engine)
+        # The panel cast names the asset-list snapshots and requests written above (bead tj-7zjov1.196).
+        from data.store.seeds.panel_records import seed_panel_records
+
+        await seed_panel_records(url, dataset_id)
     finally:
         delivery_intake.own_session, delivery_intake.publish = saved_session, saved_publish
         await engine.dispose()

@@ -70,6 +70,11 @@ from data.store.seeds.dump import (
     ENTRY_TABLE,
     INSTANCE_TABLE,
     NORMALISE_SQL,
+    PANEL_PASS_TABLE,
+    PANEL_SETTINGS_TABLE,
+    PANEL_SOURCE_SETTINGS_TABLE,
+    PANEL_TABLE,
+    PANEL_TRANSITION_TABLE,
     REQUEST_TABLE,
     RUN_TABLE,
     SEED_TABLES,
@@ -104,6 +109,20 @@ from data.store.seeds.ingest_records import (
     seed_ingest_records,
 )
 from data.store.seeds.manifest import head_revision
+from data.store.seeds.panel_records import (
+    EXPECTED_DRY_RUN_PASSES,
+    EXPECTED_PANELS,
+    EXPECTED_PASS_KINDS,
+    EXPECTED_PASSES,
+    EXPECTED_SETTINGS_VERSIONS,
+    EXPECTED_SOURCE_SETTINGS_VERSIONS,
+    EXPECTED_TIED_MEMBERS,
+    EXPECTED_TRANSITION_ROWS,
+    EXPECTED_TRANSITIONS,
+    EXPECTED_UNFINISHED_PASSES,
+    PANEL_ACTOR,
+    PANEL_NAME,
+)
 from data.store.seeds.producer import SNAPSHOT_BEGIN, SNAPSHOT_END, VERSIONS_DIR, CastDrifted, SeedRefused, produce
 from data.store.seeds.scenario import SEED_REQUESTS
 from data.store.seeds.stack import Stack, StackError
@@ -137,6 +156,13 @@ SYNTHETIC_ROWS = [
     ('a', 'ZZSEEDXA', '', 4),
     ('v', 'ZZSEEDXB', '', 1),
     ('p', 'ZZSEEDXB', '', 1),
+    # tj-7zjov1.196: the panel cast's name ('n'), its versions' actor ('o', once per settings table), a transition's
+    # symbol ('t') and a symbol a settings version allows or denies ('u').
+    ('n', PANEL_NAME, '', 1),
+    ('o', '', PANEL_ACTOR, 2),
+    ('o', '', PANEL_ACTOR, 2),
+    ('t', 'ZZSEEDXA', '', 3),
+    ('u', 'ZZSEEDXC', '', 1),
 ]
 # tj-7zjov1.195: the symbols the fake broker's asset lists serve, which the store's boot-time P47 snapshot files.
 FAKE_SNAPSHOT_SYMBOLS = (*FAKE_LISTED_SYMBOLS, *FAKE_DELISTED_SYMBOLS)
@@ -159,6 +185,14 @@ RENDERED = {
     SNAPSHOT_TABLE: ["INSERT INTO public.asset_list_snapshot (asset_list, id) VALUES ('active', '0s');"],
     SNAPSHOT_ROW_TABLE: ["INSERT INTO public.asset_list_row (id, symbol) VALUES ('0w', 'ZZSEEDXA');"],
     SNAPSHOT_EVENT_TABLE: ["INSERT INTO public.asset_list_event (id, kind) VALUES ('0v', 'appeared');"],
+    # tj-7zjov1.196: the five panel tables, parents first.
+    PANEL_TABLE: ["INSERT INTO public.panel (id, name) VALUES ('0p', 'zz-seed-panel');"],
+    PANEL_SETTINGS_TABLE: ["INSERT INTO public.panel_settings_version (id, version_no) VALUES ('0g', '1');"],
+    PANEL_SOURCE_SETTINGS_TABLE: [
+        "INSERT INTO public.panel_source_settings_version (id, version_no) VALUES ('0h', '1');"
+    ],
+    PANEL_PASS_TABLE: ["INSERT INTO public.panel_pass (id, kind) VALUES ('0k', 'MEMBERSHIP');"],
+    PANEL_TRANSITION_TABLE: ["INSERT INTO public.panel_member_transition (id, seq) VALUES ('0t', '1');"],
 }
 SETVAL_7 = "SELECT pg_catalog.setval('public.stock_market_activity_id_seq', 7, true);\n"
 EXPECTED_SQL = ''.join(f'{line}\n' for table in SEED_TABLES for line in RENDERED[table]) + SETVAL_7
@@ -172,11 +206,17 @@ COLUMNS = {
     SNAPSHOT_TABLE: ['id', 'asset_list'],
     SNAPSHOT_ROW_TABLE: ['symbol', 'id'],
     SNAPSHOT_EVENT_TABLE: ['kind', 'id'],
+    PANEL_TABLE: ['name', 'id'],
+    PANEL_SETTINGS_TABLE: ['version_no', 'id'],
+    PANEL_SOURCE_SETTINGS_TABLE: ['version_no', 'id'],
+    PANEL_PASS_TABLE: ['kind', 'id'],
+    PANEL_TRANSITION_TABLE: ['seq', 'id'],
 }
 # corporate_action's count is also the observation count of the cast refusal (the same statement), so it is the
 # cast's EXPECTED_OBSERVATIONS, as ingest_instance's is EXPECTED_INSTANCES and ingest_run's is EXPECTED_RUN_ROWS (the
 # 'run rows' check, fifteen attempt rows and four legacy-shaped runs since tj-7zjov1.30), and asset_list_row's is the
-# 'snapshot rows' check's EXPECTED_SNAPSHOT_ROWS.
+# 'snapshot rows' check's EXPECTED_SNAPSHOT_ROWS. Each panel table's count is also the panel cast's '<table> rows'
+# check (tj-7zjov1.196), so it is the cast's EXPECTED constant.
 COUNTS = {
     ENTRY_TABLE: 3,
     BAR_TABLE: 7,
@@ -187,6 +227,11 @@ COUNTS = {
     SNAPSHOT_TABLE: 5,
     SNAPSHOT_ROW_TABLE: 9,
     SNAPSHOT_EVENT_TABLE: 5,
+    PANEL_TABLE: EXPECTED_PANELS,
+    PANEL_SETTINGS_TABLE: EXPECTED_SETTINGS_VERSIONS,
+    PANEL_SOURCE_SETTINGS_TABLE: EXPECTED_SOURCE_SETTINGS_VERSIONS,
+    PANEL_PASS_TABLE: EXPECTED_PASSES,
+    PANEL_TRANSITION_TABLE: EXPECTED_TRANSITION_ROWS,
 }
 DIGESTS = {
     ENTRY_TABLE: {'id': 'i1', 'owner': 'o1'},
@@ -198,14 +243,27 @@ DIGESTS = {
     SNAPSHOT_TABLE: {'asset_list': 's1', 'id': 's0'},
     SNAPSHOT_ROW_TABLE: {'id': 'w0', 'symbol': 'w1'},
     SNAPSHOT_EVENT_TABLE: {'id': 'v0', 'kind': 'v1'},
+    PANEL_TABLE: {'id': 'p0', 'name': 'p1'},
+    PANEL_SETTINGS_TABLE: {'id': 'g0', 'version_no': 'g1'},
+    PANEL_SOURCE_SETTINGS_TABLE: {'id': 'h0', 'version_no': 'h1'},
+    PANEL_PASS_TABLE: {'id': 'k0', 'kind': 'k1'},
+    PANEL_TRANSITION_TABLE: {'id': 't0', 'seq': 't1'},
 }
 # The one query that asks for old four-column bar key collisions.
 COLLISION_MARK = 'HAVING count(*) > 1'
 # The reset of the three ingest tables and corporate_action (tj-7zjov1.31), the one script besides NORMALISE_SQL.
+# tj-7zjov1.196: then the five panel tables, children first (their foreign keys run inside them).
+PANEL_RESET_ORDER = (
+    PANEL_TRANSITION_TABLE,
+    PANEL_PASS_TABLE,
+    PANEL_SETTINGS_TABLE,
+    PANEL_SOURCE_SETTINGS_TABLE,
+    PANEL_TABLE,
+)
 RESET_SQL = (
     f'DELETE FROM {RUN_TABLE}; DELETE FROM {REQUEST_TABLE}; DELETE FROM {INSTANCE_TABLE}; '
     f'DELETE FROM {CORPORATE_ACTION_TABLE}; DELETE FROM {SNAPSHOT_EVENT_TABLE}; DELETE FROM {SNAPSHOT_ROW_TABLE}; '
-    f'DELETE FROM {SNAPSHOT_TABLE};'
+    f'DELETE FROM {SNAPSHOT_TABLE}; ' + ' '.join(f'DELETE FROM {table};' for table in PANEL_RESET_ORDER)
 )
 DATASET_ID = uuid.UUID('7ceff30a-af80-1760-5057-d346cc334f4d')
 # The cast refusal's queries, in order (_refuse_wrong_ingest_records): the counts, then since tj-7zjov1.166 every cast
@@ -228,6 +286,14 @@ CAST_CHECKS = [
     'snapshot rows',
     'snapshots whose row_count differs from their rows',
     'asset-list events',
+    # tj-7zjov1.196: the panel cast, the row counts of the five tables, then passes and transitions.
+    *(f'{table} rows' for table in SEED_TABLES[-5:]),
+    'panel pass kinds',
+    'dry-run panel passes',
+    'unfinished panel passes',
+    'panel transitions',
+    'panel passes with a gap in seq',
+    'panel members with an ENTERED and a CREATED in one pass at one as_of',
     # tj-7zjov1.166: each cast request and each instance, by id.
     'request rows',
     'instance rows',
@@ -263,6 +329,13 @@ CAST_ATTRS = (
     'rows_after_records',
     'asset_request_rows',
     'snapshot_list_rows',
+    # tj-7zjov1.196: the panel cast's answers.
+    'pass_kind_rows',
+    'dry_run_rows',
+    'unfinished_rows',
+    'transition_rows',
+    'gapped_rows',
+    'tied_rows',
 )
 # Merged into, not replaced, by FakeStack.write.
 MERGED_ATTRS = ('raw_counts', 'render', 'digests')
@@ -319,7 +392,12 @@ def stored_bar_keys(path: str, body: dict[str, str]) -> list[tuple]:
 
 def _table_of(sql: str) -> str:
     """The one seed table a per-table query names (the synthetic check, naming them all, is answered first)."""
+    # The panel tables first and the panel itself last: 'panel' is part of every other panel table's name.
     for table in (
+        PANEL_TRANSITION_TABLE,
+        PANEL_SOURCE_SETTINGS_TABLE,
+        PANEL_SETTINGS_TABLE,
+        PANEL_PASS_TABLE,
         SNAPSHOT_EVENT_TABLE,
         SNAPSHOT_ROW_TABLE,
         SNAPSHOT_TABLE,
@@ -329,6 +407,7 @@ def _table_of(sql: str) -> str:
         RUN_TABLE,
         BAR_TABLE,
         ENTRY_TABLE,
+        PANEL_TABLE,
     ):
         if table in sql:
             return table
@@ -392,6 +471,12 @@ class FakeStack:
         instance_rows=None,
         drifts=None,
         end_error=None,
+        pass_kind_rows=None,
+        dry_run_rows=None,
+        unfinished_rows=None,
+        transition_rows=None,
+        gapped_rows=None,
+        tied_rows=None,
     ):
         self.revision_rows = [(HEAD,)] if revision_rows is None else revision_rows
         self.rows_before = SYNTHETIC_ROWS + list(foreign_before)
@@ -426,6 +511,13 @@ class FakeStack:
         self.empty_snapshot_rows = [(EXPECTED_EMPTY_SNAPSHOTS,)] if empty_snapshot_rows is None else empty_snapshot_rows
         self.snapshot_stray_rows = [(0,)] if snapshot_stray_rows is None else snapshot_stray_rows
         self.event_rows = list(EXPECTED_EVENTS.items()) if event_rows is None else event_rows
+        # tj-7zjov1.196: the panel cast's answers (each table's row count is raw_counts, as for the asset-list rows).
+        self.pass_kind_rows = list(EXPECTED_PASS_KINDS.items()) if pass_kind_rows is None else pass_kind_rows
+        self.dry_run_rows = [(EXPECTED_DRY_RUN_PASSES,)] if dry_run_rows is None else dry_run_rows
+        self.unfinished_rows = [(EXPECTED_UNFINISHED_PASSES,)] if unfinished_rows is None else unfinished_rows
+        self.transition_rows = list(EXPECTED_TRANSITIONS.items()) if transition_rows is None else transition_rows
+        self.gapped_rows = [(0,)] if gapped_rows is None else gapped_rows
+        self.tied_rows = [(EXPECTED_TIED_MEMBERS,)] if tied_rows is None else tied_rows
         # tj-7zjov1.166: the per-request and per-instance answers, the cast the seeder writes, the drifts, the snapshot.
         self.request_rows = list(REQUEST_ROWS) if request_rows is None else request_rows
         self.instance_rows = list(INSTANCE_ROWS) if instance_rows is None else instance_rows
@@ -501,6 +593,19 @@ class FakeStack:
             return self.snapshot_stray_rows
         if sql == f'SELECT kind::text, count(*) FROM {SNAPSHOT_EVENT_TABLE} GROUP BY kind;':
             return self.event_rows
+        # The panel cast (tj-7zjov1.196), before the generic count shape four of them also start with.
+        if sql == f'SELECT kind::text, count(*) FROM {PANEL_PASS_TABLE} GROUP BY kind;':
+            return self.pass_kind_rows
+        if sql == f'SELECT count(*) FROM {PANEL_PASS_TABLE} WHERE dry_run;':
+            return self.dry_run_rows
+        if sql == f'SELECT count(*) FROM {PANEL_PASS_TABLE} WHERE finished_at IS NULL;':
+            return self.unfinished_rows
+        if sql == f'SELECT transition::text, count(*) FROM {PANEL_TRANSITION_TABLE} GROUP BY transition;':
+            return self.transition_rows
+        if 'GROUP BY pass_id HAVING max(seq) <> count(*) OR min(seq) <> 1' in sql:
+            return self.gapped_rows
+        if 'GROUP BY pass_id, vendor_asset_id, as_of' in sql:
+            return self.tied_rows
         if sql.startswith('SELECT count(*) FROM'):
             table = _table_of(sql)
             return self.raw_counts.get(table, [(COUNTS[table],)])
@@ -701,6 +806,33 @@ def test_the_ingest_reset_empties_exactly_the_three_ingest_tables_children_first
     assert ENTRY_TABLE not in reset and BAR_TABLE not in reset and 'TRUNCATE' not in reset
 
 
+def test_the_reset_empties_every_panel_table_and_a_child_before_its_parent():
+    """tj-7zjov1.196: derived from the models' foreign keys.
+
+    A DELETE of a parent first (a foreign-key error on a real stack, where the fake would say nothing) or a panel table
+    left out is caught here.
+    """
+    from data.store.app.database.models.panel import (
+        Panel,
+        PanelMemberTransition,
+        PanelPass,
+        PanelSettingsVersion,
+        PanelSourceSettingsVersion,
+    )
+
+    stack = FakeStack()
+    produce(stack, date='2026-09-30')
+    reset = next(sql for sql in stack.sql if sql.startswith('DELETE'))
+    deletes = [statement.strip() for statement in reset.split(';') if statement.strip()]
+    order = [statement.removeprefix('DELETE FROM ') for statement in deletes]
+    assert set(PANEL_RESET_ORDER) <= set(order)
+    models = (Panel, PanelSettingsVersion, PanelSourceSettingsVersion, PanelPass, PanelMemberTransition)
+    keys = [(model.__tablename__, key.column.table.name) for model in models for key in model.__table__.foreign_keys]
+    assert len(keys) == 6
+    for child, parent in keys:
+        assert order.index(child) < order.index(parent), (child, parent)
+
+
 def test_the_default_seeder_is_the_store_code():
     """The stub is this file's; the producer's own default is ingest_records.seed_ingest_records."""
     assert (None, seed_ingest_records) == REAL_DEFAULTS
@@ -889,6 +1021,75 @@ def test_a_synthetic_asset_list_row_with_no_symbol_or_no_owner_is_not_foreign(sy
     produce(stack, date='2026-09-30')
 
 
+# tj-7zjov1.196: the panel tables. 'n' judges a panel's name by PANEL_NAME_PATTERN, 'o' a settings version's actor by
+# OWNER_PATTERN alone (never the scheduler's or the operator's exemption), 't' and 'u' a symbol by SYMBOL_PATTERN
+# (never the fake broker's exemption, which is the asset-list tables' alone).
+PANEL_FOREIGN_ROWS = [
+    pytest.param(('n', 'momentum-top-50', '', 3), id='real-panel-name'),
+    pytest.param(('n', 'zz-seed-pane', '', 3), id='panel-name-prefix-short'),
+    pytest.param(('n', 'ZZ-SEED-PANEL', '', 3), id='panel-name-upper-case'),
+    pytest.param(('n', 'x-zz-seed-panel', '', 3), id='panel-name-not-anchored'),
+    pytest.param(('o', '', 'miguel', 3), id='real-actor'),
+    pytest.param(('o', '', SCHEDULER_ACTOR, 3), id='scheduler-actor'),
+    pytest.param(('o', '', 'operator', 3), id='operator-actor'),
+    pytest.param(('o', '', 'seed-owner-pp', 3), id='actor-pattern-miss'),
+    pytest.param(('t', 'MSFT', '', 3), id='transition-real-symbol'),
+    pytest.param(('t', FAKE_LISTED_SYMBOLS[0], '', 3), id='transition-fake-listed-symbol'),
+    pytest.param(('u', 'SPY', '', 3), id='allow-or-deny-real-symbol'),
+    pytest.param(('u', FAKE_LISTED_SYMBOLS[0], '', 3), id='allow-or-deny-fake-listed-symbol'),
+]
+
+
+@pytest.mark.parametrize('foreign', PANEL_FOREIGN_ROWS)
+def test_a_foreign_panel_row_before_the_scenario_refuses_before_any_post(no_writes, foreign):
+    stack = FakeStack(foreign_before=[foreign])
+    assert producer_module._count_foreign_rows(stack) == (3, False)
+    with pytest.raises(SeedRefused) as raised:
+        produce(stack)
+    assert str(raised.value) == '3 row(s) hold a symbol or owner outside the synthetic patterns; no seed written'
+    assert 'post' not in stack.kinds() and 'ingest reset' not in stack.kinds()
+    assert all(value not in str(raised.value) for value in foreign[1:3] if value)
+
+
+@pytest.mark.parametrize('foreign', PANEL_FOREIGN_ROWS[:1] + PANEL_FOREIGN_ROWS[4:5] + PANEL_FOREIGN_ROWS[8:9])
+def test_a_foreign_panel_row_the_seeder_wrote_refuses_before_the_rewrite(no_writes, foreign):
+    stack = FakeStack(foreign_records=[foreign])
+    with pytest.raises(SeedRefused, match=r'^3 row\(s\) hold a symbol or owner'):
+        produce(stack)
+    assert 'normalise' not in stack.kinds()
+
+
+@pytest.mark.parametrize(
+    'synthetic',
+    [
+        ('n', PANEL_NAME, '', 1),
+        ('n', f'{PANEL_NAME}-2', '', 1),
+        ('o', '', PANEL_ACTOR, 4),
+        ('o', '', 'seed-owner-a', 1),
+        ('t', 'ZZSEEDXD', '', 2),
+        ('u', 'ZZSEEDXA', '', 1),
+    ],
+    ids=['cast-name', 'suffixed-name', 'cast-actor', 'scenario-owner', 'transition-symbol', 'listed-symbol'],
+)
+def test_a_synthetic_panel_row_is_not_foreign(no_writes, synthetic):
+    assert producer_module._count_foreign_rows(FakeStack(foreign_before=[synthetic])) == (0, False)
+    produce(FakeStack(foreign_before=[synthetic], foreign_records=[synthetic]), date='2026-09-30')
+
+
+def test_the_synthetic_check_covers_the_panel_tables():
+    stack = FakeStack()
+    produce(stack, date='2026-09-30')
+    sql = stack.synthetic_sql[0]
+    assert f"SELECT 'n', name, '', count(*) FROM {PANEL_TABLE} GROUP BY name" in sql
+    assert f"SELECT 'o', '', actor, count(*) FROM {PANEL_SETTINGS_TABLE} GROUP BY actor" in sql
+    assert f"SELECT 'o', '', actor, count(*) FROM {PANEL_SOURCE_SETTINGS_TABLE} GROUP BY actor" in sql
+    assert f"SELECT 't', symbol, '', count(*) FROM {PANEL_TRANSITION_TABLE} GROUP BY symbol" in sql
+    assert (
+        "SELECT 'u', symbol, '', count(*) FROM (SELECT unnest(allow_symbols || deny_symbols) AS symbol "
+        f'FROM {PANEL_SETTINGS_TABLE}) listed GROUP BY symbol'
+    ) in sql
+
+
 # ---------------------------------------------------------------------------------------------
 # The store's own boot-time asset snapshot (bead tj-7zjov1.195): exempt by exact owner and exact symbol set
 # ---------------------------------------------------------------------------------------------
@@ -1069,6 +1270,18 @@ def _asset_list_message(what: str, per: str, found: str, expected: str) -> str:
     )
 
 
+def _panel_message(what: str, found: str, expected: str) -> str:
+    return (
+        f'the seeded panel {what} are not the expected cast (counts per kind differ); '
+        f'found {found}, expected {expected}; no seed written'
+    )
+
+
+# Written out, not derived: the refusal's text is what a reader of the error sees.
+PASS_KINDS_TEXT = 'MEMBERSHIP=4, RELEASE=1'
+TRANSITIONS_TEXT = 'CREATED=2, DEFERRED=2, DRAINED=1, DRAINING=1, ENTERED=5, EXITED=2, REFUSED=1'
+
+
 CAST_REFUSALS = [
     pytest.param(
         {'state_rows': _states(EMPTY=None)},
@@ -1245,6 +1458,80 @@ CAST_REFUSALS = [
         ),
         id='a-vanished-too-many',
     ),
+    # tj-7zjov1.196: the panel cast (_refuse_wrong_panel_records). Each refusal names the count found and expected.
+    *(
+        pytest.param(
+            {'raw_counts': {table: [(COUNTS[table] + delta,)]}},
+            f'found {COUNTS[table] + delta} {table} rows, expected {COUNTS[table]}; no seed written',
+            id=f'{table}-{"over" if delta > 0 else "short"}',
+        )
+        for table in PANEL_RESET_ORDER[::-1]
+        for delta in (-1, 1)
+    ),
+    pytest.param(
+        {'pass_kind_rows': [('MEMBERSHIP', 4)]},
+        _panel_message('passes', 'MEMBERSHIP=4', PASS_KINDS_TEXT),
+        id='panel-pass-kind-missing',
+    ),
+    pytest.param(
+        {'pass_kind_rows': [('MEMBERSHIP', 3), ('RELEASE', 2)]},
+        _panel_message('passes', 'MEMBERSHIP=3, RELEASE=2', PASS_KINDS_TEXT),
+        id='panel-pass-kinds-swapped',
+    ),
+    pytest.param(
+        {'pass_kind_rows': [('MEMBERSHIP', '4'), ('RELEASE', 1)]},
+        _panel_message('passes', "MEMBERSHIP=str '4', RELEASE=1", PASS_KINDS_TEXT),
+        id='panel-pass-kind-text-count',
+    ),
+    pytest.param(
+        {'dry_run_rows': [(0,)]}, 'found 0 dry-run panel passes, expected 1; no seed written', id='no-dry-run'
+    ),
+    pytest.param(
+        {'dry_run_rows': [(2,)]}, 'found 2 dry-run panel passes, expected 1; no seed written', id='two-dry-runs'
+    ),
+    pytest.param(
+        {'unfinished_rows': [(0,)]},
+        'found 0 unfinished panel passes, expected 1; no seed written',
+        id='no-unfinished-pass',
+    ),
+    pytest.param(
+        {'unfinished_rows': [(2,)]},
+        'found 2 unfinished panel passes, expected 1; no seed written',
+        id='two-unfinished-passes',
+    ),
+    # One per kind dropped: a cast that lost any label is refused (the bead's planted mutation, by its count).
+    *(
+        pytest.param(
+            {'transition_rows': [(k, n) for k, n in EXPECTED_TRANSITIONS.items() if k != dropped]},
+            _panel_message(
+                'transitions',
+                ', '.join(f'{k}={n}' for k, n in sorted(EXPECTED_TRANSITIONS.items()) if k != dropped),
+                TRANSITIONS_TEXT,
+            ),
+            id=f'transition-{dropped}-missing',
+        )
+        for dropped in EXPECTED_TRANSITIONS
+    ),
+    pytest.param(
+        {'transition_rows': [(k, 2 if k == 'DRAINED' else n) for k, n in EXPECTED_TRANSITIONS.items()]},
+        _panel_message('transitions', TRANSITIONS_TEXT.replace('DRAINED=1', 'DRAINED=2'), TRANSITIONS_TEXT),
+        id='transition-one-too-many',
+    ),
+    pytest.param(
+        {'gapped_rows': [(1,)]},
+        'found 1 panel pass(es) whose seq is not 1..n, expected 0; no seed written',
+        id='seq-not-1-to-n',
+    ),
+    pytest.param(
+        {'tied_rows': [(0,)]},
+        'found 0 panel member(s) with a same-pass ENTERED and CREATED, expected 1; no seed written',
+        id='no-tied-member',
+    ),
+    pytest.param(
+        {'tied_rows': [(2,)]},
+        'found 2 panel member(s) with a same-pass ENTERED and CREATED, expected 1; no seed written',
+        id='two-tied-members',
+    ),
 ]
 
 
@@ -1284,6 +1571,13 @@ def test_a_cast_refusal_exits_3_through_the_entry_point(monkeypatch, capsys, ove
         ({'empty_snapshot_rows': [('1',)]}, 'empty snapshots'),
         ({'raw_counts': {SNAPSHOT_ROW_TABLE: [(None,)]}}, 'snapshot rows'),
         ({'snapshot_stray_rows': []}, 'snapshots whose row_count differs from their rows'),
+        # tj-7zjov1.196: the panel cast's counts.
+        ({'raw_counts': {PANEL_TABLE: [(None,)]}}, f'{PANEL_TABLE} rows'),
+        ({'raw_counts': {PANEL_TRANSITION_TABLE: [('14',)]}}, f'{PANEL_TRANSITION_TABLE} rows'),
+        ({'dry_run_rows': [(True,)]}, 'dry-run panel passes'),
+        ({'unfinished_rows': []}, 'unfinished panel passes'),
+        ({'gapped_rows': [(None,)]}, 'panel passes with a gap in seq'),
+        ({'tied_rows': [('1',)]}, 'panel members with an ENTERED and a CREATED in one pass at one as_of'),
     ],
     ids=[
         'attempts',
@@ -1297,6 +1591,12 @@ def test_a_cast_refusal_exits_3_through_the_entry_point(monkeypatch, capsys, ove
         'empty-snapshots',
         'snapshot-rows',
         'snapshot-stray',
+        'panels',
+        'panel-transitions',
+        'dry-run-passes',
+        'unfinished-passes',
+        'seq-gaps',
+        'tied-members',
     ],
 )
 def test_a_cast_count_that_is_not_one_integer_fails_without_echoing_it(no_writes, override, what):
@@ -1340,6 +1640,21 @@ def test_the_cast_queries_count_what_the_refusal_names():
         f'(SELECT count(*) FROM {SNAPSHOT_ROW_TABLE} r WHERE r.snapshot_id = s.id);'
     ) in stack.sql
     assert f'SELECT kind::text, count(*) FROM {SNAPSHOT_EVENT_TABLE} GROUP BY kind;' in stack.sql
+    # tj-7zjov1.196: the panel cast's queries, unfiltered (a row outside the cast must be counted).
+    for table in PANEL_RESET_ORDER:
+        assert f'SELECT count(*) FROM {table};' in stack.sql
+    assert f'SELECT kind::text, count(*) FROM {PANEL_PASS_TABLE} GROUP BY kind;' in stack.sql
+    assert f'SELECT count(*) FROM {PANEL_PASS_TABLE} WHERE dry_run;' in stack.sql
+    assert f'SELECT count(*) FROM {PANEL_PASS_TABLE} WHERE finished_at IS NULL;' in stack.sql
+    assert f'SELECT transition::text, count(*) FROM {PANEL_TRANSITION_TABLE} GROUP BY transition;' in stack.sql
+    assert (
+        f'SELECT count(*) FROM (SELECT 1 FROM {PANEL_TRANSITION_TABLE} GROUP BY pass_id '
+        'HAVING max(seq) <> count(*) OR min(seq) <> 1) AS gapped;'
+    ) in stack.sql
+    assert (
+        f'SELECT count(*) FROM (SELECT 1 FROM {PANEL_TRANSITION_TABLE} GROUP BY pass_id, vendor_asset_id, as_of '
+        "HAVING bool_or(transition::text = 'ENTERED') AND bool_or(transition::text = 'CREATED')) AS tied;"
+    ) in stack.sql
     # tj-7zjov1.166: every request and every instance, by id, unfiltered (a row outside the cast must be seen).
     assert f'SELECT id::text, state::text, instance_id FROM {REQUEST_TABLE};' in stack.sql
     assert f'SELECT instance_id, superseded_at IS NOT NULL FROM {INSTANCE_TABLE};' in stack.sql
@@ -1392,6 +1707,10 @@ def test_the_committed_head_seed_holds_the_cast():
     assert manifest['row_counts'][INSTANCE_TABLE] == EXPECTED_INSTANCES
     assert manifest['row_counts'][RUN_TABLE] == EXPECTED_RUN_ROWS
     assert manifest['row_counts'][CORPORATE_ACTION_TABLE] == EXPECTED_OBSERVATIONS
+    # tj-7zjov1.196: the panel cast, as the producer's refusal counts it.
+    assert {table: manifest['row_counts'][table] for table in PANEL_RESET_ORDER} == {
+        table: COUNTS[table] for table in PANEL_RESET_ORDER
+    }
     sql = (REPO_ROOT / 'tests' / 'system' / 'seeds' / f'{HEAD}.sql').read_text(encoding='utf-8')
     for request_id in REQUEST_IDS.values():
         assert f"'{request_id}'" in sql, request_id
@@ -1556,6 +1875,71 @@ def test_a_cast_that_never_settles_exits_3_through_the_entry_point(monkeypatch, 
     captured = capsys.readouterr()
     assert captured.err == f'seed refused: {2 + attempts} ingest instances are held; expected 2; no seed written\n'
     assert captured.out == ''
+
+
+def panel_transition_appears(fake):
+    """A panel pass of the store's own (none runs today; the panel manager would) appends one ENTERED mid-cast."""
+    fake.write(
+        transition_rows=[(k, n + (k == 'ENTERED')) for k, n in fake.transition_rows],
+        raw_counts={PANEL_TRANSITION_TABLE: [(COUNTS[PANEL_TRANSITION_TABLE] + 1,)]},
+    )
+
+
+def panel_pass_disappears(fake):
+    """The dry-run pass is gone mid-cast: the passes, its kind and the dry-run count all move."""
+    fake.write(
+        pass_kind_rows=[(k, n - (k == 'MEMBERSHIP')) for k, n in fake.pass_kind_rows],
+        dry_run_rows=[(0,)],
+        raw_counts={PANEL_PASS_TABLE: [(COUNTS[PANEL_PASS_TABLE] - 1,)]},
+    )
+
+
+PANEL_DRIFTS = [
+    pytest.param(panel_transition_appears, id='a-transition-appears'),
+    pytest.param(panel_pass_disappears, id='a-pass-disappears'),
+]
+
+
+@pytest.mark.parametrize('drift', PANEL_DRIFTS)
+@pytest.mark.parametrize('step', ['request states', 'normalise', 'dump snapshot begin'])
+def test_a_panel_row_that_appears_or_disappears_mid_cast_is_a_drift_and_the_cast_runs_again(no_writes, step, drift):
+    stack = FakeStack(drifts={(1, step): drift})
+    assert produce(stack, date='2026-09-30').bundle == _clean_bundle()
+    assert not stack.drifts, 'the drift landed'
+    first, second = _attempts(stack)
+    assert f'{ENTRY_TABLE} render' not in first
+    assert second == ['seed dataset lookup', *RECORD_STEPS[1:], 'normalise', *DUMP_STEPS]
+
+
+@pytest.mark.parametrize(
+    ('drift', 'message'),
+    [
+        pytest.param(
+            panel_transition_appears,
+            f'found 15 {PANEL_TRANSITION_TABLE} rows, expected 14; no seed written',
+            id='a-transition-appears',
+        ),
+        pytest.param(
+            panel_pass_disappears,
+            f'found 4 {PANEL_PASS_TABLE} rows, expected 5; no seed written',
+            id='a-pass-disappears',
+        ),
+    ],
+)
+def test_a_panel_drift_that_never_settles_raises_cast_drifted(no_writes, drift, message):
+    attempts = producer_module.CAST_ATTEMPTS
+    stack = FakeStack(drifts={(n, 'normalise'): drift for n in range(1, attempts + 1)})
+    with pytest.raises(CastDrifted) as raised:
+        produce(stack)
+    assert type(raised.value) is CastDrifted and str(raised.value) == message
+    assert stack.kinds().count('seed') == attempts
+
+
+def test_a_panel_drift_inside_the_snapshot_is_in_neither_the_checks_nor_the_dump(no_writes):
+    stack = FakeStack(drifts={(1, f'{PANEL_TABLE} render'): panel_transition_appears})
+    assert produce(stack, date='2026-09-30').bundle == _clean_bundle()
+    assert stack.kinds().count('seed') == 1
+    assert stack.raw_counts[PANEL_TRANSITION_TABLE] == [(15,)], 'and is visible once the snapshot closed'
 
 
 def _request_message(differ: int, outside: int, wrong: str) -> str:
@@ -2230,7 +2614,7 @@ def test_no_rows_at_all_is_refused_as_an_empty_seed():
         raw_counts={
             table: [(0,)]
             for table in SEED_TABLES
-            if table not in (INSTANCE_TABLE, RUN_TABLE, CORPORATE_ACTION_TABLE, SNAPSHOT_ROW_TABLE)
+            if table not in (INSTANCE_TABLE, RUN_TABLE, CORPORATE_ACTION_TABLE, SNAPSHOT_ROW_TABLE, *PANEL_RESET_ORDER)
         },
     )
     with pytest.raises(SeedRefused, match='exactly one newline'):

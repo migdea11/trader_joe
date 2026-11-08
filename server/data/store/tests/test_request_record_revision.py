@@ -85,8 +85,14 @@ GREAT_GRANDCHILD_FILE = MIGRATIONS_DIR / 'versions' / f'{GREAT_GRANDCHILD}_corpo
 # own upgrade().
 HEAD = 'a3f8d2c6e914'
 HEAD_FILE = MIGRATIONS_DIR / 'versions' / f'{HEAD}_asset_list_snapshots.py'
+# The head since tj-7zjov1.33 (P20): directly on a3f8d2c6e914, it creates the panel tables and adds ONE index to
+# ingest_request, ix_ingest_request_source_created_at (the request-rate window). That index is b6d1f93a7c42's, not this
+# revision's, so it is taken off the model like the later columns, read from its own upgrade(); its shape against the
+# model is pinned in test_panel_revision.py.
+PANEL_HEAD = 'b6d1f93a7c42'
+PANEL_HEAD_FILE = MIGRATIONS_DIR / 'versions' / f'{PANEL_HEAD}_panels.py'
 # Every revision after this one, in chain order: the model is what the last of them leaves.
-LATER_FILES = [CHILD_FILE, GRANDCHILD_FILE, GREAT_GRANDCHILD_FILE, HEAD_FILE]
+LATER_FILES = [CHILD_FILE, GRANDCHILD_FILE, GREAT_GRANDCHILD_FILE, HEAD_FILE, PANEL_HEAD_FILE]
 DIALECT = postgresql.dialect()
 ADDITIVE_EXCEPTION_MARKER = re.compile(r'^\s*# additive-exception:', re.MULTILINE)
 
@@ -138,12 +144,9 @@ def _compiled(element: Any) -> str:
     return ' '.join(str(element.compile(dialect=DIALECT)).split())
 
 
-def _child_added_columns() -> dict[str, list[sa.Column]]:
-    """The columns the later revisions add, per table, in chain order, from their own upgrade() against a recorded op.
-
-    The child (tj-7zjov1.123) and, since tj-7zjov1.153, the head on it; each one's add_column calls, nothing restated.
-    """
-    added: dict[str, list[sa.Column]] = {}
+def _later_upgrade_calls() -> list[tuple[str, tuple, dict]]:
+    """Every op call the later revisions' upgrade() makes, in chain order, against a recorded op."""
+    calls: list[tuple[str, tuple, dict]] = []
     for path in LATER_FILES:
         spec = importlib.util.spec_from_file_location(f'revision_{path.stem}', path)
         module = importlib.util.module_from_spec(spec)
@@ -151,10 +154,34 @@ def _child_added_columns() -> dict[str, list[sa.Column]]:
         op = MagicMock(name='op')
         with patch.object(module, 'op', op), patch.object(postgresql.ENUM, 'create', autospec=True):
             module.upgrade()
-        for name, args, _ in op.method_calls:
-            if name == 'add_column':
-                added.setdefault(args[0], []).append(args[1])
+        calls += list(op.method_calls)
+    return calls
+
+
+def _child_added_columns() -> dict[str, list[sa.Column]]:
+    """The columns the later revisions add, per table, in chain order, from their own upgrade() against a recorded op.
+
+    The child (tj-7zjov1.123) and, since tj-7zjov1.153, the head on it; each one's add_column calls, nothing restated.
+    """
+    added: dict[str, list[sa.Column]] = {}
+    for name, args, _ in _later_upgrade_calls():
+        if name == 'add_column':
+            added.setdefault(args[0], []).append(args[1])
     return added
+
+
+def _later_index_names(table: str) -> set[str]:
+    """The indexes the later revisions create on an existing table, by name, from their own upgrade().
+
+    Since tj-7zjov1.33 (P20): b6d1f93a7c42's ix_ingest_request_source_created_at on ingest_request.
+    """
+    return {args[0] for name, args, _ in _later_upgrade_calls() if name == 'create_index' and args[1] == table}
+
+
+def _request_indexes_of_this_revision() -> list[sa.Index]:
+    """ingest_request's model indexes minus the ones a later revision creates."""
+    later = _later_index_names(REQUEST.name)
+    return [index for index in REQUEST.indexes if index.name not in later]
 
 
 def _model_columns_in(table: sa.Table, names: list[str]) -> sa.Table:
@@ -171,10 +198,12 @@ def test_the_revision_is_the_single_head_directly_on_the_head_it_was_written_on_
 
     No longer the head since tj-7zjov1.123: its one child is b8e4c1f7a923. 39c28a39b290 (tj-7zjov1.153, P35r) sits
     directly on that child, c7e19a4d5b28 (tj-7zjov1.31, P18) directly on 39c28a39b290, and the single head is
-    a3f8d2c6e914 since tj-7zjov1.30 (P17), directly on c7e19a4d5b28.
+    a3f8d2c6e914 from tj-7zjov1.30 (P17), directly on c7e19a4d5b28, and b6d1f93a7c42 since tj-7zjov1.33 (P20), directly
+    on a3f8d2c6e914.
     """
     script = ScriptDirectory(str(MIGRATIONS_DIR))
-    assert script.get_heads() == [HEAD]
+    assert script.get_heads() == [PANEL_HEAD]
+    assert script.get_revision(PANEL_HEAD).down_revision == HEAD
     assert script.get_revision(HEAD).down_revision == GREAT_GRANDCHILD
     assert script.get_revision(GREAT_GRANDCHILD).down_revision == GRANDCHILD
     assert script.get_revision(GRANDCHILD).down_revision == CHILD
@@ -302,7 +331,11 @@ def test_the_revision_adds_to_ingest_run_exactly_the_columns_the_model_has_that_
 
 
 def test_the_revision_builds_exactly_the_four_indexes_the_models_declare():
-    """Three on ingest_request (open states, QUEUED by instance, dataset) and the attempt unique index on ingest_run."""
+    """Three on ingest_request (open states, QUEUED by instance, dataset) and the attempt unique index on ingest_run.
+
+    The model's ingest_request also declares b6d1f93a7c42's source/created_at index, which this revision never built:
+    it is taken off the model (read from that revision's upgrade()), and asserted to be exactly that one index.
+    """
     op, _, _ = _run('upgrade')
     objects = SchemaObjects()
     built = {
@@ -310,7 +343,8 @@ def test_the_revision_builds_exactly_the_four_indexes_the_models_declare():
         for name, args, kwargs in op.method_calls
         if name == 'create_index'
     }
-    declared = {_compiled(CreateIndex(index)) for index in [*REQUEST.indexes, *INSTANCE.indexes]}
+    assert _later_index_names(REQUEST.name) == {IngestRequest.SOURCE_CREATED_INDEX}
+    declared = {_compiled(CreateIndex(index)) for index in [*_request_indexes_of_this_revision(), *INSTANCE.indexes]}
     declared |= {_compiled(CreateIndex(index)) for index in RUN.indexes if index.name == IngestRun.ATTEMPT_UNIQUE_INDEX}
 
     assert built == declared
@@ -437,7 +471,7 @@ def _model_upgrade_ddl() -> list[str]:
         _compiled(CreateEnumType(REQUEST.c.kind.type)),
         _compiled(CreateEnumType(REQUEST.c.state.type)),
         _compiled(CreateTable(request)),
-        *sorted(_compiled(CreateIndex(index)) for index in REQUEST.indexes),
+        *sorted(_compiled(CreateIndex(index)) for index in _request_indexes_of_this_revision()),
         _compiled(CreateTable(INSTANCE)),
         *[f'ALTER TABLE {RUN.name} ADD COLUMN {_compiled(CreateColumn(column))}' for column in added],
         *[_compiled(CreateIndex(index)) for index in RUN.indexes if index.name == IngestRun.ATTEMPT_UNIQUE_INDEX],
@@ -465,7 +499,7 @@ def test_the_offline_upgrade_sql_is_exactly_the_models_ddl(upgrade_sql):
     alembic_version bookkeeping is the only other thing in the output, so a stray statement of any kind is red.
     """
     revision = _bookkeeping(upgrade_sql)
-    request_indexes = slice(3, 3 + len(REQUEST.indexes))
+    request_indexes = slice(3, 3 + len(_request_indexes_of_this_revision()))
     revision[request_indexes] = sorted(revision[request_indexes])
 
     assert revision == _model_upgrade_ddl()

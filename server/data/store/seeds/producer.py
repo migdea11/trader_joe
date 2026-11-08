@@ -29,6 +29,11 @@ over the network (stack.py); writes nothing to disk. In order:
      instance id, which the emptying made a first sighting, so it supersedes the cast's live instance and moves its
      QUEUED request to NOT_DELIVERED (tj-7zjov1.166). A cast that drifted is a CastDrifted refusal; the whole cast
      (emptying, cast, normalise, dump) is then run again, up to CAST_ATTEMPTS times, and refused if it never settles.
+  3c. Empty the five panel tables (bead tj-7zjov1.196) in the same reset, children first, and count the panel cast that
+     panel_records.py writes last through the store's panel crud: panels, settings and source settings versions, passes
+     (by kind, dry run, unfinished) and transitions (by kind, the seq ordinals, the same-pass ENTERED + CREATED tie), each
+     refusal naming counts found and expected, never a value. The foreign-row refusal judges a panel's name
+     (PANEL_NAME_PATTERN), a version's actor (OWNER_PATTERN) and every symbol a panel names (SYMBOL_PATTERN).
   4. Normalise the tables (dump.py: why), then, in ONE REPEATABLE READ snapshot, repeat the refusals and render
      the tables, count them and take their digests. The checks and the dump therefore judge the same rows: a row the
      store's loops change after the snapshot opens is in neither, and one changed before it is refused.
@@ -62,6 +67,11 @@ from data.store.seeds.dump import (
     ENTRY_TABLE,
     INSTANCE_TABLE,
     NORMALISE_SQL,
+    PANEL_PASS_TABLE,
+    PANEL_SETTINGS_TABLE,
+    PANEL_SOURCE_SETTINGS_TABLE,
+    PANEL_TABLE,
+    PANEL_TRANSITION_TABLE,
     REQUEST_TABLE,
     RUN_TABLE,
     SEED_TABLES,
@@ -93,6 +103,19 @@ from data.store.seeds.ingest_records import (
     seed_ingest_records,
 )
 from data.store.seeds.manifest import build_manifest, column_digest_sql, head_revision, render_manifest
+from data.store.seeds.panel_records import (
+    EXPECTED_DRY_RUN_PASSES,
+    EXPECTED_PANELS,
+    EXPECTED_PASS_KINDS,
+    EXPECTED_PASSES,
+    EXPECTED_SETTINGS_VERSIONS,
+    EXPECTED_SOURCE_SETTINGS_VERSIONS,
+    EXPECTED_TIED_MEMBERS,
+    EXPECTED_TRANSITION_ROWS,
+    EXPECTED_TRANSITIONS,
+    EXPECTED_UNFINISHED_PASSES,
+    PANEL_NAME_PATTERN,
+)
 from data.store.seeds.scenario import OWNER_PATTERN, SEED_REQUESTS, SeedRequest, is_synthetic
 from data.store.seeds.stack import Stack, StackError
 from routers.common.instance_secret import INSTANCE_SECRET_HEADER
@@ -207,7 +230,15 @@ def _count_foreign_rows(stack: Stack) -> tuple[int, bool]:
         f"UNION ALL SELECT 'a', symbol, '', count(*) FROM {SNAPSHOT_ROW_TABLE} GROUP BY symbol "
         f"UNION ALL SELECT 'v', symbol, '', count(*) FROM {SNAPSHOT_EVENT_TABLE} GROUP BY symbol "
         f"UNION ALL SELECT 'p', previous_symbol, '', count(*) FROM {SNAPSHOT_EVENT_TABLE} "
-        'WHERE previous_symbol IS NOT NULL GROUP BY previous_symbol;'
+        'WHERE previous_symbol IS NOT NULL GROUP BY previous_symbol '
+        # The panel tables (tj-7zjov1.196): 'n' a panel's name, 'o' a settings version's actor (an owner with no symbol), 't' a
+        # transition's symbol and 'u' a symbol a settings version allows or denies.
+        f"UNION ALL SELECT 'n', name, '', count(*) FROM {PANEL_TABLE} GROUP BY name "
+        f"UNION ALL SELECT 'o', '', actor, count(*) FROM {PANEL_SETTINGS_TABLE} GROUP BY actor "
+        f"UNION ALL SELECT 'o', '', actor, count(*) FROM {PANEL_SOURCE_SETTINGS_TABLE} GROUP BY actor "
+        f"UNION ALL SELECT 't', symbol, '', count(*) FROM {PANEL_TRANSITION_TABLE} GROUP BY symbol "
+        "UNION ALL SELECT 'u', symbol, '', count(*) FROM (SELECT unnest(allow_symbols || deny_symbols) AS symbol "
+        f'FROM {PANEL_SETTINGS_TABLE}) listed GROUP BY symbol;'
     )
     foreign = 0
     unreadable = False
@@ -222,6 +253,12 @@ def _count_foreign_rows(stack: Stack) -> tuple[int, bool]:
         if kind == 'l':
             # No symbol to judge: the owner alone.
             if owner != SCHEDULER_ACTOR and not OWNER_PATTERN.fullmatch(owner):
+                foreign += count
+        elif kind == 'n':
+            if not PANEL_NAME_PATTERN.fullmatch(symbol):
+                foreign += count
+        elif kind == 'o':
+            if not OWNER_PATTERN.fullmatch(owner):
                 foreign += count
         elif kind in ('a', 'v', 'p') and symbol in fake_listed:
             continue
@@ -473,6 +510,7 @@ def _check_cast_counts(stack: Stack) -> None:
             f'{revised} corporate actions hold more than one payload; expected {EXPECTED_REVISED_ACTIONS}; no seed written'
         )
     _refuse_wrong_asset_lists(stack)
+    _refuse_wrong_panel_records(stack)
 
 
 def _counts_by(stack: Stack, sql: str, what: str) -> dict[str, Any]:
@@ -535,8 +573,72 @@ def _refuse_wrong_asset_lists(stack: Stack) -> None:
         )
 
 
+def _refuse_wrong_panel_records(stack: Stack) -> None:
+    """Refuse unless the five panel tables hold exactly the cast panel_records.py writes. Counts only, never a value."""
+    for table, expected in (
+        (PANEL_TABLE, EXPECTED_PANELS),
+        (PANEL_SETTINGS_TABLE, EXPECTED_SETTINGS_VERSIONS),
+        (PANEL_SOURCE_SETTINGS_TABLE, EXPECTED_SOURCE_SETTINGS_VERSIONS),
+        (PANEL_PASS_TABLE, EXPECTED_PASSES),
+        (PANEL_TRANSITION_TABLE, EXPECTED_TRANSITION_ROWS),
+    ):
+        found = _query_count(stack, f'SELECT count(*) FROM {table};', f'{table} rows')  # nosec B608 -- module constant
+        if found != expected:
+            raise SeedRefused(f'found {found} {table} rows, expected {expected}; no seed written')
+    kinds = _counts_by(
+        stack,
+        f'SELECT kind::text, count(*) FROM {PANEL_PASS_TABLE} GROUP BY kind;',  # nosec B608 -- module constant
+        'panel pass kinds',
+    )
+    if kinds != EXPECTED_PASS_KINDS:
+        raise SeedRefused(
+            'the seeded panel passes are not the expected cast (counts per kind differ); '
+            f'found {_render_counts(kinds)}, expected {_render_counts(EXPECTED_PASS_KINDS)}; no seed written'
+        )
+    for what, where, expected in (
+        ('dry-run panel passes', 'dry_run', EXPECTED_DRY_RUN_PASSES),
+        ('unfinished panel passes', 'finished_at IS NULL', EXPECTED_UNFINISHED_PASSES),
+    ):
+        found = _query_count(
+            stack,
+            f'SELECT count(*) FROM {PANEL_PASS_TABLE} WHERE {where};',  # nosec B608 -- module constants
+            what,
+        )
+        if found != expected:
+            raise SeedRefused(f'found {found} {what}, expected {expected}; no seed written')
+    transitions = _counts_by(
+        stack,
+        f'SELECT transition::text, count(*) FROM {PANEL_TRANSITION_TABLE} GROUP BY transition;',  # nosec B608
+        'panel transitions',
+    )
+    if transitions != EXPECTED_TRANSITIONS:
+        raise SeedRefused(
+            'the seeded panel transitions are not the expected cast (counts per kind differ); '
+            f'found {_render_counts(transitions)}, expected {_render_counts(EXPECTED_TRANSITIONS)}; no seed written'
+        )
+    gapped = _query_count(
+        stack,
+        'SELECT count(*) FROM (SELECT 1 FROM '  # nosec B608 -- module constant
+        f'{PANEL_TRANSITION_TABLE} GROUP BY pass_id HAVING max(seq) <> count(*) OR min(seq) <> 1) AS gapped;',
+        'panel passes with a gap in seq',
+    )
+    if gapped:
+        raise SeedRefused(f'found {gapped} panel pass(es) whose seq is not 1..n, expected 0; no seed written')
+    tied = _query_count(
+        stack,
+        'SELECT count(*) FROM (SELECT 1 FROM '  # nosec B608 -- module constant
+        f'{PANEL_TRANSITION_TABLE} GROUP BY pass_id, vendor_asset_id, as_of '
+        "HAVING bool_or(transition::text = 'ENTERED') AND bool_or(transition::text = 'CREATED')) AS tied;",
+        'panel members with an ENTERED and a CREATED in one pass at one as_of',
+    )
+    if tied != EXPECTED_TIED_MEMBERS:
+        raise SeedRefused(
+            f'found {tied} panel member(s) with a same-pass ENTERED and CREATED, expected {EXPECTED_TIED_MEMBERS}; no seed written'
+        )
+
+
 def _reset_ingest_records(stack: Stack) -> None:
-    """Empty the three ingest tables and corporate_action.
+    """Empty the three ingest tables, corporate_action, the asset-list tables and the five panel tables.
 
     Every row left is synthetic when this runs (the foreign-row refusal passed first). The instance marker has no
     label to check; a scratch stack's own ingest instance is dropped here and re-announces itself.
@@ -544,7 +646,10 @@ def _reset_ingest_records(stack: Stack) -> None:
     stack.script(
         f'DELETE FROM {RUN_TABLE}; DELETE FROM {REQUEST_TABLE}; DELETE FROM {INSTANCE_TABLE}; '  # nosec B608 -- module constants
         f'DELETE FROM {CORPORATE_ACTION_TABLE}; DELETE FROM {SNAPSHOT_EVENT_TABLE}; DELETE FROM {SNAPSHOT_ROW_TABLE}; '
-        f'DELETE FROM {SNAPSHOT_TABLE};',
+        f'DELETE FROM {SNAPSHOT_TABLE}; '
+        # The panel tables, children first (foreign keys run inside them): transitions, passes, versions, panels.
+        f'DELETE FROM {PANEL_TRANSITION_TABLE}; DELETE FROM {PANEL_PASS_TABLE}; DELETE FROM {PANEL_SETTINGS_TABLE}; '
+        f'DELETE FROM {PANEL_SOURCE_SETTINGS_TABLE}; DELETE FROM {PANEL_TABLE};',
         'ingest reset',
     )
 

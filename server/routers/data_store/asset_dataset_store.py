@@ -3,9 +3,11 @@ from typing import Annotated
 from fastapi import APIRouter, Body, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from common.errors.vocabulary import InvalidRequestError, Reason
 from common.logging import get_logger
 from common.rpc.clients.ingest_submit import IngestSubmitClient
 from data.store.app.app_depends import get_ingest_submit_client
+from data.store.app.client_label import PANEL_OWNER
 from data.store.app.database.crud.stock.store_dataset_entry import delete_entry_by_id, get_entry_by_id, search_entries
 from data.store.app.database.database import async_db
 from data.store.app.events import DatasetChange, DatasetChanged, publish
@@ -68,6 +70,10 @@ async def store_data(
     vendor actually answered for. A PUBLIC model of its own rather than a re-export of the internal
     FetchDone, so an internal change cannot move this contract silently.
 
+    THE RESERVED OWNER IS REFUSED HERE, AT THE ROUTE EDGE (owner ruling 2026-10-27, Q4): a body whose owner is
+    PANEL_OWNER is INVALID_REQUEST (422), before the request row is written. The panel manager creates its datasets on
+    the internal path (store_market_activity_worker), which is not guarded.
+
     Args:
         db: The request's session.
         submit_client: The Submit seam, as the interface.
@@ -77,7 +83,14 @@ async def store_data(
     Returns:
         StoreAssetDatasetResponse: The row count and the served window. Every 200 carries both,
         including a served window with no bars, where data_points is 0.
+
+    Raises:
+        InvalidRequestError: INVALID_REQUEST (422), the body's owner is the reserved panel owner.
     """
+    if request_body.owner == PANEL_OWNER:
+        raise InvalidRequestError(
+            Reason.INVALID_REQUEST, f'The owner {PANEL_OWNER!r} is reserved for the panel manager: use another owner.'
+        )
     log.debug(f'Storing data for {request_path.asset_type.value}, {request_path.asset_symbol}')
     # THE RUN RECORD IS THE ATTEMPT ROWS the delivery transaction writes, and DatasetChanged (RETIRED or RESUMED on a
     # collect flip, else UPDATED) is published by the intake after that commit: nothing is recorded or published here.

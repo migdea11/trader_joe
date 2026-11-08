@@ -81,10 +81,10 @@ def test_the_revision_is_directly_on_the_collect_revision_has_one_child_and_is_a
     """No longer the head since tj-7zjov1.25: f2b7d4a91c36 is its one child.
 
     b8e4c1f7a923 was the head from .123; 39c28a39b290 from tj-7zjov1.153 (P35r); c7e19a4d5b28 from tj-7zjov1.31 (P18);
-    a3f8d2c6e914 is the head since tj-7zjov1.30 (P17).
+    a3f8d2c6e914 from tj-7zjov1.30 (P17); b6d1f93a7c42 is the head since tj-7zjov1.33 (P20).
     """
     script = ScriptDirectory(str(MIGRATIONS_DIR))
-    assert script.get_heads() == ['a3f8d2c6e914']
+    assert script.get_heads() == ['b6d1f93a7c42']
     assert [rev.revision for rev in script.walk_revisions() if rev.down_revision == REVISION] == ['f2b7d4a91c36']
     module = _load()
     assert (module.revision, module.down_revision) == (REVISION, PARENT)
