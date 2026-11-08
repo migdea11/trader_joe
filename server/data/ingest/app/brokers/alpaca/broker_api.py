@@ -18,6 +18,7 @@ from alpaca.data.requests import (
     StockQuotesRequest,
     StockTradesRequest,
 )
+from alpaca.trading.client import TradingClient
 from requests.exceptions import HTTPError
 
 from common.enums.data_select import AssetType, DataType
@@ -47,7 +48,11 @@ ALPACA_ADJUSTMENT = 'raw'
 
 ALPACA_CREDENTIAL_VARS = ('ALPACA_API_KEY', 'ALPACA_API_SECRET')
 
+# Where the trading API is, read when the client is built. No default: see get_trading_client.
+ALPACA_TRADING_HOST_VAR = 'ALPACA_TRADING_BASE_URL'
+
 BARS_PATH = '/stocks/bars'
+ASSETS_PATH = '/assets'
 
 # The most rows one page of a bars call returns. The SDK's own bars call asks for the same (get_stock_bars,
 # page_size=10_000), so a read costs the pages it cost before.
@@ -61,6 +66,7 @@ BARS_PAGE_RETRY_WAIT_S = float(DEFAULT_RETRY_WAIT_SECONDS)
 _RETRIED_STATUS = 504
 
 __CLIENT: StockHistoricalDataClient | None = None
+__TRADING_CLIENT: TradingClient | None = None
 __SINGLE_FLIGHT = SingleFlight()
 # The instant the vendor's rate-limit window resets, per quota scope, read from the headers of the last response of
 # that scope that named one. Touched only on the event loop.
@@ -154,6 +160,37 @@ def resolve_feed() -> Feed:
     return Feed.SIP if sip_enabled() else Feed.IEX
 
 
+def _checked_credentials() -> tuple[str, str]:
+    """Read the configured key and secret once, register them with the log scrub, and check them.
+
+    Each variable is read exactly once into a local; the log-scrub registration, the missing check and the shape
+    check all use those locals. Each non-empty plain value is registered straight after the read, before the
+    missing and shape checks, so it is registered even when the other variable is unset or empty and even when it is
+    malformed; a blank one registers nothing (tj-7zjov1.76). Registered as the plain strings: an OpaqueStr would
+    register only the marker word.
+
+    Returns:
+        tuple[str, str]: The key id and the secret, checked and plain. The caller wraps them in OpaqueStr.
+
+    Raises:
+        MissingCredentialsError: If either credential variable is unset or empty.
+        MalformedCredentialsError: If either value is not non-empty visible ASCII. No chained cause, no value.
+    """
+    key_id, secret = (get_env_var(name) for name in ALPACA_CREDENTIAL_VARS)
+    if key_id:
+        register_secret(key_id)
+    if secret:
+        register_secret(secret)
+    missing = [name for name, value in zip(ALPACA_CREDENTIAL_VARS, (key_id, secret), strict=True) if not value]
+    if missing or key_id is None or secret is None:
+        raise MissingCredentialsError(f'Alpaca credentials are not configured: {", ".join(missing)} unset')
+    try:
+        check_credential_shape(Credential(key_id=key_id, secret=secret))
+    except CredentialShapeError:
+        raise MalformedCredentialsError(ALPACA_CREDENTIAL_VARS) from None
+    return key_id, secret
+
+
 def get_client() -> StockHistoricalDataClient:
     """Get this process's Alpaca client, building it on first use.
 
@@ -185,22 +222,7 @@ def get_client() -> StockHistoricalDataClient:
     """
     global __CLIENT
     if __CLIENT is None:
-        key_id, secret = (get_env_var(name) for name in ALPACA_CREDENTIAL_VARS)
-        # Registered as the plain strings, straight after the read and BEFORE the missing check, the shape check and the
-        # wrap, so a value that reaches a log line is already scrubbed even when the other variable is unset or empty
-        # (tj-7zjov1.76). Guarded exactly as StaticCredentialProvider.from_env is. Registering an OpaqueStr would
-        # register only the marker word.
-        if key_id:
-            register_secret(key_id)
-        if secret:
-            register_secret(secret)
-        missing = [name for name, value in zip(ALPACA_CREDENTIAL_VARS, (key_id, secret), strict=True) if not value]
-        if missing or key_id is None or secret is None:
-            raise MissingCredentialsError(f'Alpaca credentials are not configured: {", ".join(missing)} unset')
-        try:
-            check_credential_shape(Credential(key_id=key_id, secret=secret))
-        except CredentialShapeError:
-            raise MalformedCredentialsError(ALPACA_CREDENTIAL_VARS) from None
+        key_id, secret = _checked_credentials()
         # Wrapped AFTER the check, from the same two checked values (never a second read), so any later rendering of
         # the client's stored key shows the marker. Header mode only: never pass use_basic_auth, which formats the
         # key into a string and would send the marker. No reveal() here: the header carries the object and requests
@@ -221,6 +243,41 @@ def set_client(client: StockHistoricalDataClient | None) -> None:
     """
     global __CLIENT
     __CLIENT = client
+
+
+def get_trading_client() -> TradingClient:
+    """Get this process's Alpaca trading-API client, building it on first use.
+
+    The trading API serves the asset reads. It is a different host from the market data API, and the host is
+    CONFIGURATION (ALPACA_TRADING_BASE_URL), never a default: a paper key and a live key are not interchangeable
+    and nothing here may guess which one this deployment holds. Built lazily like get_client, from the same checked
+    credentials, wrapped the same way.
+
+    Returns:
+        TradingClient: Shared client for every trading-API call this process makes.
+
+    Raises:
+        MissingCredentialsError: If either credential variable, or the trading host, is unset or empty.
+        MalformedCredentialsError: If either credential value is not non-empty visible ASCII.
+    """
+    global __TRADING_CLIENT
+    if __TRADING_CLIENT is None:
+        key_id, secret = _checked_credentials()
+        host = get_env_var(ALPACA_TRADING_HOST_VAR)
+        if not host:
+            raise MissingCredentialsError(f'Alpaca trading host is not configured: {ALPACA_TRADING_HOST_VAR} unset')
+        __TRADING_CLIENT = TradingClient(OpaqueStr(key_id), OpaqueStr(secret), url_override=host.rstrip('/'))
+    return __TRADING_CLIENT
+
+
+def set_trading_client(client: TradingClient | None) -> None:
+    """Install a trading client for this process, or clear the one already built. The injection seam.
+
+    Args:
+        client (TradingClient | None): Client to use, or None to clear.
+    """
+    global __TRADING_CLIENT
+    __TRADING_CLIENT = client
 
 
 def create_stock_quote(data: Quote, symbol: str, granularity: Granularity, source: DataSource) -> None:
@@ -296,6 +353,102 @@ def request_page(client: StockHistoricalDataClient, path: str, params: dict) -> 
     if not isinstance(body, dict):
         raise ValueError(f'The vendor answered a page that is not a JSON object: HTTP {response.status_code}')
     return Page(body=body, headers=response.headers)
+
+
+@dataclass(frozen=True)
+class RawPage:
+    """One good answer of a vendor read, undecoded.
+
+    Attributes:
+        content (bytes): The response body exactly as served.
+        headers (Mapping[str, str]): The response headers.
+    """
+
+    content: bytes
+    headers: Mapping[str, str]
+
+
+def request_raw(client: TradingClient, path: str, params: dict | None = None) -> RawPage:
+    """Make exactly one HTTP GET to the trading API, with no retry and no sleep, and keep the body as served.
+
+    The sibling of request_page for a body that is not a JSON object (the asset list is an array) and that the
+    caller slices byte for byte. Same URL construction, same headers (the client's own, from the checked credential),
+    same allow_redirects=False, same APIError for an error status. Blocking; run it on the worker pool.
+
+    Args:
+        client (TradingClient): The client whose session, base URL and auth headers are used.
+        path (str): The endpoint path, such as ASSETS_PATH.
+        params (dict | None): The query parameters.
+
+    Returns:
+        RawPage: The body bytes and the response headers.
+
+    Raises:
+        alpaca.common.exceptions.APIError: If the vendor answers an error status. Its response carries the headers.
+        requests.exceptions.RequestException: As the HTTP session raises it, unwrapped.
+    """
+    url = client._base_url + '/' + client._api_version + path
+    response = client._session.request(
+        'GET', url, headers=client._get_default_headers(), allow_redirects=False, params=params
+    )
+    try:
+        response.raise_for_status()
+    except HTTPError as http_error:
+        raise APIError(response.text, http_error) from http_error
+    return RawPage(content=response.content, headers=response.headers)
+
+
+async def read_trading(
+    executor: ThreadPoolExecutor,
+    client: TradingClient,
+    path: str,
+    params: dict | None,
+    *,
+    scheduler: Scheduler,
+    scope: str,
+    priority: RequestPriority,
+    deadline: datetime | None,
+    tally: CallTally | None = None,
+) -> RawPage:
+    """Make one paced trading-API read: one scheduler token on the trading scope, one HTTP request.
+
+    Never retries (the executor retries the whole attempt) and never charges the data scope. The reset the response
+    names, good or bad, is remembered for the trading scope.
+
+    Args:
+        executor (ThreadPoolExecutor): Pool the blocking request runs on.
+        client (TradingClient): The checked trading client.
+        path (str): The endpoint path.
+        params (dict | None): The query parameters.
+        scheduler (Scheduler): The handle's scheduler.
+        scope (str): The trading-API quota scope.
+        priority (RequestPriority): The priority class of the acquire.
+        deadline (datetime | None): When the caller stops waiting, or None.
+        tally (CallTally | None): Counts the call, a good page and a 429, or None when nobody reads them.
+
+    Returns:
+        RawPage: The answer.
+
+    Raises:
+        ExogenousError: With the reason RATE_BUDGET, when the acquire cannot be admitted before the deadline.
+        alpaca.common.exceptions.APIError: If the vendor answers an error status.
+        requests.exceptions.RequestException: If the vendor cannot be reached or the connection is cut.
+    """
+    await scheduler.acquire(scope, priority, deadline=deadline)
+    if tally is not None:
+        tally.record(datetime.now(UTC))
+    loop = asyncio.get_running_loop()
+    try:
+        page = await loop.run_in_executor(executor, request_raw, client, path, params)
+    except APIError as error:
+        _remember_reset(scope, getattr(getattr(error, 'response', None), 'headers', None))
+        if error.status_code == HTTPStatus.TOO_MANY_REQUESTS and tally is not None:
+            tally.record_throttled()
+        raise
+    _remember_reset(scope, page.headers)
+    if tally is not None:
+        tally.record_page()
+    return page
 
 
 async def read_bars_pages(

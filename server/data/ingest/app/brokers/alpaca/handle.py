@@ -23,22 +23,32 @@ import math
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 
+from common.enums.data_select import AssetType
 from common.enums.data_stock import DataSource
 from common.environment import get_env_var
+from common.errors.vocabulary import InvalidRequestError, Reason
 from data.ingest.app.brokers.alpaca import broker_api
+from data.ingest.app.brokers.alpaca.asset_attempt import AssetListAttemptRunner, AssetListWork
 from data.ingest.app.brokers.alpaca.read import AlpacaRead
 from data.ingest.app.brokers.bars_attempt import BarsAttemptRunner, BarsWork
 from data.ingest.app.brokers.handle import BrokerHandle
+from data.ingest.app.brokers.rate_budget import RequestPriority
 from data.ingest.app.scheduler.credentials import Credential, StaticCredentialProvider
-from data.ingest.app.scheduler.executor import AckGatedExecutor, ExecutorSettings
+from data.ingest.app.scheduler.executor import AckGatedExecutor, AttemptResult, AttemptRunner, ExecutorSettings
 from data.ingest.app.scheduler.limits import Limit
 from data.ingest.app.scheduler.queue import ScheduledRequest
 from data.ingest.app.scheduler.retry import RetryPolicy
 from data.ingest.app.scheduler.scheduler import SchedulerBuilder
+from schemas.data_ingest.submit import RequestKind, SubmitAccepted, SubmitAck, SubmitRequest
 
 
 # The quota scope of Alpaca's market-data API. Starts with the DataSource value; see the module docstring.
 ALPACA_DATA_SCOPE = f'{DataSource.ALPACA_API.value}_DATA'
+
+# The quota scope of Alpaca's trading API, which serves the asset reads. Its own scope: the trading host keeps its own
+# rate limit (it answered x-ratelimit-limit 200, P27a s1), so an asset read never spends from the data API's scope and
+# a bars attempt's vendor_stats never counts one.
+ALPACA_TRADING_SCOPE = f'{DataSource.ALPACA_API.value}_TRADING'
 
 # Alpaca's documented basic-plan ceiling, in calls per minute (owner ruling Q1, tj-26jt9w).
 ALPACA_CALLS_PER_MINUTE_CEILING = 200
@@ -64,6 +74,22 @@ class _EnvCredentials:
             SchedulerConfigError: If either variable is unset or empty. The message names the variables only.
         """
         return StaticCredentialProvider.from_env(*broker_api.ALPACA_CREDENTIAL_VARS).credentials()
+
+
+def estimate_request_calls(request: ScheduledRequest, page_size: int) -> int:
+    """Estimate the vendor calls any request of this handle costs: one for an asset list, else its bars pages.
+
+    Args:
+        request (ScheduledRequest): A request whose payload is BarsWork or AssetListWork.
+        page_size (int): Rows per vendor page.
+
+    Returns:
+        int: At least 1.
+    """
+    if isinstance(request.payload, AssetListWork):
+        # The whole list is one HTTP request, no pagination (P27a s1).
+        return 1
+    return estimate_bars_calls(request, page_size)
 
 
 def estimate_bars_calls(request: ScheduledRequest, page_size: int) -> int:
@@ -99,11 +125,35 @@ def executor_settings_from_env() -> ExecutorSettings:
     )
 
 
+class _KindRunner:
+    """The handle's AttemptRunner: hands each request to the runner of its kind, by its payload."""
+
+    def __init__(self, bars: AttemptRunner, assets: AttemptRunner) -> None:
+        self.__bars = bars
+        self.__assets = assets
+
+    async def __call__(self, request: ScheduledRequest, attempt_no: int) -> AttemptResult:
+        """Run one attempt with the runner of the request's kind.
+
+        Args:
+            request (ScheduledRequest): A request whose payload is BarsWork or AssetListWork.
+            attempt_no (int): The attempt's number.
+
+        Returns:
+            AttemptResult: What that runner reports.
+        """
+        runner = self.__assets if isinstance(request.payload, AssetListWork) else self.__bars
+        return await runner(request, attempt_no)
+
+
 class AlpacaHandle(BrokerHandle):
     """The handle for DataSource.ALPACA_API: its scheduler, its reader and its executor."""
 
     def __init__(self, settings: ExecutorSettings | None = None, calls_per_minute: int | None = None) -> None:
         """Build the handle. Nothing runs and nothing reads a credential until start().
+
+        Two quota scopes: the market-data API's and the trading API's, which serves the asset reads. Both take the
+        same lowering (ALPACA_RATE_LIMIT_PER_MINUTE) under the same 200 ceiling, and neither spends from the other.
 
         Args:
             settings (ExecutorSettings | None): The executor's settings, or those the environment sets.
@@ -115,20 +165,24 @@ class AlpacaHandle(BrokerHandle):
         if calls_per_minute is None:
             calls_per_minute = get_env_var('ALPACA_RATE_LIMIT_PER_MINUTE', ALPACA_CALLS_PER_MINUTE_CEILING, int)
         minute = timedelta(minutes=1)
+        # Before super().__init__: the executor's on_finished is this handle's bound method.
+        self.__asset_active: set[str] = set()
         scheduler = (
             SchedulerBuilder()
             .declare_scope(ALPACA_DATA_SCOPE, [Limit(minute, ALPACA_CALLS_PER_MINUTE_CEILING)])
             .set_limit(minute, calls_per_minute, scope=ALPACA_DATA_SCOPE)
-            .cost_function(estimate_bars_calls, page_size=ALPACA_BARS_PAGE_SIZE)
+            .declare_scope(ALPACA_TRADING_SCOPE, [Limit(minute, ALPACA_CALLS_PER_MINUTE_CEILING)])
+            .set_limit(minute, calls_per_minute, scope=ALPACA_TRADING_SCOPE)
+            .cost_function(estimate_request_calls, page_size=ALPACA_BARS_PAGE_SIZE)
             .credential_provider(_EnvCredentials())
             .on_expired(self.report_expired)
             .build()
         )
-        reader = AlpacaRead(scheduler=scheduler, scope=ALPACA_DATA_SCOPE)
+        reader = AlpacaRead(scheduler=scheduler, scope=ALPACA_DATA_SCOPE, trading_scope=ALPACA_TRADING_SCOPE)
         executor = AckGatedExecutor(
             name=ALPACA_DATA_SCOPE,
             scheduler=scheduler,
-            run_attempt=BarsAttemptRunner(reader),
+            run_attempt=_KindRunner(BarsAttemptRunner(reader), AssetListAttemptRunner(reader)),
             settings=settings if settings is not None else executor_settings_from_env(),
             on_finished=self.finished,
         )
@@ -140,3 +194,64 @@ class AlpacaHandle(BrokerHandle):
             reader=reader,
             resolve_feed=broker_api.resolve_feed,
         )
+
+    @property
+    def active(self) -> int:
+        """int: Requests held that have not finished, of every kind."""
+        return super().active + len(self.__asset_active)
+
+    async def submit(self, request: SubmitRequest) -> SubmitAck:
+        """Hold one request and answer at once: an asset list here, anything else as BrokerHandle does.
+
+        An asset-list request is queued on the TRADING scope with no tape: SubmitAccepted.feed is None and the
+        ScheduledRequest.feed stays None, so an EXPIRED or EXHAUSTED report of it is FEED_UNSPECIFIED. Idempotent on
+        request_id, and a restart's recovered re-submit is charged its one-call estimate before it is queued, as
+        a bars request is. A request that arrives with its attempt budget spent is reported EXHAUSTED and never queued.
+
+        Args:
+            request (SubmitRequest): A request of any kind this handle serves.
+
+        Returns:
+            SubmitAck: Accepted with the quota scope charged.
+
+        Raises:
+            InvalidRequestError: UNSUPPORTED_ASSET_TYPE for an asset list of a kind other than stock, and for any other
+                kind as BrokerHandle.submit raises it.
+        """
+        if request.kind is not RequestKind.ASSET_LIST or request.asset_list is None:
+            return await super().submit(request)
+        listing = request.asset_list
+        if listing.asset_type is not AssetType.STOCK:
+            raise InvalidRequestError(
+                Reason.UNSUPPORTED_ASSET_TYPE, f'Alpaca lists stocks only: asset_type={listing.asset_type!r}'
+            )
+        accepted = SubmitAck(accepted=SubmitAccepted(feed=None, quota_key=ALPACA_TRADING_SCOPE))
+        if request.request_id in self.__asset_active:
+            return accepted
+        scheduled = ScheduledRequest(
+            request_id=request.request_id,
+            quota_scope=ALPACA_TRADING_SCOPE,
+            payload=AssetListWork(request=listing, priority=RequestPriority.BACKFILL),
+            ready_by=request.ready_by,
+            client_label=request.client,
+            attempt_count=request.attempt_count,
+        )
+        self.__asset_active.add(request.request_id)
+        if self.executor.settings.retry.is_last(request.attempt_count):
+            if request.recovered:
+                self.scheduler.charge_restart(scheduled)
+            self.executor.report_exhausted(scheduled)
+            return accepted
+        if request.recovered:
+            self.scheduler.charge_restart(scheduled)
+        await self.scheduler.submit(scheduled)
+        return accepted
+
+    def finished(self, request: ScheduledRequest) -> None:
+        """Forget a request that will not run again, of either kind, so the store can submit its id afresh.
+
+        Args:
+            request (ScheduledRequest): The request the executor is done with.
+        """
+        self.__asset_active.discard(request.request_id)
+        super().finished(request)

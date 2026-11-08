@@ -21,6 +21,7 @@ Broker-facing layer only; data-store owns the data. Blocking SDK calls go throug
 | ALPACA_API_KEY / ALPACA_API_SECRET | broker credentials | unset |
 | APP_INTERNAL_GRPC_HOST / APP_INTERNAL_GRPC_PORT | where the gRPC server binds; startup fails if either is unset | unset, by design (compose sets them) |
 | DATA_STORE_GRPC_TARGET | host:port of the store's gRPC server, where attempt reports go; the production app's startup fails if it is unset | unset, by design (compose sets it) |
+| ALPACA_TRADING_BASE_URL | host of the Alpaca trading API, read by the asset list and asset-by-symbol reads; paper is `https://paper-api.alpaca.markets`. The key must match the host (paper key with the paper host, live key with the live host). Unset, the asset reads fail closed with a VENDOR_AUTH failure. A host selector, not an enable flag | unset, by design (commented in `.env.default`) |
 | ALPACA_RATE_LIMIT_PER_MINUTE | Alpaca calls per minute; may only lower the hard-coded ceiling of 200. Replaces the retired ALPACA_RATE_LIMIT_PER_SEC, ALPACA_RATE_BURST and ALPACA_BACKFILL_RESERVE, which nothing reads now | 200 |
 | ALPACA_OUTGOING_BUFFER_SIZE | unacknowledged attempt reports the Alpaca handle holds before it stops taking work from its queue | 64 |
 | ALPACA_STALL_TIMEOUT_S | seconds the oldest unacknowledged report may wait before the stall alarm (ERROR log, `stalled`) | 300 |

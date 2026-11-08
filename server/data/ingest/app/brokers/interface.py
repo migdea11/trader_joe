@@ -26,6 +26,7 @@ from common.enums.data_select import AssetType
 from common.enums.data_stock import Feed, Granularity
 from common.errors.vocabulary import InvalidRequestError, Reason, TraderJoeError
 from data.ingest.app.brokers.rate_budget import RequestPriority
+from schemas.data_ingest.submit import AssetListStatus
 
 
 # The reasons a broker can give for not serving what was asked of it (TE-4).
@@ -245,8 +246,164 @@ class BarsFailure:
     error: TraderJoeError
 
 
+@dataclass(frozen=True)
+class AssetListQuery:
+    """One request for a broker's asset list, one list per request.
+
+    Attributes:
+        asset_type (AssetType): What kind of instrument to list. A broker that lists only some kinds refuses the rest.
+        status (AssetListStatus): Which list: the active one or the inactive one. Never both, never "all".
+        priority (RequestPriority): The platform's priority class for the vendor call.
+        deadline (datetime | None): When the caller stops waiting, timezone aware, or None for no bound. A rate
+            budget that cannot admit the call before it fails fast (RATE_BUDGET) instead of sleeping past it.
+        tally (CallTally | None): Counts the vendor calls this query makes, for the attempt's report.
+    """
+
+    asset_type: AssetType
+    status: AssetListStatus
+    priority: RequestPriority = field(kw_only=True)
+    deadline: datetime | None = field(default=None, kw_only=True)
+    tally: CallTally | None = field(default=None, kw_only=True)
+
+
+@dataclass(frozen=True)
+class AssetLookupQuery:
+    """One request for the broker's record of one symbol.
+
+    The lookup is by SYMBOL only. The broker's own asset id is data a lookup returns and never an argument.
+
+    Attributes:
+        symbol (str): The ticker to look up, as the caller holds it.
+        priority (RequestPriority): The platform's priority class for the vendor call.
+        deadline (datetime | None): When the caller stops waiting, timezone aware, or None for no bound.
+    """
+
+    symbol: str
+    priority: RequestPriority = field(kw_only=True)
+    deadline: datetime | None = field(default=None, kw_only=True)
+
+
+@dataclass(frozen=True)
+class Asset:
+    """One broker asset, carried RAW: a few neutral fields beside the broker's own record, untouched.
+
+    Nothing here is a judgement. active and tradable are None when the broker said nothing, which is never
+    read as inactive or untradable; the store judges what an asset is worth.
+
+    Attributes:
+        vendor_asset_id (str): The broker's id for the asset, OPAQUE: nothing parses or compares it.
+        symbol (str): The ticker the broker lists it under now.
+        raw_payload (bytes): The broker's record as served, byte for byte.
+        active (bool | None): Whether the broker's status says active, or None when it gave no status.
+        tradable (bool | None): The broker's tradable flag, or None when it gave none.
+        exchange (str): The broker's venue wording as given, empty when it gave none.
+        name (str): The broker's name for the asset as given, empty when it gave none.
+    """
+
+    vendor_asset_id: str
+    symbol: str
+    raw_payload: bytes
+    active: bool | None = None
+    tradable: bool | None = None
+    exchange: str = ''
+    name: str = ''
+
+
+@dataclass(frozen=True)
+class AssetListResponse:
+    """The SERVED outcome of an asset list: every asset the broker listed, which may be none.
+
+    Attributes:
+        assets (Sequence[Asset]): The assets in the order the broker served them.
+        as_of (datetime): When the broker answered, timezone aware, UTC.
+    """
+
+    assets: Sequence[Asset]
+    as_of: datetime
+
+
+@dataclass(frozen=True)
+class AssetListFailure:
+    """A failure get_assets RETURNS rather than raises.
+
+    Attributes:
+        error (TraderJoeError): The typed error; the caught vendor exception, where there is one, is its __cause__.
+    """
+
+    error: TraderJoeError
+
+
+@dataclass(frozen=True)
+class AssetResponse:
+    """The SERVED outcome of a lookup: the broker's record for the symbol.
+
+    Attributes:
+        asset (Asset): The record. Its symbol is the broker's own and may differ from the one asked for.
+        as_of (datetime): When the broker answered, timezone aware, UTC.
+    """
+
+    asset: Asset
+    as_of: datetime
+
+
+@dataclass(frozen=True)
+class AssetNotFound:
+    """The broker answered that it has no asset for the symbol. An outcome, not a failure.
+
+    A caller that holds a vendor id for the symbol reads this as the id having gone, not as an error.
+
+    Attributes:
+        symbol (str): The symbol that was asked for.
+        as_of (datetime): When the broker answered, timezone aware, UTC.
+    """
+
+    symbol: str
+    as_of: datetime
+
+
+@dataclass(frozen=True)
+class AssetLookupFailure:
+    """A failure get_asset RETURNS rather than raises: anything but an answer, found or not found.
+
+    Attributes:
+        error (TraderJoeError): The typed error, with reset_at where a rate limit names one.
+    """
+
+    error: TraderJoeError
+
+
 class BrokerRead(Protocol):
     """What data_ingest reads from a broker."""
+
+    async def get_assets(self, query: AssetListQuery) -> AssetListResponse | AssetListFailure:
+        """Fetch one of the broker's asset lists, whole.
+
+        Returns an AssetListFailure, and never raises, for a failure that is expected: a kind of asset the broker
+        does not list (BrokerUnsupportedError), a missing credential or configuration, a rate budget that cannot admit
+        the call before query.deadline, and a vendor that refuses or cannot answer. A bug still raises.
+
+        Args:
+            query (AssetListQuery): Which list to fetch.
+
+        Returns:
+            AssetListResponse | AssetListFailure: Every asset of the list, or the typed failure.
+        """
+        ...
+
+    async def get_asset(self, query: AssetLookupQuery) -> AssetResponse | AssetNotFound | AssetLookupFailure:
+        """Look up the broker's record for one symbol.
+
+        The broker saying it has no such asset is AssetNotFound, an answer. Every other expected failure is an
+        AssetLookupFailure: a rate limit carries its reset_at. This paces on the broker's asset-API scope and is
+        not counted in any bars attempt's spend.
+
+        Args:
+            query (AssetLookupQuery): The symbol to look up.
+
+        Returns:
+            AssetResponse | AssetNotFound | AssetLookupFailure: The record, the not-found answer, or the failure.
+        """
+        ...
 
     async def get_bars(self, query: BarsQuery) -> BarsResponse | BarsFailure:
         """Fetch historical bars for one instrument.

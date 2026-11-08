@@ -32,6 +32,7 @@ from data.ingest.app.brokers.alpaca.handle import (
     ALPACA_BARS_PAGE_SIZE,
     ALPACA_CALLS_PER_MINUTE_CEILING,
     ALPACA_DATA_SCOPE,
+    ALPACA_TRADING_SCOPE,
     AlpacaHandle,
     estimate_bars_calls,
     executor_settings_from_env,
@@ -52,7 +53,16 @@ from data.ingest.app.scheduler import (
     SchedulerConfigError,
     StaticCredentialProvider,
 )
-from data.ingest.tests.alpaca_recorded import StubVendor, bars_answer, status_answer, stub_vendor, wire_bar
+from data.ingest.tests.alpaca_recorded import (
+    ASSETS_PATH,
+    StubVendor,
+    asset_answer,
+    bars_answer,
+    status_answer,
+    stub_trading_vendor,
+    stub_vendor,
+    wire_bar,
+)
 from data.ingest.tests.feed_rule import assert_a_bars_report_names_the_tape, assert_a_no_tape_report_is_unspecified
 from data.ingest.tests.scheduler_doubles import RecordingScheduler, alpaca_reader
 from routers.data_ingest.submit_handler import IngestSubmitHandler
@@ -949,10 +959,12 @@ def iex_deployment_and_no_cached_client(monkeypatch):
     monkeypatch.delenv('ALPACA_SIP_ENABLED', raising=False)
     monkeypatch.delenv('ALPACA_RATE_LIMIT_PER_MINUTE', raising=False)
     broker_api.set_client(None)
+    broker_api.set_trading_client(None)
     # The reader remembers the last rate-limit reset per scope (tj-7zjov1.56); no case may inherit another's.
     broker_api.forget_resets()
     yield
     broker_api.set_client(None)
+    broker_api.set_trading_client(None)
     broker_api.forget_resets()
 
 
@@ -1064,6 +1076,11 @@ NON_BARS = [
     ),
 ]
 
+# What the Alpaca HANDLE itself still refuses. P12 (tj-7zjov1.22) taught AlpacaHandle.submit the asset list, so
+# only corporate actions are left (P13). The Submit HANDLER above still refuses both until P12s and P13s open it;
+# the handle's acceptance of an asset list is pinned in test_alpaca_asset_handle.py.
+NOT_SERVED_BY_THE_HANDLE = [param for param in NON_BARS if param.id == 'corporate-actions']
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('kind', NON_BARS)
@@ -1079,7 +1096,7 @@ async def test_the_submit_handler_refuses_a_kind_not_served_yet_as_invalid_reque
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('kind', NON_BARS)
+@pytest.mark.parametrize('kind', NOT_SERVED_BY_THE_HANDLE)
 async def test_the_handle_itself_refuses_a_kind_not_served_yet(kind):
     handle = alpaca_handle()
 
@@ -1139,6 +1156,10 @@ async def test_a_source_with_no_handle_is_not_implemented():
 # APIError. The reader now owns the bars page loop and sends each request through the client's HTTP session
 # (broker_api.request_page), so the vendor is the REAL alpaca-py client over a scripted transport: one answer per
 # HTTP request, a status as the HTTP answer it is. "No vendor call" is "nothing reached the transport".
+
+
+# The trading API's id for VFV in these tests: invented, opaque, not a recording.
+VFV_ID = 'a1f0c2d4-0000-4000-8000-00000000vfv0'
 
 
 def stub_client(*timestamps: datetime, pages: int = 1) -> StubVendor:
@@ -1418,8 +1439,14 @@ def bars_scheduled(**overrides) -> ScheduledRequest:
 @pytest.mark.asyncio
 async def test_a_served_attempt_reports_its_vendor_call_count_and_times():
     pacing = RecordingScheduler()
+    trading = stub_trading_vendor(asset_answer('VFV', VFV_ID))
     runner = BarsAttemptRunner(
-        alpaca_reader(stub_client(START, START + timedelta(minutes=30)).client, scheduler=pacing)
+        alpaca_reader(
+            stub_client(START, START + timedelta(minutes=30)).client,
+            scheduler=pacing,
+            trading_client=trading.client,
+            trading_scope=ALPACA_TRADING_SCOPE,
+        )
     )
 
     before = datetime.now(UTC)
@@ -1428,9 +1455,12 @@ async def test_a_served_attempt_reports_its_vendor_call_count_and_times():
 
     stats = result.trailer.vendor_stats
     assert result.trailer.outcome is DeliveryOutcome.SUCCEEDED
+    # The asset lookup after the bars (tj-7zjov1.128) is paced on the trading scope and counted nowhere.
     assert (stats.calls, stats.pages, stats.throttled_429, stats.retries) == (1, 1, 0, 0)
     assert before <= stats.first_call_at == stats.last_call_at <= after
-    assert len(pacing.acquires) == 1
+    assert [acquire.scope for acquire in pacing.acquires] == [ALPACA_DATA_SCOPE, ALPACA_TRADING_SCOPE]
+    assert [sent.path for sent in trading.sent] == [f'{ASSETS_PATH}/VFV']
+    assert result.vendor_asset_id == VFV_ID
     assert result.quota_key == ALPACA_DATA_SCOPE
     assert result.feed is Feed.IEX
     [page] = result.parts
@@ -1498,6 +1528,8 @@ def test_the_error_class_is_read_from_the_reasons_outcome():
 @pytest.mark.asyncio
 async def test_the_alpaca_handle_attempts_a_submitted_request_and_reports_it_to_the_store():
     broker_api.set_client(stub_client(START).client)
+    trading = stub_trading_vendor(asset_answer('VFV', VFV_ID))
+    broker_api.set_trading_client(trading.client)
     handle = alpaca_handle()
     store = DoubleStore()
     handle.start(store, INSTANCE)
@@ -1515,5 +1547,8 @@ async def test_the_alpaca_handle_attempts_a_submitted_request_and_reports_it_to_
     assert attempt.header.feed is Feed.IEX
     assert attempt.trailer.outcome is DeliveryOutcome.SUCCEEDED
     assert attempt.trailer.vendor_stats.calls == 1
+    # The asset looked up after the bars names the header's vendor id (tj-7zjov1.128).
+    assert attempt.header.vendor_asset_id == VFV_ID
+    assert [sent.path for sent in trading.sent] == [f'{ASSETS_PATH}/VFV']
     # FINAL finishes the request, so the handle forgets it and the id may be submitted afresh.
     assert handle.active == 0

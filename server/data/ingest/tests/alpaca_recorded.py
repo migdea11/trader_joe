@@ -7,7 +7,8 @@ can import it without importing a test module.
 
 The transport is a requests adapter mounted on the client's own session for BOTH http:// and
 https://, so every URL the SDK can build reaches it and nothing reaches a socket. It fails the test
--- rather than answering -- on any host other than Alpaca's data host, on a page token no fixture
+-- rather than answering -- on any host other than the one it serves (Alpaca's data host, or the invented
+trading host of stub_trading_vendor for the asset reads, tj-7zjov1.22), on a page token no fixture
 knows, and past a request cap, so a paging loop that never ends turns red instead of hanging.
 
 Fixture files live in fixtures/alpaca/ as JSON: {"provenance": {...}, "status": <int>, "body": ...}.
@@ -44,6 +45,7 @@ from urllib.parse import parse_qs, urlsplit
 import requests
 from alpaca.common import rest as alpaca_rest
 from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.trading.client import TradingClient
 from requests.adapters import BaseAdapter
 from requests.structures import CaseInsensitiveDict
 
@@ -227,10 +229,13 @@ class RecordedTransport(BaseAdapter):
         request_cap (int): Requests allowed before the transport fails the test.
     """
 
-    def __init__(self, responder: Responder, request_cap: int = DEFAULT_REQUEST_CAP) -> None:
+    def __init__(
+        self, responder: Responder, request_cap: int = DEFAULT_REQUEST_CAP, host: str = ALPACA_DATA_HOST
+    ) -> None:
         super().__init__()
         self.responder = responder
         self.request_cap = request_cap
+        self.host = host
         self.sent: list[SentRequest] = []
 
     def send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
@@ -238,14 +243,15 @@ class RecordedTransport(BaseAdapter):
         self.sent.append(sent)
         if len(self.sent) > self.request_cap:
             raise AssertionError(f'more than {self.request_cap} requests reached the transport; is the client looping?')
-        if sent.host != ALPACA_DATA_HOST:
+        if sent.host != self.host:
             raise AssertionError(f'request left the recorded vendor host: {sent.url}')
         recorded = self.responder(sent)
 
         response = requests.Response()
         response.status_code = recorded.status
         response.reason = HTTPStatus(recorded.status).phrase
-        response._content = json.dumps(recorded.body).encode()
+        # A bytes body is served exactly as given (the asset reads slice it byte for byte); anything else as JSON.
+        response._content = recorded.body if isinstance(recorded.body, bytes) else json.dumps(recorded.body).encode()
         response.headers = CaseInsensitiveDict({'Content-Type': 'application/json', **recorded.headers})
         response.encoding = 'utf-8'
         response.url = request.url
@@ -397,6 +403,67 @@ def stub_vendor(*answers: Answer, request_cap: int = DEFAULT_REQUEST_CAP) -> Stu
     """A real client answering each request in turn with `answers` (see scripted)."""
     client, transport = recorded_client(scripted(*answers), request_cap)
     return StubVendor(client, transport)
+
+
+# The trading host the asset-read tests configure. Invented and unresolvable on purpose: the real host is
+# deployment configuration (ALPACA_TRADING_BASE_URL), never a default, and nothing here may reach a network.
+ALPACA_TRADING_TEST_HOST = 'trading.alpaca.test.invalid'
+ALPACA_TRADING_TEST_URL = f'https://{ALPACA_TRADING_TEST_HOST}'
+# The path alpaca-py 0.44.0's TradingClient prefixes (api_version v2) to the asset endpoint.
+ASSETS_PATH = '/v2/assets'
+
+
+@dataclass
+class StubTradingVendor:
+    """A real alpaca-py TradingClient over a scripted RecordedTransport, and what reached it.
+
+    Attributes:
+        client (TradingClient): The client to inject.
+        transport (RecordedTransport): Its transport.
+    """
+
+    client: TradingClient
+    transport: RecordedTransport
+
+    @property
+    def sent(self) -> list[SentRequest]:
+        """Every HTTP request that reached the vendor, in order."""
+        return self.transport.sent
+
+
+def stub_trading_vendor(*answers: Answer, request_cap: int = DEFAULT_REQUEST_CAP) -> StubTradingVendor:
+    """A real TradingClient on ALPACA_TRADING_TEST_URL, answering each request in turn with `answers` (see scripted).
+
+    Built exactly as broker_api.get_trading_client builds one (url_override, header auth), with the placeholder pair.
+    """
+    client = TradingClient(PLACEHOLDER_KEY_ID, PLACEHOLDER_SECRET, url_override=ALPACA_TRADING_TEST_URL)
+    transport = RecordedTransport(scripted(*answers), request_cap, host=ALPACA_TRADING_TEST_HOST)
+    session = client._session
+    session.mount('https://', transport)
+    session.mount('http://', transport)
+    if set(session.adapters) != {'https://', 'http://'} or any(a is not transport for a in session.adapters.values()):
+        raise AssertionError(f'a real adapter is still mounted: {dict(session.adapters)}')
+    return StubTradingVendor(client, transport)
+
+
+def raw_answer(body: bytes, status: int = 200, headers: Mapping[str, str] | None = None) -> RecordedResponse:
+    """A constructed answer whose body is served byte for byte, never re-encoded."""
+    return RecordedResponse(
+        name=f'constructed_raw_{status}',
+        status=status,
+        body=body,
+        provenance={'kind': 'constructed'},
+        headers=dict(headers or {}),
+    )
+
+
+def asset_answer(symbol: str, vendor_asset_id: str) -> RecordedResponse:
+    """A constructed 200 asset-by-symbol answer: one trading-API asset record, invented, not a recording."""
+    body = (
+        f'{{"id": "{vendor_asset_id}", "class": "us_equity", "exchange": "NASDAQ", "symbol": "{symbol}",'
+        f' "name": "Constructed {symbol}", "status": "active", "tradable": true}}'
+    )
+    return raw_answer(body.encode('utf-8'))
 
 
 def recorded_client(

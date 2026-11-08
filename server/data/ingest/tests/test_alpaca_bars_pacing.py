@@ -48,7 +48,7 @@ from common.enums.data_stock import DataSource, Feed, Granularity, UpdateType
 from common.errors.vocabulary import ExogenousError, Reason
 from data.ingest.app.brokers.alpaca import broker_api
 from data.ingest.app.brokers.alpaca.classify import RATE_LIMIT_RESET_HEADER, RETRY_AFTER_HEADER
-from data.ingest.app.brokers.alpaca.handle import ALPACA_DATA_SCOPE
+from data.ingest.app.brokers.alpaca.handle import ALPACA_DATA_SCOPE, ALPACA_TRADING_SCOPE
 from data.ingest.app.brokers.bars_attempt import BarsAttemptRunner, BarsWork
 from data.ingest.app.brokers.broker_errors import MalformedCredentialsError
 from data.ingest.app.brokers.interface import BarsFailure, BarsQuery, BarsResponse, CallTally, Instrument
@@ -61,11 +61,14 @@ from data.ingest.tests.alpaca_recorded import (
     PLACEHOLDER_KEY_ID,
     PLACEHOLDER_SECRET,
     RecordedResponse,
+    StubTradingVendor,
+    asset_answer,
     bars_answer,
     load,
     record_page_retry_sleeps,
     sdk_retry_is_never_entered,
     status_answer,
+    stub_trading_vendor,
     stub_vendor,
     with_headers,
 )
@@ -128,6 +131,29 @@ def scheduled(ready_by: datetime | None = None) -> ScheduledRequest:
     return ScheduledRequest(request_id='r1', quota_scope=ALPACA_DATA_SCOPE, payload=two_page_work(), ready_by=ready_by)
 
 
+def served_runner(
+    vendor_client, executor: ThreadPoolExecutor, pacing: RecordingScheduler
+) -> tuple[BarsAttemptRunner, StubTradingVendor]:
+    """A bars runner over a real AlpacaRead that can also look its asset up, as a SUCCEEDED attempt now does.
+
+    The lookup after the bars (tj-7zjov1.128) goes to its own trading stub, paced on the trading scope, so the
+    data scope's acquires and the attempt's vendor_stats still count the bars calls alone.
+    """
+    trading = stub_trading_vendor(asset_answer(SYMBOL, 'aapl-vendor-id'))
+    reader = alpaca_reader(
+        vendor_client, executor, scheduler=pacing, trading_client=trading.client, trading_scope=ALPACA_TRADING_SCOPE
+    )
+    return BarsAttemptRunner(reader), trading
+
+
+def data_acquires(pacing: RecordingScheduler) -> list[Acquire]:
+    return [acquire for acquire in pacing.acquires if acquire.scope == ALPACA_DATA_SCOPE]
+
+
+def trading_acquires(pacing: RecordingScheduler) -> list[Acquire]:
+    return [acquire for acquire in pacing.acquires if acquire.scope == ALPACA_TRADING_SCOPE]
+
+
 def failure_of(outcome: BarsResponse | BarsFailure):
     assert isinstance(outcome, BarsFailure), f'expected a BarsFailure, got {outcome!r}'
     return outcome.error
@@ -188,7 +214,7 @@ async def test_a_two_page_attempt_reports_calls_2_pages_2(executor, sdk_loop):
     """ACCEPTANCE: calls 2, pages 2, through the attempt runner's VendorCallStats."""
     vendor = stub_vendor(PAGE1, PAGE2)
     pacing = RecordingScheduler()
-    runner = BarsAttemptRunner(alpaca_reader(vendor.client, executor, scheduler=pacing))
+    runner, trading = served_runner(vendor.client, executor, pacing)
 
     before = datetime.now(UTC)
     result = await runner(scheduled(), 1)
@@ -198,7 +224,12 @@ async def test_a_two_page_attempt_reports_calls_2_pages_2(executor, sdk_loop):
     assert result.trailer.outcome is DeliveryOutcome.SUCCEEDED
     assert (stats.calls, stats.pages, stats.retries, stats.throttled_429) == (2, 2, 0, 0)
     assert before <= stats.first_call_at <= stats.last_call_at <= after
-    assert len(pacing.acquires) == 2
+    assert len(data_acquires(pacing)) == 2
+    # The one lookup after the bars, on the trading scope: last, and the only acquire that is not the data scope's.
+    assert len(trading_acquires(pacing)) == 1
+    assert pacing.acquires[-1].scope == ALPACA_TRADING_SCOPE
+    assert len(pacing.acquires) == 3
+    assert len(trading.sent) == 1
     assert sdk_loop == []
 
 
@@ -447,7 +478,7 @@ async def test_the_attempt_that_missed_its_deadline_on_page_two_delivers_nothing
 async def test_a_504_then_a_page_is_retried_with_an_acquire_each_and_counted(executor, sleeps, sdk_loop):
     vendor = stub_vendor(status_answer(504), status_answer(504), load('bars_1Day'))
     pacing = RecordingScheduler()
-    runner = BarsAttemptRunner(alpaca_reader(vendor.client, executor, scheduler=pacing))
+    runner, trading = served_runner(vendor.client, executor, pacing)
 
     result = await runner(scheduled(), 1)
 
@@ -455,7 +486,10 @@ async def test_a_504_then_a_page_is_retried_with_an_acquire_each_and_counted(exe
     stats = result.trailer.vendor_stats
     assert (stats.calls, stats.pages, stats.retries, stats.throttled_429) == (3, 1, 2, 0)
     assert len(vendor.sent) == 3
-    assert len(pacing.acquires) == 3
+    assert len(data_acquires(pacing)) == 3
+    # The lookup after the bars is one more acquire, on the trading scope, and one request to the trading stub.
+    assert [acquire.scope for acquire in pacing.acquires] == [ALPACA_DATA_SCOPE] * 3 + [ALPACA_TRADING_SCOPE]
+    assert len(trading.sent) == 1
     assert sleeps == [3.0, 3.0]
     assert sdk_loop == []
     # A retry asks for the same page again: no token, as the page that failed was the first.

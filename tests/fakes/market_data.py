@@ -66,18 +66,39 @@ followed by more), so at most one ever matches and the order they are tried in c
   clock plus RATELIMIT_RESET_SECONDS: deterministic under an injected clock.
 
 A true hang is not a scenario: nothing here blocks forever.
+
+THE ASSET READS (tj-7zjov1.22, BrokerRead.get_assets and get_asset). Deterministic too, and nothing is judged:
+
+* get_assets serves FAKE_LISTED_SYMBOLS for the ACTIVE list and FAKE_DELISTED_SYMBOLS for the INACTIVE one, each
+  record fake_asset(symbol), in that order. Stocks only: another asset_type is refused UNSUPPORTED_ASSET_TYPE
+  (BrokerUnsupportedError), because a record carries no asset class and would read as a stock listing.
+* get_asset serves fake_asset(symbol) for ANY non-empty symbol, so a fake-mode bars attempt that looks its symbol
+  up after the bars (P12h) always finds one. An empty symbol is INVALID_REQUEST, as AlpacaRead answers it. The
+  fake has no not-found symbol: a test that needs AssetNotFound uses a double of its own.
+* fake_asset is a pure function of the symbol: its vendor id is a UUID5 of it, so two reads agree.
 """
 
 import asyncio
 import hashlib
+import json
 import math
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
+from common.enums.data_select import AssetType
 from common.enums.data_stock import Feed, Granularity
 from common.errors.vocabulary import ExogenousError, InvalidRequestError, Reason
 from data.ingest.app.brokers.interface import (
+    Asset,
+    AssetListFailure,
+    AssetListQuery,
+    AssetListResponse,
+    AssetLookupFailure,
+    AssetLookupQuery,
+    AssetNotFound,
+    AssetResponse,
     Bar,
     BarsFailure,
     BarsQuery,
@@ -85,6 +106,7 @@ from data.ingest.app.brokers.interface import (
     BrokerUnsupportedError,
     ServedRange,
 )
+from schemas.data_ingest.submit import AssetListStatus
 
 
 # The deployment feed a FakeRead serves unless built with another: the entitlement every fake
@@ -119,6 +141,14 @@ FAIL_PREFIX = 'FAIL_'
 SLOW_PREFIX = 'SLOW_'
 FAILONCE_PREFIX = 'FAILONCE_'
 RATELIMIT_PREFIX = 'RATELIMIT_'
+
+# The fake's asset lists, by status. Small and fixed: the fake stands for the interface, not for a market.
+FAKE_LISTED_SYMBOLS = ('VFV', 'XEQT', 'AAPL')
+FAKE_DELISTED_SYMBOLS = ('GONE',)
+# The venue every fake asset names, as a vendor string carried, never judged.
+FAKE_EXCHANGE = 'FAKE'
+# Fixed, so a fake vendor id is the same in every process (uuid5 of the symbol in this namespace).
+FAKE_ASSET_NAMESPACE = uuid.UUID('6f1c1b8e-2b4f-4c55-9a1e-6b8f5b2d7a10')
 
 
 class Scenario(StrEnum):
@@ -266,6 +296,40 @@ def fake_bar(symbol: str, timestamp: datetime) -> Bar:
     )
 
 
+def fake_asset(symbol: str) -> Asset:
+    """The asset record FakeRead serves for a symbol: a pure function of it.
+
+    Active unless the symbol is one of FAKE_DELISTED_SYMBOLS; tradable exactly when active. The raw payload is
+    the record's own JSON, as a vendor would serve it.
+
+    Args:
+        symbol (str): The symbol, non-empty.
+
+    Returns:
+        Asset: The record.
+    """
+    active = symbol not in FAKE_DELISTED_SYMBOLS
+    vendor_asset_id = str(uuid.uuid5(FAKE_ASSET_NAMESPACE, symbol))
+    record = {
+        'id': vendor_asset_id,
+        'class': 'us_equity',
+        'exchange': FAKE_EXCHANGE,
+        'symbol': symbol,
+        'name': f'{symbol} fake listing',
+        'status': 'active' if active else 'inactive',
+        'tradable': active,
+    }
+    return Asset(
+        vendor_asset_id=vendor_asset_id,
+        symbol=symbol,
+        raw_payload=json.dumps(record).encode('utf-8'),
+        active=active,
+        tradable=active,
+        exchange=FAKE_EXCHANGE,
+        name=record['name'],
+    )
+
+
 class FakeRead:
     """A deterministic BrokerRead: bars from fake_bar(), behaviour chosen by the symbol's prefix.
 
@@ -355,6 +419,41 @@ class FakeRead:
             served_range=ServedRange(query.start, served_end),
             as_of=as_of,
         )
+
+    async def get_assets(self, query: AssetListQuery) -> AssetListResponse | AssetListFailure:
+        """Serve the fake asset list the query's status names.
+
+        Args:
+            query (AssetListQuery): Which list.
+
+        Returns:
+            AssetListResponse | AssetListFailure: FAKE_LISTED_SYMBOLS or FAKE_DELISTED_SYMBOLS as fake_asset
+                records, stamped with the fake's clock; or UNSUPPORTED_ASSET_TYPE for a kind that is not a stock.
+        """
+        if query.asset_type is not AssetType.STOCK:
+            return AssetListFailure(
+                BrokerUnsupportedError(
+                    Reason.UNSUPPORTED_ASSET_TYPE, f'The fake lists stocks only: asset_type={query.asset_type!r}'
+                )
+            )
+        symbols = FAKE_LISTED_SYMBOLS if query.status is AssetListStatus.ACTIVE else FAKE_DELISTED_SYMBOLS
+        return AssetListResponse(
+            assets=[fake_asset(symbol) for symbol in symbols], as_of=self.__clock().astimezone(UTC)
+        )
+
+    async def get_asset(self, query: AssetLookupQuery) -> AssetResponse | AssetNotFound | AssetLookupFailure:
+        """Serve the fake record of one symbol: every non-empty symbol has one.
+
+        Args:
+            query (AssetLookupQuery): The symbol.
+
+        Returns:
+            AssetResponse | AssetNotFound | AssetLookupFailure: fake_asset(symbol) stamped with the fake's clock,
+                or INVALID_REQUEST for an empty symbol. Never AssetNotFound.
+        """
+        if not query.symbol.strip():
+            return AssetLookupFailure(InvalidRequestError(Reason.INVALID_REQUEST, 'An asset lookup needs a symbol'))
+        return AssetResponse(asset=fake_asset(query.symbol), as_of=self.__clock().astimezone(UTC))
 
     def __refusal(self, query: BarsQuery) -> BrokerUnsupportedError | InvalidRequestError | None:
         """The refusal a query earns before any "vendor" work, or None to go on to the scenario."""

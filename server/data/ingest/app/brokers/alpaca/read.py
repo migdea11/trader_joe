@@ -1,27 +1,41 @@
 from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from http import HTTPStatus
+from urllib.parse import quote
 
+from alpaca.common.exceptions import APIError
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.models.bars import BarSet
+from alpaca.trading.client import TradingClient
 
 from common.enums.data_select import AssetType, DataType
 from common.errors.vocabulary import InvalidRequestError, Reason, TraderJoeError
 from common.logging import get_logger
 from common.worker_pool import SharedWorkerPool
 from data.ingest.app.brokers.alpaca import broker_api
+from data.ingest.app.brokers.alpaca.assets import parse_asset, parse_asset_list
 from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
 from data.ingest.app.brokers.alpaca.classify import VENDOR_FAILURES, classify_vendor_error
 from data.ingest.app.brokers.broker_errors import MalformedCredentialsError, MissingCredentialsError
 from data.ingest.app.brokers.interface import (
+    AssetListFailure,
+    AssetListQuery,
+    AssetListResponse,
+    AssetLookupFailure,
+    AssetLookupQuery,
+    AssetNotFound,
+    AssetResponse,
     Bar,
     BarsFailure,
     BarsQuery,
     BarsResponse,
     BrokerUnsupportedError,
+    CallTally,
     ServedRange,
 )
+from data.ingest.app.brokers.rate_budget import RequestPriority
 from data.ingest.app.scheduler import Scheduler
 
 
@@ -30,6 +44,9 @@ log = get_logger(__name__)
 # Alpaca serves one consolidated US line per symbol, quoted in dollars, and cannot select a
 # listing exchange.
 ALPACA_CURRENCY = 'USD'
+
+# Sent on every asset-list call: without it the vendor adds its crypto rows, which are not stock listings.
+ASSET_CLASS_US_EQUITY = 'us_equity'
 
 
 def _utc_now() -> datetime:
@@ -56,6 +73,11 @@ class AlpacaRead:
         scheduler (Scheduler): The Alpaca handle's scheduler. Its quota limits pace every vendor call this
             reader makes, the FetchDataset path's included; nothing else does.
         scope (str): The quota scope those calls are charged to.
+        trading_client (TradingClient | None): Client for the asset reads, or None to use this process's own
+            (broker_api.get_trading_client()), resolved on each call so it stays lazy.
+        trading_scope (str | None): The trading-API quota scope the asset reads are charged to, apart from `scope`
+            so they never count against the data API. None for a reader built without asset reads; calling one then
+            is a bug and raises.
     """
 
     def __init__(
@@ -66,9 +88,13 @@ class AlpacaRead:
         *,
         scheduler: Scheduler,
         scope: str,
+        trading_client: TradingClient | None = None,
+        trading_scope: str | None = None,
     ) -> None:
         self.__scheduler = scheduler
         self.__scope = scope
+        self.__trading_client = trading_client
+        self.__trading_scope = trading_scope
         self.__client = client
         self.__executor_provider = executor_provider if executor_provider is not None else SharedWorkerPool.get_instance
         self.__clock = clock
@@ -212,6 +238,118 @@ class AlpacaRead:
             served_range=ServedRange(query.start, served_end),
             as_of=as_of,
         )
+
+    async def get_assets(self, query: AssetListQuery) -> AssetListResponse | AssetListFailure:
+        """Fetch one of Alpaca's asset lists, whole, in one vendor call.
+
+        Sends asset_class=us_equity explicitly (without it the vendor mixes crypto rows into the list) and the one
+        status the query names, never both and never absent. The body is read as served, not through the SDK model
+        (see assets.py). Paced on the trading-API scope; the data scope is not touched.
+
+        Args:
+            query (AssetListQuery): Which list to fetch.
+
+        Returns:
+            AssetListResponse | AssetListFailure: Every asset served, or BrokerUnsupportedError
+                (UNSUPPORTED_ASSET_TYPE) for a kind that is not a stock, VENDOR_AUTH for a missing or malformed
+                credential or an unset trading host or a 401 or 403, VENDOR_RATE_LIMITED with its reset_at for a 429,
+                VENDOR_UNAVAILABLE for a 5xx, a connection error or a timeout, another vendor status as the bars
+                read classifies it, and RATE_BUDGET for the rate budget's own refusal.
+
+        Raises:
+            ValueError: If the vendor's body is not a JSON array of asset records. Vendor corruption, loud.
+            RuntimeError: If this reader was built without a trading scope.
+        """
+        if query.asset_type is not AssetType.STOCK:
+            return AssetListFailure(
+                BrokerUnsupportedError(
+                    Reason.UNSUPPORTED_ASSET_TYPE, f'Alpaca lists stocks only: asset_type={query.asset_type!r}'
+                )
+            )
+        try:
+            page = await self.__read_trading(
+                broker_api.ASSETS_PATH,
+                {'status': query.status.value, 'asset_class': ASSET_CLASS_US_EQUITY},
+                query.priority,
+                query.deadline,
+                query.tally,
+            )
+        except TraderJoeError as e:
+            return AssetListFailure(e)
+        except VENDOR_FAILURES as e:
+            return AssetListFailure(self.__classify_trading(e))
+        as_of = self.__clock().astimezone(UTC)
+        return AssetListResponse(assets=parse_asset_list(page.content), as_of=as_of)
+
+    async def get_asset(self, query: AssetLookupQuery) -> AssetResponse | AssetNotFound | AssetLookupFailure:
+        """Look up Alpaca's record for one symbol, in one vendor call.
+
+        A vendor 404 is AssetNotFound, an answer. Every other expected failure is an AssetLookupFailure, a rate limit
+        carrying its reset_at. Paced on the trading-API scope. Nothing about the record is judged: an asset the
+        vendor reports inactive or untradable is returned like any other.
+
+        Args:
+            query (AssetLookupQuery): The symbol to look up.
+
+        Returns:
+            AssetResponse | AssetNotFound | AssetLookupFailure: The record, the not-found answer, or the failure,
+                classified as get_assets does; an empty symbol is INVALID_REQUEST before any vendor call.
+
+        Raises:
+            ValueError: If the vendor's body is not one asset record. Vendor corruption, loud.
+            RuntimeError: If this reader was built without a trading scope.
+        """
+        if not query.symbol.strip():
+            return AssetLookupFailure(InvalidRequestError(Reason.INVALID_REQUEST, 'An asset lookup needs a symbol'))
+        try:
+            page = await self.__read_trading(
+                f'{broker_api.ASSETS_PATH}/{quote(query.symbol, safe="")}', None, query.priority, query.deadline, None
+            )
+        except TraderJoeError as e:
+            return AssetLookupFailure(e)
+        except VENDOR_FAILURES as e:
+            if isinstance(e, APIError) and e.status_code == HTTPStatus.NOT_FOUND:
+                return AssetNotFound(symbol=query.symbol, as_of=self.__clock().astimezone(UTC))
+            return AssetLookupFailure(self.__classify_trading(e))
+        as_of = self.__clock().astimezone(UTC)
+        return AssetResponse(asset=parse_asset(page.content), as_of=as_of)
+
+    async def __read_trading(
+        self,
+        path: str,
+        params: dict | None,
+        priority: RequestPriority,
+        deadline: datetime | None,
+        tally: CallTally | None,
+    ) -> broker_api.RawPage:
+        """Make one paced trading-API read. Credential and host problems raise the typed errors the callers return."""
+        if self.__trading_scope is None:
+            raise RuntimeError('AlpacaRead was built without a trading scope, so it cannot read assets')
+        client = self.__trading_client if self.__trading_client is not None else broker_api.get_trading_client()
+        return await broker_api.read_trading(
+            self.__executor_provider(),
+            client,
+            path,
+            params,
+            scheduler=self.__scheduler,
+            scope=self.__trading_scope,
+            priority=priority,
+            deadline=deadline,
+            tally=tally,
+        )
+
+    def __classify_trading(self, error: BaseException) -> TraderJoeError:
+        """Classify a failure of a trading-API read by the same table as the bars read, on the trading scope."""
+        scope = self.__trading_scope or self.__scope
+        classified = classify_vendor_error(
+            error,
+            rate_budget=self.__scheduler.window(scope),
+            clock=self.__clock,
+            last_reset=broker_api.last_reset(scope, self.__clock()),
+        )
+        if classified is None:
+            raise error
+        return classified
 
     @staticmethod
     def __refuse(reason: Reason, detail: str, metadata: dict[str, str] | None = None) -> BarsFailure:
