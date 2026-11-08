@@ -31,7 +31,7 @@ cost estimate (P36) and the store re-requests them. The bound is buffer_size + w
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from common.enums.data_stock import Feed
@@ -39,6 +39,7 @@ from common.errors.vocabulary import TraderJoeError
 from common.logging import get_logger
 from common.rpc.clients.store_delivery import StoreDeliveryClient
 from common.rpc.mapping.values import ProtoMappingError
+from common.scheduling import Every, run_periodic
 from data.ingest.app.scheduler.outbox import OutgoingBuffer, PendingReport
 from data.ingest.app.scheduler.queue import ExpiredRequest, ScheduledRequest
 from data.ingest.app.scheduler.retry import RetryPolicy
@@ -216,7 +217,18 @@ class AckGatedExecutor:
         self.__loops = [
             asyncio.create_task(self.__work(), name=f'{self.__name}-worker-{n}') for n in range(self.__settings.workers)
         ]
-        self.__loops.append(asyncio.create_task(self.__watch(), name=f'{self.__name}-stall-alarm'))
+        # Sleep first, then look: the first fire is one interval out, as the hand-rolled loop's was.
+        interval = timedelta(seconds=self.__settings.stall_check_interval_s)
+        alarm = run_periodic(
+            f'{self.__name}-stall-alarm',
+            Every(interval, first=self.__clock() + interval),
+            self.__watch,
+            clock=self.__clock,
+            sleep=self.__sleep,
+            log=log,
+        )
+        alarm.set_name(f'{self.__name}-stall-alarm')
+        self.__loops.append(alarm)
 
     async def stop(self) -> None:
         """Cancel the workers, the deliveries in flight and the waiting retries, and wait for them to end."""
@@ -349,9 +361,7 @@ class AckGatedExecutor:
             await self.__enqueue(request, PendingReport(request, delivery, attempt_no, result.reset_at, self.__clock()))
 
     async def __watch(self) -> None:
-        while True:
-            await self.__sleep(self.__settings.stall_check_interval_s)
-            self.check_stall()
+        self.check_stall()
 
     async def __enqueue(self, request: ScheduledRequest, report: PendingReport) -> None:
         await self.__buffer.put(report)
