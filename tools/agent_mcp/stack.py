@@ -1337,6 +1337,158 @@ MODES_TEST = frozenset({MODE_TEST})
 SYSTEM_SUITE_MODE_HINT = 'the system suite runs only in test mode: call test_up first; your dev data is not touched'
 TEST_SERVICE_MODE_HINT = 'test_stop, test_start and test_env act only in test mode: call test_up first'
 
+# THE SESSION GRANT (ADR tj-4rr0la addendum 34). One human approval per bead under test, covering a declared
+# scope, held in the server's memory: every state-changing verb needs an open, unexpired grant whose mode and
+# verb list cover it, checked at ADMISSION only (a verb already running finishes). The grant only adds a
+# condition to the verb's own rails; it never skips or relaxes one. Read verbs need none.
+GRANT_PRESET_TEST = 'test-campaign'
+# Each mode's closed verb set. A grant names a subset; down is in the TEST set but NOT in the preset.
+GRANT_VERBS_TEST = (
+    'test_build',
+    'test_up',
+    'test_stop',
+    'test_start',
+    'test_env',
+    'test_reset',
+    'run_system_tests',
+    'seed_dump',
+    'migrate',
+    'restart',
+    'down',
+)
+GRANT_PRESET_TEST_VERBS = tuple(verb for verb in GRANT_VERBS_TEST if verb != 'down')
+GRANT_VERBS_DEV = ('build', 'up', 'down', 'restart', 'migrate', 'tools')
+GRANT_VERBS = {MODE_TEST: GRANT_VERBS_TEST, MODE_DEV: GRANT_VERBS_DEV}
+# (default, maximum) minutes. Over the maximum refuses the open, never clipped: the prompt the owner
+# approved is the grant that exists.
+GRANT_MINUTES = {MODE_TEST: (240, 480), MODE_DEV: (60, 120)}
+GRANT_PURPOSE_MAX = 200
+GRANT_OPEN_TOOLS = {MODE_TEST: 'stack_session_open_test', MODE_DEV: 'stack_session_open_dev'}
+GRANT_CLOSE_TOOL = 'stack_session_close'
+# The state-changing verbs whose mode is fixed by their name; migrate, restart and down take the mode the
+# mode guard resolves, so only their verb list is checked at admission and their mode right after the guard.
+GRANT_FIXED_MODE = {
+    **{verb: MODE_TEST for verb in GRANT_VERBS_TEST if verb not in ('migrate', 'restart', 'down')},
+    **{verb: MODE_DEV for verb in GRANT_VERBS_DEV if verb not in ('migrate', 'restart', 'down')},
+}
+GRANT_MODE_DEPENDENT = ('migrate', 'restart', 'down')
+_GRANT_BEAD = re.compile(r'^[a-z][a-z0-9]*-[a-z0-9]+(\.[0-9]+)*$')
+GRANT_TIME_FORMAT = '%Y-%m-%d %H:%M UTC'
+
+
+@dataclass(frozen=True)
+class Grant:
+    """One open session grant. EXPIRES is on the monotonic clock; EXPIRES_AT is the same moment in UTC, for display."""
+
+    bead: str
+    mode: str
+    verbs: tuple[str, ...]
+    purpose: str
+    expires: float
+    expires_at: datetime.datetime
+
+    def summary(self) -> str:
+        """`<bead> <MODE> [verbs] expires <UTC>`, as refusals name the grant."""
+        return (
+            f'{self.bead} {self.mode} [{", ".join(self.verbs)}] expires {self.expires_at.strftime(GRANT_TIME_FORMAT)}'
+        )
+
+    def line(self) -> str:
+        """Ps's `session:` line."""
+        return f'session: {self.summary()} - {self.purpose}'
+
+    def record(self) -> dict[str, object]:
+        """The audit line's grant field."""
+        return {
+            'bead': self.bead,
+            'mode': self.mode,
+            'verbs': list(self.verbs),
+            'expires_at': self.expires_at.isoformat(timespec='seconds'),
+            'purpose': self.purpose,
+        }
+
+
+def check_grant_bead(value: object) -> str:
+    """The bead id under test: free-form (the server cannot read the task store), but the id grammar."""
+    if not isinstance(value, str) or not _GRANT_BEAD.fullmatch(value):
+        raise Refused('bead must be a task id such as tj-ab12cd or tj-ab12cd.4 (lower-case prefix, a dash, a suffix)')
+    return value
+
+
+def check_grant_purpose(value: object) -> str:
+    """One sentence, 1..GRANT_PURPOSE_MAX printable characters, no newline."""
+    if not isinstance(value, str) or not value.strip() or not value.isprintable():
+        raise Refused('purpose must be one printable line saying what is tested and what it will touch')
+    if len(value) > GRANT_PURPOSE_MAX:
+        raise Refused(f'purpose is {len(value)} characters; the limit is {GRANT_PURPOSE_MAX}')
+    return value
+
+
+def check_grant_minutes(mode: str, value: object) -> int:
+    """The duration in minutes; the mode's default when None; over the maximum is refused, never trimmed."""
+    default, maximum = GRANT_MINUTES[mode]
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise Refused(f'minutes must be a whole number of at least 1 (default {default}, at most {maximum})')
+    if value > maximum:
+        raise Refused(
+            f'{value} minutes is over the {mode} maximum of {maximum}; nothing was opened '
+            f'(a longer campaign needs a fresh approval after this one expires)'
+        )
+    return value
+
+
+def check_grant_verbs(mode: str, value: object) -> tuple[str, ...]:
+    """The verbs a grant covers: a list from the mode's closed set, or (TEST only) the preset name."""
+    allowed = GRANT_VERBS[mode]
+    if isinstance(value, str):
+        if mode == MODE_TEST and value == GRANT_PRESET_TEST:
+            return GRANT_PRESET_TEST_VERBS
+        if value == GRANT_PRESET_TEST:
+            raise Refused(f'there is no preset in {mode} mode: name each verb of {", ".join(allowed)}')
+        raise Refused(f'verbs is a list of {mode} verbs ({", ".join(allowed)})' + _preset_hint(mode))
+    if not isinstance(value, list) or not value or not all(isinstance(item, str) for item in value):
+        raise Refused(f'verbs must be a non-empty list of {mode} verbs ({", ".join(allowed)})' + _preset_hint(mode))
+    outside = [item for item in dict.fromkeys(value) if item not in allowed]
+    if outside:
+        raise Refused(
+            f'{", ".join(map(repr, outside))} is not a {mode} grant verb; the {mode} verbs are: {", ".join(allowed)}'
+        )
+    return tuple(dict.fromkeys(value))
+
+
+def _preset_hint(mode: str) -> str:
+    if mode != MODE_TEST:
+        return ''
+    return f"; or the preset '{GRANT_PRESET_TEST}' ({', '.join(GRANT_PRESET_TEST_VERBS)}), as a string, without down"
+
+
+def grant_ask(verb: str, mode: str) -> str:
+    """What to ask the owner for, for VERB in MODE."""
+    return f'ask the owner to approve {GRANT_OPEN_TOOLS[mode]} with {verb} in verbs'
+
+
+def grant_refusal(verb: str, grant: Grant | None, expired: Grant | None, mode: str | None) -> Refused:
+    """The refusal for a state-changing VERB that no open grant covers.
+
+    MODE is the mode the verb needs when it is known (its name fixes it, or the guard resolved it), else
+    None. The text names the open grant, or says none is open, and exactly what to ask for.
+    """
+    need = mode or GRANT_FIXED_MODE.get(verb)
+    if grant is not None:
+        asked = grant_ask(verb, need or grant.mode)
+        where = f' in {need} mode' if need else ''
+        return Refused(f'refused: no grant covers {verb}{where} (open grant: {grant.summary()}); {asked}')
+    base = 'refused: no session grant is open'
+    if expired is not None:
+        base = f'refused: the session grant {expired.summary().replace(" expires ", " expired ")}'
+    if need is None:
+        return Refused(
+            f'{base}; ask the owner to approve {GRANT_OPEN_TOOLS[MODE_TEST]} or {GRANT_OPEN_TOOLS[MODE_DEV]}'
+        )
+    return Refused(f'{base}; {verb} acts in {need} mode: {grant_ask(verb, need)}')
+
 
 def dev_prod_guard_argv() -> tuple[str, ...]:
     """`docker ps -a` over every NON-one-off container of DEV_PROJECT, printing the config_files label only."""

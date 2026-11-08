@@ -27,6 +27,7 @@ import subprocess
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -666,6 +667,75 @@ def forbid_real_subprocesses(monkeypatch: pytest.MonkeyPatch, allowed: Sequence[
     monkeypatch.setattr(asyncio, 'create_subprocess_exec', refuse_async)
 
 
+# THE SESSION GRANT (ADR tj-4rr0la addendum 34). Every state-changing verb is refused at admission without an
+# open grant that covers it. The suites that test a verb's own rails are not about the grant, so a rig holds a
+# COVERING grant by default: CoveringAgentStack puts a real stack.Grant in the verb's own mode, listing every
+# verb of that mode, into the runner's grant slot for the length of each state-changing call, then clears it.
+# The production admission, mode check and audit run unchanged on it; nothing is patched. A single real grant
+# cannot do this job: one grant has one mode, and the suites call TEST and DEV verbs side by side.
+#
+# migrate, restart and down take the mode the mode guard resolves, so the covering grant's mode is read from
+# the rig's own answer to the guard step (respond, not run: the peek is not recorded as a step). A refused or
+# empty project counts as DEV, as the runner counts it.
+#
+# The grant tests (test_session_grant.py) opt out with make_rig(..., covering_grant=False): a plain AgentStack
+# with no grant, opened only through the real stack_session_open_* verbs.
+COVERING_GRANT_BEAD = 'tj-harness'
+COVERING_GRANT_PURPOSE = 'harness: covers the verb under test so its own rails are what the test sees'
+COVERING_GRANT_SECONDS = 480 * 60
+
+
+def covering_grant(mode: str, clock: Callable[[], float]) -> stack.Grant:
+    """An open grant of MODE listing every verb of that mode, expiring the TEST maximum after CLOCK's now."""
+    return stack.Grant(
+        bead=COVERING_GRANT_BEAD,
+        mode=mode,
+        verbs=stack.GRANT_VERBS[mode],
+        purpose=COVERING_GRANT_PURPOSE,
+        expires=clock() + COVERING_GRANT_SECONDS,
+        expires_at=datetime.now(UTC) + timedelta(seconds=COVERING_GRANT_SECONDS),
+    )
+
+
+class CoveringAgentStack(runner.AgentStack):
+    """An AgentStack that holds a covering grant (above) for the length of each state-changing call."""
+
+    def __init__(
+        self,
+        settings: Settings,
+        run: Callable[[stack.Step], Awaitable[runner.ProcessResult]],
+        respond: Callable[[stack.Step], runner.ProcessResult],
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        super().__init__(settings, run=run, clock=clock)
+        self._covering_respond = respond
+
+    def _covering_mode(self, verb: str) -> str:
+        fixed = stack.GRANT_FIXED_MODE.get(verb)
+        if fixed is not None:
+            return fixed
+        answer = self._covering_respond(stack.dev_prod_guard_step(self.settings.stack_dir))
+        try:
+            mode = stack.check_mode_guard(answer.exit_status, answer.stdout)
+        except stack.Refused:
+            mode = None
+        return mode or stack.MODE_DEV
+
+    async def call(self, verb: str, arguments: object) -> dict[str, Any]:
+        if not isinstance(verb, str) or verb not in self._handlers or verb in runner.GRANT_FREE_VERBS:
+            return await super().call(verb, arguments)
+        self._grant = covering_grant(self._covering_mode(verb), self._clock)
+        try:
+            return await super().call(verb, arguments)
+        finally:
+            self._grant = None
+
+
+def covering_agent(rig: 'Rig', run: Callable[[stack.Step], Awaitable[runner.ProcessResult]]) -> runner.AgentStack:
+    """A CoveringAgentStack over RUN for RIG's layout, peeking at RIG's FakeDocker for the guard's answer."""
+    return CoveringAgentStack(rig.layout.settings, run=run, respond=lambda step: rig.docker.respond(step))
+
+
 @dataclass
 class Rig:
     """One layout with its fakes installed and an AgentStack over them."""
@@ -686,8 +756,19 @@ class Rig:
         return path.read_text().splitlines() if path.exists() else []
 
 
-def make_rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, docker: FakeDocker | None = None) -> Rig:
-    """A layout, FakeGit listing repo and its one agent worktree, FakeDocker, and no real subprocess."""
+def make_rig(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    docker: FakeDocker | None = None,
+    *,
+    covering_grant: bool = True,
+    clock: Callable[[], float] = time.monotonic,
+) -> Rig:
+    """A layout, FakeGit listing repo and its one agent worktree, FakeDocker, and no real subprocess.
+
+    COVERING_GRANT (the default) gives the rig a CoveringAgentStack; False a plain AgentStack with no grant.
+    CLOCK is the runner's monotonic clock (a test of expiry passes a fake one).
+    """
     layout = make_layout(tmp_path)
     git = FakeGit(worktree_paths=[layout.repo, layout.worktree])
     monkeypatch.setattr(stack, 'run_git', git)
@@ -710,7 +791,14 @@ def make_rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, docker: FakeDocker
     ]
     forbid_real_subprocesses(monkeypatch, allowed)
     fake_docker = docker or FakeDocker()
-    return Rig(layout=layout, git=git, docker=fake_docker, agent=runner.AgentStack(layout.settings, run=fake_docker))
+    agent: runner.AgentStack
+    if covering_grant:
+        agent = CoveringAgentStack(
+            layout.settings, run=fake_docker, respond=lambda step: fake_docker.respond(step), clock=clock
+        )
+    else:
+        agent = runner.AgentStack(layout.settings, run=fake_docker, clock=clock)
+    return Rig(layout=layout, git=git, docker=fake_docker, agent=agent)
 
 
 # THE BUDGET'S ABSENCE (ADR tj-4rr0la addendum 33, owner ruling 2026-11-06). The S10 budget of 12
@@ -767,6 +855,15 @@ VERB_SAMPLES: Mapping[str, dict[str, Any]] = {
     'tools': {},
     'test_build': {},
     'test_up': {},
+}
+# A valid call of each SESSION verb (ADR tj-4rr0la addendum 34). Kept out of VERB_SAMPLES on purpose: the
+# parameterised sweeps over VERB_SAMPLES are about docker steps and their classes, and a session verb runs
+# none (test_session_grant.py pins that). test_every_verb_has_a_sample holds the two maps to the verb table
+# together, so a new verb still needs a sample in one of them.
+SESSION_VERB_SAMPLES: Mapping[str, dict[str, Any]] = {
+    'stack_session_open_test': {'bead': 'tj-ab12cd.4', 'verbs': 'test-campaign', 'purpose': 'sample open'},
+    'stack_session_open_dev': {'bead': 'tj-ab12cd.4', 'verbs': ['build', 'up'], 'purpose': 'sample open'},
+    'stack_session_close': {},
 }
 # Verbs that run no docker at all. None since tj-irhy0a.22 wired seed_dump; kept so a future verb
 # that runs no docker is classified here rather than tripping the docker sweeps.

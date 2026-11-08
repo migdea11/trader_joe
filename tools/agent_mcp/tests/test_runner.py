@@ -419,7 +419,9 @@ def test_every_call_writes_exactly_one_audit_line_with_no_secret_in_it(tmp_path:
     assert [line['known'] for line in lines] == [False, True, True, True, True, True, True]
     assert lines[3]['arguments'] == {'service': 'postgres', 'tail': 200}
     assert all(line['arguments'] is None for index, line in enumerate(lines) if statuses[index] == 'refused')
-    assert set(lines[0]) == {'time', 'verb', 'known', 'arguments', 'status', 'exit_status', 'duration_s'}
+    # 'grant' since addendum 34: the grant the call was made under, or null (no grant is open for these reads).
+    assert set(lines[0]) == {'time', 'verb', 'known', 'arguments', 'status', 'exit_status', 'duration_s', 'grant'}
+    assert [line['grant'] for line in lines if line['verb'] != 'seed_dump'] == [None] * 6
     text = (rig.layout.stack_dir / stack.AUDIT_LOG_NAME).read_text()
     # The MCP holds no secret of its own since the agent stack's generated env went (tj-iee6sn.21): the
     # sentinel stands for an argument value and for command output, both of which must stay out.

@@ -1251,13 +1251,16 @@ def test_ps_reports_the_active_names_and_the_files_values(tmp_path: Path, monkey
         'agent env data_store: container: generation 3: INSTANCE_WATCH_INTERVAL_SECONDS,PANEL_MANAGER_ENABLED; '
         'file: generation 3: INSTANCE_WATCH_INTERVAL_SECONDS=5, PANEL_MANAGER_ENABLED=false',
         'agent env data_ingest: container: generation 4: ALPACA_MAX_ATTEMPTS; file: generation 4: ALPACA_MAX_ATTEMPTS=2',
+        # Addendum 34: ps ends with the session line; no grant is open here.
+        'session: none',
     ]
 
 
 def test_ps_says_pending_when_the_file_and_the_container_differ(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     labels = b'data_store|2|PANEL_MANAGER_ENABLED\ndata_ingest||\n'
     _, result = _ps(tmp_path, monkeypatch, labels, {'data_store': STORE, 'data_ingest': INGEST})
-    store, ingest = result['message'].splitlines()[1:]
+    store, ingest, session = result['message'].splitlines()[1:]
+    assert session == 'session: none', result['message']
     assert 'pending' in store and 'pending' in ingest, result['message']
     assert ingest.startswith('agent env data_ingest: container: no overrides; file: generation 4')
 
@@ -1342,7 +1345,11 @@ def test_the_descriptions_name_test_mode_and_the_rails(verb: str):
         'Returns ok or failed itself.',
     ):
         assert fragment in text, fragment
-    assert text.endswith('Returns ok or failed itself.'), text
+    # Addendum 34 appends the session-grant note to every state-changing description: the verb's own text
+    # still ends on its return sentence, and the note follows it.
+    own, note_lead, note = text.partition(' NEEDS A SESSION GRANT: ')
+    assert own.endswith('Returns ok or failed itself.') and note_lead, text
+    assert f'lists {verb} and is a TEST grant' in note and 'stack_session_open_test' in note, note
     assert_no_budget_wording(text)
     assert 'charge' not in text.lower(), text
     if verb == 'test_env':

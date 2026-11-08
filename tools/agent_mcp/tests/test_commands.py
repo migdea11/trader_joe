@@ -41,6 +41,7 @@ from tools.agent_mcp.tests.harness import (
     DEV_UP_VERBS,
     DOCKERLESS_VERBS,
     REPO_ROOT,
+    SESSION_VERB_SAMPLES,
     SYSTEM_SUITE_VERBS,
     TEST_MODE_VERBS,
     TEST_RESET_VERBS,
@@ -105,8 +106,12 @@ def _run_verb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str, respon
 def test_every_verb_has_a_sample():
     """The parameterised tests below run every verb: a new verb without a sample goes red here."""
     agent = runner.AgentStack(settings=None)  # type: ignore[arg-type] -- only the verb table is read
-    assert set(agent.verbs) == set(VERB_SAMPLES), f'verbs {agent.verbs} vs samples {sorted(VERB_SAMPLES)}'
-    assert set(runner.VERB_SCHEMAS) == set(VERB_SAMPLES) == set(runner.VERB_TIMEOUT_SECONDS)
+    samples = set(VERB_SAMPLES) | set(SESSION_VERB_SAMPLES)
+    assert not set(VERB_SAMPLES) & set(SESSION_VERB_SAMPLES)
+    assert set(agent.verbs) == samples, f'verbs {agent.verbs} vs samples {sorted(samples)}'
+    assert set(runner.VERB_SCHEMAS) == samples
+    # The session verbs (addendum 34) take no verb lock and run no step, so only the docker verbs are timed.
+    assert set(runner.VERB_TIMEOUT_SECONDS) == set(VERB_SAMPLES)
 
 
 @pytest.mark.parametrize('verb', sorted(VERB_SAMPLES))

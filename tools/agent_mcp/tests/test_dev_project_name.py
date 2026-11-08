@@ -31,6 +31,7 @@ from tools.agent_mcp.tests.harness import (
     DEV_INGEST_CONTAINER_ID,
     DEV_MODE_LINE,
     REPO_ROOT,
+    SESSION_VERB_SAMPLES,
     SYSTEM_SUITE_VERBS,
     TEST_MODE_LINE,
     TEST_RESET_VERBS,
@@ -109,8 +110,11 @@ def _project_filters(argv) -> list[str]:
 
 
 def test_the_sweep_covers_exactly_the_verbs_the_server_offers():
-    assert set(ALL_VERBS) == set(VERB_SAMPLES) == set(runner.VERB_SCHEMAS), sorted(VERB_SAMPLES)
-    assert len(ALL_VERBS) == 19
+    # The session verbs (addendum 34) run no docker step at all, so they have nothing to address; that they run
+    # none is test_session_grant.py's. Every verb with a step is in the sweep.
+    docker_verbs = set(runner.VERB_SCHEMAS) - set(SESSION_VERB_SAMPLES)
+    assert set(ALL_VERBS) == set(VERB_SAMPLES) == docker_verbs, sorted(VERB_SAMPLES)
+    assert len(ALL_VERBS) == 19 and len(runner.VERB_SCHEMAS) == 22
 
 
 @pytest.mark.parametrize('verb', ALL_VERBS)

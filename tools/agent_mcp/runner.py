@@ -20,7 +20,7 @@ import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -98,6 +98,28 @@ _worktree_schema = {
     'type': 'string',
     'description': "'root' for the main checkout, or the name of one of this repository's worktrees",
 }
+
+_grant_bead_schema = {
+    'type': 'string',
+    'description': (
+        'the id of whatever is under test: a test-collection bead, a feature or bug bead, or an epic; '
+        'free-form, this server cannot read the task store and checks neither its existence nor its status'
+    ),
+}
+_grant_purpose_schema = {
+    'type': 'string',
+    'maxLength': stack.GRANT_PURPOSE_MAX,
+    'description': f'one sentence, at most {stack.GRANT_PURPOSE_MAX} characters: what is tested and what it will touch',
+}
+
+
+def _grant_minutes_schema(mode: str) -> dict[str, Any]:
+    default, maximum = stack.GRANT_MINUTES[mode]
+    return {
+        'type': 'integer',
+        'description': f'how long the grant lasts, default {default}, at most {maximum} (more is refused, not trimmed)',
+    }
+
 
 # The verbs' input schemas. Closed: additionalProperties false, and AgentStack.call checks the exact
 # key set again, so an unknown keyword is refused rather than dropped.
@@ -202,9 +224,52 @@ VERB_SCHEMAS: dict[str, dict[str, Any]] = {
     # Take nothing: the services, the files, the images and the data directory are constants.
     'test_build': {'properties': {}, 'required': []},
     'test_up': {'properties': {}, 'required': []},
+    # THE SESSION GRANT (addendum 34). The mode is in the tool NAME, so a client's settings can treat the
+    # dev opener differently. Nothing here names a docker thing: a grant is memory only.
+    'stack_session_open_test': {
+        'properties': {
+            'bead': _grant_bead_schema,
+            'verbs': {
+                'description': (
+                    f'what the grant covers: a list from {", ".join(stack.GRANT_VERBS_TEST)}, or the string '
+                    f"'{stack.GRANT_PRESET_TEST}' for {', '.join(stack.GRANT_PRESET_TEST_VERBS)} (down is never in "
+                    'the preset: name it in a list on its own)'
+                ),
+                'anyOf': [
+                    {'type': 'array', 'items': {'type': 'string', 'enum': list(stack.GRANT_VERBS_TEST)}},
+                    {'type': 'string', 'enum': [stack.GRANT_PRESET_TEST]},
+                ],
+            },
+            'minutes': _grant_minutes_schema(stack.MODE_TEST),
+            'purpose': _grant_purpose_schema,
+        },
+        'required': ['bead', 'verbs', 'purpose'],
+    },
+    'stack_session_open_dev': {
+        'properties': {
+            'bead': _grant_bead_schema,
+            'verbs': {
+                'type': 'array',
+                'items': {'type': 'string', 'enum': list(stack.GRANT_VERBS_DEV)},
+                'description': 'what the grant covers, each verb named (there is no preset): '
+                + ', '.join(stack.GRANT_VERBS_DEV),
+            },
+            'minutes': _grant_minutes_schema(stack.MODE_DEV),
+            'purpose': _grant_purpose_schema,
+        },
+        'required': ['bead', 'verbs', 'purpose'],
+    },
+    # Takes nothing: it ends the open grant, if any. Narrowing is always safe, so it is free.
+    'stack_session_close': {'properties': {}, 'required': []},
 }
 for _schema in VERB_SCHEMAS.values():
     _schema.update(type='object', additionalProperties=False)
+
+SESSION_OPEN_VERBS = ('stack_session_open_test', 'stack_session_open_dev')
+SESSION_VERBS = (*SESSION_OPEN_VERBS, stack.GRANT_CLOSE_TOOL)
+# The verbs that need no grant: the five reads, and the three that manage it. EVERY OTHER verb needs one, so
+# a verb added later without a decision here is refused rather than free.
+GRANT_FREE_VERBS = frozenset({'ps', 'logs', 'migrate_status', 'db_tables', 'http_get', *SESSION_VERBS})
 
 _OPTIONAL_DEFAULTS: dict[str, dict[str, Any]] = {'logs': {'tail': stack.TAIL_DEFAULT}}
 
@@ -336,6 +401,9 @@ class _Call:
     details: dict[str, Any] | None = None
     # The id of the running postgres container the test-mode rails read the data mount of (test_reset execs into it).
     postgres_target: str | None = None
+    # The grant this call was admitted under (state-changing verbs): migrate, restart and down check its mode
+    # against the mode the guard resolves, and a close or expiry in between does not unadmit the verb.
+    grant: stack.Grant | None = None
 
     async def ensure_bases(self, cwd: Path) -> None:
         """Per stack.BASE_IMAGES ref: `docker image inspect`, and `docker pull` only when that fails.
@@ -375,7 +443,10 @@ class AgentStack:
     """The verbs, serialised: a second caller is told 'busy'.
 
     Every verb acts on the ONE compose project of the owner's checkout (stack.DEV_PROJECT), in its
-    DEV or TEST mode (ADR tj-4rr0la addenda 26-27); there is no second stack. Nineteen verbs:
+    DEV or TEST mode (ADR tj-4rr0la addenda 26-27); there is no second stack. Twenty-two verbs:
+      the session grant (addendum 34): stack_session_open_test, stack_session_open_dev and stack_session_close.
+        Every state-changing verb below needs an open, unexpired grant that covers it, checked at admission;
+        these three bypass the verb lock and touch no docker;
       read-only: ps and logs (addendum 18), db_tables and http_get (addendum 22),
         migrate_status (the mode that is up);
       state-changing, label-only: down and restart (tj-iee6sn.7), held by the D6/D7 guards and the
@@ -400,6 +471,10 @@ class AgentStack:
         self._run = run
         self._clock = clock
         self._running: str | None = None
+        # The open session grant, and the last one seen to expire (named in the next refusal). Memory only:
+        # a server restart closes it.
+        self._grant: stack.Grant | None = None
+        self._expired: stack.Grant | None = None
         self._handlers: Mapping[str, Callable[..., Awaitable[tuple[str, str]]]] = {
             'migrate': self._migrate,
             'migrate_status': self._migrate_status,
@@ -420,6 +495,9 @@ class AgentStack:
             'tools': self._dev_tools,
             'test_build': self._test_build,
             'test_up': self._test_up,
+            'stack_session_open_test': self._session_open_test,
+            'stack_session_open_dev': self._session_open_dev,
+            'stack_session_close': self._session_close,
         }
 
     @property
@@ -445,14 +523,23 @@ class AgentStack:
         known = verb in self._handlers
         call = _Call(self._run)
         status, message = 'refused', ''
+        grant = self._open_grant()
         if not known:
             message = f'unknown verb; the verbs are: {", ".join(self._handlers)}'
+        elif verb in SESSION_VERBS:
+            # Memory only and no await that yields: never 'busy', so the owner can grant while a long verb runs.
+            try:
+                checked = self._check_arguments(verb, arguments)
+                status, message = await self._handlers[verb](call, **checked)
+            except stack.Refused as refusal:
+                status, message = 'refused', str(refusal)
         elif self._running is not None:
             status, message = 'busy', f'busy: {self._running} is running; verbs run one at a time, call again later'
         else:
             # No await between this check and the assignment: the lock is the event loop itself.
             self._running = verb
             try:
+                self._admit(call, verb, grant)
                 checked = self._check_arguments(verb, arguments)
                 async with asyncio.timeout(VERB_TIMEOUT_SECONDS[verb]):
                     status, message = await self._handlers[verb](call, **checked)
@@ -480,13 +567,61 @@ class AgentStack:
         }
         if call.details is not None:
             result['details'] = call.details
-        audit_error = self._audit(result, verb if known else str(verb)[:AUDIT_VERB_NAME_MAX], known, call.validated)
+        # A successful open's line carries the NEW grant; every other line carries the one open when the call began.
+        recorded = self._grant if verb in SESSION_OPEN_VERBS and status == 'ok' else grant
+        audit_error = self._audit(
+            result, verb if known else str(verb)[:AUDIT_VERB_NAME_MAX], known, call.validated, recorded
+        )
         if audit_error:
             result['audit'] = audit_error
         return result
 
-    def _audit(self, result: Mapping[str, Any], name: str, known: bool, validated: dict[str, Any] | None) -> str | None:
-        """One JSON line: UTC time, verb, known, validated arguments, status, exit status, duration.
+    def _open_grant(self) -> stack.Grant | None:
+        """The open, unexpired grant. The first call to see one expire writes its audit line and forgets it."""
+        grant = self._grant
+        if grant is not None and self._clock() >= grant.expires:
+            self._grant, self._expired = None, grant
+            self._audit_event('session_expired', grant)
+            return None
+        return grant
+
+    def _admit(self, call: _Call, verb: str, grant: stack.Grant | None) -> None:
+        """The grant check, at ADMISSION only, after 'busy' and before the argument check: no docker, no file read.
+
+        A state-changing verb needs an open grant whose list holds it and, when its name fixes its mode, whose
+        mode matches. migrate, restart and down get their mode check right after their own mode guard
+        (_check_grant_mode). The grant only adds this condition; no rail after it changes.
+        """
+        if verb in GRANT_FREE_VERBS:
+            return
+        need = stack.GRANT_FIXED_MODE.get(verb)
+        if grant is None or verb not in grant.verbs or (need is not None and grant.mode != need):
+            raise stack.grant_refusal(verb, grant, self._expired, need)
+        call.grant = grant
+
+    @staticmethod
+    def _check_grant_mode(call: _Call, verb: str, resolved: str | None) -> None:
+        """migrate, restart and down: the admitted grant's mode must be the mode the guard resolved (an empty project counts as DEV)."""
+        mode = resolved or stack.MODE_DEV
+        if call.grant is None or call.grant.mode != mode:
+            raise stack.grant_refusal(verb, call.grant, None, mode)
+
+    def _audit_event(self, name: str, grant: stack.Grant) -> None:
+        """An audit line for something that is not a call (a replaced or expired grant); best effort."""
+        result = {'status': 'ok', 'exit_status': None, 'duration_s': 0.0}
+        self._audit(result, name, True, None, grant)
+
+    def _audit(
+        self,
+        result: Mapping[str, Any],
+        name: str,
+        known: bool,
+        validated: dict[str, Any] | None,
+        grant: stack.Grant | None = None,
+    ) -> str | None:
+        """One JSON line: UTC time, verb, known, validated arguments, status, exit status, duration, grant.
+
+        grant is {bead, mode, verbs, expires_at, purpose} or null (see the call for which grant a line carries).
 
         No output and no env value. Arguments appear only once a verb has accepted them, so an
         argument that was refused never reaches the log. An unknown verb is recorded by the name it
@@ -502,6 +637,7 @@ class AgentStack:
                 'status': result['status'],
                 'exit_status': result['exit_status'],
                 'duration_s': result['duration_s'],
+                'grant': None if grant is None else grant.record(),
             }
         )
         try:
@@ -511,6 +647,57 @@ class AgentStack:
         except OSError as error:
             return f'the audit log could not be written: {type(error).__name__}'
         return None
+
+    # -----------------------------------------------------------------------------------------
+    # THE SESSION GRANT (ADR tj-4rr0la addendum 34). No docker, no file, no await that yields: atomic on the loop.
+    def _open(self, call: _Call, mode: str, bead: object, verbs: object, purpose: object, minutes: object) -> str:
+        checked_bead = stack.check_grant_bead(bead)
+        checked_verbs = stack.check_grant_verbs(mode, verbs)
+        checked_minutes = stack.check_grant_minutes(mode, minutes)
+        checked_purpose = stack.check_grant_purpose(purpose)
+        call.validated = {
+            'bead': checked_bead,
+            'mode': mode,
+            'verbs': list(checked_verbs),
+            'minutes': checked_minutes,
+            'purpose': checked_purpose,
+        }
+        # Validation is over: a refused open leaves the open grant exactly as it was.
+        old = self._open_grant()
+        if old is not None:
+            self._audit_event('session_replaced', old)
+        grant = stack.Grant(
+            bead=checked_bead,
+            mode=mode,
+            verbs=checked_verbs,
+            purpose=checked_purpose,
+            expires=self._clock() + checked_minutes * 60,
+            expires_at=datetime.now(UTC) + timedelta(minutes=checked_minutes),
+        )
+        self._grant, self._expired = grant, None
+        replaced = f'; it replaced the grant {old.summary()}' if old is not None else ''
+        return f'session grant open: {grant.summary()} - {grant.purpose}{replaced}'
+
+    async def _session_open_test(
+        self, call: _Call, bead: object, verbs: object, purpose: object, minutes: object = None
+    ) -> tuple[str, str]:
+        """OPENS THE SESSION GRANT FOR TEST MODE. One grant is held at a time, in this server's memory, and opening one REPLACES the open one (a server restart closes it). Arguments: BEAD (the id of whatever is under test: a test-collection bead, a feature or bug bead, or an epic; free-form, never checked against the task store), VERBS (a list from test_build, test_up, test_stop, test_start, test_env, test_reset, run_system_tests, seed_dump, migrate, restart, down; or the string 'test-campaign' for all of them but down, which must be named in a list on its own), MINUTES (optional; default 240, at most 480; more is REFUSED, not trimmed), PURPOSE (one sentence of at most 200 characters: what is tested and what it will touch). While it is open and unexpired, the verbs it lists run in TEST mode with no further approval; expiry or close never aborts a verb already running. Needs no grant itself and takes no verb lock. Changes nothing outside this server's memory and the audit log. The owner's client setting is what asks for approval of this call."""
+        return 'ok', self._open(call, stack.MODE_TEST, bead, verbs, purpose, minutes)
+
+    async def _session_open_dev(
+        self, call: _Call, bead: object, verbs: object, purpose: object, minutes: object = None
+    ) -> tuple[str, str]:
+        """OPENS THE SESSION GRANT FOR DEV MODE, which holds the owner's own dev data. One grant is held at a time, in this server's memory, and opening one REPLACES the open one (a server restart closes it). Arguments: BEAD (the id of whatever is under test; free-form, never checked against the task store), VERBS (a list, each named, from build, up, down, restart, migrate, tools: there is no preset), MINUTES (optional; default 60, at most 120; more is REFUSED, not trimmed), PURPOSE (one sentence of at most 200 characters: what is tested and what it will touch). While it is open and unexpired, the verbs it lists run in DEV mode with no further approval; expiry or close never aborts a verb already running. Needs no grant itself and takes no verb lock. Changes nothing outside this server's memory and the audit log. The owner's client setting is what asks for approval of this call."""
+        return 'ok', self._open(call, stack.MODE_DEV, bead, verbs, purpose, minutes)
+
+    async def _session_close(self, call: _Call) -> tuple[str, str]:
+        """ENDS THE OPEN SESSION GRANT, if any; takes nothing, needs no grant and takes no verb lock. Narrowing is always safe, so it is free. A verb already running finishes. Every state-changing verb is refused again until a new grant is opened."""
+        call.validated = {}
+        closed = self._open_grant()
+        self._grant = self._expired = None
+        if closed is None:
+            return 'ok', 'no session grant was open'
+        return 'ok', f'session grant closed: {closed.summary()}'
 
     # -----------------------------------------------------------------------------------------
     # SHARED STEPS
@@ -744,7 +931,9 @@ class AgentStack:
         read = await call.step(stack.agent_env_labels_step(self.settings.stack_dir))
         labels = stack.parse_agent_env_labels(read.stdout) if read.exit_status == 0 else None
         lines, _ = stack.describe_agent_env(file_entries, labels)
-        return 'ok', '\n'.join([f'containers of the {stack.DEV_PROJECT} compose project', *lines])
+        grant = self._open_grant()
+        session = 'session: none' if grant is None else grant.line()
+        return 'ok', '\n'.join([f'containers of the {stack.DEV_PROJECT} compose project', *lines, session])
 
     async def _dev_logs(self, call: _Call, service: object, tail: object) -> tuple[str, str]:
         """READ-ONLY: the last TAIL lines (clamped) of one service's log in the USER'S OWN dev compose project. It starts, stops and changes nothing, and reaches no other project."""
@@ -822,7 +1011,7 @@ class AgentStack:
     async def _dev_down(self, call: _Call) -> tuple[str, str]:
         """STATE-CHANGING: `docker compose -p trader_joe_dev down` on the USER'S OWN dev compose project: its containers and project networks are stopped and removed. It never removes a volume or an image and never passes --remove-orphans; the database is a host bind and survives. It reads no compose file and no env file, takes no argument and builds nothing. Refused when the project holds a container started from neither the dev nor the test files (a prod launch) or dev and test containers together, and when a compose file or dotenv file sits in the stack directory or a parent."""
         call.validated = {}
-        await self._mode_guard(call)
+        self._check_grant_mode(call, 'down', await self._mode_guard(call))
         await self._dev_admit(binds=False)
         if not await call.steps_until_failure(stack.dev_down_steps(self.settings.stack_dir)):
             return 'failed', f'compose down failed for the {stack.DEV_PROJECT} project'
@@ -832,7 +1021,7 @@ class AgentStack:
         """STATE-CHANGING: `docker compose -p trader_joe_dev restart <service>` on the USER'S OWN dev compose project, SERVICE one of data_store, data_ingest, web (never postgres). Restarts the existing container with its existing image and configuration; it creates, removes and rebuilds nothing and loads no compose file or env file. Refused when the project holds a container started from neither the dev nor the test files (a prod launch) or dev and test containers together, when a repository bind source is a symlink, and when a compose file or dotenv file sits in the stack directory or a parent."""
         checked = stack.validate_dev_restart_service(service)
         call.validated = {'service': checked}
-        await self._mode_guard(call)
+        self._check_grant_mode(call, 'restart', await self._mode_guard(call))
         await self._dev_admit(binds=True)
         if not await call.steps_until_failure(stack.dev_restart_steps(self.settings.stack_dir, checked)):
             return 'failed', f'compose restart of {checked} failed for the {stack.DEV_PROJECT} project'
@@ -1017,6 +1206,7 @@ class AgentStack:
         call.validated = {}
         settings = self.settings
         mode = await self._migrate_mode(call)
+        self._check_grant_mode(call, 'migrate', mode)
         selection = stack.migrate_selection(mode)
         failure = await self._migrate_admit(call, mode)
         if failure is not None:
@@ -1135,4 +1325,23 @@ class AgentStack:
 
     def describe(self, verb: str) -> str:
         """A verb's description for the MCP tool list: its handler's docstring, on one line."""
-        return ' '.join((self._handlers[verb].__doc__ or verb).split())
+        text = ' '.join((self._handlers[verb].__doc__ or verb).split())
+        return text if verb in SESSION_VERBS else f'{text} {self._grant_note(verb)}'
+
+    @staticmethod
+    def _grant_note(verb: str) -> str:
+        """What a tool description says about the session grant (addendum 34)."""
+        if verb in GRANT_FREE_VERBS:
+            return 'NEEDS NO SESSION GRANT (a read verb). ps prints the open grant as its one `session:` line.'
+        need = stack.GRANT_FIXED_MODE.get(verb)
+        if need:
+            covers, tools = f'a {need} grant', stack.GRANT_OPEN_TOOLS[need]
+        else:
+            covers = 'a grant whose mode is the mode the project is in (DEV also when it is empty)'
+            tools = f'{stack.GRANT_OPEN_TOOLS[stack.MODE_TEST]} or {stack.GRANT_OPEN_TOOLS[stack.MODE_DEV]}'
+        return (
+            f'NEEDS A SESSION GRANT: an open, unexpired grant that lists {verb} and is {covers}; without one it is '
+            'refused before anything runs, naming the open grant or saying none is open. The check is at admission '
+            'only, so a running verb finishes. Read the open grant with ps (its `session:` line); ask the owner '
+            f'to approve {tools} with {verb} in verbs. An open grant never relaxes any other refusal.'
+        )

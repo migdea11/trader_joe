@@ -42,6 +42,7 @@ from tools.agent_mcp.tests.harness import (
     FakeDocker,
     Rig,
     assert_no_call_counter,
+    covering_agent,
     default_response,
     dev_up_compose_argv,
     is_dev_digest,
@@ -767,7 +768,7 @@ def _secret_rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, helper: Path | 
             return await runner.run_process(replace(step, argv=argv))
         return await rig.docker(step)
 
-    rig.agent = runner.AgentStack(rig.layout.settings, run=run)
+    rig.agent = covering_agent(rig, run)
     return rig, fakebin
 
 

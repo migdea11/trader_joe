@@ -6,10 +6,11 @@ prefix (the architect's 12:55 UTC release note of 2026-10-19).
 Every literal here is spelled out, never read from the module under test: a pin that took its expectation
 from runner.py would agree with any change to it.
 
-  * THE VERB SET is exactly the nineteen final names -- dev launchers up, build, tools; test launchers test_up,
+  * THE VERB SET is exactly the twenty-two final names -- dev launchers up, build, tools; test launchers test_up,
     test_build; either mode down, restart, ps, logs, db_tables, http_get, migrate, migrate_status,
-    run_system_tests, seed_dump, test_reset; and addendum 32's test_stop, test_start, test_env (tj-7zjov1.268)
-    -- in the handler table, the input schemas, the timeouts, and so the MCP tool
+    run_system_tests, seed_dump, test_reset; addendum 32's test_stop, test_start, test_env (tj-7zjov1.268);
+    and addendum 34's stack_session_open_test, stack_session_open_dev, stack_session_close (tj-ivuy8r.4)
+    -- in the handler table, the input schemas, the timeouts (the session three excepted), and so the MCP tool
     list (server.py lists AgentStack.verbs with VERB_SCHEMAS, pinned in test_dev_migrate.py). No retired verb
     and no old dev_ name is in any of them: there are no aliases.
   * NO OLD TOOL NAME IN ANY TEXT. No description, refusal, hint, fix or docs string in the MCP's modules (nor
@@ -32,7 +33,7 @@ import re
 import pytest
 
 from tools.agent_mcp import runner, stack
-from tools.agent_mcp.tests.harness import REPO_ROOT, VERB_SAMPLES, make_rig
+from tools.agent_mcp.tests.harness import REPO_ROOT, SESSION_VERB_SAMPLES, VERB_SAMPLES, make_rig
 
 
 pytestmark = pytest.mark.build_infra
@@ -62,8 +63,14 @@ EXPECTED_VERBS = frozenset(
         'test_stop',
         'test_start',
         'test_env',
+        # ADR tj-4rr0la addendum 34 (tj-ivuy8r.4): the session grant's two openers and its close.
+        'stack_session_open_test',
+        'stack_session_open_dev',
+        'stack_session_close',
     }
 )
+# The session verbs bypass the verb lock and its timeout, so they carry no VERB_TIMEOUT_SECONDS entry.
+SESSION_VERBS = frozenset({'stack_session_open_test', 'stack_session_open_dev', 'stack_session_close'})
 # The nine tool names tj-iee6sn.26 replaced, old -> new (ADR tj-4rr0la addendum 27 (4)).
 OLD_TO_NEW = {
     'dev_up': 'up',
@@ -189,14 +196,19 @@ REMOVED_RUNNER_NAMES = (
 )
 
 
-def test_the_verb_set_is_exactly_the_nineteen_in_every_table():
-    """Addenda 26 (5) / 27 (4) / 32 (1): the handlers (so the tool list), the schemas and the timeouts agree."""
+def test_the_verb_set_is_exactly_the_twenty_two_in_every_table():
+    """Addenda 26 (5) / 27 (4) / 32 (1) / 34: the handlers (so the tool list), the schemas and the timeouts agree.
+
+    The three session verbs (addendum 34) are in the handlers and the schemas but not the timeouts: they take
+    no verb lock and run no step, so nothing times them.
+    """
     agent = runner.AgentStack(settings=None)  # type: ignore[arg-type] -- only the verb table is read
     assert set(agent.verbs) == EXPECTED_VERBS, set(agent.verbs) ^ EXPECTED_VERBS
-    assert len(agent.verbs) == len(EXPECTED_VERBS) == 19
+    assert len(agent.verbs) == len(EXPECTED_VERBS) == 22
     assert set(runner.VERB_SCHEMAS) == EXPECTED_VERBS, set(runner.VERB_SCHEMAS) ^ EXPECTED_VERBS
-    assert set(runner.VERB_TIMEOUT_SECONDS) == EXPECTED_VERBS, set(runner.VERB_TIMEOUT_SECONDS) ^ EXPECTED_VERBS
-    assert set(VERB_SAMPLES) == EXPECTED_VERBS
+    timed = EXPECTED_VERBS - SESSION_VERBS
+    assert set(runner.VERB_TIMEOUT_SECONDS) == timed, set(runner.VERB_TIMEOUT_SECONDS) ^ timed
+    assert set(VERB_SAMPLES) == timed and set(SESSION_VERB_SAMPLES) == SESSION_VERBS
 
 
 def test_every_old_name_maps_to_a_final_name_and_none_is_one():

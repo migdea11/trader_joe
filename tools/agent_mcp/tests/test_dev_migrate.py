@@ -55,6 +55,7 @@ from tools.agent_mcp.tests.harness import (
     Rig,
     assert_no_budget_wording,
     assert_no_call_counter,
+    covering_agent,
     default_response,
     is_dev_digest,
     is_dev_up_wrapper,
@@ -1080,7 +1081,7 @@ def _secret_rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str) -> t
             return await runner.run_process(replace(step, argv=(str(fake), *step.argv[1:])))
         return await docker(step)
 
-    rig.agent = runner.AgentStack(rig.layout.settings, run=run)
+    rig.agent = covering_agent(rig, run)
     return rig, fakebin
 
 

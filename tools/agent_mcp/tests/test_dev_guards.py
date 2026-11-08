@@ -1593,7 +1593,8 @@ def test_no_tool_description_or_schema_text_mentions_a_budget_or_a_charge(
 ):
     """Exhaustive over every registered verb: the description the MCP tool list carries, and every schema string."""
     agent = make_rig(tmp_path, monkeypatch).agent
-    assert len(agent.verbs) == len(runner.VERB_SCHEMAS) == 19
+    # Twenty-two: addendum 34 added the session grant's two openers and its close, which this sweep covers too.
+    assert len(agent.verbs) == len(runner.VERB_SCHEMAS) == 22
     for verb in agent.verbs:
         for text in (agent.describe(verb), *_strings_in(runner.VERB_SCHEMAS[verb])):
             assert_no_budget_wording(text)

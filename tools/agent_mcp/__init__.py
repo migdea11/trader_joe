@@ -6,13 +6,39 @@ ONE compose project, the owner's own (stack.DEV_PROJECT, trader_joe_dev), in its
 is no second, isolated stack: the separate agent stack (its own compose project, generated env files
 and data directory, and its own verbs stack_up, stack_down and stack_wipe, plus its separate
 logs and ps, which the one-project logs and ps below replace) was retired in favour of modes of
-the one project (addenda 26-28). The nineteen verbs:
+the one project (addenda 26-28). The twenty-two verbs:
 
     ps()  logs(service, tail)  db_tables()  http_get(name)  migrate_status()
     down()  restart(service)  build()  up()  tools()
     migrate()  test_build()  test_up()
     run_system_tests(worktree, paths)  seed_dump(worktree, date)  test_reset()
     test_stop(service)  test_start(service)  test_env(service, overrides)
+    stack_session_open_test(bead, verbs, purpose, minutes)
+    stack_session_open_dev(bead, verbs, purpose, minutes)  stack_session_close()
+
+THE SESSION GRANT (ADR tj-4rr0la addendum 34; owner rulings 2026-11-06). Every STATE-CHANGING verb needs an
+open, unexpired grant that covers it; the READ verbs (ps, logs, migrate_status, db_tables, http_get) and the
+three session verbs need none. A grant is one approval per bead under test, held in THIS PROCESS'S MEMORY
+only (a server restart, such as make agent-mcp-rebuild, closes it; a client reconnect does not):
+    BEAD      the id of whatever is under test (a test-collection bead, a feature or bug bead, an epic);
+              free-form, never checked against the task store, which this server cannot read.
+    MODE      in the tool NAME, so a client's settings can treat the dev opener differently.
+    VERBS     a list from the mode's closed set. TEST: test_build, test_up, test_stop, test_start, test_env,
+              test_reset, run_system_tests, seed_dump, migrate, restart, down; or the string 'test-campaign',
+              all of them but down (down is named in a list on its own). DEV: build, up, down, restart,
+              migrate, tools, each named; there is no preset.
+    MINUTES   TEST: default 240, at most 480. DEV: default 60, at most 120. Over the maximum is REFUSED,
+              never trimmed, so the grant that exists is the one that was approved.
+    PURPOSE   one sentence, at most 200 printable characters: what is tested and what it will touch.
+Opening a grant replaces the open one. stack_session_close ends it and is free. Both bypass the verb lock and
+touch no docker. ENFORCED: mode, verb list and expiry. Recorded and echoed only: the purpose, and the bead's
+identity or status. The check is at ADMISSION: after 'unknown verb' and 'busy', before the argument check and
+before every rail of the verb, and a verb already admitted runs to its own timeout whatever happens to the
+grant. migrate, restart and down take the mode the mode guard resolves (an empty project counts as DEV), so
+their mode is checked right after that guard. A grant is an extra condition only; it never skips, reorders
+or relaxes a rail, and there is no counter or rate limit anywhere (addendum 33). A refusal names the open
+grant, or says none is open, and what to ask the owner to approve. ps ends with one line,
+`session: <bead> <MODE> [verbs] expires <UTC> - <purpose>` or `session: none`.
 
 TWO READ-ONLY VERBS (ADR tj-4rr0la addendum 18; tj-kzy7w2, approved on tj-wpnr7o (b)):
 
@@ -221,8 +247,10 @@ WHAT ELSE HOLDS
     Output: exit status plus stdout/stderr per step, each cut to its last runner.OUTPUT_CAP_BYTES
         with the cut stated. No env file is printed, and none is read by this server's Python.
     Audit: one JSON line per call in <stack dir>/audit.log -- UTC time, verb, known, validated
-        arguments, status, exit status, duration; an unknown verb by its name cut to 64 characters,
-        known: false. No output, no env value, and never the token.
+        arguments, status, exit status, duration, grant ({bead, mode, verbs, expires_at, purpose}, or
+        null); an unknown verb by its name cut to 64 characters, known: false. An opened, replaced
+        (session_replaced), closed or expired (session_expired) grant each writes a line. No output, no
+        env value, and never the token.
     Auth: auth.BearerTokenMiddleware refuses any request without the token, before the MCP app.
 
 DOCKER API SECTIONS THE VERBS NEED -- the socket proxy (tj-c4mosr.4) enables exactly these, as
