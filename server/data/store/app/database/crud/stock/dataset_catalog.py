@@ -8,7 +8,8 @@ for however many datasets it is asked about:
 
     list_catalog        every matching entry with its newest bar, in one statement
     bar_extents         first bar, last bar and count for a set of entries, in one statement
-    covered_dates       the session dates holding a bar, for a set of STATIC entries, in one statement per time zone
+    recent_placeholder_bars  one dataset's newest stored placeholder bars and their write times, in one statement
+    covered_dates       the session dates holding a real (non-placeholder) bar, for a set of STATIC entries, in one statement per time zone
     siblings            the other granularities of a set of entries' series, in one statement
     list_pending        the datasets whose expiry has passed (the reaper's pending set), keyset paged, in one statement
     pending_ids         the same set as ids, or those among a page's ids, in one statement
@@ -64,7 +65,7 @@ class CatalogFilter:
 
 @dataclass(frozen=True)
 class CatalogRow:
-    """One dataset entry as the catalog reads it, plus the newest bar timestamp.
+    """One dataset entry as the catalog reads it, plus the newest real bar timestamp.
 
     Attributes:
         id: The entry's id.
@@ -81,8 +82,8 @@ class CatalogRow:
         expiry: When the dataset is deleted, or None when nothing is scheduled.
         owner: The free-text label of who asked for it.
         collect: The operator's collect intent: True or False for a DAILY or STREAM subscription, None for STATIC.
-        last_bar: The newest stored bar's timestamp, or None when there are no bars.
-        last_bar_written_at: When that newest bar was last written (its updated_at), or None when there are no bars.
+        last_bar: The newest real (non-placeholder) bar's timestamp, or None when there are none.
+        last_bar_written_at: When that newest real bar was last written (its updated_at), or None when there are none.
     """
 
     id: uuid.UUID
@@ -142,11 +143,25 @@ def _bar_matches_entry() -> list[ColumnElement[bool]]:
     ]
 
 
+def _last_bar() -> ColumnElement[datetime]:
+    """The newest REAL bar's timestamp, a correlated scalar subquery: the value freshness reads.
+
+    A placeholder bar (Bar.is_placeholder_bar: volume 0 and trade count 0) is no trade, so it is never the newest
+    bar here; the stored rows are untouched. bar_extents is the stored extent and still counts every row.
+    """
+    return (
+        select(func.max(Bar.timestamp))
+        .where(*_bar_matches_entry(), ~Bar.is_placeholder_bar)
+        .correlate(Entry)
+        .scalar_subquery()
+    )
+
+
 def _last_bar_written_at() -> ColumnElement[datetime]:
-    """The newest bar's updated_at, a correlated scalar subquery: one more index range scan per entry."""
+    """The updated_at of the newest real bar (the one _last_bar names), a correlated scalar subquery."""
     return (
         select(Bar.updated_at)
-        .where(*_bar_matches_entry())
+        .where(*_bar_matches_entry(), ~Bar.is_placeholder_bar)
         .order_by(Bar.timestamp.desc())
         .limit(1)
         .correlate(Entry)
@@ -192,7 +207,7 @@ async def list_catalog(db: AsyncSession, catalog_filter: CatalogFilter) -> list[
     Returns:
         list[CatalogRow]: All matching entries, ascending by (asset_symbol, id). Empty for an empty store.
     """
-    last_bar = select(func.max(Bar.timestamp)).where(*_bar_matches_entry()).correlate(Entry).scalar_subquery()
+    last_bar = _last_bar()
     stmt = select(Entry, last_bar.label('last_bar'), _last_bar_written_at().label('last_bar_written_at')).order_by(
         Entry.asset_symbol, Entry.id
     )
@@ -216,7 +231,7 @@ async def get_catalog_row(db: AsyncSession, dataset_id: uuid.UUID) -> CatalogRow
     Returns:
         CatalogRow | None: The entry, or None.
     """
-    last_bar = select(func.max(Bar.timestamp)).where(*_bar_matches_entry()).correlate(Entry).scalar_subquery()
+    last_bar = _last_bar()
     result = await db.execute(
         select(Entry, last_bar.label('last_bar'), _last_bar_written_at().label('last_bar_written_at')).where(
             Entry.id == dataset_id
@@ -252,7 +267,7 @@ async def list_pending(
     Returns:
         list[CatalogRow]: The pending datasets, ascending by (expiry, id).
     """
-    last_bar = select(func.max(Bar.timestamp)).where(*_bar_matches_entry()).correlate(Entry).scalar_subquery()
+    last_bar = _last_bar()
     stmt = (
         select(Entry, last_bar.label('last_bar'), _last_bar_written_at().label('last_bar_written_at'))
         .where(_past_expiry(now))
@@ -335,8 +350,54 @@ async def bar_extents(db: AsyncSession, rows: list[CatalogRow]) -> dict[uuid.UUI
     return extents
 
 
+@dataclass(frozen=True)
+class PlaceholderBar:
+    """A stored placeholder bar as the refresh's tail rule reads it.
+
+    Attributes:
+        timestamp: The bar's timestamp.
+        written_at: When it was last written (its updated_at).
+    """
+
+    timestamp: datetime
+    written_at: datetime
+
+
+async def recent_placeholder_bars(
+    db: AsyncSession, row: CatalogRow, *, not_before: datetime | None, limit: int, before: datetime | None = None
+) -> list[PlaceholderBar]:
+    """One dataset's newest stored placeholder bars (Bar.is_placeholder_bar), newest first. One statement.
+
+    Read for the DAILY refresh's tail (tj-7zjov1.114): the stored bars after the newest real bar are placeholders,
+    and the refresh must know the newest of them and when each was written. The rule is the model's, never a
+    second comparison here. The bound `not_before` keeps the scan an index range over the natural key.
+
+    Args:
+        db: A session.
+        row: The dataset to read.
+        not_before: Keep only bars at or after this instant, or None for no lower bound.
+        limit: The most bars to return.
+        before: Keep only bars strictly before this instant (the next older page), or None.
+
+    Returns:
+        list[PlaceholderBar]: At most `limit` bars, descending by timestamp; empty when there are none.
+    """
+    conditions = _window_conditions(row, not_before, before)
+    stmt = (
+        select(Bar.timestamp, Bar.updated_at)
+        .where(*conditions, Bar.is_placeholder_bar)
+        .order_by(Bar.timestamp.desc())
+        .limit(limit)
+    )
+    result = await db.execute(stmt)
+    return [PlaceholderBar(timestamp=ts, written_at=written) for ts, written in result.all()]
+
+
 async def covered_dates(db: AsyncSession, rows: list[CatalogRow], tz_name: str) -> dict[uuid.UUID, frozenset[date]]:
-    """For each entry, the set of calendar dates (in tz_name) on which it holds at least one bar.
+    """For each entry, the set of calendar dates (in tz_name) on which it holds at least one real bar.
+
+    A placeholder bar (Bar.is_placeholder_bar: volume 0 and trade count 0) covers nothing, so a session holding
+    only placeholders is absent here and reads as a gap.
 
     This is the `covered` input of health.evaluate_dataset: a bar belongs to the session whose local date its
     timestamp falls on (trading_calendar.session_of), and Postgres computes that date in the calendar's own zone, so the
@@ -357,7 +418,7 @@ async def covered_dates(db: AsyncSession, rows: list[CatalogRow], tz_name: str) 
     stmt = (
         select(Entry.id, local_date)
         .join(Bar, and_(*_bar_matches_entry()))
-        .where(Entry.id.in_([row.id for row in rows]))
+        .where(Entry.id.in_([row.id for row in rows]), ~Bar.is_placeholder_bar)
         .distinct()
     )
     result = await db.execute(stmt)

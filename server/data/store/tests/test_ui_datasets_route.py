@@ -8,10 +8,11 @@ app's lifespan never runs (no Postgres, no data_ingest).
 
 WHAT SQLITE CANNOT SAY, AND THEREFORE WHAT THIS FILE DOES NOT CLAIM. Each is named so a Postgres-tier test
 (follow-up, see the bead's verdict note) knows exactly what is left:
-  * INSTANTS. SQLite stores a DateTime's wall clock and drops the offset; every instant here is UTC, so
-    comparisons are between equal-offset strings. The fixture below hands timestamps back UTC-aware, which is
-    what asyncpg does for timestamptz. That a [start, end) given in another offset compares as an instant is
-    Postgres's to show.
+  * INSTANTS. SQLite stores a DateTime's wall clock and drops the offset. The fixture below binds an aware
+    value as its UTC instant and hands it back UTC-aware, which is what Postgres and asyncpg do for timestamptz,
+    so a value written in another offset (the DAILY refresh's local-midnight tail, tj-grna9p.154) is stored as
+    the right instant. Comparisons IN SQL are still between UTC strings; that a [start, end) given in another
+    offset compares as an instant inside a query is Postgres's to show.
   * covered_dates. Its SQL calls Postgres's timezone(zone, timestamptz). SQLite has no such function, so the
     fixture registers a stand-in that does the same conversion, purely so the statement prepares. Its date()
     then comes back as TEXT rather than a date, so a STATIC dataset WITH bars would be judged wrongly here.
@@ -115,8 +116,25 @@ def _sqlite_timezone(zone: str, stamp: str | None) -> str | None:
 
 @pytest.fixture
 def aware_sqlite_datetimes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Read a timezone=True column back UTC-aware, as asyncpg reads timestamptz. Undone after the test."""
+    """Store and read a timezone=True column as a UTC instant, as Postgres does timestamptz. Undone after the test.
+
+    Without the bind half, SQLite would store an aware value's WALL CLOCK: 2026-10-01 00:00-04:00 written as
+    2026-10-01 00:00 and read back as 00:00Z, four hours early, an error Postgres can never make.
+    """
     original = DATETIME.result_processor
+    original_bind = DATETIME.bind_processor
+
+    def bind_processor(self, dialect):
+        process = original_bind(self, dialect)
+        if not self.timezone:
+            return process
+
+        def as_utc(value):
+            if isinstance(value, datetime) and value.utcoffset() is not None:
+                value = value.astimezone(UTC)
+            return process(value) if process else value
+
+        return as_utc
 
     def result_processor(self, dialect, coltype):
         process = original(self, dialect, coltype)
@@ -130,6 +148,7 @@ def aware_sqlite_datetimes(monkeypatch: pytest.MonkeyPatch) -> None:
         return aware
 
     monkeypatch.setattr(DATETIME, 'result_processor', result_processor)
+    monkeypatch.setattr(DATETIME, 'bind_processor', bind_processor)
 
 
 @pytest_asyncio.fixture

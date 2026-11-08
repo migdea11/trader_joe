@@ -18,7 +18,8 @@ STATUSES AND THE RULING THEY COME FROM (tj-grna9p.8 addendum, final form; tj-grn
                      last bar >= the last session's close minus one bar-length.
             OVERDUE  otherwise. A FAILURE. (STREAM has no source in PR 4; the rule is here so the table
                      is complete.)
-    STATIC  COMPLETE every expected session in [start, end) has at least one bar.
+    STATIC  COMPLETE every expected session in [start, end) has at least one real bar (a placeholder bar:
+                     volume 0 and trade count 0, is no trade).
             GAPS     some do; `gap_count` counts the SESSIONS inside [start, end) of missing periods
                      (not runs). Decided by completeness.assess_completeness; the status is mapped from its
                      CompletenessStatus, not redefined here.
@@ -146,8 +147,9 @@ def evaluate_dataset(
     `collect` is the subscription's collect intent (None for a STATIC dataset, which has none): False on a DAILY or
     STREAM dataset reads RETIRED, whatever its expiry.
 
-    `last_bar` is the newest bar timestamp (None when there are none). `covered` is the set of
-    sessions holding a bar (see completeness.covered_sessions); it is only read for STATIC, where None means
+    `last_bar` is the newest REAL bar timestamp, placeholder bars (volume 0 and trade count 0) skipped (None
+    when there are none). `covered` is the set of
+    sessions holding a real bar (see completeness.covered_sessions); it is only read for STATIC, where None means
     "no bars". [start, end) is the dataset's half-open range: STATIC checks all of it and DAILY owes
     only the completed sessions inside it (none closed yet reads FRESH with nothing expected; no
     bars at all means the first session in range is the first one missed). STREAM ignores it, since
@@ -185,6 +187,20 @@ def bar_period_close(bar: datetime, calendar: TradingCalendar, granularity: Gran
         local_midnight(period, calendar), local_midnight(next_period_start(period, granularity), calendar)
     )
     return calendar.session_close(sessions[-1]) if sessions else None
+
+
+def written_before_its_stamp(bar: datetime | None, written_at: datetime | None) -> bool:
+    """Whether a stored bar was written before its own stamp, so it was served early (a bar of a period not begun).
+
+    THE ONE COMPARISON freshness and the DAILY refresh share (tj-7zjov1.120): strict, so a bar written AT its stamp
+    is not before it. The write time is the fetch transaction's start, which opens before the vendor request, so it is a
+    lower bound on when the bar was served: written at or after the stamp means served after its period began. An
+    unknown bar or write time is not before.
+    """
+    if bar is None or written_at is None:
+        return False
+    require_aware(bar=bar, written_at=written_at)
+    return written_at < bar
 
 
 def last_bar_is_provisional(
@@ -228,12 +244,20 @@ def _daily(
     owed = list(dict.fromkeys(owed_sessions.values()))
     expected = owed[-1]
     expected_bar = local_midnight(expected, calendar)
-    last_period = None if last_bar is None else period_start(session_of(last_bar, calendar), granularity)
+    # A bar written BEFORE ITS OWN STAMP is judged AT ITS WRITE TIME (tj-7zjov1.120 addendum 1). The write time is the
+    # fetch transaction's start, which opens before the vendor request, so it is a lower bound on when the bar was
+    # served: the bar proves the dataset was fetched through its write time and no further. Judging at that instant
+    # runs the ordinary rule (period, provisional test, first missed period, deadline) and gives the same answer as a
+    # bar stamped at the write time. A live 1min fetch whose last bar is stamped a few seconds after the transaction
+    # start therefore reads FRESH after the close, and a bar stamped far ahead is owed at the first close after it was
+    # written.
+    judged_at = last_bar_written_at if written_before_its_stamp(last_bar, last_bar_written_at) else last_bar
+    last_period = None if judged_at is None else period_start(session_of(judged_at, calendar), granularity)
     # The expected period's bar counts only once FINAL (written after its period closed and settled); a provisional one is pending,
     # LATE with the normal deadline, until a re-fetch after the close rewrites it. A newer, still open period holds
     # nothing owed, and the period that closes later is judged then.
     provisional = last_period == expected and last_bar_is_provisional(
-        last_bar, last_bar_written_at, calendar, granularity, settle_margin
+        judged_at, last_bar_written_at, calendar, granularity, settle_margin
     )
     if last_period is not None and last_period >= expected and not provisional:
         return DatasetHealth(FreshnessStatus.FRESH, expected, expected_bar)
@@ -282,4 +306,5 @@ __all__ = [
     'evaluate_dataset',
     'last_bar_is_provisional',
     'settle_margin_from_env',
+    'written_before_its_stamp',
 ]

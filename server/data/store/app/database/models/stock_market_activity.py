@@ -1,6 +1,7 @@
 from typing import Any
 
 from sqlalchemy import Column, Float, Index, Integer, UniqueConstraint
+from sqlalchemy.ext.hybrid import hybrid_property
 
 from common.enums.data_select import AssetType, DataType
 from data.store.app.database.models.base_market_activity import BaseMarketActivity
@@ -48,6 +49,21 @@ class StockMarketActivity(BaseMarketActivity):
         UniqueConstraint(*BaseMarketActivity.NATURAL_KEY, name=NATURAL_KEY_CONSTRAINT),
         Index(SYMBOL_GRANULARITY_TIMESTAMP_INDEX, 'asset_symbol', 'granularity', 'timestamp'),
     )
+
+    @hybrid_property
+    def is_placeholder_bar(self) -> bool:
+        """THE PLACEHOLDER RULE, written once: volume 0 AND trade count 0 (tj-7zjov1.103, tj-26jt9w addendum 7).
+
+        The vendor serves a bar for a session in which nothing traded (PARA: 809 of them, every day of 2019-12 to
+        2020-12 at 0.206). The bar is stored raw, as served, and counts as NO TRADE: it covers no session in
+        completeness, it is not the newest bar freshness reads, and it is not a holder's first or last real bar in
+        the lineage report. Volume 0 with a trade count above 0, or the reverse, is a real (odd) bar and not a
+        placeholder.
+
+        On an instance it is a plain bool; on the class it is the SQL predicate, so a query and a Python check
+        cannot disagree. Every reader that must not count a placeholder uses this, never its own comparison.
+        """
+        return (self.volume == 0) & (self.trade_count == 0)
 
     @classmethod
     def from_batch_create(cls, batch_create: BatchStockDataMarketActivityCreate) -> list[dict[str, Any]]:

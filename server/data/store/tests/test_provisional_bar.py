@@ -67,6 +67,7 @@ from data.store.app.health import (
     evaluate_dataset,
     last_bar_is_provisional,
     settle_margin_from_env,
+    written_before_its_stamp,
 )
 from data.store.app.trading_calendar import NaiveDatetimeError, session_of
 from data.store.tests import test_daily_refresh, test_ui_datasets_route
@@ -758,8 +759,9 @@ def test_a_completed_bar_gives_exactly_the_pre_change_result(granularity):
     assert judged_at_settle, 'the grid never wrote a bar exactly at its close plus the margin'
 
 
+# A write BEFORE the bar's own stamp is judged at the write time instead (decision tj-7zjov1.120 ruling 6), pinned by
+# test_a_bar_written_before_its_stamp_is_judged_at_its_write_time below; this own-period rule does not cover it.
 WITHHOLDING_WRITES = {
-    'a day before its own timestamp': lambda last_bar, close: last_bar - timedelta(days=1),
     'at its session close': lambda last_bar, close: close,
     'inside the margin': lambda last_bar, close: close + 5 * MINUTE,
     'a tick before the margin ends': lambda last_bar, close: close + SETTLE - TICK,
@@ -791,6 +793,168 @@ def test_a_provisional_bar_only_ever_withholds_fresh_for_its_own_expected_period
                     differ.append(('same', start, end, now, last_bar, got, old))
     assert not differ, differ[:5]
     assert flipped, 'the grid never reached a provisional bar of the expected period'
+
+
+# ------------------------------------------------------------------------------------------------- written early
+# Decision tj-7zjov1.120 rulings 5 and 6 (b41354d): a newest real bar written strictly BEFORE its own stamp is judged
+# AT ITS WRITE TIME, by the ordinary rule. Equality is not before.
+
+BEFORE_STAMP_WRITES = {
+    'a day before its own timestamp': lambda last_bar: last_bar - timedelta(days=1),
+    'a tick before its own timestamp': lambda last_bar: last_bar - TICK,
+    'an hour before its own timestamp': lambda last_bar: last_bar - timedelta(hours=1),
+}
+
+
+@pytest.mark.parametrize('write', BEFORE_STAMP_WRITES.values(), ids=BEFORE_STAMP_WRITES)
+@pytest.mark.parametrize('granularity', SESSION_GRANULARITIES, ids=str)
+def test_a_bar_written_before_its_stamp_is_judged_at_its_write_time(granularity, write):
+    """Over the whole grid: the same health as a bar STAMPED at its write time (and written then)."""
+    differ, early = [], 0
+    for start, end in GRID_RANGES:
+        for now in GRID_NOWS:
+            for last_bar in GRID_LAST_BARS:
+                if last_bar is None:
+                    continue
+                written = write(last_bar)
+                got = daily(start, now, last_bar, granularity, written, end)
+                if written < start:
+                    continue  # a write before the declared start is no bar of the range to judge by
+                want = daily(start, now, written, granularity, written, end)
+                early += 1
+                if got != want:
+                    differ.append((start, end, now, last_bar, written, got, want))
+    assert early, 'the grid never judged an early bar'
+    assert not differ, differ[:5]
+
+
+# (granularity, newest real bar, its write time, now, status): the architect's table on tj-7zjov1.114, by hand.
+WRITTEN_EARLY_TABLE = {
+    # D1: Mon 2 Nov never stored, the newest bar Fri 30 Oct written early: a missed session is a failure.
+    'D1 a day before its stamp, 2 Nov missed: OVERDUE': (
+        DAY,
+        z('2026-10-30T04:00:00Z'),
+        z('2026-10-29T04:00:00Z'),
+        z('2026-11-03T21:00:00Z'),
+        FreshnessStatus.OVERDUE,
+    ),
+    'D1 a tick before its stamp, 2 Nov missed: OVERDUE': (
+        DAY,
+        z('2026-10-30T04:00:00Z'),
+        z('2026-10-30T04:00:00Z') - TICK,
+        z('2026-11-03T21:00:00Z'),
+        FreshnessStatus.OVERDUE,
+    ),
+    'D1 control, written after its stamp: OVERDUE': (
+        DAY,
+        z('2026-10-30T04:00:00Z'),
+        z('2026-10-30T21:00:00Z'),
+        z('2026-11-03T21:00:00Z'),
+        FreshnessStatus.OVERDUE,
+    ),
+    # D2: a mid-session 1min fetch whose last bar is stamped 30 s after the transaction start.
+    'D2 1min written 30 s before its stamp, 15:00Z: FRESH': (
+        Granularity.ONE_MINUTE,
+        z('2026-10-20T14:37:00Z'),
+        z('2026-10-20T14:36:30Z'),
+        z('2026-10-20T15:00:00Z'),
+        FreshnessStatus.FRESH,
+    ),
+    # F7: a 1min fetch at the 20:30Z pass, last bar 20:31Z, written 20:30:10Z.
+    'F7 at 20 Oct 21:00Z: FRESH': (
+        Granularity.ONE_MINUTE,
+        z('2026-10-20T20:31:00Z'),
+        z('2026-10-20T20:30:10Z'),
+        z('2026-10-20T21:00:00Z'),
+        FreshnessStatus.FRESH,
+    ),
+    'F7 at 21 Oct 15:00Z: FRESH': (
+        Granularity.ONE_MINUTE,
+        z('2026-10-20T20:31:00Z'),
+        z('2026-10-20T20:30:10Z'),
+        z('2026-10-21T15:00:00Z'),
+        FreshnessStatus.FRESH,
+    ),
+    'F7 at 21 Oct 20:31Z: LATE': (
+        Granularity.ONE_MINUTE,
+        z('2026-10-20T20:31:00Z'),
+        z('2026-10-20T20:30:10Z'),
+        z('2026-10-21T20:31:00Z'),
+        FreshnessStatus.LATE,
+    ),
+    # A 1day bar stamped a week ahead (27 Oct), written 20 Oct 15:00Z: owed at the first close after its write.
+    'a week ahead, at 20 Oct 21:00Z: LATE': (
+        DAY,
+        z('2026-10-27T04:00:00Z'),
+        z('2026-10-20T15:00:00Z'),
+        z('2026-10-20T21:00:00Z'),
+        FreshnessStatus.LATE,
+    ),
+    'a week ahead, at 21 Oct 00:00Z: LATE': (
+        DAY,
+        z('2026-10-27T04:00:00Z'),
+        z('2026-10-20T15:00:00Z'),
+        z('2026-10-21T00:00:00Z'),
+        FreshnessStatus.LATE,
+    ),
+    'a week ahead, at 21 Oct 15:00Z: OVERDUE': (
+        DAY,
+        z('2026-10-27T04:00:00Z'),
+        z('2026-10-20T15:00:00Z'),
+        z('2026-10-21T15:00:00Z'),
+        FreshnessStatus.OVERDUE,
+    ),
+    # Ruling 5: written exactly AT its stamp is not early (and judging at it changes nothing: the same instant).
+    'written at its stamp, mid-session: FRESH': (
+        Granularity.ONE_MINUTE,
+        z('2026-10-20T14:37:00Z'),
+        z('2026-10-20T14:37:00Z'),
+        z('2026-10-20T15:00:00Z'),
+        FreshnessStatus.FRESH,
+    ),
+    'unknown write time: final, FRESH': (
+        Granularity.ONE_MINUTE,
+        z('2026-10-20T14:37:00Z'),
+        None,
+        z('2026-10-20T15:00:00Z'),
+        FreshnessStatus.FRESH,
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ('granularity', 'last_bar', 'written', 'now', 'status'), WRITTEN_EARLY_TABLE.values(), ids=WRITTEN_EARLY_TABLE
+)
+def test_the_written_early_table(granularity, last_bar, written, now, status):
+    assert daily(SUB_START, now, last_bar, granularity, written).status is status
+
+
+def test_written_before_its_stamp_is_strict_and_unknown_is_not_before():
+    stamp = z('2026-10-20T14:37:00Z')
+    assert written_before_its_stamp(stamp, stamp - TICK) is True
+    assert written_before_its_stamp(stamp, stamp) is False
+    assert written_before_its_stamp(stamp, stamp + TICK) is False
+    assert written_before_its_stamp(stamp, None) is False
+    assert written_before_its_stamp(None, stamp) is False
+
+
+def test_the_refresh_and_freshness_share_the_one_predicate():
+    """Ruling 5: one comparison, in health, used by both. A second copy in the refresh would drift (F9)."""
+    assert refresh_module.written_before_its_stamp is health.written_before_its_stamp
+    calls: list[tuple] = []
+
+    def spy(bar, written_at):
+        calls.append((bar, written_at))
+        return health.written_before_its_stamp(bar, written_at)
+
+    row = _row(z('2026-10-09T04:00:00Z'), z('2026-10-09T04:00:00Z'))
+    original = refresh_module.written_before_its_stamp
+    refresh_module.written_before_its_stamp = spy
+    try:
+        _fetch_start(row, XNYS, [], z('2026-10-14T22:00:00Z'))
+    finally:
+        refresh_module.written_before_its_stamp = original
+    assert (z('2026-10-09T04:00:00Z'), z('2026-10-09T04:00:00Z')) in calls, 'the refresh did not ask the predicate'
 
 
 # ------------------------------------------------------------------------------------------------- the fetch start
@@ -873,7 +1037,14 @@ FETCH_CASES = {
         _row(MONTH_BAR, z('2026-09-30T20:30:00Z'), MONTH, MONTHLY_SUB_START),
         MONTH_BAR + MONTH.offset,
     ),
-    'a bar on a non-session day: one bar on': (_row(m(d('2026-10-24')), z('2026-10-23T12:00:00Z')), m(d('2026-10-25'))),
+    # A real bar on a non-session day counts and the tail is one bar on. Its fixture was written BEFORE its stamp
+    # (23 Oct for a 24 Oct bar), which no longer counts (decision tj-7zjov1.120): written after its stamp here, and
+    # the early write pinned on its own next.
+    'a bar on a non-session day: one bar on': (_row(m(d('2026-10-24')), z('2026-10-24T12:00:00Z')), m(d('2026-10-25'))),
+    'a bar on a non-session day written before its stamp: the session of the write': (
+        _row(m(d('2026-10-24')), z('2026-10-23T12:00:00Z')),
+        m(d('2026-10-23')),
+    ),
 }
 
 

@@ -5,7 +5,8 @@ calendar are arguments, so a table of cases pins every answer without patching a
 trading_calendar; health builds on it (trading_calendar -> completeness -> health).
 
 STATIC COMPLETENESS (assess_completeness):
-    COMPLETE every expected session in [start, end) has at least one bar.
+    COMPLETE every expected session in [start, end) has at least one real bar (a placeholder bar:
+             volume 0 and trade count 0, is no trade).
     GAPS     some do; `gap_count` counts the SESSIONS inside [start, end) of missing periods (not runs).
 
 A BAR BELONGS TO THE SESSION WHOSE LOCAL DATE (in the calendar's time zone) ITS TIMESTAMP FALLS ON.
@@ -174,7 +175,8 @@ def assess_completeness(
 ) -> CompletenessResult:
     """Whether every expected session of [start, end) holds a bar (the STATIC rule), and how many do not.
 
-    `covered` is the set of sessions holding a bar (see covered_sessions); empty means no bars. COMPLETE when nothing
+    `covered` is the set of sessions holding a real, non-placeholder bar (see covered_sessions); empty means no
+    bars. COMPLETE when nothing
     is missing, else GAPS with `gap_count` the number of missing SESSIONS inside [start, end).
     """
     missing = _missing_sessions(start, end, covered, calendar, now, granularity)

@@ -89,6 +89,8 @@ EXPECTED: dict[str, str] = {
     'bar_period_close': 'health',
     'evaluate_dataset': 'health',
     'last_bar_is_provisional': 'health',
+    # Decision tj-7zjov1.120 ruling 5: the one written-before-its-stamp comparison freshness and the refresh share.
+    'written_before_its_stamp': 'health',
 }
 
 # freshness.__all__ at 9ecbf88, the tip before the split, written out: each must still be importable.

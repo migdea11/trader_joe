@@ -35,7 +35,8 @@ from sqlalchemy import delete, event, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.pool import StaticPool
 
-from common.enums.data_stock import DataSource, Feed, UpdateType
+from common.enums.data_select import AssetType, DataType
+from common.enums.data_stock import DataSource, ExpiryType, Feed, Granularity, UpdateType
 from common.errors.vocabulary import ERROR_DOMAIN, ExogenousError, InvalidRequestError, Reason
 from common.scheduling import AfterTradingEvent, TradingEvent
 from data.store.app import app_depends
@@ -47,7 +48,9 @@ from data.store.app.daily_refresh import (
     SCHEDULER_ACTOR,
     DailyRefresher,
     PassResult,
+    _fetch_start,
 )
+from data.store.app.database.crud.stock.dataset_catalog import CatalogRow
 from data.store.app.database.crud.stock.store_dataset_entry import OwnOverlapConflict
 from data.store.app.database.models.ingest_run import IngestRun, IngestRunState, IngestRunTrigger
 from data.store.app.database.models.stock_market_activity import StockMarketActivity
@@ -93,6 +96,10 @@ LAST_BAR = {
     'retired': ny_midnight(1),
     'running': ny_midnight(1),
 }
+# Where each behind dataset's tail starts, WRITTEN OUT rather than computed from LAST_BAR: the local midnight of the
+# day after its last 1day bar (tj-grna9p.154). `behind2`'s last bar is Fri 2 Oct, so its tail is Sat 3 Oct: the step
+# is by local date, not to the next session. `empty` has no bars and starts at its declared start.
+TAIL = {'older': ny_midnight(1), 'empty': ny_midnight(1), 'behind2': ny_midnight(3), 'behind': ny_midnight(6)}
 
 
 def _seed() -> dict[str, StoreDatasetEntry]:
@@ -369,8 +376,7 @@ async def test_each_fetch_asks_only_for_the_missing_tail_with_the_stored_feed(wo
     by_name = {world.name_of(request.asset_symbol): request for request in client.requests}
     for name in BEHIND_ORDER:
         row, request = world.rows[name], by_name[name]
-        expected_start = row.start if name == 'empty' else LAST_BAR[name] + row.granularity.offset
-        assert request.start == expected_start, name
+        assert request.start == TAIL[name], name
         assert request.end is None, name
         assert request.feed is row.feed, f'{name}: the stored feed is not the preference sent'
         assert request.update_type is UpdateType.DAILY
@@ -412,7 +418,7 @@ async def test_the_narrowed_start_would_collide_if_it_reached_the_overlap_key(wo
         source=row.source,
         feed=row.feed,
         granularity=row.granularity,
-        start=LAST_BAR['behind'] + row.granularity.offset,
+        start=TAIL['behind'],
         expiry_type=row.expiry_type,
         update_type=row.update_type,
     )
@@ -460,8 +466,8 @@ async def test_each_refresh_is_a_schedule_run_by_the_scheduler_with_the_tail_it_
         run = runs[row.id]
         assert run.trigger is IngestRunTrigger.SCHEDULE
         assert run.actor == SCHEDULER_ACTOR, "the run is the scheduler's, whatever owner the dataset has"
-        expected_start = row.start if name == 'empty' else LAST_BAR[name] + row.granularity.offset
-        assert run.requested_start == expected_start
+        # Read back from the run table: the same INSTANT as the tail, whatever offset the refresh computed it in.
+        assert run.requested_start == TAIL[name], name
         assert run.requested_end is None
         assert run.state is IngestRunState.SUCCEEDED
         assert run.bars_written == 1
@@ -890,9 +896,8 @@ async def test_an_unmigrated_database_warns_once_per_process_and_the_loop_goes_o
 LAST_CLOSE = datetime(2026, 10, 6, 20, 0, tzinfo=UTC)
 
 
-def _tail(world: World, name: str) -> datetime:
-    row = world.rows[name]
-    return row.start if name == 'empty' else LAST_BAR[name] + row.granularity.offset
+def _tail(_world: World, name: str) -> datetime:
+    return TAIL[name]
 
 
 def _scheduled_run(
@@ -1038,7 +1043,7 @@ async def test_after_a_failed_daily_run_the_next_pass_starts_at_the_last_stored_
     await world.refresher(client).run_pass(DataSource.ALPACA_API)
 
     (again,) = [request for request in client.requests if request.asset_symbol == _symbol(world, 'older')]
-    assert again.start == LAST_BAR['older'] + world.rows['older'].granularity.offset
+    assert again.start == TAIL['older']
     # Each run is attributed to the pass that wrote it, never ordered by started_at: on SQLite func.now() has
     # whole-second resolution, so both runs usually share a started_at and an ORDER BY falls to the random id.
     (succeeded,) = [run for run in await _finished_runs_of(world, 'older') if run.id != failed.id]
@@ -1171,7 +1176,8 @@ async def test_datasets_always_empty_hold_at_most_half_the_cap_and_healthy_ones_
                 name,
                 state=IngestRunState.EMPTY,
                 finished_at=LAST_CLOSE - timedelta(hours=20),
-                requested_start=ny_midnight(2) + world.rows[name].granularity.offset,
+                # Last bar Fri 2 Oct: the tail is the next local midnight, Sat 3 Oct.
+                requested_start=ny_midnight(3),
             )
             for name in dead
         ),
@@ -1315,6 +1321,106 @@ async def test_the_refresh_upserts_with_preserve_lifecycle_and_post_store_does_n
     async with AsyncSession(world.engine) as db:
         await data_action_request.store_market_activity_worker(path, stopped, db, ScriptedClient())
     assert world.upsert_kwargs == [{'collect': False}], 'POST /store dropped an explicit collect false'
+
+
+# ------------------------------------------------------------------------------------------------- the tail across DST
+# tj-grna9p.154. A 1day or 1week bar is stamped at LOCAL midnight in the calendar's zone (XNYS: America/New_York),
+# 05:00Z under EST and 04:00Z under EDT. 2026's changes are Sun 8 Mar (spring forward) and Sun 1 Nov (fall back). A
+# fixed offset from a winter stamp lands an hour AFTER the next summer stamp, and a vendor filtering on
+# timestamp >= start would drop that bar. Every expected value below is a literal instant, never computed.
+
+XNYS = calendar_for_source(DataSource.ALPACA_API)
+
+
+def _z(text: str) -> datetime:
+    return datetime.fromisoformat(text.replace('Z', '+00:00'))
+
+
+def _catalog_row(granularity: Granularity, last_bar: datetime, written: datetime | None = None) -> CatalogRow:
+    """A DAILY row whose newest bar was written long after its period closed (final), unless `written` says so."""
+    return CatalogRow(
+        id=uuid.uuid4(),
+        asset_symbol=f'{SYMBOL_PREFIX}T',
+        asset_type=AssetType.STOCK,
+        data_type=DataType.MARKET_ACTIVITY,
+        source=DataSource.ALPACA_API,
+        feed=Feed.IEX,
+        granularity=granularity,
+        start=_z('2026-01-05T05:00:00Z'),
+        end=None,
+        update_type=UpdateType.DAILY,
+        expiry_type=ExpiryType.ROLLING,
+        expiry=None,
+        owner='operator',
+        last_bar=last_bar,
+        last_bar_written_at=last_bar + timedelta(days=40) if written is None else written,
+        collect=True,
+    )
+
+
+TAIL_CASES = {
+    # The two the bead names. A fixed 7 days would give 2026-03-09T05:00Z (an hour past the bar) and 2026-11-02T04:00Z.
+    '1week spring forward': (Granularity.ONE_WEEK, '2026-03-02T05:00:00Z', '2026-03-09T04:00:00Z'),
+    '1week fall back': (Granularity.ONE_WEEK, '2026-10-26T04:00:00Z', '2026-11-02T05:00:00Z'),
+    # The vendor may stamp a week on any day of it: the tail is the next week's Monday, not the stamp plus a week.
+    '1week stamped mid-week': (Granularity.ONE_WEEK, '2026-03-04T05:00:00Z', '2026-03-09T04:00:00Z'),
+    # A Friday's tail is the Saturday (by local date, not the next session), in each zone offset.
+    '1day Friday before spring forward': (Granularity.ONE_DAY, '2026-03-06T05:00:00Z', '2026-03-07T05:00:00Z'),
+    '1day Friday before fall back': (Granularity.ONE_DAY, '2026-10-30T04:00:00Z', '2026-10-31T04:00:00Z'),
+    # The day OF the change: a fixed 24h would give 05:00Z and 04:00Z, each an hour off the next local midnight.
+    '1day the spring-forward Sunday': (Granularity.ONE_DAY, '2026-03-08T05:00:00Z', '2026-03-09T04:00:00Z'),
+    '1day the fall-back Sunday': (Granularity.ONE_DAY, '2026-11-01T04:00:00Z', '2026-11-02T05:00:00Z'),
+    # Shorter bars are absolute durations; a month keeps its 4-week offset (it always lands before the next month).
+    '1hour across spring forward keeps the offset': (
+        Granularity.ONE_HOUR,
+        '2026-03-06T20:00:00Z',
+        '2026-03-06T21:00:00Z',
+    ),
+    '1month across spring forward keeps the offset': (
+        Granularity.ONE_MONTH,
+        '2026-03-01T05:00:00Z',
+        '2026-03-29T05:00:00Z',
+    ),
+}
+
+
+@pytest.mark.parametrize(('granularity', 'last_bar', 'expected'), TAIL_CASES.values(), ids=TAIL_CASES.keys())
+def test_the_tail_starts_at_the_first_instant_the_next_bar_can_be_stamped(granularity, last_bar, expected):
+    tail = _fetch_start(_catalog_row(granularity, _z(last_bar)), XNYS)
+
+    assert tail == _z(expected)
+    assert tail.utcoffset() is not None, 'a naive tail names no instant'
+
+
+def test_a_provisional_weekly_bar_is_asked_for_again_from_itself_across_the_change():
+    """Written mid-week, before its week closed: the tail is the bar itself, inclusive, not the next Monday."""
+    last_bar = _z('2026-03-02T05:00:00Z')
+    row = _catalog_row(Granularity.ONE_WEEK, last_bar, written=_z('2026-03-04T21:00:00Z'))
+
+    assert _fetch_start(row, XNYS) == last_bar
+
+
+@pytest.mark.asyncio
+async def test_a_pass_after_spring_forward_asks_for_and_records_the_next_local_midnight(world: World):
+    """End to end: the request ingest gets and the run row read back both name 2026-03-09T04:00Z."""
+    weekly = entry(
+        f'{SYMBOL_PREFIX}W',
+        granularity=Granularity.ONE_WEEK,
+        update_type=UpdateType.DAILY,
+        start=_z('2026-02-02T05:00:00Z'),
+    )
+    world.rows['weekly'] = weekly
+    await _add(world, weekly)
+    await _add(world, bar(weekly, _z('2026-03-02T05:00:00Z')))
+    client = ScriptedClient()
+
+    # Sat 14 Mar: the week of 9 Mar has ended, so the dataset holding only the week of 2 Mar is behind.
+    await world.refresher(client, now=_z('2026-03-14T12:00:00Z')).run_pass(DataSource.ALPACA_API)
+
+    (request,) = [request for request in client.requests if request.asset_symbol == weekly.asset_symbol]
+    assert request.start == _z('2026-03-09T04:00:00Z')
+    (run,) = await _finished_runs_of(world, 'weekly')
+    assert run.requested_start == _z('2026-03-09T04:00:00Z')
 
 
 # ------------------------------------------------------------------------------------------------- the lifespan

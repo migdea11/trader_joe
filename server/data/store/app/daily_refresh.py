@@ -13,9 +13,11 @@ WHAT. Every pass derives its work from the DATABASE; nothing is stored and nothi
 It reads the DAILY entries of its source, drops the retired ones (collect is false: the operator stopped it, the
 same rule the UI judges by: is_retired; an expiry alone retires nothing), drops those with a RUNNING ingest, and keeps the ones the freshness rule
 reads LATE or OVERDUE: the last stored bar is before the last completed session. For each, oldest first, it asks
-ingest for ONLY the missing range: from the last stored bar plus one bar (the declared start when there are no
-bars; from the last bar ITSELF when it was written before its period closed, so the vendor's part-way bar is
-overwritten by the final one, tj-grna9p.167), through the same fetch path POST /store uses (store_market_activity_worker, through the run recorder with
+ingest for ONLY the missing range: from the newest STORED bar plus one bar, a placeholder bar included (the declared
+start when there are no bars), reaching back to the newest real bar when it was written before its period closed
+(the vendor's part-way bar is overwritten by the final one, tj-grna9p.167) and to the oldest placeholder not yet
+settled for PLACEHOLDER_GRACE (a pad the vendor may replace, tj-7zjov1.114); never before the declared start, and
+nothing is requested when that leaves no period to ask for; through the same fetch path POST /store uses (store_market_activity_worker, through the run recorder with
 trigger SCHEDULE and actor `scheduler`). The entry keeps its declared range as identity, so the refresh extends the
 existing entry and never creates a second one. A dataset requested earlier is therefore picked up by the next pass.
 
@@ -55,23 +57,31 @@ import asyncio
 import contextlib
 import os
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from itertools import pairwise
 from typing import Final
 
 from pydantic import ValidationError
 from sqlalchemy import inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from common.enums.data_stock import DataSource, UpdateType
+from common.enums.data_stock import DataSource, Granularity, UpdateType
 from common.environment import get_env_var
 from common.errors.vocabulary import ERROR_DOMAIN, REASONS, Outcome, TraderJoeError
 from common.logging import get_logger
 from common.rpc.clients.ingest_fetch import IngestFetchClient
 from common.scheduling import AfterTradingEvent, TradingEvent, run_periodic
+from data.store.app.completeness import next_period_start, period_start
 from data.store.app.database.crud.ingest_run import IngestRunRecord, finished_scheduled_runs, running_dataset_ids
-from data.store.app.database.crud.stock.dataset_catalog import CatalogFilter, CatalogRow, list_catalog
+from data.store.app.database.crud.stock.dataset_catalog import (
+    CatalogFilter,
+    CatalogRow,
+    PlaceholderBar,
+    list_catalog,
+    recent_placeholder_bars,
+)
 from data.store.app.database.database import own_session
 from data.store.app.database.models.ingest_run import IngestRun, IngestRunState, IngestRunTrigger
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
@@ -84,9 +94,11 @@ from data.store.app.health import SETTLE_ENV as SETTLE_ENV
 from data.store.app.health import (
     FreshnessConfig,
     FreshnessStatus,
+    bar_period_close,
     evaluate_dataset,
     last_bar_is_provisional,
     settle_margin_from_env,
+    written_before_its_stamp,
 )
 from data.store.app.ingest.data_action_request import DatasetRetiredDuringFetch, store_market_activity_worker
 from data.store.app.ingest.run_recording import recorded_run
@@ -96,6 +108,8 @@ from data.store.app.trading_calendar import (
     TradingCalendar,
     UnknownCalendarError,
     calendar_for_source,
+    local_midnight,
+    session_of,
 )
 from schemas.data_store.asset_dataset_store import StoreAssetDatasetBody, StoreAssetDatasetPath
 
@@ -119,6 +133,15 @@ SCHEDULER_ACTOR: Final = 'scheduler'
 # as never attempted, which only puts it earlier.
 ATTEMPT_LOOKBACK: Final = timedelta(days=7)
 
+# How long after its period's close (and the settle margin) a stored placeholder bar is still asked for again. The
+# cost is bounded and constant: a dead series re-requests this window in one call per pass rather than a tail that
+# grows by a session per close.
+PLACEHOLDER_GRACE: Final = timedelta(days=7)
+# How far before the newest real bar the placeholders are read: the grace plus the longest bar period (a month).
+PLACEHOLDER_LOOKBACK: Final = PLACEHOLDER_GRACE + timedelta(days=35)
+# The placeholders read per page; older pages are read while the page just read still ends in an unsettled one.
+PLACEHOLDER_SCAN_LIMIT: Final = 5000
+
 # The reasons a typed refusal can carry that no retry cures: the vocabulary's REFUSED outcome, by the single table
 # every error's disposition is decided from. As the strings a finished run stores.
 PERMANENT_REASONS: Final = frozenset(str(reason) for reason, spec in REASONS.items() if spec.outcome is Outcome.REFUSED)
@@ -140,32 +163,214 @@ def _as_aware(instant: datetime) -> datetime:
     return instant if instant.tzinfo is not None else instant.replace(tzinfo=UTC)
 
 
-def _fetch_start(row: CatalogRow, calendar: TradingCalendar) -> datetime:
-    """Where the refresh's tail starts: the declared start with no bars, else just after the newest bar.
+def _can_be_real(
+    bar: datetime,
+    written_at: datetime | None,
+    row: CatalogRow,
+    calendar: TradingCalendar,
+    now: datetime | None,
+    *,
+    placeholder: bool,
+) -> bool:
+    """Whether a stored bar COUNTS as fetched, so that it may advance the start of the tail.
 
-    A newest bar written before its period closed and settled may be the vendor's part-way bar (see
-    last_bar_is_provisional; for 1min..1hour the period is the whole session, not the bar's own), so
-    the tail starts AT that bar and the upsert overwrites it with the final one. Once it is rewritten after the close
-    it is final and the tail starts after it again.
+    THE RULE (tj-7zjov1.114, decision tj-7zjov1.120): only a bar that was a real bar of the dataset when it was
+    fetched may advance the start. A stored bar that does not count never stands for the sessions before it, because
+    the start would then pass a session never requested and nothing would ever ask for it again (a permanent gap).
+    It does not count when it
+      - is stamped at or after `now` (a bar of a period that has not happened);
+      - was WRITTEN BEFORE ITS OWN STAMP (health.written_before_its_stamp: written_at < timestamp, equality counts):
+        it was a future bar when it was fetched, so the
+        sessions between that fetch and its stamp were never requested. The `now` test alone is not enough: the bar
+        starts to count once now passes its stamp, and a pass that did not run in between (downtime) would leave
+        those sessions unrequested for good. Only a rewrite after the stamp makes it count. An unknown write time
+        (None) leaves the other tests to decide;
+      - is outside the declared range [start, end);
+      - is a PLACEHOLDER in a period that holds no session (a weekend or holiday pad), or one the calendar cannot
+        place.
+    A real bar (trades) in a no-session period is data the vendor served and still counts. A bar that does not count
+    is ignored here (it stays stored, raw). The cost is a re-request of the sessions before it.
     """
-    if row.last_bar is None:
-        return row.start
-    if last_bar_is_provisional(
-        row.last_bar, row.last_bar_written_at, calendar, row.granularity, settle_margin_from_env()
+    stamp = _as_aware(bar)
+    if now is not None and stamp >= _as_aware(now):
+        return False
+    if written_at is not None and written_before_its_stamp(stamp, _as_aware(written_at)):
+        return False
+    if stamp < _as_aware(row.start) or (row.end is not None and stamp >= _as_aware(row.end)):
+        return False
+    if not placeholder:
+        return True
+    try:
+        return bar_period_close(stamp, calendar, row.granularity) is not None
+    except CalendarRangeError:
+        return False
+
+
+def _written_early_inside_range(row: CatalogRow) -> bool:
+    """Whether the newest real bar fails to count ONLY by being written before its stamp, with a known write time."""
+    if row.last_bar is None or row.last_bar_written_at is None:
+        return False
+    stamp = _as_aware(row.last_bar)
+    inside = _as_aware(row.start) <= stamp and (row.end is None or stamp < _as_aware(row.end))
+    return inside and written_before_its_stamp(stamp, _as_aware(row.last_bar_written_at))
+
+
+def _skips_a_period(earlier: datetime, later: datetime, granularity: Granularity, calendar: TradingCalendar) -> bool:
+    """Whether a period holding a session lies wholly between two stored bars, with no bar of its own.
+
+    A hole inside the run of stored pads (the vendor padded around a session without padding it) is a session never
+    fetched; the tail must reach back to it, as the old rule did by starting at the last real bar. Only the calendar
+    decides: a weekend between two 1day bars holds no session and is no hole. Within one period, or between adjacent
+    periods, there is nothing between.
+    """
+    first = next_period_start(period_start(session_of(earlier, calendar), granularity), granularity)
+    last = period_start(session_of(later, calendar), granularity)
+    if first >= last:
+        return False
+    try:
+        return bool(calendar.sessions_overlapping(local_midnight(first, calendar), local_midnight(last, calendar)))
+    except CalendarRangeError:
+        return True
+
+
+def _placeholder_unsettled(
+    bar: PlaceholderBar, calendar: TradingCalendar, granularity: Granularity, settle_margin: timedelta
+) -> bool:
+    """Whether a stored placeholder may still be replaced by a real bar, so the tail must reach back to it.
+
+    A placeholder is SETTLED only when it was written at or after its period's close plus the settle margin plus
+    PLACEHOLDER_GRACE. The vendor pads a series with flat zero-volume bars (PARA); the evidence does not say whether
+    a pad is ever later replaced by real data, so a recent one is re-asked for until it has stood for the grace. One
+    written long after its close (a backfill of years ago) is settled at once. A re-fetch rewrites updated_at, so a
+    placeholder leaves the window by itself and the window never grows. A period holding no session (a stray weekend
+    bar) can never become a real bar and is settled; a period the calendar cannot place is NOT settled.
+    """
+    try:
+        closes = bar_period_close(_as_aware(bar.timestamp), calendar, granularity)
+    except CalendarRangeError:
+        return True
+    return closes is not None and _as_aware(bar.written_at) < closes + settle_margin + PLACEHOLDER_GRACE
+
+
+def _fetch_start(
+    row: CatalogRow,
+    calendar: TradingCalendar,
+    placeholders: Sequence[PlaceholderBar] = (),
+    now: datetime | None = None,
+    *,
+    truncated: bool = False,
+) -> datetime:
+    """Where the refresh's tail starts: the declared start with no bars, else just after the newest STORED bar.
+
+    The newest stored bar is the newest of the newest real bar (row.last_bar) and the stored placeholders that
+    _can_be_real, so a placeholder tail the vendor keeps padding is not asked for again from the last real bar on every
+    pass (tj-7zjov1.114). A stored bar that cannot be a real period (future, outside the range, in no session) never
+    counts. Freshness and the pass order still judge the real bar. The tail reaches BACK, never leaving a gap or a
+    stale bar, to the oldest of:
+      - the newest real bar, when it is provisional (written before its period closed and settled, see
+        last_bar_is_provisional; for 1min..1hour the period is the whole session, not the bar's own);
+      - every stored placeholder not yet settled (_placeholder_unsettled), because a pad may become a real bar;
+      - the first bar of the trailing run (the newest real bar and the pads after it) that is followed by a period
+        with a session and no bar (_skips_a_period).
+    The upsert overwrites each with the final bar. Once rewritten after the close (and the grace) they are final and
+    the tail starts after the newest again. The start is never before the declared start.
+
+    LOST ANCHOR. When the newest real bar exists but does not count (_can_be_real), the newest COUNTED real bar, the
+    anchor of the hole check, is not known. Two cases:
+      - It fails ONLY by being written before its own stamp (it is inside [start, end) and its write time is known).
+        The write time is the fetch transaction's start, which opens before the vendor request, so it is a lower bound
+        on when the bar was served: everything before that write was requested by that fetch or an earlier one
+        (decision tj-7zjov1.120 addendum 1). The tail starts at the local midnight of the period holding the WRITE TIME,
+        or at the oldest unsettled counted pad if earlier, never before the declared start. That period is requested
+        whole, so a part-way bar in it is rewritten. This is NORMAL for a live 1min dataset (the last bar is stamped a
+        few seconds after the transaction start): it costs at most one extra session (about 960 bars) inside the call
+        the pass makes anyway. No hole pairing and no provisional reach-back are needed, since every such candidate
+        lies at or after that midnight.
+      - Any other case (outside the declared range, or no write time): the tail starts at the declared start, a full
+        re-fetch for as long as the bad bar lasts. Bounding it by reading the newest counted real bar is tj-7zjov1.122.
+
+    TRUNCATED READ. `truncated` says the placeholder read stopped on a full page of settled bars, so older pads exist
+    that were not read. The newest real bar is then NOT paired with the oldest pad read: the unread pads between them
+    would look like a hole and the tail would reach back to the real bar, the growing re-fetch this rule removes.
+    Pairs among the pads read are still checked. A hole in the unread part was requested by an earlier fetch, at least
+    once (every fetch is one transaction from the declared start or a counted bar, decision tj-7zjov1.120); that is
+    the accepted page residual. The leading gap (before the first stored bar of a dataset with no real bar) is NOT a
+    hole, by the same decision: the first fetch asked for it and the vendor answered empty there.
+
+    These rules do not interact badly: the lost anchor returns before the pad rules; the truncation only removes a
+    pairing; the counting rule only removes bars; and the unsettled rule is independent of all of them.
+    """
+    pads = sorted(
+        (p for p in placeholders if _can_be_real(p.timestamp, p.written_at, row, calendar, now, placeholder=True)),
+        key=lambda p: _as_aware(p.timestamp),
+    )
+    if row.last_bar is not None and not _can_be_real(
+        row.last_bar, row.last_bar_written_at, row, calendar, now, placeholder=False
     ):
-        return row.last_bar
-    return row.last_bar + row.granularity.offset
+        if not _written_early_inside_range(row):
+            return row.start
+        margin = settle_margin_from_env()
+        floor = local_midnight(
+            period_start(session_of(_as_aware(row.last_bar_written_at), calendar), row.granularity), calendar
+        )
+        candidates = [
+            floor,
+            *(p.timestamp for p in pads if _placeholder_unsettled(p, calendar, row.granularity, margin)),
+        ]
+        earliest = min(candidates, key=_as_aware)
+        return row.start if _as_aware(earliest) < _as_aware(row.start) else earliest
+    real = row.last_bar
+    stored = [bar for bar in (real, *(p.timestamp for p in pads)) if bar is not None]
+    if not stored:
+        return row.start
+    margin = settle_margin_from_env()
+    starts = [_after_bar(max(stored, key=_as_aware), row.granularity, calendar)]
+    if real is not None and last_bar_is_provisional(real, row.last_bar_written_at, calendar, row.granularity, margin):
+        starts.append(real)
+    starts.extend(p.timestamp for p in pads if _placeholder_unsettled(p, calendar, row.granularity, margin))
+    after_real = [p.timestamp for p in pads if real is None or _as_aware(p.timestamp) > _as_aware(real)]
+    # A truncated read: the real bar is not the neighbour of the oldest pad read (see TRUNCATED READ above).
+    run = [real, *after_real] if real is not None and not truncated else after_real
+    for earlier, later in pairwise(run):
+        if _skips_a_period(earlier, later, row.granularity, calendar):
+            starts.append(_after_bar(earlier, row.granularity, calendar))
+            break
+    start = min(starts, key=_as_aware)
+    return row.start if _as_aware(start) < _as_aware(row.start) else start
+
+
+def _after_bar(last_bar: datetime, granularity: Granularity, calendar: TradingCalendar) -> datetime:
+    """The first instant after the bar's period, where the next bar can be stamped.
+
+    A 1day or 1week bar is stamped at a LOCAL midnight, which is 05:00Z in winter and 04:00Z in summer, so a fixed
+    offset from a winter stamp can land an hour AFTER the next summer stamp (a 1week bar of Monday 2026-03-02
+    05:00Z plus 7 days is 2026-03-09 05:00Z, past the next bar's 04:00Z), and a vendor that filters on
+    timestamp >= start would drop that bar. So those two step by local date to the next local midnight. The
+    vendor may stamp a week on any day of it, so the week is taken from its Monday. Shorter bars are absolute
+    durations, and a month's 4-week offset always lands before the next month's stamp.
+    """
+    if granularity is Granularity.ONE_DAY:
+        return local_midnight(session_of(last_bar, calendar) + timedelta(days=1), calendar)
+    if granularity is Granularity.ONE_WEEK:
+        day = session_of(last_bar, calendar)
+        return local_midnight(day - timedelta(days=day.weekday()) + timedelta(weeks=1), calendar)
+    return last_bar + granularity.offset
 
 
 def _request_for(
-    row: CatalogRow, calendar: TradingCalendar
+    row: CatalogRow,
+    calendar: TradingCalendar,
+    placeholders: Sequence[PlaceholderBar] = (),
+    now: datetime | None = None,
+    *,
+    truncated: bool = False,
 ) -> tuple[StoreAssetDatasetPath, StoreAssetDatasetBody, datetime]:
     """The request a dataset's refresh sends: its path, its body and the start of the tail it asks ingest for.
 
     Raises:
         ValidationError: The stored row no longer validates as a request.
     """
-    fetch_start = _fetch_start(row, calendar)
+    fetch_start = _fetch_start(row, calendar, placeholders, now, truncated=truncated)
     # The entry's own identity, so ingest's ack resolves to THIS entry. The stored tape is named as the
     # preference: a tape ingest can no longer serve is a refused ack, never a second entry.
     body = StoreAssetDatasetBody(
@@ -210,6 +415,67 @@ def _last_close(calendar: TradingCalendar, now: datetime) -> datetime | None:
     """The close of the last completed session at `now`, or None when the calendar has none."""
     session = calendar.last_completed_session(now)
     return None if session is None else calendar.session_close(session)
+
+
+@dataclass(frozen=True)
+class PlaceholderTail:
+    """The placeholders read for one dataset, newest first, and whether older ones were left unread.
+
+    Attributes:
+        bars: The placeholders read.
+        truncated: True when the read stopped on a full page ending in a settled bar, so older placeholders may exist.
+    """
+
+    bars: list[PlaceholderBar]
+    truncated: bool = False
+
+
+async def _read_placeholder_tails(
+    owed: list[CatalogRow], calendar: TradingCalendar
+) -> dict[uuid.UUID, PlaceholderTail]:
+    """Each owed dataset's stored placeholders that the tail rule needs (newest first), once per pass.
+
+    Read from `PLACEHOLDER_LOOKBACK` before the newest real bar (the whole history when there is none), in pages of
+    `PLACEHOLDER_SCAN_LIMIT`, newest first. The next, older page is read only while the page just read ends in a
+    placeholder that is still UNSETTLED, so the unsettled ones are all read however many bars a session holds (an
+    extended-hours 1min series has about 960 a session) and a long settled history is not. A live series with no
+    padding reads nothing. When the read stops on a full page the tail says `truncated`.
+
+    There is NO iteration cap: a cap would silently drop pages and leave an unsettled pad unread. Instead a PROGRESS
+    GUARD raises when a full page does not end strictly older than where it started, so a defect (a repeated page)
+    fails loudly instead of hanging the pass.
+
+    Raises:
+        RuntimeError: A full page did not end strictly older than the bar it was read before.
+    """
+    if not owed:
+        return {}
+    margin = settle_margin_from_env()
+    tails: dict[uuid.UUID, PlaceholderTail] = {}
+    async with own_session() as session:
+        for row in owed:
+            floor = None if row.last_bar is None else row.last_bar - PLACEHOLDER_LOOKBACK
+            found: list[PlaceholderBar] = []
+            before: datetime | None = None
+            truncated = False
+            while True:
+                page = await recent_placeholder_bars(
+                    session, row, not_before=floor, limit=PLACEHOLDER_SCAN_LIMIT, before=before
+                )
+                found.extend(page)
+                if len(page) < PLACEHOLDER_SCAN_LIMIT:
+                    break  # reached the floor or the first bar: nothing older exists
+                ceiling = page[0].timestamp if before is None else before
+                if _as_aware(page[-1].timestamp) >= _as_aware(ceiling):
+                    raise RuntimeError(
+                        'The placeholder read made no progress: a full page did not end older than it began'
+                    )
+                if not _placeholder_unsettled(page[-1], calendar, row.granularity, margin):
+                    truncated = True
+                    break
+                before = page[-1].timestamp
+            tails[row.id] = PlaceholderTail(found, truncated)
+    return tails
 
 
 async def _tables_exist(session: AsyncSession) -> bool:
@@ -341,7 +607,8 @@ class DailyRefresher:
             history = await finished_scheduled_runs(session, source, now - ATTEMPT_LOOKBACK)
 
         owed = self._behind(rows, running, calendar, now)
-        due, skipped = self._plan(owed, history, _last_close(calendar, now), calendar)
+        tails = await _read_placeholder_tails(owed, calendar)
+        due, skipped = self._plan(owed, history, _last_close(calendar, now), calendar, tails, now)
         batch = self._take(due, max_per_pass())
         refreshed = failed = refused = discarded = 0
         deferred = len(due[0]) + len(due[1]) - len(batch)
@@ -393,7 +660,12 @@ class DailyRefresher:
 
     @staticmethod
     def _plan(
-        owed: list[CatalogRow], history: list[IngestRunRecord], last_close: datetime | None, calendar: TradingCalendar
+        owed: list[CatalogRow],
+        history: list[IngestRunRecord],
+        last_close: datetime | None,
+        calendar: TradingCalendar,
+        tails: dict[uuid.UUID, PlaceholderTail] | None = None,
+        now: datetime | None = None,
     ) -> tuple[tuple[list[_Planned], list[_Planned]], int]:
         """Split the behind datasets into ((productive, due-again), skipped_count), each list in request order.
 
@@ -417,9 +689,17 @@ class DailyRefresher:
         skipped = 0
         for row in owed:
             try:
-                path, body, fetch_start = _request_for(row, calendar)
+                tail = (tails or {}).get(row.id, PlaceholderTail([]))
+                path, body, fetch_start = _request_for(row, calendar, tail.bars, now, truncated=tail.truncated)
             except ValidationError:
                 # A stored row that no longer validates as a request: never sent, and nothing to record.
+                skipped += 1
+                continue
+            if now is not None and _as_aware(fetch_start) >= _as_aware(min(effective_end(row, now), now)):
+                # Every period up to the declared end (or now) is stored, placeholders included: the tail is empty,
+                # and a request that starts at or after its end is no valid request. The end half is a guard: a DAILY
+                # row's declared end does not validate as a request today, but the guard costs nothing and keeps an
+                # invalid request from ever being sent.
                 skipped += 1
                 continue
             candidates = [
