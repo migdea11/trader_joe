@@ -15,7 +15,8 @@ ExchangeCalendarAdapter, (13) the cause constants, the creation ruling's re-crea
      flag read from the list, an unsaid tradable flag never matching; the cut in symbol order then vendor id, after
      the filters;
   R4 evidence_as_of: the first snapshot showing the new outcome, else the default;
-  R5 budget_cause: ramp first, then the TWO requests of a creation against the cap, at both boundaries;
+  R5 budget_cause: ramp first, then the TWO requests of a creation against the cap, at both boundaries, at the minimums
+     (ramp 1, cap 2) and at int32 max; a rate of None is NO LIMIT and skips only its own check (ADR tj-2ayia2 D1, D5);
   R6 member_action: the table of the creation ruling (existing entry, open request, finished without a dataset,
      PERMANENT, REFUSED, DEFERRED);
   R7 the cause strings, by value (free strings in the schema, pinned here).
@@ -407,17 +408,52 @@ def test_pin_16b_no_clamp_no_refusal(end):
 @pytest.mark.parametrize(
     ('created', 'requests', 'ramp', 'cap', 'cause'),
     [
+        # The minimums (ADR tj-2ayia2 D1): ramp 1 and cap 2 admit exactly one creation from empty windows.
         (0, 0, 1, 2, None),
-        (0, 0, 0, 100, CAUSE_RAMP_RATE),
+        (1, 0, 1, 2, CAUSE_RAMP_RATE),
+        (0, 1, 1, 2, CAUSE_REQUEST_RATE),
         (4, 0, 5, 100, None),
         (5, 0, 5, 100, CAUSE_RAMP_RATE),
         (0, 98, 5, 100, None),
         (0, 99, 5, 100, CAUSE_REQUEST_RATE),
-        (0, 0, 5, 1, CAUSE_REQUEST_RATE),
         (5, 100, 5, 100, CAUSE_RAMP_RATE),
+        # The int32 maximum is a value like any other.
+        (2147483646, 2147483645, 2147483647, 2147483647, None),
+        (2147483647, 0, 2147483647, 2147483647, CAUSE_RAMP_RATE),
     ],
 )
 def test_ramp_is_checked_first_then_two_requests_against_the_cap(created, requests, ramp, cap, cause):
+    assert budget_cause(created, requests, ramp, cap) == cause
+
+
+# ADR tj-2ayia2 D5: a rate of None is NO LIMIT and skips its own check only; the ramp is still checked first.
+@pytest.mark.parametrize(
+    ('created', 'requests', 'ramp', 'cap', 'cause'),
+    [
+        # ramp None: only the cap decides, however many were created.
+        (10**9, 0, None, 100, None),
+        (10**9, 99, None, 100, CAUSE_REQUEST_RATE),
+        (0, 98, None, 100, None),
+        # cap None: only the ramp decides, however many requests were written.
+        (0, 10**9, 5, None, None),
+        (5, 10**9, 5, None, CAUSE_RAMP_RATE),
+        (4, 0, 5, None, None),
+        # both None: nothing defers, even at windows no set rate would admit.
+        (0, 0, None, None, None),
+        (10**9, 10**9, None, None, None),
+    ],
+    ids=[
+        'ramp-none-cap-room',
+        'ramp-none-cap-full',
+        'ramp-none-cap-boundary',
+        'cap-none-ramp-room',
+        'cap-none-ramp-full',
+        'cap-none-ramp-boundary',
+        'both-none-empty',
+        'both-none-huge',
+    ],
+)
+def test_a_rate_of_none_is_no_limit_and_skips_only_its_own_check(created, requests, ramp, cap, cause):
     assert budget_cause(created, requests, ramp, cap) == cause
 
 

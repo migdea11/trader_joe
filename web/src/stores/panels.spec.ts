@@ -618,7 +618,7 @@ describe('the writes, each followed by a re-read', () => {
     await store.load()
     api.saveSourceSettings.mockResolvedValue(create(PanelSourceSettingsVersionSchema))
     api.getPanel.mockClear()
-    const params = { rampDatasetsPerHour: 0, requestCapPerHour: 1, corporateActionWindowPreDays: 2, corporateActionWindowPostDays: 3, reason: 'r' }
+    const params = { rampDatasetsPerHour: 1, requestCapPerHour: 2, corporateActionWindowPreDays: 0, corporateActionWindowPostDays: 3, reason: 'r' }
     expect(await store.saveSource(DataSource.ALPACA_API, params)).toEqual({ kind: 'ok' })
     expect(api.saveSourceSettings).toHaveBeenCalledWith(DataSource.ALPACA_API, params)
     expect(api.getPanel).toHaveBeenCalledWith(A, expect.any(AbortSignal))
@@ -693,7 +693,7 @@ describe('a 422 is re-read to say what changed', () => {
 
   const listing = (...names: string[]) =>
     create(PanelListSchema, { items: [item(A, 'Alpha'), ...names.map((name, i) => item(`${C.slice(0, -1)}${i}`, name))] })
-  const withSourceSettings = { rampDatasetsPerHour: 0, requestCapPerHour: 10 }
+  const withSourceSettings = { rampDatasetsPerHour: 1, requestCapPerHour: 10 }
   const sourceReads = () => api.getSourceSettingsVersions.mock.calls.filter((args) => args[1]?.limit === 1)
 
   describe('create', () => {
@@ -729,12 +729,43 @@ describe('a 422 is re-read to say what changed', () => {
       expect(sourceReads()).toEqual([])
     })
 
-    it('source settings sent (ramp 0) and the source has a version now: the outcome says so', async () => {
+    it('source settings sent (ramp and cap) and the source has a version now: the outcome says so', async () => {
       const store = usePanelsStore()
       await store.load()
       const outcome = await store.create({ name: 'Gamma', source: DataSource.IB_API, reason: 'r', ...withSourceSettings })
       expect(outcome).toEqual({ kind: 'moved-on', what: 'source-has-settings', error: invalid.error })
       expect(sourceReads()).toEqual([[DataSource.IB_API, { limit: 1 }]])
+    })
+
+    // ADR tj-2ayia2 D4: any of the four source fields present is source settings sent (a window-only or
+    // cap-only create is valid now), 0 included for a window day; all four absent, or present as undefined as
+    // the create form passes an empty field, is none sent.
+    it.each([
+      ['only the ramp', { rampDatasetsPerHour: 1 }],
+      ['only the cap', { requestCapPerHour: 2 }],
+      ['only the pre days', { corporateActionWindowPreDays: 30 }],
+      ['only the pre days, 0', { corporateActionWindowPreDays: 0 }],
+      ['only the post days', { corporateActionWindowPostDays: 30 }],
+      ['the window days, the rates undefined', { rampDatasetsPerHour: undefined, requestCapPerHour: undefined, corporateActionWindowPreDays: 5, corporateActionWindowPostDays: 5 }],
+    ])('%s sent and the source has a version now: the source is re-read and the outcome says so', async (_label, settings) => {
+      const store = usePanelsStore()
+      await store.load()
+      const outcome = await store.create({ name: 'Gamma', source: DataSource.IB_API, reason: 'r', ...settings })
+      expect(outcome).toEqual({ kind: 'moved-on', what: 'source-has-settings', error: invalid.error })
+      expect(sourceReads()).toEqual([[DataSource.IB_API, { limit: 1 }]])
+    })
+
+    it('all four present as undefined (every field empty on the form): none sent, the source not read', async () => {
+      const store = usePanelsStore()
+      await store.load()
+      const empty = {
+        rampDatasetsPerHour: undefined,
+        requestCapPerHour: undefined,
+        corporateActionWindowPreDays: undefined,
+        corporateActionWindowPostDays: undefined,
+      }
+      expect(await store.create({ name: 'Gamma', source: DataSource.IB_API, reason: 'r', ...empty })).toEqual(invalid)
+      expect(sourceReads()).toEqual([])
     })
 
     // tj-7zjov1.254 F2: with no name in the request there is no name to have been taken, so the name check

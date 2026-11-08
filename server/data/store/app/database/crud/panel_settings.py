@@ -10,10 +10,13 @@ boundary_read): the started_at of the first non-dry-run pass OF THIS PANEL that 
 
 A PANEL'S SOURCE NEVER CHANGES: no function takes a source for an existing panel (another source is another panel).
 
-NO FALLBACK NUMBERS. The two hourly rates have no ruled default, so current_source_settings answers None for a source
-with no version, and create_panel refuses a source without settings unless the call carries them. The only defaults named
-are the ruled ones: DEFAULT_PANEL_CADENCE (MONTHLY, applied by create_panel when the caller names no cadence) and the
-90-day corporate-action window on both sides. A panel has no size: it selects every asset its filters match.
+NO FALLBACK NUMBERS. The two hourly rates are optional and None means NO LIMIT (ADR tj-2ayia2, owner ruling
+2026-11-07): there is no default value for either. A set ramp is 1 to INT32_MAX and a set cap 2 to INT32_MAX; zero is
+refused. current_source_settings still answers None for a source with no version, but create_panel now ALWAYS writes a
+source's first version (from the source settings it is given, else no limits and the 90-day window), so every panel's
+source has one. The only defaults named are DEFAULT_PANEL_CADENCE (MONTHLY, applied by create_panel when the caller
+names no cadence) and the 90-day corporate-action window on both sides. A panel has no size: it selects every asset its
+filters match.
 
 Each write commits on its own, through write_transaction, on the session the caller hands in.
 """
@@ -43,6 +46,15 @@ from data.store.app.database.transaction import write_transaction
 # The cadence create_panel applies when the caller names none (owner ruling 2026-10-27 (c)). The schema carries no default.
 DEFAULT_PANEL_CADENCE: Final = PanelCadence.MONTHLY
 
+# The smallest ramp, 1: one creation an hour is a real limit.
+MIN_RAMP_DATASETS_PER_HOUR: Final = 1
+# The smallest request cap, 2. It equals panel_manager.REQUESTS_PER_CREATION (a creation costs the clamp query and the
+# bars request), so a smaller cap could never admit a creation. A DB CHECK needs a literal, so a test pins this value,
+# the CHECK and REQUESTS_PER_CREATION equal.
+MIN_REQUEST_CAP_PER_HOUR: Final = 2
+# The largest number any of the four fields takes: the int4 column and the int32 on the wire.
+INT32_MAX: Final = 2147483647
+
 _PANEL = Panel.__table__
 _SETTINGS = PanelSettingsVersion.__table__
 _SOURCE_SETTINGS = PanelSourceSettingsVersion.__table__
@@ -69,15 +81,16 @@ class PanelSettings:
 
 @dataclass(frozen=True)
 class SourceSettings:
-    """A source's settings, as sent: the two hourly rates (no default, no ruled value) and the corporate-action window.
+    """A source's settings, as sent: the two hourly rates and the corporate-action window.
 
-    ramp_datasets_per_hour is the most new panel datasets created per source in any trailing 60 minutes (0 pauses
-    creation); request_cap_per_hour the most ingest requests the panel manager writes per source in any trailing 60
-    minutes. The window defaults to the ruled 90 days before and after.
+    ramp_datasets_per_hour is the most new panel datasets created per source in any trailing 60 minutes (at least 1);
+    request_cap_per_hour the most ingest requests the panel manager writes per source in any trailing 60 minutes (at
+    least 2). None for a rate means NO LIMIT; there is no default, so a caller says None explicitly. Zero is refused
+    (a pause is enabled=false on the panel). The window defaults to the ruled 90 days before and after.
     """
 
-    ramp_datasets_per_hour: int
-    request_cap_per_hour: int
+    ramp_datasets_per_hour: int | None
+    request_cap_per_hour: int | None
     corporate_action_window_pre_days: int = DEFAULT_CORPORATE_ACTION_WINDOW_DAYS
     corporate_action_window_post_days: int = DEFAULT_CORPORATE_ACTION_WINDOW_DAYS
 
@@ -146,14 +159,20 @@ def _check_panel_settings(settings: PanelSettings, cadence: PanelCadence | None)
 
 
 def _check_source_settings(settings: SourceSettings) -> None:
-    numbers = (
-        settings.ramp_datasets_per_hour,
-        settings.request_cap_per_hour,
-        settings.corporate_action_window_pre_days,
-        settings.corporate_action_window_post_days,
+    rates = (
+        ('ramp_datasets_per_hour', settings.ramp_datasets_per_hour, MIN_RAMP_DATASETS_PER_HOUR),
+        ('request_cap_per_hour', settings.request_cap_per_hour, MIN_REQUEST_CAP_PER_HOUR),
     )
-    if any(number < 0 for number in numbers):
-        raise _refuse('Source settings cannot be negative.')
+    for field_name, value, minimum in rates:
+        if value is not None and not minimum <= value <= INT32_MAX:
+            raise _refuse(f'{field_name} must be {minimum} to {INT32_MAX}, or unset for no limit.')
+    windows = (
+        ('corporate_action_window_pre_days', settings.corporate_action_window_pre_days),
+        ('corporate_action_window_post_days', settings.corporate_action_window_post_days),
+    )
+    for field_name, value in windows:
+        if not 0 <= value <= INT32_MAX:
+            raise _refuse(f'{field_name} must be 0 to {INT32_MAX}.')
 
 
 def _panel_settings_values(
@@ -289,13 +308,13 @@ async def create_panel(
 ) -> tuple[PanelRecord, PanelSettingsRecord]:
     """Create a panel and its settings version 1 in one transaction.
 
-    The cadence is DEFAULT_PANEL_CADENCE when settings names none. The panel's source must have a source settings
-    version: either one already exists, or source_settings is passed and is written (as that source's first version,
-    with the same actor and reason) in the same transaction, before version 1. source_settings is accepted only for a
-    source with no version yet and is refused (422) for one that already has a version, judged under the source lock
-    (so a concurrent create is refused): a source's rates
-    change for every panel on it, so they change only through append_source_settings_version, with its own actor and
-    reason.
+    The cadence is DEFAULT_PANEL_CADENCE when settings names none. On a source with NO version this ALWAYS writes that
+    source's version 1 in the same transaction, before the panel's version 1, with the same actor and reason: from
+    source_settings when given, else SourceSettings(None, None) (no limits, the 90-day window; ADR tj-2ayia2 D4).
+    source_settings is refused (422) for a source that already has a version: a source's rates change for every panel
+    on it, so they change only through append_source_settings_version, with its own actor and reason. The source lock
+    is taken on EVERY create and the version is read under it, so two concurrent creates on a source with none write
+    one version 1 and the second is refused only if it carried source settings.
 
     Args:
         db: The session.
@@ -310,9 +329,8 @@ async def create_panel(
         tuple[PanelRecord, PanelSettingsRecord]: The panel and its version 1.
 
     Raises:
-        InvalidRequestError: INVALID_REQUEST, a blank name or actor, a negative number, a name already used, or
-            a source with no settings and none given (the rates have no ruled default), or source settings given for a
-            source that already has a version. Nothing is written.
+        InvalidRequestError: INVALID_REQUEST, a blank name or actor, a rate or window out of range, a name already
+            used, or source settings given for a source that already has a version. Nothing is written.
     """
     trimmed_name = name.strip()
     if not trimmed_name:
@@ -322,33 +340,29 @@ async def create_panel(
     if source_settings is not None:
         _check_source_settings(source_settings)
     async with write_transaction(db, f'create panel {trimmed_name}'):
-        # Lock order: the name lock first, then the source lock (only with source settings), then rows. Nothing else
+        # Lock order: the name lock first, then the source lock (every create), then rows. Nothing else
         # takes the name lock, so no cycle. It is held to the commit, so the loser of two concurrent creates reads the
         # winner's row below and is refused like any duplicate name.
         await _lock_panel_name(db, trimmed_name)
         taken = await db.execute(select(_PANEL.c.id).where(_PANEL.c.name == trimmed_name))
         if taken.first() is not None:
             raise _refuse('A panel with that name already exists.')
-        if source_settings is not None:
-            # Then the source advisory lock, before rows (the new panel and its settings). The guard below
-            # reads under it, so two concurrent creates cannot both see no version; the second is refused. Nothing
-            # here takes a panel row lock and then the source lock, so no cycle: append_settings_version holds only
-            # a panel row lock, append_source_settings_version only the source lock. Re-entrant in this transaction,
-            # so _insert_source_settings taking it again is harmless.
-            await _lock_source(db, source)
+        # Then the source advisory lock, before rows (the new panel and its settings), on every create. The read below
+        # is under it, so two concurrent creates cannot both see no version and write a version 1 and a version 2.
+        # Nothing here takes a panel row lock and then the source lock, so no cycle: append_settings_version holds
+        # only a panel row lock, append_source_settings_version only the source lock. Re-entrant in this
+        # transaction, so _insert_source_settings taking it again is harmless.
+        await _lock_source(db, source)
         has_version = await _latest_source_settings(db, source) is not None
-        if source_settings is not None:
-            if has_version:
+        if has_version:
+            if source_settings is not None:
                 raise _refuse(
                     f'The source {source.name} already has settings, and creating a panel does not change them: '
                     "save the source's settings as their own write, then create the panel without source settings."
                 )
-            await _insert_source_settings(db, source, source_settings, trimmed_actor, trimmed_reason)
-        elif not has_version:
-            raise _refuse(
-                f'The source {source.name} has no settings: the rates have no default, so give source settings '
-                'with the panel.'
-            )
+        else:
+            first = source_settings if source_settings is not None else SourceSettings(None, None)
+            await _insert_source_settings(db, source, first, trimmed_actor, trimmed_reason)
         panel_row = (
             await db.execute(_PANEL.insert().values(name=trimmed_name, source=source).returning(*_PANEL.c))
         ).one()
@@ -419,7 +433,7 @@ async def append_source_settings_version(
         SourceSettingsRecord: The new version.
 
     Raises:
-        InvalidRequestError: INVALID_REQUEST, a blank actor or a negative number. Nothing is written.
+        InvalidRequestError: INVALID_REQUEST, a blank actor or a rate or window out of range. Nothing is written.
     """
     trimmed_actor, trimmed_reason = _marker(actor, reason)
     _check_source_settings(settings)
@@ -437,7 +451,7 @@ async def current_settings(db: AsyncSession, panel_id: uuid.UUID) -> PanelSettin
 
 
 async def current_source_settings(db: AsyncSession, source: DataSource) -> SourceSettingsRecord | None:
-    """The source's latest settings version, or None when it has none yet. There is no fallback: the rates have no default."""
+    """The source's latest settings version, or None when it has none yet (no panel was created on it). No fallback."""
     return await _latest_source_settings(db, source)
 
 

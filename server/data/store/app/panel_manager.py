@@ -18,7 +18,8 @@ TWO KINDS OF PASS per enabled panel, both written to the membership ledger (crud
 
 THE RATE is per source and per hour, read from the rows each time: created_in_window (CREATED rows) against
 ramp_datasets_per_hour and requests_in_window (every request the panel owner wrote, kind and state aside) against
-request_cap_per_hour. A creation costs TWO requests (the clamp query and the bars request). It applies to creation work
+request_cap_per_hour. A creation costs TWO requests (the clamp query and the bars request). A rate that is NULL means NO
+LIMIT and its check is skipped (ADR tj-2ayia2); pausing is enabled=false, not a rate of 0. It applies to creation work
 only; the daily bars of members are the DAILY refresh's.
 
 CREATING A MEMBER'S DATASET (ruling D). CREATED names the BARS REQUEST written in the same commit as the row, never a
@@ -139,7 +140,9 @@ RATE_WINDOW: Final = timedelta(minutes=60)
 # A membership pass that crashed (never finished) holds off the next one this long, so a pass that crashes every time
 # retries at most once an hour, never at the tick rate.
 UNFINISHED_PASS_RETRY: Final = timedelta(hours=1)
-# A creation writes a corporate-actions request (the clamp) and a bars request.
+# A creation writes a corporate-actions request (the clamp) and a bars request. It is the smallest request cap that can
+# admit a creation: crud/panel_settings.MIN_REQUEST_CAP_PER_HOUR and the CHECK ck_panel_source_settings_version_request_cap_min
+# equal it, and a test pins the three together.
 REQUESTS_PER_CREATION: Final = 2
 
 
@@ -356,15 +359,15 @@ def clamp_refusal(clamp: StartClamp | None, end: datetime | None) -> str | None:
     return None
 
 
-def budget_cause(created_in_hour: int, requests_in_hour: int, ramp: int, cap: int) -> str | None:
+def budget_cause(created_in_hour: int, requests_in_hour: int, ramp: int | None, cap: int | None) -> str | None:
     """The deferral cause when a creation does not fit the hourly windows, else None.
 
     Ramp is checked first: created_in_hour must be under ramp_datasets_per_hour; then the two requests a creation costs
-    must fit under request_cap_per_hour.
+    must fit under request_cap_per_hour. A rate of None is no limit and skips its check.
     """
-    if created_in_hour >= ramp:
+    if ramp is not None and created_in_hour >= ramp:
         return CAUSE_RAMP_RATE
-    if requests_in_hour + REQUESTS_PER_CREATION > cap:
+    if cap is not None and requests_in_hour + REQUESTS_PER_CREATION > cap:
         return CAUSE_REQUEST_RATE
     return None
 
@@ -523,6 +526,7 @@ class PanelManager:
         async with own_session() as db:
             source_settings = await current_source_settings(db, source)
             if source_settings is None:
+                # A guard only: create_panel always writes a source's first version, so a source with a panel has one.
                 self._log_once(
                     panel.id, 'source', f'Panel {panel.id} is not runnable: source {source.value} has no settings'
                 )
@@ -887,12 +891,17 @@ class PanelManager:
     async def _window_cause(
         self, db: AsyncSession, source: DataSource, source_settings: SourceSettingsRecord
     ) -> str | None:
+        ramp = source_settings.settings.ramp_datasets_per_hour
+        cap = source_settings.settings.request_cap_per_hour
+        if ramp is None and cap is None:
+            # No limit at all: the two window reads would decide nothing, so they are skipped.
+            return None
         since = self._clock() - RATE_WINDOW
         return budget_cause(
             await created_in_window(db, source, since),
             await requests_in_window(db, source, PANEL_OWNER, since),
-            source_settings.settings.ramp_datasets_per_hour,
-            source_settings.settings.request_cap_per_hour,
+            ramp,
+            cap,
         )
 
     async def _create(

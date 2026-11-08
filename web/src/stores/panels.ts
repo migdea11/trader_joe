@@ -308,7 +308,14 @@ export const usePanelsStore = defineStore('panels', () => {
     if (name !== undefined && panels.value.some((item) => item.name === name)) {
       return { kind: 'moved-on', what: 'name-taken', name, error }
     }
-    if (params.rampDatasetsPerHour === undefined || params.source === undefined) return null
+    // Source settings were sent when ANY of the four fields is present (a window-only create is valid).
+    const sentSettings = [
+      params.rampDatasetsPerHour,
+      params.requestCapPerHour,
+      params.corporateActionWindowPreDays,
+      params.corporateActionWindowPostDays,
+    ].some((value) => value !== undefined)
+    if (!sentSettings || params.source === undefined) return null
     try {
       const page = await getSourceSettingsVersions(params.source, { limit: 1 })
       if (page.items.length > 0) return { kind: 'moved-on', what: 'source-has-settings', error }

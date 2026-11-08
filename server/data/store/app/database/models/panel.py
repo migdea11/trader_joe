@@ -25,8 +25,9 @@ from common.enums.data_stock import DataSource
 
 
 # Safe defaults, named here and applied where a row is CREATED (never by the schema). Only the ruled one is named: the
-# corporate-action window is 90 days on both sides (ADR tj-26jt9w, 2026-10-23 C1). The two hourly rates and the
-# cadence have no ruled default, so they have no constant and no server default.
+# corporate-action window is 90 days on both sides (ADR tj-26jt9w, 2026-10-23 C1). The two hourly rates have no default
+# value: an unset rate is NULL and means NO LIMIT (ADR tj-2ayia2, owner ruling 2026-11-07). The cadence has no ruled
+# default either, so it has no constant and no server default.
 DEFAULT_CORPORATE_ACTION_WINDOW_DAYS = 90
 
 
@@ -152,14 +153,18 @@ class PanelSourceSettingsVersion(AppBase.DATA_STORE_BASE, CustomTypeTable):
     """One version of a SOURCE's settings, shared by every panel on it: two hourly rates, corporate-action window.
 
     They act on datasets, which panels on one source share (ADR tj-26jt9w addendum 20 (b)). APPEND-ONLY, numbered per
-    source, with the same marker columns as a panel version. No policy default for any number.
+    source, with the same marker columns as a panel version. No policy default for any number: an unset rate is NULL.
 
     Both rates are read as a SLIDING WINDOW of the trailing 60 minutes from the database at each tick; nothing is
     stored, so a restart resets nothing. ramp_datasets_per_hour is the most NEW panel datasets created per source in
-    any trailing 60 minutes (CREATED transitions by recorded_at; 0 pauses creation). request_cap_per_hour is the most
+    any trailing 60 minutes (CREATED transitions by recorded_at). request_cap_per_hour is the most
     ingest requests the panel manager writes per source in any trailing 60 minutes, of every kind (ingest_request rows
     by created_at; the daily refresh's own requests do not count). The window is the days before a dataset's start and
     after its end that corporate actions are pulled for (see DEFAULT_CORPORATE_ACTION_WINDOW_DAYS).
+
+    Both rates are NULLABLE and NULL means NO LIMIT (ADR tj-2ayia2): a set ramp is at least 1 and a set cap at least 2
+    (a creation costs two requests, panel_manager.REQUESTS_PER_CREATION, so a cap of 1 could never admit one); zero is
+    refused. Pausing creation is enabled=false on the panel's settings, not a rate of 0. The CHECKs pass a NULL.
     """
 
     TABLE_NAME = 'panel_source_settings_version'
@@ -167,15 +172,17 @@ class PanelSourceSettingsVersion(AppBase.DATA_STORE_BASE, CustomTypeTable):
 
     VERSION_UNIQUE = 'uq_panel_source_settings_version_source_version_no'
     VERSION_POSITIVE = 'ck_panel_source_settings_version_version_no_positive'
-    NUMBERS_NON_NEGATIVE = 'ck_panel_source_settings_version_numbers_non_negative'
+    RAMP_POSITIVE = 'ck_panel_source_settings_version_ramp_positive'
+    REQUEST_CAP_MIN = 'ck_panel_source_settings_version_request_cap_min'
+    WINDOW_NON_NEGATIVE = 'ck_panel_source_settings_version_window_non_negative'
     ACTOR_NOT_BLANK = 'ck_panel_source_settings_version_actor_not_blank'
     REASON_NOT_BLANK = 'ck_panel_source_settings_version_reason_not_blank'
 
     id = Column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid(), nullable=False)
     source = Column(Enum(DataSource), nullable=False)
     version_no = Column(Integer, nullable=False)
-    ramp_datasets_per_hour = Column(Integer, nullable=False)
-    request_cap_per_hour = Column(Integer, nullable=False)
+    ramp_datasets_per_hour = Column(Integer, nullable=True)
+    request_cap_per_hour = Column(Integer, nullable=True)
     corporate_action_window_pre_days = Column(Integer, nullable=False)
     corporate_action_window_post_days = Column(Integer, nullable=False)
     saved_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
@@ -186,10 +193,10 @@ class PanelSourceSettingsVersion(AppBase.DATA_STORE_BASE, CustomTypeTable):
     __table_args__ = (
         UniqueConstraint('source', 'version_no', name=VERSION_UNIQUE),
         CheckConstraint('version_no >= 1', name=VERSION_POSITIVE),
+        CheckConstraint('ramp_datasets_per_hour >= 1', name=RAMP_POSITIVE),
+        CheckConstraint('request_cap_per_hour >= 2', name=REQUEST_CAP_MIN),
         CheckConstraint(
-            'ramp_datasets_per_hour >= 0 AND request_cap_per_hour >= 0 AND corporate_action_window_pre_days >= 0 '
-            'AND corporate_action_window_post_days >= 0',
-            name=NUMBERS_NON_NEGATIVE,
+            'corporate_action_window_pre_days >= 0 AND corporate_action_window_post_days >= 0', name=WINDOW_NON_NEGATIVE
         ),
         CheckConstraint("btrim(actor) <> ''", name=ACTOR_NOT_BLANK),
         CheckConstraint("btrim(reason) <> ''", name=REASON_NOT_BLANK),

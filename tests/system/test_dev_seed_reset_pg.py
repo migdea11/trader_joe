@@ -470,8 +470,9 @@ def _seed(db: ScratchDb, entry_values: Callable[..., dict[str, Any]], bar_values
                 SOURCE_SETTINGS,
                 source=PANEL_SOURCE,
                 version_no=1,
-                ramp_datasets_per_hour=1,
-                request_cap_per_hour=1,
+                # ADR tj-2ayia2: a cap of 1 is refused by request_cap_min now; NULL ramp and cap 2 carry both shapes.
+                ramp_datasets_per_hour=None,
+                request_cap_per_hour=2,
                 corporate_action_window_pre_days=0,
                 corporate_action_window_post_days=0,
                 actor='operator',

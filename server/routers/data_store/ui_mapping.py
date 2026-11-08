@@ -738,6 +738,7 @@ def panel_settings_version_message(row: SettingsVersionRow) -> panels_pb2.PanelS
 def panel_source_settings_version_message(row: SourceVersionRow) -> panels_pb2.PanelSourceSettingsVersion:
     """One source settings version as a PanelSourceSettingsVersion, the effective pass if any."""
     record = row.record
+    # A rate that is NULL is NO LIMIT and stays unset on the wire (explicit presence), never 0 (ADR tj-2ayia2 D3).
     message = panels_pb2.PanelSourceSettingsVersion(
         source=DATA_SOURCE.to_proto(record.source),
         version_no=record.version_no,
@@ -932,9 +933,13 @@ def save_panel_settings_values(request: panels_pb2.SavePanelSettingsRequest) -> 
 
 
 def _source_numbers(request: Any, *, window_default: bool) -> SourceSettings:
-    """A source settings from a body; ramp and cap are required (0 is a value), the window days default when allowed."""
-    if not request.HasField('ramp_datasets_per_hour') or not request.HasField('request_cap_per_hour'):
-        raise _refuse('ramp_datasets_per_hour and request_cap_per_hour are both required.')
+    """A source settings from a body: an absent rate is None (no limit), the window days default when allowed.
+
+    Presence only: a present 0, a ramp under 1 or a cap under 2 passes through and the crud refuses it (the one place
+    the range lives).
+    """
+    ramp = request.ramp_datasets_per_hour if request.HasField('ramp_datasets_per_hour') else None
+    cap = request.request_cap_per_hour if request.HasField('request_cap_per_hour') else None
     window: list[int] = []
     for name in ('corporate_action_window_pre_days', 'corporate_action_window_post_days'):
         if request.HasField(name):
@@ -944,8 +949,8 @@ def _source_numbers(request: Any, *, window_default: bool) -> SourceSettings:
         else:
             raise _refuse(f'{name} is required.')
     return SourceSettings(
-        ramp_datasets_per_hour=request.ramp_datasets_per_hour,
-        request_cap_per_hour=request.request_cap_per_hour,
+        ramp_datasets_per_hour=ramp,
+        request_cap_per_hour=cap,
         corporate_action_window_pre_days=window[0],
         corporate_action_window_post_days=window[1],
     )
@@ -961,7 +966,8 @@ def save_source_settings_values(request: panels_pb2.SaveSourceSettingsRequest) -
         tuple[SourceSettings, str]: The settings and the reason as sent.
 
     Raises:
-        InvalidRequestError: INVALID_REQUEST (422) when any of the four numbers is absent.
+        InvalidRequestError: INVALID_REQUEST (422) when a window day count is absent, or (from the store) a rate or
+            window is out of range.
     """
     return _source_numbers(request, window_default=False), request.reason
 
@@ -981,8 +987,8 @@ def create_panel_values(request: panels_pb2.CreatePanelRequest) -> CreatePanelVa
     """A CreatePanelRequest as plain values.
 
     The cadence UNSPECIFIED is None, so the store applies its default. The source settings are GIVEN when any of fields
-    13 to 16 is present; they then need ramp and cap both (an absent one is never read as zero), and an absent window day
-    count takes the store's 90. None given is None.
+    13 to 16 is present; an absent rate is None (no limit) and an absent window day count takes the store's 90. None
+    given is None, and the store then writes the source's first version (no limits, 90 days) when the source has none.
 
     Args:
         request: The parsed body.
@@ -991,8 +997,8 @@ def create_panel_values(request: panels_pb2.CreatePanelRequest) -> CreatePanelVa
         CreatePanelValues: The name, source, settings, optional source settings and reason.
 
     Raises:
-        InvalidRequestError: INVALID_REQUEST (422) for an absent enabled, an UNSPECIFIED or unknown source, a
-            window without both rates, or a value this release does not know.
+        InvalidRequestError: INVALID_REQUEST (422) for an absent enabled, an UNSPECIFIED or unknown source, or a
+            value this release does not know.
     """
     settings = _panel_settings_of(request)
     try:

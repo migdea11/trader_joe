@@ -9,24 +9,34 @@ create_panel REFUSES source settings for a source that already has a version, an
 the boundary read's (crud/panel_ledger.py boundary_read, pinned in test_panel_boundary_read.py), so this module has
 no effective-from function any more.
 
+REVERSED IN PART by ADR tj-2ayia2 (owner ruling 2026-11-07, D1-D5): the two rates are OPTIONAL and None is NO LIMIT
+(stored NULL); a set ramp is MIN_RAMP_DATASETS_PER_HOUR (1) to INT32_MAX, a set cap MIN_REQUEST_CAP_PER_HOUR (2) to
+INT32_MAX, zero refused; create_panel on a source with NO version ALWAYS writes that source's version 1 (from what it is
+given, else SourceSettings(None, None): no limits, 90/90), so "create refuses a source without settings" is gone; the
+source lock is taken on EVERY create, before the has-version read.
+
   S1 create_panel writes the panel and version 1 in ONE commit; a failure after the source settings were written
      leaves nothing; source settings for a source that already has a version are REFUSED and nothing is written (the
-     source's rates change only through append_source_settings_version);
+     source's rates change only through append_source_settings_version); on a source with no version it writes the
+     source's version 1 in all four given/absent combinations of the rates, the window 90 when not given;
+  S11 the ranges (tj-2ayia2 D1): ramp 0, cap 0, cap 1 and any value above INT32_MAX refused on create and on the source
+     append, nothing written; ramp 1, cap 2, INT32_MAX and None accepted; the minimum constants equal the CHECKs and
+     MIN_REQUEST_CAP_PER_HOUR equals panel_manager.REQUESTS_PER_CREATION;
   S2 a version append is a new row, version_no plus one, saved_at from the database, actor and reason stored trimmed,
      a blank or whitespace actor refused, a missing, blank or whitespace reason stored NULL (the reason is optional,
      ADR tj-46jkey, owner ruling 2026-11-06), earlier rows unchanged; a panel has no size;
   S3 the source cannot change: no write takes one for an existing panel;
   S4 enable and disable are versions;
   S5 current_settings and enabled_panels_on_source read the LATEST version;
-  S6 no fallback: current_source_settings is None without a version, create_panel refuses without one, no constant
-     names a rate; DEFAULT_PANEL_CADENCE is MONTHLY and applied only where no cadence is named; the window defaults to
+  S6 no fallback: current_source_settings is None without a version, no constant names a rate's VALUE (the range
+     constants are bounds, not defaults); DEFAULT_PANEL_CADENCE is MONTHLY and applied only where no cadence is named; the window defaults to
      DEFAULT_CORPORATE_ACTION_WINDOW_DAYS (90) on both sides;
   S7 version numbering is serialised: the panel row is read FOR UPDATE, the source under a transaction advisory lock,
      each BEFORE the max(version_no) read (the race itself is shown on Postgres, tests/system/test_panel_settings_pg.py);
   S8 (retired: effective-from is boundary_read's, see above);
   S9 append-only: every statement the module sends is a SELECT or an INSERT, and it exposes no other write;
   S10 create_panel's name lock (tj-7zjov1.244): a transaction-scoped advisory lock keyed on the TRIMMED name, taken
-     first, before the name read; then the source lock (only with source settings); then rows; a duplicate is the
+     first, before the name read; then the source lock (on EVERY create, tj-2ayia2 D4); then rows; a duplicate is the
      ordinary 422; the unique violation is not caught (the race itself: tests/system/test_panel_routes_pg.py PR3).
 
 TIER. SQLite has no ARRAY, no JSONB, no btrim, no hashtext and no advisory locks, so the two array columns and the
@@ -280,24 +290,51 @@ async def test_create_panel_keeps_a_named_cadence(world, cadence):
     assert row.cadence is cadence
 
 
-async def test_create_panel_refuses_a_source_with_no_settings_and_writes_nothing(world):
-    """NO FALLBACK RATE NUMBERS (03:25 UTC ruling (1)): the rates have no ruled value, so the call is refused."""
-    with pytest.raises(InvalidRequestError) as excinfo:
-        await _panel(world)
+@pytest.mark.parametrize(
+    ('given', 'stored'),
+    [
+        (None, (None, None, 90, 90)),
+        (SourceSettings(ramp_datasets_per_hour=5, request_cap_per_hour=None), (5, None, 90, 90)),
+        (SourceSettings(ramp_datasets_per_hour=None, request_cap_per_hour=6), (None, 6, 90, 90)),
+        (SourceSettings(ramp_datasets_per_hour=5, request_cap_per_hour=6), (5, 6, 90, 90)),
+        (SourceSettings(None, None, 10, 20), (None, None, 10, 20)),
+    ],
+    ids=['nothing-given', 'ramp-only', 'cap-only', 'both-rates', 'window-only'],
+)
+async def test_create_panel_on_a_source_with_no_version_always_writes_its_version_1(world, given, stored):
+    """ADR tj-2ayia2 D4: no refusal for want of rates. An absent rate is NULL (no limit), an absent window 90.
 
-    _refused(excinfo)
-    assert SOURCE.name in excinfo.value.detail
-    assert await world.counts() == {table.name: 0 for table in TABLES}
+    Exactly one source version, in the create's one commit, with the create's trimmed actor and reason.
+    """
+    commits_before = world.commits
+
+    panel, _ = await _panel(world, source_settings=given, actor='  operator ', reason='  first panel  ')
+
+    assert world.commits == commits_before + 1, 'the source version 1 and the panel are one transaction'
+    (source_row,) = await world.rows(SOURCE_SETTINGS)
+    assert (source_row.source, source_row.version_no) == (SOURCE, 1)
+    assert (
+        source_row.ramp_datasets_per_hour,
+        source_row.request_cap_per_hour,
+        source_row.corporate_action_window_pre_days,
+        source_row.corporate_action_window_post_days,
+    ) == stored
+    assert (source_row.actor, source_row.reason) == ('operator', 'first panel')
+    current = await _current_source(world)
+    assert current is not None and current.settings == SourceSettings(*stored)
+    assert [row.id for row in await world.rows(PANELS)] == [panel.id]
 
 
-async def test_create_panel_refuses_when_only_another_source_has_settings(world):
-    await _source(world, source=OTHER_SOURCE)
+async def test_create_panel_writes_its_own_version_1_when_only_another_source_has_one(world):
+    """The has-version read is per source: another source's version neither refuses nor stands in for this one's."""
+    other = await _source(world, source=OTHER_SOURCE)
 
-    with pytest.raises(InvalidRequestError) as excinfo:
-        await _panel(world, source=SOURCE)
+    await _panel(world, source=SOURCE)
 
-    _refused(excinfo)
-    assert len(await world.rows(PANELS)) == 0
+    first = await _current_source(world)
+    assert first is not None and (first.version_no, first.settings) == (1, SourceSettings(None, None))
+    assert await _current_source(world, OTHER_SOURCE) == other
+    assert len(await world.rows(PANELS)) == 1
 
 
 async def test_create_panel_writes_given_source_settings_in_the_same_transaction(world):
@@ -340,7 +377,15 @@ async def test_create_panel_on_a_source_with_settings_writes_no_source_version(w
 
 
 @pytest.mark.parametrize(
-    'given', [RATES, SourceSettings(ramp_datasets_per_hour=1, request_cap_per_hour=2)], ids=['same-rates', 'new-rates']
+    'given',
+    [
+        RATES,
+        SourceSettings(ramp_datasets_per_hour=1, request_cap_per_hour=2),
+        # tj-2ayia2: a given source settings with no limits, or with the window only, is still "given".
+        SourceSettings(None, None),
+        SourceSettings(None, None, 10, 20),
+    ],
+    ids=['same-rates', 'new-rates', 'no-limits', 'window-only'],
 )
 async def test_create_panel_refuses_source_settings_for_a_source_that_has_a_version_and_writes_nothing(world, given):
     """P20b-fix (tj-7zjov1.209): a source's rates change for every panel on it, so only through their own write."""
@@ -432,7 +477,7 @@ async def test_create_panel_refuses_negative_source_settings(world):
             world,
             name='beta',
             source=OTHER_SOURCE,
-            source_settings=SourceSettings(ramp_datasets_per_hour=-1, request_cap_per_hour=1),
+            source_settings=SourceSettings(ramp_datasets_per_hour=-1, request_cap_per_hour=2),
         )
 
     _refused(rates)
@@ -546,10 +591,11 @@ async def test_an_append_refuses_a_missing_cadence(world):
 @pytest.mark.parametrize(
     'settings',
     [
-        SourceSettings(ramp_datasets_per_hour=-1, request_cap_per_hour=0),
-        SourceSettings(ramp_datasets_per_hour=0, request_cap_per_hour=-1),
-        SourceSettings(ramp_datasets_per_hour=0, request_cap_per_hour=0, corporate_action_window_pre_days=-1),
-        SourceSettings(ramp_datasets_per_hour=0, request_cap_per_hour=0, corporate_action_window_post_days=-1),
+        # Each case is otherwise valid (ramp 1, cap 2, the window 0), so only the named field can refuse it.
+        SourceSettings(ramp_datasets_per_hour=-1, request_cap_per_hour=2),
+        SourceSettings(ramp_datasets_per_hour=1, request_cap_per_hour=-1),
+        SourceSettings(ramp_datasets_per_hour=1, request_cap_per_hour=2, corporate_action_window_pre_days=-1),
+        SourceSettings(ramp_datasets_per_hour=1, request_cap_per_hour=2, corporate_action_window_post_days=-1),
     ],
     ids=['ramp', 'cap', 'pre', 'post'],
 )
@@ -561,11 +607,117 @@ async def test_a_source_append_refuses_a_negative_number(world, settings):
     assert await world.rows(SOURCE_SETTINGS) == []
 
 
-async def test_a_source_append_accepts_zero_rates(world):
-    """0 pauses creation (the SourceSettings docstring): it is a value, not a refusal."""
-    record = await _source(world, settings=SourceSettings(ramp_datasets_per_hour=0, request_cap_per_hour=0))
+# ----------------------------------------------------------------------------------------- S11 ranges (tj-2ayia2)
 
-    assert (record.settings.ramp_datasets_per_hour, record.settings.request_cap_per_hour) == (0, 0)
+INT32_MAX = 2**31 - 1
+
+OUT_OF_RANGE = [
+    pytest.param(SourceSettings(0, None), 'ramp_datasets_per_hour', id='ramp-zero'),
+    pytest.param(SourceSettings(None, 0), 'request_cap_per_hour', id='cap-zero'),
+    pytest.param(SourceSettings(0, 0), 'ramp_datasets_per_hour', id='both-zero'),
+    pytest.param(SourceSettings(None, 1), 'request_cap_per_hour', id='cap-one'),
+    pytest.param(SourceSettings(1, 1), 'request_cap_per_hour', id='ramp-one-cap-one'),
+    pytest.param(SourceSettings(INT32_MAX + 1, None), 'ramp_datasets_per_hour', id='ramp-above-int32'),
+    pytest.param(SourceSettings(None, INT32_MAX + 1), 'request_cap_per_hour', id='cap-above-int32'),
+    pytest.param(SourceSettings(None, None, INT32_MAX + 1, 0), 'corporate_action_window_pre_days', id='pre-above'),
+    pytest.param(SourceSettings(None, None, 0, INT32_MAX + 1), 'corporate_action_window_post_days', id='post-above'),
+]
+
+IN_RANGE = [
+    pytest.param(SourceSettings(1, 2), id='the-minimums'),
+    pytest.param(SourceSettings(INT32_MAX, INT32_MAX, INT32_MAX, INT32_MAX), id='int32-max'),
+    pytest.param(SourceSettings(None, None, 0, 0), id='no-limit-window-zero'),
+    pytest.param(SourceSettings(1, None), id='ramp-one-no-cap'),
+    pytest.param(SourceSettings(None, 2), id='no-ramp-cap-two'),
+]
+
+
+@pytest.mark.parametrize(('settings', 'field'), OUT_OF_RANGE)
+async def test_a_source_append_refuses_a_rate_or_window_out_of_range_and_writes_nothing(world, settings, field):
+    """Zero is refused (a pause is enabled=false), a cap of 1 could never admit a creation, int32 max is the column's."""
+    await _source(world)
+    before = await world.rows(SOURCE_SETTINGS)
+    commits_before = world.commits
+
+    with pytest.raises(InvalidRequestError) as excinfo:
+        await _source(world, settings=settings)
+
+    _refused(excinfo)
+    assert field in excinfo.value.detail, excinfo.value.detail
+    assert world.commits == commits_before
+    assert await world.rows(SOURCE_SETTINGS) == before
+
+
+@pytest.mark.parametrize(('settings', 'field'), OUT_OF_RANGE)
+async def test_create_panel_refuses_source_settings_out_of_range_and_writes_nothing(world, settings, field):
+    """On a source with no version (so only the range can refuse it): nothing at all is written."""
+    world.statements.clear()
+
+    with pytest.raises(InvalidRequestError) as excinfo:
+        await _panel(world, source_settings=settings)
+
+    _refused(excinfo)
+    assert field in excinfo.value.detail, excinfo.value.detail
+    assert world.commits == 0
+    assert not [statement for statement in world.statements if isinstance(statement, Insert)]
+    assert await world.counts() == {table.name: 0 for table in TABLES}
+
+
+@pytest.mark.parametrize('settings', IN_RANGE)
+async def test_a_source_append_accepts_the_minimums_int32_max_and_no_limit(world, settings):
+    record = await _source(world, settings=settings)
+
+    (row,) = await world.rows(SOURCE_SETTINGS)
+    assert record.settings == settings
+    assert (row.ramp_datasets_per_hour, row.request_cap_per_hour) == (
+        settings.ramp_datasets_per_hour,
+        settings.request_cap_per_hour,
+    )
+
+
+@pytest.mark.parametrize('settings', IN_RANGE)
+async def test_create_panel_accepts_the_minimums_int32_max_and_no_limit(world, settings):
+    await _panel(world, source_settings=settings)
+
+    first = await _current_source(world)
+    assert first is not None and first.settings == settings
+
+
+async def test_an_unset_rate_is_stored_null_never_zero(world):
+    """None is NO LIMIT and is stored as NULL: 0 would be a refused value, so it must never stand in for None."""
+    await _source(world, settings=SourceSettings(None, None))
+
+    async with AsyncSession(world.engine) as db:
+        nulls = (
+            await db.execute(
+                sa.select(sa.func.count()).where(
+                    SOURCE_SETTINGS.c.ramp_datasets_per_hour.is_(None), SOURCE_SETTINGS.c.request_cap_per_hour.is_(None)
+                )
+            )
+        ).scalar_one()
+    assert nulls == 1
+    current = await _current_source(world)
+    assert current is not None
+    assert current.settings.ramp_datasets_per_hour is None and current.settings.request_cap_per_hour is None
+
+
+def _check_literal(name: str) -> int:
+    """The number a single-comparison CHECK of the model compares against ('<column> >= <n>')."""
+    (constraint,) = [c for c in SOURCE_SETTINGS.constraints if isinstance(c, sa.CheckConstraint) and c.name == name]
+    found = re.fullmatch(r'\s*(\w+)\s*>=\s*(\d+)\s*', str(constraint.sqltext))
+    assert found is not None, constraint.sqltext
+    return int(found.group(2))
+
+
+def test_the_minimum_constants_equal_the_checks_and_the_creation_cost():
+    """D1: a DB CHECK needs a literal, so this pins the crud constant, the CHECK and REQUESTS_PER_CREATION together."""
+    from data.store.app import panel_manager
+
+    assert panel_settings.MIN_RAMP_DATASETS_PER_HOUR == 1
+    assert _check_literal(PanelSourceSettingsVersion.RAMP_POSITIVE) == panel_settings.MIN_RAMP_DATASETS_PER_HOUR
+    assert panel_settings.MIN_REQUEST_CAP_PER_HOUR == panel_manager.REQUESTS_PER_CREATION == 2
+    assert _check_literal(PanelSourceSettingsVersion.REQUEST_CAP_MIN) == panel_settings.MIN_REQUEST_CAP_PER_HOUR
+    assert panel_settings.INT32_MAX == INT32_MAX == 2147483647
 
 
 async def test_an_append_to_an_unknown_panel_is_not_found_and_writes_nothing(world):
@@ -691,10 +843,18 @@ async def test_source_versions_are_numbered_per_source(world):
 async def test_no_constant_names_a_rate_and_the_only_defaults_are_the_ruled_ones():
     """The 03:25 UTC ruling: DEFAULT_PANEL_CADENCE and the 90-day window, nothing else; the rates have none.
 
+    ADR tj-2ayia2 adds three BOUNDS (the minimums and int32 max), which are no default: an unset rate is None, no
+    limit, and the dataclass still makes the caller say it (no field default for either rate).
     And a panel has no size at all (ADR tj-46jkey): not a field with no default, no field.
     """
     constants = {name for name in vars(panel_settings) if name.isupper() and not name.startswith('_')}
-    assert constants == {'DEFAULT_PANEL_CADENCE', 'DEFAULT_CORPORATE_ACTION_WINDOW_DAYS'}
+    assert constants == {
+        'DEFAULT_PANEL_CADENCE',
+        'DEFAULT_CORPORATE_ACTION_WINDOW_DAYS',
+        'MIN_RAMP_DATASETS_PER_HOUR',
+        'MIN_REQUEST_CAP_PER_HOUR',
+        'INT32_MAX',
+    }
     assert DEFAULT_CORPORATE_ACTION_WINDOW_DAYS == 90
     source_defaults = {f.name: f.default for f in dataclasses.fields(SourceSettings)}
     assert source_defaults == {
@@ -778,10 +938,13 @@ def _is_source_guard_read(text: str) -> bool:
     return text.startswith('SELECT') and 'FROM panel_source_settings_version' in text and 'DESC' in text
 
 
-@pytest.mark.parametrize('has_version', [False, True], ids=['source-without-a-version', 'refused-source-with-one'])
-async def test_create_panel_with_source_settings_locks_the_source_before_its_guard_read(world, has_version):
+@pytest.mark.parametrize('with_source_settings', [True, False], ids=['with-source-settings', 'none-given'])
+@pytest.mark.parametrize('has_version', [False, True], ids=['source-without-a-version', 'source-with-one'])
+async def test_create_panel_locks_the_source_before_its_guard_read(world, has_version, with_source_settings):
     """tj-7zjov1.212: the source lock comes BEFORE the has_version read, so two concurrent creates cannot both see none.
 
+    ADR tj-2ayia2 D4: on EVERY create, with source settings or not, since a create with none given now writes the
+    source's version 1 too (two concurrent creates must write one version 1, not a 1 and a 2).
     The ORDER is the pin, not a count: the second lock (inside _next_source_version_no) is re-entrant and harmless, and
     a lock moved back after the read would still be counted. Whether the order actually serialises two creates is a
     Postgres question SQLite cannot answer (one writer, no advisory locks): tests/system/test_panel_settings_pg.py PS8.
@@ -791,12 +954,12 @@ async def test_create_panel_with_source_settings_locks_the_source_before_its_gua
     world.statements.clear()
     world.locks.clear()
 
-    if has_version:
+    if has_version and with_source_settings:
         with pytest.raises(InvalidRequestError) as excinfo:
             await _panel(world, source_settings=RATES)
         _refused(excinfo)
     else:
-        await _panel(world, source_settings=RATES)
+        await _panel(world, source_settings=RATES if with_source_settings else None)
 
     sql = [_sql(statement) for statement in world.statements]
     keys = [_lock_key(statement) for statement in world.statements]
@@ -822,7 +985,7 @@ async def test_create_panel_with_source_settings_locks_the_source_before_its_gua
 # tj-7zjov1.244 (ruled by the architect gate on tj-7zjov1.36): create_panel takes a transaction-scoped advisory lock
 # on the TRIMMED name FIRST inside its transaction, before the name read, so the loser of two concurrent creates of one
 # name waits, then reads the winner's row and gets the ordinary 422 refusal instead of the unique index's 409. Lock
-# order: name, then source (only with source settings), then rows. The unique violation is NOT caught. Whether the lock
+# order: name, then source (every create since ADR tj-2ayia2 D4), then rows. The unique violation is NOT caught. Whether the lock
 # actually serialises two creates is a Postgres question SQLite cannot answer: tests/system/test_panel_routes_pg.py PR3.
 
 
@@ -843,15 +1006,17 @@ async def test_create_panel_takes_the_name_lock_first_then_the_source_lock_then_
     panel_insert = next(i for i, text in enumerate(sql) if text.startswith('INSERT INTO panel '))
     assert name_lock == 0, f'the name lock is the first statement of the transaction: {sql}'
     assert name_lock < name_read < guard < panel_insert, sql
+    # The source lock on EVERY create (ADR tj-2ayia2 D4), after the name read and before the guard read.
+    source_lock = keys.index(SOURCE_LOCK_KEY)
+    assert name_read < source_lock < guard, sql
     if with_source_settings:
-        source_lock = keys.index(SOURCE_LOCK_KEY)
-        assert name_read < source_lock < guard, sql
+        # The source had no version: the numbering's re-entrant lock follows.
         assert [key for key in keys if key is not None] == [_name_key('alpha'), SOURCE_LOCK_KEY, SOURCE_LOCK_KEY]
         assert world.locks == [_crc(_name_key('alpha')), _crc(SOURCE_LOCK_KEY), _crc(SOURCE_LOCK_KEY)]
     else:
-        # Without source settings the name lock is the only lock.
-        assert [key for key in keys if key is not None] == [_name_key('alpha')], keys
-        assert world.locks == [_crc(_name_key('alpha'))]
+        # The source had a version and none is given: the name lock, then the source lock once, nothing written to it.
+        assert [key for key in keys if key is not None] == [_name_key('alpha'), SOURCE_LOCK_KEY], keys
+        assert world.locks == [_crc(_name_key('alpha')), _crc(SOURCE_LOCK_KEY)]
 
 
 async def test_the_name_lock_key_is_the_trimmed_name(world):
@@ -864,7 +1029,10 @@ async def test_the_name_lock_key_is_the_trimmed_name(world):
         await _panel(world, name='A')
     await _panel(world, name='B')
 
-    assert world.locks == [_crc(_name_key('A')), _crc(_name_key('A')), _crc(_name_key('B'))]
+    # The source lock (every create, tj-2ayia2 D4) is filtered out: this pins the name keys only.
+    name_locks = [key for key in world.locks if key != _crc(SOURCE_LOCK_KEY)]
+    assert name_locks == [_crc(_name_key('A')), _crc(_name_key('A')), _crc(_name_key('B'))]
+    assert world.locks.count(_crc(SOURCE_LOCK_KEY)) == 2, 'the refused duplicate took no source lock'
     assert _crc(_name_key('A')) != _crc(_name_key('B'))
 
 

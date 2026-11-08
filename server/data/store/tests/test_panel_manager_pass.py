@@ -24,6 +24,8 @@ creation ruling).
       the member stays in; a finished request with no dataset is re-created, a PERMANENT one REFUSED vendor_refused;
   P6  the windows: ramp_datasets_per_hour and request_cap_per_hour over the trailing hour, two requests per creation,
       shared per source, DEFERRED ramp_rate or request_rate, a repeat writes nothing, a restart creates nothing more;
+      a NULL rate is NO LIMIT (ADR tj-2ayia2 D5): both NULL reads no window and creates (and releases) every selected
+      member in one pass; one NULL leaves the other to decide; the minimum cap 2 admits one creation an hour;
   P7  RELEASE: names the deciding pass's settings version and snapshots and the CURRENT source settings version, writes
       only CREATED, and none runs under another settings version or a disabled panel; nothing to do writes no pass;
       the pass row opens lazily (tj-7zjov1.228): in the create_request commit, never before the clamp, reset by a
@@ -156,7 +158,7 @@ async def due_again(world, seeded, by: timedelta = 2 * DAY) -> None:
         await world.put(PASSES.update().where(PASSES.c.id == row.id).values(started_at=row.started_at - by))
 
 
-async def basic(world, *, ramp: int = 10, cap: int = 100, assets=None, **settings):
+async def basic(world, *, ramp: int | None = 10, cap: int | None = 100, assets=None, **settings):
     """One source settings version, one panel created two days ago, and one active snapshot an hour ago."""
     source_settings_id = await world.source_settings(ramp=ramp, cap=cap)
     seeded = await world.panel(now() - 2 * DAY, **settings)
@@ -529,6 +531,100 @@ async def test_the_request_window_counts_two_requests_per_creation(world, clock)
     ]
     assert rows[-1].cause == CAUSE_REQUEST_RATE
     assert len(await world.requests()) == 4
+
+
+# ADR tj-2ayia2 D5 (owner ruling 2026-11-07): a NULL rate is NO LIMIT. With both NULL the two window reads are skipped
+# (they would decide nothing) and a pass creates EVERY selected member; with one NULL only the other rate decides.
+
+FIVE = [('v1', 'AAA'), ('v2', 'BBB'), ('v3', 'CCC'), ('v4', 'DDD'), ('v9', 'ZZZ')]
+
+
+def count_window_reads(monkeypatch) -> dict[str, int]:
+    calls = {'created': 0, 'requests': 0}
+    real_created, real_requests = panel_manager.created_in_window, panel_manager.requests_in_window
+
+    async def created(*args, **kw):
+        calls['created'] += 1
+        return await real_created(*args, **kw)
+
+    async def requests(*args, **kw):
+        calls['requests'] += 1
+        return await real_requests(*args, **kw)
+
+    monkeypatch.setattr(panel_manager, 'created_in_window', created)
+    monkeypatch.setattr(panel_manager, 'requests_in_window', requests)
+    return calls
+
+
+async def test_a_no_limit_source_creates_every_selected_member_in_one_pass_and_reads_no_window(
+    world, clock, monkeypatch
+):
+    seeded, _, _ = await basic(world, ramp=None, cap=None, assets=FIVE)
+    calls = count_window_reads(monkeypatch)
+
+    await manager(clock).tick()
+
+    rows = await world.transitions(seeded)
+    assert [vendor for vendor, kind in kinds(rows) if kind == 'CREATED'] == ['v1', 'v2', 'v3', 'v4', 'v9']
+    assert not [row for row in rows if row.transition is DEFERRED]
+    assert len(await world.requests(BARS)) == 5 and len(await world.requests(CORPORATE)) == 5
+    assert calls == {'created': 0, 'requests': 0}, 'the window reads ran with no limit at all'
+    (row,) = await world.passes(seeded)
+    assert row.counts['created'] == 5 and row.counts['deferred'] == 0
+
+
+async def test_a_no_limit_version_releases_every_deferred_member_however_full_the_windows_are(
+    world, clock, monkeypatch
+):
+    """Under ramp 1 three members wait; a newer version with no limits releases them all, the windows not aged."""
+    seeded, _, _ = await basic(world, ramp=1, assets=[('v1', 'AAA'), ('v2', 'BBB'), ('v3', 'CCC'), ('v4', 'DDD')])
+    await manager(clock).tick()
+    assert [v for v, kind in kinds(await world.transitions(seeded)) if kind == 'DEFERRED'] == ['v2', 'v3', 'v4']
+    no_limit = await world.source_settings(ramp=None, cap=None)
+    calls = count_window_reads(monkeypatch)
+
+    await manager(clock).tick()
+
+    (release,) = [row for row in await world.passes(seeded) if row.kind is PanelPassKind.RELEASE]
+    assert release.source_settings_version_id == no_limit
+    released = [row for row in await world.transitions(seeded) if row.pass_id == release.id]
+    assert kinds(released) == [('v2', 'CREATED'), ('v3', 'CREATED'), ('v4', 'CREATED')]
+    assert calls == {'created': 0, 'requests': 0}
+
+
+async def test_a_null_ramp_leaves_only_the_cap_to_decide(world, clock, monkeypatch):
+    seeded, _, _ = await basic(world, ramp=None, cap=6, assets=FIVE)
+    calls = count_window_reads(monkeypatch)
+
+    await manager(clock).tick()
+
+    rows = await world.transitions(seeded)
+    assert [v for v, kind in kinds(rows) if kind == 'CREATED'] == ['v1', 'v2', 'v3']
+    assert {row.cause for row in rows if row.transition is DEFERRED} == {CAUSE_REQUEST_RATE}
+    assert calls['created'] >= 1 and calls['requests'] >= 1, 'a set rate needs the windows read'
+
+
+async def test_a_null_cap_leaves_only_the_ramp_to_decide(world, clock, monkeypatch):
+    seeded, _, _ = await basic(world, ramp=2, cap=None, assets=FIVE)
+    calls = count_window_reads(monkeypatch)
+
+    await manager(clock).tick()
+
+    rows = await world.transitions(seeded)
+    assert [v for v, kind in kinds(rows) if kind == 'CREATED'] == ['v1', 'v2']
+    assert {row.cause for row in rows if row.transition is DEFERRED} == {CAUSE_RAMP_RATE}
+    assert calls['created'] >= 1
+
+
+async def test_the_minimum_cap_admits_exactly_one_creation_an_hour(world, clock):
+    """D1: a cap of 2 is REQUESTS_PER_CREATION, the smallest cap that admits a creation at all."""
+    seeded, _, _ = await basic(world, ramp=None, cap=panel_manager.REQUESTS_PER_CREATION, assets=FIVE)
+
+    await manager(clock).tick()
+
+    rows = await world.transitions(seeded)
+    assert [v for v, kind in kinds(rows) if kind == 'CREATED'] == ['v1']
+    assert len(await world.requests()) == 2
 
 
 async def test_requests_of_another_label_do_not_count(world, clock):

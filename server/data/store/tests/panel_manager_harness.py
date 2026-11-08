@@ -206,7 +206,10 @@ class World:
 
     # ------------------------------------------------------------------ set-up rows
 
-    async def source_settings(self, ramp: int = 10, cap: int = 100, source: DataSource = SOURCE) -> uuid.UUID:
+    async def source_settings(
+        self, ramp: int | None = 10, cap: int | None = 100, source: DataSource = SOURCE
+    ) -> uuid.UUID:
+        """A source settings version; a rate of None is stored NULL, NO LIMIT (ADR tj-2ayia2)."""
         number = self._versions.get(source, 0) + 1
         self._versions[source] = number
         result = await self.put(

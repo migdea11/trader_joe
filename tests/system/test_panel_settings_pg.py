@@ -22,6 +22,15 @@ no arrays and no Postgres enums:
   PS8 the guard is judged under the source lock (tj-7zjov1.212/.213): CONCURRENT creates giving source settings on a
       source with no version leave exactly one panel and ONE source version, the winner's; every other create is
       refused INVALID_REQUEST and writes nothing;
+  PS9 (ADR tj-2ayia2 D4) the source lock on EVERY create: CONCURRENT creates with NO source settings on a source with
+      no version all succeed and write ONE version 1, no limits (NULL, NULL) and 90/90;
+  PS11 (ADR tj-2ayia2 D4) the MIXED race: a bare create and a create with source settings on a source with no
+      version write ONE version 1, the first-served create's; the other is refused (settings given) or writes none;
+  PS10 (ADR tj-2ayia2 D1/D2) the CHECKs ramp_positive, request_cap_min and window_non_negative on the real schema: a
+      NULL rate, the minimums and int32 max pass; ramp 0, cap 0, cap 1 and a negative window are refused naming the
+      constraint; a value above int32 is refused by the int4 column; a no-limit version round-trips NULL on asyncpg.
+      WRITTEN, NOT YET RUN (validator tj-7zjov1.363.4): the test-stack window bead tj-7zjov1.363.7 runs them, on a
+      test database dropped and migrated again (a database already at 5d9a3c7e1b84 keeps the old schema);
   PS6 enabled_panels_on_source compiles and runs on Postgres (its correlated latest-version subquery);
   PS5 POST /store with the body owner 'panel' on the running data_store: 422 INVALID_REQUEST with the exact message,
       and no ingest_request row written for it.
@@ -167,7 +176,12 @@ async def test_concurrent_versions_of_one_source_are_numbered_consecutively(pg_a
     async def append(index: int):
         async with AsyncSession(pg_async_engine, expire_on_commit=False) as db:
             return await append_source_settings_version(
-                db, source=SOURCE, settings=SourceSettings(index, index), actor='operator', reason=f'source {index}'
+                # In range (ADR tj-2ayia2: ramp >= 1, cap >= 2): index 0 would be a refused 0 now.
+                db,
+                source=SOURCE,
+                settings=SourceSettings(index + 1, index + 2),
+                actor='operator',
+                reason=f'source {index}',
             )
 
     try:
@@ -438,6 +452,266 @@ async def test_concurrent_creates_with_source_settings_on_a_source_with_no_versi
     assert current is not None and current.settings == rates[index], "the source's rates are not the winner's"
     assert panels == [winner.id], 'a refused create left a panel row'
     assert panel_versions == [winner.id] and winner_v1.version_no == 1, 'a refused create left a settings version'
+
+
+@pytest.mark.asyncio
+async def test_concurrent_creates_with_no_source_settings_on_a_source_with_no_version_write_one_version_1(
+    pg_async_engine, written, run_identity
+):
+    """PS9 (ADR tj-2ayia2 D4): concurrent creates with nothing given on a source with no version write ONE version 1.
+
+    A create on a source with NO version ALWAYS writes its version 1, even with nothing given, and takes the source
+    lock on EVERY create. CONCURRENT such creates (distinct names) ALL succeed, and the source gets
+    exactly ONE version: version 1, no limits (NULL, NULL), the window 90/90, with the first-served create's reason.
+
+    The same gate as PS8: every create queues on the source lock before the gate lets go. With the lock taken only when
+    source settings are given (the code before tj-2ayia2) none of these would queue, _await_lock_waiters fails, and the
+    creates would race to write version 1 several times (a unique violation or several versions).
+    """
+    source = await _source_with_no_version(pg_async_engine)
+    tag = f'system-test-{run_identity.run_id}-nolimit-{uuid.uuid4().hex[:8]}'
+
+    async def create(index: int):
+        async with AsyncSession(pg_async_engine, expire_on_commit=False) as db:
+            return await create_panel(
+                db,
+                name=f'{tag}-{index}',
+                source=source,
+                settings=SETTINGS_V1,
+                actor='operator',
+                reason=f'{tag} reason {index}',
+            )
+
+    tasks: list[asyncio.Task] = []
+    try:
+        async with AsyncSession(pg_async_engine) as gate:
+            holder = (await gate.execute(sa.select(sa.func.pg_backend_pid()))).scalar_one()
+            await _lock_source(gate, source)
+            tasks = [asyncio.create_task(create(index)) for index in range(CONCURRENT)]
+            try:
+                await _await_lock_waiters(pg_async_engine, holder, CONCURRENT)
+            finally:
+                await gate.rollback()
+    finally:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        async with AsyncSession(pg_async_engine) as db:
+            written.panels.extend(
+                (await db.execute(sa.select(PANELS.c.id).where(PANELS.c.name.like(f'{tag}-%')))).scalars()
+            )
+            written.source_versions.extend(
+                (
+                    await db.execute(
+                        sa.select(SOURCE_SETTINGS.c.id).where(
+                            SOURCE_SETTINGS.c.source == source, SOURCE_SETTINGS.c.reason.like(f'{tag} reason %')
+                        )
+                    )
+                ).scalars()
+            )
+
+    failures = [result for result in results if isinstance(result, BaseException)]
+    assert failures == [], [f'{type(f).__name__}: {f}' for f in failures]
+    async with AsyncSession(pg_async_engine) as db:
+        versions = (await db.execute(sa.select(*SOURCE_SETTINGS.c).where(SOURCE_SETTINGS.c.source == source))).all()
+        panels = (await db.execute(sa.select(PANELS.c.id).where(PANELS.c.name.like(f'{tag}-%')))).scalars().all()
+    assert len(versions) == 1, f'{source.name} holds {len(versions)} source settings versions after the race'
+    (only,) = versions
+    assert only.version_no == 1 and only.reason.startswith(f'{tag} reason ')
+    assert (only.ramp_datasets_per_hour, only.request_cap_per_hour) == (None, None)
+    assert (only.corporate_action_window_pre_days, only.corporate_action_window_post_days) == (90, 90)
+    assert len(panels) == CONCURRENT
+
+
+@pytest.mark.asyncio
+async def test_a_mixed_race_bare_create_and_create_with_settings_writes_one_version_1(
+    pg_async_engine, written, run_identity
+):
+    """PS11 (ADR tj-2ayia2 D4, the architect's note on tj-7zjov1.363.7): one create WITHOUT source settings and one WITH.
+
+    Gated on the source lock as PS8/PS9. Exactly one version 1 exists after, never a version 2 or a unique violation.
+    If the bare create ran first, version 1 is NULL/NULL/90/90 and the create with settings is INVALID_REQUEST 'already
+    has settings' with nothing written (no panel, no settings row). If the create with settings ran first, version 1
+    is its values and the bare create succeeds without writing a version. Which one runs first is the lock's queue
+    order; both branches are asserted, whichever happens.
+    """
+    source = await _source_with_no_version(pg_async_engine)
+    tag = f'system-test-{run_identity.run_id}-mixed-{uuid.uuid4().hex[:8]}'
+    given = SourceSettings(ramp_datasets_per_hour=3, request_cap_per_hour=7, corporate_action_window_pre_days=11)
+
+    async def create(kind: str):
+        async with AsyncSession(pg_async_engine, expire_on_commit=False) as db:
+            return await create_panel(
+                db,
+                name=f'{tag}-{kind}',
+                source=source,
+                settings=SETTINGS_V1,
+                actor='operator',
+                reason=f'{tag} reason {kind}',
+                source_settings=given if kind == 'given' else None,
+            )
+
+    tasks: dict[str, asyncio.Task] = {}
+    try:
+        async with AsyncSession(pg_async_engine) as gate:
+            holder = (await gate.execute(sa.select(sa.func.pg_backend_pid()))).scalar_one()
+            await _lock_source(gate, source)
+            tasks = {kind: asyncio.create_task(create(kind)) for kind in ('bare', 'given')}
+            try:
+                await _await_lock_waiters(pg_async_engine, holder, 2)
+            finally:
+                await gate.rollback()
+    finally:
+        results = dict(zip(tasks, await asyncio.gather(*tasks.values(), return_exceptions=True), strict=True))
+        async with AsyncSession(pg_async_engine) as db:
+            written.panels.extend(
+                (await db.execute(sa.select(PANELS.c.id).where(PANELS.c.name.like(f'{tag}-%')))).scalars()
+            )
+            written.source_versions.extend(
+                (
+                    await db.execute(
+                        sa.select(SOURCE_SETTINGS.c.id).where(
+                            SOURCE_SETTINGS.c.source == source, SOURCE_SETTINGS.c.reason.like(f'{tag} reason %')
+                        )
+                    )
+                ).scalars()
+            )
+
+    assert not isinstance(results['bare'], BaseException), f'the bare create failed: {results["bare"]!r}'
+    async with AsyncSession(pg_async_engine) as db:
+        versions = (await db.execute(sa.select(*SOURCE_SETTINGS.c).where(SOURCE_SETTINGS.c.source == source))).all()
+        panels = (await db.execute(sa.select(PANELS.c.name).where(PANELS.c.name.like(f'{tag}-%')))).scalars().all()
+        settings_rows = (
+            (await db.execute(sa.select(SETTINGS.c.reason).where(SETTINGS.c.reason.like(f'{tag} reason %'))))
+            .scalars()
+            .all()
+        )
+    assert len(versions) == 1, f'{source.name} holds {len(versions)} source settings versions after the mixed race'
+    (only,) = versions
+    assert only.version_no == 1
+    numbers = (
+        only.ramp_datasets_per_hour,
+        only.request_cap_per_hour,
+        only.corporate_action_window_pre_days,
+        only.corporate_action_window_post_days,
+    )
+    if only.reason == f'{tag} reason bare':
+        # The bare create ran first: no limits; the create with settings is refused and wrote nothing.
+        assert numbers == (None, None, 90, 90)
+        refused = results['given']
+        assert isinstance(refused, InvalidRequestError), f'expected the store refusal, got {refused!r}'
+        assert refused.reason is Reason.INVALID_REQUEST and 'already has settings' in refused.detail, refused.detail
+        assert panels == [f'{tag}-bare'] and settings_rows == [f'{tag} reason bare']
+    else:
+        # The create with settings ran first: its values; the bare create succeeded and wrote no version.
+        assert only.reason == f'{tag} reason given', only.reason
+        assert not isinstance(results['given'], BaseException), repr(results['given'])
+        assert numbers == (3, 7, 11, 90)
+        assert sorted(panels) == [f'{tag}-bare', f'{tag}-given']
+        assert sorted(settings_rows) == [f'{tag} reason bare', f'{tag} reason given']
+
+
+# --------------------------------------------------------------------------------------------- PS10 the rate CHECKs
+
+RAMP_CHECK = PanelSourceSettingsVersion.RAMP_POSITIVE
+CAP_CHECK = PanelSourceSettingsVersion.REQUEST_CAP_MIN
+WINDOW_CHECK = PanelSourceSettingsVersion.WINDOW_NON_NEGATIVE
+
+
+def _raw_source_row(**rates) -> dict:
+    """A row written BEHIND the crud (test-only): the CHECK, not the module, is what is under test."""
+    return {
+        'source': SOURCE,
+        'version_no': 1_000_000 + int(uuid.uuid4().int % 1_000_000),
+        'ramp_datasets_per_hour': None,
+        'request_cap_per_hour': None,
+        'corporate_action_window_pre_days': 0,
+        'corporate_action_window_post_days': 0,
+        'actor': 'operator',
+        'reason': 'system test raw check row',
+    } | rates
+
+
+@pytest.mark.parametrize(
+    'rates',
+    [
+        {},
+        {'ramp_datasets_per_hour': 1, 'request_cap_per_hour': 2},
+        {'ramp_datasets_per_hour': 2147483647, 'request_cap_per_hour': 2147483647},
+        {'ramp_datasets_per_hour': None, 'request_cap_per_hour': 2},
+        {'ramp_datasets_per_hour': 1, 'request_cap_per_hour': None},
+    ],
+    ids=['both-null', 'the-minimums', 'int32-max', 'ramp-null', 'cap-null'],
+)
+def test_the_rate_checks_pass_a_null_and_the_minimums_on_postgres(pg_engine, written, rates):
+    with pg_engine.begin() as conn:
+        row_id = conn.execute(
+            sa.insert(SOURCE_SETTINGS).values(**_raw_source_row(**rates)).returning(SOURCE_SETTINGS.c.id)
+        ).scalar_one()
+    written.source_versions.append(row_id)
+    with pg_engine.connect() as conn:
+        stored = conn.execute(sa.select(SOURCE_SETTINGS).where(SOURCE_SETTINGS.c.id == row_id)).one()
+    expected = _raw_source_row(**rates)
+    assert (stored.ramp_datasets_per_hour, stored.request_cap_per_hour) == (
+        expected['ramp_datasets_per_hour'],
+        expected['request_cap_per_hour'],
+    )
+
+
+@pytest.mark.parametrize(
+    ('rates', 'constraint'),
+    [
+        ({'ramp_datasets_per_hour': 0}, RAMP_CHECK),
+        ({'ramp_datasets_per_hour': -1}, RAMP_CHECK),
+        ({'request_cap_per_hour': 0}, CAP_CHECK),
+        ({'request_cap_per_hour': 1}, CAP_CHECK),
+        ({'corporate_action_window_pre_days': -1}, WINDOW_CHECK),
+        ({'corporate_action_window_post_days': -1}, WINDOW_CHECK),
+    ],
+    ids=['ramp-zero', 'ramp-negative', 'cap-zero', 'cap-one', 'pre-negative', 'post-negative'],
+)
+def test_the_rate_checks_refuse_zero_a_cap_of_one_and_name_the_constraint_on_postgres(
+    pg_engine, written, rates, constraint
+):
+    """Each out-of-range value is refused by its own CHECK, named in Postgres's error text.
+
+    The text: 'new row for relation "panel_source_settings_version" violates check constraint "<name>"'. Pinned by
+    name so a renamed or merged CHECK is red.
+    """
+    with pg_engine.connect() as conn, pytest.raises(sa.exc.IntegrityError) as excinfo:
+        conn.execute(sa.insert(SOURCE_SETTINGS).values(**_raw_source_row(**rates)))
+    text = str(excinfo.value.orig)
+    assert 'violates check constraint' in text and f'"{constraint}"' in text, text
+    assert '"panel_source_settings_version"' in text, text
+    with pg_engine.connect() as conn:
+        leaked = conn.execute(
+            sa.select(sa.func.count())
+            .select_from(SOURCE_SETTINGS)
+            .where(SOURCE_SETTINGS.c.reason == 'system test raw check row', SOURCE_SETTINGS.c.version_no >= 1_000_000)
+        ).scalar_one()
+    assert leaked == 0
+
+
+def test_a_rate_above_int32_is_refused_by_the_int4_column_on_postgres(pg_engine):
+    """No CHECK for the upper bound (D2): the int4 column is it."""
+    with pg_engine.connect() as conn, pytest.raises(sa.exc.DBAPIError) as excinfo:
+        conn.execute(sa.insert(SOURCE_SETTINGS).values(**_raw_source_row(request_cap_per_hour=2147483648)))
+    assert 'out of range' in str(excinfo.value.orig).lower(), excinfo.value.orig
+
+
+@pytest.mark.asyncio
+async def test_a_no_limit_source_version_round_trips_null_on_asyncpg(pg_async_engine, pg_engine, written):
+    """append_source_settings_version with None rates writes NULL (never 0) and current_source_settings reads None."""
+    async with AsyncSession(pg_async_engine, expire_on_commit=False) as db:
+        record = await append_source_settings_version(
+            db, source=SOURCE, settings=SourceSettings(None, None), actor='operator', reason='system test no limit'
+        )
+    written.source_versions.append(record.id)
+    with pg_engine.connect() as conn:
+        stored = conn.execute(sa.select(SOURCE_SETTINGS).where(SOURCE_SETTINGS.c.id == record.id)).one()
+    assert stored.ramp_datasets_per_hour is None and stored.request_cap_per_hour is None
+    async with AsyncSession(pg_async_engine) as db:
+        current = await current_source_settings(db, SOURCE)
+    assert current is not None and current.id == record.id
+    assert current.settings == SourceSettings(None, None)
 
 
 @pytest.mark.asyncio

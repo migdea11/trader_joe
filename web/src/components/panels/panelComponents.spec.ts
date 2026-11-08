@@ -3,10 +3,13 @@
 // - PanelSettingsForm: Save Settings sends the form, Enable or Disable sends the SAVED settings with only
 //   `enabled` flipped (unsaved edits are not smuggled in); the reason is optional (tj-7zjov1.362.4).
 // - PanelCreateForm: cadence Monthly (default) sent UNSPECIFIED unless picked; the four source settings
-//   fields only while the chosen source's versions page is empty (ramp and cap then required, window days
-//   optional); an optional reason, no size. Validated on click (tj-7zjov1.362.2): nothing marked on open, a
-//   press with gaps marks every one, focuses the first and sends nothing; the marks then follow the fields.
-// - PanelSourceSettingsForm: all four numbers sent, 0 included; an optional reason.
+//   fields only while the chosen source's versions page is empty, all four optional (ADR tj-2ayia2 D6: an
+//   empty ramp or cap is no limit and left out; a typed one is ramp 1 or more, cap 2 or more, at most the
+//   int32 maximum); only name and source are required; an optional reason, no size. Validated on click
+//   (tj-7zjov1.362.2): nothing marked on open, a press with gaps marks every one, focuses the first and
+//   sends nothing; the marks then follow the fields.
+// - PanelSourceSettingsForm: ramp and cap optional by the same rule, validated live (Save off on a bad one);
+//   the window days required, 0 or more; an optional reason.
 // tj-7zjov1.362.4 (ADR tj-46jkey sections 1 and 2): no form and no fact shows a size; a blank reason is sent
 // as '' and a typed one trimmed, on all three writes.
 // - PanelHistoryStrip: one block per expected day, the change bar, markers with version, pass, actor and
@@ -572,33 +575,91 @@ describe('PanelCreateForm', () => {
     expect(form.emitted('close')).toHaveLength(1)
   })
 
-  it('a source with no settings version: ramp and cap required, window days optional and absent when blank', async () => {
+  // ADR tj-2ayia2 D6: on a source with no settings every one of the four fields is optional; empty means no
+  // limit (the rates) or the store default (the window days), and an empty field reaches the store as nothing.
+  it('a source with no settings version: all four empty send at once, every source field undefined', async () => {
     api.getSourceSettingsVersions.mockResolvedValue(EMPTY_PAGE)
     const { create: createPanel } = stubWrites({ kind: 'created', detail: detail() })
     const form = mountCreate()
     await fill(form, 1)
-    expect(byId(form, 'create-ramp').exists()).toBe(true)
-    expect(byId(form, 'create-pre').exists()).toBe(true)
-    expect(byId(form, 'create-ramp-error').exists()).toBe(false)
-    expect(byId(form, 'create-cap-error').exists()).toBe(false)
-    await press(form)
-    expect(createPanel).not.toHaveBeenCalled()
-    expect(byId(form, 'create-ramp-error').text()).toBe('Give a whole number, 0 or more.')
-    expect(byId(form, 'create-cap-error').text()).toBe('Give a whole number, 0 or more.')
-    focused(form, 'create-ramp')
-    expect(byId(form, 'create-submit').attributes('disabled')).toBeUndefined()
-    await byId(form, 'create-ramp').setValue('0')
-    expect(byId(form, 'create-ramp-error').exists()).toBe(false)
-    expect(byId(form, 'create-cap-error').text()).toBe('Give a whole number, 0 or more.')
-    expect(byId(form, 'create-problem').exists()).toBe(true)
-    await byId(form, 'create-cap').setValue('200')
-    expect(byId(form, 'create-problem').exists()).toBe(false)
+    for (const field of ['ramp', 'cap', 'pre', 'post']) expect(byId(form, `create-${field}`).exists()).toBe(true)
     await press(form)
     expect(createPanel).toHaveBeenCalledTimes(1)
     const sent = createPanel.mock.calls[0]![0]
-    expect(sent).toMatchObject({ rampDatasetsPerHour: 0, requestCapPerHour: 200 })
+    expect(sent.rampDatasetsPerHour).toBeUndefined()
+    expect(sent.requestCapPerHour).toBeUndefined()
     expect(sent.corporateActionWindowPreDays).toBeUndefined()
     expect(sent.corporateActionWindowPostDays).toBeUndefined()
+    expect(sent).toMatchObject({ name: 'Large caps', source: DataSource.ALPACA_API, reason: 'first panel' })
+    expect(form.findAll('[aria-invalid]')).toHaveLength(0)
+    expect(form.emitted('close')).toHaveLength(1)
+  })
+
+  it.each([
+    ['ramp', ' 1 ', { rampDatasetsPerHour: 1 }],
+    ['ramp', '2147483647', { rampDatasetsPerHour: 2_147_483_647 }],
+    ['cap', '2', { requestCapPerHour: 2 }],
+    ['cap', '2147483647', { requestCapPerHour: 2_147_483_647 }],
+  ] as const)('a %s of %j alone is sent as a number, the other rate left out', async (field, typed, expected) => {
+    api.getSourceSettingsVersions.mockResolvedValue(EMPTY_PAGE)
+    const { create: createPanel } = stubWrites({ kind: 'created', detail: detail() })
+    const form = mountCreate()
+    await fill(form, 1)
+    await byId(form, `create-${field}`).setValue(typed)
+    await press(form)
+    expect(createPanel).toHaveBeenCalledTimes(1)
+    const sent = createPanel.mock.calls[0]![0]
+    expect(sent).toMatchObject(expected)
+    const other = field === 'ramp' ? 'requestCapPerHour' : 'rampDatasetsPerHour'
+    expect(sent[other]).toBeUndefined()
+  })
+
+  it.each([
+    ['ramp', '0', 'Give a whole number, 1 to 2147483647, or leave it empty for no limit.'],
+    ['ramp', '2147483648', 'Give a whole number, 1 to 2147483647, or leave it empty for no limit.'],
+    ['ramp', '-1', 'Give a whole number, 1 to 2147483647, or leave it empty for no limit.'],
+    ['ramp', 'x', 'Give a whole number, 1 to 2147483647, or leave it empty for no limit.'],
+    ['ramp', '1.5', 'Give a whole number, 1 to 2147483647, or leave it empty for no limit.'],
+    ['cap', '0', 'Give a whole number, 2 to 2147483647, or leave it empty for no limit.'],
+    ['cap', '1', 'Give a whole number, 2 to 2147483647, or leave it empty for no limit.'],
+    ['cap', '2147483648', 'Give a whole number, 2 to 2147483647, or leave it empty for no limit.'],
+    ['cap', '-1', 'Give a whole number, 2 to 2147483647, or leave it empty for no limit.'],
+    ['cap', 'x', 'Give a whole number, 2 to 2147483647, or leave it empty for no limit.'],
+    ['cap', '2.5', 'Give a whole number, 2 to 2147483647, or leave it empty for no limit.'],
+  ] as const)('a %s of %j stops the create, marks it with its words and focuses it', async (field, typed, words) => {
+    api.getSourceSettingsVersions.mockResolvedValue(EMPTY_PAGE)
+    const { create: createPanel } = stubWrites({ kind: 'created', detail: detail() })
+    const form = mountCreate()
+    await fill(form, 1)
+    await byId(form, `create-${field}`).setValue(typed)
+    expect(byId(form, `create-${field}-error`).exists()).toBe(false)
+    await press(form)
+    expect(createPanel).not.toHaveBeenCalled()
+    expect(byId(form, `create-${field}-error`).text()).toBe(words)
+    expect(form.findAll('[aria-invalid="true"]').map((el) => el.attributes('id'))).toEqual([`create-${field}`])
+    focused(form, `create-${field}`)
+    // Emptied again, it is no limit: the mark goes and the create sends with the rate left out.
+    await byId(form, `create-${field}`).setValue('')
+    expect(byId(form, `create-${field}-error`).exists()).toBe(false)
+    await press(form)
+    expect(createPanel).toHaveBeenCalledTimes(1)
+    expect(createPanel.mock.calls[0]![0][field === 'ramp' ? 'rampDatasetsPerHour' : 'requestCapPerHour']).toBeUndefined()
+  })
+
+  it('the rate hints: both say empty is no limit, the cap gives its minimum and why', async () => {
+    api.getSourceSettingsVersions.mockResolvedValue(EMPTY_PAGE)
+    stubWrites()
+    const form = mountCreate()
+    await byId(form, 'create-source').findAll('option')[1]!.setValue()
+    await flushPromises()
+    expect(byId(form, 'create-ramp-hint').text()).toBe('Leave empty for no limit.')
+    expect(byId(form, 'create-cap-hint').text()).toBe('Leave empty for no limit. Minimum 2: each new panel dataset costs 2 requests.')
+    expect(byId(form, 'create-ramp-hint').attributes('id')).toBe('create-ramp-hint')
+    expect(byId(form, 'create-cap-hint').attributes('id')).toBe('create-cap-hint')
+    expect(byId(form, 'create-ramp').attributes('aria-describedby')).toBe('create-ramp-hint')
+    expect(byId(form, 'create-cap').attributes('aria-describedby')).toBe('create-cap-hint')
+    expect(form.find('label[for="create-ramp"]').text()).toBe('New Datasets per Hour')
+    expect(form.find('label[for="create-cap"]').text()).toBe('Requests per Hour')
   })
 
   it('window days, when given, are sent; a bad one stops the create', async () => {
@@ -612,7 +673,7 @@ describe('PanelCreateForm', () => {
     expect(byId(form, 'create-pre-error').exists()).toBe(false)
     await press(form)
     expect(createPanel).not.toHaveBeenCalled()
-    expect(byId(form, 'create-pre-error').text()).toBe('Give a whole number, 0 or more.')
+    expect(byId(form, 'create-pre-error').text()).toBe('Give a whole number, 0 to 2147483647.')
     expect(byId(form, 'create-post-error').exists()).toBe(false)
     focused(form, 'create-pre')
     await byId(form, 'create-pre').setValue('30')
@@ -625,6 +686,21 @@ describe('PanelCreateForm', () => {
       corporateActionWindowPreDays: 30,
       corporateActionWindowPostDays: 0,
     })
+  })
+
+  it('a window-only create: the rates empty, the window days sent, the rates left out', async () => {
+    api.getSourceSettingsVersions.mockResolvedValue(EMPTY_PAGE)
+    const { create: createPanel } = stubWrites({ kind: 'created', detail: detail() })
+    const form = mountCreate()
+    await fill(form, 1)
+    await byId(form, 'create-pre').setValue('7')
+    await press(form)
+    expect(createPanel).toHaveBeenCalledTimes(1)
+    const sent = createPanel.mock.calls[0]![0]
+    expect(sent.corporateActionWindowPreDays).toBe(7)
+    expect(sent.corporateActionWindowPostDays).toBeUndefined()
+    expect(sent.rampDatasetsPerHour).toBeUndefined()
+    expect(sent.requestCapPerHour).toBeUndefined()
   })
 
   it('a picked cadence, disabled and the filters are sent as chosen', async () => {
@@ -736,21 +812,35 @@ describe('PanelCreateForm', () => {
 describe('PanelCreateForm: validated on click, every missing field marked at once', () => {
   const EMPTY_PAGE = create(PanelSourceSettingsVersionPageSchema)
   const HELD_PAGE = create(PanelSourceSettingsVersionPageSchema, { items: [create(PanelSourceSettingsVersionSchema, { versionNo: 1 })] })
-  // tj-7zjov1.362.4 (architect note 22:22 UTC): name and source always; ramp and cap only while the source
-  // has no settings. Size is gone and the reason is optional, so neither is mandatory nor ever marked.
+  // tj-7zjov1.362.4, then ADR tj-2ayia2 D6 (owner ruling 2026-11-07): name and source are the only mandatory
+  // fields in every source state. Ramp and cap show only while the source has no settings, optional (no
+  // asterisk, no aria-required, empty never marked); a typed value out of range is marked like any other.
+  // Size is gone and the reason is optional, so neither is mandatory nor ever marked.
   const MANDATORY = ['name', 'source'] as const
   const OPENED = {
     name: 'Give the panel a name.',
     source: 'Choose a source.',
   }
-  const COUNT = 'Give a whole number, 0 or more.'
+  const COUNT = 'Give a whole number, 0 to 2147483647.'
+  const RAMP = 'Give a whole number, 1 to 2147483647, or leave it empty for no limit.'
+  const CAP = 'Give a whole number, 2 to 2147483647, or leave it empty for no limit.'
+  // The rate fields carry a hint, always linked; a mark puts its message first.
+  const HINTED = new Set(['ramp', 'cap'])
 
   const marker = (form: VueWrapper, field: string) => form.find(`label[for="create-${field}"] .pn-required`)
+
+  function expectOptional(form: VueWrapper, field: string): void {
+    expect(marker(form, field).exists()).toBe(false)
+    expect(form.find(`label[for="create-${field}"]`).text()).not.toContain('*')
+    expect(byId(form, `create-${field}`).attributes('aria-required')).toBeUndefined()
+  }
 
   function expectMarked(form: VueWrapper, field: string, words: string): void {
     const input = byId(form, `create-${field}`)
     expect(input.attributes('aria-invalid')).toBe('true')
-    expect(input.attributes('aria-describedby')).toBe(`create-${field}-error`)
+    expect(input.attributes('aria-describedby')).toBe(
+      HINTED.has(field) ? `create-${field}-error create-${field}-hint` : `create-${field}-error`,
+    )
     const message = form.find(`#create-${field}-error`)
     expect(message.exists()).toBe(true)
     expect(message.attributes('data-testid')).toBe(`create-${field}-error`)
@@ -763,7 +853,7 @@ describe('PanelCreateForm: validated on click, every missing field marked at onc
   function expectUnmarked(form: VueWrapper, field: string): void {
     const input = byId(form, `create-${field}`)
     expect(input.attributes('aria-invalid')).toBeUndefined()
-    expect(input.attributes('aria-describedby')).toBeUndefined()
+    expect(input.attributes('aria-describedby')).toBe(HINTED.has(field) ? `create-${field}-hint` : undefined)
     expect(byId(form, `create-${field}-error`).exists()).toBe(false)
     if (marker(form, field).exists()) expect(marker(form, field).classes()).not.toContain('pn-required--marked')
   }
@@ -810,17 +900,20 @@ describe('PanelCreateForm: validated on click, every missing field marked at onc
     }
     expectSummary(form, 0)
     expect(form.text()).toContain('Fields marked * are required.')
-    // A source with no settings: its two required fields appear with neutral asterisks, still unmarked.
+    // A source with no settings: its four fields appear optional, with no asterisk, unmarked, bad values
+    // included, until the first press.
     await byId(form, 'create-source').findAll('option')[1]!.setValue()
     await flushPromises()
-    for (const field of ['ramp', 'cap']) {
-      expectRequired(form, field)
+    for (const field of ['ramp', 'cap', 'pre', 'post']) {
+      expectOptional(form, field)
       expectUnmarked(form, field)
-      expect(marker(form, field).classes()).toEqual(['pn-required'])
     }
+    await byId(form, 'create-ramp').setValue('0')
+    await byId(form, 'create-cap').setValue('1')
     await byId(form, 'create-pre').setValue('x')
-    expectUnmarked(form, 'pre')
+    for (const field of ['ramp', 'cap', 'pre']) expectUnmarked(form, field)
     expectSummary(form, 0)
+    expect(form.findAll('label .pn-required')).toHaveLength(2)
     expect(createPanel).not.toHaveBeenCalled()
   })
 
@@ -857,7 +950,7 @@ describe('PanelCreateForm: validated on click, every missing field marked at onc
     focused(form, 'create-name')
   })
 
-  it('the asterisks are exactly name and source on a source with settings, plus ramp and cap on one without', async () => {
+  it('the asterisks and aria-required are exactly name and source, on a source with settings and on one without', async () => {
     const starred = (form: VueWrapper) =>
       form.findAll('label .pn-required').map((star) => star.element.closest('label')!.getAttribute('for'))
     const ariaRequired = (form: VueWrapper) => form.findAll('[aria-required="true"]').map((el) => el.attributes('id'))
@@ -875,11 +968,18 @@ describe('PanelCreateForm: validated on click, every missing field marked at onc
     const empty = mountCreate()
     await byId(empty, 'create-source').findAll('option')[1]!.setValue()
     await flushPromises()
-    expect(starred(empty)).toEqual(['create-name', 'create-source', 'create-ramp', 'create-cap'])
-    expect(ariaRequired(empty)).toEqual(['create-name', 'create-source', 'create-ramp', 'create-cap'])
+    expect(byId(empty, 'create-ramp').exists()).toBe(true)
+    expect(starred(empty)).toEqual(['create-name', 'create-source'])
+    expect(ariaRequired(empty)).toEqual(['create-name', 'create-source'])
+    // Pressed with every rate field empty or bad: the set does not grow.
+    await press(empty)
+    expect(starred(empty)).toEqual(['create-name', 'create-source'])
+    await byId(empty, 'create-ramp').setValue('0')
+    expect(starred(empty)).toEqual(['create-name', 'create-source'])
+    expect(ariaRequired(empty)).toEqual(['create-name', 'create-source'])
   })
 
-  it('a source without settings: a click with only a source chosen marks name, ramp and cap, focus on the name', async () => {
+  it('a source without settings: a click with only a source chosen marks the name alone, focus on the name', async () => {
     api.getSourceSettingsVersions.mockResolvedValue(EMPTY_PAGE)
     const { create: createPanel } = stubWrites()
     const form = mountCreate()
@@ -887,8 +987,9 @@ describe('PanelCreateForm: validated on click, every missing field marked at onc
     await flushPromises()
     await press(form)
     expect(createPanel).not.toHaveBeenCalled()
-    expect(form.findAll('[aria-invalid="true"]').map((el) => el.attributes('id'))).toEqual(['create-name', 'create-ramp', 'create-cap'])
-    expectSummary(form, 3)
+    expect(form.findAll('[aria-invalid="true"]').map((el) => el.attributes('id'))).toEqual(['create-name'])
+    for (const field of ['ramp', 'cap', 'pre', 'post']) expectUnmarked(form, field)
+    expectSummary(form, 1)
     focused(form, 'create-name')
   })
 
@@ -988,12 +1089,15 @@ describe('PanelCreateForm: validated on click, every missing field marked at onc
     ['a name only, a reason typed', { name: 'n', reason: 'r' }, 'create-source'],
     ['no name, the source held', { source: 'held' }, 'create-name'],
     ['no name, the source empty and nothing else', { source: 'empty' }, 'create-name'],
-    ['no name, the rest filled', { source: 'empty', ramp: '0', cap: '1', reason: 'r' }, 'create-name'],
-    ['no ramp, no cap', { name: 'n', source: 'empty' }, 'create-ramp'],
-    ['no ramp, no cap, no reason, bad window days', { name: 'n', source: 'empty', pre: 'x', post: 'x' }, 'create-ramp'],
-    ['no cap', { name: 'n', source: 'empty', ramp: '0' }, 'create-cap'],
-    ['a bad pre day and no reason', { name: 'n', source: 'empty', ramp: '0', cap: '1', pre: 'x' }, 'create-pre'],
-    ['a bad post day only', { name: 'n', source: 'empty', ramp: '0', cap: '1', post: '-1', reason: 'r' }, 'create-post'],
+    ['no name, the rest filled', { source: 'empty', ramp: '1', cap: '2', reason: 'r' }, 'create-name'],
+    ['no name, a bad ramp and cap', { source: 'empty', ramp: '0', cap: '1' }, 'create-name'],
+    ['a ramp of 0', { name: 'n', source: 'empty', ramp: '0' }, 'create-ramp'],
+    ['a bad ramp and a bad cap', { name: 'n', source: 'empty', ramp: 'x', cap: '1' }, 'create-ramp'],
+    ['a bad ramp, no reason, bad window days', { name: 'n', source: 'empty', ramp: '2147483648', pre: 'x', post: 'x' }, 'create-ramp'],
+    ['the ramp empty, a cap of 1', { name: 'n', source: 'empty', cap: '1' }, 'create-cap'],
+    ['a good ramp, a cap over the maximum', { name: 'n', source: 'empty', ramp: '1', cap: '2147483648' }, 'create-cap'],
+    ['the rates empty, a bad pre day and no reason', { name: 'n', source: 'empty', pre: 'x' }, 'create-pre'],
+    ['a bad post day only', { name: 'n', source: 'empty', ramp: '1', cap: '2', post: '-1', reason: 'r' }, 'create-post'],
   ] as const)('focus goes to the first invalid field in screen order: %s', async (_case, given: Record<string, string>, first) => {
     api.getSourceSettingsVersions.mockResolvedValue(given.source === 'empty' ? EMPTY_PAGE : HELD_PAGE)
     const { create: createPanel } = stubWrites()
@@ -1023,44 +1127,56 @@ describe('PanelCreateForm: validated on click, every missing field marked at onc
     focused(form, 'create-source')
   })
 
-  it('a source with no settings version: ramp and cap are required and marked; window days only when filled and bad', async () => {
+  it('a source with no settings version: ramp and cap empty are never marked; a typed bad one is, live, with its words', async () => {
     api.getSourceSettingsVersions.mockResolvedValue(EMPTY_PAGE)
     const { create: createPanel } = stubWrites()
     const form = mountCreate()
-    await byId(form, 'create-name').setValue('n')
     await byId(form, 'create-source').findAll('option')[1]!.setValue()
     await flushPromises()
-    for (const field of ['ramp', 'cap']) expectUnmarked(form, field)
-    expectSummary(form, 0)
+    // The name left empty keeps the create from sending, so the marks can be watched across presses.
     await press(form)
     expect(createPanel).not.toHaveBeenCalled()
-    focused(form, 'create-ramp')
-    for (const field of ['ramp', 'cap']) {
-      expectRequired(form, field)
-      expectMarked(form, field, COUNT)
-    }
-    for (const field of ['pre', 'post']) {
-      expect(marker(form, field).exists()).toBe(false)
-      expect(byId(form, `create-${field}`).attributes('aria-required')).toBeUndefined()
+    focused(form, 'create-name')
+    for (const field of ['ramp', 'cap', 'pre', 'post']) {
+      expectOptional(form, field)
       expectUnmarked(form, field)
     }
-    expectSummary(form, 2)
-    await byId(form, 'create-ramp').setValue('0')
-    await byId(form, 'create-cap').setValue('-1')
-    expectUnmarked(form, 'ramp')
-    expectMarked(form, 'cap', COUNT)
     expectSummary(form, 1)
-    await byId(form, 'create-cap').setValue('9')
+    await byId(form, 'create-ramp').setValue('0')
+    await byId(form, 'create-cap').setValue('1')
+    expectMarked(form, 'ramp', RAMP)
+    expectMarked(form, 'cap', CAP)
+    expectOptional(form, 'ramp')
+    expectOptional(form, 'cap')
+    expectSummary(form, 3)
+    await byId(form, 'create-ramp').setValue('1')
+    expectUnmarked(form, 'ramp')
+    expectMarked(form, 'cap', CAP)
+    expectSummary(form, 2)
+    await byId(form, 'create-cap').setValue('2')
+    expectUnmarked(form, 'cap')
+    expectSummary(form, 1)
+    await byId(form, 'create-ramp').setValue('2147483648')
+    expectMarked(form, 'ramp', RAMP)
+    await byId(form, 'create-ramp').setValue('  ')
+    expectUnmarked(form, 'ramp')
+    await byId(form, 'create-cap').setValue('')
+    expectUnmarked(form, 'cap')
+    expectSummary(form, 1)
     await byId(form, 'create-pre').setValue('x')
     await byId(form, 'create-post').setValue('1.5')
     expectMarked(form, 'pre', COUNT)
     expectMarked(form, 'post', COUNT)
-    expectSummary(form, 2)
+    expectSummary(form, 3)
     await byId(form, 'create-pre').setValue('')
     await byId(form, 'create-post').setValue('0')
     expectUnmarked(form, 'pre')
     expectUnmarked(form, 'post')
+    expectSummary(form, 1)
+    await byId(form, 'create-name').setValue('n')
     expectSummary(form, 0)
+    await press(form)
+    expect(createPanel).toHaveBeenCalledTimes(1)
   })
 
   it('a source with a settings version: no ramp, cap or window day field and nothing marked for them', async () => {
@@ -1143,20 +1259,164 @@ describe('PanelSourceSettingsForm', () => {
     ])
   })
 
-  it('Save sends all four numbers, 0 included, to the panel source, with the trimmed reason', async () => {
+  it('Save sends the four numbers to the panel source, at the low edges, window days 0 included, with the trimmed reason', async () => {
     const { saveSource } = stubWrites()
     const form = mount(PanelSourceSettingsForm, { props: { detail: detail() } })
-    await byId(form, 'source-ramp').setValue('0')
-    await byId(form, 'source-reason').setValue(' pause creation ')
+    await byId(form, 'source-ramp').setValue(' 1 ')
+    await byId(form, 'source-cap').setValue('2')
+    await byId(form, 'source-pre').setValue('0')
+    await byId(form, 'source-reason').setValue(' slow down ')
     await form.find('form').trigger('submit')
     await flushPromises()
     expect(saveSource).toHaveBeenCalledWith(DataSource.ALPACA_API, {
-      rampDatasetsPerHour: 0,
-      requestCapPerHour: 200,
-      corporateActionWindowPreDays: 90,
+      rampDatasetsPerHour: 1,
+      requestCapPerHour: 2,
+      corporateActionWindowPreDays: 0,
       corporateActionWindowPostDays: 30,
-      reason: 'pause creation',
+      reason: 'slow down',
     })
+  })
+
+  it('Save sends the int32 maximum for both rates', async () => {
+    const { saveSource } = stubWrites()
+    const form = mount(PanelSourceSettingsForm, { props: { detail: detail() } })
+    await byId(form, 'source-ramp').setValue('2147483647')
+    await byId(form, 'source-cap').setValue('2147483647')
+    await byId(form, 'source-post').setValue('2147483647')
+    expect(byId(form, 'source-problem').exists()).toBe(false)
+    await form.find('form').trigger('submit')
+    await flushPromises()
+    expect(saveSource.mock.calls[0]![1]).toMatchObject({
+      rampDatasetsPerHour: 2_147_483_647,
+      requestCapPerHour: 2_147_483_647,
+      corporateActionWindowPostDays: 2_147_483_647,
+    })
+  })
+
+  // ADR tj-2ayia2 D6: an emptied rate is no limit and is left out of the write; the other stays as typed.
+  it.each([
+    ['ramp', { rampDatasetsPerHour: undefined, requestCapPerHour: 200 }],
+    ['cap', { rampDatasetsPerHour: 5, requestCapPerHour: undefined }],
+  ] as const)('an emptied %s is no limit: Save stays on and sends it undefined', async (field, rates) => {
+    const { saveSource } = stubWrites()
+    const form = mount(PanelSourceSettingsForm, { props: { detail: detail() } })
+    await byId(form, `source-${field}`).setValue('   ')
+    expect(byId(form, 'source-problem').exists()).toBe(false)
+    expect(byId(form, 'source-save').attributes('disabled')).toBeUndefined()
+    await form.find('form').trigger('submit')
+    await flushPromises()
+    expect(saveSource).toHaveBeenCalledTimes(1)
+    const sent = saveSource.mock.calls[0]![1]
+    expect(sent.rampDatasetsPerHour).toBe(rates.rampDatasetsPerHour)
+    expect(sent.requestCapPerHour).toBe(rates.requestCapPerHour)
+    expect(sent).toMatchObject({ corporateActionWindowPreDays: 90, corporateActionWindowPostDays: 30 })
+  })
+
+  it('both rates emptied: Save sends neither, the window days as they are', async () => {
+    const { saveSource } = stubWrites()
+    const form = mount(PanelSourceSettingsForm, { props: { detail: detail() } })
+    await byId(form, 'source-ramp').setValue('')
+    await byId(form, 'source-cap').setValue('')
+    await form.find('form').trigger('submit')
+    await flushPromises()
+    const sent = saveSource.mock.calls[0]![1]
+    expect(sent.rampDatasetsPerHour).toBeUndefined()
+    expect(sent.requestCapPerHour).toBeUndefined()
+    expect(sent).toMatchObject({ corporateActionWindowPreDays: 90, corporateActionWindowPostDays: 30, reason: '' })
+  })
+
+  it('a saved version with no rates (no limit) starts with ramp and cap blank, the window days filled, Save on', async () => {
+    const { saveSource } = stubWrites()
+    const noLimit = detail()
+    noLimit.currentSourceVersion!.settings = create(PanelSourceSettingsSchema, {
+      corporateActionWindowPreDays: 90,
+      corporateActionWindowPostDays: 0,
+    })
+    const form = mount(PanelSourceSettingsForm, { props: { detail: noLimit } })
+    expect(['source-ramp', 'source-cap', 'source-pre', 'source-post'].map((id) => (byId(form, id).element as HTMLInputElement).value)).toEqual([
+      '',
+      '',
+      '90',
+      '0',
+    ])
+    expect(byId(form, 'source-problem').exists()).toBe(false)
+    expect(byId(form, 'source-save').attributes('disabled')).toBeUndefined()
+    await form.find('form').trigger('submit')
+    await flushPromises()
+    const sent = saveSource.mock.calls[0]![1]
+    expect(sent.rampDatasetsPerHour).toBeUndefined()
+    expect(sent.requestCapPerHour).toBeUndefined()
+    expect(sent).toMatchObject({ corporateActionWindowPreDays: 90, corporateActionWindowPostDays: 0 })
+  })
+
+  it('a saved version with only a cap starts with the ramp blank and the cap filled', () => {
+    stubWrites()
+    const capOnly = detail()
+    capOnly.currentSourceVersion!.settings = create(PanelSourceSettingsSchema, {
+      requestCapPerHour: 2,
+      corporateActionWindowPreDays: 1,
+      corporateActionWindowPostDays: 1,
+    })
+    const form = mount(PanelSourceSettingsForm, { props: { detail: capOnly } })
+    expect((byId(form, 'source-ramp').element as HTMLInputElement).value).toBe('')
+    expect((byId(form, 'source-cap').element as HTMLInputElement).value).toBe('2')
+  })
+
+  it('the rate fields read optional: no asterisk, no aria-required; the hint says empty is no limit, the cap minimum and how to pause', () => {
+    stubWrites()
+    const form = mount(PanelSourceSettingsForm, { props: { detail: detail() } })
+    for (const field of ['ramp', 'cap']) {
+      expect(form.find(`label[for="source-${field}"]`).text()).not.toContain('*')
+      expect(byId(form, `source-${field}`).attributes('aria-required')).toBeUndefined()
+    }
+    expect(form.find('label[for="source-ramp"]').text()).toBe('New Datasets per Hour')
+    expect(form.find('label[for="source-cap"]').text()).toBe('Requests per Hour')
+    const hint = form.findAll('.pn-hint').map((p) => p.text().replace(/\s+/g, ' '))
+    expect(hint).toContain(
+      'Leave new datasets per hour or requests per hour empty for no limit. The requests minimum is 2: each new panel dataset costs 2 requests. To pause a panel, turn Enabled off. The corporate action days are the span before a dataset\'s start and after its end that actions are pulled for.',
+    )
+    expect(form.text()).not.toContain('pauses')
+  })
+
+  // Live validation (tj-crl7pm): the one-line problem and Save follow each keystroke, no press needed.
+  it.each([
+    ['ramp', '0', 'New datasets per hour: Give a whole number, 1 to 2147483647, or leave it empty for no limit.'],
+    ['ramp', '2147483648', 'New datasets per hour: Give a whole number, 1 to 2147483647, or leave it empty for no limit.'],
+    ['ramp', '-1', 'New datasets per hour: Give a whole number, 1 to 2147483647, or leave it empty for no limit.'],
+    ['ramp', 'x', 'New datasets per hour: Give a whole number, 1 to 2147483647, or leave it empty for no limit.'],
+    ['ramp', '1.5', 'New datasets per hour: Give a whole number, 1 to 2147483647, or leave it empty for no limit.'],
+    ['cap', '0', 'Requests per hour: Give a whole number, 2 to 2147483647, or leave it empty for no limit.'],
+    ['cap', '1', 'Requests per hour: Give a whole number, 2 to 2147483647, or leave it empty for no limit.'],
+    ['cap', '2147483648', 'Requests per hour: Give a whole number, 2 to 2147483647, or leave it empty for no limit.'],
+    ['cap', '-1', 'Requests per hour: Give a whole number, 2 to 2147483647, or leave it empty for no limit.'],
+    ['cap', 'x', 'Requests per hour: Give a whole number, 2 to 2147483647, or leave it empty for no limit.'],
+    ['cap', '2.5', 'Requests per hour: Give a whole number, 2 to 2147483647, or leave it empty for no limit.'],
+  ] as const)('a %s of %j: the problem line says so, Save is off and a submit sends nothing; a fix turns Save on', async (field, typed, words) => {
+    const { saveSource } = stubWrites()
+    const form = mount(PanelSourceSettingsForm, { props: { detail: detail() } })
+    expect(byId(form, 'source-save').attributes('disabled')).toBeUndefined()
+    await byId(form, `source-${field}`).setValue(typed)
+    expect(byId(form, 'source-problem').text()).toBe(words)
+    expect(byId(form, 'source-save').attributes('disabled')).toBeDefined()
+    await form.find('form').trigger('submit')
+    await flushPromises()
+    expect(saveSource).not.toHaveBeenCalled()
+    await byId(form, `source-${field}`).setValue('')
+    expect(byId(form, 'source-problem').exists()).toBe(false)
+    expect(byId(form, 'source-save').attributes('disabled')).toBeUndefined()
+  })
+
+  it('a bad ramp is named before a bad cap, and a bad cap before bad window days', async () => {
+    stubWrites()
+    const form = mount(PanelSourceSettingsForm, { props: { detail: detail() } })
+    await byId(form, 'source-ramp').setValue('0')
+    await byId(form, 'source-cap').setValue('1')
+    await byId(form, 'source-pre').setValue('x')
+    expect(byId(form, 'source-problem').text()).toMatch(/^New datasets per hour: /)
+    await byId(form, 'source-ramp').setValue('1')
+    expect(byId(form, 'source-problem').text()).toMatch(/^Requests per hour: /)
+    await byId(form, 'source-cap').setValue('2')
+    expect(byId(form, 'source-problem').text()).toBe('Give each corporate action days field as a whole number, 0 to 2147483647.')
   })
 
   // tj-7zjov1.362.4: the reason is optional on a source settings save too.
@@ -1190,23 +1450,45 @@ describe('PanelSourceSettingsForm', () => {
     expect(byId(form, 'source-reason').attributes('placeholder')).toBe('Optional: why the source settings change')
   })
 
-  it('a bad number stops the save', async () => {
+  // The window days stay required on this form: empty, negative, text or over the maximum stops the save.
+  it.each(['', ' ', '-1', 'x', '1.5', '2147483648'])('a window day of %j stops the save with the window words', async (bad) => {
     const { saveSource } = stubWrites()
     const form = mount(PanelSourceSettingsForm, { props: { detail: detail() } })
-    await byId(form, 'source-cap').setValue('-1')
-    expect(byId(form, 'source-problem').text()).toBe('Give each number as a whole number, 0 or more.')
-    expect(byId(form, 'source-save').attributes('disabled')).toBeDefined()
-    await form.find('form').trigger('submit')
-    await flushPromises()
-    expect(saveSource).not.toHaveBeenCalled()
+    for (const field of ['pre', 'post']) {
+      await byId(form, `source-${field}`).setValue(bad)
+      expect(byId(form, 'source-problem').text()).toBe('Give each corporate action days field as a whole number, 0 to 2147483647.')
+      expect(byId(form, 'source-save').attributes('disabled')).toBeDefined()
+      await form.find('form').trigger('submit')
+      await flushPromises()
+      expect(saveSource).not.toHaveBeenCalled()
+      await byId(form, `source-${field}`).setValue('0')
+      expect(byId(form, 'source-problem').exists()).toBe(false)
+    }
   })
 
-  it('no source version: the fields start blank and must be given', () => {
-    stubWrites()
+  it('no source version: the fields start blank; the window days must be given, the rates need not be', async () => {
+    const { saveSource } = stubWrites()
     const form = mount(PanelSourceSettingsForm, { props: { detail: detail({ source: false }) } })
     expect(byId(form, 'source-version').exists()).toBe(false)
-    expect((byId(form, 'source-ramp').element as HTMLInputElement).value).toBe('')
-    expect(byId(form, 'source-problem').text()).toBe('Give each number as a whole number, 0 or more.')
+    expect(['source-ramp', 'source-cap', 'source-pre', 'source-post'].map((id) => (byId(form, id).element as HTMLInputElement).value)).toEqual([
+      '',
+      '',
+      '',
+      '',
+    ])
+    expect(byId(form, 'source-problem').text()).toBe('Give each corporate action days field as a whole number, 0 to 2147483647.')
+    expect(byId(form, 'source-save').attributes('disabled')).toBeDefined()
+    await byId(form, 'source-pre').setValue('90')
+    expect(byId(form, 'source-save').attributes('disabled')).toBeDefined()
+    await byId(form, 'source-post').setValue('30')
+    expect(byId(form, 'source-problem').exists()).toBe(false)
+    expect(byId(form, 'source-save').attributes('disabled')).toBeUndefined()
+    await form.find('form').trigger('submit')
+    await flushPromises()
+    const sent = saveSource.mock.calls[0]![1]
+    expect(sent.rampDatasetsPerHour).toBeUndefined()
+    expect(sent.requestCapPerHour).toBeUndefined()
+    expect(sent).toMatchObject({ corporateActionWindowPreDays: 90, corporateActionWindowPostDays: 30 })
   })
 
   it('a refusal is worded in place', async () => {

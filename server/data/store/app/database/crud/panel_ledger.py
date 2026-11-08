@@ -162,8 +162,8 @@ class SourceSettingsBoundary:
 
     version_id: uuid.UUID
     version_no: int
-    ramp_datasets_per_hour: int
-    request_cap_per_hour: int
+    ramp_datasets_per_hour: int | None
+    request_cap_per_hour: int | None
     corporate_action_window_pre_days: int
     corporate_action_window_post_days: int
     saved_at: datetime

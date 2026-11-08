@@ -478,7 +478,8 @@ async def test_boundary_read_reads_another_panels_versions_never(world):
 async def test_boundary_read_lists_the_sources_versions_effective_by_this_panels_passes(world):
     mine = await world.panel(SOURCE)  # writes SOURCE version 1
     neighbour = await world.panel(SOURCE)  # writes SOURCE version 2
-    s3 = await world.source_version(SOURCE, ramp_datasets_per_hour=0, reason='pause creation')
+    # tj-2ayia2: ramp 0 is refused now ('pause creation' is retired); an unset ramp is NULL, no limit, read as None.
+    s3 = await world.source_version(SOURCE, ramp_datasets_per_hour=None, reason='lift the ramp')
     other_source = await world.panel(OTHER_SOURCE)
     await world.open(neighbour, started_at=T0 - DAY, source_settings_id=mine.source_settings_id)
     await world.open(mine, dry_run=True, started_at=T0, source_settings_id=s3)
@@ -497,7 +498,7 @@ async def test_boundary_read_lists_the_sources_versions_effective_by_this_panels
     )
     assert (rows[1].effective_pass_id, rows[1].effective_from) == (None, None)
     assert (rows[2].effective_pass_id, rows[2].effective_from) == (mine_s3, T0 + 2 * DAY)
-    assert (rows[2].ramp_datasets_per_hour, rows[2].request_cap_per_hour, rows[2].reason) == (0, 60, 'pause creation')
+    assert (rows[2].ramp_datasets_per_hour, rows[2].request_cap_per_hour, rows[2].reason) == (None, 60, 'lift the ramp')
     assert (rows[2].corporate_action_window_pre_days, rows[2].corporate_action_window_post_days) == (90, 90)
     assert rows[2].actor == 'operator' and rows[2].saved_at is not None
 

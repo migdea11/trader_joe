@@ -18,6 +18,13 @@ data-repair artifact of a revision that no longer exists. The first revision dec
 store_dataset_entry.id beside the primary key and no model declares it, so this baseline does not create it (it is
 redundant with the primary key).
 
+EDITED IN PLACE (2026-11-07, ADR tj-2ayia2): the panel source settings rates became optional, so
+panel_source_settings_version.ramp_datasets_per_hour and request_cap_per_hour are NULLABLE (NULL is no limit) and the
+numbers_non_negative CHECK is replaced by ramp_positive (>= 1), request_cap_min (>= 2) and window_non_negative. The id
+is unchanged on purpose: nothing is persisted, and the owner drops every database after the merge, so no new revision
+is needed. A database already at this id is NOT upgraded by `make migrate` (a no-op) and keeps the old schema: drop it
+and migrate again.
+
 NO DOWNGRADE. downgrade() raises: recovery is a restore of make migrate's pre-migrate dump (ADR tj-x3ig38), and this
 revision has no parent to return to.
 
@@ -315,8 +322,8 @@ def upgrade() -> None:
     sa.Column('id', sa.UUID(), server_default=sa.text('gen_random_uuid()'), nullable=False),
     sa.Column('source', _enum('datasource'), nullable=False),
     sa.Column('version_no', sa.Integer(), nullable=False),
-    sa.Column('ramp_datasets_per_hour', sa.Integer(), nullable=False),
-    sa.Column('request_cap_per_hour', sa.Integer(), nullable=False),
+    sa.Column('ramp_datasets_per_hour', sa.Integer(), nullable=True),
+    sa.Column('request_cap_per_hour', sa.Integer(), nullable=True),
     sa.Column('corporate_action_window_pre_days', sa.Integer(), nullable=False),
     sa.Column('corporate_action_window_post_days', sa.Integer(), nullable=False),
     sa.Column('saved_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
@@ -324,7 +331,9 @@ def upgrade() -> None:
     sa.Column('reason', sa.Text(), nullable=True),
     sa.CheckConstraint("btrim(actor) <> ''", name='ck_panel_source_settings_version_actor_not_blank'),
     sa.CheckConstraint("btrim(reason) <> ''", name='ck_panel_source_settings_version_reason_not_blank'),
-    sa.CheckConstraint('ramp_datasets_per_hour >= 0 AND request_cap_per_hour >= 0 AND corporate_action_window_pre_days >= 0 AND corporate_action_window_post_days >= 0', name='ck_panel_source_settings_version_numbers_non_negative'),
+    sa.CheckConstraint('corporate_action_window_pre_days >= 0 AND corporate_action_window_post_days >= 0', name='ck_panel_source_settings_version_window_non_negative'),
+    sa.CheckConstraint('ramp_datasets_per_hour >= 1', name='ck_panel_source_settings_version_ramp_positive'),
+    sa.CheckConstraint('request_cap_per_hour >= 2', name='ck_panel_source_settings_version_request_cap_min'),
     sa.CheckConstraint('version_no >= 1', name='ck_panel_source_settings_version_version_no_positive'),
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('source', 'version_no', name='uq_panel_source_settings_version_source_version_no')

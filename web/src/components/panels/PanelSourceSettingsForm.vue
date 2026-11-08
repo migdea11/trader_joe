@@ -1,8 +1,9 @@
 <script setup lang="ts">
 // The source's settings for the selected panel (tj-7zjov1.37): shared by every panel on that source, so a
 // change is worded as the source's, not the panel's. A write appends a new source settings version (POST
-// panel-sources/{source}/settings-versions); all four numbers are sent, none may be negative, and the
-// reason is optional. Ramp 0 pauses creation of new panel datasets. The server decides what is allowed.
+// panel-sources/{source}/settings-versions). Ramp and cap are optional: an empty field is left out of the
+// request and means no limit (ramp 1 or more, cap 2 or more, zero refused); the window days are required
+// (0 or more). The reason is optional. The server decides what is allowed.
 import { computed, ref, watch } from 'vue'
 import type { PanelDetail } from '@generated/trader_joe/proto/ui/v1/panels_pb'
 
@@ -12,7 +13,7 @@ import { useFormatters } from '@/format/useFormatters'
 import { usePanelsStore } from '@/stores/panels'
 import { titleCase } from '@/theme/copy'
 
-import { effectivePassText, panelWriteNotice, parseCount } from './panelModel'
+import { effectivePassText, MAX_INT32, panelWriteNotice, parseCount, rateFieldError } from './panelModel'
 import type { PanelWriteNotice } from './panelModel'
 
 const props = defineProps<{ detail: PanelDetail }>()
@@ -26,8 +27,8 @@ const name = computed(() => sourceLabel(props.detail.source))
 function fieldsFromVersion(): { ramp: string; cap: string; pre: string; post: string } {
   const settings = version.value?.settings
   return {
-    ramp: settings === undefined ? '' : String(settings.rampDatasetsPerHour),
-    cap: settings === undefined ? '' : String(settings.requestCapPerHour),
+    ramp: settings?.rampDatasetsPerHour === undefined ? '' : String(settings.rampDatasetsPerHour),
+    cap: settings?.requestCapPerHour === undefined ? '' : String(settings.requestCapPerHour),
     pre: settings === undefined ? '' : String(settings.corporateActionWindowPreDays),
     post: settings === undefined ? '' : String(settings.corporateActionWindowPostDays),
   }
@@ -47,8 +48,13 @@ function reset(): void {
 watch(() => `${props.detail.id}:${version.value?.versionNo ?? 0}`, reset)
 
 const problem = computed(() => {
-  const counts = [fields.value.ramp, fields.value.cap, fields.value.pre, fields.value.post]
-  if (counts.some((text) => parseCount(text) === null)) return 'Give each number as a whole number, 0 or more.'
+  const ramp = rateFieldError(fields.value.ramp, 'ramp')
+  if (ramp !== '') return `New datasets per hour: ${ramp}`
+  const cap = rateFieldError(fields.value.cap, 'cap')
+  if (cap !== '') return `Requests per hour: ${cap}`
+  if ([fields.value.pre, fields.value.post].some((text) => parseCount(text) === null)) {
+    return `Give each corporate action days field as a whole number, 0 to ${MAX_INT32}.`
+  }
   return ''
 })
 
@@ -64,8 +70,8 @@ const versionText = computed(() => {
 async function save(): Promise<void> {
   if (busy.value || problem.value !== '') return
   const outcome = await store.saveSource(props.detail.source, {
-    rampDatasetsPerHour: parseCount(fields.value.ramp) ?? 0,
-    requestCapPerHour: parseCount(fields.value.cap) ?? 0,
+    rampDatasetsPerHour: parseCount(fields.value.ramp) ?? undefined,
+    requestCapPerHour: parseCount(fields.value.cap) ?? undefined,
     corporateActionWindowPreDays: parseCount(fields.value.pre) ?? 0,
     corporateActionWindowPostDays: parseCount(fields.value.post) ?? 0,
     reason: reason.value.trim(),
@@ -179,7 +185,8 @@ async function save(): Promise<void> {
         />
       </div>
       <p class="pn-hint">
-        New datasets per hour 0 pauses creating panel datasets. The corporate action days are the span before a
+        Leave new datasets per hour or requests per hour empty for no limit. The requests minimum is 2: each new
+        panel dataset costs 2 requests. To pause a panel, turn Enabled off. The corporate action days are the span before a
         dataset's start and after its end that actions are pulled for.
       </p>
       <p

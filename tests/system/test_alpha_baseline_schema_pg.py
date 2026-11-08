@@ -116,6 +116,64 @@ def test_the_enum_labels_and_their_order_are_the_models(upgraded: ScratchDb):
     assert built == declared
 
 
+SOURCE_SETTINGS_TABLE = 'panel_source_settings_version'
+# ADR tj-2ayia2 (edited IN PLACE under the same id): Postgres's own rendering (pg_get_constraintdef) of the three CHECKs
+# that replace ck_panel_source_settings_version_numbers_non_negative. Postgres parenthesises each comparison.
+RATE_CHECK_DEFINITIONS = {
+    'ck_panel_source_settings_version_ramp_positive': 'CHECK ((ramp_datasets_per_hour >= 1))',
+    'ck_panel_source_settings_version_request_cap_min': 'CHECK ((request_cap_per_hour >= 2))',
+    'ck_panel_source_settings_version_window_non_negative': (
+        'CHECK (((corporate_action_window_pre_days >= 0) AND (corporate_action_window_post_days >= 0)))'
+    ),
+}
+
+
+def test_the_edited_baseline_builds_nullable_rates_and_the_three_checks_on_postgres(upgraded: ScratchDb):
+    """B5 for the tj-2ayia2 edit, named so a failure reads as what it is.
+
+    The two rate columns are NULLABLE (NULL is no limit), the window columns are not, the three CHECKs are there in
+    Postgres's normalised text, and the old numbers_non_negative is gone.
+    """
+    _upgrade_head(upgraded)
+    built = _catalogue(upgraded)
+
+    not_null = {
+        column: facts[1] for (table, column), facts in built['columns'].items() if table == SOURCE_SETTINGS_TABLE
+    }
+    assert not_null['ramp_datasets_per_hour'] is False and not_null['request_cap_per_hour'] is False
+    assert not_null['corporate_action_window_pre_days'] is True
+    assert not_null['corporate_action_window_post_days'] is True
+    assert built['columns'][(SOURCE_SETTINGS_TABLE, 'ramp_datasets_per_hour')][0] == 'integer'
+    checks = {
+        name: facts[1]
+        for (table, name), facts in built['constraints'].items()
+        if table == SOURCE_SETTINGS_TABLE and facts[0] == 'c'
+    }
+    assert {name: checks.get(name) for name in RATE_CHECK_DEFINITIONS} == RATE_CHECK_DEFINITIONS, checks
+    assert 'ck_panel_source_settings_version_numbers_non_negative' not in checks, checks
+
+
+def test_the_rate_checks_behave_on_the_upgraded_schema(upgraded: ScratchDb):
+    """A NULL rate passes (no limit), the minimums pass, ramp 0 and a cap of 1 are refused naming their CHECK."""
+    _upgrade_head(upgraded)
+    insert = sa.text(
+        'INSERT INTO panel_source_settings_version (source, version_no, ramp_datasets_per_hour, request_cap_per_hour, '
+        "corporate_action_window_pre_days, corporate_action_window_post_days, actor) VALUES ('MANUAL_ENTRY', :n, "
+        ":ramp, :cap, 0, 0, 'operator')"
+    )
+    with upgraded.engine.begin() as conn:
+        conn.execute(insert, {'n': 1, 'ramp': None, 'cap': None})
+        conn.execute(insert, {'n': 2, 'ramp': 1, 'cap': 2})
+    for n, ramp, cap, constraint in (
+        (3, 0, None, 'ck_panel_source_settings_version_ramp_positive'),
+        (4, None, 1, 'ck_panel_source_settings_version_request_cap_min'),
+        (5, None, 0, 'ck_panel_source_settings_version_request_cap_min'),
+    ):
+        with upgraded.engine.begin() as conn, pytest.raises(sa.exc.IntegrityError) as excinfo:
+            conn.execute(insert, {'n': n, 'ramp': ramp, 'cap': cap})
+        assert f'violates check constraint "{constraint}"' in str(excinfo.value.orig), excinfo.value.orig
+
+
 def test_a_second_upgrade_is_a_no_op_and_alembic_check_finds_no_drift(upgraded: ScratchDb):
     """The CI from-empty step's repeat, on one database; then B6, alembic check against the migrated schema."""
     _upgrade_head(upgraded)

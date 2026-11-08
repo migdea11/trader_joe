@@ -187,13 +187,14 @@ async def seed_panel_records(url: URL, dataset_id: uuid.UUID) -> None:
                 db,
                 source=DataSource.ALPACA_API,
                 settings=panel_settings.SourceSettings(
-                    ramp_datasets_per_hour=10,
-                    request_cap_per_hour=100,
+                    # Both rates NULL: no limit, so the cast exercises a NULL rate (version 1 holds values).
+                    ramp_datasets_per_hour=None,
+                    request_cap_per_hour=None,
                     corporate_action_window_pre_days=30,
                     corporate_action_window_post_days=60,
                 ),
                 actor=PANEL_ACTOR,
-                reason='seed: raise the rates',
+                reason='seed: lift the rate limits',
             )
             settings_2 = await panel_settings.append_settings_version(
                 db,

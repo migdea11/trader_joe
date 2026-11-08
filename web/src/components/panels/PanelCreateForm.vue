@@ -2,8 +2,8 @@
 // Create a panel (tj-7zjov1.37; owner ruling 2026-10-27: a UI action; the reason is optional since the ruling of 2026-11-06). Name, source,
 // enabled, cadence (shown as Monthly (default) and sent UNSPECIFIED unless the operator picks one),
 // the filters and an optional reason. The source's four settings fields show only while the source has no
-// settings version (its versions page is empty): ramp and cap are required then, the window days optional
-// (the store defaults them). The write does not run the first pass: the page shows the new panel as first
+// settings version (its versions page is empty): all four are optional then. An empty ramp or cap means no
+// limit and an empty window is the store's default; an empty field is left out of the request. The write does not run the first pass: the page shows the new panel as first
 // pass pending and re-reads it. Panels are UI-only; nothing here is a client or SDK surface.
 import { computed, nextTick, ref, watch } from 'vue'
 import { DataSource } from '@generated/trader_joe/proto/market/v1/enums_pb'
@@ -103,8 +103,8 @@ async function submit(): Promise<void> {
   }
   const sourceSettings = sourceNeedsSettings.value
     ? {
-        rampDatasetsPerHour: parseCount(ramp.value) ?? 0,
-        requestCapPerHour: parseCount(cap.value) ?? 0,
+        rampDatasetsPerHour: optionalCount(ramp.value),
+        requestCapPerHour: optionalCount(cap.value),
         corporateActionWindowPreDays: optionalCount(pre.value),
         corporateActionWindowPostDays: optionalCount(post.value),
       }
@@ -241,20 +241,15 @@ async function submit(): Promise<void> {
             <label
               class="pn-label"
               for="create-ramp"
-            >{{ titleCase('New Datasets per Hour') }}<span
-              class="pn-required"
-              :class="{ 'pn-required--marked': shown.ramp }"
-              aria-hidden="true"
-            > *</span></label>
+            >{{ titleCase('New Datasets per Hour') }}</label>
             <input
               id="create-ramp"
               v-model="ramp"
               class="pn-input"
               type="text"
               inputmode="numeric"
-              aria-required="true"
               :aria-invalid="shown.ramp ? 'true' : undefined"
-              :aria-describedby="shown.ramp ? 'create-ramp-error' : undefined"
+              :aria-describedby="shown.ramp ? 'create-ramp-error create-ramp-hint' : 'create-ramp-hint'"
               :disabled="busy"
               data-testid="create-ramp"
             >
@@ -266,25 +261,27 @@ async function submit(): Promise<void> {
             >
               {{ shown.ramp }}
             </p>
+            <p
+              id="create-ramp-hint"
+              class="pn-hint"
+              data-testid="create-ramp-hint"
+            >
+              Leave empty for no limit.
+            </p>
           </div>
           <div class="pn-field">
             <label
               class="pn-label"
               for="create-cap"
-            >{{ titleCase('Requests per Hour') }}<span
-              class="pn-required"
-              :class="{ 'pn-required--marked': shown.cap }"
-              aria-hidden="true"
-            > *</span></label>
+            >{{ titleCase('Requests per Hour') }}</label>
             <input
               id="create-cap"
               v-model="cap"
               class="pn-input"
               type="text"
               inputmode="numeric"
-              aria-required="true"
               :aria-invalid="shown.cap ? 'true' : undefined"
-              :aria-describedby="shown.cap ? 'create-cap-error' : undefined"
+              :aria-describedby="shown.cap ? 'create-cap-error create-cap-hint' : 'create-cap-hint'"
               :disabled="busy"
               data-testid="create-cap"
             >
@@ -295,6 +292,13 @@ async function submit(): Promise<void> {
               data-testid="create-cap-error"
             >
               {{ shown.cap }}
+            </p>
+            <p
+              id="create-cap-hint"
+              class="pn-hint"
+              data-testid="create-cap-hint"
+            >
+              Leave empty for no limit. Minimum 2: each new panel dataset costs 2 requests.
             </p>
           </div>
           <div class="pn-field">

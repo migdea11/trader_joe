@@ -187,6 +187,44 @@ def test_both_reason_columns_are_nullable_and_keep_their_not_blank_check(recorde
     assert str(check.sqltext) == "btrim(reason) <> ''"
 
 
+# ADR tj-2ayia2 (owner ruling 2026-11-07), edited IN PLACE under the same id: the rates are optional, NULL is no limit.
+RATE_CHECKS = {
+    PanelSourceSettingsVersion.RAMP_POSITIVE: 'ramp_datasets_per_hour >= 1',
+    PanelSourceSettingsVersion.REQUEST_CAP_MIN: 'request_cap_per_hour >= 2',
+    PanelSourceSettingsVersion.WINDOW_NON_NEGATIVE: (
+        'corporate_action_window_pre_days >= 0 AND corporate_action_window_post_days >= 0'
+    ),
+}
+
+
+def test_the_source_settings_rates_are_nullable_and_the_window_is_not(recorded):
+    table = recorded.metadata.tables[PanelSourceSettingsVersion.__tablename__]
+    assert table.c.ramp_datasets_per_hour.nullable is True
+    assert table.c.request_cap_per_hour.nullable is True
+    assert table.c.corporate_action_window_pre_days.nullable is False
+    assert table.c.corporate_action_window_post_days.nullable is False
+    for name in ('ramp_datasets_per_hour', 'request_cap_per_hour'):
+        assert isinstance(table.c[name].type, sa.Integer) and table.c[name].server_default is None, name
+
+
+def test_the_three_source_settings_checks_replace_numbers_non_negative_in_the_baseline_and_the_model(recorded):
+    """Names and texts, baseline and model alike; the old CHECK is gone from both."""
+    recorded_table = recorded.metadata.tables[PanelSourceSettingsVersion.__tablename__]
+    model_table = PanelSourceSettingsVersion.__table__
+    for table in (recorded_table, model_table):
+        checks = {c.name: str(c.sqltext) for c in table.constraints if isinstance(c, sa.CheckConstraint)}
+        assert {name: checks.get(name) for name in RATE_CHECKS} == RATE_CHECKS, table
+        assert 'ck_panel_source_settings_version_numbers_non_negative' not in checks
+        assert not [text for text in checks.values() if '>= 0' in text and 'ramp' in text], checks
+
+
+def test_the_baseline_file_states_it_was_edited_in_place_for_the_rates():
+    """The id is unchanged on purpose (nothing persisted); the file says so, and that an old database must be dropped."""
+    text = BASELINE_FILE.read_text()
+    assert 'EDITED IN PLACE' in text and 'tj-2ayia2' in text
+    assert BASELINE_REVISION == '5d9a3c7e1b84'
+
+
 def test_the_entry_id_has_no_unique_beside_its_primary_key(recorded):
     """The redundant single-column UNIQUE on store_dataset_entry.id is not carried (no model declares it)."""
     entry = recorded.metadata.tables[StoreDatasetEntry.__tablename__]

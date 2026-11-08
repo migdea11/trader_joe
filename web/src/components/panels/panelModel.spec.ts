@@ -38,12 +38,16 @@ import {
   draftToSettingsInit,
   effectivePassText,
   emptyDraft,
+  MAX_INT32,
   markerLabel,
   markerPosition,
   memberHealthBadge,
+  MIN_RAMP_PER_HOUR,
+  MIN_REQUEST_CAP_PER_HOUR,
   panelWriteNotice,
   parseCount,
   parseSymbols,
+  rateFieldError,
   settingsInitWithEnabled,
   stripMarkers,
   transitionLabel,
@@ -152,12 +156,60 @@ describe('parseSymbols and parseCount', () => {
     [' 7 ', 7],
     ['007', 7],
     ['999999999', 999_999_999],
+    // tj-7zjov1.363.3: the ceiling is the wire's int32 maximum, not nine digits.
+    ['1000000000', 1_000_000_000],
+    ['2147483647', 2_147_483_647],
+    [' 2147483647 ', 2_147_483_647],
   ])('parseCount(%j) is %i', (text, count) => {
     expect(parseCount(text)).toBe(count)
   })
 
-  it.each(['', '  ', '-1', '1.5', '1e3', '12a', '+3', '0x10', '1 000', '1000000000'])('parseCount(%j) is null', (text) => {
-    expect(parseCount(text)).toBeNull()
+  it.each(['', '  ', '-1', '1.5', '1e3', '12a', '+3', '0x10', '1 000', '2147483648', '9999999999', '99999999999', '-0'])(
+    'parseCount(%j) is null',
+    (text) => {
+      expect(parseCount(text)).toBeNull()
+    },
+  )
+})
+
+// ADR tj-2ayia2 D3 and D6 (owner ruling 2026-11-07): the source rates are optional int32 on the wire. Empty is
+// no limit; a typed value is a whole number, ramp 1 or more, cap 2 or more (a creation costs two requests),
+// at most the int32 maximum. The constants are the values panels.proto documents.
+describe('the source rate limits and rateFieldError', () => {
+  const RAMP = 'Give a whole number, 1 to 2147483647, or leave it empty for no limit.'
+  const CAP = 'Give a whole number, 2 to 2147483647, or leave it empty for no limit.'
+
+  it('the constants are 1, 2 and the int32 maximum', () => {
+    expect(MIN_RAMP_PER_HOUR).toBe(1)
+    expect(MIN_REQUEST_CAP_PER_HOUR).toBe(2)
+    expect(MAX_INT32).toBe(2_147_483_647)
+    expect(MAX_INT32).toBe(2 ** 31 - 1)
+  })
+
+  it.each(['', ' ', '   ', '\t'])('an empty field (%j) is no limit: no problem for either rate', (text) => {
+    expect(rateFieldError(text, 'ramp')).toBe('')
+    expect(rateFieldError(text, 'cap')).toBe('')
+  })
+
+  it.each([
+    ['1', 'ramp'],
+    ['2', 'ramp'],
+    ['2', 'cap'],
+    ['3', 'cap'],
+    [' 5 ', 'ramp'],
+    ['200', 'cap'],
+    ['2147483647', 'ramp'],
+    ['2147483647', 'cap'],
+  ] as const)('%j is a valid %s', (text, field) => {
+    expect(rateFieldError(text, field)).toBe('')
+  })
+
+  it.each(['0', '00', '2147483648', '-1', 'x', '1.5', '1e3', '+3', '1 0'])('%j is refused for the ramp with its words', (text) => {
+    expect(rateFieldError(text, 'ramp')).toBe(RAMP)
+  })
+
+  it.each(['0', '1', '01', '2147483648', '-1', '-2', 'x', '2.5', '1e3'])('%j is refused for the cap with its words', (text) => {
+    expect(rateFieldError(text, 'cap')).toBe(CAP)
   })
 })
 
@@ -300,7 +352,9 @@ describe('draftFieldErrors: the settings draft problems per field', () => {
 })
 
 describe('createFieldErrors: every empty or invalid create field at once', () => {
-  const COUNT = 'Give a whole number, 0 or more.'
+  const COUNT = 'Give a whole number, 0 to 2147483647.'
+  const RAMP = 'Give a whole number, 1 to 2147483647, or leave it empty for no limit.'
+  const CAP = 'Give a whole number, 2 to 2147483647, or leave it empty for no limit.'
   const READY: CreateInput = {
     name: 'Large caps',
     nameTaken: false,
@@ -319,9 +373,10 @@ describe('createFieldErrors: every empty or invalid create field at once', () =>
     expect(createFieldErrors(NEEDS)).toEqual({})
   })
 
-  // tj-7zjov1.362.4 (architect note 22:22 UTC; ADR tj-46jkey sections 1 and 2): the required create fields
-  // are name and source, plus ramp and cap only while the source has no settings. Size is gone; reason is
-  // optional and is no input to the rules at all.
+  // tj-7zjov1.362.4 (ADR tj-46jkey sections 1 and 2), then ADR tj-2ayia2 D6 (owner ruling 2026-11-07): the
+  // required create fields are name and source only, in every source state. Ramp and cap show only while the
+  // source has no settings and are optional there (empty is no limit); a typed value out of range is marked.
+  // Size is gone; reason is optional and is no input to the rules at all.
   it('the form as opened: name and source only, in that order, with their words', () => {
     const opened: CreateInput = {
       ...READY,
@@ -341,23 +396,31 @@ describe('createFieldErrors: every empty or invalid create field at once', () =>
     expect(createFieldErrors({ ...READY, ramp: '', cap: '', pre: '', post: '' })).toEqual({})
   })
 
-  it('the required set on a source WITHOUT settings: name, source, ramp and cap, in that order; the window days are not required', () => {
+  it('the required set on a source WITHOUT settings: name and source only; ramp, cap and window days empty are valid', () => {
     const blank: CreateInput = { ...NEEDS, name: '', sourceProblem: true, ramp: '', cap: '', pre: '', post: '' }
-    expect(Object.keys(createFieldErrors(blank))).toEqual(['name', 'source', 'ramp', 'cap'])
-    expect(Object.keys(createFieldErrors({ ...NEEDS, ramp: '', cap: '' }))).toEqual(['ramp', 'cap'])
+    expect(Object.keys(createFieldErrors(blank))).toEqual(['name', 'source'])
+    expect(createFieldErrors({ ...NEEDS, ramp: '', cap: '' })).toEqual({})
+    expect(createFieldErrors({ ...NEEDS, ramp: '', cap: '', pre: '', post: '' })).toEqual({})
   })
 
-  it('every field at once on a source with no settings: all six, in form order', () => {
+  it('every field at once on a source with no settings: all six, in form order, each with its words', () => {
     const all: CreateInput = {
       ...NEEDS,
       name: ' ',
       sourceProblem: true,
-      ramp: '',
-      cap: '-1',
+      ramp: '0',
+      cap: '1',
       pre: 'x',
       post: '1.5',
     }
-    expect(Object.keys(createFieldErrors(all))).toEqual(['name', 'source', 'ramp', 'cap', 'pre', 'post'])
+    expect(Object.entries(createFieldErrors(all))).toEqual([
+      ['name', 'Give the panel a name.'],
+      ['source', 'The source settings could not be read. Choose the source again.'],
+      ['ramp', RAMP],
+      ['cap', CAP],
+      ['pre', COUNT],
+      ['post', COUNT],
+    ])
   })
 
   it.each(['', '   '])('a blank name (%j) is asked for, taken or not', (name) => {
@@ -383,22 +446,41 @@ describe('createFieldErrors: every empty or invalid create field at once', () =>
     expect(createFieldErrors({ ...READY, sourceNeedsSettings: null })).toStrictEqual({ source: 'Reading the source settings.' })
   })
 
-  it.each(['', ' ', '-1', 'x', '1.5'])('a source with no settings: a ramp or cap of %j is marked on that field', (bad) => {
-    expect(createFieldErrors({ ...NEEDS, ramp: bad })).toStrictEqual({ ramp: COUNT })
-    expect(createFieldErrors({ ...NEEDS, cap: bad })).toStrictEqual({ cap: COUNT })
+  it.each(['', ' ', '\t '])('a source with no settings: a ramp or cap of %j is no limit and never marked', (empty) => {
+    expect(createFieldErrors({ ...NEEDS, ramp: empty })).toEqual({})
+    expect(createFieldErrors({ ...NEEDS, cap: empty })).toEqual({})
+    expect(createFieldErrors({ ...NEEDS, ramp: empty, cap: empty })).toEqual({})
   })
 
-  it('a ramp or cap of 0 is a count', () => {
-    expect(createFieldErrors({ ...NEEDS, ramp: '0', cap: '0' })).toEqual({})
+  it.each(['0', '2147483648', '-1', 'x', '1.5', ' -3 '])('a source with no settings: a ramp of %j is marked on the ramp', (bad) => {
+    expect(createFieldErrors({ ...NEEDS, ramp: bad })).toStrictEqual({ ramp: RAMP })
   })
 
-  it.each(['-1', 'x', '1.5'])('a source with no settings: a window day of %j is marked on that field', (bad) => {
+  it.each(['0', '1', '2147483648', '-1', 'x', '1.5'])('a source with no settings: a cap of %j is marked on the cap', (bad) => {
+    expect(createFieldErrors({ ...NEEDS, cap: bad })).toStrictEqual({ cap: CAP })
+  })
+
+  it.each([
+    ['1', '2'],
+    ['2147483647', '2147483647'],
+    [' 1 ', ' 2 '],
+  ])('a source with no settings: ramp %j and cap %j are at the edges of their range and valid', (ramp, cap) => {
+    expect(createFieldErrors({ ...NEEDS, ramp, cap })).toEqual({})
+  })
+
+  it('zero is never a rate: a ramp or cap of 0 is marked (pause a panel with Enabled off)', () => {
+    expect(createFieldErrors({ ...NEEDS, ramp: '0', cap: '0' })).toStrictEqual({ ramp: RAMP, cap: CAP })
+  })
+
+  it.each(['-1', 'x', '1.5', '2147483648'])('a source with no settings: a window day of %j is marked on that field', (bad) => {
     expect(createFieldErrors({ ...NEEDS, pre: bad })).toStrictEqual({ pre: COUNT })
     expect(createFieldErrors({ ...NEEDS, post: bad })).toStrictEqual({ post: COUNT })
   })
 
-  it.each(['', '   ', '0', '30'])('a window day of %j is not marked: blank is the store default', (fine) => {
+  it.each(['', '   ', '0', '30', '2147483647'])('a window day of %j is not marked: blank is the store default', (fine) => {
     expect(createFieldErrors({ ...NEEDS, pre: fine, post: fine })).toEqual({})
+    // A window-only create: the rates left empty, the window days given.
+    expect(createFieldErrors({ ...NEEDS, ramp: '', cap: '', pre: fine, post: fine })).toEqual({})
   })
 
   it.each([false, null])('ramp, cap and window days are never marked unless the source has no settings (%s)', (needs) => {

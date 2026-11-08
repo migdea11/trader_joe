@@ -6,13 +6,15 @@ ADR tj-26jt9w addendum 20 and panels.proto. Pinned:
   * The instance secret first: a missing or wrong one is 401 before the body, the path or the panel is read, and nothing
     is written.
   * W1 POST /ui/v1/panels, CreatePanelRequest -> 201 PanelDetail: version 1, effective_pass unset, zero counts; cadence
-    UNSPECIFIED -> the store's MONTHLY; source settings GIVEN iff any of fields 13-16 is present, then ramp AND cap both
-    required (a window-only or a ramp-only body is a 422 with nothing written), an absent window day count the store's
-    90; no source version and none given is a 422; no pass is started.
+    UNSPECIFIED -> the store's MONTHLY; source settings GIVEN iff any of fields 13-16 is present; no pass is started.
+    REVERSED by ADR tj-2ayia2 (owner ruling 2026-11-07, D3/D4): an ABSENT rate is NO LIMIT (stored NULL, absent from
+    the canonical JSON read back, never 0); a present 0, a ramp under 1, a cap under 2 is the store's 422 and a value
+    above int32 max fails the parse (422), nothing written; on a source with NO version every create writes its
+    version 1 (window-only, ramp-only, cap-only and nothing given are all 201; an absent window day count is 90).
   * W2 POST /ui/v1/panels/{id}/settings-versions -> 201 PanelSettingsVersion, effective_pass unset. Order: secret, 422
     body, 404 unknown panel, 422 store refusal, write.
   * W3 POST /ui/v1/panel-sources/{source}/settings-versions -> 201 PanelSourceSettingsVersion. Order: secret, 422 source
-    or body, 422 store refusal, write.
+    or body, 422 store refusal, write. The window day counts are required; the rates take W1's rules (tj-2ayia2).
   * Every write: actor OPERATOR_PRINCIPAL (never the reserved dataset owner 'panel', and no body names an owner: an
     'owner' field is an unknown field, 422); the reason OPTIONAL (ADR tj-46jkey, owner ruling 2026-11-06): stored
     trimmed, absent or blank stored NULL and served as '' (absent from the canonical JSON); NO dataset_override_log row
@@ -225,13 +227,14 @@ async def test_w1_creates_the_panel_its_version_1_and_its_sources_first_settings
     assert world.published.events == []
 
 
-async def test_w1_keeps_a_named_cadence_and_a_given_window_day_count_and_ramp_zero(world, client):
+async def test_w1_keeps_a_named_cadence_and_a_given_window_day_count_and_an_absent_ramp_is_no_limit(world, client):
+    """tj-2ayia2: 'ramp 0 pauses creation' is retired; an absent ramp is NULL and is ABSENT from the JSON read back."""
     body = await created(
         await post(
             client,
             CREATE,
             PANEL_BODY
-            | {'cadence': 'PANEL_CADENCE_WEEKLY', 'rampDatasetsPerHour': 0, 'requestCapPerHour': 4}
+            | {'cadence': 'PANEL_CADENCE_WEEKLY', 'requestCapPerHour': 4}
             | {'corporateActionWindowPreDays': 7, 'allowSymbols': ['SPY'], 'denySymbols': ['QQQ']}
             | {'assetClass': 'ASSET_TYPE_STOCK', 'exchange': 'ARCA', 'active': True, 'tradable': False},
         )
@@ -252,7 +255,112 @@ async def test_w1_keeps_a_named_cadence_and_a_given_window_day_count_and_ramp_ze
         'corporateActionWindowPostDays': 90,
     }
     (version,) = await world.rows(SOURCE_SETTINGS)
-    assert version.ramp_datasets_per_hour == 0
+    assert version.ramp_datasets_per_hour is None and version.request_cap_per_hour == 4
+
+
+@pytest.mark.parametrize(
+    ('change', 'stored', 'json_settings'),
+    [
+        ({}, (None, None, 90, 90), {'corporateActionWindowPreDays': 90, 'corporateActionWindowPostDays': 90}),
+        (
+            {'corporateActionWindowPreDays': 5},
+            (None, None, 5, 90),
+            {'corporateActionWindowPreDays': 5, 'corporateActionWindowPostDays': 90},
+        ),
+        (
+            {'corporateActionWindowPostDays': 5, 'rampDatasetsPerHour': 1},
+            (1, None, 90, 5),
+            {'rampDatasetsPerHour': 1, 'corporateActionWindowPreDays': 90, 'corporateActionWindowPostDays': 5},
+        ),
+        (
+            {'rampDatasetsPerHour': 1},
+            (1, None, 90, 90),
+            {'rampDatasetsPerHour': 1, 'corporateActionWindowPreDays': 90, 'corporateActionWindowPostDays': 90},
+        ),
+        (
+            {'requestCapPerHour': 2},
+            (None, 2, 90, 90),
+            {'requestCapPerHour': 2, 'corporateActionWindowPreDays': 90, 'corporateActionWindowPostDays': 90},
+        ),
+        (
+            {'rampDatasetsPerHour': 2147483647, 'requestCapPerHour': 2147483647},
+            (2147483647, 2147483647, 90, 90),
+            {
+                'rampDatasetsPerHour': 2147483647,
+                'requestCapPerHour': 2147483647,
+                'corporateActionWindowPreDays': 90,
+                'corporateActionWindowPostDays': 90,
+            },
+        ),
+    ],
+    ids=['nothing-given', 'window-only', 'window-and-ramp', 'ramp-only', 'cap-only-minimum', 'int32-max'],
+)
+async def test_w1_on_a_source_with_no_version_writes_its_version_1_whatever_13_16_carry(
+    world, client, change, stored, json_settings
+):
+    """tj-2ayia2 D4: these were 422s under the reversed ruling. An absent rate is NULL and ABSENT from the JSON."""
+    body = await created(await post(client, CREATE, PANEL_BODY | change))
+
+    source = body['currentSourceVersion']
+    assert source['versionNo'] == 1 and source['actor'] == OPERATOR_PRINCIPAL and source['reason'] == 'first'
+    assert source['settings'] == json_settings
+    (row,) = await world.rows(SOURCE_SETTINGS)
+    assert (
+        row.ramp_datasets_per_hour,
+        row.request_cap_per_hour,
+        row.corporate_action_window_pre_days,
+        row.corporate_action_window_post_days,
+    ) == stored
+    counts = await world.counts()
+    assert (counts['panel'], counts['panel_settings_version']) == (1, 1)
+
+
+OUT_OF_RANGE_RATES = [
+    pytest.param({'rampDatasetsPerHour': 0}, id='ramp-zero'),
+    pytest.param({'requestCapPerHour': 0}, id='cap-zero'),
+    pytest.param({'rampDatasetsPerHour': 0, 'requestCapPerHour': 0}, id='both-zero'),
+    pytest.param({'requestCapPerHour': 1}, id='cap-one'),
+    pytest.param({'rampDatasetsPerHour': -1}, id='ramp-negative'),
+    pytest.param({'rampDatasetsPerHour': 2147483648}, id='ramp-above-int32'),
+    pytest.param({'requestCapPerHour': 2147483648}, id='cap-above-int32'),
+]
+
+
+@pytest.mark.parametrize('rates', OUT_OF_RANGE_RATES)
+async def test_w1_a_present_zero_a_cap_of_one_or_a_value_above_int32_is_a_422_writing_nothing(world, client, rates):
+    before = await world.counts()
+    problem(await post(client, CREATE, PANEL_BODY | rates), status=422, reason='INVALID_REQUEST')
+    await nothing_written(world, before)
+
+
+@pytest.mark.parametrize('rates', OUT_OF_RANGE_RATES)
+async def test_w3_a_present_zero_a_cap_of_one_or_a_value_above_int32_is_a_422_writing_nothing(world, client, rates):
+    await world.source_version(SOURCE)
+    before = await world.counts()
+    problem(await post(client, SOURCE_PATH, SOURCE_BODY | rates), status=422, reason='INVALID_REQUEST')
+    await nothing_written(world, before)
+
+
+@pytest.mark.parametrize(
+    'absent', [('rampDatasetsPerHour',), ('requestCapPerHour',), ('rampDatasetsPerHour', 'requestCapPerHour')]
+)
+async def test_w3_an_absent_rate_is_no_limit_stored_null_and_absent_from_the_json(world, client, absent):
+    await world.source_version(SOURCE)
+    sent = {key: value for key, value in SOURCE_BODY.items() if key not in absent}
+
+    body = await created(await post(client, SOURCE_PATH, sent))
+
+    assert body['versionNo'] == 2
+    assert not set(absent) & set(body['settings']), body['settings']
+    assert body['settings'] == {key: sent[key] for key in body['settings']}
+    (row,) = [row for row in await world.rows(SOURCE_SETTINGS) if row.version_no == 2]
+    for key, column in (
+        ('rampDatasetsPerHour', 'ramp_datasets_per_hour'),
+        ('requestCapPerHour', 'request_cap_per_hour'),
+    ):
+        assert getattr(row, column) == (None if key in absent else SOURCE_BODY[key]), column
+    listed = (await client.get(SOURCE_PATH)).json()['items'][0]
+    assert listed['versionNo'] == 2 and not set(absent) & set(listed['settings']), listed
 
 
 async def test_w1_on_a_source_that_has_a_version_needs_no_source_settings(world, client):
@@ -265,11 +373,8 @@ async def test_w1_on_a_source_that_has_a_version_needs_no_source_settings(world,
 @pytest.mark.parametrize(
     ('change', 'why'),
     [
-        ({'corporateActionWindowPreDays': 5}, 'a window without both rates'),
-        ({'corporateActionWindowPostDays': 5, 'rampDatasetsPerHour': 1}, 'a window and the ramp, no cap'),
-        ({'rampDatasetsPerHour': 1}, 'the ramp alone'),
-        ({'requestCapPerHour': 1}, 'the cap alone'),
-        ({}, 'no source settings for a source with no version'),
+        # tj-2ayia2: a window without both rates, the ramp alone and nothing given are 201s now (pinned above).
+        ({'requestCapPerHour': 1}, 'the cap alone, under the minimum 2'),
         (RATES | {'name': '   '}, 'a blank name'),
         (RATES | {'size': 25}, 'a size field (removed: field 3 is reserved)'),
         (RATES | {'size': 0}, 'a zero size field (presence, not value)'),
@@ -395,10 +500,11 @@ async def test_w3_order_secret_then_source_or_body_then_store_refusal(world, cli
     problem(await post(client, bad_source, SOURCE_BODY), status=422, reason='INVALID_REQUEST')
     problem(await post(client, '/ui/v1/panel-sources/ALPACA/settings-versions', SOURCE_BODY), status=422)
     problem(await post(client, SOURCE_PATH, 'not json'), status=422, reason='INVALID_REQUEST')
-    for missing in ('rampDatasetsPerHour', 'requestCapPerHour', 'corporateActionWindowPreDays'):
+    # The window day counts stay required; an absent RATE is no limit now (tj-2ayia2), pinned in its own test.
+    for missing in ('corporateActionWindowPreDays', 'corporateActionWindowPostDays'):
         body = {key: value for key, value in SOURCE_BODY.items() if key != missing}
         problem(await post(client, SOURCE_PATH, body), status=422, reason='INVALID_REQUEST')
-    for refused in ({'requestCapPerHour': -1}, {'source': 'DATA_SOURCE_IB_API'}):
+    for refused in ({'requestCapPerHour': -1}, {'requestCapPerHour': 1}, {'source': 'DATA_SOURCE_IB_API'}):
         problem(await post(client, SOURCE_PATH, SOURCE_BODY | refused), status=422, reason='INVALID_REQUEST')
     await nothing_written(world, before)
 

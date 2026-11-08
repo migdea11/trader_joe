@@ -186,8 +186,9 @@ PANEL_SETTINGS = [
 ]
 
 SOURCE_SETTINGS = [
-    _f('ramp_datasets_per_hour', 1, I32),
-    _f('request_cap_per_hour', 2, I32),
+    # ADR tj-2ayia2 D3: the rates have EXPLICIT presence on the read: unset is NO LIMIT, and 0 never appears.
+    _o('ramp_datasets_per_hour', 1, I32),
+    _o('request_cap_per_hour', 2, I32),
     _f('corporate_action_window_pre_days', 3, I32),
     _f('corporate_action_window_post_days', 4, I32),
 ]
@@ -650,16 +651,17 @@ def test_each_reason_is_documented_optional_and_never_required(message: str):
     [
         ('SavePanelSettingsRequest', 'enabled', 'an absent value is refused (422), never read as false'),
         ('SavePanelSettingsRequest', 'cadence', 'UNSPECIFIED is refused (422)'),
-        ('SaveSourceSettingsRequest', 'ramp_datasets_per_hour', 'an absent one is refused (422), never read as zero'),
+        # ADR tj-2ayia2: the RATES are no longer presence-required (absent is no limit, pinned below); the window
+        # day counts of the source write still are.
+        (
+            'SaveSourceSettingsRequest',
+            'ramp_datasets_per_hour',
+            '3-4, the window day counts: both required (an absent one is refused (422)), not negative.',
+        ),
         # P23b: the create body. enabled has no default on create either (size is removed, 2026-11-06).
         ('CreatePanelRequest', 'enabled', 'an absent value is refused (422), never read as false; there is no default'),
         ('CreatePanelRequest', 'name', 'Required, trimmed, unique; blank or already used is refused (422).'),
         ('CreatePanelRequest', 'source', "Required; UNSPECIFIED is refused (422). Fixed for the panel's life."),
-        (
-            'CreatePanelRequest',
-            'ramp_datasets_per_hour',
-            'ramp and cap are both required (an absent one is refused (422), never read as zero; ramp 0 pauses creation)',
-        ),
     ],
 )
 def test_each_presence_required_value_documents_that_absence_is_refused(message: str, field: str, words: str):
@@ -696,18 +698,19 @@ def test_the_create_cadence_unspecified_means_the_monthly_default_and_the_save_s
     'words',
     [
         '13-16: the FIRST source settings.',
-        'Given only when the source has no source settings version yet',
+        # ADR tj-2ayia2 D4: a create on a source with no version ALWAYS writes its version 1.
+        "On a source with NO settings version, the create always writes that source's version 1 from whatever 13-16 "
+        'carry: an absent rate is no limit,',
         "an absent window day count takes the store's ruled 90 (DEFAULT_CORPORATE_ACTION_WINDOW_DAYS)",
-        'All four absent means not given; a window without both rates is refused (422).',
-        'When the source has no version and none is given, the create is refused (422): the rates have no default.',
-        'When given for a source that already has a version, the create is refused (422) and nothing is written:',
+        'all four absent writes no limits and 90/90.',
+        'A present ramp under 1, cap under 2 or negative window day count is refused (422).',
+        'On a source that already has a version, any of 13-16 is refused (422) and nothing is written:',
         "a source's settings apply to every panel on that source, so they change only through their own write, "
         'POST /panel-sources/{source}/settings-versions',
-        'Each number is not negative.',
     ],
 )
 def test_the_first_source_settings_document_the_given_rule(words: str):
-    """P23b (A) 13-16, P20b's no-fallback-rates ruling (03:25 UTC on tj-7zjov1.176) and the refusal of tj-7zjov1.209.
+    """P23b (A) 13-16 as REVERSED by ADR tj-2ayia2 (owner ruling 2026-11-07), and the refusal of tj-7zjov1.209.
 
     Settings given for a source that already has a version are refused (422), nothing written, and change only through
     the source's own write (tj-7zjov1.245); pinned on the first of the four.
@@ -716,6 +719,49 @@ def test_the_first_source_settings_document_the_given_rule(words: str):
         words: One sentence of the rule.
     """
     text = _comments(_path('CreatePanelRequest', 'ramp_datasets_per_hour'))
+    assert words in text, text
+
+
+def test_no_rate_comment_keeps_the_reversed_ruling():
+    """ADR tj-2ayia2 reverses 'ramp and cap are both required', 'the rates have no default' and '0 pauses creation'.
+
+    Every comment on the three source-settings messages and their rate fields is swept for the retired wording.
+    """
+    retired = re.compile(
+        r'0 pauses creation|ramp 0 pauses|ramp and cap are both required|the rates have no default|'
+        r'a window without both rates|has no settings and none is given',
+        re.IGNORECASE,
+    )
+    texts = []
+    for message in ('PanelSourceSettings', 'SaveSourceSettingsRequest', 'CreatePanelRequest'):
+        texts.append(_comments(_path(message)))
+        texts.extend(
+            _comments(_path(message, field))
+            for field in ('ramp_datasets_per_hour', 'request_cap_per_hour')
+            if field in _fields(message)
+        )
+    assert not [text for text in texts if retired.search(text)], texts
+
+
+@pytest.mark.parametrize(
+    ('message', 'field', 'words'),
+    [
+        ('PanelSourceSettings', None, 'The two rates are optional: UNSET MEANS NO LIMIT, and 0 never appears'),
+        ('PanelSourceSettings', 'ramp_datasets_per_hour', '1 or more. Unset: no limit.'),
+        ('PanelSourceSettings', 'request_cap_per_hour', '2 or more (each new panel dataset costs two requests).'),
+        ('PanelSourceSettings', 'request_cap_per_hour', 'Unset: no limit.'),
+        ('SaveSourceSettingsRequest', 'ramp_datasets_per_hour', 'an absent rate means NO LIMIT (never refused'),
+        (
+            'SaveSourceSettingsRequest',
+            'ramp_datasets_per_hour',
+            'A present ramp under 1 or cap under 2 (so a present 0) is refused (422); a value above int32 max fails the '
+            'parse (422).',
+        ),
+    ],
+)
+def test_the_rates_are_documented_optional_unset_is_no_limit_and_the_minimums(message, field, words):
+    """ADR tj-2ayia2 D1/D3: the read and the source write say unset is no limit, ramp >= 1, cap >= 2."""
+    text = _comments(_path(message, field))
     assert words in text, text
 
 
@@ -873,8 +919,9 @@ pending = panels_pb2.PanelSettingsVersion(version_no=3, settings=settings, actor
 source = panels_pb2.PanelSourceSettingsVersion(
     source=enums_pb2.DATA_SOURCE_ALPACA_API,
     version_no=1,
+    # ADR tj-2ayia2: the ramp is NULL in the store (no limit) and the mapping passes None to the constructor as it does.
     settings=panels_pb2.PanelSourceSettings(
-        ramp_datasets_per_hour=0,
+        ramp_datasets_per_hour=None,
         request_cap_per_hour=200,
         corporate_action_window_pre_days=90,
         corporate_action_window_post_days=90,
@@ -882,6 +929,7 @@ source = panels_pb2.PanelSourceSettingsVersion(
     actor='operator',
     reason='seed',
 )
+zero_read = panels_pb2.PanelSourceSettings(ramp_datasets_per_hour=0, request_cap_per_hour=0)
 detail = panels_pb2.PanelDetail(
     id='panel-1',
     name='us',
@@ -906,12 +954,17 @@ listing = panels_pb2.PanelList(items=[panels_pb2.PanelListItem(id='panel-1', nam
 disable = panels_pb2.SavePanelSettingsRequest(
     enabled=False, cadence=panels_pb2.PANEL_CADENCE_DAILY, reason='pause for the sitting'
 )
+# ADR tj-2ayia2: a present 0 still reaches the route as a VALUE (which the store refuses, 422), never as absent.
 pause = panels_pb2.SaveSourceSettingsRequest(
     ramp_datasets_per_hour=0,
     request_cap_per_hour=0,
     corporate_action_window_pre_days=0,
     corporate_action_window_post_days=0,
     reason='pause',
+)
+# And no limit is the rates ABSENT: no key on the wire.
+no_limit = panels_pb2.SaveSourceSettingsRequest(
+    corporate_action_window_pre_days=0, corporate_action_window_post_days=0, reason='no limit'
 )
 empty_panel = json_format.Parse('{}', panels_pb2.SavePanelSettingsRequest())
 empty_source = json_format.Parse('{}', panels_pb2.SaveSourceSettingsRequest())
@@ -925,7 +978,7 @@ create_first = panels_pb2.CreatePanelRequest(
     reason='first panel',
     name='us',
     source=enums_pb2.DATA_SOURCE_ALPACA_API,
-    ramp_datasets_per_hour=0,
+    ramp_datasets_per_hour=1,
     request_cap_per_hour=200,
 )
 empty_create = json_format.Parse('{}', panels_pb2.CreatePanelRequest())
@@ -955,7 +1008,7 @@ def round_trip(message):
     return json_format.Parse(json_format.MessageToJson(message), type(message)()) == message
 
 
-every = (detail, member, day, marker, listing, disable, pause, pending, create, create_first)
+every = (detail, member, day, marker, listing, disable, pause, no_limit, pending, create, create_first, zero_read)
 json.dump(
     {
         'files_from': [panels_pb2.__file__],
@@ -968,6 +1021,12 @@ json.dump(
         'listing': json_format.MessageToDict(listing),
         'disable': json_format.MessageToDict(disable),
         'pause': json_format.MessageToDict(pause),
+        'no_limit': json_format.MessageToDict(no_limit),
+        'source_rates_has': [
+            source.settings.HasField('ramp_datasets_per_hour'),
+            source.settings.HasField('request_cap_per_hour'),
+        ],
+        'zero_read': json_format.MessageToDict(zero_read),
         'empty_has': {
             name: empty_panel.HasField(name) for name in ('enabled', 'asset_class', 'exchange', 'active', 'tradable')
         }
@@ -1099,8 +1158,35 @@ def test_a_member_a_history_day_a_marker_and_the_list_render_as_canonical_json()
     assert seen['listing'] == {'items': [{'id': 'panel-1', 'name': 'us'}]}
 
 
-def test_a_disable_and_a_paused_source_write_their_false_and_zero_values():
-    """Presence: enabled false and every rate 0 reach the route as values, so 'pause' is not 'absent'."""
+def test_an_unset_read_rate_has_no_key_and_a_zero_one_would_show():
+    """ADR tj-2ayia2 D3: PanelSourceSettings 1-2 have explicit presence.
+
+    The constructor given None (what the mapping passes for a NULL rate) leaves the field UNSET, so the canonical JSON
+    has no key (pinned on the detail above); a 0, by contrast, is present and printed, so 0 can never stand in silently
+    for 'no limit'.
+    """
+    seen = _probe()
+    assert seen['source_rates_has'] == [False, True]
+    assert 'rampDatasetsPerHour' not in seen['detail']['currentSourceVersion']['settings']
+    assert seen['zero_read'] == {'rampDatasetsPerHour': 0, 'requestCapPerHour': 0}
+
+
+def test_a_no_limit_source_write_sends_no_rate_key():
+    """ADR tj-2ayia2: no limit is the rates absent from the body, the window day counts still present (0 included)."""
+    seen = _probe()
+    assert seen['no_limit'] == {
+        'corporateActionWindowPreDays': 0,
+        'corporateActionWindowPostDays': 0,
+        'reason': 'no limit',
+    }
+
+
+def test_a_disable_and_a_zero_rate_source_write_their_false_and_zero_values():
+    """Presence: enabled false and every rate 0 reach the route as values, so a 0 is never read as absent.
+
+    Since ADR tj-2ayia2 a present rate 0 is REFUSED by the store (422, pinned in test_ui_panel_writes_route.py): the
+    point here is only that the wire keeps it a value, so it cannot be mistaken for 'no limit'.
+    """
     seen = _probe()
     assert seen['disable'] == {'enabled': False, 'cadence': 'PANEL_CADENCE_DAILY', 'reason': 'pause for the sitting'}
     assert seen['pause'] == {
@@ -1133,7 +1219,7 @@ def test_a_create_body_without_source_settings_renders_as_the_canonical_json_the
 
 
 def test_a_create_body_with_the_first_source_settings_renders_as_the_canonical_json_the_ui_sends():
-    """Ramp 0 (paused) is sent as a value; the two absent window day counts are absent keys (the store's 90 applies)."""
+    """The minimum ramp 1 is sent as a value; the two absent window day counts are absent keys (the store's 90)."""
     seen = _probe()
     assert seen['create_first'] == {
         'enabled': True,
@@ -1142,7 +1228,7 @@ def test_a_create_body_with_the_first_source_settings_renders_as_the_canonical_j
         'reason': 'first panel',
         'name': 'us',
         'source': 'DATA_SOURCE_ALPACA_API',
-        'rampDatasetsPerHour': 0,
+        'rampDatasetsPerHour': 1,
         'requestCapPerHour': 200,
     }
 

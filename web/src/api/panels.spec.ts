@@ -2,8 +2,9 @@
 // The panel routes' typed client (web/src/api/panels.ts, tj-7zjov1.37) against the ruled contract (P24
 // tj-7zjov1.36 ROUTE CONTRACT, ADR tj-26jt9w addendum 22): eight reads R1 to R8 (GET) and three writes W1 to
 // W3 (POST, 201), every path under /api/store/ui/v1, {source} the proto DataSource NAME, and a write body
-// whose optional fields are present exactly when the caller set them (an absent one is refused 422 by the
-// store, never read as zero or false). Only the network is replaced: global fetch is stubbed per test.
+// whose optional fields are present exactly when the caller set them (an absent one is never read as zero or
+// false; an absent source rate is no limit, ADR tj-2ayia2 D3). Only the network is replaced: global fetch is
+// stubbed per test.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { DataSource, DataSourceSchema } from '@generated/trader_joe/proto/market/v1/enums_pb'
@@ -78,7 +79,7 @@ const VERSION_JSON = { versionNo: 2, settings: { enabled: false }, actor: 'opera
 const SOURCE_VERSION_JSON = {
   source: 'DATA_SOURCE_ALPACA_API',
   versionNo: 1,
-  settings: { rampDatasetsPerHour: 0, requestCapPerHour: 200, corporateActionWindowPreDays: 90, corporateActionWindowPostDays: 90 },
+  settings: { rampDatasetsPerHour: 5, requestCapPerHour: 200, corporateActionWindowPreDays: 90, corporateActionWindowPostDays: 90 },
 }
 
 describe('dataSourceRouteName: the {source} path segment is the proto enum NAME', () => {
@@ -150,6 +151,28 @@ describe('the eight reads: GET on their ruled path, query as given, decoded as t
     expect(page.items[0]?.settings?.requestCapPerHour).toBe(200)
   })
 
+  // ADR tj-2ayia2 D3: PanelSourceSettings ramp and cap are optional int32; unset is no limit and decodes as
+  // undefined, never 0, while a window day of 0 is a real 0.
+  it('R4 a version with unset rates decodes them as undefined (no limit), the window days as sent', async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        items: [{ ...SOURCE_VERSION_JSON, settings: { corporateActionWindowPreDays: 0, corporateActionWindowPostDays: 30 } }],
+      }),
+    )
+    const settings = (await getSourceSettingsVersions(DataSource.ALPACA_API, { limit: 1 })).items[0]!.settings!
+    expect(settings.rampDatasetsPerHour).toBeUndefined()
+    expect(settings.requestCapPerHour).toBeUndefined()
+    expect(settings.corporateActionWindowPreDays).toBe(0)
+    expect(settings.corporateActionWindowPostDays).toBe(30)
+  })
+
+  it('R4 a version with only a cap decodes the ramp as undefined and the cap as sent', async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ items: [{ ...SOURCE_VERSION_JSON, settings: { requestCapPerHour: 2 } }] }))
+    const settings = (await getSourceSettingsVersions(DataSource.ALPACA_API)).items[0]!.settings!
+    expect(settings.rampDatasetsPerHour).toBeUndefined()
+    expect(settings.requestCapPerHour).toBe(2)
+  })
+
   it('R4 an empty page decodes to no items (the create form test), never an error', async () => {
     fetchMock.mockResolvedValue(jsonResponse({}))
     expect((await getSourceSettingsVersions(DataSource.IB_API)).items).toEqual([])
@@ -217,7 +240,7 @@ describe('the three writes: POST on their ruled path with a canonical JSON body'
       allowSymbols: ['AAPL'],
       denySymbols: [],
       reason: 'first panel',
-      rampDatasetsPerHour: 0,
+      rampDatasetsPerHour: 1,
       requestCapPerHour: 200,
     })
     const { url, init } = call()
@@ -230,10 +253,32 @@ describe('the three writes: POST on their ruled path with a canonical JSON body'
       enabled: false,
       allowSymbols: ['AAPL'],
       reason: 'first panel',
-      rampDatasetsPerHour: 0,
+      rampDatasetsPerHour: 1,
       requestCapPerHour: 200,
     })
     expect(detail.id).toBe(PANEL_ID)
+  })
+
+  // ADR tj-2ayia2 D3: an absent rate is no limit. The create form passes an empty field as an undefined
+  // value, and the body must carry no key for it.
+  it('W1 rates passed as undefined are absent from the body; a window-only create carries only the window keys', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(DETAIL_JSON, 201))
+    await createPanel({
+      name: 'n',
+      source: DataSource.ALPACA_API,
+      reason: 'r',
+      rampDatasetsPerHour: undefined,
+      requestCapPerHour: undefined,
+      corporateActionWindowPreDays: 0,
+      corporateActionWindowPostDays: undefined,
+    })
+    expect(sentBody()).toEqual({ name: 'n', source: 'DATA_SOURCE_ALPACA_API', reason: 'r', corporateActionWindowPreDays: 0 })
+  })
+
+  it('W1 the int32 maximum is sent as a JSON number', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(DETAIL_JSON, 201))
+    await createPanel({ name: 'n', source: DataSource.ALPACA_API, rampDatasetsPerHour: 2_147_483_647, requestCapPerHour: 2_147_483_647 })
+    expect(sentBody()).toMatchObject({ rampDatasetsPerHour: 2_147_483_647, requestCapPerHour: 2_147_483_647 })
   })
 
   it('W1 an UNSPECIFIED cadence and unset filters and window days are absent from the body', async () => {
@@ -298,26 +343,38 @@ describe('the three writes: POST on their ruled path with a canonical JSON body'
     expect(fetchMock).toHaveBeenCalledTimes(3)
   })
 
-  it('W3 saveSourceSettings: POST /panel-sources/{NAME}/settings-versions; every number present, 0 included', async () => {
+  it('W3 saveSourceSettings: POST /panel-sources/{NAME}/settings-versions; every number given is present, a window day of 0 included', async () => {
     fetchMock.mockResolvedValue(jsonResponse(SOURCE_VERSION_JSON, 201))
     const version = await saveSourceSettings(DataSource.ALPACA_API, {
-      rampDatasetsPerHour: 0,
-      requestCapPerHour: 200,
+      rampDatasetsPerHour: 1,
+      requestCapPerHour: 2,
       corporateActionWindowPreDays: 0,
       corporateActionWindowPostDays: 90,
-      reason: 'pause creation',
+      reason: 'slow down',
     })
     const { url, init } = call()
     expect(init.method).toBe('POST')
     expect(url.pathname).toBe('/api/store/ui/v1/panel-sources/DATA_SOURCE_ALPACA_API/settings-versions')
     expect(sentBody()).toEqual({
-      rampDatasetsPerHour: 0,
-      requestCapPerHour: 200,
+      rampDatasetsPerHour: 1,
+      requestCapPerHour: 2,
       corporateActionWindowPreDays: 0,
       corporateActionWindowPostDays: 90,
-      reason: 'pause creation',
+      reason: 'slow down',
     })
     expect(version.settings?.requestCapPerHour).toBe(200)
+  })
+
+  it('W3 rates passed as undefined (no limit) are absent from the body, the window days present', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(SOURCE_VERSION_JSON, 201))
+    await saveSourceSettings(DataSource.ALPACA_API, {
+      rampDatasetsPerHour: undefined,
+      requestCapPerHour: undefined,
+      corporateActionWindowPreDays: 90,
+      corporateActionWindowPostDays: 0,
+      reason: '',
+    })
+    expect(sentBody()).toEqual({ corporateActionWindowPreDays: 90, corporateActionWindowPostDays: 0 })
   })
 
   it('a write never sends PUT or PATCH and never carries the instance secret', async () => {

@@ -127,13 +127,15 @@ message PanelSettings {
   optional bool tradable = 9;
 }
 
-// A source's settings, shared by every panel on it. The numbers are not negative and have no policy
-// default.
+// A source's settings, shared by every panel on it. The two rates are optional: UNSET MEANS NO LIMIT, and
+// 0 never appears (a ramp is 1 or more, a cap 2 or more). The window day counts are not negative and have
+// the store's ruled default (90) when a create gives none.
 message PanelSourceSettings {
-  // The most NEW panel datasets created per source in any trailing 60 minutes; 0 pauses creation.
-  int32 ramp_datasets_per_hour = 1;
-  // The most ingest requests the panel manager writes per source in any trailing 60 minutes.
-  int32 request_cap_per_hour = 2;
+  // The most NEW panel datasets created per source in any trailing 60 minutes, 1 or more. Unset: no limit.
+  optional int32 ramp_datasets_per_hour = 1;
+  // The most ingest requests the panel manager writes per source in any trailing 60 minutes, 2 or more
+  // (each new panel dataset costs two requests). Unset: no limit.
+  optional int32 request_cap_per_hour = 2;
   // The days before a dataset's start and after its end that corporate actions are pulled for.
   int32 corporate_action_window_pre_days = 3;
   int32 corporate_action_window_post_days = 4;
@@ -340,8 +342,9 @@ message SavePanelSettingsRequest {
 
 // The body of a source's settings write: a new source settings version.
 message SaveSourceSettingsRequest {
-  // Each number is not negative; an absent one is refused (422), never read as zero
-  // (ramp_datasets_per_hour 0 pauses creation).
+  // 1-2, the rates: an absent rate means NO LIMIT (never refused, never read as zero). A present ramp under
+  // 1 or cap under 2 (so a present 0) is refused (422); a value above int32 max fails the parse (422).
+  // 3-4, the window day counts: both required (an absent one is refused (422)), not negative.
   optional int32 ramp_datasets_per_hour = 1;
   optional int32 request_cap_per_hour = 2;
   optional int32 corporate_action_window_pre_days = 3;
@@ -380,16 +383,14 @@ message CreatePanelRequest {
   string name = 11;
   // Required; UNSPECIFIED is refused (422). Fixed for the panel's life.
   trader_joe.proto.market.v1.DataSource source = 12;
-  // 13-16: the FIRST source settings. Given only when the source has no source settings version yet; then
-  // ramp and cap are both required (an absent one is refused (422), never read as zero; ramp 0 pauses
-  // creation) and an absent window day count takes the store's ruled 90
-  // (DEFAULT_CORPORATE_ACTION_WINDOW_DAYS). All four absent means not given; a window without both rates
-  // is refused (422). When the source has no version and none is given, the create is refused (422): the
-  // rates have no default. When given for a source that already has a version, the create is refused
-  // (422) and nothing is written: a source's settings apply to every panel on that source, so they change
-  // only through their own write, POST /panel-sources/{source}/settings-versions (the UI reads
-  // GET /panel-sources/{source}/settings-versions first to see whether a version exists). Each number is
-  // not negative.
+  // 13-16: the FIRST source settings. On a source with NO settings version, the create always writes that
+  // source's version 1 from whatever 13-16 carry: an absent rate is no limit, an absent window day count
+  // takes the store's ruled 90 (DEFAULT_CORPORATE_ACTION_WINDOW_DAYS); all four absent writes no limits and
+  // 90/90. A present ramp under 1, cap under 2 or negative window day count is refused (422). On a source
+  // that already has a version, any of 13-16 is refused (422) and nothing is written: a source's settings
+  // apply to every panel on that source, so they change only through their own write,
+  // POST /panel-sources/{source}/settings-versions (the UI reads
+  // GET /panel-sources/{source}/settings-versions first to see whether a version exists).
   optional int32 ramp_datasets_per_hour = 13;
   optional int32 request_cap_per_hour = 14;
   optional int32 corporate_action_window_pre_days = 15;

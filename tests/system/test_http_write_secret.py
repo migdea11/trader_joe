@@ -44,8 +44,9 @@ THE PANEL WRITES (tj-7zjov1.36 W1 to W3, added by tj-7zjov1.242): the panel crea
 version and a source's settings version, all POST. Each request is one that WOULD write past the guard, so
 the 401 test's "nothing written" bites: the row counts of panel, panel_settings_version and
 panel_source_settings_version are taken before the request and compared after it. That needs a panel and a
-source settings version to exist, so a fixture seeds both BY SQL (the create names no source settings, and
-the store refuses a create without them on a source that has no version). The source is MANUAL_ENTRY on
+source settings version to exist, so a fixture seeds both BY SQL (the create names no source settings; on a source
+with no version it would write that source's version 1 itself, ADR tj-2ayia2, and the 7c row count would then
+depend on what the source already held). The source is MANUAL_ENTRY on
 purpose: it has no trading calendar, so the panel manager skips its panels, and the seeded panel is
 disabled besides; ALPACA_API holds the seed cast's panel and is the one the manager runs on. 7c is the write
 itself: 201, and exactly the rows it should add. Every row the fixture seeded or a request added carries
@@ -304,8 +305,10 @@ def seeded_panel(pg_engine: Engine, run_identity) -> Iterator[SeededPanel]:
                 sa.insert(SOURCE_SETTINGS_TABLE).values(
                     source=PANEL_SOURCE,
                     version_no=latest + 1,
-                    ramp_datasets_per_hour=0,
-                    request_cap_per_hour=0,
+                    # NULL is no limit (ADR tj-2ayia2): 0/0 is refused by the CHECKs now. The seeded panel is disabled
+                    # on a source with no calendar, so no limit lets the manager do nothing it would not anyway.
+                    ramp_datasets_per_hour=None,
+                    request_cap_per_hour=None,
                     corporate_action_window_pre_days=90,
                     corporate_action_window_post_days=90,
                     actor='operator',

@@ -262,7 +262,19 @@ def test_one_panel_is_created_with_version_1_and_the_source_settings(recorder):
     settings = created['settings']
     assert settings.enabled is True and settings.cadence is None, 'version 1 names no cadence: the default applies'
     assert created['source_settings'] is not None, 'the source gets its first version with the panel'
+    # ADR tj-2ayia2: version 1 holds SET rates (5 and 50, in range), so the seed holds both shapes of a rate.
+    first = created['source_settings']
+    assert (first.ramp_datasets_per_hour, first.request_cap_per_hour) == (5, 50)
     assert len(recorder.named('create_panel')) == EXPECTED_PANELS
+
+
+def test_the_second_source_version_lifts_both_rate_limits_with_null_rates(recorder):
+    """ADR tj-2ayia2: the cast exercises a NULL rate (no limit) end to end, the window still set; never a 0."""
+    _run(recorder)
+    (source,) = recorder.named('append_source_settings_version')
+    settings = source['settings']
+    assert settings.ramp_datasets_per_hour is None and settings.request_cap_per_hour is None
+    assert (settings.corporate_action_window_pre_days, settings.corporate_action_window_post_days) == (30, 60)
 
 
 def test_the_second_versions_disable_the_panel_and_change_the_source(recorder):

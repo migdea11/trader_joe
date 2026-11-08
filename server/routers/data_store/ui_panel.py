@@ -188,7 +188,7 @@ async def get_panel_source_settings_versions(
 ) -> ProtoJSONResponse:
     """R4. A source's settings versions, newest first; the effective pass is that of any panel on the source.
 
-    A source with no version is an empty page, never a 404: that is how the create form learns the rates must be given.
+    A source with no version is an empty page, never a 404: that is how the create form learns it may offer the rate fields (a create on such a source writes its first version).
 
     Args:
         db: The request's session.
@@ -413,7 +413,7 @@ async def post_panel_source_settings_version(
     Args:
         db: The request's session.
         source: The source.
-        body: The four numbers (all required) and the reason.
+        body: The two rates (optional: absent is no limit; a present 0, a ramp under 1 or a cap under 2 is a 422), the two window day counts (required) and the reason.
 
     Returns:
         ProtoJSONResponse: 201 with the new PanelSourceSettingsVersion, effective_pass unset.

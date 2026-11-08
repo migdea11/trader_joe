@@ -6,6 +6,7 @@
 //   What moved is named; when nothing moved (or the re-read itself fails) the route's fixed copy shows,
 //   with the error id. The forms stay as they were.
 // - Nothing from the 422 body but its error id reaches the page: the body carries LEAK in every other field.
+// - The same harness reads the JSON the forms send: an empty source rate is absent from it (ADR tj-2ayia2 D6).
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
 import type { VueWrapper } from '@vue/test-utils'
@@ -202,7 +203,7 @@ describe('PanelCreateForm: a 422 is re-read', () => {
     await flushPromises()
     await byId(form, 'create-reason').setValue('a reason')
     if (byId(form, 'create-ramp').exists()) {
-      await byId(form, 'create-ramp').setValue('0')
+      await byId(form, 'create-ramp').setValue('1')
       await byId(form, 'create-cap').setValue('200')
     }
   }
@@ -273,8 +274,41 @@ describe('PanelCreateForm: a 422 is re-read', () => {
     const form = mount(PanelCreateForm, { attachTo: document.body })
     await fill(form)
     expect(await submit(form)).toBe('The store refused the panel, so nothing was created. Check the fields. Error ID: e-race')
-    expect(valueOf(form, 'create-ramp')).toBe('0')
+    expect(valueOf(form, 'create-ramp')).toBe('1')
     expect(valueOf(form, 'create-cap')).toBe('200')
+  })
+
+  // ADR tj-2ayia2 D4: a window-only (or cap-only) create is valid, so ANY of the four source fields sent
+  // counts as source settings sent, and the re-read of the source runs (stores/panels.ts createMovedOn).
+  it.each([
+    ['only the cap', { cap: '2' }],
+    ['only the pre days', { pre: '0' }],
+    ['only the post days', { post: '30' }],
+    ['only the ramp', { ramp: '1' }],
+  ] as const)('%s sent and the source has settings now: the notice says so', async (_label, typed: Record<string, string>) => {
+    fake.sourceHasSettings = false
+    fake.onWrite = () => (fake.sourceHasSettings = true)
+    const form = mount(PanelCreateForm, { attachTo: document.body })
+    await byId(form, 'create-name').setValue('Gamma')
+    await byId(form, 'create-source').findAll('option')[1]!.setValue()
+    await flushPromises()
+    for (const [field, value] of Object.entries(typed)) await byId(form, `create-${field}`).setValue(value)
+    expect(await submit(form)).toBe(
+      'This source has settings now, so nothing was created. Its settings fields are gone: check the form and create again. Error ID: e-race',
+    )
+    expect(byId(form, 'create-ramp').exists()).toBe(false)
+  })
+
+  it('nothing of the four sent (all empty) on a source with none: the source is not re-read, the fixed copy shows', async () => {
+    fake.sourceHasSettings = false
+    fake.onWrite = () => (fake.sourceHasSettings = true)
+    const form = mount(PanelCreateForm, { attachTo: document.body })
+    await byId(form, 'create-name').setValue('Gamma')
+    await byId(form, 'create-source').findAll('option')[1]!.setValue()
+    await flushPromises()
+    const sourceReadsBefore = fetchMock.mock.calls.filter(([input]) => String(input).includes('/panel-sources/')).length
+    expect(await submit(form)).toBe('The store refused the panel, so nothing was created. Check the fields. Error ID: e-race')
+    expect(fetchMock.mock.calls.filter(([input]) => String(input).includes('/panel-sources/')).length).toBe(sourceReadsBefore)
   })
 
   it('the list re-read fails: the fixed copy, nothing thrown', async () => {
@@ -430,5 +464,84 @@ describe('PanelSourceSettingsForm: a 422 re-reads the panel and its source versi
     expect(await save(form)).toBe('The store refused these source settings, so nothing was saved. Check the fields. Error ID: e-race')
     expect(valueOf(form, 'source-cap')).toBe('150')
     expect(usePanelsStore().writing).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------------------------------
+
+// ADR tj-2ayia2 D3 and D6, on the wire: an empty ramp or cap is no limit and its key is ABSENT from the JSON
+// body (never 0, never '', never null); a typed one is a number. Same harness: the real store and typed client,
+// the fake answering every POST 422, so the body is read from the one POST made.
+describe('the sent body: an empty rate is absent, a typed one a number', () => {
+  const body = () => JSON.parse(String(posts()[0]![1]!.body)) as Record<string, unknown>
+
+  async function createWith(typed: Record<string, string>): Promise<Record<string, unknown>> {
+    fake.sourceHasSettings = false
+    const form = mount(PanelCreateForm, { attachTo: document.body })
+    await byId(form, 'create-name').setValue('Gamma')
+    await byId(form, 'create-source').findAll('option')[1]!.setValue()
+    await flushPromises()
+    for (const [field, value] of Object.entries(typed)) await byId(form, `create-${field}`).setValue(value)
+    await form.find('form').trigger('submit')
+    await flushPromises()
+    expect(posts()).toHaveLength(1)
+    return body()
+  }
+
+  it('create, all four empty: none of the four keys is in the body', async () => {
+    const sent = await createWith({})
+    expect(sent).toEqual({ name: 'Gamma', source: 'DATA_SOURCE_ALPACA_API', enabled: true })
+  })
+
+  it('create, a window-only body: only the window keys', async () => {
+    const sent = await createWith({ ramp: ' ', cap: '', pre: '0', post: '30' })
+    expect(sent).toEqual({
+      name: 'Gamma',
+      source: 'DATA_SOURCE_ALPACA_API',
+      enabled: true,
+      corporateActionWindowPreDays: 0,
+      corporateActionWindowPostDays: 30,
+    })
+  })
+
+  it('create, ramp 1 and cap 2147483647: both numbers, no window keys', async () => {
+    const sent = await createWith({ ramp: '1', cap: '2147483647' })
+    expect(sent).toEqual({
+      name: 'Gamma',
+      source: 'DATA_SOURCE_ALPACA_API',
+      enabled: true,
+      rampDatasetsPerHour: 1,
+      requestCapPerHour: 2_147_483_647,
+    })
+  })
+
+  async function saveWith(typed: Record<string, string>): Promise<Record<string, unknown>> {
+    const form = mountOverStore(PanelSourceSettingsForm)
+    for (const [field, value] of Object.entries(typed)) await byId(form, `source-${field}`).setValue(value)
+    await form.find('form').trigger('submit')
+    await flushPromises()
+    expect(posts()).toHaveLength(1)
+    return body()
+  }
+
+  it('source save, both rates emptied: the rate keys absent, the window days present', async () => {
+    expect(await saveWith({ ramp: '', cap: '  ' })).toEqual({ corporateActionWindowPreDays: 90, corporateActionWindowPostDays: 30 })
+  })
+
+  it('source save, the ramp emptied and cap 2: the cap alone of the rates, a window day of 0 present', async () => {
+    expect(await saveWith({ ramp: '', cap: '2', post: '0' })).toEqual({
+      requestCapPerHour: 2,
+      corporateActionWindowPreDays: 90,
+      corporateActionWindowPostDays: 0,
+    })
+  })
+
+  it('source save, as read: every number present', async () => {
+    expect(await saveWith({})).toEqual({
+      rampDatasetsPerHour: 5,
+      requestCapPerHour: 200,
+      corporateActionWindowPreDays: 90,
+      corporateActionWindowPostDays: 30,
+    })
   })
 })

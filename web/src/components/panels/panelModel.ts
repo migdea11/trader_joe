@@ -150,11 +150,19 @@ export function parseSymbols(text: string): string[] {
   return text.split(/[\s,]+/).filter((symbol) => symbol !== '')
 }
 
-/** A count (ramp, cap, window days) as a non-negative whole number, or null when the field is not one (blank included). */
+/** The largest value an int32 field on the wire takes. */
+export const MAX_INT32 = 2147483647
+/** Ramp: valid 1..MAX_INT32; zero is refused (pause a panel with Enabled off). */
+export const MIN_RAMP_PER_HOUR = 1
+/** Cap: valid 2..MAX_INT32; each new panel dataset costs two requests. */
+export const MIN_REQUEST_CAP_PER_HOUR = 2
+
+/** A count (ramp, cap, window days) as a non-negative whole number up to MAX_INT32, or null when the field is not one (blank included). */
 export function parseCount(text: string): number | null {
   const trimmed = text.trim()
-  if (!/^\d{1,9}$/.test(trimmed)) return null
-  return Number(trimmed)
+  if (!/^\d{1,10}$/.test(trimmed)) return null
+  const value = Number(trimmed)
+  return value > MAX_INT32 ? null : value
 }
 
 const boolOf = (value: Tri): boolean | undefined => (value === '' ? undefined : value === 'true')
@@ -235,7 +243,18 @@ export interface CreateInput {
 /** A create form field that can carry an error. */
 export type CreateField = 'name' | 'source' | 'ramp' | 'cap' | 'pre' | 'post'
 
-const COUNT_ERROR = 'Give a whole number, 0 or more.'
+const COUNT_ERROR = `Give a whole number, 0 to ${MAX_INT32}.`
+const RAMP_ERROR = `Give a whole number, ${MIN_RAMP_PER_HOUR} to ${MAX_INT32}, or leave it empty for no limit.`
+const CAP_ERROR = `Give a whole number, ${MIN_REQUEST_CAP_PER_HOUR} to ${MAX_INT32}, or leave it empty for no limit.`
+
+/** A rate field's problem in words, or '' when it is empty (no limit) or a whole number in range. */
+export function rateFieldError(text: string, field: 'ramp' | 'cap'): string {
+  if (text.trim() === '') return ''
+  const value = parseCount(text)
+  const min = field === 'ramp' ? MIN_RAMP_PER_HOUR : MIN_REQUEST_CAP_PER_HOUR
+  if (value !== null && value >= min) return ''
+  return field === 'ramp' ? RAMP_ERROR : CAP_ERROR
+}
 
 /**
  * Every field of the create form that is empty or invalid, with the words for it. The one place the create
@@ -250,8 +269,10 @@ export function createFieldErrors(input: CreateInput): Partial<Record<CreateFiel
   else if (input.sourceProblem) errors.source = 'The source settings could not be read. Choose the source again.'
   else if (input.sourceNeedsSettings === null) errors.source = 'Reading the source settings.'
   if (input.sourceNeedsSettings) {
-    if (parseCount(input.ramp) === null) errors.ramp = COUNT_ERROR
-    if (parseCount(input.cap) === null) errors.cap = COUNT_ERROR
+    const ramp = rateFieldError(input.ramp, 'ramp')
+    if (ramp !== '') errors.ramp = ramp
+    const cap = rateFieldError(input.cap, 'cap')
+    if (cap !== '') errors.cap = cap
     if (input.pre.trim() !== '' && parseCount(input.pre) === null) errors.pre = COUNT_ERROR
     if (input.post.trim() !== '' && parseCount(input.post) === null) errors.post = COUNT_ERROR
   }

@@ -789,7 +789,8 @@ PANEL_DESIGN_COLUMNS = {
 PANEL_DESIGN_NULLABLE = {
     'panel': set(),
     'panel_settings_version': {'asset_class', 'exchange', 'active', 'tradable', 'reason'},
-    'panel_source_settings_version': {'reason'},
+    # The two rates: NULL is NO LIMIT (ADR tj-2ayia2 D2, owner ruling 2026-11-07).
+    'panel_source_settings_version': {'reason', 'ramp_datasets_per_hour', 'request_cap_per_hour'},
     'panel_pass': {'inactive_snapshot_id', 'finished_at', 'counts'},
     'panel_member_transition': {'dataset_id', 'request_id', 'cause'},
 }
@@ -804,6 +805,9 @@ PANEL_POLICY_COLUMNS = {
     },
     'panel_pass': {'kind', 'dry_run'},
 }
+# Policy columns that are NULLABLE on purpose: NULL is not a default value but NO LIMIT, a meaning of its own (ADR
+# tj-2ayia2 D2). They still carry no default of any kind, and every other policy column stays NOT NULL.
+PANEL_POLICY_NULL_IS_NO_LIMIT = {'panel_source_settings_version': {'ramp_datasets_per_hour', 'request_cap_per_hour'}}
 # The ONLY server defaults: ids, the database-time instants, and the empty symbol lists (no restriction).
 PANEL_SERVER_DEFAULTED = {
     'panel': {'id', 'created_at'},
@@ -839,11 +843,14 @@ PANEL_DESIGN_CHECKS = {
     ('panel_settings_version', 'ck_panel_settings_version_actor_not_blank', "btrim(actor) <> ''"),
     ('panel_settings_version', 'ck_panel_settings_version_reason_not_blank', "btrim(reason) <> ''"),
     ('panel_source_settings_version', 'ck_panel_source_settings_version_version_no_positive', 'version_no >= 1'),
+    # ADR tj-2ayia2 D1/D2: numbers_non_negative is replaced by three. A NULL rate passes its CHECK (no limit); a set
+    # ramp is >= 1 and a set cap >= 2 (panel_manager.REQUESTS_PER_CREATION); the window stays >= 0.
+    ('panel_source_settings_version', 'ck_panel_source_settings_version_ramp_positive', 'ramp_datasets_per_hour >= 1'),
+    ('panel_source_settings_version', 'ck_panel_source_settings_version_request_cap_min', 'request_cap_per_hour >= 2'),
     (
         'panel_source_settings_version',
-        'ck_panel_source_settings_version_numbers_non_negative',
-        'ramp_datasets_per_hour >= 0 AND request_cap_per_hour >= 0 AND corporate_action_window_pre_days >= 0 '
-        'AND corporate_action_window_post_days >= 0',
+        'ck_panel_source_settings_version_window_non_negative',
+        'corporate_action_window_pre_days >= 0 AND corporate_action_window_post_days >= 0',
     ),
     ('panel_source_settings_version', 'ck_panel_source_settings_version_actor_not_blank', "btrim(actor) <> ''"),
     ('panel_source_settings_version', 'ck_panel_source_settings_version_reason_not_blank', "btrim(reason) <> ''"),
@@ -870,10 +877,15 @@ def test_no_policy_default_and_only_the_designs_server_defaults_on_the_panel_tab
     Re-homed from test_panel_revision.py (ADR tj-kg521d), model half.
     """
     table = PANEL_TABLES[table_name]
+    no_limit = PANEL_POLICY_NULL_IS_NO_LIMIT.get(table_name, set())
+    assert no_limit <= PANEL_POLICY_COLUMNS.get(table_name, set())
     for name in PANEL_POLICY_COLUMNS.get(table_name, set()):
         column = table.c[name]
         assert column.server_default is None and column.default is None, f'{table.name}.{name} has a default'
-        assert not column.nullable, f'{table.name}.{name} is nullable, so NULL would be its default'
+        if name in no_limit:
+            assert column.nullable, f'{table.name}.{name} must be nullable: NULL is no limit (ADR tj-2ayia2)'
+        else:
+            assert not column.nullable, f'{table.name}.{name} is nullable, so NULL would be its default'
     assert {c.name for c in table.columns if c.server_default is not None} == PANEL_SERVER_DEFAULTED[table_name]
     assert {c.name for c in table.columns if c.default is not None} == set(), table
 

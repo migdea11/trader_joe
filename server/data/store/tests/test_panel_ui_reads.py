@@ -391,6 +391,49 @@ async def test_r4_pages_a_sources_versions_with_any_panels_pass_as_the_effective
     assert rest['items'][0]['effectivePass']['kind'] == 'PANEL_PASS_KIND_MEMBERSHIP'
 
 
+@pytest.mark.parametrize(
+    ('ramp', 'cap'), [(None, 60), (5, None), (None, None)], ids=['ramp-unset', 'cap-unset', 'both-unset']
+)
+async def test_r4_and_the_detail_leave_an_unset_rate_unset_never_zero(world, client, ramp, cap):
+    """ADR tj-2ayia2 D3: a NULL rate is NO LIMIT and has NO KEY in the canonical JSON (explicit presence).
+
+    0 never appears, since 0 is a refused value and would read as a rate.
+    """
+    seeded = await world.panel('first')
+    await world.source_version(SOURCE, ramp_datasets_per_hour=ramp, request_cap_per_hour=cap, reason='no limit')
+
+    (top, _) = (await get(client, '/ui/v1/panel-sources/DATA_SOURCE_ALPACA_API/settings-versions'))['items']
+    detail = await get(client, f'/ui/v1/panels/{seeded.panel_id}')
+
+    expected = {'corporateActionWindowPreDays': 90, 'corporateActionWindowPostDays': 90}
+    expected |= {} if ramp is None else {'rampDatasetsPerHour': ramp}
+    expected |= {} if cap is None else {'requestCapPerHour': cap}
+    assert top['versionNo'] == 2 and top['settings'] == expected
+    assert detail['currentSourceVersion']['versionNo'] == 2
+    assert detail['currentSourceVersion']['settings'] == expected
+
+
+async def test_the_protobuf_constructor_leaves_an_optional_field_given_none_unset_and_zero_set():
+    """The mapping passes the record's None straight to the PanelSourceSettings constructor (flagged by the builder).
+
+    That is correct only because the runtime treats a keyword of None as not given for a proto3 optional scalar; and a
+    0, by contrast, is PRESENT and printed. Pinned so a protobuf upgrade that changes either cannot pass silently.
+    """
+    from google.protobuf import json_format
+
+    from routers.data_store import ui_mapping
+
+    panels_pb2 = ui_mapping.panels_pb2  # the very module the mapping constructs from (generated code is not imported)
+    unset = panels_pb2.PanelSourceSettings(ramp_datasets_per_hour=None, request_cap_per_hour=None)
+    zero = panels_pb2.PanelSourceSettings(ramp_datasets_per_hour=0, request_cap_per_hour=0)
+    assert not unset.HasField('ramp_datasets_per_hour') and not unset.HasField('request_cap_per_hour')
+    assert zero.HasField('ramp_datasets_per_hour') and zero.HasField('request_cap_per_hour')
+    assert json_format.MessageToDict(unset) == {}
+    assert json_format.MessageToDict(zero) == {'rampDatasetsPerHour': 0, 'requestCapPerHour': 0}
+    # The read side of the same presence: an absent key parses unset, so a round trip keeps "no limit".
+    assert not json_format.Parse('{}', panels_pb2.PanelSourceSettings()).HasField('ramp_datasets_per_hour')
+
+
 async def test_r4_is_an_empty_page_for_a_source_with_no_version_never_a_404(world, client):
     assert await get(client, '/ui/v1/panel-sources/DATA_SOURCE_IB_API/settings-versions') == {}
 

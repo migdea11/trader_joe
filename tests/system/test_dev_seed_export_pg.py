@@ -214,8 +214,10 @@ def _seed_ledger(
         SOURCE_SETTINGS,
         source=PANEL_SOURCE,
         version_no=version_no,
-        ramp_datasets_per_hour=1,
-        request_cap_per_hour=1,
+        # ADR tj-2ayia2: a cap of 1 is refused by request_cap_min now; a NULL ramp (no limit) and the minimum cap 2
+        # carry both shapes of a rate through the export.
+        ramp_datasets_per_hour=None,
+        request_cap_per_hour=2,
         corporate_action_window_pre_days=0,
         corporate_action_window_post_days=0,
         actor='operator',
