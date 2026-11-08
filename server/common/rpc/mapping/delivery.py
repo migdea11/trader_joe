@@ -360,6 +360,7 @@ def asset_record_to_proto(record: domain.AssetRecord) -> store_pb2.AssetRecord:
         symbol=record.symbol,
         raw_payload=record.raw_payload,
         exchange=record.exchange,
+        name=record.name,
     )
     if record.active is not None:
         message.active = record.active
@@ -388,6 +389,7 @@ def asset_record_to_domain(message: store_pb2.AssetRecord) -> domain.AssetRecord
         active=message.active if message.HasField('active') else None,
         tradable=message.tradable if message.HasField('tradable') else None,
         exchange=message.exchange,
+        name=message.name,
     )
 
 
@@ -439,6 +441,8 @@ def corporate_action_record_to_proto(record: domain.CorporateActionRecord) -> st
     _set_optional_instant(message, 'ex_date', record.ex_date)
     _set_optional_instant(message, 'record_date', record.record_date)
     _set_optional_instant(message, 'payable_date', record.payable_date)
+    _set_optional_instant(message, 'process_date', record.process_date)
+    _set_optional_instant(message, 'effective_date', record.effective_date)
     return message
 
 
@@ -461,6 +465,8 @@ def corporate_action_record_to_domain(message: store_pb2.CorporateActionRecord) 
         ex_date=_optional_instant(message, 'ex_date'),
         record_date=_optional_instant(message, 'record_date'),
         payable_date=_optional_instant(message, 'payable_date'),
+        process_date=_optional_instant(message, 'process_date'),
+        effective_date=_optional_instant(message, 'effective_date'),
         identifiers=dict(message.identifiers),
         raw_payload=message.raw_payload,
     )

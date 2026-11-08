@@ -49,9 +49,16 @@ def a_bars(**overrides: object) -> domain.BarsRequest:
     )
 
 
-def an_asset_list() -> domain.AssetListRequest:
-    """Returns: domain.AssetListRequest: The asset-list kind."""
-    return domain.AssetListRequest(source='ALPACA', asset_type='stock')
+def an_asset_list(status: domain.AssetListStatus = domain.AssetListStatus.ACTIVE) -> domain.AssetListRequest:
+    """The asset-list kind. The status is required (tj-26jt9w addendum 7 item 9), so it always names a list.
+
+    Args:
+        status: Which of the vendor's two lists.
+
+    Returns:
+        domain.AssetListRequest: The asset-list kind.
+    """
+    return domain.AssetListRequest(source='ALPACA', asset_type='stock', status=status)
 
 
 def a_corporate_actions() -> domain.CorporateActionsRequest:

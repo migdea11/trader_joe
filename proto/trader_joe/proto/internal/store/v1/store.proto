@@ -215,13 +215,15 @@ message AssetRecord {
   optional bool tradable = 5;
   // The vendor's venue wording, uninterpreted. Empty when the vendor gave none.
   string exchange = 6;
+  // The vendor's name for the asset (company or fund name). Empty when the vendor gave none.
+  string name = 7;
 }
 
 message CorporateActionRecords {
   repeated CorporateActionRecord records = 1;
 }
 
-// One vendor corporate action, carried RAW. The three dates are the vendor's effective dates; unset when
+// One vendor corporate action, carried RAW. The five dates are the vendor's effective dates; unset when
 // the vendor gave none. The store stamps the receipt time itself.
 message CorporateActionRecord {
   // The vendor's id for the action, opaque.
@@ -235,6 +237,10 @@ message CorporateActionRecord {
   map<string, string> identifiers = 6;
   // The vendor's record as received, byte for byte.
   bytes raw_payload = 7;
+  // The vendor's process and effective dates, beside ex, record and payable. Each is unset when the vendor
+  // gave none: a name change carries process_date only, a stock merger both.
+  google.protobuf.Timestamp process_date = 8;
+  google.protobuf.Timestamp effective_date = 9;
 }
 
 // The vendor calls one attempt made. Counted by ingest. The same shape as ingest.proto's VendorCallStats,

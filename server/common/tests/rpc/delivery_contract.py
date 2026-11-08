@@ -146,6 +146,7 @@ def an_asset(index: int, *, payload_bytes: int = 0, **overrides: object) -> doma
         'active': True,
         'tradable': False,
         'exchange': 'NYSE',
+        'name': f'Company {index} Inc.',
     }
     fields.update(overrides)
     return domain.AssetRecord(**fields)
@@ -167,6 +168,9 @@ def an_action(index: int, **overrides: object) -> domain.CorporateActionRecord:
         'ex_date': WHEN,
         'record_date': WHEN + timedelta(days=1),
         'payable_date': WHEN + timedelta(days=2),
+        # Distinct from each other and from the three above, so a swap or a copy between dates is visible.
+        'process_date': WHEN + timedelta(days=3),
+        'effective_date': WHEN + timedelta(days=4),
         'identifiers': {'cusip': f'92206C{index}', 'isin': f'US92206C{index}'},
         'raw_payload': f'{{"id":"ca-{index}"}}'.encode(),
     }

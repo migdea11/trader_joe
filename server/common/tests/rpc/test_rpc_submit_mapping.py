@@ -17,6 +17,8 @@ message does not carry, or on a value the reflective builder never picks. Those 
 * THE STOPGAP'S REPLACEMENT: tj-7zjov1.13 named the seven messages in ENVELOPE_MESSAGES so the import-time
   totality check held; this bead moves all seven to MESSAGE_MAPPERS, and the guard below is what proves
   none was left behind as envelope-only.
+* AssetListRequest.status IS REQUIRED (tj-7zjov1.105, tj-26jt9w addendum 7 item 9): ACTIVE and INACTIVE
+  each cross as their own value; the zero, and an old sender's missing status, are refused, never defaulted.
 
 Messages are reached through ``fetch_contract.message_class``, never by importing trader_joe.proto (TID251).
 """
@@ -29,6 +31,8 @@ from pydantic import ValidationError
 
 from common.enums.data_stock import Feed
 from common.rpc.mapping import (
+    ASSET_LIST_STATUS,
+    ENUM_MAPPINGS,
     ENVELOPE_MESSAGES,
     MESSAGE_MAPPERS,
     ProtoMappingError,
@@ -530,3 +534,82 @@ def test_an_unset_started_at_is_refused_rather_than_read_as_the_epoch():
     """A process that started in 1970 is no answer to which process is answering."""
     with pytest.raises(ProtoMappingError, match='unset'):
         instance_response_to_domain(InstanceResponseMessage(instance_id='ingest-1'))
+
+
+# ---------------------------------------------------------------------------------------------
+# tj-7zjov1.105 (PR 5 P41, tj-26jt9w addendum 7 item 9): AssetListRequest.status, required
+
+AssetListRequestMessage = message_class('AssetListRequest')
+
+
+@pytest.mark.parametrize('status', list(domain.AssetListStatus), ids=lambda status: status.name)
+def test_each_asset_list_status_survives_both_directions_as_its_own_wire_value(status: domain.AssetListStatus):
+    """ACTIVE and INACTIVE each cross as their own non-zero number and come back as themselves.
+
+    Args:
+        status: Which of the vendor's two lists.
+    """
+    request = an_asset_list(status)
+
+    message = asset_list_request_to_proto(request)
+
+    assert message.status != 0
+    assert (
+        AssetListRequestMessage.DESCRIPTOR.fields_by_name['status'].enum_type.values_by_number[message.status].name
+        == f'ASSET_LIST_STATUS_{status.name}'
+    )
+    assert asset_list_request_to_domain(message) == request
+    assert asset_list_request_to_proto(asset_list_request_to_domain(message)) == message
+
+
+def test_the_two_statuses_are_distinct_on_the_wire():
+    """A mapper that wrote one list's number for both would pass each round trip that only reads its own back."""
+    numbers = {asset_list_request_to_proto(an_asset_list(status)).status for status in domain.AssetListStatus}
+
+    assert len(numbers) == len(domain.AssetListStatus) == 2
+
+
+def test_an_unspecified_asset_list_status_is_refused_by_the_mapper():
+    """The explicit-value rule, as for the feed: a request always names its list, so the zero is refused."""
+    message = asset_list_request_to_proto(an_asset_list())
+    message.status = 0
+
+    with pytest.raises(ProtoMappingError, match='UNSPECIFIED'):
+        asset_list_request_to_domain(message)
+
+
+def test_an_old_senders_asset_list_request_with_no_status_is_refused_not_defaulted():
+    """A sender built before tj-7zjov1.105 writes no status at all; it reads as the zero and is refused.
+
+    Built from the descriptor with only the two fields that existed before, then round-tripped through bytes.
+    """
+    old = AssetListRequestMessage(
+        source=asset_list_request_to_proto(an_asset_list()).source,
+        asset_type=asset_list_request_to_proto(an_asset_list()).asset_type,
+    )
+
+    with pytest.raises(ProtoMappingError, match='UNSPECIFIED'):
+        asset_list_request_to_domain(AssetListRequestMessage.FromString(old.SerializeToString()))
+
+
+def test_the_refusal_reaches_a_whole_submit_of_the_asset_list_kind():
+    """Not only the leaf: a Submit whose asset_list arm names no list is unmappable as a whole."""
+    message = submit_request_to_proto(a_submit(**KINDS[RequestKind.ASSET_LIST]))
+    message.asset_list.status = 0
+
+    with pytest.raises(ProtoMappingError):
+        submit_request_to_domain(message)
+
+
+def test_the_domain_asset_list_request_requires_a_status_and_has_no_unspecified_member():
+    """The twin refuses a missing status too, so no caller can build a request the mapper would have to guess."""
+    assert 'UNSPECIFIED' not in domain.AssetListStatus.__members__
+    with pytest.raises(ValidationError, match='status'):
+        domain.AssetListRequest(source='ALPACA', asset_type='stock')
+
+
+def test_the_asset_list_status_mapping_is_registered_for_the_import_time_totality_check():
+    """ENUM_MAPPINGS is what the package's import-time check and the bijection sweep both walk."""
+    assert ASSET_LIST_STATUS in ENUM_MAPPINGS
+    assert ASSET_LIST_STATUS.descriptor.full_name == f'{INGEST}.AssetListStatus'
+    assert ASSET_LIST_STATUS.python_type is domain.AssetListStatus

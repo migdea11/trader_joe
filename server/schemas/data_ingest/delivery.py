@@ -138,6 +138,8 @@ class AssetRecord(InboundContract):
     tradable: bool | None = None
     # The vendor's venue wording, uninterpreted. Empty when the vendor gave none.
     exchange: str = ''
+    # The vendor's name for the asset. Empty when the vendor gave none.
+    name: str = ''
 
 
 class AssetRecords(InboundContract):
@@ -156,6 +158,8 @@ class CorporateActionRecord(InboundContract):
     ex_date: AwareDatetime | None = None
     record_date: AwareDatetime | None = None
     payable_date: AwareDatetime | None = None
+    process_date: AwareDatetime | None = None
+    effective_date: AwareDatetime | None = None
     # Instrument identifiers the vendor gave, keyed by the vendor's own name.
     identifiers: dict[str, str] = Field(default_factory=dict)
     raw_payload: bytes

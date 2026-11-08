@@ -95,6 +95,7 @@ from common.rpc.mapping.quote import (
     scope_capacity_to_proto,
 )
 from common.rpc.mapping.submit import (
+    ASSET_LIST_STATUS,
     asset_list_request_to_domain,
     asset_list_request_to_proto,
     bars_request_to_domain,
@@ -166,6 +167,7 @@ ENUM_MAPPINGS: Final[tuple[EnumMapping, ...]] = (
     DELIVERY_OUTCOME,
     DELIVERY_ERROR_CLASS,
     DELIVERY_VERDICT,
+    ASSET_LIST_STATUS,
 )
 
 _MAPPERS: Final[tuple[MessageMapper, ...]] = (
@@ -336,6 +338,7 @@ _check_surface()
 
 
 __all__ = [
+    'ASSET_LIST_STATUS',
     'ASSET_TYPE',
     'CONTRACT_FILES',
     'CONTRACT_MESSAGES',

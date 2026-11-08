@@ -23,6 +23,8 @@ rather than letting protobuf raise a ValueError of its own.
 ready_by IS PRESENCE, NOT A VALUE: None is left unset on the wire and decodes back to None, never the epoch.
 """
 
+from typing import Final
+
 from pydantic import BaseModel, ValidationError
 
 from common.enums.data_stock import Feed
@@ -35,6 +37,7 @@ from common.rpc.mapping.values import (
     GRANULARITY,
     UPDATE_TYPE,
     ProtoMappingError,
+    enum_mapping,
     timestamp_field,
     to_timestamp,
 )
@@ -44,6 +47,9 @@ from trader_joe.proto.internal.ingest.v1 import ingest_pb2
 
 
 _FEED_UNSPECIFIED: int = 0
+
+# Required on the wire: to_domain refuses the zero, so a request that names no list is refused.
+ASSET_LIST_STATUS: Final = enum_mapping(ingest_pb2.AssetListStatus.DESCRIPTOR, domain.AssetListStatus)
 
 
 def _built[M: BaseModel](model: type[M], **fields: object) -> M:
@@ -122,7 +128,9 @@ def asset_list_request_to_proto(request: domain.AssetListRequest) -> ingest_pb2.
         ProtoMappingError: If a value cannot be put on the wire.
     """
     return ingest_pb2.AssetListRequest(
-        source=DATA_SOURCE.to_proto(request.source), asset_type=ASSET_TYPE.to_proto(request.asset_type)
+        source=DATA_SOURCE.to_proto(request.source),
+        asset_type=ASSET_TYPE.to_proto(request.asset_type),
+        status=ASSET_LIST_STATUS.to_proto(request.status),
     )
 
 
@@ -136,12 +144,13 @@ def asset_list_request_to_domain(message: ingest_pb2.AssetListRequest) -> domain
         domain.AssetListRequest: The domain request.
 
     Raises:
-        ProtoMappingError: If an enum is unspecified.
+        ProtoMappingError: If an enum is unspecified, the status included.
     """
     return _built(
         domain.AssetListRequest,
         source=DATA_SOURCE.to_domain(message.source),
         asset_type=ASSET_TYPE.to_domain(message.asset_type),
+        status=ASSET_LIST_STATUS.to_domain(message.status),
     )
 
 

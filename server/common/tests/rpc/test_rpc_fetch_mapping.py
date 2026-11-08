@@ -511,6 +511,8 @@ def test_the_unspecified_zero_is_refused_rather_than_decoded(mapping: EnumMappin
         ('trader_joe.proto.internal.ingest.v1.FetchDatasetRequest', 'asset_type'),
         ('trader_joe.proto.internal.ingest.v1.FetchDatasetRequest', 'granularity'),
         ('trader_joe.proto.internal.ingest.v1.FetchDatasetRequest', 'update_type'),
+        # tj-7zjov1.105: an old sender knows no status and sends the zero; it is refused, never guessed at.
+        ('trader_joe.proto.internal.ingest.v1.AssetListRequest', 'status'),
     ],
 )
 def test_a_required_enum_left_unset_makes_the_whole_message_unmappable(message_name: str, field: str):
@@ -620,6 +622,8 @@ def _twins_at(when: datetime) -> dict[type[BaseModel], BaseModel]:
             ex_date=when,
             record_date=when + timedelta(days=1),
             payable_date=when + timedelta(days=2),
+            process_date=when + timedelta(days=3),
+            effective_date=when + timedelta(days=4),
             raw_payload=b'{}',
         ),
         delivery_domain.RegisterInstanceRequest: delivery_domain.RegisterInstanceRequest(
@@ -644,6 +648,23 @@ def test_the_offsets_sweep_drives_every_aware_field_of_every_twin():
     }
 
     assert driven == declared
+
+
+def test_the_offsets_sweep_sets_every_aware_field_it_drives():
+    """The type-level tripwire above passes for a twin whose new date is merely left at its None default.
+
+    A None field crosses the wire as unset and back as None, so it proves nothing about an offset. Every
+    aware field of every twin in the sweep must therefore carry an instant (tj-7zjov1.106: the two
+    corporate-action dates of tj-7zjov1.105 arrived unset in this fixture, and only an AttributeError said so).
+    """
+    unset = [
+        f'{type(model).__name__}.{field}'
+        for model in _twins_at(EPOCH_BASE).values()
+        for field in aware_datetime_fields(type(model))
+        if getattr(model, field) is None
+    ]
+
+    assert not unset, unset
 
 
 @pytest.mark.parametrize('offset', OFFSETS, ids=OFFSET_IDS)

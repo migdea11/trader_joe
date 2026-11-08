@@ -65,7 +65,13 @@ from schemas.data_ingest.delivery import (
     DeliveryVerdict,
 )
 from schemas.data_ingest.fetch_dataset import BarPage
-from schemas.data_ingest.submit import AssetListRequest, BarsRequest, CorporateActionsRequest, SubmitRequest
+from schemas.data_ingest.submit import (
+    AssetListRequest,
+    AssetListStatus,
+    BarsRequest,
+    CorporateActionsRequest,
+    SubmitRequest,
+)
 
 
 pytestmark = pytest.mark.data_ingest
@@ -1039,7 +1045,12 @@ async def test_a_named_feed_the_deployment_serves_is_accepted():
 
 NON_BARS = [
     pytest.param(
-        {'bars': None, 'asset_list': AssetListRequest(source=DataSource.ALPACA_API, asset_type=AssetType.STOCK)},
+        {
+            'bars': None,
+            'asset_list': AssetListRequest(
+                source=DataSource.ALPACA_API, asset_type=AssetType.STOCK, status=AssetListStatus.ACTIVE
+            ),
+        },
         id='asset-list',
     ),
     pytest.param(

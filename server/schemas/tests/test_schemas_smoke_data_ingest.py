@@ -65,6 +65,7 @@ from schemas.data_ingest.get_dataset_request import (
 from schemas.data_ingest.quote import QuoteResult, ScopeCapacity
 from schemas.data_ingest.submit import (
     AssetListRequest,
+    AssetListStatus,
     BarsRequest,
     CorporateActionsRequest,
     InstanceRequest,
@@ -162,7 +163,8 @@ _SERVED_RANGE_PAYLOAD: dict[str, Any] = {'start': WHEN, 'end': WHEN}
 _SCOPE_PAYLOAD: dict[str, Any] = {'quota_key': 'alpaca-a', 'cap': 200, 'remaining': 150, 'window_seconds': 60}
 # The Submit request's bars arm: FetchDatasetRequest's fields minus the envelope (owner).
 _BARS_REQUEST_PAYLOAD: dict[str, Any] = {key: value for key, value in _FETCH_REQUEST_PAYLOAD.items() if key != 'owner'}
-_ASSET_LIST_PAYLOAD: dict[str, Any] = {'source': 'ALPACA', 'asset_type': 'stock'}
+# status is required (tj-7zjov1.105): a request always names which of the vendor's two lists it wants.
+_ASSET_LIST_PAYLOAD: dict[str, Any] = {'source': 'ALPACA', 'asset_type': 'stock', 'status': AssetListStatus.ACTIVE}
 # The SubmitRequest envelope's required fields. A kind arm is required too, by the oneof validator rather
 # than as a field, which is why the model is covered by its own test below.
 _SUBMIT_ENVELOPE: dict[str, Any] = {'request_id': 'request-1', 'owner': 'rebalancer'}
@@ -219,10 +221,10 @@ CONSTRAINT_CASES: list[tuple[type[BaseModel], dict[str, Any], str]] = [
 # valid payload and there is no constraint to violate. Pinned by test_a_fieldless_model_accepts_only_empty.
 FIELDLESS_MODELS: list[type[BaseModel]] = [InstanceRequest, RegisterInstanceResponse]
 
-# Public classes in the package that are NOT Pydantic models. The four here are the StrEnums the
+# Public classes in the package that are NOT Pydantic models. The five here are the StrEnums the
 # contracts name; test_every_known_non_model_is_an_enum keeps the list from hiding a model.
 KNOWN_NON_MODELS: frozenset[str] = frozenset(
-    {'RequestKind', 'DeliveryOutcome', 'DeliveryErrorClass', 'DeliveryVerdict'}
+    {'RequestKind', 'DeliveryOutcome', 'DeliveryErrorClass', 'DeliveryVerdict', 'AssetListStatus'}
 )
 
 # Models the construct/reject PAIR cannot express, each with the dedicated test that covers it

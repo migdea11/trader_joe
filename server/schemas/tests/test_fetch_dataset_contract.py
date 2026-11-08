@@ -58,6 +58,7 @@ from schemas.data_ingest.fetch_dataset import (
 from schemas.data_ingest.quote import QuoteResult, ScopeCapacity
 from schemas.data_ingest.submit import (
     AssetListRequest,
+    AssetListStatus,
     BarsRequest,
     CorporateActionsRequest,
     InstanceRequest,
@@ -487,6 +488,9 @@ NOT_A_TWIN: dict[type, str] = {
     submit.SubmitAccepted: 'domain refinement of FetchAccepted: feed is None for non-bars kinds',
     # Not a message: the arm of SubmitRequest.kind a request sets, which the oneof implies.
     submit.RequestKind: 'enum the SubmitRequest.kind oneof implies',
+    # Not a message: the Python mirror of the AssetListStatus enum (tj-7zjov1.105), whose bijection with the
+    # proto values is checked at import by common/rpc/mapping (ENUM_MAPPINGS) and pinned in common/tests.
+    submit.AssetListStatus: 'mirror of the AssetListStatus proto enum, checked through ENUM_MAPPINGS',
 }
 
 # Proto fields whose twin field is DEFERRED by the same follow-up, and only these. Removing an entry is
@@ -599,7 +603,7 @@ _A_CORPORATE_ACTIONS_REQUEST: dict[str, Any] = {'source': 'ALPACA', 'asset_symbo
 _A_SUBMIT: dict[str, Any] = {
     'request_id': 'request-1',
     'owner': 'rebalancer',
-    'asset_list': AssetListRequest(source='ALPACA', asset_type='stock'),
+    'asset_list': AssetListRequest(source='ALPACA', asset_type='stock', status=AssetListStatus.ACTIVE),
 }
 
 _NAIVE_CASES: list[tuple[type[BaseModel], str, dict[str, Any]]] = [

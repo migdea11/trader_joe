@@ -16,7 +16,12 @@ store messages included, and its offsets sweep covers their aware fields. What i
 * THE STREAM GRAMMAR, as AttemptAssembler enforces it: one header first, payloads of one kind, one trailer
   last and nothing after it.
 * REDELIVERY re-encodes identically, which is what makes the store's (request_id, attempt_no) key safe.
+* THE ADDITIVE FIELDS of tj-7zjov1.105: AssetRecord.name and CorporateActionRecord's process_date and
+  effective_date, each in its own field, each date absent independently, and an old sender's record read
+  with no dates and an empty name.
 """
+
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
@@ -741,3 +746,98 @@ def test_an_asset_record_message_with_nothing_set_decodes_flags_as_none():
     decoded = asset_record_to_domain(AssetRecordMessage())
 
     assert (decoded.active, decoded.tradable) == (None, None)
+
+
+# ---------------------------------------------------------------------------------------------
+# tj-7zjov1.105 (PR 5 P41, tj-26jt9w addendum 7 item 9): AssetRecord.name, CorporateActionRecord's two new dates
+#
+# The reflective round trip in test_rpc_fetch_mapping.py reaches every field by descriptor; these state what
+# it cannot: which date is which, that each is absent independently, and what an old sender's record reads as.
+
+ActionMessage = message_class('CorporateActionRecord')
+
+NEW_DATES = ('process_date', 'effective_date')
+
+
+def test_the_asset_name_survives_both_directions():
+    """The vendor's name crosses as itself, domain to wire to domain and wire to domain to wire."""
+    record = an_asset(1, name='Vanguard S&P 500 Index ETF')
+
+    message = asset_record_to_proto(record)
+
+    assert message.name == 'Vanguard S&P 500 Index ETF'
+    assert asset_record_to_domain(message) == record
+    assert asset_record_to_proto(asset_record_to_domain(message)) == message
+
+
+def test_an_empty_asset_name_stays_empty_rather_than_becoming_none_or_a_placeholder():
+    """535 rows of the vendor's list carry no name (addendum 7 fact e): empty is that state, both ways."""
+    message = asset_record_to_proto(an_asset(1, name=''))
+
+    assert message.name == ''
+    assert asset_record_to_domain(message).name == ''
+
+
+def test_each_new_date_lands_in_its_own_field_and_comes_back_in_it():
+    """A merger carries both dates; distinct instants make a swap or a copy between them visible."""
+    record = an_action(1, action_type='stock_merger')
+    assert record.process_date != record.effective_date
+
+    message = corporate_action_record_to_proto(record)
+
+    assert message.process_date.ToDatetime(tzinfo=UTC) == record.process_date
+    assert message.effective_date.ToDatetime(tzinfo=UTC) == record.effective_date
+    assert corporate_action_record_to_domain(message) == record
+    assert corporate_action_record_to_proto(corporate_action_record_to_domain(message)) == message
+
+
+@pytest.mark.parametrize('absent', NEW_DATES)
+def test_each_new_date_is_absent_independently_of_the_other(absent: str):
+    """A name change carries process_date only (addendum 7 fact d); either may be the missing one.
+
+    Args:
+        absent: The date the vendor gave none of.
+    """
+    (present,) = [date for date in NEW_DATES if date != absent]
+    record = an_action(1, action_type='name_change', **{absent: None})
+
+    message = corporate_action_record_to_proto(record)
+
+    assert not message.HasField(absent), f'{absent} was None and is set on the wire'
+    assert message.HasField(present)
+    decoded = corporate_action_record_to_domain(message)
+    assert getattr(decoded, absent) is None
+    assert getattr(decoded, present) == getattr(record, present)
+    assert decoded == record
+
+
+def test_an_old_senders_records_read_with_no_new_dates_and_an_empty_name():
+    """A sender built before tj-7zjov1.105 writes none of the new fields; its records decode, never guessed at.
+
+    Built from the descriptor with only the fields that existed before, as such a sender's bytes would parse.
+    """
+    old_action = ActionMessage(vendor_action_id='ca-1', action_type='cash_dividend', raw_payload=b'{}')
+    old_action.ex_date.FromDatetime(datetime(2026, 3, 2, tzinfo=UTC))
+    old_asset = AssetRecordMessage(vendor_asset_id='a-1', symbol='VFV', raw_payload=b'{}', exchange='NYSE')
+
+    action = corporate_action_record_to_domain(ActionMessage.FromString(old_action.SerializeToString()))
+    asset = asset_record_to_domain(AssetRecordMessage.FromString(old_asset.SerializeToString()))
+
+    assert (action.process_date, action.effective_date) == (None, None)
+    assert action.ex_date == datetime(2026, 3, 2, tzinfo=UTC)
+    assert asset.name == ''
+    assert asset.symbol == 'VFV'
+
+
+def test_the_new_fields_survive_a_whole_attempt_split_and_assembled():
+    """Through the production splitter and assembler, not only the leaf mappers."""
+    actions = [an_action(0), an_action(1, effective_date=None), an_action(2, process_date=None)]
+    for attempt in (
+        an_attempt(domain.CorporateActionRecords(records=actions)),
+        an_attempt(domain.AssetRecords(records=[an_asset(0), an_asset(1, name='')])),
+    ):
+        assembler = AttemptAssembler()
+        for message in attempt_to_messages(attempt):
+            assembler.feed(message)
+
+        assert records_of(assembler.finish()) == records_of(attempt)

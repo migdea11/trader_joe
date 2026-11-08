@@ -204,6 +204,19 @@ message BarsRequest {
 message AssetListRequest {
   trader_joe.proto.market.v1.DataSource source = 1;
   trader_joe.proto.market.v1.AssetType asset_type = 2;
+
+  // WHICH LIST the request wants, and REQUIRED: the zero value is refused by the mapper, the same
+  // explicit-value rule as the feed, so a request always names one list. The inactive list is large and
+  // is pulled on a slower cadence than the active one (tj-26jt9w addendum 7). An older sender that
+  // knows no such field sends the zero and is refused rather than guessed at.
+  AssetListStatus status = 3;
+}
+
+// Which of the vendor's two asset lists an AssetListRequest asks for.
+enum AssetListStatus {
+  ASSET_LIST_STATUS_UNSPECIFIED = 0;
+  ASSET_LIST_STATUS_ACTIVE = 1;
+  ASSET_LIST_STATUS_INACTIVE = 2;
 }
 
 // Corporate actions for one instrument over an EXPLICIT window. The default window (90 days each side

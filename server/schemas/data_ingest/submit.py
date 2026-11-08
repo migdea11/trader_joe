@@ -56,11 +56,20 @@ class BarsRequest(InboundContract):
     feed: Feed | None = None
 
 
+class AssetListStatus(StrEnum):
+    """Which of the vendor's two asset lists a request wants. There is no member for "unspecified"."""
+
+    ACTIVE = 'active'
+    INACTIVE = 'inactive'
+
+
 class AssetListRequest(InboundContract):
     """The vendor's asset list for one source, as it stands now."""
 
     source: DataSource
     asset_type: AssetType
+    # Required: a request always names which list it wants.
+    status: AssetListStatus
 
 
 class CorporateActionsRequest(InboundContract):

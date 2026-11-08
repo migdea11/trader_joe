@@ -148,6 +148,8 @@ STORE_MESSAGES = {
         ('active', 4, 'TYPE_BOOL', False),
         ('tradable', 5, 'TYPE_BOOL', False),
         ('exchange', 6, 'TYPE_STRING', False),
+        # tj-7zjov1.105 (tj-26jt9w addendum 7 item 9): additive, a new number.
+        ('name', 7, 'TYPE_STRING', False),
     ],
     'CorporateActionRecords': [('records', 1, f'{_STORE}.CorporateActionRecord', True)],
     'CorporateActionRecord': [
@@ -158,6 +160,9 @@ STORE_MESSAGES = {
         ('payable_date', 5, _TS, False),
         ('identifiers', 6, f'{_STORE}.CorporateActionRecord.IdentifiersEntry', True),
         ('raw_payload', 7, 'TYPE_BYTES', False),
+        # tj-7zjov1.105 (tj-26jt9w addendum 7 item 9): additive, new numbers after every existing one.
+        ('process_date', 8, _TS, False),
+        ('effective_date', 9, _TS, False),
     ],
     'VendorCallStats': [
         ('calls', 1, 'TYPE_UINT64', False),
@@ -628,7 +633,12 @@ SUBMIT_SHAPES = {
         ('update_type', 8, f'{MARKET}.UpdateType', False),
         ('feed', 9, f'{MARKET}.Feed', False),
     ],
-    'AssetListRequest': [('source', 1, f'{MARKET}.DataSource', False), ('asset_type', 2, f'{MARKET}.AssetType', False)],
+    'AssetListRequest': [
+        ('source', 1, f'{MARKET}.DataSource', False),
+        ('asset_type', 2, f'{MARKET}.AssetType', False),
+        # tj-7zjov1.105 (tj-26jt9w addendum 7 item 9): additive, required by the mapper (the zero is refused).
+        ('status', 3, f'.{INGEST_PACKAGE}.AssetListStatus', False),
+    ],
     # Both ends and nothing that could default them: no window length, no "days", no default flag.
     'CorporateActionsRequest': [
         ('source', 1, f'{MARKET}.DataSource', False),
@@ -680,6 +690,46 @@ def test_submit_and_instance_messages_have_exactly_the_ruled_fields(name: str):
     declared = messages(file_named(INGEST))
     assert name in declared, f'{name} is not declared in {INGEST}'
     assert [_shape(field) for field in declared[name].field] == SUBMIT_SHAPES[name]
+
+
+# ---------------------------------------------------------------------------------------------------------
+# tj-7zjov1.105 (PR 5 P41, tj-26jt9w addendum 7 item 9): the additive wire change.
+# ---------------------------------------------------------------------------------------------------------
+
+
+def test_asset_list_status_is_exactly_unspecified_active_inactive_by_number():
+    """Which list a request wants: the zero is UNSPECIFIED (refused by the mapper), then the vendor's two lists."""
+    declared = {
+        enum.name: [(value.name, value.number) for value in enum.value] for enum in file_named(INGEST).enum_type
+    }
+
+    assert declared.get('AssetListStatus') == [
+        ('ASSET_LIST_STATUS_UNSPECIFIED', 0),
+        ('ASSET_LIST_STATUS_ACTIVE', 1),
+        ('ASSET_LIST_STATUS_INACTIVE', 2),
+    ], declared
+
+
+def test_asset_record_name_is_a_plain_string_so_empty_means_the_vendor_gave_none():
+    """535 rows of the vendor's list carry no name (addendum 7 fact e); empty is that state, not an optional."""
+    field = _store_field('AssetRecord', 'name')
+
+    assert (field.number, field.type, field.label) == (7, FIELD.TYPE_STRING, FIELD.LABEL_OPTIONAL)
+    assert not field.proto3_optional, 'name is a plain string: empty means the vendor gave none'
+
+
+@pytest.mark.parametrize(('name', 'number'), [('process_date', 8), ('effective_date', 9)])
+def test_the_new_corporate_action_dates_are_timestamp_messages_so_unset_is_not_the_epoch(name: str, number: int):
+    """A name change carries process_date only; a message field has presence, so the missing date stays missing.
+
+    Args:
+        name: One of the two new dates.
+        number: Its field number.
+    """
+    field = _store_field('CorporateActionRecord', name)
+
+    assert (field.number, field.type, field.type_name) == (number, FIELD.TYPE_MESSAGE, _TS)
+    assert field.label != FIELD.LABEL_REPEATED
 
 
 def test_ready_by_is_a_timestamp_message_so_unset_is_distinguishable_from_the_epoch():
