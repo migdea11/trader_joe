@@ -64,7 +64,7 @@ export interface WriteOptions {
   signal?: AbortSignal
 }
 
-async function send(method: 'PATCH' | 'DELETE', path: string, options: WriteOptions): Promise<Response> {
+async function send(method: 'POST' | 'PATCH' | 'DELETE', path: string, options: WriteOptions): Promise<Response> {
   let response: Response
   try {
     response = await fetch(`${API_BASE}${path}`, {
@@ -83,6 +83,25 @@ async function send(method: 'PATCH' | 'DELETE', path: string, options: WriteOpti
   }
   if (!response.ok) throw await apiErrorFromResponse(response)
   return response
+}
+
+/**
+ * POST `path` (under API_BASE) with a JSON body and decode the 2xx body (201 for a panel write) as
+ * `schema`'s message.
+ *
+ * @throws ApiError as getMessage does.
+ */
+export async function postMessage<Desc extends DescMessage>(
+  schema: Desc,
+  path: string,
+  options: WriteOptions = {},
+): Promise<MessageShape<Desc>> {
+  const response = await send('POST', path, options)
+  try {
+    return fromJson(schema, await response.json(), { ignoreUnknownFields: true })
+  } catch {
+    throw new ApiError({ status: response.status, reason: 'MALFORMED_RESPONSE' })
+  }
 }
 
 /**

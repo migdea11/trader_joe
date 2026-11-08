@@ -288,7 +288,7 @@ describe('titleCase', () => {
   })
 
   it('the unit-checked string table: tabs, sections and sub-tabs are title case', () => {
-    expect(DATA_TABS).toEqual(['Datasets', 'Requests', 'Health', 'Usage'])
+    expect(DATA_TABS).toEqual(['Datasets', 'Panels', 'Requests', 'Health', 'Usage'])
     for (const label of [...DATA_TABS, ...SECTIONS.map((s) => s.label), ...DATA_SUB_TABS.map((t) => t.label)]) {
       expect(isTitleCase(label), label).toBe(true)
     }

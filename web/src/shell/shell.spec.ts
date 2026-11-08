@@ -50,6 +50,8 @@ const mocks = vi.hoisted(() => ({
   getReadsPerDay: vi.fn(),
   getStaleDatasets: vi.fn(),
   getStorageCurrent: vi.fn(),
+  // The Panels tab (tj-7zjov1.37) reads its selector on mount; it stays pending here.
+  listPanels: vi.fn(),
 }))
 // The shell opens the shared events socket on mount (tj-grna9p.76): replaced so no real WebSocket opens.
 vi.mock('@/api/events', async (importOriginal) =>
@@ -97,6 +99,7 @@ beforeEach(() => {
   for (const usage of [mocks.getUsageSummary, mocks.getLastReadBuckets, mocks.getReadsPerDay, mocks.getStaleDatasets, mocks.getStorageCurrent]) {
     usage.mockReturnValue(new Promise(() => undefined))
   }
+  mocks.listPanels.mockReturnValue(new Promise(() => undefined))
   mocks.listDatasets.mockResolvedValue({ items: [], nextCursor: '' })
 })
 
@@ -495,31 +498,57 @@ describe('sections and sub-tabs not built yet', () => {
     expect(router.currentRoute.value.path).toBe('/data/datasets')
   })
 
-  // tj-grna9p.62 built the Usage tab: it links now; Requests and Health stay disabled in place.
-  it('Requests and Health are disabled in place; Usage links; Datasets links and stays active under the Viewer', async () => {
+  // tj-grna9p.62 built the Usage tab and tj-7zjov1.37 the Panels tab (second, after Datasets): both link;
+  // Requests and Health stay disabled in place.
+  it('Requests and Health are disabled in place; Panels and Usage link; Datasets links and stays active under the Viewer', async () => {
     await router.push('/data/datasets/abc/viewer')
     const tabs = mountWith(DataSubTabs)
     const all = tabs.findAll('.sub-tabs__tab')
-    expect(all.map((t) => t.text())).toEqual(['Datasets', 'Requests', 'Health', 'Usage'])
-    expect(all.slice(1, 3).map((t) => [t.attributes('aria-disabled'), t.attributes('title')])).toEqual([
+    expect(all.map((t) => t.text())).toEqual(['Datasets', 'Panels', 'Requests', 'Health', 'Usage'])
+    expect(all.slice(2, 4).map((t) => [t.attributes('aria-disabled'), t.attributes('title')])).toEqual([
       ['true', 'Not built yet'],
       ['true', 'Not built yet'],
     ])
-    const usage = all[3]!
-    expect(usage.attributes('aria-disabled')).toBeUndefined()
-    expect(usage.attributes('title')).toBeUndefined()
-    expect(usage.attributes('href')).toBe('/data/usage')
-    expect(usage.attributes('aria-current')).toBeUndefined()
+    for (const [index, href] of [
+      [1, '/data/panels'],
+      [4, '/data/usage'],
+    ] as const) {
+      const tab = all[index]!
+      expect(tab.attributes('aria-disabled'), href).toBeUndefined()
+      expect(tab.attributes('title'), href).toBeUndefined()
+      expect(tab.attributes('href')).toBe(href)
+      expect(tab.attributes('aria-current'), href).toBeUndefined()
+    }
     expect(all[0]!.attributes('aria-current')).toBe('page')
   })
 
   it('the Usage tab is the current page on /data/usage, and following it from Datasets opens it', async () => {
     await router.push('/data/datasets')
     const tabs = mountWith(DataSubTabs)
-    await tabs.findAll('.sub-tabs__tab')[3]!.trigger('click')
+    await tabs.findAll('.sub-tabs__tab')[4]!.trigger('click')
     await flushPromises()
     expect(router.currentRoute.value.name).toBe('data-usage')
-    expect(tabs.findAll('.sub-tabs__tab')[3]!.attributes('aria-current')).toBe('page')
+    expect(tabs.findAll('.sub-tabs__tab')[4]!.attributes('aria-current')).toBe('page')
+  })
+
+  it('the Panels tab is the current page on /data/panels, and following it from Datasets opens it', async () => {
+    await router.push('/data/datasets')
+    const tabs = mountWith(DataSubTabs)
+    await tabs.findAll('.sub-tabs__tab')[1]!.trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value.name).toBe('data-panels')
+    expect(router.currentRoute.value.path).toBe('/data/panels')
+    expect(tabs.findAll('.sub-tabs__tab')[1]!.attributes('aria-current')).toBe('page')
+    expect(tabs.findAll('.sub-tabs__tab')[0]!.attributes('aria-current')).toBeUndefined()
+  })
+
+  it('a typed URL /data/panels shows the Panels screen, not the placeholder', async () => {
+    await router.push('/data/panels')
+    const shell = mountWith(AppShell)
+    await flushPromises()
+    expect(shell.find('main h1').text()).toBe('Panels')
+    expect(shell.find('main').text()).not.toContain('Not built yet')
+    expect(mocks.listPanels).toHaveBeenCalled()
   })
 
   it('a typed URL /data/usage shows the Usage screen and its sidebar, not the placeholder', async () => {

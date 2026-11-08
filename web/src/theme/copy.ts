@@ -49,9 +49,24 @@ export function isTitleCase(text: string): boolean {
 }
 
 // The Data section's tab names, which are also the exact page titles.
-export const DATA_TABS = ['Datasets', 'Requests', 'Health', 'Usage'] as const
+export const DATA_TABS = ['Datasets', 'Panels', 'Requests', 'Health', 'Usage'] as const
 export type DataTab = (typeof DATA_TABS)[number]
 
 // The unit the coverage text counts in: "248/250 sessions". A session is one trading day of the
 // dataset's calendar, the unit completeness is counted in. One constant so the word can change.
 export const COVERAGE_UNIT = 'sessions'
+
+// What a refused panel write says (tj-7zjov1.246). Fixed per route: the store's detail is never copied
+// into the page (tj-fa1rpu D8), so the words come from here, and from a re-read of what changed.
+export const PANEL_REFUSAL = {
+  nameTaken: (name: string): string => `A panel named "${name}" already exists. Choose another name.`,
+  createNameTakenSince: (name: string): string =>
+    `A panel named "${name}" was created in the meantime, so nothing was created. Choose another name.`,
+  createSourceHasSettings:
+    'This source has settings now, so nothing was created. Its settings fields are gone: check the form and create again.',
+  create: 'The store refused the panel, so nothing was created. Check the fields.',
+  settingsMoved: 'This panel\'s settings changed in the meantime, so nothing was saved. The page shows the current settings.',
+  settings: 'The store refused these settings, so nothing was saved. Check the fields.',
+  sourceMoved: 'These source settings changed in the meantime, so nothing was saved. The page shows the current settings.',
+  source: 'The store refused these source settings, so nothing was saved. Check the fields.',
+} as const

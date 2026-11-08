@@ -347,3 +347,49 @@ describe('the collecting PATCH through the real dev server', () => {
     ])
   })
 })
+
+// tj-7zjov1.37 / tj-7zjov1.169: the three panel POSTs reach data_store stripped, with the dev server's secret
+// in place of the browser's; every other method on those paths, and a POST near them, is the dev server's 404.
+describe('the panel POSTs through the real dev server', () => {
+  const PANELS = '/api/store/ui/v1/panels'
+  const SOURCE_SETTINGS = '/api/store/ui/v1/panel-sources/DATA_SOURCE_ALPACA_API/settings-versions'
+
+  it.each([
+    ['create', PANELS, '/ui/v1/panels'],
+    ['settings', `${PANELS}/${UUID}/settings-versions`, `/ui/v1/panels/${UUID}/settings-versions`],
+    ['source settings', SOURCE_SETTINGS, '/ui/v1/panel-sources/DATA_SOURCE_ALPACA_API/settings-versions'],
+  ])('forwards the %s POST, stripped, with the dev server secret in place of the browser one', async (_name, path, upstreamPath) => {
+    const reply = await send('POST', path, { 'x-instance-secret': 'browser-sent', 'content-type': 'application/json' })
+    expect(reply.status).toBe(200)
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toMatchObject({ method: 'POST', url: upstreamPath })
+    expect(seen[0].headers['x-instance-secret']).toBe(FAKE)
+  })
+
+  it.each([
+    ['PUT', PANELS],
+    ['PATCH', `${PANELS}/${UUID}/settings-versions`],
+    ['DELETE', SOURCE_SETTINGS],
+    ['POST', `${PANELS}/`],
+    ['POST', `${PANELS}/${UUID}`],
+    ['POST', `${PANELS}/${UUID}/members`],
+    ['POST', `${PANELS}/not-a-uuid/settings-versions`],
+    ['POST', '/api/store/ui/v1/panel-sources/ALPACA_API/settings-versions'],
+    ['POST', '/api/store/ui/v1/panel-sources/data_source_alpaca_api/settings-versions'],
+    ['POST', `${SOURCE_SETTINGS}/`],
+  ])('answers %s %s 404 not found itself, data_store never asked', async (method, path) => {
+    const reply = await send(method, path, { 'x-instance-secret': 'browser-sent' })
+    expect(reply).toMatchObject({ status: 404, body: 'not found' })
+    expect(seen).toEqual([])
+  })
+
+  it.each([
+    `${PANELS}/${UUID}%2Fsettings-versions`,
+    `${PANELS}//settings-versions`,
+    `${PANELS}/x/../${UUID}/settings-versions`,
+  ])('answers POST %s 400, data_store never asked', async (path) => {
+    const reply = await send('POST', path, { 'x-instance-secret': 'browser-sent' })
+    expect(reply).toMatchObject({ status: 400, body: 'bad request' })
+    expect(seen).toEqual([])
+  })
+})

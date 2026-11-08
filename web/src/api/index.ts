@@ -46,6 +46,27 @@ export type {
   UiEventMessage,
   WebSocketFactory,
 } from './events'
+export {
+  createPanel,
+  dataSourceRouteName,
+  getAssetListHistory,
+  getCorporateActions,
+  getPanel,
+  getPanelBoundaries,
+  getPanelMembers,
+  getPanelSettingsVersions,
+  getSourceSettingsVersions,
+  listPanels,
+  savePanelSettings,
+  saveSourceSettings,
+} from './panels'
+export type {
+  CreatePanelParams,
+  PageParams,
+  SavePanelSettingsParams,
+  SaveSourceSettingsParams,
+  WindowParams,
+} from './panels'
 export { getLastReadBuckets, getStaleDatasets, getStorageCurrent, getUsageSummary } from './usageStats'
 export type { GetStaleParams, UsageStatsParams } from './usageStats'
 export { ApiError,apiErrorFromResponse } from './errors'
