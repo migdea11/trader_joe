@@ -57,9 +57,20 @@ WHAT EACH TEST PINS:
       edge at exactly 60 minutes after the CREATED's recorded_at on the app clock.
   PM6 the request window likewise, on the clamp request's created_at.
   PM7 a filter exit: EXITED; collect stays true while another enabled panel on the source still selects the symbol,
-      and goes false (stopped_cause NULL, RETIRED published) when none does.
-  PM8 a delisting: DRAINING, held while no fetch finished since (fetch_finished_since), DRAINED and collect false once
-      one has.
+      and goes false (stopped_cause PANEL_MEMBER_LEFT since P22r, RETIRED published) when none does.
+  PM8 a delisting: DRAINING, held while no fetch finished since (fetch_finished_since), DRAINED and collect false
+      (stopped_cause PANEL_MEMBER_LEFT) once one has.
+  PM9 the re-entry restart (P22r tj-7zjov1.264, ADR tj-26jt9w addendum 23 rule A; validator P22rv tj-7zjov1.265):
+      three members exit (each entry stopped PANEL_MEMBER_LEFT, the CHECK ck_store_dataset_entry_stopped_cause_needs_stop
+      holding on Postgres) and re-enter. a (last accepted vendor id its own) is resumed: from the observer connection
+      neither the guarded UPDATE nor its ENTERED row (dataset_id, cause dataset_resumed) is visible before the pass's
+      commit, both after it, and RESUMED is published only once the resumed row is committed. b (last accepted vendor
+      id another's: a reused symbol) stays stopped with a plain ENTERED. c is stopped and resumed by an operator on
+      another connection between the pass's read and its guarded UPDATE: the UPDATE matches nothing on READ
+      COMMITTED, c's ENTERED is plain and the operator's row stands.
+
+  The PM1 and PM3 idle_in_transaction checks carry a positive control (tj-7zjov1.262 change (A)): at each clamp at
+  least one connection is listed under the engine's application_name, so their zero is not vacuous.
 
 ISOLATION. Every symbol is this test's own (own_symbol plus a letter); panel names carry the run id; the source
 settings versions, panels, settings versions, passes, transitions, snapshots and rows this test wrote are deleted by
@@ -160,6 +171,8 @@ QUOTA_KEY = 'system-test-quota-key'
 # The process date of the rename away from a symbol that the clamp query answers with (PM1, PM2).
 RENAMED_ON = datetime(2022, 6, 9, tzinfo=UTC)
 MICRO = timedelta(microseconds=1)
+# The manager's stop mark, as the column stores it (tj-7zjov1.264).
+LEFT = 'PANEL_MEMBER_LEFT'
 _REAL_CALENDAR_FOR_SOURCE = calendar_for_source
 
 
@@ -266,6 +279,9 @@ class ClampSeen:
 
     symbol: str
     idle_in_transaction: int
+    # The positive control for idle_in_transaction (tj-7zjov1.262 change (A)): the manager engine's connections that
+    # pg_stat_activity lists under its application_name at all. Zero would make idle_in_transaction == 0 vacuous.
+    app_connections: int
     membership_passes: int
     release_passes: int
     created_rows: int
@@ -581,6 +597,13 @@ class World:
                 {'name': self.app_name},
             ).scalar_one()
 
+    def app_connections(self) -> int:
+        """How many connections pg_stat_activity lists under the manager engine's application_name, in any state."""
+        with self.observer.connect() as conn:
+            return conn.execute(
+                sa.text('SELECT count(*) FROM pg_stat_activity WHERE application_name = :name'), {'name': self.app_name}
+            ).scalar_one()
+
     def passes(self, panel: PanelUnderTest, kind: PanelPassKind | None = None) -> list[sa.Row]:
         statement = sa.select(PASSES).where(PASSES.c.panel_id == panel.id)
         if kind is not None:
@@ -655,6 +678,7 @@ class World:
             ClampSeen(
                 symbol=symbol,
                 idle_in_transaction=self.idle_in_transaction(),
+                app_connections=self.app_connections(),
                 membership_passes=self._panel_passes(PanelPassKind.MEMBERSHIP),
                 release_passes=self._panel_passes(PanelPassKind.RELEASE),
                 created_rows=self._transitions_of(PanelTransition.CREATED),
@@ -907,6 +931,8 @@ async def test_pm1_a_membership_pass_on_asyncpg_commits_entered_created_and_its_
     # While each clamp waited, NO manager connection was idle inside a transaction, and the pass row was committed.
     assert [seen.symbol for seen in world.clamps] == [a.symbol, b.symbol]
     assert all(seen.idle_in_transaction == 0 for seen in world.clamps), world.clamps
+    # The zero above means something only if the filter matches: the clamp's own session is open while it waits.
+    assert all(seen.app_connections >= 1 for seen in world.clamps), 'application_name never reached pg_stat_activity'
     assert all(seen.membership_passes == 1 for seen in world.clamps), 'the pass row was not committed before a clamp'
     assert (world.clamps[0].created_rows, world.clamps[0].bars_requests) == (0, 0)
     assert (world.clamps[1].created_rows, world.clamps[1].bars_requests) == (1, 1), "a's commit landed before b's clamp"
@@ -1022,6 +1048,7 @@ async def test_pm3_a_release_pass_row_opens_lazily_and_commits_with_created_and_
     (release,) = world.passes(panel, PanelPassKind.RELEASE)
     (seen_at_clamp,) = world.clamps
     assert seen_at_clamp.release_passes == 0 and seen_at_clamp.idle_in_transaction == 0, seen_at_clamp
+    assert seen_at_clamp.app_connections >= 1, 'application_name never reached pg_stat_activity'
     (creation,) = world.creations
     assert (creation.before.release_passes, creation.before.created_rows, creation.before.request_rows) == (0, 0, 0)
     assert (creation.after.release_passes, creation.after.created_rows, creation.after.request_rows) == (1, 1, 1)
@@ -1202,7 +1229,8 @@ async def test_pm7_a_filter_exit_stops_the_entry_only_when_no_enabled_panel_stil
 
     assert _kinds(world.transitions(other))[-1] == (b.symbol, PanelTransition.EXITED)
     entries = world.entries(a, b)
-    assert entries[b.symbol].collect is False and entries[b.symbol].stopped_cause is None
+    # A manager stop is marked PANEL_MEMBER_LEFT in the same UPDATE (P22r tj-7zjov1.264, addendum 23 rule A (1)).
+    assert (entries[b.symbol].collect, entries[b.symbol].stopped_cause) == (False, LEFT)
     assert entries[a.symbol].collect is True
     assert [call.result for call in world.called('stop_collecting')] == [True]
     assert world.published == [DatasetChanged(entries[b.symbol].id, DatasetChange.RETIRED)]
@@ -1252,5 +1280,142 @@ async def test_pm8_a_delisted_member_drains_until_a_fetch_finishes_then_its_entr
     assert world.transitions(panel)[-1].transition is PanelTransition.DRAINED
     assert world.called('fetch_finished_since')[-1].result is True
     after = world.entries(a)[a.symbol]
-    assert after.collect is False and after.stopped_cause is None
+    assert (after.collect, after.stopped_cause) == (False, LEFT), 'a DRAINED stop is a manager stop: marked'
     assert world.published == [DatasetChanged(entry.id, DatasetChange.RETIRED)]
+
+
+# --------------------------------------------------------------------------------------------- PM9
+
+
+@dataclass(frozen=True)
+class Restart:
+    """What the observer connection saw of one entry and its panel's ENTERED rows at one point of the pass."""
+
+    at: str
+    collect: bool | None
+    stopped_cause: str | None
+    resumed_entered_rows: int
+
+
+async def test_pm9_a_re_entry_restarts_a_manager_stopped_entry_in_the_commit_of_its_entered_row(world):
+    a, b, c = world.asset('A'), world.asset('B'), world.asset('C')
+    # d is never listed: a version allowing only d selects none of a, b, c, so all three are filter exits.
+    d = world.asset('D')
+    await world.source_settings(ramp=10, cap=100)
+    panel = await world.panel('pm9', [a, b, c])
+    await world.snapshot([a, b, c])
+    await world.tick()
+
+    # b's bars are delivered under ANOTHER vendor asset id: its last accepted id is not b's member id (a reused symbol).
+    world.vendor_of[b.symbol] = f'{b.vendor_asset_id}-other-holder'
+    await world.deliver_bars()
+    entries = world.entries(a, b, c)
+    assert all(entry.collect is True and entry.stopped_cause is None for entry in entries.values())
+    ids = {symbol: entry.id for symbol, entry in entries.items()}
+
+    # All three exit: each entry stopped by the manager, marked in the same UPDATE.
+    await world.new_version(panel, [d])
+    await world.next_membership_pass([panel], [a, b, c])
+    await world.tick()
+
+    stopped = world.entries(a, b, c)
+    assert {s: (e.collect, e.stopped_cause) for s, e in stopped.items()} == dict.fromkeys(ids, (False, LEFT))
+    assert sorted(call.result for call in world.called('stop_collecting')) == [True] * 3
+    # The CHECK holds on Postgres: a cause on a collecting row is refused.
+    with pytest.raises(sa.exc.IntegrityError), world.observer.begin() as conn:
+        conn.execute(sa.update(ENTRIES).where(ENTRIES.c.id == ids[a.symbol]).values(collect=True))
+
+    # Observe a's entry and the panel's resumed ENTERED rows from the second connection at each step of the next pass.
+    seen: list[Restart] = []
+
+    def observe(at: str) -> None:
+        (row,) = world.rows(sa.select(ENTRIES).where(ENTRIES.c.id == ids[a.symbol]))
+        resumed = world._count(
+            sa.select(sa.func.count())
+            .select_from(TRANSITIONS)
+            .where(
+                TRANSITIONS.c.panel_id == panel.id,
+                TRANSITIONS.c.transition == PanelTransition.ENTERED,
+                TRANSITIONS.c.dataset_id.is_not(None),
+            )
+        )
+        seen.append(Restart(at, row.collect, row.stopped_cause, resumed))
+
+    mp = world.monkeypatch
+    real_vendor = panel_manager.last_accepted_vendor_asset_id
+
+    async def vendor_then_operator(db, dataset_id):
+        if dataset_id == ids[c.symbol]:
+            # An operator Resume then Stop of c, committed on another connection between the pass's read of c
+            # (collect false, PANEL_MEMBER_LEFT) and its guarded UPDATE: c is now collect false with NO cause.
+            with world.observer.begin() as conn:
+                conn.execute(
+                    sa.update(ENTRIES).where(ENTRIES.c.id == dataset_id).values(collect=False, stopped_cause=None)
+                )
+        return await real_vendor(db, dataset_id)
+
+    mp.setattr(panel_manager, 'last_accepted_vendor_asset_id', vendor_then_operator)
+
+    resumes: list[tuple[uuid.UUID, bool]] = []
+    real_resume = panel_manager.resume_panel_entry
+
+    async def resume(db, dataset_id):
+        flipped = await real_resume(db, dataset_id)
+        resumes.append((dataset_id, flipped))
+        if dataset_id == ids[a.symbol]:
+            observe('after the guarded UPDATE, before the commit')
+        return flipped
+
+    mp.setattr(panel_manager, 'resume_panel_entry', resume)
+
+    real_finish = panel_manager.finish_pass
+
+    async def finish(db, pass_id, counts):
+        observe('at finish_pass, before the commit')
+        return await real_finish(db, pass_id, counts)
+
+    mp.setattr(panel_manager, 'finish_pass', finish)
+
+    published_seen: list[tuple[Any, Restart]] = []
+
+    def publish(event) -> None:
+        observe(f'at publish {event.change.name}')
+        published_seen.append((event, seen[-1]))
+
+    mp.setattr(panel_manager, 'publish', publish)
+
+    # They re-enter.
+    await world.new_version(panel, [a, b, c])
+    await world.next_membership_pass([panel], [a, b, c])
+    await world.tick()
+
+    # a: never visible half done; resumed and named by its ENTERED row together, at the commit.
+    assert seen[:2] == [
+        Restart('after the guarded UPDATE, before the commit', False, LEFT, 0),
+        Restart('at finish_pass, before the commit', False, LEFT, 0),
+    ], seen
+    assert published_seen == [
+        (DatasetChanged(ids[a.symbol], DatasetChange.RESUMED), Restart('at publish RESUMED', True, None, 1))
+    ], 'RESUMED must be published once, for a, after its commit'
+    # The guarded UPDATE ran for a (flipped) and c (matched nothing: the operator's write won), never for b.
+    assert resumes == [(ids[a.symbol], True), (ids[c.symbol], False)], resumes
+
+    entered = {row.symbol: row for row in world.transitions(panel)[-3:]}
+    assert set(entered) == {a.symbol, b.symbol, c.symbol}
+    assert all(row.transition is PanelTransition.ENTERED for row in entered.values())
+    assert (entered[a.symbol].dataset_id, entered[a.symbol].cause) == (
+        ids[a.symbol],
+        panel_manager.CAUSE_DATASET_RESUMED,
+    )
+    assert (entered[b.symbol].dataset_id, entered[b.symbol].cause) == (None, None), 'a reused symbol was resumed'
+    assert (entered[c.symbol].dataset_id, entered[c.symbol].cause) == (None, None), 'the operator race named c'
+
+    after = world.entries(a, b, c)
+    assert (after[a.symbol].collect, after[a.symbol].stopped_cause) == (True, None)
+    assert (after[b.symbol].collect, after[b.symbol].stopped_cause) == (False, LEFT)
+    assert (after[c.symbol].collect, after[c.symbol].stopped_cause) == (False, None), (
+        "the operator's row was overwritten"
+    )
+    assert after[a.symbol].updated_at > stopped[a.symbol].updated_at
+    # A restart writes no request: the gap is the DAILY refresh's.
+    assert len(world.requests(a, b, c, kind=IngestRequestKind.BARS)) == 3

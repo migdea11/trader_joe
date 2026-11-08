@@ -1,7 +1,9 @@
-"""The reads and the one stop the panel manager needs besides the ledger and the settings (tj-7zjov1.34, P22).
+"""The reads and the two writes the panel manager needs besides the ledger and the settings (tj-7zjov1.34, P22).
 
-THE PANEL TABLES ARE ONLY READ HERE. The one write is stop_collecting, an UPDATE of a dataset entry's collect intent;
-it never commits, so it lands in the pass's transaction at the next commit. Nothing here touches stopped_cause.
+THE PANEL TABLES ARE ONLY READ HERE. The writes are stop_collecting and resume_panel_entry, UPDATEs of a dataset
+entry's collect intent (tj-7zjov1.264, ADR tj-26jt9w addendum 23); neither commits, so each lands in the pass's
+transaction at the next commit. stop_collecting marks its stop with stopped_cause PANEL_MEMBER_LEFT and
+resume_panel_entry clears exactly that mark.
 """
 
 import uuid
@@ -14,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.enums.data_stock import DataSource, Granularity, UpdateType
 from data.store.app.database.models.panel import PanelMemberTransition, PanelPass, PanelPassKind, PanelTransition
-from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
+from data.store.app.database.models.store_dataset_entry import DatasetStopCause, StoreDatasetEntry
 
 
 _ENTRY = StoreDatasetEntry.__table__
@@ -32,6 +34,8 @@ class PanelEntry:
     id: uuid.UUID
     symbol: str
     collect: bool | None
+    # Why the store stopped it (DatasetStopCause value), None when it did not.
+    stopped_cause: str | None = None
 
 
 @dataclass(frozen=True)
@@ -60,7 +64,7 @@ async def panel_entries(
     names = sorted(set(symbols))
     for start in range(0, len(names), ID_CHUNK):
         rows = await db.execute(
-            select(_ENTRY.c.id, _ENTRY.c.asset_symbol, _ENTRY.c.collect)
+            select(_ENTRY.c.id, _ENTRY.c.asset_symbol, _ENTRY.c.collect, _ENTRY.c.stopped_cause)
             .where(
                 _ENTRY.c.source == source,
                 _ENTRY.c.owner == owner,
@@ -72,12 +76,17 @@ async def panel_entries(
         )
         for row in rows:
             # Ordered newest first, so the last write per symbol is the oldest entry.
-            found[row.asset_symbol] = PanelEntry(id=row.id, symbol=row.asset_symbol, collect=row.collect)
+            found[row.asset_symbol] = PanelEntry(
+                id=row.id, symbol=row.asset_symbol, collect=row.collect, stopped_cause=row.stopped_cause
+            )
     return found
 
 
 async def stop_collecting(db: AsyncSession, dataset_id: uuid.UUID) -> bool:
-    """Set collect false on a collecting entry. Never commits and never writes stopped_cause.
+    """Set collect false on a collecting entry, marking the stop PANEL_MEMBER_LEFT. Never commits.
+
+    The manager's only stop (filter exit, DRAINED, late mint), so every manager stop carries the mark that lets a
+    re-entry tell it from an operator's stop (cause NULL) and the vendor-id stop (VENDOR_ASSET_CHANGED).
 
     Returns:
         bool: True when the entry was collecting and is now stopped.
@@ -85,7 +94,28 @@ async def stop_collecting(db: AsyncSession, dataset_id: uuid.UUID) -> bool:
     result = await db.execute(
         update(_ENTRY)
         .where(_ENTRY.c.id == dataset_id, _ENTRY.c.collect.is_(True))
-        .values(collect=False, updated_at=func.now())
+        .values(collect=False, stopped_cause=DatasetStopCause.PANEL_MEMBER_LEFT.value, updated_at=func.now())
+    )
+    return result.rowcount == 1
+
+
+async def resume_panel_entry(db: AsyncSession, dataset_id: uuid.UUID) -> bool:
+    """Set collect true and clear the cause on an entry the manager stopped. Never commits.
+
+    Guarded on collect false AND stopped_cause PANEL_MEMBER_LEFT, so an operator's write in between (a Resume, which
+    clears the cause, or a repeat Stop that left it) is never overwritten.
+
+    Returns:
+        bool: True when the entry was manager-stopped and now collects again.
+    """
+    result = await db.execute(
+        update(_ENTRY)
+        .where(
+            _ENTRY.c.id == dataset_id,
+            _ENTRY.c.collect.is_(False),
+            _ENTRY.c.stopped_cause == DatasetStopCause.PANEL_MEMBER_LEFT.value,
+        )
+        .values(collect=True, stopped_cause=None, updated_at=func.now())
     )
     return result.rowcount == 1
 

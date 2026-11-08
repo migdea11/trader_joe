@@ -29,8 +29,9 @@ creation ruling).
       rollback; a repeat clamp failure writes no pass row but still writes the clamp's own request;
   P8  the in-flight skip: an open panel BARS-without-dataset or CORPORATE_ACTIONS request for the symbol sends nothing;
   P9  exits: a filter exit EXITED, collect false only when no enabled panel on the source selects the symbol; a
-      vanished member EXITED with no entry, DRAINING with one, DRAINED after a fetch, collect false; stopped_cause is
-      never written, and an entry carrying one is never requested or set collecting; the late mint stops collecting;
+      vanished member EXITED with no entry, DRAINING with one, DRAINED after a fetch, collect false; every manager stop
+      (filter exit, DRAINED, the late mint) writes stopped_cause PANEL_MEMBER_LEFT (P22r), and an entry the vendor-id
+      rule stopped is never requested or set collecting; the late mint stops collecting;
   P10 the as_of rule: an exit is dated by the first snapshot showing it under the same settings version, by this pass's
       snapshot under a new one; a row-attribute flip is dated from the rows; ENTERED likewise, an in-flight-skipped
       one included (16c), except a size-cut entrant, dated by this pass's snapshot (16a); CREATED keeps the pass's;
@@ -41,8 +42,15 @@ creation ruling).
       (tj-7zjov1.229) only FINISHED passes satisfy the due rule and give the as_of baseline, an unfinished one holds the
       panel off for UNFINISHED_PASS_RETRY (not its release), one WARNING per unfinished pass, id only;
   P14 the manager requests no asset list and no daily bars, and never names the awaiting or committing helpers;
-  P15 re-entry as built (NOT RULED by the owner; recorded on the verdict note): a member that exited and whose entry
-      the exit stopped re-enters with ENTERED and no request, and its entry stays stopped.
+  P15 re-entry restart (P22r tj-7zjov1.264, ADR tj-26jt9w addendum 23 rule A, owner ruling 2026-11-02; validator
+      P22rv tj-7zjov1.265): in a MEMBERSHIP pass a member decided ENTERED whose symbol's panel entry is collect false
+      AND stopped_cause PANEL_MEMBER_LEFT AND whose last accepted vendor asset id is empty or the member's is resumed
+      (collect true, cause NULL) in the commit of its ENTERED row, which names the entry with cause dataset_resumed;
+      RESUMED is published after that commit and never on a rollback; whatever the previous transition (none, EXITED,
+      DRAINED), a first entry into a second panel included. NOT resumed: a different vendor id, an operator stop (cause
+      NULL, also when it came before the manager's), a vendor stop (VENDOR_ASSET_CHANGED), an operator write racing
+      the pass (plain ENTERED), a RELEASE pass, a dry run (the decision recorded, nothing changed or published). The
+      guarded UPDATE itself is pinned directly on resume_panel_entry.
 
 NOT HERE (system tier): the same statements on Postgres (asyncpg, ARRAY and JSONB, enum casts), database time on the
 windows under real concurrency, the real first_request_clamp and submit_record against ingest.
@@ -59,18 +67,20 @@ from data.store.app import panel_manager
 from data.store.app.client_label import PANEL_OWNER
 from data.store.app.database.crud.dataset_override import AuditUnavailable
 from data.store.app.database.crud.panel_ledger import NewTransition
-from data.store.app.database.crud.panel_manager_reads import latest_pass
+from data.store.app.database.crud.panel_manager_reads import latest_pass, resume_panel_entry, stop_collecting
 from data.store.app.database.crud.stock.store_dataset_entry import OwnOverlapConflict
 from data.store.app.database.models.ingest_request import (
     IngestRequestFailureCause,
     IngestRequestKind,
     IngestRequestState,
 )
-from data.store.app.database.models.ingest_run import IngestRunTrigger
+from data.store.app.database.models.ingest_run import IngestRunState, IngestRunTrigger
 from data.store.app.database.models.panel import PanelCadence, PanelPassKind, PanelTransition
+from data.store.app.database.models.store_dataset_entry import DatasetStopCause
 from data.store.app.events import DatasetChange
 from data.store.app.panel_manager import (
     CAUSE_CLAMP_UNAVAILABLE,
+    CAUSE_DATASET_RESUMED,
     CAUSE_OWN_OVERLAP,
     CAUSE_RAMP_RATE,
     CAUSE_REQUEST_RATE,
@@ -80,6 +90,7 @@ from data.store.app.panel_manager import (
     panel_dataset_start,
 )
 from data.store.tests.panel_manager_harness import (
+    ENTRIES,
     PASSES,
     SETTLE,
     SNAPSHOTS,
@@ -104,6 +115,9 @@ EXITED, DRAINING, DRAINED = PanelTransition.EXITED, PanelTransition.DRAINING, Pa
 BARS, CORPORATE = IngestRequestKind.BARS, IngestRequestKind.CORPORATE_ACTIONS
 DAY = timedelta(days=1)
 HOUR = timedelta(hours=1)
+# The stop marks, as the strings the column stores (tj-7zjov1.264).
+LEFT = 'PANEL_MEMBER_LEFT'
+VENDOR_STOP = 'VENDOR_ASSET_CHANGED'
 # The declared start of an ALPACA_API panel dataset, by hand (tj-7zjov1.239): 1990-01-01 at New York midnight (EST).
 DECLARED_START = datetime(1990, 1, 1, 5, tzinfo=UTC)
 
@@ -819,7 +833,8 @@ async def test_shared_owner_a_filter_exit_stops_collecting_only_when_no_enabled_
 
     assert kinds(await world.transitions(second))[-1] == ('vx', 'EXITED')
     entry = await world.entry_row(entry_id)
-    assert entry.collect is False and entry.stopped_cause is None
+    # A manager stop is marked PANEL_MEMBER_LEFT in the same UPDATE (P22r, addendum 23 rule A (1)).
+    assert (entry.collect, entry.stopped_cause) == (False, LEFT)
     assert [(e.id, e.change) for e in world.published] == [(entry_id, DatasetChange.RETIRED)]
 
 
@@ -888,7 +903,7 @@ async def test_a_vanished_member_with_an_entry_drains_then_is_drained_after_a_fe
     assert (last.vendor_asset_id, last.transition) == ('v1', DRAINED)
     assert last.as_of == await snapshot_as_of(world, newest)
     entry = await world.entry_row(entry_id)
-    assert entry.collect is False and entry.stopped_cause is None
+    assert (entry.collect, entry.stopped_cause) == (False, LEFT)
     assert [(e.id, e.change) for e in world.published] == [(entry_id, DatasetChange.RETIRED)]
 
 
@@ -954,7 +969,8 @@ async def test_an_entry_minted_after_its_member_exited_stops_collecting_with_no_
     await manager(clock).tick()
 
     entry = await world.entry_row(entry_id)
-    assert entry.collect is False and entry.stopped_cause is None
+    # (u10) the late-mint stop is a manager stop too, so it carries the mark.
+    assert (entry.collect, entry.stopped_cause) == (False, LEFT)
     assert len(await world.transitions(seeded)) == before
     assert [(e.id, e.change) for e in world.published] == [(entry_id, DatasetChange.RETIRED)]
 
@@ -1483,27 +1499,338 @@ async def test_the_manager_requests_no_asset_list_and_no_daily_bars(world, clock
 # The source-level half of P14 (no asset-list request, no awaiting or committing helper) is test_panel_manager_rules.py R8.
 
 
-# ===================================================================================== P15 re-entry as built
+# ===================================================================================== P15 re-entry restart (P22r)
 
 
-async def test_re_entry_as_built_a_stopped_entry_re_enters_with_no_request_and_stays_stopped(world, clock):
-    """NOT RULED by the owner (verdict note on tj-7zjov1.180): pinned as built so a change is a decision, not a drift."""
+async def test_the_stop_mark_and_the_resume_cause_are_the_designed_strings():
+    assert DatasetStopCause.PANEL_MEMBER_LEFT.value == LEFT
+    assert CAUSE_DATASET_RESUMED == 'dataset_resumed'
+
+
+async def _re_entry(world, previous, *, collect=False, cause=LEFT):
+    """A panel whose newest snapshot selects v1 (AAA) again, a panel entry for AAA, and v1's ledger ending `previous`.
+
+    previous None: the member has no ledger row on this panel at all (its entry exists: another panel minted it).
+    """
     seeded, _, snapshot_id = await basic(world, assets=[('v1', 'AAA')])
-    entry_id, rows = await _member_with_entry(world, seeded, snapshot_id, collect=False)
+    entry_id, rows = await _member_with_entry(world, seeded, snapshot_id, collect=collect, stopped_cause=cause)
     as_of = await snapshot_as_of(world, snapshot_id)
-    await world.ledger_pass(seeded, snapshot_id, rows, started_at=now() - 4 * DAY)
-    await world.ledger_pass(seeded, snapshot_id, [t('v1', EXITED, as_of)], started_at=now() - 3 * DAY)
+    if previous is not None:
+        await world.ledger_pass(seeded, snapshot_id, rows, started_at=now() - 4 * DAY)
+        await world.ledger_pass(seeded, snapshot_id, [t('v1', previous, as_of)], started_at=now() - 3 * DAY)
+    await world.age_window()
+    return seeded, entry_id
+
+
+async def _assert_resumed(world, seeded, entry_id):
+    last = (await world.transitions(seeded))[-1]
+    assert (last.vendor_asset_id, last.transition, last.dataset_id, last.cause) == (
+        'v1',
+        ENTERED,
+        entry_id,
+        CAUSE_DATASET_RESUMED,
+    ), 'the ENTERED row names the restarted entry'
+    entry = await world.entry_row(entry_id)
+    assert (entry.collect, entry.stopped_cause) == (True, None), 'collect true and the mark cleared'
+    assert entry.updated_at > datetime(2026, 1, 1, tzinfo=UTC)
+    assert [(e.id, e.change) for e in world.published] == [(entry_id, DatasetChange.RESUMED)]
+    # A restart writes no request: the gap is the DAILY refresh's (addendum 23 (4)).
+    assert world.clamps == [] and len(await world.requests(BARS)) == 1 and await world.requests(CORPORATE) == []
+
+
+async def _assert_not_resumed(world, seeded, entry_id, collect, cause):
+    last = (await world.transitions(seeded))[-1]
+    assert (last.vendor_asset_id, last.transition, last.dataset_id, last.cause) == ('v1', ENTERED, None, None)
+    entry = await world.entry_row(entry_id)
+    assert (entry.collect, entry.stopped_cause) == (collect, cause)
+    assert not [e for e in world.published if e.change is DatasetChange.RESUMED]
+    assert world.clamps == [] and len(await world.requests(BARS)) == 1
+
+
+async def test_u1_a_filter_exit_marks_the_stop_and_the_re_entry_restarts_it_in_the_entered_commit(world, clock):
+    seeded, _, snapshot_id = await basic(world, deny_symbols=['AAA'], assets=[('v1', 'AAA')])
+    entry_id, rows = await _member_with_entry(world, seeded, snapshot_id)
+    await world.ledger_pass(seeded, snapshot_id, rows, started_at=now() - 3 * DAY)
     await world.age_window()
 
     await manager(clock).tick()
 
-    assert kinds(await world.transitions(seeded))[-1] == ('v1', 'ENTERED')
-    assert world.clamps == [] and len(await world.requests(BARS)) == 1
+    assert kinds(await world.transitions(seeded))[-1] == ('v1', 'EXITED')
     entry = await world.entry_row(entry_id)
-    assert entry.collect is False and entry.stopped_cause is None
+    assert (entry.collect, entry.stopped_cause) == (False, LEFT)
+
+    await world.settings(seeded.panel_id)
+    await due_again(world, seeded)
+    await manager(clock).tick()
+
+    last = (await world.transitions(seeded))[-1]
+    assert (last.transition, last.dataset_id, last.cause) == (ENTERED, entry_id, CAUSE_DATASET_RESUMED)
+    entry = await world.entry_row(entry_id)
+    assert (entry.collect, entry.stopped_cause) == (True, None)
+    assert [(e.id, e.change) for e in world.published] == [
+        (entry_id, DatasetChange.RETIRED),
+        (entry_id, DatasetChange.RESUMED),
+    ]
+    assert world.clamps == [] and len(await world.requests(BARS)) == 1
 
 
-async def test_re_entry_as_built_a_member_with_no_entry_is_entered_and_created_again(world, clock):
+@pytest.mark.parametrize('previous', [EXITED, DRAINED, None], ids=['after-exited', 'after-drained', 'no-ledger-row'])
+async def test_u4_a_manager_stopped_entry_is_resumed_whatever_the_previous_transition(world, clock, previous):
+    seeded, entry_id = await _re_entry(world, previous)
+    await manager(clock).tick()
+    await _assert_resumed(world, seeded, entry_id)
+
+
+async def test_u6_stopped_by_panel_a_s_exit_the_first_entry_into_panel_b_resumes_it(world, clock):
+    await world.source_settings()
+    first = await world.panel(now() - 3 * DAY, deny_symbols=['AAA'])
+    old = await world.snapshot(now() - 3 * DAY, [('v1', 'AAA')])
+    await world.snapshot(now() - HOUR, [('v1', 'AAA')])
+    entry_id, rows = await _member_with_entry(world, first, old)
+    await world.ledger_pass(first, old, rows, started_at=now() - 3 * DAY)
+    await world.age_window()
+    await manager(clock).tick()
+    assert (await world.entry_row(entry_id)).stopped_cause == LEFT, 'panel A stopped it: no other panel selects AAA'
+
+    second = await world.panel(now() - DAY, allow_symbols=['AAA'])
+    world.published.clear()
+    await manager(clock).tick()
+
+    assert kinds(await world.transitions(second)) == [('v1', 'ENTERED')]
+    await _assert_resumed(world, second, entry_id)
+
+
+@pytest.mark.parametrize(
+    ('collect', 'cause'),
+    [(False, None), (False, VENDOR_STOP), (True, None)],
+    ids=['u2-operator-stop', 'u3-vendor-stop', 'collecting'],
+)
+async def test_only_a_manager_stop_is_resumed(world, clock, collect, cause):
+    seeded, entry_id = await _re_entry(world, EXITED, collect=collect, cause=cause)
+    await manager(clock).tick()
+    await _assert_not_resumed(world, seeded, entry_id, collect, cause)
+
+
+@pytest.mark.parametrize(
+    ('attempts', 'resumed'),
+    [
+        ([], True),
+        ([('v1', IngestRunState.SUCCEEDED, 5)], True),
+        ([(None, IngestRunState.EMPTY, 1), ('v1', IngestRunState.SUCCEEDED, 5)], True),
+        ([('v7', IngestRunState.FAILED, 1), ('v1', IngestRunState.EMPTY, 5)], True),
+        ([('v7', IngestRunState.SUCCEEDED, 5)], False),
+        ([('v7', IngestRunState.SUCCEEDED, 1), ('v1', IngestRunState.SUCCEEDED, 5)], False),
+    ],
+    ids=[
+        'u-empty-no-attempt',
+        'u-equal',
+        'u-equal-a-dropped-delivery-stores-none',
+        'u-equal-a-refused-attempt-is-no-base',
+        'u5-different',
+        'u5-the-newest-accepted-is-different',
+    ],
+)
+async def test_the_last_accepted_vendor_asset_id_must_be_empty_or_the_members(world, clock, attempts, resumed):
+    seeded, entry_id = await _re_entry(world, EXITED)
+    for vendor, state, days_ago in attempts:
+        await world.bars_attempt(entry_id, vendor, state=state, finished_at=now() - days_ago * DAY)
+
+    await manager(clock).tick()
+
+    if resumed:
+        await _assert_resumed(world, seeded, entry_id)
+    else:
+        await _assert_not_resumed(world, seeded, entry_id, False, LEFT)
+
+
+async def test_u8_an_operator_stop_before_the_manager_s_exit_keeps_no_mark_and_is_not_resumed(world, clock):
+    seeded, _, snapshot_id = await basic(world, deny_symbols=['AAA'], assets=[('v1', 'AAA')])
+    # The operator stopped it first (cause NULL); the exit then has nothing to flip.
+    entry_id, rows = await _member_with_entry(world, seeded, snapshot_id, collect=False)
+    await world.ledger_pass(seeded, snapshot_id, rows, started_at=now() - 3 * DAY)
+    await world.age_window()
+
+    await manager(clock).tick()
+
+    assert kinds(await world.transitions(seeded))[-1] == ('v1', 'EXITED')
+    entry = await world.entry_row(entry_id)
+    assert (entry.collect, entry.stopped_cause) == (False, None)
+    assert world.published == []
+
+    await world.settings(seeded.panel_id)
+    await due_again(world, seeded)
+    await manager(clock).tick()
+
+    await _assert_not_resumed(world, seeded, entry_id, False, None)
+
+
+@pytest.mark.parametrize(
+    ('collect', 'cause'), [(True, None), (False, None)], ids=['operator-resume', 'operator-resume-then-stop']
+)
+async def test_an_operator_write_racing_the_pass_wins_and_the_entered_row_is_plain(
+    world, clock, monkeypatch, collect, cause
+):
+    """The operator writes between the pass's read of the entry and its guarded UPDATE: rowcount 0, no restart."""
+    seeded, entry_id = await _re_entry(world, EXITED)
+    real = panel_manager.last_accepted_vendor_asset_id
+
+    async def operator_first(db, dataset_id):
+        await world.put(ENTRIES.update().where(ENTRIES.c.id == entry_id).values(collect=collect, stopped_cause=cause))
+        return await real(db, dataset_id)
+
+    monkeypatch.setattr(panel_manager, 'last_accepted_vendor_asset_id', operator_first)
+
+    await manager(clock).tick()
+
+    await _assert_not_resumed(world, seeded, entry_id, collect, cause)
+
+
+async def test_u7_a_dry_run_records_the_decision_and_changes_and_publishes_nothing(world, clock):
+    seeded, entry_id = await _re_entry(world, EXITED)
+
+    await manager(clock, dry_run=True).tick()
+
+    (dry,) = [row for row in await world.passes(seeded) if row.dry_run]
+    (decided,) = [row for row in await world.transitions(seeded) if row.pass_id == dry.id]
+    assert (decided.transition, decided.dataset_id, decided.cause) == (ENTERED, entry_id, CAUSE_DATASET_RESUMED)
+    entry = await world.entry_row(entry_id)
+    assert (entry.collect, entry.stopped_cause) == (False, LEFT)
+    assert world.published == [] and world.clamps == []
+
+    await manager(clock).tick()
+    await _assert_resumed(world, seeded, entry_id)
+
+
+@pytest.mark.parametrize(
+    ('collect', 'cause', 'vendor'),
+    [(False, None, None), (False, VENDOR_STOP, None), (False, LEFT, 'v7')],
+    ids=['operator-stop', 'vendor-stop', 'different-vendor-id'],
+)
+async def test_a_dry_run_records_a_plain_entered_for_an_entry_it_would_not_resume(world, clock, collect, cause, vendor):
+    """The dry run applies no guarded UPDATE, so its decision alone must apply all three conditions."""
+    seeded, entry_id = await _re_entry(world, EXITED, collect=collect, cause=cause)
+    if vendor is not None:
+        await world.bars_attempt(entry_id, vendor)
+
+    await manager(clock, dry_run=True).tick()
+
+    (dry,) = [row for row in await world.passes(seeded) if row.dry_run]
+    (decided,) = [row for row in await world.transitions(seeded) if row.pass_id == dry.id]
+    assert (decided.transition, decided.dataset_id, decided.cause) == (ENTERED, None, None)
+    assert world.published == []
+
+
+async def test_u9_a_release_pass_never_resumes(world, clock):
+    seeded, _, snapshot_id = await basic(world, assets=[('v1', 'AAA')])
+    entry_id, _ = await _member_with_entry(world, seeded, snapshot_id, collect=False, stopped_cause=LEFT)
+    as_of = await snapshot_as_of(world, snapshot_id)
+    # The last membership pass deferred v1 and is not due again: the tick runs a RELEASE only.
+    await world.ledger_pass(
+        seeded,
+        snapshot_id,
+        [t('v1', ENTERED, as_of), t('v1', DEFERRED, as_of, cause=CAUSE_RAMP_RATE)],
+        started_at=now(),
+    )
+    await world.age_window()
+
+    await manager(clock).tick()
+
+    assert [row.kind for row in await world.passes(seeded)] == [PanelPassKind.MEMBERSHIP], 'no new membership pass'
+    entry = await world.entry_row(entry_id)
+    assert (entry.collect, entry.stopped_cause) == (False, LEFT)
+    assert world.published == [] and world.clamps == []
+
+
+async def test_resumed_is_published_after_the_pass_commits(world, clock, monkeypatch):
+    _, entry_id = await _re_entry(world, EXITED)
+    seen = []
+
+    def recorder(event):
+        pass_db = world.pass_sessions[-1]
+        seen.append((event.change, pass_db.in_transaction(), world.commits.get(id(pass_db), 0)))
+
+    monkeypatch.setattr(panel_manager, 'publish', recorder)
+
+    await manager(clock).tick()
+
+    assert seen == [(DatasetChange.RESUMED, False, 1)], 'published once, after the one commit of the pass session'
+    entry = await world.entry_row(entry_id)
+    assert (entry.collect, entry.stopped_cause) == (True, None)
+
+
+async def test_a_rollback_loses_the_restart_and_its_entered_row_and_publishes_nothing(world, clock, monkeypatch):
+    seeded, entry_id = await _re_entry(world, EXITED)
+    before = len(await world.transitions(seeded))
+
+    async def crash(*_args, **_kw):
+        raise RuntimeError('crash before the commit')
+
+    monkeypatch.setattr(panel_manager, 'finish_pass', crash)
+    await manager(clock).tick()
+
+    assert len(await world.transitions(seeded)) == before
+    entry = await world.entry_row(entry_id)
+    assert (entry.collect, entry.stopped_cause) == (False, LEFT), 'the guarded UPDATE rolled back with the ENTERED row'
+    assert world.published == []
+
+
+async def test_a_resumed_entry_that_exits_again_is_marked_again_and_resumed_again(world, clock):
+    seeded, entry_id = await _re_entry(world, EXITED)
+    await manager(clock).tick()
+    await _assert_resumed(world, seeded, entry_id)
+
+    await world.settings(seeded.panel_id, deny_symbols=['AAA'])
+    await due_again(world, seeded)
+    await manager(clock).tick()
+    assert (await world.entry_row(entry_id)).stopped_cause == LEFT
+
+    await world.settings(seeded.panel_id)
+    await due_again(world, seeded)
+    await manager(clock).tick()
+    last = (await world.transitions(seeded))[-1]
+    assert (last.transition, last.dataset_id, last.cause) == (ENTERED, entry_id, CAUSE_DATASET_RESUMED)
+    assert [e.change for e in world.published] == [DatasetChange.RESUMED, DatasetChange.RETIRED, DatasetChange.RESUMED]
+
+
+# ------------------------------------------------------------------------------- the two crud writes, directly
+
+
+@pytest.mark.parametrize(
+    ('collect', 'cause', 'flips'),
+    [(False, LEFT, True), (False, None, False), (False, VENDOR_STOP, False), (True, None, False)],
+    ids=['manager-stopped', 'operator-stopped', 'vendor-stopped', 'collecting'],
+)
+async def test_resume_panel_entry_is_guarded_on_collect_false_and_the_mark(world, collect, cause, flips):
+    entry_id = await world.entry('AAA', collect=collect, stopped_cause=cause)
+    async with world.own_session() as db:
+        assert await resume_panel_entry(db, entry_id) is flips
+        await db.rollback()
+    assert ((await world.entry_row(entry_id)).collect, (await world.entry_row(entry_id)).stopped_cause) == (
+        collect,
+        cause,
+    ), 'it never commits'
+    async with world.own_session() as db:
+        await resume_panel_entry(db, entry_id)
+        await db.commit()
+    entry = await world.entry_row(entry_id)
+    assert (entry.collect, entry.stopped_cause) == ((True, None) if flips else (collect, cause))
+
+
+@pytest.mark.parametrize(
+    ('collect', 'cause', 'flips'),
+    [(True, None, True), (False, None, False), (False, VENDOR_STOP, False)],
+    ids=['collecting', 'operator-stopped', 'vendor-stopped'],
+)
+async def test_stop_collecting_marks_only_the_stop_it_makes(world, collect, cause, flips):
+    entry_id = await world.entry('AAA', collect=collect, stopped_cause=cause)
+    async with world.own_session() as db:
+        assert await stop_collecting(db, entry_id) is flips
+        await db.commit()
+    entry = await world.entry_row(entry_id)
+    assert (entry.collect, entry.stopped_cause) == ((False, LEFT) if flips else (collect, cause))
+
+
+async def test_re_entry_a_member_with_no_entry_is_entered_and_created_again(world, clock):
     seeded, _, snapshot_id = await basic(world, assets=[('v1', 'AAA')])
     as_of = await snapshot_as_of(world, snapshot_id)
     old = await world.request('AAA', state=IngestRequestState.FAILED, finished_at=now() - 4 * DAY)

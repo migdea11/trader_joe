@@ -16,7 +16,8 @@ What it stands up, for test_panel_manager_pass.py:
                            and its CREATED row from a SECOND session when called, which is what "submit after the
                            commit" means;
       publish              a recorder.
-    The real ledger crud, settings crud, request crud, asset-list reads, check_own_overlap and stop_collecting run.
+    The real ledger crud, settings crud, request crud, asset-list reads, check_own_overlap, stop_collecting,
+    resume_panel_entry and last_accepted_vendor_asset_id (over ingest_run, tj-7zjov1.264) run.
 
 Postgres-only behaviour (asyncpg, the ARRAY and JSONB columns, enum casts, the window counts on database time under
 real concurrency) is the system tier's: see the verdict note on tj-7zjov1.180.
@@ -50,7 +51,7 @@ from data.store.app.database.models.ingest_request import (
     IngestRequestKind,
     IngestRequestState,
 )
-from data.store.app.database.models.ingest_run import IngestRunTrigger
+from data.store.app.database.models.ingest_run import IngestRun, IngestRunState, IngestRunTrigger
 from data.store.app.database.models.panel import (
     Panel,
     PanelCadence,
@@ -77,7 +78,21 @@ INSTANCES = IngestInstance.__table__
 ENTRIES = StoreDatasetEntry.__table__
 SNAPSHOTS = AssetListSnapshot.__table__
 ASSET_ROWS = AssetListRow.__table__
-TABLES = (PANELS, SETTINGS, SOURCE_SETTINGS, PASSES, TRANSITIONS, REQUESTS, INSTANCES, ENTRIES, SNAPSHOTS, ASSET_ROWS)
+# ingest_run: the re-entry restart reads last_accepted_vendor_asset_id (tj-7zjov1.264, ADR tj-26jt9w addendum 23).
+RUNS = IngestRun.__table__
+TABLES = (
+    PANELS,
+    SETTINGS,
+    SOURCE_SETTINGS,
+    PASSES,
+    TRANSITIONS,
+    REQUESTS,
+    INSTANCES,
+    ENTRIES,
+    SNAPSHOTS,
+    ASSET_ROWS,
+    RUNS,
+)
 
 SOURCE = DataSource.ALPACA_API
 SETTLE = timedelta(minutes=30)
@@ -316,6 +331,30 @@ class World:
             'state': state,
         } | values
         return (await self.put(REQUESTS.insert().values(**row).returning(REQUESTS.c.id))).scalar_one()
+
+    async def bars_attempt(
+        self,
+        dataset_id: uuid.UUID,
+        vendor_asset_id: str | None,
+        *,
+        state: IngestRunState = IngestRunState.SUCCEEDED,
+        finished_at: datetime | None = None,
+    ) -> uuid.UUID:
+        """A bars attempt row of a dataset (granularity set), the base last_accepted_vendor_asset_id reads."""
+        values = {
+            'dataset_id': dataset_id,
+            'trigger': IngestRunTrigger.SCHEDULE,
+            'actor': 'scheduler',
+            'asset_symbol': 'AAA',
+            'asset_type': AssetType.STOCK,
+            'data_type': DataType.MARKET_ACTIVITY,
+            'source': SOURCE,
+            'granularity': Granularity.ONE_DAY,
+            'state': state,
+            'vendor_asset_id': vendor_asset_id,
+            'finished_at': finished_at or datetime.now(UTC) - timedelta(days=5),
+        }
+        return (await self.put(RUNS.insert().values(**values).returning(RUNS.c.id))).scalar_one()
 
     async def set_request(self, request_id: uuid.UUID, **values: Any) -> None:
         await self.put(REQUESTS.update().where(REQUESTS.c.id == request_id).values(**values))

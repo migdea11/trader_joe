@@ -72,6 +72,7 @@ from data.store.app.database.crud.ingest_request import (
     requests_in_window,
     symbols_with_open_requests,
 )
+from data.store.app.database.crud.ingest_run import last_accepted_vendor_asset_id
 from data.store.app.database.crud.panel_ledger import (
     MemberTransition,
     NewTransition,
@@ -87,6 +88,7 @@ from data.store.app.database.crud.panel_manager_reads import (
     created_requests,
     latest_pass,
     panel_entries,
+    resume_panel_entry,
     stop_collecting,
 )
 from data.store.app.database.crud.panel_settings import (
@@ -101,6 +103,7 @@ from data.store.app.database.database import own_session
 from data.store.app.database.models.ingest_request import IngestRequestFailureCause
 from data.store.app.database.models.ingest_run import IngestRunTrigger
 from data.store.app.database.models.panel import PanelCadence, PanelPassKind, PanelTransition
+from data.store.app.database.models.store_dataset_entry import DatasetStopCause
 from data.store.app.events import DatasetChange, DatasetChanged, publish
 from data.store.app.ingest.data_action_request import (
     StartClamp,
@@ -159,6 +162,8 @@ CAUSE_OWN_OVERLAP: Final = 'own_overlap'
 # Unreachable while panel datasets are open-ended (end None); the check stays.
 CAUSE_CLAMP_WINDOW: Final = 'clamp_window'
 CAUSE_VENDOR_REFUSED: Final = 'vendor_refused'
+# On ENTERED: the member's manager-stopped dataset was restarted in the same commit (addendum 23).
+CAUSE_DATASET_RESUMED: Final = 'dataset_resumed'
 
 # A member no longer in the panel: its latest transition is one of these.
 _NOT_MEMBER: Final = (PanelTransition.EXITED, PanelTransition.DRAINED)
@@ -679,15 +684,27 @@ class PanelManager:
         in_flight = await symbols_with_open_requests(db, source, PANEL_OWNER)
         to_create: list[_Member] = []
         entered_only: list[NewTransition] = []
+        resumed: list[uuid.UUID] = []
         for row in selected:
             state = states.get(row.vendor_asset_id)
             new = not is_member_state(state) or state.transition is PanelTransition.DRAINING
             request = request_rows.get(state.request_id) if state is not None and state.request_id else None
             action = member_action(state, row.symbol in entries, request)
             if new and action is MemberAction.NONE:
+                resume_id = await self._resume_target(db, entries.get(row.symbol), row.vendor_asset_id)
+                if resume_id is not None and not self._dry_run and not await resume_panel_entry(db, resume_id):
+                    # A concurrent operator write won: no restart, a plain ENTERED.
+                    resume_id = None
+                if resume_id is not None and not self._dry_run:
+                    resumed.append(resume_id)
                 entered_only.append(
                     NewTransition(
-                        row.vendor_asset_id, row.symbol, PanelTransition.ENTERED, as_of_of(row.vendor_asset_id, True)
+                        row.vendor_asset_id,
+                        row.symbol,
+                        PanelTransition.ENTERED,
+                        as_of_of(row.vendor_asset_id, True),
+                        dataset_id=resume_id,
+                        cause=CAUSE_DATASET_RESUMED if resume_id is not None else None,
                     )
                 )
             elif action is MemberAction.REFUSE_VENDOR:
@@ -728,6 +745,20 @@ class PanelManager:
         await run.finish()
         for dataset_id in stops:
             publish(DatasetChanged(dataset_id, DatasetChange.RETIRED))
+        for dataset_id in resumed:
+            publish(DatasetChanged(dataset_id, DatasetChange.RESUMED))
+
+    @staticmethod
+    async def _resume_target(db: AsyncSession, entry: PanelEntry | None, vendor_asset_id: str) -> uuid.UUID | None:
+        """The entry id a re-entering member's ENTERED restarts, or None.
+
+        Only an entry the manager itself stopped (collect false, PANEL_MEMBER_LEFT) whose last accepted vendor asset
+        id is empty or the member's: a different id is a reused symbol, and the dataset stays stopped.
+        """
+        if entry is None or entry.collect is not False or entry.stopped_cause != DatasetStopCause.PANEL_MEMBER_LEFT:
+            return None
+        last = await last_accepted_vendor_asset_id(db, entry.id)
+        return entry.id if last is None or last == vendor_asset_id else None
 
     async def _evidence(
         self,
@@ -769,7 +800,7 @@ class PanelManager:
 
         A member that EXITS or DRAINS while its bars request is open gets its entry minted afterwards with collect true.
         Only an entry whose CREATED request finished at or after the member's latest EXITED or DRAINED is stopped, so an
-        operator's later Resume is left alone; stopped_cause is never touched and no ledger row is written.
+        operator's later Resume is left alone; no ledger row is written (stop_collecting marks the stop PANEL_MEMBER_LEFT).
         """
         gone = {vid: s for vid, s in states.items() if s.transition in _NOT_MEMBER}
         if not gone:

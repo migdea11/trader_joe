@@ -593,8 +593,9 @@ PANEL_MODEL_IMPORTERS = frozenset(
         # append_transitions, finish_pass). P22v tj-7zjov1.180 pins the pass's rows.
         'data/store/app/panel_manager.py',
         # P22 tj-7zjov1.34, judged by P20d-v tj-7zjov1.217 at 4cb30ec: the manager's reads. It only SELECTs from
-        # panel_pass and panel_member_transition; its one write, stop_collecting, is an UPDATE of store_dataset_entry,
-        # not a panel table (the guarded-update pin below still finds finish_pass alone). P22v pins its statements.
+        # panel_pass and panel_member_transition; its two writes, stop_collecting and (P22r tj-7zjov1.264)
+        # resume_panel_entry, are UPDATEs of store_dataset_entry, not a panel table (the guarded-update pin below
+        # still finds finish_pass alone). P22v and P22rv (tj-7zjov1.265) pin its statements.
         'data/store/app/database/crud/panel_manager_reads.py',
         # P24 tj-7zjov1.36 (c716268), judged by P24v tj-7zjov1.241: the /ui/v1 reads. Every statement is a select()
         # (no insert, update, delete, text() or commit anywhere in the module); pinned SELECT-only by

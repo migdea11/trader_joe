@@ -20,6 +20,8 @@ class DatasetStopCause(StrEnum):
 
     # A bars delivery named another vendor asset id than the dataset's last accepted delivery (P50).
     VENDOR_ASSET_CHANGED = 'VENDOR_ASSET_CHANGED'
+    # The panel manager stopped a panel-owned dataset (filter exit, DRAINED or a late mint): re-entry restarts it.
+    PANEL_MEMBER_LEFT = 'PANEL_MEMBER_LEFT'
 
 
 class StoreDatasetEntry(AppBase.DATA_STORE_BASE, CustomTypeTable):
