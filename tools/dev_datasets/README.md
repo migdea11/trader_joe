@@ -20,6 +20,8 @@ resolution: monthly bars begin 2020-07 and daily bars 2020-07-27, and the depth 
 run returned a first monthly bar of 2018-11-01 for the same series). Every healthy row therefore starts after
 2020-07-27 (r6 on 2020-08-01).
 
+See `tj-7zjov1.359`: the plan names no feed, so dev runs are now served on SIP, and the depth above needs re-measuring (and r14's intentional leading GAPS re-checking).
+
 | id | symbol | granularity | start .. end | update | expiry type | expiry | owner | reads | exercises |
 |---|---|---|---|---|---|---|---|---|---|
 | r1 | SPY | 1min | D-8 .. D-5 | STATIC | BULK | D+2 | dev-datasets | | 1min paging; Expiring Soon; the override on the card; a deletion date that passes at D+2 |

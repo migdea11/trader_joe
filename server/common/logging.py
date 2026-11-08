@@ -38,8 +38,8 @@ WHAT THIS DOES NOT COVER:
   scrub, so it holds unscrubbed text.
 - At LOG_LEVEL=DEBUG the httpcore trace double-escapes backslashes, so a value with a CR or LF in
   the middle leaves both halves visible. get_client refuses such a value before any client is
-  built, and the only httpx sender that carries a credential is the dev vendor probe, which runs
-  check_credential first.
+  built, and no httpx sender in the repo now carries a vendor credential. A new sender that did
+  would need the same check_credential gate first.
 - This module is no longer stdlib-only: it imports common.sensitive for the marker.
 """
 

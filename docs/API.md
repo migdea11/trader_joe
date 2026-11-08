@@ -202,10 +202,11 @@ It was nine until the Kafka removal, when R1 left the table.
 | PW2 | `POST /ui/v1/panels/{panel_id}/settings-versions` | data_store | http (protobuf JSON) | instance secret | **Stable** |
 | PW3 | `POST /ui/v1/panel-sources/{source}/settings-versions` | data_store | http (protobuf JSON) | instance secret | **Stable** |
 
-data_ingest has no row. Its interface is the gRPC `IngestService.FetchDataset`, declared in
-`proto/trader_joe/proto/internal/ingest/v1/ingest.proto`, handled by
-`routers/data_ingest/fetch_dataset_handler.py :: IngestFetchHandler` and registered in
-`data/ingest/app/grpc_host.py`. It is outside this document's REST-shaped inventory by ADR
+data_ingest has no row. Its interface is the gRPC `IngestService` (`Submit` and `Instance` are served, `Quote` is declared
+only), declared in `proto/trader_joe/proto/internal/ingest/v1/ingest.proto`, handled by
+`routers/data_ingest/submit_handler.py` and `instance_handler.py` and registered in
+`data/ingest/app/grpc_host.py`; its results come back on the store's `StoreService.DeliverAttempt` (see
+[I1](#i1--ingestservice-and-the-push-result-path-grpc)). It is outside this document's REST-shaped inventory by ADR
 `tj-8konfu` D3, and pinned by `data/ingest/tests/test_grpc_host.py`.
 
 **One row, one manifest line.** The method-blind blind spot that once hid `GET /store/{id}` is closed
@@ -267,15 +268,17 @@ would have been. A membership table over duplicated rows is purely additive if e
 
 ## A dataset is identified by every field it was requested with
 
-The entry's unique key, `uq_store_dataset_entry_identity`, is **ten columns**: `owner`,
+The entry's unique key, `uq_store_dataset_entry_identity`, is **eleven columns**: `owner`,
 `asset_symbol`, `asset_type`, `data_type`, `source`, `granularity`, `expiry_type`, `update_type`,
-`start`, `end`. Two requests differing in **any** of them — the range included — are two datasets.
+`feed`, `start`, `end`. Two requests differing in **any** of them — the range included — are two datasets.
 Nothing is merged on conflict: the earlier behaviour of reconciling `expiry_type` and `update_type`
 to the higher-ranked value is gone.
 
-- `feed` is **not** yet part of the entry's identity. The entry is written before ingest has resolved
-  a tape, so feed on the entry is deferred to the gRPC transport work (`tj-rh4b7f`). Today one
-  deployment serves one feed, so no two entries can differ by feed. The bar does carry `feed`.
+- `feed` **is** part of the entry's identity (`tj-3mk3u5.31`, decision `tj-xn3qa6` D1). The entry is
+  written by the first delivered attempt, with the feed that attempt's header reports, so an IEX request and a SIP request over
+  the same window are two datasets. The
+  create body takes an optional `feed`; the value stored is the feed the handle resolved, which is not
+  always the body's (a body naming none is stored as `SIP`). The bar carries `feed` too.
 - `expiry` (when the dataset's data dies) is a column on the entry, not on the bar, and is **not**
   identity. It is nullable: none means the dataset never expires.
 - `end` omitted means open-ended; it is stored as a 1970-01-01 sentinel so that two open-ended
@@ -292,6 +295,16 @@ to the higher-ranked value is gone.
 | Every identity field equal to an existing entry, range included | **No-op.** The existing entry's id is reused; only its `expiry` and `updated_at` are refreshed, and `expiry` is taken from the request, so omitting it clears a stored one. This is what makes a retried POST safe. |
 | Same owner and same non-range fields, range overlapping but not equal (ranges are half-open, so ranges that only touch do not overlap) | **409**, with the overlapping entries' ids in the top-level `colliding_ids` member of the problem+json (`detail` is a sentence). Nothing is written. |
 | Anything else, including another owner's overlapping dataset | A new entry. Owner is identity, so a different owner's dataset is never a collision. |
+
+**The overlap refusal is feed-blind, and that is current behaviour.** The 409 keys on the identity
+**minus `feed`** (`OverlapKey` and `check_own_overlap` in `data/store/app/database/crud/stock/store_dataset_entry.py`;
+the POST path calls it through `_check_overlap` in `data/store/app/ingest/data_action_request.py`, and the panel manager
+through the same check, as the cause `own_overlap`). `feed` is identity but not an overlap term, and the
+range-equality exclusion ignores it too. So one owner may hold a SIP and an IEX dataset for the same symbol,
+granularity and window; a request naming IEX over a window that **partly** overlaps an owned SIP dataset is a
+**409** with `colliding_ids`; and a request over an **identical** window on the other feed is accepted as a second
+dataset, because a different feed is a different identity and so not an exact repeat. The planned fix is the
+backlog task `tj-7zjov1.352` (owner ruling 2026-11-06 on `tj-7zjov1.351`); this document records what is built.
 
 **There is no route to extend a dataset.** The 409 hands the caller an id, and the store's crud
 layer has a growth-only, id-preserving range update (`update_entry`) — but no HTTP route calls it at
@@ -325,17 +338,35 @@ open GET returns `owner` anyway, this is log hygiene, not secrecy.
 ## Bars are raw; adjustment is not built
 
 The bar row carries no `split_factor` and no `dividends_factor`. Bars are stored raw and are meant to
-be immutable; corporate actions are to be applied **on read** from a separate events table. **That
-table, the adjustment calculation and its cache do not exist yet** — only the schema decision has
-landed. Do not read the absence of the columns as "adjustment is handled": every bar this surface
+be immutable; corporate actions are to be applied **on read** from a separate events table. **The raw
+observations now exist** (the `corporate_action` table, collected as the vendor publishes them and read
+through PR8), **but the adjustment calculation and its cache do not**: nothing applies an action to a bar. Do not read the absence of the columns as "adjustment is handled": every bar this surface
 returns is unadjusted.
 
 ## The feed on a bar
 
 Every bar carries a required `feed` (`IEX`, `SIP`, or `NOT_APPLICABLE` for a source with no tape
-distinction). There is no `UNKNOWN` member. The ingest adapter stamps it from the deployment's
-entitlement (`ALPACA_SIP_ENABLED`), not from the vendor's response, which reports no feed; no caller
-can select a feed yet.
+distinction). There is no `UNKNOWN` member. The Alpaca handle resolves the feed **per request**
+(`resolve_feed` in `data/ingest/app/brokers/alpaca/broker_api.py`; owner ruling 2026-11-06, ADR
+`tj-xn3qa6` addendum 3):
+
+| The request names | Served on |
+|---|---|
+| no feed | `SIP`, the constant `ALPACA_DEFAULT_FEED` |
+| `SIP` | `SIP` |
+| `IEX` | `IEX`, only because the request named it |
+| `NOT_APPLICABLE` | refused `FEED_NOT_AVAILABLE` (422 at Submit, `PERMANENT`, no attempt row) |
+
+There is no setting and no environment read: the default is a constant. The feed a bar and its dataset
+record is the feed that was requested or resolved and sent to the vendor on every call, because Alpaca's
+bars response reports no feed. SIP history is served from 2016 on the Basic plan (ADR `tj-xn3qa6`
+addendum 2); no code constant pins that start. As an observation, not a guarantee: on the owner's key, AAPL's SIP
+daily history starts 2016-01-04 and its IEX daily history starts 2020-07-27 (spike s8, bead `tj-7zjov1.7`). SIP's recent edge is refused, never clamped silently: a
+request whose end, or whose start when it has no end, is later than now minus 16 minutes (`SIP_RECENT_WINDOW`
+15 minutes plus `SIP_EDGE_MARGIN` 1 minute, `data/ingest/app/brokers/alpaca/read.py`) is refused
+`RANGE_TOO_RECENT` with the `reset_at` at which the same request becomes servable. An open-ended SIP
+request is sent with that edge as its end, and `served_range` names it (decision `tj-7zjov1.306` addenda
+1 and 2, ruling `tj-7zjov1.314`). IEX is never edge-checked.
 
 ---
 
@@ -482,16 +513,18 @@ and is the only interface in the component that crosses two external boundaries.
 | **Response** | `schemas.data_store.asset_dataset_store.StoreAssetDatasetResponse`: `message`, `data_points` (bars written) and `served_range` |
 | **Touches** | Postgres (`AsyncSession`) **and** gRPC (`common.rpc.clients.ingest_submit.IngestSubmitClient`) |
 
-This is the write path: it creates (or resolves) the dataset entry, triggers a fetch, forwards the
-request to data_ingest through `store_market_activity_worker`, and writes the returned bars against
-that entry. When the transport moves to gRPC (`tj-8konfu`), the seam that survives is
-`store_market_activity_worker`'s contract, not the gRPC client — anything built against the
-transport is rewritten at the cutover.
+This is the write path, and the result comes back on a push, not on the call. `store_market_activity_worker`
+(`data/store/app/ingest/data_action_request.py`) refuses an own-overlap, writes the request row, submits
+it to data_ingest (`IngestService.Submit`, [I1](#i1--ingestservice-and-the-push-result-path-grpc)) and waits for the verdict, up to
+`STORE_VERDICT_DEADLINE_SECONDS` (default 300 s). Ingest reports each attempt to the store's own
+`StoreService.DeliverAttempt`, and the delivery writes the dataset entry, the bars and the `ingest_run` row in one
+transaction. A POST that outlives the deadline answers the deadline error and the request keeps running; its
+outcome is in the run history (U6).
 
 **The body is the dataset's identity.** `owner` (required, no default), `source`, `granularity`,
 `start` (required), `end` (optional; omitted means open-ended), `expiry_type` (default `BULK`) and
 `update_type` (default `STATIC`), plus `expiry` (optional; omitted or `null` means the dataset
-**never expires**). There is no `feed` field. The entry is resolved as described in
+**never expires**). `feed` is optional (`IEX`, `SIP` or `NOT_APPLICABLE`): it is a request to the handle, which resolves the tape (see [The feed on a bar](#the-feed-on-a-bar)), and the entry records the resolved one. The entry is resolved as described in
 [What a create does](#what-a-create-does): an exact repeat reuses the existing entry, an overlap with
 the same owner's dataset is a **409** carrying `colliding_ids`, anything else creates.
 
@@ -518,11 +551,11 @@ field must be 'STATIC' when 'end' is provided."*
 The refusal runs on this body only, so a dataset already stored as `STREAM` still reads, and `STREAM`
 is still accepted as a filter on S2.
 
-**`ready_by` and `best_effort` are accepted, validated and ignored.** `ready_by` is optional and must
-be timezone-aware (a naive value is a 422); `best_effort` is a boolean, default `false`. Nothing
-stores or reads either, so they change nothing about the request, are not part of the dataset's
-identity, and do not appear on S2 or S6. They are on the body so a client can send them ahead of the
-scheduler that will use them.
+**`ready_by` is the caller's deadline; `best_effort` is carried and unused.** `ready_by` is optional and must
+be timezone-aware (a naive value is a 422). Ingest checks it when it takes the request off its queue: a request
+taken after `ready_by` is reported `EXPIRED` and never sent to the vendor (see [`scheduler.md`](scheduler.md)), and the
+POST answers that as a failure. No `ready_by` means no deadline. `best_effort` is a boolean, default `false`, that
+nothing reads. Neither is part of the dataset's identity, and neither appears on S2 or S6.
 
 **Every call is recorded as a request and its attempts.** S1 writes an `ingest_request` row before it
 sends anything (trigger `REQUEST`), submits it, and answers from that row. The result comes back on
@@ -571,10 +604,9 @@ event log will eventually sit behind. See gaps **G6** (undeclared response) and 
 Lists the dataset entries for one symbol, each with its `item_count` (bars held, 0 for an entry with
 none) and its own `expiry`. Returns a **list**; to read a single entry by id, use `GET /store/{id}` (S6).
 
-Optional query filters, each an exact match on the entry's column: `owner`, `source`, `granularity`,
+Optional query filters, each an exact match on the entry's column: `owner`, `source`, `feed`, `granularity`,
 `start`, `end`, `expiry_type`, `update_type`, `created_at`, `updated_at`. The datetimes must be
-timezone-aware; `expiry_type` and `update_type` take member names. There is no `feed` filter, since
-the entry has no feed column. An unknown parameter is a 422. It has no `limit` or `offset`; see gap
+timezone-aware; `expiry_type` and `update_type` take member names. `feed` takes `IEX`, `SIP` or `NOT_APPLICABLE`. An unknown parameter is a 422. It has no `limit` or `offset`; see gap
 **G5**.
 
 It is the one route on this surface that declares its response through a **return annotation** rather
@@ -884,11 +916,21 @@ for a cursor that does not decode.
 An `IngestRun` carries `id`, `datasetId` (empty when the attempt names no dataset: a clamp query, or a POST's attempt that failed before any delivery created the entry), `label` (symbol and
 granularity), `trigger`, `actor` (the request body's `owner`, a label and never a credential), the
 requested `start` and `end`, `state` (`RUNNING`, `SUCCEEDED`, `EMPTY` or `FAILED`), `barsWritten`,
-`error` (set only when `FAILED`: `domain`, `reason`, `message`), `startedAt` and `finishedAt` (unset
+`error` (set only when `FAILED`: `domain`, `reason`, `message`; see below), `startedAt` and `finishedAt` (unset
 while `RUNNING`). `trigger` is the request's own trigger on its first attempt (`REQUEST` for a POST, `SCHEDULE` for the daily
 refresh) and `RETRY` on each later attempt of either. `requestId` names the request the attempt belongs to (empty on a legacy run); `quotaKey` is always empty. A run swept at startup reads
 `FAILED` with `reason` `INTERRUPTED`, which is a marker of the run record and not a member of the
 error vocabulary in [`errors.md`](errors.md).
+
+**The error object of a failed attempt.** A `FAILED` attempt reported on the push path carries `error.domain`
+`trader-joe` and `error.reason` equal to the vocabulary reason ingest put on `DeliveryTrailer.reason` (owner ruling
+2026-11-06 on `tj-7zjov1.236`, option C). `domain` and `reason` are both **empty** when the failure is untyped: ingest
+sent no reason (an asset the broker does not know, and the crash path where the attempt runner itself raised), and the
+store never derives a reason from `error_class`. They are empty on a non-`FAILED` attempt too, where `error` is unset.
+The store's own markers outrank the report and keep an **empty** `domain`: `INTERRUPTED` (a run swept at startup) and
+`VENDOR_ASSET_CHANGED` (a bars delivery the store refused because its vendor asset id differs from the dataset's last
+accepted one). Rows written before PR 5 are not backfilled. A client branches on `reason` and treats an empty one as
+"no typed reason".
 
 ### U7 · `GET /ui/v1/datasets/{dataset_id}/coverage`
 
@@ -1165,27 +1207,71 @@ Rules run in order: the secret (401), the body (422), existence (404, PW2 only),
 # routers/data_ingest
 
 data_ingest declares **no HTTP interface at all**, and `data_ingest.manifest` says so with a single
-`none` line. Its interface is one gRPC method.
+`none` line. Its interface is gRPC: the `IngestService` it serves, and the `StoreService` it calls.
 
-## I1 · `IngestService.FetchDataset` (gRPC, server-streaming)
+## I1 · `IngestService` and the push result path (gRPC)
 
 | | |
 |---|---|
-| **Stability** | **Stable.** This replaced the Kafka RPC entry (R1) when the transport was removed. |
+| **Stability** | **Stable.** The service replaced the Kafka RPC entry (R1) when the transport was removed; the result-bearing pull stream `FetchDataset` that first replaced it was deleted in P37 (`tj-7zjov1.18`). |
 | **Auth** | none |
-| **Contract** | `proto/trader_joe/proto/internal/ingest/v1/ingest.proto` — the source of truth; the Python stubs under `gen/proto/python/` are generated by `make proto` and never committed |
-| **Implementation** | `routers/data_ingest/fetch_dataset_handler.py :: IngestFetchHandler.fetch`, registered in `data/ingest/app/grpc_host.py :: registered_services` |
-| **Request** | `FetchDatasetRequest` |
-| **Response** | `stream FetchDatasetResponse` — a `oneof` over `FetchAccepted`, `FetchRefused`, `BarPage` and `FetchDone` |
-| **Touches** | the broker (injected, as a `readers` mapping) |
+| **Contract** | `proto/trader_joe/proto/internal/ingest/v1/ingest.proto` (the calls store makes on ingest) and `proto/trader_joe/proto/internal/store/v1/store.proto` (the calls ingest makes on store) — the source of truth; the Python stubs under `gen/proto/python/` are generated by `make proto` and never committed |
+| **Implementation** | `routers/data_ingest/submit_handler.py :: IngestSubmitHandler` and `routers/data_ingest/instance_handler.py`, registered in `data/ingest/app/grpc_host.py :: registered_services`; the store side is `data/store/app/ingest/delivery_intake.py` |
+| **Touches** | the broker handles (one per vendor, each with its own queue, executor and outgoing buffer, see [`scheduler.md`](scheduler.md)) |
 | **Pinned by** | `data/ingest/tests/test_grpc_host.py`, which asserts in a fresh interpreter that `registered_services()` returns exactly this service |
 
-**The shape is ack-first.** An acknowledgement is *always* the first message on the stream:
-`FetchAccepted`, carrying the **resolved feed**, or `FetchRefused`, which is then the stream's only
-event. Bar pages follow, each non-empty and capped at `MAX_PAGE_BARS`, and `FetchDone` terminates an
-accepted stream — so a stream that merely stops is distinguishable from one that finished. That
-distinction is the point of the design; do not treat an ended stream as a completed one without
-`FetchDone`.
+**`IngestService` has three methods; two are served.** All three are calls from data_store to data_ingest.
+
+| Method | Shape | State |
+|---|---|---|
+| `Submit` | unary | Served. Hands ingest one request of any kind (bars, asset list, corporate actions) and is answered **at once**. It is idempotent on `request_id`: an id ingest already holds is answered again and queued once. |
+| `Instance` | unary | Served. The restart marker: the id this ingest process minted at start, and when it started. |
+| `Quote` | unary | Declared, with no server and no caller (`proto/README.md`): every call is answered `UNIMPLEMENTED` (`tj-grna9p.51`). |
+
+**The Submit answer is an ack, never data.** Bars: accepted with the **resolved feed** (never
+`FEED_UNSPECIFIED`) and the quota key, or refused for its feed (`FetchRefused`, reason `FEED_NOT_AVAILABLE`,
+the one refusal carried in-band). Asset list and corporate actions: accepted with `FEED_UNSPECIFIED`, since
+they have no tape, and refused only by a gRPC status. Every other failure on the hop is a gRPC status with a
+`google.rpc.Status` and `ErrorInfo`. What is knowable before the vendor is checked before the ack.
+The `SubmitRequest` envelope carries `request_id`, `owner`, `ready_by`, `best_effort`, `recovered` and
+`attempt_count`; `ready_by` unset means no deadline, and a set one is checked when the request is taken off the queue.
+`recovered` marks a re-submission after an ingest restart, and `attempt_count` is the store's durable count, so a restart
+never resets the attempt budget.
+
+**The result comes back on `StoreService`**, which data_store serves and data_ingest calls:
+
+| Method | Shape | What it does |
+|---|---|---|
+| `DeliverAttempt` | client-streaming | One call per attempt. In order: ONE `DeliveryHeader`, then zero or more payload messages (`bar_page`, `asset_records` or `corporate_action_records`, all of the one kind the request was), then ONE `DeliveryTrailer`. A stream that ends without a trailer is incomplete: the store writes nothing for it and ingest redelivers the whole attempt. The answer is the acknowledgement, `DeliverAttemptResponse` (`verdict` `CONTINUE` or `FINAL`, and the store's durable `attempt_count`). |
+| `RegisterInstance` | unary | Ingest announces the instance id it minted at start and when it started. Idempotent; retried by ingest with backoff and never blocks its start. |
+
+**The acknowledgement gate is part of the contract.** The store writes the attempt record, any data, the durable
+attempt count, the summed spend and the verdict in one transaction, commits, and only then answers. Ingest runs no retry
+and makes no further vendor call for a request until its report is acknowledged. A report that does not reach the
+store, or whose answer does not reach ingest, is **redelivered with the same attempt number**: that is not a broker
+retry and costs no vendor call. `DeliverAttempt` is idempotent on `(request_id, attempt_no)`, and a duplicate is
+answered from the stored row and writes nothing. A report from a superseded instance is still written (its data is
+valid at its receipt time) and answered `FINAL`.
+
+**How an attempt ends** (`DeliveryOutcome` on the trailer):
+
+| Outcome | Meaning |
+|---|---|
+| `SUCCEEDED` | The vendor answered and the payload, possibly empty, is complete. |
+| `FAILED` | A vendor call was made and the attempt did not succeed. `error_class` says how: `TRANSIENT`, `RATE_LIMITED` or `PERMANENT`. |
+| `EXPIRED` | Taken off the queue after its `ready_by`, so never sent to the vendor: no stats, no payload, no attempt row; the store writes the request `FAILED` with cause expired. |
+| `EXHAUSTED` | Arrived with its attempt budget already spent, so never sent to the vendor; shaped like `EXPIRED`, and the store writes the request `FAILED` with cause attempts exhausted. |
+
+**The trailer's typed reason.** `DeliveryTrailer.reason` is the contract text, quoted from `store.proto`: "The
+vocabulary Reason value of a FAILED attempt (common/errors; the domain is always the vocabulary's ERROR_DOMAIN, so it
+is not carried). Empty on any other outcome, and empty when ingest has no typed reason. Additive. A receiver that does
+not recognise the value treats it as empty and never refuses the delivery: a refused delivery is redelivered and lost
+at an ingest restart." The store records it on the attempt row and U6 shows it (see [U6](#u6--get-uiv1datasetsdataset_idruns)).
+
+**The feed on the header.** For a bars attempt the header's `feed` is the resolved tape; for an asset list or
+corporate actions it is always `FEED_UNSPECIFIED`. An `EXPIRED` or `EXHAUSTED` report of a bars request still names
+the resolved tape. Downstream, `feed` is part of the dataset entry's identity (`tj-3mk3u5.31`), which is why an IEX
+request and a SIP request over the same window are two datasets and not one.
 
 **This entry is not in the manifest, and that is deliberate.** This document's inventory is
 REST-shaped and keyed on path; a gRPC method has no path to key on. ADR `tj-8konfu` D3 keeps the
@@ -1198,26 +1284,12 @@ second interface had appeared. That is not what happened: `tj-3mk3u5.11` deleted
 `tj-3mk3u5.32` deleted the `rpc` kind that enumerated it, and the replacement lives outside the
 manifest entirely. The entry left the table rather than changing its key.
 
-**The request carries the dataset's identity and principal.** `FetchDatasetRequest` carries `owner`,
-the dataset identity fields from S1, and the window. The caller **may** name a `feed`, but the
-adapter alone decides whether that tape can be served; `BarsResponse.feed` is the resolved one, and
-it is what `FetchAccepted` reports back. A feed that cannot be served is refused with
-`FEED_NOT_AVAILABLE` rather than quietly substituted.
-
-**The resolved feed is stamped once per fetch, never per bar.** Every bar on the stream takes the one
-feed resolved for the whole call; the encoder raises rather than overwrite a mismatch. Downstream,
-`feed` is part of the dataset entry's identity (`tj-3mk3u5.31`), which is why an IEX request and a SIP
-request over the same window are two datasets and not one.
-
 **Three asset classes are accepted; one is served — and the refusal is now typed.** A non-`STOCK`
 `asset_type` is refused up front with `UNSUPPORTED_ASSET_TYPE`, as are `QUOTE` and `TRADE` data
 types. This is a real improvement over the Kafka path, where crypto and option were empty `pass`
 callbacks that returned `None` into an `await` and surfaced as
-`TypeError: object NoneType can't be used in 'await' expression`. The check sits in the handler
-rather than in the reader on purpose: `BrokerRead`'s contract does not require a reader to refuse an
-asset type it does not serve, so leaving it to the reader would make the answer depend on which
-reader is installed. The surface still *accepts* three classes and serves one, so gap **G8** stands —
-but it now fails honestly.
+`TypeError: object NoneType can't be used in 'await' expression`. The surface still *accepts* three
+classes and serves one, so gap **G8** stands — but it now fails honestly.
 
 **A vendor failure used to arrive as success. It no longer does.** The old defect (`tj-fe19tu`) was
 that the broker call swallowed every exception and returned an empty result, so a vendor error, a
@@ -1227,31 +1299,18 @@ than the declared batch, so the observable symptom downstream was an `AttributeE
 silent at the broker layer, misattributed at the store layer.
 
 `BrokerRead.get_bars` now returns either a `BarsResponse` — served, possibly empty, carrying its
-`served_range` — or a typed `BarsFailure`, and raises only for a bug. `tj-3mk3u5.11` deleted the
-Kafka edge that turned a failure into a bare `{}`, so every typed failure reaches the gRPC servicer
-and is rendered there as a `google.rpc.Status` with `ErrorInfo`. **No sentinel survives.** An empty
-result now means an empty interval, and nothing else.
-
-**Declared, and served by nothing yet.** `ingest.proto` also declares `IngestService.Quote`, which has no
-server and no caller. `internal/store/v1/store.proto` now declares `StoreService.DeliverAttempt` (client
-streaming: one header, the payload messages, one trailer, answered with an acknowledgement; idempotent on
-`request_id` and `attempt_no`) and `StoreService.RegisterInstance` (unary: ingest announces the instance id it
-minted at start). `Bootstrap` and its messages are removed. The package is internal, so buf's breaking
-checks ignore the change. The contract is the data_ingest to data_store result path: the store writes
-an attempt durably before it answers, and ingest does not retry or call the vendor again for a request
-until the attempt is acknowledged.
-
-`FetchDatasetRequest` gained `request_id`, `ready_by` and `best_effort`, which are carried and unused,
-and `FetchAccepted.quota_key` and `FetchDone.vendor_stats` are on the wire but not yet mapped into
-the domain.
+`served_range` — or a typed `BarsFailure`, and raises only for a bug. A typed failure is reported on the
+trailer as `FAILED` with its `error_class` and its `reason`, and an empty result means an empty interval, and nothing
+else. **No sentinel survives.**
 
 Gaps **G1** and **G2** still apply to what happens *after* a failure is reported. G1 is narrowed:
 U7 answers what a dataset holds and what is missing, per session. G2 is narrowed too: U6 shows each
-failed run and its typed error. There is still no retry.
+failed run and its typed error. A failed attempt is retried by ingest within its attempt budget (see
+[`scheduler.md`](scheduler.md)).
 
 data_ingest declares **no REST interface at all** — not merely none that is bound. `tj-427x50`
 deleted the last member of its `InterfaceRest` enum, and with it the empty enum class and its `Enum`
-import. Its entire interface is the gRPC method above. See
+import. Its entire interface is the gRPC surface above. See
 [Declarations deleted by ruling](#declarations-deleted-by-ruling-2026-09-23).
 
 ---
@@ -1536,7 +1595,7 @@ table can record:
 | Work | What it changed here | Status |
 |---|---|---|
 | `tj-3mk3u5` — Kafka removal | **Predicted:** deletes C2 and C3, re-keys R1's address, changes S1's outbound hop. **Actually:** C2 and C3 *survived* — only the harness's Kafka arm went; R1 was *retired*, not re-keyed, and its replacement sits outside this manifest; S1's hop did change, as forecast. | **Landed** |
-| `tj-8konfu` — gRPC surface | Re-hosted the fetch call as `IngestService.FetchDataset` and added a contract this document does not fully cover (see `proto/README.md`). It did **not** settle versioning (G11) or readiness (G3); both are still open. | **Landed** (accepted, not "proposed") |
+| `tj-8konfu` — gRPC surface | Re-hosted the fetch call as `IngestService.FetchDataset` (a pull stream, since deleted in P37 and replaced by `Submit` and the push result path, see I1) and added a contract this document does not fully cover (see `proto/README.md`). It did **not** settle versioning (G11) or readiness (G3); both are still open. | **Landed** (accepted, not "proposed") |
 | `tj-iontkq` — monorepo split | Moved the server code under `server/`, internals unchanged. Every file path above is now relative to `server/`; addresses survived. | **Landed** |
 | `tj-a0s7vl` — authentication | Adds a real credential to every entry, replacing both `auth: none` and the deployment-level instance secret. | Pending |
 

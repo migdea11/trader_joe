@@ -4,11 +4,14 @@ framework for testing trading algos
 ## Design
 ![Design Image](docs/img/design.jpg)
 
-**Direction, not built:** request scheduling moves to ingest, with the store keeping the request log
-and each request's state (decided by the owner on 2026-10-12, recorded on decision record `tj-pd41mt`,
-whose end-state design is still being written up). Today there is no
-request log, queue or scheduler: a request is a `POST /store`, and the store only records each fetch
-it drives as a run.
+**Request scheduling lives in ingest, and the store keeps the request log** (owner ruling 2026-10-12, ADR
+`tj-26jt9w`). A request is a `POST /store`, or a request the store's own loops send. The store writes it to a
+durable log (`ingest_request`) before sending it. Ingest holds it on a per-broker FIFO queue, checks its `ready_by`
+when it is taken off the queue, paces and counts every vendor call, and pushes each attempt's result to the store,
+which acknowledges it before any retry runs. The module is described in [`docs/scheduler.md`](docs/scheduler.md) and
+its failure and restart behaviour in [`docs/runbooks/queue-ack-restart.md`](docs/runbooks/queue-ack-restart.md). Not
+built: a planner with admission control and a quota cap that survives a restart (the end-state design `tj-pd41mt` is
+still proposed).
 
 ## Getting Started
 Take a look at the `Makefile` for all the major commands. Every compose target names the stack it
@@ -368,7 +371,7 @@ The reaper still deletes a stopped dataset once its expiry has passed. A stopped
 until you delete it.
 The full contract is in [`docs/API.md`](docs/API.md).
 
-**The daily refresh is an interim scheduler**, kept in the store until ingest has its own. Per trading
+**The daily refresh is an interim scheduler**, kept in the store because ingest's scheduler does not generate standing requests. Per trading
 calendar it runs after the session close plus `DAILY_REFRESH_SETTLE_MINUTES`, and once at start. Each pass
 requests, one dataset at a time and at most `DAILY_REFRESH_MAX_PER_PASS`, only the missing tail of each
 `DAILY` dataset that is collecting (`collect` not false) and is behind. A transient failure backs off (starting at
@@ -395,7 +398,9 @@ for a new member within two hourly limits that are set per source: new datasets 
 (a creation costs two). A member that exits has its dataset stopped, never deleted. The members' daily bars are
 the daily refresh's, so raise `DAILY_REFRESH_MAX_PER_PASS` for a large panel. With `PANEL_MANAGER_DRY_RUN=true`
 it records what it would do and applies nothing. The mechanics are in
-[`server/data/store/CLAUDE.md`](server/data/store/CLAUDE.md#panels-and-the-panel-manager).
+[`server/data/store/CLAUDE.md`](server/data/store/CLAUDE.md#panels-and-the-panel-manager), and the
+operator's view, with the switches, the ledger and the sitting checks, in
+[`docs/runbooks/panel-manager.md`](docs/runbooks/panel-manager.md).
 
 **Usage tracking.** Each bar read is recorded as one row against a label the reader sends in the
 `X-Client-Id` header: send your owner string. It is a label for usage statistics, never a credential,

@@ -442,9 +442,9 @@ def test_residual_an_interior_control_character_passes_the_httpcore_trace_double
     backslashes. A trailing CR or LF is still covered by the stripped form (test above); an INTERIOR
     control character leaves both halves of the value in the trace. Only at LOG_LEVEL=DEBUG (the sink
     is INFO otherwise). get_client builds the requests-based Alpaca client, not an httpx sender, and
-    refuses such a value before building it (tj-7zjov1.67). The only httpx sender that carries a
-    credential is the dev vendor probe, which runs check_credential before it builds its client, so
-    no such value reaches this trace (accepted residual, architect ruling F2 on tj-7zjov1.74).
+    refuses such a value before building it (tj-7zjov1.67). No httpx sender in the repo now carries
+    a vendor credential (the dev vendor probe that did is gone, tj-7zjov1.63), so no such value
+    reaches this trace (accepted residual, architect ruling F2 on tj-7zjov1.74).
     If this goes red, the form was added: invert it.
     """
     head, tail = _made_up('HEAD'), _made_up('TAIL')
