@@ -5,10 +5,10 @@ tj-iee6sn.14 (the mirror is `up -d pgadmin`; --wait is kept only as the ONE name
 is the wrapper plus the dev prefix plus the trusted docker-compose.tools.yaml; one new lifecycle row;
 PGADMIN_* never in a step env, argv or audit), the 14:59 note (S6 covers the tools file), owner rulings
 D5-D7 and R2 on tj-iee6sn.1, and ADR tj-4rr0la addenda 22-24. tools is a PLAIN call (300 s, no job).
-Order, a refusal at any point running nothing after it and charging nothing:
+Order, a refusal at any point running nothing after it:
 
     D7 guard -> S6 stale copies (the tools file included) -> D6 bind-source symlinks -> D5 env-file
-    preflight -> ONE budget charge -> devnet inspect, else create, else inspect again -> the file-based
+    preflight -> devnet inspect, else create, else inspect again -> the file-based
     `up -d --wait pgadmin` over the dev files with the tools file inserted before the MCP-only overlay,
     run by up's fixed `sh -c` wrapper that derives INSTANCE_WRITE_SECRET inside the child.
 
@@ -37,9 +37,12 @@ import yaml
 from common.tests.test_ci_invariants import _make_variable
 from tools.agent_mcp import runner, stack
 from tools.agent_mcp.tests.harness import (
+    CALL_VOLUME,
+    OLD_BUDGET_REFUSAL,
     REPO_ROOT,
     FakeDocker,
     Rig,
+    assert_no_call_counter,
     default_response,
     dev_up_compose_argv,
     is_dev_up_wrapper,
@@ -79,9 +82,7 @@ UP_FAILED = (
     'PGADMIN_PASS, set it in the root env file (the pgAdmin password needs 6+ characters); see the steps and call logs'
 )
 NETWORK_FAILED = 'the trader_joe_devnet network could not be created; pgAdmin was not started'
-BUDGET_REFUSAL = '12 state-changing dev verbs in the last hour is the budget; wait, or run the make target yourself'
 STALE_PREFIX = 'the MCP image is stale: '
-BUDGET = 12
 # FAKE values in a FIXTURE env file in a tmp layout: never a real credential.
 FAKE_EMAIL = 'dummy-not-a-secret-pgadmin@example.invalid'
 FAKE_PASS = 'dummy-not-a-secret-pgadmin-pass'
@@ -138,16 +139,6 @@ def _argvs(rig: Rig) -> list[tuple[str, ...]]:
     return [step.argv for step in rig.docker.steps]
 
 
-def _charges_left(rig: Rig) -> int:
-    """How many more charges the budget takes before refusing (it is consumed by asking)."""
-    for taken in range(BUDGET + 1):
-        try:
-            rig.agent.dev_budget.charge()
-        except stack.Refused:
-            return taken
-    raise AssertionError('the budget never refused')
-
-
 # ===============================================================================================
 # THE CALL THAT WORKS
 # ===============================================================================================
@@ -162,7 +153,7 @@ def test_dev_tools_runs_the_guard_the_network_and_the_wrapped_up_and_answers_ok(
     assert _argvs(rig) == full_run(rig.layout.repo_host_path)
     assert all(step.cwd == rig.layout.stack_dir for step in rig.docker.steps), rig.docker.steps
     assert 'job' not in json.dumps(result).lower(), 'a plain call, never a job'
-    assert _charges_left(rig) == BUDGET - 1, 'charged exactly once'
+    assert_no_call_counter(rig)
 
 
 def test_the_up_is_the_six_wrapper_words_the_tools_prefix_and_up_d_wait_pgadmin(
@@ -251,7 +242,7 @@ def test_no_pgadmin_key_or_credential_word_is_in_any_argv_env_command_or_audit(
 
 
 # ===============================================================================================
-# THE ORDER: each refusal runs only the steps before it and charges nothing
+# THE ORDER: each refusal runs only the steps before it
 # ===============================================================================================
 
 
@@ -286,9 +277,9 @@ def _env_file_a_symlink(rig: Rig, responder: Responder) -> None:
     (rig.layout.repo / '.env').symlink_to(outside)
 
 
-def _spent_budget(rig: Rig, responder: Responder) -> None:
-    for _ in range(BUDGET):
-        rig.agent.dev_budget.charge()
+def _no_network(rig: Rig, responder: Responder) -> None:
+    responder.network_inspects = [1, 1]
+    responder.create_exit = 1
 
 
 REFUSALS = {
@@ -301,29 +292,25 @@ REFUSALS = {
         'server/data/store/.env is not a regular file: remove it, or start the stack yourself',
     ),
     'D5: an env file that is a symlink': (_env_file_a_symlink, symlink_refusal('.env', '.env')),
-    'the budget spent': (_spent_budget, BUDGET_REFUSAL),
 }
 
 
 @pytest.mark.parametrize(('breaks', 'message'), list(REFUSALS.values()), ids=list(REFUSALS))
-def test_each_refusal_runs_only_the_guard_and_charges_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, breaks, message: str
-):
+def test_each_refusal_runs_only_the_guard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, breaks, message: str):
     rig, responder = _rig(tmp_path, monkeypatch)
     breaks(rig, responder)
     result = _call(rig)
     assert result['status'] == 'refused', result
     assert result['message'].startswith(message), result
     assert _argvs(rig) == [GUARD]
-    if breaks is not _spent_budget:
-        assert _charges_left(rig) == BUDGET, 'a refused call was charged'
+    assert_no_call_counter(rig)
 
 
 PAIRS = {
     'D7 before S6': (_prod_container, _stale_tools_file, 'project trader_joe_dev holds a container not started'),
     'S6 before D6': (_stale_tools_file, _symlinked_bind_source, STALE_PREFIX),
     'D6 before D5': (_symlinked_bind_source, _env_file_a_directory, 'a symlink at server/common'),
-    'D5 before the budget': (_env_file_a_directory, _spent_budget, 'server/data/store/.env is not a regular file'),
+    'D5 before the network': (_env_file_a_directory, _no_network, 'server/data/store/.env is not a regular file'),
 }
 
 
@@ -344,7 +331,8 @@ def test_a_failed_guard_listing_runs_nothing_else(tmp_path: Path, monkeypatch: p
     _stale_tools_file(rig, responder)
     result = _call(rig)
     assert result['message'] == 'could not list the containers of project trader_joe_dev, so nothing was changed'
-    assert _argvs(rig) == [GUARD] and _charges_left(rig) == BUDGET
+    assert _argvs(rig) == [GUARD]
+    assert_no_call_counter(rig)
 
 
 def test_a_project_with_a_dev_tools_pgadmin_in_it_passes_the_next_guard(
@@ -358,8 +346,23 @@ def test_a_project_with_a_dev_tools_pgadmin_in_it_passes_the_next_guard(
 
 
 # ===============================================================================================
-# FAILURES AFTER ADMISSION: charged once
+# FAILURES AFTER ADMISSION, AND NO LIMIT ON ADMITTED CALLS
 # ===============================================================================================
+
+
+def test_thirteen_tools_calls_inside_one_hour_are_all_admitted_and_each_runs_the_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The withdrawn S10 budget refused the thirteenth call in an hour; now each runs guard, network, up."""
+    rig, _ = _rig(tmp_path, monkeypatch)
+    host = rig.layout.repo_host_path
+    for _ in range(CALL_VOLUME):
+        before = len(rig.docker.steps)
+        result = _call(rig)
+        assert (result['status'], result['message']) == ('ok', OK_MESSAGE), result
+        assert result['message'] != OLD_BUDGET_REFUSAL
+        assert _argvs(rig)[before:] == full_run(host)
+    assert_no_call_counter(rig)
 
 
 def test_a_missing_network_is_created_then_looked_up_again(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -376,18 +379,16 @@ def test_no_network_after_the_create_fails_and_pgadmin_is_not_started(tmp_path: 
     result = _call(rig)
     assert (result['status'], result['message']) == ('failed', NETWORK_FAILED), result
     assert _argvs(rig) == [GUARD, NET_INSPECT, NET_CREATE, NET_INSPECT]
-    assert _charges_left(rig) == BUDGET - 1
+    assert_no_call_counter(rig)
 
 
-def test_a_failed_up_answers_failed_naming_the_two_variables_and_is_charged_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
+def test_a_failed_up_answers_failed_naming_the_two_variables(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     rig, responder = _rig(tmp_path, monkeypatch)
     responder.up_exit = 1
     result = _call(rig)
     assert (result['status'], result['message'], result['exit_status']) == ('failed', UP_FAILED, 1), result
     assert _argvs(rig) == full_run(rig.layout.repo_host_path)
-    assert _charges_left(rig) == BUDGET - 1
+    assert_no_call_counter(rig)
 
 
 # ===============================================================================================
@@ -602,7 +603,7 @@ def test_an_unset_credential_is_composes_refusal_surfaced_as_failed_naming_the_v
     assert f'required variable {missing} is missing a value' in stderr, stderr
     kept = _everything_the_server_kept(rig, result)
     assert FAKE_EMAIL not in kept and FAKE_PASS not in kept
-    assert _charges_left(rig) == BUDGET - 1
+    assert_no_call_counter(rig)
 
 
 def test_the_real_tools_files_guards_name_the_variable_and_never_a_value():
@@ -681,11 +682,12 @@ def test_the_schema_is_closed_and_takes_nothing():
 @pytest.mark.parametrize(
     'arguments', [{'service': 'pgadmin'}, {'email': FAKE_EMAIL}, {'password': FAKE_PASS}, ['up'], 'up'], ids=repr
 )
-def test_any_argument_is_refused_with_no_step_and_no_charge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arguments):
+def test_any_argument_is_refused_with_no_step(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arguments):
     rig, _ = _rig(tmp_path, monkeypatch)
     result = _call(rig, arguments)
     assert result['status'] == 'refused'
-    assert rig.docker.steps == [] and _charges_left(rig) == BUDGET
+    assert rig.docker.steps == []
+    assert_no_call_counter(rig)
     assert FAKE_PASS not in '\n'.join(rig.audit_lines())
 
 

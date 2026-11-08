@@ -676,7 +676,10 @@ class Rig:
     agent: runner.AgentStack
 
     def call(self, verb: str, arguments: object) -> dict[str, Any]:
-        return asyncio.run(self.agent.call(verb, arguments))
+        result = asyncio.run(self.agent.call(verb, arguments))
+        # Every message any rig call reaches, refusals included, is checked for the withdrawn budget.
+        assert_no_budget_wording(result.get('message', ''))
+        return result
 
     def audit_lines(self) -> list[str]:
         path = self.layout.stack_dir / stack.AUDIT_LOG_NAME
@@ -710,9 +713,34 @@ def make_rig(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, docker: FakeDocker
     return Rig(layout=layout, git=git, docker=fake_docker, agent=runner.AgentStack(layout.settings, run=fake_docker))
 
 
-def budget_spent(rig: Rig) -> int:
-    """How many state-changing calls the rig's S10 budget holds in its window (read in place, never charged)."""
-    return len(rig.agent.dev_budget._calls)
+# THE BUDGET'S ABSENCE (ADR tj-4rr0la addendum 33, owner ruling 2026-11-06). The S10 budget of 12
+# state-changing dev calls per rolling hour is withdrawn: no verb charges, counts or refuses on call
+# volume, and no counter exists anywhere in the MCP. These helpers pin that absence.
+
+# The withdrawn refusal, word for word as stack.DevBudget raised it at 9fffd07.
+OLD_BUDGET_REFUSAL = '12 state-changing dev verbs in the last hour is the budget; wait, or run the make target yourself'
+# Admitted calls a volume test makes, well past the withdrawn limit of 12. A rig's calls all land within
+# seconds, so every one of them falls inside a single rolling hour.
+CALL_VOLUME = 13
+# Words the withdrawn budget's refusal and descriptions used; none may reach an agent any more.
+BUDGET_WORDS = ('budget', 'an hour', 'per hour', 'hourly')
+
+
+def assert_no_budget_wording(text: str) -> None:
+    """TEXT, a tool description or a result message, says nothing of a budget or an hourly limit."""
+    lowered = text.lower()
+    assert OLD_BUDGET_REFUSAL.lower() not in lowered, text
+    assert [word for word in BUDGET_WORDS if word in lowered] == [], text
+
+
+def assert_no_call_counter(rig: Rig) -> None:
+    """The rig's runner holds no budget and stack exposes none: no dev_budget, no DevBudget, no DEV_BUDGET_*."""
+    assert not hasattr(rig.agent, 'dev_budget')
+    assert [name for name in vars(rig.agent) if 'budget' in name.lower() or 'charge' in name.lower()] == []
+    assert not hasattr(stack, 'DevBudget')
+    assert not hasattr(stack, 'DEV_BUDGET_LIMIT')
+    assert not hasattr(stack, 'DEV_BUDGET_WINDOW_SECONDS')
+    assert [name for name in dir(stack) if 'budget' in name.lower()] == []
 
 
 # A valid call of every verb. A verb added to AgentStack without an entry here fails

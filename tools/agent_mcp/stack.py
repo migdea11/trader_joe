@@ -37,7 +37,6 @@ import shutil
 import stat
 import subprocess  # nosec B404 -- argument lists only, never a shell; see run_git
 import threading
-import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from decimal import Decimal
@@ -1479,33 +1478,6 @@ def check_trusted_copies_current(repo_root: Path, trusted_dir: Path = TRUSTED_CO
             )
 
 
-# S10. A looping agent must be stopped, not served: starting data_ingest can trigger the daily refresh
-# against the owner's paper quota. In memory, so an MCP restart resets it.
-DEV_BUDGET_LIMIT = 12
-DEV_BUDGET_WINDOW_SECONDS = 3600.0
-
-
-class DevBudget:
-    """At most DEV_BUDGET_LIMIT state-changing dev verbs per rolling DEV_BUDGET_WINDOW_SECONDS."""
-
-    def __init__(self, clock: Callable[[], float] = time.monotonic):
-        self._clock = clock
-        self._lock = threading.Lock()
-        self._calls: list[float] = []
-
-    def charge(self) -> None:
-        """Count one verb, or Refused when the window already holds the limit; a refused call is not counted."""
-        now = self._clock()
-        with self._lock:
-            self._calls = [at for at in self._calls if now - at < DEV_BUDGET_WINDOW_SECONDS]
-            if len(self._calls) >= DEV_BUDGET_LIMIT:
-                raise Refused(
-                    f'{DEV_BUDGET_LIMIT} state-changing dev verbs in the last hour is the budget; wait, '
-                    'or run the make target yourself'
-                )
-            self._calls.append(now)
-
-
 # ---------------------------------------------------------------------------------------------
 # THE LABEL-ONLY MUTATING VERBS, down AND restart (tj-iee6sn.7; owner rulings D1, D2, D6, D7).
 # `docker compose -p trader_joe_dev down` and `... restart <service>` pass no -f, so compose may search the
@@ -1578,7 +1550,7 @@ def dev_restart_steps(stack_dir: Path, service: str) -> list[Step]:
 # --project-directory the repository's host path. It creates and starts nothing and reads no env file
 # (the step env is dev_placeholder_step_env), so it needs no prod guard, no symlink check and no
 # steering walk: every -f is given, and a `:dev` image is not a container. What it does run, in
-# order: the stale-copy check (S6), the generated-code freshness precondition, the budget, the two
+# order: the stale-copy check (S6), the generated-code freshness precondition, the two
 # source digests from the TRUSTED source_digest.sh, then the build (the runner has the base images
 # present first, as for every building step).
 DEV_GENERATED_DIRS = ('gen/proto/python', 'gen/proto/ts')

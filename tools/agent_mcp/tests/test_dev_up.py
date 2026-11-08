@@ -3,13 +3,13 @@
 Design checked against: the architect's 17:02 UTC consolidated note on tj-iee6sn.9 (it wins over the
 description and the earlier notes, restating the 04:31 amendment and the 14:59 F9 wrapper), owner
 rulings D1, D3, D5 and D8 on tj-iee6sn.1, and ADR tj-4rr0la addenda 22-24 (addendum 23 (3): the secret).
-up is a PLAIN call (D8, 600 s, no job). Order, a refusal at any point running nothing after it and
-charging nothing, and a failure before the down never stopping anything:
+up is a PLAIN call (D8, 600 s, no job). Order, a refusal at any point running nothing after it, and a
+failure before the down never stopping anything:
 
     D7 guard -> S6 stale copies -> D6 bind-source symlinks -> D5 env-file preflight -> the steering
     walk (the label-only down passes no -f, so compose searches the stack directory and its parents)
     -> generated-code freshness -> one `docker image inspect` per :dev image (missing: 'call build')
-    -> ONE budget charge -> the two trusted digests (a failure returns BEFORE the down) -> the
+    -> the two trusted digests (a failure returns BEFORE the down) -> the
     label-only `docker compose -p trader_joe_dev down` -> devnet inspect, else create, else inspect again
     -> the bases (the up can build) -> the file-based up of postgres and the three apps, run by the
     fixed `sh -c` wrapper that derives INSTANCE_WRITE_SECRET inside the child.
@@ -36,9 +36,12 @@ import pytest
 from common.tests.test_ci_invariants import _made_variable, _make_variable
 from tools.agent_mcp import runner, stack
 from tools.agent_mcp.tests.harness import (
+    CALL_VOLUME,
+    OLD_BUDGET_REFUSAL,
     REPO_ROOT,
     FakeDocker,
     Rig,
+    assert_no_call_counter,
     default_response,
     dev_up_compose_argv,
     is_dev_digest,
@@ -101,10 +104,8 @@ OK_MESSAGE = 'the trader_joe_dev project was stopped and postgres, data_store, d
 DOWN_FAILED = 'compose down failed for the trader_joe_dev project; nothing was started'
 NETWORK_FAILED = 'the trader_joe_devnet network could not be created; the project is down'
 UP_FAILED = 'compose up failed for the trader_joe_dev project; see the steps and call logs'
-BUDGET_REFUSAL = '12 state-changing dev verbs in the last hour is the budget; wait, or run the make target yourself'
 STALE_PREFIX = 'the MCP image is stale: '
 GENERATE_HINT = 'run make proto gen-proto-ts in the root checkout'
-BUDGET = 12
 # A FAKE secret in a FAKE env file in a tmp layout: never a real value.
 FAKE_SECRET = 'fake-instance-secret-0d5c9e71'
 
@@ -197,16 +198,6 @@ def _call(rig: Rig, arguments: Any = None) -> dict[str, Any]:
 
 def _argvs(rig: Rig) -> list[tuple[str, ...]]:
     return [step.argv for step in rig.docker.steps]
-
-
-def _charges_left(rig: Rig) -> int:
-    """How many more charges the budget takes before refusing (it is consumed by asking)."""
-    for taken in range(BUDGET + 1):
-        try:
-            rig.agent.dev_budget.charge()
-        except stack.Refused:
-            return taken
-    raise AssertionError('the budget never refused')
 
 
 # ===============================================================================================
@@ -310,7 +301,7 @@ def test_only_the_up_step_is_flagged_as_building(tmp_path: Path, monkeypatch: py
 
 
 # ===============================================================================================
-# THE ORDER: each refusal runs only the steps before it and charges nothing
+# THE ORDER: each refusal runs only the steps before it
 # ===============================================================================================
 
 
@@ -347,9 +338,8 @@ def _stale_generated(rig: Rig, responder: Responder) -> None:
     shutil.rmtree(rig.layout.repo / 'gen' / 'proto' / 'ts')
 
 
-def _spent_budget(rig: Rig, responder: Responder) -> None:
-    for _ in range(BUDGET):
-        rig.agent.dev_budget.charge()
+def _failing_digest(rig: Rig, responder: Responder) -> None:
+    responder.digests['store'] = (1, b'')
 
 
 def _missing_image(index: int):
@@ -379,12 +369,11 @@ REFUSALS = {
     'no data_store:dev image': (_missing_image(0), _image_refusal(0), 2),
     'no data_ingest:dev image': (_missing_image(1), _image_refusal(1), 3),
     'no web:dev image': (_missing_image(2), _image_refusal(2), 4),
-    'the budget spent': (_spent_budget, BUDGET_REFUSAL, 4),
 }
 
 
 @pytest.mark.parametrize(('breaks', 'message', 'ran'), list(REFUSALS.values()), ids=list(REFUSALS))
-def test_each_refusal_runs_only_the_steps_before_it_and_charges_nothing(
+def test_each_refusal_runs_only_the_steps_before_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, breaks, message: str | None, ran: int
 ):
     rig, responder = _rig(tmp_path, monkeypatch)
@@ -399,8 +388,7 @@ def test_each_refusal_runs_only_the_steps_before_it_and_charges_nothing(
         assert result['message'] == message, result
     assert _argvs(rig) == full_run(rig.layout.repo_host_path)[:ran]
     assert DOWN not in _argvs(rig)
-    if breaks is not _spent_budget:
-        assert _charges_left(rig) == BUDGET, 'a refused call was charged'
+    assert_no_call_counter(rig)
 
 
 # Two things broken at once: the EARLIER check of the designed order must be the one that answers.
@@ -410,7 +398,7 @@ PAIRS = {
     'D5 before steering': (_env_file_a_directory, _steering_file, 'server/data/store/.env is not a regular file'),
     'steering before freshness': (_steering_file, _stale_generated, 'would steer compose'),
     'freshness before the images': (_stale_generated, _missing_image(0), 'gen/proto/ts is missing or empty'),
-    'the images before the budget': (_missing_image(0), _spent_budget, 'the image trader_joe_data_store:dev'),
+    'the images before the digests': (_missing_image(0), _failing_digest, 'the image trader_joe_data_store:dev'),
     'D7 before S6': (_prod_container, _stale_copy, 'project trader_joe_dev holds a container not started'),
 }
 
@@ -437,7 +425,7 @@ def test_the_guard_runs_first_even_with_every_later_check_failing(tmp_path: Path
 
 
 # ===============================================================================================
-# FAILURES AFTER ADMISSION: charged once; nothing before the down stops anything
+# FAILURES AFTER ADMISSION: nothing before the down stops anything
 # ===============================================================================================
 
 _BAD_DIGESTS = {
@@ -450,7 +438,7 @@ _BAD_DIGESTS = {
 
 
 @pytest.mark.parametrize(('service_name', 'answer'), list(_BAD_DIGESTS.values()), ids=list(_BAD_DIGESTS))
-def test_a_failed_digest_returns_before_the_down_and_is_charged_once(
+def test_a_failed_digest_returns_before_the_down(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, service_name: str, answer
 ):
     """The 17:02 note: a failed or malformed digest returns failed BEFORE the down, so it never leaves the stack down."""
@@ -464,7 +452,7 @@ def test_a_failed_digest_returns_before_the_down_and_is_charged_once(
     assert _argvs(rig) == ran
     assert DOWN not in _argvs(rig) and not [argv for argv in _argvs(rig) if argv[1] == 'network']
     assert not [argv for argv in _argvs(rig) if argv in base_inspects()], 'a failed digest pulls no base'
-    assert _charges_left(rig) == BUDGET - 1
+    assert_no_call_counter(rig)
 
 
 def test_a_failed_down_starts_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -473,7 +461,22 @@ def test_a_failed_down_starts_nothing(tmp_path: Path, monkeypatch: pytest.Monkey
     result = _call(rig)
     assert (result['status'], result['message']) == ('failed', DOWN_FAILED), result
     assert _argvs(rig) == [*before_down(rig.layout.repo_host_path), DOWN]
-    assert _charges_left(rig) == BUDGET - 1
+    assert_no_call_counter(rig)
+
+
+def test_thirteen_ups_inside_one_hour_are_all_admitted_and_each_runs_the_whole_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The withdrawn S10 budget refused the thirteenth up in an hour; now each runs to its up step."""
+    rig, _ = _rig(tmp_path, monkeypatch)
+    host = rig.layout.repo_host_path
+    for _ in range(CALL_VOLUME):
+        before = len(rig.docker.steps)
+        result = _call(rig)
+        assert result['status'] == 'ok' and result['message'] != OLD_BUDGET_REFUSAL, result
+        assert _argvs(rig)[before:][-1] == up_argv(host)
+    assert _argvs(rig).count(up_argv(host)) == CALL_VOLUME
+    assert_no_call_counter(rig)
 
 
 def test_a_missing_network_is_created_then_looked_up_again(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -526,8 +529,7 @@ def test_a_failed_base_pull_stops_nothing_and_starts_nothing(
     """17:33 gate ruling F-A: an absent base whose pull fails is found BEFORE anything is ended.
 
     The call stops after the digests and the base steps: no down (the project was not stopped), no
-    network step, no up. BasePullFailed's 'nothing was built' is then the whole truth, and the call
-    was admitted, so it is charged once.
+    network step, no up. BasePullFailed's 'nothing was built' is then the whole truth.
     """
     rig, responder = _rig(tmp_path, monkeypatch)
     ref = stack.BASE_IMAGES[failing]
@@ -548,7 +550,7 @@ def test_a_failed_base_pull_stops_nothing_and_starts_nothing(
     assert DOWN not in _argvs(rig), 'a failed pull stopped the project'
     assert not [argv for argv in _argvs(rig) if argv[1] == 'network']
     assert not [step for step in rig.docker.steps if is_dev_up_wrapper(step) or step.builds]
-    assert _charges_left(rig) == BUDGET - 1
+    assert_no_call_counter(rig)
 
 
 def test_an_absent_base_is_pulled_before_the_down_and_never_again(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -884,7 +886,7 @@ def test_a_second_dev_up_while_one_runs_is_told_busy_and_runs_nothing(tmp_path: 
         assert other['status'] == 'busy' and 'up is running' in other['message'], other
         assert other['steps'] == []
     assert _argvs(rig).count(DOWN) == 1 and _argvs(rig).count(GUARD) == 1
-    assert _charges_left(rig) == BUDGET - 1
+    assert_no_call_counter(rig)
 
 
 # ===============================================================================================
@@ -904,10 +906,11 @@ def test_the_schema_is_closed_and_takes_nothing():
 @pytest.mark.parametrize(
     'arguments', [{'service': 'web'}, {'services': ['postgres']}, {'no_deps': True}, ['up'], 'up'], ids=repr
 )
-def test_any_argument_is_refused_with_no_step_and_no_charge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arguments):
+def test_any_argument_is_refused_with_no_step(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arguments):
     rig, _ = _rig(tmp_path, monkeypatch)
     assert _call(rig, arguments)['status'] == 'refused'
-    assert rig.docker.steps == [] and _charges_left(rig) == BUDGET
+    assert rig.docker.steps == []
+    assert_no_call_counter(rig)
 
 
 def test_the_timeout_is_ten_minutes_inside_the_clients():

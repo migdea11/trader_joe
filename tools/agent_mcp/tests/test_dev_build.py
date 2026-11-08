@@ -7,7 +7,7 @@ no env file (D5): its build step runs in the placeholder env with COMPOSE_ENV_FI
 prod guard, no D6 check and no steering walk (it starts nothing; every -f is given). Order, a refusal at
 any point running nothing after it:
 
-    S6 stale-copy check -> generated-code freshness -> ONE budget charge
+    S6 stale-copy check -> generated-code freshness
         -> the two TRUSTED digests -> the bases (runner) -> ONE file-based build
 
 Every call goes through the REAL AgentStack with the fake-docker rig (harness.make_rig points the real S6
@@ -32,7 +32,17 @@ import yaml
 
 from common.tests.test_ci_invariants import _make_variable
 from tools.agent_mcp import runner, stack
-from tools.agent_mcp.tests.harness import REPO_ROOT, FakeDocker, Rig, default_response, is_dev_digest, make_rig
+from tools.agent_mcp.tests.harness import (
+    CALL_VOLUME,
+    OLD_BUDGET_REFUSAL,
+    REPO_ROOT,
+    FakeDocker,
+    Rig,
+    assert_no_call_counter,
+    default_response,
+    is_dev_digest,
+    make_rig,
+)
 from tools.agent_mcp.tests.test_commands import _mcp_dockerfile_copies
 
 
@@ -78,10 +88,8 @@ PLACEHOLDER_ENV = (
 BUILD_ENV = (*PLACEHOLDER_ENV, ('SOURCE_DIGEST_DATA_STORE', STORE_DIGEST), ('SOURCE_DIGEST_DATA_INGEST', INGEST_DIGEST))
 OK_MESSAGE = 'the trader_joe_dev :dev images (data_store, data_ingest, web) are built and stamped'
 BUILD_FAILED = 'compose build failed for the trader_joe_dev project'
-BUDGET_REFUSAL = '12 state-changing dev verbs in the last hour is the budget; wait, or run the make target yourself'
 STALE_PREFIX = 'the MCP image is stale: '
 GENERATE_HINT = 'run make proto gen-proto-ts in the root checkout'
-BUDGET = 12
 
 
 def file_prefix(host: Path) -> tuple[str, ...]:
@@ -125,14 +133,9 @@ def _call(rig: Rig, arguments: Any = None) -> dict[str, Any]:
     return rig.call('build', {} if arguments is None else arguments)
 
 
-def _charges_left(rig: Rig) -> int:
-    """How many more charges the budget takes before refusing (it is consumed by asking)."""
-    for taken in range(BUDGET + 1):
-        try:
-            rig.agent.dev_budget.charge()
-        except stack.Refused:
-            return taken
-    raise AssertionError('the budget never refused')
+def _builds(rig: Rig) -> list[stack.Step]:
+    """The compose build steps the rig has seen: the verb's act step."""
+    return [step for step in rig.docker.steps if step.argv[:2] == (DOCKER, 'compose')]
 
 
 # ===============================================================================================
@@ -431,7 +434,7 @@ def test_dev_build_over_a_symlinked_copy_source_fails_and_runs_no_base_or_build(
 
 
 # ===============================================================================================
-# THE ORDER: S6, then freshness, then the budget; a refusal runs and charges nothing
+# THE ORDER: S6, then freshness, then the digests; a refusal runs nothing after it
 # ===============================================================================================
 
 
@@ -440,14 +443,15 @@ def _stale_trusted_copy(rig: Rig) -> None:
     path.write_bytes(path.read_bytes() + b'# drift\n')
 
 
-def test_a_stale_trusted_copy_refuses_with_no_step_and_no_charge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_a_stale_trusted_copy_refuses_with_no_step(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     rig, _ = _rig(tmp_path, monkeypatch)
     _stale_trusted_copy(rig)
     result = _call(rig)
     assert result['status'] == 'refused', result
     assert result['message'].startswith(f'{STALE_PREFIX}docker-compose.web.dev.yaml differs'), result
     assert 'make agent-mcp-rebuild' in result['message']
-    assert rig.docker.steps == [] and _charges_left(rig) == BUDGET
+    assert rig.docker.steps == []
+    assert_no_call_counter(rig)
 
 
 @pytest.mark.parametrize('name', [checkout for checkout, _ in stack.DEV_TRUSTED_COPIES])
@@ -580,7 +584,7 @@ _STALE_GENERATED = {
 
 
 @pytest.mark.parametrize(('make_stale', 'reason'), list(_STALE_GENERATED.values()), ids=list(_STALE_GENERATED))
-def test_missing_or_unstamped_or_stale_generated_code_refuses_naming_the_fix_with_no_step_and_no_charge(
+def test_missing_or_unstamped_or_stale_generated_code_refuses_naming_the_fix_with_no_step(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_stale, reason: str
 ):
     rig, _ = _rig(tmp_path, monkeypatch)
@@ -588,7 +592,8 @@ def test_missing_or_unstamped_or_stale_generated_code_refuses_naming_the_fix_wit
     result = _call(rig)
     assert result['status'] == 'refused', result
     assert result['message'] == f'{reason}: {GENERATE_HINT}'
-    assert rig.docker.steps == [] and _charges_left(rig) == BUDGET
+    assert rig.docker.steps == []
+    assert_no_call_counter(rig)
 
 
 def test_a_digest_the_trusted_script_refuses_refuses_the_build(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -599,7 +604,8 @@ def test_a_digest_the_trusted_script_refuses_refuses_the_build(tmp_path: Path, m
     assert result['status'] == 'refused', result
     assert result['message'].startswith('the ts proto digest could not be computed (proto_digest.sh: refusing'), result
     assert result['message'].endswith(f'): {GENERATE_HINT}'), result
-    assert rig.docker.steps == [] and _charges_left(rig) == BUDGET
+    assert rig.docker.steps == []
+    assert_no_call_counter(rig)
 
 
 def _same_second(repo: Path) -> None:
@@ -651,55 +657,57 @@ def test_generated_code_whose_stamp_is_current_builds_whatever_the_mtimes(
     assert _call(rig)['status'] == 'ok'
 
 
-def test_the_freshness_check_runs_before_the_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """With the budget spent, a stale tree is still refused for being stale: the budget comes after."""
+def test_the_freshness_check_still_refuses_a_stale_tree_after_many_admitted_builds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """After CALL_VOLUME admitted builds a stale tree is refused for being stale, with no step: no counter."""
     rig, _ = _rig(tmp_path, monkeypatch)
-    for _ in range(BUDGET):
-        rig.agent.dev_budget.charge()
+    for _ in range(CALL_VOLUME):
+        assert _call(rig)['status'] == 'ok'
+    steps = len(rig.docker.steps)
     _missing_ts(rig.layout.repo)
     assert _call(rig)['message'] == f'gen/proto/ts is missing or empty: {GENERATE_HINT}'
-
-
-def test_a_spent_budget_refuses_with_no_step(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    rig, _ = _rig(tmp_path, monkeypatch)
-    for _ in range(BUDGET):
-        rig.agent.dev_budget.charge()
-    result = _call(rig)
-    assert result['status'] == 'refused' and result['message'] == BUDGET_REFUSAL, result
-    assert rig.docker.steps == []
-
-
-def test_an_admitted_call_is_charged_exactly_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    rig, _ = _rig(tmp_path, monkeypatch)
-    assert _call(rig)['status'] == 'ok'
-    assert _charges_left(rig) == BUDGET - 1
-
-
-def test_a_failed_digest_is_charged_once_too(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """The budget is charged once admitted, before the digests, so a failing digest counts.
-
-    A looping agent whose digest fails is still stopped after twelve calls (the 17:25 note: 'budget
-    charged only once admitted').
-    """
-    rig, responder = _rig(tmp_path, monkeypatch)
-    responder.digests['store'] = (1, b'')
-    assert _call(rig)['status'] == 'failed'
-    assert _charges_left(rig) == BUDGET - 1
-
-
-def test_twelve_builds_an_hour_and_the_thirteenth_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    rig, _ = _rig(tmp_path, monkeypatch)
-    assert [_call(rig)['status'] for _ in range(BUDGET)] == ['ok'] * BUDGET
-    steps = len(rig.docker.steps)
-    assert _call(rig)['message'] == BUDGET_REFUSAL
     assert len(rig.docker.steps) == steps
 
 
-def test_the_budget_is_shared_with_the_label_only_verbs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_an_admitted_call_counts_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     rig, _ = _rig(tmp_path, monkeypatch)
-    for _ in range(BUDGET):
+    assert _call(rig)['status'] == 'ok'
+    assert len(_builds(rig)) == 1
+    assert_no_call_counter(rig)
+
+
+def test_a_failed_digest_counts_nothing_and_the_next_call_builds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A failing digest answers failed and leaves no state: the next admitted call builds as usual."""
+    rig, responder = _rig(tmp_path, monkeypatch)
+    responder.digests['store'] = (1, b'')
+    assert _call(rig)['status'] == 'failed'
+    assert _builds(rig) == []
+    assert_no_call_counter(rig)
+    responder.digests['store'] = (0, f'{STORE_DIGEST}\n'.encode())
+    assert _call(rig)['status'] == 'ok'
+    assert len(_builds(rig)) == 1
+
+
+def test_thirteen_builds_inside_one_hour_are_all_admitted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The withdrawn S10 budget refused the thirteenth build in an hour; now every one builds."""
+    rig, _ = _rig(tmp_path, monkeypatch)
+    results = [_call(rig) for _ in range(CALL_VOLUME)]
+    assert [result['status'] for result in results] == ['ok'] * CALL_VOLUME, results
+    assert [result for result in results if result['message'] == OLD_BUDGET_REFUSAL] == []
+    assert len(_builds(rig)) == CALL_VOLUME
+    assert_no_call_counter(rig)
+
+
+def test_builds_mixed_with_the_label_only_verbs_are_never_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The withdrawn budget was shared with down and restart; now none of the three limits the others."""
+    rig, _ = _rig(tmp_path, monkeypatch)
+    for _ in range(CALL_VOLUME):
         assert rig.call('down', {})['status'] == 'ok'
-    assert _call(rig)['message'] == BUDGET_REFUSAL
+    results = [_call(rig) for _ in range(CALL_VOLUME)]
+    assert [result['status'] for result in results] == ['ok'] * CALL_VOLUME, results
+    assert len([step for step in _builds(rig) if step.argv[-len(BUILD_TAIL) :] == BUILD_TAIL]) == CALL_VOLUME
+    assert_no_call_counter(rig)
 
 
 def test_a_failed_base_pull_runs_no_build(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -736,7 +744,8 @@ def test_the_schema_is_closed_and_takes_nothing():
 def test_any_argument_is_refused_with_no_step(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arguments):
     rig, _ = _rig(tmp_path, monkeypatch)
     assert _call(rig, arguments)['status'] == 'refused'
-    assert rig.docker.steps == [] and _charges_left(rig) == BUDGET
+    assert rig.docker.steps == []
+    assert_no_call_counter(rig)
 
 
 def test_the_timeout_is_thirty_minutes_inside_the_clients():

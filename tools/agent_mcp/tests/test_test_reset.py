@@ -4,13 +4,14 @@ Design: the bead's RECOMMENDED DESIGN. The verb acts on TEST mode alone, with th
 and seed_dump (only test mode up, the postgres data mount exactly <repo>/volume_data/test/postgres, every
 running data_store and data_ingest source stamp equal to the root checkout's), then runs ONE `docker exec` as
 user postgres in the postgres container that drops and recreates the public schema. Nothing is deleted, no
-host path or bind mount is used, the stack stays up, one budget charge is taken per admitted call, and no
-secret passes through the server.
+host path or bind mount is used, the stack stays up, no call is counted or limited by volume (ADR tj-4rr0la
+addendum 33), and no secret passes through the server.
 
 WHAT IS PINNED
-    admitted      the rails in order, then the one exec, one charge, the response's database and revision
-    refusals      dev mode, prod, mixed, nothing up, a wrong mount, a stale stamp, no data_store, an empty
-                  budget: each runs no exec and charges nothing (the budget's own refusal charges nothing)
+    admitted      the rails in order, then the one exec, the response's database and revision
+    refusals      dev mode, prod, mixed, nothing up, a wrong mount, a stale stamp, no data_store: each runs
+                  no exec
+    volume        CALL_VOLUME admitted calls in a row each run their one exec, and none is refused
     the exec      word for word, as user postgres with NO read-only option, bound to its one tail
     the SQL       RUN under sh with a fake psql: the exact statements, in order, with the container's own
                   user and database, and every fake secret value redacted on every path
@@ -29,11 +30,14 @@ import pytest
 
 from tools.agent_mcp import runner, stack
 from tools.agent_mcp.tests.harness import (
+    CALL_VOLUME,
     DEV_CONTAINER_ID,
     DEV_INGEST_CONTAINER_ID,
+    OLD_BUDGET_REFUSAL,
     TEST_RESET_STDOUT,
     Rig,
-    budget_spent,
+    assert_no_budget_wording,
+    assert_no_call_counter,
     default_response,
     is_base_step,
     is_client_step,
@@ -47,7 +51,7 @@ from tools.agent_mcp.tests.harness import (
     postgres_test_source,
     system_suite_response,
 )
-from tools.agent_mcp.tests.test_dev_label_verbs import BUDGET_REFUSAL, DEV_LINE, GUARD_REFUSAL, MIXED_REFUSAL, PROD_LINE
+from tools.agent_mcp.tests.test_dev_label_verbs import DEV_LINE, GUARD_REFUSAL, MIXED_REFUSAL, PROD_LINE
 
 
 pytestmark = pytest.mark.build_infra
@@ -109,16 +113,14 @@ def _refused_with_no_exec(rig: Rig, result: dict, message: str | None = None) ->
         assert result['message'] == message or result['message'].endswith(message), result
     assert _execs(rig) == [], [step.argv for step in rig.docker.steps]
     assert not [step for step in rig.docker.steps if is_client_step(step) or is_base_step(step)]
-    assert budget_spent(rig) == 0
+    assert_no_call_counter(rig)
     assert not rig.layout.snapshot.exists(), 'test_reset reads no worktree and takes no snapshot'
 
 
 # --- the admitted call -------------------------------------------------------------------------------
 
 
-def test_an_admitted_call_runs_the_rails_in_order_then_one_exec_and_charges_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
+def test_an_admitted_call_runs_the_rails_in_order_then_one_exec(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     rig = _rig(tmp_path, monkeypatch)
     result = _call(rig)
     assert result['status'] == 'ok', result
@@ -153,7 +155,7 @@ def test_an_admitted_call_runs_the_rails_in_order_then_one_exec_and_charges_once
         f'stamp:{DEV_INGEST_CONTAINER_ID}',
         'exec',
     ]
-    assert budget_spent(rig) == 1
+    assert_no_call_counter(rig)
     assert not rig.layout.snapshot.exists() and rig.git.calls == [], 'no worktree is read'
 
 
@@ -216,7 +218,8 @@ def test_the_verb_takes_no_argument(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     rig = _rig(tmp_path, monkeypatch)
     result = rig.call('test_reset', {'database': 'postgres'})
     assert result['status'] == 'refused' and "no argument named 'database'" in result['message'], result
-    assert rig.docker.steps == [] and budget_spent(rig) == 0
+    assert rig.docker.steps == []
+    assert_no_call_counter(rig)
     assert runner.VERB_SCHEMAS['test_reset'] == {
         'properties': {},
         'required': [],
@@ -237,16 +240,16 @@ def test_the_verb_is_a_handler_with_a_timeout_under_the_client_margin():
         'test mode',
         '<repo>/volume_data/test/postgres',
         'source stamp',
-        '12 an hour',
         'migrate',
         'redacted',
         'no row is ever printed',
         'permission for this verb is the owner',
     ):
         assert fragment in description, fragment
+    assert_no_budget_wording(description)
 
 
-# --- the rails: every refusal runs no exec and charges nothing ----------------------------------------
+# --- the rails: every refusal runs no exec ----------------------------------------
 
 _MODES = {
     'nothing is up': (b'', MODE_REFUSAL),
@@ -354,7 +357,8 @@ def test_a_failed_digest_fails_and_runs_nothing_after(tmp_path: Path, monkeypatc
     rig = _rig(tmp_path, monkeypatch, _answer(is_dev_digest, runner.ProcessResult(1, b'', b'boom')))
     result = _call(rig)
     assert result['status'] == 'failed' and result['message'].endswith('nothing was run'), result
-    assert _execs(rig) == [] and budget_spent(rig) == 0
+    assert _execs(rig) == []
+    assert_no_call_counter(rig)
 
 
 def test_a_stale_mcp_image_refuses_before_any_docker_step(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -363,34 +367,60 @@ def test_a_stale_mcp_image_refuses_before_any_docker_step(tmp_path: Path, monkey
     (rig.layout.repo / 'docker-compose.yaml').write_text('services: {}\n# changed after the image was baked\n')
     result = _call(rig)
     assert result['status'] == 'refused' and 'the MCP image is stale' in result['message'], result
-    assert _execs(rig) == [] and budget_spent(rig) == 0
+    assert _execs(rig) == []
+    assert_no_call_counter(rig)
 
 
-def test_an_exhausted_budget_refuses_after_the_rails_and_runs_no_exec(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_call_volume_admitted_calls_each_run_their_one_exec_and_none_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """No volume limit (ADR tj-4rr0la addendum 33): past the withdrawn 12 an hour, every admitted call resets."""
     rig = _rig(tmp_path, monkeypatch)
-    for _ in range(12):
-        rig.agent.dev_budget.charge()
-    result = _call(rig)
-    assert result == {**result, 'status': 'refused', 'message': BUDGET_REFUSAL}, result
-    assert _execs(rig) == [] and budget_spent(rig) == 12
+    for count in range(1, CALL_VOLUME + 1):
+        result = _call(rig)
+        assert result['status'] == 'ok' and result['message'] != OLD_BUDGET_REFUSAL, (count, result)
+        assert len(_execs(rig)) == count, 'every admitted call reached its exec'
+    assert_no_call_counter(rig)
 
 
-def test_the_charge_is_one_per_call_across_calls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_every_call_runs_exactly_the_steps_of_one_call(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Calls are independent: the CALL_VOLUME-th call runs the same steps, word for word, as the first."""
     rig = _rig(tmp_path, monkeypatch)
-    for expected in (1, 2, 3):
+    per_call = []
+    for _ in range(CALL_VOLUME):
+        before = len(rig.docker.steps)
         assert _call(rig)['status'] == 'ok'
-        assert budget_spent(rig) == expected
+        per_call.append([list(step.argv) for step in rig.docker.steps[before:]])
+    assert all(steps == per_call[0] for steps in per_call), 'a later call ran different steps'
+    assert_no_call_counter(rig)
 
 
 # --- a failed or unclean reset -------------------------------------------------------------------------
 
 
-def test_a_failed_exec_is_failed_and_still_costs_one_charge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    rig = _rig(tmp_path, monkeypatch, _answer(is_dev_exec, runner.ProcessResult(1, b'ERROR: deadlock\n', b'')))
+def test_a_failed_exec_is_failed_and_leaves_nothing_that_affects_the_next_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    failing = {'exec': True}
+
+    def respond(step):
+        if is_dev_exec(step) and failing['exec']:
+            return runner.ProcessResult(1, b'ERROR: deadlock\n', b'')
+        return None
+
+    rig = _rig(tmp_path, monkeypatch, respond)
     result = _call(rig)
     assert result['status'] == 'failed' and 'rolled back' in result['message'], result
     assert 'details' not in result
-    assert budget_spent(rig) == 1
+    assert_no_call_counter(rig)
+    # The next call is admitted and runs its exec normally: the failure left no state behind.
+    failing['exec'] = False
+    first_call_steps = len(rig.docker.steps)
+    result = _call(rig)
+    assert result['status'] == 'ok', result
+    assert [list(step.argv) for step in rig.docker.steps[first_call_steps:]] == [
+        list(step.argv) for step in rig.docker.steps[:first_call_steps]
+    ]
 
 
 _UNCLEAN = {

@@ -16,12 +16,12 @@ WHAT IS PINNED
                      after an injected failure; the whole set replaced; {} drops the service, and the file when empty
     the file sets    the test set gains the overlay only when it exists, LAST; the argv check accepts exactly that
                      path there and nothing else; no dev set can carry it; a plain test_up deletes it before its down
-    the verbs        whole step order: the rails, then the charge, then ONE compose step on the named service only
-    the rails        each refusal runs nothing after it and charges nothing: stale MCP image, DEV/PROD/mixed/empty,
+    the verbs        whole step order: the rails, then ONE compose step on the named service only
+    the rails        each refusal runs nothing after it: stale MCP image, DEV/PROD/mixed/empty,
                      the postgres mount, a stale stamp on either service, running AND stopped, zero or two
                      containers, start on a running one, stop on a stopped one, a tampered overlay (test_env)
-    the budget       one charge per admitted call, a refused call charges nothing, an exhausted budget refuses after
-                     every rail and runs nothing
+    no budget        the withdrawn 12-an-hour budget is absent (ADR tj-4rr0la addendum 33): CALL_VOLUME admitted
+                     calls of each verb all act, none is refused, and a failed act leaves the next call unaffected
     ps               the report from the containers' labels and the MCP's own file, 'pending' on a generation
                      mismatch, never an inspect (so never .Config.Env)
     permissions      none of the three verbs is on any allow entry of the committed client settings
@@ -40,12 +40,15 @@ import yaml
 
 from tools.agent_mcp import runner, stack
 from tools.agent_mcp.tests.harness import (
+    CALL_VOLUME,
     DEV_CONTAINER_ID,
     DEV_INGEST_CONTAINER_ID,
+    OLD_BUDGET_REFUSAL,
     REPO_ROOT,
     TEST_MODE_LINE,
     Rig,
-    budget_spent,
+    assert_no_budget_wording,
+    assert_no_call_counter,
     default_response,
     is_agent_env_label_read,
     is_container_stamp_read,
@@ -59,7 +62,7 @@ from tools.agent_mcp.tests.harness import (
     service_of,
     system_suite_response,
 )
-from tools.agent_mcp.tests.test_dev_label_verbs import BUDGET_REFUSAL, DEV_LINE, GUARD_REFUSAL, MIXED_REFUSAL, PROD_LINE
+from tools.agent_mcp.tests.test_dev_label_verbs import DEV_LINE, GUARD_REFUSAL, MIXED_REFUSAL, PROD_LINE
 
 
 pytestmark = pytest.mark.build_infra
@@ -658,7 +661,7 @@ def test_the_step_builders_refuse_any_other_service(tmp_path: Path, builder: str
 
 
 # =============================================================================================================
-# THE VERBS THROUGH THE SERVER: rails, order, charge
+# THE VERBS THROUGH THE SERVER: rails, order, the act
 # =============================================================================================================
 
 
@@ -743,9 +746,16 @@ def _composes(rig: Rig) -> list[stack.Step]:
     return [step for step in rig.docker.steps if step.argv[1:2] == ('compose',)]
 
 
+def _expected_kinds(verb: str, service: str = 'data_store') -> list[str]:
+    """The whole step list of one admitted call: the rails, the bases (unless test_stop), then the act."""
+    bases = len(stack.BASE_IMAGES)
+    expected_act = [k for k in _ACT[(verb, service)] if k != 'base']
+    return [*_RAILS, *(['base'] * bases if verb != 'test_stop' else []), *expected_act]
+
+
 @pytest.mark.parametrize('service', SERVICES)
 @pytest.mark.parametrize('verb', VERBS)
-def test_an_admitted_call_runs_the_rails_in_order_then_one_compose_step_and_charges_once(
+def test_an_admitted_call_runs_the_rails_in_order_then_one_compose_step(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str, service: str
 ):
     rig = _rig(tmp_path, monkeypatch, verb)
@@ -753,64 +763,67 @@ def test_an_admitted_call_runs_the_rails_in_order_then_one_compose_step_and_char
     result = rig.call(verb, _args(verb, service, overrides))
     assert result['status'] == 'ok', result
     kinds = [_kind(step) for step in rig.docker.steps]
-    bases = len(stack.BASE_IMAGES)
-    expected_act = [k for k in _ACT[(verb, service)] if k != 'base']
-    assert kinds == [*_RAILS, *(['base'] * bases if verb != 'test_stop' else []), *expected_act], kinds
-    assert budget_spent(rig) == 1
+    assert kinds == _expected_kinds(verb, service), kinds
+    assert_no_call_counter(rig)
     assert rig.git.calls == [] and not rig.layout.snapshot.exists(), 'no worktree is read'
 
 
 @pytest.mark.parametrize('verb', VERBS)
-def test_the_budget_is_charged_after_every_rail_and_before_the_act(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str
-):
+def test_the_act_follows_the_last_rail_with_no_step_between(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str):
+    """The order is the rails, then the act: the budget step that once sat between them is gone (addendum 33)."""
     rig = _rig(tmp_path, monkeypatch, verb)
-    charged_at = []
-    real = rig.agent.dev_budget.charge
-
-    def charge():
-        charged_at.append(len(rig.docker.steps))
-        real()
-
-    monkeypatch.setattr(rig.agent.dev_budget, 'charge', charge)
     assert rig.call(verb, _args(verb))['status'] == 'ok'
-    assert charged_at == [len(_RAILS)], charged_at
+    kinds = [_kind(step) for step in rig.docker.steps]
+    assert kinds[: len(_RAILS)] == _RAILS, kinds
+    assert kinds[len(_RAILS)] == ('compose:stop data_store' if verb == 'test_stop' else 'base'), kinds
+    assert_no_call_counter(rig)
 
 
 @pytest.mark.parametrize('verb', VERBS)
-def test_an_exhausted_budget_refuses_after_the_rails_and_acts_on_nothing(
+def test_call_volume_admitted_calls_all_act_and_none_is_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str
 ):
+    """Past the withdrawn 12 an hour, inside one hour: every call runs every rail and its compose step."""
     rig = _rig(tmp_path, monkeypatch, verb)
-    for _ in range(12):
-        rig.agent.dev_budget.charge()
-    result = rig.call(verb, _args(verb))
-    assert result['status'] == 'refused' and result['message'] == BUDGET_REFUSAL, result
-    assert [_kind(step) for step in rig.docker.steps] == _RAILS
-    assert budget_spent(rig) == 12
-    assert not (rig.layout.stack_dir / OVERLAY).exists(), 'nothing is written on a refused call'
+    for index in range(CALL_VOLUME):
+        before = len(rig.docker.steps)
+        result = rig.call(verb, _args(verb))
+        assert result['status'] == 'ok' and result['message'] != OLD_BUDGET_REFUSAL, (index, result)
+        assert [_kind(step) for step in rig.docker.steps[before:]] == _expected_kinds(verb), index
+    assert len(_composes(rig)) == CALL_VOLUME
+    assert_no_call_counter(rig)
 
 
 @pytest.mark.parametrize('verb', VERBS)
-def test_the_charge_is_one_per_call_across_calls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str):
+def test_every_call_across_calls_runs_the_same_steps_as_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str):
     rig = _rig(tmp_path, monkeypatch, verb)
-    for expected in (1, 2, 3):
+    per_call = []
+    for _ in range(CALL_VOLUME):
+        before = len(rig.docker.steps)
         assert rig.call(verb, _args(verb))['status'] == 'ok'
-        assert budget_spent(rig) == expected
+        per_call.append([step.argv for step in rig.docker.steps[before:]])
+    assert all(steps == per_call[0] for steps in per_call), 'a later call ran different steps from the first'
 
 
 @pytest.mark.parametrize('verb', VERBS)
-def test_a_failed_compose_step_is_failed_and_still_one_charge(
+def test_a_failed_compose_step_is_failed_and_the_next_call_acts_normally(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str
 ):
+    """A failure after admission leaves no state that affects the next call (addendum 32 (5) as amended by 33)."""
     rig = _rig(tmp_path, monkeypatch, verb)
     daemon = rig.docker.respond
     rig.docker.respond = lambda step: (
         runner.ProcessResult(1, b'', b'boom') if step.argv[1:2] == ('compose',) else daemon(step)
     )
+    for index in range(CALL_VOLUME):
+        result = rig.call(verb, _args(verb))
+        assert result['status'] == 'failed', (index, result)
+    rig.docker.respond = daemon
+    before = len(rig.docker.steps)
     result = rig.call(verb, _args(verb))
-    assert result['status'] == 'failed', result
-    assert budget_spent(rig) == 1
+    assert result['status'] == 'ok', result
+    assert [_kind(step) for step in rig.docker.steps[before:]] == _expected_kinds(verb)
+    assert_no_call_counter(rig)
 
 
 def _refused_before_any_act(rig: Rig, result: dict, message: str | None = None) -> None:
@@ -819,7 +832,7 @@ def _refused_before_any_act(rig: Rig, result: dict, message: str | None = None) 
         assert result['message'] == message or result['message'].endswith(message), result
     assert _composes(rig) == [], [step.argv for step in rig.docker.steps]
     assert not [step for step in rig.docker.steps if _kind(step) == 'base']
-    assert budget_spent(rig) == 0
+    assert_no_call_counter(rig)
     assert not (rig.layout.stack_dir / OVERLAY).exists(), 'a refused call writes nothing'
 
 
@@ -834,7 +847,8 @@ def test_any_other_service_is_refused_before_any_docker_step(
     rig = _rig(tmp_path, monkeypatch, verb)
     result = rig.call(verb, _args(verb, service))
     assert result == {**result, 'status': 'refused', 'message': 'service must be one of: data_store, data_ingest'}
-    assert rig.docker.steps == [] and budget_spent(rig) == 0
+    assert rig.docker.steps == []
+    assert_no_call_counter(rig)
 
 
 @pytest.mark.parametrize(
@@ -851,13 +865,14 @@ def test_any_other_service_is_refused_before_any_docker_step(
     ],
     ids=['DATA_DIR', 'secret', 'postgres', 'alpaca key', 'bad bool', 'bad number', 'unknown', 'nine names'],
 )
-def test_a_refused_override_runs_nothing_charges_nothing_and_its_value_is_nowhere(
+def test_a_refused_override_runs_nothing_and_its_value_is_nowhere(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overrides: dict
 ):
     rig = _rig(tmp_path, monkeypatch)
     result = rig.call('test_env', {'service': 'data_store', 'overrides': overrides})
     assert result['status'] == 'refused', result
-    assert rig.docker.steps == [] and budget_spent(rig) == 0
+    assert rig.docker.steps == []
+    assert_no_call_counter(rig)
     assert not (rig.layout.stack_dir / OVERLAY).exists()
     assert SENTINEL not in json.dumps(result)
     assert rig.audit_lines() and all(SENTINEL not in line for line in rig.audit_lines())
@@ -869,7 +884,8 @@ def test_a_stale_mcp_image_refuses_before_any_docker_step(tmp_path: Path, monkey
     (rig.layout.repo / 'docker-compose.yaml').write_text('services: {}\n# changed after the image was baked\n')
     result = rig.call(verb, _args(verb))
     assert result['status'] == 'refused' and 'the MCP image is stale' in result['message'], result
-    assert rig.docker.steps == [] and budget_spent(rig) == 0
+    assert rig.docker.steps == []
+    assert_no_call_counter(rig)
 
 
 @pytest.mark.parametrize('verb', VERBS)
@@ -880,7 +896,8 @@ def test_a_compose_file_in_the_stack_directory_refuses_before_any_docker_step(
     (rig.layout.stack_dir / 'docker-compose.yaml').write_text('services: {}\n')
     result = rig.call(verb, _args(verb))
     assert result['status'] == 'refused', result
-    assert rig.docker.steps == [] and budget_spent(rig) == 0
+    assert rig.docker.steps == []
+    assert_no_call_counter(rig)
 
 
 # --- the mode guard -----------------------------------------------------------------------------------------
@@ -1024,12 +1041,13 @@ def test_a_lookup_line_that_is_not_an_id_and_a_state_refuses(
     _refused_before_any_act(rig, rig.call('test_env', _args('test_env')))
 
 
-def test_a_tampered_overlay_refuses_test_env_before_the_charge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_a_tampered_overlay_refuses_test_env_before_the_act(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     rig = _rig(tmp_path, monkeypatch)
     (rig.layout.stack_dir / OVERLAY).write_text(CANONICAL + '# edited\n')
     result = rig.call('test_env', _args('test_env'))
     assert result['status'] == 'refused' and result['message'] == BAD_FILE, result
-    assert _composes(rig) == [] and budget_spent(rig) == 0
+    assert _composes(rig) == []
+    assert_no_call_counter(rig)
     assert (rig.layout.stack_dir / OVERLAY).read_text() == CANONICAL + '# edited\n', 'left as found'
 
 
@@ -1154,12 +1172,12 @@ def test_a_plain_test_up_deletes_the_overlay_before_its_down(tmp_path: Path, mon
 
 
 def test_a_refused_test_up_leaves_the_overlay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Clearing is part of the act: a test_up refused at a rail or the budget changes nothing."""
+    """Clearing is part of the act: a test_up refused at a rail (here the stale MCP image) changes nothing."""
     rig = make_rig(tmp_path, monkeypatch)
     stack.write_agent_env(rig.layout.stack_dir, {'data_store': STORE})
-    for _ in range(12):
-        rig.agent.dev_budget.charge()
-    assert rig.call('test_up', {})['status'] == 'refused'
+    (rig.layout.repo / 'docker-compose.yaml').write_text('services: {}\n# changed after the image was baked\n')
+    result = rig.call('test_up', {})
+    assert result['status'] == 'refused' and 'the MCP image is stale' in result['message'], result
     assert (rig.layout.stack_dir / OVERLAY).read_text() == stack.render_agent_env({'data_store': STORE})
 
 
@@ -1278,9 +1296,21 @@ def test_ps_does_not_compare_two_containers_of_one_service(tmp_path: Path, monke
     assert '2 containers, not compared' in store and 'pending' not in store, store
 
 
-def test_ps_still_takes_no_charge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    rig, result = _ps(tmp_path, monkeypatch, b'')
-    assert result['status'] == 'ok' and budget_spent(rig) == 0
+def test_ps_is_unchanged_after_call_volume_state_changing_calls_and_has_no_budget_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Ps reports no budget, charge or window line, and CALL_VOLUME state-changing calls change nothing in it."""
+    rig = _rig(tmp_path, monkeypatch, 'test_stop')
+    first = rig.call('ps', {})
+    assert first['status'] == 'ok', first
+    for _ in range(CALL_VOLUME):
+        assert rig.call('test_stop', _args('test_stop'))['status'] == 'ok'
+    after = rig.call('ps', {})
+    assert after == {**after, 'status': 'ok', 'message': first['message']}, (first, after)
+    for line in after['message'].splitlines():
+        assert_no_budget_wording(line)
+        assert 'charge' not in line.lower() and 'window' not in line.lower(), line
+    assert_no_call_counter(rig)
 
 
 # =============================================================================================================
@@ -1302,10 +1332,19 @@ def test_the_schemas_are_closed_and_the_service_an_enum():
 
 
 @pytest.mark.parametrize('verb', VERBS)
-def test_the_descriptions_name_test_mode_the_rails_and_the_budget(verb: str):
+def test_the_descriptions_name_test_mode_and_the_rails(verb: str):
     text = runner.AgentStack(settings=None).describe(verb)  # type: ignore[arg-type]
-    for fragment in ('TEST MODE ONLY', 'data_store', 'data_ingest', '12 an hour', 'Runs nothing unless'):
+    for fragment in (
+        'TEST MODE ONLY',
+        'data_store',
+        'data_ingest',
+        'Runs nothing unless',
+        'Returns ok or failed itself.',
+    ):
         assert fragment in text, fragment
+    assert text.endswith('Returns ok or failed itself.'), text
+    assert_no_budget_wording(text)
+    assert 'charge' not in text.lower(), text
     if verb == 'test_env':
         for name in (n for rules in ALLOW.values() for n in rules):
             assert name in text, name

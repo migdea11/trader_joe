@@ -3,13 +3,13 @@
 Design: ADR tj-4rr0la addenda 26 (3), (5), (6) and 27 (1), (3), with addendum 5 ruling 2 (a worktree
 snapshot never supplies the Dockerfile); the architect's consolidated readiness note on the bead (11:00).
 
-THE RAILS, in order, each refusal running nothing after it and charging nothing: the worktree name and
+THE RAILS, in order, each refusal running nothing after it: the worktree name and
 the paths (spelling, then git); the mode guard, TEST only; the S6 stale-copy check and the D5 env-file
 preflight; the postgres data mount (one lookup, then ONE fixed inspect, accepted only when its source is
 <repo host path>/volume_data/test/postgres); a running data_store (the builder's deviation 2), the two
 digests and the stamp of every running data_store and data_ingest container; then the snapshot and its
-checks, and ONE budget charge. THE CLIENT: up's secret wrapper around `docker compose -p trader_joe_dev
---project-directory <snapshot> --env-file <repo host path>/.env` and three trusted files, the third an
+checks; no budget (ADR tj-4rr0la addendum 33 withdrew it). THE CLIENT: up's secret wrapper around
+`docker compose -p trader_joe_dev --project-directory <snapshot> --env-file <repo host path>/.env` and three trusted files, the third an
 MCP-only overlay that sets test_client's build.dockerfile alone. check_testclient_argv admits only the
 three client tails, and the dev lifecycle check refuses that prefix.
 
@@ -30,13 +30,15 @@ from common.tests import compose_model
 from common.tests.test_ci_invariants import _dockerignore_rules, _is_excluded_from_context
 from tools.agent_mcp import runner, stack
 from tools.agent_mcp.tests.harness import (
+    CALL_VOLUME,
     DEV_CONTAINER_ID,
     DEV_INGEST_CONTAINER_ID,
     LIVE_ENV_SENTINEL,
+    OLD_BUDGET_REFUSAL,
     REPO_ROOT,
     WORKTREE_NAME,
     Rig,
-    budget_spent,
+    assert_no_call_counter,
     client_prefix_words,
     client_tail,
     default_response,
@@ -54,7 +56,6 @@ from tools.agent_mcp.tests.harness import (
 )
 from tools.agent_mcp.tests.test_commands import _baked_into_trusted
 from tools.agent_mcp.tests.test_dev_label_verbs import (
-    BUDGET_REFUSAL,
     DEV_LINE,
     GUARD_REFUSAL,
     MIXED_REFUSAL,
@@ -109,12 +110,12 @@ def _call(rig: Rig, verb: str) -> dict:
 
 
 def _ran_nothing_after(rig: Rig, predicate) -> None:
-    """The last step is the first one PREDICATE matches; no client or base step ran; nothing charged."""
+    """The last step is the first one PREDICATE matches; no client or base step ran; no counter exists."""
     steps = rig.docker.steps
     assert steps and predicate(steps[-1]), [step.argv for step in steps]
     assert len([step for step in steps if predicate(step)]) == 1, [step.argv for step in steps]
     assert not [step for step in steps if is_client_step(step) or is_base_step(step)]
-    assert budget_spent(rig) == 0
+    assert_no_call_counter(rig)
     assert not rig.layout.snapshot.exists(), 'a refused rail took the snapshot'
 
 
@@ -130,10 +131,10 @@ def _ok(stdout: bytes) -> runner.ProcessResult:
 
 
 @pytest.mark.parametrize('verb', sorted(VERBS))
-def test_an_admitted_call_runs_the_rails_in_order_then_charges_once(
+def test_an_admitted_call_runs_the_rails_in_order_then_the_client(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str
 ):
-    """The rails' kinds in order, then the bases and the client; the snapshot taken; exactly one charge."""
+    """The rails' kinds in order, then the bases and the client; the snapshot taken; no budget step anywhere."""
     rig = _rig(tmp_path, monkeypatch)
     result = _call(rig, verb)
     assert result['status'] == 'ok', result
@@ -172,7 +173,7 @@ def test_an_admitted_call_runs_the_rails_in_order_then_charges_once(
     ]
     clients = ['client:run'] if verb == 'run_system_tests' else ['client:build', 'client:run']
     assert kinds == [*rails, *['base'] * len(stack.BASE_IMAGES), *clients], kinds
-    assert budget_spent(rig) == 1
+    assert_no_call_counter(rig)
     assert rig.layout.snapshot.is_dir()
 
 
@@ -189,14 +190,16 @@ def test_a_bad_worktree_name_runs_nothing(tmp_path: Path, monkeypatch: pytest.Mo
     rig = _rig(tmp_path, monkeypatch)
     result = rig.call(verb, {**VERBS[verb], 'worktree': '../escape'})
     assert result['status'] == 'refused', result
-    assert rig.git.calls == [] and rig.docker.steps == [] and budget_spent(rig) == 0
+    assert rig.git.calls == [] and rig.docker.steps == []
+    assert_no_call_counter(rig)
 
 
 def test_a_badly_spelled_path_runs_no_git_and_no_docker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     rig = _rig(tmp_path, monkeypatch)
     result = rig.call('run_system_tests', {'worktree': WORKTREE_NAME, 'paths': ['tests/fakes']})
     assert result['status'] == 'refused', result
-    assert rig.git.calls == [] and rig.docker.steps == [] and budget_spent(rig) == 0
+    assert rig.git.calls == [] and rig.docker.steps == []
+    assert_no_call_counter(rig)
 
 
 @pytest.mark.parametrize('verb', sorted(VERBS))
@@ -204,7 +207,8 @@ def test_an_unknown_worktree_runs_git_and_no_docker(tmp_path: Path, monkeypatch:
     rig = _rig(tmp_path, monkeypatch)
     result = rig.call(verb, {**VERBS[verb], 'worktree': 'wt-none'})
     assert result['status'] == 'refused' and 'no worktree named' in result['message'], result
-    assert rig.git.list_calls == 1 and rig.docker.steps == [] and budget_spent(rig) == 0
+    assert rig.git.list_calls == 1 and rig.docker.steps == []
+    assert_no_call_counter(rig)
 
 
 # --- the mode guard: TEST only ----------------------------------------------------------------------
@@ -414,7 +418,8 @@ def test_a_failed_digest_fails_and_runs_nothing_after(tmp_path: Path, monkeypatc
     assert result['status'] == 'failed' and result['message'].endswith('nothing was run'), result
     steps = rig.docker.steps
     assert is_dev_digest(steps[-1]) and len([s for s in steps if is_dev_digest(s)]) == 1
-    assert not [step for step in steps if is_client_step(step) or is_base_step(step)] and budget_spent(rig) == 0
+    assert not [step for step in steps if is_client_step(step) or is_base_step(step)]
+    assert_no_call_counter(rig)
 
 
 def _stamp_of(container: str, stamp: bytes, exit_status: int = 0):
@@ -443,7 +448,8 @@ def test_a_stale_running_container_refuses_with_no_client_step(
     steps = rig.docker.steps
     assert is_container_stamp_read(steps[-1]) and steps[-1].argv[-1] == container
     assert not [step for step in steps if is_client_step(step) or is_base_step(step)]
-    assert budget_spent(rig) == 0 and not rig.layout.snapshot.exists()
+    assert not rig.layout.snapshot.exists()
+    assert_no_call_counter(rig)
 
 
 def test_a_stopped_data_ingest_reads_only_the_data_store_stamp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -453,27 +459,44 @@ def test_a_stopped_data_ingest_reads_only_the_data_store_stamp(tmp_path: Path, m
     assert [step.argv[-1] for step in rig.docker.steps if is_container_stamp_read(step)] == [DEV_CONTAINER_ID]
 
 
-# --- after the rails: the snapshot, then one charge ----------------------------------------------------
+# --- after the rails: the snapshot, then the client; no budget (addendum 33) ----------------------------
 
 
 @pytest.mark.parametrize('verb', sorted(VERBS))
-def test_an_exhausted_budget_refuses_after_the_snapshot_and_runs_no_client(
+def test_call_volume_admitted_calls_all_run_the_client_and_none_is_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str
 ):
+    """Past the withdrawn 12 an hour, inside one hour: every call takes the snapshot and runs its client steps."""
     rig = _rig(tmp_path, monkeypatch)
-    for _ in range(12):
-        rig.agent.dev_budget.charge()
-    result = _call(rig, verb)
-    assert result == {**result, 'status': 'refused', 'message': BUDGET_REFUSAL}, result
-    assert not [step for step in rig.docker.steps if is_client_step(step) or is_base_step(step)]
-    assert rig.layout.snapshot.is_dir() and budget_spent(rig) == 12
+    per_call = 1 if verb == 'run_system_tests' else 2
+    for index in range(CALL_VOLUME):
+        before = len(rig.docker.steps)
+        result = _call(rig, verb)
+        assert result['status'] == 'ok' and result['message'] != OLD_BUDGET_REFUSAL, (index, result)
+        assert len([step for step in rig.docker.steps[before:] if is_client_step(step)]) == per_call, index
+    assert rig.layout.snapshot.is_dir()
+    assert_no_call_counter(rig)
 
 
 @pytest.mark.parametrize('verb', sorted(VERBS))
-def test_a_failed_client_still_costs_one_charge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str):
-    rig = _rig(tmp_path, monkeypatch, _answer(is_client_step, runner.ProcessResult(1, b'', b'')))
-    assert _call(rig, verb)['status'] == 'failed'
-    assert budget_spent(rig) == 1
+def test_a_failed_client_is_failed_and_the_next_call_runs_normally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str
+):
+    """A failure after admission leaves no state that affects the next call (addendum 32 (5) as amended by 33)."""
+    failing = [True]
+    rig = _rig(
+        tmp_path,
+        monkeypatch,
+        lambda step: runner.ProcessResult(1, b'', b'') if failing[0] and is_client_step(step) else None,
+    )
+    for index in range(CALL_VOLUME):
+        assert _call(rig, verb)['status'] == 'failed', index
+    failing[0] = False
+    before = len(rig.docker.steps)
+    result = _call(rig, verb)
+    assert result['status'] == 'ok', result
+    assert [step for step in rig.docker.steps[before:] if is_client_step(step)], 'the next call ran its client'
+    assert_no_call_counter(rig)
 
 
 # --- the client command -----------------------------------------------------------------------------------

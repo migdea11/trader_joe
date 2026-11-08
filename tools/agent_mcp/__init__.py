@@ -43,7 +43,7 @@ volume, an image or an orphan (the database is a host bind and survives). restar
 existing container. Neither loads a compose file or an env file. Each refuses, running nothing after
 the refusal, unless the D7 guard finds every project container started from the dev files; restart
 also refuses a symlinked bind source (D6); both refuse a compose file or dotenv file in the stack
-directory or a parent (compose would search there) and are limited to 12 state-changing dev calls an hour.
+directory or a parent (compose would search there).
 
 and ONE FILE-BASED BUILD VERB over it (tj-iee6sn.8):
 
@@ -55,7 +55,7 @@ build is make dev-build's build: the three :dev images from the checkout, as one
 placeholder step environment, COMPOSE_ENV_FILES=/dev/null), and stamps the images with digests from
 the baked source_digest.sh run with --context over the checkout. It starts no container, so it has no
 prod guard; it refuses a stale baked copy (stack.check_trusted_copies_current) and missing or old
-generated code, and is limited by the same hourly budget.
+generated code.
 
 and ONE MORE STATE-CHANGING VERB, make dev-up (tj-iee6sn.9):
 
@@ -79,7 +79,7 @@ docker-compose.tools.yaml (stack.dev_tools_prefix), in up's secret wrapper under
 environment. A plain call of up to 5 minutes; it never builds, stops or removes anything. PGADMIN_EMAIL
 and PGADMIN_PASS are read by compose from the root env file: this server neither reads nor passes them,
 so no credential reaches an argv, the audit line or the output; when one is unset compose refuses before
-creating the container. The D7, S6, D6 and D5 checks and the budget are up's. down removes pgAdmin
+creating the container. The D7, S6, D6 and D5 checks are up's. down removes pgAdmin
 with the rest of the project (label-only).
 
 and TWO MIGRATION VERBS over whichever mode of the one project is up (tj-iee6sn.10; owner ruling: ONE
@@ -99,7 +99,7 @@ DEV mode; the permission for it is the owner's client setting, not this server's
 nothing is up, under a PROD container or both modes, with no or several postgres or several data_store
 containers, with no revision file in the checkout, without the mode's data_store image, and on the
 S6/D6/D5 checks of up; it builds nothing. migrate_status is read-only: alembic current and history by
-exec in the running data_store of whichever mode is up, charging no budget. alembic check is not offered:
+exec in the running data_store of whichever mode is up. alembic check is not offered:
 make migrate-check covers it on the host.
 
 and TWO TEST-MODE VERBS over the same project (tj-iee6sn.24; ADR tj-4rr0la addenda 26-27):
@@ -137,11 +137,10 @@ mode 0600, written to a temporary name and renamed; it carries services.<service
 labels trader_joe.agent.env_generation and trader_joe.agent.env_names. It is LAST in the TEST file set
 (stack.testmode_prefix with a stack directory) only when it exists, stack.check_dev_lifecycle_argv
 accepts exactly that one path there, and the dev file sets never name it. The rails run in test_reset's
-spirit and all BEFORE the budget charge: steering files and trusted copies current, only TEST mode,
+spirit and all BEFORE the act: steering files and trusted copies current, only TEST mode,
 the postgres mount exactly <repo>/volume_data/test/postgres, every data_store and data_ingest
 container's source stamp (running or stopped) equal to the checkout's digest, and exactly one
-container of the named service in the state the verb needs. Each call then charges one of the 12 an
-hour. ps reports the active overrides: the names from the containers' labels, the generation and the
+container of the named service in the state the verb needs. ps reports the active overrides: the names from the containers' labels, the generation and the
 values from this server's own file, and 'pending' when they differ; it never reads a container's
 environment. The permission for all three stays 'ask' (the owner's client setting).
 
@@ -206,7 +205,7 @@ every mount it has come from the snapshot of the named worktree, so a worktree's
 reach the client. Rails, in order and each refusing before anything runs: only TEST mode is up (the
 mode guard), the running postgres's data mount is <repo host path>/volume_data/test/postgres
 (stack.check_test_postgres_mount), every running data_store and data_ingest container's source stamp
-equals the checkout's digest; then the snapshot and one charge of the state-changing budget. The
+equals the checkout's digest; then the snapshot. The
 compose command is stack.check_testclient_argv's. The client reads the instance write secret from the
 root env file through compose (--env-file), exactly as data_store does; this server never opens that
 file, and the secret is on no command line.

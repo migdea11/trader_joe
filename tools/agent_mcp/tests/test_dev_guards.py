@@ -13,7 +13,7 @@ What is pinned here is each check on its own, so that gutting one turns ITS test
   * the D6 symlink check over the bind sources parsed from the trusted dev files;
   * the D5 env-file preflight, which lstats and never opens;
   * the pinned and placeholder step environments, derived from the compose files' own defaults;
-  * the S6 stale-copy refusal; the S10 budget;
+  * the S6 stale-copy refusal; the S10 budget's ABSENCE (withdrawn by addendum 33: no counter anywhere);
   * Step.env: it reaches the subprocess and nothing that is recorded or audited.
 
 Expected values are literals or are parsed from the files they mirror, never read from stack.py.
@@ -29,7 +29,6 @@ import shlex
 import shutil
 import subprocess  # nosec B404 -- a fixed bash invocation of the repository's own classifier block
 import threading
-import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -38,7 +37,13 @@ import pytest
 from common.tests import compose_model
 from common.tests.test_ci_invariants import _make_recipe, _make_variable
 from tools.agent_mcp import runner, stack
-from tools.agent_mcp.tests.harness import REPO_ROOT, SERVER_ROOT, make_rig
+from tools.agent_mcp.tests.harness import (
+    REPO_ROOT,
+    SERVER_ROOT,
+    assert_no_budget_wording,
+    assert_no_call_counter,
+    make_rig,
+)
 from tools.agent_mcp.tests.test_commands import EXPECTED_DEV_BAKES, _baked_into_trusted
 
 
@@ -1531,71 +1536,76 @@ def test_the_default_trusted_directory_is_the_images():
 
 
 # ===============================================================================================
-# S10, THE BUDGET
+# S10 WITHDRAWN: NO BUDGET, NO COUNTER (ADR tj-4rr0la addendum 33, owner ruling 2026-11-06)
+# The 12-per-rolling-hour budget is gone and no call-volume limit may come back anywhere in the MCP.
+# Each verb's file pins that its own calls are never refused on volume; what is pinned here is the
+# absence across the package: no name, no source text, no description.
 # ===============================================================================================
 
-
-class Clock:
-    def __init__(self) -> None:
-        self.now = 1000.0
-
-    def __call__(self) -> float:
-        return self.now
+AGENT_MCP_DIR = Path(runner.__file__).resolve().parent
+# Source text only the withdrawn budget carried: its class, its attribute, its charge call and its refusal.
+BUDGET_SOURCE_MARKERS = ('in the last hour is the budget', 'DevBudget', 'dev_budget', 'DEV_BUDGET', '.charge(')
 
 
-def test_the_budget_constants_are_twelve_per_rolling_hour():
-    assert stack.DEV_BUDGET_LIMIT == 12
-    assert stack.DEV_BUDGET_WINDOW_SECONDS == 3600.0
+def _strings_in(value: object) -> list[str]:
+    """Every string anywhere inside a JSON-shaped VALUE (a verb schema)."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [text for key, item in value.items() for text in (*_strings_in(key), *_strings_in(item))]
+    if isinstance(value, (list, tuple)):
+        return [text for item in value for text in _strings_in(item)]
+    return []
 
 
-def test_the_thirteenth_call_in_the_hour_refuses():
-    clock = Clock()
-    budget = stack.DevBudget(clock)
-    for _ in range(12):
-        budget.charge()
-        clock.now += 1
-    with pytest.raises(stack.Refused, match='12 state-changing dev verbs in the last hour'):
-        budget.charge()
+def test_stack_exposes_no_budget():
+    assert not hasattr(stack, 'DevBudget')
+    assert not hasattr(stack, 'DEV_BUDGET_LIMIT')
+    assert not hasattr(stack, 'DEV_BUDGET_WINDOW_SECONDS')
+    assert [name for name in dir(stack) if 'budget' in name.lower()] == []
 
 
-def test_a_refused_call_is_not_counted():
-    """Twelve at t=0, refusals at t=1800: had they counted, fewer than twelve would fit at t=3600."""
-    clock = Clock()
-    budget = stack.DevBudget(clock)
-    start = clock.now
-    for _ in range(12):
-        budget.charge()
-    clock.now = start + 1800
-    for _ in range(5):
-        with pytest.raises(stack.Refused):
-            budget.charge()
-    clock.now = start + 3600
-    for _ in range(12):
-        budget.charge()
-    with pytest.raises(stack.Refused):
-        budget.charge()
+def test_the_runner_holds_no_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    assert_no_call_counter(make_rig(tmp_path, monkeypatch))
 
 
-def test_entries_expire_one_by_one_on_a_rolling_window():
-    clock = Clock()
-    budget = stack.DevBudget(clock)
-    start = clock.now
-    for second in range(12):
-        clock.now = start + second
-        budget.charge()
-    clock.now = start + 3599.999
-    with pytest.raises(stack.Refused):
-        budget.charge()
-    clock.now = start + 3600
-    budget.charge()
-    with pytest.raises(stack.Refused):
-        budget.charge()
-    clock.now = start + 3601
-    budget.charge()
+def test_no_source_file_under_agent_mcp_carries_the_budget():
+    """No production file of the package (tests excluded) spells the budget's refusal, class or charge."""
+    sources = [
+        path
+        for path in sorted(AGENT_MCP_DIR.rglob('*'))
+        if path.is_file()
+        and 'tests' not in path.relative_to(AGENT_MCP_DIR).parts
+        and '__pycache__' not in path.relative_to(AGENT_MCP_DIR).parts
+    ]
+    assert any(path.name == 'runner.py' for path in sources), sources
+    found = [
+        (str(path.relative_to(AGENT_MCP_DIR)), marker)
+        for path in sources
+        for marker in BUDGET_SOURCE_MARKERS
+        if marker in path.read_text(errors='replace')
+    ]
+    assert found == []
 
 
-def test_the_budget_defaults_to_the_monotonic_clock():
-    assert inspect.signature(stack.DevBudget).parameters['clock'].default is time.monotonic
+def test_no_tool_description_or_schema_text_mentions_a_budget_or_a_charge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Exhaustive over every registered verb: the description the MCP tool list carries, and every schema string."""
+    agent = make_rig(tmp_path, monkeypatch).agent
+    assert len(agent.verbs) == len(runner.VERB_SCHEMAS) == 19
+    for verb in agent.verbs:
+        for text in (agent.describe(verb), *_strings_in(runner.VERB_SCHEMAS[verb])):
+            assert_no_budget_wording(text)
+            assert 'charge' not in text.lower(), (verb, text)
+
+
+def test_the_package_docstring_mentions_no_budget():
+    import tools.agent_mcp as package
+
+    assert package.__doc__
+    assert_no_budget_wording(package.__doc__)
+    assert 'charge' not in package.__doc__.lower()
 
 
 # ===============================================================================================

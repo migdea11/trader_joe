@@ -7,22 +7,24 @@ server/data/store/run_migrations.sh with the Makefile's `migrate` recipe, whose 
 dev_migrate, dev_migrate_check, dev_migrate_status and migrate_check are REMOVED; so are the agent-stack
 alembic paths. Both verbs are PLAIN calls.
 
-migrate, a refusal at any point running nothing after it and charging nothing:
+migrate, a refusal at any point running nothing after it:
 
     the mode guard FIRST (one `docker ps`; DEV or TEST; empty, PROD and mixed refuse) -> S6 stale copies
     -> D6 on the MODE's bind sources -> D5 env-file preflight -> the empty-versions guard (no step) -> the
     postgres lookup (exactly one) -> the data_store lookup (several refuse, none passes, as select_stack)
     -> `docker image inspect` of the mode's data_store image (:dev 'call build' / :test 'call
     test_build') -> TEST ONLY, the stamp gate: the data_ingest lookup, then -- when data_store or
-    data_ingest runs -- the two trusted digests (a failure answers failed, uncharged) and one container
+    data_ingest runs -- the two trusted digests (a failure answers failed) and one container
     stamp read per RUNNING service (stale, unstamped or unreadable: 'stale test stack: call test_build,
-    then test_up') -> ONE budget charge -> the bases (the one-off `run` of data_store is flagged as
+    then test_up') -> the bases (the one-off `run` of data_store is flagged as
     building) -> the one-off `run --rm --no-deps data_store /code/.venv/bin/alembic upgrade head`:
         DEV   through up's fixed `sh -c` secret wrapper over the dev files, dev_pinned_step_env()
         TEST  UNWRAPPED over base + docker-compose.fake.yaml, the pinned env plus DATA_DIR=./volume_data/test
 
 migrate_status: the mode guard (DEV or TEST), the data_store lookup, ONE exec of alembic current and
-history in it. It never charges the budget and never runs upgrade.
+history in it. It never runs upgrade.
+
+No verb charges, counts or refuses on call volume (ADR tj-4rr0la addendum 33: the S10 budget is withdrawn).
 
 Every verb call goes through the REAL AgentStack over the fake-docker rig. The secret tests run the REAL
 wrapper under sh with the REAL tools/dev_instance_secret.sh, a FAKE env file and a fake docker. Expected
@@ -46,16 +48,19 @@ import yaml
 from common.tests.test_ci_invariants import _made_variable
 from tools.agent_mcp import runner, stack
 from tools.agent_mcp.tests.harness import (
+    CALL_VOLUME,
+    OLD_BUDGET_REFUSAL,
     REPO_ROOT,
     FakeDocker,
     Rig,
+    assert_no_budget_wording,
+    assert_no_call_counter,
     default_response,
     is_dev_digest,
     is_dev_up_wrapper,
     make_rig,
 )
 from tools.agent_mcp.tests.test_dev_label_verbs import (
-    BUDGET_REFUSAL,
     DEV_LINE,
     GUARD,
     GUARD_FAILED,
@@ -100,7 +105,6 @@ STORE_ID = 'bbbbbbbbbbb2'
 INGEST_ID = 'ccccccccccc3'
 TEST_DATA_DIR = './volume_data/test'
 VERSIONS = 'server/data/store/migrations/versions'
-BUDGET = 12
 STALE_PREFIX = 'the MCP image is stale: '
 MODES = ('DEV', 'TEST')
 LINES = {'DEV': DEV_LINE, 'TEST': TEST_LINE}
@@ -179,7 +183,7 @@ def base_inspects() -> list[tuple[str, ...]]:
 
 
 def admission(mode: str, host: Path, running: tuple[str, ...] = ('data_store', 'data_ingest')) -> list[tuple[str, ...]]:
-    """Every step a migrate call runs ahead of the budget charge, in order."""
+    """Every step a migrate call runs ahead of the bases, in order."""
     steps = [GUARD, lookup('postgres'), lookup('data_store')]
     if mode == 'DEV':
         return [*steps, image_inspect(DEV_STORE_IMAGE)]
@@ -271,16 +275,6 @@ def _alembic_steps(rig: Rig) -> list[stack.Step]:
     return [step for step in rig.docker.steps if ALEMBIC in step.argv or is_dev_up_wrapper(step) or 'exec' in step.argv]
 
 
-def _charges_left(rig: Rig) -> int:
-    """How many more charges the budget takes before refusing (it is consumed by asking)."""
-    for taken in range(BUDGET + 1):
-        try:
-            rig.agent.dev_budget.charge()
-        except stack.Refused:
-            return taken
-    raise AssertionError('the budget never refused')
-
-
 # ===============================================================================================
 # migrate: THE CALL THAT WORKS, in each mode
 # ===============================================================================================
@@ -296,7 +290,7 @@ def test_migrate_runs_every_step_in_the_designed_order(tmp_path: Path, monkeypat
     assert _argvs(rig) == full_run(mode, rig.layout.repo_host_path)
     assert all(step.cwd == rig.layout.stack_dir for step in rig.docker.steps), rig.docker.steps
     assert 'job' not in json.dumps(result).lower(), 'a plain call, never a job'
-    assert _charges_left(rig) == BUDGET - 1, 'an admitted call is charged exactly once'
+    assert_no_call_counter(rig)
 
 
 @pytest.mark.parametrize('mode', MODES)
@@ -398,7 +392,7 @@ def test_no_steering_walk_and_no_generated_code_check_run(tmp_path: Path, monkey
 
 
 # ===============================================================================================
-# migrate: THE ORDER -- each refusal runs only the steps before it, runs no alembic and charges nothing
+# migrate: THE ORDER -- each refusal runs only the steps before it and runs no alembic
 # ===============================================================================================
 
 
@@ -486,9 +480,16 @@ def _missing_image(rig: Rig, responder: Responder) -> None:
     responder.images = {DEV_STORE_IMAGE: 1, TEST_STORE_IMAGE: 1}
 
 
-def _spent_budget(rig: Rig, responder: Responder) -> None:
-    for _ in range(BUDGET):
-        rig.agent.dev_budget.charge()
+def _failing_base_pull(rig: Rig, responder: Responder) -> None:
+    """The first base image is absent and will not pull: a failure AFTER admission, at the bases."""
+    ref = stack.BASE_IMAGES[0]
+
+    def respond(step: stack.Step) -> runner.ProcessResult:
+        if step.argv in (image_inspect(ref), (DOCKER, 'pull', ref)):
+            return runner.ProcessResult(1, b'', b'pull access denied')
+        return responder(step)
+
+    rig.docker.respond = respond
 
 
 # name -> (break it, the refusal (None: checked by prefix below), how many steps ran (None: all of admission))
@@ -518,13 +519,12 @@ REFUSALS = {
     ),
     'the data_store lookup failed': (_data_store_lookup_failed, LOOKUP_FAILED, 3),
     'no data_store image of the mode': (_missing_image, None, 4),
-    'the budget spent': (_spent_budget, BUDGET_REFUSAL, None),
 }
 
 
 @pytest.mark.parametrize('mode', MODES)
 @pytest.mark.parametrize(('breaks', 'message', 'ran'), list(REFUSALS.values()), ids=list(REFUSALS))
-def test_each_refusal_runs_only_the_steps_before_it_no_alembic_and_charges_nothing(
+def test_each_refusal_runs_only_the_steps_before_it_and_no_alembic(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, breaks, message: str | None, ran: int | None
 ):
     rig, responder = _rig(tmp_path, monkeypatch, mode)
@@ -546,8 +546,7 @@ def test_each_refusal_runs_only_the_steps_before_it_no_alembic_and_charges_nothi
     assert _argvs(rig) == expected
     assert not _alembic_steps(rig) and not [step for step in rig.docker.steps if step.builds], 'alembic ran'
     assert 'details' not in result, 'a refusal carries no selection detail'
-    if breaks is not _spent_budget:
-        assert _charges_left(rig) == BUDGET, 'a refused call was charged'
+    assert_no_call_counter(rig)
 
 
 def test_a_stale_baked_fake_file_refuses_test_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -590,7 +589,8 @@ PAIRS = {
     'the versions guard before the lookups': (_no_revision_files, _no_postgres, 'no revision files'),
     'postgres before data_store': (_no_postgres, _two_data_store, 'no running postgres'),
     'data_store before the image': (_two_data_store, _missing_image, 'running data_store containers'),
-    'the image before the budget': (_missing_image, _spent_budget, 'first'),
+    # Was 'the image before the budget' (addendum 33 withdrew the budget): the image still precedes the bases.
+    'the image before the bases': (_missing_image, _failing_base_pull, 'first'),
 }
 
 
@@ -667,7 +667,7 @@ _BAD_IMAGE_STAMPS = {
 
 @pytest.mark.parametrize('running', list(_SERVICE_STATES.values()), ids=list(_SERVICE_STATES))
 @pytest.mark.parametrize(('answer', 'start'), list(_BAD_IMAGE_STAMPS.values()), ids=list(_BAD_IMAGE_STAMPS))
-def test_a_bad_test_image_stamp_refuses_whatever_runs_with_no_alembic_and_no_charge(
+def test_a_bad_test_image_stamp_refuses_whatever_runs_with_no_alembic(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, running: tuple[str, ...], answer, start: str
 ):
     """Postgres alone up (the old gap) included: a stale :test image refuses, naming test_build."""
@@ -679,7 +679,8 @@ def test_a_bad_test_image_stamp_refuses_whatever_runs_with_no_alembic_and_no_cha
     assert result['message'].startswith(start) and result['message'].endswith('call test_build'), result['message']
     assert _argvs(rig) == admission('TEST', rig.layout.repo_host_path)[:7], 'the gate stops at the image stamp'
     assert _argvs(rig)[-1] == IMAGE_STAMP_READ
-    assert not _alembic_steps(rig) and _charges_left(rig) == BUDGET
+    assert not _alembic_steps(rig)
+    assert_no_call_counter(rig)
 
 
 def test_a_test_image_retagged_after_test_up_refuses_although_the_running_stamps_match(
@@ -692,7 +693,8 @@ def test_a_test_image_retagged_after_test_up_refuses_although_the_running_stamps
     assert result['status'] == 'refused', result
     assert f'image stamp {OTHER_DIGEST}' in result['message'] and f'checkout digest {STORE_DIGEST}' in result['message']
     assert not [argv for argv in _argvs(rig) if argv[:2] == (DOCKER, 'inspect')], 'no container stamp after the refusal'
-    assert not _alembic_steps(rig) and _charges_left(rig) == BUDGET
+    assert not _alembic_steps(rig)
+    assert_no_call_counter(rig)
 
 
 def test_with_postgres_alone_up_and_a_matching_image_the_migration_runs(
@@ -734,7 +736,7 @@ _BAD_STAMPS = {
 
 @pytest.mark.parametrize('service', ['data_store', 'data_ingest'])
 @pytest.mark.parametrize(('answer', 'kind'), list(_BAD_STAMPS.values()), ids=list(_BAD_STAMPS))
-def test_a_bad_running_stamp_refuses_with_no_alembic_step_and_no_charge(
+def test_a_bad_running_stamp_refuses_with_no_alembic_step(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, service: str, answer, kind: str
 ):
     rig, responder = _rig(tmp_path, monkeypatch, 'TEST')
@@ -748,7 +750,7 @@ def test_a_bad_running_stamp_refuses_with_no_alembic_step_and_no_charge(
     assert result['message'].endswith(STALE_FIX), result['message']
     assert _argvs(rig)[-1] == container_stamp(container_id), 'the gate stops at the bad stamp'
     assert not _alembic_steps(rig) and not [step for step in rig.docker.steps if step.builds]
-    assert _charges_left(rig) == BUDGET
+    assert_no_call_counter(rig)
 
 
 def test_a_stale_stamp_names_both_digests(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -762,7 +764,7 @@ def test_a_stale_stamp_names_both_digests(tmp_path: Path, monkeypatch: pytest.Mo
 @pytest.mark.parametrize(
     'answer', [(1, b''), (None, b''), (0, b'not-a-digest\n')], ids=['exits 1', 'killed', 'malformed']
 )
-def test_a_failed_digest_answers_failed_before_any_stamp_and_charges_nothing(
+def test_a_failed_digest_answers_failed_before_any_stamp(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, service_name: str, answer
 ):
     rig, responder = _rig(tmp_path, monkeypatch, 'TEST')
@@ -775,7 +777,7 @@ def test_a_failed_digest_answers_failed_before_any_stamp_and_charges_nothing(
     assert _argvs(rig) == admission('TEST', host)[: 5 if service_name == 'store' else 6]
     assert IMAGE_STAMP_READ not in _argvs(rig)
     assert not _alembic_steps(rig)
-    assert _charges_left(rig) == BUDGET
+    assert_no_call_counter(rig)
 
 
 @pytest.mark.parametrize(
@@ -795,11 +797,11 @@ def test_the_data_ingest_lookup_refuses_several_a_failure_and_a_non_id(
     result = rig.call('migrate', {})
     assert result['status'] == 'refused' and result['message'].startswith(message), result
     assert _argvs(rig) == admission('TEST', rig.layout.repo_host_path)[:8]
-    assert _charges_left(rig) == BUDGET
+    assert_no_call_counter(rig)
 
 
 # ===============================================================================================
-# migrate: FAILURES AFTER ADMISSION -- charged once, the exit status surfaced, the selection kept
+# migrate: FAILURES AFTER ADMISSION -- the exit status surfaced, the selection kept, nothing counted
 # ===============================================================================================
 
 
@@ -817,13 +819,11 @@ def test_a_migration_failing_midway_answers_failed_with_alembics_exit(
     assert result['details'] == {'mode': mode, 'selection': SELECTION[mode]}
     assert 'column already exists' in result['steps'][-1]['stderr']['text']
     assert _argvs(rig) == full_run(mode, rig.layout.repo_host_path)
-    assert _charges_left(rig) == BUDGET - 1
+    assert_no_call_counter(rig)
 
 
 @pytest.mark.parametrize('mode', MODES)
-def test_a_failed_base_pull_runs_no_alembic_and_is_charged_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
-):
+def test_a_failed_base_pull_runs_no_alembic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str):
     rig, responder = _rig(tmp_path, monkeypatch, mode)
     ref = stack.BASE_IMAGES[0]
 
@@ -836,19 +836,41 @@ def test_a_failed_base_pull_runs_no_alembic_and_is_charged_once(
     result = rig.call('migrate', {})
     assert result['status'] == 'failed' and result['message'].startswith('migrate stopped: base image'), result
     assert not _alembic_steps(rig)
-    assert _charges_left(rig) == BUDGET - 1
+    assert_no_call_counter(rig)
 
 
-def test_the_budget_is_charged_once_per_call_and_the_thirteenth_is_refused(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize('mode', MODES)
+def test_no_call_volume_refuses_migrate_and_every_call_reaches_alembic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
 ):
-    rig, _ = _rig(tmp_path, monkeypatch, 'TEST')
-    for _ in range(BUDGET):
-        assert rig.call('migrate', {})['status'] == 'ok'
+    """ADR tj-4rr0la addendum 33: no budget. CALL_VOLUME admitted calls inside one hour all run the one-off.
+
+    Inverts the withdrawn 'the budget is charged once per call and the thirteenth is refused'.
+    """
+    rig, _ = _rig(tmp_path, monkeypatch, mode)
+    for index in range(CALL_VOLUME):
+        rig.docker.steps.clear()
+        result = rig.call('migrate', {})
+        assert result['status'] == 'ok' and result['message'] != OLD_BUDGET_REFUSAL, (index, result)
+        assert _argvs(rig) == full_run(mode, rig.layout.repo_host_path), f'call {index + 1} stopped short of alembic'
+        assert [step for step in rig.docker.steps if ALEMBIC in step.argv or is_dev_up_wrapper(step)], index
+    assert_no_call_counter(rig)
+
+
+@pytest.mark.parametrize('mode', MODES)
+def test_a_failure_after_admission_leaves_nothing_that_affects_the_next_migrate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+):
+    """CALL_VOLUME failing one-offs, then a passing one: the next call runs exactly as a first call would."""
+    rig, responder = _rig(tmp_path, monkeypatch, mode)
+    responder.alembic = (1, b'', b'boom\n')
+    for _ in range(CALL_VOLUME):
+        assert rig.call('migrate', {})['status'] == 'failed'
+    responder.alembic = (0, b'', b'')
     rig.docker.steps.clear()
     result = rig.call('migrate', {})
-    assert (result['status'], result['message']) == ('refused', BUDGET_REFUSAL), result
-    assert _argvs(rig) == admission('TEST', rig.layout.repo_host_path), 'the charge comes after the last check'
+    assert result['status'] == 'ok', result
+    assert _argvs(rig) == full_run(mode, rig.layout.repo_host_path)
 
 
 # ===============================================================================================
@@ -1107,7 +1129,7 @@ def test_an_empty_secret_gives_unused_and_the_dev_migration_still_runs(tmp_path:
 
 
 # ===============================================================================================
-# migrate_status: the mode guard, then the exec of the former dev_migrate_status, never charged
+# migrate_status: the mode guard, then the exec of the former dev_migrate_status
 # ===============================================================================================
 
 
@@ -1127,13 +1149,25 @@ def test_migrate_status_runs_the_guard_the_lookup_then_one_exec(
 
 
 @pytest.mark.parametrize('mode', MODES)
-def test_migrate_status_never_charges_and_runs_with_the_budget_spent(
+def test_migrate_status_answers_unchanged_after_any_volume_of_migrate_and_status_calls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
 ):
+    """Inverts 'migrate_status never charges and runs with the budget spent': no budget exists to spend."""
     rig, _ = _rig(tmp_path, monkeypatch, mode)
-    assert rig.call('migrate_status', {})['status'] == 'ok'
-    assert _charges_left(rig) == BUDGET, 'migrate_status charged the budget'
-    assert rig.call('migrate_status', {})['status'] == 'ok', 'a spent budget refused a read-only verb'
+    first = rig.call('migrate_status', {})
+    assert first['status'] == 'ok', first
+    for _ in range(CALL_VOLUME):
+        assert rig.call('migrate', {})['status'] == 'ok'
+    for _ in range(CALL_VOLUME):
+        rig.docker.steps.clear()
+        result = rig.call('migrate_status', {})
+        assert (result['status'], result['message'], result['details']) == (
+            first['status'],
+            first['message'],
+            first['details'],
+        ), result
+        assert _argvs(rig) == status_run()
+    assert_no_call_counter(rig)
 
 
 @pytest.mark.parametrize('mode', MODES)
@@ -1188,7 +1222,8 @@ def test_migrate_status_refuses_without_exec_unless_the_lookup_found_exactly_one
     assert _argvs(rig) == status_run()[:2], 'an exec ran'
     names_fallback = result['message'].endswith('; use db_tables, which works while data_store is down')
     assert names_fallback is start.startswith('no running'), result['message']
-    assert STORE_ID not in result['message'] and _charges_left(rig) == BUDGET
+    assert STORE_ID not in result['message']
+    assert_no_call_counter(rig)
 
 
 @pytest.mark.parametrize('mode', MODES)
@@ -1252,12 +1287,13 @@ def test_the_schema_is_closed_and_takes_nothing(verb: str):
     ],
     ids=repr,
 )
-def test_any_argument_is_refused_with_no_step_and_no_charge(
+def test_any_argument_is_refused_with_no_step(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verb: str, arguments: Any
 ):
     rig, _ = _rig(tmp_path, monkeypatch)
     assert rig.call(verb, arguments)['status'] == 'refused'
-    assert rig.docker.steps == [] and _charges_left(rig) == BUDGET
+    assert rig.docker.steps == []
+    assert_no_call_counter(rig)
 
 
 def test_the_dead_empty_branch_is_gone_and_the_guard_alone_refuses_empty():
@@ -1318,7 +1354,9 @@ def test_migrate_says_it_writes_the_database_of_the_mode_that_is_up():
     assert 'stale test stack: call test_build, then test_up' in text and 'Never touches prod' in text, text
     status = agent.describe('migrate_status')
     assert status.startswith('READ-ONLY: `alembic current` then `alembic history` on the mode that is up'), status
-    assert 'charges no budget' in status and 'db_tables' in status, status
+    assert 'Takes no argument and writes nothing to the database' in status and 'db_tables' in status, status
+    assert_no_budget_wording(text)
+    assert_no_budget_wording(status)
 
 
 # ===============================================================================================
