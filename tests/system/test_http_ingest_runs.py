@@ -199,6 +199,20 @@ def _assert_delivered_by_the_running_ingest(pg_engine: Engine, run_identity, req
     id of the ingest process that made it; that id is the one the request was QUEUED under, and it is a LIVE instance
     the store sighted from the running ingest, not one this suite minted (a minted id carries the run id,
     tests/system/live_instances.py). The POST's own answer is read from the same row, so it names the same window.
+
+    Reds on (P26 mutant plan, tj-7zjov1.38; tj-7zjov1.321): M1a (the attempt row's served_start is not the one
+    served, data/store/app/ingest/delivery_intake.py:876) at the served-range assertion, both parameters, the POST
+    answer's range after it too; M1b (the attempt row names no instance, delivery_intake.py:848) at 'names no ingest
+    instance'; M1s (the store records no instance sighting, data/store/app/database/crud/ingest_instance.py:53) at
+    'never sighted'. The 'superseded, not the live one' line after it has no mutant of its own: a store that marked
+    the live instance superseded would also refuse to queue under it (mark_queued), so the POST would be expected to
+    time out before this line; by reading, no single mutant reaches it alone. The 'QUEUED under' equality has none
+    either (M1b reds the line before it).
+    Covered by, without a mutant: 'an instance this suite minted' is a guard on the suite, not on production (no
+    production line can mint an id carrying the run id); the minted-id marker is pinned by
+    server/data/store/tests/test_system_live_instances.py, and ingest answering with its own instance id by
+    server/data/ingest/tests/test_ack_gated_retry.py (test_the_submit_handler_routes_by_source_and_answers_with_its_
+    instance_id).
     """
     assert (run.served_start, run.served_end) == (START, END), (
         f'the attempt row carries served range [{run.served_start}, {run.served_end}), not [{START}, {END})'

@@ -14,19 +14,43 @@ decisions are recorded, but no dataset is created, none is stopped and no releas
   * the decision is recorded: an ENTERED for the selected symbol; and nothing is applied: no CREATED, no transition
     naming a request or a dataset, no panel-owned ingest request written since the panel was created, no panel-owned
     dataset created since then and none stopped (collect false) since then.
+
+THE RATES (W1 on tj-7zjov1.38; tj-7zjov1.321). The panel runs under LIVE_RATES (ramp 1, cap 2; panels.py), so a dry
+run that took the create path would CREATE, and 'applies nothing' can go red; under rates of 0 it deferred like the
+clean path. The recreated data_store's loop ticks at its start, so the dry pass may run BEFORE this phase does: the
+rates that decide it are the version phase A appended, current since then. This phase appends one more LIVE_RATES
+version before it waits, so a later tick of this phase's wait runs under rates above 0 too; it is deleted with the rest.
+The reachability guard runs in phase A only: here the pass may already have written what the guard looks for.
+
+Reds on: M7b (the dry-run setting inverted, data/store/app/panel_manager.py:1091) at the dry_run flag assertion (every
+pass dry_run); M6c (a dry-run pass takes the create path, panel_manager.py:721) at the no-CREATED assertion, the
+assertions before it holding (the pass is a finished dry MEMBERSHIP pass, its ENTERED for SYMBOL is recorded with
+the CREATED). Inert here: M6k (no PANEL_MANAGER_ENABLED override is set for this phase), M1s.
 """
 
+import asyncio
 import time
 
 import pytest
 import sqlalchemy as sa
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from data.store.app.client_label import PANEL_OWNER
+from data.store.app.client_label import OPERATOR_PRINCIPAL, PANEL_OWNER
+from data.store.app.database.crud.panel_settings import append_source_settings_version
 from data.store.app.database.models.ingest_request import IngestRequest
 from data.store.app.database.models.panel import PanelPassKind, PanelTransition
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.panel_manager import TICK_INTERVAL
-from tests.system.phased.panels import SYMBOL, delete_s6_rows, panels, passes_of, transitions_of
+from tests.system.phased.panels import (
+    LIVE_RATES,
+    REASON_PREFIX,
+    SOURCE,
+    SYMBOL,
+    delete_s6_rows,
+    panels,
+    passes_of,
+    transitions_of,
+)
 
 
 pytestmark = pytest.mark.data_store
@@ -38,13 +62,24 @@ DRY_RUN_WAIT_S = TICK_INTERVAL.total_seconds() + 30.0
 POLL_S = 5.0
 
 
-def test_s6b_a_dry_run_records_its_decisions_and_applies_nothing(pg_engine, data_store) -> None:
+@pytest.mark.asyncio
+async def test_s6b_a_dry_run_records_its_decisions_and_applies_nothing(
+    pg_engine, pg_async_engine, run_identity, data_store
+) -> None:
     found = panels(pg_engine)
     if not found:
         pytest.fail(f'no S6 panel: phase A never ran (or failed and cleaned up). Run {PHASE_A} first.', pytrace=False)
     try:
         assert len(found) == 1, f'{len(found)} S6 panels are present; rerun phase A'
         panel = found[0]
+        async with AsyncSession(pg_async_engine, expire_on_commit=False) as db:
+            await append_source_settings_version(
+                db,
+                source=SOURCE,
+                settings=LIVE_RATES,
+                actor=OPERATOR_PRINCIPAL,
+                reason=f'{REASON_PREFIX} {run_identity.run_id} phase B',
+            )
 
         deadline = time.monotonic() + DRY_RUN_WAIT_S
         while True:
@@ -57,7 +92,7 @@ def test_s6b_a_dry_run_records_its_decisions_and_applies_nothing(pg_engine, data
                     'dry-run loop did not tick it (is PANEL_MANAGER_DRY_RUN true and PANEL_MANAGER_ENABLED unset?)',
                     pytrace=False,
                 )
-            time.sleep(POLL_S)
+            await asyncio.sleep(POLL_S)
 
         written = passes_of(pg_engine, panel.id)
         assert all(row.dry_run for row in written), f'{sum(not row.dry_run for row in written)} pass(es) not dry_run'

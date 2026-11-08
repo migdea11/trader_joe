@@ -21,7 +21,16 @@ WHAT IT PINS:
     each, no FAILED row, the durable count equal to the rows, one entry per symbol with exactly the generator's bars;
   * the quota counts are right: each request's spend equals its attempt rows' (calls and pages), with no attempt of
     unknown spend, however many times its report was redelivered;
-  * one instance, still live, made every attempt (the outage did not restart ingest).
+  * one instance, still live, made every attempt (the outage did not restart ingest);
+  * of the running bind, only that each SUCCEEDED attempt row has a served_start (its PRESENCE,
+    scenario.assert_each_reported_once); the served range's value is pinned by S1 (tests/system/
+    test_http_ingest_runs.py, mutant M1a), not here, so that M1a stays inert in this scenario beside M5b (W4 on
+    tj-7zjov1.38, ruled 00:28 UTC 2026-11-04).
+
+Reds on (P26 mutant plan, tj-7zjov1.38; tj-7zjov1.321): M5b (the outgoing buffer is never full,
+data/ingest/app/scheduler/outbox.py:67 'return False') at the bound assertion (more held reports than the buffer plus
+the workers). Guards ('did not exercise'): the outage-length assertion, 'no attempt was begun before data_store came
+back' and 'no request was first attempted after data_store came back'; when one fails the run reruns from phase A.
 
 NOT PINNABLE HERE: the stall alarm and the stalled health state (ingest's log and its gRPC health, which test_client
 cannot reach). The orchestrator reads the alarm in ingest's log (steps 4 and 6 of the step list).

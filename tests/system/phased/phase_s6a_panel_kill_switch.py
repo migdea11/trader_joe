@@ -2,10 +2,16 @@
 
 THE SCENARIO (P26 tj-7zjov1.38 acceptance: "the kill switch and the dry run"; note 02:35 UTC 2026-11-02: test_env
 data_store {PANEL_MANAGER_ENABLED: false} then a run, no pass row written, the disabled log line via logs).
-Before this phase the orchestrator recreates data_store with PANEL_MANAGER_ENABLED false. This phase creates one
-ENABLED ALPACA_API panel (panels.py: one symbol of the fake's active list, under a source settings version of its own
-with both rates 0, so even a live pass could create nothing), then watches it for KILL_WAIT_S and fails at once if any
-pass row appears for it, or any panel-owned ingest request is written.
+Before this phase the orchestrator recreates data_store with PANEL_MANAGER_ENABLED false. This phase checks that the
+create path is reachable (panels.assert_create_path_reachable), creates one ENABLED ALPACA_API panel (panels.py: one
+symbol of the fake's active list, under a source settings version of its own with LIVE_RATES, ramp 1 and cap 2, so a
+loop that ran would CREATE the member, not defer it), then watches it for KILL_WAIT_S and fails at once if any pass
+row appears for it, or any panel-owned ingest request is written.
+
+Reds on: M6k (the kill switch ignores its value, data/store/app/panel_manager.py:177 'not in _FALSE') at the pass-row
+assertion in the wait loop; with the rates above 0 the panel-owned request count after it can go red too, but the
+pass-row assertion fires first (the pass row opens before the create commits). Inert here: M6c and M7b (they act
+only on a running loop), M7a (the override is explicit).
 
 THE BOUNDED WAIT, AND WHY IT IS THIS LONG. A running panel loop ticks every TICK_INTERVAL (5 minutes,
 data/store/app/panel_manager.py, a constant) from its start, and a new enabled panel is due at its creation, with its
@@ -38,12 +44,13 @@ from data.store.app.database.crud.panel_settings import append_source_settings_v
 from data.store.app.database.models.ingest_request import IngestRequest
 from data.store.app.panel_manager import TICK_INTERVAL
 from tests.system.phased.panels import (
+    LIVE_RATES,
     NAME_PREFIX,
-    PAUSED_RATES,
     REASON_PREFIX,
     SETTINGS_V1,
     SOURCE,
     assert_active_snapshot_holds_symbol,
+    assert_create_path_reachable,
     delete_s6_rows,
     panels,
     passes_of,
@@ -72,13 +79,14 @@ async def test_s6a_the_kill_switch_holds_an_enabled_panel_off_for_a_whole_tick(
 ) -> None:
     delete_s6_rows(pg_engine)
     assert_active_snapshot_holds_symbol(pg_engine)
+    assert_create_path_reachable(pg_engine)
 
     try:
         async with AsyncSession(pg_async_engine, expire_on_commit=False) as db:
             await append_source_settings_version(
                 db,
                 source=SOURCE,
-                settings=PAUSED_RATES,
+                settings=LIVE_RATES,
                 actor=OPERATOR_PRINCIPAL,
                 reason=f'{REASON_PREFIX} {run_identity.run_id}',
             )

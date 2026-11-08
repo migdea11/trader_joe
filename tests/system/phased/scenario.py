@@ -64,6 +64,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from common.enums.data_select import AssetType, DataType
 from common.enums.data_stock import DataSource, Granularity
+from common.rpc.clients.store_delivery import DEFAULT_DELIVERY_DEADLINE_S
 from data.ingest.app.scheduler.executor import ExecutorSettings
 from data.store.app.database.crud.ingest_request import NewIngestRequest, create_request
 from data.store.app.database.models.ingest_instance import IngestInstance
@@ -73,7 +74,7 @@ from data.store.app.database.models.stock_market_activity import StockMarketActi
 from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.ingest.data_action_request import new_bars_request
 from schemas.data_store.asset_dataset_store import StoreAssetDatasetBody, StoreAssetDatasetPath
-from tests.fakes.market_data import SLOW_PREFIX, grid_timestamps
+from tests.fakes.market_data import DEFAULT_SLOW_DELAY_SECONDS, SLOW_PREFIX, grid_timestamps
 
 
 REQUESTS = IngestRequest.__table__
@@ -406,6 +407,91 @@ def assert_one_entry_each(pg_engine: Engine, run: PhaseRun, requests: dict[uuid.
             if tuple(stamps) != EXPECTED_TIMESTAMPS:
                 problems.append(f'entry {entry.id} holds {len(stamps)} bars, expected {len(EXPECTED_TIMESTAMPS)}')
     assert not problems, f'{len(problems)} problem(s), first 10: {problems[:10]}'
+
+
+# HOW LONG A data_store OUTAGE MUST LAST BEFORE A DELIVERY CAN FAIL (tj-7zjov1.350 F-A). Ingest delivers each report
+# in its own task (data/ingest/app/scheduler/executor.py, __deliver_until_acknowledged) through
+# GrpcStoreDeliveryClient, which ingest builds with the default deadline (data/ingest/app/app_depends.py, no
+# deadline_s). Each DeliverAttempt call carries timeout=DEFAULT_DELIVERY_DEADLINE_S (60 s) AND wait_for_ready=True
+# (common/rpc/clients/store_delivery.py): a call made while the store is down WAITS for it, and fails only when the
+# deadline runs out first. So an outage shorter than the deadline fails no delivery at all: the blocked first call
+# succeeds when the store returns, the redelivery branch is never taken, and a mutant that abandons a failed delivery
+# (M3r) survives. That is what the stack run showed: a 66 s outage, M3r survived with no redelivery logged; a 125 s
+# outage, M3r red.
+# The arithmetic. An attempt counted as crossing (outage_evidence) was BEGUN before last_before; its work is one slow
+# delay (DEFAULT_SLOW_DELAY_SECONDS, 8 s, FAKE_READ_SLOW_SECONDS unset on S3), after which its delivery's first call
+# starts at once (its own task). That call fails by its deadline no later than
+#     last_before + slow delay + deadline  =  last_before + 8 + 60  =  last_before + 68 s,
+# and the store's gRPC server is not up before up_at (its lifespan opens Postgres connections first). So when
+# up_at - last_before exceeds 68 s, every crosser's first call failed and its report reached the store only by a
+# redelivery. OUTAGE_MARGIN_S covers what the bound leaves out: the attempt's own overhead beyond the fake's sleep,
+# the hand-off to the delivery task, the channel's reconnect backoff (about 2.4 s), and the commit-time dating of
+# last_before. MIN_OUTAGE_S = 60 + 8 + 30 = 98 s. Read from the constants, so a changed deadline moves it.
+OUTAGE_MARGIN_S = 30.0
+MIN_OUTAGE_S = DEFAULT_DELIVERY_DEADLINE_S + DEFAULT_SLOW_DELAY_SECONDS + OUTAGE_MARGIN_S
+
+
+@dataclass(frozen=True)
+class OutageEvidence:
+    """What the database shows of a data_store outage that phase B judges (S3; S5-B reads the same rows inline).
+
+    up_at is when the store came back (data_store_connected_since). The stop leaves no row, so last_before, the last
+    delivery committed before up_at, stands in for it (the run's seeded_at when nothing was delivered before it): the
+    stop followed it by at most one slow delay. crossed holds the requests whose served attempt was BEGUN before
+    last_before, so before the stop, and DELIVERED at or after up_at. A crosser proves a redelivery only when the
+    outage is at least MIN_OUTAGE_S (assert_outage_long_enough): under it, its first call may simply have waited.
+    """
+
+    last_before: datetime
+    up_at: datetime
+    crossed: tuple[uuid.UUID, ...]
+
+    @property
+    def outage_s(self) -> float:
+        return (self.up_at - self.last_before).total_seconds()
+
+
+def outage_evidence(
+    requests: dict[uuid.UUID, sa.Row], attempts: dict[uuid.UUID, list[sa.Row]], up_at: datetime, seeded_at: datetime
+) -> OutageEvidence:
+    """Date the outage from the request rows and name the attempts held across it.
+
+    The served attempt is a request's last attempt row (its SUCCEEDED one, once assert_each_reported_once held). An
+    attempt counts only once its request is finished: one still open has not been delivered after the outage.
+    When the outage is at least MIN_OUTAGE_S, a crosser's first delivery call ran out its deadline before the store
+    came back (the arithmetic at MIN_OUTAGE_S), so its report reaching the store after up_at is a delivery that failed
+    and was redelivered. Under it, a crosser may be a first call that waited (wait_for_ready) and succeeded.
+    """
+    delivered_before = [
+        request.finished_at
+        for request in requests.values()
+        if request.finished_at is not None and request.finished_at < up_at
+    ]
+    last_before = max(delivered_before) if delivered_before else seeded_at
+    crossed = tuple(
+        request_id
+        for request_id, rows in attempts.items()
+        if rows
+        and requests[request_id].finished_at is not None
+        and rows[-1].started_at < last_before
+        and requests[request_id].finished_at >= up_at
+    )
+    return OutageEvidence(last_before=last_before, up_at=up_at, crossed=crossed)
+
+
+def assert_outage_long_enough(evidence: OutageEvidence, minimum_s: float = MIN_OUTAGE_S) -> None:
+    """Fail, as 'did not exercise', when the outage was too short for any delivery to fail (MIN_OUTAGE_S).
+
+    Raises:
+        AssertionError: The outage, dated from the database, is under minimum_s; the run proves nothing.
+    """
+    assert evidence.outage_s >= minimum_s, (
+        f'data_store was down about {evidence.outage_s:.0f} s (last delivery {evidence.last_before}, back at '
+        f'{evidence.up_at}), under {minimum_s:.0f} s (the {DEFAULT_DELIVERY_DEADLINE_S:.0f} s delivery deadline, '
+        f'which a call waits out for a stopped store, plus the {DEFAULT_SLOW_DELAY_SECONDS:.0f} s slow delay and a '
+        f'{OUTAGE_MARGIN_S:.0f} s margin): no delivery need have failed. Rerun from phase A with a longer wait '
+        'between test_stop and test_start.'
+    )
 
 
 def cleanup_if_finished(pg_engine: Engine, run: PhaseRun) -> None:

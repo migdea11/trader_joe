@@ -23,6 +23,12 @@ tj-7zjov1.290); the orchestrator reads it with `logs data_ingest` between the re
 phase_s2a_ingest_restart_before.py). What this tier does show is the store's side of the same rule: the charge is
 never written as spend, so a recovered request's spend is exactly its delivered attempt's. The charge and its line
 are pinned in ingest's unit tier (server/data/ingest/tests/test_restart_intake.py).
+
+Reds on (P26 mutant plan, tj-7zjov1.38; tj-7zjov1.321): M2n (a recovered request is counted as one more attempt,
+data/store/app/ingest/data_action_request.py:334 attempt_count) in assert_each_reported_once (a gap in the attempt
+numbers, or the durable count above the rows), or in wait_until_finished if the intake refuses the gap. Guard ('did
+not exercise'): 'no request was finished by the new instance'; when it fails the run reruns from phase A. The charge
+is a log step, not an assertion (W3, accepted).
 """
 
 import pytest

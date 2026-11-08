@@ -27,6 +27,13 @@ test deletes it at the end; otherwise the existing one is used and left alone.
 
 CLEANUP, by id, a test-only delete (the tables are append-only): the pass's transitions (none expected), the panel's
 passes and settings versions, the panel, and the source settings version this test created.
+
+Reds on (P26 mutant plan, tj-7zjov1.38; tj-7zjov1.321): M7a (the loop off by default, data/store/app/
+panel_manager.py:177 default 'false') at 'no finished pass', after the full wait; M7b (the dry-run setting inverted,
+panel_manager.py:1091) at 'the pass is a dry run'.
+Covered by, without a mutant (architect ruling 00:28 UTC 2026-11-04 on tj-7zjov1.38): the pass kind, its settings
+version, its active snapshot and its zero transitions restate P26a PM1 (tests/system/test_panel_manager_pg.py), whose
+planted mutants in the tj-7zjov1.262 mutation pass (m1, m4, m6, m7) red PM1.
 """
 
 import time

@@ -712,11 +712,21 @@ class DataStoreHttp:
         auth: WriteAuth = WriteAuth.ABSENT,
         params: dict[str, Any] | None = None,
         json: Any = None,
+        read_timeout_ok: bool = False,
     ) -> httpx.Response:
-        """Send one request. A data_store that does not answer FAILS the test, naming the URL; never a skip."""
+        """Send one request. A data_store that does not answer FAILS the test, naming the URL; never a skip.
+
+        read_timeout_ok, for a caller that expects the store to take longer than HTTP_TIMEOUT_SECONDS to answer
+        (P26 Zc, whose POST waits about a minute for its verdict; tj-7zjov1.353): an httpx.ReadTimeout is re-raised
+        for the caller to catch instead of failing the test. Only a READ timeout: the request was sent and the store
+        accepted the connection. A ConnectTimeout, a PoolTimeout, a WriteTimeout and every other transport error mean
+        the request may never have reached the store, and still fail here.
+        """
         try:
             return self._client.request(method, path, params=params, json=json, headers=self._headers(auth))
         except httpx.TransportError as exc:
+            if read_timeout_ok and isinstance(exc, httpx.ReadTimeout):
+                raise
             reason = self.redact(f'{type(exc).__name__}: {exc}')
         pytest.fail(
             f'system suite: data_store at {self.base_url} did not answer {method} {path}: {reason}. '
@@ -727,8 +737,8 @@ class DataStoreHttp:
     def get(self, path: str, *, params: dict[str, Any] | None = None, auth: WriteAuth = WriteAuth.ABSENT):
         return self.request('GET', path, params=params, auth=auth)
 
-    def post(self, path: str, *, json: Any, auth: WriteAuth) -> httpx.Response:
-        return self.request('POST', path, json=json, auth=auth)
+    def post(self, path: str, *, json: Any, auth: WriteAuth, read_timeout_ok: bool = False) -> httpx.Response:
+        return self.request('POST', path, json=json, auth=auth, read_timeout_ok=read_timeout_ok)
 
     def patch(self, path: str, *, json: Any, auth: WriteAuth) -> httpx.Response:
         return self.request('PATCH', path, json=json, auth=auth)
