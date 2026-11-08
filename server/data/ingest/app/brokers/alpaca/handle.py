@@ -31,7 +31,7 @@ from data.ingest.app.brokers.alpaca import broker_api
 from data.ingest.app.brokers.alpaca.asset_attempt import AssetListAttemptRunner, AssetListWork
 from data.ingest.app.brokers.alpaca.read import AlpacaRead
 from data.ingest.app.brokers.bars_attempt import BarsAttemptRunner, BarsWork
-from data.ingest.app.brokers.handle import BrokerHandle
+from data.ingest.app.brokers.handle import BrokerHandle, Intake
 from data.ingest.app.brokers.rate_budget import RequestPriority
 from data.ingest.app.scheduler.credentials import Credential, StaticCredentialProvider
 from data.ingest.app.scheduler.executor import AckGatedExecutor, AttemptResult, AttemptRunner, ExecutorSettings
@@ -39,7 +39,7 @@ from data.ingest.app.scheduler.limits import Limit
 from data.ingest.app.scheduler.queue import ScheduledRequest
 from data.ingest.app.scheduler.retry import RetryPolicy
 from data.ingest.app.scheduler.scheduler import SchedulerBuilder
-from schemas.data_ingest.submit import RequestKind, SubmitAccepted, SubmitAck, SubmitRequest
+from schemas.data_ingest.submit import RequestKind, SubmitRequest
 
 
 # The quota scope of Alpaca's market-data API. Starts with the DataSource value; see the module docstring.
@@ -165,8 +165,6 @@ class AlpacaHandle(BrokerHandle):
         if calls_per_minute is None:
             calls_per_minute = get_env_var('ALPACA_RATE_LIMIT_PER_MINUTE', ALPACA_CALLS_PER_MINUTE_CEILING, int)
         minute = timedelta(minutes=1)
-        # Before super().__init__: the executor's on_finished is this handle's bound method.
-        self.__asset_active: set[str] = set()
         scheduler = (
             SchedulerBuilder()
             .declare_scope(ALPACA_DATA_SCOPE, [Limit(minute, ALPACA_CALLS_PER_MINUTE_CEILING)])
@@ -194,64 +192,32 @@ class AlpacaHandle(BrokerHandle):
             reader=reader,
             resolve_feed=broker_api.resolve_feed,
         )
+        self.register_intake(RequestKind.ASSET_LIST, self.__asset_list_intake)
 
-    @property
-    def active(self) -> int:
-        """int: Requests held that have not finished, of every kind."""
-        return super().active + len(self.__asset_active)
+    @staticmethod
+    def __asset_list_intake(request: SubmitRequest) -> Intake:
+        """The asset_list kind's intake: stocks only, on the TRADING scope at BACKFILL priority, with no tape.
 
-    async def submit(self, request: SubmitRequest) -> SubmitAck:
-        """Hold one request and answer at once: an asset list here, anything else as BrokerHandle does.
-
-        An asset-list request is queued on the TRADING scope with no tape: SubmitAccepted.feed is None and the
-        ScheduledRequest.feed stays None, so an EXPIRED or EXHAUSTED report of it is FEED_UNSPECIFIED. Idempotent on
-        request_id, and a restart's recovered re-submit is charged its one-call estimate before it is queued, as
-        a bars request is. A request that arrives with its attempt budget spent is reported EXHAUSTED and never queued.
+        SubmitAccepted.feed is None and the ScheduledRequest.feed stays None, so an EXPIRED or EXHAUSTED report of it
+        is FEED_UNSPECIFIED.
 
         Args:
-            request (SubmitRequest): A request of any kind this handle serves.
+            request (SubmitRequest): An asset-list request.
 
         Returns:
-            SubmitAck: Accepted with the quota scope charged.
+            Intake: The trading scope, the AssetListWork, no feed.
 
         Raises:
-            InvalidRequestError: UNSUPPORTED_ASSET_TYPE for an asset list of a kind other than stock, and for any other
-                kind as BrokerHandle.submit raises it.
+            InvalidRequestError: INVALID_REQUEST if the request carries no asset list; UNSUPPORTED_ASSET_TYPE for an
+                asset list of a kind other than stock.
         """
-        if request.kind is not RequestKind.ASSET_LIST or request.asset_list is None:
-            return await super().submit(request)
         listing = request.asset_list
+        if listing is None:
+            raise InvalidRequestError(Reason.INVALID_REQUEST, f'{request.kind.value} requests are not served yet')
         if listing.asset_type is not AssetType.STOCK:
             raise InvalidRequestError(
                 Reason.UNSUPPORTED_ASSET_TYPE, f'Alpaca lists stocks only: asset_type={listing.asset_type!r}'
             )
-        accepted = SubmitAck(accepted=SubmitAccepted(feed=None, quota_key=ALPACA_TRADING_SCOPE))
-        if request.request_id in self.__asset_active:
-            return accepted
-        scheduled = ScheduledRequest(
-            request_id=request.request_id,
-            quota_scope=ALPACA_TRADING_SCOPE,
-            payload=AssetListWork(request=listing, priority=RequestPriority.BACKFILL),
-            ready_by=request.ready_by,
-            client_label=request.client,
-            attempt_count=request.attempt_count,
+        return Intake(
+            scope=ALPACA_TRADING_SCOPE, payload=AssetListWork(request=listing, priority=RequestPriority.BACKFILL)
         )
-        self.__asset_active.add(request.request_id)
-        if self.executor.settings.retry.is_last(request.attempt_count):
-            if request.recovered:
-                self.scheduler.charge_restart(scheduled)
-            self.executor.report_exhausted(scheduled)
-            return accepted
-        if request.recovered:
-            self.scheduler.charge_restart(scheduled)
-        await self.scheduler.submit(scheduled)
-        return accepted
-
-    def finished(self, request: ScheduledRequest) -> None:
-        """Forget a request that will not run again, of either kind, so the store can submit its id afresh.
-
-        Args:
-            request (ScheduledRequest): The request the executor is done with.
-        """
-        self.__asset_active.discard(request.request_id)
-        super().finished(request)

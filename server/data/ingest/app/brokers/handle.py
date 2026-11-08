@@ -26,6 +26,7 @@ What a handle does NOT do: announce the instance or answer the probe (app/instan
 """
 
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from common.enums.data_stock import DataSource, Feed
 from common.errors.vocabulary import ERROR_DOMAIN, InvalidRequestError, Reason
@@ -43,6 +44,20 @@ from schemas.data_ingest.submit import RequestKind, SubmitAccepted, SubmitAck, S
 # The fixed prefix of a handle's gRPC health service name. A registered servicer is named by its protobuf package and
 # service (trader_joe.proto.internal.ingest.v1.IngestService), so a name under this prefix cannot collide with one.
 INGEST_DELIVERY_HEALTH_PREFIX = 'trader_joe.ingest.delivery.'
+
+
+@dataclass(frozen=True)
+class Intake:
+    """What a request kind's intake decides for the shared tail: where it is charged, what it runs, which tape."""
+
+    scope: str
+    payload: object
+    feed: Feed | None = None
+
+
+def _not_served(kind: RequestKind) -> InvalidRequestError:
+    """Build INVALID_REQUEST for a kind (or a kind's missing body) this handle does not serve yet."""
+    return InvalidRequestError(Reason.INVALID_REQUEST, f'{kind.value} requests are not served yet')
 
 
 class BrokerHandle:
@@ -75,6 +90,8 @@ class BrokerHandle:
         self.__reader = reader
         self.__resolve_feed = resolve_feed
         self.__active: set[str] = set()
+        self.__intakes: dict[RequestKind, Callable[[SubmitRequest], Intake | SubmitAck]] = {}
+        self.register_intake(RequestKind.BARS, self.__bars_intake)
 
     @property
     def source(self) -> DataSource:
@@ -131,45 +148,55 @@ class BrokerHandle:
         """Stop the handle's workers and its waiting retries."""
         await self.__executor.stop()
 
-    async def submit(self, request: SubmitRequest) -> SubmitAck:
-        """Hold one bars request and answer at once.
+    def register_intake(self, kind: RequestKind, intake: Callable[[SubmitRequest], Intake | SubmitAck]) -> None:
+        """Register the intake of one request kind: the only part of Submit a kind supplies.
 
-        The caller has validated what is knowable before the vendor (routers/data_ingest/bars_validation.py).
+        The shared tail (submit) is not overridden to add a kind. An intake is given the SubmitRequest and returns
+        either a refusal ack (nothing is queued) or the Intake it is queued with; it raises for a request this kind
+        cannot serve. A second registration of a kind replaces the first.
 
         Args:
-            request (SubmitRequest): A bars request.
+            kind (RequestKind): The request kind the intake serves.
+            intake (Callable[[SubmitRequest], Intake | SubmitAck]): Its intake.
+        """
+        self.__intakes[kind] = intake
+
+    async def submit(self, request: SubmitRequest) -> SubmitAck:
+        """Hold one request and answer at once.
+
+        The kind's own intake decides the scope, the work and the refusals; this tail is the same for every kind and
+        its order matters: a duplicate id answered again, an exhausted request reported and never queued, a recovered
+        one charged before it is queued, and no tape put on a kind whose intake gives none. The caller has validated
+        what is knowable before the vendor (routers/data_ingest/bars_validation.py).
+
+        Args:
+            request (SubmitRequest): A request of any kind this handle has an intake for.
 
         Returns:
-            SubmitAck: Accepted with the resolved feed and the quota scope, or refused for a feed this
-            deployment cannot serve. A refused request is not queued.
+            SubmitAck: Accepted with the feed (None for a no-tape kind) and the quota scope, or the refusal its
+            intake gave. A refused request is not queued.
 
         Raises:
-            InvalidRequestError: INVALID_REQUEST for a kind this handle does not serve yet.
+            InvalidRequestError: INVALID_REQUEST for a kind this handle does not serve yet, and whatever the kind's
+                intake raises for a request it cannot serve.
         """
-        if request.kind is not RequestKind.BARS or request.bars is None:
-            raise InvalidRequestError(Reason.INVALID_REQUEST, f'{request.kind.value} requests are not served yet')
-        bars = request.bars
-        feed = self.__resolve_feed()
-        if bars.feed is not None and bars.feed != feed:
-            return SubmitAck(
-                refused=FetchRefused(
-                    reason=Reason.FEED_NOT_AVAILABLE.value,
-                    domain=ERROR_DOMAIN,
-                    detail=f'This deployment cannot serve the requested feed: feed={bars.feed.value}',
-                    metadata={'feed': bars.feed.value},
-                )
-            )
-        accepted = SubmitAck(accepted=SubmitAccepted(feed=feed, quota_key=self.__scope))
+        intake_for = self.__intakes.get(request.kind)
+        if intake_for is None:
+            raise _not_served(request.kind)
+        intake = intake_for(request)
+        if isinstance(intake, SubmitAck):
+            return intake
+        accepted = SubmitAck(accepted=SubmitAccepted(feed=intake.feed, quota_key=intake.scope))
         if request.request_id in self.__active:
             return accepted
         scheduled = ScheduledRequest(
             request_id=request.request_id,
-            quota_scope=self.__scope,
-            payload=BarsWork(request=bars, priority=priority_for_update_type(bars.update_type), feed=feed),
+            quota_scope=intake.scope,
+            payload=intake.payload,
             ready_by=request.ready_by,
             client_label=request.client,
             attempt_count=request.attempt_count,
-            feed=feed,
+            feed=intake.feed,
         )
         self.__active.add(request.request_id)
         if self.__executor.settings.retry.is_last(request.attempt_count):
@@ -184,6 +211,27 @@ class BrokerHandle:
             self.__scheduler.charge_restart(scheduled)
         await self.__scheduler.submit(scheduled)
         return accepted
+
+    def __bars_intake(self, request: SubmitRequest) -> Intake | SubmitAck:
+        """The bars kind's intake: resolve the feed, refuse one this deployment cannot serve, charge the data scope."""
+        if request.bars is None:
+            raise _not_served(request.kind)
+        bars = request.bars
+        feed = self.__resolve_feed()
+        if bars.feed is not None and bars.feed != feed:
+            return SubmitAck(
+                refused=FetchRefused(
+                    reason=Reason.FEED_NOT_AVAILABLE.value,
+                    domain=ERROR_DOMAIN,
+                    detail=f'This deployment cannot serve the requested feed: feed={bars.feed.value}',
+                    metadata={'feed': bars.feed.value},
+                )
+            )
+        return Intake(
+            scope=self.__scope,
+            payload=BarsWork(request=bars, priority=priority_for_update_type(bars.update_type), feed=feed),
+            feed=feed,
+        )
 
     async def report_expired(self, expired: ExpiredRequest) -> None:
         """Send an expired request out through the executor. This is the scheduler's expired sink.
