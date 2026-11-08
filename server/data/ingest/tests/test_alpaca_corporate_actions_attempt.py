@@ -208,7 +208,6 @@ def bars_request() -> BarsRequest:
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch):
     """An IEX deployment (so a copied tape would be visible), no credential, no trading host, no cached client."""
-    monkeypatch.delenv('ALPACA_SIP_ENABLED', raising=False)
     monkeypatch.delenv('ALPACA_RATE_LIMIT_PER_MINUTE', raising=False)
     for name in (*broker_api.ALPACA_CREDENTIAL_VARS, broker_api.ALPACA_TRADING_HOST_VAR):
         monkeypatch.delenv(name, raising=False)

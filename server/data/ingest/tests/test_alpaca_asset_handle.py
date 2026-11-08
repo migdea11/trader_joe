@@ -204,7 +204,6 @@ def bars_submit(request_id: str = 'bars-1') -> SubmitRequest:
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch):
     """An IEX deployment (so a copied tape would be visible), no credential, no trading host, no cached client."""
-    monkeypatch.delenv('ALPACA_SIP_ENABLED', raising=False)
     monkeypatch.delenv('ALPACA_RATE_LIMIT_PER_MINUTE', raising=False)
     for name in (*broker_api.ALPACA_CREDENTIAL_VARS, broker_api.ALPACA_TRADING_HOST_VAR):
         monkeypatch.delenv(name, raising=False)
@@ -436,9 +435,10 @@ async def test_a_bars_submit_still_goes_through_the_base_handle_with_its_tape_on
 
     ack = await handle.submit(bars_submit())
 
-    assert (ack.accepted.feed, ack.accepted.quota_key) == (Feed.IEX, ALPACA_DATA_SCOPE)
+    # No feed named: SIP, the default (tj-7zjov1.343).
+    assert (ack.accepted.feed, ack.accepted.quota_key) == (Feed.SIP, ALPACA_DATA_SCOPE)
     queued = await asyncio.wait_for(handle.scheduler.take(), GUARD_S)
-    assert (queued.quota_scope, queued.feed) == (ALPACA_DATA_SCOPE, Feed.IEX)
+    assert (queued.quota_scope, queued.feed) == (ALPACA_DATA_SCOPE, Feed.SIP)
 
 
 @pytest.mark.asyncio

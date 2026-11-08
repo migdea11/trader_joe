@@ -16,9 +16,9 @@ no ceiling: they set the executor's buffer, its alarm and its retry budget, and 
 read when the handle is built and falls back to the default below (the attempt default, DEFAULT_MAX_ATTEMPTS, lives in
 scheduler/retry.py so a caller needing it imports no vendor SDK).
 
-THE FEED. The handle decides the default feed, per broker and per account (owner rulings, tj-7zjov1.91). One Alpaca
-account per deployment today, so the handle reads ALPACA_SIP_ENABLED once, when it is built, as that account's setting
-(default false, IEX) and hands the resulting feed to its reader. Nothing reads the variable again.
+THE FEED is decided per request, inside this handle (owner ruling 2026-11-06; ADR tj-xn3qa6 addendum 3): a request
+naming no feed is served on SIP, one naming SIP on SIP, one naming IEX on IEX. The rule is broker_api.resolve_feed,
+passed to the generic BrokerHandle as its feed policy. There is no setting and nothing reads the environment for it.
 
 CREDENTIALS. The credential provider reads ALPACA_API_KEY and ALPACA_API_SECRET when it is asked, never at import, so
 the module stays importable without them (CLAUDE.md pitfall 1). The vendor client still takes its key from
@@ -31,7 +31,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from common.enums.data_select import AssetType
-from common.enums.data_stock import DataSource, Feed
+from common.enums.data_stock import DataSource
 from common.environment import get_env_var
 from common.errors.vocabulary import InvalidRequestError, Reason
 from data.ingest.app.brokers.alpaca import broker_api
@@ -70,16 +70,15 @@ DEFAULT_STALL_TIMEOUT_S = 300.0
 
 
 class ReaderFactory(Protocol):
-    """Builds the handle's reader from what the handle has resolved at build."""
+    """Builds the handle's reader from the scheduler and scopes the handle built."""
 
-    def __call__(self, *, scheduler: Scheduler, scope: str, trading_scope: str, feed: Feed) -> BrokerRead:
+    def __call__(self, *, scheduler: Scheduler, scope: str, trading_scope: str) -> BrokerRead:
         """Build the reader.
 
         Args:
             scheduler (Scheduler): The handle's scheduler.
             scope (str): The data scope (ALPACA_DATA_SCOPE).
             trading_scope (str): The trading scope (ALPACA_TRADING_SCOPE).
-            feed (Feed): The feed the handle resolved, once, at build.
 
         Returns:
             BrokerRead: The reader every runner and the handle use.
@@ -201,9 +200,9 @@ class AlpacaHandle(BrokerHandle):
         Args:
             settings (ExecutorSettings | None): The executor's settings, or those the environment sets.
             calls_per_minute (int | None): The per-minute limit, or ALPACA_RATE_LIMIT_PER_MINUTE, or the ceiling.
-            reader_factory (ReaderFactory | None): Called once, with the scheduler, the data scope, the trading scope and
-                the resolved feed (all keywords), for the reader the runners and the handle use. Omitted, the handle
-                builds AlpacaRead with those same arguments.
+            reader_factory (ReaderFactory | None): Called once, with the scheduler, the data scope and the trading scope
+                (all keywords), for the reader the runners and the handle use. Omitted, the handle builds AlpacaRead
+                with those same arguments.
 
         Raises:
             SchedulerConfigError: If the limit is above Alpaca's ceiling.
@@ -222,12 +221,8 @@ class AlpacaHandle(BrokerHandle):
             .on_expired(self.report_expired)
             .build()
         )
-        # Read once, here: the account's setting, and the only read of it.
-        feed = broker_api.resolve_feed()
         build_reader = reader_factory if reader_factory is not None else AlpacaRead
-        reader = build_reader(
-            scheduler=scheduler, scope=ALPACA_DATA_SCOPE, trading_scope=ALPACA_TRADING_SCOPE, feed=feed
-        )
+        reader = build_reader(scheduler=scheduler, scope=ALPACA_DATA_SCOPE, trading_scope=ALPACA_TRADING_SCOPE)
         executor = AckGatedExecutor(
             name=ALPACA_DATA_SCOPE,
             scheduler=scheduler,
@@ -243,7 +238,7 @@ class AlpacaHandle(BrokerHandle):
             scheduler=scheduler,
             executor=executor,
             reader=reader,
-            feed=feed,
+            feed_policy=broker_api.resolve_feed,
         )
         self.register_intake(RequestKind.ASSET_LIST, self.__asset_list_intake)
         self.register_intake(RequestKind.CORPORATE_ACTIONS, self.__corporate_actions_intake)

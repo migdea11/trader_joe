@@ -131,13 +131,12 @@ def executor() -> Iterator[ThreadPoolExecutor]:
 
 
 @pytest.fixture(autouse=True)
-def iex_deployment(monkeypatch):
-    """Pin the deployment's tape, so the feed asserted on the wire is not read from the host.
+def forgotten_resets(monkeypatch):
+    """Forget every remembered rate-limit reset around each test.
 
-    And forget every remembered rate-limit reset around each test: the reader keeps the last one per scope
-    (tj-7zjov1.56), so a reset one case read off a header would otherwise be another case's 429 fallback.
+    The reader keeps the last one per scope (tj-7zjov1.56), so a reset one case read off a header would otherwise be
+    another case's 429 fallback.
     """
-    monkeypatch.delenv('ALPACA_SIP_ENABLED', raising=False)
     broker_api.forget_resets()
     yield
     broker_api.forget_resets()
@@ -151,7 +150,10 @@ def build_query(
     exchange: str | None = None,
     currency: str | None = None,
     adjustment: str = 'raw',
+    feed: Feed | None = Feed.IEX,
 ) -> BarsQuery:
+    # IEX named by default: the recordings are IEX answers (tests/fakes/record_alpaca.py sends feed=iex, the tape
+    # paper keys are entitled to), and SIP is the default since tj-7zjov1.342, so each query names the recorded tape.
     return BarsQuery(
         instrument=Instrument(SYMBOL, asset_type, exchange=exchange, currency=currency),
         granularity=granularity,
@@ -159,6 +161,7 @@ def build_query(
         end=end,
         adjustment=adjustment,
         priority=RequestPriority.BACKFILL,
+        feed=feed,
     )
 
 
@@ -780,7 +783,7 @@ async def test_what_alpaca_cannot_serve_is_refused_with_zero_http_requests(execu
 @pytest.mark.parametrize(
     ('change', 'reason'),
     [
-        pytest.param({'feed': Feed.SIP}, Reason.FEED_NOT_AVAILABLE, id='named-sip-on-iex'),
+        pytest.param({'feed': Feed.NOT_APPLICABLE}, Reason.FEED_NOT_AVAILABLE, id='named-not-applicable'),
         pytest.param({'start': NOW, 'end': NOW + timedelta(days=1)}, Reason.RANGE_IN_FUTURE, id='range-in-future'),
     ],
 )

@@ -34,10 +34,11 @@ BarsResponse (SERVED) or a BarsFailure, exactly as AlpacaRead does, and never ra
 * Three REFUSALS come before any "vendor" work -- before a scenario is looked at, so no SLOW_
   sleep is slept and no FAILONCE_ memory is spent -- mirroring AlpacaRead and the Q-EMPTY ruling
   (tj-3mk3u5.37.1), so fake mode can show each end to end:
-    - a query naming a feed other than this fake's deployment feed: FEED_NOT_AVAILABLE
-      (BrokerUnsupportedError). The deployment feed is the `feed` argument, FEED unless set, so
-      in the fake-mode stack a request naming SIP is the rejection case (tj-3mk3u5.9, 16:36 UTC
-      2026-09-28: the fake's feed-entitlement setting);
+    - a query naming a feed the fake has no tape for (anything but SIP or IEX, i.e.
+      NOT_APPLICABLE): FEED_NOT_AVAILABLE (BrokerUnsupportedError). The fake serves the feed
+      the query names, and FEED (SIP) when it names none: the same per-request rule as
+      broker_api.resolve_feed (owner ruling 2026-11-06, ADR tj-xn3qa6 addendum 3). There is no
+      deployment feed: a request naming IEX is served on IEX;
     - a start at or after the fake's clock: RANGE_IN_FUTURE;
     - an end before the start: VENDOR_INVALID_REQUEST, as Alpaca's recorded 400 answers it.
 * A vendor failure (FAIL_, FAILONCE_, RATELIMIT_) carries a FakeReadError as its error's
@@ -171,9 +172,12 @@ from data.ingest.app.brokers.rate_budget import RequestPriority
 from schemas.data_ingest.submit import AssetListStatus
 
 
-# The deployment feed a FakeRead serves unless built with another: the entitlement every fake
-# response reports, known before iteration as the interface requires.
-FEED = Feed.IEX
+# The feed a FakeRead serves a query naming none: the production default (owner ruling 2026-11-06), so the fake-mode
+# stack follows production. A query naming SIP or IEX is served on the feed it names.
+FEED = Feed.SIP
+
+# The feeds the fake has a tape for. Any other named feed is refused FEED_NOT_AVAILABLE.
+SERVABLE_FEEDS = frozenset({Feed.SIP, Feed.IEX})
 
 # Every bar timestamp is GRID_EPOCH + k * granularity.offset for an integer k.
 GRID_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
@@ -827,8 +831,6 @@ class FakeRead:
         clock (Callable[[], datetime]): Yields now, timezone aware: the future-range refusal, the
             as_of a response is stamped with, the end served_range is clamped to and RATELIMIT_'s
             reset_at all read it. Injectable, as AlpacaRead's is, so tests need not sleep.
-        feed (Feed): The deployment feed: the tape this fake serves, and the only one a query may
-            name. FEED unless set.
         world (FakeWorld | None): The world to serve (asset days, lineage bars, corporate actions), or None for
             the default answers.
         scheduler (Pacer | None): What each "vendor" call acquires one call from, or None for no pacing.
@@ -845,7 +847,6 @@ class FakeRead:
         slow_delay_seconds: float = DEFAULT_SLOW_DELAY_SECONDS,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], datetime] = _utc_now,
-        feed: Feed = FEED,
         *,
         world: FakeWorld | None = None,
         scheduler: Pacer | None = None,
@@ -862,7 +863,6 @@ class FakeRead:
         self.__slow_delay_seconds = slow_delay_seconds
         self.__sleep = sleep
         self.__clock = clock
-        self.__feed = feed
         self.__world = world
         self.__scheduler = scheduler
         self.__scope = scope
@@ -889,11 +889,6 @@ class FakeRead:
         """How long SLOW_ sleeps before serving, in seconds."""
         return self.__slow_delay_seconds
 
-    @property
-    def feed(self) -> Feed:
-        """The deployment feed this fake serves."""
-        return self.__feed
-
     async def get_bars(self, query: BarsQuery) -> BarsResponse | BarsFailure:
         """Serve fake bars for one instrument, per the scenario its symbol selects.
 
@@ -901,7 +896,7 @@ class FakeRead:
             query (BarsQuery): What to fetch.
 
         Returns:
-            BarsResponse | BarsFailure: The deployment feed, the bars of [start, end) (or of
+            BarsResponse | BarsFailure: The feed the query names (FEED when it names none), the bars of [start, end) (or of
                 OPEN_ENDED_STEPS grid points when end is None) up to as_of, served_range and as_of;
                 or the failure: FEED_NOT_AVAILABLE, RANGE_IN_FUTURE or VENDOR_INVALID_REQUEST before
                 any scenario, VENDOR_UNAVAILABLE for FAIL_ and a first FAILONCE_, VENDOR_RATE_LIMITED
@@ -910,6 +905,7 @@ class FakeRead:
         refusal = self.__refusal(query)
         if refusal is not None:
             return BarsFailure(refusal)
+        feed = query.feed if query.feed is not None else FEED
 
         symbol = query.instrument.symbol
         paced = await self.__pace('bars', symbol, self.__scope, query.priority, query.deadline, query.tally)
@@ -935,7 +931,7 @@ class FakeRead:
             query.tally.record_page()
         lineage = self.__world.lineage(symbol) if self.__world is not None else None
         return BarsResponse(
-            feed=self.__feed,
+            feed=feed,
             bars=self.__iterate(query, scenario, served_end, lineage),
             served_range=ServedRange(query.start, served_end),
             as_of=as_of,
@@ -1055,10 +1051,10 @@ class FakeRead:
 
     def __refusal(self, query: BarsQuery) -> BrokerUnsupportedError | InvalidRequestError | None:
         """The refusal a query earns before any "vendor" work, or None to go on to the scenario."""
-        if query.feed is not None and query.feed != self.__feed:
+        if query.feed is not None and query.feed not in SERVABLE_FEEDS:
             return BrokerUnsupportedError(
                 Reason.FEED_NOT_AVAILABLE,
-                f'This account cannot serve the requested feed: feed={query.feed.value}',
+                f'This broker cannot serve the requested feed: feed={query.feed.value}',
                 metadata={'feed': query.feed.value},
             )
         now = self.__clock()

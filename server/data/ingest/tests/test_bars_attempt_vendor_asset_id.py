@@ -350,7 +350,6 @@ class AnsweringStore:
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch):
     """An IEX deployment, no credential, no trading host, no cached client and no remembered reset."""
-    monkeypatch.delenv('ALPACA_SIP_ENABLED', raising=False)
     monkeypatch.delenv('ALPACA_RATE_LIMIT_PER_MINUTE', raising=False)
     for name in (*broker_api.ALPACA_CREDENTIAL_VARS, broker_api.ALPACA_TRADING_HOST_VAR):
         monkeypatch.delenv(name, raising=False)
@@ -445,7 +444,8 @@ async def test_through_the_handle_a_failed_lookup_reports_failed_with_no_parts_a
     assert report.parts == []
     assert header_to_proto(report.header).vendor_asset_id == ''
     assert (report.trailer.vendor_stats.calls, report.trailer.vendor_stats.pages) == (1, 1)
-    assert report.header.feed is Feed.IEX
+    # No feed named: SIP, the default (tj-7zjov1.343).
+    assert report.header.feed is Feed.SIP
 
 
 @pytest.mark.asyncio

@@ -133,7 +133,8 @@ class BarsAttemptRunner:
             start=bars.start,
             end=bars.end,
             priority=work.priority,
-            feed=bars.feed,
+            # The feed resolved at Submit, never bars.feed, so the attempt, the key and the report agree.
+            feed=work.feed,
             deadline=request.ready_by,
             tally=tally,
         )

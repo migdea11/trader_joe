@@ -41,15 +41,19 @@ Items, tj-vhboky.14 numbering where they moved here from Sys-4:
     and the RESOLVED tape is recorded on BOTH the bars and the entry (tj-3mk3u5.16 A2). Sent with
     the RIGHT secret and asserted 2xx: this CLOSES 7c FOR THE DATASET POST (Sys-3 asserted its 409
     half; architect note 16:51 UTC 2026-09-28 on tj-vhboky.63).
-  * an unservable feed -- a POST naming a tape this deployment cannot serve is a 422
-    FEED_NOT_AVAILABLE naming the refused tape, and writes no entry and no bar (tj-3mk3u5.16 A2).
+  * IEX named -- served, not refused (owner ruling 2026-11-06, tj-7zjov1.343): a POST naming IEX over
+    the window of the default (SIP) dataset is a SEPARATE entry whose entry, bars and attempt row
+    all carry IEX, beside the SIP one.
+  * an unservable feed -- a POST naming a feed Alpaca has no tape for (NOT_APPLICABLE; the body's
+    feed is Feed | None, so the POST admits it) is a 422 FEED_NOT_AVAILABLE naming the refused feed,
+    and writes no entry and no bar (tj-3mk3u5.16 A2).
   * EMPTY, GAPS, FAIL, SLOW, FAILONCE -- one test each, symbols carrying the scenario's prefix.
   * 4 -- an exact repeat resolves to the same entry, adds none, and answers with the SAME BODY
     (tj-gp5xxi: data_points and served_range, not just a 200); changing only expiry_type, then
     only owner, each makes a new entry; no entry takes the stronger expiry_type of the two. Feed IS
-    part of an entry's identity since c4a1f7b2e905, but it cannot be varied from here: the entry
-    records the tape the ACK resolved, and this deployment resolves one. Varying it is the unit
-    tier's (data/store/tests/test_dataset_entry_identity.py).
+    part of an entry's identity since c4a1f7b2e905; since tj-7zjov1.342 it is varied from here by
+    naming IEX (the IEX-named test above), and the unit tier holds the rest
+    (data/store/tests/test_dataset_entry_identity.py).
   * 5 (success half) -- a different owner's overlapping range is a separate entry, and both hold
     their own bars at the shared instants.
   * 8 (HTTP half) -- a range of more bars than POSTGRES_MAX_BIND_PARAMETERS //
@@ -92,7 +96,7 @@ from tests.fakes.market_data import (
     grid_index,
     grid_timestamps,
 )
-from tests.fakes.market_data import FEED as FAKE_DEPLOYMENT_FEED
+from tests.fakes.market_data import FEED as FAKE_DEFAULT_FEED
 from tests.system.problem_json import assert_problem
 
 
@@ -113,14 +117,17 @@ RUN_TABLE = IngestRun.__table__
 # What a stored bar is compared on: (timestamp, open, high, low, close, volume, trade_count).
 BarTuple = tuple[datetime, float, float, float, float, int, int]
 
-# The tape this deployment serves, read off the fake rather than restated, so that rebuilding the
-# stack with another entitlement moves both halves of the feed pair together.
-SERVED_FEED = FAKE_DEPLOYMENT_FEED
-# A tape it does not serve. FakeRead refuses any named feed that is not its deployment feed, so
-# this is unservable by construction rather than by configuration. Restated rather than derived
-# from Feed, because a derived "any other member" silently becomes vacuous the day the enum has
-# one member; the guard below is what keeps the pair honest instead.
-UNSERVABLE_FEED = Feed.SIP
+# The tape a POST naming no feed is served on: SIP, the production default the fake follows (owner ruling 2026-11-06,
+# option A: the system tier follows production). Read off the fake and pinned to SIP, so a fake that drifted from
+# production fails here rather than passing on its own default.
+SERVED_FEED = FAKE_DEFAULT_FEED
+assert SERVED_FEED is Feed.SIP, f'the fake serves an unnamed request on {SERVED_FEED}, not the production default SIP'
+# The tape served only when a POST names it.
+NAMED_FEED = Feed.IEX
+# A feed Alpaca has no tape for, refused by the handle's feed policy (broker_api.resolve_feed) and FakeRead alike.
+# Restated rather than derived from Feed, because a derived "any other member" silently becomes vacuous the day the
+# enum changes; the guard in the test is what keeps it honest instead.
+UNSERVABLE_FEED = Feed.NOT_APPLICABLE
 
 # SLOW_MARGIN_SECONDS IS GONE (tj-xhcoyc). It padded a second read taken after FakeRead's SLOW_
 # delay, to catch a late RPC answer arriving once data_store had already given up on it. There is
@@ -231,7 +238,7 @@ def test_default_round_trip_stores_exactly_the_generated_bars(
     """Default round trip, with the RIGHT secret and a 2xx: this closes 7c for the dataset POST.
 
     The pipeline loses, adds and changes nothing: the bars read back under the new entry are the
-    generator's for [start, end), timestamps preserved, each labelled with FakeRead's feed (IEX),
+    generator's for [start, end), timestamps preserved, each labelled with the default feed (SIP),
     and data_points and the listing's item_count both equal the count.
 
     THE RESOLVED FEED IS ASSERTED ON THE ENTRY AS WELL AS ON THE BARS (tj-3mk3u5.16 A2). The bar
@@ -240,8 +247,8 @@ def test_default_round_trip_stores_exactly_the_generated_bars(
     entirely, and nothing here would have noticed. The entry's feed is the one tj-3mk3u5.31 made
     a NOT NULL identity column, and the one a caller filters on, so it is the one that has to be
     the resolution rather than a preference. This POST sends NO feed at all -- the ordinary
-    request, meaning "the deployment decides" -- which is what makes the stored value evidence of
-    a resolution: there was no preference for it to have been copied from.
+    request, meaning "the broker's default decides" -- which is what makes the stored value evidence
+    of a resolution: there was no preference for it to have been copied from.
     """
     expected = _expected(own_symbol)
 
@@ -260,10 +267,58 @@ def test_default_round_trip_stores_exactly_the_generated_bars(
     assert listed['feed'] == SERVED_FEED.value, f'the entry was stored with feed {listed["feed"]!r}'
 
 
+def test_naming_iex_is_served_as_a_separate_iex_dataset_beside_the_default_sip_one(
+    own_symbol: str, run_identity, data_store, adopt_entries: Callable[[str], list[UUID]], pg_engine: Engine
+) -> None:
+    """IEX named is SERVED, not refused (owner ruling 2026-11-06; tj-7zjov1.342, tj-7zjov1.343).
+
+    RE-POINTED from "a POST naming IEX is refused FEED_NOT_AVAILABLE": the Alpaca handle decides the feed per request,
+    so IEX is served whenever it is asked for. Feed is part of the entry's identity, so the IEX answer over the SAME
+    window as the default (SIP) one is a SECOND entry, and each entry, its bars and its finishing attempt row carry
+    its own tape. The same window on purpose: the feed-blind own-overlap check refuses a PARTIAL cross-tape overlap
+    (ruled acceptable, tj-7zjov1.351, backlog tj-7zjov1.352), never the identical window.
+    """
+    assert NAMED_FEED is not SERVED_FEED, 'the named feed is the default; the test proves nothing'
+    expected = _expected(own_symbol)
+
+    default, after_default = _post(data_store, adopt_entries, own_symbol, _body(run_identity.owner))
+    named, after_named = _post(data_store, adopt_entries, own_symbol, _body(run_identity.owner, feed=NAMED_FEED.value))
+
+    assert default.status_code == 200, data_store.describe(default)
+    assert named.status_code == 200, data_store.describe(named)
+    assert named.json()['data_points'] == len(expected), data_store.describe(named)
+    assert len(after_default) == 1, f'expected one entry after the default POST, found {after_default}'
+    assert len(after_named) == 2 and after_named[0] == after_default[0], f'IEX named: {after_named}'
+    sip_entry, iex_entry = after_named
+    listed = _listing(data_store, own_symbol)
+    assert {listed[str(sip_entry)]['feed'], listed[str(iex_entry)]['feed']} == {SERVED_FEED.value, NAMED_FEED.value}
+    assert listed[str(sip_entry)]['feed'] == SERVED_FEED.value
+    assert listed[str(iex_entry)]['feed'] == NAMED_FEED.value
+    for entry_id, feed in ((sip_entry, SERVED_FEED), (iex_entry, NAMED_FEED)):
+        bars = _read(data_store, entry_id)
+        assert {bar['feed'] for bar in bars} == {feed.value}, f'entry {entry_id}: {sorted({b["feed"] for b in bars})}'
+        stored = _stored(data_store, entry_id)
+        assert stored == expected, f'entry {entry_id}: {_diff(stored, expected)}'
+
+    # Two BARS requests, each finished SUCCEEDED naming its own entry, each with a written attempt row.
+    requests = _bars_requests(pg_engine, own_symbol)
+    assert [request.dataset_id for request in requests] == [sip_entry, iex_entry], requests
+    for request in requests:
+        assert request.state == IngestRequestState.SUCCEEDED, f'request {request.id} finished {request.state}'
+        attempts = _attempt_rows(pg_engine, request.id)
+        assert [row.state for row in attempts] == [IngestRunState.SUCCEEDED], attempts
+        assert attempts[0].dataset_id == request.dataset_id
+        assert attempts[0].bars_written == len(expected)
+
+
 def test_an_unservable_feed_is_refused_and_leaves_no_entry_and_no_bar(
     own_symbol: str, run_identity, data_store, adopt_entries: Callable[[str], list[UUID]]
 ) -> None:
-    """A POST naming a tape this deployment cannot serve is refused, and writes nothing.
+    """A POST naming a feed Alpaca has no tape for is refused, and writes nothing.
+
+    RE-POINTED by tj-7zjov1.343: SIP and IEX are both served now, so the refused feed is NOT_APPLICABLE. The POST
+    body's feed is Feed | None (schemas/data_store/asset_dataset_store.py), so it admits it, and the request row's
+    feed column is the same enum, so it reaches the handle's intake, which refuses it on the ack.
 
     THE ONE IN-BAND FAILURE OF THE HOP, which is why it earns a system test rather than
     a unit one. FEED_NOT_AVAILABLE never travels as a gRPC status: data_ingest answers it on the
@@ -288,6 +343,7 @@ def test_an_unservable_feed_is_refused_and_leaves_no_entry_and_no_bar(
     assert UNSERVABLE_FEED is not SERVED_FEED, (
         f'this test asks for {UNSERVABLE_FEED.value}, the tape the fake serves, so it proves nothing'
     )
+    assert UNSERVABLE_FEED is not NAMED_FEED, f'{UNSERVABLE_FEED.value} is served when named, so it proves nothing'
 
     response, ids = _post(data_store, adopt_entries, own_symbol, _body(run_identity.owner, feed=UNSERVABLE_FEED.value))
 

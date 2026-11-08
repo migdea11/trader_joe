@@ -186,7 +186,6 @@ def real_client(port: int) -> SpiedClient:
 
 @pytest.fixture(autouse=True)
 def iex_deployment_and_no_cached_client(monkeypatch):
-    monkeypatch.delenv('ALPACA_SIP_ENABLED', raising=False)
     broker_api.set_client(None)
     yield
     broker_api.set_client(None)

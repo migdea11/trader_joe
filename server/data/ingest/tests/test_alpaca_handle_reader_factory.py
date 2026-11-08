@@ -1,11 +1,12 @@
 """AlpacaHandle's reader seam: an optional, keyword-only reader factory, called once at build (P53, tj-7zjov1.158).
 
 Against builder-ingest's 9162968, checked against P53's body, ADR tj-26jt9w addendum 1 item 1 and the P14 gate verdict
-note on tj-7zjov1.24. Pinned: omitted, the handle builds AlpacaRead exactly as before (the scheduler, the data scope,
-the trading scope and the resolved feed, all keywords); given, the factory is called ONCE with those same keywords and
-its reader is handle.reader and the reader every runner calls, bars, asset list and corporate actions alike, with no
-AlpacaRead built; the feed is resolved once whether or not a factory is given, and the factory is handed that feed;
-reader_factory is keyword-only.
+note on tj-7zjov1.24. Pinned: omitted, the handle builds AlpacaRead with the scheduler, the data scope and the
+trading scope, all keywords; given, the factory is called ONCE with those same keywords and its reader is handle.reader
+and the reader every runner calls, bars, asset list and corporate actions alike, with no AlpacaRead built;
+reader_factory is keyword-only. RE-POINTED by tj-7zjov1.343 (ADR tj-xn3qa6 addendum 3, owner ruling 2026-11-06): the
+feed is decided per request, so no feed is resolved at build and the factory is handed none; a bars request naming
+no feed reaches the factory's reader as SIP.
 
 WHAT IS REAL. The production AlpacaHandle, its Scheduler, its AckGatedExecutor and its runners. The factory's reader is
 a FakeRead paced on the handle's own scheduler, as the fake-mode launcher builds it; its call log is what reached the
@@ -40,23 +41,11 @@ from tests.fakes.market_data import FakeRead
 
 pytestmark = pytest.mark.data_ingest
 
-SIP_VAR = 'ALPACA_SIP_ENABLED'
 SYMBOL = 'VFV'
 START = datetime(2026, 1, 2, 14, 30, tzinfo=UTC)
 END = START + timedelta(hours=1)
 GUARD_S = 5.0
 INSTANCE = 'instance-under-test'
-
-# The setting's values and the feed the handle must resolve from each (broker_api.resolve_feed).
-SETTINGS = pytest.mark.parametrize(
-    ('setting', 'expected'),
-    [
-        pytest.param(None, Feed.IEX, id='unset-iex'),
-        pytest.param('false', Feed.IEX, id='false-iex'),
-        pytest.param('true', Feed.SIP, id='true-sip'),
-    ],
-)
-
 
 # ---------------------------------------------------------------------------------------------
 # Doubles and harness
@@ -72,12 +61,7 @@ class RecordingFactory:
 
     def __call__(self, *args, **kwargs) -> FakeRead:
         self.calls.append((args, dict(kwargs)))
-        reader = FakeRead(
-            feed=kwargs['feed'],
-            scheduler=kwargs['scheduler'],
-            scope=kwargs['scope'],
-            trading_scope=kwargs['trading_scope'],
-        )
+        reader = FakeRead(scheduler=kwargs['scheduler'], scope=kwargs['scope'], trading_scope=kwargs['trading_scope'])
         self.built.append(reader)
         return reader
 
@@ -110,8 +94,7 @@ class AnsweringStore:
 
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch):
-    """The setting unset, no credential, no trading host, no rate-limit override, no cached client or reset."""
-    monkeypatch.delenv(SIP_VAR, raising=False)
+    """No credential, no trading host, no rate-limit override, no cached client or reset."""
     monkeypatch.delenv('ALPACA_RATE_LIMIT_PER_MINUTE', raising=False)
     for name in (*broker_api.ALPACA_CREDENTIAL_VARS, broker_api.ALPACA_TRADING_HOST_VAR):
         monkeypatch.delenv(name, raising=False)
@@ -122,13 +105,6 @@ def isolated(monkeypatch):
     broker_api.set_client(None)
     broker_api.set_trading_client(None)
     broker_api.forget_resets()
-
-
-def set_setting(monkeypatch, value: str | None) -> None:
-    if value is None:
-        monkeypatch.delenv(SIP_VAR, raising=False)
-    else:
-        monkeypatch.setenv(SIP_VAR, value)
 
 
 def settings() -> ExecutorSettings:
@@ -150,9 +126,12 @@ def refuse_alpaca_read(monkeypatch) -> Mock:
     return built
 
 
-def count_resolutions(monkeypatch) -> list[Feed]:
-    """Pass broker_api.resolve_feed through, recording every feed it resolves. The handle looks it up at call time."""
-    resolved: list[Feed] = []
+def count_resolutions(monkeypatch) -> list[Feed | None]:
+    """Pass broker_api.resolve_feed through, recording every feed it resolves.
+
+    Set before the handle is built, so the policy the handle takes is this pass-through.
+    """
+    resolved: list[Feed | None] = []
     real = broker_api.resolve_feed
 
     def counted(*args, **kwargs):
@@ -194,41 +173,32 @@ EACH_KIND = (
 # ---------------------------------------------------------------------------------------------
 
 
-@SETTINGS
-def test_without_a_factory_the_handle_builds_alpaca_read_with_the_scheduler_both_scopes_and_the_feed(
-    monkeypatch, setting, expected
-):
-    set_setting(monkeypatch, setting)
+def test_without_a_factory_the_handle_builds_alpaca_read_with_the_scheduler_and_both_scopes_and_no_feed(monkeypatch):
     built = Mock(name='AlpacaRead')
     monkeypatch.setattr(handle_module, 'AlpacaRead', built)
 
     handle = AlpacaHandle(settings=settings(), calls_per_minute=60)
 
     built.assert_called_once_with(
-        scheduler=handle.scheduler, scope=ALPACA_DATA_SCOPE, trading_scope=ALPACA_TRADING_SCOPE, feed=expected
+        scheduler=handle.scheduler, scope=ALPACA_DATA_SCOPE, trading_scope=ALPACA_TRADING_SCOPE
     )
     assert built.call_args.args == (), 'AlpacaRead was given a positional argument'
     assert handle.reader is built.return_value
-    assert handle.feed is expected
 
 
 def test_without_a_factory_the_handles_reader_is_a_real_alpaca_read():
-    # Unpatched: the production default. That it serves the resolved feed is pinned end to end in test_handle_feed.py.
+    # Unpatched: the production default. That it serves each request's feed is pinned end to end in test_handle_feed.py.
     handle = AlpacaHandle(settings=settings(), calls_per_minute=60)
 
     assert type(handle.reader) is AlpacaRead
 
 
 # ---------------------------------------------------------------------------------------------
-# (2) Given: called exactly once, with the handle's own scheduler, both scopes and the resolved feed
+# (2) Given: called exactly once, with the handle's own scheduler and both scopes, and no feed
 # ---------------------------------------------------------------------------------------------
 
 
-@SETTINGS
-def test_a_given_factory_is_called_once_with_keywords_scheduler_scope_trading_scope_and_feed(
-    monkeypatch, setting, expected
-):
-    set_setting(monkeypatch, setting)
+def test_a_given_factory_is_called_once_with_keywords_scheduler_scope_and_trading_scope_only(monkeypatch):
     refuse_alpaca_read(monkeypatch)
     factory = RecordingFactory()
 
@@ -237,12 +207,7 @@ def test_a_given_factory_is_called_once_with_keywords_scheduler_scope_trading_sc
     assert len(factory.calls) == 1, f'the factory was called {len(factory.calls)} times at build'
     args, kwargs = factory.calls[0]
     assert args == (), 'the factory was given a positional argument'
-    assert kwargs == {
-        'scheduler': handle.scheduler,
-        'scope': ALPACA_DATA_SCOPE,
-        'trading_scope': ALPACA_TRADING_SCOPE,
-        'feed': expected,
-    }
+    assert kwargs == {'scheduler': handle.scheduler, 'scope': ALPACA_DATA_SCOPE, 'trading_scope': ALPACA_TRADING_SCOPE}
     assert kwargs['scheduler'] is handle.scheduler, "the factory was handed a scheduler other than the handle's"
 
 
@@ -277,45 +242,36 @@ async def test_the_factorys_reader_is_the_handles_reader_and_serves_a_submit_of_
             f"{request_id}'s runner did not read through the factory's reader: {reports[request_id].trailer!r}"
         )
         assert call in reader.calls, f"{request_id}'s vendor call never reached the factory's reader: {reader.calls}"
+    # The bars request named no feed: it reached the factory's reader as SIP, the production default.
+    assert reports['bars-1'].header.feed is Feed.SIP
+    assert acks['bars-1'].accepted.feed is Feed.SIP
     # Every request was served after build, and the factory was still called once: never per request or per runner.
     assert len(factory.calls) == 1
     built.assert_not_called()
 
 
 # ---------------------------------------------------------------------------------------------
-# (4) One feed resolution, with a factory too, and the factory gets that feed
+# (4) No feed is resolved at build, with a factory or without; the first resolution is the first bars Submit
 # ---------------------------------------------------------------------------------------------
 
 
-@SETTINGS
-def test_with_a_factory_the_feed_is_resolved_once_and_the_factory_gets_the_handles_feed(monkeypatch, setting, expected):
-    set_setting(monkeypatch, setting)
-    refuse_alpaca_read(monkeypatch)
+@pytest.mark.asyncio
+@pytest.mark.parametrize('with_factory', [False, True], ids=['default-reader', 'factory'])
+async def test_no_feed_is_resolved_at_build_and_each_bars_submit_resolves_once(monkeypatch, with_factory):
     resolved = count_resolutions(monkeypatch)
-    factory = RecordingFactory()
+    factory = RecordingFactory() if with_factory else None
 
     handle = AlpacaHandle(settings=settings(), calls_per_minute=60, reader_factory=factory)
+    assert resolved == [], f'a feed was resolved at build: {resolved}'
 
-    assert resolved == [expected], f'the feed was resolved {len(resolved)} times at build'
-    [(_args, kwargs)] = factory.calls
-    assert kwargs['feed'] is handle.feed
-    assert handle.feed is expected
-    assert handle.reader.feed is handle.feed
+    # Not started: the Submit intake alone runs, so the only resolution is the intake's.
+    first = await handle.submit(SubmitRequest(request_id='b-1', owner='o', bars=BARS))
+    second = await handle.submit(
+        SubmitRequest(request_id='b-2', owner='o', bars=BARS.model_copy(update={'feed': Feed.IEX}))
+    )
 
-
-def test_the_factory_is_handed_the_feed_the_handle_keeps_even_when_a_second_resolution_would_differ(monkeypatch):
-    # A resolver that answers SIP once and IEX ever after: a handle that resolved twice would give the factory and
-    # itself different tapes, which a correct setting alone would never show.
-    answers = iter([Feed.SIP])
-    monkeypatch.setattr(broker_api, 'resolve_feed', lambda: next(answers, Feed.IEX))
-    refuse_alpaca_read(monkeypatch)
-    factory = RecordingFactory()
-
-    handle = AlpacaHandle(settings=settings(), calls_per_minute=60, reader_factory=factory)
-
-    [(_args, kwargs)] = factory.calls
-    assert kwargs['feed'] is Feed.SIP
-    assert handle.feed is Feed.SIP
+    assert resolved == [Feed.SIP, Feed.IEX], 'each bars Submit did not resolve its own feed exactly once'
+    assert (first.accepted.feed, second.accepted.feed) == (Feed.SIP, Feed.IEX)
 
 
 # ---------------------------------------------------------------------------------------------

@@ -3,7 +3,9 @@
 Design: decision tj-7zjov1.306 addendum 1 (R1-R3) and addendum 2 (owner ruling on Q tj-7zjov1.314, option A, with
 conditions C1 and C2), ADR tj-fa1rpu D3. The rule, as ruled:
 
-    edge = now - SIP_RECENT_WINDOW - SIP_EDGE_MARGIN, now from the reader's injected clock, on a SIP account only.
+    edge = now - SIP_RECENT_WINDOW - SIP_EDGE_MARGIN, now from the reader's injected clock, on a SIP REQUEST only.
+    Since tj-7zjov1.342 (owner ruling 2026-11-06, decision tj-7zjov1.306 addendum 3) the feed is resolved per request:
+    a request naming SIP and a request naming no feed (SIP by default) are checked; a request naming IEX never is.
     An explicit end past the edge is refused, RANGE_TOO_RECENT, before any credential lookup, rate token or vendor
     call, with metadata {feed, range_end} and reset_at = end + window + margin. An end at the edge or older is sent
     unchanged. An open end is sent as the edge and served_range names that edge (C2); a start at or after the edge
@@ -31,12 +33,20 @@ from common.enums.data_stock import DataSource, Feed, Granularity, UpdateType
 from common.errors.vocabulary import REASONS, ExogenousError, Outcome, Reason
 from data.ingest.app.brokers import bars_attempt
 from data.ingest.app.brokers.alpaca import broker_api, read
-from data.ingest.app.brokers.alpaca.handle import ALPACA_DATA_SCOPE
+from data.ingest.app.brokers.alpaca.handle import ALPACA_DATA_SCOPE, ALPACA_TRADING_SCOPE
 from data.ingest.app.brokers.bars_attempt import BarsAttemptRunner, BarsWork, error_class
 from data.ingest.app.brokers.interface import BarsFailure, BarsQuery, BarsResponse, Instrument
 from data.ingest.app.brokers.rate_budget import RequestPriority
 from data.ingest.app.scheduler import ScheduledRequest
-from data.ingest.tests.alpaca_recorded import bars_answer, parse_rfc3339, status_answer, stub_vendor, wire_bar
+from data.ingest.tests.alpaca_recorded import (
+    asset_answer,
+    bars_answer,
+    parse_rfc3339,
+    status_answer,
+    stub_trading_vendor,
+    stub_vendor,
+    wire_bar,
+)
 from data.ingest.tests.scheduler_doubles import RecordingScheduler, alpaca_reader
 from schemas.data_ingest.delivery import DeliveryErrorClass, DeliveryOutcome
 from schemas.data_ingest.submit import BarsRequest
@@ -55,6 +65,10 @@ EDGE = NOW - WINDOW - MARGIN
 ONE_US = timedelta(microseconds=1)
 START = NOW - timedelta(hours=2)
 SYMBOL = 'AAPL'
+AAPL_ID = 'b0b6dd9d-8b9b-48a9-ba46-b9d54906e415'
+
+# The requests the edge applies to: SIP named, and no feed named (SIP is the default). Every SIP pin runs on both.
+SIP_REQUESTS = pytest.mark.parametrize('named', [None, Feed.SIP], ids=['unnamed', 'named-sip'])
 
 
 def query(start: datetime = START, end: datetime | None = None, **overrides) -> BarsQuery:
@@ -96,8 +110,7 @@ class Lookups:
 
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch):
-    """No cached client, no remembered reset, and no feed in the environment: the reader is handed its feed."""
-    monkeypatch.delenv('ALPACA_SIP_ENABLED', raising=False)
+    """No cached client and no remembered reset. The reader holds no feed: each query's is resolved per request."""
     broker_api.set_client(None)
     broker_api.forget_resets()
     yield
@@ -126,12 +139,12 @@ def keys(monkeypatch) -> list:
     return built
 
 
-def reader_over(vendor, executor, monkeypatch, *, feed: Feed = Feed.SIP, clock=lambda: NOW, pacing=None):
+def reader_over(vendor, executor, monkeypatch, *, clock=lambda: NOW, pacing=None):
     """A real AlpacaRead whose client comes from a counted credential lookup, as production's does."""
     lookups = Lookups(vendor.client)
     monkeypatch.setattr(broker_api, 'get_client', lookups)
     pacing = pacing if pacing is not None else RecordingScheduler()
-    return alpaca_reader(None, executor, clock, scheduler=pacing, feed=feed), lookups, pacing
+    return alpaca_reader(None, executor, clock, scheduler=pacing), lookups, pacing
 
 
 # ---------------------------------------------------------------------------------------------
@@ -140,16 +153,19 @@ def reader_over(vendor, executor, monkeypatch, *, feed: Feed = Feed.SIP, clock=l
 
 
 @pytest.mark.asyncio
+@SIP_REQUESTS
 @pytest.mark.parametrize(
     'end',
     [EDGE + ONE_US, EDGE + timedelta(minutes=5), NOW - timedelta(minutes=1), NOW, NOW + timedelta(hours=1)],
     ids=['one-microsecond-past-the-edge', 'inside-the-window', 'a-minute-ago', 'now', 'in-the-future'],
 )
-async def test_a_sip_end_past_the_edge_is_refused_before_any_lookup_token_or_vendor_call(executor, monkeypatch, end):
+async def test_a_sip_end_past_the_edge_is_refused_before_any_lookup_token_or_vendor_call(
+    named, executor, monkeypatch, end
+):
     vendor = stub_vendor(served_page(START))
     reader, lookups, pacing = reader_over(vendor, executor, monkeypatch)
 
-    error = failure_of(await reader.get_bars(query(end=end)))
+    error = failure_of(await reader.get_bars(query(end=end, feed=named)))
 
     assert isinstance(error, ExogenousError)
     assert error.reason is Reason.RANGE_TOO_RECENT
@@ -163,15 +179,16 @@ async def test_a_sip_end_past_the_edge_is_refused_before_any_lookup_token_or_ven
 
 
 @pytest.mark.asyncio
+@SIP_REQUESTS
 @pytest.mark.parametrize(
     'end', [EDGE, EDGE - ONE_US, EDGE - timedelta(hours=1)], ids=['at-the-edge', 'just-older', 'older']
 )
-async def test_a_sip_end_at_the_edge_or_older_is_sent_unchanged(executor, monkeypatch, keys, end):
+async def test_a_sip_end_at_the_edge_or_older_is_sent_unchanged(named, executor, monkeypatch, keys, end):
     """The boundary direction: an end EXACTLY at the edge is accepted; only a later one is refused."""
     vendor = stub_vendor(served_page(START))
     reader, lookups, pacing = reader_over(vendor, executor, monkeypatch)
 
-    response = response_of(await reader.get_bars(query(end=end)))
+    response = response_of(await reader.get_bars(query(end=end, feed=named)))
 
     assert len(vendor.sent) == 1
     assert parse_rfc3339(vendor.sent[0].params['end']) == end
@@ -189,13 +206,14 @@ async def test_a_sip_end_at_the_edge_or_older_is_sent_unchanged(executor, monkey
 
 
 @pytest.mark.asyncio
-async def test_a_sip_open_end_is_sent_as_the_edge_and_served_up_to_it(executor, monkeypatch, keys):
+@SIP_REQUESTS
+async def test_a_sip_open_end_is_sent_as_the_edge_and_served_up_to_it(named, executor, monkeypatch, keys):
     """C2: served_range.end is the edge sent, never as_of and never None; no bar at or after the edge survives."""
     # Constructed: a vendor answering past the end it was sent, to pin that the filter cuts at the SAME edge.
     vendor = stub_vendor(served_page(EDGE - timedelta(minutes=1), EDGE, EDGE + timedelta(minutes=1)))
     reader, _, _ = reader_over(vendor, executor, monkeypatch)
 
-    response = response_of(await reader.get_bars(query(end=None)))
+    response = response_of(await reader.get_bars(query(end=None, feed=named)))
 
     assert parse_rfc3339(vendor.sent[0].params['end']) == EDGE
     assert response.served_range.start == START
@@ -207,8 +225,9 @@ async def test_a_sip_open_end_is_sent_as_the_edge_and_served_up_to_it(executor, 
 
 
 @pytest.mark.asyncio
+@SIP_REQUESTS
 async def test_identical_open_end_requests_share_one_key_while_the_edge_moves_with_the_clock(
-    executor, monkeypatch, keys
+    named, executor, monkeypatch, keys
 ):
     """Keying on the edge would split two identical open-end requests a tick apart onto two vendor calls."""
     ticks = iter([NOW, NOW + timedelta(seconds=1)])
@@ -223,7 +242,7 @@ async def test_identical_open_end_requests_share_one_key_while_the_edge_moves_wi
     sent_ends = []
     for tick in ticks:
         current['now'] = tick
-        response = response_of(await reader.get_bars(query(end=None)))
+        response = response_of(await reader.get_bars(query(end=None, feed=named)))
         sent_ends.append(parse_rfc3339(vendor.sent[-1].params['end']))
         assert response.served_range.end == tick - WINDOW - MARGIN
 
@@ -234,14 +253,15 @@ async def test_identical_open_end_requests_share_one_key_while_the_edge_moves_wi
 
 
 @pytest.mark.asyncio
+@SIP_REQUESTS
 @pytest.mark.parametrize(
     'start', [EDGE, EDGE + ONE_US, NOW - timedelta(minutes=1)], ids=['at-the-edge', 'just-past', 'a-minute-ago']
 )
-async def test_a_sip_open_end_whose_start_is_at_or_after_the_edge_is_refused(executor, monkeypatch, start):
+async def test_a_sip_open_end_whose_start_is_at_or_after_the_edge_is_refused(named, executor, monkeypatch, start):
     vendor = stub_vendor(served_page(START))
     reader, lookups, pacing = reader_over(vendor, executor, monkeypatch)
 
-    error = failure_of(await reader.get_bars(query(start=start, end=None)))
+    error = failure_of(await reader.get_bars(query(start=start, end=None, feed=named)))
 
     assert error.reason is Reason.RANGE_TOO_RECENT
     assert dict(error.metadata) == {'feed': Feed.SIP.value, 'range_start': start.isoformat()}
@@ -252,11 +272,12 @@ async def test_a_sip_open_end_whose_start_is_at_or_after_the_edge_is_refused(exe
 
 
 @pytest.mark.asyncio
-async def test_a_sip_open_end_whose_start_is_just_before_the_edge_is_sent_as_the_edge(executor, monkeypatch):
+@SIP_REQUESTS
+async def test_a_sip_open_end_whose_start_is_just_before_the_edge_is_sent_as_the_edge(named, executor, monkeypatch):
     vendor = stub_vendor(served_page())
     reader, _, _ = reader_over(vendor, executor, monkeypatch)
 
-    response = response_of(await reader.get_bars(query(start=EDGE - ONE_US, end=None)))
+    response = response_of(await reader.get_bars(query(start=EDGE - ONE_US, end=None, feed=named)))
 
     assert parse_rfc3339(vendor.sent[0].params['end']) == EDGE
     assert response.served_range.end == EDGE
@@ -276,17 +297,20 @@ async def test_a_start_at_or_after_now_is_still_range_in_future_first(executor, 
 
 
 @pytest.mark.asyncio
-async def test_a_named_feed_the_account_cannot_serve_is_still_feed_not_available_first(executor, monkeypatch):
+async def test_a_named_feed_alpaca_cannot_serve_is_still_feed_not_available_first(executor, monkeypatch):
+    # RE-POINTED by tj-7zjov1.343: IEX is served now, so NOT_APPLICABLE is the feed with no tape. An end at NOW would
+    # also be past a SIP edge; the feed refusal still wins, and no edge is computed for a feed that has none.
     vendor = stub_vendor()
     reader, _, _ = reader_over(vendor, executor, monkeypatch)
 
-    error = failure_of(await reader.get_bars(query(end=NOW, feed=Feed.IEX)))
+    error = failure_of(await reader.get_bars(query(end=NOW, feed=Feed.NOT_APPLICABLE)))
 
     assert error.reason is Reason.FEED_NOT_AVAILABLE
+    assert vendor.sent == []
 
 
 # ---------------------------------------------------------------------------------------------
-# (3) IEX is never checked
+# (3) IEX is never checked: a request naming IEX is served whatever its range (decision tj-7zjov1.306 addendum 3)
 # ---------------------------------------------------------------------------------------------
 
 
@@ -296,12 +320,13 @@ async def test_a_named_feed_the_account_cannot_serve_is_still_feed_not_available
 )
 async def test_an_iex_explicit_end_is_sent_unchanged_whatever_it_is(executor, monkeypatch, keys, end):
     vendor = stub_vendor(served_page(START))
-    reader, _, pacing = reader_over(vendor, executor, monkeypatch, feed=Feed.IEX)
+    reader, _, pacing = reader_over(vendor, executor, monkeypatch)
 
-    response = response_of(await reader.get_bars(query(end=end)))
+    response = response_of(await reader.get_bars(query(end=end, feed=Feed.IEX)))
 
     assert parse_rfc3339(vendor.sent[0].params['end']) == end
     assert vendor.sent[0].params['feed'] == 'iex'
+    assert response.feed is Feed.IEX
     assert response.served_range.end == min(end, NOW)
     assert len(pacing.acquires) == 1
     assert [key.range_end for key in keys] == [end]
@@ -311,9 +336,9 @@ async def test_an_iex_explicit_end_is_sent_unchanged_whatever_it_is(executor, mo
 @pytest.mark.parametrize('start', [START, EDGE, NOW - timedelta(minutes=1)], ids=['old', 'at-the-sip-edge', 'recent'])
 async def test_an_iex_open_end_is_sent_open_and_served_up_to_as_of(executor, monkeypatch, start):
     vendor = stub_vendor(served_page(start))
-    reader, _, _ = reader_over(vendor, executor, monkeypatch, feed=Feed.IEX)
+    reader, _, _ = reader_over(vendor, executor, monkeypatch)
 
-    response = response_of(await reader.get_bars(query(start=start, end=None)))
+    response = response_of(await reader.get_bars(query(start=start, end=None, feed=Feed.IEX)))
 
     assert 'end' not in vendor.sent[0].params
     assert response.served_range.end == NOW
@@ -325,13 +350,13 @@ async def test_an_iex_open_end_is_sent_open_and_served_up_to_as_of(executor, mon
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('feed', [Feed.SIP, Feed.IEX], ids=str)
+@pytest.mark.parametrize('feed', [None, Feed.SIP, Feed.IEX], ids=str)
 async def test_a_vendor_403_still_classifies_vendor_auth(executor, monkeypatch, feed):
     """Classified on status only (ingest pitfall 4), even with s8b's body: the pre-check does not reclassify."""
     vendor = stub_vendor(status_answer(403, 'subscription does not permit querying recent SIP data'))
-    reader, _, _ = reader_over(vendor, executor, monkeypatch, feed=feed)
+    reader, _, _ = reader_over(vendor, executor, monkeypatch)
 
-    error = failure_of(await reader.get_bars(query(end=EDGE - timedelta(hours=1))))
+    error = failure_of(await reader.get_bars(query(end=EDGE - timedelta(hours=1), feed=feed)))
 
     assert error.reason is Reason.VENDOR_AUTH
     assert len(vendor.sent) == 1
@@ -387,7 +412,7 @@ def test_the_rate_limited_class_is_read_from_the_requires_reset_at_column_not_a_
     assert error_class(error) is DeliveryErrorClass.TRANSIENT
 
 
-def _work(start: datetime, end: datetime | None) -> BarsWork:
+def _work(start: datetime, end: datetime | None, *, feed: Feed = Feed.SIP, named: Feed | None = None) -> BarsWork:
     request = BarsRequest(
         source=DataSource.ALPACA_API,
         asset_symbol=SYMBOL,
@@ -397,8 +422,9 @@ def _work(start: datetime, end: datetime | None) -> BarsWork:
         start=start,
         end=end,
         update_type=UpdateType.STATIC,
+        feed=named,
     )
-    return BarsWork(request=request, priority=RequestPriority.BACKFILL, feed=Feed.SIP)
+    return BarsWork(request=request, priority=RequestPriority.BACKFILL, feed=feed)
 
 
 @pytest.mark.asyncio
@@ -430,6 +456,38 @@ async def test_a_refused_sip_attempt_is_rate_limited_and_carries_its_reset_at(
     assert vendor.sent == []
     assert pacing.acquires == []
     assert lookups.count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('named', [None, Feed.IEX], ids=['bars-unnamed', 'bars-named-iex'])
+async def test_an_iex_attempt_with_a_recent_end_is_served_never_refused_by_the_edge(executor, monkeypatch, named):
+    """The attempt reads on work.feed, the feed resolved at Submit, never bars.feed (tj-7zjov1.342 item 5).
+
+    work.feed is IEX in both cases; bars.feed is IEX or absent. Had the attempt rebuilt the query from bars.feed, the
+    unnamed case would resolve to SIP and be refused RANGE_TOO_RECENT.
+    """
+    vendor = stub_vendor(served_page(START))
+    # A SUCCEEDED attempt looks its asset up after the bars, so this reader can read assets too.
+    reader = alpaca_reader(
+        vendor.client,
+        executor,
+        lambda: NOW,
+        scheduler=RecordingScheduler(),
+        trading_client=stub_trading_vendor(asset_answer(SYMBOL, AAPL_ID)).client,
+        trading_scope=ALPACA_TRADING_SCOPE,
+    )
+    scheduled = ScheduledRequest(
+        request_id='r1',
+        quota_scope=ALPACA_DATA_SCOPE,
+        payload=_work(START, NOW - timedelta(minutes=1), feed=Feed.IEX, named=named),
+        ready_by=None,
+    )
+
+    result = await BarsAttemptRunner(reader)(scheduled, 1)
+
+    assert result.trailer.outcome is DeliveryOutcome.SUCCEEDED, result.trailer
+    assert result.feed is Feed.IEX
+    assert [sent.params['feed'] for sent in vendor.sent] == ['iex']
 
 
 # ---------------------------------------------------------------------------------------------

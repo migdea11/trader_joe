@@ -195,7 +195,7 @@ class Intake:
     unentered to look at the queue with no worker taking from it.
     """
 
-    def __init__(self, *, buffer_size: int = 8, tape: Feed = Feed.IEX) -> None:
+    def __init__(self, *, buffer_size: int = 8) -> None:
         self.runner = FakeRunner()
         self.store = HeldStore()
         self.sleep = FakeSleep()
@@ -244,7 +244,8 @@ class Intake:
             scheduler=self.scheduler,
             executor=self.executor,
             reader=Mock(),
-            feed=tape,
+            # Alpaca's per-request rule, as AlpacaHandle passes it (ADR tj-xn3qa6 addendum 3).
+            feed_policy=broker_api.resolve_feed,
         )
 
     def __finished(self, request: ScheduledRequest) -> None:
@@ -294,7 +295,6 @@ def submit_request(request_id: str = 'req-1', **overrides) -> SubmitRequest:
 
 @pytest.fixture(autouse=True)
 def iex_deployment_and_no_cached_client(monkeypatch):
-    monkeypatch.delenv('ALPACA_SIP_ENABLED', raising=False)
     monkeypatch.delenv('ALPACA_RATE_LIMIT_PER_MINUTE', raising=False)
     broker_api.set_client(None)
     yield
@@ -675,24 +675,28 @@ async def test_a_request_arriving_at_or_past_the_budget_is_reported_exhausted_wi
     assert report.trailer.served_range is None
     assert 'no vendor call was made' in report.trailer.detail
     assert not report.parts
-    # tj-7zjov1.66: the feed follows the kind rule unchanged, so the bars report names the tape of the ack.
-    assert report.header.feed is ack.accepted.feed is Feed.IEX, 'the exhausted report and the ack name different tapes'
-    assert_a_bars_report_names_the_tape(report.header, Feed.IEX)
+    # tj-7zjov1.66: the feed follows the kind rule unchanged, so the bars report names the tape of the ack. The request
+    # names no feed, so that tape is SIP, the default (tj-7zjov1.343).
+    assert report.header.feed is ack.accepted.feed is Feed.SIP, 'the exhausted report and the ack name different tapes'
+    assert_a_bars_report_names_the_tape(report.header, Feed.SIP)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('tape', [Feed.IEX, Feed.SIP], ids=['iex', 'sip'])
-@pytest.mark.parametrize('named', [False, True], ids=['default-feed', 'named-feed'])
+@pytest.mark.parametrize(
+    ('named', 'tape'),
+    [(None, Feed.SIP), (Feed.SIP, Feed.SIP), (Feed.IEX, Feed.IEX)],
+    ids=['default-feed-sip', 'named-sip', 'named-iex'],
+)
 @pytest.mark.parametrize('recovered', [True, False], ids=['recovered', 'not-recovered'])
-async def test_an_exhausted_bars_report_names_the_tape_of_the_submit_ack(tape, named, recovered):
+async def test_an_exhausted_bars_report_names_the_tape_of_the_submit_ack(named, tape, recovered):
     """store.proto DeliveryHeader.feed and DELIVERY_OUTCOME_EXHAUSTED; decision tj-wisp-g9rmw0 ruling 1.
 
-    The tape BrokerHandle.submit resolved at intake is the one the ack names and the one the EXHAUSTED report
-    carries, whether the request named it or left it to the deployment's default. Nothing else in the report
-    moves off its no-call shape.
+    The tape BrokerHandle.submit resolved at intake for THIS request (tj-7zjov1.343: SIP when none is named, IEX
+    when named) is the one the ack names and the one the EXHAUSTED report carries. Nothing else in the report moves
+    off its no-call shape.
     """
-    async with Intake(tape=tape) as intake:
-        bars = bars_request(feed=tape if named else None)
+    async with Intake() as intake:
+        bars = bars_request(feed=named)
         ack = await intake.handle.submit(
             submit_request('r1', bars=bars, attempt_count=MAX_ATTEMPTS, recovered=recovered)
         )

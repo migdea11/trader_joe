@@ -117,7 +117,8 @@ class Kind:
         return self.build(request_id, **overrides)
 
 
-BARS = Kind('bars', bars_submit, ALPACA_DATA_SCOPE, Feed.IEX, BarsWork)
+# A bars request naming no feed is served on Alpaca's default, SIP (owner ruling 2026-11-06).
+BARS = Kind('bars', bars_submit, ALPACA_DATA_SCOPE, Feed.SIP, BarsWork)
 ASSET_LIST = Kind('asset_list', asset_list_submit, ALPACA_TRADING_SCOPE, None, AssetListWork)
 CORPORATE_ACTIONS = Kind('corporate_actions', actions_submit, ALPACA_DATA_SCOPE, None, CorporateActionsWork)
 # Every kind AlpacaHandle registers (bars and asset_list from P12r, corporate_actions from P13, tj-7zjov1.23).
@@ -149,19 +150,24 @@ class AnsweringStore:
         return self.received[0]
 
 
-class CountingTape:
-    """Stands in for broker_api.resolve_feed: always IEX, counting how often it is asked.
+class CountingPolicy:
+    """A pass-through on broker_api.resolve_feed recording the feed each call is asked about.
 
-    Since tj-7zjov1.97 the handle's feed is a value of its account, passed at construction: AlpacaHandle asks this
-    once, when it is built, and nothing asks it again, per request or per kind.
+    The feed is decided per request (ADR tj-xn3qa6 addendum 3): AlpacaHandle hands broker_api.resolve_feed to the
+    generic handle as its feed policy, which asks it once per bars Submit and never for a kind with no tape.
     """
 
-    def __init__(self) -> None:
-        self.calls = 0
+    def __init__(self, real) -> None:
+        self.asked: list[Feed | None] = []
+        self.__real = real
 
-    def __call__(self) -> Feed:
-        self.calls += 1
-        return Feed.IEX
+    @property
+    def calls(self) -> int:
+        return len(self.asked)
+
+    def __call__(self, requested: Feed | None) -> Feed | None:
+        self.asked.append(requested)
+        return self.__real(requested)
 
 
 def settings() -> ExecutorSettings:
@@ -215,11 +221,12 @@ async def _no_expired_sink(_expired) -> None:
     raise AssertionError('no request should expire in this test')
 
 
-def bare_handle(feed: Feed = Feed.IEX) -> BrokerHandle:
+def bare_handle(feed_policy=lambda requested: requested if requested is not None else Feed.IEX) -> BrokerHandle:
     """A bare production BrokerHandle (bars only, as built) over a real Scheduler with two scopes and a real executor.
 
     Args:
-        feed (Feed): The account's feed the handle is built with (tj-7zjov1.97).
+        feed_policy: The per-request feed rule the handle is built with. The default here maps an unnamed feed to IEX,
+            deliberately NOT Alpaca's SIP, so a generic handle that substituted a default of its own would show.
     """
     minute = timedelta(minutes=1)
     scheduler = (
@@ -242,7 +249,12 @@ def bare_handle(feed: Feed = Feed.IEX) -> BrokerHandle:
         on_finished=lambda request: holder['handle'].finished(request),
     )
     handle = BrokerHandle(
-        source=DataSource.ALPACA_API, scope=BARE_SCOPE, scheduler=scheduler, executor=executor, reader=Mock(), feed=feed
+        source=DataSource.ALPACA_API,
+        scope=BARE_SCOPE,
+        scheduler=scheduler,
+        executor=executor,
+        reader=Mock(),
+        feed_policy=feed_policy,
     )
     holder['handle'] = handle
     return handle
@@ -261,9 +273,9 @@ def actions_intake(request: SubmitRequest) -> Intake:
 
 
 @pytest.fixture
-def tape(monkeypatch) -> CountingTape:
-    """The Alpaca account's tape, IEX, counted. AlpacaHandle calls broker_api.resolve_feed once, when it is built."""
-    counting = CountingTape()
+def tape(monkeypatch) -> CountingPolicy:
+    """broker_api.resolve_feed, counted. AlpacaHandle takes it as its feed policy when it is built."""
+    counting = CountingPolicy(broker_api.resolve_feed)
     monkeypatch.setattr(broker_api, 'resolve_feed', counting)
     return counting
 
@@ -276,7 +288,6 @@ def alpaca(tape) -> Watched:
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch):
     """No credential, no trading host, no rate-limit override, no cached client."""
-    monkeypatch.delenv('ALPACA_SIP_ENABLED', raising=False)
     monkeypatch.delenv('ALPACA_RATE_LIMIT_PER_MINUTE', raising=False)
     for name in (*broker_api.ALPACA_CREDENTIAL_VARS, broker_api.ALPACA_TRADING_HOST_VAR):
         monkeypatch.delenv(name, raising=False)
@@ -306,7 +317,8 @@ def test_alpaca_handle_defines_no_submit_active_or_finished_of_its_own():
 @pytest.mark.asyncio
 @pytest.mark.parametrize('feed', [Feed.IEX, Feed.SIP], ids=['iex', 'sip'])
 async def test_a_second_kind_registers_its_intake_on_a_bare_handle_and_is_queued_by_the_shared_submit(feed):
-    watched = Watched(bare_handle(feed))
+    policy = CountingPolicy(lambda _requested: feed)
+    watched = Watched(bare_handle(policy))
     handle = watched.handle
     handle.register_intake(RequestKind.CORPORATE_ACTIONS, actions_intake)
 
@@ -324,24 +336,59 @@ async def test_a_second_kind_registers_its_intake_on_a_bare_handle_and_is_queued
     assert queued.ready_by == datetime(2026, 12, 1, tzinfo=UTC)
     assert queued.client_label == 'label'
     assert queued.attempt_count == 0
-    assert queued.feed is None, "the handle's tape was copied onto a kind whose intake gave none"
+    assert queued.feed is None, 'a tape was put onto a kind whose intake gave none'
+    assert policy.asked == [], 'the feed policy was asked about a kind with no tape'
+
+
+# What the bare handle's own policy is asked (the named feed) and what it answers: the generic handle must carry the
+# policy's answer and nothing of its own. The default policy maps an unnamed feed to IEX, not SIP.
+BARE_POLICY_CASES = pytest.mark.parametrize(
+    ('named', 'expected'),
+    [
+        pytest.param(None, Feed.IEX, id='unnamed-policy-iex'),
+        pytest.param(Feed.SIP, Feed.SIP, id='sip-sip'),
+        pytest.param(Feed.IEX, Feed.IEX, id='iex-iex'),
+    ],
+)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('feed', [Feed.IEX, Feed.SIP], ids=['iex', 'sip'])
-async def test_the_bare_handle_still_serves_bars_through_its_own_registered_intake(feed):
-    watched = Watched(bare_handle(feed))
+@BARE_POLICY_CASES
+async def test_the_bare_handle_serves_bars_on_the_feed_its_policy_gives_and_asks_it_once(named, expected):
+    policy = CountingPolicy(bare_handle.__defaults__[0])
+    watched = Watched(bare_handle(policy))
     handle = watched.handle
 
-    ack = await handle.submit(bars_submit('b-1'))
+    ack = await handle.submit(bars_submit('b-1', feed=named))
 
-    assert handle.feed is feed
-    assert ack == SubmitAck(accepted=SubmitAccepted(feed=feed, quota_key=BARE_SCOPE))
+    assert policy.asked == [named], 'the policy was not asked exactly once, with the named feed'
+    assert ack == SubmitAck(accepted=SubmitAccepted(feed=expected, quota_key=BARE_SCOPE))
     queued = await asyncio.wait_for(handle.scheduler.take(), GUARD_S)
     assert isinstance(queued.payload, BarsWork)
-    assert queued.payload.feed is feed
-    assert queued.feed is feed
+    assert queued.payload.feed is expected
+    assert queued.feed is expected
     assert queued.quota_scope == BARE_SCOPE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('named', [Feed.SIP, Feed.IEX, Feed.NOT_APPLICABLE], ids=lambda feed: feed.value)
+async def test_the_bare_handle_refuses_feed_not_available_only_when_its_policy_gives_none(named):
+    # Named feeds only. A policy refusing an UNNAMED feed makes the intake build FetchRefused metadata {'feed': None},
+    # which the schema rejects (a ValidationError, not an ack): unreachable through Alpaca's rule, which serves every
+    # unnamed request, and recorded as a non-blocking finding on tj-7zjov1.343 rather than pinned.
+    policy = CountingPolicy(lambda _requested: None)
+    watched = Watched(bare_handle(policy))
+    handle = watched.handle
+
+    ack = await handle.submit(bars_submit('b-1', feed=named))
+
+    assert policy.asked == [named]
+    assert ack.accepted is None
+    assert ack.refused.reason == Reason.FEED_NOT_AVAILABLE.value
+    assert ack.refused.detail == f'This broker cannot serve the requested feed: feed={named.value}'
+    assert dict(ack.refused.metadata) == {'feed': named.value}
+    assert watched.order == [], 'a refused request was charged, queued or reported'
+    assert handle.active == 0
 
 
 @pytest.mark.asyncio
@@ -389,7 +436,7 @@ async def test_an_intake_refusal_is_answered_as_given_and_is_neither_queued_char
 async def test_a_refused_id_is_not_held_so_a_later_accepted_submit_of_it_is_queued(alpaca):
     handle = alpaca.handle
 
-    refused = await handle.submit(bars_submit('b-1', feed=Feed.SIP))
+    refused = await handle.submit(bars_submit('b-1', feed=Feed.NOT_APPLICABLE))
     accepted = await handle.submit(bars_submit('b-1'))
 
     assert refused.refused is not None
@@ -422,17 +469,16 @@ async def test_the_alpaca_handle_has_every_kind_registered_so_corporate_actions_
     """FLIPPED by tj-7zjov1.23: it pinned corporate_actions as the Alpaca handle's unregistered kind.
 
     P13 registers it, so no kind is left unregistered on AlpacaHandle; the unregistered-kind refusal stays pinned
-    on the bare handle above. The registered intake is queued through the shared tail with no tape. The account's
-    feed was resolved once, when the handle was built (tj-7zjov1.97), and the no-tape kind asks for none.
+    on the bare handle above. The registered intake is queued through the shared tail with no tape, and the feed
+    policy is never asked about a kind with no tape (ADR tj-xn3qa6 addendum 3).
     """
-    assert tape.calls == 1
     ack = await alpaca.handle.submit(actions_submit('ca-1'))
 
     assert ack == SubmitAck(accepted=SubmitAccepted(feed=None, quota_key=ALPACA_DATA_SCOPE))
     assert alpaca.order == [('queue', 'ca-1')]
     assert alpaca.handle.active == 1
-    assert alpaca.queued[0].feed is None, "the handle's tape was copied onto a kind that has none"
-    assert tape.calls == 1, 'the tape was resolved again at submit'
+    assert alpaca.queued[0].feed is None, 'a tape was copied onto a kind that has none'
+    assert tape.calls == 0, 'the feed policy was asked about a kind with no tape'
 
 
 def bodiless(kind: RequestKind) -> SimpleNamespace:
@@ -478,12 +524,13 @@ async def test_a_kind_with_its_body_missing_raises_invalid_request_saying_it_has
 
 @pytest.mark.asyncio
 @EVERY_KIND
-async def test_the_tape_comes_from_the_kinds_intake_alone_and_is_resolved_once_at_build(alpaca, tape, kind):
-    """RE-POINTED by tj-7zjov1.97: the account's feed is resolved once, when the handle is built, and never again.
+async def test_the_tape_comes_from_the_kinds_intake_alone_and_is_resolved_once_per_bars_submit(alpaca, tape, kind):
+    """RE-POINTED by tj-7zjov1.343 (ADR tj-xn3qa6 addendum 3): the feed is resolved per request, never at build.
 
-    It was resolved by the bars intake once per request; the handle now holds it as a value, for any kind or request.
+    Nothing is resolved when the handle is built; the bars intake asks the policy once per Submit and the no-tape
+    kinds never ask.
     """
-    assert tape.calls == 1, 'the handle did not resolve the account feed exactly once at build'
+    assert tape.calls == 0, 'the handle resolved a feed at build'
     ack = await alpaca.handle.submit(kind.submit('r-1'))
 
     assert ack == SubmitAck(accepted=SubmitAccepted(feed=kind.feed, quota_key=kind.scope))
@@ -491,8 +538,7 @@ async def test_the_tape_comes_from_the_kinds_intake_alone_and_is_resolved_once_a
     assert queued.feed is kind.feed, 'the queued request carries a tape its kind did not give'
     assert queued.quota_scope == kind.scope
     assert isinstance(queued.payload, kind.work)
-    # The account's tape was resolved at build; no request, of any kind, resolves it again.
-    assert tape.calls == 1, 'the tape was resolved again at submit'
+    assert tape.asked == ([None] if kind.feed is not None else []), 'the policy was asked a wrong number of times'
 
 
 @pytest.mark.asyncio

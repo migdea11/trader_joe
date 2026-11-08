@@ -40,7 +40,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.enums.data_select import AssetType
-from common.enums.data_stock import DataSource, Feed
+from common.enums.data_stock import DataSource
 from common.errors.vocabulary import ExogenousError, InvalidRequestError, Reason, TraderJoeError
 from data.ingest.app.brokers.alpaca.handle import ALPACA_DATA_SCOPE, ALPACA_TRADING_SCOPE
 from data.ingest.app.brokers.alpaca.read import AlpacaRead
@@ -398,7 +398,6 @@ async def test_a_list_the_guard_refuses_is_retried_to_the_budget_and_filed_faile
             scope=ALPACA_DATA_SCOPE,
             trading_client=vendor.client,
             trading_scope=ALPACA_TRADING_SCOPE,
-            feed=Feed.IEX,
         )
         monkeypatch.setattr(trip.ingest.reader, 'get_assets', alpaca.get_assets)
 

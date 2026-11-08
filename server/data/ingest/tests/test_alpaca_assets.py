@@ -30,7 +30,6 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.models import Asset as SdkAsset
 
 from common.enums.data_select import AssetType
-from common.enums.data_stock import Feed
 from common.errors.vocabulary import ExogenousError, InvalidRequestError, Reason
 from data.ingest.app.brokers.alpaca import broker_api
 from data.ingest.app.brokers.alpaca.assets import (
@@ -186,7 +185,6 @@ def reader(
         scope=ALPACA_DATA_SCOPE,
         trading_client=trading_client,
         trading_scope=trading_scope,
-        feed=Feed.IEX,
     )
 
 

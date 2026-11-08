@@ -76,7 +76,6 @@ async def bars_of(response) -> list[tuple[datetime, float]]:
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch):
     """An IEX deployment, no cached client, and no remembered reset, around every test."""
-    monkeypatch.delenv('ALPACA_SIP_ENABLED', raising=False)
     broker_api.set_client(None)
     broker_api.forget_resets()
     yield

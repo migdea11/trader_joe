@@ -79,7 +79,7 @@ class BrokerHandle:
         scheduler: Scheduler,
         executor: AckGatedExecutor,
         reader: BrokerRead,
-        feed: Feed,
+        feed_policy: Callable[[Feed | None], Feed | None],
     ) -> None:
         """Bind a handle to the parts its broker built.
 
@@ -89,17 +89,16 @@ class BrokerHandle:
             scheduler (Scheduler): The handle's scheduler.
             executor (AckGatedExecutor): The handle's executor, over the same scheduler.
             reader (BrokerRead): What the executor's runner reads.
-            feed (Feed): The default tape of the account this handle is built for, a value of the account passed at
-                construction (owner rulings, tj-7zjov1.91). The handle is the one place a feed is resolved: every
-                bars request is served on this feed and a request naming another is refused. One handle, one account,
-                one feed (ADR tj-xn3qa6 addendum 1): never resolved per request or per granularity.
+            feed_policy (Callable[[Feed | None], Feed | None]): The concrete handle's per-request feed rule: given the
+                feed a bars request names (or None), the feed to serve, or None when the broker cannot serve it
+                (ADR tj-xn3qa6 addendum 3). This class decides no feed itself.
         """
         self.__source = source
         self.__scope = scope
         self.__scheduler = scheduler
         self.__executor = executor
         self.__reader = reader
-        self.__feed = feed
+        self.__feed_policy = feed_policy
         self.__active: set[str] = set()
         self.__intakes: dict[RequestKind, Callable[[SubmitRequest], Intake | SubmitAck]] = {}
         self.register_intake(RequestKind.BARS, self.__bars_intake)
@@ -108,11 +107,6 @@ class BrokerHandle:
     def source(self) -> DataSource:
         """DataSource: The source this handle serves."""
         return self.__source
-
-    @property
-    def feed(self) -> Feed:
-        """Feed: The default tape of the account this handle serves; the one feed every bars request is served on."""
-        return self.__feed
 
     @property
     def reader(self) -> BrokerRead:
@@ -237,24 +231,24 @@ class BrokerHandle:
         )
 
     def __bars_intake(self, request: SubmitRequest) -> Intake | SubmitAck:
-        """The bars kind's intake: serve the account's feed, refuse a named one it cannot serve, charge the data scope.
+        """The bars kind's intake: resolve the feed once per Submit, refuse one the broker cannot serve, charge the scope.
 
-        The feed is resolved once, when AlpacaHandle is built (broker_api.resolve_feed in AlpacaHandle.__init__); this
-        intake serves the stored value and refuses a differing named feed (tj-7zjov1.97, owner rulings of
-        tj-7zjov1.91). The feed is sent to the vendor explicitly, so the feed requested is known and recorded; no
-        request goes out without one, and a feed is never guessed for one that did.
+        The concrete handle's feed policy decides the feed (ADR tj-xn3qa6 addendum 3). It is called once here and the
+        result rides the work, the scheduled request and the ack, so the attempt, the single-flight key and the
+        report agree. Refused FEED_NOT_AVAILABLE only when the policy returns None.
         """
         if request.bars is None:
             raise no_body(request.kind)
         bars = request.bars
-        feed = self.__feed
-        if bars.feed is not None and bars.feed != feed:
+        feed = self.__feed_policy(bars.feed)
+        if feed is None:
+            named = bars.feed.value if bars.feed is not None else None
             return SubmitAck(
                 refused=FetchRefused(
                     reason=Reason.FEED_NOT_AVAILABLE.value,
                     domain=ERROR_DOMAIN,
-                    detail=f'This account cannot serve the requested feed: feed={bars.feed.value}',
-                    metadata={'feed': bars.feed.value},
+                    detail=f'This broker cannot serve the requested feed: feed={named}',
+                    metadata={'feed': named},
                 )
             )
         return Intake(

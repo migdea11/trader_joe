@@ -95,8 +95,14 @@ NOW = datetime(2026, 10, 6, 22, 0, tzinfo=UTC)
 DAY = Granularity.ONE_DAY.offset
 START = datetime(2026, 9, 28, tzinfo=UTC)
 SEEDED = [START + DAY * k for k in range(5)]  # 28 Sep .. 2 Oct, 00:00Z
-UNSERVABLE_FEED = Feed.SIP
+# A feed no Alpaca handle serves (tj-7zjov1.343): SIP is now the default the fake serves and IEX is served when named,
+# so NOT_APPLICABLE is the refusal, in production and in this in-process fake alike.
+UNSERVABLE_FEED = Feed.NOT_APPLICABLE
 assert UNSERVABLE_FEED is not FAKE_FEED
+# The tape every entry this file expects refreshed is stored on: the one FakeIngest serves. The refresh asks for the
+# entry's stored tape, and FakeIngest refuses any other, so an entry left on entry_values' default (IEX, conftest.py)
+# is refused, not refreshed, once FAKE_FEED is SIP (tj-7zjov1.350 F-B). Named on every seeding site, not inherited.
+SERVED_FEED = FAKE_FEED
 # The DAILY loop's ready_by at NOW: the open of Wed 7 Oct, 09:30 New York (EDT).
 NEXT_OPEN = datetime(2026, 10, 7, 13, 30, tzinfo=UTC)
 # Where the tail starts after the newest stored 1day bar (CLAUDE.md DAILY refresh, _after_bar): the LOCAL midnight
@@ -222,6 +228,7 @@ def _seed(engine: sa.Engine, entry_values, bar_values, run_identity) -> dict[str
         'update_type': UpdateType.DAILY.value,
         'expiry_type': ExpiryType.ROLLING.value,
         'granularity': Granularity.ONE_DAY,
+        'feed': SERVED_FEED,
         'start': START,
         'end': NullableDateTime.EPOCH,
     }
@@ -428,6 +435,7 @@ def _operator_daily(engine: sa.Engine, entry_values, bar_values, run_identity) -
                     update_type=UpdateType.DAILY.value,
                     expiry_type=ExpiryType.ROLLING.value,
                     granularity=Granularity.ONE_DAY,
+                    feed=SERVED_FEED,
                     start=START,
                     end=NullableDateTime.EPOCH,
                 )
@@ -591,6 +599,7 @@ async def test_a_provisional_newest_bar_is_re_requested_and_rewritten_final_on_p
                     update_type=UpdateType.DAILY.value,
                     expiry_type=ExpiryType.ROLLING.value,
                     granularity=Granularity.ONE_DAY,
+                    feed=SERVED_FEED,
                     start=START,
                     end=NullableDateTime.EPOCH,
                 )

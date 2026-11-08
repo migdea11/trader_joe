@@ -441,7 +441,8 @@ async def test_a_request_expired_at_dequeue_is_never_sent_and_is_returned_failed
     assert ingest.reader.calls == ()
     assert written(store) == [('r1', 1, DeliveryOutcome.EXPIRED, DeliveryVerdict.FINAL)]
     report = store.written[0].attempt
-    assert (report.header.feed, report.trailer.vendor_stats, report.trailer.as_of) == (Feed.IEX, None, None)
+    # No feed named: SIP, the default, which the fake follows (tj-7zjov1.343).
+    assert (report.header.feed, report.trailer.vendor_stats, report.trailer.as_of) == (Feed.SIP, None, None)
     assert store.count('r1') == 0 and store.is_finished('r1')
 
 

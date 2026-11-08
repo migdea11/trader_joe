@@ -143,7 +143,6 @@ NON_SECRET_BROKER_SETTINGS = frozenset(
         'ALPACA_MAX_ATTEMPTS',
         'ALPACA_OUTGOING_BUFFER_SIZE',
         'ALPACA_RATE_LIMIT_PER_MINUTE',
-        'ALPACA_SIP_ENABLED',
         'ALPACA_STALL_TIMEOUT_S',
     }
 )
@@ -557,7 +556,7 @@ _PASS_THROUGH = {
     'env-mapping-secrets-expression': {'env': {'ALPACA_API_KEY': '${{ secrets.ALPACA_API_KEY }}'}},
     'allowlisted-settings-as-literals': {
         'env': {'ALPACA_RATE_LIMIT_PER_MINUTE': 60},
-        'run': 'ALPACA_SIP_ENABLED=true ./x',
+        'run': 'ALPACA_MAX_ATTEMPTS=3 ./x',
     },
 }
 _MUST_FAIL = {
@@ -566,7 +565,10 @@ _MUST_FAIL = {
     'secrets-expression-with-literal-fallback': {'env': {'ALPACA_API_KEY': "${{ secrets.K || 'pk-literal' }}"}},
     'lowercase-name': {'run': 'alpaca_api_key=pk-literal ./x'},
     'unlisted-questrade-token': {'env': {'QUESTRADE_REFRESH_TOKEN': 'rt-literal'}},
-    'allowlist-name-as-prefix-only': {'env': {'ALPACA_SIP_ENABLED_KEY': 'pk-literal'}},
+    'allowlist-name-as-prefix-only': {'env': {'ALPACA_MAX_ATTEMPTS_KEY': 'pk-literal'}},
+    # ALPACA_SIP_ENABLED was retired by the owner ruling of 2026-11-06 (the Alpaca feed is not config at all), so it
+    # left the allowlist: a workflow setting it to a literal is now judged a credential, failing closed.
+    'retired-feed-setting-as-literal': {'run': 'ALPACA_SIP_ENABLED=true ./x'},
     'literal-inside-quoted-echo': {'run': 'echo "ALPACA_API_KEY=pk-literal" >> .env'},
 }
 

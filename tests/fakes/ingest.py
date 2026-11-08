@@ -33,9 +33,10 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
 from common.enums.data_select import AssetType
-from common.enums.data_stock import DataSource, Feed
+from common.enums.data_stock import DataSource
 from common.errors.vocabulary import InvalidRequestError, Reason
 from common.rpc.clients.store_delivery import StoreDeliveryClient
+from data.ingest.app.brokers.alpaca import broker_api
 from data.ingest.app.brokers.alpaca.asset_attempt import AssetListAttemptRunner, AssetListWork
 from data.ingest.app.brokers.alpaca.corporate_actions_attempt import CorporateActionsAttemptRunner, CorporateActionsWork
 from data.ingest.app.brokers.alpaca.handle import (
@@ -62,7 +63,7 @@ from data.ingest.app.scheduler import (
 )
 from schemas.data_ingest.delivery import RegisterInstanceRequest
 from schemas.data_ingest.submit import RequestKind, SubmitAck, SubmitRequest
-from tests.fakes.market_data import FEED, FakeRead, FakeWorld
+from tests.fakes.market_data import FakeRead, FakeWorld
 
 
 # A label pair the scheduler's credential provider hands out. Not a vendor key: nothing here calls a vendor.
@@ -124,7 +125,6 @@ class FakeIngest:
         calls_per_minute (int): The per-minute limit of both scopes, at most Alpaca's ceiling of 200.
         page_size (int): The page size the cost estimate assumes; Alpaca's unless set.
         world (FakeWorld | None): The world the reader serves, or None for its default answers.
-        feed (Feed): The account's tape.
         clock (Clock): The wall clock of the scheduler, the executor, the reader and the minted identity.
         budget_clock (Callable[[], float] | None): The monotonic clock the rate budgets refill on, or the default.
         sleep (Sleep): The executor's and the reader's sleep.
@@ -138,7 +138,6 @@ class FakeIngest:
         calls_per_minute: int = ALPACA_CALLS_PER_MINUTE_CEILING,
         page_size: int = ALPACA_BARS_PAGE_SIZE,
         world: FakeWorld | None = None,
-        feed: Feed = FEED,
         clock: Clock = _utc_now,
         budget_clock: Callable[[], float] | None = None,
         sleep: Sleep = asyncio.sleep,
@@ -148,7 +147,6 @@ class FakeIngest:
         self.__calls_per_minute = calls_per_minute
         self.__page_size = page_size
         self.__world = world
-        self.__feed = feed
         self.__clock = clock
         self.__budget_clock = budget_clock
         self.__sleep = sleep
@@ -267,7 +265,6 @@ class FakeIngest:
         reader = FakeRead(
             sleep=self.__sleep,
             clock=self.__clock,
-            feed=self.__feed,
             world=self.__world,
             scheduler=scheduler,
             scope=ALPACA_DATA_SCOPE,
@@ -288,7 +285,8 @@ class FakeIngest:
             scheduler=scheduler,
             executor=executor,
             reader=reader,
-            feed=self.__feed,
+            # Alpaca's own per-request rule, as AlpacaHandle passes it (ADR tj-xn3qa6 addendum 3).
+            feed_policy=broker_api.resolve_feed,
         )
         handle.register_intake(RequestKind.ASSET_LIST, _asset_list_intake)
         handle.register_intake(RequestKind.CORPORATE_ACTIONS, _corporate_actions_intake)

@@ -528,7 +528,7 @@ async def test_a_request_entering_at_or_past_the_budget_gets_no_vendor_attempt_t
             scheduler=rig.scheduler,
             executor=rig.executor,
             reader=Mock(),
-            feed=Feed.IEX,
+            feed_policy=broker_api.resolve_feed,
         )
         ack = await handle.submit(submit_request('r1', attempt_count=attempt_count, recovered=True))
         only = await rig.store.next()
@@ -544,8 +544,9 @@ async def test_a_request_entering_at_or_past_the_budget_gets_no_vendor_attempt_t
     assert only.attempt.trailer.error_class is None
     assert only.attempt.trailer.last_attempt is False
     assert only.attempt.trailer.vendor_stats is None
-    assert only.attempt.header.feed is ack.accepted.feed is Feed.IEX
-    assert_a_bars_report_names_the_tape(only.attempt.header, Feed.IEX)
+    # The request names no feed: SIP, the default (tj-7zjov1.343).
+    assert only.attempt.header.feed is ack.accepted.feed is Feed.SIP
+    assert_a_bars_report_names_the_tape(only.attempt.header, Feed.SIP)
     assert len(rig.store.received) == 1
     assert rig.finished == ['r1']
 
@@ -579,8 +580,9 @@ async def test_the_alpaca_handle_does_not_queue_a_request_already_past_the_budge
     assert delivered.attempt.trailer.outcome is DeliveryOutcome.EXHAUSTED
     assert delivered.attempt.trailer.error_class is None
     assert delivered.attempt.trailer.last_attempt is False
-    assert delivered.attempt.header.feed is ack.accepted.feed is Feed.IEX
-    assert_a_bars_report_names_the_tape(delivered.attempt.header, Feed.IEX)
+    # The request names no feed: SIP, the default (tj-7zjov1.343).
+    assert delivered.attempt.header.feed is ack.accepted.feed is Feed.SIP
+    assert_a_bars_report_names_the_tape(delivered.attempt.header, Feed.SIP)
     assert handle.active == 0
 
 
@@ -828,13 +830,16 @@ async def test_a_retry_re_entering_the_queue_keeps_its_feed_and_its_expiry_names
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('tape', [Feed.IEX, Feed.SIP], ids=['iex', 'sip'])
-@pytest.mark.parametrize('named', [False, True], ids=['default-feed', 'named-feed'])
-async def test_a_bars_request_expiring_after_submit_names_the_feed_of_its_ack(tape, named):
+@pytest.mark.parametrize(
+    ('named', 'tape'),
+    [(None, Feed.SIP), (Feed.SIP, Feed.SIP), (Feed.IEX, Feed.IEX)],
+    ids=['default-feed-sip', 'named-sip', 'named-iex'],
+)
+async def test_a_bars_request_expiring_after_submit_names_the_feed_of_its_ack(named, tape):
     """Through BrokerHandle.submit: the EXPIRED report names the same tape as the Submit ack.
 
-    The tape is the handle's, the account's feed passed at construction (tj-7zjov1.97), whether the request named
-    it or left it to the default.
+    RE-POINTED by tj-7zjov1.343: the tape is resolved per request by the handle's feed policy (Alpaca's rule here),
+    SIP when the request names none, IEX when it names IEX.
     """
     runner = FakeRunner(succeeded())
     async with Rig(runner) as rig:
@@ -844,9 +849,9 @@ async def test_a_bars_request_expiring_after_submit_names_the_feed_of_its_ack(ta
             scheduler=rig.scheduler,
             executor=rig.executor,
             reader=Mock(),
-            feed=tape,
+            feed_policy=broker_api.resolve_feed,
         )
-        bars = bars_request(feed=tape) if named else bars_request()
+        bars = bars_request(feed=named)
         ack = await handle.submit(submit_request('r1', bars=bars, ready_by=T0 - timedelta(seconds=1)))
         delivered = await rig.store.next()
         answer(delivered, DeliveryVerdict.FINAL)
@@ -962,7 +967,6 @@ async def test_start_twice_is_refused():
 
 @pytest.fixture(autouse=True)
 def iex_deployment_and_no_cached_client(monkeypatch):
-    monkeypatch.delenv('ALPACA_SIP_ENABLED', raising=False)
     monkeypatch.delenv('ALPACA_RATE_LIMIT_PER_MINUTE', raising=False)
     broker_api.set_client(None)
     broker_api.set_trading_client(None)
@@ -1005,7 +1009,8 @@ async def test_submit_queues_the_request_and_answers_at_once_with_the_feed_and_t
     ack = await handle.submit(submit_request(ready_by=ready_by, attempt_count=2, client='backtest'))
 
     assert ack.refused is None
-    assert ack.accepted.feed is Feed.IEX
+    # No feed named: SIP, the default (owner ruling 2026-11-06).
+    assert ack.accepted.feed is Feed.SIP
     assert ack.accepted.quota_key == ALPACA_DATA_SCOPE
     assert handle.scheduler.queued == 1
     queued = await asyncio.wait_for(handle.scheduler.take(), GUARD_S)
@@ -1014,9 +1019,9 @@ async def test_submit_queues_the_request_and_answers_at_once_with_the_feed_and_t
     assert queued.ready_by == ready_by
     assert queued.attempt_count == 2
     assert queued.client_label == 'backtest'
-    assert queued.feed is Feed.IEX, 'the request does not carry the tape its ack named'
+    assert queued.feed is Feed.SIP, 'the request does not carry the tape its ack named'
     assert queued.payload == BarsWork(
-        request=bars_request(), priority=priority_for_update_type(UpdateType.STATIC), feed=Feed.IEX
+        request=bars_request(), priority=priority_for_update_type(UpdateType.STATIC), feed=Feed.SIP
     )
 
 
@@ -1039,26 +1044,30 @@ async def test_submit_is_idempotent_on_request_id_while_the_request_is_active():
 
 
 @pytest.mark.asyncio
-async def test_a_feed_the_deployment_cannot_serve_is_refused_and_not_queued():
+async def test_a_feed_alpaca_cannot_serve_is_refused_and_not_queued():
+    # RE-POINTED by tj-7zjov1.343: SIP and IEX are both served; NOT_APPLICABLE is the feed with no tape.
     handle = alpaca_handle()
 
-    ack = await handle.submit(submit_request(bars=bars_request(feed=Feed.SIP)))
+    ack = await handle.submit(submit_request(bars=bars_request(feed=Feed.NOT_APPLICABLE)))
 
     assert ack.accepted is None
     assert ack.refused.reason == Reason.FEED_NOT_AVAILABLE.value
-    assert ack.refused.metadata == {'feed': Feed.SIP.value}
+    assert ack.refused.metadata == {'feed': Feed.NOT_APPLICABLE.value}
     assert handle.scheduler.queued == 0
     assert handle.active == 0
 
 
 @pytest.mark.asyncio
-async def test_a_named_feed_the_deployment_serves_is_accepted():
+@pytest.mark.parametrize('named', [Feed.IEX, Feed.SIP], ids=['iex', 'sip'])
+async def test_a_named_feed_alpaca_serves_is_accepted_on_that_feed(named):
     handle = alpaca_handle()
 
-    ack = await handle.submit(submit_request(bars=bars_request(feed=Feed.IEX)))
+    ack = await handle.submit(submit_request(bars=bars_request(feed=named)))
 
-    assert ack.accepted.feed is Feed.IEX
+    assert ack.accepted.feed is named
     assert handle.scheduler.queued == 1
+    queued = await asyncio.wait_for(handle.scheduler.take(), GUARD_S)
+    assert (queued.feed, queued.payload.feed) == (named, named)
 
 
 NON_BARS = [
@@ -1343,7 +1352,7 @@ def corporate_actions_submit(request_id: str = 'ca-1', **overrides) -> SubmitReq
 
 
 RECOVERABLE_KINDS = [
-    pytest.param(submit_request, Feed.IEX, BarsWork, id='bars'),
+    pytest.param(submit_request, Feed.SIP, BarsWork, id='bars'),
     pytest.param(corporate_actions_submit, None, CorporateActionsWork, id='corporate-actions'),
 ]
 
@@ -1880,7 +1889,8 @@ async def test_the_alpaca_handle_attempts_a_submitted_request_and_reports_it_to_
     attempt = delivered.attempt
     assert (attempt.header.request_id, attempt.header.attempt_no, attempt.header.instance_id) == ('req-1', 1, INSTANCE)
     assert attempt.header.quota_key == ALPACA_DATA_SCOPE
-    assert attempt.header.feed is Feed.IEX
+    # No feed named: served on SIP, the default (tj-7zjov1.343); START lies far behind the SIP edge.
+    assert attempt.header.feed is Feed.SIP
     assert attempt.trailer.outcome is DeliveryOutcome.SUCCEEDED
     assert attempt.trailer.vendor_stats.calls == 1
     # The asset looked up after the bars names the header's vendor id (tj-7zjov1.128).

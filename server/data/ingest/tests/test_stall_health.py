@@ -34,7 +34,7 @@ import pytest
 from grpc_health.v1 import health_pb2, health_pb2_grpc
 
 from common.enums.data_select import AssetType, DataType
-from common.enums.data_stock import DataSource, Feed, Granularity, UpdateType
+from common.enums.data_stock import DataSource, Granularity, UpdateType
 from common.rpc.channel import create_channel
 from common.rpc.server import BindAddress, GrpcServerHost
 from data.ingest.app import app_depends, main
@@ -196,7 +196,7 @@ def make_handle(scope: str, clock: FakeClock, sleep: TickSleep) -> BrokerHandle:
         scheduler=scheduler,
         executor=executor,
         reader=Mock(name='reader, never read here'),
-        feed=Feed.IEX,
+        feed_policy=Mock(name='feed policy, never asked here', side_effect=AssertionError('no bars submit here')),
     )
 
 
@@ -259,7 +259,6 @@ class HealthRig:
 
 @pytest.fixture(autouse=True)
 def iex_deployment_and_no_cached_client(monkeypatch):
-    monkeypatch.delenv('ALPACA_SIP_ENABLED', raising=False)
     monkeypatch.delenv('ALPACA_RATE_LIMIT_PER_MINUTE', raising=False)
     broker_api.set_client(None)
     yield

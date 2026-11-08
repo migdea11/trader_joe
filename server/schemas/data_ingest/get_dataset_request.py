@@ -18,11 +18,11 @@ class BaseGetDatasetRequest(InboundContract):
     source: DataSource
     # KEPT, BUT INERT TODAY, AND THE COMMENT THAT USED TO SIT HERE OVERSTATED IT. It claimed this
     # was "the only model where that optionality is meant to end" -- that the adapter would take
-    # the caller's selection when there is one. NOTHING IN data/ingest READS THIS FIELD. The one
-    # resolution site (alpaca/broker_api.py, `'sip' if sip_enabled() else 'iex'`) consults a
-    # deployment env var and never the request, so a request naming a tape is accepted and
-    # ignored -- exactly the failure schemas/inbound_contract.py exists to prevent, arriving
-    # through a field rather than past one.
+    # the caller's selection when there is one. NOTHING IN data/ingest READS THIS FIELD. The Alpaca
+    # handle decides the feed per request from the request it is handed (SIP by default, IEX only
+    # when a request names it; no setting), but it is never handed this model, so a tape named
+    # here is accepted and ignored -- exactly the failure schemas/inbound_contract.py exists to
+    # prevent, arriving through a field rather than past one.
     #
     # WHY IT SURVIVES ANYWAY, while StoreAssetDatasetBody.feed did not: nothing can populate it
     # now. tj-rh4b7f (2026-09-25) deferred caller-selected feed, so there is no feed to forward.

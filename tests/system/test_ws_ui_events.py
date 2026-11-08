@@ -12,7 +12,10 @@ the DatasetChanged of a delivery that resolved a dataset. So:
   * EVERY POST first sends its name_change clamp query (P51), a corporate-actions request whose attempt row is
     announced like any other: one frame labelled with the symbol alone (no bar width), EMPTY because FakeRead serves
     no actions without a world, before the bars request is sent;
-  * a refused feed (FEED_NOT_AVAILABLE) is refused at Submit: the request is FAILED PERMANENT with NO attempt row, so
+  * a POST naming IEX is SERVED (owner ruling 2026-11-06, tj-7zjov1.343), announced as any served POST: one
+    SUCCEEDED bars frame naming its dataset, whose attempt row carries IEX, then DatasetChanged UPDATED;
+  * a refused feed (FEED_NOT_AVAILABLE; NOT_APPLICABLE, since SIP and IEX are both served) is refused at Submit: the
+    request is FAILED PERMANENT with NO attempt row, so
     NO bars run frame and no DatasetChanged; the clamp's frame is the POST's only announcement. Nothing publishes
     RequestChanged (reserved, docs/API.md U8). docs/API.md's U8 table still describes the legacy three frames.
 Each test compares the frames with the attempt rows in ingest_run, by id and in attempt order: one frame per row.
@@ -324,16 +327,53 @@ def test_a_failing_vendor_announces_each_failed_attempt_and_no_dataset(
     assert _dataset_frames(frames) == [], f'nothing was written, so nothing is announced: {frames}'
 
 
-def test_a_refused_feed_announces_no_bars_run_and_no_dataset(
+def test_a_post_naming_iex_is_served_and_announced_as_one_succeeded_attempt_then_its_dataset(
     own_symbol, run_identity, data_store, adopt_entries, open_socket, pg_engine
 ):
-    """FEED_NOT_AVAILABLE is refused at Submit: no attempt row, so no bars frame; the clamp's frame is all there is."""
+    """RE-DERIVED by tj-7zjov1.343: naming IEX was the refused case; it is served now, and announced like any POST."""
     socket = open_socket()
     _settle()
 
     try:
         response = data_store.post(
-            _store_path(own_symbol), json=_body(run_identity.owner, feed=Feed.SIP.value), auth='right'
+            _store_path(own_symbol), json=_body(run_identity.owner, feed=Feed.IEX.value), auth='right'
+        )
+    finally:
+        ids = adopt_entries(own_symbol)
+    assert response.status_code == 200, data_store.describe(response)
+    (dataset_id,) = ids
+
+    frames = socket.read_until(lambda fs: bool(_dataset_frames(fs, dataset_id)), f'DatasetChanged for {dataset_id}')
+    frames = socket.read_quietly()
+    for frame in frames:
+        _assert_canonical(frame)
+
+    _assert_the_clamp_came_first(frames, own_symbol)
+    runs = _run_frames(frames, own_symbol)
+    assert [run['state'] for run in runs] == [SUCCEEDED], f'one delivered attempt, one frame: {runs}'
+    _assert_one_frame_per_attempt(pg_engine, runs)
+    (run,) = runs
+    assert run.get('datasetId') == str(dataset_id), run
+    assert _dataset_frames(frames, dataset_id) == [{'id': str(dataset_id), 'change': UPDATED}]
+    with pg_engine.connect() as conn:
+        feed = conn.execute(sa.select(RUNS.c.feed).where(RUNS.c.id == UUID(run['id']))).scalar_one()
+    assert feed == Feed.IEX, f'the announced attempt was served on {feed}, not the IEX the POST named'
+
+
+def test_a_refused_feed_announces_no_bars_run_and_no_dataset(
+    own_symbol, run_identity, data_store, adopt_entries, open_socket, pg_engine
+):
+    """FEED_NOT_AVAILABLE is refused at Submit: no attempt row, so no bars frame; the clamp's frame is all there is.
+
+    RE-DERIVED by tj-7zjov1.343: the refused feed is NOT_APPLICABLE (SIP and IEX are both served; the POST body admits
+    any Feed).
+    """
+    socket = open_socket()
+    _settle()
+
+    try:
+        response = data_store.post(
+            _store_path(own_symbol), json=_body(run_identity.owner, feed=Feed.NOT_APPLICABLE.value), auth='right'
         )
     finally:
         ids = adopt_entries(own_symbol)

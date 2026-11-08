@@ -143,7 +143,6 @@ def clean_process_state(monkeypatch) -> Iterator[None]:
     for name in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv('NO_PROXY', '127.0.0.1,localhost')
-    monkeypatch.delenv('ALPACA_SIP_ENABLED', raising=False)
     monkeypatch.setenv(KEY_VAR, KEY)
     monkeypatch.setenv(SECRET_VAR, SECRET)
     broker_api.set_client(None)

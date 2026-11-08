@@ -15,8 +15,10 @@ POST's bars runs. The acceptance --
   * a peer failure is SEVERAL FAILED attempt rows (attempt 1..N, trigger REQUEST then RETRY), no dataset, the
     vendor's sentence each; the request is FAILED ATTEMPTS_EXHAUSTED and the POST answers 503 VENDOR_UNAVAILABLE.
     The attempt row's error_domain and error_reason are NOT asserted either way (open question tj-7zjov1.236);
-  * a refused feed (FEED_NOT_AVAILABLE) is refused at Submit: NO bars attempt row at all; the request is FAILED
-    PERMANENT with no dataset, and the POST answers 422;
+  * a POST naming IEX is SERVED on IEX (owner ruling 2026-11-06, tj-7zjov1.343): one SUCCEEDED attempt row whose
+    feed is IEX, beside the default POST's SIP one, each naming its own dataset;
+  * a refused feed (FEED_NOT_AVAILABLE; NOT_APPLICABLE, since SIP and IEX are both served) is refused at Submit: NO
+    bars attempt row at all; the request is FAILED PERMANENT with no dataset, and the POST answers 422;
   * the bars request is COMMITTED and OPEN, readable from a second connection, while the fetch is in flight, before
     any attempt row; afterwards the same request is finished with its one attempt row. A first POST is NOT asserted
     as catalog Running: Running reads open requests WITH a dataset id, and a first POST has none until its first
@@ -64,7 +66,7 @@ from data.store.app.database.models.ingest_request import (
 from data.store.app.database.models.ingest_run import IngestRun, IngestRunState, IngestRunTrigger
 from routers.data_store.app_endpoints import AssetDatasetStoreInterface, UiDatasetsInterface
 from tests.fakes.market_data import EMPTY_PREFIX, FAIL_PREFIX, SLOW_PREFIX
-from tests.fakes.market_data import FEED as FAKE_DEPLOYMENT_FEED
+from tests.fakes.market_data import FEED as FAKE_DEFAULT_FEED
 from tests.system.problem_json import assert_problem
 
 
@@ -76,7 +78,11 @@ INSTANCES = IngestInstance.__table__
 GRANULARITY = Granularity.ONE_MINUTE
 START = datetime.fromisoformat('2001-02-05T14:30:00+00:00')
 END = START + timedelta(minutes=30)
-UNSERVABLE_FEED = Feed.SIP
+# A POST naming no feed is served on SIP, the production default the fake follows (owner ruling 2026-11-06, option A).
+DEFAULT_FEED = Feed.SIP
+NAMED_FEED = Feed.IEX
+# SIP and IEX are both served; NOT_APPLICABLE is the feed Alpaca has no tape for. The POST body admits it (Feed | None).
+UNSERVABLE_FEED = Feed.NOT_APPLICABLE
 # How long the in-flight test polls for the bars request: the clamp query's round trip comes first, then FakeRead's
 # SLOW_ delay (DEFAULT_SLOW_DELAY_SECONDS, 8 s) holds the bars request open. Generous on purpose.
 IN_FLIGHT_POLL_SECONDS = 30.0
@@ -174,7 +180,8 @@ def test_a_served_fetch_leaves_one_attempt_row_naming_its_dataset(
     (run,) = _bars_runs(pg_engine, symbol)
     assert (run.state, run.bars_written, run.dataset_id) == (state, response.json()['data_points'], ids[0])
     assert (run.request_id, run.attempt_no, run.trigger) == (request.id, 1, IngestRunTrigger.REQUEST)
-    assert (run.feed, run.granularity) == (FAKE_DEPLOYMENT_FEED, GRANULARITY)
+    assert FAKE_DEFAULT_FEED is DEFAULT_FEED, f'the fake serves an unnamed request on {FAKE_DEFAULT_FEED}, not SIP'
+    assert (run.feed, run.granularity) == (DEFAULT_FEED, GRANULARITY)
     assert (run.requested_start, run.requested_end) == (START, END)
     assert run.finished_at is not None
     # A success carries no error at all: designed, not as-built.
@@ -234,6 +241,35 @@ def test_a_peer_failure_leaves_failed_attempts_and_an_exhausted_request(
         IngestRequestFailureCause.ATTEMPTS_EXHAUSTED,
         None,
     )
+
+
+def test_a_post_naming_iex_is_served_on_iex_with_its_own_attempt_row_beside_the_default_sip_one(
+    own_symbol, run_identity, data_store, pg_engine, adopt_entries
+):
+    """IEX named is served, not refused (tj-7zjov1.342): each POST's one attempt row carries the feed it resolved to.
+
+    The same window on purpose: a PARTIAL cross-tape overlap is refused by the feed-blind own-overlap check (ruled
+    acceptable, tj-7zjov1.351); the identical window is two datasets, because feed is part of the entry's identity.
+    """
+    default, after_default = _post(data_store, adopt_entries, own_symbol, _body(run_identity.owner))
+    named, after_named = _post(data_store, adopt_entries, own_symbol, _body(run_identity.owner, feed=NAMED_FEED.value))
+
+    assert default.status_code == 200, data_store.describe(default)
+    assert named.status_code == 200, data_store.describe(named)
+    assert len(after_named) == 2 and after_named[0] == after_default[0], f'IEX named: {after_named}'
+    sip_entry, iex_entry = after_named
+    requests = _bars_requests(pg_engine, own_symbol)
+    runs = _bars_runs(pg_engine, own_symbol)
+    assert len(requests) == 2 and len(runs) == 2, (requests, runs)
+    by_request = {run.request_id: run for run in runs}
+    assert set(by_request) == {request.id for request in requests}, 'a request without its own attempt row'
+    feeds = {request.dataset_id: by_request[request.id].feed for request in requests}
+    assert feeds == {sip_entry: DEFAULT_FEED, iex_entry: NAMED_FEED}, feeds
+    for request in requests:
+        run = by_request[request.id]
+        assert (request.state, run.state) == (IngestRequestState.SUCCEEDED, IngestRunState.SUCCEEDED), (request, run)
+        assert (run.attempt_no, run.trigger, run.dataset_id) == (1, IngestRunTrigger.REQUEST, request.dataset_id)
+        assert run.bars_written == named.json()['data_points']
 
 
 def test_a_refused_feed_leaves_a_failed_request_and_no_bars_attempt(

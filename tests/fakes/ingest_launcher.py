@@ -9,8 +9,9 @@ The app is built by production's own create_app, so the lifespan, the RPC server
 router are the real ones. The handle in the ALPACA_API slot is the production AlpacaHandle too
 (P53, tj-7zjov1.158): its scheduler, executor, runners and intakes are production's, and only its
 reader differs. The handle builds that reader through its reader_factory seam, once, with its own
-scheduler, its two quota scopes and the feed it resolved, so the FakeRead is PACED on the handle's
-scheduler as AlpacaRead is and serves the account's feed. Submit is the one read path: the
+scheduler and its two quota scopes, so the FakeRead is PACED on the handle's scheduler as AlpacaRead
+is. The feed is decided per request (the handle's intake resolves it and the query carries it), so
+the fake serves the feed each query names, SIP when it names none. Submit is the one read path: the
 FetchDataset pull stream that used to read through a second readers mapping is gone (tj-7zjov1.275,
 owner ruling 2026-11-02), and `reader` below is kept only as the handle's reader, for the banner and
 for tests that inspect it.
@@ -26,7 +27,7 @@ can tell a fake-mode service from a real one.
 import os
 from collections.abc import Mapping
 
-from common.enums.data_stock import DataSource, Feed
+from common.enums.data_stock import DataSource
 from common.logging import get_logger
 from data.ingest.app.brokers.alpaca.handle import AlpacaHandle
 from data.ingest.app.main import create_app
@@ -71,14 +72,13 @@ class FakeReaderFactory:
     def __init__(self, slow_delay_seconds: float) -> None:
         self.__slow_delay_seconds = slow_delay_seconds
 
-    def __call__(self, *, scheduler: Scheduler, scope: str, trading_scope: str, feed: Feed) -> FakeRead:
-        """Build the handle's reader from what the handle resolved at build.
+    def __call__(self, *, scheduler: Scheduler, scope: str, trading_scope: str) -> FakeRead:
+        """Build the handle's reader with the handle's scheduler and scopes.
 
         Args:
             scheduler (Scheduler): The handle's scheduler, which paces every fake "vendor" call.
             scope (str): The data scope bars and corporate actions are charged to.
             trading_scope (str): The trading scope asset reads are charged to.
-            feed (Feed): The feed the handle resolved; the fake serves it.
 
         Returns:
             FakeRead: The reader.
@@ -87,11 +87,7 @@ class FakeReaderFactory:
             ValueError: If FakeRead refuses the delay.
         """
         return FakeRead(
-            slow_delay_seconds=self.__slow_delay_seconds,
-            feed=feed,
-            scheduler=scheduler,
-            scope=scope,
-            trading_scope=trading_scope,
+            slow_delay_seconds=self.__slow_delay_seconds, scheduler=scheduler, scope=scope, trading_scope=trading_scope
         )
 
 

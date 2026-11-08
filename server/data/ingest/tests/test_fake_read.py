@@ -19,7 +19,7 @@ other implementation has.
 THE TYPED OUTCOMES (TE-5 tj-3mk3u5.37.6; ADR tj-fa1rpu D2, D3, D8; the Q-EMPTY ruling on
 tj-3mk3u5.37.1): FakeRead RETURNS a BarsResponse or a BarsFailure. FAIL_ and a first FAILONCE_ are
 VENDOR_UNAVAILABLE, RATELIMIT_ is VENDOR_RATE_LIMITED with a deterministic reset_at, EMPTY_ is
-SERVED with no bars, and three refusals (a named feed the fake's deployment feed is not, a start at or
+SERVED with no bars, and three refusals (a named feed the fake has no tape for, a start at or
 after its clock, an end before the start) come before any scenario. Tests of those use an injected
 clock, NOW; the older tests keep the real clock, whose ranges all lie in the past.
 """
@@ -53,6 +53,7 @@ from common.rpc.clients.ingest_submit import GrpcIngestSubmitClient
 from common.tests.image_path import image_pythonpath
 from common.tests.roots import REPO_ROOT, SERVER_ROOT, repo_relative
 from data.ingest.app import app_depends, grpc_host
+from data.ingest.app.brokers.alpaca import broker_api
 from data.ingest.app.brokers.alpaca.broker_codes import AlpacaGranularity
 from data.ingest.app.brokers.alpaca.handle import ALPACA_DATA_SCOPE, ALPACA_TRADING_SCOPE, AlpacaHandle
 from data.ingest.app.brokers.interface import (
@@ -142,7 +143,7 @@ def query(
         start (datetime): Inclusive start.
         end (datetime | None): Exclusive end, or None.
         granularity (Granularity): Bar size.
-        feed (Feed | None): The feed the query names, or None to leave it to the deployment.
+        feed (Feed | None): The feed the query names, or None for the default (SIP).
 
     Returns:
         BarsQuery: The query.
@@ -181,7 +182,8 @@ async def served(reader: FakeRead, bars_query: BarsQuery, cap: int = OPEN_ENDED_
     """
     response = await reader.get_bars(bars_query)
     assert isinstance(response, BarsResponse), f'expected SERVED, got {response!r}'
-    assert response.feed is Feed.IEX
+    # The feed the query names, SIP when it names none (owner ruling 2026-11-06).
+    assert response.feed is (bars_query.feed if bars_query.feed is not None else Feed.SIP)
     bars: list[Bar] = []
     async for bar in response.bars:
         bars.append(bar)
@@ -511,54 +513,84 @@ async def test_ratelimit_returns_vendor_rate_limited_with_a_deterministic_reset_
 # ---------------------------------------------------------------------------------------------
 
 
-def recording_reader(feed: Feed = FEED) -> tuple[FakeRead, list[float]]:
+def recording_reader() -> tuple[FakeRead, list[float]]:
     """A FakeRead whose SLOW_ sleeps are recorded, so 'before any scenario' is observable."""
     slept: list[float] = []
 
     async def record(seconds: float) -> None:
         slept.append(seconds)
 
-    return FakeRead(slow_delay_seconds=0.5, sleep=record, clock=at_now, feed=feed), slept
+    return FakeRead(slow_delay_seconds=0.5, sleep=record, clock=at_now), slept
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ('deployment', 'named'),
-    [
-        pytest.param(Feed.IEX, Feed.SIP, id='sip-on-the-default-iex'),
-        pytest.param(Feed.SIP, Feed.IEX, id='iex-on-a-sip-deployment'),
-        pytest.param(Feed.IEX, Feed.NOT_APPLICABLE, id='not-applicable'),
-    ],
-)
-async def test_a_named_feed_other_than_the_deployment_feed_is_refused_before_any_scenario(deployment, named):
-    reader, slept = recording_reader(deployment)
+async def test_a_feed_the_fake_has_no_tape_for_is_refused_before_any_scenario():
+    # RE-POINTED by tj-7zjov1.343: the fake has no deployment feed any more (owner ruling 2026-11-06). It serves SIP
+    # and IEX as named, so the only refusal left is a feed with no tape at all, as broker_api.resolve_feed refuses it.
+    reader, slept = recording_reader()
 
-    error = await failure(reader, query(f'{SLOW_PREFIX}VFV', end=ON_GRID + 2 * HOUR, feed=named))
+    error = await failure(reader, query(f'{SLOW_PREFIX}VFV', end=ON_GRID + 2 * HOUR, feed=Feed.NOT_APPLICABLE))
 
     assert type(error) is BrokerUnsupportedError
     assert error.reason is Reason.FEED_NOT_AVAILABLE
     assert REASONS[error.reason].outcome is Outcome.REFUSED
-    assert named.value in error.detail
-    assert dict(error.metadata) == {'feed': named.value}
+    assert error.detail == 'This broker cannot serve the requested feed: feed=NOT_APPLICABLE'
+    assert dict(error.metadata) == {'feed': Feed.NOT_APPLICABLE.value}
     assert slept == [], 'SLOW_ slept before the feed refusal'
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('named', [None, Feed.SIP], ids=['unnamed', 'named-sip'])
-async def test_the_deployment_feed_is_served_and_reported_named_or_not(named):
-    reader, slept = recording_reader(Feed.SIP)
+@pytest.mark.parametrize(
+    ('named', 'expected'),
+    [
+        pytest.param(None, Feed.SIP, id='unnamed-sip'),
+        pytest.param(Feed.SIP, Feed.SIP, id='sip-sip'),
+        pytest.param(Feed.IEX, Feed.IEX, id='iex-iex'),
+    ],
+)
+async def test_the_fake_serves_and_reports_the_feed_the_query_names_sip_when_none(named, expected):
+    reader, slept = recording_reader()
 
     response = await reader.get_bars(query(f'{SLOW_PREFIX}VFV', end=ON_GRID + 2 * HOUR, feed=named))
 
     assert isinstance(response, BarsResponse)
-    assert response.feed is Feed.SIP
-    assert reader.feed is Feed.SIP
+    assert response.feed is expected
     # The same arrangement that is refused above does reach the scenario here, so 'no sleep' was not vacuous.
     assert slept == [0.5]
 
 
-def test_the_default_deployment_feed_is_iex():
-    assert FakeRead().feed is FEED is Feed.IEX
+@pytest.mark.asyncio
+async def test_one_fake_serves_queries_naming_different_feeds_each_on_its_own():
+    reader, _slept = recording_reader()
+
+    feeds = [
+        (await reader.get_bars(query('VFV', end=ON_GRID + 2 * HOUR, feed=named))).feed
+        for named in (Feed.IEX, None, Feed.SIP, Feed.IEX)
+    ]
+
+    assert feeds == [Feed.IEX, Feed.SIP, Feed.SIP, Feed.IEX]
+
+
+def test_the_fakes_default_feed_is_the_production_default():
+    # The fake-mode stack follows production (owner ruling 2026-11-06, option A): no feed named is SIP in both.
+    assert FEED is broker_api.ALPACA_DEFAULT_FEED is Feed.SIP
+
+
+@pytest.mark.parametrize('feed', list(Feed), ids=lambda feed: feed.value)
+def test_the_fakes_feed_rule_agrees_with_resolve_feed_for_every_feed(feed):
+    # The fake keeps its own copy of the rule (it must not import the vendor module's behaviour by accident); this
+    # pins the copy to the production rule, so the two cannot drift.
+    reader, _slept = recording_reader()
+    outcome = asyncio.run(reader.get_bars(query('VFV', end=ON_GRID + 2 * HOUR, feed=feed)))
+    served = outcome.feed if isinstance(outcome, BarsResponse) else None
+
+    assert served is broker_api.resolve_feed(feed)
+
+
+def test_the_fake_has_no_deployment_feed():
+    assert not hasattr(FakeRead(), 'feed')
+    with pytest.raises(TypeError):
+        FakeRead(feed=Feed.IEX)
 
 
 @pytest.mark.asyncio
@@ -566,7 +598,7 @@ async def test_a_refused_failonce_query_does_not_spend_the_fail_once_memory():
     reader, _slept = recording_reader()
     symbol = f'{FAILONCE_PREFIX}VFV'
 
-    await failure(reader, query(symbol, end=ON_GRID + 2 * HOUR, feed=Feed.SIP))
+    await failure(reader, query(symbol, end=ON_GRID + 2 * HOUR, feed=Feed.NOT_APPLICABLE))
 
     # The first query that reaches the scenario is still the first call for the range.
     assert_vendor_unavailable(await failure(reader, query(symbol, end=ON_GRID + 2 * HOUR)))
@@ -1027,7 +1059,8 @@ async def test_the_launchers_app_accepts_and_serves_a_submit_of_each_kind_throug
     )
     # request id, body, the quota key and tape the ack must name, the "vendor" call the attempt must make.
     each_kind = (
-        ('launcher-bars', {'bars': bars}, ALPACA_DATA_SCOPE, launcher.handle.feed, ('bars', 'VFV')),
+        # The bars request names no feed: the launcher's production handle serves it on SIP, the production default.
+        ('launcher-bars', {'bars': bars}, ALPACA_DATA_SCOPE, Feed.SIP, ('bars', 'VFV')),
         ('launcher-assets', {'asset_list': listing}, ALPACA_TRADING_SCOPE, None, ('assets', 'inactive')),
         ('launcher-actions', {'corporate_actions': actions}, ALPACA_DATA_SCOPE, None, ('corporate_actions', 'VFV')),
     )

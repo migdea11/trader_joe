@@ -126,9 +126,8 @@ def assert_caused_by(error: TraderJoeError, answer: Answer) -> None:
 
 
 @pytest.fixture(autouse=True)
-def iex_deployment_and_no_cached_client(monkeypatch):
-    """An IEX deployment unless a test says otherwise, no client cached and no reset remembered across tests."""
-    monkeypatch.delenv('ALPACA_SIP_ENABLED', raising=False)
+def no_cached_client(monkeypatch):
+    """No client cached and no reset remembered across tests."""
     broker_api.set_client(None)
     broker_api.forget_resets()
     yield
@@ -158,14 +157,10 @@ def executor() -> Iterator[ThreadPoolExecutor]:
         yield pool
 
 
-def reader(
-    vendor: StubVendor | None, executor: ThreadPoolExecutor, clock=lambda: NOW, scheduler=None, feed: Feed = Feed.IEX
-) -> AlpacaRead:
-    """A real AlpacaRead built with the handle's feed (tj-7zjov1.97), IEX unless a test says otherwise."""
+def reader(vendor: StubVendor | None, executor: ThreadPoolExecutor, clock=lambda: NOW, scheduler=None) -> AlpacaRead:
+    """A real AlpacaRead. It holds no feed: each query's feed is resolved per request (SIP when none is named)."""
     client = vendor.client if vendor is not None else None
-    return alpaca_reader(
-        client, executor, clock, scheduler=scheduler if scheduler is not None else PACING['scheduler'], feed=feed
-    )
+    return alpaca_reader(client, executor, clock, scheduler=scheduler if scheduler is not None else PACING['scheduler'])
 
 
 def query(**overrides) -> BarsQuery:
@@ -185,35 +180,24 @@ def failure_of(outcome: BarsResponse | BarsFailure) -> TraderJoeError:
 
 
 # ---------------------------------------------------------------------------------------------
-# The named feed (TE-4 item 2): honoured when this deployment serves it, else refused before the vendor
+# The named feed (TE-4 item 2): served per request (SIP when none is named, IEX when named), refused before the vendor
+# only when Alpaca has no tape for it (owner ruling 2026-11-06, ADR tj-xn3qa6 addendum 3)
 # ---------------------------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ('served', 'named'),
-    [
-        pytest.param(Feed.IEX, Feed.SIP, id='sip-on-an-iex-deployment'),
-        pytest.param(Feed.SIP, Feed.IEX, id='iex-on-a-sip-deployment'),
-        pytest.param(Feed.IEX, Feed.NOT_APPLICABLE, id='not-applicable'),
-    ],
-)
-async def test_a_named_feed_the_deployment_cannot_serve_is_refused_before_any_call_or_token(
-    executor, budget, served, named
-):
-    """The reader serves the feed its handle resolved (tj-7zjov1.97) and refuses a differing named one.
-
-    Re-pointed from ALPACA_SIP_ENABLED to the reader's own feed: the reader reads no environment any more.
-    """
+async def test_a_named_feed_alpaca_cannot_serve_is_refused_before_any_call_or_token(executor, budget):
+    """RE-POINTED by tj-7zjov1.343: SIP and IEX are both served now, so NOT_APPLICABLE is the one refusal left."""
     client = stub_client(START)
+    named = Feed.NOT_APPLICABLE
 
-    error = failure_of(await reader(client, executor, feed=served).get_bars(query(feed=named)))
+    error = failure_of(await reader(client, executor).get_bars(query(feed=named)))
 
     assert type(error) is BrokerUnsupportedError
     assert isinstance(error, InvalidRequestError)
     assert error.reason is Reason.FEED_NOT_AVAILABLE
     assert REASONS[error.reason].outcome is Outcome.REFUSED
-    assert named.value in error.detail
+    assert error.detail == 'This broker cannot serve the requested feed: feed=NOT_APPLICABLE'
     assert dict(error.metadata) == {'feed': named.value}
     assert error.__cause__ is None
     assert client.sent == [], 'the vendor was called before the feed refusal'
@@ -221,25 +205,32 @@ async def test_a_named_feed_the_deployment_cannot_serve_is_refused_before_any_ca
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('named', [pytest.param(Feed.IEX, id='iex'), pytest.param(Feed.SIP, id='sip')])
-async def test_a_named_feed_the_deployment_serves_is_honoured_up_to_the_vendors_feed_parameter(executor, budget, named):
-    """Re-pointed by tj-7zjov1.97: the reader is built with the handle's feed, and a query naming it is served."""
+@pytest.mark.parametrize(
+    ('named', 'expected'),
+    [
+        pytest.param(None, Feed.SIP, id='unnamed-sip'),
+        pytest.param(Feed.SIP, Feed.SIP, id='sip'),
+        pytest.param(Feed.IEX, Feed.IEX, id='iex'),
+    ],
+)
+async def test_the_requests_feed_is_honoured_up_to_the_vendors_feed_parameter(executor, budget, named, expected):
+    """RE-POINTED by tj-7zjov1.343: one reader, any feed; each query is served on the feed it resolves to."""
     client = stub_client(START)
 
-    response = await reader(client, executor, feed=named).get_bars(query(feed=named))
+    response = await reader(client, executor).get_bars(query(feed=named))
 
     assert isinstance(response, BarsResponse)
-    assert response.feed is named
+    assert response.feed is expected
     [sent] = client.sent
-    assert sent.params['feed'] == DataFeed(named.value.lower()).value
+    assert sent.params['feed'] == DataFeed(expected.value.lower()).value
     assert len(budget.acquires) == 1
 
 
 @pytest.mark.asyncio
 async def test_a_feed_refusal_comes_before_the_credential_is_resolved(executor, budget):
     # No client injected and no credentials: the feed refusal still wins over VENDOR_AUTH.
-    with patch.dict(os.environ, {'ALPACA_SIP_ENABLED': 'false'}, clear=True):
-        error = failure_of(await reader(None, executor).get_bars(query(feed=Feed.SIP)))
+    with patch.dict(os.environ, {}, clear=True):
+        error = failure_of(await reader(None, executor).get_bars(query(feed=Feed.NOT_APPLICABLE)))
 
     assert error.reason is Reason.FEED_NOT_AVAILABLE
 
@@ -280,7 +271,7 @@ async def test_a_range_starting_at_or_after_the_readers_clock_is_refused_before_
 async def test_a_range_starting_just_before_the_clock_is_fetched_not_refused(executor, budget):
     client = stub_client()
 
-    response = await reader(client, executor).get_bars(query(start=NOW - MICROSECOND, end=None))
+    response = await reader(client, executor).get_bars(query(start=NOW - MICROSECOND, end=None, feed=Feed.IEX))
 
     assert isinstance(response, BarsResponse)
     assert len(client.sent) == 1
@@ -328,7 +319,9 @@ async def test_a_missing_credential_is_returned_as_vendor_auth_before_any_token(
 
 @pytest.mark.asyncio
 async def test_a_past_range_is_served_as_asked_with_as_of_from_the_readers_clock(executor, budget):
-    response = await reader(stub_client(START), executor).get_bars(query())
+    # IEX named: these as_of and open-end pins are for a feed with no recent-data edge (SIP's is in
+    # test_alpaca_sip_edge.py); SIP is the default since tj-7zjov1.342.
+    response = await reader(stub_client(START), executor).get_bars(query(feed=Feed.IEX))
 
     assert response.served_range == ServedRange(START, END)
     assert type(response.served_range) is ServedRange
@@ -338,7 +331,7 @@ async def test_a_past_range_is_served_as_asked_with_as_of_from_the_readers_clock
 
 @pytest.mark.asyncio
 async def test_an_open_end_is_served_up_to_as_of(executor, budget):
-    response = await reader(stub_client(START), executor).get_bars(query(end=None))
+    response = await reader(stub_client(START), executor).get_bars(query(end=None, feed=Feed.IEX))
 
     assert response.served_range == ServedRange(START, NOW)
     assert response.as_of == NOW
@@ -350,7 +343,7 @@ async def test_a_range_that_starts_in_the_past_and_ends_in_the_future_is_served_
     future_end = NOW + timedelta(days=3)
     client = stub_client(START)
 
-    response = await reader(client, executor).get_bars(query(end=future_end))
+    response = await reader(client, executor).get_bars(query(end=future_end, feed=Feed.IEX))
 
     assert isinstance(response, BarsResponse)
     assert response.served_range == ServedRange(START, NOW)
@@ -359,7 +352,7 @@ async def test_a_range_that_starts_in_the_past_and_ends_in_the_future_is_served_
 
 @pytest.mark.asyncio
 async def test_an_end_exactly_at_the_clock_is_kept(executor, budget):
-    response = await reader(stub_client(START), executor).get_bars(query(end=NOW))
+    response = await reader(stub_client(START), executor).get_bars(query(end=NOW, feed=Feed.IEX))
 
     assert response.served_range == ServedRange(START, NOW)
 
@@ -367,7 +360,7 @@ async def test_an_end_exactly_at_the_clock_is_kept(executor, budget):
 @pytest.mark.asyncio
 async def test_as_of_is_utc_whatever_offset_the_clock_answers_in(executor, budget):
     response = await reader(stub_client(START), executor, clock=lambda: NOW.astimezone(PLUS_FIVE)).get_bars(
-        query(end=None)
+        query(end=None, feed=Feed.IEX)
     )
 
     assert response.as_of == NOW
@@ -380,7 +373,9 @@ async def test_as_of_is_read_after_the_vendor_answered(executor, budget):
     # Two reads of the clock: the pre-check before the call, as_of after it.
     readings = iter([NOW - timedelta(seconds=5), NOW])
 
-    response = await reader(stub_client(START), executor, clock=lambda: next(readings)).get_bars(query(end=None))
+    response = await reader(stub_client(START), executor, clock=lambda: next(readings)).get_bars(
+        query(end=None, feed=Feed.IEX)
+    )
 
     assert response.as_of == NOW
     assert response.served_range.end == NOW

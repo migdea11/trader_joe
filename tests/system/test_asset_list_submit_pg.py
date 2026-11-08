@@ -225,6 +225,15 @@ def _asset_list_intake(request: SubmitRequest) -> Intake:
     return Intake(scope=TRADING_SCOPE, payload=AssetListWork(request=listing, priority=RequestPriority.BACKFILL))
 
 
+def _feed_never_asked(requested: Feed | None) -> Feed | None:
+    """The handle's feed policy. Only a bars Submit asks it (handle.py), and this path submits none.
+
+    Not alpaca/broker_api.resolve_feed: that module imports alpaca-py, which the test_client image does not install.
+    Raising rather than answering means a bars Submit reaching this handle is loud.
+    """
+    raise AssertionError(f'no bars Submit on the asset-list path; the feed policy was asked for {requested}')
+
+
 class Ingest:
     """One ingest process's asset-list path, assembled from production parts around a paced FakeRead."""
 
@@ -259,7 +268,7 @@ class Ingest:
             scheduler=self.scheduler,
             executor=executor,
             reader=self.reader,
-            feed=Feed.IEX,
+            feed_policy=_feed_never_asked,
         )
         self.handle.register_intake(RequestKind.ASSET_LIST, _asset_list_intake)
         self.submit = IngestSubmitHandler({SOURCE: self.handle}, instance_id)

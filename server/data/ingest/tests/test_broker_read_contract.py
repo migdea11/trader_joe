@@ -169,12 +169,16 @@ class Unsupported:
 
 
 def bars_query(symbol: str, granularity: Granularity, start: datetime, end: datetime | None) -> BarsQuery:
+    # IEX named: the contract's served-range rules are those of a feed with no recent-data edge (the SIP edge is
+    # Alpaca's own, pinned in test_alpaca_sip_edge.py), and the recorded answers are IEX. SIP is the default since
+    # tj-7zjov1.342, so the tape is named rather than left to it.
     return BarsQuery(
         instrument=Instrument(symbol, AssetType.STOCK),
         granularity=granularity,
         start=start,
         end=end,
         priority=RequestPriority.BACKFILL,
+        feed=Feed.IEX,
     )
 
 
@@ -433,9 +437,8 @@ def executor() -> Iterator[ThreadPoolExecutor]:
 
 
 @pytest.fixture(autouse=True)
-def iex_deployment(monkeypatch):
-    """Pin the deployment's tape, so the resolved feed is not read from the host: IEX for every subject."""
-    monkeypatch.delenv('ALPACA_SIP_ENABLED', raising=False)
+def no_deployment_feed(monkeypatch):
+    """Nothing to pin: no subject holds a feed or reads one from the host; each query names its own."""
 
 
 @pytest.fixture(params=SUBJECTS)
@@ -668,10 +671,11 @@ async def test_an_end_before_the_start_is_refused_as_the_callers_mistake(subject
 
 
 @pytest.mark.asyncio
-async def test_a_named_feed_the_deployment_cannot_serve_is_refused_before_any_vendor_work(subject):
+async def test_a_named_feed_the_broker_cannot_serve_is_refused_before_any_vendor_work(subject):
+    # RE-POINTED by tj-7zjov1.343: SIP and IEX are both served; NOT_APPLICABLE is the feed with no tape.
     arrangement = subject.watched()
 
-    error = await fail(arrangement, replace(arrangement.query, feed=Feed.SIP))
+    error = await fail(arrangement, replace(arrangement.query, feed=Feed.NOT_APPLICABLE))
 
     assert type(error) is BrokerUnsupportedError
     assert error.reason is Reason.FEED_NOT_AVAILABLE
@@ -680,7 +684,7 @@ async def test_a_named_feed_the_deployment_cannot_serve_is_refused_before_any_ve
 
 
 @pytest.mark.asyncio
-async def test_the_deployments_own_feed_named_is_served_after_vendor_work(subject):
+async def test_a_named_feed_the_broker_serves_is_served_after_vendor_work(subject):
     # The other side of the refusal above, on the same arrangement: so its zero is not vacuous.
     arrangement = subject.watched()
     query = replace(arrangement.query, feed=Feed.IEX)

@@ -225,7 +225,6 @@ def clean_process_state(monkeypatch) -> Iterator[None]:
     for name in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv('NO_PROXY', '127.0.0.1,localhost')
-    monkeypatch.delenv('ALPACA_SIP_ENABLED', raising=False)
     monkeypatch.delenv(KEY_VAR, raising=False)
     monkeypatch.delenv(SECRET_VAR, raising=False)
     broker_api.set_client(None)
@@ -709,7 +708,7 @@ async def test_the_executor_retries_to_the_budget_with_no_token_no_call_and_no_t
         .on_expired(lambda _expired: None)
         .build()
     )
-    reader = AlpacaRead(executor_provider=lambda: pool, scheduler=scheduler, scope=ALPACA_DATA_SCOPE, feed=Feed.IEX)
+    reader = AlpacaRead(executor_provider=lambda: pool, scheduler=scheduler, scope=ALPACA_DATA_SCOPE)
     executor = AckGatedExecutor(
         name='MALFORMED_TEST',
         scheduler=scheduler,

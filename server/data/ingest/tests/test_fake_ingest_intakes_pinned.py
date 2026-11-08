@@ -39,11 +39,12 @@ from tests.fakes.ingest import FakeIngest
 
 pytestmark = pytest.mark.data_ingest
 
-SIP_VAR = 'ALPACA_SIP_ENABLED'
 READY_BY = datetime(2026, 3, 2, tzinfo=UTC)
 
-FEEDS = pytest.mark.parametrize(
-    ('setting', 'feed'), [pytest.param('false', Feed.IEX, id='iex'), pytest.param('true', Feed.SIP, id='sip')]
+# The feed a bars request names. FakeIngest's handle must resolve every one as AlpacaHandle does (tj-7zjov1.343): the
+# feed is decided per request by broker_api.resolve_feed, SIP when none is named, IEX served, NOT_APPLICABLE refused.
+NAMED_FEEDS = pytest.mark.parametrize(
+    'named', [None, Feed.SIP, Feed.IEX, Feed.NOT_APPLICABLE], ids=['unnamed', 'sip', 'iex', 'not_applicable']
 )
 
 
@@ -115,13 +116,9 @@ def queued_by(handle: BrokerHandle) -> list[ScheduledRequest]:
     return queued
 
 
-def both(monkeypatch, setting: str, feed: Feed) -> tuple[BrokerHandle, BrokerHandle]:
-    """AlpacaHandle and FakeIngest's handle on the same account feed."""
-    monkeypatch.setenv(SIP_VAR, setting)
-    alpaca = AlpacaHandle(calls_per_minute=60)
-    fake = FakeIngest(NoStore(), feed=feed, calls_per_minute=60).handle
-    assert alpaca.feed is fake.feed is feed
-    return alpaca, fake
+def both() -> tuple[BrokerHandle, BrokerHandle]:
+    """AlpacaHandle and FakeIngest's handle. Neither holds a feed: each resolves the feed per bars request."""
+    return AlpacaHandle(calls_per_minute=60), FakeIngest(NoStore(), calls_per_minute=60).handle
 
 
 def queued_view(request: ScheduledRequest) -> dict:
@@ -143,10 +140,9 @@ def refusal_view(error: BaseException) -> dict:
 
 
 @pytest.mark.asyncio
-@FEEDS
 @ACCEPTED
-async def test_both_intakes_accept_and_queue_the_same_request_the_same_way(monkeypatch, setting, feed, body):
-    alpaca, fake = both(monkeypatch, setting, feed)
+async def test_both_intakes_accept_and_queue_the_same_request_the_same_way(body):
+    alpaca, fake = both()
     alpaca_queued, fake_queued = queued_by(alpaca), queued_by(fake)
     request = SubmitRequest(request_id='same', owner='world-manager', **body)
 
@@ -154,7 +150,7 @@ async def test_both_intakes_accept_and_queue_the_same_request_the_same_way(monke
     fake_ack = await fake.submit(request)
 
     assert fake_ack == alpaca_ack, 'FakeIngest acks this kind otherwise than AlpacaHandle'
-    # The no-tape rule, on both: a kind with no tape takes none of the account's feed.
+    # The no-tape rule, on both: a kind with no tape takes no feed.
     assert alpaca_ack.accepted is not None
     assert alpaca_ack.accepted.feed is None
     assert [queued_view(q) for q in fake_queued] == [queued_view(q) for q in alpaca_queued], (
@@ -165,12 +161,9 @@ async def test_both_intakes_accept_and_queue_the_same_request_the_same_way(monke
 
 
 @pytest.mark.asyncio
-@FEEDS
 @REFUSED_TYPES
-async def test_both_intakes_refuse_an_asset_list_that_is_not_stocks_alike_and_queue_nothing(
-    monkeypatch, setting, feed, asset_type
-):
-    alpaca, fake = both(monkeypatch, setting, feed)
+async def test_both_intakes_refuse_an_asset_list_that_is_not_stocks_alike_and_queue_nothing(asset_type):
+    alpaca, fake = both()
     alpaca_queued, fake_queued = queued_by(alpaca), queued_by(fake)
     request = SubmitRequest(request_id='not-stocks', owner='world-manager', asset_list=listing(asset_type))
 
@@ -232,10 +225,9 @@ def test_both_intakes_refuse_a_request_without_their_kinds_body_alike(alpaca_int
 
 
 @pytest.mark.asyncio
-@FEEDS
-async def test_both_handles_serve_the_same_request_kinds(monkeypatch, setting, feed):
+async def test_both_handles_serve_the_same_request_kinds():
     # A kind registered on one and not the other is a drift too: one answers, the other refuses it as not served.
-    alpaca, fake = both(monkeypatch, setting, feed)
+    alpaca, fake = both()
     for n, body in enumerate(
         ({'bars': BARS}, {'asset_list': listing(AssetType.STOCK)}, {'corporate_actions': ACTIONS})
     ):
@@ -243,3 +235,23 @@ async def test_both_handles_serve_the_same_request_kinds(monkeypatch, setting, f
         alpaca_ack = await alpaca.submit(request)
         fake_ack = await fake.submit(request)
         assert fake_ack == alpaca_ack, f'{request.kind.value}: {fake_ack!r} != {alpaca_ack!r}'
+
+
+@pytest.mark.asyncio
+@NAMED_FEEDS
+async def test_both_handles_resolve_a_bars_requests_feed_alike_and_queue_it_alike(named):
+    alpaca, fake = both()
+    alpaca_queued, fake_queued = queued_by(alpaca), queued_by(fake)
+    request = SubmitRequest(request_id='bars', owner='o', bars=BARS.model_copy(update={'feed': named}))
+
+    alpaca_ack = await alpaca.submit(request)
+    fake_ack = await fake.submit(request)
+
+    assert fake_ack == alpaca_ack, f'FakeIngest resolves feed={named} otherwise than AlpacaHandle'
+    assert [queued_view(q) for q in fake_queued] == [queued_view(q) for q in alpaca_queued]
+    expected = {None: Feed.SIP, Feed.SIP: Feed.SIP, Feed.IEX: Feed.IEX, Feed.NOT_APPLICABLE: None}[named]
+    if expected is None:
+        assert alpaca_ack.refused is not None and alpaca_queued == []
+    else:
+        assert alpaca_ack.accepted.feed is expected
+        assert [q.feed for q in alpaca_queued] == [expected]

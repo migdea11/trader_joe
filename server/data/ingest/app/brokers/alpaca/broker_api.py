@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
+from typing import Final
 
 from alpaca.common.constants import DEFAULT_RETRY_ATTEMPTS, DEFAULT_RETRY_WAIT_SECONDS
 from alpaca.common.exceptions import APIError
@@ -47,6 +48,10 @@ log = get_logger(__name__)
 # section 6 rules that bars are stored raw and immutable, with adjustment applied on read
 # against an events table that is not built yet. Do not "fix" this by passing an adjustment.
 ALPACA_ADJUSTMENT = 'raw'
+
+# The feed a bars request is served on when it names none (owner ruling 2026-11-06): the consolidated tape. A constant,
+# not a setting; IEX is served only when a request names it.
+ALPACA_DEFAULT_FEED: Final = Feed.SIP
 
 ALPACA_CREDENTIAL_VARS = ('ALPACA_API_KEY', 'ALPACA_API_SECRET')
 
@@ -132,37 +137,28 @@ def _remember_reset(scope: str, headers: Mapping[str, str] | None) -> None:
         __LAST_RESET[scope] = reset
 
 
-def sip_enabled() -> bool:
-    """Report whether the account's setting asks for the SIP feed rather than IEX.
+def resolve_feed(requested: Feed | None) -> Feed | None:
+    """Give the feed one bars request is served on: SIP unless the request names IEX.
 
-    Reads ALPACA_SIP_ENABLED. It is called once, when the Alpaca handle is built, and never per call or per request
-    (tj-7zjov1.97). Cast, because an unset variable and the string 'false' are both truthy without it, and the feed
-    is part of the request key rather than a log line.
+    The vendor rule lives here and nowhere else (owner ruling 2026-11-06, ADR tj-xn3qa6 addendum 3): no feed named
+    gives ALPACA_DEFAULT_FEED, SIP gives SIP, IEX gives IEX. There is no setting and no environment read; the default
+    is a constant. Pure, so the Submit intake and a direct get_bars call agree on the answer.
 
-    Returns:
-        bool: True when ALPACA_SIP_ENABLED is set to a true value; false when it is unset.
-    """
-    return get_env_var('ALPACA_SIP_ENABLED', default=False, cast_type=bool)
+    WHAT THIS RECORDS, SAID PLAINLY: the feed REQUESTED. Alpaca's bars response carries no feed field to read the
+    served tape back off (researcher-broker), so the feed is sent to the vendor explicitly on every call and recorded
+    as sent. A feed is never guessed.
 
-
-def resolve_feed() -> Feed:
-    """Give the default feed of the account the Alpaca handle is built for.
-
-    Called only by AlpacaHandle when it is built; its result is the handle's feed, and the handle is the single
-    resolution site (owner rulings, tj-7zjov1.91; tj-7zjov1.97). The handle decides per broker and per account; the
-    deployment-global flag is only today's input for the one Alpaca account. Neither AlpacaRead nor any caller
-    resolves a feed again, so the single-flight key, the vendor parameter and the stamped batch cannot drift apart.
-
-    WHAT THIS RECORDS, SAID PLAINLY: an assertion about the ACCOUNT ("which tape is it entitled to"), not an
-    observation of the response. Alpaca's bars response carries no feed field to read the served tape back off
-    (researcher-broker), so the feed is the one REQUESTED, sent to the vendor explicitly on every call. A lapsed or
-    misconfigured entitlement would make it wrong in a way nothing here can detect. Where a handle cannot know which
-    feed the vendor used, the feed requested is recorded and unspecified stays its own value: a feed is never guessed.
+    Args:
+        requested (Feed | None): The feed the request names, or None.
 
     Returns:
-        Feed: Feed.SIP when the account's setting asks for the consolidated tape, else Feed.IEX.
+        Feed | None: The feed to serve, or None for a feed Alpaca cannot serve (NOT_APPLICABLE).
     """
-    return Feed.SIP if sip_enabled() else Feed.IEX
+    if requested is None:
+        return ALPACA_DEFAULT_FEED
+    if requested in (Feed.SIP, Feed.IEX):
+        return requested
+    return None
 
 
 def _checked_credentials() -> tuple[str, str]:
@@ -685,7 +681,7 @@ async def fetch_data_type(
         params (dict): Vendor request parameters. Already carries this call's resolved
             `feed`, put there by AlpacaRead.get_bars so every vendor call asks for the same
             tape the key and the response record.
-        feed (Feed): This call's resolved tape (the handle's feed, handed to AlpacaRead at build), taken as a parameter
+        feed (Feed): This call's resolved tape (resolved per request by AlpacaRead.get_bars), taken as a parameter
             rather than re-read here so the key can never disagree with the response that
             AlpacaRead stamps from the same value.
         client (StockHistoricalDataClient | None): Client to call, or None for this
