@@ -483,7 +483,7 @@ class FakeRead:
         if query.feed is not None and query.feed != self.__feed:
             return BrokerUnsupportedError(
                 Reason.FEED_NOT_AVAILABLE,
-                f'This deployment cannot serve the requested feed: feed={query.feed.value}',
+                f'This account cannot serve the requested feed: feed={query.feed.value}',
                 metadata={'feed': query.feed.value},
             )
         now = self.__clock()

@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+from common.enums.data_stock import Feed
 from data.ingest.app.brokers.alpaca.handle import ALPACA_DATA_SCOPE
 from data.ingest.app.brokers.alpaca.read import AlpacaRead
 from data.ingest.app.brokers.rate_budget import RequestPriority
@@ -83,8 +84,12 @@ def alpaca_reader(
     scope: str = ALPACA_DATA_SCOPE,
     trading_client=None,
     trading_scope: str | None = None,
+    feed: Feed = Feed.IEX,
 ) -> AlpacaRead:
     """A real AlpacaRead paced by the given scheduler (a fresh RecordingScheduler when None).
+
+    The reader reads no environment for its feed (tj-7zjov1.97): the handle resolves it once, at build, and hands it
+    over. IEX by default, which is what the handle resolves with ALPACA_SIP_ENABLED unset.
 
     Args:
         client: The vendor client to inject, or None for the process's own.
@@ -96,6 +101,7 @@ def alpaca_reader(
         trading_scope (str | None): The trading-API scope the asset reads are charged to, or None for a reader
             that cannot read assets. A bars attempt looks its asset up after the bars (tj-7zjov1.128), so a test
             that runs a SUCCEEDED bars attempt through a real AlpacaRead needs both.
+        feed (Feed): The tape the reader serves, as the handle would hand it over.
 
     Returns:
         AlpacaRead: The reader.
@@ -111,6 +117,7 @@ def alpaca_reader(
         scope=scope,
         trading_client=trading_client,
         trading_scope=trading_scope,
+        feed=feed,
         **kwargs,
     )
 

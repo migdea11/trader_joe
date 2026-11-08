@@ -150,7 +150,11 @@ class AnsweringStore:
 
 
 class CountingTape:
-    """The deployment's tape resolver: always IEX, counting how often it is asked."""
+    """Stands in for broker_api.resolve_feed: always IEX, counting how often it is asked.
+
+    Since tj-7zjov1.97 the handle's feed is a value of its account, passed at construction: AlpacaHandle asks this
+    once, when it is built, and nothing asks it again, per request or per kind.
+    """
 
     def __init__(self) -> None:
         self.calls = 0
@@ -211,8 +215,12 @@ async def _no_expired_sink(_expired) -> None:
     raise AssertionError('no request should expire in this test')
 
 
-def bare_handle(tape: CountingTape | None = None) -> BrokerHandle:
-    """A bare production BrokerHandle (bars only, as built) over a real Scheduler with two scopes and a real executor."""
+def bare_handle(feed: Feed = Feed.IEX) -> BrokerHandle:
+    """A bare production BrokerHandle (bars only, as built) over a real Scheduler with two scopes and a real executor.
+
+    Args:
+        feed (Feed): The account's feed the handle is built with (tj-7zjov1.97).
+    """
     minute = timedelta(minutes=1)
     scheduler = (
         SchedulerBuilder()
@@ -234,12 +242,7 @@ def bare_handle(tape: CountingTape | None = None) -> BrokerHandle:
         on_finished=lambda request: holder['handle'].finished(request),
     )
     handle = BrokerHandle(
-        source=DataSource.ALPACA_API,
-        scope=BARE_SCOPE,
-        scheduler=scheduler,
-        executor=executor,
-        reader=Mock(),
-        resolve_feed=tape if tape is not None else CountingTape(),
+        source=DataSource.ALPACA_API, scope=BARE_SCOPE, scheduler=scheduler, executor=executor, reader=Mock(), feed=feed
     )
     holder['handle'] = handle
     return handle
@@ -259,7 +262,7 @@ def actions_intake(request: SubmitRequest) -> Intake:
 
 @pytest.fixture
 def tape(monkeypatch) -> CountingTape:
-    """The Alpaca deployment's tape, IEX, counted. AlpacaHandle binds broker_api.resolve_feed when it is built."""
+    """The Alpaca account's tape, IEX, counted. AlpacaHandle calls broker_api.resolve_feed once, when it is built."""
     counting = CountingTape()
     monkeypatch.setattr(broker_api, 'resolve_feed', counting)
     return counting
@@ -301,9 +304,9 @@ def test_alpaca_handle_defines_no_submit_active_or_finished_of_its_own():
 
 
 @pytest.mark.asyncio
-async def test_a_second_kind_registers_its_intake_on_a_bare_handle_and_is_queued_by_the_shared_submit():
-    tape = CountingTape()
-    watched = Watched(bare_handle(tape))
+@pytest.mark.parametrize('feed', [Feed.IEX, Feed.SIP], ids=['iex', 'sip'])
+async def test_a_second_kind_registers_its_intake_on_a_bare_handle_and_is_queued_by_the_shared_submit(feed):
+    watched = Watched(bare_handle(feed))
     handle = watched.handle
     handle.register_intake(RequestKind.CORPORATE_ACTIONS, actions_intake)
 
@@ -321,25 +324,24 @@ async def test_a_second_kind_registers_its_intake_on_a_bare_handle_and_is_queued
     assert queued.ready_by == datetime(2026, 12, 1, tzinfo=UTC)
     assert queued.client_label == 'label'
     assert queued.attempt_count == 0
-    assert queued.feed is None, 'the deployment tape was copied onto a kind whose intake gave none'
-    assert tape.calls == 0, 'the tape was resolved for a kind that has none'
+    assert queued.feed is None, "the handle's tape was copied onto a kind whose intake gave none"
 
 
 @pytest.mark.asyncio
-async def test_the_bare_handle_still_serves_bars_through_its_own_registered_intake():
-    tape = CountingTape()
-    watched = Watched(bare_handle(tape))
+@pytest.mark.parametrize('feed', [Feed.IEX, Feed.SIP], ids=['iex', 'sip'])
+async def test_the_bare_handle_still_serves_bars_through_its_own_registered_intake(feed):
+    watched = Watched(bare_handle(feed))
     handle = watched.handle
 
     ack = await handle.submit(bars_submit('b-1'))
 
-    assert ack == SubmitAck(accepted=SubmitAccepted(feed=Feed.IEX, quota_key=BARE_SCOPE))
+    assert handle.feed is feed
+    assert ack == SubmitAck(accepted=SubmitAccepted(feed=feed, quota_key=BARE_SCOPE))
     queued = await asyncio.wait_for(handle.scheduler.take(), GUARD_S)
     assert isinstance(queued.payload, BarsWork)
-    assert queued.payload.feed is Feed.IEX
-    assert queued.feed is Feed.IEX
+    assert queued.payload.feed is feed
+    assert queued.feed is feed
     assert queued.quota_scope == BARE_SCOPE
-    assert tape.calls == 1
 
 
 @pytest.mark.asyncio
@@ -420,14 +422,17 @@ async def test_the_alpaca_handle_has_every_kind_registered_so_corporate_actions_
     """FLIPPED by tj-7zjov1.23: it pinned corporate_actions as the Alpaca handle's unregistered kind.
 
     P13 registers it, so no kind is left unregistered on AlpacaHandle; the unregistered-kind refusal stays pinned
-    on the bare handle above. The registered intake is queued through the shared tail with no tape.
+    on the bare handle above. The registered intake is queued through the shared tail with no tape. The account's
+    feed was resolved once, when the handle was built (tj-7zjov1.97), and the no-tape kind asks for none.
     """
+    assert tape.calls == 1
     ack = await alpaca.handle.submit(actions_submit('ca-1'))
 
     assert ack == SubmitAck(accepted=SubmitAccepted(feed=None, quota_key=ALPACA_DATA_SCOPE))
     assert alpaca.order == [('queue', 'ca-1')]
     assert alpaca.handle.active == 1
-    assert tape.calls == 0, 'the tape was resolved for a kind that has none'
+    assert alpaca.queued[0].feed is None, "the handle's tape was copied onto a kind that has none"
+    assert tape.calls == 1, 'the tape was resolved again at submit'
 
 
 def bodiless(kind: RequestKind) -> SimpleNamespace:
@@ -468,7 +473,12 @@ async def test_a_kind_with_its_body_missing_raises_invalid_request_with_the_old_
 
 @pytest.mark.asyncio
 @EVERY_KIND
-async def test_the_tape_comes_from_the_kinds_intake_alone_and_is_resolved_at_most_once(alpaca, tape, kind):
+async def test_the_tape_comes_from_the_kinds_intake_alone_and_is_resolved_once_at_build(alpaca, tape, kind):
+    """RE-POINTED by tj-7zjov1.97: the account's feed is resolved once, when the handle is built, and never again.
+
+    It was resolved by the bars intake once per request; the handle now holds it as a value, for any kind or request.
+    """
+    assert tape.calls == 1, 'the handle did not resolve the account feed exactly once at build'
     ack = await alpaca.handle.submit(kind.submit('r-1'))
 
     assert ack == SubmitAck(accepted=SubmitAccepted(feed=kind.feed, quota_key=kind.scope))
@@ -476,8 +486,8 @@ async def test_the_tape_comes_from_the_kinds_intake_alone_and_is_resolved_at_mos
     assert queued.feed is kind.feed, 'the queued request carries a tape its kind did not give'
     assert queued.quota_scope == kind.scope
     assert isinstance(queued.payload, kind.work)
-    # Bars decide their tape once per request; a no-tape kind never asks for one.
-    assert tape.calls == (1 if kind.feed is not None else 0)
+    # The account's tape was resolved at build; no request, of any kind, resolves it again.
+    assert tape.calls == 1, 'the tape was resolved again at submit'
 
 
 @pytest.mark.asyncio

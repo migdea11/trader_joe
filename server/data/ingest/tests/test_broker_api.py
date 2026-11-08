@@ -62,7 +62,9 @@ def executor() -> Iterator[ThreadPoolExecutor]:
         yield pool
 
 
-def alpaca_reader(executor: ThreadPoolExecutor, client: StockHistoricalDataClient | None = None) -> AlpacaRead:
+def alpaca_reader(
+    executor: ThreadPoolExecutor, client: StockHistoricalDataClient | None = None, feed: Feed = Feed.IEX
+) -> AlpacaRead:
     """A real AlpacaRead over the given pool.
 
     Replaced install_alpaca() on tj-3mk3u5.32: the reader used to be installed in the ALPACA_API
@@ -73,6 +75,7 @@ def alpaca_reader(executor: ThreadPoolExecutor, client: StockHistoricalDataClien
     Args:
         executor (ThreadPoolExecutor): Pool the vendor call runs on.
         client (StockHistoricalDataClient | None): Client to inject, or None for production's own (broker_api.get_client()).
+        feed (Feed): The tape the Alpaca handle resolved for its account and hands the reader (tj-7zjov1.97).
 
     Since P11 (tj-7zjov1.20) the reader is paced by the Alpaca handle's scheduler, a required keyword; a
     scheduler that grants every call stands in for it, as nothing here is about pacing.
@@ -80,7 +83,7 @@ def alpaca_reader(executor: ThreadPoolExecutor, client: StockHistoricalDataClien
     Returns:
         AlpacaRead: The reader.
     """
-    return paced_reader(client, executor)
+    return paced_reader(client, executor, feed=feed)
 
 
 def build_query(request: StockDatasetRequest) -> BarsQuery:
@@ -230,11 +233,16 @@ async def test_an_injected_client_is_used_without_any_credentials(executor: Thre
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(('sip_enabled', 'expected'), [('false', Feed.IEX), ('true', Feed.SIP)], ids=['iex', 'sip'])
-async def test_the_feed_the_deployment_resolves_reaches_the_vendor_call(
-    sip_enabled: str, expected: Feed, executor: ThreadPoolExecutor
+@pytest.mark.parametrize(('expected', 'opposite'), [(Feed.IEX, 'true'), (Feed.SIP, 'false')], ids=['iex', 'sip'])
+async def test_the_feed_the_handle_resolves_reaches_the_vendor_call(
+    expected: Feed, opposite: str, executor: ThreadPoolExecutor
 ):
-    """The scope amendment on tj-vhboky.13: ALPACA_SIP_ENABLED decides the tape Alpaca is asked for.
+    """The scope amendment on tj-vhboky.13: the account's tape is the one Alpaca is asked for.
+
+    RE-POINTED A THIRD TIME by tj-7zjov1.97. ALPACA_SIP_ENABLED was read by AlpacaRead on each call; the Alpaca
+    handle now reads it once, at build, and hands the reader its feed. So the reader is BUILT with the feed here,
+    and the environment is set to the OPPOSITE tape while it serves, to show it reads none. The environment's half,
+    the variable deciding the handle's feed, is pinned in test_handle_feed.py.
 
     RE-POINTED TWICE. tj-irhy0a.7 moved it onto store_retrieve_stock over a real AlpacaRead, because
     that reached the vendor call and the batch stamp in one go. tj-3mk3u5.32 moved it onto get_bars,
@@ -258,19 +266,19 @@ async def test_the_feed_the_deployment_resolves_reaches_the_vendor_call(
     is how a vendor string ends up in a column typed by the shared enum.
 
     Args:
-        sip_enabled: The value of ALPACA_SIP_ENABLED for this case.
-        expected: The Feed the adapter must resolve from it.
+        expected: The Feed the reader is built with, as the handle hands it over.
+        opposite: A value of ALPACA_SIP_ENABLED naming the other tape, set while the reader serves.
         executor: Pool the vendor call runs on.
     """
     request = build_request()
     vendor = one_bar_vendor(request.asset_symbol)
-    reader = alpaca_reader(executor, vendor.client)
+    reader = alpaca_reader(executor, vendor.client, feed=expected)
 
-    with patch.dict(os.environ, {'ALPACA_SIP_ENABLED': sip_enabled}):
+    with patch.dict(os.environ, {'ALPACA_SIP_ENABLED': opposite}):
         response = await reader.get_bars(build_query(request))
         assert [bar async for bar in response.bars], 'the vendor served nothing, so no call was made to inspect'
 
-    assert response.feed is expected, 'the adapter resolved a tape the deployment did not configure'
+    assert response.feed is expected, 'the adapter served a tape other than the one the handle resolved'
     [sent] = vendor.sent
     assert sent.params['feed'] == DataFeed(expected.value.lower()).value
 
@@ -308,13 +316,14 @@ class KeyRecordingSingleFlight:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(('sip_enabled', 'expected'), [('false', 'iex'), ('true', 'sip')], ids=['iex', 'sip'])
+@pytest.mark.parametrize(('feed', 'expected'), [(Feed.IEX, 'iex'), (Feed.SIP, 'sip')], ids=['iex', 'sip'])
 async def test_the_resolved_feed_is_written_into_the_single_flight_key(
-    sip_enabled: str, expected: str, executor: ThreadPoolExecutor
+    feed: Feed, expected: str, executor: ThreadPoolExecutor
 ):
     """broker_api.fetch_data_type's key, the third leg of resolve_feed() and the one that was untested.
 
-    Re-pointed to AlpacaRead.get_bars, which resolves the feed once and hands it to fetch_data_type.
+    Re-pointed to AlpacaRead.get_bars, which hands the feed it was built with to fetch_data_type. Since
+    tj-7zjov1.97 that feed is the handle's, resolved once at build, so the reader is built with it here.
 
     The other two legs -- the vendor call and the batch stamp -- are asserted above. This one is
     the single-flight key, and it fails DIFFERENTLY from both: the tape reaching the vendor and the
@@ -330,12 +339,9 @@ async def test_the_resolved_feed_is_written_into_the_single_flight_key(
     request = build_request()
     vendor = one_bar_vendor(request.asset_symbol)
     recorder = KeyRecordingSingleFlight(getattr(broker_api, '__SINGLE_FLIGHT'))
-    reader = alpaca_reader(executor, vendor.client)
+    reader = alpaca_reader(executor, vendor.client, feed=feed)
 
-    with (
-        patch.object(broker_api, '__SINGLE_FLIGHT', recorder),
-        patch.dict(os.environ, {'ALPACA_SIP_ENABLED': sip_enabled}),
-    ):
+    with patch.object(broker_api, '__SINGLE_FLIGHT', recorder):
         await reader.get_bars(build_query(request))
 
     assert len(recorder.keys) == 1, 'the adapter did not go through the single flight at all'
@@ -354,17 +360,18 @@ async def test_two_tapes_do_not_share_one_single_flight_key(executor: ThreadPool
 
     Everything except the tape is held constant: same symbol, same granularity, same range, same
     adjustment. So if these keys are equal, feed is missing from the key.
+
+    Since tj-7zjov1.97 a reader serves the one feed its handle resolved, so the two tapes are two readers, one per
+    account feed, over the same vendor client and the same process-wide single flight.
     """
     request = build_request()
     # One answer per tape: each request below reaches the vendor once.
     vendor = stub_vendor(*(bars_answer({request.asset_symbol: [wire_bar(START)]}) for _ in range(2)))
     recorder = KeyRecordingSingleFlight(getattr(broker_api, '__SINGLE_FLIGHT'))
-    reader = alpaca_reader(executor, vendor.client)
 
     with patch.object(broker_api, '__SINGLE_FLIGHT', recorder):
-        for sip_enabled in ('false', 'true'):
-            with patch.dict(os.environ, {'ALPACA_SIP_ENABLED': sip_enabled}):
-                await reader.get_bars(build_query(request))
+        for feed in (Feed.IEX, Feed.SIP):
+            await alpaca_reader(executor, vendor.client, feed=feed).get_bars(build_query(request))
 
     iex_key, sip_key = recorder.keys
     assert iex_key != sip_key, 'an IEX request and a SIP request collapse onto one vendor call'

@@ -196,7 +196,7 @@ def make_handle(scope: str, clock: FakeClock, sleep: TickSleep) -> BrokerHandle:
         scheduler=scheduler,
         executor=executor,
         reader=Mock(name='reader, never read here'),
-        resolve_feed=lambda: Feed.IEX,
+        feed=Feed.IEX,
     )
 
 

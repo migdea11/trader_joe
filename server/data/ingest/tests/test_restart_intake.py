@@ -235,7 +235,7 @@ class Intake:
             scheduler=self.scheduler,
             executor=self.executor,
             reader=Mock(),
-            resolve_feed=lambda: tape,
+            feed=tape,
         )
 
     def __finished(self, request: ScheduledRequest) -> None:

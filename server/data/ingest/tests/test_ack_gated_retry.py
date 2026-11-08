@@ -526,7 +526,7 @@ async def test_a_request_entering_at_or_past_the_budget_gets_no_vendor_attempt_t
             scheduler=rig.scheduler,
             executor=rig.executor,
             reader=Mock(),
-            resolve_feed=lambda: Feed.IEX,
+            feed=Feed.IEX,
         )
         ack = await handle.submit(submit_request('r1', attempt_count=attempt_count, recovered=True))
         only = await rig.store.next()
@@ -831,7 +831,8 @@ async def test_a_retry_re_entering_the_queue_keeps_its_feed_and_its_expiry_names
 async def test_a_bars_request_expiring_after_submit_names_the_feed_of_its_ack(tape, named):
     """Through BrokerHandle.submit: the EXPIRED report names the same tape as the Submit ack.
 
-    The tape is the deployment's (resolve_feed), whether the request named it or left it to the default.
+    The tape is the handle's, the account's feed passed at construction (tj-7zjov1.97), whether the request named
+    it or left it to the default.
     """
     runner = FakeRunner(succeeded())
     async with Rig(runner) as rig:
@@ -841,7 +842,7 @@ async def test_a_bars_request_expiring_after_submit_names_the_feed_of_its_ack(ta
             scheduler=rig.scheduler,
             executor=rig.executor,
             reader=Mock(),
-            resolve_feed=lambda: tape,
+            feed=tape,
         )
         bars = bars_request(feed=tape) if named else bars_request()
         ack = await handle.submit(submit_request('r1', bars=bars, ready_by=T0 - timedelta(seconds=1)))

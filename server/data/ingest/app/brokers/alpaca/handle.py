@@ -14,6 +14,10 @@ CONFIGURATION may only LOWER what is hard-coded here (limits.py): ALPACA_RATE_LI
 ALPACA_OUTGOING_BUFFER_SIZE, ALPACA_STALL_TIMEOUT_S and ALPACA_MAX_ATTEMPTS set the executor's buffer, its alarm and
 its retry budget. Each is read when the handle is built and falls back to the default below.
 
+THE FEED. The handle decides the default feed, per broker and per account (owner rulings, tj-7zjov1.91). One Alpaca
+account per deployment today, so the handle reads ALPACA_SIP_ENABLED once, when it is built, as that account's setting
+(default false, IEX) and hands the resulting feed to its reader. Nothing reads the variable again.
+
 CREDENTIALS. The credential provider reads ALPACA_API_KEY and ALPACA_API_SECRET when it is asked, never at import, so
 the module stays importable without them (CLAUDE.md pitfall 1). The vendor client still takes its key from
 broker_api.get_client(); the provider is the seam the account mapping replaces.
@@ -188,7 +192,9 @@ class AlpacaHandle(BrokerHandle):
             .on_expired(self.report_expired)
             .build()
         )
-        reader = AlpacaRead(scheduler=scheduler, scope=ALPACA_DATA_SCOPE, trading_scope=ALPACA_TRADING_SCOPE)
+        # Read once, here: the account's setting, and the only read of it.
+        feed = broker_api.resolve_feed()
+        reader = AlpacaRead(scheduler=scheduler, scope=ALPACA_DATA_SCOPE, trading_scope=ALPACA_TRADING_SCOPE, feed=feed)
         executor = AckGatedExecutor(
             name=ALPACA_DATA_SCOPE,
             scheduler=scheduler,
@@ -204,7 +210,7 @@ class AlpacaHandle(BrokerHandle):
             scheduler=scheduler,
             executor=executor,
             reader=reader,
-            resolve_feed=broker_api.resolve_feed,
+            feed=feed,
         )
         self.register_intake(RequestKind.ASSET_LIST, self.__asset_list_intake)
         self.register_intake(RequestKind.CORPORATE_ACTIONS, self.__corporate_actions_intake)

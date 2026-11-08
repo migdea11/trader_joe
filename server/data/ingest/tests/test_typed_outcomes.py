@@ -158,9 +158,14 @@ def executor() -> Iterator[ThreadPoolExecutor]:
         yield pool
 
 
-def reader(vendor: StubVendor | None, executor: ThreadPoolExecutor, clock=lambda: NOW, scheduler=None) -> AlpacaRead:
+def reader(
+    vendor: StubVendor | None, executor: ThreadPoolExecutor, clock=lambda: NOW, scheduler=None, feed: Feed = Feed.IEX
+) -> AlpacaRead:
+    """A real AlpacaRead built with the handle's feed (tj-7zjov1.97), IEX unless a test says otherwise."""
     client = vendor.client if vendor is not None else None
-    return alpaca_reader(client, executor, clock, scheduler=scheduler if scheduler is not None else PACING['scheduler'])
+    return alpaca_reader(
+        client, executor, clock, scheduler=scheduler if scheduler is not None else PACING['scheduler'], feed=feed
+    )
 
 
 def query(**overrides) -> BarsQuery:
@@ -186,20 +191,23 @@ def failure_of(outcome: BarsResponse | BarsFailure) -> TraderJoeError:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ('sip_enabled', 'named'),
+    ('served', 'named'),
     [
-        pytest.param('false', Feed.SIP, id='sip-on-an-iex-deployment'),
-        pytest.param('true', Feed.IEX, id='iex-on-a-sip-deployment'),
-        pytest.param('false', Feed.NOT_APPLICABLE, id='not-applicable'),
+        pytest.param(Feed.IEX, Feed.SIP, id='sip-on-an-iex-deployment'),
+        pytest.param(Feed.SIP, Feed.IEX, id='iex-on-a-sip-deployment'),
+        pytest.param(Feed.IEX, Feed.NOT_APPLICABLE, id='not-applicable'),
     ],
 )
 async def test_a_named_feed_the_deployment_cannot_serve_is_refused_before_any_call_or_token(
-    monkeypatch, executor, budget, sip_enabled, named
+    executor, budget, served, named
 ):
-    monkeypatch.setenv('ALPACA_SIP_ENABLED', sip_enabled)
+    """The reader serves the feed its handle resolved (tj-7zjov1.97) and refuses a differing named one.
+
+    Re-pointed from ALPACA_SIP_ENABLED to the reader's own feed: the reader reads no environment any more.
+    """
     client = stub_client(START)
 
-    error = failure_of(await reader(client, executor).get_bars(query(feed=named)))
+    error = failure_of(await reader(client, executor, feed=served).get_bars(query(feed=named)))
 
     assert type(error) is BrokerUnsupportedError
     assert isinstance(error, InvalidRequestError)
@@ -213,16 +221,12 @@ async def test_a_named_feed_the_deployment_cannot_serve_is_refused_before_any_ca
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ('sip_enabled', 'named'), [pytest.param('false', Feed.IEX, id='iex'), pytest.param('true', Feed.SIP, id='sip')]
-)
-async def test_a_named_feed_the_deployment_serves_is_honoured_up_to_the_vendors_feed_parameter(
-    monkeypatch, executor, budget, sip_enabled, named
-):
-    monkeypatch.setenv('ALPACA_SIP_ENABLED', sip_enabled)
+@pytest.mark.parametrize('named', [pytest.param(Feed.IEX, id='iex'), pytest.param(Feed.SIP, id='sip')])
+async def test_a_named_feed_the_deployment_serves_is_honoured_up_to_the_vendors_feed_parameter(executor, budget, named):
+    """Re-pointed by tj-7zjov1.97: the reader is built with the handle's feed, and a query naming it is served."""
     client = stub_client(START)
 
-    response = await reader(client, executor).get_bars(query(feed=named))
+    response = await reader(client, executor, feed=named).get_bars(query(feed=named))
 
     assert isinstance(response, BarsResponse)
     assert response.feed is named

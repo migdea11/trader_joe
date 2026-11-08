@@ -30,6 +30,7 @@ import pytest
 import requests
 from alpaca.common.exceptions import APIError
 
+from common.enums.data_stock import Feed
 from common.errors.vocabulary import InvalidRequestError, Reason
 from data.ingest.app.brokers.alpaca import broker_api
 from data.ingest.app.brokers.alpaca.classify import RATE_LIMIT_RESET_HEADER
@@ -459,6 +460,7 @@ def reader(executor, client=None, *, scheduler=None, trading_client=None, clock=
         trading_client=trading_client,
         corporate_actions_client=client,
         trading_scope=ALPACA_TRADING_SCOPE,
+        feed=Feed.IEX,
     )
 
 

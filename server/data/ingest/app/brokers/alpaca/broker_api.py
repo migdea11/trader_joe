@@ -62,7 +62,9 @@ CORPORATE_ACTIONS_PATH = '/corporate-actions'
 BARS_PAGE_SIZE = 10_000
 
 # The page count past which a bars read is refused as a vendor that never ends. The longest legitimate read is one
-# symbol at 1Min over the full SIP history (about a million rows, roughly 100 pages); this leaves tenfold headroom.
+# liquid symbol at 1Min over the full SIP history since 2016, extended hours included (up to 960 bars a day, about
+# 2.6 million rows, roughly 260 pages at 10,000 rows per page), growing about 24 pages a year; 1000 leaves nearly
+# fourfold headroom.
 BARS_MAX_PAGES = 1000
 
 # The most records one page of a corporate-actions call returns (the vendor's limit parameter caps at 1000), and the page
@@ -131,44 +133,34 @@ def _remember_reset(scope: str, headers: Mapping[str, str] | None) -> None:
 
 
 def sip_enabled() -> bool:
-    """Report whether this process is configured for the SIP feed rather than IEX.
+    """Report whether the account's setting asks for the SIP feed rather than IEX.
 
-    Read on each call rather than at import, for the same reason the client is built
-    lazily. Cast, because an unset variable and the string 'false' are both truthy
-    without it, and the feed is part of the request key rather than a log line.
+    Reads ALPACA_SIP_ENABLED. It is called once, when the Alpaca handle is built, and never per call or per request
+    (tj-7zjov1.97). Cast, because an unset variable and the string 'false' are both truthy without it, and the feed
+    is part of the request key rather than a log line.
 
     Returns:
-        bool: True when ALPACA_SIP_ENABLED is set to a true value.
+        bool: True when ALPACA_SIP_ENABLED is set to a true value; false when it is unset.
     """
     return get_env_var('ALPACA_SIP_ENABLED', default=False, cast_type=bool)
 
 
 def resolve_feed() -> Feed:
-    """Resolve the tape this deployment is entitled to, once, for a whole fetch.
+    """Give the default feed of the account the Alpaca handle is built for.
 
-    THE SINGLE RESOLUTION SITE (tj-rh4b7f, 2026-09-25 ruling; tj-vhboky.9 part B). Both the
-    single-flight request key and the batch stamped onto every bar must agree, so this is the
-    only place ALPACA_SIP_ENABLED is read for that purpose -- callers take the return value
-    rather than re-deriving it, which is what stops the key and the batch silently drifting
-    apart.
+    Called only by AlpacaHandle when it is built; its result is the handle's feed, and the handle is the single
+    resolution site (owner rulings, tj-7zjov1.91; tj-7zjov1.97). The handle decides per broker and per account; the
+    deployment-global flag is only today's input for the one Alpaca account. Neither AlpacaRead nor any caller
+    resolves a feed again, so the single-flight key, the vendor parameter and the stamped batch cannot drift apart.
 
-    WHAT THIS RECORDS, SAID PLAINLY RATHER THAN PAPERED OVER: this is an assertion about the
-    ACCOUNT ("which tape is this deployment entitled to"), not an observation of the response
-    ("which tape actually served this call"). A CALLER MAY NAME A FEED (BarsQuery.feed, live at
-    the adapter since PR 2's typed errors), but AlpacaRead serves a named feed only if it IS
-    the tape this returns, and otherwise answers FEED_NOT_AVAILABLE before any vendor call. So
-    the deployment, never the caller, decides the tape. Alpaca's bars response carries no feed
-    field at any level to read the served tape back off of (researcher-broker, confirmed on two
-    independent reads) -- so there is no vendor confirmation to fall back to even if there were
-    a caller selection to try first. The value below is passed to the vendor call as its own
-    `feed` parameter (AlpacaRead.get_bars), which is the best available assurance that the
-    entitled tape and the requested tape are the same one; it is still not proof that the tape
-    which answered matches, since a lapsed or misconfigured entitlement would make this value
-    wrong in a way nothing here can detect.
+    WHAT THIS RECORDS, SAID PLAINLY: an assertion about the ACCOUNT ("which tape is it entitled to"), not an
+    observation of the response. Alpaca's bars response carries no feed field to read the served tape back off
+    (researcher-broker), so the feed is the one REQUESTED, sent to the vendor explicitly on every call. A lapsed or
+    misconfigured entitlement would make it wrong in a way nothing here can detect. Where a handle cannot know which
+    feed the vendor used, the feed requested is recorded and unspecified stays its own value: a feed is never guessed.
 
     Returns:
-        Feed: Feed.SIP when this deployment is entitled to the consolidated tape,
-            else Feed.IEX.
+        Feed: Feed.SIP when the account's setting asks for the consolidated tape, else Feed.IEX.
     """
     return Feed.SIP if sip_enabled() else Feed.IEX
 
@@ -691,7 +683,7 @@ async def fetch_data_type(
         params (dict): Vendor request parameters. Already carries this call's resolved
             `feed`, put there by AlpacaRead.get_bars so every vendor call asks for the same
             tape the key and the response record.
-        feed (Feed): This call's resolved tape (resolve_feed()), taken as a parameter
+        feed (Feed): This call's resolved tape (the handle's feed, handed to AlpacaRead at build), taken as a parameter
             rather than re-read here so the key can never disagree with the response that
             AlpacaRead stamps from the same value.
         client (StockHistoricalDataClient | None): Client to call, or None for this

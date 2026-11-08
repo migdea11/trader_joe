@@ -496,7 +496,7 @@ async def test_the_feed_refusal_is_raised_before_the_first_event_is_yielded():
     error_id, which is the honest answer to a handler bug and a terrible answer to an unservable feed.
     """
     refusal = BrokerUnsupportedError(
-        Reason.FEED_NOT_AVAILABLE, 'This deployment cannot serve the requested feed: feed=sip'
+        Reason.FEED_NOT_AVAILABLE, 'This account cannot serve the requested feed: feed=sip'
     )
     reader = ScriptedRead(failure=refusal)
     handler = IngestFetchHandler({DataSource.ALPACA_API: reader})

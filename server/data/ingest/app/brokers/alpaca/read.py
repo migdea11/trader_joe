@@ -12,6 +12,7 @@ from alpaca.data.models.bars import BarSet
 from alpaca.trading.client import TradingClient
 
 from common.enums.data_select import AssetType, DataType
+from common.enums.data_stock import Feed
 from common.errors.vocabulary import InvalidRequestError, Reason, TraderJoeError
 from common.logging import get_logger
 from common.worker_pool import SharedWorkerPool
@@ -88,6 +89,8 @@ class AlpacaRead:
             (broker_api.get_trading_client()), resolved on each call so it stays lazy.
         corporate_actions_client (CorporateActionsClient | None): Client for the corporate-actions read, or None to use
             this process's own (broker_api.get_corporate_actions_client()), resolved on each call so it stays lazy.
+        feed (Feed): The tape the Alpaca handle resolved for its account (tj-7zjov1.91). This reader reads no
+            environment for it: it serves this feed and refuses a named one that differs (FEED_NOT_AVAILABLE).
         trading_scope (str | None): The trading-API quota scope the asset reads are charged to, apart from `scope`
             so they never count against the data API. None for a reader built without asset reads; calling one then
             is a bug and raises.
@@ -104,7 +107,9 @@ class AlpacaRead:
         trading_client: TradingClient | None = None,
         corporate_actions_client: CorporateActionsClient | None = None,
         trading_scope: str | None = None,
+        feed: Feed,
     ) -> None:
+        self.__feed = feed
         self.__scheduler = scheduler
         self.__scope = scope
         self.__trading_client = trading_client
@@ -128,10 +133,10 @@ class AlpacaRead:
             query (BarsQuery): What to fetch.
 
         Returns:
-            BarsResponse | BarsFailure: The feed this deployment is entitled to, the converted
+            BarsResponse | BarsFailure: The feed of the account the handle resolved, the converted
                 bars and the range they answer for, or the failure: UNSUPPORTED_ASSET_TYPE or
                 UNSUPPORTED_INSTRUMENT (BrokerUnsupportedError) for an instrument or adjustment
-                Alpaca cannot serve, FEED_NOT_AVAILABLE for a feed this deployment cannot,
+                Alpaca cannot serve, FEED_NOT_AVAILABLE for a feed this account cannot,
                 RANGE_IN_FUTURE for a start at or after the clock, VENDOR_AUTH for a missing
                 or malformed credential or a 401 or 403, VENDOR_INVALID_REQUEST for a 400, VENDOR_REJECTED for
                 another 4xx, VENDOR_RATE_LIMITED for a 429, VENDOR_UNAVAILABLE for a 5xx, a
@@ -169,15 +174,13 @@ class AlpacaRead:
                 Reason.UNSUPPORTED_INSTRUMENT, f'Alpaca serves {ALPACA_CURRENCY} only: currency={instrument.currency!r}'
             )
 
-        # Resolved once for the whole fetch and threaded through explicitly (fetch_data_type's
-        # key, the vendor params below, and the response returned at the end) rather than
-        # re-read from sip_enabled() at each site (tj-vhboky.9). One deployment has exactly one
-        # active tape at a time (tj-rh4b7f), so it can serve a named feed only if that is the one.
-        feed = broker_api.resolve_feed()
+        # The handle's feed, resolved once for the account (tj-7zjov1.97): this reader decides nothing. It is threaded
+        # through explicitly (fetch_data_type's key, the vendor params below, and the response returned at the end).
+        feed = self.__feed
         if query.feed is not None and query.feed != feed:
             return self.__refuse(
                 Reason.FEED_NOT_AVAILABLE,
-                f'This deployment cannot serve the requested feed: feed={query.feed.value}',
+                f'This account cannot serve the requested feed: feed={query.feed.value}',
                 metadata={'feed': query.feed.value},
             )
 

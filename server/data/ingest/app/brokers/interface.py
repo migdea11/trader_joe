@@ -43,7 +43,7 @@ class BrokerUnsupportedError(InvalidRequestError):
     PR (decision tj-j4wknb addendum 4 item 8). A reader RETURNS it inside a BarsFailure.
 
     It carries UNSUPPORTED_INSTRUMENT (a currency, exchange or adjustment the broker cannot serve),
-    UNSUPPORTED_ASSET_TYPE (not a stock) or FEED_NOT_AVAILABLE (a feed this deployment cannot serve). The
+    UNSUPPORTED_ASSET_TYPE (not a stock) or FEED_NOT_AVAILABLE (a feed this account cannot serve). The
     detail names the field and the value that could not be served.
 
     Args:
@@ -144,8 +144,8 @@ class BarsQuery:
         adjustment (str): Price adjustment. Only 'raw' today: bars are stored raw and adjusted
             on read (tj-vhboky.1 section 6).
         priority (RequestPriority): The platform's fetch priority; the adapter's rate budget uses it.
-        feed (Feed | None): The tape the caller names, or None to leave it to the deployment. A reader
-            serves a named feed only if its deployment can, and otherwise refuses before any vendor
+        feed (Feed | None): The tape the caller names, or None to leave it to the account. A reader
+            serves a named feed only if its account can, and otherwise refuses before any vendor
             call (FEED_NOT_AVAILABLE).
         deadline (datetime | None): When the caller stops waiting, timezone aware, or None for no
             bound. A rate budget that cannot admit the call before it fails fast (RATE_BUDGET)

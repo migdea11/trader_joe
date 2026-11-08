@@ -709,7 +709,7 @@ async def test_the_executor_retries_to_the_budget_with_no_token_no_call_and_no_t
         .on_expired(lambda _expired: None)
         .build()
     )
-    reader = AlpacaRead(executor_provider=lambda: pool, scheduler=scheduler, scope=ALPACA_DATA_SCOPE)
+    reader = AlpacaRead(executor_provider=lambda: pool, scheduler=scheduler, scope=ALPACA_DATA_SCOPE, feed=Feed.IEX)
     executor = AckGatedExecutor(
         name='MALFORMED_TEST',
         scheduler=scheduler,

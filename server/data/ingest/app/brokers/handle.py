@@ -71,7 +71,7 @@ class BrokerHandle:
         scheduler: Scheduler,
         executor: AckGatedExecutor,
         reader: BrokerRead,
-        resolve_feed: Callable[[], Feed],
+        feed: Feed,
     ) -> None:
         """Bind a handle to the parts its broker built.
 
@@ -81,14 +81,17 @@ class BrokerHandle:
             scheduler (Scheduler): The handle's scheduler.
             executor (AckGatedExecutor): The handle's executor, over the same scheduler.
             reader (BrokerRead): What FetchDataset reads through, and what the executor's runner reads.
-            resolve_feed (Callable[[], Feed]): The tape this deployment is entitled to, decided once per request.
+            feed (Feed): The default tape of the account this handle is built for, a value of the account passed at
+                construction (owner rulings, tj-7zjov1.91). The handle is the one place a feed is resolved: every
+                bars request is served on this feed and a request naming another is refused. One handle, one account,
+                one feed (ADR tj-xn3qa6 addendum 1): never resolved per request or per granularity.
         """
         self.__source = source
         self.__scope = scope
         self.__scheduler = scheduler
         self.__executor = executor
         self.__reader = reader
-        self.__resolve_feed = resolve_feed
+        self.__feed = feed
         self.__active: set[str] = set()
         self.__intakes: dict[RequestKind, Callable[[SubmitRequest], Intake | SubmitAck]] = {}
         self.register_intake(RequestKind.BARS, self.__bars_intake)
@@ -97,6 +100,11 @@ class BrokerHandle:
     def source(self) -> DataSource:
         """DataSource: The source this handle serves."""
         return self.__source
+
+    @property
+    def feed(self) -> Feed:
+        """Feed: The default tape of the account this handle serves; the one feed every bars request is served on."""
+        return self.__feed
 
     @property
     def reader(self) -> BrokerRead:
@@ -213,17 +221,23 @@ class BrokerHandle:
         return accepted
 
     def __bars_intake(self, request: SubmitRequest) -> Intake | SubmitAck:
-        """The bars kind's intake: resolve the feed, refuse one this deployment cannot serve, charge the data scope."""
+        """The bars kind's intake: serve the account's feed, refuse a named one it cannot serve, charge the data scope.
+
+        The feed is resolved once, when AlpacaHandle is built (broker_api.resolve_feed in AlpacaHandle.__init__); this
+        intake serves the stored value and refuses a differing named feed (tj-7zjov1.97, owner rulings of
+        tj-7zjov1.91). The feed is sent to the vendor explicitly, so the feed requested is known and recorded; no
+        request goes out without one, and a feed is never guessed for one that did.
+        """
         if request.bars is None:
             raise _not_served(request.kind)
         bars = request.bars
-        feed = self.__resolve_feed()
+        feed = self.__feed
         if bars.feed is not None and bars.feed != feed:
             return SubmitAck(
                 refused=FetchRefused(
                     reason=Reason.FEED_NOT_AVAILABLE.value,
                     domain=ERROR_DOMAIN,
-                    detail=f'This deployment cannot serve the requested feed: feed={bars.feed.value}',
+                    detail=f'This account cannot serve the requested feed: feed={bars.feed.value}',
                     metadata={'feed': bars.feed.value},
                 )
             )
