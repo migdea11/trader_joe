@@ -20,7 +20,7 @@ For each enabled panel of each source that has a trading calendar, a failure end
 A tick runs, for each enabled panel, either:
 
 - a **membership pass**, when one is due (below). It reads the newest active asset-list snapshot, applies the panel's
-  filters, keeps every asset that passes (a panel has no size and no cut; the order is symbol, then vendor asset id), and records what happened to each member as ledger
+  filters (allow and deny lists, asset class, exchange, active, tradable, and Include OTC Securities), keeps every asset that passes (a panel has no size and no cut; the order is symbol, then vendor asset id), and records what happened to each member as ledger
   transitions: `ENTERED`, `EXITED`, `DRAINING`, `DRAINED`, `REFUSED`, and for a member it creates, `CREATED` (or
   `DEFERRED` when a rate window is full); or
 - a **release pass**, between membership passes: it creates the members whose latest transition is `DEFERRED` while
@@ -109,11 +109,18 @@ Rules that decide a create (all refusals are `INVALID_REQUEST`, 422, with the st
   version 1 first while this one saw no version: save the settings through the source's own write instead. If the
   manager ever meets a panel whose source has no settings (a guard; a create always writes them) it logs once
   `Panel <id> is not runnable: source <source> has no settings` and skips it.
+- **Include OTC Securities** (`include_otc`, a boolean, off by default; an absent value on the wire is false). With it
+  off, an asset whose exchange is exactly `OTC` is not selected by the panel. It is off because the current
+  market-data feed (SIP, the consolidated tape of US exchanges) carries no bars for OTC securities, so an OTC asset
+  would get a dataset that can never fill. Off together with the exchange filter set to `OTC` is refused (422,
+  nothing written), on create and on save, because it would select nothing.
 - **Pausing a panel is `enabled` false** (a new version). It stops that panel's passes only (no new creations, no exits, no releases): its members stay as
   recorded and their datasets keep collecting through the daily refresh. Stopping the datasets too is a backlog item
   ("Panel: disabling a panel should pause its members' datasets"), not built. To empty a panel, change its filters so
   they select nothing: every member then exits and its dataset is stopped, unless another enabled panel on the source
   still selects it.
+- **The forms** carry the checkbox "Include OTC Securities" with the hint "Off by default. The current market-data
+  feed has no bars for OTC securities."
 - **The web create form** validates on click: nothing is marked until Create Panel has been pressed once, then every
   empty or invalid field is marked at once and the marks follow the fields. A name and a source are the only required
   fields. Ramp and cap are shown only while the source has no settings version and are both optional, with the
@@ -122,7 +129,13 @@ Rules that decide a create (all refusals are `INVALID_REQUEST`, 422, with the st
 - Creates are serialised by name (a transaction-scoped advisory lock), so the loser of two concurrent creates of one
   name is refused as a duplicate; source settings are judged under a lock on the source.
 - Effective-from has no column: a version takes effect at the `started_at` of the first non-dry-run pass of that panel
-  that names it.
+  that names it. A new settings version therefore takes effect at the panel's next membership pass, which comes by its
+  cadence, not at once; a pass that is running keeps the settings version it started with.
+- **Turning Include OTC Securities off on a running panel.** Nothing changes when the version is saved. At the next
+  membership pass the OTC members are no longer selected, so each goes `EXITED` and its dataset is stopped
+  (`stopped_cause` `PANEL_MEMBER_LEFT`), unless another enabled panel on the source still selects the symbol. The
+  stopped datasets show as Stopped and keep their bars. Turning it on again re-enters those members at a later pass
+  and restarts a dataset the manager stopped (see Exits and re-entry).
 
 **The writes need the instance secret.** All three are behind it (a 401 comes before body validation, then 422, then
 404 for an unknown panel). The web edge adds the secret for the browser, and the browser holds none. A panel write
@@ -164,7 +177,7 @@ beside it.
 | Table | Read it as |
 |---|---|
 | `panel` | One row per panel: `name` (unique), `source`, `created_at` |
-| `panel_settings_version` | A panel's versions, `version_no` ascending, with `enabled`, `cadence`, the filters, `actor`, `reason` (NULL when none), `saved_at` |
+| `panel_settings_version` | A panel's versions, `version_no` ascending, with `enabled`, `cadence`, the filters (`include_otc` among them), `actor`, `reason` (NULL when none), `saved_at` |
 | `panel_source_settings_version` | A source's rates and window days by `version_no`, shared by its panels |
 | `panel_pass` | One row per pass: `kind` (`MEMBERSHIP` or `RELEASE`), the settings versions and the snapshots it ran under, `dry_run`, `started_at`, `finished_at` (null until it finishes) and `counts` |
 | `panel_member_transition` | The membership ledger: `transition`, `symbol`, `vendor_asset_id`, `dataset_id` or `request_id` where one applies, `cause`, `as_of`, `recorded_at` |

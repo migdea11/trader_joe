@@ -351,7 +351,7 @@ restarts, and the only bounds are the per-pass cap, the one-at-a-time serialisat
 budget and the missing-tail-only request.
 
 **The panel manager** decides which assets a *panel* holds and creates their datasets. A panel is a named
-selection of one source's assets (filters on the daily asset-list snapshot and a cadence of daily,
+selection of one source's assets (filters on the daily asset-list snapshot, including Include OTC Securities, which is off by default because the current feed has no bars for OTC securities, and a cadence of daily,
 weekly or monthly; monthly unless told otherwise), owned by the reserved owner `panel`, which `POST /store`
 refuses. Panels are UI-only: they are created and edited in the web UI's Panels tab (`/data/panels`) through
 the `/ui/v1` panel routes (`docs/API.md`, *The panel routes*), and there is no SDK panel API. Every 5 minutes it works out from the stored rows what is due, so a
@@ -434,7 +434,8 @@ revisions before it were deleted, and the repository supports no schema from bef
   `make migrate` with "Can't locate revision" instead of being taken for the baseline. Datasets exported from the
   dev stack before the baseline (`output/dev_seed/<old revision>/`) cannot be loaded into it: request them again
   after the reset.
-- **The baseline was edited in place on 2026-11-07 and kept its id** (the panel source rates became optional). A
+- **The baseline was edited in place on 2026-11-07 and kept its id** (the panel source rates became optional) and again on 2026-11-10 (the panel settings gained the Include OTC
+  Securities flag). A
   database already at it is not upgraded by `make migrate`: drop it and migrate again, on every stack, dev included.
 - **There is no downgrade.** The baseline's `downgrade()` raises. Recovery is a restore of the pre-migrate dump that
   `make migrate` takes (below).
