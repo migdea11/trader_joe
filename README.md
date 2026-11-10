@@ -103,27 +103,6 @@ no target tears down the other project to make room. (Dev's other published port
 does not publish them. pgAdmin, with its fixed name, runs only in dev.) Stop one before starting the other, with
 `make prod-down` for prod or `make dev-down` for dev and test; each reaches its own project only.
 
-**One-time step on an existing dev machine.** Dev and test used to run in the default project. A stack
-started under the old project name must be stopped by name before the first `make dev-up` of this version,
-because its containers still hold postgres's fixed name and the web port. From the repository root:
-
-```
-docker compose -p trader_joe down --remove-orphans
-```
-
-This was run on the owner's stack and removed its web, data_store, db and data_ingest containers and its
-four `trader_joe` networks. Then:
-
-1. `make dev-up`, which starts the stack as `trader_joe_dev`. The first one after pulling this version
-   recreates the dev containers, because postgres now starts with the dev marker (see
-   [Seeding refuses a database without a marker](#seeding-refuses-a-database-without-a-marker)); the data folder
-   is a host directory and survives.
-2. `make agent-mcp-rebuild`, then reconnect the MCP in your client, because the MCP now addresses
-   `trader_joe_dev` only (see [The agent-stack MCP](#the-agent-stack-mcp)).
-
-Your data folders (`DATA_DIR` and `./volume_data/test`) are host directories and are untouched. A prod
-host needs nothing: its project and launch did not change.
-
 ### Seeding refuses a database without a marker
 
 The dev showcase seed (`tools/dev_datasets`, see its [README](tools/dev_datasets/README.md)) empties and
@@ -190,20 +169,7 @@ container on `store_api`.
 The fixed name is read from `STORE_API_NETWORK`, defaulting to `trader_joe_store_api`; nothing in the
 repository sets it. In the same way, every service's env files are read from `ROOT_ENV_FILE`,
 `STORE_ENV_FILE` and `INGEST_ENV_FILE`, defaulting to `.env`, `server/data/store/.env` and
-`server/data/ingest/.env`; a normal launch never sets them.
-
-**Upgrading from the layout before the monorepo split:** the per-service env files moved with their
-directories, from `data/store/` and `data/ingest/` to `server/data/store/` and `server/data/ingest/`.
-Compose does not find an untracked file left at the old path, and `make dev-launch` stops on it. Move
-each one:
-
-```
-mv data/store/.env server/data/store/.env
-mv data/ingest/.env server/data/ingest/.env
-```
-
-The root `.env` has not moved. Each service directory also carries a `.env.default` to copy from if
-you never had a file.
+`server/data/ingest/.env`; a normal launch never sets them. Each service directory carries a `.env.default` to copy from.
 
 **Dev** adds one external network, `trader_joe_devnet`, created by `make dev-network`. The dev
 override attaches every stack service to it and publishes postgres, data_store and data_ingest on
@@ -604,7 +570,7 @@ already exists. On the production host, from the repository root:
    migration, then `make prod-launch`. Do not run `make migrate` again until the failing revision is fixed and
    rehearsed.
 
-<!-- TODO: verify — the production recovery commands (stop and start targets, the schema drop, the restore flags) have not been rehearsed against production; confirm at the production sitting; also confirm at that sitting that the pre-migrate dump line names the production data directory's backups folder -->
+Steps 3 and 4 are the statements `restore_dump.sh` runs against the test stack, which `make migrate-rehearse` exercises. They are not run against production by any target.
 
 ### Revisions that are not additive
 
