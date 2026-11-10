@@ -50,20 +50,35 @@ selects every row of the newest ACTIVE asset list (14,399 rows on the dev stack'
 the database is safe at that size. Time is what bounds it. Ingest allows at most 200 market-data requests a minute
 (`ALPACA_RATE_LIMIT_PER_MINUTE`, which configuration can only lower), and the clamp and the bars request of each
 creation both draw from that one bucket. The asset lookup draws from the trading scope. A clamp query whose answer
-spans several pages costs one token per page (a panel's 1day bars request, about 9,200 sessions from 1990, fits one
-10,000-bar page). As an observation from a dev run against the real vendor, not a guarantee: the pass made about 77
-creations a minute (80.8 a minute over its first 48 seconds), so about 3 hours for 14,399 members, with the
-market-data side near 155 of its 200 requests a minute and no 429 answers. A larger asset list or a slower vendor
-takes longer. Manager runs never overlap, so for those hours no other panel on any source gets a pass. Ingest keeps one queue per broker, shared by both of its quota scopes (market data and trading): requests with a
+spans several pages costs one token per page. A panel's 1day bars request starts at the member's entry date (below), so it covers days, not decades, and fits one
+page. Each creation still makes the same three vendor calls (the clamp, the bars request and the asset lookup), so
+its two market-data tokens set a floor: at 200 a minute, at most 100 creations a minute, which is at least about 2.4
+hours for 14,399 members. As an observation from a dev run against the real vendor with bars requests about 9,200
+sessions long, not a guarantee: the pass made about 77 creations a minute (80.8 a minute over its first 48 seconds),
+about 3 hours for 14,399 members, with the market-data side near 155 of its 200 requests a minute and no 429 answers.
+The pace with entry-date requests is not measured. A larger asset list or a slower vendor takes longer. Manager runs never overlap, so for those hours no other panel on any source gets a pass. Ingest keeps one queue per broker, shared by both of its quota scopes (market data and trading): requests with a
 ready-by go first, and undated work follows in arrival order. The panel manager's requests and the asset-list snapshot
 carry no ready-by, so the snapshot queues behind the burst in arrival order; the daily refresh carries a ready-by and
 is served ahead of it. The asset list draws its tokens from the trading scope, so it waits because it is queued, not
 because tokens run out (`docs/scheduler.md`). A clamp that waits past 300 s becomes a deferral (`clamp_unavailable`) that a later pass picks up.
 Set the rates, or a filter, if that matters.
 
-**A member's dataset** starts at `panel_dataset_start`: the source calendar's local midnight of 1990-01-01
-(`CALENDAR_START`), never UTC midnight, which would fall on the previous local date before the calendar's first day.
-The name-change clamp can move it later. `CREATED` names the bars **request**, never a dataset: the delivery intake
+**A member's dataset** starts at `panel_dataset_start`: the source calendar's local midnight of the local date of the
+member's `ENTERED` transition, that is, of the snapshot the panel first knew the member from. No history before that
+date is requested and nothing is backfilled.
+
+- The first pass starts every dataset at the snapshot's local date in the source calendar: an evening New York
+  snapshot lands on that New York day, not on the UTC day.
+- A member that enters later starts at its own entry date. A member whose creation is deferred (a full rate window)
+  and created in a later pass still starts at its entry date.
+- A member that exits and re-enters keeps its dataset and its start. Panels on a source share the owner `panel`, and when
+  a panel-owned dataset already exists for the symbol (made for this or another panel) nothing is created, so the
+  start stays that of the dataset created first.
+- A weekend or holiday start is fine: nothing is owed until the first session after it closes.
+- The name-change check still runs on every creation; it is what collects the member's corporate actions, and it
+  can move the start later.
+
+`CREATED` names the bars **request**, never a dataset: the delivery intake
 mints the dataset on the first delivered attempt, as for any POST, and the manager never waits for the verdict.
 
 ## Switching it off, and rehearsing

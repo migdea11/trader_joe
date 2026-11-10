@@ -351,10 +351,11 @@ restarts, and the only bounds are the per-pass cap, the one-at-a-time serialisat
 budget and the missing-tail-only request.
 
 **The panel manager** decides which assets a *panel* holds and creates their datasets. A panel is a named
-selection of one source's assets (filters on the daily asset-list snapshot, including Include OTC Securities, which is off by default because the current feed has no bars for OTC securities, and a cadence of daily,
-weekly or monthly; monthly unless told otherwise), owned by the reserved owner `panel`, which `POST /store`
-refuses. Panels are UI-only: they are created and edited in the web UI's Panels tab (`/data/panels`) through
-the `/ui/v1` panel routes (`docs/API.md`, *The panel routes*), and there is no SDK panel API. Every 5 minutes it works out from the stored rows what is due, so a
+selection of one source's assets (filters on the daily asset-list snapshot, including Include OTC Securities, which is off by default because the
+current feed has no bars for OTC securities, and a cadence of daily, weekly or monthly; monthly unless told
+otherwise), owned by the reserved owner `panel`, which `POST /store` refuses. A member's dataset starts at the local
+date the panel first knew the member from, with no earlier history. Panels are UI-only: they are created and edited
+in the web UI's Panels tab (`/data/panels`) through the `/ui/v1` panel routes (`docs/API.md`, *The panel routes*), and there is no SDK panel API. Every 5 minutes it works out from the stored rows what is due, so a
 restart resets nothing. A membership pass runs at the panel's creation, on the newest snapshot, then an interval
 after the last *finished* pass (a pass that crashed holds the next off for an hour). It records every decision
 (entered, created, deferred, refused, exited, draining, drained) in an append-only ledger, and creates a dataset
