@@ -9,7 +9,7 @@ harness in `data/ingest/tests/alpaca_recorded.py`. One response per file:
 
 ## Recorded
 
-Recorded 2026-10-01 at the host sitting (tj-irhy0a.3, item H4) by `tests/fakes/record_alpaca.py`,
+Recorded 2026-10-01 on the host by `tests/fakes/record_alpaca.py`,
 with paper keys, from `GET https://data.alpaca.markets/v2/stocks/bars`, symbol `AAPL`, feed `iex`
 (the tape paper keys are entitled to). Each file is the recorder's output byte for byte; its
 `provenance` carries `kind: recorded`, `recorded_at` and the endpoint. The request each one answers
@@ -30,9 +30,9 @@ and an error message. They contain no header, credential, query string or accoun
 
 ## Recorded byte for byte: corporate actions
 
-Captured 2026-10-24 through the dev vendor probe (P27a s10 and s10x, tj-7zjov1.7) from
-`GET https://data.alpaca.markets/v1/corporate-actions`. The reader slices each record's own bytes out of the body
-(tj-7zjov1.23), so these files carry the body as served in `body_text`, a string, instead of a decoded `body`.
+Captured 2026-10-24 through the dev vendor probe from
+`GET https://data.alpaca.markets/v1/corporate-actions`. The reader slices each record's own bytes out of the body,
+so these files carry the body as served in `body_text`, a string, instead of a decoded `body`.
 `provenance` carries the request's parameters and the capture's own `byte_length` and `sha256`, and
 `alpaca_recorded.load_raw` refuses a file whose text no longer matches them. Load them with `load_raw`, never `load`.
 
@@ -48,8 +48,7 @@ No recording has a second page: the token-following tests use constructed pages.
 ## Documented, not recorded
 
 These are built by hand from Alpaca's published response shape,
-<https://docs.alpaca.markets/us/reference/stockbars>, and the wire contract pinned in research
-tj-vhboky.57. Prices and volumes are illustrative. Each file's `provenance.kind` says `documented`.
+<https://docs.alpaca.markets/us/reference/stockbars>. Prices and volumes are illustrative. Each file's `provenance.kind` says `documented`.
 
 | File | Why it is not recorded |
 |---|---|

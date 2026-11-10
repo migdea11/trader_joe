@@ -4,14 +4,12 @@ framework for testing trading algos
 ## Design
 ![Design Image](docs/img/design.jpg)
 
-**Request scheduling lives in ingest, and the store keeps the request log** (owner ruling 2026-10-12, ADR
-`tj-26jt9w`). A request is a `POST /store`, or a request the store's own loops send. The store writes it to a
+**Request scheduling lives in ingest, and the store keeps the request log.** A request is a `POST /store`, or a request the store's own loops send. The store writes it to a
 durable log (`ingest_request`) before sending it. Ingest holds it on a per-broker FIFO queue, checks its `ready_by`
 when it is taken off the queue, paces and counts every vendor call, and pushes each attempt's result to the store,
 which acknowledges it before any retry runs. The module is described in [`docs/scheduler.md`](docs/scheduler.md) and
 its failure and restart behaviour in [`docs/runbooks/queue-ack-restart.md`](docs/runbooks/queue-ack-restart.md). Not
-built: a planner with admission control and a quota cap that survives a restart (the end-state design `tj-pd41mt` is
-still proposed).
+built: a planner with admission control, and a quota cap that survives a restart.
 
 ## Getting Started
 Take a look at the `Makefile` for all the major commands. Every compose target names the stack it
@@ -169,7 +167,7 @@ files, where the reaper is dry-run again.
 
 ## Networks: prod publishes one loopback port
 
-The two stacks are wired differently on purpose (decision record `tj-q9ae5u`, addendum 1).
+The two stacks are wired differently on purpose.
 
 **Prod** puts every service on named networks and publishes **no host port**, with one deliberate
 exception: the web container's single port, on loopback only (see [The web UI](#the-web-ui)).
@@ -456,7 +454,7 @@ make migrate
 ```
 
 **Run this after every deploy**, and after any pull that brings new revisions. Migrations are a
-deploy step, not part of starting the stack (decision record `tj-x3ig38`). `make migrate` is the
+deploy step, not part of starting the stack. `make migrate` is the
 only supported spelling of that step: run it by hand today, and the server deploy script will call
 the same target once it exists. A database that is not at head is not a state to run the store in.
 

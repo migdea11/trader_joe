@@ -201,8 +201,7 @@ click outside closes it except while an export runs).
 - Averages start late on the earliest page, because nothing precedes it.
 - A reconnect returns the Viewer's chart to the newest page.
 - A CSV export of a long window is long, and the popover cannot say how large before it runs.
-- Longer ranges drawn coarser (aggregation, a line view) are deferred, not built: decision
-  `tj-4rj52w`.
+- Longer ranges drawn coarser (aggregation, a line view) are not built.
 
 ## Layout
 
