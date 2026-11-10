@@ -11,7 +11,8 @@ What it stands up, for test_panel_manager_pass.py:
   * the three seams the pass reaches past the database replaced IN THE MANAGER'S NAMESPACE ONLY:
       first_request_clamp  a double that writes the corporate-actions request row on the session it is GIVEN (as the
                            real one does, so the request window counts it), records that session, and answers a clamp,
-                           no clamp, or raises, per symbol;
+                           no clamp, or raises, per symbol; like the real one, a clamped start not after the body's
+                           start is no clamp;
       submit_record        a recorder (the real one is pinned by test_post_request_path.py); it reads the bars request
                            and its CREATED row from a SECOND session when called, which is what "submit after the
                            commit" means;
@@ -95,6 +96,9 @@ TABLES = (
 )
 
 SOURCE = DataSource.ALPACA_API
+# An existing panel entry's declared start (World.entry): the point-in-time start (ADR tj-iov38l P1) of a member that
+# entered on 2026-01-01, New York midnight (EST). A stored start is never rewritten by a later pass (P4, re-entry).
+ENTRY_START = datetime(2026, 1, 1, 5, tzinfo=UTC)
 SETTLE = timedelta(minutes=30)
 CLOSE_UTC = time(21, 0)
 
@@ -305,7 +309,7 @@ class World:
             'asset_type': AssetType.STOCK,
             'data_type': DataType.MARKET_ACTIVITY,
             'granularity': Granularity.ONE_DAY,
-            'start': panel_manager.panel_dataset_start(SOURCE),
+            'start': ENTRY_START,
             'end': NullableDateTime.EPOCH,
             'expiry_type': ExpiryType.ROLLING,
             'update_type': UpdateType.DAILY,
@@ -495,7 +499,9 @@ def install(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
         if symbol in world.clamp_errors:
             raise world.clamp_errors[symbol]
         clamped = world.clamp_starts.get(symbol)
-        if clamped is None:
+        # As the real clamp (first_request_clamp): a clamped start not after the body's start leaves it standing. Since
+        # the point-in-time start (ADR tj-iov38l P5) a past rename usually clamps nothing, so the double must say so.
+        if clamped is None or clamped <= body.start:
             return None, record.id
         return StartClamp(symbol, clamped, body.start, clamped), record.id
 

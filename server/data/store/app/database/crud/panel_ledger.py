@@ -407,6 +407,26 @@ async def latest_state(db: AsyncSession, panel_id: uuid.UUID) -> dict[str, Membe
     return {row.vendor_asset_id: _member_transition(row) for row in rows}
 
 
+async def entered_as_of_by_member(db: AsyncSession, panel_id: uuid.UUID) -> dict[str, datetime]:
+    """Per vendor asset id, the as_of of the member's newest ENTERED transition: when the panel knew it from.
+
+    ONE statement for the whole panel, never one per member. The newest ENTERED is the current stint's (a member that
+    exited and re-entered has one per stint), by the ledger order (as_of, the pass's started_at, pass, seq). It is the
+    point-in-time start of the member's dataset (ADR tj-iov38l P1). A vendor asset id with no ENTERED row is absent.
+    Dry-run passes are ignored.
+
+    Args:
+        db: A session.
+        panel_id: The panel.
+
+    Returns:
+        dict[str, datetime]: Keyed by vendor asset id, the ENTERED as_of (timezone-aware).
+    """
+    ranked = _ranked(panel_id, (PanelTransition.ENTERED,), None).subquery()
+    rows = (await db.execute(select(ranked.c.vendor_asset_id, ranked.c.as_of).where(ranked.c.rank == 1))).all()
+    return {row.vendor_asset_id: row.as_of for row in rows}
+
+
 async def members_at(db: AsyncSession, panel_id: uuid.UUID, instant: datetime) -> list[MemberAt]:
     """Who was a member of the panel at an instant, read by as_of from the transitions alone.
 

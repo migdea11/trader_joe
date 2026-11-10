@@ -23,6 +23,9 @@ then pass_id, then seq (the per-pass append ordinal), never by the random id.
      addendum 21) a CREATED row names its request only, so "the ledger names" is the union of the datasets non-dry-run
      transitions name directly and the non-NULL ingest_request.dataset_id of the requests non-dry-run CREATED rows
      name; a NULL dataset, a missing request, a dry-run CREATED and a non-CREATED row's request contribute nothing.
+  R5 entered_as_of_by_member (ADR tj-iov38l P1, tj-7zjov1.364.10): per vendor asset id the as_of of the NEWEST ENTERED
+     by the same order as R1 (a re-entry's later ENTERED wins), whatever transitions follow it; a member with no
+     ENTERED is absent; dry-run passes and other panels ignored; aware; ONE statement for the whole panel.
 """
 
 import random
@@ -41,6 +44,7 @@ from data.store.app.database.crud.panel_ledger import (
     NewTransition,
     boundary_read,
     created_in_window,
+    entered_as_of_by_member,
     latest_state,
     members_at,
 )
@@ -667,3 +671,104 @@ async def test_reads_take_new_transition_rows_of_every_kind(world):
     await world.open(seeded, rows=rows)
     assert await _state(world, seeded.panel_id) == {f'v{i}': kind for i, kind in enumerate(PanelTransition)}
     assert len(await world.rows(PASSES)) == 1
+
+
+# --------------------------------------------------------------------------------------------- R5 entered_as_of_by_member
+
+
+async def _entered_at(world: World, panel_id: uuid.UUID) -> dict[str, datetime]:
+    async with world.session() as db:
+        return await entered_as_of_by_member(db, panel_id)
+
+
+async def test_entered_as_of_by_member_is_empty_for_a_panel_with_no_transitions(world):
+    seeded = await world.panel()
+    assert await _entered_at(world, seeded.panel_id) == {}
+    assert await _entered_at(world, uuid.uuid4()) == {}
+
+
+async def test_entered_as_of_by_member_reads_each_members_entered_as_of_not_its_latest_transition(world):
+    """The ENTERED row's as_of, whatever came after it in the stint (CREATED, DEFERRED: later process facts)."""
+    seeded = await world.panel()
+    await world.open(
+        seeded,
+        started_at=T0,
+        rows=(
+            entered('a', T0 - DAY),
+            created('a', T0),
+            entered('b', T0 - 2 * DAY),
+            transition('b', D, T0, cause='ramp_rate'),
+            entered('c', T0),
+        ),
+    )
+    await world.open(seeded, kind=PanelPassKind.RELEASE, started_at=T0 + HOUR, rows=(created('b', T0 + HOUR),))
+    assert await _entered_at(world, seeded.panel_id) == {'a': T0 - DAY, 'b': T0 - 2 * DAY, 'c': T0}
+
+
+async def test_a_re_entrys_later_entered_wins_over_the_earlier_one(world):
+    """Exit then re-entry: two ENTERED rows, one per stint; the current stint's (the newer) is the answer."""
+    seeded = await world.panel()
+    await world.open(seeded, started_at=T0, rows=(entered('a', T0), created('a', T0)))
+    await world.open(seeded, started_at=T0 + 10 * DAY, rows=(transition('a', X, T0 + 9 * DAY),))
+    await world.open(seeded, started_at=T0 + 20 * DAY, rows=(entered('a', T0 + 19 * DAY),))
+    assert await _entered_at(world, seeded.panel_id) == {'a': T0 + 19 * DAY}
+
+
+async def test_a_re_entry_written_by_an_earlier_started_pass_still_wins_by_its_later_as_of(world):
+    """The ledger order is as_of first: the later stint's ENTERED wins even when its pass row started earlier."""
+    seeded = await world.panel()
+    await world.open(seeded, started_at=T0 + 10 * DAY, rows=(entered('a', T0),))
+    await world.open(seeded, started_at=T0 + DAY, rows=(entered('a', T0 + 5 * DAY),))
+    assert await _entered_at(world, seeded.panel_id) == {'a': T0 + 5 * DAY}
+
+
+async def test_a_member_with_no_entered_row_is_absent(world):
+    """Only ENTERED answers: a member whose ledger holds CREATED, DEFERRED or EXITED alone has no entry date."""
+    seeded = await world.panel()
+    await world.open(
+        seeded,
+        started_at=T0,
+        rows=(created('a', T0), transition('b', D, T0, cause='ramp_rate'), transition('c', X, T0), entered('d', T0)),
+    )
+    assert await _entered_at(world, seeded.panel_id) == {'d': T0}
+
+
+async def test_entered_as_of_by_member_ignores_dry_run_passes(world):
+    """A dry-run ENTERED, newer or for a member the real ledger never entered, is not a start."""
+    seeded = await world.panel()
+    await world.open(seeded, started_at=T0, rows=(entered('a', T0),))
+    await world.open(
+        seeded, dry_run=True, started_at=T0 + 2 * DAY, rows=(entered('a', T0 + 2 * DAY), entered('z', T0 + 2 * DAY))
+    )
+    assert await _entered_at(world, seeded.panel_id) == {'a': T0}
+
+
+async def test_entered_as_of_by_member_reads_one_panel_only(world):
+    mine = await world.panel()
+    theirs = await world.panel()
+    await world.open(mine, started_at=T0, rows=(entered('a', T0),))
+    await world.open(theirs, started_at=T0 + DAY, rows=(entered('a', T0 + 3 * DAY), entered('b', T0 + DAY)))
+    assert await _entered_at(world, mine.panel_id) == {'a': T0}
+    assert await _entered_at(world, theirs.panel_id) == {'a': T0 + 3 * DAY, 'b': T0 + DAY}
+
+
+async def test_entered_as_of_by_member_returns_aware_instants(world):
+    seeded = await world.panel()
+    tokyo = (T0 + DAY).astimezone(ZoneInfo('Asia/Tokyo'))
+    await world.open(seeded, started_at=T0, rows=(entered('a', tokyo),))
+    (as_of,) = (await _entered_at(world, seeded.panel_id)).values()
+    assert as_of.utcoffset() is not None and as_of == T0 + DAY
+
+
+async def test_entered_as_of_by_member_is_one_statement_for_the_whole_panel(world):
+    """ONE statement per call whatever the member count (never one per member): the manager reads it once per pass."""
+    seeded = await world.panel()
+    rows = tuple(row for i in range(60) for row in (entered(f'v{i:02d}', T0 + i * HOUR), created(f'v{i:02d}', T0)))
+    await world.open(seeded, started_at=T0, rows=rows)
+    world.statements.clear()
+
+    found = await _entered_at(world, seeded.panel_id)
+
+    assert len(found) == 60 and found['v59'] == T0 + 59 * HOUR
+    assert len(world.statements) == 1, f'{len(world.statements)} statements for one read'
+    assert isinstance(world.statements[0], sa.Select)

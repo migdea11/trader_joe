@@ -23,7 +23,7 @@ as_of, the pass's started_at, pass_id, seq; a finished pass takes no transitions
   W4s seq is 1..n in list order within a pass, continuing across ROW_CHUNK statements and across calls in one pass
      (the pass's max plus one), restarting at 1 in another pass; it is read back on MemberTransition;
   W5 no function commits: the caller's rollback leaves nothing;
-  W6 append-only: the public surface is exactly the seven functions, and the only non-SELECT, non-INSERT statement the
+  W6 append-only: the public surface is exactly the eight functions, and the only non-SELECT, non-INSERT statement the
      module sends is finish_pass's guarded UPDATE;
   W7 every statement the module sends compiles for the postgresql dialect (the auto-correlation class of defect found
      in panel_settings.enabled_panels_on_source raises at compile time).
@@ -70,6 +70,7 @@ from data.store.app.database.crud.panel_ledger import (
     append_transitions,
     boundary_read,
     created_in_window,
+    entered_as_of_by_member,
     finish_pass,
     latest_state,
     members_at,
@@ -115,6 +116,8 @@ PUBLIC_FUNCTIONS = {
     'members_at',
     'boundary_read',
     'created_in_window',
+    # ADR tj-iov38l P1 (tj-7zjov1.364.10): each member's newest ENTERED as_of, the point-in-time dataset start.
+    'entered_as_of_by_member',
 }
 ALL_COUNT_KEYS = ('entered', 'created', 'deferred', 'refused', 'exited', 'draining', 'drained')
 
@@ -979,7 +982,7 @@ async def test_no_function_calls_commit_rollback_or_begin(name):
 # --------------------------------------------------------------------------------------------- W6 append-only
 
 
-async def test_the_public_surface_is_exactly_the_seven_functions():
+async def test_the_public_surface_is_exactly_the_eight_functions():
     public = {
         name
         for name, value in vars(panel_ledger).items()
@@ -1016,6 +1019,7 @@ async def test_a_full_round_sends_only_selects_inserts_and_the_one_guarded_updat
         await created_in_window(db, SOURCE, T0)
         await boundary_read(db, seeded.panel_id)
         await boundary_read(db, uuid.uuid4())
+        await entered_as_of_by_member(db, seeded.panel_id)
         await db.commit()
 
     others = [s for s in world.statements if not isinstance(s, Select | Insert)]
@@ -1039,10 +1043,11 @@ async def test_every_statement_the_module_sends_compiles_for_postgres(world):
         await members_at(db, seeded.panel_id, T0)
         await created_in_window(db, SOURCE, T0)
         await boundary_read(db, seeded.panel_id)
+        await entered_as_of_by_member(db, seeded.panel_id)
         await db.commit()
 
     sent = [s for s in world.statements if isinstance(s, Select | Insert | Update)]
-    assert len(sent) >= 15
+    assert len(sent) >= 16
     compiled = [pg_sql(statement) for statement in sent]
     assert all(sql for sql in compiled)
 
@@ -1054,13 +1059,17 @@ async def test_the_member_state_order_is_as_of_then_pass_started_at_then_pass_th
     async with world.session() as db:
         await latest_state(db, seeded.panel_id)
         await members_at(db, seeded.panel_id, T0)
+        await entered_as_of_by_member(db, seeded.panel_id)
     over = (
         'row_number() OVER (PARTITION BY panel_member_transition.vendor_asset_id '
         'ORDER BY panel_member_transition.as_of DESC, panel_pass.started_at DESC, '
         'panel_member_transition.pass_id DESC, panel_member_transition.seq DESC)'
     )
-    latest, at = (pg_sql(s) for s in world.statements)
-    for sql in (latest, at):
+    latest, at, entered_at = (pg_sql(s) for s in world.statements)
+    # entered_as_of_by_member (ADR tj-iov38l): the same order, ENTERED only, no instant bound.
+    assert 'panel_member_transition.transition IN (__[POSTCOMPILE_transition_1])' in entered_at
+    assert 'as_of <=' not in entered_at
+    for sql in (latest, at, entered_at):
         assert over in sql, sql
         assert 'panel_pass.dry_run IS false' in sql
         assert 'JOIN panel_pass ON panel_pass.id = panel_member_transition.pass_id' in sql

@@ -665,12 +665,18 @@ def test_the_module_never_names_the_asset_list_request_the_awaiting_or_the_commi
     assert _names_used(panel_manager) & forbidden == set()
 
 
-def test_the_declared_start_is_the_calendar_start_at_the_source_calendar_s_local_midnight(xnys):
-    """tj-7zjov1.239 ruling A': never UTC midnight, which is 1989-12-31 in New York, before the calendar's first day."""
+def test_the_declared_start_is_the_local_midnight_of_the_entered_snapshot_s_local_date(xnys):
+    """ADR tj-iov38l P1, superseding tj-7zjov1.239's CALENDAR_START: the local midnight of the ENTERED local date.
+
+    The source calendar's local midnight of the local date of the ENTERED as_of, never UTC midnight and never 1990.
+    21:48 New York on 9 Nov is 02:48Z on the 10th.
+    """
     from data.store.app.trading_calendar import CALENDAR_START
 
-    assert date(1990, 1, 1) == CALENDAR_START
-    start = panel_manager.panel_dataset_start(DataSource.ALPACA_API)
-    assert start == datetime.combine(CALENDAR_START, datetime.min.time(), tzinfo=NEW_YORK) == utc(1990, 1, 1, 5)
-    assert start.astimezone(xnys.tz).date() == CALENDAR_START
+    entered = utc(2026, 11, 10, 2, 48)
+    start = panel_manager.panel_dataset_start(DataSource.ALPACA_API, entered)
+    assert start == datetime(2026, 11, 9, tzinfo=NEW_YORK) == utc(2026, 11, 9, 5)
+    assert start.astimezone(xnys.tz).date() == date(2026, 11, 9) != entered.date()
+    assert start.astimezone(xnys.tz).date() != CALENDAR_START
     assert not hasattr(panel_manager, 'PANEL_DATASET_START'), 'the old constant is deleted, so no caller keeps it'
+    assert 'CALENDAR_START' not in vars(panel_manager), 'the panel path no longer names the 1990 constant'

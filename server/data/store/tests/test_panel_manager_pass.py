@@ -15,7 +15,9 @@ creation ruling).
       snapshots, finished with counts; ENTERED then CREATED per member in symbol order, every filtered match (a panel
       has no size since ADR tj-46jkey, owner ruling 2026-11-06);
   P2  CREATED names its POST-shaped bars request (dataset_id NULL on both); every panel request carries client_label
-      'panel' and ready_by NULL; trigger REQUEST; the declared start, end None, DAILY 1day, collect true;
+      'panel' and ready_by NULL; trigger REQUEST; the declared start (since ADR tj-iov38l the New York midnight of the
+      ENTERED snapshot's local date, the rest of that rule in test_panel_dataset_start.py), end None, DAILY 1day,
+      collect true;
   P3  the clamp runs on a session that is NOT the pass session, after P committed; its start is the bars request's and
       the own-overlap key's, and check_own_overlap runs on P;
   P4  ENTERED, CREATED and the request row commit together, before the submit, or not at all; a rollback is not retried
@@ -61,7 +63,8 @@ windows under real concurrency, the real first_request_clamp and submit_record a
 """
 
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 import pytest_asyncio
@@ -122,8 +125,15 @@ HOUR = timedelta(hours=1)
 # The stop marks, as the strings the column stores (tj-7zjov1.264).
 LEFT = 'PANEL_MEMBER_LEFT'
 VENDOR_STOP = 'VENDOR_ASSET_CHANGED'
-# The declared start of an ALPACA_API panel dataset, by hand (tj-7zjov1.239): 1990-01-01 at New York midnight (EST).
-DECLARED_START = datetime(1990, 1, 1, 5, tzinfo=UTC)
+NEW_YORK = ZoneInfo('America/New_York')
+
+
+def declared_start(entered_as_of: datetime) -> datetime:
+    """The declared start of an ALPACA_API panel dataset, by hand (ADR tj-iov38l P1, superseding tj-7zjov1.239's 1990).
+
+    New York midnight of the New York date of the member's ENTERED as_of.
+    """
+    return datetime.combine(entered_as_of.astimezone(NEW_YORK).date(), time.min, tzinfo=NEW_YORK)
 
 
 @pytest_asyncio.fixture
@@ -219,7 +229,7 @@ async def test_created_names_its_post_shaped_bars_request_owned_by_panel(world, 
         assert request.client_label == PANEL_OWNER == 'panel'
         assert request.ready_by is None
         assert request.trigger is IngestRunTrigger.REQUEST
-        assert request.requested_start == DECLARED_START == panel_dataset_start(request.source)
+        assert request.requested_start == declared_start(as_of) == panel_dataset_start(request.source, as_of)
         assert request.requested_end is None
         assert (request.granularity, request.update_type) == (Granularity.ONE_DAY, UpdateType.DAILY.value)
         assert request.collect is True
@@ -229,14 +239,15 @@ async def test_created_names_its_post_shaped_bars_request_owned_by_panel(world, 
 
 
 async def test_each_creation_writes_two_panel_requests_the_clamp_and_the_bars(world, clock):
-    await basic(world)
+    _, _, snapshot_id = await basic(world)
+    as_of = await snapshot_as_of(world, snapshot_id)
     await manager(clock).tick()
     corporate = await world.requests(CORPORATE)
     bars = await world.requests(BARS)
     assert sorted(r.asset_symbol for r in corporate) == sorted(r.asset_symbol for r in bars) == ['AAA', 'BBB', 'CCC']
     for call in world.clamps:
         assert call.body.owner == PANEL_OWNER and call.body.ready_by is None and call.body.end is None
-        assert call.body.start == DECLARED_START and call.body.collect is True
+        assert call.body.start == declared_start(as_of) and call.body.collect is True
 
 
 # ===================================================================================== P3 the clamp
@@ -253,8 +264,9 @@ async def test_the_clamp_runs_on_its_own_session_after_the_pass_session_committe
 
 
 async def test_the_clamped_start_is_the_bars_request_start_and_the_overlap_key_checked_on_p(world, clock, monkeypatch):
-    await basic(world, assets=[('v1', 'AAA')])
-    clamped = datetime(2022, 6, 9, 4, tzinfo=UTC)
+    _, _, snapshot_id = await basic(world, assets=[('v1', 'AAA')])
+    # A rename dated after the point-in-time start (a future-dated one, ADR tj-iov38l P5): the clamp moves it later.
+    clamped = declared_start(await snapshot_as_of(world, snapshot_id)) + 2 * DAY
     world.clamp_starts['AAA'] = clamped
     checked = []
     real = panel_manager.check_own_overlap
@@ -385,8 +397,9 @@ async def test_pin_16b_a_clamp_window_refusal_writes_refused_clamp_window_and_no
     world, clock, monkeypatch
 ):
     """Unreachable while panel datasets are open-ended (end None): the pure rule is forced to answer, to pin its wiring."""
-    seeded, _, _ = await basic(world, assets=[('v1', 'AAA'), ('v2', 'BBB')])
-    world.clamp_starts['AAA'] = datetime(2022, 6, 9, 4, tzinfo=UTC)
+    seeded, _, snapshot_id = await basic(world, assets=[('v1', 'AAA'), ('v2', 'BBB')])
+    # Later than the point-in-time start, so the clamp answers (an earlier rename clamps nothing, ADR tj-iov38l P5).
+    world.clamp_starts['AAA'] = declared_start(await snapshot_as_of(world, snapshot_id)) + 2 * DAY
     seen = []
     checked = []
 

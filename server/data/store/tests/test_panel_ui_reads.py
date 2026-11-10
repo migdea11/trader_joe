@@ -27,9 +27,9 @@ THE DESIGN is the ROUTE CONTRACT and READ RULES ruled on tj-7zjov1.36 (03:05 UTC
   ALL limit 1 to 500 (default 100); cursors opaque and bound to their route and parent; a constant statement count per
       request, never one per panel, member or version.
 
-NOT PINNED HERE, ON PURPOSE: the health of a manager-created dataset that starts at PANEL_DATASET_START (1990-01-01),
-which the builder found reads UNSPECIFIED because the XNYS calendar judges that instant before its start (the architect
-is ruling on it). Every dataset here starts 1 Sep 2026, a valid calendar date.
+NOT PINNED HERE, ON PURPOSE: the health of a manager-created dataset. Its start is point in time since ADR tj-iov38l
+(the local midnight of the member's ENTERED date, no longer 1990-01-01), and its health on the real XNYS calendar is
+pinned in test_panel_dataset_start.py (b). Every dataset here starts 1 Sep 2026, a valid calendar date.
 """
 
 import base64

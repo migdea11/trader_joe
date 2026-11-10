@@ -71,6 +71,13 @@ WHAT EACH TEST PINS:
   PM10 include_otc (ADR tj-ed4t8m, validator tj-7zjov1.364.4, WRITTEN NOT YET RUN): off exits and stops the OTC member
       only (PANEL_MEMBER_LEFT, RETIRED); on again restarts it (dataset_resumed, RESUMED), no new request.
 
+  THE POINT-IN-TIME START (ADR tj-iov38l, validator tj-7zjov1.364.11, WRITTEN NOT YET RUN): a declared start is the
+  XNYS local midnight of the local date of the member's ENTERED as_of, no longer CALENDAR_START. PM1 and PM2 date their
+  first snapshot FIRST_SNAPSHOT_AS_OF, 21:30 New York on 30 May 2022 (already 31 May in UTC), so b starts on 30 May
+  (the local date, on asyncpg's timestamptz) and the clamp still moves a, renamed away on RENAMED_ON (9 June 2022,
+  after that start; a rename before the start no longer clamps). PM3's release reads the ENTERED date through
+  entered_as_of_by_member (the row_number window on Postgres) and its bars request starts there.
+
   The PM1 and PM3 idle_in_transaction checks carry a positive control (tj-7zjov1.262 change (A)): at each clamp at
   least one connection is listed under the engine's application_name, so their zero is not vacuous.
 
@@ -86,8 +93,9 @@ import uuid
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 import pytest_asyncio
@@ -134,7 +142,7 @@ from data.store.app.database.models.store_dataset_entry import StoreDatasetEntry
 from data.store.app.events import DatasetChange, DatasetChanged
 from data.store.app.ingest import data_action_request, delivery_intake
 from data.store.app.ingest.delivery_intake import DeliveryIntake
-from data.store.app.trading_calendar import CALENDAR_START, calendar_for_source, local_midnight
+from data.store.app.trading_calendar import calendar_for_source, local_midnight
 from schemas.data_ingest.delivery import (
     AttemptDelivery,
     CorporateActionRecord,
@@ -172,6 +180,10 @@ SETTLE = timedelta(minutes=30)
 QUOTA_KEY = 'system-test-quota-key'
 # The process date of the rename away from a symbol that the clamp query answers with (PM1, PM2).
 RENAMED_ON = datetime(2022, 6, 9, tzinfo=UTC)
+# PM1 and PM2's first active snapshot (ADR tj-iov38l): 21:30 New York (EDT) on 30 May 2022, 01:30Z on the 31st. Before
+# RENAMED_ON, so the clamp still moves a's point-in-time start; an evening, so the local date is not the UTC one.
+FIRST_SNAPSHOT_AS_OF = datetime(2022, 5, 31, 1, 30, tzinfo=UTC)
+NEW_YORK = ZoneInfo('America/New_York')
 MICRO = timedelta(microseconds=1)
 # The manager's stop mark, as the column stores it (tj-7zjov1.264).
 LEFT = 'PANEL_MEMBER_LEFT'
@@ -188,9 +200,12 @@ def _xnys():
     return _REAL_CALENDAR_FOR_SOURCE(CALENDAR_SOURCE)
 
 
-def declared_start() -> datetime:
-    """panel_dataset_start for SOURCE under the mapped calendar: XNYS local midnight of CALENDAR_START."""
-    return local_midnight(CALENDAR_START, _xnys())
+def declared_start(entered_as_of: datetime) -> datetime:
+    """panel_dataset_start for SOURCE under the mapped calendar, by hand (ADR tj-iov38l P1).
+
+    New York midnight of the New York date of the member's ENTERED as_of.
+    """
+    return datetime.combine(entered_as_of.astimezone(NEW_YORK).date(), time.min, tzinfo=NEW_YORK)
 
 
 def clamped_start() -> datetime:
@@ -525,6 +540,8 @@ class World:
             'fetch_finished_since',
             'stop_collecting',
             'check_own_overlap',
+            # The pass's one ledger read of the ENTERED dates (ADR tj-iov38l, tj-7zjov1.364.10).
+            'entered_as_of_by_member',
         ):
             self._spy(name)
 
@@ -870,7 +887,7 @@ async def _first_pass(world: World):
     world.ingest.renames[a.symbol] = RENAMED_ON
     source_version = await world.source_settings(ramp=10, cap=100)
     panel = await world.panel('pass', [a, b, c], tradable=True)
-    active = await world.snapshot([a, b, c])
+    active = await world.snapshot([a, b, c], as_of=FIRST_SNAPSHOT_AS_OF)
     await world.tick()
     return a, b, c, panel, active, source_version
 
@@ -884,7 +901,8 @@ async def test_pm1_a_membership_pass_on_asyncpg_commits_entered_created_and_its_
     world.ingest.renames[a.symbol] = RENAMED_ON
     source_version = await world.source_settings(ramp=10, cap=100)
     panel = await world.panel('pm1', [a, b, c], tradable=True)
-    active = await world.snapshot([a, b, c])
+    # An old evening snapshot: the first pass runs on it at once (it only logs that it is older), ADR tj-iov38l.
+    active = await world.snapshot([a, b, c], as_of=FIRST_SNAPSHOT_AS_OF)
     inactive = await world.snapshot([world.asset('D')], status=AssetListStatus.INACTIVE)
 
     await world.tick()
@@ -921,7 +939,8 @@ async def test_pm1_a_membership_pass_on_asyncpg_commits_entered_created_and_its_
         assert row.granularity == Granularity.ONE_DAY and row.update_type == UpdateType.DAILY.value
         assert row.state == IngestRequestState.QUEUED and row.instance_id == world.instance_id
     assert bars[a.symbol].requested_start == clamped_start(), 'the clamp did not move the stored start'
-    assert bars[b.symbol].requested_start == declared_start()
+    assert bars[b.symbol].requested_start == declared_start(active.as_of) == datetime(2022, 5, 30, 4, tzinfo=UTC)
+    assert declared_start(active.as_of) < clamped_start(), 'the precondition: the rename is after the start'
 
     # The REAL clamp ran: one finished corporate-actions request per member, written before its bars request.
     queries = {row.asset_symbol: row for row in world.requests(a, b, c, kind=IngestRequestKind.CORPORATE_ACTIONS)}
@@ -957,7 +976,10 @@ async def test_pm1_a_membership_pass_on_asyncpg_commits_entered_created_and_its_
     assert [call.result for call in world.called('requests_in_window')] == [0, 2]
     assert [call.result for call in world.called('created_in_window')] == [0, 1]
     overlap_starts = [call.args[0].start for call in world.called('check_own_overlap')]
-    assert overlap_starts == [clamped_start(), declared_start()], 'check_own_overlap did not take the clamped start'
+    assert overlap_starts == [clamped_start(), declared_start(active.as_of)], (
+        'check_own_overlap missed the clamped start'
+    )
+    assert world.called('entered_as_of_by_member') == [], 'a first pass of new members reads no ENTERED dates'
     assert world.entries(a, b) == {}, 'the manager minted an entry; only the delivery intake may'
 
     async with AsyncSession(world.engine) as db:
@@ -981,7 +1003,7 @@ async def test_pm2_the_intake_mints_each_entry_and_the_next_pass_sees_them_as_ex
         assert entry.owner == PANEL_OWNER and entry.collect is True and entry.stopped_cause is None
         assert entry.feed == Feed.IEX and entry.update_type == UpdateType.DAILY.value
     assert entries[a.symbol].start == clamped_start(), 'the entry does not declare the clamped start'
-    assert entries[b.symbol].start == declared_start()
+    assert entries[b.symbol].start == declared_start(first.as_of)
     for symbol, request in bars.items():
         (after,) = world.rows(sa.select(REQUESTS).where(REQUESTS.c.id == request.id))
         assert after.dataset_id == entries[symbol].id and not after.state.is_open, 'the intake did not set dataset_id'
@@ -1066,6 +1088,17 @@ async def test_pm3_a_release_pass_row_opens_lazily_and_commits_with_created_and_
     deferred, created = rows[1], rows[-1]
     assert deferred.as_of == created.as_of == active.as_of, 'the release did not date CREATED by the deciding snapshot'
     assert release.started_at > membership.started_at
+
+    # The point-in-time start (ADR tj-iov38l P4): the release read the ENTERED date on asyncpg (one read per release
+    # tick: the failed one and this one; none in the membership pass, whose member was new) and the bars request starts
+    # at its New York midnight.
+    entered_reads = world.called('entered_as_of_by_member')
+    assert len(entered_reads) == 2 and all(call.args == (panel.id,) for call in entered_reads), entered_reads
+    assert (
+        entered_reads[-1].result == {a.vendor_asset_id: rows[0].as_of} and rows[0].transition is PanelTransition.ENTERED
+    )
+    (bars,) = world.requests(a, kind=IngestRequestKind.BARS)
+    assert bars.requested_start == declared_start(rows[0].as_of)
 
     # The tie on as_of is broken by started_at: the release's CREATED is the member's state.
     assert (await world.latest(panel))[a.vendor_asset_id].transition is PanelTransition.CREATED

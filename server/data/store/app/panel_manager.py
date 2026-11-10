@@ -26,7 +26,9 @@ CREATING A MEMBER'S DATASET (ruling D). CREATED names the BARS REQUEST written i
 dataset: the delivery intake mints the entry on the first delivered attempt, as for every POST. Per member, on the pass's
 session P: existing and in-flight checks, budget, commit P, the clamp on its OWN session (never P), the own-overlap check on
 P with the clamped start, then ONE commit of ENTERED + CREATED + create_request, and the submit after it. The bars verdict
-is never awaited. A rollback in that commit loses that member's ENTERED and CREATED; the next pass re-decides, and nothing
+is never awaited. The dataset starts POINT IN TIME (ADR tj-iov38l): at the source calendar's local midnight of the local
+date of the member's ENTERED as_of, never earlier (no history before the panel knew the member); the name_change clamp
+can only move it later. A rollback in that commit loses that member's ENTERED and CREATED; the next pass re-decides, and nothing
 is retried within the pass. P never carries a pending row across the clamp.
 
 ONE WRITER PER PASS: a pass is written from open_pass to finish_pass by one session of one task. The clamp's own session
@@ -79,6 +81,7 @@ from data.store.app.database.crud.panel_ledger import (
     NewTransition,
     append_transitions,
     created_in_window,
+    entered_as_of_by_member,
     finish_pass,
     latest_state,
     open_pass,
@@ -115,12 +118,13 @@ from data.store.app.ingest.data_action_request import (
     verdict_deadline_seconds,
 )
 from data.store.app.trading_calendar import (
-    CALENDAR_START,
     SOURCE_CALENDARS,
     TradingCalendar,
     UnknownCalendarError,
     calendar_for_source,
     local_midnight,
+    require_aware,
+    session_of,
 )
 from schemas.data_ingest.submit import AssetListStatus
 from schemas.data_store.asset_dataset_store import StoreAssetDatasetBody, StoreAssetDatasetPath
@@ -147,15 +151,19 @@ UNFINISHED_PASS_RETRY: Final = timedelta(hours=1)
 REQUESTS_PER_CREATION: Final = 2
 
 
-def panel_dataset_start(source: DataSource) -> datetime:
+def panel_dataset_start(source: DataSource, entered_as_of: datetime) -> datetime:
     """The declared start of a panel dataset of `source`, before the name_change clamp moves it.
 
-    The source calendar's local midnight of CALENDAR_START, the widest start the store's calendars cover (UTC midnight
-    would fall on the previous local date, before the calendar's first day, and the dataset would get no health and
-    never be owed by the DAILY refresh). The vendor answers from the first bar it holds. Raises UnknownCalendarError for
-    a source without a calendar; never falls back to UTC.
+    POINT IN TIME (ADR tj-iov38l P1 to P4): the source calendar's local midnight of the LOCAL date, in the calendar's
+    time zone, of the member's ENTERED as_of, the instant the panel knew the symbol from. The snapshot's own day is
+    included (a list taken at any hour on D is the list for D), a weekend or holiday date is a fine start (nothing is
+    owed until the first session after it closes), and the local date is used because an evening snapshot is already
+    the next day in UTC. No history before the panel knew the member is requested. Raises UnknownCalendarError for a
+    source without a calendar and NaiveDatetimeError for a naive instant; never falls back to UTC.
     """
-    return local_midnight(CALENDAR_START, calendar_for_source(source))
+    require_aware(entered_as_of=entered_as_of)
+    calendar = calendar_for_source(source)
+    return local_midnight(session_of(entered_as_of, calendar), calendar)
 
 
 # Ledger causes (no CHECK in the schema, by design): pinned by name.
@@ -739,6 +747,9 @@ class PanelManager:
                     to_create.append(_Member(row.vendor_asset_id, row.symbol, new, state))
         await run.append([*plain, *entered_only])
 
+        # ONE ledger read per pass, only when a member already entered earlier is to be created (a new member's
+        # ENTERED date is the one this pass writes).
+        entered_dates = await entered_as_of_by_member(db, panel.id) if any(not m.new for m in to_create) else {}
         for member in to_create:
             await self._create(
                 run,
@@ -748,6 +759,7 @@ class PanelManager:
                 member,
                 newest.as_of,
                 entered_as_of=as_of_of(member.vendor_asset_id, True),
+                entered_dates=entered_dates,
             )
         await run.finish()
         for dataset_id in stops:
@@ -876,6 +888,7 @@ class PanelManager:
             last.inactive_snapshot_id,
             False,
         )
+        entered_dates = await entered_as_of_by_member(db, panel.id)
         for state in deferred:
             if state.symbol in entries or state.symbol in in_flight:
                 continue
@@ -886,6 +899,7 @@ class PanelManager:
                 source_settings,
                 _Member(state.vendor_asset_id, state.symbol, False, state),
                 snapshot.as_of,
+                entered_dates=entered_dates,
             )
         await run.finish()
 
@@ -917,13 +931,23 @@ class PanelManager:
         as_of: datetime,
         *,
         entered_as_of: datetime | None = None,
+        entered_dates: Mapping[str, datetime] | None = None,
     ) -> None:
         """Create one member's dataset request, in the order of the creation ruling. See the module docstring.
 
         as_of dates CREATED, DEFERRED and REFUSED (the pass's snapshot); entered_as_of dates ENTERED (evidence-backdated),
-        and defaults to as_of.
+        and defaults to as_of. The dataset starts at the local date of the member's ENTERED as_of: the one this call
+        writes for a new member, else the ledger's current one in entered_dates (the pass's single read). A member with
+        no ENTERED row is a bug: its id is logged and it is skipped, never given a fallback start.
         """
         db = run.db
+        if member.new:
+            entered_when = as_of if entered_as_of is None else entered_as_of
+        else:
+            entered_when = (entered_dates or {}).get(member.vendor_asset_id)
+            if entered_when is None:
+                log.error(f'Panel member {member.vendor_asset_id} has no ENTERED transition; no dataset created')
+                return
         entered = (
             [
                 NewTransition(
@@ -970,7 +994,7 @@ class PanelManager:
         path = StoreAssetDatasetPath(
             asset_type=snapshot.asset_type, data_type=DataType.MARKET_ACTIVITY, asset_symbol=member.symbol
         )
-        declared_start = panel_dataset_start(source)
+        declared_start = panel_dataset_start(source, entered_when)
         body = self._body(source, declared_start)
         # (4) the clamp, on its OWN session, never P.
         try:
