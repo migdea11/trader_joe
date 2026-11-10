@@ -35,20 +35,22 @@ time (none arrived)`. With no active snapshot at all it logs once `Panel <id> wa
 
 **What it creates and how fast.** The rate is per source and per hour, read from the rows each time over a sliding 60
 minutes: `CREATED` rows against `ramp_datasets_per_hour`, and every request the `panel` owner wrote against
-`request_cap_per_hour`. A creation costs **two** requests (`REQUESTS_PER_CREATION`): the name-change clamp query and
-the bars request. The ramp is checked first, and once a window is full the rest of the members in that pass share its
+`request_cap_per_hour`. A creation costs **two** requests against these limits (`REQUESTS_PER_CREATION`): the name-change clamp query and
+the bars request. Ingest makes a third vendor call for each creation, the asset lookup by symbol on the trading API,
+which counts against neither the request cap nor the market-data budget. The ramp is checked first, and once a window is full the rest of the members in that pass share its
 cause. A rate that is empty (no limit) skips its check. This limits creation only: the daily bars of members are the DAILY refresh's, bounded by
 `DAILY_REFRESH_MAX_PER_PASS`, so a large panel needs that cap raised to about the number of assets its filters select.
 
 **Warning: a first pass with no rates and no filter is very long.** With both rates empty and no filter, a panel
-selects the whole asset snapshot (about 33,500 rows in dev) and creates every member in one pass. There is no big
-transaction: each member gets its own small commits, so the database is safe at that size. Time is what bounds it.
-Ingest allows at most 200 market-data requests a minute (`ALPACA_RATE_LIMIT_PER_MINUTE`, which configuration can only
-lower), and the clamp and the bars request of each creation both draw from that one bucket. A clamp query whose answer
+selects every row of the newest ACTIVE asset list (14,399 rows on the dev stack's STOCK list) and creates every member in one pass. There is no big transaction: each member gets its own small commits, so
+the database is safe at that size. Time is what bounds it. Ingest allows at most 200 market-data requests a minute
+(`ALPACA_RATE_LIMIT_PER_MINUTE`, which configuration can only lower), and the clamp and the bars request of each
+creation both draw from that one bucket. The asset lookup draws from the trading scope. A clamp query whose answer
 spans several pages costs one token per page (a panel's 1day bars request, about 9,200 sessions from 1990, fits one
-10,000-bar page). So roughly 100 creations a minute, about 5 to 6 hours, is **the shortest** the pass could take, not a
-typical time: expect at least that. Manager runs never overlap, so for those hours no other panel on any source gets a
-pass. Ingest keeps one queue per broker, shared by both of its quota scopes (market data and trading): requests with a
+10,000-bar page). As an observation from a dev run against the real vendor, not a guarantee: the pass made about 77
+creations a minute (80.8 a minute over its first 48 seconds), so about 3 hours for 14,399 members, with the
+market-data side near 155 of its 200 requests a minute and no 429 answers. A larger asset list or a slower vendor
+takes longer. Manager runs never overlap, so for those hours no other panel on any source gets a pass. Ingest keeps one queue per broker, shared by both of its quota scopes (market data and trading): requests with a
 ready-by go first, and undated work follows in arrival order. The panel manager's requests and the asset-list snapshot
 carry no ready-by, so the snapshot queues behind the burst in arrival order; the daily refresh carries a ready-by and
 is served ahead of it. The asset list draws its tokens from the trading scope, so it waits because it is queued, not
