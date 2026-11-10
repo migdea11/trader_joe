@@ -318,7 +318,7 @@ and cannot rely on an error.
 | **No orphan OpenAPI components** | The store app prunes any `components.schemas` entry no `$ref` reaches, so the leftover integer-enum components `ExpiryType` and `UpdateType` are no longer in the document. A client generated from it gets one type per component actually used. |
 | **Instance secret before schema validation** | On a guarded route the 401 is answered before path, query and body values are validated against their models, so an unauthenticated request with, say, a bad path value or a body that fails the schema is a 401, not a 422. **Except for a body that is not valid JSON:** FastAPI parses the JSON body before it runs the secret dependency, so an unparseable body is a 422 whether or not the secret is present. |
 | **One database session per request** | Every store route gets its session from the `async_db` dependency (`data/store/app/database/database.py`), which opens it through `PostgresSessionFactory.AsyncSessionHandle.session()` and closes it when the request ends, including when the request raises. Closing rolls back any transaction still open and returns the connection to the pool. There is no `get_session` and no task-scoped registry behind it. |
-| **Database errors** | A write rolls back once, is logged once at ERROR with its traceback, and **re-raises the original SQLAlchemy error**. No exception handler is registered, so over HTTP it is a bare **500**; there is no typed conversion (a 503-class status with a structured body) at the store app's HTTP boundary. |
+| **Database errors** | A write rolls back once, is logged once at ERROR with its traceback, and **re-raises the original SQLAlchemy error**, which the error handlers render as a 500 problem+json with an `error_id`. |
 
 **Status codes the store routes can answer by design:**
 
@@ -328,10 +328,10 @@ and cannot rely on an error.
 | 403 | The declared `owner` does not own the entry (a missing owner is treated as a wrong one) | S3 |
 | 404 | No entry or dataset with that id | S3, S6, U4, U5, U6, U7, U9, W1, W2, W3 |
 | 409 | The create overlaps the same owner's existing dataset; the top-level `colliding_ids` member of the problem+json lists them | S1 |
-| 422 | Validation: a naive datetime, an unknown field or parameter, a missing required field, a bars query naming no selector or a blank symbol, a `validate_fields` rule on the create body, an `asset_type`/`data_type` pair other than `stock`/`market_activity` on the internal asset-data path, or a malformed single-bar body; a `STREAM` create or a naive `ready_by` on S1; a coverage read for a dataset no trading calendar covers (U7) | all |
+| 422 | Validation: a naive datetime, an unknown field or parameter, a missing required field, a bars query naming no selector or a blank symbol, a `validate_fields` rule on the create body, an `asset_type`/`data_type` pair other than `stock`/`market_activity` on the internal asset-data path, or a malformed single-bar body; a `STREAM` create or a naive `ready_by` on S1; a coverage read for a dataset no trading calendar covers (U7); on S1, a non-stock `asset_type` (`UNSUPPORTED_ASSET_TYPE`: data_ingest refuses the bars request when it is submitted, after the name-change check has run) | all |
 | 409 | `OVERRIDE_REQUIRED`: the dataset belongs to another owner and the operator override is missing, unconfirmed or blank. The body never names the owner | W1, W2, W3 |
 | 503 | `DATABASE_UNAVAILABLE`: the audit tables are missing and the write needs one (run `make migrate`) | W1, W2, W3 |
-| 500 | Anything unmapped: a database error, a non-stock `asset_type` on S1 (gap **G8**), a duplicate timestamp inside one ingested batch | all |
+| 500 | Anything unmapped, such as a database error | all |
 
 ---
 
@@ -355,9 +355,9 @@ response body — so a body assertion pins a string nothing reads.
 It is served by both applications but declared once, here, because the manifest enumerates routers
 and nothing enumerates applications. One interface, one implementation, one entry.
 
-Because the handler touches nothing, a 2xx from it says only that the web server is up. See gap
-**G3** — this is the entire health story today: it is what `make prod-launch` and CI's `up --wait`
-block on for both services.
+Because the handler touches nothing, a 2xx from it says only that the web server is up. Each container's
+healthcheck also probes its gRPC listener's health service after this route, and `make prod-launch` and CI's
+`up --wait` block on both. See gap **G3**.
 
 ## C2 · `/latency/{latency_type}`
 
@@ -1199,141 +1199,85 @@ carries a single `none` line.
 
 # Gaps in the interface
 
-Each gap is labelled **REAL GAP** — a reader would expect it, it is missing, and nothing owns it — or
-**NOT-YET** — absent on purpose and out of scope here. The label is the point: an interface
-reference's worst failure is letting a reader conclude that an absence was an oversight.
+The limits of the surface as it stands. Each is labelled **LIMIT** (a reader might expect otherwise, and the
+surface does not do it) or **OUT OF SCOPE** (not built, by scope).
 
-## G1 · No way to ask what a dataset's coverage is — **REAL GAP**, the largest here
+## G1 · The older read routes say nothing about completeness — **LIMIT**
 
-A caller can POST a fetch and GET rows back. Nothing answers *"what do you already hold for this
-symbol over this window, and what is missing?"* The only way to find out is to read the rows and infer
-from absence — and that inference is unsafe: an absent interval is ambiguous, and on an IEX-only tape
-empty intervals are normal. The whole recovery design exists to remove that ambiguity.
+S2 and S5 return datasets and rows and nothing about what is missing: an absent interval is ambiguous, and on an
+IEX-only tape empty intervals are normal. U7 answers coverage per dataset, computed on read over the trading
+calendar. It reports which sessions hold at least one bar, not what was fetched.
 
-**Partly covered:** U7 answers the question for the UI, per dataset, computed on read over the trading
-calendar. It is not the ledger: it says which sessions hold at least one bar, not what was fetched,
-and the older read routes (S2, S5) still say nothing about completeness.
+## G2 · No caller-initiated retry — **LIMIT**
 
-## G2 · No way to retry a failed fetch — **REAL GAP**
+No route retries a failed fetch. Every store-driven fetch is recorded as an ingest run with its typed error, and
+U6 and U8 expose it. A run's history is per dataset, so a request that failed before any dataset existed is listed
+under no dataset.
 
-Every store-driven fetch is recorded as an ingest run, with its typed error,
-and U6 and U8 expose that. A failed fetch is therefore visible. No caller-initiated retry is built, and a run's
-history is per dataset: a request that failed before any dataset existed is listed under no dataset.
+## G3 · No readiness check beyond `/ping` and the gRPC health service — **LIMIT**
 
-## G3 · No health/readiness distinction beyond `/ping` — **REAL GAP**
+`GET /ping` touches nothing: no Postgres, no gRPC, no broker. Each service's container healthcheck probes it and
+then the gRPC listener's standard health service (`docker-compose.yaml`), and `make prod-launch` and CI's
+`up --wait` block on that. Nothing probes Postgres or broker credentials, so a container with a dead database
+pool or exhausted credentials can report healthy.
 
-`GET /ping` is answered by a handler that touches nothing — no Postgres, no gRPC, no broker — and it
-is the container healthcheck for *both* services, which `make prod-launch` and CI's `up --wait`
-block on. So a container with a dead Postgres pool, unreachable peer or exhausted broker credentials
-reports healthy, and the launch reports success. (data_store's own start waits on postgres being
-healthy, through its own probe, not on data_ingest.)
+## G4 · No caller authentication on any route — **LIMIT**
 
-There is a sharper version: both healthchecks probe HTTP `/ping`, so a container whose **gRPC**
-listener is dead still reports healthy, although the gRPC listener is the one that carries all
-inter-service traffic.
+The write routes require the deployment's instance secret, and nothing else on the surface requires anything. The
+secret authenticates the deployment, not the caller: with one key there is one effective principal, and the
+per-dataset owner check stops mistakes rather than anyone holding the key. Every other surface answers without
+credentials. Prod publishing no host port and dev binding loopback narrow who can reach them; both are a
+perimeter, not an identity.
 
-*Recommendation:* a readiness endpoint that actually checks dependencies, the gRPC listener included.
-`/ping` stays as liveness and keeps its current shape.
-
-## G4 · No caller authentication on any route — **REAL GAP**, the blocking one
-
-The write routes require the deployment's instance secret, and nothing else on the surface
-requires anything. **The secret is not caller authentication**: it authenticates the deployment, so
-with one key there is one effective principal, and the per-dataset owner check stops mistakes rather
-than anyone holding the key. Every other surface answers without credentials;
-prod publishing no host port narrows who can reach them to containers on the stack's networks, which
-is not the same thing, and neither is loopback binding: both are a perimeter, not an identity.
-
-Specifics worth naming rather than leaving to inference:
-
-- `GET /latency/{latency_type}` is an unauthenticated **request amplifier** (C2).
-- `DELETE /store/{id}` is **destructive** and guarded only by the shared secret plus a declared
-  owner that any key holder can name (S3).
+- `GET /latency/{latency_type}` is an unauthenticated request amplifier when switched on (C2).
+- `DELETE /store/{id}` is destructive and guarded only by the shared secret plus a declared owner that any key
+  holder can name (S3).
 - Every read, including the one that returns every entry's `owner`, is open.
 
-*Recommendation:* this is why the document opens with the warning and why every entry carries an
-`auth` field.
+## G5 · S2 and S5 do not paginate — **LIMIT**
 
-## G5 · No pagination on reads — **REAL GAP**, narrowed
+S5 requires a `dataset_id` or `asset_symbol` selector, so the widest read it can express is one symbol across all
+its datasets and all time. S2 is scoped to one symbol. Neither takes `limit` or `offset`. S2 returns dataset entries; S5 returns bars, so one liquid symbol at
+minute granularity is a large S5 answer returned in one 200 response. The UI routes page: U2 and U5 take a keyset
+`cursor` and a `limit`.
 
-`GET /internal/asset-data/{asset_type}/{data_type}` (S5) no longer returns every row: it requires a
-`dataset_id` or `asset_symbol` selector, so the widest read it can express is one symbol across all
-its datasets and all time. `GET /store/{asset_type}/{data_type}/{asset_symbol}` (S2) is scoped to one
-symbol. Neither takes `limit` or `offset`. The bar table is unbounded with no retention policy, so one
-liquid symbol at minute granularity is still a large answer, returned 200 in one response. The UI's
-routes do page (U2 and U5 take a keyset `cursor` and a `limit`); the gap is that S2 and S5 do not.
+## G6 · Routes that declare no response model — **LIMIT**
 
-## G6 · Routes that declare no response model — **REAL GAP**, cheap, and it compounds
+`DELETE /store/{id}` (S3) and `GET /ping` (C1) return ad-hoc dicts, as do the latency pair (C2, C3). The generated
+OpenAPI documents no response for them, and this document marks each such entry "undeclared" rather than
+transcribing the dict shape as a contract.
 
-Two HTTP routes return undeclared dicts: `DELETE /store/{id}` (S3) and `GET /ping` (C1). The latency pair (C2, C3) returns ad-hoc dicts too.
+## G7 · One untyped request body — **LIMIT**
 
-The generated OpenAPI therefore documents nothing for them, and a typed client generated from it has
-nothing to work from where the response model is absent.
+`POST /internal/asset-data/{asset_type}/{data_type}` (S4) takes a plain `dict` and builds
+`StockDataMarketActivityCreate` from it inside the handler, so the OpenAPI document describes no body and the
+manifest's `touches` field for that route reads `dict`. The target model is strict (unknown fields rejected,
+`dataset_id` and `feed` required), and a body that fails it is a 422 in the usual shape.
 
-*Recommendation:* one chore covering all of them. Meanwhile this document marks each such entry
-"undeclared" rather than transcribing the dict shape as if it were a contract.
+## G8 · The surface accepts three asset classes and serves one — **LIMIT**
 
-## G7 · One untyped request body — **REAL GAP**, currently low-impact
+`AssetType` has `STOCK`, `CRYPTO` and `OPTION`; `DataType` has `MARKET_ACTIVITY`, `QUOTE` and `TRADE`. Stock market
+activity is the only pair served. The ingest handlers refuse any other asset type with `UNSUPPORTED_ASSET_TYPE`,
+and S4 and S5 refuse an unsupported pair at the path model with a 422 before the handler runs. S1's path model
+accepts any `asset_type`, and it is ingest that refuses it.
 
-`POST /internal/asset-data/{asset_type}/{data_type}` takes a plain `dict` and splats it into
-`StockDataMarketActivityCreate` inside the handler. It is the reason the manifest's `touches` field
-for that route reads `dict` — there is no schema to name, so the OpenAPI document describes no body.
+## G9 · Nothing here touches accounts, portfolios, orders or fills — **OUT OF SCOPE**
 
-The target model is strict (unknown fields rejected, `dataset_id` and `feed` required), and a body
-that fails it is a 422 in the usual shape, re-raised by the handler. What remains is the typing
-gap itself: nothing documents the body to a generated client.
+This is the market-data surface and only that. A reader arriving from the project description will look for an
+account model, a portfolio model and an append-only order/fill event log, and will find a market-data pipeline.
+Those surfaces are not built, by scope and not by omission.
 
-## G8 · The surface promises three asset classes and serves one — **REAL GAP in the contract**
+## G10 · The write path is idempotent in data, not in work — **LIMIT**
 
-**The ingest half of this is handled.** The gRPC handler refuses a non-`STOCK` `asset_type` up front
-with `UNSUPPORTED_ASSET_TYPE`, and refuses `QUOTE` and `TRADE` data types the same way.
+`POST /store/...` (S1) is idempotent in what it stores: an exact repeat resolves to the same dataset entry, and the
+bar upsert refreshes existing rows on the bar's natural key. It is not idempotent in what it does: every call
+records a request and submits it to data_ingest. Concurrent identical vendor calls collapse onto one at ingest
+(single-flight, `data/ingest/app/brokers/single_flight.py`); a sequential repeat fetches again.
 
-In the data_store internal family S4 and S5 refuse an unsupported pair at the path model
-with a 422, before the handler runs. Their `UnsupportedAssetType` branch is still in the handler but
-is no longer reachable over HTTP.
+## G11 · Versioning covers the UI paths only — **LIMIT**
 
-Stock-only is the correct **scope** today. But an interface that accepts an argument it will 500 on is
-a contract defect regardless of scope.
-
-*Recommendation:* state stock-only in terms (done, here). The ingest side rejects cleanly and S4 and S5
-refuse at the path model. **What is left is S1**, which accepts an `asset_type` it
-cannot serve and discovers it only downstream; it should refuse with a 4xx of its own. Cheap.
-
-## G9 · Nothing here touches accounts, portfolios, orders or fills — **NOT-YET**, unambiguously
-
-This is stated at the top of the document as well, because it is the absence most likely to be
-misread. A reader arriving from the project description will look for an account model, a portfolio
-model and an append-only order/fill event log, and will find a market-data pipeline. Those surfaces
-are not built, by scope and not by omission.
-
-## G10 · The write path is idempotent in data, not in work — **REAL**, not yet urgent
-
-`POST /store/...` is idempotent in what it **stores**: an exact repeat resolves to the same
-dataset entry, and the bar upsert refreshes existing rows on the bar's natural key rather than adding
-new ones. It is not idempotent in what it **does**: every call, repeat or not, triggers a fetch and
-forwards to data_ingest, so a retried or duplicated call repeats the hop to data_ingest. Concurrent identical
-fetches collapse onto one vendor call at ingest (single-flight, `data/ingest/app/brokers/single_flight.py`);
-a sequential repeat fetches again, and the caller cannot tell the two apart.
-
-The cost of a duplicate is a wasted fetch.
-
-## G11 · No versioning on any path — **REAL GAP**, cheap to decide and expensive to retrofit
-
-No `/v1`, no version header, bare paths throughout. A contract change therefore lands under the same
-paths (S1's required `owner` and S5's query are examples), which is the cost this gap names.
-
-*Recommendation:* decide it alongside the gRPC surface rather than separately, so that one versioning
-answer covers both surfaces.
-
-## Deliberately not filed as gaps
-
-Recorded so the next reader does not re-raise them:
-
-| Not a gap | Why |
-|---|---|
-| Rate limiting | Belongs to the rate budget inside the pipeline, not to the route surface. |
-| Bulk / batch endpoints | None on the client surface. `IngestService.Submit` is unary and internal (store to ingest). |
-| A notification transport for fills | Narrowed to a cursor **read** on purpose — an absence by decision. |
+The `/ui/v1/...` routes carry a version in the path. `/store/...`, `/internal/asset-data/...`, `/ping` and
+`/latency/...` carry none, and there is no version header, so a change to those lands under the same paths.
 
 ---
 
